@@ -1,5 +1,6 @@
 #pragma once
 #include "strix/qwen_target_state_digest.hpp"
+#include "qwen_cache_admission.hpp"
 #include "qwen_tiled_prompt_plan.hpp"
 #include "qwen_serial_prompt_certificate.hpp"
 // Block-boundary prefix state cache on the tiled known-prefix prefill: session-state capture and
@@ -205,6 +206,20 @@ struct PrefixCaptureOrder {
     std::optional<hipStream_t> next_target, predictor, next_predictor;
 };
 
+// Attach-time HIP resources; a descriptor retains this owner through DMA/quarantine.
+struct PrefixCaptureResources {
+    void* staging=nullptr;
+    std::uint64_t cap=0;
+    bool poisoned=false;
+    hipStream_t download=nullptr;
+    hipEvent_t target_ready=nullptr,mtp_ready=nullptr,done=nullptr;
+    ~PrefixCaptureResources() {
+        for(auto event:{done,mtp_ready,target_ready}) if(event) (void)hipEventDestroy(event);
+        if(download) (void)hipStreamDestroy(download);
+        if(staging) (void)hipFree(staging);
+    }
+};
+
 // One process-wide, nonblocking snapshot slot. Worker submission owns no session pointer.
 // Only service-thread methods touch the slot; submitted is the worker release/acquire handoff.
 struct PrefixAsyncCapture : std::enable_shared_from_this<PrefixAsyncCapture> {
@@ -214,6 +229,7 @@ struct PrefixAsyncCapture : std::enable_shared_from_this<PrefixAsyncCapture> {
     std::shared_ptr<PrefixCacheCheckpoint> checkpoint;
     PrefixStateCache::Reservation reservation;
     std::vector<Slice> slices;
+    std::shared_ptr<PrefixCaptureResources> resources;
     void* staging = nullptr;
     std::uint64_t bytes = 0, row_bytes = 0;
     std::weak_ptr<PrefixStateCacheRequestStats> request;
@@ -222,7 +238,7 @@ struct PrefixAsyncCapture : std::enable_shared_from_this<PrefixAsyncCapture> {
     hipEvent_t target_ready = nullptr, mtp_ready = nullptr, done = nullptr;
     std::atomic<bool> submitted{false};
     bool committed = false, cancelled = false, started = false, publish = true;
-    bool poisoned=false;
+    bool poisoned=false, split_target=false, metadata_complete=true;
     const void* owner_tag=nullptr;
     hipStream_t target_stream=nullptr;
     // Serialized runner thread only. Query is deliberately nonblocking; no producer wait.
@@ -242,6 +258,7 @@ struct PrefixAsyncCapture : std::enable_shared_from_this<PrefixAsyncCapture> {
         if(e!=hipSuccess) throw PrefixCaptureHipError(e,what);
     }
     ~PrefixAsyncCapture() {
+        if(resources) return;
         if(done) (void)hipEventDestroy(done);
         if(mtp_ready) (void)hipEventDestroy(mtp_ready);
         if(target_ready) (void)hipEventDestroy(target_ready);
@@ -250,6 +267,7 @@ struct PrefixAsyncCapture : std::enable_shared_from_this<PrefixAsyncCapture> {
     }
     // Checked retirement runs while a shared quarantine owner can still retain backing.
     void retire() {
+        if(resources) return;
         try {
             for(auto* event:{&done,&mtp_ready,&target_ready}) if(*event) {
                 check(hipEventDestroy(*event),"prefix event retirement"); *event=nullptr;
@@ -259,6 +277,7 @@ struct PrefixAsyncCapture : std::enable_shared_from_this<PrefixAsyncCapture> {
         } catch(...) {fatal();throw;}
     }
     void fatal() {
+        if(resources) resources->poisoned=true;
         if(!quarantine) return;
         quarantine->checkpoint=checkpoint;
         quarantine->snapshot_owner=shared_from_this();
@@ -272,12 +291,29 @@ struct PrefixAsyncCapture : std::enable_shared_from_this<PrefixAsyncCapture> {
                 static_cast<std::size_t>(s.bytes),hipMemcpyDeviceToDevice,stream),"prefix snapshot D2D");
         check(hipEventRecord(predictor?mtp_ready:target_ready,stream),"prefix snapshot ready");
     }
+    // The split target download has no predictor dependency. The same download stream
+    // later joins the predictor group, so done covers both groups and their leases.
+    void submit_target_download() {
+        check(hipStreamWaitEvent(download,target_ready,0),"prefix target dependency");
+        for(const auto& s:slices) if(!s.predictor)
+            check(hipMemcpyAsync(s.destination,static_cast<std::byte*>(staging)+s.offset,
+                static_cast<std::size_t>(s.bytes),hipMemcpyDeviceToHost,download),"prefix target D2H");
+    }
+    void cancel_target() {
+        if(!split_target || submitted.load(std::memory_order_acquire)) {cancelled=true;return;}
+        cancelled=true;
+        try {
+            check(hipEventRecord(done,download),"prefix cancelled target completion");
+            submitted.store(true,std::memory_order_release);
+        } catch(...) {fatal();throw;}
+    }
     void submit_predictor(hipStream_t stream) {
         try {
+            if(split_target && !metadata_complete) throw std::logic_error("prefix split metadata incomplete");
             snapshot(true,stream);
-            check(hipStreamWaitEvent(download,target_ready,0),"prefix target dependency");
+            if(!split_target) check(hipStreamWaitEvent(download,target_ready,0),"prefix target dependency");
             check(hipStreamWaitEvent(download,mtp_ready,0),"prefix predictor dependency");
-            for(const auto& s:slices)
+            for(const auto& s:slices) if(!split_target || s.predictor)
                 check(hipMemcpyAsync(s.destination,static_cast<std::byte*>(staging)+s.offset,
                     static_cast<std::size_t>(s.bytes),hipMemcpyDeviceToHost,download),"prefix snapshot D2H");
             check(hipEventRecord(done,download),"prefix snapshot completion event");
@@ -308,11 +344,31 @@ struct PrefixAsyncCapture : std::enable_shared_from_this<PrefixAsyncCapture> {
         d->store->record_staging(0,d->bytes,false);
         slot.reset();
     }
-    void commit(bool valid) noexcept {committed=valid;cancelled=cancelled || !valid || poisoned;}
+    void commit(bool valid) noexcept {
+        committed=valid && metadata_complete;
+        cancelled=cancelled || !committed || poisoned;
+    }
     // Called explicitly after serving returns, before runtime owners disappear.
     static void shutdown() {reap(true);}
 };
 
+// Shared by legacy setup and post-residency attachment; byte framing is stable.
+template<class Cache>
+inline void bind_mtp_prefix_cache(Cache& cache, std::uintptr_t kv, std::uint64_t kv_row,
+    std::uintptr_t index, std::uint64_t index_row, std::uintptr_t held, std::uint64_t held_bytes,
+    const ModelContentIdentity& sidecar, std::uint64_t plan, std::uint64_t profile,
+    bool draft_chain, bool draft_exact, bool draft_q4, std::function<void(std::uint64_t)> restore) {
+    cache.add_rows(kv,kv_row,1U,"mtp.kv");
+    cache.add_rows(index,index_row,1U,"mtp.index");
+    cache.add_fixed_device(held,held_bytes,"mtp.held");
+    std::vector<std::byte> frame;
+    const auto u64=[&](std::uint64_t v){for(unsigned b=0;b<64;b+=8)frame.push_back(static_cast<std::byte>((v>>b)&255U));};
+    for(const auto byte:sidecar.bytes)frame.push_back(static_cast<std::byte>(byte));
+    u64(plan);u64(profile);u64(draft_chain);u64(draft_exact);u64(draft_q4);
+    const char* q4_all=std::getenv("STRIX_MTP_DRAFT_Q4_ALL");u64(!q4_all || q4_all[0]!='0');
+    cache.extend_identity(sha256_bytes(frame));
+    if(restore) cache.set_restore_hook(std::move(restore));
+}
 // One live session's view of the store. Capture copies the state after a completed tiled block;
 // restore copies a checkpoint into a fresh session and republishes its recorded metadata.
 class HipPrefixStateCacheSession final {
@@ -496,6 +552,9 @@ public:
     [[nodiscard]] const PrefixStateCacheRequestStats& request() const noexcept { return *request_; }
     [[nodiscard]] PrefixStateCache& store() noexcept { return *store_; }
     // False: the component registry of --rtx-state-import / STRIX_RTX_EXPORT_STATE alone (no capture, no lookup).
+    void disable_store_before_ready() {
+        PrefixAsyncCapture::reap(true); segments_.clear(); row_chain_->clear(); store_.reset();
+    }
     [[nodiscard]] bool has_store() const noexcept { return store_ != nullptr; }
 
     // ---- externally produced state (strix-qwen-rtx-state-v1, docs/rtx-state-import.md) ----
@@ -734,11 +793,71 @@ public:
 
     // Reset callbacks invoke this after their incumbent device fence, before reset writes.
     void before_target_reset() const {PrefixAsyncCapture::before_writer(capture_tag_,nullptr);}
+    double attach_capture_pool(bool automatic_admitted=false) {
+        if(!automatic_admitted || !store_ || store_->policy().legacy || store_->capture_resources) return 0;
+        const auto start=std::chrono::steady_clock::now();
+        auto resources=std::make_shared<PrefixCaptureResources>();
+        resources->cap=staging_cap_?staging_cap_:row_bytes_*block_rows_+fixed_bytes_;
+        check(hipMalloc(&resources->staging,static_cast<std::size_t>(resources->cap)),"prefix pool staging allocation");
+        check(hipStreamCreateWithFlags(&resources->download,hipStreamNonBlocking),"prefix pool download stream");
+        for(auto* event:{&resources->target_ready,&resources->mtp_ready,&resources->done})
+            check(hipEventCreateWithFlags(event,hipEventDisableTiming),"prefix pool event");
+        // Reserve bounded metadata inside B; the slab includes every free-list byte.
+        const auto budget=store_->policy().host_byte_budget;
+        const auto metadata=std::min<std::uint64_t>(budget/8U,UINT64_C(1)<<20);
+        // Round the slab down, charging its alignment remainder to metadata too.
+        const auto slab=(budget-metadata)&~UINT64_C(255);
+        auto pool=std::make_shared<PrefixPayloadPool>(hip_pinned_prefix_capture_buffer(slab));
+        store_->attach_payload_pool(std::move(pool),budget-slab);
+        store_->set_pool_staging_bytes(resources->cap);
+        store_->capture_resources=std::move(resources);
+        return ms(start);
+    }
     void set_staging_cap(std::uint64_t bytes) { staging_cap_=bytes; }
     using Capture = std::shared_ptr<PrefixAsyncCapture>;
     Capture try_prepare_capture(const SerialSessionContext& session, std::span<const std::uint32_t> prompt,
         hipStream_t producer, bool target_valid, PrefixCaptureOrder order={}, std::uint64_t covered=UINT64_MAX,
         std::shared_ptr<const void> target_owner={},std::shared_ptr<const void> predictor_owner={},const void* owner_tag=nullptr) {
+        return prepare_capture(session,prompt,producer,target_valid,order,covered,
+            std::move(target_owner),std::move(predictor_owner),owner_tag,false);
+    }
+    [[nodiscard]] bool pooled_capture() const {return store_ && bool(store_->capture_resources);}
+    Capture try_prepare_target_capture(const SerialSessionContext& session, std::span<const std::uint32_t> prompt,
+        hipStream_t producer, bool target_valid, PrefixCaptureOrder order={}, std::uint64_t covered=UINT64_MAX,
+        std::shared_ptr<const void> target_owner={},std::shared_ptr<const void> predictor_owner={},const void* owner_tag=nullptr) {
+        if(!pooled_capture()) return {};
+        return prepare_capture(session,prompt,producer,target_valid,order,covered,
+            std::move(target_owner),std::move(predictor_owner),owner_tag,true);
+    }
+    // Called only at the original complete boundary, after priming and held-row update.
+    // In particular predictor_complete includes the incumbent predictor-frontier check.
+    bool complete_target_capture(const Capture& d,const SerialSessionContext& session,
+        bool predictor_complete,hipStream_t predictor) {
+        if(!d || !d->split_target || d->metadata_complete) return false;
+        const auto p=d->checkpoint->position;
+        if(d->cancelled || !predictor_complete || session.next_position!=p || session.committed_tokens!=p ||
+            session.health!=SerialSessionHealth::ready || d->checkpoint->identity!=active_identity() ||
+            !certified_metadata(session.state,session.arithmetic_lineage,p)) {
+            d->cancel_target();return false;
+        }
+        try {
+            d->checkpoint->metadata=encode_metadata(session);
+            d->checkpoint->producer_certificate=execution_certificate(p);
+            if(d->checkpoint->producer_certificate.empty()) {d->cancel_target();return false;}
+            if(d->publish) for(const auto& f:fixed_) if(!f.device)
+                std::memcpy(d->checkpoint->fixed.data.get()+f.offset,reinterpret_cast<const void*>(f.address),
+                    static_cast<std::size_t>(f.bytes));
+            d->metadata_complete=true;
+            d->submit_predictor(predictor);
+            return true;
+        } catch(const PrefixCaptureHipError&) {throw;}
+          catch(...) {d->cancel_target();throw;}
+    }
+private:
+    Capture prepare_capture(const SerialSessionContext& session, std::span<const std::uint32_t> prompt,
+        hipStream_t producer, bool target_valid, PrefixCaptureOrder order, std::uint64_t covered,
+        std::shared_ptr<const void> target_owner,std::shared_ptr<const void> predictor_owner,const void* owner_tag,
+        bool split_target) {
         PrefixAsyncCapture::reap();
         if(serial_path_) {certificate_decline("serial-async-capture-unsupported");return {};}
         const auto p=session.next_position;
@@ -760,11 +879,14 @@ public:
             !order.next_predictor || *order.predictor!=*order.next_predictor) {
             store_->record_cross_stream_skip();return {};
         }
-        if(PrefixAsyncCapture::slot) {store_->record_staging_skip(false);return {};}
+        const auto resources=std::static_pointer_cast<PrefixCaptureResources>(store_->capture_resources);
+        if(PrefixAsyncCapture::slot) {store_->record_staging_skip(false);if(resources) store_->record_no_slot();return {};}
+        if(resources && resources->poisoned) {store_->record_no_slot();return {};}
         Capture d;
         if(prefix_batch_certification_enabled()) store_->record_snapshot_preparation();
         try {
             d=std::make_shared<PrefixAsyncCapture>(); d->store=store_;
+            d->split_target=split_target;d->metadata_complete=!split_target;
             d->owner_tag=owner_tag;d->target_stream=producer;
             d->publish=selected; d->row_chain=row_chain_; d->request=request_;
             d->target_owner=std::move(target_owner);d->predictor_owner=std::move(predictor_owner);
@@ -773,8 +895,15 @@ public:
             if(digests.size()!=blocks || store_->contains(digests.back())) return {};
             auto c=std::make_shared<PrefixCacheCheckpoint>(); d->checkpoint=c;
             c->identity=active_identity(); c->digest=digests.back(); c->position=p; c->block_rows=block_rows_;
-            c->conversation=conversation_; c->metadata=encode_metadata(session);
-            c->producer_certificate=execution_certificate(p); c->fixed.bytes=selected?fixed_bytes_:0;
+            c->conversation=conversation_;
+            if(split_target) {
+                // Charge the same metadata/certificate sizes before DMA; freeze values only post-prime.
+                c->metadata.resize(encode_metadata(session).size());
+                c->producer_certificate.resize(execution_certificate(p).size());
+            } else {
+                c->metadata=encode_metadata(session);c->producer_certificate=execution_certificate(p);
+            }
+            c->fixed.bytes=selected?fixed_bytes_:0;
             std::vector<std::shared_ptr<PrefixCacheSegment>> missing;
             for(std::uint64_t k=0;k<blocks;++k) {
                 auto retained=k<row_chain_->size()?(*row_chain_)[k]:store_->find_segment(digests[k]);
@@ -790,17 +919,23 @@ public:
             if(selected) for(const auto& f:fixed_) if(f.device) d->bytes+=f.bytes;
             const auto cap=staging_cap_?staging_cap_:row_bytes_*plan_.rows+fixed_bytes_;
             store_->record_staging(cap,0,false);
-            if(d->bytes>cap) {store_->record_staging_skip(true);return {};}
+            if(d->bytes>cap || (resources && d->bytes>resources->cap)) {store_->record_staging_skip(true);return {};}
             d->reservation=store_->reserve(store_->incremental_bytes(*c),c.get());
-            if(!d->reservation) return {};
+            if(!d->reservation) {if(resources) store_->record_no_slot();return {};}
             if(selected) c->fixed=store_->allocate(fixed_bytes_,d->reservation);
             for(const auto& segment:missing) segment->payload=store_->allocate(segment->payload.bytes,d->reservation,true);
-            auto e=hipMalloc(&d->staging,static_cast<std::size_t>(d->bytes));
-            if(e==hipErrorOutOfMemory) {store_->record_staging_skip(true);return {};}
-            check(e,"prefix staging allocation");
-            check(hipStreamCreateWithFlags(&d->download,hipStreamNonBlocking),"prefix D2H stream");
-            for(auto* event:{&d->target_ready,&d->mtp_ready,&d->done})
-                check(hipEventCreateWithFlags(event,hipEventDisableTiming),"prefix capture event");
+            if(resources) {
+                d->resources=resources;
+                d->staging=resources->staging;d->download=resources->download;
+                d->target_ready=resources->target_ready;d->mtp_ready=resources->mtp_ready;d->done=resources->done;
+            } else {
+                auto e=hipMalloc(&d->staging,static_cast<std::size_t>(d->bytes));
+                if(e==hipErrorOutOfMemory) {store_->record_staging_skip(true);return {};}
+                check(e,"prefix staging allocation");
+                check(hipStreamCreateWithFlags(&d->download,hipStreamNonBlocking),"prefix D2H stream");
+                for(auto* event:{&d->target_ready,&d->mtp_ready,&d->done})
+                    check(hipEventCreateWithFlags(event,hipEventDisableTiming),"prefix capture event");
+            }
             std::uint64_t offset=0;
             for(const auto& segment:missing) {
                 std::uint64_t dest=0;
@@ -815,16 +950,19 @@ public:
                 if(f.device) {
                     d->slices.push_back({reinterpret_cast<const void*>(f.address),c->fixed.data.get()+f.offset,offset,f.bytes,
                         f.id=="mtp.held"}); offset+=f.bytes;
-                } else std::memcpy(c->fixed.data.get()+f.offset,reinterpret_cast<const void*>(f.address),static_cast<std::size_t>(f.bytes));
+                } else if(!split_target) std::memcpy(c->fixed.data.get()+f.offset,reinterpret_cast<const void*>(f.address),static_cast<std::size_t>(f.bytes));
             }
             // All allocations, host history and credits exist before the first submission.
             capture_tag_=owner_tag;
             PrefixAsyncCapture::slot=d;
             store_->record_staging(cap,d->bytes,true);
             d->started=true;
-            try {d->snapshot(false,producer);} catch(...) {d->fatal();throw;}
+            try {
+                d->snapshot(false,producer);
+                if(split_target) d->submit_target_download();
+            } catch(...) {d->fatal();throw;}
             return d;
-        } catch(const PrefixCacheAllocationFailure&) {store_->record_capture_failure();return {};}
+        } catch(const PrefixCacheAllocationFailure&) {if(resources) store_->record_no_slot();else store_->record_capture_failure();return {};}
           catch(const std::bad_alloc&) {if(d && d->started) {d->fatal();throw;} store_->record_capture_failure();return {};}
           catch(const PrefixCaptureHipError& e) {
               if(!d->started && e.error==hipErrorOutOfMemory) {store_->record_capture_failure();return {};}
@@ -832,6 +970,7 @@ public:
           }
     }
 
+public:
     // After a completed tiled block: the session is at a block boundary of `prompt` (absolute
     // positions). Captures it when the boundary is selected and not cached yet.
     // `covered` is how far complete T-row blocks can run for this prompt (the prompt length, or one
@@ -865,8 +1004,7 @@ public:
             if(serial_path_) certificate_decline("serial-capture-metadata-mismatch");
             return;
         }
-        const bool last = position + block_rows_ > covered;
-        if (position % every_ && !last) return;
+        if (!prefix_capture_boundary_selected(position,covered,block_rows_,every_)) return;
         if (!retain_) { store_->record_no_store_skip(); return; }
         if(prefix_batch_certification_enabled()) store_->record_snapshot_preparation();
         const auto blocks = position / block_rows_;

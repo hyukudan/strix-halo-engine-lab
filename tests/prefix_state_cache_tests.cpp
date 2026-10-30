@@ -10,6 +10,28 @@
 #include <string>
 #include <thread>
 #include <atomic>
+#include <cstdlib>
+#include <new>
+
+// Test-only host pressure, independent of HIP allocation fault injection.
+thread_local bool prefix_test_fail_host_allocations=false;
+void* operator new(std::size_t bytes) {
+    if(prefix_test_fail_host_allocations) throw std::bad_alloc();
+    if(auto* p=std::malloc(bytes?bytes:1)) return p;
+    throw std::bad_alloc();
+}
+#if defined(_MSC_VER)
+__declspec(noinline)
+#else
+__attribute__((noinline))
+#endif
+void prefix_test_free(void* p) noexcept {std::free(p);}
+void* operator new[](std::size_t bytes) {return ::operator new(bytes);}
+void operator delete(void* p) noexcept {prefix_test_free(p);}
+void operator delete(void* p,std::size_t) noexcept {::operator delete(p);}
+void operator delete[](void* p) noexcept {::operator delete(p);}
+void operator delete[](void* p,std::size_t) noexcept {::operator delete(p);}
+
 
 namespace {
 void require(bool ok, const char* message) {
@@ -484,6 +506,111 @@ int main() {
                 "certified candidate API cannot consume old v1 disk files");
             const auto legacy_hit=reader.find_longest(id,disk_tokens,T,8);
             require(legacy_hit && reader.counters().disk_hits==1,"explicit legacy disk API remains functional");
+        }
+        {
+            constexpr std::uint64_t budget=8192, metadata=1024;
+            auto pool=std::make_shared<strix::PrefixPayloadPool>(heap(budget-metadata));
+            strix::PrefixStateCache pooled({budget,{},0,strix::PrefixCacheRetention::lru},heap);
+            pooled.attach_payload_pool(pool,metadata);
+            auto stats=pooled.counters();
+            require(stats.host_bytes==budget && stats.pool_bytes+stats.pool_metadata_reserved==budget &&
+                stats.pool_free_bytes==budget-metadata,"all retained slab/free-list bytes charged exactly once to B");
+            auto first=pool->allocate(1), second=pool->allocate(257);
+            require(second.data.get()-first.data.get()==256 && pool->free_bytes()==budget-metadata-768,
+                "pool preserves 256-byte suballocation alignment");
+            auto lease=first.data;first={};second={};
+            require(pool->free_bytes()==budget-metadata-256,"outstanding lease holds slab range");
+            prefix_test_fail_host_allocations=true;
+            lease.reset();
+            prefix_test_fail_host_allocations=false;
+            require(pool->free_bytes()==budget-metadata,"released adjacent slabs coalesce");
+            auto left=pool->allocate(256), middle=pool->allocate(256), right=pool->allocate(256);
+            prefix_test_fail_host_allocations=true;
+            left={}; right={}; middle={};
+            prefix_test_fail_host_allocations=false;
+            require(pool->free_bytes()==pool->bytes(),"all coalescing forms return leases without host allocation");
+            auto full=pool->allocate(budget-metadata);
+            bool skipped=false;
+            try {(void)pool->allocate(1);} catch(const strix::PrefixCacheAllocationFailure&) {skipped=true;}
+            require(skipped,"pool exhaustion refuses immediately");full={};
+            strix::PrefixStateCache original({budget,{},0},heap);
+            const std::vector<std::uint32_t> input(5,7);
+            auto before=build(original,id,input), after=build(pooled,id,input);
+            require(same_payloads(*before[0],*after[0]) && before[0]->digest==after[0]->digest,
+                "pooled registry payload/metadata/digest are byte-identical to original allocator");
+            require(pooled.insert(after[0]),"pooled checkpoint inserted");
+            const auto used=pool->bytes()-pool->free_bytes();
+            after.clear();
+            require(used && pool->free_bytes()!=pool->bytes(),"directory retains payload slabs");
+            prefix_test_fail_host_allocations=true;
+            auto credit=pooled.reserve(budget);
+            prefix_test_fail_host_allocations=false;
+            require(bool(credit) && pooled.counters().evicted==1 && pool->free_bytes()==pool->bytes(),
+                "eviction returns all payload slabs to free list without freeing backing");
+            require(pooled.counters().host_bytes==budget,"eviction keeps physical pool charge B");
+        }
+        // Real reservations and allocation order, including the physical slab
+        // sub-budget rather than forcing eviction with reserve(B).
+        for(const auto retention:{strix::PrefixCacheRetention::fair,strix::PrefixCacheRetention::lru}) {
+            const auto capture=[&](strix::PrefixStateCache& cache,unsigned token,std::uint64_t bytes,
+                std::uint64_t metadata=264) -> std::shared_ptr<const strix::PrefixCacheCheckpoint> {
+                auto segment=std::make_shared<strix::PrefixCacheSegment>();
+                segment->identity=id;segment->parent=id;segment->tokens={token};segment->block_rows=1;
+                segment->digest=strix::prefix_cache_block_digest(id,segment->tokens);segment->payload.bytes=bytes;
+                auto c=std::make_shared<strix::PrefixCacheCheckpoint>();
+                c->identity=id;c->digest=segment->digest;c->position=1;c->block_rows=1;c->segments={segment};
+                c->metadata.resize(metadata);
+                auto reservation=cache.reserve(cache.incremental_bytes(*c),c.get());
+                if(!reservation) return {};
+                segment->payload=cache.allocate(bytes,reservation,true);
+                require(cache.insert(c,&reservation),"physical capture insertion");
+                return c;
+            };
+            {
+                auto pool=std::make_shared<strix::PrefixPayloadPool>(heap(28672));
+                strix::PrefixStateCache cache({32768,{},0,retention},heap);cache.attach_payload_pool(pool,4096);
+                require(bool(capture(cache,1,14336)) && bool(capture(cache,2,14336)),"mixed-size slab fill");
+                require(pool->free_bytes()==0 && cache.counters().host_checkpoints==2,"physical slab full below logical B");
+                const auto replacement=capture(cache,3,512);
+                require(replacement && cache.counters().evicted==1 && cache.counters().host_checkpoints==2 &&
+                    pool->free_bytes()==13824,"small replacement reclaims eligible checkpoint before allocation");
+            }
+            {
+                auto pool=std::make_shared<strix::PrefixPayloadPool>(heap(28672));
+                strix::PrefixStateCache cache({32768,{},0,retention},heap);cache.attach_payload_pool(pool,4096);
+                auto a=capture(cache,1,14336),b=capture(cache,2,14336);
+                require(a && b && !capture(cache,3,512) && cache.counters().evicted==0,
+                    "physical pressure never waits for or evicts leased checkpoints");
+                a.reset();
+                require(bool(capture(cache,3,512)) && cache.counters().evicted==1,
+                    "released reader permits replacement on next capture");
+            }
+            {
+                auto pool=std::make_shared<strix::PrefixPayloadPool>(heap(28672));
+                strix::PrefixStateCache cache({32768,{},0,retention},heap);cache.attach_payload_pool(pool,4096);
+                auto gap1=pool->allocate(7168);
+                require(bool(capture(cache,1,7168)),"fragmented first capture");
+                auto gap2=pool->allocate(7168);
+                require(bool(capture(cache,2,7168)),"fragmented second capture");
+                gap1={};gap2={};
+                require(pool->free_bytes()==14336,"enough aggregate free bytes before extent pressure");
+                require(bool(capture(cache,3,10000)) && cache.counters().evicted==1,
+                    "contiguous extent pressure reclaims in retention order");
+            }
+            {
+                auto pool=std::make_shared<strix::PrefixPayloadPool>(heap(512));
+                strix::PrefixStateCache cache({4608,{},0,retention},heap);cache.attach_payload_pool(pool,4096);
+                require(bool(capture(cache,1,257)) && pool->free_bytes()==0,"alignment consumes complete payload slab");
+                require(bool(capture(cache,2,1)) && cache.counters().evicted==1,
+                    "alignment pressure is physical admission pressure");
+            }
+            {
+                auto pool=std::make_shared<strix::PrefixPayloadPool>(heap(28672));
+                strix::PrefixStateCache cache({32768,{},0,retention},heap);cache.attach_payload_pool(pool,4096);
+                require(bool(capture(cache,1,1,2100)),"metadata allowance first capture");
+                require(bool(capture(cache,2,1,2100)) && cache.counters().evicted==1,
+                    "metadata stays within the separate retained allowance");
+            }
         }
         std::filesystem::remove_all(dir);
         prefix_dma_tests();

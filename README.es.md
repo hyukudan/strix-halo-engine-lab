@@ -720,8 +720,14 @@ en los límites admitidos y solo lee el sufijo. Configure `--prefix-cache-host-b
 opcionalmente, `--prefix-cache-dir DIR`; la retención equitativa es la predeterminada (`--prefix-cache-retention lru` restaura
 LRU). Las capturas reservan memoria antes de las copias fijadas. `"state_cache":{"retain":false}` permite lecturas
 sin almacenar prefijos nuevos; `GET /v1/cache/stats` informa de la retención y de los motivos de expulsión.
-`--prefix-cache off` / `STRIX_PREFIX_CACHE=0` la desactiva. El tiling HTTP automático no proporciona
-por sí mismo un presupuesto de caché. La restauración MTP solo acepta planes de sufijo equivalentes a la ejecución sin caché;
+`--prefix-cache off` / `STRIX_PREFIX_CACHE=0` la desactiva. La caché certificada solo está activada por defecto
+en HTTP MTP en tiles con un único ejecutor (`--http-batch 0`, o capacidad automática que resuelve a un solo
+ejecutor) con T=2048, el perfil y los assets por defecto y contexto de hasta 16,384; ahí el presupuesto automático
+tras la residencia nativa es `min(4 GiB, A/16, A - reserve)` de la memoria disponible A, y los resultados son
+idénticos bit a bit a los de sin caché. Cualquier otra configuración automática, incluido el comando de servicio
+simple (que resuelve T=8192), la rechaza por nombre y se ejecuta exactamente como sin caché; los bytes de host
+explícitos mantienen su comportamiento. El arranque, `--print-effective-config`, `/v1/capabilities` y
+`/v1/cache/stats` informan de la política solicitada y efectiva y de su motivo. La restauración MTP solo acepta planes de sufijo equivalentes a la ejecución sin caché;
 las copias de checkpoints siguen los límites de bloque existentes.
 
 <a id="deepseek-pair"></a>

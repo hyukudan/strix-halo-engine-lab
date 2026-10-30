@@ -1,6 +1,7 @@
 #include "../apps/qwen_prompt_organization.hpp"
 #include "../apps/qwen_http_memory.hpp"
 #include "../apps/mtp_asset_verification.hpp"
+#include "../apps/qwen_cache_family_contract.hpp"
 #include "strix/mtp_selection_transaction.hpp"
 #include "qwen_prefill_contract.hpp"
 #include "rotary_mock.hpp"
@@ -13,6 +14,10 @@
 #include "qwen_serial_contract.hpp"
 #include "qwen_historical_resolver.hpp"
 #include <iostream>
+#include <fstream>
+#include "strix/prompt_terminal_diagnostics.hpp"
+#include "qwen_cache_compatibility_cases.hpp"
+#include "../apps/http_slot_capacity.hpp"
 #include <limits>
 #include <set>
 #include "strix/q8_projection_organization.hpp"
@@ -1728,7 +1733,7 @@ int main(int argc, char** arguments) {
             c.sources.erase("--prefix-cache"); c.sources.erase("--prefix-cache-retention");
             c.options.prefix_cache=true; c.options.prefix_cache_retention="fair";
             c.options.prefix_cache_reason="not-serving";
-            return effective_config_json(c);
+            return without_cache_policy(effective_config_json(c));
         };
         for (const auto& suffix : std::vector<std::vector<std::string>>{{},{"--prefix-cache","off"},{"--prefix-cache-retention","lru"}}) {
             std::vector<std::string> args{"decoder","MODEL"}; args.insert(args.end(),32768,"1");
@@ -2628,6 +2633,727 @@ int main(int argc, char** arguments) {
     expect(batch_cli.prefix_batch_cert==1,"batch certification CLI wins env");
     expect(parse({"decoder","MODEL","1","--prefix-batch-cert","1","--baseline"}).prefix_batch_cert==0,"baseline wins batch CLI");
     for(const auto& row:prefix_batch_cert_route_qualifications) expect(!row.gpu_qualified,"batch L1 remains unqualified");
+    {
+        const auto records=cache_compatibility_records(model);
+        if(argc==2 && std::string_view(arguments[1])=="--dump-cache-reference") {
+            for(const auto& [name,digest]:records) std::cout<<name<<' '<<digest<<'\n';
+            return 0;
+        }
+        std::ifstream reference(std::filesystem::path(__FILE__).parent_path()/"qwen_cache_public_main_reference.txt");
+        expect(bool(reference),"public-main reference table exists");
+        for(const auto& [name,digest]:records) {
+            std::string expected_name,expected_digest;reference>>expected_name>>expected_digest;
+            if(expected_name!=name || expected_digest!=digest) std::cerr<<"reference mismatch "<<name<<'\n';
+            expect(expected_name==name && expected_digest==digest,"explicit resolver output matches public main");
+        }
+        std::string extra;expect(!(reference>>extra),"reference table has no missing cases");
+    }
+    {
+        for(const auto runner:{CacheRunner::cli,CacheRunner::target,CacheRunner::single_mtp,CacheRunner::batch_mtp}) {
+            Options o;o.context_tokens=8192;o.http_serve=runner!=CacheRunner::cli;
+            o.mtp.enabled=runner==CacheRunner::single_mtp || runner==CacheRunner::batch_mtp;
+            o.known_prefix_prefill_rows=2048;
+            resolve_session_defaults(o,model,{},128*gib_bytes);resolve_prefix_defaults(o,model,{},128*gib_bytes);
+            const auto before=effective_prefill_argv(o);const auto session_reason=o.session_off_reason;
+            expect(cache_activation_json(o).find("effective")->is_null(),"inspection activation is pending");
+            expect(cache_activation_json(o).find("batch_certification")->find("effective")->is_null(),"inspection cert is pending");
+            finalize_cache_family(o,runner,runner==CacheRunner::batch_mtp?4:1);
+            expect(!automatic_cache_work(o) && !o.cache_activation->prefix && !o.cache_activation->session &&
+                !prefix_batch_cert_execution_mode(o) && !o.prefix_cache_host_bytes,"unknown identity performs zero optional work");
+            expect(effective_prefill_argv(o)==before && o.context_tokens==8192 && o.session_off_reason==session_reason,
+                "decline preserves inference and incumbent reporting");
+            if(runner==CacheRunner::cli) expect(o.cache_activation->session_reason=="cli-save-load-explicit","CLI reason is not overwritten");
+        }
+        CacheLateFit fit;fit.U=256*gib_bytes;fit.A=136*gib_bytes;fit.L=120*gib_bytes;
+        intersect_cache_capacity(fit,128*gib_bytes);
+        expect(*fit.L==120*gib_bytes && *fit.A==8*gib_bytes && *fit.U==128*gib_bytes,"configured ceiling cannot erase residency");
+        fit.observation_id=1;fit.limits_consistent=fit.aliasing_known=true;fit.F=fit.E=fit.S=fit.device_unpaid=0;
+        fit.device_free=32*gib_bytes;fit.checkpoint=gib_bytes;fit.explicit_budget=8*gib_bytes;
+        expect(!fit_cache_late(fit).budget,"clamped residency reproducer refuses unsafe fit");
+        fit.U=112*gib_bytes;fit.A=3*gib_bytes;fit.L=120*gib_bytes;intersect_cache_capacity(fit,128*gib_bytes);
+        expect(*fit.A==0 && *fit.L==120*gib_bytes,"cgroup intersection keeps independent residency");
+        for(const auto tile:{2048U,3072U,8192U}) for(const auto every:{0U,4096U,65536U}) {
+            const auto cadence=prefix_capture_cadence(tile,every);
+            expect(minimum_prefix_capture_boundary(tile,tile*2,cadence)==tile,"last-boundary checkpoint fits below periodic cadence");
+            expect(prefix_capture_boundary_selected(tile,tile+1,tile,cadence),"off-cadence last boundary retained");
+            expect(!minimum_prefix_capture_boundary(tile,tile,cadence),"checkpoint must precede context boundary");
+        }
+        expect(prefix_capture_cadence(3072,0)==6144,"non-divisor default cadence agrees with capture");
+        expect(cache_unpaid_slot_bytes(100,200,30,4,4,4)==120,"eager native slots still owe simultaneous prompt taps");
+        expect(cache_unpaid_slot_bytes(100,200,30,4,1,1)==1020,"lazy native/state commitments plus all taps");
+        expect(cache_unpaid_slot_bytes(100,200,30,1,1,1)==30,"single route unpaid prompt taps");
+#ifndef _WIN32
+        {
+            const char* prompt_name="STRIX_PROMPT_STATE_DIGEST";
+            const char* prompt_old=std::getenv(prompt_name);
+            const std::optional<std::string> prompt_saved=prompt_old?std::optional<std::string>(prompt_old):std::nullopt;
+            const char* name="STRIX_FINAL_STATE_DIGEST";
+            const char* old=std::getenv(name);
+            const std::optional<std::string> saved=old?std::optional<std::string>(old):std::nullopt;
+            for(const bool mtp:{false,true}) {
+                Options o;o.tokens={1,2,3};o.mtp.enabled=mtp;
+                o.known_prefix_prefill_rows=2048;o.known_prefix_window=true;
+                resolve_session_defaults(o,model,{},128*gib_bytes);
+                resolve_prefix_defaults(o,model,{},128*gib_bytes);
+                expect(o.cache_activation->automatic_path && !o.prefix_cache_host_bytes,
+                    "CLI observer startup has no storage");
+                // Plain CLI requests prompt state; MTP CLI requests only final state.
+                if(mtp) {::setenv(name,"1",1);::unsetenv(prompt_name);}
+                else {::unsetenv(name);::setenv(prompt_name,"1",1);}
+                const auto required=[&] {
+                    const char* prompt=std::getenv(prompt_name);
+                    return cache_startup_observer_required(o,false,prompt && prompt[0]=='1');
+                };
+                expect(required(),"upstream CLI diagnostic creates independent registry without storage");
+                finalize_cache_family(o,CacheRunner::cli,1,{});
+                expect(!o.cache_activation->prefix && required(),"registry survives automatic family refusal");
+                decline_cache_activation(*o.cache_activation,"cache-setup-allocation-failed");
+                expect(required(),"registry survives storage rollback");
+                o.known_prefix_window=false;
+                expect(!required(),"diagnostic registry requires upstream tiled predicate");
+            }
+            ::unsetenv(name);
+            if(prompt_saved) ::setenv(prompt_name,prompt_saved->c_str(),1);else ::unsetenv(prompt_name);
+            Options o;o.known_prefix_prefill_rows=2048;o.known_prefix_window=true;
+            expect(cache_startup_observer_required(o,true,false),"import registry survives storage refusal");
+            expect(!cache_startup_observer_required(o,false,false),"plain run needs no optional observer");
+            if(saved) ::setenv(name,saved->c_str(),1);else ::unsetenv(name);
+        }
+#endif
+        {
+            CacheLateFit pressure;pressure.U=128*gib_bytes;pressure.L=120*gib_bytes;pressure.A=8*gib_bytes;
+            pressure.E=pressure.S=pressure.device_unpaid=0;pressure.F=0;pressure.device_free=8*gib_bytes;
+            pressure.checkpoint=256U<<20;pressure.observation_id=1;pressure.limits_consistent=pressure.aliasing_known=true;
+            expect(fit_cache_late(pressure).budget!=0,"readiness pressure without unpaid owners would fit");
+            pressure.F=cache_unpaid_slot_bytes(100,200,gib_bytes,4,4,4);
+            expect(!fit_cache_late(pressure).budget,"readiness pressure reserves every simultaneous request owner");
+        }
+        CachePolicyActivation activation;activation.automatic_path=true;activation.prefix=true;activation.cert_effective=1;
+        set_prefix_batch_certification_enabled(true);
+        activation.certification_transition=[](bool enabled){set_prefix_batch_certification_enabled(enabled);};
+        auto shared=std::make_shared<CachePolicyActivation>(activation);Options original;original.cache_activation=shared;auto copy=original;
+        decline_cache_activation(*copy.cache_activation,"pressure-at-readiness");
+        expect(!prefix_batch_certification_enabled() && !original.cache_activation->cert_effective && !original.cache_activation->prefix,"shared decline clears certification latch");
+        Options protocol;protocol.http_serve=true;protocol.session_mtp_fixed=protocol.session_tiled_suffix=true;
+        protocol.session_mtp_fixed_requested=protocol.session_tiled_suffix_requested=true;
+        expect(!cache_activation_json(protocol).find("executed_session_protocol")->find("fixed_effective")->as_bool(),"declined HTTP protocol reports ineffective");
+        protocol.session_management_requested=true;
+        expect(cache_activation_json(protocol).find("executed_session_protocol")->find("fixed_effective")->as_bool(),"managed explicit protocol reports effective");
+    }
+    {
+        for(const auto n:{1U,2U,4U}) for(unsigned built=1;built<=n;++built) {
+            expect(cache_future_slot_bytes(100,20,n,built,0)==100U*(n-built)+20U*n,
+                "initial cache fit reserves all lazy states and every unpaid native owner");
+            expect(cache_future_slot_bytes(100,20,n,built,built)==120U*(n-built),
+                "readiness fit retains the full remaining lazy growth commitment");
+        }
+        for(const auto mode:{0U,1U,2U}) {
+            bool declined_overflow=false;
+            try {
+                if(mode==0) (void)cache_future_slot_bytes(UINT64_MAX,1,4,1,0);
+                if(mode==1) (void)cache_future_slot_bytes(UINT64_MAX/2,UINT64_MAX/2,2,0,0);
+                if(mode==2) (void)cache_future_slot_bytes(100,20,1,2,0);
+            } catch(const std::overflow_error&) {declined_overflow=true;}
+            expect(declined_overflow,"OFF owner commitment overflow/count mismatch refuses instead of wrapping");
+        }
+    }
+    {
+        CacheLateFit fit;
+        fit.U=128*gib_bytes; fit.L=64*gib_bytes; fit.A=64*gib_bytes; fit.F=8*gib_bytes;
+        fit.E=16U<<20; fit.S=128U<<20; fit.checkpoint=gib_bytes; fit.device_unpaid=gib_bytes;
+        fit.device_free=64*gib_bytes; fit.observation_id=1; fit.limits_consistent=fit.aliasing_known=true;
+        fit.context_off=fit.context=8192; fit.slots_off=fit.slots=4;
+        expect(fit_cache_late(fit).budget==4*gib_bytes,"late min cap and A/16");
+        const auto activation=[] {
+            Options o; auto& a=*o.cache_activation;
+            a.automatic_path=a.prefix_requested=a.automatic_qualified=a.finalized=true;
+            a.runner=CacheRunner::single_mtp; a.source="auto"; a.reason="pending-post-residency";
+            return o;
+        };
+        for(unsigned variant=0;variant<8;++variant) {
+            auto early=fit;
+            if(variant==0) early.A=1;
+            if(variant==1) early.F=UINT64_MAX;
+            if(variant==2) early.F.reset();
+            if(variant==3) early.device_free=0;
+            if(variant==4) early.checkpoint=5*gib_bytes;
+            if(variant==5) early.age_ns=UINT64_MAX;
+            if(variant==6) early.E.reset();
+            if(variant==7) early.device_unpaid.reset();
+            auto o=activation();
+            expect(!prepare_automatic_cache_fit(o,early,false) && !o.cache_activation->B &&
+                !o.cache_activation->prefix && o.prefix_cache_host_bytes==0 &&
+                o.cache_activation->reason=="pending-post-residency", "pressure/age/unpaid size deferred without B");
+            expect(o.cache_activation->decision_phase=="pre-bridge-feasibility","pending phase");
+            expect(prepare_automatic_cache_fit(o,fit,true),"fresh readiness recovers early pressure");
+            expect(o.cache_activation->B==4*gib_bytes && o.cache_activation->F==fit.F &&
+                o.cache_activation->U==fit.U && o.cache_activation->L==fit.L && o.cache_activation->A==fit.A &&
+                o.cache_activation->reserve==cache_fit_reserve(fit) &&
+                o.cache_activation->decision_phase=="post-residency-ready","ready deciding observation published");
+        }
+        for(unsigned variant=0;variant<8;++variant) {
+            auto early=fit;
+            const char* refusal="post-residency-memory-unavailable";
+            if(variant==0) early.U.reset();
+            if(variant==1) early.limits_consistent=false;
+            if(variant==2) early.L.reset();
+            if(variant==3) early.A.reset();
+            if(variant==4) early.L=*early.U+1;
+            if(variant==5) {early.aliasing_known=false;refusal="owner-size-unknown";}
+            if(variant==6) {early.context--;refusal="would-reduce-context-or-slots";}
+            if(variant==7) {early.slots--;refusal="would-reduce-context-or-slots";}
+            auto o=activation();
+            expect(!prepare_automatic_cache_fit(o,early,false) && o.cache_activation->reason==refusal,
+                "terminal feasibility reason retained");
+            expect(!prepare_automatic_cache_fit(o,fit,true) &&
+                o.cache_activation->decision_phase=="pre-bridge-feasibility","terminal early decline is not retried");
+        }
+        for(unsigned variant=0;variant<3;++variant) {
+            auto o=activation(); auto late=fit;
+            prepare_automatic_cache_fit(o,fit,false);
+            if(variant==0) late.A=1;
+            if(variant==1) late.device_free=0;
+            if(variant==2) late.checkpoint=5*gib_bytes;
+            expect(!prepare_automatic_cache_fit(o,late,true) && !o.cache_activation->prefix &&
+                o.cache_activation->B==0 && o.prefix_cache_host_bytes==0 &&
+                o.cache_activation->decision_phase=="post-residency-ready","late pressure decides decline");
+        }
+        auto fraction=fit; fraction.A=16*gib_bytes;
+        expect(fit_cache_late(fraction).budget==gib_bytes,"fraction uses late availability");
+        auto residual=fit; residual.A=13*gib_bytes; residual.F=8*gib_bytes; residual.checkpoint=4096;
+        const auto expected=std::min(*residual.A/16,*residual.A-4*gib_bytes-*residual.F-*residual.E-(256U<<20)-*residual.S);
+        expect(fit_cache_late(residual).budget==expected/4096*4096,"residual subtraction and 4096 alignment");
+        const auto reason=[&](CacheLateFit x,const char* r) { const auto result=fit_cache_late(x);
+            expect(result.budget==0 && result.reason==r,r); };
+        auto x=fit; x.observation_id=0; reason(x,"post-residency-memory-unavailable");
+        x=fit; x.limits_consistent=false; reason(x,"post-residency-memory-unavailable");
+        x=fit; x.A.reset(); reason(x,"post-residency-memory-unavailable");
+        x=fit; x.age_ns=1000000001; reason(x,"memory-observation-stale");
+        x=fit; x.age_ns=1000000000; expect(fit_cache_late(x).budget!=0,"one second observation boundary");
+        x=fit; x.aliasing_known=false; reason(x,"owner-size-unknown");
+        x=fit; x.F.reset(); reason(x,"owner-size-unknown");
+        x=fit; x.E.reset(); reason(x,"owner-size-unknown");
+        x=fit; x.F=UINT64_MAX; reason(x,"memory-arithmetic-overflow");
+        x=fit; x.L=UINT64_MAX; x.U=UINT64_MAX; reason(x,"memory-arithmetic-overflow");
+        x=fit; x.A=1; reason(x,"insufficient-host-headroom");
+        x=fit; x.U=70*gib_bytes; reason(x,"insufficient-host-headroom");
+        x=fit; x.checkpoint=5*gib_bytes; reason(x,"checkpoint-does-not-fit");
+        x=fit; x.context--; reason(x,"would-reduce-context-or-slots");
+        x=fit; x.slots--; reason(x,"would-reduce-context-or-slots");
+        x=fit; x.device_free=0; reason(x,"staging-does-not-fit");
+        x=fit; x.device_free.reset(); reason(x,"staging-does-not-fit");
+        x=fit; x.device_unpaid=UINT64_MAX; reason(x,"memory-arithmetic-overflow");
+        x=fit; x.explicit_budget=6*gib_bytes;
+        expect(fit_cache_late(x).budget==6*gib_bytes,"explicit budget bypasses fraction, retains safety");
+        x.explicit_budget=64*gib_bytes; reason(x,"insufficient-host-headroom");
+        x=fit; x.U=128*gib_bytes; x.L=123*gib_bytes; x.A=5*gib_bytes; x.F=0; x.E=0; x.device_unpaid=0;
+        x.explicit_budget=4*gib_bytes;
+        reason(x,"insufficient-host-headroom");
+        x.resident_payload=4*gib_bytes;
+        expect(fit_cache_late(x).budget==4*gib_bytes,"readiness recheck does not reserve live payload backing twice");
+        x.resident_payload=5*gib_bytes; reason(x,"post-residency-memory-unavailable");
+        x=fit; x.headroom=64*gib_bytes; reason(x,"insufficient-host-headroom");
+    }
+    {
+        // Legacy explicit reservations can reduce capacity; no OFF plan is computed.
+        Options o; o.http_serve=true; o.prefix_cache_host_bytes=2*gib_bytes;
+        o.supplied_options.insert("--prefix-cache-host-bytes");
+        resolve_session_defaults(o,model,{},128*gib_bytes);
+        resolve_prefix_defaults(o,model,{},128*gib_bytes);
+        const auto off=resolve_http_slot_capacity(gib_bytes,0,3*gib_bytes,3*gib_bytes,0);
+        const auto incumbent=resolve_http_slot_capacity(gib_bytes,0,3*gib_bytes,3*gib_bytes,o.prefix_cache_host_bytes);
+        expect(off.slots==4 && incumbent.slots==2,"explicit reservation reduces incumbent slots");
+        finalize_cache_family(o,CacheRunner::batch_mtp,incumbent.slots);
+        const auto report=cache_activation_json(o);
+        expect(report.find("slots_off")->is_null() && report.find("context_off")->is_null(),
+            "legacy report has no fabricated OFF capacity");
+        expect(report.find("slots_admitted")->as_int()==2 && o.prefix_cache_host_bytes==2*gib_bytes,
+            "legacy current capacity and budget survive reporting");
+    }
+    {
+        // Parse first, then resolve; CLI wins env, and either baseline form suppresses raw execution only.
+        for(const bool env_baseline:{false,true}) for(const bool env_cert:{false,true})
+            for(const bool disk:{false,true}) {
+            std::vector<std::string> args={"decoder","MODEL","1"};
+            if(!env_baseline) args.push_back("--baseline");
+            if(!env_cert) { args.push_back("--prefix-batch-cert"); args.push_back("l0"); }
+            args.insert(args.end(),{"--generate","4",
+                "--known-prefix-window","--known-prefix-full-rows","--known-prefix-prefill-rows","1024",
+                "--known-prefix-workspace-budget-bytes","1048576","--known-prefix-host-metadata-budget-bytes","1048576",
+                "--known-prefix-uma-budget-bytes","1048576","--known-prefix-host-headroom-bytes","0",
+                "--deferred-moe-status","--virtual-q8-gdn-input","--prefetch-q8-gdn-input",
+                "--virtual-q8-gdn-output","--wave8-q8-gdn-input","--wave8-q8-gdn-output",
+                "--prefix-cache-host-bytes","1073741824"});
+            if(disk) args.insert(args.end(),{"--prefix-cache-dir","cache-placeholder"});
+            auto o=parse(args);
+            Environment env;
+            if(env_baseline) env["STRIX_BASELINE"]="1";
+            env["STRIX_PREFIX_BATCH_CERT"]=env_cert?"l0":"l1";
+            resolve_session_defaults(o,model,env,128*gib_bytes);
+            resolve_prefix_defaults(o,model,env,128*gib_bytes);
+            auto report=cache_activation_json(o);
+            expect(report.find("batch_certification")->find("policy")->as_string()=="l0-where-eligible",
+                "inspection preserves CLI/env L0 request before either baseline form");
+            expect(report.find("batch_certification")->find("effective")->is_null(),"inspection cert stays pending");
+            const auto legacy_source=o.prefix_cache_source;
+            finalize_cache_family(o,CacheRunner::cli,1);
+            report=cache_activation_json(o);
+            expect(!o.prefix_batch_cert && !prefix_batch_cert_execution_mode(o),"baseline execution still suppressed");
+            expect(report.find("batch_certification")->find("effective")->as_string()=="declined" &&
+                report.find("batch_certification")->find("reason")->as_string()=="baseline","baseline cert decline disclosed");
+            expect(report.find("source")->as_string()=="explicit" && report.find("suppression")->as_string()=="baseline" &&
+                o.prefix_cache_source==legacy_source && o.prefix_cache_host_bytes==gib_bytes,
+                "surviving baseline storage is explicit without changing legacy fields");
+            expect(!disk || o.prefix_cache_dir=="cache-placeholder","baseline disk path survives");
+        }
+        auto off=parse({"decoder","MODEL","1","--prefix-batch-cert","off"});
+        Environment env={{"STRIX_PREFIX_BATCH_CERT","l0"}};
+        resolve_session_defaults(off,model,env,128*gib_bytes);resolve_prefix_defaults(off,model,env,128*gib_bytes);
+        finalize_cache_family(off,CacheRunner::batch_mtp,2);
+        expect(cache_activation_json(off).find("batch_certification")->find("policy")->as_string()=="off",
+            "explicit CLI cert OFF wins env ON");
+    }
+    {
+        for(const auto cli:{"omitted","on","off"}) for(const auto env_value:{"0","1"})
+            for(const bool suppress_session:{false,true}) {
+            std::vector<std::string> args={"decoder","MODEL","1"};
+            if(std::string_view(cli)!="omitted") args.insert(args.end(),{"--session-cache",cli});
+            if(suppress_session) args.push_back("--baseline");
+            auto o=parse(args); Environment env={{"STRIX_SESSION_CACHE",env_value}};
+            const bool requested=std::string_view(cli)=="omitted"?std::string_view(env_value)!="0":std::string_view(cli)=="on";
+            auto legacy=o;resolve_legacy_session_defaults(legacy,model,env,128*gib_bytes);
+            resolve_session_defaults(o,model,env,128*gib_bytes);resolve_prefix_defaults(o,model,env,128*gib_bytes);
+            expect(cache_activation_json(o).find("session_requested")->as_bool()==requested,"session request uses CLI over env before admission");
+            expect(o.session_cache==legacy.session_cache && o.session_off_reason==legacy.session_off_reason &&
+                o.session_management_requested==legacy.session_management_requested,"session reporting preserves legacy admission");
+            finalize_cache_family(o,CacheRunner::cli,1);
+            expect(cache_activation_json(o).find("session_requested")->as_bool()==requested,"final session request survives suppression");
+        }
+    }
+    {
+        for(const auto runner:{CacheRunner::cli,CacheRunner::target,CacheRunner::single_mtp,CacheRunner::batch_mtp}) {
+            Options o;o.http_serve=runner!=CacheRunner::cli;o.known_prefix_prefill_rows=2048;
+            resolve_session_defaults(o,model,{},128*gib_bytes);resolve_prefix_defaults(o,model,{},128*gib_bytes);
+            expect(cache_activation_json(o).find("batch_certification")->find("reason")->as_string()=="pending-post-residency",
+                "inspection retains pending automatic certification");
+            finalize_cache_family(o,runner,runner==CacheRunner::batch_mtp?4:1);
+            const auto cert=cache_activation_json(o).find("batch_certification")->dump();
+            expect(cert.find("pending")==std::string::npos,"finalized runner has no pending certification reason");
+            expect(o.cache_activation->cert_reason==(runner==CacheRunner::cli?"no-reuse-route":
+                runner==CacheRunner::batch_mtp?"batch-scheduler-family-unqualified":
+                runner==CacheRunner::single_mtp?"mtp-contract-unqualified":"not-applicable-non-batch"),
+                "finalized certification explains runner decline");
+        }
+    }
+    {
+        const auto root=std::filesystem::temp_directory_path()/"qwen-cache-cgroup-fixture";
+        std::filesystem::create_directories(root/"parent"/"leaf");
+        const auto write=[&](const char* path,const char* value) { std::ofstream(root/path)<<value; };
+        write("parent/memory.max","max\n"); write("parent/memory.current","40\n");
+        write("parent/leaf/memory.max","max\n"); write("parent/leaf/memory.current","20\n");
+        const auto observe=[&](std::string groups="0::/parent/leaf\n") {
+            PrefillMemory m;m.usable_ceiling=1000;m.cache_available=800;
+            intersect_cache_cgroup_limits(m,groups,root,"1 0 0:1 / /sys/fs/cgroup rw - cgroup2 cgroup rw",
+                "cgroup:[4026531835]");return m;
+        };
+        expect(observe().cache_limits_known,"v2 root without controller files is unlimited");
+        std::filesystem::remove(root/"parent/memory.current");
+        expect(!observe().cache_limits_known,"missing non-root current is unknown");
+        write("parent/memory.current","40\n");
+        std::filesystem::remove(root/"parent/leaf/memory.max");
+        expect(!observe().cache_limits_known,"missing non-root maximum is unknown");
+        write("parent/leaf/memory.max","500\n");write("parent/memory.max","600\n");
+        auto m=observe();
+        expect(m.cache_limits_known && m.usable_ceiling==500 && m.cache_available==480,
+            "ancestor and leaf capacity/free limits intersect");
+        write("parent/memory.current","590\n");m=observe();
+        expect(m.cache_limits_known && m.usable_ceiling==500 && m.cache_available==10,
+            "ancestor free headroom intersects independently");
+        write("parent/memory.current","601\n");
+        expect(!observe().cache_limits_known,"used above maximum declines");
+        expect(!observe("1:memory:/parent/leaf\n").cache_limits_known,"v1 stays unknown");
+        expect(!observe("0::/../escape\n").cache_limits_known,"unknown hierarchy cannot escape root");
+        expect(!observe("1:cpu,memory:/x\n0::/\n").cache_limits_known,"hybrid memory ownership unknown");
+        expect(observe("0::/\n").cache_limits_known,"initial namespace global root needs no controller files");
+        PrefillMemory global; global.usable_ceiling=1000; global.cache_available=800;
+        intersect_cache_cgroup_limits(global,"0::/\n",root,
+            "1 0 0:1 / /sys/fs/cgroup rw - cgroup2 cgroup rw","cgroup:[4026531835]");
+        expect(global.cache_limits_known,"proven global root without files known");
+        write("memory.max","120\n"); write("memory.current","119\n");
+        auto limited=observe("0::/\n");
+        expect(!limited.cache_limits_known,"controller files at purported global root are inconsistent");
+        write("parent/memory.current","40\n");
+        limited=observe();
+        expect(!limited.cache_limits_known,"unexpected root controller files decline non-root membership too");
+        PrefillMemory delegated;delegated.usable_ceiling=1000;delegated.cache_available=800;
+        intersect_cache_cgroup_limits(delegated,"0::/delegated/parent/leaf\n",root,
+            "1 0 0:1 /delegated /sys/fs/cgroup rw - cgroup2 cgroup rw");
+        expect(!delegated.cache_limits_known,"subtree mount conceals limiting ancestors");
+        write("memory.max","max\n");
+        intersect_cache_cgroup_limits(delegated,"0::/delegated\n",root,
+            "1 0 0:1 /delegated /sys/fs/cgroup rw - cgroup2 cgroup rw","cgroup:[4026531835]");
+        expect(!delegated.cache_limits_known,"unlimited visible subtree cannot prove hidden parent headroom");
+        intersect_cache_cgroup_limits(delegated,"0::/parent/leaf\n",root,
+            "1 0 0:1 / /sys/fs/cgroup rw - cgroup2 cgroup rw","cgroup:[1234]");
+        expect(!delegated.cache_limits_known,"private namespace remains unknown even with shared container PID 1");
+        intersect_cache_cgroup_limits(delegated,"0::/parent/leaf\n",root,
+            "1 0 0:1 / /sys/fs/cgroup rw - cgroup2 cgroup rw");
+        expect(!delegated.cache_limits_known,"missing namespace evidence declines non-root membership too");
+        PrefillMemory unmapped;
+        intersect_cache_cgroup_limits(unmapped,"0::/\n",root);
+        expect(!unmapped.cache_limits_known,"missing mount proof declines even with readable root files");
+        std::filesystem::remove_all(root);
+    }
+    {
+        Options o; o.cache_activation->automatic_path=true;
+        o.cache_activation->automatic_qualified=true; o.cache_activation->source="auto";
+        o.cache_activation->finalized=true;
+        CacheLateFit x;x.U=128849018880ULL;x.L=100000000000ULL;x.A=28849018880ULL;
+        x.F=35181467972ULL;x.E=2001312;x.S=178790912;
+        x.observation_id=1;x.age_ns=12345;x.aliasing_known=true;
+        x.checkpoint=1;x.device_unpaid=x.F;x.device_free=100000000000ULL;
+        expect(!apply_automatic_cache_fit(o,x),"unknown limits decline with inputs");
+        auto ancestry=x; ancestry.cgroup_ancestry_unproven=true;
+        expect(cache_feasibility_decline(ancestry)=="cgroup-ancestry-unproven","named ancestry feasibility refusal");
+        expect(!apply_automatic_cache_fit(o,ancestry) && o.cache_activation->reason=="cgroup-ancestry-unproven",
+            "named ancestry final refusal");
+        apply_automatic_cache_fit(o,x);
+        auto report=cache_activation_json(o);
+        expect(report.find("U")->as_int()==128849018880LL && report.find("L")->as_int()==100000000000LL &&
+            report.find("A")->as_int()==28849018880LL && report.find("reserve")->as_int()==39925662948LL &&
+            !report.find("limits_consistent")->as_bool() && report.find("observation_age_ns")->as_int()==12345,
+            "late fit reports intersected inputs and checked reserve on decline");
+        x.limits_consistent=true;
+        expect(fit_cache_late(x).reason=="insufficient-host-headroom","real commitment needs enough available capacity");
+        x.L=80000000000ULL;x.A=48849018880ULL;
+        expect(fit_cache_late(x).budget!=0,"real commitment fits when post-residency capacity suffices");
+        x.F=UINT64_MAX;
+        expect(!cache_fit_reserve(x),"report reserve overflow stays unknown");
+        Options explicit_path;
+        expect(!cache_activation_json(explicit_path).find("U"),"explicit report has no new observation fields");
+    }
+    {
+        // Caller accounting seam: native/shared setup moves from F to observed L.
+        const std::uint64_t native=16*gib_bytes, transient=gib_bytes;
+        CacheLateFit fit;fit.U=128*gib_bytes;fit.L=96*gib_bytes;fit.A=32*gib_bytes;
+        fit.F=cache_unpaid_commitment(false,native+transient,transient);
+        fit.E=fit.S=0;fit.device_unpaid=0;fit.device_free=32*gib_bytes;
+        fit.checkpoint=gib_bytes;fit.observation_id=1;fit.limits_consistent=fit.aliasing_known=true;
+        const auto fitted=fit_cache_late(fit).budget;
+        expect(fitted!=0,"CLI initial accounting fits");
+        fit.explicit_budget=fitted;fit.L=*fit.L+native;fit.A=*fit.A-native;
+        fit.F=cache_unpaid_commitment(true,native+transient,transient);
+        expect(fit.F==transient && fit_cache_late(fit).budget==fitted,
+            "CLI ready sample preserves fitted cap after native setup becomes resident");
+        fit.F=native+transient;
+        expect(!fit_cache_late(fit).budget,"duplicated native commitment reproduces false readiness decline");
+        expect(!cache_unpaid_commitment(true,native+transient,{}),"unknown ready inventory stays unknown");
+    }
+    {
+        const auto& row=automatic_prefix_auto_route_qualifications[0];
+        expect(row.identity.complete(),"single candidate binds every identity field");
+        const auto match=[&](const CacheFamilyIdentity& id) {
+            return row.matches(CacheRunner::single_mtp,1,16384,2048,id);
+        };
+        expect(match(row.identity),"single family exact identity matches");
+        const auto mismatch=[&](const CacheFamilyIdentity& id) { expect(!match(id),"changed identity cannot match single family"); };
+        { auto id=row.identity; id.model+="-mismatch"; mismatch(id); }
+        { auto id=row.identity; id.layout+="-mismatch"; mismatch(id); }
+        { auto id=row.identity; id.tokenizer+="-mismatch"; mismatch(id); }
+        { auto id=row.identity; id.sidecar+="-mismatch"; mismatch(id); }
+        { auto id=row.identity; id.golden+="-mismatch"; mismatch(id); }
+        { auto id=row.identity; id.replay+="-mismatch"; mismatch(id); }
+        { auto id=row.identity; id.build_family+="-mismatch"; mismatch(id); }
+        { auto id=row.identity; id.gfx+="-mismatch"; mismatch(id); }
+        { auto id=row.identity; id.numerical_contract+="-mismatch"; mismatch(id); }
+        { auto id=row.identity; id.kv_precision+="-mismatch"; mismatch(id); }
+        { auto id=row.identity; id.recurrent_precision+="-mismatch"; mismatch(id); }
+        { auto id=row.identity; id.prefill_profile+="-mismatch"; mismatch(id); }
+        { auto id=row.identity; id.decode_profile+="-mismatch"; mismatch(id); }
+        { auto id=row.identity; id.output_policy+="-mismatch"; mismatch(id); }
+        { auto id=row.identity; id.profile_pair+="-mismatch"; mismatch(id); }
+        { auto id=row.identity; id.tails.push_back(1); mismatch(id); }
+        { auto id=row.identity; ++id.scheduler.schedule; mismatch(id); }
+        { auto id=row.identity; ++id.scheduler.pipe; mismatch(id); }
+        { auto id=row.identity; ++id.scheduler.lookahead; mismatch(id); }
+        { auto id=row.identity; ++id.scheduler.short_rows; mismatch(id); }
+        { auto id=row.identity; ++id.scheduler.service_ms; mismatch(id); }
+        { auto id=row.identity; ++id.scheduler.prompt_share; mismatch(id); }
+        { auto id=row.identity; ++id.scheduler.nest_rows; mismatch(id); }
+        { auto id=row.identity; ++id.scheduler.interleave; mismatch(id); }
+        { auto id=row.identity; ++id.scheduler.group_rows; mismatch(id); }
+        { auto id=row.identity; id.scheduler.groups=!id.scheduler.groups; mismatch(id); }
+        { auto id=row.identity; id.scheduler.cohort=!id.scheduler.cohort; mismatch(id); }
+        { auto id=row.identity; id.scheduler.small=!id.scheduler.small; mismatch(id); }
+        { auto id=row.identity; id.scheduler.group_owner=!id.scheduler.group_owner; mismatch(id); }
+        { auto id=row.identity; id.scheduler.windows=!id.scheduler.windows; mismatch(id); }
+        { auto id=row.identity; id.scheduler.cancel=!id.scheduler.cancel; mismatch(id); }
+        { auto id=row.identity; id.scheduler.priming=!id.scheduler.priming; mismatch(id); }
+        { auto id=row.identity; id.scheduler.worker=!id.scheduler.worker; mismatch(id); }
+        { auto id=row.identity; id.scheduler.tiled_start=!id.scheduler.tiled_start; mismatch(id); }
+        { auto id=row.identity; id.scheduler.merge=!id.scheduler.merge; mismatch(id); }
+        { auto id=row.identity; id.scheduler.balance=!id.scheduler.balance; mismatch(id); }
+        { auto id=row.identity; id.scheduler.shared+="-mismatch"; mismatch(id); }
+        for(auto context:{1U,2048U,8192U,10400U,16384U})
+            expect(row.matches(CacheRunner::single_mtp,1,context,2048,row.identity),"candidate context interval");
+        for(auto context:{0U,16385U}) expect(!row.matches(CacheRunner::single_mtp,1,context,2048,row.identity),"context outside interval");
+        expect(!row.matches(CacheRunner::single_mtp,2,16384,2048,row.identity),"single runner has exactly N=1");
+        expect(!row.matches(CacheRunner::single_mtp,0,16384,2048,row.identity),"zero slots cannot match");
+        expect(!row.matches(CacheRunner::single_mtp,1,16384,8192,row.identity),"different tile declines");
+        for(auto runner:{CacheRunner::cli,CacheRunner::target,CacheRunner::batch_mtp})
+            expect(!row.matches(runner,1,16384,2048,row.identity),"batch N=1 and other runners cannot match single");
+        const auto candidate=[&](int http_batch=0) {
+            Options o; o.http_serve=true; o.http_batch=http_batch; o.mtp.enabled=true;
+            o.context_tokens=16384; o.known_prefix_prefill_rows=2048;
+            o.mtp.enabled=true;
+            o.mtp.metadata_only=false;
+            o.mtp.draft_chain=true;
+            o.mtp.draft_exact=false;
+            o.mtp.draft_q4=true;
+            o.mtp.draft_context_vocab=4096;
+            o.mtp.candidate_depth=7;
+            o.mtp.window_rows=8;
+            o.mtp.spec_min_p=0.7;
+            o.mtp.window_prefix=true;
+            o.mtp.window_expert_union=true;
+            o.mtp.window_hyper_mix=true;
+            o.mtp.window_qsa_rows=true;
+            o.mtp.window_arena_bytes=2147483648ULL;
+            o.mtp.window_capture_bytes=67108864;
+            o.mtp.window_checkpoint_bytes=8589934592ULL;
+            o.mtp.window_total_bytes=17179869184ULL;
+            o.mtp.window_history_intervals=8192;
+            o.mtp.window_expert_union_bytes=65536;
+            o.mtp.calibration_rows=0;
+            o.mtp.policy_identity=1;
+            o.mtp.ngram_draft=false;
+            o.mtp.ngram_off=false;
+            o.mtp.ngram_context=false;
+            o.mtp.ngram_copy_edit=false;
+            o.mtp.ngram_wide_only=false;
+            o.mtp.sample_options=false;
+            o.mtp.sample_temperature=0;
+            o.mtp.sample_top_p=1;
+            o.mtp.sample_min_p=0;
+            o.mtp.sample_top_k=0;
+            o.mtp.sample_seed=0;
+            o.mtp.sample_speculation=true;
+            o.mtp.sample_timing_schedule=false;
+            o.mtp.sample_repeats=1;
+            o.mtp.max_hidden_error=0;
+            o.mtp.max_logit_error=0;
+            o.mtp.sidecar_bytes=2786568256ULL;
+            o.mtp.header_bytes=33554432;
+            o.mtp.sidecar_retained_bytes=3221225472ULL;
+            o.mtp.sidecar_setup_bytes=4294967296ULL;
+            o.mtp.golden_max_bytes=6442450944ULL;
+            o.mtp.replay_host_bytes=6442450944ULL;
+            o.mtp.runtime_bytes=134217728;
+            o.mtp.target_capture_bytes=268435456;
+            o.mtp.window_expert_union_bytes_explicit=true;
+            o.mtp.window_rows_set={2,4,8};o.mtp.draft_vocab="auto:ASSETS";o.mtp.sidecar_residency="register";
+
+            resolve_session_defaults(o,model,{},128*gib_bytes);resolve_prefix_defaults(o,model,{},128*gib_bytes);
+            finalize_cache_family(o,CacheRunner::single_mtp,1,row.identity);
+            return o;
+        };
+#ifndef _WIN32
+        {
+            const char* name="STRIX_PROMPT_STATE_DIGEST";
+            const char* old=std::getenv(name);
+            const std::optional<std::string> saved=old?std::optional<std::string>(old):std::nullopt;
+            ::unsetenv(name);
+            auto o=candidate();
+            const auto cli=cache_family_execution_cli(o);
+            const auto off=cache_family_execution_signature(cli,false,false);
+            const auto storage=session_numerical_config(cli);
+            expect(o.cache_activation->automatic_qualified==row.qualified(),"unset observer retains production admission");
+            ::setenv(name,"1",1);
+            const auto on=cache_family_execution_signature(cli,false,false);
+            expect(on!=off && session_numerical_config(cli)!=storage,"prompt observer changes family and storage identity");
+            auto identity=row.identity;
+            identity.numerical_contract=model_content_identity_hex(on);
+            finalize_cache_family(o,CacheRunner::single_mtp,1,identity);
+            expect(!o.cache_activation->automatic_qualified && o.cache_activation->reason=="family-unqualified",
+                "prompt observer declines production family by name");
+            ::unsetenv(name);
+            expect(cache_family_execution_signature(cli,false,false)==off,"unset production identity is stable");
+            if(saved) ::setenv(name,saved->c_str(),1);else ::unsetenv(name);
+        }
+#endif
+        {auto o=candidate();o.mtp.window_expert_union_bytes_explicit=false;
+            finalize_cache_family(o,CacheRunner::single_mtp,1,row.identity);
+            expect(o.cache_activation->reason=="mtp-contract-unqualified","resolved explicit union budget mode bound");}
+        for(const auto& [changed_name,unused_digest]:cache_mtp_vocabulary_digests) {
+            (void)unused_digest;
+            const auto hash=[&](const std::filesystem::path& file) {
+                for(const auto& [name,digest]:cache_mtp_vocabulary_digests)
+                    if(file.filename()==name) return std::string(name==changed_name?"changed":digest);
+                return std::string{};
+            };
+            expect(!cache_mtp_vocabulary_qualified(candidate(),hash),"every auto vocabulary content mutation declines");
+        }
+        expect(cache_mtp_vocabulary_qualified(candidate(),[](const std::filesystem::path& file) {
+            for(const auto& [name,digest]:cache_mtp_vocabulary_digests) if(file.filename()==name) return std::string(digest);
+            return std::string{};
+        }),"bound vocabulary content admitted independently of path");
+        expect(!cache_mtp_vocabulary_qualified(candidate()),"missing vocabulary assets decline");
+        expect(cache_mtp_contract_qualified(candidate()),"bound production MTP contract admitted");
+        if(!row.cost_qualified) expect(candidate().cache_activation->reason=="cost-unqualified",
+            "matched held row names the independent cost gate");
+        const auto reject_mtp=[&](Options o) {
+            finalize_cache_family(o,CacheRunner::single_mtp,1,row.identity);
+            expect(!o.cache_activation->automatic_qualified && o.cache_activation->reason=="mtp-contract-unqualified",
+                "resolved MTP mutation declines by name");
+        };
+        {auto o=candidate();o.mtp.enabled=!o.mtp.enabled;reject_mtp(o);}
+        {auto o=candidate();o.mtp.metadata_only=!o.mtp.metadata_only;reject_mtp(o);}
+        {auto o=candidate();o.mtp.draft_chain=!o.mtp.draft_chain;reject_mtp(o);}
+        {auto o=candidate();o.mtp.draft_exact=!o.mtp.draft_exact;reject_mtp(o);}
+        {auto o=candidate();o.mtp.draft_q4=!o.mtp.draft_q4;reject_mtp(o);}
+        {auto o=candidate();o.mtp.draft_context_vocab=o.mtp.draft_context_vocab+1;reject_mtp(o);}
+        {auto o=candidate();o.mtp.candidate_depth=o.mtp.candidate_depth+1;reject_mtp(o);}
+        {auto o=candidate();o.mtp.window_rows=o.mtp.window_rows+1;reject_mtp(o);}
+        {auto o=candidate();o.mtp.spec_min_p=o.mtp.spec_min_p+1;reject_mtp(o);}
+        {auto o=candidate();o.mtp.window_prefix=!o.mtp.window_prefix;reject_mtp(o);}
+        {auto o=candidate();o.mtp.window_expert_union=!o.mtp.window_expert_union;reject_mtp(o);}
+        {auto o=candidate();o.mtp.window_hyper_mix=!o.mtp.window_hyper_mix;reject_mtp(o);}
+        {auto o=candidate();o.mtp.window_qsa_rows=!o.mtp.window_qsa_rows;reject_mtp(o);}
+        {auto o=candidate();o.mtp.window_arena_bytes=o.mtp.window_arena_bytes+1;reject_mtp(o);}
+        {auto o=candidate();o.mtp.window_capture_bytes=o.mtp.window_capture_bytes+1;reject_mtp(o);}
+        {auto o=candidate();o.mtp.window_checkpoint_bytes=o.mtp.window_checkpoint_bytes+1;reject_mtp(o);}
+        {auto o=candidate();o.mtp.window_total_bytes=o.mtp.window_total_bytes+1;reject_mtp(o);}
+        {auto o=candidate();o.mtp.window_history_intervals=o.mtp.window_history_intervals+1;reject_mtp(o);}
+        {auto o=candidate();o.mtp.window_expert_union_bytes=o.mtp.window_expert_union_bytes+1;reject_mtp(o);}
+        {auto o=candidate();o.mtp.calibration_rows=o.mtp.calibration_rows+1;reject_mtp(o);}
+        {auto o=candidate();o.mtp.policy_identity=o.mtp.policy_identity+1;reject_mtp(o);}
+        {auto o=candidate();o.mtp.ngram_draft=!o.mtp.ngram_draft;reject_mtp(o);}
+        {auto o=candidate();o.mtp.ngram_off=!o.mtp.ngram_off;reject_mtp(o);}
+        {auto o=candidate();o.mtp.ngram_context=!o.mtp.ngram_context;reject_mtp(o);}
+        {auto o=candidate();o.mtp.ngram_copy_edit=!o.mtp.ngram_copy_edit;reject_mtp(o);}
+        {auto o=candidate();o.mtp.ngram_wide_only=!o.mtp.ngram_wide_only;reject_mtp(o);}
+        {auto o=candidate();o.mtp.sample_options=!o.mtp.sample_options;reject_mtp(o);}
+        {auto o=candidate();o.mtp.sample_temperature=o.mtp.sample_temperature+1;reject_mtp(o);}
+        {auto o=candidate();o.mtp.sample_top_p=o.mtp.sample_top_p+1;reject_mtp(o);}
+        {auto o=candidate();o.mtp.sample_min_p=o.mtp.sample_min_p+1;reject_mtp(o);}
+        {auto o=candidate();o.mtp.sample_top_k=o.mtp.sample_top_k+1;reject_mtp(o);}
+        {auto o=candidate();o.mtp.sample_seed=o.mtp.sample_seed+1;reject_mtp(o);}
+        {auto o=candidate();o.mtp.sample_speculation=!o.mtp.sample_speculation;reject_mtp(o);}
+        {auto o=candidate();o.mtp.sample_timing_schedule=!o.mtp.sample_timing_schedule;reject_mtp(o);}
+        {auto o=candidate();o.mtp.sample_repeats=o.mtp.sample_repeats+1;reject_mtp(o);}
+        {auto o=candidate();o.mtp.max_hidden_error=o.mtp.max_hidden_error+1;reject_mtp(o);}
+        {auto o=candidate();o.mtp.max_logit_error=o.mtp.max_logit_error+1;reject_mtp(o);}
+        {auto o=candidate();o.mtp.sidecar_bytes=o.mtp.sidecar_bytes+1;reject_mtp(o);}
+        {auto o=candidate();o.mtp.header_bytes=o.mtp.header_bytes+1;reject_mtp(o);}
+        {auto o=candidate();o.mtp.sidecar_retained_bytes=o.mtp.sidecar_retained_bytes+1;reject_mtp(o);}
+        {auto o=candidate();o.mtp.sidecar_setup_bytes=o.mtp.sidecar_setup_bytes+1;reject_mtp(o);}
+        {auto o=candidate();o.mtp.golden_max_bytes=o.mtp.golden_max_bytes+1;reject_mtp(o);}
+        {auto o=candidate();o.mtp.replay_host_bytes=o.mtp.replay_host_bytes+1;reject_mtp(o);}
+        {auto o=candidate();o.mtp.runtime_bytes=o.mtp.runtime_bytes+1;reject_mtp(o);}
+        {auto o=candidate();o.mtp.target_capture_bytes=o.mtp.target_capture_bytes+1;reject_mtp(o);}
+        {auto o=candidate();o.mtp.window_rows_set={2,4};reject_mtp(o);}
+        {auto o=candidate();o.mtp.copy_wide_rows={16};reject_mtp(o);}
+        {auto o=candidate();o.mtp.draft_vocab="other.bin";reject_mtp(o);}
+        {auto o=candidate();o.mtp.draft_profile="base";reject_mtp(o);}
+        {auto o=candidate();o.mtp.cohort_mode="sequential";reject_mtp(o);}
+        {auto o=candidate();o.mtp.cohort.push_back({});reject_mtp(o);}
+        {auto o=candidate();o.mtp.golden_dump="dump";reject_mtp(o);}
+        {auto o=candidate();o.mtp.sidecar_residency="copy";reject_mtp(o);}
+        {auto o=candidate();o.rtx_state_import=true;reject_mtp(o);}
+        {auto o=candidate();o.rtx_state_import_decode_threads=0;reject_mtp(o);}
+        CacheLateFit fit;fit.U=128*gib_bytes;fit.L=64*gib_bytes;fit.A=64*gib_bytes;
+        fit.F=gib_bytes;fit.E=16U<<20;fit.S=128U<<20;fit.checkpoint=gib_bytes;
+        fit.device_unpaid=gib_bytes;fit.device_free=64*gib_bytes;fit.observation_id=1;
+        fit.limits_consistent=fit.aliasing_known=true;fit.context_off=fit.context=16384;fit.slots_off=fit.slots=1;
+        for(int requested_batch:{0,-1}) {
+            auto o=candidate(requested_batch);
+            expect(!o.cache_activation->prefix && !o.prefix_cache_host_bytes,"identity match alone does not activate storage");
+            expect(apply_automatic_cache_fit(o,fit)==row.qualified(),"explicit single and auto fallback activate only after fit");
+            expect(o.cache_activation->prefix==row.qualified() && !o.cache_activation->session && !o.cache_activation->cert_effective,
+                "single prefix admission never activates session or batch cert");
+        }
+        if(row.qualified()) {
+            const auto decline=[&](CacheLateFit x,const char* reason) {
+                auto o=candidate();expect(!apply_automatic_cache_fit(o,x) && !o.cache_activation->prefix && !o.prefix_cache_host_bytes &&
+                    o.cache_activation->reason==reason,reason);
+            };
+            auto x=fit;x.observation_id=0;decline(x,"post-residency-memory-unavailable");
+            x=fit;x.age_ns=1000000001;decline(x,"memory-observation-stale");
+            x=fit;x.aliasing_known=false;decline(x,"owner-size-unknown");
+            x=fit;x.context--;decline(x,"would-reduce-context-or-slots");
+            x=fit;x.F=UINT64_MAX;decline(x,"memory-arithmetic-overflow");
+            x=fit;x.A=0;decline(x,"insufficient-host-headroom");
+            x=fit;x.device_free=0;decline(x,"staging-does-not-fit");
+            x=fit;x.checkpoint=5*gib_bytes;decline(x,"checkpoint-does-not-fit");
+        }
+        for(auto runner:{CacheRunner::cli,CacheRunner::target,CacheRunner::batch_mtp}) {
+            auto o=candidate();finalize_cache_family(o,runner,1,row.identity);
+            expect(!apply_automatic_cache_fit(o,fit),"no other runner admits even the exact single identity");
+        }
+        {
+            auto o=candidate();o.tokens={1};
+            expect(std::string_view(qsa_mtp_pool_decline(o))=="unqualified-route-requires-STRIX_QSA_MTP_POOL=1" &&
+                ple_reclaim_inactive_reason(o,HipModelResidencyPolicy{},false)=="http-serving" &&
+                !mtp_prompt_phase_separation(o),
+                "upstream QSA pool, rolling PLE and phase retirement exclude default HTTP");
+        }
+        for(const bool bundle_selected:{false,true}) {
+            auto o=candidate();o.rotary=validate_qwen_rotary_request(2,true,524288,false);
+            if(bundle_selected) {o.mtp_bundle_path="MODEL.gguf.mtp-bundle.json";o.yarn_decode_source=o.mtp_bundle_path;}
+            finalize_cache_family(o,CacheRunner::single_mtp,1,row.identity);
+            expect(!apply_automatic_cache_fit(o,fit) && o.cache_activation->reason=="rotary-cache-unqualified",
+                "explicit and bundle-selected YaRN decline even with a supplied native identity");
+        }
+        for(const auto& env: {Environment{{"STRIX_BASELINE","1"}},Environment{{"STRIX_QPF2K_DEFAULTS","0"}}}) {
+            Options o;o.http_serve=true;o.http_batch=0;o.mtp.enabled=true;
+            o.context_tokens=16384;o.known_prefix_prefill_rows=2048;
+            resolve_session_defaults(o,model,env,128*gib_bytes);resolve_prefix_defaults(o,model,env,128*gib_bytes);
+            finalize_cache_family(o,CacheRunner::single_mtp,1,row.identity);
+            expect(!apply_automatic_cache_fit(o,fit) && !o.cache_activation->prefix,"suppression defeats the bound family");
+        }
+        auto report=parse({"decoder","MODEL","1","--print-cache-family"});
+        expect(report.print_cache_family && !report.route_owned,"identity reporting does not own numerical routing");
+    }
+    for(const auto& registry:{std::span<const CacheQualification>(automatic_prefix_auto_route_qualifications),
+            std::span<const CacheQualification>(automatic_prefix_batch_cert_route_qualifications),
+            std::span<const CacheQualification>(automatic_session_route_qualifications)})
+        for(const auto& row:registry) {
+            if(&row==&automatic_prefix_auto_route_qualifications[0]) {
+                expect(row.gpu_qualified && row.resource_qualified,"single row retains equality and capacity qualification");
+                expect(row.qualified()==(row.gpu_qualified && row.cost_qualified && row.resource_qualified && !row.evidence_id.empty()),
+                    "all three independent row bits required");
+                auto held=row;held.cost_qualified=false;
+                expect(!held.qualified(),"equality and capacity cannot substitute for cost evidence");
+            } else expect(!row.gpu_qualified && !row.cost_qualified && !row.resource_qualified && !row.identity.complete(),"every other automatic family stays unqualified");
+        }
+    expect(parse({"decoder","MODEL","1","--prefix-cache-host-bytes","42","--prefix-cache","off"}).route_owned,
+        "explicit budget plus OFF retains public-main route ownership");
+    {
+        Options o;o.http_serve=true;o.http_batch=0;o.mtp.enabled=true;
+        o.known_prefix_window=o.known_prefix_full_rows=true;o.known_prefix_prefill_rows=2048;
+        const auto cli=cache_family_execution_cli(o);
+        auto operational=o;operational.http_port=32123;operational.http_bind="0.0.0.0";operational.http_model_id="another-label";
+        expect(cli==cache_family_execution_cli(operational),"family omits only operational listener fields");
+        const auto signature=[&](const Options& x) {return cache_family_execution_signature(cache_family_execution_cli(x),false,false);};
+        const auto original=signature(o);
+        auto numerical=o;numerical.prefill_numerical_profile=DecodeNumericalProfile::fast_prefill_f16wmma_v1;
+        expect(signature(numerical)!=original,"fast prefill remains a different family");
+#ifndef _WIN32
+        for(const char* name:{"STRIX_PROMPT_STATE_DIGEST","STRIX_PREFILL_LOGITS_DIGEST",
+                "STRIX_PREFIX_CACHE_DIGEST","STRIX_SERIAL_LOGITS_DIGEST","STRIX_FINAL_STATE_DIGEST",
+                "STRIX_QPF2K_SCHED","STRIX_UNKNOWN_NUMERICAL_CONTROL"}) {
+            const char* old=std::getenv(name);const std::optional<std::string> saved=old?std::optional<std::string>(old):std::nullopt;
+            ::unsetenv(name);
+            const auto family=session_family_numerical_config(cli);
+            const auto storage=session_numerical_config(cli);
+            ::setenv(name,"1",1);
+            const bool excluded=std::string_view(name)=="STRIX_PREFILL_LOGITS_DIGEST";
+            expect((family==session_family_numerical_config(cli))==excluded,"family filters only audited observers");
+            expect(storage!=session_numerical_config(cli),"storage namespace retains every diagnostic");
+            if(saved) ::setenv(name,saved->c_str(),1);else ::unsetenv(name);
+        }
+#endif
+    }
     std::cout << "qwen effective config: " << failures << " failures\n";
     return failures ? 1 : 0;
 }

@@ -4,6 +4,7 @@
 #include "strix/qsa_committed_pool.hpp"
 #include <iostream>
 #include "state_cache_stats.hpp"
+#include "qwen_cache_admission.hpp"
 #include "strix/decode_execution_options.hpp"
 #include "strix/known_prefill_limits.hpp"
 #include "strix/qpf2k_defaults.hpp"
@@ -242,6 +243,7 @@ struct Options {
     bool baseline = false;
     std::string suppressed_yarn_request;
     bool print_effective_config = false;
+    bool print_cache_family = false;
     strix::RotaryDescriptor rotary = strix::RotaryDescriptor::native();
     bool automatic_prefill = false;
     bool route_owned = false;
@@ -402,6 +404,10 @@ struct Options {
     // Block-boundary prefix state cache on the tiled known-prefix prefill (docs/engine/serving/prefix-state-cache.md).
     // A positive host budget enables it; everything else is optional.
     std::shared_ptr<StateCacheStatsMirror> state_cache_stats = std::make_shared<StateCacheStatsMirror>();
+    std::shared_ptr<CachePolicyActivation> cache_activation=std::make_shared<CachePolicyActivation>();
+    std::function<void()> cache_readiness_recheck;
+    // Automatic single-route admission, invoked with all ordinary owners resident.
+    std::function<void()> cache_attach_ready, cache_attach_rollback;
     unsigned prefix_batch_cert = 0; // 0 off, 1 strict L0, 2 capture-only, 3 unqualified L1 (capture only)
     bool prefix_cache = true;
     std::string prefix_cache_retention = "fair", prefix_cache_source = "off", prefix_cache_reason = "not-serving";
@@ -467,6 +473,65 @@ struct Options {
     // connection thread decodes too; created on the first encoded chunk).
     std::uint32_t rtx_state_import_decode_threads = 4;
 };
+
+// Qualification only: the bound production MTP command, independent of the
+// storage/certificate identity. Q4 weights derive from the pinned sidecar bytes;
+// auto vocabulary contents are checked separately before constructing FAMILY.
+inline bool cache_mtp_contract_qualified(const Options& o) {
+    const auto& m=o.mtp;
+    return m.enabled==true &&
+        m.metadata_only==false &&
+        m.draft_chain==true &&
+        m.draft_exact==false &&
+        m.draft_q4==true &&
+        m.draft_context_vocab==4096 &&
+        m.candidate_depth==7 &&
+        m.window_rows==8 &&
+        m.spec_min_p==0.7 &&
+        m.window_prefix==true &&
+        m.window_expert_union==true &&
+        m.window_hyper_mix==true &&
+        m.window_qsa_rows==true &&
+        m.window_arena_bytes==2147483648ULL &&
+        m.window_capture_bytes==67108864 &&
+        m.window_checkpoint_bytes==8589934592ULL &&
+        m.window_total_bytes==17179869184ULL &&
+        m.window_history_intervals==8192 &&
+        m.window_expert_union_bytes==65536 &&
+        m.window_expert_union_bytes_explicit &&
+        m.calibration_rows==0 &&
+        m.policy_identity==1 &&
+        m.ngram_draft==false &&
+        m.ngram_off==false &&
+        m.ngram_context==false &&
+        m.ngram_copy_edit==false &&
+        m.ngram_wide_only==false &&
+        m.sample_options==false &&
+        m.sample_temperature==0 &&
+        m.sample_top_p==1 &&
+        m.sample_min_p==0 &&
+        m.sample_top_k==0 &&
+        m.sample_seed==0 &&
+        m.sample_speculation==true &&
+        m.sample_timing_schedule==false &&
+        m.sample_repeats==1 &&
+        m.max_hidden_error==0 &&
+        m.max_logit_error==0 &&
+        m.sidecar_bytes==2786568256ULL &&
+        m.header_bytes==33554432 &&
+        m.sidecar_retained_bytes==3221225472ULL &&
+        m.sidecar_setup_bytes==4294967296ULL &&
+        m.golden_max_bytes==6442450944ULL &&
+        m.replay_host_bytes==6442450944ULL &&
+        m.runtime_bytes==134217728 &&
+        m.target_capture_bytes==268435456 &&
+        m.window_rows_set==std::vector<std::uint32_t>{2,4,8} &&
+        m.copy_wide_rows.empty() && m.cohort.empty() && m.cohort_mode.empty() &&
+        m.golden_dump.empty() && m.draft_profile.empty() && m.draft_vocab.starts_with("auto:") &&
+        m.draft_vocab.size()>5 && m.sidecar_residency=="register" &&
+        !o.rtx_state_import && o.rtx_state_import_decode_threads==4 &&
+        !std::getenv("STRIX_RTX_EXPORT_STATE");
+}
 
 // Prefix-cache requests may restore or replace the original prompt in this process.
 // Keep their public prompt-wide PLE path until rolling owners are rebuilt per prompt.
@@ -1552,6 +1617,19 @@ inline bool batch_prompt_small(const Options&) {
     return value && value[0] == '1';
 }
 // Cache controls own storage policy, never numerical routing or tail selection.
+inline unsigned prefix_batch_cert_execution_mode(const Options& o) {
+    return o.cache_activation->automatic_path ? o.cache_activation->cert_effective : o.prefix_batch_cert;
+}
+// Startup observer ownership is independent of storage admission and rollback.
+// Match the upstream tiled route, including plain CLI, and final-only diagnostics.
+inline bool cache_startup_observer_required(const Options& o, bool import_export, bool prompt_digest) {
+    return cache_observer_required(o.known_prefix_prefill_rows && o.known_prefix_window,
+        import_export, prompt_digest || std::getenv("STRIX_FINAL_STATE_DIGEST"));
+}
+inline bool automatic_cache_work(const Options& o) {
+    const auto& a=*o.cache_activation;
+    return a.automatic_path && a.automatic_qualified && a.prefix_requested && a.suppression.empty();
+}
 inline bool operational_session_option(std::string_view flag) {
     flag = flag.substr(0, flag.find('='));
     return flag == "--prefix-batch-cert" || flag == "--prefix-cache-staging-bytes" || flag == "--prefix-cache" || flag == "--prefix-cache-retention" || flag == "--session-cache" || flag == "--session-disk" || flag == "--session-dir" ||
@@ -1568,8 +1646,18 @@ inline void apply_prefix_cache_environment(Options& o, Lookup lookup) {
         if(v=="l1") return 3;
         throw std::invalid_argument("prefix batch certification requires 0|1|capture|l0|l1");
     };
+    bool cert_from_environment=false;
     if (!o.supplied_options.contains("--prefix-batch-cert"))
-        if(const auto v=lookup("STRIX_PREFIX_BATCH_CERT")) o.prefix_batch_cert=batch_mode(*v);
+        if(const auto v=lookup("STRIX_PREFIX_BATCH_CERT")) {
+            o.prefix_batch_cert=batch_mode(*v); cert_from_environment=true;
+        }
+    // Reporting retains the request before legacy baseline suppression. This
+    // parser is also reapplied during resolution after the raw mode was cleared.
+    if(!o.cache_activation->cert_policy_parsed || cert_from_environment) {
+        o.cache_activation=std::make_shared<CachePolicyActivation>(*o.cache_activation);
+        o.cache_activation->cert_requested=o.prefix_batch_cert;
+        o.cache_activation->cert_policy_parsed=true;
+    }
     if(o.baseline) o.prefix_batch_cert=0;
     if (!o.supplied_options.contains("--prefix-cache")) {
         if (const auto v = lookup("STRIX_PREFIX_CACHE")) {
@@ -1720,6 +1808,7 @@ inline Options parse_options(
             if (!input.eof() || options.tokens.empty()) throw std::invalid_argument("--prompt-ids invalid or empty text file");
             continue;
         }
+        if (argument == "--print-cache-family") { options.print_cache_family = true; continue; }
         if (argument == "--print-effective-config") { options.print_effective_config = true; continue; }
         if (argument == "--known-prefix-window=0" || argument == "--known-prefix-full-rows=0" ||
             argument == "--known-prefix-expert-union=0" || argument == "--known-window-router-rows=0" ||

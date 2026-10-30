@@ -7,21 +7,27 @@ Measured P prefill: **22.6 s**; save stall: **2.51 s**; write/fsync: **0.91 s**;
 restore: **1.04 s**; serial suffix: **6.5 s**; 64-output generation: **3.18 s**.
 These results qualify the r1b route. New r2 tiled/MTP/HTTP paths remain drafts pending a
 Linux/HIP build and native gates. CPU tests and declaration-only checks do not qualify
-native completeness or numerics. Existing prefix formats/defaults and the r1 gate are unchanged.
+native completeness or numerics. Existing prefix formats and the r1 gate are unchanged.
 
 ## Serving defaults
 
-Serving admission uses the `session_route_qualifications` table in
-`apps/qwen_effective_config.hpp`. **No HTTP or MTP serving route is GPU-qualified today**;
-all decline automatic admission with exactly one line:
-`session cache: off (route not yet GPU-qualified: <route>)`.
-The table contains serving routes only; its set of qualified routes is currently empty.
-CLI save/load are explicit commands, independent of `--session-cache on`. Default ON
-applies only to qualified serving routes; it does not enable a CLI cache. An explicit
-CLI cache switch declines with `session cache: off (cli-save-load-explicit)`.
-After a serving route passes its compiler, native execution, fidelity and complete-workload
-checks, its table entry is the single admission switch. An explicit `--session-cache on`
-still requires that qualification.
+Session storage is separate from the qualified default-on single-runner
+[prefix cache](prefix-state-cache.md). No automatic HTTP session family is qualified.
+The requested session policy defaults on, but effective management declines by name:
+ordinary single-MTP requests report `session-numerical-contract-unqualified`, and
+batch owners report `session-batch-owner-unqualified`. A declined configuration
+executes as with session caching off. An explicit `--session-cache on` does not
+bypass qualification or select fixed-MTP/tiled-suffix arithmetic.
+
+CLI save/load remain explicit commands, independent of serving cache policy.
+Session storage and its numerical protocols remain off unless explicitly requested
+under their existing qualification/diagnostic contracts. The qualified prefix family
+does not qualify sessions. Unnamed requests never capture session checkpoints.
+Startup `qwen cache policy`, `--print-effective-config` and `/v1/capabilities`
+expose requested/effective policy, source, reason and phase, including declines
+and OFF. `/v1/cache/stats` includes this policy only while storage is active;
+`session_requested`, `session_effective` and `session_reason` distinguish session
+admission. Inspection remains pending without allocations or disk probes.
 
 Qualification tools explicitly supply both `--session-mtp-fixed` and
 `--session-tiled-suffix` to exercise the draft protocol. This diagnostic access is separate

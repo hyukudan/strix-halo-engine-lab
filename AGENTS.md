@@ -49,6 +49,23 @@ restores R1. Exactness references must match that identity.
 
 Qwen HTTP serving: omitted `--http-batch` = as many slots as memory admits (startup line `http slots N (...)`, built on demand), `N` caps, `0` = one request at a time. In-block decode service, short-first, nested admission and boundary cancellation are on (`STRIX_BATCH_SERVICE_MS`, `STRIX_BATCH_SHORT_FIRST_ROWS`, `STRIX_BATCH_NEST_ROWS`, `STRIX_BATCH_CANCEL_POINTS`; `0` = off). Gates: `tests/batch_service_gpu_gate.py`, `tests/http_slots_gpu_gate.py` ([serving](docs/engine/serving/serving.md#scheduling-qualification)).
 
+Qwen certified prefix caching is ON by default only for single tiled-MTP HTTP (`--http-batch 0`
+or auto capacity resolving to the single runner), T=2048, default numerical profile/schedule/tails
+and model assets, context up to 16384. Gated outputs, raw logits and canonical state digests are
+bitwise identical to cache-off in the same binary/configuration. After native residency,
+`B = min(4 GiB, A/16, A - reserve)`, aligned down to 4 KiB; A is conservative available memory
+and reserve protects headroom, remaining OFF commitments, metadata and staging. Never reduce
+context, slots or lazy growth for caching. Startup `qwen cache policy`, `--print-effective-config`,
+`/v1/capabilities` report requested/effective/source/reason/phase, including declines/OFF;
+`/v1/cache/stats` includes policy only while storage is active. Inspection
+is pending without device work. Other automatic configurations decline by name and preserve
+cache-off execution. Batch routes, sessions, serial CLI, YaRN and other profiles remain
+unqualified for automatic reuse; preserve their explicit-only contracts and scheduler defaults.
+OFF controls: `--prefix-cache off`, `--prefix-batch-cert off`, `--session-cache off`.
+Explicit `--prefix-cache-host-bytes` keeps its existing behavior. Widening qualification requires
+complete token/logit/state equality, unchanged capacity, interleaved cold-cost/noise checks and
+useful warm reuse; a startup smoke does not establish these gates.
+
 Use each engine's built-in exactness gates and compare complete token IDs and logits/state digests.
 Qwen: profile-pair qualification and operator byte checks; DeepSeek pair: both-rank prefill/greedy/verify/batch
 and transport gates; RTX: replica canonical/pressure/plain-speculative chat gates; MiniMax: golden logits,

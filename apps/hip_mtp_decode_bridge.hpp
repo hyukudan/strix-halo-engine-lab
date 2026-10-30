@@ -409,7 +409,7 @@ public:
             if(submitter_.valid()) submitter_.wait();
             if(runtime_.prime_hidden_rows_pending()) (void)hipStreamSynchronize(static_cast<hipStream_t>(runtime_.resources().stream()));
         }
-        if(capture_ && !capture_->committed) capture_->cancelled=true;
+        if(capture_ && !capture_->committed) capture_->cancel_target();
         if(hidden_allocation_)(void)hipFree(hidden_allocation_);
     }
     TiledMtpPrompt(const TiledMtpPrompt&)=delete;
@@ -620,6 +620,13 @@ public:
         if(pos_){views.push_back(view(held_));next.push_back(tokens_[static_cast<std::size_t>(pos_)]);}
         for(std::uint32_t r=0;r+1U<rows;++r){views.push_back(view(block_hidden_+static_cast<std::size_t>(r)*width_));
             next.push_back(tokens_[static_cast<std::size_t>(pos_+r+1U)]);}
+        const bool split_capture=(block.capture || tiled_.cache_tails) && tiled_.cache && tiled_.cache->pooled_capture();
+        if(split_capture) {
+            const auto stream=static_cast<hipStream_t>(runtime_.resources().stream());
+            capture_=tiled_.cache->try_prepare_target_capture(session_,tokens_,block.owner->producer_stream(),
+                !block.owner->completion_pending(),capture_order(block,grouped,stream),n_-1U,
+                block.owner->producer_lifetime(),runtime_.resources().shared_from_this(),batch_?this:nullptr);
+        }
         runtime_.prime_hidden_rows(qualified_,activated_,views,next,producer_rotary_);
         check(hipMemcpy(held_,block_hidden_+static_cast<std::size_t>(rows-1U)*width_,static_cast<std::size_t>(width_),hipMemcpyDeviceToDevice),
             "tiled MTP held copy");
@@ -628,7 +635,15 @@ public:
             runtime_.next_source_position()+1U==pos_;
         if((block.capture || tiled_.cache_tails) && tiled_.cache) {
             if(legacy_cache()) tiled_.cache->after_block(session_,tokens_,n_-1U);
-            else if(complete) {
+            else if(split_capture) {
+                if(capture_) {
+                    const auto stream=static_cast<hipStream_t>(runtime_.resources().stream());
+                    const bool valid=tiled_.cache->complete_target_capture(capture_,session_,complete,stream);
+                    capture_->commit(valid);
+                    PrefixAsyncCapture::reap();
+                    capture_.reset();
+                }
+            } else if(complete) {
                 const auto stream=static_cast<hipStream_t>(runtime_.resources().stream());
                 capture_=tiled_.cache->try_prepare_capture(session_,tokens_,block.owner->producer_stream(),true,capture_order(block,grouped,stream),n_-1U,
                     block.owner->producer_lifetime(),runtime_.resources().shared_from_this(),batch_?this:nullptr);
@@ -1190,6 +1205,8 @@ public:
     [[nodiscard]] bool has_free_slot() const noexcept { return active() < slots_.size(); }
     [[nodiscard]] bool interleaved() const noexcept { return interleave_; }
     [[nodiscard]] static bool prompt_batching() noexcept { return prompt_batch_enabled(); }
+    [[nodiscard]] static std::uint32_t prompt_group_rows() { return prompt_batch_rows(); }
+    [[nodiscard]] static bool prompt_window_cohort() { return prompt_window_cohort_enabled(); }
     [[nodiscard]] std::size_t prefilling() const noexcept {
         return static_cast<std::size_t>(std::count_if(slots_.begin(), slots_.end(), [](const auto& s) { return s->prefilling; }));
     }
@@ -1219,9 +1236,9 @@ public:
 private:
     BatchCertContext batch_cert_context(const Slot& s) const {
         BatchCertContext result;
-        result.enabled=options_.prefix_batch_cert && !options_.baseline;
+        result.enabled=prefix_batch_cert_execution_mode(options_) && !options_.baseline;
         if(!result.enabled) return result;
-        result.allow_restore=options_.prefix_batch_cert==1 && !service_mode_;
+        result.allow_restore=prefix_batch_cert_execution_mode(options_)==1 && !service_mode_;
         auto& c=result.config;
         c.groups=prompt_batch_enabled();c.group_rows=prompt_batch_rows();
         c.group_owner=bool(slots_.front()->parents->tiled.group);
@@ -1841,7 +1858,7 @@ private:
         s.draft_rows_begin=s.runtime->execution_stats().full_forward_rows;
         s.pending.begin_step_logits_digest();
         s.result.generated_tokens = 1;
-        if(options_.prefix_batch_cert && !s.request.constraint && prompt_terminal_digest_enabled()) {
+        if(prefix_batch_cert_execution_mode(options_) && !s.request.constraint && prompt_terminal_digest_enabled()) {
             s.output_chain.append(s.pending.terminal_logits_digest());
             if(diagnostic_failed(s)) return;
         }
@@ -1855,7 +1872,7 @@ private:
             if(!result.emitted_tokens.empty())s.request.on_tokens(result.emitted_tokens);
             constraint_failed(s,serve::ConstraintError(*result.selection_failure));return;
         }
-        if(options_.prefix_batch_cert && !s.request.constraint && prompt_terminal_digest_enabled()) {
+        if(prefix_batch_cert_execution_mode(options_) && !s.request.constraint && prompt_terminal_digest_enabled()) {
             if(result.output_logits_digests.size()!=result.emitted_tokens.size())
                 s.output_chain.fail("request final incomplete output logits coverage");
             for(const auto& row:result.output_logits_digests) s.output_chain.append(row);
@@ -1898,12 +1915,12 @@ private:
             if(s.window && s.window->pending_window()) s.window->flush_pending_window();
             check_service(hipDeviceSynchronize(),"complete final committed state digest");
             s.result.final_state_position=s.session->next_position;
-            s.result.final_state_digest=model_content_identity_hex((options_.prefix_batch_cert?s.parents->tiled.cache->state_digest(s.session->next_position,s.runtime->next_source_position()):
+            s.result.final_state_digest=model_content_identity_hex((prefix_batch_cert_execution_mode(options_)?s.parents->tiled.cache->state_digest(s.session->next_position,s.runtime->next_source_position()):
                 s.parents->tiled.cache->state_digest(s.session->next_position)));
             static const bool components=[] {const char* v=std::getenv("STRIX_PREFIX_CACHE_DIGEST_COMPONENTS");return v&&v[0]=='1';}();
             if(components) s.result.final_state_components=s.parents->tiled.cache->component_digests(s.session->next_position);
         }
-        if(state_digest && options_.prefix_batch_cert && !s.request.constraint) {
+        if(state_digest && prefix_batch_cert_execution_mode(options_) && !s.request.constraint) {
             s.output_chain.complete(s.result.generated_tokens);
             if(!s.parents->tiled.cache) s.output_chain.fail("request final missing diagnostic state");
             if(diagnostic_failed(s)) return;
@@ -1952,7 +1969,7 @@ private:
         s.output_chain={};
         s.pending = {};
         ++stats_.finished;
-        if(options_.prefix_batch_cert && !options_.baseline) PrefixAsyncCapture::reap();
+        if(prefix_batch_cert_execution_mode(options_) && !options_.baseline) PrefixAsyncCapture::reap();
         if (publish_session_stats) publish_session_stats();
         else if (s.parents->tiled.cache && s.parents->tiled.cache->has_store()) options_.state_cache_stats->publish(prefix_snapshot(s.parents->tiled.cache->store()));
         if (s.request.on_finish) s.request.on_finish(s.result);
@@ -2015,7 +2032,9 @@ inline void run_mtp_decode_bridge(const Options& options,const ModelContract& mo
             try {PrefixAsyncCapture::shutdown();} catch(...) {std::terminate();}
         }
     } capture_shutdown;
-    set_prefix_batch_certification_enabled(options.prefix_batch_cert && !options.baseline);
+    if(options.cache_activation->automatic_path)
+        options.cache_activation->certification_transition=[](bool enabled) { set_prefix_batch_certification_enabled(enabled); };
+    set_prefix_batch_certification_enabled(prefix_batch_cert_execution_mode(options) && !options.baseline);
     validate_resolved_mtp_cli(options);
     if(!options.mtp.enabled || !parents || session.next_position || session.committed_tokens ||
        session.health!=SerialSessionHealth::ready || session.execution_identity!=compiled.execution_identity)
@@ -2177,6 +2196,7 @@ inline void run_mtp_decode_bridge(const Options& options,const ModelContract& mo
     };
     if(!separated_prompt) allocate_window();
     if(parents->resources.qsa_committed_pool) native->attach_qsa_pool(parents->resources.qsa_committed_pool);
+    if(!options.http_serve && options.cache_readiness_recheck) options.cache_readiness_recheck();
     assets->validate_assets_unchanged();
     std::vector<HipMtpReplayRow> replay_rows;replay_rows.reserve(golden.rows.size());
     std::vector<std::uint32_t> generated;generated.reserve(static_cast<std::size_t>(options.generate_tokens));
@@ -2347,24 +2367,32 @@ inline void run_mtp_decode_bridge(const Options& options,const ModelContract& mo
             // gains everything that changes them (cache rows use the draft kernels when the draft chain
             // is not exact). Every slot of a batched run extends its own view identically.
             const auto predictor_profile_identity=runtime->numerical_profile_identity();
-            const auto extend_cache=[&](HipPrefixStateCacheSession& cache,const HipMtpResources& predictor,std::byte* held) {
+            const auto extend_cache=[&](HipPrefixStateCacheSession& cache,const HipMtpResources& predictor,std::byte* held,
+                std::function<void(std::uint64_t)> restore={}) {
                 const auto pool=predictor.qsa_pool();
                 if(pool) cache.set_before_restore_hook([pool] {pool->invalidate(false,0);pool->invalidate(true,0);});
                 const auto kv=predictor.view(HipMtpBuffer::kv),index=predictor.view(HipMtpBuffer::raw_index);
-                cache.add_rows(kv.address,mtp_cli_mul(mtp_cli_mul(model.kv_heads,model.head_dim),4U),1U,"mtp.kv");
-                cache.add_rows(index.address,mtp_cli_mul(model.indexer_head_dim,2U),1U,"mtp.index");
-                cache.add_fixed_device(reinterpret_cast<std::uintptr_t>(held),width*2U,"mtp.held");
-                std::vector<std::byte> frame;
-                const auto u64=[&](std::uint64_t v){for(unsigned b=0;b<64;b+=8)frame.push_back(static_cast<std::byte>((v>>b)&255U));};
-                for(const auto byte:assets->shared_target().sidecar_model_content_identity.bytes)frame.push_back(static_cast<std::byte>(byte));
-                u64(assets->compiled().plan_identity);u64(predictor_profile_identity);
-                u64(m.draft_chain);u64(m.draft_exact);u64(m.draft_q4);
-                const char* q4_all=std::getenv("STRIX_MTP_DRAFT_Q4_ALL");u64(!q4_all || q4_all[0]!='0');
-                cache.extend_identity(sha256_bytes(frame));
+                bind_mtp_prefix_cache(cache,kv.address,mtp_cli_mul(mtp_cli_mul(model.kv_heads,model.head_dim),4U),
+                    index.address,mtp_cli_mul(model.indexer_head_dim,2U),reinterpret_cast<std::uintptr_t>(held),width*2U,
+                    assets->shared_target().sidecar_model_content_identity,assets->compiled().plan_identity,
+                    predictor_profile_identity,m.draft_chain,m.draft_exact,m.draft_q4,std::move(restore));
+                if(options.cache_activation->automatic_path && options.cache_activation->source=="auto" &&
+                    options.cache_activation->prefix && options.cache_activation->decision_phase=="post-residency-ready") {
+                    const auto setup_start=std::chrono::steady_clock::now();
+                    try {
+                        options.cache_activation->pool_setup_ms=cache.attach_capture_pool(true);
+                    } catch(...) {
+                        options.cache_activation->pool_setup_ms=std::chrono::duration<double,std::milli>(
+                            std::chrono::steady_clock::now()-setup_start).count();
+                        options.cache_activation->reason="capture-pool-allocation-failed";
+                        throw;
+                    }
+                }
             };
+            const auto bind_cache=[&] {
             if(parents->tiled.cache) {
-                extend_cache(*parents->tiled.cache,*native,tiled_held);
-                parents->tiled.cache->set_restore_hook([&](std::uint64_t position){runtime->restore_cache_frontier(qualified,activated,position-1U);});
+                extend_cache(*parents->tiled.cache,*native,tiled_held,
+                    [&](std::uint64_t position){runtime->restore_cache_frontier(qualified,activated,position-1U);});
                 // --rtx-state-import / STRIX_RTX_EXPORT_STATE: what a state at position p must carry besides its bytes.
                 // Every prompt row (tiled or serial) runs each step of the serial plan once, and each step's writes
                 // advance the generation of every flag it writes: generation f = base + p * (steps writing f).
@@ -2381,6 +2409,20 @@ inline void run_mtp_decode_bridge(const Options& options,const ModelContract& mo
                 }
             } else if(parents->tiled.rtx_import)
                 throw std::invalid_argument("--rtx-state-import needs the state component registry of the tiled MTP prompt");
+            };
+            // Required diagnostic/import observers must reach exactly the OFF binding
+            // before the optional transaction. Required setup failures propagate.
+            bind_cache();
+            const auto* off_cache=parents->tiled.cache;
+            if(options.cache_attach_ready)
+                finalize_cache_attachment(options.cache_attach_ready,[&] {
+                    if(parents->tiled.cache!=off_cache) bind_cache();
+                },options.cache_attach_rollback,[&] {
+                    // Binding can attach retained payload/staging resources. Publish
+                    // their finalized commitment before exposing the serving runner.
+                    if(parents->tiled.cache && parents->tiled.cache->has_store())
+                        options.state_cache_stats->publish(prefix_snapshot(parents->tiled.cache->store()));
+                });
 
             std::uint64_t served=0;
                 const MtpServeRunner ordinary_request=[&](const MtpServeRequest& q) {
@@ -2562,7 +2604,7 @@ inline void run_mtp_decode_bridge(const Options& options,const ModelContract& mo
                         std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-slot_begin).count());
                     return slot;
                 };
-                if (!named_run || options.prefix_batch_cert) install_restore(*slots.front());
+                if (!named_run || prefix_batch_cert_execution_mode(options)) install_restore(*slots.front());
                 for(const auto& setup:parents->batch_slots) slots.push_back(prepare_slot(setup, slots.size()));
                 pending={};
                 if (!named_run) runtime.reset();
@@ -2613,7 +2655,7 @@ inline void run_mtp_decode_bridge(const Options& options,const ModelContract& mo
                     <<",\"prompt_groups\":"<<st.prompt_groups<<",\"prompt_window_cohorts\":"<<st.prompt_window_cohorts
                     <<",\"prompt_window_members\":"<<st.prompt_window_members<<","<<batch_service_receipt(st)
                     <<",\"calibration_rows\":"<<calibration_rows<<",\"calibration_ms\":"<<calibration_ms;
-                if(options.prefix_batch_cert && !options.baseline && parents->tiled.cache && parents->tiled.cache->has_store()) {
+                if(prefix_batch_cert_execution_mode(options) && !options.baseline && parents->tiled.cache && parents->tiled.cache->has_store()) {
                     PrefixAsyncCapture::reap();
                     const auto counters=parents->tiled.cache->store().counters();
                     output<<",\"snapshot_preparations\":"<<counters.snapshot_preparations
@@ -2928,7 +2970,7 @@ inline void run_mtp_decode_bridge(const Options& options,const ModelContract& mo
                 assets->validate_assets_unchanged();
                 output<<"{\"mode\":\"native-mtp-http-serve\",\"served_requests\":"<<served
                     <<",\"calibration_rows\":"<<calibration_rows<<",\"calibration_ms\":"<<calibration_ms;
-                if(options.prefix_batch_cert && !options.baseline && parents->tiled.cache && parents->tiled.cache->has_store()) {
+                if(prefix_batch_cert_execution_mode(options) && !options.baseline && parents->tiled.cache && parents->tiled.cache->has_store()) {
                     PrefixAsyncCapture::reap();
                     const auto counters=parents->tiled.cache->store().counters();
                     output<<",\"snapshot_preparations\":"<<counters.snapshot_preparations

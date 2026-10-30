@@ -1,10 +1,22 @@
 # Prefix state cache
 
 Agent requests resend long, mostly identical prompts: a system prompt, tool schemas and the
-conversation so far. `--prefix-cache-host-bytes N` keeps the complete model state at block
-boundaries of the tiled prefill, and a later request whose prompt starts with a cached prefix
-restores that state and prefills only the rest. The exactness contract is bitwise equality with prefilling the whole prompt under the same
-configuration. The new certified MTP path still awaits native qualification.
+conversation so far. The certified prefix cache is ON by default for the qualified single
+tiled-MTP HTTP family: T=2048, default numerical profile, schedule, tails and model assets,
+and context up to 16384. This covers `--http-batch 0` and automatic capacity resolving to
+the actual single runner; an explicit batch runner with one slot is a batch family.
+Admission requires all three row bits: GPU equality, resource/capacity and cost
+qualification. The MTP contract is restricted to the bound production draft Q4
+arithmetic, pinned auto vocabulary bytes, context vocabulary 4096, prefix verifier
+rows 2/4/8, draft minimum probability 0.7 and default n-gram mode. Changed draft
+arithmetic, vocabulary, verifier geometry, copy modes or state-transfer modes
+refuse automatic reuse with `mtp-contract-unqualified`.
+A later request whose prompt starts with a certified cached prefix restores the complete
+model state at a tiled boundary and prefills only the rest. On this qualified family,
+complete generated token IDs, raw logits and canonical state digests are bitwise identical
+to cache-off execution under the same configuration, as required by the qualification gates.
+Other automatic configurations decline with a named reason and execute exactly as with
+the cache off. Explicit `--prefix-cache-host-bytes N` retains its existing behavior.
 
 It runs on the tiled known-prefix prefill
 (`--known-prefix-window --known-prefix-full-rows --known-prefix-prefill-rows T`), with serial
@@ -95,7 +107,8 @@ without a minimum percentage threshold.
 
 | Option | Meaning |
 |---|---|
-| `--prefix-cache-host-bytes N` | Explicit byte budget of the host tier (pinned host memory). |
+| `--prefix-cache on\|off` | Requested policy defaults on; `off` disables prefix caching. Automatic admission is limited to the qualified family and late memory fit. |
+| `--prefix-cache-host-bytes N` | Explicit byte budget of the host tier (pinned host memory); existing behavior is unchanged. Not required for qualified automatic admission. |
 | `--prefix-cache-dir DIR` | Optional disk tier: checkpoints are written behind the request and found by later processes. |
 | `--prefix-cache-disk-bytes N` | Optional disk budget (oldest checkpoints are deleted first; 0 = unbounded). |
 | `--prefix-cache-every N` | Capture interval in tokens, a multiple of T (default: 4096 rounded up to a multiple of T). The last eligible block boundary is selected; incomplete or uncertified boundaries are skipped. Certified async boundaries use stable snapshots. |
@@ -262,15 +275,32 @@ and its actual stream handle must equal the snapshot producer stream. Tail,
 window, serial, group, handoff or unknown next owners skip the boundary; no producer
 wait is added to save it. Only under this same-stream condition do target snapshot
 reads precede the next block's writes by stream order. An incumbent partial block
-of that same T owner is also safe by stream order. Host history and metadata
-are copied at P. The existing MTP worker submission copies predictor rows and held
+of that same T owner is also safe by stream order.
+
+Automatic pooled capture on the admitted synchronous single-runner path splits
+submission at P. Target production is followed by the target snapshot on its
+producer stream, target-ready, then target D2H on the download stream. These
+target downloads are queued before the original predictor prime and held update.
+After that prime/update, metadata, host fixed state and the producer certificate
+are frozen and checked at the complete P/P-1 frontier. Predictor snapshots then
+follow on the predictor stream, with predictor-ready and predictor D2H on the
+same download stream. Target-only completion cannot publish a checkpoint.
+
+The explicit/legacy combined path retains per-capture resources: host history and
+metadata are copied at P, predictor submission follows priming and the incumbent
+held copy, and downloads begin after both snapshot-ready events.
+For both paths, the existing MTP worker submission copies predictor rows and held
 hidden after priming and the incumbent held copy, then records its ready event.
 The next predictor/held writer must use that same MTP stream. The next target block
 uses the spare tap buffer; the incumbent priming drain joins the worker and completes
 the MTP stream before tap reuse or a synchronous held write. Unknown predictor
 ordering also refuses capture. `capture_skips_cross_stream` counts these refusals
 before snapshot allocation/submission (no-store requests count only no-store skips).
-A side D2H stream waits on both ready events and reads only staging.
+One side D2H stream reads only staging. In the automatic split it waits on
+target-ready before target D2H, then predictor-ready before predictor D2H; in the
+combined path it waits on both ready events before either group's downloads.
+A single final done event covers both groups. Done plus CPU commit/cancellation
+handoff gates publication, resource retirement and reusable-slot admission.
 
 The normal priming drain validates the P-1 frontier and commits the descriptor.
 Service points query its D2H completion event; only committed, successfully completed
@@ -283,8 +313,10 @@ Snapshot copies, allocation and bookkeeping still have costs.
 
 `--prefix-cache-staging-bytes N` (`STRIX_PREFIX_CACHE_STAGING_BYTES`, CLI wins)
 bounds device staging. Zero, the default, uses one T-block of all registered rows
-plus the aligned fixed registry. Actual staging charges only missing row slices and
-fixed device bytes. Larger catch-up candidates are refused. Pinned destinations and
+plus the aligned fixed registry. Live staging bytes charge only missing row slices
+and fixed device bytes of an active descriptor. Automatic pooling separately retains the entire staging
+cap across requests, including when live staging bytes are zero. Larger catch-up
+candidates are refused. Pinned destinations and
 private row leases remain inside the existing host allocation ledger. Stats expose
 `staging_budget_bytes`, `staging_bytes`, `staging_peak_bytes`, `staging_cap_skips`,
 `capture_busy_skips`, and `row_prefetches`; pool `move_staging_bytes` mirrors live
@@ -355,18 +387,39 @@ geometries use their actual registered sizes. P=n remains excluded.
 `--prefix-cache-host-bytes N` retains its existing meaning. Outside HTTP serving,
 there is no automatic host budget.
 
-All automatic serving routes (`http-target`, `http-mtp-fixed`, `http-mtp-batch`)
-are currently unqualified in `prefix_auto_route_qualifications`. An otherwise
-accepted automatic route has no budget, source `off`, and emits one
-`prefix cache: off (automatic budget not yet GPU-qualified: <route>)` line.
-Explicit host budgets remain opt-in experiments. The gated fit code and test-only
-qualified route retain the `min(4 GiB, MemAvailable / 16)` estimate, rounded down
-to 4096 bytes, and a complete-checkpoint size check. Before enabling a production
-entry, re-observe memory after weight residency and lane plans; include retained
-prefix bytes and capture peaks in the shared UMA fit and reserve host headroom.
-The early observation alone does not establish capacity. Session admission runs
-first: an automatic prefix budget never disables sessions. Disk storage remains
-explicitly configured, with the existing version-1 files unchanged.
+Automatic admission is qualified only for the single tiled-MTP HTTP family described
+above. Batch routes, named sessions, serial CLI, YaRN and other profiles remain
+unqualified for automatic caching. Their explicit controls retain their existing
+contracts; an ON request does not bypass qualification or enable numerical modes.
+
+The automatic budget is decided after native residency and calibration, once target,
+predictor, window and other native owners are ready. With fresh conservative host/UMA
+availability A, the shared host budget is:
+
+```text
+B = align_down(min(4 GiB, floor(A / 16), saturating_sub(A, reserve)), 4096)
+```
+
+The reserve covers protected host headroom, remaining cache-off commitments (including
+lazy slots), bounded metadata/uncertainty and device snapshot staging. Fit also checks
+the shared UMA ceiling, device headroom and room for a complete checkpoint and its
+working set. Unknown observations, unsafe fit or setup failure decline by name before
+optional cache work. The cache never reduces context, slot capacity or lazy growth,
+or changes the numerical profile, schedule or tails. Certified storage is RAM-only;
+explicit disk configuration retains its existing contract.
+
+The startup `qwen cache policy` record, `--print-effective-config`,
+`GET /v1/capabilities` expose `cache_policy` with
+`requested`, `effective`, `source`, `reason` and `phase`, plus family and budget details.
+`GET /v1/cache/stats` includes `cache_policy` only while storage is active.
+Declines and OFF are reported by startup, inspection and capabilities; they do not
+add a stats route.
+Read-only inspection exits before device work: automatic `effective` and B are null,
+with `pending-post-residency` and phase `inspection`. Early terminal refusals use
+`pre-bridge-feasibility`; the deciding fresh late fit uses `post-residency-ready`.
+Runtime records report the final admission or named decline, such as
+`fitted-host-budget`, `batch-scheduler-family-unqualified`, `no-reuse-route` or
+`serial-capture-cost-unqualified`. A decline preserves cache-off execution.
 
 `--prefix-cache-retention fair|lru` and `STRIX_PREFIX_CACHE_RETENTION=fair|lru`
 select the host victim policy; fair is the default. `--baseline` or
@@ -479,20 +532,26 @@ is currently refused by name; this binding does not qualify those combinations.
 
 ### Experimental batch certification
 
-Batch prefix certification defaults off. `STRIX_PREFIX_BATCH_CERT=1` or
-`--prefix-batch-cert l0` enables strict diagnostic L0 capture/restore; `0` disables
-it. CLI wins over the environment, and `--baseline` disables it. `capture` collects
-certified checkpoints without restoring. `l1` currently also captures only: the
-separate batch L1 qualification row remains false. An explicit RAM budget is still
-required while automatic prefix-budget qualification is false.
+The requested automatic policy is `l0-where-eligible`; effective batch reuse remains
+unqualified and declines before optional capture, restore or staging work. Ordinary
+scheduler defaults stay unchanged. Batch routes, including an explicit one-slot batch
+runner, are off unless explicitly requested under their existing diagnostic contract;
+that access does not qualify automatic reuse. `--prefix-batch-cert off` (or `0`) and
+`STRIX_PREFIX_BATCH_CERT=0` disable certification. CLI wins over the environment;
+`--baseline` suppresses automatic admission.
 
-On the batch HTTP route with the prefix cache enabled and a resolved host budget,
-`GET /v1/capabilities` includes `prefix_batch_certification` only when this opt-in
-is enabled. Its `mode` is `l0`, `capture` or `l1`, matching effective config's
-`prefix_cache.batch_cert_mode`; `experimental` is true, and `l1_qualified` and
-`automatic_qualified` are false. Inactive routes omit these certification fields.
+Explicit `--prefix-batch-cert l0` retains strict diagnostic L0 capture/restore;
+`capture` collects without restoring, and `l1` currently also captures only. These
+explicit modes require the existing resolved RAM budget. L1 and automatic batch
+qualification remain false; no batch family is promoted by single-runner qualification.
 
-Under the opt-in, `snapshot_preparations` counts snapshot preparations after the
+`cache_policy.batch_certification` in inspection, startup and runtime metadata reports
+requested `policy`, `effective`, `reason`, `l1_qualified` and `automatic_qualified`.
+Pending inspection is distinct from a runtime decline. Legacy diagnostic mode fields
+may also appear for explicitly configured certification; they do not imply automatic
+qualification.
+
+Under explicit diagnostic certification, `snapshot_preparations` counts snapshot preparations after the
 no-store check; it is monotonic, so a no-store request must not increase it.
 `GET /v1/cache/stats` exposes it in `prefix`, alongside the existing `staging_bytes`
 gauge for live snapshot staging. Prompt receipts with `STRIX_PREFIX_CACHE_DIGEST=1`
@@ -545,7 +604,37 @@ over every emitted output row. Missing coverage fails closed. The final hash
 reads the actual predictor frontier without replay or normalization. Diagnostic
 readbacks/fences affect timing; performance runs must disable them.
 
-Slot-capacity sizing and lazy growth reserve the K=1 staging cap once, alongside
-the retained host budget. This is a peak reservation, not proof of aggregate UMA
-fit. Native per-request logits/state equality, race/lifetime and complete-workload
-gates remain required before any automatic enablement.
+Automatic sizing protects cache-off context, maximum slot capacity and lazy growth
+first, then fits the host budget and process-wide K=1 staging cap in residual capacity.
+Batch per-request logits/state equality, peer equivalence, race/lifetime and
+complete-workload gates remain required before automatic batch reuse is qualified.
+
+Automatically admitted certified MTP capture prepares its payload slab and one reusable staging slot,
+download stream and event set at post-residency attachment. Automatic startup
+policy records include `pool_setup_ms`; failure declines with
+`capture-pool-allocation-failed`. Explicit and legacy paths retain per-capture
+allocation and retirement; an explicit host budget creates no startup pool.
+Both paths share payload framing. The automatic synchronous split queues target
+D2H before predictor priming; explicit/legacy capture retains combined submission
+and per-capture allocation as described above.
+
+The pinned slab and its bounded metadata allowance together consume exactly B.
+`host_bytes` counts that commitment once, including free ranges; the logical
+reservation ledger tracks admission credits without adding the slab again.
+`pool_bytes`, `pool_metadata_reserved`, `pool_free_bytes` and
+`pool_staging_bytes` expose the retained payload, metadata allowance, available
+ranges and retained device staging cap. `pool_staging_bytes` remains charged
+between captures; `staging_bytes` and pool `move_staging_bytes` report only live
+descriptor staging and return to zero on retirement. Eviction returns payload
+ranges to the slab. Physical admission accounts for aligned payload sizes and
+contiguous free extents within the slab sub-budget. Eligible unleased checkpoints
+are reclaimed in the existing retention order with bounded, nonwaiting work
+before an extent-pressure refusal. Automatic capture and retirement allocate or
+free no HIP memory, streams or events.
+Payload leases survive both DMA completion and commit/cancellation handoff, and
+quarantined resources cannot be reused. Busy or exhausted storage declines
+immediately and increments `capture_skipped_no_slot`; no admission waits or
+capacity reductions are introduced. Hashing, component framing, native producer
+order and predictor priming order are unchanged; automatic target snapshot/download submission moves ahead of
+priming under the split dependencies above. Pooling alone does not establish
+the complete-workload cost or native exactness qualification gates.

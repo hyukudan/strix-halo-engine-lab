@@ -22,6 +22,8 @@ inline serve::Json state_cache_json(const StateCacheSnapshotV1& s) {
     STRIX_PREFIX(lookup_tokens); STRIX_PREFIX(hit_tokens); STRIX_PREFIX(restored_tokens);
     STRIX_PREFIX(plan_misses); STRIX_PREFIX(captures); STRIX_PREFIX(capture_failures); STRIX_PREFIX(inserted); STRIX_PREFIX(no_store_skips); STRIX_PREFIX(budget_skips);
     STRIX_PREFIX(staging_budget_bytes); STRIX_PREFIX(staging_bytes); STRIX_PREFIX(staging_peak_bytes);
+    STRIX_PREFIX(capture_skipped_no_slot); STRIX_PREFIX(pool_bytes); STRIX_PREFIX(pool_budget_bytes);
+    STRIX_PREFIX(pool_staging_bytes); STRIX_PREFIX(pool_metadata_reserved); STRIX_PREFIX(pool_free_bytes);
     STRIX_PREFIX(row_prefetches); STRIX_PREFIX(capture_busy_skips); STRIX_PREFIX(staging_cap_skips);
     STRIX_PREFIX(capture_skips_cross_stream);
     Json declines=Json::object();

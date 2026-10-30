@@ -194,10 +194,24 @@ PrefixStateCache::Reservation::~Reservation() {
 PrefixStateCache::Reservation PrefixStateCache::reserve(std::uint64_t bytes, const PrefixCacheCheckpoint* incoming) {
     if (policy_.legacy) return {};
     std::lock_guard lock(mutex_);
+    std::vector<std::uint64_t> payloads;
+    std::uint64_t metadata=0;
+    if(payload_pool_ && incoming) {
+        // Capture allocates fixed first, then each missing segment. Already leased
+        // segments are charged physically by the pool and are never reclaimed here.
+        if(!incoming->fixed.data && incoming->fixed.bytes) payloads.push_back(incoming->fixed.bytes);
+        for(const auto& segment:incoming->segments)
+            if(!segment->payload.data && segment->payload.bytes) payloads.push_back(segment->payload.bytes);
+        metadata=incoming->metadata.size()+incoming->producer_certificate.size()*sizeof(std::uint64_t);
+    }
+    const auto physical_fits=[&] {
+        return !payload_pool_ || (metadata<=metadata_allowance_ && metadata_bytes_<=metadata_allowance_-metadata &&
+            payload_pool_->can_allocate(payloads));
+    };
     if (bytes <= policy_.host_byte_budget) {
-        evict_to_budget_locked(bytes, policy_.retention == PrefixCacheRetention::fair ? incoming : nullptr);
+        evict_to_budget_locked(bytes, policy_.retention == PrefixCacheRetention::fair ? incoming : nullptr,payloads,metadata);
         if ((!incoming || policy_.retention != PrefixCacheRetention::fair || entries_.size() < 256) &&
-            retained_bytes_locked() <= policy_.host_byte_budget - bytes) {
+            retained_bytes_locked() <= policy_.host_byte_budget - bytes && physical_fits()) {
             std::lock_guard ledger_lock(ledger_->mutex);
             ledger_->reserved += bytes;
             return Reservation(ledger_, bytes);
@@ -280,7 +294,7 @@ std::uint64_t PrefixStateCache::incremental_bytes_locked(const PrefixCacheCheckp
     const auto registered = [&](const PrefixCacheBuffer& b) {
         const auto it = receipts_.find(b.data.get());
         const auto r = it == receipts_.end() ? nullptr : it->second.lock();
-        return r && r->registered;
+        return b.data && r && r->registered;
     };
     if (!policy_.legacy && registered(checkpoint.fixed)) total -= checkpoint.fixed.bytes;
     for (const auto& segment : checkpoint.segments) {
@@ -327,13 +341,23 @@ void PrefixStateCache::touch_locked(Entry& entry, bool reused) {
     lru_.splice(lru_.end(), lru_, entry.lru);
 }
 
-void PrefixStateCache::evict_to_budget_locked(std::uint64_t reserve, const PrefixCacheCheckpoint* incoming) {
+void PrefixStateCache::evict_to_budget_locked(std::uint64_t reserve, const PrefixCacheCheckpoint* incoming,
+    std::span<const std::uint64_t> payloads, std::uint64_t metadata) {
     // Directory/association work is bounded independently of the payload size.
-    while (!lru_.empty()) {
-        const bool pressure = retained_bytes_locked() + reserve > policy_.host_byte_budget;
+    auto remaining=payload_pool_?std::min<std::size_t>(entries_.size(),256):entries_.size();
+    while (!lru_.empty() && remaining--) {
+        const bool physical_pressure=payload_pool_ &&
+            (metadata>metadata_allowance_ || metadata_bytes_>metadata_allowance_-metadata || !payload_pool_->can_allocate(payloads));
+        const bool pressure = retained_bytes_locked() + reserve > policy_.host_byte_budget || physical_pressure;
         const bool entry_pressure = policy_.retention == PrefixCacheRetention::fair && entries_.size() + (incoming ? 1U : 0U) > 256;
         if (!pressure && !entry_pressure) break;
         auto victim = entries_.find(lru_.front());
+        if(payload_pool_ && policy_.retention==PrefixCacheRetention::lru) {
+            auto oldest=lru_.begin();
+            while(oldest!=lru_.end() && entries_.at(*oldest).checkpoint.use_count()!=1) ++oldest;
+            if(oldest==lru_.end()) break;
+            victim=entries_.find(*oldest);
+        }
         unsigned victim_rank = 0;
         long double best = -1;
         if (policy_.retention == PrefixCacheRetention::fair) {
@@ -438,6 +462,10 @@ bool PrefixStateCache::insert(std::shared_ptr<const PrefixCacheCheckpoint> check
             ledger_->reserved -= reservation->bytes_; reservation->bytes_ = 0;
         }
         ++stats_.captures;
+        const auto metadata=checkpoint->metadata.size()+checkpoint->producer_certificate.size()*sizeof(std::uint64_t);
+        if(payload_pool_ && metadata>metadata_allowance_-std::min(metadata_allowance_,metadata_bytes_)) {
+            ++stats_.budget_skips; return false;
+        }
         const auto need = incremental_bytes_locked(*checkpoint);
         if (need > policy_.host_byte_budget) {
             ++stats_.rejected_over_budget; ++stats_.budget_skips;
@@ -874,7 +902,9 @@ PrefixStateCacheStats PrefixStateCache::counters() {
         out.host_bytes = host_bytes_locked(); out.host_segments = segments_.size();
     } else {
         std::lock_guard ledger_lock(ledger_->mutex);
-        out.host_bytes = ledger_->bytes + metadata_bytes_;
+        // Count the retained slab (including free ranges) and its reserved metadata once.
+        out.host_bytes = payload_pool_ ? policy_.host_byte_budget : ledger_->bytes + metadata_bytes_;
+        if(payload_pool_) out.pool_free_bytes=payload_pool_->free_bytes();
         out.host_segments = ledger_->segments;
     }
     out.host_checkpoints = entries_.size();

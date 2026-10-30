@@ -214,6 +214,7 @@ inline MtpDecodeServe make_http_serve(const Options& options, std::string engine
     std::shared_ptr<RtxStateImportRegistry> rtx_import = {},
     std::optional<StartupPreflight> startup = {}, serve::Json assets = {}) {
     return [&options, engine_description = std::move(engine_description), rtx_import, startup, assets](const MtpServeRunner& run,bool selection_mtp_available) {
+        if(options.cache_readiness_recheck) options.cache_readiness_recheck();
         const auto tokenizer = serve::BpeTokenizer::load_gguf(options.model_path);
         serve::ApiConfig config;
         config.model_id = options.http_model_id;
@@ -227,8 +228,9 @@ inline MtpDecodeServe make_http_serve(const Options& options, std::string engine
         config.default_min_p = options.http_default_min_p;
         config.responses = options.http_responses;
         config.capabilities = options.http_capabilities;
-        config.capabilities_extra = [modes=session_modes_json(options)](serve::Json& out) {
+        config.capabilities_extra = [modes=session_modes_json(options), policy=cache_activation_json(options)](serve::Json& out) {
             qwen_rotary_capabilities(out);
+            out.set("cache_policy",policy);
             out.set("session_numerical_modes",modes);
         };
         config.stream_receipts = options.http_stream_receipts;
@@ -241,7 +243,9 @@ inline MtpDecodeServe make_http_serve(const Options& options, std::string engine
             if (options.session_management_requested) {
                 MtpServeRequest stats; stats.session_operation="stats"; (void)run(stats);
             }
-            config.state_cache_stats=[mirror=options.state_cache_stats] { return mirror->read(); };
+            config.state_cache_stats=[mirror=options.state_cache_stats,policy=cache_activation_json(options)] {
+                auto out=serve::parse_json(mirror->read());out.set("cache_policy",policy);return out.dump();
+            };
         }
         config.stop_tokens.push_back(tokenizer->eos_token());
         if (const auto end = tokenizer->find("<|endoftext|>"); end != UINT32_MAX) config.stop_tokens.push_back(end);
@@ -318,6 +322,7 @@ inline MtpDecodeBatchServe make_http_batch_serve(const Options& options, std::st
     std::shared_ptr<const serve::BpeTokenizer> supplied_tokenizer = {}) {
     return [&options, engine_description = std::move(engine_description), startup, assets,
         supplied_tokenizer = std::move(supplied_tokenizer)](MtpBatchRunner& runner) {
+        if(options.cache_readiness_recheck) options.cache_readiness_recheck();
         const auto tokenizer = supplied_tokenizer ? supplied_tokenizer : serve::BpeTokenizer::load_gguf(options.model_path);
         serve::ApiConfig config;
         config.model_id = options.http_model_id;
@@ -333,6 +338,7 @@ inline MtpDecodeBatchServe make_http_batch_serve(const Options& options, std::st
         config.capabilities = options.http_capabilities;
         auto cert=serve::Json::object();
         prefix_batch_cert_capabilities(cert,options);
+        cert.set("cache_policy",cache_activation_json(options));
         config.capabilities_extra = [modes=session_modes_json(options), cert=std::move(cert)](serve::Json& out) {
             qwen_rotary_capabilities(out);
             out.set("session_numerical_modes",modes);
@@ -348,7 +354,9 @@ inline MtpDecodeBatchServe make_http_batch_serve(const Options& options, std::st
             if (options.session_management_requested) {
                 MtpServeRequest stats; stats.session_operation="stats"; (void)runner.session_run(stats);
             }
-            config.state_cache_stats=[mirror=options.state_cache_stats] { return mirror->read(); };
+            config.state_cache_stats=[mirror=options.state_cache_stats,policy=cache_activation_json(options)] {
+                auto out=serve::parse_json(mirror->read());out.set("cache_policy",policy);return out.dump();
+            };
         }
         config.engine_routes = [&runner, enabled = options.session_management_requested](const serve::HttpRequest& request, serve::HttpResponseWriter& response) {
             return handle_session_route(enabled, runner.session_run, request, response);

@@ -698,8 +698,13 @@ state at admitted boundaries and reads only the suffix. Configure `--prefix-cach
 optionally `--prefix-cache-dir DIR`; fair retention is default (`--prefix-cache-retention lru` restores
 LRU). Captures reserve memory before pinned copies. `"state_cache":{"retain":false}` permits reads
 without storing new prefixes; `GET /v1/cache/stats` reports retention and eviction reasons.
-`--prefix-cache off` / `STRIX_PREFIX_CACHE=0` disables it. Automatic HTTP tiling does not itself
-supply a cache budget. MTP restore accepts only suffix plans equivalent to the uncached execution;
+`--prefix-cache off` / `STRIX_PREFIX_CACHE=0` disables it. Certified caching is on by default only for
+single tiled-MTP HTTP (`--http-batch 0`, or automatic capacity resolving to the single runner) at T=2048 with
+the default profile and assets and context up to 16,384; there the automatic budget after native residency is
+`min(4 GiB, A/16, A - reserve)` of available memory A, and results are bitwise identical to cache-off. Every
+other automatic configuration, including the plain serve command (which resolves T=8192), declines by name and
+runs exactly as cache-off; explicit host bytes keep their behaviour. Startup, `--print-effective-config`,
+`/v1/capabilities` and `/v1/cache/stats` report the requested and effective policy and its reason. MTP restore accepts only suffix plans equivalent to the uncached execution;
 checkpoint copies follow existing block boundaries.
 
 ### DeepSeek pair

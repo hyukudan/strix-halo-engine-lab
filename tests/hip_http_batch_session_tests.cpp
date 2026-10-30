@@ -40,7 +40,7 @@ void receipt_compatibility() {
         "M1 active batch owner emits histogram");
 }
 std::atomic<bool> headers_seen{false};
-std::string request(unsigned port, const std::string& body) {
+std::string request(unsigned port, const std::string& body, const std::string& path="") {
     const int fd = ::socket(AF_INET, SOCK_STREAM, 0);
     require(fd >= 0, "socket");
     timeval timeout{5,0};
@@ -48,7 +48,7 @@ std::string request(unsigned port, const std::string& body) {
     sockaddr_in address{}; address.sin_family=AF_INET; address.sin_port=htons(static_cast<std::uint16_t>(port));
     address.sin_addr.s_addr=htonl(INADDR_LOOPBACK);
     if (::connect(fd,reinterpret_cast<sockaddr*>(&address),sizeof(address))) { ::close(fd); return {}; }
-    const auto text = "POST /v1/completions HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: " +
+    const auto text = (path.empty()?std::string("POST /v1/completions"):"GET "+path)+" HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: " +
         std::to_string(body.size())+"\r\n\r\n"+body;
     require(::send(fd,text.data(),text.size(),MSG_NOSIGNAL)==static_cast<ssize_t>(text.size()), "send");
     std::string wire; char buffer[4096];
@@ -74,6 +74,10 @@ void run(bool streaming, unsigned failure_kind) {
     options.http_bind="127.0.0.1"; options.http_port=free_port(); options.http_batch=1;
     options.http_model_id="test"; options.context_tokens=64; options.session_management_requested=true;
     options.state_cache_stats=std::make_shared<StateCacheStatsMirror>();
+    options.cache_activation->automatic_path=true;
+    options.cache_activation->finalized=true;
+    options.cache_activation->reason=streaming?"disabled":"insufficient-host-headroom";
+    options.cache_activation->source="off";
     auto tokenizer=serve::BpeTokenizer::from_parts({"a","b","<|endoftext|>"},{1,1,3},{},"qwen35");
     const auto model=ModelContract::qwen38_flash_next();
     CompiledSerialExecution compiled;
@@ -118,6 +122,12 @@ void run(bool streaming, unsigned failure_kind) {
         if(healthy.empty()) std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
     require(healthy.find("200 OK")!=std::string::npos,"batch server ready");
+    const auto capabilities=request(options.http_port,"","/v1/capabilities");
+    require(capabilities.find("cache_policy")!=std::string::npos &&
+        capabilities.find(options.cache_activation->reason)!=std::string::npos,
+        "decline and OFF policy available in real adapter capabilities");
+    require(request(options.http_port,"","/v1/cache/stats").find("200 OK")!=std::string::npos,
+        "explicitly enabled session storage retains stats route");
     const auto body=[&](const char* id) {
         return std::string("{\"prompt\":[0],\"max_tokens\":1,\"session\":\"")+id+"\",\"stream\":"+(streaming?"true":"false")+"}";
     };
@@ -133,6 +143,34 @@ void run(bool streaming, unsigned failure_kind) {
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
     require(stopped.load() && !failure.empty(),"fatal shutdown completes within bound");
 }
+void run_policy(bool off) {
+    Options options;options.http_bind="127.0.0.1";options.http_port=free_port();options.http_batch=1;
+    options.http_model_id="test";options.context_tokens=64;
+    options.cache_activation->automatic_path=options.cache_activation->finalized=true;
+    options.cache_activation->reason=off?"disabled":"insufficient-host-headroom";
+    options.cache_activation->source="off";
+    auto tokenizer=serve::BpeTokenizer::from_parts({"a","b","<|endoftext|>"},{1,1,3},{},"qwen35");
+    CompiledSerialExecution compiled;QualifiedMtpDraftPlan qualified;ActivatedMtpDraftPlan activated;
+    std::vector<std::unique_ptr<MtpBatchRunner::Slot>> slots;
+    slots.push_back(std::make_unique<MtpBatchRunner::Slot>());
+    const auto model=ModelContract::qwen38_flash_next();
+    MtpBatchRunner runner(options,model,compiled,qualified,activated,{},std::move(slots));
+    auto serve=make_http_batch_serve(options,"test",{},{},tokenizer);
+    std::string failure;
+    std::thread server([&] {try {serve(runner);} catch(const std::exception& e) {failure=e.what();}});
+    struct Join {std::thread& thread;~Join(){http_serve_stop_requested().store(true);thread.join();}} join{server};
+    std::string caps;
+    const auto deadline=std::chrono::steady_clock::now()+std::chrono::seconds(5);
+    while(caps.empty() && std::chrono::steady_clock::now()<deadline) {
+        caps=request(options.http_port,"","/v1/capabilities");
+        if(caps.empty()) std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    require(caps.find("200 OK")!=std::string::npos && caps.find("cache_policy")!=std::string::npos &&
+        caps.find(options.cache_activation->reason)!=std::string::npos,"storage-free decline/OFF capabilities");
+    require(request(options.http_port,"","/v1/cache/stats").find("404")!=std::string::npos,
+        "storage-free decline/OFF preserves main unsupported stats route");
+}
+
 }
 int main() try {
     receipt_compatibility();
@@ -140,6 +178,7 @@ int main() try {
     ::setenv("STRIX_BATCH_SERVICE_MS","0",1);
     ::setenv("STRIX_BATCH_CANCEL_POINTS","0",1);
     ::setenv("STRIX_BATCH_NEST_ROWS","0",1);
+    run_policy(false);run_policy(true);
     for(bool stream:{false,true}) for(unsigned kind:{0U,1U,2U}) run(stream,kind);
     std::cout<<"batch HTTP session failures PASS\n";
     return 0;

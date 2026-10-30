@@ -103,6 +103,80 @@ public:
     PrefixCacheAllocationFailure() : std::runtime_error("prefix state cache pinned host allocation failed") {}
 };
 
+// One attach-time backing allocation. Leases return aligned ranges, never pinned pages.
+class PrefixPayloadPool : public std::enable_shared_from_this<PrefixPayloadPool> {
+    PrefixCacheBuffer backing_;
+    std::mutex mutex_;
+    using FreeRanges = std::map<std::uint64_t,std::uint64_t>;
+    FreeRanges free_;
+    void release(std::uint64_t at, std::uint64_t bytes, FreeRanges::node_type node) noexcept {
+        std::lock_guard lock(mutex_);
+        auto next=free_.lower_bound(at);
+        if(next!=free_.begin()) {
+            auto prev=std::prev(next);
+            if(prev->first+prev->second==at) {at=prev->first;bytes+=prev->second;free_.erase(prev);}
+        }
+        if(next!=free_.end() && at+bytes==next->first) {bytes+=next->second;free_.erase(next);}
+        node.key()=at; node.mapped()=bytes;
+        free_.insert(std::move(node)); // granted leases already own this node; no allocation
+    }
+public:
+    explicit PrefixPayloadPool(PrefixCacheBuffer backing) : backing_(std::move(backing)) {
+        free_.emplace(0,backing_.bytes);
+    }
+    std::uint64_t bytes() const {return backing_.bytes;}
+    std::uint64_t free_bytes() {
+        std::lock_guard lock(mutex_);
+        std::uint64_t total=0;
+        for(const auto& [at,bytes]:free_) { (void)at; total+=bytes; }
+        return total;
+    }
+    // Simulate the same first-fit order as capture allocation, including alignment
+    // and contiguous extents. This is a non-waiting admission observation, not a lease.
+    bool can_allocate(std::span<const std::uint64_t> requests) {
+        if(requests.empty()) return true;
+        std::lock_guard lock(mutex_);
+        std::vector<std::pair<std::uint64_t,std::uint64_t>> ranges(free_.begin(),free_.end());
+        for(const auto bytes:requests) {
+            if(!bytes) continue;
+            if(bytes>UINT64_MAX-255U) return false;
+            const auto aligned=(bytes+255U)&~UINT64_C(255);
+            bool found=false;
+            for(auto& range:ranges) if(range.second>=aligned) {
+                range.first+=aligned; range.second-=aligned; found=true; break;
+            }
+            if(!found) return false;
+        }
+        return true;
+    }
+    PrefixCacheBuffer allocate(std::uint64_t bytes) {
+        if(!bytes) return {};
+        if(bytes>UINT64_MAX-255U) throw PrefixCacheAllocationFailure();
+        const auto aligned=(bytes+255U)&~UINT64_C(255);
+        struct Lease {
+            std::shared_ptr<PrefixPayloadPool> pool;
+            std::uint64_t at=0, bytes=0;
+            FreeRanges::node_type return_node;
+            ~Lease() {if(bytes) pool->release(at,bytes,std::move(return_node));}
+        };
+        auto lease=std::make_shared<Lease>(); lease->pool=shared_from_this();
+        // Reserve destructor-path control storage before modifying the free list.
+        // Failure here leaves the pool untouched and no lease has been granted.
+        FreeRanges spare;
+        spare.emplace(0,0);
+        lease->return_node=spare.extract(spare.begin());
+        std::lock_guard lock(mutex_);
+        for(auto it=free_.begin();it!=free_.end();++it) if(it->second>=aligned) {
+            const auto at=it->first, remaining=it->second-aligned;
+            auto node=free_.extract(it);
+            if(remaining) {node.key()=at+aligned;node.mapped()=remaining;free_.insert(std::move(node));}
+            lease->at=at;lease->bytes=aligned;
+            return {std::shared_ptr<std::byte>(lease,backing_.data.get()+at),bytes};
+        }
+        throw PrefixCacheAllocationFailure();
+    }
+};
+
 inline constexpr std::array<std::string_view,11> prefix_certificate_decline_names{
     "serial-async-capture-unsupported",
     "serial-lookup-disabled-or-short",
@@ -131,7 +205,7 @@ struct PrefixStateCacheStats {
     std::uint64_t capture_skips_cross_stream=0;
     std::array<std::uint64_t,prefix_certificate_decline_names.size()> certificate_declines{};
     std::uint64_t capture_skips_tripwire=0,capture_skips_batch_config=0;
-    std::uint64_t snapshot_preparations=0;
+    std::uint64_t snapshot_preparations=0, capture_skipped_no_slot=0, pool_bytes=0, pool_budget_bytes=0, pool_metadata_reserved=0, pool_free_bytes=0, pool_staging_bytes=0;
     double disk_read_ms = 0.0, disk_write_ms = 0.0;
 };
 
@@ -191,6 +265,20 @@ public:
     void flush();
     [[nodiscard]] PrefixStateCacheStats stats();
     [[nodiscard]] PrefixStateCacheStats counters();
+    // The logical ledger remains admission credit, not another physical allocation.
+    // A bounded metadata allowance stays inside B alongside the retained pinned slab.
+    void attach_payload_pool(std::shared_ptr<PrefixPayloadPool> pool, std::uint64_t metadata_allowance) {
+        if(!pool || pool->bytes()>policy_.host_byte_budget ||
+            metadata_allowance!=policy_.host_byte_budget-pool->bytes())
+            throw std::invalid_argument("prefix pool commitments must equal B");
+        payload_pool_=std::move(pool); metadata_allowance_=metadata_allowance;
+        allocate_=[pool=payload_pool_](std::uint64_t n) {return pool->allocate(n);};
+        stats_.pool_bytes=payload_pool_->bytes(); stats_.pool_budget_bytes=policy_.host_byte_budget;
+        stats_.pool_metadata_reserved=metadata_allowance;
+    }
+    std::shared_ptr<void> capture_resources;
+    void set_pool_staging_bytes(std::uint64_t bytes) {stats_.pool_staging_bytes=bytes;}
+    void record_no_slot() {std::lock_guard lock(mutex_); ++stats_.capture_skipped_no_slot;}
     void record_no_store_skip();
     void record_capture_failure();
     void record_snapshot_preparation();
@@ -243,7 +331,8 @@ private:
     std::uint64_t host_bytes_locked();
     std::uint64_t retained_bytes_locked();
     void touch_locked(Entry&, bool reused = false);
-    void evict_to_budget_locked(std::uint64_t reserve, const PrefixCacheCheckpoint* incoming = nullptr);
+    void evict_to_budget_locked(std::uint64_t reserve, const PrefixCacheCheckpoint* incoming = nullptr,
+        std::span<const std::uint64_t> payloads = {}, std::uint64_t metadata = 0);
     std::shared_ptr<const PrefixCacheCheckpoint> load_from_disk(const ModelContentIdentity& identity,
         const ModelContentIdentity& digest, std::span<const std::uint32_t> tokens, std::uint32_t block_rows);
     std::shared_ptr<const PrefixCacheSegment> load_segment(const ModelContentIdentity& identity,
@@ -260,6 +349,8 @@ private:
     std::map<const std::byte*, std::pair<std::weak_ptr<std::byte>, std::uint64_t>> session_buffers_;
     PrefixStateCachePolicy policy_;
     PrefixCacheAllocator allocate_;
+    std::shared_ptr<PrefixPayloadPool> payload_pool_;
+    std::uint64_t metadata_allowance_=0;
     mutable std::mutex mutex_;
     std::map<ModelContentIdentity, Entry, DigestLess> entries_;
     std::list<ModelContentIdentity> lru_;  // front: least recently used

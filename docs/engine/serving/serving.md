@@ -48,7 +48,13 @@ The token IDs on the command line are the **calibration prompt**: its first
 `--mtp-calibration-rows R` pairs are replayed against the golden (`--mtp-golden`) to qualify the
 predictor, exactly as for a command-line request. Requests do not need to share anything with it.
 `--generate` is ignored while serving. The prefix state cache flags (`--prefix-cache-host-bytes`,
-`--prefix-cache-every`, `--prefix-cache-dir`) apply across requests.
+`--prefix-cache-every`, `--prefix-cache-dir`) apply across requests. Certified prefix
+caching is ON by default only for the qualified single tiled-MTP HTTP runner
+(`--http-batch 0` or auto capacity resolving to single), T=2048, default numerical
+profile/schedule/tails and model assets, context up to 16384. Qualified results are
+bitwise identical to cache-off. Explicit host bytes retain their existing behavior.
+`--prefix-cache off` disables prefix caching; `--prefix-batch-cert off` and
+`--session-cache off` disable their separate policies.
 
 The prompt may run a separate prefill profile (`--prefill-numerical-profile`, see
 [prefill-numerical-profile.md](../prefill/prefill-numerical-profile.md)), for example the fast prefill profile
@@ -1295,8 +1301,25 @@ makes no changes to `/metrics` or `/api/status`.
 See [prefix retention policy](prefix-state-cache.md) for budget fitting, fair/LRU
 controls, exact boundary rules and the current qualification limit. The certified MTP
 prefix path consumes the incumbent cold plan and resumes its whole-prompt cursor.
-It skips async capture and unsupported batch plans; automatic qualification remains
-off. Refused RAM candidates add `plan_misses`, without accepted-hit token credit.
+It captures asynchronously only at certified eligible boundaries. After native residency,
+automatic admission fits `B = min(4 GiB, A/16, A - reserve)`, rounded down to 4 KiB,
+using conservative available memory A and protected commitments in reserve. Context,
+slot capacity and lazy growth never shrink. Other automatic configurations decline
+by name and execute exactly as cache-off. Batch routes, sessions, serial CLI, YaRN
+and other profiles remain unqualified for automatic reuse; explicit diagnostic
+contracts stay separate. Refused RAM candidates add `plan_misses`, without accepted-hit
+token credit.
+
+Startup `qwen cache policy`, `--print-effective-config` and `/v1/capabilities`
+report `cache_policy` requested/effective/source/reason/phase, including declines
+and OFF. `/v1/cache/stats` includes that policy only while storage is active.
+Inspection is allocation-free and pending (`effective` and B null); runtime reports
+final admission or decline. The late deciding phase is `post-residency-ready`;
+early terminal refusals use `pre-bridge-feasibility`. Batch policy requests
+`l0-where-eligible` but declines unqualified families without changing scheduling.
+Named-session storage is separately unqualified and never implicitly selects fixed
+MTP or tiled-suffix arithmetic. Policy-selected requests keep their existing cache
+bypass. See [automatic budget details](prefix-state-cache.md#controls-and-fitted-http-budget).
 
 The stats endpoint returns the last immutable sample without entering the runner
 or store. Startup seeds all legacy session fields and disk budget before listening.

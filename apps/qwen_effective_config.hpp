@@ -55,6 +55,9 @@ struct PrefillMemory {
     std::function<std::uint64_t(const Options&, const Environment&)> verify_ple_credit{};
     // Optional explicit storage sizing for YaRN MTP, without mutating Options or process env.
     std::function<PrefillRequirements(const Options&, std::uint32_t)> estimate_with_score_ring{};
+    std::uint64_t observation_id=0, end_steady_ns=0;
+    std::optional<std::uint64_t> usable_ceiling{}, cache_available{}, gfx_target{}, resident{};
+    bool cache_limits_known=false;
 };
 // Both inspection and execution validate explicit-T assets before the inspection exit.
 inline void validate_http_serving_memory(const Options& o,const PrefillMemory& memory) {
@@ -586,7 +589,7 @@ inline bool session_route_gpu_qualified(std::string_view route) {
     return false;
 }
 // Session policy is independent of prompt auto-prefill admission. Never changes a route.
-inline void resolve_session_defaults(Options& o, const ModelContract& model,
+inline void resolve_legacy_session_defaults(Options& o, const ModelContract& model,
     const Environment& env, std::optional<std::uint64_t> available) {
     o.session_tiled_suffix_requested = o.session_tiled_suffix;
     o.session_mtp_fixed_requested = o.session_mtp_fixed;
@@ -686,7 +689,7 @@ inline void prefix_batch_cert_capabilities(serve::Json& out, const Options& o) {
 inline constexpr SessionRouteQualification prefix_batch_cert_route_qualifications[] = {
     {"http-mtp-batch-certified-l1", false}
 };
-inline void resolve_prefix_defaults(Options& o, const ModelContract& model,
+inline void resolve_legacy_prefix_defaults(Options& o, const ModelContract& model,
     const Environment& env, std::optional<std::uint64_t> available,
     std::span<const SessionRouteQualification> qualifications = prefix_auto_route_qualifications) {
     const auto supplied = [&](const char* flag) { return o.supplied_options.contains(flag); };
@@ -853,6 +856,252 @@ inline void resolve_serve_prefill(EffectiveConfig& result, const ModelContract& 
     }
     notice(attempts + "explicit tiled configuration required");
 }
+// Stage A is pure: no host budget estimate, device work or directory probes.
+inline std::string cache_defaults_suppression(const Options& o, const Environment& env) {
+    if (o.baseline || env_is(env,"STRIX_BASELINE","1")) return "baseline";
+    if (const auto i=env.find("STRIX_QPF2K_DEFAULTS"); i!=env.end() && !i->second.empty() && i->second[0]=='0')
+        return "defaults-suppressed";
+    return {};
+}
+inline bool explicit_cache_configuration(const Options& o, const Environment& env) {
+    for(const auto& flag:o.supplied_options)
+        if(flag.starts_with("--prefix-cache") || flag=="--prefix-batch-cert" || flag.starts_with("--session-")) return true;
+    for(const auto* name:{"STRIX_PREFIX_CACHE","STRIX_PREFIX_CACHE_RETENTION","STRIX_PREFIX_CACHE_STAGING_BYTES",
+            "STRIX_PREFIX_BATCH_CERT","STRIX_SESSION_CACHE","STRIX_SESSION_DISK"})
+        if(env.contains(name)) return true;
+    return o.prefix_cache_host_bytes || !o.prefix_cache_dir.empty() || o.prefix_cache_disk_bytes ||
+        o.prefix_cache_every || o.prefix_cache_block_rows || o.prefix_batch_cert || o.session_mtp_fixed ||
+        o.session_tiled_suffix || !o.session_save.empty() || !o.session_load.empty() || !o.session_dir.empty();
+}
+inline void resolve_session_defaults(Options& o, const ModelContract& model,
+    const Environment& env, std::optional<std::uint64_t> available) {
+    o.cache_activation=std::make_shared<CachePolicyActivation>(*o.cache_activation);
+    auto& a=*o.cache_activation;
+    a.automatic_path=!explicit_cache_configuration(o,env) && o.prefix_cache && cache_defaults_suppression(o,env).empty();
+    a.prefix_requested=o.prefix_cache;
+    a.session_requested=!o.supplied_options.contains("--session-cache") && env.contains("STRIX_SESSION_CACHE")
+        ? !env_is(env,"STRIX_SESSION_CACHE","0") : o.session_cache;
+    a.suppression=cache_defaults_suppression(o,env);
+    resolve_legacy_session_defaults(o,model,env,available);
+    a.session=o.session_management_requested; a.session_reason=o.session_off_reason;
+}
+inline void resolve_prefix_defaults(Options& o, const ModelContract& model,
+    const Environment& env, std::optional<std::uint64_t> available,
+    std::span<const SessionRouteQualification> qualifications=prefix_auto_route_qualifications) {
+    o.cache_activation=std::make_shared<CachePolicyActivation>(*o.cache_activation);
+    // Preserve all public fields. The new automatic decision is reported separately.
+    resolve_legacy_prefix_defaults(o,model,env,available,qualifications);
+    auto& a=*o.cache_activation;
+    a.prefix_requested=o.prefix_cache;
+    a.prefix=o.prefix_cache_host_bytes!=0;
+    a.source=a.prefix?"explicit":o.prefix_cache_source; a.reason=o.prefix_cache_reason;
+    a.cert_requested=a.automatic_path?1U:a.cert_policy_parsed?a.cert_requested:o.prefix_batch_cert;
+    a.cert_effective=a.automatic_path?0U:o.prefix_batch_cert;
+    a.cert_reason=!a.cert_requested?"disabled":!a.cert_effective && a.suppression=="baseline"?"baseline":"explicit";
+    if(a.automatic_path) {
+        a.source="auto";
+        a.reason=o.http_serve?"pending-post-residency":o.prefix_cache_then_prompts.empty()?"no-reuse-route":"serial-capture-cost-unqualified";
+        a.cert_reason="pending-post-residency";
+    }
+}
+inline serve::Json cache_activation_json(const Options& o) {
+    const auto& a=*o.cache_activation;
+    auto out=serve::Json::object();
+    out.set("requested",serve::Json(a.prefix_requested));
+    out.set("effective",a.finalized?serve::Json(a.prefix):serve::Json());
+    out.set("session_requested",serve::Json(a.session_requested));
+    out.set("session_effective",a.finalized?serve::Json(a.session):serve::Json());
+    out.set("session_reason",serve::Json(a.session_reason));
+    out.set("source",serve::Json(a.source)); out.set("reason",serve::Json(a.reason));
+    out.set("suppression",serve::Json(a.suppression));
+    out.set("runner",serve::Json(std::string(a.runner==CacheRunner::pending?"pending-runner":a.runner==CacheRunner::cli?"cli-target-tiled":a.runner==CacheRunner::batch_mtp?"http-mtp-batch":a.runner==CacheRunner::single_mtp?"http-mtp-fixed":"http-target")));
+    out.set("family",serve::Json(a.family)); out.set("evidence_id",serve::Json(a.evidence_id));
+    out.set("automatic_qualified",serve::Json(a.automatic_qualified));
+    out.set("phase",serve::Json(a.automatic_path && !a.decision_phase.empty()?a.decision_phase:(a.finalized?"post-residency":"inspection")));
+    for (const auto& [name,value]: {std::pair{"B",a.B},{"S",a.S},{"H",a.H},{"F",a.F},{"E",a.E},
+            {"context_off",a.context_off},{"slots_off",a.slots_off},
+            {"context_admitted",a.context_admitted},{"slots_admitted",a.slots_admitted}})
+        out.set(name,value?serve::Json(*value):serve::Json());
+    if(a.automatic_path && a.pool_setup_ms>0) out.set("pool_setup_ms",serve::Json(a.pool_setup_ms));
+    if(a.observation_age_ns) {
+        for(const auto& [name,value]: {std::pair{"U",a.U},{"L",a.L},{"A",a.A},{"reserve",a.reserve}})
+            out.set(name,value?serve::Json(*value):serve::Json());
+        out.set("limits_consistent",serve::Json(a.limits_consistent));
+        out.set("observation_age_ns",serve::Json(*a.observation_age_ns));
+    }
+    auto protocol=serve::Json::object();
+    const bool executed=o.session_mtp_fixed && (!o.http_serve || o.session_management_requested || o.session_live_control);
+    protocol.set("fixed_requested",serve::Json(o.session_mtp_fixed_requested));
+    protocol.set("fixed_effective",serve::Json(executed));
+    protocol.set("tiled_suffix_requested",serve::Json(o.session_tiled_suffix_requested));
+    protocol.set("tiled_suffix_effective",serve::Json(o.session_tiled_suffix && (!o.http_serve || executed)));
+    protocol.set("reason",serve::Json(executed?"explicit-protocol":a.session_reason));
+    out.set("executed_session_protocol",std::move(protocol));
+    auto cert=serve::Json::object();
+    cert.set("policy",serve::Json((a.cert_requested==0?"off":a.cert_requested==1?"l0-where-eligible":a.cert_requested==2?"capture":"l1")));
+    cert.set("effective",!a.finalized?serve::Json():serve::Json(!a.cert_requested?"off":a.cert_effective?
+        (a.cert_effective==1?"l0":a.cert_effective==2?"capture":"l1"):"declined"));
+    cert.set("reason",serve::Json(a.cert_reason));
+    cert.set("l1_qualified",serve::Json(false));
+    cert.set("automatic_qualified",serve::Json(a.automatic_qualified && a.cert_effective==1));
+    out.set("batch_certification",std::move(cert));
+    return out;
+}
+inline serve::Json cache_family_identity_json(const CacheFamilyIdentity& id) {
+    auto out=serve::Json::object();
+    out.set("mtp_contract_qualified",serve::Json(id.mtp_contract_qualified));
+    out.set("model",serve::Json(id.model));
+    out.set("layout",serve::Json(id.layout));
+    out.set("tokenizer",serve::Json(id.tokenizer));
+    out.set("sidecar",serve::Json(id.sidecar));
+    out.set("golden",serve::Json(id.golden));
+    out.set("replay",serve::Json(id.replay));
+    out.set("build_family",serve::Json(id.build_family));
+    out.set("gfx",serve::Json(id.gfx));
+    out.set("numerical_contract",serve::Json(id.numerical_contract));
+    out.set("kv_precision",serve::Json(id.kv_precision));
+    out.set("recurrent_precision",serve::Json(id.recurrent_precision));
+    out.set("prefill_profile",serve::Json(id.prefill_profile));
+    out.set("decode_profile",serve::Json(id.decode_profile));
+    out.set("output_policy",serve::Json(id.output_policy));
+    out.set("profile_pair",serve::Json(id.profile_pair));
+    auto tails=serve::Json::array();
+    for(auto value:id.tails) tails.as_array().emplace_back(static_cast<double>(value));
+    out.set("tails",std::move(tails));
+    auto scheduler=serve::Json::object();
+    scheduler.set("schedule",serve::Json(static_cast<double>(id.scheduler.schedule)));
+    scheduler.set("pipe",serve::Json(static_cast<double>(id.scheduler.pipe)));
+    scheduler.set("lookahead",serve::Json(static_cast<double>(id.scheduler.lookahead)));
+    scheduler.set("short_rows",serve::Json(static_cast<double>(id.scheduler.short_rows)));
+    scheduler.set("service_ms",serve::Json(static_cast<double>(id.scheduler.service_ms)));
+    scheduler.set("prompt_share",serve::Json(static_cast<double>(id.scheduler.prompt_share)));
+    scheduler.set("nest_rows",serve::Json(static_cast<double>(id.scheduler.nest_rows)));
+    scheduler.set("interleave",serve::Json(static_cast<double>(id.scheduler.interleave)));
+    scheduler.set("group_rows",serve::Json(static_cast<double>(id.scheduler.group_rows)));
+    scheduler.set("groups",serve::Json(id.scheduler.groups));
+    scheduler.set("cohort",serve::Json(id.scheduler.cohort));
+    scheduler.set("small",serve::Json(id.scheduler.small));
+    scheduler.set("group_owner",serve::Json(id.scheduler.group_owner));
+    scheduler.set("windows",serve::Json(id.scheduler.windows));
+    scheduler.set("cancel",serve::Json(id.scheduler.cancel));
+    scheduler.set("priming",serve::Json(id.scheduler.priming));
+    scheduler.set("worker",serve::Json(id.scheduler.worker));
+    scheduler.set("tiled_start",serve::Json(id.scheduler.tiled_start));
+    scheduler.set("merge",serve::Json(id.scheduler.merge));
+    scheduler.set("balance",serve::Json(id.scheduler.balance));
+    scheduler.set("shared",serve::Json(id.scheduler.shared));
+    out.set("scheduler",std::move(scheduler));
+    return out;
+}
+// Called only on the automatic path after the actual runner/identity is bound.
+inline bool apply_automatic_cache_fit(Options& o, const CacheLateFit& fit) {
+    auto& a=*o.cache_activation;
+    if(!automatic_cache_work(o)) return false;
+    const auto result=fit.cgroup_ancestry_unproven ? CacheFitResult{0,"cgroup-ancestry-unproven"} : fit_cache_late(fit);
+    a.S=fit.S; a.H=std::max(UINT64_C(4)<<30,fit.headroom); a.F=fit.F;
+    if(fit.E && *fit.E<=UINT64_MAX-(UINT64_C(256)<<20)) a.E=*fit.E+(UINT64_C(256)<<20);
+    a.U=fit.U; a.L=fit.L; a.A=fit.A; a.observation_age_ns=fit.age_ns;
+    a.limits_consistent=fit.limits_consistent; a.reserve=cache_fit_reserve(fit);
+    a.B=result.budget; a.prefix=result.budget!=0;
+    a.reason=o.prefix_cache_reason=std::string(result.reason);
+    o.prefix_cache_host_bytes=result.budget;
+    if(!result.budget) decline_cache_activation(a,result.reason);
+    if(a.runner==CacheRunner::batch_mtp && a.automatic_qualified) {
+        a.cert_effective=result.budget?1U:0U; a.cert_reason=std::string(result.reason);
+    }
+    return result.budget!=0;
+}
+// Feasibility never assigns B. Only the ready sample may fit automatic single storage.
+inline bool prepare_automatic_cache_fit(Options& o, const CacheLateFit& fit, bool ready) {
+    auto& a=*o.cache_activation;
+    if(a.automatic_path && a.source=="auto" && a.runner==CacheRunner::single_mtp) {
+        if(a.decision_phase=="post-residency-ready") return a.prefix;
+        if(ready && a.reason!="pending-post-residency") return false;
+        a.decision_phase=ready?"post-residency-ready":"pre-bridge-feasibility";
+        if(!ready) {
+            // Record this observation without fitting or assigning a budget.
+            a.U=fit.U; a.L=fit.L; a.A=fit.A; a.F=fit.F; a.S=fit.S;
+            a.H=std::max(UINT64_C(4)<<30,fit.headroom);
+            if(fit.E && *fit.E<=UINT64_MAX-(UINT64_C(256)<<20)) a.E=*fit.E+(UINT64_C(256)<<20);
+            a.reserve=cache_fit_reserve(fit); a.observation_age_ns=fit.age_ns;
+            a.limits_consistent=fit.limits_consistent;
+            const auto reason=cache_feasibility_decline(fit);
+            if(!reason.empty()) {
+                decline_cache_activation(a,reason); o.prefix_cache_reason=a.reason;
+            } else { a.B.reset(); a.prefix=false; }
+            return false;
+        }
+    }
+    return apply_automatic_cache_fit(o,fit);
+}
+// Bind the actual runner only after OFF sizing; batch N=1 remains a batch family.
+inline void finalize_cache_family(Options& o, CacheRunner runner, std::uint32_t slots,
+    const CacheFamilyIdentity& identity={}) {
+    auto& a=*o.cache_activation;
+    a.runner=runner; a.finalized=true;
+    a.context_admitted=o.context_tokens; a.slots_admitted=slots;
+    // Legacy sizing may reserve explicit cache backing. It computed no OFF plan.
+    a.context_off.reset(); a.slots_off.reset();
+    if(!a.automatic_path) {
+        a.prefix=o.prefix_cache_host_bytes!=0; a.session=o.session_management_requested;
+        a.cert_effective=o.prefix_batch_cert; a.B=o.prefix_cache_host_bytes;
+        return;
+    }
+    a.decision_phase="pre-bridge-feasibility";
+    a.context_off=o.context_tokens; a.slots_off=slots;
+    a.B=0; a.S=0; a.H=std::max(UINT64_C(4)<<30,o.known_prefill_host_headroom);
+    a.prefix=false; a.cert_effective=0; a.session=false;
+    if(o.rotary.mode()==RotaryMode::yarn) {
+        a.automatic_qualified=false; a.source="off";
+        decline_cache_activation(a,"rotary-cache-unqualified");
+        return;
+    }
+    if(runner==CacheRunner::single_mtp && (!cache_mtp_contract_qualified(o) || !identity.mtp_contract_qualified)) {
+        a.automatic_qualified=false; a.source="off";
+        decline_cache_activation(a,"mtp-contract-unqualified");
+        return;
+    }
+    const CacheQualification* matched=nullptr;
+    for (const auto& row:automatic_prefix_auto_route_qualifications)
+        if (row.matches(runner,slots,o.context_tokens,o.known_prefix_prefill_rows,identity)) { matched=&row; break; }
+    if (matched) { a.family=matched->family; a.evidence_id=matched->evidence_id; }
+    else for(const auto& row:automatic_prefix_auto_route_qualifications)
+        if(row.runner==runner && slots>=row.n_min && slots<=row.n_max && o.known_prefix_prefill_rows==row.tile) {
+            a.family=row.family; a.evidence_id=row.evidence_id; break; // candidate, never a permission
+        }
+    a.automatic_qualified=matched && matched->qualified();
+    if (runner!=CacheRunner::cli && a.session_requested && o.session_modes_suppression.empty()) {
+        a.session_reason=runner==CacheRunner::batch_mtp?"session-batch-owner-unqualified":
+            runner==CacheRunner::target?"session-owner-unavailable":
+            !o.session_mtp_fixed || !o.session_tiled_suffix?"session-numerical-contract-unqualified":"family-unqualified";
+    }
+    if (!a.prefix_requested || a.reason=="baseline" || a.reason=="defaults-suppressed") return;
+    if (a.source=="explicit" && !a.suppression.empty()) return;
+    if (runner==CacheRunner::batch_mtp) {
+        const CacheQualification* cert=nullptr;
+        for(const auto& row:automatic_prefix_batch_cert_route_qualifications)
+            if(row.use==CacheUse::batch_l0 && row.matches(runner,slots,o.context_tokens,o.known_prefix_prefill_rows,identity)) {
+                cert=&row; break;
+            }
+        const bool admitted=a.automatic_qualified && cert && cert->qualified() && a.cert_requested==1;
+        a.cert_reason=!a.cert_requested?"disabled":admitted?"pending-post-residency":"batch-scheduler-family-unqualified";
+        if(!admitted) {
+            a.reason=!a.cert_requested?"batch-cert-disabled":"batch-scheduler-family-unqualified";
+            a.source="off"; o.prefix_cache_host_bytes=0;
+            return;
+        }
+        a.reason="pending-post-residency";
+        return; // effective L0 is assigned only after the final shared fit
+    }
+    a.cert_reason=!a.cert_requested?"disabled":!a.suppression.empty()?a.suppression:
+        runner==CacheRunner::cli?a.reason:"not-applicable-non-batch";
+    if (a.source=="explicit") return; // late physical fit still required
+    if (a.reason=="pending-post-residency" && !a.automatic_qualified) {
+        a.reason=matched && matched->gpu_qualified && matched->resource_qualified && !matched->cost_qualified?
+            "cost-unqualified":runner==CacheRunner::target?"route-unqualified":"family-unqualified";
+        a.source="off";
+    }
+}
 inline EffectiveConfig resolve_effective_config(const RequestedOptions& request,
     const ModelContract& model, const gguf::FileInfo& info, const ModelManifest& manifest,
     std::string_view content, const PrefillCapabilities& capabilities, const PrefillMemory& memory) {
@@ -869,16 +1118,100 @@ inline EffectiveConfig resolve_effective_config(const RequestedOptions& request,
     }
     return result;
 }
+// Only the initial cgroup namespace and a hierarchy-root mount expose all ancestors.
+// Linux include/linux/proc_ns.h: PROC_CGROUP_INIT_INO = 0xEFFFFFFB (4026531835).
+// PID 1 namespace equality is insufficient: PID 1 can itself be in a container.
+inline void intersect_cache_cgroup_limits(PrefillMemory& result, const std::string& groups,
+    const std::filesystem::path& root, std::string_view mountinfo={},
+    std::string_view self_namespace={}) {
+    result.cache_limits_known=false;
+    if(self_namespace!="cgroup:[4026531835]") return;
+    std::istringstream group_lines(groups); std::string line, membership;
+    while(std::getline(group_lines,line)) {
+        const auto first=line.find(':');
+        const auto second=first==std::string::npos?first:line.find(':',first+1);
+        if(second==std::string::npos) return;
+        const auto controllers=","+line.substr(first+1,second-first-1)+",";
+        if(controllers.find(",memory,")!=std::string::npos) return; // v1 owns memory, including hybrid
+        if(line.starts_with("0::/")) {
+            if(!membership.empty()) return;
+            membership=line.substr(3);
+        }
+    }
+    if(membership.empty()) return;
+    std::string mount_root;
+    std::istringstream mounts{std::string(mountinfo)};
+    while(std::getline(mounts,line)) {
+        const auto separator=line.find(" - cgroup2 ");
+        if(separator==std::string::npos) continue;
+        std::istringstream fields(line.substr(0,separator));
+        std::string id,parent,device,mapped,point;
+        if(!(fields>>id>>parent>>device>>mapped>>point)) return;
+        if(point!="/sys/fs/cgroup") continue;
+        if(!mount_root.empty()) return;
+        mount_root=mapped;
+    }
+    if(mount_root!="/") return; // subtree mounts conceal possibly limiting parents
+    const auto safe=[](const std::filesystem::path& path) {
+        for(const auto& part:path) if(part=="." || part=="..") return false;
+        return true;
+    };
+    if(!safe(membership)) return;
+    const auto relative=membership.substr(1);
+    auto path=root/relative;
+    if(relative.empty()) path=root;
+    for(;;) {
+        if(path==root) {
+            std::error_code error1,error2;
+            const bool has_limit=std::filesystem::exists(path/"memory.max",error1);
+            const bool has_current=std::filesystem::exists(path/"memory.current",error2);
+            if(has_limit || has_current || error1 || error2) return;
+            break; // the global root has no memory controller files
+        }
+        const auto [limit,status]=read_linux_uma_text(path/"memory.max");
+        const auto [current,current_status]=read_linux_uma_text(path/"memory.current");
+        if(status!=LinuxUmaReadStatus::read || current_status!=LinuxUmaReadStatus::read) return;
+        try {
+            const auto token=[](const std::string& value) { return value.substr(0,value.find_first_of("\r\n \t")); };
+            const auto used=parse_u64(token(current),"cgroup memory.current");
+            if(token(limit)!="max") {
+                const auto maximum=parse_u64(token(limit),"cgroup memory.max");
+                if(used>maximum || !result.usable_ceiling) return;
+                result.usable_ceiling=std::min(*result.usable_ceiling,maximum);
+                if(result.cache_available) result.cache_available=std::min(*result.cache_available,maximum-used);
+            }
+        } catch(const std::exception&) { return; }
+        if(path==root) break;
+        path=path.parent_path();
+    }
+    result.cache_limits_known=true;
+}
 // Read sysfs only when one unambiguously selected KFD GPU is visible. Ambiguous
 // visibility is unknown capacity and declines; HIP is never initialized here.
-inline PrefillMemory observe_prefill_memory(PrefillCapabilities& capabilities) {
+inline PrefillMemory observe_prefill_memory(PrefillCapabilities& capabilities, bool cache_limits=false) {
     PrefillMemory result;
+    (void)cache_limits;
     const auto observed = observe_linux_uma_memory();
     if (observed.memory.observation_identity) {
         result.available = observed.memory.mem_available_bytes;
         result.total = observed.memory.mem_total_bytes;
+        result.observation_id=observed.memory.observation_identity;
+        result.end_steady_ns=observed.begin_steady_ns;
+        result.usable_ceiling=result.total; result.cache_available=result.available;
+        if(result.total && result.available && *result.available<=*result.total) result.resident=*result.total-*result.available;
     }
 #ifdef __linux__
+    if(cache_limits) {
+    // Cache admission must intersect cgroup limits. Unknown v1/delegated layouts
+    // decline cache admission; they do not change incumbent context/slot sizing.
+    const auto [groups,group_status]=read_linux_uma_text("/proc/self/cgroup");
+    const auto [mounts,mount_status]=read_linux_uma_text("/proc/self/mountinfo");
+    std::error_code self_error;
+    const auto self_ns=std::filesystem::read_symlink("/proc/self/ns/cgroup",self_error);
+    if(group_status==LinuxUmaReadStatus::read && mount_status==LinuxUmaReadStatus::read)
+        intersect_cache_cgroup_limits(result,groups,"/sys/fs/cgroup",mounts,
+            self_error?"":self_ns.string());
+    }
     const auto page = ::sysconf(_SC_PAGESIZE);
     if (page > 0) result.ple_reclaim_page = static_cast<std::uint64_t>(page);
     for (const char* name : {"HIP_VISIBLE_DEVICES", "ROCR_VISIBLE_DEVICES", "GPU_DEVICE_ORDINAL"})
@@ -916,6 +1249,7 @@ inline PrefillMemory observe_prefill_memory(PrefillCapabilities& capabilities) {
     };
     result.gtt_limit = read("mem_info_gtt_total");
     result.gtt_used = read("mem_info_gtt_used");
+    result.gfx_target=gfx;
     capabilities.target_qualified = gfx == 110501U;
     capabilities.fp16_operands = capabilities.target_qualified;
 #endif
@@ -1123,6 +1457,7 @@ inline std::string effective_config_json(const EffectiveConfig& config) {
         prefix.set("batch_l1_qualified",serve::Json(false));
     }
     if (!o.baseline) out << "\"prefix_cache\":" << prefix.dump() << ",";
+    out << "\"cache_policy\":" << cache_activation_json(o).dump() << ",";
     out << "\"session_cache\":" << session.dump() << ",\"http_slots\":{";
     out << "\"mode\":\"" << (o.http_batch_explicit ? (o.http_batch_cap ? "cap" : "single") : "auto")
         << "\",\"cap\":" << o.http_batch_cap << ",\"slots\":";

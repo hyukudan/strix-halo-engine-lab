@@ -76,6 +76,7 @@
 #include "hip_http_serve.hpp"
 #include "hip_prefix_state_cache.hpp"
 #include "strix/mtp_step_logits_digest.hpp"
+#include "qwen_cache_family_contract.hpp"
 #include "hip_mtp_cohort_bridge.hpp"
 #include "hip_mtp_cohort_tiled.hpp"
 #if defined(STRIX_MTP_MODEL_QUALIFICATION_RUNNER)
@@ -1038,6 +1039,60 @@ std::uint32_t prefix_cache_unit(const O& options) {
 #ifndef STRIX_DECODE_ENTRY
 #define STRIX_DECODE_ENTRY main
 #endif
+// Qualification uses a canonical capacity layout; actual context remains an explicit
+// range predicate. This never replaces the storage/certificate identity.
+static strix::decode_cli::CacheFamilyIdentity resolved_cache_family(
+    const strix::decode_cli::Options& options, const strix::ModelContract& source_model,
+    const strix::ModelManifest& manifest, const strix::MappedModelFile& mapped) {
+    auto model=source_model;
+    model.attention_kv_storage=options.attention_kv_storage;
+    strix::SerialSessionStateLayoutRequest family_layout;
+    family_layout.context_tokens=16384;
+    family_layout.recurrent_storage=options.gdn_recurrent_storage;
+    strix::decode_cli::CacheFamilyIdentity cache_family;
+    using namespace strix::decode_cli;
+    cache_family.mtp_contract_qualified=cache_mtp_contract_qualified(options) && cache_mtp_vocabulary_qualified(options);
+    cache_family.model=strix::model_content_identity_hex(mapped.file_sha256());
+    cache_family.layout=std::to_string(manifest.layout_identity)+":"+std::to_string(strix::build_serial_session_state_layout(model, family_layout).layout_identity);
+    cache_family.tokenizer=cache_family.model; // tokenizer is in the same full GGUF
+    cache_family.sidecar=strix::model_content_identity_hex(strix::session_cached_file_hash(options.mtp.sidecar));
+    cache_family.golden=cache_family.replay=strix::model_content_identity_hex(strix::session_cached_file_hash(options.mtp.golden));
+    PrefillCapabilities cache_caps;
+    const auto cache_observation=observe_prefill_memory(cache_caps);
+    if(cache_observation.gfx_target) cache_family.gfx="gfx"+std::to_string(*cache_observation.gfx_target/10000)+std::to_string((*cache_observation.gfx_target/100)%100)+std::to_string(*cache_observation.gfx_target%100)+":"+std::to_string(*cache_observation.gfx_target);
+    int runtime=0,driver=0;
+    if(hipRuntimeGetVersion(&runtime)==hipSuccess && hipDriverGetVersion(&driver)==hipSuccess)
+        cache_family.build_family=std::string(__VERSION__)+":"+std::to_string(runtime)+":"+std::to_string(driver);
+    cache_family.kv_precision=std::to_string(static_cast<unsigned>(options.attention_kv_storage));
+    cache_family.recurrent_precision=std::to_string(static_cast<unsigned>(options.gdn_recurrent_storage));
+    const auto profiles=numerical_profile_pair(options);
+    cache_family.prefill_profile=numerical_profile_name(profiles.prefill);
+    cache_family.decode_profile=numerical_profile_name(profiles.decode);
+    cache_family.profile_pair=std::to_string(strix::numerical_profile_pair_identity(profiles));
+    cache_family.output_policy=std::to_string(static_cast<unsigned>(options.known_prefix_output_policy));
+    cache_family.numerical_contract=strix::model_content_identity_hex(cache_family_execution_signature(
+        cache_family_execution_cli(options),options.baseline,strix::qpf2k::has_gsq_gate(manifest),model.rotary_identity()));
+    cache_family.tails=options.known_prefix_tail_rows;
+    const auto number=[](const char* name,std::uint64_t fallback) {
+        const char* value=std::getenv(name); return value?static_cast<std::uint64_t>(std::strtoull(value,nullptr,0)):fallback;
+    };
+    auto& c=cache_family.scheduler;
+    c.schedule=number("STRIX_QPF2K_SCHED",0); c.pipe=number("STRIX_PREFILL_PIPE",0);
+    c.groups=strix::decode_cli::MtpBatchRunner::prompt_batching(); c.group_rows=strix::decode_cli::MtpBatchRunner::prompt_group_rows(); c.group_owner=(number("STRIX_PROMPT_BATCH_ROWS",0)>options.known_prefix_prefill_rows);
+    c.cohort=strix::decode_cli::MtpBatchRunner::prompt_window_cohort(); c.small=number("STRIX_BATCH_PROMPT_SMALL",0)!=0;
+    c.windows=number("STRIX_PROMPT_WINDOW",1)!=0;
+    c.nest_rows=number("STRIX_BATCH_NEST_ROWS",2048); c.short_rows=number("STRIX_BATCH_SHORT_FIRST_ROWS",2048);
+    c.lookahead=number("STRIX_BATCH_SERVICE_LOOKAHEAD",2); c.cancel=number("STRIX_BATCH_CANCEL_POINTS",1)!=0;
+    c.interleave=number("STRIX_BATCH_INTERLEAVE",options.http_serve?1:0);
+    const char* service=std::getenv("STRIX_BATCH_SERVICE_MS"); c.service_ms=service?std::max(0.0,std::atof(service)):250;
+    const char* share=std::getenv("STRIX_BATCH_PROMPT_SHARE"); c.prompt_share=share?std::max(0.0,std::atof(share)):0;
+    const char* shared=std::getenv("STRIX_PROMPT_BATCH_SHARED"); c.shared=shared?shared:"hc,router,moe,elementwise";
+    c.priming=(c.pipe&2)!=0; c.worker=(c.pipe&32)!=0;
+    c.tiled_start=number("STRIX_MTP_TILED_START",1)!=0;
+    c.merge=(c.schedule&16)!=0; c.balance=(c.schedule&4)!=0;
+    return cache_family;
+}
+
 static int run_decode_entry(
     int argc,
     char** argv, strix::decode_cli::MtpBundleSetupRetry bundle_retry = {}) try {
@@ -1048,6 +1103,7 @@ static int run_decode_entry(
             "  --baseline / STRIX_BASELINE=1 (historical resolution, controlled defaults off)\n"
             "  --print-effective-config (deterministic host JSON; exits before HIP setup)\n"
             "  --mtp-bundle FILE (YaRN MTP pins/policy/budgets; otherwise discover MODEL.gguf.mtp-bundle.json)\n"
+            "  --print-cache-family (resolved qualification identity; hashes assets, no inference)\n"
             "  --prefill-numerical-profile dense-a8|fast-prefill-f16wmma-v1 (automatic tiled default: FP16)\n"
             "  STRIX_PREFILL_F16=0 restores historical resolution of the same argv\n"
             "  --known-prefix-prefill-rows 16..8192; route/full-rows/union/router/prefill-rows accept =0\n"
@@ -1083,6 +1139,7 @@ static int run_decode_entry(
             "  --session-save DIR | --session-load DIR | --session-live-control [--session-then-prompt FILE] [--session-logits FILE]\n"
             "  --session-first-generate N (first turn only); --session-capture-host-bytes N (default 8 GiB); --session-validate-only (CPU preflight)\n"
             "  --prefix-batch-cert 0|1|capture|l0|l1 (default 0; 1=l0; l1 capture-only until qualified)\n"
+            "      Automatic policy requests L0 only without explicit storage controls; unqualified families decline.\n"
             "  --prefix-cache-staging-bytes N (0: one T-block plus fixed state; STRIX_PREFIX_CACHE_STAGING_BYTES)\n"
             "  --prefix-cache-host-bytes N [--prefix-cache-dir DIR [--prefix-cache-disk-bytes N]] [--prefix-cache-every N]\n"
             "      [--prefix-cache-then-prompt FILE ...] (block-boundary prefix state cache, tiled known-prefix prefill only)\n"
@@ -1113,7 +1170,7 @@ static int run_decode_entry(
     options.mtp_cli_phase_retirement=false;
 #endif
     const auto startup_preflight = strix::emit_qwen_startup_diagnostics(
-        options.print_effective_config || strix::decode_cli::yarn_bundle_serial_retry);
+        options.print_effective_config || options.print_cache_family || strix::decode_cli::yarn_bundle_serial_retry);
     const auto release_assets = strix::decode_cli::verify_http_release_assets(options);
     // Bind supplied numerical settings; operational paths, switches and budgets are excluded.
     const std::set<std::string_view> session_io_options{"--session-save", "--session-load", "--session-then-prompt", "--session-logits",
@@ -1504,6 +1561,11 @@ static int run_decode_entry(
         throw std::invalid_argument("batched MoE activation requires resolved Q4K A8 gate/up execution");
     if (options.moe_shared_overlap && !options.deferred_moe_status)
         throw std::invalid_argument("MoE shared overlap requires the resolved eager deferred-status owner");
+    if (options.print_cache_family) {
+        const auto identity=resolved_cache_family(options,model,manifest,mapped);
+        std::cout << strix::decode_cli::cache_family_identity_json(identity).dump() << '\n';
+        return 0;
+    }
     std::optional<strix::LoadedOfflineTuningCache> loaded_offline_tuning;
     if (!options.offline_tuning_cache_path.empty())
         loaded_offline_tuning.emplace(strix::load_offline_tuning_cache_file(options.offline_tuning_cache_path));
@@ -2931,6 +2993,103 @@ static int run_decode_entry(
     std::unique_ptr<strix::decode_cli::HipPrefixStateCacheSession> rtx_state_session;
     strix::ModelContentIdentity prefix_cache_identity;
     std::uint64_t prefix_cache_every = 0;
+    std::function<void(bool)> enable_prefix_store;
+    std::function<void()> prepare_prefix_state;
+    // OFF commitments are fixed before a cache budget is fitted. Until all
+    // native owners are present, reserve their declared setup upper bounds.
+    std::optional<std::uint64_t> cache_future_commitment, cache_ready_commitment;
+    std::optional<std::uint64_t> cache_slot_retained, cache_slot_native;
+    std::uint64_t cache_prompt_transient=0;
+    const auto cache_fit_observation = [&](bool ready) {
+        using namespace strix::decode_cli;
+        PrefillCapabilities caps;
+        const auto observed=observe_prefill_memory(caps,true);
+        CacheLateFit fit;
+        fit.observation_id=observed.observation_id;
+        const auto now=static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count());
+        fit.age_ns=now>=observed.end_steady_ns?now-observed.end_steady_ns:UINT64_MAX;
+        fit.U=observed.usable_ceiling; fit.A=observed.cache_available; fit.L=observed.resident;
+        fit.limits_consistent=observed.cache_limits_known;
+        fit.cgroup_ancestry_unproven=!observed.cache_limits_known;
+        fit.aliasing_known=base_runtime_owner_inventory && base_runtime_owner_inventory->unique_backing_reserved_bytes.has_value();
+        if(fit.L && fit.aliasing_known) fit.L=std::max(*fit.L,*base_runtime_owner_inventory->unique_backing_reserved_bytes);
+        intersect_cache_capacity(fit,options.known_prefill_uma_budget);
+        fit.F=cache_unpaid_commitment(ready,cache_future_commitment,cache_ready_commitment);
+        fit.headroom=options.known_prefill_host_headroom;
+        fit.context_off=fit.context=options.context_tokens;
+        fit.slots_off=fit.slots=options.http_batch?options.http_batch:1;
+        if(options.cache_activation->source=="explicit") fit.explicit_budget=options.prefix_cache_host_bytes;
+        // Metadata/certificates charged by the payload ledger stay in B.
+        // E below bounds token copies, index/control nodes and lookup scratch.
+        fit.S=0; fit.device_unpaid=fit.F;
+        if(observed.gtt_limit && observed.gtt_used && *observed.gtt_used<=*observed.gtt_limit)
+            fit.device_free=*observed.gtt_limit-*observed.gtt_used;
+        try {
+            auto checkpoint=prefill_checked_add(state_layout.device_total_bytes,state_layout.host_total_bytes);
+            if(options.mtp.enabled) {
+                const auto mul=[](std::uint64_t a,std::uint64_t b) {
+                    if(b && a>UINT64_MAX/b) throw std::overflow_error("cache checkpoint overflow");
+                    return a*b;
+                };
+                const auto predictor_row=prefill_checked_add(mul(mul(model.kv_heads,model.head_dim),4),mul(model.indexer_head_dim,2));
+                checkpoint=prefill_checked_add(checkpoint,prefill_checked_add(16U<<20,mul(options.context_tokens,predictor_row)));
+            }
+            std::uint64_t rows=0,fixed=0;
+            for(const auto& allocation:state_layout.allocations) {
+                if(allocation.component==strix::SessionStateComponent::attention_kv || allocation.component==strix::SessionStateComponent::sparse_index) {
+                    if(!state_layout.context_tokens || allocation.bytes%state_layout.context_tokens) { fit.aliasing_known=false; break; }
+                    rows=prefill_checked_add(rows,allocation.bytes/state_layout.context_tokens);
+                } else fixed=prefill_checked_add(fixed,prefill_checked_add(allocation.bytes,255)&~UINT64_C(255));
+            }
+            if(options.mtp.enabled) {
+                const auto predictor_row=prefill_checked_mul(model.mtp_full_attention_layers,
+                    prefill_checked_add(prefill_checked_mul(prefill_checked_mul(model.kv_heads,model.head_dim),4),prefill_checked_mul(model.indexer_head_dim,2)));
+                // One process-wide K=1 slab, never multiplied by the slot count.
+                fit.S=prefill_checked_add(qwen_batch_staging_cap(options.prefix_cache_staging_bytes,rows,fixed,predictor_row,
+                    prefill_checked_mul(prefill_checked_mul(model.hidden_size,model.hc_count),2),options.known_prefix_prefill_rows),1U<<20);
+            }
+            const auto cap=options.cache_activation->source=="explicit"?options.prefix_cache_host_bytes:UINT64_C(4)<<30;
+            const auto unit=prefix_cache_unit(options);
+            const auto segment=prefill_checked_mul(rows,unit);
+            if(!fixed || !segment || !unit) fit.E.reset();
+            else {
+                const auto segments=prefill_checked_add(cap/segment,1);
+                const auto checkpoints=prefill_checked_add(cap/fixed,1);
+                // 4 KiB per object/control node, 16 bounded conversation keys
+                // (128 bytes each), geometric vector growth, plus one request's
+                // whole-context lookup token copy. Encoded metadata is in B.
+                const auto per_segment=prefill_checked_add(4096,prefill_checked_mul(unit,8));
+                const auto per_checkpoint=prefill_checked_add(4096+16*256,
+                    prefill_checked_mul(options.context_tokens/unit+1,32));
+                fit.E=prefill_checked_add(prefill_checked_mul(segments,per_segment),
+                    prefill_checked_add(prefill_checked_mul(checkpoints,per_checkpoint),prefill_checked_mul(options.context_tokens,8)));
+                if(!options.prefix_cache_dir.empty()) fit.E=prefill_checked_add(*fit.E,prefill_checked_mul(checkpoint,2));
+            }
+            const auto tile=options.known_prefix_prefill_rows;
+            const auto cadence=prefix_capture_cadence(tile,options.prefix_cache_every);
+            const auto first=minimum_prefix_capture_boundary(tile,options.context_tokens,cadence);
+            auto checkpoint_rows=rows, checkpoint_fixed=fixed;
+            if(options.mtp.enabled) {
+                checkpoint_rows=prefill_checked_add(checkpoint_rows,prefill_checked_mul(model.mtp_full_attention_layers,
+                    prefill_checked_add(prefill_checked_mul(prefill_checked_mul(model.kv_heads,model.head_dim),4),prefill_checked_mul(model.indexer_head_dim,2))));
+                checkpoint_fixed=prefill_checked_add(checkpoint_fixed,16U<<20);
+            }
+            fit.checkpoint=first && first<options.context_tokens?
+                prefill_checked_add(checkpoint_fixed,prefill_checked_mul(checkpoint_rows,first)):0;
+        } catch(const std::overflow_error&) { fit.F=UINT64_MAX; }
+        if(ready && prefix_store) {
+            const auto live=prefix_store->counters();
+            fit.explicit_budget=options.cache_activation->B; // recheck the already fitted cap
+            fit.resident_payload=live.host_bytes; fit.resident_staging=std::max(live.staging_bytes,live.pool_staging_bytes);
+        }
+        return fit;
+    };
+    const auto apply_cache_fit = [&](bool ready) {
+        using namespace strix::decode_cli;
+        const auto fit=cache_fit_observation(ready);
+        return prepare_automatic_cache_fit(options,fit,ready);
+    };
     std::uint64_t known_prefix_union_bytes = 0; // routed-union scratch of the tiled prefill owners (0: none)
     // Prompt groups of the batched tiled MTP prompt (STRIX_PROMPT_BATCH_ROWS above T): a tiled owner of that many rows
     // with its own arena, on which the blocks of several requests run as one segmented prefill.
@@ -3239,6 +3398,7 @@ static int run_decode_entry(
                 known_group_memory->scratch, model.vocab_size, original_work_device);
         }
         // Sessions use the registry without legacy prefix lookup/capture in every arm.
+        if(!options.cache_activation->automatic_path) {
         const bool rtx_state_registry = session_cache_enabled || (!strix::decode_cli::prefix_state_cache_requested(options) &&
             (options.known_prefix_prefill_rows && options.known_prefix_window) &&
                 (options.rtx_state_import || strix::decode_cli::rtx_state_export_request() ||
@@ -3288,6 +3448,87 @@ static int run_decode_entry(
                 prefix_state->set_staging_cap(options.prefix_cache_staging_bytes);
             }
         }
+        } else {
+        const bool rtx_state_registry = session_cache_enabled ||
+            strix::decode_cli::cache_startup_observer_required(options,
+                options.rtx_state_import || strix::decode_cli::rtx_state_export_request(),
+                strix::decode_cli::prompt_state_digest_request(strix::decode_cli::prefix_batch_cert_execution_mode(options)));
+        prepare_prefix_state=[&,rtx_state_registry] {
+
+            if (options.prefix_cache_host_bytes || (options.cache_activation->prefix_requested &&
+                options.cache_activation->automatic_qualified && options.cache_activation->suppression.empty() &&
+                options.cache_activation->source!="off") || rtx_state_registry) {
+                if (!known_prefill_plan || !known_prefix_backend)
+                    throw std::logic_error("prefix state cache reached a route other than the tiled known-prefix prefill");
+                const auto pair = strix::decode_cli::numerical_profile_pair(options);
+                strix::decode_cli::PrefixStateCacheIdentityInputs in;
+                in.model_content = model_residency.binding().model_content_identity;
+                std::string execution_cli;
+                for(const auto& arg : strix::decode_cli::effective_prefill_argv(options))
+                    execution_cli += std::to_string(arg.size())+":"+arg;
+                in.effective_execution = strix::decode_cli::prefix_effective_execution_signature(
+                    execution_cli, options.baseline, strix::qpf2k::has_gsq_gate(manifest), model.rotary_identity());
+                if (!options.prefix_cache_dir.empty()) in.engine_build = strix::decode_cli::prefix_state_cache_engine_build();
+                in.state_layout_identity = state_layout.layout_identity;
+                in.runtime_compatibility_identity = identities.compatibility_identity;
+                in.decode_execution_identity = compiled.execution_identity;
+                in.decode_kernel_plan_identity = compiled.kernel_plan_identity;
+                in.prefill_execution_identity = compiled_prefill ? compiled_prefill->execution_identity : compiled.execution_identity;
+                in.prefill_kernel_plan_identity = compiled_prefill ? compiled_prefill->kernel_plan_identity : compiled.kernel_plan_identity;
+                in.tiled_execution_identity = known_prefill_plan->prefill_execution_identity;
+                in.tiled_kernel_plan_identity = known_prefill_plan->prefill_kernel_plan_identity;
+                in.prefill_profile_identity = strix::numerical_profile_identity(pair.prefill);
+                in.decode_profile_identity = strix::numerical_profile_identity(pair.decode);
+                in.profile_pair_identity = strix::numerical_profile_pair_identity(pair);
+                in.block_rows = options.known_prefix_prefill_rows;
+                in.tail_rows = options.known_prefix_tail_rows;
+                in.context_tokens = options.context_tokens;
+                prefix_cache_identity = strix::decode_cli::prefix_state_cache_identity(in);
+                const std::uint64_t rows = options.known_prefix_prefill_rows;
+                if (rtx_state_registry && !rtx_state_session) {
+                    rtx_state_session = std::make_unique<strix::decode_cli::HipPrefixStateCacheSession>(nullptr,
+                        prefix_cache_identity, options.known_prefix_prefill_rows, rows, model, state_layout, memory.state());
+                }
+                {
+                    enable_prefix_store = [&,rows](bool ready) {
+                        if(!options.cache_activation->prefix_requested ||
+                            (!options.prefix_cache_host_bytes && (!options.cache_activation->automatic_qualified ||
+                                !options.cache_activation->suppression.empty() || options.cache_activation->source=="off")) ||
+                            !apply_cache_fit(ready)) return;
+                        try {
+                            prefix_cache_every = options.prefix_cache_every ? options.prefix_cache_every
+                                : strix::decode_cli::prefix_capture_cadence(rows,0);
+                            prefix_store = std::make_shared<strix::PrefixStateCache>(strix::PrefixStateCachePolicy{
+                                options.prefix_cache_host_bytes, options.prefix_cache_dir, options.prefix_cache_disk_bytes,
+                                options.prefix_cache_retention == "fair" ? strix::PrefixCacheRetention::fair : strix::PrefixCacheRetention::lru, options.baseline},
+                                options.baseline ? strix::decode_cli::hip_pinned_prefix_buffer : strix::decode_cli::hip_pinned_prefix_capture_buffer);
+                            options.state_cache_stats->publish(strix::decode_cli::prefix_snapshot(*prefix_store));
+                            prefix_state = std::make_unique<strix::decode_cli::HipPrefixStateCacheSession>(prefix_store,
+                                prefix_cache_identity, prefix_cache_unit(options), prefix_cache_every, model, state_layout,
+                                memory.state());
+                            prefix_state->set_staging_cap(options.prefix_cache_staging_bytes);
+                        } catch(const std::exception&) {
+                            // One rollback for every partial setup, including failure
+                            // after publishing the store but before registry completion.
+                            strix::decode_cli::decline_cache_activation(*options.cache_activation,"cache-setup-allocation-failed");
+                            options.prefix_cache_reason=options.cache_activation->reason;
+                            options.prefix_cache_host_bytes=0; prefix_state.reset(); prefix_store.reset();
+                            options.state_cache_stats->publish({});
+                        }
+                    };
+                }
+            }
+        };
+        if(rtx_state_registry) prepare_prefix_state();
+        }
+    }
+    if (!options.mtp.enabled) {
+        strix::decode_cli::finalize_cache_family(options,options.http_serve?strix::decode_cli::CacheRunner::target:strix::decode_cli::CacheRunner::cli,1);
+        if(prepare_prefix_state) prepare_prefix_state();
+        if(strix::decode_cli::automatic_cache_work(options)) {
+            if(enable_prefix_store) enable_prefix_store(false);
+        }
+        std::cerr << "qwen cache policy: " << strix::decode_cli::cache_activation_json(options).dump() << '\n';
     }
 
 #if defined(STRIX_MTP_MODEL_QUALIFICATION_RUNNER)
@@ -3651,7 +3892,8 @@ static int run_decode_entry(
             const auto fixed_headroom = options.known_prefill_headroom_explicit ? options.known_prefill_host_headroom : UINT64_C(4) << 30U;
             // Shared bridge assets and the cache's future payload are not resident
             // at this observation boundary. Reserve them once, never per slot.
-            auto headroom = add(fixed_headroom, options.prefix_cache_host_bytes);
+            // The automatic cache budget is fitted after residency; reserve only explicit payload here.
+            auto headroom = add(fixed_headroom, options.cache_activation->automatic_path ? UINT64_C(0) : options.prefix_cache_host_bytes);
             // UMA: K=1 device staging and pinned host payload share physical RAM.
             // Initial sizing reserves the peak; growth reserves only its outstanding fraction.
             const auto staging_reserve=qwen_http_batch_staging_reserve(options,model,state_layout);
@@ -3686,6 +3928,21 @@ static int run_decode_entry(
                     return HttpBridgeGrowthObservation{pressure.available,gtt_free(pressure),
                         stats.host_bytes,stats.staging_bytes};
                 });
+            if(options.cache_activation->automatic_path) {
+                cache_slot_retained=retained;
+                const auto mul=strix::decode_cli::prefill_checked_mul;
+                // Native owner budgets bound the geometry charged in serving.slot_*.
+                cache_slot_native=add(add(options.mtp.runtime_bytes,options.mtp.window_total_bytes),options.mtp.target_capture_bytes);
+                // Request admission builds taps, draft/greedy heads and scratch.
+                // Keep all of them unpaid even when the lane's native owners exist.
+                const auto width=mul(mul(model.hidden_size,model.hc_count),2U);
+                const bool subset=!options.mtp.draft_vocab.empty() || options.mtp.draft_context_vocab;
+                const auto row=subset ? mul(model.hidden_size/32U,options.mtp.draft_q4?18U:34U) : 0U;
+                cache_prompt_transient=add(mul(mul(2U,options.known_prefix_prefill_rows),width),mul(2U,width));
+                cache_prompt_transient=add(cache_prompt_transient,mul(model.vocab_size,add(row,77U)));
+                cache_prompt_transient=add(cache_prompt_transient,add(mul((model.vocab_size+255U)/256U,32U),4096U));
+                cache_prompt_transient=add(cache_prompt_transient,4U*(11U*640U+1U)+2U*4U*10240U*4U);
+            }
             options.http_slot_reason = "limited by " + capacity.limiting;
             batch_slots = !single_route && (capacity.slots > 1U || (options.http_batch_explicit && options.http_batch_cap == 1U))
                 ? capacity.slots : 0U;
@@ -3706,6 +3963,119 @@ static int run_decode_entry(
             // The measurement probe is retained only if it belongs to the eager part.
             if (eager_slots == 1U) batch_stacks.clear();
         }
+        using strix::decode_cli::prefill_checked_add;
+        using strix::decode_cli::prefill_checked_mul;
+        if(options.cache_activation->automatic_path && std::any_of(
+            std::begin(strix::decode_cli::automatic_prefix_auto_route_qualifications),
+            std::end(strix::decode_cli::automatic_prefix_auto_route_qualifications),[](const auto& row) {return row.qualified();})) try {
+            const auto shared=prefill_checked_add(std::max(options.mtp.sidecar_retained_bytes,options.mtp.sidecar_setup_bytes),
+                prefill_checked_add(options.mtp.golden_max_bytes,options.mtp.replay_host_bytes));
+            if(batch_slots && cache_slot_retained && cache_slot_native) {
+                cache_future_commitment=prefill_checked_add(strix::decode_cli::cache_unpaid_slot_bytes(
+                    *cache_slot_retained,*cache_slot_native,cache_prompt_transient,batch_slots,1U+batch_stacks.size(),0),shared);
+                cache_ready_commitment=strix::decode_cli::cache_unpaid_slot_bytes(
+                    *cache_slot_retained,*cache_slot_native,cache_prompt_transient,batch_slots,eager_slots,eager_slots);
+            } else {
+                auto future=prefill_checked_add(options.mtp.runtime_bytes,options.mtp.window_total_bytes);
+                future=prefill_checked_add(future,options.mtp.target_capture_bytes);
+                const auto resident_native=future;
+                const auto width=prefill_checked_mul(prefill_checked_mul(model.hidden_size,model.hc_count),2);
+                const bool subset=!options.mtp.draft_vocab.empty() || options.mtp.draft_context_vocab;
+                const auto row=subset?prefill_checked_mul(model.hidden_size/32U,options.mtp.draft_q4?18U:34U):0U;
+                future=prefill_checked_add(future,prefill_checked_mul(width,2));
+                future=prefill_checked_add(future,prefill_checked_mul(model.vocab_size,prefill_checked_add(row,77U)));
+                future=prefill_checked_add(future,prefill_checked_add(prefill_checked_mul((model.vocab_size+255U)/256U,32U),4096U));
+                future=prefill_checked_add(future,4U*(11U*640U+1U)+2U*4U*10240U*4U);
+                const char* pipe=std::getenv("STRIX_PREFILL_PIPE");
+                const auto copies=pipe && (std::strtoul(pipe,nullptr,0)&1U)?2U:1U;
+                cache_prompt_transient=prefill_checked_mul(prefill_checked_mul(prefill_checked_mul(
+                    options.known_prefix_prefill_rows,model.hidden_size),model.hc_count),2U*copies);
+                cache_prompt_transient=prefill_checked_add(cache_prompt_transient,future-resident_native);
+                cache_future_commitment=prefill_checked_add(prefill_checked_add(resident_native,shared),cache_prompt_transient);
+                // CLI retains the full unpaid bound until its native setup completes.
+                cache_ready_commitment=cache_prompt_transient;
+            }
+        } catch(const std::overflow_error&) { cache_future_commitment=cache_ready_commitment=UINT64_MAX; }
+        strix::decode_cli::CacheFamilyIdentity cache_family;
+        const auto cache_runner=!options.http_serve?strix::decode_cli::CacheRunner::cli:
+            batch_slots?strix::decode_cli::CacheRunner::batch_mtp:strix::decode_cli::CacheRunner::single_mtp;
+        const bool inspect_qualified_family=options.cache_activation->automatic_path && options.cache_activation->prefix_requested &&
+            options.cache_activation->suppression.empty() && options.cache_activation->source!="off" &&
+            std::any_of(std::begin(strix::decode_cli::automatic_prefix_auto_route_qualifications),
+                std::end(strix::decode_cli::automatic_prefix_auto_route_qualifications),[&](const auto& row) {
+                    return row.qualified() && row.runner==cache_runner && (batch_slots?batch_slots:1)>=row.n_min &&
+                        (batch_slots?batch_slots:1)<=row.n_max && options.known_prefix_prefill_rows==row.tile;
+                });
+        if(inspect_qualified_family) {
+            // Hash work is deferred until a release row exists. Paths never serve
+            // as asset identity; unknown assets leave the family unmatched.
+            cache_family=resolved_cache_family(options,model,manifest,mapped);
+        }
+        strix::decode_cli::finalize_cache_family(options,cache_runner,
+            static_cast<std::uint32_t>(batch_slots?batch_slots:1),cache_family);
+        if(prepare_prefix_state) prepare_prefix_state();
+        if(strix::decode_cli::automatic_cache_work(options)) {
+            if(enable_prefix_store) enable_prefix_store(false);
+        }
+        if(rtx_state_session && !prefix_state) parents->tiled.cache=rtx_state_session.get();
+        if(prefix_state) {
+            parents->tiled.cache=prefix_state.get();
+            parents->tiled.cache_tails=prefix_cache_unit(options)<options.known_prefix_prefill_rows;
+        }
+        if(options.cache_activation->automatic_path && prefix_store) try {
+            for(auto& stack:batch_stacks) {
+                // The OFF measurement probe predates store admission. Attach only
+                // its optional cache registry now; retain its original state/owners.
+                stack->cache=std::make_unique<strix::decode_cli::HipPrefixStateCacheSession>(prefix_store,
+                    prefix_cache_identity,prefix_cache_unit(options),prefix_cache_every,model,state_layout,stack->memory->state());
+                stack->cache->set_staging_cap(options.prefix_cache_staging_bytes);
+                stack->parents->tiled.cache=stack->cache.get();
+                stack->parents->tiled.cache_tails=prefix_cache_unit(options)<options.known_prefix_prefill_rows;
+            }
+        } catch(const std::exception&) {
+            // No cache copies have been submitted during startup registry setup.
+            strix::decode_cli::decline_cache_activation(*options.cache_activation,"cache-setup-allocation-failed");
+            options.prefix_cache_reason=options.cache_activation->reason; options.prefix_cache_host_bytes=0;
+            parents->tiled.cache=rtx_state_session.get();
+            for(auto& stack:batch_stacks) {
+                if(stack->cache) stack->cache->disable_store_before_ready();
+                stack->parents->tiled.cache=stack->cache.get();
+            }
+            prefix_state.reset(); prefix_store.reset(); options.state_cache_stats->publish({});
+        }
+        if(options.cache_activation->automatic_path && options.cache_activation->source=="auto" &&
+            cache_runner==strix::decode_cli::CacheRunner::single_mtp &&
+            options.cache_activation->automatic_qualified &&
+            options.cache_activation->reason=="pending-post-residency") {
+            options.cache_attach_ready=[&,parents] {
+                if(enable_prefix_store) enable_prefix_store(true);
+                if(prefix_state) {
+                    parents->tiled.cache=prefix_state.get();
+                    parents->tiled.cache_tails=prefix_cache_unit(options)<options.known_prefix_prefill_rows;
+                }
+            };
+            options.cache_attach_rollback=[&,parents] {
+                parents->tiled.cache=rtx_state_session.get();
+                parents->tiled.cache_tails=false;
+                prefix_state.reset(); prefix_store.reset();
+                const auto reason=options.cache_activation->reason=="capture-pool-allocation-failed"?
+                    "capture-pool-allocation-failed":"cache-setup-allocation-failed";
+                strix::decode_cli::decline_cache_activation(*options.cache_activation,reason);
+                options.prefix_cache_reason=options.cache_activation->reason;
+                options.prefix_cache_host_bytes=0; options.state_cache_stats->publish({});
+            };
+        }
+        options.cache_readiness_recheck=[&] {
+            if(options.cache_activation->decision_phase!="post-residency-ready" &&
+                strix::decode_cli::automatic_cache_work(options) && options.cache_activation->prefix && !apply_cache_fit(true) && prefix_state) {
+                prefix_state->disable_store_before_ready();
+                for(auto& stack:batch_stacks) if(stack->cache) stack->cache->disable_store_before_ready();
+                prefix_store.reset();
+                options.state_cache_stats->publish({});
+            }
+            std::cerr << "qwen cache policy: " << strix::decode_cli::cache_activation_json(options).dump() << '\n';
+        };
+
         if (options.http_serve) {
             std::cerr << "http slots " << (batch_slots ? batch_slots : 1U) << " (";
             if (options.http_batch_explicit && !options.http_batch_cap) std::cerr << "explicit single route";

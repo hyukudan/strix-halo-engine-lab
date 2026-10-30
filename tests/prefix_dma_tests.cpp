@@ -1,15 +1,20 @@
 #include "../apps/hip_prefix_state_cache.hpp"
 #include "strix/prompt_terminal_diagnostics.hpp"
 #include "strix/mtp_target_window_payload.hpp"
+#include "../apps/state_cache_stats.hpp"
 #include <stdexcept>
 #include <deque>
 #include <map>
 #include <iostream>
 
+extern thread_local bool prefix_test_fail_host_allocations;
+
 namespace {
 bool queued = false, freed_pending = false, allocation_failure = false;
 hipError_t drain_error = hipSuccess, copy_error = hipSuccess;
-unsigned calls = 0, waits = 0, copies = 0;
+unsigned calls = 0, waits = 0, copies = 0, live_streams = 0, streams_created = 0;
+unsigned resource_calls=0;
+bool stream_failure=false;
 bool snapshot_shim=false;
 struct ShimEvent {bool ready=false;};
 std::map<hipStream_t,std::deque<std::function<bool()>>> operations;
@@ -20,8 +25,8 @@ void pump(hipStream_t stream) {
 
 void require(bool ok, const char* why) { if (!ok) throw std::runtime_error(why); }
 }
-extern "C" hipError_t hipStreamCreateWithFlags(hipStream_t* p, unsigned) { *p = reinterpret_cast<void*>(1); return hipSuccess; }
-extern "C" hipError_t hipStreamDestroy(hipStream_t) { return hipSuccess; }
+extern "C" hipError_t hipStreamCreateWithFlags(hipStream_t* p, unsigned) { ++resource_calls; if(stream_failure) return hipErrorOutOfMemory; ++live_streams; ++streams_created; *p = reinterpret_cast<void*>(1); return hipSuccess; }
+extern "C" hipError_t hipStreamDestroy(hipStream_t) { ++resource_calls; --live_streams; return hipSuccess; }
 extern "C" hipError_t hipDeviceSynchronize() { return hipSuccess; }
 extern "C" hipError_t hipStreamSynchronize(hipStream_t stream) {
     ++waits;
@@ -37,13 +42,14 @@ extern "C" hipError_t hipMemcpyAsync(void* dest, const void* src, std::size_t n,
     return copy_error;
 }
 extern "C" hipError_t hipMalloc(void** p,std::size_t n) {
-    if(allocation_failure) return hipErrorOutOfMemory;
+    ++resource_calls; if(allocation_failure) return hipErrorOutOfMemory;
     *p=new std::byte[n];return hipSuccess;
 }
-extern "C" hipError_t hipFree(void* p) {delete[] static_cast<std::byte*>(p);return hipSuccess;}
-extern "C" hipError_t hipEventCreateWithFlags(hipEvent_t* p,unsigned) {*p=new ShimEvent;return hipSuccess;}
-extern "C" hipError_t hipEventDestroy(hipEvent_t p) {delete static_cast<ShimEvent*>(p);return hipSuccess;}
+extern "C" hipError_t hipFree(void* p) {++resource_calls;delete[] static_cast<std::byte*>(p);return hipSuccess;}
+extern "C" hipError_t hipEventCreateWithFlags(hipEvent_t* p,unsigned) {++resource_calls;*p=new ShimEvent;return hipSuccess;}
+extern "C" hipError_t hipEventDestroy(hipEvent_t p) {++resource_calls;delete static_cast<ShimEvent*>(p);return hipSuccess;}
 extern "C" hipError_t hipEventRecord(hipEvent_t p,hipStream_t stream) {
+    static_cast<ShimEvent*>(p)->ready=false;
     operations[stream].push_back([=] {static_cast<ShimEvent*>(p)->ready=true;return true;});return hipSuccess;
 }
 extern "C" hipError_t hipEventQuery(hipEvent_t p) {
@@ -58,14 +64,135 @@ extern "C" hipError_t hipEventSynchronize(hipEvent_t p) {
 extern "C" hipError_t hipStreamWaitEvent(hipStream_t stream,hipEvent_t p,unsigned) {
     operations[stream].push_back([=] {return static_cast<ShimEvent*>(p)->ready;});return hipSuccess;
 }
+extern "C" hipError_t hipHostMalloc(void** p,std::size_t n,unsigned) {return hipMalloc(p,n);}
+extern "C" hipError_t hipHostFree(void* p) {return hipFree(p);}
 extern "C" const char* hipGetErrorString(hipError_t) { return "injected HIP failure"; }
 
 void async_snapshot_tests();
 void batch_snapshot_tests();
+void split_snapshot_tests();
 
 void prefix_dma_tests() {
     using namespace strix;
     using namespace strix::decode_cli;
+    {
+        const auto id=sha256_bytes(std::as_bytes(std::span("attach",6)));
+        SerialSessionStateLayout layout;layout.layout_identity=1;layout.context_tokens=8;
+        SessionStateMemoryBinding memory;memory.layout_identity=1;
+        const auto alloc=[](std::uint64_t n) {return PrefixCacheBuffer{
+            std::shared_ptr<std::byte>(new std::byte[n?n:1]{},std::default_delete<std::byte[]>()),n};};
+        const auto store=[&] {return std::make_shared<PrefixStateCache>(PrefixStateCachePolicy{8192,{},0},alloc);};
+        unsigned restored=0;
+        const auto bind=[&](HipPrefixStateCacheSession& c) {
+            bind_mtp_prefix_cache(c,1,8,2,2,3,16,id,17,19,true,false,true,
+                [&](std::uint64_t p) {restored=static_cast<unsigned>(p);});
+        };
+        auto explicit_store=store();
+        auto legacy=std::make_unique<HipPrefixStateCacheSession>(explicit_store,id,2,2,ModelContract{},layout,memory);
+        bind(*legacy);
+        std::shared_ptr<PrefixStateCache> automatic_store;
+        std::unique_ptr<HipPrefixStateCacheSession> registry;
+        HipPrefixStateCacheSession* cache=nullptr;
+        const auto rollback=[&] {cache=nullptr;registry.reset();automatic_store.reset();};
+        const auto attach=[&] {
+            automatic_store=store();
+            registry=std::make_unique<HipPrefixStateCacheSession>(automatic_store,id,2,2,ModelContract{},layout,memory);
+            cache=registry.get();
+        };
+        finalize_cache_attachment(attach,[&] {if(cache) bind(*cache);},rollback);
+        require(cache && registry && automatic_store && live_streams==2,"admitted attach owns exactly one registry/stream");
+        const auto a=legacy->rtx_layout({}), b=cache->rtx_layout({});
+        require(legacy->identity()==cache->identity() && a.identity_extension_hex==b.identity_extension_hex &&
+            a.cache_identity_hex==b.cache_identity_hex && rtx_state_geometry_identity(a)==rtx_state_geometry_identity(b),
+            "legacy and attached identities and descriptor geometry identical at the same B");
+        require(a.rows.size()==2 && b.rows.size()==2 && a.fixed.size()==1 && b.fixed.size()==1 &&
+            a.row_bytes==10 && a.fixed_bytes==256,"shared binding descriptor counts and sizes");
+        for(std::size_t i=0;i<a.rows.size();++i) require(a.rows[i].id==b.rows[i].id &&
+            a.rows[i].bytes_per_row==b.rows[i].bytes_per_row && a.rows[i].shift==b.rows[i].shift,"row descriptors identical");
+        require(a.fixed[0].id==b.fixed[0].id && a.fixed[0].bytes==b.fixed[0].bytes &&
+            a.fixed[0].offset==b.fixed[0].offset,"fixed descriptors identical");
+        // Capture/restore exercises both the registered addresses and restore callback.
+        SerialSessionContext state;state.state_layout_identity=1;state.next_position=state.committed_tokens=2;
+        state.arithmetic_lineage=prepare_prefill_chunk_lineage(state.arithmetic_lineage,0,2,1,2,1);
+        const std::vector<std::uint32_t> tokens(8,1);
+        legacy->after_block(state,tokens);
+        SerialSessionContext fresh;fresh.state_layout_identity=1;
+        require(legacy->begin_request(fresh,tokens)==2 && restored==2,"legacy restore hook bound");
+        restored=0;cache->after_block(state,tokens);fresh={};fresh.state_layout_identity=1;
+        require(cache->begin_request(fresh,tokens)==2 && restored==2,"attached restore hook bound identically");
+        rollback();legacy.reset();explicit_store.reset();
+        require(!cache && !registry && !automatic_store && live_streams==0,"optional owners released");
+        const auto created=streams_created;
+        for(unsigned reason=0;reason<4;++reason) {
+            CacheLateFit fit; // unknown late observation
+            if(reason) {fit.observation_id=1;fit.limits_consistent=fit.aliasing_known=true;
+                fit.U=128ULL<<30;fit.L=64ULL<<30;fit.A=reason==1?1:64ULL<<30;
+                fit.F=fit.E=fit.S=fit.device_unpaid=0;fit.checkpoint=reason==3?5ULL<<30:4096;fit.device_free=reason==2?std::optional<std::uint64_t>{}:0;}
+            finalize_cache_attachment([&] {if(fit_cache_late(fit).budget) attach();},[&] {if(cache) bind(*cache);},rollback);
+            require(!cache && !registry && !automatic_store && live_streams==0 && streams_created==created,
+                "late decline creates zero cache, registry or stream owners");
+        }
+        for(unsigned failure=0;failure<3;++failure) {
+            stream_failure=failure==0;
+            finalize_cache_attachment([&] {attach();if(failure==1) throw std::bad_alloc();},[&] {
+                bind(*cache);if(failure==2) throw std::runtime_error("binding failure");},rollback);
+            stream_failure=false;
+            require(!cache && !registry && !automatic_store && live_streams==0,"setup or extension failure destroys every optional owner");
+        }
+        StateCacheStatsMirror mirror;
+        finalize_cache_attachment([&] {
+            automatic_store=store();mirror.publish(prefix_snapshot(*automatic_store));
+            throw std::bad_alloc(); // publication succeeded; registry setup did not
+        },[] {},[&] {rollback();mirror.publish({});});
+        const auto mirrored=serve::parse_json(mirror.read());
+        require(mirrored.find("ram_budget")->as_int()==0 &&
+            !mirrored.find("engine")->find("state_cache")->find("prefix_enabled")->as_bool(),
+            "partial setup rollback reseeds the published OFF mirror");
+        bool bound=false;
+        finalize_cache_attachment([&] {
+            attach();mirror.publish(prefix_snapshot(*automatic_store));
+        },[&] {
+            bind(*cache);cache->attach_capture_pool(true);bound=true;
+        },[&] {rollback();mirror.publish({});},[&] {
+            require(bound,"startup publication follows successful binding");
+            mirror.publish(prefix_snapshot(cache->store()));
+        });
+        const auto startup=serve::parse_json(mirror.read());
+        const auto* prefix=startup.find("engine")->find("state_cache")->find("prefix");
+        const auto live=automatic_store->counters();
+        require(prefix->find("host_bytes")->as_int()==8192 && live.host_bytes==8192 &&
+            prefix->find("pool_bytes")->as_int()==static_cast<std::int64_t>(live.pool_bytes) && live.pool_bytes>0 &&
+            prefix->find("pool_metadata_reserved")->as_int()==static_cast<std::int64_t>(live.pool_metadata_reserved) &&
+            prefix->find("pool_free_bytes")->as_int()==static_cast<std::int64_t>(live.pool_free_bytes) &&
+            prefix->find("pool_staging_bytes")->as_int()==static_cast<std::int64_t>(live.pool_staging_bytes) &&
+            live.pool_staging_bytes>0 && prefix->find("inserted")->as_int()==0 && prefix->find("lookups")->as_int()==0,
+            "before-first-request mirror includes all finalized pool commitments");
+        rollback();
+        auto observer=std::make_unique<HipPrefixStateCacheSession>(nullptr,id,2,2,ModelContract{},layout,memory);
+        bind(*observer);
+        const auto imports=std::make_shared<RtxStateImportRegistry>(alloc);
+        SerialSessionContext off_fresh;off_fresh.state_layout_identity=1;
+        observer->set_rtx_facts({});
+        observer->enable_rtx_import(imports,off_fresh);
+        const auto off_layout=observer->rtx_layout({});
+        const auto off_identity=observer->identity();
+        cache=observer.get();
+        for(unsigned failure=0;failure<3;++failure) {
+            finalize_cache_attachment([&] {attach();if(failure==0) throw std::bad_alloc();},[&] {
+                bind(*cache);
+                if(failure==1) throw std::bad_alloc();
+                cache->set_rtx_facts({});
+                if(failure==2) throw std::runtime_error("import registry publication failure");
+            },[&] {registry.reset();automatic_store.reset();cache=observer.get();});
+            const auto actual=cache->rtx_layout({});
+            require(cache==observer.get() && cache->identity()==off_identity &&
+                actual.rows.size()==off_layout.rows.size() && actual.fixed.size()==off_layout.fixed.size() &&
+                rtx_state_geometry_identity(actual)==rtx_state_geometry_identity(off_layout) &&
+                imports->layout() && rtx_state_geometry_identity(*imports->layout())==rtx_state_geometry_identity(off_layout) && live_streams==1,
+                "failed optional attach preserves fully bound OFF observer and import geometry");
+        }
+        observer.reset();cache=nullptr;
+    }
     {
         const std::array<float,4> row{0.0F,-0.0F,1.0F,-2.0F};
         require(!raw_fp32_logits_digest({}),"missing terminal row fails closed");
@@ -469,6 +596,7 @@ void prefix_dma_tests() {
     }
 
     async_snapshot_tests();
+    split_snapshot_tests();
     batch_snapshot_tests();
 
 }
@@ -507,6 +635,7 @@ void async_snapshot_tests() {
         QwenTiledPlanConfig config;config.rows=2;config.block={2,QwenPlanOutput::terminal};
         config.block.execution=1;config.block.kernel=2;config.priming=255;
         adapter->set_plan(config,8,true);
+        adapter->attach_capture_pool(true);
         SerialSessionContext session;session.state_layout_identity=1;
         session.next_position=session.committed_tokens=2;
         session.arithmetic_lineage=prepare_prefill_chunk_lineage(session.arithmetic_lineage,0,2,1,2,1);
@@ -539,15 +668,20 @@ void async_snapshot_tests() {
             adapter->set_plan(config,8,true);
         }
         if(scenario==6) adapter->set_staging_cap(1);
-        if(scenario==7) allocation_failure=true;
+        PrefixCacheBuffer exhausted;
+        if(scenario==7) exhausted=store->allocate(store->counters().pool_bytes);
+        const auto hot_calls=resource_calls;
         auto d=adapter->try_prepare_capture(session,tokens,producer,true,ordered);
-        allocation_failure=false;
+        require(resource_calls==hot_calls,"capture performs no HIP resource allocation/free");
         require(store->counters().snapshot_preparations==1,"retained preparation counted even before failure or insertion");
+        if(scenario==7) require(store->counters().capture_skipped_no_slot==1,"exhausted pool capture counted");
         if(scenario>=6) {require(!d && store->counters().inserted==0,"pre-submit cap/allocation skip");continue;}
         require(bool(d),"snapshot prepared");
         require(!adapter->try_prepare_capture(session,tokens,producer,true,ordered),"global busy slot skips without wait");
         PrefixAsyncCapture::reap();
         require(store->counters().inserted==0,"worker not yet submitted cannot publish");
+        const auto held_free=store->counters().pool_free_bytes;
+        require(held_free<store->counters().pool_bytes,"in-flight descriptor holds slab leases");
         // A next block cannot run ahead of reads already queued on its stream.
         bool next_block_ran=false;
         operations[producer].push_back([&] {fixed=std::byte{99};target.fill(std::byte{99});next_block_ran=true;return true;});
@@ -561,14 +695,20 @@ void async_snapshot_tests() {
         if(scenario%2==0) {
             pump(d->download);PrefixAsyncCapture::reap();
             require(store->counters().inserted==0,"D2H without commit cannot publish");
+            require(store->counters().pool_free_bytes==held_free,"done alone cannot recycle payload leases");
         }
         d->commit(scenario<2); // failed validation/reset
         adapter.reset(); // descriptor survives prompt/registry destruction
+        const auto retire_calls=resource_calls;
         PrefixAsyncCapture::reap();
-        if(scenario%2) require(store->counters().inserted==0,"commit without D2H cannot publish");
+        if(scenario%2) {
+            require(store->counters().inserted==0,"commit without D2H cannot publish");
+            require(store->counters().pool_free_bytes==held_free,"handoff alone cannot recycle pending DMA leases");
+        }
         if(scenario==5) {PrefixAsyncCapture::shutdown();require(waits==before_waits+1U,"shutdown explicitly drains");}
         else {pump(d->download);PrefixAsyncCapture::reap();}
         require(!PrefixAsyncCapture::slot,"completed descriptor reaped");
+        require(resource_calls==retire_calls,"retirement performs no HIP resource allocation/free");
         require(store->counters().staging_bytes==0 && store->counters().snapshot_preparations==1,"settled capture has no live staging and keeps preparation count");
         adapter=std::make_unique<HipPrefixStateCacheSession>(store,id,2,2,ModelContract{},layout,memory);
         adapter->add_rows(reinterpret_cast<std::uintptr_t>(target.data()),1,0);
@@ -587,6 +727,90 @@ void async_snapshot_tests() {
             require(c.segments[0]->payload.data.get()[0]==std::byte{11} &&
                 c.segments[0]->payload.data.get()[2]==std::byte{21},"stable target and predictor row snapshots");
         }
+        d.reset();
+        if(scenario>=2) require(store->counters().pool_free_bytes==store->counters().pool_bytes,
+            "cancelled payloads recycle only after done and handoff and final lease release");
+    }
+    // Allocation counts match the original per-capture allocator. Both routes
+    // exercise the same framing, DMA, cancellation and publication implementation.
+    std::vector<std::byte> reference_bytes;
+    for(bool automatic:{false,true}) {
+        operations.clear();
+        auto store=std::make_shared<PrefixStateCache>(PrefixStateCachePolicy{UINT64_C(32)<<30,{},0},hip_pinned_prefix_capture_buffer);
+        SerialSessionStateLayout layout;layout.layout_identity=1;layout.context_tokens=8;
+        SessionStateMemoryBinding memory;memory.layout_identity=1;
+        HipPrefixStateCacheSession adapter(store,id,2,2,ModelContract{},layout,memory);
+        std::array<std::byte,8> target{},mtp{};
+        std::array<std::byte,256> fixed{};fixed.fill(std::byte{31});
+        target[0]=std::byte{11};target[1]=std::byte{12};mtp[0]=std::byte{21};
+        adapter.add_rows(reinterpret_cast<std::uintptr_t>(target.data()),1,0);
+        adapter.add_rows(reinterpret_cast<std::uintptr_t>(mtp.data()),1,1);
+        adapter.add_fixed_device(reinterpret_cast<std::uintptr_t>(fixed.data()),fixed.size());
+        QwenTiledPlanConfig config;config.rows=2;config.block={2,QwenPlanOutput::terminal};
+        config.block.execution=1;config.block.kernel=2;config.priming=255;
+        adapter.set_plan(config,8,true);
+        const auto startup_calls=resource_calls;
+        adapter.attach_capture_pool();
+        require(resource_calls==startup_calls && !store->capture_resources && !store->counters().pool_bytes &&
+            store->counters().host_bytes==0,"explicit 32 GiB budget pins no startup payload");
+        // Use a small pool for the automatic shim; explicit keeps its 32 GiB budget.
+        if(automatic) {
+            store=std::make_shared<PrefixStateCache>(PrefixStateCachePolicy{8192,{},0},hip_pinned_prefix_capture_buffer);
+        }
+        // A separate adapter is needed only to bind the smaller automatic budget.
+        HipPrefixStateCacheSession capture(store,id,2,2,ModelContract{},layout,memory);
+        capture.add_rows(reinterpret_cast<std::uintptr_t>(target.data()),1,0);
+        capture.add_rows(reinterpret_cast<std::uintptr_t>(mtp.data()),1,1);
+        capture.add_fixed_device(reinterpret_cast<std::uintptr_t>(fixed.data()),fixed.size());
+        capture.set_plan(config,8,true);
+        if(automatic) capture.attach_capture_pool(true);
+        SerialSessionContext session;session.state_layout_identity=1;session.next_position=session.committed_tokens=2;
+        session.arithmetic_lineage=prepare_prefill_chunk_lineage(session.arithmetic_lineage,0,2,1,2,1);
+        for(bool commit:{false,true}) {
+            const auto before=resource_calls;
+            auto d=capture.try_prepare_capture(session,tokens,producer,true,ordered);
+            require(bool(d),"both allocation routes prepare capture");
+            require(resource_calls-before==(automatic?0U:7U),"original capture: two pinned payloads, staging, stream, three events");
+            d->submit_predictor(predictor);pump(producer);pump(predictor);pump(d->download);
+            std::vector<std::byte> bytes=d->checkpoint->metadata;
+            for(const auto& segment:d->checkpoint->segments)
+                bytes.insert(bytes.end(),segment->payload.data.get(),segment->payload.data.get()+segment->payload.bytes);
+            bytes.insert(bytes.end(),d->checkpoint->fixed.data.get(),d->checkpoint->fixed.data.get()+d->checkpoint->fixed.bytes);
+            if(reference_bytes.empty()) reference_bytes=bytes;
+            else require(bytes==reference_bytes,"automatic and original capture payload and metadata bytes identical");
+            const auto retire_calls=resource_calls;
+            d->commit(commit);
+            // Publication itself may allocate. Cancellation and checked resource
+            // retirement must release already granted leases under host pressure.
+            if(automatic && !commit) prefix_test_fail_host_allocations=true;
+            PrefixAsyncCapture::reap();
+            prefix_test_fail_host_allocations=false;
+            require(resource_calls-retire_calls==(automatic?0U:5U),"original retirement: three events, stream, staging");
+            if(automatic) prefix_test_fail_host_allocations=true;
+            d.reset();
+            prefix_test_fail_host_allocations=false;
+            require(resource_calls-retire_calls==(automatic?0U:(commit?5U:7U)),"cancelled original payloads freed after final lease");
+        }
+        require(store->counters().inserted==1,"both paths publish only committed capture");
+    }
+    // Attach failure leaves no reusable partial pool and can be retried at startup.
+    for(bool fail_stream:{false,true}) {
+        auto store=std::make_shared<PrefixStateCache>(PrefixStateCachePolicy{8192,{},0},hip_pinned_prefix_capture_buffer);
+        SerialSessionStateLayout layout;layout.layout_identity=1;layout.context_tokens=8;
+        SessionStateMemoryBinding memory;memory.layout_identity=1;
+        HipPrefixStateCacheSession adapter(store,id,2,2,ModelContract{},layout,memory);
+        const auto streams=live_streams;
+        allocation_failure=!fail_stream;stream_failure=fail_stream;
+        bool failed=false;
+        try {(void)adapter.attach_capture_pool(true);} catch(const PrefixCacheFatalError&) {failed=true;}
+        allocation_failure=stream_failure=false;
+        require(failed && !store->capture_resources && live_streams==streams,"failed attach rolls back partial GPU resources");
+        const auto before=resource_calls;
+        adapter.attach_capture_pool();
+        require(resource_calls==before && !store->capture_resources && !store->counters().pool_bytes,
+            "explicit attachment creates no startup pool");
+        adapter.attach_capture_pool(true);
+        require(bool(store->capture_resources),"attach retry succeeds outside request path");
     }
     // Invoke real capture hooks between numerical units; compare every descriptor and priming flag.
     for(const auto t:{2048U,8192U}) for(const auto n:{1280U,6000U,8300U,10300U,10400U,8192U,32768U}) for(bool roomy:{false,true}) {
@@ -605,6 +829,7 @@ void async_snapshot_tests() {
         config.ladder={1024,256,64,16};
         for(const auto r:config.ladder) config.tails.push_back({r,QwenPlanOutput::terminal});
         adapter.set_plan(config,n,true);
+        adapter.attach_capture_pool(true);
         QwenPlanCursor off,on;std::uint64_t position=0;
         SerialSessionContext session;session.state_layout_identity=1;
         const std::vector<std::uint32_t> prompt(n,1);
@@ -624,6 +849,12 @@ void async_snapshot_tests() {
         }
         const auto expected=t==2048U?(n==32768U?8U:n==8192U?2U:n==8300U || n==6000U?1U:n>=10300U?2U:0U):
             (n==32768U?3U:n==10300U || n==10400U?1U:0U);
+        if(admitted!=expected || store->counters().inserted!=expected) {
+            const auto c=store->counters();
+            std::cerr<<"capture count mismatch n="<<n<<" T="<<t<<" roomy="<<roomy<<" admitted="<<admitted
+                <<" expected="<<expected<<" inserted="<<c.inserted<<" no_slot="<<c.capture_skipped_no_slot
+                <<" cap_skips="<<c.staging_cap_skips<<" budget_skips="<<c.budget_skips<<'\n';
+        }
         require(admitted==expected && store->counters().inserted==expected,"default and enlarged-cap capture opportunity counts");
         const auto cross=t==2048U?(n==8300U || n==10300U || n==10400U?1U:0U):(n==8300U?1U:0U);
         require(store->counters().capture_skips_cross_stream==cross,"planner refuses tail/window/serial transitions even with matching handles");
@@ -643,6 +874,7 @@ void async_snapshot_tests() {
         adapter.add_rows(reinterpret_cast<std::uintptr_t>(target.data()),1,0);
         QwenTiledPlanConfig config;config.rows=2;config.block={2,QwenPlanOutput::terminal};
         config.block.execution=1;config.block.kernel=2;adapter.set_plan(config,8,true);
+        adapter.attach_capture_pool(true);
         SerialSessionContext session;session.state_layout_identity=1;session.next_position=session.committed_tokens=2;
         session.arithmetic_lineage=prepare_prefill_chunk_lineage(session.arithmetic_lineage,0,2,1,2,1);
         auto d=adapter.try_prepare_capture(session,tokens,producer,true,ordered);
@@ -788,4 +1020,119 @@ void batch_snapshot_tests() {
     }
     operations.clear();snapshot_shim=false;
     set_prefix_batch_certification_enabled(false);
+}
+
+// Compare the old combined boundary against the automatic two-part schedule.
+// Deferred streams allow target writers/downloads to run while priming is still absent.
+void split_snapshot_tests() {
+    using namespace strix;
+    using namespace strix::decode_cli;
+    snapshot_shim=true;drain_error=copy_error=hipSuccess;
+    const auto producer=reinterpret_cast<hipStream_t>(2),predictor=reinterpret_cast<hipStream_t>(3);
+    const PrefixCaptureOrder order{producer,predictor,predictor};
+    const auto id=sha256_bytes(std::as_bytes(std::span("split",5)));
+    const std::vector<std::uint32_t> tokens(8,1);
+    std::vector<std::byte> reference;
+    std::vector<std::uint64_t> offsets;
+    for(unsigned scenario=0;scenario<7;++scenario) {
+        operations.clear();
+        auto store=std::make_shared<PrefixStateCache>(PrefixStateCachePolicy{8192,{},0},hip_pinned_prefix_capture_buffer);
+        SerialSessionStateLayout layout;layout.layout_identity=1;layout.context_tokens=8;
+        SessionStateMemoryBinding memory;memory.layout_identity=1;
+        HipPrefixStateCacheSession cache(store,id,2,2,ModelContract{},layout,memory);
+        std::array<std::byte,8> target{},mtp{};
+        std::array<std::byte,256> fixed{},held{};
+        target[0]=std::byte{11};target[1]=std::byte{12};fixed.fill(std::byte{31});
+        cache.add_rows(reinterpret_cast<std::uintptr_t>(target.data()),1,0);
+        cache.add_rows(reinterpret_cast<std::uintptr_t>(mtp.data()),1,1);
+        cache.add_fixed_device(reinterpret_cast<std::uintptr_t>(fixed.data()),fixed.size());
+        cache.add_fixed_device(reinterpret_cast<std::uintptr_t>(held.data()),held.size(),"mtp.held");
+        QwenTiledPlanConfig config;config.rows=2;config.block={2,QwenPlanOutput::terminal};
+        config.block.execution=1;config.block.kernel=2;config.priming=255;
+        cache.set_plan(config,8,true);
+        SerialSessionContext session;session.state_layout_identity=1;
+        session.next_position=session.committed_tokens=2;
+        session.arithmetic_lineage=prepare_prefill_chunk_lineage(session.arithmetic_lineage,0,2,1,2,1);
+        const bool split=scenario!=0;
+        if(split) cache.attach_capture_pool(true);
+        else require(!cache.try_prepare_target_capture(session,tokens,producer,true,order) && operations.empty(),
+            "explicit route declines target-only API without submissions");
+        cache.set_retention(false);
+        require(!cache.try_prepare_target_capture(session,tokens,producer,true,order) && operations.empty(),
+            "split no-store performs no payload work");
+        cache.set_retention(true);
+        auto short_session=session;short_session.next_position=short_session.committed_tokens=1;
+        require(!cache.try_prepare_target_capture(short_session,tokens,producer,true,order) && operations.empty(),
+            "split partial-T path performs no payload work");
+        const auto hot_calls=resource_calls, before_waits=waits;
+        auto d=split?cache.try_prepare_target_capture(session,tokens,producer,true,order):
+            HipPrefixStateCacheSession::Capture{};
+        if(split) {
+            require(bool(d) && resource_calls==hot_calls,"split prepares without HIP allocation");
+            require(!d->metadata_complete && !d->submitted.load(),"target part has no complete certificate or publication handoff");
+            if(scenario==5) {
+                d->cancel_target();PrefixAsyncCapture::reap();
+                require(PrefixAsyncCapture::slot && store->counters().pool_free_bytes<store->counters().pool_bytes,
+                    "cancel between parts retains leases while target DMA is pending");
+                pump(producer);pump(d->download);PrefixAsyncCapture::reap();d.reset();
+                require(!PrefixAsyncCapture::slot && store->counters().pool_free_bytes==store->counters().pool_bytes,
+                    "pending cancellation recycles only after target download finishes");
+                continue;
+            }
+            pump(producer);pump(d->download);
+            require(d->checkpoint->segments[0]->payload.data.get()[0]==std::byte{11} &&
+                d->checkpoint->fixed.data.get()[0]==std::byte{31},"target D2H completes before predictor is submitted");
+            target.fill(std::byte{99});fixed.fill(std::byte{99});
+            PrefixAsyncCapture::reap();
+            require(store->counters().inserted==0,"target completion alone never publishes");
+            if(scenario==2) {
+                d->cancel_target(); // cancellation between the two parts
+            } else if(scenario==3 || scenario==4) {
+                if(scenario==4) session.next_position=4;
+                require(!cache.complete_target_capture(d,session,scenario==4,predictor),
+                    "post-prime incomplete frontier or changed boundary refuses capture");
+            }
+            if(scenario>=2 && scenario<=4) {
+                pump(d->download);PrefixAsyncCapture::reap();d.reset();
+                require(!PrefixAsyncCapture::slot && store->counters().inserted==0 &&
+                    store->counters().pool_free_bytes==store->counters().pool_bytes && store->counters().staging_bytes==0,
+                    "cancelled/failed second part returns all pool credits after DMA");
+                require(waits==before_waits,"cancelling split adds no host wait");
+                continue;
+            }
+        }
+        // The incumbent prime and held update finish at this boundary.
+        mtp[0]=std::byte{21};held.fill(std::byte{41});session.execution_identity=17;
+        if(split) require(cache.complete_target_capture(d,session,true,predictor),"complete predictor frontier accepted post-prime");
+        else {
+            d=cache.try_prepare_capture(session,tokens,producer,true,order);
+            require(bool(d) && operations[d->download].empty(),"explicit combined path queues no download before predictor");
+            d->submit_predictor(predictor);
+        }
+        pump(producer);pump(predictor);pump(d->download);
+        require(store->counters().inserted==0,"both completed groups still need native commit");
+        d->commit(true);PrefixAsyncCapture::reap();
+        require(store->counters().inserted==1 && !PrefixAsyncCapture::slot,"complete split checkpoint published after commit");
+        std::vector<std::byte> bytes=d->checkpoint->metadata;
+        const auto& c=*d->checkpoint;
+        const auto append=[&](const auto& value) {
+            const auto span=std::as_bytes(std::span(&value,1));bytes.insert(bytes.end(),span.begin(),span.end());
+        };
+        for(auto word:c.producer_certificate) append(word);
+        for(auto byte:c.identity.bytes) append(byte);
+        for(auto byte:c.digest.bytes) append(byte);
+        append(c.position);append(c.block_rows);
+        for(const auto& segment:c.segments) {
+            for(auto byte:segment->digest.bytes) append(byte);
+            for(auto byte:segment->parent.bytes) append(byte);
+            bytes.insert(bytes.end(),segment->payload.data.get(),segment->payload.data.get()+segment->payload.bytes);
+        }
+        bytes.insert(bytes.end(),c.fixed.data.get(),c.fixed.data.get()+c.fixed.bytes);
+        std::vector<std::uint64_t> framing;
+        for(const auto& slice:d->slices) {framing.push_back(slice.offset);framing.push_back(slice.bytes);framing.push_back(slice.predictor);}
+        if(!split) {reference=bytes;offsets=framing;}
+        else require(bytes==reference && offsets==framing,"split checkpoint bytes, offsets, digests, metadata and certificate equal pre-split boundary");
+        require(waits==before_waits,"split completion adds no host wait");
+    }
+    snapshot_shim=false;operations.clear();
 }
