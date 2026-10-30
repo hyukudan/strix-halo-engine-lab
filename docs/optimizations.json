@@ -643,6 +643,17 @@
   },
   {
     "engine": "deepseek",
+    "name": "Engram prefill projection tile with prefetch",
+    "flag_or_env": "STRIX_DS41_ENGRAM_F16_PF",
+    "default": "on",
+    "exact": "Bitwise: every output byte equals enqueue_f16_rows (rows 1..8192 incl. tile edges, padded strides with guard values, 3 independent F16 weight matrices, BF16-rounded inputs with signed zeros); same per-lane chains, separate multiply and add rounding, same butterfly and storing lane. 164 VGPR, no spill or scratch.",
+    "gain": "Isolated Engram projection (6144 -> 25600, event medians, interleaved arms, 3 weight copies) vs enqueue_f16_rows: rows 32 0.54x, 128 0.87x, 256 0.94x, 512 0.86x, 1024 0.86x (88.1 -> 75.8 ms), 2048 0.86x, 4096 0.86x, 8192 0.87x; 49..64 rows keep enqueue_f16_rows (64 rows: 1.16x). End-to-end TTFT not separately measured.",
+    "preconditions": "F16 Engram KV, full aligned view (width 6144, 25600 outputs, first 0, 16-byte aligned, valid strides), 32..8192 rows, row padding at most 9/8 of the 64-row tile (49..64 rows excluded); every other view keeps enqueue_f16_rows.",
+    "off_switch": "STRIX_DS41_ENGRAM_F16_PF=0 (read on every call)",
+    "doc_anchor": "docs/optimizations.md#ds-engram-f16-pf"
+  },
+  {
+    "engine": "deepseek",
     "name": "Grouped shared expert",
     "flag_or_env": "STRIX_DS41_SHARED_GROUPED",
     "default": "ON",

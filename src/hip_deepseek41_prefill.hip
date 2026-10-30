@@ -1722,7 +1722,7 @@ PrefillResult DevicePrefill::run_from(std::span<const std::uint32_t> tokens, std
                 v.x_stride = v.width;
                 v.out_stride = v.count;
                 v.out = m.ekv.p;
-                ds41::enqueue_f16_rows(v, st);
+                ds41::enqueue_engram_f16_rows(v, st);
                 ds41::enqueue_engram_inject(stream_now() + std::size_t{r0} * stream_row, m.ekv.p, m.devf(p + "engram_q_norm.weight"),
                                             m.devf(p + "engram_k_norm.weight"), n, H, 1e-20F, st);
             }

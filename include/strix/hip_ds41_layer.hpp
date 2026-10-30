@@ -254,6 +254,15 @@ struct F16RowsView {
     const std::uint8_t* weight_f8 = nullptr;
 };
 void enqueue_f16_rows(const F16RowsView& view, void* stream);
+// Engram prefill projection (F16 6144 -> 25600, first 0, 32..8192 rows (default admission below), 16-byte aligned x / weights, valid strides): a 48 x 64
+// LDS tile that prefetches the next slab into registers (the bits of enqueue_f16_rows). Default on; STRIX_DS41_ENGRAM_F16_PF=0
+// (read on every call) restores enqueue_f16_rows, which also serves every other view.
+void enqueue_engram_f16_rows(const F16RowsView& view, void* stream);
+// Explicit entry for tests / microbench: rejects unsupported views, ignores the switch.
+[[nodiscard]] bool engram_f16_pf_supported(const F16RowsView& view) noexcept;
+// Default admission (enqueue_engram_f16_rows): supported and the 48-row padding at most 9/8 of the 64-row tile's.
+[[nodiscard]] bool engram_f16_pf_admitted(const F16RowsView& view) noexcept;
+void enqueue_engram_f16_pf(const F16RowsView& view, void* stream);
 // enqueue_f16_rows(a) then enqueue_f16_rows(b); with STRIX_DS41_F16_PAIR=1 (default off) one launch for both when both
 // take the decode lanes kernels (F16 weights, the same 1..8 rows): the same outputs bit for bit.
 void enqueue_f16_rows_pair(const F16RowsView& a, const F16RowsView& b, void* stream);
