@@ -365,6 +365,10 @@ int main(int argc, char** argv) {
     bool wb_defer = true;  // adopted default: deferred write-backs; --no-wb-defer = boundary write-backs
     const char* ce_env = std::getenv("STRIX_DS41_CE_PACING");
     bool ce_pacing = !(ce_env && std::string(ce_env) == "0");  // default ON (PRO A/B: exact, not slower)
+    // tierstream dg_wb_stream: deferred write-backs on their own D2H stream (overlapping the next layer's demand H2D)
+    // instead of the demand stream; default ON (PRO copy bench: duplex 43.3 -> 44.8 GB/s; transport only)
+    const char* wbs_env = std::getenv("STRIX_DS41_WB_STREAM");
+    bool wb_stream = !(wbs_env && std::string(wbs_env) == "0");
     std::string draft_file, draft_vocab = "auto", window_arg = "controller", controller_scope = "chat";
     std::string draft_keep_from;  // --draft-keep-from FILE: route_stats lines of an earlier run (summed)
     std::uint32_t draft_keep = 64;  // --draft-keep N: the N most routed experts per drafter stage stay (0: all); adopted default 64
@@ -416,6 +420,7 @@ int main(int argc, char** argv) {
         controller_costs_given = false;
         wb_defer = false;
         ce_pacing = false;
+        wb_stream = false;
         evict = "lru";
         controller_scope = "run";
         host_spares = 96;
@@ -468,6 +473,8 @@ int main(int argc, char** argv) {
         else if (a == "--session-max-parked") session_config.max_parked=strix::ds41::session::unsigned_value(next());
         else if (a == "--session-dir") session_config.dir=next();
         else if (a == "--session-disk-bytes") {session_config.disk_bytes=strix::ds41::session::unsigned_value(next());session_config.disk_explicit=true;}
+        else if (a == "--wb-stream") wb_stream = true;
+        else if (a == "--no-wb-stream") wb_stream = false;
         else if (a == "--q8-r1") q8_r1 = true;
         else if (a == "--q8-r1-off") q8_r1 = false;
         else if (a == "--q8-r1-pad") q8_r1_pad = true;
@@ -766,6 +773,7 @@ int main(int argc, char** argv) {
         str("evict", evict); field("census", census);
         field("wb_defer", wb_defer); field("wb_alt", wb_alt); field("flush_ready", flush_ready);
         field("ce_pacing", ce_pacing);
+        field("wb_stream", wb_stream);
         str("warmup_graphs", warmup_graphs.empty() ? "none" : warmup_graphs);
         str("residency_seed", residency_seed.empty() ? "none" : (residency_auto ? "auto:" : "") + residency_seed);
         str("residency_save", residency_save.empty() ? "none" : residency_save);
@@ -1161,6 +1169,7 @@ int main(int argc, char** argv) {
             to.prefetch_per_token = pf_token;
             to.wb_defer = wb_defer;
             to.ce_pacing = ce_pacing;
+            to.wb_stream = wb_stream;
             if (!winpf_prior_file.empty()) {
                 std::ifstream pf(winpf_prior_file, std::ios::binary);
                 if (!pf) usage("cannot read --winpf-prior");

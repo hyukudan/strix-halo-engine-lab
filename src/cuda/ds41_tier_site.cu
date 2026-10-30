@@ -145,6 +145,7 @@ struct TierSite::Impl {
         so.dg_prior = o.prior.empty() ? nullptr : o.prior.data();  // read during ts_open only
         so.dg_prior_len = o.prior.size();
         so.dg_wb_defer = o.wb_defer ? 1U : 0U;
+        so.dg_wb_stream = o.wb_stream ? 1U : 0U;  // explicit both ways: an older tierstream's default was 0
         if (o.ce_pacing) {
             const auto p = rtx::ce_pacing(static_cast<std::uint32_t>(s.gate_expert_bytes()), static_cast<std::uint32_t>(s.down_expert_bytes()));
             so.dg_wb_layer_bytes = p.layer_bytes;
