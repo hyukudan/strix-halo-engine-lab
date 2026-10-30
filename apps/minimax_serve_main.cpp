@@ -5,7 +5,7 @@
 //
 // usage: strix-minimax-serve MODEL_DIR --rank R --transport T [--port 8080] [--bind 127.0.0.1] [--slots 8]
 //        [--capacity 8256] [--max-rows 4096] [--model-id minimax-m3.1-flash] [--max-tokens 4096]
-//        [--dspark DIR [--dspark-exl3 DIR]] [--admin] [--resume-check P.u32[:k/k...][,...] [--resume-check-nested SHORT.u32 [--resume-check-child-layers K]] [--resume-check-tokens 256] [--check-only]]
+//        [--dspark-mode off|auto|on] [--dspark DIR [--dspark-exl3 DIR]] [--admin] [--resume-check P.u32[:k/k...][,...] [--resume-check-nested SHORT.u32 [--resume-check-child-layers K]] [--resume-check-tokens 256] [--check-only]]
 //   TRANSPORT: usb4-auto | tcp-listen:PORT | tcp-connect:HOST:PORT
 // Routes (rank 0): POST /v1/chat/completions, POST /v1/completions (stream or not), GET /v1/models, GET /health,
 // GET /metrics (metrics text), GET /api/status[?detail=1] (strix-serve-status-v1), POST /tokenize; with --admin,
@@ -24,6 +24,9 @@
 //     admission and admit again before decoding. Short-first requires a protected FIFO head. Bounded tasks use
 //     STRIX_MM_SERVE_SERVICE_MS (250) when idle; with decoders they use the remaining gap budget, recent layer-cost
 //     upper samples and a control margin. Rank 1 only replays these decisions.
+//   Default auto uses structural-v1 admission; prose stays plain. --dspark-prior unqualified-v1 restores conservative plain.
+//   --dspark-mode off disables drafting, taps and appends; on retains the legacy opt-in scheduler.
+//   --dspark supplies assets, independently of mode; optional local MODEL_DIR/dspark discovery never downloads.
 //   --dspark: DSpark windows inside the batch steps, sharing the step's 8 rows (n decoding rows + drafts <= 8: C1 up to 7
 //     drafts, C8 none). Requests admitted while <= STRIX_MM_SERVE_DSPARK_INFLIGHT (default 1: measurement C2 measured slower) are in flight keep a
 //     drafter context (prefill taps + every committed row); above it appends stop and those contexts are stale for good.
@@ -39,6 +42,8 @@
 #include "minimax/serve/minimax_tokenizer.hpp"
 #include "strix/minimax/engine.hpp"
 #include "minimax/engine/mm_defaults.hpp"
+#include "minimax/serve/minimax_dspark_policy.hpp"
+#include <filesystem>
 #include "minimax/xfer/minimax_xfer.hpp"
 #include "hip_minimax_dspark.hpp"
 #include "strix/serve/bpe_tokenizer.hpp"
@@ -138,6 +143,7 @@ private:
 //   rows (one row per slot, or a slot's verify window: its anchor then its drafts at consecutive positions); `append` bit
 //   s = slot s's committed rows (anchor + accepted drafts, from the step's tokens on each rank) are appended to its drafter
 //   context. draft: the 7-row DSpark block + 7 Markov steps of each of `dslots` slots from its anchor at its position.
+//   retire: append is a mask of contexts whose staging/prefill append ownership is revoked at this boundary.
 //   taps: the engine's draft taps on (pflags 1) / off (0), only with no prefill open (DSpark switched at runtime).
 using Command = ms::Command;
 using ms::Control;
@@ -170,12 +176,18 @@ struct Runner {
     std::uint32_t v0 = 0, vn = 0;     // this rank's vocabulary half (drafter Markov steps)
 
     std::uint64_t local_id = 0, control_round = 0;
-    std::uint32_t last_next = 0;
+    std::uint32_t last_next = 0, contexts = 0;
+    void retire_contexts(std::uint32_t mask) {
+        contexts &= ~mask;
+        if (dd != nullptr) for (std::uint32_t s = 0; s < eng.slots(); ++s)
+            if ((mask >> s) & 1U) dd->drop_staged(s);
+    }
     void prefill_begin(std::uint32_t slot, std::span<const std::uint32_t> prompt, bool context,
                        std::uint64_t id, std::uint64_t parent = 0, std::uint64_t generation = 0) {
+        contexts = (contexts & ~(1U << slot)) | (context ? 1U << slot : 0U);
         mm::Engine::PrefillTapSink sink;
         if (dd != nullptr && context)
-            sink = [this](const float* taps, std::size_t n, std::uint32_t s, std::uint64_t pos0) { dd->append(s, taps, n, pos0, nullptr); };
+            sink = [this](const float* taps, std::size_t n, std::uint32_t s, std::uint64_t pos0) { if ((contexts >> s) & 1U) dd->append(s, taps, n, pos0, nullptr); };
         if (id == 0) throw std::runtime_error("prefill begin: missing task ID");
         eng.prefill_begin_task(id, parent, generation, slot, prompt, std::move(sink));
     }
@@ -206,6 +218,7 @@ struct Runner {
     }
     // DSpark block + Markov chain (one 8-byte candidate exchange per step) + confidences, as strix-minimax-rank --spec auto.
     Drafts draft(std::uint32_t slot, std::uint32_t anchor, std::uint64_t pos) {
+        if (slot >= eng.slots() || ((contexts >> slot) & 1U) == 0) throw std::runtime_error("draft: retired drafter context");
         Drafts out;
         dd->forward_block(slot, eng.embed_row(anchor), eng.embed_row(ds::noise_token), pos, nullptr);
         const float* logits = eng.head_logits(dd->y(), ds::block);
@@ -224,6 +237,7 @@ struct Runner {
     // One step; then each slot of `append` gets its committed rows appended (its anchor + the drafts the target accepted:
     // the window's contiguous tap rows, before the next call overwrites them).
     std::vector<std::uint32_t> step(std::span<const mm::Row> rows, std::uint32_t append) {
+        if ((append & ~contexts) != 0) throw std::runtime_error("step: retired drafter context");
         auto g = eng.step(rows);
         if (dd != nullptr && append != 0) {
             const float* taps = eng.last_taps();
@@ -595,7 +609,16 @@ sv::Json policy_json(Shared& shared, bool drafter) {
     b.set("max_unit_layers", sv::Json(static_cast<std::int64_t>(c.max_unit_layers)));
     b.set("qualification", sv::Json("pending"));
     b.set("gap_ms", sv::Json(p.gap_ms));
-    b.set("dspark", sv::Json(p.dspark && drafter));
+    b.set("dspark", sv::Json(drafter && (p.dspark_mode == ds::Mode::on || shared.dspark_contexts != 0)));
+    b.set("dspark_mode", sv::Json(ds::mode_name(p.dspark_mode)));
+    b.set("dspark_effective", sv::Json(p.dspark_mode == ds::Mode::on && drafter ? "on" : p.dspark_mode == ds::Mode::automatic && p.dspark_prior == ds::Prior::structural_v1 && drafter ? "per_request" : "plain"));
+    b.set("dspark_assets", sv::Json(drafter));
+    b.set("dspark_live", sv::Json(static_cast<std::int64_t>(shared.dspark_live)));
+    b.set("dspark_contexts", sv::Json(static_cast<std::int64_t>(shared.dspark_contexts)));
+    b.set("dspark_concurrency_eligible", sv::Json(shared.dspark_live == 1 && shared.active_id == 0 && shared.parked_id == 0));
+    b.set("dspark_prior", sv::Json(ds::prior_name(p.dspark_prior)));
+    b.set("dspark_reason", sv::Json(p.dspark_mode == ds::Mode::off ? "plain:off" : !drafter ? "plain:assets_missing" :
+                                     p.dspark_mode == ds::Mode::automatic ? (p.dspark_prior == ds::Prior::unqualified_v1 ? "plain:prior_unqualified" : "auto:per_request") : "legacy"));
     b.set("dspark_inflight", sv::Json(static_cast<std::int64_t>(p.inflight)));
     b.set("draft_slots", sv::Json(static_cast<std::int64_t>(p.draft_slots)));
     b.set("epoch", sv::Json(static_cast<std::int64_t>(p.epoch)));
@@ -667,8 +690,11 @@ sv::Json admin_sched(const sv::HttpRequest& req, Shared& shared, bool drafter) {
             p.nest = v->as_bool();
         }
         if (const auto* v = body.find("short_first"); v && v->is_bool()) p.short_first = v->as_bool();
-        if (const auto* v = body.find("dspark"); v && v->is_bool()) p.dspark = v->as_bool();
-        if (const auto* v = body.find("dspark_inflight"); v && v->is_number()) p.inflight = static_cast<std::uint32_t>(std::max<std::int64_t>(0, v->as_int()));
+        p.dspark_mode = ms::dspark_mode_update(p.dspark_mode, body);
+        if (const auto* v = body.find("dspark_inflight")) {
+            if (!v->is_number()) throw std::invalid_argument("dspark_inflight: 0..8");
+            p.inflight = ds::parse_inflight(v->dump().c_str());
+        }
         if (const auto* v = body.find("draft_slots"); v && v->is_number()) p.draft_slots = static_cast<std::uint32_t>(std::clamp<std::int64_t>(v->as_int(), 1, 8));
         if (body.find("reset_counters")) shared.counters = Counters{};
         ++p.epoch;
@@ -689,7 +715,7 @@ int main(int argc, char** argv) {
     }
     if (argc < 2) {
         std::fprintf(stderr, "usage: %s MODEL_DIR --rank R --transport T [--port P] [--bind ADDR] [--slots S] [--capacity C] "
-                             "[--max-rows R] [--model-id ID] [--max-tokens N] [--dspark DIR [--dspark-exl3 DIR]] [--admin] "
+                             "[--max-rows R] [--model-id ID] [--max-tokens N] [--dspark-mode off|auto|on] [--dspark DIR [--dspark-exl3 DIR]] [--admin] "
                              "[--resume-check P.u32[,...]]\n", argv[0]);
         return 2;
     }
@@ -712,6 +738,8 @@ int main(int argc, char** argv) {
         std::uint16_t port = 8080;
         std::uint32_t max_tokens = 4096, check_tokens = 256, check_child_layers = ~0U;
         bool admin = false, check_only = false;
+        std::string dspark_mode_value, dspark_prior_value;
+        const auto dspark_inflight = ds::parse_inflight(std::getenv("STRIX_MM_SERVE_DSPARK_INFLIGHT"));
         for (int i = 2; i < argc; ++i) {
             const std::string a = argv[i];
             auto next = [&]() -> std::string {
@@ -728,6 +756,8 @@ int main(int argc, char** argv) {
             else if (a == "--model-id") model_id = next();
             else if (a == "--max-tokens") max_tokens = static_cast<std::uint32_t>(std::stoul(next()));
             else if (a == "--dspark") dspark_dir = next();
+            else if (a == "--dspark-prior") dspark_prior_value = next();
+            else if (a == "--dspark-mode") dspark_mode_value = next();
             else if (a == "--dspark-exl3") dspark_exl3 = next();
             else if (a == "--admin") admin = true;
             else if (a == "--resume-check-child-layers") check_child_layers = static_cast<unsigned>(std::stoul(next()));
@@ -740,6 +770,8 @@ int main(int argc, char** argv) {
             else if (a == "--check-only") check_only = true;
             else throw std::invalid_argument("unknown option " + a);
         }
+        const auto dspark_prior = ds::parse_prior(dspark_prior_value.empty() ? std::getenv("STRIX_MM_DSPARK_PRIOR") : dspark_prior_value.c_str());
+        const auto dspark_mode = ds::parse_mode(dspark_mode_value.empty() ? std::getenv("STRIX_MM_SERVE_DSPARK") : dspark_mode_value.c_str());
         if (check_child_layers == 0 || (check_child_layers != ~0U && check_child_layers >= 60))
             throw std::invalid_argument("--resume-check-child-layers: 1..59");
         if ((!check_nested.empty() || check_child_layers != ~0U) && check.empty())
@@ -750,6 +782,12 @@ int main(int argc, char** argv) {
             throw std::invalid_argument("bounded child requires enough continuation tokens for every background step");
         if (opt.slots == 0 || opt.slots > 8) throw std::invalid_argument("--slots 1..8");
         if (!dspark_exl3.empty() && dspark_dir.empty()) dspark_dir = opt.model_dir + "/dspark";
+        if (dspark_dir.empty() && dspark_mode != ds::Mode::off && std::filesystem::is_directory(opt.model_dir + "/dspark"))
+            for (const auto& entry : std::filesystem::directory_iterator(opt.model_dir + "/dspark"))
+                if (entry.is_regular_file() && entry.path().extension() == ".safetensors") {
+                    dspark_dir = opt.model_dir + "/dspark";
+                    break;
+                }
         std::signal(SIGINT, on_signal);
         std::signal(SIGTERM, on_signal);
         std::string receipt;
@@ -777,6 +815,12 @@ int main(int argc, char** argv) {
         mm::Engine eng(opt, comm);
         if (exchanger) eng.set_exchanger(exchanger.get(), true);
         const auto lr = eng.load();
+        const std::uint32_t dspark_config = 0x4d4d0400U | (static_cast<std::uint32_t>(dspark_prior) << 7) | (static_cast<std::uint32_t>(dspark_mode) << 5) |
+                                            (dspark_dir.empty() ? 0U : 16U) | dspark_inflight;
+        if (eng.peer(dspark_config) != dspark_config) {
+            eng.abort("DSpark startup mode / assets / protocol mismatch");
+            throw std::runtime_error("DSpark startup mode / assets / protocol mismatch");
+        }
         std::printf("rank %u: load %.1f s, device used %.1f GiB\n", opt.rank, lr.seconds, lr.device_gib);
         std::fflush(stdout);
         // DSpark drafter on both ranks (both run every draft command; the target's residual taps are replicated)
@@ -820,7 +864,7 @@ int main(int argc, char** argv) {
             }
         }
         // taps only while DSpark is on (both ranks read the same STRIX_MM_SERVE_DSPARK; runtime switches via Command::taps)
-        const bool dspark_on = drafter != nullptr && env_num("STRIX_MM_SERVE_DSPARK", 0) != 0;
+        const bool dspark_on = drafter != nullptr && dspark_mode == ds::Mode::on;
         if (drafter != nullptr) eng.set_taps(dspark_on);
         if (opt.rank != 0) {
             follow(eng, run);
@@ -838,8 +882,9 @@ int main(int argc, char** argv) {
             shared.policy.short_first = env_num("STRIX_MM_SERVE_SHORT_FIRST", 1) != 0;
             shared.unlimited_reason = eng.prefill_unlimited_reason();
             shared.policy.gap_ms = ms::gap_ms(std::getenv("STRIX_MM_SERVE_GAP_MS"));
-            shared.policy.dspark = dspark_on;
-            shared.policy.inflight = static_cast<std::uint32_t>(env_num("STRIX_MM_SERVE_DSPARK_INFLIGHT", 1));
+            shared.policy.dspark_mode = dspark_mode;
+            shared.policy.dspark_prior = dspark_prior;
+            shared.policy.inflight = dspark_inflight;
             shared.policy.draft_slots = static_cast<std::uint32_t>(std::clamp(env_num("STRIX_MM_SERVE_DRAFT_SLOTS", 8), 1.0, 8.0));
         }
         sv::GenerationQueue queue(64);
@@ -871,7 +916,8 @@ int main(int argc, char** argv) {
             const bool has_drafter = drafter != nullptr;
             ao.admin_sched = [&shared, has_drafter](const sv::HttpRequest& r) { return admin_sched(r, shared, has_drafter); };
         }
-        ms::MinimaxApi api(ms::api_tokenizer(ms::MinimaxTokenizer::load(opt.model_dir + "/tokenizer.json")), queue, ao, observer);
+        const auto tokenizer = ms::MinimaxTokenizer::load(opt.model_dir + "/tokenizer.json");
+        ms::MinimaxApi api(ms::api_tokenizer(tokenizer), queue, ao, observer);
         sv::HttpServerConfig hc;
         hc.bind_address = bind;
         hc.port = port;
@@ -881,9 +927,10 @@ int main(int argc, char** argv) {
         std::printf("minimax serve policy: %s\n", policy_json(shared, drafter != nullptr).dump().c_str());
         std::printf("READY rank 0 http://%s:%u model %s slots %u context %llu sched %s gap %.0f ms dspark %s\n", bind.c_str(), http.port(),
                     model_id.c_str(), opt.slots, static_cast<unsigned long long>(opt.capacity),
-                    shared.policy.sched == Sched::interleave ? "interleave" : "off", shared.policy.gap_ms, shared.policy.dspark ? "on" : "off");
+                    shared.policy.sched == Sched::interleave ? "interleave" : "off", shared.policy.gap_ms, ds::mode_name(shared.policy.dspark_mode));
         std::fflush(stdout);
-        Lead lead(eng, run, queue, shared, opt.max_rows, dspark_on, g_stop);
+        Lead lead(eng, run, queue, shared, opt.max_rows, dspark_on, g_stop,
+                  [tokenizer](const std::vector<std::uint32_t>& ids) { return tokenizer->decode(ids, true); });
         lead.loop();
         queue.shutdown();
         http.stop();

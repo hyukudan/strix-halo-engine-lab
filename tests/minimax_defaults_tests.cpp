@@ -85,6 +85,7 @@ std::set<std::string> lines(const std::string& text) {
 
 // The value each item replaced (measurement evidence), written out independently of the table.
 const std::map<std::string, std::string> kFormer = {
+    {"STRIX_MM_SERVE_DSPARK", "0"},
     {"STRIX_MM_SERVE_NEST", "0"}, {"STRIX_MM_SERVE_SCHED", "off"}, {"STRIX_MM_SERVE_SERVICE_MS", "0"}, {"STRIX_MM_SERVE_SHORT_FIRST", "0"},
     {"STRIX_MMX_MOE_WIDE", "0"},           {"STRIX_MM_INDEX_CONC", "0"},       {"STRIX_MMX_CRC", "1"},
     {"STRIX_MM_XB_WAIT", "0"},             {"STRIX_MM_XB_INPLACE", "0"},       {"STRIX_MM_XB_PUBLISH", "0"},
@@ -205,6 +206,10 @@ void test_cli() {
     check(r.transport == "tcp-listen:9000" && r.slots == 2 && r.capacity == 100 && r.max_rows == 16, "rank cli");
     const auto s = md::parse_cli("serve", {"M", "--transport", "usb4gpu", "--slots", "4"});
     check(s.app == "serve" && s.transport == "usb4gpu" && s.slots == 4 && s.capacity == 8256 && s.max_rows == 4096, "serve cli");
+    const auto override_cli = md::parse_cli("serve", {"M", "--dspark-mode", "on"});
+    const EnvMap bad_mode = {{"STRIX_MM_SERVE_DSPARK", "invalid"}, {md::kBaselineEnv, "1"}};
+    check(lines(md::effective_config(override_cli, lookup(bad_mode))).count("serve.dspark_mode=on") == 1,
+          "CLI overrides env and baseline before validation");
     const auto d = md::parse_cli("serve", {"M"});
     check(d.transport == "usb4-auto" && d.slots == 8, "serve cli defaults = receipt");
 }
@@ -214,8 +219,19 @@ void test_serve_preflight() {
     const EnvMap none;
     const auto defaults = lines(md::effective_config(cli, lookup(none)));
     for (const char* line : {"serve.sched=interleave", "serve.service_ms=250", "serve.gap_ms=1500",
-                             "serve.short_first=1", "serve.nest=1"})
+                             "serve.short_first=1", "serve.nest=1", "serve.dspark_mode=auto", "serve.dspark_effective=per_request_if_assets", "serve.dspark_prior=structural-v1", "dspark.prior=structural-v1", "serve.dspark_inflight=1"})
         check(defaults.count(line) == 1, std::string("resolved policy: ") + line);
+    const EnvMap prior_env = {{"STRIX_MM_DSPARK_PRIOR", "unqualified-v1"}};
+    check(lines(md::effective_config(cli, lookup(prior_env))).count("serve.dspark_reason=plain:prior_unqualified") == 1, "prior env fallback");
+    for (const char* app : {"serve", "rank"}) {
+        auto c = md::Cli{}; c.app = app; c.dspark_prior = "structural-v1";
+        const EnvMap invalid = {{"STRIX_MM_DSPARK_PRIOR", "invalid"}};
+        check(lines(md::effective_config(c, lookup(invalid))).count("dspark.prior=structural-v1") == 1, "prior CLI overrides invalid env");
+        c.dspark_prior.clear(); bool rejected = false;
+        try { (void)md::effective_config(c, lookup(invalid)); } catch (const std::invalid_argument&) { rejected = true; }
+        check(rejected, "both apps reject invalid prior");
+    }
+    check(md::parse_cli("rank", {"M", "0", "usb4-auto", "O", "--dspark-prior", "unqualified-v1"}).dspark_prior == "unqualified-v1", "rank prior CLI");
     const EnvMap custom = {{"STRIX_MM_SERVE_SCHED", "0"}, {"STRIX_MM_SERVE_SERVICE_MS", "0"},
                           {"STRIX_MM_SERVE_GAP_MS", "100"}, {"STRIX_MM_SERVE_SHORT_FIRST", "0"},
                           {"STRIX_MM_SERVE_NEST", "0"}};
@@ -230,7 +246,7 @@ void test_serve_preflight() {
           baseline.count("serve.short_first=0") == 1 && baseline.count("serve.nest=0") == 1 &&
           baseline.count("serve.gap_ms=1500") == 1, "baseline policy resolves before export");
     for (const char* name : {"STRIX_MM_SERVE_SCHED", "STRIX_MM_SERVE_SERVICE_MS", "STRIX_MM_SERVE_GAP_MS",
-                             "STRIX_MM_SERVE_SHORT_FIRST", "STRIX_MM_SERVE_NEST"}) {
+                             "STRIX_MM_SERVE_SHORT_FIRST", "STRIX_MM_SERVE_NEST", "STRIX_MM_SERVE_DSPARK", "STRIX_MM_SERVE_DSPARK_INFLIGHT"}) {
         std::vector<std::string> invalid = {"nan", "inf", "1e999", "4294967296", "-1", "invalid"};
         if (std::strcmp(name, "STRIX_MM_SERVE_GAP_MS") == 0) invalid.push_back("0");
         for (const auto& value : invalid) {
@@ -265,7 +281,7 @@ void test_apply() {
     }
     // Exercise the actual app entry with and without inspection, for both rank arguments.
     for (const char* name : {"STRIX_MM_SERVE_SCHED", "STRIX_MM_SERVE_SERVICE_MS", "STRIX_MM_SERVE_GAP_MS",
-                             "STRIX_MM_SERVE_SHORT_FIRST", "STRIX_MM_SERVE_NEST"}) {
+                             "STRIX_MM_SERVE_SHORT_FIRST", "STRIX_MM_SERVE_NEST", "STRIX_MM_SERVE_DSPARK", "STRIX_MM_SERVE_DSPARK_INFLIGHT"}) {
         const char* old = std::getenv(name);
         const std::string saved = old == nullptr ? "" : old;
         const bool had = old != nullptr;

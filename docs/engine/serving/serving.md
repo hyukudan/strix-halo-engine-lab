@@ -508,6 +508,45 @@ same facts it already holds on the host; it adds no device synchronization.
 The MiniMax TP2 server (rank 0 serves HTTP; rank 1 replays the control blocks) has its own API module,
 `src/minimax/serve/minimax_api.*`, with the same routes plus:
 
+DSpark mode defaults to `auto` (`STRIX_MM_SERVE_DSPARK`); `--dspark-mode off|auto|on` overrides
+explicit environment, which overrides the resolver. Environment aliases `0|off` and `1|on` remain
+supported. Invalid values fail preflight on both ranks, including inspection-only runs.
+`STRIX_MM_BASELINE=1` supplies `0` when the item is unset; explicit environment or CLI still wins.
+Use `STRIX_MM_SERVE_DSPARK=0` for a DSpark-only comparison. Baseline also changes other optimizations.
+`--dspark DIR` supplies assets independently of mode. With no explicit path, auto/on discovers local
+safetensors under `MODEL_DIR/dspark`; missing optional assets use plain. No assets are downloaded.
+Explicit invalid assets fail. Both arms of an in-process comparison must load the same drafter;
+report cold load time, rings, nested tap banks and peak memory separately from generation.
+
+The frozen default prior is **structural-v1**: eligible C1 prompts with JSON/code markers
+or at least 6551 tokens enter the legacy automatic controller. Ordinary prose of every
+language stays plain without neural probes. Select `STRIX_MM_DSPARK_PRIOR=unqualified-v1`
+or `--dspark-prior unqualified-v1` for conservative plain admission; CLI overrides env.
+The [frozen feature definitions and thresholds](dspark-auto-qualification.md#frozen-structural-v1-features)
+are host-only and evaluated on rank 0. Grouped prompts remain
+`plain:grouped_taps_unqualified`. Auto excludes queued competitors, C2/C4 and competing
+prefills, including surviving requests after burst drain. Raising
+`STRIX_MM_SERVE_DSPARK_INFLIGHT` never enables automatic C2; zero disables admission.
+Structural-v1 node qualification: Serve, two Strix Halo nodes over 2x USB4 Gen3, PerfOpt kernel, one load with mode switched per request (off / auto / auto / off, twice per class), 256-token greedy C1 chat requests: generated token IDs (ids_fnv) and text identical in every visit of every class; wall time auto vs off: JSON -34.6 % (13.57 -> 8.87 s, 95 % interval -4.99..-4.40 s), code -17.5 % (-2.67..-1.90 s), Spanish prose plain (no drafts) +0.2 % (-0.08..+0.13 s), English story plain -0.1 % (-0.04..+0.03 s). Long prompts were not measured on serve (prompts above max_rows stay plain). English story remains plain unless structural/length
+features qualify; its historical marginal gain is not claimed as retained.
+
+`--dspark-mode on` or `/admin/sched` boolean `dspark:true` retains the legacy controller and its
+exploration behavior; it has no new per-class performance claim. Boolean false is immediate OFF;
+`dspark_mode:"off"|"auto"|"on"` selects explicitly. Sending both fields is rejected even if they agree.
+An epoch change retires existing contexts on both ranks; no stale ring resumes. Protocol v3 uses the
+same 512-byte control block and a context retirement mask. OFF stops context appends at the returned
+boundary even in an open prefill; tap disable waits for both active and parked prefills to close.
+Target calls, original row shapes and split policies stay fixed. Runtime mode, prior, asset availability,
+context count and concurrency eligibility are reported by `/admin/sched`; request timings report
+`dspark_mode`, `dspark_reason`, `dspark_context`. Status snapshots can lag one returned boundary.
+
+Rank `--spec ...:auto` uses the same frozen structural admission and the ordinary session as its plain
+oracle. `auto:legacy` preserves the previous automatic controller; `fixed:K` and diagnostics remain
+explicit. The serve-specific environment does not rewrite rank policies. Candidate Markov remains
+applicable to promoted rank auto and explicit neural policies; serve still runs the full Markov chain.
+Passive grouped trailing taps, the net-cost active/probe controller and serve candidate
+Markov integration remain pending. See [DSpark qualification](dspark-auto-qualification.md) before claiming performance qualification.
+
 The resolver defaults to `STRIX_MM_SERVE_SCHED=interleave`, `STRIX_MM_SERVE_SERVICE_MS=250`
 and `STRIX_MM_SERVE_SHORT_FIRST=1`. GPU exactness and HTTP load measurements appear below.
 `STRIX_MM_SERVE_SCHED=off` restores whole-prefill scheduling and FIFO admission;

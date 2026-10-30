@@ -21,12 +21,13 @@ struct Trace {
     bool open = false;
     std::uint64_t active = 0, parked = 0, parent = 0, generation = 0;
     std::vector<unsigned> calls;
-    bool prefill_open() const { return open; }
+    bool prefill_open() const { return open || parked != 0; }
     void prefill_check(std::uint64_t id, unsigned) const { if (id != active || open) throw std::runtime_error("wrong completion"); }
     void require_active(std::uint64_t id, unsigned bank = 0) const { if (!open || active != id || bank != (parent != 0 ? 1U : 0U)) throw std::runtime_error("wrong task"); }
     void prefill_park(std::uint64_t id) { require_active(id, parent != 0 ? 1U : 0U); parked = id; open = false; calls.push_back(9); }
     void prefill_resume_parked(std::uint64_t id) { if (open || parked == 0 || parked != id) throw std::runtime_error("wrong parent"); active = id; parked = 0; parent = 0; open = true; calls.push_back(11); }
     void cancel_all() { if (open) prefill_cancel(active); if (parked) prefill_cancel(parked); }
+    void retire_contexts(unsigned mask) { calls.push_back(1300 + mask); }
     void set_taps(bool on) { calls.push_back(on ? 81 : 80); }
     void prefill_begin(unsigned slot, std::span<const unsigned> prompt, bool context, std::uint64_t id, std::uint64_t p, std::uint64_t g) {
         if (open || (p != 0 && (parked != p || id == p))) throw std::runtime_error("wrong begin");
@@ -78,6 +79,24 @@ struct WireTrace : Trace {
 int main() {
     int bad = 0;
     const auto check = [&](bool ok) { if (!ok) { ++bad; std::cerr << "scheduler check failed\n"; } };
+    for (bool open : {false, true}) for (unsigned flags : {0U, 1U, 2U}) {
+        Trace trace; trace.open = open;
+        Control c; c.command = static_cast<unsigned>(ms::Command::taps); c.pflags = flags;
+        bool rejected = false;
+        try { (void)ms::replay_command(c, trace, trace, [](std::size_t n) { return std::vector<unsigned>(n); }); }
+        catch (const std::runtime_error&) { rejected = true; }
+        check(rejected == (open || flags > 1));
+        check(rejected ? trace.calls.empty() : trace.calls.size() == 1);
+    }
+    for (unsigned mask : {1U, 255U, 256U}) {
+        Trace trace; trace.open = true;
+        Control c; c.command = static_cast<unsigned>(ms::Command::retire); c.append = mask;
+        bool rejected = false;
+        try { (void)ms::replay_command(c, trace, trace, [](std::size_t n) { return std::vector<unsigned>(n); }); }
+        catch (const std::runtime_error&) { rejected = true; }
+        check(rejected == (mask > 255));
+        check(rejected ? trace.calls.empty() : trace.calls == std::vector<unsigned>({1300 + mask}));
+    }
     check(!ms::protects(10, 10, true));
     check(!ms::protects(10, 9, false));
     check(ms::protects(10, 9, true));

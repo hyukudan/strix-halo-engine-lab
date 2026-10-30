@@ -658,7 +658,7 @@ void test_scheduler_side() {
     Rig rig(true);
     const std::vector<std::string> keys{"queue_ms", "prefill_ms", "decode_ms", "decode_tok_s", "completion_tokens", "ttft_ms",
                                         "max_gap_ms", "stall_ms", "prefill_units", "cycles", "drafted", "accepted", "ids_fnv",
-                                        "prompt_fnv", "sched", "effective_sched", "service_ms", "max_unit_layers", "task_id", "nested", "parent_request", "nest_count", "nest_service_ms", "nest_switch_ms", "park_wall_ms", "short_first", "fallback_reason", "sampling"};
+                                        "prompt_fnv", "sched", "effective_sched", "service_ms", "max_unit_layers", "task_id", "nested", "parent_request", "nest_count", "nest_service_ms", "nest_switch_ms", "park_wall_ms", "short_first", "fallback_reason", "dspark_mode", "dspark_reason", "dspark_context", "sampling"};
     auto key_order = [](const Json& t) {
         std::vector<std::string> out;
         if (t.is_object())
@@ -670,6 +670,7 @@ void test_scheduler_side() {
     rig.api.handle(post("/v1/chat/completions", kChat + "}", "sched0001"), a);
     const auto j = sv::parse_json(a.body);
     const auto& t = at(j, "timings");
+    check(at(t, "dspark_mode").as_string() == "auto" && at(t, "dspark_reason").as_string() == "plain:prior_unqualified" && !at(t, "dspark_context").as_bool(), "unqualified auto timings");
     check(key_order(t) == keys, "non-stream timings: the scheduler's keys in order");
     check(at(t, "ttft_ms").as_double() == 12.5 && at(t, "max_gap_ms").as_double() == 3.25 && at(t, "prefill_units").as_int() == 2 &&
               at(t, "drafted").as_int() == 6 && at(t, "completion_tokens").as_int() == 3,

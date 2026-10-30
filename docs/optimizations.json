@@ -1050,6 +1050,17 @@
   },
   {
     "engine": "minimax",
+    "name": "DSpark automatic admission",
+    "flag_or_env": "STRIX_MM_SERVE_DSPARK; --dspark-mode; /admin/sched dspark_mode",
+    "default": "auto",
+    "exact": "Plain fallback uses the unchanged target schedule; promoted structural-v1 cells use legacy greedy verification; serve A/B: generated token IDs (ids_fnv) and text identical with auto and off for JSON, code, Spanish prose and English story.",
+    "gain": "Serve, two Strix Halo nodes over 2x USB4 Gen3, PerfOpt kernel, one load with mode switched per request (off / auto / auto / off, twice per class), 256-token greedy C1 chat requests: generated token IDs (ids_fnv) and text identical in every visit of every class; wall time auto vs off: JSON -34.6 % (13.57 -> 8.87 s, 95 % interval -4.99..-4.40 s), code -17.5 % (-2.67..-1.90 s), Spanish prose plain (no drafts) +0.2 % (-0.08..+0.13 s), English story plain -0.1 % (-0.04..+0.03 s). Long prompts were not measured on serve (prompts above max_rows stay plain).",
+    "preconditions": "Compatible local assets; auto C1 only, no queued competitor or competing prefill; grouped serve prompts stay plain. Default structural-v1 uses frozen host byte/token features and legacy control; STRIX_MM_DSPARK_PRIOR / --dspark-prior unqualified-v1 admits no neural work. Serve uses full Markov; candidate settings apply to rank neural policies.",
+    "off_switch": "STRIX_MM_SERVE_DSPARK=0; --dspark-mode off; /admin/sched dspark=false or dspark_mode=off; STRIX_MM_BASELINE=1 unless explicitly overridden; STRIX_MM_SERVE_DSPARK_INFLIGHT=0 prevents legacy admission",
+    "doc_anchor": "docs/optimizations.md#mm-serve-dspark"
+  },
+  {
+    "engine": "minimax",
     "name": "DSpark attention",
     "flag_or_env": "STRIX_MM_DSPARK_ATTN",
     "default": "2",

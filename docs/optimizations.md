@@ -1574,6 +1574,27 @@ Warm 8 MiB of boundary data.
 - **Measured gain:** Exchange boundary measurement: exact, 1K 48.56 -> 44.40 ms/token
 - **Implementation / evidence:** [38-item resolver](../src/minimax/engine/mm_defaults.cpp), [rank gates](../apps/minimax_rank_main.cpp)
 
+<a id="mm-serve-dspark"></a>
+
+### DSpark automatic admission
+
+**Engine:** `minimax`. **Control:** `STRIX_MM_SERVE_DSPARK`; `--dspark-mode`. **Default:** auto.
+
+The frozen default prior `structural-v1` promotes eligible C1 JSON/code markers and prompts
+of at least 6551 tokens into the legacy automatic controller. Other prose stays plain without
+neural probes. `STRIX_MM_DSPARK_PRIOR=unqualified-v1` or `--dspark-prior unqualified-v1`
+restores conservative plain admission. Thresholds and route reasons are documented in the
+qualification contract. Serve node qualification under the pre-registered not-slower rule
+(same load, mode switched per request): JSON -34.6 %, code -17.5 % wall time, Spanish prose and
+English story plain and not slower, identical generated tokens in every class; long prompts on
+serve stay plain (above max_rows).
+
+- **Preconditions:** Local compatible assets, C1, no queued competitor or competing prefill, room for the block. Grouped trailing taps remain unqualified; grouped serve prompts stay plain. No request-local net-saving exit exists yet; promoted requests retain legacy control.
+- **Compatibility:** `1|on` selects the legacy serve controller; rank `auto:legacy`, `auto:nogate` and `fixed:K` remain explicit. Serve still uses full Markov; candidate resolver items apply to rank neural policies.
+- **Off switch:** `STRIX_MM_SERVE_DSPARK=0`, `--dspark-mode off`, `/admin/sched` `dspark:false` or `dspark_mode:"off"`. Baseline supplies 0 unless overridden. `STRIX_MM_SERVE_DSPARK_INFLIGHT=0` prevents legacy context admission; the cap otherwise defaults to 1.
+- **Qualification:** [Contracts and paired protocol](engine/serving/dspark-auto-qualification.md). A paired 95% interval wholly slower rejects a selected regime; a straddling interval is not proof of equivalence. No minimum percentage gain veto.
+- **Implementation:** [Resolver](../src/minimax/engine/mm_defaults.cpp), [host admission](../src/minimax/dspark/minimax_auto.hpp), [CPU tests](../tests/minimax_auto_tests.cpp).
+
 <a id="mm-dspark-attn"></a>
 
 ### DSpark attention
@@ -1585,7 +1606,7 @@ Use mode-2 drafter attention.
 - **Preconditions:** Attached compatible DSpark drafter and attention geometry.
 - **Automatic selection:** Resolver supplies 2 only when unset; explicit values win. Shape/core dispatch determines actual use.
 - **Fallback notice:** Unsupported operator geometry keeps its supported dispatch without a universal decline notice; invalid explicit settings fail validation.
-- **Exactness evidence:** Published same-identity qualification: Drafter measurement: bitwise, drafter attention B/A 0.964-0.975 / 0.918-0.924 / 0.815-0.819 at ctx 300/1000/4095; repeat golden-logit/token/state and relevant exchange gates for the chosen workload.
+- **Exactness evidence:** Plain fallback uses the unchanged target schedule; promoted structural-v1 cells use legacy greedy verification; serve A/B: generated token IDs (ids_fnv) and text identical with auto and off for JSON, code, Spanish prose and English story.
 - **Off switch:** STRIX_MM_DSPARK_ATTN=0
 - **Measured gain:** Drafter measurement: bitwise, drafter attention B/A 0.964-0.975 / 0.918-0.924 / 0.815-0.819 at ctx 300/1000/4095
 - **Implementation / evidence:** [38-item resolver](../src/minimax/engine/mm_defaults.cpp), [rank gates](../apps/minimax_rank_main.cpp)

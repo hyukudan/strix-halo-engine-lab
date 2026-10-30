@@ -4,6 +4,7 @@
 #include "minimax_control.hpp"
 #include "minimax_api.hpp"
 #include "minimax/dspark/minimax_dspark.hpp"
+#include "minimax/dspark/minimax_auto.hpp"
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -13,6 +14,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <map>
+#include <functional>
 #include <mutex>
 #include <optional>
 #include <thread>
@@ -47,7 +49,8 @@ using Sched = ms::Sched;
 struct Policy : ms::RequestPolicy {
     bool nest = true;
     bool short_first = true;
-    bool dspark = true;           // with a drafter loaded
+    ds::Mode dspark_mode = ds::Mode::automatic;
+    ds::Prior dspark_prior = ds::Prior::structural_v1;
     std::uint32_t inflight = 1;   // DSpark contexts kept while <= this many requests are in flight (measurement: C2 slower)
     std::uint32_t draft_slots = 8;  // at most this many slots draft in one cycle
     std::uint64_t epoch = 0;      // bumped by every change (the lead resets its cost tables / gates)
@@ -72,6 +75,7 @@ struct Shared {
     unsigned nest_rows = 0;
     std::uint64_t active_id = 0, parked_id = 0;
     bool nest_taps = false;
+    std::uint32_t dspark_live = 0, dspark_contexts = 0;
     std::unordered_map<const sv::GenerationTicket*, Extra> extras;
 };
 
@@ -89,6 +93,8 @@ struct Running {
     ms::NestQuota nest_quota;
     bool prefilling = false;
     bool context = false;  // DSpark: the drafter context of this slot is complete
+    ds::AutoRequest automatic;
+    ds::Prior dspark_prior = ds::Prior::structural_v1;
     ds::SurvivalController survival{16};
     double tau = 1.0;      // EMA of emitted tokens per drafting cycle (which slots draft first)
 };
@@ -123,6 +129,7 @@ struct Costs {
 };
 
 inline void log_request(const Running& r, const char* finish) {
+    std::fprintf(stderr, "mmserve-dspark mode=%s reason=%s prior=%s\n", r.x.dspark_mode.c_str(), r.x.dspark_reason.c_str(), ds::prior_name(r.dspark_prior));
     std::fprintf(stderr, "mmserve-policy sched=%s service_ms=%.1f max_unit_layers=%u short_first=%u fallback=%s nested=%u parent_request=%llu task_id=%llu\n",
                  r.x.sched.c_str(), r.x.service_ms, r.x.max_unit_layers, r.x.short_first ? 1U : 0U, r.x.fallback_reason.c_str(), r.x.nested ? 1U : 0U,
                  static_cast<unsigned long long>(r.x.parent_request), static_cast<unsigned long long>(r.request_id));
@@ -144,9 +151,11 @@ inline void log_request(const Running& r, const char* finish) {
 template<class Engine, class Runner, class Time = std::chrono::steady_clock>
 class Lead {
 public:
-    Lead(Engine& eng, Runner& run, sv::GenerationQueue& queue, Shared& shared, std::uint64_t max_rows, bool taps, std::atomic<bool>& stop)
+    Lead(Engine& eng, Runner& run, sv::GenerationQueue& queue, Shared& shared, std::uint64_t max_rows, bool taps, std::atomic<bool>& stop,
+         std::function<std::string(const std::vector<std::uint32_t>&)> prompt_bytes = {})
         : eng_(eng), run_(run), queue_(queue), sh_(shared), slots_(eng.slots()), capacity_(eng.capacity()), max_rows_(max_rows),
           run_slots_(slots_), stop_(stop), taps_(taps) {
+        prompt_bytes_ = std::move(prompt_bytes);
         round_ = run.control_round;
         const char* v = std::getenv("STRIX_MM_SERVE_TIMELINE");
         timeline_on_ = v != nullptr && std::strcmp(v, "1") == 0;
@@ -278,8 +287,11 @@ private:
     // The engine's draft taps follow DSpark on / off (taps cost capture work in every call): switched on both ranks with
     // no prefill open; requests admitted while they were off have no drafter context.
     void sync_taps() {
-        const bool want = run_.dd != nullptr && pol_.dspark;
-        if (want == taps_ || eng_.prefill_open()) return;
+        bool active = false;
+        for (const auto& r : run_slots_) active |= r && r->context;
+        const bool want = run_.dd != nullptr && (pol_.dspark_mode == ds::Mode::on ||
+                          (pol_.dspark_mode == ds::Mode::automatic && active));
+        if (want == taps_ || eng_.prefill_open() || parked_slot_ < slots_) return;
         Control c;
         c.command = static_cast<std::uint32_t>(Command::taps);
         c.round = round_++;
@@ -291,12 +303,31 @@ private:
     void refresh_policy() {
         std::lock_guard<std::mutex> l(sh_.m);
         if (sh_.policy.epoch != pol_.epoch) {  // reset optimization gates, retain deadline safety estimates
+            std::uint32_t retiring = 0;
+            for (const auto& r : run_slots_) if (r && r->context) retiring |= 1U << r->slot;
+            if (retiring != 0) {
+                Control c;
+                c.command = static_cast<std::uint32_t>(Command::retire);
+                c.round = round_++;
+                c.append = retiring;
+                (void)exchange(eng_, c);
+                run_.retire_contexts(retiring);
+            }
+            for (auto& r : run_slots_) if (r) {
+                r->context = false;
+                r->x.context = false;
+                r->automatic.retire("plain:policy_epoch");
+                r->x.dspark_reason = r->automatic.reason;
+            }
             costs_.reset();
             // Deadline safety samples survive policy/counter epochs.
             gates_.assign(kStepRows + 1, ds::DraftGate());
             explore_ = {};
         }
         pol_ = sh_.policy;
+        sh_.dspark_live = inflight();
+        sh_.dspark_contexts = 0;
+        for (const auto& r : run_slots_) if (r && r->context) ++sh_.dspark_contexts;
     }
     std::uint32_t decoding_count() const {
         std::uint32_t n = 0;
@@ -493,6 +524,7 @@ private:
         }
         Running r;
         r.policy = pol_;
+        r.dspark_prior = pol_.dspark_prior;
         if (!nested && off) r.policy.sched = Sched::off;  // effective operation policy, including cancellation/DSpark residency
         r.request_id = ++request_id_;
         r.x.task_id = r.request_id;
@@ -503,8 +535,41 @@ private:
         r.x.ids_fnv = 14695981039346656037ULL;
         // DSpark context: a drafter, DSpark on, few enough requests in flight, a one-chunk prompt (longer ones keep the
         // grouped prefill), room for the 7-row block
-        r.context = run_.dd != nullptr && pol_.dspark && taps_ && inflight() + 1 <= pol_.inflight && prompt.size() <= max_rows_ &&
-                    prompt.size() + ds::block + 1 < capacity_;
+        // A second admission retires the original auto context permanently before any newcomer work.
+        if (pol_.dspark_mode == ds::Mode::automatic && inflight() != 0) {
+            std::uint32_t retiring = 0;
+            for (auto& old : run_slots_) if (old && old->context) {
+                retiring |= 1U << old->slot;
+                old->context = old->x.context = false;
+                old->automatic.retire("plain:concurrency");
+                old->x.dspark_reason = old->automatic.reason;
+            }
+            if (retiring) {
+                Control c; c.command = static_cast<std::uint32_t>(Command::retire);
+                c.round = round_++; c.append = retiring;
+                (void)exchange(eng_, c); run_.retire_contexts(retiring);
+                sync_taps();
+            }
+        }
+        const bool competing = nested || parked_slot_ < slots_ ||
+            queue_.has_waiting([](const sv::GenerationJob&, Clock::time_point) { return true; });
+        ds::Features structure;
+        if (pol_.dspark_mode == ds::Mode::automatic && pol_.dspark_prior == ds::Prior::structural_v1 &&
+            run_.dd && inflight() == 0 && !competing &&
+            prompt.size() <= max_rows_ && prompt.size() < ds::long_prompt_tokens && prompt_bytes_)
+            structure = ds::features(prompt_bytes_(prompt));
+        r.automatic.admit({pol_.dspark_mode, run_.dd != nullptr && pol_.inflight != 0, inflight(), competing,
+                           prompt.size(), max_rows_, t->job.max_tokens, prompt.size() + ds::block + 1 < capacity_,
+                           pol_.dspark_prior, structure});
+        const bool promoted = pol_.dspark_mode == ds::Mode::automatic && r.automatic.state == ds::AutoRequest::State::active;
+        if (promoted && !taps_ && !eng_.prefill_open() && parked_slot_ >= slots_) {
+            Control c; c.command = static_cast<std::uint32_t>(Command::taps); c.round = round_++; c.pflags = 1;
+            (void)exchange(eng_, c); eng_.set_taps(true); taps_ = true;
+        }
+        r.context = run_.dd != nullptr && (pol_.dspark_mode == ds::Mode::on || promoted) && taps_ &&
+                    inflight() + 1 <= pol_.inflight && prompt.size() <= max_rows_ && prompt.size() + ds::block + 1 < capacity_;
+        r.x.dspark_mode = ds::mode_name(pol_.dspark_mode);
+        r.x.dspark_reason = pol_.dspark_mode == ds::Mode::on ? (r.context ? "legacy" : "plain:legacy_ineligible") : r.automatic.reason;
         r.x.context = r.context;
         r.x.sched = pol_.sched == Sched::off ? "off" : "interleave";
         r.x.service_ms = pol_.service_ms;
@@ -701,11 +766,16 @@ private:
         if (order.empty()) return;
         const auto n = static_cast<std::uint32_t>(order.size());
         // DSpark contexts: kept only while few requests are in flight (each append reads the 94 MB fc)
-        const bool keep = run_.dd != nullptr && pol_.dspark && taps_ && inflight() <= pol_.inflight;
+        const bool keep = run_.dd != nullptr && taps_ &&
+            ((pol_.dspark_mode == ds::Mode::on && inflight() <= pol_.inflight) ||
+             (pol_.dspark_mode == ds::Mode::automatic && inflight() == 1 && parked_slot_ >= slots_));
         std::uint32_t append = 0;
         for (auto s : order) {
             auto& r = run_slots_[s];
-            if (!keep) r->context = false;  // stale for good (acceptance only)
+            if (!keep) {
+                r->context = false;  // stale for good (acceptance only)
+                r->x.context = false;
+            }
             if (r->context) append |= 1U << s;
         }
         // drafting slots: contexts, room for the block, more than one token to go; the budget is the step's free rows
@@ -918,6 +988,7 @@ private:
         }
     }
 
+    std::function<std::string(const std::vector<std::uint32_t>&)> prompt_bytes_;
     Engine& eng_;
     Runner& run_;
     sv::GenerationQueue& queue_;

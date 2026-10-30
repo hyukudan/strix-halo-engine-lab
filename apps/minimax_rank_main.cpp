@@ -31,6 +31,7 @@
 //                                                    (pfpipe: production vs STRIX_MM_AB_PIPE=1|2, default 2; 7 hashed prefills)
 //                                                    (core8: v4 MT8, 0 vs STRIX_MM_AB_CORE8, default 1; forces mtfit; 7 hashed prefills)
 //   --spec NAME:PROMPT.u32:STEPS:POLICY              speculative decode with the DSpark draft (POLICY fixed:K | auto);
+//                                                     auto: structural-v1 admission, prose stays plain; --dspark-prior unqualified-v1 restores plain; auto:legacy restores the former controller
 //                                                     tokens compared with the --session of the same NAME (exactness)
 //   --dspark DIR                                     draft checkpoint (default MODEL_DIR/dspark)
 //   --dspark-exl3 DIR                                draft linears from an EXL3 requant (strix-trellis gemv), rest from --dspark
@@ -59,6 +60,8 @@
 #include "minimax/xfer/minimax_xfer.hpp"
 #include "minimax/pfx/pf_exchange.hpp"
 #include "hip_minimax_dspark.hpp"
+#include "minimax/dspark/minimax_auto.hpp"
+#include "minimax/serve/minimax_tokenizer.hpp"
 #include "markov_cand.hpp"
 #include "minimax_ngram.hpp"
 
@@ -494,6 +497,10 @@ bool markov_cand_session() {
 }
 std::unique_ptr<ds::CandMarkov> g_cand;
 
+ds::Prior g_auto_prior = ds::Prior::structural_v1;
+std::string g_auto_model;
+std::shared_ptr<const strix::minimax::serve::MinimaxTokenizer> g_auto_tokenizer;
+
 struct SpecStats {
     std::size_t cycles = 0, drafted = 0, accepted = 0, emitted = 0, copy_cycles = 0, copy_accepted = 0, copy_drafted = 0;
     std::size_t n_markov_fallback = 0;
@@ -515,22 +522,44 @@ struct SpecStats {
 std::vector<std::uint32_t> spec_session(mm::Engine& eng, ds::DeviceDrafter& dd, const std::string& name,
                                         const std::vector<std::uint32_t>& prompt, int steps, const std::string& policy,
                                         const std::string& out_dir) {
+    if (policy == "auto") {
+        ds::AutoRequest automatic;
+        if (eng.rank() == 0) {
+            ds::Features f;
+            if (g_auto_prior == ds::Prior::structural_v1 && prompt.size() < ds::long_prompt_tokens) {
+                if (!g_auto_tokenizer) g_auto_tokenizer = strix::minimax::serve::MinimaxTokenizer::load(g_auto_model + "/tokenizer.json");
+                f = ds::features(g_auto_tokenizer->decode(prompt, true));
+            }
+            automatic.admit({ds::Mode::automatic, true, 0, false, prompt.size(), prompt.size(),
+                             static_cast<std::uint64_t>(std::max(0, steps)), true, g_auto_prior, f});
+            std::printf("rank %u %s: dspark auto %s prior %s\n", eng.rank(), name.c_str(), automatic.reason, ds::prior_name(g_auto_prior));
+        }
+        const auto action = eng.agree(automatic.state == ds::AutoRequest::State::active ? 1U : 0U);
+        if (action > 1) throw std::runtime_error("auto: unsupported agreed action");
+        if (action == 1) return spec_session(eng, dd, name, prompt, steps, "auto:legacy", out_dir);
+        eng.set_taps(false);
+        eng.set_prefill_tap_sink({});
+        dd.drop_staged(0);
+        const auto gen = session(eng, name, prompt, steps, out_dir);
+        std::ofstream output(out_dir + "/spec-" + name + "-rank" + std::to_string(eng.rank()) + ".u32", std::ios::binary);
+        output.write(reinterpret_cast<const char*>(gen.data()), static_cast<std::streamsize>(gen.size() * 4));
+        return gen;
+    }
     const bool dump_y = std::getenv("STRIX_MM_DSPARK_DUMP_Y") != nullptr && eng.rank() == 0;
     std::ofstream ydump;
     if (dump_y) ydump.open(out_dir + "/y-" + name + "-" + std::to_string(steps) + ".f32", std::ios::binary | std::ios::app);
-    // auto = ds::SurvivalController window + ds::DraftGate (decides before drafting whether the cycle drafts at all; s7:
-    // never slower beyond noise, prose-es +5.8 %); auto:nogate = the window controller alone
+    // auto:legacy = the original SurvivalController + DraftGate; auto:nogate = the window controller alone
     // probe = M12's stride-1 matched-continuation diagnostic: a full draft (7 Markov steps + confidences) at EVERY token
     // position, verified with k = 0 (plain greedy decoding plus the draft's cost); afterwards each position's drafts are
     // compared with the greedy continuation -> uncensored accepted length 0..7 per position (out_dir/probe-NAME.tsv), so
     // any causal gate / window policy can be replayed offline at token positions
     const bool probe = policy == "probe";
-    const bool gated = policy == "auto", autop = gated || policy == "auto:nogate", ngram = policy.rfind("ngram:", 0) == 0,
+    const bool gated = policy == "auto:legacy", autop = gated || policy == "auto:nogate", ngram = policy.rfind("ngram:", 0) == 0,
                hybrid = policy.rfind("hybrid:", 0) == 0, chain = policy.rfind("chain:", 0) == 0;
     const std::uint32_t fixed_k =
         autop || probe ? 7U : static_cast<std::uint32_t>(std::stoul(policy.substr(policy.find(':') + 1)));
     if ((!autop && !probe && !ngram && !hybrid && !chain && policy.rfind("fixed:", 0) != 0) || fixed_k > ds::block)
-        throw std::invalid_argument("spec policy: fixed:K | auto | auto:nogate | probe | ngram:K | hybrid:K | chain:K (K <= 7)");
+        throw std::invalid_argument("spec policy: fixed:K | auto | auto:legacy | auto:nogate | probe | ngram:K | hybrid:K | chain:K (K <= 7)");
     struct ProbeRow {
         std::array<std::uint32_t, ds::block> d;
         std::array<float, ds::block> conf;
@@ -1530,6 +1559,9 @@ int main(int argc, char** argv) {
         const auto t_start = Clock::now();
         mm::Options opt;
         opt.model_dir = argv[1];
+        g_auto_model = opt.model_dir;
+        const auto auto_cli = strix::minimax::defaults::parse_cli("rank", std::vector<std::string>(argv + 1, argv + argc));
+        g_auto_prior = ds::parse_prior(auto_cli.dspark_prior.empty() ? std::getenv("STRIX_MM_DSPARK_PRIOR") : auto_cli.dspark_prior.c_str());
         opt.rank = static_cast<std::uint32_t>(std::stoul(argv[2]));
         opt.slots = 8;
         const std::string out_dir = argv[4];
@@ -1559,6 +1591,7 @@ int main(int argc, char** argv) {
             else if (a == "--batch") batches.push_back(next());
             else if (a == "--verify-trace") vtraces.push_back(next());
             else if (a == "--ab") ab_runs.push_back(next());
+            else if (a == "--dspark-prior") (void)next();
             else if (a == "--decode-check") dchecks.push_back(next());
             else if (a == "--xb-check") xbchecks.push_back(next());
             else if (a == "--spec") specs.push_back(next());
