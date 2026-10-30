@@ -1605,6 +1605,7 @@ inline std::string effective_config_json(const EffectiveConfig& config) {
         out << "{\"rotary\":" << (config.rotary_identity.descriptor().mode() == RotaryMode::yarn ?
             config.rotary_identity.json() : o.rotary.json()) << ',';
     else out << "{\"rotary\":" << o.rotary.json() << ',';
+    out << "\"profile\":" << o.product_profile.json() << ',';
     if (!o.suppressed_yarn_request.empty())
         out << "\"suppressed_yarn_request\":\"" << yarn_json_error(o.suppressed_yarn_request) << "\",";
     // YaRN preflight can verify a drop before device setup. Native inspection

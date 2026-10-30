@@ -1100,6 +1100,8 @@ static int run_decode_entry(
     if (argc == 2 && std::string_view(argv[1]) == "--help") {
         std::cout << "Usage: strix-hip-decode-token MODEL.gguf TOKEN_ID ... [options]\n"
             "  --context N --generate N --eos-token ID --residency register|copy\n"
+            "  --profile default|fast|quality (default: current qualified settings)\n"
+            "  --allow-pending (benchmark runnable pending profile rows; unqualified)\n"
             "  --optimization-profile auto|manual (default auto, qualified checkpoint only)\n"
             "  --baseline / STRIX_BASELINE=1 (historical resolution, controlled defaults off)\n"
             "  --print-effective-config (deterministic host JSON; exits before HIP setup)\n"
@@ -1170,8 +1172,12 @@ static int run_decode_entry(
         parse_options(
             argc,
             argv, true);
+    // Product policy must precede the eager-loading exec and all cached switch
+    // readers. Export provenance makes resolution in the restarted image stable.
+    strix::qwen::profile::apply(options.product_profile);
     bundle_retry.selected=options.mtp.enabled && !options.mtp_bundle_path.empty();
 #if defined(STRIX_MTP_MODEL_QUALIFICATION_RUNNER)
+    strix::tests::set_mtp_product_profile(options.product_profile);
     options.mtp_cli_phase_retirement=false;
 #endif
     // Before any device/runtime observation. Respect even an empty user value.
@@ -1194,6 +1200,7 @@ static int run_decode_entry(
         std::fprintf(stderr, "eager code loading: restart failed (%s); continuing with deferred loading\n",
             std::strerror(errno));
     }
+    for (const auto& notice : options.product_profile.notices()) std::cerr << notice << '\n';
     strix::set_prefill_identity_override(options.prefill_exact_fp16, options.prefill_disabled);
     const auto startup_preflight = strix::emit_qwen_startup_diagnostics(
         options.print_effective_config || options.print_cache_family || strix::decode_cli::yarn_bundle_serial_retry);
@@ -1206,6 +1213,10 @@ static int run_decode_entry(
     for (int i = 2; i < argc; ++i) {
         const std::string_view arg = argv[i];
         if (!arg.starts_with("--")) continue; // positional token IDs
+        if (strix::qwen::profile::policy_option(arg.substr(0, arg.find('=')))) {
+            if (arg == "--profile") ++i;
+            continue;
+        }
         if (arg == "--no-early-setup" || arg == "--no-eager-code-load") continue;
         if (arg == "--session-live-control" || arg == "--session-validate-only") continue;
         if (session_io_options.count(arg)) { ++i; continue; }
@@ -1623,6 +1634,7 @@ static int run_decode_entry(
           "  \"ple_cpu_helpers_actual\":null,\n"
         : std::string{};
     std::string optimization_profile_receipt =
+        "  \"profile\":" + options.product_profile.json() + ",\n" +
         strix::decode_cli::prefill_identity_fields(effective.prefill_option_mask) + ",\n" +
         "  \"optimization_profile_requested\": \"" + optimization_profile.requested + "\",\n" +
         "  \"optimization_profile_selected\": \"" + optimization_profile.selected + "\",\n" +

@@ -37,13 +37,15 @@ inline void append_mtp_pool_receipt(serve::GenerationStats& stats, const MtpServ
     stats.engine_extra.emplace_back("mtp_chosen_window_rows_histogram",rows+"}");
 }
 
-inline void add_prefill_capabilities(serve::Json& out) {
+inline void add_prefill_capabilities(serve::Json& out, const strix::qwen::profile::Resolution& profile = {}) {
+    out.set("profile", serve::parse_json(profile.json()));
     const auto fields = serve::parse_json("{" + prefill_identity_fields(prefill_options_active()) + "," + http_exact_prefill_fields() + "}");
     for (const auto& [key, value] : fields.as_object()) out.set(key, value);
     out.set("prefill_override_scope", serve::Json("server-level only"));
 }
 
-inline void add_prefill_stats(serve::GenerationStats& stats) {
+inline void add_prefill_stats(serve::GenerationStats& stats, const strix::qwen::profile::Resolution& profile = {}) {
+    stats.engine_extra.emplace_back("profile", profile.json());
     const auto fields = serve::parse_json("{" + prefill_identity_fields(prefill_options_active()) + "," + http_exact_prefill_fields() + "}");
     for (const auto& [key, value] : fields.as_object()) stats.engine_extra.emplace_back(key, value.dump());
 }
@@ -78,9 +80,9 @@ class MtpBridgeEngine final : public serve::GenerationEngine {
 public:
     MtpBridgeEngine(const MtpServeRunner& run, std::uint64_t context_tokens,
         HttpConstraintRequests& constraints, bool enabled, bool thinking_enabled, bool selection_mtp_available,
-        serve::BackendProbeSlot* probe = nullptr)
+        serve::BackendProbeSlot* probe = nullptr, strix::qwen::profile::Resolution profile = {})
         : run_(run), context_(context_tokens), constraints_(constraints), constraints_enabled_(enabled),
-          thinking_enabled_(thinking_enabled), selection_mtp_available_(selection_mtp_available), probe_(probe) {}
+          thinking_enabled_(thinking_enabled), selection_mtp_available_(selection_mtp_available), probe_(probe), profile_(std::move(profile)) {}
     serve::GenerationStats generate(serve::GenerationJob& job) override {
         if (failed_.load()) throw std::runtime_error("the engine failed during an earlier request; restart the server");
         if (job.prompt.empty() || job.prompt.size() >= context_) throw std::invalid_argument("prompt is empty or fills the context");
@@ -101,6 +103,7 @@ public:
             result = run_(request);
         } catch (const SessionApiError& e) {
             serve::GenerationStats stats;
+            add_prefill_stats(stats, profile_);
             stats.prompt_tokens=job.prompt.size(); stats.finish="admission_refused";
             stats.error_status=e.status; stats.error_code=e.code;
             throw serve::GenerationRequestError(std::move(stats),e.what());
@@ -109,7 +112,7 @@ public:
             if (probe_) probe_->fail();
             if (!request.constraint) throw;
             serve::GenerationStats stats;
-            add_prefill_stats(stats);
+            add_prefill_stats(stats, profile_);
             stats.prompt_tokens = job.prompt.size();
             stats.finish = "execution_failure";
             stats.constraint = request.constraint->verdict(stats.finish);
@@ -118,7 +121,7 @@ public:
             catch (...) { throw serve::GenerationRequestError(std::move(stats), "engine failure"); }
         }
         serve::GenerationStats stats;
-        add_prefill_stats(stats);
+        add_prefill_stats(stats, profile_);
         stats.prompt_tokens = job.prompt.size();
         stats.cached_tokens = result.restored_tokens;
         stats.generated_tokens = result.generated_tokens;
@@ -160,6 +163,7 @@ private:
     bool selection_mtp_available_;
     std::atomic<bool> failed_{false};
     serve::BackendProbeSlot* probe_;
+    strix::qwen::profile::Resolution profile_;
 };
 
 inline std::atomic<bool>& http_serve_stop_requested() {
@@ -241,11 +245,11 @@ inline MtpDecodeServe make_http_serve(const Options& options, std::string engine
         config.default_min_p = options.http_default_min_p;
         config.responses = options.http_responses;
         config.capabilities = options.http_capabilities;
-        config.capabilities_extra = [modes=session_modes_json(options), policy=cache_activation_json(options), &options](serve::Json& out) {
+        config.capabilities_extra = [modes=session_modes_json(options), policy=cache_activation_json(options), &options, profile=options.product_profile](serve::Json& out) {
             qwen_rotary_capabilities(out);
             out.set("cache_policy",policy);
             prefix_cache_capabilities(out,options);
-            add_prefill_capabilities(out);
+            add_prefill_capabilities(out, profile);
             out.set("session_numerical_modes",modes);
         };
         config.stream_receipts = options.http_stream_receipts;
@@ -289,7 +293,7 @@ inline MtpDecodeServe make_http_serve(const Options& options, std::string engine
             config.health_provider = [&] { return probe.snapshot(); };
         }
         MtpBridgeEngine engine(run, options.context_tokens, constraints, config.engine_constraints, config.engine_thinking_budget,
-            selection_mtp_available, probing ? &probe : nullptr);
+            selection_mtp_available, probing ? &probe : nullptr, options.product_profile);
         serve::ApiService api(config, tokenizer, queue, options.context_tokens, false);
         serve::HttpServerConfig http;
         http.bind_address = options.http_bind;
@@ -355,9 +359,9 @@ inline MtpDecodeBatchServe make_http_batch_serve(const Options& options, std::st
         prefix_batch_cert_capabilities(cert,options);
         cert.set("cache_policy",cache_activation_json(options));
         prefix_cache_capabilities(cert,options);
-        config.capabilities_extra = [modes=session_modes_json(options), cert=std::move(cert)](serve::Json& out) {
+        config.capabilities_extra = [modes=session_modes_json(options), cert=std::move(cert), profile=options.product_profile](serve::Json& out) {
             qwen_rotary_capabilities(out);
-            add_prefill_capabilities(out);
+            add_prefill_capabilities(out, profile);
             out.set("session_numerical_modes",modes);
             for(const auto& [key,value]:cert.as_object()) out.set(key,value);
         };
@@ -450,7 +454,7 @@ inline MtpDecodeBatchServe make_http_batch_serve(const Options& options, std::st
                 if (!runner.session_run || runner.active()) throw std::logic_error("named session requires an idle session runner");
                 if (batch_lock.owns_lock()) batch_lock.unlock();
                 // Named sessions run the fixed session protocol: no constrained decoding on that path.
-                MtpBridgeEngine engine(runner.session_run, options.context_tokens, constraints, false, false, false, probing ? &probe : nullptr);
+                MtpBridgeEngine engine(runner.session_run, options.context_tokens, constraints, false, false, false, probing ? &probe : nullptr, options.product_profile);
                 finish_http_session_job(queue, *taken, engine, [&] { release(taken); });
                 return;
             }
@@ -486,9 +490,9 @@ inline MtpDecodeBatchServe make_http_batch_serve(const Options& options, std::st
                 sampling = "sampling-v1";
             }
             const auto prompt_tokens = job.prompt.size();
-            request.on_finish = [&queue, &release, taken, prompt_tokens, sampling](const MtpServeResult& result) {
+            request.on_finish = [&queue, &release, taken, prompt_tokens, sampling, profile=options.product_profile](const MtpServeResult& result) {
                 serve::GenerationStats stats;
-                add_prefill_stats(stats);
+                add_prefill_stats(stats, profile);
                 stats.prompt_tokens = prompt_tokens;
                 stats.cached_tokens = result.restored_tokens;
                 stats.generated_tokens = result.generated_tokens;

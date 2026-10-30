@@ -715,6 +715,20 @@ is on by default wherever the cache is on and only acts on concurrent strict-L0 
 `STRIX_PREFIX_CACHE_INFLIGHT=0` / `--prefix-cache-inflight off` turns it off. MTP restore accepts only suffix plans equivalent to the uncached execution;
 checkpoint copies follow existing block boundaries.
 
+#### `--profile default|fast|quality`
+
+One switch selects a product profile for Qwen (CLI, `--http-serve` and the MTP runner):
+
+- `default`: the exact default described above; it sets nothing.
+- `fast`: the default plus every qualified bit-changing option. None is qualified yet, so `fast` currently runs
+  exactly like `default`; its pending options (attention selection budget, BF16 expert route storage, FP16
+  chunked recurrence, FP16 output head) are listed in the receipt and in one stderr line each, and are never applied.
+- `quality`: there is no quality pack for this model, so it runs `default` and says so in the receipt.
+
+`--allow-pending` (or `STRIX_QWEN_PROFILE_ALLOW_PENDING=1`) runs pending options whose code is in the build, for
+benchmarking only, and stamps the receipt `unqualified`. An explicit environment variable or CLI option always
+wins over the profile. `--print-effective-config` shows the selected profile and the state of every option.
+
 ### DeepSeek pair
 
 Run one rank on each node with matching assets and environment; set `R` to 0 or 1 locally:

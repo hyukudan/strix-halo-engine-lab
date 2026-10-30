@@ -1,5 +1,26 @@
 # Optimizations
 
+## Qwen product profiles
+
+`--profile default|fast|quality` selects the Qwen product policy for decode,
+prefill, MTP and HTTP serving. `default` preserves current production behavior
+without exporting profile switches. `fast` applies every ready lever in the
+[single profile table](../include/strix/qwen_profile_table.hpp). Its four proposed
+arithmetic levers (attention budget, BF16 expert routing, FP16 recurrent chunks,
+output head) are currently pending and unavailable in this build: builtin paths
+continue, with one notice per row and declared targets in `profile.pending`.
+`quality` runs default settings with one notice because no quality pack exists.
+
+Explicit environment variables and lever options override the profile.
+`--allow-pending` / `STRIX_QWEN_PROFILE_ALLOW_PENDING=1` applies only runnable
+pending rows for benchmarks and stamps `profile.qualification` as
+`unqualified: <rows>`. Unavailable rows remain pending. Required assets remain
+mandatory, and explicit requests for unavailable code refuse. No new fast arithmetic is qualified by selecting
+a profile. All receipts, HTTP capabilities/stats and effective config report
+`profile`, `qualification`, `levers`, `pending` and `unqualified` inside the
+`profile` object. Apply profiles at startup and restart servers to change them.
+See the [command-line contract](getting-started/engine-reference.md#command-line).
+
 The fast path is the default in all five public engines. Use the plain recommended command and inspect its
 resolution before adding overrides. `ON` means enabled; `auto` means enabled when admission guards pass;
 `opt-in` requires an explicit selection. An unlisted isolated gain means unmeasured, not zero.

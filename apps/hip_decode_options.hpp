@@ -7,6 +7,7 @@
 #include "qwen_cache_admission.hpp"
 
 #include "qwen_prefill_options.hpp"
+#include "strix/qwen_profile.hpp"
 #include "strix/decode_execution_options.hpp"
 #include "strix/known_prefill_limits.hpp"
 #include "strix/qpf2k_defaults.hpp"
@@ -240,6 +241,9 @@ inline bool mtp_sha256_text(std::string_view value) noexcept {
     return nonzero;
 }
 struct Options {
+    std::optional<strix::qwen::profile::Name> product_profile_requested;
+    strix::qwen::profile::Inputs product_profile_inputs;
+    strix::qwen::profile::Resolution product_profile;
     std::string mtp_bundle_path;
     std::string yarn_decode_source = "explicit";
     bool early_setup = true;
@@ -1586,6 +1590,7 @@ inline std::string yarn_route_refusal(const Options& o) {
         for(const auto& flag:o.supplied_options) {
             if(flag.starts_with("--mtp") || flag=="--prefix-batch-cert" || flag=="--rope-yarn" || flag=="--context" || flag=="--generate" ||
                flag=="--unqualified-context" || flag=="--print-effective-config" || flag=="--prompt-ids" ||
+               flag=="--profile" || flag=="--allow-pending" ||
                flag=="--optimization-profile" || flag=="--known-prefix-window" || flag=="--known-prefix-full-rows" ||
                flag=="--known-prefix-expert-union" || flag=="--known-window-router-rows" ||
                flag=="--known-prefix-prefill-rows" || flag=="--known-prefix-tail-rows" ||
@@ -1785,7 +1790,7 @@ inline Options parse_options(
             "usage: strix-hip-decode-token MODEL.gguf [TOKEN_ID ...] "
             "[--mtp-bundle FILE] "
             "[--mtp --mtp-sidecar FILE --mtp-sidecar-sha256 HEX (--mtp-golden FILE --mtp-golden-sha256 HEX | --mtp-golden-dump FILE) [--mtp-window-expert-union --mtp-window-expert-union-bytes N] [--mtp-window-hyper-mix] [--mtp-window-qsa-rows] [--mtp-window-prefix] [--mtp-draft-chain [--mtp-draft-vocab FILE[,FILE...]|auto:DIR] [--mtp-draft-context-vocab N] [--mtp-draft-exact] [--mtp-draft-q4] [--mtp-ngram-draft[=on|off|auto|ctx|copy|wide]]] [--mtp-draft-profile base|distill-d|distill-g] (explicit source/conversion/cast/budget options required)] "
-            "[--optimization-profile auto|manual] [--baseline] [--print-effective-config] [--prefill-exact-fp16] [--prefill-disable NAME[,NAME...]] [--config FILE] [--execution-inventory] [--host-dispatch-telemetry] [--execution-telemetry-trace] [--device-queue-trace] "
+            "[--profile default|fast|quality] [--allow-pending] [--optimization-profile auto|manual] [--baseline] [--print-effective-config] [--prefill-exact-fp16] [--prefill-disable NAME[,NAME...]] [--config FILE] [--execution-inventory] [--host-dispatch-telemetry] [--execution-telemetry-trace] [--device-queue-trace] "
             "[--numerical-profile exact-v5|hc-splitk-f32-v1|q51-a8-down-v1|hc-splitk-f32+q51-a8-down-v1|q51-q80-a8-down-v1|hc-splitk-f32+q51-q80-a8-down-v1|hc-splitk-f32+q51-q80-a8-down+q5k-a8-gateup-v1|hc-deferred-norm-f32+q51-q80-a8-down-v1|hc-deferred-norm-f32+q51-q80-a8-down+q5k-a8-gateup-v1|hc-splitk-f32+q51-q80-a8-down+q5k-a8-gateup+dense-a8-v1|hc-deferred-norm-f32+q51-q80-a8-down+q5k-a8-gateup+dense-a8-v1] [--prefill-numerical-profile NAME] "
             "[--teacher-forced-score --generate 1 [--teacher-logits-file PATH]] [--dense-q6p-pack PATH] [--dense-trellis-pack PATH] "
             "[--gpu-greedy-token] [--logprob-token ID ...] [--offline-tuning-cache FILE [--offline-compile-provenance FILE]] [--gdn-recurrent-layout baseline|stride32|stride33|transposed] [--gdn-recurrent-storage key-value|value-key] [--attention-kv-storage bf16|kv-int8-tok-v1] [--known-prefix-window --known-prefix-rows 2|4|8 --known-prefix-expert-union] [--known-window-router-rows] [--known-prefix-prefill-rows 16..16384 --known-prefix-workspace-budget-bytes N --known-prefix-host-metadata-budget-bytes N --known-prefix-uma-budget-bytes N --known-prefix-host-headroom-bytes N] [--prompt-lookup [--prompt-lookup-depth 0|1|2 | --prompt-lookup-adaptive] [--prompt-lookup-snapshot occupied-kv-v1 --prompt-lookup-snapshot-bytes N]] [--serve-prefix-u32le FILE ... --serve-concurrency 1|2|4 [--serve-tensor-cohort-rows 2|4 | --serve-prefill-rows 2|4|8|16..2048 --serve-prefill-workspace-budget-bytes N --serve-prefill-host-metadata-budget-bytes N] --serve-memory-budget-bytes N --serve-request-budget-bytes N --serve-headroom-bytes N] [--gdn-islands] [--qsa-hierarchical-selection] [--qsa-gqa-heads-per-block 1|2|4] [--prepared-eager] [--moe-shared-overlap [--moe-token-cost-policy]] [--moe-overlap-arena-budget-bytes N] [--batched-moe-activation] [--validation-final-state DIR] [--validation-final-state-max-bytes N] [--reference FILE] [--max-logit-error X] "
@@ -1818,6 +1823,8 @@ inline Options parse_options(
         const std::string_view argument =
             argv[index];
         if (argument.starts_with("--")) options.supplied_options.emplace(argument.substr(0, argument.find('=')));
+        if (strix::qwen::profile::take_option(argc, argv, index,
+                options.product_profile_requested, options.product_profile_inputs)) continue;
         // These switches alter arithmetic only; they must not claim an explicit
         // organization route or prevent automatic prefill admission.
         if (argument == "--no-early-setup") { options.early_setup = false; continue; }
@@ -3287,6 +3294,8 @@ inline Options parse_options(
     const bool defer_serve_prefill = http_prefill_pending(options);
     if (!defer_serve_prefill) validate_prefix_state_cache(options);
     validate_http_serve(options, defer_serve_prefill);
+    options.product_profile = strix::qwen::profile::resolve(
+        options.product_profile_requested.value_or(strix::qwen::profile::Name::standard), options.product_profile_inputs);
     return options;
 }
 

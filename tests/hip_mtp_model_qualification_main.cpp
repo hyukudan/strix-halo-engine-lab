@@ -18,11 +18,15 @@ namespace strix::tests {
 namespace {
 struct Request {std::string path,sha,export_path,prefix_gate_path;std::uint64_t file_bytes=0,host_bytes=0,coverage=31,export_bytes=0,export_capture_bytes=0,export_greedy_rows=0;bool component_diagnostic=false;};
 Request request;
+std::string product_profile_json;
 std::optional<MtpQualificationReference> reference;
 void require(bool v,const char* message){if(!v)throw std::invalid_argument(message);}
 std::uint64_t number(std::string_view text){std::uint64_t n=0;const auto r=std::from_chars(text.data(),text.data()+text.size(),n);
     require(r.ec==std::errc{} && r.ptr==text.data()+text.size(),"invalid qualification numeric option");return n;}
 std::vector<char*> configure(int argc,char** argv){
+    // Product profile options pass through unchanged. The shared decoder applies
+    // them before its eager exec, which restarts this wrapper with the original
+    // qualification arguments as well as the inherited profile provenance.
     std::set<std::string> seen;std::vector<char*> forward{argv[0]};
     for(int i=1;i<argc;++i){const std::string_view arg=argv[i];if(!arg.starts_with("--qualification-")){forward.push_back(argv[i]);continue;}
         const auto eq=arg.find('=');const std::string key(arg.substr(0,eq));std::string_view value;
@@ -101,7 +105,7 @@ void run_mtp_component_diagnostic(const std::shared_ptr<HipMtpResources>& owner,
     default:throw std::invalid_argument("component diagnostic admits only reference kinds 3, 4 or 6");
     }
     owner->validate();owner->require_idle();
-    std::cout<<"{\"mode\":\"native-mtp-component-diagnostic\",\"kind\":"<<static_cast<std::uint32_t>(g.kind)
+    std::cout<<"{\"profile\":"<<product_profile_json<<",\"mode\":\"native-mtp-component-diagnostic\",\"kind\":"<<static_cast<std::uint32_t>(g.kind)
         <<",\"completed_records\":"<<completed<<",\"component_passed\":true,\"full_forward_qualified\":false,"
         <<"\"mtp_activated\":false,\"performance_qualified\":false,\"reference_file_sha256\":\""<<request.sha<<"\"}\n";
 }
@@ -162,7 +166,7 @@ void export_mtp_target_inputs(const decode_cli::Options& o,const ModelContract& 
     const bool closed=std::fclose(file)==0;
     if(!written || !closed){std::error_code ignored;std::filesystem::remove(request.export_path,ignored);
         throw std::runtime_error("target input packet write failed");}
-    std::cout<<"{\"mode\":\"target-input-only\",\"mtp_executed\":false,\"mtp_activated\":false,\"rows\":"<<rows
+    std::cout<<"{\"profile\":"<<product_profile_json<<",\"mode\":\"target-input-only\",\"mtp_executed\":false,\"mtp_activated\":false,\"rows\":"<<rows
         <<",\"prompt_rows\":"<<o.tokens.size()<<",\"greedy_rows\":"<<request.export_greedy_rows
         <<",\"bytes\":"<<packet.size()<<",\"packet_sha256\":\""<<model_content_identity_hex(sha256_bytes(packet))
         <<"\",\"target_file_sha256\":\""<<model_content_identity_hex(actual->mapped->file_sha256())<<"\",\"history_interval_counts\":[";
@@ -230,7 +234,7 @@ void run_mtp_model_qualification(decode_cli::MtpDecodeQualificationContext& c){
     }
     if(checkpoint_observation){
         const auto& observed=*checkpoint_observation;
-        std::cout<<"{\"mode\":\"native-mtp-checkpoint-window-observation\",\"kind\":7,"
+        std::cout<<"{\"profile\":"<<product_profile_json<<",\"mode\":\"native-mtp-checkpoint-window-observation\",\"kind\":7,"
             <<"\"scope\":\"one-successful-window-mutation-restored-to-own-baseline\","
             <<"\"reference_file_sha256\":\""<<request.sha<<"\",\"logical_rows\":"<<observed.logical_rows
             <<",\"window_execution_identity\":"<<observed.window_execution_identity
@@ -252,10 +256,11 @@ void run_mtp_model_qualification(decode_cli::MtpDecodeQualificationContext& c){
             <<",\"full_device_bytes_restored\":true,\"full_host_bytes_restored\":true,\"deferred_status_restored\":true,"
             <<"\"exact_session_metadata_restored\":true,\"performance_qualified\":false}\n";
     }
-    std::cout<<"{\"mode\":\"native-mtp-model-fixture\",\"kind\":"<<static_cast<std::uint32_t>(g.kind)
+    std::cout<<"{\"profile\":"<<product_profile_json<<",\"mode\":\"native-mtp-model-fixture\",\"kind\":"<<static_cast<std::uint32_t>(g.kind)
         <<",\"completed_records\":"<<completed<<",\"native_fixture_passed\":true,\"performance_qualified\":false,"
         <<"\"reference_file_sha256\":\""<<request.sha<<"\",\"reference_independence\":\"externally-supplied-not-established-by-digest\"}\n";
 }
+void set_mtp_product_profile(const qwen::profile::Resolution& profile) { product_profile_json = profile.json(); }
 } // namespace strix::tests
 int main(int argc,char** argv){try{
     auto forwarded=strix::tests::configure(argc,argv);

@@ -100,6 +100,27 @@ ninja -C build strix-hip-decode-token
 
 ## Command line
 
+Qwen accepts `--profile default|fast|quality` for CLI decode, `--http-serve`,
+MTP and the MTP qualification runner. Omission means `default`: it exports no
+profile switches and preserves the existing exact bundle, output WMMA and
+automatic prefill pair, including their existing admission guards.
+`fast` applies every ready row in the [profile table](../../include/strix/qwen_profile_table.hpp).
+The attention budget, BF16 expert routing, FP16 recurrent chunks and output-head
+candidates are currently pending and absent from this build. Each keeps the
+builtin running, appears with its target in `profile.pending`, and prints one
+stderr notice. Pending rows never cause a refusal. `quality` currently runs
+default settings and prints `quality: no quality rows for this model, using default`.
+
+Explicit environment and lever options take precedence and are recorded as
+explicit or off. An explicit request for unavailable code is refused.
+`--allow-pending` (or `STRIX_QWEN_PROFILE_ALLOW_PENDING=1`) is for benchmarking:
+only runnable pending rows execute, with `qualification: "unqualified: <rows>"`
+and an `unqualified` list. It cannot enable any of the four absent candidates.
+CLI receipts, HTTP capabilities and generation stats, and `--print-effective-config`
+include the same `profile` object. Selection happens before the eager-loading
+restart; it changes cache identity only through the applied arithmetic switches.
+Profile controls are server-level and require a restart.
+
 `strix-hip-decode-token` takes a GGUF model and the prompt as token IDs; it has no tokenizer. It writes a JSON
 receipt to stdout that includes `generated_tokens`, cycle counts and timings. `--help` lists the general options;
 the MTP options are documented in [mtp-native-cli.md](../engine/speculative/mtp-native-cli.md).
