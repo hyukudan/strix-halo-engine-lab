@@ -76,6 +76,10 @@ ninja -C build strix-hip-decode-token
 ctest --test-dir build --output-on-failure
 ```
 
+Every HIP target builds for the AMD GPU targets in `STRIX_HIP_ARCHITECTURES` (default `gfx1151`); to add an
+architecture, pass for example `-DSTRIX_HIP_ARCHITECTURES="gfx1151;gfx1160"`. The runtime still decides which kernel
+sets a given architecture may run.
+
 With the matching Qwen model and token IDs available in your working directory:
 
 ```bash

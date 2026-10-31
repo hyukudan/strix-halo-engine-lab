@@ -359,6 +359,12 @@ if(STRIX_TIERSTREAM_DIR)
     if(strix_mfile_define)
         target_compile_definitions(strix_tierstream INTERFACE STRIX_HAVE_TIERSTREAM_MFILE=1)
     endif()
+    # Device profiles (ss_devprof_*): the library loads the HIP / CUDA / NVML runtimes at run time.
+    file(STRINGS "${STRIX_TIERSTREAM_DIR}/include/strix_stream/ss.h" strix_devprof_define REGEX "^#define SS_DEVPROF +1")
+    if(strix_devprof_define)
+        target_compile_definitions(strix_tierstream INTERFACE STRIX_HAVE_TIERSTREAM_DEVPROF=1)
+        target_link_libraries(strix_tierstream INTERFACE ${CMAKE_DL_LIBS})
+    endif()
 endif()
 
 if(BUILD_TESTING)
@@ -1722,6 +1728,10 @@ if(BUILD_TESTING)
 endif()
 
 
+# One list of AMD GPU targets for every HIP target (a successor arch is added here, e.g. "gfx1151;gfx1160"; the
+# runtime gates still decide which kernel sets a qualified arch may run).
+set(STRIX_HIP_ARCHITECTURES "gfx1151" CACHE STRING "AMD GPU targets (HIP_ARCHITECTURES) of every HIP target")
+
 if(STRIX_ENABLE_HIP_RUNTIME)
     enable_language(HIP)
 
@@ -1754,27 +1764,27 @@ if(STRIX_ENABLE_HIP_RUNTIME)
         target_link_libraries(strix_q4k_a8_hip_probe PUBLIC strix_q4k_a8_contract "${STRIX_HIP_RUNTIME_LIBRARY}")
         foreach(target strix_q4k_a8_hip_probe)
             target_include_directories(${target} PUBLIC include "${STRIX_HIP_INCLUDE_DIR}")
-            set_target_properties(${target} PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES gfx1151)
+            set_target_properties(${target} PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHITECTURES}")
             target_compile_options(${target} PRIVATE -mno-wavefrontsize64 -fno-fast-math -ffp-contract=off -fhip-fp32-correctly-rounded-divide-sqrt -fdenormal-fp-math=ieee)
             strix_target_warnings(${target})
         endforeach()
         if(STRIX_BUILD_EXPERIMENTAL_Q4K_A8_PROBE)
             add_library(strix_q4k_a8_dot4_compile_probe OBJECT lab/q4k_a8/dot4_compile_probe.hip)
             target_include_directories(strix_q4k_a8_dot4_compile_probe PRIVATE include "${STRIX_HIP_INCLUDE_DIR}")
-            set_target_properties(strix_q4k_a8_dot4_compile_probe PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES gfx1151)
+            set_target_properties(strix_q4k_a8_dot4_compile_probe PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHITECTURES}")
             target_compile_options(strix_q4k_a8_dot4_compile_probe PRIVATE -mno-wavefrontsize64 -fno-fast-math -ffp-contract=off -fhip-fp32-correctly-rounded-divide-sqrt -fdenormal-fp-math=ieee)
             strix_target_warnings(strix_q4k_a8_dot4_compile_probe)
         endif()
         if(BUILD_TESTING AND STRIX_BUILD_EXPERIMENTAL_Q4K_A8_PROBE)
             add_executable(strix-hip-moe-a8-down-tests tests/hip_moe_a8_down_tests.hip)
             target_link_libraries(strix-hip-moe-a8-down-tests PRIVATE strix_q4k_a8_hip_probe strix_q4k_a8_contract strix_core strix_hip_runtime)
-            set_target_properties(strix-hip-moe-a8-down-tests PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES gfx1151)
+            set_target_properties(strix-hip-moe-a8-down-tests PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHITECTURES}")
             target_compile_options(strix-hip-moe-a8-down-tests PRIVATE -mno-wavefrontsize64 -fno-fast-math -ffp-contract=off -fhip-fp32-correctly-rounded-divide-sqrt -fdenormal-fp-math=ieee)
             strix_target_warnings(strix-hip-moe-a8-down-tests)
             add_test(NAME strix-hip-moe-a8-down-tests COMMAND strix-hip-moe-a8-down-tests)
             add_executable(strix-hip-moe-wmma-prefill-tests tests/hip_moe_wmma_prefill_tests.hip)
             target_link_libraries(strix-hip-moe-wmma-prefill-tests PRIVATE strix_q4k_a8_hip_probe strix_q4k_a8_contract strix_core)
-            set_target_properties(strix-hip-moe-wmma-prefill-tests PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES gfx1151)
+            set_target_properties(strix-hip-moe-wmma-prefill-tests PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHITECTURES}")
             target_compile_options(strix-hip-moe-wmma-prefill-tests PRIVATE -mno-wavefrontsize64 -fno-fast-math -ffp-contract=off -fhip-fp32-correctly-rounded-divide-sqrt -fdenormal-fp-math=ieee)
             strix_target_warnings(strix-hip-moe-wmma-prefill-tests)
             add_test(NAME strix-hip-moe-wmma-prefill-tests COMMAND strix-hip-moe-wmma-prefill-tests)
@@ -1782,19 +1792,19 @@ if(STRIX_ENABLE_HIP_RUNTIME)
             add_test(NAME strix-hip-moe-prefill-gsq-tests COMMAND strix-hip-moe-wmma-prefill-tests gsq)
             add_executable(strix-hip-q4k-a8-probe-tests tests/hip_moe_q4k_a8_probe_tests.hip $<TARGET_OBJECTS:strix_q4k_a8_dot4_compile_probe>)
             target_link_libraries(strix-hip-q4k-a8-probe-tests PRIVATE strix_q4k_a8_hip_probe strix_core)
-            set_target_properties(strix-hip-q4k-a8-probe-tests PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES gfx1151)
+            set_target_properties(strix-hip-q4k-a8-probe-tests PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHITECTURES}")
             target_compile_options(strix-hip-q4k-a8-probe-tests PRIVATE -mno-wavefrontsize64 -fno-fast-math -ffp-contract=off -fhip-fp32-correctly-rounded-divide-sqrt -fdenormal-fp-math=ieee)
             strix_target_warnings(strix-hip-q4k-a8-probe-tests)
             add_test(NAME strix-hip-q4k-a8-probe-tests COMMAND strix-hip-q4k-a8-probe-tests)
             add_executable(strix-hip-q5k-a8-probe-tests tests/hip_moe_q5k_a8_probe_tests.hip)
             target_link_libraries(strix-hip-q5k-a8-probe-tests PRIVATE strix_q4k_a8_hip_probe strix_core)
-            set_target_properties(strix-hip-q5k-a8-probe-tests PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES gfx1151)
+            set_target_properties(strix-hip-q5k-a8-probe-tests PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHITECTURES}")
             target_compile_options(strix-hip-q5k-a8-probe-tests PRIVATE -mno-wavefrontsize64 -fno-fast-math -ffp-contract=off -fhip-fp32-correctly-rounded-divide-sqrt -fdenormal-fp-math=ieee)
             strix_target_warnings(strix-hip-q5k-a8-probe-tests)
             add_test(NAME strix-hip-q5k-a8-probe-tests COMMAND strix-hip-q5k-a8-probe-tests)
             add_executable(strix-hip-q20-a8-probe-tests tests/hip_moe_q20_a8_probe_tests.hip)
             target_link_libraries(strix-hip-q20-a8-probe-tests PRIVATE strix_q4k_a8_hip_probe strix_q4k_a8_contract strix_core strix_hip_runtime)
-            set_target_properties(strix-hip-q20-a8-probe-tests PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES gfx1151)
+            set_target_properties(strix-hip-q20-a8-probe-tests PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHITECTURES}")
             target_compile_options(strix-hip-q20-a8-probe-tests PRIVATE -mno-wavefrontsize64 -fno-fast-math -ffp-contract=off -fhip-fp32-correctly-rounded-divide-sqrt -fdenormal-fp-math=ieee)
             strix_target_warnings(strix-hip-q20-a8-probe-tests)
             add_test(NAME strix-hip-q20-a8-probe-tests COMMAND strix-hip-q20-a8-probe-tests)
@@ -1882,7 +1892,7 @@ if(STRIX_ENABLE_HIP_RUNTIME)
         PROPERTIES
         HIP_STANDARD 20
         HIP_STANDARD_REQUIRED ON
-        HIP_ARCHITECTURES gfx1151
+        HIP_ARCHITECTURES "${STRIX_HIP_ARCHITECTURES}"
     )
     target_link_libraries(
         strix_hip_runtime
@@ -1912,7 +1922,7 @@ if(STRIX_ENABLE_HIP_RUNTIME)
         add_executable(strix-hip-qwen-yarn-rotary-tests tests/hip_qwen_yarn_rotary_tests.hip)
         target_link_libraries(strix-hip-qwen-yarn-rotary-tests PRIVATE strix_hip_runtime)
         set_target_properties(strix-hip-qwen-yarn-rotary-tests PROPERTIES
-            HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES gfx1151)
+            HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHITECTURES}")
         strix_target_warnings(strix-hip-qwen-yarn-rotary-tests)
         add_test(NAME strix-hip-qwen-yarn-rotary-tests COMMAND strix-hip-qwen-yarn-rotary-tests)
         add_test(NAME strix-qwen-rotary-host-admission-tests COMMAND strix-hip-qwen-yarn-rotary-tests --host-admission-only)
@@ -1927,7 +1937,7 @@ if(STRIX_ENABLE_HIP_RUNTIME)
             add_executable(strix-hip-mtp-${mtp_fixture}-tests tests/hip_mtp_${mtp_fixture_file}_tests.hip)
             target_link_libraries(strix-hip-mtp-${mtp_fixture}-tests PRIVATE strix_hip_runtime)
             set_target_properties(strix-hip-mtp-${mtp_fixture}-tests PROPERTIES
-                HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES gfx1151)
+                HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHITECTURES}")
             target_compile_options(strix-hip-mtp-${mtp_fixture}-tests PRIVATE
                 -mno-wavefrontsize64 -fno-fast-math -ffp-contract=off)
             strix_target_warnings(strix-hip-mtp-${mtp_fixture}-tests)
@@ -1943,13 +1953,13 @@ if(STRIX_ENABLE_HIP_RUNTIME)
             tests/hip_mtp_qualification_reference.hip)
         target_link_libraries(strix_mtp_projection_component_fixtures PRIVATE strix_hip_runtime)
         set_target_properties(strix_mtp_projection_component_fixtures PROPERTIES
-            HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES gfx1151)
+            HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHITECTURES}")
         strix_target_warnings(strix_mtp_projection_component_fixtures)
         add_library(strix_qsa_selection_diagnostic INTERFACE)
         target_link_libraries(strix_qsa_selection_diagnostic INTERFACE strix_hip_runtime)
         add_executable(strix-hip-qsa-selection-diagnostic-tests tests/hip_qsa_selection_diagnostic_tests.hip)
         target_link_libraries(strix-hip-qsa-selection-diagnostic-tests PRIVATE strix_qsa_selection_diagnostic)
-        set_target_properties(strix-hip-qsa-selection-diagnostic-tests PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES gfx1151)
+        set_target_properties(strix-hip-qsa-selection-diagnostic-tests PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHITECTURES}")
         strix_target_warnings(strix-hip-qsa-selection-diagnostic-tests)
         add_test(NAME strix-hip-qsa-selection-diagnostic-tests COMMAND strix-hip-qsa-selection-diagnostic-tests)
     endif()
@@ -2015,7 +2025,7 @@ if(STRIX_ENABLE_HIP_RUNTIME)
         target_link_libraries(strix-hip-mtp-qualification-reference-tests PRIVATE
             strix_hip_runtime strix_mtp_projection_component_fixtures strix_serve strix_assets)
         set_target_properties(strix-hip-mtp-qualification-reference-tests PROPERTIES
-            HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES gfx1151)
+            HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHITECTURES}")
         strix_target_warnings(strix-hip-mtp-qualification-reference-tests)
         add_test(NAME strix-hip-mtp-qualification-reference-tests COMMAND strix-hip-mtp-qualification-reference-tests)
     endif()
@@ -2045,7 +2055,7 @@ if(STRIX_ENABLE_HIP_RUNTIME)
             lab/direct_gpu_stream/commission_main.hip
             lab/direct_gpu_stream/bounded_tcp_control.cpp)
         set_target_properties(strix-direct-gpu-commission PROPERTIES
-            HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES gfx1151)
+            HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHITECTURES}")
         target_link_libraries(strix-direct-gpu-commission PRIVATE strix_hip_runtime)
         strix_target_warnings(strix-direct-gpu-commission)
     endif()
@@ -2060,7 +2070,7 @@ if(STRIX_ENABLE_HIP_RUNTIME)
             PROPERTIES
             HIP_STANDARD 20
             HIP_STANDARD_REQUIRED ON
-            HIP_ARCHITECTURES gfx1151
+            HIP_ARCHITECTURES "${STRIX_HIP_ARCHITECTURES}"
         )
         target_link_libraries(
             strix-hip-runtime-launchers-tests
@@ -2083,7 +2093,7 @@ if(STRIX_ENABLE_HIP_RUNTIME)
             PROPERTIES
             HIP_STANDARD 20
             HIP_STANDARD_REQUIRED ON
-            HIP_ARCHITECTURES gfx1151
+            HIP_ARCHITECTURES "${STRIX_HIP_ARCHITECTURES}"
         )
         target_link_libraries(
             strix-hip-moe-route-launcher-tests
@@ -2105,13 +2115,13 @@ if(STRIX_ENABLE_HIP_RUNTIME)
         add_executable(strix-hip-integer-projection-runtime-tests tests/hip_integer_projection_runtime_tests.hip)
         add_executable(strix-hip-serial-graph-tests tests/hip_serial_graph_tests.hip)
         set_target_properties(strix-hip-serial-graph-tests PROPERTIES
-            HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES gfx1151)
+            HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHITECTURES}")
         target_link_libraries(strix-hip-serial-graph-tests PRIVATE strix_hip_runtime)
         strix_target_warnings(strix-hip-serial-graph-tests)
         add_test(NAME strix-hip-serial-graph-tests COMMAND strix-hip-serial-graph-tests)
         set_tests_properties(strix-hip-serial-graph-tests PROPERTIES SKIP_RETURN_CODE 77)
         set_target_properties(strix-hip-integer-projection-runtime-tests PROPERTIES
-            HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES gfx1151)
+            HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHITECTURES}")
         target_link_libraries(strix-hip-integer-projection-runtime-tests PRIVATE strix_hip_runtime)
         target_compile_options(strix-hip-integer-projection-runtime-tests PRIVATE -ffp-contract=off)
         strix_target_warnings(strix-hip-integer-projection-runtime-tests)
@@ -2135,12 +2145,12 @@ if(STRIX_ENABLE_HIP_RUNTIME)
         add_test(NAME strix-hip-direct-transport-gpu-export-tests COMMAND strix-hip-direct-transport-gpu-export-tests)
         add_executable(strix-hip-graph-attention-state-tests tests/hip_graph_attention_state_tests.hip)
         set_target_properties(strix-hip-graph-attention-state-tests PROPERTIES
-            HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES gfx1151)
+            HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHITECTURES}")
         target_link_libraries(strix-hip-graph-attention-state-tests PRIVATE strix_hip_runtime)
         strix_target_warnings(strix-hip-graph-attention-state-tests)
         add_test(NAME strix-hip-graph-attention-state-tests COMMAND strix-hip-graph-attention-state-tests)
         set_target_properties(strix-hip-graph-inputs-tests PROPERTIES
-            HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES gfx1151)
+            HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHITECTURES}")
         target_link_libraries(strix-hip-graph-inputs-tests PRIVATE strix_hip_runtime)
         strix_target_warnings(strix-hip-graph-inputs-tests)
         add_test(NAME strix-hip-graph-inputs-tests COMMAND strix-hip-graph-inputs-tests)
@@ -2149,7 +2159,7 @@ if(STRIX_ENABLE_HIP_RUNTIME)
             PROPERTIES
             HIP_STANDARD 20
             HIP_STANDARD_REQUIRED ON
-            HIP_ARCHITECTURES gfx1151
+            HIP_ARCHITECTURES "${STRIX_HIP_ARCHITECTURES}"
         )
         target_link_libraries(
             strix-hip-embedding-launcher-tests
@@ -2167,22 +2177,22 @@ if(STRIX_ENABLE_HIP_RUNTIME)
         add_test(NAME strix-hip-lane-chain-hyper-integration-tests COMMAND strix-hip-hyper-mix-launcher-tests lane-chain)
         add_test(NAME strix-hip-hc-next-tile-integration-tests COMMAND strix-hip-hyper-mix-launcher-tests next-tile)
         add_executable(strix-hip-hc-projection-next-tile-tests tests/hip_hc_projection_next_tile_tests.hip)
-        set_target_properties(strix-hip-hc-projection-next-tile-tests PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES gfx1151)
+        set_target_properties(strix-hip-hc-projection-next-tile-tests PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHITECTURES}")
         target_link_libraries(strix-hip-hc-projection-next-tile-tests PRIVATE strix_hip_runtime)
         strix_target_warnings(strix-hip-hc-projection-next-tile-tests)
         add_test(NAME strix-hip-hc-projection-next-tile-tests COMMAND strix-hip-hc-projection-next-tile-tests)
         add_executable(strix-hip-lane-chain-hyper-output-tests tests/hip_lane_chain_hyper_output_tests.hip)
-        set_target_properties(strix-hip-lane-chain-hyper-output-tests PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES gfx1151)
+        set_target_properties(strix-hip-lane-chain-hyper-output-tests PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHITECTURES}")
         target_link_libraries(strix-hip-lane-chain-hyper-output-tests PRIVATE strix_hip_runtime)
         strix_target_warnings(strix-hip-lane-chain-hyper-output-tests)
         add_test(NAME strix-hip-lane-chain-hyper-output-tests COMMAND strix-hip-lane-chain-hyper-output-tests)
         add_executable(strix-hip-hc-wide-rows-tests tests/hip_hc_wide_rows_tests.hip)
-        set_target_properties(strix-hip-hc-wide-rows-tests PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES gfx1151)
+        set_target_properties(strix-hip-hc-wide-rows-tests PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHITECTURES}")
         target_link_libraries(strix-hip-hc-wide-rows-tests PRIVATE strix_hip_runtime)
         strix_target_warnings(strix-hip-hc-wide-rows-tests)
         add_test(NAME strix-hip-hc-wide-rows-tests COMMAND strix-hip-hc-wide-rows-tests)
         add_executable(strix-hip-parallel-hyper-projection-tests tests/hip_parallel_hyper_projection_tests.hip)
-        set_target_properties(strix-hip-parallel-hyper-projection-tests PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES gfx1151)
+        set_target_properties(strix-hip-parallel-hyper-projection-tests PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHITECTURES}")
         target_link_libraries(strix-hip-parallel-hyper-projection-tests PRIVATE strix_hip_runtime)
         strix_target_warnings(strix-hip-parallel-hyper-projection-tests)
         add_test(NAME strix-hip-parallel-hyper-projection-tests COMMAND strix-hip-parallel-hyper-projection-tests)
@@ -2192,23 +2202,23 @@ if(STRIX_ENABLE_HIP_RUNTIME)
         add_test(NAME strix-hip-splitk-hyper-integration-tests COMMAND strix-hip-splitk-hyper-integration-tests)
         add_executable(strix-hip-hc-deferred-norm-tests tests/hip_hc_deferred_norm_tests.hip)
         target_link_libraries(strix-hip-hc-deferred-norm-tests PRIVATE strix_hip_runtime strix_q4k_a8_contract)
-        set_target_properties(strix-hip-hc-deferred-norm-tests PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES gfx1151)
+        set_target_properties(strix-hip-hc-deferred-norm-tests PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHITECTURES}")
         target_compile_options(strix-hip-hc-deferred-norm-tests PRIVATE -mno-wavefrontsize64 -fno-fast-math -ffp-contract=off -fhip-fp32-correctly-rounded-divide-sqrt -fdenormal-fp-math=ieee)
         strix_target_warnings(strix-hip-hc-deferred-norm-tests)
         add_test(NAME strix-hip-hc-deferred-norm-tests COMMAND strix-hip-hc-deferred-norm-tests)
 
         add_executable(strix-hip-lane-chain-hyper-projection-tests tests/hip_lane_chain_hyper_projection_tests.hip)
-        set_target_properties(strix-hip-lane-chain-hyper-projection-tests PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES gfx1151)
+        set_target_properties(strix-hip-lane-chain-hyper-projection-tests PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHITECTURES}")
         target_link_libraries(strix-hip-lane-chain-hyper-projection-tests PRIVATE strix_hip_runtime)
         strix_target_warnings(strix-hip-lane-chain-hyper-projection-tests)
         add_test(NAME strix-hip-lane-chain-hyper-projection-tests COMMAND strix-hip-lane-chain-hyper-projection-tests)
         add_library(strix_hc_repacked_diagnostic STATIC src/hip_hc_repacked_diagnostic.hip)
         target_include_directories(strix_hc_repacked_diagnostic PUBLIC include)
-        set_target_properties(strix_hc_repacked_diagnostic PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES gfx1151)
+        set_target_properties(strix_hc_repacked_diagnostic PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHITECTURES}")
         target_link_libraries(strix_hc_repacked_diagnostic PUBLIC strix_core "${STRIX_HIP_RUNTIME_LIBRARY}")
         strix_target_warnings(strix_hc_repacked_diagnostic)
         add_executable(strix-hip-repacked-hyper-projection-tests tests/hip_repacked_hyper_projection_tests.hip)
-        set_target_properties(strix-hip-repacked-hyper-projection-tests PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES gfx1151)
+        set_target_properties(strix-hip-repacked-hyper-projection-tests PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHITECTURES}")
         target_link_libraries(strix-hip-repacked-hyper-projection-tests PRIVATE strix_hip_runtime strix_hc_repacked_down_pack strix_hc_repacked_diagnostic)
         strix_target_warnings(strix-hip-repacked-hyper-projection-tests)
         # Always build the diagnostic binary; only an externally admitted subset
@@ -2232,7 +2242,7 @@ if(STRIX_ENABLE_HIP_RUNTIME)
             PROPERTIES
             HIP_STANDARD 20
             HIP_STANDARD_REQUIRED ON
-            HIP_ARCHITECTURES gfx1151
+            HIP_ARCHITECTURES "${STRIX_HIP_ARCHITECTURES}"
         )
         target_link_libraries(
             strix-hip-hyper-mix-launcher-tests
@@ -2292,7 +2302,7 @@ if(STRIX_ENABLE_HIP_RUNTIME)
             PROPERTIES
             HIP_STANDARD 20
             HIP_STANDARD_REQUIRED ON
-            HIP_ARCHITECTURES gfx1151
+            HIP_ARCHITECTURES "${STRIX_HIP_ARCHITECTURES}"
         )
         target_link_libraries(
             strix-hip-lm-head-launcher-tests
@@ -2315,7 +2325,7 @@ if(STRIX_ENABLE_HIP_RUNTIME)
             PROPERTIES
             HIP_STANDARD 20
             HIP_STANDARD_REQUIRED ON
-            HIP_ARCHITECTURES gfx1151
+            HIP_ARCHITECTURES "${STRIX_HIP_ARCHITECTURES}"
         )
         target_link_libraries(
             strix-hip-shared-expert-launcher-tests
@@ -2331,7 +2341,7 @@ if(STRIX_ENABLE_HIP_RUNTIME)
 
         add_executable(strix-hip-shared-known-window-rows-tests tests/hip_shared_known_window_rows_tests.hip)
         set_target_properties(strix-hip-shared-known-window-rows-tests PROPERTIES
-            HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES gfx1151)
+            HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHITECTURES}")
         target_link_libraries(strix-hip-shared-known-window-rows-tests PRIVATE strix_hip_runtime)
         target_compile_options(strix-hip-shared-known-window-rows-tests PRIVATE
             -mno-wavefrontsize64 -fno-fast-math -ffp-contract=off -fdenormal-fp-math=ieee)
@@ -2348,7 +2358,7 @@ if(STRIX_ENABLE_HIP_RUNTIME)
 
         add_executable(strix-hip-gdn-retained-window-tests tests/hip_gdn_retained_window_tests.hip)
         set_target_properties(strix-hip-gdn-retained-window-tests PROPERTIES
-            HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES gfx1151)
+            HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHITECTURES}")
         target_link_libraries(strix-hip-gdn-retained-window-tests PRIVATE strix_hip_runtime)
         target_compile_definitions(strix-hip-gdn-retained-window-tests PRIVATE STRIX_BUILD_KNOWN_WINDOW_DIAGNOSTIC=1)
         target_compile_options(strix-hip-gdn-retained-window-tests PRIVATE
@@ -2358,7 +2368,7 @@ if(STRIX_ENABLE_HIP_RUNTIME)
 
         add_executable(strix-hip-gdn-deferred-window-tests tests/hip_gdn_deferred_window_tests.hip)
         set_target_properties(strix-hip-gdn-deferred-window-tests PROPERTIES
-            HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES gfx1151)
+            HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHITECTURES}")
         target_link_libraries(strix-hip-gdn-deferred-window-tests PRIVATE strix_hip_runtime)
         target_compile_definitions(strix-hip-gdn-deferred-window-tests PRIVATE STRIX_BUILD_KNOWN_WINDOW_DIAGNOSTIC=1)
         target_compile_options(strix-hip-gdn-deferred-window-tests PRIVATE
@@ -2368,7 +2378,7 @@ if(STRIX_ENABLE_HIP_RUNTIME)
 
         add_executable(strix-hip-gdn-wide-projection-tests tests/hip_gdn_wide_projection_tests.hip)
         set_target_properties(strix-hip-gdn-wide-projection-tests PROPERTIES
-            HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES gfx1151)
+            HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHITECTURES}")
         target_link_libraries(strix-hip-gdn-wide-projection-tests PRIVATE strix_hip_runtime)
         target_compile_definitions(strix-hip-gdn-wide-projection-tests PRIVATE STRIX_BUILD_KNOWN_WINDOW_DIAGNOSTIC=1)
         target_compile_options(strix-hip-gdn-wide-projection-tests PRIVATE
@@ -2378,7 +2388,7 @@ if(STRIX_ENABLE_HIP_RUNTIME)
 
         add_executable(strix-hip-q8-rows-projection-tests tests/hip_q8_rows_projection_tests.hip)
         set_target_properties(strix-hip-q8-rows-projection-tests PROPERTIES
-            HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES gfx1151)
+            HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHITECTURES}")
         target_link_libraries(strix-hip-q8-rows-projection-tests PRIVATE strix_hip_runtime)
         target_compile_definitions(strix-hip-q8-rows-projection-tests PRIVATE STRIX_BUILD_KNOWN_WINDOW_DIAGNOSTIC=1)
         target_compile_options(strix-hip-q8-rows-projection-tests PRIVATE
@@ -2390,7 +2400,7 @@ if(STRIX_ENABLE_HIP_RUNTIME)
         # reference separately. Never register a GPU invocation with CTest.
         add_executable(strix-hip-dense-trellis-tests tests/hip_dense_trellis_tests.hip)
         set_target_properties(strix-hip-dense-trellis-tests PROPERTIES
-            HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES gfx1151)
+            HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHITECTURES}")
         target_link_libraries(strix-hip-dense-trellis-tests PRIVATE strix_hip_runtime)
         target_compile_definitions(strix-hip-dense-trellis-tests PRIVATE STRIX_BUILD_KNOWN_WINDOW_DIAGNOSTIC=1)
         target_compile_options(strix-hip-dense-trellis-tests PRIVATE
@@ -2400,7 +2410,7 @@ if(STRIX_ENABLE_HIP_RUNTIME)
         # Dense A8 profile prototypes: dot4 decode form vs iu8 WMMA prefill form (header-only, standalone).
         add_executable(strix-hip-dense-a8-wmma-tests tests/hip_dense_a8_wmma_tests.hip)
         set_target_properties(strix-hip-dense-a8-wmma-tests PROPERTIES
-            HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES gfx1151)
+            HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHITECTURES}")
         target_compile_options(strix-hip-dense-a8-wmma-tests PRIVATE
             -mno-wavefrontsize64 -fno-fast-math -ffp-contract=off -fdenormal-fp-math=ieee)
         # hip_q8_rows_gemv.hpp reads the Q6P32 registry (strix/q6p_registry.hpp).
@@ -2409,7 +2419,7 @@ if(STRIX_ENABLE_HIP_RUNTIME)
         add_test(NAME strix-hip-dense-a8-wmma-tests COMMAND strix-hip-dense-a8-wmma-tests)
         add_executable(strix-hip-gsq-dense-a8-tests tests/hip_gsq_dense_a8_tests.hip)
         set_target_properties(strix-hip-gsq-dense-a8-tests PROPERTIES
-            HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES gfx1151)
+            HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHITECTURES}")
         target_compile_options(strix-hip-gsq-dense-a8-tests PRIVATE
             -mno-wavefrontsize64 -fno-fast-math -ffp-contract=off -fdenormal-fp-math=ieee)
         target_link_libraries(strix-hip-gsq-dense-a8-tests PRIVATE strix_hip_runtime strix_core)
@@ -2419,7 +2429,7 @@ if(STRIX_ENABLE_HIP_RUNTIME)
         # diagnostic probes: every row alone == batched T = 1..8 == the host contract.
         add_executable(strix-hip-gsq-typed-sites-tests tests/hip_gsq_typed_sites_tests.hip)
         set_target_properties(strix-hip-gsq-typed-sites-tests PROPERTIES
-            HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES gfx1151)
+            HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHITECTURES}")
         target_compile_definitions(strix-hip-gsq-typed-sites-tests PRIVATE STRIX_BUILD_KNOWN_WINDOW_DIAGNOSTIC=1)
         target_compile_options(strix-hip-gsq-typed-sites-tests PRIVATE
             -mno-wavefrontsize64 -fno-fast-math -ffp-contract=off -fdenormal-fp-math=ieee)
@@ -2431,7 +2441,7 @@ if(STRIX_ENABLE_HIP_RUNTIME)
         # Whole-T register-blocked dense FP16 projections (STRIX_QPF2K_DENSE=1) == launch_dense_f16, bitwise.
         add_executable(strix-hip-dense-f16-tiled-tests tests/hip_dense_f16_tiled_tests.hip)
         set_target_properties(strix-hip-dense-f16-tiled-tests PROPERTIES
-            HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES gfx1151)
+            HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHITECTURES}")
         target_compile_options(strix-hip-dense-f16-tiled-tests PRIVATE
             -mno-wavefrontsize64 -fno-fast-math -ffp-contract=off -fdenormal-fp-math=ieee)
         target_link_libraries(strix-hip-dense-f16-tiled-tests PRIVATE strix_hip_runtime)
@@ -2441,7 +2451,7 @@ if(STRIX_ENABLE_HIP_RUNTIME)
         if(STRIX_ENABLE_EXPERIMENTAL_Q4K_A8_RUNTIME)
             add_executable(strix-hip-moe-q4k-a8-known-rows-tests tests/hip_moe_q4k_a8_known_rows_tests.hip)
             set_target_properties(strix-hip-moe-q4k-a8-known-rows-tests PROPERTIES
-                HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES gfx1151)
+                HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHITECTURES}")
             target_link_libraries(strix-hip-moe-q4k-a8-known-rows-tests PRIVATE strix_hip_runtime)
             target_compile_options(strix-hip-moe-q4k-a8-known-rows-tests PRIVATE
                 -mno-wavefrontsize64 -fno-fast-math -ffp-contract=off -fhip-fp32-correctly-rounded-divide-sqrt -fdenormal-fp-math=ieee)
@@ -2452,7 +2462,7 @@ if(STRIX_ENABLE_HIP_RUNTIME)
             endforeach()
             add_executable(strix-hip-moe-known-rows-tests tests/hip_moe_known_rows_tests.hip)
             set_target_properties(strix-hip-moe-known-rows-tests PROPERTIES
-                HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES gfx1151)
+                HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHITECTURES}")
             target_link_libraries(strix-hip-moe-known-rows-tests PRIVATE strix_hip_runtime)
             target_compile_options(strix-hip-moe-known-rows-tests PRIVATE
                 -mno-wavefrontsize64 -fno-fast-math -ffp-contract=off -fdenormal-fp-math=ieee)
@@ -2479,14 +2489,14 @@ if(STRIX_ENABLE_HIP_RUNTIME)
 
         add_executable(strix-hip-event-queue-trace-tests tests/hip_event_queue_trace_tests.hip)
         set_target_properties(strix-hip-event-queue-trace-tests PROPERTIES
-            HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES gfx1151)
+            HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHITECTURES}")
         target_link_libraries(strix-hip-event-queue-trace-tests PRIVATE strix_hip_runtime)
         target_compile_options(strix-hip-event-queue-trace-tests PRIVATE -mno-wavefrontsize64)
         strix_target_warnings(strix-hip-event-queue-trace-tests)
         add_test(NAME hip-event-queue-trace COMMAND strix-hip-event-queue-trace-tests)
         add_executable(strix-hip-known-window-tests tests/hip_known_window_tests.hip)
         set_target_properties(strix-hip-known-window-tests PROPERTIES
-            HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES gfx1151)
+            HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHITECTURES}")
         target_link_libraries(strix-hip-known-window-tests PRIVATE strix_hip_runtime)
         target_compile_definitions(strix-hip-known-window-tests PRIVATE STRIX_BUILD_KNOWN_WINDOW_DIAGNOSTIC=1)
         target_compile_options(strix-hip-known-window-tests PRIVATE
@@ -2495,7 +2505,7 @@ if(STRIX_ENABLE_HIP_RUNTIME)
         add_test(NAME strix-hip-known-window-tests COMMAND strix-hip-known-window-tests)
         add_executable(strix-hip-token-sampling-device-tests tests/hip_token_sampling_device_tests.hip)
         set_target_properties(strix-hip-token-sampling-device-tests PROPERTIES
-            HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES gfx1151)
+            HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHITECTURES}")
         target_link_libraries(strix-hip-token-sampling-device-tests PRIVATE strix_hip_runtime)
         target_compile_options(strix-hip-token-sampling-device-tests PRIVATE -mno-wavefrontsize64)
         strix_target_warnings(strix-hip-token-sampling-device-tests)
@@ -2505,7 +2515,7 @@ if(STRIX_ENABLE_HIP_RUNTIME)
         add_test(NAME strix-hip-known-window-fold-tests COMMAND strix-hip-known-window-tests --window-folds)
         add_executable(strix-hip-qsa-committed-pool-tests tests/hip_qsa_committed_pool_tests.hip)
         set_target_properties(strix-hip-qsa-committed-pool-tests PROPERTIES
-            HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES gfx1151)
+            HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHITECTURES}")
         target_link_libraries(strix-hip-qsa-committed-pool-tests PRIVATE strix_hip_runtime)
         target_compile_definitions(strix-hip-qsa-committed-pool-tests PRIVATE STRIX_BUILD_KNOWN_WINDOW_DIAGNOSTIC=1)
         target_compile_options(strix-hip-qsa-committed-pool-tests PRIVATE -mno-wavefrontsize64 -fno-fast-math -ffp-contract=off)
@@ -2520,7 +2530,7 @@ if(STRIX_ENABLE_HIP_RUNTIME)
         set_tests_properties(strix-hip-qsa-committed-pool-tests PROPERTIES SKIP_RETURN_CODE 77)
         add_executable(strix-hip-qsa-decode-pool-bf16-tests tests/qsa_decode_pool_bf16.hip)
         set_target_properties(strix-hip-qsa-decode-pool-bf16-tests PROPERTIES
-            HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES gfx1151)
+            HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHITECTURES}")
         target_link_libraries(strix-hip-qsa-decode-pool-bf16-tests PRIVATE "${STRIX_HIP_RUNTIME_LIBRARY}")
         target_compile_options(strix-hip-qsa-decode-pool-bf16-tests PRIVATE
             -mno-wavefrontsize64 -fno-fast-math -ffp-contract=off -fdenormal-fp-math=ieee)
@@ -2529,7 +2539,7 @@ if(STRIX_ENABLE_HIP_RUNTIME)
         set_tests_properties(strix-hip-qsa-decode-pool-bf16-tests PROPERTIES SKIP_RETURN_CODE 77)
         add_executable(strix-hip-qsa-block-select-tests tests/hip_qsa_block_select_tests.hip)
         set_target_properties(strix-hip-qsa-block-select-tests PROPERTIES
-            HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES gfx1151)
+            HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHITECTURES}")
         target_link_libraries(strix-hip-qsa-block-select-tests PRIVATE strix_hip_runtime)
         target_compile_definitions(strix-hip-qsa-block-select-tests PRIVATE STRIX_BUILD_KNOWN_WINDOW_DIAGNOSTIC=1)
         target_compile_options(strix-hip-qsa-block-select-tests PRIVATE -mno-wavefrontsize64)
@@ -2538,7 +2548,7 @@ if(STRIX_ENABLE_HIP_RUNTIME)
         set_tests_properties(strix-hip-qsa-block-select-tests PROPERTIES SKIP_RETURN_CODE 77)
         add_executable(strix-hip-attention-kv-int8-tests tests/hip_attention_kv_int8_tests.hip)
         set_target_properties(strix-hip-attention-kv-int8-tests PROPERTIES
-            HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES gfx1151)
+            HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHITECTURES}")
         target_link_libraries(strix-hip-attention-kv-int8-tests PRIVATE strix_hip_runtime)
         target_compile_definitions(strix-hip-attention-kv-int8-tests PRIVATE STRIX_BUILD_KNOWN_WINDOW_DIAGNOSTIC=1)
         target_compile_options(strix-hip-attention-kv-int8-tests PRIVATE -mno-wavefrontsize64 -fno-fast-math)
@@ -2550,7 +2560,7 @@ if(STRIX_ENABLE_HIP_RUNTIME)
         # it is intentionally absent from the automatic device regression.
         add_executable(strix-hip-known-window-model-qualification tests/hip_known_window_model_qualification.hip)
         set_target_properties(strix-hip-known-window-model-qualification PROPERTIES
-            HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES gfx1151)
+            HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHITECTURES}")
         target_link_libraries(strix-hip-known-window-model-qualification PRIVATE strix_hip_runtime)
         strix_target_warnings(strix-hip-known-window-model-qualification)
 
@@ -2561,7 +2571,7 @@ if(STRIX_ENABLE_HIP_RUNTIME)
         # not run transport or qualify a distributed model; never automatic CTest.
         add_executable(strix-hip-distributed-stage-model-qualification tests/hip_distributed_stage_tests.hip)
         set_target_properties(strix-hip-distributed-stage-model-qualification PROPERTIES
-            HIP_ARCHITECTURES gfx1151 HIP_STANDARD 20 HIP_STANDARD_REQUIRED YES)
+            HIP_ARCHITECTURES "${STRIX_HIP_ARCHITECTURES}" HIP_STANDARD 20 HIP_STANDARD_REQUIRED YES)
         target_compile_options(strix-hip-distributed-stage-model-qualification PRIVATE
             -mno-wavefrontsize64 -fno-fast-math -ffp-contract=off -fdenormal-fp-math=ieee)
         target_link_libraries(strix-hip-distributed-stage-model-qualification PRIVATE strix_hip_runtime)
@@ -2572,7 +2582,7 @@ if(STRIX_ENABLE_HIP_RUNTIME)
         add_library(strix-hip-distributed-sequence-model-fixture STATIC
             tests/hip_distributed_sequence_model_qualification.hip)
         set_target_properties(strix-hip-distributed-sequence-model-fixture PROPERTIES
-            HIP_ARCHITECTURES gfx1151 HIP_STANDARD 20 HIP_STANDARD_REQUIRED YES)
+            HIP_ARCHITECTURES "${STRIX_HIP_ARCHITECTURES}" HIP_STANDARD 20 HIP_STANDARD_REQUIRED YES)
         target_compile_options(strix-hip-distributed-sequence-model-fixture PRIVATE
             -mno-wavefrontsize64 -fno-fast-math -ffp-contract=off -fdenormal-fp-math=ieee)
         target_link_libraries(strix-hip-distributed-sequence-model-fixture PUBLIC strix_hip_runtime)
@@ -2585,7 +2595,7 @@ if(STRIX_ENABLE_HIP_RUNTIME)
         add_library(strix-hip-distributed-greedy-model-fixture STATIC
             tests/hip_distributed_greedy_model_qualification.hip)
         set_target_properties(strix-hip-distributed-greedy-model-fixture PROPERTIES
-            HIP_ARCHITECTURES gfx1151 HIP_STANDARD 20 HIP_STANDARD_REQUIRED YES)
+            HIP_ARCHITECTURES "${STRIX_HIP_ARCHITECTURES}" HIP_STANDARD 20 HIP_STANDARD_REQUIRED YES)
         target_compile_options(strix-hip-distributed-greedy-model-fixture PRIVATE
             -mno-wavefrontsize64 -fno-fast-math -ffp-contract=off -fdenormal-fp-math=ieee)
         target_include_directories(strix-hip-distributed-greedy-model-fixture PUBLIC
@@ -2596,7 +2606,7 @@ if(STRIX_ENABLE_HIP_RUNTIME)
 
         add_executable(strix-hip-serving-greedy-model-qualification tests/hip_serving_greedy_backend_tests.hip)
         set_target_properties(strix-hip-serving-greedy-model-qualification PROPERTIES
-            HIP_ARCHITECTURES gfx1151 HIP_STANDARD 20 HIP_STANDARD_REQUIRED YES)
+            HIP_ARCHITECTURES "${STRIX_HIP_ARCHITECTURES}" HIP_STANDARD 20 HIP_STANDARD_REQUIRED YES)
         target_compile_definitions(strix-hip-serving-greedy-model-qualification PRIVATE STRIX_BUILD_GREEDY_OUTPUT_DIAGNOSTIC=1)
         target_compile_options(strix-hip-serving-greedy-model-qualification PRIVATE -fno-fast-math -ffp-contract=off)
         target_link_libraries(strix-hip-serving-greedy-model-qualification PRIVATE strix_hip_runtime Threads::Threads)
@@ -2604,7 +2614,7 @@ if(STRIX_ENABLE_HIP_RUNTIME)
 
         add_executable(strix-hip-known-prompt-model-qualification tests/hip_known_prompt_model_qualification.hip)
         set_target_properties(strix-hip-known-prompt-model-qualification PROPERTIES
-            HIP_ARCHITECTURES gfx1151 HIP_STANDARD 20 HIP_STANDARD_REQUIRED YES)
+            HIP_ARCHITECTURES "${STRIX_HIP_ARCHITECTURES}" HIP_STANDARD 20 HIP_STANDARD_REQUIRED YES)
         target_link_libraries(strix-hip-known-prompt-model-qualification PRIVATE strix_hip_runtime)
         strix_target_warnings(strix-hip-known-prompt-model-qualification)
 
@@ -2617,7 +2627,7 @@ if(STRIX_ENABLE_HIP_RUNTIME)
             PROPERTIES
             HIP_STANDARD 20
             HIP_STANDARD_REQUIRED ON
-            HIP_ARCHITECTURES gfx1151
+            HIP_ARCHITECTURES "${STRIX_HIP_ARCHITECTURES}"
         )
         target_link_libraries(
             strix-hip-moe-experts-launcher-tests
@@ -2635,12 +2645,12 @@ if(STRIX_ENABLE_HIP_RUNTIME)
             add_executable(strix-hip-q51-grouped-down-probe-tests tests/hip_q51_grouped_down_probe_tests.hip)
             add_test(NAME strix-hip-moe-a8-down-runtime-admission-tests
                 COMMAND strix-hip-moe-kquant-tests 4 a8-down-runtime-admission)
-            set_target_properties(strix-hip-q51-grouped-down-probe-tests PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES gfx1151)
+            set_target_properties(strix-hip-q51-grouped-down-probe-tests PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHITECTURES}")
             target_link_libraries(strix-hip-q51-grouped-down-probe-tests PRIVATE strix_hip_runtime)
             strix_target_warnings(strix-hip-q51-grouped-down-probe-tests)
             add_test(NAME strix-hip-q51-grouped-down-probe-tests COMMAND strix-hip-q51-grouped-down-probe-tests)
             add_executable(strix-hip-q51-slot-parallel-probe-tests tests/hip_q51_slot_parallel_probe_tests.hip)
-            set_target_properties(strix-hip-q51-slot-parallel-probe-tests PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES gfx1151)
+            set_target_properties(strix-hip-q51-slot-parallel-probe-tests PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHITECTURES}")
             target_link_libraries(strix-hip-q51-slot-parallel-probe-tests PRIVATE strix_hip_runtime)
             target_compile_options(strix-hip-q51-slot-parallel-probe-tests PRIVATE -fno-fast-math -ffp-contract=off -fdenormal-fp-math=ieee)
             strix_target_warnings(strix-hip-q51-slot-parallel-probe-tests)
@@ -2676,7 +2686,7 @@ if(STRIX_ENABLE_HIP_RUNTIME)
             -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/check_q4k_a8_runtime_cli.cmake")
         add_executable(strix-hip-moe-kquant-tests tests/hip_moe_kquant_tests.hip)
         set_target_properties(strix-hip-moe-kquant-tests PROPERTIES
-            HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES gfx1151)
+            HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHITECTURES}")
         target_link_libraries(strix-hip-moe-kquant-tests PRIVATE strix_hip_runtime)
         strix_target_warnings(strix-hip-moe-kquant-tests)
         foreach(mode RANGE 0 7)
@@ -2686,21 +2696,21 @@ if(STRIX_ENABLE_HIP_RUNTIME)
 
         add_executable(strix-hip-ggml-weight-formats-tests tests/hip_ggml_weight_formats_tests.hip)
         set_target_properties(strix-hip-ggml-weight-formats-tests PROPERTIES
-            HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES gfx1151)
+            HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHITECTURES}")
         target_link_libraries(strix-hip-ggml-weight-formats-tests PRIVATE strix_hip_runtime)
         strix_target_warnings(strix-hip-ggml-weight-formats-tests)
         add_test(NAME strix-hip-ggml-weight-formats-tests COMMAND strix-hip-ggml-weight-formats-tests)
 
         add_executable(strix-hip-gdn-output-projection-tests tests/hip_gdn_output_projection_tests.hip)
         target_link_libraries(strix-hip-gdn-output-projection-tests PRIVATE strix_hip_runtime)
-        set_target_properties(strix-hip-gdn-output-projection-tests PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES gfx1151)
+        set_target_properties(strix-hip-gdn-output-projection-tests PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHITECTURES}")
         strix_target_warnings(strix-hip-gdn-output-projection-tests)
         add_test(NAME strix-hip-gdn-output-projection-tests COMMAND strix-hip-gdn-output-projection-tests)
 
         add_executable(strix-hip-qsa-output-projection-tests tests/hip_qsa_output_projection_tests.hip)
         target_compile_definitions(strix-hip-qsa-output-projection-tests PRIVATE STRIX_BUILD_QSA_OUTPUT_PROJECTION_DIAGNOSTIC=1)
         target_link_libraries(strix-hip-qsa-output-projection-tests PRIVATE strix_hip_runtime)
-        set_target_properties(strix-hip-qsa-output-projection-tests PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES gfx1151)
+        set_target_properties(strix-hip-qsa-output-projection-tests PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHITECTURES}")
         strix_target_warnings(strix-hip-qsa-output-projection-tests)
         add_test(NAME strix-hip-qsa-output-projection-tests COMMAND strix-hip-qsa-output-projection-tests)
 
@@ -2713,7 +2723,7 @@ if(STRIX_ENABLE_HIP_RUNTIME)
             PROPERTIES
             HIP_STANDARD 20
             HIP_STANDARD_REQUIRED ON
-            HIP_ARCHITECTURES gfx1151
+            HIP_ARCHITECTURES "${STRIX_HIP_ARCHITECTURES}"
         )
         target_link_libraries(
             strix-hip-gdn-launcher-tests
@@ -2749,7 +2759,7 @@ if(STRIX_ENABLE_HIP_RUNTIME)
             PROPERTIES
             HIP_STANDARD 20
             HIP_STANDARD_REQUIRED ON
-            HIP_ARCHITECTURES gfx1151
+            HIP_ARCHITECTURES "${STRIX_HIP_ARCHITECTURES}"
         )
         target_link_libraries(
             strix-hip-ple-launcher-tests
@@ -2764,18 +2774,18 @@ if(STRIX_ENABLE_HIP_RUNTIME)
         )
 
         add_executable(strix-hip-qsa-input-prefetch-tests tests/hip_qsa_input_prefetch_tests.hip)
-        set_target_properties(strix-hip-qsa-input-prefetch-tests PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES gfx1151)
+        set_target_properties(strix-hip-qsa-input-prefetch-tests PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHITECTURES}")
         target_link_libraries(strix-hip-qsa-input-prefetch-tests PRIVATE strix_hip_runtime)
         strix_target_warnings(strix-hip-qsa-input-prefetch-tests)
         add_test(NAME strix-hip-qsa-input-prefetch-tests COMMAND strix-hip-qsa-input-prefetch-tests)
         add_executable(strix-hip-shared-expert-prefetch-tests tests/hip_shared_expert_prefetch_tests.hip)
-        set_target_properties(strix-hip-shared-expert-prefetch-tests PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES gfx1151)
+        set_target_properties(strix-hip-shared-expert-prefetch-tests PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHITECTURES}")
         target_link_libraries(strix-hip-shared-expert-prefetch-tests PRIVATE strix_hip_runtime)
         strix_target_warnings(strix-hip-shared-expert-prefetch-tests)
         add_test(NAME strix-hip-shared-expert-prefetch-tests COMMAND strix-hip-shared-expert-prefetch-tests)
 
         add_executable(strix-hip-q8-projection-organization-tests tests/hip_q8_projection_organization_tests.hip)
-        set_target_properties(strix-hip-q8-projection-organization-tests PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES gfx1151)
+        set_target_properties(strix-hip-q8-projection-organization-tests PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHITECTURES}")
         target_link_libraries(strix-hip-q8-projection-organization-tests PRIVATE strix_hip_runtime)
         strix_target_warnings(strix-hip-q8-projection-organization-tests)
         add_test(NAME strix-hip-q8-projection-organization-tests COMMAND strix-hip-q8-projection-organization-tests)
@@ -2797,51 +2807,51 @@ if(STRIX_ENABLE_HIP_RUNTIME)
         endforeach()
         add_executable(strix-hip-gdn-lm-wave8-diagnostic-tests tests/hip_gdn_lm_wave8_diagnostic_tests.hip)
         add_executable(strix-hip-shared-expert-rows-diagnostic-tests tests/hip_shared_expert_rows_diagnostic_tests.hip)
-        set_target_properties(strix-hip-shared-expert-rows-diagnostic-tests PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES gfx1151)
+        set_target_properties(strix-hip-shared-expert-rows-diagnostic-tests PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHITECTURES}")
         target_link_libraries(strix-hip-shared-expert-rows-diagnostic-tests PRIVATE strix_hip_runtime)
         strix_target_warnings(strix-hip-shared-expert-rows-diagnostic-tests)
         add_test(NAME strix-hip-shared-expert-rows-diagnostic-tests COMMAND strix-hip-shared-expert-rows-diagnostic-tests)
         add_executable(strix-hip-qpersist-attention-tests tests/hip_qpersist_attention_tests.hip)
-        set_target_properties(strix-hip-qpersist-attention-tests PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES gfx1151)
+        set_target_properties(strix-hip-qpersist-attention-tests PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHITECTURES}")
         target_link_libraries(strix-hip-qpersist-attention-tests PRIVATE strix_hip_runtime)
         strix_target_warnings(strix-hip-qpersist-attention-tests)
         add_test(NAME strix-hip-qpersist-attention-tests COMMAND strix-hip-qpersist-attention-tests)
         add_executable(strix-hip-router-select-tests tests/hip_router_select_tests.hip)
-        set_target_properties(strix-hip-router-select-tests PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES gfx1151)
+        set_target_properties(strix-hip-router-select-tests PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHITECTURES}")
         target_link_libraries(strix-hip-router-select-tests PRIVATE strix_hip_runtime)
         strix_target_warnings(strix-hip-router-select-tests)
         add_test(NAME strix-hip-router-select-tests COMMAND strix-hip-router-select-tests 5)
         add_executable(strix-hip-draft-attention-exact-tests tests/hip_draft_attention_exact_tests.hip)
-        set_target_properties(strix-hip-draft-attention-exact-tests PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES gfx1151)
+        set_target_properties(strix-hip-draft-attention-exact-tests PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHITECTURES}")
         target_link_libraries(strix-hip-draft-attention-exact-tests PRIVATE strix_hip_runtime)
         strix_target_warnings(strix-hip-draft-attention-exact-tests)
         add_test(NAME strix-hip-draft-attention-exact-tests COMMAND strix-hip-draft-attention-exact-tests)
         add_executable(strix-hip-qsa-gqa-reuse-diagnostic-tests tests/hip_qsa_gqa_reuse_diagnostic_tests.hip)
-        set_target_properties(strix-hip-qsa-gqa-reuse-diagnostic-tests PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES gfx1151)
+        set_target_properties(strix-hip-qsa-gqa-reuse-diagnostic-tests PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHITECTURES}")
         target_link_libraries(strix-hip-qsa-gqa-reuse-diagnostic-tests PRIVATE strix_hip_runtime)
         strix_target_warnings(strix-hip-qsa-gqa-reuse-diagnostic-tests)
         add_test(NAME strix-hip-qsa-gqa-reuse-diagnostic-tests COMMAND strix-hip-qsa-gqa-reuse-diagnostic-tests)
         add_executable(strix-hip-moe-batched-activation-diagnostic-tests tests/hip_moe_batched_activation_diagnostic_tests.hip)
-        set_target_properties(strix-hip-moe-batched-activation-diagnostic-tests PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES gfx1151)
+        set_target_properties(strix-hip-moe-batched-activation-diagnostic-tests PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHITECTURES}")
         target_link_libraries(strix-hip-moe-batched-activation-diagnostic-tests PRIVATE strix_hip_runtime)
         strix_target_warnings(strix-hip-moe-batched-activation-diagnostic-tests)
         add_test(NAME strix-hip-moe-batched-activation-diagnostic-tests COMMAND strix-hip-moe-batched-activation-diagnostic-tests)
         add_executable(strix-hip-moe-overlap-dispatcher-tests tests/hip_moe_overlap_dispatcher_tests.hip)
-        set_target_properties(strix-hip-moe-overlap-dispatcher-tests PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES gfx1151)
+        set_target_properties(strix-hip-moe-overlap-dispatcher-tests PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHITECTURES}")
         target_link_libraries(strix-hip-moe-overlap-dispatcher-tests PRIVATE strix_hip_runtime)
         strix_target_warnings(strix-hip-moe-overlap-dispatcher-tests)
         add_test(NAME strix-hip-moe-overlap-dispatcher-tests COMMAND strix-hip-moe-overlap-dispatcher-tests)
         add_executable(strix-hip-generation-output-tests tests/hip_generation_output_tests.hip)
         add_executable(strix-hip-gdn-recurrent-layout-diagnostic-tests tests/hip_gdn_recurrent_layout_diagnostic_tests.hip)
-        set_target_properties(strix-hip-gdn-recurrent-layout-diagnostic-tests PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES gfx1151)
+        set_target_properties(strix-hip-gdn-recurrent-layout-diagnostic-tests PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHITECTURES}")
         target_link_libraries(strix-hip-gdn-recurrent-layout-diagnostic-tests PRIVATE strix_hip_runtime)
         strix_target_warnings(strix-hip-gdn-recurrent-layout-diagnostic-tests)
         add_test(NAME strix-hip-gdn-recurrent-layout-diagnostic-tests COMMAND strix-hip-gdn-recurrent-layout-diagnostic-tests)
-        set_target_properties(strix-hip-generation-output-tests PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES gfx1151)
+        set_target_properties(strix-hip-generation-output-tests PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHITECTURES}")
         target_link_libraries(strix-hip-generation-output-tests PRIVATE strix_hip_runtime)
         strix_target_warnings(strix-hip-generation-output-tests)
         add_test(NAME strix-hip-generation-output-tests COMMAND strix-hip-generation-output-tests)
-        set_target_properties(strix-hip-gdn-lm-wave8-diagnostic-tests PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES gfx1151)
+        set_target_properties(strix-hip-gdn-lm-wave8-diagnostic-tests PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHITECTURES}")
         target_link_libraries(strix-hip-gdn-lm-wave8-diagnostic-tests PRIVATE strix_hip_runtime)
         strix_target_warnings(strix-hip-gdn-lm-wave8-diagnostic-tests)
         add_test(NAME strix-hip-gdn-lm-wave8-diagnostic-tests COMMAND strix-hip-gdn-lm-wave8-diagnostic-tests)
@@ -2855,7 +2865,7 @@ if(STRIX_ENABLE_HIP_RUNTIME)
             PROPERTIES
             HIP_STANDARD 20
             HIP_STANDARD_REQUIRED ON
-            HIP_ARCHITECTURES gfx1151
+            HIP_ARCHITECTURES "${STRIX_HIP_ARCHITECTURES}"
         )
         target_link_libraries(
             strix-hip-indexed-attention-launcher-tests
@@ -3126,7 +3136,7 @@ if(STRIX_ENABLE_HIP_RUNTIME)
         list(APPEND strix_ds41_attention_hip_targets strix-hip-ds41-attention-timing)
     endif()
     foreach(target ${strix_ds41_attention_hip_targets})
-        set_target_properties(${target} PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES gfx1151)
+        set_target_properties(${target} PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHITECTURES}")
         target_compile_options(${target} PRIVATE -mno-wavefrontsize64 -fno-fast-math -ffp-contract=off
             -fhip-fp32-correctly-rounded-divide-sqrt -fdenormal-fp-math=ieee)
         strix_target_warnings(${target})
@@ -3464,7 +3474,7 @@ if(STRIX_ENABLE_HIP_RUNTIME)
         list(APPEND strix_ds41_hip_targets strix-hip-ds41-small-ops-tests)
     endif()
     foreach(target ${strix_ds41_hip_targets})
-        set_target_properties(${target} PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES gfx1151)
+        set_target_properties(${target} PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHITECTURES}")
         target_compile_options(${target} PRIVATE -mno-wavefrontsize64 -fno-fast-math -ffp-contract=off
             -fhip-fp32-correctly-rounded-divide-sqrt -fdenormal-fp-math=ieee)
         strix_target_warnings(${target})
@@ -3576,7 +3586,7 @@ if(STRIX_ENABLE_HIP_RUNTIME)
     add_library(strix_ds41_xs_hip STATIC src/hip_ds41_expert_backend.hip)
     target_link_libraries(strix_ds41_xs_hip PUBLIC strix_ds41_xs strix_ds41_hip "${STRIX_HIP_RUNTIME_LIBRARY}")
     target_include_directories(strix_ds41_xs_hip PUBLIC include "${STRIX_HIP_INCLUDE_DIR}")
-    set_target_properties(strix_ds41_xs_hip PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES gfx1151)
+    set_target_properties(strix_ds41_xs_hip PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHITECTURES}")
     target_compile_options(strix_ds41_xs_hip PRIVATE -mno-wavefrontsize64 -fno-fast-math -ffp-contract=off
         -fhip-fp32-correctly-rounded-divide-sqrt -fdenormal-fp-math=ieee)
     strix_target_warnings(strix_ds41_xs_hip)
@@ -3613,7 +3623,7 @@ if(STRIX_ENABLE_HIP_RUNTIME)
         list(APPEND strix_ds41_prefill_hip_targets strix-hip-ds41-prefill-tiles-tests)
     endif()
     foreach(target ${strix_ds41_prefill_hip_targets})
-        set_target_properties(${target} PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES gfx1151)
+        set_target_properties(${target} PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHITECTURES}")
         target_compile_options(${target} PRIVATE -mno-wavefrontsize64 -fno-fast-math -ffp-contract=off
             -fhip-fp32-correctly-rounded-divide-sqrt -fdenormal-fp-math=ieee)
         strix_target_warnings(${target})
@@ -3676,7 +3686,7 @@ if(STRIX_ENABLE_HIP_RUNTIME)
         target_link_libraries(strix-deepseek41-rank PRIVATE strix_ds41_spec_tail)
     endif()
     foreach(target ${strix_ds41_dspark_hip_targets})
-        set_target_properties(${target} PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES gfx1151)
+        set_target_properties(${target} PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHITECTURES}")
         target_compile_options(${target} PRIVATE -mno-wavefrontsize64 -fno-fast-math -ffp-contract=off
             -fhip-fp32-correctly-rounded-divide-sqrt -fdenormal-fp-math=ieee)
         strix_target_warnings(${target})
@@ -3688,7 +3698,7 @@ if(STRIX_ENABLE_HIP_RUNTIME)
     target_link_libraries(strix_ds41_device_prefill PUBLIC strix_ds41_device_forward strix_ds41_prefill_hip strix_ds41_layer_hip
         strix_ds41_attention_hip strix_dist)
     target_include_directories(strix_ds41_device_prefill PUBLIC include "${STRIX_HIP_INCLUDE_DIR}")
-    set_target_properties(strix_ds41_device_prefill PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES gfx1151)
+    set_target_properties(strix_ds41_device_prefill PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHITECTURES}")
     target_compile_options(strix_ds41_device_prefill PRIVATE -mno-wavefrontsize64 -fno-fast-math -ffp-contract=off
         -fhip-fp32-correctly-rounded-divide-sqrt -fdenormal-fp-math=ieee)
     strix_target_warnings(strix_ds41_device_prefill)
@@ -4192,14 +4202,14 @@ if(STRIX_FAMILY_MINIMAX)
             add_library(strix_minimax_pfx STATIC src/minimax/pfx/pf_exchange.hip src/minimax/pfx/pf_crc.cpp)
             target_link_libraries(strix_minimax_pfx PUBLIC strix_dist "${STRIX_HIP_RUNTIME_LIBRARY}" Threads::Threads)
             target_include_directories(strix_minimax_pfx PUBLIC include src "${STRIX_HIP_INCLUDE_DIR}")
-            set_target_properties(strix_minimax_pfx PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES gfx1151)
+            set_target_properties(strix_minimax_pfx PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHITECTURES}")
             target_compile_features(strix_minimax_pfx PUBLIC cxx_std_20)
             target_compile_options(strix_minimax_pfx PRIVATE $<$<COMPILE_LANGUAGE:HIP>:-mno-wavefrontsize64>)
             strix_target_warnings(strix_minimax_pfx)
             if(BUILD_TESTING)
                 add_executable(strix-hip-mm-pfx-tests tests/hip_mm_pfx_tests.hip)
                 target_link_libraries(strix-hip-mm-pfx-tests PRIVATE strix_minimax_pfx)
-                set_target_properties(strix-hip-mm-pfx-tests PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES gfx1151)
+                set_target_properties(strix-hip-mm-pfx-tests PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHITECTURES}")
                 target_compile_options(strix-hip-mm-pfx-tests PRIVATE -mno-wavefrontsize64)
             endif()
             add_library(strix_minimax_engine STATIC src/minimax/engine/engine.hip src/minimax/engine/draft_lin.hip src/minimax/engine/mm_pack.cpp
@@ -4207,7 +4217,7 @@ if(STRIX_FAMILY_MINIMAX)
             target_link_libraries(strix_minimax_engine PUBLIC strix_minimax_assets strix_minimax_defaults strix_minimax_msa_hip strix_minimax_moe_opt_hip strix_minimax_pfx strix_dist "${strix_minimax_trellis_lib}")
             target_include_directories(strix_minimax_engine PUBLIC include src "${STRIX_HIP_INCLUDE_DIR}"
                 PRIVATE "${STRIX_MINIMAX_TRELLIS_DIR}/include")
-            set_target_properties(strix_minimax_engine PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES gfx1151)
+            set_target_properties(strix_minimax_engine PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHITECTURES}")
             target_compile_features(strix_minimax_engine PUBLIC cxx_std_20)
             target_compile_options(strix_minimax_engine PRIVATE $<$<COMPILE_LANGUAGE:HIP>:-mno-wavefrontsize64 -fno-fast-math
                 -ffp-contract=off -fhip-fp32-correctly-rounded-divide-sqrt -fdenormal-fp-math=ieee>)
@@ -4217,7 +4227,7 @@ if(STRIX_FAMILY_MINIMAX)
                 src/minimax/dspark/minimax_dspark_files.cpp src/minimax/dspark/minimax_ngram.cpp)
             target_include_directories(strix_minimax_dspark PUBLIC src/minimax/dspark "${STRIX_HIP_INCLUDE_DIR}")
             target_link_libraries(strix_minimax_dspark PUBLIC strix_minimax_assets "${STRIX_HIP_RUNTIME_LIBRARY}" Threads::Threads)
-            set_target_properties(strix_minimax_dspark PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES gfx1151)
+            set_target_properties(strix_minimax_dspark PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHITECTURES}")
             target_compile_features(strix_minimax_dspark PUBLIC cxx_std_20)
             target_compile_options(strix_minimax_dspark PRIVATE -fno-fast-math -ffp-contract=off $<$<COMPILE_LANGUAGE:HIP>:-mno-wavefrontsize64
                 -fhip-fp32-correctly-rounded-divide-sqrt -fdenormal-fp-math=ieee>)
@@ -4229,12 +4239,12 @@ if(STRIX_FAMILY_MINIMAX)
                 add_test(NAME strix-mm-dspark-tests COMMAND strix-mm-dspark-tests)
                 add_executable(strix-hip-mm-markov-cand-tests src/minimax/dspark/tests/hip_markov_cand_tests.hip)
                 target_link_libraries(strix-hip-mm-markov-cand-tests PRIVATE strix_minimax_dspark Threads::Threads)
-                set_target_properties(strix-hip-mm-markov-cand-tests PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES gfx1151)
+                set_target_properties(strix-hip-mm-markov-cand-tests PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHITECTURES}")
                 target_compile_options(strix-hip-mm-markov-cand-tests PRIVATE -mno-wavefrontsize64 -fno-fast-math -ffp-contract=off
                     -fhip-fp32-correctly-rounded-divide-sqrt -fdenormal-fp-math=ieee)
                 add_executable(strix-hip-mm-dspark-tests src/minimax/dspark/tests/hip_minimax_dspark_tests.hip)
                 target_link_libraries(strix-hip-mm-dspark-tests PRIVATE strix_minimax_dspark)
-                set_target_properties(strix-hip-mm-dspark-tests PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES gfx1151)
+                set_target_properties(strix-hip-mm-dspark-tests PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHITECTURES}")
                 target_compile_options(strix-hip-mm-dspark-tests PRIVATE -mno-wavefrontsize64 -fno-fast-math -ffp-contract=off
                     -fhip-fp32-correctly-rounded-divide-sqrt -fdenormal-fp-math=ieee)
             endif()
@@ -4251,7 +4261,7 @@ if(STRIX_FAMILY_MINIMAX)
                 add_executable(strix-hip-mmx-draft-bench tests/hip_mmx_draft_bench.hip)
                 target_link_libraries(strix-hip-mmx-draft-bench PRIVATE strix_minimax_engine strix_minimax_dspark)
                 target_include_directories(strix-hip-mmx-draft-bench PRIVATE "${STRIX_MINIMAX_TRELLIS_DIR}/include")
-                set_target_properties(strix-hip-mmx-draft-bench PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES gfx1151)
+                set_target_properties(strix-hip-mmx-draft-bench PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHITECTURES}")
                 target_compile_options(strix-hip-mmx-draft-bench PRIVATE -mno-wavefrontsize64 -fno-fast-math -ffp-contract=off)
             endif()
             add_executable(strix-minimax-serve apps/minimax_serve_main.cpp)
@@ -4260,7 +4270,7 @@ if(STRIX_FAMILY_MINIMAX)
             strix_target_warnings(strix-minimax-serve)
         endif()
         foreach(target ${strix_minimax_msa_hip_targets})
-            set_target_properties(${target} PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES gfx1151)
+            set_target_properties(${target} PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHITECTURES}")
             target_compile_options(${target} PRIVATE -mno-wavefrontsize64 -fno-fast-math -ffp-contract=off
                 -fhip-fp32-correctly-rounded-divide-sqrt -fdenormal-fp-math=ieee)
             strix_target_warnings(${target})
@@ -4391,7 +4401,7 @@ if(STRIX_FAMILY_GLM5)
             strix_target_warnings(strix-glm5-rank)
         endif()
         foreach(target ${strix_glm5_hip_targets})
-            set_target_properties(${target} PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES gfx1151)
+            set_target_properties(${target} PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHITECTURES}")
             target_compile_options(${target} PRIVATE $<$<COMPILE_LANGUAGE:HIP>:${strix_glm5_hip_flags}>)
             strix_target_warnings(${target})
         endforeach()
