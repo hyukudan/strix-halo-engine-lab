@@ -961,7 +961,12 @@ Receipts, `--print-effective-config`, HTTP response `strix` receipts and `GET /v
 report `prefill_identity`, `prefill_identity_hash` (16 lowercase hex digits), and
 `prefill_options_active` (names in registry order). This identifies the option set; the existing
 numerical profile pair still identifies the surrounding arithmetic. Every changed active set
-must be re-qualified against its own reference.
+must be re-qualified against its own reference. The set is declared on every route, but
+`hc_output_wmma` executes only when prefill runs a fast prefill profile (stderr witness
+`qpf2k HC out16 active`); on other routes, including `--baseline` and explicit dense-A8 routes,
+it is inert. Equivalence never uses the declared set alone: prefix-state cache keys include the
+effective prefill command line (both numerical profiles and `--baseline`), and session state
+carries the compiled prefill execution identity, so routes with different arithmetic never compare equal.
 
 **Server-level only:** restart the server to change these options. Compiled prefill plans and
 prefix-state caches are shared across requests; the enabled set is bound into compiled execution,

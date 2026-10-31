@@ -4,6 +4,7 @@
 #include "../apps/qwen_cache_family_contract.hpp"
 #include "strix/mtp_selection_transaction.hpp"
 #include "../apps/qwen_prefill_plan.hpp"
+#include "../apps/prefix_state_cache_identity.hpp"
 #include "qwen_prefill_contract.hpp"
 #include "rotary_mock.hpp"
 #include "strix/memory_plan.hpp"
@@ -2078,10 +2079,46 @@ void prefill_identity_plumbing_tests() {
         "unready options never appear in the active identity");
 }
 
+// Receipt contract: hcout16 declares the governed option on every route, but HC output WMMA executes only
+// with a fast prefill pair. Equivalence must therefore never key on the declared mask alone.
+void prefill_identity_equivalence_tests() {
+    const auto route = [](std::vector<std::string> extra) {
+        std::vector<std::string> args{"decoder", "model.gguf", "1", "--numerical-profile",
+            "hc-splitk-f32+q51-q80-a8-down+q5k-a8-gateup+dense-a8-v1", "--known-prefix-window",
+            "--known-prefix-full-rows", "--known-prefix-workspace-budget-bytes", "8589934592",
+            "--known-prefix-host-metadata-budget-bytes", "1073741824", "--known-prefix-uma-budget-bytes",
+            "128849018880", "--known-prefix-host-headroom-bytes", "4294967296", "--known-prefix-prefill-rows", "4096"};
+        args.insert(args.end(), extra.begin(), extra.end());
+        return parse(args);
+    };
+    const auto fast = route({"--prefill-numerical-profile", "fast-prefill-f16wmma-v1"});
+    const auto plain = route({});
+    const auto baseline = route({"--baseline"});
+    expect(numerical_profile_pair(fast).fast_components != 0U && numerical_profile_pair(plain).fast_components == 0U &&
+        numerical_profile_pair(baseline).fast_components == 0U, "routes resolve to one fast and two non-fast prefill pairs");
+    const auto key = [](const Options& o) {
+        std::string cli;
+        for (const auto& arg : effective_prefill_argv(o)) cli += std::to_string(arg.size()) + ":" + arg;
+        return prefix_effective_execution_signature(cli, o.baseline, false, {}, kPrefillOptionsReady);
+    };
+    expect(key(fast) != key(plain) && key(fast) != key(baseline) && key(plain) != key(baseline),
+        "prefix-cache keys of non-fast and baseline routes never equal the fast-pair key under the same declared mask");
+    const auto arithmetic = [](const Options& o, unsigned mask) {
+        return prefill_arithmetic_identity(numerical_profile_pair(o), mask, false);
+    };
+    expect(arithmetic(plain, kPrefillOptionsReady) == arithmetic(plain, 0U) &&
+        arithmetic(baseline, kPrefillOptionsReady) == arithmetic(baseline, 0U),
+        "on non-fast pairs the declared mask is inert in the compiled prefill identity");
+    expect(arithmetic(fast, kPrefillOptionsReady) != arithmetic(fast, 0U) &&
+        arithmetic(fast, kPrefillOptionsReady) != arithmetic(plain, kPrefillOptionsReady),
+        "the session identity follows the executed arithmetic, not the declared name");
+}
+
 int main(int argc, char** arguments) {
     resident_fallback_tests();
     mtp_reservation_arithmetic_tests();
     prefill_identity_plumbing_tests();
+    prefill_identity_equivalence_tests();
     const auto model = ModelContract::qwen38_flash_next();
     gguf::FileInfo info;
     ModelManifest manifest;
