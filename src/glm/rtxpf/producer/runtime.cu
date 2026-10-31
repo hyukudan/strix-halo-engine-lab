@@ -347,7 +347,7 @@ struct Runtime::Impl {
                     persist_note=!tp.refused.empty()?"off: the whole-device plan cannot afford the persistent FP16 copies ("+tp.refused+")"
                         :"off: the persistent FP16 copies would move "+std::to_string(tp.plan.tier.disk-tp2.plan.tier.disk)+" expert units to the file tier";
                     tp=std::move(tp2);}}
-            tile=rows=tp.tile;budget_in=tp.in;const auto& planned=tp.plan;startup_budget=tp.json;
+            spares_reduced=tp.spares_reduced;tile=rows=tp.tile;budget_in=tp.in;const auto& planned=tp.plan;startup_budget=tp.json;
             need(valid_schedule(cap,rows),"capacity 4-aligned <=131072; tile 32-aligned <=min(capacity,32768)");
             startup_budget.set("mode",whole_device?"whole-device caps (--vram-total-gib/--ram-total-gib)":"device room (no whole-device cap)");
             std::cerr<<"INFO decode budget plan: "<<startup_budget.dump()<<"\n";
@@ -403,7 +403,7 @@ struct Runtime::Impl {
         else {for(std::size_t off=0;off<base.bytes;){auto n=std::min<std::size_t>(staging.bytes,base.bytes-off);base.file->read_at(off,staging.p,n);ck(cudaMemcpyAsync(base.device.as<char>()+off,staging.p,n,cudaMemcpyHostToDevice,h2d.s));ck(cudaStreamSynchronize(h2d.s));off+=n;}}
         // Decode allocations precede expert admission: the device budget below
         // is measured after them (session, replay, head, bounded expert slots).
-        dopt=dopts;if(persist_refused)dopt.persistent_dense_fp16=false;if(decode_on)prepare_decode(staging,dopt.expert_tier,floor_gib);
+        dopt=dopts;if(persist_refused)dopt.persistent_dense_fp16=false;if(spares_reduced)dopt.tier_spare_permille=0;if(decode_on)prepare_decode(staging,dopt.expert_tier,floor_gib);
         const auto init=prefill_init(prefill_via_cache);
         if(init.rings){Charge c(ring_part);for(auto& r:ring){r.device.allocate(largest);r.host.allocate(largest,true);}}
         Charge layer_charge("prefill expert layers (resident/pinned) + descriptors");
@@ -676,7 +676,7 @@ struct Runtime::Impl {
     static constexpr const char* persist_part="persistent FP16 shared + dense experts (decode)";
     // Shared experts of layers 3..44 (H x 2048 gate/up, 2048 x H down) and the dense FFNs of 0..2 (H x 12288).
     static constexpr std::uint64_t persist_bytes=42ULL*3*4096*2048*2+3ULL*3*4096*12288*2;
-    bool persist_refused=false;std::string persist_note;
+    bool persist_refused=false;std::string persist_note;bool spares_reduced=false; // the startup plan dropped the spare share (file tier)
     static constexpr const char* staging_part="startup staging + small host buffers";
     // Our host commit (process private bytes minus our WDDM device backing).
     static std::uint64_t process_host_bytes(){const auto c=process_host_commit();need(c.raw_private!=~0ULL,"process memory counters");return c.host;}
@@ -713,11 +713,18 @@ struct Runtime::Impl {
     // by default; activations and workspaces grow with the tile and come out of
     // the expert arena); --row-tile is planned exactly. The refusal of the
     // smallest candidate is returned when none fits.
-    struct TilePlan {unsigned tile=0;WholeDeviceIn in;WholeDevicePlan plan;Json json;std::string refused;};
+    struct TilePlan {unsigned tile=0;WholeDeviceIn in;WholeDevicePlan plan;Json json;std::string refused;bool spares_reduced=false;std::uint64_t file_units_kept_off=0;};
     static TilePlan plan_tile(const Json& m,unsigned cap,unsigned requested,const DecodeOptions& d,std::uint64_t context,std::uint64_t host_avail,std::uint64_t proc,bool rings,std::uint64_t hard){
-        auto one=[&](unsigned t){TilePlan p;p.tile=t;p.in=budget_inputs(m,cap,t,d,context,host_avail,proc,rings);if(!p.in.vram_total)p.in.vram_total=hard;
+        auto with=[&](unsigned t,const DecodeOptions& dd){TilePlan p;p.tile=t;p.in=budget_inputs(m,cap,t,dd,context,host_avail,proc,rings);if(!p.in.vram_total)p.in.vram_total=hard;
             need(p.in.vram_total<=hard,("--vram-total-gib "+gib_text(p.in.vram_total)+" exceeds this device's usable "+gib_text(hard)+" (99.86 GB cap)").c_str());
             p.plan=plan_whole_device(p.in);p.json=whole_device_json(p.in,p.plan);p.refused=plan_refusal(p.in,p.plan,p.json.find("summary")->as_string());return p;};
+        // The arena spare share (placement only) yields to device residents when it would put
+        // expert units on the file tier that the minimum spares keep in device or pinned memory.
+        auto one=[&](unsigned t){auto p=with(t,d);
+            if(p.refused.empty()&&p.plan.tier.disk>0&&d.tier_spare_permille>0){auto d2=d;d2.tier_spare_permille=0;auto p2=with(t,d2);
+                if(p2.refused.empty()&&p2.plan.tier.disk<p.plan.tier.disk){p2.spares_reduced=true;p2.file_units_kept_off=p.plan.tier.disk-p2.plan.tier.disk;
+                    p2.json.set("spare_share_note","the "+std::to_string(d.tier_spare_permille/10)+"% arena spare share would put "+std::to_string(p2.file_units_kept_off)+" more expert units on the file tier: minimum spares");return p2;}}
+            return p;};
         // The trade at a tile: expert arena, residents and the other tiers, as planned.
         auto trade=[&](const TilePlan& p,const char* role){auto x=Json::object();x.set("row_tile",int(p.tile));x.set("role",role);x.set("verdict",p.refused.empty()?"ADMITTED":"REFUSED");
             x.set("tile_dependent_bytes",tile_cost(cap,p.tile));x.set("expert_arena_bytes",p.refused.empty()?p.plan.tier.slots*p.in.tier.unit_bytes:0);x.set("expert_arena_gib",p.refused.empty()?double(p.plan.tier.slots*p.in.tier.unit_bytes)/double(1ULL<<30):0.0);
@@ -735,11 +742,14 @@ struct Runtime::Impl {
         auto tried=Json::array();TilePlan last;
         for(unsigned t=first_tile_candidate(cap,default_max_row_tile);t;t=next_tile_candidate(t)){need(valid_schedule(cap,t),"tile candidate");auto p=one(t);
             const std::uint64_t cost=tile_cost(cap,t),growth=cost>base_cost?cost-base_cost:0;
-            const bool within=t<=base_tile||(base_arena&&tile_growth_within(growth,base_arena));
+            // A larger tile must also keep the file tier no larger than tile 2048 does.
+            const bool off_file=!base.refused.empty()||!p.refused.empty()||p.plan.tier.disk<=base.plan.tier.disk;
+            const bool within=t<=base_tile||(base_arena&&tile_growth_within(growth,base_arena)&&off_file);
             auto x=Json::object();x.set("row_tile",int(t));x.set("activation_plus_workspace_bytes",cost);x.set("growth_over_2048_bytes",growth);
             x.set("growth_share_of_arena_2048",base_arena?double(growth)/double(base_arena):-1.0);
             x.set("expert_arena_bytes",p.refused.empty()?p.plan.tier.slots*p.in.tier.unit_bytes:0);x.set("resident_units",p.plan.tier.resident);
-            x.set("verdict",!p.refused.empty()?"REFUSED (plan)":!within?"REFUSED (growth over 5% of the expert arena)":"CHOSEN");tried.push(x);
+            x.set("file_units",p.plan.tier.disk);
+            x.set("verdict",!p.refused.empty()?"REFUSED (plan)":!off_file?"REFUSED (more expert units on the file tier than tile 2048)":!within?"REFUSED (growth over 5% of the expert arena)":"CHOSEN");tried.push(x);
             if(p.refused.empty()&&within){p.json.set("row_tile",int(t));
                 p.json.set("row_tile_choice","default: the largest tile <= 8192 the whole-device plan admits whose activation + workspace growth over tile 2048 is <= 5% of the expert arena planned at 2048");
                 p.json.set("expert_arena_at_2048_bytes",base_arena);p.json.set("row_tiles_tried",tried);p.json.set("row_tile_components",tile_components(cap));trades(p);return p;}
