@@ -862,7 +862,9 @@ __device__ __forceinline__ void store_key(float4* row, unsigned part, const KeyR
 __device__ __forceinline__ float f16_scaled(std::uint32_t bits16, float s) {
     return __builtin_fmaf(static_cast<float>(__builtin_bit_cast(_Float16, static_cast<std::uint16_t>(bits16))), s, -0.0F);
 }
-template <bool Swizzle>
+// Lean 7: the E4M3 halves as x + (x & 0x4000) with x = byte << 7 (the sign lands on bit 14 and the add carries it to
+// bit 15): the same bits as (c & 0x7F) << 7 | sign << 15 in one instruction less per pair.
+template <bool Swizzle, bool Lean7 = false>
 __device__ __forceinline__ void store_key_lean(float4* row, unsigned part, const KeyRaw& k, bool win, bool valid) {
     const std::uint32_t cw[8] = {k.c0.x, k.c0.y, k.c0.z, k.c0.w, k.c1.x, k.c1.y, k.c1.z, k.c1.w};
     if (valid && win) {
@@ -879,7 +881,12 @@ __device__ __forceinline__ void store_key_lean(float4* row, unsigned part, const
 #pragma unroll
                 for (unsigned t = 0; t < 2; ++t) {   // bytes 2t, 2t + 1 -> f16 halves
                     const std::uint32_t pz = __builtin_amdgcn_perm(0U, w, t == 0U ? 0x0C010C00U : 0x0C030C02U);
-                    h[t] = ((pz & 0x007F007FU) << 7U) | ((pz & 0x00800080U) << 8U);
+                    if constexpr (Lean7) {
+                        const std::uint32_t x = pz << 7U;
+                        h[t] = x + (x & 0x40004000U);
+                    } else {
+                        h[t] = ((pz & 0x007F007FU) << 7U) | ((pz & 0x00800080U) << 8U);
+                    }
                 }
                 row[lds_key_slot<Swizzle>(key_slot(part, i))] = make_float4(f16_scaled(h[0], sv), f16_scaled(h[0] >> 16U, sv),
                                                                             f16_scaled(h[1], sv), f16_scaled(h[1] >> 16U, sv));
@@ -1323,11 +1330,11 @@ __device__ __forceinline__ void attention_chunk_body(const AttentionView& v, con
         if constexpr (Half) {
             f32_tile = __syncthreads_or(store_key_f16(kb[tk], part, raw, t0 + tk < nw, tk < cnt) ? 0 : 1) != 0;
             if (f32_tile) {   // uniform: some value of the tile is not exact in f16: today's f32 tile over the same LDS
-                if constexpr (Lean >= 2U) store_key_lean<Swizzle>(ks[tk], part, raw, t0 + tk < nw, tk < cnt); else store_key<Swizzle>(ks[tk], part, raw, t0 + tk < nw, tk < cnt);
+                if constexpr (Lean >= 2U) store_key_lean<Swizzle, (Lean >= 7U)>(ks[tk], part, raw, t0 + tk < nw, tk < cnt); else store_key<Swizzle>(ks[tk], part, raw, t0 + tk < nw, tk < cnt);
                 __syncthreads();
             }
         } else {
-            if constexpr (Lean >= 2U) store_key_lean<Swizzle>(ks[tk], part, raw, t0 + tk < nw, tk < cnt); else store_key<Swizzle>(ks[tk], part, raw, t0 + tk < nw, tk < cnt);
+            if constexpr (Lean >= 2U) store_key_lean<Swizzle, (Lean >= 7U)>(ks[tk], part, raw, t0 + tk < nw, tk < cnt); else store_key<Swizzle>(ks[tk], part, raw, t0 + tk < nw, tk < cnt);
             __syncthreads();
         }
         DS41_MARK(2U + 2U * ((t0 - j0) / kTile));
@@ -1789,9 +1796,9 @@ int attention_lean_mode = -1;
 void set_attention_lean(int mode) { attention_lean_mode = mode; }
 int attention_lean() {
     // default 2 (softmax/PV + dequant), 1 softmax/PV only, 0 off
-    static const int env = [] { const char* e = std::getenv("STRIX_DS41_ATTN_LEAN"); return e == nullptr || e[0] == 0 ? 2 : e[0] >= '0' && e[0] <= '6' ? e[0] - '0' : 2; }();
+    static const int env = [] { const char* e = std::getenv("STRIX_DS41_ATTN_LEAN"); return e == nullptr || e[0] == 0 ? 2 : e[0] >= '0' && e[0] <= '7' ? e[0] - '0' : 2; }();
     const int m = attention_lean_mode < 0 ? env : attention_lean_mode;
-    return m > 6 ? 6 : m;
+    return m > 7 ? 7 : m;
 }
 static void check_fold(const AttentionView& v) {
     if ((v.kv == nullptr) != (v.ring_out == nullptr) || (v.kv != nullptr && (v.kv_norm == nullptr || v.ring_out != v.ring || v.rows > kMaxRows)))
@@ -1841,7 +1848,8 @@ void enqueue_attention(const AttentionView& v_in, hipStream_t stream) {
     check_fold(v);
     const bool fold = v.kv != nullptr;
     const int lean = attention_lean();
-    if (lean == 6) enqueue_attention_form<6>(v, fold, stream);
+    if (lean == 7) enqueue_attention_form<7>(v, fold, stream);
+    else if (lean == 6) enqueue_attention_form<6>(v, fold, stream);
     else if (lean == 5) enqueue_attention_form<5>(v, fold, stream);
     else if (lean == 4) enqueue_attention_form<4>(v, fold, stream);
     else if (lean == 3) enqueue_attention_form<3>(v, fold, stream);
@@ -1958,7 +1966,8 @@ void enqueue_attention_segments(std::span<const AttentionView> views, hipStream_
         if ((v.kv != nullptr) != fold) throw std::invalid_argument("ds41 attention segments: window fold on some segments only");
     }
     const int lean = attention_lean();
-    if (lean == 6) enqueue_attention_segments_form<6>(views, fold, stream);
+    if (lean == 7) enqueue_attention_segments_form<7>(views, fold, stream);
+    else if (lean == 6) enqueue_attention_segments_form<6>(views, fold, stream);
     else if (lean == 5) enqueue_attention_segments_form<5>(views, fold, stream);
     else if (lean == 4) enqueue_attention_segments_form<4>(views, fold, stream);
     else if (lean == 3) enqueue_attention_segments_form<3>(views, fold, stream);
