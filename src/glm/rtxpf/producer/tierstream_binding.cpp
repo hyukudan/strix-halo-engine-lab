@@ -72,7 +72,9 @@ public:
         ts_dg_stats s{};s.struct_size=sizeof s;if(ts_stats_dg(h_.ctx,&s)!=TS_OK){const char* e=ts_last_error();j.set("stats_error",std::string(e?e:"stats failed"));return j;}
         j.set("tokens",s.tokens);j.set("device_timeouts",s.device_timeouts);j.set("stalled",s.stalled);j.set("miss_layers",s.miss_layers);j.set("lookups",s.lookups);j.set("misses",s.misses);
         j.set("covered_waits",s.covered_waits);j.set("fetched",s.fetched);j.set("prefetched",s.prefetched);j.set("free_slots",s.free_slots);j.set("slots",s.slots);j.set("blocks",s.blocks);
-        j.set("wb_forced",s.wb_forced);j.set("wb_outstanding_bytes",s.wb_outstanding_bytes);return j;}
+        j.set("wb_forced",s.wb_forced);j.set("wb_outstanding_bytes",s.wb_outstanding_bytes);
+        // The library's view of the CUDA module loading mode at open (0 unknown, 1 eager, 2 lazy).
+        j.set("cuda_module_loading",s.cuda_module_loading==1?"eager":s.cuda_module_loading==2?"lazy":"unknown");return j;}
     TierView view()const override{return view_;}
     void reset_open()override{ts_ok(ts_dg_reset_open(h_.ctx),"reset_open");before_=read();plan_.reset();}
     // Prefill through the cache (SS_DG_MAKE_RESIDENT): between

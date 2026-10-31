@@ -868,6 +868,7 @@ struct Runtime::Impl {
         tier_plan.set("unit_file",dopt.unit_file);tier_plan.set("unit_file_sha256",unit_file_sha);tier_plan.set("unit_manifest_sha256",dopt.unit_manifest_sha256);
         {auto c=ts_tier->census(compute.s);for(const auto& l:c.find("layers")->as_array())ts_tier->open_persistent.push_back(std::uint32_t(l.find("persistent")->as_int()));
          tier_plan.set("slot_census_at_open",c);} // homes per gated layer as the cache opened
+        if(auto diag=ts_tier->api->diagnostics();diag.find("cuda_module_loading"))tier_plan.set("tierstream_cuda_module_loading",diag.find("cuda_module_loading")->as_string());
         tier_plan.set("restore_decode_residency",dopt.restore_decode_residency?"on: the open placement is made resident again after every prefill through the cache":"off");
         tier_plan.set("unit_file_authenticated",unit_auth_how);tier_plan.set("unit_file_binding",binding_text);tier_plan.set("unit_file_bound_path",bound_path);tier_plan.set("unit_file_hash_ms",unit_hash_ms);tier_plan.set("reference_compare",reference_tier!=nullptr);tier_plan.set("unit_stride",stride);tier_plan.set("resident_units",b.resident);tier_plan.set("pinned_units",b.pinned);tier_plan.set("file_units",b.disk);
         tier_plan.set("arena_slots",b.slots+b.ring);tier_plan.set("spare_slots",b.spare_slots);tier_plan.set("host_spares",b.host_spares);tier_plan.set("disk_staging",b.staging);tier_plan.set("three_tier",b.three_tier);

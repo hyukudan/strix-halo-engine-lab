@@ -20,15 +20,15 @@ or routes.
 - Windows 10/11, Visual Studio 2022 (MSVC, x64), CUDA 13.0, CMake >= 3.24,
   Ninja, Python 3.11+ and PowerShell 7 (`pwsh`).
 - [tierstream](https://github.com/hyukudan/tierstream) at commit
-  [`f6e4167044e40922deceb769fa5bf7b78ebba004`](https://github.com/hyukudan/tierstream/commit/f6e4167044e40922deceb769fa5bf7b78ebba004).
+  [`602702b4e5138df5fffc9dbb22091737e84e374f`](https://github.com/hyukudan/tierstream/commit/602702b4e5138df5fffc9dbb22091737e84e374f).
   The build takes it as a plain source export with a `STAMP` file naming that
   commit (configuration refuses any other commit):
 
   ```powershell
   git clone https://github.com/hyukudan/tierstream.git tierstream-src
   mkdir TIERSTREAM_DIR
-  git -C tierstream-src archive --format=tar f6e4167044e40922deceb769fa5bf7b78ebba004 | tar -x -C TIERSTREAM_DIR
-  Set-Content TIERSTREAM_DIR/STAMP f6e4167044e40922deceb769fa5bf7b78ebba004
+  git -C tierstream-src archive --format=tar 602702b4e5138df5fffc9dbb22091737e84e374f | tar -x -C TIERSTREAM_DIR
+  Set-Content TIERSTREAM_DIR/STAMP 602702b4e5138df5fffc9dbb22091737e84e374f
   ```
 
 - CUTLASS 4.2.1 headers. CMake downloads the pinned release and checks its
