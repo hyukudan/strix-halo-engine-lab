@@ -539,16 +539,18 @@ Prefill (tok/s; todos los perfiles usan prefill exacto):
 
 | Prompt | `default` | `fast` | `quality` | llama.cpp |
 |---|---:|---:|---:|---:|
-| 512 | 471 | 474 | 236 | 2,065 |
-| 2K | 466 | 458 | 225 | 2,052 |
-| 8K | 429 | 414 | 173 | 1,873 |
-| 16K | 404 | 403 | 64 | 1,684 |
-| 32K | 358 | 355 | no medido | 1,373 |
+| 512 | 471 | 474 | 768 | 2,065 |
+| 2K | 466 | 458 | 769 | 2,052 |
+| 8K | 429 | 414 | 701 | 1,873 |
+| 16K | 404 | 403 | 618 | 1,684 |
+| 32K | 358 | 355 | 520 | 1,373 |
 
-El prefill exacto usa aritmética FP32 sin contracción y alcanza aproximadamente una cuarta parte de la velocidad de
-llama.cpp. El prefill WMMA del perfil `fast` está pendiente de cualificación y no se aplica; el prefill de `quality`
-sigue ejecutándose en fragmentos de ocho filas y se ralentiza con contexto largo. En C4/C8, `default` queda por debajo
-de llama.cpp y `fast` por encima.
+El prefill exacto usa aritmética FP32 sin contracción: `default` y `fast` alcanzan aproximadamente una cuarta parte
+de la velocidad de llama.cpp, y `quality` (EXL3, prefill exacto de muchas filas) alrededor del 37-38 % en todas
+las longitudes. La columna `quality` se midió en una sesión posterior, en la que llama.cpp dio
+2,048 / 2,053 / 1,875 / 1,664 / 1,371 tok/s; `STRIX_G4_PREFILL_EXACT_MANYROW=0` restaura las pasadas de ocho filas
+con los mismos bytes. El prefill WMMA del perfil `fast` está pendiente de cualificación y no se aplica. En C4/C8,
+`default` queda por debajo de llama.cpp y `fast` por encima.
 
 Comandos de llama.cpp: C1 `llama-bench -m Q4_K_M.gguf -fa 1 -ngl 99 -n 128 -p 0 -r 3`; C4/C8
 `llama-batched-bench -m Q4_K_M.gguf -fa on -ngl 99 -c 2048 -npp 64 -ntg 32 -npl 1,4,8`; prefill

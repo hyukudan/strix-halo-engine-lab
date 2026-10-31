@@ -36,6 +36,20 @@ if(STRIX_ENABLE_HIP_RUNTIME)
     set_target_properties(strix-gemma4-exl3-device-tests PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES gfx1151)
     target_compile_options(strix-gemma4-exl3-device-tests PRIVATE -mno-wavefrontsize64 -fno-fast-math -ffp-contract=off
         -fhip-fp32-correctly-rounded-divide-sqrt -fdenormal-fp-math=ieee -fno-gpu-flush-denormals-to-zero -fno-rounding-math)
+    # EXL3 many-row cores: byte gate against the eight-row device linears per identity.
+    add_executable(strix-gemma4-exl3-rows-tests tests/gemma4_exl3/rows.hip)
+    target_link_libraries(strix-gemma4-exl3-rows-tests PRIVATE strix_gemma4_prefill)
+    set_source_files_properties(tests/gemma4_exl3/rows.hip PROPERTIES COMPILE_OPTIONS "-fno-rounding-math")
+    set_target_properties(strix-gemma4-exl3-rows-tests PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES gfx1151)
+    target_compile_options(strix-gemma4-exl3-rows-tests PRIVATE -mno-wavefrontsize64 -fno-fast-math -ffp-contract=off
+        -fhip-fp32-correctly-rounded-divide-sqrt -fdenormal-fp-math=ieee -fno-gpu-flush-denormals-to-zero -fno-rounding-math)
+    if(BUILD_TESTING)
+        foreach(version v1 v2 v3)
+            add_test(NAME strix-gemma4-exl3-rows-${version}-tests COMMAND strix-gemma4-exl3-rows-tests)
+            set_tests_properties(strix-gemma4-exl3-rows-${version}-tests PROPERTIES TIMEOUT 120 LABELS "gpu;gemma4"
+                ENVIRONMENT "STRIX_G4_EXL3_IDENTITY=${version}")
+        endforeach()
+    endif()
     add_executable(strix-gemma4-exl3-bench tests/gemma4_exl3/bench.hip)
     target_link_libraries(strix-gemma4-exl3-bench PRIVATE strix_gemma4_prefill)
     set_source_files_properties(tests/gemma4_exl3/bench.hip PROPERTIES COMPILE_OPTIONS "-fno-rounding-math")

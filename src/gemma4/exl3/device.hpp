@@ -25,6 +25,14 @@ void device_linear_group(const LinearView* w, unsigned count, const float* x, un
 enum class CoreRoute : unsigned { automatic, legacy, lane8, lane4, staged8, staged4 };
 void device_core(LinearView w, const void* transformed, unsigned rows, float* out, std::uint32_t* failure,
                  CoreRoute route, gpu::Queue queue = nullptr);
+// Many-row exact linear for prompt chunks (rows > 8): the bytes equal
+// device_linear over consecutive slices of at most eight rows under the
+// process identity (v1 lane order or v2/v3 split order). scratch holds
+// rows_scratch_bytes(w, rows). Returns false (nothing enqueued) for rows <= 8
+// or with STRIX_G4_PREFILL_EXACT_MANYROW=0; callers then use device_linear.
+[[nodiscard]] std::size_t rows_scratch_bytes(LinearView w, unsigned rows);
+bool device_linear_rows(LinearView w, const float* x, unsigned rows, float* out, void* scratch, std::size_t scratch_bytes,
+                        std::uint32_t* failure, gpu::Queue queue = nullptr);
 // Input transform only: rows*inputs FP16 values into scratch (tests/benchmarks).
 void device_input(LinearView w, const float* x, unsigned rows, void* scratch, std::uint32_t* failure, gpu::Queue queue = nullptr);
 // Writes the lane-tile packed decode of all 65,536 states (FP16 bits) for tests.

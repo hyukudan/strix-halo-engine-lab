@@ -1,6 +1,7 @@
 #include "device.hpp"
 #include "validation.hpp"
 #include "gemma4/kernels/rows_linear.hpp"
+#include "gemma4/exl3/device.hpp"
 #include <hip/hip_runtime.h>
 #include <cstdlib>
 #include <string_view>
@@ -59,7 +60,7 @@ struct DevicePrefill::Impl {
     std::map<const std::uint8_t*, std::unique_ptr<PreparedLinear>> prepared;
     Buffer sliding, global, residual, x, q, k, v, att, out, gate, up, ple, logits, taps;
     Buffer tokens, positions, reads, writes, scores, maxima, partials, failure, halves, maximum, attention_halves, global_halves, pair_halves, last_row;
-    Buffer canonical_scores, canonical_denominators, canonical_packed;
+    Buffer canonical_scores, canonical_denominators, canonical_packed, exl3_scratch;
     unsigned table_positions = 0, stride = 0;
     std::vector<Range> ranges;
     std::map<std::string, float> range_maxima;
@@ -111,12 +112,27 @@ struct DevicePrefill::Impl {
                                failure.as<unsigned>(), maximum.as<unsigned>() + index, queue);
         });
     }
+    // g4-v1 rows linear, or the EXL3 pack's own identity: many-row core for
+    // chunks, its eight-row decode linear otherwise (same bytes either way).
+    void exact_linear(LinearView matrix, const float* input, unsigned rows, float* output) {
+        if (matrix.format != WeightFormat::exl3_mul1) {
+            gpu::linear_rows(matrix, input, rows, output, queue, failure.as<unsigned>());
+            return;
+        }
+        const auto bytes = std::max(exl3::device_scratch_bytes, exl3::rows_scratch_bytes(matrix, rows));
+        if (exl3_scratch.size() < bytes) exl3_scratch.resize(bytes);
+        if (exl3::device_linear_rows(matrix, input, rows, output, exl3_scratch.data(), exl3_scratch.size(), failure.as<unsigned>(), queue))
+            return;
+        for (unsigned r = 0; r < rows; r += 8)
+            exl3::device_linear(matrix, input + std::size_t(r) * matrix.inputs, std::min(8U, rows - r),
+                                output + std::size_t(r) * matrix.outputs, exl3_scratch.data(), failure.as<unsigned>(), true, queue);
+    }
     void dot(const std::string& name, LinearView matrix, const float* input, float* output, unsigned rows, bool preconverted = false) {
         const auto index = unsigned(ranges.size());
         ranges.push_back({name, 0.0F});
         const auto before = stats.linear_ms;
         if (stats.linears == Linears::exact) {
-            timing(stats.linear_ms, [&] { gpu::linear_rows(matrix, input, rows, output, queue, failure.as<unsigned>()); });
+            timing(stats.linear_ms, [&] { exact_linear(matrix, input, rows, output); });
             if (profile) {
                 auto& p = stats.kernels[name]; ++p.calls; p.ms += stats.linear_ms - before; p.matrix_ms += stats.linear_ms - before;
                 p.flops += 2.0 * rows * matrix.inputs * matrix.outputs;
@@ -340,8 +356,14 @@ ChunkResult DevicePrefill::forward(KvTxn& transaction, std::span<const unsigned>
                 // The decode target's gate_up: gelu_tanh(gate) * up stored per element.
                 b.ranges.push_back({name + "gate", 0.0F}); b.ranges.push_back({name + "up", 0.0F});
                 b.timing(b.stats.linear_ms, [&] {
-                    gpu::gate_up_rows(y.gate, y.up, b.x.as<float>(), n, b.gate.as<float>(), b.queue, b.failure.as<unsigned>(),
-                                      gpu::rows_linear_enabled(), -1, b.up.as<float>());
+                    if (y.gate.format == WeightFormat::exl3_mul1 || y.up.format == WeightFormat::exl3_mul1) {
+                        // EXL3 packs: separate linears, then the decode target's gelu product.
+                        b.exact_linear(y.gate, b.x.as<float>(), n, b.gate.as<float>());
+                        b.exact_linear(y.up, b.x.as<float>(), n, b.up.as<float>());
+                        gpu::gelu_product(b.gate.as<float>(), b.up.as<float>(), n * c.inter, b.queue);
+                    } else
+                        gpu::gate_up_rows(y.gate, y.up, b.x.as<float>(), n, b.gate.as<float>(), b.queue, b.failure.as<unsigned>(),
+                                          gpu::rows_linear_enabled(), -1, b.up.as<float>());
                 });
                 b.dot(name + "down", y.down, b.gate.as<float>(), b.out.as<float>(), n);
             } else if (b.fused(y.gate, y.up, y.down)) {

@@ -698,6 +698,11 @@ unsigned lane_groups(LinearView w, unsigned rows) {
 }
 // DRAM-cold operator measurements: staged windows help up to two rows;
 // direct half-tile windows are as fast or faster beyond. STRIX_G4_EXL3_STAGED=0 disables.
+// STRIX_G4_PREFILL_EXACT_MANYROW=0 keeps EXL3 prompt chunks on the eight-row passes.
+bool rows_enabled() {
+    static const bool enabled = env_on("STRIX_G4_PREFILL_EXACT_MANYROW");
+    return enabled;
+}
 bool lane_staged(unsigned rows) {
     static const bool enabled = env_on("STRIX_G4_EXL3_STAGED");
     return enabled && rows <= 2;
@@ -1040,6 +1045,205 @@ void device_linear_group(const LinearView* w, unsigned count, const float* x, un
         hipLaunchKernelGGL(output_group_kernel, dim3((rows * (outputs / 128) + 3) / 4, count), dim3(128), 0, q, g, rows, failure);
         checked();
     }
+}
+namespace {
+// Many-row cores for prompt chunks. Every output keeps its identity's order:
+// v1 is lane_body's (lane l owns chunks l mod 32, e ascending, one exact FP16
+// product per FP32 add, then the lane butterfly); v2/v3 is coop_body's (split
+// ranges, lanes a = 0..3 over (2a, 2a+1, 2a+8, 2a+9), quad reduction, split
+// sum in increasing order). A workgroup decodes each lane's coefficients once
+// and applies them to R rows whose transformed FP16 inputs are staged in LDS.
+// No row affects another row's value, so the bytes equal the eight-row passes.
+constexpr unsigned rows_v1 = 16, rows_v2 = 32;
+// One K block (32 chunks) of one lane's half tile against R staged rows; the
+// pair layout [row][e/2][lane] gives each lane its own consecutive word.
+template <unsigned K, unsigned R, unsigned G0>
+__device__ __forceinline__ void rows_lane_block(const std::uint32_t* tile, const std::uint32_t* staged, unsigned lane,
+                                                float (&acc)[4][2][R]) {
+    LaneTile<K, 4, G0> current;
+    current.load(tile);
+    unrolled<8>([&]<unsigned P>() {
+        float wl[2][4], wh[2][4];
+        unrolled<2>([&]<unsigned E>() {
+            unrolled<4>([&]<unsigned g>() {
+                wl[E][g] = float(codebook_half(current.template state<position_of(2 * P + E, G0 + g)>()));
+                wh[E][g] = float(codebook_half(current.template state<position_of(2 * P + E, G0 + g + 8)>()));
+            });
+        });
+#pragma unroll
+        for (unsigned r = 0; r < R; ++r) {
+            const std::uint32_t pair = staged[(r * 8 + P) * 32 + lane];
+            const float in0 = float(__builtin_bit_cast(_Float16, std::uint16_t(pair))),
+                        in1 = float(__builtin_bit_cast(_Float16, std::uint16_t(pair >> 16U)));
+#pragma unroll
+            for (unsigned g = 0; g < 4; ++g) {
+                acc[g][0][r] = __builtin_fmaf(wl[0][g], in0, acc[g][0][r]);
+                acc[g][1][r] = __builtin_fmaf(wh[0][g], in0, acc[g][1][r]);
+            }
+#pragma unroll
+            for (unsigned g = 0; g < 4; ++g) {
+                acc[g][0][r] = __builtin_fmaf(wl[1][g], in1, acc[g][0][r]);
+                acc[g][1][r] = __builtin_fmaf(wh[1][g], in1, acc[g][1][r]);
+            }
+        }
+    });
+}
+// Eight waves = four 16-output tile columns (two half tiles each) x R rows.
+template <unsigned K, unsigned R>
+__global__ __launch_bounds__(256) void rows_lane_kernel(LinearView w, const _Float16* x, unsigned rows, float* out,
+                                                        unsigned* failure) {
+    __shared__ std::uint32_t staged[R * 8 * 32];
+    const unsigned wave = threadIdx.x / 32, lane = threadIdx.x % 32, row0 = blockIdx.x * R;
+    const unsigned n = blockIdx.y * 4 + wave / 2, chunks = w.inputs / 16, tiles = w.outputs / 16;
+    const bool active_tile = n < tiles;
+    const auto* core = reinterpret_cast<const std::uint32_t*>(w.data + 2ULL * (w.inputs + w.outputs));
+    const auto* words = reinterpret_cast<const std::uint32_t*>(x);
+    float acc[4][2][R] = {};
+    for (unsigned b = 0; b < (chunks + 31) / 32; ++b) {
+        __syncthreads();
+#pragma unroll
+        for (unsigned i = 0; i < R * 8 * 32 / 256; ++i) {
+            // Global order (row, lane, pair) keeps the loads contiguous.
+            const unsigned j = threadIdx.x + 256 * i, r = j / 256, l = (j / 8) % 32, p = j % 8, c = b * 32 + l;
+            if (c < chunks)
+                staged[(r * 8 + p) * 32 + l] = words[(std::size_t(min(row0 + r, rows - 1)) * w.inputs + c * 16) / 2 + p];
+        }
+        __syncthreads();
+        const unsigned c = b * 32 + lane;
+        if (active_tile && c < chunks) {
+            const auto* tile = core + (std::size_t(c) * tiles + n) * (8 * K);
+            if (wave & 1U) rows_lane_block<K, R, 4>(tile, staged, lane, acc);
+            else rows_lane_block<K, R, 0>(tile, staged, lane, acc);
+        }
+    }
+    if (!active_tile) return;
+    const unsigned g0 = (wave & 1U) * 4;
+#pragma unroll
+    for (unsigned g = 0; g < 4; ++g)
+#pragma unroll
+        for (unsigned h = 0; h < 2; ++h)
+#pragma unroll
+            for (unsigned r = 0; r < R; ++r) {
+                auto value = acc[g][h][r];
+                for (unsigned d = 16; d; d >>= 1U) value = value + __shfl_down(value, d, 32);
+                if (!lane && row0 + r < rows) {
+                    out[std::size_t(row0 + r) * w.outputs + n * 16 + g0 + g + 8 * h] = value;
+                    flag(value, failure);
+                }
+            }
+}
+// Eight waves = eight tile columns (128 outputs) of one split x R rows. Chunks
+// of the split are staged 32 at a time as [row][chunk][pair].
+template <unsigned K, unsigned R>
+__global__ __launch_bounds__(256) void rows_coop_kernel(LinearView w, const _Float16* x, unsigned rows, float* out,
+                                                        float* partial, unsigned splits, unsigned* failure) {
+    __shared__ std::uint32_t staged[R * 32 * 8];
+    const unsigned wave = threadIdx.x / 32, lane = threadIdx.x % 32, row0 = blockIdx.x * R;
+    const unsigned tile = blockIdx.y * 8 + wave, split = blockIdx.z, tiles = w.outputs / 16;
+    const unsigned a = lane & 3U, column = lane >> 2U, chunks = w.inputs / 16, span = chunks / splits;
+    const unsigned begin = split * span, end = begin + span;
+    const bool active_tile = tile < tiles;
+    const auto* core = reinterpret_cast<const std::uint32_t*>(w.data + 2ULL * (w.inputs + w.outputs));
+    const auto* words = reinterpret_cast<const std::uint32_t*>(x);
+    float acc[2][R] = {};
+    for (unsigned k0 = begin; k0 < end; k0 += 32) {
+        const unsigned count = min(32U, end - k0);
+        __syncthreads();
+#pragma unroll
+        for (unsigned i = 0; i < R * 32 * 8 / 256; ++i) {
+            const unsigned j = threadIdx.x + 256 * i, r = j / 256, kk = (j / 8) % 32, p = j % 8;
+            if (kk < count)
+                staged[(r * 32 + kk) * 8 + p] = words[(std::size_t(min(row0 + r, rows - 1)) * w.inputs + (k0 + kk) * 16) / 2 + p];
+        }
+        __syncthreads();
+        if (!active_tile) continue;
+        for (unsigned kk = 0; kk < count; ++kk) {
+            CoopLane<K> t;
+            t.load(core + (std::size_t(k0 + kk) * tiles + tile) * (8 * K), lane);
+            const float c0 = float(codebook_half(t.template state<0>())), c1 = float(codebook_half(t.template state<1>()));
+            const float c2 = float(codebook_half(t.template state<2>())), c3 = float(codebook_half(t.template state<3>()));
+            const float c4 = float(codebook_half(t.template state<4>())), c5 = float(codebook_half(t.template state<5>()));
+            const float c6 = float(codebook_half(t.template state<6>())), c7 = float(codebook_half(t.template state<7>()));
+#pragma unroll
+            for (unsigned r = 0; r < R; ++r) {
+                const std::uint32_t low = staged[(r * 32 + kk) * 8 + a], high = staged[(r * 32 + kk) * 8 + a + 4];
+                const float x0 = float(__builtin_bit_cast(_Float16, std::uint16_t(low))),
+                            x1 = float(__builtin_bit_cast(_Float16, std::uint16_t(low >> 16U)));
+                const float x8 = float(__builtin_bit_cast(_Float16, std::uint16_t(high))),
+                            x9 = float(__builtin_bit_cast(_Float16, std::uint16_t(high >> 16U)));
+                acc[0][r] = __builtin_fmaf(c0, x0, acc[0][r]); acc[0][r] = __builtin_fmaf(c1, x1, acc[0][r]);
+                acc[0][r] = __builtin_fmaf(c2, x8, acc[0][r]); acc[0][r] = __builtin_fmaf(c3, x9, acc[0][r]);
+                acc[1][r] = __builtin_fmaf(c4, x0, acc[1][r]); acc[1][r] = __builtin_fmaf(c5, x1, acc[1][r]);
+                acc[1][r] = __builtin_fmaf(c6, x8, acc[1][r]); acc[1][r] = __builtin_fmaf(c7, x9, acc[1][r]);
+            }
+        }
+    }
+    if (!active_tile) return;
+#pragma unroll
+    for (unsigned h = 0; h < 2; ++h)
+#pragma unroll
+        for (unsigned r = 0; r < R; ++r) {
+            acc[h][r] = acc[h][r] + __shfl_down(acc[h][r], 2, 4);
+            acc[h][r] = acc[h][r] + __shfl_down(acc[h][r], 1, 4);
+        }
+#pragma unroll
+    for (unsigned h = 0; h < 2; ++h)
+#pragma unroll
+        for (unsigned r = 0; r < R; ++r) {
+            const float v = acc[h][r];
+            if (!a && row0 + r < rows) {
+                const auto o = tile * 16 + column + 8 * h;
+                if (splits == 1) { out[std::size_t(row0 + r) * w.outputs + o] = v; flag(v, failure); }
+                else partial[(std::size_t(split) * rows + row0 + r) * w.outputs + o] = v;
+            }
+        }
+}
+std::size_t transformed_bytes(LinearView w, unsigned rows) {
+    return (std::size_t(rows) * w.inputs * sizeof(_Float16) + 255) / 256 * 256;
+}
+} // namespace
+std::size_t rows_scratch_bytes(LinearView w, unsigned rows) {
+    const unsigned splits = v2_active() ? v2_splits(w.inputs, w.outputs) : 1U;
+    return transformed_bytes(w, rows) + (splits > 1 ? std::size_t(splits) * rows * w.outputs * sizeof(float) : 0);
+}
+bool device_linear_rows(LinearView w, const float* x, unsigned rows, float* out, void* scratch, std::size_t scratch_bytes,
+                        unsigned* failure, gpu::Queue queue) {
+    if (!rows_enabled() || rows <= 8 || !geometry(w)) return false;
+    if (!x || !out || !scratch || !failure || scratch_bytes < rows_scratch_bytes(w, rows))
+        throw std::invalid_argument("EXL3 many-row arguments");
+    const auto q = static_cast<hipStream_t>(queue);
+    auto* transformed = static_cast<_Float16*>(scratch);
+    hipLaunchKernelGGL(input_kernel, dim3((rows * (w.inputs / 128) + 3) / 4), dim3(128), 0, q, w, x, rows, transformed,
+                       failure, nullptr);
+    checked();
+    if (v2_active()) {
+        const unsigned splits = v2_splits(w.inputs, w.outputs);
+        auto* partial = reinterpret_cast<float*>(static_cast<std::uint8_t*>(scratch) + transformed_bytes(w, rows));
+        const dim3 grid((rows + rows_v2 - 1) / rows_v2, (w.outputs / 16 + 7) / 8, splits);
+        switch (bits(w)) {
+#define G4_EXL3_RC(K) case K: hipLaunchKernelGGL((rows_coop_kernel<K, rows_v2>), grid, dim3(256), 0, q, w, transformed, rows, out, partial, splits, failure); break
+            G4_EXL3_RC(4); G4_EXL3_RC(5); G4_EXL3_RC(6); G4_EXL3_RC(8);
+#undef G4_EXL3_RC
+        }
+        checked();
+        if (splits > 1)
+            hipLaunchKernelGGL(coop_output_kernel, dim3((rows * (w.outputs / 128) + 3) / 4), dim3(128), 0, q, w, partial, splits,
+                               out, rows, failure);
+        else
+            hipLaunchKernelGGL(output_kernel, dim3((rows * (w.outputs / 128) + 3) / 4), dim3(128), 0, q, w, out, rows, failure);
+        checked();
+        return true;
+    }
+    const dim3 grid((rows + rows_v1 - 1) / rows_v1, (w.outputs / 16 + 3) / 4);
+    switch (bits(w)) {
+#define G4_EXL3_RL(K) case K: hipLaunchKernelGGL((rows_lane_kernel<K, rows_v1>), grid, dim3(256), 0, q, w, transformed, rows, out, failure); break
+        G4_EXL3_RL(4); G4_EXL3_RL(5); G4_EXL3_RL(6); G4_EXL3_RL(8);
+#undef G4_EXL3_RL
+    }
+    checked();
+    hipLaunchKernelGGL(output_kernel, dim3((rows * (w.outputs / 128) + 3) / 4), dim3(128), 0, q, w, out, rows, failure);
+    checked();
+    return true;
 }
 void device_prefill(LinearView w, const float* x, unsigned rows, float* out, void* scratch,
                     unsigned* failure, unsigned* maximum, const void* panels, gpu::Queue queue, void* converted_event) {

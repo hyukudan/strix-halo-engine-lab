@@ -528,15 +528,17 @@ Prefill (tok/s; every profile uses exact prefill):
 
 | Prompt | `default` | `fast` | `quality` | llama.cpp |
 |---|---:|---:|---:|---:|
-| 512 | 471 | 474 | 236 | 2,065 |
-| 2K | 466 | 458 | 225 | 2,052 |
-| 8K | 429 | 414 | 173 | 1,873 |
-| 16K | 404 | 403 | 64 | 1,684 |
-| 32K | 358 | 355 | not measured | 1,373 |
+| 512 | 471 | 474 | 768 | 2,065 |
+| 2K | 466 | 458 | 769 | 2,052 |
+| 8K | 429 | 414 | 701 | 1,873 |
+| 16K | 404 | 403 | 618 | 1,684 |
+| 32K | 358 | 355 | 520 | 1,373 |
 
-Exact prefill uses FP32 arithmetic without contraction and is about a quarter of llama.cpp's speed. The `fast`
-profile's WMMA prefill is pending qualification and is not applied; `quality` prefill still runs in eight-row pieces
-and slows down at long context. `default` C4/C8 is below llama.cpp; `fast` is above it.
+Exact prefill uses FP32 arithmetic without contraction: `default` and `fast` reach about a quarter of llama.cpp's
+speed, `quality` (EXL3, exact many-row prefill) about 37-38 % at every length. The `quality` column was
+measured in a later session, where llama.cpp gave 2,048 / 2,053 / 1,875 / 1,664 / 1,371 tok/s;
+`STRIX_G4_PREFILL_EXACT_MANYROW=0` restores the eight-row passes with the same bytes. The `fast` profile's WMMA
+prefill is pending qualification and is not applied. `default` C4/C8 is below llama.cpp; `fast` is above it.
 
 llama.cpp commands: C1 `llama-bench -m Q4_K_M.gguf -fa 1 -ngl 99 -n 128 -p 0 -r 3`; C4/C8
 `llama-batched-bench -m Q4_K_M.gguf -fa on -ngl 99 -c 2048 -npp 64 -ntg 32 -npl 1,4,8`; prefill
