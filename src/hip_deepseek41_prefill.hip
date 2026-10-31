@@ -2615,16 +2615,17 @@ PrefillResult DevicePrefill::run_from(std::span<const std::uint32_t> tokens, std
                     const std::uint32_t nmax = std::max(np, no);
                     const std::size_t half_bytes = std::size_t{nmax} * H * 4U;
                     const dist::Tag half_tag{static_cast<std::uint32_t>(dist::TagKind::half_sum), layer, 0U};
-                    // a task parks only at a boundary its grant runs out at; the message must not be in flight across a park
-                    // (the scheduler may run other exchanges then): staged only if this layer's MoE units all run now
-                    const bool staged = m.staged_half && nmax > 0U &&
-                                        (m.task == nullptr || m.moe_joint || T <= m.joint_max_rows ||
-                                         m.task->runs_through(PrefillUnitLevel::finest, pieces(np) + pieces(no) + 1U));
-                    float* peer_half = m.half_other.p;
-                    if (staged) {
-                        peer_half = static_cast<float*>(m.options.communicator->send_staging(half_bytes));
-                        if (peer_half == nullptr) throw std::logic_error("deepseek41 prefill: no staging buffer for the half sums");
-                    }
+                    // A task parks only at a boundary its grant runs out at, and the scheduler may then run other exchanges
+                    // (which also write the send buffer the peer half sums would build up in): staged only if every MoE unit
+                    // of this layer runs now (same unit and grant on both ranks), and if this size takes the host path
+                    // (the same route table on both ranks); otherwise the copy path through half_other / half_recv.
+                    float* peer_half = m.staged_half && nmax > 0U &&
+                                               (m.task == nullptr || m.moe_joint || T <= m.joint_max_rows ||
+                                                m.task->runs_through(PrefillUnitLevel::finest, pieces(np) + pieces(no) + 1U))
+                                           ? static_cast<float*>(m.options.communicator->send_staging(half_bytes))
+                                           : nullptr;
+                    const bool staged = peer_half != nullptr;
+                    if (!staged) peer_half = m.half_other.p;
                     if (m.moe_joint || T <= m.joint_max_rows) {  // one expert pass over [peer rows; own rows], the peer rows' half sums first
                         cut(PrefillUnitLevel::finest, s.layer, "moe.joint");
                         moe.enqueue_half_joint(pin, in, moe_half, peer_half, m.half_own.p, st, m.half_ready[0]);
