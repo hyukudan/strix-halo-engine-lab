@@ -123,6 +123,7 @@ El comando produce un recibo JSON con los IDs de token y los tiempos. Los ficher
 | DeepSeek V4.1 Flash, RTX independiente | RTX PRO 6000 (96 GB, Windows WDDM) | **Production** | Expertos GGUF Q2, densos Q8_0; VRAM exclusiva + caché en memoria de host fijada (pinned); DSpark en la GPU con el controlador caliente seleccionado como opción especulativa predeterminada |
 | MiniMax M3.1 Flash (EXL3, 3.06 bpw) | 2 nodos TP2 sobre USB4 | **Production** | Gate de calidad de ocho textos superado; prefill/decode exactos; admisión automática de DSpark en el servicio y modo MSA 5; valores predeterminados de prefill/intercambio activados |
 | GLM-5.3 Flash (EXL3, 4.05 bpw) | 2 nodos TP2 sobre USB4 | **Production** | Identidad de decode R1b por defecto; autoespeculación MTP exacta por defecto; prefill por fragmentos R1 exacto; `--identity r1` restaura R1; corrección R≥3 verificada en el par |
+| GLM-5.3 Flash en una RTX PRO 6000 (borrador) | RTX PRO 6000 (96 GB, Windows) | **Opcional (opt-in)** | Prefill y decode greedy exactos; expertos enrutados servidos por la caché con compuerta en el dispositivo de [tierstream](https://github.com/hyukudan/tierstream) (dispositivo, RAM pinned, archivo de unidades); `--profile`; [guía](src/glm/rtxpf/README.md) |
 | Nemotron 3.5 Bolt E4B (Q4_K_M; paquete EXL3 para `quality`) | 1 nodo | **Compilación opcional (opt-in)** (`STRIX_FAMILY_GEMMA4=ON`) | `--profile default\|fast\|quality`; decode exacto con cualquier tamaño de batch; drafter MTP exacto en C1; servidor con batching continuo |
 
 El núcleo no conoce ningún modelo: cada familia es un módulo con su propio contrato, plan, kernels y gates
@@ -517,6 +518,16 @@ sigue sin resolverse. Los grafos HIP **no están implementados**: el perfil más
 y un hueco recuperable calculado de **≤1.8 ms** (una cota, no una aceleración medida). El avance del host a través de
 los límites de intercambio requiere captura segmentada; los kernels de dispositivo y el desfase entre ranks tienen prioridad.
 
+**GLM-5.3 Flash en una RTX PRO 6000 (borrador, opcional, Windows).** El tronco, las capas densas y los expertos
+compartidos se quedan en la tarjeta; los 43 x 288 expertos enrutados los sirve la caché con compuerta en el dispositivo
+de [tierstream](https://github.com/hyukudan/tierstream), y el prefill los lee a través de la misma caché, así que la
+tarjeta guarda una sola copia de cada experto. El prefill y el decode son exactos (digests bit a bit de logits y
+estado; estado del prefill igual con tiles de 2048 / 4096 / 8192 filas). Tarjeta completa: TTFT **17.7 s** con 8K y
+**41.2 s** con 32K con el mejor tile (17.7-22.7 s / 41-55 s según el tile); decode de unos **3.3 tok/s** en caliente
+(2.5 en frío), limitado por el cómputo y el coste de lanzamiento, y aún en optimización. Las configuraciones más
+pequeñas (por ejemplo 24 GiB de VRAM + 32 GiB de RAM con la mayoría de los expertos leídos del archivo de unidades)
+todavía no funcionan. Compilación, archivo de unidades y opciones: [guía de GLM RTX](src/glm/rtxpf/README.md).
+
 ### Nemotron 3.5 Bolt E4B
 
 Fuentes: [guía del modelo](docs/models/nemotron-3.5-bolt-e4b/README.md).
@@ -907,6 +918,14 @@ El decode R1b predeterminado usa autoespeculación MTP exacta y prefill de promp
 con los mismos tokens. `--identity r1` selecciona una identidad de referencia distinta. El prefill usa automáticamente
 8192 filas si ambos ranks las admiten; en caso contrario, 4096. Véanse el [resolutor](apps/glm_rank_defaults.hpp),
 las [familias de modelos](docs/models/model-families.md) y la [cualificación/rendimiento](docs/performance.md).
+
+### GLM en una RTX PRO 6000
+
+Solo Windows, opcional (opt-in): compile con `pwsh src/glm/rtxpf/producer/build.ps1` contra una exportación del código
+de tierstream, genere una vez el archivo de unidades con `glm_unit_file.exe` y ejecute
+`decode_qualification_window.py --full-card --allow-gpu`. Todos los pasos, el commit fijado de tierstream y las
+opciones (`--profile`, `--print-effective-config`, `--vram-total-gib`) están en la
+[guía de GLM RTX](src/glm/rtxpf/README.md).
 
 ### Nemotron 3.5 Bolt E4B
 
