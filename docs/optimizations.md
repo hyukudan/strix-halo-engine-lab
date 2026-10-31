@@ -1283,16 +1283,16 @@ The server's prefill task names the next piece of its plan before each piece. On
 
 ### Split prefill MoE kernels v2
 
-**Engine:** `deepseek`. **Control:** `STRIX_DS41_PREFILL_MOE_V2; STRIX_DS41_PREFILL_MOE_BAND`. **Default:** ON.
+**Engine:** `deepseek`. **Control:** `STRIX_DS41_PREFILL_MOE_V2; STRIX_DS41_PREFILL_MOE_V2_Q8; STRIX_DS41_PREFILL_MOE_BAND`. **Default:** ON.
 
-IQ2_XXS gate/up and Q2_K down split kernels with the same products, chains, tree and epilogue as forms 7 / 6: each class-wave owns classes q + 8k (tree levels 1-2 in registers, a quarter of the LDS tree exchange; a partial last chunk is balanced across waves and loads only its blocks), two LDS-only barriers per chunk, the Q2_K minimum term as an exact fma chain, permlanes without source copies, weight tiles from two uniform bases with shared 32-bit offsets, and blocks dispatched in bands of 4 batches.
+IQ2_XXS gate/up and Q2_K down split kernels with the same products, chains, tree and epilogue as forms 7 / 6: each class-wave owns classes q + 8k (tree levels 1-2 in registers, a quarter of the LDS tree exchange; a partial last chunk is balanced across waves and loads only its blocks), two LDS-only barriers per chunk, the Q2_K minimum term as an exact fma chain, permlanes without source copies, weight tiles from two uniform bases with shared 32-bit offsets, and blocks dispatched in bands of 4 batches. The Q8_0 shared expert's gate/up and down (and the Q8_0 x A8 projections on 16-row site routes) run on the same v2 kernels with direct per-lane weight reads (STRIX_DS41_PREFILL_MOE_V2_Q8).
 
-- **Preconditions:** Default form 7, batches of 16 rows, IQ2_XXS gate/up with hidden a multiple of 1024, Q2_K down with width a multiple of 256.
+- **Preconditions:** Default form 7, batches of 16 rows, IQ2_XXS gate/up with hidden a multiple of 1024, Q2_K down with width a multiple of 256; Q8_0 gate/up and down.
 - **Automatic selection:** On for the eligible split launches; other formats and forms keep their kernels.
 - **Fallback notice:** None; ineligible shapes run the form 7 / 6 kernels silently.
-- **Exactness evidence:** Bitwise: device prefill expert tests (synthetic incl. empty, 1-row and tail experts, real layer 20, DSpark MTP) with v2 on and off; rank-shaped bench (192 of 384 experts, pieces of 2048/4096/8192 rows) A8 codes, deltas, sums and down vectors identical to the previous kernels.
-- **Off switch:** STRIX_DS41_PREFILL_MOE_V2=0 (STRIX_DS41_PREFILL_MOE_BAND=1 keeps batch-fastest order)
-- **Measured gain:** Rank-shaped kernel bench (layer 20, interleaved): down -27 / -30 / -30 %, gate/up -4.5 / -6.1 / -7.8 % at 2048 / 4096 / 8192-row pieces. Two-node serve TTFT at 8,399 / 32,499 / 44,699 tokens (one binary, cache off, one load per arm, separate GPU turns): STRIX_DS41_PREFILL_MOE_V2=0 10.42 / 37.29 / 53.35 s vs default 9.80 / 34.70 / 49.09 s (-5.9 / -6.9 / -8.0 %).
+- **Exactness evidence:** Bitwise: device prefill expert tests (synthetic incl. empty, 1-row and tail experts, real layer 20, DSpark MTP) with v2 on and off; rank-shaped bench (192 of 384 experts, pieces of 2048/4096/8192 rows) A8 codes, deltas, sums and down vectors identical to the previous kernels; the same for the Q8_0 shared expert (STRIX_DS41_PREFILL_MOE_V2_Q8 on and off). With NaN weight scales or activation deltas (never in valid tensors) every non-NaN result and every NaN position is identical; the payload or sign of a NaN result can differ.
+- **Off switch:** STRIX_DS41_PREFILL_MOE_V2=0 (STRIX_DS41_PREFILL_MOE_V2_Q8=0 keeps the Q8_0 split kernels of form 7 / 6) (STRIX_DS41_PREFILL_MOE_BAND=1 keeps batch-fastest order)
+- **Measured gain:** Rank-shaped kernel bench (layer 20, interleaved): down -27 / -30 / -30 %, gate/up -4.5 / -6.1 / -7.8 % at 2048 / 4096 / 8192-row pieces. Two-node serve TTFT at 8,399 / 32,499 / 44,699 tokens (one binary, cache off, one load per arm, separate GPU turns): STRIX_DS41_PREFILL_MOE_V2=0 10.42 / 37.29 / 53.35 s vs default 9.80 / 34.70 / 49.09 s (-5.9 / -6.9 / -8.0 %). Q8_0 shared expert (one expert, all rows), v2 vs STRIX_DS41_PREFILL_MOE_V2_Q8=0: gate/up -21 / -20 / -32 %, down -26 / -33 / -40 % at 2048 / 4096 / 8192 rows.
 - **Public evidence:** [Prefill MoE kernels](../src/hip_ds41_prefill.hip)
 
 <a id="ds-dense"></a>

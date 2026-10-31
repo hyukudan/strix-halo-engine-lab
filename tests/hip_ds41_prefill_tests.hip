@@ -22,6 +22,7 @@
 #include <iomanip>
 #include <iostream>
 #include <map>
+#include <memory>
 #include <numeric>
 #include <random>
 #include <span>
@@ -415,6 +416,7 @@ void check_case(const DeviceExperts& x, std::uint32_t rows, std::uint32_t top_k,
 
 void check_chunked(const DeviceExperts& x, std::uint32_t rows, std::uint32_t top_k, std::uint32_t split, unsigned seed,
                    const std::string& label);
+void check_q8_nan_payloads();
 
 void test_synthetic() {
     {
@@ -450,6 +452,74 @@ void test_synthetic() {
         const DeviceExperts x(e);
         check_case(x, 45, 1, 1, 32, 0.0, 7, "synthetic Q8_0 shared h5120");
         check_case(x, 37, 1, 1, 16, 0.0, 8, "synthetic Q8_0 shared h5120");
+    }
+    check_q8_nan_payloads();
+}
+
+// Q8_0 split kernels v2 (default) against the v1 split kernels (STRIX_DS41_PREFILL_MOE_V2_Q8=0) with NaNs of distinct
+// payloads and signs in about 1 % of the weight scales (gate, up, down) and of the activation deltas, spread over all
+// lane classes so differing NaNs meet in the products, the epilogue and the reduction tree: every intermediate (gate,
+// up, A8 codes / deltas / sums, down) bit for bit, except the payload / sign of a NaN result.
+void check_q8_nan_payloads() {
+    using namespace strix::ds41;
+    auto e = synthetic_experts(WeightFormat::q8_0, WeightFormat::q8_0, 1, 5120, 2304, 45);
+    unsigned marked = 0;
+    for (auto& bytes : e.host)
+        for (std::size_t b = 0; b * 34U < bytes.size(); ++b)
+            if ((b * 2654435761ULL) % 97U == 0U) {
+                const auto nan = static_cast<std::uint16_t>(((b & 1U) << 15U) | 0x7c00U | (1U + b % 0x3ffU));
+                bytes[b * 34U] = static_cast<std::uint8_t>(nan & 0xffU);
+                bytes[b * 34U + 1U] = static_cast<std::uint8_t>(nan >> 8U);
+                ++marked;
+            }
+    const DeviceExperts x(e);
+    for (const std::uint32_t batch_rows : {16U, 32U}) {
+        const std::uint32_t rows = batch_rows == 16U ? 37U : 45U;
+        const auto ids = routing(rows, 1, 1, 0.0, 70U + batch_rows);
+        RouteBuffers rb(rows, 1, 1, batch_rows);
+        rb.ids.upload(ids);
+        enqueue_build_prefill_routes(rb.ids.data, rows, 1, 1, 1, batch_rows, rb.b, nullptr);
+        Inputs in(rows, 1, e.hidden, 71U + batch_rows);
+        auto deltas = in.deltas.download();
+        for (std::size_t i = 0; i < deltas.size(); ++i)
+            if ((i * 40503U) % 53U == 0U)
+                deltas[i] = std::bit_cast<float>(static_cast<std::uint32_t>(((i & 1U) << 31U) | 0x7f800000U | (1U + i % 0x3fffffU)));
+        in.deltas.upload(deltas);
+        const auto view = prefill_routes_view(rb.b, rows, 1, 1, batch_rows);
+        const auto run_arm = [&](const char* q8) {
+            if (q8) setenv("STRIX_DS41_PREFILL_MOE_V2_Q8", q8, 1);
+            else unsetenv("STRIX_DS41_PREFILL_MOE_V2_Q8");
+            auto run = std::make_unique<PrefillRun>(rows, rows, e.hidden, e.inter, true);
+            run->raw.fill_pattern(); run->gate.fill_pattern(); run->up.fill_pattern(); run->act_codes.fill_pattern();
+            enqueue_prefill(x, in, view, *run, true);
+            check(hipDeviceSynchronize(), "q8 nan prefill");
+            return run;
+        };
+        const auto v1 = run_arm("0");
+        const auto v2 = run_arm(nullptr);
+        unsetenv("STRIX_DS41_PREFILL_MOE_V2_Q8");
+        // NaN results: the same positions; their payload / sign may differ (two-NaN additions return one operand's NaN and
+        // the compiler may commute a commutative add). Every non-NaN value and every A8 code / sum bit for bit.
+        std::size_t value_bad = 0, payload_only = 0, nans = 0;
+        const auto compare = [&](const std::vector<float>& a, const std::vector<float>& b) {
+            value_bad += a.size() != b.size();
+            for (std::size_t i = 0; i < std::min(a.size(), b.size()); ++i) {
+                nans += std::isnan(b[i]);
+                if (std::bit_cast<std::uint32_t>(a[i]) == std::bit_cast<std::uint32_t>(b[i])) continue;
+                if (std::isnan(a[i]) && std::isnan(b[i])) ++payload_only;
+                else ++value_bad;
+            }
+        };
+        compare(v1->gate.download(), v2->gate.download());
+        compare(v1->up.download(), v2->up.download());
+        compare(v1->act_deltas.download(), v2->act_deltas.download());
+        compare(v1->raw.download(), v2->raw.download());
+        value_bad += bit_mismatches(v1->act_codes.download(), v2->act_codes.download()) + bit_mismatches(v1->act_sums.download(), v2->act_sums.download());
+        expect(value_bad == 0U && nans > 0U, "Q8_0 NaN inputs, batches of " + std::to_string(batch_rows) + ": " + std::to_string(value_bad) +
+            " values differ beyond NaN payload (" + std::to_string(payload_only) + " NaN payload/sign only, " + std::to_string(nans) + " NaN values)");
+        std::cout << "synthetic Q8_0 shared h5120 NaN inputs (" << marked << " NaN scales, batches of " << batch_rows << ", " << nans
+                  << " NaN results, " << payload_only << " differ in NaN payload/sign only): every non-NaN value, NaN position, A8 code and sum "
+                  << "bit-exact v2 vs V2_Q8=0" << std::endl;
     }
 }
 
@@ -937,6 +1007,15 @@ int main() {
                 if (rank_env && *rank_env == '1') bench_rank(x, 6, x.e.experts / 2U, "blk.20");
                 else if (timing && moe_env && *moe_env == '1') bench_moe(x, 6, 192, "blk.20");
                 else if (timing) { bench(x, 6, 192, "blk.20"); if (!bench_only) bench_decode(x, 6, 192, 2048, "blk.20"); }
+            }
+            // STRIX_DS41_BENCH_SHARED=1 (with STRIX_DS41_BENCH_RANK=1): the rank bench on the Q8_0 shared expert (one expert, all T rows)
+            if (const char* sh = std::getenv("STRIX_DS41_BENCH_SHARED"); sh && *sh == '1') {
+                const char* rank_env = std::getenv("STRIX_DS41_BENCH_RANK");
+                if (rank_env && *rank_env == '1') {
+                    const auto e = file_experts(q2, "blk.20.ffn_gate_shexp.weight", "blk.20.ffn_up_shexp.weight", "blk.20.ffn_down_shexp.weight");
+                    const DeviceExperts x(e);
+                    bench_rank(x, 1, 1, "blk.20-shared");
+                }
             }
             if (!bench_only) {
                 const auto e = file_experts(q2, "blk.20.ffn_gate_shexp.weight", "blk.20.ffn_up_shexp.weight", "blk.20.ffn_down_shexp.weight");
