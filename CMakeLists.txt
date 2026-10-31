@@ -4034,6 +4034,13 @@ if(STRIX_FAMILY_MINIMAX)
         endforeach()
     endif()
 endif()
+option(STRIX_FAMILY_GEMMA4 "Build the gemma4 (Nemotron 3.5 Bolt E4B) family modules" OFF)
+if(STRIX_FAMILY_GEMMA4)
+    file(GLOB strix_gemma4_cmake "${CMAKE_CURRENT_SOURCE_DIR}/cmake/gemma4_*.cmake")
+    foreach(f IN LISTS strix_gemma4_cmake)
+        include(${f})
+    endforeach()
+endif()
 
 # GLM-5.3-Flash engine (glm/engine): Tier A host emulation + CPU semantic test, Tier A / DSA device
 # kernels + gate-K tests, and the TP2 engine (strix-glm5-rank) on strix-trellis (design notes).

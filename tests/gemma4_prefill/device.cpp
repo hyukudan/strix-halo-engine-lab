@@ -1,0 +1,276 @@
+#include "gemma4/prefill/device.hpp"
+#include "gemma4/prefill/reference.hpp"
+#include "../gemma4_gpu/fixture.hpp"
+#include <limits>
+#include <numeric>
+
+using namespace strix::gemma4;
+namespace pf = strix::gemma4::prefill;
+namespace gpu = strix::gemma4::gpu;
+
+namespace {
+void conversion_tests() {
+    std::vector<float> values;
+    for (unsigned h = 0; h < 0x7bffU; ++h) {
+        const float a = fp16_value(std::uint16_t(h)), b = fp16_value(std::uint16_t(h + 1));
+        const float midpoint = float((double(a) + double(b)) * 0.5);
+        for (float v : {std::nextafter(midpoint, a), midpoint, std::nextafter(midpoint, b)}) {
+            values.push_back(v); values.push_back(-v);
+        }
+    }
+    gpu::Buffer weights(values.size() * sizeof(float)), input(512 * sizeof(float)), output(values.size() * sizeof(float));
+    gpu::Buffer scratch(512 * 16 * sizeof(std::uint16_t)), failure(sizeof(unsigned)), maximum(sizeof(unsigned));
+    weights.upload(values.data(), weights.size());
+    const float one = 1.0F; input.upload(&one, sizeof(one)); failure.zero(); maximum.zero();
+    LinearView w{weights.as<std::uint8_t>(), unsigned(values.size()), 1, sizeof(float), WeightFormat::f32};
+    pf::linear(w, input.as<float>(), 1, output.as<float>(), scratch.data(), failure.as<unsigned>(), maximum.as<unsigned>());
+    gpu::synchronize();
+    unsigned flag = 0; failure.download(&flag, sizeof(flag)); CHECK(flag == 0);
+    std::vector<float> actual(values.size()); output.download(actual.data(), output.size());
+    for (std::size_t i = 0; i < values.size(); ++i) {
+        std::uint16_t h = 0; CHECK(pf::half_bits(values[i], h));
+        std::array<std::uint16_t, 16> a{}, b{}; a[0] = 0x3c00U; b[0] = h;
+        CHECK(bit_cast<unsigned>(actual[i]) == bit_cast<unsigned>(pf::instruction(a, b, 0.0F)));
+    }
+    weights.upload(&one, sizeof(one)); w.outputs = 1;
+    for (std::size_t first = 0; first < values.size(); first += 512) {
+        const auto count = unsigned(std::min<std::size_t>(512, values.size() - first));
+        input.upload(values.data() + first, std::size_t(count) * sizeof(float));
+        pf::linear(w, input.as<float>(), count, output.as<float>(), scratch.data(), failure.as<unsigned>(), maximum.as<unsigned>());
+        gpu::synchronize();
+        std::vector<std::uint16_t> converted(std::size_t(count) * 16);
+        scratch.download(converted.data(), converted.size() * sizeof(std::uint16_t));
+        for (unsigned r = 0; r < count; ++r) {
+            std::uint16_t h = 0; CHECK(pf::half_bits(values[first + r], h)); CHECK(converted[std::size_t(r) * 16] == h);
+            for (unsigned k = 1; k < 16; ++k) CHECK(converted[std::size_t(r) * 16 + k] == 0);
+        }
+    }
+    failure.download(&flag, sizeof(flag)); CHECK(flag == 0);
+    for (float bad : {65520.0F, -65520.0F, std::numeric_limits<float>::infinity(), std::numeric_limits<float>::quiet_NaN()}) {
+        input.upload(&bad, sizeof(bad)); failure.zero(); maximum.zero();
+        pf::linear(w, input.as<float>(), 1, output.as<float>(), scratch.data(), failure.as<unsigned>(), maximum.as<unsigned>());
+        gpu::synchronize(); failure.download(&flag, sizeof(flag)); CHECK((flag & 4U) != 0);
+        input.upload(&one, sizeof(one)); weights.upload(&bad, sizeof(bad)); failure.zero(); maximum.zero();
+        refuses([&] { pf::PreparedLinear invalid(w); });
+        pf::linear(w, input.as<float>(), 1, output.as<float>(), scratch.data(), failure.as<unsigned>(), maximum.as<unsigned>());
+        gpu::synchronize(); failure.download(&flag, sizeof(flag)); CHECK((flag & 4U) != 0);
+        weights.upload(&one, sizeof(one));
+    }
+    std::puts("prefill native FP16 midpoint/activation/weight conversion PASS");
+}
+void layout_tests() {
+    for (const auto format : {WeightFormat::bf16, WeightFormat::f32, WeightFormat::q4_k, WeightFormat::q6_k, WeightFormat::q8_0}) {
+        constexpr unsigned width = 512, outputs = 67, rows = 65;
+        const auto packed = fixture::packed(format, outputs, width);
+        gpu::Buffer weights(packed.size()), input(rows * width * sizeof(float)), output(rows * outputs * sizeof(float));
+        gpu::Buffer scratch(rows * width * sizeof(std::uint16_t)), failure(sizeof(unsigned)), maximum(sizeof(unsigned));
+        weights.upload(packed.data(), packed.size());
+        std::vector<float> x(rows * width);
+        for (unsigned r = 0; r < rows; ++r) x[std::size_t(r) * width + (r * 23) % width] = 1.0F;
+        input.upload(x.data(), input.size()); failure.zero(); maximum.zero();
+        LinearView w{weights.as<std::uint8_t>(), outputs, width, packed_row_bytes(format, width), format};
+        pf::linear(w, input.as<float>(), rows, output.as<float>(), scratch.data(), failure.as<unsigned>(), maximum.as<unsigned>());
+        gpu::synchronize();
+        unsigned flag = 0; failure.download(&flag, sizeof(flag)); CHECK(flag == 0);
+        std::vector<float> actual(rows * outputs); output.download(actual.data(), output.size());
+        w.data = packed.data();
+        bytes(actual, pf::emulate_linear(w, x, rows));
+    }
+    std::puts("prefill packed/tile/layout PASS");
+}
+void tile_tests() {
+    for (const auto format : {WeightFormat::bf16, WeightFormat::f32, WeightFormat::q4_k, WeightFormat::q6_k, WeightFormat::q8_0}) {
+        const bool quant = format == WeightFormat::q4_k || format == WeightFormat::q6_k || format == WeightFormat::q8_0;
+        for (const unsigned width : quant ? std::vector<unsigned>{256, 512} : std::vector<unsigned>{1, 15, 16, 17, 257, 10240, 10752}) {
+            for (const unsigned rows : width > 1024 ? std::vector<unsigned>{3} : std::vector<unsigned>{1, 8, 17}) {
+                const unsigned outputs = 19;
+                const auto packed = fixture::packed(format, outputs, width, width + 71);
+                gpu::Buffer weights(packed.size()), input(std::size_t(rows) * width * sizeof(float));
+                gpu::Buffer output(rows * outputs * sizeof(float)), reference(output.size());
+                gpu::Buffer scratch(std::size_t(rows) * ((width + 15U) / 16U) * 16 * sizeof(std::uint16_t)), failure(sizeof(unsigned)), maximum(sizeof(unsigned));
+                weights.upload(packed.data(), packed.size());
+                std::vector<float> x(std::size_t(rows) * width);
+                std::mt19937 rng(width + 91);
+                for (auto& a : x) a = float(int(rng() % 65535) - 32767) * 0.0009765625F;
+                input.upload(x.data(), input.size()); failure.zero(); maximum.zero();
+                const LinearView w{weights.as<std::uint8_t>(), outputs, width, packed_row_bytes(format, width), format};
+                pf::linear(w, input.as<float>(), rows, output.as<float>(), scratch.data(), failure.as<unsigned>(), maximum.as<unsigned>());
+                pf::linear(w, input.as<float>(), rows, reference.as<float>(), scratch.data(), failure.as<unsigned>(), maximum.as<unsigned>(), nullptr, false);
+                gpu::synchronize();
+                unsigned flag = 0; failure.download(&flag, sizeof(flag)); CHECK(flag == 0);
+                std::vector<float> actual(rows * outputs), expected(rows * outputs);
+                output.download(actual.data(), output.size()); reference.download(expected.data(), reference.size()); bytes(actual, expected);
+                auto host_weights = w; host_weights.data = packed.data();
+                bytes(actual, pf::emulate_linear(host_weights, x, rows));
+                pf::PreparedLinear prepared(w);
+                pf::linear(w, input.as<float>(), rows, output.as<float>(), scratch.data(), failure.as<unsigned>(), maximum.as<unsigned>(), nullptr, true, &prepared);
+                gpu::synchronize(); failure.download(&flag, sizeof(flag)); CHECK(flag == 0);
+                output.download(actual.data(), output.size()); bytes(actual, expected);
+            }
+        }
+    }
+    std::puts("prefill shared/prepared/reference tile equality PASS");
+}
+ForwardResult decode(gpu::DeviceTarget& target, gpu::DeviceStream& stream, std::span<const unsigned> tokens) {
+    auto tx = stream.begin();
+    std::vector<RowPlan> rows;
+    for (unsigned r = 0; r < tokens.size(); ++r) rows.push_back({1, 1, tx->frontier() + r, tokens[r], tx.get(), r, true});
+    auto out = target.forward_rows(rows); tx->commit(tokens.size()); return out;
+}
+void split_tests() {
+    const auto model = fixture::tiny(6);
+    fixture::Tables tables;
+    const auto weights = bind_host_weights(model);
+    pf::DevicePrefill target(weights, tables.view());
+    gpu::DeviceTarget decoder(weights, tables.view());
+    std::vector<unsigned> tokens(35);
+    for (unsigned r = 0; r < tokens.size(); ++r) tokens[r] = r % model.config.vocab;
+    gpu::DeviceStream canonical(model.config, 1024);
+    const auto expected = target.run(canonical, tokens);
+    const auto digest = canonical.digest();
+    { pf::DevicePrefill borrowed(target.borrow_device_weights(), tables.view(), pf::Residency::device);
+      gpu::DeviceStream stream(model.config, 1024);
+      const auto out = borrowed.run(stream, tokens);
+      bytes(out.last_logits, expected.last_logits); bytes(out.tail_taps, expected.tail_taps); CHECK(stream.digest() == digest); }
+    pf::Reference reference(weights, tables.view(), 1024);
+    const auto host = reference.run(tokens);
+    bytes(host.last_logits, expected.last_logits); bytes(host.tail_taps, expected.tail_taps);
+    CHECK(reference.digest() == digest);
+    { gpu::DeviceStream all(model.config, 1024); auto tx = all.begin();
+      const auto out = target.forward(*tx, tokens, true);
+      bytes(out.last_logits, expected.last_logits);
+      bytes(std::vector<float>(out.all_logits.end() - model.config.vocab, out.all_logits.end()), expected.last_logits); }
+    for (unsigned split = 0; split <= tokens.size(); ++split) {
+        gpu::DeviceStream stream(model.config, 1024);
+        pf::Prompt prompt(target, stream);
+        prompt.append(std::span(tokens).first(split)); prompt.append(std::span(tokens).subspan(split));
+        const auto out = prompt.finish();
+        CHECK(out.frontier == tokens.size()); bytes(out.last_logits, expected.last_logits); bytes(out.tail_taps, expected.tail_taps);
+        CHECK(stream.digest() == digest); refuses([&] { prompt.append({}); }); refuses([&] { (void)prompt.finish(); });
+    }
+    // Cross a fixed prompt chunk and ring edge; fragment every input separately.
+    tokens.resize(521);
+    for (unsigned r = 0; r < tokens.size(); ++r) tokens[r] = (r * 7) % model.config.vocab;
+    gpu::DeviceStream a(model.config, 1024), b(model.config, 1024);
+    const auto whole = target.run(a, tokens);
+    pf::Prompt fragmented(target, b);
+    for (const auto& token : tokens) fragmented.append({&token, 1});
+    const auto one = fragmented.finish();
+    bytes(whole.last_logits, one.last_logits); bytes(whole.tail_taps, one.tail_taps); CHECK(a.digest() == b.digest());
+    // Decode rows from the identical WMMA state remain canonical, including
+    // hypothetical verify inputs. The speculative verdict is coordinator-owned.
+    const std::array<unsigned, 4> next = {3, 1, 5, 8};
+    const auto batched = decode(decoder, a, next);
+    for (unsigned r = 0; r < next.size(); ++r) {
+        const auto serial = decode(decoder, b, {&next[r], 1});
+        bytes(serial.logits, std::vector<float>(batched.logits.begin() + std::ptrdiff_t(r * model.config.vocab), batched.logits.begin() + std::ptrdiff_t((r + 1) * model.config.vocab)));
+        bytes(serial.taps, std::vector<float>(batched.taps.begin() + std::ptrdiff_t(r * 5 * model.config.hidden), batched.taps.begin() + std::ptrdiff_t((r + 1) * 5 * model.config.hidden)));
+    }
+    CHECK(a.digest() == b.digest());
+    // Rejected overlays do not replace committed prompt state.
+    const auto before = a.digest();
+    { auto tx = a.begin(); (void)target.forward(*tx, std::span(next).first(1)); }
+    CHECK(a.digest() == before);
+    std::puts("prefill split/commit/canonical decode PASS");
+}
+void alias_tests() {
+    const auto model = fixture::tiny(42);
+    fixture::Tables tables;
+    pf::DevicePrefill target(bind_host_weights(model), tables.view());
+    std::vector<unsigned> tokens(513);
+    for (unsigned r = 0; r < tokens.size(); ++r) tokens[r] = (r * 7) % model.config.vocab;
+    gpu::DeviceStream a(model.config, 1024), b(model.config, 1024);
+    const auto expected = target.run(a, tokens);
+    pf::Prompt prompt(target, b);
+    for (const auto token : tokens) prompt.append({&token, 1});
+    const auto out = prompt.finish();
+    bytes(out.last_logits, expected.last_logits); bytes(out.tail_taps, expected.tail_taps); CHECK(a.digest() == b.digest());
+    std::puts("prefill shared KV 22/23 and ring crossing PASS");
+}
+void c4_tests() {
+    const auto model = fixture::tiny(6);
+    fixture::Tables tables;
+    const auto weights = bind_host_weights(model);
+    pf::DevicePrefill prefill(weights, tables.view());
+    gpu::DeviceTarget decoder(weights, tables.view());
+    std::array<std::unique_ptr<gpu::DeviceStream>, 4> streams;
+    std::array<std::unique_ptr<pf::Reference>, 4> reference;
+    std::array<unsigned, 4> anchors{};
+    for (unsigned i = 0; i < 4; ++i) {
+        streams[i] = std::make_unique<gpu::DeviceStream>(model.config, 1024);
+        reference[i] = std::make_unique<pf::Reference>(weights, tables.view(), 1024);
+        std::vector<unsigned> tokens(1 + i * 5, i + 2);
+        const auto out = prefill.run(*streams[i], tokens), expected = reference[i]->run(tokens);
+        bytes(out.last_logits, expected.last_logits); CHECK(streams[i]->digest() == reference[i]->digest());
+        anchors[i] = i + 2;
+    }
+    for (unsigned step = 0; step < 3; ++step) {
+        std::array<std::unique_ptr<KvTxn>, 4> tx;
+        std::vector<RowPlan> rows;
+        for (unsigned i = 0; i < 4; ++i) {
+            tx[i] = streams[i]->begin(); rows.push_back({i, 7, tx[i]->frontier(), anchors[i], tx[i].get(), 3 - i, true});
+        }
+        const auto out = decoder.forward_rows(rows);
+        for (unsigned i = 0; i < 4; ++i) {
+            tx[i]->commit(1); const auto expected = reference[i]->forward({&anchors[i], 1}, false);
+            const auto first = std::size_t(3 - i) * out.vocab;
+            bytes(expected.last_logits, std::vector<float>(out.logits.begin() + std::ptrdiff_t(first), out.logits.begin() + std::ptrdiff_t(first + out.vocab)));
+            const auto tap = std::size_t(3 - i) * out.tap_width;
+            bytes(expected.taps, std::vector<float>(out.taps.begin() + std::ptrdiff_t(tap), out.taps.begin() + std::ptrdiff_t(tap + out.tap_width)));
+            CHECK(streams[i]->digest() == reference[i]->digest()); anchors[i] = (anchors[i] + 3) % model.config.vocab;
+        }
+    }
+    std::puts("prefill unequal-context C4/permuted slots versus host C1 PASS");
+}
+void context_callback_tests() {
+    auto model = fixture::tiny(1); model.config.max_positions = 2048;
+    fixture::Tables tables(2048);
+    pf::DevicePrefill prefill(bind_host_weights(model), tables.view());
+    gpu::DeviceStream expected(model.config, 2048), stream(model.config, 2048);
+    struct Context final : DraftContext {
+        gpu::DeviceStream& stream;
+        std::uint64_t frontier = 0;
+        std::vector<float> taps;
+        explicit Context(gpu::DeviceStream& state) : stream(state) {}
+        void append(std::span<const float> values, std::span<const std::uint64_t> positions) override {
+            CHECK(!positions.empty() && positions.size() <= 8 && positions.front() == frontier);
+            CHECK(positions.back() < stream.frontier());
+            taps.insert(taps.end(), values.begin(), values.end()); frontier += positions.size();
+        }
+    } context(stream);
+    std::vector<unsigned> tokens(1049);
+    for (unsigned i = 0; i < tokens.size(); ++i) tokens[i] = i % model.config.vocab;
+    const auto whole = prefill.run(expected, tokens);
+    (void)prefill.run(stream, std::span(tokens).first(16), &context);
+    CHECK(context.frontier == 16);
+    const auto extended = prefill.run(stream, std::span(tokens).subspan(16), &context);
+    CHECK(context.frontier == tokens.size() && context.taps.size() == tokens.size() * 5 * model.config.hidden);
+    bytes(whole.last_logits, extended.last_logits); bytes(whole.tail_taps, extended.tail_taps);
+    CHECK(stream.digest() == expected.digest());
+    bytes(extended.tail_taps, std::vector<float>(context.taps.end() - std::ptrdiff_t(extended.tail_taps.size()), context.taps.end()));
+    std::puts("prefill committed draft callback and long stream extension PASS");
+}
+void overflow_test() {
+    auto model = fixture::tiny(1);
+    bool injected = false;
+    for (auto& t : model.tensors)
+        if (t.name == "model.language_model.embed_tokens.weight") {
+            // BF16 embedding multiplication stays finite FP32 but exceeds FP16.
+            auto data = std::make_shared<std::vector<std::uint8_t>>(std::size_t(t.view.outputs) * t.view.row_bytes);
+            for (std::size_t i = 0; i < data->size(); i += 2) fixture::put16(data->data() + i, bf16_bits(2000.0F));
+            t.view.data = data->data(); model.storage.push_back(data);
+            injected = true;
+        }
+    CHECK(injected);
+    fixture::Tables tables;
+    pf::DevicePrefill target(bind_host_weights(model), tables.view());
+    gpu::DeviceStream stream(model.config, 64);
+    const auto before = stream.digest();
+    { auto tx = stream.begin(); const unsigned token = 1;
+      refuses([&] { (void)target.forward(*tx, {&token, 1}); }); refuses([&] { tx->commit(1); }); }
+    CHECK(stream.frontier() == 0 && stream.digest() == before);
+    std::puts("prefill FP16 overflow rollback PASS");
+}
+} // namespace
+int main() try { conversion_tests(); layout_tests(); tile_tests(); split_tests(); alias_tests(); c4_tests(); context_callback_tests(); overflow_test(); return 0; }
+catch (const std::exception& e) { std::cerr << e.what() << '\n'; return 1; }

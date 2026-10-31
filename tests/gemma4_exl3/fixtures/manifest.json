@@ -1,0 +1,8 @@
+{
+  "seed": 871,
+  "inputs": 256,
+  "outputs": 128,
+  "rows": 8,
+  "reference": "Independent mul1 ring decoder and ascending-stride FP32 transforms; chunk16 wave dots",
+  "description": "Synthetic signed zeros, half subnormals/underflow ties, large and RNE-boundary inputs; no model weights"
+}
