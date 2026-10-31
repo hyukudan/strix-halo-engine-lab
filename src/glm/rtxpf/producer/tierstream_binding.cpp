@@ -35,7 +35,7 @@ void configure(const TierOpenConfig& c,Handles& h,ts_budget& b,ts_options& o){
     o.dg_flush_ready=c.flush_ready?1u:0u; // as DS TierSite: flush the demand stream after each ready signal (WDDM)
 }
 class Binding final:public TierCacheApi {
-    Handles h_;TierView view_{};CacheCounters before_{};std::uint64_t unit_=0;unsigned pred_=0,pred_through_=0;bool flush_ready_=false;std::string last_error_;
+    Handles h_;TierView view_{};CacheCounters before_{};std::uint64_t unit_=0;unsigned pred_=0,pred_through_=0;bool flush_ready_=false;std::string last_error_;StepPlan plan_;
     CacheCounters read(){ts_dg_stats s{};ts_ok(ts_stats_dg(h_.ctx,&s),"stats");CacheCounters c;c.lookups=s.lookups;c.misses=s.misses;c.fetched=s.fetched;c.prefetched=s.prefetched;c.resurrected=s.resurrected;c.covered=s.covered;c.bank_serves=s.bank_serves;c.file_reads=s.disk_reads;c.file_bytes=s.disk_read_bytes;c.file_ns=s.disk_read_ns;
         c.evicted=s.evicted;c.drops=s.disk_drops;c.writebacks=s.writebacks_done;c.stalled=s.stalled;c.timeouts=s.device_timeouts;c.free_slots=s.free_slots;return c;}
 public:
@@ -46,13 +46,19 @@ public:
         expert_need(v.parts[0].stride==c.unit_bytes&&v.parts[0].bytes==c.unit_bytes,"tierstream view: arena stride != GLM unit stride");
         for(unsigned g=0;g<c.expected_gated;++g)expert_need(ts_dg_gated_index(h_.ctx,int(g))==int(g),"tierstream: gated ordinals out of order");
         view_.slot_of=v.slot_of;view_.unit_base=v.unit_base;view_.abort=v.abort;view_.absent_err=v.absent_err;view_.guard_slot=v.guard_slot;view_.n_gated=v.n_gated;view_.units=c.expected_units;
-        view_.base=v.parts[0].base;view_.stride=v.parts[0].stride;unit_=c.unit_bytes;before_=read();
+        view_.base=v.parts[0].base;view_.stride=v.parts[0].stride;unit_=c.unit_bytes;before_=read();plan_.init(v.n_gated);
     }
-    void begin()override{ts_ok(ts_begin(h_.ctx,nullptr,0),"begin");}
+    // An all-layer (decode) token never starts while a prefill keep set is held: the
+    // library would skip that layer while the decode exports it and waits for its units.
+    void begin()override{for(unsigned g=0;g<plan_.held.size();++g)if(plan_.held[g])throw std::runtime_error("decode token while gated layer "+std::to_string(g)+" still holds its prefill keep set (released on every prefill path; tierstream would skip it)");
+        ts_ok(ts_begin(h_.ctx,nullptr,0),"begin");plan_.begin_all();}
+    bool step_exports(unsigned g)const override{return plan_.exports(g);}
     void enqueue_begin(void* s)override{ts_ok(ts_dg_enqueue_begin(h_.ctx,s),"enqueue begin");}
-    void enqueue_export(unsigned g,const std::int32_t* ids,unsigned n,void* s)override{ts_ok(ts_dg_enqueue_export(h_.ctx,int(g),ids,int(n),int(g<pred_through_?pred_:0),s),"enqueue export");}
+    void enqueue_export(unsigned g,const std::int32_t* ids,unsigned n,void* s)override{expert_need(plan_.exports(g),"export of a gated layer the step skips or holds");
+        ts_ok(ts_dg_enqueue_export(h_.ctx,int(g),ids,int(n),int(plan_.promise(g,pred_,pred_through_)),s),"enqueue export");}
     void set_predict_ids(unsigned n,unsigned through)override{expert_need(n<=SS_DG_MAX_IDS&&through<view_.n_gated,"predicted ids");pred_=n;pred_through_=n?through:0;}
-    void enqueue_predict(unsigned g,const std::int32_t* ids,unsigned n,void* s)override{expert_need(pred_&&n==pred_&&g<pred_through_,"predict without a promise");ts_ok(ts_dg_enqueue_predict(h_.ctx,int(g),ids,int(n),s),"enqueue predict");}
+    void enqueue_predict(unsigned g,const std::int32_t* ids,unsigned n,void* s)override{expert_need(pred_&&n==pred_&&g<pred_through_,"predict without a promise");
+        expert_need(plan_.promise(g,pred_,pred_through_)==n,"prediction for a gated layer the step skips or holds");ts_ok(ts_dg_enqueue_predict(h_.ctx,int(g),ids,int(n),s),"enqueue predict");}
     std::vector<std::uint32_t> residency()override{std::uint32_t total=0;std::vector<ts_dg_unit> u(std::size_t(view_.n_gated)*view_.units);
         ts_ok(ts_dg_residency(h_.ctx,u.data(),std::uint32_t(u.size()),&total),"residency");std::vector<std::uint32_t> keys;keys.reserve(std::min<std::size_t>(total,u.size()));
         for(std::size_t i=0;i<total&&i<u.size();++i)keys.push_back(std::uint32_t(u[i].gated)*view_.units+std::uint32_t(u[i].unit));return keys;}
@@ -68,17 +74,17 @@ public:
         j.set("covered_waits",s.covered_waits);j.set("fetched",s.fetched);j.set("prefetched",s.prefetched);j.set("free_slots",s.free_slots);j.set("slots",s.slots);j.set("blocks",s.blocks);
         j.set("wb_forced",s.wb_forced);j.set("wb_outstanding_bytes",s.wb_outstanding_bytes);return j;}
     TierView view()const override{return view_;}
-    void reset_open()override{ts_ok(ts_dg_reset_open(h_.ctx),"reset_open");before_=read();}
+    void reset_open()override{ts_ok(ts_dg_reset_open(h_.ctx),"reset_open");before_=read();plan_.reset();}
     // Prefill through the cache (SS_DG_MAKE_RESIDENT): between
     // tokens; SS_E_CAPACITY changed nothing (false). A held set is never exported:
     // a prefill step exports nothing (rows 0 elsewhere) and reads the kept ids through
     // ss_dg_slot; the set is released right after its step, before any decode token.
     bool supports_make_resident()const override{return true;}
     bool make_resident(unsigned g,const std::int32_t* ids,unsigned n)override{
-        const auto s=ts_dg_make_resident(h_.ctx,int(g),ids,int(n));if(s==TS_E_CAPACITY)return false;ts_ok(s,"make_resident");return true;}
-    void release_resident(unsigned g)override{ts_ok(ts_dg_keep(h_.ctx,int(g),nullptr,0),"release resident set");}
+        const auto s=ts_dg_make_resident(h_.ctx,int(g),ids,int(n));if(s==TS_E_CAPACITY)return false;ts_ok(s,"make_resident");plan_.hold(g);return true;}
+    void release_resident(unsigned g)override{ts_ok(ts_dg_keep(h_.ctx,int(g),nullptr,0),"release resident set");plan_.release(g);}
     void begin_layer_step(unsigned g)override{std::vector<std::uint32_t> rows(view_.n_gated,0);expert_need(g<rows.size(),"gated layer");rows[g]=1;
-        ts_ok(ts_begin(h_.ctx,rows.data(),int(rows.size())),"begin single-layer step");}
+        ts_ok(ts_begin(h_.ctx,rows.data(),int(rows.size())),"begin single-layer step");plan_.begin_layer(g);}
     // Deltas since the previous collect (cache_delta in expert_tier.hpp).
     Json stats()override{auto now=read();auto j=cache_delta(before_,now,unit_);before_=now;
         // Prefill residency (make_resident) totals since open: counted only here, nowhere else.

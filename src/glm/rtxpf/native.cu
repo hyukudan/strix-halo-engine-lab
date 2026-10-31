@@ -1,5 +1,6 @@
 #include "native.cuh"
 #include "c1_layout.cuh"
+#include "c1_schedule.hpp"
 #include <mma.h>
 #include <algorithm>
 #include <limits>
@@ -91,9 +92,9 @@ __device__ void h128(float (&v)[4],unsigned lane) {
     for(unsigned j=0;j<4;++j) v[j]=__fmul_rn(v[j],0x1.6a09e6p-4f);
 }
 __global__ void transform(const Expert* ex,const float* x,const float* activation,const U32* offsets,const U32* map,
-    U16* ag,U16* au,U16* ad,unsigned first,unsigned count,unsigned width,unsigned routes,bool down) {
-    unsigned e=first+blockIdx.y;
+    U16* ag,U16* au,U16* ad,unsigned first,unsigned count,unsigned width,unsigned routes,bool down,const U32* act=nullptr) {
     if(blockIdx.y>=count) return;
+    unsigned e=c1_expert(act,first+blockIdx.y);
     unsigned lane=threadIdx.x%32, warp=threadIdx.x/32;
     unsigned nblocks=width/128;
     for(unsigned block=blockIdx.x*8+warp;block<(offsets[e+1]-offsets[e])*nblocks;block+=gridDim.x*8) {
@@ -261,6 +262,8 @@ cudaError_t prepare_cutlass(CutlassExecution& e) {
 }
 cudaError_t enqueue_cutlass(const Call& v,void* p,std::size_t n,cudaStream_t s,
     const CutlassExecution& e,Profile* prof) { return launch_cutlass(v,p,n,s,e,prof); }
+cudaError_t decode_expert_fp16(const Expert* x,unsigned h,unsigned i,U16* qg,U16* qu,U16* qd,const U32* one,
+    const CutlassExecution& e,cudaStream_t s) { return decode_one_expert(x,h,i,qg,qu,qd,one,e,s); }
 
 std::size_t workspace_bytes(unsigned r,unsigned e,unsigned h,unsigned i) {
     if(!shape(r,e,h,i)) return 0;

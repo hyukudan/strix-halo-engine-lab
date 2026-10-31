@@ -642,7 +642,53 @@ still returns a FAILED receipt with the original error and the measured peaks,
 plus `expert_cache`: the library's last token error (which flag of which gated
 layer and token), `device_timeouts`, stalls, misses, free slots and `flush_ready`.
 In `--decode-commands` mode the failing command writes that receipt to stderr as
-one `FAILED-RECEIPT {...}` line before the worker exits. An explicit `--tier-vram-gib` arena and the keepable minimum (288 residents; the
+one `FAILED-RECEIPT {...}` line before the worker exits.
+
+**Steps, predictions and the decode timeline.** The binding keeps the library's
+step rule (`StepPlan`, equal to tierstream's `DgSteps` over GLM's whole call order
+in `glm_native_decode_host`): a step exports a gated layer when its rows name it
+and it holds no prefill keep set. An export promises predicted ids, and
+`--tier-predict 1` enqueues them, only when the step also exports the next layer,
+so no prediction ever targets a layer the step skips or holds; an export of a
+skipped or held layer, a mismatched prediction, and an all-layer decode token
+while any layer still holds its keep set all fail loudly naming the layer.
+`--decode-profile` (service and harness) records one CUDA event per enqueued
+decode phase (embed, hyper-connection mixes, KDA with its open-block replay, DSA
+indexer + sparse attention, router, cache export + device wait + bind, predicted
+fork, routed MoE, shared expert, combine, head + argmax, the host gap at the
+result synchronization, MTP) and puts per-layer and per-phase device/host
+milliseconds into every decode step record (`timeline`) and per bench arm
+(`timeline_totals`). Events only: tokens and digests are unchanged; timings
+include the events. A failed token keeps its partial timeline in the failure
+receipt (`expert_cache.decode_timeline_at_failure`), whose longest interval names
+the layer and phase where the device stalled.
+
+**Slot census.** Health `tier_plan.slot_census_at_open`, every `--decode-profile`
+step record (`slot_census`) and every failure receipt
+(`expert_cache.slot_census_at_failure`) carry the library slot table's homes per
+gated layer (units on a persistent slot - `guard_slot - 2 x max_ids` residents and
+spares - on a bank alias slot, absent), the free persistent slots read from the
+table (live, unlike `ts_dg_stats.free_slots`, which is folded at the last
+boundary), and with `--decode-profile` each exported layer's decode misses
+(its ids absent from the table when it exported; tierstream counts misses only at
+`ss_end`). Read-only kernels; outputs unchanged.
+
+**Exact decode levers (pending rows).** `skip_empty_expert_groups`
+(`--skip-empty-expert-groups 0|1`, `STRIX_GLM_RTX_SKIP_EMPTY_GROUPS`): the routed
+MoE call lists the experts holding routed rows first on the device
+(`c1_schedule.hpp`, after the dispatch, in the scatter cursor's space) and launches
+only ceil(min(288, rows x 8) / 16) expert groups (1 instead of 18 for a decode
+row); groups keep their 0.. numbering, parity and `retired[g-2]` guard; every
+expert's decode, GEMM problems and epilogue are unchanged, and the merge sums the
+routes in the same order. `persistent_dense_fp16` (`--persistent-dense-fp16 0|1`,
+`STRIX_GLM_RTX_PERSISTENT_DENSE_FP16`): the shared experts of layers 3..44 and the
+dense FFNs of 0..2 are decoded once at startup by the C1 decode window into
+persistent FP16 operands (~2.8 GiB, the plan part "persistent FP16 shared + dense
+experts (decode)", charged before the cache opens so the arena shrinks by it); the
+decode calls skip their decode window. When the whole-device plan cannot afford
+it, startup drops it and health `tier_plan.persistent_dense_fp16` says why. Both
+are pending in every profile (their builtin, off, runs) until a window shows equal
+decode digests with and without them; `--allow-pending` or the switch runs them. An explicit `--tier-vram-gib` arena and the keepable minimum (288 residents; the
 planner adds the spares) are checked in the startup plan and the dry plan,
 before authentication or any load. Every run uses the reduced schedule (32K TTFT
 only with `--full-card`); a schedule whose printed estimate exceeds `--timeout`

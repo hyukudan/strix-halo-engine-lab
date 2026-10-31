@@ -28,6 +28,12 @@ struct Call {
     // contribution untouched, so batches of WHOLE experts over the same rows and
     // workspace, the last with combine=true, give the one-call result bitwise.
     bool combine=true;
+    // CUTLASS path, routed (experts > 1): launch only the groups that can hold routed rows;
+    // the device lists the routed experts first (c1_schedule.hpp). Per-expert arithmetic unchanged.
+    bool compact_groups=false;
+    // CUTLASS path, one expert (shared / dense): its FP16 B operands decoded once by
+    // decode_expert_fp16 (the decode window's exact values); the per-call decode is skipped.
+    const U16 *fp16_gate=nullptr,*fp16_up=nullptr,*fp16_down=nullptr;
 };
 struct Profile {
     cudaEvent_t begin[18], decoded[18], gate_up[18], down[18];
@@ -48,6 +54,10 @@ cudaError_t prepare_cutlass(CutlassExecution&); // host setup, before timing
 std::size_t workspace_bytes_cutlass(unsigned rows,unsigned experts,unsigned hidden,unsigned inter);
 cudaError_t enqueue_cutlass(const Call&,void*,std::size_t,cudaStream_t,
     const CutlassExecution&,Profile* = nullptr);
+// One expert's gate/up (hidden x inter) and down (inter x hidden) FP16 B operands, exactly as the
+// C1 decode window writes them; `one` is a device word holding 1. Caller owns the buffers.
+cudaError_t decode_expert_fp16(const Expert* e,unsigned hidden,unsigned inter,U16* qg,U16* qu,U16* qd,const U32* one,
+    const CutlassExecution&,cudaStream_t);
 // Caller owns workspace and keeps matrices/inputs alive through stream completion.
 // No allocation, synchronization, device discovery or environment reading inside enqueue.
 std::size_t workspace_bytes(unsigned rows,unsigned experts,unsigned hidden,unsigned inter);

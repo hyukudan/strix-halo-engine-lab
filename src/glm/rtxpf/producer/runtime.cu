@@ -9,6 +9,7 @@
 #include "unit_auth.hpp"
 #include "head_select.hpp"
 #include "runtime.hpp"
+#include "decode_timeline.hpp"
 #include "policy.hpp"
 #include "state_slices.hpp"
 #include "strix/serve/json.hpp"
@@ -150,6 +151,14 @@ __global__ void router(const float* x,const U16* w,const float* bias,U32* ids,fl
 __global__ void check_finite(const float* x,std::size_t n,unsigned* flag){auto j=std::size_t(blockIdx.x)*256+threadIdx.x;if(j<n)flag_if(flag,x[j]);}
 // Tierstream adapter: guarded slot -> GLM descriptor for each selected ID,
 // indexed by original expert ID. Unselected entries stay zero (never read).
+// Census (diagnostics, read-only): the layer's exported ids absent from the slot table at
+// export time (its decode misses), and per gated layer the table's homes.
+__global__ void count_absent(TierView v,unsigned g,const U32* ids,unsigned n,U32* misses){
+    if(threadIdx.x==0){const volatile std::int32_t* t=v.slot_of+v.unit_base[g];unsigned c=0;for(unsigned j=0;j<n;++j)c+=t[ids[j]]<0?1u:0u;misses[g]=c;}}
+__global__ void slot_census(TierView v,unsigned persistent,U32* out){
+    const unsigned g=blockIdx.x;if(g>=v.n_gated)return;const volatile std::int32_t* t=v.slot_of+v.unit_base[g];unsigned a=0,b=0,c=0;
+    for(unsigned u=threadIdx.x;u<v.units;u+=blockDim.x){const std::int32_t s=t[u];if(s<0)++c;else if(unsigned(s)<persistent)++a;else ++b;}
+    atomicAdd(out+3*g,a);atomicAdd(out+3*g+1,b);atomicAdd(out+3*g+2,c);}
 __global__ void bind_units(TierView v,unsigned g,const U32* ids,unsigned n,const UnitOffsets* offsets,Expert* out){
     unsigned j=threadIdx.x;if(j>=n)return;U32 id=ids[j];bool absent=false;
     auto slot=guarded_slot(v.slot_of,v.unit_base,v.abort?*v.abort:0u,v.guard_slot,g,id,&absent);
@@ -225,6 +234,7 @@ struct Layer {
     const U16 *input=nullptr,*post=nullptr,*router=nullptr;
     const float* bias=nullptr;
     Expert shared{},dense{};Buffer descriptors,host_descriptors,shared_descriptor;Event ready;
+    Buffer fp16_g,fp16_u,fp16_d; // persistent_dense_fp16: this layer's shared (or dense) FP16 B operands
 };
 struct Blob {std::string name,sha;std::size_t bytes;Buffer device,host;std::unique_ptr<VerifiedFile> file;};
 struct Ring {double read_ms=0;Buffer device,host;Event loaded,retired;bool used=false;std::future<void> read;int layer=-1;};
@@ -328,6 +338,10 @@ struct Runtime::Impl {
             // Without --vram-total-gib (also with only --ram-total-gib) the usable device is the VRAM cap.
             const std::uint64_t hard=std::min<std::uint64_t>(total0,99860000000ULL);
             auto tp=plan_tile(manifest,cap,requested_rows,dopts,used0,host_budget(physical0,commit0,floor_gib),process_host_bytes(),!prefill_via_cache,hard);
+            // persistent_dense_fp16 is dropped (and recorded) when the plan cannot afford its copies.
+            if(!tp.refused.empty()&&dopts.persistent_dense_fp16){auto d2=dopts;d2.persistent_dense_fp16=false;
+                auto tp2=plan_tile(manifest,cap,requested_rows,d2,used0,host_budget(physical0,commit0,floor_gib),process_host_bytes(),!prefill_via_cache,hard);
+                if(tp2.refused.empty()){persist_refused=true;persist_note="off: the whole-device plan cannot afford the persistent FP16 copies ("+tp.refused+")";tp=std::move(tp2);}}
             tile=rows=tp.tile;budget_in=tp.in;const auto& planned=tp.plan;startup_budget=tp.json;
             need(valid_schedule(cap,rows),"capacity 4-aligned <=131072; tile 32-aligned <=min(capacity,32768)");
             startup_budget.set("mode",whole_device?"whole-device caps (--vram-total-gib/--ram-total-gib)":"device room (no whole-device cap)");
@@ -384,7 +398,7 @@ struct Runtime::Impl {
         else {for(std::size_t off=0;off<base.bytes;){auto n=std::min<std::size_t>(staging.bytes,base.bytes-off);base.file->read_at(off,staging.p,n);ck(cudaMemcpyAsync(base.device.as<char>()+off,staging.p,n,cudaMemcpyHostToDevice,h2d.s));ck(cudaStreamSynchronize(h2d.s));off+=n;}}
         // Decode allocations precede expert admission: the device budget below
         // is measured after them (session, replay, head, bounded expert slots).
-        dopt=dopts;if(decode_on)prepare_decode(staging,dopt.expert_tier,floor_gib);
+        dopt=dopts;if(persist_refused)dopt.persistent_dense_fp16=false;if(decode_on)prepare_decode(staging,dopt.expert_tier,floor_gib);
         const auto init=prefill_init(prefill_via_cache);
         if(init.rings){Charge c(ring_part);for(auto& r:ring){r.device.allocate(largest);r.host.allocate(largest,true);}}
         Charge layer_charge("prefill expert layers (resident/pinned) + descriptors");
@@ -421,6 +435,14 @@ struct Runtime::Impl {
                 ck(cudaMemcpyAsync(w->descriptors.p,desc,288*sizeof(Expert),cudaMemcpyHostToDevice,h2d.s));}
             layers.push_back(std::move(w));
         }
+        // persistent_dense_fp16 (decode): each shared expert and dense FFN decoded once with the C1
+        // decode window (the same FP16 operands every call would decode), charged by name, before
+        // the cache opens so its arena is planned from what is left.
+        if(decode_on&&dopt.persistent_dense_fp16){Charge c(persist_part);Buffer one;one.allocate(4);const U32 h1=1;ck(cudaMemcpy(one.p,&h1,4,cudaMemcpyHostToDevice));
+            for(unsigned l=0;l<45;++l){auto& w=*layers[l];const std::size_t inter=l<3?12288:2048,n=std::size_t(4096)*inter;
+                w.fp16_g.allocate(n*2);w.fp16_u.allocate(n*2);w.fp16_d.allocate(n*2);
+                ck(decode_expert_fp16(w.shared_descriptor.as<Expert>(),4096,unsigned(inter),w.fp16_g.as<U16>(),w.fp16_u.as<U16>(),w.fp16_d.as<U16>(),one.as<U32>(),exec,compute.s));}
+            ck(cudaStreamSynchronize(compute.s));ck(cudaGetLastError());}
         // Tierstream opens last: its VRAM arena is what remains after prefill
         // residency, base weights, workspaces, head and session; RAM from the
         // free host memory above the floor; the unit file is the disk tier.
@@ -594,6 +616,33 @@ struct Runtime::Impl {
     // The authenticated unit binding is declared BEFORE `tier` (destroyed after it);
     // at cache open it moves into the cache's BoundCache owner, which always closes
     // the cache before releasing the binding, including on constructor unwinding.
+    // Opt-in decode timeline (decode_timeline.hpp): one event per enqueued phase on the
+    // compute stream, read after the token's synchronization. Events only.
+    struct DecodeTimelineRec {
+        bool on=false;std::vector<cudaEvent_t> ev;std::vector<TimelineMark> marks;std::size_t n=0;std::chrono::steady_clock::time_point last;
+        ~DecodeTimelineRec(){for(auto e:ev)if(e)cudaEventDestroy(e);}
+        void enable(){if(ev.empty()){ev.resize(640,nullptr);for(auto& e:ev)ck(cudaEventCreate(&e));}on=true;}
+        void start(cudaStream_t s){if(!on)return;marks.clear();n=0;ck(cudaEventRecord(ev[n++],s));last=std::chrono::steady_clock::now();}
+        void mark(int layer,DecodePhase phase,cudaStream_t s){if(!on)return;need(n<ev.size(),"decode timeline: event pool exhausted");ck(cudaEventRecord(ev[n++],s));
+            const auto t=std::chrono::steady_clock::now();marks.push_back({layer,phase,std::chrono::duration<double,std::milli>(t-last).count()});last=t;}
+        // After the stream synchronized: device intervals between consecutive events.
+        Json collect(){std::vector<double> gpu(marks.size());for(std::size_t i=0;i<marks.size();++i){float ms=0;ck(cudaEventElapsedTime(&ms,ev[i],ev[i+1]));gpu[i]=ms;}
+            float span=0;if(n>1)ck(cudaEventElapsedTime(&span,ev[0],ev[n-1]));return decode_timeline_json(marks,gpu,span);}
+        // A failed token, after the streams were synchronized (best effort, never throws): the
+        // intervals up to the first event that did not complete; the longest interval names the
+        // layer and phase where the device stalled (a timed-out cache wait shows as ~the timeout).
+        Json collect_failed()noexcept{try{auto j=Json::object();std::vector<TimelineMark> done;std::vector<double> gpu;double longest=-1;std::size_t at=0;
+                for(std::size_t i=0;i<marks.size();++i){if(cudaEventQuery(ev[i+1])!=cudaSuccess){cudaGetLastError();
+                        auto p=Json::object();p.set("layer",marks[i].layer);p.set("phase",decode_phase_names[std::size_t(marks[i].phase)]);j.set("first_incomplete",p);break;}
+                    float ms=0;if(cudaEventElapsedTime(&ms,ev[i],ev[i+1])!=cudaSuccess){cudaGetLastError();break;}
+                    done.push_back(marks[i]);gpu.push_back(ms);if(ms>longest){longest=ms;at=i;}}
+                j.set("timeline",decode_timeline_json(done,gpu,0));
+                if(longest>=0){auto p=Json::object();p.set("layer",done[at].layer);p.set("phase",decode_phase_names[std::size_t(done[at].phase)]);p.set("gpu_ms",longest);j.set("longest_interval",p);}
+                return j;}catch(...){return Json::object();}}
+    } timeline;
+    Json failed_timeline; // the last failed decode token's partial timeline (--decode-profile)
+    Json failed_slots;    // the slot census after the last failed decode token (always; best effort)
+    void failed_census()noexcept{try{if(ts_tier&&tier.get()==ts_tier)failed_slots=ts_tier->census(compute.s);}catch(...){cudaGetLastError();}}
     bool decode_mode=false;SessionFrontier sess;std::unique_ptr<ExpertCatalog> catalog;std::unique_ptr<UnitBinding> unit_binding;std::unique_ptr<ExpertTier> tier;
     Buffer kda_s,kda_c,ck_s,ck_c,tail,dlat,dkey,dgate,dpool,head_dec,head_suh,head_svh,head_ws,logits,argres,rx,rx2,hrow,emb,route,mtp_out,host_small;
     std::vector<std::vector<std::byte>> snapshot;std::vector<std::uint32_t> snapshot_tokens;
@@ -616,6 +665,10 @@ struct Runtime::Impl {
     static constexpr const char* head_blob_part="lm_head compressed (startup transient)";
     static constexpr const char* compare_part="comparison backend slots";
     static constexpr const char* table_part="GLM unit tables";
+    static constexpr const char* persist_part="persistent FP16 shared + dense experts (decode)";
+    // Shared experts of layers 3..44 (H x 2048 gate/up, 2048 x H down) and the dense FFNs of 0..2 (H x 12288).
+    static constexpr std::uint64_t persist_bytes=42ULL*3*4096*2048*2+3ULL*3*4096*12288*2;
+    bool persist_refused=false;std::string persist_note;
     static constexpr const char* staging_part="startup staging + small host buffers";
     // Our host commit (process private bytes minus our WDDM device backing).
     static std::uint64_t process_host_bytes(){const auto c=process_host_commit();need(c.raw_private!=~0ULL,"process memory counters");return c.host;}
@@ -634,6 +687,7 @@ struct Runtime::Impl {
         if(rings)in.device.push_back({ring_part,2*largest}); // interim: prefill streams layers through its own rings
         else in.min_resident=PrefillResidency::min_resident(); // one whole layer kept (the planner adds the spares), refused before loading
         if(d.reference_compare)in.device.push_back({compare_part,8*dstride+288*sizeof(Expert)});
+        if(d.persistent_dense_fp16)in.device.push_back({persist_part,persist_bytes});
         // Margins kept free under the caps (graphs, CUTLASS, untracked, process growth): today's 4 GiB without a whole-device cap.
         in.vram_margin=whole?(1ULL<<30):(4ULL<<30);in.ram_margin=1ULL<<30;
         in.pinned={{staging_part,(8ULL<<20)+65536+(16ULL<<20)}};if(rings)in.pinned.push_back({ring_part,2*io_round(largest)});
@@ -791,8 +845,9 @@ struct Runtime::Impl {
             placement.set("resident_per_layer_min",lo);placement.set("resident_per_layer_max",hi);placement.set("policy",dopt.tier_policy);}
         if(dopt.tier_predict)ts_tier->enable_predict();
         if(!dopt.routes_out.empty()){ts_tier->enable_routes();routes_file.open(dopt.routes_out,std::ios::binary|std::ios::app);need(routes_file.is_open(),("open --routes-out "+dopt.routes_out).c_str());}
-        tier_plan=Json::object();tier_plan.set("placement",placement);tier_plan.set("flush_ready",dopt.tier_flush_ready?"on: dg_flush_ready, the demand stream is flushed after each ready signal (WDDM submission)":"off");tier_plan.set("predicted_prefetch",dopt.tier_predict?"on: next layer's router on this layer's MoE input, ss_dg_enqueue_predict on a side stream (8 ids, layers 3..43 predict 4..44)":"off");tier_plan.set("routes_recording",dopt.routes_out.empty()?"off":dopt.routes_out);
+        tier_plan=Json::object();tier_plan.set("placement",placement);tier_plan.set("skip_empty_expert_groups",dopt.skip_empty_expert_groups?"on: routed MoE launches only the expert groups holding routed rows (device compaction)":"off");tier_plan.set("persistent_dense_fp16",dopt.persistent_dense_fp16?"on: shared experts and dense FFNs decoded once at startup":persist_note.empty()?std::string("off"):persist_note);tier_plan.set("flush_ready",dopt.tier_flush_ready?"on: dg_flush_ready, the demand stream is flushed after each ready signal (WDDM submission)":"off");tier_plan.set("predicted_prefetch",dopt.tier_predict?"on: next layer's router on this layer's MoE input, ss_dg_enqueue_predict on a side stream (8 ids, layers 3..43 predict 4..44)":"off");tier_plan.set("routes_recording",dopt.routes_out.empty()?"off":dopt.routes_out);
         tier_plan.set("unit_file",dopt.unit_file);tier_plan.set("unit_file_sha256",unit_file_sha);tier_plan.set("unit_manifest_sha256",dopt.unit_manifest_sha256);
+        tier_plan.set("slot_census_at_open",ts_tier->census(compute.s)); // homes per gated layer as the cache opened
         tier_plan.set("unit_file_authenticated",unit_auth_how);tier_plan.set("unit_file_binding",binding_text);tier_plan.set("unit_file_bound_path",bound_path);tier_plan.set("unit_file_hash_ms",unit_hash_ms);tier_plan.set("reference_compare",reference_tier!=nullptr);tier_plan.set("unit_stride",stride);tier_plan.set("resident_units",b.resident);tier_plan.set("pinned_units",b.pinned);tier_plan.set("file_units",b.disk);
         tier_plan.set("arena_slots",b.slots+b.ring);tier_plan.set("spare_slots",b.spare_slots);tier_plan.set("host_spares",b.host_spares);tier_plan.set("disk_staging",b.staging);tier_plan.set("three_tier",b.three_tier);
         tier_plan.set("vram_bytes",(b.slots+b.ring)*stride);tier_plan.set("ram_bytes",b.host_bytes(stride));tier_plan.set("device_budget_bytes",dev);tier_plan.set("host_budget_bytes",host);
@@ -931,6 +986,7 @@ struct Runtime::Impl {
         void acquire(unsigned l,const std::uint32_t* ids,unsigned n,void* s)override{auto st=static_cast<cudaStream_t>(s);
             if(join_pending){ck(cudaStreamWaitEvent(st,join.e,0));join_pending=false;} // the previous layer's predict branch, joined before this export
             if(l==routed_first_layer)api->enqueue_begin(s);
+            if(census_on){count_absent<<<1,32,0,st>>>(api->view(),gated_ordinal(l),ids,n,miss_dev.as<U32>());ck(cudaGetLastError());}
             api->enqueue_export(gated_ordinal(l),reinterpret_cast<const std::int32_t*>(ids),n,s);api->enqueue_wait(gated_ordinal(l),s);
             ck(cudaMemsetAsync(desc.p,0,desc.bytes,st));bind_units<<<1,32,0,st>>>(api->view(),gated_ordinal(l),ids,n,offsets.as<UnitOffsets>(),desc.as<Expert>());ck(cudaGetLastError());
             if(route_log.p)ck(cudaMemcpyAsync(route_log.as<U32>()+gated_ordinal(l)*routed_topk,ids,routed_topk*4,cudaMemcpyDeviceToDevice,st));}
@@ -942,7 +998,8 @@ struct Runtime::Impl {
         bool predict=false,join_pending=false;Buffer pred_in,pred_ids,pred_rates,pred_flag;Stream side;Event fork,join;
         void enable_predict(){Charge c(table_part);pred_in.allocate(4096*4);pred_ids.allocate(routed_topk*4);pred_rates.allocate(routed_topk*4);pred_flag.allocate(4);api->set_predict_ids(routed_topk,gated_ordinal(routed_last_layer-1));predict=true;}
         void predict_next(unsigned l,const float* x,cudaStream_t st){
-            if(!predict||l+1>=routed_last_layer)return;auto& w=*r.layers[l+1];
+            // Never for a layer the step skips or holds: its export promised nothing (StepPlan).
+            if(!predict||l+1>=routed_last_layer||!api->step_exports(gated_ordinal(l+1)))return;auto& w=*r.layers[l+1];
             // The branch reads its OWN copy of the input: the next layer overwrites `x`
             // (normalized) before the join. The copy is ordered on the main stream.
             ck(cudaMemcpyAsync(pred_in.p,x,4096*4,cudaMemcpyDeviceToDevice,st));
@@ -950,6 +1007,19 @@ struct Runtime::Impl {
             router<<<1,320,0,side.s>>>(pred_in.as<float>(),w.router,w.bias,pred_ids.as<U32>(),pred_rates.as<float>(),pred_flag.as<unsigned>());ck(cudaGetLastError());
             api->enqueue_predict(gated_ordinal(l),reinterpret_cast<const std::int32_t*>(pred_ids.p),routed_topk,side.s);
             ck(cudaEventRecord(join.e,side.s));join_pending=true;}
+        // Slot census (diagnostics): per-layer decode misses (counted before each export) and the
+        // table's homes per layer; with --decode-profile per token, at a failure, and at open.
+        Buffer miss_dev,census_dev;bool census_on=false;
+        unsigned persistent_slots()const{auto v=api->view();return v.guard_slot>=2*routed_topk?v.guard_slot-2*routed_topk:0;}
+        void enable_census(){if(!miss_dev.p){Charge c(table_part);miss_dev.allocate(routed_gated*4);census_dev.allocate(routed_gated*3*4);}census_on=true;}
+        void census_begin(cudaStream_t s){if(census_on)ck(cudaMemsetAsync(miss_dev.p,0xFF,miss_dev.bytes,s));}
+        // After the stream synchronized (best effort for a failed token's caller).
+        Json census(cudaStream_t s){if(!census_dev.p){Charge c(table_part);miss_dev.allocate(routed_gated*4);ck(cudaMemsetAsync(miss_dev.p,0xFF,miss_dev.bytes,s));census_dev.allocate(routed_gated*3*4);}
+            const unsigned persistent=persistent_slots();ck(cudaMemsetAsync(census_dev.p,0,census_dev.bytes,s));slot_census<<<routed_gated,256,0,s>>>(api->view(),persistent,census_dev.as<U32>());ck(cudaGetLastError());
+            std::vector<U32> raw(routed_gated*3),miss(routed_gated);ck(cudaMemcpyAsync(raw.data(),census_dev.p,census_dev.bytes,cudaMemcpyDeviceToHost,s));
+            ck(cudaMemcpyAsync(miss.data(),miss_dev.p,miss_dev.bytes,cudaMemcpyDeviceToHost,s));ck(cudaStreamSynchronize(s));
+            std::vector<LayerCensus> layers(routed_gated);for(unsigned g=0;g<routed_gated;++g)layers[g]={raw[3*g],raw[3*g+1],raw[3*g+2]};
+            return census_json(layers,census_on?miss:std::vector<U32>{},persistent);}
         // Routes census (DS routes format): every gated layer's 8 ids of the token.
         Buffer route_log;
         void enable_routes(){Charge c(table_part);route_log.allocate(std::size_t(routed_gated)*routed_topk*4);ck(cudaMemset(route_log.p,0xFF,route_log.bytes));}
@@ -989,13 +1059,15 @@ struct Runtime::Impl {
             for(auto& r:ring){r.layer=-1;if(r.read.valid())try{r.read.get();}catch(...){}cudaEventRecord(r.retired.e,compute.s);}cudaStreamSynchronize(compute.s);throw;}
         in_session=false;sess.begin(input);routes_header("session-"+std::to_string(++route_sessions),input.size());auto j=Json::object();j.set("frontier",int(sess.frontier()));j.set("prefill_ms",std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-begin).count());j.set("prefill_timings",last_timings);return j;
     }
+    static void predecoded(Call& v,Layer& w){if(w.fp16_g.p){v.fp16_gate=w.fp16_g.as<U16>();v.fp16_up=w.fp16_u.as<U16>();v.fp16_down=w.fp16_d.as<U16>();}}
     void moe(unsigned l,Layer& w,const float* x,float* y){
-        router<<<1,320,0,compute.s>>>(x,w.router,w.bias,ids.as<U32>(),rates.as<float>(),flag.as<unsigned>());
-        tier->acquire(l,ids.as<U32>(),8,compute.s);if(ts_tier&&tier.get()==ts_tier)ts_tier->predict_next(l,x,compute.s);
+        router<<<1,320,0,compute.s>>>(x,w.router,w.bias,ids.as<U32>(),rates.as<float>(),flag.as<unsigned>());timeline.mark(int(l),DecodePhase::router,compute.s);
+        tier->acquire(l,ids.as<U32>(),8,compute.s);timeline.mark(int(l),DecodePhase::export_wait,compute.s);
+        if(ts_tier&&tier.get()==ts_tier&&ts_tier->predict){ts_tier->predict_next(l,x,compute.s);timeline.mark(int(l),DecodePhase::predict,compute.s);}
         auto* d=static_cast<const Expert*>(tier->bind_selected_descriptors(l,compute.s));
-        Call v{1,288,4096,2048,x,ids.as<U32>(),rates.as<float>(),d,routed.as<float>()};ck(enqueue_cutlass(v,workspace.p,ws_bytes,compute.s,exec));
-        Call sh{1,1,4096,2048,x,nullptr,nullptr,w.shared_descriptor.as<Expert>(),shared.as<float>()};ck(enqueue_cutlass(sh,workspace.p,ws_bytes,compute.s,exec));
-        add<<<16,256,0,compute.s>>>(routed.as<float>(),shared.as<float>(),y,4096,flag.as<unsigned>());tier->release(l,compute.s);
+        Call v{1,288,4096,2048,x,ids.as<U32>(),rates.as<float>(),d,routed.as<float>()};v.compact_groups=dopt.skip_empty_expert_groups;ck(enqueue_cutlass(v,workspace.p,ws_bytes,compute.s,exec));timeline.mark(int(l),DecodePhase::routed_moe,compute.s);
+        Call sh{1,1,4096,2048,x,nullptr,nullptr,w.shared_descriptor.as<Expert>(),shared.as<float>()};predecoded(sh,w);ck(enqueue_cutlass(sh,workspace.p,ws_bytes,compute.s,exec));timeline.mark(int(l),DecodePhase::shared_expert,compute.s);
+        add<<<16,256,0,compute.s>>>(routed.as<float>(),shared.as<float>(),y,4096,flag.as<unsigned>());tier->release(l,compute.s);timeline.mark(int(l),DecodePhase::combine,compute.s);
     }
     // Session working KDA state (export/replay target); the prefill writes it through kst/kcv.
     float* kst2(unsigned l){return kda_s.as<float>()+std::size_t(kda_slot(l))*(kda_state_bytes/4);}
@@ -1006,27 +1078,29 @@ struct Runtime::Impl {
     Json decode_one(bool qualification){
         need(decode_mode,"decode not enabled");const unsigned P=sess.position();const U32 pending=sess.pending();
         try{
-            auto begin=std::chrono::steady_clock::now();ck(cudaMemsetAsync(flag.p,0,4,compute.s));
+            auto begin=std::chrono::steady_clock::now();timeline.start(compute.s);ck(cudaMemsetAsync(flag.p,0,4,compute.s));
             auto* hs=host_small.as<U32>();hs[0]=pending;ck(cudaMemcpyAsync(tokens.as<U32>()+P,hs,4,cudaMemcpyHostToDevice,compute.s));
-            embed<<<64,256,0,compute.s>>>(u16("model.language_model.embed_tokens.weight"),tokens.as<U32>()+P,rx.as<float>(),1,4);
+            embed<<<64,256,0,compute.s>>>(u16("model.language_model.embed_tokens.weight"),tokens.as<U32>()+P,rx.as<float>(),1,4);timeline.mark(-1,DecodePhase::embed,compute.s);
+            if(ts_tier&&tier.get()==ts_tier)ts_tier->census_begin(compute.s);
             tier->begin_token(P);const unsigned n=kda_replay_rows(P);
             for(unsigned l=0;l<45;++l){auto& w=*layers[l];const float* yrow=part.as<float>();
-                pre(w.attn,w.input,rx.as<float>(),normalized.as<float>(),1);
+                pre(w.attn,w.input,rx.as<float>(),normalized.as<float>(),1);timeline.mark(int(l),DecodePhase::hc_pre_attn,compute.s);
                 if(is_kda_layer(l)){
                     ck(cudaMemcpyAsync(tl(l)+std::size_t(n-1)*4096,normalized.p,kda_row_bytes,cudaMemcpyDeviceToDevice,compute.s));
                     ck(cudaMemcpyAsync(kst2(l),cks(l),kda_state_bytes,cudaMemcpyDeviceToDevice,compute.s));ck(cudaMemcpyAsync(kcv2(l),ckc(l),kda_conv_bytes,cudaMemcpyDeviceToDevice,compute.s));
                     KdaCall v{n,w.k,tl(l),part.as<float>(),kst2(l),kcv2(l)};ck(enqueue_kda(v,workspace.p,ws_bytes,compute.s));yrow=part.as<float>()+std::size_t(n-1)*4096;
                     if(kda_promotes(P)){ck(cudaMemcpyAsync(cks(l),kst2(l),kda_state_bytes,cudaMemcpyDeviceToDevice,compute.s));ck(cudaMemcpyAsync(ckc(l),kcv2(l),kda_conv_bytes,cudaMemcpyDeviceToDevice,compute.s));}
-                }else{DsaCall v{};v.rows=1;v.first=P;v.w=w.d;v.state=sdstate(l);v.x=normalized.as<float>();v.y=part.as<float>();v.nonfinite=flag.as<unsigned>();v.index=DsaIndex::fp32;ck(enqueue_dsa(v,workspace.p,ws_bytes,compute.s));}
-                post(rx.as<float>(),yrow,rx2.as<float>(),1);
-                pre(w.ffn,w.post,rx2.as<float>(),normalized.as<float>(),1);
-                if(l<3){Call v{1,1,4096,12288,normalized.as<float>(),nullptr,nullptr,w.shared_descriptor.as<Expert>(),part.as<float>()};ck(enqueue_cutlass(v,workspace.p,ws_bytes,compute.s,exec));}
+                    timeline.mark(int(l),DecodePhase::kda,compute.s);
+                }else{DsaCall v{};v.rows=1;v.first=P;v.w=w.d;v.state=sdstate(l);v.x=normalized.as<float>();v.y=part.as<float>();v.nonfinite=flag.as<unsigned>();v.index=DsaIndex::fp32;ck(enqueue_dsa(v,workspace.p,ws_bytes,compute.s));timeline.mark(int(l),DecodePhase::dsa,compute.s);}
+                post(rx.as<float>(),yrow,rx2.as<float>(),1);timeline.mark(int(l),DecodePhase::hc_post_attn,compute.s);
+                pre(w.ffn,w.post,rx2.as<float>(),normalized.as<float>(),1);timeline.mark(int(l),DecodePhase::hc_pre_ffn,compute.s);
+                if(l<3){Call v{1,1,4096,12288,normalized.as<float>(),nullptr,nullptr,w.shared_descriptor.as<Expert>(),part.as<float>()};predecoded(v,w);ck(enqueue_cutlass(v,workspace.p,ws_bytes,compute.s,exec));timeline.mark(int(l),DecodePhase::dense_ffn,compute.s);}
                 else moe(l,w,normalized.as<float>(),part.as<float>());
-                post(rx2.as<float>(),part.as<float>(),rx.as<float>(),1);
+                post(rx2.as<float>(),part.as<float>(),rx.as<float>(),1);timeline.mark(int(l),DecodePhase::hc_post_ffn,compute.s);
             }
             hc_final_kernel<<<dim3(16,1),256,0,compute.s>>>(rx.as<float>(),part.as<float>());norm<<<1,256,0,compute.s>>>(part.as<float>(),u16("model.language_model.norm.weight"),hrow.as<float>(),1);
             ck(enqueue_head(head(),hrow.as<float>(),logits.as<float>(),1,head_ws.p,head_ws.bytes,compute.s));ck(enqueue_argmax(logits.as<float>(),vocab_size,argres.as<U32>(),compute.s));
-            ck(cudaMemcpyAsync(hs,argres.p,12,cudaMemcpyDeviceToHost,compute.s));ck(cudaMemcpyAsync(hs+4,flag.p,4,cudaMemcpyDeviceToHost,compute.s));ck(cudaStreamSynchronize(compute.s));
+            ck(cudaMemcpyAsync(hs,argres.p,12,cudaMemcpyDeviceToHost,compute.s));ck(cudaMemcpyAsync(hs+4,flag.p,4,cudaMemcpyDeviceToHost,compute.s));timeline.mark(-1,DecodePhase::head,compute.s);ck(cudaStreamSynchronize(compute.s));
             HeadChoice choice{hs[0],hs[1],0};std::memcpy(&choice.logit,hs+2,4);need(!hs[4],"nonfinite trunk activation; session invalidated");const U32 y=accept_choice(choice);
             auto record=Json::object();
             double digest_ms=0;
@@ -1036,20 +1110,22 @@ struct Runtime::Impl {
                 digest_ms=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-digest_begin).count();record.set("digest_ms",digest_ms);}
             auto trunk_ms=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-begin).count();
             // MTP maintenance (qualification state; does not choose the token).
+            timeline.mark(-1,DecodePhase::host_gap,compute.s); // device idle while the host synchronized, checked and digested
             hs[8]=y;ck(cudaMemcpyAsync(tokens.as<U32>()+P+1,hs+8,4,cudaMemcpyHostToDevice,compute.s));
             embed<<<16,256,0,compute.s>>>(u16("model.language_model.embed_tokens.weight"),tokens.as<U32>()+P+1,emb.as<float>(),1,1);
             auto& w=*layers[45];
             MtpCall m1{1,P,w.m,sdstate(45),emb.as<float>(),hrow.as<float>(),mtp_out.as<float>(),flag.as<unsigned>(),DsaIndex::fp32};m1.phase=1;m1.route_ids=route.as<U32>();ck(enqueue_mtp(m1,workspace.p,ws_bytes,compute.s,exec));
             tier->acquire(45,route.as<U32>(),8,compute.s);auto m2=m1;m2.phase=2;m2.route_ids=nullptr;m2.w.experts=static_cast<const Expert*>(tier->bind_selected_descriptors(45,compute.s));ck(enqueue_mtp(m2,workspace.p,ws_bytes,compute.s,exec));
-            tier->release(45,compute.s);ck(cudaMemcpyAsync(hs+4,flag.p,4,cudaMemcpyDeviceToHost,compute.s));ck(cudaStreamSynchronize(compute.s));ck(cudaGetLastError());need(!hs[4],"nonfinite MTP activation; session invalidated");
+            tier->release(45,compute.s);ck(cudaMemcpyAsync(hs+4,flag.p,4,cudaMemcpyDeviceToHost,compute.s));timeline.mark(-1,DecodePhase::mtp,compute.s);ck(cudaStreamSynchronize(compute.s));ck(cudaGetLastError());need(!hs[4],"nonfinite MTP activation; session invalidated");
             tier->end_token();sess.commit(y);
             std::string routes;
             if(ts_tier&&tier.get()==ts_tier&&ts_tier->route_log.p){std::vector<U32> h(std::size_t(routed_gated)*routed_topk);ck(cudaMemcpy(h.data(),ts_tier->route_log.p,h.size()*4,cudaMemcpyDeviceToHost));routes=routes_line(h.data());
                 if(routes_file.is_open()){routes_file<<routes<<'\n';routes_file.flush();}}
             record.set("position",int(P));record.set("token",std::uint64_t(y));record.set("trunk_ms",trunk_ms);record.set("step_ms",std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-begin).count());record.set("experts",tier->collect_stats());if(!routes.empty())record.set("routes",routes);
+            if(timeline.on){record.set("timeline",timeline.collect());if(ts_tier&&tier.get()==ts_tier)record.set("slot_census",ts_tier->census(compute.s));}
             return record;
-        }catch(const std::exception& e){tier->fail_token(e.what());session_failed();throw;}
-        catch(...){tier->fail_token("non-standard exception");session_failed();throw;}
+        }catch(const std::exception& e){tier->fail_token(e.what());session_failed();if(timeline.on)failed_timeline=timeline.collect_failed();failed_census();throw;}
+        catch(...){tier->fail_token("non-standard exception");session_failed();if(timeline.on)failed_timeline=timeline.collect_failed();failed_census();throw;}
     }
     void export_session(const StateSink& sink){
         need(decode_mode&&sess.open(),"no open session to export");const unsigned P=sess.frontier();ck(cudaStreamSynchronize(compute.s));
@@ -1094,7 +1170,10 @@ std::string Runtime::plan_budget(const std::string& model,unsigned cap,unsigned 
     j.set("cuda_driver_loaded",GetModuleHandleW(L"nvcuda.dll")!=nullptr);return j.dump();
 }
 std::string Runtime::memory_report(const std::string& stage){return p_->memory_json(stage).dump();}
+void Runtime::set_decode_profile(bool on){if(on)p_->timeline.enable();else p_->timeline.on=false;if(p_->ts_tier){if(on)p_->ts_tier->enable_census();else p_->ts_tier->census_on=false;}}
 std::string Runtime::expert_diagnostics(){auto j=Json::object();if(!p_->ts_tier)return j.dump();j=p_->ts_tier->api->diagnostics();
+    if(p_->failed_timeline.find("timeline"))j.set("decode_timeline_at_failure",p_->failed_timeline);
+    if(p_->failed_slots.find("layers"))j.set("slot_census_at_failure",p_->failed_slots);
     if(auto why=p_->ts_tier->unusable();!why.empty())j.set("retired",why);return j.dump();}
 std::string Runtime::save_residency(){return p_->save_residency();}
 std::string Runtime::model_sha256()const{return p_->model_hash;}

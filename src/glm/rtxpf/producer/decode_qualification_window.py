@@ -249,6 +249,8 @@ def service_command(a, binary):
                             ('--tier-policy', getattr(a, 'tier_policy', None)),
                             ('--tier-predict', getattr(a, 'tier_predict', None)),
                             ('--tier-flush-ready', getattr(a, 'tier_flush_ready', None)),
+                            ('--skip-empty-expert-groups', getattr(a, 'skip_empty_expert_groups', None)),
+                            ('--persistent-dense-fp16', getattr(a, 'persistent_dense_fp16', None)),
                             ('--expert-residency', getattr(a, 'expert_residency', None)),
                             ('--expert-routes', getattr(a, 'expert_routes', None)),
                             ('--routes-out', getattr(a, 'routes_out', None)),
@@ -258,6 +260,8 @@ def service_command(a, binary):
                 tier += [flag, str(value)]
         if getattr(a, 'allow_pending', False):
             tier += ['--allow-pending']
+        if getattr(a, 'decode_profile', False):
+            tier += ['--decode-profile']
     prefill = TIERSTREAM_PREFILL_FLAGS if a.expert_tier == 'tierstream' else FILE_TIER_FLAGS
     return [str(binary), *source, '--capacity', str(capacity(a)), *prefill, '--decode-commands', *tier, '--allow-gpu']
 
@@ -1009,13 +1013,15 @@ def worker_options(a):
     the fitted tile sweep (and the note of an arm the parent dropped)."""
     argv = []
     for name in ('capacity', 'vram_total_gib', 'ram_total_gib', 'tier_vram_gib', 'tier_ram_gib', 'tier_spare_percent',
-                 'tier_policy', 'tier_predict', 'tier_flush_ready', 'expert_residency', 'expert_routes', 'routes_out', 'row_tile', 'profile'):
+                 'tier_policy', 'tier_predict', 'tier_flush_ready', 'skip_empty_expert_groups', 'persistent_dense_fp16', 'expert_residency', 'expert_routes', 'routes_out', 'row_tile', 'profile'):
         if getattr(a, name, None) is not None:
             argv += ['--' + name.replace('_', '-'), str(getattr(a, name))]
     if getattr(a, 'full_card', False):
         argv += ['--full-card']
     if getattr(a, 'allow_pending', False):
         argv += ['--allow-pending']
+    if getattr(a, 'decode_profile', False):
+        argv += ['--decode-profile']
     if getattr(a, 'tile_sweep', None):
         argv += ['--tile-sweep', ','.join(str(x) for x in a.tile_sweep)]
         if getattr(a, 'sweep_note', ''):
@@ -1116,6 +1122,11 @@ def arguments(argv=None):
                    'is dropped first if the whole sweep does not fit --timeout')
     p.add_argument('--profile', choices=['default', 'fast', 'quality'],
                    help='the service profile (one switch for every lever; default = today; per-lever options override)')
+    p.add_argument('--skip-empty-expert-groups', choices=['0', '1'], help='routed MoE: launch only expert groups holding routed rows (exact; pending row)')
+    p.add_argument('--persistent-dense-fp16', choices=['0', '1'], help='shared experts / dense FFNs decoded once at startup (exact; pending row; ~2.8 GiB)')
+    p.add_argument('--decode-profile', action='store_true',
+                   help='decode timeline: CUDA events per phase per layer in every decode step record and per-arm totals '
+                        '(outputs unchanged; timings include the events)')
     p.add_argument('--allow-pending', action='store_true', help='run pending profile rows (benchmarks only: receipts unqualified)')
     p.add_argument('--print-effective-config', action='store_true',
                    help='print the service profile resolution (every lever row) and exit; no model read, no CUDA call')

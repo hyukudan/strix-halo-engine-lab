@@ -115,13 +115,15 @@ if(EXISTS "${GLM_TIERSTREAM_SRC}/CMakeLists.txt" AND EXISTS "${GLM_TIERSTREAM_SR
     else()
       set(ts_cuda OFF)
     endif()
+    # The sub-build runs as many jobs as the producer build (build.ps1 -Parallel), default one.
+    set(GLM_TS_PARALLEL 1 CACHE STRING "parallel jobs of the tierstream sub-build")
     set(ts_dir "${CMAKE_BINARY_DIR}/tierstream-${flavor}")
     ExternalProject_Add(tierstream_${flavor}
       SOURCE_DIR "${GLM_TIERSTREAM_SRC}" BINARY_DIR "${ts_dir}" DOWNLOAD_COMMAND "" UPDATE_COMMAND "" INSTALL_COMMAND ""
       CMAKE_ARGS -DCMAKE_BUILD_TYPE=Release -DTS_CUDA=${ts_cuda} -DTS_TESTS=OFF -DCMAKE_CUDA_ARCHITECTURES=120
                  -DCMAKE_C_COMPILER=cl -DCMAKE_CXX_COMPILER=cl "-DCMAKE_CUDA_COMPILER=${CMAKE_CUDA_COMPILER}"
                  -DCMAKE_CXX_COMPILER_LAUNCHER= -DCMAKE_CUDA_COMPILER_LAUNCHER=
-      BUILD_COMMAND ${CMAKE_COMMAND} --build "${ts_dir}" --target tierstream --parallel 2
+      BUILD_COMMAND ${CMAKE_COMMAND} --build "${ts_dir}" --target tierstream --parallel ${GLM_TS_PARALLEL}
       BUILD_BYPRODUCTS "${ts_dir}/tierstream.lib")
     add_library(glm_tierstream_${flavor} STATIC IMPORTED)
     set_target_properties(glm_tierstream_${flavor} PROPERTIES IMPORTED_LOCATION "${ts_dir}/tierstream.lib")

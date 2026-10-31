@@ -32,3 +32,20 @@ std::string tierstream_source_read(const std::string& desc_text,const char* raw_
         if(st!=SS_OK||got!=bytes)return "ss_mfile_pread failed ("+std::to_string(int(st))+"): "+err;return {};
     }catch(const std::exception& e){std::string m=e.what();return m.empty()?"rejected":m;}
 }
+// The library's own step bookkeeping (src/dg_steps.hpp, device-free): replays a
+// script of keep/step calls and returns each step's exported layers. ops: 'H' g =
+// ss_dg_make_resident(g) succeeded, 'R' g = ss_dg_keep(g, NULL, 0), 'A' = ss_begin
+// with no rows (every layer), 'L' g = ss_begin with rows only for g, 'X' = reset_open.
+#include "dg_steps.hpp"
+#include <utility>
+#include <vector>
+std::vector<std::vector<std::uint8_t>> tierstream_dg_steps(unsigned gated,const std::vector<std::pair<char,unsigned>>& ops){
+    ts::DgSteps s;s.init(gated);std::vector<int> layer_of(gated);for(unsigned g=0;g<gated;++g)layer_of[g]=int(g);
+    std::vector<std::vector<std::uint8_t>> out;std::uint32_t seq=0;
+    for(auto [op,g]:ops){
+        if(op=='H')s.hold(g,{g});else if(op=='R')s.keep(g,{});else if(op=='X')s.reset();
+        else if(op=='A'){out.push_back(s.plan(nullptr,layer_of));s.begin(++seq);}
+        else if(op=='L'){std::vector<std::uint32_t> rows(gated,0);rows[g]=1;out.push_back(s.plan(rows.data(),layer_of));s.begin(++seq);}
+    }
+    return out;
+}
