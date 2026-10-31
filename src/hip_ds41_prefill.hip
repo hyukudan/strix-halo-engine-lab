@@ -2182,6 +2182,83 @@ __global__ __launch_bounds__(prouter_threads) void prefill_router_scores_kernel(
             view.scores[static_cast<unsigned long long>(row) * view.experts + expert] = router_score(logits[r][e]);
     }
 }
+// v2 of the same scores (STRIX_DS41_PREFILL_ROUTER_V2, default on): a block of 8 waves covers 32 rows x 32 experts (a
+// wave 8 rows x 16 experts), x and the weights are staged 128 elements at a time and the next chunk's 16-byte loads are
+// issued before the current chunk's products, so the loads overlap the FMAs instead of waiting behind two barriers.
+// Lane l still owns the elements l, l + 32, ... of every (row, expert) of its tile, in ascending order from 0, and the
+// lanes meet in the same butterfly: each score is formed by exactly the decode chain and tree, so every bit is equal.
+// Needs hidden % 4 == 0 and 16-byte aligned x and weight (otherwise the kernel above runs).
+constexpr unsigned prouter2_rows = 32U, prouter2_experts = 32U, prouter2_chunk = 128U, prouter2_threads = 256U;
+constexpr unsigned prouter2_quads = prouter2_rows * prouter2_chunk / 4U / prouter2_threads; // 16-byte loads per thread per array
+__global__ __launch_bounds__(prouter2_threads) void prefill_router_scores_v2_kernel(RouterView view) {
+    __shared__ alignas(16) float xs[prouter2_rows][prouter2_chunk];
+    __shared__ alignas(16) float ws[prouter2_experts][prouter2_chunk];
+    __shared__ float logits[prouter2_rows][prouter2_experts];
+    const unsigned lane = threadIdx.x % 32U, wave = threadIdx.x / 32U;
+    const unsigned row0 = blockIdx.y * prouter2_rows, expert0 = blockIdx.x * prouter2_experts;
+    const unsigned wr = (wave & 3U) * 8U, we = (wave >> 2U) * 16U;
+    float acc[8][16];
+#pragma unroll
+    for (unsigned r = 0; r < 8U; ++r)
+#pragma unroll
+        for (unsigned e = 0; e < 16U; ++e) acc[r][e] = 0.0F;
+    float4 xv4[prouter2_quads], wv4[prouter2_quads];
+    const auto load = [&](unsigned c0) {
+        const unsigned n = (view.hidden - c0 < prouter2_chunk ? view.hidden - c0 : prouter2_chunk);
+#pragma unroll
+        for (unsigned t = 0; t < prouter2_quads; ++t) {
+            const unsigned i = threadIdx.x + t * prouter2_threads, r = i / (prouter2_chunk / 4U), k = (i % (prouter2_chunk / 4U)) * 4U;
+            const unsigned row = row0 + r, expert = expert0 + r;
+            xv4[t] = row < view.rows && k < n ? *reinterpret_cast<const float4*>(view.x + static_cast<unsigned long long>(row) * view.hidden + c0 + k)
+                                              : float4{0.0F, 0.0F, 0.0F, 0.0F};
+            wv4[t] = expert < view.experts && k < n
+                         ? *reinterpret_cast<const float4*>(view.weight + static_cast<unsigned long long>(expert) * view.hidden + c0 + k)
+                         : float4{0.0F, 0.0F, 0.0F, 0.0F};
+        }
+    };
+    load(0U);
+    for (unsigned c0 = 0; c0 < view.hidden; c0 += prouter2_chunk) {
+        const unsigned n = (view.hidden - c0 < prouter2_chunk ? view.hidden - c0 : prouter2_chunk);
+        if (c0) __syncthreads();
+#pragma unroll
+        for (unsigned t = 0; t < prouter2_quads; ++t) {
+            const unsigned i = threadIdx.x + t * prouter2_threads, r = i / (prouter2_chunk / 4U), k = (i % (prouter2_chunk / 4U)) * 4U;
+            *reinterpret_cast<float4*>(&xs[r][k]) = xv4[t];
+            *reinterpret_cast<float4*>(&ws[r][k]) = wv4[t];
+        }
+        __syncthreads();
+        if (c0 + prouter2_chunk < view.hidden) load(c0 + prouter2_chunk);
+        for (unsigned j = 0; j < prouter2_chunk / 32U; ++j) {
+            const unsigned k = lane + 32U * j;
+            if (k >= n) break; // n is a multiple of 32 (hidden is); the chain skips nothing
+            float xv[8], wv[16];
+#pragma unroll
+            for (unsigned r = 0; r < 8U; ++r) xv[r] = xs[wr + r][k];
+#pragma unroll
+            for (unsigned e = 0; e < 16U; ++e) wv[e] = ws[we + e][k];
+#pragma unroll
+            for (unsigned r = 0; r < 8U; ++r)
+#pragma unroll
+                for (unsigned e = 0; e < 16U; ++e) acc[r][e] = acc[r][e] + wv[e] * xv[r];
+        }
+    }
+#pragma unroll
+    for (unsigned r = 0; r < 8U; ++r)
+#pragma unroll
+        for (unsigned e = 0; e < 16U; ++e) {
+            float v = acc[r][e];
+#pragma unroll
+            for (unsigned d = 16U; d; d /= 2U) v = v + __shfl_xor(v, static_cast<int>(d), 32);
+            if (lane == 0U) logits[wr + r][we + e] = v;
+        }
+    __syncthreads();
+    for (unsigned i = threadIdx.x; i < prouter2_rows * prouter2_experts; i += prouter2_threads) {
+        const unsigned r = i / prouter2_experts, e = i % prouter2_experts, row = row0 + r, expert = expert0 + e;
+        if (row < view.rows && expert < view.experts)
+            view.scores[static_cast<unsigned long long>(row) * view.experts + expert] = router_score(logits[r][e]);
+    }
+}
+
 // Top-k of one row per block, as the decode router's selection: repeated arg-max of score + bias
 // (larger value, then lower id), weights from the unbiased scores in selection order.
 __global__ __launch_bounds__(256) void prefill_router_select_kernel(RouterView view) {
@@ -2591,8 +2668,17 @@ void enqueue_prefill_router(const RouterView& view, void* stream) {
     RouterView v = view;
     v.wide_stage = wide && view.wide_stage && view.hidden % 4U == 0U && reinterpret_cast<std::uintptr_t>(view.x) % 16U == 0U &&
                    reinterpret_cast<std::uintptr_t>(view.weight) % 16U == 0U;
-    hipLaunchKernelGGL(prefill_router_scores_kernel, dim3((view.rows + prouter_rows - 1U) / prouter_rows,
-                       (view.experts + prouter_experts - 1U) / prouter_experts), dim3(prouter_threads), 0, queue, v);
+    // STRIX_DS41_PREFILL_ROUTER_V2 (read per call; default on, =0 off): the v2 scores kernel, the same bits
+    const char* v2_env = std::getenv("STRIX_DS41_PREFILL_ROUTER_V2");
+    const bool v2 = !(v2_env && v2_env[0] == '0') && v.wide_stage; // 16-byte staging admitted (alignment, hidden % 4)
+    if (v2) {
+        // experts fastest: the blocks of one row tile run together and share its activations in the L2
+        hipLaunchKernelGGL(prefill_router_scores_v2_kernel, dim3((view.experts + prouter2_experts - 1U) / prouter2_experts,
+                           (view.rows + prouter2_rows - 1U) / prouter2_rows), dim3(prouter2_threads), 0, queue, v);
+    } else {
+        hipLaunchKernelGGL(prefill_router_scores_kernel, dim3((view.rows + prouter_rows - 1U) / prouter_rows,
+                           (view.experts + prouter_experts - 1U) / prouter_experts), dim3(prouter_threads), 0, queue, v);
+    }
     hipLaunchKernelGGL(prefill_router_select_kernel, dim3(view.rows), dim3(256), 0, queue, view);
     check(hipGetLastError(), "prefill router launch");
 }

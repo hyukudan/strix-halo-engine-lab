@@ -885,6 +885,17 @@
   },
   {
     "engine": "deepseek",
+    "name": "Prefill router scores v2",
+    "flag_or_env": "STRIX_DS41_PREFILL_ROUTER_V2",
+    "default": "on",
+    "exact": "Bitwise: prefill router scores, ids and weights of the v2 and v1 kernels equal to the decode router and to the host reference (synthetic 64 experts / 77 rows, 40 experts / hidden 1056 / 33 and 1 rows, real layer 20 at 300 and 8192 rows).",
+    "gain": "Router kernel (layer 20 weights, 384 experts, scores + selection, interleaved): 20.71 -> 5.87 ms at 8192 rows (-72 %), 5.26 -> 1.52 ms at 2048, 0.58 -> 0.40 ms at 512. Two-node serve TTFT at 8,399 / 32,499 tokens (one binary, cache off, one load per arm, two GPU turns in opposite arm order): 8.876 / 31.852 s with STRIX_DS41_PREFILL_ROUTER_V2=0 vs 8.707 / 31.373 s default (-1.9 / -1.5 %); logits and generated ids identical.",
+    "preconditions": "16-byte aligned activations and router weights and hidden a multiple of 4 (hidden a multiple of 32 is required by every prefill router call); otherwise the v1 kernel.",
+    "off_switch": "STRIX_DS41_PREFILL_ROUTER_V2=0",
+    "doc_anchor": "docs/optimizations.md#ds-router-v2"
+  },
+  {
+    "engine": "deepseek",
     "name": "Exact dense prefill selector",
     "flag_or_env": "STRIX_DS41_DENSE_SELECT",
     "default": "auto",
