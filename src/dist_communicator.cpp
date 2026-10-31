@@ -1674,6 +1674,7 @@ public:
 class Communicator::Pipeline {
 public:
     std::size_t chunk = 0;
+    std::size_t capacity = 0;  // largest message of the chunked path (larger ones take the plain host path)
     std::byte *send = nullptr, *receive = nullptr;
     hipStream_t tx = nullptr, rx = nullptr;
     hipEvent_t producer = nullptr, consumer = nullptr;
@@ -1707,7 +1708,7 @@ public:
         if (failed.load(std::memory_order_acquire)) throw std::runtime_error("dist pipeline: a stage failed");
     }
     bool legacy = false;
-    Pipeline(std::size_t capacity, std::size_t size, bool compatible) : chunk(size), legacy(compatible) {
+    Pipeline(std::size_t bytes, std::size_t size, bool compatible) : chunk(size), capacity(bytes), legacy(compatible) {
         const auto count = (capacity - 1U) / chunk + 1U;
         const auto allocation = capacity + count * sizeof(Trailer);
         try {
@@ -1850,7 +1851,7 @@ Communicator::Communicator(Group group, std::unique_ptr<Transport> transport, st
     if (direct_ && trace_) direct_->set_trace(trace_);
 }
 
-void Communicator::resize_bytes(std::size_t bytes) {
+void Communicator::resize_bytes(std::size_t bytes, bool grow_pipeline) {
     if (bytes == max_bytes_) return;
     if (bytes < staged_ready_bytes_) throw std::invalid_argument("dist resize below staged readiness capacity");
     if (started_ || direct_started_ || staged_prepared_ || staged_receive_held_)
@@ -1860,7 +1861,7 @@ void Communicator::resize_bytes(std::size_t bytes) {
     const auto old_bytes = max_bytes_;
     const auto chunk = pipeline_ ? pipeline_->chunk : 0;
     const bool legacy = pipeline_ && pipeline_->legacy;
-    pipeline_.reset();
+    if (grow_pipeline) pipeline_.reset();
     check(hipHostFree(send_host_), "release send capacity");
     send_host_ = nullptr;
     check(hipHostFree(receive_host_), "release receive capacity");
@@ -1870,7 +1871,7 @@ void Communicator::resize_bytes(std::size_t bytes) {
     check(hipHostMalloc(reinterpret_cast<void**>(&send_host_), bytes + sizeof(Trailer), flags), "grow pinned send buffer");
     check(hipHostMalloc(reinterpret_cast<void**>(&receive_host_), bytes + sizeof(Trailer), flags), "grow pinned receive buffer");
     if (d2h_kernel_bytes_) check(hipHostGetDevicePointer(&send_device_alias_, send_host_, 0), "grow send alias");
-    if (chunk) pipeline_ = std::make_unique<Pipeline>(bytes, chunk, legacy);
+    if (chunk && grow_pipeline) pipeline_ = std::make_unique<Pipeline>(bytes, chunk, legacy);
     max_bytes_ = bytes;
     for (auto& r : routes_) if (!r.direct && r.up_to == old_bytes) r.up_to = bytes;
 }
@@ -2253,13 +2254,13 @@ void Communicator::start(hipStream_t stream, const void* local, std::size_t byte
     }
     if (bytes == 0U || bytes > max_bytes_ || !local) throw std::invalid_argument("dist exchange size or buffers");
     tag_ = tag;
-    if (pipeline_ && bytes > pipeline_->chunk) start_pipeline(stream, local, bytes);
+    if (pipeline_ && bytes > pipeline_->chunk && bytes <= pipeline_->capacity) start_pipeline(stream, local, bytes);
     else start_host(stream, local, bytes);
 }
 
 bool Communicator::start_async(hipStream_t stream, const void* local, void* remote, std::size_t bytes, const Tag& tag,
                                hipEvent_t destination_last_use, hipEvent_t source_free) {
-    if (!async_start_ || !pipeline_ || bytes <= pipeline_->chunk || (direct_ && route(bytes).direct)) {
+    if (!async_start_ || !pipeline_ || bytes <= pipeline_->chunk || bytes > pipeline_->capacity || (direct_ && route(bytes).direct)) {
         start(stream, local, bytes, tag);
         return false;
     }

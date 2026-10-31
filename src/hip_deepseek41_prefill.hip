@@ -942,24 +942,26 @@ DevicePrefill::DevicePrefill(const std::filesystem::path& gguf, const PrefillOpt
     m.sh_deltas = Dev<float>(T * I / 32U);
     m.sh_sums = Dev<std::int32_t>(T * I / 32U);
     if (m.distributed()) {
+        // row_split: the half sums hold one rank's rows of a split run (every other window), or a whole run below
+        // split_min_rows (no split); without the row split, every row
+        const std::size_t split_rows = ((T + 2U * W - 1U) / (2U * W)) * W;
+        const std::size_t half_rows = options.row_split ? std::max(split_rows, std::min<std::size_t>(T, m.split_min_rows)) : T;
         if (options.row_split) {
             bool want = true;
             if (const char* v = std::getenv("STRIX_DS41_PREFILL_STAGED_HALF"); v != nullptr && v[0] == '0') want = false;
-            // one rank's rows of a split run: every other window
-            const std::size_t bytes = ((T + 2U * W - 1U) / (2U * W)) * W * H * 4U;
+            const std::size_t bytes = split_rows * H * 4U;
             auto* comm = options.communicator;
             if (want && comm->send_staging(std::min(bytes, comm->max_bytes())) != nullptr) {
                 const std::size_t before = comm->max_bytes();
-                if (bytes > before) comm->resize_bytes(bytes);
+                if (bytes > before) comm->resize_bytes(bytes, false);  // the staging buffers only (one message per layer)
                 m.staged_half = comm->send_staging(bytes) != nullptr;
-                if (!m.staged_half && bytes > before) comm->resize_bytes(before);
+                if (!m.staged_half && bytes > before) comm->resize_bytes(before, false);
             }
             m.staged_gather = m.staged_half;
             if (const char* v = std::getenv("STRIX_DS41_PREFILL_STAGED_GATHER"); v != nullptr && v[0] == '0') m.staged_gather = false;
         }
-        m.half_own = Dev<float>(T * H);
-        // staged: half_other only for the runs below split_min_rows (no row split), half_recv not at all
-        m.half_other = Dev<float>((m.staged_half ? std::min<std::size_t>(T, std::max(m.split_min_rows, 1U)) : T) * H);
+        m.half_own = Dev<float>(half_rows * H);
+        m.half_other = Dev<float>(half_rows * H);
         if (options.row_split) {
             m.peer_kv = Dev<float>(T * attn::kHeadDim);
             m.peer_ckv = Dev<float>(T * attn::kHeadDim);
@@ -968,7 +970,7 @@ DevicePrefill::DevicePrefill(const std::filesystem::path& gguf, const PrefillOpt
             m.peer_xdeltas = Dev<float>(T * H / 32U);
             m.peer_ids = Dev<std::uint32_t>(T * K);
             m.peer_route_w = Dev<float>(T * K);
-            if (!m.staged_half) m.half_recv = Dev<float>(T * H);
+            m.half_recv = Dev<float>(half_rows * H);
             m.h_peer = Dev<float>(H);
             // the widest packed row: window K/V + compressor kv + score (3 x 512 floats), or the MoE input
             const std::size_t pack_words = std::max<std::size_t>(3U * attn::kHeadDim, H / 4U + H / 32U + 2U * K);
@@ -1152,6 +1154,13 @@ struct PrefillTask::State {
             timings[timed].device_ms = ms;
             by_place[where[timed]] = ms;
         }
+    }
+    // The worker, inside a unit: do the next `boundaries` boundaries at `level` all pass without parking (no other
+    // work on the communicator in between)? Both ranks hold the same grant at the same unit (the scheduler's budget).
+    bool runs_through(PrefillUnitLevel level, std::uint32_t boundaries) {
+        if (static_cast<std::uint32_t>(level) > static_cast<std::uint32_t>(opt.level)) return true;
+        std::lock_guard<std::mutex> lock(mu);
+        return granted > boundaries;
     }
     // A unit boundary of run_from at `level`: the unit in progress ends; the next one runs `next_kind` in `next_layer`.
     void boundary(PrefillUnitLevel level, std::int32_t next_layer, const char* next_kind) {
@@ -2606,12 +2615,16 @@ PrefillResult DevicePrefill::run_from(std::span<const std::uint32_t> tokens, std
                     const std::uint32_t nmax = std::max(np, no);
                     const std::size_t half_bytes = std::size_t{nmax} * H * 4U;
                     const dist::Tag half_tag{static_cast<std::uint32_t>(dist::TagKind::half_sum), layer, 0U};
+                    // a task parks only at a boundary its grant runs out at; the message must not be in flight across a park
+                    // (the scheduler may run other exchanges then): staged only if this layer's MoE units all run now
+                    const bool staged = m.staged_half && nmax > 0U &&
+                                        (m.task == nullptr || m.moe_joint || T <= m.joint_max_rows ||
+                                         m.task->runs_through(PrefillUnitLevel::finest, pieces(np) + pieces(no) + 1U));
                     float* peer_half = m.half_other.p;
-                    if (m.staged_half && nmax > 0U) {
+                    if (staged) {
                         peer_half = static_cast<float*>(m.options.communicator->send_staging(half_bytes));
                         if (peer_half == nullptr) throw std::logic_error("deepseek41 prefill: no staging buffer for the half sums");
                     }
-                    const bool staged = m.staged_half && nmax > 0U;
                     if (m.moe_joint || T <= m.joint_max_rows) {  // one expert pass over [peer rows; own rows], the peer rows' half sums first
                         cut(PrefillUnitLevel::finest, s.layer, "moe.joint");
                         moe.enqueue_half_joint(pin, in, moe_half, peer_half, m.half_own.p, st, m.half_ready[0]);
