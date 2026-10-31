@@ -1080,7 +1080,10 @@ __device__ __forceinline__ void attention_tile(const void* tile, unsigned cnt, u
                 tm = fmaxf(tm, xor_lane<8>(tm));
                 tm = fmaxf(tm, xor_lane<16>(tm));
             }
-            const float mn = fmaxf(m[h], tm);
+            // Lean 8: the running max as a wave-uniform value (readfirstlane of the wave-wide max, the same float), so the
+            // compiler keeps m, l, the rescale's exp_f_sel and l's sums on the scalar unit (gfx1151 SALU float)
+            float mn = fmaxf(m[h], tm);
+            if constexpr (Lean >= 8U) mn = __builtin_bit_cast(float, __builtin_amdgcn_readfirstlane(__builtin_bit_cast(int, mn)));
             mnv[h] = mn;
             if constexpr (!kSpread) {
                 pr[h][0] = exp_f_sel(s[h][0] - mn);
@@ -1796,9 +1799,9 @@ int attention_lean_mode = -1;
 void set_attention_lean(int mode) { attention_lean_mode = mode; }
 int attention_lean() {
     // default 2 (softmax/PV + dequant), 1 softmax/PV only, 0 off
-    static const int env = [] { const char* e = std::getenv("STRIX_DS41_ATTN_LEAN"); return e == nullptr || e[0] == 0 ? 2 : e[0] >= '0' && e[0] <= '7' ? e[0] - '0' : 2; }();
+    static const int env = [] { const char* e = std::getenv("STRIX_DS41_ATTN_LEAN"); return e == nullptr || e[0] == 0 ? 2 : e[0] >= '0' && e[0] <= '8' ? e[0] - '0' : 2; }();
     const int m = attention_lean_mode < 0 ? env : attention_lean_mode;
-    return m > 7 ? 7 : m;
+    return m > 8 ? 8 : m;
 }
 static void check_fold(const AttentionView& v) {
     if ((v.kv == nullptr) != (v.ring_out == nullptr) || (v.kv != nullptr && (v.kv_norm == nullptr || v.ring_out != v.ring || v.rows > kMaxRows)))
@@ -1848,7 +1851,8 @@ void enqueue_attention(const AttentionView& v_in, hipStream_t stream) {
     check_fold(v);
     const bool fold = v.kv != nullptr;
     const int lean = attention_lean();
-    if (lean == 7) enqueue_attention_form<7>(v, fold, stream);
+    if (lean == 8) enqueue_attention_form<8>(v, fold, stream);
+    else if (lean == 7) enqueue_attention_form<7>(v, fold, stream);
     else if (lean == 6) enqueue_attention_form<6>(v, fold, stream);
     else if (lean == 5) enqueue_attention_form<5>(v, fold, stream);
     else if (lean == 4) enqueue_attention_form<4>(v, fold, stream);
@@ -1966,7 +1970,8 @@ void enqueue_attention_segments(std::span<const AttentionView> views, hipStream_
         if ((v.kv != nullptr) != fold) throw std::invalid_argument("ds41 attention segments: window fold on some segments only");
     }
     const int lean = attention_lean();
-    if (lean == 7) enqueue_attention_segments_form<7>(views, fold, stream);
+    if (lean == 8) enqueue_attention_segments_form<8>(views, fold, stream);
+    else if (lean == 7) enqueue_attention_segments_form<7>(views, fold, stream);
     else if (lean == 6) enqueue_attention_segments_form<6>(views, fold, stream);
     else if (lean == 5) enqueue_attention_segments_form<5>(views, fold, stream);
     else if (lean == 4) enqueue_attention_segments_form<4>(views, fold, stream);

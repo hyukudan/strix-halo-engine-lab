@@ -1050,7 +1050,7 @@ void lean_equal(int mode, unsigned rows, unsigned heads, unsigned nwin, std::uin
         g::set_attention_lds_swizzle(swz);
         g::set_attention_tile_f16(f16);
         std::vector<std::uint8_t> ref;
-        for (const int form : {0, 1, 2, 3, 4, 5, 6, 7, 17}) {   // 17: lean 7 + STRIX_DS41_ATTN_SPLIT_COMBINE
+        for (const int form : {0, 1, 2, 3, 4, 5, 6, 7, 8, 18}) {   // 18: lean 8 + STRIX_DS41_ATTN_SPLIT_COMBINE
             const int lean = form % 10;
             g::set_attention_lean(lean);
             g::set_attention_split_combine(form >= 10 ? 1 : 0);
