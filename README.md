@@ -6,22 +6,30 @@ discrete GPU when there is one.**
 [English](README.md) · [Español](README.es.md)
 
 This C++/HIP inference engine targets **AMD Strix Halo** (Ryzen AI Max+ 395, Radeon 8060S
-`gfx1151`, 128 GB unified memory) under Linux with ROCm. All five public engines are
-**Production**, with exact execution and fast defaults: Qwen on one node, DeepSeek on a USB4
-pair or standalone RTX, and MiniMax and GLM on the pair. DeepSeek also supports RTX + pair execution.
+`gfx1151`, 128 GB unified memory) under Linux with ROCm. Five engines are **Production**, with exact
+execution and fast defaults: Qwen on one node, DeepSeek on a USB4 pair or standalone RTX, and MiniMax and GLM on
+the pair. DeepSeek also supports RTX + pair execution. Two more are opt-in: **Nemotron 3.5 Bolt E4B** on one node
+(`--profile default|fast|quality`, with a published [MTP drafter](https://huggingface.co/hyukudan/Nemotron-3.5-Bolt-E4B-MTP-Drafter) and [EXL3 quality pack](https://huggingface.co/hyukudan/Nemotron-3.5-Bolt-E4B-EXL3)) and
+**GLM-5.3 Flash on one RTX PRO 6000** (draft, Windows).
 
 Published measurements include:
 
+- **Nemotron 3.5 Bolt E4B (one node):** 85.1 tok/s at one request with the MTP drafter on the official Q4_K_M;
+  337.5 tok/s aggregate at eight requests with `fast`; the `quality` EXL3 pack agrees with BF16 on 92.9 % of
+  top-1 tokens (Q4_K_M: 87.0 %).
 - **Qwen3.8-Flash-Next:** 59.59 / 54.00 tok/s on 1K / 8K code prompts with MTP;
   two replicas reach 158.1 tok/s wall throughput at eight concurrent coding chats.
 - **DeepSeek V4.1 Flash pair:** 70.6 tok/s on code with DSpark; eight plain decode rows
-  reach 113.9 tok/s aggregate (calculated from measured step time).
+  reach 113.9 tok/s aggregate (calculated from measured step time); exact prompt processing (server time to first
+  token, one client, cache off) 9.00 / 31.94 / 45.46 s at 8.4K / 32.5K / 44.7K tokens.
 - **DeepSeek standalone RTX PRO 6000:** same-load code / English / Spanish decode
   at 82.3 / 87.7 / 94.4 tok/s with the target and draft on the GPU.
 - **MiniMax M3.1 Flash:** 44.57 ms/token at 1K with plain decode; DSpark reaches
   54.4 / 34.1 / 24.1 tok/s on JSON / Python / prose.
 - **GLM-5.3 Flash:** default exact MTP self-speculation reaches
   37.1 / 44.5 / 40.0 tok/s on chat / code / JSON.
+- **GLM-5.3 Flash on one RTX PRO 6000:** exact prefill (time to first token 17.7 s at 8K, 41.2 s at 32K tokens) and
+  exact decode (3.3 tok/s) with an expert cache across VRAM, pinned RAM and disk; decode speed work is ongoing.
 
 These are workload-specific results, not speed guarantees. [How fast](#how-fast) preserves the
 hardware, profiles, concurrency and measurement limits; [published performance](docs/performance.md)
@@ -43,7 +51,7 @@ Standalone RTX uses a persistent file-queue worker. See [Run](#run) for each eng
 |---|---|
 | What is it? | An independent C++/HIP inference engine, with model-specific execution paths, kernels, verification gates and HTTP serving. |
 | Which hardware? | One Strix Halo Linux node, two nodes linked by USB4, and optional RTX PRO assistance for selected profiles. |
-| Which models? | Qwen, DeepSeek (pair, standalone RTX and RTX + pair), MiniMax and GLM are Production. See [Models](#models). |
+| Which models? | Qwen, DeepSeek (pair, standalone RTX and RTX + pair), MiniMax and GLM are Production; Nemotron 3.5 Bolt E4B (one node) and GLM on one RTX PRO 6000 are opt-in. See [Models](#models). |
 | Does it change model outputs? | Exact by default relative to a declared profile and reference; speculative and concurrent execution preserve that sequence. See [Exactness](#exactness). |
 | How do I verify release assets? | Use the CPU [release asset manifest](docs/operations/release-assets.md) tool for full hashes and explicit role closure. |
 | What startup diagnostics are available? | Qwen has default-on [read-only preflight and configured build identity](docs/operations/startup-preflight.md), with explicit off switches. |
