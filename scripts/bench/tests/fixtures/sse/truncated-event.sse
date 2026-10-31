@@ -1,0 +1,11 @@
+data: {"id":"cmpl-ID","object":"text_completion","created":0,"model":"qwen3.8-flash-next","choices":[{"index":0,"text":"","logprobs":null,"finish_reason":null}],"strix":{"sampling_requested":"greedy","sampling_effective":"greedy","max_tokens_effective":4,"stream":{"enabled":true,"receipts":true}}}
+
+: keepalive
+
+data: {"id":"cmpl-ID","object":"text_completion","created":0,"model":"qwen3.8-flash-next","choices":[{"index":0,"text":"a","logprobs":null,"finish_reason":null}]}
+
+data: {"id":"cmpl-ID","object":"text_completion","created":0,"model":"qwen3.8-flash-next","choices":[{"index":0,"text":"bc","logprobs":null,"finish_reason":null}]}
+
+data: {"id":"cmpl-ID","object":"text_completion","created":0,"model":"qwen3.8-flash-next","choices":[{"index":0,"text":"d","logprobs":null,"finish_reason":null}]}
+
+data: {"id":"cmpl-ID","object":"text_completion","created":0,"model":"qwen3.8-flash-next","choices":[{"index":0,"text":"","logprobs":null,"finish_reason":"length"}],

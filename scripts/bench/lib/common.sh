@@ -100,14 +100,16 @@ measure() {
     if [[ $pair == 1 ]]; then pair_run "$log" "${command[@]}"; else run_local "$log" "${command[@]}"; fi
     py ingest "$out" "$prompt" "$mode" "$generation" "$log"
 }
+# Optional label (default serve) names the cell and its log; an optional claimed T is checked against the server.
 serve_measure() {
-    local log="$out/server.log" rc=0
+    local label=${1:-serve} claim=${2:-} rc=0
+    local log="$out/server${label#serve}.log"
     printf "1\n" >>"$out/model-loads.txt"
     py free-port "${BENCH_PORT:-18880}"
     if [[ $pair == 1 ]]; then pair_start "${command[@]}"; fi
     timeout --signal=TERM --kill-after=5 "$(remaining)s" env "${rank_env[@]}" "${command[@]}" >"$log" 2>&1 &
     local_pid=$!
-    py http "$out" "${BENCH_PORT:-18880}" || rc=$?
+    py http "$out" "${BENCH_PORT:-18880}" "$label" "$claim" || rc=$?
     stop_local || rc=1
     if [[ $pair == 1 ]]; then pair_stop || rc=1; fi
     py sanitize "$log"

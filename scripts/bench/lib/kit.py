@@ -63,6 +63,16 @@ PINS = {
 }
 
 
+# Draft witnesses: proposed drafts, verify cycles and accepted drafts, as engine receipts report them.
+DRAFT_KEYS = {'proposed': ('mtp_proposed', 'mtp_proposed_candidates'), 'verified': ('mtp_cycles',),
+              'accepted': ('mtp_accepted', 'mtp_accepted_candidates')}
+# positive-control: the cell claims live drafting and fails without it; observed: counts label the cell.
+DRAFT_ROLES = ('positive-control', 'observed')
+DRAFT_STATUSES = ('drafted', 'no-draft', 'declined', 'unwitnessed')
+# Witnesses a cell may claim; BENCH_EVIDENCE (comma list) declares the claimed scope of a run.
+EVIDENCE = ('ids', 'logits', 'state')
+
+
 def dump(path, obj):
     Path(path).write_text(json.dumps(obj, indent=2, ensure_ascii=True) + '\n', encoding='utf-8')
 
@@ -252,6 +262,15 @@ def inventory():
             'build_options': options, 'hardware': hw}
 
 
+def run_identity():
+    """The repo commit validate() requires, checked before any timed cell or server launch."""
+    commit = capture(['git', '-C', str(ROOT), 'rev-parse', 'HEAD'])
+    if not re.fullmatch('[0-9a-f]{40}', commit):
+        raise ValueError('run identity: no repository commit for this tree (run from a git checkout); '
+                         'results would fail validation, so nothing was launched')
+    return commit
+
+
 def model_inventory(mode=None):
     mode = mode or os.environ.get('BENCH_VERIFY_MODELS', 'cached')
     cache = ModelHashes(MODELS, mode, sha)
@@ -360,6 +379,97 @@ def nested(obj, key):
     return None
 
 
+def draft_status(counts):
+    # Zero proposals is a cost-declined cell; proposals without acceptance is a low-acceptance cell.
+    if counts['accepted'] > counts['proposed']:
+        raise ValueError('inconsistent draft witness: accepted exceeds proposed')
+    if counts['proposed'] == 0:
+        return 'no-draft'
+    if counts['verified'] == 0:
+        raise ValueError('inconsistent draft witness: proposals without a verify cycle')
+    return 'declined' if counts['accepted'] == 0 else 'drafted'
+
+
+def draft_witness(obj):
+    """Draft counts of one receipt; absent counters are unwitnessed, never zero."""
+    counts = {}
+    for name, keys in DRAFT_KEYS.items():
+        found = [obj[key] for key in keys if isinstance(obj, dict) and key in obj]
+        counts[name] = found[0] if found else None
+    if all(v is None for v in counts.values()):
+        return dict(status='unwitnessed', **counts)
+    if any(type(v) is not int or v < 0 for v in counts.values()):
+        raise ValueError('partial or invalid draft witness')
+    return dict(status=draft_status(counts), **counts)
+
+
+def draft_role():
+    role = os.environ.get('BENCH_DRAFT_ROLE', 'observed')
+    if role not in DRAFT_ROLES:
+        raise ValueError('BENCH_DRAFT_ROLE must be one of: ' + ', '.join(DRAFT_ROLES))
+    return role
+
+
+def draft_total(witnesses, role):
+    """One cell's draft work; a positive control requires drafted, verified and accepted work."""
+    if not witnesses or any(w['status'] == 'unwitnessed' for w in witnesses):
+        total = dict(status='unwitnessed', proposed=None, verified=None, accepted=None)
+    else:
+        counts = {name: sum(w[name] for w in witnesses) for name in DRAFT_KEYS}
+        total = dict(status=draft_status(counts), **counts)
+    total['role'] = role
+    check_draft(total)
+    return total
+
+
+def check_draft(d):
+    if not isinstance(d, dict) or d.get('role') not in DRAFT_ROLES or d.get('status') not in DRAFT_STATUSES:
+        raise ValueError('invalid draft witness record')
+    counts = {name: d.get(name) for name in DRAFT_KEYS}
+    if d['status'] == 'unwitnessed':
+        if any(v is not None for v in counts.values()):
+            raise ValueError('unwitnessed draft record carries counts')
+    elif any(type(v) is not int or v < 0 for v in counts.values()) or draft_status(counts) != d['status']:
+        raise ValueError('draft label differs from its counts')
+    if d['role'] == 'positive-control' and d['status'] != 'drafted':
+        raise ValueError('positive-control MTP cell requires drafted>0, verified>0, accepted>0; got ' + d['status'])
+
+
+def evidence_scope():
+    scope = [x for x in os.environ.get('BENCH_EVIDENCE', '').split(',') if x]
+    if any(x not in EVIDENCE for x in scope) or len(set(scope)) != len(scope):
+        raise ValueError('BENCH_EVIDENCE must be a comma list of: ' + ', '.join(EVIDENCE))
+    return [x for x in EVIDENCE if x in scope]
+
+
+def check_evidence(record):
+    """A cell claiming IDs, logits or state must carry that witness; absence is never a pass."""
+    scope = record.get('evidence_scope', [])
+    if not isinstance(scope, list) or any(x not in EVIDENCE for x in scope):
+        raise ValueError('invalid evidence scope')
+    digest = record.get('engine_digest') or {}
+    def has(word):
+        return any(word in key and isinstance(value, str) and value for key, value in digest.items())
+    if 'ids' in scope and (not isinstance(record.get('token_ids_sha256'), str)
+                           or not re.fullmatch('[0-9a-f]{64}', record['token_ids_sha256'])
+                           or type(record.get('actual_tokens')) is not int or record['actual_tokens'] <= 0):
+        raise ValueError('scope claims token IDs but the cell has none')
+    for word in ('logits', 'state'):
+        if word in scope and not has(word):
+            raise ValueError('scope claims ' + word + ' but the cell has no ' + word + ' digest')
+
+
+def witnessed(sample, draft=None):
+    """Stamp the claimed evidence scope and draft witness on one sample, failing closed."""
+    scope = evidence_scope()
+    if scope:
+        sample['evidence_scope'] = scope
+        check_evidence(sample)
+    if draft is not None:
+        sample['draft'] = dict(draft, role=draft_role())
+    return sample
+
+
 def qwen_admission(text):
     declined=re.search(r'Qwen auto-prefill declined: ([^\n]+)',text)
     if declined: raise ValueError('Qwen auto-prefill declined: '+declined[1])
@@ -373,6 +483,7 @@ def ingest(out, prompt, mode, generation, log):
     text = log.read_text(encoding='utf-8', errors='replace')
     rows = []
     admission = None
+    draft = None
     if ENGINE == 'qwen':
         obj = receipt(log)
         ids = obj.get('generated_tokens')
@@ -394,6 +505,8 @@ def ingest(out, prompt, mode, generation, log):
             ms = obj.get(key)
             if not isinstance(ms, (int, float)) or not math.isfinite(ms) or ms <= 0:
                 raise ValueError('missing decode timing field: ' + key)
+            # The MTP receipt counts proposed/accepted candidates and cycles; absent counters stay unwitnessed.
+            if mode == 'spec': draft = draft_witness(obj)
             rows.append((mode, ids, [len(ids) * 1000 / ms], 'tok/s', engine_digest or None))
     elif ENGINE == 'deepseek-pair':
         if mode == 'ttft':
@@ -437,10 +550,10 @@ def ingest(out, prompt, mode, generation, log):
     with (out / 'samples.jsonl').open('a', encoding='utf-8') as f:
         for row_index, (m, ids, values, unit, digest) in enumerate(rows):
             if ENGINE == 'deepseek-rtx' and mode == 'ttft' and row_index < int(os.environ.get('BENCH_WARMUP', '0')): continue
-            f.write(json.dumps({'prompt_id': (next((x['id'] for x in read(out / 'prompts.json') if x['id'] + '-' in name), prompt) if ENGINE == 'deepseek-rtx' and mode != 'ttft' and (out / 'prompts.json').exists() else prompt), 'mode': m, 'generate_length': generation,
+            f.write(json.dumps(witnessed({'prompt_id': (next((x['id'] for x in read(out / 'prompts.json') if x['id'] + '-' in name), prompt) if ENGINE == 'deepseek-rtx' and mode != 'ttft' and (out / 'prompts.json').exists() else prompt), 'mode': m, 'generate_length': generation,
                                 'actual_tokens': len(ids), 'token_ids_sha256': id_hash(ids),
                                 'engine_digest': digest, 'values': values, 'unit': unit,
-                                'log': log.name, **({'auto_prefill':admission} if admission else {})}) + '\n')
+                                'log': log.name, **({'auto_prefill':admission} if admission else {})}, draft)) + '\n')
 
 
 def sanitize(text):
@@ -556,9 +669,9 @@ def ingest_batch(out, manifest, log):
             if row['warmup']: continue
             if ids is not None and row['mode']!='ttft' and len(ids)!=row['generation']: raise ValueError('generation length differs')
             stats([value])
-            f.write(json.dumps(dict(prompt_id=row['prompt_id'],mode=row['mode'],generate_length=row['generation'],
+            f.write(json.dumps(witnessed(dict(prompt_id=row['prompt_id'],mode=row['mode'],generate_length=row['generation'],
                                    actual_tokens=len(ids) if ids is not None else row['generation'],token_ids_sha256=id_hash(ids) if ids is not None else None,engine_digest=digest,values=[value],
-                                   unit='s' if row['mode']=='ttft' else 'tok/s',log=log.name, timing_scope='native'))+'\n')
+                                   unit='s' if row['mode']=='ttft' else 'tok/s',log=log.name, timing_scope='native')))+'\n')
 
 
 def parse_effective(text, explicit=()):
@@ -572,7 +685,8 @@ def parse_effective(text, explicit=()):
     for line in lines:
         # Informational Qwen resolver notices (auto-prefill, baseline YaRN suppression, active YaRN)
         # carry '=' but are not settings; the structured JSON on stdout is the configuration.
-        if line.startswith(('Qwen auto-prefill', 'Qwen baseline:', 'Qwen experimental YaRN')): continue
+        # The serve-prefill notice may list rejected T trials with '=' in their memory bounds.
+        if line.startswith(('Qwen auto-prefill', 'Qwen serve-prefill', 'Qwen baseline:', 'Qwen experimental YaRN')): continue
         if line.startswith('env '):
             key,value=line[4:].split('=',1); env[key]=value
         elif line.startswith('effective env '):
@@ -820,10 +934,17 @@ def finalize(out, write_refs=False, status='complete'):
         key = (s['prompt_id'], s['mode'], s['generate_length'])
         groups.setdefault(key, []).append(s)
     for (p, mode, length), group in groups.items():
+        # One cell has one claimed scope, one timing scope and one draft role; mixed samples are conflated cells.
+        for field in ('evidence_scope', 'timing_scope', 'unit'):
+            if len({json.dumps(s.get(field)) for s in group}) != 1:
+                raise ValueError('conflated cell identities: ' + field + ' differs within ' + p + '/' + mode)
+        if len({s['draft']['role'] if 'draft' in s else None for s in group}) != 1:
+            raise ValueError('conflated cell identities: draft witness differs within ' + p + '/' + mode)
         values = [v for s in group for v in s['values']]
         measurement = {'prompt_id': p, 'mode': mode, 'unit': group[0]['unit'], **stats(values)}
         if any('auto_prefill' in s for s in group): measurement['auto_prefill']=[s['auto_prefill'] for s in group]
         if 'timing_scope' in group[0]: measurement['timing_scope']=group[0]['timing_scope']
+        if 'draft' in group[0]: measurement['draft']=draft_total([s['draft'] for s in group], group[0]['draft']['role'])
         data['measurements'].append(measurement)
         if any(s['token_ids_sha256'] is None for s in group):
             note='GLM MTP: native equality/hash receipt only; full token IDs unavailable, kit exactness unqualified'
@@ -842,8 +963,11 @@ def finalize(out, write_refs=False, status='complete'):
             verdict = 'MISMATCH'
         elif target is not None:
             verdict = 'EXACT' if target == candidate else 'MISMATCH'
+        # A missing reference stays NO-REFERENCE; reference_found records that no lookup succeeded.
         data['exactness'].append({'prompt_id': p, 'mode': mode, 'generate_length': length,
-                                  'verdict': verdict, 'repeat_stable': stable, **candidate})
+                                  'verdict': verdict, 'repeat_stable': stable, 'reference_found': target is not None,
+                                  **({'evidence_scope': group[0]['evidence_scope']} if 'evidence_scope' in group[0] else {}),
+                                  **({'draft': measurement['draft']} if 'draft' in measurement else {}), **candidate})
         if stable:
             candidates[key] = candidate
     if 'exactness' not in data.get('params', {'only':['exactness']}).get('only', []):
@@ -882,27 +1006,91 @@ def validate(d):
         raise ValueError('bad schema/identity')
     if d['status'] not in ('complete', 'failed', 'mismatch') or not re.fullmatch('[0-9a-f]{40}', d['repo_commit']):
         raise ValueError('bad run status/commit')
+    # Engines are an open set: any adapter name the kit can source is accepted.
+    if not isinstance(d['engine'], str) or not re.fullmatch('[a-z0-9][a-z0-9-]*', d['engine']):
+        raise ValueError('bad engine name')
+    if 'reference_sha256' in d and 'reference_key' in d:
+        key = hashlib.sha256(json.dumps(d['reference_key'], sort_keys=True, separators=(',', ':')).encode()).hexdigest()
+        if key != d['reference_sha256']:
+            raise ValueError('conflated identities: reference_sha256 does not hash reference_key')
     for f in d['identity'].get('binary_sha256s', []) + d['identity'].get('model_files', []):
         if Path(f['name']).name != f['name'] or '\\' in f['name'] or (f['sha256'] is None and d.get('models_verified', True)) or (f['sha256'] is not None and not re.fullmatch('[0-9a-f]{64}', f['sha256'])):
             raise ValueError('file record requires a basename and SHA256')
+    prompts = {}
     for p in d['prompts']:
         if not re.fullmatch('[0-9a-f]{64}', p['sha256']) or p['tokens'] <= 0:
             raise ValueError('bad prompt record')
+        if p['id'] in prompts:
+            raise ValueError('conflated identities: duplicate prompt id ' + p['id'])
+        prompts[p['id']] = p['sha256']
+    cells = set()
     for m in d['measurements']:
         if m['unit'] not in ('s', 'tok/s') or m['repeat_count'] < 1:
             raise ValueError('bad measurement units/count')
         expected = stats(m['samples'])
         if any(m[k] != expected[k] for k in expected):
             raise ValueError('measurement summary differs from samples')
+        cell = (m['prompt_id'], m['mode'], m.get('timing_scope'))
+        if cell in cells:
+            raise ValueError('conflated identities: duplicate measurement cell ' + '/'.join(map(str, cell)))
+        cells.add(cell)
+        if 'draft' in m:
+            check_draft(m['draft'])
+        if 'route' in m:
+            check_route(m['route'], d['engine'])
+            if not m['prompt_id'].startswith('http-c'):
+                raise ValueError('serve route cell id is not http-cN: ' + m['prompt_id'])
+    cells = set()
     for e in d['exactness']:
         if e['verdict'] not in ('EXACT', 'MISMATCH', 'NO-REFERENCE'):
             raise ValueError('invalid exactness verdict')
         for key in ('prompt_sha256', 'token_ids_sha256'):
-            if not re.fullmatch('[0-9a-f]{64}', e[key]):
+            if not isinstance(e[key], str) or not re.fullmatch('[0-9a-f]{64}', e[key]):
                 raise ValueError('invalid exactness digest')
+        cell = (e['prompt_id'], e['mode'], e['generate_length'])
+        if cell in cells:
+            raise ValueError('conflated identities: duplicate exactness cell ' + '/'.join(map(str, cell)))
+        cells.add(cell)
+        if prompts.get(e['prompt_id']) != e['prompt_sha256']:
+            raise ValueError('conflated identities: exactness prompt hash differs from its prompt record')
+        # Only a found reference can pass; NO-REFERENCE is never promoted.
+        if e['verdict'] == 'EXACT' and (e.get('reference_found') is not True or not e['repeat_stable']
+                                        or e.get('plain_tokens_equal') is False):
+            raise ValueError('EXACT requires a found reference, repeat stability and plain/spec equality')
+        if e['verdict'] == 'NO-REFERENCE' and (e.get('reference_found') is True or not e['repeat_stable']
+                                               or e.get('plain_tokens_equal') is False):
+            raise ValueError('NO-REFERENCE contradicts a found reference or an observed mismatch')
+        check_evidence(e)
+        if 'draft' in e:
+            check_draft(e['draft'])
+    if d['status'] == 'complete' and any(e['verdict'] == 'MISMATCH' for e in d['exactness']):
+        raise ValueError('complete status with a MISMATCH cell')
+    if d['status'] != 'failed':
+        pair_outcomes(d)
     for p in d.get('logs', []):
         if Path(p).name != p or '\\' in p:
             raise ValueError('log path must be basename only')
+
+
+def pair_outcomes(d):
+    """Once a run reports plain and speculative outcomes, every cell must carry both, and spec its comparison."""
+    native = [m for m in d['measurements'] if m.get('timing_scope') != 'http-end-to-end']
+    sides = {}
+    for rows, key in ((d['exactness'], lambda x: ('exactness', x['prompt_id'], x['generate_length'])),
+                      (native, lambda x: ('measurement', x['prompt_id']))):
+        for x in rows:
+            if x['mode'] in ('plain', 'greedy', 'spec'):
+                sides.setdefault(key(x), set()).add('spec' if x['mode'] == 'spec' else 'plain')
+    # The population is paired when either list reports both outcomes anywhere.
+    if set().union(*sides.values()) == {'plain', 'spec'}:
+        partial = sorted(str(cell) for cell, found in sides.items() if len(found) != 2)
+        if partial:
+            raise ValueError('partial pair outcome: ' + ', '.join(partial))
+    for e in d['exactness']:
+        plain = [x for x in d['exactness'] if x['prompt_id'] == e['prompt_id'] and x['mode'] in ('plain', 'greedy')
+                 and x['generate_length'] == e['generate_length']]
+        if e['mode'] == 'spec' and plain and e.get('plain_tokens_equal') != (e['token_ids_sha256'] == plain[0]['token_ids_sha256']):
+            raise ValueError('partial pair outcome: spec cell lacks its plain comparison')
 
 
 def baseline(engine, p, mode, profile=None):
@@ -941,24 +1129,159 @@ def report(path):
         if b and not b.get('workload_match'):
             check += ' (workload differs/unspecified)'
         scope = ' [HTTP end-to-end]' if m.get('timing_scope')=='http-end-to-end' else ''
+        if 'route' in m:
+            r = m['route']
+            scope += f" [{r['label']} T{r['T']}]" if r['status'] == 'read' else f" [{r['label']} route unread]"
+        # Draft labels: drafted cells show proposed/verified/accepted; no-draft, declined and unwitnessed say so.
+        if 'draft' in m:
+            w = m['draft']
+            scope += f" [draft {w['status']}" + (f" {w['proposed']}/{w['verified']}/{w['accepted']}" if w['status'] != 'unwitnessed' else '') + ']'
         lines.append(f"| {m['prompt_id']} / {m['mode']}{scope} (n={m['repeat_count']}) | {expected} | {m['median']:.3f} ({m['min']:.3f}-{m['max']:.3f}) {m['unit']} | {f'{ratio:.3f}' if ratio else '--'} | {check} |")
     lines += ['', '| Prompt / mode / requested length | Exactness |', '|---|---|']
     for e in d['exactness']:
         lines.append(f"| {e['prompt_id']} / {e['mode']} / {e['generate_length']} | {e['verdict']} |")
-    lines += ['', 'NO-REFERENCE is unqualified. Candidate references require maintainer review and an independent run.', '']
+    lines += ['', 'NO-REFERENCE is unqualified. Candidate references require maintainer review and an independent run.',
+              'Draft counts are proposed/verified/accepted; only drafted cells measure live speculation.', '']
     for s in d.get('skipped', []):
         lines.append('Skipped: ' + s)
     lines += ['', 'Attach results.json and results.md to a GitHub issue. Review logs before attaching them.', '']
     path.with_suffix('.md').write_text('\n'.join(lines), encoding='utf-8', newline='\n')
 
 
-def http(out, port):
+def sse_receipt(lines, prompt_ids, start, clock=time.perf_counter):
+    """Parse one streamed completion; a truncated or conflated stream fails closed.
+
+    Emission times are monotonic seconds after the request; TPOT divides the content span by the
+    completion tokens after the first, never by chunks: a speculative burst emits several tokens per chunk.
+    """
+    stream_id, finish, usage, done = None, None, None, False
+    receipt, emissions = {}, []
+    for raw in lines:
+        now = clock() - start
+        line = raw.strip()
+        # Blank separators, ': keepalive' and progress comments carry no data.
+        if not line.startswith(b'data:'):
+            continue
+        if done:
+            raise ValueError('SSE data after [DONE]')
+        data = line[5:].strip()
+        if data == b'[DONE]':
+            done = True
+            continue
+        try:
+            obj = json.loads(data)
+        except ValueError:
+            raise ValueError('truncated SSE event') from None
+        if not isinstance(obj, dict):
+            raise ValueError('truncated SSE event')
+        if 'error' in obj:
+            raise ValueError('HTTP generation error')
+        if 'id' in obj:
+            if stream_id is not None and obj['id'] != stream_id:
+                raise ValueError('conflated identities: SSE chunks of one stream carry different ids')
+            stream_id = obj['id']
+        for choice in obj.get('choices', []):
+            if choice.get('text'):
+                if finish is not None:
+                    raise ValueError('SSE content after finish_reason')
+                if emissions and now < emissions[-1]:
+                    raise ValueError('non-monotonic SSE emission times')
+                emissions.append(now)
+            if choice.get('finish_reason') is not None:
+                finish = choice['finish_reason']
+        if obj.get('usage'):
+            usage = obj['usage']
+        if isinstance(obj.get('strix'), dict):
+            # The opening receipt states policy; the closing one adds IDs, timings and draft counters.
+            receipt.update(obj['strix'])
+    if not done or finish is None or usage is None:
+        raise ValueError('truncated SSE stream: missing [DONE], finish_reason or usage')
+    if stream_id is None:
+        raise ValueError('SSE stream lacks a completion id')
+    if usage.get('prompt_tokens') != len(prompt_ids):
+        raise ValueError('server prompt token count differs from shipped input IDs')
+    tokens, ids = usage.get('completion_tokens'), receipt.get('token_ids')
+    if not emissions or type(tokens) is not int or tokens <= 0 or not ids or len(ids) != tokens:
+        raise ValueError('SSE response lacks first content, token IDs or matching completion usage')
+    span = emissions[-1] - emissions[0]
+    digest = {key: receipt[key] for key in ('final_state_digest', 'prompt_state_digest') if isinstance(receipt.get(key), str)}
+    record = {'completion_id': stream_id, 'token_ids_sha256': id_hash(ids), 'actual_tokens': tokens,
+              'completion_tokens': tokens, 'finish_reason': finish, 'ttft_s': emissions[0],
+              'emission_times_s': emissions, 'tpot_s': span / (tokens - 1) if tokens > 1 and span > 0 else None,
+              'engine_digest': digest or None, 'draft': draft_witness(receipt)}
+    scope = evidence_scope()
+    if scope:
+        record['evidence_scope'] = scope
+        check_evidence(record)
+    return record
+
+
+ROUTE_LABELS = ('default',)
+
+
+def serve_route(out, label, log, base, claimed_t=''):
+    """Resolved T and cache policy of one server; unread values are labelled, claimed values verified.
+
+    T comes from the startup 'Qwen serve-prefill:' line, the policy from GET /v1/capabilities.
+    Claims are a pinned T and the recorded --print-effective-config T and requested cache policy.
+    """
+    route = {'label': 'default' if label == 'serve' else label, 'T': None, 'T_source': None,
+             'cache_policy': None, 'cache_policy_source': None}
+    resolved = re.findall(r'^Qwen serve-prefill: (?:automatic|explicit) T([0-9]+)\b', log, re.M)
+    if resolved:
+        route.update(T=int(resolved[-1]), T_source='startup-log')
+    try:
+        with urllib.request.urlopen(base + '/v1/capabilities', timeout=10) as r:
+            policy = json.loads(r.read()).get('cache_policy')
+        if isinstance(policy, dict):
+            route.update(cache_policy=policy, cache_policy_source='capabilities')
+    except (OSError, ValueError, AttributeError):
+        pass
+    claims = {}
+    if claimed_t:
+        claims['pinned_T'] = int(claimed_t)
+    config = out / ('effective-' + label + '.json')
+    if config.exists():
+        settings = read(config).get('settings', {})
+        if isinstance(settings.get('T'), int) and settings['T'] > 0:
+            claims['inspected_T'] = settings['T']
+        if isinstance(settings.get('cache_policy'), dict):
+            claims['cache_requested'] = {key: settings['cache_policy'].get(key) for key in ('requested', 'session_requested')}
+    route['claimed'] = claims
+    route['status'] = 'read' if route['T'] is not None and route['cache_policy'] is not None else 'unread'
+    check_route(route, os.environ.get('BENCH_ENGINE', ''))
+    return route
+
+
+def check_route(route, engine=''):
+    if not isinstance(route, dict) or route.get('label') not in ROUTE_LABELS or route.get('status') not in ('read', 'unread'):
+        raise ValueError('invalid serve route record')
+    t, policy, claims = route.get('T'), route.get('cache_policy'), route.get('claimed', {})
+    if t is not None and (type(t) is not int or t <= 0):
+        raise ValueError('invalid resolved T')
+    if (route['status'] == 'read') != (t is not None and isinstance(policy, dict)):
+        raise ValueError('serve route status differs from what was read')
+    # Qwen's --http-serve requires the tiled MTP route, so every Qwen serve cell pins T.
+    if engine == 'qwen' and 'pinned_T' not in claims:
+        raise ValueError('serve route has no pinned T')
+    for key in ('pinned_T', 'inspected_T'):
+        if key in claims and claims[key] != t:
+            raise ValueError('claimed ' + key + ' ' + str(claims[key]) + ' differs from server receipt ' + str(t))
+    if 'cache_requested' in claims:
+        if not isinstance(policy, dict) or any(policy.get(k) != v for k, v in claims['cache_requested'].items()):
+            raise ValueError('claimed cache policy differs from server receipt')
+
+
+def http(out, port, label='serve', claimed_t=''):
     base = 'http://localhost:' + str(int(port))
+    log_path = out / ('server' + label[len('serve'):] + '.log')
+    # Serve cells keep the README-comparable http-cN ids.
+    cell_id = 'http-c'
     end = time.perf_counter() + 600
     while time.perf_counter() < end:
         try:
             # The engine we launched must have opened its listener; an unrelated /health is insufficient.
-            log = (out / 'server.log').read_text(encoding='utf-8', errors='replace')
+            log = log_path.read_text(encoding='utf-8', errors='replace')
             if 'strix serve: listening' not in log and 'READY rank 0' not in log and not any(o.get('event') == 'READY' for o in objects(log)):
                 time.sleep(0.5)
                 continue
@@ -969,6 +1292,8 @@ def http(out, port):
             time.sleep(0.5)
     else:
         raise ValueError('HTTP server readiness timeout')
+    # Read and verify the resolved route before any timed request.
+    route = serve_route(out, label, log, base, claimed_t)
     prompt_names = list(prompt_texts()) if (out / 'prompts.json').exists() else ['chat', 'code', 'prose']
     prompt_ids = {p: ids_read(out / (p + '.ids')) for p in prompt_names}
 
@@ -979,47 +1304,46 @@ def http(out, port):
                               'stream_options': {'include_usage': True}}).encode()
         req = urllib.request.Request(base + '/v1/completions', payload, {'Content-Type': 'application/json'})
         start = time.perf_counter()
-        first = None
-        tokens = None
-        output_ids = None
+        raw = []
         with urllib.request.urlopen(req, timeout=300) as response:
-            for raw in response:
-                if not raw.startswith(b'data:') or raw.strip() == b'data: [DONE]':
-                    continue
-                obj = json.loads(raw[5:])
-                if 'error' in obj:
-                    raise ValueError('HTTP generation error')
-                for choice in obj.get('choices', []):
-                    if choice.get('text') and first is None:
-                        first = time.perf_counter() - start
-                if obj.get('usage'):
-                    tokens = obj['usage'].get('completion_tokens')
-                    if obj['usage'].get('prompt_tokens') != len(prompt_ids[prompt]):
-                        raise ValueError('server prompt token count differs from shipped input IDs')
-                if obj.get('strix'):
-                    output_ids = obj['strix'].get('token_ids')
-        if first is None or not isinstance(tokens, int) or tokens <= 0 or not output_ids or len(output_ids) != tokens:
-            raise ValueError('SSE response lacks first content, token IDs or matching completion usage')
-        return {'request': index, 'prompt_id': prompt, 'prompt_sha256': id_hash(prompt_ids[prompt]),
-                'token_ids_sha256': id_hash(output_ids), 'ttft_s': first, 'completion_tokens': tokens,
-                'elapsed_s': time.perf_counter() - start}
+            try:
+                record = sse_receipt((raw.append(line) or line for line in response), prompt_ids[prompt], start)
+            except ValueError:
+                # Keep the raw stream of a request that fails parsing, so the failing field is visible.
+                (out / f'{cell_id}{c}-raw-{index}.txt').write_bytes(b''.join(raw))
+                raise
+        record.update(request=index, prompt_id=prompt, prompt_sha256=id_hash(prompt_ids[prompt]),
+                      elapsed_s=time.perf_counter() - start)
+        return record
 
     measurements = []
+    role = draft_role()
     for c in map(int, os.environ.get('BENCH_CONCURRENCY', '1,4,8').split(',')):
-        rates, ttfts, requests = [], [], []
+        rates, ttfts, tpots, requests = [], [], [], []
         for repeat_index in range(int(os.environ.get('BENCH_WARMUP', '0')) + int(os.environ['BENCH_REPEATS'])):
             start = time.perf_counter()
             with concurrent.futures.ThreadPoolExecutor(max_workers=c) as pool:
                 results = list(pool.map(request, range(8)))
             elapsed = time.perf_counter() - start
+            # Every concurrent request owns one completion; a shared id means conflated streams.
+            if len({x.pop('completion_id') for x in results}) != len(results):
+                raise ValueError('conflated identities: concurrent requests share a completion id')
             if repeat_index < int(os.environ.get('BENCH_WARMUP', '0')): continue
             rates.append(sum(x['completion_tokens'] for x in results) / elapsed)
             ttfts.extend(x['ttft_s'] for x in results)
+            tpots.extend(x['tpot_s'] for x in results if x['tpot_s'] is not None)
             requests.append(results)
-        measurements.extend([{'prompt_id': f'http-c{c}', 'mode': 'aggregate-wall', 'unit': 'tok/s', 'timing_scope':'http-end-to-end', **stats(rates)},
-                             {'prompt_id': f'http-c{c}', 'mode': 'ttft', 'unit': 's', 'timing_scope':'http-end-to-end', **stats(ttfts)}])
-        dump(out / f'http-c{c}.json', {'concurrency': c, 'max_tokens': int(os.environ.get('BENCH_GEN_TOKENS', '128')), 'requests': requests})
-    dump(out / 'http-measurements.json', measurements)
+        cell = {'timing_scope': 'http-end-to-end', 'route': route,
+                'draft': draft_total([x['draft'] for wave in requests for x in wave], role)}
+        measurements.extend([{'prompt_id': f'{cell_id}{c}', 'mode': 'aggregate-wall', 'unit': 'tok/s', **cell, **stats(rates)},
+                             {'prompt_id': f'{cell_id}{c}', 'mode': 'ttft', 'unit': 's', **cell, **stats(ttfts)}])
+        if tpots:
+            measurements.append({'prompt_id': f'{cell_id}{c}', 'mode': 'tpot', 'unit': 's', **cell,
+                                 'tpot_scope': 'per-token-request-mean', **stats(tpots)})
+        dump(out / f'{cell_id}{c}.json', {'concurrency': c, 'max_tokens': int(os.environ.get('BENCH_GEN_TOKENS', '128')), 'requests': requests})
+    # Each server cell appends to the run's HTTP measurements.
+    previous = read(out / 'http-measurements.json') if (out / 'http-measurements.json').exists() else []
+    dump(out / 'http-measurements.json', previous + measurements)
 
 
 def main(args):
@@ -1068,6 +1392,8 @@ def main(args):
         return int(bool(problems))
     elif action == 'inventory':
         print(json.dumps(inventory()))
+    elif action == 'run-identity':
+        run_identity()
     elif action == 'compare':
         a, b = read(args[1]), read(args[2])
         for key in ('repo_commit', 'binary_sha256s', 'model_files', 'build_options'):
@@ -1107,6 +1433,7 @@ def main(args):
         if (out / 'http-measurements.json').exists():
             d = read(out / 'results.json')
             d['measurements'].extend(read(out / 'http-measurements.json'))
+            validate(d)
             dump(out / 'results.json', d)
             report(out / 'results.json')
     elif action == 'report':
@@ -1120,7 +1447,7 @@ def main(args):
         for p in Path(args[1]).glob('*.log'):
             sanitize_file(p)
     elif action == 'http':
-        http(Path(args[1]), args[2])
+        http(Path(args[1]), args[2], *args[3:])
     elif action == 'free-port':
         port = int(args[1])
         if not 0 < port <= 65535:

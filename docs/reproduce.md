@@ -234,7 +234,12 @@ as well as specs; `baseline` uses `STRIX_MM_BASELINE=1` and greedy sessions. GLM
 `mtp` (r1b identity, native `--spec-run 7`), `baseline` (`STRIX_GLM_BASELINE=1`).
 Qwen `baseline` runs plain decode/prefill with `--baseline`; RTX: `default` or `baseline`
 (the replica receives `--baseline` after measurement arguments). `BENCH_PORT` defaults to 18880; `BENCH_SSH_TIMEOUT` to 60 seconds for bounded
-SSH operations (connection timeout 10 seconds). These are environment controls, not CLI flags.
+SSH operations (connection timeout 10 seconds). `BENCH_EVIDENCE` (empty default, or a comma list of
+`ids`, `logits`, `state`) declares the witnesses every decode/prefill/HTTP cell of the run claims; a
+claimed witness missing from a receipt fails the run. `BENCH_DRAFT_ROLE` (`observed` default, or
+`positive-control`) sets the draft role of measured cells; the Qwen serve sweep sets
+`positive-control` itself.
+These are environment controls, not CLI flags.
 Inherited `STRIX_`, `HIP_`, `HSA_`, `ROCR_` overrides are rejected. Pair apps resolve their
 published production defaults. The kit supplies pack locations, measurement controls, rank/transport
 and selected profile off switches. Qwen records `--print-effective-config` on rank 0 before
@@ -284,7 +289,15 @@ notice in each prefill measurement's `auto_prefill` list. A declined line
 a missing admission also fails. Diagnostic variables such as `STRIX_PREFILL_LOGITS_DIGEST`,
 `STRIX_RTX_EXPORT_STATE`, `STRIX_QRTX_STEP_DUMP` and `STRIX_PROMPT_BATCH_ROWS` are never injected.
 FP16 prefill has its own numerical identity; inspect the resolved profile pair and any arithmetic
-fallback. MTP and serve retain explicit tiled commands and do not receive automatic fast prefill.
+fallback. MTP retains explicit tiled commands and does not receive automatic fast prefill.
+The Qwen server accepts only the tiled MTP route (`--http-serve` is refused without
+`--known-prefix-window`), so the serve sweep launches the spec population's MTP command (same
+sidecar, pins, depth and windows) with `--mtp-golden` for the first prompt at the shortest
+context, plus `--http-serve`, on the spec command's tiled organization pinned to T8192. This is the
+single serve cell: its rows are `http-cN`, labelled `default`, and the server must report T8192.
+With decode in the run it reuses that prompt's plain receipt and calibration golden; a serve-only
+run first makes one untimed plain launch and one calibration launch. Profiles `plain` and
+`baseline` have no HTTP population and record a skip.
 `--profile baseline` adds `--baseline`, skips MTP and measures a separate historical prefill
 population without requiring auto admission; long baseline prompts receive explicit context.
 GSQ production prefill cannot pass the auto admission gate on this revision; use decode-only GSQ.
@@ -332,7 +345,8 @@ local inference/server launches, excluding tokenizers; each pair launch loads bo
 
 For P prompts, C contexts and R=warmup+repeat, Qwen MTP loads are `P*C*(2*R+1)+C*R`,
 plain `P*C*R+C*R`; DeepSeek default `2+C`, single mode `1+C`; GLM 2; MiniMax 1; RTX `1+C`.
-Removing work removes launches. Serve adds one persistent load for Qwen/DeepSeek/MiniMax,
+Removing work removes launches. Serve adds one persistent load for Qwen/DeepSeek/MiniMax
+(Qwen serve-only also adds its plain and calibration launches),
 none for GLM/RTX. Default C1/C4/C8 sweeps send eight requests per concurrency per round:
 24 quick; 96 full including 24 discarded warmups. Budget minutes to tens of minutes plus
 startup depending on tokens/queueing. Serve-only loads are 1/1 for supported engines in
@@ -344,6 +358,35 @@ wall time including prefill/queueing. TTFT is first nonempty content. Usage must
 `http-c*.json` records hashes/timings. Native decode/TTFT timings exclude load. Optional serve
 rates include prefill and HTTP overhead (`timing_scope: http-end-to-end`); whole-run wall
 includes load. Discarded warmups still execute and load according to each engine's plan.
+
+Streams fail closed: each must end with `data: [DONE]` after a `finish_reason` and `usage`, every
+event must parse, all events carry one completion id, concurrent requests must have distinct ids,
+and `strix.token_ids` must match `usage.completion_tokens`. Each request records monotonic
+`emission_times_s` (seconds after the request for every content event) and `tpot_s`: the span from
+the first to the last content event divided by `completion_tokens - 1`, a per-token mean
+(`mode: tpot`, `tpot_scope: per-token-request-mean`). Chunk gaps are never used as TPOT because a
+speculative burst emits several tokens in one event; the servers do not report per-event token
+counts. Draft work comes from the closing `strix` receipt (`mtp_proposed`, `mtp_cycles`,
+`mtp_accepted`) and from the Qwen MTP command-line receipt (`mtp_proposed_candidates`,
+`mtp_cycles`, `mtp_accepted_candidates`). Each HTTP cell and Qwen spec cell carries `draft`:
+`proposed`, `verified` (verify cycles), `accepted`, a `status` and a `role`. Status `drafted`
+needs all three above zero; zero proposals is `no-draft` (cost-declined), proposals without
+acceptance `declined` (low acceptance), absent counters `unwitnessed` with null counts, never zero.
+A `positive-control` cell fails unless it is `drafted`; an `observed` cell keeps its label, and
+`results.md` shows it next to the row. MiniMax replies have no draft counters, so its HTTP cells are
+`unwitnessed`. DeepSeek serve reports DSpark proposals and acceptances only for requests inside an
+armed observation period (zero otherwise) and counts generated tokens as cycles, so its observed
+`no-draft` label can mean unobserved; it is never a positive control.
+
+Each HTTP cell also carries `route`: `label` (always `default`), the resolved `T` read from
+the server's startup line `Qwen serve-prefill: automatic|explicit T<N>` (`T_source: startup-log`),
+the `cache_policy` object read from `GET /v1/capabilities` (`cache_policy_source: capabilities`),
+`claimed` values, and `status` (`read` when both were read, otherwise `unread`, with nulls).
+Every Qwen cell claims `pinned_T` (8192), which must equal the server's resolved T, and, when the
+launch's `--print-effective-config` was recorded, its `T` and requested cache policy (`requested`,
+`session_requested`). A Qwen cell without `pinned_T`, or a claim that cannot be read back or
+differs from the server, fails the run before any timed request. Servers without that line or
+route (MiniMax, DeepSeek) record `unread` and claim nothing.
 
 ## Expected numbers and exactness
 
@@ -463,9 +506,24 @@ The exact single-run contract is [results.schema.json](../scripts/bench/results.
 | Params / identity.parameters | Public `engine`, `suite`; integer arrays `contexts`, `concurrency`; integers `gen_tokens`, `repeat`, `warmup`, `timeout`; strings `profile`, `prompts` (`kit`/`file`), `verify_models`; string array `only`; booleans `serve`, `json`, `md`, `write_refs`, `dry_run`, `peer`; path markers `bin_dir`, `model_dir`, `peer_bin_dir`, `peer_model_dir`, `peer_repo` (`default`/`configured`), `out` (`run-directory`) |
 | Prompt set | `name` (`kit`/`file`), exact source-byte `sha256` |
 | Prompt | `id`, `tokens`, token-list `sha256`, `construction` |
-| Measurement | `prompt_id`, `mode`, `unit` (`s`/`tok/s`), `repeat_count`, numeric array `samples`, `median`, `min`, `max` |
-| Exactness | `prompt_id`, `mode`, `generate_length`, `actual_tokens`, `prompt_sha256`, `token_ids_sha256`, nullable `engine_digest`, boolean `repeat_stable`, `verdict` (`EXACT`/`MISMATCH`/`NO-REFERENCE`); spec with plain peer also has `plain_tokens_equal` |
+| Measurement | `prompt_id`, `mode`, `unit` (`s`/`tok/s`), `repeat_count`, numeric array `samples`, `median`, `min`, `max`; optional `timing_scope` (`native`/`http-end-to-end`), `tpot_scope`, `draft`, `route` |
+| Exactness | `prompt_id`, `mode`, `generate_length`, `actual_tokens`, `prompt_sha256`, `token_ids_sha256`, nullable `engine_digest`, boolean `repeat_stable`, `verdict` (`EXACT`/`MISMATCH`/`NO-REFERENCE`), boolean `reference_found`; spec with plain peer also has `plain_tokens_equal`; optional `evidence_scope`, `draft` |
+| Route | `label` (`default`), `status` (`read`/`unread`), nullable `T`, `T_source`, `cache_policy`, `cache_policy_source`, object `claimed` (`pinned_T`, required for Qwen; `inspected_T`, `cache_requested`) |
+| Draft | `role` (`positive-control`/`observed`), `status` (`drafted`/`no-draft`/`declined`/`unwitnessed`), nullable integers `proposed`, `verified`, `accepted` |
 | Peer inventory | Null or `repo_commit`, `tracked_dirty`, `binary_sha256s`, `model_files`, `models_verified`, `build_options`, `hardware`; no connection details |
+
+The validator also rejects: `EXACT` without `reference_found: true`, repeat stability and plain/spec
+equality; `NO-REFERENCE` with a found reference or an observed inequality; `complete` status with
+a MISMATCH; draft labels that differ from their counts and positive controls that did not draft;
+route records whose status, pinned T or cell id disagree with their label, or whose claims differ
+from the read T or cache policy;
+claimed IDs, logits or state without that witness; duplicate prompt, measurement or exactness cells,
+an exactness prompt hash that differs from its prompt record and a `reference_sha256` that does not
+hash `reference_key` (conflated identities); and, unless the status is `failed`, partial plain/spec
+pairs: once a run reports both outcomes, every decode cell must have both and each spec cell its
+plain comparison. `engine` is any lowercase adapter name, so a new adapter needs no schema change.
+`run` checks the repository commit that `repo_commit` requires before prerequisites, launches or
+the output directory: a tree without `.git` fails at once with `run identity: no repository commit`.
 
 `all --json` returns `{"schema_version":1,"engines":[...]}`. Elements are full successful
 results (internal pair engine names include `-pair`), skip records such as
@@ -590,5 +648,12 @@ Python, which breaks the path comparisons of the effective-config tests.
 CPU verification covers shell syntax, five offline plans, pair quoting/mapping, platform
 admission, effective-config equality/mismatch/dropped-item shims, receipts, schema/Markdown,
 references, cache, parameters, machine JSON, fetch previews,
-HTTP test server and forced local teardown. ShellCheck runs if installed. This verifies wrapper
+HTTP test server, recorded SSE streams (complete, truncated, conflated, burst, no-draft, declined,
+partial and absent draft counters), resolved-route reads and claims, witnessed result fixtures for
+every fail-closed rule, the Qwen MTP serve preview (tiled, pinned to T8192), a scan
+of every previewed Qwen command for controllers the binary refuses under the pinned numerical
+profile (such as `--gpu-greedy-token`, which Qwen commands no longer pass) and forced local teardown.
+With `BENCH_QWEN_BIN=PATH` (and `BENCH_QWEN_MODEL_DIR` for the model directory) the unit tests also
+pass each previewed command without run-time placeholders to that binary's `--print-effective-config`
+(host-only inspection, no device work); otherwise that check is skipped. ShellCheck runs if installed. This verifies wrapper
 behavior, not hardware performance, remote driver teardown or numerical qualification.

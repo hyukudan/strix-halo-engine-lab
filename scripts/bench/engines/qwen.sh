@@ -32,7 +32,9 @@ qwen_command() {
     fi
     command=(env "${rank_env[@]}" "$(binary strix-hip-decode-token)" "$model_dir/${assets[0]}" "${ids[@]}"
         --context "$context" --execution-mode eager --residency register --generate "$generate"
-        --optimization-profile auto --numerical-profile "$identity" --gpu-greedy-token)
+        --optimization-profile auto --numerical-profile "$identity")
+    # No --gpu-greedy-token: the pinned numerical profile, the known-prefix window and MTP each refuse
+    # that alternate selection controller (validate_numerical_profile_cli, known-prefix and MTP checks).
     [[ $context == 8192 ]] || command+=(--unqualified-context)
     [[ $profile != baseline ]] || command+=(--baseline)
 }
@@ -46,22 +48,28 @@ qwen_prefill_production() {
         if ((n + 1 > 8192)); then command+=(--context "$((n + 512))" --unqualified-context); fi
     fi
 }
+# Under --numerical-profile the binary admits a tiled organization only with the full v5 organization
+# spelled out (no implicit flag changes).
+QWEN_V5_ORGANIZATION=(--parallel-hyper-mix --staged-hyper-projections --fused-staged-hyper-mix
+    --typed-fused-hyper-projections --prefetch-typed-hyper-rows --prefetch-q8-hyper-output
+    --lane-chain-hyper-output --prefetch-q8-qsa-input --parallel-moe-router --wave-moe-router-topk
+    --virtual-q8-gdn-input --prefetch-q8-gdn-input --virtual-q8-gdn-output --deferred-moe-status
+    --prefetch-q8-shared-expert --q4k-a8g32-gate-up --grouped-exact-q51-down --virtual-q8-lm-head
+    --q51-slot-parallel-down --batched-moe-activation --wave8-q8-gdn-input --wave8-q8-gdn-output
+    --prefetch-q8-lm-head --wave8-q8-lm-head --wave8-q8-qsa-output)
 qwen_tiled() {
     local tile=${1:-8192}
+    [[ $profile == baseline ]] || command+=("${QWEN_V5_ORGANIZATION[@]}")
     command+=(--known-prefix-window --known-prefix-full-rows --known-prefix-prefill-rows "$tile"
         --known-prefix-workspace-budget-bytes 8589934592
         --known-prefix-host-metadata-budget-bytes 1073741824
         --known-prefix-uma-budget-bytes 137438953472 --known-prefix-host-headroom-bytes 4294967296)
 }
 qwen_mtp() {
+    # MTP calibration rows require the tiled prompt; every MTP launch, including HTTP, is tiled.
     local content=$1 tile=${2:-8192} depth=7 window=8 windows=2,4,8
     [[ $profile != mtp-k* ]] || depth=${profile#mtp-k}
     if ((depth < 3)); then window=2; windows=2; elif ((depth < 7)); then window=4; windows=2,4; fi
-    local arg
-    local filtered=()
-    # MTP owns selection; validate_mtp_cli explicitly rejects --gpu-greedy-token.
-    for arg in "${command[@]}"; do [[ $arg == --gpu-greedy-token ]] || filtered+=("$arg"); done
-    command=("${filtered[@]}")
     command+=(--mtp --mtp-draft-profile distill-g --mtp-sidecar "$model_dir/${assets[1]}"
         --mtp-target-sha256 "$target_sha" --mtp-target-content "$content"
         --mtp-conversion effective-norm-embedding-first-v1 --mtp-normalized-rounding bf16-rne
@@ -96,22 +104,15 @@ qwen_execute() {
         for n in "${context_values[@]}"; do
             for name in "${prompt_names[@]}"; do
                 p=$name-ctx$n
-                # Plain mode supplies content identity and a token reference for MTP calibration.
+                # Plain mode supplies content identity and a token reference for MTP calibration, on the
+                # same tiled organization as the spec arm.
                 for ((rep=1; rep<=warmup+repeats; rep++)); do
                     qwen_command "$p" "$gen_tokens"
                     [[ $profile == baseline ]] || qwen_tiled
                     qwen_emit "$p" plain "$gen_tokens" "$rep"
                 done
                 [[ $profile != plain && $profile != baseline ]] || continue
-                if [[ $dry != 1 ]]; then content=$(py receipt-field "$out/$p-plain-$((warmup+1)).log" model_content_identity); fi
-                golden="$out/$p.golden"
-                qwen_command "$p" "$gen_tokens"; qwen_mtp "$content"
-                effective_config "$p-calibration" --print-effective-config "${command[@]}" --mtp-golden-dump "$golden"
-                if [[ $dry == 1 ]]; then show_command "${command[@]}" --mtp-golden-dump "$golden"
-                else
-                    run_local "$out/$p-calibration.log" "${command[@]}" --mtp-golden-dump "$golden"
-                    golden_sha=$(py hash "$golden")
-                fi
+                qwen_calibrate "$p" "$out/$p-plain-$((warmup+1)).log"
                 for ((rep=1; rep<=warmup+repeats; rep++)); do
                     qwen_command "$p" "$gen_tokens"; qwen_mtp "$content"
                     command+=(--mtp-golden "$golden" --mtp-golden-sha256 "$golden_sha")
@@ -130,12 +131,58 @@ qwen_execute() {
             done
         done
     fi
-    if [[ $serve == 1 ]]; then
-        qwen_command "${prompt_names[0]}" "$gen_tokens"; qwen_tiled 2048
-        command+=(--http-serve --http-port "${BENCH_PORT:-18880}")
-        effective_config serve --print-effective-config "${command[@]}"
-        if [[ $dry == 1 ]]; then show_command "${command[@]}"; else serve_measure; fi
+    if [[ $serve == 1 ]]; then qwen_serve; fi
+}
+# Sets the caller's content, golden and golden_sha from a plain receipt and one calibration launch.
+qwen_calibrate() {
+    local p=$1 plain_log=$2
+    if [[ $dry != 1 ]]; then content=$(py receipt-field "$plain_log" model_content_identity); fi
+    golden="$out/$p.golden"
+    qwen_command "$p" "$gen_tokens"; qwen_mtp "$content"
+    effective_config "$p-calibration" --print-effective-config "${command[@]}" --mtp-golden-dump "$golden"
+    if [[ $dry == 1 ]]; then show_command "${command[@]}" --mtp-golden-dump "$golden"
+    else
+        run_local "$out/$p-calibration.log" "${command[@]}" --mtp-golden-dump "$golden"
+        golden_sha=$(py hash "$golden")
     fi
+}
+# The server accepts only the tiled MTP route, so the HTTP population is the spec population's
+# production MTP command (sidecar, pins, depth, windows) plus its startup calibration golden, on the
+# same T8192 tiled organization; the server still reports T and cache policy, which must match the claim.
+# Its responses report proposed/verified/accepted drafts, so every cell is a positive control.
+qwen_serve() {
+    if [[ $profile == plain || $profile == baseline ]]; then
+        printf '%s\n' "SKIP serve: Qwen HTTP serving runs MTP; profile $profile has no HTTP population" >&2
+        if [[ $dry != 1 ]]; then py skipped "$out" "HTTP: Qwen serving runs MTP; profile $profile has no HTTP population"; fi
+        return 0
+    fi
+    local n=${context_values[0]} c p
+    for c in "${context_values[@]}"; do ((c >= n)) || n=$c; done
+    # The shortest context-expanded first prompt is the calibration prompt; decode already calibrated it.
+    p=${prompt_names[0]}-ctx$n
+    if decode_enabled; then
+        golden="$out/$p.golden"
+        if [[ $dry != 1 ]]; then
+            content=$(py receipt-field "$out/$p-plain-$((warmup+1)).log" model_content_identity)
+            golden_sha=$(py hash "$golden")
+        fi
+    else
+        # Serve-only: one untimed plain launch supplies the content identity, then calibration.
+        qwen_command "$p" "$gen_tokens"
+        effective_config "$p-plain" --print-effective-config "${command[@]}"
+        if [[ $dry == 1 ]]; then show_command "${command[@]}"; else run_local "$out/$p-serve-plain.log" "${command[@]}"; fi
+        qwen_calibrate "$p" "$out/$p-serve-plain.log"
+    fi
+    export BENCH_DRAFT_ROLE=positive-control
+    qwen_serve_cell serve 8192
+}
+# One server per cell; the pinned T is the cell's claim and must match the server's startup receipt.
+qwen_serve_cell() {
+    local label=$1 tile=$2
+    qwen_command "$p" "$gen_tokens"; qwen_mtp "$content" "$tile"
+    command+=(--mtp-golden "$golden" --mtp-golden-sha256 "$golden_sha" --http-serve --http-port "${BENCH_PORT:-18880}")
+    effective_config "$label" --print-effective-config "${command[@]}"
+    if [[ $dry == 1 ]]; then show_command "${command[@]}"; else serve_measure "$label" "$tile"; fi
 }
 profile_dry_run() { local out=DETERMINISTIC_PROMPTS; qwen_execute; }
 profile_run() { qwen_execute; py initialize "$out"; }

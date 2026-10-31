@@ -27,13 +27,9 @@
       "pattern": "^[0-9a-f]{40}$"
     },
     "engine": {
-      "enum": [
-        "qwen",
-        "deepseek-pair",
-        "deepseek-rtx",
-        "glm-pair",
-        "minimax-pair"
-      ]
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9-]*$",
+      "description": "Adapter name; an open set, so a new engine adapter needs no schema change."
     },
     "identity": {
       "type": "object"
@@ -122,6 +118,21 @@
           "max": {
             "type": "number",
             "exclusiveMinimum": 0
+          },
+          "timing_scope": {
+            "enum": [
+              "native",
+              "http-end-to-end"
+            ]
+          },
+          "tpot_scope": {
+            "const": "per-token-request-mean"
+          },
+          "draft": {
+            "$ref": "#/$defs/draft"
+          },
+          "route": {
+            "$ref": "#/$defs/route"
           }
         }
       }
@@ -163,8 +174,122 @@
           },
           "repeat_stable": {
             "type": "boolean"
+          },
+          "reference_found": {
+            "type": "boolean",
+            "description": "False keeps the verdict NO-REFERENCE or MISMATCH; EXACT requires true."
+          },
+          "plain_tokens_equal": {
+            "type": "boolean"
+          },
+          "evidence_scope": {
+            "type": "array",
+            "uniqueItems": true,
+            "items": {
+              "enum": [
+                "ids",
+                "logits",
+                "state"
+              ]
+            }
+          },
+          "draft": {
+            "$ref": "#/$defs/draft"
           }
-        }
+        },
+        "allOf": [
+          {
+            "if": {
+              "properties": {
+                "verdict": {
+                  "const": "EXACT"
+                }
+              }
+            },
+            "then": {
+              "required": [
+                "reference_found"
+              ],
+              "properties": {
+                "reference_found": {
+                  "const": true
+                },
+                "repeat_stable": {
+                  "const": true
+                },
+                "plain_tokens_equal": {
+                  "const": true
+                }
+              }
+            }
+          },
+          {
+            "if": {
+              "properties": {
+                "verdict": {
+                  "const": "NO-REFERENCE"
+                }
+              }
+            },
+            "then": {
+              "properties": {
+                "reference_found": {
+                  "const": false
+                },
+                "repeat_stable": {
+                  "const": true
+                },
+                "plain_tokens_equal": {
+                  "const": true
+                }
+              }
+            }
+          },
+          {
+            "if": {
+              "properties": {
+                "evidence_scope": {
+                  "contains": {
+                    "const": "logits"
+                  }
+                }
+              },
+              "required": [
+                "evidence_scope"
+              ]
+            },
+            "then": {
+              "properties": {
+                "engine_digest": {
+                  "type": "object",
+                  "minProperties": 1
+                }
+              }
+            }
+          },
+          {
+            "if": {
+              "properties": {
+                "evidence_scope": {
+                  "contains": {
+                    "const": "state"
+                  }
+                }
+              },
+              "required": [
+                "evidence_scope"
+              ]
+            },
+            "then": {
+              "properties": {
+                "engine_digest": {
+                  "type": "object",
+                  "minProperties": 1
+                }
+              }
+            }
+          }
+        ]
       }
     },
     "reference_sha256": {
@@ -174,10 +299,232 @@
       "type": "object"
     }
   },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "engine": {
+            "const": "qwen"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "measurements": {
+            "items": {
+              "properties": {
+                "route": {
+                  "properties": {
+                    "claimed": {
+                      "required": [
+                        "pinned_T"
+                      ]
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  ],
   "$defs": {
     "hash": {
       "type": "string",
       "pattern": "^[0-9a-f]{64}$"
+    },
+    "count": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "minimum": 0
+    },
+    "draft": {
+      "type": "object",
+      "required": [
+        "role",
+        "status",
+        "proposed",
+        "verified",
+        "accepted"
+      ],
+      "description": "Draft work of one cell: proposed drafts, verify cycles, accepted drafts. Cost-declined cells are no-draft, low-acceptance cells declined, absent counters unwitnessed.",
+      "properties": {
+        "role": {
+          "enum": [
+            "positive-control",
+            "observed"
+          ]
+        },
+        "status": {
+          "enum": [
+            "drafted",
+            "no-draft",
+            "declined",
+            "unwitnessed"
+          ]
+        },
+        "proposed": {
+          "$ref": "#/$defs/count"
+        },
+        "verified": {
+          "$ref": "#/$defs/count"
+        },
+        "accepted": {
+          "$ref": "#/$defs/count"
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "role": {
+                "const": "positive-control"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "status": {
+                "const": "drafted"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "status": {
+                "const": "drafted"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "proposed": {
+                "type": "integer",
+                "minimum": 1
+              },
+              "verified": {
+                "type": "integer",
+                "minimum": 1
+              },
+              "accepted": {
+                "type": "integer",
+                "minimum": 1
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "status": {
+                "const": "unwitnessed"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "proposed": {
+                "type": "null"
+              },
+              "verified": {
+                "type": "null"
+              },
+              "accepted": {
+                "type": "null"
+              }
+            }
+          }
+        }
+      ]
+    },
+    "route": {
+      "type": "object",
+      "required": [
+        "label",
+        "status",
+        "T",
+        "cache_policy",
+        "claimed"
+      ],
+      "description": "Resolved serving route of an HTTP cell: T from the startup serve-prefill line, cache policy from /v1/capabilities. Claims (pinned or inspected T, requested cache policy) must equal what the server reported; Qwen cells always pin T because its --http-serve requires the tiled MTP route.",
+      "properties": {
+        "label": {
+          "enum": [
+            "default"
+          ]
+        },
+        "status": {
+          "enum": [
+            "read",
+            "unread"
+          ]
+        },
+        "T": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 1
+        },
+        "T_source": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "cache_policy": {
+          "type": [
+            "object",
+            "null"
+          ]
+        },
+        "cache_policy_source": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "claimed": {
+          "type": "object",
+          "properties": {
+            "pinned_T": {
+              "type": "integer"
+            },
+            "inspected_T": {
+              "type": "integer"
+            },
+            "cache_requested": {
+              "type": "object"
+            }
+          }
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "status": {
+                "const": "read"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "T": {
+                "type": "integer"
+              },
+              "cache_policy": {
+                "type": "object"
+              }
+            }
+          }
+        }
+      ]
     }
   }
 }

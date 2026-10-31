@@ -8,7 +8,7 @@
     "engine": "qwen",
     "profile": "fixture"
   },
-  "reference_sha256": "1111111111111111111111111111111111111111111111111111111111111111",
+  "reference_sha256": "ced15fa80dc201c4a2a87659755a7209a4781305a16dec6da87b52dc08cdf6d5",
   "identity": {
     "profile": "synthetic-test-only",
     "build_options": {},
@@ -57,6 +57,7 @@
       "mode": "plain",
       "generate_length": 2,
       "verdict": "NO-REFERENCE",
+      "reference_found": false,
       "repeat_stable": true,
       "prompt_sha256": "a615eeaee21de5179de080de8c3052c8da901138406ba71c38c032845f7d54f4",
       "token_ids_sha256": "49a64717d5d4cb19952e6eac2946415cf6879adacf9908e7d872332d32c6e684",

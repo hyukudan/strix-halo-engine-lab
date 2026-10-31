@@ -1,0 +1,10 @@
+data: {"id":"cmpl-ID","object":"text_completion","created":0,"model":"qwen3.8-flash-next","choices":[{"index":0,"text":"a","logprobs":null,"finish_reason":null}]}
+
+data: {"id":"cmpl-ID","object":"text_completion","created":0,"model":"qwen3.8-flash-next","choices":[{"index":0,"text":"bc","logprobs":null,"finish_reason":null}]}
+
+data: {"id":"cmpl-ID","object":"text_completion","created":0,"model":"qwen3.8-flash-next","choices":[{"index":0,"text":"","logprobs":null,"finish_reason":"length"}],"strix":{"token_ids":[5,6,7]}}
+
+data: {"id":"cmpl-ID","object":"text_completion","created":0,"model":"minimax","choices":[],"usage":{"prompt_tokens":3,"completion_tokens":3,"total_tokens":6},"strix":{"token_ids":[5,6,7]}}
+
+data: [DONE]
+

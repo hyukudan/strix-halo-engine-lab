@@ -81,6 +81,27 @@ done
 [[ ! -s $BENCH_SSH_RECORD ]]
 grep -q 'node B (SSH, setsid, PID file, same timeout)' "$tmp/deepseek-pair-preview"
 printf 'PASS all five dry-runs, no GPU/assets/SSH execution\n'
+# Qwen HTTP serves the production MTP command with its calibration golden on the spec arm's T8192
+# tiled route, which --http-serve requires; serve-only runs calibrate first.
+bash scripts/bench/bench.sh run --engine qwen --suite quick --only serve --dry-run >"$tmp/qwen-serve" 2>&1
+grep -- '--http-serve' "$tmp/qwen-serve" | grep -- ' --mtp ' | grep -q -- '--mtp-golden-sha256'
+if grep -- '--http-serve' "$tmp/qwen-serve" | grep -q -- '--gpu-greedy-token'; then exit 1; fi
+[[ $(grep -c -- '--http-serve' "$tmp/qwen-serve") == 2 ]]  # effective-config print and server launch
+[[ $(grep -- '--http-serve' "$tmp/qwen-serve" | grep -c -- '--known-prefix-prefill-rows 8192') == 2 ]]
+grep -q -- '--mtp-golden-dump' "$tmp/qwen-serve"
+bash scripts/bench/bench.sh run --engine qwen --suite quick --profile plain --only serve --dry-run >"$tmp/qwen-plain-serve" 2>&1
+grep -q 'SKIP serve' "$tmp/qwen-plain-serve"
+if grep -q -- '--http-serve' "$tmp/qwen-plain-serve"; then exit 1; fi
+printf 'PASS Qwen HTTP population runs MTP with a calibration golden\n'
+# A run from a tree without .git refuses before prerequisites, launches or a result directory.
+mkdir -p "$tmp/nogit/scripts"
+cp -r scripts/bench "$tmp/nogit/scripts/bench"
+if bash "$tmp/nogit/scripts/bench/bench.sh" run --engine qwen --suite quick --bin-dir "$tmp/bin" --model-dir "$tmp/models" >"$tmp/nogit.log" 2>&1; then
+    printf 'run without a repository commit must fail\n' >&2; exit 1
+fi
+grep -q 'run identity: no repository commit' "$tmp/nogit.log"
+if grep -q 'Prerequisites OK\|MISSING' "$tmp/nogit.log" || [[ -e $tmp/nogit/bench-results ]]; then exit 1; fi
+printf 'PASS run identity refused up front without a repository\n'
 bash scripts/bench/tests/effective_config.sh
 bash scripts/bench/tests/single_config.sh
 bash scripts/bench/tests/pair_args.sh
@@ -89,6 +110,10 @@ cp scripts/bench/tests/fixtures/results.json "$tmp/results.json"
 bash scripts/bench/bench.sh report "$tmp"
 "$BENCH_PYTHON" scripts/bench/lib/kit.py validate "$tmp/results.json"
 grep -q 'NO-REFERENCE' "$tmp/results.md"
+mkdir -p "$tmp/witnessed"
+cp scripts/bench/tests/fixtures/results-witnessed.json "$tmp/witnessed/results.json"
+bash scripts/bench/bench.sh report "$tmp/witnessed"
+grep -q 'draft drafted 12/4/6' "$tmp/witnessed/results.md"
 printf 'PASS fixture schema and markdown render\n'
 "$BENCH_PYTHON" scripts/bench/tests/test_kit.py
 # Public machine endpoints must contain exactly one JSON document on stdout.

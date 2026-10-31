@@ -1,0 +1,214 @@
+{
+  "schema_version": 1,
+  "kit_version": "1.0.0",
+  "repo_commit": "0000000000000000000000000000000000000000",
+  "engine": "qwen",
+  "identity_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+  "reference_key": {
+    "engine": "qwen",
+    "profile": "fixture"
+  },
+  "reference_sha256": "ced15fa80dc201c4a2a87659755a7209a4781305a16dec6da87b52dc08cdf6d5",
+  "identity": {
+    "profile": "synthetic-test-only",
+    "build_options": {},
+    "binary_sha256s": [],
+    "model_files": [],
+    "rocm_version": null
+  },
+  "hardware": {
+    "cpu_model": "Synthetic CPU",
+    "gpu_names": [],
+    "gfx_arch": [],
+    "ram_bytes": null,
+    "kernel": "test",
+    "rocm_version": null,
+    "driver_module_version": null,
+    "usb4_links": []
+  },
+  "status": "complete",
+  "prompts": [
+    {
+      "id": "code",
+      "tokens": 3,
+      "sha256": "a615eeaee21de5179de080de8c3052c8da901138406ba71c38c032845f7d54f4",
+      "construction": "test-only"
+    }
+  ],
+  "measurements": [
+    {
+      "prompt_id": "code",
+      "mode": "plain",
+      "unit": "tok/s",
+      "repeat_count": 3,
+      "median": 40,
+      "min": 38,
+      "max": 42,
+      "samples": [
+        38,
+        40,
+        42
+      ],
+      "timing_scope": "native"
+    },
+    {
+      "prompt_id": "code",
+      "mode": "spec",
+      "unit": "tok/s",
+      "repeat_count": 3,
+      "median": 40,
+      "min": 38,
+      "max": 42,
+      "samples": [
+        38,
+        40,
+        42
+      ],
+      "timing_scope": "native",
+      "draft": {
+        "role": "positive-control",
+        "status": "drafted",
+        "proposed": 12,
+        "verified": 4,
+        "accepted": 6
+      }
+    },
+    {
+      "unit": "s",
+      "repeat_count": 2,
+      "median": 0.5,
+      "min": 0.25,
+      "max": 0.75,
+      "samples": [
+        0.25,
+        0.75
+      ],
+      "timing_scope": "http-end-to-end",
+      "draft": {
+        "role": "positive-control",
+        "status": "drafted",
+        "proposed": 48,
+        "verified": 16,
+        "accepted": 24
+      },
+      "prompt_id": "http-c1",
+      "mode": "ttft",
+      "route": {
+        "label": "default",
+        "T": 8192,
+        "T_source": "startup-log",
+        "cache_policy": {
+          "requested": true,
+          "session_requested": false,
+          "effective": true
+        },
+        "cache_policy_source": "capabilities",
+        "claimed": {
+          "pinned_T": 8192,
+          "inspected_T": 8192,
+          "cache_requested": {
+            "requested": true,
+            "session_requested": false
+          }
+        },
+        "status": "read"
+      }
+    },
+    {
+      "unit": "s",
+      "repeat_count": 2,
+      "median": 0.5,
+      "min": 0.25,
+      "max": 0.75,
+      "samples": [
+        0.25,
+        0.75
+      ],
+      "timing_scope": "http-end-to-end",
+      "draft": {
+        "role": "positive-control",
+        "status": "drafted",
+        "proposed": 48,
+        "verified": 16,
+        "accepted": 24
+      },
+      "prompt_id": "http-c1",
+      "mode": "tpot",
+      "tpot_scope": "per-token-request-mean",
+      "route": {
+        "label": "default",
+        "T": 8192,
+        "T_source": "startup-log",
+        "cache_policy": {
+          "requested": true,
+          "session_requested": false,
+          "effective": true
+        },
+        "cache_policy_source": "capabilities",
+        "claimed": {
+          "pinned_T": 8192,
+          "inspected_T": 8192,
+          "cache_requested": {
+            "requested": true,
+            "session_requested": false
+          }
+        },
+        "status": "read"
+      }
+    }
+  ],
+  "exactness": [
+    {
+      "prompt_id": "code",
+      "mode": "plain",
+      "generate_length": 2,
+      "verdict": "NO-REFERENCE",
+      "reference_found": false,
+      "repeat_stable": true,
+      "prompt_sha256": "a615eeaee21de5179de080de8c3052c8da901138406ba71c38c032845f7d54f4",
+      "token_ids_sha256": "49a64717d5d4cb19952e6eac2946415cf6879adacf9908e7d872332d32c6e684",
+      "engine_digest": {
+        "final_logits_digest": "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd",
+        "final_state_digest": "abababababababababababababababab"
+      },
+      "actual_tokens": 2,
+      "evidence_scope": [
+        "ids",
+        "logits",
+        "state"
+      ]
+    },
+    {
+      "prompt_id": "code",
+      "mode": "spec",
+      "generate_length": 2,
+      "verdict": "NO-REFERENCE",
+      "reference_found": false,
+      "repeat_stable": true,
+      "prompt_sha256": "a615eeaee21de5179de080de8c3052c8da901138406ba71c38c032845f7d54f4",
+      "token_ids_sha256": "49a64717d5d4cb19952e6eac2946415cf6879adacf9908e7d872332d32c6e684",
+      "engine_digest": {
+        "final_logits_digest": "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd",
+        "final_state_digest": "abababababababababababababababab"
+      },
+      "actual_tokens": 2,
+      "evidence_scope": [
+        "ids",
+        "logits",
+        "state"
+      ],
+      "plain_tokens_equal": true,
+      "draft": {
+        "role": "positive-control",
+        "status": "drafted",
+        "proposed": 12,
+        "verified": 4,
+        "accepted": 6
+      }
+    }
+  ],
+  "skipped": [],
+  "logs": [
+    "fixture.log"
+  ]
+}

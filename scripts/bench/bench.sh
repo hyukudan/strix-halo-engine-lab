@@ -115,6 +115,8 @@ if [[ ${BENCH_TIMEOUT_ACTIVE:-0} != 1 ]]; then
         bash "$BENCH_ROOT/scripts/bench/bench.sh" "${original_args[@]}"
 fi
 if [[ $json == 1 || $md == 1 ]]; then exec 3>&1; exec 1>&2; fi
+# The result's repo identity is validated now, before any launch, not only when results are written.
+py run-identity || exit 1
 prerequisites || exit 1
 if [[ $pair == 1 ]]; then pair_check || exit 1; fi
 out=${out:-bench-results/$engine-$(date -u +%Y%m%dT%H%M%SZ)}
