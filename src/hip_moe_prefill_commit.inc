@@ -2,7 +2,7 @@
 // intermediates < 2^124. Admitted calls cannot set merge bit 8. Unproven calls execute the
 // original merge_z body and publish only after its final header is known. No public admission bits.
 // A row status implies header[0] != 0 before merge (production CSR/projection invariant).
-template <bool Acc>
+template <bool Acc, bool RouteBF16 = false>
 __device__ __forceinline__ void moe_prefill_merge_commit_element(std::uint32_t* header, std::uint32_t* status,
     const std::uint32_t* routes, const float* rawdots, const float* route_weights, float* accumulation, std::uint16_t* output,
     std::uint32_t out, std::uint32_t hidden_size, std::uint32_t experts, std::uint32_t top_k) {
@@ -15,7 +15,7 @@ __device__ __forceinline__ void moe_prefill_merge_commit_element(std::uint32_t* 
     }
     float dots[10];
 #pragma unroll
-    for (std::uint32_t slot = 0; slot < 10U; ++slot) if (slot < top_k) dots[slot] = rawdots[static_cast<std::uint64_t>(slot) * hidden_size + out];
+    for (std::uint32_t slot = 0; slot < 10U; ++slot) if (slot < top_k) dots[slot] = moe_route_load<RouteBF16>(rawdots, static_cast<std::uint64_t>(slot) * hidden_size + out);
     float current = 0.0F;
 #pragma unroll
     for (std::uint32_t slot = 0; slot < 10U; ++slot) if (slot < top_k) {
@@ -47,7 +47,7 @@ __device__ __forceinline__ void moe_prefill_commit_record(std::uint32_t* header,
     }
 }
 
-template <bool Fused = false, bool Acc = false, class View, class RowAt>
+template <bool Fused = false, bool Acc = false, bool RouteBF16 = false, class View, class RowAt>
 __device__ __forceinline__ void moe_prefill_merge_z_body(View view, std::uint32_t* header,
     std::uint32_t hidden_size, std::uint32_t experts, std::uint32_t top_k, const RowAt& row_at, const unsigned* unsafe = nullptr) {
     const auto row = blockIdx.y;
@@ -56,7 +56,7 @@ __device__ __forceinline__ void moe_prefill_merge_z_body(View view, std::uint32_
     if (header[0] || *status) { if (out < hidden_size) row_at(view.accumulation, row)[out] = 0.0F; return; }
     // The private word is read after the original header/status guards, before any changed stores.
     if constexpr (Fused) if (*unsafe == 0U) {
-        moe_prefill_merge_commit_element<Acc>(header, status, row_at(view.routes, row), row_at(view.rawdots, row),
+        moe_prefill_merge_commit_element<Acc, RouteBF16>(header, status, row_at(view.routes, row), row_at(view.rawdots, row),
             row_at(view.route_weights, row), row_at(view.accumulation, row), row_at(view.output, row),
             out, hidden_size, experts, top_k);
         return;
@@ -68,7 +68,7 @@ __device__ __forceinline__ void moe_prefill_merge_z_body(View view, std::uint32_
     const auto* route_weights = row_at(view.route_weights, row);
     float dots[10];
 #pragma unroll
-    for (std::uint32_t slot = 0; slot < 10U; ++slot) if (slot < top_k) dots[slot] = rawdots[static_cast<std::uint64_t>(slot) * hidden_size + out];
+    for (std::uint32_t slot = 0; slot < 10U; ++slot) if (slot < top_k) dots[slot] = moe_route_load<RouteBF16>(rawdots, static_cast<std::uint64_t>(slot) * hidden_size + out);
     float current = 0.0F;
 #pragma unroll
     for (std::uint32_t slot = 0; slot < 10U; ++slot) if (slot < top_k) {
@@ -87,7 +87,7 @@ __device__ __forceinline__ void moe_prefill_merge_z_body(View view, std::uint32_
 // the scalar body as well); every row the merge flags gets status exactly 8 (header and status were 0 before the merge),
 // so the finish record ({q4k_a8, 8}: the bits of the first flagged row, not its index) and the thrown completion error are
 // the same, and the failed call's accumulation is never read. Host requires hidden % 4 == 0, 16-byte rawdot/accumulation rows and 8-byte output rows.
-template <bool Acc, class View, class RowAt>
+template <bool Acc, bool RouteBF16 = false, class View, class RowAt>
 __device__ __forceinline__ void moe_prefill_merge_z_body_vec4(View view, std::uint32_t* header,
     std::uint32_t hidden_size, std::uint32_t experts, std::uint32_t top_k, const RowAt& row_at, const unsigned* unsafe) {
     const auto row = blockIdx.y;
@@ -109,8 +109,15 @@ __device__ __forceinline__ void moe_prefill_merge_z_body_vec4(View view, std::ui
     const auto* route_weights = row_at(view.route_weights, row);
     float4 dots[10];
 #pragma unroll
-    for (std::uint32_t slot = 0; slot < 10U; ++slot) if (slot < top_k)
-        dots[slot] = *reinterpret_cast<const float4*>(rawdots + static_cast<std::uint64_t>(slot) * hidden_size + out);
+    for (std::uint32_t slot = 0; slot < 10U; ++slot) if (slot < top_k) {
+        if constexpr (RouteBF16) {
+            const auto index = static_cast<std::uint64_t>(slot) * hidden_size + out;
+            const auto packed = *reinterpret_cast<const uint2*>(reinterpret_cast<const std::uint16_t*>(rawdots) + index);
+            dots[slot] = make_float4(__uint_as_float((packed.x & 0xffffU) << 16U), __uint_as_float(packed.x & 0xffff0000U),
+                __uint_as_float((packed.y & 0xffffU) << 16U), __uint_as_float(packed.y & 0xffff0000U));
+        } else
+            dots[slot] = *reinterpret_cast<const float4*>(rawdots + static_cast<std::uint64_t>(slot) * hidden_size + out);
+    }
     float current[4] = {0.0F, 0.0F, 0.0F, 0.0F};
 #pragma unroll
     for (std::uint32_t slot = 0; slot < 10U; ++slot) if (slot < top_k) {

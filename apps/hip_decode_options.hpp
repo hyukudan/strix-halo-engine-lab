@@ -274,6 +274,9 @@ struct Options {
     std::optional<strix::DecodeNumericalProfile> prefill_numerical_profile;
     // --prefill-fast-components hc,dense,moe,qsa,router: the components a fast prefill profile runs (all by default).
     std::optional<std::uint32_t> prefill_fast_components;
+    std::optional<bool> prefill_moe_route_bf16_requested;
+    bool prefill_moe_route_bf16 = false;
+    std::string prefill_moe_route_bf16_reason = "off";
     bool profile_explicit = false;
     bool any_low_level_flag = false;
     bool context_explicit = false;
@@ -771,7 +774,8 @@ inline void validate_numerical_profile_cli(const Options& options) {
 inline strix::NumericalProfilePair numerical_profile_pair(const Options& options) noexcept {
     const auto prefill = options.prefill_numerical_profile.value_or(options.numerical_profile);
     return {prefill, options.numerical_profile,
-        strix::numerical_profile_fast_prefill(prefill) ? options.prefill_fast_components.value_or(strix::kFastPrefillAll) : 0U};
+        strix::numerical_profile_fast_prefill(prefill) ? (options.prefill_fast_components.value_or(strix::kFastPrefillAll) |
+            (options.prefill_moe_route_bf16 ? strix::kFastPrefillMoeRouteBF16 : 0U)) : 0U};
 }
 
 // A split pair is admitted only where the code runs it: the tiled known-prefix prefill
@@ -1769,7 +1773,7 @@ inline Options parse_options(
             "usage: strix-hip-decode-token MODEL.gguf [TOKEN_ID ...] "
             "[--mtp-bundle FILE] "
             "[--mtp --mtp-sidecar FILE --mtp-sidecar-sha256 HEX (--mtp-golden FILE --mtp-golden-sha256 HEX | --mtp-golden-dump FILE) [--mtp-window-expert-union --mtp-window-expert-union-bytes N] [--mtp-window-hyper-mix] [--mtp-window-qsa-rows] [--mtp-window-prefix] [--mtp-draft-chain [--mtp-draft-vocab FILE[,FILE...]|auto:DIR] [--mtp-draft-context-vocab N] [--mtp-draft-exact] [--mtp-draft-q4] [--mtp-ngram-draft[=on|off|auto|ctx|copy|wide]]] [--mtp-draft-profile base|distill-d|distill-g] (explicit source/conversion/cast/budget options required)] "
-            "[--optimization-profile auto|manual] [--baseline] [--print-effective-config] [--execution-inventory] [--host-dispatch-telemetry] [--execution-telemetry-trace] [--device-queue-trace] "
+            "[--optimization-profile auto|manual] [--prefill-moe-route-bf16 on|off] [--baseline] [--print-effective-config] [--execution-inventory] [--host-dispatch-telemetry] [--execution-telemetry-trace] [--device-queue-trace] "
             "[--numerical-profile exact-v5|hc-splitk-f32-v1|q51-a8-down-v1|hc-splitk-f32+q51-a8-down-v1|q51-q80-a8-down-v1|hc-splitk-f32+q51-q80-a8-down-v1|hc-splitk-f32+q51-q80-a8-down+q5k-a8-gateup-v1|hc-deferred-norm-f32+q51-q80-a8-down-v1|hc-deferred-norm-f32+q51-q80-a8-down+q5k-a8-gateup-v1|hc-splitk-f32+q51-q80-a8-down+q5k-a8-gateup+dense-a8-v1|hc-deferred-norm-f32+q51-q80-a8-down+q5k-a8-gateup+dense-a8-v1] [--prefill-numerical-profile NAME] "
             "[--teacher-forced-score --generate 1 [--teacher-logits-file PATH]] [--dense-q6p-pack PATH] [--dense-trellis-pack PATH] "
             "[--gpu-greedy-token] [--logprob-token ID ...] [--offline-tuning-cache FILE [--offline-compile-provenance FILE]] [--gdn-recurrent-layout baseline|stride32|stride33|transposed] [--gdn-recurrent-storage key-value|value-key] [--attention-kv-storage bf16|kv-int8-tok-v1] [--known-prefix-window --known-prefix-rows 2|4|8 --known-prefix-expert-union] [--known-window-router-rows] [--known-prefix-prefill-rows 16..8192 --known-prefix-workspace-budget-bytes N --known-prefix-host-metadata-budget-bytes N --known-prefix-uma-budget-bytes N --known-prefix-host-headroom-bytes N] [--prompt-lookup [--prompt-lookup-depth 0|1|2 | --prompt-lookup-adaptive] [--prompt-lookup-snapshot occupied-kv-v1 --prompt-lookup-snapshot-bytes N]] [--serve-prefix-u32le FILE ... --serve-concurrency 1|2|4 [--serve-tensor-cohort-rows 2|4 | --serve-prefill-rows 2|4|8|16..2048 --serve-prefill-workspace-budget-bytes N --serve-prefill-host-metadata-budget-bytes N] --serve-memory-budget-bytes N --serve-request-budget-bytes N --serve-headroom-bytes N] [--gdn-islands] [--qsa-hierarchical-selection] [--qsa-gqa-heads-per-block 1|2|4] [--prepared-eager] [--moe-shared-overlap [--moe-token-cost-policy]] [--moe-overlap-arena-budget-bytes N] [--batched-moe-activation] [--validation-final-state DIR] [--validation-final-state-max-bytes N] [--reference FILE] [--max-logit-error X] "
@@ -1946,6 +1950,15 @@ inline Options parse_options(
                 throw std::invalid_argument("--prefill-numerical-profile requires a supported numerical recipe");
             options.prefill_numerical_profile = *parsed;
             options.prefill_profile_deferred = value == "dense-a8";
+            continue;
+        }
+        if (argument == "--prefill-moe-route-bf16") {
+            if (options.prefill_moe_route_bf16_requested || index + 1 >= argc)
+                throw std::invalid_argument("--prefill-moe-route-bf16 requires on or off once");
+            const std::string_view value = argv[++index];
+            if (value != "on" && value != "off" && value != "1" && value != "0")
+                throw std::invalid_argument("--prefill-moe-route-bf16 requires on or off");
+            options.prefill_moe_route_bf16_requested = value == "on" || value == "1";
             continue;
         }
         if (argument == "--prefill-fast-components") {

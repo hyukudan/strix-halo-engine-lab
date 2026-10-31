@@ -149,7 +149,9 @@ inline constexpr std::uint32_t kFastPrefillHc = 1U, kFastPrefillDense = 2U, kFas
     kFastPrefillAll = kFastPrefillHc | kFastPrefillDense | kFastPrefillMoe | kFastPrefillQsa | kFastPrefillRouter;
 // dense8: the dense projections as A8-G64 (int8 x int8, int32 over 64 features per scale step) instead of the FP16 form
 // of `dense`; opt-in (not part of the default set) and exclusive with `dense`.
-inline constexpr std::uint32_t kFastPrefillDense8 = 32U, kFastPrefillKnown = kFastPrefillAll | kFastPrefillDense8;
+// moeroute16: candidate BF16 route-dot storage; opt-in, requires moe, outside the default set.
+inline constexpr std::uint32_t kFastPrefillDense8 = 32U, kFastPrefillMoeRouteBF16 = 64U,
+    kFastPrefillKnown = kFastPrefillAll | kFastPrefillDense8 | kFastPrefillMoeRouteBF16;
 
 // Prefill/decode arithmetic pair. The prompt prefill may run a different (prefill) profile from
 // the decode/MTP windows; decode always runs `decode`. A pair is admitted when both profiles are
@@ -170,6 +172,7 @@ inline constexpr bool numerical_profile_pair_admitted(NumericalProfilePair pair)
         return numerical_profile_fast_prefill_decode(pair.prefill) == (numerical_profile_dense_trellis(pair.decode)
                 ? DecodeNumericalProfile::hc_splitk_f32_q51_q80_a8_down_q5k_a8_gateup_dense_a8_v1 : pair.decode) && pair.fast_components != 0U &&
             (pair.fast_components & ~kFastPrefillKnown) == 0U &&
+            (!(pair.fast_components & kFastPrefillMoeRouteBF16) || (pair.fast_components & kFastPrefillMoe)) &&
             (pair.fast_components & (kFastPrefillDense | kFastPrefillDense8)) != (kFastPrefillDense | kFastPrefillDense8);
     return pair.fast_components == 0U && (!pair.split() || numerical_profile_dense_a8_sibling(pair.decode) == pair.prefill);
 }
