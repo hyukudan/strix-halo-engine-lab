@@ -709,7 +709,10 @@ the default profile and assets and context up to 16,384; there the automatic bud
 `min(4 GiB, A/16, A - reserve)` of available memory A, and results are bitwise identical to cache-off. Every
 other automatic configuration, including the plain serve command (which resolves T=8192), declines by name and
 runs exactly as cache-off; explicit host bytes keep their behaviour. Startup, `--print-effective-config`,
-`/v1/capabilities` and `/v1/cache/stats` report the requested and effective policy and its reason. MTP restore accepts only suffix plans equivalent to the uncached execution;
+`/v1/capabilities` and `/v1/cache/stats` report the requested and effective policy and its reason. In-flight
+prefix joining (a request waits for the certified checkpoint another slot is producing instead of recomputing it)
+is on by default wherever the cache is on and only acts on concurrent strict-L0 certified batch routes;
+`STRIX_PREFIX_CACHE_INFLIGHT=0` / `--prefix-cache-inflight off` turns it off. MTP restore accepts only suffix plans equivalent to the uncached execution;
 checkpoint copies follow existing block boundaries.
 
 ### DeepSeek pair

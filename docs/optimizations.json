@@ -23,6 +23,17 @@
   },
   {
     "engine": "qwen",
+    "name": "Certified prefix restart and in-flight joining",
+    "flag_or_env": "--prefix-cache-inflight; STRIX_PREFIX_CACHE_INFLIGHT; --prefix-cache-disk; STRIX_PREFIX_CACHE_DISK; --prefix-cache-durable; STRIX_PREFIX_CACHE_DURABLE",
+    "default": "ON: joining wherever the prefix cache is on (acts only on concurrent strict-L0 certified batch routes; inert on the single runner); disk persistence/durability with a configured directory. Does not widen the cache's qualified routes; batch L1 remains unqualified",
+    "exact": "Matching cold full-T certificates, complete state and unchanged suffix cursor. Existing v1 store with tagged certificate metadata; no tail-to-T inference. Native gate on the strict-L0 batch route: 9/9 mixed-arrival joining runs and a disk restart bitwise identical to cold (logits, IDs, committed state).",
+    "gain": "Strict-L0 batch route, mixed arrivals: joiner TTFT -40 %, aggregate throughput +65 % versus recomputing the shared prefix; exact.",
+    "preconditions": "Active cache; disk requires an explicit directory. Joining requires strict L0, interleaved ordinary admission, solo groups, compatible namespaces and suffix-solo units, retained cold producer and a consumer outside short-first priority. Cancellation/reuse or failed capture releases to normal lookup/cold execution.",
+    "off_switch": "--prefix-cache-inflight off / STRIX_PREFIX_CACHE_INFLIGHT=0; --prefix-cache-disk off / STRIX_PREFIX_CACHE_DISK=0; --prefix-cache-durable off / STRIX_PREFIX_CACHE_DURABLE=0. CLI wins; baseline preserves legacy behavior.",
+    "doc_anchor": "docs/engine/serving/prefix-state-cache.md#certified-restart-and-in-flight-joining"
+  },
+  {
+    "engine": "qwen",
     "name": "Plan-neutral prefix cache on the MTP serving route",
     "flag_or_env": "--prefix-cache; STRIX_PREFIX_CACHE; --prefix-cache-host-bytes; --prefix-cache-staging-bytes; STRIX_PREFIX_CACHE_STAGING_BYTES",
     "default": "ON on the qualified single tiled-MTP HTTP family after post-residency fit; other automatic families decline",

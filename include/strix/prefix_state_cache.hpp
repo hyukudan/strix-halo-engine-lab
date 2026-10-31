@@ -63,7 +63,7 @@ struct PrefixCacheSegment {
 
 struct PrefixCacheCheckpoint {
     ModelContentIdentity identity, digest;
-    std::vector<std::uint64_t> producer_certificate; // nonempty: certified RAM-only family
+    std::vector<std::uint64_t> producer_certificate; // nonempty: certified producer family
     std::string conversation; // retention only; never serialized or part of numerical identity
     std::uint64_t position = 0;  // P = segments.size() * block_rows
     std::uint32_t block_rows = 0;
@@ -90,6 +90,8 @@ struct PrefixStateCachePolicy {
     std::uint64_t disk_byte_budget = 0;    // 0 with a directory: unbounded
     PrefixCacheRetention retention = PrefixCacheRetention::fair;
     bool legacy = false; // Baseline preserves the original explicit-cache path.
+    bool certified_disk = true; // Certificate envelope in existing v1 checkpoint metadata.
+    bool durable = true; // Sync files and directory before publishing a checkpoint.
 };
 
 // Allocators may mark non-resource failures that opportunistic capture must propagate.
@@ -242,7 +244,7 @@ public:
     // Longest checkpoint for this identity whose prefix is tokens[0, P) with P = k*block_rows <=
     // limit. Host first, then disk (promote=false suppresses host publication). Null: miss.
     // The returned handle keeps its payloads alive. An eligibility predicate runs outside
-    // the mutex on that lease, before hit accounting; this candidate path is RAM-only.
+    // the mutex on that lease, before hit accounting. Disk candidates must carry a certificate.
     [[nodiscard]] std::shared_ptr<const PrefixCacheCheckpoint> find_longest(const ModelContentIdentity& identity,
         std::span<const std::uint32_t> tokens, std::uint32_t block_rows, std::uint64_t limit, bool promote = true, std::string_view conversation = {},
         const std::function<bool(const PrefixCacheCheckpoint&)>& eligible = {});

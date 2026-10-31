@@ -183,6 +183,30 @@ try {
                 require(!qwen_suffix_solo_class(batch_plan,length,t,cfg,true),"nesting excludes L0");
             }
     }
+    {
+        QwenTiledPlanConfig plan;plan.rows=1024;plan.block={1024,QwenPlanOutput::terminal};plan.schedule=12;
+        QwenBatchConfig batch;batch.groups=false;batch.cohort=false;batch.windows=false;
+        const auto p=qwen_prefix_join_boundary(plan,11392,plan,10192,9692,1024,batch,false);
+        require(p==9216,"join selects deepest common cold full-T boundary");
+        auto changed=plan;changed.block.kernel=123;
+        require(!qwen_prefix_join_boundary(plan,11392,changed,10192,9692,1024,batch,false),
+            "join refuses changed arithmetic identity");
+        require(!qwen_prefix_join_boundary(plan,11392,plan,10192,9692,1024,batch,true),
+            "join refuses possible nested suffix");
+        require(!qwen_prefix_join_boundary(plan,11392,plan,10192,9692,9216,batch,false),
+            "join cannot wait for already passed work");
+        require(!qwen_prefix_join_boundary(plan,11392,plan,10192,1023,0,batch,false),
+            "join cannot split a full-T block");
+        require(qwen_prefix_join_grid(8192,8192) && qwen_prefix_join_grid(1024,8192) && qwen_prefix_join_grid(1024,2048),
+            "join accepts a cache grid dividing T, including the HTTP 1024-row checkpoint default");
+        require(!qwen_prefix_join_grid(0,8192) && !qwen_prefix_join_grid(3072,8192) && !qwen_prefix_join_grid(1024,0),
+            "join refuses a missing or non-dividing cache grid");
+        QwenPrefixJoinWait wait{42,9216};
+        require(wait.pending(42,true,true,1024) && wait.pending(42,true,true,9216),"wait keeps incomplete producer");
+        require(!wait.pending(43,true,true,0),"ABA slot generation releases waiter");
+        require(!wait.pending(42,false,true,1024) && !wait.pending(42,true,false,1024),"producer cancellation/completion releases waiter");
+        require(!wait.pending(42,true,true,10240),"passed boundary releases waiter");
+    }
     std::cout<<"planner passed: "<<shapes<<" shapes, "<<units<<" units; certificates and capture eligibility passed\n";
     return 0;
 } catch(const std::exception& e) {std::cerr<<e.what()<<'\n';return 1;}

@@ -54,7 +54,10 @@ caching is ON by default only for the qualified single tiled-MTP HTTP runner
 profile/schedule/tails and model assets, context up to 16384. Qualified results are
 bitwise identical to cache-off. Explicit host bytes retain their existing behavior.
 `--prefix-cache off` disables prefix caching; `--prefix-batch-cert off` and
-`--session-cache off` disable their separate policies.
+`--session-cache off` disable their separate policies. In-flight prefix joining is
+on by default wherever the cache is on and only acts on concurrent strict-L0
+certified batch routes (inert on the single runner); `STRIX_PREFIX_CACHE_INFLIGHT=0`
+or `--prefix-cache-inflight off` turns it off.
 
 The prompt may run a separate prefill profile (`--prefill-numerical-profile`, see
 [prefill-numerical-profile.md](../prefill/prefill-numerical-profile.md)), for example the fast prefill profile
@@ -1330,3 +1333,49 @@ nonblocking with respect to the runner and `age_ms` increases; a read never refr
 Ledger byte and segment gauges are read together. Eviction reason counters have
 their own scope and do not sum to legacy `evicted`; explicit deletion leaves that
 legacy counter unchanged.
+
+
+### Prefix joining and restart qualification
+
+The [certified prefix tier](prefix-state-cache.md#certified-restart-and-in-flight-joining)
+can persist unnamed prefix checkpoints across process restarts. This is distinct
+from named sessions. In-flight joining is on by default wherever the cache is on,
+acts only on concurrent strict L0 certified batch routes, and uses the same
+certificate and cold continuation as ordinary hits.
+`--prefix-cache-inflight off` / `STRIX_PREFIX_CACHE_INFLIGHT=0` disables waiting;
+`--prefix-cache-disk off` / `STRIX_PREFIX_CACHE_DISK=0` disables prefix disk reads
+and writes; `--prefix-cache-durable off` / `STRIX_PREFIX_CACHE_DURABLE=0` disables
+publication syncs. Effective config and capabilities disclose the guarded policies.
+Automatic prefix budgets and batch L1 remain unqualified.
+
+The native gate below requires a pinned native server command with model, MTP
+receipt/state/reference assets, numerical settings, context, tiled prefill and an
+explicit `--prefix-cache-host-bytes` budget. Keep all assets and receipts private.
+The producer/joiner fixtures must share several full-T blocks and diverge before
+their final prompt rows; the short fixture is unrelated. All must fit the context.
+For T=8192, this experiment requires nesting off; a finer cache grid does not
+qualify tail-to-T equivalence.
+
+```sh
+python3 tests/prefix_cache_gpu_gate.py \
+  --producer assets/producer.ids --joiner assets/joiner.ids \
+  --short assets/short.ids --timing --out "$PRIVATE_RECEIPTS/prefix-joining" \
+  -- build/strix-hip-decode-token MODEL.gguf [PINNED_MTP_AND_PREFILL_ARGS] \
+  --prefix-cache-host-bytes 4294967296
+```
+
+The driver runs cold references, mixed-arrival off/on/off ABA three times, and a
+persisted producer followed by a new-process joining turn. It requires an actual
+joining reuse witness and restart restore credit. Equality covers all token IDs,
+every emitted raw FP32 vocabulary row through a coverage-counted SHA-256 chain,
+prompt terminal logits and state, and final committed target/predictor state,
+positions and generations/lineage. Missing fields or tripwire evidence fail closed.
+It does not exclude predictor components to obtain a pass.
+
+Repeat with partial terminal blocks/tails and shared-prefix divergences, no-store,
+producer cancellation and immediate slot reuse, capture-credit refusal and service
+admissions. Compare against cold at the identical numerical identity. With `--timing`, a second ABA x3 matrix disables diagnostic readbacks, checks
+complete IDs against the exactness reference, and requires no slower producer,
+joiner or unrelated-short median TTFT and no lower complete-workload throughput.
+Keep capacity and startup settings fixed across arms; retain the private receipts.
+No timing or native exactness claim is established by the host tests in this change.

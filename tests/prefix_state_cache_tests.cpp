@@ -89,7 +89,8 @@ std::vector<std::shared_ptr<const strix::PrefixCacheCheckpoint>> build(strix::Pr
 
 bool same_payloads(const strix::PrefixCacheCheckpoint& a, const strix::PrefixCacheCheckpoint& b) {
     if (a.position != b.position || a.segments.size() != b.segments.size() || a.fixed.bytes != b.fixed.bytes ||
-        a.metadata != b.metadata || std::memcmp(a.fixed.data.get(), b.fixed.data.get(), a.fixed.bytes) != 0)
+        a.metadata != b.metadata || a.producer_certificate != b.producer_certificate ||
+        std::memcmp(a.fixed.data.get(), b.fixed.data.get(), a.fixed.bytes) != 0)
         return false;
     for (std::size_t k = 0; k < a.segments.size(); ++k)
         if (a.segments[k]->tokens != b.segments[k]->tokens || a.segments[k]->payload.bytes != b.segments[k]->payload.bytes ||
@@ -490,7 +491,58 @@ int main() {
             require(!hit && stats.plan_misses==6 && stats.host_hits==1 && stats.misses==1 && stats.restored_tokens==16,
                 "all refused is a miss, never a false restore");
             cache.flush();
-            require(cache.counters().disk_writes==0,"certified checkpoints never enter v1 disk writer");
+            require(cache.counters().disk_writes==5,"certified checkpoints persist in v1 store");
+        }
+        {
+            // Restart: reconstruct the store, require the certificate before accounting a hit.
+            const std::vector<std::uint32_t> candidate_tokens(21,7);
+            strix::PrefixStateCache cache({1U<<20,dir/"certified",0},heap);
+            const auto eligible=[&](const strix::PrefixCacheCheckpoint& c) {
+                (void)cache.counters();
+                return c.producer_certificate==std::vector<std::uint64_t>{1};
+            };
+            auto hit=cache.find_longest(id,candidate_tokens,T,20,false,{},eligible);
+            require(hit && hit->position==16 && hit->producer_certificate==std::vector<std::uint64_t>{1},
+                "restart restores certificate and matching candidate");
+            strix::PrefixStateCache reference({1U<<20,{},0},heap);
+            auto expected=std::make_shared<strix::PrefixCacheCheckpoint>(*build(reference,id,candidate_tokens)[3]);
+            expected->producer_certificate={1};
+            require(same_payloads(*hit,*expected),"certified restart full payload bit equality");
+            const auto stats=cache.counters();
+            require(stats.disk_hits==1 && stats.plan_misses==1 && stats.host_checkpoints==0 && stats.restored_tokens==16,
+                "restart accepted-only counters and no-store");
+            require(!cache.find_longest(id,candidate_tokens,T,20,false,{},[](const auto&){return false;}),
+                "restart incompatible certificate misses");
+            require(!cache.find_longest(id,candidate_tokens,T,20),"legacy lookup cannot restore certified files");
+        }
+        {
+            // A corrupt certificate envelope must miss before any accepted-hit credit.
+            const auto tier=dir/"certified";
+            const std::vector<std::uint32_t> candidate_tokens(21,7);
+            const auto chain=strix::prefix_cache_block_digests(id,candidate_tokens,T,4);
+            const auto path=tier/("ckpt-"+strix::model_content_identity_hex(chain.back())+".tmpc");
+            {
+                std::fstream file(path,std::ios::binary|std::ios::in|std::ios::out);
+                file.seekp(128+4*32);file.put(0); // damage the certified metadata count/checksum
+            }
+            strix::PrefixStateCache cache({1U<<20,tier,0},heap);
+            require(!cache.find_longest(id,candidate_tokens,T,20,false,{},[](const auto& c) {
+                return c.producer_certificate==std::vector<std::uint64_t>{1};
+            }),"corrupt certificate cannot restore");
+            require(cache.counters().disk_read_failures==1 && cache.counters().disk_hits==0 &&
+                cache.counters().restored_tokens==0,"corrupt envelope has no hit credit");
+        }
+        {
+            strix::PrefixStateCachePolicy policy{1U<<20,dir/"certified",0};
+            policy.certified_disk=false;
+            strix::PrefixStateCache cache(policy,heap);
+            const std::vector<std::uint32_t> candidate_tokens(21,7);
+            require(!cache.find_longest(id,candidate_tokens,T,20,false,{},[](const auto&){return true;}),
+                "certified disk off switch refuses restart");
+            require(cache.counters().disk_reads==0,"off switch avoids disk payload reads");
+            auto cp=std::make_shared<strix::PrefixCacheCheckpoint>(*build(cache,other,candidate_tokens)[0]);
+            cp->producer_certificate={1};require(cache.insert(cp),"off disk still allows RAM capture");
+            cache.flush();require(cache.counters().disk_writes==0,"certified disk off suppresses writer");
         }
         {
             const auto tier=dir/"legacy-v1-refusal";

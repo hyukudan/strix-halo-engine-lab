@@ -70,6 +70,27 @@ then exit before HIP initialization. See [command-line admission](getting-starte
 The historical baseline resolves ordinary generation with exact-v5, prepared execution, shared overlap,
 GDN islands and implicit context 8192; it does not automatically select dense A8 or enlarge the context.
 
+### Certified prefix restart and in-flight joining
+
+**Engine:** `qwen`. **Default:** disk persistence/durability on when an explicit
+prefix directory is configured; joining on wherever the cache is on, acting only on
+concurrent strict L0 certified batch routes (inert on the single runner).
+Automatic HTTP budgets and batch L1 qualification remain off.
+
+- **Contract:** reuse the existing v1 store, execution signature, full-T certificates
+  and cold continuation. Joining requires solo groups and compatible suffix units;
+  it never changes the T/tail block plan. Invalid, cancelled or unavailable producers
+  fall back to lookup/cold execution. Native gate on the strict L0 batch route:
+  9/9 mixed-arrival joining runs and a disk restart bitwise identical to cold;
+  joiner TTFT -40 %, aggregate throughput +65 %.
+- **Off switches:** `--prefix-cache-inflight off` / `STRIX_PREFIX_CACHE_INFLIGHT=0`,
+  `--prefix-cache-disk off` / `STRIX_PREFIX_CACHE_DISK=0`, and
+  `--prefix-cache-durable off` / `STRIX_PREFIX_CACHE_DURABLE=0`; CLI wins. Master
+  cache off disables all reuse; baseline preserves the legacy cache behavior.
+- **Inspect/gate:** `prefix_cache` in effective config and HTTP capabilities reports
+  guarded policy. See [guards and disk contract](engine/serving/prefix-state-cache.md#certified-restart-and-in-flight-joining)
+  and [mixed-arrival/restart gate](engine/serving/serving.md#prefix-joining-and-restart-qualification).
+
 <a id="qwen-tiled"></a>
 
 ### Automatic tiled prefill, expert union and router rows

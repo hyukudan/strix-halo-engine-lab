@@ -103,6 +103,8 @@ static std::string numerical_config(std::string_view cli, const RotaryIdentity& 
         // PROMPT_STATE, PREFIX_CACHE, SERIAL_LOGITS and FINAL_STATE remain in the match:
         // their consumers can flush pending windows or synchronize a device readback.
         if (family && value.starts_with("STRIX_PREFILL_LOGITS_DIGEST=")) continue;
+        if (value.starts_with("STRIX_PREFIX_CACHE_INFLIGHT=") || value.starts_with("STRIX_PREFIX_CACHE_DISK=") ||
+            value.starts_with("STRIX_PREFIX_CACHE_DURABLE=")) continue;
         for (const auto prefix : {"STRIX_", "HIP_", "HSA_", "AMD_", "ROCR_", "GPU_"})
             if (value.starts_with(prefix)) { env.emplace_back(*p); break; }
     }

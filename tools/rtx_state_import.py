@@ -192,12 +192,20 @@ def complete(server, prompt, max_tokens):
 def decode_ckpt(path):
     with open(path, "rb") as f:
         raw = f.read()
-    position, block_rows, _, segments, fixed_bytes, metadata_bytes = struct.unpack_from("<QIIQQQ", raw, 72)
+    position, block_rows, envelope, segments, fixed_bytes, metadata_bytes = struct.unpack_from("<QIIQQQ", raw, 72)
     meta_at = 128 + 32 * segments
     m = struct.unpack_from(f"<{metadata_bytes // 8}Q", raw, meta_at)
+    certificate = []
+    if envelope == 1:
+        if not m or not 0 < m[0] < len(m):
+            raise SystemExit("malformed prefix producer certificate")
+        certificate, m = list(m[1:1 + m[0]]), m[1 + m[0]:]
+    elif envelope:
+        raise SystemExit("unknown prefix metadata envelope")
     if m[0] != 0x31544d5043585054:
         raise SystemExit("not a prefix-state checkpoint metadata block")
     out = {"position": position, "block_rows": block_rows, "segments": segments, "fixed_bytes": fixed_bytes,
+           "producer_certificate": certificate,
            "next_position": m[1], "committed_tokens": m[2], "layout_identity": hex(m[3]), "row_bytes": m[4], "fixed_bytes_meta": m[5],
            "execution_identity": hex(m[6]), "runtime_compatibility_identity": hex(m[7]), "valid": m[8], "generations": list(m[9:15])}
     count = m[17]

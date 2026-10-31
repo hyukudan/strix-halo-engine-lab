@@ -710,11 +710,34 @@ public:
     }
     [[nodiscard]] const std::optional<QwenPlanCursor>& continuation() const {return continuation_;}
     [[nodiscard]] const ModelContentIdentity& active_identity() const {return certified_path_?plan_identity_:identity_;}
+    void request_capture(std::uint64_t position) { requested_captures_.insert(position); }
+    [[nodiscard]] std::uint64_t cached_boundary(std::span<const std::uint32_t> prompt) const {
+        if(!store_ || prompt.empty()) return 0;
+        const auto digests=prefix_cache_block_digests(active_identity(),prompt,block_rows_,(prompt.size()-1U)/block_rows_);
+        for(auto k=digests.size();k>0;--k) if(store_->contains(digests[k-1U])) return k*block_rows_;
+        return 0;
+    }
+    [[nodiscard]] bool joining_allowed() const {
+        static const bool lookup=[] {const char* v=std::getenv("STRIX_PREFIX_CACHE_LOOKUP");return !v || v[0]!='0';}();
+        return store_ && !store_->policy().legacy && certified_path_ && plan_enabled_ &&
+            plan_route_==2 && allow_restore_ && !batch_config_.groups && !policy_selection_ &&
+            lookup && !imported_ && qwen_prefix_join_grid(block_rows_,plan_.rows);
+    }
+    [[nodiscard]] bool retaining() const {return retain_;}
+    [[nodiscard]] std::uint64_t join_boundary(const HipPrefixStateCacheSession& producer,
+        std::uint64_t common,std::uint64_t from) const {
+        if(!joining_allowed() || !producer.joining_allowed() || !producer.retain_ ||
+            (batch_config_.short_rows && plan_n_<=batch_config_.short_rows) ||
+            active_identity()!=producer.active_identity()) return 0;
+        return qwen_prefix_join_boundary(producer.plan_,producer.plan_n_,plan_,plan_n_,common,from,
+            batch_config_,nesting_possible_);
+    }
     std::uint64_t begin_request(SerialSessionContext& session, std::span<const std::uint32_t> prompt) {
         PrefixAsyncCapture::reap();
         used_ = true;
         request_ = std::make_shared<PrefixStateCacheRequestStats>();
         continuation_.reset();
+        requested_captures_.clear();
         request_->prompt_tokens = prompt.size();
         segments_.clear();
         row_chain_=std::make_shared<PrefixAsyncCapture::RowChain>();
@@ -866,7 +889,7 @@ private:
             session.health!=SerialSessionHealth::ready || !target_valid ||
             !certified_metadata(session.state,session.arithmetic_lineage,p) ||
             !qwen_full_t_continuation(plan_,plan_n_,p)) return {};
-        const bool selected=p%every_==0 || p+block_rows_>std::min<std::uint64_t>(covered,prompt.size());
+        const bool selected=requested_captures_.contains(p) || p%every_==0 || p+block_rows_>std::min<std::uint64_t>(covered,prompt.size());
         // Unselected boundaries may prefetch rows privately. They never publish checkpoints.
         // This lets a one-block staging cap feed a checkpoint cadence larger than T.
         if(!retain_) {store_->record_no_store_skip();return {};}
@@ -1490,6 +1513,7 @@ private:
     QwenBatchConfig batch_config_;
     bool allow_restore_=true,nesting_possible_=false;
     bool certified_path_=false,plan_enabled_=false,serial_path_=false;
+    std::set<std::uint64_t> requested_captures_;
     std::vector<KnownPromptChunkUnit> serial_cold_,serial_executed_;
     std::function<bool(std::uint64_t)> serial_can_resume_;
     std::uint32_t block_rows_ = 0;

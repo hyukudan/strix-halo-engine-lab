@@ -17,6 +17,30 @@ inline std::string without_cache_policy(std::string text) {
         }
     return text;
 }
+// In-flight joining and certified-disk reporting are additive fields inside
+// "prefix_cache"; strip them so every incumbent field is still compared.
+inline std::string without_prefix_reuse_policy(std::string text) {
+    const auto object=text.find("\"prefix_cache\":{");
+    if(object==std::string::npos) return text;
+    for(const char* key:{"disk","certified_disk","durable","inflight","inflight_requested",
+            "inflight_source","inflight_reason","inflight_policy"}) {
+        std::size_t close=object+16;
+        for(unsigned depth=1;close<text.size() && depth;++close) {
+            if(text[close]=='\"') {for(++close;close<text.size() && text[close]!='\"';++close) if(text[close]=='\\') ++close;continue;}
+            if(text[close]=='{') ++depth; else if(text[close]=='}') --depth;
+        }
+        const auto needle=std::string("\"")+key+"\":";
+        auto start=text.find(needle,object);
+        if(start==std::string::npos || start>=close) continue;
+        auto end=start+needle.size();
+        if(end<text.size() && text[end]=='\"') {for(++end;end<text.size() && text[end]!='\"';++end) if(text[end]=='\\') ++end;++end;}
+        else while(end<text.size() && text[end]!=',' && text[end]!='}') ++end;
+        if(end<text.size() && text[end]==',') ++end;
+        else if(start>0 && text[start-1]==',') --start;
+        text.erase(start,end-start);
+    }
+    return text;
+}
 
 // Public-main resolver output fingerprints. Generation uses the same fixture
 // against the preserved source; expected values are in the adjacent table.
@@ -32,7 +56,7 @@ inline std::vector<std::pair<std::string,std::string>> cache_compatibility_recor
         auto text=effective_config_json(config);
         // New report is additive; compare every incumbent field, including its
         // original representation/reason, rather than a handpicked subset.
-        text=without_cache_policy(std::move(text));
+        text=without_prefix_reuse_policy(without_cache_policy(std::move(text)));
         text+=';'+std::to_string(o.prefix_batch_cert)+';'+std::to_string(o.session_management_requested);
         text+=';'+std::to_string(ordinary_http_batch_slots(o))+';'+std::to_string(o.prefix_cache_every);
         text+=';'+std::to_string(o.prefix_cache_disk_bytes)+';'+o.prefix_cache_dir;

@@ -312,7 +312,7 @@ public:
         MtpDecodeTargetParents::TiledPrompt& tiled,SerialSessionContext& session,HipMtpTargetHidden& target,HipMtpRuntime& runtime,
         const QualifiedMtpDraftPlan& qualified,const ActivatedMtpDraftPlan& activated,const ExecutionRuntimeResources& resources,
         DirectLaunchDispatcher& dispatcher,std::byte* held,std::shared_ptr<TokenSampler> final_sampler={},
-        HipMtpHostRowSelector final_selector={},std::function<void(serve::GenerationProgress)> progress={}, bool session_resume=false, bool tiled_suffix=true, bool batch=false, BatchCertContext batch_cert={})
+        HipMtpHostRowSelector final_selector={},std::function<void(serve::GenerationProgress)> progress={}, bool session_resume=false, bool tiled_suffix=true, bool batch=false, BatchCertContext batch_cert={}, bool defer_cache_lookup=false)
         :tokens_(tokens.begin(),tokens.end()),tiled_(tiled),session_(session),target_(target),runtime_(runtime),qualified_(qualified),
          activated_(activated),resources_(resources),dispatcher_(dispatcher),held_(held),final_sampler_(std::move(final_sampler)),final_selector_(std::move(final_selector)),progress_(std::move(progress)) {
         producer_rotary_=model.rotary_identity();
@@ -378,12 +378,13 @@ public:
             });
         }
         if(tiled_.cache) tiled_.cache->set_policy_selection(!!final_selector_);
+        deferred_lookup_=defer_cache_lookup && tiled_.cache && tiled_.cache->joining_allowed() && !session_resume;
         start_=std::chrono::steady_clock::now();
         if(session_resume) {
             restored_=session_.next_position;
             if(!restored_ || restored_>=n_ || runtime_.next_source_position()+1U!=restored_)
                 throw std::invalid_argument("MTP session suffix frontier differs");
-        } else if(tiled_.cache) restored_=tiled_.cache->begin_request(session_,tokens_);
+        } else if(tiled_.cache && !deferred_lookup_) restored_=tiled_.cache->begin_request(session_,tokens_);
         pos_=restored_;
         if(restored_ && !session_resume && !tiled_.rtx_import && !legacy_cache()) {
             const auto& cursor=tiled_.cache->continuation();
@@ -418,6 +419,21 @@ public:
     [[nodiscard]] std::uint64_t position() const noexcept {return pos_;}
     [[nodiscard]] std::uint64_t remaining() const noexcept {return n_-pos_;}
     [[nodiscard]] std::uint64_t restored() const noexcept {return restored_;}
+    [[nodiscard]] bool lookup_deferred() const noexcept {return deferred_lookup_;}
+    // Only an untouched cold slot can retry lookup after its producer publishes.
+    void retry_join_lookup() {
+        if(!deferred_lookup_ || pos_ || restored_ || !certified_request_ || !tiled_.cache || !tiled_.cache->joining_allowed())
+            throw std::logic_error("prefix join retry requires an untouched certified prompt");
+        deferred_lookup_=false;
+        restored_=tiled_.cache->begin_request(session_,tokens_);
+        pos_=restored_;
+        if(restored_) {
+            const auto& cursor=tiled_.cache->continuation();
+            if(!cursor) throw std::logic_error("prefix join lacks cold continuation");
+            phase_=cursor->phase;tail_=cursor->tail;balanced_=cursor->balanced;
+            report_progress();
+        }
+    }
     // The prompt's next unit when it is a tiled block (a T-row block or a tail block): its backend, owner, rows,
     // whether it is a T block (prefix cache capture) and whether it ends the prompt. Null when the next unit is
     // serial rows or the prompt is done. Only advances past exhausted block phases, as step() would.
@@ -803,6 +819,7 @@ private:
     }
     QwenTiledPlanConfig plan_config_;
     bool certified_request_=false,batch_=false;
+    bool deferred_lookup_=false;
     BatchCertContext batch_cert_;
     std::vector<QwenUnitExec> trace_;
     std::uint64_t request_order_=0;
@@ -1104,6 +1121,8 @@ public:
         bool active = false;     // the slot holds a request (prefilling or decoding)
         bool prefilling = false; // its prompt is still running (interleaved admission)
         std::unique_ptr<TiledMtpPrompt> prefill;
+        Slot* waits_for=nullptr;
+        QwenPrefixJoinWait join_wait;
         std::uint64_t order = 0; // admission order: prompts advance oldest first
         std::chrono::steady_clock::time_point prompt_start;
         MtpBatchRequest request;
@@ -1119,6 +1138,7 @@ public:
         std::uint64_t prompt_groups = 0, grouped_blocks = 0, grouped_rows = 0;
         double prompt_group_ms = 0.0;
         std::uint64_t lazy_slot_builds = 0;
+        std::uint64_t inflight_waits=0,inflight_wait_tokens=0,inflight_restored_tokens=0;
         double lazy_slot_ms = 0.0, lazy_slot_max_ms = 0.0;
         bool lazy_slot_memory_declined = false;
         // Prompt window cohorts (STRIX_PROMPT_WINDOW_COHORT=1): steps that ran known-row windows, and their windows.
@@ -1321,17 +1341,22 @@ private:
         // Predictor priming and cache checkpoints use the configured draft identity for every prompt.
         enable_draft_(*s.runtime, s.request.prompt, s.request.sampler);
         s.prompt_start = start;
+        s.waits_for=nullptr;s.join_wait={};
         if (s.parents->tiled.cache) s.parents->tiled.cache->set_retention(s.request.cache_retention != serve::CacheRetention::no_store);
         s.prefill = std::make_unique<TiledMtpPrompt>(s.request.prompt, model_, compiled_, s.parents->tiled, *s.session, *s.target,
             *s.runtime, qualified_, activated_, s.parents->resources, *s.dispatcher, s.held, s.request.sampler,
             s.request.constraint?HipMtpHostRowSelector{[state=s.request.constraint](auto row){return state->select(row);}}:HipMtpHostRowSelector{},
-            s.request.on_progress,false,true,true,batch_cert_context(s));
+            s.request.on_progress,false,true,true,batch_cert_context(s),
+            options_.prefix_cache_inflight && interleave_ && !service_mode_);
         static_cast<void>(m);
         ++stats_.admitted;
         s.order = stats_.admitted;
         s.prefill->set_request_order(s.order);
         s.active = true;
         s.prefilling = true;
+        if(options_.prefix_cache_inflight && interleave_ && !service_mode_ && !s.request.constraint &&
+            s.prefill->lookup_deferred()) wait_for_shared_prefix(s);
+        if(!s.waits_for && s.prefill->lookup_deferred()) s.prefill->retry_join_lookup();
         stats_.max_active = std::max<std::uint64_t>(stats_.max_active, active());
         if(worker_) s.prefill->execute_native=[this,&s](HipKnownPrefixWindow& owner,const std::function<void()>& job){
             if(service_mode_) {
@@ -1360,6 +1385,18 @@ public:
         using clock = std::chrono::steady_clock;
         Slot* prompt = nullptr;
         bool decoding = false;
+        for(auto& owner:slots_) {
+            auto& s=*owner;
+            if(!s.prefilling || !s.waits_for) continue;
+            if(cancel_requested(s)) {cancel_prefill(s,false);continue;}
+            const auto& producer=*s.waits_for;
+            if(s.join_wait.pending(producer.order,producer.active,producer.prefilling,
+                producer.prefill?producer.prefill->position():0)) continue;
+            s.waits_for=nullptr;s.join_wait={};
+            PrefixAsyncCapture::reap();
+            s.prefill->retry_join_lookup();
+            stats_.inflight_restored_tokens+=s.prefill->restored();
+        }
         // STRIX_BATCH_SHORT_FIRST_ROWS (default 2048; 0 = oldest prompt first): a prompt with at most that many rows left runs
         // its units before longer prompts (oldest such prompt first), so a short request waits for the current unit of a
         // long prompt, not for the rest of it. Exact: every prompt's units, rows and bits are its own whatever the order.
@@ -1369,7 +1406,7 @@ public:
             return sa!=sb?sa:a.order<b.order;
         };
         for (auto& s : slots_) {
-            if (s->prefilling && (!prompt || ahead(*s, *prompt))) prompt = s.get();
+            if (s->prefilling && !s->waits_for && (!prompt || ahead(*s, *prompt))) prompt = s.get();
             if (s->active && !s->prefilling) decoding = true;
         }
         if (!prompt) prompt_debt_ms_ = 0.0;
@@ -1498,6 +1535,7 @@ public:
             const bool was_active=s->active;
             s->active = false;
             s->prefilling = false;
+            s->waits_for=nullptr;s->join_wait={};
             s->prefill.reset();
             s->greedy.reset();
             s->pending = {};
@@ -1507,6 +1545,26 @@ public:
     }
 
 private:
+    void wait_for_shared_prefix(Slot& s) {
+        auto* cache=s.parents->tiled.cache;
+        if(!cache || !cache->joining_allowed()) return;
+        Slot* best=nullptr;std::uint64_t boundary=0;
+        for(auto& owner:slots_) {
+            auto& other=*owner;
+            auto* source=other.parents->tiled.cache;
+            if(&other==&s || !other.prefilling || other.waits_for || !other.prefill || !source ||
+                other.prefill->restored() || other.request.constraint) continue;
+            std::uint64_t common=0;
+            const auto count=std::min(s.request.prompt.size(),other.request.prompt.size());
+            while(common<count && s.request.prompt[common]==other.request.prompt[common]) ++common;
+            const auto p=cache->join_boundary(*source,common,other.prefill->position());
+            if(p>boundary) {best=&other;boundary=p;}
+        }
+        if(!best || boundary<=cache->cached_boundary(s.request.prompt)) return;
+        best->parents->tiled.cache->request_capture(boundary);
+        s.waits_for=best;s.join_wait={best->order,boundary};
+        ++stats_.inflight_waits;stats_.inflight_wait_tokens+=boundary;
+    }
     static void check_service(hipError_t e,const char* what) {
         if(e!=hipSuccess) throw std::runtime_error(std::string(what)+": "+hipGetErrorString(e));
     }
@@ -1590,7 +1648,7 @@ private:
         Slot* candidate=nullptr;
         for(auto& slot:slots_) {
             auto& s=*slot;
-            if(!s.prefilling || &s==paused_) continue;
+            if(!s.prefilling || s.waits_for || &s==paused_) continue;
             if(const auto reason=nested_decline(s)) {skip(&s,reason);continue;}
             if(!candidate || s.order<candidate->order) candidate=&s;
         }
@@ -1733,6 +1791,7 @@ private:
         std::vector<Member> members;
         std::uint32_t rows = 0;
         const auto join = [&](Slot& s) {
+            if(s.waits_for) return;
             const auto block = s.prefill->next_block();
             // A balanced partial block (STRIX_QPF2K_SCHED bit 4) runs alone.
             if (!block || block->rows > budget - rows || block->rows != block->backend->logical_rows()) return;
@@ -1742,7 +1801,7 @@ private:
         join(oldest);
         if (members.empty()) return false;
         std::vector<Slot*> others;
-        for (auto& s : slots_) if (s.get() != &oldest && s->prefilling) others.push_back(s.get());
+        for (auto& s : slots_) if (s.get() != &oldest && s->prefilling && !s->waits_for) others.push_back(s.get());
         std::sort(others.begin(), others.end(), [](const Slot* a, const Slot* b) { return a->order < b->order; });
         for (auto* s : others) join(*s);
         if (members.size() < 2U) return false;
@@ -1796,7 +1855,7 @@ private:
         std::vector<HipMtpWindowVerifier::PromptRowsRequest> requests{{oldest.prefill->window_verifier(), &oldest.prefill->session(),
             oldest.prefill->window_tokens(first)}};
         std::vector<Slot*> others;
-        for (auto& s : slots_) if (s.get() != &oldest && s->prefilling) others.push_back(s.get());
+        for (auto& s : slots_) if (s.get() != &oldest && s->prefilling && !s->waits_for) others.push_back(s.get());
         std::sort(others.begin(), others.end(), [](const Slot* a, const Slot* b) { return a->order < b->order; });
         for (auto* s : others) {
             const auto rows = s->prefill->window_unit();
@@ -1962,6 +2021,7 @@ private:
         finish(s);
     }
     void finish(Slot& s) {
+        s.waits_for=nullptr;s.join_wait={};
         if(s.request.constraint) s.result.constraint=s.request.constraint->verdict(s.result.finish);
         s.prefill.reset();s.prefilling=false;
         s.active = false;
@@ -2653,6 +2713,8 @@ inline void run_mtp_decode_bridge(const Options& options,const ModelContract& mo
                     <<",\"cohort_windows\":"<<st.cohort.cohort_windows<<",\"cohort_window_sessions\":"<<st.cohort.cohort_sessions
                     <<",\"cohort_window_rows\":"<<st.cohort.cohort_rows<<",\"cohort_solo_windows\":"<<st.cohort.solo_windows<<",\"cohort_chunks\":"<<st.cohort.cohort_chunks
                     <<",\"prompt_groups\":"<<st.prompt_groups<<",\"prompt_window_cohorts\":"<<st.prompt_window_cohorts
+                    <<",\"inflight_waits\":"<<st.inflight_waits<<",\"inflight_wait_tokens\":"<<st.inflight_wait_tokens
+                    <<",\"inflight_restored_tokens\":"<<st.inflight_restored_tokens
                     <<",\"prompt_window_members\":"<<st.prompt_window_members<<","<<batch_service_receipt(st)
                     <<",\"calibration_rows\":"<<calibration_rows<<",\"calibration_ms\":"<<calibration_ms;
                 if(prefix_batch_cert_execution_mode(options) && !options.baseline && parents->tiled.cache && parents->tiled.cache->has_store()) {

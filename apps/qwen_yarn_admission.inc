@@ -29,9 +29,12 @@ inline std::string yarn_environment_refusal(const Environment& environment, unsi
     for (const auto& [name, value] : environment) {
         if (storage_location_environment(name)) continue;
         // Operational policies add no rotary work. Prefix policy uses the
-        // shared parser; serving tile/unit controls cannot execute here because
-        // the route guard separately bounds explicit MTP and refuses caching and HTTP.
-        if (name == "STRIX_PREFIX_BATCH_CERT" || name == "STRIX_SERVE_PREFILL" || name == "STRIX_BATCH_PROMPT_SMALL") continue;
+        // shared parser (validates the value and applies CLI precedence);
+        // serving tile/unit controls cannot execute here because the route
+        // guard separately bounds explicit MTP and refuses caching and HTTP.
+        if (name == "STRIX_PREFIX_BATCH_CERT" || name == "STRIX_SERVE_PREFILL" || name == "STRIX_BATCH_PROMPT_SMALL" ||
+            name == "STRIX_PREFIX_CACHE_INFLIGHT" || name == "STRIX_PREFIX_CACHE_DISK" ||
+            name == "STRIX_PREFIX_CACHE_DURABLE") continue;
         const auto entry = std::find_if(qpf2k::defaults.begin(), qpf2k::defaults.end(),
             [&](const auto& item) { return name == item.name; });
         if (entry != qpf2k::defaults.end() &&
