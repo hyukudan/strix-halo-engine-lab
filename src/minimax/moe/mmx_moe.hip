@@ -1241,6 +1241,16 @@ int moe_wide() {
     return w;
 }
 bool wide_for(unsigned rows) { return route::wide_for(rows, moe_wide()); }
+// STRIX_MMX_MOE_TIGHT_GRID (default 1, 0 = off; read per call for in-process A/B): the v4 routed gate/up and down grids
+// get count + 1 <= 4 N + 1 slot rows instead of kMaxSlots + 1. map_slot() makes every CTA with y > count return at
+// once, so the rows dropped never did work; the kept CTAs have the same block indices, work and bits. At N = 1 this
+// removes 28 of 33 rows (about 10,000 empty CTAs per launch, two launches per MoE layer).
+unsigned moe_grid_slots(unsigned rows) {
+    const char* value = std::getenv("STRIX_MMX_MOE_TIGHT_GRID");
+    if (value != nullptr && std::string(value) == "0") return kMaxSlots + 1;
+    if (value != nullptr && std::string(value) != "1") throw std::invalid_argument("STRIX_MMX_MOE_TIGHT_GRID must be 0 or 1");
+    return std::min(kMaxSlots, kTopE * std::max(rows, 1U)) + 1;
+}
 // Default 1 via mm_defaults (STRIX_MM_BASELINE=1 or =0 switches it off). Read on every call for in-process A/B.
 bool moe_single() {
     const char* value = std::getenv("STRIX_MMX_MOE_SINGLE");
@@ -1255,7 +1265,8 @@ void launch_experts4_grid(const Args& input, hipStream_t stream, hipEvent_t* mar
     a.single_stream = Single;
     constexpr unsigned gu_groups = Wide ? kInter / 256U : kInter / (16U * W);
     constexpr unsigned dn_groups = Wide ? kHidden / 256U : kHidden / (16U * W);
-    const dim3 gu_grid(gu_groups * kGateSplits * (a.interleave_gu ? 2U : 1U), kMaxSlots + 1,
+    const unsigned slots = moe_grid_slots(a.rows);
+    const dim3 gu_grid(gu_groups * kGateSplits * (a.interleave_gu ? 2U : 1U), slots,
                        a.interleave_gu ? 1U : 2U);
     hipLaunchKernelGGL((gate_up4_kernel<MaxR, Depth, W, DepthBig, SkipShared, Wide, Single>),
                        gu_grid, dim3(32 * W), 0, stream, a);
@@ -1264,7 +1275,7 @@ void launch_experts4_grid(const Args& input, hipStream_t stream, hipEvent_t* mar
     if (route::moe_down_split(a.down_split, a.rows, Wide, W, Depth)) {
         // Same producers and scratch addresses, without any U-wide arrival counters or finish epilogue.
         hipLaunchKernelGGL((down4_kernel<MaxR, Depth, W, DepthBig, Wide, Single, true>),
-                           dim3(dn_groups * kDownSplits, kMaxSlots + 1), dim3(32 * W), 0, stream, a);
+                           dim3(dn_groups * kDownSplits, slots), dim3(32 * W), 0, stream, a);
         launched("down4 partials");
         if (a.down_done != nullptr) (void)hipEventRecord(a.down_done, stream);
         // Stream ordering makes all partial stores visible; no spin, fences or producer counters needed.
@@ -1272,7 +1283,7 @@ void launch_experts4_grid(const Args& input, hipStream_t stream, hipEvent_t* mar
         launched("down4 combine");
     } else {
         hipLaunchKernelGGL((down4_kernel<MaxR, Depth, W, DepthBig, Wide, Single>),
-                           dim3(dn_groups * kDownSplits, kMaxSlots + 1), dim3(32 * W), 0, stream, a);
+                           dim3(dn_groups * kDownSplits, slots), dim3(32 * W), 0, stream, a);
         launched("down4");
         if (a.down_done != nullptr) (void)hipEventRecord(a.down_done, stream);
     }

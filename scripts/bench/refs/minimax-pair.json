@@ -19,6 +19,8 @@
           "STRIX_MM_XB_PUBLISH": "1",
           "STRIX_MM_XB_POSTILP": "2",
           "STRIX_MM_XB_WARM": "8",
+          "STRIX_MM_XB_WARM_O": "8",
+          "STRIX_MMX_MOE_TIGHT_GRID": "1",
           "STRIX_MM_DSPARK_ATTN": "2",
           "STRIX_MM_DRAFT_LIN": "opt",
           "STRIX_MMX_PREFILL_CORE": "v4",

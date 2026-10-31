@@ -477,6 +477,9 @@ struct Engine::Impl {
     unsigned xb_warm_mb = 8;      // STRIX_MM_XB_WARM=MB (0 = off; default 8, exchange boundary set): per exchange, warm up to MB of the next phase's weights
     hipStream_t xb_warm_stream = nullptr;  // side stream: waits for each message's TX flag, then the warm kernel
     unsigned* xb_warm_sink = nullptr;
+    unsigned xb_warm_o_mb = 8;    // STRIX_MM_XB_WARM_O=MB (0 = off; default 8): during each layer's MSA, warm up to MB of its o_proj on the warm stream
+    std::vector<hipEvent_t> xb_attn_ev;  // per layer: q/k/v and index projections done (the warm's gate), re-recorded each step
+    std::uint64_t xb_warm_o_count = 0;
     bool xb_prep = false;      // STRIX_MM_XB_PREP=1: the FFN post_exchange writes the next layer's q/k/v input transform (no prepare launch)
     bool xb_prepped = false;   // the next q/k/v call's inputs were transformed by the post_exchange just enqueued
     unsigned xb_layers = 0;    // layers of the current layers_forward call (the fold needs a next layer)
@@ -559,7 +562,7 @@ struct Engine::Impl {
         moe::opt::cleanup_prefill_table_ring();
         moe::opt::cleanup_prefill_dense();
         for (auto* ptr : {nest_bank.h, nest_bank.hn, nest_bank.taps}) if (ptr) (void)hipFree(ptr);
-        for (auto* events : {&idx_fork, &idx_join, &pf_idx_fork, &pf_idx_join, &pf_idx_fork_device, &pf_idx_join_device, &tev})
+        for (auto* events : {&idx_fork, &idx_join, &xb_attn_ev, &pf_idx_fork, &pf_idx_join, &pf_idx_fork_device, &pf_idx_join_device, &tev})
             for (hipEvent_t ev : *events)
                 if (ev != nullptr) (void)hipEventDestroy(ev);
         if (routes_ready != nullptr) (void)hipEventDestroy(routes_ready);
@@ -628,6 +631,7 @@ struct Engine::Impl {
             xb_pub = false;
         }
         if (const char* wm = std::getenv("STRIX_MM_XB_WARM")) xb_warm_mb = static_cast<unsigned>(std::strtoul(wm, nullptr, 10));
+        if (const char* wo = std::getenv("STRIX_MM_XB_WARM_O")) xb_warm_o_mb = static_cast<unsigned>(std::strtoul(wo, nullptr, 10));
         index_decode = env_flag("STRIX_MM_INDEX_DECODE", true);  // ON by default (measurement: same tokens, decode 129.4 -> 55.4 ms/token); =0
         const char* apf = std::getenv("STRIX_MM_ATTN_PREFILL");
         attn_prefill_fused = apf == nullptr || std::string(apf) != "off";  // ON by default (measurement: bitwise, TTFT -5.5 %); =off
@@ -849,6 +853,8 @@ struct Engine::Impl {
             hip_ok(hipEventCreateWithFlags(&idx_fork[l], hipEventDisableTiming), "index fork event");
             hip_ok(hipEventCreateWithFlags(&idx_join[l], hipEventDisableTiming), "index join event");
         }
+        xb_attn_ev.resize(kLayers);  // STRIX_MM_XB_WARM_O: same lifetime rule as the index fork/join pairs
+        for (unsigned l = 0; l < kLayers; ++l) hip_ok(hipEventCreateWithFlags(&xb_attn_ev[l], hipEventDisableTiming), "warm o event");
         // Distinct events for every pending chunk/layer. A later group can reuse
         // these slots: each call joins before any shared iq/ik scratch is reused.
         pf_idx_fork.resize(std::size_t{pf_group} * kLayers);
@@ -1098,6 +1104,24 @@ struct Engine::Impl {
         hipLaunchKernelGGL(xb_warm_kernel, dim3(160), dim3(256), 0, xb_warm_stream, w);
         hip_ok(hipGetLastError(), "warm kernel");
         ++xb_count[4];
+    }
+
+    // STRIX_MM_XB_WARM_O: the MSA kernels of a decode layer leave memory nearly idle (latency-bound, ~2-4 MB of cache
+    // reads); the warm stream reads the first MB of the layer's o_proj trellis meanwhile, gated on the end of the q/k/v
+    // and index projections (so it does not compete with them). Cache state only, as xb_warm.
+    void xb_warm_o(unsigned layer) {
+        const mmoe::Exl3& o = layers[layer].ro;
+        const std::size_t bytes = std::min(std::size_t{o.input} * o.output * o.bits / 8, std::size_t{xb_warm_o_mb} << 20) & ~std::size_t{15};
+        if (o.trellis == nullptr || bytes == 0) return;
+        WarmRanges w;
+        w.sink = xb_warm_sink;
+        w.p[0] = reinterpret_cast<const uint4*>(o.trellis);
+        w.n16[0] = bytes / 16;
+        hip_ok(hipEventRecord(xb_attn_ev[layer], nullptr), "warm o record");
+        hip_ok(hipStreamWaitEvent(xb_warm_stream, xb_attn_ev[layer], 0), "warm o gate");
+        hipLaunchKernelGGL(xb_warm_kernel, dim3(160), dim3(256), 0, xb_warm_stream, w);
+        hip_ok(hipGetLastError(), "warm o kernel");
+        ++xb_warm_o_count;
     }
 
     // Every post-exchange launch of the engine (STRIX_MM_XB_POSTILP selects the loads-first form, same bits).
@@ -1448,6 +1472,7 @@ struct Engine::Impl {
             if (tl) tl->mark(conc ? "index-join" : "index-projection", false);
             lap(prof.attn_proj);
             tmark(tmark_at(L, 0));
+            if (lin_opt && xb_warm_o_mb != 0 && use_xfer() && !pf_active) xb_warm_o(L);  // STRIX_MM_XB_WARM_O
             const bool traced_batch = rows.empty() && attn_prefill_fused &&
                 (pf_msa_batch || (pf_idx_tile && n > 8) || (pf_msa_rework != 0 && n > 8));
             if (tl && !traced_batch) tl->mark("msa", true);
@@ -2875,6 +2900,9 @@ std::uint64_t Engine::xb_publish_count() const { return impl_->xb_count[3]; }
 void Engine::set_xb_warm(unsigned mb) { impl_->xb_warm_mb = mb; }
 unsigned Engine::xb_warm() const { return impl_->xb_warm_mb; }
 std::uint64_t Engine::xb_warm_count() const { return impl_->xb_count[4]; }
+void Engine::set_xb_warm_o(unsigned mb) { impl_->xb_warm_o_mb = mb; }
+unsigned Engine::xb_warm_o() const { return impl_->xb_warm_o_mb; }
+std::uint64_t Engine::xb_warm_o_count() const { return impl_->xb_warm_o_count; }
 void Engine::set_xb_postilp(bool on) { impl_->xb_postilp = on; }
 bool Engine::xb_postilp() const { return impl_->xb_postilp; }
 std::uint64_t Engine::xb_postilp_count() const { return impl_->xb_count[5]; }

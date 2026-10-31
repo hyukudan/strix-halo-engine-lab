@@ -252,6 +252,12 @@ public:
     void set_xb_warm(unsigned mb);
     [[nodiscard]] unsigned xb_warm() const;
     [[nodiscard]] std::uint64_t xb_warm_count() const;
+    // STRIX_MM_XB_WARM_O=MB (0 = off): per decode layer, the warm stream reads up to MB of the layer's o_proj into the
+    // memory-side cache while its MSA kernels run (gated on the end of the q/k/v and index projections; cache state
+    // only, same bits); xb_warm_o_count = warms.
+    void set_xb_warm_o(unsigned mb);
+    [[nodiscard]] unsigned xb_warm_o() const;
+    [[nodiscard]] std::uint64_t xb_warm_o_count() const;
     // STRIX_MM_XB_POSTILP=1: every post-exchange kernel issues all its loads before the first store (same bits);
     // xb_postilp_count = post-exchange launches that took it.
     void set_xb_postilp(bool on);

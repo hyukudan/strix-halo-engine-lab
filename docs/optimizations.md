@@ -1877,6 +1877,38 @@ Warm 8 MiB of boundary data.
 - **Measured gain:** Exchange boundary measurement: exact, 1K 48.56 -> 44.40 ms/token
 - **Implementation / evidence:** [38-item resolver](../src/minimax/engine/mm_defaults.cpp), [rank gates](../apps/minimax_rank_main.cpp)
 
+<a id="mm-xb-warm-o"></a>
+
+### o_proj warm during decode attention
+
+**Engine:** `minimax`. **Control:** `STRIX_MM_XB_WARM_O`. **Default:** 8.
+
+The decode attention kernels of a layer leave memory nearly idle; a side stream reads the first 8 MiB of the layer's
+o_proj weights into the memory-side cache meanwhile (gated on the end of the q/k/v and index projections).
+
+- **Preconditions:** Decode exchange module path with the optimized linears (two-rank decode steps).
+- **Automatic selection:** Resolver supplies 8 only when unset; explicit values win; 0 disables.
+- **Exactness evidence:** Cache state only; decode logits bitwise on both ranks vs off at N1/N4/N8 and a 4-row verify window; in-process matched replay identical.
+- **Off switch:** STRIX_MM_XB_WARM_O=0
+- **Measured gain:** C1 8K two-node decode 44.64-44.66 -> 44.01-44.07 ms/token (-1.3 %); 14 MiB is slower.
+- **Implementation / evidence:** [resolver](../src/minimax/engine/mm_defaults.cpp), [rank gates](../apps/minimax_rank_main.cpp) (`--ab xbwarmo`, `--xb-check` cfg `o`)
+
+<a id="mm-moe-tight-grid"></a>
+
+### Tight decode MoE grids
+
+**Engine:** `minimax`. **Control:** `STRIX_MMX_MOE_TIGHT_GRID`. **Default:** 1.
+
+The routed gate/up and down launches size their slot dimension to min(32, 4N) + 1 rows instead of 33; the dropped
+rows returned before any work, so at N = 1 about 10,000 empty CTAs per launch are no longer dispatched.
+
+- **Preconditions:** v4 decode MoE launches (N = 1..8).
+- **Automatic selection:** Resolver supplies 1 only when unset; read per call.
+- **Exactness evidence:** Decode logits bitwise on both ranks vs off at N1/N4/N8 and a 4-row verify window; in-process matched replay identical.
+- **Off switch:** STRIX_MMX_MOE_TIGHT_GRID=0
+- **Measured gain:** C1 8K two-node decode 45.12-45.18 -> 44.60-44.68 ms/token (-1.2 %).
+- **Implementation / evidence:** [MoE launches](../src/minimax/moe/mmx_moe.hip), [rank gates](../apps/minimax_rank_main.cpp) (`--ab moegrid`, `--xb-check` cfg `g`)
+
 <a id="mm-serve-dspark"></a>
 
 ### DSpark automatic admission
