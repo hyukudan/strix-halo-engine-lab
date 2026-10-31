@@ -1050,20 +1050,17 @@ void lean_equal(int mode, unsigned rows, unsigned heads, unsigned nwin, std::uin
         g::set_attention_lds_swizzle(swz);
         g::set_attention_tile_f16(f16);
         std::vector<std::uint8_t> ref;
-        for (const int form : {0, 1, 2, 3, 4, 5, 6, 7, 8, 18}) {   // 18: lean 8 + STRIX_DS41_ATTN_SPLIT_COMBINE
-            const int lean = form % 10;
+        for (const int lean : {0, 1, 2, 3}) {
             g::set_attention_lean(lean);
-            g::set_attention_split_combine(form >= 10 ? 1 : 0);
             pw.clear();
             pw.run();
             if (lean == 0) ref = pw.bytes();
-            else expect(pw.bytes() == ref, "lean form " + std::to_string(form) + " == previous form, mode " + std::to_string(mode) + " rows " + std::to_string(rows) + " heads " +
+            else expect(pw.bytes() == ref, "lean " + std::to_string(lean) + " == previous form, mode " + std::to_string(mode) + " rows " + std::to_string(rows) + " heads " +
                         std::to_string(heads) + " windows " + std::to_string(nwin) + " p0 " + std::to_string(p0) + " ratio " + std::to_string(ratio) +
                         " a8 " + std::to_string(a8) + " swizzle " + std::to_string(swz) + " f16 " + std::to_string(f16));
         }
     }
     g::set_attention_lean(-1);
-    g::set_attention_split_combine(-1);
     g::set_attention_tile_f16(-1);
     g::set_attention_lds_swizzle(-1);
     std::printf("lean == previous form: mode %d, %u windows x %u rows from position %llu, %u heads, ratio %u%s\n", mode, nwin, rows,
@@ -1076,14 +1073,13 @@ void prefill_bench(unsigned rows, unsigned heads, unsigned nwin, std::uint64_t p
     PrefillWindows pw(1, rows, heads, nwin, p0, ratio, true);
     hipEvent_t e0, e1;
     check(hipEventCreate(&e0)); check(hipEventCreate(&e1));
-    std::vector<int> forms;   // lean level, + 10 with a following 'c': STRIX_DS41_ATTN_SPLIT_COMBINE on
-    { const char* e = std::getenv("STRIX_DS41_PF_BENCH_FORMS"); for (const char* c = e ? e : "0123"; *c; ++c) if (*c >= '0' && *c <= '9') forms.push_back(*c - '0'); else if (*c == 'c' && !forms.empty()) forms.back() += 10; }
+    std::vector<int> forms;
+    { const char* e = std::getenv("STRIX_DS41_PF_BENCH_FORMS"); for (const char* c = e ? e : "0123"; *c; ++c) if (*c >= '0' && *c <= '9') forms.push_back(*c - '0'); }
     const unsigned nf = static_cast<unsigned>(forms.size());
     std::vector<std::vector<float>> t(nf);
     for (unsigned k = 0; k < nf * reps + nf; ++k) {
-        const int lean = forms[k % nf] % 10;
+        const int lean = forms[k % nf];
         g::set_attention_lean(lean);
-        g::set_attention_split_combine(forms[k % nf] >= 10 ? 1 : 0);
         pw.run();   // warm
         check(hipEventRecord(e0));
         for (unsigned w = 0; w < pw.nwin; ++w) g::enqueue_attention(pw.view(w), pw.st[w % PrefillWindows::kLanes]);
@@ -1094,12 +1090,11 @@ void prefill_bench(unsigned rows, unsigned heads, unsigned nwin, std::uint64_t p
         if (k >= nf) t[k % nf].push_back(ms * 1e3F * 8.0F / static_cast<float>(nwin * rows));   // us per 8 rows
     }
     g::set_attention_lean(-1);
-    g::set_attention_split_combine(-1);
     for (auto& v : t) std::sort(v.begin(), v.end());
     std::printf("  prefill bench %u windows x %u rows, %u heads, positions %llu.., ratio %u: us per 8 rows (median, min)", nwin, rows, heads,
                 static_cast<unsigned long long>(p0), ratio);
     for (unsigned f = 0; f < nf; ++f)
-        std::printf("%s lean %d%s %.1f (%+.1f %%) [%.1f]", f ? "," : "", forms[f] % 10, forms[f] >= 10 ? "c" : "", t[f][reps / 2], 100.0 * (t[f][reps / 2] / t[0][reps / 2] - 1.0), t[f][0]);
+        std::printf("%s lean %d %.1f (%+.1f %%) [%.1f]", f ? "," : "", forms[f], t[f][reps / 2], 100.0 * (t[f][reps / 2] / t[0][reps / 2] - 1.0), t[f][0]);
     std::printf("\n");
     if (std::getenv("STRIX_DS41_PF_BENCH_EXTRA") == nullptr) { check(hipEventDestroy(e0)); check(hipEventDestroy(e1)); return; }
     // lean 2 with AttentionView::max_visible (the grid's live chunks) at the default heads-per-wave rule and at Hpw 4 always
