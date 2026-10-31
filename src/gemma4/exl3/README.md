@@ -65,6 +65,15 @@ reuse the same transform and core arithmetic, so bytes are unchanged.
 equality at the family shapes, then times the routes with DRAM-cold weights.
 No arm becomes an automatic default through this import path.
 
+Prompt chunks of more than eight rows use `device_linear_rows`: the same
+input transform, a many-row core, and the same output transform. A workgroup
+decodes each lane's coefficients once and applies them to 16 (v1) or 32
+(v2/v3) rows whose transformed FP16 inputs are staged in LDS; every output
+keeps its identity's order (v1 lane chunks and butterfly, v2/v3 split ranges,
+quad reduction and increasing split sum), so the bytes equal `device_linear`
+over eight-row slices. `strix-gemma4-exl3-rows-tests` (ctest per identity)
+compares them by memcmp; `STRIX_G4_PREFILL_EXACT_MANYROW=0` keeps the slices.
+
 The separate `strix-gemma4-exl3-check` CLI runs full-model gates, bounded
 speed trials (`--mode speed`) or teacher-forced prefill (`--mode quality`).
 It accepts `--model ARM_DIR --bf16 BF16_DIR --rope TABLE_DIR`, or a GGUF

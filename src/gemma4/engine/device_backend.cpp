@@ -2,6 +2,7 @@
 #include "gemma4/kernels/device.hpp"
 #include "gemma4/dflash/device.hpp"
 #include "gemma4/prefill/device.hpp"
+#include "gemma4/exl3/device.hpp"
 
 #include <cstdlib>
 #include <stdexcept>
@@ -12,16 +13,6 @@ namespace {
 bool enabled(const char* name) {
     const auto* value = std::getenv(name);
     return !value || std::string(value) != "0";
-}
-// The many-row prefill covers the formats of the exact linears; EXL3 packs keep
-// the eight-row passes.
-bool many_row_formats(const HostWeights& w) {
-    const auto plain = [](LinearView v) { return !v.data || v.format != WeightFormat::exl3_mul1; };
-    if (!plain(w.embedding) || !plain(w.head) || !plain(w.ple_model)) return false;
-    for (const auto& y : w.layer)
-        for (const auto v : {y.q, y.k, y.v, y.o, y.gate, y.up, y.down, y.ple_gate, y.ple_projection})
-            if (!plain(v)) return false;
-    return true;
 }
 class DeviceState final : public StreamState {
 public:
@@ -55,8 +46,9 @@ public:
         switches.set("STRIX_G4_HOST_PARALLEL","not used by device target or device drafter");
         metadata_.set("off_switches",switches);
         // Prompt prefill: exact many-row chunks (same bytes as the eight-row
-        // passes); STRIX_G4_PREFILL_EXACT_MANYROW=0 or an EXL3 pack keeps the passes.
-        const bool many_row = enabled("STRIX_G4_PREFILL_EXACT_MANYROW") && many_row_formats(bind_host_weights(model));
+        // passes; EXL3 packs keep their identity's core order);
+        // STRIX_G4_PREFILL_EXACT_MANYROW=0 keeps the passes.
+        const bool many_row = enabled("STRIX_G4_PREFILL_EXACT_MANYROW");
         metadata_.set("prefill_route",many_row ? "many-row" : "rows8");
         // Read-only inspection must never initialize HIP or upload weights.
         if (!inspect) {
@@ -81,14 +73,18 @@ public:
     bool head_logits(std::span<const float> hidden, std::vector<float>& logits) override {
         if (!target_ || hidden.size() != config_.hidden) return false;
         const auto head = target_->resident_head();
-        if (head.format == WeightFormat::exl3_mul1) return false;
         // The decode target's head on one row: the same linear and softcap bytes.
         if (head_input_.size() < hidden.size_bytes()) head_input_.resize(hidden.size_bytes());
         if (head_output_.size() < std::size_t(config_.vocab) * sizeof(float)) head_output_.resize(std::size_t(config_.vocab) * sizeof(float));
         if (!head_failure_.size()) head_failure_.resize(sizeof(std::uint32_t));
         head_input_.upload(hidden.data(),hidden.size_bytes());
         head_failure_.zero();
-        gpu::linear(head,head_input_.as<float>(),1,head_output_.as<float>(),true,nullptr,head_failure_.as<std::uint32_t>());
+        if (head.format == WeightFormat::exl3_mul1) {
+            if (head_scratch_.size() < exl3::device_scratch_bytes) head_scratch_.resize(exl3::device_scratch_bytes);
+            exl3::device_linear(head,head_input_.as<float>(),1,head_output_.as<float>(),head_scratch_.data(),
+                head_failure_.as<std::uint32_t>());
+        } else
+            gpu::linear(head,head_input_.as<float>(),1,head_output_.as<float>(),true,nullptr,head_failure_.as<std::uint32_t>());
         gpu::cap_logits(head_output_.as<float>(),config_.vocab);
         gpu::synchronize();
         std::uint32_t failure = 0;
@@ -132,7 +128,7 @@ private:
     strix::serve::Json metadata_;
     std::unique_ptr<gpu::DeviceTarget> target_;
     std::unique_ptr<prefill::DevicePrefill> prefill_;
-    gpu::Buffer head_input_, head_output_, head_failure_;
+    gpu::Buffer head_input_, head_output_, head_failure_, head_scratch_;
 };
 struct DraftAssets {
     const dflash::Weights& weights;
