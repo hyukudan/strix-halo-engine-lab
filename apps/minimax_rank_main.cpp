@@ -491,14 +491,33 @@ bool dspark_deskew() {
 // The four STRIX_MM_MARKOV* items live in the mm_defaults table: print_or_apply() exports their resolved values (explicit
 // env > STRIX_MM_BASELINE > default) before any reader runs, so the fallbacks below only matter without apply().
 bool mm_baseline() { return strix::minimax::defaults::baseline([](const char* n) { return std::getenv(n); }); }
-bool markov_cand_session() {
-    static int n = 0;
+std::string markov_mode() {
     const char* e = std::getenv("STRIX_MM_MARKOV");
     const std::string m = e != nullptr && *e != '\0' ? e : (mm_baseline() ? "full" : "cand");
     if (m != "full" && m != "cand" && m != "ab") throw std::invalid_argument("STRIX_MM_MARKOV must be full, cand or ab");
+    return m;
+}
+bool markov_cand_session() {
+    static int n = 0;
+    const std::string m = markov_mode();
     return m == "cand" || (m == "ab" && (n++ % 2) == 1);
 }
 std::unique_ptr<ds::CandMarkov> g_cand;
+// The candidate set (H by W2 row norms over the whole vocabulary, host sort) and the device buffers, built once per process.
+// Called right after the drafter loads (prewarm: no spec session pays it) and, as a fallback, by the first cand session.
+// Local to the rank (no peer exchange), so the call site does not change the ranks' lockstep.
+void ensure_cand(mm::Engine& eng, ds::DeviceDrafter& dd) {
+    if (g_cand) return;
+    const auto t0 = Clock::now();
+    const auto [v0, vn] = eng.vocab_range();
+    const auto& w = dd.device_weights();
+    const unsigned C = markov_cand_env("STRIX_MM_MARKOV_C", 4096), nh = markov_cand_env("STRIX_MM_MARKOV_H", 8192);
+    g_cand = std::make_unique<ds::CandMarkov>(w.markov_w1, w.markov_w2, ds::vocab, v0, vn, C, nh);
+    std::printf("rank %u: markov cand ready (C %u, |H| %u, exchange %s, topc %s, %u candidates, payload %.1f KB, setup %.1f ms)\n",
+                eng.rank(), C, nh, markov_xchg_device() ? "device" : "host",
+                g_cand->topc() == ds::CandMarkov::TopC::v2 ? "v2" : "v1", g_cand->candidates(),
+                static_cast<double>(g_cand->payload_bytes()) / 1024.0, secs(t0, Clock::now()) * 1e3);
+}
 
 ds::Prior g_auto_prior = ds::Prior::structural_v1;
 std::string g_auto_model;
@@ -585,14 +604,7 @@ std::vector<std::uint32_t> spec_session(mm::Engine& eng, ds::DeviceDrafter& dd, 
     SpecStats st;
     const bool use_cand = markov_cand_session();
     const bool markov_check = std::getenv("STRIX_MM_MARKOV_CHECK") == nullptr || std::getenv("STRIX_MM_MARKOV_CHECK")[0] != '0';
-    if (use_cand && !g_cand) {
-        const auto& w = dd.device_weights();
-        const unsigned C = markov_cand_env("STRIX_MM_MARKOV_C", 4096), nh = markov_cand_env("STRIX_MM_MARKOV_H", 8192);
-        g_cand = std::make_unique<ds::CandMarkov>(w.markov_w1, w.markov_w2, ds::vocab, v0, vn, C, nh);
-        std::printf("rank %u: markov cand ready (C %u, |H| %u, exchange %s, topc %s, %u candidates, payload %.1f KB)\n", eng.rank(), C, nh,
-                    markov_xchg_device() ? "device" : "host", g_cand->topc() == ds::CandMarkov::TopC::v2 ? "v2" : "v1",
-                    g_cand->candidates(), static_cast<double>(g_cand->payload_bytes()) / 1024.0);
-    }
+    if (use_cand) ensure_cand(eng, dd);
     const ds::CandMarkov::Stats cs0 = g_cand ? g_cand->stats() : ds::CandMarkov::Stats{};
     std::vector<double> cost(ds::block + 1, 0.0);  // cost[k] = draft (k > 0) + verify of k + 1 rows, measured online
     // auto: window by ds::SurvivalController on measured costs (verify EMA per row count; unmeasured row counts scaled from
@@ -1875,6 +1887,7 @@ int main(int argc, char** argv) {
                 if (!dspark_exl3.empty()) eng.attach_draft_exl3(dspark_exl3, *drafter);
                 for (const std::string& h : dspark_heads) eng.attach_draft_head(h);
                 drafter->set_profile(std::getenv("STRIX_MM_DSPARK_PROFILE") != nullptr);
+                if (markov_mode() != "full") ensure_cand(eng, *drafter);  // prewarm (cand or ab)
                 std::printf("rank %u: dspark %s loaded in %.1f s (%.2f GB device, ring %.0f MB)\n", opt.rank, dspark_dir.c_str(),
                             secs(t0, Clock::now()), static_cast<double>(drafter->weight_bytes()) / 1e9,
                             static_cast<double>(drafter->ring_bytes()) / 1e6);
