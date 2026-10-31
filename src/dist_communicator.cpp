@@ -327,6 +327,7 @@ public:
         }
     }
     ~Usb4HostTransport() override {
+        if (traffic_) std::fprintf(stderr, "%s\n", traffic().c_str());
         aborted_.store(true, std::memory_order_release);
         writers_.clear();
         readers_.clear();
@@ -407,6 +408,7 @@ private:
         std::size_t done = 0;
         auto deadline = std::chrono::steady_clock::now() + timeout_;
         auto& st = stats_[k];
+        const auto begin_ns = traffic_ ? now_ns() : 0U;
         st.want_w.store(bytes.size(), std::memory_order_relaxed);
         st.done_w.store(0, std::memory_order_relaxed);
         while (done < bytes.size()) {
@@ -431,6 +433,12 @@ private:
             }
             fail_stream(k, n == 0 ? std::string("write returned 0") : "write: " + errno_text(errno));
         }
+        if (traffic_) {
+            const auto end_ns = now_ns();
+            st.bytes_w.fetch_add(bytes.size(), std::memory_order_relaxed);
+            st.busy_w.fetch_add(end_ns - begin_ns, std::memory_order_relaxed);
+            st.fin_w.store(end_ns, std::memory_order_relaxed);
+        }
         latency::mark("stream_write_end", k);
     }
     void read_part(std::size_t k, std::span<std::byte> bytes) {
@@ -438,6 +446,7 @@ private:
         std::size_t done = 0;
         auto deadline = std::chrono::steady_clock::now() + timeout_;
         auto& st = stats_[k];
+        const auto begin_ns = traffic_ ? now_ns() : 0U;
         st.want_r.store(bytes.size(), std::memory_order_relaxed);
         st.done_r.store(0, std::memory_order_relaxed);
         while (done < bytes.size()) {
@@ -462,6 +471,12 @@ private:
                 continue;
             }
             fail_stream(k, "read: " + errno_text(errno));
+        }
+        if (traffic_) {
+            const auto end_ns = now_ns();
+            st.bytes_r.fetch_add(bytes.size(), std::memory_order_relaxed);
+            st.busy_r.fetch_add(end_ns - begin_ns, std::memory_order_relaxed);
+            st.fin_r.store(end_ns, std::memory_order_relaxed);
         }
         latency::mark("stream_read_end", k);
     }
@@ -576,6 +591,10 @@ private:
         const std::size_t size = out ? out->size() : in->size();
         const std::size_t used = streams_for(size);
         if (size <= eager_) {
+            if (traffic_) {
+                ++eager_messages_;
+                eager_bytes_ += size;
+            }
             try {
                 eager(out, in, used, on_wire, context);
                 return;
@@ -618,6 +637,26 @@ private:
             fail(poison_ + " (all streams closed; the peer rank sees them close)");
         }
         if (first) std::rethrow_exception(first);
+        if (traffic_ && used > 1U) {  // completion skew of this message's parts (the bottleneck stream finished last)
+            const auto skew = [&](bool write) {
+                std::uint64_t lo = UINT64_MAX, hi = 0;
+                std::size_t last = 0;
+                for (std::size_t k = 0; k < used; ++k) {
+                    const auto t = (write ? stats_[k].fin_w : stats_[k].fin_r).load(std::memory_order_relaxed);
+                    lo = std::min(lo, t);
+                    if (t >= hi) {
+                        hi = t;
+                        last = k;
+                    }
+                }
+                (write ? skew_w_ns_ : skew_r_ns_) += hi - lo;
+                ++(write ? stats_[last].last_w_count : stats_[last].last_r_count);
+            };
+            ++striped_messages_;
+            striped_bytes_ += size;
+            if (out) skew(true);
+            if (in) skew(false);
+        }
     }
     template <class F> void guarded(F&& f) {
         try { f(); } catch (const Aborted&) {
@@ -638,7 +677,29 @@ private:
     struct StreamStats {
         std::atomic<std::uint64_t> done_w{0}, want_w{0}, done_r{0}, want_r{0}, last_w{0}, last_r{0};
         std::atomic<int> revents{0};
+        // STRIX_DIST_USB4_TRAFFIC=1: striped parts only (eager messages are counted per transport)
+        std::atomic<std::uint64_t> bytes_w{0}, bytes_r{0}, busy_w{0}, busy_r{0}, fin_w{0}, fin_r{0};
+        std::uint64_t last_w_count = 0, last_r_count = 0;  // calling thread only
     };
+    // STRIX_DIST_USB4_TRAFFIC=1: per-stream bytes, busy time and completion skew, printed when the transport closes
+    const bool traffic_ = [] { const char* v = std::getenv("STRIX_DIST_USB4_TRAFFIC"); return v && v[0] == '1'; }();
+    std::uint64_t eager_messages_ = 0, eager_bytes_ = 0, striped_messages_ = 0, striped_bytes_ = 0, skew_w_ns_ = 0, skew_r_ns_ = 0;
+    [[nodiscard]] std::string traffic() const {
+        std::ostringstream out;
+        const auto d = [](std::uint64_t v) { return static_cast<double>(v); };
+        const auto rate = [&](std::uint64_t b, std::uint64_t ns) { return ns ? d(b) * 8.0 / d(ns) : 0.0; };  // Gb/s while busy
+        out << "usb4 traffic: eager " << eager_messages_ << " msgs " << d(eager_bytes_) / 1e6 << " MB; striped " << striped_messages_
+            << " msgs " << d(striped_bytes_) / 1e6 << " MB, completion skew write " << d(skew_w_ns_) / 1e6 << " ms read " << d(skew_r_ns_) / 1e6
+            << " ms";
+        for (std::size_t k = 0; k < names_.size(); ++k) {
+            const auto& st = stats_[k];
+            const std::uint64_t bw = st.bytes_w.load(), tw = st.busy_w.load(), br = st.bytes_r.load(), tr = st.busy_r.load();
+            out << "\n  " << names_[k] << " w " << d(bw) / 1e6 << " MB busy " << d(tw) / 1e6 << " ms (" << rate(bw, tw) << " Gb/s) last "
+                << st.last_w_count << "x; r " << d(br) / 1e6 << " MB busy " << d(tr) / 1e6 << " ms (" << rate(br, tr) << " Gb/s) last "
+                << st.last_r_count << "x";
+        }
+        return out.str();
+    }
     std::array<StreamStats, 8> stats_{};
     static std::uint64_t now_ns() {
         return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
