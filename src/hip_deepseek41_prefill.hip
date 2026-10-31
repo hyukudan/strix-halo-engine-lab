@@ -2030,40 +2030,55 @@ PrefillResult DevicePrefill::run_from(std::span<const std::uint32_t> tokens, std
                     fe.ring_rows = own_ring;
                     fe.comp_pos = m.lpos64.p + lx0;
                     fe.comp_rows = own_comp;
-                    fe.packed = m.pack_send.p;
+                    // staged (m.staged_gather): packed straight into the pinned send buffer, unpacked from the receive buffer,
+                    // so the message crosses while the indexer projections run instead of after them
+                    const std::size_t entry_bytes = std::size_t{std::max(own_words, peer_words)} * 4U;
+                    auto* staged_send = m.staged_gather && entry_bytes > 0U
+                                            ? static_cast<std::uint32_t*>(m.options.communicator->send_staging(entry_bytes)) : nullptr;
+                    std::uint32_t* const send_words = staged_send ? staged_send : m.pack_send.p;
+                    fe.packed = send_words;
                     if (own_ring + own_comp) {
                         final_entries_kernel<true><<<own_ring + own_comp, 128, 0, st>>>(fe);
                         check(hipGetLastError(), "final entries pack");
                     }
                     const std::size_t carry_at = std::size_t{own_words} - carry_words;
                     if (carry_words && last_local) {  // after this rank's last compress: the run's pending row (or none)
-                        check(hipMemcpyAsync(m.pack_send.p + carry_at, L.carry[L.carry_cur].p, std::size_t{2U * D} * 4U, hipMemcpyDeviceToDevice, st),
+                        check(hipMemcpyAsync(send_words + carry_at, L.carry[L.carry_cur].p, std::size_t{2U * D} * 4U, hipMemcpyDefault, st),
                               "carry");
-                        check(hipMemcpyAsync(m.pack_send.p + carry_at + 2U * D, L.carry_valid[L.carry_cur].p, 4U, hipMemcpyDeviceToDevice, st),
+                        check(hipMemcpyAsync(send_words + carry_at + 2U * D, L.carry_valid[L.carry_cur].p, 4U, hipMemcpyDefault, st),
                               "carry");
                     }
-                    start_gather();
-                    index_projections();  // while the entries cross
-                    exchange_rows(m.pack_send.p, own_words, m.pack_recv.p, peer_words, 4U, layer);
-                    join_gather();
+                    const std::uint32_t* recv_words = m.pack_recv.p;
+                    if (staged_send) {
+                        m.options.communicator->start_staged(st, entry_bytes,
+                                                             dist::Tag{static_cast<std::uint32_t>(dist::TagKind::raw_slots), layer, ++exchange_seq});
+                        index_projections();  // while the entries cross
+                        recv_words = static_cast<const std::uint32_t*>(m.options.communicator->finish_staged(st));
+                    } else {
+                        start_gather();
+                        index_projections();  // while the entries cross
+                        exchange_rows(m.pack_send.p, own_words, m.pack_recv.p, peer_words, 4U, layer);
+                        join_gather();
+                    }
                     fe.ring_pos = m.ppos64.p + pk0;
                     fe.ring_rows = peer_ring;
                     fe.comp_pos = m.ppos64.p + px0;
                     fe.comp_rows = peer_comp;
-                    fe.packed = m.pack_recv.p;
+                    fe.packed = const_cast<std::uint32_t*>(recv_words);
                     if (peer_ring + peer_comp) {
                         final_entries_kernel<false><<<peer_ring + peer_comp, 128, 0, st>>>(fe);
                         check(hipGetLastError(), "final entries unpack");
                     }
                     if (carry_words && !last_local) {
                         const std::size_t peer_carry = std::size_t{peer_words} - carry_words;
-                        check(hipMemcpyAsync(L.carry[1 - L.carry_cur].p, m.pack_recv.p + peer_carry, std::size_t{2U * D} * 4U,
-                                             hipMemcpyDeviceToDevice, st),
+                        check(hipMemcpyAsync(L.carry[1 - L.carry_cur].p, recv_words + peer_carry, std::size_t{2U * D} * 4U,
+                                             hipMemcpyDefault, st),
                               "carry");
-                        check(hipMemcpyAsync(L.carry_valid[1 - L.carry_cur].p, m.pack_recv.p + peer_carry + 2U * D, 4U, hipMemcpyDeviceToDevice, st),
+                        check(hipMemcpyAsync(L.carry_valid[1 - L.carry_cur].p, recv_words + peer_carry + 2U * D, 4U, hipMemcpyDefault, st),
                               "carry");
                         L.carry_cur = 1 - L.carry_cur;
                     }
+                    if (staged_send) m.options.communicator->release_staged(st);
                 } else if (split) {  // the peer's window K/V (rows from k0) and compressor inputs (rows from x0)
                     const std::uint32_t pk0 = local_of(peer, R0.k0), px0 = local_of(peer, R0.x0);
                     const Field kv{m.kv.p + std::size_t{L0.k0} * D, m.peer_kv.p + std::size_t{pk0} * D, D * 4U};
