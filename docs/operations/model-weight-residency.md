@@ -73,3 +73,24 @@ complete logits, generated history, initial/final state payloads, dispatch
 counters and selected kernels. Separate these checks and instrumented copy/API
 measurements from ordinary full-request performance samples. A result for one
 arithmetic recipe does not qualify another, and isolated gains are not additive.
+
+## Registered page lock
+
+Registered (`--residency register`) model ranges are locked in RAM by default
+(`mlock2` with `MLOCK_ONFAULT`) when `RLIMIT_MEMLOCK` covers every registered
+byte. A registered page that the kernel reclaims or migrates invalidates the
+userptr registration, and the driver then evicts every GPU queue of the process
+until the whole registration is revalidated. Under host memory pressure, for
+example an HTTP server sizing its slots while other files fill the page cache,
+that restore can take minutes or not complete, and the next GPU submission
+waits indefinitely. Locked pages stay resident and are no longer reported as
+`MemAvailable`, so automatic HTTP slot sizing sees the real headroom.
+
+When the limit is too small, or `mlock2` fails, startup prints one notice and
+the pages stay unlocked (previous behaviour). HTTP slot sizing then subtracts
+the unlocked registered bytes from `MemAvailable`, because reclaiming them is
+not free capacity for this process. Weight bytes, kernels and arithmetic are
+unchanged.
+
+Off switch: `STRIX_MODEL_REGISTER_MLOCK=0` (unlocked pages; slot sizing still
+subtracts them).

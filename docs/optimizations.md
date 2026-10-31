@@ -116,6 +116,20 @@ Register the mmap-backed GGUF without a second full model allocation.
 - **Measured gain:** No isolated measurement
 - **Implementation / evidence:** [Residency](operations/model-weight-residency.md)
 
+### Registered page lock
+
+**Engine:** `qwen`. **Control:** `STRIX_MODEL_REGISTER_MLOCK`. **Default:** ON when `RLIMIT_MEMLOCK` covers the registered bytes.
+
+Keep registered model pages off the reclaim LRU so host memory pressure cannot evict the process's GPU queues.
+
+- **Preconditions:** Linux, `--residency register`, `RLIMIT_MEMLOCK` >= registered bytes.
+- **Automatic selection:** Every registered model mapping; HTTP slot sizing subtracts any registered bytes that stay unlocked from `MemAvailable`.
+- **Fallback notice:** `model residency: RLIMIT_MEMLOCK below ...` or `mlock of ... failed`; the pages stay unlocked.
+- **Exactness evidence:** Weight bytes, kernels and arithmetic are unchanged; only page residency and the slot-capacity estimate change.
+- **Off switch:** STRIX_MODEL_REGISTER_MLOCK=0
+- **Measured gain:** One Strix Halo node, HTTP server: cold starts locked 42/42 vs unlocked 5 hangs in 41 (GPU queues evicted, never restored); 8 x 8500-token clients 106.1 vs 106.8 s (1.55 vs 1.5 tok/s, ABBA); 16 clients complete (320/320 tokens, 187-199 s) where the unlocked server stalled during on-demand slot growth in both legs. Automatic slots reflect the real headroom (29 -> 8 on the measured node).
+- **Implementation / evidence:** [Residency](operations/model-weight-residency.md#registered-page-lock)
+
 <a id="qwen-l1"></a>
 
 ### PLE page reclaim and prefetch admission

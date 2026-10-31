@@ -137,6 +137,17 @@
   },
   {
     "engine": "qwen",
+    "name": "Registered page lock",
+    "flag_or_env": "STRIX_MODEL_REGISTER_MLOCK",
+    "default": "ON when RLIMIT_MEMLOCK covers the registered bytes",
+    "exact": "Weight bytes, kernels and arithmetic are unchanged; only page residency and the slot-capacity estimate change.",
+    "gain": "One Strix Halo node, HTTP server: cold starts locked 42/42 vs unlocked 5 hangs in 41 (GPU queues evicted, never restored); 8 x 8500-token clients 106.1 vs 106.8 s (1.55 vs 1.5 tok/s, ABBA); 16 clients complete (320/320 tokens, 187-199 s) where the unlocked server stalled during on-demand slot growth in both legs.",
+    "preconditions": "Linux, --residency register, RLIMIT_MEMLOCK >= registered bytes.",
+    "off_switch": "STRIX_MODEL_REGISTER_MLOCK=0",
+    "doc_anchor": "docs/optimizations.md#registered-page-lock"
+  },
+  {
+    "engine": "qwen",
     "name": "PLE page reclaim and prefetch admission",
     "flag_or_env": "STRIX_PLE_RECLAIMABLE=auto",
     "default": "auto",

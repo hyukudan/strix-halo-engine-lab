@@ -144,6 +144,13 @@ public:
         return registered_bytes_;
     }
 
+    // Registered bytes kept off the reclaim LRU (mlock2). The rest can be
+    // reclaimed and still counts as MemAvailable while it is resident.
+    [[nodiscard]] std::uint64_t
+    registered_locked_bytes() const noexcept {
+        return registered_locked_bytes_;
+    }
+
     [[nodiscard]] std::uint64_t
     copied_bytes() const noexcept {
         return copied_bytes_;
@@ -167,6 +174,7 @@ private:
         std::uintptr_t host_base = 0;
         std::uintptr_t device_base = 0;
         std::uint64_t bytes = 0;
+        bool locked = false;
     };
 
     struct CopiedRange {
@@ -191,6 +199,7 @@ private:
     std::vector<SelectiveCopyRange> arena_ranges_;
     std::shared_ptr<const HipSetupQuiescenceGuard> selective_guard_;
     std::uint64_t registered_bytes_ = 0;
+    std::uint64_t registered_locked_bytes_ = 0;
     std::uint64_t copied_bytes_ = 0;
     std::uint64_t generation_ = 0;
     const MappedModelFile* source_mapping_ = nullptr;
