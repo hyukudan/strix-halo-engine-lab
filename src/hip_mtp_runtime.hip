@@ -17,6 +17,7 @@
 #include "strix/hip_lm_head_launcher.hpp"
 #include "strix/hip_generation_output.hpp"
 #include "strix/hip_launch_context.hpp"
+#include "strix/hip_ple_launcher.hpp"
 #include "strix/mtp_sidecar_binding.hpp"
 #include <cstring>
 #include <cstdio>
@@ -459,6 +460,7 @@ struct HipMtpRuntime::Impl {
                     std::max<std::uint32_t>(owner->budget().maximum_candidate_depth,1U));
                 draft_device->set_vocabulary(draft->host_ids(),draft->stats().rows,stream);
             }
+            ple_window_warm::begin(pending_token); // STRIX_PLE_WINDOW_WARM: verify row 0
             return true;
         } catch(...) {failure();throw;}
     }
@@ -521,6 +523,7 @@ struct HipMtpRuntime::Impl {
             if((cs.min_probability>0.0F || cs.keep) && k+1U<cs.requested) {
                 if(!sampler || cs.device_draft) draft->wait_step(k,batch_stream?static_cast<void*>(batch_stream):owner->stream());
                 host_phase_mark("2w draft step wait");
+                if(ple_window_warm::enabled()) ple_window_warm::draft(k,draft->step_token(k)); // verify row k + 1
                 if(cs.min_probability>0.0F && draft->probability(k)<cs.min_probability) {cs.depth=k+1U;cs.stop=true;return false;}
                 if(cs.keep) {
                     probabilities.resize(k+1U);runner_ups.resize(k+1U);
@@ -542,6 +545,7 @@ struct HipMtpRuntime::Impl {
                 for(std::uint32_t k=0;k<depth;++k) draft->record_token(k,sampled[k].token);
             }
             auto tokens=draft->read(depth);
+            for(std::uint32_t k=0;k<depth;++k) ple_window_warm::draft(k,tokens[k]); // rows not warmed per step
             probabilities.resize(depth);runner_ups.resize(depth);
             for(std::uint32_t k=0;k<depth;++k) {probabilities[k]=draft->probability(k);runner_ups[k]=draft->runner_up_probability(k);}
             // STRIX_MTP_DRAFT_LOG=1: every proposal (chain start position, step, token, probability bits and

@@ -429,6 +429,10 @@ std::vector<std::uint32_t> HipMtpDraftHead::read(std::uint32_t count) const {
     for(const auto token:tokens) require(token<p.config.vocab_size,"MTP draft head produced out-of-vocabulary token");
     return tokens;
 }
+std::uint32_t HipMtpDraftHead::step_token(std::uint32_t step) const {
+    const auto& p=*impl_;require(step<p.config.max_depth,"MTP draft token step is invalid");
+    const volatile std::uint32_t* mapped=p.reply->tokens;return mapped[step];
+}
 float HipMtpDraftHead::probability(std::uint32_t step) const {
     const auto& p=*impl_;require(step<p.config.max_depth,"MTP draft probability step is invalid");
     const volatile float* mapped=p.reply->probabilities;return mapped[step];

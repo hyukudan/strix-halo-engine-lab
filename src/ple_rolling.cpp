@@ -619,7 +619,7 @@ void ResidencyManager::configure_prompt(PromptConfig config) {
     prompt_config_ = config;
 }
 void ResidencyManager::source(std::uint64_t id, std::uintptr_t table, std::uint64_t generation,
-    std::span<const std::uint64_t> rows, const std::function<void()>& copy, std::uint64_t epoch) {
+    std::span<const std::uint64_t> rows, const std::function<void()>& copy, std::uint64_t epoch, std::uint64_t* uncached) {
     std::shared_ptr<RollingPipeline> pipeline;
     {
         const std::lock_guard lock(mutex_);
@@ -656,6 +656,7 @@ void ResidencyManager::source(std::uint64_t id, std::uintptr_t table, std::uint6
             !std::binary_search(s.window.begin(), s.window.end(), pg)) needed.push_back(pg);
         const auto capacity = quota_ / page_;
         if (needed.size() > capacity) throw std::runtime_error("PLE residency: source wave exceeds reserved quota");
+        if (uncached) *uncached = needed.size();
         const bool refresh = s.cache.size() + needed.size() > capacity;
         while (s.cache.size() + needed.size() > capacity) {
             auto victim = s.lru.end();
@@ -815,6 +816,12 @@ std::uint64_t ResidencyManager::Turn::epoch() const {
 void ResidencyManager::Turn::source(std::uintptr_t table, std::uint64_t generation,
     std::span<const std::uint64_t> rows, const std::function<void()>& copy, std::uint64_t epoch) {
     manager_->source(id_, table, generation, rows, copy, epoch);
+}
+std::uint64_t ResidencyManager::Turn::warm(std::uintptr_t table, std::uint64_t generation, std::span<const std::uint64_t> rows) {
+    if (prompt() || rows.empty()) throw std::runtime_error("PLE residency: decode warming requires decode-phase rows");
+    std::uint64_t uncached = 0;
+    manager_->source(id_, table, generation, rows, [] {}, epoch(), &uncached);
+    return uncached;
 }
 void ResidencyManager::Turn::verify_window(std::uintptr_t table, std::uint64_t generation,
     std::uint64_t positions, std::span<const std::uint64_t> rows, const std::function<void()>& copy) {

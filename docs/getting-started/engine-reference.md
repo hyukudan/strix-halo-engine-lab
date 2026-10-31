@@ -170,6 +170,8 @@ Off switches:
   alternatives below, whose `=0` disables only that item and keeps the route. To measure a single operator inside
   the same tiled identity, use an explicit tiled route with the same T, budgets and profile pair.
 - `STRIX_PLE_RECLAIMABLE=0`: keep the original warm PLE pages; `auto` has its own route/setup admission.
+- `STRIX_PLE_WINDOW_WARM=0`: stop loading the next MTP verify window's PLE pages during the draft phase
+  (default on with rolling residency; never changes bytes, see [PLE verify-window warming](../optimizations.md#qwen-ple-warm)).
 - `--known-prefix-window=0`: disable automatic tiling. The full-rows, expert-union, router-rows and prefill-rows
   route flags also accept `=0`.
 

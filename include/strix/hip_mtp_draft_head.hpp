@@ -67,6 +67,8 @@ public:
     // arrive. Equivalent to synchronising before reading probability(step). `stream` is the stream carrying
     // the step: the head's own, or the multi-session draft batch stream (launch_rows).
     void wait_step(std::uint32_t step,void* stream) const;
+    // After wait_step(step): the token the step selected (unchecked; a hint, e.g. for cache warming).
+    [[nodiscard]] std::uint32_t step_token(std::uint32_t step) const;
     // Sampled drafts: after wait_step(step), copy the active rows' logits to the host,
     // and replace the step's selection (device slot and mapped reply) before the
     // next step reads it. host_ids() maps rows to token ids (empty in full mode).

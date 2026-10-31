@@ -21,9 +21,12 @@
 #include <cstdlib>
 #include <cstdio>
 #include <chrono>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <memory>
+#include <mutex>
 #include <exception>
 #include <limits>
 #include <optional>
@@ -40,6 +43,167 @@
 #endif
 
 namespace strix {
+// STRIX_PLE_WINDOW_WARM (default on; =0, STRIX_QPF2K_DEFAULTS=0 or STRIX_BASELINE=1 turn it off): decode cache
+// warming for the next verify window's PLE rows. The MTP draft loop reports
+// each window row's input token as soon as the host knows it (the pending token when the draft chain starts, each
+// draft after its step); the row's n-gram table rows are hashed from the last published history exactly as launch()
+// hashes them and a worker loads their pages into the rolling-residency decode cache (Turn::warm). No bytes are
+// handed to the window: its launch() runs unchanged and its leased gather finds the pages cached. A wrong guess
+// (stale history, rejected or padded rows, a min-p stop) only leaves warm pages that the decode quota evicts.
+namespace ple_window_warm {
+namespace {
+struct Warmer {
+    std::mutex mutex;
+    std::condition_variable wake;
+    std::thread thread;
+    bool stop = false;
+    // Registered by the last verify launch() (source) and the last history publication (history).
+    std::weak_ptr<ple_reclaim::ResidencyManager::Turn> turn;
+    std::uintptr_t table = 0;
+    std::uint64_t generation = 0;
+    PleHashContract contract{};
+    bool source = false, history_valid = false;
+    std::array<std::uint32_t, PleHashContract::maximum_ngram - 1> history{};
+    // The cycle being warmed: row ids of rows [0, rows), queued rows not yet loaded.
+    std::array<std::uint32_t, PleHashContract::maximum_ngram - 1> previous{};
+    std::array<std::uint64_t, 8U * PleHashContract::maximum_heads> ids{};
+    std::uint32_t rows = 0, queued_from = 0, heads = 0;
+    bool cycle = false;
+    unsigned jobs = 0;   // queued or running warm calls
+    std::chrono::steady_clock::time_point warmed_at;
+    // STRIX_CYCLE_TIMING counters.
+    unsigned long long cycles = 0, warmed_rows = 0, row_reads = 0, pages_read = 0, errors = 0, windows = 0,
+        window_rows = 0, matched_rows = 0, pending_at_window = 0;
+    double warm_ms = 0, ahead_ms = 0;
+    unsigned long long ahead_n = 0;
+    bool timing = std::getenv("STRIX_CYCLE_TIMING") != nullptr;
+    ~Warmer() {
+        {
+            const std::lock_guard lock(mutex);
+            stop = true;
+        }
+        wake.notify_all();
+        if (thread.joinable()) thread.join();
+        if (!timing || !cycles) return;
+        std::fprintf(stderr, "window PLE warm: %llu cycles, rows warmed %llu, row reads %llu, pages read %llu, warm %.4f ms/cycle, "
+            "errors %llu; %llu windows: rows %llu matched %llu, warm done %.4f ms before window start (%llu windows), "
+            "warm still running at window start %llu\n",
+            cycles, warmed_rows, row_reads, pages_read, warm_ms / static_cast<double>(cycles), errors, windows, window_rows,
+            matched_rows, ahead_n ? ahead_ms / static_cast<double>(ahead_n) : 0.0, ahead_n, pending_at_window);
+    }
+    // Caller holds mutex: hashes the cycle's next row and queues it.
+    void add(std::uint32_t token) {
+        if (!cycle || rows >= 8U) return;
+        const auto context = static_cast<std::size_t>(contract.ngram_size - 1U);
+        const auto hash = hash_ple_token(contract, token, std::span<const std::uint32_t>(previous.data(), context));
+        if (hash.row_count != heads) { cycle = false; return; }
+        std::copy_n(hash.row_ids.begin(), heads, ids.begin() + static_cast<std::size_t>(rows) * heads);
+        std::copy_n(hash.next_context.begin(), context, previous.begin());
+        ++rows;
+        if (!thread.joinable()) thread = std::thread([this] { run(); });
+        wake.notify_one();
+    }
+    void run() noexcept {
+        std::unique_lock lock(mutex);
+        for (;;) {
+            wake.wait(lock, [this] { return stop || (cycle && queued_from < rows); });
+            if (stop) return;
+            const std::vector<std::uint64_t> batch(ids.begin() + static_cast<std::size_t>(queued_from) * heads,
+                ids.begin() + static_cast<std::size_t>(rows) * heads);
+            const auto count = rows - queued_from;
+            queued_from = rows;
+            const auto owner = turn.lock();
+            const auto address = table;
+            const auto gen = generation;
+            ++jobs;
+            lock.unlock();
+            std::uint64_t read = 0;
+            bool failed = !owner;
+            const auto t0 = std::chrono::steady_clock::now();
+            if (owner) {
+                try { read = owner->warm(address, gen, batch); } catch (...) { failed = true; }
+            }
+            const auto t1 = std::chrono::steady_clock::now();
+            lock.lock();
+            --jobs;
+            warmed_at = t1;
+            warmed_rows += count; row_reads += batch.size(); pages_read += read; errors += failed ? 1U : 0U;
+            warm_ms += std::chrono::duration<double, std::milli>(t1 - t0).count();
+        }
+    }
+};
+Warmer& warmer() {
+    static Warmer instance;
+    return instance;
+}
+}  // namespace
+
+bool enabled() noexcept {
+    static const bool on = [] {
+        if (const char* v = std::getenv("STRIX_PLE_WINDOW_WARM")) return std::strcmp(v, "0") != 0;
+        const char* defaults = std::getenv("STRIX_QPF2K_DEFAULTS");
+        const char* baseline = std::getenv("STRIX_BASELINE");
+        return !(defaults && defaults[0] == '0') && !(baseline && std::strcmp(baseline, "1") == 0);
+    }();
+    return on;
+}
+void begin(std::uint32_t token) noexcept {
+    if (!enabled()) return;
+    auto& w = warmer();
+    const std::lock_guard lock(w.mutex);
+    try {
+        w.cycle = w.source && w.history_valid && !w.turn.expired();
+        if (!w.cycle) return;
+        w.previous = w.history; w.rows = 0; w.queued_from = 0; w.heads = w.contract.head_count;
+        if (!w.heads || w.heads > PleHashContract::maximum_heads) { w.cycle = false; return; }
+        ++w.cycles;
+        w.add(token);
+    } catch (...) { w.cycle = false; }
+}
+void draft(std::uint32_t step, std::uint32_t token) noexcept {
+    if (!enabled()) return;
+    auto& w = warmer();
+    const std::lock_guard lock(w.mutex);
+    try {
+        if (w.cycle && step + 1U == w.rows) w.add(token);
+    } catch (...) { w.cycle = false; }
+}
+namespace {
+// launch(): a verify window starts; compares its row ids with the warmed ones and ends the cycle.
+void window(std::span<const PleHashResult> hashes, std::chrono::steady_clock::time_point start) noexcept {
+    if (!enabled()) return;
+    auto& w = warmer();
+    const std::lock_guard lock(w.mutex);
+    if (!w.cycle) return;
+    ++w.windows; w.window_rows += hashes.size();
+    for (std::size_t r = 0; r < hashes.size() && r < w.rows; ++r)
+        if (hashes[r].row_count == w.heads &&
+            std::equal(hashes[r].row_ids.begin(), hashes[r].row_ids.begin() + w.heads, w.ids.begin() + r * w.heads)) ++w.matched_rows;
+    if (w.jobs || w.queued_from < w.rows) ++w.pending_at_window;
+    else if (w.queued_from) {
+        w.ahead_ms += std::chrono::duration<double, std::milli>(start - w.warmed_at).count(); ++w.ahead_n;
+    }
+    w.cycle = false;
+}
+void register_source(const std::shared_ptr<ple_reclaim::ResidencyManager::Turn>& turn, const RuntimeTensorBinding& table,
+    const PleHashContract& contract) noexcept {
+    if (!enabled()) return;
+    auto& w = warmer();
+    const std::lock_guard lock(w.mutex);
+    w.source = static_cast<bool>(turn);
+    if (!turn) return;
+    w.turn = turn; w.table = table.address; w.generation = table.allocation_generation; w.contract = contract;
+}
+void register_history(const PleHashResult& hash) noexcept {
+    if (!enabled()) return;
+    auto& w = warmer();
+    const std::lock_guard lock(w.mutex);
+    w.history_valid = hash.context_count && hash.context_count <= w.history.size();
+    std::copy_n(hash.next_context.begin(), std::min<std::size_t>(hash.context_count, w.history.size()), w.history.begin());
+}
+}  // namespace
+}  // namespace ple_window_warm
+
 namespace {
 
 constexpr std::uint32_t kThreads = 256;
@@ -2016,6 +2180,7 @@ void launch_ple(const ExecutionDispatchContext& context, void* user_data) {
         static_cast<std::size_t>(
             hash.context_count) *
             sizeof(std::uint32_t));
+    ple_window_warm::register_history(hash);
 }
 
 std::string kernel_id(
@@ -2668,6 +2833,7 @@ void HipPleKnownWindow::preflight(std::span<const ExecutionDispatchContext> rows
 
 void HipPleKnownWindow::launch(std::span<const ExecutionDispatchContext> rows) {
     auto& w = *impl_;
+    const auto launch_start = std::chrono::steady_clock::now();
     static const bool timing = [] { const char* v = std::getenv("STRIX_PREFILL_TIMING"); return v && v[0] == '1'; }();
     auto mark = std::chrono::steady_clock::now();
     const auto lap = [&](const char* name) {
@@ -2806,6 +2972,7 @@ void HipPleKnownWindow::launch(std::span<const ExecutionDispatchContext> rows) {
         if (same) { reclaim_receipt.staged_rows = rows.size(); deferred.clear(); }
     }
     lap("hash");
+    if (!w.prefill) ple_window_warm::window(std::span<const PleHashResult>(w.hashes.data(), rows.size()), launch_start);
     const auto hash_end = block_stats ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     if (block_stats) reclaim_receipt.hash_ns = static_cast<std::uint64_t>(
         std::chrono::duration_cast<std::chrono::nanoseconds>(hash_end - reclaim_t0).count());
@@ -3056,8 +3223,9 @@ void HipPleKnownWindow::launch(std::span<const ExecutionDispatchContext> rows) {
         const auto& hash = w.hashes[rows.size() - 1U];
         std::memcpy(reinterpret_cast<void*>(w.ngram_address), hash.next_context.data(),
             static_cast<std::size_t>(hash.context_count) * sizeof(std::uint32_t));
+        ple_window_warm::register_history(hash);
         w.rows = 0;
-    }
+    } else ple_window_warm::register_source(source_turn, *prepared[0].tensors.table.runtime, contract);
 }
 
 void HipPleKnownWindow::commit(std::uint32_t n_keep, void* stream) {
@@ -3070,6 +3238,7 @@ void HipPleKnownWindow::commit(std::uint32_t n_keep, void* stream) {
     const auto& hash = w.hashes[n_keep - 1U];
     std::memcpy(reinterpret_cast<void*>(w.ngram_address), hash.next_context.data(),
         static_cast<std::size_t>(hash.context_count) * sizeof(std::uint32_t));
+    ple_window_warm::register_history(hash);
     w.rows = 0;
 }
 

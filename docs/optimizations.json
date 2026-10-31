@@ -159,6 +159,17 @@
   },
   {
     "engine": "qwen",
+    "name": "PLE verify-window warming",
+    "flag_or_env": "STRIX_PLE_WINDOW_WARM",
+    "default": "ON",
+    "exact": "Exact by construction: warming never hands bytes to the window; it only loads pages the window's own rolling lease reads into the decode cache. Hashing, stored rows, IQ4_NL decoding, BF16 conversion, staging and GPU arithmetic are unchanged. Fixture strix-hip-ple-window-warm-tests compares windows with and without warming bitwise (R 1/2/4/8, edge/EOS/repeated tokens, wrong-token and stale-history warming, plain mapping and rolling turn); decode A/B token IDs identical.",
+    "gain": "1K-token MTP decode (G70), 2 interleaved rounds: code +1.1 %, code R8 +0.5 %, prose +1.0 %, prose R8 +1.0 %; traced R8 window PLE host gather 3.4 -> 0.87 ms.",
+    "preconditions": "MTP decode with a rolling-residency decode turn; inert without one. The draft loop reports the pending token and each draft token after its step; rows are hashed from the last published n-gram history and their pages loaded by a background thread into the fixed 256 MiB decode cache. Wrong guesses only leave replaceable warm pages.",
+    "off_switch": "STRIX_PLE_WINDOW_WARM=0 (also off with STRIX_QPF2K_DEFAULTS=0 or STRIX_BASELINE=1).",
+    "doc_anchor": "docs/optimizations.md#qwen-ple-warm"
+  },
+  {
+    "engine": "qwen",
     "name": "Combined QPF2K and wrapper defaults",
     "flag_or_env": "STRIX_QPF2K_DEFAULTS",
     "default": "ON",

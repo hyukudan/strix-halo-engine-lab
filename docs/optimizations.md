@@ -148,6 +148,39 @@ Reclaim file-backed L1 PLE pages and gather immutable rows through bounded owned
 - **Off switch:** STRIX_PLE_RECLAIMABLE=0
 - **Measured gain:** Historical prompt-wide admission supports T8192 at 128K/262K; rolling native qualification is pending. No isolated speed attribution.
 - **Implementation / evidence:** [Admission](../include/strix/ple_reclaim.hpp), [implementation](../src/ple_reclaim.cpp)
+- **Decode warming:** with rolling residency, MTP decode loads each verify window's PLE pages during the draft phase; see [PLE verify-window warming](#qwen-ple-warm).
+
+<a id="qwen-ple-warm"></a>
+
+### PLE verify-window warming
+
+**Engine:** `qwen`. **Control:** `STRIX_PLE_WINDOW_WARM`. **Default:** ON.
+
+Under rolling PLE residency a verify window's PLE step reads its table rows (16 per window row) with O_DIRECT
+reads, about 3.4 ms per R8 window, while the GPU waits after layer 0. The MTP draft loop now reports each window
+row's input token as soon as the host knows it: the pending token when the draft chain starts, and each draft after
+its draft step. The row's table row ids are hashed from the last published n-gram history exactly as the window
+hashes them, and a background thread loads their pages into the rolling decode cache. The window itself is
+unchanged; its leased gather finds the pages cached.
+
+- **Preconditions:** MTP decode with a rolling-residency decode turn (`STRIX_PLE_RECLAIMABLE` auto/required with
+  rolling active). Without a turn (plain mapping, rolling off) the item is inert.
+- **Automatic selection:** On unless `STRIX_PLE_WINDOW_WARM=0`, `STRIX_QPF2K_DEFAULTS=0` or `STRIX_BASELINE=1`.
+- **Fallback notice:** Rows guessed from a stale history, rejected or padded rows and min-p stops only leave warm
+  pages that the fixed 256 MiB decode cache replaces; warming errors are counted and ignored.
+- **Exactness evidence:** Exact by construction: warming never hands bytes to the window. It only admits pages
+  into the decode cache that the window's own lease would read; hashing, stored rows, IQ4_NL decoding, BF16
+  conversion, staging and GPU arithmetic are unchanged. The fixture `strix-hip-ple-window-warm-tests` compares
+  windows with and without warming bitwise (R 1/2/4/8, vocabulary-edge, EOS and repeated tokens, wrong-token and
+  stale-history warming) on the plain mapping and on a rolling decode turn; decode A/B token IDs were identical.
+- **Off switch:** STRIX_PLE_WINDOW_WARM=0
+- **Measured gain:** 1K-token decode, MTP G70 preset, 2 interleaved rounds: code +1.1 % (58.70 -> 59.36 tok/s),
+  code at R8 +0.5 %, prose +1.0 %, prose at R8 +1.0 %. Traced R8: window PLE host gather 3.4 -> 0.87 ms; the
+  idle gap before the PLE projection disappears from the top idle list.
+- **Diagnostics:** `STRIX_CYCLE_TIMING=1` prints `window PLE warm:` (rows warmed, pages read, warm time, window
+  rows matched, warm completion relative to the window start).
+- **Implementation / evidence:** [warming](../src/hip_ple_launcher.hip), [decode cache](../src/ple_rolling.cpp),
+  [fixture](../tests/hip_ple_window_warm_tests.hip)
 
 <a id="qwen-defaults"></a>
 
