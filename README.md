@@ -121,6 +121,7 @@ The command produces a JSON receipt with token IDs and timing. Actual model file
 | DeepSeek V4.1 Flash, standalone RTX | RTX PRO 6000 (96 GB, Windows WDDM) | **Production** | Q2 GGUF experts, Q8_0 dense; exclusive VRAM + pinned-host cache; on-GPU DSpark with warm controller selected as the speculative default |
 | MiniMax M3.1 Flash (EXL3, 3.06 bpw) | 2 nodes TP2 over USB4 | **Production** | Eight-text quality gate passed; exact prefill/decode; DSpark serving auto admission and MSA mode 5; prefill/exchange defaults on |
 | GLM-5.3 Flash (EXL3, 4.05 bpw) | 2 nodes TP2 over USB4 | **Production** | R1b decode identity by default; exact MTP self-speculation by default; exact R1 chunked prefill; `--identity r1` restores R1; R≥3 fix verified on the pair |
+| Nemotron 3.5 Bolt E4B (Q4_K_M; EXL3 pack for `quality`) | 1 node | **Opt-in build** (`STRIX_FAMILY_GEMMA4=ON`) | `--profile default\|fast\|quality`; exact decode at every batch size; exact MTP drafter at C1; continuous-batching server |
 
 The core knows no model: each family is a module with its own contract, plan, kernels and gates
 ([docs/models/model-families.md](docs/models/model-families.md)). Automatic routes admit model assets under their documented contracts; provenance and licenses are recorded in
@@ -506,6 +507,41 @@ unresolved. HIP graphs are **not implemented**: the latest profile (`41d8cfdc`) 
 and a calculated recoverable gap of **≤1.8 ms** (a bound, not a measured speedup). Host progress across
 exchange boundaries requires segmented capture; device kernels and rank skew take priority.
 
+### Nemotron 3.5 Bolt E4B
+
+Sources: [model guide](docs/models/nemotron-3.5-bolt-e4b/README.md).
+
+One Strix Halo node (gfx1151, 128 GB), official Q4_K_M GGUF for `default` and `fast`, EXL3 pack for `quality`;
+256-token English chat decode, greedy. C4 and C8 are aggregate tok/s across concurrent requests. Each llama.cpp
+value comes from the same measuring session as the row it is compared with.
+
+| Profile | C1 | C1 + MTP drafter | C4 | C8 |
+|---|---:|---:|---:|---:|
+| `default` (exact, `g4-v1`) | 55.9 | 85.1 | 169.3 | 237.9 |
+| `fast` (`g4-a8-v1`, qualified) | 53.9 | 92.2 | 205.1 | 337.5 |
+| `quality` (EXL3, `g4-exl3-v3`) | 44.4 | 72.1 | 153.0 | 258.7 |
+| llama.cpp `74a4fb00`, same Q4_K_M | 55.4 | — | 193.3 | 281.9 |
+
+With the drafter, token ids equal drafting off (verified for English, Spanish, Japanese and code at C1, and at C4).
+
+Prefill (tok/s; every profile uses exact prefill):
+
+| Prompt | `default` | `fast` | `quality` | llama.cpp |
+|---|---:|---:|---:|---:|
+| 512 | 471 | 474 | 236 | 2,065 |
+| 2K | 466 | 458 | 225 | 2,052 |
+| 8K | 429 | 414 | 173 | 1,873 |
+| 16K | 404 | 403 | 64 | 1,684 |
+| 32K | 358 | 355 | not measured | 1,373 |
+
+Exact prefill uses FP32 arithmetic without contraction and is about a quarter of llama.cpp's speed. The `fast`
+profile's WMMA prefill is pending qualification and is not applied; `quality` prefill still runs in eight-row pieces
+and slows down at long context. `default` C4/C8 is below llama.cpp; `fast` is above it.
+
+llama.cpp commands: C1 `llama-bench -m Q4_K_M.gguf -fa 1 -ngl 99 -n 128 -p 0 -r 3`; C4/C8
+`llama-batched-bench -m Q4_K_M.gguf -fa on -ngl 99 -c 2048 -npp 64 -ntg 32 -npl 1,4,8`; prefill
+`llama-bench -m Q4_K_M.gguf -fa 1 -ngl 99 -n 0 -r 2 -p 512,2048,8192` and `-r 1 -p 8192,16384,32768`.
+
 ### Shipped changes beyond the historical campaigns
 
 The detailed campaigns above retain their measured build identities. Main also ships the following
@@ -814,6 +850,21 @@ Default R1b decode uses exact MTP self-speculation and R1 prompt prefill; `--mtp
 with the same tokens. `--identity r1` selects a different reference identity. Prefill automatically uses
 8192 rows if both ranks admit them, otherwise 4096. See the [resolver](apps/glm_rank_defaults.hpp),
 [model families](docs/models/model-families.md) and [qualification/performance](docs/performance.md).
+
+### Nemotron 3.5 Bolt E4B
+
+Build with `-DSTRIX_FAMILY_GEMMA4=ON` (default OFF) and `ninja -C build strix-gemma4-serve`. Generate the rotary
+tables once, then serve on one node:
+
+```sh
+python src/gemma4/ref/make_rope_tables.py rotary-tables --positions 65536 --workers 6
+./build/strix-gemma4-serve MODEL_DIR --rope-tables rotary-tables --tokenizer MODEL_DIR/tokenizer.json --profile default
+```
+
+`--profile fast` selects int8 activations; `--profile quality` needs `--exl3-arm DIR`. An MTP drafter package in
+`MODEL_DIR/drafter-mtp/` is used automatically (`--draft off` disables it). The drafter package and the EXL3 packs
+are not published yet; without them, `default` and `fast` run plain decode and `quality` refuses to start. See the
+[model guide](docs/models/nemotron-3.5-bolt-e4b/README.md).
 
 ### Qwen long context
 

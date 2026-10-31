@@ -1,0 +1,187 @@
+#pragma once
+
+#include "gemma4/contracts/g4_types.hpp"
+#include "gemma4/dflash/dflash.hpp"
+#include "auto_policy.hpp"
+#include "strix/serve/json.hpp"
+#include <functional>
+#include <map>
+#include <stdexcept>
+
+// Optional DraftSession hooks for autoregressive drafters are available (e4b-eagle / MTP check these).
+#define STRIX_G4_DRAFT_ROWS_API 1
+#define STRIX_G4_DRAFT_KV_API 1
+// DraftSession::multi_stream_candidate (auto drafting at >1 live stream, window <= k cap).
+#define STRIX_G4_DRAFT_MULTI_API 1
+
+namespace strix::gemma4::engine {
+
+// Backends own cache allocation and transaction type. Scheduling knows only the frozen
+// Target/RowPlan/KvTxn contract. All assets and the backend outlive the coordinator.
+class StreamState {
+public:
+    virtual ~StreamState() = default;
+    virtual std::unique_ptr<KvTxn> begin() = 0;
+    [[nodiscard]] virtual std::uint64_t frontier() const = 0;
+    [[nodiscard]] virtual std::string digest() const = 0;
+    // Optional read-only KV view of a producing target layer (MTP drafters): committed snapshot + optional overlay of
+    // `transaction`. The coordinator drafts before any candidate row exists, so it passes nullptr. false = unavailable.
+    virtual bool kv_view(std::uint32_t layer, const KvTxn* transaction, KvView& out) const {
+        (void)layer; (void)transaction; (void)out; return false;
+    }
+};
+// Rows of one exact many-row prefill call (no logits): taps per row and, when
+// requested, the final-norm hidden rows that RowPlan::export_hidden returns.
+struct PrefillRows {
+    std::vector<float> taps, hidden;
+    std::uint32_t tap_width = 0;
+};
+class Backend : public Target {
+public:
+    // Optional exact many-row prefill (prefill-exact). prefill_rows evaluates
+    // consecutive positions of a fresh transaction; its committed KV, taps and
+    // hidden rows equal forward_rows passes over the same rows. 0 = unsupported.
+    [[nodiscard]] virtual std::size_t prefill_chunk_rows() const { return 0; }
+    virtual PrefillRows prefill_rows(KvTxn& transaction, std::span<const std::uint32_t> tokens, bool hidden) {
+        (void)transaction; (void)tokens; (void)hidden;
+        throw std::logic_error("backend has no many-row prefill");
+    }
+    // Capped logits of one final-norm hidden row, equal to forward_rows' logits
+    // for that row. false = unsupported.
+    virtual bool head_logits(std::span<const float> hidden, std::vector<float>& logits) {
+        (void)hidden; (void)logits;
+        return false;
+    }
+    virtual std::unique_ptr<StreamState> create_stream() = 0;
+    virtual std::unique_ptr<StreamState> create_stream(std::uint32_t admitted_context) {
+        (void)admitted_context;
+        return create_stream();
+    }
+    [[nodiscard]] virtual const ModelConfig& config() const = 0;
+    [[nodiscard]] virtual strix::serve::Json identity() const = 0;
+    // Returns a resident read-only alias only for this exact host matrix.
+    // An empty result requests the explicit copy fallback.
+    [[nodiscard]] virtual LinearView resident_embedding(LinearView source) const {
+        (void)source;
+        return {};
+    }
+    [[nodiscard]] virtual LinearView resident_head(LinearView source) const {
+        return resident_embedding(source);
+    }
+};
+class DraftSession : public gemma4::DraftContext {
+public:
+    virtual std::array<std::uint32_t, 7> propose(std::uint32_t anchor, std::uint64_t position) = 0;
+    // Optional hooks for autoregressive drafters (e4b-eagle). Defaults keep DFlash behaviour and bytes unchanged.
+    // The admitted window k is known before drafting, because chained draft cost grows with depth.
+    virtual std::array<std::uint32_t, 7> propose_window(std::uint32_t anchor, std::uint64_t position, std::uint32_t k) {
+        (void)k;
+        return propose(anchor, position);
+    }
+    // Called once after creation with the request's own stream (drafters that read committed target KV).
+    virtual void attach(StreamState& state) { (void)state; }
+    // Request RowPlan::export_hidden on this stream's rows (post-final-norm tap, zero cost when false).
+    [[nodiscard]] virtual bool wants_hidden() const { return false; }
+    // true: a drafter whose cost grows per depth from a small base (MTP). Only such sessions are planned, probed
+    // or measured by the multi-stream auto policy; it still admits them only on their measured cost. Default
+    // false keeps DFlash (fixed block cost) C1-only exactly as before.
+    [[nodiscard]] virtual bool multi_stream_candidate() const { return false; }
+    // Committed rows plus the token that follows each row (prompt[j+1] in prefill, verdict.emitted[j] in decode)
+    // and, when wanted, their hidden rows. Same staging/publication protocol as stage().
+    virtual void stage_rows(std::span<const float> taps, std::span<const float> hidden,
+                            std::span<const std::uint32_t> next_tokens, std::span<const std::uint64_t> positions) {
+        (void)hidden;
+        (void)next_tokens;
+        stage(taps, positions);
+    }
+    // The coordinator stages accepted taps before target commit, then publishes
+    // draft context. Device sessions override these with C's atomic stage API.
+    virtual void stage(std::span<const float> taps, std::span<const std::uint64_t> positions) {
+        pending_taps_.assign(taps.begin(),taps.end());
+        pending_positions_.assign(positions.begin(),positions.end());
+    }
+    virtual void publish() { append(pending_taps_,pending_positions_); discard(); }
+    virtual void discard() noexcept { pending_taps_.clear(); pending_positions_.clear(); }
+private:
+    std::vector<float> pending_taps_;
+    std::vector<std::uint64_t> pending_positions_;
+};
+using DraftFactory = std::function<std::unique_ptr<DraftSession>()>;
+
+enum class DraftMode { off, on, automatic };
+struct Sampling {
+    float temperature = 0.0F, top_p = 1.0F;
+    std::uint32_t top_k = 0;
+    std::uint64_t seed = 0, draws = 0;
+    void validate() const;
+};
+// splitmix64-cdf-v1: state=seed+draws*0x9e3779b97f4a7c15; one 53-bit uniform
+// per sampled token. Descending capped logit, low-ID ties; top-k then top-p;
+// declared FP32 exp weights, FP64 ordered CDF. Greedy consumes no random draws.
+std::uint32_t select_token(std::span<const float> logits, const Sampling& sampling, std::uint64_t& draws);
+
+struct Request {
+    std::vector<std::uint32_t> prompt, stop_ids{1, 106};
+    std::size_t max_tokens = 256;
+    Sampling sampling;
+    DraftMode dflash = DraftMode::automatic;
+    std::uint32_t draft_k = 7;
+};
+[[nodiscard]] strix::serve::Json effective_config(const Backend& backend, const Request& request,
+    bool drafter_available, std::size_t streams = 1);
+// Private cost partition: identical model/assets and prompt. This is stricter
+// than pooling unrelated languages; the key is never published in receipts.
+[[nodiscard]] std::string measurement_key(const Backend& backend, const Request& request);
+enum class Status { running, stopped, length, cancelled, failed };
+struct Result {
+    Status status = Status::running;
+    std::vector<std::uint32_t> ids;
+    std::string error, digest; // digest is final on completion/cancellation; receipt() also supports live inspection
+    std::uint64_t frontier = 0, rng_draws = 0;
+    dflash::Acceptance acceptance;
+    double setup_ms = 0, prefill_ms = 0, decode_ms = 0, draft_ms = 0, context_ms = 0, verify_ms = 0, commit_ms = 0;
+    std::uint64_t target_calls = 0, target_rows = 0;
+    std::size_t peak_streams = 1;
+    std::array<std::uint64_t, 8> windows{};
+    std::uint64_t probes = 0;
+    std::uint64_t multistream_auto_cycles = 0, multistream_auto_proposals = 0;
+    std::uint32_t multistream_auto_max_window = 0; // largest auto window drafted while >1 stream was live
+};
+const char* status_name(Status status);
+
+// Evidence is separated by live-stream count and k, never extrapolated from C1
+// to C4. Full cycle times include drafting, target, context update and commit.
+class CostModel {
+public:
+    void observe(std::size_t streams, std::uint32_t k, double ms, std::size_t emitted,
+        std::uint64_t position = 0, const std::string& workload = {});
+    [[nodiscard]] std::uint32_t choose(std::size_t streams, std::uint32_t max_k,
+        std::uint64_t position = 0, const std::string& workload = {}) const;
+private:
+    struct Bin { double n = 0, time = 0, time2 = 0, tokens = 0, tokens2 = 0; };
+    std::map<std::string,std::array<std::array<Bin,8>,8>> bins_;
+};
+
+class Coordinator {
+public:
+    explicit Coordinator(Backend& backend, DraftFactory drafts = {}, std::shared_ptr<CostModel> costs = {});
+    ~Coordinator();
+    // A completed slot may be replaced; generation IDs never repeat after reuse.
+    std::size_t submit(Request request);
+    void cancel(std::size_t slot);
+    // At most one forward_rows call, with <=8 total causal/independent rows.
+    bool step();
+    void run();
+    [[nodiscard]] const Result& result(std::size_t slot) const;
+    [[nodiscard]] strix::serve::Json receipt(std::size_t slot) const;
+private:
+    struct Slot;
+    Backend& backend_;
+    DraftFactory drafts_;
+    std::shared_ptr<CostModel> costs_;
+    MultiStreamPolicy multi_;
+    std::vector<std::unique_ptr<Slot>> slots_;
+    std::uint64_t generation_ = 0, steps_ = 0;
+};
+
+} // namespace strix::gemma4::engine

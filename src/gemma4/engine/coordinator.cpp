@@ -1,0 +1,504 @@
+#include "coordinator.hpp"
+#include "strix/model_content_hash.hpp"
+
+#include <algorithm>
+#include <chrono>
+#include <cmath>
+#include <cstdlib>
+#include <numeric>
+#include <stdexcept>
+#ifdef __linux__
+#include <fstream>
+#include <sys/utsname.h>
+#endif
+
+namespace strix::gemma4::engine {
+namespace {
+using Clock = std::chrono::steady_clock;
+using Json = strix::serve::Json;
+double elapsed(Clock::time_point start) { return std::chrono::duration<double, std::milli>(Clock::now()-start).count(); }
+bool env_on(const char* name) { const auto* v = std::getenv(name); return !v || std::string(v) != "0"; }
+void require(bool ok, const char* message) { if (!ok) throw std::invalid_argument(message); }
+void add(dflash::Acceptance& a, const dflash::Acceptance& b) {
+    a.cycles += b.cycles; a.attempted += b.attempted; a.eligible += b.eligible;
+    a.accepted += b.accepted; a.emitted += b.emitted; a.all_accepted += b.all_accepted;
+    for (std::size_t i = 0; i < a.depth_eligible.size(); ++i) {
+        a.depth_eligible[i] += b.depth_eligible[i]; a.depth_accepted[i] += b.depth_accepted[i];
+    }
+    for (std::size_t i = 0; i < a.rejection_depth.size(); ++i) a.rejection_depth[i] += b.rejection_depth[i];
+}
+std::string cost_bucket(const std::string& workload, std::uint64_t position) {
+    const auto length = position < 512 ? 0 : position < 2048 ? 1 : position < 8192 ? 2 : position < 32768 ? 3 : 4;
+    return workload+":"+std::to_string(length);
+}
+}
+std::string measurement_key(const Backend& backend, const Request& request) {
+    strix::Sha256Fast hash;
+    const auto assets = backend.identity().dump();
+    hash.update(std::as_bytes(std::span(assets.data(),assets.size())));
+    hash.update(std::as_bytes(std::span(request.prompt)));
+    return strix::model_content_identity_hex(hash.finalize());
+}
+void Sampling::validate() const {
+    require(std::isfinite(temperature) && temperature >= 0 && std::isfinite(top_p) && top_p > 0 && top_p <= 1,
+            "invalid temperature/top_p");
+}
+std::uint32_t select_token(std::span<const float> logits, const Sampling& sampling, std::uint64_t& draws) {
+    sampling.validate();
+    require(!logits.empty() && logits.size() <= UINT32_MAX, "empty/oversized logits");
+    for (const auto x : logits) require(std::isfinite(x), "nonfinite target logits");
+    std::uint32_t best = 0;
+    for (std::uint32_t i = 1; i < logits.size(); ++i) if (better(logits[i],i,logits[best],best)) best = i;
+    if (sampling.temperature == 0) return best;
+    std::vector<std::uint32_t> order(logits.size());
+    std::iota(order.begin(),order.end(),0U);
+    std::sort(order.begin(),order.end(),[&](auto a, auto b) { return better(logits[a],a,logits[b],b); });
+    if (sampling.top_k && order.size() > sampling.top_k) order.resize(sampling.top_k);
+    std::vector<double> weights;
+    double sum = 0;
+    for (const auto id : order) {
+        const float delta = (logits[id]-logits[best])/sampling.temperature;
+        // Negative overflow is the zero-mass tail, never a nonfinite model value.
+        const double w = declared_exp(delta);
+        sum += w; weights.push_back(w);
+    }
+    std::size_t count = 0;
+    double retained = 0;
+    do { retained += weights[count++]; } while (count < weights.size() && retained < double(sampling.top_p)*sum);
+    std::uint64_t z = sampling.seed + (++draws)*UINT64_C(0x9e3779b97f4a7c15);
+    z = (z^(z>>30U))*UINT64_C(0xbf58476d1ce4e5b9);
+    z = (z^(z>>27U))*UINT64_C(0x94d049bb133111eb);
+    z ^= z>>31U;
+    const double threshold = double(z>>11U)*0x1p-53*retained;
+    double cdf = 0;
+    for (std::size_t i = 0; i < count; ++i) { cdf += weights[i]; if (threshold < cdf) return order[i]; }
+    return order[count-1];
+}
+const char* status_name(Status s) {
+    switch (s) {
+    case Status::running: return "running";
+    case Status::stopped: return "stop";
+    case Status::length: return "length";
+    case Status::cancelled: return "cancelled";
+    case Status::failed: return "error";
+    }
+    return "error";
+}
+Json effective_config(const Backend& backend, const Request& request, bool drafter_available, std::size_t streams) {
+    auto j = backend.identity();
+    const auto* identity = j.find("identity");
+    j.set("decode_identity",identity ? *identity : Json(arithmetic_id)); j.set("prefill_identity","prefill-exact"); j.set("row_cap",8);
+    j.set("sampling_identity","splitmix64-cdf-v1"); j.set("temperature",double(request.sampling.temperature));
+    j.set("top_p",double(request.sampling.top_p)); j.set("top_k",std::uint64_t(request.sampling.top_k)); j.set("seed",request.sampling.seed);
+    j.set("max_tokens",std::uint64_t(request.max_tokens)); j.set("draft_k_max",std::uint64_t(request.draft_k)); j.set("streams",std::uint64_t(streams));
+    auto stops = Json::array(); for (const auto id : request.stop_ids) stops.push(std::uint64_t(id));
+    j.set("stop_ids",stops);
+    j.set("dflash_requested",request.dflash == DraftMode::on ? "on" : request.dflash == DraftMode::off ? "off" : "auto");
+    const bool enabled = dflash::enabled_from_environment();
+    const auto* environment = std::getenv("STRIX_G4_DFLASH");
+    const bool forced = environment && std::string(environment) == "on" && request.dflash == DraftMode::automatic;
+    j.set("dflash_admission",!enabled ? "environment-off" : request.sampling.temperature != 0 ? "serial-sampling" :
+        request.dflash == DraftMode::off ? "request-off" : !drafter_available ? "no-drafter" :
+        request.dflash == DraftMode::on || forced ? "explicit-bounded-window" : "measured-conservative-auto");
+    auto switches = j.find("off_switches") ? Json(j.find("off_switches")->as_object()) : Json::object();
+    switches.set("STRIX_G4_DFLASH",enabled);
+    const auto multi = MultiStreamConfig::from_environment();
+    switches.set("STRIX_G4_DRAFT_MULTI",multi.enabled);
+    if (!switches.find("STRIX_G4_TOKENIZER_HEAP")) switches.set("STRIX_G4_TOKENIZER_HEAP",env_on("STRIX_G4_TOKENIZER_HEAP"));
+    j.set("off_switches",switches);
+    j.set("auto_policy",multi.enabled ?
+        "stream-survival-cost-v1; C1 length bins; Beta(1,2) minus one posterior SD; decay 0.98; measured cycle upper/plain lower; >=5% gain; bounded calibration probes; "
+        "C2..C8 multi-stream-batch-v1: window <= max_k for per-depth-cost drafters (MTP; DFlash C1-only) under max_draft_share, measured batch step upper/plain lower per (C, draft rows), >= min_gain" :
+        "stream-survival-cost-v1; C1 length bins; Beta(1,2) minus one posterior SD; decay 0.98; measured cycle upper/plain lower; >=5% gain; bounded calibration probes; C2..C8 plain");
+    if (multi.enabled) j.set("multi_stream_policy",multi.json());
+    j.set("dflash_environment",environment ? environment : "unset");
+    j.set("qualification","per profile: see profile.levers (ready rows applied, pending rows listed)");
+#ifdef __linux__
+    utsname system{};
+    j.set("kernel",uname(&system) == 0 ? system.release : "unavailable");
+    std::string perfopt;
+    std::ifstream parameter("/sys/module/amdgpu/parameters/iommu_perfopt");
+    j.set("amdgpu.iommu_perfopt",parameter >> perfopt ? perfopt : "not-present");
+#endif
+    return j;
+}
+void CostModel::observe(std::size_t streams, std::uint32_t k, double ms, std::size_t emitted, std::uint64_t position, const std::string& workload) {
+    require(streams >= 1 && streams <= 8 && k <= 7 && std::isfinite(ms) && ms > 0 && emitted > 0, "invalid cycle observation");
+    // Bound retained evidence in a long-lived service. Eviction only forces
+    // conservative remeasurement; it cannot change the verified output.
+    const auto key = cost_bucket(workload,position);
+    if (!bins_.contains(key) && bins_.size() >= 128) bins_.erase(bins_.begin());
+    auto& b = bins_[key][streams-1][k];
+    b.n += 1; b.time += ms; b.time2 += ms*ms;
+    const double t = double(emitted); b.tokens += t; b.tokens2 += t*t;
+}
+std::uint32_t CostModel::choose(std::size_t streams, std::uint32_t max_k, std::uint64_t position, const std::string& workload) const {
+    require(streams >= 1 && streams <= 8 && max_k <= 7, "invalid cost-model bucket");
+    const auto found = bins_.find(cost_bucket(workload,position));
+    if (found == bins_.end()) return 0;
+    const auto& bins = found->second[streams-1];
+    const auto bound = [](const Bin& b, bool tokens, bool upper) {
+        const double sum = tokens ? b.tokens : b.time, square = tokens ? b.tokens2 : b.time2;
+        const double mean = sum/b.n, error = 2*std::sqrt(std::max(0.0,square/b.n-mean*mean)/b.n);
+        return upper ? mean+error : std::max(0.0,mean-error);
+    };
+    if (bins[0].n < 4) return 0;
+    const double plain_time = bound(bins[0],false,false);
+    if (plain_time <= 0) return 0;
+    double best = 1.05*bound(bins[0],true,true)/plain_time;
+    std::uint32_t chosen = 0;
+    for (std::uint32_t k = 1; k <= max_k; ++k) if (bins[k].n >= 4) {
+        const double rate = bound(bins[k],true,false)/bound(bins[k],false,true);
+        if (rate > best) { best = rate; chosen = k; }
+    }
+    return chosen;
+}
+struct Coordinator::Slot {
+    Request request;
+    Result out;
+    std::unique_ptr<StreamState> state;
+    std::unique_ptr<DraftSession> draft;
+    std::size_t prompt_processed = 0;
+    std::uint64_t generation = 0;
+    bool dflash_enabled = false;
+    std::string workload;
+    AutoPolicy policy;
+    std::array<std::uint64_t,8> admitted{};
+    double minimum_gain = 0;
+};
+Coordinator::Coordinator(Backend& backend, DraftFactory drafts, std::shared_ptr<CostModel> costs)
+    : backend_(backend), drafts_(std::move(drafts)), costs_(costs ? std::move(costs) : std::make_shared<CostModel>()) {}
+Coordinator::~Coordinator() = default;
+std::size_t Coordinator::submit(Request r) {
+    const auto setup_start = Clock::now();
+    const auto& c = backend_.config();
+    r.sampling.validate();
+    const auto* environment = std::getenv("STRIX_G4_DFLASH");
+    if (environment && std::string(environment) == "on" && r.dflash == DraftMode::automatic) r.dflash = DraftMode::on;
+    require(!r.prompt.empty() && r.max_tokens > 0 && r.draft_k <= 7, "invalid prompt/max_tokens/draft_k");
+    require(r.prompt.size() <= c.max_positions && r.max_tokens <= c.max_positions-r.prompt.size(), "request exceeds context capacity");
+    for (const auto id : r.prompt) require(id < c.vocab, "prompt token outside vocabulary");
+    std::size_t slot = 0;
+    while (slot < slots_.size() && slots_[slot]->out.status == Status::running) ++slot;
+    require(slot < 8, "at most eight live streams");
+    auto s = std::make_unique<Slot>();
+    s->request = std::move(r);
+    // Return a completed/cancelled lease before acquiring the replacement.
+    // Receipts retain their values; no live transaction crosses this boundary.
+    if (slot < slots_.size()) slots_[slot]->draft.reset();
+    s->state = backend_.create_stream(std::uint32_t(s->request.prompt.size()+s->request.max_tokens));
+    s->generation = ++generation_;
+    require(bool(s->state) && s->state->frontier() == 0, "backend must provide a fresh stream");
+    s->out.digest = s->state->digest();
+    s->workload = measurement_key(backend_,s->request);
+    s->out.rng_draws = s->request.sampling.draws;
+    s->dflash_enabled = dflash::enabled_from_environment();
+    if (s->dflash_enabled && s->request.dflash != DraftMode::off && drafts_ && s->request.sampling.temperature == 0)
+        s->draft = drafts_();
+    if (s->draft) s->draft->attach(*s->state);
+    if (s->request.dflash == DraftMode::on && s->dflash_enabled && s->request.sampling.temperature == 0)
+        require(bool(s->draft), "DFlash on requires a drafter");
+    s->out.setup_ms = elapsed(setup_start);
+    if (slot == slots_.size()) slots_.push_back(std::move(s)); else slots_[slot] = std::move(s);
+    return slot;
+}
+void Coordinator::cancel(std::size_t slot) {
+    auto& s = *slots_.at(slot);
+    if (s.out.status == Status::running) {
+        if (s.draft) s.draft->discard();
+        s.out.status = Status::cancelled; s.out.digest = s.state->digest();
+    }
+}
+const Result& Coordinator::result(std::size_t slot) const { return slots_.at(slot)->out; }
+bool Coordinator::step() {
+    struct Work {
+        std::size_t slot = 0, start = 0, rows = 1;
+        bool prefill = false;
+        std::uint32_t k = 0;
+        WindowDecision decision;
+        dflash::Acceptance delta;
+        double draft_ms = 0, context_ms = 0;
+        std::array<std::uint32_t,7> proposals{};
+        std::unique_ptr<KvTxn> tx;
+    };
+    std::vector<Work> work;
+    std::vector<RowPlan> plans;
+    std::size_t live = 0;
+    for (const auto& s : slots_) if (s->out.status == Status::running) ++live;
+    if (!live) return false;
+    const auto start = Clock::now();
+    ++steps_;
+    // Multi-stream: a whole-batch plan when >1 stream is live, every live stream decodes and none is forced on. Mixed
+    // prefill/forced steps stay plain for auto (as before) and are not batch evidence.
+    bool batch = false;
+    BatchPlan plan;
+    if (live > 1 && multi_.config().enabled) {
+        batch = true;
+        std::vector<StreamCandidate> candidates;
+        for (const auto& p : slots_) {
+            const auto& s = *p;
+            if (s.out.status != Status::running) continue;
+            if (s.prompt_processed+1 < s.request.prompt.size() || s.request.dflash == DraftMode::on) { batch = false; break; }
+            StreamCandidate c;
+            c.position = s.state->frontier();
+            const auto budget = s.request.max_tokens-s.out.ids.size();
+            if (s.draft && s.draft->multi_stream_candidate() && s.request.dflash == DraftMode::automatic && s.dflash_enabled &&
+                s.request.sampling.temperature == 0 && c.position+7 < backend_.config().max_positions) {
+                c.policy = &s.policy;
+                c.limit = std::min({s.request.draft_k,std::uint32_t(7),std::uint32_t(std::min<std::size_t>(7,budget-1))});
+            }
+            candidates.push_back(c);
+        }
+        if (batch) plan = multi_.choose(candidates);
+    }
+    try {
+        // Exact many-row prefill: a stream with more than one pass of prompt
+        // rows left prefills one chunk (ending on a chunk multiple) on its own.
+        // Committed KV and taps equal the eight-row passes; the drafter receives
+        // the same rows in groups of at most eight.
+        std::vector<bool> prefilled(slots_.size(), false);
+        std::size_t rowed = live; // streams left for this step's forward_rows pass
+        if (const auto chunk = backend_.prefill_chunk_rows()) {
+            for (std::size_t i = 0; i < slots_.size(); ++i) {
+                auto& s = *slots_[i];
+                if (s.out.status != Status::running || s.prompt_processed+1+8 >= s.request.prompt.size()) continue;
+                s.out.peak_streams = std::max(s.out.peak_streams,live);
+                const auto begin = Clock::now();
+                auto tx = s.state->begin();
+                const auto position = tx->frontier();
+                const auto n = std::min<std::size_t>(s.request.prompt.size()-1-s.prompt_processed, chunk-position%chunk);
+                const bool hidden = s.draft && s.draft->wants_hidden();
+                const auto rows = backend_.prefill_rows(*tx,{s.request.prompt.data()+s.prompt_processed,n},hidden);
+                const auto width = std::size_t(backend_.config().hidden);
+                require(rows.tap_width == 5*width && rows.taps.size() == n*rows.tap_width &&
+                    (!hidden || rows.hidden.size() == n*width), "invalid backend prefill layout");
+                for (const auto x : rows.taps) require(std::isfinite(x), "nonfinite backend taps");
+                std::size_t staged = 0;
+                const auto stage = [&] {
+                    const auto first = staged, count = std::min<std::size_t>(8,n-first);
+                    std::vector<std::uint64_t> positions;
+                    std::vector<std::uint32_t> next;
+                    for (std::size_t r = first; r < first+count; ++r) {
+                        positions.push_back(position+r);
+                        next.push_back(s.request.prompt[s.prompt_processed+r+1]);
+                    }
+                    s.draft->stage_rows({rows.taps.data()+first*rows.tap_width,count*rows.tap_width},
+                        hidden ? std::span<const float>(rows.hidden.data()+first*width,count*width) : std::span<const float>{},
+                        next,positions);
+                    staged += count;
+                };
+                double context_ms = 0;
+                if (s.draft) { const auto t = Clock::now(); stage(); context_ms += elapsed(t); }
+                const auto commit_start = Clock::now();
+                tx->commit(n);
+                tx.reset();
+                s.out.commit_ms += elapsed(commit_start);
+                if (s.draft) {
+                    const auto t = Clock::now();
+                    s.draft->publish();
+                    while (staged < n) { stage(); s.draft->publish(); }
+                    context_ms += elapsed(t);
+                }
+                s.out.context_ms += context_ms;
+                ++s.out.target_calls; s.out.target_rows += n;
+                s.out.frontier = s.state->frontier();
+                s.prompt_processed += n;
+                s.out.prefill_ms += elapsed(begin);
+                prefilled[i] = true;
+                --rowed;
+            }
+            if (!rowed) return true;
+        }
+        std::size_t remaining = 8, pending = rowed, index = 0;
+        for (std::size_t i = 0; i < slots_.size(); ++i) {
+            auto& s = *slots_[i];
+            if (s.out.status != Status::running || prefilled[i]) continue;
+            s.out.peak_streams = std::max(s.out.peak_streams,live);
+            Work w; w.slot = i; w.start = plans.size(); w.tx = s.state->begin();
+            const auto position = w.tx->frontier();
+            const auto capacity = remaining-(--pending);
+            w.prefill = s.prompt_processed+1 < s.request.prompt.size();
+            if (w.prefill) {
+                w.rows = std::min(capacity,s.request.prompt.size()-1-s.prompt_processed);
+            } else {
+                const auto budget = s.request.max_tokens-s.out.ids.size();
+                std::uint32_t k = 0;
+                if (s.draft) {
+                    const auto limit = std::min({s.request.draft_k,std::uint32_t(capacity-1),
+                        std::uint32_t(std::min<std::size_t>(7,budget-1))});
+                    // Multi-stream auto remains plain until a whole-batch estimator is
+                    // available; independent per-stream rates cannot qualify batch gains.
+                    if (s.request.dflash == DraftMode::on) k = limit;
+                    else if (live == 1) { w.decision = s.policy.choose(limit,position); k = w.decision.k; }
+                    // Multi-stream: >1 live stream -> only the batch plan (k <= max_k; 0 for DFlash or when it loses).
+                    else if (batch && plan.k[index]) {
+                        k = std::min(plan.k[index],limit);
+                        w.decision = {k,plan.probe,k ? s.policy.expected_tokens(position,k) : 1,plan.cost_ms,plan.gain};
+                    }
+                }
+                k = dflash::admit_window(k,position,budget,s.dflash_enabled,
+                    s.request.sampling.temperature != 0);
+                if (position+7 >= backend_.config().max_positions) k = 0;
+                w.k = k; w.rows = k+1;
+                if (k) {
+                    const auto begin = Clock::now();
+                    try { w.proposals = s.draft->propose_window(s.out.ids.empty() ? s.request.prompt.back() : s.out.ids.back(),position,k); }
+                    catch (...) { s.out.draft_ms += elapsed(begin); throw; }
+                    w.draft_ms = elapsed(begin); s.out.draft_ms += w.draft_ms;
+                    for (const auto id : w.proposals) require(id < backend_.config().vocab, "draft token outside vocabulary");
+                }
+            }
+            const bool hidden = s.draft && s.draft->wants_hidden();
+            for (std::size_t r = 0; r < w.rows; ++r) {
+                const auto token = w.prefill ? s.request.prompt[s.prompt_processed+r] :
+                    (r ? w.proposals[r-1] : (s.out.ids.empty() ? s.request.prompt.back() : s.out.ids.back()));
+                plans.push_back({i,s.generation,position+r,token,w.tx.get(),plans.size(),true,hidden});
+            }
+            remaining -= w.rows;
+            ++index;
+            work.push_back(std::move(w));
+        }
+        const auto target_start = Clock::now();
+        const auto out = backend_.forward_rows(plans);
+        const auto verify_ms = elapsed(target_start);
+        require(out.rows == plans.size() && out.vocab == backend_.config().vocab &&
+            out.logits.size() == out.rows*out.vocab && out.tap_width == 5*backend_.config().hidden &&
+            out.taps.size() == out.rows*out.tap_width, "invalid backend result layout");
+        for (const auto x : out.logits) require(std::isfinite(x), "nonfinite backend logits");
+        for (const auto x : out.taps) require(std::isfinite(x), "nonfinite backend taps");
+        const bool any_hidden = std::any_of(plans.begin(),plans.end(),[](const RowPlan& p) { return p.export_hidden; });
+        require(!any_hidden || out.hidden.size() == out.rows*backend_.config().hidden, "missing exported hidden rows");
+        for (auto& w : work) {
+            auto& s = *slots_[w.slot];
+            std::size_t processed = w.rows;
+            dflash::Verdict verdict;
+            if (!w.prefill) {
+                std::vector<std::uint32_t> selected;
+                for (std::size_t r = 0; r < w.rows; ++r)
+                    selected.push_back(select_token({out.logits.data()+(w.start+r)*out.vocab,out.vocab},s.request.sampling,s.out.rng_draws));
+                verdict = dflash::verify_greedy({w.proposals.data(),w.k},selected,
+                    s.request.max_tokens-s.out.ids.size(),s.request.stop_ids,&w.delta);
+                processed = verdict.processed;
+            }
+            if (s.draft) {
+                const auto begin = Clock::now();
+                std::vector<std::uint64_t> positions;
+                for (std::size_t r = 0; r < processed; ++r) positions.push_back(plans[w.start+r].position);
+                // The token that follows each committed row. Prefill windows cover prompt[0..n-2] only (the
+                // last prompt token is the first decode anchor, never a prefill row), so prompt_processed+r+1 <= n-1.
+                // The first EMITTED token follows the anchor row and is staged by that decode cycle (verdict.emitted).
+                std::vector<std::uint32_t> next;
+                if (w.prefill) for (std::size_t r = 0; r < processed; ++r) {
+                    require(s.prompt_processed+r+1 < s.request.prompt.size(), "prefill row has no following prompt token");
+                    next.push_back(s.request.prompt[s.prompt_processed+r+1]);
+                }
+                else next.assign(verdict.emitted.begin(),verdict.emitted.begin()+std::ptrdiff_t(processed));
+                const auto width = std::size_t(backend_.config().hidden);
+                const std::span<const float> hidden = s.draft->wants_hidden() ?
+                    std::span<const float>(out.hidden.data()+w.start*width,processed*width) : std::span<const float>{};
+                s.draft->stage_rows({out.taps.data()+w.start*out.tap_width,processed*out.tap_width},hidden,next,positions);
+                w.context_ms += elapsed(begin);
+            }
+            const auto commit_start = Clock::now();
+            w.tx->commit(processed);
+            w.tx.reset();
+            s.out.commit_ms += elapsed(commit_start);
+            if (s.draft) {
+                const auto begin = Clock::now();
+                s.draft->publish();
+                w.context_ms += elapsed(begin); s.out.context_ms += w.context_ms;
+            }
+            // As in the device cycle helper, statistics/output become visible
+            // only after both target and draft publications have succeeded.
+            if (!w.prefill) add(s.out.acceptance,w.delta);
+            ++s.out.target_calls; s.out.target_rows += w.rows;
+            s.out.frontier = s.state->frontier();
+            if (w.prefill) s.prompt_processed += processed;
+            else {
+                s.out.ids.insert(s.out.ids.end(),verdict.emitted.begin(),verdict.emitted.end());
+                ++s.out.windows[w.k];
+                if (live > 1 && s.request.dflash == DraftMode::automatic) {
+                    ++s.out.multistream_auto_cycles;
+                    s.out.multistream_auto_proposals += w.k;
+                    s.out.multistream_auto_max_window = std::max(s.out.multistream_auto_max_window,w.k);
+                }
+                s.out.probes += w.k && w.decision.probe ? 1 : 0;
+                if (w.k && s.request.dflash == DraftMode::automatic && !w.decision.probe) {
+                    ++s.admitted[w.k];
+                    s.minimum_gain = s.minimum_gain > 0 ? std::min(s.minimum_gain,w.decision.gain) : w.decision.gain;
+                }
+                s.out.verify_ms += verify_ms;
+                if (verdict.stopped) s.out.status = Status::stopped;
+                else if (s.out.ids.size() == s.request.max_tokens) s.out.status = Status::length;
+            }
+        }
+        const double ms = elapsed(start);
+        for (const auto& w : work) {
+            auto& s = *slots_[w.slot];
+            if (w.prefill) s.out.prefill_ms += ms; else s.out.decode_ms += ms;
+        }
+        // Only complete C1 cycles qualify auto. Diagnostic state hashing is
+        // outside decode timing and runs once at completion/cancellation.
+        if (work.size() == 1 && !work[0].prefill) {
+            const auto& w = work[0]; auto& s = *slots_[w.slot];
+            costs_->observe(1,w.k,ms,std::size_t(s.out.frontier-plans[w.start].position),plans[w.start].position,s.workload);
+            if (s.draft) s.policy.observe(plans[w.start].position,w.k,ms,w.draft_ms,verify_ms,w.context_ms,w.delta,w.k && w.decision.probe);
+        }
+        // Multi-stream: complete all-decode C>1 steps are whole-batch evidence; drafted streams add acceptance/draft cost.
+        if (batch && work.size() == live) {
+            std::uint32_t extra = 0;
+            for (const auto& w : work) {
+                extra += w.k;
+                if (w.k) slots_[w.slot]->policy.observe_multi(plans[w.start].position,w.k,w.draft_ms,w.delta);
+            }
+            multi_.observe(live,extra,ms,plan.probe);
+        }
+        for (const auto& w : work) {
+            auto& s = *slots_[w.slot];
+            if (s.out.status != Status::running) s.out.digest = s.state->digest();
+        }
+    } catch (const std::exception& e) {
+        // Publication/append failure invalidates affected requests. Never resume
+        // a target whose committed frontier and drafter context might disagree.
+        for (auto& s : slots_) {
+            if (s->draft) s->draft->discard();
+            if (s->out.status != Status::running) continue;
+            s->out.status = Status::failed; s->out.error = e.what();
+            s->out.frontier = s->state->frontier(); s->out.digest = s->state->digest();
+        }
+    }
+    return true;
+}
+void Coordinator::run() { while (step()) {} }
+Json Coordinator::receipt(std::size_t slot) const {
+    const auto& s = *slots_.at(slot); const auto& r = s.out;
+    Json j = effective_config(backend_,s.request,bool(drafts_),r.peak_streams), acceptance = Json::object(), timings = Json::object();
+    j.set("rng_draws",r.rng_draws);
+    auto switches = Json(j.find("off_switches")->as_object());
+    switches.set("STRIX_G4_DFLASH",s.dflash_enabled);
+    j.set("off_switches",switches); j.set("finish_reason",status_name(r.status)); j.set("frontier",r.frontier);
+    j.set("state_digest",r.status == Status::running ? s.state->digest() : r.digest);
+    j.set("target_calls",r.target_calls); j.set("target_rows",r.target_rows);
+    const auto& a = r.acceptance;
+    acceptance.set("cycles",a.cycles); acceptance.set("attempted",a.attempted); acceptance.set("eligible",a.eligible);
+    acceptance.set("accepted",a.accepted); acceptance.set("emitted",a.emitted); acceptance.set("all_accepted",a.all_accepted);
+    const auto array = [](const auto& values) { Json v = Json::array(); for (const auto n : values) v.push(n); return v; };
+    acceptance.set("depth_eligible",array(a.depth_eligible)); acceptance.set("depth_accepted",array(a.depth_accepted));
+    acceptance.set("rejection_depth",array(a.rejection_depth)); acceptance.set("windows",array(r.windows));
+    acceptance.set("calibration_probes",r.probes); acceptance.set("auto_admitted_windows",array(s.admitted));
+    acceptance.set("multistream_auto_cycles",r.multistream_auto_cycles);
+    acceptance.set("multistream_auto_proposals",r.multistream_auto_proposals);
+    acceptance.set("multistream_auto_max_window",std::uint64_t(r.multistream_auto_max_window));
+    j.set("minimum_admitted_gain_estimate",s.minimum_gain);
+    j.set("auto_evidence",s.policy.receipt());
+    if (multi_.config().enabled) j.set("multistream_evidence",multi_.receipt());
+    j.set("acceptance",acceptance);
+    timings.set("prefill_ms",r.prefill_ms); timings.set("decode_ms",r.decode_ms); timings.set("draft_ms",r.draft_ms); timings.set("context_ms",r.context_ms);
+    timings.set("verify_ms",r.verify_ms); timings.set("commit_ms",r.commit_ms);
+    timings.set("session_setup_ms",r.setup_ms);
+    timings.set("state_hash_scope","completion/cancellation or explicit receipt; outside decode_ms");
+    j.set("timings",timings);
+    if (!r.error.empty()) j.set("error",r.error);
+    return j;
+}
+} // namespace strix::gemma4::engine
