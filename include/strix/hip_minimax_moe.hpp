@@ -2,6 +2,7 @@
 // minimax-m3 fused post-exchange kernel (gfx1151): residual + part0 + part1, Gemma norm, optional router top-4.
 // Equals strix/minimax_moe.hpp (post_exchange_row, route_row) bit for bit. One 256-thread block per row; rows are
 // independent (batch invariance). No inter-block flags: completion is the kernel boundary on the stream.
+#include <cstddef>
 #include <cstdint>
 
 #include <hip/hip_runtime.h>
@@ -40,5 +41,10 @@ void enqueue_post_exchange(const PostExchangeView& v, hipStream_t stream);
 // Routes normalized global y only; batch_rows is 4 or 8. Tail rows are masked.
 void enqueue_router_batch(std::uint32_t rows, const float* y, const float* router_w, const float* bias,
                           std::uint32_t* ids, float* weights, unsigned batch_rows, hipStream_t stream);
+// The same routes with the router weights read once per 32 rows (tiled scores, then the same selection); scratch holds
+// router_tiled_scratch_floats(rows) floats of device memory.
+inline constexpr std::size_t router_tiled_scratch_floats(std::uint32_t rows) { return std::size_t{rows} * 2 * kExperts; }
+void enqueue_router_tiled(std::uint32_t rows, const float* y, const float* router_w, const float* bias,
+                          std::uint32_t* ids, float* weights, float* scratch, hipStream_t stream);
 
 }  // namespace strix::minimax::moe::hip

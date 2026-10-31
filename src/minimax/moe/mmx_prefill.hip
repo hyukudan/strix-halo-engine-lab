@@ -9,6 +9,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <mutex>
 #include <stdexcept>
 #include <string>
 
@@ -210,6 +211,41 @@ __global__ __launch_bounds__(256) void gather_transform_tiled_kernel(const float
     for (int j = 0; j < 4; ++j) out[tiled_at(R, b * 128U + lane + 32U * static_cast<unsigned>(j), kHidden)] = static_cast<_Float16>(v[j]);
 }
 
+// v4, token-major: one wave = one (token, 128-block). It reads the token's fp32 block once and runs
+// gather_transform_tiled_kernel's per-(pair, matrix) statements for the token's 4 routed pairs and its shared pair, gate
+// then up. Same values, same stores (padded rows untouched); the input block is read once instead of 10 times.
+__global__ __launch_bounds__(256) void gather_transform_token_kernel(const float* y, Tables t) {
+    const unsigned wave = threadIdx.x >> 5U, lane = threadIdx.x & 31U;
+    const unsigned q = blockIdx.x * 8U + wave;
+    if (q >= t.rows * kHB) return;
+    const unsigned tok = q / kHB, b = q % kHB;
+    const float* x = y + static_cast<std::size_t>(tok) * kHidden;
+    float xv[4];
+#pragma unroll
+    for (int j = 0; j < 4; ++j) xv[j] = x[b * 128U + lane + 32U * static_cast<unsigned>(j)];
+#pragma unroll 1
+    for (unsigned k = 0; k <= kTopE; ++k) {
+        const unsigned p = k < kTopE ? t.tok_pair[tok * kTopE + k] : t.groups[t.shared_group].pair_begin + tok;
+        const PGroup& g = t.groups[t.pair_group[p]];
+        const unsigned R = g.tbegin + (p - g.pair_begin);
+#pragma unroll
+        for (unsigned m = 0; m < 2; ++m) {
+            const std::uint16_t* suh = m == 0 ? g.w.gate.suh : g.w.up.suh;
+            float v[4];
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                const unsigned c = b * 128U + lane + 32U * static_cast<unsigned>(j);
+                const float scaled = d::materialize(xv[j] * d::half_bits(suh[c]));
+                v[j] = static_cast<float>(static_cast<_Float16>(scaled));
+            }
+            d::hadamard128(v, lane);
+            _Float16* out = t.xt + static_cast<std::size_t>(m) * t.tpairs * kHidden;
+#pragma unroll
+            for (int j = 0; j < 4; ++j) out[tiled_at(R, b * 128U + lane + 32U * static_cast<unsigned>(j), kHidden)] = static_cast<_Float16>(v[j]);
+        }
+    }
+}
+
 __device__ __forceinline__ float swiglu(float g, float u) {  // tests/minimax_gate_common.hpp swiglu_kernel
     const float gg = g < kLimit ? g : kLimit;
     const float uu = u < -kLimit ? -kLimit : (u > kLimit ? kLimit : u);
@@ -383,6 +419,60 @@ __global__ __launch_bounds__(256) void down_combine_kernel(Tables t, float* out)
 #pragma unroll
     for (int j = 0; j < 4; ++j)
         out[static_cast<std::size_t>(tok) * kHidden + b * 128 + lane + 32U * static_cast<unsigned>(j)] = acc[j] + v[j];
+}
+
+// Dense prefill linears on the v4 core (enqueue_prefill_dense): the library input transform, row-major x -> tile-major
+// f16 per job (transform_block's statements, one x read for every job), and the library output transform per job.
+struct DenseArgs {
+    const std::uint16_t* suh[kMaxDenseJobs];
+    const std::uint16_t* svh[kMaxDenseJobs];
+    _Float16* xt[kMaxDenseJobs];
+    const float* part[kMaxDenseJobs];
+    float* out[kMaxDenseJobs];
+    unsigned n[kMaxDenseJobs], splits[kMaxDenseJobs];
+    unsigned count, rows, k;
+};
+
+__global__ __launch_bounds__(256) void dense_transform_kernel(const float* x, DenseArgs a) {
+    const unsigned wave = threadIdx.x >> 5U, lane = threadIdx.x & 31U;
+    const unsigned q = blockIdx.x * 8U + wave, kb = a.k / 128U;
+    if (q >= a.rows * kb) return;
+    const unsigned row = q / kb, b = q % kb;
+    const float* xr = x + static_cast<std::size_t>(row) * a.k;
+    float xv[4];
+#pragma unroll
+    for (int j = 0; j < 4; ++j) xv[j] = xr[b * 128U + lane + 32U * static_cast<unsigned>(j)];
+#pragma unroll 1
+    for (unsigned m = 0; m < a.count; ++m) {
+        float v[4];
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const unsigned c = b * 128U + lane + 32U * static_cast<unsigned>(j);
+            const float scaled = d::materialize(xv[j] * d::half_bits(a.suh[m][c]));
+            v[j] = static_cast<float>(static_cast<_Float16>(scaled));
+        }
+        d::hadamard128(v, lane);
+#pragma unroll
+        for (int j = 0; j < 4; ++j)
+            a.xt[m][tiled_at(row, b * 128U + lane + 32U * static_cast<unsigned>(j), a.k)] = static_cast<_Float16>(v[j]);
+    }
+}
+
+__global__ __launch_bounds__(256) void dense_finish_kernel(DenseArgs a) {
+    const unsigned wave = threadIdx.x >> 5U, lane = threadIdx.x & 31U;
+    unsigned q = blockIdx.x * 8U + wave, m = 0;
+    for (; m < a.count; ++m) {  // job m owns rows * n / 128 consecutive waves
+        const unsigned w = a.rows * (a.n[m] / 128U);
+        if (q < w) break;
+        q -= w;
+    }
+    if (m == a.count) return;
+    const unsigned nb = a.n[m] / 128U, row = q / nb, b = q % nb;
+    float v[4];
+    finish_block(a.part[m], a.splits[m], a.rows, row, a.n[m], b, a.svh[m], lane, v);
+#pragma unroll
+    for (int j = 0; j < 4; ++j)
+        a.out[m][static_cast<std::size_t>(row) * a.n[m] + b * 128U + lane + 32U * static_cast<unsigned>(j)] = v[j];
 }
 
 void launched(const char* what) {
@@ -562,6 +652,7 @@ int g_mtfit_override = -1;
 int g_core8_override = -1;
 int g_pipe_override = -1;
 int g_gufuse_override = -1;
+int g_gather_tok_override = -1;
 bool g_gufuse_debug = false;
 bool g_gufuse_producer_only = false;
 float* g_gufuse_intermediates = nullptr;
@@ -630,6 +721,19 @@ bool prefill_gufuse_default() {
     return on;
 }
 bool prefill_gufuse() { return g_gufuse_override < 0 ? prefill_gufuse_default() : g_gufuse_override != 0; }
+
+// STRIX_MMX_PREFILL_GATHER_TOK: 1 (default) = v4 gather in token-major order (gather_transform_token_kernel),
+// 0 = one wave per (pair, matrix, block). Same values and stores.
+bool prefill_gather_tok_default() {
+    static const bool on = [] {
+        const char* e = std::getenv("STRIX_MMX_PREFILL_GATHER_TOK");
+        if (e == nullptr || std::string(e) == "1") return true;
+        if (std::string(e) == "0") return false;
+        throw std::invalid_argument("STRIX_MMX_PREFILL_GATHER_TOK must be 0 or 1");
+    }();
+    return on;
+}
+bool prefill_gather_tok() { return g_gather_tok_override < 0 ? prefill_gather_tok_default() : g_gather_tok_override != 0; }
 
 // Gate/up and down lists: v4 classes are MT - 1; older cores retain the four power-of-two classes.
 struct V2Items {
@@ -873,6 +977,11 @@ void set_prefill_gufuse(int on) {
     (void)prefill_gufuse_default();
     g_gufuse_override = on;
 }
+void set_prefill_gather_tok(int on) {
+    if (on < -1 || on > 1) throw std::invalid_argument("set_prefill_gather_tok: value must be -1, 0 or 1");
+    (void)prefill_gather_tok_default();
+    g_gather_tok_override = on;
+}
 void set_prefill_gufuse_debug(bool on, float* intermediates, bool producer_only) {
     g_gufuse_debug = on || producer_only;
     g_gufuse_intermediates = intermediates;
@@ -987,7 +1096,8 @@ void enqueue_prefill_moe(const PrefillMoeView& v, void* workspace, std::size_t w
     const auto n_gu = static_cast<unsigned>(p.gu_items.size()), n16 = static_cast<unsigned>(p.dn_items16.size()),
                n64 = static_cast<unsigned>(p.dn_items64.size());
     mark("start", stream);
-    if (tiled) hipLaunchKernelGGL(gather_transform_tiled_kernel, dim3((t.pairs * 2 * kHB + 7) / 8), dim3(256), 0, stream, v.y, t);
+    if (tiled && prefill_gather_tok()) hipLaunchKernelGGL(gather_transform_token_kernel, dim3((v.rows * kHB + 7) / 8), dim3(256), 0, stream, v.y, t);
+    else if (tiled) hipLaunchKernelGGL(gather_transform_tiled_kernel, dim3((t.pairs * 2 * kHB + 7) / 8), dim3(256), 0, stream, v.y, t);
     else hipLaunchKernelGGL(gather_transform_kernel, dim3((t.pairs * 2 * kHB + 7) / 8), dim3(256), 0, stream, v.y, t);
     launched("gather transform");
     mark("gather", stream);
@@ -1043,6 +1153,149 @@ void enqueue_prefill_moe(const PrefillMoeView& v, void* workspace, std::size_t w
     hipLaunchKernelGGL(down_combine_kernel, dim3((v.rows * kHB + 7) / 8), dim3(256), 0, stream, t, v.out);
     launched("down combine");
     mark("combine", stream);
+}
+
+namespace {
+// Item list of one dense call: at most kMaxDenseJobs jobs x (main + tail) items.
+constexpr std::size_t kDenseItems = 2 * kMaxDenseJobs;
+struct DensePlan {
+    unsigned k = 0, tpad = 0;
+    unsigned splits[kMaxDenseJobs] = {};
+    std::size_t off_items = 0, off_xt[kMaxDenseJobs] = {}, off_part[kMaxDenseJobs] = {}, bytes = 0;
+};
+bool dense_bits_supported(unsigned bits) { return bits == 3 || bits == 4 || bits == 5 || bits == 6 || bits == 8; }
+DensePlan make_dense_plan(const PrefillDenseJob* jobs, unsigned count, unsigned rows) {
+    if (jobs == nullptr || count == 0 || count > kMaxDenseJobs || rows == 0)
+        throw std::invalid_argument("minimax prefill dense: bad job count or rows");
+    DensePlan p;
+    p.k = jobs[0].w.input;
+    p.tpad = (rows + 15U) / 16U * 16U;
+    if (p.k == 0 || p.k % 128 != 0) throw std::invalid_argument("minimax prefill dense: input must be a multiple of 128");
+    std::size_t off = 0;
+    p.off_items = off;
+    off += align256(kDenseItems * sizeof(pfk::Item));
+    for (unsigned m = 0; m < count; ++m) {
+        const Exl3& w = jobs[m].w;
+        if (w.input != p.k || w.output == 0 || w.output % 128 != 0 || w.trellis == nullptr || w.suh == nullptr ||
+            w.svh == nullptr || jobs[m].out == nullptr)
+            throw std::invalid_argument("minimax prefill dense: jobs need one input width and outputs % 128 == 0");
+        if (!dense_bits_supported(w.bits)) throw std::invalid_argument("minimax prefill dense: unsupported bit width");
+        p.splits[m] = gemm_splits(w.input, w.output, w.bits, rows);
+        p.off_xt[m] = off;
+        off += align256(std::size_t{p.tpad} * p.k * 2);
+        p.off_part[m] = off;
+        off += align256(std::size_t{p.splits[m]} * rows * w.output * 4);
+    }
+    p.bytes = off;
+    return p;
+}
+// Pinned host staging for the item lists: the H2D copy is stream-ordered into the call's workspace (consumed by the
+// call's own launches before any later call on that stream overwrites it); a slot is reused only after its copy event.
+struct DenseSlot {
+    pfk::Item* host = nullptr;
+    hipEvent_t copied = nullptr;
+    bool pending = false;
+};
+constexpr unsigned kDenseSlots = 16;
+DenseSlot g_dense_slots[kDenseSlots];
+unsigned g_dense_next = 0;
+std::mutex g_dense_mutex;  // reserve -> fill -> copy -> record, and cleanup: one transaction per thread
+DenseSlot& next_dense_slot() {
+    DenseSlot& slot = g_dense_slots[g_dense_next];
+    g_dense_next = (g_dense_next + 1) % kDenseSlots;
+    if (slot.host == nullptr) {
+        ok(hipHostMalloc(reinterpret_cast<void**>(&slot.host), kDenseItems * sizeof(pfk::Item), hipHostMallocDefault), "dense items host");
+        ok(hipEventCreateWithFlags(&slot.copied, hipEventDisableTiming), "dense items event");
+    }
+    if (slot.pending) {
+        ok(hipEventSynchronize(slot.copied), "dense items slot reuse");
+        slot.pending = false;
+    }
+    return slot;
+}
+}  // namespace
+
+bool prefill_dense_supported(const Exl3& w) { return dense_bits_supported(w.bits) && w.input % 128 == 0 && w.output % 128 == 0; }
+
+std::size_t prefill_dense_workspace_bytes(const PrefillDenseJob* jobs, unsigned count, unsigned rows) {
+    return make_dense_plan(jobs, count, rows).bytes;
+}
+
+void enqueue_prefill_dense(const PrefillDenseJob* jobs, unsigned count, const float* x, unsigned rows, void* workspace,
+                           std::size_t workspace_bytes, hipStream_t stream) {
+    const DensePlan p = make_dense_plan(jobs, count, rows);
+    if (x == nullptr || workspace == nullptr || workspace_bytes < p.bytes)
+        throw std::invalid_argument("minimax prefill dense: null input or workspace too small");
+    auto* ws = static_cast<unsigned char*>(workspace);
+    std::vector<pfk::Item> lists[8];
+    unsigned ctas[8] = {};
+    for (unsigned m = 0; m < count; ++m) {
+        const Exl3& w = jobs[m].w;
+        pfk::Item it{};
+        it.trellis = w.trellis;
+        it.x = reinterpret_cast<_Float16*>(ws + p.off_xt[m]);
+        it.part = reinterpret_cast<float*>(ws + p.off_part[m]);
+        it.input = w.input;
+        it.output = w.output;
+        it.bits = w.bits;
+        it.rows = rows;
+        it.splits = p.splits[m];
+        it.gx = w.output / 128;
+        auto emit = [&](unsigned c, unsigned row0, unsigned gy) {
+            it.row0 = row0;
+            it.gy = gy;
+            it.cta_begin = ctas[c];
+            ctas[c] += it.gx * gy * it.splits;
+            lists[c].push_back(it);
+        };
+        const auto fit = route::mtfit(rows);  // the production v4 + mtfit item shapes
+        if (fit.main != 0) emit(7, 0, fit.main);
+        if (fit.remainder != 0) emit(fit.tail_class, fit.main * 128, 1);
+    }
+    std::lock_guard<std::mutex> staging(g_dense_mutex);
+    DenseSlot& slot = next_dense_slot();
+    unsigned at[8] = {}, used = 0;
+    for (unsigned c = 0; c < 8; ++c) {
+        at[c] = used;
+        for (const pfk::Item& it : lists[c]) slot.host[used++] = it;
+    }
+    auto* items_d = reinterpret_cast<pfk::Item*>(ws + p.off_items);
+    ok(hipMemcpyAsync(items_d, slot.host, used * sizeof(pfk::Item), hipMemcpyHostToDevice, stream), "dense items");
+    ok(hipEventRecord(slot.copied, stream), "dense items event");
+    slot.pending = true;
+    DenseArgs a{};
+    a.count = count;
+    a.rows = rows;
+    a.k = p.k;
+    unsigned waves = 0;
+    for (unsigned m = 0; m < count; ++m) {
+        a.suh[m] = jobs[m].w.suh;
+        a.svh[m] = jobs[m].w.svh;
+        a.xt[m] = reinterpret_cast<_Float16*>(ws + p.off_xt[m]);
+        a.part[m] = reinterpret_cast<const float*>(ws + p.off_part[m]);
+        a.out[m] = jobs[m].out;
+        a.n[m] = jobs[m].w.output;
+        a.splits[m] = p.splits[m];
+        waves += rows * (jobs[m].w.output / 128);
+    }
+    hipLaunchKernelGGL(dense_transform_kernel, dim3((rows * (p.k / 128) + 7) / 8), dim3(256), 0, stream, x, a);
+    launched("dense transform");
+    for (unsigned c = 0; c < 8; ++c)
+        if (!lists[c].empty()) launch_class<4>(items_d + at[c], static_cast<unsigned>(lists[c].size()), ctas[c], c, stream);
+    launched("dense v4");
+    hipLaunchKernelGGL(dense_finish_kernel, dim3((waves + 7) / 8), dim3(256), 0, stream, a);
+    launched("dense finish");
+}
+
+void cleanup_prefill_dense() noexcept {
+    std::lock_guard<std::mutex> staging(g_dense_mutex);
+    for (DenseSlot& slot : g_dense_slots) {
+        if (slot.pending) (void)hipEventSynchronize(slot.copied);
+        if (slot.copied != nullptr) (void)hipEventDestroy(slot.copied);
+        if (slot.host != nullptr) (void)hipHostFree(slot.host);
+        slot = DenseSlot{};
+    }
+    g_dense_next = 0;
 }
 
 }  // namespace strix::minimax::moe::opt
