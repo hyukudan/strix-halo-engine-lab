@@ -5,6 +5,7 @@
 #include "strix/hip_ds41_attention.hpp"
 
 #include <algorithm>
+#include <bit>
 #include <cmath>
 #include <chrono>
 #include <cstdio>
@@ -995,7 +996,17 @@ struct PrefillWindows {
         }
         ring = std::make_unique<Dev<std::uint8_t>>(hr);
         kv = std::make_unique<Dev<std::uint8_t>>(hk);
-        q = std::make_unique<Dev<float>>(random_f(std::size_t{n} * heads * 512, -0.5F, 0.5F));
+        auto hq = random_f(std::size_t{n} * heads * 512, -0.5F, 0.5F);
+        if (mode == 2) {   // NaN payloads in q (other payloads and signs in lanes that meet in the butterfly): operand order
+            const auto nan = [](std::uint32_t u) { return std::bit_cast<float>(u); };
+            for (std::size_t rh = 0; rh < std::size_t{n} * heads; ++rh) {
+                float* x = hq.data() + rh * 512;
+                if (rh % 4 == 1) { x[16 * 3] = nan(0x7FC12345U); x[16 * 19 + 2] = nan(0xFFD00001U); }   // xor-16 partners
+                if (rh % 4 == 2) { x[16 * 5 + 1] = nan(0xFFC00000U); x[16 * 6] = nan(0x7FC00000U); x[16 * 13] = nan(0x7FC0BEEFU); }
+                if (rh % 4 == 3) x[16 * 28 + 7] = nan(0xFFC00F00U);   // one lane (a RoPE lane)
+            }
+        }
+        q = std::make_unique<Dev<float>>(hq);
         sink = std::make_unique<Dev<float>>(random_f(heads, -2, 2));
         out = std::make_unique<Dev<float>>(std::size_t{n} * heads * 512);
         part = std::make_unique<Dev<float>>(std::size_t{kLanes} * rows * heads * a::kMaxChunks * 514);
@@ -1050,7 +1061,7 @@ void lean_equal(int mode, unsigned rows, unsigned heads, unsigned nwin, std::uin
         g::set_attention_lds_swizzle(swz);
         g::set_attention_tile_f16(f16);
         std::vector<std::uint8_t> ref;
-        for (const int lean : {0, 1, 2}) {
+        for (const int lean : {0, 1, 2, 3}) {
             g::set_attention_lean(lean);
             pw.clear();
             pw.run();
@@ -1067,14 +1078,18 @@ void lean_equal(int mode, unsigned rows, unsigned heads, unsigned nwin, std::uin
                 static_cast<unsigned long long>(p0), heads, ratio, a8 ? ", A8" : "");
 }
 
-// Prefill attention bench: `nwin` windows over 4 streams, the forms alternated (0 1 2 0 1 2 ...), median wall time per window.
+// Prefill attention bench: `nwin` windows over 4 streams, the forms alternated (STRIX_DS41_PF_BENCH_FORMS, digits of
+// STRIX_DS41_ATTN_LEAN levels, default 0123), median wall time per window.
 void prefill_bench(unsigned rows, unsigned heads, unsigned nwin, std::uint64_t p0, unsigned ratio, unsigned reps) {
     PrefillWindows pw(1, rows, heads, nwin, p0, ratio, true);
     hipEvent_t e0, e1;
     check(hipEventCreate(&e0)); check(hipEventCreate(&e1));
-    std::vector<float> t[3];
-    for (unsigned k = 0; k < 3 * reps + 3; ++k) {
-        const int lean = static_cast<int>(k % 3U);
+    std::vector<int> forms;
+    { const char* e = std::getenv("STRIX_DS41_PF_BENCH_FORMS"); for (const char* c = e ? e : "0123"; *c; ++c) if (*c >= '0' && *c <= '9') forms.push_back(*c - '0'); }
+    const unsigned nf = static_cast<unsigned>(forms.size());
+    std::vector<std::vector<float>> t(nf);
+    for (unsigned k = 0; k < nf * reps + nf; ++k) {
+        const int lean = forms[k % nf];
         g::set_attention_lean(lean);
         pw.run();   // warm
         check(hipEventRecord(e0));
@@ -1083,10 +1098,16 @@ void prefill_bench(unsigned rows, unsigned heads, unsigned nwin, std::uint64_t p
         check(hipEventRecord(e1));
         check(hipEventSynchronize(e1));
         float ms; check(hipEventElapsedTime(&ms, e0, e1));
-        if (k >= 3) t[lean].push_back(ms * 1e3F * 8.0F / static_cast<float>(nwin * rows));   // us per 8 rows
+        if (k >= nf) t[k % nf].push_back(ms * 1e3F * 8.0F / static_cast<float>(nwin * rows));   // us per 8 rows
     }
     g::set_attention_lean(-1);
     for (auto& v : t) std::sort(v.begin(), v.end());
+    std::printf("  prefill bench %u windows x %u rows, %u heads, positions %llu.., ratio %u: us per 8 rows (median, min)", nwin, rows, heads,
+                static_cast<unsigned long long>(p0), ratio);
+    for (unsigned f = 0; f < nf; ++f)
+        std::printf("%s lean %d %.1f (%+.1f %%) [%.1f]", f ? "," : "", forms[f], t[f][reps / 2], 100.0 * (t[f][reps / 2] / t[0][reps / 2] - 1.0), t[f][0]);
+    std::printf("\n");
+    if (std::getenv("STRIX_DS41_PF_BENCH_EXTRA") == nullptr) { check(hipEventDestroy(e0)); check(hipEventDestroy(e1)); return; }
     // lean 2 with AttentionView::max_visible (the grid's live chunks) at the default heads-per-wave rule and at Hpw 4 always
     float tl[2] = {0.0F, 0.0F};
     {
@@ -1126,10 +1147,6 @@ void prefill_bench(unsigned rows, unsigned heads, unsigned nwin, std::uint64_t p
             tb[variant - 1] = tv[tv.size() / 2];
         }
     }
-    std::printf("  prefill bench %u windows x %u rows, %u heads, positions %llu.., ratio %u: us per 8 rows, previous %.1f, lean 1 %.1f (%+.1f %%),"
-                " lean 2 %.1f (%+.1f %%) [min %.1f / %.1f / %.1f]\n", nwin, rows, heads, static_cast<unsigned long long>(p0), ratio, t[0][reps / 2],
-                t[1][reps / 2], 100.0 * (t[1][reps / 2] / t[0][reps / 2] - 1.0), t[2][reps / 2], 100.0 * (t[2][reps / 2] / t[0][reps / 2] - 1.0),
-                t[0][0], t[1][0], t[2][0]);
     std::printf("    lean 2 + max_visible: %.1f us (default heads-per-wave rule), %.1f us (Hpw 4 always) per 8 rows\n", tl[0], tl[1]);
     if (tb[0] > 0.0F) std::printf("    (approximate BF16 hi/lo prefill attention, not this identity: variant 1 %.1f us, variant 2 %.1f us per 8 rows; the combine kernel launch included)\n", tb[0], tb[1]);
     check(hipEventDestroy(e0)); check(hipEventDestroy(e1));
@@ -1142,6 +1159,8 @@ int main() {
         if (std::getenv("STRIX_DS41_PF_ATTN_BENCH")) {   // prefill-shaped attention: lean equality + bench only
             for (const unsigned heads : {32U, 64U}) {
                 lean_equal(0, 8, heads, 8, 5000, 4, true);
+                lean_equal(2, 8, heads, 8, 9000, 4, true);     // NaN payloads and signs in q
+                lean_equal(2, 3, heads, 4, 333, 2, false);
                 lean_equal(1, 8, heads, 8, 0, 4, false);       // the first rows: windows < 128, counts < 512
                 lean_equal(1, 8, heads, 8, 60, 2, true);       // across the 64-key chunk boundary, ratio 2
                 lean_equal(1, 8, heads, 4, 120, 1, false);     // window 121..128 keys, ratio 1 counts 121..
@@ -1262,6 +1281,7 @@ int main() {
             for (const unsigned heads : {32U, 64U}) { tile_f16_sweep(0, rows, heads); tile_f16_sweep(1, rows, heads); }
         for (const unsigned heads : {32U, 64U}) {   // STRIX_DS41_ATTN_LEAN == the previous form on prefill-shaped calls
             lean_equal(0, 8, heads, 4, 5000, 4, true);
+            lean_equal(2, 8, heads, 4, 9000, 4, true);
             lean_equal(1, 8, heads, 4, 0, 4, false);
             lean_equal(1, 8, heads, 4, 60, 2, true);
             lean_equal(1, 8, heads, 4, 8000, 128, true);

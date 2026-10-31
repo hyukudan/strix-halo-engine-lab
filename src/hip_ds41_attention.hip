@@ -2,6 +2,7 @@
 // gfx1151 kernels of the deepseek41 decode attention. The arithmetic of each kernel is its host reference in
 // src/ds41_attention.cpp (same chains, same xor butterflies, same scalar helpers), so results match bit for bit.
 #include "strix/hip_ds41_attention.hpp"
+#include "hip_ds41_attention_qk.inc"
 
 #include <cstdlib>
 #include <stdexcept>
@@ -42,6 +43,23 @@ template <unsigned D> __device__ __forceinline__ float xor_lane(float v) {
     const unsigned x = __builtin_bit_cast(unsigned, v);
     if constexpr (D == 16U) return __builtin_bit_cast(float, __builtin_amdgcn_permlanex16(x, x, 0x76543210U, 0xfedcba98U, false, false));
     else return __builtin_bit_cast(float, __builtin_amdgcn_update_dpp(static_cast<int>(x), static_cast<int>(x), static_cast<int>(0x160U + D), 0xF, 0xF, false));
+}
+// The same exchange without tying the result to the source register (DPP old operand undefined: every lane of a
+// row_xmask exchange is in bounds), so the source stays live without a copy. The empty asm keeps the moved value out
+// of DPP combining: a combined v_add_f32_dpp takes the partner as src0, and with two NaN operands v_add_f32 returns
+// the src0 NaN (gfx1151), so own + partner keeps its operand order.
+template <unsigned D> __device__ __forceinline__ float xor_lane_nt(float v) {
+    const unsigned x = __builtin_bit_cast(unsigned, v);
+    if constexpr (D == 16U) return __builtin_bit_cast(float, __builtin_amdgcn_permlanex16(x, x, 0x76543210U, 0xfedcba98U, false, false));
+    else {
+        int r = __builtin_amdgcn_mov_dpp(static_cast<int>(x), static_cast<int>(0x160U + D), 0xF, 0xF, true);
+        asm("" : "+v"(r));
+        return __builtin_bit_cast(float, r);
+    }
+}
+// The value of quad lane 0 in every lane of the quad (DPP quad_perm [0, 0, 0, 0])
+__device__ __forceinline__ float quad_first(float v) {
+    return __builtin_bit_cast(float, __builtin_amdgcn_mov_dpp(__builtin_bit_cast(int, v), 0x00, 0xF, 0xF, true));
 }
 __device__ __forceinline__ float wave_sum(float v) {
     v = v + xor_lane<16>(v);
@@ -856,7 +874,11 @@ __device__ __forceinline__ void store_key(float4* row, unsigned part, const KeyR
 __device__ __forceinline__ float f16_scaled(std::uint32_t bits16, float s) {
     return __builtin_fmaf(static_cast<float>(__builtin_bit_cast(_Float16, static_cast<std::uint16_t>(bits16))), s, -0.0F);
 }
-template <bool Swizzle>
+// Lean 3: the E4M3 halves as x + (x & 0x4000) with x = byte << 7 (the sign lands on bit 14 and the add carries it to
+// bit 15): the same bits as (c & 0x7F) << 7 | sign << 15 in one instruction less per pair.
+// E2M1: the f16 high byte of each nibble, (n & 8) << 4 | (n & 7) << 1, for all 8 nibbles of a word in two masks and
+// one byte permutation per byte (no byte extraction, no integer multiply): the same halves.
+template <bool Swizzle, bool Lean3 = false>
 __device__ __forceinline__ void store_key_lean(float4* row, unsigned part, const KeyRaw& k, bool win, bool valid) {
     const std::uint32_t cw[8] = {k.c0.x, k.c0.y, k.c0.z, k.c0.w, k.c1.x, k.c1.y, k.c1.z, k.c1.w};
     if (valid && win) {
@@ -873,7 +895,12 @@ __device__ __forceinline__ void store_key_lean(float4* row, unsigned part, const
 #pragma unroll
                 for (unsigned t = 0; t < 2; ++t) {   // bytes 2t, 2t + 1 -> f16 halves
                     const std::uint32_t pz = __builtin_amdgcn_perm(0U, w, t == 0U ? 0x0C010C00U : 0x0C030C02U);
-                    h[t] = ((pz & 0x007F007FU) << 7U) | ((pz & 0x00800080U) << 8U);
+                    if constexpr (Lean3) {
+                        const std::uint32_t x = pz << 7U;
+                        h[t] = x + (x & 0x40004000U);
+                    } else {
+                        h[t] = ((pz & 0x007F007FU) << 7U) | ((pz & 0x00800080U) << 8U);
+                    }
                 }
                 row[lds_key_slot<Swizzle>(key_slot(part, i))] = make_float4(f16_scaled(h[0], sv), f16_scaled(h[0] >> 16U, sv),
                                                                             f16_scaled(h[1], sv), f16_scaled(h[1] >> 16U, sv));
@@ -890,8 +917,18 @@ __device__ __forceinline__ void store_key_lean(float4* row, unsigned part, const
             std::uint32_t h[2];
 #pragma unroll
             for (unsigned t = 0; t < 2; ++t) {   // byte t of the 16 bits: its low nibble -> low half, high nibble -> high half
-                const std::uint32_t by = (w >> (8U * t)) & 0xFFU, pz = (by | (by << 12U)) & 0x000F000FU;
-                h[t] = ((pz & 0x00070007U) << 9U) | ((pz & 0x00080008U) << 12U);
+                if constexpr (Lean3) {
+                    // the f16 high bytes of every nibble of the word at once, (n & 8) << 4 | (n & 7) << 1 (low nibbles
+                    // in xl, high nibbles in xh), then one byte permutation per byte: the same halves as below
+                    const std::uint32_t c = cw[i / 2];
+                    const std::uint32_t xl = ((c << 4U) & 0x80808080U) | ((c << 1U) & 0x0E0E0E0EU);
+                    const std::uint32_t xh = (c & 0x80808080U) | ((c >> 3U) & 0x0E0E0E0EU);
+                    const std::uint32_t kb = 2U * (i % 2U) + t;   // byte of the word
+                    h[t] = __builtin_amdgcn_perm(xh, xl, 0x000C000CU | (kb << 8U) | ((4U + kb) << 24U));
+                } else {
+                    const std::uint32_t by = (w >> (8U * t)) & 0xFFU, pz = (by | (by << 12U)) & 0x000F000FU;
+                    h[t] = ((pz & 0x00070007U) << 9U) | ((pz & 0x00080008U) << 12U);
+                }
             }
             const float s = sv[i / 4];
             row[lds_key_slot<Swizzle>(key_slot(part, i))] = make_float4(f16_scaled(h[0], s), f16_scaled(h[0] >> 16U, s),
@@ -930,7 +967,7 @@ __device__ __forceinline__ void tile_key(const void* tile, unsigned j, unsigned 
 }
 // One tile's online-softmax step for the wave's Hpw heads over its first cnt keys (loops over keys kept rolled: the
 // kernel is instruction-fetch bound when fully unrolled).
-// Lean (STRIX_DS41_ATTN_LEAN, default 2, =0 off; 2 also stores the tile through store_key_lean): the same operations in fewer instructions: exp_f's range tests as
+// Lean (STRIX_DS41_ATTN_LEAN, default 3, =0 off; 2 also stores the tile through store_key_lean; 3: see the Lean 3 notes below): the same operations in fewer instructions: exp_f's range tests as
 // selects over the same polynomial (exp_f_sel), the running sum l[h] = l[h] + p_j taken in the PV loop (same j order,
 // after the same l[h] * sc) instead of a second loop over the tile's keys, and the PV loop split at key 8 so p_j is
 // read from pr[h][0] / pr[h][1] without a per-key select.
@@ -941,6 +978,69 @@ __device__ __forceinline__ void attention_tile(const void* tile, unsigned cnt, u
     const float ninf = -__builtin_inff();
     const bool b4 = (lane & 16U) != 0U, b3 = (lane & 8U) != 0U, b2 = (lane & 4U) != 0U;
     float s[kAttnHpw][2];
+    if constexpr (Lean >= 3U && !Half) {
+        // Lean 3: lane slot jj of each half holds key jj ^ (lane bits 4..2) (each lane's own fmaf chains, unchanged), so
+        // every stage of the transposed butterfly keeps slots 0.. and sends the upper slots without selects: at each
+        // stage the lane and its partner hold the same key in the kept / sent slot and the sum is the same
+        // own + partner's of the per-key butterfly; slot 0 ends with key lane / 4, as before.
+        const char* tb = static_cast<const char*>(tile) + 16U * lds_key_slot<Swizzle>(lane);   // + 2048 key + 512 i
+        const unsigned kx = ((lane >> 2U) & 7U) << 11U;
+#pragma unroll 1
+        for (unsigned sb = 0; sb < 2; ++sb) {
+            float pt[kAttnHpw][8];
+            const unsigned ka = kx + 16384U * sb;
+            if constexpr (kAttnHpw == 4U) {
+                // 4 heads per wave: the same chains as one asm block with fixed registers, every FMA pair dual-issued
+                // (tools/gen_ds41_qk_asm.py); the tile's LDS address as a 32-bit LDS pointer
+                using f32x16 = float __attribute__((ext_vector_type(16)));
+                using f32x32 = float __attribute__((ext_vector_type(32)));
+                f32x16 qv[4];
+#pragma unroll
+                for (unsigned h = 0; h < 4; ++h)
+#pragma unroll
+                    for (unsigned i = 0; i < 16; ++i) qv[h][i] = q[h][i];
+                using lds_cp = const __attribute__((address_space(3))) char*;
+                const auto tl = static_cast<unsigned>(reinterpret_cast<std::uintptr_t>((lds_cp)tb));
+                f32x32 o;
+                asm volatile(DS41_QK_ASM_TEXT : "=&{v[102:133]}"(o) : "v"(ka), "v"(tl), "{v[0:15]}"(qv[0]), "{v[17:32]}"(qv[1]), "{v[34:49]}"(qv[2]),
+                             "{v[51:66]}"(qv[3]) : DS41_QK_ASM_CLOBBERS, "memory");
+#pragma unroll
+                for (unsigned h = 0; h < 4; ++h)
+#pragma unroll
+                    for (unsigned jj = 0; jj < 8; ++jj) pt[h][jj] = o[8 * (jj / 2) + 2 * h + jj % 2];
+            } else
+#pragma unroll
+            for (unsigned jj = 0; jj < 8; ++jj) {
+                const float4* kp = reinterpret_cast<const float4*>(tb + (ka ^ (jj << 11U)));
+                float k[16];
+#pragma unroll
+                for (unsigned i = 0; i < 4; ++i) {
+                    const float4 kk = kp[32U * i];
+                    k[4 * i] = kk.x; k[4 * i + 1] = kk.y; k[4 * i + 2] = kk.z; k[4 * i + 3] = kk.w;
+                }
+#pragma unroll
+                for (unsigned h = 0; h < kAttnHpw; ++h) {
+                    float t = 0.0F;
+#pragma unroll
+                    for (unsigned i = 0; i < 16; ++i) t = fmaf(q[h][i], k[i], t);
+                    pt[h][jj] = t;
+                }
+            }
+#pragma unroll
+            for (unsigned h = 0; h < kAttnHpw; ++h) {
+#pragma unroll
+                for (unsigned i = 0; i < 4; ++i) pt[h][i] = pt[h][i] + xor_lane_nt<16>(pt[h][i + 4]);
+#pragma unroll
+                for (unsigned i = 0; i < 2; ++i) pt[h][i] = pt[h][i] + xor_lane_nt<8>(pt[h][i + 2]);
+                pt[h][0] = pt[h][0] + xor_lane_nt<4>(pt[h][1]);
+                float t = pt[h][0];
+                t = t + xor_lane_nt<2>(t);
+                t = t + xor_lane_nt<1>(t);
+                const float sv = 8U * sb + lane / 4U < cnt ? t * kAttnScale : ninf;
+                if (sb == 0U) s[h][0] = sv; else s[h][1] = sv;
+            }
+        }
+    } else {
 #pragma unroll 1
     for (unsigned sb = 0; sb < 2; ++sb) {
         float pt[kAttnHpw][8];
@@ -983,32 +1083,78 @@ __device__ __forceinline__ void attention_tile(const void* tile, unsigned cnt, u
             if (sb == 0U) s[h][0] = sv; else s[h][1] = sv;
         }
     }
+    }
     if (mark) DS41_CMARK(1U);
     float pr[kAttnHpw][2];
     if constexpr (Lean) {
+        // Lean 3, 4 heads per wave: the probability of head h for key j is evaluated in lane 4 j + h instead of every lane
+        // of the quad, from quad lane 0's score and running max (the floats lane 4 j uses in the previous form): 2
+        // exp_f_sel per lane instead of 8, read back from lane 4 j + h.
+        constexpr bool kSpread = Lean >= 3U && kAttnHpw == 4U;
+        [[maybe_unused]] float mnv[kAttnHpw];
 #pragma unroll
         for (unsigned h = 0; h < kAttnHpw; ++h) {
             float tm = fmaxf(s[h][0], s[h][1]);
-            tm = fmaxf(tm, xor_lane<4>(tm));
-            tm = fmaxf(tm, xor_lane<8>(tm));
-            tm = fmaxf(tm, xor_lane<16>(tm));
-            const float mn = fmaxf(m[h], tm), sc = exp_f_sel(m[h] - mn);
-            pr[h][0] = exp_f_sel(s[h][0] - mn);
-            pr[h][1] = exp_f_sel(s[h][1] - mn);
-            l[h] = l[h] * sc;
+            if constexpr (Lean >= 3U) {
+                tm = fmaxf(tm, xor_lane_nt<4>(tm));
+                tm = fmaxf(tm, xor_lane_nt<8>(tm));
+                tm = fmaxf(tm, xor_lane_nt<16>(tm));
+            } else {
+                tm = fmaxf(tm, xor_lane<4>(tm));
+                tm = fmaxf(tm, xor_lane<8>(tm));
+                tm = fmaxf(tm, xor_lane<16>(tm));
+            }
+            const float mn = fmaxf(m[h], tm);
+            mnv[h] = mn;
+            if constexpr (!kSpread) {
+                pr[h][0] = exp_f_sel(s[h][0] - mn);
+                pr[h][1] = exp_f_sel(s[h][1] - mn);
+            }
+            // Lean 3: m - mn is the same in every lane (m and the tile max are wave-wide); when it is +0 (the running
+            // max did not grow) sc = exp_f_sel(+0) is exactly 1 and l * 1, acc * 1 are l, acc: the rescale is skipped
+            const float d = m[h] - mn;
+            if (Lean < 3U || __builtin_amdgcn_readfirstlane(__builtin_bit_cast(int, d)) != 0) {
+                const float sc = exp_f_sel(d);
+                l[h] = l[h] * sc;
 #pragma unroll
-            for (unsigned i = 0; i < 16; ++i) acc[h][i] = acc[h][i] * sc;
+                for (unsigned i = 0; i < 16; ++i) acc[h][i] = acc[h][i] * sc;
+            }
             m[h] = mn;
+        }
+        if constexpr (kSpread) {
+            const unsigned r = lane & 3U;
+            float mq[4], sq[4][2];
+#pragma unroll
+            for (unsigned h = 0; h < 4; ++h) { mq[h] = quad_first(mnv[h]); sq[h][0] = quad_first(s[h][0]); sq[h][1] = quad_first(s[h][1]); }
+            const float mr = r == 0U ? mq[0] : r == 1U ? mq[1] : r == 2U ? mq[2] : mq[3];
+#pragma unroll
+            for (unsigned x = 0; x < 2; ++x) {
+                const float sr = r == 0U ? sq[0][x] : r == 1U ? sq[1][x] : r == 2U ? sq[2][x] : sq[3][x];
+                pr[0][x] = exp_f_sel(sr - mr);
+            }
         }
         if (mark) DS41_CMARK(2U);
         const unsigned c0 = cnt < 8U ? cnt : 8U;
+        // Lean 3, f32 tile: one address per key (the lane's 4 vectors at + 512 i)
+        const auto pv_key = [&](unsigned j, float (&k)[16]) {
+            if constexpr (Lean >= 3U && !Half) {
+                const float4* kp = reinterpret_cast<const float4*>(static_cast<const char*>(tile) + 16U * lds_key_slot<Swizzle>(lane) + 2048U * j);
+#pragma unroll
+                for (unsigned i = 0; i < 4; ++i) {
+                    const float4 kk = kp[32U * i];
+                    k[4 * i] = kk.x; k[4 * i + 1] = kk.y; k[4 * i + 2] = kk.z; k[4 * i + 3] = kk.w;
+                }
+            } else {
+                tile_key<Swizzle, Half>(tile, j, lane, k);
+            }
+        };
 #pragma unroll 1
         for (unsigned j = 0; j < c0; ++j) {
             float k[16];
-            tile_key<Swizzle, Half>(tile, j, lane, k);
+            pv_key(j, k);
 #pragma unroll
             for (unsigned h = 0; h < kAttnHpw; ++h) {
-                const float pj = lane_value(pr[h][0], 4U * j);
+                const float pj = kSpread ? lane_value(pr[0][0], 4U * j + h) : lane_value(pr[h][0], 4U * j);
                 l[h] = l[h] + pj;
 #pragma unroll
                 for (unsigned i = 0; i < 16; ++i) acc[h][i] = fmaf(pj, k[i], acc[h][i]);
@@ -1017,10 +1163,10 @@ __device__ __forceinline__ void attention_tile(const void* tile, unsigned cnt, u
 #pragma unroll 1
         for (unsigned j = 8; j < cnt; ++j) {
             float k[16];
-            tile_key<Swizzle, Half>(tile, j, lane, k);
+            pv_key(j, k);
 #pragma unroll
             for (unsigned h = 0; h < kAttnHpw; ++h) {
-                const float pj = lane_value(pr[h][1], 4U * (j - 8U));
+                const float pj = kSpread ? lane_value(pr[0][1], 4U * (j - 8U) + h) : lane_value(pr[h][1], 4U * (j - 8U));
                 l[h] = l[h] + pj;
 #pragma unroll
                 for (unsigned i = 0; i < 16; ++i) acc[h][i] = fmaf(pj, k[i], acc[h][i]);
@@ -1059,7 +1205,9 @@ __device__ __forceinline__ void attention_tile(const void* tile, unsigned cnt, u
     }
     if (mark) DS41_CMARK(3U);
 }
-// Combine of one (row, head) in chunk order, sink, 1 / L, inverse RoPE.
+// Combine of one (row, head) in chunk order, sink, 1 / L, inverse RoPE. Sel (STRIX_DS41_ATTN_LEAN 3): exp_f_sel, the same
+// polynomial with the range tests as selects.
+template <bool Sel = false>
 __device__ __forceinline__ void attention_combine_head(const AttentionView& v, unsigned r, unsigned h, unsigned lane, unsigned chunks) {
     const float* part = v.partial + (static_cast<std::size_t>(r) * v.heads + h) * kMaxChunks * (2 + kHeadDim);
     // every chunk's (m, l) and the lane's 16 accumulators are loaded at once (one memory round trip), then combined
@@ -1082,13 +1230,13 @@ __device__ __forceinline__ void attention_combine_head(const AttentionView& v, u
 #pragma unroll
     for (unsigned c = 0; c < kMaxChunks; ++c) {
         if (c < chunks) {
-            const float e = exp_f(mc[c] - mm);
+            const float e = Sel ? exp_f_sel(mc[c] - mm) : exp_f(mc[c] - mm);
             lsum = fmaf(lc[c], e, lsum);
 #pragma unroll
             for (unsigned i = 0; i < 16; ++i) acc[i] = fmaf(pa[c][i], e, acc[i]);
         }
     }
-    lsum = lsum + exp_f(v.sink[h] - mm);
+    lsum = lsum + (Sel ? exp_f_sel(v.sink[h] - mm) : exp_f(v.sink[h] - mm));
 #pragma unroll
     for (unsigned i = 0; i < 16; ++i) acc[i] = acc[i] / lsum;
     rope512(acc, v.rope[r], lane, true);
@@ -1211,11 +1359,11 @@ __device__ __forceinline__ void attention_chunk_body(const AttentionView& v, con
         if constexpr (Half) {
             f32_tile = __syncthreads_or(store_key_f16(kb[tk], part, raw, t0 + tk < nw, tk < cnt) ? 0 : 1) != 0;
             if (f32_tile) {   // uniform: some value of the tile is not exact in f16: today's f32 tile over the same LDS
-                if constexpr (Lean >= 2U) store_key_lean<Swizzle>(ks[tk], part, raw, t0 + tk < nw, tk < cnt); else store_key<Swizzle>(ks[tk], part, raw, t0 + tk < nw, tk < cnt);
+                if constexpr (Lean >= 2U) store_key_lean<Swizzle, (Lean >= 3U)>(ks[tk], part, raw, t0 + tk < nw, tk < cnt); else store_key<Swizzle>(ks[tk], part, raw, t0 + tk < nw, tk < cnt);
                 __syncthreads();
             }
         } else {
-            if constexpr (Lean >= 2U) store_key_lean<Swizzle>(ks[tk], part, raw, t0 + tk < nw, tk < cnt); else store_key<Swizzle>(ks[tk], part, raw, t0 + tk < nw, tk < cnt);
+            if constexpr (Lean >= 2U) store_key_lean<Swizzle, (Lean >= 3U)>(ks[tk], part, raw, t0 + tk < nw, tk < cnt); else store_key<Swizzle>(ks[tk], part, raw, t0 + tk < nw, tk < cnt);
             __syncthreads();
         }
         DS41_MARK(2U + 2U * ((t0 - j0) / kTile));
@@ -1243,7 +1391,7 @@ __device__ __forceinline__ void attention_chunk_body(const AttentionView& v, con
     if (last_s == 0U) return;
     __threadfence();
 #pragma unroll 1
-    for (unsigned h = 0; h < kAttnHpw; ++h) attention_combine_head(v, r, hb + h, lane, chunks);
+    for (unsigned h = 0; h < kAttnHpw; ++h) attention_combine_head<(Lean >= 3U)>(v, r, hb + h, lane, chunks);
     if (tid == 0U) *ticket = 0U;
     DS41_MARK(11U);
 }
@@ -1678,10 +1826,10 @@ static bool attention_tile_f16() {
 int attention_lean_mode = -1;
 void set_attention_lean(int mode) { attention_lean_mode = mode; }
 int attention_lean() {
-    // default 2 (softmax/PV + dequant), 1 softmax/PV only, 0 off
-    static const int env = [] { const char* e = std::getenv("STRIX_DS41_ATTN_LEAN"); return e == nullptr || e[0] == 0 ? 2 : e[0] == '0' ? 0 : e[0] == '1' ? 1 : 2; }();
+    // default 3 (2 + permuted-key / dual-issue QK, PV addressing, rescale skip, spread exp), 2 softmax/PV + dequant, 1 softmax/PV only, 0 off
+    static const int env = [] { const char* e = std::getenv("STRIX_DS41_ATTN_LEAN"); return e == nullptr || e[0] == 0 ? 3 : e[0] >= '0' && e[0] <= '3' ? e[0] - '0' : 3; }();
     const int m = attention_lean_mode < 0 ? env : attention_lean_mode;
-    return m > 2 ? 2 : m;
+    return m > 3 ? 3 : m;
 }
 static void check_fold(const AttentionView& v) {
     if ((v.kv == nullptr) != (v.ring_out == nullptr) || (v.kv != nullptr && (v.kv_norm == nullptr || v.ring_out != v.ring || v.rows > kMaxRows)))
@@ -1753,7 +1901,8 @@ void enqueue_attention(const AttentionView& v, hipStream_t stream) {
     check_fold(v);
     const bool fold = v.kv != nullptr;
     const int lean = attention_lean();
-    lean == 2 ? enqueue_attention_form<2>(v, fold, stream) : lean == 1 ? enqueue_attention_form<1>(v, fold, stream) : enqueue_attention_form<0>(v, fold, stream);
+    if (lean == 3) enqueue_attention_form<3>(v, fold, stream);
+    else lean == 2 ? enqueue_attention_form<2>(v, fold, stream) : lean == 1 ? enqueue_attention_form<1>(v, fold, stream) : enqueue_attention_form<0>(v, fold, stream);
 }
 
 // ---- several requests' segments per launch (BatchForward): the per-call checks and grids, flushed at kMaxSegments ----
@@ -1866,8 +2015,9 @@ void enqueue_attention_segments(std::span<const AttentionView> views, hipStream_
         if ((v.kv != nullptr) != fold) throw std::invalid_argument("ds41 attention segments: window fold on some segments only");
     }
     const int lean = attention_lean();
-    lean == 2 ? enqueue_attention_segments_form<2>(views, fold, stream) : lean == 1 ? enqueue_attention_segments_form<1>(views, fold, stream)
-              : enqueue_attention_segments_form<0>(views, fold, stream);
+    if (lean == 3) enqueue_attention_segments_form<3>(views, fold, stream);
+    else lean == 2 ? enqueue_attention_segments_form<2>(views, fold, stream) : lean == 1 ? enqueue_attention_segments_form<1>(views, fold, stream)
+                   : enqueue_attention_segments_form<0>(views, fold, stream);
 }
 
 }  // namespace strix::ds41::attn::hip
