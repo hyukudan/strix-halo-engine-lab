@@ -406,6 +406,9 @@ struct DevicePrefill::Impl {
     // stream would hold back until the own-row pass ends); one message per layer, sent while the own rows run.
     // Same kernels, same sum order: bitwise identical. Default on; STRIX_DS41_PREFILL_STAGED_HALF=0: the copy path.
     bool staged_half = false;
+    // row_split with staged_half: the MoE input all-gather the same way (packed into the pinned send buffer right after
+    // the router, crossing while the shared expert runs). Default on; STRIX_DS41_PREFILL_STAGED_GATHER=0: the copy path.
+    bool staged_gather = false;
     Dev<std::uint32_t> pack_send, pack_recv;
     // sites run on the dense WMMA kernel instead of the batch kernel (STRIX_DS41_PREFILL_DENSE_SITES, comma list of
     // q_a, kv, q_b, o_a; default q_a,kv, faster on the dense kernel at 512 and 2048 rows; "none" = all on the batch
@@ -951,6 +954,8 @@ DevicePrefill::DevicePrefill(const std::filesystem::path& gguf, const PrefillOpt
                 m.staged_half = comm->send_staging(bytes) != nullptr;
                 if (!m.staged_half && bytes > before) comm->resize_bytes(before);
             }
+            m.staged_gather = m.staged_half;
+            if (const char* v = std::getenv("STRIX_DS41_PREFILL_STAGED_GATHER"); v != nullptr && v[0] == '0') m.staged_gather = false;
         }
         m.half_own = Dev<float>(T * H);
         // staged: half_other only for the runs below split_min_rows (no row split), half_recv not at all
@@ -1556,13 +1561,7 @@ PrefillResult DevicePrefill::run_from(std::span<const std::uint32_t> tokens, std
     // the same for several fields of the same rows (own buffers at this rank's first row, destinations at the peer's),
     // packed into one message per piece
     struct Field { const void* own; void* dst; std::size_t row_bytes; };
-    const auto exchange_fields = [&](std::initializer_list<Field> fields, std::uint32_t own_rows, std::uint32_t peer_rows, std::uint32_t layer) {
-        if (!m.pack || fields.size() == 1U) {
-            for (const auto& f : fields) exchange_rows(f.own, own_rows, f.dst, peer_rows, f.row_bytes, layer);
-            return;
-        }
-        const std::uint32_t n = std::max(own_rows, peer_rows);
-        if (n == 0U) return;
+    const auto pack_of = [](std::initializer_list<Field> fields) {
         PackFields pf;
         for (const auto& f : fields) {
             pf.src[pf.count] = static_cast<const std::uint32_t*>(f.own);
@@ -1571,6 +1570,16 @@ PrefillResult DevicePrefill::run_from(std::span<const std::uint32_t> tokens, std
             pf.stride += pf.words[pf.count];
             ++pf.count;
         }
+        return pf;
+    };
+    const auto exchange_fields = [&](std::initializer_list<Field> fields, std::uint32_t own_rows, std::uint32_t peer_rows, std::uint32_t layer) {
+        if (!m.pack || fields.size() == 1U) {
+            for (const auto& f : fields) exchange_rows(f.own, own_rows, f.dst, peer_rows, f.row_bytes, layer);
+            return;
+        }
+        const std::uint32_t n = std::max(own_rows, peer_rows);
+        if (n == 0U) return;
+        const PackFields pf = pack_of(fields);
         // on the stream the exchange runs on (async: the communication stream, after its wait for the producers)
         hipStream_t us = m.async_gather ? m.comm_stream : st;
         hipLaunchKernelGGL(pack_rows_kernel, dim3(n), dim3(256), 0, us, pf, m.pack_send.p);
@@ -1583,6 +1592,32 @@ PrefillResult DevicePrefill::run_from(std::span<const std::uint32_t> tokens, std
         if (!m.async_gather) return;
         check(hipEventRecord(m.gathered, m.comm_stream), "gathered");
         check(hipStreamWaitEvent(st, m.gathered, 0), "gather join");
+    };
+    // row_split, staged MoE input (m.staged_gather): packed on the main stream straight into the pinned send buffer and
+    // put on the wire right after the router, so it crosses while the shared expert runs (a pack kernel or a copy on the
+    // communication stream waits behind the shared expert's kernels); unpacked from the pinned receive buffer
+    const auto moe_input_pack = [&](const Rows& R, std::uint32_t own0) {
+        const std::uint32_t p0 = local_of(peer, R.o0);
+        return pack_of({Field{m.xcodes.p + std::size_t{own0} * H, m.peer_xcodes.p + std::size_t{p0} * H, H},
+                        Field{m.xdeltas.p + std::size_t{own0} * H / 32U, m.peer_xdeltas.p + std::size_t{p0} * H / 32U, H / 32U * 4U},
+                        Field{m.ids.p + std::size_t{own0} * K, m.peer_ids.p + std::size_t{p0} * K, K * 4U},
+                        Field{m.route_w.p + std::size_t{own0} * K, m.peer_route_w.p + std::size_t{p0} * K, K * 4U}});
+    };
+    std::uint32_t moe_input_rows = 0;  // > 0: a staged MoE input is on the wire (rows of the message)
+    // both ranks take the same path (staged_gather and the buffer size are the same on both): the same messages
+    const auto begin_moe_input = [&](const Rows& R, std::uint32_t own0, std::uint32_t own_rows, std::uint32_t layer) {
+        const std::uint32_t n = std::max(own_rows, Tp - local_of(peer, R.o0));
+        const PackFields pf = moe_input_pack(R, own0);
+        const std::size_t bytes = std::size_t{n} * pf.stride * 4U;
+        auto* send = m.staged_gather && m.pack && n > 0U ? static_cast<std::uint32_t*>(m.options.communicator->send_staging(bytes)) : nullptr;
+        if (send == nullptr) {
+            start_gather();
+            return;
+        }
+        hipLaunchKernelGGL(pack_rows_kernel, dim3(n), dim3(256), 0, st, pf, send);
+        check(hipGetLastError(), "pack rows");
+        m.options.communicator->start_staged(st, bytes, dist::Tag{static_cast<std::uint32_t>(dist::TagKind::raw_slots), layer, ++exchange_seq});
+        moe_input_rows = n;
     };
 
     // fresh sequence: every layer's attention state cleared (extend keeps it)
@@ -2381,7 +2416,7 @@ PrefillResult DevicePrefill::run_from(std::span<const std::uint32_t> tokens, std
         case Op::router: {
             if (no == 0U) {
                 if (m.options.routing_loads) result.routing_loads.emplace_back(c.n_routed_experts, 0U);
-                if (split) start_gather();  // nothing of this rank's crosses, but the gather still pairs with the peer's
+                if (split) begin_moe_input(R0, o0, no, layer);  // nothing of this rank's crosses, but the gather still pairs with the peer's
                 break;
             }
             ds41::RouterView v;
@@ -2400,7 +2435,7 @@ PrefillResult DevicePrefill::run_from(std::span<const std::uint32_t> tokens, std
             v.weights = m.route_w.p + std::size_t{o0} * K;
             ds41::enqueue_prefill_router(v, st);
             if (m.options.trace) trace_router = download(m.ids.p + std::size_t{o0} * K, std::size_t{no} * K, st);
-            if (split) start_gather();  // the MoE input of this rank's rows is ready; the shared expert runs while it crosses
+            if (split) begin_moe_input(R0, o0, no, layer);  // the MoE input of this rank's rows is ready; the shared expert runs while it crosses
             if (m.options.routing_loads) {  // per-expert entries of this layer's output rows
                 const auto ids = download(m.ids.p + std::size_t{o0} * K, std::size_t{no} * K, st);
                 std::vector<std::uint32_t> load(c.n_routed_experts, 0U);
@@ -2532,12 +2567,20 @@ PrefillResult DevicePrefill::run_from(std::span<const std::uint32_t> tokens, std
                     // the MoE input of the peer's output rows; this rank's half of the peer's rows first, sent while this
                     // rank's own rows run; the peer's half of this rank's rows comes back; y = (shared + low) + high
                     const std::uint32_t p0 = local_of(peer, R0.o0), np = Tp - p0;
-                    exchange_fields({Field{m.xcodes.p + std::size_t{o0} * H, m.peer_xcodes.p + std::size_t{p0} * H, H},
-                                     Field{m.xdeltas.p + std::size_t{o0} * H / 32U, m.peer_xdeltas.p + std::size_t{p0} * H / 32U, H / 32U * 4U},
-                                     Field{m.ids.p + std::size_t{o0} * K, m.peer_ids.p + std::size_t{p0} * K, K * 4U},
-                                     Field{m.route_w.p + std::size_t{o0} * K, m.peer_route_w.p + std::size_t{p0} * K, K * 4U}},
-                                    no, np, layer);
-                    join_gather();
+                    if (moe_input_rows > 0U) {  // staged at the router: already on the wire
+                        const auto* recv = static_cast<const std::uint32_t*>(m.options.communicator->finish_staged(st));
+                        hipLaunchKernelGGL(unpack_rows_kernel, dim3(moe_input_rows), dim3(256), 0, st, moe_input_pack(R0, o0), recv);
+                        check(hipGetLastError(), "unpack rows");
+                        m.options.communicator->release_staged(st);
+                        moe_input_rows = 0;
+                    } else {
+                        exchange_fields({Field{m.xcodes.p + std::size_t{o0} * H, m.peer_xcodes.p + std::size_t{p0} * H, H},
+                                         Field{m.xdeltas.p + std::size_t{o0} * H / 32U, m.peer_xdeltas.p + std::size_t{p0} * H / 32U, H / 32U * 4U},
+                                         Field{m.ids.p + std::size_t{o0} * K, m.peer_ids.p + std::size_t{p0} * K, K * 4U},
+                                         Field{m.route_w.p + std::size_t{o0} * K, m.peer_route_w.p + std::size_t{p0} * K, K * 4U}},
+                                        no, np, layer);
+                        join_gather();
+                    }
                     ds41::PrefillMoeInputs pin;
                     pin.rows = np;
                     pin.ids = m.peer_ids.p + std::size_t{p0} * K;
