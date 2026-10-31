@@ -6,22 +6,32 @@ GPU discreta cuando la hay.**
 [English](README.md) · [Español](README.es.md)
 
 Este motor de inferencia en C++/HIP está dirigido a **AMD Strix Halo** (Ryzen AI Max+ 395, Radeon 8060S
-`gfx1151`, 128 GB de memoria unificada) en Linux con ROCm. Los cinco motores públicos están en
-**Production**, con ejecución exacta y valores predeterminados rápidos: Qwen en un nodo, DeepSeek en un par USB4
-o en una RTX independiente, y MiniMax y GLM en el par. DeepSeek también admite ejecución RTX + par.
+`gfx1151`, 128 GB de memoria unificada) en Linux con ROCm. Cinco motores están en **Production**, con ejecución
+exacta y valores predeterminados rápidos: Qwen en un nodo, DeepSeek en un par USB4 o en una RTX independiente, y
+MiniMax y GLM en el par. DeepSeek también admite ejecución RTX + par. Otros dos son opcionales (opt-in):
+**Nemotron 3.5 Bolt E4B** en un nodo (`--profile default|fast|quality`, con un [drafter MTP](https://huggingface.co/hyukudan/Nemotron-3.5-Bolt-E4B-MTP-Drafter) y un
+[paquete de calidad EXL3](https://huggingface.co/hyukudan/Nemotron-3.5-Bolt-E4B-EXL3) publicados) y **GLM-5.3 Flash en una RTX PRO 6000** (borrador, Windows).
 
 Entre las mediciones publicadas se incluyen:
 
+- **Nemotron 3.5 Bolt E4B (un nodo):** 85.1 tok/s con una petición y el drafter MTP sobre el Q4_K_M oficial;
+  337.5 tok/s agregados con ocho peticiones en `fast`; el paquete EXL3 de `quality` coincide con BF16 en el 92.9 %
+  de los tokens top-1 (Q4_K_M: 87.0 %).
 - **Qwen3.8-Flash-Next:** 59.59 / 54.00 tok/s en prompts de código de 1K / 8K con MTP;
   dos réplicas alcanzan 158.1 tok/s de rendimiento de reloj (wall) con ocho chats de programación concurrentes.
 - **Par DeepSeek V4.1 Flash:** 70.6 tok/s en código con DSpark; ocho filas de decode simple
-  alcanzan 113.9 tok/s agregados (calculado a partir del tiempo de paso medido).
+  alcanzan 113.9 tok/s agregados (calculado a partir del tiempo de paso medido); procesamiento exacto del prompt
+  (tiempo hasta el primer token del servidor, un cliente, caché desactivada) de 9.00 / 31.94 / 45.46 s con
+  8.4K / 32.5K / 44.7K tokens.
 - **DeepSeek en RTX PRO 6000 independiente:** decode de código / inglés / español con la misma carga
   a 82.3 / 87.7 / 94.4 tok/s con el modelo objetivo y el draft en la GPU.
 - **MiniMax M3.1 Flash:** 44.57 ms/token a 1K con decode simple; DSpark alcanza
   54.4 / 34.1 / 24.1 tok/s en JSON / Python / prosa.
 - **GLM-5.3 Flash:** la autoespeculación MTP exacta predeterminada alcanza
   37.1 / 44.5 / 40.0 tok/s en chat / código / JSON.
+- **GLM-5.3 Flash en una RTX PRO 6000:** prefill exacto (tiempo hasta el primer token de 17.7 s con 8K y 41.2 s con
+  32K tokens) y decode exacto (3.3 tok/s) con una caché de expertos repartida entre VRAM, RAM pinned y disco; el
+  trabajo sobre la velocidad de decode continúa.
 
 Son resultados específicos de cada carga de trabajo, no garantías de velocidad. [Qué velocidad](#how-fast) conserva el
 hardware, los perfiles, la concurrencia y los límites de medición; el [rendimiento publicado](docs/performance.md)
@@ -43,7 +53,7 @@ La RTX independiente usa un worker persistente con cola de ficheros. Véase [Eje
 |---|---|
 | ¿Qué es? | Un motor de inferencia independiente en C++/HIP, con rutas de ejecución, kernels, gates de verificación y servicio HTTP específicos por modelo. |
 | ¿Qué hardware? | Un nodo Linux Strix Halo, dos nodos enlazados por USB4 y asistencia opcional de una RTX PRO para perfiles seleccionados. |
-| ¿Qué modelos? | Qwen, DeepSeek (par, RTX independiente y RTX + par), MiniMax y GLM están en Production. Véase [Modelos](#models). |
+| ¿Qué modelos? | Qwen, DeepSeek (par, RTX independiente y RTX + par), MiniMax y GLM están en Production; Nemotron 3.5 Bolt E4B (un nodo) y GLM en una RTX PRO 6000 son opcionales (opt-in). Véase [Modelos](#models). |
 | ¿Cambia las salidas del modelo? | Exacto por defecto respecto a un perfil y una referencia declarados; la ejecución especulativa y concurrente preserva esa secuencia. Véase [Exactitud](#exactness). |
 | ¿Cómo verifico los assets de una versión? | Use la herramienta de CPU del [manifiesto de assets de la versión](docs/operations/release-assets.md) para obtener hashes completos y un cierre explícito de roles. |
 | ¿Qué diagnósticos de arranque hay disponibles? | Qwen tiene, activados por defecto, un [preflight de solo lectura y la identidad de compilación configurada](docs/operations/startup-preflight.md), con interruptores de desactivación explícitos. |
