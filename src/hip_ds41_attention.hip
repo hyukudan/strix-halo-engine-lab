@@ -953,7 +953,7 @@ __device__ __forceinline__ void tile_key(const void* tile, unsigned j, unsigned 
 }
 // One tile's online-softmax step for the wave's Hpw heads over its first cnt keys (loops over keys kept rolled: the
 // kernel is instruction-fetch bound when fully unrolled).
-// Lean (STRIX_DS41_ATTN_LEAN, default 2, =0 off; 2 also stores the tile through store_key_lean): the same operations in fewer instructions: exp_f's range tests as
+// Lean (STRIX_DS41_ATTN_LEAN, default 3, =0 off; 2 also stores the tile through store_key_lean; 3: see the Lean 3 notes below): the same operations in fewer instructions: exp_f's range tests as
 // selects over the same polynomial (exp_f_sel), the running sum l[h] = l[h] + p_j taken in the PV loop (same j order,
 // after the same l[h] * sc) instead of a second loop over the tile's keys, and the PV loop split at key 8 so p_j is
 // read from pr[h][0] / pr[h][1] without a per-key select.
@@ -1808,8 +1808,8 @@ static bool attention_tile_f16() {
 int attention_lean_mode = -1;
 void set_attention_lean(int mode) { attention_lean_mode = mode; }
 int attention_lean() {
-    // default 2 (softmax/PV + dequant), 1 softmax/PV only, 0 off
-    static const int env = [] { const char* e = std::getenv("STRIX_DS41_ATTN_LEAN"); return e == nullptr || e[0] == 0 ? 2 : e[0] >= '0' && e[0] <= '3' ? e[0] - '0' : 2; }();
+    // default 3 (2 + permuted-key / dual-issue QK, PV addressing, rescale skip, spread exp), 2 softmax/PV + dequant, 1 softmax/PV only, 0 off
+    static const int env = [] { const char* e = std::getenv("STRIX_DS41_ATTN_LEAN"); return e == nullptr || e[0] == 0 ? 3 : e[0] >= '0' && e[0] <= '3' ? e[0] - '0' : 3; }();
     const int m = attention_lean_mode < 0 ? env : attention_lean_mode;
     return m > 3 ? 3 : m;
 }
