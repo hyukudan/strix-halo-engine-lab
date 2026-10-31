@@ -328,6 +328,24 @@ inline void select_mtp_bundle_golden(Options& options, const ModelContract& mode
 }
 #include "qwen_yarn_admission.inc"
 
+// Test proposed exports against the actual YaRN environment admission before
+// touching process state. Explicit requests keep their existing refusal contract.
+inline void admit_product_profile(Options& o) {
+    if (o.rotary.mode() != RotaryMode::yarn) return;
+    for (auto& entry : o.product_profile.entries) {
+        if (entry.status != qwen::profile::Status::set && entry.status != qwen::profile::Status::unqualified &&
+            entry.status != qwen::profile::Status::provisional) continue;
+        Environment candidate;
+        if (!entry.lever->env.empty()) candidate.emplace(entry.lever->env, entry.value);
+        const auto reason = yarn_environment_refusal(candidate, o.rotary.factor());
+        if (reason.empty()) continue;
+        entry.status = qwen::profile::Status::pending;
+        entry.target = std::string(entry.lever->target);
+        entry.value = std::string(entry.lever->builtin);
+        entry.reason = reason;
+    }
+}
+
 inline EffectiveConfig resolve_prefill_effective_config(const RequestedOptions& request,
     const ModelContract& model, const gguf::FileInfo& info, const ModelManifest& manifest,
     std::string_view verified_content, const PrefillCapabilities& capabilities, const PrefillMemory& memory) {
@@ -1456,6 +1474,7 @@ inline std::string effective_config_json(const EffectiveConfig& config) {
         out << "{\"rotary\":" << (config.rotary_identity.descriptor().mode() == RotaryMode::yarn ?
             config.rotary_identity.json() : o.rotary.json()) << ',';
     else out << "{\"rotary\":" << o.rotary.json() << ',';
+    out << "\"profile\":" << o.product_profile.json() << ',';
     if (!o.suppressed_yarn_request.empty())
         out << "\"suppressed_yarn_request\":\"" << yarn_json_error(o.suppressed_yarn_request) << "\",";
     // YaRN preflight can verify a drop before device setup. Native inspection
@@ -1600,7 +1619,7 @@ inline std::string effective_config_json(const EffectiveConfig& config) {
     out << "],\"option_sources\":{";
     bool first_source = true;
     for (const auto& [name,source] : config.sources) {
-        if (!name.starts_with("--")) continue;
+        if (!name.starts_with("--") || qwen::profile::policy_option(name)) continue;
         out << (first_source ? "" : ",") << '"' << name << "\":\"" <<
             (source == OptionSource::automatic ? "automatic" : source == OptionSource::baseline ? "baseline" : "explicit") << '"';
         first_source = false;

@@ -97,6 +97,9 @@ static std::string numerical_config(std::string_view cli, const RotaryIdentity& 
 #endif
     for(;p && *p;++p) {
         const std::string_view value(*p);
+        // Policy/provenance is metadata; applied arithmetic switches remain bound.
+        if (value.starts_with("STRIX_QWEN_PROFILE_ALLOW_PENDING=") ||
+            value.starts_with("STRIX_QWEN_PROFILE_OWNED_")) continue;
         // Operational, per-process values: the GPU-turn wrapper's ids and the hash-cache directory.
         if (value.starts_with("GPU_TURN_") || value.starts_with("GPU_WINDOW=") || value.starts_with("STRIX_HASH_CACHE=")) continue;
         // This observer does not alter the single tiled-MTP execution/flush order.

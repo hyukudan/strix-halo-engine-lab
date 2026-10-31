@@ -100,6 +100,41 @@ ninja -C build strix-hip-decode-token
 
 ## Command line
 
+Qwen accepts `--profile default|fast|quality` for CLI decode, `--http-serve`,
+MTP and the MTP qualification runner. Omission means `default`: it exports no
+profile switches and preserves the existing exact bundle, output WMMA and
+automatic prefill pair, including their existing admission guards.
+`fast` applies ready rows and explicitly provisional runnable rows in the
+[profile table](../../include/strix/qwen_profile_table.hpp). It currently exports
+`STRIX_QPF2K_MOE_ROUTE_BF16=1` for BF16 MoE route storage without `--allow-pending`.
+This row is selected ahead of its qualification receipt: it is bit-changing,
+changes logits, and its qualification is in progress. The receipt reports status
+`provisional` and stamps `qualification in progress: moe_route_bf16`; one stderr
+line states the bit change and qualification status. Attention budget, FP16
+recurrent chunks and output head remain pending because their implementations
+are absent. Each keeps the builtin running, appears with its target in
+`profile.pending`, and prints one stderr notice. Pending rows never cause a
+refusal. `quality` currently runs default settings and prints
+`quality: no quality rows for this model, using default`.
+
+Explicit environment and lever options take precedence and are recorded as
+explicit or off; explicit off prevents profile application. An explicit request
+for unavailable code is refused. `--allow-pending` (or
+`STRIX_QWEN_PROFILE_ALLOW_PENDING=1`) is for benchmarking: only runnable genuinely
+pending rows execute, with `unqualified: <rows>` in the qualification stamp and
+an `unqualified` list. If both types apply, the stamp lists qualification in
+progress first, then `; unqualified: <rows>`. The three pending rows currently
+remain pending even with this flag. The existing `--prefill-moe-route-bf16 on|off`
+contract is unchanged. On YaRN, proposed exports are checked against rotary
+admission first: a refused row stays pending with the admission reason, is not
+exported, and is not stamped as applied. Explicit switches retain their existing
+admission contracts.
+CLI receipts, HTTP capabilities and generation stats, and `--print-effective-config`
+include the same `profile` object. Selection happens immediately after parsing,
+before switch readers; provenance markers preserve resolution across a future
+re-exec. Cache identity changes only through the applied arithmetic switches.
+Profile controls are server-level and require a restart.
+
 `strix-hip-decode-token` takes a GGUF model and the prompt as token IDs; it has no tokenizer. It writes a JSON
 receipt to stdout that includes `generated_tokens`, cycle counts and timings. `--help` lists the general options;
 the MTP options are documented in [mtp-native-cli.md](../engine/speculative/mtp-native-cli.md).

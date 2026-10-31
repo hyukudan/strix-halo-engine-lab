@@ -858,6 +858,25 @@ is on by default wherever the cache is on and only acts on concurrent strict-L0 
 `STRIX_PREFIX_CACHE_INFLIGHT=0` / `--prefix-cache-inflight off` turns it off. MTP restore accepts only suffix plans equivalent to the uncached execution;
 checkpoint copies follow existing block boundaries.
 
+#### Qwen `--profile default|fast|quality`
+
+One switch selects a product profile for Qwen (CLI, `--http-serve` and the MTP runner):
+
+- `default`: the exact default described above; it sets nothing.
+- `fast`: currently applies BF16 MoE route storage (`STRIX_QPF2K_MOE_ROUTE_BF16=1`) ahead of its
+  qualification receipt, without `--allow-pending`. This is bit-changing and changes logits; qualification is
+  in progress. The receipt stamps `qualification in progress: moe_route_bf16` and marks the row `provisional`;
+  one stderr line discloses the bit change and qualification status. Attention selection budget, FP16 chunked
+  recurrence and FP16 output head remain pending and keep their builtin paths, with one notice each.
+- `quality`: there is no quality pack for this model, so it runs `default` and says so in the receipt.
+
+`--allow-pending` (or `STRIX_QWEN_PROFILE_ALLOW_PENDING=1`) runs genuinely pending options whose code is in
+the build, for benchmarking only, and stamps them `unqualified: <rows>`. The three pending rows currently
+have no runnable implementation, so this flag does not change fast's resolution. On YaRN, a row refused by
+rotary admission stays pending with its reason and is not stamped as applied. An explicit environment variable
+or CLI option always wins over the profile, including explicit off. `--print-effective-config` shows the selected
+profile and the state of every option.
+
 ### DeepSeek pair
 
 Run one rank on each node with matching assets and environment; set `R` to 0 or 1 locally:

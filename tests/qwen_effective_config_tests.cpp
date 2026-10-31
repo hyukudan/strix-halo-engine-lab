@@ -1663,6 +1663,28 @@ int main(int argc, char** arguments) {
         constexpr auto candidate_key = "STRIX_QPF2K_MOE_ROUTE_BF16";
         const auto base = resolve(request,memory);
         expect(!base.options.prefill_moe_route_bf16 && base.error.empty(),"route BF16 default off");
+        for (const auto profile : {qwen::profile::Name::standard, qwen::profile::Name::fast, qwen::profile::Name::quality}) {
+            for (const bool allow : {false, true}) {
+                auto selected = request;
+                qwen::profile::Inputs inputs;
+                inputs.env = [](const char*) -> const char* { return nullptr; };
+                inputs.allow_pending = allow;
+                selected.options.product_profile = qwen::profile::resolve(profile, inputs);
+                admit_product_profile(selected.options);
+                qwen::profile::apply(selected.options.product_profile, [&](const char* key, const char* value) {
+                    if (!qwen::profile::metadata_environment(key)) selected.environment[key] = value;
+                    return true;
+                });
+                const auto got = resolve(selected, memory);
+                const bool enabled = profile == qwen::profile::Name::fast;
+                expect(got.error.empty() && got.options.prefill_moe_route_bf16 == enabled,
+                    "fast profile applies provisional storage through native resolver without permission");
+                expect(moe_prefill_storage_name(got.options.prefill_moe_route_bf16) ==
+                    std::string_view(enabled ? "fp16-v1+moeroute16" : "fp16-v1") &&
+                    got.options.product_profile.qualification() == (enabled ? "qualification in progress: moe_route_bf16" : "qualified"),
+                    "product receipt and actual storage identity agree");
+            }
+        }
         expect(moe_prefill_storage_identity(false) == 0xa0094634843e16eeULL &&
             numerical_profile_pair_identity(numerical_profile_pair(base.options)) == 0xf51680d10954bfe0ULL,
             "plain FP16 pair identity unchanged");

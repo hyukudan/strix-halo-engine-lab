@@ -345,6 +345,24 @@ void campaign_defaults_contract(){
 }
 
 int main(){try{
+    for (const auto* profile : {"default", "fast", "quality"}) {
+        auto args=request(); args.insert(args.end(), {"--profile",profile,"--allow-pending"});
+        const auto product=parse(args);
+        const auto plain=parse(request());
+        require(product.product_profile.profile==strix::qwen::profile::parse(profile) && product.mtp.enabled &&
+            product.mtp.candidate_depth==plain.mtp.candidate_depth && product.mtp.sidecar_sha256==plain.mtp.sidecar_sha256 &&
+            product.numerical_profile==plain.numerical_profile && product.prefill_numerical_profile==plain.prefill_numerical_profile &&
+            product.any_low_level_flag==plain.any_low_level_flag && product.route_owned==plain.route_owned,
+            "product profiles preserve the pinned MTP route and arithmetic");
+        auto served=request(); served.insert(served.begin()+5,13,"1");
+        served.insert(served.end(), {"--profile",profile,"--http-serve","--http-batch","0"});
+        const auto http=parse(served);
+        require(http.http_serve && http.mtp.enabled && http.product_profile.profile==product.product_profile.profile,
+            "HTTP serving retains the selected product profile with its MTP route");
+        args.insert(args.end(), {"--rope-yarn","2","--context","32768"});
+        args.insert(args.begin()+5, {"4","5","6","7","8","9","10"});
+        require(parse(args).mtp.enabled,"product selectors are admitted on the YaRN MTP route");
+    }
     {
         auto args=request();args.insert(args.begin()+5,{"4","5","6","7","8","9","10"});args.insert(args.end(),{"--rope-yarn","2","--context","32768"});
         const auto ym=parse(args);require(ym.mtp.enabled && ym.rotary.factor()==2,"explicit YMTP parser admission");

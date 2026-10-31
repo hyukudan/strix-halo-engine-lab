@@ -105,6 +105,7 @@ inline void write_hashes(std::ostream& out, const Hashes& hashes) {
     out << ']';
 }
 inline void run(decode_cli::MtpDecodeQualificationContext& c, const std::filesystem::path& destination) {
+    const auto profile_json = c.options.product_profile.json();
     require(c.window && c.initial.valid() && !c.target->token_sampler() && !c.window->survival_controller(),
         "prefix gate requires a greedy min-p verifier and actual prompt frontier");
     const auto owners = c.window->window_owners();
@@ -153,7 +154,7 @@ inline void run(decode_cli::MtpDecodeQualificationContext& c, const std::filesys
     reset();
     std::ofstream out(destination / "result.pending.json", std::ios::binary);
     out.exceptions(std::ios::failbit | std::ios::badbit);
-    out << "{\"schema\":\"mtp-prefix-gate-v1\",\"performance_qualified\":false,\"initial_position\":" << base.next_position
+    out << "{\"profile\":" << profile_json << ",\"schema\":\"mtp-prefix-gate-v1\",\"performance_qualified\":false,\"initial_position\":" << base.next_position
         << ",\"numerical_profile\":\"" << numerical_profile_name(c.options.numerical_profile) << '"'
         << ",\"target_content\":\"" << model_content_identity_hex(c.initial.target_content_identity()) << '"'
         << ",\"serial_execution_identity\":" << compiled.execution_identity << ",\"serial_kernel_plan_identity\":" << compiled.kernel_plan_identity
@@ -317,7 +318,7 @@ inline void run(decode_cli::MtpDecodeQualificationContext& c, const std::filesys
         } clear_copy_observers{owners};
         std::ofstream copy_out(destination / "copy-cycle.pending.json", std::ios::binary);
         copy_out.exceptions(std::ios::failbit | std::ios::badbit);
-        copy_out << "{\"schema\":\"mtp-copy-cycle-gate-v1\",\"mode\":\"" << selected
+        copy_out << "{\"profile\":" << profile_json << ",\"schema\":\"mtp-copy-cycle-gate-v1\",\"mode\":\"" << selected
             << "\",\"performance_qualified\":false,\"cycles\":[";
         auto frontier = c.initial;
         unsigned copied = 0, cycle_count = 0, compared_logits = 0;
@@ -376,6 +377,6 @@ inline void run(decode_cli::MtpDecodeQualificationContext& c, const std::filesys
     // reads this switch; it times from the restored frontier on the oracle above and restores the session.
     if (const char* wide = std::getenv("STRIX_MTP_WIDE_COST"); wide && std::string_view(wide) == "1")
         wide_cost::run(c, destination, owners, tokens, logits, reset);
-    std::cout << "{\"mode\":\"native-mtp-prefix-gate\",\"cases\":" << cases << ",\"passed\":true,\"performance_qualified\":false}\n";
+    std::cout << "{\"profile\":" << profile_json << ",\"mode\":\"native-mtp-prefix-gate\",\"cases\":" << cases << ",\"passed\":true,\"performance_qualified\":false}\n";
 }
 } // namespace strix::tests::prefix_gate
