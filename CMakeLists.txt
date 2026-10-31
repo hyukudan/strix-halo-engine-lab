@@ -2772,6 +2772,12 @@ if(STRIX_ENABLE_HIP_RUNTIME)
             NAME strix-hip-ple-launcher-tests
             COMMAND strix-hip-ple-launcher-tests
         )
+        # STRIX_PLE_WINDOW_WARM: verify-window PLE rows with and without decode cache warming, bitwise.
+        add_executable(strix-hip-ple-window-warm-tests tests/hip_ple_window_warm_tests.hip)
+        set_target_properties(strix-hip-ple-window-warm-tests PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES gfx1151)
+        target_link_libraries(strix-hip-ple-window-warm-tests PRIVATE strix_hip_runtime)
+        strix_target_warnings(strix-hip-ple-window-warm-tests)
+        add_test(NAME strix-hip-ple-window-warm-tests COMMAND strix-hip-ple-window-warm-tests)
 
         add_executable(strix-hip-qsa-input-prefetch-tests tests/hip_qsa_input_prefetch_tests.hip)
         set_target_properties(strix-hip-qsa-input-prefetch-tests PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHITECTURES}")

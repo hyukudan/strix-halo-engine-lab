@@ -78,6 +78,16 @@ private:
 // reads in place (unified memory: no copy and no synchronisation inside the window). The host
 // n-gram history is not advanced by launch(); the PLE convolution state after each row is kept,
 // and commit(n_keep) restores row n_keep-1's convolution state and publishes its history.
+// STRIX_PLE_WINDOW_WARM (default on; =0, STRIX_QPF2K_DEFAULTS=0 or STRIX_BASELINE=1 off; effective only with a
+// rolling-residency decode turn): the MTP draft loop reports the next verify window's
+// input tokens as the host learns them (begin: row 0, the pending token; draft(k): row k + 1, draft k). Their PLE
+// table pages are loaded into the decode read cache in the background; the window's lookups and bytes are unchanged.
+namespace ple_window_warm {
+[[nodiscard]] bool enabled() noexcept;
+void begin(std::uint32_t token) noexcept;
+void draft(std::uint32_t step, std::uint32_t token) noexcept;
+}  // namespace ple_window_warm
+
 class HipPleKnownWindow {
 public:
     // prefill: up to known_prefill_max_rows (8192) rows that are always all kept; launch() publishes the last row's

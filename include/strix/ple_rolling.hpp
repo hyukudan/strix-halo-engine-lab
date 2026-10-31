@@ -148,6 +148,10 @@ public:
         static constexpr std::uint64_t maximum_verify_positions = 8;
         void verify_window(std::uintptr_t table, std::uint64_t generation,
             std::uint64_t positions, std::span<const std::uint64_t> rows, const std::function<void()>& copy);
+        // Decode cache warming: admits and reads the pages of `rows` into this turn's decode cache like a verify
+        // source, without a copy (no bytes leave the cache; later lookups copy the same immutable bytes). Returns
+        // the pages that were not yet in the decode cache. Any thread; serialised by the ledger like source().
+        std::uint64_t warm(std::uintptr_t table, std::uint64_t generation, std::span<const std::uint64_t> rows);
         [[nodiscard]] std::uint64_t epoch() const;
         void gather(std::span<const std::uint64_t> rows, const std::function<void()>& copy);
         // Known prompt only: the same ordered, capped I/O pipeline as plain CLI.
@@ -210,7 +214,8 @@ private:
     void retire_prompt(State& state);
     void sample();
     void source(std::uint64_t id, std::uintptr_t table, std::uint64_t generation,
-        std::span<const std::uint64_t> rows, const std::function<void()>& copy, std::uint64_t epoch);
+        std::span<const std::uint64_t> rows, const std::function<void()>& copy, std::uint64_t epoch,
+        std::uint64_t* uncached = nullptr);
     void gather(std::uint64_t id, std::span<const std::uint64_t> rows, const std::function<void()>& copy);
     void phase(std::uint64_t id, bool prompt);
     void close(std::uint64_t id, bool cancelled);

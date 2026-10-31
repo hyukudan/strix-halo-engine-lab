@@ -530,6 +530,14 @@ void bf16_reader_binding() {
             }
         });
     }
+    // Decode warming (draft-phase PLE prefetch): the verified pages are already in the decode cache, so warming
+    // reads nothing and the next lookup copies the same bytes.
+    expect(turn->warm(runtime.address,23,ids)==0,"decode warming finds cached verify pages and reads nothing");
+    target.finish(target.start({ids,320,&tensor,&runtime}),leased);
+    expect(warm==leased,"decode warming leaves the leased BF16 bytes unchanged");
+    turn->phase(true);
+    refuses([&] { (void)turn->warm(runtime.address,23,ids); });
+    turn->phase(false);
     turn->finish(); target.bind_residency(nullptr);
     auto late=owner->begin(); target.bind_residency(late);
     const auto stale=target.start({ids,320,&tensor,&runtime});
