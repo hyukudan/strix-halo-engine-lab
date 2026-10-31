@@ -1,0 +1,18 @@
+# Product profiles (--profile default|fast|quality): one table maps each profile to existing switches.
+add_library(strix_gemma4_profile STATIC src/gemma4/engine/profile.cpp)
+target_link_libraries(strix_gemma4_profile PUBLIC strix_gemma4_contracts)
+strix_target_warnings(strix_gemma4_profile)
+target_link_libraries(strix_gemma4_engine PUBLIC strix_gemma4_profile)
+foreach(app IN ITEMS strix-gemma4-bench strix-gemma4-prefill-check
+        strix_gemma4_device_host_compile strix_gemma4_prefill_host_compile)
+    if(TARGET ${app})
+        target_link_libraries(${app} PRIVATE strix_gemma4_profile)
+    endif()
+endforeach()
+if(BUILD_TESTING)
+    add_executable(strix-gemma4-profile-tests tests/gemma4_profile/profile_tests.cpp)
+    target_link_libraries(strix-gemma4-profile-tests PRIVATE strix_gemma4_profile)
+    strix_target_warnings(strix-gemma4-profile-tests)
+    add_test(NAME strix-gemma4-profile-tests COMMAND strix-gemma4-profile-tests)
+    set_tests_properties(strix-gemma4-profile-tests PROPERTIES TIMEOUT 60)
+endif()

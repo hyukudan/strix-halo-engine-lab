@@ -1,0 +1,1004 @@
+{
+ "tokenizer_class": "GemmaTokenizer",
+ "special": {
+  "bos_token": "<bos>",
+  "eos_token": "<eos>",
+  "unk_token": "<unk>",
+  "pad_token": "<pad>",
+  "mask_token": "<mask>",
+  "audio_token": "<|audio|>",
+  "boa_token": "<|audio>",
+  "boi_token": "<|image>",
+  "eoa_token": "<audio|>",
+  "eoc_token": "<channel|>",
+  "eoi_token": "<image|>",
+  "eot_token": "<turn|>",
+  "escape_token": "<|\"|>",
+  "etc_token": "<tool_call|>",
+  "etd_token": "<tool|>",
+  "etr_token": "<tool_response|>",
+  "image_token": "<|image|>",
+  "soc_token": "<|channel>",
+  "sot_token": "<|turn>",
+  "stc_token": "<|tool_call>",
+  "std_token": "<|tool>",
+  "str_token": "<|tool_response>",
+  "think_token": "<|think|>"
+ },
+ "bos_id": 2,
+ "eos_id": 1,
+ "pad_id": 0,
+ "encode": [
+  {
+   "text": "",
+   "ids": [],
+   "decoded": ""
+  },
+  {
+   "text": " ",
+   "ids": [
+    236743
+   ],
+   "decoded": " "
+  },
+  {
+   "text": "Hello, world!",
+   "ids": [
+    9259,
+    236764,
+    1902,
+    236888
+   ],
+   "decoded": "Hello, world!"
+  },
+  {
+   "text": "  leading and trailing spaces  ",
+   "ids": [
+    138,
+    26016,
+    532,
+    45330,
+    9952,
+    138
+   ],
+   "decoded": "  leading and trailing spaces  "
+  },
+  {
+   "text": "line1\nline2\n\n\ttab",
+   "ids": [
+    1257,
+    236770,
+    107,
+    1257,
+    236778,
+    108,
+    255968,
+    4823
+   ],
+   "decoded": "line1\nline2\n\n\ttab"
+  },
+  {
+   "text": "Ünïcödé façade naïve",
+   "ids": [
+    238194,
+    236749,
+    238527,
+    236755,
+    55515,
+    236859,
+    96008,
+    120362
+   ],
+   "decoded": "Ünïcödé façade naïve"
+  },
+  {
+   "text": "¿Qué tal estás? Señor Muñoz pagó 1.234,56 € el 3/10/2026.",
+   "ids": [
+    237665,
+    24338,
+    5883,
+    64135,
+    236881,
+    79831,
+    115303,
+    8564,
+    236916,
+    236743,
+    236770,
+    236761,
+    236778,
+    236800,
+    236812,
+    236764,
+    236810,
+    236825,
+    11361,
+    862,
+    236743,
+    236800,
+    236786,
+    236770,
+    236771,
+    236786,
+    236778,
+    236771,
+    236778,
+    236825,
+    236761
+   ],
+   "decoded": "¿Qué tal estás? Señor Muñoz pagó 1.234,56 € el 3/10/2026."
+  },
+  {
+   "text": "Le cœur a ses raisons que la raison ne connaît point.",
+   "ids": [
+    3258,
+    47037,
+    496,
+    7529,
+    107687,
+    929,
+    759,
+    37344,
+    770,
+    158328,
+    1523,
+    236761
+   ],
+   "decoded": "Le cœur a ses raisons que la raison ne connaît point."
+  },
+  {
+   "text": "Grüße aus München – Straße, Fluß, Maß.",
+   "ids": [
+    9322,
+    236959,
+    16756,
+    5581,
+    67772,
+    1271,
+    80176,
+    236764,
+    39614,
+    237435,
+    236764,
+    83754,
+    236761
+   ],
+   "decoded": "Grüße aus München – Straße, Fluß, Maß."
+  },
+  {
+   "text": "机器学习是人工智能的一个分支。",
+   "ids": [
+    202589,
+    237026,
+    136119,
+    55399,
+    132286,
+    236924
+   ],
+   "decoded": "机器学习是人工智能的一个分支。"
+  },
+  {
+   "text": "東京で雨の日に楽しめる観光スポット",
+   "ids": [
+    31414,
+    237007,
+    239226,
+    236945,
+    46160,
+    160570,
+    85313,
+    160784
+   ],
+   "decoded": "東京で雨の日に楽しめる観光スポット"
+  },
+  {
+   "text": "한국어 텍스트입니다.",
+   "ids": [
+    114216,
+    237430,
+    236743,
+    243007,
+    34718,
+    15245,
+    236761
+   ],
+   "decoded": "한국어 텍스트입니다."
+  },
+  {
+   "text": "Привет, как дела?",
+   "ids": [
+    116130,
+    236764,
+    6815,
+    22633,
+    236881
+   ],
+   "decoded": "Привет, как дела?"
+  },
+  {
+   "text": "مرحبا بالعالم",
+   "ids": [
+    236873,
+    150345,
+    107602,
+    17193
+   ],
+   "decoded": "مرحبا بالعالم"
+  },
+  {
+   "text": "नमस्ते दुनिया",
+   "ids": [
+    226767,
+    19975
+   ],
+   "decoded": "नमस्ते दुनिया"
+  },
+  {
+   "text": "สวัสดีครับ",
+   "ids": [
+    49366,
+    45451
+   ],
+   "decoded": "สวัสดีครับ"
+  },
+  {
+   "text": "emoji 🙂🚀👍🏽 and ZWJ 👨‍👩‍👧",
+   "ids": [
+    67906,
+    57235,
+    242015,
+    240493,
+    242713,
+    532,
+    1491,
+    236824,
+    236863,
+    236743,
+    243874,
+    237243,
+    243767,
+    237243,
+    244814
+   ],
+   "decoded": "emoji 🙂🚀👍🏽 and ZWJ 👨‍👩‍👧"
+  },
+  {
+   "text": "def f(x):\n    return x ** 2  # square\n",
+   "ids": [
+    2063,
+    517,
+    236769,
+    236781,
+    1473,
+    107,
+    140,
+    2060,
+    1123,
+    5213,
+    236743,
+    236778,
+    138,
+    236865,
+    6281,
+    107
+   ],
+   "decoded": "def f(x):\n    return x ** 2  # square\n"
+  },
+  {
+   "text": "{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Madrid\"}}",
+   "ids": [
+    14937,
+    1201,
+    1083,
+    623,
+    828,
+    236779,
+    19323,
+    827,
+    623,
+    33178,
+    1083,
+    3714,
+    13319,
+    1083,
+    623,
+    133732,
+    127096
+   ],
+   "decoded": "{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Madrid\"}}"
+  },
+  {
+   "text": "1234567890 3.14159 -0.5e-3",
+   "ids": [
+    236770,
+    236778,
+    236800,
+    236812,
+    236810,
+    236825,
+    236832,
+    236828,
+    236819,
+    236771,
+    236743,
+    236800,
+    236761,
+    236770,
+    236812,
+    236770,
+    236810,
+    236819,
+    753,
+    236771,
+    236761,
+    236810,
+    236744,
+    236772,
+    236800
+   ],
+   "decoded": "1234567890 3.14159 -0.5e-3"
+  },
+  {
+   "text": "<start_of_turn>user\nhi<end_of_turn>",
+   "ids": [
+    236820,
+    3041,
+    236779,
+    1340,
+    236779,
+    887,
+    236813,
+    2364,
+    107,
+    2202,
+    236820,
+    643,
+    236779,
+    1340,
+    236779,
+    887,
+    236813
+   ],
+   "decoded": "<start_of_turn>user\nhi<end_of_turn>"
+  },
+  {
+   "text": "\u0000\u0001 control ",
+   "ids": [
+    238,
+    249732,
+    2256,
+    236743,
+    251541
+   ],
+   "decoded": "\u0000\u0001 control "
+  },
+  {
+   "text": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+   "ids": [
+    128820,
+    128820,
+    128820,
+    128820,
+    128820,
+    128820,
+    128820,
+    128820,
+    128820,
+    128820,
+    128820,
+    128820,
+    128820,
+    128820,
+    128820,
+    128820,
+    128820,
+    128820,
+    128820,
+    128820,
+    128820,
+    128820,
+    128820,
+    128820,
+    128820,
+    128820,
+    128820,
+    128820,
+    128820,
+    128820,
+    128820,
+    128820,
+    128820,
+    128820,
+    128820,
+    128820,
+    128820,
+    50354
+   ],
+   "decoded": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+  },
+  {
+   "text": "https://huggingface.co/nvidia/NVIDIA-Nemotron-3.5-Bolt-E4B-BF16?x=1&y=2#frag",
+   "ids": [
+    2574,
+    1411,
+    236754,
+    113416,
+    1979,
+    236761,
+    1364,
+    236786,
+    189824,
+    236786,
+    236797,
+    69553,
+    236772,
+    98269,
+    68745,
+    236772,
+    236800,
+    236761,
+    236810,
+    236772,
+    226338,
+    236772,
+    236788,
+    236812,
+    236799,
+    236772,
+    28671,
+    236770,
+    236825,
+    236881,
+    236781,
+    236784,
+    236770,
+    236880,
+    236762,
+    236784,
+    236778,
+    236865,
+    45265
+   ],
+   "decoded": "https://huggingface.co/nvidia/NVIDIA-Nemotron-3.5-Bolt-E4B-BF16?x=1&y=2#frag"
+  }
+ ],
+ "chat": [
+  {
+   "name": "single_user",
+   "messages": [
+    {
+     "role": "user",
+     "content": "Hola, ¿qué tal?"
+    }
+   ],
+   "kwargs": {},
+   "rendered": "<bos><|turn>user\nHola, ¿qué tal?<turn|>\n<|turn>model\n",
+   "ids": [
+    2,
+    105,
+    2364,
+    107,
+    21529,
+    236764,
+    7196,
+    24360,
+    5883,
+    236881,
+    106,
+    107,
+    105,
+    4368,
+    107
+   ]
+  },
+  {
+   "name": "system_user",
+   "messages": [
+    {
+     "role": "system",
+     "content": "Eres un asistente conciso."
+    },
+    {
+     "role": "user",
+     "content": "Resume la Revolución Francesa."
+    }
+   ],
+   "kwargs": {},
+   "rendered": "<bos><|turn>system\nEres un asistente conciso.<turn|>\n<|turn>user\nResume la Revolución Francesa.<turn|>\n<|turn>model\n",
+   "ids": [
+    2,
+    105,
+    9731,
+    107,
+    202057,
+    723,
+    155855,
+    3300,
+    11208,
+    236761,
+    106,
+    107,
+    105,
+    2364,
+    107,
+    34355,
+    759,
+    200370,
+    30843,
+    236746,
+    236761,
+    106,
+    107,
+    105,
+    4368,
+    107
+   ]
+  },
+  {
+   "name": "thinking_on",
+   "messages": [
+    {
+     "role": "user",
+     "content": "¿Cuánto es 17*23?"
+    }
+   ],
+   "kwargs": {
+    "enable_thinking": true
+   },
+   "rendered": "<bos><|turn>system\n<|think|>\n<turn|>\n<|turn>user\n¿Cuánto es 17*23?<turn|>\n<|turn>model\n",
+   "ids": [
+    2,
+    105,
+    9731,
+    107,
+    98,
+    107,
+    106,
+    107,
+    105,
+    2364,
+    107,
+    237665,
+    139708,
+    1115,
+    236743,
+    236770,
+    236832,
+    236829,
+    236778,
+    236800,
+    236881,
+    106,
+    107,
+    105,
+    4368,
+    107
+   ]
+  },
+  {
+   "name": "multi_turn",
+   "messages": [
+    {
+     "role": "user",
+     "content": "Hi"
+    },
+    {
+     "role": "assistant",
+     "content": "Hello! How can I help?"
+    },
+    {
+     "role": "user",
+     "content": "Tell me a joke."
+    }
+   ],
+   "kwargs": {},
+   "rendered": "<bos><|turn>user\nHi<turn|>\n<|turn>model\nHello! How can I help?<turn|>\n<|turn>user\nTell me a joke.<turn|>\n<|turn>model\n",
+   "ids": [
+    2,
+    105,
+    2364,
+    107,
+    10979,
+    106,
+    107,
+    105,
+    4368,
+    107,
+    9259,
+    236888,
+    2088,
+    740,
+    564,
+    1601,
+    236881,
+    106,
+    107,
+    105,
+    2364,
+    107,
+    54593,
+    786,
+    496,
+    31481,
+    236761,
+    106,
+    107,
+    105,
+    4368,
+    107
+   ]
+  },
+  {
+   "name": "tools",
+   "messages": [
+    {
+     "role": "user",
+     "content": "Weather in Madrid in celsius?"
+    }
+   ],
+   "kwargs": {
+    "tools": [
+     {
+      "type": "function",
+      "function": {
+       "name": "get_weather",
+       "description": "Get the current weather for a city",
+       "parameters": {
+        "type": "object",
+        "properties": {
+         "city": {
+          "type": "string"
+         },
+         "unit": {
+          "type": "string",
+          "enum": [
+           "celsius",
+           "fahrenheit"
+          ]
+         }
+        },
+        "required": [
+         "city"
+        ]
+       }
+      }
+     }
+    ]
+   },
+   "rendered": "<bos><|turn>system\n<|tool>declaration:get_weather{description:<|\"|>Get the current weather for a city<|\"|>,parameters:{properties:{city:{type:<|\"|>STRING<|\"|>},unit:{enum:[<|\"|>celsius<|\"|>,<|\"|>fahrenheit<|\"|>],type:<|\"|>STRING<|\"|>}},required:[<|\"|>city<|\"|>],type:<|\"|>OBJECT<|\"|>}}<tool|><turn|>\n<|turn>user\nWeather in Madrid in celsius?<turn|>\n<|turn>model\n",
+   "ids": [
+    2,
+    105,
+    9731,
+    107,
+    46,
+    163688,
+    236787,
+    828,
+    236779,
+    19323,
+    236782,
+    7777,
+    236787,
+    52,
+    3407,
+    506,
+    1873,
+    7606,
+    573,
+    496,
+    3207,
+    52,
+    236764,
+    19031,
+    29616,
+    15921,
+    29616,
+    13319,
+    29616,
+    2084,
+    236787,
+    52,
+    35410,
+    52,
+    1263,
+    6805,
+    29616,
+    24626,
+    24845,
+    52,
+    236755,
+    42024,
+    52,
+    236764,
+    52,
+    46435,
+    15882,
+    52,
+    1604,
+    2084,
+    236787,
+    52,
+    35410,
+    52,
+    5237,
+    15979,
+    24845,
+    52,
+    13319,
+    52,
+    1604,
+    2084,
+    236787,
+    52,
+    60688,
+    52,
+    1807,
+    47,
+    106,
+    107,
+    105,
+    2364,
+    107,
+    26588,
+    528,
+    19627,
+    528,
+    154651,
+    236881,
+    106,
+    107,
+    105,
+    4368,
+    107
+   ]
+  },
+  {
+   "name": "tool_round_trip",
+   "messages": [
+    {
+     "role": "user",
+     "content": "Weather in Madrid?"
+    },
+    {
+     "role": "assistant",
+     "tool_calls": [
+      {
+       "type": "function",
+       "function": {
+        "name": "get_weather",
+        "arguments": {
+         "city": "Madrid",
+         "unit": "celsius"
+        }
+       }
+      }
+     ]
+    },
+    {
+     "role": "tool",
+     "name": "get_weather",
+     "content": "{\"temp\": 21, \"sky\": \"clear\"}"
+    }
+   ],
+   "kwargs": {
+    "tools": [
+     {
+      "type": "function",
+      "function": {
+       "name": "get_weather",
+       "description": "Get the current weather for a city",
+       "parameters": {
+        "type": "object",
+        "properties": {
+         "city": {
+          "type": "string"
+         },
+         "unit": {
+          "type": "string",
+          "enum": [
+           "celsius",
+           "fahrenheit"
+          ]
+         }
+        },
+        "required": [
+         "city"
+        ]
+       }
+      }
+     }
+    ]
+   },
+   "rendered": "<bos><|turn>system\n<|tool>declaration:get_weather{description:<|\"|>Get the current weather for a city<|\"|>,parameters:{properties:{city:{type:<|\"|>STRING<|\"|>},unit:{enum:[<|\"|>celsius<|\"|>,<|\"|>fahrenheit<|\"|>],type:<|\"|>STRING<|\"|>}},required:[<|\"|>city<|\"|>],type:<|\"|>OBJECT<|\"|>}}<tool|><turn|>\n<|turn>user\nWeather in Madrid?<turn|>\n<|turn>model\n<|tool_call>call:get_weather{city:<|\"|>Madrid<|\"|>,unit:<|\"|>celsius<|\"|>}<tool_call|><|tool_response>response:get_weather{value:<|\"|>{\"temp\": 21, \"sky\": \"clear\"}<|\"|>}<tool_response|>",
+   "ids": [
+    2,
+    105,
+    9731,
+    107,
+    46,
+    163688,
+    236787,
+    828,
+    236779,
+    19323,
+    236782,
+    7777,
+    236787,
+    52,
+    3407,
+    506,
+    1873,
+    7606,
+    573,
+    496,
+    3207,
+    52,
+    236764,
+    19031,
+    29616,
+    15921,
+    29616,
+    13319,
+    29616,
+    2084,
+    236787,
+    52,
+    35410,
+    52,
+    1263,
+    6805,
+    29616,
+    24626,
+    24845,
+    52,
+    236755,
+    42024,
+    52,
+    236764,
+    52,
+    46435,
+    15882,
+    52,
+    1604,
+    2084,
+    236787,
+    52,
+    35410,
+    52,
+    5237,
+    15979,
+    24845,
+    52,
+    13319,
+    52,
+    1604,
+    2084,
+    236787,
+    52,
+    60688,
+    52,
+    1807,
+    47,
+    106,
+    107,
+    105,
+    2364,
+    107,
+    26588,
+    528,
+    19627,
+    236881,
+    106,
+    107,
+    105,
+    4368,
+    107,
+    48,
+    6639,
+    236787,
+    828,
+    236779,
+    19323,
+    236782,
+    13319,
+    236787,
+    52,
+    133732,
+    52,
+    236764,
+    6805,
+    236787,
+    52,
+    236755,
+    42024,
+    52,
+    236783,
+    49,
+    50,
+    6275,
+    236787,
+    828,
+    236779,
+    19323,
+    236782,
+    2394,
+    236787,
+    52,
+    14937,
+    7617,
+    1083,
+    236743,
+    236778,
+    236770,
+    236764,
+    623,
+    16012,
+    1083,
+    623,
+    9347,
+    25938,
+    52,
+    236783,
+    51
+   ]
+  },
+  {
+   "name": "conversational",
+   "messages": [
+    {
+     "role": "user",
+     "content": "Cuéntame algo breve."
+    }
+   ],
+   "kwargs": {
+    "conversational_mode": true
+   },
+   "rendered": "<bos><|turn>system\nYou are having a spoken conversation with the user. Respond as briefly as possible while still addressing their questions fully.<turn|>\n<|turn>user\nCuéntame algo breve.<turn|>\n<|turn>model\n",
+   "ids": [
+    2,
+    105,
+    9731,
+    107,
+    3048,
+    659,
+    2963,
+    496,
+    22852,
+    12309,
+    607,
+    506,
+    2430,
+    236761,
+    58025,
+    618,
+    21485,
+    618,
+    2653,
+    1651,
+    2036,
+    25963,
+    910,
+    4137,
+    6340,
+    236761,
+    106,
+    107,
+    105,
+    2364,
+    107,
+    14344,
+    44140,
+    683,
+    18815,
+    57921,
+    236761,
+    106,
+    107,
+    105,
+    4368,
+    107
+   ]
+  }
+ ]
+}

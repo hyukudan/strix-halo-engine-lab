@@ -5,7 +5,9 @@ verify windows, golden replay, the prefix cache, the two-rank communicator and t
 optional module that registers itself with the core and owns its contract, execution plan and kernels. Any subset of
 families must build and pass its own tests. Today `deepseek41` is a module (CMake option `STRIX_FAMILY_DEEPSEEK41`,
 default ON). The Qwen path will move behind the same registry in a dedicated step with its own gates; until then it
-is built unconditionally and does not depend on any family module.
+is built unconditionally and does not depend on any family module. The `gemma4` family (Nemotron 3.5
+Bolt E4B, CMake option `STRIX_FAMILY_GEMMA4`, default OFF) builds its own targets under `src/gemma4/` and does not
+register with the core yet; see [nemotron-3.5-bolt-e4b](nemotron-3.5-bolt-e4b/README.md).
 
 ## The registry (core)
 

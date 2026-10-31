@@ -123,6 +123,7 @@ El comando produce un recibo JSON con los IDs de token y los tiempos. Los ficher
 | DeepSeek V4.1 Flash, RTX independiente | RTX PRO 6000 (96 GB, Windows WDDM) | **Production** | Expertos GGUF Q2, densos Q8_0; VRAM exclusiva + caché en memoria de host fijada (pinned); DSpark en la GPU con el controlador caliente seleccionado como opción especulativa predeterminada |
 | MiniMax M3.1 Flash (EXL3, 3.06 bpw) | 2 nodos TP2 sobre USB4 | **Production** | Gate de calidad de ocho textos superado; prefill/decode exactos; admisión automática de DSpark en el servicio y modo MSA 5; valores predeterminados de prefill/intercambio activados |
 | GLM-5.3 Flash (EXL3, 4.05 bpw) | 2 nodos TP2 sobre USB4 | **Production** | Identidad de decode R1b por defecto; autoespeculación MTP exacta por defecto; prefill por fragmentos R1 exacto; `--identity r1` restaura R1; corrección R≥3 verificada en el par |
+| Nemotron 3.5 Bolt E4B (Q4_K_M; paquete EXL3 para `quality`) | 1 nodo | **Compilación opcional (opt-in)** (`STRIX_FAMILY_GEMMA4=ON`) | `--profile default\|fast\|quality`; decode exacto con cualquier tamaño de batch; drafter MTP exacto en C1; servidor con batching continuo |
 
 El núcleo no conoce ningún modelo: cada familia es un módulo con su propio contrato, plan, kernels y gates
 ([docs/models/model-families.md](docs/models/model-families.md)). Las rutas automáticas admiten los assets de modelo según sus contratos documentados; la procedencia y las licencias se registran en
@@ -516,6 +517,43 @@ sigue sin resolverse. Los grafos HIP **no están implementados**: el perfil más
 y un hueco recuperable calculado de **≤1.8 ms** (una cota, no una aceleración medida). El avance del host a través de
 los límites de intercambio requiere captura segmentada; los kernels de dispositivo y el desfase entre ranks tienen prioridad.
 
+### Nemotron 3.5 Bolt E4B
+
+Fuentes: [guía del modelo](docs/models/nemotron-3.5-bolt-e4b/README.md).
+
+Un nodo Strix Halo (gfx1151, 128 GB), GGUF Q4_K_M oficial para `default` y `fast`, paquete EXL3 para `quality`;
+decode de chat en inglés de 256 tokens, greedy. C4 y C8 son tok/s agregados entre peticiones concurrentes. Cada valor
+de llama.cpp procede de la misma sesión de medida que la fila con la que se compara.
+
+| Perfil | C1 | C1 + drafter MTP | C4 | C8 |
+|---|---:|---:|---:|---:|
+| `default` (exacto, `g4-v1`) | 55.9 | 85.1 | 169.3 | 237.9 |
+| `fast` (`g4-a8-v1`, cualificado) | 53.9 | 92.2 | 205.1 | 337.5 |
+| `quality` (EXL3, `g4-exl3-v3`) | 44.4 | 72.1 | 153.0 | 258.7 |
+| llama.cpp `74a4fb00`, mismo Q4_K_M | 55.4 | — | 193.3 | 281.9 |
+
+Con el drafter, los ids de los tokens son iguales a los obtenidos sin draft (verificado en inglés, español, japonés y
+código en C1, y en C4).
+
+Prefill (tok/s; todos los perfiles usan prefill exacto):
+
+| Prompt | `default` | `fast` | `quality` | llama.cpp |
+|---|---:|---:|---:|---:|
+| 512 | 471 | 474 | 236 | 2,065 |
+| 2K | 466 | 458 | 225 | 2,052 |
+| 8K | 429 | 414 | 173 | 1,873 |
+| 16K | 404 | 403 | 64 | 1,684 |
+| 32K | 358 | 355 | no medido | 1,373 |
+
+El prefill exacto usa aritmética FP32 sin contracción y alcanza aproximadamente una cuarta parte de la velocidad de
+llama.cpp. El prefill WMMA del perfil `fast` está pendiente de cualificación y no se aplica; el prefill de `quality`
+sigue ejecutándose en fragmentos de ocho filas y se ralentiza con contexto largo. En C4/C8, `default` queda por debajo
+de llama.cpp y `fast` por encima.
+
+Comandos de llama.cpp: C1 `llama-bench -m Q4_K_M.gguf -fa 1 -ngl 99 -n 128 -p 0 -r 3`; C4/C8
+`llama-batched-bench -m Q4_K_M.gguf -fa on -ngl 99 -c 2048 -npp 64 -ntg 32 -npl 1,4,8`; prefill
+`llama-bench -m Q4_K_M.gguf -fa 1 -ngl 99 -n 0 -r 2 -p 512,2048,8192` y `-r 1 -p 8192,16384,32768`.
+
 ### Cambios incorporados más allá de las campañas históricas
 
 Las campañas detalladas anteriores conservan sus identidades de compilación medidas. Main también incorpora los siguientes
@@ -848,6 +886,21 @@ El decode R1b predeterminado usa autoespeculación MTP exacta y prefill de promp
 con los mismos tokens. `--identity r1` selecciona una identidad de referencia distinta. El prefill usa automáticamente
 8192 filas si ambos ranks las admiten; en caso contrario, 4096. Véanse el [resolutor](apps/glm_rank_defaults.hpp),
 las [familias de modelos](docs/models/model-families.md) y la [cualificación/rendimiento](docs/performance.md).
+
+### Nemotron 3.5 Bolt E4B
+
+Compile con `-DSTRIX_FAMILY_GEMMA4=ON` (desactivado por defecto) y `ninja -C build strix-gemma4-serve`. Genere las
+tablas rotatorias una vez y sirva en un nodo:
+
+```sh
+python src/gemma4/ref/make_rope_tables.py rotary-tables --positions 65536 --workers 6
+./build/strix-gemma4-serve MODEL_DIR --rope-tables rotary-tables --tokenizer MODEL_DIR/tokenizer.json --profile default
+```
+
+`--profile fast` selecciona activaciones int8; `--profile quality` requiere `--exl3-arm DIR`. Un paquete de drafter
+MTP en `MODEL_DIR/drafter-mtp/` se usa automáticamente (`--draft off` lo desactiva). El paquete del drafter y los
+paquetes EXL3 aún no están publicados; sin ellos, `default` y `fast` ejecutan decode simple y `quality` no arranca.
+Véase la [guía del modelo](docs/models/nemotron-3.5-bolt-e4b/README.md).
 
 <a id="qwen-long-context"></a>
 

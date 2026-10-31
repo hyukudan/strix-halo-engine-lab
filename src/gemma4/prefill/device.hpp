@@ -1,0 +1,162 @@
+#pragma once
+#include "prefill.hpp"
+#include "attention.hpp"
+#include "gemma4/kernels/device.hpp"
+#include <map>
+
+namespace strix::gemma4::prefill {
+[[nodiscard]] bool tiled_enabled(); // startup-cached STRIX_G4_PREFILL_TILING
+[[nodiscard]] bool prepared_enabled(); // startup-cached STRIX_G4_PREFILL_PREPARE
+[[nodiscard]] unsigned direct_mode(); // startup-cached STRIX_G4_PREFILL_DIRECT, default 3
+// Immutable FP16 panels, decoded once with the identity's RNE/overflow rules.
+// This owns an additional 2*ceil(N/16)*16*ceil(K/16)*16 bytes, never alters w.
+// Construction synchronizes and rejects overflow before returning usable panels.
+class PreparedLinear {
+  public:
+    explicit PreparedLinear(LinearView weights, gpu::Queue queue = nullptr);
+    [[nodiscard]] const gpu::Buffer& panels() const { return panels_; }
+    [[nodiscard]] LinearView weights() const { return weights_; }
+  private:
+    LinearView weights_;
+    gpu::Buffer panels_;
+};
+// Inputs/outputs/weights are device-resident. Scratch holds rows*ceil(K/16)*16
+// FP16 values. failure and maximum are required device uint32_t scalars; maximum
+// receives max(abs(input)) as positive FP32 bits. Calls enqueue on queue.
+void linear(LinearView weights, const float* x, unsigned rows, float* out, void* scratch,
+            std::uint32_t* failure, std::uint32_t* maximum, gpu::Queue queue = nullptr, bool tiled = true,
+            const PreparedLinear* prepared = nullptr, void* converted_event = nullptr, bool converted = false);
+// Exact fusion of gate, up, gelu_tanh(gate)*up and the next linear's FP16
+// input conversion: product receives rows x outputs FP16 panels as linear's
+// scratch would after converting the FP32 product; maximum[0..2] receive the
+// gate/up input and product abs-bits maxima. STRIX_G4_PREFILL_FUSE_FFN=0
+// keeps the separate steps (identical bits).
+[[nodiscard]] bool fused_ffn_enabled();
+[[nodiscard]] bool gelu_pair_supported(const PreparedLinear& gate, const PreparedLinear& up);
+void gelu_pair(const PreparedLinear& gate, const PreparedLinear& up, const float* x, unsigned rows, void* scratch,
+               void* product, std::uint32_t* failure, std::uint32_t* maximum, gpu::Queue queue = nullptr);
+// Opt-in attention sub-profile. Descriptors use B's immutable snapshot
+// and unpublished overlay contract. Queries are consecutive absolute positions
+// in one stream, with identical cache/overlay descriptors except position.
+// No cache bytes or tags are written here.
+void attention(const float* q, const gpu::KvRead* reads, unsigned rows, unsigned heads, unsigned dim,
+               float* out, std::uint32_t* failure, gpu::Queue queue = nullptr, void* packed = nullptr,
+               unsigned packed_stride = 0, unsigned key_capacity = 0, bool repack = true);
+// Bytes required for packed at packed_stride positions of width KV components.
+// The default split operand layout (STRIX_G4_PREFILL_ATTN_SPLIT=0 restores the
+// original kernel; identical bits) needs more than the original 2*stride*width.
+[[nodiscard]] std::size_t attention_packed_bytes(unsigned packed_stride, unsigned width);
+[[nodiscard]] bool attention_split_enabled(); // startup-cached STRIX_G4_PREFILL_ATTN_SPLIT
+// Canonical (g4-v1) attention for a whole prefill chunk in three launches,
+// byte-identical to gpu::attention evaluated row by row on the same
+// descriptors (see canonical.hip). reads is the host copy of the chunk's
+// descriptors: consecutive positions of one stream, identical otherwise.
+// Scores span [base, base + width) per (row, head); scratch needs
+// rows * heads * width floats and denominators rows * heads floats.
+// Returns false, enqueueing nothing, for head dimensions other than 256/512.
+[[nodiscard]] bool canonical_kernel_enabled(); // startup-cached STRIX_G4_PREFILL_CANON_KERNEL, default on
+struct CanonicalSpan {
+    std::uint64_t base = 0;
+    unsigned width = 0;
+};
+[[nodiscard]] bool canonical_pack_enabled(); // startup-cached STRIX_G4_PREFILL_CANON_PACK, default on
+[[nodiscard]] bool canonical_fuse_enabled(); // startup-cached STRIX_G4_PREFILL_CANON_FUSE, default on
+[[nodiscard]] CanonicalSpan canonical_span(const gpu::KvRead& first_row, unsigned rows);
+// Packed queries/keys (post-order lane layout) and key presence for launch one.
+[[nodiscard]] std::size_t canonical_packed_floats(unsigned rows, unsigned heads, unsigned dim, unsigned span_width);
+struct CanonicalScratch {
+    float* scores = nullptr;       // rows * heads * span width floats
+    std::size_t score_floats = 0;
+    float* denominators = nullptr; // rows * heads floats
+    float* packed = nullptr;       // canonical_packed_floats(), when packing
+    std::size_t packed_floats = 0;
+};
+// pack/fuse: -1 = STRIX_G4_PREFILL_CANON_PACK/_FUSE, 0/1 forced. Fused computes
+// row maxima in the score launch and exp/denominators in the value launch (no
+// softmax launch). phase_ms (optional, four entries: pack, scores, softmax,
+// values) accumulates synchronized event times.
+bool canonical_attention(const float* q, std::span<const gpu::KvRead> reads, unsigned heads, unsigned dim, float* out,
+                         std::uint32_t* failure, gpu::Queue queue, const CanonicalScratch& scratch, int pack = -1,
+                         float* phase_ms = nullptr, int fuse = -1);
+
+// Linear arithmetic of a prefill object. wmma is the g4-wmma-pf identity
+// (FP16 operands). exact keeps every g4-v1 linear: gpu::linear_rows, whose
+// bytes equal the decode target's eight-row passes, with canonical attention
+// and the same norms/RoPE/PLE stages, so the committed state is prefill-exact
+// (STRIX_G4_PREFILL_EXACT_MANYROW=0 runs the eight-row linears instead).
+enum class Linears { wmma, exact };
+struct Range {
+    std::string tensor;
+    float input_maximum = 0.0F;
+};
+struct Stats {
+    double linear_ms = 0.0, attention_ms = 0.0; // cumulative, only when profiling
+    struct Kernel {
+        double ms = 0.0, conversion_ms = 0.0, matrix_ms = 0.0, flops = 0.0, bytes = 0.0;
+        std::uint64_t calls = 0;
+    };
+    std::map<std::string, Kernel> kernels;
+    std::size_t prepared_bytes = 0;
+    bool tiled = false, prepared = false;
+    unsigned direct = 0;
+    AttentionMode attention = AttentionMode::canonical;
+    bool attention_packed = false;
+    bool canonical_kernel = false; // whole-chunk canonical attention (canonical mode only)
+    Linears linears = Linears::wmma;
+};
+enum class Residency { host, device };
+class DevicePrefill {
+  public:
+    // Host residency uploads packed weights once. Device residency borrows immutable
+    // views (owner must outlive this object), allowing the coordinator to share them.
+    // Linears::exact requires canonical attention and prepares no FP16 panels.
+    DevicePrefill(HostWeights weights, RopeTables tables, Residency residency = Residency::host, bool profile = false,
+                  AttentionMode attention = attention_mode(), Linears linears = Linears::wmma);
+    ~DevicePrefill();
+    DevicePrefill(const DevicePrefill&) = delete;
+    DevicePrefill& operator=(const DevicePrefill&) = delete;
+    // Evaluate an unpublished target transaction, at most chunk_rows prompt inputs.
+    // Padding never writes KV. Failure leaves the transaction uncommittable.
+    // logits=false skips the head for a chunk that may not end the prompt; the
+    // last row's final-norm output is kept so last_logits() can produce the
+    // same logits later if that chunk turns out to be the last one.
+    // hidden=true also returns every row's final-norm output (the decode
+    // target's RowPlan::export_hidden row).
+    ChunkResult forward(KvTxn& transaction, std::span<const std::uint32_t> tokens, bool all_logits = false, bool logits = true,
+                        bool hidden = false);
+    [[nodiscard]] std::vector<float> last_logits();
+    // Commits canonical chunks and returns last-row logits and recent committed taps.
+    Result run(gpu::DeviceStream& stream, std::span<const std::uint32_t> tokens, DraftContext* context = nullptr);
+    // Cumulative maxima over all chunks evaluated by this object, including failures.
+    [[nodiscard]] const std::vector<Range>& ranges() const;
+    [[nodiscard]] const Stats& stats() const;
+    // Device-address views only, for consumers accepting Residency::device.
+    // The owning prefill must outlive every borrower. Never pass these to a
+    // host tensor reader or an API that assumes host-address weights.
+    [[nodiscard]] const HostWeights& borrow_device_weights() const;
+    // A/B switch for the canonical route: whole-chunk kernels or the per-8-row loop.
+    void use_canonical_kernel(bool enabled);
+    // Turns per-op event timing (Stats::linear_ms/attention_ms/kernels) on or off.
+    void set_profile(bool enabled);
+  private:
+    struct Impl;
+    std::unique_ptr<Impl> impl_;
+};
+
+// Scheduler input fragments are buffered until a canonical chunk is complete.
+// finish() is the prompt boundary. No scheduler slice may call finish implicitly.
+class Prompt {
+  public:
+    Prompt(DevicePrefill& prefill, gpu::DeviceStream& stream, DraftContext* context = nullptr);
+    void append(std::span<const std::uint32_t> tokens);
+    Result finish();
+  private:
+    void flush(bool final);
+    DevicePrefill& prefill_;
+    gpu::DeviceStream& stream_;
+    DraftContext* context_ = nullptr;
+    std::vector<std::uint32_t> pending_;
+    Result result_;
+    bool finished_ = false, failed_ = false;
+};
+} // namespace strix::gemma4::prefill

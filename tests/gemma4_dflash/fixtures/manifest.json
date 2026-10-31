@@ -1,0 +1,32 @@
+{
+  "purpose": "small host semantics and immutable rotary fixtures; no device/full-model qualification",
+  "torch_version": "2.10.0+cpu",
+  "mpmath_version": "1.3.0",
+  "rounding_precision_decimal_digits": [
+    100,
+    180
+  ],
+  "rotary": {
+    "theta": 1000000,
+    "layout": "NeoX",
+    "recipe": "FP32 exponent, rounded real pow, FP32 reciprocal/angle, rounded real sin/cos"
+  },
+  "forward": {
+    "hidden": 16,
+    "layers": 2,
+    "q_heads": 4,
+    "kv_heads": 1,
+    "head_dim": 8,
+    "inter": 32,
+    "context_rows": 3,
+    "block_rows": 8,
+    "attention_scale": 0.0883883461356163,
+    "layout": "final normalized block, context K all layers, context V all layers",
+    "absolute_tolerance": 2e-05
+  },
+  "sha256": {
+    "rope128-p0-p8.g4dr": "f14630096e7041e1122cb97065350e81b68eba713dcc58478b6641bb22f72770",
+    "rope8-p0-p2063.g4dr": "1f1f603f6cbe4d4badbeb09357639759a98892eb0dca6ac03030cc61c4b2581e",
+    "torch-forward.f32": "80a6d3ced99ab28b9165cd8f941b8863c03920ee0af0746ab77e5f65f87776ce"
+  }
+}
