@@ -1007,8 +1007,17 @@ inline void validate_resolved_teacher_forced_score(const Options& options, std::
         (o.rotary.mode()!=RotaryMode::yarn ||
          (o.rotary.factor()==2U && o.context_tokens<=524288U) ||
          (o.rotary.factor()==4U && o.context_tokens<=1048576U));
+    // The single-request HTTP runner (resolved --http-batch 0) owns one service: every request starts a fresh
+    // epoch and the in-memory prefix-cache restore hook invalidates both domains. Batch slots, sessions, disk
+    // prefix restore and YaRN HTTP keep the explicit opt-in.
+    const bool qualified_http_single=o.http_serve && !o.http_batch && !o.session_live_control &&
+        o.session_load.empty() && o.session_save.empty() && o.session_then_prompt.empty() && !o.session_mtp_fixed &&
+        !o.session_management_requested && o.prefix_cache_dir.empty() && o.prefix_cache_then_prompts.empty() &&
+        o.serving_prefix_files.empty() && !o.rtx_state_import && !o.prefix_cache_roundtrip &&
+        o.mtp.sample_repeats==1U && o.rotary.mode()!=RotaryMode::yarn;
     const char* explicit_on=std::getenv("STRIX_QSA_MTP_POOL");
-    if (!qualified_cli && !o.qsa_mtp_pool_explicit_opt_in && !(explicit_on && std::string_view(explicit_on)=="1"))
+    if (!qualified_cli && !qualified_http_single && !o.qsa_mtp_pool_explicit_opt_in &&
+        !(explicit_on && std::string_view(explicit_on)=="1"))
         return "unqualified-route-requires-STRIX_QSA_MTP_POOL=1";
     if (!qpf2k::long_context_item_enabled("STRIX_QSA_DECODE_POOL_BF16",gsq)) return "bf16-disabled";
     if (o.execution.mode==DecodeExecutionMode::graph || o.qsa_hierarchical_selection) return "unsupported-control";

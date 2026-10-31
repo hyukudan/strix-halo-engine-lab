@@ -2521,7 +2521,7 @@ int main(int argc, char** arguments) {
         expect(requested_prefill_environment()==prior_image,"MTP OFF preserves historical printed environment bytes");
         expect(qsa_mtp_pool_bytes(mtp_pool,ModelContract::qwen38_flash_next())==0,"MTP OFF has no extra admission bytes");
         ::unsetenv("STRIX_QSA_MTP_POOL");
-        for(unsigned route=0;route<9U;++route) {
+        for(unsigned route=0;route<11U;++route) {
             auto draft=mtp_pool;
             if(route==0) draft.http_serve=true;
             if(route==1) { draft.http_serve=true;draft.http_batch=8; }
@@ -2532,7 +2532,10 @@ int main(int argc, char** arguments) {
             if(route==6) draft.rtx_state_import=true;
             if(route==7) { draft.rotary=RotaryDescriptor::yarn(4);draft.context_tokens=1048576; }
             if(route==8) draft.serving_prefix_files={"PREFIX"};
-            expect(qsa_mtp_pool_route(draft)==(route==7),"YaRN f4 CLI defaults on; multi-request M1 routes stay opt-in");
+            if(route==9) { draft.http_serve=true;draft.prefix_cache_dir="DIR"; }
+            if(route==10) { draft.http_serve=true;draft.rotary=RotaryDescriptor::yarn(2);draft.context_tokens=262144; }
+            expect(qsa_mtp_pool_route(draft)==(route==0 || route==7),
+                "single HTTP and YaRN f4 CLI default on; slots, sessions, disk prefix restore and YaRN HTTP stay opt-in");
             ::setenv("STRIX_QSA_MTP_POOL","1",1);
             expect(qsa_mtp_pool_route(draft),"explicit env enables unqualified M1 route when supported");
             ::setenv("STRIX_QPF2K_DEFAULTS","0",1);
@@ -3429,10 +3432,12 @@ int main(int argc, char** arguments) {
         }
         {
             auto o=candidate();o.tokens={1};
-            expect(std::string_view(qsa_mtp_pool_decline(o))=="unqualified-route-requires-STRIX_QSA_MTP_POOL=1" &&
+            auto batch=candidate(8);batch.tokens={1};
+            expect(qsa_mtp_pool_decline(o)==nullptr &&
+                std::string_view(qsa_mtp_pool_decline(batch))=="unqualified-route-requires-STRIX_QSA_MTP_POOL=1" &&
                 ple_reclaim_inactive_reason(o,HipModelResidencyPolicy{},false)=="http-serving" &&
                 !mtp_prompt_phase_separation(o),
-                "upstream QSA pool, rolling PLE and phase retirement exclude default HTTP");
+                "QSA pool defaults on for single HTTP only; rolling PLE and phase retirement exclude default HTTP");
         }
         for(const bool bundle_selected:{false,true}) {
             auto o=candidate();o.rotary=validate_qwen_rotary_request(2,true,524288,false);

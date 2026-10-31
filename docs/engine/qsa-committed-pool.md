@@ -7,8 +7,9 @@ predictor dispatch. Each HTTP slot owns its own service.
 
 `STRIX_QSA_MTP_POOL=0` restores the historical MTP key paths, admission bytes and
 inspection image. Otherwise the service defaults on when the route and memory
-admit it on the qualified CLI routes in the table below. HTTP slots, nested
-scheduling, session and prefix restore/reuse require `STRIX_QSA_MTP_POOL=1`.
+admit it on the qualified CLI routes and the single-request HTTP runner in the
+table below. HTTP batch slots, nested scheduling, sessions and disk prefix restore
+require `STRIX_QSA_MTP_POOL=1`.
 Baseline, GSQ, defaults suppression, explicit FP32 pool storage, graphs,
 hierarchical selection, wide-copy writers and explicit cohort requests retain
 their existing paths. The explicit YaRN MTP CLI route can use the
@@ -62,7 +63,20 @@ factor-2 MTP CLI through 524K, factor-4 MTP CLI through 1M, and serial YaRN.
 The 1M factor-4 prose gate matched all 256 tokens, every committed full-vocabulary
 logit digest, prompt/final target state and predictor state across serial YaRN,
 pooled MTP and pool-off MTP. This evidence does not qualify composed HTTP
-scheduling or restore ownership. Host tests and builds add no GPU qualification.
+scheduling or restore ownership.
+
+The single-request HTTP runner was qualified separately on one node with the explicit
+T8192 tiled MTP route, the dense A8 decode profile with the `fast-prefill-f16wmma-v1`
+prefill profile, R2/R4/R8 windows at min-p 0.7 and an explicit in-memory prefix cache:
+a five-request 22.8K-token conversation (one exact repeat, later turns restoring 16K),
+a three-turn 48.6K-token conversation (restoring 40K) and a three-turn 120.4K-token
+conversation (restoring 114.7K). With `STRIX_QSA_MTP_POOL_CHECK=1` all thirteen roles
+compared nonzero scores with zero differences (172.7M scores over 10 requests); every
+reply and every `STRIX_MTP_LOGITS_DIGEST=1` terminal digest matched the pool-off server.
+Two interleaved rounds at 120.4K tokens decoded at 54.4 / 54.5 tok/s against 41.8 / 41.7
+pool-off on the first turn (48.1 / 48.5 against 38.1 / 38.1 and 37.7 / 38.1 against
+28.6 / 28.8 on the restored turns); prompt and restore times were unchanged. Batch
+slots, nested scheduling, sessions and disk prefix restore were not part of this scope. Host tests and builds add no GPU qualification.
 Final-prefill seeding
 and selector algorithm changes are not part of this service.
 
@@ -72,9 +86,10 @@ The shipped route policy is:
 |---|---|---|
 | Eligible eager tiled CLI | Default on | Native MTP CLI default on when admitted |
 | Adaptive R2/R4/R8 + min-p | Leased CLI enabled | Enabled when admitted |
-| HTTP, slots, nested scheduling | Off (unsupported) | Opt-in: `STRIX_QSA_MTP_POOL=1`, per-slot owner |
+| HTTP single runner (resolved `--http-batch 0`), in-memory prefix restore | Off (unsupported) | Default on when admitted |
+| HTTP batch slots, nested scheduling | Off (unsupported) | Opt-in: `STRIX_QSA_MTP_POOL=1`, per-slot owner |
 | Session load/live/follow-up | Off | Opt-in: `STRIX_QSA_MTP_POOL=1`; fixed-session boundaries invalidate |
-| Prefix restore/import/reuse | Plain prompt-wide; MTP warm | Opt-in: `STRIX_QSA_MTP_POOL=1`; restore invalidates both domains |
+| Prefix restore/import/reuse outside the single HTTP runner, disk restore | Plain prompt-wide; MTP warm | Opt-in: `STRIX_QSA_MTP_POOL=1`; restore invalidates both domains |
 | YaRN | Serial default on; MTP f2 through 524K and f4 through 1M default on | MTP f2 through 524K and f4 through 1M default on |
 | Baseline / DEFAULTS=0 / GSQ | Suppressed | Suppressed |
 

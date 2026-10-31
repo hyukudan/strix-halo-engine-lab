@@ -683,7 +683,9 @@ logits/state and workload qualification remain pending; the YaRN CLI scope
 includes the full 1M factor-4 prose gate described below. The seven-row
 [route table](engine/qsa-committed-pool.md) enables rolling PLE and the MTP pool
 by default for factor 2 through 524288 and factor 4 through 1048576; both `=0`
-off switches remain authoritative.
+off switches remain authoritative. The single-request HTTP runner (resolved
+`--http-batch 0`, in-memory prefix restore) also admits the service by default; batch
+slots, sessions and disk prefix restore remain opt-in.
 
 <a id="qwen-qsa-decode-select"></a>
 
