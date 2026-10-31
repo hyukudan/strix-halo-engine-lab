@@ -100,7 +100,7 @@ inline MtpDecodeBatchServe make_cohort_tiled_run(const Options& options, const M
         const auto stop_name = [](const std::string& finish) {
             return finish == "stop" ? "eos" : finish == "length" ? "token-budget" : finish == "context" ? "context-capacity" : finish.c_str();
         };
-        output << "{\n  \"mode\":\"native-mtp-cohort-tiled-prompt-target-verified-" << (mtp_sampling(m) ? "sampled" : "greedy") << "\",\n"
+        output << "{\n" << prefill_identity_fields(prefill_options_active()) << ",\n  \"mode\":\"native-mtp-cohort-tiled-prompt-target-verified-" << (mtp_sampling(m) ? "sampled" : "greedy") << "\",\n"
             << "  \"mtp_native_hardware_qualified\":false,\n  \"mtp_performance_qualified\":false,\n"
             << "  \"mtp_cohort_mode\":\"" << (lockstep ? "lockstep" : "sequential") << "\",\n"
             << "  \"mtp_cohort_shared_steps\":" << ([] { const char* v = std::getenv("STRIX_COHORT_SHARED"); return !v || v[0] != '0'; }() ? "true" : "false") << ",\n"

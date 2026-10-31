@@ -1,4 +1,5 @@
 #include "rotary_mock.hpp"
+#include "strix/prefill_identity.hpp"
 #include "strix/compiled_execution.hpp"
 #include "strix/rotary_descriptor.hpp"
 
@@ -177,6 +178,14 @@ int main() {
         previous = plan.execution_identity;
     }
 
+    auto option_request = binding_request;
+    option_request.prefill_arithmetic_identity = strix::bind_prefill_option_identity(42U, 0U);
+    const auto plain_prefill = strix::compile_serial_execution(model, registry, option_request, buffer_request, 256);
+    option_request.prefill_arithmetic_identity = strix::bind_prefill_option_identity(42U, strix::kPrefillOptionsReady);
+    const auto ready_prefill = strix::compile_serial_execution(model, registry, option_request, buffer_request, 256);
+    expect(plain_prefill.execution_identity != ready_prefill.execution_identity &&
+        plain_prefill.kernel_plan_identity != ready_prefill.kernel_plan_identity,
+        "real compiled prefill execution and kernel identities distinguish enabled sets");
     expect(compiled.bindings.missing_steps == 0,
            "compiled execution is fully bound");
     expect(compiled.kernel_plan_identity != 0 &&

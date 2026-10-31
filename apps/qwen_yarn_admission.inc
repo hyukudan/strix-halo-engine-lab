@@ -34,7 +34,8 @@ inline std::string yarn_environment_refusal(const Environment& environment, unsi
         // guard separately bounds explicit MTP and refuses caching and HTTP.
         if (name == "STRIX_PREFIX_BATCH_CERT" || name == "STRIX_SERVE_PREFILL" || name == "STRIX_BATCH_PROMPT_SMALL" ||
             name == "STRIX_PREFIX_CACHE_INFLIGHT" || name == "STRIX_PREFIX_CACHE_DISK" ||
-            name == "STRIX_PREFIX_CACHE_DURABLE") continue;
+            name == "STRIX_PREFIX_CACHE_DURABLE" || name == "STRIX_PREFILL_EXACT_FP16" ||
+            name == "STRIX_PREFILL_HC_OUTPUT_WMMA") continue;
         const auto entry = std::find_if(qpf2k::defaults.begin(), qpf2k::defaults.end(),
             [&](const auto& item) { return name == item.name; });
         if (entry != qpf2k::defaults.end() &&
@@ -108,11 +109,9 @@ inline EffectiveConfig resolve_yarn_config(const RequestedOptions& request,
     const ModelContract& model, const gguf::FileInfo& info, const ModelManifest& manifest,
     std::string_view content, const PrefillCapabilities& capabilities, const PrefillMemory& memory) {
     constexpr std::uint64_t gib = UINT64_C(1) << 30U;
-    EffectiveConfig result;
-    result.options = request.options;
+    auto result = initialize_prefill_config(request);
     result.options.ple_rolling_explicit_opt_in=env_is(request.environment,"STRIX_PLE_ROLLING","1");
     result.options.qsa_mtp_pool_explicit_opt_in=env_is(request.environment,"STRIX_QSA_MTP_POOL","1");
-    result.environment = request.environment;
     for (const auto& name : request.options.supplied_options) result.sources[name] = OptionSource::explicit_value;
     result.rotary_identity = model.rotary_identity();
     auto& o = result.options;

@@ -44,7 +44,11 @@ inline PrefillRequirements compile_prompt_requirements(const Options& options,
     }
     const auto pair = numerical_profile_pair(options);
     if (pair.split()) {
-        binding_request.prefill_arithmetic_identity = numerical_profile_pair_identity(pair);
+        if (numerical_profile_fast_prefill(pair.prefill))
+            binding_request.prefill_arithmetic_identity = prefill_arithmetic_identity(pair,
+                options.resolved_prefill_option_mask.value_or(resolve_prefill_options(
+                    [](const char* name) { return std::getenv(name); }, options.prefill_exact_fp16, options.prefill_disabled)),
+                qpf2k::has_gsq_gate(manifest));
         catalog_config.numerical_profile = pair.prefill;
         catalog_config.fast_prefill_components = pair.fast_components;
         kernels::KernelRegistry prefill_registry;

@@ -1,6 +1,17 @@
 [
   {
     "engine": "qwen",
+    "name": "HC output FP16 WMMA",
+    "flag_or_env": "STRIX_PREFILL_HC_OUTPUT_WMMA; --prefill-disable hc_output_wmma; config prefill_disable",
+    "default": "ON",
+    "exact": "hc_output_wmma passed a pre-declared confirmation holdout; its NLL endpoint is measured against a rounding-equivalent control whose per-case movement is capped at +-0.02 nats/token (a bounded control allowance, not an unbiased estimate of the uncapped difference); the absolute NLL change vs the exact reference also passed (-0.37 % NLL/token, upper bound +0.38 %). The off switch restores the exact output path.",
+    "gain": "No new throughput claim.",
+    "preconditions": "Fast HC admitted wide shape, FP32 normalized rows and compatible output selector. Fast HC option excluded from MTP and nested admission pending qualification. Server-level only.",
+    "off_switch": "STRIX_PREFILL_HC_OUTPUT_WMMA=0 / --prefill-disable hc_output_wmma / prefill_disable = [\"hc_output_wmma\"]; master STRIX_PREFILL_EXACT_FP16=1 / --prefill-exact-fp16 / prefill_exact_fp16 = true",
+    "doc_anchor": "docs/optimizations.md#bit-changing-prefill-options"
+  },
+  {
+    "engine": "qwen",
     "name": "Cohort-gated calibrated joint plan rule",
     "flag_or_env": "STRIX_MTP_JOINT_PLAN; STRIX_MTP_JOINT_RULE_FILE",
     "default": "calibrated-c3 when STRIX_MTP_BATCH_JOINT=1: calibrated at >=3 members, production at 1-2",

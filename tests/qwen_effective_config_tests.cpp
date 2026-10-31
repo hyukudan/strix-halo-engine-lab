@@ -22,6 +22,7 @@
 #include <limits>
 #include <set>
 #include "strix/q8_projection_organization.hpp"
+#include <filesystem>
 
 using namespace strix;
 using namespace strix::decode_cli;
@@ -1599,9 +1600,177 @@ void long_context_admission_tests(const RequestedOptions& original, const ModelC
 }
 
 }
+void prefill_identity_plumbing_tests() {
+    const auto saved = detail::prefill_identity_override();
+    detail::prefill_identity_override() = {};
+    const auto options = parse({"decoder", "model.gguf", "1", "--prefill-exact-fp16",
+        "--prefill-disable", "hc_output_wmma", "--prefill-disable=hc_output_wmma"});
+    expect(options.prefill_exact_fp16 && options.prefill_disabled == 1U && !options.route_owned,
+        "prefill switches parse without owning the automatic route");
+    expect(parse_prefill_option_list("hc_output_wmma") == 1U, "all declared option names are recognized");
+    for (const auto* value : {"unknown", "", "hc_output_wmma,", ",hc_output_wmma", "hc_output_wmma,,hc_output_wmma"}) {
+        bool rejected = false;
+        try { (void)parse({"decoder", "model.gguf", "1", "--prefill-disable", value}); }
+        catch (const std::invalid_argument&) { rejected = true; }
+        expect(rejected, "malformed CLI prefill lists are rejected");
+    }
+    for (const auto* flag : {"--config", "--prefill-disable"}) {
+        bool rejected = false;
+        try { (void)parse({"decoder", "model.gguf", "1", flag}); }
+        catch (const std::invalid_argument&) { rejected = true; }
+        expect(rejected, "prefill startup flags require values");
+    }
+    bool exact = false; unsigned disabled = 0U;
+    std::istringstream config("# startup identity\nprefill_exact_fp16 = true\nprefill_disable = [\"hc_output_wmma\", \"hc_output_wmma\"] # off\n");
+    read_prefill_config(config, exact, disabled);
+    expect(exact && disabled == 1U, "startup config parses bool and quoted option array");
+    const auto config_path = std::filesystem::current_path() / "qwen-prefill-startup-test.conf";
+    struct RemoveConfig {
+        std::filesystem::path path;
+        ~RemoveConfig() { std::error_code error; std::filesystem::remove(path, error); }
+    } cleanup{config_path};
+    {
+        std::ofstream file(config_path);
+        file << "prefill_exact_fp16 = false\nprefill_disable = [\"hc_output_wmma\"]\n";
+    }
+    for (const bool config_first : {true, false}) {
+        auto argv = std::vector<std::string>{"decoder", "model.gguf", "1"};
+        const auto config_args = std::vector<std::string>{"--config", config_path.string()};
+        const auto cli_args = std::vector<std::string>{"--prefill-exact-fp16", "--prefill-disable=hc_output_wmma"};
+        const auto& first = config_first ? config_args : cli_args;
+        const auto& second = config_first ? cli_args : config_args;
+        argv.insert(argv.end(), first.begin(), first.end());
+        argv.insert(argv.end(), second.begin(), second.end());
+        const auto loaded = parse(argv);
+        expect(loaded.prefill_exact_fp16 && loaded.prefill_disabled == 1U && !loaded.route_owned,
+            "config file and CLI restrictions combine regardless of argument order");
+    }
+    expect(parse({"decoder", "model.gguf", "1", "--config=" + config_path.string()}).prefill_disabled == 1U,
+        "config supports equals syntax");
+    const auto captured = requested_prefill_environment([](const char* name) -> const char* {
+        const std::string_view key(name);
+        if (key == "STRIX_PREFILL_EXACT_FP16") return "1";
+        for (const auto& option : kPrefillOptions) if (key == option.env) return "0";
+        return nullptr;
+    });
+    expect(captured.size() == 2U && captured.at("STRIX_PREFILL_EXACT_FP16") == "1",
+        "effective config captures master and all declared option environment controls");
+    for (const auto* text : {"prefill_exact_fp16 = 1", "unknown = true", "prefill_disable = [\"unknown\"]",
+        "prefill_disable = [\"hc_output_wmma\",]", "prefill_disable = [hc_output_wmma]",
+        "prefill_disable = [\"\"]", "prefill_exact_fp16 = false\nprefill_exact_fp16 = true"}) {
+        bool rejected = false; bool test_exact = false; unsigned test_disabled = 0U;
+        std::istringstream input(text);
+        try { read_prefill_config(input, test_exact, test_disabled); }
+        catch (const std::invalid_argument&) { rejected = true; }
+        expect(rejected, "malformed or unknown startup config is rejected");
+    }
+    const auto resolved = [&](Options parsed, Environment env) {
+        return resolve_effective_config({std::move(parsed), std::move(env)},
+            ModelContract::qwen38_flash_next(), {}, {}, "", {}, {});
+    };
+    const char* old_env = std::getenv("STRIX_PREFILL_HC_OUTPUT_WMMA");
+    const std::optional<std::string> saved_env = old_env ? std::optional<std::string>(old_env) : std::nullopt;
+    const auto set_option_env = [](const char* value) {
+#ifdef _WIN32
+        _putenv_s("STRIX_PREFILL_HC_OUTPUT_WMMA", value ? value : "");
+#else
+        if (value) ::setenv("STRIX_PREFILL_HC_OUTPUT_WMMA", value, 1);
+        else ::unsetenv("STRIX_PREFILL_HC_OUTPUT_WMMA");
+#endif
+    };
+    set_option_env("0");
+    const auto plain_options = parse({"decoder", "model.gguf", "1"});
+    const auto enabled = resolved(plain_options, {});
+    expect(kPrefillOptionsReady == 1U && enabled.prefill_option_mask == kPrefillOptionsReady &&
+        prefill_identity_hash(1U) == UINT64_C(17162327878354112617) &&
+        effective_config_json(enabled).find(prefill_identity_fields(1U)) != std::string::npos,
+        "clean supplied environment reports real READY default ON name/hash/options");
+    set_option_env("1");
+    for (const auto& env : {Environment{{"STRIX_PREFILL_HC_OUTPUT_WMMA", "0"}},
+             Environment{{"STRIX_PREFILL_EXACT_FP16", "1"}}}) {
+        const auto off = resolved(plain_options, env);
+        expect(off.prefill_option_mask == 0U &&
+            effective_config_json(off).find(prefill_identity_fields(0U)) != std::string::npos,
+            "captured individual/master OFF determines serialized identity");
+    }
+    for (const char* flag : {"--prefill-exact-fp16", "--prefill-disable=hc_output_wmma"})
+        expect(resolved(parse({"decoder", "model.gguf", "1", flag}), {}).prefill_option_mask == 0U,
+            "public CLI controls resolve OFF with real READY mask");
+    for (const char* body : {"prefill_disable = [\"hc_output_wmma\"]\n", "prefill_exact_fp16 = true\n"}) {
+        { std::ofstream file(config_path); file << body; }
+        expect(resolved(parse({"decoder", "model.gguf", "1", "--config", config_path.string()}), {}).prefill_option_mask == 0U,
+            "config-file individual/master controls resolve OFF");
+    }
+    expect(governed_hc_output_kernel(2U, 0U) == 1U && governed_hc_output_kernel(2U, 1U) == 2U,
+        "legacy output selector obeys public OFF controls");
+    set_prefill_identity_override(false, 1U);
+    set_prefill_identity_override(true, 8U);
+    expect(detail::prefill_identity_override().exact && detail::prefill_identity_override().disabled == 9U &&
+        prefill_options_active() == 0U, "startup overrides accumulate and master restores FP16");
+    expect(resolved(plain_options, {}).prefill_option_mask == 1U &&
+        effective_config_json(enabled).find(prefill_identity_fields(1U)) != std::string::npos,
+        "global master override and later process state cannot suppress captured READY configuration");
+    expect(prefill_identity_name() == "fp16-v1" && prefill_identity_hash() == prefill_identity_hash(0U) && prefill_identity_hash(0U) == UINT64_C(11531825512229770990),
+        "plain FP16 name and hash agree with the active set");
+    expect(prefill_identity_name(1U) == "fp16-v1+hcout16",
+        "identity components follow enum order");
+    std::set<std::uint64_t> hashes;
+    for (unsigned mask = 0; mask < 2U; ++mask) hashes.insert(prefill_identity_hash(mask));
+    expect(hashes.size() == 2U, "every declared combination has a distinct identity hash");
+    const auto fields = prefill_identity_fields(0U);
+    const auto hash_begin = fields.find("\"prefill_identity_hash\":\"") + std::string("\"prefill_identity_hash\":\"").size();
+    expect(fields.substr(hash_begin, 16U).find_first_not_of("0123456789abcdef") == std::string::npos &&
+        fields[hash_begin + 16U] == '"' && fields.find("\"prefill_options_active\":[]") != std::string::npos,
+        "receipt hash is 16 lowercase hex digits and inactive options form an empty array");
+    expect(prefill_identity_fields(1U).find("\"hc_output_wmma\"") != std::string::npos,
+        "receipt active option names follow enum order");
+    EffectiveConfig effective;
+    effective.options = options;
+    expect(effective_config_json(effective).find(fields) != std::string::npos,
+        "effective config reports the same identity fields as receipts");
+    const auto replay = effective_prefill_argv(options);
+    expect(std::find(replay.begin(), replay.end(), "--prefill-exact-fp16") != replay.end(),
+        "effective argv preserves the master switch");
+    for (unsigned mask : {0U, 1U}) {
+        auto requested = plain_options;
+        requested.rotary = RotaryDescriptor::yarn(2U);
+        requested.prefill_disabled = mask ? 0U : 1U;
+        const RequestedOptions request{requested, {}};
+        const auto direct = resolve_yarn_config(request, ModelContract::qwen38_flash_next(), {}, {}, "", {}, {});
+        expect(direct.prefill_option_mask == mask && direct.options.resolved_prefill_option_mask == mask,
+            "direct YaRN resolver initializes options even before a refusal");
+        const auto native = initialize_prefill_config(request);
+        expect(native.prefill_option_mask == direct.prefill_option_mask, "both resolvers use one initializer");
+    }
+    auto bundled_mtp = plain_options;
+    bundled_mtp.mtp.enabled = true;
+    bundled_mtp.mtp_bundle_path = "model.mtp-bundle.json";
+    const auto bundled = initialize_prefill_config({bundled_mtp, {}});
+    expect(bundled.prefill_option_mask == 0U &&
+        (bundled.options.prefill_disabled & prefill_option_bit(PrefillOption::hc_output_wmma)),
+        "automatic YaRN MTP bundle retains its qualified prefill arithmetic");
+    auto split = plain_options;
+    split.numerical_profile = dense_a8_profile;
+    split.numerical_profile_explicit = true;
+    split.prefill_numerical_profile = DecodeNumericalProfile::fast_prefill_f16wmma_v1;
+    split.known_prefix_window = split.known_prefix_full_rows = true;
+    split.known_prefix_prefill_rows = 2048U;
+    split.validation_final_state_path = "private-state";
+    validate_prefill_numerical_profile_cli(split);
+    const auto pair = numerical_profile_pair(split);
+    const auto on_identity = prefill_arithmetic_identity(pair, 1U, false);
+    expect(on_identity != prefill_arithmetic_identity(pair, 0U, false), "host/runtime arithmetic binds option mask");
+    expect(on_identity != prefill_arithmetic_identity(pair, 1U, true), "host/runtime arithmetic binds GSQ");
+    set_option_env(saved_env ? saved_env->c_str() : nullptr);
+    detail::prefill_identity_override() = saved;
+    expect((prefill_options_active() & ~kPrefillOptionsReady) == 0U,
+        "unready options never appear in the active identity");
+}
+
 int main(int argc, char** arguments) {
     resident_fallback_tests();
     mtp_reservation_arithmetic_tests();
+    prefill_identity_plumbing_tests();
     const auto model = ModelContract::qwen38_flash_next();
     gguf::FileInfo info;
     ModelManifest manifest;
@@ -2074,6 +2243,7 @@ int main(int argc, char** arguments) {
             "--serve-memory-budget-bytes","8192","--serve-request-budget-bytes","1024","--serve-headroom-bytes","1024"});
         if (route == 3) {
             owned.options = manual;
+            owned.options.prefill_disabled = 1U; // fast HC MTP requires explicit OFF until qualified
             owned.options.mtp = parse(mtp_fixture()).mtp;
             auto& m = owned.options.mtp;
             m.window_rows = 8U; m.window_rows_set = {2U,4U,8U}; m.candidate_depth = 7U;

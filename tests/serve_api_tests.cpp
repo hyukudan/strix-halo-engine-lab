@@ -1676,6 +1676,8 @@ int main() try {
         // Generation-affecting fields the server does not execute are refused before the engine runs; neutral values pass.
         const auto before = engine.prompts().size();
         const std::vector<std::pair<std::string, std::string>> refused = {
+            {"prefill_exact_fp16", "true"}, {"prefill_exact_fp16", "false"},
+            {"prefill_disable", R"(["gdn_chunked"])"},
             {"presence_penalty", R"(0.5)"}, {"frequency_penalty", R"(-1)"}, {"repetition_penalty", R"(1.1)"},
             {"logit_bias", R"({"5":-100})"}, {"logprobs", R"(true)"}, {"top_logprobs", R"(3)"},
             {"response_format", R"({"type":"json_object"})"}, {"parallel_tool_calls", R"(false)"}, {"tool_choice", R"("required")"},

@@ -37,6 +37,17 @@ inline void append_mtp_pool_receipt(serve::GenerationStats& stats, const MtpServ
     stats.engine_extra.emplace_back("mtp_chosen_window_rows_histogram",rows+"}");
 }
 
+inline void add_prefill_capabilities(serve::Json& out) {
+    const auto fields = serve::parse_json("{" + prefill_identity_fields(prefill_options_active()) + "}");
+    for (const auto& [key, value] : fields.as_object()) out.set(key, value);
+    out.set("prefill_override_scope", serve::Json("server-level only"));
+}
+
+inline void add_prefill_stats(serve::GenerationStats& stats) {
+    const auto fields = serve::parse_json("{" + prefill_identity_fields(prefill_options_active()) + "}");
+    for (const auto& [key, value] : fields.as_object()) stats.engine_extra.emplace_back(key, value.dump());
+}
+
 // Used only on the bridge thread. The tokenizer-wide trie is built lazily once
 // per server; mutable selection frontiers are created afresh for each request.
 class HttpConstraintRequests {
@@ -98,6 +109,7 @@ public:
             if (probe_) probe_->fail();
             if (!request.constraint) throw;
             serve::GenerationStats stats;
+            add_prefill_stats(stats);
             stats.prompt_tokens = job.prompt.size();
             stats.finish = "execution_failure";
             stats.constraint = request.constraint->verdict(stats.finish);
@@ -106,6 +118,7 @@ public:
             catch (...) { throw serve::GenerationRequestError(std::move(stats), "engine failure"); }
         }
         serve::GenerationStats stats;
+        add_prefill_stats(stats);
         stats.prompt_tokens = job.prompt.size();
         stats.cached_tokens = result.restored_tokens;
         stats.generated_tokens = result.generated_tokens;
@@ -232,6 +245,7 @@ inline MtpDecodeServe make_http_serve(const Options& options, std::string engine
             qwen_rotary_capabilities(out);
             out.set("cache_policy",policy);
             prefix_cache_capabilities(out,options);
+            add_prefill_capabilities(out);
             out.set("session_numerical_modes",modes);
         };
         config.stream_receipts = options.http_stream_receipts;
@@ -343,6 +357,7 @@ inline MtpDecodeBatchServe make_http_batch_serve(const Options& options, std::st
         prefix_cache_capabilities(cert,options);
         config.capabilities_extra = [modes=session_modes_json(options), cert=std::move(cert)](serve::Json& out) {
             qwen_rotary_capabilities(out);
+            add_prefill_capabilities(out);
             out.set("session_numerical_modes",modes);
             for(const auto& [key,value]:cert.as_object()) out.set(key,value);
         };
@@ -473,6 +488,7 @@ inline MtpDecodeBatchServe make_http_batch_serve(const Options& options, std::st
             const auto prompt_tokens = job.prompt.size();
             request.on_finish = [&queue, &release, taken, prompt_tokens, sampling](const MtpServeResult& result) {
                 serve::GenerationStats stats;
+                add_prefill_stats(stats);
                 stats.prompt_tokens = prompt_tokens;
                 stats.cached_tokens = result.restored_tokens;
                 stats.generated_tokens = result.generated_tokens;

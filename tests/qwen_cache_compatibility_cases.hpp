@@ -42,6 +42,35 @@ inline std::string without_prefix_reuse_policy(std::string text) {
     return text;
 }
 
+// Remove only additive reports; retain the frozen bytes of every incumbent field.
+inline std::string without_added_prefill_reports(std::string text) {
+    for (const char* key : {"prefill_identity", "prefill_identity_hash", "prefill_options_active"}) {
+        const auto needle = std::string("\"") + key + "\":";
+        const auto start = text.find(needle);
+        if (start == std::string::npos) continue;
+        auto end = start + needle.size();
+        unsigned depth = 0;
+        bool quoted = false, escape = false;
+        for (; end < text.size(); ++end) {
+            const char c = text[end];
+            if (quoted) {
+                if (escape) escape = false;
+                else if (c == '\\') escape = true;
+                else if (c == '\"') quoted = false;
+                continue;
+            }
+            if (c == '\"') quoted = true;
+            else if (c == '{' || c == '[') ++depth;
+            else if ((c == '}' || c == ']') && depth) --depth;
+            else if (!depth && (c == ',' || c == '}')) break;
+        }
+        if (end < text.size() && text[end] == ',') text.erase(start, end + 1U - start);
+        else text.erase(start && text[start - 1U] == ',' ? start - 1U : start,
+            end - start + (start && text[start - 1U] == ',' ? 1U : 0U));
+    }
+    return text;
+}
+
 // Public-main resolver output fingerprints. Generation uses the same fixture
 // against the preserved source; expected values are in the adjacent table.
 inline std::vector<std::pair<std::string,std::string>> cache_compatibility_records(const strix::ModelContract& model) {
@@ -56,7 +85,7 @@ inline std::vector<std::pair<std::string,std::string>> cache_compatibility_recor
         auto text=effective_config_json(config);
         // New report is additive; compare every incumbent field, including its
         // original representation/reason, rather than a handpicked subset.
-        text=without_prefix_reuse_policy(without_cache_policy(std::move(text)));
+        text=without_added_prefill_reports(without_prefix_reuse_policy(without_cache_policy(std::move(text))));
         text+=';'+std::to_string(o.prefix_batch_cert)+';'+std::to_string(o.session_management_requested);
         text+=';'+std::to_string(ordinary_http_batch_slots(o))+';'+std::to_string(o.prefix_cache_every);
         text+=';'+std::to_string(o.prefix_cache_disk_bytes)+';'+o.prefix_cache_dir;

@@ -214,7 +214,7 @@ inline void run_mtp_cohort_bridge(const Options& options, const ModelContract& m
         assets->validate_assets_unchanged();
         std::uint64_t total_tokens = 0;
         for (const auto& l : live) total_tokens += l.generated.size() - 1U;
-        output << "{\n  \"mode\":\"native-mtp-cohort-independent-replay-then-target-verified-greedy\",\n"
+        output << "{\n" << prefill_identity_fields(prefill_options_active()) << ",\n  \"mode\":\"native-mtp-cohort-independent-replay-then-target-verified-greedy\",\n"
             << "  \"mtp_native_hardware_qualified\":false,\n  \"mtp_performance_qualified\":false,\n"
             << "  \"optimization_profile_selected\":\"" << decode_receipt::escape_json_string(resolved_profile) << "\",\n"
             << "  \"target_numerical_profile\":\"" << numerical_profile_name(pair.decode) << "\",\n"

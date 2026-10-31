@@ -68,6 +68,7 @@ inline void validate_http_serving_memory(const Options& o,const PrefillMemory& m
 }
 struct EffectiveConfig {
     Options options;
+    unsigned prefill_option_mask = 0U;
     OptimizationProfileResolution organization;
     Environment environment;
     std::map<std::string, OptionSource> sources;
@@ -120,7 +121,7 @@ inline Environment requested_prefill_environment(Get get) {
             "STRIX_KNOWN_PREFIX_WINDOW", "STRIX_KNOWN_PREFIX_FULL_ROWS", "STRIX_KNOWN_PREFIX_EXPERT_UNION",
             "STRIX_KNOWN_WINDOW_ROUTER_ROWS", "STRIX_KNOWN_PREFIX_PREFILL_ROWS",
             "STRIX_RTX_EXPORT_STATE", "STRIX_QRTX_STEP_DUMP", "STRIX_PROMPT_BATCH_ROWS", "STRIX_PREFILL_LOGITS_DIGEST",
-            "STRIX_MODEL_COPY_ALL", "STRIX_PLE_RECLAIM_DECODE_BYTES",
+            "STRIX_PREFILL_EXACT_FP16", "STRIX_MODEL_COPY_ALL", "STRIX_PLE_RECLAIM_DECODE_BYTES",
             "STRIX_QSA_UNION_MERGE", "STRIX_QSA_SCORE_ROWS64", "STRIX_QSA_POOL_PACKED", "STRIX_QSA_DECODE_POOL",
             "STRIX_QSA_DECODE_SELECT", "STRIX_QSA_DECODE_POOL_BF16", "STRIX_QSA_DECODE_POOL_CHECK", "STRIX_PREFILL_MOE_MERGE_VEC",
             "STRIX_CTX_EXACT_MEMORY", "STRIX_QSA_SCORE_RING", "STRIX_QSA_SCORE_RING_ROWS", "STRIX_TERMINAL_LOGITS_ARENA",
@@ -135,6 +136,8 @@ inline Environment requested_prefill_environment(Get get) {
     // OFF keeps the complete historical inspection image, including its environment map.
     for(const char* name:{"STRIX_QSA_MTP_POOL","STRIX_QSA_MTP_POOL_CHECK","STRIX_MTP_LOGITS_DIGEST","STRIX_MTP_STEP_LOGITS_DIGEST"})
         if(const char* value=get(name); value && value[0]!='0') env.emplace(name,value);
+    for (const auto& option : kPrefillOptions)
+        if (const char* value = get(option.env.data())) env.emplace(option.env, value);
     return env;
 }
 inline Environment requested_prefill_environment() {
@@ -324,6 +327,24 @@ inline void select_mtp_bundle_golden(Options& options, const ModelContract& mode
     const auto cached=std::filesystem::is_regular_file(shipped)?shipped:mtp_golden_cache_dir()/(identity+".golden");
     options.mtp.golden=std::filesystem::is_regular_file(cached)?cached.string():std::string{};
 }
+inline EffectiveConfig initialize_prefill_config(const RequestedOptions& request) {
+    EffectiveConfig result;
+    result.options = request.options;
+    result.environment = request.environment;
+    result.prefill_option_mask = resolve_prefill_options([&](const char* name) -> const char* {
+        const auto it = result.environment.find(name);
+        return it == result.environment.end() ? nullptr : it->second.c_str();
+    }, request.options.prefill_exact_fp16, request.options.prefill_disabled);
+    // Verified YaRN bundles select the upstream MTP arithmetic. New fast HC
+    // arithmetic remains excluded until its MTP gates pass.
+    if (result.options.mtp.enabled && !result.options.mtp_bundle_path.empty()) {
+        const auto excluded = prefill_option_bit(PrefillOption::hc_output_wmma);
+        result.options.prefill_disabled |= excluded;
+        result.prefill_option_mask &= ~excluded;
+    }
+    result.options.resolved_prefill_option_mask = result.prefill_option_mask;
+    return result;
+}
 #include "qwen_yarn_admission.inc"
 
 inline EffectiveConfig resolve_prefill_effective_config(const RequestedOptions& request,
@@ -332,12 +353,10 @@ inline EffectiveConfig resolve_prefill_effective_config(const RequestedOptions& 
     if (request.options.rotary.mode() == RotaryMode::yarn && !request.options.baseline &&
         !env_is(request.environment, "STRIX_BASELINE", "1"))
         return resolve_yarn_config(request, model, info, manifest, verified_content, capabilities, memory);
-    EffectiveConfig result;
-    result.options = request.options;
+    auto result = initialize_prefill_config(request);
     result.options.ple_rolling_explicit_opt_in=env_is(request.environment,"STRIX_PLE_ROLLING","1");
     result.options.qsa_mtp_pool_explicit_opt_in=env_is(request.environment,"STRIX_QSA_MTP_POOL","1");
     result.gsq_owner = qpf2k::has_gsq_gate(manifest);
-    result.environment = request.environment;
     for (const auto& name : request.options.supplied_options) result.sources[name] = OptionSource::explicit_value;
     auto& o = result.options;
     const bool baseline = o.baseline || env_is(request.environment, "STRIX_BASELINE", "1");
@@ -1330,6 +1349,9 @@ inline std::string effective_config_notice(const EffectiveConfig& config) {
 inline std::vector<std::string> effective_prefill_argv(const Options& o) {
     std::vector<std::string> args{"--context", std::to_string(o.context_tokens)};
     if (o.rotary.mode() == RotaryMode::yarn) args.insert(args.end(), {"--rope-yarn",std::to_string(o.rotary.factor())});
+    if (o.prefill_exact_fp16) args.emplace_back("--prefill-exact-fp16");
+    for (unsigned i = 0; i < kPrefillOptions.size(); ++i)
+        if (o.prefill_disabled & (1U << i)) args.insert(args.end(), {"--prefill-disable", std::string(kPrefillOptions[i].name)});
     if (o.unqualified_context) args.emplace_back("--unqualified-context");
     args.insert(args.end(), {"--execution-mode", o.execution.mode == DecodeExecutionMode::eager ? "eager" : "graph",
         "--residency", o.residency == HipModelResidencyMode::registered_file_mapping ? "register" : "copy",
@@ -1505,6 +1527,7 @@ inline std::string effective_config_json(const EffectiveConfig& config) {
     }
     if (!o.baseline) out << "\"prefix_cache\":" << prefix.dump() << ",";
     out << "\"cache_policy\":" << cache_activation_json(o).dump() << ",";
+    out << prefill_identity_fields(config.prefill_option_mask) << ",";
     out << "\"session_cache\":" << session.dump() << ",\"http_slots\":{";
     out << "\"mode\":\"" << (o.http_batch_explicit ? (o.http_batch_cap ? "cap" : "single") : "auto")
         << "\",\"cap\":" << o.http_batch_cap << ",\"slots\":";

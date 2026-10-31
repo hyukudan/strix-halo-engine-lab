@@ -1,5 +1,7 @@
 #include "strix/prefix_state_cache.hpp"
 #include "strix/model_content_hash.hpp"
+#include "../apps/prefix_state_cache_identity.hpp"
+#include "strix/arithmetic_lineage.hpp"
 
 #include <chrono>
 #include <cstring>
@@ -46,6 +48,29 @@ strix::PrefixCacheBuffer heap(std::uint64_t bytes) {
 
 strix::ModelContentIdentity identity_of(const char* text) {
     return strix::sha256_bytes(std::as_bytes(std::span<const char>(text, std::strlen(text))));
+}
+
+// Frozen v1 key encoding: the old domain and fields, without v2 option-set fields.
+strix::ModelContentIdentity legacy_v1_identity(const strix::decode_cli::PrefixStateCacheIdentityInputs& in) {
+    std::vector<std::byte> frame;
+    const auto u64 = [&](std::uint64_t value) {
+        for (unsigned shift = 0; shift < 64; shift += 8)
+            frame.push_back(static_cast<std::byte>((value >> shift) & 255U));
+    };
+    const auto digest = [&](const strix::ModelContentIdentity& value) {
+        for (const auto byte : value.bytes) frame.push_back(static_cast<std::byte>(byte));
+    };
+    u64(0x5354524958504331ULL);
+    digest(in.model_content);
+    digest(in.engine_build);
+    for (const auto value : {in.state_layout_identity, in.runtime_compatibility_identity, in.decode_execution_identity,
+             in.decode_kernel_plan_identity, in.prefill_execution_identity, in.prefill_kernel_plan_identity,
+             in.tiled_execution_identity, in.tiled_kernel_plan_identity, in.prefill_profile_identity,
+             in.decode_profile_identity, in.profile_pair_identity, static_cast<std::uint64_t>(in.block_rows),
+             static_cast<std::uint64_t>(in.tail_rows.size()), in.context_tokens})
+        u64(value);
+    for (const auto rows : in.tail_rows) u64(rows);
+    return strix::sha256_bytes(frame);
 }
 
 constexpr std::uint32_t T = 4;
@@ -102,7 +127,64 @@ bool same_payloads(const strix::PrefixCacheCheckpoint& a, const strix::PrefixCac
 
 void prefix_dma_tests();
 
-int main() {
+int main(int argc, char** argv) {
+    if (argc == 3) {
+        try {
+            strix::decode_cli::PrefixStateCacheIdentityInputs in;
+            in.model_content = identity_of("same model");
+            in.effective_execution = strix::decode_cli::prefix_effective_execution_signature("test",false,false,{},0U);
+            in.state_layout_identity = in.runtime_compatibility_identity = 1U;
+            in.decode_execution_identity = in.prefill_execution_identity = in.tiled_execution_identity = 2U;
+            in.block_rows = T;
+            const auto legacy = legacy_v1_identity(in);
+            const auto off = strix::decode_cli::prefix_state_cache_identity(in);
+            in.effective_execution = strix::decode_cli::prefix_effective_execution_signature("test",false,false,{},strix::kPrefillOptionsReady);
+            const auto on = strix::decode_cli::prefix_state_cache_identity(in);
+            require(on != off, "production ON/OFF cache namespaces must differ");
+            require(legacy != off && legacy != on, "v2 keys must differ from v1 even with options OFF");
+            const auto execution_on = strix::bind_prefill_option_identity(42U, strix::kPrefillOptionsReady);
+            const auto execution_off = strix::bind_prefill_option_identity(42U, 0U);
+            require(execution_on != execution_off, "compiled arithmetic identities must differ");
+            const auto history_on = strix::prepare_prefill_chunk_lineage({}, 0U, T, execution_on, 3U, execution_on);
+            const auto history_off = strix::prepare_prefill_chunk_lineage({}, 0U, T, execution_off, 3U, execution_off);
+            require(history_on.history_identity != history_off.history_identity, "lineage must inherit option identity");
+            const std::vector<std::uint32_t> tokens{1, 2, 3, 4};
+            const std::vector<std::uint32_t> legacy_tokens{5, 6, 7, 8};
+            strix::PrefixStateCache cache({1ULL << 20, argv[2], 0}, heap);
+            if (std::string(argv[1]) == "--write-option-checkpoint") {
+                require(cache.insert(build(cache, legacy, legacy_tokens).front()), "write legacy v1 checkpoint");
+                require(cache.insert(build(cache, on, tokens).front()), "write ON checkpoint");
+                cache.flush();
+                require(cache.stats().disk_writes == 2U, "v1 and v2 checkpoints persisted together");
+            } else {
+                require(cache.find_longest(off, legacy_tokens, T, T) == nullptr &&
+                        cache.find_longest(on, legacy_tokens, T, T) == nullptr,
+                    "legacy-only prefix is a cold miss under both v2 option sets");
+                require(cache.stats().disk_read_failures == 0U, "legacy namespace miss is not payload corruption");
+                strix::PrefixStateCache reference({1ULL << 20, {}, 0}, heap);
+                const auto legacy_hit = cache.find_longest(legacy, legacy_tokens, T, T);
+                require(legacy_hit && same_payloads(*legacy_hit, *build(reference, legacy, legacy_tokens).front()),
+                    "legacy checkpoint remains valid and readable under its v1 key");
+                require(cache.find_longest(off, tokens, T, T) == nullptr, "fresh OFF process rejects ON checkpoint");
+                const auto on_hit = cache.find_longest(on, tokens, T, T);
+                require(on_hit && same_payloads(*on_hit, *build(reference, on, tokens).front()),
+                    "fresh ON process restores compatible v2 payload alongside v1 entry");
+                // Also place the ON payload at the OFF filename: validation must reject it.
+                const auto on_digest = strix::prefix_cache_block_digest(on, tokens);
+                const auto off_digest = strix::prefix_cache_block_digest(off, tokens);
+                const std::filesystem::path directory(argv[2]);
+                std::filesystem::copy_file(directory / ("ckpt-" + strix::model_content_identity_hex(on_digest) + ".tmpc"),
+                    directory / ("ckpt-" + strix::model_content_identity_hex(off_digest) + ".tmpc"),
+                    std::filesystem::copy_options::overwrite_existing);
+                require(cache.find_longest(off, tokens, T, T) == nullptr && cache.stats().disk_read_failures > 0U,
+                    "incompatible checkpoint payload rejected even at expected filename");
+            }
+            return 0;
+        } catch (const std::exception& error) {
+            std::cerr << error.what() << '\n';
+            return 1;
+        }
+    }
     const auto dir = std::filesystem::temp_directory_path() /
         ("strix-prefix-cache-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
     try {

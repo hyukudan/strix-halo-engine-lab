@@ -96,3 +96,27 @@ on the same kernel.
 Keep deployment endpoints, machine/account identifiers, private paths, prompts, receipts and unpublished
 benchmark/review material out of public changes. Use relative asset placeholders in commands and public
 implementation or qualification contracts for links.
+
+## Bit-changing Qwen prefill options
+
+The single registry and active-set identity live in
+[include/strix/prefill_identity.hpp](include/strix/prefill_identity.hpp).
+Every bit-changing prefill option is on by default once READY, must have an individual
+off switch (`--prefill-disable NAME`, config `prefill_disable`, `STRIX_PREFILL_<NAME>=0`),
+and must honor the master (`--prefill-exact-fp16`, config `prefill_exact_fp16 = true`,
+`STRIX_PREFILL_EXACT_FP16=1`). Keep unfinished options out of `kPrefillOptionsReady`.
+Receipts, effective config and HTTP capabilities must report the active name, 16-hex
+identity hash and option list. Re-qualify every changed active set: compiler, native
+execution, model fidelity and complete-workload gates must pass before READY.
+These controls are server-level only; changing a shared prefill plan or prefix-state
+cache identity requires a server restart. See the
+[option catalog](docs/optimizations.md#bit-changing-prefill-options).
+
+Qwen `hc_output_wmma` is default ON. `hc_output_wmma` passed a pre-declared confirmation holdout; its NLL endpoint is measured against a rounding-equivalent control whose per-case movement is capped at +-0.02 nats/token (a bounded control allowance, not an unbiased estimate of the uncapped difference); the absolute NLL change vs the exact reference also passed (-0.37 % NLL/token, upper bound +0.38 %). The off switch restores the exact output path.
+Controls are server-level only: `STRIX_PREFILL_HC_OUTPUT_WMMA=0`,
+`--prefill-disable hc_output_wmma`, or config `prefill_disable = ["hc_output_wmma"]`;
+master `STRIX_PREFILL_EXACT_FP16=1`, `--prefill-exact-fp16`, or config
+`prefill_exact_fp16 = true`. Restart the server; request-level controls return HTTP 400.
+Fast HC with this option is excluded from MTP and nested admission pending qualification;
+ordinary MTP/HTTP profiles retain their existing arithmetic. OFF restoration compares logits
+and seven state payloads to public main; compiled, lineage and cache identity bytes may differ.

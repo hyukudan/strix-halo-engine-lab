@@ -873,6 +873,56 @@ baselines have engine-specific scope and may change arithmetic; they are not a u
 the reference fixed. See [precedence, guards and fallbacks](docs/optimizations.md#baselines-inspection-and-exactness)
 and the [JSON catalog](docs/optimizations.json).
 
+### Bit-changing prefill options
+
+Qwen's registry is [prefill_identity.hpp](include/strix/prefill_identity.hpp). Each option is
+**on by default once READY**, with an individual off switch and a master exact-FP16 switch.
+The registry contains only `hc_output_wmma` (its bit in `kPrefillOptionsReady`). With every option on, the default prefill identity is
+`fp16-v1+hcout16` (`prefill_identity_hash` ee2cd64684149069); `--prefill-exact-fp16` gives the plain
+`fp16-v1` identity (a0094634843e16ee).
+
+| Option | What it does | Gain | Changes bits vs FP16 identity | Measured quality | Switch off (CLI / config / API / env) |
+|---|---|---|---|---|---|
+| `hc_output_wmma` (on) | HC output: FP16 low values and Q8 coefficients, WMMA accumulation in ascending K16 order, same sigmoid and stream mix | Passed a pre-declared confirmation holdout | yes | `hc_output_wmma` passed a pre-declared confirmation holdout; its NLL endpoint is measured against a rounding-equivalent control whose per-case movement is capped at +-0.02 nats/token (a bounded control allowance, not an unbiased estimate of the uncapped difference); the absolute NLL change vs the exact reference also passed (-0.37 % NLL/token, upper bound +0.38 %). The off switch restores the exact output path. | `--prefill-disable hc_output_wmma` / `prefill_disable = ["hc_output_wmma"]` / server-level only / `STRIX_PREFILL_HC_OUTPUT_WMMA=0` |
+
+The prefill identity hash is FNV-1a 64 of the identity name. The enabled-set tag is not
+executed-path evidence: OUT16 requires the fast HC component, the qualified wide shape
+(hidden 2560, four streams, rank 320), QPF2K HC admission, FP32 normalized rows and
+compatible output selection. Serial suffixes, incompatible normalization forms and
+non-fast profiles can retain `hcout16` without executing OUT16. The once-per-process
+stderr witness does not establish execution for every request.
+
+Use `--prefill-exact-fp16`, `prefill_exact_fp16 = true`, or `STRIX_PREFILL_EXACT_FP16=1`
+to switch it off. `--prefill-disable` accepts comma-separated names and can be repeated;
+unknown or empty names are rejected. CLI/config restrictions combine with environment restrictions;
+a config `false` or empty array does not re-enable an environment-disabled option.
+These arithmetic controls preserve automatic route selection.
+
+The decode-token app and its `--http-serve` mode share these startup controls.
+`--config FILE` reads the two keys above as `key = value` assignments,
+one per line, with lowercase booleans, single-line arrays of double-quoted names and `#` comments.
+Unknown/duplicate keys and malformed values are rejected. For example:
+
+```text
+prefill_exact_fp16 = false
+prefill_disable = ["hc_output_wmma"]
+```
+
+Receipts, `--print-effective-config`, HTTP response `strix` receipts and `GET /v1/capabilities`
+report `prefill_identity`, `prefill_identity_hash` (16 lowercase hex digits), and
+`prefill_options_active` (names in registry order). This identifies the option set; the existing
+numerical profile pair still identifies the surrounding arithmetic. Every changed active set
+must be re-qualified against its own reference.
+
+**Server-level only:** restart the server to change these options. Compiled prefill plans and
+prefix-state caches are shared across requests; the enabled set is bound into compiled execution,
+lineage and persistent-cache keys. The process-wide override has no request-scoped synchronization.
+A per-call getter alone cannot isolate concurrent or resumed requests. Request fields `prefill_exact_fp16` and `prefill_disable` are refused with HTTP 400.
+
+OFF is required to preserve public-main logits and all seven state components across CLI, MTP, HTTP, nested, GSQ and baseline routes. Compiled execution, lineage and cache identity bytes may differ even when numerical bytes match; native restoration gates must compare numerical payloads separately. Native restoration against public main remains a required release gate.
+
+The [native release gate commands](docs/engine/prefill/hc-output-wmma-qualification.md) cover public-main/OFF restoration, ON repeatability, full state exports, MTP, HTTP and nested scheduling.
+
 ## Optimizations
 
 The fast path is the default for all five engines. `auto` applies the documented admission guards;

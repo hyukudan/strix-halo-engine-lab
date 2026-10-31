@@ -636,6 +636,15 @@ if(BUILD_TESTING)
     target_link_libraries(strix-prefix-state-cache-tests PRIVATE strix_core strix_serve)
     strix_target_warnings(strix-prefix-state-cache-tests)
     add_test(NAME strix-prefix-state-cache-tests COMMAND strix-prefix-state-cache-tests)
+    add_test(NAME strix-prefill-option-cache-write COMMAND strix-prefix-state-cache-tests
+        --write-option-checkpoint "${CMAKE_CURRENT_BINARY_DIR}/prefill-option-cache")
+    add_test(NAME strix-prefill-option-cache-read COMMAND strix-prefix-state-cache-tests
+        --read-option-checkpoint "${CMAKE_CURRENT_BINARY_DIR}/prefill-option-cache")
+    set_tests_properties(strix-prefill-option-cache-write PROPERTIES FIXTURES_SETUP prefill_option_cache)
+    set_tests_properties(strix-prefill-option-cache-read PROPERTIES FIXTURES_REQUIRED prefill_option_cache)
+    add_test(NAME strix-prefill-option-cache-clean COMMAND ${CMAKE_COMMAND} -E rm -rf
+        "${CMAKE_CURRENT_BINARY_DIR}/prefill-option-cache")
+    set_tests_properties(strix-prefill-option-cache-clean PROPERTIES FIXTURES_CLEANUP prefill_option_cache)
 
     add_executable(strix-rtx-state-import-tests tests/rtx_state_import_tests.cpp)
     target_include_directories(strix-rtx-state-import-tests PRIVATE apps)
@@ -1696,6 +1705,8 @@ if(BUILD_TESTING)
                 --emitter $<TARGET_FILE:strix-qwen-yarn-table-tests>)
         add_test(NAME strix-session-gate-tests
             COMMAND ${Python3_EXECUTABLE} -B ${CMAKE_SOURCE_DIR}/tests/session_gate_tests.py)
+        add_test(NAME strix-qwen-prefill-public-controls-gate-tests
+            COMMAND ${Python3_EXECUTABLE} -B ${CMAKE_SOURCE_DIR}/tests/qwen_prefill_public_controls_gate_tests.py)
         add_test(NAME strix-ctest-evidence-tests
             COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/ctest_evidence_tests.py)
         add_test(NAME strix-queue-trace-evidence-tests
@@ -2191,6 +2202,8 @@ if(STRIX_ENABLE_HIP_RUNTIME)
         target_link_libraries(strix-hip-hc-wide-rows-tests PRIVATE strix_hip_runtime)
         strix_target_warnings(strix-hip-hc-wide-rows-tests)
         add_test(NAME strix-hip-hc-wide-rows-tests COMMAND strix-hip-hc-wide-rows-tests)
+        add_test(NAME strix-hip-hc-out16-tests COMMAND strix-hip-hc-wide-rows-tests)
+        set_tests_properties(strix-hip-hc-out16-tests PROPERTIES ENVIRONMENT "STRIX_PREFILL_EXACT_FP16=0;STRIX_PREFILL_HC_OUTPUT_WMMA=1;STRIX_HCW_OUTPUT=1;STRIX_HC_OUT16_FIXTURES_ONLY=1;STRIX_QPF2K_HC=1;STRIX_QPF2K_HC_LOWBAND=3")
         add_executable(strix-hip-parallel-hyper-projection-tests tests/hip_parallel_hyper_projection_tests.hip)
         set_target_properties(strix-hip-parallel-hyper-projection-tests PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHITECTURES}")
         target_link_libraries(strix-hip-parallel-hyper-projection-tests PRIVATE strix_hip_runtime)

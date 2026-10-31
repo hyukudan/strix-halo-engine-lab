@@ -1,4 +1,5 @@
 #include "strix/hip_mtp_fast_draft.hpp"
+#include "strix/prefill_identity.hpp"
 #include "strix/dispatch_fuse.hpp"
 #include "strix/hip_lane_chain_hyper_output_tests.hpp"
 #include "strix/hip_hc_wide_rows_tests.hpp"
@@ -5233,6 +5234,7 @@ bool wide_hyper_rows(const PreparedHyperRows& prepared, const HipHyperMixLaunche
 
 #include "hip_hc_fast_wmma.inc"
 #include "hip_qpf2k_hc.inc"
+#include "hip_qpf2k_hc_out16.inc"
 
 constexpr unsigned kSkipKernel = 255U;  // test seam: launch only the other kernel
 // Transposed low values for the wide2 output kernel: 320 x up to kWide2LowRows rows (prefill steps).
@@ -5260,6 +5262,15 @@ void launch_wide_hyper_kernels(const HyperWideRows& wide_in, const void* down, c
     // Test seam: output kernels 3..6 = the STRIX_QPF2K_HC output (packed coefficients) on the lane-chain output's inputs:
     // 3 v1 (ring 4, conditional look-ahead), 4 v2 (blocks of 8 steps; the engine's form), 5 blocks of 4, 6 blocks of 10.
     // Projection kernels 3 / 4 = the STRIX_QPF2K_HC projection, register prefetch depth 2 (v1) / 1 (v2, the engine's form).
+    // Form 14 is the output-only / paired fixture seam; the env selects only the
+    // normal fused FP32-normalized route and leaves fast_output_kernel() at 1.
+    const bool out16 = output_kernel == 14U || (output_kernel == 1U && qpf2k_hc_out16() &&
+        config.fast_prefill_wmma && config.hidden_size == 2560U && config.hc_count == 4U &&
+        projection_kernel == 2U && !wide.normalized16 && !wide.inverse);
+    if (output_kernel == 14U) output_kernel = 1U;
+    if (out16 && (config.hidden_size != 2560U || config.hc_count != 4U || wide.normalized16 || wide.inverse ||
+        (projection_kernel != 2U && projection_kernel != 4U && projection_kernel != kSkipKernel)))
+        throw std::invalid_argument("HC out16 requires FP32 normalized rows and the WMMA low image");
     const unsigned qpf2k_output_form = output_kernel >= 3U && output_kernel <= 6U ? output_kernel : 0U;
     const bool qpf2k_output = qpf2k_output_form != 0U;
     if (qpf2k_output) output_kernel = 1U;
@@ -5273,11 +5284,11 @@ void launch_wide_hyper_kernels(const HyperWideRows& wide_in, const void* down, c
     const unsigned qpf2k_projection_form = projection_kernel == 3U || projection_kernel == 4U ? projection_kernel : 0U;
     const bool qpf2k_projection = qpf2k_projection_form != 0U;
     if (qpf2k_projection) projection_kernel = 2U;
-    if (output_kernel == 1U && (projection_kernel == 1U || projection_kernel == 2U || projection_kernel == kSkipKernel) &&
+    if (!out16 && output_kernel == 1U && (projection_kernel == 1U || projection_kernel == 2U || projection_kernel == kSkipKernel) &&
         (wide.count + kWide2OutputRows - 1U) / kWide2OutputRows * kWide2OutputRows <= kWide2LowRows) {
         wide.low_t = wide2_low_scratch();
         wide.low_t_pitch = (wide.count + kWide2OutputRows - 1U) / kWide2OutputRows * kWide2OutputRows;
-    } else if (output_kernel == 1U) {
+    } else if (!out16 && output_kernel == 1U) {
         if (qpf2k_output || qpf2k_output3) throw std::invalid_argument("qpf2k HC output test needs the transposed low values");
         output_kernel = 0U;
     }
@@ -5294,7 +5305,7 @@ void launch_wide_hyper_kernels(const HyperWideRows& wide_in, const void* down, c
             config.hidden_size == 2560U && (qpf2k_output3 || (!qpf2k_output && output_rows_first && config.fast_prefill_wmma && qpf2k_hc_output3()));
         const bool qpf2k_projection_route = projection_kernel == 2U && !wide.normalized16 && !wide.inverse && !qpf2k_hc_check() &&
             (qpf2k_projection ? qpf2k_projection_form == 4U : (qpf2k_hc_mask() & 8U) != 0U);
-        if (output3_route && qpf2k_projection_route && output3_band_used == 16U && !output3_zero_low_rank_stride)
+        if (!out16 && output3_route && qpf2k_projection_route && output3_band_used == 16U && !output3_zero_low_rank_stride)
             low_mode = (low_band == UINT32_MAX ? qpf2k_hc_lowband() : low_band) & 3U;
         if (wide.low_t_pitch <= kQpf2kLowBandRows) low_mode &= ~1U;
         if (low_mode & 1U) { wide.low_t_band = true; wide.low_t_pitch = kQpf2kLowBandRows; }
@@ -5302,8 +5313,8 @@ void launch_wide_hyper_kernels(const HyperWideRows& wide_in, const void* down, c
         // that call wrote another layout (bit 0: low_t banded) or skipped low16 (bit 1). Every projection records what it wrote.
         static std::atomic<unsigned> low_state{0U};
         if (projection_kernel == kSkipKernel) {
-            if (output_kernel != kSkipKernel && (((low_state.load() & 1U) && output_kernel == 1U && wide.low_t) ||
-                                                 ((low_state.load() & 2U) && output_kernel == 2U)))
+            if (output_kernel != kSkipKernel && (((low_state.load() & 1U) && output_kernel == 1U && !out16 && wide.low_t) ||
+                                                 ((low_state.load() & 2U) && (output_kernel == 2U || out16))))
                 throw std::invalid_argument("HC wide rows test: the last projection left the low values in another layout");
         } else if (projection_kernel == 2U) {
             low_state.store(((wide.low_t ? low_mode : low_state.load()) & 1U) | (low_mode & 2U));
@@ -5325,7 +5336,7 @@ void launch_wide_hyper_kernels(const HyperWideRows& wide_in, const void* down, c
     // Kernels 2 (fast-prefill-f16wmma-v1): FP16 WMMA projection and output over per-call FP16 weight packs;
     // output kernel 2 reads the FP16 low values projection kernel 2 writes; output kernel 1 (the FP32 lane-chain
     // output) reads the transposed FP32 low values it also writes.
-    if (projection_kernel == 2U || output_kernel == 2U) {
+    if (projection_kernel == 2U || output_kernel == 2U || out16) {
         if (wide.count > kHcwLowRows || config.hc_count != 4U)
             throw std::invalid_argument("HC WMMA rows: row count or stream count unsupported");
         const auto scratch = hcw_scratch();
@@ -5393,6 +5404,22 @@ void launch_wide_hyper_kernels(const HyperWideRows& wide_in, const void* down, c
             check_hip(hipGetLastError(), "prefill HC WMMA projection launch");
         } else if (projection_kernel != kSkipKernel) throw std::invalid_argument("HC WMMA output requires the WMMA projection");
         if (output_kernel == kSkipKernel) return;
+        if (out16) {
+            static std::atomic<bool> witnessed{false};
+            if (qpf2k_hc_out16() && !witnessed.exchange(true))
+                std::fprintf(stderr, "qpf2k HC out16 active (rows %u, FP16 low image retained)\n", wide.count);
+            // As for output3: cached byte-identical Q8 image, including copy cost.
+            const void* up16 = qpf2k_hc_upcopy() ? qpf2k_hc_up_copy(up,
+                std::uint64_t{4U} * config.hidden_size * 340U, wide.count, stream) : up;
+            const dim3 grid((wide.count + 31U) / 32U, config.hidden_size / 128U);
+            if (config.activation == HipActivationStorage::bf16)
+                hipLaunchKernelGGL(HIP_KERNEL_NAME(qpf2k_hc_out16_kernel<std::uint16_t>), grid, dim3(128U), 0, stream,
+                    wide, static_cast<const unsigned char*>(up16), scratch.low16, config.hidden_size);
+            else hipLaunchKernelGGL(HIP_KERNEL_NAME(qpf2k_hc_out16_kernel<float>), grid, dim3(128U), 0, stream,
+                    wide, static_cast<const unsigned char*>(up16), scratch.low16, config.hidden_size);
+            check_hip(hipGetLastError(), "qpf2k HC out16 launch");
+            return;
+        }
         if (output_kernel == 1U && wide.low_t) {
             projection_kernel = kSkipKernel;  // fall through to the lane-chain output below
         } else {
@@ -5477,8 +5504,9 @@ void launch_wide_hyper_kernels(const HyperWideRows& wide_in, const void* down, c
                     // STRIX_QPF2K_HC_OUTPUT3 (fast profile): output v3, the same arithmetic as the kernel below; same bytes.
                     if (qpf2k_output3 || (!qpf2k_output && output_rows_first && config.fast_prefill_wmma && qpf2k_hc_output3() && config.hidden_size == 2560U)) {
                         const dim3 grid(groups, features);
-                        // Engine path: the up weights via the cached per-call copy (seam forms keep the fixture's buffer).
-                        const void* up3 = !qpf2k_output3 && qpf2k_hc_upcopy() ?
+                        // Engine and fast-profile fixtures include the cached per-call copy.
+                        // Ordinary seam fixtures keep their supplied buffer.
+                        const void* up3 = config.fast_prefill_wmma && qpf2k_hc_upcopy() ?
                             qpf2k_hc_up_copy(up, std::uint64_t{kWideStreams} * config.hidden_size * 340U, wide.count, stream) : up;
                         const unsigned band = output3_band_used;
                         if (wide.low_t_band && band != 16U) throw std::logic_error("qpf2k HC banded low values without output v3 band 16");
@@ -5597,7 +5625,7 @@ unsigned wide_projection_kernel() {
 // values) or STRIX_HCW_OUTPUT=2 (the FP16 WMMA output).
 unsigned fast_output_kernel() {
     static const unsigned k = [] { const char* v = std::getenv("STRIX_HCW_OUTPUT"); return v && std::atoi(v) == 2 ? 2U : 1U; }();
-    return k;
+    return strix::governed_hc_output_kernel(k, strix::prefill_options_active());
 }
 unsigned wide_output_kernel() {
     static const unsigned k = [] { const char* v = std::getenv("STRIX_HC_WIDE_OUTPUT_KERNEL"); return v ? static_cast<unsigned>(std::atoi(v)) : 1U; }();
@@ -5962,7 +5990,7 @@ void testing::enqueue_wide_hyper_rows_test(const HipHyperMixLauncherConfig& conf
         config.hidden_size % (32U * kWideOutputWaves) || !views.rows || !views.normalized || !views.output || !views.down ||
         !views.up || (views.inject && !views.injection) || views.normalized_stride % 16U || !aligned(views.normalized, 16U) ||
         !aligned(views.up, 4U) || (projection_kernel > 4U && projection_kernel != kSkipKernel) ||
-        (output_kernel > 13U && output_kernel != kSkipKernel) ||
+        (output_kernel > 14U && output_kernel != kSkipKernel) ||
         (views.output3_band != UINT32_MAX && (!qpf2k_hc_output3_band_valid(views.output3_band) || output_kernel != 7U)) ||
         (views.output3_zero_low_rank_stride && (output_kernel != 7U || projection_kernel != kSkipKernel || views.output3_band != 0U)) ||
         (views.low_band != UINT32_MAX && views.low_band > 3U))
