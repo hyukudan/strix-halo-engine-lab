@@ -40,7 +40,7 @@ public:
                 "STRIX_G4_KV_POOL","STRIX_G4_OUTPUT_TILE","STRIX_G4_KV_PUBLISH",
                 "STRIX_G4_LINEAR_FINITE","STRIX_G4_NORM_PREFETCH","STRIX_G4_NORM_FINITE",
                 "STRIX_G4_EXL3_OUTPUT_TILE","STRIX_G4_EXL3_COLUMN_CACHE",
-                "STRIX_G4_PREFILL_EXACT_MANYROW"}) switches.set(name,enabled(name));
+                "STRIX_G4_PREFILL_EXACT_MANYROW","STRIX_G4_ATTN_KV_SHARED"}) switches.set(name,enabled(name));
         const auto* tiling = std::getenv("STRIX_G4_OUTPUT_TILE");
         switches.set("STRIX_G4_OUTPUT_TILE",enabled("STRIX_G4_CHUNK_DECODE") && tiling && std::string(tiling) == "1");
         switches.set("STRIX_G4_HOST_PARALLEL","not used by device target or device drafter");

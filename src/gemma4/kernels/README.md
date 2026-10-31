@@ -151,6 +151,15 @@ kernels byte for byte):
   chunk block of each (row, head) merging the partials in chunk order. Producer
   K norm/rotation and V norm are written straight into the overlay. `0`
   restores head-norm, overlay and four-kernel attention launches.
+- `STRIX_G4_ATTN_KV_SHARED` (default on): the two long-span launches run on a
+  (row x head, chunk) grid, so every row and query head reading one key/value
+  chunk runs back to back and the chunk leaves memory once per pass; passes of
+  more than one row use one block per (row, key/value head, chunk) that loads
+  each key and value once for the group's four query heads. The merge block
+  forms the maximum of the chunk maxima with all its threads (order free except
+  +0/-0, which give the same exponentials). `1` keeps one block per query head,
+  `2` always groups, `0` restores the chunk-fastest grid.
+  `strix-gemma4-device-attention-shared-tests` compares the modes byte for byte.
 - `STRIX_G4_STORE_FUSION` (default on): the PLE gate store applies the PLE
   activation and the head store applies the softcap.
 - `STRIX_G4_MULTI_LINEAR` (default on): producer Q/K/V projections of one

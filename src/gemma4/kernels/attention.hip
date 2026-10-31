@@ -616,21 +616,27 @@ __global__ void __launch_bounds__(256) fused_attention_fast_kernel(const float* 
 // Long spans, launch one of two: the chunk-parallel scores with the query
 // norm/rotation recomputed per chunk block (same values as the separate head
 // kernel), and per-chunk maxima.
+// Shared (STRIX_G4_ATTN_KV_SHARED, default on): the grid is (row x head, chunk)
+// instead of (chunk, row x head), so the blocks of every row and query head
+// that read one key/value chunk run back to back and the chunk is read from
+// memory once per pass instead of once per row and head. Each block computes
+// exactly the values of the chunk-fastest grid.
 template <unsigned Dim>
 __global__ void __launch_bounds__(128) chunk_scores_kernel(const float* q, LinearView q_norm,
                                                            const std::uint64_t* positions, const float* table,
                                                            const KvRead* reads, unsigned heads_count, unsigned stride,
                                                            float* scores, float* maxima, bool parallel, bool bounded,
-                                                           bool intervals, unsigned* failure) {
-    const unsigned rh = blockIdx.y, row = rh / heads_count, head = rh % heads_count;
+                                                           bool intervals, unsigned* failure, bool shared) {
+    const unsigned rh = shared ? blockIdx.x : blockIdx.y, row = rh / heads_count, head = rh % heads_count;
+    const unsigned chunk = shared ? blockIdx.y : blockIdx.x, chunks = shared ? gridDim.y : gridDim.x;
     const auto r = reads[row];
     const auto range = visible(r.position, r.global, r.window);
-    const std::uint64_t begin = std::uint64_t(blockIdx.x) * attention_chunk;
+    const std::uint64_t begin = std::uint64_t(chunk) * attention_chunk;
     const unsigned lane = threadIdx.x % 32U, wave = threadIdx.x / 32U;
     auto* out = scores + std::size_t(rh) * stride;
     if (begin > range.last || begin + attention_chunk <= range.first) {
         if (threadIdx.x == 0)
-            maxima[std::size_t(rh) * gridDim.x + blockIdx.x] = bit_cast<float>(0xff800000U);
+            maxima[std::size_t(rh) * chunks + chunk] = bit_cast<float>(0xff800000U);
         return;
     }
     __shared__ float query[Dim];
@@ -678,29 +684,53 @@ __global__ void __launch_bounds__(128) chunk_scores_kernel(const float* q, Linea
             if (p >= range.first && p <= range.last)
                 m = out[p] > m ? out[p] : m;
         }
-        maxima[std::size_t(rh) * gridDim.x + blockIdx.x] = m;
+        maxima[std::size_t(rh) * chunks + chunk] = m;
     }
 }
 // Launch two: every chunk block merges the chunk maxima in order itself, writes
 // its partial, and the last chunk block of each (row, head) merges the partials
 // in chunk order. Values equal the maximum/partial/merge kernels.
+// Shared: (row x head, chunk) grid as in chunk_scores_kernel, and the block
+// forms the maximum with all its threads. The maximum of the visible scores
+// is order independent except for +0 versus -0, and declared_exp(s - (+0)) ==
+// declared_exp(s - (-0)) for every s, so every e and every byte is unchanged.
 template <bool Quant = false>
 __global__ void __launch_bounds__(256) chunk_partial_merge_kernel(const KvRead* reads, unsigned heads_count,
                                                                   unsigned dim, unsigned stride, const float* scores,
                                                                   const float* maxima, float* partials, float* out,
                                                                   unsigned* counters, unsigned* failure,
-                                                                  A8Rows quant = {}) {
-    const unsigned rh = blockIdx.y, head = rh % heads_count, chunks = gridDim.x;
+                                                                  A8Rows quant = {}, bool shared = false) {
+    const unsigned rh = shared ? blockIdx.x : blockIdx.y, head = rh % heads_count;
+    const unsigned chunk = shared ? blockIdx.y : blockIdx.x, chunks = shared ? gridDim.y : gridDim.x;
     const auto r = reads[rh / heads_count];
     const auto range = visible(r.position, r.global, r.window);
-    const auto first = std::uint64_t(blockIdx.x) * attention_chunk;
+    const auto first = std::uint64_t(chunk) * attention_chunk;
     __shared__ float e[attention_chunk];
     __shared__ const float* values[attention_chunk];
     __shared__ float maximum;
+    __shared__ float wave_maxima[8];
     __shared__ unsigned ticket;
     const auto first_chunk = range.first / attention_chunk, last_chunk = range.last / attention_chunk;
     if (!(first > range.last || first + attention_chunk <= range.first)) {
-        if (threadIdx.x == 0) {
+        if (shared) {
+            float m = bit_cast<float>(0xff800000U);
+            for (auto c = first_chunk + threadIdx.x; c <= last_chunk; c += blockDim.x) {
+                const float a = maxima[std::size_t(rh) * chunks + c];
+                m = a > m ? a : m;
+            }
+#pragma unroll
+            for (unsigned d = 16; d != 0; d >>= 1U) {
+                const float a = __shfl_xor(m, int(d), 32);
+                m = a > m ? a : m;
+            }
+            if (threadIdx.x % 32U == 0) wave_maxima[threadIdx.x / 32U] = m;
+            __syncthreads();
+            if (threadIdx.x == 0) {
+                m = wave_maxima[0];
+                for (unsigned w = 1; w < blockDim.x / 32U; ++w) m = wave_maxima[w] > m ? wave_maxima[w] : m;
+                maximum = m;
+            }
+        } else if (threadIdx.x == 0) {
             float m = bit_cast<float>(0xff800000U);
             for (auto c = first_chunk; c <= last_chunk; ++c) {
                 const float a = maxima[std::size_t(rh) * chunks + c];
@@ -715,7 +745,7 @@ __global__ void __launch_bounds__(256) chunk_partial_merge_kernel(const KvRead* 
             values[p - first] = kv_at(r, p, true, failure);
         }
         __syncthreads();
-        float* partial = partials + (std::size_t(rh) * chunks + blockIdx.x) * (dim + 1U);
+        float* partial = partials + (std::size_t(rh) * chunks + chunk) * (dim + 1U);
         if (threadIdx.x == 0) {
             float denominator = 0.0F;
             for (auto p = begin; p < end; ++p)
@@ -769,6 +799,196 @@ __global__ void __launch_bounds__(256) chunk_partial_merge_kernel(const KvRead* 
     }
     if (threadIdx.x == 0)
         atomicExch(counters + rh, 0U);
+}
+// Grouped long-span launches (STRIX_G4_ATTN_KV_SHARED=2): one block per
+// (row, key/value head, chunk) serves the group's query heads, so each key and
+// value is loaded once for all of them. Grid (row x kv head, chunk) as in the
+// shared mode. Per (row, head) every score, maximum, e, partial and merged value
+// is the chunk_scores/chunk_partial_merge value, formed by the same operations
+// in the same order; only the head loop moves inside the block.
+template <unsigned Dim>
+__global__ void __launch_bounds__(128) group_scores_kernel(const float* q, LinearView q_norm,
+                                                           const std::uint64_t* positions, const float* table,
+                                                           const KvRead* reads, unsigned heads_count, unsigned stride,
+                                                           float* scores, float* maxima, bool parallel, bool bounded,
+                                                           bool intervals, unsigned* failure) {
+    static_assert(group == 4U);
+    const unsigned kv_count = heads_count / group, row = blockIdx.x / kv_count, kv_head = blockIdx.x % kv_count;
+    const unsigned chunk = blockIdx.y, chunks = gridDim.y, rh0 = row * heads_count + kv_head * group;
+    const auto r = reads[row];
+    const auto range = visible(r.position, r.global, r.window);
+    const std::uint64_t begin = std::uint64_t(chunk) * attention_chunk;
+    const unsigned lane = threadIdx.x % 32U, wave = threadIdx.x / 32U;
+    if (begin > range.last || begin + attention_chunk <= range.first) {
+        if (threadIdx.x < group)
+            maxima[std::size_t(rh0 + threadIdx.x) * chunks + chunk] = bit_cast<float>(0xff800000U);
+        return;
+    }
+    __shared__ float query[group][Dim];
+    {
+        // Wave w forms query head kv_head * group + w (the separate head kernel's values).
+        float v[Dim / 32U];
+#pragma unroll
+        for (unsigned j = 0; j < Dim / 32U; ++j)
+            v[j] = q[std::size_t(rh0 + wave) * Dim + lane + 32U * j];
+        register_head_values<Dim>(v, q_norm, table + std::size_t(positions[row]) * Dim, parallel, bounded, intervals);
+#pragma unroll
+        for (unsigned j = 0; j < Dim / 32U; ++j) {
+            query[wave][lane + 32U * j] = v[j];
+            finite_flag(v[j], failure);
+        }
+    }
+    __syncthreads();
+    const auto kv_offset = kv_head * Dim;
+    for (unsigned j = wave; j < attention_chunk; j += 4U) {
+        const auto p = begin + j;
+        if (p < range.first || p > range.last)
+            continue;
+        const auto* k = kv_at(r, p, false, failure);
+        float sum[group] = {};
+        if (k) {
+            float key[Dim / 32U];
+#pragma unroll
+            for (unsigned c = 0; c < Dim / 32U; ++c)
+                key[c] = k[kv_offset + lane + 32U * c];
+#pragma unroll
+            for (unsigned h = 0; h < group; ++h)
+#pragma unroll
+                for (unsigned c = 0; c < Dim / 32U; ++c)
+                    sum[h] = sum[h] + query[h][lane + 32U * c] * key[c];
+        }
+#pragma unroll
+        for (unsigned h = 0; h < group; ++h) {
+            const float total = wave_sum(sum[h]);
+            if (lane == 0) {
+                finite_flag(total, failure);
+                scores[std::size_t(rh0 + h) * stride + p] = total;
+            }
+        }
+    }
+    __syncthreads();
+    if (threadIdx.x < group) {
+        const float* out = scores + std::size_t(rh0 + threadIdx.x) * stride;
+        float m = bit_cast<float>(0xff800000U);
+        for (unsigned j = 0; j < attention_chunk; ++j) {
+            const auto p = begin + j;
+            if (p >= range.first && p <= range.last)
+                m = out[p] > m ? out[p] : m;
+        }
+        maxima[std::size_t(rh0 + threadIdx.x) * chunks + chunk] = m;
+    }
+}
+template <bool Quant = false>
+__global__ void __launch_bounds__(256) group_partial_merge_kernel(const KvRead* reads, unsigned heads_count,
+                                                                  unsigned dim, unsigned stride, const float* scores,
+                                                                  const float* maxima, float* partials, float* out,
+                                                                  unsigned* counters, unsigned* failure,
+                                                                  A8Rows quant = {}) {
+    const unsigned kv_count = heads_count / group, row = blockIdx.x / kv_count, kv_head = blockIdx.x % kv_count;
+    const unsigned chunk = blockIdx.y, chunks = gridDim.y, rh0 = row * heads_count + kv_head * group;
+    const auto r = reads[row];
+    const auto range = visible(r.position, r.global, r.window);
+    const auto first = std::uint64_t(chunk) * attention_chunk;
+    __shared__ float e[group][attention_chunk];
+    __shared__ const float* values[attention_chunk];
+    __shared__ float maximum[group], wave_maxima[8][group];
+    __shared__ unsigned ticket;
+    const auto first_chunk = range.first / attention_chunk, last_chunk = range.last / attention_chunk;
+    if (!(first > range.last || first + attention_chunk <= range.first)) {
+        // Maximum of the chunk maxima per head, by all threads (order free, see chunk_partial_merge_kernel).
+        float m[group];
+#pragma unroll
+        for (unsigned h = 0; h < group; ++h) m[h] = bit_cast<float>(0xff800000U);
+        for (auto c = first_chunk + threadIdx.x; c <= last_chunk; c += blockDim.x)
+#pragma unroll
+            for (unsigned h = 0; h < group; ++h) {
+                const float a = maxima[std::size_t(rh0 + h) * chunks + c];
+                m[h] = a > m[h] ? a : m[h];
+            }
+#pragma unroll
+        for (unsigned h = 0; h < group; ++h) {
+#pragma unroll
+            for (unsigned d = 16; d != 0; d >>= 1U) {
+                const float a = __shfl_xor(m[h], int(d), 32);
+                m[h] = a > m[h] ? a : m[h];
+            }
+            if (threadIdx.x % 32U == 0) wave_maxima[threadIdx.x / 32U][h] = m[h];
+        }
+        __syncthreads();
+        if (threadIdx.x < group) {
+            float a = wave_maxima[0][threadIdx.x];
+            for (unsigned w = 1; w < blockDim.x / 32U; ++w) a = wave_maxima[w][threadIdx.x] > a ? wave_maxima[w][threadIdx.x] : a;
+            maximum[threadIdx.x] = a;
+        }
+        __syncthreads();
+        const auto begin = max(first, range.first), end = min(first + attention_chunk, range.last + 1);
+        for (auto p = begin + threadIdx.x; p < end; p += blockDim.x) {
+#pragma unroll
+            for (unsigned h = 0; h < group; ++h)
+                e[h][p - first] = declared_exp(scores[std::size_t(rh0 + h) * stride + p] - maximum[h]);
+            values[p - first] = kv_at(r, p, true, failure);
+        }
+        __syncthreads();
+        if (threadIdx.x < group) {
+            float denominator = 0.0F;
+            for (auto p = begin; p < end; ++p)
+                denominator = denominator + e[threadIdx.x][p - first];
+            partials[(std::size_t(rh0 + threadIdx.x) * chunks + chunk) * (dim + 1U) + dim] = denominator;
+        }
+        for (unsigned i = threadIdx.x; i < dim; i += blockDim.x) {
+            float numerator[group] = {};
+            for (auto p = begin; p < end; p += 8U) {
+                float v[8];
+                unsigned present = 0;
+#pragma unroll
+                for (unsigned j = 0; j < 8; ++j)
+                    if (p + j < end) {
+                        const auto* pointer = values[p + j - first];
+                        if (pointer) {
+                            v[j] = pointer[kv_head * dim + i];
+                            present |= 1U << j;
+                        }
+                    }
+#pragma unroll
+                for (unsigned j = 0; j < 8; ++j)
+                    if (present & (1U << j))
+#pragma unroll
+                        for (unsigned h = 0; h < group; ++h)
+                            numerator[h] = numerator[h] + e[h][p + j - first] * v[j];
+            }
+#pragma unroll
+            for (unsigned h = 0; h < group; ++h) {
+                finite_flag(numerator[h], failure);
+                partials[(std::size_t(rh0 + h) * chunks + chunk) * (dim + 1U) + i] = numerator[h];
+            }
+        }
+    }
+    __builtin_amdgcn_fence(__ATOMIC_RELEASE, "agent");
+    __syncthreads();
+    if (threadIdx.x == 0)
+        ticket = atomicAdd(counters + rh0, 1U);
+    __syncthreads();
+    if (ticket != chunks - 1U)
+        return;
+    __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "agent");
+    for (unsigned h = 0; h < group; ++h) {
+        const float* merged = partials + std::size_t(rh0 + h) * chunks * (dim + 1U);
+        float denominator = 0.0F;
+        for (auto c = first_chunk; c <= last_chunk; ++c)
+            denominator = denominator + merged[c * (dim + 1U) + dim];
+        for (unsigned i = threadIdx.x; i < dim; i += blockDim.x) {
+            float numerator = 0.0F;
+            for (auto c = first_chunk; c <= last_chunk; ++c)
+                numerator = numerator + merged[c * (dim + 1U) + i];
+            const float value = numerator / denominator;
+            out[std::size_t(rh0 + h) * dim + i] = value;
+            finite_flag(value, failure);
+            if constexpr (Quant)
+                a8_quantize_lane(value, quant, row, (kv_head * group + h) * dim + i);
+        }
+    }
+    if (threadIdx.x == 0)
+        atomicExch(counters + rh0, 0U);
 }
 template <unsigned Dim, bool Store, unsigned Shape>
 void launch_fast_attention_shape(unsigned blocks, hipStream_t stream, const float* q, LinearView q_norm,
@@ -826,11 +1046,19 @@ bool fused_attention_enabled() {
     }();
     return enabled;
 }
+int attention_kv_shared_mode() {
+    static const int mode = [] {
+        const auto* p = std::getenv("STRIX_G4_ATTN_KV_SHARED");
+        return p && std::string_view(p) == "0" ? 0 : p && std::string_view(p) == "1" ? 1 : p && std::string_view(p) == "2" ? 2 : 3;
+    }();
+    return mode;
+}
+bool attention_kv_shared_enabled() { return attention_kv_shared_mode() != 0; }
 bool fused_attention(const float* q, LinearView q_norm, const std::uint64_t* positions, const float* table,
                      const KvRead* reads, unsigned rows, unsigned heads_count, unsigned dim, unsigned stride,
                      bool global, float* out, unsigned* failure, Queue queue, bool parallel, bool bounded,
                      bool intervals, float* scores, float* maxima, float* partials, unsigned* counters,
-                     A8Rows quant) {
+                     A8Rows quant, int kv_shared) {
     valid_rows(rows);
     // g4-a8-v1: quantize the attention rows in the writing launch (whole groups per wave).
     const bool quantize = quant.codes && quant.width == heads_count * dim && dim % 256U == 0;
@@ -849,21 +1077,42 @@ bool fused_attention(const float* q, LinearView q_norm, const std::uint64_t* pos
     if (span > std::min(limit, fused_chunks)) {
         if (!counters || !scores || !maxima || !partials)
             return false;
+        // Default (3): one row keeps a block per query head (more blocks); more rows share the group.
+        int mode = kv_shared < 0 ? attention_kv_shared_mode() : kv_shared;
+        if (mode == 3) mode = rows > 1U ? 2 : 1;
+        if (mode == 2) {
+            const dim3 groups(rows * (heads_count / group), chunks);
+            if (global)
+                hipLaunchKernelGGL((group_scores_kernel<512>), groups, dim3(128), 0, stream, q, q_norm, positions, table, reads,
+                                   heads_count, stride, scores, maxima, parallel, bounded, intervals, failure);
+            else
+                hipLaunchKernelGGL((group_scores_kernel<256>), groups, dim3(128), 0, stream, q, q_norm, positions, table, reads,
+                                   heads_count, stride, scores, maxima, parallel, bounded, intervals, failure);
+            launch_checked();
+            if (quantize)
+                hipLaunchKernelGGL(group_partial_merge_kernel<true>, groups, dim3(256), 0, stream, reads, heads_count, dim,
+                                   stride, scores, maxima, partials, out, counters, failure, quant);
+            else
+                hipLaunchKernelGGL(group_partial_merge_kernel<false>, groups, dim3(256), 0, stream, reads, heads_count, dim,
+                                   stride, scores, maxima, partials, out, counters, failure, quant);
+            launch_checked();
+            return true;
+        }
+        const bool shared = mode != 0;
+        const dim3 grid = shared ? dim3(rows * heads_count, chunks) : dim3(chunks, rows * heads_count);
         if (global)
-            hipLaunchKernelGGL((chunk_scores_kernel<512>), dim3(chunks, rows * heads_count), dim3(128), 0, stream, q,
-                               q_norm, positions, table, reads, heads_count, stride, scores, maxima, parallel, bounded,
-                               intervals, failure);
+            hipLaunchKernelGGL((chunk_scores_kernel<512>), grid, dim3(128), 0, stream, q, q_norm, positions, table, reads,
+                               heads_count, stride, scores, maxima, parallel, bounded, intervals, failure, shared);
         else
-            hipLaunchKernelGGL((chunk_scores_kernel<256>), dim3(chunks, rows * heads_count), dim3(128), 0, stream, q,
-                               q_norm, positions, table, reads, heads_count, stride, scores, maxima, parallel, bounded,
-                               intervals, failure);
+            hipLaunchKernelGGL((chunk_scores_kernel<256>), grid, dim3(128), 0, stream, q, q_norm, positions, table, reads,
+                               heads_count, stride, scores, maxima, parallel, bounded, intervals, failure, shared);
         launch_checked();
         if (quantize)
-            hipLaunchKernelGGL(chunk_partial_merge_kernel<true>, dim3(chunks, rows * heads_count), dim3(256), 0, stream,
-                               reads, heads_count, dim, stride, scores, maxima, partials, out, counters, failure, quant);
+            hipLaunchKernelGGL(chunk_partial_merge_kernel<true>, grid, dim3(256), 0, stream, reads, heads_count, dim, stride,
+                               scores, maxima, partials, out, counters, failure, quant, shared);
         else
-            hipLaunchKernelGGL(chunk_partial_merge_kernel<false>, dim3(chunks, rows * heads_count), dim3(256), 0, stream,
-                               reads, heads_count, dim, stride, scores, maxima, partials, out, counters, failure, quant);
+            hipLaunchKernelGGL(chunk_partial_merge_kernel<false>, grid, dim3(256), 0, stream, reads, heads_count, dim, stride,
+                               scores, maxima, partials, out, counters, failure, quant, shared);
         launch_checked();
         return true;
     }
