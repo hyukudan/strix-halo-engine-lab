@@ -19,6 +19,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <iomanip>
 #include <iostream>
 #include <map>
 #include <numeric>
@@ -431,6 +432,14 @@ void test_synthetic() {
         check_case(x, 21, 6, 4, 16, 0.0, 5, "synthetic IQ2_XXS/Q2_K h5120");
     }
     {
+        // many experts, few rows: empty experts, 1-row experts, tails of 1..15 rows past 16 / 32 / 48 (split kernels v2:
+        // class map, partial Q2_K chunk, bands of batches)
+        const auto e = synthetic_experts(WeightFormat::iq2_xxs, WeightFormat::q2_k, 24, 5120, 2304, 65);
+        const DeviceExperts x(e);
+        check_case(x, 9, 6, 12, 16, 0.0, 61, "synthetic IQ2_XXS/Q2_K h5120 sparse");
+        check_case(x, 60, 6, 12, 16, 1.2, 62, "synthetic IQ2_XXS/Q2_K h5120 skewed");
+    }
+    {
         const auto e = synthetic_experts(WeightFormat::mxfp4, WeightFormat::mxfp4, 12, 5120, 2304, 25);
         const DeviceExperts x(e);
         check_case(x, 50, 3, 6, 32, 0.5, 6, "synthetic MXFP4 h5120");
@@ -770,6 +779,125 @@ void bench_router(const RouterWeights& rw, const std::string& label) {
     }
 }
 
+// Rank-shaped expert calls of the pair prefill (one piece of T rows routed top-k over all experts; this rank owns experts
+// [0, owned)), split kernels only (batches of 16). Arms (STRIX_DS41_BENCH_ARMS = "name:VAR=V,VAR=-;name2:..."; '-' unsets)
+// alternate within each repetition, every arm's outputs (A8 codes, deltas, sums, raw down vectors) compared bitwise with
+// the first arm's. STRIX_DS41_BENCH_T (comma list), STRIX_DS41_BENCH_REPS, STRIX_DS41_BENCH_SKEW.
+std::vector<std::string> split_on(const std::string& s, char c) {
+    std::vector<std::string> out;
+    std::string cur;
+    for (const char ch : s) {
+        if (ch == c) { out.push_back(cur); cur.clear(); } else cur += ch;
+    }
+    if (!cur.empty()) out.push_back(cur);
+    return out;
+}
+struct Arm { std::string name; std::vector<std::pair<std::string, std::string>> env; };
+void apply_arm(const Arm& a) {
+    for (const auto& [k, v] : a.env) {
+        if (v == "-") unsetenv(k.c_str());
+        else setenv(k.c_str(), v.c_str(), 1);
+    }
+}
+void bench_rank(const DeviceExperts& x, std::uint32_t top_k, std::uint32_t owned, const std::string& label) {
+    using namespace strix::ds41;
+    const auto& e = x.e;
+    std::vector<Arm> arms;
+    const char* arms_env = std::getenv("STRIX_DS41_BENCH_ARMS");
+    for (const auto& spec : split_on(arms_env && *arms_env ? arms_env : "v1:STRIX_DS41_PREFILL_MOE_V2=0;v2:STRIX_DS41_PREFILL_MOE_V2=-", ';')) {
+        Arm a;
+        const auto colon = spec.find(':');
+        a.name = spec.substr(0, colon);
+        if (colon != std::string::npos)
+            for (const auto& kv : split_on(spec.substr(colon + 1U), ',')) {
+                const auto eq = kv.find('=');
+                a.env.emplace_back(kv.substr(0, eq), eq == std::string::npos ? "-" : kv.substr(eq + 1U));
+            }
+        arms.push_back(a);
+    }
+    std::vector<std::uint32_t> sizes{2048U, 4096U};
+    if (const char* t = std::getenv("STRIX_DS41_BENCH_T"); t && *t) {
+        sizes.clear();
+        for (const auto& v : split_on(t, ',')) sizes.push_back(static_cast<std::uint32_t>(std::stoul(v)));
+    }
+    const char* reps_env = std::getenv("STRIX_DS41_BENCH_REPS");
+    const unsigned reps = reps_env && *reps_env ? static_cast<unsigned>(std::stoul(reps_env)) : 7U;
+    const char* skew_env = std::getenv("STRIX_DS41_BENCH_SKEW");
+    const double skew = skew_env && *skew_env ? std::stod(skew_env) : 0.15;
+    Device<int> flush(64U * 1024U * 1024U), sink(1);
+    check(hipMemset(flush.data, 0, flush.count * sizeof(int)), "flush");
+    hipEvent_t ev[3];
+    for (auto& v : ev) check(hipEventCreate(&v), "event");
+    const double peak = 59.4e12; // 40 CUs x 512 iu8 ops/clk x 2.9 GHz
+    for (const std::uint32_t rows : sizes) {
+        const std::uint32_t batch_rows = 16U;
+        const auto ids = routing(rows, top_k, e.experts, skew, 900U + rows);
+        RouteBuffers rb(rows, top_k, owned, batch_rows), rb32(rows, top_k, owned, 32U);
+        rb.ids.upload(ids);
+        rb32.ids.upload(ids);
+        enqueue_build_prefill_routes(rb.ids.data, rows, top_k, e.experts, owned, batch_rows, rb.b, nullptr, 0U, owned);
+        enqueue_build_prefill_routes(rb32.ids.data, rows, top_k, e.experts, owned, 32U, rb32.b, nullptr, 0U, owned);
+        check(hipDeviceSynchronize(), "routes");
+        const auto view32 = prefill_routes_view(rb32.b, rows, top_k, owned, 32U);
+        const auto counts = rb.counts.download();
+        const auto batches = rb.batch_total.download()[0];
+        std::uint64_t entries = 0;
+        std::uint32_t empty = 0, small = 0, longest = 0;
+        for (const auto c : counts) { entries += c; empty += c == 0U; small += c > 0U && c < 16U; longest = std::max(longest, c); }
+        Inputs in(rows, top_k, e.hidden, 950U + rows);
+        const std::size_t slots = static_cast<std::size_t>(rows) * top_k;
+        PrefillRun run(slots, rows, e.hidden, e.inter, false);
+        const auto view = prefill_routes_view(rb.b, rows, top_k, owned, batch_rows);
+        std::cout << "RANK " << label << " T=" << rows << " owned " << owned << " entries " << entries << " (" << static_cast<double>(entries) / static_cast<double>(owned)
+                  << "/expert, longest " << longest << ", empty " << empty << ", 1-15 rows " << small << ") batches " << batches
+                  << " (32-row: " << rb32.batch_total.download()[0] << ")\n";
+        std::vector<std::vector<float>> gu(arms.size()), dn(arms.size());
+        std::vector<std::int8_t> ref_codes;
+        std::vector<float> ref_deltas, ref_raw;
+        std::vector<std::int32_t> ref_sums;
+        for (unsigned rep = 0; rep < reps + 1U; ++rep)
+            for (std::size_t a = 0; a < arms.size(); ++a) {
+                apply_arm(arms[(a + rep) % arms.size()]);
+                const std::size_t arm = (a + rep) % arms.size();
+                const char* r2 = std::getenv("STRIX_DS41_PREFILL_MOE_R2"); // 32-row routes for the R2 arms
+                if (rep == 0U) { run.raw.fill_pattern(); run.act_codes.fill_pattern(); }
+                hipLaunchKernelGGL(flush_kernel, dim3(1024), dim3(256), 0, nullptr, flush.data, flush.count, sink.data);
+                enqueue_prefill(x, in, r2 && std::strcmp(r2, "1") == 0 ? view32 : view, run, false, ev);
+                check(hipEventSynchronize(ev[2]), "sync");
+                float g = 0, d = 0;
+                check(hipEventElapsedTime(&g, ev[0], ev[1]), "elapsed");
+                check(hipEventElapsedTime(&d, ev[1], ev[2]), "elapsed");
+                if (rep > 0U) { gu[arm].push_back(g); dn[arm].push_back(d); }
+                if (rep == 0U) {
+                    auto codes = run.act_codes.download();
+                    auto deltas = run.act_deltas.download();
+                    auto sums = run.act_sums.download();
+                    auto raw = run.raw.download();
+                    if (a == 0U) { ref_codes = codes; ref_deltas = deltas; ref_sums = sums; ref_raw = raw; }
+                    const auto bad = bit_mismatches(codes, ref_codes) + bit_mismatches(deltas, ref_deltas) + bit_mismatches(sums, ref_sums) +
+                        bit_mismatches(raw, ref_raw);
+                    expect(bad == 0U, label + " T=" + std::to_string(rows) + " arm " + arms[arm].name + ": outputs differ from arm " + arms[0].name);
+                    std::cout << "RANK-CHECK " << label << " T=" << rows << " arm " << arms[arm].name << " vs " << arms[0].name << ": "
+                              << (bad == 0U ? "bit-identical" : "MISMATCH " + std::to_string(bad)) << " (A8 codes/deltas/sums, raw)\n";
+                }
+            }
+        const double ops_gu = 2.0 * static_cast<double>(entries) * 2.0 * e.inter * e.hidden;
+        const double ops_dn = 2.0 * static_cast<double>(entries) * e.inter * e.hidden;
+        for (std::size_t a = 0; a < arms.size(); ++a) {
+            const double g = median_of(gu[a]), d = median_of(dn[a]);
+            std::cout << std::fixed << std::setprecision(3) << "RANK " << label << " T=" << rows << " arm " << arms[a].name << " gate_up_ms=" << g
+                      << " (" << std::setprecision(1) << 100.0 * ops_gu / (g * 1e-3) / peak << "% iu8 peak) down_ms=" << std::setprecision(3) << d
+                      << " (" << std::setprecision(1) << 100.0 * ops_dn / (d * 1e-3) / peak << "%) total_ms=" << std::setprecision(3) << g + d
+                      << " gu_all=";
+            for (const auto v : gu[a]) std::cout << v << ',';
+            std::cout << " dn_all=";
+            for (const auto v : dn[a]) std::cout << v << ',';
+            std::cout << std::defaultfloat << '\n';
+        }
+    }
+    for (auto& v : ev) (void)hipEventDestroy(v);
+}
+
 } // namespace
 
 int main() {
@@ -805,7 +933,9 @@ int main() {
                     if (timing) bench_router(rw, "blk.20");
                 }
                 const char* moe_env = std::getenv("STRIX_DS41_BENCH_MOE");
-                if (timing && moe_env && *moe_env == '1') bench_moe(x, 6, 192, "blk.20");
+                const char* rank_env = std::getenv("STRIX_DS41_BENCH_RANK");
+                if (rank_env && *rank_env == '1') bench_rank(x, 6, x.e.experts / 2U, "blk.20");
+                else if (timing && moe_env && *moe_env == '1') bench_moe(x, 6, 192, "blk.20");
                 else if (timing) { bench(x, 6, 192, "blk.20"); if (!bench_only) bench_decode(x, 6, 192, 2048, "blk.20"); }
             }
             if (!bench_only) {

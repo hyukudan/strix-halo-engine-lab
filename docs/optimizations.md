@@ -1242,6 +1242,22 @@ Uses the qualified split gate/up MoE prefill schedule.
 - **Measured gain:** -
 - **Public evidence:** [Two-node defaults](models/deepseek-v4.1/production-defaults.md)
 
+<a id="ds-moe-v2"></a>
+
+### Split prefill MoE kernels v2
+
+**Engine:** `deepseek`. **Control:** `STRIX_DS41_PREFILL_MOE_V2; STRIX_DS41_PREFILL_MOE_BAND`. **Default:** ON.
+
+IQ2_XXS gate/up and Q2_K down split kernels with the same products, chains, tree and epilogue as forms 7 / 6: each class-wave owns classes q + 8k (tree levels 1-2 in registers, a quarter of the LDS tree exchange; a partial last chunk is balanced across waves and loads only its blocks), two LDS-only barriers per chunk, the Q2_K minimum term as an exact fma chain, permlanes without source copies, weight tiles from two uniform bases with shared 32-bit offsets, and blocks dispatched in bands of 4 batches.
+
+- **Preconditions:** Default form 7, batches of 16 rows, IQ2_XXS gate/up with hidden a multiple of 1024, Q2_K down with width a multiple of 256.
+- **Automatic selection:** On for the eligible split launches; other formats and forms keep their kernels.
+- **Fallback notice:** None; ineligible shapes run the form 7 / 6 kernels silently.
+- **Exactness evidence:** Bitwise: device prefill expert tests (synthetic incl. empty, 1-row and tail experts, real layer 20, DSpark MTP) with v2 on and off; rank-shaped bench (192 of 384 experts, pieces of 2048/4096/8192 rows) A8 codes, deltas, sums and down vectors identical to the previous kernels.
+- **Off switch:** STRIX_DS41_PREFILL_MOE_V2=0 (STRIX_DS41_PREFILL_MOE_BAND=1 keeps batch-fastest order)
+- **Measured gain:** Rank-shaped kernel bench (layer 20, interleaved): down -27 / -30 / -30 %, gate/up -4.5 / -6.1 / -7.8 % at 2048 / 4096 / 8192-row pieces.
+- **Public evidence:** [Prefill MoE kernels](../src/hip_ds41_prefill.hip)
+
 <a id="ds-dense"></a>
 
 ### Exact dense prefill selector

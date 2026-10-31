@@ -852,6 +852,17 @@
   },
   {
     "engine": "deepseek",
+    "name": "Split prefill MoE kernels v2",
+    "flag_or_env": "STRIX_DS41_PREFILL_MOE_V2; STRIX_DS41_PREFILL_MOE_BAND",
+    "default": "on",
+    "exact": "Bitwise: device prefill expert tests (synthetic incl. empty, 1-row and tail experts, real layer 20, DSpark MTP) with v2 on and off; rank-shaped bench A8 codes, deltas, sums and down vectors identical to the previous kernels.",
+    "gain": "Rank-shaped kernel bench (layer 20, interleaved): down -27 / -30 / -30 %, gate/up -4.5 / -6.1 / -7.8 % at 2048 / 4096 / 8192-row pieces.",
+    "preconditions": "Default form 7, batches of 16 rows, IQ2_XXS gate/up (hidden a multiple of 1024), Q2_K down (width a multiple of 256).",
+    "off_switch": "STRIX_DS41_PREFILL_MOE_V2=0",
+    "doc_anchor": "docs/optimizations.md#ds-moe-v2"
+  },
+  {
+    "engine": "deepseek",
     "name": "Exact dense prefill selector",
     "flag_or_env": "STRIX_DS41_DENSE_SELECT",
     "default": "auto",
