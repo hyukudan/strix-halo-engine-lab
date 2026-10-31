@@ -3,6 +3,8 @@
 #include "strix/mtp_target_window_payload.hpp"
 #include "../apps/state_cache_stats.hpp"
 #include <stdexcept>
+#include <cstdio>
+#include <string>
 #include <deque>
 #include <map>
 #include <iostream>
@@ -75,6 +77,25 @@ void split_snapshot_tests();
 void prefix_dma_tests() {
     using namespace strix;
     using namespace strix::decode_cli;
+    {
+        // A served request's prompt-state diagnostic reports its failure on the line and never throws.
+        const auto line = [](auto digest) {
+            std::FILE* file = std::tmpfile();
+            require(file != nullptr, "temporary file");
+            print_target_state_digest(file, "prompt", 4096U, digest);
+            std::rewind(file);
+            std::string text(256, '\0');
+            text.resize(std::fread(text.data(), 1, text.size(), file));
+            std::fclose(file);
+            return text;
+        };
+        const auto ok = line([] { return sha256_bytes(std::as_bytes(std::span("state", 5))); });
+        require(ok.starts_with("qwen-target-state phase=prompt position=4096 sha256=") &&
+                ok.find("error=") == std::string::npos, "successful digest prints its hex on the line");
+        const auto failed = line([]() -> ModelContentIdentity { throw std::invalid_argument("target digest history/frontier differs"); });
+        require(failed == "qwen-target-state phase=prompt position=4096 error=target digest history/frontier differs\n",
+                "failed digest is logged on the line instead of failing the request");
+    }
     {
         const auto id=sha256_bytes(std::as_bytes(std::span("attach",6)));
         SerialSessionStateLayout layout;layout.layout_identity=1;layout.context_tokens=8;

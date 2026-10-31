@@ -161,6 +161,20 @@ inline bool prompt_state_digest_request(bool batch_cert=false) {
     return on || (batch_cert && digest && digest[0]=='1');
 }
 
+// One `qwen-target-state` line. Served requests use it so a failed diagnostic is logged on the line
+// instead of failing the request (and with it the server).
+template <class Digest>
+void print_target_state_digest(std::FILE* out, const char* phase, std::uint64_t position, Digest&& digest) {
+    try {
+        const auto hex = model_content_identity_hex(digest());
+        std::fprintf(out, "qwen-target-state phase=%s position=%llu sha256=%s\n", phase,
+            static_cast<unsigned long long>(position), hex.c_str());
+    } catch (const std::exception& error) {
+        std::fprintf(out, "qwen-target-state phase=%s position=%llu error=%s\n", phase,
+            static_cast<unsigned long long>(position), error.what());
+    }
+}
+
 // What the consumer knows about the state an import must reproduce (computed from the compiled serial plan).
 struct RtxStateImportFacts {
     std::array<std::uint64_t, 6> generations_per_row{};  // steps of the serial plan writing flag f (bit f)

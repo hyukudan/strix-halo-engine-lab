@@ -2532,11 +2532,11 @@ inline void run_mtp_decode_bridge(const Options& options,const ModelContract& mo
                         const auto decode_start=std::chrono::steady_clock::now();
                         out.prompt_ms=std::chrono::duration<double,std::milli>(decode_start-request_start).count();
                         if(parents->tiled.cache && prompt_state_digest_request()) {
-            if(window)window->flush_pending_window();
-            std::fprintf(stderr,"qwen-target-state phase=prompt position=%llu sha256=%s\n",
-                static_cast<unsigned long long>(session.next_position),
-                model_content_identity_hex(parents->tiled.cache->target_state_digest(session.next_position,options.tokens,pending.predicted_token())).c_str());
-        }
+                            // The served request's own prompt is the committed history (never the startup tokens).
+                            if(window)window->flush_pending_window();
+                            print_target_state_digest(stderr,"prompt",session.next_position,[&] {
+                                return parents->tiled.cache->target_state_digest(session.next_position,q.prompt,pending.predicted_token());});
+                        }
         HipMtpGreedyRuntime greedy(runtime,qualified,activated,target,session,r,dispatcher,parents);
                         const auto route=resolve_mtp_selection_route(options.http_selection_mtp,!!window,window && window->policy_selection_admitted());
                         if(q.constraint && !route.mtp && window && window->pending_window())window->flush_pending_window();
