@@ -2,7 +2,9 @@
 // kda_prep / kda_update / kda_out, glm_dsa.hip dsa_store), unchanged; only the row loop and what is stored differ.
 // Build with -ffp-contract=off -fno-fast-math -fno-gpu-flush-denormals-to-zero.
 #include "glm/spec/glm_spec_dev.hpp"
+#include "glm/kernels/glm_tree.hpp"
 
+#include <cstdlib>
 #include <stdexcept>
 #include <string>
 
@@ -34,6 +36,25 @@ template <unsigned L> __device__ __forceinline__ float lds_tree(float* s, float 
     const float r = s[0];
     __syncthreads();
     return r;
+}
+
+// Process-wide switch read once. The rank app's resolver sets 2 by default (item spec-kda-tree-2); unset = tree 1.
+bool kda_tree2() {
+    static const bool enabled = [] {
+        const char* e = std::getenv("STRIX_GLM_SPEC_KDA_TREE");
+        return e && std::string(e) == "2";
+    }();
+    return enabled;
+}
+
+// Both schedules compute b[l] = (a[l] + a[l+64]) + (a[l+32] + a[l+96]), l < 32,
+// then b[l] = b[l] + b[l+h] at h = 16,8,4,2,1, always lower index on the left.
+// In particular b[0] starts as ((a0+a64)+(a32+a96)); neither schedule reassociates it.
+// Tree 2 uses a separate result slot: its second barrier retires all input reads; the next
+// call's first barrier retires all result reads before wave 0 overwrites that slot.
+template <bool kTr> __device__ __forceinline__ float kda_tree(float* s, float part) {
+    if constexpr (kTr) return detail::tree128_w0(s, s + 128, threadIdx.x, true, part);
+    else return lds_tree<128>(s, part);
 }
 
 constexpr unsigned kMaxRows = 8;
@@ -95,6 +116,7 @@ __global__ __launch_bounds__(128) void kda_verify_prep_kernel(KdaDev k, const fl
 
 // 4b: grid (head, value tile of 32); lane = key index. The tile S[:, tile] lives in registers for the whole call: the
 // replay rows update it and it is stored once; the new rows update the register copy and emit o.
+template <bool kTr>
 __device__ __forceinline__ void kda_row_update(float (&Sr)[32], float* s, const float* sc, float bt, unsigned tile, unsigned kk,
                                                unsigned* flag, float* o_row) {
     const float q = sc[kk], key = sc[kKdaDim + kk], dec = declared_exp(sc[3 * kKdaDim + kk]);
@@ -102,35 +124,36 @@ __device__ __forceinline__ void kda_row_update(float (&Sr)[32], float* s, const 
     for (unsigned c = 0; c < 32; ++c) {
         const unsigned vv = tile * 32 + c;
         const float sp = Sr[c] * dec;
-        const float u = lds_tree<128>(s, 0.0F + sp * key);  // host tree_sum: lane = +0 + term
+        const float u = kda_tree<kTr>(s, 0.0F + sp * key);  // host tree_sum: lane = +0 + term
         const float dlt = (sc[2 * kKdaDim + vv] - u) * bt;
         const float sn = __builtin_fmaf(key, dlt, sp);
         flag_if(flag, sn);
         Sr[c] = sn;
         if (o_row) {
-            const float ov = lds_tree<128>(s, 0.0F + sn * q);
+            const float ov = kda_tree<kTr>(s, 0.0F + sn * q);
             if (kk == 0) o_row[vv] = ov;
         }
     }
 }
+template <bool kTr>
 __global__ __launch_bounds__(128) void kda_verify_update_kernel(unsigned H, float* S, const float* scr_rep, const float* beta_rep,
                                                                 unsigned n_rep, const float* scr, const float* beta, unsigned n_new,
                                                                 float* o, unsigned* flag, unsigned* row_flag) {
-    __shared__ float s[128];
+    __shared__ float s[kTr ? 129 : 128];
     const unsigned h = blockIdx.x, tile = blockIdx.y, kk = threadIdx.x;
     float* Sh = S + static_cast<std::size_t>(h) * kKdaDim * kKdaDim + static_cast<std::size_t>(kk) * kKdaDim + tile * 32;
     float Sr[32];
 #pragma unroll
     for (unsigned c = 0; c < 32; ++c) Sr[c] = Sh[c];
     for (unsigned r = 0; r < n_rep; ++r)
-        kda_row_update(Sr, s, scr_rep + (static_cast<std::size_t>(r) * H + h) * 4 * kKdaDim, beta_rep[static_cast<std::size_t>(r) * H + h],
+        kda_row_update<kTr>(Sr, s, scr_rep + (static_cast<std::size_t>(r) * H + h) * 4 * kKdaDim, beta_rep[static_cast<std::size_t>(r) * H + h],
                        tile, kk, flag, nullptr);
     if (n_rep > 0) {
 #pragma unroll
         for (unsigned c = 0; c < 32; ++c) Sh[c] = Sr[c];
     }
     for (unsigned r = 0; r < n_new; ++r)
-        kda_row_update(Sr, s, scr + (static_cast<std::size_t>(r) * H + h) * 4 * kKdaDim, beta[static_cast<std::size_t>(r) * H + h], tile,
+        kda_row_update<kTr>(Sr, s, scr + (static_cast<std::size_t>(r) * H + h) * 4 * kKdaDim, beta[static_cast<std::size_t>(r) * H + h], tile,
                        kk, GLMSPEC_MUTANT == 4 ? flag : (row_flag ? row_flag + r : nullptr), o + (static_cast<std::size_t>(r) * H + h) * kKdaDim);
 }
 
@@ -191,13 +214,19 @@ __global__ __launch_bounds__(128) void dsa_rows_pool_kernel(DsaSlot sl, unsigned
 void kda_verify(const KdaDev& k, const float* qkv_rep, const float* scr_rep, const float* beta_rep, unsigned n_rep,
                 const float* qkv, const float* f, const float* gate, const float* b, unsigned n_new, float* S,
                 float* conv_state, float* scr_new, float* beta_new, float* o, float* y, unsigned* flag, unsigned* row_flag,
-                hipStream_t s) {
+                hipStream_t s, unsigned tree) {
+    if (tree > 2) throw std::invalid_argument("kda_verify: tree must be 0 (env), 1 or 2");
     if (n_rep > kMaxRows || n_new > kMaxRows) throw std::invalid_argument("kda_verify: at most 8 replay and 8 new rows");
     if (n_rep == 0 && n_new == 0) return;
     kda_verify_prep_kernel<<<k.heads, 128, 0, s>>>(k, qkv_rep, n_rep, qkv, f, b, n_new, conv_state, scr_new, beta_new);
     ok(hipGetLastError(), "glm kda_verify_prep");
-    kda_verify_update_kernel<<<dim3(k.heads, kKdaDim / 32), 128, 0, s>>>(k.heads, S, scr_rep, beta_rep, n_rep, scr_new, beta_new,
-                                                                          n_new, o, flag, row_flag);
+    if (tree == 2 || (tree == 0 && kda_tree2())) {
+        kda_verify_update_kernel<true><<<dim3(k.heads, kKdaDim / 32), 128, 0, s>>>(k.heads, S, scr_rep, beta_rep, n_rep, scr_new,
+                                                                                 beta_new, n_new, o, flag, row_flag);
+    } else {
+        kda_verify_update_kernel<false><<<dim3(k.heads, kKdaDim / 32), 128, 0, s>>>(k.heads, S, scr_rep, beta_rep, n_rep, scr_new,
+                                                                                  beta_new, n_new, o, flag, row_flag);
+    }
     ok(hipGetLastError(), "glm kda_verify_update");
     if (n_new > 0) {
         kda_verify_out_kernel<<<dim3(k.heads, n_new), 128, 0, s>>>(k, o, gate, y);

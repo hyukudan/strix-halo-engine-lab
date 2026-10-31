@@ -1,6 +1,8 @@
 #pragma once
 // GLM engine: safetensors pack index + O_DIRECT reads through one bounce buffer (copied from the MiniMax engine's
 // mm_common.hpp / mm_pack.cpp, model-agnostic): no file page is ever handed to HIP.
+#include "glm_json.hpp"
+
 #include <cstdint>
 #include <map>
 #include <stdexcept>
@@ -11,18 +13,6 @@
 namespace strix::glm::engine::detail {
 
 // ---------------------------------------------------------------- minimal JSON (safetensors headers, index)
-struct Json;
-using JsonObj = std::map<std::string, Json>;
-using JsonArr = std::vector<Json>;
-struct Json {
-    std::variant<std::nullptr_t, double, std::string, JsonArr, JsonObj> v;
-    const JsonObj& obj() const { return std::get<JsonObj>(v); }
-    const JsonArr& arr() const { return std::get<JsonArr>(v); }
-    const std::string& str() const { return std::get<std::string>(v); }
-    double num() const { return std::get<double>(v); }
-};
-Json parse_json(const char* begin, const char* end);
-
 // ---------------------------------------------------------------- safetensors pack, O_DIRECT reads
 struct TensorInfo {
     std::string dtype;

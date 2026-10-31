@@ -12,6 +12,7 @@
 //   (|z - z64| / sum|x w| max / rms, |z - z64| / max|z64|, share of chains where R1b is closer), hc mix (pre/post/comb)
 //   max |d| vs the float64 R6 chain, router top-8 flips vs the float64 route.
 #include "glm/engine/glm_r1b.hpp"
+#include "glm/kernels/glm_tier_a.hpp"
 #include "glm/attn/glm_attn_fast.hpp"
 #include "glm/host/glm_host.hpp"
 #include "glm/xfer/glm_post_fast.hpp"
@@ -620,7 +621,61 @@ void gate_packed_rows(const LayerCase& c, const std::vector<float>& Xall, int se
     check(padding, "R1b dense packed auto/v6 preserves output stride padding" + label);
 }
 
+// Real hc_attn and hc_ffn residuals, exact production BF16 weights, padded buffers.
+void gate_hc_norm(const LayerCase& c, const std::vector<float>& Xall) {
+    constexpr std::size_t N = kHc * kHidden;
+    for (unsigned site = 0; site < 2; ++site) {
+        auto* fn = up(c.fn[site]);
+        auto* base = up(c.base[site]);
+        auto* scale = up(c.scale[site]);
+        const auto& nw = site == 0 ? c.in_norm : c.post_norm;
+        std::vector<std::uint16_t> nb(kHidden);
+        for (unsigned i = 0; i < kHidden; ++i) nb[i] = float_to_bf16(nw[i]);
+        auto* norm = up(nb);
+        bool exact = true, independent = true;
+        for (unsigned R = 1; R <= 8; ++R) for (unsigned perm = 0; perm < 3; ++perm) {
+            // Identity, reverse, rotation. Tail input and all output padding stay NaN.
+            std::vector<float> X(9 * N, std::nanf(""));
+            for (unsigned r = 0; r < R; ++r) {
+                const unsigned src = perm == 0 ? r : perm == 1 ? R - 1 - r : (r + 1) % R;
+                std::memcpy(X.data() + r * N, Xall.data() + src * N, N * sizeof(float));
+            }
+            auto* dX = up(X);
+            const std::vector<float> pf(9 * N, std::nanf("")), pm(9 * kHcMix, std::nanf("")), px(9 * kHidden, std::nanf(""));
+            auto* F = up(pf); auto* mix = up(pm); auto* xc = up(px); auto* xn = up(px);
+            r1b::hc_pre(dX, fn, base, scale, F, mix, xc, R, nullptr, 4);
+            dev::rmsnorm(xc, norm, dev::WType::BF16, kHidden, kEps, xn, R, nullptr);
+            const auto refF = down(F, pf.size()), refM = down(mix, pm.size()), refC = down(xc, px.size()), refN = down(xn, px.size());
+            for (unsigned rep = 0; rep < 3; ++rep) {
+                hok(hipMemcpy(F, pf.data(), pf.size() * 4, hipMemcpyHostToDevice), "poison F");
+                hok(hipMemcpy(mix, pm.data(), pm.size() * 4, hipMemcpyHostToDevice), "poison mix");
+                hok(hipMemcpy(xc, px.data(), px.size() * 4, hipMemcpyHostToDevice), "poison xc");
+                hok(hipMemcpy(xn, px.data(), px.size() * 4, hipMemcpyHostToDevice), "poison xn");
+                r1b::hc_pre_norm(dX, fn, base, scale, F, mix, xc, norm, xn, R, nullptr);
+                exact = same_bits(refF, down(F, pf.size())) && same_bits(refM, down(mix, pm.size())) &&
+                        same_bits(refC, down(xc, px.size())) && same_bits(refN, down(xn, px.size())) && exact;
+            }
+            // Each permuted row alone must match all four batched results.
+            for (unsigned r = 0; r < R; ++r) {
+                r1b::hc_pre_norm(dX + r * N, fn, base, scale, F, mix, xc, norm, xn, 1, nullptr);
+                const auto f = down(F, N), m = down(mix, kHcMix), x = down(xc, kHidden), n = down(xn, kHidden);
+                independent = std::memcmp(f.data(), refF.data() + r * N, N * 4) == 0 &&
+                              std::memcmp(m.data(), refM.data() + r * kHcMix, kHcMix * 4) == 0 &&
+                              std::memcmp(x.data(), refC.data() + r * kHidden, kHidden * 4) == 0 &&
+                              std::memcmp(n.data(), refN.data() + r * kHidden, kHidden * 4) == 0 && independent;
+            }
+            for (void* ptr : {static_cast<void*>(dX), static_cast<void*>(F), static_cast<void*>(mix), static_cast<void*>(xc), static_cast<void*>(xn)})
+                hok(hipFree(ptr), "free hc norm");
+        }
+        check(exact && independent, "hc_pre_norm L" + std::to_string(c.l) + " site " + std::to_string(site) +
+              ": F/mix/xc/xn == hc v4 + rmsnorm, R1..8, permutations, padding, x3, row independence");
+        for (void* ptr : {static_cast<void*>(fn), static_cast<void*>(base), static_cast<void*>(scale), static_cast<void*>(norm)})
+            hok(hipFree(ptr), "free hc norm weights");
+    }
+}
+
 void gates(const LayerCase& c, const std::vector<float>& Xall) {
+    gate_hc_norm(c, Xall);
     gates_variant(c, Xall, 2, 1);
     gates_variant(c, Xall, 4, 3);
     gate_packed_dense(c, Xall);
@@ -747,6 +802,10 @@ void bench(const LayerCase& c, const std::vector<float>& Xall) {
     float* dF = up(std::vector<float>(8 * N));
     float* dmix = up(std::vector<float>(8 * kHcMix));
     float* dxc = up(std::vector<float>(8 * kHidden));
+    float* dxn = up(std::vector<float>(8 * kHidden));
+    std::vector<std::uint16_t> nb(kHidden);
+    for (unsigned i = 0; i < kHidden; ++i) nb[i] = float_to_bf16(c.in_norm[i]);
+    auto* dnorm = up(nb);
     std::vector<float> xs;
     for (unsigned r = 0; r < 8; ++r) {
         const auto xn = site_input(Xall.data() + r * N, c, 0);
@@ -786,6 +845,14 @@ void bench(const LayerCase& c, const std::vector<float>& Xall) {
         cold_aba("hc COLD R1|hc4", R, kCopies, prod, hc4);
         cold_aba("hc COLD hc1|hc4", R, kCopies, hc1, hc4);
         cold_aba("hc COLD hc3|hc4", R, kCopies, hc3, hc4);
+        auto old_norm = [&](unsigned k) {
+            hc4(k);
+            dev::rmsnorm(dxc, dnorm, dev::WType::BF16, kHidden, kEps, dxn, R, nullptr);
+        };
+        auto fused_norm = [&](unsigned k) {
+            r1b::hc_pre_norm(dX, fns[k], dbase, dscale, dF, dmix, dxc, dnorm, dxn, R, nullptr);
+        };
+        cold_aba("hc+norm COLD old|fused", R, kCopies, old_norm, fused_norm);
         if (c.moe) {
             auto v2 = [&](unsigned k) { r1b::router_dense(dx, rts[k], dlg, R, nullptr, 2); };
             auto v4 = [&](unsigned k) { r1b::router_dense(dx, rts[k], dlg, R, nullptr, 4); };
@@ -861,6 +928,8 @@ void bench(const LayerCase& c, const std::vector<float>& Xall) {
         for (auto* p : gp) hok(hipFree(p), "free");
         for (auto* p : bp) hok(hipFree(p), "free");
     }
+    hok(hipFree(dxn), "free");
+    hok(hipFree(dnorm), "free");
     for (float* p : fns) hok(hipFree(p), "free");
     for (std::uint16_t* p : rts) hok(hipFree(p), "free");
     for (std::uint16_t* p : rts_packed) hok(hipFree(p), "free");

@@ -1,12 +1,15 @@
 // strix-glm5-rank defaults: optimizations are ON by default in code and switched OFF per item, or all at
 // once with the baseline master switch). Host-only, no HIP: the rank app resolves its route here, --print-effective-config
 // prints the resolution without touching a GPU or a peer, and tests/glm_rank_defaults_cpu_tests.cpp diffs the plain
-// default invocation against the measured decode, batch, and host-path prefill configuration.
+// default invocation against the measured decode, batch, and host-path prefill configuration. Eligible normal decode
+// enables self-speculation when the model has a complete MTP inventory; explicit-off retains the plain route.
 //
-// Rules: an explicit flag or environment value always wins; the default resolves to the receipt's route + flags + env;
+// Rules: explicit flags and environment values have the per-item precedence below;
 // --baseline / STRIX_GLM_BASELINE=1 restores the old path of every item (except where noted) unless that item is set
 // explicitly; a default whose precondition fails falls back with one notice line (prefill auto at world 1, see the app).
 #pragma once
+
+#include "glm_model_facts.hpp"
 
 #include <cstdint>
 #include <cstdlib>
@@ -62,6 +65,12 @@ inline const std::vector<EnvItem>& env_items() {
          "Measurement: FastAttn matches STRIX_GLM_ATTN=ref (G3), Tier A 12-40x"},
         {"attn-tierb-fused", "STRIX_GLM_TIERB", "fused", "lib", false, true,
          "Measurement: fused Tier B -2.46 ms/token vs strix_gemv, tokens match reference"},
+        {"spec-xfer", "STRIX_GLM_SPEC_XCH", "xfer", "comm", false, true,
+         "Measurement: verify + MTP drafter on XferExchange, token vectors match --mtp 0, SP1a PASS"},
+        {"hc-norm-fused", "STRIX_GLM_HC_NORM", "1", "0", true, true,
+         "Measurement: R1b decode hc_fin + RMSNorm fused, tokens and R8 match reference, -0.37 ms/token"},
+        {"spec-kda-tree-2", "STRIX_GLM_SPEC_KDA_TREE", "2", "1", true, true,
+         "Measurement: two-barrier KDA verify tree, bitwise == 9-barrier tree, token vectors match --mtp 0, +2.8 %"},
         {"xfer-boundary-fused", "STRIX_GLM_BOUNDARY", "1", "0", false, true,
          "Measurement: Xfer reduce +1.41 -> fused boundary ~+1.10 ms/token over local, bitwise"},
         {"moe-fast", "STRIX_GLM_MOE", "fast", "ref", false, false,
@@ -85,15 +94,18 @@ inline bool is_value_free(const std::string& a) {
 inline bool is_reference_gate(const std::string& a) {
     return a == "--ab" || a == "--aba" || a == "--g3-sweep" || a == "--aba-attn3" || a == "--aba-xch" || a == "--g4" ||
            a == "--tf" || a == "--spec-oracle" || a == "--spec-run" || a == "--state-in" || a == "--state-out" ||
-           a == "--pf-gate" || a == "--pf-ttft" || a == "--pf-null-study";
+           a == "--mtp-prefill-gate" || a == "--pf-gate" || a == "--pf-ttft" || a == "--pf-null-study";
 }
 
 // The part of the command line the defaults depend on (args = argv[2..], i.e. without program and MODEL_DIR).
 struct Request {
     std::uint32_t world = 2;
     std::optional<std::string> identity, prefill, decode_xch;
-    std::optional<bool> mtp;
+    std::optional<bool> mtp, mtp_spec;
     std::optional<unsigned> max_rows;
+    bool decode = false;
+    unsigned mtp_k = 3;
+    bool adaptive = true;
     bool spec = false, g3 = false, decode_or_batch = false, mem_plan = false, reference_gate = false;
     unsigned idcheck = 0;
     std::string xch = "comm";
@@ -118,12 +130,29 @@ inline Request scan(const std::vector<std::string>& args) {
         else if (a == "--prefill") r.prefill = v;
         else if (a == "--mtp") r.mtp = std::stoul(v) != 0;
         else if (a == "--max-rows") r.max_rows = static_cast<unsigned>(std::stoul(v));
+        else if (a == "--mtp-spec") {
+            if (v != "0" && v != "1") throw std::invalid_argument("--mtp-spec 0|1");
+            r.mtp_spec = v == "1";
+        }
+        else if (a == "--mtp-k") {
+            const auto k = std::stoul(v);
+            if (k > 7) throw std::invalid_argument("--mtp-k 0..7");
+            r.mtp_k = static_cast<unsigned>(k);
+        }
+        else if (a == "--mtp-adaptive") {
+            if (v != "0" && v != "1") throw std::invalid_argument("--mtp-adaptive 0|1");
+            r.adaptive = v == "1";
+        }
         else if (a == "--spec") r.spec = std::stoul(v) != 0;
         else if (a == "--decode-xch") r.decode_xch = v;
         else if (a == "--xch") r.xch = v;
         else if (a == "--idcheck") r.idcheck = static_cast<unsigned>(std::stoul(v));
         else if (a == "--g3") r.g3 = !v.empty();
-        else if (a == "--decode" || a == "--batch") r.decode_or_batch = r.decode_or_batch || std::stoul(v) != 0;
+        else if (a == "--decode" || a == "--batch") {
+            const bool on = std::stoul(v) != 0;
+            r.decode_or_batch = r.decode_or_batch || on;
+            if (a == "--decode") r.decode = on;
+        }
     }
     return r;
 }
@@ -137,11 +166,11 @@ inline bool baseline_requested(const Request& r, const EnvGet& env) {
     return r.baseline_flag || env_is(env, "STRIX_GLM_BASELINE", "1");
 }
 
-// The exact chunked prefill (gemv identity) is the default for runs that prefill in R1 without MTP/spec; the reference
-// (row by row, same bits) for MTP/spec, r1b-all, G3/smoke/mem-plan, --idcheck and the gate modes.
+// Exact chunked prefill is also available with MTP fill for normal self-speculation. Gate and legacy MTP-only modes
+// keep reference prefill; r1b-all, G3/smoke/mem-plan and --idcheck retain their existing exclusions.
 inline std::string resolve_prefill_auto(bool mtp, bool spec, bool g3_only, bool smoke_head, bool mem_plan, bool r1b_all,
-                                        unsigned idcheck, bool reference_gate) {
-    return !mtp && !spec && !g3_only && !smoke_head && !mem_plan && !r1b_all && idcheck == 0 && !reference_gate ? "gemv" : "ref";
+                                        unsigned idcheck, bool reference_gate, bool mtp_spec = false) {
+    return (mtp_spec || (!mtp && !spec)) && !g3_only && !smoke_head && !mem_plan && !r1b_all && idcheck == 0 && !reference_gate ? "gemv" : "ref";
 }
 
 struct Value {
@@ -151,13 +180,17 @@ struct Value {
 
 struct Effective {
     bool baseline = false;
-    Value identity, prefill_requested, mtp, decode_xch, max_rows;
+    Value identity, prefill_requested, mtp, mtp_spec, spec, decode_xch, max_rows;
+    ModelFacts head;
+    bool mtp_spec_candidate = false;
+    unsigned kmax = 3;
+    bool adaptive = true;
     std::string prefill;  // resolved: gemv | ref | wmma
     std::string xch;
     std::map<std::string, Value> env;  // env name -> effective value
 };
 
-inline Effective resolve(const Request& r, const EnvGet& env) {
+inline Effective resolve(const Request& r, const EnvGet& env, const ModelFacts& facts = {}) {
     Effective e;
     e.baseline = baseline_requested(r, env);
     const char* src_b = e.baseline ? "baseline" : "default";
@@ -165,9 +198,25 @@ inline Effective resolve(const Request& r, const EnvGet& env) {
     if (const char* v = env("STRIX_GLM_IDENTITY")) e.identity = {v, "explicit"};
     else if (r.identity) e.identity = {*r.identity, "explicit"};
     else e.identity = {e.baseline ? "r1" : "r1b", src_b};
-    // MTP layer: the measured production command runs --mtp 0 (prefill auto needs it); --mtp 1 for --spec-run / drafting
+    e.head = facts;
+    e.kmax = r.mtp_k;
+    e.adaptive = r.adaptive;
+    std::optional<bool> requested = r.mtp_spec;
+    if (!requested) if (const char* v = env("STRIX_GLM_MTP_SPEC")) {
+        if (std::string(v) != "0" && std::string(v) != "1") throw std::invalid_argument("STRIX_GLM_MTP_SPEC=0|1");
+        requested = std::string(v) == "1";
+    }
+    const bool normal_decode = r.decode && !r.reference_gate && !r.mem_plan && r.idcheck == 0;
+    const std::string requested_prefill = r.prefill.value_or(env("STRIX_GLM_PREFILL") ? env("STRIX_GLM_PREFILL") : "auto");
+    const bool eligible = !env_is(env, "STRIX_GLM_SMOKE_HEAD", "1") && e.identity.value != "r1b-all" &&
+                          r.xch == "comm" && requested_prefill != "wmma" && (r.world == 1 || r.world == 2);
+    e.mtp_spec_candidate = normal_decode && requested.value_or(!e.baseline) && r.mtp.value_or(true) && r.xch == "comm";
+    const bool enabled = e.mtp_spec_candidate && eligible && facts.mtp_complete;
+    e.mtp_spec = {enabled ? "1" : "0", requested ? "explicit" : src_b};
     if (r.mtp) e.mtp = {*r.mtp ? "1" : "0", "explicit"};
-    else e.mtp = {e.baseline ? "1" : "0", src_b};
+    else e.mtp = {enabled ? "1" : "0", src_b};
+    if (e.mtp_spec_candidate && !facts.mtp_complete) e.mtp = {"0", "fallback"};
+    e.spec = {enabled || r.spec ? "1" : "0", r.spec ? "explicit" : src_b};
     // prefill: --prefill wins over STRIX_GLM_PREFILL
     if (r.prefill) e.prefill_requested = {*r.prefill, "explicit"};
     else if (const char* v = env("STRIX_GLM_PREFILL")) e.prefill_requested = {v, "explicit"};
@@ -186,7 +235,7 @@ inline Effective resolve(const Request& r, const EnvGet& env) {
     e.prefill = e.prefill_requested.value != "auto"
                     ? e.prefill_requested.value
                     : resolve_prefill_auto(e.mtp.value == "1", r.spec, g3_only, smoke_head, r.mem_plan,
-                                           e.identity.value == "r1b-all", r.idcheck, r.reference_gate);
+                                           e.identity.value == "r1b-all", r.idcheck, r.reference_gate, enabled);
     for (const auto& it : env_items()) {
         if (const char* v = env(it.env)) e.env[it.env] = {v, "explicit"};
         else if (e.baseline && it.in_baseline) e.env[it.env] = {it.off, "baseline"};
@@ -211,6 +260,11 @@ inline std::string print(const Effective& e) {
     s += std::string("effective baseline=") + (e.baseline ? "1" : "0") + "\n";
     line("identity", e.identity);
     line("mtp", e.mtp);
+    line("mtp-spec", e.mtp_spec);
+    line("spec", e.spec);
+    s += "effective mtp-head=" + e.head.reason + "\n";
+    s += "effective mtp-kmax=" + std::to_string(e.kmax) + " adaptive=" + (e.adaptive ? "1" : "0") + "\n";
+    s += "effective mtp-bootstrap=" + std::string(e.mtp_spec.value == "1" ? (e.prefill == "gemv" ? "chunked" : "ref") : "plain") + "\n";
     s += "effective prefill=" + e.prefill + " (requested " + e.prefill_requested.value + ", " + e.prefill_requested.source + ")\n";
     line("decode-xch", e.decode_xch);
     line("max-rows", e.max_rows);

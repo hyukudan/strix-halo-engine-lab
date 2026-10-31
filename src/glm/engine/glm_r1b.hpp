@@ -52,4 +52,10 @@ void dense_f16_k4096_x3(const float* x, unsigned ldx, const std::uint16_t* const
 void hc_pre(const float* X, const float* fn, const float* base, const float* scale, float* F, float* mix, float* xc,
             unsigned rows, hipStream_t s, int variant = -1);
 
+// Opt-in process option (read once, default false). Fusion uses the v4 hc finish,
+// followed by the exact dev::rmsnorm<256> BF16 arithmetic; xc remains materialized.
+bool hc_norm_enabled();
+void hc_pre_norm(const float* X, const float* fn, const float* base, const float* scale, float* F, float* mix, float* xc,
+                 const std::uint16_t* norm, float* xn, unsigned rows, hipStream_t s);
+
 }  // namespace strix::glm::r1b

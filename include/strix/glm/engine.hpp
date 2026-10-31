@@ -13,6 +13,8 @@
 // that is the bitwise reference; an alternative must reproduce its outputs AND state bit for bit (arithmetic contract section 1)
 // unless a declared arithmetic deviation is approved. Implementations are installed with Engine::set_*() before load() or between
 // calls; the engine owns weights and state, seams own only their scratch.
+#include "glm/spec/glm_spec_merge.hpp"
+
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -194,19 +196,16 @@ public:
                                 unsigned* /*flag*/, unsigned /*rows*/, hipStream_t /*s*/) {
         return false;
     }
+    // Row-aware hook: existing seams retain the single-flag contract.
+    virtual bool fused_boundary_rows(const float* part, const float* X, const float* mix, float* Xout,
+                                     unsigned* flags, unsigned rows, unsigned flag_stride, hipStream_t s) {
+        return flag_stride == 0 && fused_boundary(part, X, mix, Xout, flags, rows, s);
+    }
     // Speculative control merge (design notes §2), host side, one call per verify / MTP step: per row R18 on
     // (value, id) and OR on flag; OR on ctl.replay_flag; rank 0's cost table; MTP confidence (max M, sum Z) merged as
     // M = max(M0, M1), Z = Z0 e^(M0-M) + Z1 e^(M1-M); a (cycle, step, kind) mismatch between ranks throws on both.
-    struct MergeRow {
-        float value = 0;
-        std::uint32_t id = 0, flag = 0;
-    };
-    struct MergeCtl {
-        std::uint32_t cycle = 0, step = 0, kind = 0, replay_flag = 0;
-        std::uint32_t table_version = 0;
-        float table[11] = {};  // plain_ms, verify_ms[1..8], step_ms, spare (spec::CostTable order)
-        float mtp_max = 0, mtp_sum = 0;
-    };
+    using MergeRow = spec::MergeRow;
+    using MergeCtl = spec::MergeCtl;
     virtual void merge(MergeRow* rows, unsigned n, MergeCtl& ctl, hipStream_t s);
 };
 // Prefill of one layer over a chunk of rows of ONE slot at consecutive positions. Default: row-by-row decode order
@@ -225,6 +224,13 @@ public:
     }
     // Exact under consecutive half-row calls on one stream (including recurrence / cache commits).
     virtual bool supports_pipeline() const { return false; }
+    // Exact row-invariant linear for bootstrap projections. Unsupported paths fail closed.
+    virtual bool exact_linears() const { return false; }
+    virtual void linear_exact(const Linear& l, const CallCtx& c, const float* x, float* y,
+                              unsigned K, unsigned N) const {
+        (void)l, (void)c, (void)x, (void)y, (void)K, (void)N;
+        throw std::logic_error("PrefillPath::linear_exact not implemented by this seam");
+    }
     // Largest LinearRunner workspace any call of this path needs; Engine::set_prefill reserves it up front.
     virtual std::uint64_t linear_workspace_bytes() const { return 0; }
     // Free-memory margin (device and host) the reservation must leave; the path's own admission uses the same one.
@@ -263,8 +269,9 @@ struct Options {
     // STRIX_GLM_IDENTITY=r1|r1b|r1b-all overrides this option at construction.
     bool external_exchange = false;      // world 2 without a Communicator: the caller installs its Exchange
                                          // (set_exchange) before the first forward (e.g. XferExchange)
-    bool decode_xfer = true;             // TP2 Communicator: plain forwards with 1..8 rows borrow its transport.
+    bool decode_xfer = true;             // TP2: Plain/Verify/MTP with 1..8 rows can borrow its transport.
                                          // STRIX_GLM_DECODE_XCH=comm|xfer overrides this option on both ranks.
+                                         // STRIX_GLM_SPEC_XCH=comm keeps Verify/MTP on Comm (default xfer).
     unsigned pf_pipeline = 1;           // 1: current schedule; 2: half-row whole-layer overlap
                                          // STRIX_GLM_PF_PIPELINE=1|2 overrides this option on both ranks.
 };
@@ -349,6 +356,9 @@ public:
     // of spec vs plain); valid until the next call.
     [[nodiscard]] const float* last_logits() const;
     [[nodiscard]] std::uint32_t vocab_slice() const;
+    // One vocabulary slice, allocated/planned with MTP: preserve bootstrap trunk logits across the seed drafter.
+    void save_trunk_logits();
+    void restore_trunk_logits();
     // The MTP layer (45, design notes) on n <= 8 pairs (h_j, x_{j+1}) of `slot` at MTP cache indices mtp_pos0..:
     // h = device [n][4096] (trunk last_hidden rows or the previous step's mtp_hidden), tokens = x_{j+1}. Writes the
     // pairs into the MTP DSA cache (its frontier is implicit: later passes overwrite) and returns each row's merged
@@ -363,6 +373,15 @@ public:
     MtpOut mtp(std::uint32_t slot, const float* h, std::span<const std::uint32_t> tokens, std::uint64_t mtp_pos0,
                Exchange::MergeCtl& ctl);
     [[nodiscard]] const float* mtp_hidden() const;
+    // Exact chunked R1 prompt bootstrap, including layer 45. hp is device [4096], valid until the next call.
+    // Requires an exact PrefillPath, all trunk layers and MTP; restores the generated identity on every exit.
+    struct MtpPrefillOut {
+        std::uint32_t y0 = 0;
+        MtpOut mtp;
+        const float* hp = nullptr;
+    };
+    MtpPrefillOut prefill_mtp(std::uint32_t slot, std::span<const std::uint32_t> tokens, std::uint64_t pos0,
+                             Exchange::MergeCtl& ctl);
 
     // ---- gates (G3 / G4 / replay)
     // Teacher-forced run of the first `layers` layers over `tokens` (slot 0, positions 0..): returns the 4-stream

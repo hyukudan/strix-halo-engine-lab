@@ -2,6 +2,8 @@
 #include "glm/spec/glm_spec_host.hpp"
 
 #include <algorithm>
+#include <cmath>
+#include <limits>
 #include <stdexcept>
 
 namespace strix::glm::spec {
@@ -46,6 +48,104 @@ bool window_extend(const CostTable& t, float survival_k, unsigned k, unsigned km
     return survival_k * t.plain_ms > (t.verify_ms[k + 2] - t.verify_ms[k + 1]) + t.step_ms;
 }
 bool window_gate_open(const CostTable& t, float conf1) { return conf1 * t.plain_ms > t.verify_ms[2] - t.verify_ms[1]; }
+
+bool valid_cost_table(const CostTable& t) {
+    if (!std::isfinite(t.plain_ms) || t.plain_ms <= 0 || !std::isfinite(t.step_ms) || t.step_ms <= 0 ||
+        !std::isfinite(t.catchup_ms) || t.catchup_ms <= 0) return false;
+    for (unsigned r = 1; r <= 8; ++r)
+        if (!std::isfinite(t.verify_ms[r]) || t.verify_ms[r] <= 0 ||
+            (r > 1 && t.verify_ms[r] < t.verify_ms[r - 1])) return false;
+    return true;
+}
+CostTable seeded_cost_table() {
+    // TP2 decode on the Xfer exchange (verify + MTP drafter), mean over 384 cycles: R1 43.2, R2 53.9, R3 64.0,
+    // R4 73.7 ms (~10 ms per extra row), extension 2.4 ms, catch-up 3.1 ms, plain step 40.0 ms.
+    CostTable t;
+    t.version = 1;
+    t.plain_ms = 40.0F;
+    t.verify_ms[1] = 43.2F;
+    t.verify_ms[2] = 53.9F;
+    t.verify_ms[3] = 64.0F;
+    t.verify_ms[4] = 73.7F;
+    for (unsigned r = 5; r <= 8; ++r) t.verify_ms[r] = t.verify_ms[r - 1] + 10.0F;
+    t.step_ms = 2.4F;
+    t.catchup_ms = 3.1F;
+    return t;
+}
+void store_cost_table(const CostTable& t, std::span<float, 11> wire) {
+    wire[0] = t.plain_ms;
+    for (unsigned r = 1; r <= 8; ++r) wire[r] = t.verify_ms[r];
+    wire[9] = t.step_ms;
+    wire[10] = t.catchup_ms;
+}
+bool load_cost_table(std::span<const float, 11> wire, std::uint32_t version, CostTable& out) {
+    CostTable t;
+    t.version = version;
+    t.plain_ms = wire[0];
+    for (unsigned r = 1; r <= 8; ++r) t.verify_ms[r] = wire[r];
+    t.step_ms = wire[9];
+    t.catchup_ms = wire[10];
+    if (!valid_cost_table(t)) return false;
+    out = t;
+    return true;
+}
+void observe_cost(CostTable& t, unsigned index, double ms) {
+    if (index > 10 || !std::isfinite(ms) || ms <= 0 || ms > std::numeric_limits<float>::max()) return;
+    float* cell = index == 0 ? &t.plain_ms : index <= 8 ? &t.verify_ms[index] : index == 9 ? &t.step_ms : &t.catchup_ms;
+    *cell += (static_cast<float>(ms) - *cell) * 0.125F;
+    if (index >= 1 && index <= 8) {
+        ++t.verify_samples[index];
+        // Least-squares slope over the sampled rows (seed slope until two are sampled), clamped >= 0; each unsampled
+        // row = nearest sampled row + slope * distance.
+        unsigned n = 0;
+        double sr = 0, sv = 0, srr = 0, srv = 0;
+        for (unsigned r = 1; r <= 8; ++r)
+            if (t.verify_samples[r] != 0) {
+                ++n;
+                sr += r; sv += t.verify_ms[r]; srr += double(r) * r; srv += double(r) * t.verify_ms[r];
+            }
+        const auto seed = seeded_cost_table();
+        float slope = (seed.verify_ms[4] - seed.verify_ms[1]) / 3.0F;
+        if (n >= 2) slope = static_cast<float>(std::max(0.0, (n * srv - sr * sv) / (n * srr - sr * sr)));
+        for (unsigned r = 1; r <= 8; ++r) {
+            if (t.verify_samples[r] != 0) continue;
+            unsigned best = 0;
+            for (unsigned q = 1; q <= 8; ++q)
+                if (t.verify_samples[q] != 0 && (best == 0 || (q > r ? q - r : r - q) < (best > r ? best - r : r - best)))
+                    best = q;
+            t.verify_ms[r] = std::max(0.01F, t.verify_ms[best] + slope * (static_cast<float>(r) - static_cast<float>(best)));
+        }
+    }
+    for (unsigned r = 2; r <= 8; ++r) t.verify_ms[r] = std::max(t.verify_ms[r], t.verify_ms[r - 1]);
+    ++t.version;
+}
+bool window_extend(const CostTable& t, const WindowEstimate& w, float next, unsigned kmax) {
+    if (!valid_cost_table(t) || w.k == 0 || w.k >= std::min(kmax, 7U) ||
+        !std::isfinite(next) || !std::isfinite(w.survival) || !std::isfinite(w.expected) ||
+        !std::isfinite(w.cycle_ms) || w.expected <= 0 || w.cycle_ms <= 0) return false;
+    return std::clamp(w.survival, 0.0F, 1.0F) * std::clamp(next, 0.0F, 1.0F) * (w.cycle_ms / w.expected) >
+           1.03F * (t.verify_ms[w.k + 2] - t.verify_ms[w.k + 1] + t.step_ms);
+}
+unsigned draft_limit(unsigned kmax, unsigned remaining, std::uint64_t p, std::uint64_t capacity) {
+    if (remaining == 0 || p >= capacity) return 0;
+    return static_cast<unsigned>(std::min<std::uint64_t>(std::min({kmax, 7U, remaining - 1}), capacity - p - 1));
+}
+unsigned Calibration::bin(float c) {
+    if (!std::isfinite(c)) return 0;
+    return std::min(7U, static_cast<unsigned>(std::clamp(c, 0.0F, 1.0F) * 8));
+}
+float Calibration::probability(unsigned depth, float c) const {
+    const unsigned d = std::clamp(depth, 1U, 7U), b = bin(c);
+    const float prior = d == 1 ? 0.90F : d == 2 ? 0.80F : 0.70F;
+    // Weight-2 virtual prior: a 64-token request reaches ~20 cycles, so its own acceptance must decide within a few
+    // observations (weight 8 held the depth-3 prior 0.70 at the K2/K3 break-even and kept chat at K3).
+    return (2 * prior + static_cast<float>(successes_[d][b])) / (2 + static_cast<float>(trials_[d][b]));
+}
+void Calibration::observe(unsigned depth, float c, bool accepted) {
+    const unsigned d = std::clamp(depth, 1U, 7U), b = bin(c);
+    ++trials_[d][b];
+    successes_[d][b] += accepted ? 1U : 0U;
+}
 
 // ---------------------------------------------------------------- KDA deferred replay
 unsigned KdaVerify::run(std::span<const KdaRow> rows, const KdaWeights& w, std::vector<std::vector<float>>& y) {

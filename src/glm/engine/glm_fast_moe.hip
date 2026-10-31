@@ -46,7 +46,8 @@ public:
         v.shared = slices(w.shared);
         v.out = y;
         v.ws = ws_;
-        M::enqueue_experts(v, c.stream);
+        if (c.decode && M::pipe_enabled()) M::enqueue_experts_pipe(v, c.stream);
+        else M::enqueue_experts(v, c.stream);
     }
 
     std::uint64_t warm_bytes(const MoeLayerWeights& w) const override {  // one hipMalloc per layer table (2 MiB granule) + its host copy

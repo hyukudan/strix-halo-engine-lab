@@ -5,6 +5,7 @@
 
 #include "glm/common/glm_math.hpp"
 
+#include <cstring>
 #include <cstdio>
 #include <cstdlib>
 
@@ -114,6 +115,17 @@ void XferExchange::reduce(float* p, unsigned rows, hipStream_t s) {
 
 void XferExchange::boundary(const float* part, const float* X, const float* mix, float* Xout, unsigned* flag, unsigned rows,
                             hipStream_t s) {
+    boundary_rows(part, X, mix, Xout, flag, rows, 0, s);
+}
+
+bool XferExchange::fused_boundary_rows(const float* part, const float* X, const float* mix, float* Xout, unsigned* flags,
+                                       unsigned rows, unsigned flag_stride, hipStream_t s) {
+    boundary_rows(part, X, mix, Xout, flags, rows, flag_stride, s);
+    return true;
+}
+
+void XferExchange::boundary_rows(const float* part, const float* X, const float* mix, float* Xout, unsigned* flag,
+                                  unsigned rows, unsigned flag_stride, hipStream_t s) {
     if (rows == 0 || rows > max_rows_) throw std::invalid_argument("glm xfer exchange: rows");
     Exchanger& x = ensure(s);
     const std::size_t bytes = GlmSchedule::row_bytes(rows);
@@ -126,13 +138,34 @@ void XferExchange::boundary(const float* part, const float* X, const float* mix,
     const RxView none{};
     if (kwait_) {
         const RxView v = x.recv_view();
-        if (use_bracket_) post_expand_bracket(bracket_, mix, part, nullptr, v, rank_, Xout, flag, rows, s);
-        else post_expand(X, mix, part, nullptr, v, rank_, Xout, flag, rows, s);
+        if (use_bracket_) post_expand_bracket(bracket_, mix, part, nullptr, v, rank_, Xout, flag, rows, s, flag_stride);
+        else post_expand(X, mix, part, nullptr, v, rank_, Xout, flag, rows, s, flag_stride);
     } else {
         const auto* peer = static_cast<const float*>(x.recv());
-        if (use_bracket_) post_expand_bracket(bracket_, mix, part, peer, none, rank_, Xout, flag, rows, s);
-        else post_expand(X, mix, part, peer, none, rank_, Xout, flag, rows, s);
+        if (use_bracket_) post_expand_bracket(bracket_, mix, part, peer, none, rank_, Xout, flag, rows, s, flag_stride);
+        else post_expand(X, mix, part, peer, none, rank_, Xout, flag, rows, s, flag_stride);
     }
+}
+
+void XferExchange::merge(MergeRow* rows, unsigned n, MergeCtl& ctl, hipStream_t s) {
+    if (n == 0 || n > 8 || n > max_rows_) throw std::invalid_argument("glm xfer exchange: merge rows");
+    const std::size_t bytes = sizeof(MergeCtl) + static_cast<std::size_t>(n) * sizeof(MergeRow);
+    std::memcpy(merge_tx_.data(), &ctl, sizeof(ctl));
+    std::memcpy(merge_tx_.data() + sizeof(ctl), rows, n * sizeof(MergeRow));
+    Exchanger& x = ensure(s);
+    ok(hipMemcpyAsync(x.tx(), merge_tx_.data(), bytes, hipMemcpyHostToDevice, s), "merge up");
+    x.send(bytes, Tag{Kind::control, static_cast<std::uint32_t>(layer_ / 2), step_}, Publish::kernel);
+    const void* peer = x.recv();
+    ok(hipMemcpyAsync(merge_rx_.data(), peer, bytes, hipMemcpyDeviceToHost, s), "merge down");
+    ok(hipStreamSynchronize(s), "merge sync");
+    x.drain();  // validate identity, size and CRC before trusting the packet
+    MergeCtl pc{};
+    std::array<MergeRow, 8> peer_rows{};
+    std::memcpy(&pc, merge_rx_.data(), sizeof(pc));
+    std::memcpy(peer_rows.data(), merge_rx_.data() + sizeof(pc), n * sizeof(MergeRow));
+    spec::merge_rank_order({rows, n}, ctl, {peer_rows.data(), n}, pc, rank_);
+    ++step_;
+    layer_ = 0;
 }
 
 void XferExchange::argmax(float* value, std::uint32_t* id, unsigned rows, hipStream_t s) {
