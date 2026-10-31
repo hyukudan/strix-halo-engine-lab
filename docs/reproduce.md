@@ -175,7 +175,7 @@ bash scripts/bench/bench.sh hash-models --engine deepseek --model-dir models
 
 Fetch options: required `--engine` (five names and pair aliases), required `--model-dir`,
 `--profile` (default `default`; `gsq` changes Qwen selection), `--dry-run` (off), `-h/--help`.
-It downloads mirror main's `SHA256SUMS`, selects manifest members, retains LICENSE/README
+It downloads each mirror's `SHA256SUMS` at the revision pinned in `scripts/bench/lib/fetch_models.py`, selects manifest members, retains LICENSE/README
 files and verifies selected bytes. Qwen merging checks a pinned hash. Byte-identical in-tree
 vocabulary files may be reused. Manifest integrity is not independent publisher authentication.
 

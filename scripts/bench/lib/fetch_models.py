@@ -25,16 +25,28 @@ UPSTREAM = {
     TRELLIS: 'hyukudan/'+TRELLIS,
     'DeepSeek-V4.1-Flash-1017-strix-dense-U6': 'hyukudan/DeepSeek-V4.1-Flash-1017-strix-dense-U6',
 }
+U6 = 'DeepSeek-V4.1-Flash-1017-strix-dense-U6'
+# Every mirror is read at a fixed revision: its SHA256SUMS and the selected files come from the same commit.
+REVISION = {
+    QWEN: 'b056e49fcdf2f3251f956c8a89512397e2d2470d',
+    'deepseek-v4.1-flash-gguf-mirror': '311b7b64963b8eaa38ef18800c62e8046fd44faf',
+    'GLM-5.3-Flash-exl3-mirror': 'f162df61e2bbab8d5c626840f0e5b99c16c5ddc8',
+    'MiniMax-M3.1-Flash-EXL3-EAQ-v1-3.06-bpw-mirror': '3534d6330ea6285fed2d50ac7f81d0eb5a201ac3',
+    'Qwen3.8-Flash-Next-GSQ-hybrid-Q2': '39bd5d51828c759fc6296d5dc6652eb2aabe514e',
+    TRELLIS: '1cb035dd585e0b6d8b9838f6ebeee1d90c611745',
+    U6: '289359b3992d3f7838c5c7cbde9390efa09fd870',
+}
 
 
 def recipe(engine, profile):
     if engine in ('deepseek', 'deepseek-rtx'):
         jobs = [('deepseek-v4.1-flash-gguf-mirror', '', ['DeepSeek-V4.1-Flash-1017-Q2.gguf', 'DeepSeek-V4.1-Flash-1017-DSpark-MXFP4.gguf'])]
         if engine == 'deepseek':
-            jobs += [('DeepSeek-V4.1-Flash-1017-strix-dense-U6', '', ['c-u6.gguf', 'c-u6.json']),
-                     (TRELLIS, '', ['ours-K4/*', 'ours-K5/*', 'mixB.txt', 'aux/vocab/*.bin', 'aux/draft-keep-stats.jsonl'])]
+            # The draft vocabularies and keep statistics are published with the U6 overlay, not the trellis packs.
+            jobs += [(U6, '', ['c-u6.gguf', 'c-u6.json', 'aux/vocab/*.bin', 'aux/draft-keep-stats.jsonl']),
+                     (TRELLIS, '', ['ours-K4/*', 'ours-K5/*', 'mixB.txt'])]
         else:
-            jobs += [(TRELLIS, 'ds41-draft-vocab', ['aux/vocab/*.bin'])]
+            jobs += [(U6, 'ds41-draft-vocab', ['aux/vocab/*.bin'])]
         return jobs
     if engine == 'qwen':
         jobs = [(QWEN, '', ['MTP/*.gguf'] + ([] if profile == 'gsq' else ['UD-Q4_K_XL/*.gguf']))]
@@ -60,15 +72,16 @@ def command(argv, dry=False):
 def fetch(repo, subdir, patterns, destination, cli, dry):
     remote = PREFIX+repo
     upstream = UPSTREAM[repo]
+    revision = REVISION[repo]
     target = destination/subdir
     with tempfile.TemporaryDirectory(prefix='bench-download-') as td:
         sums = Path(td)/'SHA256SUMS'
         argv = ['curl', '--fail', '--location', '--connect-timeout', '10', '--max-time', '60', '--retry', '0',
-                'https://huggingface.co/'+remote+'/resolve/main/SHA256SUMS', '--output', 'SHA256SUMS' if dry else str(sums)]
+                'https://huggingface.co/'+remote+'/resolve/'+revision+'/SHA256SUMS', '--output', 'SHA256SUMS' if dry else str(sums)]
         try:
             command(argv, dry)
             if dry:
-                command([cli, 'download', remote, '--revision', 'main', '--local-dir', target, '--include', *patterns, 'LICENSE*', 'README*'], True)
+                command([cli, 'download', remote, '--revision', revision, '--local-dir', target, '--include', *patterns, 'LICENSE*', 'README*'], True)
                 print('Verify selected files against SHA256SUMS; file not found in repo '+remote+'; try upstream '+upstream)
                 return
             entries = {}
@@ -88,17 +101,17 @@ def fetch(repo, subdir, patterns, destination, cli, dry):
             for name in names:
                 path = target/name
                 # Reuse only byte-identical in-tree vocabulary packs.
-                if repo == TRELLIS and name.startswith('aux/vocab/'):
+                if repo == U6 and name.startswith('aux/vocab/'):
                     local = Path(__file__).resolve().parents[3]/'data/draft-vocab'/Path(name).name
                     if local.is_file() and sha(local) == entries[name]:
                         path.parent.mkdir(parents=True, exist_ok=True)
                         shutil.copyfile(local, path)
                 if not path.is_file() or sha(path) != entries[name]:
-                    command([cli, 'download', remote, name, '--revision', 'main', '--local-dir', target])
+                    command([cli, 'download', remote, name, '--revision', revision, '--local-dir', target])
                 if not path.is_file() or sha(path) != entries[name]: raise ValueError('SHA256 mismatch: '+name)
             # Preserve attribution and published integrity manifest with downloaded assets.
             shutil.copyfile(sums, target/('SHA256SUMS.'+repo))
-            if repo == TRELLIS:
+            if repo == U6 and any(n.startswith('aux/vocab/') for n in names):
                 vocab = target if subdir else destination/'vocab'; vocab.mkdir(exist_ok=True)
                 for path in (target/'aux/vocab').glob('*.bin'): shutil.copyfile(path, vocab/path.name)
             if repo == QWEN and any(n.startswith('UD-Q4_K_XL/') for n in names):
