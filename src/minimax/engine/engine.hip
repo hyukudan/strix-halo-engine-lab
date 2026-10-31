@@ -485,6 +485,7 @@ struct Engine::Impl {
     bool index_tiled = true;  // STRIX_MM_INDEX_PROJ (runtime; default tiled, =off: dense_t): index q/k projections, token-tiled, F16 weights
     bool attn_prefill_fused = true;  // STRIX_MM_ATTN_PREFILL (runtime; default fused, =off: K1-K4): prefill MSA in fused 16-row windows
     bool pf_idx_tile = false;
+    bool pf_dense_qkv = true;  // STRIX_MM_PF_DENSE_QKV (default ON): prefill q/k/v in one v4-core call from 1024 rows (same bits as strix_gemm); =0 library
     unsigned pf_idx_rows = 32;
     unsigned pf_msa_rework = 5;  // STRIX_MM_PF_MSA_REWORK: prefill only, default 5 (= 3 with packed two-head probabilities, exact); =3 the previous default, =0 original
     bool pf_msa_batch = true;  // STRIX_MM_PF_MSA_BATCH (default ON, exact measurement): independent scratch per prefill window
@@ -512,7 +513,8 @@ struct Engine::Impl {
     bool pf_on = false, pf_active = false, pf_interleave = true;  // interleave ON by default (measurement: exact, 8K -11.5 %)
     bool pf_force_comm = false;                // STRIX_MM_PF_INTERLEAVE=comm: the communicator backend even with the module on
     bool pf_router_batch = true;               // STRIX_MM_PF_ROUTER_BATCH: prefill only, default ON (prefill measurement exact); =0 off
-    unsigned pf_router_rows = 8;                // STRIX_MM_PF_ROUTER_ROWS: 4 or 8
+    unsigned pf_router_rows = 8;                // STRIX_MM_PF_ROUTER_ROWS: 4 or 8 (default), 32 = tiled scores (opt-in: bitwise, not faster yet); same bits
+    float* router_scratch = nullptr;           // tiled router scores [T][2][128]
     bool pf_tx_uncached = false;              // STRIX_MM_PF_TX_UNCACHED: prefill producers write uncached TX
     bool pf_inplace = false;                   // STRIX_MM_PFX_INPLACE: o_proj / FFN outputs written straight into the TX slot
     bool pf_async_start = true, pf_late_src_fence = true;
@@ -555,6 +557,7 @@ struct Engine::Impl {
             for (auto ev : bank.p_free) if (ev) (void)hipEventDestroy(ev);
         }
         moe::opt::cleanup_prefill_table_ring();
+        moe::opt::cleanup_prefill_dense();
         for (auto* ptr : {nest_bank.h, nest_bank.hn, nest_bank.taps}) if (ptr) (void)hipFree(ptr);
         for (auto* events : {&idx_fork, &idx_join, &pf_idx_fork, &pf_idx_join, &pf_idx_fork_device, &pf_idx_join_device, &tev})
             for (hipEvent_t ev : *events)
@@ -645,6 +648,7 @@ struct Engine::Impl {
         pf_kv_tile = kv_tile_mode(std::getenv("STRIX_MM_PF_KV_TILE"));
         if (pf_kv_tile != -1) (void)kv_tile_available();
         pf_idx_tile = env_flag("STRIX_MM_PF_IDX_TILE", false);
+        pf_dense_qkv = env_flag("STRIX_MM_PF_DENSE_QKV", true);
         if (const char* ir = std::getenv("STRIX_MM_PF_IDX_ROWS")) {
             const std::string value(ir);
             if (value != "16" && value != "32" && value != "64")
@@ -672,8 +676,8 @@ struct Engine::Impl {
         pf_router_batch = env_flag("STRIX_MM_PF_ROUTER_BATCH", true);
         if (const char* rr = std::getenv("STRIX_MM_PF_ROUTER_ROWS"); rr != nullptr && *rr != '\0') {
             const std::string mode(rr);
-            if (mode != "4" && mode != "8") throw std::invalid_argument("STRIX_MM_PF_ROUTER_ROWS must be 4 or 8");
-            pf_router_rows = mode == "4" ? 4U : 8U;
+            if (mode != "4" && mode != "8" && mode != "32") throw std::invalid_argument("STRIX_MM_PF_ROUTER_ROWS must be 4, 8 or 32");
+            pf_router_rows = mode == "4" ? 4U : mode == "8" ? 8U : 32U;
         }
         pf_inplace = env_flag("STRIX_MM_PFX_INPLACE", false);
         pf_tx_uncached = env_flag("STRIX_MM_PF_TX_UNCACHED", true);  // ON (measurement: exact, send 0.23 -> 0.002 s); =0
@@ -918,6 +922,7 @@ struct Engine::Impl {
         hip_ok(hipHostMalloc(reinterpret_cast<void**>(&pack_h), 2 * T * kTopE * 4, hipHostMallocDefault), "pack host");
         ids_d = route_d;
         wts4_d = reinterpret_cast<float*>(route_d + T * kTopE);
+        if (pf_router_batch && pf_router_rows == 32) router_scratch = dalloc<float>(moe::hip::router_tiled_scratch_floats(static_cast<std::uint32_t>(T)));
         part = dalloc<float>(T * kHidden);
         remote = dalloc<float>(T * kHidden);
         if (pf != nullptr && pf->options().depth < pf_group)
@@ -1103,7 +1108,10 @@ struct Engine::Impl {
             const float* router_w = view.router_w;
             view.router_w = nullptr;
             moe::hip::enqueue_post_exchange(view, stream);
-            moe::hip::enqueue_router_batch(view.rows, view.y, router_w, view.bias, view.ids, view.weights, pf_router_rows, stream);
+            if (pf_router_rows == 32 && router_scratch != nullptr)
+                moe::hip::enqueue_router_tiled(view.rows, view.y, router_w, view.bias, view.ids, view.weights, router_scratch, stream);
+            else
+                moe::hip::enqueue_router_batch(view.rows, view.y, router_w, view.bias, view.ids, view.weights, pf_router_rows == 4 ? 4U : 8U, stream);
         } else {
             moe::hip::enqueue_post_exchange(view, stream);
         }
@@ -1341,6 +1349,16 @@ struct Engine::Impl {
         }
     }
 
+    // Prefill q/k/v on the v4 core: measured faster than three strix_gemm calls from 1024 rows (bench pfdv4 q+k+v
+    // T1024 0.78, T4096 0.70; o alone is slower at 1024 rows and stays on the library).
+    static constexpr std::size_t kDenseQkvMinRows = 1024;
+    bool dense_qkv(std::size_t n, const mmoe::PrefillDenseJob (&jobs)[3]) const {
+        if (!pf_dense_qkv || n < kDenseQkvMinRows || pf_ws == nullptr) return false;
+        for (const auto& j : jobs)  // raw weights loaded, same input width, implemented bit width; else the library
+            if (j.w.trellis == nullptr || j.w.input != jobs[0].w.input || !mmoe::prefill_dense_supported(j.w)) return false;
+        return mmoe::prefill_dense_workspace_bytes(jobs, 3, static_cast<unsigned>(n)) <= pf_ws_bytes;
+    }
+
     // Layer L up to the attention partial: q/k/v + index projections, MSA, o_proj -> out (n rows; h / hn: the rows').
     void stage_attn(unsigned L, std::size_t n, std::span<const Row> rows, std::uint32_t slot, std::uint64_t pos0, float* out) {
         if (tl) tl->context(task.c + pf_idx_member, L);
@@ -1372,6 +1390,11 @@ struct Engine::Impl {
                 if (xb_prepped) mmoe::enqueue_linears_prepared(j, 3, static_cast<unsigned>(n), lin_ws, nullptr);  // STRIX_MM_XB_PREP
                 else mmoe::enqueue_linears(j, 3, static_cast<unsigned>(n), lin_ws, nullptr);
                 xb_prepped = false;
+            } else if (const mmoe::PrefillDenseJob qkv[3] = {{y.rq, q}, {y.rk, k}, {y.rv, v}}; dense_qkv(n, qkv)) {
+                // STRIX_MM_PF_DENSE_QKV: one v4-core call, one timeline interval (compare with q + k + v of the library).
+                if (tl) tl->mark("qkv-projections", true);
+                mmoe::enqueue_prefill_dense(qkv, 3, hn, static_cast<unsigned>(n), pf_ws, pf_ws_bytes, nullptr);
+                if (tl) tl->mark("qkv-projections", false);
             } else {
                 if (tl) tl->mark("q-projection", true);
                 lib.mm(y.q, hn, q, n, gemv);

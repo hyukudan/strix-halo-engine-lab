@@ -32,6 +32,22 @@ struct PrefillMoeView {
     float* out = nullptr;                       // T x 6144 (device)
 };
 
+// Dense prefill linears on the v4 core: jobs share one input x [rows][input] (input % 128 == 0, output % 128 == 0)
+// and each writes out [rows][output] fp32 with the library's gemm bits (input transform, gemm_splits split-K WMMA
+// chain, ordered split sum + output transform). Supported bit widths: 3, 4, 5, 6, 8 (prefill_dense_supported). Item
+// lists are staged through a small pinned ring and copied on the stream into the workspace; cleanup_prefill_dense()
+// frees the ring.
+inline constexpr unsigned kMaxDenseJobs = 4;
+struct PrefillDenseJob {
+    Exl3 w{};
+    float* out = nullptr;
+};
+bool prefill_dense_supported(const Exl3& w);
+std::size_t prefill_dense_workspace_bytes(const PrefillDenseJob* jobs, unsigned count, unsigned rows);
+void enqueue_prefill_dense(const PrefillDenseJob* jobs, unsigned count, const float* x, unsigned rows, void* workspace,
+                           std::size_t workspace_bytes, hipStream_t stream);
+void cleanup_prefill_dense() noexcept;
+
 // Device workspace for one call (depends on the routes: split counts follow each expert's row count).
 std::size_t prefill_moe_workspace_bytes(const PrefillMoeView& v);
 // Upper bound for any routes of T rows.
@@ -50,6 +66,8 @@ void set_prefill_table_ring(int on);
 void cleanup_prefill_table_ring() noexcept;
 // v4 single-split gate/up epilogue fusion; -1 = environment (default off), 0 = off, 1 = on.
 void set_prefill_gufuse(int on);
+// v4 token-major gather (one input read per token); -1 = environment (default on), 0 = off, 1 = on. Same bits.
+void set_prefill_gather_tok(int on);
 // Tests only: materialize fused gate/up partials. Optional device buffer [4][pairs][1536]
 // captures finished gate, up, SwiGLU and FP16-rounded down input in both v4 arms.
 // The caller keeps the buffer alive until the stream completes; nullptr disables capture.
