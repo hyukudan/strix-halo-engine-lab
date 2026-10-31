@@ -938,6 +938,15 @@ int main() {
                 else if (timing && moe_env && *moe_env == '1') bench_moe(x, 6, 192, "blk.20");
                 else if (timing) { bench(x, 6, 192, "blk.20"); if (!bench_only) bench_decode(x, 6, 192, 2048, "blk.20"); }
             }
+            // STRIX_DS41_BENCH_SHARED=1 (with STRIX_DS41_BENCH_RANK=1): the rank bench on the Q8_0 shared expert (one expert, all T rows)
+            if (const char* sh = std::getenv("STRIX_DS41_BENCH_SHARED"); sh && *sh == '1') {
+                const char* rank_env = std::getenv("STRIX_DS41_BENCH_RANK");
+                if (rank_env && *rank_env == '1') {
+                    const auto e = file_experts(q2, "blk.20.ffn_gate_shexp.weight", "blk.20.ffn_up_shexp.weight", "blk.20.ffn_down_shexp.weight");
+                    const DeviceExperts x(e);
+                    bench_rank(x, 1, 1, "blk.20-shared");
+                }
+            }
             if (!bench_only) {
                 const auto e = file_experts(q2, "blk.20.ffn_gate_shexp.weight", "blk.20.ffn_up_shexp.weight", "blk.20.ffn_down_shexp.weight");
                 const DeviceExperts x(e);
