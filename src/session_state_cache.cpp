@@ -88,7 +88,7 @@ ModelContentIdentity session_cached_file_hash(const std::filesystem::path& path,
     require(identity()==key,"session content file changed during hashing");
     cache.emplace(key,h); return h;
 }
-std::string session_numerical_config(std::string_view cli, const RotaryIdentity& rotary) {
+static std::string numerical_config(std::string_view cli, const RotaryIdentity& rotary, bool family) {
     std::vector<std::string> env;
 #ifdef _WIN32
     auto p=_environ;
@@ -99,6 +99,10 @@ std::string session_numerical_config(std::string_view cli, const RotaryIdentity&
         const std::string_view value(*p);
         // Operational, per-process values: the GPU-turn wrapper's ids and the hash-cache directory.
         if (value.starts_with("GPU_TURN_") || value.starts_with("GPU_WINDOW=") || value.starts_with("STRIX_HASH_CACHE=")) continue;
+        // This observer does not alter the single tiled-MTP execution/flush order.
+        // PROMPT_STATE, PREFIX_CACHE, SERIAL_LOGITS and FINAL_STATE remain in the match:
+        // their consumers can flush pending windows or synchronize a device readback.
+        if (family && value.starts_with("STRIX_PREFILL_LOGITS_DIGEST=")) continue;
         for (const auto prefix : {"STRIX_", "HIP_", "HSA_", "AMD_", "ROCR_", "GPU_"})
             if (value.starts_with(prefix)) { env.emplace_back(*p); break; }
     }
@@ -110,6 +114,12 @@ std::string session_numerical_config(std::string_view cli, const RotaryIdentity&
     const auto identity=rotary.canonical_bytes(); w.u64(identity.size()); w.raw(identity);
     w.str(cli); w.u64(env.size()); for(const auto& v:env) w.str(v);
     return {reinterpret_cast<const char*>(w.b.data()),w.b.size()};
+}
+std::string session_numerical_config(std::string_view cli, const RotaryIdentity& rotary) {
+    return numerical_config(cli,rotary,false);
+}
+std::string session_family_numerical_config(std::string_view cli, const RotaryIdentity& rotary) {
+    return numerical_config(cli,rotary,true);
 }
 PrefixCacheBuffer encode_session_checkpoint(const SessionCheckpoint& c,const PrefixCacheAllocator& alloc) {
     frontier_valid(c.frontier);

@@ -627,7 +627,7 @@ if(BUILD_TESTING)
 
     add_executable(strix-prefix-state-cache-tests tests/prefix_state_cache_tests.cpp tests/prefix_dma_tests.cpp)
     target_include_directories(strix-prefix-state-cache-tests PRIVATE tests/prefix_dma_shim)
-    target_link_libraries(strix-prefix-state-cache-tests PRIVATE strix_core)
+    target_link_libraries(strix-prefix-state-cache-tests PRIVATE strix_core strix_serve)
     strix_target_warnings(strix-prefix-state-cache-tests)
     add_test(NAME strix-prefix-state-cache-tests COMMAND strix-prefix-state-cache-tests)
 

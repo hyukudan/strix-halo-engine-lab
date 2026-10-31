@@ -131,7 +131,7 @@ and [performance.md](performance.md).
 ## Engine: serving
 
 - [Greedy serving](engine/serving/greedy-serving.md): Greedy serving options: shared-projection cohorts and known-input prefill chunks with budgets.
-- [Prefix state cache](engine/serving/prefix-state-cache.md): Prefix state cache (--prefix-cache-host-bytes): restore model state for repeated prompt prefixes.
+- [Prefix state cache](engine/serving/prefix-state-cache.md): Certified prefix reuse defaults on for the qualified single tiled-MTP HTTP family; late memory admission, OFF controls and explicit host-budget contract.
 - [Serving prefill and prefix-cache composition](engine/serving/serving-prefill-prefix-cache.md): Composition of serving prefix cache with native prefill producer (exact-length lookup).
 - [Serving over HTTP](engine/serving/serving.md): HTTP serving (--http-serve): OpenAI/Anthropic-compatible API, queue, batching, options.
 
