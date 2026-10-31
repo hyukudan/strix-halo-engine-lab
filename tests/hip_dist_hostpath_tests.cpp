@@ -233,6 +233,64 @@ void stalled(bool abandon, bool async = false) {
     ::close(pair[1]);
 }
 }
+// exchange_host() between device exchanges: its own host buffers, the same sequence, trailer and CRC checks; a
+// corrupted host exchange stops the communicator (the next call reports it).
+void host_interleave(int fault) {
+    constexpr std::size_t capacity = 2U << 20U;
+    std::vector<int> fds[2];
+    for (unsigned k = 0; k < 4; ++k) {
+        int pair[2];
+        if (::socketpair(AF_UNIX, SOCK_STREAM, 0, pair)) throw std::runtime_error("socketpair");
+        for (unsigned r = 0; r < 2; ++r) fds[r].push_back(pair[r]);
+    }
+    std::exception_ptr errors[2];
+    bool detected[2] = {false, false};
+    const auto rank = [&](unsigned r) {
+        try {
+            auto t = strix::dist::usb4_host_descriptors(fds[r], {"a", "b", "c", "d"}, {3, 3, 2, 2}, 4096,
+                                                       std::chrono::milliseconds(2000));
+            strix::dist::Communicator c({r, 2, 17, 31}, std::make_unique<Mutate>(std::move(t), fault), capacity);
+            hipStream_t stream{};
+            check(hipStreamCreateWithFlags(&stream, hipStreamNonBlocking));
+            void *local = nullptr, *remote = nullptr;
+            check(hipMalloc(&local, capacity)); check(hipMalloc(&remote, capacity));
+            std::vector<std::byte> out(capacity), in(capacity), got(capacity);
+            const auto fill = [](std::vector<std::byte>& v, std::size_t n, unsigned who, unsigned salt) {
+                for (std::size_t i = 0; i < n; ++i) v[i] = static_cast<std::byte>((i * 37U + who * 11U + salt) >> 2U);
+            };
+            try {
+                unsigned salt = 0;
+                for (const std::size_t n : {std::size_t{64}, std::size_t{512}, std::size_t{122880}, std::size_t{1048577}}) {
+                    fill(out, n, r, ++salt);
+                    check(hipMemcpyAsync(local, out.data(), n, hipMemcpyHostToDevice, stream));
+                    c.exchange(stream, local, remote, n, {7, 1, n});
+                    check(hipMemcpyAsync(got.data(), remote, n, hipMemcpyDeviceToHost, stream));
+                    check(hipStreamSynchronize(stream));
+                    fill(out, n, 1U - r, salt);
+                    if (!std::equal(got.begin(), got.begin() + static_cast<std::ptrdiff_t>(n), out.begin())) throw std::runtime_error("device bytes differ");
+                    fill(out, n, r, ++salt);
+                    c.exchange_host(std::span<const std::byte>(out.data(), n), std::span<std::byte>(in.data(), n), {9, 2, n});
+                    fill(got, n, 1U - r, salt);
+                    if (!std::equal(in.begin(), in.begin() + static_cast<std::ptrdiff_t>(n), got.begin())) throw std::runtime_error("host bytes differ");
+                }
+            } catch (const std::exception& e) {
+                const std::string s = e.what();
+                detected[r] = s.find("CRC mismatch") != std::string::npos || s.find("does not match") != std::string::npos;
+                if (!fault || (!detected[r] && s.find("all streams closed") == std::string::npos && s.find("stopped") == std::string::npos)) throw;
+                try { c.exchange_host(std::span<const std::byte>(out.data(), 64), {}, {}); throw std::runtime_error("poison not retained"); }
+                catch (const std::exception& later) {
+                    if (std::string(later.what()).find("stopped earlier") == std::string::npos) throw;
+                }
+            }
+            check(hipStreamSynchronize(stream));
+            check(hipFree(local)); check(hipFree(remote)); check(hipStreamDestroy(stream));
+        } catch (...) { errors[r] = std::current_exception(); }
+    };
+    std::thread peer([&] { rank(1); }); rank(0); peer.join();
+    for (auto e : errors) if (e) std::rethrow_exception(e);
+    if (fault && !detected[0] && !detected[1]) throw std::runtime_error("host exchange corruption not reported");
+}
+
 int main() try {
     ::signal(SIGPIPE, SIG_IGN); // socket test double, like dist_transport_tests
     ::setenv("GPU_MAX_HW_QUEUES", "16", 0);
@@ -248,6 +306,7 @@ int main() try {
     // MiniMax-style per-instance enable must work with global mode still OFF.
     run(0, true, true); run(1, true, true); run(2, true, true);
     async_ordering(false); async_ordering(true);
+    host_interleave(0); host_interleave(1);
     ::setenv("STRIX_DIST_ASYNC_START", "1", 1);
     for (const char* overlap : {"0", "1"}) {
         ::setenv("STRIX_DIST_HOST_CRC_OVERLAP", overlap, 1);
