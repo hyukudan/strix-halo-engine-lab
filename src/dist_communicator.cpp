@@ -686,14 +686,16 @@ private:
     std::uint64_t eager_messages_ = 0, eager_bytes_ = 0, striped_messages_ = 0, striped_bytes_ = 0, skew_w_ns_ = 0, skew_r_ns_ = 0;
     [[nodiscard]] std::string traffic() const {
         std::ostringstream out;
-        out << "usb4 traffic: eager " << eager_messages_ << " msgs " << eager_bytes_ / 1000000.0 << " MB; striped " << striped_messages_
-            << " msgs " << striped_bytes_ / 1000000.0 << " MB, completion skew write " << skew_w_ns_ / 1e6 << " ms read " << skew_r_ns_ / 1e6 << " ms";
+        const auto d = [](std::uint64_t v) { return static_cast<double>(v); };
+        const auto rate = [&](std::uint64_t b, std::uint64_t ns) { return ns ? d(b) * 8.0 / d(ns) : 0.0; };  // Gb/s while busy
+        out << "usb4 traffic: eager " << eager_messages_ << " msgs " << d(eager_bytes_) / 1e6 << " MB; striped " << striped_messages_
+            << " msgs " << d(striped_bytes_) / 1e6 << " MB, completion skew write " << d(skew_w_ns_) / 1e6 << " ms read " << d(skew_r_ns_) / 1e6
+            << " ms";
         for (std::size_t k = 0; k < names_.size(); ++k) {
             const auto& st = stats_[k];
-            const auto rate = [](std::uint64_t b, std::uint64_t ns) { return ns ? b * 8.0 / ns : 0.0; };  // Gb/s while busy
-            out << "\n  " << names_[k] << " w " << st.bytes_w.load() / 1000000.0 << " MB busy " << st.busy_w.load() / 1e6 << " ms ("
-                << rate(st.bytes_w.load(), st.busy_w.load()) << " Gb/s) last " << st.last_w_count << "x; r " << st.bytes_r.load() / 1000000.0
-                << " MB busy " << st.busy_r.load() / 1e6 << " ms (" << rate(st.bytes_r.load(), st.busy_r.load()) << " Gb/s) last "
+            const std::uint64_t bw = st.bytes_w.load(), tw = st.busy_w.load(), br = st.bytes_r.load(), tr = st.busy_r.load();
+            out << "\n  " << names_[k] << " w " << d(bw) / 1e6 << " MB busy " << d(tw) / 1e6 << " ms (" << rate(bw, tw) << " Gb/s) last "
+                << st.last_w_count << "x; r " << d(br) / 1e6 << " MB busy " << d(tr) / 1e6 << " ms (" << rate(br, tr) << " Gb/s) last "
                 << st.last_r_count << "x";
         }
         return out.str();
