@@ -32,6 +32,19 @@ void service_options() {
     expect(sc::unit_budget(o, [](double ms) { return ms == 250.0 ? 2U : 0U; }) == 2U, "lead predicts default service units");
     expect(sc::unit_budget(o, [](double) { return 0U; }) == 1U, "cold service makes progress");
     expect(o.resumable() && o.target_ms() == 250.0 && o.short_first, "default fine service, including idle");
+    const auto two = [](double) { return 2U; };
+    expect(o.idle_whole && sc::tick_budget(o, false, false, two) == 0U, "idle tick: the rest of the piece at once");
+    expect(sc::tick_budget(o, true, false, two) == 2U, "decoders: service units");
+    expect(sc::tick_budget(o, false, true, two) == 2U, "another prompt waits: service units");
+    env["STRIX_DS41_SERVE_IDLE_WHOLE"] = "0";
+    expect(!options().idle_whole && sc::tick_budget(options(), false, false, two) == 2U, "IDLE_WHOLE=0: service units while idle");
+    env["STRIX_DS41_SERVE_IDLE_WHOLE"] = "2";
+    {
+        bool threw = false;
+        try { (void)options(); } catch (const std::invalid_argument&) { threw = true; }
+        expect(threw, "IDLE_WHOLE is 0 or 1");
+    }
+    env.erase("STRIX_DS41_SERVE_IDLE_WHOLE");
     env["STRIX_DS41_SERVE_SERVICE_MS"] = "0";
     o = options();
     expect(!o.resumable() && sc::row_budget(o, true) == UINT32_MAX, "zero service restores idle whole pieces");
@@ -42,6 +55,7 @@ void service_options() {
     env["STRIX_DS41_SERVE_SCHED_UNIT_BUDGET"] = "3";
     expect(options().unit_budget == 3 && options().resumable(), "fixed budget overrides rows");
     expect(sc::unit_budget(options(), [](double) { return 99U; }) == 3U, "fixed units bypass prediction");
+    expect(sc::tick_budget(options(), false, false, [](double) { return 99U; }) == 3U, "legacy units keep their budget while idle");
     env["STRIX_DS41_SERVE_SCHED_UNIT_MS"] = "12";
     expect(options().target_ms() == 12.0 && options().unit_budget == 0, "legacy ms overrides fixed budget");
     env["STRIX_DS41_SERVE_SCHED_UNIT_MS"] = "0";
@@ -142,6 +156,34 @@ void control_trace() {
     lead = {}; follower = {};
     tick(99, true);
     expect(lead.units == 0 && lead.cancels == 1, "immediate abort does not begin work");
+    // Idle whole pieces: budget 0 runs the rest of the piece (SlotPrefill::step: run/extend, or the open task to its end),
+    // after bounded units beside decoders and on a fresh piece; both ranks follow the same control.
+    struct PieceTask {
+        unsigned units = 0, pieces = 0;
+        bool owned = true;
+        bool step(unsigned, unsigned budget) {
+            units = budget == 0U ? 6U : std::min(6U, units + budget);
+            if (units == 6U) {
+                owned = false;
+                ++pieces;
+            }
+            return !owned;
+        }
+        void cancel() { owned = false; }
+    } plead, pfollow;
+    const auto ptick = [&](unsigned budget) {
+        const auto a = sc::apply_unit(plead, 256, budget, false), b = sc::apply_unit(pfollow, 256, budget, false);
+        expect(a == b && plead.units == pfollow.units && plead.pieces == pfollow.pieces, "whole pieces: both ranks agree");
+        return a;
+    };
+    const auto two = [](double) { return 2U; };
+    expect(ptick(sc::tick_budget(service, true, false, two)) != sc::UnitResult::complete && plead.units == 2, "decoders: bounded unit");
+    expect(ptick(sc::tick_budget(service, false, false, two)) == sc::UnitResult::complete && plead.units == 6, "idle: the rest of the open piece");
+    plead = {}; pfollow = {};  // the next piece
+    expect(ptick(sc::tick_budget(service, false, false, two)) == sc::UnitResult::complete && plead.pieces == 1, "idle: a fresh piece at once");
+    plead = {}; pfollow = {};
+    expect(ptick(sc::tick_budget(service, false, true, two)) != sc::UnitResult::complete, "another prompt waits: bounded unit");
+    expect(ptick(sc::tick_budget(service, false, false, two)) == sc::UnitResult::complete, "then the rest once it is alone");
     expect(lead.trace == std::vector<std::string>{"abort"}, "immediate abort has no ack");
     lead = {}; follower = {};  // whole-cache hit: begin completes without a unit command
     lead.owned = false; follower.owned = false;

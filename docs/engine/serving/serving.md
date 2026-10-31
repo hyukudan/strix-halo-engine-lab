@@ -1128,8 +1128,12 @@ unchanged. With device prefill, `STRIX_DS41_SERVE_SCHED=interleave` remains the
 default; `off` runs whole prefills and `defer` retains deferred admission.
 
 `STRIX_DS41_SERVE_SERVICE_MS=250` is the default soft target for the next completed
-service boundary, including when the long prompt has no decoder beside it. Rank 0
-predicts a positive number of finest resumable units and sends that budget to rank 1.
+service boundary while requests decode beside the prompt or another admitted prompt waits
+for its prefill. Rank 0 predicts a positive number of finest resumable units and sends that
+budget to rank 1. While no request decodes and no other admitted prompt waits, rank 0 sends
+budget 0 instead: both ranks run the rest of the current piece at once (same bits; up to
+16384 rows with `--prefill-rows auto`), so a request that arrives meanwhile, an abort or an
+import waits for that piece. `STRIX_DS41_SERVE_IDLE_WHOLE=0` restores bounded units while idle.
 The ordinary piece endpoints and cache snapshots stay unchanged. Arrivals, status
 and cancellation are inspected between resumes. One indivisible unit, decode sweep,
 state import or allocation can exceed the target; it is not a latency guarantee.
@@ -1155,7 +1159,7 @@ There is one active device prefill: a later short prompt can be admitted at a se
 boundary, but waits for that task to finish or cancel. No nested prefill lane is enabled.
 
 An HTTP abort cancels the active resumable task at the completed boundary on both
-ranks without computing the remaining piece. The abandoned sequence cannot extend
+ranks without computing the remaining piece (bounded units; an idle whole piece completes first). The abandoned sequence cannot extend
 until a fresh run or a validated complete state import restores it. Import is refused
 while a task owns the instance. Rank 1 applies rank 0's budget and abort controls;
 it does not select them from its own clock. Both ranks exchange and compare completion,
@@ -1232,6 +1236,7 @@ model and limits in every arm:
 curl -fsSN "$BASE/v1/chat/completions" -H 'Content-Type: application/json' \
   --data-binary @assets/long.request.json > "$OUT/long.sse" &
 LONG=$!
+# Run this recipe with STRIX_DS41_SERVE_IDLE_WHOLE=0 on both ranks (an idle whole piece has no fine units).
 # After /api/status reports prefill.max_unit_ms > 0, while the long prefill is active:
 curl -fsSN "$BASE/v1/chat/completions" -H 'Content-Type: application/json' \
   --data-binary @assets/short.request.json > "$OUT/short.sse" &
