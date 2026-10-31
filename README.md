@@ -232,8 +232,8 @@ Logits and the 32 generated ids equal the published references at all three leng
 separate turns, one load per arm): MoE v2 −5.9 / −6.9 / −8.0 %, Engram lookahead −3.3 % at 32,499 and −2.8 % at
 44,699 tokens, attention lean −1.4 to −2.4 %.
 
-`--profile fast` (not enabled until its quality qualification): the relaxed-order MoE lever `STRIX_DS41_FAST_MOE=1`
-measured 9.07 / 31.08 / 44.09 s on the same prompts; it changes logits, so it stays pending.
+`--profile fast` turns on the relaxed-order MoE lever `STRIX_DS41_FAST_MOE=1`: **8.53 / 29.24 / 41.90 s** on the same
+prompts. It changes logits; its quality qualification is in progress, and `default` is unchanged.
 
 **DeepSeek with the RTX PRO, pipeline split** (same model files; the RTX runs layers 0-21 with CUDA, the two nodes run
 layers 22-39 and the head):
@@ -858,9 +858,8 @@ See [production defaults](docs/models/deepseek-v4.1/production-defaults.md),
 
 Every pair app (`rank`, `batch`, `prefill`, `serve`) accepts `--profile default|fast|quality`; run the
 same profile on both ranks. `default` is the exact production configuration above and sets nothing. `fast`
-adds every qualified bit-changing option; none is qualified yet, so it currently runs like `default` and
-lists its pending options (FP16 sparse attention, relaxed MoE epilogue) in the receipt and in one stderr
-line each. `quality` has no pack for this model and runs `default` with a notice. An explicit environment
+adds the relaxed MoE epilogue (`STRIX_DS41_FAST_MOE=1`, bit-changing; its qualification is in progress) and lists
+the still-pending FP16 sparse attention in the receipt and in one stderr line. `quality` has no pack for this model and runs `default` with a notice. An explicit environment
 variable or option always wins; `--allow-pending` runs pending options whose code is in the build, for
 benchmarks only, stamped `unqualified`. `--print-effective-config` lists the profile and every option.
 
