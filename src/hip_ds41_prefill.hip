@@ -1172,6 +1172,23 @@ __device__ __forceinline__ v8i v2_group_dot(v4i a0, v4i b0, v4i a1, v4i b1, cons
     const v8i c = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(true, a0, true, b0, magic, false);
     return __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(true, a1, true, b1, c, false);
 }
+// V2_PIN: the two WMMAs of v2_group_dot as inline asm on pinned registers so that A, B and C of every WMMA start in
+// three different VGPR banks (bank = register % 4; gfx1151 issues a WMMA whose A, B and C share a bank in 34 cycles, not
+// 32): magic accumulator v[0:7] (bank 0), A v[163:170] (bank 3), B v[154:161] (bank 2), D of output tile t v[137 + 8t]
+// (bank 1, disjoint from A and B). The same two instructions on the same values (signed A and B: neg_lo:[1,1,0]).
+constexpr unsigned v2_pin = 16U;
+template <unsigned T>
+__device__ __forceinline__ v8i v2_group_dot_pin(v4i a0, v4i b0, v4i a1, v4i b1, const v8i& magic) {
+    v8i d;
+    if constexpr (T == 0U) {
+        asm("v_wmma_i32_16x16x16_iu8 %0, %1, %2, %3 neg_lo:[1,1,0]" : "={v[137:144]}"(d) : "{v[163:166]}"(a0), "{v[154:157]}"(b0), "{v[0:7]}"(magic));
+        asm("v_wmma_i32_16x16x16_iu8 %0, %1, %2, %0 neg_lo:[1,1,0]" : "+{v[137:144]}"(d) : "{v[167:170]}"(a1), "{v[158:161]}"(b1));
+    } else {
+        asm("v_wmma_i32_16x16x16_iu8 %0, %1, %2, %3 neg_lo:[1,1,0]" : "={v[145:152]}"(d) : "{v[163:166]}"(a0), "{v[154:157]}"(b0), "{v[0:7]}"(magic));
+        asm("v_wmma_i32_16x16x16_iu8 %0, %1, %2, %0 neg_lo:[1,1,0]" : "+{v[145:152]}"(d) : "{v[167:170]}"(a1), "{v[158:161]}"(b1));
+    }
+    return d;
+}
 
 // Leaves leaf[k][t][e]: class q + 8k, output tile t, D element e (row 2e + h, output 16t + i).
 template <WeightFormat Format, unsigned L>
@@ -1225,7 +1242,9 @@ __device__ __forceinline__ void class_wave_v2(unsigned char* lds, unsigned q, un
             for (unsigned t = 0; t < 2U; ++t) {
                 const bool mine = (t == 1U) == upper; // this half decoded tile t
                 const v4i b0 = pick(mine, own.b0, x0), b1 = pick(mine, own.b1, x1);
-                const v8i r = STRIX_DS41_V2_MAGIC != 0 ? v2_group_dot(a0, b0, a1, b1, magic) : group_dot(a0, b0, a1, b1);
+                v8i r;
+                if constexpr ((L & v2_pin) != 0U) r = t == 0U ? v2_group_dot_pin<0U>(a0, b0, a1, b1, magic) : v2_group_dot_pin<1U>(a0, b0, a1, b1, magic);
+                else r = STRIX_DS41_V2_MAGIC != 0 ? v2_group_dot(a0, b0, a1, b1, magic) : group_dot(a0, b0, a1, b1);
                 if constexpr (q2) {
                     const unsigned dmb = mine ? own.dm_bits : x_dm, scb = mine ? own.sc_bits : x_sc;
                     const float dd = half_bits(static_cast<unsigned short>(dmb & 0xffffU));
@@ -2070,7 +2089,13 @@ unsigned prefill_v2() {
     const char* v = std::getenv("STRIX_DS41_PREFILL_MOE_V2");
     if (v && std::strcmp(v, "0") == 0) return 0U;
     const char* m = std::getenv("STRIX_DS41_PREFILL_MOE_V2_MASK");
-    return v2_on | (m && *m ? static_cast<unsigned>(std::strtoul(m, nullptr, 0)) & (v2_decode | v2_fma | v2_part) : v2_fma | v2_part);
+    unsigned mask = v2_on | (m && *m ? static_cast<unsigned>(std::strtoul(m, nullptr, 0)) & (v2_decode | v2_fma | v2_part | v2_pin) : v2_fma | v2_part);
+    // STRIX_DS41_PREFILL_MOE_V2_PIN (default on, =0 off; read per call): v2_pin, the WMMAs on bank-pinned registers.
+    if (!(m && *m)) {
+        const char* pin = std::getenv("STRIX_DS41_PREFILL_MOE_V2_PIN");
+        if (!(pin && std::strcmp(pin, "0") == 0)) mask |= v2_pin;
+    }
+    return mask;
 }
 unsigned prefill_band() {
     const char* v = std::getenv("STRIX_DS41_PREFILL_MOE_BAND");
@@ -2103,6 +2128,7 @@ void launch_split_gate_up(const PrefillGateUpView& view, hipStream_t stream) {
     if constexpr (Format == WeightFormat::iq2_xxs) {
         if (const unsigned m = prefill_v2(); (m & v2_on) && view.hidden % (split_chunk_groups * 32U) == 0U) {
             if (m & v2_decode) launch_split_gate_up_v2<Format, v2_on | v2_decode>(view, stream);
+            else if (m & v2_pin) launch_split_gate_up_v2<Format, v2_on | v2_pin>(view, stream);
             else launch_split_gate_up_v2<Format, v2_on>(view, stream);
             return;
         }
@@ -2126,7 +2152,8 @@ template <WeightFormat Format>
 void launch_split_down(const PrefillDownView& view, hipStream_t stream) {
     if constexpr (Format == WeightFormat::q2_k) {
         if (const unsigned m = prefill_v2(); m & v2_on) {
-            switch (m & (v2_fma | v2_part)) {
+            switch (m & (v2_fma | v2_part | v2_pin)) {
+            case v2_fma | v2_part | v2_pin: launch_split_down_v2<Format, v2_on | v2_fma | v2_part | v2_pin>(view, stream); break;
             case v2_fma | v2_part: launch_split_down_v2<Format, v2_on | v2_fma | v2_part>(view, stream); break;
             case v2_fma: launch_split_down_v2<Format, v2_on | v2_fma>(view, stream); break;
             case v2_part: launch_split_down_v2<Format, v2_on | v2_part>(view, stream); break;
