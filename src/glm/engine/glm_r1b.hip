@@ -335,8 +335,9 @@ __device__ __forceinline__ void r6_wave(const float* z, float* m, const float* b
 }
 
 // Launch 3: per row, the 64-partial tree (offsets 32 .. 1) per chain, then R6 + collapse exactly as dev::hc_pre.
-template <bool Distributed, bool ParallelR6 = false>
-__global__ __launch_bounds__(256) void hc_fin_kernel(const float* X, const float* base, const float* scale, float* mix, float* xc) {
+template <bool Distributed, bool ParallelR6 = false, bool Norm = false>
+__global__ __launch_bounds__(256) void hc_fin_kernel(const float* X, const float* base, const float* scale, float* mix, float* xc,
+                                                     const std::uint16_t* norm = nullptr, float* xn = nullptr) {
     __shared__ float z[kHcMix];
     __shared__ float m[kHcMix];
     const unsigned r = blockIdx.x, l = threadIdx.x;
@@ -383,6 +384,18 @@ __global__ __launch_bounds__(256) void hc_fin_kernel(const float* X, const float
     float* xr = xc + static_cast<std::size_t>(r) * kHidden;
     for (unsigned d = l; d < kHidden; d += 256)
         xr[d] = ((m[0] * Xr[d] + m[1] * Xr[kHidden + d]) + m[2] * Xr[2 * kHidden + d]) + m[3] * Xr[3 * kHidden + d];
+    if constexpr (Norm) {
+        // Materialize xc before reading it, exactly as the separate rmsnorm launch.
+        __syncthreads();
+        __shared__ float ns[256];
+        float a = 0.0F;
+        for (unsigned i = l; i < kHidden; i += 256) a = __builtin_fmaf(xr[i], xr[i], a);
+        const float ss = lds_tree<256>(ns, a);
+        const float rr = inv_sqrt(ss / static_cast<float>(kHidden) + kEps);
+        float* yr = xn + static_cast<std::size_t>(r) * kHidden;
+        for (unsigned i = l; i < kHidden; i += 256)
+            yr[i] = norm ? (xr[i] * rr) * bf16_to_float(norm[i]) : xr[i] * rr;
+    }
 }
 
 
@@ -522,6 +535,26 @@ void hc_pre(const float* X, const float* fn, const float* base, const float* sca
         hc_fin_kernel<false><<<rows, 256, 0, s>>>(X, base, scale, mix, xc);
     }
     ok(hipGetLastError(), "hc_fin");
+}
+
+bool hc_norm_enabled() {
+    static const bool enabled = [] {
+        const char* v = std::getenv("STRIX_GLM_HC_NORM");
+        return v != nullptr && std::string(v) == "1";
+    }();
+    return enabled;
+}
+
+void hc_pre_norm(const float* X, const float* fn, const float* base, const float* scale, float* F, float* mix, float* xc,
+                 const std::uint16_t* norm, float* xn, unsigned rows, hipStream_t s) {
+    if (rows == 0 || rows > kMaxRows) throw std::invalid_argument("r1b hc_pre_norm: rows 1..8");
+    hc_rr_kernel<<<rows, 256, 0, s>>>(X);
+    ok(hipGetLastError(), "hc_norm_rr");
+    if (rows == 1) hc_part_kernel<1><<<kHcBlocks, kPartThreads, 0, s>>>(X, fn, F, rows);
+    else hc_part_kernel<kMaxRows><<<kHcBlocks, kPartThreads, 0, s>>>(X, fn, F, rows);
+    ok(hipGetLastError(), "hc_norm_part");
+    hc_fin_kernel<true, true, true><<<rows, 256, 0, s>>>(X, base, scale, mix, xc, norm, xn);
+    ok(hipGetLastError(), "hc_norm_fin");
 }
 
 }  // namespace strix::glm::r1b

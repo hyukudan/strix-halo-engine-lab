@@ -152,6 +152,9 @@ __device__ __forceinline__ void slot_info(const Args& a, unsigned slot, bool use
 constexpr unsigned kWideDepth = 4;
 constexpr unsigned kRowbufU = 8 * 6;  // uint4 per wave row buffer (Bits <= 6)
 using WideV4 = std::uint32_t __attribute__((ext_vector_type(4)));
+using GlobalWideV4 = const WideV4 __attribute__((address_space(1)));
+// K6's 48 vectors round up to 64 so every lane stores both vectors unconditionally.
+template <bool Pipe> constexpr unsigned kRowbufStride = Pipe ? 64U : kRowbufU;
 template <int Bits, int R, unsigned KPS, bool Store>
 __device__ __forceinline__ void wide_core(const Exl3 w, unsigned output, unsigned k0, unsigned k1, unsigned col0,
                                           const _Float16* xs, unsigned xs_stride, unsigned nrows, unsigned wave,
@@ -250,14 +253,132 @@ __device__ __forceinline__ void wide_core(const Exl3 w, unsigned output, unsigne
         split_end(split);
     }
 }
-template <int MaxR, unsigned KPS, bool Store>
+// Opt-in scheduling variant: arithmetic below is copied verbatim from wide_core.
+template <int Bits, int R, unsigned KPS, bool Store>
+__device__ __forceinline__ void wide_core_pipe(const Exl3 w, unsigned output, unsigned k0, unsigned k1, unsigned col0,
+                                          const _Float16* xs, unsigned xs_stride, unsigned nrows, unsigned wave,
+                                          unsigned lane, WideV4* rowbuf_all, float* part0, std::size_t row_stride,
+                                          float* fin, unsigned fin_stride, unsigned fin_col0) {
+    constexpr unsigned runU = 8U * Bits, UPL = (runU + 31U) / 32U;
+    static_assert(runU <= kRowbufU && KPS % kWideDepth == 0, "row buffer size; split boundaries on ring boundaries");
+    static_assert(UPL * 32U <= kRowbufStride<true>, "unconditional padded LDS stores stay wave-private");
+    WideV4* rowbuf = rowbuf_all + wave * kRowbufStride<true>;
+    const unsigned cols = output / 16U;
+    const auto* gw = (GlobalWideV4*)(reinterpret_cast<const WideV4*>(d::uniform(w.trellis)));
+    const std::size_t kstride = static_cast<std::size_t>(cols) * 2U * Bits, cbase = static_cast<std::size_t>(col0) * 2U * Bits;
+    WideV4 ring[kWideDepth][UPL] = {};
+    auto load = [&](unsigned k, auto slot) __attribute__((always_inline)) {
+        constexpr unsigned q = decltype(slot)::value;
+#pragma unroll
+        for (unsigned u = 0; u < UPL; ++u) {
+            const unsigned e = lane + 32U * u;
+            ring[q][u] = gw[static_cast<std::size_t>(k) * kstride + cbase + (e < runU ? e : runU - 1U)];
+        }
+    };
+    const d::LaneGeom<Bits> geo(lane);
+    float sums[4][R][2];
+#pragma unroll
+    for (int c = 0; c < 4; ++c)
+#pragma unroll
+        for (int r = 0; r < R; ++r) sums[c][r][0] = sums[c][r][1] = 0.0F;
+    const auto* rl = (d::LocalU32*)(reinterpret_cast<const std::uint32_t*>(rowbuf));
+    const auto* xw = (d::LocalU32*)(reinterpret_cast<const std::uint32_t*>(xs)) + (lane & 3U);
+    auto split_end = [&](unsigned split) __attribute__((always_inline)) {
+        float* const ps = Store ? part0 + static_cast<std::size_t>(split) * kInter : nullptr;  // wave-uniform
+#pragma unroll
+        for (unsigned c = 0; c < 4; ++c)
+#pragma unroll
+            for (int r = 0; r < R; ++r) {
+                const float v0 = d::reduce4(sums[c][r][0]), v1 = d::reduce4(sums[c][r][1]);
+                if ((lane & 3U) == 0 && static_cast<unsigned>(r) < nrows) {
+                    if constexpr (Store) {
+                        float* pr = ps + static_cast<std::size_t>(r) * row_stride + (col0 + c) * 16 + lane / 4;
+                        pr[0] = v0;
+                        pr[8] = v1;
+                    } else {
+                        float* pf = fin + static_cast<unsigned>(r) * fin_stride + (fin_col0 + c) * 16 + lane / 4;
+                        pf[0] = split == 0 ? 0.0F + v0 : pf[0] + v0;
+                        pf[8] = split == 0 ? 0.0F + v1 : pf[8] + v1;
+                    }
+                }
+                sums[c][r][0] = sums[c][r][1] = 0.0F;
+            }
+    };
+    auto step = [&](unsigned k, auto slot, auto with_load) __attribute__((always_inline)) {
+        constexpr unsigned q = decltype(slot)::value;
+#pragma unroll
+        for (unsigned u = 0; u < UPL; ++u) {
+            const unsigned e = lane + 32U * u;
+            rowbuf[e] = ring[q][u];
+        }
+        if constexpr (decltype(with_load)::value) load(k + kWideDepth, slot);
+        d::Half2 act[R][2];
+#pragma unroll
+        for (int r = 0; r < R; ++r) {
+            const auto* pr = xw + (static_cast<unsigned>(r) * xs_stride) / 2U + (k - k0) * 8U;
+            act[r][0] = __builtin_bit_cast(d::Half2, pr[0]);
+            act[r][1] = __builtin_bit_cast(d::Half2, pr[4]);
+        }
+#pragma unroll
+        for (unsigned c = 0; c < 4; ++c) {
+            d::Slot<Bits, R> cur;
+            const unsigned tw = c * Bits * 8U;
+            cur.a = rl[tw + geo.oa / 4U];
+            cur.b = rl[tw + geo.ob / 4U];
+            cur.c = rl[tw + geo.oc / 4U];
+#pragma unroll
+            for (int r = 0; r < R; ++r) {
+                cur.act[r][0] = act[r][0];
+                cur.act[r][1] = act[r][1];
+            }
+            d::compute_slot<Bits, R>(cur, geo, static_cast<unsigned>(R), sums[c]);
+        }
+        __builtin_amdgcn_sched_barrier(0);
+    };
+    using S0 = std::integral_constant<unsigned, 0>;
+    using S1 = std::integral_constant<unsigned, 1>;
+    using S2 = std::integral_constant<unsigned, 2>;
+    using S3 = std::integral_constant<unsigned, 3>;
+    __builtin_amdgcn_sched_barrier(0);
+    load(k0 + 0, S0{});
+    __builtin_amdgcn_sched_barrier(0);
+    load(k0 + 1, S1{});
+    __builtin_amdgcn_sched_barrier(0);
+    load(k0 + 2, S2{});
+    __builtin_amdgcn_sched_barrier(0);
+    load(k0 + 3, S3{});
+    __builtin_amdgcn_sched_barrier(0);
+    // Identical k order and split ends. Peel the final ring group: no conditional refill.
+    const unsigned nk = k1 - k0;
+    for (unsigned kk = 0; kk + kWideDepth < nk; kk += kWideDepth) {
+        const unsigned k = k0 + kk;
+        step(k, S0{}, std::true_type{});
+        step(k + 1, S1{}, std::true_type{});
+        step(k + 2, S2{}, std::true_type{});
+        step(k + 3, S3{}, std::true_type{});
+        if ((kk + kWideDepth) % KPS == 0) split_end((kk + kWideDepth) / KPS - 1U);
+    }
+    const unsigned k = k1 - kWideDepth;
+    step(k, S0{}, std::false_type{});
+    step(k + 1, S1{}, std::false_type{});
+    step(k + 2, S2{}, std::false_type{});
+    step(k + 3, S3{}, std::false_type{});
+    split_end(nk / KPS - 1U);
+}
+template <int MaxR, unsigned KPS, bool Store, bool Pipe>
 __device__ __forceinline__ void wide_rows(const Exl3 w, unsigned output, unsigned k0, unsigned k1, unsigned col0, const _Float16* xs,
                           unsigned xs_stride, unsigned nrows, unsigned wave, unsigned lane, WideV4* rowbuf, float* part0,
                           std::size_t row_stride, float* fin, unsigned fin_stride, unsigned fin_col0) {
     auto run = [&](auto bits_tag) {
         constexpr int Bits = decltype(bits_tag)::value;
-#define GLM_WIDE(R) wide_core<Bits, R, KPS, Store>(w, output, k0, k1, col0, xs, xs_stride, nrows, wave, lane, rowbuf, part0, \
-                                                   row_stride, fin, fin_stride, fin_col0)
+#define GLM_WIDE(R) core(std::integral_constant<int, R>{})
+        auto core = [&](auto rows_tag) {
+            constexpr int R = decltype(rows_tag)::value;
+            if constexpr (Pipe) wide_core_pipe<Bits, R, KPS, Store>(w, output, k0, k1, col0, xs, xs_stride, nrows, wave, lane, rowbuf, part0,
+                                                                  row_stride, fin, fin_stride, fin_col0);
+            else wide_core<Bits, R, KPS, Store>(w, output, k0, k1, col0, xs, xs_stride, nrows, wave, lane, rowbuf, part0,
+                                                               row_stride, fin, fin_stride, fin_col0);
+        };
         if (nrows == 1 || MaxR == 1) GLM_WIDE(1);
         else if (nrows == 2 || MaxR == 2) GLM_WIDE(2);
         else if constexpr (MaxR >= 4) {
@@ -285,8 +406,8 @@ __device__ __forceinline__ Exl3 slot_matrix(const Args& a, const SlotInfo& si, u
 
 // ---------------------------------------------------------------- gate + up (+ R15 + down input transform)
 // CTA = 4 waves x 4 columns (2 output blocks) of matrix m over SG library splits starting at split sg * SG.
-template <int MaxR, unsigned SG> constexpr std::size_t kGuSmem = std::size_t{MaxR} * SG * kSplitCh * 2 + 4 * kRowbufU * 16;
-template <int MaxR, unsigned SG>
+template <int MaxR, unsigned SG, bool Pipe> constexpr std::size_t kGuSmem = std::size_t{MaxR} * SG * kSplitCh * 2 + 4 * kRowbufStride<Pipe> * 16;
+template <int MaxR, unsigned SG, bool Pipe>
 __device__ __forceinline__ void gate_up_body(const Args& a, const SlotInfo& si, unsigned slot, unsigned cg, unsigned sg, unsigned m,
                              unsigned char* smem) {
     auto* xs = reinterpret_cast<_Float16*>(smem);
@@ -302,7 +423,7 @@ __device__ __forceinline__ void gate_up_body(const Args& a, const SlotInfo& si, 
     __syncthreads();
     const unsigned col0 = static_cast<unsigned>(__builtin_amdgcn_readfirstlane(static_cast<int>(cg * 16U + wave * 4U)));
     const unsigned k0 = sg * SG * kGateKps;
-    wide_rows<MaxR, kGateKps, true>(w, kInter, k0, k0 + SG * kGateKps, col0, xs, SG * kSplitCh, nrows, wave, lane, rowbuf,
+    wide_rows<MaxR, kGateKps, true, Pipe>(w, kInter, k0, k0 + SG * kGateKps, col0, xs, SG * kSplitCh, nrows, wave, lane, rowbuf,
                                     a.part(first, m, sg * SG), std::size_t{2} * kGateSplits * kInter, nullptr, 0, 0);
     auto finish = [&](unsigned block) {
         const std::uint16_t* gsvh = slot_matrix(a, si, slot, 0).svh;
@@ -348,15 +469,15 @@ __device__ __forceinline__ void gate_up_body(const Args& a, const SlotInfo& si, 
 }
 
 // grid (kGuGroups x 32 / SG, slots, 2 matrices); FirstSlot 0 (shared included) or 1 (routed only).
-template <int MaxR, unsigned SG, unsigned FirstSlot>
+template <int MaxR, unsigned SG, unsigned FirstSlot, bool Pipe>
 __global__ __launch_bounds__(128) void gate_up_kernel(Args a) {
-    __shared__ alignas(16) unsigned char smem[kGuSmem<MaxR, SG>];
+    __shared__ alignas(16) unsigned char smem[kGuSmem<MaxR, SG, Pipe>];
     __shared__ SlotInfo si;
     __shared__ std::uint32_t ids[kMaxRows * kTopE], mask[kMaskWords];
     const unsigned slot = blockIdx.y + FirstSlot;
     slot_info(a, slot, true, si, ids, mask);
     if (!si.active) return;
-    gate_up_body<MaxR, SG>(a, si, slot, blockIdx.x % kGuGroups, blockIdx.x / kGuGroups, blockIdx.z, smem);
+    gate_up_body<MaxR, SG, Pipe>(a, si, slot, blockIdx.x % kGuGroups, blockIdx.x / kGuGroups, blockIdx.z, smem);
 }
 
 // ---------------------------------------------------------------- router (R1 logits, R14 / R5) + shared gate/up
@@ -496,12 +617,12 @@ __device__ __forceinline__ void router_cta(const Args& a, unsigned char* smem) {
     }
 }
 
-template <int MaxR, unsigned SG>
-constexpr std::size_t kRsSmem = kGuSmem<MaxR, SG> > kRouterSmem ? kGuSmem<MaxR, SG> : kRouterSmem;
+template <int MaxR, unsigned SG, bool Pipe>
+constexpr std::size_t kRsSmem = kGuSmem<MaxR, SG, Pipe> > kRouterSmem ? kGuSmem<MaxR, SG, Pipe> : kRouterSmem;
 // grid kRouterCtas + kGuGroups x 32 / SG x 2 (the shared expert's gate/up, slot 0).
-template <int MaxR, unsigned SG>
+template <int MaxR, unsigned SG, bool Pipe>
 __global__ __launch_bounds__(128) void router_shared_kernel(Args a) {
-    __shared__ alignas(16) unsigned char smem[kRsSmem<MaxR, SG>];
+    __shared__ alignas(16) unsigned char smem[kRsSmem<MaxR, SG, Pipe>];
     __shared__ SlotInfo si;
     if (blockIdx.x < kRouterCtas) {
         router_cta(a, smem);
@@ -509,17 +630,17 @@ __global__ __launch_bounds__(128) void router_shared_kernel(Args a) {
     }
     const unsigned local = blockIdx.x - kRouterCtas, per_m = kGuGroups * (kGateSplits / SG);
     slot_info(a, 0, false, si, nullptr, nullptr);
-    gate_up_body<MaxR, SG>(a, si, 0, (local % per_m) % kGuGroups, (local % per_m) / kGuGroups, local / per_m, smem);
+    gate_up_body<MaxR, SG, Pipe>(a, si, 0, (local % per_m) % kGuGroups, (local % per_m) / kGuGroups, local / per_m, smem);
 }
 
 // ---------------------------------------------------------------- down (+ output transform, + R16 combine)
 // grid (kDnGroups, slots incl. shared). CTA = 4 waves x 4 columns (256 outputs) over the whole K: the 4 library splits
 // accumulate in ascending order in the CTA's fin rows; H32 + svh per 128-output block into yslot; the last CTA of the
 // 256-output group (over all active slots) runs R16 for every row.
-template <int MaxR>
+template <int MaxR, bool Pipe>
 __global__ __launch_bounds__(128) void down_kernel(Args a) {
     __shared__ _Float16 xs[MaxR * kInter];
-    __shared__ WideV4 rowbuf[4 * kRowbufU];
+    __shared__ WideV4 rowbuf[4 * kRowbufStride<Pipe>];
     __shared__ float fin[MaxR * 256];
     __shared__ SlotInfo si;
     __shared__ std::uint32_t ids[kMaxRows * kTopE], mask[kMaskWords], pairs[kMaxRows * kTopE];
@@ -535,7 +656,7 @@ __global__ __launch_bounds__(128) void down_kernel(Args a) {
     }
     __syncthreads();
     const unsigned col0 = static_cast<unsigned>(__builtin_amdgcn_readfirstlane(static_cast<int>(cg * 16U + wave * 4U)));
-    wide_rows<MaxR, kDownKps, false>(w, kHidden, 0, kDownKt, col0, xs, kInter, nrows, wave, lane, rowbuf, nullptr, 0, fin, 256,
+    wide_rows<MaxR, kDownKps, false, Pipe>(w, kHidden, 0, kDownKt, col0, xs, kInter, nrows, wave, lane, rowbuf, nullptr, 0, fin, 256,
                                      wave * 4U);
     __syncthreads();
     for (unsigned job = wave; job < nrows * 2; job += 4) {  // output transform per (row, 128-output block)
@@ -611,48 +732,63 @@ void check_launch(const char* what) {
 
 unsigned routed_slots(unsigned rows) { return rows * kTopE < kExperts ? rows * kTopE : kExperts; }
 
-template <int MaxR, unsigned SG>
+template <int MaxR, unsigned SG, bool Pipe>
 void launch_rows_sg(const Args& a, bool router, hipStream_t stream, hipEvent_t* marks) {
     const unsigned routed = routed_slots(a.rows);
     if (router) {
-        router_shared_kernel<MaxR, SG><<<kRouterCtas + kGuGroups * (kGateSplits / SG) * 2, 128, 0, stream>>>(a);
+        router_shared_kernel<MaxR, SG, Pipe><<<kRouterCtas + kGuGroups * (kGateSplits / SG) * 2, 128, 0, stream>>>(a);
         check_launch("router_shared");
         if (marks != nullptr) (void)hipEventRecord(marks[0], stream);
-        gate_up_kernel<MaxR, SG, 1><<<dim3(kGuGroups * (kGateSplits / SG), routed, 2), 128, 0, stream>>>(a);
+        gate_up_kernel<MaxR, SG, 1, Pipe><<<dim3(kGuGroups * (kGateSplits / SG), routed, 2), 128, 0, stream>>>(a);
     } else {
-        gate_up_kernel<MaxR, SG, 0><<<dim3(kGuGroups * (kGateSplits / SG), routed + 1, 2), 128, 0, stream>>>(a);
+        gate_up_kernel<MaxR, SG, 0, Pipe><<<dim3(kGuGroups * (kGateSplits / SG), routed + 1, 2), 128, 0, stream>>>(a);
     }
     check_launch("gate_up");
     if (marks != nullptr) (void)hipEventRecord(marks[router ? 1 : 0], stream);
-    down_kernel<MaxR><<<dim3(kDnGroups, routed + 1), 128, 0, stream>>>(a);
+    down_kernel<MaxR, Pipe><<<dim3(kDnGroups, routed + 1), 128, 0, stream>>>(a);
     check_launch("down");
 }
-template <int MaxR> void launch_rows(const Args& a, bool router, hipStream_t stream, hipEvent_t* marks) {
+template <int MaxR, bool Pipe> void launch_rows(const Args& a, bool router, hipStream_t stream, hipEvent_t* marks) {
     switch (split_group(static_cast<unsigned>(MaxR))) {
-    case 1: launch_rows_sg<MaxR, 1>(a, router, stream, marks); break;
-    case 2: launch_rows_sg<MaxR, 2>(a, router, stream, marks); break;
-    case 8: launch_rows_sg<MaxR, 8>(a, router, stream, marks); break;
-    default: launch_rows_sg<MaxR, 4>(a, router, stream, marks); break;
+    case 1: launch_rows_sg<MaxR, 1, Pipe>(a, router, stream, marks); break;
+    case 2: launch_rows_sg<MaxR, 2, Pipe>(a, router, stream, marks); break;
+    case 8: launch_rows_sg<MaxR, 8, Pipe>(a, router, stream, marks); break;
+    default: launch_rows_sg<MaxR, 4, Pipe>(a, router, stream, marks); break;
     }
 }
+template <bool Pipe>
 void launch(const MoeView& v, bool router, hipStream_t stream, hipEvent_t* marks) {
     const Args a = make_args(v, router);
-    if (a.rows == 1) launch_rows<1>(a, router, stream, marks);
-    else if (a.rows == 2) launch_rows<2>(a, router, stream, marks);
-    else if (a.rows <= 4) launch_rows<4>(a, router, stream, marks);
-    else launch_rows<8>(a, router, stream, marks);
+    if (a.rows == 1) launch_rows<1, Pipe>(a, router, stream, marks);
+    else if (a.rows == 2) launch_rows<2, Pipe>(a, router, stream, marks);
+    else if (a.rows <= 4) launch_rows<4, Pipe>(a, router, stream, marks);
+    else launch_rows<8, Pipe>(a, router, stream, marks);
 }
 
 }  // namespace
 
 std::size_t moe_workspace_bytes() { return kMoeBytes; }
+const float* moe_pair_gate_partials(const MoeWorkspace& ws, unsigned pair) {
+    return reinterpret_cast<const float*>(static_cast<const unsigned char*>(ws.base) + kOffPart) +
+           static_cast<std::size_t>(pair) * 2 * kGateSplits * kInter;
+}
 const float* moe_pair_output(const MoeWorkspace& ws, unsigned pair) {
     return reinterpret_cast<const float*>(static_cast<const unsigned char*>(ws.base) + kOffY) + static_cast<std::size_t>(pair) * kHidden;
 }
 const std::uint16_t* moe_pair_down_input(const MoeWorkspace& ws, unsigned pair) {
     return reinterpret_cast<const std::uint16_t*>(static_cast<const unsigned char*>(ws.base) + kOffAt) + static_cast<std::size_t>(pair) * kInter;
 }
-void enqueue_moe(const MoeView& v, hipStream_t stream, hipEvent_t* marks) { launch(v, true, stream, marks); }
-void enqueue_experts(const MoeView& v, hipStream_t stream, hipEvent_t* marks) { launch(v, false, stream, marks); }
+void enqueue_moe(const MoeView& v, hipStream_t stream, hipEvent_t* marks) { launch<false>(v, true, stream, marks); }
+void enqueue_experts(const MoeView& v, hipStream_t stream, hipEvent_t* marks) { launch<false>(v, false, stream, marks); }
+
+void enqueue_moe_pipe(const MoeView& v, hipStream_t stream, hipEvent_t* marks) { launch<true>(v, true, stream, marks); }
+void enqueue_experts_pipe(const MoeView& v, hipStream_t stream, hipEvent_t* marks) { launch<true>(v, false, stream, marks); }
+bool pipe_enabled() {
+    static const bool enabled = [] {
+        const char* v = std::getenv("STRIX_GLM_MOE_PIPE");
+        return v != nullptr && std::string(v) == "1";
+    }();
+    return enabled;
+}
 
 }  // namespace strix::glm::moe

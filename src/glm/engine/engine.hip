@@ -236,13 +236,16 @@ class CommExchange final : public Exchange {
 public:
     CommExchange(dist::Communicator& comm, std::uint32_t rank, unsigned max_rows)
         : comm_(comm), rank_(rank), remote_(dalloc<float>(static_cast<std::size_t>(max_rows) * kHidden)),
-          am_l_(dalloc<std::uint64_t>(max_rows)), am_r_(dalloc<std::uint64_t>(max_rows)) {}
+          am_l_(dalloc<std::uint64_t>(max_rows)), am_r_(dalloc<std::uint64_t>(max_rows)),
+          merge_l_(dalloc<std::uint8_t>(kMergeBytes)), merge_r_(dalloc<std::uint8_t>(kMergeBytes)) {}
     ~CommExchange() override {
         for (auto e : source_free_) if (e) (void)hipEventDestroy(e);
         for (auto e : remote_last_use_) if (e) (void)hipEventDestroy(e);
         (void)hipFree(remote_);
         (void)hipFree(am_l_);
         (void)hipFree(am_r_);
+        (void)hipFree(merge_l_);
+        (void)hipFree(merge_r_);
     }
     void reduce(float* p, unsigned rows, hipStream_t s) override {
         dist::Tag tag;
@@ -335,44 +338,34 @@ public:
     }
     // design notes section 2: one exchange of [ctl][rows] per call; both ranks merge the same two halves in rank order.
     void merge(MergeRow* rows, unsigned n, MergeCtl& ctl, hipStream_t s) override {
+        if (n > 8) throw std::invalid_argument("merge: at most eight rows");
         const std::size_t bytes = sizeof(MergeCtl) + static_cast<std::size_t>(n) * sizeof(MergeRow);
         std::vector<std::uint8_t> mine(bytes), peer(bytes);
         std::memcpy(mine.data(), &ctl, sizeof(MergeCtl));
         std::memcpy(mine.data() + sizeof(MergeCtl), rows, n * sizeof(MergeRow));
-        hip_ok(hipMemcpy(am_l_, mine.data(), bytes, hipMemcpyHostToDevice), "merge up");
+        hip_ok(hipMemcpy(merge_l_, mine.data(), bytes, hipMemcpyHostToDevice), "merge up");
         dist::Tag tag;
         tag.kind = static_cast<std::uint32_t>(dist::TagKind::argmax);
         tag.request = seq_++;
-        comm_.exchange(s, am_l_, am_r_, bytes, tag);
-        hip_ok(hipMemcpyAsync(peer.data(), am_r_, bytes, hipMemcpyDeviceToHost, s), "merge down");
+        comm_.exchange(s, merge_l_, merge_r_, bytes, tag);
+        hip_ok(hipMemcpyAsync(peer.data(), merge_r_, bytes, hipMemcpyDeviceToHost, s), "merge down");
         hip_ok(hipStreamSynchronize(s), "merge sync");
         MergeCtl pc;
         std::memcpy(&pc, peer.data(), sizeof(MergeCtl));
-        if (pc.cycle != ctl.cycle || pc.step != ctl.step || pc.kind != ctl.kind)
-            throw std::runtime_error("spec control word mismatch between ranks (cycle / step / kind)");
-        const MergeCtl& c0 = rank_ == 0 ? ctl : pc;
-        const MergeCtl& c1 = rank_ == 0 ? pc : ctl;
-        MergeCtl out = c0;  // rank 0's cost table
-        out.replay_flag = c0.replay_flag | c1.replay_flag;
-        out.mtp_max = std::max(c0.mtp_max, c1.mtp_max);
-        out.mtp_sum = c0.mtp_sum * std::exp(c0.mtp_max - out.mtp_max) + c1.mtp_sum * std::exp(c1.mtp_max - out.mtp_max);
-        ctl = out;
-        for (unsigned r = 0; r < n; ++r) {
-            MergeRow p;
-            std::memcpy(&p, peer.data() + sizeof(MergeCtl) + r * sizeof(MergeRow), sizeof(MergeRow));
-            const MergeRow& a = rank_ == 0 ? rows[r] : p;  // rank order: a = rank 0, b = rank 1
-            const MergeRow& b = rank_ == 0 ? p : rows[r];
-            MergeRow m = (b.value > a.value || (b.value == a.value && b.id < a.id)) ? b : a;  // R18
-            m.flag = a.flag | b.flag;
-            rows[r] = m;
-        }
+        std::array<MergeRow, 8> peer_rows{};
+        std::memcpy(peer_rows.data(), peer.data() + sizeof(MergeCtl), n * sizeof(MergeRow));
+        spec::merge_rank_order({rows, n}, ctl, {peer_rows.data(), n}, pc, rank_);
     }
 
 private:
     dist::Communicator& comm_;
     std::uint32_t rank_;
     float* remote_;
+    static_assert(sizeof(MergeRow) == 12);
+    static_assert(sizeof(MergeCtl) == 72);
+    static constexpr std::size_t kMergeBytes = sizeof(MergeCtl) + 8 * sizeof(MergeRow);
     std::uint64_t *am_l_, *am_r_;
+    std::uint8_t *merge_l_, *merge_r_;
     std::uint64_t seq_ = 0;
     float* pending_part_ = nullptr;
     unsigned pending_rows_ = 0;
@@ -508,6 +501,10 @@ struct Engine::Impl {
     std::vector<unsigned> pending, cur;
     // MTP drafter buffers (Options::mtp): own flag (drafter non-finite never touches the trunk flag), h' rows
     unsigned* mtp_flag = nullptr;
+    float* trunk_logits = nullptr;
+    std::vector<Row> mtp_rows;
+    std::vector<std::uint32_t> mtp_slots;
+    std::vector<std::uint64_t> mtp_positions;
     float *m_e = nullptr, *m_en = nullptr, *m_hn = nullptr, *m_cat = nullptr, *m_z = nullptr, *m_r = nullptr, *m_y = nullptr, *m_h = nullptr,
           *m_mz = nullptr;
     // load memory accounting (design notes): plan (dry run) -> calibration -> admission -> checked load
@@ -573,9 +570,14 @@ struct Engine::Impl {
         xch = next;
     }
 
-    void select_exchange(bool plain, unsigned rows, const SpecRows* sp, bool pfc) {
-        switch_exchange(decode_xch && plain && rows > 0 && rows <= 8 && sp == nullptr && !pfc
-                            ? decode_xch : fallback_xch);
+    enum class ForwardKind { Plain, Verify, Mtp, Gate, Prefill };
+    void select_exchange(ForwardKind kind, unsigned rows) {
+        const char* env = std::getenv("STRIX_GLM_SPEC_XCH");
+        const std::string mode = env == nullptr || *env == '\0' ? "xfer" : env;
+        if (mode != "xfer" && mode != "comm") throw std::invalid_argument("STRIX_GLM_SPEC_XCH must be xfer or comm");
+        const bool fast = kind == ForwardKind::Plain ||
+                          ((kind == ForwardKind::Verify || kind == ForwardKind::Mtp) && mode == "xfer");
+        switch_exchange(decode_xch && fast && rows > 0 && rows <= 8 ? decode_xch : fallback_xch);
     }
 
     std::string L(unsigned l) const { return kP + "layers." + std::to_string(l) + "."; }
@@ -982,8 +984,8 @@ struct Engine::Impl {
         xc = lib.buffer<float>(RC * kHidden);
         xn = lib.buffer<float>(RC * kHidden);
         part = lib.buffer<float>(RC * kHidden);
-        hfin = lib.buffer<float>(R * kHidden);
-        hidden = lib.buffer<float>(R * kHidden);
+        hfin = lib.buffer<float>(RC * kHidden);
+        hidden = lib.buffer<float>(RC * kHidden);
         logits = lib.buffer<float>(R * std::max<std::size_t>(vocab_n, kExperts));
         rlog = lib.buffer<float>(RC * kExperts);
         wts = lib.buffer<float>(RC * kTopE);
@@ -1002,14 +1004,18 @@ struct Engine::Impl {
         }
         if (opt.mtp) {
             mtp_flag = lib.state<unsigned>(1);
-            m_e = lib.buffer<float>(R * kHidden);
-            m_en = lib.buffer<float>(R * kHidden);
-            m_hn = lib.buffer<float>(R * kHidden);
-            m_cat = lib.buffer<float>(R * 2 * kHidden);
-            m_z = lib.buffer<float>(R * kHidden);
-            m_r = lib.buffer<float>(R * kHidden);
-            m_y = lib.buffer<float>(R * kHidden);
-            m_h = lib.buffer<float>(R * kHidden);
+            trunk_logits = lib.buffer<float>(vocab_n);
+            mtp_rows.reserve(RC);
+            mtp_slots.reserve(RC);
+            mtp_positions.reserve(RC);
+            m_e = lib.buffer<float>(RC * kHidden);
+            m_en = lib.buffer<float>(RC * kHidden);
+            m_hn = lib.buffer<float>(RC * kHidden);
+            m_cat = lib.buffer<float>(RC * 2 * kHidden);
+            m_z = lib.buffer<float>(RC * kHidden);
+            m_r = lib.buffer<float>(RC * kHidden);
+            m_y = lib.buffer<float>(RC * kHidden);
+            m_h = lib.buffer<float>(RC * kHidden);
             m_mz = lib.buffer<float>(2);
         }
         dg = lib.buffer<float>(R * dense_i);
@@ -1095,10 +1101,10 @@ struct Engine::Impl {
     }
 
     // Sublayer boundary: TP reduce of `part` + R7 expand into X. The exchange's fused form when it has one and the call
-    // uses one flag (STRIX_GLM_BOUNDARY=0 forces the split form); per-row flags (spec verify) always split.
+    // supports per-row flags when the exchange provides them (STRIX_GLM_BOUNDARY=0 forces the split form).
     // pfc (chunked prefill rows, up to max_rows): always the split form (the fused kernels take decode rows only).
     void boundary(unsigned* c1, unsigned c1_stride, unsigned R, bool pfc = false) {
-        if (!pfc && c1_stride == 0 && boundary_fused && xch->fused_boundary(part, X, mix, X2, c1, R, stream)) {
+        if (!pfc && boundary_fused && xch->fused_boundary_rows(part, X, mix, X2, c1, R, c1_stride, stream)) {
             mark(segXch);  // the fused kernel: exchange wait + R17 + R7
         } else {
             xch->reduce(part, R, stream);
@@ -1226,7 +1232,8 @@ struct Engine::Impl {
     // sp != nullptr: speculative verify rows (one slot): checkpoints go to sp->row_flag[r], nothing throws here.
     // pfc: a chunk of a chunked prefill (rows of one slot, any count <= max_rows): attention, MoE and the dense FFN go
     // through the PrefillPath seam; the row-batched Tier A sites use pf::hc_pre_rows / pf::dense_rows (== decode bits).
-    void layers_forward(std::span<const Row> rows, unsigned n_layers, const SpecRows* sp = nullptr, bool pfc = false, bool plain = false) {
+    void layers_forward(std::span<const Row> rows, unsigned n_layers, ForwardKind kind, const SpecRows* sp = nullptr) {
+        const bool pfc = kind == ForwardKind::Prefill;
         const auto R = static_cast<unsigned>(rows.size());
         if (pfc && opt.pf_pipeline == 2) {
             if (sp != nullptr || layer_dump != nullptr || null_layer >= 0)
@@ -1263,7 +1270,7 @@ struct Engine::Impl {
         if (!pfc && R > 8) throw std::invalid_argument("layers_forward: decode calls take 1..8 rows");
         if (R > std::max<unsigned>(8U, opt.max_rows)) throw std::invalid_argument("layers_forward: rows > max_rows");
         if (pfc && r1b) throw std::logic_error("r1b-all needs the reference prefill; the chunked prefill implements R1 prompts");
-        select_exchange(plain, R, sp, pfc);
+        select_exchange(kind, R);
         if (pfc && opt.pf_pipeline == 2) {
             layers_forward_pipeline(rows, n_layers);
             return;
@@ -1274,9 +1281,14 @@ struct Engine::Impl {
         for (unsigned li = 0; li < n_layers; ++li) {
             LayerW& w = layers[li];
             cur_layer = li;
-            if (pfc) glm::pf::hc_pre_rows(X, w.hc_attn.fn, w.hc_attn.base, w.hc_attn.scale, F, hz, mix, xc, R, stream);
-            else hc_pre(X, w.hc_attn.fn, w.hc_attn.base, w.hc_attn.scale, F, mix, xc, R);
-            D::rmsnorm(xc, w.in_norm, D::WType::BF16, kHidden, kEps, xn, R, stream);
+            if (!pfc && r1b && strix::glm::r1b::hc_norm_enabled()) {
+                strix::glm::r1b::hc_pre_norm(X, w.hc_attn.fn, w.hc_attn.base, w.hc_attn.scale, F, mix, xc,
+                                          w.in_norm, xn, R, stream);
+            } else {
+                if (pfc) glm::pf::hc_pre_rows(X, w.hc_attn.fn, w.hc_attn.base, w.hc_attn.scale, F, hz, mix, xc, R, stream);
+                else hc_pre(X, w.hc_attn.fn, w.hc_attn.base, w.hc_attn.scale, F, mix, xc, R);
+                D::rmsnorm(xc, w.in_norm, D::WType::BF16, kHidden, kEps, xn, R, stream);
+            }
             mark(segHc);
             if (pfc) {
                 if (w.kda) pf->kda(w.kdaw, w.kst, c, xn, part);
@@ -1288,9 +1300,14 @@ struct Engine::Impl {
             }
             mark(w.kda ? segKda : segDsa);
             boundary(c1, c1_stride, R, pfc);
-            if (pfc) glm::pf::hc_pre_rows(X, w.hc_ffn.fn, w.hc_ffn.base, w.hc_ffn.scale, F, hz, mix, xc, R, stream);
-            else hc_pre(X, w.hc_ffn.fn, w.hc_ffn.base, w.hc_ffn.scale, F, mix, xc, R);
-            D::rmsnorm(xc, w.post_norm, D::WType::BF16, kHidden, kEps, xn, R, stream);
+            if (!pfc && r1b && strix::glm::r1b::hc_norm_enabled()) {
+                strix::glm::r1b::hc_pre_norm(X, w.hc_ffn.fn, w.hc_ffn.base, w.hc_ffn.scale, F, mix, xc,
+                                          w.post_norm, xn, R, stream);
+            } else {
+                if (pfc) glm::pf::hc_pre_rows(X, w.hc_ffn.fn, w.hc_ffn.base, w.hc_ffn.scale, F, hz, mix, xc, R, stream);
+                else hc_pre(X, w.hc_ffn.fn, w.hc_ffn.base, w.hc_ffn.scale, F, mix, xc, R);
+                D::rmsnorm(xc, w.post_norm, D::WType::BF16, kHidden, kEps, xn, R, stream);
+            }
             mark(segHc);
             if (w.moe) {
                 if (pfc) {  // chunk rows: the row-tiled router chain (== decode bits) + R14 route
@@ -1346,7 +1363,7 @@ struct Engine::Impl {
         if (opt.spec)  // mode change spec -> plain: apply the slots' pending KDA rows first (design notes section 1)
             for (const Row& r : rows)
                 if (pending.at(r.slot) > 0) flush(r.slot);
-        layers_forward(rows, opt.layers, nullptr, false, true);
+        layers_forward(rows, opt.layers, ForwardKind::Plain);
         D::hc_final(X, hfin, R, stream);
         D::rmsnorm(hfin, final_norm, D::WType::BF16, kHidden, kEps, hidden, R, stream);
         lib.run(head, hidden, logits, R, stream);
@@ -1371,7 +1388,7 @@ struct Engine::Impl {
         layer_dump = &one;
         for (std::size_t t = 0; t < tokens.size(); ++t) {
             const Row r{0, tokens[t], t};
-            layers_forward({&r, 1}, n_layers);
+            layers_forward({&r, 1}, n_layers, ForwardKind::Gate);
             hip_ok(hipStreamSynchronize(stream), "gate sync");
             xch->complete(stream);
             std::copy(one.begin(), one.end(), out.begin() + static_cast<std::ptrdiff_t>(t * per));
@@ -1384,7 +1401,7 @@ struct Engine::Impl {
         std::vector<float> out(tokens.size() * kHc * kHidden);
         for (std::size_t t = 0; t < tokens.size(); ++t) {
             const Row r{0, tokens[t], t};
-            layers_forward({&r, 1}, n_layers);
+            layers_forward({&r, 1}, n_layers, ForwardKind::Gate);
             hip_ok(hipMemcpyAsync(out.data() + t * kHc * kHidden, X, kHc * kHidden * 4, hipMemcpyDeviceToHost, stream), "residual");
             hip_ok(hipStreamSynchronize(stream), "gate sync");
             xch->complete(stream);  // every exchange of this forward verified before its residual is trusted
@@ -1406,7 +1423,7 @@ struct Engine::Impl {
             const std::size_t n = std::min(C, tokens.size() - c0);
             rows.resize(n);
             for (std::size_t i = 0; i < n; ++i) rows[i] = Row{slot, tokens[c0 + i], pos0 + c0 + i};
-            layers_forward(rows, opt.layers, nullptr, true);
+            layers_forward(rows, opt.layers, ForwardKind::Prefill);
         }
         const unsigned last = static_cast<unsigned>(rows.size() - 1);
         D::hc_final(X + static_cast<std::size_t>(last) * kHc * kHidden, hfin, 1, stream);
@@ -1418,6 +1435,70 @@ struct Engine::Impl {
         std::uint32_t out = 0;
         hip_ok(hipMemcpyAsync(&out, ami, 4, hipMemcpyDeviceToHost, stream), "token out");
         hip_ok(hipStreamSynchronize(stream), "prefill sync");
+        ++prof.calls;
+        return out;
+    }
+
+    Engine::MtpPrefillOut prefill_mtp(std::uint32_t slot, std::span<const std::uint32_t> tokens,
+                                     std::uint64_t pos0, Exchange::MergeCtl& ctl) {
+        if (load_test) throw std::logic_error("STRIX_GLM_LOAD_TEST: load only");
+        if (!opt.mtp || layers.empty() || !layers.back().mtp || opt.layers != kLayers || final_norm == nullptr)
+            throw std::logic_error("prefill_mtp needs all 45 trunk layers and MTP");
+        if (!pf->exact_linears() || reference_prefill_installed())
+            throw std::logic_error("prefill_mtp requires an exact chunked PrefillPath (gemv)");
+        if (tokens.empty()) throw std::invalid_argument("prefill_mtp: no tokens");
+        if (slot >= opt.slots || pos0 > opt.capacity || tokens.size() > opt.capacity - pos0)
+            throw std::out_of_range("prefill_mtp: slot / capacity");
+        for (auto t : tokens)
+            if (t >= kVocab) throw std::out_of_range("token id");
+        if (opt.spec && pending.at(slot) > 0) flush(slot);
+        no_mtp.at(slot) = 1;  // stays poisoned until the final single-row seed also succeeds
+        const std::size_t C = std::max<std::size_t>(1, opt.max_rows);
+        std::vector<Row> rows;
+        unsigned last = 0, interior_flag = 0;
+        for (std::size_t c0 = 0; c0 < tokens.size(); c0 += C) {
+            const auto R = static_cast<unsigned>(std::min(C, tokens.size() - c0));
+            rows.resize(R);
+            for (unsigned j = 0; j < R; ++j) rows[j] = Row{slot, tokens[c0 + j], pos0 + c0 + j};
+            layers_forward(rows, opt.layers, ForwardKind::Prefill);
+            D::hc_final(X, hfin, R, stream);
+            D::rmsnorm(hfin, final_norm, D::WType::BF16, kHidden, kEps, hidden, R, stream);
+            // Like the plain chunked prefill, interior rows run no vocabulary head (trunk or MTP): their ids are
+            // discarded and drafts are always verified, so only the final row's head (y0) and the seed drafter
+            // below need logits. Per-row vocabulary heads cost ~15 % of the prefill at 8K/32K.
+            // Look ahead in the full prompt: a chunk's last hidden pairs with the next chunk's first token.
+            // Only the final prompt row waits for the trunk head's y0.
+            const auto pairs = static_cast<unsigned>(std::min<std::size_t>(R, tokens.size() - c0 - 1));
+            if (pairs != 0) {
+                mtp_cache(slot, hidden, tokens.subspan(c0 + 1, pairs), pos0 + c0, true);
+                unsigned f = 0;
+                hip_ok(hipGetLastError(), "MTP prefill kernels");
+                hip_ok(hipMemcpyAsync(&f, mtp_flag, 4, hipMemcpyDeviceToHost, stream), "MTP prefill flag");
+                hip_ok(hipStreamSynchronize(stream), "MTP prefill sync");
+                xch->complete(stream);
+                interior_flag |= f;  // propagated through the final seed merge on both ranks
+            }
+            last = R - 1;
+        }
+        // Preserve last_hidden()'s single final-row contract before the existing head and MTP seed paths.
+        if (last != 0)
+            hip_ok(hipMemcpyAsync(hidden, hidden + static_cast<std::size_t>(last) * kHidden, kHidden * 4,
+                                  hipMemcpyDeviceToDevice, stream), "MTP prefill last hidden");
+        lib.run(head, hidden, logits, 1, stream);
+        D::argmax(logits, vocab_n, vocab0, amv, ami, flag, 1, stream);
+        check_flag("head");
+        xch->argmax(amv, ami, 1, stream);
+        Engine::MtpPrefillOut out;
+        hip_ok(hipMemcpyAsync(&out.y0, ami, 4, hipMemcpyDeviceToHost, stream), "MTP prefill y0");
+        hip_ok(hipStreamSynchronize(stream), "MTP prefill head sync");
+        hip_ok(hipMemcpyAsync(trunk_logits, logits, std::size_t{vocab_n} * sizeof(float),
+                              hipMemcpyDeviceToDevice, stream), "save trunk logits");
+        out.mtp = mtp(slot, hidden, {&out.y0, 1}, pos0 + tokens.size() - 1, ctl, true, interior_flag);
+        hip_ok(hipMemcpyAsync(logits, trunk_logits, std::size_t{vocab_n} * sizeof(float),
+                              hipMemcpyDeviceToDevice, stream), "restore trunk logits");
+        hip_ok(hipStreamSynchronize(stream), "trunk logits sync");
+        out.hp = m_h;
+        no_mtp.at(slot) = 0;
         ++prof.calls;
         return out;
     }
@@ -1441,20 +1522,20 @@ struct Engine::Impl {
         if (slot < no_mtp.size()) no_mtp[slot] = 0;
     }
 
-    // ---- MTP drafter (MTP arithmetic consensus; design notes section 3)
-    Engine::MtpOut mtp(std::uint32_t slot, const float* h, std::span<const std::uint32_t> tokens, std::uint64_t pos0,
-                       Exchange::MergeCtl& ctl) {
-        if (!opt.mtp || layers.empty() || !layers.back().mtp) throw std::logic_error("mtp needs Options::mtp (layer 45 loaded)");
-        if (final_norm == nullptr) throw std::logic_error("mtp needs the head");
+    // Shared layer-45 body: chunked teacher forcing and the single-row drafter use the same weights/state.
+    // Only the caller runs the LM head; no chunk-sized vocabulary scratch is needed.
+    void mtp_cache(std::uint32_t slot, const float* h, std::span<const std::uint32_t> tokens,
+                   std::uint64_t pos0, bool pfc) {
         const auto R = static_cast<unsigned>(tokens.size());
-        if (R == 0 || R > 8) throw std::invalid_argument("mtp: 1..8 rows");
-        if (slot >= opt.slots || pos0 + R > opt.capacity) throw std::out_of_range("mtp: slot / MTP capacity (clamp first)");
-        if (no_mtp.at(slot)) throw std::logic_error("mtp: the slot was chunk-prefilled (MTP cache not filled; reset first)");
-        select_exchange(false, R, nullptr, false);  // MTP always needs the fallback's speculative merge
+        select_exchange(pfc ? ForwardKind::Prefill : ForwardKind::Mtp, R);
         LayerW& w = layers.back();
-        std::vector<std::uint32_t> sl(R, slot);
-        std::vector<std::uint64_t> ps(R);
-        std::vector<Row> rows(R);
+        // Keep asynchronous metadata uploads alive through the caller's head/flag synchronization.
+        mtp_slots.assign(R, slot);
+        mtp_positions.resize(R);
+        mtp_rows.resize(R);
+        auto& sl = mtp_slots;
+        auto& ps = mtp_positions;
+        auto& rows = mtp_rows;
         for (unsigned j = 0; j < R; ++j) {
             if (tokens[j] >= kVocab) throw std::out_of_range("token id");
             ps[j] = pos0 + j;
@@ -1464,23 +1545,54 @@ struct Engine::Impl {
         hip_ok(hipMemcpyAsync(tok_d, tokens.data(), R * 4, hipMemcpyHostToDevice, stream), "mtp tokens");
         hip_ok(hipMemcpyAsync(slot_d, sl.data(), R * 4, hipMemcpyHostToDevice, stream), "mtp slots");
         hip_ok(hipMemcpyAsync(pos_d, ps.data(), R * 8, hipMemcpyHostToDevice, stream), "mtp pos");
-        const CallCtx c{&lib, rows, slot_d, pos_d, mtp_flag, stream, true, nullptr};
+        const CallCtx c{&lib, rows, slot_d, pos_d, mtp_flag, stream, !pfc, nullptr};
         embed1_kernel<<<dim3(kHidden / 256, R), 256, 0, stream>>>(embed, tok_d, m_e);
         D::rmsnorm(m_e, w.enorm, D::WType::BF16, kHidden, kEps, m_en, R, stream);
         D::rmsnorm(h, w.hnorm, D::WType::BF16, kHidden, kEps, m_hn, R, stream);
         cat2_kernel<<<dim3(kHidden / 256, R), 256, 0, stream>>>(m_en, m_hn, m_cat);
-        lib.run(w.eh_proj, m_cat, m_z, R, stream);  // [enorm(e) | hnorm(h)] -> z
+        if (pfc) pf->linear_exact(w.eh_proj, c, m_cat, m_z, 2 * kHidden, kHidden);
+        else lib.run(w.eh_proj, m_cat, m_z, R, stream);  // [enorm(e) | hnorm(h)] -> z
         D::rmsnorm(m_z, w.in_norm, D::WType::BF16, kHidden, kEps, xn, R, stream);
-        attn->dsa(w.dsaw, w.dst, c, xn, part);
+        if (pfc) pf->dsa(w.dsaw, w.dst, c, xn, part);
+        else attn->dsa(w.dsaw, w.dst, c, xn, part);
         xch->reduce(part, R, stream);
         const std::size_t n = static_cast<std::size_t>(R) * kHidden;
         add_kernel<<<static_cast<unsigned>((n + 255) / 256), 256, 0, stream>>>(m_z, part, m_r, n);  // r = z + attn
         D::rmsnorm(m_r, w.post_norm, D::WType::BF16, kHidden, kEps, xn, R, stream);
-        router_route(xn, w.moew, R);
-        moe->forward(w.moew, c, xn, ids, wts, part);
+        if (pfc) {
+            glm::pf::dense_rows(xn, w.moew.router, D::WType::F16, kHidden, 0, kExperts, rlog, R, stream);
+            D::route(rlog, w.moew.bias, ids, wts, R, stream);
+            if (pf->moe_by_row()) {
+                const unsigned B = std::clamp(pf->moe_row_block(), 1U, 8U);
+                for (unsigned q = 0; q < R; q += B) {
+                    const CallCtx cq{&lib, c.rows.subspan(q, std::min(B, R - q)), slot_d + q, pos_d + q,
+                                     mtp_flag, stream, false, nullptr};
+                    moe->forward(w.moew, cq, xn + static_cast<std::size_t>(q) * kHidden,
+                                 ids + static_cast<std::size_t>(q) * kTopE, wts + static_cast<std::size_t>(q) * kTopE,
+                                 part + static_cast<std::size_t>(q) * kHidden);
+                }
+            } else {
+                pf->moe(w.moew, c, xn, ids, wts, part);
+            }
+        } else {
+            router_route(xn, w.moew, R);
+            moe->forward(w.moew, c, xn, ids, wts, part);
+        }
         xch->reduce(part, R, stream);
         add_kernel<<<static_cast<unsigned>((n + 255) / 256), 256, 0, stream>>>(m_r, part, m_y, n);  // y = r + MoE
         D::rmsnorm(m_y, w.head_norm, D::WType::BF16, kHidden, kEps, m_h, R, stream);  // h' = shared_head.norm(y)
+    }
+
+    // ---- MTP drafter (MTP arithmetic consensus; design notes section 3)
+    Engine::MtpOut mtp(std::uint32_t slot, const float* h, std::span<const std::uint32_t> tokens, std::uint64_t pos0,
+                       Exchange::MergeCtl& ctl, bool bootstrap = false, unsigned inherited_flag = 0) {
+        if (!opt.mtp || layers.empty() || !layers.back().mtp) throw std::logic_error("mtp needs Options::mtp (layer 45 loaded)");
+        if (final_norm == nullptr) throw std::logic_error("mtp needs the head");
+        const auto R = static_cast<unsigned>(tokens.size());
+        if (R == 0 || R > 8) throw std::invalid_argument("mtp: 1..8 rows");
+        if (slot >= opt.slots || pos0 + R > opt.capacity) throw std::out_of_range("mtp: slot / MTP capacity (clamp first)");
+        if (no_mtp.at(slot) && !bootstrap) throw std::logic_error("mtp: the slot was chunk-prefilled (MTP cache not filled; reset first)");
+        mtp_cache(slot, h, tokens, pos0, false);
         lib.run(head, m_h, logits, R, stream);
         D::argmax(logits, vocab_n, vocab0, amv, ami, mtp_flag, R, stream);
         lse_kernel<<<1, 256, 0, stream>>>(logits + static_cast<std::size_t>(R - 1) * vocab_n, vocab_n, m_mz);
@@ -1494,7 +1606,7 @@ struct Engine::Impl {
         hip_ok(hipMemcpyAsync(&f, mtp_flag, 4, hipMemcpyDeviceToHost, stream), "mtp flag");
         hip_ok(hipStreamSynchronize(stream), "mtp sync");
         std::vector<Exchange::MergeRow> m(R);
-        for (unsigned j = 0; j < R; ++j) m[j] = Exchange::MergeRow{v[j], id[j], f};
+        for (unsigned j = 0; j < R; ++j) m[j] = Exchange::MergeRow{v[j], id[j], f | inherited_flag};
         ctl.replay_flag = 0;
         ctl.mtp_max = mz[0];
         ctl.mtp_sum = mz[1];
@@ -1522,7 +1634,7 @@ struct Engine::Impl {
         pending[slot] = 0;  // consumed by this call whatever the outcome (stored by the replay); commit sets it again
         std::vector<Row> rows(R);
         for (unsigned j = 0; j < R; ++j) rows[j] = Row{slot, tokens[j], p + j};
-        layers_forward(rows, opt.layers, &sp);
+        layers_forward(rows, opt.layers, ForwardKind::Verify, &sp);
         D::hc_final(X, hfin, R, stream);
         D::rmsnorm(hfin, final_norm, D::WType::BF16, kHidden, kEps, hidden, R, stream);
         lib.run(head, hidden, logits, R, stream);
@@ -1655,6 +1767,24 @@ std::uint32_t Engine::prefill(std::uint32_t slot, std::span<const std::uint32_t>
     }
     return next;
 }
+Engine::MtpPrefillOut Engine::prefill_mtp(std::uint32_t slot, std::span<const std::uint32_t> tokens,
+                                        std::uint64_t pos0, Exchange::MergeCtl& ctl) {
+    if (impl_->identity == IdentityMode::kR1bAll)
+        throw std::logic_error("prefill_mtp requires R1 prompts (r1 or r1b)");
+    struct Scope {
+        Impl& impl;
+        bool saved, active;
+        explicit Scope(Impl& i) : impl(i), saved(i.r1b), active(strix::glm::r1b::active()) {
+            impl.r1b = false;
+            strix::glm::r1b::set_active(false);
+        }
+        ~Scope() {
+            impl.r1b = saved;
+            strix::glm::r1b::set_active(active);
+        }
+    } scope(*impl_);
+    return impl_->prefill_mtp(slot, tokens, pos0, ctl);
+}
 std::vector<std::uint32_t> Engine::step(std::span<const Row> rows) { return impl_->step(rows); }
 void Engine::reset(std::uint32_t slot) { impl_->reset(slot); }
 void Engine::set_attn(std::shared_ptr<AttnPath> p) { impl_->attn = std::move(p); }
@@ -1724,6 +1854,17 @@ void Engine::flush(std::uint32_t slot) { impl_->flush(slot); }
 const float* Engine::last_hidden() const { return impl_->hidden; }
 const float* Engine::last_logits() const { return impl_->logits; }
 std::uint32_t Engine::vocab_slice() const { return impl_->vocab_n; }
+void Engine::save_trunk_logits() {
+    if (!impl_->trunk_logits) throw std::logic_error("save_trunk_logits requires MTP");
+    hip_ok(hipMemcpyAsync(impl_->trunk_logits, impl_->logits, std::size_t{impl_->vocab_n} * sizeof(float),
+                          hipMemcpyDeviceToDevice, impl_->stream), "save trunk logits");
+}
+void Engine::restore_trunk_logits() {
+    if (!impl_->trunk_logits) throw std::logic_error("restore_trunk_logits requires MTP");
+    hip_ok(hipMemcpyAsync(impl_->logits, impl_->trunk_logits, std::size_t{impl_->vocab_n} * sizeof(float),
+                          hipMemcpyDeviceToDevice, impl_->stream), "restore trunk logits");
+    hip_ok(hipStreamSynchronize(impl_->stream), "trunk logits sync");
+}
 std::vector<std::uint8_t> Engine::state_bytes_upto(std::uint32_t slot, std::uint64_t frontier) const {
     return impl_->state_bytes(slot, frontier);
 }

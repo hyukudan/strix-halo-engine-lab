@@ -64,6 +64,7 @@ std::size_t moe_workspace_bytes();
 // Diagnostics (tests): device pointers into the workspace after a call. Pair p < R: the shared expert of row p; routed
 // pairs follow in (expert ascending, row ascending) order. pair_output = the expert's down output (strix_gemv bits),
 // pair_down_input = its transformed down input (FP16, the library's input_transform of R15(g, u)).
+const float* moe_pair_gate_partials(const MoeWorkspace& ws, unsigned pair);  // [2][32][1024], tests
 const float* moe_pair_output(const MoeWorkspace& ws, unsigned pair);
 const std::uint16_t* moe_pair_down_input(const MoeWorkspace& ws, unsigned pair);
 
@@ -88,6 +89,12 @@ struct MoeView {
 // marks (optional, profiling): enqueue_moe records 2 events (after launch 1, after launch 2), enqueue_experts 1.
 void enqueue_moe(const MoeView& v, hipStream_t stream, hipEvent_t* marks = nullptr);
 void enqueue_experts(const MoeView& v, hipStream_t stream, hipEvent_t* marks = nullptr);
+
+// Scheduling-only opt-in variants. Existing entrypoints always launch the old kernels.
+// The engine selects these only for decode when STRIX_GLM_MOE_PIPE=1 (read once).
+bool pipe_enabled();
+void enqueue_moe_pipe(const MoeView& v, hipStream_t stream, hipEvent_t* marks = nullptr);
+void enqueue_experts_pipe(const MoeView& v, hipStream_t stream, hipEvent_t* marks = nullptr);
 
 // Tunable (bitwise at every value; environment, read once): STRIX_GLM_MOE_SG = library splits per gate_up CTA
 // (1, 2, 4, 8) for every row count; unset = default_split_group(row bucket), measured: SG1 for R <= 2, SG2 above.

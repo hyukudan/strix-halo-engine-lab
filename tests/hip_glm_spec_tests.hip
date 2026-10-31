@@ -2,7 +2,7 @@
 // admitted download): verify-row device kernels of ONE slot == the host reference bit for bit
 // (design notes section 5).
 //   * kda_verify (deferred replay), real L4 rank-0 KDA weights (32 heads): a stream of verify cycles with an enforced
-//     schedule (every R = 1..8 with full and single-row commits, replay counts 0..8) then random cycles; rejected rows
+//     schedule (both exact trees; every replay 0..4 x R 1..8, plus every R = 1..8 with full and single-row commits, replay counts 0..8) then random cycles; rejected rows
 //     carry junk inputs. Every new row's y (accepted or not) == spec::KdaVerify, the committed S + conv after every call
 //     == host, the final flush == the plain kda_step sequence. Inactive rows of every buffer are re-poisoned (NaN) before
 //     each call and must stay NaN.
@@ -202,6 +202,37 @@ struct KdaDev2 {
     }
 };
 
+// Independent persistent replay/state buffers for each tree. Every call, including NaN probes
+// and flushes, compares all output/state/flag bits before either buffer is reused.
+struct KdaTrees : KdaDev2 {
+    KdaDev2 other;
+    bool equal = true;
+    explicit KdaTrees(const H::KdaState& st) : KdaDev2(st), other(st) {}
+    void load(unsigned nxt, const std::vector<S::KdaRow>& rows) {
+        KdaDev2::load(nxt, rows);
+        other.load(nxt, rows);
+        put(o, std::vector<float>(static_cast<std::size_t>(MR) * C, kNaN));
+        put(other.o, std::vector<float>(static_cast<std::size_t>(MR) * C, kNaN));
+    }
+    void verify(const D::KdaDev& k, unsigned cur, unsigned n_rep, unsigned nxt, unsigned R) {
+        // Callers may clear flags between probes. The preceding call already compared them.
+        put(other.flag, down(flag, 1));
+        put(other.rflag, down(rflag, MR));
+        D::kda_verify(k, qkv[cur], scr[cur], beta[cur], n_rep, qkv[nxt], f, g, b, R, S, conv, scr[nxt], beta[nxt],
+                      o, y, flag, rflag, nullptr, 1);
+        D::kda_verify(k, other.qkv[cur], other.scr[cur], other.beta[cur], n_rep, other.qkv[nxt], other.f, other.g, other.b,
+                      R, other.S, other.conv, other.scr[nxt], other.beta[nxt], other.o, other.y, other.flag, other.rflag, nullptr, 2);
+        equal &= same(down(S, static_cast<std::size_t>(Hh) * kKdaDim * kKdaDim),
+                      down(other.S, static_cast<std::size_t>(Hh) * kKdaDim * kKdaDim));
+        equal &= same(down(conv, static_cast<std::size_t>(3) * C * 3), down(other.conv, static_cast<std::size_t>(3) * C * 3));
+        equal &= same(down(o, static_cast<std::size_t>(MR) * C), down(other.o, static_cast<std::size_t>(MR) * C));
+        equal &= same(down(y, static_cast<std::size_t>(MR) * C), down(other.y, static_cast<std::size_t>(MR) * C));
+        equal &= same(down(scr[nxt], static_cast<std::size_t>(MR) * SCR), down(other.scr[nxt], static_cast<std::size_t>(MR) * SCR));
+        equal &= same(down(beta[nxt], MR * Hh), down(other.beta[nxt], MR * Hh));
+        equal &= same(down(flag, 1), down(other.flag, 1)) && same(down(rflag, MR), down(other.rflag, MR));
+    }
+};
+
 void test_kda_verify(const std::string& cases, std::mt19937& g) {
     const KdaFix fx(cases);
     constexpr unsigned C = KdaFix::C, MR = KdaFix::MR, SCR = KdaFix::SCR;
@@ -210,6 +241,13 @@ void test_kda_verify(const std::string& cases, std::mt19937& g) {
         sched.push_back({R, R});
         sched.push_back({R, 1});
     }
+    // Each target call is preceded by a call committing exactly rep rows: cover the
+    // Cartesian product, not just the two marginal sets (including a zero-row commit).
+    for (unsigned rep = 0; rep <= 4; ++rep)
+        for (unsigned R = 1; R <= MR; ++R) {
+            sched.push_back({std::max(1U, rep), rep});
+            sched.push_back({R, 1});
+        }
     unsigned N = 0;
     for (auto& s : sched) N += s.second;
     N += 40;  // then random cycles
@@ -218,10 +256,11 @@ void test_kda_verify(const std::string& cases, std::mt19937& g) {
     const H::KdaState fresh{KdaFix::Hh, std::vector<float>(static_cast<std::size_t>(KdaFix::Hh) * kKdaDim * kKdaDim, 0.0F),
                             std::vector<float>(static_cast<std::size_t>(3) * C * 3, 0.0F)};
     S::KdaVerify hv(fresh);
-    KdaDev2 d(fresh);
+    KdaTrees d(fresh);
     unsigned pos = 0, cur = 0, n_rep = 0, cycles = 0, junk = 0;
     bool ys = true, states = true, pad = true, flags = true;
     std::set<unsigned> seenR, seenRep;
+    std::set<std::pair<unsigned, unsigned>> seenPairs;
     while (pos < N) {
         unsigned R, m1;
         if (cycles < sched.size()) {
@@ -237,8 +276,7 @@ void test_kda_verify(const std::string& cases, std::mt19937& g) {
         junk += R - m1;
         const unsigned nxt = cur ^ 1U;
         d.load(nxt, rows);
-        D::kda_verify(fx.kd, d.qkv[cur], d.scr[cur], d.beta[cur], n_rep, d.qkv[nxt], d.f, d.g, d.b, R, d.S, d.conv, d.scr[nxt],
-                      d.beta[nxt], d.o, d.y, d.flag, d.rflag, nullptr);
+        d.verify(fx.kd, cur, n_rep, nxt, R);
         std::vector<std::vector<float>> yh;
         const unsigned first = hv.run(rows, fx.hw, yh);
         const auto yd = down(d.y, static_cast<std::size_t>(MR) * C);
@@ -254,14 +292,15 @@ void test_kda_verify(const std::string& cases, std::mt19937& g) {
         flags &= std::all_of(rf.begin(), rf.end(), [](unsigned v) { return v == 0; }) && down(d.flag, 1)[0] == 0;
         seenR.insert(R);
         seenRep.insert(n_rep);
+        if (n_rep <= 4) seenPairs.insert({n_rep, R});
         hv.commit(m1);
         n_rep = m1;
         cur = nxt;
         pos += m1;
         ++cycles;
     }
-    D::kda_verify(fx.kd, d.qkv[cur], d.scr[cur], d.beta[cur], n_rep, nullptr, nullptr, nullptr, nullptr, 0, d.S, d.conv, d.scr[cur ^ 1U],
-                  d.beta[cur ^ 1U], d.o, d.y, d.flag, d.rflag, nullptr);  // flush
+    d.verify(fx.kd, cur, n_rep, cur ^ 1U, 0);  // flush
+    flags &= down(d.flag, 1)[0] == 0;
     hv.flush(fx.hw);
     H::KdaState plain = fresh;
     std::vector<float> y(C);
@@ -271,7 +310,7 @@ void test_kda_verify(const std::string& cases, std::mt19937& g) {
     char bf[240];
     std::snprintf(bf, sizeof bf, "%u cycles, %u positions, %u junk rows, R seen %zu/8, replay counts seen %zu/9, real L4 rank-0 weights",
                   cycles, N, junk, seenR.size(), seenRep.size());
-    check(ys && seenR.size() == 8 && seenRep.size() == 9, std::string("kda_verify: every new row's y == host (accepted and rejected; ") + bf + ")");
+    check(ys && seenR.size() == 8 && seenRep.size() == 9 && seenPairs.size() == 40, std::string("kda_verify: every new row's y == host (accepted and rejected; ") + bf + ")");
     check(states, "kda_verify: committed S + conv after every call == host KdaVerify (replay of the previous commit)");
     check(final_ok, "kda_verify: flush (n_new = 0) == host flush == plain kda_step sequence");
     check(pad, "kda_verify: inactive rows (re-poisoned before every call) untouched: y, prep scratch, beta stay NaN");
@@ -283,13 +322,15 @@ void test_kda_verify(const std::string& cases, std::mt19937& g) {
         rows[0].qkv[3] = kNaN;  // a Q channel of head 0
         d.load(0, rows);
         hok(hipMemset(d.flag, 0, 4), "f0");
-        D::kda_verify(fx.kd, nullptr, nullptr, nullptr, 0, d.qkv[0], d.f, d.g, d.b, 1, d.S, d.conv, d.scr[0], d.beta[0], d.o, d.y,
-                      d.flag, d.rflag, nullptr);
+        d.verify(fx.kd, 1, 0, 0, 1);
         const auto rf = down(d.rflag, MR);
         const auto yq = down(d.y, C);
+        S::KdaVerify probe(plain);
+        std::vector<std::vector<float>> yh;
+        const unsigned first = probe.run(rows, fx.hw, yh);
         const bool y_nan = std::any_of(yq.begin(), yq.end(), [](float v) { return std::isnan(v); });
         const bool st = same(down(d.S, plain.S.size()), plain.S) && same(down(d.conv, plain.conv.size()), plain.conv);
-        check(rf[0] == 0 && down(d.flag, 1)[0] == 0 && y_nan && st,
+        check(first == 1 && same(yq, yh[0]) && rf[0] == 0 && down(d.flag, 1)[0] == 0 && y_nan && st,
               "kda_verify: Q-only NaN -> non-finite y but no C2 flag, stored state untouched (the row is not committed)");
     }
     // flag attribution 1: NaN in rejected row 1 of 3 -> row_flag[1] (and the later row 2, fed by its conv state), the
@@ -299,15 +340,17 @@ void test_kda_verify(const std::string& cases, std::mt19937& g) {
         rows[1].qkv[C + 5] = kNaN;  // a K channel: K reaches the state update (Q does not)
         d.load(0, rows);
         hok(hipMemset(d.flag, 0, 4), "f0");
-        D::kda_verify(fx.kd, nullptr, nullptr, nullptr, 0, d.qkv[0], d.f, d.g, d.b, 3, d.S, d.conv, d.scr[0], d.beta[0], d.o, d.y,
-                      d.flag, d.rflag, nullptr);
+        d.verify(fx.kd, 1, 0, 0, 3);
         const auto rf = down(d.rflag, MR);
         const unsigned cflag = down(d.flag, 1)[0];
-        D::kda_verify(fx.kd, d.qkv[0], d.scr[0], d.beta[0], 1, nullptr, nullptr, nullptr, nullptr, 0, d.S, d.conv, d.scr[1], d.beta[1], d.o,
-                      d.y, d.flag, d.rflag, nullptr);
+        S::KdaVerify probe(plain);
+        std::vector<std::vector<float>> yh;
+        const unsigned first = probe.run(rows, fx.hw, yh);
+        const bool prefix = first == 1 && same(down(d.y, C), yh[0]);
+        d.verify(fx.kd, 0, 1, 1, 0);
         H::kda_step(plain, rows[0].in(), fx.hw, y);
         const bool st = same(down(d.S, plain.S.size()), plain.S) && same(down(d.conv, plain.conv.size()), plain.conv);
-        check(rf[0] == 0 && rf[1] != 0 && cflag == 0 && down(d.flag, 1)[0] == 0 && st,
+        check(prefix && rf[0] == 0 && rf[1] == 1 && cflag == 0 && down(d.flag, 1)[0] == 0 && st,
               "kda_verify: NaN in rejected row 1 -> row_flag[1] only, committed flag clear, committed row 0 state exact");
     }
     // flag attribution 2: NaN in row 0, which is then committed -> row_flag[0] at verify and the committed flag at replay
@@ -316,15 +359,19 @@ void test_kda_verify(const std::string& cases, std::mt19937& g) {
         rows[0].qkv[C + 7] = kNaN;  // a K channel
         d.load(0, rows);
         hok(hipMemset(d.flag, 0, 4), "f0");
-        D::kda_verify(fx.kd, nullptr, nullptr, nullptr, 0, d.qkv[0], d.f, d.g, d.b, 2, d.S, d.conv, d.scr[0], d.beta[0], d.o, d.y,
-                      d.flag, d.rflag, nullptr);
+        d.verify(fx.kd, 1, 0, 0, 2);
         const auto rf = down(d.rflag, MR);
         const unsigned before = down(d.flag, 1)[0];
-        D::kda_verify(fx.kd, d.qkv[0], d.scr[0], d.beta[0], 1, nullptr, nullptr, nullptr, nullptr, 0, d.S, d.conv, d.scr[1], d.beta[1], d.o,
-                      d.y, d.flag, d.rflag, nullptr);
-        check(rf[0] != 0 && before == 0 && down(d.flag, 1)[0] != 0,
+        S::KdaVerify probe(plain);
+        std::vector<std::vector<float>> yh;
+        const unsigned first = probe.run(rows, fx.hw, yh);
+        d.verify(fx.kd, 0, 1, 1, 0);
+        check(first == 0 && rf[0] == 1 && before == 0 && down(d.flag, 1)[0] == 1,
               "kda_verify: NaN in row 0 -> row_flag[0] at verify, committed flag (C2) set when the row is replayed");
     }
+    check(d.equal, "kda_verify: trees 1/2 bitwise equal: o/y, S/conv, scratch/beta, committed/per-row flags (including NaNs and flushes)");
+    check(seenPairs.size() == 40, "kda_verify: both trees vs host for every replay 0..4 x R 1..8");
+
 }
 
 // ---------------------------------------------------------------- DSA rows of one slot

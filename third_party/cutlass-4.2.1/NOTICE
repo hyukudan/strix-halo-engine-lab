@@ -1,0 +1,6 @@
+CUTLASS 4.2.1 header subset
+Copyright (c) 2017 - 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+BSD-3-Clause; see LICENSE and individual file notices (including third-party notices).
+Source: NVIDIA CUTLASS, https://github.com/NVIDIA/cutlass, version macros 4.2.1.
+Unmodified headers, selected by recursive local include dependency closure.
+No claim of independent authorship.

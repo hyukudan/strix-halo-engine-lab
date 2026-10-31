@@ -31,11 +31,14 @@ enum class TierB { wmma, gemv };
 //         for 9 pairs per token, plus tables; 792849408 / 1585660416 bytes at R=2048 / 4096);
 //   workspace: the largest strix_gemm_pinned (s = 1) workspace of the path's linears; Engine::set_prefill reserves the
 //         larger of it and every GEMV call's workspace (gemv-mode Tier B, head);
-//   engine_rows: the engine's row buffers sized max(8, Options::max_rows) (allocated by the engine at construction).
+//   engine_rows: the engine's row buffers sized max(8, Options::max_rows) (allocated/admitted by the load plan).
+//         Includes two H-wide final hidden buffers and, when mtp, nine H-wide MTP scratch equivalents.
+//         pf_mem_budget mirrors must include (2 + (mtp ? 9 : 0)) * RC * H * 4 bytes: 352 MiB at RC=2048 with MTP.
+//         Decode-only logits/argmax and other fixed-size scratch are outside this row-scaled subtotal.
 struct PrefillBudget {
     std::uint64_t path = 0, workspace = 0, engine_rows = 0;
 };
-PrefillBudget prefill_budget(unsigned kda_heads, unsigned mla_heads, std::uint64_t capacity, unsigned max_rows);
+PrefillBudget prefill_budget(unsigned kda_heads, unsigned mla_heads, std::uint64_t capacity, unsigned max_rows, bool mtp = true);
 
 // heads: rank KDA / MLA heads; capacity: DSA positions per slot; max_rows: largest chunk.
 // Fails closed (std::runtime_error, nothing allocated) unless path + workspace + a margin fit both the free device
