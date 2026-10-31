@@ -1327,6 +1327,22 @@ IQ2_XXS gate/up and Q2_K down split kernels with the same products, chains, tree
 - **Measured gain:** Rank-shaped kernel bench (layer 20, interleaved): down -27 / -30 / -30 %, gate/up -4.5 / -6.1 / -7.8 % at 2048 / 4096 / 8192-row pieces. Two-node serve TTFT at 8,399 / 32,499 / 44,699 tokens (one binary, cache off, one load per arm, separate GPU turns): STRIX_DS41_PREFILL_MOE_V2=0 10.42 / 37.29 / 53.35 s vs default 9.80 / 34.70 / 49.09 s (-5.9 / -6.9 / -8.0 %). Q8_0 shared expert (one expert, all rows), v2 vs STRIX_DS41_PREFILL_MOE_V2_Q8=0: gate/up -21 / -20 / -32 %, down -26 / -33 / -40 % at 2048 / 4096 / 8192 rows.
 - **Public evidence:** [Prefill MoE kernels](../src/hip_ds41_prefill.hip)
 
+<a id="ds-router-v2"></a>
+
+### Prefill router scores v2
+
+**Engine:** `deepseek`. **Control:** `STRIX_DS41_PREFILL_ROUTER_V2`. **Default:** ON.
+
+The prefill router's scores kernel takes 32 rows x 32 experts per block (a wave 8 rows x 16 experts) and stages x and the router weights 128 elements at a time, issuing the next chunk's 16-byte loads before the current chunk's products; blocks walk the experts first so the blocks of one row tile share its activations in the cache. Each lane still adds the elements l, l + 32, ... of every (row, expert) in ascending order from 0, then the same butterfly and router score: the decode router's chain.
+
+- **Preconditions:** 16-byte aligned activations and router weights and hidden a multiple of 4 (the 16-byte staging, STRIX_DS41_PREFILL_ROUTER_WIDE); otherwise the v1 kernel. Hidden a multiple of 32 is required by every prefill router call.
+- **Automatic selection:** On for every prefill router call that admits 16-byte staging.
+- **Fallback notice:** None; ineligible views run the v1 kernel silently.
+- **Exactness evidence:** Bitwise: prefill router scores, ids and weights of the v2 and v1 kernels equal to the decode router and to the host reference (synthetic 64 experts / 77 rows, 40 experts / hidden 1056 / 33 and 1 rows, real layer 20 at 300 and 8192 rows).
+- **Off switch:** STRIX_DS41_PREFILL_ROUTER_V2=0
+- **Measured gain:** Router kernel (layer 20 weights, 384 experts, scores + selection, interleaved): 20.71 -> 5.87 ms at 8192 rows (-72 %), 5.26 -> 1.52 ms at 2048, 0.58 -> 0.40 ms at 512. Two-node serve TTFT at 8,399 / 32,499 tokens (one binary, cache off, one load per arm, two GPU turns in opposite arm order): 8.876 / 31.852 s with STRIX_DS41_PREFILL_ROUTER_V2=0 vs 8.707 / 31.373 s default (-1.9 / -1.5 %); logits and generated ids identical.
+- **Public evidence:** [Prefill router](../src/hip_ds41_prefill.hip)
+
 <a id="ds-dense"></a>
 
 ### Exact dense prefill selector

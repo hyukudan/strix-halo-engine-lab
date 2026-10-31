@@ -642,6 +642,21 @@ RouterWeights synthetic_router(std::uint32_t experts, std::uint32_t hidden, std:
     return r;
 }
 
+// Restores an environment variable (set, empty or unset) when it goes out of scope.
+struct EnvRestore {
+    std::string name, value;
+    bool was_set = false;
+    explicit EnvRestore(const char* n) : name(n) {
+        const char* v = std::getenv(n);
+        was_set = v != nullptr;
+        if (v) value = v;
+    }
+    ~EnvRestore() {
+        if (was_set) setenv(name.c_str(), value.c_str(), 1);
+        else unsetenv(name.c_str());
+    }
+};
+
 // Prefill router (T rows) = decode router (chunks of 8 rows) bitwise, plus host rows.
 void check_router(const RouterWeights& rw, std::uint32_t rows, unsigned seed, const std::string& label) {
     using namespace strix::ds41;
@@ -671,9 +686,15 @@ void check_router(const RouterWeights& rw, std::uint32_t rows, unsigned seed, co
         check(hipDeviceSynchronize(), "router");
         return std::make_tuple(scores.download(), ids.download(), weights.download());
     };
+    // the v2 scores kernel (default) and the v1 kernel (STRIX_DS41_PREFILL_ROUTER_V2=0) against the decode router
+    const EnvRestore restore("STRIX_DS41_PREFILL_ROUTER_V2");
+    setenv("STRIX_DS41_PREFILL_ROUTER_V2", "0", 1);
+    const auto [vs, vi, vw] = run(true);
+    setenv("STRIX_DS41_PREFILL_ROUTER_V2", "1", 1);
     const auto [ps, pi, pw] = run(true);
     const auto [ds, di, dw2] = run(false);
-    const auto bad = bit_mismatches(ps, ds) + bit_mismatches(pi, di) + bit_mismatches(pw, dw2);
+    const auto bad = bit_mismatches(ps, ds) + bit_mismatches(pi, di) + bit_mismatches(pw, dw2) + bit_mismatches(vs, ds) +
+                     bit_mismatches(vi, di) + bit_mismatches(vw, dw2);
     const std::uint32_t host_rows = std::min(rows, 3U);
     const auto host = reference_router(std::span<const float>(x.data(), static_cast<std::size_t>(host_rows) * rw.hidden), host_rows, rw.hidden,
                                        rw.weight, rw.experts, rw.bias, rw.bias_image, std::span<const std::uint8_t>(image.data(), host_rows),
@@ -683,7 +704,7 @@ void check_router(const RouterWeights& rw, std::uint32_t rows, unsigned seed, co
     for (std::size_t i = 0; i < host.ids.size(); ++i) host_bad += host.ids[i] != pi[i] || std::bit_cast<std::uint32_t>(host.weights[i]) != std::bit_cast<std::uint32_t>(pw[i]);
     expect(bad == 0U && host_bad == 0U, label + ": prefill router vs decode router " + std::to_string(bad) + ", vs host " + std::to_string(host_bad) + " differ");
     std::cout << label << ": router T=" << rows << " (" << rw.experts << " experts, top-" << rw.top_k << ", image rows): scores, ids, weights "
-              << (bad == 0U && host_bad == 0U ? "bit-exact vs decode router and host" : "MISMATCH") << '\n';
+              << (bad == 0U && host_bad == 0U ? "bit-exact vs decode router and host (scores kernels v2 and v1)" : "MISMATCH") << '\n';
 }
 
 strix::ds41::PrefillMoeWeights moe_weights(const DeviceExperts& x, std::uint32_t first_expert) {
@@ -834,18 +855,22 @@ void bench_router(const RouterWeights& rw, const std::string& label) {
         v.route_scale = rw.scale; v.scores = scores.data; v.ids = ids.data; v.weights = weights.data;
         hipEvent_t a, b;
         check(hipEventCreate(&a), "event"); check(hipEventCreate(&b), "event");
-        std::vector<float> ms;
-        for (unsigned rep = 0; rep < 6U; ++rep) {
+        // interleaved: the v1 scores kernel (STRIX_DS41_PREFILL_ROUTER_V2=0), then the default (scores + selection)
+        std::vector<float> ms[2];
+        const EnvRestore restore("STRIX_DS41_PREFILL_ROUTER_V2");
+        for (unsigned rep = 0; rep < 14U; ++rep) {
+            const unsigned arm = rep % 2U;
+            setenv("STRIX_DS41_PREFILL_ROUTER_V2", arm == 0U ? "0" : "1", 1);
             check(hipEventRecord(a, nullptr), "event");
             enqueue_prefill_router(v, nullptr);
             check(hipEventRecord(b, nullptr), "event");
             check(hipEventSynchronize(b), "sync");
             float t = 0;
             check(hipEventElapsedTime(&t, a, b), "elapsed");
-            if (rep >= 1U) ms.push_back(t);
+            if (rep >= 2U) ms[arm].push_back(t);
         }
         (void)hipEventDestroy(a); (void)hipEventDestroy(b);
-        std::cout << "ROUTER " << label << " T=" << rows << " ms=" << median_of(ms) << '\n';
+        std::cout << "ROUTER " << label << " T=" << rows << " ms=" << median_of(ms[1]) << " v1_ms=" << median_of(ms[0]) << '\n';
     }
 }
 
@@ -978,6 +1003,9 @@ int main() {
         if (!bench_only) {
             test_synthetic();
             check_router(synthetic_router(64, 1024, 6, 5), 77, 6, "synthetic");
+            // experts not a multiple of the 32-expert tile, a 32-element last chunk, one row
+            check_router(synthetic_router(40, 1056, 6, 8), 33, 9, "synthetic tails");
+            check_router(synthetic_router(40, 1056, 6, 8), 1, 10, "synthetic tails");
         }
         const char* q2 = std::getenv("STRIX_DS41_Q2_GGUF");
         const char* dspark = std::getenv("STRIX_DS41_DSPARK_GGUF");
@@ -1000,6 +1028,7 @@ int main() {
                     rw.bias = read_f32(q2, "blk.20.exp_probs_b.bias", rw.experts);
                     rw.bias_image = read_f32(q2, "blk.20.exp_probs_b_vl.bias", rw.experts);
                     check_router(rw, 300, 47, "real blk.20");
+                    check_router(rw, 8192, 48, "real blk.20");
                     if (timing) bench_router(rw, "blk.20");
                 }
                 const char* moe_env = std::getenv("STRIX_DS41_BENCH_MOE");

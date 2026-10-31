@@ -165,7 +165,8 @@ struct RouterView {
     bool row_waves = false;
     // Prefill router (enqueue_prefill_router): x and the weights staged into LDS with 16-byte loads, several in flight
     // (default; needs 16-byte aligned x / weight and hidden % 4 == 0, else the element loop; STRIX_DS41_PREFILL_ROUTER_WIDE=0
-    // keeps the element loop). The same staged values, same bits.
+    // keeps the element loop). The same staged values, same bits. With 16-byte staging the v2 scores kernel runs (32 rows
+    // x 32 experts per block, next chunk loaded during the current one; STRIX_DS41_PREFILL_ROUTER_V2=0 keeps v1), same bits.
     bool wide_stage = true;
     // STRIX_DS41_ROUTER_FAST=1 (default off) or fast = 1: the row-wave scores, then the selection by one wave per row in
     // the select block's comparison tree. fast = 4 / 8 / 16 (A/B; slower at every row count measured): wide scores, one
