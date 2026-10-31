@@ -1290,6 +1290,26 @@ The f32 attention tiles (the 4-heads-per-wave tile and the f16 kernels' f32 fall
 - **Measured gain:** Two-node in-process ABA, swizzle with the f16 tile vs the f16 tile alone: R6 -0.20 % (3/4 pairs faster), R1 neutral, batch N8 decode -0.04 % / -0.40 % in two turns.
 - **Public evidence:** [Exact memory options](ds41-exact-memory-options.md), [two-node defaults](models/deepseek-v4.1/production-defaults.md)
 
+<a id="ds-attn-lean"></a>
+
+### Attention lean chunk kernel
+
+**Engine:** `deepseek`. **Control:** `STRIX_DS41_ATTN_LEAN`. **Default:** 2.
+
+The packed-attention chunk kernels run the same operations in the same order with fewer instructions. Level 1: the
+softmax exponentials use selects instead of branches over the same polynomial, the running sum is taken in the PV loop
+in the same key order, and the PV loop is split at key 8. Level 2 (default) also dequantises the key tile through f16
+bit patterns and one fused multiply per value, which rounds the same real product once; a key part with a NaN code or
+a scale outside the exact range uses the previous code.
+
+- **Preconditions:** Packed-attention HIP chunk kernels (prefill windows, decode, verify and batch segments).
+- **Automatic selection:** On for every launch.
+- **Fallback notice:** None; parts outside the exact range use the previous dequantisation silently.
+- **Exactness evidence:** Bitwise: HIP attention device tests against the host reference with the default level, and level 1 and 2 byte-equal to level 0 on prefill-shaped calls (four streams, every E4M3/E2M1 code and scale byte, early positions, window-only and compressed layers, A8 combine, every tile choice).
+- **Off switch:** STRIX_DS41_ATTN_LEAN=0 (STRIX_DS41_ATTN_LEAN=1 keeps the previous dequantisation)
+- **Measured gain:** GAIN_PLACEHOLDER
+- **Public evidence:** [Two-node defaults](models/deepseek-v4.1/production-defaults.md)
+
 <a id="ds-warm"></a>
 
 ### Server warm-up and DSpark calibration

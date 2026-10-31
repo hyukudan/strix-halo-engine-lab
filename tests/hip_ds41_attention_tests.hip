@@ -965,7 +965,8 @@ struct PrefillWindows {
     std::unique_ptr<Dev<float>> deltas;
     std::unique_ptr<Dev<std::int32_t>> sums;
     hipStream_t st[kLanes]{};
-    bool window_only = false, a8 = false;
+    bool window_only = false, a8 = false, live = false;   // live: AttentionView::max_visible from the window's last row
+    std::vector<std::uint32_t> hcount;
     // count of row at position p: every compressed position up to p / ratio (ratio 0: window-only layer), at most top-k
     PrefillWindows(int mode, unsigned rows_, unsigned heads_, unsigned nwin_, std::uint64_t p0, unsigned ratio, bool a8_)
         : rows(rows_), heads(heads_), nwin(nwin_), cap(a::kWindow + rows_ * nwin_ + 8U), window_only(ratio == 0U), a8(a8_) {
@@ -1000,6 +1001,7 @@ struct PrefillWindows {
         part = std::make_unique<Dev<float>>(std::size_t{kLanes} * rows * heads * a::kMaxChunks * 514);
         dpos = std::make_unique<Dev<std::uint64_t>>(pos);
         rope = std::make_unique<Dev<a::RopeRow>>(ropes(a::RopeKind::compressed, pos));
+        hcount = hcnt;
         idx = std::make_unique<Dev<std::uint32_t>>(hidx);
         cnt = std::make_unique<Dev<std::uint32_t>>(hcnt);
         tick = std::make_unique<Dev<std::uint32_t>>(std::size_t{kLanes} * rows * g::kAttnGroupCount);
@@ -1020,6 +1022,10 @@ struct PrefillWindows {
                            tick->p + std::size_t{lane} * rows * g::kAttnGroupCount};
         v.heads = heads;
         if (a8) { v.codes = codes->p + r0 * heads * 512; v.deltas = deltas->p + r0 * heads * 16; v.sums = sums->p + r0 * heads * 16; }
+        if (live) {
+            const std::size_t last = r0 + rows - 1U;
+            v.max_visible = static_cast<std::uint32_t>(std::min<std::uint64_t>(pos[last] + 1U, a::kWindow) + (window_only ? 0U : hcount[last]));
+        }
         return v;
     }
     void run() const {
@@ -1063,7 +1069,7 @@ void lean_equal(int mode, unsigned rows, unsigned heads, unsigned nwin, std::uin
 
 // Prefill attention bench: `nwin` windows over 4 streams, the forms alternated (0 1 2 0 1 2 ...), median wall time per window.
 void prefill_bench(unsigned rows, unsigned heads, unsigned nwin, std::uint64_t p0, unsigned ratio, unsigned reps) {
-    const PrefillWindows pw(1, rows, heads, nwin, p0, ratio, true);
+    PrefillWindows pw(1, rows, heads, nwin, p0, ratio, true);
     hipEvent_t e0, e1;
     check(hipEventCreate(&e0)); check(hipEventCreate(&e1));
     std::vector<float> t[3];
@@ -1081,6 +1087,28 @@ void prefill_bench(unsigned rows, unsigned heads, unsigned nwin, std::uint64_t p
     }
     g::set_attention_lean(-1);
     for (auto& v : t) std::sort(v.begin(), v.end());
+    // lean 2 with AttentionView::max_visible (the grid's live chunks) at the default heads-per-wave rule and at Hpw 4 always
+    float tl[2] = {0.0F, 0.0F};
+    {
+        pw.live = true;
+        for (const unsigned mb : {0U, 1U}) {
+            g::set_attention_min_blocks(mb);
+            std::vector<float> tv;
+            for (unsigned k = 0; k <= reps; ++k) {
+                check(hipEventRecord(e0));
+                for (unsigned w = 0; w < pw.nwin; ++w) g::enqueue_attention(pw.view(w), pw.st[w % PrefillWindows::kLanes]);
+                for (auto s : pw.st) { hipEvent_t d; check(hipEventCreateWithFlags(&d, hipEventDisableTiming)); check(hipEventRecord(d, s)); check(hipStreamWaitEvent(nullptr, d, 0)); check(hipEventDestroy(d)); }
+                check(hipEventRecord(e1));
+                check(hipEventSynchronize(e1));
+                float ms; check(hipEventElapsedTime(&ms, e0, e1));
+                if (k > 0) tv.push_back(ms * 1e3F * 8.0F / static_cast<float>(nwin * rows));
+            }
+            std::sort(tv.begin(), tv.end());
+            tl[mb] = tv[tv.size() / 2];
+        }
+        g::set_attention_min_blocks(0U);
+        pw.live = false;
+    }
     float tb[2] = {0.0F, 0.0F};   // reference only: the approximate BF16 hi/lo prefill attention (other bits), variants 1 and 2
     if (heads % 16U == 0U && ratio != 0U) {
         for (const int variant : {1, 2}) {
@@ -1102,6 +1130,7 @@ void prefill_bench(unsigned rows, unsigned heads, unsigned nwin, std::uint64_t p
                 " lean 2 %.1f (%+.1f %%) [min %.1f / %.1f / %.1f]\n", nwin, rows, heads, static_cast<unsigned long long>(p0), ratio, t[0][reps / 2],
                 t[1][reps / 2], 100.0 * (t[1][reps / 2] / t[0][reps / 2] - 1.0), t[2][reps / 2], 100.0 * (t[2][reps / 2] / t[0][reps / 2] - 1.0),
                 t[0][0], t[1][0], t[2][0]);
+    std::printf("    lean 2 + max_visible: %.1f us (default heads-per-wave rule), %.1f us (Hpw 4 always) per 8 rows\n", tl[0], tl[1]);
     if (tb[0] > 0.0F) std::printf("    (approximate BF16 hi/lo prefill attention, not this identity: variant 1 %.1f us, variant 2 %.1f us per 8 rows; the combine kernel launch included)\n", tb[0], tb[1]);
     check(hipEventDestroy(e0)); check(hipEventDestroy(e1));
 }

@@ -885,6 +885,17 @@
   },
   {
     "engine": "deepseek",
+    "name": "Attention lean chunk kernel",
+    "flag_or_env": "STRIX_DS41_ATTN_LEAN",
+    "default": "2",
+    "exact": "Bitwise: the same operations in the same order; HIP attention device tests against the host reference, and levels 1 and 2 byte-equal to level 0 on prefill-shaped calls (four streams, every code and scale byte, early positions, window-only and compressed layers, A8 combine, every tile choice).",
+    "gain": "GAIN_PLACEHOLDER",
+    "preconditions": "Packed-attention HIP chunk kernels.",
+    "off_switch": "STRIX_DS41_ATTN_LEAN=0",
+    "doc_anchor": "docs/optimizations.md#ds-attn-lean"
+  },
+  {
+    "engine": "deepseek",
     "name": "Server warm-up and DSpark calibration",
     "flag_or_env": "STRIX_DS41_SERVE_WARM; STRIX_DS41_DSPARK_CALIB",
     "default": "auto",
