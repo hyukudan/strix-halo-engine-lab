@@ -663,6 +663,14 @@ include the events. A failed token keeps its partial timeline in the failure
 receipt (`expert_cache.decode_timeline_at_failure`), whose longest interval names
 the layer and phase where the device stalled.
 
+**Eager module loading.** The service sets `CUDA_MODULE_LOADING=EAGER` at the top
+of `main`, before any CUDA call, unless the variable is set explicitly (the harness
+also defaults it and records it in the receipt): with lazy loading, the first launch
+of a decode kernel while the cache's wait kernel spins can stall until the wait
+deadline. Health records the value and the driver's actual loading mode, and the
+tierstream decode service refuses a lazy driver. `--print-effective-config` reports
+the value (it runs no CUDA call).
+
 **Slot census.** Health `tier_plan.slot_census_at_open`, every `--decode-profile`
 step record (`slot_census`) and every failure receipt
 (`expert_cache.slot_census_at_failure`) carry the library slot table's homes per

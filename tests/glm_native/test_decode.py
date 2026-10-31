@@ -923,6 +923,20 @@ class WindowTests(unittest.TestCase):
                                   '--row-tile', '8192', '--check-inputs'])
             self.assertEqual(dw.worker_options(c)[dw.worker_options(c).index('--row-tile') + 1], '8192')
 
+    def test_service_sets_eager_module_loading(self):
+        """The service sets CUDA_MODULE_LOADING=EAGER at the top of main, before any CUDA call
+        (--print-effective-config exits before the first one and reports it); an explicit value is kept."""
+        exe = BUILD / 'glm_native_service.exe'
+        if not exe.is_file():
+            self.skipTest('service not built')
+        env = {k: v for k, v in os.environ.items() if k != 'CUDA_MODULE_LOADING'}
+        out = subprocess.run([str(exe), '--print-effective-config'], capture_output=True, text=True, env=env, timeout=60)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertEqual(json.loads(out.stdout.strip().splitlines()[-1])['cuda_module_loading'], 'EAGER (set by the service)')
+        env['CUDA_MODULE_LOADING'] = 'LAZY'
+        out = subprocess.run([str(exe), '--print-effective-config'], capture_output=True, text=True, env=env, timeout=60)
+        self.assertEqual(json.loads(out.stdout.strip().splitlines()[-1])['cuda_module_loading'], 'LAZY (environment)')
+
     def test_profile_switch_through_harness(self):
         """--profile / --allow-pending reach the service and the worker; --print-effective-config runs the service's
         print mode (no model read, no CUDA call) and relays its JSON; the summary records the ready event's profile."""

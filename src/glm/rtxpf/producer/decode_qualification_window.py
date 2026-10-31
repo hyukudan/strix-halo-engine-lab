@@ -1003,7 +1003,8 @@ def finalize(a, out, results, plan_gaps, peaks, startup_s, starts, segments, don
         if summary.get('verdict') == 'EXACT':
             summary['verdict'] = 'INCOMPLETE'  # a failed run is never EXACT (exit 4)
     print(json.dumps(dict(summary, identity=IDENTITY, output=str(out), results=results, memory=memory, startup_s=startup_s,
-                          starts=starts, expected_wall_seconds=expected, qualification='DRAFT; decode self-consistency only'),
+                          starts=starts, expected_wall_seconds=expected, qualification='DRAFT; decode self-consistency only',
+                          cuda_module_loading=os.environ.get('CUDA_MODULE_LOADING', '')),
                      default=str))
     return 0 if summary.get('verdict') == 'EXACT' else (4 if summary.get('verdict') == 'INCOMPLETE' else 3)
 
@@ -1183,4 +1184,6 @@ def arguments(argv=None):
 
 
 if __name__ == '__main__':
+    # eager CUDA module loading for the service (it also sets it itself); recorded in the receipt
+    os.environ.setdefault('CUDA_MODULE_LOADING', 'EAGER')
     raise SystemExit(run(arguments()))

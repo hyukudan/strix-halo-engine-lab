@@ -9,6 +9,7 @@
 #include "profile.hpp"
 #include "strix/serve/json.hpp"
 #include <atomic>
+#include <cuda.h>
 #include <condition_variable>
 #include <iostream>
 #include <mutex>
@@ -168,6 +169,13 @@ Json failed_receipt(p::Runtime& runtime,const std::string& error,const std::stri
 void response(w::Socket fd,int code,const std::string& body){std::string text="HTTP/1.1 "+std::to_string(code)+" Result\r\nContent-Type: application/json\r\nContent-Length: "+std::to_string(body.size())+"\r\nConnection: close\r\n\r\n"+body;w::io(fd,std::as_writable_bytes(std::span(text)),true);}
 
 int main(int argc,char** argv){try{
+    // Lazy module loading + a kernel spinning on a device flag (tierstream's wait kernel) can
+    // stall the first launch of another kernel until the wait deadline (as the DS replica and
+    // tierstream's own preload guard against): CUDA modules load eagerly, set here before any
+    // CUDA call, unless CUDA_MODULE_LOADING is set explicitly (the tierstream decode service
+    // then still refuses a lazy driver below).
+    std::string module_loading;{const char* v=std::getenv("CUDA_MODULE_LOADING");
+        if(v&&*v)module_loading=std::string(v)+" (environment)";else{_putenv_s("CUDA_MODULE_LOADING","EAGER");module_loading="EAGER (set by the service)";}}
     std::string cache,model,manifest_hash,key_file,export_dir,prompt_file,identity="glm-pf-rtx-native-v1",bind="127.0.0.1";unsigned port=8097,capacity=8192,tile=0,host_floor_gib=8,max_device_layers=43,max_pinned_layers=43;bool require_file_tier=false,allow=false,graphs=true,self_check=false,legacy_index=false,serial_stage=false,enable_generate=false,decode_commands=false,decode_profile=false;std::vector<std::string> check_prompts;unsigned decode_tokens=0;p::DecodeOptions dopts;bool plan_budget=false,print_effective=false;double device_total_gib=-1,device_free_gib=-1;
     for(int i=1;i<argc;++i){std::string a=argv[i];if(a=="--require-file-tier")require_file_tier=true;else if(a=="--legacy-fp32-index")legacy_index=true;else if(a=="--serial-stage")serial_stage=true;else if(a=="--self-check-schedule")self_check=true;else if(a=="--allow-gpu")allow=true;else if(a=="--no-graphs")graphs=false;else if(a=="--enable-generate")enable_generate=true;else if(a=="--decode-commands")decode_commands=true;else if(a=="--reference-compare")dopts.reference_compare=true;else if(a=="--plan-budget")plan_budget=true;else if(a=="--allow-pending"){}else if(a=="--print-effective-config")print_effective=true;else if(a=="--decode-profile")decode_profile=true;else {w::require(i+1<argc,"missing option argument");std::string value=argv[++i];if(a=="--profile"){}else if(a=="--cache")cache=value;else if(a=="--model")model=value;else if(a=="--cache-manifest-sha256")manifest_hash=value;else if(a=="--key-file")key_file=value;else if(a=="--export-state")export_dir=value;else if(a=="--prompt"){prompt_file=value;check_prompts.push_back(value);}else if(a=="--identity")identity=value;else if(a=="--decode"){auto n=std::stoul(value);w::require(n>=1&&n<=131072,"decode token count");decode_tokens=unsigned(n);}else if(a=="--expert-tier")dopts.expert_tier=value;else if(a=="--unit-file")dopts.unit_file=value;else if(a=="--vram-total-gib")dopts.vram_total_gib=std::stod(value);else if(a=="--ram-total-gib")dopts.ram_total_gib=std::stod(value);else if(a=="--device-total-gib")device_total_gib=std::stod(value);else if(a=="--device-free-gib")device_free_gib=std::stod(value);else if(a=="--tier-vram-gib")dopts.tier_vram_gib=std::stod(value);else if(a=="--tier-ram-gib")dopts.tier_ram_gib=std::stod(value);
         else if(a=="--tier-spare-slots"){dopts.tier_spare_slots=unsigned(std::stoul(value));dopts.tier_spare_permille=0;}else if(a=="--tier-spare-percent"){const double v=std::stod(value);if(!(v>=0&&v<=50))throw std::runtime_error("--tier-spare-percent must be in [0, 50]");dopts.tier_spare_permille=unsigned(v*10+0.5);}else if(a=="--expert-residency")dopts.expert_residency=value;else if(a=="--expert-routes")dopts.expert_routes=value;else if(a=="--routes-out")dopts.routes_out=value;
@@ -216,7 +224,7 @@ int main(int argc,char** argv){try{
         if(lever=="dsa_index_mma")return "fp32";
         return {};};
     const std::string profile_json=prof.json(effective);
-    if(print_effective){std::cout<<profile_json<<"\n"<<std::flush;return 0;}
+    if(print_effective){auto pj=strix::serve::parse_json(profile_json);pj.set("cuda_module_loading",module_loading);std::cout<<pj.dump()<<"\n"<<std::flush;return 0;}
     for(const auto& line:prof.notices())std::cerr<<line<<"\n";
     if(plan_budget){
         // Dry plan (no --allow-gpu, no CUDA calls): sizes from shard headers, host
@@ -244,7 +252,10 @@ int main(int argc,char** argv){try{
     std::unique_ptr<p::VerifiedManifest> manifest_file;
     if(!cache.empty())manifest_file=std::make_unique<p::VerifiedManifest>(std::filesystem::path(cache)/"manifest.json",manifest_hash);
     auto startup_begin=std::chrono::steady_clock::now();
-    p::Runtime runtime(model.empty()?cache:model,capacity,tile,!model.empty(),graphs,host_floor_gib,legacy_index,serial_stage,manifest_file.get(),max_device_layers,max_pinned_layers,require_file_tier,decode,dopts);if(decode_profile)runtime.set_decode_profile(true);auto health_value=strix::serve::parse_json(runtime.health());health_value.set("decode_profile",decode_profile);
+    p::Runtime runtime(model.empty()?cache:model,capacity,tile,!model.empty(),graphs,host_floor_gib,legacy_index,serial_stage,manifest_file.get(),max_device_layers,max_pinned_layers,require_file_tier,decode,dopts);if(decode_profile)runtime.set_decode_profile(true);auto health_value=strix::serve::parse_json(runtime.health());
+    {CUmoduleLoadingMode mode{};const bool eager=cuModuleGetLoadingMode(&mode)==CUDA_SUCCESS&&mode==CU_MODULE_EAGER_LOADING;
+     health_value.set("cuda_module_loading",module_loading+(eager?"; driver: eager":"; driver: lazy"));
+     w::require(eager||!decode||dopts.expert_tier!="tierstream","the tierstream decode service needs eager CUDA module loading (unset CUDA_MODULE_LOADING or set it to EAGER): a lazily loaded kernel launched while the cache's wait kernel spins can stall until the wait deadline");}health_value.set("decode_profile",decode_profile);
     health_value.set("startup_ms",std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-startup_begin).count());const auto health=health_value.dump();
     std::wstring module(32768,L'\0');auto module_length=GetModuleFileNameW(nullptr,module.data(),DWORD(module.size()));w::require(module_length>0&&module_length<module.size(),"executable path");module.resize(module_length);
     const auto executable_hash=strix::model_content_identity_hex(strix::sha256_file_content(std::filesystem::path(module)));
