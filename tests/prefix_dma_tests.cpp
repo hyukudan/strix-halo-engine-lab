@@ -278,6 +278,13 @@ void prefix_dma_tests() {
         const auto signature=[&] {return prefix_effective_execution_signature("effective-cli",false,false);};
         in.effective_execution=signature();
         const auto original=prefix_state_cache_identity(in);
+        for (const char* name : {"STRIX_QWEN_PROFILE_ALLOW_PENDING", "STRIX_QWEN_PROFILE_OWNED_moe_route_bf16"}) {
+            const char* old = std::getenv(name);
+            const std::optional<std::string> saved = old ? std::optional<std::string>{old} : std::nullopt;
+            ::setenv(name, "1", 1); in.effective_execution = signature();
+            require(prefix_state_cache_identity(in) == original, "profile metadata preserves prefix namespace");
+            if (saved) ::setenv(name, saved->c_str(), 1); else ::unsetenv(name);
+        }
         for(const char* name : {"STRIX_QSA_UNION_MERGE","STRIX_QSA_SCORE_ROWS64","STRIX_QSA_POOL_PACKED",
                 "STRIX_QSA_DECODE_POOL","STRIX_QSA_DECODE_SELECT","STRIX_QSA_DECODE_POOL_BF16","STRIX_QSA_DECODE_POOL_CHECK","STRIX_PREFILL_MOE_MERGE_VEC",
                 "STRIX_QPF2K_DEFAULTS","STRIX_BASELINE","STRIX_QPF2K_QSA_MASK","STRIX_QPF2K_MOE_ROUTE_BF16"}) {

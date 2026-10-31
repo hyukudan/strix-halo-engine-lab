@@ -1,5 +1,37 @@
 # Optimizations
 
+## Qwen product profiles
+
+`--profile default|fast|quality` selects the Qwen product policy for decode,
+prefill, MTP and HTTP serving. `default` preserves current production behavior
+without exporting profile switches. `fast` applies ready and explicitly provisional
+runnable levers in the [single profile table](../include/strix/qwen_profile_table.hpp).
+It currently applies BF16 MoE route storage by exporting
+`STRIX_QPF2K_MOE_ROUTE_BF16=1`, without `--allow-pending`. This bit-changing row
+changes logits and is selected ahead of its qualification receipt; qualification
+is in progress. Its receipt status is `provisional`, with qualification stamp
+`qualification in progress: moe_route_bf16`, and exactly one stderr line states
+that it is bit-changing and qualification is in progress. Attention budget,
+FP16 recurrent chunks and output head remain pending: builtin paths continue,
+with one notice per row and declared targets in `profile.pending`.
+`quality` runs default settings with one notice because no quality pack exists.
+
+Explicit environment variables and lever options override the profile, including
+explicit off. `--allow-pending` / `STRIX_QWEN_PROFILE_ALLOW_PENDING=1` applies only
+runnable genuinely pending rows for benchmarks and stamps `unqualified: <rows>`.
+When combined with provisional rows, this follows the qualification-in-progress
+stamp, separated by `; `. The three pending rows have no runnable implementation,
+so this flag currently leaves fast's resolution unchanged. The existing
+`--prefill-moe-route-bf16` contract is preserved. On YaRN, profile rows refused by
+rotary admission stay pending with their reason and are not exported or stamped
+as applied; selection alone cannot cause that refusal. Required assets remain
+mandatory, and explicit requests for unavailable code refuse. Selecting a profile
+does not establish qualification. All receipts, HTTP capabilities/stats and
+effective config report `profile`, `qualification`, `levers`, `pending` and
+`unqualified` inside the `profile` object. Apply profiles at startup and restart
+servers to change them.
+See the [command-line contract](getting-started/engine-reference.md#command-line).
+
 The fast path is the default in all five public engines. Use the plain recommended command and inspect its
 resolution before adding overrides. `ON` means enabled; `auto` means enabled when admission guards pass;
 `opt-in` requires an explicit selection. An unlisted isolated gain means unmeasured, not zero.

@@ -891,6 +891,26 @@ las copias de checkpoints siguen los límites de bloque existentes.
 
 <a id="deepseek-pair"></a>
 
+#### `--profile default|fast|quality` de Qwen
+
+Un solo interruptor selecciona un perfil de producto para Qwen (CLI, `--http-serve` y el ejecutor MTP):
+
+- `default`: el valor exacto predeterminado descrito arriba; no cambia nada.
+- `fast`: aplica por ahora el almacenamiento BF16 de las rutas MoE (`STRIX_QPF2K_MOE_ROUTE_BF16=1`) antes de su
+  recibo de cualificación, sin `--allow-pending`. Cambia bits y modifica los logits; la cualificación está en curso.
+  El recibo indica `qualification in progress: moe_route_bf16` y marca la fila como `provisional`; una línea de
+  stderr informa del cambio de bits y del estado de la cualificación. El presupuesto de selección de atención, la
+  recurrencia por fragmentos FP16 y la cabeza de salida FP16 siguen pendientes y mantienen sus rutas internas, con un
+  aviso cada una.
+- `quality`: no hay paquete de calidad para este modelo, así que ejecuta `default` y lo indica en el recibo.
+
+`--allow-pending` (o `STRIX_QWEN_PROFILE_ALLOW_PENDING=1`) ejecuta las opciones realmente pendientes cuyo código está
+en el build, solo para benchmarks, y las marca como `unqualified: <rows>`. Las tres filas pendientes no tienen todavía
+una implementación ejecutable, así que este indicador no cambia la resolución de fast. En YaRN, una fila rechazada
+por la admisión rotatoria queda pendiente con su motivo y no se marca como aplicada. Una variable de entorno u opción
+de CLI explícita siempre tiene prioridad sobre el perfil, incluido el apagado explícito. `--print-effective-config`
+muestra el perfil seleccionado y el estado de cada opción.
+
 ### Par DeepSeek
 
 Ejecute un rank en cada nodo con assets y entorno coincidentes; establezca `R` en 0 o 1 localmente:

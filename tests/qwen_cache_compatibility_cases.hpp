@@ -42,9 +42,23 @@ inline std::string without_prefix_reuse_policy(std::string text) {
     return text;
 }
 
-// The storage candidate adds scalar report fields. Exclude only those fields
-// from the frozen cache-policy comparison; candidate reporting has its own tests.
+// Profile metadata and the storage candidate add report fields. Exclude only
+// those fields from the frozen comparison; each report has separate tests.
 inline std::string without_moe_route_report(std::string text) {
+    if (const auto start = text.find("\"profile\":"); start != std::string::npos) {
+        auto end = start + 10U;
+        unsigned depth = 0;
+        bool quoted = false, escape = false;
+        for (; end < text.size(); ++end) {
+            const char c = text[end];
+            if (quoted) { if (escape) escape = false; else if (c == '\\') escape = true; else if (c == '"') quoted = false; continue; }
+            if (c == '"') quoted = true;
+            else if (c == '{') ++depth;
+            else if (c == '}' && --depth == 0) { ++end; break; }
+        }
+        if (end < text.size() && text[end] == ',') ++end;
+        text.erase(start, end - start);
+    }
     for(const char* key:{"prefill_moe_route_bf16","prefill_storage_identity","prefill_storage_identity_hash",
             "prefill_moe_route_bf16_reason","prefill_fast_components"}) {
         const auto needle=std::string("\"")+key+"\":";

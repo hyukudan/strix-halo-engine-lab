@@ -1099,6 +1099,8 @@ static int run_decode_entry(
     if (argc == 2 && std::string_view(argv[1]) == "--help") {
         std::cout << "Usage: strix-hip-decode-token MODEL.gguf TOKEN_ID ... [options]\n"
             "  --context N --generate N --eos-token ID --residency register|copy\n"
+            "  --profile default|fast|quality (default: current qualified settings)\n"
+            "  --allow-pending (benchmark runnable pending profile rows; unqualified)\n"
             "  --optimization-profile auto|manual (default auto, qualified checkpoint only)\n"
             "  --baseline / STRIX_BASELINE=1 (historical resolution, controlled defaults off)\n"
             "  --print-effective-config (deterministic host JSON; exits before HIP setup)\n"
@@ -1165,8 +1167,13 @@ static int run_decode_entry(
         parse_options(
             argc,
             argv, true);
+    // Resolve route admission before exporting policy, ahead of switch readers.
+    strix::decode_cli::admit_product_profile(options);
+    strix::qwen::profile::apply(options.product_profile);
+    for (const auto& notice : options.product_profile.notices()) std::cerr << notice << '\n';
     bundle_retry.selected=options.mtp.enabled && !options.mtp_bundle_path.empty();
 #if defined(STRIX_MTP_MODEL_QUALIFICATION_RUNNER)
+    strix::tests::set_mtp_product_profile(options.product_profile);
     options.mtp_cli_phase_retirement=false;
 #endif
     const auto startup_preflight = strix::emit_qwen_startup_diagnostics(
@@ -1180,6 +1187,10 @@ static int run_decode_entry(
     for (int i = 2; i < argc; ++i) {
         const std::string_view arg = argv[i];
         if (!arg.starts_with("--")) continue; // positional token IDs
+        if (strix::qwen::profile::policy_option(arg.substr(0, arg.find('=')))) {
+            if (arg == "--profile") ++i;
+            continue;
+        }
         if (arg == "--session-live-control" || arg == "--session-validate-only") continue;
         if (session_io_options.count(arg)) { ++i; continue; }
         options.session_effective_cli += std::to_string(arg.size()) + ":" + std::string(arg);
@@ -1433,6 +1444,7 @@ static int run_decode_entry(
         const auto equal = text.find('=');
         if (text.starts_with("STRIX_") && equal != std::string_view::npos) {
             const auto name = text.substr(0, equal);
+            if (strix::qwen::profile::metadata_environment(name)) continue;
             const bool injected = (name == "STRIX_QPF2K_MOE_DEFAULTED" && strix::qpf2k::pre_injected_moe_marker) ||
                 std::any_of(strix::qpf2k::defaults.begin(), strix::qpf2k::defaults.end(), [&](const auto& item) {
                     return name == item.name && (strix::qpf2k::pre_injected & strix::qpf2k::bit(item.item));
@@ -1595,6 +1607,7 @@ static int run_decode_entry(
           "  \"ple_cpu_helpers_actual\":null,\n"
         : std::string{};
     std::string optimization_profile_receipt =
+        "  \"profile\":" + options.product_profile.json() + ",\n" +
         "  \"optimization_profile_requested\": \"" + optimization_profile.requested + "\",\n" +
         "  \"optimization_profile_selected\": \"" + optimization_profile.selected + "\",\n" +
         "  \"optimization_profile_base_selected\": \"" + base_optimization_profile + "\",\n" +

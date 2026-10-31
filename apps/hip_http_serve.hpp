@@ -68,9 +68,9 @@ class MtpBridgeEngine final : public serve::GenerationEngine {
 public:
     MtpBridgeEngine(const MtpServeRunner& run, std::uint64_t context_tokens,
         HttpConstraintRequests& constraints, bool enabled, bool thinking_enabled, bool selection_mtp_available,
-        serve::BackendProbeSlot* probe = nullptr)
+        serve::BackendProbeSlot* probe = nullptr, strix::qwen::profile::Resolution profile = {})
         : run_(run), context_(context_tokens), constraints_(constraints), constraints_enabled_(enabled),
-          thinking_enabled_(thinking_enabled), selection_mtp_available_(selection_mtp_available), probe_(probe) {}
+          thinking_enabled_(thinking_enabled), selection_mtp_available_(selection_mtp_available), probe_(probe), profile_(std::move(profile)) {}
     serve::GenerationStats generate(serve::GenerationJob& job) override {
         if (failed_.load()) throw std::runtime_error("the engine failed during an earlier request; restart the server");
         if (job.prompt.empty() || job.prompt.size() >= context_) throw std::invalid_argument("prompt is empty or fills the context");
@@ -91,6 +91,7 @@ public:
             result = run_(request);
         } catch (const SessionApiError& e) {
             serve::GenerationStats stats;
+            stats.engine_extra.emplace_back("profile", profile_.json());
             stats.prompt_tokens=job.prompt.size(); stats.finish="admission_refused";
             stats.error_status=e.status; stats.error_code=e.code;
             throw serve::GenerationRequestError(std::move(stats),e.what());
@@ -99,6 +100,7 @@ public:
             if (probe_) probe_->fail();
             if (!request.constraint) throw;
             serve::GenerationStats stats;
+            stats.engine_extra.emplace_back("profile", profile_.json());
             stats.prompt_tokens = job.prompt.size();
             stats.finish = "execution_failure";
             stats.constraint = request.constraint->verdict(stats.finish);
@@ -107,6 +109,7 @@ public:
             catch (...) { throw serve::GenerationRequestError(std::move(stats), "engine failure"); }
         }
         serve::GenerationStats stats;
+        stats.engine_extra.emplace_back("profile", profile_.json());
         stats.prompt_tokens = job.prompt.size();
         stats.cached_tokens = result.restored_tokens;
         stats.generated_tokens = result.generated_tokens;
@@ -148,6 +151,7 @@ private:
     bool selection_mtp_available_;
     std::atomic<bool> failed_{false};
     serve::BackendProbeSlot* probe_;
+    strix::qwen::profile::Resolution profile_;
 };
 
 inline std::atomic<bool>& http_serve_stop_requested() {
@@ -230,6 +234,7 @@ inline MtpDecodeServe make_http_serve(const Options& options, std::string engine
         config.responses = options.http_responses;
         config.capabilities = options.http_capabilities;
         config.capabilities_extra = [modes=session_modes_json(options), policy=cache_activation_json(options), &options](serve::Json& out) {
+            out.set("profile", serve::parse_json(options.product_profile.json()));
             qwen_rotary_capabilities(out);
             out.set("cache_policy",policy);
             prefix_cache_capabilities(out,options);
@@ -277,7 +282,7 @@ inline MtpDecodeServe make_http_serve(const Options& options, std::string engine
             config.health_provider = [&] { return probe.snapshot(); };
         }
         MtpBridgeEngine engine(run, options.context_tokens, constraints, config.engine_constraints, config.engine_thinking_budget,
-            selection_mtp_available, probing ? &probe : nullptr);
+            selection_mtp_available, probing ? &probe : nullptr, options.product_profile);
         serve::ApiService api(config, tokenizer, queue, options.context_tokens, false);
         serve::HttpServerConfig http;
         http.bind_address = options.http_bind;
@@ -343,7 +348,8 @@ inline MtpDecodeBatchServe make_http_batch_serve(const Options& options, std::st
         prefix_batch_cert_capabilities(cert,options);
         cert.set("cache_policy",cache_activation_json(options));
         prefix_cache_capabilities(cert,options);
-        config.capabilities_extra = [modes=session_modes_json(options), cert=std::move(cert)](serve::Json& out) {
+        config.capabilities_extra = [modes=session_modes_json(options), cert=std::move(cert), profile=options.product_profile](serve::Json& out) {
+            out.set("profile", serve::parse_json(profile.json()));
             qwen_rotary_capabilities(out);
             moe_route_bf16_capabilities(out);
             out.set("session_numerical_modes",modes);
@@ -438,7 +444,7 @@ inline MtpDecodeBatchServe make_http_batch_serve(const Options& options, std::st
                 if (!runner.session_run || runner.active()) throw std::logic_error("named session requires an idle session runner");
                 if (batch_lock.owns_lock()) batch_lock.unlock();
                 // Named sessions run the fixed session protocol: no constrained decoding on that path.
-                MtpBridgeEngine engine(runner.session_run, options.context_tokens, constraints, false, false, false, probing ? &probe : nullptr);
+                MtpBridgeEngine engine(runner.session_run, options.context_tokens, constraints, false, false, false, probing ? &probe : nullptr, options.product_profile);
                 finish_http_session_job(queue, *taken, engine, [&] { release(taken); });
                 return;
             }
@@ -474,8 +480,9 @@ inline MtpDecodeBatchServe make_http_batch_serve(const Options& options, std::st
                 sampling = "sampling-v1";
             }
             const auto prompt_tokens = job.prompt.size();
-            request.on_finish = [&queue, &release, taken, prompt_tokens, sampling](const MtpServeResult& result) {
+            request.on_finish = [&queue, &release, taken, prompt_tokens, sampling, profile=options.product_profile](const MtpServeResult& result) {
                 serve::GenerationStats stats;
+                stats.engine_extra.emplace_back("profile", profile.json());
                 stats.prompt_tokens = prompt_tokens;
                 stats.cached_tokens = result.restored_tokens;
                 stats.generated_tokens = result.generated_tokens;
