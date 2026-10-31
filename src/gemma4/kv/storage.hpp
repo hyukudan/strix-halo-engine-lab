@@ -39,7 +39,8 @@ bool fused_attention(const float* q, LinearView q_norm, const std::uint64_t* pos
                      const KvRead* reads, std::uint32_t rows, std::uint32_t head_count, std::uint32_t dim,
                      std::uint32_t score_stride, bool global, float* out, std::uint32_t* failure, Queue queue,
                      bool parallel, bool bounded, bool intervals, float* scores = nullptr, float* maxima = nullptr,
-                     float* partials = nullptr, std::uint32_t* counters = nullptr, A8Rows quant = {});
+                     float* partials = nullptr, std::uint32_t* counters = nullptr, A8Rows quant = {},
+                     int kv_shared = -1);
 // fused_attention with kv_store folded in (STRIX_G4_ATTN_KV_STORE, default on):
 // only for passes in which every row is its transaction's only new position.
 // Returns false, enqueueing nothing, when the single-launch span or geometry is
@@ -51,6 +52,13 @@ bool fused_attention_store(const float* q, LinearView q_norm, const float* k, co
                            std::uint32_t* failure, Queue queue, bool parallel, bool bounded, bool intervals,
                            A8Rows quant = {});
 bool fused_attention_enabled();
+// STRIX_G4_ATTN_KV_SHARED: the long-span launches run every row and query head of
+// one key/value chunk back to back (1), or one block serves a key/value head's
+// query heads (2); by default one-row passes use 1 and larger passes 2.
+// 0 = chunk-fastest blocks per row and head. Same bytes in every mode.
+// kv_shared -1 follows the switch, 0..3 force a mode (tests).
+bool attention_kv_shared_enabled();
+int attention_kv_shared_mode();
 
 class DeviceStream {
   public:

@@ -607,6 +607,18 @@ Drafters sobre el Q4_K_M oficial (`default`, C1, ids de token idénticos a los o
 DFlash obtiene más tokens por paso en inglés, pero cada uno de sus pasos de draft cuesta unos 10 ms en esta máquina
 frente a ~1 ms del asistente MTP, así que su aceleración es menor (x1.12-1.41 frente a x1.47-1.89).
 
+Decode con contexto largo (`default`, una petición, Q4_K_M, tok/s con la profundidad de contexto indicada; la
+atención de las capas globales lee cada fragmento K/V una vez por pasada, idéntico byte a byte,
+`STRIX_G4_ATTN_KV_SHARED=0` restaura el kernel anterior):
+
+| Contexto | Antes | Ahora | llama.cpp `74a4fb00`, misma profundidad |
+|---|---:|---:|---:|
+| 8K | 33.9 | **38.7** | 49.4 |
+| 32K | 9.8 | **26.7** | 42.6 |
+| 64K | 5.7 | **18.4** | 36.2 |
+
+llama.cpp sigue por delante con contexto largo; la siguiente palanca reduce los bytes de la caché KV leídos por token.
+
 Prefill (tok/s; todos los perfiles usan prefill exacto):
 
 | Prompt | `default` | `fast` | `quality` | llama.cpp |

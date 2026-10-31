@@ -591,6 +591,17 @@ Drafters on the official Q4_K_M (`default`, C1, token ids identical to drafting 
 DFlash gets more tokens per step in English, but each of its draft steps costs about 10 ms on this machine against
 about 1 ms for the MTP assistant, so its speed-up is lower (x1.12-1.41 vs x1.47-1.89).
 
+Long-context decode (`default`, one request, Q4_K_M, tok/s at the given context depth; global-layer attention
+reads each K/V chunk once per pass, byte-identical, `STRIX_G4_ATTN_KV_SHARED=0` restores the previous kernel):
+
+| Context | Before | Now | llama.cpp `74a4fb00`, same depth |
+|---|---:|---:|---:|
+| 8K | 33.9 | **38.7** | 49.4 |
+| 32K | 9.8 | **26.7** | 42.6 |
+| 64K | 5.7 | **18.4** | 36.2 |
+
+llama.cpp is still ahead at long context; the next lever reduces the KV-cache bytes read per token.
+
 Prefill (tok/s; every profile uses exact prefill):
 
 | Prompt | `default` | `fast` | `quality` | llama.cpp |
