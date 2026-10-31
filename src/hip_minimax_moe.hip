@@ -230,6 +230,86 @@ __global__ __launch_bounds__(kNormThreads) void router_batch_kernel(
     }
 }
 
+// Prefill router, tiled (enqueue_router_tiled): CTA = kRtRows rows x kRtExperts experts, so the router weights are read
+// once per 32 rows (router_batch_kernel: once per 4 / 8 rows). Per (row, expert) lane L still runs
+// a = fmaf(y[j], w[e][j], a) over j = L, L + 32, ... ascending from 0.0F (kRtChunk % 32 == 0), then the same xor
+// butterfly, sigmoid and bias: the same bits. blockIdx.x = expert group (fastest), so the groups of one row tile run
+// together and share its y rows in cache. Scores go to scratch [rows][2][kExperts]; router_select_kernel runs the
+// selection of router_batch_kernel unchanged.
+constexpr unsigned kRtRows = 32, kRtExperts = 32, kRtChunk = 256, kRtPerWave = kRtExperts / kWaves;
+static_assert(kRtExperts % kWaves == 0 && kExperts % kRtExperts == 0 && kHidden % kRtChunk == 0 && kRtChunk % kRouterLanes == 0);
+
+__global__ __launch_bounds__(kNormThreads) void router_tiled_kernel(std::uint32_t rows, const float* y, const float* router_w,
+                                                                     const float* bias, float* scores) {
+    static_assert(kRouterLanes == 32);
+    __shared__ float ys[kRtRows][kRtChunk];
+    const unsigned t = threadIdx.x, lane = t & 31U, wave = t >> 5U;
+    const unsigned e0 = blockIdx.x * kRtExperts, first = blockIdx.y * kRtRows;
+    const unsigned valid = rows - first < kRtRows ? rows - first : kRtRows;
+    float a[kRtPerWave][kRtRows];
+#pragma unroll
+    for (unsigned q = 0; q < kRtPerWave; ++q)
+#pragma unroll
+        for (unsigned row = 0; row < kRtRows; ++row) a[q][row] = 0.0F;
+    for (unsigned c0 = 0; c0 < kHidden; c0 += kRtChunk) {
+        __syncthreads();
+        for (unsigned i = t; i < kRtRows * kRtChunk; i += kNormThreads) {
+            const unsigned row = i / kRtChunk, j = i % kRtChunk;
+            ys[row][j] = row < valid ? y[static_cast<std::size_t>(first + row) * kHidden + c0 + j] : 0.0F;
+        }
+        __syncthreads();
+#pragma unroll
+        for (unsigned q = 0; q < kRtPerWave; ++q) {
+            const float* w = router_w + static_cast<std::size_t>(e0 + wave + q * kWaves) * kHidden + c0;
+            for (unsigned j = lane; j < kRtChunk; j += kRouterLanes) {
+                const float wj = w[j];
+#pragma unroll
+                for (unsigned row = 0; row < kRtRows; ++row) a[q][row] = __builtin_fmaf(ys[row][j], wj, a[q][row]);
+            }
+        }
+    }
+#pragma unroll
+    for (unsigned q = 0; q < kRtPerWave; ++q) {
+        const unsigned e = e0 + wave + q * kWaves;
+#pragma unroll
+        for (unsigned row = 0; row < kRtRows; ++row) {
+            float x = a[q][row];
+            for (unsigned d = 16; d >= 1; d >>= 1U) x = x + __shfl_xor(x, static_cast<int>(d), 32);
+            if (lane == 0 && row < valid) {
+                const float sv = 1.0F / (1.0F + msa::exp_f(-x));
+                float* out = scores + static_cast<std::size_t>(first + row) * 2 * kExperts;
+                out[e] = sv;
+                out[kExperts + e] = sv + bias[e];
+            }
+        }
+    }
+}
+
+__global__ __launch_bounds__(256) void router_select_kernel(std::uint32_t rows, const float* scores, std::uint32_t* ids,
+                                                            float* weights) {
+    const unsigned r = blockIdx.x * 256U + threadIdx.x;
+    if (r >= rows) return;
+    const float* sc = scores + static_cast<std::size_t>(r) * 2 * kExperts;
+    const float* ch = sc + kExperts;
+    std::uint32_t best[kTopE];
+    for (unsigned k = 0; k < kTopE; ++k) {  // k-th best by (choice desc, id asc) among the not yet taken
+        std::uint32_t pick = kExperts;
+        for (std::uint32_t e = 0; e < kExperts; ++e) {
+            bool taken = false;
+            for (unsigned q = 0; q < k; ++q) taken |= best[q] == e;
+            if (taken) continue;
+            if (pick == kExperts || ch[e] > ch[pick]) pick = e;  // ascending scan: equal choice keeps the smaller id
+        }
+        best[k] = pick;
+    }
+    float sum = 0.0F;
+    for (unsigned k = 0; k < kTopE; ++k) sum = sum + sc[best[k]];
+    for (unsigned k = 0; k < kTopE; ++k) {
+        ids[r * kTopE + k] = best[k];
+        weights[r * kTopE + k] = (sc[best[k]] / (sum + kSumEps)) * kRouteScale;
+    }
+}
+
 }  // namespace
 
 void enqueue_post_exchange(const PostExchangeView& v, hipStream_t stream) {
@@ -263,6 +343,17 @@ void enqueue_router_batch(std::uint32_t rows, const float* y, const float* route
         hipLaunchKernelGGL(router_batch_kernel<8>, grid, dim3(kNormThreads), 0, stream, rows, y, router_w, bias, ids, weights);
     const hipError_t e = hipGetLastError();
     if (e != hipSuccess) throw std::runtime_error(std::string("minimax router batch: ") + hipGetErrorString(e));
+}
+
+void enqueue_router_tiled(std::uint32_t rows, const float* y, const float* router_w, const float* bias,
+                          std::uint32_t* ids, float* weights, float* scratch, hipStream_t stream) {
+    if (rows == 0) return;
+    if (scratch == nullptr) throw std::invalid_argument("minimax router tiled: scratch is required");
+    const dim3 grid(kExperts / kRtExperts, rows / kRtRows + (rows % kRtRows != 0));
+    hipLaunchKernelGGL(router_tiled_kernel, grid, dim3(kNormThreads), 0, stream, rows, y, router_w, bias, scratch);
+    hipLaunchKernelGGL(router_select_kernel, dim3((rows + 255) / 256), dim3(256), 0, stream, rows, scratch, ids, weights);
+    const hipError_t e = hipGetLastError();
+    if (e != hipSuccess) throw std::runtime_error(std::string("minimax router tiled: ") + hipGetErrorString(e));
 }
 
 }  // namespace strix::minimax::moe::hip

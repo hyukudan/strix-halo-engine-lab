@@ -2095,6 +2095,53 @@ struct Bench {
         test_prefill_mtfit(true);
     }
     void test_prefill_core8() { test_prefill_pipe(); }
+    // Token-major v4 gather (STRIX_MMX_PREFILL_GATHER_TOK) == per-pair gather: raw tile-major xt / at (padded rows
+    // included: both start from the 0xff-poisoned workspace), split partials and output bitwise, gufuse off and on.
+    void test_prefill_gather() {
+        struct Restore { ~Restore() { opt::set_prefill_gather_tok(-1); } } restore;
+        auto run = [&](Prefill& q, const std::string& name) {
+            for (int gufuse : {0, 1}) {
+                opt::set_prefill_gather_tok(0);
+                const PfDump off = run_dump(q, 3, -1, true, 0, gufuse);
+                opt::set_prefill_gather_tok(1);
+                const PfDump on = run_dump(q, 3, -1, true, 0, gufuse);
+                const bool part = off.part == on.part, xt = off.xt == on.xt, at = off.at == on.at, out = same_bits(off.out, on.out);
+                const std::string cell = "gather_tok " + name + " gufuse=" + std::to_string(gufuse);
+                check(part && xt && at && out, cell + " differs (part " + std::to_string(part) + " xt " + std::to_string(xt) +
+                      " at " + std::to_string(at) + " out " + std::to_string(out) + ")");
+                std::printf("%s: tiled xt %s, tiled at %s, partials %s, output %s\n", cell.c_str(), xt ? "bitwise" : "DIFF",
+                            at ? "bitwise" : "DIFF", part ? "bitwise" : "DIFF", out ? "bitwise" : "DIFF");
+                std::fflush(stdout);
+            }
+        };
+        for (unsigned T : {1U, 17U, 100U, 1024U, 4096U}) {
+            Prefill q = make_prefill_routes(T);
+            run(q, "T" + std::to_string(T));
+            free_prefill(q);
+        }
+        Prefill c = make_prefill_crafted();
+        run(c, "crafted640");
+        free_prefill(c);
+    }
+    void bench_prefill_gather() {
+        for (unsigned T : {1024U, 4096U}) {
+            const std::string cell = "pfg T" + std::to_string(T);
+            if (!wanted(cell)) continue;
+            Prefill q = make_prefill_routes(T);
+            const int saved = o.iters;
+            o.iters = std::max(2, o.iters / 8);
+            // Whole calls, A = per-pair gather, B = token-major gather (production v4 otherwise).
+            aba(cell + " pair/tok", 0, [&](int) { opt::set_prefill_gather_tok(0); prefill_B(q); },
+                [&](int) { opt::set_prefill_gather_tok(1); prefill_B(q); });
+            o.iters = saved;
+            for (int tok : {0, 1, 0, 1}) {
+                opt::set_prefill_gather_tok(tok);
+                stage_split(q, cell + (tok ? " tok" : " pair"), 1);  // production v4 (mtfit default on)
+            }
+            opt::set_prefill_gather_tok(-1);
+            free_prefill(q);
+        }
+    }
     void test_prefill_mtfit(bool core8 = false) {
         // Five small weight sets cover all supported bit widths in the same grouped launches.
         std::vector<void*> owned;
@@ -2260,6 +2307,127 @@ struct Bench {
         }
     }
     // Dense prefill sites through strix_gemm (the engine's prefill identity) at T rows: us and TFLOPS.
+    // Dense prefill linears on the v4 core (opt::enqueue_prefill_dense) == the library strix_gemm, bitwise, for the
+    // attention sites alone and k+v in one call; outputs start poisoned.
+    std::vector<std::vector<DenseSite*>> dense_v4_groups() {
+        std::vector<std::vector<DenseSite*>> g;
+        DenseSite *q = nullptr, *k = nullptr, *v = nullptr, *ov = nullptr;
+        for (auto& ds : dense) {
+            if (ds.name == "q") q = &ds;
+            if (ds.name == "k") k = &ds;
+            if (ds.name == "v") v = &ds;
+            if (ds.name == "o") ov = &ds;
+        }
+        if (k != nullptr && v != nullptr) g.push_back({k, v});
+        if (q != nullptr) g.push_back({q});
+        if (ov != nullptr) g.push_back({ov});
+        if (q != nullptr && k != nullptr && v != nullptr) g.push_back({q, k, v});
+        return g;
+    }
+    void run_dense_v4(const std::vector<DenseSite*>& g, const float* in, std::vector<float*>& outs, unsigned T, void* ws, std::size_t ws_bytes, std::size_t copy) {
+        std::vector<opt::PrefillDenseJob> jobs;
+        for (std::size_t i = 0; i < g.size(); ++i) jobs.push_back({g[i]->copies[copy % g[i]->copies.size()].dev, outs[i]});
+        opt::enqueue_prefill_dense(jobs.data(), static_cast<unsigned>(jobs.size()), in, T, ws, ws_bytes, nullptr);
+    }
+    std::size_t dense_v4_bytes(const std::vector<DenseSite*>& g, unsigned T) {
+        std::vector<opt::PrefillDenseJob> jobs;
+        for (auto* ds : g) jobs.push_back({ds->copies[0].dev, reinterpret_cast<float*>(1)});
+        return opt::prefill_dense_workspace_bytes(jobs.data(), static_cast<unsigned>(jobs.size()), T);
+    }
+    void test_prefill_dense() {
+        {  // unsupported bit widths are refused (the engine then keeps the library call)
+            opt::Exl3 w = dense[0].copies[0].dev;
+            w.bits = 7;
+            bool refused = false;
+            try {
+                const opt::PrefillDenseJob j{w, reinterpret_cast<float*>(1)};
+                (void)opt::prefill_dense_workspace_bytes(&j, 1, 1024);
+            } catch (const std::invalid_argument&) {
+                refused = true;
+            }
+            check(refused && !opt::prefill_dense_supported(w), "dense_v4 refuses 7-bit weights");
+            std::printf("dense_v4 7-bit descriptor: %s\n", refused ? "refused" : "ACCEPTED");
+        }
+        for (unsigned T : {9U, 17U, 100U, 129U, 1024U, 4096U}) {
+            for (const auto& g : dense_v4_groups()) {
+                const unsigned K = g[0]->input;
+                std::vector<float> hin(std::size_t{T} * K);
+                std::normal_distribution<float> nd(0.0F, 1.0F);
+                for (auto& x : hin) x = nd(rng);
+                float* in = dupload(hin);
+                std::vector<float*> libOut, v4Out;
+                for (auto* ds : g) {
+                    libOut.push_back(dalloc<float>(std::size_t{T} * ds->output));
+                    v4Out.push_back(dalloc<float>(std::size_t{T} * ds->output));
+                    hip_ok(hipMemset(libOut.back(), 0xff, std::size_t{T} * ds->output * 4), "poison");
+                    hip_ok(hipMemset(v4Out.back(), 0xff, std::size_t{T} * ds->output * 4), "poison");
+                }
+                const std::size_t bytes = dense_v4_bytes(g, T);
+                void* ws = nullptr;
+                hip_ok(hipMalloc(&ws, bytes), "dense ws");
+                hip_ok(hipMemset(ws, 0xff, bytes), "poison ws");
+                for (std::size_t i = 0; i < g.size(); ++i) lib.gemm_wmma(g[i]->copies[0].lib, g[i]->input, g[i]->output, in, libOut[i], T);
+                run_dense_v4(g, in, v4Out, T, ws, bytes, 0);
+                hip_ok(hipDeviceSynchronize(), "dense sync");
+                bool all = true;
+                std::string detail;
+                for (std::size_t i = 0; i < g.size(); ++i) {
+                    const auto a = d2h(libOut[i], std::size_t{T} * g[i]->output), b = d2h(v4Out[i], std::size_t{T} * g[i]->output);
+                    const bool same = same_bits(a, b);
+                    std::size_t diff = 0;
+                    for (std::size_t j = 0; j < a.size(); ++j)
+                        if (std::memcmp(&a[j], &b[j], 4) != 0) ++diff;
+                    all = all && same;
+                    detail += " " + g[i]->name + (same ? " bitwise" : " DIFF " + std::to_string(diff) + "/" + std::to_string(a.size()));
+                }
+                const std::string cell = "dense_v4 " + group_name(g) + " T" + std::to_string(T);
+                check(all, cell + " differs:" + detail);
+                std::printf("%s:%s (splits", cell.c_str(), detail.c_str());
+                for (auto* ds : g) std::printf(" %u", opt::gemm_splits(ds->input, ds->output, ds->copies[0].dev.bits, T));
+                std::printf(")\n");
+                std::fflush(stdout);
+                hip_ok(hipFree(ws), "free");
+                hip_ok(hipFree(in), "free");
+                for (auto* x : libOut) hip_ok(hipFree(x), "free");
+                for (auto* x : v4Out) hip_ok(hipFree(x), "free");
+            }
+        }
+    }
+    void bench_prefill_dense() {
+        for (unsigned T : {1024U, 4096U}) {
+            for (const auto& g : dense_v4_groups()) {
+                const std::string cell = "pfdv4 " + group_name(g) + " T" + std::to_string(T);
+                if (!wanted(cell)) continue;
+                const unsigned K = g[0]->input;
+                float* in = dalloc<float>(std::size_t{T} * K);
+                hip_ok(hipMemset(in, 0, std::size_t{T} * K * 4), "zero");
+                std::vector<float*> outs;
+                double fl = 0;
+                std::uint64_t wbytes = 0;
+                for (auto* ds : g) {
+                    outs.push_back(dalloc<float>(std::size_t{T} * ds->output));
+                    fl += 2.0 * T * ds->input * ds->output;
+                    wbytes += ds->copies[0].bytes;
+                }
+                const std::size_t bytes = dense_v4_bytes(g, T);
+                void* ws = nullptr;
+                hip_ok(hipMalloc(&ws, bytes), "dense ws");
+                // Rotating cold copies on both sides; A = library strix_gemm per site, B = one v4 call for the group.
+                aba(cell + " lib/v4", wbytes, [&](int i) {
+                        for (std::size_t si = 0; si < g.size(); ++si) {
+                            const Mat& m = g[si]->copies[static_cast<std::size_t>(i < 0 ? 0 : i) % g[si]->copies.size()];
+                            lib.gemm_wmma(m.lib, g[si]->input, g[si]->output, in, outs[si], T);
+                        }
+                    }, [&](int i) { run_dense_v4(g, in, outs, T, ws, bytes, static_cast<std::size_t>(i < 0 ? 0 : i)); });
+                const double us = time_us([&](int i) { run_dense_v4(g, in, outs, T, ws, bytes, static_cast<std::size_t>(i < 0 ? 0 : i)); }, o.iters);
+                std::printf("cell %-26s v4 %9.1f us  %.2f TFLOPS\n", cell.c_str(), us, fl / us / 1e6);
+                std::fflush(stdout);
+                hip_ok(hipFree(ws), "free");
+                hip_ok(hipFree(in), "free");
+                for (auto* x : outs) hip_ok(hipFree(x), "free");
+            }
+        }
+    }
     void bench_dense_prefill() {
         for (unsigned T : {1024U, 4096U}) {
             float* in = dalloc<float>(std::size_t{T} * H);
@@ -2822,6 +2990,8 @@ int main(int argc, char** argv) {
             if (!o.no_moe && o.tests == "test_prefill_pipe") test_section("test_prefill_pipe", [&] { b.test_prefill_pipe(); });
             if (!o.no_moe) test_section("test_prefill_gufuse", [&] { b.test_prefill_gufuse(); });
             if (!o.no_moe) test_section("test_prefill_table_ring", [&] { b.test_prefill_table_ring(); });
+            if (!o.no_moe) test_section("test_prefill_gather", [&] { b.test_prefill_gather(); });
+            test_section("test_prefill_dense", [&] { b.test_prefill_dense(); });
             if (g_fail == 0) std::printf("TESTS PASS\n");
             else std::printf("TESTS FAIL (%d failures)\n", g_fail);
             std::fflush(stdout);
@@ -2833,6 +3003,8 @@ int main(int argc, char** argv) {
             if (!o.no_moe) section("bench_prefill", [&] { b.bench_prefill(); });
             if (!o.no_moe) section("bench_prefill_gufuse", [&] { b.bench_prefill_gufuse(); });
             if (!o.no_moe) section("bench_prefill_v2", [&] { b.bench_prefill_v2(); });
+            if (!o.no_moe) section("bench_prefill_gather", [&] { b.bench_prefill_gather(); });
+            section("bench_prefill_dense", [&] { b.bench_prefill_dense(); });
             section("bench_dense_prefill", [&] { b.bench_dense_prefill(); });
             section("bench_dense", [&] { b.bench_dense(); });
             section("bench_ceiling", [&] { b.bench_ceiling(); });

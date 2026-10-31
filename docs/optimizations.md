@@ -1965,6 +1965,38 @@ Rework attention scheduling without changing the reference result.
 - **Measured gain:** Mode 5 (= mode 3 with packed two-head probability evaluation) vs mode 3, GPU, two Strix Halo nodes over 2x USB4 Gen3, PerfOpt kernel, one binary, rank --ab pfmsarework (A=3, B=5; A B A B A B A prefills) in two processes: 8K TTFT B - bracketing A mean -0.129 s, 1K -0.109 s (n=6 each, intervals include 0, not slower); producers -2.9 %, attention -1 % in the kernel bench. Mode 3 vs the original: 8K B/A 0.963 / 0.957 / 0.972
 - **Implementation / evidence:** [38-item resolver](../src/minimax/engine/mm_defaults.cpp), [rank gates](../apps/minimax_rank_main.cpp)
 
+<a id="mm-pf-gather-tok"></a>
+
+### Prefill MoE token-major gather
+
+**Engine:** `minimax`. **Control:** `STRIX_MMX_PREFILL_GATHER_TOK`. **Default:** 1.
+
+Read each token's input row once for all of its routed experts and the shared expert, instead of once per expert and matrix.
+
+- **Preconditions:** v4 prefill MoE core (the default).
+- **Automatic selection:** Resolver supplies 1 only when unset; explicit values win.
+- **Fallback notice:** None needed: every row count uses the same kernel; =0 restores the per-pair gather.
+- **Exactness evidence:** Exact: tile-major gate/up inputs, down inputs, split partials and outputs byte-identical to the per-pair gather (T 1 to 4096 rows and crafted row counts, single-split fusion off and on, real weights of two layers); prefill state, final rows and tokens identical on both ranks in every PAIR arm at 8K and 32K.
+- **Off switch:** STRIX_MMX_PREFILL_GATHER_TOK=0
+- **Measured gain:** Gather stage per 4096-row call 6.35 -> 4.14 ms (1024 rows: 1.48 -> 0.99 ms), real weights. Together with the q/k/v item below, two Strix Halo nodes over 2x USB4, fresh process per arm: 8K TTFT -2.3 to -4.3 %, 32K -4.3 %.
+- **Implementation / evidence:** [kernel](../src/minimax/moe/mmx_prefill.hip), [resolver](../src/minimax/engine/mm_defaults.cpp), [bench tests](../tests/hip_mmx_moe_bench.hip)
+
+<a id="mm-pf-dense-qkv"></a>
+
+### Prefill q/k/v projections on the v4 core
+
+**Engine:** `minimax`. **Control:** `STRIX_MM_PF_DENSE_QKV`. **Default:** 1.
+
+Run the attention q, k and v projections of a prefill piece as one call on the engine's v4 WMMA core, which decodes each weight tile once per 128 rows and transforms the input once for all three.
+
+- **Preconditions:** Prefill pieces of at least 1024 rows, EXL3 weights of 3, 4, 5, 6 or 8 bits (other widths and smaller pieces keep the library call).
+- **Automatic selection:** Resolver supplies 1 only when unset; explicit values win. The o projection stays on the library (slower at 1024 rows on the v4 core).
+- **Fallback notice:** None: unsupported shapes silently keep the library call.
+- **Exactness evidence:** Exact: q, k, v and o outputs byte-identical to the library GEMM for 9 to 4096 rows (split counts 1 to 32), real weights of two layers; prefill state, final rows and tokens identical on both ranks in every PAIR arm at 8K and 32K.
+- **Off switch:** STRIX_MM_PF_DENSE_QKV=0
+- **Measured gain:** q+k+v per piece 12.37 -> 7.78 ms at 4096 rows, 2.61 -> 1.96 ms at 1024 rows (k+v alone 5.47 -> 2.09 ms). Together with the token-major gather: 8K TTFT -2.3 to -4.3 %, 32K -4.3 %.
+- **Implementation / evidence:** [dense call](../src/minimax/moe/mmx_prefill.hip), [engine site](../src/minimax/engine/engine.hip), [resolver](../src/minimax/engine/mm_defaults.cpp), [bench tests](../tests/hip_mmx_moe_bench.hip)
+
 <a id="mm-moe-gu-interleave"></a>
 
 ### Decode MoE gate/up interleave

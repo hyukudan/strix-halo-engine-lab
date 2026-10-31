@@ -1303,6 +1303,28 @@
   },
   {
     "engine": "minimax",
+    "name": "Prefill MoE token-major gather",
+    "flag_or_env": "STRIX_MMX_PREFILL_GATHER_TOK",
+    "default": "1",
+    "exact": "Exact: tile-major gate/up inputs, down inputs, split partials and outputs byte-identical to the per-pair gather (T 1 to 4096 rows, crafted row counts, fusion off and on, real weights of two layers); prefill state, final rows and tokens identical on both ranks in every PAIR arm at 8K and 32K.",
+    "gain": "Gather stage per 4096-row call 6.35 -> 4.14 ms; with the q/k/v item: 8K TTFT -2.3 to -4.3 %, 32K -4.3 % (two Strix Halo nodes, fresh process per arm)",
+    "preconditions": "v4 prefill MoE core (the default).",
+    "off_switch": "STRIX_MMX_PREFILL_GATHER_TOK=0",
+    "doc_anchor": "docs/optimizations.md#mm-pf-gather-tok"
+  },
+  {
+    "engine": "minimax",
+    "name": "Prefill q/k/v projections on the v4 core",
+    "flag_or_env": "STRIX_MM_PF_DENSE_QKV",
+    "default": "1",
+    "exact": "Exact: q, k, v and o outputs byte-identical to the library GEMM for 9 to 4096 rows (split counts 1 to 32), real weights of two layers; prefill state, final rows and tokens identical on both ranks in every PAIR arm at 8K and 32K.",
+    "gain": "q+k+v per piece 12.37 -> 7.78 ms at 4096 rows, 2.61 -> 1.96 ms at 1024 rows; with the token-major gather: 8K TTFT -2.3 to -4.3 %, 32K -4.3 %",
+    "preconditions": "Prefill pieces of at least 1024 rows; EXL3 weights of 3, 4, 5, 6 or 8 bits (otherwise the library call).",
+    "off_switch": "STRIX_MM_PF_DENSE_QKV=0",
+    "doc_anchor": "docs/optimizations.md#mm-pf-dense-qkv"
+  },
+  {
+    "engine": "minimax",
     "name": "Decode MoE gate/up interleave",
     "flag_or_env": "STRIX_MMX_MOE_GU_INTERLEAVE",
     "default": "1",

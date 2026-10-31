@@ -32,6 +32,12 @@
 {"prefill-core", 'a', "matrix+fixed splits+per-row WMMA chain", "mm_defaults.cpp pf_core_v4; every split partial bitwise gate", ""},
 // src/minimax/moe/mmx_prefill.hip:710
 {"prefill-pipe", 'a', "matrix+fixed splits+WMMA chain", "mm_defaults.cpp pf_moe_pipe bitwise gate; source core8 comments; nondefault combinations need same-partial gate", ""},
+// src/minimax/moe/mmx_prefill.hip: gather_transform_token_kernel
+{"prefill-gather-tok", 'a', "per-(pair, matrix) input transform statements; tile-major pair layout", "hip-mmx-moe-bench test_prefill_gather: raw tiled xt/at, partials and output bitwise (T 1..4096, crafted, gufuse 0/1); mm_defaults.cpp pf_gather_tok", ""},
+// src/minimax/moe/mmx_prefill.hip: enqueue_prefill_dense; src/minimax/engine/engine.hip: dense_qkv
+{"prefill-dense-qkv", 'a', "EXL3 matrix+library gemm_splits+per-row WMMA chain+ordered split finish", "hip-mmx-moe-bench test_prefill_dense == strix_gemm bitwise (q/k/v/o, q+k+v, T 9..4096); bits 3/4/5/6/8 only, else the library call; mm_defaults.cpp pf_dense_qkv", ""},
+// src/minimax/engine/engine.hip: enqueue_post (STRIX_MM_PF_ROUTER_ROWS=32 -> enqueue_router_tiled)
+{"prefill-router-tiled", 'a', "router lane chain (j = lane mod 32 ascending) + xor butterfly + ordered top-4 scan", "hip-minimax-moe-tests router_batch_tests: tiled 32 vs fused/4/8 bytes for every kind and tail; opt-in only (default 8)", ""},
 // src/minimax/moe/mmx_prefill.hip:647
 {"prefill-fuse", 'a', "single-split WMMA+epilogue contract", "prefill gufuse intermediate/producer debug gate in hip-mmx-moe-bench; default OFF; combinations outside gate remain unqualified", ""},
 // src/minimax/moe/mmx_prefill.hip:416
