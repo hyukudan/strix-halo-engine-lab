@@ -174,6 +174,7 @@ int main(int argc,char** argv){try{
         else if(a=="--tier-policy"){w::require(value=="lru"||value=="scored"||value=="auto","--tier-policy must be lru, scored or auto");dopts.tier_policy=value;}else if(a=="--tier-predict"){w::require(value=="0"||value=="1","--tier-predict 0|1");dopts.tier_predict=value=="1";}
         else if(a=="--skip-empty-expert-groups"){w::require(value=="0"||value=="1","--skip-empty-expert-groups 0|1");dopts.skip_empty_expert_groups=value=="1";}
         else if(a=="--persistent-dense-fp16"){w::require(value=="0"||value=="1","--persistent-dense-fp16 0|1");dopts.persistent_dense_fp16=value=="1";}
+        else if(a=="--restore-decode-residency"){w::require(value=="0"||value=="1","--restore-decode-residency 0|1");dopts.restore_decode_residency=value=="1";}
         else if(a=="--tier-flush-ready"){w::require(value=="0"||value=="1","--tier-flush-ready 0|1");dopts.tier_flush_ready=value=="1";}
         else if(a=="--tier-host-spares")dopts.tier_host_spares=unsigned(std::stoul(value));else if(a=="--tier-staging")dopts.tier_staging=unsigned(std::stoul(value));
         else if(a=="--disk-prefetch")dopts.disk_prefetch=value=="1";else if(a=="--unit-manifest-sha256")dopts.unit_manifest_sha256=value;else if(a=="--bind")bind=value;else if(a=="--port")port=unsigned(std::stoul(value));else if(a=="--capacity")capacity=unsigned(std::stoul(value));else if(a=="--row-tile")tile=value=="auto"?0:unsigned(std::stoul(value));else if(a=="--max-device-layers")max_device_layers=p::layer_limit(value);else if(a=="--max-pinned-layers")max_pinned_layers=p::layer_limit(value);else if(a=="--host-floor-gib"){auto n=std::stoul(value);w::require(n<=1024,"host floor range");host_floor_gib=unsigned(n);}else throw std::runtime_error("unknown service option");}}
@@ -195,6 +196,7 @@ int main(int argc,char** argv){try{
     // the environment (STRIX_GLM_RTX_SKIP_EMPTY_GROUPS / _PERSISTENT_DENSE_FP16) sets them explicitly.
     for(auto [lever,flag]:{std::pair<const char*,bool*>{"skip_empty_expert_groups",&dopts.skip_empty_expert_groups},{"persistent_dense_fp16",&dopts.persistent_dense_fp16}})
         if(auto* e=prof.find(lever);e&&e->status!=rp::Status::explicit_cli&&e->status!=rp::Status::pending)*flag=e->value!="off"&&e->value!="0";
+    if(auto* e=prof.find("restore_decode_residency");e&&e->status!=rp::Status::explicit_cli)dopts.restore_decode_residency=e->value!="off"&&e->value!="0";
     if(auto* e=prof.find("flush_ready");e&&e->status!=rp::Status::explicit_cli)dopts.tier_flush_ready=e->value!="off"&&e->value!="0";
     if(auto* e=prof.find("predicted_prefetch");e&&(e->status==rp::Status::pending||e->status==rp::Status::profile||e->status==rp::Status::unqualified))dopts.tier_predict=e->value=="1";
     if(auto* e=use("prefill_tile_large");e&&e->status==rp::Status::unqualified){auto* rt=prof.find("row_tile");if(!rt||rt->status!=rp::Status::explicit_cli)tile=std::min(8192u,capacity/32*32);}
@@ -206,6 +208,7 @@ int main(int argc,char** argv){try{
         if(lever=="row_tile")return tile?std::to_string(tile):std::string("auto (planner rule)");
         if(lever=="cuda_graphs")return graphs?"on":"off";
         if(lever=="flush_ready")return dopts.tier_flush_ready?"on":"off";
+        if(lever=="restore_decode_residency")return dopts.restore_decode_residency?"on":"off";
         if(lever=="skip_empty_expert_groups")return dopts.skip_empty_expert_groups?"1":"0";
         if(lever=="persistent_dense_fp16")return dopts.persistent_dense_fp16?"1 (dropped at startup if the plan cannot afford it)":"0";
         if(lever=="predicted_prefetch")return dopts.tier_predict?"1":"0";

@@ -35,6 +35,9 @@ struct DecodeOptions {
     // shared experts and dense FFNs keep a persistent FP16 copy decoded once at startup
     // (a named whole-device plan part; dropped when the plan cannot afford it).
     bool skip_empty_expert_groups=false,persistent_dense_fp16=false;
+    // After each prefill through the cache, the open decode placement is made resident again
+    // (placement only); without it the last prefilled layers own the arena (profile row).
+    bool restore_decode_residency=true;
     bool disk_prefetch=false;
     bool reference_compare=false;        // tierstream: also keep the uncached reference tier for same-window comparison
     std::string unit_manifest_sha256;    // pinned digest of PRIMARY.units.json (trusted manifest)

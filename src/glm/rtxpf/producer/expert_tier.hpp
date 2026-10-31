@@ -107,7 +107,7 @@ public:
     virtual Json stats()=0;
     // Best effort, for failure receipts: raw counters and the last token error (empty: none).
     virtual Json diagnostics(){return Json::object();}
-    // Whether the open step exports gated layer g (StepPlan below); a cache without steps exports every layer.
+    // Whether the open step exports gated layer g (StepPlan above); a cache without steps exports every layer.
     virtual bool step_exports(unsigned)const{return true;}
     // Between tokens: device-resident keys, most recent first (ss_dg_residency;
     // written at shutdown, it seeds the next open). Empty when unsupported.
@@ -351,6 +351,12 @@ public:
     // Prefill residency, only between accepted tokens. ANY unsuccessful call,
     // a capacity refusal included, retires the worker irreversibly: later
     // requests report the original error (the request it served is discarded).
+    // As make_resident, but SS_E_CAPACITY returns false WITHOUT retiring (nothing changed;
+    // the residency restore after a prefill stops there); any other failure retires.
+    bool try_make_resident(unsigned g,const std::int32_t* ids,unsigned n){
+        between_tokens("residency restore only between accepted tokens");
+        if(!api_.supports_make_resident())return false;
+        try{return api_.make_resident(g,ids,n);}catch(const std::exception& e){retire(e.what());throw;}catch(...){retire("make_resident: non-standard exception");throw;}}
     void make_resident(unsigned g,const std::int32_t* ids,unsigned n){
         between_tokens("prefill residency only between accepted tokens");
         if(!api_.supports_make_resident()){const std::string m="this tierstream library has no make_resident (reader/resident requested)";retire(m);throw std::runtime_error(m);}
@@ -382,6 +388,16 @@ public:
 // cache does none of these (descriptors are zeroed, then bound per layer).
 struct PrefillInit {bool rings=true,admit_layers=true,startup_descriptors=true;};
 inline PrefillInit prefill_init(bool via_cache){return via_cache?PrefillInit{false,false,false}:PrefillInit{};}
+// The decode placement planned at open (the tier array's residents, per gated layer, in
+// ascending unit order): restored after every prefill through the cache, whose whole-layer
+// make_resident sets otherwise stay in the persistent slots (ordinary residents once
+// released) and leave the decode residency to the last prefilled layers. Restore = one held
+// make_resident set per layer in order (each set protects the previous ones; the planned
+// residents + the spare target fit the persistent slots by the plan), then every set released.
+inline std::vector<std::vector<std::int32_t>> planned_residents(const std::vector<std::uint8_t>& tiers,std::uint8_t resident_tier,unsigned gated,unsigned units){
+    std::vector<std::vector<std::int32_t>> p(gated);
+    for(std::size_t k=0;k<tiers.size()&&k<std::size_t(gated)*units;++k)if(tiers[k]==resident_tier)p[k/units].push_back(std::int32_t(k%units));
+    return p;}
 struct PrefillResidency {
     static constexpr unsigned units=288;
     std::vector<std::int32_t> ids;

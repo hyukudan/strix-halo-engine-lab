@@ -234,6 +234,17 @@ void slot_census_tests(){
           "census: misses only for exported layers");
     std::vector<LayerCensus> full(43,LayerCensus{14,0,274});check(census_json(full,{},persistent).find("persistent_free")->as_int()==0,"census: a full arena has no free slot");
 }
+// restore_decode_residency: the open placement per gated layer from the tier array (resident
+// keys, ascending units), sized like the plan (residents + spares = persistent slots).
+void planned_residents_tests(){
+    TierBudget b;b.resident=557;b.pinned=2495;b.disk=43ULL*288-557-2495;b.slots=587;
+    const auto order=round_robin_order();const auto tiers=tier_assignment(b,43ULL*288,order);
+    const auto p=planned_residents(tiers,0,43,288);std::uint64_t n=0;bool ascending=true,resident=true;
+    for(unsigned g=0;g<43;++g){n+=p[g].size();for(std::size_t i=0;i<p[g].size();++i){ascending=ascending&&(i==0||p[g][i-1]<p[g][i]);resident=resident&&tiers[std::size_t(g)*288+std::size_t(p[g][i])]==0;}}
+    check(n==557&&ascending&&resident,"planned residents: every resident key once, per layer ascending");
+    check(p[0].size()==13&&p[40].size()==13&&p[41].size()==12&&p[42].size()==12,"planned residents: the round-robin open placement (13 per layer, 12 for 41/42)");
+    check(planned_residents(std::vector<std::uint8_t>(43*288,1),0,43,288)[5].empty(),"planned residents: none without device residents");
+}
 void tierstream_parser_tests(const ExpertCatalog& c,const Json& d){
 #ifdef GLM_TIERSTREAM_PARSER
     std::uint64_t layers=0,units=0,max_unit=0;auto error=tierstream_desc_check(d.dump(),&layers,&units,&max_unit);
@@ -624,7 +635,7 @@ void profile_tests(){
     auto run=[&](std::vector<std::string> args,std::vector<std::pair<std::string,std::string>> env={}){rp::Inputs in;in.args=std::move(args);in.env=lookup(std::move(env));return rp::resolve(rp::App::decode_service,in);};
     const auto def=run({});
     check(def.name==rp::Name::standard&&def.qualification()=="qualified","no --profile = default, qualified");
-    for(const char* l:{"expert_tier","placement","eviction_policy","spare_share","row_tile","cuda_graphs","flush_ready"}){
+    for(const char* l:{"expert_tier","placement","eviction_policy","spare_share","row_tile","cuda_graphs","restore_decode_residency","flush_ready"}){
         auto* e=def.find(l);check(e&&e->status==rp::Status::profile&&e->lever->kind==rp::Kind::exact,(std::string("default: exact lever on: ")+l).c_str());}
     check(def.find("expert_tier")->value=="tierstream"&&def.find("eviction_policy")->value=="auto"&&def.find("spare_share")->value=="5"&&def.find("row_tile")->value=="auto",
           "default values = today's service defaults");
@@ -655,6 +666,9 @@ void profile_tests(){
         check(allowed.find(l)->status==rp::Status::unqualified&&allowed.find(l)->value=="1",(std::string("--allow-pending runs ")+l).c_str());}}
     {const auto c=run({"--skip-empty-expert-groups","1"});check(c.find("skip_empty_expert_groups")->status==rp::Status::explicit_cli,"--skip-empty-expert-groups explicit");
      const auto e=run({},{{"STRIX_GLM_RTX_PERSISTENT_DENSE_FP16","1"}});check(e.find("persistent_dense_fp16")->status==rp::Status::explicit_env&&e.find("persistent_dense_fp16")->value=="1","STRIX_GLM_RTX_PERSISTENT_DENSE_FP16=1 explicit");}
+    // restore_decode_residency: placement only, on in every profile; CLI / environment override
+    check(def.find("restore_decode_residency")->value=="on"&&fast.find("restore_decode_residency")->value=="on"&&def.find("restore_decode_residency")->status==rp::Status::profile,"restore_decode_residency on");
+    {const auto off=run({},{{"STRIX_GLM_RTX_RESTORE_RESIDENCY","0"}});check(off.find("restore_decode_residency")->status==rp::Status::explicit_env&&off.find("restore_decode_residency")->value=="off","STRIX_GLM_RTX_RESTORE_RESIDENCY=0");}
     // flush_ready: on in every profile; --tier-flush-ready (CLI) beats STRIX_GLM_RTX_FLUSH_READY (env)
     check(def.find("flush_ready")->value=="on"&&fast.find("flush_ready")->value=="on"&&quality.find("flush_ready")->value=="on","flush_ready on in all profiles");
     {const auto env_off=run({},{{"STRIX_GLM_RTX_FLUSH_READY","0"}});auto* e=env_off.find("flush_ready");
@@ -957,6 +971,6 @@ int main(int argc,char** argv){try{
 #ifdef GLM_TIERSTREAM_LIBRARY
     tier_budget_tests();
 #endif
-    tier_mapping_tests();prefill_cache_tests();step_plan_tests();decode_timeline_tests();c1_schedule_tests();slot_census_tests();host_commit_tests();placement_tests();profile_tests();unit_file_tests(argv[1]);binding_tests(argv[1]);encoding_tests(argv[1]);lifetime_tests(argv[1]);receipt_tests(argc>2?std::filesystem::path(argv[2]):std::filesystem::path());request_tests();
+    tier_mapping_tests();prefill_cache_tests();step_plan_tests();decode_timeline_tests();c1_schedule_tests();slot_census_tests();planned_residents_tests();host_commit_tests();placement_tests();profile_tests();unit_file_tests(argv[1]);binding_tests(argv[1]);encoding_tests(argv[1]);lifetime_tests(argv[1]);receipt_tests(argc>2?std::filesystem::path(argv[2]):std::filesystem::path());request_tests();
     std::cout<<"PASS "<<checks<<" decode host checks: session/frontier, state bytes, KDA open-block replay model, DSA pools, argmax, expert catalog/units, cross-shard reads, guarded slots, generate requests\n";return 0;
 }catch(const std::exception& e){std::cerr<<e.what()<<"\n";return 1;}}

@@ -31,6 +31,10 @@ constexpr Lever kTable[] = {
      .source = "the planner rule: the largest tile <= 8192 whose growth over 2048 costs <= 5% of the expert arena"},
     {.name = "cuda_graphs", .options = {{{"--no-graphs", "off"}}}, .value = {"on", "on", "on"}, .builtin = "on", .ready = all,
      .runnable = all, .kind = Kind::exact, .apps = service, .source = "prefill CUDA graph templates (full tile + exact tail)"},
+    {.name = "restore_decode_residency", .env = "STRIX_GLM_RTX_RESTORE_RESIDENCY", .options = {{{"--restore-decode-residency", "*"}}},
+     .value = {"on", "on", "on"}, .builtin = "on", .ready = all, .runnable = all, .kind = Kind::exact, .apps = service,
+     .source = "placement only: after every prefill through the cache the open decode placement is made resident again (held "
+               "make_resident sets, then released); without it the last prefilled layers own the arena and decode misses everywhere"},
     {.name = "flush_ready", .env = "STRIX_GLM_RTX_FLUSH_READY", .options = {{{"--tier-flush-ready", "*"}}},
      .value = {"on", "on", "on"}, .builtin = "on", .ready = all, .runnable = all, .kind = Kind::exact, .apps = service,
      .source = "tierstream dg_flush_ready as the DS tier site: the demand stream is flushed after each ready signal so WDDM "

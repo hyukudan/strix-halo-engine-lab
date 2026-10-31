@@ -339,9 +339,14 @@ struct Runtime::Impl {
             const std::uint64_t hard=std::min<std::uint64_t>(total0,99860000000ULL);
             auto tp=plan_tile(manifest,cap,requested_rows,dopts,used0,host_budget(physical0,commit0,floor_gib),process_host_bytes(),!prefill_via_cache,hard);
             // persistent_dense_fp16 is dropped (and recorded) when the plan cannot afford its copies.
-            if(!tp.refused.empty()&&dopts.persistent_dense_fp16){auto d2=dopts;d2.persistent_dense_fp16=false;
+            // It is also dropped when its copies would push expert units to the file tier that the
+            // plan without them keeps in device or pinned memory (decode misses would then read files).
+            if(dopts.persistent_dense_fp16&&(!tp.refused.empty()||tp.plan.tier.disk>0)){auto d2=dopts;d2.persistent_dense_fp16=false;
                 auto tp2=plan_tile(manifest,cap,requested_rows,d2,used0,host_budget(physical0,commit0,floor_gib),process_host_bytes(),!prefill_via_cache,hard);
-                if(tp2.refused.empty()){persist_refused=true;persist_note="off: the whole-device plan cannot afford the persistent FP16 copies ("+tp.refused+")";tp=std::move(tp2);}}
+                if(tp2.refused.empty()&&(!tp.refused.empty()||tp2.plan.tier.disk<tp.plan.tier.disk)){persist_refused=true;
+                    persist_note=!tp.refused.empty()?"off: the whole-device plan cannot afford the persistent FP16 copies ("+tp.refused+")"
+                        :"off: the persistent FP16 copies would move "+std::to_string(tp.plan.tier.disk-tp2.plan.tier.disk)+" expert units to the file tier";
+                    tp=std::move(tp2);}}
             tile=rows=tp.tile;budget_in=tp.in;const auto& planned=tp.plan;startup_budget=tp.json;
             need(valid_schedule(cap,rows),"capacity 4-aligned <=131072; tile 32-aligned <=min(capacity,32768)");
             startup_budget.set("mode",whole_device?"whole-device caps (--vram-total-gib/--ram-total-gib)":"device room (no whole-device cap)");
@@ -606,6 +611,8 @@ struct Runtime::Impl {
             auto binding=std::to_string(first)+":"+std::to_string(n)+":"+identity+":"+std::to_string(legacy_index)+session_key(P);if(graphs){auto& g=graph[45][chunk.bucket];g.launch(compute.s,binding,sequence);graph_binding_ms+=g.binding_ms;}else sequence();
         }
         if(prefill_via_cache)prefill_end(45);
+        // The decode placement again (the prefill's whole-layer sets displaced it); placement only.
+        residency_restore=Json::object();if(prefill_via_cache&&ts_tier&&ts_tier->restore)residency_restore=ts_tier->restore_residency(compute.s);
         ck(cudaEventRecord(ring[1].retired.e,compute.s));if(!in_session)export_state(45,P,sink);ck(cudaStreamSynchronize(compute.s));ck(cudaGetLastError());
         if(in_session){unsigned bad=0;ck(cudaMemcpy(&bad,flag.p,4,cudaMemcpyDeviceToHost));need(!bad,"nonfinite session prefill");}
         unsigned read_mask=(file_ring_bytes[0]?1u:0u)|(file_ring_bytes[1]?2u:0u);
@@ -641,6 +648,7 @@ struct Runtime::Impl {
                 return j;}catch(...){return Json::object();}}
     } timeline;
     Json failed_timeline; // the last failed decode token's partial timeline (--decode-profile)
+    Json residency_restore; // the last prefill's restore of the decode placement
     Json failed_slots;    // the slot census after the last failed decode token (always; best effort)
     void failed_census()noexcept{try{if(ts_tier&&tier.get()==ts_tier)failed_slots=ts_tier->census(compute.s);}catch(...){cudaGetLastError();}}
     bool decode_mode=false;SessionFrontier sess;std::unique_ptr<ExpertCatalog> catalog;std::unique_ptr<UnitBinding> unit_binding;std::unique_ptr<ExpertTier> tier;
@@ -840,6 +848,7 @@ struct Runtime::Impl {
         auto& ub=owned.binding();ub.bound->verify_serving(*ub.lock); // the bound name still resolves to the authenticated object after the open
         const auto binding_text=ub.bound->describe(),bound_path=ub.bound->path.string();
         {auto t=std::make_unique<TierstreamTier>(*this,std::move(owned));ts_tier=t.get();tier=std::move(t);}product_tier=tier.get();
+        ts_tier->planned=planned_residents(cfg.tiers,std::uint8_t(0),routed_gated,routed_experts);ts_tier->restore=dopt.restore_decode_residency;
         if(prefill_via_cache)need(PrefillResidency::refusal(b).empty(),PrefillResidency::refusal(b).c_str());
         {std::uint64_t lo=~0ULL,hi=0;for(unsigned g=0;g<routed_gated;++g){std::uint64_t n=0;for(unsigned u=0;u<routed_experts;++u)n+=cfg.tiers[g*routed_experts+u]==0;lo=std::min(lo,n);hi=std::max(hi,n);}
             placement.set("resident_per_layer_min",lo);placement.set("resident_per_layer_max",hi);placement.set("policy",dopt.tier_policy);}
@@ -847,7 +856,9 @@ struct Runtime::Impl {
         if(!dopt.routes_out.empty()){ts_tier->enable_routes();routes_file.open(dopt.routes_out,std::ios::binary|std::ios::app);need(routes_file.is_open(),("open --routes-out "+dopt.routes_out).c_str());}
         tier_plan=Json::object();tier_plan.set("placement",placement);tier_plan.set("skip_empty_expert_groups",dopt.skip_empty_expert_groups?"on: routed MoE launches only the expert groups holding routed rows (device compaction)":"off");tier_plan.set("persistent_dense_fp16",dopt.persistent_dense_fp16?"on: shared experts and dense FFNs decoded once at startup":persist_note.empty()?std::string("off"):persist_note);tier_plan.set("flush_ready",dopt.tier_flush_ready?"on: dg_flush_ready, the demand stream is flushed after each ready signal (WDDM submission)":"off");tier_plan.set("predicted_prefetch",dopt.tier_predict?"on: next layer's router on this layer's MoE input, ss_dg_enqueue_predict on a side stream (8 ids, layers 3..43 predict 4..44)":"off");tier_plan.set("routes_recording",dopt.routes_out.empty()?"off":dopt.routes_out);
         tier_plan.set("unit_file",dopt.unit_file);tier_plan.set("unit_file_sha256",unit_file_sha);tier_plan.set("unit_manifest_sha256",dopt.unit_manifest_sha256);
-        tier_plan.set("slot_census_at_open",ts_tier->census(compute.s)); // homes per gated layer as the cache opened
+        {auto c=ts_tier->census(compute.s);for(const auto& l:c.find("layers")->as_array())ts_tier->open_persistent.push_back(std::uint32_t(l.find("persistent")->as_int()));
+         tier_plan.set("slot_census_at_open",c);} // homes per gated layer as the cache opened
+        tier_plan.set("restore_decode_residency",dopt.restore_decode_residency?"on: the open placement is made resident again after every prefill through the cache":"off");
         tier_plan.set("unit_file_authenticated",unit_auth_how);tier_plan.set("unit_file_binding",binding_text);tier_plan.set("unit_file_bound_path",bound_path);tier_plan.set("unit_file_hash_ms",unit_hash_ms);tier_plan.set("reference_compare",reference_tier!=nullptr);tier_plan.set("unit_stride",stride);tier_plan.set("resident_units",b.resident);tier_plan.set("pinned_units",b.pinned);tier_plan.set("file_units",b.disk);
         tier_plan.set("arena_slots",b.slots+b.ring);tier_plan.set("spare_slots",b.spare_slots);tier_plan.set("host_spares",b.host_spares);tier_plan.set("disk_staging",b.staging);tier_plan.set("three_tier",b.three_tier);
         tier_plan.set("vram_bytes",(b.slots+b.ring)*stride);tier_plan.set("ram_bytes",b.host_bytes(stride));tier_plan.set("device_budget_bytes",dev);tier_plan.set("host_budget_bytes",host);
@@ -1048,6 +1059,26 @@ struct Runtime::Impl {
             site.release_resident(gated_ordinal(l));prefill_active=false;}
         void fail_token(const std::string& why)override{site.fail(why);}
         std::string unusable()const override{return site.unusable();}
+        // restore_decode_residency: after a prefill through the cache, the open placement again
+        // (planned_residents). Placement only: outputs unchanged. Every held set is released
+        // before returning, also when a set is refused (the restore stops there, recorded).
+        std::vector<std::vector<std::int32_t>> planned;bool restore=false;std::vector<std::uint32_t> open_persistent;
+        Json restore_residency(cudaStream_t s){
+            auto j=Json::object();const auto begin=std::chrono::steady_clock::now();ck(cudaStreamSynchronize(s));
+            std::vector<unsigned> held;std::uint64_t units=0;std::string refused;
+            try{for(unsigned g=0;g<planned.size();++g){if(planned[g].empty())continue;
+                    if(!site.try_make_resident(g,planned[g].data(),unsigned(planned[g].size()))){refused="gated layer "+std::to_string(g)+" (SS_E_CAPACITY)";break;}
+                    held.push_back(g);units+=planned[g].size();}}
+            catch(...){for(auto g:held)try{site.release_resident(g);}catch(...){}throw;}
+            for(auto g:held)site.release_resident(g);
+            j.set("ms",std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-begin).count());j.set("layers",std::uint64_t(held.size()));j.set("units",units);
+            if(!refused.empty())j.set("refused",refused);
+            // Every layer holds at least its open count again. (make_resident fills the free slots
+            // first and evicts only what it needs, so up to the spare target of prefill units stay
+            // and free is 0 until the next boundary defers its victims, as after any prefill.)
+            auto c=census(s);bool restored=!open_persistent.empty();const auto& ls=c.find("layers")->as_array();
+            for(std::size_t g=0;g<ls.size()&&g<open_persistent.size();++g)restored=restored&&std::uint32_t(ls[g].find("persistent")->as_int())>=open_persistent[g];
+            j.set("persistent_at_least_open",restored);j.set("persistent_used",c.find("persistent_used")->as_int());j.set("persistent_free",c.find("persistent_free")->as_int());return j;}
     };
     void session_failed(){sess.fail();cudaStreamSynchronize(compute.s);cudaStreamSynchronize(decode.s);cudaStreamSynchronize(h2d.s);}
     Json begin_session(std::span<const U32> input){
