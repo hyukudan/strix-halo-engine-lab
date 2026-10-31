@@ -435,10 +435,15 @@ void test_profile() {
         auto fast_args = plain_args;
         fast_args.insert(fast_args.end(), {"--profile", "fast"});
         const auto f = w.run(app, fast_args);
-        check(f.args == base.args && f.set_env == base.set_env, "fast: pending rows are never applied");
+        auto fast_env = base.set_env;
+        fast_env.emplace_back("STRIX_DS41_FAST_MOE", "1");
+        check(f.args == base.args && std::is_permutation(f.set_env.begin(), f.set_env.end(), fast_env.begin(), fast_env.end()),
+              "fast: applies moe_relaxed only; the pending attention row is never applied");
+        check(f.profile->find("moe_relaxed")->status == pr::Status::set && f.profile->find("moe_relaxed")->value == "1",
+              "fast: moe_relaxed set");
         std::size_t pending = 0;
         for (const auto& e : f.profile->entries) pending += e.status == pr::Status::pending;
-        check(pending == pd::profile_table.size() && f.notices.size() == base.notices.size() + pending, "fast: one notice per pending row");
+        check(pending == pd::profile_table.size() - 1U && f.notices.size() == base.notices.size() + pending, "fast: one notice per pending row");
         check(f.profile->qualification() == "qualified", "fast: still qualified");
 
         auto q_args = plain_args;
