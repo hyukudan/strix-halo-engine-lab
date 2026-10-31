@@ -150,6 +150,8 @@ void set_attention_window_fold(int mode);
 // environment.
 void set_attention_lean(int mode);
 [[nodiscard]] int attention_lean();
+void set_attention_split_combine(int mode);
+[[nodiscard]] bool attention_split_combine();
 
 // Segment launches (several requests of a batch step per launch, STRIX_DS41_BATCH_SEGMENTS): one view per request
 // segment, each exactly the call above (its checks, its grid, every block's work), at most kMaxSegments per launch.
