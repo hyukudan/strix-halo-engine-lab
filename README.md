@@ -515,14 +515,32 @@ One Strix Halo node (gfx1151, 128 GB), official Q4_K_M GGUF for `default` and `f
 256-token English chat decode, greedy. C4 and C8 are aggregate tok/s across concurrent requests. Each llama.cpp
 value comes from the same measuring session as the row it is compared with.
 
-| Profile | C1 | C1 + MTP drafter | C4 | C8 |
+| Profile | C1 with the [MTP drafter](https://huggingface.co/hyukudan/Nemotron-3.5-Bolt-E4B-MTP-Drafter) (shipped) | C1, drafter off | C4 | C8 |
 |---|---:|---:|---:|---:|
-| `default` (exact, `g4-v1`) | 55.9 | 85.1 | 169.3 | 237.9 |
-| `fast` (`g4-a8-v1`, qualified) | 53.9 | 92.2 | 205.1 | 337.5 |
-| `quality` (EXL3, `g4-exl3-v3`) | 44.4 | 72.1 | 153.0 | 258.7 |
-| llama.cpp `74a4fb00`, same Q4_K_M | 55.4 | — | 193.3 | 281.9 |
+| `default` (exact, `g4-v1`) | **85.1** | 55.9 | 169.3 | 237.9 |
+| `fast` (`g4-a8-v1`, qualified) | **92.2** | 53.9 | 205.1 | 337.5 |
+| `quality` ([EXL3 M4 pack](https://huggingface.co/hyukudan/Nemotron-3.5-Bolt-E4B-EXL3), `g4-exl3-v3`) | **72.1** | 44.4 | 153.0 | 258.7 |
+| llama.cpp `74a4fb00`, same Q4_K_M | — | 55.4 | 193.3 | 281.9 |
 
 With the drafter, token ids equal drafting off (verified for English, Spanish, Japanese and code at C1, and at C4).
+
+**MTP drafter** - [hyukudan/Nemotron-3.5-Bolt-E4B-MTP-Drafter](https://huggingface.co/hyukudan/Nemotron-3.5-Bolt-E4B-MTP-Drafter). A small assistant model (Google's
+Gemma-4-E4B-it MTP assistant, 78.8M parameters) proposes the next few tokens and the main model verifies them, so the
+output is identical to decoding without it; only the speed changes. We fine-tuned it on about 6.3M tokens that
+Nemotron 3.5 Bolt E4B generated from 17,865 prompts in eight languages plus code, tool calls and reasoning, so that
+more drafted tokens are accepted. In the release run it accepted 56.6 % (English), 60.2 % (Spanish), 45.0 %
+(Japanese) and 74.5 % (code) of the drafted tokens and raised C1 decode from 52.2 to 85.1 tok/s in English (`default`,
+drafter off and on measured in the same session, x1.63). Download it into `MODEL_DIR/drafter-mtp/`; the engine uses it
+automatically.
+
+**EXL3 M4 pack (`quality` profile)** - [hyukudan/Nemotron-3.5-Bolt-E4B-EXL3](https://huggingface.co/hyukudan/Nemotron-3.5-Bolt-E4B-EXL3). An EXL3 (trellis-coded,
+scaled-Hessian) quantization of the BF16 model: MLP at 4 bits, attention q/o at 5, k/v and the output head at 6,
+embedding and per-layer tables kept in BF16 - 4.65 bits per weight across the quantized linears, a 9.7 GB download
+(2.5 GB of quantized weights) that reads 2.70 GB of weights per token (about 14 % less than Q4_K_M). On a held-out
+40-document, 8-language set its output is closer to the original BF16 model than the standard Q4_K_M: top-1 agreement
+92.94 % vs 87.0 %, mean KL 0.0367 vs 0.141. Pick it (`--profile quality --exl3-arm DIR`) when you want output closer
+to BF16; stay on `default` or `fast` with Q4_K_M for the highest speed. `quality` decodes at 72.1 tok/s with the
+drafter (44.4 without, token ids unchanged); its prefill and decode are still being optimised.
 
 Prefill (tok/s; every profile uses exact prefill):
 
@@ -864,8 +882,15 @@ python src/gemma4/ref/make_rope_tables.py rotary-tables --positions 65536 --work
 ```
 
 `--profile fast` selects int8 activations; `--profile quality` needs `--exl3-arm DIR`. An MTP drafter package in
-`MODEL_DIR/drafter-mtp/` is used automatically (`--draft off` disables it). The drafter package and the EXL3 packs
-are not published yet; without them, `default` and `fast` run plain decode and `quality` refuses to start. See the
+`MODEL_DIR/drafter-mtp/` is used automatically (`--draft off` disables it). Download the published packs:
+
+```sh
+hf download hyukudan/Nemotron-3.5-Bolt-E4B-MTP-Drafter --local-dir MODEL_DIR/drafter-mtp
+hf download hyukudan/Nemotron-3.5-Bolt-E4B-EXL3 --local-dir EXL3_DIR
+./build/strix-gemma4-serve MODEL_DIR --rope-tables rotary-tables --tokenizer MODEL_DIR/tokenizer.json --profile quality --exl3-arm EXL3_DIR
+```
+
+Without the drafter folder, decode runs exactly as without a drafter. See the
 [model guide](docs/models/nemotron-3.5-bolt-e4b/README.md).
 
 ### Qwen long context
