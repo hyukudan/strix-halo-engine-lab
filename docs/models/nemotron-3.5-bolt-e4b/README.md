@@ -29,9 +29,10 @@ output does not depend on load. `STRIX_G4_EXL3_IDENTITY=v1|v2|v3` forces it.
 - Rotary tables, generated once offline (see `src/gemma4/ref/README.md`):
   `python src/gemma4/ref/make_rope_tables.py rotary-tables --positions 65536 --workers 6`
 - Drafter: an MTP assistant package in `<model dir>/drafter-mtp/` (config, weights, LICENSE, NOTICE, LINEAGE,
-  MANIFEST) is found automatically. `--draft-mtp DIR` points elsewhere; `--draft off` or `STRIX_G4_DRAFT=0`
+  MANIFEST) is found automatically; the published drafter is [hyukudan/Nemotron-3.5-Bolt-E4B-MTP-Drafter](https://huggingface.co/hyukudan/Nemotron-3.5-Bolt-E4B-MTP-Drafter). `--draft-mtp DIR` points elsewhere; `--draft off` or `STRIX_G4_DRAFT=0`
   disables drafting. Without the folder, decode runs exactly as without a drafter.
-- EXL3 packs (`quality`): one directory per pack arm, loaded with `--exl3-arm DIR` next to the BF16 model.
+- EXL3 packs (`quality`): one directory per pack arm, loaded with `--exl3-arm DIR` next to the BF16 model; the
+  published pack is [hyukudan/Nemotron-3.5-Bolt-E4B-EXL3](https://huggingface.co/hyukudan/Nemotron-3.5-Bolt-E4B-EXL3) (M4).
 
 ## Serving
 

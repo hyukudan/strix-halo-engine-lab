@@ -525,15 +525,34 @@ Un nodo Strix Halo (gfx1151, 128 GB), GGUF Q4_K_M oficial para `default` y `fast
 decode de chat en inglés de 256 tokens, greedy. C4 y C8 son tok/s agregados entre peticiones concurrentes. Cada valor
 de llama.cpp procede de la misma sesión de medida que la fila con la que se compara.
 
-| Perfil | C1 | C1 + drafter MTP | C4 | C8 |
+| Perfil | C1 con el [drafter MTP](https://huggingface.co/hyukudan/Nemotron-3.5-Bolt-E4B-MTP-Drafter) (configuración publicada) | C1, sin drafter | C4 | C8 |
 |---|---:|---:|---:|---:|
-| `default` (exacto, `g4-v1`) | 55.9 | 85.1 | 169.3 | 237.9 |
-| `fast` (`g4-a8-v1`, cualificado) | 53.9 | 92.2 | 205.1 | 337.5 |
-| `quality` (EXL3, `g4-exl3-v3`) | 44.4 | 72.1 | 153.0 | 258.7 |
-| llama.cpp `74a4fb00`, mismo Q4_K_M | 55.4 | — | 193.3 | 281.9 |
+| `default` (exacto, `g4-v1`) | **85.1** | 55.9 | 169.3 | 237.9 |
+| `fast` (`g4-a8-v1`, cualificado) | **92.2** | 53.9 | 205.1 | 337.5 |
+| `quality` ([paquete EXL3 M4](https://huggingface.co/hyukudan/Nemotron-3.5-Bolt-E4B-EXL3), `g4-exl3-v3`) | **72.1** | 44.4 | 153.0 | 258.7 |
+| llama.cpp `74a4fb00`, mismo Q4_K_M | — | 55.4 | 193.3 | 281.9 |
 
 Con el drafter, los ids de los tokens son iguales a los obtenidos sin draft (verificado en inglés, español, japonés y
 código en C1, y en C4).
+
+**Drafter MTP** - [hyukudan/Nemotron-3.5-Bolt-E4B-MTP-Drafter](https://huggingface.co/hyukudan/Nemotron-3.5-Bolt-E4B-MTP-Drafter). Un modelo asistente pequeño (el asistente MTP
+de Gemma-4-E4B-it de Google, 78.8M parámetros) propone los siguientes tokens y el modelo principal los verifica, así
+que la salida es idéntica a la del decode sin él; solo cambia la velocidad. Lo ajustamos (fine-tuning) con unos 6.3M
+tokens generados por Nemotron 3.5 Bolt E4B a partir de 17,865 prompts en ocho idiomas, más código, llamadas a
+herramientas y razonamiento, para que se acepten más tokens propuestos. En la ejecución de la versión publicada aceptó
+el 56.6 % (inglés), el 60.2 % (español), el 45.0 % (japonés) y el 74.5 % (código) de los tokens propuestos y elevó el
+decode en C1 de 52.2 a 85.1 tok/s en inglés (`default`, con y sin drafter medidos en la misma sesión, x1.63).
+Descárguelo en `MODEL_DIR/drafter-mtp/`; el motor lo usa automáticamente.
+
+**Paquete EXL3 M4 (perfil `quality`)** - [hyukudan/Nemotron-3.5-Bolt-E4B-EXL3](https://huggingface.co/hyukudan/Nemotron-3.5-Bolt-E4B-EXL3). Una cuantización EXL3
+(codificada con trellis, Hessiana escalada) del modelo BF16: MLP a 4 bits, atención q/o a 5, k/v y la cabeza de salida
+a 6, embedding y tablas por capa en BF16; 4.65 bits por peso en las capas lineales cuantizadas, una descarga de 9.7 GB
+(2.5 GB de pesos cuantizados) que lee 2.70 GB de pesos por token (alrededor de un 14 % menos que Q4_K_M). En un
+conjunto reservado de 40 documentos en 8 idiomas, su salida está más cerca del modelo BF16 original que la del Q4_K_M
+estándar: coincidencia top-1 del 92.94 % frente al 87.0 % y KL media de 0.0367 frente a 0.141. Elíjalo
+(`--profile quality --exl3-arm DIR`) cuando quiera una salida más cercana a BF16; quédese en `default` o `fast` con
+Q4_K_M para obtener la máxima velocidad. `quality` decodifica a 72.1 tok/s con el drafter (44.4 sin él, mismos ids de
+token); su prefill y su decode se siguen optimizando.
 
 Prefill (tok/s; todos los perfiles usan prefill exacto):
 
@@ -900,9 +919,17 @@ python src/gemma4/ref/make_rope_tables.py rotary-tables --positions 65536 --work
 ```
 
 `--profile fast` selecciona activaciones int8; `--profile quality` requiere `--exl3-arm DIR`. Un paquete de drafter
-MTP en `MODEL_DIR/drafter-mtp/` se usa automáticamente (`--draft off` lo desactiva). El paquete del drafter y los
-paquetes EXL3 aún no están publicados; sin ellos, `default` y `fast` ejecutan decode simple y `quality` no arranca.
-Véase la [guía del modelo](docs/models/nemotron-3.5-bolt-e4b/README.md).
+MTP en `MODEL_DIR/drafter-mtp/` se usa automáticamente (`--draft off` lo desactiva). Descargue los paquetes
+publicados:
+
+```sh
+hf download hyukudan/Nemotron-3.5-Bolt-E4B-MTP-Drafter --local-dir MODEL_DIR/drafter-mtp
+hf download hyukudan/Nemotron-3.5-Bolt-E4B-EXL3 --local-dir EXL3_DIR
+./build/strix-gemma4-serve MODEL_DIR --rope-tables rotary-tables --tokenizer MODEL_DIR/tokenizer.json --profile quality --exl3-arm EXL3_DIR
+```
+
+Sin la carpeta del drafter, el decode funciona exactamente igual que sin drafter. Véase la
+[guía del modelo](docs/models/nemotron-3.5-bolt-e4b/README.md).
 
 <a id="qwen-long-context"></a>
 
