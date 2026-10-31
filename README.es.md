@@ -213,6 +213,26 @@ Servidor: dos ejecuciones por brazo en ambos órdenes; una de las dos ejecucione
 de 3.8 s (causa en investigación), por lo que C8 usa la ejecución limpia. La compilación del par medida sustituye
 a la regresión anterior en el servicio con un solo cliente: sirve más rápido que `69c6bdab`.
 
+**Activados por defecto** (exactos, mismos logits e ids generados):
+kernel de atención por fragmentos «lean» (`STRIX_DS41_ATTN_LEAN=0` para desactivarlo), kernels MoE de prefill
+separados v2 (`STRIX_DS41_PREFILL_MOE_V2=0`) y lectura anticipada de Engram entre piezas de prefill del servidor
+(`STRIX_DS41_ENGRAM_LOOKAHEAD=0`). TTFT del servidor, un cliente, caché desactivada, prompts en inglés en frío,
+2 nodos:
+
+| Prompt | Antes (main #148) | Ahora | Cambio |
+|---|---:|---:|---:|
+| 8,399 tokens | 10.44 s | **9.70 s** | −7.1 % |
+| 32,499 tokens | 36.85 s | **33.79 s** | −8.3 % |
+| 44,699 tokens | 53.62 s | **48.27 s** | −10.0 % |
+
+Los logits y los 32 ids generados son iguales a las referencias publicadas en las tres longitudes. Por palanca (mismo
+turno de GPU o turnos separados, una carga por brazo): MoE v2 −5.9 / −6.9 / −8.0 %, lectura anticipada de Engram
+−3.3 % con 32,499 y −2.8 % con 44,699 tokens, atención «lean» −1.4 a −2.4 %.
+
+`--profile fast` (no se activa hasta su cualificación de calidad): la palanca MoE de orden relajado
+`STRIX_DS41_FAST_MOE=1` midió 9.07 / 31.08 / 44.09 s con los mismos prompts; cambia los logits, así que sigue
+pendiente.
+
 **DeepSeek con la RTX PRO, división del pipeline** (los mismos ficheros de modelo; la RTX ejecuta las capas 0-21 con CUDA, los dos nodos ejecutan
 las capas 22-39 y la cabeza):
 
@@ -756,6 +776,15 @@ la [preparación única de expertos](docs/models/deepseek-v4.1/prepared-load.md)
 la [caché de prefijos](docs/engine/serving/prefix-state-cache.md#deepseek-pair-agent-prefix-cache),
 los [contextos largos](docs/models/deepseek-v4.1/long-context.md) y
 la [colocación de expertos calientes](docs/models/deepseek-v4.1/hot-placement.md).
+
+Todas las aplicaciones del par (`rank`, `batch`, `prefill`, `serve`) aceptan `--profile default|fast|quality`;
+use el mismo perfil en los dos ranks. `default` es la configuración de producción exacta descrita arriba y no
+cambia nada. `fast` añade todas las opciones cualificadas que cambian bits; todavía no hay ninguna cualificada, así
+que hoy funciona igual que `default` e indica sus opciones pendientes (atención dispersa FP16, epílogo MoE relajado)
+en el recibo y en una línea de stderr cada una. `quality` no tiene paquete para este modelo y ejecuta `default` con
+un aviso. Una variable de entorno u opción explícita siempre tiene prioridad; `--allow-pending` ejecuta las opciones
+pendientes cuyo código está en el build, solo para benchmarks, marcadas como `unqualified`.
+`--print-effective-config` muestra el perfil y todas las opciones.
 
 **RTX + par:** use el [contrato de lanzamiento de etapas del pipeline](docs/models/deepseek-v4.1/pipeline-stages.md).
 La RTX ejecuta las capas 0–21; el par ejecuta las capas 22–39 y la cabeza. Conserve la identidad compuesta declarada

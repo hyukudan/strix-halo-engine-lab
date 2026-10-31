@@ -1,4 +1,5 @@
 #include "strix/deepseek41_pair_defaults.hpp"
+#include "strix/deepseek41_pair_profile_table.hpp"
 #include "strix/deepseek41_serve_cache_policy.hpp"
 
 #include <algorithm>
@@ -175,6 +176,30 @@ const char* app_name(App app) {
     return "?";
 }
 
+const strix::profile::Engine& profile_engine() {
+    static const strix::profile::Engine engine{"deepseek41-pair", "STRIX_DS41_PROFILE_ALLOW_PENDING", profile_table, false};
+    return engine;
+}
+
+namespace {
+std::string& profile_json_storage() {
+    static std::string json;
+    return json;
+}
+std::optional<strix::profile::Resolution>& profile_storage() {
+    static std::optional<strix::profile::Resolution> resolution;
+    return resolution;
+}
+}  // namespace
+
+const std::string& profile_json() { return profile_json_storage(); }
+
+const strix::profile::Resolution& profile_resolution() {
+    auto& r = profile_storage();
+    if (!r) r = strix::profile::resolve(profile_engine(), {});  // no Effective (tests): the default resolution
+    return *r;
+}
+
 const std::vector<std::pair<std::string, std::string>>& baseline_off_items() {
     // 2026-10-25 release: D1 shared expert as grouped SwiGLU pairs. 2026-10-26 release: D1b fused shared
     // down, prefill MoE form 7, exact dense selector, attention window fold / live chunks / f16 tile, serve warm-up
@@ -187,13 +212,30 @@ const std::vector<std::pair<std::string, std::string>>& baseline_off_items() {
     return items;
 }
 
-Resolved resolve(App app, const std::vector<std::string>& in, const Getenv& env, const Probe& probe, const Build& build) {
+Resolved resolve(App app, const std::vector<std::string>& in, const Getenv& raw_env, const Probe& probe, const Build& build) {
     Resolved r;
     std::vector<std::string> user;
     for (const auto& a : in) {
         if (a == "--print-effective-config") r.print_only = true;
         else user.push_back(a);
     }
+    // Product profile first: its switches are environment for everything below (an explicit one wins).
+    strix::profile::Inputs profile_inputs;
+    profile_inputs.env = raw_env;
+    strix::profile::take_options(profile_engine(), user, profile_inputs);
+    r.profile = strix::profile::resolve(profile_engine(), profile_inputs);
+    std::vector<std::pair<std::string, std::string>> profile_env;
+    for (const auto& e : r.profile->entries)
+        if (!e.lever->env.empty() && (e.status == strix::profile::Status::set || e.status == strix::profile::Status::unqualified))
+            profile_env.emplace_back(std::string(e.lever->env), e.value);
+    r.set_env = profile_env;
+    if (auto extra = strix::profile::profile_args(*r.profile); !extra.empty())
+        user.insert(user.begin() + (!user.empty() && !user[0].empty() && user[0][0] != '-' ? 1 : 0), extra.begin(), extra.end());
+    for (auto& n : r.profile->notices()) r.notices.push_back(std::move(n));
+    const Getenv env = [&](const char* name) -> const char* {
+        for (const auto& [k, v] : profile_env) if (k == name) return v.c_str();
+        return raw_env(name);
+    };
     const auto put = [&](const char* name, std::string value) {
         if (env(name) == nullptr) r.set_env.emplace_back(name, std::move(value));
     };
@@ -324,6 +366,7 @@ Resolved resolve(App app, const std::vector<std::string>& in, const Getenv& env,
 std::string describe(App app, const Resolved& r) {
     std::ostringstream o;
     o << "app " << app_name(app) << '\n';
+    if (r.profile) o << r.profile->describe();
     for (const auto& [k, v] : r.set_env) o << "env " << k << '=' << v << '\n';
     for (const auto& k : r.unset_env) o << "unset " << k << '\n';
     for (const auto& a : r.args) o << "arg " << a << '\n';
@@ -396,12 +439,17 @@ Effective::Effective(App app, int& argc, char**& argv, const Build& build) {
         ::unsetenv(k.c_str());
 #endif
     }
+    profile_json_storage() = r.profile ? r.profile->json() : std::string();
+    profile_storage() = r.profile;
     if (r.print_only) {
         std::cout << describe(app, r);
         std::cout.flush();
         std::exit(0);
     }
     for (const auto& n : r.notices) std::cerr << n << '\n';
+    // Receipt line on stderr (stdout stays the app's own, e.g. --describe-json); the serve also reports it in its
+    // capabilities.
+    std::cerr << "profile " << profile_json_storage() << '\n';
     storage_.reserve(r.args.size() + 1U);
     storage_.emplace_back(argv[0]);
     storage_.insert(storage_.end(), r.args.begin(), r.args.end());

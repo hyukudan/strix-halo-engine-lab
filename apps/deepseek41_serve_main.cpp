@@ -773,6 +773,12 @@ public:
                 for (const auto p : points_)
                     if (p > at_ && p < end) inside.push_back(p);
                 sp_.prefill_->set_snapshot_points(std::move(inside));
+                // the next piece of the default plan: its Engram rows are read while this piece runs
+                if (end < N) {
+                    const auto it = std::upper_bound(ends_.begin(), ends_.end(), end);
+                    const std::uint32_t next = it == ends_.end() ? N : *it;
+                    sp_.prefill_->set_engram_lookahead(std::span<const std::uint32_t>(prompt_.data() + end, next - end));
+                }
             }
             if (budget == 0U && !ptask_) {
                 const std::span<const std::uint32_t> piece(prompt_.data() + at_, end - at_);
@@ -1780,6 +1786,8 @@ void lead(const Args& initial, BatchForward& fwd, strix::dist::Communicator& com
         policy.set("direct_prefill_below_rows", serve::Json(static_cast<std::uint64_t>(sched.min_rows)));
         policy.set("qualification", serve::Json("pending-both-rank-gates"));
         out.set("scheduler", std::move(policy));
+        if (const auto& profile = strix::deepseek41::pair_defaults::profile_json(); !profile.empty())
+            out.set("profile", serve::parse_json(profile));
     };
     config.stop_tokens = {tokenizer->eos_token()};
     config.chat_renderer = [](const serve::ChatTemplateInput& in) { return serve::render_deepseek_v41_chat(in); };
@@ -3250,6 +3258,9 @@ void run_rank(Args a, std::uint32_t rank, std::unique_ptr<strix::dist::Transport
     strix::dist::Communicator comm(strix::dist::Group{rank, 2U, a.epoch, fnv(a.group_id)}, std::move(transport), std::move(gpu_direct),
                                    a.device_prefill ? std::size_t{22} << 20U : std::size_t{4} << 20U);
     std::fprintf(stderr, "rank %u: dist %s\n", rank, comm.transport_name().c_str());
+    strix::profile::check_peer(strix::deepseek41::pair_defaults::profile_resolution(), [&](std::span<const std::byte> profile_out, std::span<std::byte> profile_in) {
+        comm.exchange_host(profile_out, profile_in, strix::dist::Tag{static_cast<std::uint32_t>(strix::dist::TagKind::control), 0x70726f66U, 0U});
+    });  // both ranks must run the same product profile
     Watchdog dog(rank, a.peer_timeout);
     dog.pause(true);  // loading the weights is not a round
     BatchForward fwd(a.model, forward_options(a, &comm, rank));

@@ -418,6 +418,8 @@ void EngramRowReader::read(std::span<const EngramRowRequest> requests, std::span
     stats_.busy_seconds += std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
 }
 
+bool EngramRowReader::payload_cache() const noexcept { return cache_ && !cache_->entries.empty(); }
+
 EngramReaderStats EngramRowReader::stats() const {
     std::lock_guard<std::mutex> caller(read_mutex_);
     auto s = stats_;

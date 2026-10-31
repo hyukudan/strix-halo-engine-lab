@@ -8,7 +8,8 @@
 
 namespace strix::deepseek41::quality {
 
-// Arm labels: exact, dense (FP16 all projections), attention (BF16 attention), or a diagnostic spec of '_' tokens:
+// Arm labels: exact, dense (FP16 all projections), attention (BF16 attention), fattn / fmoe / fast (the FAST levers
+// STRIX_DS41_FAST_ATTN / STRIX_DS41_FAST_MOE / both), or a diagnostic spec of '_' tokens:
 // kind d (FP16 dense), a (BF16 attention), da (both), n (null: one-ulp flip of the stream after layer l<L>), then
 // qa kv qb oa ob (projections; none = all), l<first>t<end> (layers), a8 (FP16 operands from the A8 codes), r<rows>
 // (FP16 only at calls of >= rows rows), f (FP16 output form: STRIX_DS41_PREFILL_FP16_FAST), s<seed> (null: +-1 ulp by a
@@ -18,6 +19,10 @@ inline PrefillOptions arm_precision(const std::string& label) {
     if (label == "exact") return o;
     if (label == "dense") { o.fp16_dense = true; return o; }
     if (label == "attention") { o.bf16_attention = true; return o; }
+    // the FAST levers: f16 WMMA attention, relaxed-order MoE, both (the composed DS FAST prefill)
+    if (label == "fattn") { o.fast_attention = true; return o; }
+    if (label == "fmoe") { o.fast_moe = true; return o; }
+    if (label == "fast") { o.fast_attention = true; o.fast_moe = true; return o; }
     std::vector<std::string> tok;
     std::stringstream ss(label);
     for (std::string t; std::getline(ss, t, '_');) tok.push_back(t);

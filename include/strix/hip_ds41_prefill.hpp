@@ -97,6 +97,11 @@ struct PrefillGateUpView {
     std::int32_t* act_sums = nullptr;
 };
 void enqueue_prefill_gate_up(WeightFormat format, const PrefillGateUpView& view, void* stream);
+// FAST lever ds41-moe-relaxed-v1 (NOT bit-exact; STRIX_DS41_FAST_MOE=1, default off): IQ2_XXS gate/up and Q2_K down of the
+// batch path (enqueue_prefill_gate_up / _down) add each output's group terms in ascending group order with FMAs, 64 rows of
+// one expert per block; same A8 activations, weight integers and group dots. Test override: 1 on, 0 off, -1 environment.
+void set_fast_moe(int mode);
+[[nodiscard]] bool fast_moe();
 
 // Down of every entry: A8 activation of slot entry_slots[i] (codes[slot * width], deltas) times the
 // batch expert's rows; out[slot * outputs + o] is the unweighted raw slot vector. Formats Q2_K,

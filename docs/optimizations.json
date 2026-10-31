@@ -863,6 +863,28 @@
   },
   {
     "engine": "deepseek",
+    "name": "Engram lookahead between prefill pieces",
+    "flag_or_env": "STRIX_DS41_ENGRAM_LOOKAHEAD",
+    "default": "on",
+    "exact": "Bitwise: the payload cache returns the same bytes; two-node serve logits and generated ids identical to the published references at 8,399 / 32,499 / 44,699 tokens with the lever on and off.",
+    "gain": "Two-node serve TTFT, same GPU turn: 9.66 / 34.53 / 49.13 s off vs 9.51 / 33.39 / 47.77 s on at 8,399 / 32,499 / 44,699 tokens (-3.3 % at 32,499, -2.8 % at 44,699).",
+    "preconditions": "Two-node server device prefill of more than one piece; Engram payload cache on.",
+    "off_switch": "STRIX_DS41_ENGRAM_LOOKAHEAD=0",
+    "doc_anchor": "docs/optimizations.md#ds-engram-lookahead"
+  },
+  {
+    "engine": "deepseek",
+    "name": "Split prefill MoE kernels v2",
+    "flag_or_env": "STRIX_DS41_PREFILL_MOE_V2; STRIX_DS41_PREFILL_MOE_BAND",
+    "default": "on",
+    "exact": "Bitwise: device prefill expert tests (synthetic incl. empty, 1-row and tail experts, real layer 20, DSpark MTP) with v2 on and off; rank-shaped bench A8 codes, deltas, sums and down vectors identical to the previous kernels.",
+    "gain": "Rank-shaped kernel bench (layer 20, interleaved): down -27 / -30 / -30 %, gate/up -4.5 / -6.1 / -7.8 % at 2048 / 4096 / 8192-row pieces. Two-node serve TTFT at 8,399 / 32,499 / 44,699 tokens (one binary, cache off, one load per arm, separate GPU turns): STRIX_DS41_PREFILL_MOE_V2=0 10.42 / 37.29 / 53.35 s vs default 9.80 / 34.70 / 49.09 s (-5.9 / -6.9 / -8.0 %).",
+    "preconditions": "Default form 7, batches of 16 rows, IQ2_XXS gate/up (hidden a multiple of 1024), Q2_K down (width a multiple of 256).",
+    "off_switch": "STRIX_DS41_PREFILL_MOE_V2=0",
+    "doc_anchor": "docs/optimizations.md#ds-moe-v2"
+  },
+  {
+    "engine": "deepseek",
     "name": "Exact dense prefill selector",
     "flag_or_env": "STRIX_DS41_DENSE_SELECT",
     "default": "auto",
@@ -893,6 +915,17 @@
     "preconditions": "Packed-attention HIP kernels without the window fold; the f16 tile choice is unchanged.",
     "off_switch": "STRIX_DS41_ATTN_LDS_SWIZZLE=0",
     "doc_anchor": "docs/optimizations.md#ds-attn-swizzle"
+  },
+  {
+    "engine": "deepseek",
+    "name": "Attention lean chunk kernel",
+    "flag_or_env": "STRIX_DS41_ATTN_LEAN",
+    "default": "2",
+    "exact": "Bitwise: the same operations in the same order; HIP attention device tests against the host reference, and levels 1 and 2 byte-equal to level 0 on prefill-shaped calls (four streams, every code and scale byte, early positions, window-only and compressed layers, A8 combine, every tile choice).",
+    "gain": "Two-node serve TTFT at 8,399 / 32,499 / 44,699 tokens (one binary, cache off, one load per arm, separate GPU turns): STRIX_DS41_ATTN_LEAN=0 9.99 / 35.20 / 50.29 s vs default 9.80 / 34.70 / 49.09 s (-1.9 / -1.4 / -2.4 %); prefill window bench -11.8 % (32 heads) / -13.5 % (64 heads) per 8-row window.",
+    "preconditions": "Packed-attention HIP chunk kernels.",
+    "off_switch": "STRIX_DS41_ATTN_LEAN=0",
+    "doc_anchor": "docs/optimizations.md#ds-attn-lean"
   },
   {
     "engine": "deepseek",

@@ -91,7 +91,9 @@ DS41A_HD float exp_f(float x) {
     p = __builtin_fmaf(p, r, 0.5F);
     p = __builtin_fmaf(p, r, 1.0F);
     p = __builtin_fmaf(p, r, 1.0F);
-    return p * pow2f(static_cast<int>(n));
+    // n clamped to pow2f's range before the conversion (a NaN x gives n = NaN, whose int conversion is undefined): the
+    // same n for every x not returned above, and a NaN x still gives the NaN of p
+    return p * pow2f(static_cast<int>(__builtin_fminf(__builtin_fmaxf(n, -126.0F), 127.0F)));
 }
 DS41A_HD std::uint32_t order_key(float x) {  // monotone float -> uint32 (for selection)
     const std::uint32_t b = f2u(x);

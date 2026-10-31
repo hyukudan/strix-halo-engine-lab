@@ -82,6 +82,7 @@ public:
     EngramRowReader& operator=(const EngramRowReader&) = delete;
     void read(std::span<const EngramRowRequest> requests, std::span<std::uint8_t> out);
     [[nodiscard]] bool direct_io() const noexcept { return direct_; }
+    [[nodiscard]] bool payload_cache() const noexcept;  // a payload cache with room (rows read once are served again)
     [[nodiscard]] EngramReaderStats stats() const;
 
 private:

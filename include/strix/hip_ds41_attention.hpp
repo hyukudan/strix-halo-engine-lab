@@ -128,6 +128,13 @@ struct AttentionView {
 inline constexpr unsigned kAttnGroupCount = 8;   // at most 8 head groups per row (8 heads per block)
 // variant 0: STRIX_DS41_BF16_ATTN_VARIANT (default 1, the first kernel); 2: QK split over the waves, 16-byte key stores
 void enqueue_attention_bf16_prefill(const AttentionView&, hipStream_t stream, int variant = 0);
+// FAST lever ds41-attn-f16wmma-v1 (prefill only, NOT bit-exact): QK^T and PV on f16 WMMA with FP32 accumulation, FP32
+// softmax statistics with the ordered rescale, today's FP32 chunk combine. Same view contract as enqueue_attention (no
+// window fold; heads a multiple of 16). Selected by the prefill with STRIX_DS41_FAST_ATTN=1 (default off).
+void enqueue_attention_f16wmma_prefill(const AttentionView& v, hipStream_t stream);
+// Benchmarks only: chunks per block (1, 2 = default, 5, 10), an ablation mask (0 = none; see the kernel; non-zero = wrong
+// results) and heads per block (16 = default, 32 where the call's heads allow it: measured slower, kept for benchmarks).
+void set_fast_attn_tuning(unsigned chunks_per_block, unsigned ablate, unsigned heads_per_block = 16U);
 void enqueue_attention(const AttentionView& v, hipStream_t stream);
 // STRIX_DS41_ATTN_LDS_SWIZZLE (default on, =0 off): permute the f32 tile's 16-byte LDS vectors only (the tile choice is unchanged).
 // Test override: 0 off, 1 on, -1 environment. Arithmetic and reduction order are unchanged.
@@ -145,6 +152,11 @@ void set_attention_live_chunks(int mode);
 // write. Test override: 0 off, 1 on, -1 environment.
 void set_attention_window_fold(int mode);
 [[nodiscard]] bool attention_window_fold();
+// STRIX_DS41_ATTN_LEAN (default 2, =0 off): the chunk kernels in fewer instructions, the same values in the same order
+// (same bits): 1 = the softmax and PV steps, 2 = also the key dequantisation into the tile. Test override: 0, 1, 2, or -1
+// environment.
+void set_attention_lean(int mode);
+[[nodiscard]] int attention_lean();
 
 // Segment launches (several requests of a batch step per launch, STRIX_DS41_BATCH_SEGMENTS): one view per request
 // segment, each exactly the call above (its checks, its grid, every block's work), at most kMaxSegments per launch.

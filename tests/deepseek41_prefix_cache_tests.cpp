@@ -490,7 +490,7 @@ void test_namespace() {
     std::ofstream(overlay2, std::ios::binary) << std::string(4095, 'o') << 'p';  // same size, other content
     for (const char* v : {"STRIX_DS41_OVERLAY", "STRIX_DS41_CB4", "STRIX_DS41_TRELLIS", "STRIX_DS41_TRELLIS_SITES", "STRIX_DS41_TRELLIS_MIX",
                           "STRIX_DS41_SHEXP_TP", "STRIX_DS41_EP_MAP", "STRIX_DS41_PREFILL_BF16_ATTN", "STRIX_DS41_PREFILL_FP16_DENSE",
-                          "STRIX_DS41_FP16_CACHE", "STRIX_DS41_FP16_CACHE_READONLY"})
+                          "STRIX_DS41_FP16_CACHE", "STRIX_DS41_FP16_CACHE_READONLY", "STRIX_DS41_FAST_ATTN", "STRIX_DS41_FAST_MOE"})
         unsetenv(v);
     const auto base = ds::prefix_namespace_from_env(false);
     expect(base.text == ds::prefix_namespace_from_env(false).text && base.tag.size() == 16U, "namespace: deterministic, 16-digit tag");
@@ -498,6 +498,16 @@ void test_namespace() {
     const auto bf16 = ds::prefix_namespace_from_env(false);
     expect(bf16.tag != base.tag, "namespace: BF16 attention changes cache identity");
     unsetenv("STRIX_DS41_PREFILL_BF16_ATTN");
+    // the FAST levers: each its own identity, distinct from the exact one and from each other
+    setenv("STRIX_DS41_FAST_ATTN", "1", 1);
+    const auto fast_attn = ds::prefix_namespace_from_env(false);
+    unsetenv("STRIX_DS41_FAST_ATTN");
+    setenv("STRIX_DS41_FAST_MOE", "1", 1);
+    const auto fast_moe = ds::prefix_namespace_from_env(false);
+    unsetenv("STRIX_DS41_FAST_MOE");
+    expect(fast_attn.tag != base.tag && fast_moe.tag != base.tag && fast_attn.tag != fast_moe.tag && fast_attn.tag != bf16.tag,
+           "namespace: FAST attention / MoE levers change cache identity");
+    expect(ds::prefix_namespace_from_env(false).tag == base.tag, "namespace: FAST levers unset = the exact identity");
     setenv("STRIX_DS41_PREFILL_FP16_DENSE", "1", 1);
     bool rejected = false;
     try { (void)ds::prefix_namespace_from_env(false); } catch (const std::invalid_argument&) { rejected = true; }

@@ -29,6 +29,12 @@ namespace strix::deepseek41 {
 struct PrefillOptions {
     bool fp16_dense = false;          // non-exact, optional hipBLASLt backend
     bool bf16_attention = false;      // non-exact, prefill only, independent of dense
+    // FAST lever ds41-attn-f16wmma-v1 (STRIX_DS41_FAST_ATTN=1): non-exact f16 WMMA attention, prefill only, layers
+    // [approx_layer_first, approx_layer_end); bf16_attention wins where both are set
+    bool fast_attention = false;
+    // FAST lever ds41-moe-relaxed-v1 (STRIX_DS41_FAST_MOE=1): routed experts in relaxed order. Read from the environment by
+    // the MoE dispatch; set_precision_for_new_sequence applies an explicit value (quality arms).
+    bool fast_moe = false;
     // Diagnostics/selection for the non-exact paths (no effect while both switches above are off, except null_ulp_layer):
     // projection bits 1 q_a, 2 kv, 4 q_b, 8 o_a, 16 o_b; layers [approx_layer_first, approx_layer_end); FP16 only at
     // calls of at least fp16_min_rows rows; fp16_keep_a8: FP16 operands from the A8 codes (the exact path's activations)
@@ -274,6 +280,11 @@ public:
     // state a run ending at p exports, bitwise (rings, the caches' first p / ratio entries, a ratio-2 carry: empty at an
     // even p), with topk_known false; tokens and next_token are the caller's. The points apply to one run only.
     void set_snapshot_points(std::vector<std::uint32_t> positions);
+    // The tokens of the sequence's next run (the piece after the next run / extend / begin; copied, one run only). Once
+    // that run's own Engram rows are read, a thread reads this rank's Engram rows of `next` into the reader's payload
+    // cache, so the next run's read is served from host memory (the same bytes; nothing else changes). A next run with
+    // other tokens or boundaries reads what the cache misses as before. STRIX_DS41_ENGRAM_LOOKAHEAD=0: ignored.
+    void set_engram_lookahead(std::span<const std::uint32_t> next);
     [[nodiscard]] AttentionState export_state_at(std::uint32_t position) const;
     [[nodiscard]] std::uint64_t weight_bytes() const noexcept;         // loaded (owned) by this prefill
     [[nodiscard]] std::uint64_t shared_weight_bytes() const noexcept;  // read in place from shared_weights
