@@ -548,12 +548,14 @@ código en C1, y en C4).
 
 **Drafter MTP** - [hyukudan/Nemotron-3.5-Bolt-E4B-MTP-Drafter](https://huggingface.co/hyukudan/Nemotron-3.5-Bolt-E4B-MTP-Drafter). Un modelo asistente pequeño (el asistente MTP
 de Gemma-4-E4B-it de Google, 78.8M parámetros) propone los siguientes tokens y el modelo principal los verifica, así
-que la salida es idéntica a la del decode sin él; solo cambia la velocidad. Lo ajustamos (fine-tuning) con unos 6.3M
-tokens generados por Nemotron 3.5 Bolt E4B a partir de 17,865 prompts en ocho idiomas, más código, llamadas a
-herramientas y razonamiento, para que se acepten más tokens propuestos. En la ejecución de la versión publicada aceptó
-el 56.6 % (inglés), el 60.2 % (español), el 45.0 % (japonés) y el 74.5 % (código) de los tokens propuestos y elevó el
-decode en C1 de 52.2 a 85.1 tok/s en inglés (`default`, con y sin drafter medidos en la misma sesión, x1.63).
-Descárguelo en `MODEL_DIR/drafter-mtp/`; el motor lo usa automáticamente.
+que la salida es idéntica a la del decode sin él; solo cambia la velocidad. La aceleración procede de la arquitectura
+del asistente MTP y del decode especulativo exacto del motor: el decode en C1 pasa de 52.2 a 85.1 tok/s en inglés
+(`default`, con y sin drafter en la misma sesión, x1.63), y el [asistente de Google sin ajustar](https://huggingface.co/google/gemma-4-E4B-it-assistant) es igual de rápido
+en este motor (véase la comparación más abajo). Lo ajustamos ligeramente (fine-tuning) con unos 6.3M tokens generados
+por Nemotron 3.5 Bolt E4B a partir de 17,865 prompts en ocho idiomas, más código, llamadas a herramientas y
+razonamiento; en un conjunto reservado de 697 prompts eso añade alrededor de un 1.5 % de tokens esperados por ciclo
+(inglés 3.61 -> 3.65, japonés 2.52 -> 2.60), dentro del ruido en los prompts medidos. Descárguelo en
+`MODEL_DIR/drafter-mtp/`; el motor lo usa automáticamente.
 
 **Paquete EXL3 M4 (perfil `quality`)** - [hyukudan/Nemotron-3.5-Bolt-E4B-EXL3](https://huggingface.co/hyukudan/Nemotron-3.5-Bolt-E4B-EXL3). Una cuantización EXL3
 (codificada con trellis, Hessiana escalada) del modelo BF16: MLP a 4 bits, atención q/o a 5, k/v y la cabeza de salida
@@ -564,6 +566,36 @@ estándar: coincidencia top-1 del 92.94 % frente al 87.0 % y KL media de 0.0367 
 (`--profile quality --exl3-arm DIR`) cuando quiera una salida más cercana a BF16; quédese en `default` o `fast` con
 Q4_K_M para obtener la máxima velocidad. `quality` decodifica a 72.1 tok/s con el drafter (44.4 sin él, mismos ids de
 token); su prefill y su decode se siguen optimizando.
+
+**Comparación con las versiones oficiales de NVIDIA.** NVIDIA publica el modelo principal en [BF16](https://huggingface.co/nvidia/NVIDIA-Nemotron-3.5-Bolt-E4B-BF16) y en
+una sola cuantización, el [GGUF Q4_K_M](https://huggingface.co/nvidia/NVIDIA-Nemotron-3.5-Bolt-E4B-4GB), además de un [drafter DFlash](https://huggingface.co/nvidia/NVIDIA-Nemotron-3.5-Bolt-E4B-4GB-DFlash). Solo celdas medidas; una celda vacía
+no se midió. Misma máquina, greedy, decode de chat de 256 tokens, tok/s.
+
+| Modelo (perfil del motor) | Descarga GB | Bytes de pesos leídos por token | Top-1 frente a BF16 | KL media frente a BF16 | C1 con drafter MTP | C1 simple | C4 | C8 | Prefill 2K | Prefill 8K |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| BF16 oficial, referencia | 16.06 | 9.29 GB | 100 % | 0 | 38.1 | 19.8 | 72.4 | 156.7 | 565 | 534 |
+| Q4_K_M oficial, `default` | 6.18 | 3.13 GB | 87.0 % | 0.141 | 85.1 | 55.9 | 169.3 | 237.9 | 466 | 429 |
+| Q4_K_M oficial, `fast` | 6.18 | 3.13 GB | 86.7 % | 0.150 | 92.2 | 53.9 | 205.1 | 337.5 | 458 | 414 |
+| **EXL3 M4**, `quality` | 9.71 | **2.70 GB** | **92.94 %** | **0.0367** | 72.1 | 44.4 | 153.0 | 258.7 | 769 | 701 |
+| llama.cpp `74a4fb00`, Q4_K_M oficial | 6.18 | 3.13 GB | | | | 55.4 | 193.3 | 281.9 | 2,052 | 1,873 |
+
+Bytes de pesos por token: todas las capas lineales más una fila de las tablas de embedding y por capa (la descarga EXL3
+es mayor porque lleva esas tablas en BF16). Fidelidad: el conjunto reservado de 40 documentos en 8 idiomas frente a los
+logits del BF16 oficial; la fila `fast` procede de la evaluación de activaciones int8, que midió `default` en
+86.95 % / 0.144 en paralelo. C4 y C8 se ejecutan sin draft. Las celdas de prefill de EXL3 proceden de una sesión
+posterior, en la que llama.cpp midió 2,053 / 1,875 tok/s.
+
+Drafters sobre el Q4_K_M oficial (`default`, C1, ids de token idénticos a los obtenidos sin draft con todos los drafters):
+
+| Prompt | Nuestro drafter MTP: tokens / paso | tok/s | Asistente de Google sin ajustar: tokens / paso | tok/s | DFlash de NVIDIA (360M): tokens / paso | tok/s | Sin draft: tok/s |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| Inglés | 2.02 | **85.1** | 2.03 | **85.2** | 2.21 | 69.0 | 52.1 |
+| Español | 1.73 | **78.6** | 1.83 | **79.9** | 1.55 | 58.5 | 52.0 |
+| Japonés | 1.83 | **76.5** | 1.84 | **76.9** | 1.56 | 59.9 | 52.1 |
+| Código | 2.33 | **98.1** | 2.27 | **95.3** | 2.15 | 73.6 | 52.0 |
+
+DFlash obtiene más tokens por paso en inglés, pero cada uno de sus pasos de draft cuesta unos 10 ms en esta máquina
+frente a ~1 ms del asistente MTP, así que su aceleración es menor (x1.12-1.41 frente a x1.47-1.89).
 
 Prefill (tok/s; todos los perfiles usan prefill exacto):
 
