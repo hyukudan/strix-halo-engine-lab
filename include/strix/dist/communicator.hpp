@@ -242,8 +242,11 @@ public:
     Communicator(const Communicator&) = delete;
     Communicator& operator=(const Communicator&) = delete;
 
-    // Resize host capacity between collectives; preserves sequence numbers and the route table.
-    void resize_bytes(std::size_t bytes);
+    // Resize host capacity between collectives; preserves sequence numbers and the route table. grow_pipeline = false:
+    // only the (fused) staging buffers grow; the chunked host pipeline keeps its capacity and messages above it take the
+    // plain host path (for large staged messages only, without a second pair of pipeline buffers).
+    void resize_bytes(std::size_t bytes, bool grow_pipeline = true);
+    [[nodiscard]] std::size_t max_bytes() const noexcept { return max_bytes_; }
 
     // Sends `bytes` of device buffer `local` to the peer and writes the peer's `bytes` into device buffer
     // `remote`. The copy of `local` is ordered after its producer on `stream` and the CPU waits for it
