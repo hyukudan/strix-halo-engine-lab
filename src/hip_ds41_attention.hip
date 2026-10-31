@@ -1203,7 +1203,9 @@ __device__ __forceinline__ void attention_tile(const void* tile, unsigned cnt, u
     }
     if (mark) DS41_CMARK(3U);
 }
-// Combine of one (row, head) in chunk order, sink, 1 / L, inverse RoPE.
+// Combine of one (row, head) in chunk order, sink, 1 / L, inverse RoPE. Sel (STRIX_DS41_ATTN_LEAN 3): exp_f_sel, the same
+// polynomial with the range tests as selects.
+template <bool Sel = false>
 __device__ __forceinline__ void attention_combine_head(const AttentionView& v, unsigned r, unsigned h, unsigned lane, unsigned chunks) {
     const float* part = v.partial + (static_cast<std::size_t>(r) * v.heads + h) * kMaxChunks * (2 + kHeadDim);
     // every chunk's (m, l) and the lane's 16 accumulators are loaded at once (one memory round trip), then combined
@@ -1226,13 +1228,13 @@ __device__ __forceinline__ void attention_combine_head(const AttentionView& v, u
 #pragma unroll
     for (unsigned c = 0; c < kMaxChunks; ++c) {
         if (c < chunks) {
-            const float e = exp_f(mc[c] - mm);
+            const float e = Sel ? exp_f_sel(mc[c] - mm) : exp_f(mc[c] - mm);
             lsum = fmaf(lc[c], e, lsum);
 #pragma unroll
             for (unsigned i = 0; i < 16; ++i) acc[i] = fmaf(pa[c][i], e, acc[i]);
         }
     }
-    lsum = lsum + exp_f(v.sink[h] - mm);
+    lsum = lsum + (Sel ? exp_f_sel(v.sink[h] - mm) : exp_f(v.sink[h] - mm));
 #pragma unroll
     for (unsigned i = 0; i < 16; ++i) acc[i] = acc[i] / lsum;
     rope512(acc, v.rope[r], lane, true);
@@ -1387,7 +1389,7 @@ __device__ __forceinline__ void attention_chunk_body(const AttentionView& v, con
     if (last_s == 0U) return;
     __threadfence();
 #pragma unroll 1
-    for (unsigned h = 0; h < kAttnHpw; ++h) attention_combine_head(v, r, hb + h, lane, chunks);
+    for (unsigned h = 0; h < kAttnHpw; ++h) attention_combine_head<(Lean >= 3U)>(v, r, hb + h, lane, chunks);
     if (tid == 0U) *ticket = 0U;
     DS41_MARK(11U);
 }
