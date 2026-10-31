@@ -121,6 +121,7 @@ The command produces a JSON receipt with token IDs and timing. Actual model file
 | DeepSeek V4.1 Flash, standalone RTX | RTX PRO 6000 (96 GB, Windows WDDM) | **Production** | Q2 GGUF experts, Q8_0 dense; exclusive VRAM + pinned-host cache; on-GPU DSpark with warm controller selected as the speculative default |
 | MiniMax M3.1 Flash (EXL3, 3.06 bpw) | 2 nodes TP2 over USB4 | **Production** | Eight-text quality gate passed; exact prefill/decode; DSpark serving auto admission and MSA mode 5; prefill/exchange defaults on |
 | GLM-5.3 Flash (EXL3, 4.05 bpw) | 2 nodes TP2 over USB4 | **Production** | R1b decode identity by default; exact MTP self-speculation by default; exact R1 chunked prefill; `--identity r1` restores R1; R≥3 fix verified on the pair |
+| GLM-5.3 Flash on one RTX PRO 6000 (draft) | RTX PRO 6000 (96 GB, Windows) | **Opt-in** | Exact prefill and greedy decode; routed experts streamed through the [tierstream](https://github.com/hyukudan/tierstream) device-gated cache (device, pinned RAM, unit file); `--profile`; [guide](src/glm/rtxpf/README.md) |
 | Nemotron 3.5 Bolt E4B (Q4_K_M; EXL3 pack for `quality`) | 1 node | **Opt-in build** (`STRIX_FAMILY_GEMMA4=ON`) | `--profile default\|fast\|quality`; exact decode at every batch size; exact MTP drafter at C1; continuous-batching server |
 
 The core knows no model: each family is a module with its own contract, plan, kernels and gates
@@ -507,6 +508,15 @@ unresolved. HIP graphs are **not implemented**: the latest profile (`41d8cfdc`) 
 and a calculated recoverable gap of **≤1.8 ms** (a bound, not a measured speedup). Host progress across
 exchange boundaries requires segmented capture; device kernels and rank skew take priority.
 
+**GLM-5.3 Flash on one RTX PRO 6000 (draft, opt-in, Windows).** The trunk, dense layers and shared experts stay
+on the card; the 43 x 288 routed experts are served by the [tierstream](https://github.com/hyukudan/tierstream)
+device-gated cache, and prefill reads them through the same cache, so the card holds one copy of every expert.
+Prefill and decode are exact (bitwise digests of logits and state; prefill state equal across row tiles 2048 / 4096 /
+8192). Full card: TTFT **17.7 s** at 8K and **41.2 s** at 32K with the best row tile (17.7-22.7 s / 41-55 s across
+tiles); decode about **3.3 tok/s** warm (2.5 cold), bound by compute and launch overhead and still being optimised.
+Smaller configurations (for example 24 GiB VRAM + 32 GiB RAM with most experts read from the unit file) do not work
+yet. Build, unit file and options: [GLM RTX guide](src/glm/rtxpf/README.md).
+
 ### Nemotron 3.5 Bolt E4B
 
 Sources: [model guide](docs/models/nemotron-3.5-bolt-e4b/README.md).
@@ -870,6 +880,13 @@ Default R1b decode uses exact MTP self-speculation and R1 prompt prefill; `--mtp
 with the same tokens. `--identity r1` selects a different reference identity. Prefill automatically uses
 8192 rows if both ranks admit them, otherwise 4096. See the [resolver](apps/glm_rank_defaults.hpp),
 [model families](docs/models/model-families.md) and [qualification/performance](docs/performance.md).
+
+### GLM on one RTX PRO 6000
+
+Windows only, opt-in: build with `pwsh src/glm/rtxpf/producer/build.ps1` against a tierstream source export, build
+the unit file once with `glm_unit_file.exe`, then run `decode_qualification_window.py --full-card --allow-gpu`. Every
+step, the pinned tierstream commit and the options (`--profile`, `--print-effective-config`, `--vram-total-gib`) are
+in the [GLM RTX guide](src/glm/rtxpf/README.md).
 
 ### Nemotron 3.5 Bolt E4B
 
