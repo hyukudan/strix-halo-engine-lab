@@ -880,6 +880,12 @@ void run_rank(const Args& a, std::uint32_t rank, std::unique_ptr<strix::dist::Tr
     if (transport && gpu_direct)
         comm = std::make_unique<strix::dist::Communicator>(strix::dist::Group{rank, 2U, 1U, 0x64733462ULL}, std::move(transport), std::move(gpu_direct), 4U << 20U);
     else if (transport) comm = std::make_unique<strix::dist::Communicator>(strix::dist::Group{rank, 2U, 1U, 0x64733462ULL}, std::move(transport), 4U << 20U);
+    if (comm) {  // both ranks must run the same product profile
+        auto& c = *comm;
+        strix::profile::check_peer(strix::deepseek41::pair_defaults::profile_resolution(), [&](std::span<const std::byte> profile_out, std::span<std::byte> profile_in) {
+            c.exchange_host(profile_out, profile_in, strix::dist::Tag{static_cast<std::uint32_t>(strix::dist::TagKind::control), 0x70726f66U, 0U});
+        });
+    }
     std::vector<std::uint32_t> ns;
     for (const auto& s : split(a.n_list, ',')) ns.push_back(static_cast<std::uint32_t>(std::stoul(s)));
     const std::uint32_t n_max = *std::max_element(ns.begin(), ns.end());

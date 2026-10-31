@@ -1,6 +1,9 @@
 #include "strix/deepseek41_pair_defaults.hpp"
+#include "strix/deepseek41_pair_profile_table.hpp"
 
 #include <algorithm>
+#include <array>
+#include <stdexcept>
 #include <cstdio>
 #include <cstdlib>
 #include <map>
@@ -407,6 +410,125 @@ void test_session_off_settings() {
     }
 }
 
+// Product profile: default changes nothing (same resolution as no --profile, lines only added after "app"),
+// fast/quality never refuse, a pending row is listed and never applied, explicit settings win,
+// --allow-pending runs a runnable pending row stamped unqualified. Generic resolver on a fake table too.
+void test_profile() {
+    namespace pr = strix::profile;
+    for (const auto app : {pd::App::rank, pd::App::batch, pd::App::prefill, pd::App::serve}) {
+        const World w;
+        const std::vector<std::string> plain_args{MODEL, "--rank", "0", "--transport", app == pd::App::prefill ? "usb4-auto" : "usb4auto"};
+        const auto base = w.run(app, plain_args);
+        for (const auto& spelled : {std::vector<std::string>{"--profile", "default"}, std::vector<std::string>{"--profile=default"}}) {
+            auto args = plain_args;
+            args.insert(args.end(), spelled.begin(), spelled.end());
+            const auto d = w.run(app, args);
+            check(d.args == base.args && d.set_env == base.set_env && d.unset_env == base.unset_env && d.notices == base.notices,
+                  std::string(pd::app_name(app)) + ": --profile default == today's resolution");
+            check(pd::describe(app, d) == pd::describe(app, base), "describe: --profile default == no --profile");
+        }
+        const auto d = pd::describe(app, base);
+        const auto head = std::string("app ") + pd::app_name(app) + "\nprofile default\nprofile qualification qualified\n";
+        check(d.rfind(head, 0) == 0, "describe: profile lines right after the app line");
+        check(base.profile && base.profile->json().find("\"pending\":[]") != std::string::npos, "default: nothing pending");
+
+        auto fast_args = plain_args;
+        fast_args.insert(fast_args.end(), {"--profile", "fast"});
+        const auto f = w.run(app, fast_args);
+        check(f.args == base.args && f.set_env == base.set_env, "fast: pending rows are never applied");
+        std::size_t pending = 0;
+        for (const auto& e : f.profile->entries) pending += e.status == pr::Status::pending;
+        check(pending == pd::profile_table.size() && f.notices.size() == base.notices.size() + pending, "fast: one notice per pending row");
+        check(f.profile->qualification() == "qualified", "fast: still qualified");
+
+        auto q_args = plain_args;
+        q_args.insert(q_args.end(), {"--profile", "quality"});
+        const auto q = w.run(app, q_args);
+        check(q.args == base.args && q.set_env == base.set_env && q.notices.size() == base.notices.size() + 1U &&
+                  q.profile->json().find("no quality rows") != std::string::npos, "quality: default plus one notice");
+
+        World e = w;
+        e.env["STRIX_DS41_FAST_ATTN"] = "0";
+        const auto x = e.run(app, fast_args);
+        check(x.profile->find("attention_f16wmma")->status == pr::Status::off, "explicit env wins over the profile");
+    }
+    {
+        const World w;
+        // Not a profile name: left untouched for the app's parser (e.g. the value of another option).
+        const auto other = w.run(pd::App::rank, {MODEL, "--rank", "0", "--out", "--profile", "--profile=x"});
+        check(has_arg(other, "--profile") && has_arg(other, "--profile=x") && other.profile->profile == pr::Name::standard,
+              "a --profile token without a profile name stays in args");
+        bool threw = false;
+        try { (void)w.run(pd::App::rank, {MODEL, "--profile", "fast", "--profile", "default"}); } catch (const std::invalid_argument&) { threw = true; }
+        check(threw, "duplicate --profile is an argument error");
+    }
+    {
+        static constexpr std::array<pr::Lever, 3> table{{
+            {"env_ready", "X_READY", "", {"", "1", ""}, "0", pr::Kind::bit_changing, {true, true, true}, {true, true, true}, "", "0", "r1"},
+            {"env_pending", "X_PENDING", "", {"", "1", ""}, "0", pr::Kind::bit_changing, {true, false, true}, {true, true, true}, "big", "0", "p"},
+            {"cli_ready", "", "--rows", {"", "8192", ""}, "4096", pr::Kind::bit_changing, {true, true, true}, {true, true, true}, "", "", "r2"},
+        }};
+        const pr::Engine engine{"test-pair", "X_ALLOW", table, false};
+        std::map<std::string, std::string> env;
+        const auto lookup = [&](const char* n) -> const char* { const auto it = env.find(n); return it == env.end() ? nullptr : it->second.c_str(); };
+        std::vector<std::string> args{"m.gguf", "--profile", "fast", "--rows", "2048", "--other"};
+        pr::Inputs in;
+        in.env = lookup;
+        pr::take_options(engine, args, in);
+        check((args == std::vector<std::string>{"m.gguf", "--rows", "2048", "--other"}), "take_options keeps app options, drops --profile");
+        auto r = pr::resolve(engine, in);
+        check(r.find("env_ready")->status == pr::Status::set && r.find("env_ready")->value == "1", "ready env row applied");
+        check(r.find("env_pending")->status == pr::Status::pending && r.find("env_pending")->target == "big", "pending row listed");
+        check(r.find("cli_ready")->status == pr::Status::explicit_cli && pr::profile_args(r).empty(), "CLI wins; no profile arg added");
+        pr::Pairs exported;
+        pr::apply(r, [&](const char* k, const char* v) { exported.emplace_back(k, v); return true; });
+        check((exported == pr::Pairs{{"X_READY", "1"}}), "apply exports only qualified env rows");
+        in.cli.clear();
+        env["X_ALLOW"] = "1";
+        r = pr::resolve(engine, in);
+        check(r.find("env_pending")->status == pr::Status::unqualified && r.qualification() == "unqualified: env_pending",
+              "allow-pending runs a runnable pending row, stamped unqualified");
+        check((pr::profile_args(r) == std::vector<std::string>{"--rows", "8192"}), "CLI-only ready row becomes an argument");
+        std::vector<std::string> legacy{"--profile", "--x"};
+        pr::Inputs li;
+        pr::take_options(engine, legacy, li);
+        check(legacy.size() == 2U && !li.profile, "a bare --profile is left for the app");
+        check(pr::json_string(std::string("a\"b\\") + '\n' + '\x01') == "\"a\\\"b\\\\\\n\\u0001\"", "json escaping");
+        // Rank agreement: a fake control channel hands each side the other's 32 bytes.
+        const auto pair_check = [&](const pr::Resolution& a, const pr::Resolution& b) {
+            std::array<std::byte, 32> from_a{}, from_b{};
+            bool a_ok = true, b_ok = true;
+            try { pr::check_peer(b, [&](std::span<const std::byte> out, std::span<std::byte>) { std::copy(out.begin(), out.end(), from_b.begin()); }); }
+            catch (const std::runtime_error&) {}
+            try { pr::check_peer(a, [&](std::span<const std::byte> out, std::span<std::byte> peer) {
+                std::copy(out.begin(), out.end(), from_a.begin()); std::copy(from_b.begin(), from_b.end(), peer.begin()); }); }
+            catch (const std::runtime_error&) { a_ok = false; }
+            try { pr::check_peer(b, [&](std::span<const std::byte>, std::span<std::byte> peer) { std::copy(from_a.begin(), from_a.end(), peer.begin()); }); }
+            catch (const std::runtime_error&) { b_ok = false; }
+            return a_ok && b_ok;
+        };
+        env.erase("X_ALLOW");
+        pr::Inputs fast_in, default_in, allow_in, explicit_in;
+        fast_in.env = default_in.env = allow_in.env = explicit_in.env = lookup;
+        fast_in.profile = allow_in.profile = explicit_in.profile = pr::Name::fast;
+        allow_in.allow_pending = true;
+        explicit_in.cli = {{"cli_ready", "8192"}};
+        const auto rf = pr::resolve(engine, fast_in), rd0 = pr::resolve(engine, default_in), ra = pr::resolve(engine, allow_in),
+                   rx = pr::resolve(engine, explicit_in);
+        check(pair_check(rf, rf) && pair_check(rd0, rd0), "same profile on both ranks: agree");
+        check(pair_check(rf, rx), "an explicit value equal to the profile's is the same run");
+        check(!pair_check(rf, rd0) && !pair_check(rf, ra), "fast vs default, or --allow-pending on one rank only: refused");
+        bool threw = false;
+        std::vector<std::string> typo{"m", "--profile", "fastt"};
+        pr::Inputs ti;
+        try { pr::take_options(engine, typo, ti); } catch (const std::invalid_argument&) { threw = true; }
+        check(threw, "--profile fastt is an argument error");
+        std::vector<std::string> session{"m", "--profile", "a:p.u32:4"};
+        pr::take_options(engine, session, ti);
+        check(session.size() == 3U, "--profile NAME:PROMPT:STEPS stays for the app");
+    }
+}
+
 }  // namespace
 
 int main() {
@@ -415,10 +537,11 @@ int main() {
     test_fallbacks();
     test_session_defaults();
     test_session_off_settings();
+    test_profile();
     if (failures != 0) {
         std::fprintf(stderr, "%d failure(s)\n", failures);
         return 1;
     }
-    std::printf("deepseek41 pair defaults: receipt equivalence (rank, batch, prefill, serve), off switches, fallbacks PASS\n");
+    std::printf("deepseek41 pair defaults: receipt equivalence (rank, batch, prefill, serve), off switches, fallbacks, profiles PASS\n");
     return 0;
 }

@@ -38,6 +38,7 @@
 #include <set>
 #include <stdexcept>
 #include <thread>
+#include <system_error>
 #include <initializer_list>
 #include <utility>
 
@@ -449,6 +450,9 @@ struct DevicePrefill::Impl {
     bool bf16_at(std::uint32_t layer) const {
         return options.bf16_attention && layer >= options.approx_layer_first && layer < options.approx_layer_end;
     }
+    bool fast_attn_at(std::uint32_t layer) const {
+        return options.fast_attention && layer >= options.approx_layer_first && layer < options.approx_layer_end;
+    }
     void dense(const ds41::Q8A8DensePrefillView& v, const float* input_x, void* st, bool fp16) {
         (void)input_x;
         if (fp16) {
@@ -496,6 +500,15 @@ struct DevicePrefill::Impl {
     Dev<std::uint32_t> dtokens;
     std::uint8_t* engram_pinned = nullptr;
     std::size_t engram_pinned_bytes = 0;
+    // Engram lookahead (set_engram_lookahead, STRIX_DS41_ENGRAM_LOOKAHEAD default on, =0 off): the next run's tokens,
+    // and the thread that reads this rank's rows of them into the reader's payload cache after this run's own read.
+    std::vector<std::uint32_t> engram_next;
+    std::vector<ds41::EngramRowRequest> engram_ahead_requests;
+    std::vector<std::uint8_t> engram_ahead_out;
+    std::thread engram_ahead;
+    void join_engram_ahead() {
+        if (engram_ahead.joinable()) engram_ahead.join();
+    }
     // world 2 with row_split: runs of fewer rows than this take the tensor-parallel form instead (same bits)
     std::uint32_t split_min_rows = 0;
     // row_split MoE: runs of at most this many rows take the joint expert pass (one read of the expert half per layer
@@ -643,6 +656,7 @@ DevicePrefill::DevicePrefill(const std::filesystem::path& gguf, const PrefillOpt
     }
     if(const char* e=std::getenv("STRIX_DS41_PREFILL_FP16_DENSE");e && std::string(e)=="1")options.fp16_dense=true;
     if(const char* e=std::getenv("STRIX_DS41_PREFILL_BF16_ATTN");e && std::string(e)=="1")options.bf16_attention=true;
+    if (const char* e = std::getenv("STRIX_DS41_FAST_ATTN"); e != nullptr && std::string(e) == "1") options.fast_attention = true;
     // Per-shape selector of the FP16 backend: STRIX_DS41_PREFILL_FP16_PROJ (comma list of q_a, kv, q_b, o_a, o_b),
     // STRIX_DS41_PREFILL_FP16_MIN_ROWS (calls of at least that many rows), STRIX_DS41_PREFILL_APPROX_LAYERS=first-end,
     // STRIX_DS41_PREFILL_FP16_A8=1 (operands from the A8 codes)
@@ -1037,6 +1051,7 @@ DevicePrefill::~DevicePrefill() {
     if (impl_->gathered != nullptr) (void)hipEventDestroy(impl_->gathered);
     if (impl_->comm_stream != nullptr) (void)hipStreamDestroy(impl_->comm_stream);
     if (impl_->stream != nullptr) (void)hipStreamDestroy(impl_->stream);
+    impl_->join_engram_ahead();
     if (impl_->engram_pinned != nullptr) (void)hipHostFree(impl_->engram_pinned);
 }
 
@@ -1307,6 +1322,18 @@ void PrefillTask::cancel() {
     s.cv.wait(lock, [&] { return s.finished; });
 }
 
+namespace {
+// The global rows of `rank`'s local rows in a run of T rows: with row_split (world 2) window k of W rows belongs to rank
+// k % 2 and a rank's rows are compacted in window order; otherwise local rows = global rows (the run's own mapping).
+std::vector<std::uint32_t> rank_global_rows(bool split, std::uint32_t T, std::uint32_t W, std::uint32_t rank) {
+    std::vector<std::uint32_t> rows;
+    rows.reserve(split ? T / 2U + W : T);
+    for (std::uint32_t g = 0; g < T; ++g)
+        if (!split || (g / W) % 2U == rank) rows.push_back(g);
+    return rows;
+}
+}  // namespace
+
 std::unique_ptr<PrefillTask> DevicePrefill::begin_run(std::span<const std::uint32_t> tokens, const PrefillTaskOptions& task) {
     return begin_from(tokens, false, task);
 }
@@ -1361,6 +1388,9 @@ void DevicePrefill::set_precision_for_new_sequence(const PrefillOptions& p) {
     o.null_ulp_layer = p.null_ulp_layer;
     o.null_seed = p.null_seed;
     o.trace = p.trace;
+    o.fast_attention = p.fast_attention;
+    o.fast_moe = p.fast_moe;
+    ds41::set_fast_moe(p.fast_moe ? 1 : 0);   // process-wide switch of the batch MoE dispatch (one sequence at a time here)
 }
 
 PrefillResult DevicePrefill::run(std::span<const std::uint32_t> tokens) {
@@ -1654,6 +1684,8 @@ PrefillResult DevicePrefill::run_from(std::span<const std::uint32_t> tokens, std
     std::vector<std::uint32_t> engram_layers;
     std::vector<ds41::EngramRowRequest> requests;
     std::future<double> engram_job;  // declared after `requests`: destroyed (joined) first
+    m.join_engram_ahead();  // the previous run's lookahead: its rows are in the payload cache (or it failed: read below)
+    const std::vector<std::uint32_t> engram_next = std::exchange(m.engram_next, {});
     {
         const auto t0 = std::chrono::steady_clock::now();
         if (P0 == 0U) m.hasher->reset();
@@ -1671,6 +1703,49 @@ PrefillResult DevicePrefill::run_from(std::span<const std::uint32_t> tokens, std
                 for (std::uint32_t k = 0; k < engram_cols; ++k)
                     requests.push_back({li, ids[std::size_t{global_row[t]} * per_token + li * engram_cols + k]});
         }
+        // lookahead: this rank's Engram rows of the next run (its history continues this run's), read after this run's own
+        m.engram_ahead_requests.clear();
+        if (!engram_next.empty() && !requests.empty() && m.engram_reader->payload_cache()) {  // without a cache nothing is reused
+            if (rank_global_rows(split, T, W, me) != global_row) throw std::logic_error("deepseek41 prefill: Engram lookahead row map");
+            const auto Tx = static_cast<std::uint32_t>(engram_next.size());
+            const bool split_next = m.distributed() && m.options.row_split && Tx >= m.split_min_rows;
+            const auto next_rows = rank_global_rows(split_next, Tx, W, me);
+            ds41::EngramHasher h = *m.hasher;
+            std::vector<std::uint64_t> nids(std::size_t{Tx} * per_token);
+            for (std::uint32_t t = 0; t < Tx; ++t) {
+                h.push(engram_next[t], one);
+                std::copy(one.begin(), one.end(), nids.begin() + static_cast<std::ptrdiff_t>(std::size_t{t} * per_token));
+            }
+            for (const auto li : engram_layers)
+                for (const auto t : next_rows)
+                    for (std::uint32_t k = 0; k < engram_cols; ++k)
+                        m.engram_ahead_requests.push_back({li, nids[std::size_t{t} * per_token + li * engram_cols + k]});
+        }
+        static const bool ahead_log = [] { const char* v = std::getenv("STRIX_DS41_ENGRAM_LOOKAHEAD_LOG"); return v && v[0] == '1'; }();
+        const auto own_stats = ahead_log ? m.engram_reader->stats() : ds41::EngramReaderStats{};
+        const auto start_ahead = [&m, P0, T, own_stats] {  // after this run's own read (the reader serves one caller at a time)
+            if (ahead_log) {
+                const auto s = m.engram_reader->stats();
+                std::fprintf(stderr, "engram lookahead: run at %u, %u rows: own read %llu requests, %llu cache hits, %llu misses, %.3f s busy; next run %zu requests\n",
+                             P0, T, static_cast<unsigned long long>(s.requests - own_stats.requests),
+                             static_cast<unsigned long long>(s.payload_hits - own_stats.payload_hits),
+                             static_cast<unsigned long long>(s.payload_misses - own_stats.payload_misses), s.busy_seconds - own_stats.busy_seconds,
+                             m.engram_ahead_requests.size());
+            }
+            if (m.engram_ahead_requests.empty()) return;
+            try {  // no thread: the next run reads its rows itself
+                m.engram_ahead = std::thread([&m] {
+                    const auto t0 = std::chrono::steady_clock::now();
+                    try {
+                        m.engram_ahead_out.resize(m.engram_ahead_requests.size() * 264U);
+                        m.engram_reader->read(m.engram_ahead_requests, m.engram_ahead_out);
+                    } catch (...) {  // a warm-up only: the next run reads what the cache misses
+                    }
+                    if (ahead_log) std::fprintf(stderr, "engram lookahead: next run's %zu requests read in %.3f s\n", m.engram_ahead_requests.size(), seconds_since(t0));
+                });
+            } catch (const std::system_error&) {
+            }
+        };
         const std::size_t bytes = requests.size() * 264U;
         if (m.overlap) {
             if (m.engram_pinned_bytes < bytes) {
@@ -1682,15 +1757,18 @@ PrefillResult DevicePrefill::run_from(std::span<const std::uint32_t> tokens, std
             }
             engram_data = m.engram_pinned;
             if (!requests.empty())
-                engram_job = std::async(std::launch::async, [&m, &requests, bytes] {
+                engram_job = std::async(std::launch::async, [&m, &requests, bytes, start_ahead] {
                     const auto t1 = std::chrono::steady_clock::now();
                     m.engram_reader->read(requests, std::span<std::uint8_t>(m.engram_pinned, bytes));
-                    return seconds_since(t1);
+                    const double s = seconds_since(t1);
+                    start_ahead();
+                    return s;
                 });
         } else {
             engram_bytes.resize(bytes);
             if (!requests.empty()) m.engram_reader->read(requests, engram_bytes);
             engram_data = engram_bytes.data();
+            if (!requests.empty()) start_ahead();
         }
         result.engram_seconds = seconds_since(t0);
     }
@@ -2262,6 +2340,7 @@ PrefillResult DevicePrefill::run_from(std::span<const std::uint32_t> tokens, std
                         v.tickets = ln.attn_tickets.p;
                         v.o = m.o.p + std::size_t{w0 - r0} * QL;
                         if(m.bf16_at(layer)) attn::hip::enqueue_attention_bf16_prefill(v,ls);
+                        else if (m.fast_attn_at(layer)) attn::hip::enqueue_attention_f16wmma_prefill(v, ls);
                         else attn::hip::enqueue_attention(v, ls);
                     }
                     close_halves();  // the previous chunk's wo_b halves crossed meanwhile; y_own is free again
@@ -2985,6 +3064,12 @@ AttentionState DevicePrefill::export_state() const {
         }
     }
     return s;
+}
+
+void DevicePrefill::set_engram_lookahead(std::span<const std::uint32_t> next) {
+    static const bool on = [] { const char* v = std::getenv("STRIX_DS41_ENGRAM_LOOKAHEAD"); return !(v && std::strcmp(v, "0") == 0); }();
+    impl_->engram_next.assign(next.begin(), next.end());
+    if (!on) impl_->engram_next.clear();
 }
 
 void DevicePrefill::set_snapshot_points(std::vector<std::uint32_t> positions) {

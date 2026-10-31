@@ -1,6 +1,6 @@
 // Reviewed source receipt. Do not regenerate to silence a failure: audit the
 // changed/new selectors, update their allow-table and tests, then update hashes.
-{"CMakeLists.txt", 0x221a883f6576cb5aULL},
+{"CMakeLists.txt", 0xba68bec2abee9e53ULL},
 {"apps/minimax_rank_main.cpp", 0x3047c942babcb95eULL},
 {"apps/minimax_serve_main.cpp", 0xe762a5eeb30f4178ULL},
 {"src/minimax/attn/index_proj.hip", 0x8332b8f8830e98d8ULL},

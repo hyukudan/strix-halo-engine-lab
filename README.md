@@ -207,6 +207,24 @@ Server: two runs per arm in both orders; one of the two new-build runs had a sin
 of 3.8 s (cause under investigation), so C8 uses the clean run. The measured pair build supersedes
 the earlier single-client serving regression: it serves faster than `69c6bdab`.
 
+**On by default** (exact, same logits and generated ids): attention lean chunk
+kernel (`STRIX_DS41_ATTN_LEAN=0` to disable), split prefill MoE kernels v2 (`STRIX_DS41_PREFILL_MOE_V2=0`), and
+Engram lookahead between server prefill pieces (`STRIX_DS41_ENGRAM_LOOKAHEAD=0`). Server TTFT, one client, cache off,
+cold English prompts, 2 nodes:
+
+| Prompt | Before (main #148) | Now | Change |
+|---|---:|---:|---:|
+| 8,399 tokens | 10.44 s | **9.70 s** | −7.1 % |
+| 32,499 tokens | 36.85 s | **33.79 s** | −8.3 % |
+| 44,699 tokens | 53.62 s | **48.27 s** | −10.0 % |
+
+Logits and the 32 generated ids equal the published references at all three lengths. Per lever (same GPU turn or
+separate turns, one load per arm): MoE v2 −5.9 / −6.9 / −8.0 %, Engram lookahead −3.3 % at 32,499 and −2.8 % at
+44,699 tokens, attention lean −1.4 to −2.4 %.
+
+`--profile fast` (not enabled until its quality qualification): the relaxed-order MoE lever `STRIX_DS41_FAST_MOE=1`
+measured 9.07 / 31.08 / 44.09 s on the same prompts; it changes logits, so it stays pending.
+
 **DeepSeek with the RTX PRO, pipeline split** (same model files; the RTX runs layers 0-21 with CUDA, the two nodes run
 layers 22-39 and the head):
 
@@ -731,6 +749,14 @@ See [production defaults](docs/models/deepseek-v4.1/production-defaults.md),
 [prefix caching](docs/engine/serving/prefix-state-cache.md#deepseek-pair-agent-prefix-cache),
 [long contexts](docs/models/deepseek-v4.1/long-context.md) and
 [hot-expert placement](docs/models/deepseek-v4.1/hot-placement.md).
+
+Every pair app (`rank`, `batch`, `prefill`, `serve`) accepts `--profile default|fast|quality`; run the
+same profile on both ranks. `default` is the exact production configuration above and sets nothing. `fast`
+adds every qualified bit-changing option; none is qualified yet, so it currently runs like `default` and
+lists its pending options (FP16 sparse attention, relaxed MoE epilogue) in the receipt and in one stderr
+line each. `quality` has no pack for this model and runs `default` with a notice. An explicit environment
+variable or option always wins; `--allow-pending` runs pending options whose code is in the build, for
+benchmarks only, stamped `unqualified`. `--print-effective-config` lists the profile and every option.
 
 **RTX + pair:** use the [pipeline stage launch contract](docs/models/deepseek-v4.1/pipeline-stages.md).
 The RTX runs layers 0–21; the pair runs layers 22–39 and the head. Preserve the declared composed

@@ -1650,6 +1650,12 @@ void run_rank(const Args& a, std::uint32_t rank, std::unique_ptr<strix::dist::Tr
         comm_owner = std::make_unique<strix::dist::Communicator>(strix::dist::Group{rank, 2U, 1U, 0x64733431ULL}, std::move(transport),
                                                                  std::move(gpu_direct), std::size_t{1} << 20U);
     else if (!single) comm_owner = std::make_unique<strix::dist::Communicator>(strix::dist::Group{rank, 2U, 1U, 0x64733431ULL}, std::move(transport), std::size_t{1} << 20U);
+    if (comm_owner) {  // both ranks must run the same product profile
+        auto& comm = *comm_owner;
+        strix::profile::check_peer(strix::deepseek41::pair_defaults::profile_resolution(), [&](std::span<const std::byte> profile_out, std::span<std::byte> profile_in) {
+            comm.exchange_host(profile_out, profile_in, strix::dist::Tag{static_cast<std::uint32_t>(strix::dist::TagKind::control), 0x70726f66U, 0U});
+        });
+    }
     const strix::dist::CommunicatorStats no_stats{};
     strix::deepseek41::DeviceForwardOptions o;
     o.layers = a.layers;

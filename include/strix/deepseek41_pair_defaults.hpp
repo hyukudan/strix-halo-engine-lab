@@ -2,9 +2,12 @@
 
 #include <cstdint>
 #include <functional>
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
+
+#include "strix/engine_profile.hpp"
 
 // Two-node (TP2 pair) defaults of the deepseek41 apps: the plain invocation resolves to the measured production
 // command of the 2026-10-26 qualification run, so nobody has to
@@ -36,6 +39,12 @@
 // allowlist is empty. STRIX_SESSION_CACHE=0, --session-cache off and STRIX_DS41_BASELINE disable sessions.
 // One-shot rank commands remain explicit.
 // --print-effective-config prints the resolved environment and arguments and exits before any device work.
+//
+// Product profile (every app): '--profile default|fast|quality' (strix/engine_profile.hpp, rows in
+// strix/deepseek41_pair_profile_table.hpp) resolves first; default sets nothing, so the resolution above is
+// unchanged. A fast/quality row that is not qualified is pending: listed in the receipt ("profile {...}") and in
+// one stderr line, never applied, never a refusal. '--allow-pending' (STRIX_DS41_PROFILE_ALLOW_PENDING=1) runs a
+// pending row whose code is in this build, stamped "unqualified". Both ranks must run the same profile.
 namespace strix::deepseek41::pair_defaults {
 
 enum class App { rank, batch, prefill, serve };
@@ -74,11 +83,19 @@ struct Resolved {
     std::vector<std::string> unset_env;                        // a path variable given as =0: removed
     std::vector<std::string> notices;                          // one line each
     bool print_only = false;                                   // --print-effective-config (removed from args)
+    std::optional<strix::profile::Resolution> profile;         // --profile (removed from args); always resolved
 };
 
 using Getenv = std::function<const char*(const char*)>;
 
 const char* app_name(App app);
+// The product-profile table of the pair apps (deepseek41_pair_profile_table.hpp).
+const strix::profile::Engine& profile_engine();
+// JSON of this process's resolved profile ("" before Effective ran): the serve's capabilities and receipts.
+const std::string& profile_json();
+// This process's resolved profile (Effective ran first): two-rank apps check it against the peer
+// (strix::profile::check_peer) on their control channel right after the communicator exists.
+const strix::profile::Resolution& profile_resolution();
 // The code defaults adopted on 2026-10-25/26 that STRIX_DS41_BASELINE=1 switches off (variable, value).
 const std::vector<std::pair<std::string, std::string>>& baseline_off_items();
 Resolved resolve(App app, const std::vector<std::string>& args, const Getenv& env, const Probe& probe, const Build& build);

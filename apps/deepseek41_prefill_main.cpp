@@ -623,6 +623,9 @@ std::atomic<bool> task_failed{false};
 void run_rank(const Args& a, const std::vector<std::uint32_t>& prompt, std::uint32_t rank, std::unique_ptr<strix::dist::Transport> t,
               bool print, strix::deepseek41::PrefillResult* out, std::vector<std::pair<std::string, std::uint64_t>>* out_state = nullptr) {
     strix::dist::Communicator comm(strix::dist::Group{rank, 2U, 1U, 0x64733450ULL}, std::move(t), std::move(gpu_direct), std::size_t{22} << 20U);
+    strix::profile::check_peer(strix::deepseek41::pair_defaults::profile_resolution(), [&](std::span<const std::byte> profile_out, std::span<std::byte> profile_in) {
+        comm.exchange_host(profile_out, profile_in, strix::dist::Tag{static_cast<std::uint32_t>(strix::dist::TagKind::control), 0x70726f66U, 0U});
+    });  // both ranks must run the same product profile
     ttft_clock.line("communicator");
     auto o = options(a, prompt.size());
     o.rank = rank;

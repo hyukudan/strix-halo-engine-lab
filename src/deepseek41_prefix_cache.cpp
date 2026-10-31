@@ -588,6 +588,10 @@ PrefixNamespace prefix_namespace_from_env(bool expert_tp_decode) {
     t += "prefill=ep;";
     // Approximate prefill states must never alias the incumbent namespace.
     if (env_or("STRIX_DS41_PREFILL_BF16_ATTN") == "1") t += "prefill_attention=bf16-hilo-v1;";
+    else if (env_or("STRIX_DS41_FAST_ATTN") == "1") t += "prefill_attention=f16wmma-v1;";
+    // FAST MoE: every routed entry takes the relaxed kernels whatever the chunking and route selectors (window / sparse
+    // paths are off under the lever), so its arithmetic is one identity
+    if (env_or("STRIX_DS41_FAST_MOE") == "1") t += "prefill_moe=relaxed-v1;";
     if (env_or("STRIX_DS41_PREFILL_FP16_DENSE") == "1") {
         const auto picks = env_or("STRIX_DS41_FP16_CACHE");
         if (picks.empty() || env_or("STRIX_DS41_FP16_CACHE_READONLY") != "1")
@@ -595,7 +599,7 @@ PrefixNamespace prefix_namespace_from_env(bool expert_tp_decode) {
         t += "prefill_dense=fp16-lt-v1:" + path_digest(picks) + ";";
     }
     // every knob that changes an approximate prefill's arithmetic (unset in the exact default: no change to its namespace)
-    if (env_or("STRIX_DS41_PREFILL_BF16_ATTN") == "1" || env_or("STRIX_DS41_PREFILL_FP16_DENSE") == "1")
+    if (env_or("STRIX_DS41_PREFILL_BF16_ATTN") == "1" || env_or("STRIX_DS41_PREFILL_FP16_DENSE") == "1" || env_or("STRIX_DS41_FAST_ATTN") == "1")
         for (const char* k : {"STRIX_DS41_PREFILL_APPROX_LAYERS", "STRIX_DS41_BF16_ATTN_VARIANT", "STRIX_DS41_PREFILL_FP16_PROJ",
                               "STRIX_DS41_PREFILL_FP16_MIN_ROWS", "STRIX_DS41_PREFILL_FP16_A8", "STRIX_DS41_PREFILL_FP16_FAST",
                               "STRIX_DS41_PREFILL_FP16_WSPLIT"})

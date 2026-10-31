@@ -1263,6 +1263,38 @@ Uses the qualified split gate/up MoE prefill schedule.
 - **Measured gain:** -
 - **Public evidence:** [Two-node defaults](models/deepseek-v4.1/production-defaults.md)
 
+<a id="ds-engram-lookahead"></a>
+
+### Engram lookahead between prefill pieces
+
+**Engine:** `deepseek`. **Control:** `STRIX_DS41_ENGRAM_LOOKAHEAD`. **Default:** ON.
+
+The server's prefill task names the next piece of its plan before each piece. Once the current piece's own Engram rows are read, a background thread reads this rank's Engram rows of the next piece (same row map and Engram history) through the row reader, whose payload cache then serves the next piece's read from host memory. Before, the GPU waited for that read before the first Engram layer of every piece (about 0.9 s per 16,384-row piece).
+
+- **Preconditions:** Two-node server device prefill of more than one piece; Engram payload cache on (the default).
+- **Automatic selection:** On for every piece that has a next piece; a single-piece prompt is unchanged.
+- **Fallback notice:** None; a lookahead that does not match the next piece only costs extra reads.
+- **Exactness evidence:** Bitwise: the cache returns the same bytes; two-node serve logits and generated ids identical to the published references at 8,399 / 32,499 / 44,699 tokens with the lever on and off.
+- **Off switch:** STRIX_DS41_ENGRAM_LOOKAHEAD=0 (STRIX_DS41_ENGRAM_LOOKAHEAD_LOG=1 prints each piece's Engram read and the lookahead read)
+- **Measured gain:** Two-node serve TTFT, same GPU turn, one load per arm: 9.66 / 34.53 / 49.13 s with the lever off vs 9.51 / 33.39 / 47.77 s on at 8,399 / 32,499 / 44,699 tokens (-3.3 % at 32,499, -2.8 % at 44,699); payload-cache hits 123,230 -> 1,074,078 with the same disk reads.
+- **Public evidence:** [Two-node defaults](models/deepseek-v4.1/production-defaults.md)
+
+<a id="ds-moe-v2"></a>
+
+### Split prefill MoE kernels v2
+
+**Engine:** `deepseek`. **Control:** `STRIX_DS41_PREFILL_MOE_V2; STRIX_DS41_PREFILL_MOE_BAND`. **Default:** ON.
+
+IQ2_XXS gate/up and Q2_K down split kernels with the same products, chains, tree and epilogue as forms 7 / 6: each class-wave owns classes q + 8k (tree levels 1-2 in registers, a quarter of the LDS tree exchange; a partial last chunk is balanced across waves and loads only its blocks), two LDS-only barriers per chunk, the Q2_K minimum term as an exact fma chain, permlanes without source copies, weight tiles from two uniform bases with shared 32-bit offsets, and blocks dispatched in bands of 4 batches.
+
+- **Preconditions:** Default form 7, batches of 16 rows, IQ2_XXS gate/up with hidden a multiple of 1024, Q2_K down with width a multiple of 256.
+- **Automatic selection:** On for the eligible split launches; other formats and forms keep their kernels.
+- **Fallback notice:** None; ineligible shapes run the form 7 / 6 kernels silently.
+- **Exactness evidence:** Bitwise: device prefill expert tests (synthetic incl. empty, 1-row and tail experts, real layer 20, DSpark MTP) with v2 on and off; rank-shaped bench (192 of 384 experts, pieces of 2048/4096/8192 rows) A8 codes, deltas, sums and down vectors identical to the previous kernels.
+- **Off switch:** STRIX_DS41_PREFILL_MOE_V2=0 (STRIX_DS41_PREFILL_MOE_BAND=1 keeps batch-fastest order)
+- **Measured gain:** Rank-shaped kernel bench (layer 20, interleaved): down -27 / -30 / -30 %, gate/up -4.5 / -6.1 / -7.8 % at 2048 / 4096 / 8192-row pieces. Two-node serve TTFT at 8,399 / 32,499 / 44,699 tokens (one binary, cache off, one load per arm, separate GPU turns): STRIX_DS41_PREFILL_MOE_V2=0 10.42 / 37.29 / 53.35 s vs default 9.80 / 34.70 / 49.09 s (-5.9 / -6.9 / -8.0 %).
+- **Public evidence:** [Prefill MoE kernels](../src/hip_ds41_prefill.hip)
+
 <a id="ds-dense"></a>
 
 ### Exact dense prefill selector
@@ -1311,6 +1343,26 @@ The f32 attention tiles (the 4-heads-per-wave tile and the f16 kernels' f32 fall
 - **Measured gain:** Two-node in-process ABA, swizzle with the f16 tile vs the f16 tile alone: R6 -0.20 % (3/4 pairs faster), R1 neutral, batch N8 decode -0.04 % / -0.40 % in two turns.
 - **Public evidence:** [Exact memory options](ds41-exact-memory-options.md), [two-node defaults](models/deepseek-v4.1/production-defaults.md)
 
+<a id="ds-attn-lean"></a>
+
+### Attention lean chunk kernel
+
+**Engine:** `deepseek`. **Control:** `STRIX_DS41_ATTN_LEAN`. **Default:** 2.
+
+The packed-attention chunk kernels run the same operations in the same order with fewer instructions. Level 1: the
+softmax exponentials use selects instead of branches over the same polynomial, the running sum is taken in the PV loop
+in the same key order, and the PV loop is split at key 8. Level 2 (default) also dequantises the key tile through f16
+bit patterns and one fused multiply per value, which rounds the same real product once; a key part with a NaN code or
+a scale outside the exact range uses the previous code.
+
+- **Preconditions:** Packed-attention HIP chunk kernels (prefill windows, decode, verify and batch segments).
+- **Automatic selection:** On for every launch.
+- **Fallback notice:** None; parts outside the exact range use the previous dequantisation silently.
+- **Exactness evidence:** Bitwise: HIP attention device tests against the host reference with the default level, and level 1 and 2 byte-equal to level 0 on prefill-shaped calls (four streams, every E4M3/E2M1 code and scale byte, early positions, window-only and compressed layers, A8 combine, every tile choice).
+- **Off switch:** STRIX_DS41_ATTN_LEAN=0 (STRIX_DS41_ATTN_LEAN=1 keeps the previous dequantisation)
+- **Measured gain:** Two-node serve TTFT at 8,399 / 32,499 / 44,699 tokens (one binary, cache off, one load per arm, separate GPU turns): STRIX_DS41_ATTN_LEAN=0 9.99 / 35.20 / 50.29 s vs default 9.80 / 34.70 / 49.09 s (-1.9 / -1.4 / -2.4 %); prefill window bench -11.8 % (32 heads) / -13.5 % (64 heads) per 8-row window.
+- **Public evidence:** [Two-node defaults](models/deepseek-v4.1/production-defaults.md)
+
 <a id="ds-warm"></a>
 
 ### Server warm-up and DSpark calibration
@@ -1341,6 +1393,22 @@ Expire an armed detailed serving observation after a bounded interval.
 - **Exactness evidence:** Observation lifetime changes no arithmetic or committed tokens; inference reference gates remain required.
 - **Off switch:** STRIX_SERVE_OBSERVE_EXPIRY_S=0 keeps observation armed until exit
 - **Measured gain:** No isolated measurement
+
+### Product profiles (pair)
+
+`--profile default|fast|quality` selects the product policy of the two-node DeepSeek apps
+(`strix-deepseek41-rank`, `-batch`, `-prefill`, `-serve`); both ranks must run the same profile (checked at startup: a mismatch stops both ranks with one message naming both profiles).
+It resolves before the [production defaults](models/deepseek-v4.1/production-defaults.md), one row per option in the
+[profile table](../include/strix/deepseek41_pair_profile_table.hpp). `default` exports nothing: the resolution, the
+arguments and every exact default are those of the plain invocation. `fast` applies every ready row; its two
+bit-changing options (FP16 sparse attention, relaxed MoE epilogue) are pending, so the builtin keeps running, each
+appears with its target in `profile.pending` and prints one stderr line. `quality` has no quality pack: it runs
+default settings and says so. Pending rows never refuse.
+
+Explicit environment variables override the profile and are recorded as explicit or off. `--allow-pending` /
+`STRIX_DS41_PROFILE_ALLOW_PENDING=1` applies pending rows whose code is in the build (none today), stamped
+`unqualified: <rows>`. `--print-effective-config` prints `profile ...` lines right after the `app` line; every app
+prints a `profile {...}` receipt line on stderr; the serve also reports it in its capabilities (`profile`).
 
 ## DeepSeek RTX PRO standalone
 
