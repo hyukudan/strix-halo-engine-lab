@@ -767,6 +767,25 @@ Use 64-row scorer tiles at very long contexts (previously pinned to 16 rows abov
 
 `STRIX_QSA_POOL_PACKED=1` (packed BF16 pooled keys) is included as an exact opt-in; it is not a default.
 
+<a id="qwen-qsa-window-grouped-score"></a>
+
+### QSA grouped window attention score
+
+**Engine:** `qwen`. **Control:** `STRIX_QSA_WINDOW_ATTN_V2`. **Default:** 1.
+
+Single-session MTP verify windows (2/4/8 rows) score QSA attention with one wave per group of 12 query heads that
+share a KV head, so each key row is loaded once per group instead of once per head (8 slots per wave at 2 rows, 16
+at 4-8 rows). The MTP draft step scores with four heads per wave in place of its one-block score kernel. Softmax and
+value/gate keep their kernels; prefill tiles and multi-session cohort windows are untouched.
+
+- **Preconditions:** BF16 KV cache, head_dim 256, a multiple of 12 query heads per KV head for windows (of 4 for the draft step); the draft step only where it runs the one-block score kernel (`STRIX_QPERSIST_DRAFT_SCORE` unset). Int8 KV, other shapes, prefill and cohort windows keep the previous score kernels.
+- **Automatic selection:** On when unset. Off with `STRIX_QSA_WINDOW_ATTN_V2=0` (also `off` / `false`), `--baseline` / `STRIX_BASELINE=1` and `STRIX_QPF2K_DEFAULTS=0`. An explicit `STRIX_QSA_WINDOW_GROUPED=1` or `STRIX_QSA_SCORE_SLOTS` other than 4 keeps the explicitly selected window score kernel.
+- **Fallback notice:** Unadmitted shapes run the previous kernels without a notice.
+- **Exactness evidence:** Exact by construction: per (row, head, slot) the same products, the same pairs and the same reduction tree, and every product and addition is operand-pinned (inline `v_mul_f32` / `v_add_f32`) to the order of the kernel it replaces, so results are byte-identical including NaN payloads. `strix-hip-qsa-window-attn-v2-tests` compares raw scores, probabilities, outputs and A8 codes/deltas byte for byte against the replaced production kernels (counts 1..2051, contiguous and sparse selections, non-finite inputs including NaN keys and queries with distinct payloads) and checks the routing. MTP decode A/B, 2 rounds: complete token IDs identical, 34 exactness checks pass.
+- **Off switch:** STRIX_QSA_WINDOW_ATTN_V2=0
+- **Measured gain:** MTP decode with 1K-token prompts +3.0 to +5.7 % (code prompt 59.25 -> 61.98 tok/s, +4.6 %, windows of 2 rows +3.1 %, of 8 rows +4.7 %; prose prompt +4.2 %, 2 rows +3.0 %, 8 rows +5.7 %). Score kernel at 2,051 selected tokens: 170 / 327 / 640 us -> about 19 / 30 / 55 us per call at 2 / 4 / 8 rows; draft score 326 -> 17 us.
+- **Implementation / evidence:** [QSA launcher](../src/hip_indexed_attention_launcher.hip), [fixture](../tests/hip_qsa_window_attn_v2_tests.hip)
+
 ### Exact options that remain opt-in
 
 MoE PK/MERGE, QSA_OUT16, attend pairing and `STRIX_QPF2K_HC_LOWBAND` are exact experiments with neutral or unmeasured complete-workload

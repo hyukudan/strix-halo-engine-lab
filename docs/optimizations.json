@@ -609,6 +609,17 @@
     "doc_anchor": "docs/optimizations.md#qwen-qsa-score-rows64"
   },
   {
+    "engine": "qwen",
+    "name": "QSA grouped window attention score",
+    "flag_or_env": "STRIX_QSA_WINDOW_ATTN_V2",
+    "default": "1",
+    "exact": "Exact by construction: per (row, head, slot) the same products, pairs and reduction tree, every product and addition operand-pinned to the replaced kernel's order, so byte-identical including NaN payloads. strix-hip-qsa-window-attn-v2-tests: raw scores, probabilities, outputs and A8 codes/deltas byte-identical to the replaced production kernels (counts 1..2051, sparse selections, non-finite inputs including distinct-payload NaN keys and queries); routing checked. MTP decode A/B: token IDs identical, 34 exactness checks pass.",
+    "gain": "MTP decode with 1K-token prompts +3.0 to +5.7 % (code +4.6 %, prose +4.2 %; 2-row windows +3.0..+3.1 %, 8-row +4.7..+5.7 %). Window score kernel 170/327/640 -> ~19/30/55 us per call at 2/4/8 rows (2,051 tokens); draft score 326 -> 17 us.",
+    "preconditions": "Single-session MTP verify windows of 2/4/8 rows: BF16 KV, head_dim 256, a multiple of 12 query heads per KV head; the MTP draft step (multiple of 4) where it runs the one-block score kernel (STRIX_QPERSIST_DRAFT_SCORE unset). Prefill tiles, multi-session cohort windows and int8 KV are untouched; an explicit STRIX_QSA_WINDOW_GROUPED=1 or STRIX_QSA_SCORE_SLOTS other than 4 keeps the selected kernel. Off under --baseline / STRIX_BASELINE=1 and STRIX_QPF2K_DEFAULTS=0.",
+    "off_switch": "STRIX_QSA_WINDOW_ATTN_V2=0 (or off / false)",
+    "doc_anchor": "docs/optimizations.md#qwen-qsa-window-grouped-score"
+  },
+  {
     "engine": "deepseek",
     "name": "Prepared rank-local expert loading",
     "flag_or_env": "STRIX_DS41_PREPARED_LOAD; STRIX_DS41_PREPARED_ROOT",
