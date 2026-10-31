@@ -2452,11 +2452,12 @@ void lead(const Args& initial, BatchForward& fwd, strix::dist::Communicator& com
     };
     // interleave: the active task's next unit on both ranks (budget_rows 0: up to its next default piece end)
     // A resumable task stopped inside a piece continues that piece, including while idle.
-    const auto run_unit = [&](std::uint32_t budget_rows) {
+    const auto run_unit = [&](std::uint32_t budget_rows, bool decoding) {
         auto& at = *active;
         const std::uint32_t end = at.task->mid_piece() ? at.task->piece_end()
                                                        : strix::deepseek41::sched::next_unit_end(at.task->rows(), at.task->default_ends(), budget_rows, kMinRows);
-        const std::uint32_t budget = strix::deepseek41::sched::unit_budget(sched,
+        const bool others_waiting = std::any_of(running.begin(), running.end(), [&](const auto& r) { return r->device_prefill && r.get() != at.r; });
+        const std::uint32_t budget = strix::deepseek41::sched::tick_budget(sched, decoding, others_waiting,
             [&](double ms) { return at.task->units_within(ms); });
         Control c;
         c.command = static_cast<std::uint32_t>(Command::prefill_unit);
@@ -3101,7 +3102,7 @@ void lead(const Args& initial, BatchForward& fwd, strix::dist::Communicator& com
                 }
                 if (active) {
                     // phase B (resumable): the default pieces, a few units per tick; else pieces of unit_rows rows
-                    run_unit(strix::deepseek41::sched::row_budget(sched, seqs.empty()));
+                    run_unit(strix::deepseek41::sched::row_budget(sched, seqs.empty()), !seqs.empty());
                     if (!active) publish();  // its first token
                     continue;
                 }

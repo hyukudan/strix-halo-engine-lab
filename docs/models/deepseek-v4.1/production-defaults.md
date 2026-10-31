@@ -207,6 +207,9 @@ Device serving now defaults to a 250 ms soft service target and stable short-fir
 admission/waiting-prefill selection. These additions still require both-rank GPU and
 mixed-load qualification; the P17.1 figures above do not qualify them. See the
 [server contract and legacy-budget precedence](../../engine/serving/serving.md#deepseek-v41-pair-scheduler).
+While no request decodes and no other prompt waits for its prefill, the pending prefill runs the rest of its
+piece at once instead of 250 ms units (same bits; a request that arrives meanwhile waits for that piece);
+`STRIX_DS41_SERVE_IDLE_WHOLE=0` keeps the bounded units while idle.
 Use `STRIX_DS41_SERVE_SERVICE_MS=0` for coarse row budgeting and
 `STRIX_DS41_SERVE_SHORT_FIRST=0` for FIFO; restart both ranks when changing settings.
 

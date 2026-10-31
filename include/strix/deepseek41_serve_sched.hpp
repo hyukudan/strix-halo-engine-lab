@@ -26,7 +26,8 @@
 //     local prefill never runs.
 //   interleave (device default): the prefill runs as a PrefillTask in bounded units between decode steps: every scheduler tick runs one
 //     batch step of the decoding requests, then one unit of the pending prefill, until it completes; then the request
-//     joins the batch. Idle prompts use the same bounded service. Default pieces stay unchanged;
+//     joins the batch. While no request decodes and no other prompt waits for its prefill, a tick runs the rest of the
+//     piece at once (STRIX_DS41_SERVE_IDLE_WHOLE=0: the bounded service while idle too). Default pieces stay unchanged;
 //     resumable finest units target STRIX_DS41_SERVE_SERVICE_MS (default 250). With no legacy controls, 0 restores
 //     whole default pieces while idle and row units beside decoders.
 //     Explicit legacy controls override SERVICE_MS; positive UNIT_MS > UNIT_BUDGET > UNIT_ROWS.
@@ -54,6 +55,11 @@ struct Options {
     double unit_ms = 0.0;
     double service_ms = 250.0;
     bool legacy_units = false, short_first = true;
+    // interleave, service-target units: while no request decodes and no other prompt waits for its prefill, a tick runs
+    // the rest of the current piece at once (the whole-piece form: no per-unit drain and control round, MoE chunks of the
+    // prefill's own size; same bits). A request that arrives meanwhile waits for the piece. STRIX_DS41_SERVE_IDLE_WHOLE=0:
+    // bounded units while idle too.
+    bool idle_whole = true;
     [[nodiscard]] double target_ms() const noexcept { return legacy_units ? unit_ms : service_ms; }
     [[nodiscard]] const char* budget_source() const noexcept {
         return legacy_units ? (unit_ms > 0.0 ? "legacy-ms" : unit_budget > 0U ? "fixed-units" : "row-units") :
@@ -115,6 +121,10 @@ inline Options options_from(bool device_prefill, Env env) {
         o.short_first = v == "1";
     }
     if (const auto v = env("STRIX_DS41_SERVE_SCHED_MOE_CHUNK"); !v.empty()) o.moe_chunk_rows = static_cast<std::uint32_t>(std::stoul(v));
+    if (const auto v = env("STRIX_DS41_SERVE_IDLE_WHOLE"); !v.empty()) {
+        if (v != "0" && v != "1") throw std::invalid_argument("STRIX_DS41_SERVE_IDLE_WHOLE is 0 or 1");
+        o.idle_whole = v == "1";
+    }
     o.log = o.mode != Mode::off && env("STRIX_DS41_SERVE_SCHED_LOG") != "0";
     return o;
 }
@@ -163,6 +173,13 @@ inline constexpr std::uint32_t kAutoPrefillFallback = 2048U;
     return o.resumable() || (idle && !o.legacy_units) ? UINT32_MAX : o.unit_rows;
 }
 
+// A tick's PrefillTask budget: 0 (the rest of the piece at once) while idle_whole and no request decodes or waits for its
+// prefill (service-target units only; explicit legacy controls keep their units), else unit_budget.
+template <class Predict>
+[[nodiscard]] std::uint32_t tick_budget(const Options& o, bool decoding, bool others_waiting, Predict predict) {
+    if (o.idle_whole && !o.legacy_units && o.service_ms > 0.0 && !decoding && !others_waiting) return 0U;
+    return o.target_ms() > 0.0 ? std::max(1U, predict(o.target_ms())) : o.unit_budget;
+}
 template <class Predict>
 [[nodiscard]] std::uint32_t unit_budget(const Options& o, Predict predict) {
     return o.target_ms() > 0.0 ? std::max(1U, predict(o.target_ms())) : o.unit_budget;
