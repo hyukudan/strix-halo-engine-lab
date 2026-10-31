@@ -874,6 +874,8 @@ __device__ __forceinline__ float f16_scaled(std::uint32_t bits16, float s) {
 }
 // Lean 3: the E4M3 halves as x + (x & 0x4000) with x = byte << 7 (the sign lands on bit 14 and the add carries it to
 // bit 15): the same bits as (c & 0x7F) << 7 | sign << 15 in one instruction less per pair.
+// E2M1: the f16 high byte of each nibble, (n & 8) << 4 | (n & 7) << 1, for all 8 nibbles of a word in two masks and
+// one byte permutation per byte (no byte extraction, no integer multiply): the same halves.
 template <bool Swizzle, bool Lean3 = false>
 __device__ __forceinline__ void store_key_lean(float4* row, unsigned part, const KeyRaw& k, bool win, bool valid) {
     const std::uint32_t cw[8] = {k.c0.x, k.c0.y, k.c0.z, k.c0.w, k.c1.x, k.c1.y, k.c1.z, k.c1.w};
@@ -913,8 +915,18 @@ __device__ __forceinline__ void store_key_lean(float4* row, unsigned part, const
             std::uint32_t h[2];
 #pragma unroll
             for (unsigned t = 0; t < 2; ++t) {   // byte t of the 16 bits: its low nibble -> low half, high nibble -> high half
-                const std::uint32_t by = (w >> (8U * t)) & 0xFFU, pz = (by | (by << 12U)) & 0x000F000FU;
-                h[t] = ((pz & 0x00070007U) << 9U) | ((pz & 0x00080008U) << 12U);
+                if constexpr (Lean3) {
+                    // the f16 high bytes of every nibble of the word at once, (n & 8) << 4 | (n & 7) << 1 (low nibbles
+                    // in xl, high nibbles in xh), then one byte permutation per byte: the same halves as below
+                    const std::uint32_t c = cw[i / 2];
+                    const std::uint32_t xl = ((c << 4U) & 0x80808080U) | ((c << 1U) & 0x0E0E0E0EU);
+                    const std::uint32_t xh = (c & 0x80808080U) | ((c >> 3U) & 0x0E0E0E0EU);
+                    const std::uint32_t kb = 2U * (i % 2U) + t;   // byte of the word
+                    h[t] = __builtin_amdgcn_perm(xh, xl, 0x000C000CU | (kb << 8U) | ((4U + kb) << 24U));
+                } else {
+                    const std::uint32_t by = (w >> (8U * t)) & 0xFFU, pz = (by | (by << 12U)) & 0x000F000FU;
+                    h[t] = ((pz & 0x00070007U) << 9U) | ((pz & 0x00080008U) << 12U);
+                }
             }
             const float s = sv[i / 4];
             row[lds_key_slot<Swizzle>(key_slot(part, i))] = make_float4(f16_scaled(h[0], s), f16_scaled(h[0] >> 16U, s),
