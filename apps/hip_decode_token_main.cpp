@@ -1175,7 +1175,8 @@ static int run_decode_entry(
     // Bind supplied numerical settings; operational paths, switches and budgets are excluded.
     const std::set<std::string_view> session_io_options{"--session-save", "--session-load", "--session-then-prompt", "--session-logits",
         "--session-cache", "--session-disk", "--session-disk-bytes", "--session-first-generate", "--session-capture-host-bytes", "--session-dir", "--session-ram-bytes", "--session-max-parked", "--http-port",
-        "--generate", "--tokens-file", "--record-raw", "--reference", "--teacher-logits-file"};
+        "--generate", "--tokens-file", "--record-raw", "--reference", "--teacher-logits-file",
+        "--prefix-cache-inflight", "--prefix-cache-disk", "--prefix-cache-durable"};
     for (int i = 2; i < argc; ++i) {
         const std::string_view arg = argv[i];
         if (!arg.starts_with("--")) continue; // positional token IDs
@@ -3438,8 +3439,9 @@ static int run_decode_entry(
                 prefix_cache_every = options.prefix_cache_every ? options.prefix_cache_every
                     : std::max<std::uint64_t>(rows, (4096U + rows - 1U) / rows * rows);
                 prefix_store = std::make_shared<strix::PrefixStateCache>(strix::PrefixStateCachePolicy{
-                    options.prefix_cache_host_bytes, options.prefix_cache_dir, options.prefix_cache_disk_bytes,
-                    options.prefix_cache_retention == "fair" ? strix::PrefixCacheRetention::fair : strix::PrefixCacheRetention::lru, options.baseline},
+                    options.prefix_cache_host_bytes, options.prefix_cache_disk ? options.prefix_cache_dir : "", options.prefix_cache_disk_bytes,
+                    options.prefix_cache_retention == "fair" ? strix::PrefixCacheRetention::fair : strix::PrefixCacheRetention::lru, options.baseline,
+                    !options.baseline, options.prefix_cache_durable},
                     options.baseline ? strix::decode_cli::hip_pinned_prefix_buffer : strix::decode_cli::hip_pinned_prefix_capture_buffer);
                 options.state_cache_stats->publish(strix::decode_cli::prefix_snapshot(*prefix_store));
                 prefix_state = std::make_unique<strix::decode_cli::HipPrefixStateCacheSession>(prefix_store,
@@ -3499,8 +3501,9 @@ static int run_decode_entry(
                             prefix_cache_every = options.prefix_cache_every ? options.prefix_cache_every
                                 : strix::decode_cli::prefix_capture_cadence(rows,0);
                             prefix_store = std::make_shared<strix::PrefixStateCache>(strix::PrefixStateCachePolicy{
-                                options.prefix_cache_host_bytes, options.prefix_cache_dir, options.prefix_cache_disk_bytes,
-                                options.prefix_cache_retention == "fair" ? strix::PrefixCacheRetention::fair : strix::PrefixCacheRetention::lru, options.baseline},
+                                options.prefix_cache_host_bytes, options.prefix_cache_disk ? options.prefix_cache_dir : "", options.prefix_cache_disk_bytes,
+                                options.prefix_cache_retention == "fair" ? strix::PrefixCacheRetention::fair : strix::PrefixCacheRetention::lru, options.baseline,
+                                !options.baseline, options.prefix_cache_durable},
                                 options.baseline ? strix::decode_cli::hip_pinned_prefix_buffer : strix::decode_cli::hip_pinned_prefix_capture_buffer);
                             options.state_cache_stats->publish(strix::decode_cli::prefix_snapshot(*prefix_store));
                             prefix_state = std::make_unique<strix::decode_cli::HipPrefixStateCacheSession>(prefix_store,

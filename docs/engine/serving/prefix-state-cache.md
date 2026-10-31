@@ -233,9 +233,9 @@ It never constructs a new request from the remaining tokens.
 
 Serial capture retains the synchronous, fenced snapshot path. Asynchronous serial
 capture declines as `serial-async-capture-unsupported`; no unordered snapshot is
-submitted. Certified serial checkpoints are RAM-only, including explicit legacy
-configuration. Old uncertified disk/RAM entries and segment grids smaller than T
-cannot authorize reuse. Other legacy disk APIs and formats are unchanged.
+submitted. Certified serial checkpoints can use the explicitly configured prefix disk tier.
+Old uncertified disk/RAM entries and segment grids smaller than T cannot authorize
+reuse. Baseline retains the original legacy disk path.
 
 Request receipts and published cache statistics expose named `certificate_declines`.
 Reasons distinguish unsupported plans/boundaries/units, mismatched producer or state
@@ -331,8 +331,9 @@ The next selected checkpoint reuses these charged row leases. This preserves bot
 the checkpoint cadence and the one-block staging default. A delayed/busy descriptor
 can prevent that preparation; missing slices exceeding the cap still skip.
 
-Certified checkpoints remain RAM-only and cannot use the v1 disk writer or reader.
-Existing MTP legacy disk APIs/formats and baseline capture/priming behavior remain unchanged.
+Certified checkpoints use the existing v1 store with a tagged certificate envelope
+in its opaque metadata section when a disk directory is explicitly configured.
+Existing segment files and baseline capture/priming behavior remain unchanged.
 No old uncertified RAM or disk checkpoint is accepted by certified lookup.
 
 With schedule 12, pipeline 255, default cadence (4096 rounded up to T), tiled-start
@@ -638,3 +639,70 @@ capacity reductions are introduced. Hashing, component framing, native producer
 order and predictor priming order are unchanged; automatic target snapshot/download submission moves ahead of
 priming under the split dependencies above. Pooling alone does not establish
 the complete-workload cost or native exactness qualification gates.
+
+
+### Certified restart and in-flight joining
+
+`--prefix-cache-disk on|off` / `STRIX_PREFIX_CACHE_DISK=0|1|off|on` controls the
+explicit disk tier. `--prefix-cache-durable on|off` /
+`STRIX_PREFIX_CACHE_DURABLE=0|1|off|on` controls durable publication. Both default
+on with an explicitly configured `--prefix-cache-dir`; neither creates a directory
+or budget by default. CLI wins over environment. On POSIX, files are flushed and
+synced before rename, segment directory entries are synced before checkpoint
+publication, and the directory is synced after publishing the checkpoint. Other
+host platforms sync file contents only. Baseline preserves legacy disk behavior.
+
+The existing v1 checkpoint header's metadata-envelope tag distinguishes legacy
+metadata (0) from certificate plus metadata (1). The section checksum covers both;
+segments, digest chains, paths and store are unchanged. A certified disk candidate
+must pass the same certificate, token, complete-state and cold-cursor preflight as
+RAM before hit credit or device copies. Legacy and certified reads never cross.
+An invalid candidate misses or falls back to a shorter checkpoint. Restart uses
+the same binary, model, runtime, capacity, execution signature and scheduler
+namespace. Named session envelopes are a separate continuation protocol.
+
+Restore retains main's reservation-backed whole-load path and immutable DMA
+leases. This change adds neither an aligned second format nor deferred/streamed
+payloads. Snapshot and restore failures keep the existing drain/quarantine rules.
+
+`--prefix-cache-inflight on|off` / `STRIX_PREFIX_CACHE_INFLIGHT=0|1|off|on`
+defaults on wherever the prefix cache is on: it follows the cache's own enablement
+and never widens the cache's qualified routes. It acts only where concurrent
+producers and joiners share a strict L0 certified batch route; on the single
+runner (including the automatic default route) it is inert. `--prefix-cache off`
+and baseline turn it off. It is armed only with an active cache and interleaved ordinary
+admission, solo prompt groups (`STRIX_PROMPT_BATCH=0`), lookup enabled, matching
+full-T cold certificates/namespaces and the existing suffix-solo/nesting guards.
+Short-first eligible consumers, policy selection, service-mode admissions,
+no-store producers and producers restored from a cache do not supply shared work.
+Consumer no-store still permits a validated hit. No production qualification or
+automatic budget is enabled by this policy default.
+
+A joining prompt waits before lookup and before executing any units. It requests
+an existing full-T capture boundary of the producer's cold plan, without splitting
+or replanning blocks. Any cache grid that divides T, including the HTTP 1024-row
+checkpoint default, contains those boundaries. Independent waiters can request different boundaries. After
+the producer passes the boundary, the consumer performs ordinary certified lookup
+and installs its own preflighted whole-prompt continuation cursor. Only an observed
+valid snapshot can become a hit; missed capture falls back to an ordinary lookup
+or cold execution. Cancellation and completion release waiters; an admission
+generation prevents reused producer slots from extending an old wait. Waiting
+consumers do not enter prompt groups, window cohorts or nested execution.
+
+Effective config's `prefix_cache` and HTTP capabilities report the armed `inflight`,
+`certified_disk`, `durable` policies and `inflight_policy` guards, plus
+`inflight_requested`, `inflight_source` (`default`, `cli`, `env`, `baseline` or
+`prefix-cache-off`) and `inflight_reason` (`armed`, `off-switch`, `single-slot-route`,
+`prefix-cache-inactive`, `batch-cert-not-strict-l0`, ...); these are not a
+promise of a hit on every request. The batch shutdown receipt reports
+`inflight_waits`, `inflight_wait_tokens` and `inflight_restored_tokens`.
+
+The exactness contract preserves the cold T/tail decomposition, owner/kernel and
+profile identities, priming and committed target/predictor generations/lineage.
+It does not infer that tail rows equal full-T rows from the segment size. The
+canonical effective-execution signature and QFULLT2 batch namespace remain the
+admission authority. The new operational switches do not change that signature.
+
+Source and host tests do not qualify native execution or timing. Run the
+[serving gate](serving.md#prefix-joining-and-restart-qualification) before claiming
+native equality, a complete-workload gain or broader automatic admission.

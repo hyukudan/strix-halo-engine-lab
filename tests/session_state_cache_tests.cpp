@@ -247,6 +247,21 @@ int main() {
             set(nullptr); check(!one.starts_with(strix::session_numerical_config("cli")),"removed runtime env accepted as prefix");
             set(saved ? saved->c_str() : nullptr);
         }
+        for(const auto* key:{"STRIX_PREFIX_CACHE_INFLIGHT","STRIX_PREFIX_CACHE_DISK","STRIX_PREFIX_CACHE_DURABLE"}) {
+            const char* previous=std::getenv(key);
+            const std::optional<std::string> saved=previous?std::optional<std::string>{previous}:std::nullopt;
+            const auto set=[&](const char* value) {
+#ifdef _WIN32
+                check(_putenv_s(key,value?value:"")==0,"operational environment update");
+#else
+                check((value?setenv(key,value,1):unsetenv(key))==0,"operational environment update");
+#endif
+            };
+            set(nullptr);const auto absent=strix::session_numerical_config("same CLI");
+            set("0");check(absent==strix::session_numerical_config("same CLI"),"operational off must preserve numerical signature");
+            set("1");check(absent==strix::session_numerical_config("same CLI"),"operational on must preserve numerical signature");
+            set(saved?saved->c_str():nullptr);
+        }
         std::filesystem::remove_all(dir);
         std::cout<<"session_state_cache_tests PASS\n"; return 0;
     } catch(const std::exception& e) {

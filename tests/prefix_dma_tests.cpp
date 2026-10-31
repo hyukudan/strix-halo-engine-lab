@@ -904,15 +904,17 @@ void batch_snapshot_tests() {
     snapshot_shim=true;drain_error=copy_error=hipSuccess;allocation_failure=false;
     const auto id=sha256_bytes(std::as_bytes(std::span("batch-dma",9)));
     const auto producer=reinterpret_cast<hipStream_t>(2),predictor=reinterpret_cast<hipStream_t>(3),foreign=reinterpret_cast<hipStream_t>(4);
-    for(unsigned scenario=0;scenario<5;++scenario) {
+    const auto tier=std::filesystem::temp_directory_path()/
+        ("strix-batch-prefix-dma-"+std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+    for(unsigned scenario=0;scenario<6;++scenario) {
         operations.clear();
-        auto store=std::make_shared<PrefixStateCache>(PrefixStateCachePolicy{8192,{},0},[](std::uint64_t n) {
+        auto store=std::make_shared<PrefixStateCache>(PrefixStateCachePolicy{8192,scenario==5?tier:std::filesystem::path{},0},[](std::uint64_t n) {
             return PrefixCacheBuffer{std::shared_ptr<std::byte>(new std::byte[n?n:1]{},std::default_delete<std::byte[]>()),n};
         });
         SerialSessionStateLayout layout;layout.layout_identity=1;layout.context_tokens=8;
         SessionStateMemoryBinding memory;memory.layout_identity=1;
         std::array<std::byte,8> rows{};std::byte fixed{31};
-        HipPrefixStateCacheSession adapter(store,id,2,2,ModelContract{},layout,memory);
+        HipPrefixStateCacheSession adapter(store,id,2,scenario==5?8U:2U,ModelContract{},layout,memory);
         adapter.add_rows(reinterpret_cast<std::uintptr_t>(rows.data()),1,0);
         adapter.add_fixed_device(reinterpret_cast<std::uintptr_t>(&fixed),1);
         QwenTiledPlanConfig config;config.rows=2;config.block={2,QwenPlanOutput::terminal};
@@ -950,8 +952,10 @@ void batch_snapshot_tests() {
         require(!adapter.try_prepare_capture(session,tokens,producer,true,{producer,predictor,predictor},7,{},{},&tag) && operations.empty(),"batch no-store prepares nothing");
         require(store->counters().no_store_skips==no_store+1,"batch no-store counted");
         adapter.set_retention(true);
+        if(scenario==5) adapter.request_capture(2); // off cadence, unchanged cold full-T boundary
         auto d=adapter.try_prepare_capture(session,tokens,producer,true,{producer,predictor,predictor},7,{},{},&tag);
         require(bool(d),"batch tagged snapshot prepared");
+        require(d->publish,"requested boundary publishes fixed state without changing the producer plan");
         const auto before_waits=waits;
         PrefixAsyncCapture::before_writer(&other_tag,foreign);
         require(!d->poisoned,"another slot does not poison the snapshot");
@@ -976,6 +980,7 @@ void batch_snapshot_tests() {
             require(chain && chain->empty(),"poisoned snapshot cannot publish private row segments");
             continue;
         }
+        store->flush(); // Complete disk publication before the later deliberate RAM corruption.
         const auto digests=prefix_cache_block_digests(identity,tokens,2,1);
         const auto checkpoint=store->find_longest(identity,tokens,2,2);
         require(checkpoint && checkpoint->producer_certificate==adapter.execution_certificate(2),"batch certificate stored");
@@ -1017,7 +1022,33 @@ void batch_snapshot_tests() {
         other.set_plan(config,8,true,2,batch);fresh={};fresh.state_layout_identity=1;
         require(other.begin_request(fresh,tokens)==0 && other_fixed==std::byte{77},"batch corrupt proof is a zero-write miss");
         require(digests[0]==checkpoint->digest,"cross-slot token namespace stable");
+        if(scenario==5) {
+            auto restarted=std::make_shared<PrefixStateCache>(PrefixStateCachePolicy{8192,tier,0},[](std::uint64_t n) {
+                return PrefixCacheBuffer{std::shared_ptr<std::byte>(new std::byte[n?n:1]{},std::default_delete<std::byte[]>()),n};
+            });
+            std::array<std::byte,8> restored_rows{};restored_rows.fill(std::byte{77});
+            std::byte restored_fixed{77};
+            HipPrefixStateCacheSession restored(restarted,id,2,8,ModelContract{},layout,memory);
+            restored.add_rows(reinterpret_cast<std::uintptr_t>(restored_rows.data()),1,0);
+            restored.add_fixed_device(reinterpret_cast<std::uintptr_t>(&restored_fixed),1);
+            restored.set_plan(config,8,true,2,batch);
+            std::uint64_t frontier=0;restored.bind_restore_runtime([&](std::uint64_t p){frontier=p;});
+            restored.set_retention(false);
+            SerialSessionContext cold;cold.state_layout_identity=1;
+            require(restored.begin_request(cold,tokens)==2 && frontier==2 && restored_fixed==std::byte{31},
+                "fresh store certified adapter restores persisted fixed state and predictor hook");
+            require(restored_rows[0]==rows[0] && restored_rows[1]==rows[1] && restored_rows[2]==std::byte{77} &&
+                cold.state.valid==session.state.valid && cold.state.generations==session.state.generations &&
+                cold.arithmetic_lineage.intervals==session.arithmetic_lineage.intervals &&
+                cold.arithmetic_lineage.history_identity==session.arithmetic_lineage.history_identity &&
+                cold.arithmetic_lineage.tainted==session.arithmetic_lineage.tainted &&
+                cold.next_position==session.next_position && cold.committed_tokens==session.committed_tokens,
+                "persisted adapter restores exact rows and complete committed metadata");
+            require(restarted->counters().disk_hits==1 && restarted->counters().host_checkpoints==0,
+                "fresh adapter restart is a disk-only no-store hit");
+        }
     }
+    std::filesystem::remove_all(tier);
     operations.clear();snapshot_shim=false;
     set_prefix_batch_certification_enabled(false);
 }

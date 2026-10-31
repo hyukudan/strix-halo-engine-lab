@@ -228,9 +228,10 @@ inline MtpDecodeServe make_http_serve(const Options& options, std::string engine
         config.default_min_p = options.http_default_min_p;
         config.responses = options.http_responses;
         config.capabilities = options.http_capabilities;
-        config.capabilities_extra = [modes=session_modes_json(options), policy=cache_activation_json(options)](serve::Json& out) {
+        config.capabilities_extra = [modes=session_modes_json(options), policy=cache_activation_json(options), &options](serve::Json& out) {
             qwen_rotary_capabilities(out);
             out.set("cache_policy",policy);
+            prefix_cache_capabilities(out,options);
             out.set("session_numerical_modes",modes);
         };
         config.stream_receipts = options.http_stream_receipts;
@@ -339,6 +340,7 @@ inline MtpDecodeBatchServe make_http_batch_serve(const Options& options, std::st
         auto cert=serve::Json::object();
         prefix_batch_cert_capabilities(cert,options);
         cert.set("cache_policy",cache_activation_json(options));
+        prefix_cache_capabilities(cert,options);
         config.capabilities_extra = [modes=session_modes_json(options), cert=std::move(cert)](serve::Json& out) {
             qwen_rotary_capabilities(out);
             out.set("session_numerical_modes",modes);

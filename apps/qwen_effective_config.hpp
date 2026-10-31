@@ -126,6 +126,7 @@ inline Environment requested_prefill_environment(Get get) {
             "STRIX_CTX_EXACT_MEMORY", "STRIX_QSA_SCORE_RING", "STRIX_QSA_SCORE_RING_ROWS", "STRIX_TERMINAL_LOGITS_ARENA",
             "STRIX_SESSION_CACHE", "STRIX_SESSION_DISK", "XDG_CACHE_HOME", "HOME",
             "STRIX_PREFIX_BATCH_CERT", "STRIX_QWEN_YARN_MTP", "STRIX_QWEN_YARN_HOST_RESERVE", "STRIX_PLE_ROLLING_CAP_BYTES", "STRIX_PLE_ROLLING", "STRIX_PLE_ROLLING_POSITIONS", "STRIX_PREFIX_CACHE", "STRIX_PREFIX_CACHE_RETENTION",
+            "STRIX_PREFIX_CACHE_INFLIGHT", "STRIX_PREFIX_CACHE_DISK", "STRIX_PREFIX_CACHE_DURABLE",
             "STRIX_SERVE_PREFILL", "STRIX_BATCH_PROMPT_SMALL"})
         if (!(qpf2k::pre_injected_moe_marker && std::string_view(name) == "STRIX_QPF2K_MOE_DEFAULTED"))
             if (const char* value = get(name)) env.emplace(name, value);
@@ -676,6 +677,43 @@ inline bool prefix_batch_cert_active(const Options& o) {
     return o.prefix_batch_cert && !o.baseline && ordinary_http_batch_slots(o) &&
         o.prefix_cache && o.prefix_cache_host_bytes;
 }
+// In-flight joining follows the prefix cache's own enablement: it is on by
+// default wherever the cache is on, and armed only where concurrent producers
+// and joiners share a strict-L0 certified batch route. A single-slot route has
+// no concurrent producer, so the policy is inert there. It never widens the
+// cache's qualified route set.
+struct PrefixInflightState {
+    bool requested=false, effective=false;
+    std::string source, reason;
+};
+inline PrefixInflightState prefix_cache_inflight_state(const Options& o) {
+    PrefixInflightState s{o.prefix_cache_inflight,false,o.prefix_cache_inflight_source,"armed"};
+    if(o.baseline) s.reason="baseline";
+    else if(!o.prefix_cache) s.reason="prefix-cache-off";
+    else if(!o.prefix_cache_inflight) s.reason="off-switch";
+    else if(!ordinary_http_batch_slots(o)) s.reason="single-slot-route";
+    else if(!o.prefix_cache_host_bytes) s.reason="prefix-cache-inactive";
+    else if(prefix_batch_cert_execution_mode(o)!=1) s.reason="batch-cert-not-strict-l0";
+    else s.effective=true;
+    return s;
+}
+inline void prefix_inflight_json(serve::Json& out,const Options& o) {
+    const auto state=prefix_cache_inflight_state(o);
+    out.set("inflight",serve::Json(state.effective));
+    out.set("inflight_requested",serve::Json(state.requested));
+    out.set("inflight_source",serve::Json(state.source));
+    out.set("inflight_reason",serve::Json(state.reason));
+    out.set("inflight_policy",serve::Json("strict-l0; matching-cold-full-t; ordinary-admission-only"));
+}
+inline void prefix_cache_capabilities(serve::Json& out,const Options& o) {
+    if(o.baseline || !o.prefix_cache || !o.prefix_cache_host_bytes) return;
+    serve::Json cache=serve::Json::object();
+    const bool disk=o.prefix_cache_disk && !o.prefix_cache_dir.empty();
+    cache.set("certified_disk",serve::Json(disk));
+    cache.set("durable",serve::Json(disk && o.prefix_cache_durable));
+    prefix_inflight_json(cache,o);
+    out.set("prefix_cache",std::move(cache));
+}
 inline void prefix_batch_cert_capabilities(serve::Json& out, const Options& o) {
     if (!prefix_batch_cert_active(o)) return;
     serve::Json cert=serve::Json::object();
@@ -683,6 +721,7 @@ inline void prefix_batch_cert_capabilities(serve::Json& out, const Options& o) {
     cert.set("experimental",serve::Json(true));
     cert.set("l1_qualified",serve::Json(false));
     cert.set("automatic_qualified",serve::Json(false));
+    cert.set("inflight",serve::Json(prefix_cache_inflight_state(o).effective));
     out.set("prefix_batch_certification",std::move(cert));
 }
 // Separate from cache-budget admission: Round 1 permits strict L0 restores only.
@@ -864,8 +903,11 @@ inline std::string cache_defaults_suppression(const Options& o, const Environmen
     return {};
 }
 inline bool explicit_cache_configuration(const Options& o, const Environment& env) {
+    // Joining and disk-publication switches are policies within the cache, not
+    // a cache configuration: they never move a run off the automatic path.
     for(const auto& flag:o.supplied_options)
-        if(flag.starts_with("--prefix-cache") || flag=="--prefix-batch-cert" || flag.starts_with("--session-")) return true;
+        if((flag.starts_with("--prefix-cache") && flag!="--prefix-cache-inflight" && flag!="--prefix-cache-disk" &&
+            flag!="--prefix-cache-durable") || flag=="--prefix-batch-cert" || flag.starts_with("--session-")) return true;
     for(const auto* name:{"STRIX_PREFIX_CACHE","STRIX_PREFIX_CACHE_RETENTION","STRIX_PREFIX_CACHE_STAGING_BYTES",
             "STRIX_PREFIX_BATCH_CERT","STRIX_SESSION_CACHE","STRIX_SESSION_DISK"})
         if(env.contains(name)) return true;
@@ -1450,6 +1492,11 @@ inline std::string effective_config_json(const EffectiveConfig& config) {
     prefix.set("budget",serve::Json(o.prefix_cache_host_bytes));
     prefix.set("retention",serve::Json(o.prefix_cache_retention));
     prefix.set("reason",serve::Json(o.prefix_cache_reason));
+    const bool disk=o.prefix_cache && o.prefix_cache_host_bytes && o.prefix_cache_disk && !o.prefix_cache_dir.empty();
+    prefix.set("disk",serve::Json(disk));
+    prefix.set("certified_disk",serve::Json(disk && !o.baseline));
+    prefix.set("durable",serve::Json(disk && o.prefix_cache_durable && !o.baseline));
+    prefix_inflight_json(prefix,o);
     prefix.set("serial_certificate",serve::Json("full-t-v1; whole-prompt-cursor; synchronous-snapshot"));
     prefix.set("serial_declines",serve::Json("serial-async-capture-unsupported,serial-lookup-disabled-or-short,serial-certificate-missing-or-incompatible,serial-plan-unsupported,serial-no-certified-checkpoint,serial-producer-plan-mismatch,serial-cursor-continuation-unsupported,serial-checkpoint-preflight,serial-capture-unit-unsupported,serial-capture-boundary-unsupported,serial-capture-metadata-mismatch"));
     if(prefix_batch_cert_active(o)) {

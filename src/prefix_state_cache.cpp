@@ -13,7 +13,10 @@
 #include <unordered_set>
 
 #if defined(__unix__)
+#include <fcntl.h>
 #include <unistd.h>
+#elif defined(_WIN32)
+#include <io.h>
 #endif
 
 namespace strix {
@@ -88,13 +91,46 @@ public:
             bytes -= chunk;
         }
     }
-    void close() {
+    void close(bool durable = false) {
+        if (file_ && durable) {
+            if (std::fflush(file_) != 0) throw std::runtime_error("prefix cache file flush failed");
+#if defined(__unix__)
+            if (::fdatasync(::fileno(file_)) != 0) throw std::runtime_error("prefix cache file sync failed");
+#elif defined(_WIN32)
+            if (::_commit(::_fileno(file_)) != 0) throw std::runtime_error("prefix cache file sync failed");
+#endif
+        }
         if (file_ && std::fclose(file_) != 0) { file_ = nullptr; throw std::runtime_error("prefix cache file close failed"); }
         file_ = nullptr;
     }
 private:
     std::FILE* file_ = nullptr;
 };
+
+void sync_directory(const std::filesystem::path& dir, bool durable) {
+#if defined(__unix__)
+    if (!durable) return;
+    const int fd = ::open(dir.c_str(), O_RDONLY | O_DIRECTORY);
+    if (fd < 0) throw std::runtime_error("prefix cache directory open failed");
+    const int result = ::fsync(fd);
+    ::close(fd);
+    if (result != 0) throw std::runtime_error("prefix cache directory sync failed");
+#else
+    // The native serving implementation is POSIX; other hosts sync file contents only.
+    static_cast<void>(dir); static_cast<void>(durable);
+#endif
+}
+
+// A tagged envelope inside the existing v1 metadata section. No parallel files/store.
+std::vector<std::byte> disk_metadata(const PrefixCacheCheckpoint& checkpoint) {
+    if (checkpoint.producer_certificate.empty()) return checkpoint.metadata;
+    const auto count = static_cast<std::uint64_t>(checkpoint.producer_certificate.size());
+    std::vector<std::byte> out(sizeof(count) + count*sizeof(std::uint64_t) + checkpoint.metadata.size());
+    std::memcpy(out.data(), &count, sizeof(count));
+    std::memcpy(out.data()+sizeof(count), checkpoint.producer_certificate.data(), count*sizeof(std::uint64_t));
+    std::memcpy(out.data()+sizeof(count)+count*sizeof(std::uint64_t), checkpoint.metadata.data(), checkpoint.metadata.size());
+    return out;
+}
 
 std::filesystem::path temporary_path(const std::filesystem::path& path) {
     long pid = 0;
@@ -481,7 +517,7 @@ bool PrefixStateCache::insert(std::shared_ptr<const PrefixCacheCheckpoint> check
         add_locked(checkpoint);
         ++stats_.inserted;
     }
-    if (writer_.joinable() && checkpoint->producer_certificate.empty()) {
+    if (writer_.joinable() && (checkpoint->producer_certificate.empty() || (policy_.certified_disk && !policy_.legacy))) {
         {
             std::lock_guard lock(queue_mutex_);
             queue_.push_back(std::move(checkpoint));
@@ -549,11 +585,20 @@ std::shared_ptr<const PrefixCacheCheckpoint> PrefixStateCache::find_longest(cons
             { std::lock_guard lock(mutex_); erase_locked(digest); ++stats_.evicted; ++stats_.evictions_invalid; }
             continue;  // digest collision or corrupt entry: never used
         }
-        if (eligible || policy_.disk_directory.empty()) continue;
+        if (policy_.disk_directory.empty() || (eligible && (!policy_.certified_disk || policy_.legacy))) continue;
         std::error_code error;
         if (!std::filesystem::exists(checkpoint_path(policy_.disk_directory, digest), error)) continue;
         try {
+            // Certified and legacy lookups never cross. Check before payload allocation.
+            File probe(checkpoint_path(policy_.disk_directory, digest), "rb");
+            CheckpointHeader candidate;
+            if (!probe.open()) continue;
+            probe.read(&candidate, sizeof(candidate));
+            if (candidate.reserved != (eligible ? 1U : 0U)) continue;
             if (auto loaded = load_from_disk(identity, digest, tokens.first(static_cast<std::size_t>(k * block_rows)), block_rows)) {
+                if (eligible && (loaded->producer_certificate.empty() || !eligible(*loaded))) {
+                    std::lock_guard lock(mutex_); ++stats_.plan_misses; continue;
+                }
                 {
                     std::lock_guard lock(mutex_);
                     ++stats_.disk_hits; stats_.hit_tokens += loaded->position; stats_.restored_tokens += loaded->position;
@@ -626,7 +671,8 @@ std::shared_ptr<const PrefixCacheCheckpoint> PrefixStateCache::load_from_disk(co
     file.read(&header, sizeof(header));
     if (header.magic != checkpoint_magic || get(header.identity) != identity || get(header.digest) != digest ||
         header.block_rows != block_rows || header.position != tokens.size() ||
-        header.segment_count * block_rows != header.position)
+        header.segment_count != header.position / block_rows || header.position % block_rows ||
+        header.reserved > 1U || header.metadata_bytes > policy_.host_byte_budget)
         throw std::runtime_error("prefix cache checkpoint header does not match");
     std::vector<std::uint8_t> segment_digests(static_cast<std::size_t>(header.segment_count * 32));
     file.read(segment_digests.data(), segment_digests.size());
@@ -657,6 +703,17 @@ std::shared_ptr<const PrefixCacheCheckpoint> PrefixStateCache::load_from_disk(co
     file.read(checkpoint->metadata.data(), header.metadata_bytes);
     if (prefix_cache_checksum(checkpoint->metadata) != header.metadata_checksum)
         throw std::runtime_error("prefix cache metadata checksum differs");
+    if (header.reserved == 1U) {
+        std::uint64_t count = 0;
+        if (checkpoint->metadata.size() < sizeof(count)) throw std::runtime_error("prefix cache certificate is truncated");
+        std::memcpy(&count, checkpoint->metadata.data(), sizeof(count));
+        if (!count || count > (checkpoint->metadata.size()-sizeof(count))/sizeof(std::uint64_t))
+            throw std::runtime_error("prefix cache certificate is malformed");
+        checkpoint->producer_certificate.resize(static_cast<std::size_t>(count));
+        std::memcpy(checkpoint->producer_certificate.data(), checkpoint->metadata.data()+sizeof(count), count*sizeof(std::uint64_t));
+        checkpoint->metadata.erase(checkpoint->metadata.begin(),
+            checkpoint->metadata.begin()+static_cast<std::ptrdiff_t>(sizeof(count)+count*sizeof(std::uint64_t)));
+    }
     checkpoint->fixed = policy_.legacy ? allocate(header.fixed_bytes) : allocate(header.fixed_bytes, reservation);
     file.read(checkpoint->fixed.data.get(), header.fixed_bytes);
     if (prefix_cache_checksum(checkpoint->fixed.span()) != header.fixed_checksum)
@@ -689,7 +746,15 @@ void PrefixStateCache::write_to_disk(const PrefixCacheCheckpoint& checkpoint) {
     std::error_code error;
     for (const auto& segment : checkpoint.segments) {
         const auto path = segment_path(dir, segment->digest);
-        if (std::filesystem::exists(path, error)) continue;
+        if (std::filesystem::exists(path, error)) {
+            // This segment may have been published by an earlier non-durable writer.
+            if(policy_.durable && !policy_.legacy) {
+                File retained(path,"r+b");
+                if(!retained.open()) throw std::runtime_error("prefix cache retained segment cannot be synced");
+                retained.close(true);
+            }
+            continue;
+        }
         SegmentHeader header;
         put(header.identity, segment->identity);
         put(header.digest, segment->digest);
@@ -705,12 +770,14 @@ void PrefixStateCache::write_to_disk(const PrefixCacheCheckpoint& checkpoint) {
             file.write(&header, sizeof(header));
             file.write(segment->tokens.data(), segment->tokens.size() * sizeof(std::uint32_t));
             file.write(segment->payload.data.get(), segment->payload.bytes);
-            file.close();
+            file.close(policy_.durable && !policy_.legacy);
         }
         std::filesystem::rename(temporary, path);
         written += sizeof(header) + segment->payload.bytes;
     }
     const auto path = checkpoint_path(dir, checkpoint.digest);
+    // Every segment name is durable before publishing the checkpoint that references it.
+    sync_directory(dir, policy_.durable && !policy_.legacy);
     if (!std::filesystem::exists(path, error)) {
         CheckpointHeader header;
         put(header.identity, checkpoint.identity);
@@ -719,21 +786,29 @@ void PrefixStateCache::write_to_disk(const PrefixCacheCheckpoint& checkpoint) {
         header.block_rows = checkpoint.block_rows;
         header.segment_count = checkpoint.segments.size();
         header.fixed_bytes = checkpoint.fixed.bytes;
-        header.metadata_bytes = checkpoint.metadata.size();
+        const auto metadata = disk_metadata(checkpoint);
+        header.reserved = checkpoint.producer_certificate.empty() ? 0U : 1U;
+        header.metadata_bytes = metadata.size();
         header.fixed_checksum = prefix_cache_checksum(checkpoint.fixed.span());
-        header.metadata_checksum = prefix_cache_checksum(checkpoint.metadata);
+        header.metadata_checksum = prefix_cache_checksum(metadata);
         const auto temporary = temporary_path(path);
         {
             File file(temporary, "wb");
             if (!file.open()) throw std::runtime_error("prefix cache checkpoint file cannot be created");
             file.write(&header, sizeof(header));
             for (const auto& segment : checkpoint.segments) file.write(segment->digest.bytes.data(), 32);
-            file.write(checkpoint.metadata.data(), checkpoint.metadata.size());
+            file.write(metadata.data(), metadata.size());
             file.write(checkpoint.fixed.data.get(), checkpoint.fixed.bytes);
-            file.close();
+            file.close(policy_.durable && !policy_.legacy);
         }
         std::filesystem::rename(temporary, path);
-        written += sizeof(header) + checkpoint.fixed.bytes + checkpoint.metadata.size();
+        sync_directory(dir, policy_.durable && !policy_.legacy);
+        written += sizeof(header) + checkpoint.fixed.bytes + metadata.size();
+    } else if(policy_.durable && !policy_.legacy) {
+        File retained(path,"r+b");
+        if(!retained.open()) throw std::runtime_error("prefix cache retained checkpoint cannot be synced");
+        retained.close(true);
+        sync_directory(dir,true);
     }
     std::lock_guard lock(mutex_);
     ++stats_.disk_writes;

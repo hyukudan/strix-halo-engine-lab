@@ -732,7 +732,10 @@ tras la residencia nativa es `min(4 GiB, A/16, A - reserve)` de la memoria dispo
 idénticos bit a bit a los de sin caché. Cualquier otra configuración automática, incluido el comando de servicio
 simple (que resuelve T=8192), la rechaza por nombre y se ejecuta exactamente como sin caché; los bytes de host
 explícitos mantienen su comportamiento. El arranque, `--print-effective-config`, `/v1/capabilities` y
-`/v1/cache/stats` informan de la política solicitada y efectiva y de su motivo. La restauración MTP solo acepta planes de sufijo equivalentes a la ejecución sin caché;
+`/v1/cache/stats` informan de la política solicitada y efectiva y de su motivo. La unión a prefijos en curso
+(una petición espera el checkpoint certificado que otro slot está produciendo en lugar de recalcularlo) está
+activada por defecto allí donde la caché está activada y solo actúa en rutas batch concurrentes con certificación
+L0 estricta; `STRIX_PREFIX_CACHE_INFLIGHT=0` / `--prefix-cache-inflight off` la desactiva. La restauración MTP solo acepta planes de sufijo equivalentes a la ejecución sin caché;
 las copias de checkpoints siguen los límites de bloque existentes.
 
 <a id="deepseek-pair"></a>

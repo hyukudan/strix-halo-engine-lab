@@ -410,6 +410,9 @@ struct Options {
     std::function<void()> cache_attach_ready, cache_attach_rollback;
     unsigned prefix_batch_cert = 0; // 0 off, 1 strict L0, 2 capture-only, 3 unqualified L1 (capture only)
     bool prefix_cache = true;
+    bool prefix_cache_inflight = true, prefix_cache_disk = true, prefix_cache_durable = true;
+    // Where the in-flight joining policy came from: default, cli, env, baseline or prefix-cache-off.
+    std::string prefix_cache_inflight_source = "default";
     std::string prefix_cache_retention = "fair", prefix_cache_source = "off", prefix_cache_reason = "not-serving";
     std::uint64_t prefix_cache_host_bytes = 0;
     std::uint64_t prefix_cache_staging_bytes = 0; // 0: one T-block of rows plus fixed registry
@@ -1632,13 +1635,26 @@ inline bool automatic_cache_work(const Options& o) {
 }
 inline bool operational_session_option(std::string_view flag) {
     flag = flag.substr(0, flag.find('='));
-    return flag == "--prefix-batch-cert" || flag == "--prefix-cache-staging-bytes" || flag == "--prefix-cache" || flag == "--prefix-cache-retention" || flag == "--session-cache" || flag == "--session-disk" || flag == "--session-dir" ||
+    return flag == "--prefix-cache-inflight" || flag == "--prefix-cache-disk" || flag == "--prefix-cache-durable" ||
+        flag == "--prefix-batch-cert" || flag == "--prefix-cache-staging-bytes" || flag == "--prefix-cache" || flag == "--prefix-cache-retention" || flag == "--session-cache" || flag == "--session-disk" || flag == "--session-dir" ||
         flag == "--session-ram-bytes" || flag == "--session-disk-bytes" ||
         flag == "--session-max-parked" || flag == "--session-capture-host-bytes";
 }
 // One strict policy parser for CLI-only paths and effective-config resolution.
 template<class Lookup>
 inline void apply_prefix_cache_environment(Options& o, Lookup lookup) {
+    const auto toggle=[&](bool& target,const char* flag,const char* env,std::string* source=nullptr) {
+        if(o.supplied_options.contains(flag)) {if(source) *source="cli";return;}
+        if(const auto v=lookup(env)) {
+            if(*v!="0" && *v!="1" && *v!="off" && *v!="on")
+                throw std::invalid_argument(std::string(env)+" requires 0|1|on|off");
+            target=*v=="1" || *v=="on";
+            if(source) *source="env";
+        }
+    };
+    toggle(o.prefix_cache_inflight,"--prefix-cache-inflight","STRIX_PREFIX_CACHE_INFLIGHT",&o.prefix_cache_inflight_source);
+    toggle(o.prefix_cache_disk,"--prefix-cache-disk","STRIX_PREFIX_CACHE_DISK");
+    toggle(o.prefix_cache_durable,"--prefix-cache-durable","STRIX_PREFIX_CACHE_DURABLE");
     const auto batch_mode=[](std::string_view v) -> unsigned {
         if(v=="0" || v=="off") return 0;
         if(v=="1" || v=="l0") return 1;
@@ -1676,7 +1692,10 @@ inline void apply_prefix_cache_environment(Options& o, Lookup lookup) {
     if (const auto v = lookup("STRIX_BASELINE"); v && *v == "1") o.baseline = true;
     if(o.baseline) o.prefix_batch_cert=0;
     if (o.baseline) o.prefix_cache_retention = "lru";
+    if (o.baseline) {o.prefix_cache_inflight=false;o.prefix_cache_durable=false;o.prefix_cache_inflight_source="baseline";}
     if (!o.prefix_cache) {
+        // Joining follows the cache's own enablement: no cache, no joining.
+        o.prefix_cache_inflight=false; o.prefix_cache_inflight_source="prefix-cache-off";
         o.prefix_cache_host_bytes = 0; o.prefix_cache_dir.clear(); o.prefix_cache_block_rows = 0;
         o.prefix_cache_disk_bytes_explicit = false; o.prefix_cache_every_explicit = false;
         o.prefix_cache_then_prompts.clear();
@@ -1757,7 +1776,7 @@ inline Options parse_options(
             "[--context N [--unqualified-context]] [--residency register|copy] [--coalesce-gap BYTES] [--model-copy-tier none|normalization|hot_nonexpert|experts --model-copy-payload-bytes N --model-retained-budget N --model-setup-peak-budget N] "
             "[--planned-ple-io] [--ple-cpu-helper-threads 1..8] [--ple-cache-rows N --ple-cache-budget-bytes N] [--ple-max-rows-per-io N] [--ple-max-inflight-ios N] "
             "[--generate N] [--eos-token TOKEN_ID] [--prefix-cache-roundtrip] "
-            "[--prefix-cache on|off] [--prefix-cache-retention fair|lru] [--prefix-cache-host-bytes N [--prefix-cache-dir DIR [--prefix-cache-disk-bytes N]] [--prefix-cache-every N] [--prefix-cache-then-prompt FILE ...]] "
+            "[--prefix-cache on|off] [--prefix-cache-inflight on|off] [--prefix-cache-disk on|off] [--prefix-cache-durable on|off] [--prefix-cache-retention fair|lru] [--prefix-cache-host-bytes N [--prefix-cache-dir DIR [--prefix-cache-disk-bytes N]] [--prefix-cache-every N] [--prefix-cache-then-prompt FILE ...]] "
             "[--parallel-moe-router] [--ranked-moe-router-topk | --wave-moe-router-topk] "
             "[--prefetch-q8-qsa-input] [--prefetch-q8-shared-expert] [--prefetch-q8-lm-head [--wave8-q8-lm-head]] [--wave8-q8-gdn-input] [--wave8-q8-gdn-output] [--wave8-q8-qsa-output] [--virtual-q8-lm-head] [--virtual-q8-gdn-input [--prefetch-q8-gdn-input]] [--q4k-a8g32-gate-up [--grouped-exact-q51-down]] [--deferred-moe-status] "
             "[--parallel-hyper-mix [--staged-hyper-projections [--fused-staged-hyper-mix [--typed-fused-hyper-projections [--prefetch-typed-hyper-rows] [--prefetch-q8-hyper-output [--lane-chain-hyper-output]]]]]]");
@@ -2185,15 +2204,21 @@ inline Options parse_options(
             target = argv[++index];
             continue;
         }
-        if (argument == "--prefix-cache" || argument == "--prefix-cache-retention") {
+        if (argument == "--prefix-cache" || argument == "--prefix-cache-retention" ||
+            argument == "--prefix-cache-inflight" || argument == "--prefix-cache-disk" || argument == "--prefix-cache-durable") {
             if (++index >= argc) throw std::invalid_argument("missing prefix cache option value");
             const std::string value = argv[index];
             if (argument == "--prefix-cache") {
                 if (value != "on" && value != "off") throw std::invalid_argument("--prefix-cache requires on|off");
                 options.prefix_cache = value == "on";
-            } else {
+            } else if(argument=="--prefix-cache-retention") {
                 if (value != "fair" && value != "lru") throw std::invalid_argument("--prefix-cache-retention requires fair|lru");
                 options.prefix_cache_retention = value;
+            } else {
+                if(value!="on" && value!="off") throw std::invalid_argument(std::string(argument)+" requires on|off");
+                if(argument=="--prefix-cache-inflight") {options.prefix_cache_inflight=value=="on";options.prefix_cache_inflight_source="cli";}
+                if(argument=="--prefix-cache-disk") options.prefix_cache_disk=value=="on";
+                if(argument=="--prefix-cache-durable") options.prefix_cache_durable=value=="on";
             }
             continue;
         }

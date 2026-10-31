@@ -1,6 +1,7 @@
 #pragma once
 #include "strix/known_prefill_limits.hpp"
 #include <array>
+#include <algorithm>
 #include <bit>
 #include <string>
 #include <optional>
@@ -273,5 +274,36 @@ inline bool qwen_suffix_solo_class(const QwenTiledPlanConfig& config,std::uint64
         p=unit->end;
     }
     return p==n;
+}
+
+// Join boundaries are full-T certified boundaries. Any cache grid that divides T
+// (including the HTTP 1024-row checkpoint default) contains every such boundary,
+// so the producer's capture and the joiner's ordinary lookup meet there.
+inline bool qwen_prefix_join_grid(std::uint64_t cache_rows,std::uint64_t t_rows) {
+    return cache_rows && t_rows && t_rows%cache_rows==0;
+}
+// A wait is tied to an admission generation, never just a reusable slot address.
+struct QwenPrefixJoinWait {
+    std::uint64_t generation=0,boundary=0;
+    bool pending(std::uint64_t current,bool active,bool prefilling,std::uint64_t position) const {
+        return boundary && current==generation && active && prefilling && position<=boundary;
+    }
+};
+inline std::uint64_t qwen_prefix_join_boundary(const QwenTiledPlanConfig& producer,std::uint64_t pn,
+    const QwenTiledPlanConfig& consumer,std::uint64_t cn,std::uint64_t common,std::uint64_t from,
+    const QwenBatchConfig& batch,bool nesting_possible) {
+    if(!producer.rows || producer.rows!=consumer.rows || pn<2 || cn<2 ||
+        !batch.allowed(producer.schedule) || !batch.allowed(consumer.schedule)) return 0;
+    auto p=std::min({common,pn-1U,cn-1U})/producer.rows*producer.rows;
+    for(;p>from;p-=producer.rows) {
+        const auto proof=qwen_full_t_certificate_v2(producer,pn,p);
+        if(proof.empty() || proof!=qwen_full_t_certificate_v2(consumer,cn,p) ||
+            !qwen_suffix_solo_class(consumer,cn,p,batch,nesting_possible)) continue;
+        auto cursor=qwen_full_t_continuation(producer,pn,p);
+        const auto next=qwen_prompt_next(producer,*cursor,p,pn);
+        // Existing asynchronous capture needs the next writer on the same T owner.
+        if(next && next->t_owner && next->owner==producer.block) return p;
+    }
+    return 0;
 }
 } // namespace strix::decode_cli

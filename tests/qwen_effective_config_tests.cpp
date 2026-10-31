@@ -18,6 +18,7 @@
 #include "strix/prompt_terminal_diagnostics.hpp"
 #include "qwen_cache_compatibility_cases.hpp"
 #include "../apps/http_slot_capacity.hpp"
+#include "../apps/qwen_tiled_prompt_plan.hpp"
 #include <limits>
 #include <set>
 #include "strix/q8_projection_organization.hpp"
@@ -255,6 +256,52 @@ void serve_prefill_admission_tests(const ModelContract& model, const ModelManife
     const auto resolve=[&](const RequestedOptions& r,const PrefillMemory& m) {
         return resolve_effective_config(r,model,{},manifest,validated_model_content_identity,{true,true,true},m);
     };
+    {
+        // Native joining gate shape: pinned MTP server args (C24576, T8192 serving prefill),
+        // explicit 4 GiB host budget, --http-batch 3 --prefix-batch-cert l0, gate env.
+        // The HTTP 1024-row checkpoint default applies; joining must still be armed.
+        auto gate_args=args;
+        const auto block_rows_flag=std::find(gate_args.begin(),gate_args.end(),"--prefix-cache-block-rows");
+        if(block_rows_flag!=gate_args.end()) gate_args.erase(block_rows_flag,block_rows_flag+2);
+        *(std::find(gate_args.begin(),gate_args.end(),"--http-batch")+1)="3";
+        // The gate's pinned known-prefix window (explicit T8192 and tails), as srvargs passes it.
+        gate_args.insert(gate_args.end(),{"--known-prefix-window","--known-prefix-full-rows",
+            "--known-prefix-workspace-budget-bytes","8589934592","--known-prefix-host-metadata-budget-bytes","1073741824",
+            "--known-prefix-uma-budget-bytes","128849018880","--known-prefix-host-headroom-bytes","4294967296",
+            "--known-prefix-output-policy","terminal-row","--known-prefix-expert-union","--known-window-router-rows",
+            "--known-prefix-prefill-rows","8192","--known-prefix-tail-rows","1024,256,64,16",
+            "--prefix-cache-host-bytes","4294967296","--prefix-batch-cert","l0"});
+        RequestedOptions gate{parse(gate_args),{{"STRIX_BATCH_PROMPT_SMALL","0"},
+            {"STRIX_PREFIX_CACHE_DIGEST","1"},{"STRIX_PREFIX_CACHE_DIGEST_COMPONENTS","1"},
+            {"STRIX_FINAL_STATE_DIGEST","1"},{"STRIX_PROMPT_STATE_DIGEST","1"},{"STRIX_PREFIX_CACHE_LOOKUP","1"},
+            {"STRIX_PREFIX_CACHE_INFLIGHT","1"},{"STRIX_PROMPT_BATCH","0"},{"STRIX_PROMPT_WINDOW_COHORT","0"},
+            {"STRIX_BATCH_NEST_ROWS","0"},{"STRIX_MTP_BATCH_LOG","a"}}};
+        // The resolver reads memory only through PrefillMemory: check the fixture and a
+        // small CI-runner-like observation (16 GiB available/GTT); an explicit T and host
+        // budget keep the gate route identical on any host.
+        auto runner_memory=memory;
+        runner_memory.available=16*gib_bytes; runner_memory.gtt_limit=16*gib_bytes; runner_memory.gtt_used=0;
+        runner_memory.total=16*gib_bytes;
+        for(const auto* observed:{&memory,&runner_memory}) {
+        const auto resolved_gate=resolve(gate,*observed);
+        const auto& o=resolved_gate.options;
+        expect(o.prefix_cache && o.prefix_cache_host_bytes==4*gib_bytes && o.prefix_cache_source=="explicit" &&
+            !o.cache_activation->automatic_path,"gate route: explicit 4 GiB cache stays ON");
+        expect(prefix_batch_cert_execution_mode(o)==1 && ordinary_http_batch_slots(o)!=0,"gate route: strict L0 batch cert");
+        if(o.known_prefix_prefill_rows!=8192 || o.prefix_cache_block_rows!=1024)
+            std::cerr<<"gate route T="<<o.known_prefix_prefill_rows<<" block_rows="<<o.prefix_cache_block_rows
+                <<" http_serve="<<o.http_serve<<" admitted="<<resolved_gate.admitted<<" reason="<<resolved_gate.reason<<'\n';
+        expect(o.known_prefix_prefill_rows==8192 && o.prefix_cache_block_rows==1024,
+            "gate route: T8192 with the 1024-row checkpoint default");
+        expect(qwen_prefix_join_grid(o.prefix_cache_block_rows,o.known_prefix_prefill_rows),
+            "gate route: joining accepts the 1024-row grid");
+        const auto state=prefix_cache_inflight_state(o);
+        if(!state.effective) std::cerr<<"gate inflight reason "<<state.reason<<'\n';
+        expect(state.effective && state.reason=="armed" && state.source=="env","gate route: joining armed");
+        auto off=gate;off.environment["STRIX_PREFIX_CACHE_INFLIGHT"]="0";
+        expect(!prefix_cache_inflight_state(resolve(off,*observed).options).effective,"gate route: joining OFF arm");
+        }
+    }
     // Native dense-A8 serving geometry at C24576. File-only backing must not
     // crowd out T8192; registration is charged to both UMA and GTT. Represent
     // the aggregate extents with synthetic tensors, without model assets.
@@ -1733,6 +1780,8 @@ int main(int argc, char** arguments) {
             c.sources.erase("--prefix-cache"); c.sources.erase("--prefix-cache-retention");
             c.options.prefix_cache=true; c.options.prefix_cache_retention="fair";
             c.options.prefix_cache_reason="not-serving";
+            // Joining follows the cache switch; it is operational, not numerical.
+            c.options.prefix_cache_inflight=true; c.options.prefix_cache_inflight_source="default";
             return without_cache_policy(effective_config_json(c));
         };
         for (const auto& suffix : std::vector<std::vector<std::string>>{{},{"--prefix-cache","off"},{"--prefix-cache-retention","lru"}}) {
@@ -3353,6 +3402,126 @@ int main(int argc, char** arguments) {
             if(saved) ::setenv(name,saved->c_str(),1);else ::unsetenv(name);
         }
 #endif
+    }
+    for(const auto* flag:{"--prefix-cache-inflight","--prefix-cache-disk","--prefix-cache-durable"}) {
+        expect(operational_session_option(flag),"prefix reuse switch is operational");
+        const auto disabled=parse({"decoder","MODEL","1",flag,"off"});
+        expect(std::string_view(flag)=="--prefix-cache-inflight"?!disabled.prefix_cache_inflight:
+            std::string_view(flag)=="--prefix-cache-disk"?!disabled.prefix_cache_disk:!disabled.prefix_cache_durable,
+            "prefix reuse CLI off switch");
+        auto selected=parse({"decoder","MODEL","1",flag,"on"});
+        apply_prefix_cache_environment(selected,[](const char* name)->std::optional<std::string_view> {
+            if(std::string_view(name)=="STRIX_PREFIX_CACHE_INFLIGHT" ||
+                std::string_view(name)=="STRIX_PREFIX_CACHE_DISK" || std::string_view(name)=="STRIX_PREFIX_CACHE_DURABLE") return "0";
+            return {};
+        });
+        expect(std::string_view(flag)=="--prefix-cache-inflight"?selected.prefix_cache_inflight:
+            std::string_view(flag)=="--prefix-cache-disk"?selected.prefix_cache_disk:selected.prefix_cache_durable,
+            "prefix reuse CLI wins environment");
+        bool invalid_cli=false;
+        try {(void)parse({"decoder","MODEL","1",flag,"maybe"});} catch(const std::invalid_argument&) {invalid_cli=true;}
+        expect(invalid_cli,"invalid prefix reuse CLI refused");
+    }
+    for(const auto* key:{"STRIX_PREFIX_CACHE_INFLIGHT","STRIX_PREFIX_CACHE_DISK","STRIX_PREFIX_CACHE_DURABLE"}) {
+        expect(yarn_environment_refusal(Environment{{key,"0"}},2).empty(),"reuse switch performs no rotary work");
+        Options invalid;
+        bool refused=false;
+        try {
+            apply_prefix_cache_environment(invalid,[&](const char* name)->std::optional<std::string_view> {
+                if(std::string_view(name)==key) return "maybe";
+                return {};
+            });
+        } catch(const std::invalid_argument&) {refused=true;}
+        expect(refused,"invalid prefix reuse environment refused");
+    }
+    {
+        Options defaults;
+        expect(defaults.prefix_cache_inflight && defaults.prefix_cache_disk && defaults.prefix_cache_durable,
+            "reuse policies default on within admitted routes");
+        const auto env=requested_prefill_environment([](const char* name)->const char* {
+            return std::string_view(name).starts_with("STRIX_PREFIX_CACHE_")?"0":nullptr;
+        });
+        expect(env.contains("STRIX_PREFIX_CACHE_INFLIGHT") && env.contains("STRIX_PREFIX_CACHE_DISK") &&
+            env.contains("STRIX_PREFIX_CACHE_DURABLE"),"resolver collects reuse environment");
+        apply_prefix_cache_environment(defaults,[](const char* name)->std::optional<std::string_view> {
+            if(std::string_view(name)=="STRIX_PREFIX_CACHE_INFLIGHT" ||
+                std::string_view(name)=="STRIX_PREFIX_CACHE_DISK" || std::string_view(name)=="STRIX_PREFIX_CACHE_DURABLE") return "off";
+            return {};
+        });
+        expect(!defaults.prefix_cache_inflight && !defaults.prefix_cache_disk && !defaults.prefix_cache_durable,
+            "environment off switches");
+        auto reuse_baseline=parse({"decoder","MODEL","1","--baseline"});
+        expect(!reuse_baseline.prefix_cache_inflight && !reuse_baseline.prefix_cache_durable,"baseline suppresses new reuse policy");
+        Options admitted;admitted.http_serve=true;admitted.http_batch=2;admitted.prefix_cache_host_bytes=4096;
+        admitted.prefix_cache_dir="prefix-cache";admitted.prefix_batch_cert=1;
+        auto caps=serve::Json::object();prefix_cache_capabilities(caps,admitted);
+        const auto* cache=caps.find("prefix_cache");
+        expect(cache && cache->find("certified_disk")->as_bool() && cache->find("inflight")->as_bool() &&
+            cache->find("durable")->as_bool(),"capabilities report guarded reuse policy");
+        EffectiveConfig c;c.options=admitted;
+        const auto effective=serve::parse_json(effective_config_json(c));
+        expect(effective.find("prefix_cache")->find("inflight")->as_bool(),"effective config reports joining");
+        admitted.prefix_cache_disk=false;admitted.prefix_cache_inflight=false;
+        caps=serve::Json::object();prefix_cache_capabilities(caps,admitted);
+        expect(!caps.find("prefix_cache")->find("certified_disk")->as_bool() &&
+            !caps.find("prefix_cache")->find("inflight")->as_bool(),"capabilities report switches off");
+    }
+    {
+        // In-flight joining follows the cache's own enablement: default ON with
+        // the cache ON, OFF with STRIX_PREFIX_CACHE_INFLIGHT=0 or the cache off.
+        const auto resolved=[&](std::vector<std::string> args,Environment env) {
+            auto o=parse(args);
+            resolve_session_defaults(o,model,env,128*gib_bytes);
+            resolve_prefix_defaults(o,model,env,128*gib_bytes);
+            return o;
+        };
+        const std::vector<std::string> serve_args={"decoder","MODEL","1"};
+        const auto on=resolved(serve_args,{});
+        expect(on.prefix_cache && on.prefix_cache_inflight && on.prefix_cache_inflight_source=="default",
+            "joining resolves ON by default with the cache ON");
+        expect(on.cache_activation->automatic_path,"joining default keeps the automatic cache path");
+        const auto env_off=resolved(serve_args,{{"STRIX_PREFIX_CACHE_INFLIGHT","0"}});
+        expect(!env_off.prefix_cache_inflight && env_off.prefix_cache_inflight_source=="env" &&
+            prefix_cache_inflight_state(env_off).reason=="off-switch","STRIX_PREFIX_CACHE_INFLIGHT=0 turns joining OFF");
+        expect(env_off.cache_activation->automatic_path,"joining OFF switch leaves the automatic cache path");
+        const auto env_on=resolved(serve_args,{{"STRIX_PREFIX_CACHE_INFLIGHT","1"}});
+        expect(env_on.prefix_cache_inflight && env_on.prefix_cache_inflight_source=="env","STRIX_PREFIX_CACHE_INFLIGHT=1 keeps joining ON");
+        auto cli_args=serve_args;cli_args.insert(cli_args.end(),{"--prefix-cache-inflight","off"});
+        const auto cli_off=resolved(cli_args,{{"STRIX_PREFIX_CACHE_INFLIGHT","1"}});
+        expect(!cli_off.prefix_cache_inflight && cli_off.prefix_cache_inflight_source=="cli","joining CLI OFF wins env");
+        expect(cli_off.cache_activation->automatic_path,"joining CLI switch is not a cache configuration");
+        auto cache_off_args=serve_args;cache_off_args.insert(cache_off_args.end(),{"--prefix-cache","off"});
+        const auto cache_off=resolved(cache_off_args,{});
+        expect(!cache_off.prefix_cache_inflight && cache_off.prefix_cache_inflight_source=="prefix-cache-off" &&
+            prefix_cache_inflight_state(cache_off).reason=="prefix-cache-off","cache OFF turns joining OFF");
+        const auto cache_env_off=resolved(serve_args,{{"STRIX_PREFIX_CACHE","0"},{"STRIX_PREFIX_CACHE_INFLIGHT","1"}});
+        expect(!cache_env_off.prefix_cache_inflight && !prefix_cache_inflight_state(cache_env_off).effective,
+            "STRIX_PREFIX_CACHE=0 turns joining OFF");
+        auto baseline_args=serve_args;baseline_args.push_back("--baseline");
+        const auto baseline_run=resolved(baseline_args,{});
+        expect(!baseline_run.prefix_cache_inflight && prefix_cache_inflight_state(baseline_run).reason=="baseline","baseline turns joining OFF");
+        // The qualified automatic route is single-slot: joining is ON but inert.
+        auto single=on;single.http_serve=true;single.http_batch=0;single.prefix_cache_host_bytes=4*gib_bytes;
+        const auto single_state=prefix_cache_inflight_state(single);
+        expect(single_state.requested && !single_state.effective && single_state.reason=="single-slot-route",
+            "single-slot cache route reports joining inert");
+        // A concurrent strict-L0 certified route arms joining with the cache on.
+        auto batch=on;batch.http_serve=true;batch.http_batch=3;batch.prefix_cache_host_bytes=4*gib_bytes;batch.prefix_batch_cert=1;
+        batch.cache_activation=std::make_shared<CachePolicyActivation>();
+        expect(prefix_cache_inflight_state(batch).effective,"strict-L0 batch route arms joining by default");
+        EffectiveConfig c;c.options=batch;
+        auto effective=serve::parse_json(effective_config_json(c));
+        const auto* prefix=effective.find("prefix_cache");
+        expect(prefix->find("inflight")->as_bool() && prefix->find("inflight_requested")->as_bool() &&
+            prefix->find("inflight_source")->as_string()=="default" && prefix->find("inflight_reason")->as_string()=="armed",
+            "effective config reports joining state and source");
+        auto batch_off=batch;batch_off.prefix_cache_inflight=false;batch_off.prefix_cache_inflight_source="env";
+        c.options=batch_off;effective=serve::parse_json(effective_config_json(c));
+        prefix=effective.find("prefix_cache");
+        expect(!prefix->find("inflight")->as_bool() && prefix->find("inflight_source")->as_string()=="env" &&
+            prefix->find("inflight_reason")->as_string()=="off-switch","effective config reports joining OFF source");
+        auto capture=batch;capture.prefix_batch_cert=2;
+        expect(prefix_cache_inflight_state(capture).reason=="batch-cert-not-strict-l0","capture-only cert does not arm joining");
     }
     std::cout << "qwen effective config: " << failures << " failures\n";
     return failures ? 1 : 0;
