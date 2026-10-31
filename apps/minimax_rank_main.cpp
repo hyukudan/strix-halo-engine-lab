@@ -19,7 +19,7 @@
 //   --batch PROMPT.u32:STEPS:N1,N2,...               batched decode (rows = prefixes of the prompt), checked vs alone
 //   --verify-trace NAME:PROMPT.u32:REPS:R1,R2,...    verify-shaped steps (one slot, R rows) timed by R (xfer on/off
 //                                                     ABA) + per-phase GPU trace and distinct routed experts per layer
-//   --ab FLAG:PROMPT.u32:BLOCK                       ABA x3 of a runtime flag (staging | shared | attn | linears | xfer | attnpf | index | idxdec | idxattn | idxconc | xbwait | xbinplace | xbboth | xbprep | xbpub | xbwarm | xbilp | xbset | pfx | pfil | pfxip | pfcore | pfattn4 | pfmsa | pfmsarework | mtfit | core8 | pfpipe | pftab | pfgufuse | pfrouter | pfidxconc | pfkvtile | pftiled | pfidx | pftxuc | pfall): TTFT and decode blocks
+//   --ab FLAG:PROMPT.u32:BLOCK                       ABA x3 of a runtime flag (staging | shared | attn | linears | xfer | attnpf | index | idxdec | idxattn | idxconc | xbwait | xbinplace | xbboth | xbprep | xbpub | xbwarm | xbwarmo | moegrid | xbilp | xbset | pfx | pfil | pfxip | pfcore | pfattn4 | pfmsa | pfmsarework | mtfit | core8 | pfpipe | pftab | pfgufuse | pfrouter | pfidxconc | pfkvtile | pftiled | pfidx | pftxuc | pfall): TTFT and decode blocks
 //                                                    (pfidxconc: 0 vs STRIX_MM_AB_IDXCONC=1|2, default 2; 7 hashed prefills)
 //                                                    (pfkvtile: off vs STRIX_MM_AB_KVTILE=auto|<index>, default auto; 7 hashed prefills)
 //                                                    (pftxuc: PFX copy-to-host-coherent vs producer-to-uncached TX; 7 hashed prefills)
@@ -1015,6 +1015,11 @@ std::uint64_t ab_flag(mm::Engine& eng, const std::string& flag, const std::vecto
             const char* m = std::getenv("STRIX_MM_AB_WARM");
             eng.set_xb_warm(on ? (m != nullptr ? static_cast<unsigned>(std::strtoul(m, nullptr, 10)) : 8U) : 0U);
         }  // the other xb flags keep the process setting (env)
+        else if (flag == "moegrid") setenv("STRIX_MMX_MOE_TIGHT_GRID", on ? "1" : "0", 1);  // MoE v4 grids: 33 slot rows (A) vs 4 N + 1 (B)
+        else if (flag == "xbwarmo") {  // MSA-window o_proj warm: 0 vs STRIX_MM_AB_WARM_O MB (default 8)
+            const char* m = std::getenv("STRIX_MM_AB_WARM_O");
+            eng.set_xb_warm_o(on ? (m != nullptr ? static_cast<unsigned>(std::strtoul(m, nullptr, 10)) : 8U) : 0U);
+        }
         else if (flag == "pfx") eng.set_prefill_xchg(on);
         else if (flag == "pfidx") {
             eng.set_prefill_msa_batch(true);  // isolate index tiling in both arms
@@ -1086,7 +1091,7 @@ std::uint64_t ab_flag(mm::Engine& eng, const std::string& flag, const std::vecto
                          : flag == "idxdec" ? eng.index_decode() : flag == "idxattn" ? eng.index_attn()
                          : flag == "idxconc" ? eng.index_concurrent()
                          : flag == "xbwait" ? eng.xb_wait() : flag == "xbinplace" ? eng.xb_inplace()
-                         : flag == "xbboth" ? eng.xb_wait() : flag == "xbprep" ? eng.xb_prep() : flag == "xbpub" ? eng.xb_publish() : flag == "xbwarm" ? eng.xb_warm() != 0 : flag == "xbilp" ? eng.xb_postilp() : flag == "xbset" ? eng.xb_wait()
+                         : flag == "xbboth" ? eng.xb_wait() : flag == "xbprep" ? eng.xb_prep() : flag == "xbpub" ? eng.xb_publish() : flag == "xbwarm" ? eng.xb_warm() != 0 : flag == "xbwarmo" ? eng.xb_warm_o() != 0 : flag == "moegrid" ? true : flag == "xbilp" ? eng.xb_postilp() : flag == "xbset" ? eng.xb_wait()
                          : flag == "pfx" ? eng.prefill_xchg() : flag == "pfil" ? eng.prefill_interleave()
                          : flag == "pfidx" ? eng.prefill_index_tile()
                          : flag == "pftxuc" ? eng.prefill_tx_uncached()
@@ -1098,9 +1103,12 @@ std::uint64_t ab_flag(mm::Engine& eng, const std::string& flag, const std::vecto
                          : eng.shared_first();
     const bool pfx0 = eng.prefill_xchg(), pfxip0 = eng.prefill_inplace();
     const bool msa0 = eng.prefill_msa_batch(), att0 = eng.prefill_attend4(), rtr0 = eng.prefill_router_batch();  // pfall restores these
-    const bool xb = flag == "xbwait" || flag == "xbinplace" || flag == "xbboth" || flag == "xbprep" || flag == "xbpub" || flag == "xbwarm" || flag == "xbilp" || flag == "xbset";
+    const bool xb = flag == "xbwait" || flag == "xbinplace" || flag == "xbboth" || flag == "xbprep" || flag == "xbpub" || flag == "xbwarm" || flag == "xbwarmo" || flag == "moegrid" || flag == "xbilp" || flag == "xbset";
     const bool xb_w0 = eng.xb_wait(), xb_i0 = eng.xb_inplace(), xb_p0 = eng.xb_prep(), xb_u0 = eng.xb_publish();
-    const unsigned xb_m0 = eng.xb_warm();
+    const unsigned xb_m0 = eng.xb_warm(), xb_o0 = eng.xb_warm_o();
+    const auto xb_oc0 = eng.xb_warm_o_count();
+    const char* grid_env = std::getenv("STRIX_MMX_MOE_TIGHT_GRID");
+    const std::string grid0 = grid_env != nullptr ? grid_env : "";
     const bool xb_l0 = eng.xb_postilp();
     const auto xb_lc0 = eng.xb_postilp_count();
     const auto xb_pc0 = eng.xb_prep_count(), xb_uc0 = eng.xb_publish_count(), xb_mc0 = eng.xb_warm_count();  // decode: both flags restored as they were (saved before any set())
@@ -1110,7 +1118,7 @@ std::uint64_t ab_flag(mm::Engine& eng, const std::string& flag, const std::vecto
     std::vector<std::uint64_t> states, outs;  // per arm: K/V/IK state FNV, final-rows FNV (this rank only; never in the cross-rank hash)
     const bool hash_state = (flag != "pfcore" && (flag == "pfcore" || flag == "pfattn4" || flag == "pfmsa" || flag == "pfmsarework" || flag == "mtfit" || flag == "core8" || flag == "pftab" || flag == "pfgufuse" || flag == "pfidx" || flag == "pftxuc" || flag == "pfpipe" || flag == "pfrouter" || flag == "pfidxconc" || flag == "pfkvtile" || flag == "pftiled" || flag == "pfall")) || (state_fnv_on() && (flag == "pfx" || flag == "pfil" || flag == "pfxip" || flag == "pfcore" || std::getenv("STRIX_MM_AB_STATE") != nullptr));
     // pfcore / pfattn4 / pfmsa / pfmsarework / mtfit / core8 / pftab / pfgufuse / pfidx / pftxuc / pfrouter / pfidxconc / pfkvtile / pftiled: A B A B A B A (every B bracketed by two A prefills); the other prefill flags: A B A B A B
-    const int prefills = flag == "attn" || flag == "linears" || flag == "xfer" || flag == "idxdec" || flag == "idxconc" || flag == "xbwait" || flag == "xbinplace" || flag == "xbboth" || flag == "xbprep" || flag == "xbpub" || flag == "xbwarm" || flag == "xbilp" || flag == "xbset" ? 1 : (flag == "pfcore" || flag == "pfattn4" || flag == "pfmsa" || flag == "pfmsarework" || flag == "mtfit" || flag == "core8" || flag == "pftab" || flag == "pfgufuse" || flag == "pfidx" || flag == "pftxuc" || flag == "pfpipe" || flag == "pfrouter" || flag == "pfidxconc" || flag == "pfkvtile" || flag == "pftiled" || flag == "pfall") ? 7 : 6;  // idxattn: both  // decode-only flags: one prefill, no TTFT cells
+    const int prefills = flag == "attn" || flag == "linears" || flag == "xfer" || flag == "idxdec" || flag == "idxconc" || flag == "xbwait" || flag == "xbinplace" || flag == "xbboth" || flag == "xbprep" || flag == "xbpub" || flag == "xbwarm" || flag == "xbwarmo" || flag == "moegrid" || flag == "xbilp" || flag == "xbset" ? 1 : (flag == "pfcore" || flag == "pfattn4" || flag == "pfmsa" || flag == "pfmsarework" || flag == "mtfit" || flag == "core8" || flag == "pftab" || flag == "pfgufuse" || flag == "pfidx" || flag == "pftxuc" || flag == "pfpipe" || flag == "pfrouter" || flag == "pfidxconc" || flag == "pfkvtile" || flag == "pftiled" || flag == "pfall") ? 7 : 6;  // idxattn: both  // decode-only flags: one prefill, no TTFT cells
     first.resize(static_cast<std::size_t>(prefills));
     for (int r = 0; r < prefills; ++r) {
         set(r % 2 == 1);
@@ -1197,10 +1205,18 @@ std::uint64_t ab_flag(mm::Engine& eng, const std::string& flag, const std::vecto
         eng.set_xb_prep(xb_p0);
         eng.set_xb_publish(xb_u0);
         eng.set_xb_warm(xb_m0);
+        eng.set_xb_warm_o(xb_o0);
+        if (flag == "moegrid") {  // the process setting as it was
+            if (grid0.empty()) unsetenv("STRIX_MMX_MOE_TIGHT_GRID");
+            else setenv("STRIX_MMX_MOE_TIGHT_GRID", grid0.c_str(), 1);
+        }
         eng.set_xb_postilp(xb_l0);
         std::printf("rank %u ab-%s: prep fold %llu layers, self-publish %llu exchanges, warm %llu, post-ilp %llu\n", eng.rank(), flag.c_str(),
                     static_cast<unsigned long long>(eng.xb_prep_count() - xb_pc0), static_cast<unsigned long long>(eng.xb_publish_count() - xb_uc0),
                     static_cast<unsigned long long>(eng.xb_warm_count() - xb_mc0), static_cast<unsigned long long>(eng.xb_postilp_count() - xb_lc0));
+        const char* wo = std::getenv("STRIX_MM_AB_WARM_O");
+        std::printf("rank %u ab-%s: o_proj warms %llu (B = %s MB)\n", eng.rank(), flag.c_str(),
+                    static_cast<unsigned long long>(eng.xb_warm_o_count() - xb_oc0), wo != nullptr ? wo : "8");
         const auto c1 = eng.xb_counts();
         std::printf("rank %u ab-%s: path activation: in-kernel wait %llu, in-place producer %llu exchanges\n", eng.rank(), flag.c_str(),
                     static_cast<unsigned long long>(c1.first - xb_c0.first), static_cast<unsigned long long>(c1.second - xb_c0.second));
@@ -1486,9 +1502,15 @@ void xb_check(mm::Engine& eng, const std::string& name, const std::vector<std::u
     const bool l0 = eng.xb_postilp();
     const char* cw = std::getenv("STRIX_MM_XB_CHECK_WARM");  // MB used by the warm configurations (default 8)
     const unsigned warm_mb = cw != nullptr ? static_cast<unsigned>(std::strtoul(cw, nullptr, 10)) : 8U;
+    const unsigned o0 = eng.xb_warm_o();
+    const char* co = std::getenv("STRIX_MM_XB_CHECK_WARM_O");  // MB used by the o_proj warm configurations (default 8)
+    const unsigned warm_o_mb = co != nullptr ? static_cast<unsigned>(std::strtoul(co, nullptr, 10)) : 8U;
+    const char* grid_env = std::getenv("STRIX_MMX_MOE_TIGHT_GRID");
+    const std::string grid0 = grid_env != nullptr ? grid_env : "";
     // Configurations: STRIX_MM_XB_CHECK_SET = comma list of flag sets (w wait, i inplace, p prep, u self-publish, m warm;
-    // '-' none; the first one is the reference), e.g. "-,w,i,iu,p,m,ip,wiupm"; unset: the 4 (wait, inplace) sets.
-    struct Cfg { std::string label; bool w, i, p, u, m, l; };
+    // o o_proj warm, g tight MoE grid; '-' none; the first one is the reference), e.g. "-,w,i,iu,p,m,ip,wiupm";
+    // unset: the 4 (wait, inplace) sets.
+    struct Cfg { std::string label; bool w, i, p, u, m, l, o, g; };
     std::vector<Cfg> cfgs;
     std::string set_list = std::getenv("STRIX_MM_XB_CHECK_SET") != nullptr ? std::getenv("STRIX_MM_XB_CHECK_SET") : "";
     const bool legacy = set_list.empty();
@@ -1497,7 +1519,7 @@ void xb_check(mm::Engine& eng, const std::string& name, const std::vector<std::u
         const std::size_t c = std::min(set_list.find(',', pos), set_list.size());
         const std::string t = set_list.substr(pos, c - pos);
         auto has = [&](char x) { return t.find(x) != std::string::npos; };
-        if (!t.empty()) cfgs.push_back({t, has('w'), has('i'), has('p'), has('u'), has('m'), has('l')});
+        if (!t.empty()) cfgs.push_back({t, has('w'), has('i'), has('p'), has('u'), has('m'), has('l'), has('o'), has('g')});
         pos = c + 1;
     }
     std::uint64_t ref = 0;
@@ -1510,6 +1532,9 @@ void xb_check(mm::Engine& eng, const std::string& name, const std::vector<std::u
         eng.set_xb_publish(g.u);
         eng.set_xb_warm(g.m ? warm_mb : 0U);
         eng.set_xb_postilp(g.l);
+        eng.set_xb_warm_o(g.o ? warm_o_mb : 0U);
+        setenv("STRIX_MMX_MOE_TIGHT_GRID", g.g ? "1" : "0", 1);
+        const auto co0 = eng.xb_warm_o_count();
         const auto cl0 = eng.xb_postilp_count();
         const auto c0 = eng.xb_counts();
         const auto cp0 = eng.xb_prep_count(), cu0 = eng.xb_publish_count(), cm0 = eng.xb_warm_count();
@@ -1551,7 +1576,13 @@ void xb_check(mm::Engine& eng, const std::string& name, const std::vector<std::u
                     static_cast<unsigned long long>(c1.second - c0.second), static_cast<unsigned long long>(eng.xb_prep_count() - cp0),
                     static_cast<unsigned long long>(eng.xb_publish_count() - cu0), static_cast<unsigned long long>(eng.xb_warm_count() - cm0),
                     static_cast<unsigned long long>(eng.xb_postilp_count() - cl0));
+        if (g.o || g.g)
+            std::printf("rank %u xb-check %s N%u%s K%zu cfg %s: o_proj warms %llu, tight grid %u\n", eng.rank(), name.c_str(), n,
+                        verify ? " verify" : "", k, label, static_cast<unsigned long long>(eng.xb_warm_o_count() - co0), g.g ? 1U : 0U);
     }
+    eng.set_xb_warm_o(o0);
+    if (grid0.empty()) unsetenv("STRIX_MMX_MOE_TIGHT_GRID");
+    else setenv("STRIX_MMX_MOE_TIGHT_GRID", grid0.c_str(), 1);
     eng.set_xb_postilp(l0);
     eng.set_xb_prep(p0x);
     eng.set_xb_publish(u0);
@@ -1960,8 +1991,20 @@ int main(int argc, char** argv) {
             const auto c0 = b.find(':'), c = b.rfind(':');
             const std::string ppath = b.substr(c0 + 1, c - c0 - 1);
             const auto ref = g_session_tokens.find(ppath);
-            const std::uint64_t ah = ab_flag(eng, b.substr(0, c0), read_u32(ppath), std::stoi(b.substr(c + 1)),
+            std::string name = b.substr(0, c0);
+            const char* wo_env = std::getenv("STRIX_MM_AB_WARM_O");
+            const std::string wo0 = wo_env != nullptr ? wo_env : "";
+            const bool wo_set = name.rfind("xbwarmo=", 0) == 0;
+            if (wo_set) {  // xbwarmo=MB: this run's B value (several sizes in one process); the env is restored below
+                setenv("STRIX_MM_AB_WARM_O", name.substr(8).c_str(), 1);
+                name = "xbwarmo";
+            }
+            const std::uint64_t ah = ab_flag(eng, name, read_u32(ppath), std::stoi(b.substr(c + 1)),
                                              ref == g_session_tokens.end() ? nullptr : &ref->second);
+            if (wo_set) {
+                if (wo_env == nullptr) unsetenv("STRIX_MM_AB_WARM_O");
+                else setenv("STRIX_MM_AB_WARM_O", wo0.c_str(), 1);
+            }
             hs = fnv(&ah, 8, hs);
         }
         for (const auto& v : vtraces) {
