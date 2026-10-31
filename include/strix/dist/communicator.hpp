@@ -335,6 +335,7 @@ private:
     std::size_t max_bytes_;
     std::byte* send_host_ = nullptr;
     std::byte* receive_host_ = nullptr;
+    std::vector<std::byte> control_send_, control_receive_; // exchange_host(): own host buffers, no device copies
     void* send_device_alias_ = nullptr;
     std::size_t d2h_kernel_bytes_ = 0; // STRIX_DIST_HOST_D2H_KERNEL_BYTES, default off; at most 1 MiB
     std::size_t staged_ready_bytes_ = 0, staged_prepared_bytes_ = 0;
@@ -380,7 +381,8 @@ private:
     } pending_;
     bool trace_pending_ = false;
     void flush_trace();
-    void validate_peer(bool deferred = false); // the peer's trailer and CRC of the received message (deferred: identity only)
+    // the peer's trailer and CRC of the received message (deferred: identity only); received: the receive buffer used
+    void validate_peer(bool deferred = false, const std::byte* received = nullptr);
     // Bounded waits (STRIX_DIST_WAIT_TIMEOUT_MS, default 120000): the producer's copy, the reuse of the receive buffer,
     // and the progress job. On expiry (or any failed host exchange) the communicator stops for good, prints its state
     // (the collective in flight and its phase, the last collectives, the streams' progress) to stderr and closes the

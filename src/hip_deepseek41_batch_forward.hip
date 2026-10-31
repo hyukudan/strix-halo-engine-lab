@@ -1303,9 +1303,22 @@ void BatchForward::exchange_host(std::span<const std::byte> out, std::span<std::
     auto& m = *impl_;
     if (!m.distributed()) throw std::logic_error("deepseek41 batch forward: exchange_host needs world 2");
     if (out.size() != in.size() || out.size() > control_bytes) throw std::invalid_argument("deepseek41 batch forward: control messages are equal and <= 64 KiB");
+    const dist::Tag tag{static_cast<std::uint32_t>(dist::TagKind::control), 0xC0U, 0U};
+    // STRIX_DS41_SERVE_HOST_CONTROL (default on; =0 the device path, both ranks the same): the control message goes
+    // host to host at once instead of behind the device work queued on the stream (the device path uploads it,
+    // copies it to the host again for the wire and back, all in stream order), so the peer is not held while this
+    // rank's device drains. The same wire message; on return the stream is idle, as before.
+    static const bool host_control = [] {
+        const char* v = std::getenv("STRIX_DS41_SERVE_HOST_CONTROL");
+        return v == nullptr || v[0] != '0';
+    }();
+    if (host_control) {
+        m.options.communicator->exchange_host(out, in, tag);
+        check(hipStreamSynchronize(m.stream), "control");
+        return;
+    }
     check(hipMemcpyAsync(m.control.p, out.data(), out.size(), hipMemcpyHostToDevice, m.stream), "control upload");
-    m.options.communicator->exchange(m.stream, m.control.p, m.control.p + control_bytes, out.size(),
-                                     dist::Tag{static_cast<std::uint32_t>(dist::TagKind::control), 0xC0U, 0U});
+    m.options.communicator->exchange(m.stream, m.control.p, m.control.p + control_bytes, out.size(), tag);
     check(hipMemcpyAsync(in.data(), m.control.p + control_bytes, in.size(), hipMemcpyDeviceToHost, m.stream), "control download");
     check(hipStreamSynchronize(m.stream), "control");
 }
