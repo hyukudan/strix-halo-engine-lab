@@ -244,6 +244,7 @@ public:
 
     // Resize host capacity between collectives; preserves sequence numbers and the route table.
     void resize_bytes(std::size_t bytes);
+    [[nodiscard]] std::size_t max_bytes() const noexcept { return max_bytes_; }
 
     // Sends `bytes` of device buffer `local` to the peer and writes the peer's `bytes` into device buffer
     // `remote`. The copy of `local` is ordered after its producer on `stream` and the CPU waits for it

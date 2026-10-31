@@ -401,6 +401,11 @@ struct DevicePrefill::Impl {
     bool async_gather = true;
     // row_split: per-row fields of one all-gather packed into one message (STRIX_DS41_PREFILL_PACK=0: one exchange per field)
     bool pack = true;
+    // row_split: the peer rows' MoE half sums are written straight into the communicator's pinned send buffer and the
+    // peer's are read straight from its receive buffer (no device<->host copy, which long MoE kernels on the main
+    // stream would hold back until the own-row pass ends); one message per layer, sent while the own rows run.
+    // Same kernels, same sum order: bitwise identical. Default on; STRIX_DS41_PREFILL_STAGED_HALF=0: the copy path.
+    bool staged_half = false;
     Dev<std::uint32_t> pack_send, pack_recv;
     // sites run on the dense WMMA kernel instead of the batch kernel (STRIX_DS41_PREFILL_DENSE_SITES, comma list of
     // q_a, kv, q_b, o_a; default q_a,kv, faster on the dense kernel at 512 and 2048 rows; "none" = all on the batch
@@ -934,8 +939,22 @@ DevicePrefill::DevicePrefill(const std::filesystem::path& gguf, const PrefillOpt
     m.sh_deltas = Dev<float>(T * I / 32U);
     m.sh_sums = Dev<std::int32_t>(T * I / 32U);
     if (m.distributed()) {
+        if (options.row_split) {
+            bool want = true;
+            if (const char* v = std::getenv("STRIX_DS41_PREFILL_STAGED_HALF"); v != nullptr && v[0] == '0') want = false;
+            // one rank's rows of a split run: every other window
+            const std::size_t bytes = ((T + 2U * W - 1U) / (2U * W)) * W * H * 4U;
+            auto* comm = options.communicator;
+            if (want && comm->send_staging(std::min(bytes, comm->max_bytes())) != nullptr) {
+                const std::size_t before = comm->max_bytes();
+                if (bytes > before) comm->resize_bytes(bytes);
+                m.staged_half = comm->send_staging(bytes) != nullptr;
+                if (!m.staged_half && bytes > before) comm->resize_bytes(before);
+            }
+        }
         m.half_own = Dev<float>(T * H);
-        m.half_other = Dev<float>(T * H);
+        // staged: half_other only for the runs below split_min_rows (no row split), half_recv not at all
+        m.half_other = Dev<float>((m.staged_half ? std::min<std::size_t>(T, std::max(m.split_min_rows, 1U)) : T) * H);
         if (options.row_split) {
             m.peer_kv = Dev<float>(T * attn::kHeadDim);
             m.peer_ckv = Dev<float>(T * attn::kHeadDim);
@@ -944,7 +963,7 @@ DevicePrefill::DevicePrefill(const std::filesystem::path& gguf, const PrefillOpt
             m.peer_xdeltas = Dev<float>(T * H / 32U);
             m.peer_ids = Dev<std::uint32_t>(T * K);
             m.peer_route_w = Dev<float>(T * K);
-            m.half_recv = Dev<float>(T * H);
+            if (!m.staged_half) m.half_recv = Dev<float>(T * H);
             m.h_peer = Dev<float>(H);
             // the widest packed row: window K/V + compressor kv + score (3 x 512 floats), or the MoE input
             const std::size_t pack_words = std::max<std::size_t>(3U * attn::kHeadDim, H / 4U + H / 32U + 2U * K);
@@ -2525,15 +2544,28 @@ PrefillResult DevicePrefill::run_from(std::span<const std::uint32_t> tokens, std
                     pin.weights = m.peer_route_w.p + std::size_t{p0} * K;
                     pin.codes = m.peer_xcodes.p + std::size_t{p0} * H;
                     pin.deltas = m.peer_xdeltas.p + std::size_t{p0} * H / 32U;
+                    // both ranks send max(np, no) rows (the same message size); staged: in one message
+                    const std::uint32_t nmax = std::max(np, no);
+                    const std::size_t half_bytes = std::size_t{nmax} * H * 4U;
+                    const dist::Tag half_tag{static_cast<std::uint32_t>(dist::TagKind::half_sum), layer, 0U};
+                    float* peer_half = m.half_other.p;
+                    if (m.staged_half && nmax > 0U) {
+                        peer_half = static_cast<float*>(m.options.communicator->send_staging(half_bytes));
+                        if (peer_half == nullptr) throw std::logic_error("deepseek41 prefill: no staging buffer for the half sums");
+                    }
+                    const bool staged = m.staged_half && nmax > 0U;
                     if (m.moe_joint || T <= m.joint_max_rows) {  // one expert pass over [peer rows; own rows], the peer rows' half sums first
                         cut(PrefillUnitLevel::finest, s.layer, "moe.joint");
-                        moe.enqueue_half_joint(pin, in, moe_half, m.half_other.p, m.half_own.p, st, m.half_ready[0]);
+                        moe.enqueue_half_joint(pin, in, moe_half, peer_half, m.half_own.p, st, m.half_ready[0]);
+                        if (staged) m.options.communicator->start_staged(st, half_bytes, half_tag);
                     } else {  // task units: one per chunk pass (chunks(np) + chunks(no): the same count on both ranks)
                         for (std::uint32_t ch = 0; ch < pieces(np); ++ch) {
                             cut(PrefillUnitLevel::finest, s.layer, "moe.peer");
-                            half_piece(pin, ch, m.half_other.p);
+                            half_piece(pin, ch, peer_half);
                         }
                         check(hipEventRecord(m.half_ready[0], st), "peer half ready");
+                        // staged: on the wire as soon as the peer rows are done, while the own rows below run
+                        if (staged) m.options.communicator->start_staged(st, half_bytes, half_tag);
                         for (std::uint32_t ch = 0; ch < pieces(no); ++ch) {
                             cut(PrefillUnitLevel::finest, s.layer, "moe.own");
                             half_piece(in, ch, m.half_own.p);
@@ -2542,9 +2574,17 @@ PrefillResult DevicePrefill::run_from(std::span<const std::uint32_t> tokens, std
                     // task: the half sums' exchange and the canonical sum as their own unit (two-pass form: the joint
                     // pass is one unit already); the same place on both ranks
                     if (!(m.moe_joint || T <= m.joint_max_rows)) cut(PrefillUnitLevel::finest, s.layer, "moe.sum");
+                    if (staged) {
+                        const auto* recv = static_cast<const float*>(m.options.communicator->finish_staged(st));
+                        const float* low = me == 0U ? m.half_own.p : recv;
+                        const float* high = me == 0U ? recv : m.half_own.p;
+                        if (no > 0U) ds41::enqueue_canonical_sum(in.shared, low, high, std::size_t{no} * H, y, st);
+                        m.options.communicator->release_staged(st);
+                        if (!m.moe_persist || m.options.stream_experts) check(hipStreamSynchronize(st), "moe");
+                        return;
+                    }
                     hipStream_t cs = m.comm_stream;
                     check(hipStreamWaitEvent(cs, m.half_ready[0], 0), "peer half ready");
-                    const std::uint32_t nmax = std::max(np, no);
                     for (std::uint32_t q0 = 0; q0 < nmax; q0 += C) {
                         const std::uint32_t qn = std::min(C, nmax - q0);
                         m.options.communicator->start(cs, m.half_other.p + std::size_t{q0} * H, std::size_t{qn} * H * 4U,
