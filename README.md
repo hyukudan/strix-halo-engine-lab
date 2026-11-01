@@ -21,7 +21,7 @@ Published measurements include:
   two replicas reach 158.1 tok/s wall throughput at eight concurrent coding chats.
 - **DeepSeek V4.1 Flash pair:** 70.6 tok/s on code with DSpark; eight plain decode rows
   reach 113.9 tok/s aggregate (calculated from measured step time); exact prompt processing (server time to first
-  token, one client, cache off) 9.00 / 31.94 / 45.46 s at 8.4K / 32.5K / 44.7K tokens.
+  token, one client, cache off) 8.29 / 29.77 / 42.72 s at 8.4K / 32.5K / 44.7K tokens.
 - **DeepSeek standalone RTX PRO 6000:** same-load code / English / Spanish decode
   at 82.3 / 87.7 / 94.4 tok/s with the target and draft on the GPU.
 - **MiniMax M3.1 Flash:** 44.57 ms/token at 1K with plain decode; DSpark reaches
@@ -220,13 +220,13 @@ the earlier single-client serving regression: it serves faster than `69c6bdab`.
 **On by default** (exact, same logits and generated ids): attention lean chunk
 kernel (`STRIX_DS41_ATTN_LEAN=0` to disable), split prefill MoE kernels v2 (`STRIX_DS41_PREFILL_MOE_V2=0`), and
 Engram lookahead between server prefill pieces (`STRIX_DS41_ENGRAM_LOOKAHEAD=0`). Server TTFT, one client, cache off,
-cold English prompts, 2 nodes:
+cold English prompts, 2 nodes; the current-default column also includes the later default changes through PR #184:
 
-| Prompt | Before (main #148) | Now | Change |
-|---|---:|---:|---:|
-| 8,399 tokens | 10.44 s | **9.70 s** | −7.1 % |
-| 32,499 tokens | 36.85 s | **33.79 s** | −8.3 % |
-| 44,699 tokens | 53.62 s | **48.27 s** | −10.0 % |
+| Prompt | Before (main #148) | These three levers | Current default (after #184) | Change vs before |
+|---|---:|---:|---:|---:|
+| 8,399 tokens | 10.44 s | 9.70 s (−7.1 %) | **8.29 s** | −20.6 % |
+| 32,499 tokens | 36.85 s | 33.79 s (−8.3 %) | **29.77 s** | −19.2 % |
+| 44,699 tokens | 53.62 s | 48.27 s (−10.0 %) | **42.72 s** | −20.3 % |
 
 Logits and the 32 generated ids equal the published references at all three lengths. Per lever (same GPU turn or
 separate turns, one load per arm): MoE v2 −5.9 / −6.9 / −8.0 %, Engram lookahead −3.3 % at 32,499 and −2.8 % at
@@ -515,6 +515,7 @@ admission headroom and the final value with its source. See the [catalog](docs/o
 | MTP self-speculation (default) | Chat / code / JSON prompts, 64–128 generated tokens, rank 0 | **26.98 / 22.46 / 24.98 ms/token = 37.1 / 44.5 / 40.0 tok/s** (1.50× / 1.79× / 1.62× plain 40.3–40.6 ms/token); TTFT 8K **31.13 s** (+2.9 %), 32K **140.9 s** (+8.7 %: MTP cache fill of the extra layer) | Full token vectors and prompt logits equal `--mtp 0` on 7 prompts, both ranks; plain TTFT unchanged |
 | Exact chunked prefill, X2 linear core (default) | 1K / 8K / 32K benchmark prompts | TTFT **3.78 / 27.93 / 120.26 s** (271 / 293 / 272 tok/s); same run with `STRIX_GLM_PF_EXACT_X=0`: 1K 3.84 s, 8K 29.59 s (**−5.6 %** at 8K) | logits bitwise equal the X=0 path on both ranks; decode anchors and speculative oracle unchanged |
 | Exact chunked prefill, X2 linear core + MoE auto (default) | 1K / 8K / 32K benchmark prompts | TTFT **3.74 / 26.85 / 113.73 s** (274 / 305 / 288 tok/s); same run with `STRIX_GLM_PF_EXACTMOE_V=3`: 1K 3.76 s, 8K 28.17 s (**−4.7 %** at 8K) | outputs bitwise equal the v3 path on both ranks (internal FP32 NaN payloads may differ only in the FP16 overflow case); decode anchors and speculative oracle unchanged |
+| Exact chunked prefill, X3 MoE core and row buckets (current default, PR #183) | 1K / 8K benchmark prompts, 8192-row chunks | TTFT **3.18 / 20.32 s**; same run with `STRIX_GLM_PF_EXACTMOE_V=7`: 1K 3.75 s, 8K 25.24 s (**−15 % / −19.5 %**) | two pairs per arm; R1 bitwise (same DOT2 chains, reduce4 and split order) |
 | R1b teacher-forced agreement | 32 prompts, 256 positions each; chat, code, JSON, math, reasoning, translation | **8,126/8,192 = 99.19 %** top-1; mean KL **~1.8e-3 nats** | `4dad4c19`; free runs diverge on **28/32** prompts within 19–227 tokens |
 
 The R≥3 buffer fix is verified on the real pair. The latest integration uses direct exchange for plain
@@ -1055,10 +1056,12 @@ YaRN, not native rotary, and do not qualify general 1M model fidelity or complet
 Measured on one Strix Halo node, default route (code `a199c8e0` plus the bundle selection of #137), diverse
 real prose (50 public-domain books in six languages), greedy decoding, automatic storage ladder (no storage
 overrides). TTFT runs from process launch to the first token and includes model load.
+The 262K prefill and decode cells are from build `7b2453fe` (262,144-token prompt, prefill time without model load,
+`--profile default` and `--profile fast` interleaved); the row's other cells are from the build above.
 
 | Context (YaRN factor) | Exact gate (MTP == serial == pool off) | TTFT serial / MTP | Prefill, serial | Decode serial / MTP | MTP acceptance |
 |---|---|---|---|---|---|
-| 262,400 (2) | Full scope | 219 s / 224 s | 1,254 tok/s | 19.9 / **56.0 tok/s** (2.8x) | 75 % |
+| 262,400 (2) | Full scope | 219 s / 224 s | **1,371 tok/s** `--profile default`; 1,412 tok/s `--profile fast` (`7b2453fe`) | 20.55 / **59.5 tok/s** (2.9x, `7b2453fe`) | 75 % |
 | 524,288 (2) | Target scope | 470 s / 508 s | 1,215 tok/s | 19.7 / **60.6 tok/s** (3.1x) | 85 % |
 | 1,048,576 (4) | Full scope, plus the default-path receipt | 1,005 s / 1,096 s | 1,081 tok/s (MTP route about 970) | 18.7 / **55.9 tok/s** (3.0x) | 83 % |
 

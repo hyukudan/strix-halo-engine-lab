@@ -33,7 +33,7 @@ rows only for the named build and workload. Raw receipts and review corresponden
 | Qwen MTP decode, UD-Q4_K_XL, dense A8 | One node, code 1K / 8K, auto windows, 256 generated tokens; `702bc074`, 2026-10-25 | **59.59 / 54.00 tok/s**; 1K **69 %** of 86.8 tok/s byte ceiling | Recipe golden equal; prose 8K **49.58 tok/s** on `226bb691`, exact |
 | DeepSeek pipeline, expert-TP identity | RTX PRO + pair over 1 GbE, two groups; pair `6525d5e8`, CUDA `463c08ec` line | Batch N2/4/8 **60.1 / 97.5 / 137.2 tok/s**; DSpark N1/2/4 **52.4 / 91.3 / 156.8 tok/s** wall aggregate (2026-10-24); server C1/2/4/8 **43.2 / 65.8 / 77.9 / 91.7 tok/s** (2026-10-25) | Batch: 8 prompts × 48 tokens, bitwise gates; server: 8-category short set, 32/32 IDs equal pair-only |
 | MiniMax M3.1 Flash, EXL3 3.06 bpw | Two nodes TP2 over USB4, 1K / 8K greedy benchmark, 2026-10-26 | **44.57 / 46.10 ms/token**; fresh 8K prefill **17.731 s (462 tok/s)** | Exact archived-reference checks at 1K/8K; new defaults pending publication |
-| GLM-5.3 Flash, EXL3 4.05 bpw, R1 | Two nodes TP2 over USB4, chat decode / R8 batch / exact 8K prefill, 2026-10-26 | **45.29 ms/token (22.1 tok/s)**, **51 %** of 23.2 ms floor; batch **122.0 ms/step = 65.5 tok/s** aggregate (calculated); prefill **34.70 s (236 tok/s)** | R1 reference equal; latest integration `41d8cfdc`, pending publication |
+| GLM-5.3 Flash, EXL3 4.05 bpw, R1 | Two nodes TP2 over USB4, chat decode / R8 batch / exact 8K prefill, 2026-10-26 | **45.29 ms/token (22.1 tok/s)**, **51 %** of 23.2 ms floor; batch **122.0 ms/step = 65.5 tok/s** aggregate (calculated); exact 8K prefill **20.32 s** after PR #183 (earlier 34.70 s on `875ca821`) | R1 reference equal; latest integration `41d8cfdc`, pending publication |
 
 Standalone RTX best runs across loads (2026-10-25): code **94–95**, English **97**, Spanish **100–101 tok/s**,
 **58–63 %** of the 6.18 ms all-hit ceiling. Loads vary by up to **~10 %**; compare within one load.
@@ -184,6 +184,7 @@ EXL3 4.05 bpw, two Strix Halo nodes TP2 over USB4. Production engine; newer buil
 | Greedy decode, R1 | 31-token chat prompt + 64 generated tokens | **45.29 ms/token = 22.1 tok/s**; **51 %** of calculated 23.2 ms floor | 2026-10-26 | `1836c99c`; tokens equal the reference |
 | Batch decode, R1 | Eight independent rows, benchmark context unspecified | **122.0 ms/step** = 65.5 tok/s aggregate (calculated) | 2026-10-26 | `1836c99c`; tokens equal the earlier real-pair reference |
 | Exact chunked prefill | 1K / 8K / 32K benchmark prompts, kind unspecified | TTFT **4.268 / 34.70 / 144.75 s** (240 / 236 / 226 tok/s) | 2026-10-26 | `875ca821`, integrated in `41d8cfdc`; both ranks' logits bitwise equal the previous exact prefill |
+| Exact chunked prefill, X3 MoE core and row buckets (current default) | 1K / 8K benchmark prompts, 8192-row chunks | TTFT **3.18 / 20.32 s**; same run with `STRIX_GLM_PF_EXACTMOE_V=7`: 3.75 / 25.24 s (**−15 % / −19.5 %**) | — | PR #183; two pairs per arm; R1 bitwise (same DOT2 chains, reduce4 and split order) |
 | R1b-fast, now the default decode identity | Same chat benchmark, 96-token alternating comparison | **41.93–41.96 ms/token**, vs R1 47.33–47.48 (**−11.5 %**, **55 %** of 23.2 ms floor) | 2026-10-26 | `8877de1d`; stable within each identity, not bitwise to R1 |
 | R1b teacher-forced agreement | 32 prompts, 256 positions each; chat, code, JSON, math, reasoning, translation | **8,126/8,192 = 99.19 %** top-1; mean KL **~1.8e-3 nats** | 2026-10-26 | `4dad4c19`; free runs diverge on **28/32** prompts within 19–227 tokens |
 
@@ -221,10 +222,12 @@ These are historical 2026-10-22 rows; the overnight snapshot gives the newer exa
 Measured on one Strix Halo node, default route (code `a199c8e0` plus the bundle selection of #137), diverse
 real prose (50 public-domain books in six languages), greedy decoding, automatic storage ladder (no storage
 overrides). TTFT runs from process launch to the first token and includes model load.
+The 262K prefill and decode cells are from build `7b2453fe` (262,144-token prompt, prefill time without model load,
+`--profile default` and `--profile fast` interleaved); the row's other cells are from the build above.
 
 | Context (YaRN factor) | Exact gate (MTP == serial == pool off) | TTFT serial / MTP | Prefill, serial | Decode serial / MTP | MTP acceptance |
 |---|---|---|---|---|---|
-| 262,400 (2) | Full scope | 219 s / 224 s | 1,254 tok/s | 19.9 / **56.0 tok/s** (2.8x) | 75 % |
+| 262,400 (2) | Full scope | 219 s / 224 s | **1,371 tok/s** `--profile default`; 1,412 tok/s `--profile fast` (`7b2453fe`) | 20.55 / **59.5 tok/s** (2.9x, `7b2453fe`) | 75 % |
 | 524,288 (2) | Target scope | 470 s / 508 s | 1,215 tok/s | 19.7 / **60.6 tok/s** (3.1x) | 85 % |
 | 1,048,576 (4) | Full scope, plus the default-path receipt | 1,005 s / 1,096 s | 1,081 tok/s (MTP route about 970) | 18.7 / **55.9 tok/s** (3.0x) | 83 % |
 
