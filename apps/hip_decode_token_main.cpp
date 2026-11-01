@@ -1167,13 +1167,8 @@ static int run_decode_entry(
         parse_options(
             argc,
             argv, true);
-    // Resolve route admission before exporting policy, ahead of switch readers.
-    strix::decode_cli::admit_product_profile(options);
-    strix::qwen::profile::apply(options.product_profile);
-    for (const auto& notice : options.product_profile.notices()) std::cerr << notice << '\n';
     bundle_retry.selected=options.mtp.enabled && !options.mtp_bundle_path.empty();
 #if defined(STRIX_MTP_MODEL_QUALIFICATION_RUNNER)
-    strix::tests::set_mtp_product_profile(options.product_profile);
     options.mtp_cli_phase_retirement=false;
 #endif
     const auto startup_preflight = strix::emit_qwen_startup_diagnostics(
@@ -1457,6 +1452,13 @@ static int run_decode_entry(
         {options, requested_environment, !target_input_export}, model, info, manifest,
         admitted_content, prompt_capabilities, prompt_memory);
     options = effective.options;
+    // Export only after the resolved route has admitted the profile proposals.
+    strix::qwen::profile::withdraw_declined(options.product_profile);
+    strix::qwen::profile::apply(options.product_profile);
+    for (const auto& notice : options.product_profile.notices()) std::cerr << notice << '\n';
+#if defined(STRIX_MTP_MODEL_QUALIFICATION_RUNNER)
+    strix::tests::set_mtp_product_profile(options.product_profile);
+#endif
     session_cache_enabled = !options.session_save.empty() || !options.session_load.empty() || options.session_live_control || options.session_management_requested;
     strix::decode_cli::require_bitcalc_session_route(options, bitcalc.enabled());
     if (bitcalc.enabled() && (options.mtp.enabled || options.mtp.supplied || options.prompt_lookup ||

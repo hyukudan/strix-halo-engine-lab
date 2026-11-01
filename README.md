@@ -870,11 +870,13 @@ checkpoint copies follow existing block boundaries.
 One switch selects a product profile for Qwen (CLI, `--http-serve` and the MTP runner):
 
 - `default`: the exact default described above; it sets nothing.
-- `fast`: currently applies BF16 MoE route storage (`STRIX_QPF2K_MOE_ROUTE_BF16=1`) ahead of its
-  qualification receipt, without `--allow-pending`. This is bit-changing and changes logits; qualification is
+- `fast`: currently applies BF16 MoE route storage (`STRIX_QPF2K_MOE_ROUTE_BF16=1`) where the route admits it,
+  ahead of its qualification receipt, without `--allow-pending`. This is bit-changing and changes logits; qualification is
   in progress. The receipt stamps `qualification in progress: moe_route_bf16` and marks the row `provisional`;
-  one stderr line discloses the bit change and qualification status. Attention selection budget, FP16 chunked
-  recurrence and FP16 output head remain pending and keep their builtin paths, with one notice each.
+  one stderr line discloses the bit change and qualification status. Elsewhere, including HTTP and MTP,
+  the row stays `pending` with the decline reason, keeps FP32 route storage and is not exported or stamped as applied.
+  Attention selection budget, FP16 chunked recurrence and FP16 output head remain pending and keep their builtin paths,
+  with one notice each.
 - `quality`: there is no quality pack for this model, so it runs `default` and says so in the receipt.
 
 `--allow-pending` (or `STRIX_QWEN_PROFILE_ALLOW_PENDING=1`) runs genuinely pending options whose code is in

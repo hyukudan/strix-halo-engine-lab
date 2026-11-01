@@ -197,9 +197,16 @@ void cli_and_receipts() {
         check(dc::effective_prefill_argv(o) == dc::effective_prefill_argv(plain), "prefix effective arguments exclude product metadata");
         const auto effective = dc::resolve_effective_config({o,{}}, strix::ModelContract::qwen38_flash_next(), {}, {}, "", {}, {});
         const auto json = strix::serve::parse_json_unique(dc::effective_config_json(effective));
-        check(json.find("profile")->dump() == o.product_profile.json(), "effective config profile receipt");
+        check(json.find("profile")->dump() == effective.options.product_profile.json(), "effective config profile receipt");
         auto expected = strix::serve::parse_json_unique(dc::effective_config_json(dc::resolve_effective_config({plain,{}}, strix::ModelContract::qwen38_flash_next(), {}, {}, "", {}, {})));
         expected.set("profile", *json.find("profile"));
+        if (std::string_view(value) == "fast") {
+            const auto* row = effective.options.product_profile.find("moe_route_bf16");
+            check(row->status == pr::Status::pending && row->value == "0" &&
+                row->reason == effective.options.prefill_moe_route_bf16_reason,
+                "unavailable backend keeps profile storage pending");
+            expected.set("prefill_moe_route_bf16_reason", *json.find("prefill_moe_route_bf16_reason"));
+        }
         check(expected.dump() == json.dump(), "effective config differs only by profile receipt");
     }
     check(parse({"decoder","model.gguf","1","--profile=fast"}).product_profile.profile == pr::Name::fast, "equals syntax");
@@ -270,6 +277,26 @@ void native_switch_and_yarn() {
     inputs.cli = {{"moe_route_bf16","1"}};
     check(pr::resolve(pr::Name::fast, inputs).find("moe_route_bf16")->status == pr::Status::explicit_cli, "explicit CLI beats env off");
 }
+void declined_provenance() {
+    Env env{{"STRIX_QPF2K_MOE_ROUTE_BF16", "1"}, {"STRIX_QWEN_PROFILE_OWNED_moe_route_bf16", "fast:provisional:1"}};
+    auto options = parse({"decoder", "model.gguf", "1"});
+    options.product_profile = pr::resolve(pr::Name::fast, {{}, lookup(env)});
+    const auto got = dc::resolve_effective_config({options, env},
+        strix::ModelContract::qwen38_flash_next(), {}, {}, "", {}, {});
+    check(got.error.empty() && got.options.product_profile.find("moe_route_bf16")->status == pr::Status::pending,
+        "inherited profile ownership still permits soft decline");
+    const auto erase = [&](const char* key) { env.erase(key); return true; };
+    pr::withdraw_declined(got.options.product_profile, lookup(env), erase);
+    pr::apply(got.options.product_profile, [&](const char* key, const char* value) { env[key] = value; return true; });
+    check(env.empty(), "declined inherited proposal and provenance are removed before runtime");
+    env["STRIX_QPF2K_MOE_ROUTE_BF16"] = "1";
+    pr::withdraw_declined(got.options.product_profile, lookup(env), erase);
+    check(env.at("STRIX_QPF2K_MOE_ROUTE_BF16") == "1", "withdrawal preserves unowned explicit environment");
+    options.product_profile = pr::resolve(pr::Name::fast, {{}, lookup(env)});
+    const auto explicit_request = dc::resolve_effective_config({options, env},
+        strix::ModelContract::qwen38_flash_next(), {}, {}, "", {}, {});
+    check(!explicit_request.error.empty(), "unowned inherited environment keeps hard refusal");
+}
 void identity() {
     const auto before = strix::session_numerical_config("fixture");
     check(pr::export_environment("STRIX_QWEN_PROFILE_ALLOW_PENDING", "1"), "set policy metadata");
@@ -312,7 +339,7 @@ int main(int argc, char** argv) try {
 #else
     (void)argc; (void)argv;
 #endif
-    product(); resolver(); provisional_resolution(); cli_and_receipts(); native_switch_and_yarn(); identity();
+    product(); resolver(); provisional_resolution(); cli_and_receipts(); native_switch_and_yarn(); declined_provenance(); identity();
     std::cout << checks << " profile checks passed\n";
     return 0;
 } catch (const std::exception& error) { std::cerr << error.what() << '\n'; return 1; }
