@@ -1,6 +1,7 @@
 #include "native.cuh"
 #include "c1_layout.cuh"
 #include "c1_schedule.hpp"
+#include "row_mma.cuh"
 #include <mma.h>
 #include <algorithm>
 #include <limits>

@@ -81,12 +81,13 @@ cudaError_t gemm(const U16* a,const U16* w,float* y,unsigned rows,unsigned in,un
     return cudaGetLastError();
 }
 template<class Arena>
-cudaError_t project(Matrix w,const float* x,float* y,unsigned rows,Arena& a,cudaStream_t s,bool ref,bool tiled=false) {
+cudaError_t project(Matrix w,const float* x,float* y,unsigned rows,Arena& a,cudaStream_t s,bool ref,bool tiled=false,bool row=false) {
     // qkv has 24576 columns, beyond the FFN diagnostic decoder's public bound.
     // Its format and decode kernel are identical; use the layer-local decoder below.
     input_transform<<<(rows*(w.input/128)+7)/8,256,0,s>>>(x,a.operand,w.suh,rows,w.input);
     if(ref&&tiled)projection_fp32_tiled<<<dim3((w.output+31)/32,(rows+7)/8),128,0,s>>>(nullptr,a.operand,a.decoded,a.raw,rows,w.input,w.output,false);
     else if(ref)projection_reference<<<unsigned((std::size_t(rows)*w.output+255)/256),256,0,s>>>(nullptr,a.operand,a.decoded,a.raw,rows,w.input,w.output,false);
+    else if(row)launch_row_project(w,a.operand,a.raw,rows,s); // the caller skipped the layer decode
     else {auto e=gemm<Row>(a.operand,a.decoded,a.raw,rows,w.input,w.output,a.problem,s);if(e!=cudaSuccess)return e;}
     output_transform<<<(rows*(w.output/128)+7)/8,256,0,s>>>(a.raw,y,w.svh,rows,w.output);
     return cudaGetLastError();

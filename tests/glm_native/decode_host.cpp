@@ -1,4 +1,5 @@
 // CPU-only decode contract tests: no CUDA runtime, device or model data.
+#include "glm/rtxpf/producer/runtime.hpp"
 #include "glm/rtxpf/producer/session.hpp"
 #include "glm/rtxpf/producer/head_select.hpp"
 #include "glm/rtxpf/producer/expert_tier.hpp"
@@ -650,7 +651,7 @@ void profile_tests(){
     auto run=[&](std::vector<std::string> args,std::vector<std::pair<std::string,std::string>> env={}){rp::Inputs in;in.args=std::move(args);in.env=lookup(std::move(env));return rp::resolve(rp::App::decode_service,in);};
     const auto def=run({});
     check(def.name==rp::Name::standard&&def.qualification()=="qualified","no --profile = default, qualified");
-    for(const char* l:{"expert_tier","placement","eviction_policy","spare_share","row_tile","cuda_graphs","restore_decode_residency","flush_ready"}){
+    for(const char* l:{"expert_tier","placement","eviction_policy","spare_share","row_tile","cuda_graphs","restore_decode_residency","flush_ready","decode_row_kernels"}){
         auto* e=def.find(l);check(e&&e->status==rp::Status::profile&&e->lever->kind==rp::Kind::exact,(std::string("default: exact lever on: ")+l).c_str());}
     check(def.find("expert_tier")->value=="tierstream"&&def.find("eviction_policy")->value=="auto"&&def.find("spare_share")->value=="5"&&def.find("row_tile")->value=="auto",
           "default values = today's service defaults");
@@ -681,6 +682,14 @@ void profile_tests(){
         check(allowed.find(l)->status==rp::Status::unqualified&&allowed.find(l)->value=="1",(std::string("--allow-pending runs ")+l).c_str());}}
     {const auto c=run({"--skip-empty-expert-groups","1"});check(c.find("skip_empty_expert_groups")->status==rp::Status::explicit_cli,"--skip-empty-expert-groups explicit");
      const auto e=run({},{{"STRIX_GLM_RTX_PERSISTENT_DENSE_FP16","1"}});check(e.find("persistent_dense_fp16")->status==rp::Status::explicit_env&&e.find("persistent_dense_fp16")->value=="1","STRIX_GLM_RTX_PERSISTENT_DENSE_FP16=1 explicit");}
+    // decode_row_kernels: on in every profile; 0, 1 or a '+' subset; the runtime switches follow the value
+    check(def.find("decode_row_kernels")->value=="1"&&fast.find("decode_row_kernels")->value=="1","decode_row_kernels on by default");
+    check(run({},{{"STRIX_GLM_RTX_ROW_KERNELS","0"}}).find("decode_row_kernels")->value=="off","STRIX_GLM_RTX_ROW_KERNELS=0 turns it off");
+    {const auto c=run({"--decode-row-kernels","moe+router"});check(c.find("decode_row_kernels")->status==rp::Status::explicit_cli&&c.find("decode_row_kernels")->value=="moe+router","--decode-row-kernels explicit");
+     DecodeOptions d;set_row_kernels_value(d,"moe+router");check(d.row_moe&&!d.row_hc&&d.row_router&&row_kernels_name(d)=="moe+router","row kernel subset");
+     set_row_kernels_value(d,"1");check(d.row_moe&&d.row_hc&&d.row_router&&row_kernels_name(d)=="1","row kernels all");
+     set_row_kernels_value(d,"0");check(!d.row_moe&&!d.row_hc&&!d.row_router&&row_kernels_name(d)=="0","row kernels none");
+     bool threw=false;try{set_row_kernels_value(d,"moe+gemm");}catch(const std::exception&){threw=true;}check(threw,"unknown row kernel refused");}
     // restore_decode_residency: placement only, on in every profile; CLI / environment override
     check(def.find("restore_decode_residency")->value=="on"&&fast.find("restore_decode_residency")->value=="on"&&def.find("restore_decode_residency")->status==rp::Status::profile,"restore_decode_residency on");
     {const auto off=run({},{{"STRIX_GLM_RTX_RESTORE_RESIDENCY","0"}});check(off.find("restore_decode_residency")->status==rp::Status::explicit_env&&off.find("restore_decode_residency")->value=="off","STRIX_GLM_RTX_RESTORE_RESIDENCY=0");}

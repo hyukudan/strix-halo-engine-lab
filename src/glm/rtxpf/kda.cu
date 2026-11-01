@@ -1,4 +1,5 @@
 #include "kda.cuh"
+#include "row_mma.cuh"
 #include <mma.h>
 #include <cutlass/gemm/device/gemm_grouped.h>
 #include <cutlass/gemm/kernel/default_gemm_grouped.h>
@@ -151,8 +152,9 @@ cudaError_t enqueue_kda(const KdaCall& v,void* workspace,std::size_t bytes,cudaS
     Arena a(workspace,r,w.hidden,w.heads);if(bytes<a.size)return cudaErrorInvalidValue;
     if(cp&&(cp->row%B||cp->row>=r||!cp->state||!cp->conv))return cudaErrorInvalidValue;
     auto s=stream;cudaError_t e;
-    layer_decode<<<w.qkv.input/16*(w.qkv.output/16),256,0,s>>>(w.qkv,a.decoded);
-    if((e=project(w.qkv,v.x,a.qkv,r,a,s,ref))!=cudaSuccess)return e;
+    const bool rq=v.row_kernels&&!ref&&row_project_fits(w.qkv,r),ro=v.row_kernels&&!ref&&row_project_fits(w.out,r);
+    if(!rq)layer_decode<<<w.qkv.input/16*(w.qkv.output/16),256,0,s>>>(w.qkv,a.decoded);
+    if((e=project(w.qkv,v.x,a.qkv,r,a,s,ref,false,rq))!=cudaSuccess)return e;
     if((e=ordinary(v.x,w.fa,a.lo,r,w.hidden,D,a,s,ref))!=cudaSuccess)return e;
     if((e=ordinary(v.x,w.ga,a.hi,r,w.hidden,D,a,s,ref))!=cudaSuccess)return e;
     if((e=ordinary(a.lo,w.fb,a.f,r,D,c,a,s,ref))!=cudaSuccess)return e;
@@ -172,7 +174,7 @@ cudaError_t enqueue_kda(const KdaCall& v,void* workspace,std::size_t bytes,cudaS
         block_products<true><<<dim3(w.heads,8,8),32,0,s>>>(a.prep,a.prefix,a.cq,a.bq,a.delta,v.state,a.o,w.heads,first,n);
     }
     output_gate<<<dim3(w.heads,r),D,0,s>>>(w,a.o,a.g,a.z);
-    layer_decode<<<w.out.input/16*(w.out.output/16),256,0,s>>>(w.out,a.decoded);
-    return project(w.out,a.z,v.y,r,a,s,ref);
+    if(!ro)layer_decode<<<w.out.input/16*(w.out.output/16),256,0,s>>>(w.out,a.decoded);
+    return project(w.out,a.z,v.y,r,a,s,ref,false,ro);
 }
 }

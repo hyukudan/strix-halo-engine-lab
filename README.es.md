@@ -31,8 +31,9 @@ Entre las mediciones publicadas se incluyen:
   37.1 / 44.5 / 40.0 tok/s en chat / código / JSON.
 - **GLM-5.3 Flash en una RTX PRO 6000, presupuestos de todo el dispositivo:** prefill y decode exactos con una caché de
   expertos repartida entre VRAM, RAM pinned y disco. Tarjeta completa: TTFT 17.7 s con 8K y 41.2 s con 32K (vea la nota
-  más abajo: unos 10-15 s más por prefill en la rama main actual hasta que llegue una corrección);
-  decode de 3.3 tok/s en caliente. Ahora también funciona de forma exacta con 24 GiB de VRAM + 32 GiB de RAM del host
+  más abajo: unos 10-15 s más por prefill en la rama main actual hasta que llegue una corrección); decode de 6.0 / 6.2
+  tok/s en caliente con 1K / 8K con los kernels de decode de pocas filas (2.4 tok/s con ellos desactivados, misma
+  carga). Ahora también funciona de forma exacta con 24 GiB de VRAM + 32 GiB de RAM del host
   (expertos leídos del disco): TTFT 64.8 s con 1K y 76.7 s con 8K; decode de 0.67 tok/s en caliente (0.63 en frío).
   Exacto = cada digest de estado y de logits es igual al de un prefill nuevo de prompt+t.
 
@@ -545,8 +546,15 @@ compartidos se quedan en la tarjeta; los 43 x 288 expertos enrutados los sirve l
 de [tierstream](https://github.com/hyukudan/tierstream), y el prefill los lee a través de la misma caché, así que la
 tarjeta guarda una sola copia de cada experto. El prefill y el decode son exactos (digests bit a bit de logits y
 estado; estado del prefill igual con tiles de 2048 / 4096 / 8192 filas). Tarjeta completa: TTFT **17.7 s** con 8K y
-**41.2 s** con 32K con el mejor tile (17.7-22.7 s / 41-55 s según el tile); decode de unos **3.3 tok/s** en caliente
-(2.5 en frío), limitado por el cómputo y el coste de lanzamiento, y aún en optimización. Con 24 GiB de VRAM + 32 GiB de
+**41.2 s** con 32K con el mejor tile (17.7-22.7 s / 41-55 s según el tile); decode de **6.00 / 6.15 tok/s** en caliente
+con 1K / 8K (3.75 / 3.70 en frío) con los kernels de decode de pocas filas activados por defecto, frente a 2.43 / 2.36
+tok/s con ellos desactivados en la misma carga del servicio (tarjeta completa; la RAM del host dejó 1,098 unidades de
+expertos en el archivo de unidades, así que se incluyen los fallos de archivo por token; prueba de 24 tokens). Los
+tokens, todos los digests de logits y el estado final de la sesión son iguales bit a bit con ellos activados y
+desactivados, y la cualificación de 1K/8K pasa con ellos activados. Los kernels decodifican cada tesela de pesos
+directamente en fragmentos de tensor cores y mantienen el orden de acumulación de los GEMM fijados; desactívelos con
+`--decode-row-kernels 0` o `STRIX_GLM_RTX_ROW_KERNELS=0`.
+Con 24 GiB de VRAM + 32 GiB de
 RAM del host (la mayoría de los expertos leídos del archivo de unidades en disco) también funciona de forma exacta: TTFT
 **64.8 s** con 1K y **76.7 s** con 8K; decode de **0.67 tok/s** en caliente (0.63 en frío). Compilación, archivo de unidades y opciones: [guía de GLM RTX](src/glm/rtxpf/README.md).
 

@@ -251,6 +251,7 @@ def service_command(a, binary):
                             ('--tier-flush-ready', getattr(a, 'tier_flush_ready', None)),
                             ('--skip-empty-expert-groups', getattr(a, 'skip_empty_expert_groups', None)),
                             ('--persistent-dense-fp16', getattr(a, 'persistent_dense_fp16', None)),
+                            ('--decode-row-kernels', getattr(a, 'decode_row_kernels', None)),
                             ('--expert-residency', getattr(a, 'expert_residency', None)),
                             ('--expert-routes', getattr(a, 'expert_routes', None)),
                             ('--routes-out', getattr(a, 'routes_out', None)),
@@ -1014,7 +1015,7 @@ def worker_options(a):
     the fitted tile sweep (and the note of an arm the parent dropped)."""
     argv = []
     for name in ('capacity', 'vram_total_gib', 'ram_total_gib', 'tier_vram_gib', 'tier_ram_gib', 'tier_spare_percent',
-                 'tier_policy', 'tier_predict', 'tier_flush_ready', 'skip_empty_expert_groups', 'persistent_dense_fp16', 'expert_residency', 'expert_routes', 'routes_out', 'row_tile', 'profile'):
+                 'tier_policy', 'tier_predict', 'tier_flush_ready', 'skip_empty_expert_groups', 'persistent_dense_fp16', 'decode_row_kernels', 'expert_residency', 'expert_routes', 'routes_out', 'row_tile', 'profile'):
         if getattr(a, name, None) is not None:
             argv += ['--' + name.replace('_', '-'), str(getattr(a, name))]
     if getattr(a, 'full_card', False):
@@ -1125,6 +1126,7 @@ def arguments(argv=None):
                    help='the service profile (one switch for every lever; default = today; per-lever options override)')
     p.add_argument('--skip-empty-expert-groups', choices=['0', '1'], help='routed MoE: launch only expert groups holding routed rows (exact; pending row)')
     p.add_argument('--persistent-dense-fp16', choices=['0', '1'], help='shared experts / dense FFNs decoded once at startup (exact; pending row; ~2.8 GiB)')
+    p.add_argument('--decode-row-kernels', help='one-row decode kernels: 0, 1 or a subset of moe, hc, router, kda, dsa joined by + (exact; pending row)')
     p.add_argument('--decode-profile', action='store_true',
                    help='decode timeline: CUDA events per phase per layer in every decode step record and per-arm totals '
                         '(outputs unchanged; timings include the events)')

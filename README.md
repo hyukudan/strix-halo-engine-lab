@@ -29,8 +29,9 @@ Published measurements include:
 - **GLM-5.3 Flash:** default exact MTP self-speculation reaches
   37.1 / 44.5 / 40.0 tok/s on chat / code / JSON.
 - **GLM-5.3 Flash on one RTX PRO 6000, whole-device budgets:** exact prefill and decode with an expert cache across
-  VRAM, pinned RAM and disk. Full card: TTFT 17.7 s at 8K, 41.2 s at 32K (see the note below: about 10-15 s higher per prefill on current
-  main until a fix lands); decode 3.3 tok/s warm. Now also
+  VRAM, pinned RAM and disk. Full card: TTFT 17.7 s at 8K, 41.2 s at 32K (see the note below: about 10-15 s higher per
+  prefill on current main until a fix lands); decode 6.0 / 6.2 tok/s warm at 1K / 8K with the few-row decode kernels
+  (2.4 tok/s with them off, same load). Now also
   runs exact with 24 GiB VRAM + 32 GiB host RAM (experts streamed from disk): TTFT 64.8 s at 1K, 76.7 s at 8K;
   decode 0.67 tok/s warm (0.63 cold). Exact = every state/logit digest equals a fresh prefill of prompt+t.
 
@@ -535,7 +536,12 @@ on the card; the 43 x 288 routed experts are served by the [tierstream](https://
 device-gated cache, and prefill reads them through the same cache, so the card holds one copy of every expert.
 Prefill and decode are exact (bitwise digests of logits and state; prefill state equal across row tiles 2048 / 4096 /
 8192). Full card: TTFT **17.7 s** at 8K and **41.2 s** at 32K with the best row tile (17.7-22.7 s / 41-55 s across
-tiles); decode about **3.3 tok/s** warm (2.5 cold), bound by compute and launch overhead and still being optimised.
+tiles); decode **6.00 / 6.15 tok/s** warm at 1K / 8K (3.75 / 3.70 cold) with the few-row decode kernels on by
+default, from 2.43 / 2.36 tok/s with them off in the same service load (full card; host RAM put 1,098 expert units on
+the unit file, so per-token file misses are included; 24-token bench). Tokens, every logits digest and the final
+session state are bitwise equal on and off, and the 1K/8K qualification passes with them on. The kernels decode each
+weight tile straight into tensor-core fragments and keep the pinned GEMMs' accumulation order; turn them off with
+`--decode-row-kernels 0` or `STRIX_GLM_RTX_ROW_KERNELS=0`.
 With 24 GiB VRAM + 32 GiB host RAM (most experts streamed from the unit file on disk) it also runs exact: TTFT
 **64.8 s** at 1K and **76.7 s** at 8K; decode **0.67 tok/s** warm (0.63 cold). Build, unit file and options: [GLM RTX guide](src/glm/rtxpf/README.md).
 
