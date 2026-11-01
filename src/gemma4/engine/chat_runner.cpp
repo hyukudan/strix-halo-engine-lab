@@ -3,66 +3,79 @@
 #include <stdexcept>
 
 namespace strix::gemma4::engine {
+ChatJob::ChatJob(const gemma4::serve::Adapter& adapter, ChatRequest request, ChatSink sink)
+    : adapter_(adapter), request_(std::move(request)), sink_(std::move(sink)) {
+    if (request_.generation.max_tokens > UINT32_MAX) throw std::invalid_argument("max_tokens exceeds chat limit");
+    if (request_.thinking_budget && (!request_.input.enable_thinking || request_.thinking_budget >= request_.generation.max_tokens))
+        throw std::invalid_argument("thinking_budget requires thinking and must be below max_tokens");
+    const auto prepared = adapter_.prepare(request_.input);
+    prompt_ = prepared.ids;
+    stop_ids_ = prepared.stop_ids;
+    starts_in_reasoning_ = prepared.starts_in_reasoning;
+    draws_ = request_.generation.sampling.draws;
+}
+Request ChatJob::phase_request() {
+    auto job = request_.generation;
+    job.prompt = prompt_; job.stop_ids = stop_ids_; job.sampling.draws = draws_;
+    job.stop_ids.push_back(adapter_.tokenizer().find("<|tool_response>"));
+    job.max_tokens = phase_ == 0 && request_.thinking_budget ? request_.thinking_budget : request_.generation.max_tokens-result_.ids.size();
+    result_.prompt_tokens += prompt_.size();
+    parser_.emplace(starts_in_reasoning_);
+    sent_ = 0;
+    return job;
+}
+bool ChatJob::absorb(const Result& out) {
+    while (!disconnected_ && sent_ < out.ids.size()) {
+        const auto delta = parser_->push(adapter_.tokenizer().token_bytes(out.ids[sent_++]));
+        if (sink_ && !sink_(delta)) disconnected_ = true;
+    }
+    return !disconnected_;
+}
+bool ChatJob::end_phase(const Result& out, strix::serve::Json receipt) {
+    const auto tail = parser_->finish();
+    if (!disconnected_ && sink_ && !sink_(tail)) disconnected_ = true;
+    if (out.status == Status::failed) throw std::runtime_error(out.error);
+    draws_ = out.rng_draws;
+    receipt.set("chat_policy",strix::serve::Json(strix::serve::Json::Object{
+        {"enable_thinking",request_.input.enable_thinking},
+        {"conversational_mode",request_.input.conversational_mode},
+        {"thinking_budget",std::uint64_t(request_.thinking_budget)},
+        {"phase",std::uint64_t(phase_)},
+        {"selection",phase_ ? "budget-answer-continuation" : request_.thinking_budget ? "within-thinking-budget" : "ordinary-chat"}}));
+    result_.receipts.push_back(std::move(receipt));
+    result_.ids.insert(result_.ids.end(),out.ids.begin(),out.ids.end());
+    const auto& parsed = parser_->output();
+    result_.output.reasoning += parsed.reasoning; result_.output.content += parsed.content;
+    for (const auto& call : parsed.tool_calls.as_array()) result_.output.tool_calls.push(call);
+    result_.output.reasoning_complete = result_.output.reasoning_complete || parsed.reasoning_complete;
+    result_.output.unfinished_call = parsed.unfinished_call; result_.output.unfinished_control = parsed.unfinished_control;
+    result_.output.stopped = parsed.stopped;
+    result_.finish = disconnected_ ? "cancelled" : status_name(out.status);
+    if (phase_ || !request_.thinking_budget || out.status != Status::length || disconnected_) {
+        if (result_.output.tool_calls.size() && result_.finish == "stop") result_.finish = "tool_calls";
+        return false;
+    }
+    const auto continuation = gemma4::serve::continue_after_budget(request_.input,parsed,
+        std::uint32_t(out.ids.size()),request_.thinking_budget,std::uint32_t(request_.generation.max_tokens));
+    prompt_ = adapter_.tokenizer().encode(continuation.prompt);
+    starts_in_reasoning_ = continuation.prompt.ends_with("<|channel>thought\n");
+    result_.budget_continued = true;
+    phase_ = 1;
+    return true;
+}
 ChatResult run_chat(Backend& backend, const gemma4::serve::Adapter& adapter, ChatRequest request,
     DraftFactory drafts, const ChatSink& sink, const Cancelled& cancelled, std::shared_ptr<CostModel> costs) {
-    if (request.generation.max_tokens > UINT32_MAX) throw std::invalid_argument("max_tokens exceeds chat limit");
-    if (request.thinking_budget && (!request.input.enable_thinking || request.thinking_budget >= request.generation.max_tokens))
-        throw std::invalid_argument("thinking_budget requires thinking and must be below max_tokens");
-    const auto prepared = adapter.prepare(request.input);
-    ChatResult result;
-    auto prompt = prepared.ids;
-    bool starts_in_reasoning = prepared.starts_in_reasoning;
-    const auto maximum = request.generation.max_tokens;
-    std::uint64_t draws = request.generation.sampling.draws;
-    for (unsigned phase = 0; phase < 2; ++phase) {
-        auto job = request.generation;
-        job.prompt = prompt; job.stop_ids = prepared.stop_ids; job.sampling.draws = draws;
-        job.stop_ids.push_back(adapter.tokenizer().find("<|tool_response>"));
-        job.max_tokens = phase == 0 && request.thinking_budget ? request.thinking_budget : maximum-result.ids.size();
-        result.prompt_tokens += prompt.size();
+    ChatJob chat(adapter,std::move(request),sink);
+    for (bool more = true; more;) {
         Coordinator coordinator(backend,drafts,costs);
-        const auto slot = coordinator.submit(std::move(job));
-        gemma4::serve::OutputParser parser(starts_in_reasoning);
-        std::size_t sent = 0;
-        bool disconnected = false;
+        const auto slot = coordinator.submit(chat.phase_request());
         while (coordinator.result(slot).status == Status::running) {
-            if ((cancelled && cancelled()) || disconnected) { coordinator.cancel(slot); break; }
+            if ((cancelled && cancelled()) || chat.disconnected()) { coordinator.cancel(slot); break; }
             coordinator.step();
-            const auto& ids = coordinator.result(slot).ids;
-            while (sent < ids.size()) {
-                const auto delta = parser.push(adapter.tokenizer().token_bytes(ids[sent++]));
-                if (sink && !sink(delta)) { disconnected = true; coordinator.cancel(slot); break; }
-            }
+            if (!chat.absorb(coordinator.result(slot))) coordinator.cancel(slot);
         }
-        const auto tail = parser.finish();
-        if (!disconnected && sink && !sink(tail)) disconnected = true;
-        const auto& out = coordinator.result(slot);
-        if (out.status == Status::failed) throw std::runtime_error(out.error);
-        draws = out.rng_draws;
-        auto receipt = coordinator.receipt(slot);
-        receipt.set("chat_policy",strix::serve::Json(strix::serve::Json::Object{
-            {"enable_thinking",request.input.enable_thinking},
-            {"conversational_mode",request.input.conversational_mode},
-            {"thinking_budget",std::uint64_t(request.thinking_budget)},
-            {"phase",std::uint64_t(phase)},
-            {"selection",phase ? "budget-answer-continuation" : request.thinking_budget ? "within-thinking-budget" : "ordinary-chat"}}));
-        result.receipts.push_back(std::move(receipt));
-        result.ids.insert(result.ids.end(),out.ids.begin(),out.ids.end());
-        const auto& parsed = parser.output();
-        result.output.reasoning += parsed.reasoning; result.output.content += parsed.content;
-        for (const auto& call : parsed.tool_calls.as_array()) result.output.tool_calls.push(call);
-        result.output.reasoning_complete = result.output.reasoning_complete || parsed.reasoning_complete;
-        result.output.unfinished_call = parsed.unfinished_call; result.output.unfinished_control = parsed.unfinished_control;
-        result.output.stopped = parsed.stopped;
-        result.finish = disconnected ? "cancelled" : status_name(out.status);
-        if (phase || !request.thinking_budget || out.status != Status::length || disconnected) break;
-        const auto continuation = gemma4::serve::continue_after_budget(request.input,parsed,
-            std::uint32_t(out.ids.size()),request.thinking_budget,std::uint32_t(maximum));
-        prompt = adapter.tokenizer().encode(continuation.prompt);
-        starts_in_reasoning = continuation.prompt.ends_with("<|channel>thought\n");
-        result.budget_continued = true;
+        more = chat.end_phase(coordinator.result(slot),coordinator.receipt(slot));
     }
-    if (result.output.tool_calls.size() && result.finish == "stop") result.finish = "tool_calls";
-    return result;
+    return chat.take();
 }
 } // namespace strix::gemma4::engine

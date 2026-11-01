@@ -578,6 +578,27 @@ drafter solo dentro del ruido en chat, código, prompts de agente y 32K (agente 
 herramienta JSON 172.2 frente a 171.6, código 112.6 frente a 112.5, 29.5K 50.5 frente a 50.4, chat en inglés 92.8 frente
 a 92.8). `STRIX_G4_LOOKUP=0` lo desactiva.
 
+El servidor HTTP agrupa las peticiones de chat concurrentes: hasta ocho peticiones (`STRIX_G4_SERVE_SLOTS`) comparten
+un planificador y se decodifican en la misma pasada del modelo, las peticiones nuevas entran entre pasos y los ids de
+tokens de cada petición son iguales a los de esa misma petición servida sola (verificado con `default`, `fast` y
+`quality` con ocho a once peticiones solapadas: chat greedy en cuatro idiomas, un documento largo, muestreo con
+semilla, continuación del presupuesto de razonamiento, streaming y un cliente que se desconecta a mitad). Una sola
+petición no cambia (C1 con el drafter, mismos ids y velocidad). `STRIX_G4_SERVE_BATCH=0` restaura un trabajo de chat
+cada vez. Si no se indica `--streams`, la identidad del núcleo EXL3, fijada por sesión, se elige para el número de
+ranuras (ocho), así que un paquete M5 selecciona `g4-exl3-v3` en lugar de `v1`; M4 y M6 usan siempre `v3`.
+
+| `default`, streaming, 128 tokens por petición | 1 cliente | 4 clientes | 8 clientes |
+|---|---:|---:|---:|
+| Prompts mixtos (chat, código, un documento de ~1.3K tokens): batching activado, tok/s agregados | 70.1 | **87.9** | **73.1** |
+| Igual, una petición cada vez (`STRIX_G4_SERVE_BATCH=0`) | 70.0 | 62.8 | 63.0 |
+| Igual, tiempo hasta el primer token p50, activado / desactivado | 0.10 / 0.10 s | **0.26** / 4.6 s | **0.60** / 13.8 s |
+| servidor de llama.cpp `74a4fb00` (`-np 8`, mismo Q4_K_M, misma sesión) | 50.1 | 124.4 | 239.7 |
+| Prompts de chat cortos, 256 tokens: batching activado / servidor de llama.cpp | — | — | **172.4** / 245.9 |
+
+El paso de decode con ocho peticiones iguala el paso C8 del propio motor. Con prompts largos en la mezcla, el
+procesamiento exacto del prompt (unos 435 tok/s) todavía pausa a las demás peticiones mientras corre un fragmento del
+prompt; es la principal diferencia pendiente.
+
 **Drafter MTP** - [hyukudan/Nemotron-3.5-Bolt-E4B-MTP-Drafter](https://huggingface.co/hyukudan/Nemotron-3.5-Bolt-E4B-MTP-Drafter). Un modelo asistente pequeño (el asistente MTP
 de Gemma-4-E4B-it de Google, 78.8M parámetros) propone los siguientes tokens y el modelo principal los verifica, así
 que la salida es idéntica a la del decode sin él; solo cambia la velocidad. La aceleración procede de la arquitectura
@@ -1180,6 +1201,7 @@ Listas completas de elementos, condiciones previas, avisos y pruebas: [catálogo
 | MiniMax: admisión anidada | El banco de activaciones del hijo preserva al padre en pausa | Activado | TTFT del segundo corto 1.25/2.06 frente a 13.2/12.5 s; TTFT largo alrededor de +20% | Hijo anidado de 512 tokens 10/10 e hijo completo de 511 tokens 6/6 idénticos en ambos ranks | `STRIX_MM_SERVE_NEST=0`; `/admin/sched` `nest=false` |
 | Nemotron `quality`: FFN EXL3 fusionada (prefill) | Transformadas de salida gate/up, producto gelu y transformada de entrada de down en un lanzamiento | Activado | FFN con 512 filas 11.29 → 11.05 ms (−2 %), formas de EXL3 M4, un nodo | Mismos bytes (gates de bytes por operador; digests de prompts de 512 a 16K tokens iguales) | `STRIX_G4_EXL3_FFN_FUSE=0` |
 | Nemotron: prompt lookup | El decode C1 propone la continuación de la coincidencia anterior más larga de los últimos tokens (prompt y salida) y la verifica; junto al drafter MTP, un selector por petición solo lo usa ante una coincidencia fuerte | Activado | Sin drafter, C1 `default`, 256 tokens: prompt de agente con edición **114.9** frente a 48.2 tok/s, prompt de herramienta JSON **122.9** frente a 49.3, documento de 29.5K **35.0** frente a 28.1, código **55.8** frente a 51.9, chat +1–2 %; junto al drafter MTP igual dentro del ruido (chat, código, agente, 32K); un nodo | Ids de tokens iguales sin draft (todas las ejecuciones) | `STRIX_G4_LOOKUP=0` |
+| Nemotron: el servidor agrupa peticiones concurrentes | Hasta ocho peticiones HTTP de chat comparten un planificador y se decodifican en la misma pasada del modelo; las nuevas entran entre pasos; la salida en streaming la escribe el hilo de socket de cada petición | Activado | `default`, 128 tokens, prompts mixtos, 4 / 8 clientes: 62.8 / 63.0 → **87.9 / 73.1** tok/s agregados, tiempo hasta el primer token p50 4.6 / 13.8 → **0.26 / 0.60** s; un cliente sin cambios; un nodo | Ids de tokens de cada petición iguales a la petición servida sola (`default`, `fast`, `quality`) | `STRIX_G4_SERVE_BATCH=0` |
 | Nemotron `quality`: prefetch del decode EXL3 | Los núcleos de decode mantienen cuatro fragmentos de palabras trellis en vuelo por wave | Activado | Decode C1 sin drafter 41.4 → 46.5 tok/s (+12.3 %), EXL3 M4, prompt de 120 tokens + 256 tokens, ejecuciones alternadas en un nodo | Mismos bytes (dispositivo == emulador host por forma; ids de tokens y digest de estado iguales) | `STRIX_G4_EXL3_COOP_DEPTH=1` |
 | Nemotron: palancas de host del prefill | Taps copiados solo para un drafter que los lee (memoria fijada, asíncrono); una comprobación de finitud en el dispositivo de los taps devueltos; proyecciones K/V y la proyección PLE del bloque en una segunda cola; epílogos norm + residual + finitud fusionados | Activado | Prefill exacto (la ruta publicada): dentro de ±0.5 % (epílogos fusionados +0.4 a +0.5 %), 1.3–1.7 ms menos de host ocioso por bloque de 512 filas; ruta de prefill WMMA (pendiente de cualificación): +0.7 a +1.7 % por palanca a 512/2K tokens; ejecuciones alternadas en el mismo turno en un nodo | Mismos bytes (ids de tokens, digest de KV y recibos iguales en todos los brazos salvo los campos de palancas; gates de bytes en dispositivo de los epílogos fusionados y de los taps fijados) | `STRIX_G4_PREFILL_PINNED_TAPS=0`, `STRIX_G4_PREFILL_DEVICE_FINITE=0`, `STRIX_G4_PREFILL_SIDE_STREAM=0`, `STRIX_G4_PREFILL_FUSE_EPILOGUE=0` |
 | Nemotron: tesela gate/up fusionada en el prefill | Una tesela rows-linear lee x una vez para gate y up y evalúa el producto GELU en los 32 lanes (un par por lane) | Activado | Prefill exacto `default`, Q4_K_M, chat en inglés, un nodo, intercalado: 470 / 448 / 427 → 490 / 470 / 444 tok/s con 512 / 2K / 8K (+4–5 %) | Mismos bytes (8,515 casos rows-linear; digest de KV, últimos logits y taps del prefill iguales al decode de ocho filas con 512 / 2K / 8K) | `STRIX_G4_ROWS_GATE_SPLIT=1` |

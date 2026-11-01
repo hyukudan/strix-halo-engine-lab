@@ -2,6 +2,7 @@
 
 #include "coordinator.hpp"
 #include "gemma4/serve/adapter.hpp"
+#include <optional>
 
 namespace strix::gemma4::engine {
 
@@ -21,6 +22,30 @@ struct ChatResult {
 // Callback returns false on cancellation/disconnect, including during prefill.
 using ChatSink = std::function<bool(const gemma4::serve::OutputDelta&)>;
 using Cancelled = std::function<bool()>;
+// One chat request as coordinator jobs: phase 0, then (thinking budget reached) the phase-1 answer continuation.
+// The caller submits phase_request() to a Coordinator slot, passes the slot's Result to absorb() after each step
+// (new ids -> parser -> sink) and to end_phase() once the slot stops; true there means submit the next phase.
+class ChatJob {
+public:
+    ChatJob(const gemma4::serve::Adapter& adapter, ChatRequest request, ChatSink sink = {});
+    [[nodiscard]] Request phase_request();
+    // false once the sink refused a delta (cancel the slot).
+    bool absorb(const Result& out);
+    bool end_phase(const Result& out, strix::serve::Json receipt);
+    [[nodiscard]] bool disconnected() const { return disconnected_; }
+    [[nodiscard]] ChatResult take() { return std::move(result_); }
+private:
+    const gemma4::serve::Adapter& adapter_;
+    ChatRequest request_;
+    ChatSink sink_;
+    ChatResult result_;
+    std::vector<std::uint32_t> prompt_, stop_ids_;
+    std::optional<gemma4::serve::OutputParser> parser_;
+    std::uint64_t draws_ = 0;
+    std::size_t sent_ = 0;
+    unsigned phase_ = 0;
+    bool starts_in_reasoning_ = false, disconnected_ = false;
+};
 ChatResult run_chat(Backend& backend, const gemma4::serve::Adapter& adapter,
     ChatRequest request, DraftFactory drafts = {}, const ChatSink& sink = {}, const Cancelled& cancelled = {},
     std::shared_ptr<CostModel> costs = {});

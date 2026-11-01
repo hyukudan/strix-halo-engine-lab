@@ -1,8 +1,10 @@
 #include "api.hpp"
 #include "gemma4/features/features.hpp"
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cstdlib>
 #include <map>
 #include <mutex>
 #include <thread>
@@ -40,7 +42,15 @@ Json output_message(const gemma4::serve::Output& output) {
     if (output.tool_calls.size()) message.set("tool_calls",wire_calls(output.tool_calls,false));
     return message;
 }
+std::size_t env_count(const char* name, std::size_t fallback, std::size_t maximum) {
+    const auto* p = std::getenv(name);
+    if (!p) return fallback;
+    const auto n = std::strtoull(p,nullptr,10);
+    return n > maximum ? maximum : std::size_t(n);
 }
+bool serve_batched() { const auto* p = std::getenv("STRIX_G4_SERVE_BATCH"); return !p || std::string(p) != "0"; }
+}
+std::size_t serve_slots() { return serve_batched() ? std::max<std::size_t>(1,env_count("STRIX_G4_SERVE_SLOTS",8,8)) : 1; }
 ChatRequest parse_chat_request(const Json& j, DraftMode default_mode, const Request& defaults) {
     if (!j.is_object()) throw std::invalid_argument("chat request must be an object");
     for (const auto& [key,value] : j.as_object()) {
@@ -112,6 +122,9 @@ struct Api::Impl final : strix::serve::GenerationEngine {
         ChatResult result;
         ChatSink sink;
         std::atomic<bool> cancelled{false};
+        // Continuous batching: deltas the batcher produced, written to the client by the handler thread.
+        std::mutex deltas_mutex;
+        std::vector<gemma4::serve::OutputDelta> deltas;
     };
     Backend& backend;
     gemma4::serve::Adapter adapter;
@@ -126,10 +139,16 @@ struct Api::Impl final : strix::serve::GenerationEngine {
     std::unique_ptr<features::Exporter> feature_exporter;
     std::map<std::string,std::shared_ptr<Task>> tasks;
     std::atomic<std::uint64_t> sequence{0};
+    // STRIX_G4_SERVE_BATCH=0: one chat job at a time (queue.run + run_chat). Otherwise up to STRIX_G4_SERVE_SLOTS
+    // (default 8) jobs share one Coordinator and decode together; STRIX_G4_SERVE_PREFILL_PER_STEP (default 1, 0 = all)
+    // bounds the prompt chunks one step may prefill. Each job's ids equal the job run alone.
+    const bool batched = serve_batched();
+    const std::size_t slots = serve_slots();
+    const std::size_t prefill_per_step = env_count("STRIX_G4_SERVE_PREFILL_PER_STEP",1,8);
     std::thread worker;
     Impl(Backend& b, std::shared_ptr<const gemma4::serve::Tokenizer> t, DraftFactory d, DraftMode m, std::string name, Request settings)
         : backend(b), adapter(std::move(t)), drafts(std::move(d)), mode(m), defaults(std::move(settings)), model(std::move(name)),
-          worker([this] { queue.run(*this); }) {}
+          worker([this] { if (batched) batch_loop(); else queue.run(*this); }) {}
     ~Impl() override {
         { std::lock_guard lock(mutex); for (auto& [id,t] : tasks) { (void)id; t->cancelled = true; } }
         queue.shutdown(); worker.join();
@@ -149,6 +168,99 @@ struct Api::Impl final : strix::serve::GenerationEngine {
         if (job.on_tokens) (void)job.on_tokens(task->result.ids);
         return stats;
     }
+    void batch_loop() {
+        struct Live {
+            strix::serve::TakenJob taken;
+            std::shared_ptr<Task> task;
+            std::unique_ptr<ChatJob> chat;
+            std::size_t slot = 0, prompt = 0;
+            // Per phase, for the receipt: steps while live, summed and widest batch, steps that also prefilled
+            // another request's prompt chunk.
+            std::uint64_t admitted = 0, steps = 0, width_sum = 0, width_max = 0, shared_prefill = 0;
+        };
+        std::uint64_t steps = 0;
+        Coordinator coordinator(backend,drafts,costs);
+        coordinator.set_prefill_limit(prefill_per_step);
+        std::vector<Live> live;
+        const auto finish = [&](Live& l, const std::string& error) {
+            strix::serve::GenerationStats stats;
+            if (error.empty()) {
+                l.task->result = l.chat->take();
+                stats.prompt_tokens = l.task->result.prompt_tokens; stats.generated_tokens = l.task->result.ids.size();
+                stats.finish = l.task->result.finish;
+                if (l.taken.job.on_tokens) (void)l.taken.job.on_tokens(l.task->result.ids);
+            }
+            queue.finish(l.taken,stats,error);
+        };
+        const auto receipt = [&](const Live& l) {
+            auto r = coordinator.receipt(l.slot);
+            r.set("serve_batch",Json(Json::Object{{"mode","continuous"},{"slots",std::uint64_t(slots)},
+                {"prefill_per_step",std::uint64_t(prefill_per_step)},{"slot",std::uint64_t(l.slot)},
+                {"admitted_at_step",l.admitted},{"steps",l.steps},{"max_batch",l.width_max},
+                {"mean_batch",l.steps ? double(l.width_sum)/double(l.steps) : 0.0},
+                {"steps_sharing_prefill",l.shared_prefill}}));
+            return r;
+        };
+        const auto submit = [&](Live& l) {
+            auto job = l.chat->phase_request();
+            l.prompt = job.prompt.size(); l.admitted = steps;
+            l.steps = l.width_sum = l.width_max = l.shared_prefill = 0;
+            std::lock_guard lock(backend_mutex);
+            l.slot = coordinator.submit(std::move(job));
+        };
+        const auto prefilling = [&](const Live& l) { return coordinator.result(l.slot).frontier+1 < l.prompt; };
+        for (;;) {
+            while (live.size() < slots) {
+                auto taken = queue.take(live.empty());
+                if (!taken) break;
+                Live l{std::move(*taken),nullptr,nullptr};
+                try {
+                    { std::lock_guard lock(mutex); l.task = tasks.at(l.taken.job.session_id); }
+                    l.chat = std::make_unique<ChatJob>(adapter,l.task->request,l.task->sink);
+                    submit(l);
+                } catch (const std::exception& e) {
+                    queue.finish(l.taken,{},e.what());
+                    continue;
+                }
+                live.push_back(std::move(l));
+            }
+            if (live.empty()) {
+                if (queue.stopping()) return;
+                continue;
+            }
+            std::size_t prefills = 0;
+            for (auto& l : live) {
+                if (l.task->cancelled || l.chat->disconnected()) coordinator.cancel(l.slot);
+                prefills += prefilling(l) ? 1 : 0;
+            }
+            for (auto& l : live) {
+                ++l.steps; l.width_sum += live.size(); l.width_max = std::max<std::uint64_t>(l.width_max,live.size());
+                l.shared_prefill += prefills > (prefilling(l) ? 1U : 0U) ? 1 : 0;
+            }
+            ++steps;
+            {
+                std::lock_guard lock(backend_mutex);
+                coordinator.step();
+            }
+            for (std::size_t i = 0; i < live.size();) {
+                auto& l = live[i];
+                if (!l.chat->absorb(coordinator.result(l.slot))) coordinator.cancel(l.slot);
+                if (coordinator.result(l.slot).status == Status::running) { ++i; continue; }
+                std::string error;
+                try {
+                    if (l.chat->end_phase(coordinator.result(l.slot),receipt(l))) {
+                        submit(l);
+                        ++i;
+                        continue;
+                    }
+                } catch (const std::exception& e) {
+                    error = e.what();
+                }
+                finish(l,error);
+                live.erase(live.begin()+std::ptrdiff_t(i));
+            }
+        }
+    }
     void handle(const HttpRequest& req, HttpResponseWriter& writer) {
         bool streaming = false;
         int failure_status = 400;
@@ -163,7 +275,8 @@ struct Api::Impl final : strix::serve::GenerationEngine {
                 const auto config = effective_config(backend,defaults,bool(drafts));
                 writer.send(200,"application/json",Json(Json::Object{{"model",model},{"identity",*config.find("decode_identity")},
                     {"prefill","prefill-exact"},{"sampling","splitmix64-cdf-v1"},{"thinking_budget","checked-two-job-continuation"},
-                    {"tools",true},{"reasoning_content",true},{"queue","FIFO; one chat job at a time"},
+                    {"tools",true},{"reasoning_content",true},{"queue",batched ? "continuous batching; up to "+std::to_string(slots)+" chat jobs decode together" :
+                        std::string("FIFO; one chat job at a time")},
                     {"features",backend.identity().find("feature_identity") ? *backend.identity().find("feature_identity") : Json()},
                     {"dflash",config},
                     {"unsupported",Json(Json::Array{"response_format","logprobs","stop","penalties","forced tool_choice"})}}).dump()); return;
@@ -202,9 +315,10 @@ struct Api::Impl final : strix::serve::GenerationEngine {
             streaming = body.find("stream") && get(body,"stream").as_bool();
             bool first = true;
             std::size_t tool_index = 0;
+            ChatSink emit;
             if (streaming) {
                 if (!writer.begin_stream(200,"text/event-stream",{{"Cache-Control","no-cache"}})) return;
-                task->sink = [&](const gemma4::serve::OutputDelta& delta) {
+                emit = [&](const gemma4::serve::OutputDelta& delta) {
                     if (writer.client_gone()) return false;
                     Json d = Json::object();
                     if (first) { d.set("role","assistant"); first = false; }
@@ -218,7 +332,19 @@ struct Api::Impl final : strix::serve::GenerationEngine {
                     if (!d.size()) return true;
                     return writer.write("data: "+envelope(Json(Json::Object{{"index",0},{"delta",d},{"finish_reason",Json()}}),"chat.completion.chunk").dump()+"\n\n");
                 };
+                // Batched: the batcher only buffers; this thread writes, so a slow client never stalls other jobs.
+                task->sink = batched ? ChatSink([task = task.get()](const gemma4::serve::OutputDelta& delta) {
+                    std::lock_guard lock(task->deltas_mutex);
+                    task->deltas.push_back(delta);
+                    return !task->cancelled.load();
+                }) : emit;
             }
+            const auto drain = [&] {
+                std::vector<gemma4::serve::OutputDelta> deltas;
+                { std::lock_guard lock(task->deltas_mutex); deltas.swap(task->deltas); }
+                for (const auto& delta : deltas)
+                    if (!task->cancelled && emit && !emit(delta)) task->cancelled = true;
+            };
             { std::lock_guard lock(mutex); tasks.emplace(task_id,task); }
             auto job = prepared.job(std::uint32_t(task->request.generation.max_tokens)); job.session_id = task_id;
             const auto ticket = queue.submit(std::move(job));
@@ -226,10 +352,12 @@ struct Api::Impl final : strix::serve::GenerationEngine {
             failure_status = 500;
             bool done = false;
             for (;;) {
-                (void)ticket->wait(std::chrono::milliseconds(50),done,false);
-                if (writer.client_gone()) { task->cancelled = true; ticket->cancel(); }
+                (void)ticket->wait(std::chrono::milliseconds(batched && streaming ? 5 : 50),done,false);
+                drain();
+                if (writer.client_gone() || task->cancelled) { task->cancelled = true; ticket->cancel(); }
                 if (done) break;
             }
+            drain();
             { std::lock_guard lock(mutex); tasks.erase(task_id); }
             if (!ticket->error().empty()) throw std::runtime_error(ticket->error());
             if (writer.client_gone()) return;

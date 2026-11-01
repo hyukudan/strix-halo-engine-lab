@@ -97,9 +97,18 @@ counter and remaining output allowance. A natural stop does not continue.
 The continuation re-prefills a fresh state; it does not claim prefix-cache reuse.
 Malformed/incomplete control or tool frames fail explicitly at that boundary.
 
-`Api` uses the existing portable JSON, HTTP writer and FIFO generation queue.
-One queue worker owns the backend for chat jobs; independent socket threads do
-not execute it concurrently. The family handler supports `/health`, `/v1/models`,
+`Api` uses the existing portable JSON, HTTP writer and generation queue. One
+batcher thread owns the backend for chat jobs: it admits up to
+`STRIX_G4_SERVE_SLOTS` (default 8) queued requests into one long-lived
+`Coordinator`, steps them together (one target pass per step, prompt chunks of
+at most `STRIX_G4_SERVE_PREFILL_PER_STEP` requests per step, default 1,
+round-robin) and retires each on stop, length, cancellation or its thinking
+budget continuation. Each request's ids equal the same request served alone:
+rows of different streams never mix, and selection and sampling draws are per
+request. Socket threads write their own SSE deltas, so a slow client never
+stalls the batch. `STRIX_G4_SERVE_BATCH=0` restores one chat job at a time.
+Each phase receipt carries `serve_batch` (slot, admission step, steps, mean and
+widest batch, steps that shared a prompt chunk). The family handler supports `/health`, `/v1/models`,
 `/v1/capabilities` and `/v1/chat/completions`, including SSE, object tool arguments
 on input (OpenAI JSON strings are parsed), JSON-string tool arguments on the
 wire, separate reasoning content, conversational mode and budget continuation.
@@ -148,8 +157,8 @@ Poisoned sessions are dropped. The scheduler serializes all device calls.
 `STRIX_G4_DRAFT_HEAD_SHARE=0` restores the immutable packed head copy.
 These exact fallbacks are recorded in effective configuration/receipts.
 Inspection initializes no HIP state; DFlash OFF/sampling creates no request
-session. Assets/factory and target must outlive all leases. HTTP remains FIFO,
-so concurrent clients queue C1 jobs; coordinator C2..C8 auto remains k=0.
+session. Assets/factory and target must outlive all leases. Concurrent HTTP clients
+decode together; the C2..C8 draft planner applies to them as in the engine.
 Final HTTP `strix.generated_ids` includes every emitted raw token ID for
 streaming and ordinary replies, including control/stop tokens.
 Frozen draft tables must cover the admitted context and full draft reservation.

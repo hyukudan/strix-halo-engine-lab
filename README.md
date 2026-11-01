@@ -564,6 +564,26 @@ selector drafts a lookup window only on a strong match and backs off on misses, 
 the drafter alone within noise on chat, code, agent prompts and 32K (agent edit 146.8 vs 146.2, JSON tool 172.2 vs
 171.6, code 112.6 vs 112.5, 29.5K 50.5 vs 50.4, English chat 92.8 vs 92.8). `STRIX_G4_LOOKUP=0` turns it off.
 
+The HTTP server batches concurrent chat requests: up to eight requests (`STRIX_G4_SERVE_SLOTS`) share one scheduler
+and decode in the same target pass, new requests join between steps, and every request's token ids equal the same
+request served alone (verified for `default`, `fast` and `quality` with eight to eleven overlapping requests: greedy
+chat in four languages, a long document, seeded sampling, thinking-budget continuation, streaming and a client that
+disconnects mid-stream). One request at a time is unchanged (C1 with the drafter, same ids and speed).
+`STRIX_G4_SERVE_BATCH=0` restores one chat job at a time. When `--streams` is not given, the session-fixed EXL3 core
+identity is chosen for the slot count (eight), so an M5 pack selects `g4-exl3-v3` instead of `v1`; M4 and M6 always
+use `v3`.
+
+| `default`, streaming, 128 tokens per request | 1 client | 4 clients | 8 clients |
+|---|---:|---:|---:|
+| Mixed prompts (chat, code, one ~1.3K-token document): batching on, aggregate tok/s | 70.1 | **87.9** | **73.1** |
+| Same, one request at a time (`STRIX_G4_SERVE_BATCH=0`) | 70.0 | 62.8 | 63.0 |
+| Same, time to first token p50, on / off | 0.10 / 0.10 s | **0.26** / 4.6 s | **0.60** / 13.8 s |
+| llama.cpp `74a4fb00` server (`-np 8`, same Q4_K_M, same session) | 50.1 | 124.4 | 239.7 |
+| Short chat prompts, 256 tokens: batching on / llama.cpp server | — | — | **172.4** / 245.9 |
+
+The decode step with eight requests matches the engine's own C8 step. With long prompts in the mix, exact prompt
+processing (about 435 tok/s) still pauses the other requests while a prompt chunk runs; that is the main remaining gap.
+
 **MTP drafter** - [hyukudan/Nemotron-3.5-Bolt-E4B-MTP-Drafter](https://huggingface.co/hyukudan/Nemotron-3.5-Bolt-E4B-MTP-Drafter). A small assistant model (Google's
 Gemma-4-E4B-it MTP assistant, 78.8M parameters) proposes the next few tokens and the main model verifies them, so the
 output is identical to decoding without it; only the speed changes. The speed-up comes from the MTP assistant
@@ -1129,6 +1149,7 @@ Full item lists, preconditions, notices and evidence: [optimization catalog](doc
 | MiniMax: nested admission | Child activation bank preserves paused parent | On | Second-short TTFT 1.25/2.06 vs 13.2/12.5 s; long TTFT about +20% | Both-rank nested 512-token child 10/10 and whole 511-token child 6/6 identical | `STRIX_MM_SERVE_NEST=0`; `/admin/sched` `nest=false` |
 | Nemotron `quality`: fused EXL3 FFN (prefill) | Gate/up output transforms, gelu product and down input transform in one launch | On | FFN at 512 rows 11.29 → 11.05 ms (−2 %), EXL3 M4 shapes, one node | Same bytes (operator byte gates; prompt digests at 512 to 16K tokens equal) | `STRIX_G4_EXL3_FFN_FUSE=0` |
 | Nemotron: prompt lookup | C1 decode proposes the continuation of the longest earlier match of the last tokens (prompt and output) and verifies it; beside the MTP drafter a per-request selector uses it only on a strong match | On | No drafter, C1 `default`, 256 tokens: agent edit prompt **114.9** vs 48.2 tok/s, JSON tool prompt **122.9** vs 49.3, 29.5K document **35.0** vs 28.1, code **55.8** vs 51.9, chat +1–2 %; beside the MTP drafter equal within noise (chat, code, agent, 32K); one node | Token ids equal drafting off (every run) | `STRIX_G4_LOOKUP=0` |
+| Nemotron: serving batches concurrent requests | Up to eight HTTP chat requests share one scheduler and decode in the same target pass; new requests join between steps; streamed output is written by each request's own socket thread | On | `default`, 128 tokens, mixed prompts, 4 / 8 clients: 62.8 / 63.0 → **87.9 / 73.1** tok/s aggregate, time to first token p50 4.6 / 13.8 → **0.26 / 0.60** s; one client unchanged; one node | Token ids of every request equal the request served alone (`default`, `fast`, `quality`) | `STRIX_G4_SERVE_BATCH=0` |
 | Nemotron `quality`: EXL3 decode prefetch | Decode cores keep four chunks of raw trellis words in flight per wave | On | C1 plain decode 41.4 → 46.5 tok/s (+12.3 %), EXL3 M4, 120-token prompt + 256 tokens, alternating runs on one node | Same bytes (device == host emulator per shape; token ids and state digest equal) | `STRIX_G4_EXL3_COOP_DEPTH=1` |
 | Nemotron: prefill host levers | Taps copied only for a drafter that reads them (pinned, asynchronous); one device finite check of the returned taps; K/V projections and the chunk's PLE projection on a second queue; fused norm + residual + finite epilogues | On | Exact prefill (the shipped route): within ±0.5 % (fused epilogues +0.4 to +0.5 %), 1.3–1.7 ms less host idle per 512-row chunk; WMMA prefill route (pending qualification): +0.7 to +1.7 % per lever at 512/2K tokens; alternating same-turn runs on one node | Same bytes (token ids, KV digest and receipts equal in every arm apart from the lever fields; device byte gates for the fused epilogues and the pinned taps) | `STRIX_G4_PREFILL_PINNED_TAPS=0`, `STRIX_G4_PREFILL_DEVICE_FINITE=0`, `STRIX_G4_PREFILL_SIDE_STREAM=0`, `STRIX_G4_PREFILL_FUSE_EPILOGUE=0` |
 | Nemotron: fused gate/up prefill tile | One rows-linear tile reads x once for gate and up and evaluates the GELU product on all 32 lanes (one pair per lane) | On | Exact `default` prefill, Q4_K_M, English chat, one node, interleaved: 470 / 448 / 427 → 490 / 470 / 444 tok/s at 512 / 2K / 8K (+4–5 %) | Same bytes (8,515 rows-linear cases; prefill vs eight-row decode KV digest, last logits and taps equal at 512 / 2K / 8K) | `STRIX_G4_ROWS_GATE_SPLIT=1` |

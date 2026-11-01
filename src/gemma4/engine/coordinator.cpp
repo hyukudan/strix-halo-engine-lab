@@ -269,10 +269,16 @@ bool Coordinator::step() {
         std::vector<bool> prefilled(slots_.size(), false);
         std::size_t rowed = live; // streams left for this step's forward_rows pass
         if (const auto chunk = backend_.prefill_chunk_rows()) {
-            for (std::size_t i = 0; i < slots_.size(); ++i) {
+            // With a prefill limit, at most that many streams prefill a chunk this step, round-robin from the
+            // cursor; the others sit this step out (scheduling only: rows and their order per stream are unchanged).
+            std::size_t chunks = 0, cursor = prefill_cursor_;
+            for (std::size_t j = 0; j < slots_.size(); ++j) {
+                const auto i = (prefill_cursor_+j)%slots_.size();
                 auto& s = *slots_[i];
                 if (s.out.status != Status::running || s.prompt_processed+1+8 >= s.request.prompt.size()) continue;
                 s.out.peak_streams = std::max(s.out.peak_streams,live);
+                if (prefill_limit_ && chunks == prefill_limit_) { prefilled[i] = true; --rowed; continue; }
+                ++chunks; cursor = i+1;
                 const auto begin = Clock::now();
                 auto tx = s.state->begin();
                 const auto position = tx->frontier();
@@ -326,6 +332,7 @@ bool Coordinator::step() {
                 prefilled[i] = true;
                 --rowed;
             }
+            if (prefill_limit_) prefill_cursor_ = cursor%slots_.size();
             if (!rowed) return true;
         }
         std::size_t remaining = 8, pending = rowed, index = 0;
