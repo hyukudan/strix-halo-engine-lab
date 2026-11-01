@@ -388,6 +388,14 @@ void log_dspark_memory(std::uint32_t rank, const strix::ds41::dspark::Weights& w
                  detail.c_str(), static_cast<double>(fell) / 1048576.0);
 }
 
+// DSpark with a drafter on each rank: a request drafting alone in a step is drafted by both ranks, each over half the
+// output head (BatchSpecOptions::coop; exact, the same draft). STRIX_DS41_DSPARK_COOP=0: by its owner rank alone.
+// Both ranks must agree: the hello compares it.
+bool dspark_coop_on() {
+    const char* env = std::getenv("STRIX_DS41_DSPARK_COOP");
+    return env == nullptr || std::strcmp(env, "0") != 0;
+}
+
 Control hello(const Args& a) {
     Control c;
     c.command = static_cast<std::uint32_t>(Command::hello);
@@ -398,7 +406,7 @@ Control hello(const Args& a) {
     c.layers = a.layers;
     c.slots = a.slots;
     c.context = a.context;
-    c.tp = (a.tp ? 1U : 0U) | (BatchForward::configured_row_limit() > BatchForward::max_rows ? 2U : 0U);
+    c.tp = (a.tp ? 1U : 0U) | (BatchForward::configured_row_limit() > BatchForward::max_rows ? 2U : 0U) | (dspark_coop_on() ? 4U : 0U);
     c.pool = a.pool;
     c.prefill_mode = a.device_prefill ? 1U : 0U;
     c.prefill_rows = a.prefill_rows_auto ? 0U : a.prefill_rows;  // auto: resolved by both ranks after the load
@@ -447,6 +455,7 @@ std::string hello_mismatch(const Control& mine, const Control& peer) {
     if (peer.epoch != mine.epoch) return "epoch differs between the ranks";
     if (peer.exe_hash != mine.exe_hash) return "the engine executables differ (SHA-256)";
     if (peer.model_bytes != mine.model_bytes) return "the model files differ (size)";
+    if ((peer.tp ^ mine.tp) & 4U) return "STRIX_DS41_DSPARK_COOP differs between the ranks";
     if (peer.layers != mine.layers || peer.slots != mine.slots || peer.context != mine.context || peer.tp != mine.tp || peer.pool != mine.pool)
         return "layers, slots, context, KV pool or tensor-parallel attention differ between the ranks";
     if (peer.prefill_mode != mine.prefill_mode || peer.prefill_rows != mine.prefill_rows || peer.prefix_block != mine.prefix_block ||
@@ -1209,6 +1218,7 @@ void follow(const Args& initial, BatchForward& fwd, Watchdog& dog, SlotPrefill* 
         so.rank = 1U;
         so.world = 2U;
         so.split_started = false;
+        so.coop = dspark_coop_on();
         so.exchange = [&](std::span<const std::byte> out, std::span<std::byte> in) { fwd.exchange_host(out, in); };
         so.calib = serve_warm_on() && stage == nullptr;  // with the warm-up (split decode skips it)
         spec = std::make_unique<strix::deepseek41::BatchSpeculator>(fwd, *drafter, a.slots, so);
@@ -1330,6 +1340,7 @@ void follow(const Args& initial, BatchForward& fwd, Watchdog& dog, SlotPrefill* 
             if (digest != c.pkey) poisoned(1U, "imported state: the digest differs from rank 0's");
             if (a.pool == 0U) fwd.reset(c.pslot);  // with a pool the reserve above reset it
             fwd.import_state(c.pslot, st);
+            if (spec) spec->forget(c.pslot);  // its drafting contexts no longer in step on both ranks
             if (prefill) prefill->on_prefill(c.pslot, st.tokens);  // the slot's token history (session snapshots)
             reply.pkey = digest;  // rank 0's acknowledgement round
             continue;
@@ -1751,6 +1762,7 @@ void lead(const Args& initial, BatchForward& fwd, strix::dist::Communicator& com
         if (a.dspark_ranks == 2U) {
             so.world = 2U;
             so.split_started = false;  // rank 1 sees a prompt read in rows only row by row
+            so.coop = dspark_coop_on();
             so.exchange = [&](std::span<const std::byte> out, std::span<std::byte> in) { fwd.exchange_host(out, in); };
         }
         if (a.dspark_window.rfind("fixed:", 0) == 0) so.fixed_rows = static_cast<std::uint32_t>(std::stoul(a.dspark_window.substr(6)));
@@ -2102,11 +2114,12 @@ void lead(const Args& initial, BatchForward& fwd, strix::dist::Communicator& com
                 const auto& st = sp->stats();
                 const auto& c = sp->controller().costs();
                 std::fprintf(stderr, "; dspark: %llu drafted steps, draft %.1f s total, plan %.1f s, finish %.1f s, windows %llu, plain rows %llu,"
-                             " drafts %llu accepted of %llu; costs ms plain[1..4] %.1f %.1f %.1f %.1f row %.2f draft %.2f round %.2f",
+                             " drafts %llu accepted of %llu (cooperative %llu); costs ms plain[1..4] %.1f %.1f %.1f %.1f row %.2f draft %.2f round %.2f coop %.2f",
                              static_cast<unsigned long long>(st.drafted_steps), st.draft_seconds, st.plan_seconds, st.finish_seconds,
                              static_cast<unsigned long long>(st.windows), static_cast<unsigned long long>(st.plain_rows),
-                             static_cast<unsigned long long>(st.drafts_accepted), static_cast<unsigned long long>(st.drafts_verified), c.plain[1] * 1e3,
-                             c.plain[2] * 1e3, c.plain[3] * 1e3, c.plain[4] * 1e3, c.row * 1e3, c.draft * 1e3, c.round * 1e3);
+                             static_cast<unsigned long long>(st.drafts_accepted), static_cast<unsigned long long>(st.drafts_verified),
+                             static_cast<unsigned long long>(st.coop_drafts), c.plain[1] * 1e3, c.plain[2] * 1e3, c.plain[3] * 1e3, c.plain[4] * 1e3,
+                             c.row * 1e3, c.draft * 1e3, c.round * 1e3, c.coop * 1e3);
             }
             std::fprintf(stderr, "; steps by rows %s, by running %s, drafts allowed %llu; %s\n", hist(by_rows).c_str(), hist(by_running).c_str(),
                          static_cast<unsigned long long>(drafts_allowed), plans_since_ready().c_str());
@@ -2291,6 +2304,7 @@ void lead(const Args& initial, BatchForward& fwd, strix::dist::Communicator& com
         c.pkey = j.digest;
         c.snaps = pending_snaps;  // rank 1 takes the last step's session snapshots before the import may reuse a slot
         pending_snaps = 0;
+        take_commits(c);  // rank 1 applies commits at every control block (before it stages the last step's rows)
         (void)exchange(fwd, c);
         transfer_state(fwd, j.bytes, nullptr);
         dog.progress();
@@ -2298,6 +2312,7 @@ void lead(const Args& initial, BatchForward& fwd, strix::dist::Communicator& com
         if (a.pool == 0U) fwd.reset(slot);
         fwd.import_state(slot, st);
         if (stage) stage->import_state(slot, st);
+        if (spec) spec->forget(slot);  // its drafting contexts no longer in step on both ranks
         if (prefill) prefill->on_prefill(slot, st.tokens);
         Control ack;
         ack.command = static_cast<std::uint32_t>(Command::heartbeat);

@@ -29,6 +29,7 @@ constexpr std::uint32_t stage_rows = 128;  // kept rows staged per slot before t
 // world 2: the draft round, rank 0 -> rank 1, and rank 1's drafts back (one 512-byte exchange each)
 struct DraftRound {
     std::uint32_t magic = BatchSpeculator::round_magic, done = 0, commits = 0, requests = 0;
+    std::uint32_t coop = 0;  // 1: one request (slot[0]), drafted by both ranks together (no reply)
     // one entry per request (at most one commit and one draft per request and step), whatever the rows per step
     std::uint32_t commit[ds::BatchWindowController::max_requests]{};  // slot << 16 | kept
     std::uint32_t slot[ds::BatchWindowController::max_requests]{}, token[ds::BatchWindowController::max_requests]{};
@@ -102,6 +103,9 @@ BatchSpeculator::BatchSpeculator(BatchForward& target, ds::DeviceDrafter& drafte
     positions_.assign(slots, 0U);
     kept_.fill(0xFFFFFFFFU);
     owners_.assign(slots, 0U);
+    coop_ = options_.world == 2U && options_.coop;
+    in_step_.assign(slots, false);
+    coop_pending_.assign(slots, false);
     (void)target_.captured_streams();  // throws without capture_main_hidden
     drafter_.set_sequences(slots);
     auto& S = *slots_;
@@ -162,6 +166,7 @@ void BatchSpeculator::start(std::uint32_t slot, std::span<const std::uint32_t> p
     prompts_[slot].assign(prompt.begin(), prompt.end());
     positions_[slot] = 0;
     owners_[slot] = options_.world == 2U && options_.split_started ? slot % 2U : 0U;
+    in_step_[slot] = false;  // rank 1 may not see a prompt read in rows: imported() requests only
 }
 
 void BatchSpeculator::imported(std::uint32_t slot, std::span<const std::uint32_t> prompt, std::uint32_t position, std::uint32_t first) {
@@ -176,7 +181,8 @@ void BatchSpeculator::imported(std::uint32_t slot, std::span<const std::uint32_t
     ctx.push_back(first);
     positions_[slot] = position;
     owners_[slot] = options_.world == 2U ? slot % 2U : 0U;
-    rows = owner(slot) == options_.rank && seed[0] != nullptr ? std::min({rows, position, stage_rows}) : 0U;
+    in_step_[slot] = coop_;  // both ranks import it with the same seed rows
+    rows = keeps(slot) && seed[0] != nullptr ? std::min({rows, position, stage_rows}) : 0U;
     drafter_.skip_to(position - rows);  // the seed rows (if any) come first
     if (rows != 0U) {
         stage_from(slot, seed, 0U, rows, stream);
@@ -215,7 +221,9 @@ void BatchSpeculator::follow_stage(std::span<const BatchRow> last_rows, std::spa
         while (r0 + count < last_rows.size() && last_rows[r0 + count].slot == slot) ++count;
         const std::uint32_t k = std::min(count, kept_.at(slot));
         const bool prompt = positions_[slot] < prompts_[slot].size();
-        if (owner(slot) == 1U) {
+        if (count > 1U && !coop_pending_[slot]) in_step_[slot] = false;  // rows not from a cooperative draft (as finish())
+        coop_pending_[slot] = false;
+        if (keeps(slot)) {
             stage(slot, r0, k);
             if (prompt) {
                 if (positions_[slot] + count >= prompts_[slot].size()) {
@@ -247,9 +255,17 @@ bool BatchSpeculator::follow_packet(std::span<const std::byte> packet, std::span
     }
     follow_stage(last_rows, last_tokens, step);
     if (round.done) return false;
+    if (round.coop != 0U) {
+        if (round.requests != 1U || round.slot[0] >= in_step_.size() || !in_step_[round.slot[0]])
+            throw std::runtime_error("deepseek41 batch dspark: cooperative round for a context not in step on rank 1");
+        (void)coop_draft(round.slot[0], round.token[0]);  // rank 0 has the draft: no reply
+        coop_pending_[round.slot[0]] = true;
+        return true;
+    }
     DraftReply reply;
     for (std::uint32_t q = 0; q < round.requests; ++q) {
         const auto slot = round.slot[q];
+        in_step_[slot] = false;  // drafted here alone
         flush(slot);
         drafter_.select(slot);
         const auto d = drafter_.draft(round.token[q], false);
@@ -259,6 +275,25 @@ bool BatchSpeculator::follow_packet(std::span<const std::byte> packet, std::span
     reply.count = round.requests;
     (void)swap_packets<DraftRound>(options_.exchange, reply);
     return true;
+}
+
+ds::Draft BatchSpeculator::coop_draft(std::uint32_t slot, std::uint32_t token) {
+    flush(slot);
+    drafter_.select(slot);
+    // each Markov step's candidate (value, id: 8 bytes) through the 512-byte host exchange
+    drafter_.set_rank(options_.rank, 2U, [this](void* stream, const void* local, void* remote, std::size_t bytes) {
+        std::array<std::byte, round_bytes> o{}, i{};
+        check(hipMemcpyAsync(o.data(), local, bytes, hipMemcpyDeviceToHost, static_cast<hipStream_t>(stream)), "coop candidate");
+        check(hipStreamSynchronize(static_cast<hipStream_t>(stream)), "coop candidate");
+        options_.exchange(o, i);
+        check(hipMemcpyAsync(remote, i.data(), bytes, hipMemcpyHostToDevice, static_cast<hipStream_t>(stream)), "coop candidate");
+        check(hipStreamSynchronize(static_cast<hipStream_t>(stream)), "coop candidate");  // i is on this frame
+    });
+    struct OneRank {  // the drafter scans the whole head again however the draft ends
+        ds41::dspark::DeviceDrafter& d;
+        ~OneRank() { d.set_rank(0U, 1U, {}); }
+    } one{drafter_};
+    return drafter_.draft(token, false);
 }
 
 struct BatchSpeculator::ParkedPlan {
@@ -354,6 +389,15 @@ const PlannedStep& BatchSpeculator::plan(std::span<BatchSequence* const> seqs, s
     }
     planned_probe_ = false;
     if (calib_ && nd != 0U && chunks.empty() && ++probe_plans_ % 32U == 0U) probe_due_ = true;  // every 32 decode plans
+    // a lone drafting request is drafted cooperatively only when its context is in step: the controller prices it so
+    // when every decoding request's is (whichever it picks), else as draft + round
+    if (coop_) {
+        bool all = nd != 0U;
+        for (std::uint32_t k = 0; k < nd; ++k) all = all && in_step_[slots[k]];
+        auto c = controller_.costs();
+        c.coop = all && coop_n_ != 0U ? static_cast<float>(coop_mean_) : 0.0F;
+        controller_.set_costs(c);
+    }
     // stage 1: who drafts (the first decode step of every request count is plain: its cost is measured first)
     std::vector<bool> drafting(nd, false);
     if (nd != 0U && budget > nd && allow_drafts_) {
@@ -371,6 +415,27 @@ const PlannedStep& BatchSpeculator::plan(std::span<BatchSequence* const> seqs, s
     std::vector<std::uint32_t> remote;  // k drafted by rank 1
     for (std::uint32_t k = 0; k < nd; ++k)
         if (drafting[k] && owner(slots[k]) == 1U) remote.push_back(k);
+    // coop_: the only drafting request, its context in step on both ranks, is drafted by both (a round without reply)
+    std::uint32_t coop_k = nd;
+    if (coop_) {
+        std::uint32_t count = 0;
+        for (std::uint32_t k = 0; k < nd; ++k)
+            if (drafting[k]) ++count, coop_k = k;
+        if (count != 1U || !in_step_[slots[coop_k]]) coop_k = nd;
+        else remote.clear();
+    }
+    const auto t_coop = clock_type::now();  // a cooperative draft's price includes its entry exchange
+    if (coop_k != nd) {
+        DraftRound round;
+        round.coop = 1U;
+        round.commits = static_cast<std::uint32_t>(pending_commits_.size());
+        std::copy(pending_commits_.begin(), pending_commits_.end(), round.commit);
+        pending_commits_.clear();
+        round.slot[0] = slots[coop_k];
+        round.token[0] = seqs[dec[coop_k]]->generated.back();
+        round.requests = 1U;
+        (void)swap_packets<DraftReply>(options_.exchange, round);
+    }
     const bool split = options_.world == 2U && !remote.empty();  // otherwise no round: the commits go with the step's packet
     if (split) {
         DraftRound round;
@@ -385,12 +450,26 @@ const PlannedStep& BatchSpeculator::plan(std::span<BatchSequence* const> seqs, s
     }
     for (std::uint32_t k = 0; k < nd; ++k) {
         if (!drafting[k]) continue;
-        if (options_.world == 2U && owner(slots[k]) == 1U) {
+        if (k != coop_k) in_step_[slots[k]] = false;  // drafted (flushed) on one rank only
+        if (options_.world == 2U && k != coop_k && owner(slots[k]) == 1U) {
             drafted_[dec[k]] = true;
             ++ndraft;
             continue;
         }
         const auto td = clock_type::now();
+        if (k == coop_k) {
+            drafts[k] = coop_draft(slots[k], seqs[dec[k]]->generated.back());
+            coop_pending_[slots[k]] = true;
+            ++stats_.coop_drafts;
+            const double dc = since(t_coop);  // its own price: half the head, the entry and candidate exchanges
+            stats_.draft_seconds += since(td);
+            if (chunks.empty() && (!calib_ || seen_coop_)) accumulate(coop_mean_, coop_n_, dc);
+            seen_coop_ = true;
+            drafts_[dec[k]] = drafts[k];
+            drafted_[dec[k]] = true;
+            ++ndraft;
+            continue;
+        }
         flush(slots[k]);
         drafter_.select(slots[k]);
         drafts[k] = drafter_.draft(seqs[dec[k]]->generated.back(), false);
@@ -497,6 +576,8 @@ std::vector<std::pair<std::uint32_t, std::uint32_t>> BatchSpeculator::finish(std
         while (r0 + count < plan_.rows.size() && plan_.owner[r0 + count] == i) ++count;
         auto& s = *seqs[i];
         const auto slot = s.slot;
+        if (count > 1U && !coop_pending_[slot]) in_step_[slot] = false;  // rows not from a cooperative draft (as follow_stage)
+        coop_pending_[slot] = false;
         if (window_rows_[i] != 0U) {  // a window: row j + 1 is kept when draft j + 1 equalled row j's greedy token
             std::uint32_t accepted = 0;
             while (accepted + 1U < count && plan_.rows[r0 + accepted + 1U].token == tokens[r0 + accepted]) ++accepted;
@@ -506,10 +587,10 @@ std::vector<std::pair<std::uint32_t, std::uint32_t>> BatchSpeculator::finish(std
                 commits.emplace_back(slot, kept);
                 if (options_.world == 2U) pending_commits_.push_back(slot << 16U | kept);
             }
-            if (owner(slot) == options_.rank) stage(slot, r0, kept);
+            if (keeps(slot)) stage(slot, r0, kept);
             for (std::uint32_t j = 0; j < kept; ++j) {
                 s.generated.push_back(tokens[r0 + j]);
-                if (owner(slot) == options_.rank) S.context[slot].push_back(tokens[r0 + j]);
+                if (keeps(slot)) S.context[slot].push_back(tokens[r0 + j]);
             }
             s.position += kept;
             emitted += kept;

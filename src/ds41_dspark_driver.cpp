@@ -191,6 +191,7 @@ double BatchWindowController::step_cost(std::span<const std::uint32_t> rows, std
     const double draft = costs_.draft > 0.0F ? costs_.draft : 0.2 * plain_cost(1U);
     const double extra = costs_.draft > 0.0F ? costs_.extra : 0.0015;  // measured drafts: `extra` as given (0 = inside the walls)
     const std::uint32_t drafters = std::max(costs_.drafters, 1U);
+    if (drafting == 1U && costs_.coop > 0.0F) return plain + row * (total - n) + costs_.coop + extra * n;
     return plain + row * (total - n) + draft * ((drafting + drafters - 1U) / drafters) + (drafters > 1U ? costs_.round : 0.0F) + extra * n;
 }
 
