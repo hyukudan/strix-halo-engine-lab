@@ -30,7 +30,8 @@ Entre las mediciones publicadas se incluyen:
 - **GLM-5.3 Flash:** la autoespeculación MTP exacta predeterminada alcanza
   37.1 / 44.5 / 40.0 tok/s en chat / código / JSON.
 - **GLM-5.3 Flash en una RTX PRO 6000, presupuestos de todo el dispositivo:** prefill y decode exactos con una caché de
-  expertos repartida entre VRAM, RAM pinned y disco. Tarjeta completa sin cambios: TTFT 17.7 s con 8K y 41.2 s con 32K;
+  expertos repartida entre VRAM, RAM pinned y disco. Tarjeta completa: TTFT 17.7 s con 8K y 41.2 s con 32K (vea la nota
+  más abajo: unos 10-15 s más por prefill en la rama main actual hasta que llegue una corrección);
   decode de 3.3 tok/s en caliente. Ahora también funciona de forma exacta con 24 GiB de VRAM + 32 GiB de RAM del host
   (expertos leídos del disco): TTFT 64.8 s con 1K y 76.7 s con 8K; decode de 0.67 tok/s en caliente (0.63 en frío).
   Exacto = cada digest de estado y de logits es igual al de un prefill nuevo de prompt+t.
@@ -548,6 +549,16 @@ estado; estado del prefill igual con tiles de 2048 / 4096 / 8192 filas). Tarjeta
 (2.5 en frío), limitado por el cómputo y el coste de lanzamiento, y aún en optimización. Con 24 GiB de VRAM + 32 GiB de
 RAM del host (la mayoría de los expertos leídos del archivo de unidades en disco) también funciona de forma exacta: TTFT
 **64.8 s** con 1K y **76.7 s** con 8K; decode de **0.67 tok/s** en caliente (0.63 en frío). Compilación, archivo de unidades y opciones: [guía de GLM RTX](src/glm/rtxpf/README.md).
+
+> **Regresión conocida en la rama main actual (TTFT con la tarjeta completa):** desde #202 la restauración de la
+> residencia del decode se ejecuta dentro de cada prefill y, con un nivel de archivo, vuelve a copiar unidades de
+> expertos desalojadas; además, una reserva de huecos libres menor con un nivel de archivo
+> cuesta unos segundos más. En total añade unos 10-15 s por prefill (unos 29 s con 8K y unos 54 s con 32K en lugar de 17.7 /
+> 41.2 s). Las salidas no cambian y siguen siendo exactas. Hay en curso una corrección que restaura de forma diferida
+> antes del primer paso de decode. Solución temporal (exacta; prevista a partir de las mediciones del host, aún no
+> confirmada en la GPU): `STRIX_GLM_RTX_RESTORE_RESIDENCY=0` (o `--restore-decode-residency 0`) elimina la
+> restauración, unos 10-11 s del total; el decode justo después de un prefill falla entonces más a menudo en la caché
+> de expertos.
 
 ### Nemotron 3.5 Bolt E4B
 
