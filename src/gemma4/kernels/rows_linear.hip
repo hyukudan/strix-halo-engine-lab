@@ -18,12 +18,13 @@ constexpr unsigned tile_waves = 8U;
 // Each accumulator (output, row) still starts at +0 and adds RN(w * x) for its
 // lane's chunks and elements in ascending order, and its 32 lane values are
 // combined by wave_sum, exactly as in pair_linear_kernel; no row affects
-// another row's value.
-template <WeightFormat Format, bool Gate, unsigned T, unsigned R, unsigned G>
+// another row's value. S = 2 alternates two input tiles, so each stage needs
+// one barrier instead of two; the values read are the same.
+template <WeightFormat Format, bool Gate, unsigned T, unsigned R, unsigned G, unsigned S = 1>
 __global__ void __launch_bounds__(256) rows_linear_kernel(LinearView w, LinearView up, const float* x, unsigned rows,
                                                          float* out, unsigned* failure, bool hardware_half) {
-    static_assert(4U % G == 0U && (R * 32U * G) % 256U == 0U);
-    __shared__ float4 tile[R * G * 32U];
+    static_assert(4U % G == 0U && (R * 32U * G) % 256U == 0U && (S == 1U || S == 2U));
+    __shared__ float4 tiles[S * R * G * 32U];
     const unsigned lane = threadIdx.x % 32U, wave = threadIdx.x / 32U;
     const unsigned first = (blockIdx.y * tile_waves + wave) * T, row0 = blockIdx.x * R;
     const unsigned chunks = w.inputs / 16U, blocks = (chunks + 31U) / 32U;
@@ -51,7 +52,8 @@ __global__ void __launch_bounds__(256) rows_linear_kernel(LinearView w, LinearVi
         }
 #pragma unroll
         for (unsigned h = 0; h < 4U / G; ++h) {
-            __syncthreads();
+            float4* tile = tiles + (S == 1U ? 0U : ((b * (4U / G) + h) % S) * (R * G * 32U));
+            if constexpr (S == 1U) __syncthreads();
 #pragma unroll
             for (unsigned j = 0; j < R * 32U * G / 256U; ++j) {
                 const unsigned i = threadIdx.x + 256U * j;
@@ -137,23 +139,37 @@ bool hardware_half() {
     return enabled;
 }
 // Measured on gfx1151 (rows 512, production shapes): 4x16x2 fastest except
-// Q6_K, where 2x32x2 is. STRIX_G4_ROWS_TILE forces one variant everywhere.
-int default_variant(WeightFormat format) {
+// Q6_K, where 2x32x2 is. ROWS_TILE_V2 (default on; read per call so a lever
+// A/B can switch it in one process): calls of at least 256 rows with more
+// than 512 outputs stage Q4_K and BF16 inputs in two alternating tiles
+// (4x16x2) and use 4x32x1 with two tiles for Q6_K; both won in forward and
+// reverse bench passes at 512 rows. Narrow outputs and short calls keep the
+// first table. STRIX_G4_ROWS_TILE forces one variant everywhere.
+int default_variant(WeightFormat format, unsigned outputs, unsigned rows) {
     static const int forced = [] {
         const auto* p = std::getenv("STRIX_G4_ROWS_TILE");
         const int v = p ? std::atoi(p) : -1;
         return v >= 0 && v < rows_linear_variants ? v : -1;
     }();
-    return forced >= 0 ? forced : format == WeightFormat::q6_k ? 3 : 4;
+    if (forced >= 0)
+        return forced;
+    if (rows >= 256U && outputs > 512U && rows_tile_v2()) {
+        if (format == WeightFormat::q6_k)
+            return 8;
+        if (format == WeightFormat::q4_k || format == WeightFormat::bf16)
+            return 9;
+    }
+    return format == WeightFormat::q6_k ? 3 : 4;
 }
-template <WeightFormat Format, bool Gate, unsigned T, unsigned R, unsigned G>
+template <WeightFormat Format, bool Gate, unsigned T, unsigned R, unsigned G, unsigned S = 1>
 void launch(LinearView w, LinearView up, const float* x, unsigned rows, float* out, Queue q, unsigned* failure) {
     const dim3 grid((rows + R - 1U) / R, (w.outputs + tile_waves * T - 1U) / (tile_waves * T));
-    hipLaunchKernelGGL((rows_linear_kernel<Format, Gate, T, R, G>), grid, dim3(256), 0, static_cast<hipStream_t>(q), w,
+    hipLaunchKernelGGL((rows_linear_kernel<Format, Gate, T, R, G, S>), grid, dim3(256), 0, static_cast<hipStream_t>(q), w,
                        up, x, rows, out, failure, hardware_half());
 }
 // Variants (outputs per wave, rows, groups per barrier): 4x16x4, 4x32x2, 8x16x4,
-// 2x32x2, 4x16x2, 4x16x1, 4x8x4, 8x8x2. Gate kernels hold two accumulator sets with half the outputs per wave.
+// 2x32x2, 4x16x2, 4x16x1, 4x8x4, 8x8x2; two-tile stages 4x32x1, 4x16x2, 2x32x1;
+// register-tiled 2x64x1. Gate kernels hold two accumulator sets with half the outputs per wave.
 template <WeightFormat Format, bool Gate>
 void launch_variant(int variant, LinearView w, LinearView up, const float* x, unsigned rows, float* out, Queue q,
                     unsigned* failure) {
@@ -165,6 +181,10 @@ void launch_variant(int variant, LinearView w, LinearView up, const float* x, un
     case 5: launch<Format, Gate, Gate ? 2U : 4U, 16U, 1U>(w, up, x, rows, out, q, failure); break;
     case 6: launch<Format, Gate, Gate ? 2U : 4U, 8U, 4U>(w, up, x, rows, out, q, failure); break;
     case 7: launch<Format, Gate, Gate ? 4U : 8U, 8U, 2U>(w, up, x, rows, out, q, failure); break;
+    case 8: launch<Format, Gate, Gate ? 2U : 4U, 32U, 1U, 2U>(w, up, x, rows, out, q, failure); break;
+    case 9: launch<Format, Gate, Gate ? 2U : 4U, 16U, 2U, 2U>(w, up, x, rows, out, q, failure); break;
+    case 10: launch<Format, Gate, Gate ? 1U : 2U, 32U, 1U, 2U>(w, up, x, rows, out, q, failure); break;
+    case 11: launch<Format, Gate, Gate ? 1U : 2U, 64U, 1U>(w, up, x, rows, out, q, failure); break;
     default: launch<Format, Gate, Gate ? 2U : 4U, 16U, 4U>(w, up, x, rows, out, q, failure); break;
     }
 }
@@ -174,7 +194,7 @@ bool many_rows(LinearView w, LinearView up, const float* x, unsigned rows, float
     if (rows <= 8U || !w.data || w.inputs % 16U || (Gate && (up.format != w.format || up.inputs != w.inputs)))
         return false;
     if (variant < 0)
-        variant = default_variant(w.format);
+        variant = default_variant(w.format, w.outputs, rows);
     switch (w.format) {
 #define G4_ROWS_FORMAT(F)                                                                                                  \
     case WeightFormat::F: launch_variant<WeightFormat::F, Gate>(variant, w, up, x, rows, out, q, failure); break
@@ -190,6 +210,10 @@ bool many_rows(LinearView w, LinearView up, const float* x, unsigned rows, float
     return true;
 }
 } // namespace
+bool rows_tile_v2() {
+    const auto* p = std::getenv("STRIX_G4_PREFILL_ROWS_TILE_V2");
+    return !p || std::string_view(p) != "0";
+}
 bool rows_linear_enabled() {
     static const bool enabled = [] {
         const auto* p = std::getenv("STRIX_G4_PREFILL_EXACT_MANYROW");

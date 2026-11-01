@@ -30,6 +30,7 @@ enum Lever : std::uint32_t {
     lever_device_finite = 1U << 1U, // DEVICE_FINITE: taps checked finite on the device, inside the failure fence
     lever_fuse_epilogue = 1U << 2U, // FUSE_EPILOGUE: norm+residual+finite(+next norm), gelu/PLE/RoPE/gather + finite in one launch
     lever_side_stream = 1U << 3U, // SIDE_STREAM: K/V projections and the chunk's PLE projection on a second queue
+    lever_rows_tile_v2 = 1U << 4U, // ROWS_TILE_V2: per-shape many-row linear tiles (two-tile input staging)
 };
 struct LeverName {
     Lever bit;
@@ -41,6 +42,7 @@ inline constexpr LeverName lever_names[] = {
     {lever_device_finite, "device_finite", "STRIX_G4_PREFILL_DEVICE_FINITE"},
     {lever_fuse_epilogue, "fuse_epilogue", "STRIX_G4_PREFILL_FUSE_EPILOGUE"},
     {lever_side_stream, "side_stream", "STRIX_G4_PREFILL_SIDE_STREAM"},
+    {lever_rows_tile_v2, "rows_tile_v2", "STRIX_G4_PREFILL_ROWS_TILE_V2"},
 };
 [[nodiscard]] inline bool lever_enabled(Lever bit) {
     for (const auto& l : lever_names)
