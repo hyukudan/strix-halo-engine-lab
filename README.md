@@ -555,6 +555,15 @@ At one request the engine verifies only the drafted tokens the drafter is confid
 window, threshold stored per drafter), which lifted C1 with the drafter from 85.1 / 92.2 / 72.1 to 92.9 / 100.6 / 83.8
 tok/s (`default` / `fast` / `quality`, same machine); `STRIX_G4_MTP_CONF=0` restores the previous window policy.
 
+Single-request decode also drafts from the text itself (prompt lookup): it proposes the continuation of the longest
+earlier match of the last tokens in the prompt and output, and the main model verifies every token, so token ids equal
+drafting off. Without a drafter it gains strongly (C1, `default`, 256 tokens): agent edit prompt (2.2K tokens)
+**114.9** tok/s vs 48.2 with drafting off, JSON tool prompt (1.2K) **122.9** vs 49.3, 29.5K-token document **35.0** vs
+28.1, code **55.8** vs 51.9; English, Spanish and Japanese chat +1 to 2 %. Beside the MTP drafter a per-request
+selector drafts a lookup window only on a strong match and backs off on misses, so it stays out of the way: equal to
+the drafter alone within noise on chat, code, agent prompts and 32K (agent edit 146.8 vs 146.2, JSON tool 172.2 vs
+171.6, code 112.6 vs 112.5, 29.5K 50.5 vs 50.4, English chat 92.8 vs 92.8). `STRIX_G4_LOOKUP=0` turns it off.
+
 **MTP drafter** - [hyukudan/Nemotron-3.5-Bolt-E4B-MTP-Drafter](https://huggingface.co/hyukudan/Nemotron-3.5-Bolt-E4B-MTP-Drafter). A small assistant model (Google's
 Gemma-4-E4B-it MTP assistant, 78.8M parameters) proposes the next few tokens and the main model verifies them, so the
 output is identical to decoding without it; only the speed changes. The speed-up comes from the MTP assistant
@@ -1119,6 +1128,7 @@ Full item lists, preconditions, notices and evidence: [optimization catalog](doc
 | MiniMax: serving | Deadline resumes and short-first admission | On | Mixed first-short TTFT 1.19/1.03 vs 14.2/13.4 s; long TTFT +20%/+19%; burst throughput lower in these runs | Both-rank resume 11/11 identical; extended coverage remains scoped | `STRIX_MM_SERVE_SCHED=off`; `STRIX_MM_SERVE_SERVICE_MS=0`; `STRIX_MM_SERVE_SHORT_FIRST=0` |
 | MiniMax: nested admission | Child activation bank preserves paused parent | On | Second-short TTFT 1.25/2.06 vs 13.2/12.5 s; long TTFT about +20% | Both-rank nested 512-token child 10/10 and whole 511-token child 6/6 identical | `STRIX_MM_SERVE_NEST=0`; `/admin/sched` `nest=false` |
 | Nemotron `quality`: fused EXL3 FFN (prefill) | Gate/up output transforms, gelu product and down input transform in one launch | On | FFN at 512 rows 11.29 → 11.05 ms (−2 %), EXL3 M4 shapes, one node | Same bytes (operator byte gates; prompt digests at 512 to 16K tokens equal) | `STRIX_G4_EXL3_FFN_FUSE=0` |
+| Nemotron: prompt lookup | C1 decode proposes the continuation of the longest earlier match of the last tokens (prompt and output) and verifies it; beside the MTP drafter a per-request selector uses it only on a strong match | On | No drafter, C1 `default`, 256 tokens: agent edit prompt **114.9** vs 48.2 tok/s, JSON tool prompt **122.9** vs 49.3, 29.5K document **35.0** vs 28.1, code **55.8** vs 51.9, chat +1–2 %; beside the MTP drafter equal within noise (chat, code, agent, 32K); one node | Token ids equal drafting off (every run) | `STRIX_G4_LOOKUP=0` |
 | Nemotron `quality`: EXL3 decode prefetch | Decode cores keep four chunks of raw trellis words in flight per wave | On | C1 plain decode 41.4 → 46.5 tok/s (+12.3 %), EXL3 M4, 120-token prompt + 256 tokens, alternating runs on one node | Same bytes (device == host emulator per shape; token ids and state digest equal) | `STRIX_G4_EXL3_COOP_DEPTH=1` |
 | Nemotron: prefill host levers | Taps copied only for a drafter that reads them (pinned, asynchronous); one device finite check of the returned taps; K/V projections and the chunk's PLE projection on a second queue; fused norm + residual + finite epilogues | On | Exact prefill (the shipped route): within ±0.5 % (fused epilogues +0.4 to +0.5 %), 1.3–1.7 ms less host idle per 512-row chunk; WMMA prefill route (pending qualification): +0.7 to +1.7 % per lever at 512/2K tokens; alternating same-turn runs on one node | Same bytes (token ids, KV digest and receipts equal in every arm apart from the lever fields; device byte gates for the fused epilogues and the pinned taps) | `STRIX_G4_PREFILL_PINNED_TAPS=0`, `STRIX_G4_PREFILL_DEVICE_FINITE=0`, `STRIX_G4_PREFILL_SIDE_STREAM=0`, `STRIX_G4_PREFILL_FUSE_EPILOGUE=0` |
 | GLM: R1b decode | Faster FP32 summation identity | On | 41.93–41.96 vs R1 47.33–47.48 ms/token | Own identity; differs from R1 | `--identity r1` |

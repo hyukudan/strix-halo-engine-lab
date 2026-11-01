@@ -1,4 +1,5 @@
 #include "gemma4/engine/runtime.hpp"
+#include "gemma4/engine/lookup.hpp"
 #include "gemma4/prefill/prefill.hpp"
 #include "../gemma4_dflash/fixture.hpp"
 
@@ -438,6 +439,24 @@ void prefill_taps_tests() {
         if (family != 2) CHECK(logs[0]->taps == logs[1]->taps); // MTP never reads them
         if (family != 2) CHECK(!logs[1]->taps.empty());
         if (family == 2) CHECK(logs[1]->empty_taps > 0);
+    }
+    // The shipped default wraps the MTP drafter in prompt lookup: the wrapper forwards wants_taps() (lookup reads
+    // committed tokens only), so prompt prefill still skips the tap copy; same outputs as the MTP shape alone.
+    {
+        set_env("STRIX_G4_PREFILL_PINNED_TAPS", nullptr);
+        backend.requested.clear();
+        auto log = std::make_shared<StageLog>();
+        const e::DraftFactory mtp = [=] { return std::make_unique<ShapeDraft>(2,reference.ids,r.prompt.size()-1,log); };
+        auto req = r; req.dflash = e::DraftMode::on;
+        e::Coordinator c(backend,e::lookup::hybrid_factory(mtp,e::lookup::LookupConfig{})); const auto s = c.submit(req); c.run();
+        check_equal(c.result(s),reference);
+        CHECK(!backend.requested.empty());
+        for (const bool asked : backend.requested) CHECK(!asked);
+        const auto receipt = c.receipt(s);
+        const auto* taps = receipt.find("prefill_taps");
+        CHECK(taps && taps->as_string() == "skipped (no consumer)");
+        CHECK(receipt.find("prompt_lookup"));
+        CHECK(log->empty_taps > 0);
     }
     set_env("STRIX_G4_PREFILL_PINNED_TAPS", nullptr);
 }

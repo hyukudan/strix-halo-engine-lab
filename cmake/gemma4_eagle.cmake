@@ -47,6 +47,12 @@ if(TARGET strix_gemma4_dflash)
             add_test(NAME strix-gemma4-eagle-coordinator-tests COMMAND strix-gemma4-eagle-coordinator-tests)
             # The real-Coordinator e2e takes > 120 s on a busy host build (owner request).
             set_tests_properties(strix-gemma4-eagle-coordinator-tests PROPERTIES TIMEOUT 600 LABELS "gemma4")
+            # Prompt lookup: n-gram index vs brute force; hybrid session through the real Coordinator (ids == OFF).
+            add_executable(strix-gemma4-lookup-tests tests/gemma4_eagle/lookup_tests.cpp)
+            target_link_libraries(strix-gemma4-lookup-tests PRIVATE strix_gemma4_engine strix_gemma4_eagle)
+            strix_target_warnings(strix-gemma4-lookup-tests)
+            add_test(NAME strix-gemma4-lookup-tests COMMAND strix-gemma4-lookup-tests)
+            set_tests_properties(strix-gemma4-lookup-tests PROPERTIES TIMEOUT 300 LABELS "gemma4")
         endif()
         if(TARGET strix_gemma4_eagle_device)
             add_executable(strix-gemma4-eagle-device-tests tests/gemma4_eagle/device_tests.cpp)

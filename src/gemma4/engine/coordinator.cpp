@@ -534,6 +534,7 @@ Json Coordinator::receipt(std::size_t slot) const {
     j.set("auto_evidence",s.policy.receipt());
     if (multi_.config().enabled) j.set("multistream_evidence",multi_.receipt());
     j.set("acceptance",acceptance);
+    if (s.draft) s.draft->report(j);
     if (!r.prefill_levers.empty()) {
         auto levers = Json::object();
         for (const auto& [name,chunks] : r.prefill_levers) levers.set(name,chunks);

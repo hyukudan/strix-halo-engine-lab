@@ -32,6 +32,13 @@ constexpr Lever table[] = {
      .required = {false, false, false}, .ready = {true, true, true}, .runnable = {true, true, true},
      .kind = Kind::exact, .apps = engine, .off = "0",
      .source = "gemma4/e4b-mtp2: confidence-gated C1 MTP window, ids == OFF; gate EN untuned 85.6 -> 97.6 tok/s"},
+    // Prompt lookup (n-gram) drafting, exact: auto = per-request selector beside the MTP drafter (drafts only on a strong
+    // match, backs off on misses; measured equal to the drafter alone) and lookup drafting when no drafter is loaded
+    // (agent prompts 48.2 -> 114.9, 49.3 -> 122.9 tok/s); 0 = off.
+    {.name = "draft_lookup", .env = "STRIX_G4_LOOKUP", .value = {"auto", "auto", "auto"}, .builtin = "auto",
+     .required = {false, false, false}, .ready = {true, true, true}, .runnable = {true, true, true},
+     .kind = Kind::exact, .apps = engine, .off = "0",
+     .source = "prompt-lookup drafting, ids == OFF; beside the MTP drafter equal, without a drafter agent 48.2 -> 114.9 tok/s"},
     {.name = "exl3_route", .option = "--exl3-arm", .value = {"", "", "pack"}, .builtin = "off",
      .required = {false, false, true}, .ready = {true, true, true}, .runnable = {true, true, true}, .kind = Kind::pack,
      .apps = all_apps, .asset = true, .source = "EXL3 pack route (--exl3-arm)"},
