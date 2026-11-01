@@ -37,6 +37,10 @@ namespace D = strix::glm::dev;
 namespace P = strix::glm::pf;
 
 namespace {
+// Explicit MLA {scores, o-bar, gemm} versions gated bitwise against the 3/5/1 reference (intermediates, decode outputs).
+constexpr unsigned kMlaPairs = 9;
+constexpr unsigned kMlaPair[kMlaPairs][3] = {{4, 5, 1}, {3, 6, 1}, {4, 6, 1}, {5, 5, 1}, {4, 7, 1}, {5, 7, 1},
+                                             {5, 7, 2}, {4, 5, 2}, {4, 6, 2}};
 
 int failures = 0, checks = 0;
 void check(bool ok, const std::string& what) {
@@ -416,12 +420,16 @@ void dsa_case(const DsaFix& fx, const std::string& label, unsigned T, const std:
     float* pwh = poison<float>(static_cast<std::size_t>(CMAX) * kIdxHeads);
     std::uint32_t* pkeys = poison<std::uint32_t>(static_cast<std::size_t>(CMAX) * kcap);
     std::uint32_t *ptok = poison<std::uint32_t>(static_cast<std::size_t>(NQ) * P::kMaxTokens), *pn = poison<std::uint32_t>(NQ);
+    std::uint32_t *ptok2 = poison<std::uint32_t>(static_cast<std::size_t>(NQ) * P::kMaxTokens), *pn2 = poison<std::uint32_t>(NQ);
+    float* pwh_in = poison<float>(static_cast<std::size_t>(CMAX) * kIdxHeads);
+    bool sel2_ok = true;
     float *pqt = poison<float>(static_cast<std::size_t>(CMAX) * 64 * kKvLora), *pe = poison<float>(static_cast<std::size_t>(CMAX) * 64 * P::kEStride);
     float* pob = poison<float>(static_cast<std::size_t>(CMAX) * 64 * kKvLora);
     float* pO[3];
     for (int c = 0; c < 3; ++c) pO[c] = poison<float>(static_cast<std::size_t>(NQ) * kHeadCfgs[c].H * kMlaDim);
     bool wh_ok = true, keys_ok = true, inter_ok = true, lists_ok = true;
-    bool versions_ok[3] = {true, true, true};
+    bool versions_ok[kMlaPairs];
+    for (bool& v : versions_ok) v = true;
     std::string first_bad;
     std::vector<std::uint16_t> lat_host;  // decode latent cache, for the host R13 intermediates
     unsigned t0 = 0;
@@ -433,6 +441,7 @@ void dsa_case(const DsaFix& fx, const std::string& label, unsigned T, const std:
         if (t0 + C > query_from) {
             const unsigned a = t0 >= query_from ? t0 : query_from, Cq = t0 + C - a, qa = a - query_from;
             P::dense_rows(dx + static_cast<std::size_t>(a) * kHidden, fx.dw.weights_proj, D::WType::F16, kHidden, 0, kIdxHeads, pwh, Cq, nullptr);
+            hok(hipMemcpy(pwh_in, pwh, static_cast<std::size_t>(Cq) * kIdxHeads * 4, hipMemcpyDeviceToDevice), "wh copy");
             P::indexer_select_rows(ps.s, a, dqI + static_cast<std::size_t>(a) * kIdxHeads * kIdxDim, pwh, pkeys, kcap,
                                    ptok + static_cast<std::size_t>(qa) * P::kMaxTokens, pn + qa, Cq, nullptr);
             const bool scored = (a + Cq) / kKpool > kIdxPools;  // indexer_select_rows scaled wh in place
@@ -447,6 +456,17 @@ void dsa_case(const DsaFix& fx, const std::string& label, unsigned T, const std:
                 keys_ok &= std::equal(ref.begin(), ref.end(), kh.begin() + static_cast<std::size_t>(r) * kcap) && ref.size() == Pt;
             }
             const auto nh = down(pn + qa, Cq), th = down(ptok + static_cast<std::size_t>(qa) * P::kMaxTokens, static_cast<std::size_t>(Cq) * P::kMaxTokens);
+            for (const auto& vv : {std::pair{2U, 1U}, std::pair{3U, 1U}, std::pair{2U, 2U}}) {  // explicit pairs == default (3/2)
+                const auto keys_all = down(pkeys, static_cast<std::size_t>(Cq) * kcap);
+                hok(hipMemcpy(pwh, pwh_in, static_cast<std::size_t>(Cq) * kIdxHeads * 4, hipMemcpyDeviceToDevice), "wh restore");
+                P::indexer_select_rows_versions(ps.s, a, dqI + static_cast<std::size_t>(a) * kIdxHeads * kIdxDim, pwh, pkeys, kcap,
+                                                ptok2 + static_cast<std::size_t>(qa) * P::kMaxTokens, pn2 + qa, Cq, nullptr, vv.first, vv.second);
+                const auto n2 = down(pn2 + qa, Cq), t2 = down(ptok2 + static_cast<std::size_t>(qa) * P::kMaxTokens, static_cast<std::size_t>(Cq) * P::kMaxTokens);
+                sel2_ok &= n2 == nh && keys_all == down(pkeys, keys_all.size()) && bits_eq(whh, down(pwh, whh.size()));
+                for (unsigned r = 0; r < Cq && sel2_ok; ++r)
+                    sel2_ok &= std::equal(th.begin() + static_cast<std::size_t>(r) * P::kMaxTokens, th.begin() + static_cast<std::size_t>(r) * P::kMaxTokens + nh[r],
+                                          t2.begin() + static_cast<std::size_t>(r) * P::kMaxTokens);
+            }
             for (unsigned r = 0; r < Cq; ++r)
                 if (!list_ok(th.data() + static_cast<std::size_t>(r) * P::kMaxTokens, nh[r], a + r)) {
                     lists_ok = false;
@@ -462,9 +482,9 @@ void dsa_case(const DsaFix& fx, const std::string& label, unsigned T, const std:
                     const auto* tk = ptok + static_cast<std::size_t>(qa + rb) * P::kMaxTokens;
                     const float* qm = dqm[c] + static_cast<std::size_t>(qa + rb) * H * kMlaDim;
                     float* out = pO[c] + static_cast<std::size_t>(qa + rb) * H * kMlaDim;
-                    auto call = [&](unsigned sv, unsigned ov) {
+                    auto call = [&](unsigned sv, unsigned ov, unsigned gv = 1) {
                         P::mla_attention_rows_versions(ps.s, tk, pn + qa + rb, qm, kvb_dev[c], H,
-                                                       pqt, pe, pob, out, rows, nullptr, sv, ov);
+                                                       pqt, pe, pob, out, rows, nullptr, sv, ov, gv);
                     };
                     call(3, 5);
                     const auto qt_ref = down(pqt, static_cast<std::size_t>(rows) * H * kKvLora);
@@ -472,9 +492,9 @@ void dsa_case(const DsaFix& fx, const std::string& label, unsigned T, const std:
                     const auto e_ref = down(pe, static_cast<std::size_t>(rows) * H * P::kEStride);
                     const auto o_ref = down(out, static_cast<std::size_t>(rows) * H * kMlaDim);
                     const auto decode = down(rO[c] + static_cast<std::size_t>(qa + rb) * H * kMlaDim, o_ref.size());
-                    for (unsigned v = 0; v < 3; ++v) {
-                        const unsigned sv = v == 1 ? 3U : 4U, ov = v == 0 ? 5U : 6U;
-                        call(sv, ov);
+                    for (unsigned v = 0; v < kMlaPairs; ++v) {
+                        const unsigned sv = kMlaPair[v][0], ov = kMlaPair[v][1];
+                        call(sv, ov, kMlaPair[v][2]);
                         bool same = bits_eq(qt_ref, down(pqt, qt_ref.size())) && bits_eq(ob_ref, down(pob, ob_ref.size())) &&
                                     bits_eq(o_ref, down(out, o_ref.size())) && bits_eq(o_ref, decode) && all_finite(o_ref);
                         const auto ep = down(pe, e_ref.size());
@@ -486,7 +506,7 @@ void dsa_case(const DsaFix& fx, const std::string& label, unsigned T, const std:
                                     const unsigned lane = P::kObRounds * rev + j / 256;
                                     const std::size_t base = (static_cast<std::size_t>(rr) * H + h) * P::kEStride;
                                     same &= std::memcmp(&e_ref[base + (H == 32 ? lane : j)],
-                                                        &ep[base + (H == 32 && ov == 5 ? lane : j)], 4) == 0;
+                                                        &ep[base + (H == 32 && (ov == 5 || ov == 7) ? lane : j)], 4) == 0;
                                 }
                         versions_ok[v] &= same;
                     }
@@ -573,6 +593,7 @@ void dsa_case(const DsaFix& fx, const std::string& label, unsigned T, const std:
     }
     check(lists, tag + ": token lists + n of rows " + std::to_string(query_from) + ".." + std::to_string(T - 1) + " == decode indexer_select" +
                      (bad_row < T ? " (first bad row " + std::to_string(bad_row) + ")" : std::string()));
+    check(sel2_ok, tag + ": indexer scores/select 2/1, 3/1, 2/2 == default 3/2 (token lists, counts), keys and scaled wh bitwise, every chunk");
     check(wh_ok && keys_ok && !r_keys.empty(), tag + ": per-row scaled wh + ordered keys (" + std::to_string(r_keys.size()) + " scored rows) == decode");
     if (!rep_rows.empty()) check(inter_ok, tag + ": absorbed q (64 heads) == decode; probabilities + o-bar (heads 0/31/32/63) == host R13, finite");
     for (int c = 0; c < 3; ++c) {
@@ -583,8 +604,9 @@ void dsa_case(const DsaFix& fx, const std::string& label, unsigned T, const std:
         check(bad == 0 && all_finite(po), tag + ": MLA outputs, " + kHeadCfgs[c].label + " (H=" + std::to_string(kHeadCfgs[c].H) + "), == decode, finite (mismatches " +
                                               std::to_string(bad) + ")");
     }
-    for (unsigned v = 0; v < 3; ++v)
-        check(versions_ok[v], tag + ": explicit scores/obar " + (v == 0 ? "4/5" : v == 1 ? "3/6" : "4/6") +
+    for (unsigned v = 0; v < kMlaPairs; ++v)
+        check(versions_ok[v], tag + ": explicit scores/obar/gemm " + std::to_string(kMlaPair[v][0]) + "/" + std::to_string(kMlaPair[v][1]) +
+                                  "/" + std::to_string(kMlaPair[v][2]) +
               " == 3/5 intermediates and decode outputs, all queried rows, H=32 ranks 0/1 and H=64");
     check(down(rflag, 1)[0] == 0 && down(pflag, 1)[0] == 0, tag + ": no C3/C4 flag on either path");
 }
@@ -880,8 +902,8 @@ void test_dsa(const std::string& cases, std::mt19937& g) {
                 for (std::size_t i = 0; i < lat.size(); ++i) lat[i] = finite[(i + i / kKvLora) % 8];
                 if (ieee) { lat[3] = 0x7F80; lat[9] = 0xFF80; lat[17 * kKvLora + 5] = 0x7FC1; }
                 hok(hipMemcpy(slot.s.latent, lat.data(), lat.size() * 2, hipMemcpyHostToDevice), "MLA seed");
-                auto call = [&](unsigned sv, unsigned ov) {
-                    P::mla_attention_rows_versions(slot.s, tk, nn, q, kv, H, qt, ep, ob, out, C, nullptr, sv, ov);
+                auto call = [&](unsigned sv, unsigned ov, unsigned gv = 1) {
+                    P::mla_attention_rows_versions(slot.s, tk, nn, q, kv, H, qt, ep, ob, out, C, nullptr, sv, ov, gv);
                 };
                 call(3, 5);
                 const auto qr = down(qt, nq + 17), er = down(ep, ne + 17), obr = down(ob, nq + 17), oo = down(out, no + 17);
@@ -896,9 +918,9 @@ void test_dsa(const std::string& cases, std::mt19937& g) {
                     return intact;
                 };
                 same &= guard_ok(qr, nq) && guard_ok(er, ne) && guard_ok(obr, nq) && guard_ok(oo, no);
-                for (unsigned v = 0; v < 3; ++v) {
-                    const unsigned sv = v == 1 ? 3U : 4U, ov = v == 0 ? 5U : 6U;
-                    call(sv, ov);
+                for (unsigned v = 0; v < kMlaPairs; ++v) {
+                    const unsigned sv = kMlaPair[v][0], ov = kMlaPair[v][1];
+                    call(sv, ov, kMlaPair[v][2]);
                     const auto eo = down(ep, ne + 17);
                     same &= bits_eq(qr, down(qt, nq + 17)) && bits_eq(obr, down(ob, nq + 17)) && bits_eq(oo, down(out, no + 17));
                     for (unsigned r = 0; r < C; ++r)
@@ -908,7 +930,7 @@ void test_dsa(const std::string& cases, std::mt19937& g) {
                                 for (unsigned bit = 0; bit < 8; ++bit) rev |= ((j >> bit) & 1U) << (7 - bit);
                                 const unsigned lane = P::kObRounds * rev + j / 256;
                                 const std::size_t base = (static_cast<std::size_t>(r) * H + h) * P::kEStride;
-                                same &= std::memcmp(&er[base + (H == 32 ? lane : j)], &eo[base + (H == 32 && ov == 5 ? lane : j)], 4) == 0;
+                                same &= std::memcmp(&er[base + (H == 32 ? lane : j)], &eo[base + (H == 32 && (ov == 5 || ov == 7) ? lane : j)], 4) == 0;
                             }
                     for (unsigned j = 0; j < 17; ++j) {
                         std::uint32_t u;
@@ -917,7 +939,7 @@ void test_dsa(const std::string& cases, std::mt19937& g) {
                     }
                 }
                 // Byte comparisons deliberately include NaN payloads and the output guard regions.
-                check(same, "MLA explicit 4/5, 3/6, 4/6 == 3/5 bitwise intermediates/output/guards H=" + std::to_string(H) +
+                check(same, "MLA explicit scores/obar/gemm (9 combinations incl. 5/7/2, 4/6/2) == 3/5/1 bitwise intermediates/output/guards H=" + std::to_string(H) +
                       (ieee ? " NaN/+Inf/-Inf latent" : " signed-zero/subnormal latent") + ", n=1..2051 tile boundaries");
             }
         }
