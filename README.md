@@ -1181,8 +1181,15 @@ OFF, 20.34 s T16384 OFF and 20.07 s eager loading OFF. Early setup and T16384 sh
 measured gains; eager loading is neutral within noise. These gains are not additive.
 At 131,072 and 262,143 real-text tokens the default admits automatic T16384, and with
 `STRIX_QPF2K_T16K=0` it admits T8192 as before, with no fallback. Open, nonblocking gates
-are the seven state payloads, T16384 at 262K and pressure fallback, and staged versus
-unstaged PLE gathered bytes; see [local CI](docs/engine/prefill/hc-output-wmma-qualification.md#bundle-local-ci-evidence).
+are the seven state payloads and T16384 at 262K with pressure fallback; see
+[local CI](docs/engine/prefill/hc-output-wmma-qualification.md#bundle-local-ci-evidence).
+The staged-gather acceptance fix is measured with one binary, staged versus the earlier acceptance rule: full logits
+equal at 4K and 32K, tokens equal at 4K, 32K and 262K; prefill 4K -1.1 %, 32K -1.9 % (-0.40 s), and 262K (YaRN
+factor 2, T8192 blocks) 198.19 -> 185.49 s (-6.4 %, mean of two pairs), with GPU idle time over that prompt down
+from 10.2 s to 1.56 s.
+Combined, with one binary on the plain CLI default route (alternating runs), the defaults above against every one of
+their OFF switches: 4K 2.548 -> 2.397 s (-5.9 %), 32K 20.57 -> 19.05 s (-7.4 %; T16384 against T8192). The OFF arm
+reproduces the earlier logits byte for byte, and generated tokens are equal in every arm.
 
 The READY mask contains `hc_output_wmma`. The implemented candidate `index_proj_wmma` stays outside READY and is default OFF pending qualification. The default prefill identity remains
 `fp16-v1+hcout16` (`prefill_identity_hash` ee2cd64684149069); `--prefill-exact-fp16` gives the plain
@@ -1245,7 +1252,7 @@ Full item lists, preconditions, notices and evidence: [optimization catalog](doc
 
 | Engine / optimization | What | Default | Gain | Exact? | Off switch |
 |---|---|---|---|---|---|
-| Qwen: PLE staged-gather acceptance | Accept ordered tail after successful row-0 consumption | Unconditional bug fix | No measured speed claim | Local CI launcher/staged-gather fixtures pass; gathered-byte gate open | No switch |
+| Qwen: PLE staged-gather acceptance | Accept ordered tail after successful row-0 consumption | Unconditional bug fix | Prefill 4K -1.1 %, 32K -1.9 %, 262K (YaRN) 198.19 -> 185.49 s (-6.4 %, two pairs), staged vs earlier rule, one binary | Full logits equal at 4K/32K; tokens equal at 4K/32K/262K | No switch |
 | Qwen: compact QSA output images | Exact BF16 storage and FP32 widening | On for eligible full-T owners | Calculated -96 MiB/T8192 owner | Local CI fixtures and 32K last-row logits bitwise; timing neutral within noise | `STRIX_QPF2K_COMPACT_IMAGES=0` |
 | Qwen: HC low-band layout | Banded low_t, skip unused low16 stores | On (mode 3), guarded FP32 output route | No timing claim (inactive on default route) | Exact, bitwise-checked in local CI (132/132 cases and 32K last-row logits) | `STRIX_QPF2K_HC_LOWBAND=0` |
 | Qwen: tiled prefill | Auto tile/context, expert union, router rows | Auto | 32K: 22.03 s, 1,487 tok/s | Own FP16 reference; differs from dense A8 | `STRIX_PREFILL_F16=0` |
