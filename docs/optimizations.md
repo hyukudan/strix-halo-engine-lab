@@ -17,15 +17,16 @@ HTTP and MTP, the row stays `pending` with the same reason as an explicit reques
 decline, keeps FP32 route storage and is not exported or stamped as applied. If no
 provisional or unqualified row runs, the qualification stamp is `qualified`.
 Attention budget, FP16 recurrent chunks and output head remain pending: builtin paths continue,
-with one notice per row and declared targets in `profile.pending`.
+with one notice per row and declared targets in `profile.pending`. The FP16 recurrent chunk row
+(`STRIX_QPF2K_GDN_FP16_CHUNK`, [chunked GDN prefill](#qwen-gdn-chunk)) is runnable but awaits fidelity qualification.
 `quality` runs default settings with one notice because no quality pack exists.
 
 Explicit environment variables and lever options override the profile, including
 explicit off. `--allow-pending` / `STRIX_QWEN_PROFILE_ALLOW_PENDING=1` applies only
 runnable genuinely pending rows for benchmarks and stamps `unqualified: <rows>`.
 When combined with provisional rows, this follows the qualification-in-progress
-stamp, separated by `; `. The three pending rows have no runnable implementation,
-so this flag currently leaves fast's resolution unchanged. The existing
+stamp, separated by `; `. Of the three pending rows only the FP16 recurrent chunk row is runnable,
+so with this flag fast also exports `STRIX_QPF2K_GDN_FP16_CHUNK=1` and stamps `unqualified: gdn_fp16_chunk`. The existing
 `--prefill-moe-route-bf16` contract is preserved. On YaRN, profile rows refused by
 rotary admission stay pending with their reason and are not exported or stamped
 as applied; selection alone cannot cause that refusal. Required assets remain
@@ -453,6 +454,32 @@ Uses the exact recurrence forms, batches gates and feeds eligible dense output d
 - **Off switch:** STRIX_QPF2K_GDN=0; independently STRIX_QPF2K_GDN_GATES_BATCH=0 or STRIX_QPF2K_GDN_CORE16=0 (one at a time)
 - **Measured gain:** -
 - **Public evidence:** [Qwen results](performance.md#qwen-prefill-and-defaults)
+
+<a id="qwen-gdn-chunk"></a>
+
+### Chunked GDN prefill on FP16 WMMA (FAST)
+
+**Engine:** `qwen`. **Control:** `STRIX_QPF2K_GDN_FP16_CHUNK=1` or `--gdn-fp16-chunk 1`. **Default:** OFF (profile `fast`
+row `gdn_fp16_chunk`, pending qualification).
+
+Replaces conv, recurrence and gated norm of the GDN prefill row route with identity `qwen-gdn-fp16-chunk rev 2`
+([contract](engine/kernels/gdn-fp16-chunk.md)): 32-row chunks in WY form, FP16 WMMA operands with FP32 accumulation,
+FP32 state, decays applied in FP32. Under it the tiled input projection writes its (already BF16-rounded) q/k/v/z
+values as BF16 rows for the route.
+
+- **Preconditions:** Prefill row route, head dimension 128, value heads a multiple of key heads (at most 4 per key head).
+  Ignored under the baseline and for GSQ checkpoints; other shapes keep the exact route.
+- **Fallback notice:** stderr `GDN FAST lever qwen-gdn-fp16-chunk rev 2: ON (...)` or `... shape not supported -> exact recurrence`.
+- **Exactness evidence:** Bit-changing by design. Fixture `strix-hip-gdn-fp16-chunk-tests` screens against an FP64 token
+  recurrence (relL2 ~4e-4) and checks determinism and aligned-split invariance; model fidelity is qualified separately.
+- **Identity:** prefill option `gdn_fp16_chunk` (candidate, tag `gdnchunk16` in the prefill identity name and hash);
+  excluded on automatic YaRN MTP and bundle routes like the other candidates; the GDN check modes run the exact route.
+- **Memory:** persistent per stream, grow-only: about 211 MiB of chunk scratch plus 256 MiB of BF16 projection rows at
+  T8192 (16 key / 48 value heads).
+- **Off switch:** unset or `STRIX_QPF2K_GDN_FP16_CHUNK=0`; also `STRIX_PREFILL_EXACT_FP16=1` or
+  `--prefill-disable gdn_fp16_chunk` (exact production route).
+- **Measured gain:** plain CLI, same build, FAST vs exact: 4K 2.42 → 2.36 s (−2.6 %), 32K 19.61 → 18.81 s
+  (−4.1 %), 262K 177.9 → 170.0 s (−4.5 %, one pair). Pending fidelity qualification.
 
 <a id="qwen-hc"></a>
 

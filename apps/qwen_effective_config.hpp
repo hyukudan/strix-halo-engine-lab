@@ -422,7 +422,7 @@ inline EffectiveConfig initialize_prefill_config(const RequestedOptions& request
     if (result.options.mtp.enabled && (!result.options.mtp_bundle_path.empty() ||
         (result.options.rotary.mode() == RotaryMode::yarn && !result.options.prefill_numerical_profile))) {
         const auto excluded = prefill_option_bit(PrefillOption::hc_output_wmma) |
-            prefill_option_bit(PrefillOption::index_proj_wmma);
+            prefill_option_bit(PrefillOption::index_proj_wmma) | prefill_option_bit(PrefillOption::gdn_fp16_chunk);
         result.options.prefill_disabled |= excluded;
         result.prefill_option_mask &= ~excluded;
     }

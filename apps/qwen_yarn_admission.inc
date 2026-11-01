@@ -55,6 +55,9 @@ inline std::string yarn_environment_refusal(const Environment& environment, unsi
         // Match the candidate parser: empty or any 0-prefix is OFF, all other
         // nonempty values are ON. Its writer/reader/controller guards still apply.
         if (name == "STRIX_QPF2K_MOE_ROUTE_BF16") continue;
+        // No rotary: the chunked GDN prefill route (src/hip_gdn_fp16_chunk.inc) replaces conv, recurrence and gated
+        // norm of linear-attention layers only; RoPE lives in the QSA layers it does not touch.
+        if (name == "STRIX_QPF2K_GDN_FP16_CHUNK") continue;
         // Serial decode pool controls: the pool's only rotary site is block_pool_kernel under with_qwen_rotary
         // (qsa_decode_pool_scores, bound to the table by bind_qwen_pool); the self-check re-derives the scores with
         // block_score_kernel from the same table; selection and key storage perform no rotation. The fused maxima and the
