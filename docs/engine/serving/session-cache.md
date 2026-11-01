@@ -239,10 +239,38 @@ within --session-ram-bytes. RAM lookup reserves parser/lineage space; disk loadi
 sessions; exceeding either working budget fails explicitly. This accounts cache/temporary
 allocations, not complete process RSS or total-machine memory.
 
-Whole envelopes are synchronous without segment deduplication, streaming or O_DIRECT.
-Capture can stall inference. Byte/count limits evict least recently used envelopes. The
+Whole envelopes are synchronous without segment deduplication. Capture can stall inference. Byte/count limits evict least recently used envelopes. The
 serving disk tier enforces its byte quota; explicit DELETE removes published checkpoints.
 CLI save directories remain under caller management.
+
+### State-file I/O (Linux)
+
+session.bin (and the prefix-cache segment/checkpoint files) are written and read around the
+page cache. Publication stages the envelope through recycled 8 MiB aligned buffers with
+O_DIRECT (padded tail truncated to the true length, then fdatasync when durable; same
+exclusive temp, rename and directory fsync order). Restore reads the file in 8 MiB direct
+chunks while a helper thread reads the next one, and the manifest root SHA-256 is computed
+as each chunk lands instead of in a second pass. File format, bytes and validation are
+unchanged; old files restore as before. A filesystem that refuses O_DIRECT (for example
+tmpfs) falls back to buffered I/O that drops each written/read range from the page cache.
+Other platforms keep the buffered path.
+
+Measured on node NVMe (ext4) with a 356 MB session: save 113 -> 77 ms (-32 %), restore plus
+verification 423 -> 369 ms (-13 %); after a save the session file is 0 % resident in the page
+cache (100 % buffered) while the model file stays resident. End to end over HTTP (one server
+alternating the two modes, 36 paired blocks, medians): save 423 -> 388 ms (-8 %), cold
+restore plus verification 1000 -> 879 ms (-14 %), decode right after a save unchanged
+(65.00 vs 64.95 tok/s). Token ids, FP32 logits and state digests are byte-identical
+to the buffered path.
+
+| Switch | Effect when 0 |
+|---|---|
+| `STRIX_SESSION_DIRECT_IO=0` | Original buffered reads and writes (also disables the two below). |
+| `STRIX_SESSION_READAHEAD=0` | Direct reads without the read-ahead helper thread. |
+| `STRIX_SESSION_CHUNKED=0` | Manifest root verified in a second pass after the read. |
+
+These switches select I/O mode only and are excluded from the session numerical identity, so
+flipping them does not invalidate saved sessions or prefix identities.
 
 ## Qualification
 

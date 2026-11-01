@@ -1,5 +1,6 @@
 #include "strix/prefix_state_cache.hpp"
 #include "strix/model_content_hash.hpp"
+#include "strix/unbuffered_file.hpp"
 
 #include <algorithm>
 #include <bit>
@@ -69,11 +70,24 @@ ModelContentIdentity get(const std::uint8_t (&in)[32]) {
 class File final {
 public:
     File(const std::filesystem::path& path, const char* mode) : file_(std::fopen(path.string().c_str(), mode)) {}
+    // Whole-file payload streams ("rb" or "wb"): unbuffered unless STRIX_SESSION_DIRECT_IO=0.
+    enum class Stream { payload };
+    File(const std::filesystem::path& path, const char* mode, Stream) {
+        if (!state_file_io::unbuffered_io_enabled()) { file_ = std::fopen(path.string().c_str(), mode); return; }
+        if (std::string_view(mode) == "wb") writer_ = std::make_unique<state_file_io::SequentialWriter>(path, false, 0666);
+        else reader_ = std::make_unique<state_file_io::SequentialReader>(path);
+    }
     ~File() { if (file_) std::fclose(file_); }
     File(const File&) = delete;
     File& operator=(const File&) = delete;
-    [[nodiscard]] bool open() const noexcept { return file_ != nullptr; }
+    [[nodiscard]] bool open() const noexcept {
+        return file_ != nullptr || (writer_ && writer_->open()) || (reader_ && reader_->open());
+    }
     void read(void* data, std::uint64_t bytes) {
+        if (reader_) {
+            try { reader_->read(data, bytes); } catch (const std::exception&) { throw std::runtime_error("prefix cache file is truncated"); }
+            return;
+        }
         auto* out = static_cast<std::byte*>(data);
         while (bytes) {
             const auto chunk = static_cast<std::size_t>(std::min<std::uint64_t>(bytes, 64ULL << 20));
@@ -83,6 +97,10 @@ public:
         }
     }
     void write(const void* data, std::uint64_t bytes) {
+        if (writer_) {
+            try { writer_->write(data, bytes); } catch (const std::exception&) { throw std::runtime_error("prefix cache file write failed"); }
+            return;
+        }
         const auto* in = static_cast<const std::byte*>(data);
         while (bytes) {
             const auto chunk = static_cast<std::size_t>(std::min<std::uint64_t>(bytes, 64ULL << 20));
@@ -92,6 +110,11 @@ public:
         }
     }
     void close(bool durable = false) {
+        if (writer_) {
+            auto writer = std::move(writer_);
+            try { writer->finish(durable); } catch (const std::exception&) { throw std::runtime_error("prefix cache file sync failed"); }
+            return;
+        }
         if (file_ && durable) {
             if (std::fflush(file_) != 0) throw std::runtime_error("prefix cache file flush failed");
 #if defined(__unix__)
@@ -105,6 +128,8 @@ public:
     }
 private:
     std::FILE* file_ = nullptr;
+    std::unique_ptr<state_file_io::SequentialWriter> writer_;
+    std::unique_ptr<state_file_io::SequentialReader> reader_;
 };
 
 void sync_directory(const std::filesystem::path& dir, bool durable) {
@@ -636,7 +661,7 @@ std::shared_ptr<const PrefixCacheCheckpoint> PrefixStateCache::find_longest(cons
 std::shared_ptr<const PrefixCacheSegment> PrefixStateCache::load_segment(const ModelContentIdentity& identity,
     const ModelContentIdentity& digest, std::uint32_t block_rows, Reservation* reservation) {
     if (auto retained = find_segment(digest)) return retained;
-    File file(segment_path(policy_.disk_directory, digest), "rb");
+    File file(segment_path(policy_.disk_directory, digest), "rb", File::Stream::payload);
     if (!file.open()) throw std::runtime_error("prefix cache segment file is missing");
     SegmentHeader header;
     file.read(&header, sizeof(header));
@@ -665,7 +690,7 @@ std::shared_ptr<const PrefixCacheSegment> PrefixStateCache::load_segment(const M
 std::shared_ptr<const PrefixCacheCheckpoint> PrefixStateCache::load_from_disk(const ModelContentIdentity& identity,
     const ModelContentIdentity& digest, std::span<const std::uint32_t> tokens, std::uint32_t block_rows) {
     const auto start = std::chrono::steady_clock::now();
-    File file(checkpoint_path(policy_.disk_directory, digest), "rb");
+    File file(checkpoint_path(policy_.disk_directory, digest), "rb", File::Stream::payload);
     if (!file.open()) return nullptr;
     CheckpointHeader header;
     file.read(&header, sizeof(header));
@@ -765,7 +790,7 @@ void PrefixStateCache::write_to_disk(const PrefixCacheCheckpoint& checkpoint) {
         header.payload_checksum = prefix_cache_checksum(segment->payload.span());
         const auto temporary = temporary_path(path);
         {
-            File file(temporary, "wb");
+            File file(temporary, "wb", File::Stream::payload);
             if (!file.open()) throw std::runtime_error("prefix cache segment file cannot be created");
             file.write(&header, sizeof(header));
             file.write(segment->tokens.data(), segment->tokens.size() * sizeof(std::uint32_t));
@@ -793,7 +818,7 @@ void PrefixStateCache::write_to_disk(const PrefixCacheCheckpoint& checkpoint) {
         header.metadata_checksum = prefix_cache_checksum(metadata);
         const auto temporary = temporary_path(path);
         {
-            File file(temporary, "wb");
+            File file(temporary, "wb", File::Stream::payload);
             if (!file.open()) throw std::runtime_error("prefix cache checkpoint file cannot be created");
             file.write(&header, sizeof(header));
             for (const auto& segment : checkpoint.segments) file.write(segment->digest.bytes.data(), 32);

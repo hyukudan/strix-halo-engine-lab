@@ -181,6 +181,10 @@ and the list of segment digests), written to a temporary name and renamed. Heade
 digests and a 64-bit payload checksum; segment tokens are re-hashed on load and must chain to the
 requested digest. A file that fails any check is skipped (counted) and the next shorter prefix is
 tried. Writes run on a background thread; the process waits for them before exiting.
+On Linux, segment and checkpoint files use the same unbuffered state-file I/O as session.bin
+(O_DIRECT staged writes and read-ahead restore; buffered fallback when the filesystem refuses
+O_DIRECT); file bytes are unchanged. `STRIX_SESSION_DIRECT_IO=0` restores buffered I/O. See
+[State-file I/O](session-cache.md#state-file-io-linux).
 
 ## MTP
 
