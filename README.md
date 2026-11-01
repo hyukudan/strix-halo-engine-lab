@@ -401,7 +401,9 @@ Batched MTP drafting remains opt-in. The HTTP server sizes its request slots fro
 (or `--prefill-moe-route-bf16 on`) stores the per-route MoE dot products in BF16 and widens them exactly in the
 ordered merge. It is bit-changing (prefill storage identity `fp16-v1+moeroute16`), default OFF, and
 applied only by `--profile fast` as a provisional row until it passes qualification. Same build, plain CLI, three paired runs each: 32K TTFT
-**21.83 → 21.15 s (−3.2 %)**, 16K **10.38 → 10.11 s (−2.3 %)**, every pair faster. See the
+**21.83 → 21.15 s (−3.2 %)**, 16K **10.38 → 10.11 s (−2.3 %)**, every pair faster. At 262K (YaRN factor 2,
+serial route, `--profile default` vs `--profile fast`, two interleaved pairs) prefill took **191.2 → 185.7 s
+(−2.9 %, 1,371 → 1,412 tok/s)**, every fast run faster than every default run; decode is unchanged. See the
 [catalog](docs/optimizations.md#qwen-moe-route-bf16).
 
 GSQ below is a separate speed-over-quality profile.

@@ -2123,7 +2123,7 @@
     "default": "OFF",
     "status": "candidate; outside READY; pending qualification",
     "exact": "Bit-changing: each FP32 DA16 route dot rounds to BF16 RNE, preserving NaN/Inf; exact FP32 widening precedes the unchanged slot-order FMA and status/commit logic. OFF preserves incumbent arithmetic and identity.",
-    "gain": "Same build, plain CLI, three alternating pairs: 32K TTFT 21.83 -> 21.15 s (-3.2 %), 16K 10.38 -> 10.11 s (-2.3 %); every pair faster. Native fixture passes; model-fidelity qualification pending.",
+    "gain": "Same build, plain CLI, three alternating pairs: 32K TTFT 21.83 -> 21.15 s (-3.2 %), 16K 10.38 -> 10.11 s (-2.3 %); every pair faster. 262K YaRN serial, two interleaved pairs: prefill 191.2 -> 185.7 s (-2.9 %), decode unchanged. Native fixture passes; model-fidelity qualification pending.",
     "preconditions": "Full-row known-prefix fast FP16 MoE on native or YaRN long-context plain CLI routes, Q4_K/Q5_K gate/up, Q5_1/Q8_0 DA16 certificate down, effective tunes 80/82/88 including XOR rows, ROUTE=14, MC=1; default vector and MERGE_VEC=0 scalar merge/commit, including unsafe fallback. No added rotary site or YaRN rotary identity change; YaRN model-fidelity and complete-workload qualification pending. Other writers/readers, GSQ, core/G3/P1, SMALL, MTP, nested/serving, cache/session and CUDA decline. Logical dot row bytes halve; allocation and arena pitch remain FP32-sized.",
     "off_switch": "Any environment value starting with 0; --prefill-moe-route-bf16 off; --baseline; STRIX_BASELINE=1; STRIX_QPF2K_DEFAULTS=0.",
     "doc_anchor": "docs/optimizations.md#qwen-moe-route-bf16"
