@@ -295,7 +295,8 @@ private:
             return false;
         }
         bool previous_dot = false;
-        for (const unsigned char character : key) {
+        for (const char symbol : key) {
+            const auto character = static_cast<unsigned char>(symbol);
             const bool valid = (character >= 'a' && character <= 'z') ||
                                (character >= '0' && character <= '9') ||
                                character == '_' || character == '.';

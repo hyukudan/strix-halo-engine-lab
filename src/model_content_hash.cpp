@@ -416,7 +416,7 @@ std::optional<HashCacheKey> hash_cache_key(const std::filesystem::path& path, [[
     else return std::nullopt;
     struct stat st {};
     if (expected) {
-        st.st_dev = expected->dev; st.st_ino = expected->ino; st.st_size = expected->size;
+        st.st_dev = expected->dev; st.st_ino = expected->ino; st.st_size = static_cast<off_t>(expected->size);
         st.st_mtim = {expected->mtime_sec, expected->mtime_ns};
         st.st_ctim = {expected->ctime_sec, expected->ctime_ns};
     } else if (::stat(path.c_str(), &st) != 0 || !S_ISREG(st.st_mode)) return std::nullopt;
