@@ -450,6 +450,8 @@ ChunkResult DevicePrefill::forward(KvTxn& transaction, std::span<const unsigned>
         // ROWS_TILE_V2 engages where the g4-v1 many-row linears run.
         if (b.stats.linears == Linears::exact && gpu::rows_linear_enabled() && lever_enabled(lever_rows_tile_v2))
             result.levers |= lever_rows_tile_v2;
+        if (b.stats.linears == Linears::exact && gpu::rows_linear_enabled() && lever_enabled(lever_decode24))
+            result.levers |= lever_decode24;
         hipLaunchKernelGGL(gather, dim3((n * c.hidden + 255U) / 256U), dim3(256), 0, b.queue, w.embedding,
                            b.tokens.as<unsigned>(), n, embedding_scale, b.residual.as<float>(), b.fused_flag());
         launched(); launched_at = Clock::now();

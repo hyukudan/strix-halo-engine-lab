@@ -20,7 +20,14 @@ constexpr unsigned tile_waves = 8U;
 // combined by wave_sum, exactly as in pair_linear_kernel; no row affects
 // another row's value. S = 2 alternates two input tiles, so each stage needs
 // one barrier instead of two; the values read are the same.
-template <WeightFormat Format, bool Gate, unsigned T, unsigned R, unsigned G, unsigned S = 1>
+// M24: Q4_K/Q6_K decode their integer scale products with the 24-bit multiply (same values).
+template <WeightFormat Format, bool M24, class C> __device__ inline float decoded(const C& c, unsigned e) {
+    if constexpr (M24 && (Format == WeightFormat::q4_k || Format == WeightFormat::q6_k))
+        return c.at24(e);
+    else
+        return c.at(e);
+}
+template <WeightFormat Format, bool Gate, unsigned T, unsigned R, unsigned G, unsigned S = 1, bool M24 = false>
 __global__ void __launch_bounds__(256) rows_linear_kernel(LinearView w, LinearView up, const float* x, unsigned rows,
                                                          float* out, unsigned* failure, bool hardware_half) {
     static_assert(4U % G == 0U && (R * 32U * G) % 256U == 0U && (S == 1U || S == 2U));
@@ -73,9 +80,9 @@ __global__ void __launch_bounds__(256) rows_linear_kernel(LinearView w, LinearVi
                     for (unsigned t = 0; t < T; ++t)
 #pragma unroll
                         for (unsigned k = 0; k < 4; ++k) {
-                            v[t][k] = a[t].at((h * G + g) * 4U + k);
+                            v[t][k] = decoded<Format, M24>(a[t], (h * G + g) * 4U + k);
                             if constexpr (Gate)
-                                uv[t][k] = u[t].at((h * G + g) * 4U + k);
+                                uv[t][k] = decoded<Format, M24>(u[t], (h * G + g) * 4U + k);
                         }
 #pragma unroll
                     for (unsigned rr = 0; rr < R; ++rr) {
@@ -153,18 +160,26 @@ int default_variant(WeightFormat format, unsigned outputs, unsigned rows) {
     }();
     if (forced >= 0)
         return forced;
+    // DECODE24: the same tiles with 24-bit integer scale products in the
+    // Q4_K decoder (every Q4_K tile) and the wide Q6_K tile; both won in
+    // forward and reverse bench passes. Narrow Q6_K keeps 2x32x2.
+    const bool m24 = decode24();
     if (rows >= 256U && outputs > 512U && rows_tile_v2()) {
         if (format == WeightFormat::q6_k)
-            return 8;
-        if (format == WeightFormat::q4_k || format == WeightFormat::bf16)
+            return m24 ? 15 : 8;
+        if (format == WeightFormat::q4_k)
+            return m24 ? 14 : 9;
+        if (format == WeightFormat::bf16)
             return 9;
     }
-    return format == WeightFormat::q6_k ? 3 : 4;
+    if (format == WeightFormat::q6_k)
+        return 3;
+    return format == WeightFormat::q4_k && m24 ? 12 : 4;
 }
-template <WeightFormat Format, bool Gate, unsigned T, unsigned R, unsigned G, unsigned S = 1>
+template <WeightFormat Format, bool Gate, unsigned T, unsigned R, unsigned G, unsigned S = 1, bool M24 = false>
 void launch(LinearView w, LinearView up, const float* x, unsigned rows, float* out, Queue q, unsigned* failure) {
     const dim3 grid((rows + R - 1U) / R, (w.outputs + tile_waves * T - 1U) / (tile_waves * T));
-    hipLaunchKernelGGL((rows_linear_kernel<Format, Gate, T, R, G, S>), grid, dim3(256), 0, static_cast<hipStream_t>(q), w,
+    hipLaunchKernelGGL((rows_linear_kernel<Format, Gate, T, R, G, S, M24>), grid, dim3(256), 0, static_cast<hipStream_t>(q), w,
                        up, x, rows, out, failure, hardware_half());
 }
 // Variants (outputs per wave, rows, groups per barrier): 4x16x4, 4x32x2, 8x16x4,
@@ -185,6 +200,11 @@ void launch_variant(int variant, LinearView w, LinearView up, const float* x, un
     case 9: launch<Format, Gate, Gate ? 2U : 4U, 16U, 2U, 2U>(w, up, x, rows, out, q, failure); break;
     case 10: launch<Format, Gate, Gate ? 1U : 2U, 32U, 1U, 2U>(w, up, x, rows, out, q, failure); break;
     case 11: launch<Format, Gate, Gate ? 1U : 2U, 64U, 1U>(w, up, x, rows, out, q, failure); break;
+    // 24-bit integer scale products in the decoder: 4x16x2, 2x32x2, 4x16x2 S2, 4x32x1 S2.
+    case 12: launch<Format, Gate, Gate ? 2U : 4U, 16U, 2U, 1U, true>(w, up, x, rows, out, q, failure); break;
+    case 13: launch<Format, Gate, Gate ? 1U : 2U, 32U, 2U, 1U, true>(w, up, x, rows, out, q, failure); break;
+    case 14: launch<Format, Gate, Gate ? 2U : 4U, 16U, 2U, 2U, true>(w, up, x, rows, out, q, failure); break;
+    case 15: launch<Format, Gate, Gate ? 2U : 4U, 32U, 1U, 2U, true>(w, up, x, rows, out, q, failure); break;
     default: launch<Format, Gate, Gate ? 2U : 4U, 16U, 4U>(w, up, x, rows, out, q, failure); break;
     }
 }
@@ -210,6 +230,10 @@ bool many_rows(LinearView w, LinearView up, const float* x, unsigned rows, float
     return true;
 }
 } // namespace
+bool decode24() {
+    const auto* p = std::getenv("STRIX_G4_PREFILL_DECODE24");
+    return !p || std::string_view(p) != "0";
+}
 bool rows_tile_v2() {
     const auto* p = std::getenv("STRIX_G4_PREFILL_ROWS_TILE_V2");
     return !p || std::string_view(p) != "0";

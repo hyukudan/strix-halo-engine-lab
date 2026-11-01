@@ -97,6 +97,16 @@ template <bool Streaming> struct WeightChunk<WeightFormat::q4_k, Streaming> {
         const int q = int((chunk_byte(codes, e) >> shift) & 15U);
         return d * float(scale * q) - minimum;
     }
+    // The same value: scale < 64 (6-bit fields, constructor) and q < 16
+    // (4-bit code), so the 24-bit multiply returns the same integer at full
+    // rate (v_mul_u32_u24, not v_mul_lo_u32). A format reusing this decoder
+    // must keep both operands inside these bounds.
+    static constexpr unsigned scale_limit = 64U, code_limit = 16U;
+    static_assert(scale_limit * code_limit <= (1U << 24U), "Q4_K scale * code must fit the unsigned 24-bit multiply");
+    __device__ float at24(unsigned e) const {
+        const unsigned q = (chunk_byte(codes, e) >> shift) & 15U;
+        return d * float(int(__umul24(unsigned(scale), q))) - minimum;
+    }
 };
 template <bool Streaming> struct WeightChunk<WeightFormat::q6_k, Streaming> {
     uint4 low, high;
@@ -120,6 +130,17 @@ template <bool Streaming> struct WeightChunk<WeightFormat::q6_k, Streaming> {
         const int q = int(((chunk_byte(low, e) >> low_shift) & 15U) |
                           (((chunk_byte(high, e) >> high_shift) & 3U) << 4U));
         return d * float(scale * (q - 32));
+    }
+    // The same value: scale is a signed byte (-128..127) and q - 32 lies in
+    // -32..31 (6-bit code), so the signed 24-bit multiply returns the same
+    // integer at full rate (v_mul_i32_i24). A format reusing this decoder must
+    // keep both operands inside these bounds.
+    static constexpr int scale_limit = 128, code_limit = 32;
+    static_assert(scale_limit * code_limit < (1 << 23), "Q6_K scale * (code - 32) must fit the signed 24-bit multiply");
+    __device__ float at24(unsigned e) const {
+        const int q = int(((chunk_byte(low, e) >> low_shift) & 15U) |
+                          (((chunk_byte(high, e) >> high_shift) & 3U) << 4U));
+        return d * float(__mul24(scale, q - 32));
     }
 };
 } // namespace strix::gemma4::gpu
