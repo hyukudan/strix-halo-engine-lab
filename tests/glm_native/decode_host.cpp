@@ -245,6 +245,14 @@ void planned_residents_tests(){
     check(p[0].size()==13&&p[40].size()==13&&p[41].size()==12&&p[42].size()==12,"planned residents: the round-robin open placement (13 per layer, 12 for 41/42)");
     check(planned_residents(std::vector<std::uint8_t>(43*288,1),0,43,288)[5].empty(),"planned residents: none without device residents");
 }
+// MTP prefill pieces (schedule.hpp): at most 2048 rows whatever the trunk tile, 4-aligned (absolute DSA
+// positions pool every 4 rows), never larger than the tile itself; every row covered once.
+void mtp_tile_tests(){
+    check(mtp_row_tile(8192)==2048&&mtp_row_tile(4096)==2048&&mtp_row_tile(2048)==2048&&mtp_row_tile(1024)==1024&&mtp_row_tile(32)==32,"MTP piece = min(tile, 2048)");
+    for(unsigned P:{31u,2047u,2048u,8191u,31999u}){unsigned covered=0,pieces=0;bool aligned=true;
+        for(unsigned first=0;first<P;first+=mtp_row_tile(8192)){auto c=row_tile(first,P,mtp_row_tile(8192));aligned=aligned&&first%4==0;covered+=c.rows;++pieces;}
+        check(covered==P&&aligned&&pieces==(P+2047)/2048,"MTP pieces cover every prefill row once, 4-aligned");}
+}
 void tierstream_parser_tests(const ExpertCatalog& c,const Json& d){
 #ifdef GLM_TIERSTREAM_PARSER
     std::uint64_t layers=0,units=0,max_unit=0;auto error=tierstream_desc_check(d.dump(),&layers,&units,&max_unit);
@@ -971,6 +979,6 @@ int main(int argc,char** argv){try{
 #ifdef GLM_TIERSTREAM_LIBRARY
     tier_budget_tests();
 #endif
-    tier_mapping_tests();prefill_cache_tests();step_plan_tests();decode_timeline_tests();c1_schedule_tests();slot_census_tests();planned_residents_tests();host_commit_tests();placement_tests();profile_tests();unit_file_tests(argv[1]);binding_tests(argv[1]);encoding_tests(argv[1]);lifetime_tests(argv[1]);receipt_tests(argc>2?std::filesystem::path(argv[2]):std::filesystem::path());request_tests();
+    tier_mapping_tests();prefill_cache_tests();step_plan_tests();decode_timeline_tests();c1_schedule_tests();slot_census_tests();planned_residents_tests();mtp_tile_tests();host_commit_tests();placement_tests();profile_tests();unit_file_tests(argv[1]);binding_tests(argv[1]);encoding_tests(argv[1]);lifetime_tests(argv[1]);receipt_tests(argc>2?std::filesystem::path(argv[2]):std::filesystem::path());request_tests();
     std::cout<<"PASS "<<checks<<" decode host checks: session/frontier, state bytes, KDA open-block replay model, DSA pools, argmax, expert catalog/units, cross-shard reads, guarded slots, generate requests\n";return 0;
 }catch(const std::exception& e){std::cerr<<e.what()<<"\n";return 1;}}

@@ -581,10 +581,10 @@ struct Runtime::Impl {
                     else {DsaCall v{};v.rows=n;v.first=first;v.w=w.d;v.state=dstate(l);v.x=normalized.as<float>();v.y=part.as<float>();v.nonfinite=flag.as<unsigned>();v.index=mode;v.legacy_fp32_index=legacy_index;ck(enqueue_dsa(v,workspace.p,ws_bytes,compute.s));}
                     post(X.as<float>()+off*4,part.as<float>(),X2.as<float>(),n);
                     pre(w.ffn,w.post,X2.as<float>(),normalized.as<float>(),n);
-                    if(l<3){Call v{n,1,4096,12288,normalized.as<float>(),nullptr,nullptr,w.shared_descriptor.as<Expert>(),part.as<float>()};ck(enqueue_cutlass(v,workspace.p,ws_bytes,compute.s,exec));}
+                    if(l<3){Call v{n,1,4096,12288,normalized.as<float>(),nullptr,nullptr,w.shared_descriptor.as<Expert>(),part.as<float>()};predecoded(v,w);ck(enqueue_cutlass(v,workspace.p,ws_bytes,compute.s,exec));}
                     else {router<<<n,320,0,compute.s>>>(normalized.as<float>(),w.router,w.bias,ids.as<U32>(),rates.as<float>(),flag.as<unsigned>());
                         Call v{n,288,4096,2048,normalized.as<float>(),ids.as<U32>(),rates.as<float>(),w.descriptors.as<Expert>(),routed.as<float>()};ck(enqueue_cutlass(v,workspace.p,ws_bytes,compute.s,exec));
-                        Call sh{n,1,4096,2048,normalized.as<float>(),nullptr,nullptr,w.shared_descriptor.as<Expert>(),shared.as<float>()};ck(enqueue_cutlass(sh,workspace.p,ws_bytes,compute.s,exec));
+                        Call sh{n,1,4096,2048,normalized.as<float>(),nullptr,nullptr,w.shared_descriptor.as<Expert>(),shared.as<float>()};predecoded(sh,w);ck(enqueue_cutlass(sh,workspace.p,ws_bytes,compute.s,exec));
                         add<<<unsigned((std::size_t(n)*4096+255)/256),256,0,compute.s>>>(routed.as<float>(),shared.as<float>(),part.as<float>(),std::size_t(n)*4096,flag.as<unsigned>());
                     }
                     post(X2.as<float>(),part.as<float>(),X.as<float>()+off*4,n);
@@ -605,7 +605,8 @@ struct Runtime::Impl {
         zero_layer(45);auto stage_start=std::chrono::steady_clock::now();stage(45);staging_ms+=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-stage_start).count();auto& w=*layers[45];
         // Each exact row tile pairs hidden[t] with input[t+1]. Absolute DSA
         // positions and complete pools survive between calls; no padded tokens.
-        for(unsigned first=0;first<P;first+=tile){auto chunk=row_tile(first,P,tile);unsigned n=chunk.rows;auto off=std::size_t(first)*4096;
+        const unsigned mtp_tile=mtp_row_tile(tile); // MTP in its own (<= 2048-row) pieces
+        for(unsigned first=0;first<P;first+=mtp_tile){auto chunk=row_tile(first,P,mtp_tile);unsigned n=chunk.rows;auto off=std::size_t(first)*4096;
             auto sequence=[&]{embed<<<unsigned((std::size_t(n)*4096+255)/256),256,0,compute.s>>>(u16("model.language_model.embed_tokens.weight"),tokens.as<U32>()+first+1,embedding.as<float>(),n,1);
                 MtpCall v{n,first,w.m,dstate(45),embedding.as<float>(),hidden.as<float>()+off,part.as<float>(),flag.as<unsigned>(),mode};v.legacy_fp32_index=legacy_index;ck(enqueue_mtp(v,workspace.p,ws_bytes,compute.s,exec));};
             auto binding=std::to_string(first)+":"+std::to_string(n)+":"+identity+":"+std::to_string(legacy_index)+session_key(P);if(graphs){auto& g=graph[45][chunk.bucket];g.launch(compute.s,binding,sequence);graph_binding_ms+=g.binding_ms;}else sequence();
@@ -657,7 +658,7 @@ struct Runtime::Impl {
     static void check_device(){
         int count=0;ck(cudaGetDeviceCount(&count));need(count==1,"one visible device required");cudaDeviceProp prop{};ck(cudaGetDeviceProperties(&prop,0));
         need(prop.major==12&&prop.minor==0&&std::string(prop.name).find("PRO")!=std::string::npos,"requires sm_120 PRO");}
-    static std::uint64_t workspace_for(unsigned rows,unsigned cap){return std::max({workspace_bytes_cutlass(rows,288,4096,2048),workspace_bytes_cutlass(rows,1,4096,12288),kda_workspace_bytes(rows,4096,64),dsa_workspace_bytes(rows,cap),mtp_workspace_bytes(rows,cap)});}
+    static std::uint64_t workspace_for(unsigned rows,unsigned cap){return std::max({workspace_bytes_cutlass(rows,288,4096,2048),workspace_bytes_cutlass(rows,1,4096,12288),kda_workspace_bytes(rows,4096,64),dsa_workspace_bytes(rows,cap),mtp_workspace_bytes(mtp_row_tile(rows),cap)});}
     static std::uint64_t prefill_fixed_bytes(unsigned cap,unsigned tile,std::uint64_t ws,std::uint64_t base,std::uint64_t largest,std::uint64_t decode_fixed){
         return activation_bytes(cap,tile)+64*128*128*4+3*64*128*3*4+std::uint64_t(cap)*1664+ws+base+2*largest+(4ULL<<20)+decode_fixed;}
     // Component names: the budget plan's fixed parts and the ledger's Charge labels.
@@ -760,10 +761,10 @@ struct Runtime::Impl {
     static std::uint64_t tile_cost(unsigned cap,unsigned t){return activation_bytes(cap,t)+workspace_for(t,cap);}
     // The footprint by component at tiles 2048 / 8192 / 32768 (those <= capacity).
     static Json tile_components(unsigned cap){auto a=Json::array();
-        for(unsigned t:{2048u,8192u,32768u}){if(t>cap)continue;auto j=Json::object();j.set("row_tile",int(t));
+        for(unsigned t:{2048u,4096u,8192u,32768u}){if(t>cap)continue;auto j=Json::object();j.set("row_tile",int(t));
             j.set("activations_residual_bytes",std::uint64_t(cap)*4096*4*5);j.set("activations_tile_bytes",activation_bytes(cap,t)-std::uint64_t(cap)*4096*4*5);
             j.set("workspace_cutlass_routed_bytes",std::uint64_t(workspace_bytes_cutlass(t,288,4096,2048)));j.set("workspace_cutlass_dense_bytes",std::uint64_t(workspace_bytes_cutlass(t,1,4096,12288)));
-            j.set("workspace_kda_bytes",std::uint64_t(kda_workspace_bytes(t,4096,64)));j.set("workspace_dsa_bytes",std::uint64_t(dsa_workspace_bytes(t,cap)));j.set("workspace_mtp_bytes",std::uint64_t(mtp_workspace_bytes(t,cap)));
+            j.set("workspace_kda_bytes",std::uint64_t(kda_workspace_bytes(t,4096,64)));j.set("workspace_dsa_bytes",std::uint64_t(dsa_workspace_bytes(t,cap)));j.set("workspace_mtp_bytes",std::uint64_t(mtp_workspace_bytes(mtp_row_tile(t),cap)));j.set("mtp_row_tile",int(mtp_row_tile(t)));
             j.set("workspace_bytes (max of the above)",workspace_for(t,cap));j.set("tile_dependent_total_bytes",tile_cost(cap,t));a.push(j);}
         return a;}
     static std::string plan_refusal(const WholeDeviceIn& in,const WholeDevicePlan& p,const std::string& summary){

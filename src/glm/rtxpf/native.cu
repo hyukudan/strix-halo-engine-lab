@@ -29,7 +29,9 @@ struct Layout {
         std::size_t q=std::size_t(std::min(group_size,e))*h*i*2, n=std::size_t(r)*routes;
         qg=(U16*)take(q); qu=(U16*)take(q); qd=(U16*)take(q);
         ag=(U16*)take(n*h*2); au=(U16*)take(n*h*2); ad=(U16*)take(n*i*2);
-        activation=(float*)take(n*i*4); contribution=(float*)take(n*h*4);
+        // The C1 (CUTLASS) path never reads `activation`: its transform runs with down=false only and
+        // its down input is c1_down_transform over `ad`; only the legacy path keeps the buffer.
+        activation=c1?nullptr:(float*)take(n*i*4); contribution=(float*)take(n*h*4);
         if(c1) {
             qg2=(U16*)take(q); qu2=(U16*)take(q); qd2=(U16*)take(q);
             scratch_g=(float*)take(n*std::max(h,i)*4); scratch_u=(float*)take(n*i*4);

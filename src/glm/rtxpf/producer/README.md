@@ -663,6 +663,17 @@ include the events. A failed token keeps its partial timeline in the failure
 receipt (`expert_cache.decode_timeline_at_failure`), whose longest interval names
 the layer and phase where the device stalled.
 
+**Prefill workspace.** The CUTLASS (C1) MoE layout reserves no activation buffer
+(its transform never reads one: the down input is `c1_down_transform` over `ad`; only
+the legacy path keeps it), and the MTP layer runs its prefill in pieces of at most
+2048 rows whatever the trunk tile (`mtp_row_tile`; per-row router, GEMM K order and
+absolute DSA positions do not depend on the piece; the bitwise-equal
+prefill state across tiles includes the MTP layer). The workspace is the maximum over operators
+with MTP at its own tile: 3.444 / 3.624 / 5.637 GB at tiles 2048 / 4096 / 8192
+(was 3.579 / 5.057 / 8.015 GB); the plan's `row_tile_components` list each part.
+The prefill's shared/dense calls also use the persistent FP16 operands when
+`persistent_dense_fp16` is admitted.
+
 **Eager module loading.** The service sets `CUDA_MODULE_LOADING=EAGER` at the top
 of `main`, before any CUDA call, unless the variable is set explicitly (the harness
 also defaults it and records it in the receipt): with lazy loading, the first launch
