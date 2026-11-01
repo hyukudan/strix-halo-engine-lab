@@ -31,6 +31,15 @@ template <SmallWeightKind Kind> __device__ float load_small_weight(const void* w
 #include "../src/hip_qsa_prefill_stages.inc"
 #include "../src/hip_qsa_scatter.inc"
 #include "../src/hip_qsa_pooled_score.inc"
+// qsa_flash::row_maxima_kernel (src/hip_qsa_prefill_flash.inc), the separate launch the fused decode scorer replaces.
+__global__ __launch_bounds__(256) void row_maxima_reference(const float* scores, std::uint32_t blocks, float* maxima) {
+    const auto g = static_cast<std::uint32_t>(blockIdx.x) * 256U + threadIdx.x;
+    if (g >= (blocks + 3U) / 4U) return;
+    float s[4];
+#pragma unroll
+    for (unsigned i = 0; i < 4U; ++i) s[i] = 4U * g + i < blocks ? scores[4U * g + i] : -INFINITY;
+    maxima[g] = fmaxf(fmaxf(s[0], s[1]), fmaxf(s[2], s[3]));
+}
 
 void check(hipError_t e, const char* what) {
     if (e != hipSuccess) { std::fprintf(stderr, "%s: %s\n", what, hipGetErrorString(e)); std::exit(2); }
@@ -98,9 +107,15 @@ int main() {
     std::vector<std::uint16_t> packed(std::size_t{maximum} * dim);
     std::vector<float> keys(packed.size());
     for (std::size_t i = 0; i < keys.size(); ++i) { packed[i] = rng.bf16(); keys[i] = widen(packed[i]); }
+    // Non-finite keys (+inf, NaN, -inf) in a few blocks: scores and group maxima must still match bit for bit.
+    for (const auto [block, bits] : {std::pair{5U, 0x7f80U}, std::pair{40U, 0x7fc1U}, std::pair{300U, 0xff80U}, std::pair{70001U, 0x7f80U}})
+        for (unsigned f = 0; f < dim; f += 37U) { packed[std::size_t{block} * dim + f] = static_cast<std::uint16_t>(bits);
+            keys[std::size_t{block} * dim + f] = widen(packed[std::size_t{block} * dim + f]); }
     auto* d_p = device<std::uint16_t>(packed.size()); auto* d_k = device<float>(keys.size());
     auto* d_q = device<float>(heads * dim);
     auto* d_f = device<float>(maximum + guard); auto* d_b = device<float>(maximum + guard);
+    auto* d_m = device<float>(maximum / 4U + guard); auto* d_r = device<float>(maximum / 4U + guard);
+    std::vector<std::uint32_t> fused_maxima(maximum / 4U + guard), reference_maxima(maximum / 4U + guard);
     check(hipMemcpy(d_p, packed.data(), packed.size() * sizeof(packed[0]), hipMemcpyHostToDevice), "packed keys");
     check(hipMemcpy(d_k, keys.data(), keys.size() * sizeof(keys[0]), hipMemcpyHostToDevice), "float keys");
     hipEvent_t begin{}, end{}; check(hipEventCreate(&begin), "event"); check(hipEventCreate(&end), "event");
@@ -129,8 +144,35 @@ int main() {
                 std::printf("FAIL blocks=%u word=%u FP32=%08x BF16=%08x\n", blocks, i, fp32[i], bf16[i]); return 1;
             }
         }
+        // STRIX_QSA_DECODE_FUSED_MAXIMA: the fused decode scorer's scores equal the scorer's, its group maxima equal
+        // row_maxima_kernel over those scores (FP32 and BF16 keys), and nothing past the row or its groups is written.
+        const auto groups = (blocks + 3U) / 4U;
+        hipLaunchKernelGGL(row_maxima_reference, dim3((groups + 255U) / 256U), dim3(256), 0, nullptr, d_f, blocks, d_r);
+        check(hipMemcpy(reference_maxima.data(), d_r, groups * sizeof(float), hipMemcpyDeviceToHost), "reference maxima");
+        for (const bool packed_keys : {false, true}) {
+            check(hipMemset(d_b, 0xa5, (blocks + guard) * sizeof(float)), "canary");
+            check(hipMemset(d_m, 0xa5, (groups + guard) * sizeof(float)), "canary");
+            QsaRowsScoreViews<1U> views{};
+            views.index_query[0] = d_q; views.block_scores[0] = d_b; views.blocks[0] = blocks;
+            const dim3 grid(((blocks + 31U) / 32U + 7U) / 8U);
+            if (packed_keys) hipLaunchKernelGGL(HIP_KERNEL_NAME(block_score_pooled_decode_maxima_kernel<std::uint16_t>), grid, dim3(256), 0,
+                nullptr, views, static_cast<const std::uint16_t*>(d_p), blocks, dim, d_m);
+            else hipLaunchKernelGGL(HIP_KERNEL_NAME(block_score_pooled_decode_maxima_kernel<float>), grid, dim3(256), 0, nullptr, views,
+                static_cast<const float*>(d_k), blocks, dim, d_m);
+            check(hipGetLastError(), "fused maxima launch");
+            check(hipMemcpy(bf16.data(), d_b, (blocks + guard) * sizeof(float), hipMemcpyDeviceToHost), "fused scores");
+            check(hipMemcpy(fused_maxima.data(), d_m, (groups + guard) * sizeof(float), hipMemcpyDeviceToHost), "fused maxima");
+            for (unsigned i = 0; i < blocks + guard; ++i)
+                if (bf16[i] != fp32[i]) { std::printf("FAIL fused scores blocks=%u word=%u\n", blocks, i); return 1; }
+            for (unsigned g = 0; g < groups + guard; ++g)
+                if (g < groups ? fused_maxima[g] != reference_maxima[g] : fused_maxima[g] != 0xa5a5a5a5U) {
+                    std::printf("FAIL fused maxima blocks=%u group=%u fused=%08x reference=%08x\n", blocks, g, fused_maxima[g],
+                        g < groups ? reference_maxima[g] : 0xa5a5a5a5U);
+                    return 1;
+                }
+        }
         ++cases;
-        std::printf("EXACT blocks=%u scores=%u PASS\n", blocks, blocks);
+        std::printf("EXACT blocks=%u scores=%u maxima=%u PASS\n", blocks, blocks, groups);
         if (blocks == 65536U || blocks == 131072U || blocks == 262144U) {
             const auto timed = [&](bool packed_keys) {
                 check(hipEventRecord(begin), "begin");
@@ -148,6 +190,6 @@ int main() {
     }
     check(hipEventDestroy(begin), "destroy event"); check(hipEventDestroy(end), "destroy event");
     check(hipFree(d_p), "free"); check(hipFree(d_k), "free"); check(hipFree(d_q), "free");
-    check(hipFree(d_f), "free"); check(hipFree(d_b), "free");
+    check(hipFree(d_f), "free"); check(hipFree(d_b), "free"); check(hipFree(d_m), "free"); check(hipFree(d_r), "free");
     std::printf("RESULT PASS cases=%u\n", cases); return 0;
 }

@@ -2703,6 +2703,7 @@ if(STRIX_ENABLE_HIP_RUNTIME)
             add_executable(strix-hip-q51-grouped-down-probe-tests tests/hip_q51_grouped_down_probe_tests.hip)
             add_test(NAME strix-hip-moe-a8-down-runtime-admission-tests
                 COMMAND strix-hip-moe-kquant-tests 4 a8-down-runtime-admission)
+            add_test(NAME strix-hip-moe-r1-glue-tail-tests COMMAND strix-hip-moe-kquant-tests 0 r1-glue-tail)
             set_target_properties(strix-hip-q51-grouped-down-probe-tests PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHITECTURES}")
             target_link_libraries(strix-hip-q51-grouped-down-probe-tests PRIVATE strix_hip_runtime)
             strix_target_warnings(strix-hip-q51-grouped-down-probe-tests)

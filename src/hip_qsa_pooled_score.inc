@@ -9,9 +9,12 @@
 // One wave scores RowsPerWave consecutive rows against 32 consecutive blocks (lane i keeps
 // block base + i); index head_dim 128, 4 index heads.
 // Key changes only the load: BF16 upper halves widen exactly before the shared FP32 arithmetic.
-template <unsigned Rows, unsigned RowsPerWave, class Key = float>
-__global__ __launch_bounds__(256) void block_score_pooled_rows_kernel(QsaRowsScoreViews<Rows> views, const Key* pooled_keys,
-    std::uint32_t scored_blocks, std::uint32_t head_dim) {
+// Maxima (one serial decode row, STRIX_QSA_DECODE_FUSED_MAXIMA): the wave also writes the 4-block group maxima of its 32
+// blocks with row_maxima_kernel's expression fmaxf(fmaxf(s0, s1), fmaxf(s2, s3)) over the scores it stores (-inf past
+// the row's blocks), so the selection reads them without the separate row_maxima_kernel launch.
+template <unsigned Rows, unsigned RowsPerWave, class Key, bool Maxima>
+__device__ __forceinline__ void block_score_pooled_rows_body(const QsaRowsScoreViews<Rows>& views, const Key* pooled_keys,
+    std::uint32_t scored_blocks, std::uint32_t head_dim, float* maxima) {
 #pragma clang fp contract(off)
     constexpr unsigned Heads = 4U, Dim = 128U; // head_dim == Dim (checked by the caller)
     const auto lane = threadIdx.x % 32U;
@@ -61,4 +64,22 @@ __global__ __launch_bounds__(256) void block_score_pooled_rows_kernel(QsaRowsSco
 #pragma unroll
     for (unsigned rr = 0; rr < RowsPerWave; ++rr)
         if (lane < last && base + lane < blocks[rr]) views.block_scores[r0 + rr][base + lane] = result[rr];
+    if constexpr (Maxima) {
+        static_assert(Rows == 1U && RowsPerWave == 1U);
+        const float stored = lane < last && base + lane < blocks[0] ? result[0] : -INFINITY;
+        const auto first = static_cast<int>(lane & ~3U);
+        const float s0 = __shfl(stored, first, 32), s1 = __shfl(stored, first + 1, 32), s2 = __shfl(stored, first + 2, 32),
+            s3 = __shfl(stored, first + 3, 32);
+        if ((lane & 3U) == 0U && base + lane < blocks[0]) maxima[(base + lane) / 4U] = fmaxf(fmaxf(s0, s1), fmaxf(s2, s3));
+    }
+}
+template <unsigned Rows, unsigned RowsPerWave, class Key = float>
+__global__ __launch_bounds__(256) void block_score_pooled_rows_kernel(QsaRowsScoreViews<Rows> views, const Key* pooled_keys,
+    std::uint32_t scored_blocks, std::uint32_t head_dim) {
+    block_score_pooled_rows_body<Rows, RowsPerWave, Key, false>(views, pooled_keys, scored_blocks, head_dim, nullptr);
+}
+template <class Key = float>
+__global__ __launch_bounds__(256) void block_score_pooled_decode_maxima_kernel(QsaRowsScoreViews<1U> views, const Key* pooled_keys,
+    std::uint32_t scored_blocks, std::uint32_t head_dim, float* maxima) {
+    block_score_pooled_rows_body<1U, 1U, Key, true>(views, pooled_keys, scored_blocks, head_dim, maxima);
 }

@@ -665,6 +665,50 @@
   },
   {
     "engine": "qwen",
+    "name": "Plain decode QSA grouped attention score",
+    "flag_or_env": "STRIX_QSA_DECODE_ATTN_V2",
+    "default": "1 (eager plain one-row decode)",
+    "exact": "Byte-identical: kernel fixtures vs the replaced launches (incl. non-finite inputs); full model a 2,304-token prompt (576 complete blocks, above the 512-block selection) and a 32,768-token prompt (64 steps) give byte-identical full FP32 logits for every decode step ON vs OFF vs ON, tokens identical at 1K and 32K",
+    "gain": "plain decode, prose prompt, 256 tokens, ON vs all four switches off, interleaved ABAB on one node: 1K 43.95 -> 41.59 ms/step (-5.4 %), 32K 46.75 -> 43.92 ms/step (-6.1 %), 262K (explicit YaRN factor 2, default prefill, 128 tokens) 49.46 -> 45.91 ms/step (-7.2 %, 20.2 -> 21.8 tok/s); tokens identical in every pair",
+    "preconditions": "Eager plain one-row decode on the CLI serial route; see the doc section for per-item shape and route conditions.",
+    "off_switch": "STRIX_QSA_DECODE_ATTN_V2=0",
+    "doc_anchor": "docs/optimizations.md#qwen-plain-decode-step"
+  },
+  {
+    "engine": "qwen",
+    "name": "Plain decode QSA grouped value/gate",
+    "flag_or_env": "STRIX_QSA_DECODE_VALUE_V2",
+    "default": "1 (eager plain one-row decode)",
+    "exact": "Byte-identical: kernel fixtures vs the replaced launches (incl. non-finite inputs); full model a 2,304-token prompt (576 complete blocks, above the 512-block selection) and a 32,768-token prompt (64 steps) give byte-identical full FP32 logits for every decode step ON vs OFF vs ON, tokens identical at 1K and 32K",
+    "gain": "plain decode, prose prompt, 256 tokens, ON vs all four switches off, interleaved ABAB on one node: 1K 43.95 -> 41.59 ms/step (-5.4 %), 32K 46.75 -> 43.92 ms/step (-6.1 %), 262K (explicit YaRN factor 2, default prefill, 128 tokens) 49.46 -> 45.91 ms/step (-7.2 %, 20.2 -> 21.8 tok/s); tokens identical in every pair",
+    "preconditions": "Eager plain one-row decode on the CLI serial route; see the doc section for per-item shape and route conditions.",
+    "off_switch": "STRIX_QSA_DECODE_VALUE_V2=0",
+    "doc_anchor": "docs/optimizations.md#qwen-plain-decode-step"
+  },
+  {
+    "engine": "qwen",
+    "name": "Plain decode fused selection maxima",
+    "flag_or_env": "STRIX_QSA_DECODE_FUSED_MAXIMA",
+    "default": "1 (eager plain one-row decode)",
+    "exact": "Byte-identical: kernel fixtures vs the replaced launches (incl. non-finite inputs); full model a 2,304-token prompt (576 complete blocks, above the 512-block selection) and a 32,768-token prompt (64 steps) give byte-identical full FP32 logits for every decode step ON vs OFF vs ON, tokens identical at 1K and 32K",
+    "gain": "plain decode, prose prompt, 256 tokens, ON vs all four switches off, interleaved ABAB on one node: 1K 43.95 -> 41.59 ms/step (-5.4 %), 32K 46.75 -> 43.92 ms/step (-6.1 %), 262K (explicit YaRN factor 2, default prefill, 128 tokens) 49.46 -> 45.91 ms/step (-7.2 %, 20.2 -> 21.8 tok/s); tokens identical in every pair",
+    "preconditions": "Eager plain one-row decode on the CLI serial route; see the doc section for per-item shape and route conditions.",
+    "off_switch": "STRIX_QSA_DECODE_FUSED_MAXIMA=0",
+    "doc_anchor": "docs/optimizations.md#qwen-plain-decode-step"
+  },
+  {
+    "engine": "qwen",
+    "name": "Plain decode two-launch routed MoE glue",
+    "flag_or_env": "STRIX_MOE_R1_GLUE_FUSE",
+    "default": "1 (eager plain one-row decode)",
+    "exact": "Byte-identical: kernel fixtures vs the replaced launches (incl. non-finite inputs); full model a 2,304-token prompt (576 complete blocks, above the 512-block selection) and a 32,768-token prompt (64 steps) give byte-identical full FP32 logits for every decode step ON vs OFF vs ON, tokens identical at 1K and 32K",
+    "gain": "plain decode, prose prompt, 256 tokens, ON vs all four switches off, interleaved ABAB on one node: 1K 43.95 -> 41.59 ms/step (-5.4 %), 32K 46.75 -> 43.92 ms/step (-6.1 %), 262K (explicit YaRN factor 2, default prefill, 128 tokens) 49.46 -> 45.91 ms/step (-7.2 %, 20.2 -> 21.8 tok/s); tokens identical in every pair",
+    "preconditions": "Eager plain one-row decode on the CLI serial route; see the doc section for per-item shape and route conditions.",
+    "off_switch": "STRIX_MOE_R1_GLUE_FUSE=0",
+    "doc_anchor": "docs/optimizations.md#qwen-plain-decode-step"
+  },
+  {
+    "engine": "qwen",
     "name": "QSA MTP committed BF16 key service",
     "flag_or_env": "STRIX_QSA_MTP_POOL",
     "default": "1 (eligible native MTP CLI and YaRN f2 MTP CLI through 524288 and f4 through 1048576 positions; see seven-row route table)",

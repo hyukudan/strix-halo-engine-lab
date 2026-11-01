@@ -53,6 +53,13 @@ make_hip_moe_experts_launcher(
     HipMoeExpertsLauncherConfig* config,
     bool perform_device_setup = true);
 
+// Test-only (Q4K A8 runtime builds): the serial A8-down glue tail on caller buffers, either fused
+// (STRIX_MOE_R1_GLUE_FUSE's one launch) or as the incumbent merge, finite scan, BF16 commit and deferred
+// first-error publication. record points at the 8-byte DeferredMoeFirstError; stream is a hipStream_t.
+void enqueue_q4k_a8_serial_tail_for_test(bool fused, const float* rawdots, const std::uint32_t* routes,
+    const float* route_weights, std::uint32_t hidden_size, std::uint32_t experts, std::uint32_t top_k,
+    float* accumulation, std::uint16_t* output, std::uint32_t* status, void* record, void* stream);
+
 // Explicit retained known-prefix window R2/R4/R8 organization, not an R1
 // variant or automatic strategy. Requires the selected Q4K A8 / Q5_1
 // slot-parallel layer, BF16 C1 rows and owned eager D1 scope. Quantization,

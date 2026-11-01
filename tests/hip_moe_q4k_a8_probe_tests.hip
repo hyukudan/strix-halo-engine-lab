@@ -300,6 +300,58 @@ void projection_case(unsigned hidden,unsigned rows,unsigned top_k,bool bf16,unsi
         expect(rejected,"host rejection missing");for(auto* buffer:{&codes,&deltas,&sums,&out}) buffer->unchanged();expect(status.read<unsigned>()[0]==0,"host rejection changed status");
     }
 }
+// enqueue_serial_prologue_probe against the serial experts step it replaces: the accumulation/status clear,
+// validate_routes_kernel (route index or nonfinite weight -> invalid_route; modelled by writing that bit) and
+// enqueue_probe. Same owner bytes of codes, deltas, sums, status and projection output (guards included), a zeroed
+// accumulation, for valid inputs, an invalid last route, a NaN last weight, a NaN last activation and zero deltas.
+void serial_prologue_case(unsigned hidden,unsigned rows,unsigned top_k,bool bf16,unsigned error,const strix::HipSetupQuiescenceGuard& guard) {
+    Request req;req.enabled=true;req.approved_numerical_identity=numerical_identity;
+    const unsigned experts=std::max(top_k,3U);
+    req.input=bf16?InputKind::bf16:InputKind::fp32;req.shape={hidden,rows,experts,top_k,1};
+    const std::size_t wb=static_cast<std::size_t>(experts)*rows*(hidden/256U)*144U;
+    Buffer input(hidden*(bf16?2U:4U),guard),gate(wb,guard),up(wb,guard),routes(top_k*4U,guard),codes(hidden,guard),deltas(hidden/8U,guard),
+        sums(hidden/8U,guard),status(4,guard),out(top_k*2U*rows*4U,guard),weights(top_k*4U,guard),accumulation(hidden*4U,guard);
+    Bindings bind{input.view(),gate.view(),up.view(),routes.view(),codes.view(),deltas.view(),sums.view(),status.view(),out.view()};
+    std::mt19937 random(0x271828U+hidden+rows+top_k+error);
+    std::vector<float> x(hidden),w(top_k);std::vector<unsigned short> bx(hidden);std::vector<unsigned> rt(top_k);
+    for(unsigned i=0;i<hidden;++i) {
+        x[i]=error==4?std::bit_cast<float>(1U):std::ldexp(static_cast<float>(static_cast<int>(random()%255U)-127),-6);
+        bx[i]=static_cast<unsigned short>(std::bit_cast<unsigned>(x[i])>>16U);
+        if(bf16) x[i]=std::bit_cast<float>(static_cast<unsigned>(bx[i])<<16U);
+    }
+    if(error==3) {x.back()=std::numeric_limits<float>::quiet_NaN();bx.back()=0x7fc1U;}
+    std::vector<std::byte> gw(wb),uw(wb);
+    for(auto* v:{&gw,&uw}) {
+        for(auto& value:*v) value=static_cast<std::byte>(random()&255U);
+        for(std::size_t block=0;block<wb/144U;++block) {
+            const std::array<unsigned,6> headers{0,0x8000,1,0x3c00,0xbc00,0x03ff};
+            const unsigned d=headers[random()%headers.size()],dm=headers[random()%headers.size()];
+            (*v)[block*144U]=static_cast<std::byte>(d&255U);(*v)[block*144U+1U]=static_cast<std::byte>(d>>8U);
+            (*v)[block*144U+2U]=static_cast<std::byte>(dm&255U);(*v)[block*144U+3U]=static_cast<std::byte>(dm>>8U);
+        }
+    }
+    for(unsigned i=0;i<top_k;++i) {rt[i]=(i*7U+1U)%experts;w[i]=0.125F*static_cast<float>(i+1U);}
+    if(error==1) rt.back()=experts;
+    if(error==2) w.back()=std::numeric_limits<float>::quiet_NaN();
+    bool route_bad=false;
+    for(unsigned i=0;i<top_k;++i) route_bad=route_bad || rt[i]>=experts || !std::isfinite(w[i]);
+    guard.run([&]{input.upload(bf16?static_cast<const void*>(bx.data()):static_cast<const void*>(x.data()));gate.upload(gw.data());
+        up.upload(uw.data());routes.upload(rt.data());weights.upload(w.data());});
+    const auto poison=[&]{for(auto* b:{&codes,&deltas,&sums,&status,&out,&accumulation}) b->poison();};
+    guard.run([&]{poison();check(hipMemset(accumulation.data(),0,accumulation.bytes));check(hipMemset(status.data(),0,4));
+        if(route_bad) check(hipMemcpy(status.data(),&invalid_route,4,hipMemcpyHostToDevice));enqueue_probe(req,bind);});
+    const auto reference=std::array{codes.read_owner(),deltas.read_owner(),sums.read_owner(),status.read_owner(),out.read_owner(),
+        accumulation.read_owner()};
+    guard.run([&]{poison();enqueue_serial_prologue_probe(req,bind,static_cast<float*>(accumulation.data()),hidden,
+        static_cast<const float*>(weights.data()),nullptr);});
+    const auto fused=std::array{codes.read_owner(),deltas.read_owner(),sums.read_owner(),status.read_owner(),out.read_owner(),
+        accumulation.read_owner()};
+    for(unsigned view=0;view<fused.size();++view) expect(fused[view]==reference[view],"serial prologue differs from the incumbent bytes");
+    const unsigned bits=status.read<unsigned>()[0];
+    expect(error==0 ? bits==0U : error<=2 ? bits==invalid_route : error==3 ? (bits==nonfinite_activation || bf16) :
+        (bits==invalid_delta || bf16),"serial prologue status");
+    std::cout<<"serial prologue H="<<hidden<<" I="<<rows<<" K="<<top_k<<" bf16="<<bf16<<" error="<<error<<" status="<<bits<<" PASS\n";
+}
 }
 int main() try {
     strix::HipSetupQuiescenceGuard guard;
@@ -317,6 +369,9 @@ int main() try {
         // Nonfinite header in exactly one projection/expert/row. The peer
         // projection remains covered by finite independent-oracle equality.
         for(unsigned special:{9U,10U,11U,12U}) projection_case(512,64,2,true,special,guard,enqueue);
+    }
+    for(bool bf16:{false,true}) for(unsigned error=0;error<5U;++error) {
+        serial_prologue_case(2560,640,10,bf16,error,guard);serial_prologue_case(256,32,1,bf16,error,guard);
     }
     for(unsigned m=1;m<arithmetic_mutants.size();++m)
         expect(arithmetic_mutants[m],"existing arithmetic mutation lacks a finite distinguishing fixture");

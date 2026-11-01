@@ -1283,6 +1283,72 @@ __global__ void q51_slot_parallel_merge_kernel(const float* rawdots,
     accumulation[out]=current;
 }
 
+// One serial row with A8 down (STRIX_MOE_R1_GLUE_FUSE): q51_slot_parallel_merge_kernel, q4k_a8_validate_finite_kernel,
+// commit_experts_kernel and publish_deferred_moe_first_error in one CTA. Per output the same ordered v_fmac merge (the
+// accumulation word written only where the merge kernel writes it), the same finite threshold over the accumulation,
+// status |= 8 when any output fails it (only from a clean status), the commit only from a clean final status, and the
+// first-error record merged from the final status. Eager only (no graph aggregate).
+template <typename Storage>
+__global__ __launch_bounds__(1024) void q4k_a8_serial_tail_kernel(const float* rawdots, const std::uint32_t* routes,
+    const float* route_weights, std::uint32_t hidden_size, std::uint32_t experts, std::uint32_t top_k, float* accumulation,
+    Storage* output, std::uint32_t* status, bool bf16_commit, DeferredMoeFirstError* record, std::uint32_t domain) {
+    __shared__ std::uint32_t initial, nonfinite;
+    if (threadIdx.x == 0U) { initial = *status; nonfinite = 0U; }
+    __syncthreads();
+    if (initial == 0U) {
+        for (auto out = static_cast<std::uint32_t>(threadIdx.x); out < hidden_size; out += blockDim.x) {
+            float current = 0.0F;
+            bool written = true;
+            for (std::uint32_t slot = 0; slot < top_k; ++slot) {
+                if (routes[slot] >= experts) { written = false; break; }
+                const float weight = route_weights[slot];
+                const float dot = rawdots[static_cast<std::uint64_t>(slot) * hidden_size + out];
+                asm volatile("v_fmac_f32 %0, %1, %2" : "+v"(current) : "s"(weight), "v"(dot));
+            }
+            if (written) accumulation[out] = current;
+            const float value = written ? current : accumulation[out];
+            if ((__float_as_uint(value) & 0x7fffffffU) >= (bf16_commit ? 0x7f7f8000U : 0x7f800000U)) atomicOr(&nonfinite, 1U);
+        }
+    }
+    __syncthreads();
+    const auto final_status = initial | (nonfinite ? 8U : 0U);
+    if (final_status == 0U)
+        for (auto out = static_cast<std::uint32_t>(threadIdx.x); out < hidden_size; out += blockDim.x)
+            store_activation(&output[out], accumulation[out]);
+    if (threadIdx.x == 0U) {
+        if (nonfinite) atomicOr(status, 8U);
+        merge_deferred_moe_first_error(*record, final_status, static_cast<DeferredMoeDomain>(domain));
+    }
+}
+// STRIX_MOE_R1_GLUE_FUSE (default on): the serial Q4K A8 experts step with A8 down runs its glue in two launches
+// (moe_q4k_a8::enqueue_serial_prologue_probe and q4k_a8_serial_tail_kernel) instead of nine (accumulation/status clear,
+// validate_routes_kernel, the probe's route check and quantizer, merge, finite scan, commit and the deferred status
+// publication). Eager deferred-status execution only. Off with STRIX_MOE_R1_GLUE_FUSE=0, under the baseline and
+// STRIX_QPF2K_DEFAULTS=0.
+bool moe_r1_glue_fuse_enabled() {
+    static const bool on = qpf2k::long_context_item_enabled("STRIX_MOE_R1_GLUE_FUSE", false);
+    return on && !qpf2k::baseline;
+}
+void enqueue_serial_tail_for_test(bool fused, const float* rawdots, const std::uint32_t* routes,
+    const float* route_weights, std::uint32_t hidden_size, std::uint32_t experts, std::uint32_t top_k,
+    float* accumulation, std::uint16_t* output, std::uint32_t* status, void* record, hipStream_t stream) {
+    auto* first_error = reinterpret_cast<DeferredMoeFirstError*>(record);
+    if (fused) {
+        hipLaunchKernelGGL(HIP_KERNEL_NAME(q4k_a8_serial_tail_kernel<std::uint16_t>), dim3(1), dim3(1024), 0, stream, rawdots, routes,
+            route_weights, hidden_size, experts, top_k, accumulation, output, status, true, first_error,
+            static_cast<std::uint32_t>(DeferredMoeDomain::q4k_a8));
+    } else {
+        hipLaunchKernelGGL(q51_slot_parallel_merge_kernel, dim3((hidden_size + kThreads - 1U) / kThreads), dim3(kThreads), 0, stream,
+            rawdots, routes, route_weights, hidden_size, experts, top_k, accumulation, status);
+        hipLaunchKernelGGL(q4k_a8_validate_finite_kernel, dim3((hidden_size + kThreads - 1U) / kThreads), dim3(kThreads), 0, stream,
+            accumulation, hidden_size, status, nullptr, true);
+        hipLaunchKernelGGL(HIP_KERNEL_NAME(commit_experts_kernel<std::uint16_t>), dim3((hidden_size + kThreads - 1U) / kThreads),
+            dim3(kThreads), 0, stream, accumulation, output, hidden_size, status);
+        hipLaunchKernelGGL(publish_deferred_moe_first_error, dim3(1), dim3(1), 0, stream, status,
+            reinterpret_cast<std::uint32_t*>(record), static_cast<std::uint32_t>(DeferredMoeDomain::q4k_a8));
+    }
+    check_hip(hipGetLastError(), "Q4K A8 serial tail test enqueue");
+}
 void require_q51_slot_eager_stream(hipStream_t stream) {
     if (hip_graph_status()!=nullptr)
         throw std::invalid_argument("slot-parallel Q5_1 down admits eager execution only");
@@ -1426,6 +1492,15 @@ void launch_q4k_a8_typed(const HipMoeExpertsLauncherConfig& config,
     const auto* weights = reinterpret_cast<const float*>(route_weights.address);
     auto* aggregate = hip_graph_status();
     check_hip(hipPeekAtLastError(), "Q4K A8 runtime pre-enqueue stale error");
+    // The accumulation's status word directly follows it (moe_q4k_a8_runtime.cpp layout), so the fused prologue's
+    // accumulation clear plus its status write cover the bytes of the clear below.
+    const bool glue_fuse = prepared.a8_down_request && config.deferred_moe_status && aggregate == nullptr &&
+        layout.status_offset == layout.accumulation_offset + layout.accumulation_bytes && layout.accumulation_bytes % 4U == 0U &&
+        moe_r1_glue_fuse_enabled();
+    if (glue_fuse) {
+        moe_q4k_a8::enqueue_serial_prologue_probe(request,bindings,accumulation,
+            static_cast<unsigned>(layout.accumulation_bytes / 4U),weights,hip_execution_stream());
+    } else {
     check_hip(hipMemsetAsync(accumulation,0,
         static_cast<std::size_t>(layout.accumulation_bytes + 4),hip_execution_stream()),
         "clear Q4K A8 runtime accumulation/status");
@@ -1433,6 +1508,7 @@ void launch_q4k_a8_typed(const HipMoeExpertsLauncherConfig& config,
         routes,weights,config.top_k,config.expert_count,status,aggregate);
     check_hip(hipGetLastError(),"Q4K A8 route/weight validation");
     moe_q4k_a8::enqueue_probe(request,bindings,hip_execution_stream());
+    }
     const auto scan = [&](const float* values,std::uint32_t count,bool bf16_commit=false) {
         hipLaunchKernelGGL(q4k_a8_validate_finite_kernel,
             dim3((count+kThreads-1U)/kThreads),dim3(kThreads),0,hip_execution_stream(),
@@ -1466,6 +1542,21 @@ void launch_q4k_a8_typed(const HipMoeExpertsLauncherConfig& config,
     }
     scan(workspace,2U*config.intermediate_size*config.top_k);
     }
+    if (glue_fuse) {
+        moe_q4k_a8::enqueue_down_rawdots(*prepared.a8_down_request,
+            prepared.a8_down_bindings,hip_execution_stream());
+        hipLaunchKernelGGL(HIP_KERNEL_NAME(q4k_a8_serial_tail_kernel<Storage>),dim3(1),dim3(1024),0,hip_execution_stream(),
+            reinterpret_cast<const float*>(prepared.a8_down_bindings.rawdots.address),routes,weights,config.hidden_size,
+            config.expert_count,config.top_k,accumulation,reinterpret_cast<Storage*>(output.address),status,
+            config.activation == HipActivationStorage::bf16,reinterpret_cast<DeferredMoeFirstError*>(hip_deferred_moe_status()),
+            static_cast<std::uint32_t>(DeferredMoeDomain::q4k_a8));
+        check_hip(hipGetLastError(),"Q4K A8 serial fused merge/commit");
+        if (config.q4k_a8_stats) {
+            auto& counter = prepared.a8_down_request->weight_type == 7U ?
+                config.q4k_a8_stats->a8_down_q51_submissions : config.q4k_a8_stats->a8_down_q80_submissions;
+            counter.fetch_add(1,std::memory_order_relaxed);
+        }
+    } else {
     if (prepared.a8_down_request) {
         moe_q4k_a8::enqueue_down_rawdots(*prepared.a8_down_request,
             prepared.a8_down_bindings,hip_execution_stream());
@@ -1526,6 +1617,7 @@ void launch_q4k_a8_typed(const HipMoeExpertsLauncherConfig& config,
         if (host_status != 0)
             throw std::invalid_argument("Q4K A8 rejected status bits (route/weight=1,input=2,delta=4,pipeline=8): " +
                 std::to_string(host_status));
+    }
     }
     if (config.q4k_a8_stats) config.q4k_a8_stats->quantized_submissions.fetch_add(1,std::memory_order_relaxed);
     if (request.gate_type == 13U && config.q4k_a8_stats)
@@ -3371,4 +3463,12 @@ void enqueue_hip_mtp_routed_experts_q8(const std::uint16_t* input,const std::uin
         accumulation,output,2560U,status);
     check_hip(hipGetLastError(),"MTP routed BF16 final commit");
 }
+#ifdef STRIX_HAS_EXPERIMENTAL_Q4K_A8_RUNTIME
+void enqueue_q4k_a8_serial_tail_for_test(bool fused, const float* rawdots, const std::uint32_t* routes,
+    const float* route_weights, std::uint32_t hidden_size, std::uint32_t experts, std::uint32_t top_k,
+    float* accumulation, std::uint16_t* output, std::uint32_t* status, void* record, void* stream) {
+    enqueue_serial_tail_for_test(fused, rawdots, routes, route_weights, hidden_size, experts, top_k, accumulation, output, status,
+        record, static_cast<hipStream_t>(stream));
+}
+#endif
 } // namespace strix

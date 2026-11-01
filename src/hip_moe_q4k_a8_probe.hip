@@ -172,6 +172,24 @@ __global__ void prefill_prologue(known_rows::PrefillRows v, unsigned hidden, uns
         stride_row(v.sums,row),route_bits);
     if(threadIdx.x==0) *stride_row(v.status,row)=route_bits|bad;
 }
+// One serial row (STRIX_MOE_R1_GLUE_FUSE): the window prologue's row CTA on the serial bindings. It replaces the clear of
+// the accumulation and status words, validate_routes_kernel (route index or nonfinite weight -> invalid_route),
+// validate_routes (route index -> invalid_route) and quantize: the same status word (route bits, else the quantizer's
+// bits), the same codes/deltas/sums and the same zeroed accumulation.
+template<bool Bf16>
+__global__ void serial_prologue(const void* input, const unsigned* routes, const float* route_weights, float* clear,
+    unsigned clear_words, unsigned hidden, unsigned top_k, unsigned experts, signed char* codes, float* deltas, int* sums,
+    unsigned* status) {
+    __shared__ unsigned route_bits;
+    if(threadIdx.x==0) route_bits=0;
+    for(unsigned i=threadIdx.x;i<clear_words;i+=blockDim.x) clear[i]=0.0F;
+    __syncthreads();
+    if(threadIdx.x<top_k && (routes[threadIdx.x]>=experts || !isfinite(route_weights[threadIdx.x])))
+        atomicOr(&route_bits,invalid_route);
+    __syncthreads();
+    const unsigned bad=quantize_row<Bf16>(input,hidden,codes,deltas,sums,route_bits);
+    if(threadIdx.x==0) *status=route_bits|bad;
+}
 __global__ void project(const unsigned char* gate,const unsigned char* up,const unsigned* routes,
     const signed char* codes,const float* deltas,const int* sums,const unsigned* status,
     float* output,unsigned hidden,unsigned rows) {
@@ -424,20 +442,12 @@ void admit_q5k_stream(hipStream_t stream) {
         throw std::invalid_argument("Q5K A8 rejects capture before enqueue");
 }
 }
-void enqueue_probe(const Request& request,const Bindings& b,hipStream_t stream) {
-    validate(request,b);
-    if (request.gate_type == 13 || gsq_a8::gate_type(request.gate_type)) admit_q5k_stream(stream);
-    check(hipPeekAtLastError(),"Q4K A8 pre-enqueue stale error");
+namespace {
+void enqueue_projection(const Request& request,const Bindings& b,hipStream_t stream) {
     auto* status=reinterpret_cast<unsigned*>(b.status.address);
     const auto* routes=reinterpret_cast<const unsigned*>(b.routes.address);
-    validate_routes<<<1,32,0,stream>>>(routes,request.shape.top_k,request.shape.experts,status);
-    check(hipGetLastError(),"Q4K A8 route enqueue");
-    const void* input=reinterpret_cast<const void*>(b.input.address);
     auto* codes=reinterpret_cast<signed char*>(b.codes.address);auto* deltas=reinterpret_cast<float*>(b.deltas.address);
     auto* sums=reinterpret_cast<int*>(b.sums.address);
-    if(request.input==InputKind::bf16) quantize<true><<<1,256,0,stream>>>(input,request.shape.hidden,codes,deltas,sums,status);
-    else quantize<false><<<1,256,0,stream>>>(input,request.shape.hidden,codes,deltas,sums,status);
-    check(hipGetLastError(),"Q4K A8 quantizer enqueue");
     const auto iq=[&]<std::uint32_t T>(){
         project_iq<T><<<dim3(request.shape.rows/32U,2,request.shape.top_k),256,0,stream>>>(
             reinterpret_cast<const unsigned char*>(b.gate.address),reinterpret_cast<const unsigned char*>(b.up.address),
@@ -461,6 +471,41 @@ void enqueue_probe(const Request& request,const Bindings& b,hipStream_t stream) 
             routes,codes,deltas,sums,status,reinterpret_cast<float*>(b.output.address),request.shape.hidden,request.shape.rows);
     }
     check(hipGetLastError(),"Q4K A8 projection enqueue");
+}
+} // namespace
+void enqueue_probe(const Request& request,const Bindings& b,hipStream_t stream) {
+    validate(request,b);
+    if (request.gate_type == 13 || gsq_a8::gate_type(request.gate_type)) admit_q5k_stream(stream);
+    check(hipPeekAtLastError(),"Q4K A8 pre-enqueue stale error");
+    auto* status=reinterpret_cast<unsigned*>(b.status.address);
+    const auto* routes=reinterpret_cast<const unsigned*>(b.routes.address);
+    validate_routes<<<1,32,0,stream>>>(routes,request.shape.top_k,request.shape.experts,status);
+    check(hipGetLastError(),"Q4K A8 route enqueue");
+    const void* input=reinterpret_cast<const void*>(b.input.address);
+    auto* codes=reinterpret_cast<signed char*>(b.codes.address);auto* deltas=reinterpret_cast<float*>(b.deltas.address);
+    auto* sums=reinterpret_cast<int*>(b.sums.address);
+    if(request.input==InputKind::bf16) quantize<true><<<1,256,0,stream>>>(input,request.shape.hidden,codes,deltas,sums,status);
+    else quantize<false><<<1,256,0,stream>>>(input,request.shape.hidden,codes,deltas,sums,status);
+    check(hipGetLastError(),"Q4K A8 quantizer enqueue");
+    enqueue_projection(request,b,stream);
+}
+void enqueue_serial_prologue_probe(const Request& request,const Bindings& b,float* clear,unsigned clear_words,
+    const float* route_weights,hipStream_t stream) {
+    validate(request,b);
+    if (request.gate_type == 13 || gsq_a8::gate_type(request.gate_type)) admit_q5k_stream(stream);
+    if(!clear || !route_weights || request.shape.top_k>1024U) throw std::invalid_argument("Q4K A8 serial prologue bindings are invalid");
+    check(hipPeekAtLastError(),"Q4K A8 pre-enqueue stale error");
+    auto* status=reinterpret_cast<unsigned*>(b.status.address);
+    const auto* routes=reinterpret_cast<const unsigned*>(b.routes.address);
+    const void* input=reinterpret_cast<const void*>(b.input.address);
+    auto* codes=reinterpret_cast<signed char*>(b.codes.address);auto* deltas=reinterpret_cast<float*>(b.deltas.address);
+    auto* sums=reinterpret_cast<int*>(b.sums.address);
+    if(request.input==InputKind::bf16) serial_prologue<true><<<1,1024,0,stream>>>(input,routes,route_weights,clear,clear_words,
+        request.shape.hidden,request.shape.top_k,request.shape.experts,codes,deltas,sums,status);
+    else serial_prologue<false><<<1,1024,0,stream>>>(input,routes,route_weights,clear,clear_words,
+        request.shape.hidden,request.shape.top_k,request.shape.experts,codes,deltas,sums,status);
+    check(hipGetLastError(),"Q4K A8 serial prologue enqueue");
+    enqueue_projection(request,b,stream);
 }
 void enqueue_probe_shared_gate_up(const Request& request,const Bindings& b,hipStream_t stream) {
     validate(request,b);
