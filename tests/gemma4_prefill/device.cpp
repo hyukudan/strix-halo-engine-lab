@@ -1,5 +1,6 @@
 #include "gemma4/prefill/device.hpp"
 #include "gemma4/prefill/reference.hpp"
+#include "gemma4/kernels/ops.hpp"
 #include "../gemma4_gpu/fixture.hpp"
 #include <limits>
 #include <numeric>
@@ -176,6 +177,35 @@ void split_tests() {
 // PINNED_TAPS: pinned views (taps consumed, hidden rows) of a full and a
 // partial chunk are byte-equal to the vectors of views=false; taps=false
 // changes no logits, hidden row or committed KV.
+// A model with fewer layers than a tap index leaves that tap's columns at
+// zero on the pinned path too. The device tap buffer is poisoned first: freed
+// blocks of its exact size filled with NaN bytes are what the allocator hands
+// back, so a missing zero shows as NaN instead of passing on fresh memory.
+void pinned_absent_taps_tests() {
+    const auto model = fixture::tiny(6);
+    const std::size_t tap_bytes = std::size_t(pf::chunk_rows) * model.config.hidden * sizeof(float) * 5;
+    {
+        const std::vector<std::uint8_t> poison(tap_bytes, 0xff);
+        std::vector<gpu::Buffer> blocks;
+        for (unsigned i = 0; i < 8; ++i) { blocks.emplace_back(tap_bytes); blocks.back().upload(poison.data(), tap_bytes); }
+    }
+    fixture::Tables tables;
+    pf::DevicePrefill target(bind_host_weights(model), tables.view());
+    std::vector<unsigned> tokens(37);
+    for (unsigned r = 0; r < tokens.size(); ++r) tokens[r] = (r * 3 + 1) % model.config.vocab;
+    gpu::DeviceStream stream(model.config, 1024);
+    auto tx = stream.begin();
+    const auto out = target.forward(*tx, tokens, false, true, false, true, true);
+    const auto taps = out.tap_rows();
+    CHECK(taps.size() == tokens.size() * std::size_t(out.tap_width));
+    const auto hidden = model.config.hidden;
+    for (unsigned t = 0; t < 5; ++t) {
+        if (tap_layers[t] < model.config.layers) continue;
+        for (unsigned r = 0; r < tokens.size(); ++r)
+            for (unsigned i = 0; i < hidden; ++i) CHECK(taps[std::size_t(r) * out.tap_width + t * hidden + i] == 0.0F);
+    }
+    std::puts("prefill pinned taps zero absent tap layers PASS");
+}
 void pinned_views_tests() {
     const auto model = fixture::tiny(6);
     fixture::Tables tables;
@@ -305,5 +335,5 @@ void overflow_test() {
     std::puts("prefill FP16 overflow rollback PASS");
 }
 } // namespace
-int main() try { conversion_tests(); layout_tests(); tile_tests(); split_tests(); pinned_views_tests(); alias_tests(); c4_tests(); context_callback_tests(); overflow_test(); return 0; }
+int main() try { conversion_tests(); layout_tests(); tile_tests(); pinned_absent_taps_tests(); split_tests(); pinned_views_tests(); alias_tests(); c4_tests(); context_callback_tests(); overflow_test(); return 0; }
 catch (const std::exception& e) { std::cerr << e.what() << '\n'; return 1; }
