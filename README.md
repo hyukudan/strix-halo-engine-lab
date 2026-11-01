@@ -689,7 +689,9 @@ identity. None implies equality to a different identity or full-precision weight
 These outputs are checked token for token (or byte for byte) against a matching reference:
 
 - Qwen MTP speculative decoding equals serial greedy decode with the same numerical profile, bit for bit
-  (golden replay error 0 on every timed run; replicas 570/570 equal to one node).
+  (golden replay error 0 on every timed run; replicas 570/570 equal to one node). Sampled MTP decode is
+  distribution-exact (the same output distribution as sampled serial decode) but not serial-identical: with
+  the same seed its tokens can differ from those of a sampled serial run.
 - Qwen tiled prefill and teacher-forced scoring preserve their declared profile reference; the automatic
   fast FP16 prefill path is not dense-A8 serial bit equality.
 - DeepSeek on the pair: greedy and DSpark windows equal the stored references on both ranks; batch tokens and

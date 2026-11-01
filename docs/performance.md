@@ -8,7 +8,7 @@ says otherwise. The overnight snapshot states counts where recorded; unspecified
 Estimates and calculations are not listed as results.
 
 The README shows, per mode, the **best** measured result and a **typical** one. Additional measured builds
-are collected [below](#after-this-release-pre-release-builds), with build IDs. The overnight snapshot and README
+are collected [below](#additional-measured-builds), with build IDs. The overnight snapshot and README
 supersede older rows only for the named build and workload.
 
 Hardware names used below:
@@ -33,7 +33,7 @@ rows only for the named build and workload. Raw receipts and review corresponden
 | Qwen MTP decode, UD-Q4_K_XL, dense A8 | One node, code 1K / 8K, auto windows, 256 generated tokens; `702bc074`, 2026-10-25 | **59.59 / 54.00 tok/s**; 1K **69 %** of 86.8 tok/s byte ceiling | Recipe golden equal; prose 8K **49.58 tok/s** on `226bb691`, exact |
 | DeepSeek pipeline, expert-TP identity | RTX PRO + pair over 1 GbE, two groups; pair `6525d5e8`, CUDA `463c08ec` line | Batch N2/4/8 **60.1 / 97.5 / 137.2 tok/s**; DSpark N1/2/4 **52.4 / 91.3 / 156.8 tok/s** wall aggregate (2026-10-24); server C1/2/4/8 **43.2 / 65.8 / 77.9 / 91.7 tok/s** (2026-10-25) | Batch: 8 prompts × 48 tokens, bitwise gates; server: 8-category short set, 32/32 IDs equal pair-only |
 | MiniMax M3.1 Flash, EXL3 3.06 bpw | Two nodes TP2 over USB4, 1K / 8K greedy benchmark, 2026-10-26 | **44.57 / 46.10 ms/token**; fresh 8K prefill **17.731 s (462 tok/s)** | Exact archived-reference checks at 1K/8K; new defaults pending publication |
-| GLM-5.3 Flash, EXL3 4.05 bpw, R1 | Two nodes TP2 over USB4, chat decode / R8 batch / exact 8K prefill, 2026-10-26 | **45.29 ms/token (22.1 tok/s)**, **51 %** of 23.2 ms floor; batch **65.5 tok/s**; prefill **34.70 s (236 tok/s)** | R1 reference equal; latest integration `41d8cfdc`, pending publication |
+| GLM-5.3 Flash, EXL3 4.05 bpw, R1 | Two nodes TP2 over USB4, chat decode / R8 batch / exact 8K prefill, 2026-10-26 | **45.29 ms/token (22.1 tok/s)**, **51 %** of 23.2 ms floor; batch **122.0 ms/step = 65.5 tok/s** aggregate (calculated); prefill **34.70 s (236 tok/s)** | R1 reference equal; latest integration `41d8cfdc`, pending publication |
 
 Standalone RTX best runs across loads (2026-10-25): code **94–95**, English **97**, Spanish **100–101 tok/s**,
 **58–63 %** of the 6.18 ms all-hit ceiling. Loads vary by up to **~10 %**; compare within one load.
@@ -177,21 +177,21 @@ are byte-identical. Qualification is conditional on those eight texts; the older
 ### GLM latest measurements
 
 EXL3 4.05 bpw, two Strix Halo nodes TP2 over USB4. Production engine; newer builds below are
-**in development, pending publication**. R1 remains the default numerical identity.
+**in development, pending publication**. R1b is the default decode identity; `--identity r1` restores R1.
 
 | Mode | Prompt / context | Measured | Date | Build / exactness |
 |---|---|---:|---|---|
 | Greedy decode, R1 | 31-token chat prompt + 64 generated tokens | **45.29 ms/token = 22.1 tok/s**; **51 %** of calculated 23.2 ms floor | 2026-10-26 | `1836c99c`; tokens equal the reference |
-| Batch decode, R1 | Eight independent rows, benchmark context unspecified | **122.0 ms/step = 65.5 tok/s aggregate** | 2026-10-26 | `1836c99c`; tokens equal the earlier real-pair reference |
+| Batch decode, R1 | Eight independent rows, benchmark context unspecified | **122.0 ms/step** = 65.5 tok/s aggregate (calculated) | 2026-10-26 | `1836c99c`; tokens equal the earlier real-pair reference |
 | Exact chunked prefill | 1K / 8K / 32K benchmark prompts, kind unspecified | TTFT **4.268 / 34.70 / 144.75 s** (240 / 236 / 226 tok/s) | 2026-10-26 | `875ca821`, integrated in `41d8cfdc`; both ranks' logits bitwise equal the previous exact prefill |
-| R1b-fast, opt-in identity | Same chat benchmark, 96-token alternating comparison | **41.93–41.96 ms/token**, vs R1 47.33–47.48 (**−11.5 %**, **55 %** of 23.2 ms floor) | 2026-10-26 | `8877de1d`; stable within each identity, not bitwise to R1 |
+| R1b-fast, now the default decode identity | Same chat benchmark, 96-token alternating comparison | **41.93–41.96 ms/token**, vs R1 47.33–47.48 (**−11.5 %**, **55 %** of 23.2 ms floor) | 2026-10-26 | `8877de1d`; stable within each identity, not bitwise to R1 |
 | R1b teacher-forced agreement | 32 prompts, 256 positions each; chat, code, JSON, math, reasoning, translation | **8,126/8,192 = 99.19 %** top-1; mean KL **~1.8e-3 nats** | 2026-10-26 | `4dad4c19`; free runs diverge on **28/32** prompts within 19–227 tokens |
 
 The R≥3 buffer fix is verified on the real pair. The latest integration uses direct exchange for plain
 forwards and exact MoE v3 for prefill; the speculative oracle also passes with drained exchange switching.
 Prefill rows are single runs. They replace the earlier synthetic-only result.
 
-R1b changes FP32 summation order and remains opt-in; which identity is closer to float64 at full depth is
+R1b changes FP32 summation order and is the default decode identity (`--identity r1` restores R1); which identity is closer to float64 at full depth is
 unresolved. HIP graphs are **not implemented**: the latest profile (`41d8cfdc`) keeps the GPU busy **96.3 %** of each forward (was 80.8 %; 909 launches instead of 1,679) and leaves only **2.10 ms idle per forward**
 and a calculated recoverable gap of **≤1.8 ms** (a bound, not a measured speedup). Host progress across
 exchange boundaries requires segmented capture; device kernels and rank skew take priority.
