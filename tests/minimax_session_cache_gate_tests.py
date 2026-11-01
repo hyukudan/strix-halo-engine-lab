@@ -71,7 +71,9 @@ with tempfile.TemporaryDirectory(prefix='mm-gate-') as temp:
     assert not list(root.glob('*.pid'))
     assert run('normal',int(time.time())+5,'true').returncode==0
     assert (root/'normal.ended').read_text().strip()=='0'
-    assert run('timeout',int(time.time())+1,'sleep','60').returncode==124
+    # +3 s: the runner exits 124 without an .ended file when the deadline has already passed at launch (a 1 s margin
+    # raced under load); this case must reach the timeout path.
+    assert run('timeout',int(time.time())+3,'sleep','60').returncode==124
     assert (root/'timeout.ended').read_text().strip()=='124'
     # Cleanup must kill and verify a live process group, then close admission.
     process=subprocess.Popen(command(runner,path,'live',int(time.time())+60,'sleep','60'))
