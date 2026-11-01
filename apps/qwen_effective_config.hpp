@@ -1182,10 +1182,7 @@ inline EffectiveConfig resolve_effective_config(const RequestedOptions& request,
     auto& o = result.options;
     // A profile proposal may fall back to builtin storage. Explicit requests
     // retain the hard-refusal contract, including native CLI precedence.
-    const auto* route_row = o.product_profile.find("moe_route_bf16");
-    const bool profile_route = !o.prefill_moe_route_bf16_requested.has_value() && route_row &&
-        (route_row->status == qwen::profile::Status::set || route_row->status == qwen::profile::Status::unqualified ||
-         route_row->status == qwen::profile::Status::provisional);
+    const bool profile_route = moe_route_bf16_profile_owned(o);
     std::string route_error;
     resolve_moe_route_bf16(o, result.environment, result.gsq_owner, capabilities.fp16_operands, route_error);
     if (o.prefill_moe_route_bf16) {

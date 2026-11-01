@@ -248,8 +248,10 @@ inline EffectiveConfig resolve_yarn_config(const RequestedOptions& request,
                 auto validation = organization;
                 apply_numerical_profile(o, model, manifest, content, capabilities.a8_runtime, validation);
                 // Bind storage arithmetic before compiling the admission identities.
-                resolve_moe_route_bf16(o, result.environment, false, capabilities.fp16_operands, result.error);
-                if (!result.error.empty()) return refuse(result.error);
+                std::string route_error;
+                resolve_moe_route_bf16(o, result.environment, false, capabilities.fp16_operands, route_error);
+                // The outer resolver withdraws declined profile proposals after admission.
+                if (!route_error.empty() && !moe_route_bf16_profile_owned(o)) return refuse(route_error);
                 validate_effective_options(o,model);
                 result.admission = {{"ple_credit_verification_attempted",memory.verify_ple_credit?1U:0U},{"context_capacity",o.context_tokens},{"window_capacity_rows",rows},{"mtp_enabled",o.mtp.enabled?1U:0U},
                     {"parked_session_bytes",0},{"capture_bytes",0U},{"restore_peak_bytes",0},{"host_reserve_bytes",o.known_prefill_host_headroom},{"verified_ple_credit_bytes",credit},
