@@ -177,6 +177,12 @@ def list_engines(k):
     return rows
 
 
+def mismatch_record(text):
+    try: doc=json.loads(text)
+    except ValueError: return False
+    return isinstance(doc,dict) and doc.get('status')=='mismatch'
+
+
 def all_engines(args,k):
     json_mode='--json' in args; md_mode='--md' in args; records=[]; rc=0
     for row in list_engines(k):
@@ -191,6 +197,8 @@ def all_engines(args,k):
         sys.stderr.write(result.stderr)
         if result.returncode: rc=1
         if json_mode and result.returncode==0 and result.stdout.strip(): records.append(json.loads(result.stdout))
+        # A MISMATCH run exits 1 but still prints its full result document.
+        elif json_mode and result.returncode==1 and mismatch_record(result.stdout): records.append(json.loads(result.stdout))
         elif json_mode: records.append(dict(engine=row['engine'],returncode=result.returncode,dry_run='--dry-run' in args))
         elif not json_mode: print(result.stdout,end='')
     if json_mode: print(json.dumps(dict(schema_version=1,engines=records)))
