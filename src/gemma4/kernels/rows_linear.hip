@@ -138,6 +138,83 @@ __global__ void __launch_bounds__(256) rows_linear_kernel(LinearView w, LinearVi
         }
     }
 }
+// Shared decoded weights: a workgroup owns O consecutive outputs and 8 * RW
+// rows (RW per wave). Per 512-element K block, wave w decodes the lane-l chunk
+// of outputs w, w + 8, ... once into LDS as FP32 ([output][group][lane]
+// float4); every wave then applies them to its own RW rows, whose FP32 inputs
+// each lane reads straight from x (its own chunk). Lane l still owns chunks
+// l, l + 32, ... of K and adds their 16 elements in ascending order from +0 as
+// RN(acc + RN(w * x)); wave_sum combines the 32 lane values. Same bytes as
+// rows_linear_kernel; only who decodes a weight and how often changes.
+template <WeightFormat Format, unsigned O, unsigned RW>
+__global__ void __launch_bounds__(256) shared_rows_kernel(LinearView w, const float* x, unsigned rows, float* out,
+                                                          unsigned* failure, bool hardware_half) {
+    static_assert(O % tile_waves == 0U);
+    __shared__ float4 weights[O * 4U * 32U];
+    const unsigned lane = threadIdx.x % 32U, wave = threadIdx.x / 32U;
+    const unsigned first = blockIdx.y * O, row0 = (blockIdx.x * tile_waves + wave) * RW;
+    const unsigned chunks = w.inputs / 16U, blocks = (chunks + 31U) / 32U;
+    constexpr unsigned per_wave = O / tile_waves;
+    const std::uint8_t* wp[per_wave];
+#pragma unroll
+    for (unsigned j = 0; j < per_wave; ++j)
+        wp[j] = w.data + std::size_t(min(first + wave + j * tile_waves, w.outputs - 1U)) * w.row_bytes;
+    const float* xr[RW];
+#pragma unroll
+    for (unsigned r = 0; r < RW; ++r)
+        xr[r] = x + std::size_t(min(row0 + r, rows - 1U)) * w.inputs;
+    float acc[O][RW] = {};
+    for (unsigned b = 0; b < blocks; ++b) {
+        const unsigned c = b * 32U + lane;
+        const bool active = c < chunks;
+        __syncthreads();
+        if (active) {
+#pragma unroll
+            for (unsigned j = 0; j < per_wave; ++j) {
+                const WeightChunk<Format> a(wp[j], c * 16U, true, hardware_half);
+                const unsigned o = wave + j * tile_waves;
+#pragma unroll
+                for (unsigned g = 0; g < 4U; ++g)
+                    weights[(o * 4U + g) * 32U + lane] =
+                        make_float4(decoded<Format, true>(a, g * 4U), decoded<Format, true>(a, g * 4U + 1U),
+                                    decoded<Format, true>(a, g * 4U + 2U), decoded<Format, true>(a, g * 4U + 3U));
+            }
+        }
+        __syncthreads();
+        if (active) {
+#pragma unroll
+            for (unsigned g = 0; g < 4U; ++g) {
+                float4 in[RW];
+#pragma unroll
+                for (unsigned r = 0; r < RW; ++r)
+                    in[r] = *reinterpret_cast<const float4*>(xr[r] + c * 16U + g * 4U);
+#pragma unroll
+                for (unsigned o = 0; o < O; ++o) {
+                    const float4 wv = weights[(o * 4U + g) * 32U + lane];
+#pragma unroll
+                    for (unsigned r = 0; r < RW; ++r) {
+                        acc[o][r] = acc[o][r] + wv.x * in[r].x;
+                        acc[o][r] = acc[o][r] + wv.y * in[r].y;
+                        acc[o][r] = acc[o][r] + wv.z * in[r].z;
+                        acc[o][r] = acc[o][r] + wv.w * in[r].w;
+                    }
+                }
+            }
+        }
+    }
+#pragma unroll
+    for (unsigned o = 0; o < O; ++o) {
+#pragma unroll
+        for (unsigned r = 0; r < RW; ++r) {
+            const float sa = wave_sum(acc[o][r]);
+            if (lane == 0 && first + o < w.outputs && row0 + r < rows) {
+                out[std::size_t(row0 + r) * w.outputs + first + o] = sa;
+                if (failure)
+                    finite_flag(sa, failure);
+            }
+        }
+    }
+}
 bool hardware_half() {
     static const bool enabled = [] {
         const auto* p = std::getenv("STRIX_G4_HARDWARE_HALF");
@@ -160,13 +237,16 @@ int default_variant(WeightFormat format, unsigned outputs, unsigned rows) {
     }();
     if (forced >= 0)
         return forced;
+    // SHARED_Q6 (with DECODE24): the wide Q6_K linear decodes each weight once
+    // per workgroup into LDS and applies it to 32 rows (16 outputs x 4 rows per
+    // wave); it won in both bench passes there and lost on every Q4_K shape.
     // DECODE24: the same tiles with 24-bit integer scale products in the
     // Q4_K decoder (every Q4_K tile) and the wide Q6_K tile; both won in
     // forward and reverse bench passes. Narrow Q6_K keeps 2x32x2.
     const bool m24 = decode24();
     if (rows >= 256U && outputs > 512U && rows_tile_v2()) {
         if (format == WeightFormat::q6_k)
-            return m24 ? 15 : 8;
+            return m24 ? (shared_q6() ? 17 : 15) : 8;
         if (format == WeightFormat::q4_k)
             return m24 ? 14 : 9;
         if (format == WeightFormat::bf16)
@@ -185,6 +265,12 @@ void launch(LinearView w, LinearView up, const float* x, unsigned rows, float* o
 // Variants (outputs per wave, rows, groups per barrier): 4x16x4, 4x32x2, 8x16x4,
 // 2x32x2, 4x16x2, 4x16x1, 4x8x4, 8x8x2; two-tile stages 4x32x1, 4x16x2, 2x32x1;
 // register-tiled 2x64x1. Gate kernels hold two accumulator sets with half the outputs per wave.
+template <WeightFormat Format, unsigned O, unsigned RW>
+void launch_shared(LinearView w, const float* x, unsigned rows, float* out, Queue q, unsigned* failure) {
+    const dim3 grid((rows + tile_waves * RW - 1U) / (tile_waves * RW), (w.outputs + O - 1U) / O);
+    hipLaunchKernelGGL((shared_rows_kernel<Format, O, RW>), grid, dim3(256), 0, static_cast<hipStream_t>(q), w, x, rows,
+                       out, failure, hardware_half());
+}
 template <WeightFormat Format, bool Gate>
 void launch_variant(int variant, LinearView w, LinearView up, const float* x, unsigned rows, float* out, Queue q,
                     unsigned* failure) {
@@ -205,6 +291,19 @@ void launch_variant(int variant, LinearView w, LinearView up, const float* x, un
     case 13: launch<Format, Gate, Gate ? 1U : 2U, 32U, 2U, 1U, true>(w, up, x, rows, out, q, failure); break;
     case 14: launch<Format, Gate, Gate ? 2U : 4U, 16U, 2U, 2U, true>(w, up, x, rows, out, q, failure); break;
     case 15: launch<Format, Gate, Gate ? 2U : 4U, 32U, 1U, 2U, true>(w, up, x, rows, out, q, failure); break;
+    // Shared decoded weights (outputs x rows per wave): 8x8, 16x4, 32x2. The fused
+    // gate/up tile has no shared form; it keeps 4x16x2 with two tiles and 24-bit decode.
+    case 16: case 17: case 18:
+        if constexpr (Gate) {
+            launch<Format, Gate, 2U, 16U, 2U, 2U, true>(w, up, x, rows, out, q, failure);
+        } else if (variant == 16) {
+            launch_shared<Format, 8U, 8U>(w, x, rows, out, q, failure);
+        } else if (variant == 17) {
+            launch_shared<Format, 16U, 4U>(w, x, rows, out, q, failure);
+        } else {
+            launch_shared<Format, 32U, 2U>(w, x, rows, out, q, failure);
+        }
+        break;
     default: launch<Format, Gate, Gate ? 2U : 4U, 16U, 4U>(w, up, x, rows, out, q, failure); break;
     }
 }
@@ -230,6 +329,10 @@ bool many_rows(LinearView w, LinearView up, const float* x, unsigned rows, float
     return true;
 }
 } // namespace
+bool shared_q6() {
+    const auto* p = std::getenv("STRIX_G4_PREFILL_SHARED_Q6");
+    return !p || std::string_view(p) != "0";
+}
 bool decode24() {
     const auto* p = std::getenv("STRIX_G4_PREFILL_DECODE24");
     return !p || std::string_view(p) != "0";

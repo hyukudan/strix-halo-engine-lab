@@ -4,6 +4,7 @@
 #include "gemma4/kernels/internal.hpp"
 #include "fixture.hpp"
 #include <chrono>
+#include <cstdlib>
 #include <iomanip>
 #include <string_view>
 
@@ -142,6 +143,11 @@ void tests(bool full) {
     compare(g, &u, 100, 4242);
 }
 // Production geometry, synthetic bytes. Diagnostic only, not a ctest.
+// probe != nullptr: run only that shape, at probe_rows rows, variant probe_variant
+// (gate shapes: split schedule), ten times, for hardware counter collection.
+const char* probe = nullptr;
+unsigned probe_rows = 512;
+int probe_variant = -1;
 void bench() {
     struct Shape {
         const char* name;
@@ -159,7 +165,25 @@ void bench() {
                             {"q4_ple_projection", WeightFormat::q4_k, 2560, 256, false},
                             {"bf16_ple_model", WeightFormat::bf16, 10752, 2560, false}};
     for (const auto& s : shapes) {
+        if (probe && std::string_view(probe) != s.name)
+            continue;
         const Matrix w(s.format, s.outputs, s.inputs, 3), up(s.format, s.outputs, s.inputs, 4);
+        if (probe) {
+            const auto x = inputs(std::size_t(probe_rows) * s.inputs, 5);
+            auto dx = device(x);
+            Buffer out(std::size_t(probe_rows) * s.outputs * sizeof(float));
+            Buffer scratch(s.gate ? std::size_t(probe_rows) * s.outputs * sizeof(float) : 0);
+            for (unsigned r = 0; r < 10U; ++r) {
+                if (s.gate)
+                    gate_up_rows(w.view, up.view, dx.as<float>(), probe_rows, out.as<float>(), nullptr, nullptr, true,
+                                 probe_variant, scratch.as<float>(), 1);
+                else
+                    linear_rows(w.view, dx.as<float>(), probe_rows, out.as<float>(), nullptr, nullptr, true, probe_variant);
+            }
+            synchronize();
+            std::cout << "{\"probe\":\"" << s.name << "\",\"rows\":" << probe_rows << ",\"variant\":" << probe_variant << "}\n";
+            continue;
+        }
         for (unsigned rows : {64U, 512U}) {
             const auto x = inputs(std::size_t(rows) * s.inputs, 5);
             auto dx = device(x);
@@ -204,6 +228,13 @@ int main(int argc, char** argv) {
     try {
         require_device();
         if (argc == 2 && std::string_view(argv[1]) == "bench") {
+            bench();
+            return 0;
+        }
+        if (argc == 5 && std::string_view(argv[1]) == "probe") {
+            probe = argv[2];
+            probe_rows = unsigned(std::atoi(argv[3]));
+            probe_variant = std::atoi(argv[4]);
             bench();
             return 0;
         }
