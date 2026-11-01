@@ -1,10 +1,17 @@
+#include "gemma4/engine/api.hpp"
 #include "gemma4/engine/runtime.hpp"
 #include <iostream>
+#include <string_view>
 
 int main(int argc, char** argv) {
     namespace e = strix::gemma4::engine;
     try {
-        const auto options = e::parse_options(argc,argv);
+        auto options = e::parse_options(argc,argv);
+        // Up to serve_slots() requests decode together: session-fixed choices (the EXL3 core identity) see that
+        // stream count unless --streams sets it.
+        bool streams_given = false;
+        for (int i = 1; i < argc; ++i) streams_given |= std::string_view(argv[i]) == "--streams";
+        if (!streams_given) options.streams = std::uint32_t(e::serve_slots());
         if (options.help) {
             std::cout << "strix-gemma4-serve MODEL --rope-tables TABLE_DIR --tokenizer tokenizer.json [--bind 127.0.0.1 --port 8080] [--dflash on|off|auto] [--draft-mtp DIR | --draft DRAFT.gguf --draft-rope TABLE.g4dr | --draft-eagle FILE] [--threads 1..16]\n"
                 "drafters: --draft-mtp DIR (Gemma-4-E4B-it MTP assistant: a drafter-mtp/ package or a model dir containing one; recommended),\n"

@@ -39,6 +39,13 @@ constexpr Lever table[] = {
      .required = {false, false, false}, .ready = {true, true, true}, .runnable = {true, true, true},
      .kind = Kind::exact, .apps = engine, .off = "0",
      .source = "prompt-lookup drafting, ids == OFF; beside the MTP drafter equal, without a drafter agent 48.2 -> 114.9 tok/s"},
+    // HTTP serve: up to eight chat requests share one coordinator and decode together; each request's ids equal the
+    // request served alone. STRIX_G4_SERVE_BATCH=0 serves one chat job at a time.
+    {.name = "serve_batch", .env = "STRIX_G4_SERVE_BATCH", .value = {"continuous", "continuous", "continuous"},
+     .builtin = "continuous", .required = {false, false, false}, .ready = {true, true, true}, .runnable = {true, true, true},
+     .kind = Kind::exact, .apps = engine, .off = "0",
+     .source = "continuous batching in serve: concurrent requests == each alone (greedy, seeded sampling, thinking "
+               "budget, streaming) on g4-v1, g4-a8-v1 and g4-exl3-v3"},
     {.name = "exl3_route", .option = "--exl3-arm", .value = {"", "", "pack"}, .builtin = "off",
      .required = {false, false, true}, .ready = {true, true, true}, .runnable = {true, true, true}, .kind = Kind::pack,
      .apps = all_apps, .asset = true, .source = "EXL3 pack route (--exl3-arm)"},

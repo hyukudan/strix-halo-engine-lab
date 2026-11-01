@@ -19,6 +19,9 @@ private:
     struct Impl;
     std::unique_ptr<Impl> impl_;
 };
+// Chat jobs that decode together in serve: STRIX_G4_SERVE_SLOTS (1..8, default 8), or 1 with
+// STRIX_G4_SERVE_BATCH=0 (one chat job at a time).
+[[nodiscard]] std::size_t serve_slots();
 ChatRequest parse_chat_request(const strix::serve::Json& json, DraftMode default_mode = DraftMode::automatic,
     const Request& defaults = {});
 

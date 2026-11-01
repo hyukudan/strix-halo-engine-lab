@@ -214,6 +214,9 @@ public:
     void cancel(std::size_t slot);
     // At most one forward_rows call, with <=8 total causal/independent rows.
     bool step();
+    // At most `streams` many-row prefill chunks per step, round-robin across slots (0 = every eligible stream,
+    // the default). Decoding streams still step every call; outputs are unchanged.
+    void set_prefill_limit(std::size_t streams) { prefill_limit_ = streams; }
     void run();
     [[nodiscard]] const Result& result(std::size_t slot) const;
     [[nodiscard]] strix::serve::Json receipt(std::size_t slot) const;
@@ -226,6 +229,7 @@ private:
     ConfidenceConfig confidence_ = ConfidenceConfig::from_environment();
     std::vector<std::unique_ptr<Slot>> slots_;
     std::uint64_t generation_ = 0, steps_ = 0;
+    std::size_t prefill_limit_ = 0, prefill_cursor_ = 0;
 };
 
 } // namespace strix::gemma4::engine
