@@ -17,6 +17,10 @@ k = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(k)
 
 
+# What finalize records for the fixture's code/plain measurement (asserted in test_pairs_ignore_optional_exactness).
+WORKLOAD = {'prompts': [{'id': 'code', 'sha256': k.id_hash([1, 2, 3]), 'tokens': 3}], 'generate_length': 2}
+
+
 class KitTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -477,6 +481,240 @@ class KitTests(unittest.TestCase):
         k.dump(self.out / 'b.json', data)
         with self.assertRaisesRegex(ValueError, 'repo_commit'):
             k.main(['compare', str(self.out / 'a.json'), str(self.out / 'b.json')])
+
+
+    def protocol_run(self, env=None, requests=None):
+        fixture = k.read(HERE / 'fixtures/results.json')
+        identity = copy.deepcopy(fixture)
+        for key in ('measurements', 'exactness', 'prompts'):
+            identity.pop(key)
+        k.dump(self.out / 'identity.json', identity)
+        k.dump(self.out / 'prompts.json', fixture['prompts'])
+        sample = {'prompt_id': 'code', 'mode': 'plain', 'generate_length': 2, 'actual_tokens': 2,
+                  'token_ids_sha256': k.id_hash([1, 2]), 'engine_digest': None,
+                  'values': [40], 'unit': 'tok/s', 'log': 'fixture.log'}
+        (self.out / 'samples.jsonl').write_text(json.dumps(sample) + '\n', encoding='utf-8')
+        if requests is not None:
+            k.dump(self.out / 'http-c1.json', {'concurrency': 1, 'max_tokens': 2, 'requests': [requests]})
+        with patch.dict(k.os.environ, env or {}):
+            rc = k.main(['finalize', str(self.out), '0'])
+        return rc, k.read(self.out / 'results.json')
+
+    def test_http_engine_counts_and_cache_state(self):
+        (self.out / 'server.log').write_text('{"event":"READY"}\n', encoding='ascii')
+        for prompt in ('chat', 'code', 'prose'):
+            (self.out / (prompt + '.ids')).write_text('1,2,3\n', encoding='ascii')
+        class Response:
+            status = 200
+            def __enter__(self):
+                return self
+            def __exit__(self, *args):
+                pass
+            def __iter__(self):
+                yield b'data: {"choices":[{"text":"x"}]}\n'
+                yield (b'data: {"usage":{"prompt_tokens":3,"completion_tokens":2,"prompt_tokens_details":{"cached_tokens":2}},'
+                       b'"strix":{"token_ids":[4,5],"queue_ms":1.0,"prefill_ms":9.0,"decode_ms":50.0}}\n')
+                yield b'data: [DONE]\n'
+        with patch.object(k.urllib.request, 'urlopen', return_value=Response()), \
+             patch.dict(k.os.environ, {'BENCH_REPEATS': '1', 'BENCH_CONCURRENCY': '1'}):
+            k.http(self.out, 18880)
+        request = k.read(self.out / 'http-c1.json')['requests'][0][0]
+        self.assertEqual((request['completion_tokens'], request['client_token_count'], request['cached_tokens']), (2, 2, 2))
+        self.assertEqual(request['engine_decode_ms'], 50.0)
+        rows = {r['mode']: r for r in k.read(self.out / 'http-measurements.json')}
+        self.assertEqual(set(rows), {'aggregate-wall', 'ttft', 'engine-decode', 'engine-ttft'})
+        self.assertEqual(rows['engine-decode']['median'], 40.0)
+        self.assertAlmostEqual(rows['engine-ttft']['median'], 0.010)
+        self.assertEqual(rows['engine-decode']['rate_source'], 'engine')
+        self.assertEqual(rows['aggregate-wall']['rate_source'], 'client-clock')
+        self.assertEqual({r['cache_state'] for r in rows.values()}, {'reused'})
+        self.assertEqual(rows['aggregate-wall']['workload'],
+                         {'prompts': [dict(id=p, sha256=k.id_hash([1, 2, 3]), tokens=3) for p in ('chat', 'code', 'prose')],
+                          'generate_length': 128})
+
+    def test_cache_policy_flag_refuse_declared(self):
+        reused = [dict(request=0, cached_tokens=64), dict(request=1, cached_tokens=0)]
+        rc, d = self.protocol_run(requests=reused)
+        self.assertEqual((rc, d['status']), (0, 'complete'))
+        policy = d['cache_policy']
+        self.assertEqual((policy['states'], policy['nonconforming'], policy['refused']), ({'http-c1': 'reused'}, True, False))
+        self.assertIn('NONCONFORMING', (self.out / 'results.md').read_text())
+        rc, d = self.protocol_run({'BENCH_CACHE_POLICY': 'refuse'}, reused)
+        self.assertEqual((rc, d['status'], d['cache_policy']['refused']), (1, 'failed', True))
+        rc, d = self.protocol_run({'BENCH_CACHE_POLICY': 'refuse', 'BENCH_ALLOWED_CACHED_TOKENS': '64'}, reused)
+        self.assertEqual((rc, d['cache_policy']['nonconforming']), (0, False))
+        rc, d = self.protocol_run({'BENCH_CACHE_POLICY': 'refuse', 'BENCH_DECLARED_CACHE_REUSE': '1'}, reused)
+        self.assertEqual((rc, d['cache_policy']['nonconforming'], d['cache_policy']['declared_reuse']), (0, False, True))
+        rc, d = self.protocol_run(requests=[dict(request=0, cached_tokens=0)])
+        self.assertEqual(d['cache_policy']['states'], {'http-c1': 'cold'})
+        # A refused run cannot write reference candidates.
+        with patch.dict(k.os.environ, {'BENCH_CACHE_POLICY': 'refuse'}), self.assertRaisesRegex(ValueError, 'cannot write'):
+            k.dump(self.out / 'http-c1.json', {'concurrency': 1, 'requests': [reused]})
+            k.finalize(self.out, True)
+
+    def test_not_run_list(self):
+        rc, d = self.protocol_run()
+        self.assertEqual((rc, d['not_run']), (0, []))
+        self.assertNotIn('cache_policy', d)
+        k.main(['not-run', str(self.out), 'decode-32768', 'out of memory budget'])
+        (self.out / 'skipped.json').write_text(json.dumps(['serve: no peer']), encoding='utf-8')
+        rc, d = self.protocol_run(requests=[dict(request=0, completion_tokens=1)])
+        items = {x['item']: x['reason'] for x in d['not_run']}
+        self.assertEqual(items['decode-32768'], 'out of memory budget')
+        self.assertEqual(items['skipped'], 'serve: no peer')
+        self.assertIn('no strix engine_decode_ms', items['http-c1 engine-decode'])
+        self.assertIn('cached_tokens absent', items['http-c1 cache state'])
+        self.assertEqual(d['cache_policy']['states'], {'http-c1': 'unverified'})
+        self.assertIn('Not run: decode-32768', (self.out / 'results.md').read_text())
+        # Engine rows present in http-measurements.json are not listed as not run.
+        k.dump(self.out / 'http-measurements.json', [dict(prompt_id='http-c1', mode='engine-decode', unit='tok/s', **k.stats([40])),
+                                                      dict(prompt_id='http-c1', mode='engine-ttft', unit='s', **k.stats([0.01]))])
+        rc, d = self.protocol_run(requests=[dict(request=0, completion_tokens=1)])
+        self.assertNotIn('http-c1 engine-decode', {x['item'] for x in d['not_run']})
+        d['not_run'].append({'item': 'x'})
+        with self.assertRaisesRegex(ValueError, 'not_run'):
+            k.validate(d)
+        # Legacy receipts without the protocol fields still validate.
+        k.validate(k.read(HERE / 'fixtures/results.json'))
+
+    def test_abba_k_of_n_pairs(self):
+        seq = [('A', 40), ('B', 44), ('B', 42), ('A', 40), ('A', 41), ('B', 40), ('B', 43), ('A', 40)]
+        r = k.abba_pairs(seq)
+        self.assertEqual((r['n_pairs'], r['ab_pairs'], r['ba_pairs']), (4, 2, 2))
+        self.assertEqual((r['b_better_pairs'], r['a_better_pairs'], r['k_of_n'], r['sign_agreement']), (3, 1, '3/4', '3/4'))
+        self.assertAlmostEqual(r['deltas'][0], 0.1)
+        lower = k.abba_pairs([('A', 2.0), ('B', 1.0)], higher_is_better=False)
+        self.assertEqual(lower['k_of_n'], '1/1')
+        with self.assertRaisesRegex(ValueError, 'even'):
+            k.abba_pairs([('A', 1)])
+        with self.assertRaisesRegex(ValueError, 'one A and one B'):
+            k.abba_pairs([('A', 1), ('A', 2)])
+        fixture = k.read(HERE / 'fixtures/results.json')
+        paths = []
+        for i, (arm, value) in enumerate(seq[:4]):
+            d = copy.deepcopy(fixture)
+            d['measurements'] = [dict(d['measurements'][0], workload=copy.deepcopy(WORKLOAD), **k.stats([value]))]
+            paths.append(f'{arm}={self.out}/r{i}.json')
+            k.dump(self.out / f'r{i}.json', d)
+        import contextlib, io
+        with contextlib.redirect_stdout(io.StringIO()):
+            k.main(['pairs', str(self.out / 'pairs.json'), *paths])
+        result = k.read(self.out / 'pairs.json')
+        self.assertEqual(result['arms'], ['A', 'B', 'B', 'A'])
+        self.assertEqual(result['pairs'][0]['k_of_n'], '2/2')
+        d = k.read(self.out / 'r1.json')
+        d['cache_policy'] = {'nonconforming': True}
+        k.dump(self.out / 'r1.json', d)
+        with self.assertRaisesRegex(ValueError, 'cache-nonconforming'):
+            k.pairs([tuple(p.split('=', 1)) for p in paths])
+        d['reference_key'] = dict(d['reference_key'], prompt_set_sha256='0' * 64)
+        k.dump(self.out / 'r1.json', d)
+        with self.assertRaisesRegex(ValueError, 'differ'):
+            k.pairs([tuple(p.split('=', 1)) for p in paths])
+
+    def test_report_shows_readme_abba_pairs(self):
+        k.dump(self.out / 'results.json', k.read(HERE / 'fixtures/results.json'))
+        row = dict(value=40, unit='tok/s', tolerance=0.1, workload_match=True, pairs_faster=5, pairs=6)
+        with patch.object(k, 'baseline', return_value=row):
+            k.report(self.out / 'results.json')
+        self.assertIn('(ABBA 5/6)', (self.out / 'results.md').read_text())
+
+    def test_dispatch_census_attaches_to_receipt(self):
+        k.dump(self.out / 'results.json', k.read(HERE / 'fixtures/results.json'))
+        trace = k.ROOT / 'tests/data/dispatch_census/kernel_trace.csv'
+        k.main(['census', str(self.out), str(trace), '--window-kernel', 'marker_kernel', '--tokens', '5'])
+        d = k.read(self.out / 'results.json')
+        self.assertEqual(d['dispatch_census']['per_token']['launches'], 1.0)
+        self.assertEqual(d['dispatch_census']['source']['trace'], 'kernel_trace.csv')
+        self.assertIn('Dispatch census: 8 dispatches', (self.out / 'results.md').read_text())
+        # A later finalize keeps the attached census.
+        rc, d = self.protocol_run()
+        self.assertEqual(d['dispatch_census']['windows']['count'], 2)
+
+
+    def arm_files(self, change=None):
+        """Four ABBA arm receipts from the fixture; change(index, results) edits one before writing."""
+        fixture = k.read(HERE / 'fixtures/results.json')
+        fixture['params'] = dict(gen_tokens=2, contexts=[1024], concurrency=[1], prompts='kit', serve=False)
+        arms = []
+        for i, (arm, value) in enumerate([('A', 40), ('B', 44), ('B', 42), ('A', 40)]):
+            d = copy.deepcopy(fixture)
+            d['measurements'] = [dict(d['measurements'][0], workload=copy.deepcopy(WORKLOAD), **k.stats([value]))]
+            if change: change(i, d)
+            k.dump(self.out / f'arm{i}.json', d)
+            arms.append((arm, self.out / f'arm{i}.json'))
+        return arms
+
+    def test_pairs_require_identical_cache_state(self):
+        # Sol finding 2: a cold arm against a declared-reuse arm is refused, even when reuse is declared.
+        self.assertEqual(k.pairs(self.arm_files())['pairs'][0]['k_of_n'], '2/2')
+        def reused(i, d):
+            if i == 1:
+                d['measurements'][0].update(cache_state='reused', cached_tokens_max=64)
+                d['cache_policy'] = {'nonconforming': False, 'declared_reuse': True}
+        with patch.dict(k.os.environ, {'BENCH_DECLARED_CACHE_REUSE': '1'}), self.assertRaisesRegex(ValueError, 'cache state differs'):
+            k.pairs(self.arm_files(reused))
+        def all_reused(i, d):
+            d['measurements'][0].update(cache_state='reused', cached_tokens_max=64)
+        self.assertEqual(k.pairs(self.arm_files(all_reused))['pairs'][0]['cache_state'], 'reused')
+
+    def test_pairs_require_equal_workload(self):
+        # Sol finding 3: generation length, prompt identity and capacity parameters must match.
+        def longer(i, d):
+            if i == 2: d['params']['gen_tokens'] = 256
+        with self.assertRaisesRegex(ValueError, 'workload'):
+            k.pairs(self.arm_files(longer))
+        def slots(i, d):
+            if i == 2: d['params']['http_slots'] = 8
+        with self.assertRaisesRegex(ValueError, 'workload'):
+            k.pairs(self.arm_files(slots))
+        def prompt(i, d):
+            if i == 1: d['measurements'][0]['workload']['prompts'][0]['sha256'] = 'b' * 64
+        with self.assertRaisesRegex(ValueError, 'prompt identity or generation length'):
+            k.pairs(self.arm_files(prompt))
+        def length(i, d):
+            if i == 3: d['measurements'][0]['workload']['generate_length'] = 256
+        with self.assertRaisesRegex(ValueError, 'prompt identity or generation length'):
+            k.pairs(self.arm_files(length))
+
+    def test_pairs_http_rows_compare_constituent_prompts(self):
+        # Sol r2 finding 1: a synthetic http-cN row is compared through its constituent prompts and generation length.
+        def http(i, d):
+            d['measurements'][0].update(prompt_id='http-c1', mode='aggregate-wall', cache_state='cold', cached_tokens_max=0,
+                                        workload={'prompts': [dict(id='chat', sha256='a' * 64, tokens=3),
+                                                              dict(id='code', sha256='c' * 64, tokens=3)],
+                                                  'generate_length': 128})
+        self.assertEqual(k.pairs(self.arm_files(http))['pairs'][0]['prompt_id'], 'http-c1')
+        def changed(i, d):
+            http(i, d)
+            if i == 2: d['measurements'][0]['workload']['prompts'][1]['sha256'] = 'd' * 64
+        with self.assertRaisesRegex(ValueError, 'http-c1/aggregate-wall: prompt identity or generation length'):
+            k.pairs(self.arm_files(changed))
+        def gen(i, d):
+            http(i, d)
+            if i == 1: d['measurements'][0]['workload']['generate_length'] = 256
+        with self.assertRaisesRegex(ValueError, 'prompt identity or generation length'):
+            k.pairs(self.arm_files(gen))
+
+    def test_pairs_ignore_optional_exactness(self):
+        # Sol r2 finding 2: --only decode (no exactness rows) pairs with --only decode,exactness.
+        rc, d = self.protocol_run()
+        self.assertEqual(d['measurements'][0]['workload'], WORKLOAD)
+        def no_exactness(i, d):
+            if i in (1, 2): d['exactness'] = []
+        self.assertEqual(k.pairs(self.arm_files(no_exactness))['pairs'][0]['k_of_n'], '2/2')
+
+    def test_pairs_validate_and_reject_failed_arms(self):
+        # Sol finding 4: every receipt is validated and failed/mismatch arms are refused.
+        for status in ('mismatch', 'failed'):
+            def bad(i, d, status=status):
+                if i == 2: d['status'] = status
+            with self.assertRaisesRegex(ValueError, 'status ' + status):
+                k.pairs(self.arm_files(bad))
+        def invalid(i, d):
+            if i == 0: d['measurements'][0]['median'] = 99
+        with self.assertRaisesRegex(ValueError, 'summary differs'):
+            k.pairs(self.arm_files(invalid))
 
 
 if __name__ == '__main__':

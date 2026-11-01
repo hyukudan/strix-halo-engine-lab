@@ -1,0 +1,20 @@
+{"rocprofiler-sdk-tool": [{
+  "metadata": {"pid": 1},
+  "kernel_symbols": [
+    {"kernel_id": 10, "kernel_name": "init_kernel(int)", "formatted_kernel_name": "init_kernel(int)"},
+    {"kernel_id": 11, "kernel_name": "marker_kernel()", "formatted_kernel_name": "marker_kernel()"},
+    {"kernel_id": 12, "kernel_name": "void kA<2>(float*, int)", "formatted_kernel_name": "void kA<2>(float*, int)"},
+    {"kernel_id": 13, "kernel_name": "kB(float const*)", "formatted_kernel_name": "kB(float const*)"},
+    {"kernel_id": 14, "kernel_name": "kC", "formatted_kernel_name": "kC"}
+  ],
+  "buffer_records": {"kernel_dispatch": [
+    {"thread_id": 100, "correlation_id": {"internal": 1, "external": 0}, "start_timestamp": 0, "end_timestamp": 1000, "dispatch_info": {"kernel_id": 10, "dispatch_id": 1}},
+    {"thread_id": 100, "correlation_id": {"internal": 2, "external": 0}, "start_timestamp": 10000, "end_timestamp": 10100, "dispatch_info": {"kernel_id": 11, "dispatch_id": 2}},
+    {"thread_id": 100, "correlation_id": {"internal": 3, "external": 0}, "start_timestamp": 10200, "end_timestamp": 12200, "dispatch_info": {"kernel_id": 12, "dispatch_id": 3}},
+    {"thread_id": 100, "correlation_id": {"internal": 4, "external": 0}, "start_timestamp": 12300, "end_timestamp": 13300, "dispatch_info": {"kernel_id": 13, "dispatch_id": 4}},
+    {"thread_id": 100, "correlation_id": {"internal": 5, "external": 0}, "start_timestamp": 13000, "end_timestamp": 14000, "dispatch_info": {"kernel_id": 12, "dispatch_id": 5}},
+    {"thread_id": 100, "correlation_id": {"internal": 6, "external": 0}, "start_timestamp": 20000, "end_timestamp": 20100, "dispatch_info": {"kernel_id": 11, "dispatch_id": 6}},
+    {"thread_id": 100, "correlation_id": {"internal": 7, "external": 0}, "start_timestamp": 20500, "end_timestamp": 22500, "dispatch_info": {"kernel_id": 12, "dispatch_id": 7}},
+    {"thread_id": 100, "correlation_id": {"internal": 8, "external": 0}, "start_timestamp": 23000, "end_timestamp": 23500, "dispatch_info": {"kernel_id": 14, "dispatch_id": 8}}
+  ]}
+}]}
