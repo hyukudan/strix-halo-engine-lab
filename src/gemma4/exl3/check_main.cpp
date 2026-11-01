@@ -56,7 +56,7 @@ Args arguments(int argc, char** argv) {
     }
     if (a.model.empty() || a.rope.empty() || !a.steps || !a.limit || a.steps > 1024 ||
         (a.mode != "gate" && a.mode != "speed" && a.mode != "speed-all" && a.mode != "quality" && a.mode != "quality-decode" &&
-         a.mode != "quality-exact")) throw std::invalid_argument("invalid check arguments");
+         a.mode != "quality-exact" && a.mode != "parity")) throw std::invalid_argument("invalid check arguments");
     return a;
 }
 void print(Json value) { std::cout << value.dump() << std::endl; }
@@ -318,6 +318,78 @@ void quality(const g4::HostWeights& w, g4::RopeTables rope, const Args& args, bo
     }
 }
 }
+// Paired parity of the two EXL3 prompt routes on the same teacher tokens:
+// REF = the engine's exact prefill (many-row linears), candidate = g4-exl3-wmma-pf-v1.
+// Per parent: top-1 disagreement, full-vocabulary KL(REF || candidate) per row and
+// next-token NLL of both (teacher ids only; any number of parents).
+void parity(const g4::HostWeights& w, g4::RopeTables rope, const Args& args) {
+    if (args.teacher.empty()) throw std::invalid_argument("parity requires a teacher directory");
+    using g4::model_detail::require;
+    const auto manifest = g4::read_json(args.teacher / "manifest.json");
+    g4::prefill::DevicePrefill ref(w, rope, g4::prefill::Residency::host, false, g4::prefill::AttentionMode::canonical,
+                                   g4::prefill::Linears::exact);
+    g4::prefill::DevicePrefill candidate(w, rope, g4::prefill::Residency::host, false, g4::prefill::AttentionMode::canonical,
+                                         g4::prefill::Linears::wmma);
+    std::vector<std::filesystem::path> paths;
+    for (const auto& e : std::filesystem::directory_iterator(args.teacher)) if (e.path().extension() == ".npz") paths.push_back(e.path());
+    std::sort(paths.begin(), paths.end());
+    for (std::size_t doc = args.skip; doc < paths.size() && doc < std::size_t(args.skip) + args.limit; ++doc) {
+        const auto t = Clock::now();
+        const auto id = paths[doc].stem().string();
+        const auto& record = require(require(manifest, "docs"), id.c_str());
+        const auto hash = require(record, "npz_sha256").as_string();
+        {
+            const g4::MappedFile file(paths[doc]);
+            if (g4::hash_bytes(file.data(), file.size()) != hash) throw std::runtime_error("teacher hash mismatch");
+        }
+        const auto ids = g4::read_npz(paths[doc]).at("ids").values<std::int32_t>("<i4");
+        if (ids.size() < 2) throw std::runtime_error("teacher geometry");
+        std::vector<double> kl(ids.size()), nll_ref(ids.size() - 1), nll_candidate(ids.size() - 1);
+        std::vector<unsigned> disagree(ids.size());
+        gpu::DeviceStream ref_stream(w.config, unsigned(ids.size() + 8)), candidate_stream(w.config, unsigned(ids.size() + 8));
+        for (std::size_t base = 0; base < ids.size(); base += g4::prefill::chunk_rows) {
+            const auto count = std::min<std::size_t>(g4::prefill::chunk_rows, ids.size() - base);
+            std::vector<unsigned> tokens(count);
+            for (std::size_t i = 0; i < count; ++i) { if (ids[base + i] < 0) throw std::runtime_error("negative teacher token"); tokens[i] = unsigned(ids[base + i]); }
+            auto rtx = ref_stream.begin();
+            const auto a = ref.forward(*rtx, tokens, true).all_logits;
+            rtx->commit(count);
+            auto ctx = candidate_stream.begin();
+            const auto b = candidate.forward(*ctx, tokens, true).all_logits;
+            ctx->commit(count);
+            std::atomic<unsigned> cursor{0}; std::exception_ptr error; std::mutex mutex;
+            const auto work = [&] {
+                try { for (;;) {
+                    const auto r = cursor.fetch_add(1); if (r >= count) break;
+                    const auto pos = base + r;
+                    const auto ra = std::span(a).subspan(std::size_t(r) * w.config.vocab, w.config.vocab);
+                    const auto rb = std::span(b).subspan(std::size_t(r) * w.config.vocab, w.config.vocab);
+                    disagree[pos] = greedy(ra) != greedy(rb);
+                    const double la = lse(ra), lb = lse(rb);
+                    double sum = 0;
+                    for (unsigned v = 0; v < w.config.vocab; ++v) {
+                        const double lp = double(ra[v]) - la;
+                        sum += std::exp(lp) * (lp - (double(rb[v]) - lb));
+                    }
+                    kl[pos] = sum;
+                    if (pos + 1 < ids.size()) {
+                        nll_ref[pos] = la - ra[unsigned(ids[pos + 1])];
+                        nll_candidate[pos] = lb - rb[unsigned(ids[pos + 1])];
+                    }
+                } } catch (...) { std::lock_guard lock(mutex); if (!error) error = std::current_exception(); }
+            };
+            std::vector<std::thread> workers; for (unsigned i = 0; i < 16; ++i) workers.emplace_back(work);
+            for (auto& worker : workers) worker.join(); if (error) std::rethrow_exception(error);
+        }
+        auto values = Json::array(); for (double value : kl) values.push(value);
+        print(Json::Object{{"metric", "parity"}, {"parent", id}, {"language", require(record, "lang")}, {"teacher_sha256", hash},
+            {"rows", std::uint64_t(ids.size())}, {"top1_disagree", std::uint64_t(std::accumulate(disagree.begin(), disagree.end(), 0ULL))},
+            {"sum_kl_ref_candidate", std::accumulate(kl.begin(), kl.end(), 0.0)},
+            {"max_kl_ref_candidate", *std::max_element(kl.begin(), kl.end())}, {"kl_ref_candidate", values},
+            {"nll_positions", std::uint64_t(nll_ref.size())}, {"sum_nll_ref", std::accumulate(nll_ref.begin(), nll_ref.end(), 0.0)},
+            {"sum_nll_candidate", std::accumulate(nll_candidate.begin(), nll_candidate.end(), 0.0)}, {"seconds", elapsed(t)}});
+    }
+}
 int main(int argc, char** argv) {
     try {
         const auto args = arguments(argc, argv); const auto t = Clock::now();
@@ -332,6 +404,7 @@ int main(int argc, char** argv) {
         auto meta = Json::object(); meta.set("identity", model.identity); meta.set("model_hash", model.model_hash);
         meta.set("rope_hash", rope.view.hash); meta.set("mode", args.mode); meta.set("qualified", false);
         meta.set("prefill_identity", args.mode == "gate" ? "prefill-exact" : args.mode == "quality-decode" ? "decode-path" : args.mode == "quality-exact" ? "prefill-exact"
+                 : args.mode == "parity" ? "prefill-exact vs g4-exl3-wmma-pf-v1"
                  : model.identity == ex::identity || model.identity == ex::identity_v2 || model.identity == ex::identity_v3 ? ex::prefill_identity : g4::prefill::identity);
         meta.set("load_s", elapsed(t));
         auto switches = Json::object();
@@ -350,6 +423,7 @@ int main(int argc, char** argv) {
         else if (args.mode == "speed") {
             gpu::DeviceTarget target(weights, rope.view); speed(target, rope.view, args);
         }
+        else if (args.mode == "parity") parity(weights, rope.view, args);
         else quality(weights, rope.view, args, args.mode == "quality-decode");
         return 0;
     } catch (const std::exception& e) { std::cerr << e.what() << std::endl; return 1; }
