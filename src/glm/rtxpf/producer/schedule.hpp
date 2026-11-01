@@ -14,6 +14,10 @@ inline bool valid_schedule(unsigned capacity,unsigned tile){return capacity>=4&&
 // activation + workspace growth over tile 2048 is at most 5% of the expert arena
 // planned at tile 2048 (tiles <= 2048 have no growth). 0 ends the list.
 inline constexpr unsigned default_max_row_tile=8192,baseline_row_tile=2048,tile_arena_share_percent=5;
+// MTP prefill runs in pieces of at most 2048 rows whatever the trunk tile (its per-row arithmetic does not
+// depend on the piece: per-row router, GEMM K order and absolute DSA positions; pieces stay 4-aligned).
+inline constexpr unsigned mtp_max_row_tile=2048;
+inline unsigned mtp_row_tile(unsigned tile){return tile<mtp_max_row_tile?tile:mtp_max_row_tile;}
 inline unsigned first_tile_candidate(unsigned capacity,unsigned cap_tile=max_row_tile){return std::min({capacity,max_row_tile,cap_tile})/32*32;}
 inline unsigned next_tile_candidate(unsigned tile){return tile>32?std::max(32u,tile/2/32*32):0u;}
 inline bool tile_growth_within(std::uint64_t growth,std::uint64_t baseline_arena){return growth*100<=std::uint64_t(tile_arena_share_percent)*baseline_arena;}

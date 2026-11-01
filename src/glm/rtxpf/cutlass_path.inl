@@ -54,10 +54,10 @@ __device__ __forceinline__ void decode_tiles(Matrix w,U16* q,U32* words) {
     }
 }
 __global__ __launch_bounds__(256) void decode_window(const Expert* ex,const U32* counts,
-    U16* qg,U16* qu,U16* qd,unsigned first,unsigned h,unsigned i) {
-    unsigned local=blockIdx.y,which=blockIdx.z;
-    if(!counts[first+local])return;
-    Expert e=ex[first+local]; Matrix w=which==0?e.gate:(which==1?e.up:e.down);
+    U16* qg,U16* qu,U16* qd,unsigned first,unsigned h,unsigned i,const U32* act=nullptr) {
+    unsigned local=blockIdx.y,which=blockIdx.z;const unsigned x=c1_expert(act,first+local);
+    if(!counts[x])return;
+    Expert e=ex[x]; Matrix w=which==0?e.gate:(which==1?e.up:e.down);
     U16* q=(which==0?qg:which==1?qu:qd)+std::size_t(local)*h*i;
     __shared__ __align__(16) U32 packed[8][48];
     U32* words=packed[threadIdx.x/32];
@@ -75,10 +75,10 @@ __global__ __launch_bounds__(256) void decode_window(const Expert* ex,const U32*
 // is retained, so CUTLASS predicates tails rather than reading padded rows.
 __global__ void problem_list(Problems* p,const U32* offsets,const U16* ag,
     const U16* au,U16* qg,U16* qu,float* sg,float* su,
-    unsigned first,unsigned count,unsigned k,unsigned n,bool gu) {
+    unsigned first,unsigned count,unsigned k,unsigned n,bool gu,const U32* act=nullptr) {
     unsigned j=threadIdx.x,local=j/(gu?2:1),which=gu?j%2:0;
     if(local>=count) return;
-    unsigned begin=offsets[first+local],m=offsets[first+local+1]-begin;
+    const unsigned x=c1_expert(act,first+local);unsigned begin=offsets[x],m=offsets[x+1]-begin;
     for(unsigned cls=0;cls<2;++cls) {
         p->size[cls][j]=Coord(((m<=32)==bool(cls))?m:0,n,k);
         p->a[cls][j]=(Half*)(which?au:ag)+std::size_t(begin)*k;
@@ -112,9 +112,9 @@ cudaError_t gemms(Problems* p,unsigned count,const CutlassExecution& e,cudaStrea
 template<bool GU>
 __global__ void c1_epilogue(const Expert* ex,const U32* offsets,const U32* map,
     const float* sg,const float* su,U16* ad,float* out,
-    unsigned first,unsigned count,unsigned width) {
-    unsigned e=first+blockIdx.y,lane=threadIdx.x%32,warp=threadIdx.x/32;
+    unsigned first,unsigned count,unsigned width,const U32* act=nullptr) {
     if(blockIdx.y>=count) return;
+    unsigned e=c1_expert(act,first+blockIdx.y),lane=threadIdx.x%32,warp=threadIdx.x/32;
     unsigned blocks=width/128,begin=offsets[e],rows=offsets[e+1]-begin;
     Expert w=ex[e];
     for(unsigned b=blockIdx.x*8+warp;b<rows*blocks;b+=gridDim.x*8) {
@@ -137,9 +137,9 @@ __global__ void c1_epilogue(const Expert* ex,const U32* offsets,const U32* map,
         }
     }
 }
-__global__ void c1_down_transform(U16* ad,const U32* offsets,unsigned first,unsigned count,unsigned width) {
-    unsigned e=first+blockIdx.y,lane=threadIdx.x%32,warp=threadIdx.x/32;
+__global__ void c1_down_transform(U16* ad,const U32* offsets,unsigned first,unsigned count,unsigned width,const U32* act=nullptr) {
     if(blockIdx.y>=count)return;
+    unsigned e=c1_expert(act,first+blockIdx.y),lane=threadIdx.x%32,warp=threadIdx.x/32;
     unsigned blocks=width/128,begin=offsets[e],rows=offsets[e+1]-begin;
     for(unsigned b=blockIdx.x*8+warp;b<rows*blocks;b+=gridDim.x*8) {
         std::size_t p=std::size_t(begin+b/blocks)*width+b%blocks*128+lane;
@@ -152,6 +152,14 @@ __global__ void c1_down_transform(U16* ad,const U32* offsets,unsigned first,unsi
     }
 }
 
+__global__ void compact_active(const U32* counts,U32* act,unsigned e){if(threadIdx.x==0&&blockIdx.x==0)c1_compact(counts,act,e);}
+cudaError_t decode_one_expert(const Expert* x,unsigned h,unsigned i,U16* qg,U16* qu,U16* qd,const U32* one,
+    const CutlassExecution& exec,cudaStream_t s) {
+    if(!x||!qg||!qu||!qd||!one||exec.decode_blocks<=0)return cudaErrorInvalidValue;
+    unsigned per_matrix=std::max(1u,(unsigned(exec.decode_blocks)+2)/3);
+    decode_window<<<dim3(per_matrix,1,3),256,0,s>>>(x,one,qg,qu,qd,0,h,i);
+    return cudaGetLastError();
+}
 cudaError_t launch_cutlass(const Call& v,void* ws,std::size_t bytes,cudaStream_t s,
     const CutlassExecution& exec,Profile* prof) {
     unsigned routes=v.experts==1?1:8;
@@ -173,37 +181,47 @@ cudaError_t launch_cutlass(const Call& v,void* ws,std::size_t bytes,cudaStream_t
         prefix<<<1,1,0,s>>>(l.counts,l.offsets,l.cursor,v.experts);
         scatter<<<(entries+255)/256,256,0,s>>>(v.ids,l.cursor,l.map,entries,v.experts);
     }
+    // Decode, routed: the routed experts first (cursor is free after the scatter), and only the
+    // groups that can hold them (c1_schedule.hpp); the slot -> expert list is the only change.
+    const U32* act=nullptr;
+    if(v.compact_groups&&routes!=1){compact_active<<<1,1,0,s>>>(l.counts,l.cursor,v.experts);act=l.cursor;}
+    const unsigned groups=c1_groups(v.experts,v.rows,routes,act!=nullptr);
+    // One expert with startup-decoded operands: no decode window (same FP16 values).
+    const bool pre=routes==1&&v.fp16_gate&&v.fp16_up&&v.fp16_down;
     C1_CHECK(cudaEventRecord(exec.dispatch,s));
     C1_CHECK(cudaStreamWaitEvent(exec.decode_stream,exec.dispatch,0));
-    for(unsigned first=0;first<v.experts;first+=16) {
+    for(unsigned first=0;first<v.experts&&first/16<groups;first+=16) {
         unsigned n=std::min(16u,v.experts-first),g=first/16;
         if(prof) C1_CHECK(cudaEventRecord(prof->begin[g],s));
         U16 *qg=g%2?l.qg2:l.qg,*qu=g%2?l.qu2:l.qu,*qd=g%2?l.qd2:l.qd;
+        if(pre){qg=const_cast<U16*>(v.fp16_gate);qu=const_cast<U16*>(v.fp16_up);qd=const_cast<U16*>(v.fp16_down);}
+        else {
         if(g>=2) C1_CHECK(cudaStreamWaitEvent(exec.decode_stream,exec.retired[g-2],0));
         if(prof) C1_CHECK(cudaEventRecord(prof->decode_start[g],exec.decode_stream));
         unsigned per_matrix=std::max(1u,(unsigned(exec.decode_blocks)+3*n-1)/(3*n));
-        decode_window<<<dim3(per_matrix,n,3),256,0,exec.decode_stream>>>(v.matrices,l.counts,qg,qu,qd,first,v.hidden,v.inter);
+        decode_window<<<dim3(per_matrix,n,3),256,0,exec.decode_stream>>>(v.matrices,l.counts,qg,qu,qd,first,v.hidden,v.inter,act);
         C1_CHECK(cudaGetLastError());
         if(prof) C1_CHECK(cudaEventRecord(prof->decoded[g],exec.decode_stream));
         C1_CHECK(cudaEventRecord(exec.ready[g],exec.decode_stream));
-        transform<<<dim3(256,n),256,0,s>>>(v.matrices,v.x,l.activation,l.offsets,l.map,l.ag,l.au,l.ad,first,n,v.hidden,routes,false);
+        }
+        transform<<<dim3(256,n),256,0,s>>>(v.matrices,v.x,l.activation,l.offsets,l.map,l.ag,l.au,l.ad,first,n,v.hidden,routes,false,act);
         if(prof) C1_CHECK(cudaEventRecord(prof->input[g],s));
-        C1_CHECK(cudaStreamWaitEvent(s,exec.ready[g],0));
+        if(!pre) C1_CHECK(cudaStreamWaitEvent(s,exec.ready[g],0));
         if(prof) C1_CHECK(cudaEventRecord(prof->ready[g],s));
-        problem_list<<<1,32,0,s>>>(p,l.offsets,l.ag,l.au,qg,qu,l.scratch_g,l.scratch_u,first,n,v.hidden,v.inter,true);
+        problem_list<<<1,32,0,s>>>(p,l.offsets,l.ag,l.au,qg,qu,l.scratch_g,l.scratch_u,first,n,v.hidden,v.inter,true,act);
         if(prof) C1_CHECK(cudaEventRecord(prof->gu_start[g],s));
         C1_CHECK(gemms(p,n*2,exec,s));
         if(prof) C1_CHECK(cudaEventRecord(prof->gu_gemm[g],s));
-        c1_epilogue<true><<<dim3(256,n),256,0,s>>>(v.matrices,l.offsets,l.map,l.scratch_g,l.scratch_u,l.ad,l.contribution,first,n,v.inter);
+        c1_epilogue<true><<<dim3(256,n),256,0,s>>>(v.matrices,l.offsets,l.map,l.scratch_g,l.scratch_u,l.ad,l.contribution,first,n,v.inter,act);
         if(prof) C1_CHECK(cudaEventRecord(prof->swiglu[g],s));
-        c1_down_transform<<<dim3(256,n),256,0,s>>>(l.ad,l.offsets,first,n,v.inter);
+        c1_down_transform<<<dim3(256,n),256,0,s>>>(l.ad,l.offsets,first,n,v.inter,act);
         if(prof) C1_CHECK(cudaEventRecord(prof->down_input[g],s));
-        problem_list<<<1,32,0,s>>>(p,l.offsets,l.ad,nullptr,qd,nullptr,l.scratch_g,nullptr,first,n,v.inter,v.hidden,false);
+        problem_list<<<1,32,0,s>>>(p,l.offsets,l.ad,nullptr,qd,nullptr,l.scratch_g,nullptr,first,n,v.inter,v.hidden,false,act);
         if(prof) C1_CHECK(cudaEventRecord(prof->down_start[g],s));
         C1_CHECK(gemms(p,n,exec,s));
         if(prof) C1_CHECK(cudaEventRecord(prof->down_gemm[g],s));
         C1_CHECK(cudaEventRecord(exec.retired[g],s));
-        c1_epilogue<false><<<dim3(256,n),256,0,s>>>(v.matrices,l.offsets,l.map,l.scratch_g,nullptr,l.ad,l.contribution,first,n,v.hidden);
+        c1_epilogue<false><<<dim3(256,n),256,0,s>>>(v.matrices,l.offsets,l.map,l.scratch_g,nullptr,l.ad,l.contribution,first,n,v.hidden,act);
         if(prof) C1_CHECK(cudaEventRecord(prof->down[g],s));
     }
     if(v.combine){ // a non-last expert batch leaves the merge to the last one

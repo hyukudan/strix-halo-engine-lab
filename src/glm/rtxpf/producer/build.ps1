@@ -10,6 +10,7 @@ $freshOption = if ($Fresh) { '--fresh' } else { '' }
 # offline CUTLASS v4.2.1 tree (else CMake fetches the pinned release).
 if ($TierstreamSource) { $freshOption += " -DGLM_TIERSTREAM_SRC=`"$([IO.Path]::GetFullPath($TierstreamSource) -replace '\\','/')`"" }
 if ($CutlassDir) { $freshOption += " -DGLM_CUTLASS_DIR=`"$([IO.Path]::GetFullPath($CutlassDir) -replace '\\','/')`"" }
+$freshOption += " -DGLM_TS_PARALLEL=$Parallel" # the tierstream sub-build follows -Parallel
 $lines = @('@echo off', 'set "PATH=C:\Program Files (x86)\Microsoft Visual Studio\Installer;%PATH%"', "set `"TMP=$build\tmp`"", "set `"TEMP=$build\tmp`"", 'set "CCACHE_DISABLE=1"',
     "call `"$vs`" >nul", 'if errorlevel 1 exit /b 1', 'chcp 65001 >nul',
     "cmake $freshOption -S `"$PSScriptRoot`" -B `"$build`" -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES=120 -DCMAKE_CXX_COMPILER=cl -DCMAKE_CUDA_COMPILER=`"$($cuda -replace '\\','/')/bin/nvcc.exe`" -DCMAKE_CXX_COMPILER_LAUNCHER= -DCMAKE_CUDA_COMPILER_LAUNCHER=",

@@ -491,7 +491,7 @@ model identity, geometry, rates and per-unit SHA-256, and a one-part
 MTP -> 42; model layer in `x-glm-layer`), format `x-glm-exl3-unit-v1`,
 `offset + unit*stride`, stride == bytes. `glm_native_decode_host` compiles
 tierstream `src/desc.cpp`/`src/json.cpp` read-only from `GLM_TIERSTREAM_SRC`
-(a private `git archive` snapshot `../tierstream-f6e4167` of tierstream `f6e4167`,
+(a private `git archive` snapshot `../tierstream-602702b` of tierstream `602702b`,
 its STAMP checked against the pin: configuration fails on another commit) and parses the generated descriptor; it reports SKIP
 when that worktree is absent. The adapter
 follows the DS tier site: `begin_token`, `acquire` (export IDs + wait),
@@ -613,7 +613,7 @@ cache); no prefill rings are allocated. `SS_E_CAPACITY` (an arena below
 288 + spares + guard) is refused: expert batches with masked dispatch are not
 implemented. A CPU mock of the contract (decode_host) checks the protocol and
 that every slot-bound descriptor addresses bytes identical to the source
-tensors. Active with the pinned tierstream f6e4167
+tensors. Active with the pinned tierstream 602702b
 (`SS_DG_MAKE_RESIDENT`; first GPU run is GLM's: serial pinned -> device
 copy-ins; transfers are transactional: a read failure leaves
 every keep and slot consistent, a device failure poisons the context, which
@@ -642,7 +642,72 @@ still returns a FAILED receipt with the original error and the measured peaks,
 plus `expert_cache`: the library's last token error (which flag of which gated
 layer and token), `device_timeouts`, stalls, misses, free slots and `flush_ready`.
 In `--decode-commands` mode the failing command writes that receipt to stderr as
-one `FAILED-RECEIPT {...}` line before the worker exits. An explicit `--tier-vram-gib` arena and the keepable minimum (288 residents; the
+one `FAILED-RECEIPT {...}` line before the worker exits.
+
+**Steps, predictions and the decode timeline.** The binding keeps the library's
+step rule (`StepPlan`, equal to tierstream's `DgSteps` over GLM's whole call order
+in `glm_native_decode_host`): a step exports a gated layer when its rows name it
+and it holds no prefill keep set. An export promises predicted ids, and
+`--tier-predict 1` enqueues them, only when the step also exports the next layer,
+so no prediction ever targets a layer the step skips or holds; an export of a
+skipped or held layer, a mismatched prediction, and an all-layer decode token
+while any layer still holds its keep set all fail loudly naming the layer.
+`--decode-profile` (service and harness) records one CUDA event per enqueued
+decode phase (embed, hyper-connection mixes, KDA with its open-block replay, DSA
+indexer + sparse attention, router, cache export + device wait + bind, predicted
+fork, routed MoE, shared expert, combine, head + argmax, the host gap at the
+result synchronization, MTP) and puts per-layer and per-phase device/host
+milliseconds into every decode step record (`timeline`) and per bench arm
+(`timeline_totals`). Events only: tokens and digests are unchanged; timings
+include the events. A failed token keeps its partial timeline in the failure
+receipt (`expert_cache.decode_timeline_at_failure`), whose longest interval names
+the layer and phase where the device stalled.
+
+**Prefill workspace.** The CUTLASS (C1) MoE layout reserves no activation buffer
+(its transform never reads one: the down input is `c1_down_transform` over `ad`; only
+the legacy path keeps it), and the MTP layer runs its prefill in pieces of at most
+2048 rows whatever the trunk tile (`mtp_row_tile`; per-row router, GEMM K order and
+absolute DSA positions do not depend on the piece; the bitwise-equal
+prefill state across tiles includes the MTP layer). The workspace is the maximum over operators
+with MTP at its own tile: 3.444 / 3.624 / 5.637 GB at tiles 2048 / 4096 / 8192
+(was 3.579 / 5.057 / 8.015 GB); the plan's `row_tile_components` list each part.
+The prefill's shared/dense calls also use the persistent FP16 operands when
+`persistent_dense_fp16` is admitted.
+
+**Eager module loading.** The service sets `CUDA_MODULE_LOADING=EAGER` at the top
+of `main`, before any CUDA call, unless the variable is set explicitly (the harness
+also defaults it and records it in the receipt): with lazy loading, the first launch
+of a decode kernel while the cache's wait kernel spins can stall until the wait
+deadline. Health records the value and the driver's actual loading mode, and the
+tierstream decode service refuses a lazy driver. `--print-effective-config` reports
+the value (it runs no CUDA call).
+
+**Slot census.** Health `tier_plan.slot_census_at_open`, every `--decode-profile`
+step record (`slot_census`) and every failure receipt
+(`expert_cache.slot_census_at_failure`) carry the library slot table's homes per
+gated layer (units on a persistent slot - `guard_slot - 2 x max_ids` residents and
+spares - on a bank alias slot, absent), the free persistent slots read from the
+table (live, unlike `ts_dg_stats.free_slots`, which is folded at the last
+boundary), and with `--decode-profile` each exported layer's decode misses
+(its ids absent from the table when it exported; tierstream counts misses only at
+`ss_end`). Read-only kernels; outputs unchanged.
+
+**Exact decode levers (pending rows).** `skip_empty_expert_groups`
+(`--skip-empty-expert-groups 0|1`, `STRIX_GLM_RTX_SKIP_EMPTY_GROUPS`): the routed
+MoE call lists the experts holding routed rows first on the device
+(`c1_schedule.hpp`, after the dispatch, in the scatter cursor's space) and launches
+only ceil(min(288, rows x 8) / 16) expert groups (1 instead of 18 for a decode
+row); groups keep their 0.. numbering, parity and `retired[g-2]` guard; every
+expert's decode, GEMM problems and epilogue are unchanged, and the merge sums the
+routes in the same order. `persistent_dense_fp16` (`--persistent-dense-fp16 0|1`,
+`STRIX_GLM_RTX_PERSISTENT_DENSE_FP16`): the shared experts of layers 3..44 and the
+dense FFNs of 0..2 are decoded once at startup by the C1 decode window into
+persistent FP16 operands (~2.8 GiB, the plan part "persistent FP16 shared + dense
+experts (decode)", charged before the cache opens so the arena shrinks by it); the
+decode calls skip their decode window. When the whole-device plan cannot afford
+it, startup drops it and health `tier_plan.persistent_dense_fp16` says why. Both
+are pending in every profile (their builtin, off, runs) until a window shows equal
+decode digests with and without them; `--allow-pending` or the switch runs them. An explicit `--tier-vram-gib` arena and the keepable minimum (288 residents; the
 planner adds the spares) are checked in the startup plan and the dry plan,
 before authentication or any load. Every run uses the reduced schedule (32K TTFT
 only with `--full-card`); a schedule whose printed estimate exceeds `--timeout`

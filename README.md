@@ -28,8 +28,10 @@ Published measurements include:
   54.4 / 34.1 / 24.1 tok/s on JSON / Python / prose.
 - **GLM-5.3 Flash:** default exact MTP self-speculation reaches
   37.1 / 44.5 / 40.0 tok/s on chat / code / JSON.
-- **GLM-5.3 Flash on one RTX PRO 6000:** exact prefill (time to first token 17.7 s at 8K, 41.2 s at 32K tokens) and
-  exact decode (3.3 tok/s) with an expert cache across VRAM, pinned RAM and disk; decode speed work is ongoing.
+- **GLM-5.3 Flash on one RTX PRO 6000, whole-device budgets:** exact prefill and decode with an expert cache across
+  VRAM, pinned RAM and disk. Full card unchanged: TTFT 17.7 s at 8K, 41.2 s at 32K; decode 3.3 tok/s warm. Now also
+  runs exact with 24 GiB VRAM + 32 GiB host RAM (experts streamed from disk): TTFT 64.8 s at 1K, 76.7 s at 8K;
+  decode 0.67 tok/s warm (0.63 cold). Exact = every state/logit digest equals a fresh prefill of prompt+t.
 
 These are workload-specific results, not speed guarantees. [How fast](#how-fast) preserves the
 hardware, profiles, concurrency and measurement limits; [published performance](docs/performance.md)
@@ -532,8 +534,8 @@ device-gated cache, and prefill reads them through the same cache, so the card h
 Prefill and decode are exact (bitwise digests of logits and state; prefill state equal across row tiles 2048 / 4096 /
 8192). Full card: TTFT **17.7 s** at 8K and **41.2 s** at 32K with the best row tile (17.7-22.7 s / 41-55 s across
 tiles); decode about **3.3 tok/s** warm (2.5 cold), bound by compute and launch overhead and still being optimised.
-Smaller configurations (for example 24 GiB VRAM + 32 GiB RAM with most experts read from the unit file) do not work
-yet. Build, unit file and options: [GLM RTX guide](src/glm/rtxpf/README.md).
+With 24 GiB VRAM + 32 GiB host RAM (most experts streamed from the unit file on disk) it also runs exact: TTFT
+**64.8 s** at 1K and **76.7 s** at 8K; decode **0.67 tok/s** warm (0.63 cold). Build, unit file and options: [GLM RTX guide](src/glm/rtxpf/README.md).
 
 ### Nemotron 3.5 Bolt E4B
 

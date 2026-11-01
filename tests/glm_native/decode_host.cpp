@@ -2,6 +2,8 @@
 #include "glm/rtxpf/producer/session.hpp"
 #include "glm/rtxpf/producer/head_select.hpp"
 #include "glm/rtxpf/producer/expert_tier.hpp"
+#include "glm/rtxpf/producer/decode_timeline.hpp"
+#include "glm/rtxpf/c1_schedule.hpp"
 #include "glm/rtxpf/producer/schedule.hpp"
 #include "glm/rtxpf/producer/profile.hpp"
 #include "glm/rtxpf/producer/generate_request.hpp"
@@ -14,6 +16,8 @@
 #include <algorithm>
 #include <functional>
 #include <cmath>
+#include <tuple>
+#include <numeric>
 #include <iostream>
 #include <limits>
 #include <map>
@@ -119,6 +123,136 @@ Synthetic synthetic(){
 std::string tierstream_desc_check(const std::string& text,std::uint64_t* layers,std::uint64_t* units,std::uint64_t* max_unit);
 std::string tierstream_source_read(const std::string& desc_text,const char* raw_path,const std::string& sha256,std::uint64_t bytes,std::string* data);
 #endif
+#ifdef GLM_TIERSTREAM_PARSER
+std::vector<std::vector<std::uint8_t>> tierstream_dg_steps(unsigned gated,const std::vector<std::pair<char,unsigned>>& ops);
+#endif
+// Predicted prefetch never targets a layer the step skips or holds: GLM's StepPlan
+// (the binding's export/promise rule) replayed over GLM's own call order (two prefills
+// through the cache = 43 single-layer held steps each, then decode tokens), a layer
+// held during an all-layer step, and reset_open; every step's export set must equal
+// the library's DgSteps (src/dg_steps.hpp, compiled from GLM_TIERSTREAM_SRC).
+void step_plan_tests(){
+    constexpr unsigned G=43,through=41,n=routed_topk;std::vector<std::pair<char,unsigned>> ops;
+    for(int prefill=0;prefill<2;++prefill)for(unsigned g=0;g<G;++g){ops.push_back({'H',g});ops.push_back({'L',g});ops.push_back({'R',g});}
+    for(int t=0;t<3;++t)ops.push_back({'A',0});
+    ops.push_back({'H',5});ops.push_back({'A',0});ops.push_back({'L',5});ops.push_back({'L',6});ops.push_back({'X',0});ops.push_back({'A',0});
+    StepPlan plan;plan.init(G);std::vector<std::vector<std::uint8_t>> mine;unsigned promised=0,decode_steps=0;
+    for(auto [op,g]:ops){
+        if(op=='H')plan.hold(g);else if(op=='R')plan.release(g);else if(op=='X')plan.reset();
+        else{if(op=='A')plan.begin_all();else plan.begin_layer(g);mine.push_back(plan.run);
+            bool all=true;for(unsigned h=0;h<G;++h){const unsigned p=plan.promise(h,n,through);
+                check(!p||(plan.exports(h)&&plan.exports(h+1)),"a promise only when the step exports the layer and the next one");
+                check(plan.promise(h,0,through)==0,"no promise without predicted ids");promised+=p?1:0;all=all&&plan.exports(h);}
+            if(op=='L')for(unsigned h=0;h<G;++h)check(plan.promise(h,n,through)==0,"a single-layer step promises nothing");
+            if(op=='A'&&all){++decode_steps;for(unsigned h=0;h<through;++h)check(plan.promise(h,n,through)==n,"a decode token promises every layer before `through`");
+                check(plan.promise(through,n,through)==0&&plan.promise(G-1,n,through)==0,"no promise at or past `through`");}}
+    }
+    check(mine.size()==2*G+3+4&&decode_steps==4,"step count of the replayed sequence");
+    // the held layer 5 in an all-layer step: neither 5 nor 4 (whose next is 5) promise; 5 is not exported
+    const auto& held_step=mine[2*G+3];check(!held_step[5]&&held_step[4]&&held_step[6],"a held layer is not exported in an all-layer step");
+    {StepPlan p;p.init(G);p.hold(5);p.begin_all();check(p.promise(4,n,through)==0&&p.promise(5,n,through)==0&&p.promise(6,n,through)==n,"no prediction toward or from a held layer");
+     p.begin_layer(5);check(!p.exports(5),"a held layer's own single-layer step exports nothing");}
+#ifdef GLM_TIERSTREAM_PARSER
+    const auto lib=tierstream_dg_steps(G,ops);check(lib.size()==mine.size(),"library step count");
+    for(std::size_t i=0;i<mine.size()&&i<lib.size();++i)check(lib[i]==mine[i],("step "+std::to_string(i)+": GLM's export set == the library's DgSteps").c_str());
+    std::cout<<"INFO step plan == tierstream DgSteps over "<<mine.size()<<" steps ("<<promised<<" promises)\n";
+#else
+    std::cout<<"SKIP tierstream DgSteps comparison not configured (GLM_TIERSTREAM_SRC)\n";
+#endif
+}
+// Decode timeline (decode_timeline.hpp): device intervals summed per phase and per
+// layer, host enqueue time kept apart, totals equal to the sum of the intervals, and
+// the per-arm aggregation over the steps that carry a timeline.
+void decode_timeline_tests(){
+    std::vector<TimelineMark> marks{{-1,DecodePhase::embed,0.01},{3,DecodePhase::router,0.02},{3,DecodePhase::export_wait,0.03},{3,DecodePhase::routed_moe,0.04},
+                                    {4,DecodePhase::router,0.02},{4,DecodePhase::routed_moe,0.05},{-1,DecodePhase::head,0.01},{-1,DecodePhase::host_gap,1.5}};
+    std::vector<double> gpu{0.1,0.2,2.0,3.0,0.25,3.5,1.0,1.4};
+    const auto t=decode_timeline_json(marks,gpu,11.45);
+    const auto* ph=t.find("phases");
+    check(std::abs(ph->find("routed_moe")->find("gpu_ms")->as_double()-6.5)<1e-12&&ph->find("routed_moe")->find("count")->as_int()==2,"timeline: per-phase device sum and count");
+    check(std::abs(ph->find("host_gap")->find("host_ms")->as_double()-1.5)<1e-12,"timeline: host time per phase");
+    check(std::abs(t.find("gpu_ms_total")->as_double()-11.45)<1e-9&&std::abs(t.find("span_ms")->as_double()-11.45)<1e-12,"timeline: interval total == span");
+    const auto& layers=t.find("layers")->as_array();
+    check(layers.size()==2&&layers[0].find("layer")->as_int()==3&&std::abs(layers[0].find("export_wait")->as_double()-2.0)<1e-12&&!layers[1].find("export_wait"),"timeline: per-layer phases");
+    check(!ph->find("kda")&&!ph->find("predict"),"timeline: phases never marked are omitted");
+    bool refused=false;try{(void)decode_timeline_json(marks,{1.0},1.0);}catch(const std::invalid_argument&){refused=true;}check(refused,"timeline: one interval per mark");
+    auto steps=Json::array();for(int i=0;i<2;++i){auto s=Json::object();s.set("token",i);s.set("timeline",t);steps.push(s);}
+    auto plain=Json::object();plain.set("token",9);steps.push(plain);
+    const auto agg=aggregate_decode_timelines(steps);
+    check(agg.find("tokens")->as_int()==2&&std::abs(agg.find("span_ms_per_token")->as_double()-11.45)<1e-9
+          &&std::abs(agg.find("phases")->find("routed_moe")->find("gpu_ms_per_token")->as_double()-6.5)<1e-9
+          &&std::abs(agg.find("phases")->find("routed_moe")->find("gpu_ms_total")->as_double()-13.0)<1e-9,"timeline: per-arm totals over the steps that carry one");
+    check(!aggregate_decode_timelines(Json::array()).find("tokens"),"timeline: no timeline, no totals");
+}
+// skip_empty_expert_groups: the C1 group schedule (c1_schedule.hpp, the same functions the
+// kernels call). Group counts; the device's slot -> expert list is a permutation with the
+// routed experts first (ascending); a model of the launch loop (groups 0.. with double-buffer
+// parity g % 2 and the retired[g - 2] guard, each slot running its expert only when that expert
+// has rows) runs exactly the routed experts once each, as the full schedule does.
+void c1_schedule_tests(){
+    namespace r=strix::glm::rtxpf;
+    check(r::c1_groups(288,1,8,true)==1&&r::c1_groups(288,1,8,false)==18&&r::c1_groups(288,2,8,true)==1&&r::c1_groups(288,3,8,true)==2,"groups: decode rows");
+    check(r::c1_groups(288,36,8,true)==18&&r::c1_groups(288,8192,8,true)==18&&r::c1_groups(1,1,1,true)==1&&r::c1_groups(1,4096,1,false)==1,"groups: prefill rows and one expert");
+    std::mt19937 rng(87);
+    for(unsigned rows:{1u,2u,3u,5u,40u}){
+        for(int trial=0;trial<200;++trial){
+            std::vector<std::uint32_t> counts(288,0);
+            for(unsigned row=0;row<rows;++row){std::vector<unsigned> e(288);std::iota(e.begin(),e.end(),0u);std::shuffle(e.begin(),e.end(),rng);for(unsigned k=0;k<8;++k)++counts[e[k]];}
+            std::vector<std::uint32_t> act(288);r::c1_compact(counts.data(),act.data(),288);
+            auto sorted=act;std::sort(sorted.begin(),sorted.end());bool perm=true;for(unsigned j=0;j<288;++j)perm=perm&&sorted[j]==j;
+            unsigned active=0;for(auto c:counts)active+=c?1:0;
+            bool order=true;for(unsigned j=0;j+1<288;++j)if((counts[act[j]]>0)==(counts[act[j+1]]>0))order=order&&act[j]<act[j+1];
+            for(unsigned j=0;j<288;++j)order=order&&((j<active)==(counts[act[j]]>0));
+            const unsigned groups=r::c1_groups(288,rows,8,true);
+            // the launch loop model: which experts run, how often, and the group numbering
+            auto run=[&](const std::uint32_t* list,unsigned ngroups){std::vector<unsigned> ran(288,0);unsigned executed=0;bool consecutive=true;
+                for(unsigned first=0;first<288&&first/16<ngroups;first+=16){const unsigned g=first/16;consecutive=consecutive&&g==executed;++executed;
+                    for(unsigned local=0;local<std::min(16u,288-first);++local){const unsigned e=r::c1_expert(list,first+local);if(counts[e])++ran[e];}}
+                return std::make_tuple(ran,executed,consecutive);};
+            auto [ran_c,exec_c,cons_c]=run(act.data(),groups);auto [ran_f,exec_f,cons_f]=run(nullptr,r::c1_groups(288,rows,8,false));
+            check(perm&&order,"compaction: a permutation, routed experts first and ascending");
+            check(active<=16*groups&&exec_c==groups&&cons_c&&cons_f&&exec_f==18,"every routed expert lies in an executed group; groups numbered 0.. consecutively");
+            check(ran_c==ran_f,"the compacted schedule runs exactly the experts the full one runs");
+            bool once=true;for(unsigned e=0;e<288;++e)once=once&&ran_c[e]==(counts[e]?1u:0u);check(once,"each routed expert runs once, no empty expert runs");
+        }
+    }
+    std::vector<std::uint32_t> all(288,1),act(288);r::c1_compact(all.data(),act.data(),288);bool id=true;for(unsigned j=0;j<288;++j)id=id&&act[j]==j;
+    check(id,"every expert routed: the list is the identity (the full schedule)");
+}
+// Slot census (expert_tier.hpp): table homes per gated layer (persistent slots first, then the
+// bank aliases), decode misses per exported layer, free persistent slots from the table.
+void slot_census_tests(){
+    constexpr std::uint32_t persistent=587,units=288;
+    std::vector<std::int32_t> layer(units,-1);for(unsigned u=0;u<13;++u)layer[u]=std::int32_t(u*40);layer[200]=588;layer[201]=603-1;
+    const auto c=census_layer(layer.data(),units,persistent);
+    check(c.persistent==13&&c.bank==2&&c.absent==units-15,"census: persistent / bank / absent homes");
+    std::vector<LayerCensus> all(43,c);std::vector<std::uint32_t> misses(43,0xFFFFFFFFu);misses[0]=8;misses[38]=8;misses[39]=0;
+    const auto j=census_json(all,misses,persistent);
+    check(j.find("persistent_used")->as_int()==43*13&&j.find("persistent_free")->as_int()==int(persistent-43*13)&&j.find("bank_used")->as_int()==86,"census: totals and free persistent slots");
+    const auto& a=j.find("layers")->as_array();
+    check(a.size()==43&&a[0].find("misses")->as_int()==8&&a[38].find("misses")->as_int()==8&&a[39].find("misses")->as_int()==0&&!a[1].find("misses")&&j.find("misses")->as_int()==16,
+          "census: misses only for exported layers");
+    std::vector<LayerCensus> full(43,LayerCensus{14,0,274});check(census_json(full,{},persistent).find("persistent_free")->as_int()==0,"census: a full arena has no free slot");
+}
+// restore_decode_residency: the open placement per gated layer from the tier array (resident
+// keys, ascending units), sized like the plan (residents + spares = persistent slots).
+void planned_residents_tests(){
+    TierBudget b;b.resident=557;b.pinned=2495;b.disk=43ULL*288-557-2495;b.slots=587;
+    const auto order=round_robin_order();const auto tiers=tier_assignment(b,43ULL*288,order);
+    const auto p=planned_residents(tiers,0,43,288);std::uint64_t n=0;bool ascending=true,resident=true;
+    for(unsigned g=0;g<43;++g){n+=p[g].size();for(std::size_t i=0;i<p[g].size();++i){ascending=ascending&&(i==0||p[g][i-1]<p[g][i]);resident=resident&&tiers[std::size_t(g)*288+std::size_t(p[g][i])]==0;}}
+    check(n==557&&ascending&&resident,"planned residents: every resident key once, per layer ascending");
+    check(p[0].size()==13&&p[40].size()==13&&p[41].size()==12&&p[42].size()==12,"planned residents: the round-robin open placement (13 per layer, 12 for 41/42)");
+    check(planned_residents(std::vector<std::uint8_t>(43*288,1),0,43,288)[5].empty(),"planned residents: none without device residents");
+}
+// MTP prefill pieces (schedule.hpp): at most 2048 rows whatever the trunk tile, 4-aligned (absolute DSA
+// positions pool every 4 rows), never larger than the tile itself; every row covered once.
+void mtp_tile_tests(){
+    check(mtp_row_tile(8192)==2048&&mtp_row_tile(4096)==2048&&mtp_row_tile(2048)==2048&&mtp_row_tile(1024)==1024&&mtp_row_tile(32)==32,"MTP piece = min(tile, 2048)");
+    for(unsigned P:{31u,2047u,2048u,8191u,31999u}){unsigned covered=0,pieces=0;bool aligned=true;
+        for(unsigned first=0;first<P;first+=mtp_row_tile(8192)){auto c=row_tile(first,P,mtp_row_tile(8192));aligned=aligned&&first%4==0;covered+=c.rows;++pieces;}
+        check(covered==P&&aligned&&pieces==(P+2047)/2048,"MTP pieces cover every prefill row once, 4-aligned");}
+}
 void tierstream_parser_tests(const ExpertCatalog& c,const Json& d){
 #ifdef GLM_TIERSTREAM_PARSER
     std::uint64_t layers=0,units=0,max_unit=0;auto error=tierstream_desc_check(d.dump(),&layers,&units,&max_unit);
@@ -420,6 +554,13 @@ void decode_budget_tests(){
     check(p.refuse.empty()&&p.device_planned<=24*gib&&p.host_planned<=32*gib&&p.tier.resident>0&&p.tier.resident+p.tier.pinned+p.tier.disk==c.size(),("whole-device 24/32 admitted within the caps: "+p.refuse).c_str());
     check(p.device_planned+in.vram_margin<=24*gib&&p.device_planned+in.vram_margin+stride>24*gib,"the arena is everything the VRAM cap leaves after the margin (one more slot would not fit)");
     check(p.min_vram_total<=24*gib&&p.min_ram_total<=32*gib,"minimum caps below the requested ones");
+    {   // host growth after open (session snapshot + driver headroom) comes out of the pinned tier, not the cap
+        auto grown=glm();const std::uint64_t snap=489406976;add_host_growth_parts(grown.pageable,snap);auto g=plan_whole_device(grown);
+        check(g.refuse.empty()&&g.host_planned<=32*gib&&g.tier.pinned<p.tier.pinned,"host growth parts admitted under the RAM cap, fewer pinned units");
+        const std::uint64_t freed=(p.tier.pinned-g.tier.pinned)*stride;
+        check(freed+stride>snap+host_growth_headroom&&freed<=snap+host_growth_headroom+2*stride,"the pinned tier gives up exactly the snapshot + headroom (to a unit)");
+        check(grown.pageable.size()==in.pageable.size()+2&&grown.pageable.back().name==std::string(host_growth_part),"named parts for the plan JSON");
+    }
     TierOpenConfig cfg;cfg.budget=p.tier;cfg.descriptor_json=tierstream_descriptor(c,"OUT_DIR/glm-units.bin",std::string(64,'b')).dump();cfg.tiers=tier_assignment(p.tier,c.size(),{});cfg.unit_bytes=stride;cfg.cuda=false;
     auto lib=tierstream_admission_probe(cfg);check(lib.first==8,("ts library admits the whole-device 24/32 open (got "+std::to_string(lib.first)+": "+lib.second+")").c_str());
     std::cout<<"INFO whole-device 24/32 at 43x288 (representative parts): "<<j.find("summary")->as_string()<<"\n";
@@ -509,16 +650,16 @@ void profile_tests(){
     auto run=[&](std::vector<std::string> args,std::vector<std::pair<std::string,std::string>> env={}){rp::Inputs in;in.args=std::move(args);in.env=lookup(std::move(env));return rp::resolve(rp::App::decode_service,in);};
     const auto def=run({});
     check(def.name==rp::Name::standard&&def.qualification()=="qualified","no --profile = default, qualified");
-    for(const char* l:{"expert_tier","placement","eviction_policy","spare_share","row_tile","cuda_graphs","flush_ready"}){
+    for(const char* l:{"expert_tier","placement","eviction_policy","spare_share","row_tile","cuda_graphs","restore_decode_residency","flush_ready"}){
         auto* e=def.find(l);check(e&&e->status==rp::Status::profile&&e->lever->kind==rp::Kind::exact,(std::string("default: exact lever on: ")+l).c_str());}
     check(def.find("expert_tier")->value=="tierstream"&&def.find("eviction_policy")->value=="auto"&&def.find("spare_share")->value=="5"&&def.find("row_tile")->value=="auto",
           "default values = today's service defaults");
     auto* pp=def.find("predicted_prefetch");
     check(pp&&pp->status==rp::Status::pending&&pp->value=="0"&&pp->wanted=="1","predicted prefetch pending in default: its builtin (off) runs");
     check(!def.find("prefill_tile_large")&&!def.find("dsa_index_mma"),"default leaves the fast-only rows alone");
-    check(def.pending()==std::vector<std::string>{"predicted_prefetch"},"default pending list");
+    check(def.pending()==std::vector<std::string>{"predicted_prefetch","skip_empty_expert_groups","persistent_dense_fp16"},"default pending list");
     const auto fast=run({"--profile","fast"});
-    check(fast.pending()==std::vector<std::string>{"predicted_prefetch","prefill_tile_large","dsa_index_mma"},"fast: every fast-only row pending (none qualified)");
+    check(fast.pending()==std::vector<std::string>{"predicted_prefetch","skip_empty_expert_groups","persistent_dense_fp16","prefill_tile_large","dsa_index_mma"},"fast: every fast-only row pending (none qualified)");
     check(fast.find("prefill_tile_large")->value=="off"&&fast.find("dsa_index_mma")->value=="fp32"&&fast.find("dsa_index_mma")->lever->kind==rp::Kind::bit_changing,
           "fast pending rows run their builtin form");
     const auto quality=run({"--profile","quality"});
@@ -533,6 +674,16 @@ void profile_tests(){
     check(cli.find("row_tile")->value=="4096"&&cli.find("cuda_graphs")->value=="off"&&cli.find("cuda_graphs")->status==rp::Status::explicit_cli,"--row-tile / --no-graphs explicit");
     check(cli.find("spare_share")->status==rp::Status::explicit_cli&&cli.find("spare_share")->value=="96","--tier-spare-slots explicit (overrides the 5% share)");
     check(run({"--tier-predict","1"}).find("predicted_prefetch")->status==rp::Status::explicit_cli,"explicit --tier-predict is an expert override, not pending");
+    // the exact decode levers: pending everywhere (builtin 0 runs), explicit by CLI or environment, run by --allow-pending
+    {const auto allowed=run({"--allow-pending"});
+     for(const char* l:{"skip_empty_expert_groups","persistent_dense_fp16"}){auto* e=def.find(l);
+        check(e&&e->status==rp::Status::pending&&e->value=="0"&&e->wanted=="1"&&e->lever->kind==rp::Kind::exact,(std::string("pending exact lever: ")+l).c_str());
+        check(allowed.find(l)->status==rp::Status::unqualified&&allowed.find(l)->value=="1",(std::string("--allow-pending runs ")+l).c_str());}}
+    {const auto c=run({"--skip-empty-expert-groups","1"});check(c.find("skip_empty_expert_groups")->status==rp::Status::explicit_cli,"--skip-empty-expert-groups explicit");
+     const auto e=run({},{{"STRIX_GLM_RTX_PERSISTENT_DENSE_FP16","1"}});check(e.find("persistent_dense_fp16")->status==rp::Status::explicit_env&&e.find("persistent_dense_fp16")->value=="1","STRIX_GLM_RTX_PERSISTENT_DENSE_FP16=1 explicit");}
+    // restore_decode_residency: placement only, on in every profile; CLI / environment override
+    check(def.find("restore_decode_residency")->value=="on"&&fast.find("restore_decode_residency")->value=="on"&&def.find("restore_decode_residency")->status==rp::Status::profile,"restore_decode_residency on");
+    {const auto off=run({},{{"STRIX_GLM_RTX_RESTORE_RESIDENCY","0"}});check(off.find("restore_decode_residency")->status==rp::Status::explicit_env&&off.find("restore_decode_residency")->value=="off","STRIX_GLM_RTX_RESTORE_RESIDENCY=0");}
     // flush_ready: on in every profile; --tier-flush-ready (CLI) beats STRIX_GLM_RTX_FLUSH_READY (env)
     check(def.find("flush_ready")->value=="on"&&fast.find("flush_ready")->value=="on"&&quality.find("flush_ready")->value=="on","flush_ready on in all profiles");
     {const auto env_off=run({},{{"STRIX_GLM_RTX_FLUSH_READY","0"}});auto* e=env_off.find("flush_ready");
@@ -549,11 +700,11 @@ void profile_tests(){
     check(bench.find("prefill_tile_large")->status==rp::Status::unqualified&&bench.find("prefill_tile_large")->value=="8192"&&
           bench.find("predicted_prefetch")->status==rp::Status::unqualified&&bench.find("dsa_index_mma")->status==rp::Status::pending,
           "--allow-pending runs pending rows that are in this build only (dsa_index_mma stays pending)");
-    check(bench.qualification()=="unqualified: predicted_prefetch,prefill_tile_large","the receipt is stamped unqualified");
+    check(bench.qualification()=="unqualified: predicted_prefetch,skip_empty_expert_groups,persistent_dense_fp16,prefill_tile_large","the receipt is stamped unqualified");
     check(run({},{{"STRIX_GLM_RTX_PROFILE_ALLOW_PENDING","1"}}).allow_pending,"STRIX_GLM_RTX_PROFILE_ALLOW_PENDING=1");
     // stderr notices: one line per pending row, one for an unqualified run
-    auto n=fast.notices();check(n.size()==3&&n[0].rfind("profile fast: predicted_prefetch pending, not used (",0)==0,"pending stderr lines");
-    check(bench.notices().back()=="profile fast: unqualified: predicted_prefetch,prefill_tile_large (--allow-pending: benchmarks only)","unqualified stderr line");
+    auto n=fast.notices();check(n.size()==5&&n[0].rfind("profile fast: predicted_prefetch pending, not used (",0)==0,"pending stderr lines");
+    check(bench.notices().back()=="profile fast: unqualified: predicted_prefetch,skip_empty_expert_groups,persistent_dense_fp16,prefill_tile_large (--allow-pending: benchmarks only)","unqualified stderr line");
     // the JSON (--print-effective-config / the first receipt event's "profile")
     auto j=strix::serve::parse_json(fast.json([](std::string_view l){return l=="row_tile"?std::string("auto (planner rule)"):std::string();}));
     check(j.find("profile")->as_string()=="fast"&&j.find("app")->as_string()=="decode-service"&&j.find("qualification")->as_string()=="qualified"&&!j.find("allow_pending")->as_bool(),
@@ -562,7 +713,7 @@ void profile_tests(){
     auto* row=levers->find("row_tile");check(row->find("effective")->as_string()=="auto (planner rule)"&&row->find("switch")->as_string()=="--row-tile"&&
           row->find("kind")->as_string()=="exact"&&row->find("status")->as_string()=="profile","JSON row fields");
     check(levers->find("dsa_index_mma")->find("wanted")->as_string()=="mma"&&levers->find("dsa_index_mma")->find("kind")->as_string()=="bit-changing","JSON pending row");
-    check(j.find("pending")->as_array().size()==3&&j.find("unqualified")->as_array().empty(),"JSON pending / unqualified lists");
+    check(j.find("pending")->as_array().size()==5&&j.find("unqualified")->as_array().empty(),"JSON pending / unqualified lists");
     check(strix::serve::parse_json(quality.json()).find("note")!=nullptr,"quality JSON states quality = default");
     std::cout<<"INFO profile default: "<<def.json().size()<<" B JSON, pending "<<def.pending().size()<<"; fast pending "<<fast.pending().size()<<"\n";
 }
@@ -835,6 +986,6 @@ int main(int argc,char** argv){try{
 #ifdef GLM_TIERSTREAM_LIBRARY
     tier_budget_tests();
 #endif
-    tier_mapping_tests();prefill_cache_tests();host_commit_tests();placement_tests();profile_tests();unit_file_tests(argv[1]);binding_tests(argv[1]);encoding_tests(argv[1]);lifetime_tests(argv[1]);receipt_tests(argc>2?std::filesystem::path(argv[2]):std::filesystem::path());request_tests();
+    tier_mapping_tests();prefill_cache_tests();step_plan_tests();decode_timeline_tests();c1_schedule_tests();slot_census_tests();planned_residents_tests();mtp_tile_tests();host_commit_tests();placement_tests();profile_tests();unit_file_tests(argv[1]);binding_tests(argv[1]);encoding_tests(argv[1]);lifetime_tests(argv[1]);receipt_tests(argc>2?std::filesystem::path(argv[2]):std::filesystem::path());request_tests();
     std::cout<<"PASS "<<checks<<" decode host checks: session/frontier, state bytes, KDA open-block replay model, DSA pools, argmax, expert catalog/units, cross-shard reads, guarded slots, generate requests\n";return 0;
 }catch(const std::exception& e){std::cerr<<e.what()<<"\n";return 1;}}
