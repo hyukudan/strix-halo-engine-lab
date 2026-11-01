@@ -235,19 +235,22 @@ void native_switch_and_yarn() {
         dc::admit_product_profile(o);
         Env exported;
         pr::apply(o.product_profile, [&](const char* key, const char* value) { exported[key] = value; return true; });
-        check(exported.empty(), "YaRN never exports unsupported profile switches");
-        check(dc::yarn_environment_refusal(exported, 2).empty(), "profile cannot introduce YaRN refusal");
-        check(o.product_profile.qualification() == "qualified", "YaRN declined row is not executed unqualified");
-        if (std::string_view(profile) != "fast") continue;
+        // The YaRN sweep skips profile metadata, as the decoder does before its admission check.
+        Env execution;
+        for (const auto& [key, value] : exported) if (!pr::metadata_environment(key)) execution.emplace(key, value);
+        check(dc::yarn_environment_refusal(execution, 2).empty(), "profile cannot introduce YaRN refusal");
+        const bool fast = std::string_view(profile) == "fast";
+        // YaRN admits BF16 route storage (no rotary site), so fast applies it there as on native.
+        check(fast ? execution == Env{{"STRIX_QPF2K_MOE_ROUTE_BF16", "1"}} : execution.empty(),
+            "YaRN exports only admitted profile switches");
+        check(!fast || exported.at("STRIX_QWEN_PROFILE_OWNED_moe_route_bf16") == "fast:provisional:1",
+            "YaRN exports provisional provenance");
+        check(o.product_profile.qualification() == (fast ? "qualification in progress: moe_route_bf16" : "qualified"),
+            "YaRN stamps the applied provisional row");
+        if (!fast) continue;
         const auto* row = o.product_profile.find("moe_route_bf16");
-        check(row && row->status == pr::Status::pending && row->value == "0", "YaRN declines runnable row to builtin");
-        check(row->reason == "YaRN execution environment not supported: STRIX_QPF2K_MOE_ROUTE_BF16", "YaRN uses actual admission reason");
-        const auto json = strix::serve::parse_json_unique(o.product_profile.json());
-        check(json.find("levers")->find("moe_route_bf16")->find("reason")->as_string() == row->reason, "decline reason in row receipt");
-        check(json.find("pending")->as_array()[1].find("reason")->as_string() == row->reason, "decline reason in pending receipt");
-        check(o.product_profile.notices()[1].find(row->reason) != std::string::npos, "decline reason in single row notice");
-        for (const auto& notice : o.product_profile.notices())
-            check(notice.find("qualification in progress") == std::string::npos, "declined row never claims provisional execution");
+        check(row && row->status == pr::Status::provisional && row->value == "1" && row->reason.empty(),
+            "YaRN applies the admitted provisional row");
     }
     check(pr::metadata_environment("STRIX_QWEN_PROFILE_ALLOW_PENDING") &&
         pr::metadata_environment("STRIX_QWEN_PROFILE_OWNED_moe_route_bf16") &&

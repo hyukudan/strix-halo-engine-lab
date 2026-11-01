@@ -711,6 +711,116 @@ void yarn_admission_tests(const gguf::FileInfo& info, const ModelManifest& manif
         return resolve_effective_config(r,model,info,manifest,validated_model_content_identity,{true,true,true},m);
     };
     {
+        constexpr auto key = "STRIX_QPF2K_MOE_ROUTE_BF16";
+        auto plain = request; plain.options.tokens.resize(262144U,1U);
+        const auto off = resolve(plain,memory);
+        expect(off.admitted && !off.options.prefill_moe_route_bf16,"YaRN long prompt candidate defaults off");
+        const auto off_pair = numerical_profile_pair(off.options);
+        // Exercise the host compiler with synthetic kernels, without HIP. The
+        // production prefix key includes this execution identity and pair hash.
+        const auto compile_identity = [&](const Options& o) {
+            auto req=prompt_compiler_requests(o,model,manifest);
+            req.binding.prefill_arithmetic_identity=numerical_profile_pair_identity(numerical_profile_pair(o));
+            const auto registry=config_test_registry(model,req.binding);
+            return compile_serial_execution(model,registry,req.binding,req.buffers,256).execution_identity;
+        };
+        auto compiled_memory=memory;
+        compiled_memory.estimate = [&](const Options& o) {
+            auto required=memory.estimate(o);
+            required.organization["prefill_execution_identity"]=compile_identity(o);
+            return required;
+        };
+        const auto compiled_off=resolve(plain,compiled_memory);
+        for (const bool cli : {false,true}) {
+            auto on = plain;
+            if (cli) {
+                on.options = parse({"decoder","MODEL","1","--rope-yarn","2","--context","300000",
+                    "--generate","32","--prefill-moe-route-bf16","on"});
+                on.options.tokens = plain.options.tokens;
+                expect(!on.options.any_low_level_flag && !on.options.route_owned && yarn_route_refusal(on.options).empty(),
+                    "candidate CLI does not own the YaRN execution route");
+            } else on.environment[key] = "1";
+            const auto got = resolve(on,memory);
+            const auto pair = numerical_profile_pair(got.options);
+            const auto compiled_on=resolve(on,compiled_memory);
+            expect(compiled_on.admitted && compiled_on.host_compilation.at("prefill_execution_identity")==compile_identity(got.options) &&
+                compiled_on.host_compilation!=compiled_off.host_compilation,
+                "YaRN candidate reaches admission compiler and separates prefix execution identity");
+            expect(got.admitted && got.error.empty() && got.options.prefill_moe_route_bf16 &&
+                (pair.fast_components & kFastPrefillMoeRouteBF16) && numerical_profile_pair_admitted(pair),
+                "YaRN env and CLI candidate admitted with composed prefill identity");
+            expect(pair.decode==off_pair.decode && pair.prefill==off_pair.prefill &&
+                numerical_profile_pair_identity(pair)!=numerical_profile_pair_identity(off_pair) &&
+                got.rotary_identity.json()==off.rotary_identity.json() && got.admission==off.admission,
+                "YaRN candidate separates arithmetic identity without changing rotary or capacity");
+            const auto json = effective_config_json(got);
+            expect(json.find("\"prefill_moe_route_bf16\":true")!=std::string::npos &&
+                json.find("fp16-v1+moeroute16")!=std::string::npos &&
+                json.find(std::to_string(moe_prefill_storage_identity(true)))!=std::string::npos,
+                "YaRN inspection carries candidate storage descriptor and hash");
+            on.options.prefill_moe_route_bf16_requested = false;
+            const auto cli_off = resolve(on,memory);
+            const auto recompiled_off=resolve(on,compiled_memory);
+            expect(recompiled_off.admitted && recompiled_off.host_compilation==compiled_off.host_compilation,
+                "YaRN candidate off restores compiled prefix execution identity");
+            expect(cli_off.admitted && !cli_off.options.prefill_moe_route_bf16 &&
+                numerical_profile_pair(cli_off.options)==off_pair && cli_off.host_compilation==off.host_compilation &&
+                cli_off.admission==off.admission && cli_off.rotary_identity.json()==off.rotary_identity.json(),
+                "YaRN CLI off restores plain identities and admission including env precedence");
+        }
+        // The environment candidate parser intentionally accepts every string.
+        for (const char* value : {"","0","0suffix","1","on","other"}) {
+            auto r=plain; r.environment[key]=value; const auto got=resolve(r,memory);
+            const bool enabled=value[0] && value[0]!='0';
+            expect(yarn_environment_refusal({{key,value}},2).empty() && got.admitted &&
+                got.options.prefill_moe_route_bf16==enabled,"YaRN matches native candidate environment value semantics");
+            if (!enabled) expect(numerical_profile_pair(got.options)==off_pair &&
+                effective_config_json(got).find("fp16-v1+moeroute16")==std::string::npos,
+                "YaRN environment off retains plain storage identity");
+        }
+        for (const char* value : {"on","off","1","0"}) {
+            const auto o=parse({"decoder","MODEL","1","--rope-yarn","2","--context","300000",
+                "--prefill-moe-route-bf16",value});
+            expect(!o.any_low_level_flag && !o.route_owned,"all candidate CLI values are product switches");
+        }
+        for (const char* value : {"","perhaps","01","true"}) {
+            bool rejected=false;
+            try { (void)parse({"decoder","MODEL","1","--rope-yarn","2","--context","300000",
+                "--prefill-moe-route-bf16",value}); }
+            catch (const std::invalid_argument&) { rejected=true; }
+            expect(rejected,"YaRN invalid candidate CLI values refused");
+        }
+        for (const auto& [name,value] : Environment{{"STRIX_QPF2K_MOE","513"},{"STRIX_QPF2K_MOE_SMALL","16"},
+            {"STRIX_QPF2K_MOE_MC","2"},{"STRIX_QPF2K_MOE_DA16","0"},{"STRIX_QPF2K_MOE_ROUTE","6"},
+            {"STRIX_INTPREFILL_MOE_TUNE","0"}}) {
+            auto env=off.environment; env[key]="1"; env[name]=value;
+            auto yarn=off.options, native=yarn; native.rotary=RotaryDescriptor::native();
+            std::string yarn_error,native_error;
+            resolve_moe_route_bf16(yarn,env,false,true,yarn_error);
+            resolve_moe_route_bf16(native,env,false,true,native_error);
+            expect(!yarn.prefill_moe_route_bf16 && yarn_error==native_error &&
+                yarn_error.find("other writers/readers unsupported")!=std::string::npos,
+                "YaRN uncovered writers and readers retain native candidate decline");
+        }
+        for (unsigned route=0;route<10U;++route) {
+            auto yarn=off.options; auto env=off.environment; env[key]="1";
+            if(route==0U)yarn.mtp.enabled=true;
+            if(route==1U)yarn.http_serve=true;
+            if(route==2U)yarn.http_batch=true;
+            if(route==3U)yarn.serving_concurrency=2;
+            if(route==4U)yarn.prefix_cache_host_bytes=4096;
+            if(route==5U)yarn.session_save="checkpoint";
+            if(route==6U)yarn.known_prefix_tail_rows={8};
+            if(route==7U)yarn.known_prefix_prefill_rows=0;
+            auto native=yarn; native.rotary=RotaryDescriptor::native();
+            std::string yarn_error,native_error;
+            resolve_moe_route_bf16(yarn,env,route==8U,route!=9U,yarn_error);
+            resolve_moe_route_bf16(native,env,route==8U,route!=9U,native_error);
+            expect(!yarn.prefill_moe_route_bf16 && !yarn_error.empty() && yarn_error==native_error,
+                "YaRN unsupported controllers, tails, GSQ and backend keep native decline reasons");
+        }
+    }
+    {
         SerialSessionStateLayoutRequest state_request; state_request.context_tokens = 300000U;
         const auto state = build_serial_session_state_layout(model,state_request);
         auto sized = request.options; sized.known_prefix_prefill_rows = 8192U;
@@ -1110,6 +1220,23 @@ void yarn_admission_tests(const gguf::FileInfo& info, const ModelManifest& manif
     mm.draft_chain=true;mo.known_prefix_window=mo.known_prefix_full_rows=true;mo.known_prefix_prefill_rows=8192;
     const auto ym=resolve(mtp,memory);
     expect(ym.admitted && ym.admission.at("mtp_enabled")==1,"explicit YaRN MTP admitted after resolved target organization");
+    {
+        auto candidate=mtp; candidate.environment["STRIX_QPF2K_MOE_ROUTE_BF16"]="1";
+        const auto declined=resolve(candidate,memory);
+        expect(!declined.admitted && !declined.options.prefill_moe_route_bf16 &&
+            declined.error=="MoE route BF16 candidate declined: MTP, nested, serving, cache and session routes are unsupported",
+            "YaRN MTP environment candidate refuses without mixing storage");
+        candidate.environment["STRIX_QPF2K_MOE_ROUTE_BF16"]="0";
+        const auto unchanged=resolve(candidate,memory);
+        expect(unchanged.admitted && unchanged.admission==ym.admission && unchanged.host_compilation==ym.host_compilation &&
+            numerical_profile_pair(unchanged.options)==numerical_profile_pair(ym.options),"YaRN MTP candidate off unchanged");
+        for (const bool on : {false,true}) {
+            candidate.options.prefill_moe_route_bf16_requested=on;
+            candidate.options.supplied_options.insert("--prefill-moe-route-bf16");
+            expect(yarn_route_refusal(candidate.options)=="YaRN MTP explicit target override not supported: --prefill-moe-route-bf16",
+                "YaRN MTP closed explicit organization unchanged for candidate flag");
+        }
+    }
     for(const auto c:{32768U,131072U,262144U,393216U,524288U}) {
         auto f2=mtp;f2.options.context_tokens=c;
         const auto unchanged=resolve(f2,memory);
@@ -1713,7 +1840,21 @@ int main(int argc, char** arguments) {
         auto baseline=request; baseline.options.baseline=true; baseline.options.prefill_moe_route_bf16_requested=true;
         expect(!resolve(baseline,memory).options.prefill_moe_route_bf16,"CLI baseline suppresses candidate CLI");
         const auto parsed=parse({"decoder","MODEL","1","--prefill-moe-route-bf16","on"});
-        expect(parsed.prefill_moe_route_bf16_requested==true,"candidate CLI parses");
+        expect(parsed.prefill_moe_route_bf16_requested==true && !parsed.any_low_level_flag && !parsed.route_owned,
+            "native candidate CLI parses without owning execution organization");
+        auto native_cli=request; native_cli.options=parsed; native_cli.options.tokens=request.options.tokens;
+        native_cli.options.generate_tokens=request.options.generate_tokens;
+        const auto native_on=resolve(native_cli,memory);
+        auto native_env=request; native_env.environment[candidate_key]="1";
+        const auto native_env_on=resolve(native_env,memory);
+        expect(native_on.admitted && native_on.options.prefill_moe_route_bf16 &&
+            numerical_profile_pair(native_on.options)==numerical_profile_pair(native_env_on.options) &&
+            native_on.options.rotary.mode()==RotaryMode::native,"native CLI and environment retain candidate semantics");
+        native_cli.options.prefill_moe_route_bf16_requested=false;
+        const auto native_off=resolve(native_cli,memory);
+        expect(native_off.admitted && !native_off.options.prefill_moe_route_bf16 &&
+            numerical_profile_pair(native_off.options)==numerical_profile_pair(base.options) &&
+            native_off.host_compilation==base.host_compilation,"native CLI off retains plain identities");
         auto precedence=request; precedence.environment[candidate_key]="1";
         precedence.options.prefill_moe_route_bf16_requested=false;
         expect(!resolve(precedence,memory).options.prefill_moe_route_bf16,"CLI off overrides env on");
@@ -1750,8 +1891,12 @@ int main(int argc, char** arguments) {
             const auto saved = old ? std::optional<std::string>{old} : std::nullopt;
             ::setenv(key,"0",1);
             const auto off = session_numerical_config("same execution");
+            const auto yarn_rotary=mock_rotary(2)->identity();
+            const auto yarn_off=session_numerical_config("same execution",yarn_rotary);
             ::setenv(key,"1",1);
             expect(session_numerical_config("same execution") != off,"route BF16 changes session namespace");
+            expect(session_numerical_config("same execution",yarn_rotary)!=yarn_off,
+                "YaRN candidate separates persisted state namespace with fixed rotary identity");
             if(saved) ::setenv(key,saved->c_str(),1); else ::unsetenv(key);
         }
         const auto captured=requested_prefill_environment([](const char* name)->const char* {

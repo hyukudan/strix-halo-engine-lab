@@ -2909,6 +2909,8 @@ Weights, activations and route weights retain their existing arithmetic.
   Q5_1/Q8_0 DA16 certificate down, effective tunes 80/82/88 (including XOR rows), ROUTE=14 and MC=1.
   The default vector merge/commit and scalar route (`STRIX_PREFILL_MOE_MERGE_VEC=0`)
   both widen BF16 in the admitted and device-side merge-zero/finish fallback branches.
+  Native and YaRN long-context plain CLI routes are covered; this
+  storage control adds no rotary site and leaves the YaRN rotary identity unchanged.
 - **Declines:** other tunes, core/G3/P1, SMALL, non-DA16 F16X, GSQ, plain/decode and
   known-rows organizations, MTP, nested/serving, cache/session routes and CUDA.
   Unsupported geometry or weight formats are refused before execution. The ordinary
@@ -2931,7 +2933,9 @@ Weights, activations and route weights retain their existing arithmetic.
 - **Qualification:** CPU option/identity/suppression tests and the native HIP fixture
   (scalar and vector merge, tunes 80/82/88, nonfinite status) pass. Model-fidelity
   qualification against its own references is pending; until it passes the candidate stays
-  opt-in and outside every profile.
+  opt-in outside the `default` and `quality` profiles, and `--profile fast` applies it as a
+  provisional row. YaRN model-fidelity and complete-workload qualification remain pending;
+  host admission does not establish them.
 - **Native fixture:** `ctest -R strix-hip-moe-route-bf16-tests --output-on-failure`
   covers both down formats, all three tunes, scalar/vector tails, top-k ten, padded tails, RNE ties, subnormals,
   infinities, NaNs, OFF byte equality and both merge/commit branches.
