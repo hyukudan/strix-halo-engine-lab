@@ -3,6 +3,7 @@
 // candidate pool, attention with window-only and compressed visible sets) and the compress kernel's fast form against
 // its default, and the segment launches against the per-segment calls. STRIX_DS41_ATTN_BENCH=1 adds timings.
 #include "strix/hip_ds41_attention.hpp"
+#include "strix/hip_ds41_formats.hpp"
 
 #include <algorithm>
 #include <bit>
@@ -485,6 +486,26 @@ void attention(std::uint64_t last, unsigned rows, unsigned nc, bool bench) {
         }
         expect(same(dout.get(), o) && same(dcodes.get(), codes) && same(ddeltas.get(), deltas) && same(dsums.get(), sums),
                "attention combine A8 = quantize_a8 of o, rows " + std::to_string(rows));
+    }
+    // the combine's A8 = the device enqueue_quantize_a8 of the o it stores, also with one NaN head (16 all-NaN groups):
+    // codes and sums bitwise, deltas bitwise or both NaN
+    for (const bool poison : {false, true}) {
+        auto qn = q;
+        if (poison) std::fill(qn.begin(), qn.begin() + 512, std::numeric_limits<float>::quiet_NaN());
+        Dev<float> dqn(qn), dout2(o.size()), fdeltas(o.size() / 32U), qdeltas(o.size() / 32U);
+        Dev<std::int8_t> fcodes(o.size()), qcodes(o.size());
+        Dev<std::int32_t> fsums(o.size() / 32U), qsums(o.size() / 32U);
+        g::AttentionView avn = avf;
+        avn.q = dqn.p; avn.o = dout2.p; avn.codes = fcodes.p; avn.deltas = fdeltas.p; avn.sums = fsums.p;
+        g::enqueue_attention(avn, nullptr);
+        strix::ds41::enqueue_quantize_a8(dout2.p, 64U * 512U, rows, qcodes.p, qdeltas.p, qsums.p, nullptr);
+        check(hipDeviceSynchronize());
+        const auto fd = fdeltas.get(), qd = qdeltas.get();
+        bool deltas_same = fd.size() == qd.size();
+        for (std::size_t i = 0; deltas_same && i < fd.size(); ++i)
+            deltas_same = std::isnan(fd[i]) ? std::isnan(qd[i]) : std::bit_cast<std::uint32_t>(fd[i]) == std::bit_cast<std::uint32_t>(qd[i]);
+        expect(same(fcodes.get(), qcodes.get()) && same(fsums.get(), qsums.get()) && deltas_same,
+               std::string("attention combine A8 = device quantize_a8 of o") + (poison ? " (NaN head)" : "") + ", rows " + std::to_string(rows));
     }
     // tensor-parallel rank 1: heads 32..63 only (q, sink and o of those heads, contiguous)
     {
