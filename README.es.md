@@ -1146,8 +1146,9 @@ las [comprobaciones de fidelidad en contexto largo](tools/qualification/longctx_
 ### Exposición de los servidores
 
 Qwen y DeepSeek publican las funciones ejecutadas en `GET /v1/capabilities`; el objeto `strix` de cada respuesta
-indica la política de muestreo solicitada frente a la efectiva. Los campos de generación no admitidos devuelven 400 indicando
-el campo. Qwen admite JSON restringido exacto respecto a su objetivo restringido, presupuestos de thinking, logprobs,
+indica la política de muestreo solicitada frente a la efectiva. En todos los servidores (Qwen, DeepSeek, MiniMax) los
+campos de generación no admitidos devuelven 400 indicando el campo. MiniMax decodifica de forma greedy: una temperatura
+positiva se acepta y se indica como ignorada en `timings.sampling_note`. Qwen admite JSON restringido exacto respecto a su objetivo restringido, presupuestos de thinking, logprobs,
 transformaciones de logits y progreso SSE. Los presupuestos/transformaciones son políticas declaradas que cambian tokens;
 los logprobs/el progreso conservan los tokens. La selección de políticas usa ventanas MTP admitidas equivalentes al serial o
 la alternativa serial; `--http-selection-mtp off` fuerza esta última. Véanse los

@@ -1093,8 +1093,9 @@ See [YaRN MTP and bundles](docs/engine/speculative/mtp-native-cli.md#explicit-ya
 ### Exposing the servers
 
 Qwen and DeepSeek publish executed features at `GET /v1/capabilities`; each response's `strix` object
-states requested versus effective sampling policy. Unsupported generation fields return 400 naming
-the field. Qwen supports constrained JSON exact to its constrained target, thinking budgets, logprobs,
+states requested versus effective sampling policy. On every server (Qwen, DeepSeek, MiniMax) unsupported
+generation fields return 400 naming the field. MiniMax decodes greedy: a positive temperature is accepted and
+reported as ignored in `timings.sampling_note`. Qwen supports constrained JSON exact to its constrained target, thinking budgets, logprobs,
 logit transforms and SSE progress. Budgets/transforms are declared token-changing policies;
 logprobs/progress preserve tokens. Policy selection uses admitted serial-equivalent MTP windows or
 serial fallback; `--http-selection-mtp off` forces the latter. See
