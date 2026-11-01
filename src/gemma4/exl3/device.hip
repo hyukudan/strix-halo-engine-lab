@@ -265,6 +265,14 @@ template <unsigned K> struct CoopLane {
         low = (b << shift) | (c >> (32 - shift));
         tail = c << shift;
     }
+    // The same window from words fetched earlier (CoopWords): alignment is
+    // deferred to the chunk's use so pending prefetches are not waited on.
+    __device__ __forceinline__ void align(std::uint32_t a, std::uint32_t b, std::uint32_t c, unsigned lane) {
+        const unsigned shift = ((lane * 8 + 1) * K + 256 * K - 16) & 31U;
+        high = (a << shift) | (b >> (32 - shift));
+        low = (b << shift) | (c >> (32 - shift));
+        tail = c << shift;
+    }
     // State 8t+J: the 16 ring bits starting J*K bits into the aligned window.
     template <unsigned J> __device__ __forceinline__ unsigned state() const {
         constexpr unsigned offset = J * K;
@@ -272,6 +280,15 @@ template <unsigned K> struct CoopLane {
         else if constexpr (offset < 32) return ((high << (offset - 16)) | (low >> (48 - offset))) & 65535U;
         else if constexpr (offset <= 48) return (low >> (48 - offset)) & 65535U;
         else return ((low << (offset - 48)) | (tail >> (80 - offset))) & 65535U;
+    }
+};
+// Raw trellis words of one lane and chunk (CoopLane::load's three reads).
+template <unsigned K> struct CoopWords {
+    std::uint32_t a, b, c;
+    __device__ __forceinline__ void fetch(const std::uint32_t* data, unsigned lane) {
+        constexpr unsigned count = 8 * K;
+        const unsigned index = ((lane * 8 + 1) * K + 256 * K - 16) / 32;
+        a = data[index % count]; b = data[(index + 1) % count]; c = data[(index + 2) % count];
     }
 };
 // Accumulates one split of one tile column; returns the quad-reduced value in
@@ -304,9 +321,9 @@ __device__ __forceinline__ void coop_body(LinearView w, const _Float16* x, unsig
     const auto* core = reinterpret_cast<const std::uint32_t*>(w.data + 2ULL * (w.inputs + w.outputs));
     if constexpr (Depth > 1) {
         if (span % Depth == 0) {
-            CoopLane<K> pipe[Depth];
+            CoopWords<K> pipe[Depth];
 #pragma unroll
-            for (unsigned j = 0; j < Depth; ++j) pipe[j].load(core + (std::size_t(begin + j) * tiles + tile) * (8 * K), lane);
+            for (unsigned j = 0; j < Depth; ++j) pipe[j].fetch(core + (std::size_t(begin + j) * tiles + tile) * (8 * K), lane);
             for (unsigned k = begin; k < end; k += Depth) {
 #pragma unroll
                 for (unsigned j = 0; j < Depth; ++j) {
@@ -316,8 +333,9 @@ __device__ __forceinline__ void coop_body(LinearView w, const _Float16* x, unsig
                         const auto* row = x + std::size_t(r) * w.inputs + (k + j) * 16 + 2 * a;
                         xs[r][0] = row[0]; xs[r][1] = row[1]; xs[r][2] = row[8]; xs[r][3] = row[9];
                     }
-                    const CoopLane<K> t = pipe[j];
-                    if (k + j + Depth < end) pipe[j].load(core + (std::size_t(k + j + Depth) * tiles + tile) * (8 * K), lane);
+                    CoopLane<K> t;
+                    t.align(pipe[j].a, pipe[j].b, pipe[j].c, lane);
+                    if (k + j + Depth < end) pipe[j].fetch(core + (std::size_t(k + j + Depth) * tiles + tile) * (8 * K), lane);
                     coop_chunk<K, Rows>(t, xs, acc);
                 }
             }
@@ -490,14 +508,14 @@ __global__ void coop_output_group_kernel(CoopGroup g, unsigned rows, unsigned* f
     }
     output_body(w, g.out[t], rows, failure, group);
 }
-// Trellis prefetch depth of the decode cores: 2 by default (measured C1 decode
-// gain; 4 measured the same), STRIX_G4_EXL3_COOP_DEPTH=1 restores one chunk.
+// Trellis prefetch depth of the decode cores: 4 by default (fastest measured C1
+// decode), 2 selectable; STRIX_G4_EXL3_COOP_DEPTH=1 restores one aligned chunk.
 unsigned coop_depth() {
     static const unsigned depth = [] {
         const auto* p = std::getenv("STRIX_G4_EXL3_COOP_DEPTH");
-        if (!p || std::string_view(p) == "2") return 2U;
+        if (!p || std::string_view(p) == "4") return 4U;
         if (std::string_view(p) == "1") return 1U;
-        if (std::string_view(p) == "4") return 4U;
+        if (std::string_view(p) == "2") return 2U;
         throw std::invalid_argument("STRIX_G4_EXL3_COOP_DEPTH must be 1, 2 or 4");
     }();
     return depth;
