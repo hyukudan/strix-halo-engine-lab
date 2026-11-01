@@ -111,6 +111,12 @@ Json effective_config(const Backend& backend, const Request& request, bool draft
         "C2..C8 multi-stream-batch-v1: window <= max_k for per-depth-cost drafters (MTP; DFlash C1-only) under max_draft_share, measured batch step upper/plain lower per (C, draft rows), >= min_gain" :
         "stream-survival-cost-v1; C1 length bins; Beta(1,2) minus one posterior SD; decay 0.98; measured cycle upper/plain lower; >=5% gain; bounded calibration probes; C2..C8 plain");
     if (multi.enabled) j.set("multi_stream_policy",multi.json());
+    // Only when enabled: OFF receipts stay byte-identical.
+    const auto confidence = ConfidenceConfig::from_environment();
+    if (confidence.enabled()) {
+        j.set("auto_policy",j.find("auto_policy")->as_string()+"; C1 MTP drafter-confidence window: cumulative top-1 prob >= tau, chunked drafting, no probes");
+        j.set("mtp_confidence",confidence.json());
+    }
     j.set("dflash_environment",environment ? environment : "unset");
     j.set("qualification","per profile: see profile.levers (ready rows applied, pending rows listed)");
 #ifdef __linux__
@@ -165,6 +171,7 @@ struct Coordinator::Slot {
     AutoPolicy policy;
     std::array<std::uint64_t,8> admitted{};
     double minimum_gain = 0;
+    ConfidenceConfig confidence; // resolved per session (env, drafter config or builtin); disabled when not capable
 };
 Coordinator::Coordinator(Backend& backend, DraftFactory drafts, std::shared_ptr<CostModel> costs)
     : backend_(backend), drafts_(std::move(drafts)), costs_(costs ? std::move(costs) : std::make_shared<CostModel>()) {}
@@ -196,6 +203,7 @@ std::size_t Coordinator::submit(Request r) {
     if (s->dflash_enabled && s->request.dflash != DraftMode::off && drafts_ && s->request.sampling.temperature == 0)
         s->draft = drafts_();
     if (s->draft) s->draft->attach(*s->state);
+    if (s->draft && confidence_.enabled()) s->confidence = s->draft->resolve_confidence(confidence_);
     if (s->request.dflash == DraftMode::on && s->dflash_enabled && s->request.sampling.temperature == 0)
         require(bool(s->draft), "DFlash on requires a drafter");
     s->out.setup_ms = elapsed(setup_start);
@@ -216,6 +224,7 @@ bool Coordinator::step() {
         bool prefill = false;
         std::uint32_t k = 0;
         WindowDecision decision;
+        bool confident = false;
         dflash::Acceptance delta;
         double draft_ms = 0, context_ms = 0;
         std::array<std::uint32_t,7> proposals{};
@@ -329,6 +338,9 @@ bool Coordinator::step() {
                     // Multi-stream auto remains plain until a whole-batch estimator is
                     // available; independent per-stream rates cannot qualify batch gains.
                     if (s.request.dflash == DraftMode::on) k = limit;
+                    // Drafter-confidence-gated C1 window: k is only the cap; the session picks the window below.
+                    else if (live == 1 && s.confidence.enabled() && s.request.dflash == DraftMode::automatic &&
+                             s.draft->confidence_capable()) { w.confident = true; k = std::min(limit,s.confidence.max_k); }
                     else if (live == 1) { w.decision = s.policy.choose(limit,position); k = w.decision.k; }
                     // Multi-stream: >1 live stream -> only the batch plan (k <= max_k; 0 for DFlash or when it loses).
                     else if (batch && plan.k[index]) {
@@ -342,7 +354,21 @@ bool Coordinator::step() {
                 w.k = k; w.rows = k+1;
                 if (k) {
                     const auto begin = Clock::now();
-                    try { w.proposals = s.draft->propose_window(s.out.ids.empty() ? s.request.prompt.back() : s.out.ids.back(),position,k); }
+                    const auto anchor = s.out.ids.empty() ? s.request.prompt.back() : s.out.ids.back();
+                    try {
+                        if (w.confident) {
+                            // Exactness: the window only selects how many drafted tokens are verified; the greedy
+                            // verdict decides every emitted token. No probes, no plain refresh on this path.
+                            const auto c = s.draft->propose_confident(anchor,position,k,s.confidence);
+                            require(c.window <= c.drafted && c.drafted <= k, "invalid confidence window");
+                            w.k = c.window; w.rows = w.k+1;
+                            for (std::uint32_t d = 0; d < w.k; ++d) w.proposals[d] = c.tokens[d];
+                            w.decision = {w.k,false,w.k ? s.policy.expected_tokens(position,w.k) : 1,0,0};
+                            ++s.out.confidence_cycles; s.out.confidence_drafted += c.drafted;
+                            s.out.confidence_unverified += c.drafted-c.window;
+                        }
+                        else w.proposals = s.draft->propose_window(anchor,position,k);
+                    }
                     catch (...) { s.out.draft_ms += elapsed(begin); throw; }
                     w.draft_ms = elapsed(begin); s.out.draft_ms += w.draft_ms;
                     for (const auto id : w.proposals) require(id < backend_.config().vocab, "draft token outside vocabulary");
@@ -489,6 +515,11 @@ Json Coordinator::receipt(std::size_t slot) const {
     acceptance.set("multistream_auto_cycles",r.multistream_auto_cycles);
     acceptance.set("multistream_auto_proposals",r.multistream_auto_proposals);
     acceptance.set("multistream_auto_max_window",std::uint64_t(r.multistream_auto_max_window));
+    if (s.confidence.enabled()) {
+        acceptance.set("confidence_cycles",r.confidence_cycles); acceptance.set("confidence_drafted",r.confidence_drafted);
+        acceptance.set("confidence_unverified",r.confidence_unverified);
+        j.set("mtp_confidence_resolved",s.confidence.json()); // tau + source (env, drafter-config or builtin)
+    }
     j.set("minimum_admitted_gain_estimate",s.minimum_gain);
     j.set("auto_evidence",s.policy.receipt());
     if (multi_.config().enabled) j.set("multistream_evidence",multi_.receipt());

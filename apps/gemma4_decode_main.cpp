@@ -27,7 +27,7 @@ int main(int argc, char** argv) {
         if (options.help) {
             std::cout << "strix-gemma4-decode MODEL --rope-tables TABLE_DIR [--ids IDS.txt | --prompt TEXT | --chat REQUEST.json | --fixture FIXTURE.npz] [--tokenizer tokenizer.json]\n"
                 "[--max-tokens 256] [--streams 1..8] [--dflash on|off|auto] [--draft-mtp DIR | --draft DRAFT.gguf --draft-rope TABLE.g4dr | --draft-eagle FILE] [--draft-k 0..7]\n"
-                "[--temperature 0 --top-p 1 --top-k 0 --seed 0] [--output json|ids|text] [--threads 1..16] [--backend host|device] [--ignore-eos] [--print-effective-config]\n"
+                "[--temperature 0 --top-p 1 --top-k 0 --seed 0] [--output json|ids|text] [--threads 1..16] [--backend host|device (default device in GPU builds)] [--ignore-eos] [--print-effective-config]\n"
                 "drafters: --draft-mtp DIR (Gemma-4-E4B-it MTP assistant: a drafter-mtp/ package or a model dir containing one; recommended),\n"
                 "  --draft DRAFT.gguf --draft-rope TABLE.g4dr (DFlash), --draft-eagle EAGLE.gguf (e4b-eagle fallback)\n"
                 "env: STRIX_G4_DRAFT_KIND=dflash|mtp|eagle (how --draft is read), STRIX_G4_MTP_TOPK=1..64 (clusters, default 64),\n"

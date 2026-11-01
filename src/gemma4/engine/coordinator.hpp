@@ -13,6 +13,8 @@
 #define STRIX_G4_DRAFT_KV_API 1
 // DraftSession::multi_stream_candidate (auto drafting at >1 live stream, window <= k cap).
 #define STRIX_G4_DRAFT_MULTI_API 1
+// DraftSession::confidence_capable / propose_confident (drafter-confidence-gated C1 window, STRIX_G4_MTP_CONF).
+#define STRIX_G4_DRAFT_CONFIDENCE_API 1
 
 namespace strix::gemma4::engine {
 
@@ -86,6 +88,24 @@ public:
     // or measured by the multi-stream auto policy; it still admits them only on their measured cost. Default
     // false keeps DFlash (fixed block cost) C1-only exactly as before.
     [[nodiscard]] virtual bool multi_stream_candidate() const { return false; }
+    // Drafter-confidence-gated window (ConfidenceConfig): the session drafts in chunks up to kmax depths, stopping
+    // once the cumulative top-1 probability falls below tau, and returns the window to verify (<= drafted <= kmax)
+    // plus the depths it drafted. Only confidence_capable() sessions are asked; the default keeps propose_window.
+    struct Confident {
+        std::array<std::uint32_t, 7> tokens{};
+        std::uint32_t window = 0, drafted = 0;
+    };
+    [[nodiscard]] virtual bool confidence_capable() const { return false; }
+    // The window configuration this session runs with: an env-explicit config as is, a per-drafter (default ON) one
+    // resolved from the drafter's config file / builtin default. Non-capable sessions never run the window.
+    [[nodiscard]] virtual ConfidenceConfig resolve_confidence(const ConfidenceConfig& config) const {
+        return confidence_capable() ? config : ConfidenceConfig{};
+    }
+    virtual Confident propose_confident(std::uint32_t anchor, std::uint64_t position, std::uint32_t kmax,
+                                        const ConfidenceConfig& config) {
+        (void)config;
+        return {propose_window(anchor, position, kmax), kmax, kmax};
+    }
     // Committed rows plus the token that follows each row (prompt[j+1] in prefill, verdict.emitted[j] in decode)
     // and, when wanted, their hidden rows. Same staging/publication protocol as stage().
     virtual void stage_rows(std::span<const float> taps, std::span<const float> hidden,
@@ -146,6 +166,8 @@ struct Result {
     std::uint64_t probes = 0;
     std::uint64_t multistream_auto_cycles = 0, multistream_auto_proposals = 0;
     std::uint32_t multistream_auto_max_window = 0; // largest auto window drafted while >1 stream was live
+    // Drafter-confidence-gated C1 cycles (STRIX_G4_MTP_CONF): cycles, depths drafted, drafted depths not verified.
+    std::uint64_t confidence_cycles = 0, confidence_drafted = 0, confidence_unverified = 0;
 };
 const char* status_name(Status status);
 
@@ -180,6 +202,7 @@ private:
     DraftFactory drafts_;
     std::shared_ptr<CostModel> costs_;
     MultiStreamPolicy multi_;
+    ConfidenceConfig confidence_ = ConfidenceConfig::from_environment();
     std::vector<std::unique_ptr<Slot>> slots_;
     std::uint64_t generation_ = 0, steps_ = 0;
 };

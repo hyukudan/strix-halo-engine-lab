@@ -118,16 +118,49 @@ std::filesystem::path resolve_drafter(const std::filesystem::path& path) {
     return {};
 }
 
+// Measured thresholds (gate n2/n3, see the comment below); ConfidenceConfig::builtin_tau covers unknown weights.
+constexpr float TAU_UNTUNED = 0.6F, TAU_FT1 = 0.4F;
+
+ConfidenceKeys confidence_keys(const strix::serve::Json& cfg) {
+    ConfidenceKeys k;
+    if (const auto* t = cfg.find("confidence_tau")) {
+        require(t->is_number() && t->as_double() > 0 && t->as_double() <= 1, "config.json confidence_tau must be in (0,1]");
+        k.tau = float(t->as_double());
+    }
+    for (auto [key, out] : {std::pair{"confidence_max_k", &k.max_k}, std::pair{"confidence_first", &k.first}})
+        if (const auto* v = cfg.find(key)) {
+            const double x = v->is_number() ? v->as_double() : 0;
+            require(x >= 1 && x <= 7 && x == std::floor(x), std::string("config.json ") + key + " must be an integer 1..7");
+            *out = std::uint32_t(x);
+        }
+    return k;
+}
+ConfidenceKeys confidence_keys(std::string_view config_json) { return confidence_keys(strix::serve::parse_json(config_json)); }
+
+float builtin_confidence_tau(std::string_view sha) {
+    // Measured C1 gate (EN/ES/JA/code, 256 tokens, ids == OFF): the untuned Google assistant is over-confident (top-1
+    // prob 0.80 vs 0.65 accepted), the Nemotron fine-tune ft1 is calibrated, hence different thresholds.
+    struct Known { std::string_view prefix; float tau; };
+    static constexpr Known known[] = {
+        {"12875062fc25c51e8fa9b62abd2de7ad48b7d63f8559d5d604fbd5a3d6bcff16", TAU_UNTUNED}, // google gemma-4-E4B-it-assistant
+        {"19594909271ef877", TAU_FT1},                                                      // e4bdraft ft1 (release drafter)
+    };
+    for (const auto& k : known) if (sha.substr(0, k.prefix.size()) == k.prefix) return k.tau;
+    return 0.0F;
+}
+
 Weights Weights::load(const std::filesystem::path& path, WeightFormat matrices) {
     (void)mtp_format_check(matrices);
     const auto directory = resolve_drafter(path);
     require(!directory.empty(), "no MTP drafter at " + path.string() + " (model.safetensors or " + drafter_subdirectory + "/)");
+    ConfidenceKeys confidence;
     if (std::filesystem::exists(directory / "config.json")) {
         const auto cfg = read_json(directory / "config.json");
         const auto* type = cfg.find("model_type");
         const auto* backbone = cfg.find("backbone_hidden_size");
         require(type && type->is_string() && type->as_string() == "gemma4_assistant", "config.json model_type must be gemma4_assistant");
         require(!backbone || backbone->as_int() == gemma4::hidden, "config.json backbone_hidden_size must be 2560");
+        confidence = confidence_keys(cfg);
     }
     const auto file = read_safetensors(directory / "model.safetensors");
     std::map<std::string, const SafeTensor*> by;
@@ -213,6 +246,10 @@ Weights Weights::load(const std::filesystem::path& path, WeightFormat matrices) 
     }
     require(used == file.tensors.size(), "unexpected tensor in assistant checkpoint (lm_head must stay tied)");
     w.source = hash_bytes(file.storage->data(), file.storage->size());
+    w.config.confidence_tau = confidence.tau;
+    w.config.confidence_max_k = confidence.max_k;
+    w.config.confidence_first = confidence.first;
+    w.config.confidence_builtin = builtin_confidence_tau(w.source);
     w.directory = directory;
     w.has_license = std::filesystem::exists(directory / "LICENSE");
     w.has_notice = std::filesystem::exists(directory / "NOTICE");
@@ -319,6 +356,18 @@ std::vector<std::uint32_t> top_clusters(std::span<const float> logits, std::uint
         out.push_back(id);
     }
     return out;
+}
+
+void Drafter::remember(const Inputs& in, std::uint32_t k) {
+    if (in.hidden.data() != saved_hidden_.data()) saved_hidden_.assign(in.hidden.begin(), in.hidden.end());
+    saved_ = in;
+    saved_.hidden = saved_hidden_;
+    saved_depth_ = k;
+}
+Draft Drafter::extend(std::uint32_t k) {
+    require(saved_depth_ && k > saved_depth_ && k <= max_depth, "extend needs a previous shallower draft");
+    const auto in = saved_;
+    return draft(in, k); // draft() calls remember(): saved_depth_ becomes k
 }
 
 struct HostDrafter::Impl {
@@ -431,6 +480,7 @@ Draft HostDrafter::draft(const Inputs& in, std::uint32_t k) {
         out.margin[depth] = bv[0] - second;
     }
     impl_->times.draft_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+    remember(in, k);
     return out;
 }
 

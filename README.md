@@ -14,8 +14,8 @@ the pair. DeepSeek also supports RTX + pair execution. Two more are opt-in: **Ne
 
 Published measurements include:
 
-- **Nemotron 3.5 Bolt E4B (one node):** 85.1 tok/s at one request with the MTP drafter on the official Q4_K_M;
-  337.5 tok/s aggregate at eight requests with `fast`; the `quality` EXL3 pack agrees with BF16 on 92.9 % of
+- **Nemotron 3.5 Bolt E4B (one node):** 92.9 tok/s at one request with the MTP drafter on the official Q4_K_M
+  (100.6 with `fast`); 340.2 tok/s aggregate at eight requests with `fast`; the `quality` EXL3 pack agrees with BF16 on 92.9 % of
   top-1 tokens (Q4_K_M: 87.0 %).
 - **Qwen3.8-Flash-Next:** 59.59 / 54.00 tok/s on 1K / 8K code prompts with MTP;
   two replicas reach 158.1 tok/s wall throughput at eight concurrent coding chats.
@@ -543,22 +543,25 @@ value comes from the same measuring session as the row it is compared with.
 
 | Profile | C1 with the [MTP drafter](https://huggingface.co/hyukudan/Nemotron-3.5-Bolt-E4B-MTP-Drafter) (shipped) | C1, drafter off | C4 | C8 |
 |---|---:|---:|---:|---:|
-| `default` (exact, `g4-v1`) | **85.1** | 55.9 | 169.3 | 237.9 |
-| `fast` (`g4-a8-v1`, qualified) | **92.2** | 53.9 | 205.1 | 337.5 |
-| `quality` ([EXL3 M4 pack](https://huggingface.co/hyukudan/Nemotron-3.5-Bolt-E4B-EXL3), `g4-exl3-v3`) | **72.1** | 44.4 | 153.0 | 258.7 |
-| llama.cpp `74a4fb00`, same Q4_K_M | — | 55.4 | 193.3 | 281.9 |
+| `default` (exact, `g4-v1`) | **92.9** | 56.0 | 169.3 | 238.5 |
+| `fast` (`g4-a8-v1`, qualified) | **100.6** | 54.1 | 206.7 | 340.2 |
+| `quality` ([EXL3 M4 pack](https://huggingface.co/hyukudan/Nemotron-3.5-Bolt-E4B-EXL3), `g4-exl3-v3`) | **83.8** | 44.4 | 153.1 | 258.3 |
+| llama.cpp `74a4fb00`, same Q4_K_M | — | 55.5 | 193.8 | 283.4 |
 
 With the drafter, token ids equal drafting off (verified for English, Spanish, Japanese and code at C1, and at C4).
+At one request the engine verifies only the drafted tokens the drafter is confident about (a cumulative-probability
+window, threshold stored per drafter), which lifted C1 with the drafter from 85.1 / 92.2 / 72.1 to 92.9 / 100.6 / 83.8
+tok/s (`default` / `fast` / `quality`, same machine); `STRIX_G4_MTP_CONF=0` restores the previous window policy.
 
 **MTP drafter** - [hyukudan/Nemotron-3.5-Bolt-E4B-MTP-Drafter](https://huggingface.co/hyukudan/Nemotron-3.5-Bolt-E4B-MTP-Drafter). A small assistant model (Google's
 Gemma-4-E4B-it MTP assistant, 78.8M parameters) proposes the next few tokens and the main model verifies them, so the
 output is identical to decoding without it; only the speed changes. The speed-up comes from the MTP assistant
-architecture and the engine's exact speculative decoding: C1 decode goes from 52.2 to 85.1 tok/s in English
-(`default`, drafter off and on in the same session, x1.63), and [Google's untuned assistant](https://huggingface.co/google/gemma-4-E4B-it-assistant) is just as fast in
+architecture and the engine's exact speculative decoding: C1 decode goes from 52.0 to 92.9 tok/s in English
+(`default`, drafter off and on in the same session, x1.79); [Google's untuned assistant](https://huggingface.co/google/gemma-4-E4B-it-assistant) is about as fast in
 this engine (see the comparison below). We lightly fine-tuned it on about 6.3M tokens that Nemotron 3.5 Bolt E4B
 generated from 17,865 prompts in eight languages plus code, tool calls and reasoning; on a held-out set of 697 prompts
-that adds about 1.5 % expected tokens per cycle (English 3.61 -> 3.65, Japanese 2.52 -> 2.60), within noise on the
-measured prompts. Download it into `MODEL_DIR/drafter-mtp/`; the engine uses it automatically.
+that adds about 1.5 % expected tokens per cycle (English 3.61 -> 3.65, Japanese 2.52 -> 2.60); with the confidence window it is faster
+than the untuned assistant on Spanish, Japanese and code and slower on English (+1.4 % geometric mean over the four). Download it into `MODEL_DIR/drafter-mtp/`; the engine uses it automatically.
 
 **EXL3 M4 pack (`quality` profile)** - [hyukudan/Nemotron-3.5-Bolt-E4B-EXL3](https://huggingface.co/hyukudan/Nemotron-3.5-Bolt-E4B-EXL3). An EXL3 (trellis-coded,
 scaled-Hessian) quantization of the BF16 model: MLP at 4 bits, attention q/o at 5, k/v and the output head at 6,
@@ -566,7 +569,7 @@ embedding and per-layer tables kept in BF16 - 4.65 bits per weight across the qu
 (2.5 GB of quantized weights) that reads 2.70 GB of weights per token (about 14 % less than Q4_K_M). On a held-out
 40-document, 8-language set its output is closer to the original BF16 model than the standard Q4_K_M: top-1 agreement
 92.94 % vs 87.0 %, mean KL 0.0367 vs 0.141. Pick it (`--profile quality --exl3-arm DIR`) when you want output closer
-to BF16; stay on `default` or `fast` with Q4_K_M for the highest speed. `quality` decodes at 72.1 tok/s with the
+to BF16; stay on `default` or `fast` with Q4_K_M for the highest speed. `quality` decodes at 83.8 tok/s with the
 drafter (44.4 without, token ids unchanged); its prefill and decode are still being optimised.
 
 **Compared with NVIDIA's official releases.** NVIDIA publishes the main model as [BF16](https://huggingface.co/nvidia/NVIDIA-Nemotron-3.5-Bolt-E4B-BF16) and as one
@@ -575,29 +578,31 @@ measured. Same machine, greedy, 256-token chat decode, tok/s.
 
 | Model (engine profile) | Download GB | Weight bytes read per token | Top-1 vs BF16 | Mean KL vs BF16 | C1 with MTP drafter | C1 plain | C4 | C8 | Prefill 2K | Prefill 8K |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| Official BF16, reference | 16.06 | 9.29 GB | 100 % | 0 | 38.1 | 19.8 | 72.4 | 156.7 | 565 | 534 |
-| Official Q4_K_M, `default` | 6.18 | 3.13 GB | 87.0 % | 0.141 | 85.1 | 55.9 | 169.3 | 237.9 | 466 | 429 |
-| Official Q4_K_M, `fast` | 6.18 | 3.13 GB | 86.7 % | 0.150 | 92.2 | 53.9 | 205.1 | 337.5 | 458 | 414 |
-| **EXL3 M4**, `quality` | 9.71 | **2.70 GB** | **92.94 %** | **0.0367** | 72.1 | 44.4 | 153.0 | 258.7 | 769 | 701 |
-| llama.cpp `74a4fb00`, official Q4_K_M | 6.18 | 3.13 GB | | | | 55.4 | 193.3 | 281.9 | 2,052 | 1,873 |
+| Official BF16, reference | 16.06 | 9.29 GB | 100 % | 0 | 38.1 ¹ | 19.8 | 72.4 | 156.7 | 565 | 534 |
+| Official Q4_K_M, `default` | 6.18 | 3.13 GB | 87.0 % | 0.141 | 92.9 | 56.0 | 169.3 | 238.5 | 466 | 429 |
+| Official Q4_K_M, `fast` | 6.18 | 3.13 GB | 86.7 % | 0.150 | 100.6 | 54.1 | 206.7 | 340.2 | 458 | 414 |
+| **EXL3 M4**, `quality` | 9.71 | **2.70 GB** | **92.94 %** | **0.0367** | 83.8 | 44.4 | 153.1 | 258.3 | 769 | 701 |
+| llama.cpp `74a4fb00`, official Q4_K_M | 6.18 | 3.13 GB | | | | 55.5 | 193.8 | 283.4 | 2,052 | 1,873 |
 
 Weight bytes per token: all linear layers plus one row of the embedding and per-layer tables (the EXL3 download is
 larger because it carries those tables in BF16). Fidelity: the held-out 40-document, 8-language set against the
 official BF16 logits; the `fast` row comes from the int8-activation evaluation, which measured `default` at
 86.95 % / 0.144 side by side. C4 and C8 run without drafting. The EXL3 prefill cells come from a later session, in which
-llama.cpp measured 2,053 / 1,875 tok/s.
+llama.cpp measured 2,053 / 1,875 tok/s. ¹ BF16 row measured before the confidence window; the Q4_K_M and EXL3
+decode cells and the llama.cpp decode cells come from one later session.
 
-Drafters on the official Q4_K_M (`default`, C1, token ids identical to drafting off for every drafter):
+Drafters on the official Q4_K_M (`default`, C1, token ids identical to drafting off for every drafter; MTP drafters
+with the confidence window at their own thresholds, 0.4 for ours and 0.6 for Google's; DFlash from an earlier session):
 
 | Prompt | Our MTP drafter: tokens / step | tok/s | Google assistant, untuned: tokens / step | tok/s | NVIDIA DFlash (360M): tokens / step | tok/s | Drafting off: tok/s |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| English | 2.02 | **85.1** | 2.03 | **85.2** | 2.21 | 69.0 | 52.1 |
-| Spanish | 1.73 | **78.6** | 1.83 | **79.9** | 1.55 | 58.5 | 52.0 |
-| Japanese | 1.83 | **76.5** | 1.84 | **76.9** | 1.56 | 59.9 | 52.1 |
-| Code | 2.33 | **98.1** | 2.27 | **95.3** | 2.15 | 73.6 | 52.0 |
+| English | 2.39 | 93.8 | 2.59 | **97.6** | 2.21 | 69.0 | 52.1 |
+| Spanish | 2.10 | **86.7** | 2.10 | 83.4 | 1.55 | 58.5 | 52.0 |
+| Japanese | 2.13 | **85.9** | 2.19 | 85.0 | 1.56 | 59.9 | 52.0 |
+| Code | 3.46 | **113.3** | 3.32 | 108.1 | 2.15 | 73.6 | 52.0 |
 
 DFlash gets more tokens per step in English, but each of its draft steps costs about 10 ms on this machine against
-about 1 ms for the MTP assistant, so its speed-up is lower (x1.12-1.41 vs x1.47-1.89).
+about 1 ms for the MTP assistant, so its speed-up is lower (x1.12-1.41 vs x1.60-2.18).
 
 Long-context decode (`default`, one request, Q4_K_M, tok/s at the given context depth; global-layer attention
 reads each K/V chunk once per pass, byte-identical, `STRIX_G4_ATTN_KV_SHARED=0` restores the previous kernel):

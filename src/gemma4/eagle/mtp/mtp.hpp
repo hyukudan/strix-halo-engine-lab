@@ -22,6 +22,7 @@
 #include <array>
 #include <filesystem>
 #include <memory>
+#include <string_view>
 #include <vector>
 
 namespace strix::gemma4::eagle::mtp {
@@ -39,6 +40,11 @@ struct Config {
     std::uint32_t sliding_keys = 512;
     std::array<bool, layers> full{false, false, false, true};
     float embedding_scale = 50.5F;
+    // Confidence-window defaults of this drafter (engine::ConfidenceConfig, used when STRIX_G4_MTP_CONF is unset):
+    // optional config.json keys confidence_tau (0,1] / confidence_max_k / confidence_first (1..7); 0 = key absent.
+    // confidence_builtin: the engine's builtin tau for this drafter (known weight hashes, see builtin_confidence_tau).
+    float confidence_tau = 0.0F, confidence_builtin = 0.0F;
+    std::uint32_t confidence_max_k = 0, confidence_first = 0;
     [[nodiscard]] std::uint32_t per_cluster() const { return vocab / centroids; }
     [[nodiscard]] std::uint32_t candidates() const { return top_k * per_cluster(); }
     [[nodiscard]] std::uint32_t head_dim(std::uint32_t l) const { return full[l] ? full_dim : sliding_dim; }
@@ -46,6 +52,12 @@ struct Config {
 };
 
 [[nodiscard]] std::uint32_t top_k_from_environment(std::uint32_t fallback = 64); // STRIX_G4_MTP_TOPK
+// Builtin confidence-window tau for known drafter weights (sha256 of model.safetensors), 0 when unknown (the engine
+// then uses ConfidenceConfig::builtin_tau). Measured on the C1 gate prompts (EN/ES/JA/code), ids == OFF.
+[[nodiscard]] float builtin_confidence_tau(std::string_view weights_sha256);
+// Optional confidence-window keys of drafter-mtp/config.json (validated; 0 = absent). Weights::load applies them.
+struct ConfidenceKeys { float tau = 0.0F; std::uint32_t max_k = 0, first = 0; };
+[[nodiscard]] ConfidenceKeys confidence_keys(std::string_view config_json);
 
 // Packaging convention (release): the drafter ships as <model dir>/drafter-mtp/ with config.json, model.safetensors,
 // LICENSE, NOTICE and LINEAGE.md (src/gemma4/eagle/mtp/export_drafter.py builds it). Accepts the drafter directory
@@ -128,6 +140,17 @@ public:
     [[nodiscard]] virtual const Config& config() const = 0;
     [[nodiscard]] virtual const Timings& timings() const = 0;
     virtual Draft draft(const Inputs& inputs, std::uint32_t k) = 0;
+    // Continue the most recent draft() call to total depth k (its depth < k <= max_depth). Result (tokens, prob,
+    // margin of every depth) is bit-identical to draft(inputs, k) from scratch: the chain is deterministic. The target
+    // KV views passed to draft() must be unchanged. Default: re-runs draft() on the inputs saved by remember().
+    virtual Draft extend(std::uint32_t k);
+protected:
+    // Saves the inputs (hidden row copied; KV views by pointer) and depth of a draft() call for the default extend().
+    void remember(const Inputs& inputs, std::uint32_t k);
+private:
+    Inputs saved_;
+    std::vector<float> saved_hidden_;
+    std::uint32_t saved_depth_ = 0;
 };
 
 class HostDrafter final : public Drafter {

@@ -12,7 +12,12 @@ struct Options {
     std::filesystem::path model, rope, tokenizer, draft, draft_rope, draft_eagle, draft_mtp, chat, ids;
     std::filesystem::path exl3_arm; // explicit changed-weight identity; model supplies BF16 exemptions
     std::vector<std::filesystem::path> fixtures;
-    std::string prompt, output = "json", backend = "host", bind = "127.0.0.1";
+#ifdef STRIX_GEMMA4_DEVICE_BACKEND
+    static constexpr const char* default_backend = "device"; // GPU builds run on the GPU unless --backend host
+#else
+    static constexpr const char* default_backend = "host";
+#endif
+    std::string prompt, output = "json", backend = default_backend, bind = "127.0.0.1";
     std::uint32_t threads = 16, streams = 1;
     std::uint16_t port = 8080;
     Request request;

@@ -24,6 +24,11 @@
 #else
 #define STRIX_G4_MTP_MULTI
 #endif
+#if defined(STRIX_G4_DRAFT_CONFIDENCE_API)
+#define STRIX_G4_MTP_CONF override
+#else
+#define STRIX_G4_MTP_CONF
+#endif
 
 namespace strix::gemma4::eagle::mtp {
 
@@ -48,6 +53,21 @@ public:
     // Cost grows per depth from a small base (~0.56 ms/depth on E4B): eligible for multi-stream auto,
     // still admitted only on its measured draft cost and the measured batch step.
     [[nodiscard]] bool multi_stream_candidate() const STRIX_G4_MTP_MULTI { return true; }
+#if defined(STRIX_G4_DRAFT_CONFIDENCE_API)
+    // Drafter-confidence-gated window (engine::ConfidenceConfig): draft config.first depths, extend by config.step
+    // (Drafter::extend, no recomputation on device) while the cumulative top-1 probability >= tau and depth < kmax;
+    // window = leading depths with cumulative probability >= tau (>= 1; 0 when prob_1 < min1). Same guards as
+    // propose_window, except that an unavailable draft verifies nothing (window 0, drafted 0).
+    [[nodiscard]] bool confidence_capable() const STRIX_G4_MTP_CONF { return true; }
+    // Per-drafter defaults when the env leaves them open: config.json confidence_* keys, else the builtin tau for
+    // these weights (builtin_confidence_tau), else ConfidenceConfig::builtin_tau.
+    [[nodiscard]] engine::ConfidenceConfig resolve_confidence(const engine::ConfidenceConfig& config) const STRIX_G4_MTP_CONF {
+        const auto& c = drafter_->config();
+        return config.resolved(c.confidence_tau, c.confidence_max_k, c.confidence_first, c.confidence_builtin);
+    }
+    Confident propose_confident(std::uint32_t anchor, std::uint64_t position, std::uint32_t kmax,
+                                const engine::ConfidenceConfig& config) STRIX_G4_MTP_CONF;
+#endif
     void stage_rows(std::span<const float> taps, std::span<const float> hidden, std::span<const std::uint32_t> next_tokens,
                     std::span<const std::uint64_t> positions) STRIX_G4_MTP_ROWS;
 #if defined(STRIX_G4_DRAFT_KV_API)
@@ -56,6 +76,8 @@ public:
     void set_source(KvSource source) { source_ = std::move(source); }
     [[nodiscard]] const Draft& last_draft() const { return last_; }
 private:
+    // Draft inputs of a cycle at (anchor, position); false when the previous row's hidden or the KV views are missing.
+    bool inputs(std::uint32_t anchor, std::uint64_t position, Inputs& in) const;
     std::unique_ptr<Drafter> drafter_;
     std::pair<std::uint32_t, std::uint32_t> layers_;
     Release release_;

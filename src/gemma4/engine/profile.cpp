@@ -15,7 +15,7 @@ constexpr Lever table[] = {
      .required = {false, true, false}, .ready = {true, true, true}, .runnable = {true, true, true},
      .kind = Kind::bit_changing, .apps = engine | decode_bench,
      .source = "g4-a8-v1 (A8G32 activations, integer dots; byte gates exact); "
-               "qualified: holdout fidelity bands met"},
+               "qualified: held-out fidelity bands met"},
     // Drafter: <model dir>/drafter-mtp when present, --draft-mtp DIR overrides, --draft off or
     // STRIX_G4_DRAFT=0 switches it off. Missing weights never fail: decode runs exact without it.
     {.name = "draft", .env = "STRIX_G4_DRAFT", .option = "--draft-mtp", .value = {"mtp-auto", "mtp-auto", "mtp-auto"},
@@ -25,6 +25,13 @@ constexpr Lever table[] = {
     {.name = "draft_mode", .env = "STRIX_G4_DFLASH", .option = "--dflash", .value = {"auto", "auto", "auto"},
      .builtin = "auto", .required = {false, false, false}, .ready = {true, true, true}, .runnable = {true, true, true},
      .kind = Kind::exact, .apps = engine, .off = "0", .source = "draft admission auto: C1 drafts, C2..C8 plain"},
+    // C1 MTP drafter-confidence window: the window only selects how many drafted tokens are verified (ids == OFF).
+    // Unset = per drafter (drafter-mtp/config.json confidence_tau, else the builtin tau for known weights, else 0.6);
+    // a number forces tau; STRIX_G4_MTP_CONF=0 switches it off (AutoPolicy windows as before).
+    {.name = "draft_window", .env = "STRIX_G4_MTP_CONF", .value = {"auto", "auto", "auto"}, .builtin = "auto",
+     .required = {false, false, false}, .ready = {true, true, true}, .runnable = {true, true, true},
+     .kind = Kind::exact, .apps = engine, .off = "0",
+     .source = "gemma4/e4b-mtp2: confidence-gated C1 MTP window, ids == OFF; gate EN untuned 85.6 -> 97.6 tok/s"},
     {.name = "exl3_route", .option = "--exl3-arm", .value = {"", "", "pack"}, .builtin = "off",
      .required = {false, false, true}, .ready = {true, true, true}, .runnable = {true, true, true}, .kind = Kind::pack,
      .apps = all_apps, .asset = true, .source = "EXL3 pack route (--exl3-arm)"},
@@ -34,7 +41,7 @@ constexpr Lever table[] = {
      .required = {false, false, false}, .ready = {false, false, true}, .runnable = {false, false, true},
      .kind = Kind::pack, .apps = engine,
      .source = "auto-select per pack and --streams: M4/M6 g4-exl3-v3 always, M5 v3 at >= 8 streams, else v1"},
-    // FAST targets WMMA prefill. g4-wmma-pf-v1 failed its frozen holdout gate, so the FAST column is pending
+    // FAST targets WMMA prefill. g4-wmma-pf-v1 failed its frozen held-out gate, so the FAST column is pending
     // g4-wmma-pf-v2 qualification; --allow-pending runs the v1 implementation, unqualified.
     {.name = "prefill_route", .env = "STRIX_G4_PREFILL", .value = {"exact", "wmma", "exact"}, .builtin = "exact",
      .required = {false, true, false}, .ready = {true, false, true}, .runnable = {true, false, true},
