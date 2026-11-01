@@ -907,6 +907,17 @@
   },
   {
     "engine": "deepseek",
+    "name": "FAST MoE block order",
+    "flag_or_env": "STRIX_DS41_FAST_MOE_ORDER",
+    "default": "on (with STRIX_DS41_FAST_MOE=1)",
+    "exact": "The FAST relaxed MoE kernels' outputs are bitwise identical in both block orders: rank-shaped bench (layer 20, 2048 / 4096 / 8192 rows) A8 codes, deltas, sums and raw down vectors, and two-node serve logits and generated ids under --profile fast. The FAST identity itself is unchanged.",
+    "gain": "Two-node serve TTFT with STRIX_DS41_FAST_MOE=1 at 8,399 / 32,499 tokens (one binary, cache off, one load per arm, two GPU turns in opposite arm order): 8.279 / 28.34 s with STRIX_DS41_FAST_MOE_ORDER=0 vs 8.107 / 27.65 s default (-2.1 / -2.4 %). Rank-shaped kernel bench: -2..-4 %.",
+    "preconditions": "STRIX_DS41_FAST_MOE=1 (--profile fast) and at most 65,535 route batches per call (else the batch-fastest order).",
+    "off_switch": "STRIX_DS41_FAST_MOE_ORDER=0",
+    "doc_anchor": "docs/optimizations.md#ds-fast-moe-order"
+  },
+  {
+    "engine": "deepseek",
     "name": "Prefill router scores v2",
     "flag_or_env": "STRIX_DS41_PREFILL_ROUTER_V2",
     "default": "on",

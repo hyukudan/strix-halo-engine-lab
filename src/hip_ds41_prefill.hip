@@ -2686,6 +2686,12 @@ void enqueue_prefill_router(const RouterView& view, void* stream) {
 // FAST lever ds41-moe-relaxed-v1: STRIX_DS41_FAST_MOE=1 (default off) or set_fast_moe(1 / 0; -1 = the environment)
 int fast_moe_mode = -1;
 void set_fast_moe(int mode) { fast_moe_mode = mode; }
+// STRIX_DS41_FAST_MOE_ORDER (read per call; default on, =0 off): the relaxed kernels walk output blocks fastest (same bits;
+// calls of more than 65535 batches keep the batch-fastest order, the grid y limit)
+static bool fast_moe_order() {
+    const char* e = std::getenv("STRIX_DS41_FAST_MOE_ORDER");
+    return !(e && e[0] == '0');
+}
 bool fast_moe() {
     static const bool env = [] { const char* e = std::getenv("STRIX_DS41_FAST_MOE"); return e != nullptr && std::strcmp(e, "1") == 0; }();
     return fast_moe_mode < 0 ? env : fast_moe_mode != 0;
@@ -2702,8 +2708,12 @@ void enqueue_prefill_gate_up(WeightFormat format, const PrefillGateUpView& view,
     const auto queue = static_cast<hipStream_t>(stream);
     if (fast_moe() && format == WeightFormat::iq2_xxs && view.hidden % 256U == 0U && view.inter % 128U == 0U &&
         view.routes.batch_rows <= relaxed_rows) {
-        hipLaunchKernelGGL(HIP_KERNEL_NAME(relaxed_gate_up_kernel<WeightFormat::iq2_xxs>), dim3(view.routes.max_batches, view.inter / 128U),
-                           dim3(relaxed_threads), 0, queue, view);
+        if (fast_moe_order() && view.routes.max_batches <= 65535U)  // grid y limit
+            hipLaunchKernelGGL(HIP_KERNEL_NAME(relaxed_gate_up_kernel<WeightFormat::iq2_xxs, true>), dim3(view.inter / 128U, view.routes.max_batches),
+                               dim3(relaxed_threads), 0, queue, view);
+        else
+            hipLaunchKernelGGL(HIP_KERNEL_NAME(relaxed_gate_up_kernel<WeightFormat::iq2_xxs, false>), dim3(view.routes.max_batches, view.inter / 128U),
+                               dim3(relaxed_threads), 0, queue, view);
         check(hipGetLastError(), "prefill gate/up launch (relaxed)");
         return;
     }
@@ -2756,8 +2766,12 @@ void enqueue_prefill_down(WeightFormat format, const PrefillDownView& view, void
     const auto queue = static_cast<hipStream_t>(stream);
     if (fast_moe() && format == WeightFormat::q2_k && view.width % 256U == 0U && view.outputs % 256U == 0U &&
         view.routes.batch_rows <= relaxed_rows) {
-        hipLaunchKernelGGL(HIP_KERNEL_NAME(relaxed_down_kernel<WeightFormat::q2_k>), dim3(view.routes.max_batches, view.outputs / 256U),
-                           dim3(relaxed_threads), 0, queue, view);
+        if (fast_moe_order() && view.routes.max_batches <= 65535U)  // grid y limit
+            hipLaunchKernelGGL(HIP_KERNEL_NAME(relaxed_down_kernel<WeightFormat::q2_k, true>), dim3(view.outputs / 256U, view.routes.max_batches),
+                               dim3(relaxed_threads), 0, queue, view);
+        else
+            hipLaunchKernelGGL(HIP_KERNEL_NAME(relaxed_down_kernel<WeightFormat::q2_k, false>), dim3(view.routes.max_batches, view.outputs / 256U),
+                               dim3(relaxed_threads), 0, queue, view);
         check(hipGetLastError(), "prefill down launch (relaxed)");
         return;
     }
