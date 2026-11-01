@@ -874,6 +874,17 @@
   },
   {
     "engine": "deepseek",
+    "name": "Split Engram read of a prefill piece",
+    "flag_or_env": "STRIX_DS41_ENGRAM_SPLIT_READ",
+    "default": "on",
+    "exact": "Bitwise: the same rows land in the same buffer; two-node serve logits and generated ids identical to the published references at 8,399 / 32,499 / 44,699 tokens with the lever on and off.",
+    "gain": "Two-node serve TTFT, A/B and B/A GPU turns: 9.01 / 31.87 / 45.04 s off vs 8.50 / 30.79 / 44.41 s on at 8,399 / 32,499 / 44,699 tokens (-5.6 / -3.4 / -1.4 %).",
+    "preconditions": "Device prefill with the overlapped Engram read and at least two Engram layers.",
+    "off_switch": "STRIX_DS41_ENGRAM_SPLIT_READ=0",
+    "doc_anchor": "docs/optimizations.md#ds-engram-split-read"
+  },
+  {
+    "engine": "deepseek",
     "name": "Engram lookahead between prefill pieces",
     "flag_or_env": "STRIX_DS41_ENGRAM_LOOKAHEAD",
     "default": "on",

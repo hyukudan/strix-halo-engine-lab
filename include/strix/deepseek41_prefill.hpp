@@ -137,7 +137,7 @@ struct PrefillResult {
     std::uint32_t next_token = 0;
     std::vector<std::uint64_t> stream_hashes;  // last row, after each layer (stream_hashes)
     double seconds = 0.0, engram_seconds = 0.0, head_seconds = 0.0;
-    double engram_wait_seconds = 0.0;  // overlapped Engram read: the part the run waited for (before the first Engram layer)
+    double engram_wait_seconds = 0.0;  // overlapped Engram read: the part the run waited for (before the Engram layers)
     std::vector<PrefillLayerTiming> layers;
     std::uint64_t row_layers = 0;        // rows x layers computed (the cone's saving against rows x 40)
     std::vector<std::vector<std::uint32_t>> routing_loads;  // routing_loads: [layer][expert] entries of the output rows
