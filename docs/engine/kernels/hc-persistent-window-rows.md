@@ -28,10 +28,18 @@ Every value keeps the expression and operation order of the three-kernel form:
 - Output: per row and up row the serial chain over its 320 coefficients, then the ascending stream mix.
 - Folded inject: `hyper + hidden * gate`, stored in the activation format, exactly as the inject launch.
 
+The folded inject, the norm leaves and tree, the normalised product and the stream mix are operand-pinned to the
+separate kernels' instructions (`v_fmac hyper += gate * hidden`; tree upper operand first at every level, as
+`rows_prepare_hyper_norm_kernel`; `inverse * value` (FP32 streams `value * inverse`) then the weight;
+`v_fmac mixed += normalised * sig`), so NaN payloads equal the separate launches too.
+
 The fixture `strix-hip-known-window-hc-persistent-tests` (`strix-hip-known-window-tests --hc-rows`
 with both switches) requires the 36 HC rows cases to equal the serial R1 launches bit for bit with the
 persistent form launched, and the folded inject + HC launch to equal the inject and HC rows launches over
-the whole window arena for three inject/HC pairs at 2, 4 and 8 rows.
+the whole window arena for three inject/HC pairs at 2, 4 and 8 rows. It then repeats the pairs over NaN-payload
+corpora (NaNs of different payloads in different leaves of one stream, NaN norm weights and gates, all-NaN and
+special values) against the separate launches (`hip_hyper_mix_testing_separate_launches`): the persistent HC step
+over the whole arena, normalised rows included, and the persistent inject fold over every live byte.
 
 ## Synchronisation
 

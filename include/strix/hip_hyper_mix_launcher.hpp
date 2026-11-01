@@ -104,6 +104,9 @@ bool hyper_mix_known_window_rows_launch_folded(const ElementwiseRowsViews* combi
     const HipElementwiseLauncherConfig& elementwise);
 // Number of folded window HC launches so far, for fixtures.
 std::uint64_t hip_hyper_mix_testing_folded_launches();
+// The owner-held HC workspace of the last folded launch ([8 rows][normalised row, low values] FP32), or null when it
+// worked in the arena's own workspace, for fixtures.
+const float* hip_hyper_mix_testing_folded_workspace();
 // Prefill: all T rows of an HC step (T a multiple of 8, tiles one stride apart) in one launch per kernel.
 void hyper_mix_known_prefill_rows_preflight(std::span<const ExecutionDispatchContext> rows,
     const HipHyperMixLauncherConfig& config);
@@ -149,6 +152,9 @@ private:
 
 // Number of persistent window HC launches so far (STRIX_HC_PERSISTENT=1), for fixtures.
 std::uint64_t hip_hyper_mix_testing_persistent_launches();
+// Fixtures: true runs the window HC rows (and declines the persistent inject fold) as the separate launches even
+// with STRIX_HC_PERSISTENT=1, as the reference of the persistent form.
+void hip_hyper_mix_testing_separate_launches(bool separate);
 // Phase timestamps of the last persistent launch ([block][8], wall_clock64; STRIX_HC_PERSISTENT_TRACE).
 std::vector<std::uint64_t> hip_hyper_mix_testing_persistent_trace();
 

@@ -513,28 +513,8 @@ __device__ __forceinline__ std::uint32_t qpf2k_round_bf16(float value) {
     const auto bits = __float_as_uint(value);
     return (bits + 0x7fffU + ((bits >> 16U) & 1U)) >> 16U;
 }
-// Operand-pinned FP32 operations. IEEE results do not depend on operand order except for which NaN payload survives
-// when two NaN operands meet; the compiler commutes fadd / fmul / fma multiplicands freely, so the fold kernel pins
-// the base kernels' measured operand order (src0 first) to equal their bytes for NaN inputs too:
-//   combine_rows_kernel  v_add_f32  shared, routed
-//   inject_rows_kernel   v_fmac_f32 hyper += gate * hidden        (src0 gate)
-//   norm leaves          v_fmac_f32 sum += value * value
-//   norm LDS tree        v_add_f32  r[l + s], r[l]                (upper first)
-//   normalized           v_mul_f32  inverse, value; v_mul_f32 (that), weight
-__device__ __forceinline__ float qpf2k_add(float src0, float src1) {
-    float d;
-    asm volatile("v_add_f32 %0, %1, %2" : "=v"(d) : "v"(src0), "v"(src1));
-    return d;
-}
-__device__ __forceinline__ float qpf2k_mul(float src0, float src1) {
-    float d;
-    asm volatile("v_mul_f32 %0, %1, %2" : "=v"(d) : "v"(src0), "v"(src1));
-    return d;
-}
-__device__ __forceinline__ float qpf2k_fmac(float acc, float src0, float src1) {
-    asm volatile("v_fmac_f32 %0, %1, %2" : "+v"(acc) : "v"(src0), "v"(src1));
-    return acc;
-}
+// Operand-pinned FP32 operations: qpf2k_add / qpf2k_mul / qpf2k_fmac (hip_hyper_mix_launcher.hip, with the measured
+// operand order of each base kernel).
 template <unsigned D> __device__ __forceinline__ float qpf2k_from_lane(float value) {
     return __shfl_down(value, D, 32);
 }

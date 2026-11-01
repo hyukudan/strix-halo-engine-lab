@@ -82,6 +82,13 @@ bool moe_experts_known_window_rows_launch_combined(std::span<const ExecutionDisp
     const HipMoeExpertsLauncherConfig& config, const q51_known_rows::Workspace& workspace,
     std::span<const void* const> combine_shared, std::span<const void* const> combine_routed,
     std::span<void* const> combine_output, const std::function<void()>& before_commit, std::uint32_t active_rows = 0);
+// STRIX_WINDOW_COMMIT_COMBINE against the separate launches it replaces (known_moe_rows_commit_kernel, then the window
+// combine_rows_kernel) on generated rows (2560 wide) of any bits: flavor 0 finite, 1 Inf / denormal / -0 / NaN payloads
+// (quiet and signalling, both signs) in the accumulation, shared and earlier routed rows, 2 BF16 rounding ties, carries
+// and overflow, 3 a row quantizer status, 4 a header route failure, 5 a row with status 8, 6 / 7 the combined row in place of
+// the shared / routed row, 8 a NaN in every accumulation and shared element. Compares every byte of every row view,
+// the CSR header and the D1 record. Returns {words, words differing}.
+std::array<double, 2> known_moe_commit_combine_selftest(std::uint32_t rows, std::uint32_t flavor, std::uint32_t seed);
 // Known-prompt prefill, A8 profile: all T rows (multiple of 8) of one routed step in one
 // call. Every 8-row chunk passes the window admission above (with the window's own
 // 8-row workspace); each per-row view must then be row 0 plus r times one stride.
