@@ -415,7 +415,14 @@ ChunkResult DevicePrefill::forward(KvTxn& transaction, std::span<const unsigned>
             if (bytes > tx->overlay[l].k.size()) { tx->overlay[l].k.resize(bytes); tx->overlay[l].v.resize(bytes); }
         }
         b.ranges.clear(); b.maximum.zero(); b.failure.zero();
-        if (!pinned) b.taps.zero(); // pinned copies only the rows this chunk writes
+        // Pinned copies only the rows this chunk writes; a model with fewer
+        // layers than a tap index leaves that tap's columns at zero, as the
+        // vector path's full zero does.
+        bool every_tap = true;
+        for (const auto t : tap_layers) every_tap = every_tap && t < c.layers;
+        if (!pinned) b.taps.zero();
+        else if (want_taps && !every_tap)
+            checked(hipMemsetAsync(b.taps.data(), 0, std::size_t(n) * result.tap_width * sizeof(float), b.queue));
         if (pinned) {
             b.copy_ready();
             if (want_taps) Impl::host_rows(b.pinned_taps, b.pinned_taps_floats, std::size_t(chunk_rows) * result.tap_width);
