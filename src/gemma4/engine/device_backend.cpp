@@ -45,7 +45,7 @@ public:
         switches.set("STRIX_G4_OUTPUT_TILE",enabled("STRIX_G4_CHUNK_DECODE") && tiling && std::string(tiling) == "1");
         switches.set("STRIX_G4_HOST_PARALLEL","not used by device target or device drafter");
         const auto* depth = std::getenv("STRIX_G4_EXL3_COOP_DEPTH");
-        switches.set("STRIX_G4_EXL3_COOP_DEPTH",std::string(depth && *depth ? depth : "2"));
+        switches.set("STRIX_G4_EXL3_COOP_DEPTH",std::string(depth && *depth ? depth : "4"));
         metadata_.set("off_switches",switches);
         // Prompt prefill: exact many-row chunks (same bytes as the eight-row
         // passes; EXL3 packs keep their identity's core order);

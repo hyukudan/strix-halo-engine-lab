@@ -87,10 +87,11 @@ the bytes equal the pack's own 64x64 WMMA kernel (`STRIX_G4_EXL3_PREFILL_GEMM=0`
 restores it). The FFN keeps raw gate/up GEMM values and forms the middle stage
 above into down's input panels in one launch (`STRIX_G4_PREFILL_FUSE_FFN=0` runs
 the separate linears). `strix-gemma4-exl3-panels-tests` compares both by memcmp.
-Decode cores (rows <= 8) keep two chunks of trellis words in flight per wave
-(the single-chunk core was latency-bound); chunks are consumed in the same order
-with the same arithmetic, so the bytes are unchanged (`STRIX_G4_EXL3_COOP_DEPTH=1`
-restores one chunk, `4` keeps four).
+Decode cores (rows <= 8) keep four chunks of raw trellis words in flight per
+wave and align each chunk's window only when it is consumed (the single-chunk
+core was latency-bound); chunks are consumed in the same order with the same
+arithmetic, so the bytes are unchanged (`STRIX_G4_EXL3_COOP_DEPTH=1` restores one
+chunk, `2` keeps two).
 
 The engine selects this identity with `STRIX_G4_EXL3_PREFILL=wmma` (profile row
 `exl3_prefill`, pending in QUALITY until its qualification receipt; the panels
