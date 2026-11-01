@@ -133,6 +133,8 @@ public:
     }
     virtual void publish() { append(pending_taps_,pending_positions_); discard(); }
     virtual void discard() noexcept { pending_taps_.clear(); pending_positions_.clear(); }
+    // Session-specific receipt fields (prompt lookup); default adds nothing, so other sessions' receipts are unchanged.
+    virtual void report(strix::serve::Json& receipt) const { (void)receipt; }
 private:
     std::vector<float> pending_taps_;
     std::vector<std::uint64_t> pending_positions_;

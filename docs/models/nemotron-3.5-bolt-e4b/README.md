@@ -30,7 +30,8 @@ output does not depend on load. `STRIX_G4_EXL3_IDENTITY=v1|v2|v3` forces it.
   `python src/gemma4/ref/make_rope_tables.py rotary-tables --positions 65536 --workers 6`
 - Drafter: an MTP assistant package in `<model dir>/drafter-mtp/` (config, weights, LICENSE, NOTICE, LINEAGE,
   MANIFEST) is found automatically; the published drafter is [hyukudan/Nemotron-3.5-Bolt-E4B-MTP-Drafter](https://huggingface.co/hyukudan/Nemotron-3.5-Bolt-E4B-MTP-Drafter). `--draft-mtp DIR` points elsewhere; `--draft off` or `STRIX_G4_DRAFT=0`
-  disables drafting. Without the folder, decode runs exactly as without a drafter.
+  unloads the drafter (prompt lookup, below, still drafts); `STRIX_G4_LOOKUP=0` turns prompt lookup off and
+  `--dflash off` turns all drafting off.
 - EXL3 packs (`quality`): one directory per pack arm, loaded with `--exl3-arm DIR` next to the BF16 model; the
   published pack is [hyukudan/Nemotron-3.5-Bolt-E4B-EXL3](https://huggingface.co/hyukudan/Nemotron-3.5-Bolt-E4B-EXL3) (M4).
 
@@ -42,6 +43,11 @@ strix-gemma4-serve MODEL --rope-tables rotary-tables --tokenizer MODEL/tokenizer
 
 With `MODEL/drafter-mtp/` present, single-request decode drafts automatically; output is identical to drafting off.
 With more than one active request the drafter is admitted only where its measured cost pays off.
+Single-request decode also drafts by prompt lookup (the continuation of the longest earlier match of the last tokens
+in the prompt and output), verified token by token, so output is identical to drafting off. Beside the drafter a
+per-request selector uses it only on a strong match (equal to the drafter alone within noise); without a drafter,
+agent-style prompts that copy from their context gain most (C1 `default`: 114.9 vs 48.2 tok/s). `STRIX_G4_LOOKUP=0`
+turns it off.
 `--print-effective-config` (decode) prints the resolved profile and switches without loading a request.
 
 ## Measured (one Strix Halo, gfx1151, 128 GB, Q4_K_M)

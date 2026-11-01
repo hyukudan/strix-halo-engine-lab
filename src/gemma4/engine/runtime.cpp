@@ -1,4 +1,5 @@
 #include "runtime.hpp"
+#include "lookup.hpp"
 #include "gemma4/exl3/pack.hpp"
 #include "gemma4/exl3/format.hpp"
 #include "gemma4/features/features.hpp"
@@ -220,6 +221,16 @@ Runtime::Runtime(const Options& o) {
         metadata.set("draft_backend",o.backend == "device" ? "resident-device" : "host-reference");
         metadata.set("draft_identity",dflash::arithmetic_id); metadata.set("draft_hash",file_hash(o.draft));
         metadata.set("draft_rope_hash",file_hash(o.draft_rope));
+    }
+    // Prompt lookup (STRIX_G4_LOOKUP, default auto): wraps the MTP drafter with the per-request selector, or stands
+    // alone when no drafter is loaded; =0 off. DFlash and e4b-eagle sessions are left unchanged. Drafting off (--dflash off or
+    // STRIX_G4_DFLASH=0) leaves it out entirely, so those receipts carry no prompt_lookup.
+    const bool drafting_off = o.request.dflash == DraftMode::off || !dflash::enabled_from_environment();
+    if (const auto lookup = lookup::LookupConfig::from_environment();
+        lookup::wraps(lookup, bool(drafts), mtp_kind, drafting_off)) {
+        drafts = lookup::hybrid_factory(std::move(drafts),lookup);
+        metadata.set("prompt_lookup",lookup.json());
+        if (!metadata.find("draft_kind")) metadata.set("draft_kind","prompt-lookup");
     }
     metadata.set("profile",strix::serve::parse_json_unique(o.profile.json()));
     metadata.set("qualification",o.profile.qualification());
