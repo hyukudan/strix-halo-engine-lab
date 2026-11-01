@@ -5,6 +5,11 @@ source-identified external inspection artifacts outside Git. Public documentatio
 describes project-owned contracts, independent mathematical semantics, implementation
 status and qualification evidence without naming unrelated runtime projects.
 
+Amendment (user-approved exception): an outside runtime may appear only as a same-machine
+reference row that states its version and command (llama.cpp), and an external quantizer or
+format may be named only as format/quantizer attribution (exllamav3). No other outside-runtime
+reference is permitted.
+
 Preserve accurate provenance, licenses and notices for actual adopted code, dependencies,
 model assets and official mathematical/ISA references. Neutralization must not erase
 required attribution or manufacture independent authorship.

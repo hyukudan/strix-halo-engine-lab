@@ -712,7 +712,9 @@ rotatoria. Ninguna implica igualdad con una identidad distinta ni con pesos de p
 Estas salidas se comprueban token a token (o byte a byte) frente a una referencia correspondiente:
 
 - El decode especulativo MTP de Qwen es igual al decode greedy serial con el mismo perfil numérico, bit a bit
-  (error de repetición golden 0 en todas las ejecuciones cronometradas; réplicas 570/570 iguales a un nodo).
+  (error de repetición golden 0 en todas las ejecuciones cronometradas; réplicas 570/570 iguales a un nodo). El decode
+  MTP con muestreo es exacto en distribución (la misma distribución de salida que el decode serial con muestreo), pero no
+  idéntico al serial: con la misma semilla, sus tokens pueden diferir de los de una ejecución serial con muestreo.
 - El prefill por tiles de Qwen y la puntuación con teacher forcing preservan la referencia de su perfil declarado; la ruta automática
   de prefill FP16 rápido no es igualdad de bits con el serial A8 denso.
 - DeepSeek en el par: las ventanas greedy y DSpark son iguales a las referencias almacenadas en ambos ranks; los tokens de batch y
