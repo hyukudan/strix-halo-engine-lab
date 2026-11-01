@@ -429,6 +429,7 @@ add_library(strix_serve STATIC
     src/serve/http_server.cpp
     src/serve/engine.cpp
     src/serve/api.cpp
+    src/serve/request_fields.cpp
     src/serve/health.cpp
 )
 target_include_directories(strix_serve PUBLIC include PRIVATE src/serve)

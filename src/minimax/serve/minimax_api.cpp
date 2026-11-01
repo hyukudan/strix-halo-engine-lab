@@ -1,4 +1,5 @@
 #include "minimax/serve/minimax_api.hpp"
+#include "strix/serve/request_fields.hpp"
 #include "strix/serve/session_api.hpp"
 
 #include "minimax/serve/minimax_chat.hpp"
@@ -7,6 +8,8 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
+#include <cstdint>
 #include <cstdio>
 #include <ctime>
 #include <optional>
@@ -19,13 +22,66 @@ namespace {
 
 namespace sv = strix::serve;
 void send_json(sv::HttpResponseWriter& w, int status, const sv::Json& body) { w.send(status, "application/json", body.dump()); }
-void send_error(sv::HttpResponseWriter& w, int status, const std::string& message) {
+void send_error(sv::HttpResponseWriter& w, int status, const std::string& message, const std::string& param = {}) {
     sv::Json e = sv::Json::object();
     e.set("message", sv::Json(message));
     e.set("type", sv::Json(status == 400 ? "invalid_request_error" : "server_error"));
+    if (!param.empty()) e.set("param", sv::Json(param));
     sv::Json b = sv::Json::object();
     b.set("error", std::move(e));
     send_json(w, status, b);
+}
+
+// Generation fields, checked with the shared front-end checks (strix/serve/request_fields.hpp) so the contract is the
+// Qwen/DeepSeek one. This server decodes greedy only and executes no constraints, logit transforms or scoring: those
+// fields are refused with a 400 naming them unless their value is neutral, as are stop strings, n / best_of other than
+// 1, suffix and echo. A positive temperature runs greedy and the reply says so (timings.sampling_note, the shared
+// server's note text). Returns the sampling note ("" when nothing was ignored).
+std::string check_fields(const sv::Json& body) {
+    sv::refuse_unexecuted(body, false, false);
+    const auto set = [&](const char* key) -> const sv::Json* { const auto* v = body.find(key); return v && !v->is_null() ? v : nullptr; };
+    const auto refuse = [](const std::string& param, const std::string& what) {
+        throw sv::RequestFieldError(param, what + " is not supported by this server");
+    };
+    const auto real = [&](const char* key, double low, double high, bool open_low, bool open_high, double absent) {
+        const auto* v = set(key);
+        return v ? sv::finite_number(*v, key, low, high, open_low, open_high) : absent;
+    };
+    const double temperature = real("temperature", 0, 2, false, false, 0);
+    const double top_p = real("top_p", 0, 1, true, false, 1);
+    const double min_p = real("min_p", 0, 1, false, true, 0);
+    const std::uint64_t top_k = set("top_k") ? sv::unsigned_integer(*set("top_k"), "top_k", UINT32_MAX) : 0;
+    if (const auto* v = set("seed")) (void)sv::unsigned_integer(*v, "seed", INT64_MAX);
+    for (const char* key : {"n", "best_of"})
+        if (const auto* v = set(key); v && (!v->is_number() || sv::exact_integer(v->number_source()) != std::optional<std::uint64_t>{1}))
+            throw sv::RequestFieldError(key, std::string("only ") + key + " = 1 is supported");
+    if (const auto* v = set("stop")) {
+        bool empty = v->is_string() && v->as_string().empty();
+        if (v->is_array()) {
+            empty = true;
+            for (const auto& s : v->as_array()) empty = empty && s.is_string() && s.as_string().empty();
+        }
+        if (!empty) refuse("stop", "stop strings");
+    }
+    if (const auto* v = set("suffix"); v && !(v->is_string() && v->as_string().empty())) refuse("suffix", "suffix");
+    if (const auto* v = set("echo"); v && !(v->is_bool() && !v->as_bool())) refuse("echo", "echo");
+    if (temperature > 0.0) return "temperature ignored: this engine decodes greedy (exact)";
+    if (top_p != 1.0 || min_p != 0.0 || top_k != 0U) return "filters ignored at temperature 0 (greedy)";
+    return {};
+}
+
+// max_completion_tokens (preferred) or max_tokens: a positive integer read exactly from its JSON spelling; a value above
+// the context is clamped to it (the engine ends a generation at its context limit anyway), never wrapped. A server
+// without a known context (0) clamps to the largest count a job holds.
+std::uint32_t requested_max_tokens(const sv::Json& body, std::uint32_t fallback, std::uint64_t context) {
+    for (const char* key : {"max_completion_tokens", "max_tokens"})
+        if (const auto* v = body.find(key); v && !v->is_null()) {
+            const auto requested = sv::unsigned_integer(*v, key, UINT64_MAX);
+            if (requested < 1U) throw sv::RequestFieldError(key, std::string(key) + " must be a positive integer");
+            const auto limit = context ? std::min<std::uint64_t>(context, UINT32_MAX) : std::uint64_t{UINT32_MAX};
+            return static_cast<std::uint32_t>(std::min(requested, limit));
+        }
+    return fallback;
 }
 
 // A boolean request option: absent or null = false; any other non-boolean is a 400.
@@ -108,9 +164,13 @@ MinimaxApi::MinimaxApi(ApiTokenizer tokenizer, sv::GenerationQueue& queue, Minim
 
 void MinimaxApi::generate(const sv::HttpRequest&, sv::HttpResponseWriter& w, std::vector<std::uint32_t> prompt, const sv::Json& body,
                           bool chat, const std::string& inbound_id) {
-    std::uint32_t max_tokens = options_.default_max_tokens;
-    for (const char* k : {"max_tokens", "max_completion_tokens"})
-        if (const auto* v = body.find(k); v && v->is_number()) max_tokens = static_cast<std::uint32_t>(std::max<std::int64_t>(1, v->as_int()));
+    const std::string sampling_note = check_fields(body);
+    const std::uint32_t max_tokens = requested_max_tokens(body, options_.default_max_tokens, options_.context_tokens);
+    const auto timings = [&](const sv::GenerationStats& st, const std::optional<RequestExtra>& x) {
+        auto t = reply_timings(st, x.value_or(RequestExtra{}));
+        if (!sampling_note.empty()) t.set("sampling_note", sv::Json(sampling_note));
+        return t;
+    };
     const bool stream = option(body, "stream");
     const bool want_ids = option(body, "return_token_ids");
     bool usage_option = false;
@@ -271,7 +331,7 @@ void MinimaxApi::generate(const sv::HttpRequest&, sv::HttpResponseWriter& w, std
             else write(event(b));
         }
         auto last = chunk("", finish_reason(st));
-        last.set("timings", reply_timings(st, x.value_or(RequestExtra{})));
+        last.set("timings", timings(st, x));
         if (want_ids) last.set("strix", reply_extension(all_ids));
         write(event(last));
         if (include_usage) {
@@ -328,7 +388,7 @@ void MinimaxApi::generate(const sv::HttpRequest&, sv::HttpResponseWriter& w, std
     arr.as_array().push_back(std::move(choice));
     out.set("choices", std::move(arr));
     out.set("usage", usage_json(st));
-    out.set("timings", reply_timings(st, x.value_or(RequestExtra{})));
+    out.set("timings", timings(st, x));
     if (want_ids) out.set("strix", reply_extension(all_ids));
     send_json(w, 200, out);
     finish_record(st, err, x);  // a non-streamed reply is one send(): its delivery is not observable here
@@ -391,8 +451,12 @@ void MinimaxApi::handle(const sv::HttpRequest& req, sv::HttpResponseWriter& w) {
                 if (const auto* v = kw->find("reasoning_effort"); v && v->is_string()) o.reasoning_effort = v->as_string();
             }
             if (const auto* v = body.find("reasoning_effort"); v && v->is_string()) o.reasoning_effort = v->as_string();
+            // tool_choice "none" (string or {"type":"none"}): the tools are not offered, as in the shared server.
+            const auto* choice = body.find("tool_choice");
+            const auto* choice_type = choice && choice->is_object() ? choice->find("type") : choice;
+            const bool tools_off = choice_type && choice_type->is_string() && choice_type->as_string() == "none";
             const auto* tools = body.find("tools");
-            const std::string text = render_minimax_chat(*messages, tools && tools->is_array() ? tools : nullptr, o);
+            const std::string text = render_minimax_chat(*messages, tools && tools->is_array() && !tools_off ? tools : nullptr, o);
             return generate(req, w, tok_.encode(text), body, true, inbound);
         }
         if (req.path == "/v1/completions") {
@@ -401,6 +465,8 @@ void MinimaxApi::handle(const sv::HttpRequest& req, sv::HttpResponseWriter& w) {
             return generate(req, w, tok_.encode(p->as_string()), body, false, inbound);
         }
         return send_error(w, 404, "no route " + req.path);
+    } catch (const sv::RequestFieldError& e) {
+        return send_error(w, 400, e.what(), e.param);
     } catch (const std::exception& e) {
         return send_error(w, 400, e.what());
     }

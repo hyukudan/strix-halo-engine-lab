@@ -1,6 +1,6 @@
 // Reviewed source receipt. Do not regenerate to silence a failure: audit the
 // changed/new selectors, update their allow-table and tests, then update hashes.
-{"CMakeLists.txt", 0x807c4da532e7da61ULL},
+{"CMakeLists.txt", 0x65db3610a3ae6f74ULL},
 {"apps/minimax_rank_main.cpp", 0x038b6d81d2171430ULL},
 {"apps/minimax_serve_main.cpp", 0xe762a5eeb30f4178ULL},
 {"src/minimax/attn/index_proj.hip", 0x8332b8f8830e98d8ULL},
@@ -65,7 +65,7 @@
 {"src/minimax/rtxpf/fp32_identity_ref.hpp", 0x8ded5b0b0b59d3bdULL},
 {"src/minimax/rtxpf/fp32_identity_tests.inc", 0xe4124d32ea82844cULL},
 {"src/minimax/serve/fixtures/minimax_tokenizer_fixtures.json", 0x9ddf67438eb479f7ULL},
-{"src/minimax/serve/minimax_api.cpp", 0x6ede8e4a69d19840ULL},
+{"src/minimax/serve/minimax_api.cpp", 0x78f46ce9bed21fd1ULL},
 {"src/minimax/serve/minimax_api.hpp", 0x2d6cf78bb71fce8bULL},
 {"src/minimax/serve/minimax_chat.cpp", 0x017aefe737367fdcULL},
 {"src/minimax/serve/minimax_chat.hpp", 0xe085dc74d815ed27ULL},

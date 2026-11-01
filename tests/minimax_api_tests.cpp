@@ -125,6 +125,14 @@ public:
         const std::lock_guard<std::mutex> l(m_);
         return session_;
     }
+    std::uint32_t max_tokens() {
+        const std::lock_guard<std::mutex> l(m_);
+        return max_tokens_;
+    }
+    std::vector<std::uint32_t> prompt() {
+        const std::lock_guard<std::mutex> l(m_);
+        return prompt_;
+    }
     // As the serve scheduler: per-request extras inserted before the ticket finishes, taken by the API (hook).
     void keep_extras(bool on) {
         const std::lock_guard<std::mutex> l(m_);
@@ -156,6 +164,8 @@ private:
                 const std::lock_guard<std::mutex> l(m_);
                 s = script_;
                 session_ = t->job.session;
+                max_tokens_ = t->job.max_tokens;
+                prompt_ = t->job.prompt;
             }
             sv::GenerationStats st;
             st.prompt_tokens = t->job.prompt.size();
@@ -229,6 +239,8 @@ private:
     std::condition_variable cv_;
     Script script_;
     std::string session_;
+    std::uint32_t max_tokens_ = 0;
+    std::vector<std::uint32_t> prompt_;
     bool released_ = false;
     bool keep_extras_ = false;
     std::map<const sv::GenerationTicket*, mo::RequestExtra> extras_;
@@ -779,7 +791,91 @@ void test_sessions() {
 }
 }  // namespace
 
+// Generation fields: unsupported non-neutral values are refused with a 400 naming the field before any submission; a
+// positive temperature runs greedy and says so; max_tokens is a positive integer read without wrapping.
+void test_request_fields() {
+    mo::observe_reset_for_tests();
+    Rig rig;
+    const auto refused = [&](const std::string& extra, const std::string& param) {
+        Writer w;
+        rig.api.handle(post("/v1/chat/completions", kChat + "," + extra + "}"), w);
+        const auto j = sv::parse_json(w.body);
+        check(w.status == 400 && at(at(j, "error"), "param").as_string() == param, "refused with its field: " + extra);
+    };
+    refused(R"("stop":["\n\n"])", "stop");
+    refused(R"("stop":"END")", "stop");
+    refused(R"("n":2)", "n");
+    refused(R"("logprobs":true)", "logprobs");
+    refused(R"("top_logprobs":3)", "top_logprobs");
+    refused(R"("response_format":{"type":"json_object"})", "response_format");
+    refused(R"("presence_penalty":0.5)", "presence_penalty");
+    refused(R"("logit_bias":{"5":-100})", "logit_bias");
+    refused(R"("tool_choice":"required")", "tool_choice");
+    refused(R"("temperature":3)", "temperature");
+    refused(R"("temperature":"hot")", "temperature");
+    refused(R"("top_p":0)", "top_p");
+    refused(R"("seed":-1)", "seed");
+    refused(R"("max_completion_tokens":0)", "max_completion_tokens");
+    // exact integers: read from the spelling, never through a double
+    refused(R"("max_completion_tokens":1.00000000000000001)", "max_completion_tokens");
+    refused(R"("max_completion_tokens":0.99999999999999999)", "max_completion_tokens");
+    refused(R"("max_completion_tokens":9007199254740992.5)", "max_completion_tokens");
+    refused(R"("top_k":4294967296)", "top_k");
+    refused(R"("seed":9223372036854775808)", "seed");
+    refused(R"("n":1.5)", "n");
+    refused(R"("logprobs":1e400)", "logprobs");
+    // the shared refusals (same checks as the Qwen/DeepSeek server)
+    refused(R"("tool_choice":{"type":"function","function":{"name":"f"}})", "tool_choice");
+    refused(R"("tool_choice":{"type":"auto","disable_parallel_tool_use":true})", "tool_choice.disable_parallel_tool_use");
+    refused(R"("tools":[{"type":"function","function":{"name":"f","strict":true}}])", "tools[0].function.strict");
+    refused(R"("prefill_disable":["x"])", "prefill_disable");
+    refused(R"("frequency_penalty":0.5)", "frequency_penalty");
+    refused(R"("stream":true,"stop":"END")", "stop");
+    {
+        Writer w;  // max_tokens sits in kChat, so the overriding field is max_completion_tokens
+        rig.api.handle(post("/v1/chat/completions", R"({"messages":[{"role":"user","content":"hi"}],"max_tokens":-1})"), w);
+        check(w.status == 400 && at(at(sv::parse_json(w.body), "error"), "param").as_string() == "max_tokens", "negative max_tokens refused");
+        Writer w2;
+        rig.api.handle(post("/v1/chat/completions", R"({"messages":[{"role":"user","content":"hi"}],"max_tokens":1.5})"), w2);
+        check(w2.status == 400, "fractional max_tokens refused");
+    }
+    check(rig.engine.finished() == 0U, "refused requests never reach the engine");
+    const auto accepted = [&](const std::string& extra, std::size_t n) {
+        rig.engine.next({{5, kEos}});
+        Writer w;
+        rig.api.handle(post("/v1/chat/completions", kChat + "," + extra + "}"), w);
+        rig.engine.wait_finished(n);
+        check(w.status == 200, "neutral values accepted: " + extra);
+        return sv::parse_json(w.body);
+    };
+    auto j = accepted(R"("stop":null,"n":1,"logprobs":false,"presence_penalty":0,"logit_bias":{},"response_format":{"type":"text"},"tool_choice":"auto","seed":7)", 1);
+    check(at(j, "timings").find("sampling_note") == nullptr, "no note when nothing was ignored");
+    j = accepted(R"("temperature":0.7,"top_p":0.9)", 2);
+    check(at(at(j, "timings"), "sampling_note").as_string() == "temperature ignored: this engine decodes greedy (exact)" &&
+              at(at(j, "timings"), "sampling").as_string() == "greedy", "positive temperature runs greedy and says so");
+    j = accepted(R"("top_p":0.9)", 3);
+    check(at(at(j, "timings"), "sampling_note").as_string() == "filters ignored at temperature 0 (greedy)", "filters note at temperature 0");
+    (void)accepted(R"("max_completion_tokens":4294967296)", 4);
+    check(rig.engine.max_tokens() == 8256U, "2^32 max_tokens is clamped to the context, not wrapped to 0");
+    (void)accepted(R"("max_completion_tokens":5)", 5);
+    check(rig.engine.max_tokens() == 5U, "max_completion_tokens wins over max_tokens");
+    (void)accepted(R"("max_completion_tokens":null)", 6);
+    check(rig.engine.max_tokens() == 8U, "a null max_completion_tokens falls back to max_tokens");
+    (void)accepted(R"("max_completion_tokens":1e3)", 7);
+    check(rig.engine.max_tokens() == 1000U, "1e3 is the integer 1000");
+    (void)accepted(R"("max_completion_tokens":1.0,"n":1.0,"top_k":40)", 8);
+    check(rig.engine.max_tokens() == 1U, "1.0 is the integer 1");
+    // tool_choice none: the tools are not offered (same prompt as without tools)
+    (void)accepted(R"("tool_choice":"none","tools":[{"type":"function","function":{"name":"f","parameters":{}}}])", 9);
+    const auto without_offer = rig.engine.prompt();
+    (void)accepted(R"("tools":[{"type":"function","function":{"name":"f","parameters":{}}}])", 10);
+    const auto offered = rig.engine.prompt();
+    (void)accepted(R"("tool_choice":{"type":"none"})", 11);
+    check(without_offer == rig.engine.prompt() && offered != without_offer, "tool_choice none renders no tools");
+}
+
 int main() {
+    test_request_fields();
     test_unarmed_non_stream();
     test_armed_stream();
     test_terminal_paths();
