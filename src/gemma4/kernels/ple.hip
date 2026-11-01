@@ -580,6 +580,14 @@ __global__ void product_kernel(float* g, const float* u, unsigned n) {
     if (i < n)
         g[i] = gelu_tanh(g[i]) * u[i];
 }
+__global__ void product_finite_kernel(float* g, const float* u, unsigned n, unsigned* failure) {
+    const auto i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        const float value = gelu_tanh(g[i]) * u[i];
+        g[i] = value;
+        finite_flag(value, failure);
+    }
+}
 __global__ void cap_kernel(float* x, unsigned n) {
     const auto i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n)
@@ -870,6 +878,29 @@ bool norm_residual(const float* branch, LinearView w, float* residual, unsigned 
                            bounded_search(), interval_search());
     launch_checked();
     return false;
+}
+bool norm_residual_rows(const float* branch, LinearView w, float* residual, unsigned rows, unsigned width, LinearView scalar,
+                        float* next, LinearView next_weight, unsigned* failure, Queue q) {
+    if (!rows || !width || !w.data || w.outputs != 1 || w.inputs != width || !failure ||
+        (next && (!next_weight.data || next_weight.outputs != 1 || next_weight.inputs != width)))
+        throw std::runtime_error("device norm residual rows geometry");
+    // The schedule norm() selects for these widths: grouped, staged and parallel.
+    static const bool grouped = [] {
+        const auto* p = std::getenv("STRIX_G4_NORM_GROUP");
+        return !p || std::string_view(p) != "0";
+    }();
+    if (!grouped || !parallel_search() || !stage_norm(width))
+        return false;
+    hipLaunchKernelGGL((norm_residual_kernel<true, true>), dim3(rows), dim3(256), width * sizeof(float),
+                       static_cast<hipStream_t>(q), branch, w, residual, width, scalar, next, next_weight, failure,
+                       prefetch_norm(), bounded_search(), interval_search());
+    launch_checked();
+    return true;
+}
+void gelu_product_finite(float* g, const float* u, unsigned n, unsigned* failure, Queue q) {
+    hipLaunchKernelGGL(product_finite_kernel, dim3((n + 255U) / 256U), dim3(256), 0, static_cast<hipStream_t>(q), g, u, n,
+                       failure);
+    launch_checked();
 }
 bool ffn_ple_gate(const float* branch, LinearView w, float* residual, LinearView gate, const float* ple,
                   unsigned product_stride, unsigned rows, unsigned width, float* out, unsigned* failure,

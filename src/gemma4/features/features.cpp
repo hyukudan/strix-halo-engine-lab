@@ -148,7 +148,7 @@ Result Exporter::export_features(const Request& r) {
             if (many && r.prefix->size()-p > 8) {
                 const auto n = std::min<std::size_t>(r.prefix->size()-p,many-p%many);
                 auto tx = temporary.state->begin();
-                (void)backend_.prefill_rows(*tx,{r.prefix->data()+p,n},false);
+                (void)backend_.prefill_rows(*tx,{r.prefix->data()+p,n},false,false);
                 tx->commit(n); p += n;
                 continue;
             }
@@ -203,11 +203,12 @@ Result Exporter::export_features(const Request& r, engine::StreamState& prefix) 
         const auto many = r.chunk_rows == 8 ? backend_.prefill_chunk_rows() : 0;
         if (many && b.tokens.size() > 8 && b.tokens.size() <= many) {
             tx.reset(); tx = prefix.begin();
-            const auto rows = backend_.prefill_rows(*tx,b.tokens,true);
-            if (rows.hidden.size() != b.tokens.size()*c.hidden) throw std::runtime_error("backend returned incomplete feature rows");
+            const auto rows = backend_.prefill_rows(*tx,b.tokens,true,false);
+            const auto hidden_rows = rows.hidden_rows();
+            if (hidden_rows.size() != b.tokens.size()*c.hidden) throw std::runtime_error("backend returned incomplete feature rows");
             const auto row = [&](std::size_t position) {
                 HiddenRow h; h.branch_position = position; h.absolute_position = base+position;
-                const auto first = rows.hidden.begin()+std::ptrdiff_t(position*c.hidden);
+                const auto first = hidden_rows.begin()+std::ptrdiff_t(position*c.hidden);
                 h.values.assign(first,first+c.hidden);
                 for (auto x : h.values) if (!std::isfinite(x)) throw std::runtime_error("nonfinite exported hidden row");
                 return h;

@@ -1,8 +1,10 @@
 #include "gemma4/engine/runtime.hpp"
 #include "gemma4/ref/npz.hpp"
+#include "gemma4_prefill_ab.hpp"
 
 #include <iostream>
 #include <sstream>
+#include <string_view>
 
 namespace e = strix::gemma4::engine;
 namespace g4 = strix::gemma4;
@@ -22,6 +24,7 @@ void emit(const e::Options& options, const e::Runtime& runtime, std::span<const 
 }
 }
 int main(int argc, char** argv) {
+    for (int i = 1; i < argc; ++i) if (std::string_view(argv[i]) == "--ab-switch") return prefill_ab::run(argc, argv);
     try {
         const auto options = e::parse_options(argc,argv);
         if (options.help) {

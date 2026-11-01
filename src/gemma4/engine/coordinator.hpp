@@ -34,18 +34,27 @@ public:
 };
 // Rows of one exact many-row prefill call (no logits): taps per row and, when
 // requested, the final-norm hidden rows that RowPlan::export_hidden returns.
+// A backend may return either as a view of its own memory instead (valid until
+// its next prefill_rows call), and may omit taps nobody asked for.
 struct PrefillRows {
     std::vector<float> taps, hidden;
     std::uint32_t tap_width = 0;
+    std::span<const float> tap_view, hidden_view;
+    // Prefill levers that ran for this call (receipt counters, prefill::Lever bits).
+    std::uint32_t levers = 0;
+    double host_ms = 0; // backend host time outside its device work (receipt timings.prefill_host_ms)
+    [[nodiscard]] std::span<const float> tap_rows() const { return tap_view.empty() ? std::span<const float>(taps) : tap_view; }
+    [[nodiscard]] std::span<const float> hidden_rows() const { return hidden_view.empty() ? std::span<const float>(hidden) : hidden_view; }
 };
 class Backend : public Target {
 public:
     // Optional exact many-row prefill (prefill-exact). prefill_rows evaluates
     // consecutive positions of a fresh transaction; its committed KV, taps and
     // hidden rows equal forward_rows passes over the same rows. 0 = unsupported.
+    // taps=false: the caller consumes no taps, which the backend may then omit.
     [[nodiscard]] virtual std::size_t prefill_chunk_rows() const { return 0; }
-    virtual PrefillRows prefill_rows(KvTxn& transaction, std::span<const std::uint32_t> tokens, bool hidden) {
-        (void)transaction; (void)tokens; (void)hidden;
+    virtual PrefillRows prefill_rows(KvTxn& transaction, std::span<const std::uint32_t> tokens, bool hidden, bool taps) {
+        (void)transaction; (void)tokens; (void)hidden; (void)taps;
         throw std::logic_error("backend has no many-row prefill");
     }
     // Capped logits of one final-norm hidden row, equal to forward_rows' logits
@@ -84,6 +93,8 @@ public:
     virtual void attach(StreamState& state) { (void)state; }
     // Request RowPlan::export_hidden on this stream's rows (post-final-norm tap, zero cost when false).
     [[nodiscard]] virtual bool wants_hidden() const { return false; }
+    // false: stage_rows ignores its taps, so prompt prefill may skip copying them.
+    [[nodiscard]] virtual bool wants_taps() const { return true; }
     // true: a drafter whose cost grows per depth from a small base (MTP). Only such sessions are planned, probed
     // or measured by the multi-stream auto policy; it still admits them only on their measured cost. Default
     // false keeps DFlash (fixed block cost) C1-only exactly as before.
@@ -168,6 +179,14 @@ struct Result {
     std::uint32_t multistream_auto_max_window = 0; // largest auto window drafted while >1 stream was live
     // Drafter-confidence-gated C1 cycles (STRIX_G4_MTP_CONF): cycles, depths drafted, drafted depths not verified.
     std::uint64_t confidence_cycles = 0, confidence_drafted = 0, confidence_unverified = 0;
+    // Prompt prefill chunks per engaged prefill lever (receipt "prefill_levers", only when any ran).
+    std::map<std::string, std::uint64_t> prefill_levers;
+    // PINNED_TAPS: how the last prompt chunk delivered target taps ("skipped (no consumer)" or "pinned-async").
+    std::string prefill_taps;
+    // Host time of prompt prefill chunks with the device idle: the backend's own share plus the
+    // coordinator's work around each call (checks, drafter staging, commit).
+    std::uint64_t prefill_calls = 0;
+    double prefill_host_ms = 0;
 };
 const char* status_name(Status status);
 

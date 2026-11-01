@@ -173,6 +173,39 @@ void split_tests() {
     CHECK(a.digest() == before);
     std::puts("prefill split/commit/canonical decode PASS");
 }
+// PINNED_TAPS: pinned views (taps consumed, hidden rows) of a full and a
+// partial chunk are byte-equal to the vectors of views=false; taps=false
+// changes no logits, hidden row or committed KV.
+void pinned_views_tests() {
+    const auto model = fixture::tiny(6);
+    fixture::Tables tables;
+    const auto weights = bind_host_weights(model);
+    pf::DevicePrefill target(weights, tables.view());
+    std::vector<unsigned> tokens(pf::chunk_rows + 9);
+    for (unsigned r = 0; r < tokens.size(); ++r) tokens[r] = (r * 5 + 3) % model.config.vocab;
+    const auto vec = [](std::span<const float> v) { return std::vector<float>(v.begin(), v.end()); };
+    gpu::DeviceStream plain(model.config, 1024), views(model.config, 1024), untapped(model.config, 1024);
+    for (unsigned start = 0; start < tokens.size(); start += pf::chunk_rows) {
+        const auto chunk = std::span(tokens).subspan(start, std::min<std::size_t>(pf::chunk_rows, tokens.size() - start));
+        auto ta = plain.begin();
+        const auto a = target.forward(*ta, chunk, false, true, true, true, false);
+        const auto a_taps = vec(a.tap_rows()), a_hidden = vec(a.hidden_rows());
+        CHECK(a.pinned_taps.empty() && a_taps.size() == chunk.size() * a.tap_width && a_hidden.size() == chunk.size() * model.config.hidden);
+        ta->commit(unsigned(chunk.size()));
+        auto tb = views.begin();
+        const auto b = target.forward(*tb, chunk, false, true, true, true, true);
+        CHECK(!b.pinned_taps.empty() && !b.pinned_hidden.empty());
+        bytes(b.last_logits, a.last_logits); bytes(vec(b.tap_rows()), a_taps); bytes(vec(b.hidden_rows()), a_hidden);
+        tb->commit(unsigned(chunk.size()));
+        auto tc = untapped.begin();
+        const auto c = target.forward(*tc, chunk, false, true, true, false, true);
+        CHECK(c.tap_rows().empty());
+        bytes(c.last_logits, a.last_logits); bytes(vec(c.hidden_rows()), a_hidden);
+        tc->commit(unsigned(chunk.size()));
+    }
+    CHECK(plain.digest() == views.digest() && plain.digest() == untapped.digest());
+    std::puts("prefill pinned views PASS");
+}
 void alias_tests() {
     const auto model = fixture::tiny(42);
     fixture::Tables tables;
@@ -272,5 +305,5 @@ void overflow_test() {
     std::puts("prefill FP16 overflow rollback PASS");
 }
 } // namespace
-int main() try { conversion_tests(); layout_tests(); tile_tests(); split_tests(); alias_tests(); c4_tests(); context_callback_tests(); overflow_test(); return 0; }
+int main() try { conversion_tests(); layout_tests(); tile_tests(); split_tests(); pinned_views_tests(); alias_tests(); c4_tests(); context_callback_tests(); overflow_test(); return 0; }
 catch (const std::exception& e) { std::cerr << e.what() << '\n'; return 1; }

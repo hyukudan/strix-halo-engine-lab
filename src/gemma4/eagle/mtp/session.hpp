@@ -50,6 +50,8 @@ public:
     void discard() noexcept override;
     std::array<std::uint32_t, 7> propose_window(std::uint32_t anchor, std::uint64_t position, std::uint32_t k) STRIX_G4_MTP_ROWS;
     [[nodiscard]] bool wants_hidden() const STRIX_G4_MTP_ROWS { return true; }
+    // stage_rows keeps only the last final hidden row; target taps are never read.
+    [[nodiscard]] bool wants_taps() const STRIX_G4_MTP_ROWS { return false; }
     // Cost grows per depth from a small base (~0.56 ms/depth on E4B): eligible for multi-stream auto,
     // still admitted only on its measured draft cost and the measured batch step.
     [[nodiscard]] bool multi_stream_candidate() const STRIX_G4_MTP_MULTI { return true; }
