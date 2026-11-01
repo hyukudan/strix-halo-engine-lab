@@ -4954,6 +4954,117 @@ __global__ __launch_bounds__(kThreads / F) void attention_value_draft_kernel(con
     }
 }
 
+// STRIX_QSA_WINDOW_ATTN_V2 score: attention_score_rows_group256_kernel<Rows, G, Slots, Int8 = false> (G query heads of
+// one KV head per wave share each K row; the wave's token indices loaded once; the next slot's K row requested before
+// the current slot's products) with every product and addition operand-pinned to the kernel it replaces. IEEE results
+// do not depend on operand order except for which NaN survives when two NaN operands meet, and the compiler commutes
+// fmul / fadd freely, so the pinned order (src0 first, as measured in the replaced kernel's ISA) makes the bytes equal
+// for NaN inputs too:
+//   products                 v_mul_f32 q, k                                   (both orders)
+//   Order::window            attention_score_rows_wave_kernel<Rows, 4>: lane-local p[j + 4] + p[j], p[2] + p[0],
+//                            p[3] + p[1], then p[0] + p[1]; lanes 16..1: own (lower lane) + shuffled (upper lane)
+//   Order::lds_tree          attention_score_kernel / attention_score_body: every level scratch[f + s] + scratch[f]
+//                            (upper first), lanes 16..1 included
+// The lane steps run as the reduce-scatter of hip_qsa_scatter.inc (the same pairs: each step adds the partials of the
+// lower lane L and the upper lane L ^ D), with the lower / upper operand chosen by the lane bit rather than by which
+// lane computes it. head_dim == 256 (checked by the caller).
+enum class QsaScoreOrder : unsigned { window, lds_tree };
+__device__ __forceinline__ float qsa_pinned_add(float src0, float src1) {
+    float d;
+    asm("v_add_f32 %0, %1, %2" : "=v"(d) : "v"(src0), "v"(src1));
+    return d;
+}
+__device__ __forceinline__ float qsa_pinned_mul(float src0, float src1) {
+    float d;
+    asm("v_mul_f32 %0, %1, %2" : "=v"(d) : "v"(src0), "v"(src1));
+    return d;
+}
+template <QsaScoreOrder Order> __device__ __forceinline__ float qsa_pinned_pair(float lower, float upper) {
+    if constexpr (Order == QsaScoreOrder::lds_tree) return qsa_pinned_add(upper, lower);
+    else return qsa_pinned_add(lower, upper);
+}
+template <unsigned P, QsaScoreOrder Order, unsigned Step = 0U>
+__device__ __forceinline__ void qsa_pinned_scatter(float (&v)[P], unsigned lane) {
+    if constexpr (Step < 5U) {
+        constexpr unsigned D = 16U >> Step, Count = (P >> Step) > 0U ? (P >> Step) : 1U;
+        const bool upper = (lane & D) != 0U;
+        if constexpr (Count > 1U) {
+            constexpr unsigned H = Count / 2U;
+#pragma unroll
+            for (unsigned j = 0; j < H; ++j) {
+                // Lower lane: its own head-j partial and the upper lane's; upper lane: the lower lane's head-(j + H)
+                // partial and its own. Selects move bits.
+                const float low = qsa_lane_xor<D>(v[j]), high = qsa_lane_xor<D>(v[j + H]);
+                v[j] = qsa_pinned_pair<Order>(upper ? high : v[j], upper ? v[j + H] : low);
+            }
+        } else {
+            const float other = qsa_lane_xor<D>(v[0]);
+            v[0] = qsa_pinned_pair<Order>(upper ? other : v[0], upper ? v[0] : other);
+        }
+        qsa_pinned_scatter<P, Order, Step + 1U>(v, lane);
+    }
+}
+template <unsigned Rows, unsigned G, unsigned Slots, QsaScoreOrder Order>
+__global__ __launch_bounds__(256) void attention_score_rows_pinned_kernel(QsaRowsAttentionViews<Rows> views,
+    const std::uint16_t* kv_state, std::uint32_t maximum_selected, std::uint32_t attention_heads, std::uint32_t kv_heads,
+    std::uint32_t head_dim, std::uint32_t slots) {
+#pragma clang fp contract(off)
+    static_assert(Slots <= 32U);
+    constexpr unsigned Dim = 256U; // head_dim == Dim (checked by the caller)
+    const auto lane = threadIdx.x % 32U;
+    const auto wave = blockIdx.x * 8U + threadIdx.x / 32U;
+    const auto groups = (slots + Slots - 1U) / Slots, head_groups = attention_heads / G;
+    const auto r = wave / (head_groups * groups);
+    if (r >= Rows) return;
+    const auto head0 = wave / groups % head_groups * G, first = wave % groups * Slots;
+    if (first >= views.count[r]) return;
+    const auto kv_head = head0 / (attention_heads / kv_heads);
+    float qv[G][8];
+#pragma unroll
+    for (unsigned h = 0; h < G; ++h) {
+        const auto* q = views.q_gate[r] + static_cast<std::uint64_t>(head0 + h) * Dim * 2ULL;
+#pragma unroll
+        for (unsigned j = 0; j < 8U; ++j) qv[h][j] = q[lane + 32U * j];
+    }
+    const float scale = sqrtf(static_cast<float>(head_dim));
+    const auto last = min(first + Slots, views.count[r]);
+    const auto tokens = lane < last - first ? views.selected[r][first + lane] : 0U;
+    float* const scores = views.scores[r]; // loaded once: a store could alias the argument block
+    const auto* kbase = kv_state + static_cast<std::uint64_t>(kv_head) * Dim + lane;
+    const auto row_elements = static_cast<std::uint64_t>(kv_heads) * Dim * 2ULL;
+    std::uint16_t raw[8];
+    const auto load = [&](std::uint32_t index) {
+        const auto token = static_cast<std::uint32_t>(__builtin_amdgcn_readlane(static_cast<int>(tokens), static_cast<int>(index)));
+        const auto* row = kbase + static_cast<std::uint64_t>(token) * row_elements;
+#pragma unroll
+        for (unsigned j = 0; j < 8U; ++j) raw[j] = row[32U * j];
+    };
+    load(0U);
+    constexpr unsigned P = G <= 2U ? 2U : G <= 4U ? 4U : G <= 8U ? 8U : 16U;
+    for (auto slot = first; slot < last; ++slot) {
+        float kf[8];
+#pragma unroll
+        for (unsigned j = 0; j < 8U; ++j) kf[j] = bf16_to_float(raw[j]);
+        if (slot + 1U < last) load(slot + 1U - first);
+        float partial[P];
+#pragma unroll
+        for (unsigned h = 0; h < P; ++h) {
+            if (h >= G) { partial[h] = 0.0F; continue; }
+            float p[8];
+#pragma unroll
+            for (unsigned j = 0; j < 8U; ++j) p[j] = qsa_pinned_mul(qv[h][j], kf[j]);
+#pragma unroll
+            for (unsigned j = 0; j < 4U; ++j) p[j] = qsa_pinned_add(p[j + 4U], p[j]);
+            p[0] = qsa_pinned_add(p[2], p[0]); p[1] = qsa_pinned_add(p[3], p[1]);
+            partial[h] = qsa_pinned_pair<Order>(p[0], p[1]);
+        }
+        qsa_pinned_scatter<P, Order>(partial, lane);
+        const auto h = qsa_scatter_head<P>(lane);
+        if (h < G && (lane & ((32U / P) - 1U)) == 0U)
+            scores[static_cast<std::uint64_t>(head0 + h) * maximum_selected + slot] = partial[0] / scale;
+    }
+}
+
 // Draft attention variants (host). Score: the production instantiation (w4) or wider forms that are
 // existing exact score kernels: wP = attention_score_rows_wave_kernel<1, P> (P slots per wave),
 // gGsS = attention_score_rows_group256_kernel<1, G, S> (G query heads of one KV head per wave share
@@ -5072,6 +5183,81 @@ void launch_draft_attention_tail(DraftTailVariant variant, const float* q_gate, 
         break;
     }
     check_hip(hipGetLastError(), "MTP draft attention tail enqueue");
+}
+
+// STRIX_QSA_WINDOW_ATTN_V2 (exact, on by default): single-session MTP verify windows of 2/4/8 rows (BF16 KV,
+// head_dim 256, a multiple of 12 query heads per KV head) score with attention_score_rows_pinned_kernel<Rows, 12, S,
+// window> (8 slots per wave at 2 rows, 16 at 4-8 rows) instead of attention_score_rows_wave_kernel<Rows, 4>; softmax
+// and value/gate keep their kernels (fused tail included). The MTP draft step, where it runs attention_score_kernel
+// (no STRIX_QPERSIST_DRAFT_SCORE), scores with attention_score_rows_pinned_kernel<1, 4, 16, lds_tree> and keeps its
+// tail. Prefill tiles, multi-session cohort windows, int8 KV and other shapes keep their kernels, and so do windows
+// with an explicit STRIX_QSA_WINDOW_GROUPED=1 or STRIX_QSA_SCORE_SLOTS other than 4 (the explicit selection wins).
+// Off with STRIX_QSA_WINDOW_ATTN_V2=0|off|false, under the baseline and under STRIX_QPF2K_DEFAULTS=0.
+bool window_attn_v2_switch(const char* setting, const char* defaults, bool baseline) {
+    const auto off = [](const char* v) {
+        return v && (std::string_view(v) == "0" || std::string_view(v) == "off" || std::string_view(v) == "false");
+    };
+    return !baseline && !off(setting) && !(defaults && defaults[0] == '0');
+}
+bool qsa_window_attn_v2_enabled() {
+    static const bool on = window_attn_v2_switch(std::getenv("STRIX_QSA_WINDOW_ATTN_V2"), std::getenv("STRIX_QPF2K_DEFAULTS"), false);
+    return on && !qpf2k::baseline;
+}
+// STRIX_QSA_WINDOW_GROUPED=1 (opt-in KV-head-grouped window score) and STRIX_QSA_SCORE_SLOTS=1|2|4|8 (default 4).
+bool qsa_window_grouped_requested() {
+    static const bool on = [] { const char* v = std::getenv("STRIX_QSA_WINDOW_GROUPED"); return v && v[0] == '1'; }();
+    return on;
+}
+unsigned qsa_score_slots_per_wave() {
+    static const unsigned per_wave = [] {
+        const char* v = std::getenv("STRIX_QSA_SCORE_SLOTS");
+        const int n = v ? std::atoi(v) : 4;
+        return n == 2 || n == 4 || n == 8 ? static_cast<unsigned>(n) : 1U;
+    }();
+    return per_wave;
+}
+constexpr std::uint32_t kWindowV2Group = 12U, kDraftV2Group = 4U;
+bool window_attn_v2_admitted(std::uint32_t group, std::uint32_t heads, std::uint32_t kv_heads, std::uint32_t dim) {
+    const auto per_kv = kv_heads && heads % kv_heads == 0U ? heads / kv_heads : 0U;
+    return per_kv && per_kv % group == 0U && dim == 256U;
+}
+// Whether a known-rows score launch takes the v2 window score: only the single-session verify-window caller sets
+// verify_window, and only where the replaced kernel is attention_score_rows_wave_kernel<Rows, 4>.
+bool window_attn_v2_route(bool enabled, bool verify_window, unsigned rows, bool int8, bool fast, bool window_grouped,
+    unsigned score_slots, std::uint32_t heads, std::uint32_t kv_heads, std::uint32_t dim) {
+    return enabled && verify_window && (rows == 2U || rows == 4U || rows == 8U) && !int8 && !fast && !window_grouped &&
+        score_slots == 4U && window_attn_v2_admitted(kWindowV2Group, heads, kv_heads, dim);
+}
+// Whether the MTP draft step's score takes the v2 draft score (in place of attention_score_kernel).
+bool draft_attn_v2_route(bool enabled, bool draft, bool qpersist_draft_score, std::uint32_t heads, std::uint32_t kv_heads,
+    std::uint32_t dim) {
+    return enabled && draft && !qpersist_draft_score && window_attn_v2_admitted(kDraftV2Group, heads, kv_heads, dim);
+}
+template <unsigned Rows>
+void launch_window_attn_v2_scores(const QsaRowsAttentionViews<Rows>& views, const std::uint16_t* kv, std::uint32_t maximum,
+    std::uint32_t heads, std::uint32_t kv_heads, std::uint32_t dim, std::uint32_t count, hipStream_t stream) {
+    constexpr unsigned G = kWindowV2Group, S = Rows <= 2U ? 8U : 16U;
+    const auto waves = static_cast<std::uint64_t>(Rows) * (heads / G) * ((count + S - 1U) / S);
+    hipLaunchKernelGGL(HIP_KERNEL_NAME(attention_score_rows_pinned_kernel<Rows, G, S, QsaScoreOrder::window>),
+        dim3(checked_u32((waves + 7U) / 8U, "QSA window v2 score grid")), dim3(kThreads), 0, stream, views, kv, maximum,
+        heads, kv_heads, dim, count);
+    check_hip(hipGetLastError(), "QSA window v2 score launch");
+}
+// The MTP draft step's score where it does not run the wave kernel: attention_score_kernel, or with v2 (the caller
+// routes it with draft_attn_v2_route) attention_score_rows_pinned_kernel<1, 4, 16, lds_tree> on the same buffers.
+void launch_draft_one_block_scores(bool v2, const float* q_gate, const std::uint16_t* kv, const std::uint32_t* selected,
+    float* scores, std::uint32_t count, std::uint32_t maximum, std::uint32_t heads, std::uint32_t kv_heads, std::uint32_t dim,
+    GraphSelectionArguments selection, hipStream_t stream) {
+    if (v2) {
+        QsaRowsAttentionViews<1U> views{};
+        views.q_gate[0] = q_gate; views.selected[0] = selected; views.scores[0] = scores; views.count[0] = count;
+        const auto waves = static_cast<std::uint64_t>(heads / kDraftV2Group) * ((count + 15U) / 16U);
+        hipLaunchKernelGGL(HIP_KERNEL_NAME(attention_score_rows_pinned_kernel<1U, kDraftV2Group, 16U, QsaScoreOrder::lds_tree>),
+            dim3(checked_u32((waves + 7U) / 8U, "MTP draft v2 score grid")), dim3(kThreads), 0, stream, views, kv, maximum,
+            heads, kv_heads, dim, count);
+    } else hipLaunchKernelGGL(attention_score_kernel, dim3(checked_u32(static_cast<std::uint64_t>(heads) * count, "MTP attention score grid")),
+        dim3(kThreads), 0, stream, q_gate, kv, selected, count, maximum, heads, kv_heads, dim, scores, selection);
+    check_hip(hipGetLastError(), "MTP attention scores enqueue");
 }
 
 #include "hip_qsa_pooled_score.inc"
@@ -5805,7 +5991,7 @@ template <unsigned Rows>
 void enqueue_qsa_known_rows(const QsaKnownRows<Rows>& prepared, const HipIndexedAttentionLauncherConfig& config,
     unsigned parts = 7U, QsaPrefillPool* pool = nullptr, unsigned skip_inputs = 0U,
     const q8_rows::DenseA8Slot* cohort_slot = nullptr, unsigned cohort_row = 0U, unsigned subparts = 127U,
-    const qsa_flash::ScoreGroup<Rows>* staged = nullptr) {
+    const qsa_flash::ScoreGroup<Rows>* staged = nullptr, bool verify_window = false) {
     for(const auto& row:prepared.row)
         require_qsa_score_source(!row.workspace_layout.block_scores_bytes,!(parts & 2U) || row.workspace.block_scores!=nullptr);
     if (staged) subparts &= ~7U; // norms, append and scores already completed in stream order
@@ -6299,8 +6485,7 @@ void enqueue_qsa_known_rows(const QsaKnownRows<Rows>& prepared, const HipIndexed
             // attention_score_rows_wave_kernel; the key row is read once per head group instead of
             // once per head). STRIX_QSA_WINDOW_SLOTS=4|8|16 slots per wave (default 8). The value/gate
             // output keeps the window kernel.
-            static const bool window_grouped = [] { const char* v = std::getenv("STRIX_QSA_WINDOW_GROUPED"); return v && v[0] == '1'; }();
-            grouped_score = window_grouped && head_group != 0U && a.head_dim <= kThreads && per_kv && per_kv % head_group == 0U;
+            grouped_score = qsa_window_grouped_requested() && head_group != 0U && a.head_dim <= kThreads && per_kv && per_kv % head_group == 0U;
         }
         static const unsigned window_slots = [] {
             const char* v = std::getenv("STRIX_QSA_WINDOW_SLOTS");
@@ -6308,7 +6493,15 @@ void enqueue_qsa_known_rows(const QsaKnownRows<Rows>& prepared, const HipIndexed
             return n == 4 || n == 16 ? static_cast<unsigned>(n) : 8U;
         }();
         const auto score_slots = Rows > 8U ? group_slots : window_slots;
+        // STRIX_QSA_WINDOW_ATTN_V2 (default on): the operand-pinned grouped score for single-session verify windows
+        // (see window_attn_v2_route).
+        const bool window_v2 = window_attn_v2_route(qsa_window_attn_v2_enabled(), verify_window, Rows, Int8, fast,
+            qsa_window_grouped_requested(), qsa_score_slots_per_wave(), a.attention_heads, a.kv_heads, a.head_dim);
         if (!(subparts & 16U) || fast) {
+        } else if (window_v2) {
+            static_cast<void>(prepare_indexed_attention_score_grid(a.attention_heads, maximum_count));
+            if constexpr (Rows <= 8U && !Int8) launch_window_attn_v2_scores<Rows>(attention, kv, maximum_selected, a.attention_heads,
+                a.kv_heads, a.head_dim, maximum_count, stream);
         } else if (grouped_score) {
             {
                 static_cast<void>(prepare_indexed_attention_score_grid(a.attention_heads, maximum_count));
@@ -6341,11 +6534,7 @@ void enqueue_qsa_known_rows(const QsaKnownRows<Rows>& prepared, const HipIndexed
         } else if (a.head_dim <= kThreads) {
             static_cast<void>(prepare_indexed_attention_score_grid(a.attention_heads, maximum_count));
             // STRIX_QSA_SCORE_SLOTS=1|2|4|8: selected slots per wave (same per-slot arithmetic).
-            static const unsigned per_wave = [] {
-                const char* v = std::getenv("STRIX_QSA_SCORE_SLOTS");
-                const int n = v ? std::atoi(v) : 4;
-                return n == 2 || n == 4 || n == 8 ? static_cast<unsigned>(n) : 1U;
-            }();
+            const unsigned per_wave = qsa_score_slots_per_wave();
             const auto launch_score = [&]<unsigned PerWave>() {
                 const auto groups = (maximum_count + PerWave - 1U) / PerWave;
                 const auto waves = static_cast<std::uint64_t>(Rows) * a.attention_heads * groups;
@@ -7427,7 +7616,7 @@ void enqueue_qsa_window_rows(std::span<const ExecutionDispatchContext> rows, con
     }
     auto* pool=access?static_cast<QsaPrefillPool*>(access->storage()):
         qsa_window_pool(prepared.row[0], prepared.selection[0].ratio, config, prepared.position[0]);
-    enqueue_qsa_known_rows<Rows>(prepared, config, 7U, pool);
+    enqueue_qsa_known_rows<Rows>(prepared, config, 7U, pool, 0U, nullptr, 0U, 127U, nullptr, true);
     // This owner may be idle while serial steps or other owners overwrite its
     // rejected rows. A later frontier could already be past the stale blocks,
     // so clamping only on the next call cannot detect them. Retain only blocks
@@ -8949,7 +9138,11 @@ void mtp_sparse_attention(const MtpNativeContext& c,void* raw_stream,bool draft)
                 p.heads, p.kv_heads, p.dim, p.selected);
     }
     if (!exact) { // incumbent score + tail
-    if (qpersist_draft_score_enabled() && p.dim <= kThreads) {
+    // STRIX_QSA_WINDOW_ATTN_V2 (default on), draft only, in place of attention_score_kernel: the four query heads of one
+    // KV head share each K row, in attention_score_kernel's operand order; the tail below is unchanged.
+    const bool draft_v2 = draft_attn_v2_route(qsa_window_attn_v2_enabled(), draft, qpersist_draft_score_enabled(), p.heads,
+        p.kv_heads, p.dim);
+    if (!draft_v2 && qpersist_draft_score_enabled() && p.dim <= kThreads) {
         // The draft formerly used one 256-thread block for every head/slot.
         // Use the incumbent window tree: eight waves/block, four slots/wave,
         // with query features held across slots. No split or reassociated dot.
@@ -8962,9 +9155,8 @@ void mtp_sparse_attention(const MtpNativeContext& c,void* raw_stream,bool draft)
             dim3(checked_u32((waves + 7U) / 8U, "MTP tiled score grid")), dim3(kThreads), 0, stream,
             attention, reinterpret_cast<const std::uint16_t*>(p.kv.address), p.maximum_selected,
             p.heads, p.kv_heads, p.dim, p.selected);
-    } else hipLaunchKernelGGL(attention_score_kernel,dim3(checked_u32(static_cast<std::uint64_t>(p.heads)*p.selected,"MTP attention score grid")),
-        dim3(kThreads),0,stream,w.q_gate,reinterpret_cast<const std::uint16_t*>(p.kv.address),w.selected_indices,p.selected,p.maximum_selected,
-        p.heads,p.kv_heads,p.dim,w.attention_scores,selection);
+    } else launch_draft_one_block_scores(draft_v2, w.q_gate, reinterpret_cast<const std::uint16_t*>(p.kv.address),
+        w.selected_indices, w.attention_scores, p.selected, p.maximum_selected, p.heads, p.kv_heads, p.dim, selection, stream);
     check_hip(hipGetLastError(),"MTP attention scores enqueue");
     if (qpersist_qsa_tail_enabled() && p.dim <= kThreads) {
         hipLaunchKernelGGL(attention_tail_kernel, dim3(p.heads), dim3(kThreads), 0, stream,
@@ -9463,6 +9655,21 @@ void enqueue_tail(const Attention& a, bool fused, hipStream_t stream) {
     }
     check_hip(hipGetLastError(), "qpersist diagnostic tail");
 }
+bool window_v2_admitted(const Attention& a) {
+    return window_attn_v2_admitted(kWindowV2Group, a.heads, a.kv_heads, a.dim);
+}
+void enqueue_window_v2_scores(const Attention& a, hipStream_t stream) {
+    validate(a, stream);
+    if (!window_v2_admitted(a)) throw std::invalid_argument("qpersist diagnostic window v2 score is not admitted");
+    std::uint32_t count = 0;
+    for (const auto& row : a.rows) count = std::max(count, row.count);
+    switch (a.rows.size()) {
+    case 1U: launch_window_attn_v2_scores<1U>(views<1U>(a), a.kv, a.maximum, a.heads, a.kv_heads, a.dim, count, stream); break;
+    case 2U: launch_window_attn_v2_scores<2U>(views<2U>(a), a.kv, a.maximum, a.heads, a.kv_heads, a.dim, count, stream); break;
+    case 4U: launch_window_attn_v2_scores<4U>(views<4U>(a), a.kv, a.maximum, a.heads, a.kv_heads, a.dim, count, stream); break;
+    default: launch_window_attn_v2_scores<8U>(views<8U>(a), a.kv, a.maximum, a.heads, a.kv_heads, a.dim, count, stream); break;
+    }
+}
 void enqueue_cache(const Cache& c, bool fused, hipStream_t stream) {
     require_stream(stream);
     if (!c.status || !c.capacity || (!c.index_dim && !c.kv_width) || c.index_dim > 256U || c.kv_width > 8192U ||
@@ -9515,6 +9722,30 @@ void enqueue_draft_tail(const DraftAttention& a, const char* variant, hipStream_
         throw std::invalid_argument("qpersist diagnostic draft tail variant is not admitted");
     launch_draft_attention_tail(v, a.query, a.kv, a.selected, a.scores, a.count, a.maximum, a.heads, a.kv_heads, a.dim,
         a.output, selection(a), stream);
+}
+void enqueue_draft_one_block(const DraftAttention& a, bool v2, bool tail, hipStream_t stream) {
+    validate(a, stream);
+    if (a.position != nullptr || (v2 && !window_attn_v2_admitted(kDraftV2Group, a.heads, a.kv_heads, a.dim)))
+        throw std::invalid_argument("qpersist diagnostic draft one-block score is not admitted");
+    const auto dynamic = selection(a);
+    launch_draft_one_block_scores(v2, a.query, a.kv, a.selected, a.scores, a.count, a.maximum, a.heads, a.kv_heads, a.dim,
+        dynamic, stream);
+    if (!tail) return;
+    // mtp_sparse_attention's unfused tail (no STRIX_QPERSIST_QSA_TAIL).
+    hipLaunchKernelGGL(attention_softmax_kernel, dim3(a.heads), dim3(kThreads), 0, stream, a.scores, a.count, a.maximum, dynamic);
+    hipLaunchKernelGGL(attention_output_kernel, dim3(a.heads), dim3(a.dim), 0, stream, a.query, a.kv, a.selected, a.scores,
+        a.count, a.maximum, a.heads, a.kv_heads, a.dim, a.output, dynamic);
+    check_hip(hipGetLastError(), "qpersist diagnostic draft one-block tail");
+}
+bool window_v2_switch(const char* setting, const char* defaults, bool baseline) {
+    return window_attn_v2_switch(setting, defaults, baseline);
+}
+bool window_v2_routed(const WindowV2Route& r) {
+    return window_attn_v2_route(r.enabled, r.verify_window, r.rows, r.int8, r.fast, r.window_grouped, r.score_slots, r.heads,
+        r.kv_heads, r.dim);
+}
+bool draft_v2_routed(bool enabled, bool draft, bool qpersist_draft_score, unsigned heads, unsigned kv_heads, unsigned dim) {
+    return draft_attn_v2_route(enabled, draft, qpersist_draft_score, heads, kv_heads, dim);
 }
 std::string draft_attention_selection(const char* attn, const char* score, const char* tail) {
     const auto c = resolve_draft_attention(attn, score, tail);

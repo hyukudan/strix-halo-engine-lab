@@ -25,6 +25,11 @@ struct Attention {
 };
 void enqueue_scores(const Attention&, bool tiled, hipStream_t);
 void enqueue_tail(const Attention&, bool fused, hipStream_t);
+// Window attention v2 (STRIX_QSA_WINDOW_ATTN_V2) score as the engine launches it for verify windows: the operand-pinned
+// KV-head-grouped score (12 query heads per wave; 8 slots at 1-2 rows, 16 at 4-8) in attention_score_rows_wave_kernel<R,
+// 4>'s operand order (head_dim 256). R1 is exercised here only as a kernel shape; the engine routes 2/4/8-row windows.
+bool window_v2_admitted(const Attention&);
+void enqueue_window_v2_scores(const Attention&, hipStream_t);
 struct Cache {
     const float* index = nullptr;
     const float* key = nullptr;
@@ -55,6 +60,18 @@ struct DraftAttention {
 bool draft_attention_admitted(const DraftAttention&, const char* score_variant, const char* tail_variant);
 void enqueue_draft_scores(const DraftAttention&, const char* variant, hipStream_t);
 void enqueue_draft_tail(const DraftAttention&, const char* variant, hipStream_t);
+// The MTP draft step's score where it runs the one-block form (no STRIX_QPERSIST_DRAFT_SCORE), as the engine launches
+// it: attention_score_kernel, or with v2 (STRIX_QSA_WINDOW_ATTN_V2) four query heads per K row in its operand order
+// (head_dim 256); tail = also the engine's unfused softmax and value/gate launches. No dynamic position.
+void enqueue_draft_one_block(const DraftAttention&, bool v2, bool tail, hipStream_t);
+// STRIX_QSA_WINDOW_ATTN_V2 resolution and routing as the engine decides them.
+bool window_v2_switch(const char* setting, const char* defaults, bool baseline);
+struct WindowV2Route {
+    bool enabled = true, verify_window = true, int8 = false, fast = false, window_grouped = false;
+    unsigned rows = 2U, score_slots = 4U, heads = 24U, kv_heads = 2U, dim = 256U;
+};
+bool window_v2_routed(const WindowV2Route&);
+bool draft_v2_routed(bool enabled, bool draft, bool qpersist_draft_score, unsigned heads, unsigned kv_heads, unsigned dim);
 // Two-launch tails ("v2", "v4") only: the softmax launch (value == false) or the value launch alone.
 void enqueue_draft_tail_stage(const DraftAttention&, const char* variant, bool value, hipStream_t);
 // The engine's resolution of STRIX_QPERSIST_DRAFT_ATTN / _SCORE / _TAIL (null = unset): "incumbent" or
