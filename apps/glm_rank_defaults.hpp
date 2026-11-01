@@ -73,9 +73,9 @@ inline const std::vector<EnvItem>& env_items() {
          "Measurement: Xfer reduce +1.41 -> fused boundary ~+1.10 ms/token over local, bitwise"},
         {"moe-fast", "STRIX_GLM_MOE", "fast", "ref", false, false,
          "Measurement: FastMoe matches DefaultMoe bitwise (real TP2 slices); raw-only experts (fits GTT)"},
-        // =3 restores the previous default (v3 for every call); the baseline restores v1.
+        // =7 restores the previous large-call core (X2), =3 v3 for every call; the baseline restores v1.
         {"pf-exact-moe-auto", "STRIX_GLM_PF_EXACTMOE_V", "auto", "1", true, true,
-         "Measurement: exact MoE auto (v7 through the X2 core for calls >= 2048 rows, v3 below), outputs bitwise; 8K TTFT -6.1 %, 1K unchanged"},
+         "Measurement: exact MoE auto (v10 through the X3 core for calls >= 512 rows, v3 with row buckets below), outputs bitwise; 8K TTFT -19.5 % and 1K -15 % vs the X2 core"},
         {"pf-exact-x", "STRIX_GLM_PF_EXACT_X", "auto", "0", true, true,
          "Measurement: exact register-blocked X2 prefill linear core for calls >= 2048 rows (TM16 below), bitwise"},
         {"pf-obar-v5", "STRIX_GLM_PF_OBAR", "5", "2", false, true, "Measurement: MLA o-bar v5 exact, 2.9x"},

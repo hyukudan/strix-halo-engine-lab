@@ -145,9 +145,29 @@ __global__ __launch_bounds__(256) void x_kernel(Mat m, const _Float16* t, float*
     const unsigned nr = rows - row0 < 32U ? rows - row0 : 32U;
     exact_x::core<B, Prefetch>(m, XRows{t, y, ys, m.input, row0}, nr, splits, hp, lds);
 }
+template<int B, unsigned R>
+__global__ __launch_bounds__(256) void x3_kernel(Mat m, const _Float16* t, float* y,
+                                                std::size_t ys, unsigned rows, unsigned splits, bool hp) {
+    __shared__ exact_x::StorageS<R> lds;
+    const unsigned row0 = blockIdx.y * 8U * R;
+    const unsigned nr = rows - row0 < 8U * R ? rows - row0 : 8U * R;
+    exact_x::core_s<B, R>(m, XRows{t, y, ys, m.input, row0}, nr, splits, hp, lds);
+}
 template<int B, unsigned TM>
 void launch(Mat m, const _Float16* t, float* y, std::size_t ys, unsigned rows, hipStream_t s, std::size_t* scratch) {
-    if constexpr (TM == 0 || TM == 1) {
+    if constexpr (TM == 3 || TM == 4) {
+        constexpr unsigned R = TM == 3 ? 4U : 8U;
+        if (scratch) {
+            hipFuncAttributes a{};
+            ok(hipFuncGetAttributes(&a, reinterpret_cast<const void*>(&x3_kernel<B, R>)));
+            *scratch = a.localSizeBytes;
+            return;
+        }
+        x3_kernel<B, R><<<dim3(m.output / 128U, (rows - 1U) / (8U * R) + 1U), 256, 0, s>>>(
+            m, t, y, ys, rows, vector_splits(m.input, m.output, m.bits), h128_partition(m));
+        ok(hipGetLastError());
+        return;
+    } else if constexpr (TM == 0 || TM == 1) {
         if (scratch) {
             hipFuncAttributes a{};
             ok(hipFuncGetAttributes(&a, reinterpret_cast<const void*>(&x_kernel<B, TM == 1>)));
@@ -184,6 +204,8 @@ void dispatch_tm(unsigned tm, Mat m, const _Float16* t, float* y, std::size_t ys
     switch (tm) {
     case 1: dispatch<1>(m, t, y, ys, rows, s, scratch); break;
     case 0: dispatch<0>(m, t, y, ys, rows, s, scratch); break;
+    case 3: dispatch<3>(m, t, y, ys, rows, s, scratch); break;
+    case 4: dispatch<4>(m, t, y, ys, rows, s, scratch); break;
     case 16: dispatch<16>(m, t, y, ys, rows, s, scratch); break;
     case 32: dispatch<32>(m, t, y, ys, rows, s, scratch); break;
     case 64: dispatch<64>(m, t, y, ys, rows, s, scratch); break;
@@ -205,8 +227,10 @@ Route route(unsigned rows) {
     if (!p || std::strcmp(p, "0") == 0) return Route::tm;
     if (std::strcmp(p, "1") == 0) return Route::x;
     if (std::strcmp(p, "2") == 0) return Route::x2;
+    if (std::strcmp(p, "3") == 0) return Route::x3;
+    if (std::strcmp(p, "4") == 0) return Route::x3r8;
     if (std::strcmp(p, "auto") == 0) return rows >= x_auto_rows() ? Route::x2 : Route::tm;
-    throw std::invalid_argument("STRIX_GLM_PF_EXACT_X must be 0, 1, 2 or auto");
+    throw std::invalid_argument("STRIX_GLM_PF_EXACT_X must be 0, 1, 2, 3, 4 or auto");
 }
 unsigned vector_splits(unsigned input, unsigned output, unsigned bits) {
     const unsigned s = bits == 5 && input == 4096 && output == 1024 ? 16U :
@@ -242,14 +266,18 @@ void linear_rows(const engine::Linear& l, const float* x, std::size_t xs, float*
     const auto grid = static_cast<unsigned>((std::size_t{rows} * (m.input / 128U) + 3U) / 4U);
     input_kernel<<<grid, 128, 0, s>>>(x, xs, m, rows, t);
     ok(hipGetLastError());
-    dispatch_tm(selected == Route::x2 ? 1U : (selected == Route::x ? 0U : tm), m, t, y, ys, rows, s);
+    const unsigned core = selected == Route::x3r8 ? 4U : selected == Route::x3 ? 3U :
+        selected == Route::x2 ? 1U : (selected == Route::x ? 0U : tm);
+    dispatch_tm(core, m, t, y, ys, rows, s);
 }
 hipFuncAttributes x_resources(const engine::Linear& l, unsigned variant) {
     Mat m;
     if (!parts(l, m)) throw std::invalid_argument("glm pf exact: unsupported linear");
     hipFuncAttributes a{};
-    if (variant != 1 && variant != 2) throw std::invalid_argument("glm pf exact: X resources variant must be 1 or 2");
-#define CASE(B) case B: if (variant == 2) { ok(hipFuncGetAttributes(&a, reinterpret_cast<const void*>(&x_kernel<B, true>))); } \
+    if (variant < 1 || variant > 4) throw std::invalid_argument("glm pf exact: X resources variant must be 1..4");
+#define CASE(B) case B: if (variant == 4) { ok(hipFuncGetAttributes(&a, reinterpret_cast<const void*>(&x3_kernel<B, 8>))); } \
+                       else if (variant == 3) { ok(hipFuncGetAttributes(&a, reinterpret_cast<const void*>(&x3_kernel<B, 4>))); } \
+                       else if (variant == 2) { ok(hipFuncGetAttributes(&a, reinterpret_cast<const void*>(&x_kernel<B, true>))); } \
                        else { ok(hipFuncGetAttributes(&a, reinterpret_cast<const void*>(&x_kernel<B>))); } break
     switch (m.bits) {
     CASE(2); CASE(3); CASE(4); CASE(5); CASE(6); CASE(7); CASE(8);

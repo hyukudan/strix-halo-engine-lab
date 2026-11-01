@@ -47,6 +47,7 @@ struct Args {
     _Float16* at;
     float* output;
     _Float16* input;
+    unsigned rcap;  // v3 row buckets on (1) / off (0)
 };
 // One global load from the device table (entry E = the shared expert): selecting a member of a by-value / kernarg
 // struct with a runtime index forces the struct to scratch (328 B/lane in the first draft).
@@ -206,8 +207,9 @@ __global__ __launch_bounds__(256) void linear_kernel(Args a) {
 }
 // V3: dense operand schedule, with one CTA per (expert, output block, matrix).
 // The descriptor address is wave-uniform; load it once outside all row/split loops.
-// Bits is a launch-time specialization, never a per-row or per-k branch.
-template<int Bits, bool Down>
+// Bits is a launch-time specialization, never a per-row or per-k branch. Rcap (1..16) bounds the row chains a
+// tile computes; live rows run the same statements at any Rcap, rows past tile.count are never published.
+template<int Bits, bool Down, unsigned Rcap = 16>
 __device__ __forceinline__ void core_v3(Args a, Tile tile, moe::Exl3 w, unsigned m,
                                        std::uint32_t* act, float* total) {
     constexpr unsigned KPS = Down ? 16U : 8U, Splits = Down ? 4U : 32U;
@@ -219,7 +221,7 @@ __device__ __forceinline__ void core_v3(Args a, Tile tile, moe::Exl3 w, unsigned
     for (unsigned q = threadIdx.x; q < 16U * 128U; q += 256U) total[q] = 0.0F;
     __syncthreads();
     for (unsigned sp = 0; sp < Splits; ++sp) {
-        for (unsigned q = threadIdx.x; q < 16U * Pairs; q += 256U) {
+        for (unsigned q = threadIdx.x; q < Rcap * Pairs; q += 256U) {
             const unsigned r = q / Pairs, c = q % Pairs;
             std::uint32_t value = 0;
             if (r < tile.count) {
@@ -232,7 +234,7 @@ __device__ __forceinline__ void core_v3(Args a, Tile tile, moe::Exl3 w, unsigned
             act[q] = value;
         }
         __syncthreads();
-        float sums[16][2] = {};
+        float sums[Rcap][2] = {};
         for (unsigned kk = 0; kk < KPS; ++kk) {
             const auto* raw = packed + (std::size_t{sp * KPS + kk} * (N / 16U) + col) * Bits * 32U;
             const d::TileStates<Bits> st(raw, geo);
@@ -241,7 +243,7 @@ __device__ __forceinline__ void core_v3(Args a, Tile tile, moe::Exl3 w, unsigned
             const d::Half2 w2 = d::mul1_pair(st.template state<4>(), st.template state<5>());
             const d::Half2 w3 = d::mul1_pair(st.template state<6>(), st.template state<7>());
 #pragma unroll
-            for (unsigned r = 0; r < 16U; ++r) {
+            for (unsigned r = 0; r < Rcap; ++r) {
                 const unsigned p = r * Pairs + kk * 8U + (lane & 3U);
                 const d::Half2 a0 = __builtin_bit_cast(d::Half2, act[p]);
                 const d::Half2 a1 = __builtin_bit_cast(d::Half2, act[p + 4U]);
@@ -252,7 +254,7 @@ __device__ __forceinline__ void core_v3(Args a, Tile tile, moe::Exl3 w, unsigned
             }
         }
 #pragma unroll
-        for (unsigned r = 0; r < 16U; ++r) {
+        for (unsigned r = 0; r < Rcap; ++r) {
             const float v0 = d::reduce4(sums[r][0]), v1 = d::reduce4(sums[r][1]);
             if ((lane & 3U) == 0) {
                 const unsigned o = r * 128U + wave * 16U + lane / 4U;
@@ -298,7 +300,12 @@ __global__ __launch_bounds__(256) void linear_kernel_v3(Args a) {
     const unsigned r1 = Shared ? (group.count < r0 + kSharedRows ? group.count : r0 + kSharedRows) : group.count;
     for (unsigned r = r0; r < r1; r += 16U) {
         const Tile tile{expert, group.first + r, r1 - r < 16U ? r1 - r : 16U};
-        core_v3<Bits, Down>(a, tile, w, m, act, total);
+        // Smallest row bucket covering the tile (uniform per CTA); STRIX_GLM_PF_EXACTMOE_V3_RCAP=0 keeps 16 rows.
+        if (!a.rcap || tile.count > 8U) core_v3<Bits, Down>(a, tile, w, m, act, total);
+        else if (tile.count > 4U) core_v3<Bits, Down, 8>(a, tile, w, m, act, total);
+        else if (tile.count > 2U) core_v3<Bits, Down, 4>(a, tile, w, m, act, total);
+        else if (tile.count > 1U) core_v3<Bits, Down, 2>(a, tile, w, m, act, total);
+        else core_v3<Bits, Down, 1>(a, tile, w, m, act, total);
     }
 }
 template<bool Down>
@@ -353,6 +360,64 @@ void launch_linear_x(Args a, unsigned shared_bits, hipStream_t stream) {
     else
         linear_kernel_x<4, Down, true, Prefetch><<<dim3(N / 128U, (a.rows + kSharedRows - 1U) / kSharedRows, Down ? 1U : 2U), 256, 0, stream>>>(a);
     ok(hipGetLastError(), "X shared linear");
+}
+template<int Bits, bool Down, bool Shared, unsigned R>
+__global__ __launch_bounds__(256) void linear_kernel_s(Args a) {
+    __shared__ exact_x::StorageS<R> lds;
+    const unsigned expert = Shared ? E : blockIdx.y;
+    const Tile group = a.groups[expert];
+    if (group.count == 0) return;
+    const unsigned m = Down ? 2U : blockIdx.z;
+    const auto w = *d::uniform((&a.experts[expert].gate) + m);
+    const unsigned r0 = Shared ? blockIdx.y * kSharedRows : 0U;
+    const unsigned r1 = Shared ? (group.count < r0 + kSharedRows ? group.count : r0 + kSharedRows) : group.count;
+    for (unsigned r = r0; r < r1; r += 8U * R) {
+        const Tile tile{expert, group.first + r, r1 - r < 8U * R ? r1 - r : 8U * R};
+        exact_x::core_s<Bits, R>(w, XRows<Down>{a, tile, m}, tile.count, Down ? 4U : 32U, false, lds);
+    }
+}
+// V10: per expert group, 32-row tiles (four rows per wave) for groups of up to 32 rows, 64-row tiles above.
+template<int Bits, bool Down, bool Shared>
+__global__ __launch_bounds__(256) void linear_kernel_s2(Args a) {
+    __shared__ exact_x::StorageS<8> lds;
+    const unsigned expert = Shared ? E : blockIdx.y;
+    const Tile group = a.groups[expert];
+    if (group.count == 0) return;
+    const unsigned m = Down ? 2U : blockIdx.z;
+    const auto w = *d::uniform((&a.experts[expert].gate) + m);
+    const unsigned r0 = Shared ? blockIdx.y * kSharedRows : 0U;
+    const unsigned r1 = Shared ? (group.count < r0 + kSharedRows ? group.count : r0 + kSharedRows) : group.count;
+    if (r1 - r0 <= 32U) {
+        auto& small = *reinterpret_cast<exact_x::StorageS<4>*>(&lds);
+        exact_x::core_s<Bits, 4>(w, XRows<Down>{a, Tile{expert, group.first + r0, r1 - r0}, m}, r1 - r0, Down ? 4U : 32U, false, small);
+        return;
+    }
+    for (unsigned r = r0; r < r1; r += 64U) {
+        const Tile tile{expert, group.first + r, r1 - r < 64U ? r1 - r : 64U};
+        exact_x::core_s<Bits, 8>(w, XRows<Down>{a, tile, m}, tile.count, Down ? 4U : 32U, false, lds);
+    }
+}
+template<bool Down>
+void launch_linear_s2(Args a, unsigned shared_bits, hipStream_t stream) {
+    constexpr unsigned N = Down ? H : I;
+    linear_kernel_s2<4, Down, false><<<dim3(N / 128U, E, Down ? 1U : 2U), 256, 0, stream>>>(a);
+    ok(hipGetLastError(), "X3 routed linear");
+    if (shared_bits == 6U)
+        linear_kernel_s2<6, Down, true><<<dim3(N / 128U, (a.rows + kSharedRows - 1U) / kSharedRows, Down ? 1U : 2U), 256, 0, stream>>>(a);
+    else
+        linear_kernel_s2<4, Down, true><<<dim3(N / 128U, (a.rows + kSharedRows - 1U) / kSharedRows, Down ? 1U : 2U), 256, 0, stream>>>(a);
+    ok(hipGetLastError(), "X3 shared linear");
+}
+template<bool Down, unsigned R>
+void launch_linear_s(Args a, unsigned shared_bits, hipStream_t stream) {
+    constexpr unsigned N = Down ? H : I;
+    linear_kernel_s<4, Down, false, R><<<dim3(N / 128U, E, Down ? 1U : 2U), 256, 0, stream>>>(a);
+    ok(hipGetLastError(), "X3 routed linear");
+    if (shared_bits == 6U)
+        linear_kernel_s<6, Down, true, R><<<dim3(N / 128U, (a.rows + kSharedRows - 1U) / kSharedRows, Down ? 1U : 2U), 256, 0, stream>>>(a);
+    else
+        linear_kernel_s<4, Down, true, R><<<dim3(N / 128U, (a.rows + kSharedRows - 1U) / kSharedRows, Down ? 1U : 2U), 256, 0, stream>>>(a);
+    ok(hipGetLastError(), "X3 shared linear");
 }
 __global__ void activation_kernel(Args a) {
     const Tile tile = a.tiles[blockIdx.y];
@@ -418,10 +483,24 @@ hipFuncAttributes query_x_resources(unsigned bits, bool down, bool shared) {
 #undef QUERY
     return a;
 }
+template<unsigned R>
+hipFuncAttributes query_s_resources(unsigned bits, bool down, bool shared) {
+    hipFuncAttributes a{};
+#define QUERY(B, D, S) ok(hipFuncGetAttributes(&a, reinterpret_cast<const void*>(&linear_kernel_s<B, D, S, R>)), "X3 resources")
+#define SELECT(B) if (down) { if (shared) { QUERY(B, true, true); } else { QUERY(B, true, false); } }                   else { if (shared) { QUERY(B, false, true); } else { QUERY(B, false, false); } }
+    if (bits == 4) { SELECT(4); }
+    else if (bits == 6 && shared) { SELECT(6); }
+    else throw std::invalid_argument("exact moe: X3 resource bits/shared");
+#undef SELECT
+#undef QUERY
+    return a;
+}
 hipFuncAttributes x_resources(unsigned bits, bool down, bool shared, unsigned variant) {
     if (variant == 6) return query_x_resources<false>(bits, down, shared);
     if (variant == 7) return query_x_resources<true>(bits, down, shared);
-    throw std::invalid_argument("exact moe: X resources variant must be 6 or 7");
+    if (variant == 8) return query_s_resources<4>(bits, down, shared);
+    if (variant == 9) return query_s_resources<8>(bits, down, shared);
+    throw std::invalid_argument("exact moe: X resources variant must be 6, 7, 8 or 9");
 }
 Plan::Plan(unsigned max_rows) : capacity(max_rows) {
     (void)Layout(max_rows);
@@ -445,16 +524,23 @@ const float* pair_output(void* ws, unsigned rows, unsigned pair) {
 unsigned x_auto_rows() {
     // STRIX_GLM_PF_EXACTMOE_X_MIN_ROWS overrides the auto threshold (rows per MoE call).
     const char* p = std::getenv("STRIX_GLM_PF_EXACTMOE_X_MIN_ROWS");
-    if (!p) return 2048;
+    if (!p) return 512;
     char* end = nullptr;
     const unsigned long n = std::strtoul(p, &end, 10);
     if (!*p || *end || n == 0 || n > 65536) throw std::invalid_argument("STRIX_GLM_PF_EXACTMOE_X_MIN_ROWS must be 1..65536");
     return static_cast<unsigned>(n);
 }
+bool v3_row_buckets() {
+    // Default on: v3 tiles compute only the smallest power-of-two row bucket covering their rows (same bits).
+    const char* p = std::getenv("STRIX_GLM_PF_EXACTMOE_V3_RCAP");
+    if (!p || std::string(p) == "1") return true;
+    if (std::string(p) == "0") return false;
+    throw std::invalid_argument("STRIX_GLM_PF_EXACTMOE_V3_RCAP must be 0 or 1");
+}
 unsigned selected_variant(unsigned rows) {
     const char* variant = std::getenv("STRIX_GLM_PF_EXACTMOE_V");
     // v3 is the measured default (real pair, 1K/8K/32K TTFT logits bitwise == v1 on both ranks, -10..-11 % ms/token);
-    // STRIX_GLM_PF_EXACTMOE_V=1 restores v1. auto: v7 for calls >= x_auto_rows() rows, v3 below (both exact;
+    // STRIX_GLM_PF_EXACTMOE_V=1 restores v1. auto: v10 (X3 core) for calls >= x_auto_rows() rows, v3 below (both exact;
     // 32-row X tiles mostly pad the small expert groups of short calls).
     if (!variant) return 3;
     const std::string s(variant);
@@ -463,8 +549,11 @@ unsigned selected_variant(unsigned rows) {
     if (s == "3") return 3;
     if (s == "6") return 6;
     if (s == "7") return 7;
-    if (s == "auto") return rows >= x_auto_rows() ? 7 : 3;
-    throw std::invalid_argument("STRIX_GLM_PF_EXACTMOE_V must be 1, 2, 3, 6, 7 or auto");
+    if (s == "8") return 8;
+    if (s == "9") return 9;
+    if (s == "10") return 10;
+    if (s == "auto") return rows >= x_auto_rows() ? 10 : 3;
+    throw std::invalid_argument("STRIX_GLM_PF_EXACTMOE_V must be 1, 2, 3, 6, 7, 8, 9, 10 or auto");
 }
 void enqueue(const View& v, Plan& plan, void* ws, std::size_t bytes, hipStream_t stream, unsigned tm) {
     const Layout l(plan.capacity);
@@ -478,7 +567,7 @@ void enqueue(const View& v, Plan& plan, void* ws, std::size_t bytes, hipStream_t
     }
     if (tm != 16 && tm != 32) throw std::invalid_argument("exact moe: TM must be 16 or 32");
     const unsigned selected = selected_variant(v.rows);
-    const bool v2 = selected == 2, v3 = selected == 3, v6 = selected == 6, v7 = selected == 7;
+    const bool v2 = selected == 2, v3 = selected == 3, v6 = selected == 6, v7 = selected == 7, v8 = selected == 8, v9 = selected == 9, v10 = selected == 10;
     for (unsigned e = 0; e <= E; ++e) {
         const auto& ex = e == E ? v.shared : v.experts[e];
         check_matrix(ex.gate, H, I, e == E);
@@ -521,22 +610,28 @@ void enqueue(const View& v, Plan& plan, void* ws, std::size_t bytes, hipStream_t
     ok(hipMemcpyAsync(table + E, &v.shared, sizeof(moe::ExpertSlices), hipMemcpyHostToDevice, stream), "shared expert");
     ok(hipMemcpyAsync(pairs, plan.pairs.data(), plan.pairs.size() * sizeof(unsigned), hipMemcpyHostToDevice, stream), "pairs");
     ok(hipMemcpyAsync(tiles, plan.tiles.data(), plan.tiles.size() * sizeof(Tile), hipMemcpyHostToDevice, stream), "tiles");
-    if (v3 || v6 || v7) ok(hipMemcpyAsync(device_groups, groups.data(), sizeof(groups), hipMemcpyHostToDevice, stream), "expert groups");
+    if (v3 || v6 || v7 || v8 || v9 || v10) ok(hipMemcpyAsync(device_groups, groups.data(), sizeof(groups), hipMemcpyHostToDevice, stream), "expert groups");
     // Owns host upload lifetimes even when callers immediately reuse their table or Plan.
     ok(hipStreamSynchronize(stream), "plan upload");
     Args a{v.rows, v.x, v.weights, v.out, table, v.shared, pairs, tiles, device_groups,
            reinterpret_cast<float*>(base + l.gu), reinterpret_cast<_Float16*>(base + l.at), reinterpret_cast<float*>(base + l.output),
-           reinterpret_cast<_Float16*>(base + l.input)};
+           reinterpret_cast<_Float16*>(base + l.input), v3_row_buckets() ? 1U : 0U};
     const unsigned nt = static_cast<unsigned>(plan.tiles.size());
-    if (v3 || v6 || v7) {
+    if (v3 || v6 || v7 || v8 || v9 || v10) {
         input_kernel<<<dim3(H / 1024, nt, 2), 256, 0, stream>>>(a);
         ok(hipGetLastError(), "v3 gate/up input transform");
-        if (v7) launch_linear_x<false, true>(a, v.shared.gate.bits, stream);
+        if (v10) launch_linear_s2<false>(a, v.shared.gate.bits, stream);
+        else if (v9) launch_linear_s<false, 8>(a, v.shared.gate.bits, stream);
+        else if (v8) launch_linear_s<false, 4>(a, v.shared.gate.bits, stream);
+        else if (v7) launch_linear_x<false, true>(a, v.shared.gate.bits, stream);
         else if (v6) launch_linear_x<false>(a, v.shared.gate.bits, stream);
         else launch_linear_v3<false>(a, v.shared.gate.bits, stream);
         activation_kernel<<<dim3(I / 128, nt), 256, 0, stream>>>(a);
         ok(hipGetLastError(), "v3 R15/down transform");
-        if (v7) launch_linear_x<true, true>(a, v.shared.down.bits, stream);
+        if (v10) launch_linear_s2<true>(a, v.shared.down.bits, stream);
+        else if (v9) launch_linear_s<true, 8>(a, v.shared.down.bits, stream);
+        else if (v8) launch_linear_s<true, 4>(a, v.shared.down.bits, stream);
+        else if (v7) launch_linear_x<true, true>(a, v.shared.down.bits, stream);
         else if (v6) launch_linear_x<true>(a, v.shared.down.bits, stream);
         else launch_linear_v3<true>(a, v.shared.down.bits, stream);
         combine_kernel<<<dim3(H / 256, a.rows), 256, 0, stream>>>(a);
