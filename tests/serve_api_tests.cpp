@@ -751,6 +751,52 @@ void test_scoring_transforms(const std::shared_ptr<const BpeTokenizer>& tokenize
 
 int main() try {
     {
+        // A handler that throws a non-standard type fails that request with 500; the server keeps serving.
+        HttpServerConfig boom_config;
+        boom_config.port = 0;
+        HttpServer boom(boom_config, [](const HttpRequest& r, HttpResponseWriter& w) {
+            if (r.path == "/boom") throw 42;
+            if (r.path == "/stream-boom") {
+                (void)w.begin_stream(200, "text/event-stream");
+                (void)w.write("data: x\n\n");
+                throw 42;
+            }
+            w.send(200, "text/plain", "ok");
+        });
+        boom.listen();
+        std::thread boom_thread([&] { boom.serve(); });
+        check(http(boom.port(), "GET", "/boom", "").status == 500, "non-standard handler exception answers 500");
+        check(http(boom.port(), "GET", "/ok", "").status == 200, "server survives a non-standard handler exception");
+        {
+            // Pipelined keep-alive requests: a stream interrupted by an exception must end the connection, so the
+            // second response can never appear inside the unfinished chunked body.
+            const int fd = ::socket(AF_INET, SOCK_STREAM, 0);
+            sockaddr_in address{};
+            address.sin_family = AF_INET;
+            address.sin_port = htons(boom.port());
+            ::inet_pton(AF_INET, "127.0.0.1", &address.sin_addr);
+            check(::connect(fd, reinterpret_cast<sockaddr*>(&address), sizeof(address)) == 0, "pipelined client connects");
+            timeval receive_limit{};
+            receive_limit.tv_sec = 20;  // a regression keeps the connection open: fail fast instead of the 300 s idle wait
+            ::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &receive_limit, sizeof(receive_limit));
+            const std::string requests = "GET /stream-boom HTTP/1.1\r\nHost: x\r\n\r\nGET /ok HTTP/1.1\r\nHost: x\r\n\r\n";
+            (void)::send(fd, requests.data(), requests.size(), MSG_NOSIGNAL);
+            std::string raw;
+            char buffer[4096];
+            for (;;) {
+                const auto n = ::recv(fd, buffer, sizeof(buffer), 0);
+                if (n <= 0) break;
+                raw.append(buffer, static_cast<std::size_t>(n));
+            }
+            ::close(fd);
+            std::size_t responses = 0;
+            for (auto at = raw.find("HTTP/1.1 "); at != std::string::npos; at = raw.find("HTTP/1.1 ", at + 1U)) ++responses;
+            check(responses == 1 && raw.find("data: x") != std::string::npos, "interrupted stream closes the connection");
+        }
+        boom.stop();
+        boom_thread.join();
+    }
+    {
         GenerationTicket ticket;
         check(ticket.progress().phase == GenerationPhase::queued, "ticket starts queued");
         for (std::uint64_t n = 0; n <= 100; ++n) ticket.report_progress({GenerationPhase::prefill, n, 10, 110});
