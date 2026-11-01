@@ -17,13 +17,15 @@
 
 // Product profiles of an engine: one switch '--profile default|fast|quality' selects every lever's value.
 //   default  today's exact defaults (exports nothing: the plain invocation, byte for byte)
-//   fast     default + every QUALIFIED bit-changing lever of the engine
+//   fast     default + every QUALIFIED bit-changing lever of the engine (and any marked provisional, stamped so)
 //   quality  a quality pack where the engine has one, else default plus one notice
 // Each lever is one table row (the engine's *_profile_table.hpp). A profile column that is not qualified yet
 // (`ready = false`) is pending: it is never applied and never makes the profile refuse; the builtin keeps
 // running, the receipt lists the row with its declared target and one stderr line says so. '--allow-pending'
 // (or the engine's ..._PROFILE_ALLOW_PENDING=1) applies a pending column whose implementation exists in this
-// build (`runnable`), for benchmarks only, and stamps the receipt "unqualified: <rows>". Precedence per lever:
+// build (`runnable`), for benchmarks only, and stamps the receipt "unqualified: <rows>". A `provisional` column
+// runs its runnable code ahead of qualification without --allow-pending, stamped "qualification in progress: <rows>"
+// with one stderr line per row; it is never "qualified". Precedence per lever:
 // CLI option > environment variable > profile > builtin; an explicit setting is recorded as explicit (or `off`).
 // Header-only and host-only (no HIP/CUDA, no JSON library): shared by the two-node engines' apps.
 namespace strix::profile {
@@ -43,6 +45,7 @@ struct Lever {
     std::string_view target;                // declared target of a pending column; empty: the value
     std::string_view off;                   // explicit value that switches the lever off
     std::string_view source;                // qualification receipt, or what a pending column waits for
+    std::array<bool, 3> provisional{};      // selected ahead of qualification; still requires `runnable`; wins over `ready` until the row is flipped
 };
 
 // One engine: its receipt tag, the allow-pending variable and the table.
@@ -69,7 +72,7 @@ inline const char* name(Name value) {
     return "unknown";
 }
 
-enum class Status { set, explicit_env, explicit_cli, builtin, pending, unqualified, off };
+enum class Status { set, explicit_env, explicit_cli, builtin, pending, unqualified, off, provisional };
 inline const char* status_name(Status value) {
     switch (value) {
     case Status::set: return "profile";
@@ -79,6 +82,7 @@ inline const char* status_name(Status value) {
     case Status::pending: return "pending";
     case Status::unqualified: return "unqualified";
     case Status::off: return "off";
+    case Status::provisional: return "provisional";
     }
     return "unknown";
 }
@@ -129,27 +133,36 @@ struct Resolution {
         return nullptr;
     }
     [[nodiscard]] bool quality_fallback() const { return profile == Name::quality && !engine->quality_rows; }
-    // "qualified", or "unqualified: <rows>" when --allow-pending ran pending columns.
+    // "qualified"; else "qualification in progress: <rows>" for provisional columns and/or "unqualified: <rows>"
+    // when --allow-pending ran pending columns, separated by "; ".
     [[nodiscard]] std::string qualification() const {
-        std::string rows;
-        for (const auto& entry : entries) if (entry.status == Status::unqualified)
-            rows += (rows.empty() ? "" : ",") + std::string(entry.lever->name);
-        return rows.empty() ? "qualified" : "unqualified: " + rows;
+        std::string provisional, unqualified;
+        for (const auto& entry : entries) {
+            auto* rows = entry.status == Status::provisional ? &provisional :
+                entry.status == Status::unqualified ? &unqualified : nullptr;
+            if (rows != nullptr) *rows += (rows->empty() ? "" : ",") + std::string(entry.lever->name);
+        }
+        std::string out;
+        if (!provisional.empty()) out = "qualification in progress: " + provisional;
+        if (!unqualified.empty()) out += (out.empty() ? "" : "; ") + std::string("unqualified: ") + unqualified;
+        return out.empty() ? "qualified" : out;
     }
-    // One stderr line per pending row (and the quality fallback note).
+    // One stderr line per pending, provisional or unqualified row (and the quality fallback note).
     [[nodiscard]] std::vector<std::string> notices() const {
         std::vector<std::string> out;
         const std::string head = std::string(engine->tag) + " profile " + name(profile) + ": ";
         if (quality_fallback()) out.push_back(head + "no quality rows for this model, using default");
+        for (const auto& entry : entries) if (entry.status == Status::provisional)
+            out.push_back(head + std::string(entry.lever->name) + "=" + entry.value + " is bit-changing; qualification in progress");
         for (const auto& entry : entries) if (entry.status == Status::pending)
             out.push_back(head + std::string(entry.lever->name) + " pending " + entry.target + " (" + entry.value + " runs)");
         for (const auto& entry : entries) if (entry.status == Status::unqualified)
             out.push_back(head + std::string(entry.lever->name) + "=" + entry.value + " UNQUALIFIED (--allow-pending, benchmarks only)");
         return out;
     }
-    // {"profile":...,"engine":...,"qualification":...,"levers":{...},"pending":[...],"unqualified":[...]}
+    // {"profile":...,"engine":...,"qualification":...,"levers":{...},"pending":[...],"unqualified":[...],"provisional":[...]}
     [[nodiscard]] std::string json() const {
-        std::string levers, pending, unqualified;
+        std::string levers, pending, unqualified, provisional;
         for (const auto& entry : entries) {
             const auto& lever = *entry.lever;
             if (!levers.empty()) levers += ',';
@@ -167,11 +180,16 @@ struct Resolution {
                 if (!unqualified.empty()) unqualified += ',';
                 unqualified += json_string(lever.name);
             }
+            if (entry.status == Status::provisional) {
+                if (!provisional.empty()) provisional += ',';
+                provisional += json_string(lever.name);
+            }
         }
         std::string out = "{\"profile\":" + json_string(name(profile)) + ",\"engine\":" + json_string(engine->tag) +
             ",\"qualification\":" + json_string(qualification());
         if (quality_fallback()) out += ",\"note\":\"quality: no quality rows for this model, using default\"";
-        return out + ",\"levers\":{" + levers + "},\"pending\":[" + pending + "],\"unqualified\":[" + unqualified + "]}";
+        return out + ",\"levers\":{" + levers + "},\"pending\":[" + pending + "],\"unqualified\":[" + unqualified +
+            "],\"provisional\":[" + provisional + "]}";
     }
     // Line form for line-oriented --print-effective-config outputs (appended after the engine's own lines).
     [[nodiscard]] std::string describe() const {
@@ -275,16 +293,21 @@ inline Resolution resolve(const Engine& engine, const Inputs& inputs) {
             if ((!lever.off.empty() && entry.value == lever.off) || entry.value == "off") entry.status = Status::off;
         } else if (wanted.empty() || wanted == lever.builtin) {
             // builtin (the default column always is: default exports nothing)
-        } else if (!lever.ready[column] && !(out.allow_pending && lever.runnable[column])) {
+        } else if (!lever.ready[column] && !((lever.provisional[column] || out.allow_pending) && lever.runnable[column])) {
             entry.status = Status::pending;
             entry.target = std::string(lever.target.empty() ? wanted : lever.target);
         } else {
             entry.value = std::string(wanted);
-            entry.status = lever.ready[column] ? Status::set : Status::unqualified;
+            entry.status = lever.provisional[column] ? Status::provisional : lever.ready[column] ? Status::set : Status::unqualified;
         }
         out.entries.push_back(std::move(entry));
     }
     return out;
+}
+
+// The statuses the profile itself applies (an explicit setting is the app's own).
+inline bool applied(Status status) {
+    return status == Status::set || status == Status::unqualified || status == Status::provisional;
 }
 
 using Export = std::function<bool(const char*, const char*)>;
@@ -295,12 +318,13 @@ inline bool export_environment(const char* key, const char* value) {
     return ::setenv(key, value, 1) == 0;
 #endif
 }
-// Exports the switches the profile sets (status set / unqualified, env levers only; CLI-only levers: profile_args).
+// Exports the switches the profile sets (status set / unqualified / provisional, env levers only; CLI-only levers:
+// profile_args).
 // Call right after argument parsing, before anything reads (and caches) those switches. Default exports nothing.
 inline void apply(const Resolution& resolution, const Export& put = export_environment) {
     for (const auto& entry : resolution.entries) {
         const auto& lever = *entry.lever;
-        if (lever.env.empty() || (entry.status != Status::set && entry.status != Status::unqualified)) continue;
+        if (lever.env.empty() || !applied(entry.status)) continue;
         if (!put(std::string(lever.env).c_str(), entry.value.c_str()))
             throw std::runtime_error("cannot export profile switch " + std::string(lever.env));
     }
@@ -312,7 +336,7 @@ inline std::vector<std::string> profile_args(const Resolution& resolution) {
     std::vector<std::string> out;
     for (const auto& entry : resolution.entries) {
         const auto& lever = *entry.lever;
-        if (!lever.env.empty() || lever.option.empty() || (entry.status != Status::set && entry.status != Status::unqualified)) continue;
+        if (!lever.env.empty() || lever.option.empty() || !applied(entry.status)) continue;
         out.emplace_back(lever.option);
         out.push_back(entry.value);
     }

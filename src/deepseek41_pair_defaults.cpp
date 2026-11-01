@@ -226,7 +226,7 @@ Resolved resolve(App app, const std::vector<std::string>& in, const Getenv& raw_
     r.profile = strix::profile::resolve(profile_engine(), profile_inputs);
     std::vector<std::pair<std::string, std::string>> profile_env;
     for (const auto& e : r.profile->entries)
-        if (!e.lever->env.empty() && (e.status == strix::profile::Status::set || e.status == strix::profile::Status::unqualified))
+        if (!e.lever->env.empty() && strix::profile::applied(e.status))
             profile_env.emplace_back(std::string(e.lever->env), e.value);
     r.set_env = profile_env;
     if (auto extra = strix::profile::profile_args(*r.profile); !extra.empty())
