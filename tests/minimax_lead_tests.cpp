@@ -385,6 +385,23 @@ int main() {
         for (std::size_t i = 1; i < r.controls.size(); ++i)
             check(r.controls[i].round == r.controls[i - 1].round + 1, "session preserves control round sequence");
     }
+    {
+        // The session ran out of context after one token: the reply's finish wins over the max_tokens comparison.
+        Scenario s(ms::Sched::interleave);
+        s.submit(0, 1, 10, 4, "conversation");
+        ms::SessionService service;
+        service.execute = [&](const std::string&, const ms::SessionService::Publish& publish) {
+            const std::array<std::uint32_t, 1> ids{201};
+            (void)publish(ids);
+            auto reply = sv::Json::object(), tokens = sv::Json::array();
+            tokens.push(sv::Json(std::uint64_t(ids[0])));
+            reply.set("token_ids", std::move(tokens)); reply.set("hit", sv::Json(true)); reply.set("finish", sv::Json("length"));
+            return reply;
+        };
+        (void)s.run(40000, &service);
+        const auto stats = s.tickets.at(1)->stats();
+        check(stats.generated_tokens == 1 && stats.finish == "length", "context-clamped session generation finishes with length");
+    }
     std::cout << "production Lead traces: " << failures << " failures\n";
     return failures == 0 ? 0 : 1;
 }

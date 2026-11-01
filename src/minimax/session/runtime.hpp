@@ -32,6 +32,8 @@ public:
   void restore_auto(const std::string&);
   void erase(const std::string &id);
   bool begin_request(const std::string&, std::span<const std::uint32_t>);
+  // Tokens generate() can still produce in the active session (0 when the context is full or nothing is active).
+  std::uint64_t generation_room() const;
   std::vector<Summary> describe() const { return cache_->describe(options_.disk_enabled); }
   std::uint64_t ram_budget() const { return options_.budget; }
   bool in_ram(const std::string& id) const { return cache_->in_ram(id); }

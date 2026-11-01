@@ -944,6 +944,9 @@ The [resolver](src/minimax/engine/mm_defaults.cpp) enables the production decode
 including MSA prefill mode 5. `strix-minimax-serve` uses structural DSpark auto admission with compatible
 local assets; eligible uncontended requests may draft, while competing/grouped or unsupported requests
 stay plain. See [admission and qualification](docs/engine/serving/dspark-auto-qualification.md).
+A named session request that does not fit the context returns HTTP 400 `context_length_exceeded` (the
+session stays parked); generation stops at the end of the context with finish reason `length`. See
+[session cache](docs/minimax/session-cache.md).
 
 ### GLM pair
 
