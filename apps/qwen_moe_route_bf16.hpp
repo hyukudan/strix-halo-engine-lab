@@ -4,6 +4,12 @@
 #include "strix/serve/json.hpp"
 
 namespace strix::decode_cli {
+inline bool moe_route_bf16_profile_owned(const Options& o) {
+    const auto* row = o.product_profile.find("moe_route_bf16");
+    return !o.prefill_moe_route_bf16_requested.has_value() && row &&
+        (row->status == qwen::profile::Status::set || row->status == qwen::profile::Status::unqualified ||
+         row->status == qwen::profile::Status::provisional);
+}
 // Candidate storage arithmetic is resolved after the ordinary prefill owner, before device setup.
 template<class Environment>
 inline void resolve_moe_route_bf16(Options& o, const Environment& env, bool gsq, bool hip_fp16, std::string& error) {

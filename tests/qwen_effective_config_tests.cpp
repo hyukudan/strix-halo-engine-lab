@@ -726,6 +726,8 @@ void yarn_admission_tests(const gguf::FileInfo& info, const ModelManifest& manif
             fast_config.options.product_profile.find("moe_route_bf16")->status == qwen::profile::Status::provisional &&
             exported.at(key) == "1" && exported.at("STRIX_QWEN_PROFILE_OWNED_moe_route_bf16") == "fast:provisional:1",
             "fast YaRN long CLI still admits and exports provisional storage");
+        expect(effective_config_json(fast_config).find("fp16-v1+moeroute16") != std::string::npos,
+            "fast YaRN serial retains composed storage identity");
         const auto off_pair = numerical_profile_pair(off.options);
         // Exercise the host compiler with synthetic kernels, without HIP. The
         // production prefix key includes this execution identity and pair hash.
@@ -1231,6 +1233,44 @@ void yarn_admission_tests(const gguf::FileInfo& info, const ModelManifest& manif
     mm.draft_chain=true;mo.known_prefix_window=mo.known_prefix_full_rows=true;mo.known_prefix_prefill_rows=8192;
     const auto ym=resolve(mtp,memory);
     expect(ym.admitted && ym.admission.at("mtp_enabled")==1,"explicit YaRN MTP admitted after resolved target organization");
+    {
+        constexpr auto key = "STRIX_QPF2K_MOE_ROUTE_BF16";
+        auto fast = mtp;
+        fast.options.product_profile = parse({"decoder","MODEL","1","--profile","fast"}).product_profile;
+        const auto got = resolve(fast,memory);
+        const auto* row = got.options.product_profile.find("moe_route_bf16");
+        expect(got.admitted && got.error.empty() && !got.options.prefill_moe_route_bf16 &&
+            row && row->status == qwen::profile::Status::pending &&
+            row->reason == "MTP, nested, serving, cache and session routes are unsupported" &&
+            row->reason == got.options.prefill_moe_route_bf16_reason,
+            "fast YaRN MTP softly declines profile storage with a pending reason");
+        Environment exported;
+        qwen::profile::apply(got.options.product_profile, [&](const char* name, const char* value) {
+            exported[name] = value; return true;
+        });
+        expect(!got.environment.contains(key) && !exported.contains(key) &&
+            !exported.contains("STRIX_QWEN_PROFILE_OWNED_moe_route_bf16"),
+            "declined YaRN MTP profile storage has no BF16 export");
+        expect(got.admission == ym.admission && got.host_compilation == ym.host_compilation &&
+            numerical_profile_pair(got.options) == numerical_profile_pair(ym.options),
+            "fast YaRN MTP decline preserves FP32 storage admission and identity");
+        fast.options.prefill_moe_route_bf16_requested = true;
+        const auto explicit_on = resolve(fast,memory);
+        expect(!explicit_on.admitted && !explicit_on.options.prefill_moe_route_bf16 &&
+            explicit_on.error == "MoE route BF16 candidate declined: MTP, nested, serving, cache and session routes are unsupported",
+            "explicit YaRN MTP BF16 request keeps hard refusal under fast profile");
+        fast.options.supplied_options.insert("--prefill-moe-route-bf16");
+        expect(!resolve(fast,memory).error.empty(), "explicit YaRN MTP BF16 CLI keeps route refusal under fast profile");
+        fast.options.supplied_options.erase("--prefill-moe-route-bf16");
+        fast.options.prefill_moe_route_bf16_requested = false;
+        fast.options.product_profile = parse({"decoder","MODEL","1","--profile","fast",
+            "--prefill-moe-route-bf16","off"}).product_profile;
+        const auto explicit_off = resolve(fast,memory);
+        expect(explicit_off.admitted && explicit_off.error.empty() && !explicit_off.options.prefill_moe_route_bf16 &&
+            !explicit_off.environment.contains(key) && explicit_off.admission == ym.admission &&
+            numerical_profile_pair(explicit_off.options) == numerical_profile_pair(ym.options),
+            "explicit YaRN MTP BF16 off preserves FP32 storage under fast profile");
+    }
     {
         auto candidate=mtp; candidate.environment["STRIX_QPF2K_MOE_ROUTE_BF16"]="1";
         const auto declined=resolve(candidate,memory);
