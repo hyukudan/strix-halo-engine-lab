@@ -105,6 +105,8 @@ public:
     virtual TierView view()const=0;
     virtual void reset_open()=0;
     virtual Json stats()=0;
+    // Raw cumulative counters (never reset): eviction / write-back / make_resident totals for phase deltas.
+    virtual Json counters(){return Json::object();}
     // Best effort, for failure receipts: raw counters and the last token error (empty: none).
     virtual Json diagnostics(){return Json::object();}
     // Whether the open step exports gated layer g (StepPlan above); a cache without steps exports every layer.

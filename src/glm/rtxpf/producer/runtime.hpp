@@ -91,12 +91,18 @@ public:
     std::string timings()const;
     void prefill(std::span<const std::uint32_t> tokens,const std::string& identity,const StateSink&);
     std::string self_check(std::span<const std::uint32_t> tokens,const std::string& identity,unsigned reference_tile=256);
-    // Prefill row tile: the current one, the one allocated at startup, and a
-    // per-request override (valid_schedule, at most the allocated tile; graph
-    // templates recapture for the new shape, as the self-check does).
+    // Prefill row tile: the last one used (the startup allocation before any request), the
+    // one allocated at startup, and a per-request override (valid_schedule, at most the
+    // allocated tile; 0 = auto). Auto: every prefill picks select_prefill_tile(rows,
+    // allocated, crossover) (schedule.hpp): min(4096, allocated) below the crossover, the
+    // allocated tile at and above it. Graph templates are keyed by first:rows and recapture
+    // (update or re-instantiate) when the tile changes. The self-check pins its own tiles.
     unsigned prefill_row_tile()const;
     unsigned allocated_prefill_row_tile()const;
     void use_prefill_row_tile(unsigned tile);
+    unsigned requested_prefill_row_tile()const;
+    void set_prefill_tile_crossover(unsigned rows);
+    unsigned prefill_tile_crossover()const;
     // ---- single session decode, identity glm-dec-rtx-native-v1 (draft) ----
     // One pending token: after begin_session(S) the frontier is |S|-1 and S.back()
     // is pending. decode_one consumes it and appends the greedy token. Any

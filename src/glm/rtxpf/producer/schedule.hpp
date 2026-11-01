@@ -2,6 +2,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <string>
 namespace strix::glm::rtxpf::producer {
 inline constexpr unsigned max_capacity=131072,max_row_tile=32768;
 // Zero is the capacity-scaled candidate; explicit numeric tiles remain fixed.
@@ -24,8 +25,25 @@ inline bool tile_growth_within(std::uint64_t growth,std::uint64_t baseline_arena
 template<class Fits> unsigned largest_fitting_tile(unsigned capacity,Fits fits,unsigned cap_tile=max_row_tile){
     for(unsigned t=first_tile_candidate(capacity,cap_tile);t;t=next_tile_candidate(t))if(fits(t))return t;return 0;
 }
+// Per-request prefill tile inside the startup allocation (exact: the tile only changes the row
+// chunking; the tile sweeps showed equal prefill state digests). A request whose prefill rows
+// (prompt tokens - 1) are below the crossover runs at min(small_prefill_tile, allocated); at and
+// above it, at the allocated tile. Crossover 0 = always the allocated tile. The crossover is the
+// profile row prefill_tile_crossover (--prefill-tile-crossover); default 0 = always the allocated tile: the one-load
+// sweep (allocation 8192) had 8192 fastest at every length (8K 29.2 / 30.2 / 32.5 s at 8192 / 4096 / 2048,
+// 16K 36.7 / 38.6 / 43.3, 32K 53.6 / 56.6 / 66.4); the rule stays for an override or a later re-measure.
+inline constexpr unsigned small_prefill_tile=4096,default_prefill_tile_crossover=0;
+inline unsigned select_prefill_tile(unsigned rows,unsigned allocated,unsigned crossover){
+    return crossover&&rows<crossover?std::min(small_prefill_tile,allocated):allocated;}
+inline const char* prefill_tile_reason(unsigned rows,unsigned crossover){
+    return !crossover?"auto: crossover off (allocated tile)":rows<crossover?"auto: rows below the crossover (small tile)":"auto: rows at or above the crossover (allocated tile)";}
 struct RowTile {unsigned first,rows,bucket;};
 inline RowTile row_tile(unsigned first,unsigned prefix,unsigned tile){auto n=std::min(tile,prefix-first);return {first,n,n==tile?0u:1u};}
+// Prefill CUDA graph template key (graph[layer][bucket], bucket 0 = a full tile, 1 = the tail): every
+// launch parameter that varies between requests is in it (first row, rows, index identity, the session's
+// open KDA block), so a tile change (rows differ) recaptures the slot; equal keys = identical launches.
+inline std::string prefill_binding(unsigned first,unsigned rows,const std::string& identity,bool legacy,const std::string& session){
+    return std::to_string(first)+":"+std::to_string(rows)+":"+identity+":"+std::to_string(legacy?1:0)+session;}
 // Persistent residuals + final hidden only. Working rows are not capacity rows.
 inline std::uint64_t activation_bytes(unsigned capacity,unsigned tile){return std::uint64_t(capacity)*4096*4*5+std::uint64_t(tile)*4096*4*14+std::uint64_t(tile)*24*4+std::uint64_t(capacity+1)*4+std::uint64_t(tile)*64+4;}
 }

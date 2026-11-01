@@ -254,6 +254,36 @@ void mtp_tile_tests(){
         for(unsigned first=0;first<P;first+=mtp_row_tile(8192)){auto c=row_tile(first,P,mtp_row_tile(8192));aligned=aligned&&first%4==0;covered+=c.rows;++pieces;}
         check(covered==P&&aligned&&pieces==(P+2047)/2048,"MTP pieces cover every prefill row once, 4-aligned");}
 }
+// Per-request prefill tile (schedule.hpp select_prefill_tile): below the crossover min(4096, allocated),
+// at/above it the allocated tile, crossover 0 = always allocated; both tiles cover the same rows once
+// (exact: only the chunking changes); the two-slot graph template cache keyed by prefill_binding never
+// replays a template captured for another shape when tiles alternate between requests.
+void prefill_tile_selection_tests(){
+    check(default_prefill_tile_crossover==0&&small_prefill_tile==4096,"crossover default 0 (always the allocated tile), small tile 4096");
+    check(select_prefill_tile(8191,8192,default_prefill_tile_crossover)==8192&&select_prefill_tile(31999,8192,default_prefill_tile_crossover)==8192,"default: every request at the allocation");
+    check(select_prefill_tile(8191,8192,16384)==4096&&select_prefill_tile(16383,8192,16384)==4096,"rows below the crossover: 4096");
+    check(select_prefill_tile(16384,8192,16384)==8192&&select_prefill_tile(31999,8192,16384)==8192,"rows at/above the crossover: the allocated tile");
+    check(select_prefill_tile(1023,2048,16384)==2048&&select_prefill_tile(1023,4096,16384)==4096,"an allocation <= 4096 is never exceeded");
+    check(select_prefill_tile(1023,8192,0)==8192&&select_prefill_tile(31999,8192,0)==8192,"crossover 0 (off): always the allocated tile");
+    check(select_prefill_tile(100,8192,1)==8192&&select_prefill_tile(0,8192,1)==4096,"crossover 1: only an empty prefix takes the small tile");
+    check(std::string(prefill_tile_reason(1023,16384)).find("below")!=std::string::npos&&std::string(prefill_tile_reason(16384,16384)).find("at or above")!=std::string::npos
+          &&std::string(prefill_tile_reason(5,0)).find("off")!=std::string::npos,"tile choice reasons");
+    for(unsigned P:{1023u,4095u,4096u,8191u,16383u,16384u,31999u})for(unsigned t:{4096u,8192u}){
+        std::vector<unsigned> hit(P,0);for(unsigned first=0;first<P;first+=t){auto c=row_tile(first,P,t);check(c.bucket==(c.rows==t?0u:1u)&&c.rows>0,"bucket 0 = full tile, 1 = tail");for(unsigned r=0;r<c.rows;++r)++hit[c.first+r];}
+        check(std::all_of(hit.begin(),hit.end(),[](unsigned h){return h==1;}),"every prefill row in exactly one chunk at either tile");}
+    // Model of graph[layer][bucket]: a slot replays only when its stored key equals the wanted key; the
+    // captured shape must then be the wanted one (first, rows, session block), whatever the tile history.
+    struct Slot{std::string key;unsigned first=0,rows=0,P=0;bool live=false;};
+    for(bool session:{false,true}){Slot slot[2];unsigned replays=0,captures=0;
+        const std::vector<std::pair<unsigned,unsigned>> requests{{8192,8192},{4096,8192},{8192,8192},{4096,4096},{8192,32000},{4096,32000},{8192,16384},{4096,16384},{4096,8192},{8192,8192},{8192,1024},{4096,1024}};
+        for(auto [t,n]:requests){const unsigned P=n-1;const std::string sk=session?":s"+std::to_string(P/32*32)+"/"+std::to_string(P%32):"";
+            for(unsigned first=0;first<P;first+=t){auto c=row_tile(first,P,t);auto& s=slot[c.bucket];const auto key=prefill_binding(first,c.rows,"glm-pf-rtx-native-v1",false,sk);
+                if(s.live&&s.key==key){++replays;check(s.first==first&&s.rows==c.rows&&(!session||(s.P/32==P/32&&s.P%32==P%32)),"a replayed template has the wanted shape (no stale capture)");}
+                else{++captures;s={key,first,c.rows,P,true};}}}
+        check(replays>0&&captures>0,"the alternating sequence both replays and recaptures");}
+    check(prefill_binding(0,4096,"glm-pf-rtx-native-v1",false,"")!=prefill_binding(0,8192,"glm-pf-rtx-native-v1",false,""),"a tile change changes the full-tile key");
+    check(prefill_binding(0,8191,"x",true,":s8160/31")=="0:8191:x:1:s8160/31","binding key layout unchanged");
+}
 void tierstream_parser_tests(const ExpertCatalog& c,const Json& d){
 #ifdef GLM_TIERSTREAM_PARSER
     std::uint64_t layers=0,units=0,max_unit=0;auto error=tierstream_desc_check(d.dump(),&layers,&units,&max_unit);
@@ -651,10 +681,12 @@ void profile_tests(){
     auto run=[&](std::vector<std::string> args,std::vector<std::pair<std::string,std::string>> env={}){rp::Inputs in;in.args=std::move(args);in.env=lookup(std::move(env));return rp::resolve(rp::App::decode_service,in);};
     const auto def=run({});
     check(def.name==rp::Name::standard&&def.qualification()=="qualified","no --profile = default, qualified");
-    for(const char* l:{"expert_tier","placement","eviction_policy","spare_share","row_tile","cuda_graphs","restore_decode_residency","flush_ready","decode_row_kernels"}){
+    for(const char* l:{"expert_tier","placement","eviction_policy","spare_share","row_tile","prefill_tile_crossover","cuda_graphs","restore_decode_residency","flush_ready","decode_row_kernels"}){
         auto* e=def.find(l);check(e&&e->status==rp::Status::profile&&e->lever->kind==rp::Kind::exact,(std::string("default: exact lever on: ")+l).c_str());}
     check(def.find("expert_tier")->value=="tierstream"&&def.find("eviction_policy")->value=="auto"&&def.find("spare_share")->value=="5"&&def.find("row_tile")->value=="auto",
           "default values = today's service defaults");
+    check(def.find("prefill_tile_crossover")->value=="0"&&run({"--profile","fast"}).find("prefill_tile_crossover")->value=="0","crossover 0 (allocated tile) in every profile");
+    {const auto c=run({"--prefill-tile-crossover","8192"});check(c.find("prefill_tile_crossover")->status==rp::Status::explicit_cli&&c.find("prefill_tile_crossover")->value=="8192","--prefill-tile-crossover explicit");}
     auto* pp=def.find("predicted_prefetch");
     check(pp&&pp->status==rp::Status::pending&&pp->value=="0"&&pp->wanted=="1","predicted prefetch pending in default: its builtin (off) runs");
     check(!def.find("prefill_tile_large")&&!def.find("dsa_index_mma"),"default leaves the fast-only rows alone");
@@ -995,6 +1027,6 @@ int main(int argc,char** argv){try{
 #ifdef GLM_TIERSTREAM_LIBRARY
     tier_budget_tests();
 #endif
-    tier_mapping_tests();prefill_cache_tests();step_plan_tests();decode_timeline_tests();c1_schedule_tests();slot_census_tests();planned_residents_tests();mtp_tile_tests();host_commit_tests();placement_tests();profile_tests();unit_file_tests(argv[1]);binding_tests(argv[1]);encoding_tests(argv[1]);lifetime_tests(argv[1]);receipt_tests(argc>2?std::filesystem::path(argv[2]):std::filesystem::path());request_tests();
+    tier_mapping_tests();prefill_cache_tests();step_plan_tests();decode_timeline_tests();c1_schedule_tests();slot_census_tests();planned_residents_tests();mtp_tile_tests();prefill_tile_selection_tests();host_commit_tests();placement_tests();profile_tests();unit_file_tests(argv[1]);binding_tests(argv[1]);encoding_tests(argv[1]);lifetime_tests(argv[1]);receipt_tests(argc>2?std::filesystem::path(argv[2]):std::filesystem::path());request_tests();
     std::cout<<"PASS "<<checks<<" decode host checks: session/frontier, state bytes, KDA open-block replay model, DSA pools, argmax, expert catalog/units, cross-shard reads, guarded slots, generate requests\n";return 0;
 }catch(const std::exception& e){std::cerr<<e.what()<<"\n";return 1;}}

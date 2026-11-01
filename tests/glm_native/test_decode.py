@@ -849,6 +849,7 @@ class WindowTests(unittest.TestCase):
             class FakeService:
                 def __init__(self, command, _log):
                     tile = int(command[command.index('--row-tile') + 1])
+                    test.assertEqual(command[command.index('--prefill-tile-crossover') + 1], '0')  # every request at the startup tile
                     starts.append(tile)
                     self.proc = types.SimpleNamespace(poll=lambda: 0)
                     ready = dict(ready=True, producer_executable_sha256='e'*64, health=dict(
@@ -883,6 +884,268 @@ class WindowTests(unittest.TestCase):
             self.assertEqual(verdicts[('bench', 1024)], 'BITWISE-EQUAL')  # same tokens, logits, final state
             self.assertTrue((out/'tile-2048'/'health.json').is_file() and (out/'tile-8192'/'ttft-q8192.json').is_file())
             self.assertTrue(any(r['prompt'] == 'ttft-32000.u32' and r['verdict'] == 'INCOMPLETE' for r in summary['results']))
+
+    def test_tile_requests_one_load(self):
+        """--tile-requests 4096,8192: ONE service start at the default allocation, the gate, then
+        TTFT 8K/16K/32K at every tile (row_tile per request) plus the auto arm (the service's own
+        choice: rows < 16384 -> 4096); per-length bitwise compare and the crossover estimate."""
+        with tempfile.TemporaryDirectory(dir=BUILD) as td:
+            d = self.prompts(td, CHAT_ALL)
+            (d/'ttft-16384.u32').write_bytes(struct.pack('<16384I', *([11]*16384)))  # 32K stays missing: INCOMPLETE
+            a = self.cached(self.args(d), td)
+            a.full_card, a.capacity, a.tile_requests = True, 32768, [4096, 8192]
+            out = Path(td)/'out'
+            out.mkdir()
+            starts, sent = [], []
+            gate = [self.record(4, 1024), self.record(4, 8192), self.compare_record()]
+            auto = {8192: 4096, 16384: 4096}  # the service rule, written out: 8191 and 16383 rows are below 16384
+            speed = {(8192, 4096): 1.0, (8192, 8192): 1.2, (16384, 4096): 2.4, (16384, 8192): 2.0}
+            test = self
+
+            class FakeService:
+                def __init__(self, command, _log):
+                    test.assertNotIn('--row-tile', command)  # the default allocation
+                    test.assertNotIn('--prefill-tile-crossover', command)  # the profile value
+                    starts.append(command)
+                    self.proc = types.SimpleNamespace(poll=lambda: 0)
+                    self.replies = [dict(ready=True, producer_executable_sha256='e'*64, health=dict(
+                        decode_identity=dw.IDENTITY, row_tile=8192, prefill_tile_crossover=16384, startup_ms=180000,
+                        residency=dict(decode=dict(expert_tier='tierstream', tier_plan=dict(
+                            three_tier=True, reference_compare=True, unit_manifest_sha256='f'*64)))))] + list(gate)
+
+                def read(self, deadline):
+                    if self.replies:
+                        return self.replies.pop(0)
+                    cmd = sent[-1][1]
+                    n = 16384 if cmd['prompt'].endswith('ttft-16384.u32') else 8192
+                    tile = cmd.get('row_tile') or auto[n]
+                    state = dict(rank0_sha256='a'*64, rank1_sha256='b'*64, rank0_bytes=10, rank1_bytes=10,
+                                 replay_sha256='d'*64, frontier=n - 1, components=[[0, 0, 10]])
+                    return dict(backend='tierstream', prompt_tokens=n, ttft_s=speed[(n, tile)] + 0.1, prefill_s=speed[(n, tile)],
+                                token=5, row_tile=tile, allocated_row_tile=8192, prefill_tile_crossover=16384,
+                                row_tile_choice='request override (row_tile)' if cmd.get('row_tile') else 'auto: rows below the crossover (small tile)',
+                                prefill=dict(row_tile=tile), prefill_state=state)
+
+                def send(self, command):
+                    if command['op'] != 'quit':
+                        test.assertNotIn('row_tile', command) if command['op'] != 'ttft' else None
+                    sent.append((command['op'], command))
+
+            deadline = types.SimpleNamespace(left=lambda: 100000)
+            with patch.object(dw, 'Service', FakeService), patch.object(dw, 'stop'), patch.object(dw, 'snapshot_check'), \
+                 contextlib.redirect_stdout(io.StringIO()) as printed:
+                dw.execute(a, out, deadline, dict(service_sha256='e'*64), dw.check_inputs(a))
+            summary = json.loads(printed.getvalue())
+            self.assertEqual(len(starts), 1)
+            ttft = [(c['prompt'].rsplit('/', 1)[-1].rsplit('\\', 1)[-1], c.get('row_tile')) for op, c in sent if op == 'ttft']
+            self.assertEqual(ttft, [('q8192.u32', 4096), ('q8192.u32', 8192), ('q8192.u32', None),
+                                    ('ttft-16384.u32', 4096), ('ttft-16384.u32', 8192), ('ttft-16384.u32', None)])
+            res = [r for r in summary['results'] if r['op'] == 'ttft']
+            self.assertTrue(all(r['verdict'] == 'EXACT' for r in res if r['prompt'] != 'ttft-32000.u32'), res)
+            self.assertEqual([r['row_tile_expected'] for r in res if r['prompt'] != 'ttft-32000.u32'], [4096, 8192, 4096, 4096, 8192, 4096])
+            self.assertEqual([r.get('prefill_row_tile') for r in res if r['prompt'] != 'ttft-32000.u32'], [4096, 8192, 4096, 4096, 8192, 4096])
+            self.assertTrue(any(r['prompt'] == 'ttft-32000.u32' and r['verdict'] == 'INCOMPLETE' for r in res))
+            tr = summary['tile_requests']
+            self.assertEqual((tr['tiles'], tr['lengths'], tr['crossover_service']), ([4096, 8192], [8192, 16384, 32000], 16384))
+            self.assertEqual({c['tokens']: c['verdict'] for c in tr['comparison']}, {8192: 'BITWISE-EQUAL', 16384: 'BITWISE-EQUAL'})
+            est = tr['crossover_estimate']
+            self.assertEqual([(r['tokens'], r['faster']) for r in est['per_length']], [(8192, 4096), (16384, 8192)])
+            self.assertEqual(est['crossover_at_most_rows'], 16383)
+            self.assertNotIn('failure', summary)
+
+    def test_tile_requests_arguments_and_auto_tile(self):
+        with patch.object(dw, 'host_total_gib', return_value=191.6):
+            a = dw.arguments(['--build', '.', '--model', 'M', '--prompt-dir', 'P', '--full-card', '--tile-requests', '4096,8192'])
+        self.assertEqual(a.tile_requests, [4096, 8192])
+        self.assertLessEqual(dw.expected_seconds(a), dw.MAX_SECONDS)
+        plan = [(i[0], i[1], i[3] if len(i) > 3 else None) for i in dw.prompt_plan(a)]
+        self.assertEqual(plan[:3], [('qualify', 1024, None), ('qualify', 8192, None), ('compare', 1024, None)])
+        self.assertEqual(plan[3:], [('ttft', n, t) for n in (8192, 16384, 32000) for t in (4096, 8192, None)])
+        self.assertEqual(dw.prompt_plan(a)[6][2].name, 'ttft-16384.u32')
+        self.assertNotIn('--prefill-tile-crossover', dw.service_command(a, 'svc'))
+        self.assertEqual(dw.worker_options(a)[dw.worker_options(a).index('--tile-requests') + 1], '4096,8192')
+        with patch.object(dw, 'host_total_gib', return_value=191.6):
+            b = dw.arguments(['--build', '.', '--model', 'M', '--prompt-dir', 'P', '--full-card', '--prefill-tile-crossover', '12000'])
+            s = dw.arguments(['--build', '.', '--model', 'M', '--prompt-dir', 'P', '--full-card', '--tile-sweep', '2048,8192'])
+        cmd = dw.service_command(b, 'svc')
+        self.assertEqual(cmd[cmd.index('--prefill-tile-crossover') + 1], '12000')
+        self.assertEqual(dw.worker_options(b)[dw.worker_options(b).index('--prefill-tile-crossover') + 1], '12000')
+        cmd = dw.service_command(s, 'svc')
+        self.assertEqual(cmd[cmd.index('--prefill-tile-crossover') + 1], '0')  # per-start sweep: crossover off
+        for bad in (['--tile-requests', '4096'], ['--tile-requests', '4096,4096'], ['--tile-requests', '4096,8200'],
+                    ['--tile-requests', '4096,8192', '--tile-sweep', '2048,8192'], ['--prefill-tile-crossover', '-1'],
+                    ['--prefill-tile-crossover', '200000']):
+            with self.assertRaises(SystemExit), patch.object(dw, 'host_total_gib', return_value=191.6), contextlib.redirect_stderr(io.StringIO()):
+                dw.arguments(['--build', '.', '--model', 'M', '--prompt-dir', 'P', '--full-card'] + bad)
+        with self.assertRaises(SystemExit), contextlib.redirect_stderr(io.StringIO()):
+            dw.arguments(['--build', '.', '--model', 'M', '--prompt-dir', 'P', '--tile-requests', '4096,8192'])  # full card only
+        # the Python mirror of schedule.hpp select_prefill_tile
+        self.assertEqual([dw.auto_tile(r, 8192, 16384) for r in (1023, 8191, 16383, 16384, 31999)], [4096, 4096, 4096, 8192, 8192])
+        self.assertEqual([dw.auto_tile(1023, 2048, 16384), dw.auto_tile(1023, 8192, 0)], [2048, 8192])
+        self.assertEqual(dw.crossover_estimate([], 8192)['note'], 'no comparable lengths')
+        slow = [dict(tokens=32000, verdict='BITWISE-EQUAL', timing=[dict(row_tile=4096, prefill_s=9.0), dict(row_tile=8192, prefill_s=9.5)])]
+        self.assertIsNone(dw.crossover_estimate(slow, 8192)['crossover_at_most_rows'])
+
+    def test_service_parses_every_planned_command(self):
+        """Every request shape the harness can send (each run mode's plan, built by decode_command
+        exactly as execute does, with the per-request tile at several allocations, plus quit) goes through
+        the REAL service binary's decode-command parser (--check-decode-commands, CPU only); malformed
+        shapes are refused with the field named."""
+        exe = BUILD / 'glm_native_service.exe'
+        if not exe.is_file():
+            self.skipTest('service binary not built')
+        modes = [[], ['--full-card'], ['--full-card', '--tile-sweep', '2048,8192'], ['--full-card', '--tile-requests', '4096,8192'],
+                 ['--full-card', '--row-tile', '8192', '--tile-requests', '2048,4096,8192'], ['--full-card', '--ttft-only']]
+        lines, expected = [], []
+        seg = Path('SEG')
+        for mode in modes:
+            with patch.object(dw, 'host_total_gib', return_value=191.6):
+                a = dw.arguments(['--build', '.', '--model', 'M', '--prompt-dir', 'P'] + mode)
+            for allocated in (2048, 4096, 8192):
+                for health in (dict(prefill_tile_crossover=16384), dict(prefill_tile_crossover=0), {}):
+                    for item in dw.prompt_plan(a):
+                        command, tile, _ = dw.decode_command(a, item, allocated, health, seg)
+                        lines.append(json.dumps(command))
+                        expected.append(command)
+        self.assertTrue(any('row_tile' in c for c in expected) and any('order' in c for c in expected)
+                        and any('export_dir' in c for c in expected), 'every optional field is exercised')
+        self.assertTrue({c.get('row_tile') for c in expected if c['op'] == 'ttft'} >= {None, 2048, 4096, 8192})
+        # the in-process A/B fields (decode_row_kernels, decode timeline) on every work op
+        for op in ('qualify', 'bench', 'compare', 'ttft'):
+            base = next(c for c in expected if c['op'] == op)
+            for extra in (dict(row_kernels='0'), dict(row_kernels='1'), dict(row_kernels='moe+router'), dict(row_kernels='hc+kda+dsa'),
+                          dict(decode_profile=True), dict(decode_profile=False), dict(row_kernels='moe', decode_profile=True)):
+                command = dict(base, **extra)
+                lines.append(json.dumps(command))
+                expected.append(command)
+        lines.append(json.dumps(dict(op='quit')))
+        expected.append(dict(op='quit'))
+        bad = [(dict(op='ttft', prompt='p', steps=1, tile=4096), 'unsupported request field: tile'),
+               (dict(op='qualify', prompt='p', steps=4, row_tile=4096), 'row_tile is not a field of op qualify'),
+               (dict(op='ttft', prompt='p', steps=1, row_tile=100), 'row_tile must be a multiple of 32'),
+               (dict(op='bench', prompt='p', steps=4), 'bench needs order'),
+               (dict(op='ttft', prompt='p', steps=1, export_dir='x'), 'export_dir is not a field of op ttft'),
+               (dict(op='warmup', prompt='p', steps=1), 'unknown op: warmup'),
+               (dict(op='quit', steps=1), 'quit takes no fields'),
+               (dict(op='quit', row_kernels='1'), 'row_kernels is not a field of op quit'),
+               (dict(op='ttft', prompt='p', steps=1, row_kernels='moe+gemm'), 'subset of moe, hc, router, kda, dsa'),
+               (dict(op='ttft', prompt='p', steps=1, row_kernels=1), 'row_kernels must be a non-empty string'),
+               (dict(op='bench', prompt='p', steps=4, order=['cold', 'warm'], decode_profile=1), 'decode_profile must be true or false')]
+        lines += [json.dumps(b) for b, _ in bad]
+        env = dict(os.environ)
+        env.pop('CUDA_VISIBLE_DEVICES', None)
+        done = subprocess.run([str(exe), '--check-decode-commands'], input='\n'.join(lines) + '\n', capture_output=True,
+                              text=True, env=env, timeout=60)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        out = [json.loads(x) for x in done.stdout.splitlines() if x.strip()]
+        self.assertEqual(len(out), len(lines))
+        for command, got in zip(expected, out):
+            self.assertTrue(got['ok'], (command, got))
+            self.assertEqual(got['op'], command['op'])
+            if command['op'] != 'quit':
+                self.assertEqual(got['row_tile'], command.get('row_tile', 0))
+                self.assertEqual(got['steps'], command['steps'])
+                self.assertEqual(got['export_dir'], 'export_dir' in command)
+                if 'row_kernels' in command:
+                    self.assertEqual(got['row_kernels'], command['row_kernels'])
+                if 'decode_profile' in command:
+                    self.assertEqual(got['decode_profile'], command['decode_profile'])
+        for (b, why), got in zip(bad, out[len(expected):]):
+            self.assertFalse(got['ok'], b)
+            self.assertIn(why, got['error'])
+
+    def test_ttft_records_prefill_file_traffic(self):
+        """The TTFT result carries the prefill's own file reads/bytes (service counter delta) and
+        tile_compare's timing shows them per tile."""
+        rec = TileCompareTests.rec(TileCompareTests(), tile=8192)
+        rec.update(prefill_file_reads=511, prefill_file_bytes=511 * 4096, prefill_misses=600)
+        a = types.SimpleNamespace(expert_tier='tierstream', steps=4)
+        r = dw.materialize(a, 'ttft', 8192, ('ttft', 8192, Path('q8192.u32'), 8192), rec, dict(op='ttft', tokens=8192), Path('.'),
+                           1.0, 8192, 8192)
+        self.assertEqual((r['verdict'], r['prefill_file_reads'], r['prefill_file_bytes'], r['prefill_misses']),
+                         ('EXACT', 511, 511 * 4096, 600))
+        other = dw.materialize(a, 'ttft', 8192, ('ttft', 8192, Path('q8192.u32'), 2048), dict(rec, row_tile=2048, prefill_file_reads=0,
+                               prefill_file_bytes=0), dict(op='ttft', tokens=8192), Path('.'), 1.0, 2048, 8192)
+        cmp = dw.tile_compare([r, other])
+        self.assertEqual({t['row_tile']: t['prefill_file_reads'] for t in cmp[0]['timing']}, {8192: 511, 2048: 0})
+
+    def test_tile_requests_three_tiles_fit(self):
+        """--tile-requests 2048,4096,8192 under a forced 8192 allocation: all three tiles at 8K/16K/32K plus auto, in the deadline."""
+        with patch.object(dw, 'host_total_gib', return_value=191.6):
+            a = dw.arguments(['--build', '.', '--model', 'M', '--prompt-dir', 'P', '--full-card', '--row-tile', '8192',
+                              '--tile-requests', '2048,4096,8192'])
+        self.assertEqual(a.tile_requests, [2048, 4096, 8192])
+        self.assertLessEqual(dw.expected_seconds(a), a.timeout)
+        ttft = [(i[1], i[3]) for i in dw.prompt_plan(a) if i[0] == 'ttft']
+        self.assertEqual(ttft, [(n, t) for n in (8192, 16384, 32000) for t in (2048, 4096, 8192, None)])
+        self.assertEqual([dw.decode_command(a, i, 8192, dict(prefill_tile_crossover=16384), Path('S'))[0].get('row_tile')
+                          for i in dw.prompt_plan(a) if i[0] == 'ttft'][:4], [2048, 4096, 8192, None])
+        with self.assertRaises(SystemExit), patch.object(dw, 'host_total_gib', return_value=191.6), contextlib.redirect_stderr(io.StringIO()):
+            dw.arguments(['--build', '.', '--model', 'M', '--prompt-dir', 'P', '--full-card', '--tile-requests', '2048,4096,8192',
+                          '--timeout', '1200'])  # does not fit: refused up front
+
+    def test_restore_and_spare_slot_flags_reach_the_service(self):
+        """TTFT regression A/B: --restore-decode-residency and --tier-spare-slots pass through the
+        harness to the service command and the worker, and the real service binary accepts them
+        (--print-effective-config, CPU only); the two spare options are exclusive."""
+        with patch.object(dw, 'host_total_gib', return_value=191.6):
+            a = dw.arguments(['--build', '.', '--model', 'M', '--prompt-dir', 'P', '--full-card', '--row-tile', '8192',
+                              '--tile-requests', '4096,8192', '--restore-decode-residency', '0', '--tier-spare-slots', '290'])
+        cmd = dw.service_command(a, 'svc')
+        self.assertEqual(cmd[cmd.index('--restore-decode-residency') + 1], '0')
+        self.assertEqual(cmd[cmd.index('--tier-spare-slots') + 1], '290')
+        w = dw.worker_options(a)
+        self.assertEqual((w[w.index('--restore-decode-residency') + 1], w[w.index('--tier-spare-slots') + 1]), ('0', '290'))
+        with patch.object(dw, 'host_total_gib', return_value=191.6):
+            plain = dw.arguments(['--build', '.', '--model', 'M', '--prompt-dir', 'P', '--full-card'])
+        self.assertNotIn('--restore-decode-residency', dw.service_command(plain, 'svc'))
+        self.assertNotIn('--tier-spare-slots', dw.service_command(plain, 'svc'))
+        with self.assertRaises(SystemExit), patch.object(dw, 'host_total_gib', return_value=191.6), contextlib.redirect_stderr(io.StringIO()):
+            dw.arguments(['--build', '.', '--model', 'M', '--prompt-dir', 'P', '--tier-spare-slots', '290', '--tier-spare-percent', '5'])
+        exe = BUILD / 'glm_native_service.exe'
+        if not exe.is_file():
+            self.skipTest('service binary not built')
+        env = dict(os.environ)
+        env.pop('CUDA_VISIBLE_DEVICES', None)
+        out = subprocess.run([str(exe), '--restore-decode-residency', '0', '--tier-spare-slots', '290', '--print-effective-config'],
+                             capture_output=True, text=True, env=env, timeout=60)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        levers = json.loads(out.stdout.strip().splitlines()[-1])['levers']
+        self.assertEqual(levers['restore_decode_residency']['effective'], 'off')
+        self.assertIn('290 slots', levers['spare_share']['effective'])
+
+    def test_ttft_only_mode(self):
+        """--ttft-only: one load, no gate (summary says so instead of reporting a gap), TTFT 8K and 32K at
+        the allocated tile (sent explicitly), 2 repeats each, repeats compared bitwise, phases per arm."""
+        with patch.object(dw, 'host_total_gib', return_value=191.6):
+            a = dw.arguments(['--build', '.', '--model', 'M', '--prompt-dir', 'P', '--full-card', '--row-tile', '8192', '--ttft-only',
+                              '--tier-spare-slots', '290'])
+        self.assertEqual([(i[0], i[1], i[3]) for i in dw.prompt_plan(a)],
+                         [('ttft', 8192, 'allocated')] * 2 + [('ttft', 32000, 'allocated')] * 2)
+        self.assertLessEqual(dw.expected_seconds(a), 15 * 60)
+        cmd, tile, extra = dw.decode_command(a, dw.prompt_plan(a)[0], 8192, dict(prefill_tile_crossover=16384), Path('S'))
+        self.assertEqual((cmd.get('row_tile'), tile, extra['row_tile_requested']), (8192, 8192, 'allocated'))
+        self.assertIn('--ttft-only', dw.worker_options(a))
+        for bad in (['--ttft-only'], ['--full-card', '--ttft-only', '--tile-requests', '4096,8192']):
+            with self.assertRaises(SystemExit), patch.object(dw, 'host_total_gib', return_value=191.6), contextlib.redirect_stderr(io.StringIO()):
+                dw.arguments(['--build', '.', '--model', 'M', '--prompt-dir', 'P'] + bad)
+        rec = TileCompareTests.rec(TileCompareTests(), tile=8192)
+        rec.update(prefill_cache=dict(evicted=0, writebacks=0), make_resident_ms_total=900.0,
+                   decode_restore=dict(wall_ms=12.0, units_copied=0, displaced_units=0))
+        arm = lambda r: dw.materialize(types.SimpleNamespace(expert_tier='tierstream', steps=4), 'ttft', 8192,
+                                       ('ttft', 8192, Path('q8192.u32'), 'allocated'), r, dict(op='ttft', tokens=8192, prompt='q8192.u32'),
+                                       Path('.'), 1.0, 8192, 8192)
+        same = [arm(rec), arm(dict(rec))]
+        self.assertEqual(same[0]['decode_restore']['units_copied'], 0)
+        cmp = dw.repeat_compare(same)
+        self.assertEqual((cmp[0]['tokens'], cmp[0]['arms'], cmp[0]['verdict']), (8192, 2, 'BITWISE-EQUAL'))
+        self.assertEqual(cmp[0]['timing'][0]['make_resident_ms_total'], 900.0)
+        other = arm(dict(rec, token=9))
+        self.assertEqual(dw.repeat_compare([same[0], other])[0]['verdict'], 'DIFFERENT')
+        summary = dw.summarize(same, gate=False)
+        self.assertEqual((summary['verdict'], summary['completion']), ('EXACT', 'COMPLETE'))
+        self.assertIn('skipped', summary['gate'])
+        self.assertIn('qualification at 1024 not EXACT', dw.summarize(same)['gaps'])  # the gate stays required elsewhere
 
     def test_worker_receives_tile_and_sweep_options(self):
         """The parent forwards the startup tile, the fitted sweep, its note and the
@@ -1069,6 +1332,11 @@ class TileCompareTests(unittest.TestCase):
         self.assertEqual(dw.ttft_tile(2048, 4096), (2048, 'requested 2048'))
         self.assertEqual(dw.ttft_tile(None, 4096)[0], None)
         self.assertIn('allocated tile 4096', dw.ttft_tile(None, 4096)[1])
+        self.assertIn('auto', dw.ttft_tile(None, 4096)[1])
+        # the auto arm is judged against the service's per-request rule: an 8K prompt on an 8192 allocation runs at 4096
+        good = TileCompareTests.rec(TileCompareTests(), tile=4096)
+        self.assertEqual(dw.judge_ttft(good, 8192, dw.auto_tile(8191, 8192, 16384), 8192)[0], 'EXACT')
+        self.assertEqual(dw.judge_ttft(dict(good, row_tile=8192), 8192, dw.auto_tile(8191, 8192, 16384), 8192)[0], 'NO-REFERENCE')
 
 
 class PlacementInputTests(unittest.TestCase):

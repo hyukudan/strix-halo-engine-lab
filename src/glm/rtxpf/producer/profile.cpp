@@ -29,6 +29,11 @@ constexpr Lever kTable[] = {
     {.name = "row_tile", .options = {{{"--row-tile", "*"}}}, .value = {"auto", "auto", "auto"}, .builtin = "auto",
      .ready = all, .runnable = all, .kind = Kind::exact, .apps = service,
      .source = "the planner rule: the largest tile <= 8192 whose growth over 2048 costs <= 5% of the expert arena"},
+    {.name = "prefill_tile_crossover", .options = {{{"--prefill-tile-crossover", "*"}}}, .value = {"0", "0", "0"},
+     .builtin = "0", .ready = all, .runnable = all, .kind = Kind::exact, .apps = service,
+     .source = "per-request prefill tile inside the allocation: prefill rows below the crossover run at min(4096, allocated), "
+               "at and above it at the allocated tile (exact: the tile only changes row chunking; the tile sweeps showed equal "
+               "prefill state digests); 0 = always the allocated tile: the one-load tile sweep (allocation 8192) had 8192 fastest at 8K/16K/32K (29.2/36.7/53.6 s vs 30.2/38.6/56.6 at 4096); --prefill-tile-crossover N re-enables the rule"},
     {.name = "cuda_graphs", .options = {{{"--no-graphs", "off"}}}, .value = {"on", "on", "on"}, .builtin = "on", .ready = all,
      .runnable = all, .kind = Kind::exact, .apps = service, .source = "prefill CUDA graph templates (full tile + exact tail)"},
     {.name = "restore_decode_residency", .env = "STRIX_GLM_RTX_RESTORE_RESIDENCY", .options = {{{"--restore-decode-residency", "*"}}},

@@ -87,6 +87,9 @@ public:
     void release_resident(unsigned g)override{ts_ok(ts_dg_keep(h_.ctx,int(g),nullptr,0),"release resident set");plan_.release(g);}
     void begin_layer_step(unsigned g)override{std::vector<std::uint32_t> rows(view_.n_gated,0);expert_need(g<rows.size(),"gated layer");rows[g]=1;
         ts_ok(ts_begin(h_.ctx,rows.data(),int(rows.size())),"begin single-layer step");plan_.begin_layer(g);}
+    Json counters()override{ts_dg_stats s{};ts_ok(ts_stats_dg(h_.ctx,&s),"stats");auto j=Json::object();
+        j.set("evicted",s.evicted);j.set("writebacks",s.writebacks_done);j.set("fetched",s.fetched);j.set("file_reads",s.disk_reads);j.set("file_bytes",s.disk_read_bytes);
+        j.set("resident_units",s.resident_units);j.set("resident_evicted",s.resident_evicted);j.set("resident_bytes",s.resident_bytes);j.set("resident_ns",s.resident_ns);return j;}
     // Deltas since the previous collect (cache_delta in expert_tier.hpp).
     Json stats()override{auto now=read();auto j=cache_delta(before_,now,unit_);before_=now;
         // Prefill residency (make_resident) totals since open: counted only here, nowhere else.

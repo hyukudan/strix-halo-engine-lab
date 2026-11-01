@@ -63,11 +63,12 @@ FULL_CARD_PRIORS = {('qualify', 1024): 150, ('qualify', 8192): 300, ('compare', 
                     ('bench', 1024): 100, ('bench', 8192): 150,
                     # a full-card run measured TTFT 8.03 s (1K) / 17.05 s (8K) at tile 2048; each arm also
                     # exports the prefill state for its digest (untimed). 32K is not measured yet.
-                    ('ttft', 1024): 30, ('ttft', 8192): 60, ('ttft', 32000): 180}
-# Full card: TTFT tile arms per prompt length (None = the service's allocated tile:
-# the default rule, the largest tile <= 8192 whose growth over 2048 costs <= 5% of
-# the expert arena; a number is capped at it, since a per-request tile cannot exceed
-# the startup allocation, and the receipt says so). The
+                    ('ttft', 1024): 30, ('ttft', 8192): 60, ('ttft', 16384): 100, ('ttft', 32000): 180}
+# Full card: TTFT tile arms per prompt length (None = the service's per-request rule:
+# prefill rows below --prefill-tile-crossover run at min(4096, allocated), at/above it
+# at the allocated tile (the default rule, the largest tile <= 8192 whose growth over 2048
+# costs <= 5% of the expert arena); a number is capped at the allocation, since a
+# per-request tile cannot exceed the startup allocation, and the receipt says so). The
 # prefill state digests of the arms of one length are compared bitwise: equal means
 # the tile is a pure speed choice; different means it changes reduction order, so
 # the larger tile is a FAST-profile lever, not the default.
@@ -80,11 +81,98 @@ FULL_CARD_TTFT_TILES = {1024: (None,), 8192: (8192, 2048), 32000: (None, 2048)}
 # 147 s, TTFT 8K 23 s, bench 26 / 28 s, startup 180 s incl. the 104 s unit-file hash)
 # with margin; restarts recall the unit-file record (no hash).
 SWEEP_PRIORS = {('qualify', 1024): 100, ('qualify', 8192): 180, ('compare', 1024): 120,
-                ('ttft', 8192): 35, ('ttft', 32000): 120, ('bench', 1024): 40, ('bench', 8192): 45}
+                ('ttft', 8192): 35, ('ttft', 16384): 65, ('ttft', 32000): 120, ('bench', 1024): 40, ('bench', 8192): 45}
 SWEEP_FIRST_START = 200  # the first start hashes the unit file once (then the record is recalled)
 SWEEP_RESTART = 100      # a later start: loads only
 SWEEP_STOP = 60          # service exit between tiles (device + pinned memory release)
 SWEEP_DROP_FIRST = 4096  # dropped first when the sweep does not fit the deadline
+
+
+# One-load tile requests (full card, --tile-requests 4096,8192): ONE service start at the
+# default allocation; the exactness gate (q1024 + q8192 + the untimed q1024 compare), then
+# TTFT at 8K/16K/32K for every requested tile (the per-request override, capped at the
+# allocation) and the auto arm (the service's own choice), each with its prefill state
+# digest: per length the tiles are compared bitwise and timed (tile_compare), and the
+# crossover estimate says where the allocated tile starts to win. 16K = ttft-16384.u32.
+TILE_REQUEST_LENGTHS = (8192, 16384, 32000)
+# TTFT-only (full card, --ttft-only): ONE service load, no exactness gate (proven on the binary's
+# gate run), TTFT at 8K and 32K at the allocated tile, TTFT_REPEATS each; the repeats of one length
+# are compared bitwise (repeat_compare) and the prefill phases (make_resident, cache evictions /
+# write-backs, the deferred decode residency restore) are listed per arm.
+TTFT_ONLY_LENGTHS = (8192, 32000)
+TTFT_REPEATS = 2
+SMALL_PREFILL_TILE = 4096
+
+
+def ttft_prompt(d, n):
+    return d / (f'q{n}.u32' if n in QUALIFY else f'ttft-{n}.u32')
+
+
+def ttft_only_items(a):
+    """Every (op, length, path, 'allocated') of a TTFT-only run."""
+    return [('ttft', n, ttft_prompt(a.prompt_dir, n), 'allocated') for n in TTFT_ONLY_LENGTHS for _ in range(TTFT_REPEATS)]
+
+
+def repeat_compare(results):
+    """Per TTFT length: every EXACT arm's canonical prefill state + first token bitwise equal (repeats
+    of one load), with each arm's timings and prefill phases. Never raises."""
+    out = []
+    try:
+        lengths = sorted({r['tokens'] for r in results if isinstance(r, dict) and r.get('op') == 'ttft'})
+    except Exception as exc:  # noqa: BLE001
+        return [dict(verdict='NO-REFERENCE', reason=f'results: {exc}', internal_error=True)]
+    for n in lengths:
+        try:
+            arms = [r for r in results if isinstance(r, dict) and r.get('op') == 'ttft' and r.get('tokens') == n and r.get('verdict') == 'EXACT']
+            keys = {evidence_key(r) for r in arms}
+            timing = [{k: r.get(k) for k in ('row_tile', 'prefill_s', 'ttft_s', 'make_resident_ms_total', 'prefill_cache', 'decode_restore')} for r in arms]
+        except Exception as exc:  # noqa: BLE001
+            out.append(dict(tokens=n, verdict='NO-REFERENCE', reason=str(exc), internal_error=True))
+            continue
+        out.append(dict(tokens=n, arms=len(arms), verdict='BITWISE-EQUAL' if len(arms) > 1 and len(keys) == 1 else
+                        'DIFFERENT' if len(keys) > 1 else 'NOT-COMPARED', timing=timing))
+    return out
+
+
+def tile_request_items(a):
+    """Every (op, length, path[, tile]) of a one-load tile request sweep."""
+    d = a.prompt_dir
+    items = [('qualify', n, d / f'q{n}.u32') for n in QUALIFY]
+    items += [('compare', n, d / (f'q{n}.u32' if kind == 'q' else f'chat-{kind}-{n}.u32')) for kind, n in COMPARE]
+    for n in TILE_REQUEST_LENGTHS:
+        items += [('ttft', n, ttft_prompt(d, n), t) for t in a.tile_requests] + [('ttft', n, ttft_prompt(d, n), None)]
+    return items
+
+
+def auto_tile(rows, allocated, crossover):
+    """Mirror of schedule.hpp select_prefill_tile: below the crossover min(4096, allocated), else the allocation."""
+    return min(SMALL_PREFILL_TILE, allocated) if crossover and rows < crossover else allocated
+
+
+def crossover_estimate(compare, allocated):
+    """Informational: per TTFT length (bitwise-equal tiles only) the faster tile by prefill time,
+    and the smallest length from which the allocated tile wins at every longer length."""
+    rows, suggestion = [], None
+    for c in compare:
+        if c.get('verdict') != 'BITWISE-EQUAL':
+            continue
+        best = {}
+        for t in c.get('timing', []):
+            best[t['row_tile']] = min(best.get(t['row_tile'], t['prefill_s']), t['prefill_s'])
+        if len(best) < 2:
+            continue
+        rows.append(dict(tokens=c['tokens'], prefill_s=best, faster=min(best, key=best.get)))
+    for r in sorted(rows, key=lambda r: r['tokens'], reverse=True):
+        if r['faster'] != allocated:
+            break
+        suggestion = r['tokens'] - 1
+    if not rows:
+        note = 'no comparable lengths'
+    elif suggestion is None:
+        note = 'the allocated tile is not faster at the longest tested length: crossover above it'
+    else:
+        note = f'the allocated tile wins from {suggestion + 1} tokens on; the crossover lies at or below {suggestion} rows'
+    return dict(per_length=rows, allocated=allocated, crossover_at_most_rows=suggestion, note=note)
 
 
 def sweep_segments(a):
@@ -122,7 +210,7 @@ def priors(a):
     p = dict(PRIOR_SECONDS)
     if getattr(a, 'full_card', False):
         p.update(FULL_CARD_PRIORS)
-    if getattr(a, 'tile_sweep', None):
+    if getattr(a, 'tile_sweep', None) or getattr(a, 'tile_requests', None) or getattr(a, 'ttft_only', False):
         p.update(SWEEP_PRIORS)
     return p
 
@@ -190,6 +278,10 @@ def read_u32(path, length):
 
 def prompt_plan(a):
     """Every planned (op, length, path[, order]); chat cases are planned whether present or not."""
+    if getattr(a, 'ttft_only', False):
+        return ttft_only_items(a)
+    if getattr(a, 'tile_requests', None):
+        return tile_request_items(a)
     if getattr(a, 'tile_sweep', None):
         return [i for _, seg in sweep_segments(a) for i in seg]
     if a.expert_tier != 'tierstream':
@@ -202,7 +294,7 @@ def prompt_plan(a):
     # Sized with the startup prior so the printed estimate fits the deadline.
     lengths = TTFT if getattr(a, 'full_card', False) else QUALIFY
     for n in lengths:
-        path = a.prompt_dir / (f'q{n}.u32' if n in QUALIFY else f'ttft-{n}.u32')
+        path = ttft_prompt(a.prompt_dir, n)
         tiles = FULL_CARD_TTFT_TILES[n] if getattr(a, 'full_card', False) else (None,)
         items += [('ttft', n, path, tile) for tile in tiles]
     for n in QUALIFY:
@@ -237,6 +329,15 @@ def check_inputs(a):
     return pins
 
 
+def crossover_option(a):
+    """--prefill-tile-crossover for the service: as given; the per-start --tile-sweep measures each
+    startup tile on every request, so it runs with the crossover off (0); else the profile value."""
+    given = getattr(a, 'prefill_tile_crossover', None)
+    if given is not None:
+        return given
+    return 0 if getattr(a, 'tile_sweep', None) else None
+
+
 def service_command(a, binary):
     source = (['--model', str(a.model)] if a.model else
               ['--cache', str(a.cache), '--cache-manifest-sha256', digest(a.cache_manifest_sha256)])
@@ -246,6 +347,8 @@ def service_command(a, binary):
         for flag, value in (('--vram-total-gib', getattr(a, 'vram_total_gib', None)), ('--ram-total-gib', getattr(a, 'ram_total_gib', None)),
                             ('--tier-vram-gib', a.tier_vram_gib), ('--tier-ram-gib', a.tier_ram_gib),
                             ('--tier-spare-percent', getattr(a, 'tier_spare_percent', None)),
+                            ('--tier-spare-slots', getattr(a, 'tier_spare_slots', None)),
+                            ('--restore-decode-residency', getattr(a, 'restore_decode_residency', None)),
                             ('--tier-policy', getattr(a, 'tier_policy', None)),
                             ('--tier-predict', getattr(a, 'tier_predict', None)),
                             ('--tier-flush-ready', getattr(a, 'tier_flush_ready', None)),
@@ -256,6 +359,7 @@ def service_command(a, binary):
                             ('--expert-routes', getattr(a, 'expert_routes', None)),
                             ('--routes-out', getattr(a, 'routes_out', None)),
                             ('--row-tile', getattr(a, 'row_tile', None)),
+                            ('--prefill-tile-crossover', crossover_option(a)),
                             ('--profile', getattr(a, 'profile', None))):
             if value is not None:
                 tier += [flag, str(value)]
@@ -624,8 +728,8 @@ def tile_compare(results):
             if len(set(tiles)) < 2:
                 continue
             keys = {evidence_key(r) for r in arms}
-            timing = [dict(row_tile=r['evidence']['row_tile'], prefill_s=r['evidence']['prefill_s'], ttft_s=r['evidence']['ttft_s'])
-                      for r in arms]
+            timing = [dict(row_tile=r['evidence']['row_tile'], prefill_s=r['evidence']['prefill_s'], ttft_s=r['evidence']['ttft_s'],
+                           **{k: r[k] for k in ('prefill_file_reads', 'prefill_file_bytes') if k in r}) for r in arms]
         except Exception as exc:  # noqa: BLE001
             out.append(dict(tokens=n, verdict='NO-REFERENCE', reason=str(exc), internal_error=True))
             continue
@@ -708,10 +812,53 @@ def ttft_tile(requested, allocated):
     """(row_tile to send or None, note) for a TTFT tile arm: per-request tiles cannot
     exceed the tile the service allocated at startup."""
     if requested is None:
-        return None, f'allocated tile {allocated} (the default rule; per-request tiles cannot exceed it)'
+        return None, f'auto: the service picks per request (rows vs its crossover) within the allocated tile {allocated}'
+    if requested == 'allocated':
+        return (allocated or None), f'the allocated tile {allocated} (sent explicitly)'
     if allocated and requested > allocated:
         return allocated, f'requested {requested} exceeds the startup allocation {allocated}: ran at {allocated}'
     return requested, f'requested {requested}'
+
+
+def prefill_tiles(rec):
+    """The prefill tile(s) the service chose for this request (receipt fields), for the results list."""
+    out = {}
+    if not isinstance(rec, dict):
+        return out
+    for key in ('session_row_tile', 'legacy_prefill_row_tile'):
+        if key in rec:
+            out[key] = rec[key]
+    pre = rec.get('prefill')
+    if isinstance(pre, dict) and 'row_tile' in pre:
+        out['prefill_row_tile'] = pre['row_tile']
+        if 'row_tile_choice' in pre:
+            out['prefill_row_tile_choice'] = pre['row_tile_choice']
+    if isinstance(rec.get('fresh'), list):
+        out['fresh_row_tiles'] = [f.get('row_tile') for f in rec['fresh'] if isinstance(f, dict)]
+    return out
+
+
+def decode_command(a, item, allocated, health, seg):
+    """(command, expected_tile, entry fields) of one planned item: the ONE place that builds a
+    --decode-commands request (the service parses it with decode_command.hpp; the suite feeds
+    every planned shape through the real binary's --check-decode-commands)."""
+    op, n, path = item[:3]
+    command = dict(op=op, prompt=str(path), steps=a.bench_steps if op == 'bench' else 1 if op == 'ttft' else a.steps)
+    expected_tile, extra = None, {}
+    if op == 'bench':
+        command['order'] = item[3]
+    if op == 'ttft':
+        tile_req, note = ttft_tile(item[3] if len(item) > 3 else None, allocated if type(allocated) is int else 0)
+        if tile_req:
+            command['row_tile'] = tile_req
+        crossover = health.get('prefill_tile_crossover', 0)  # absent (older service): the allocated tile
+        expected_tile = tile_req or (auto_tile(n - 1, allocated, crossover)
+                                     if type(allocated) is int and type(crossover) is int else allocated)
+        extra = dict(row_tile_expected=expected_tile, row_tile_requested=item[3] if len(item) > 3 and item[3] else 'allocated',
+                     row_tile_note=note)
+    if op == 'qualify' and n == 1024:
+        command['export_dir'] = str(seg / 'export-1024')
+    return command, expected_tile, extra
 
 
 def health_coverage(health, a):
@@ -765,7 +912,7 @@ def memory_gate(rec, a, peaks):
     return gaps
 
 
-def summarize(results, extra_gaps=()):
+def summarize(results, extra_gaps=(), gate=True):
     """Exactness of completed cases and completion of the planned workload, separately."""
     done = [r for r in results if r['verdict'] not in ('INCOMPLETE',)]
     exactness = ('MISMATCH' if any(r['verdict'] == 'MISMATCH' for r in done) else
@@ -773,14 +920,17 @@ def summarize(results, extra_gaps=()):
                  'EXACT' if done else 'NO-CASES-COMPLETED')
     gaps = [f'{r["prompt"]}: {r.get("reason", "not run")}' for r in results if r['verdict'] == 'INCOMPLETE']
     gaps += [m for r in done for m in r.get('missing', [])] + list(extra_gaps)
-    for n in QUALIFY:
+    for n in (QUALIFY if gate else ()):
         if not any(r['op'] == 'qualify' and r['tokens'] == n and r['verdict'] == 'EXACT' for r in results):
             gaps.append(f'qualification at {n} not EXACT')
     completion = 'COMPLETE' if not gaps else 'INCOMPLETE'
     verdict = (exactness if exactness in ('MISMATCH', 'NO-REFERENCE') else
                'EXACT' if exactness == 'EXACT' and completion == 'COMPLETE' else 'INCOMPLETE')
-    return dict(verdict=verdict, exactness_of_completed=exactness, completion=completion, gaps=gaps,
-                completed_cases=len(done), planned_cases=len(results))
+    out = dict(verdict=verdict, exactness_of_completed=exactness, completion=completion, gaps=gaps,
+               completed_cases=len(done), planned_cases=len(results))
+    if not gate:
+        out['gate'] = 'skipped (TTFT-only: exactness proven on this binary\'s gate run; repeats compared bitwise)'
+    return out
 
 
 class Service:
@@ -864,7 +1014,8 @@ def execute(a, out, deadline, candidate, pins):
                     seg_startup = (ready['health'].get('startup_ms') or 0) / 1000  # measured: replaces the priors next time
                     startup_s = seg_startup if startup_s is None else startup_s
                     allocated = ready['health'].get('row_tile')
-                    starts.append(dict(tile=tile, allocated_row_tile=allocated, startup_s=seg_startup, profile=ready.get('profile')))
+                    starts.append(dict(tile=tile, allocated_row_tile=allocated, startup_s=seg_startup, profile=ready.get('profile'),
+                                       prefill_tile_crossover=ready['health'].get('prefill_tile_crossover')))
                     if sweep and allocated != tile:
                         plan_gaps.append(f'tile {tile}: the service allocated row tile {allocated!r}')
                     plan_gaps += [g for g in health_coverage(ready['health'], a_seg) if g not in plan_gaps]
@@ -885,22 +1036,13 @@ def execute(a, out, deadline, candidate, pins):
                             results.append(dict(entry, verdict='INCOMPLETE', reason='remaining time below estimate'))
                             done.add((k, j))
                             continue
-                        command = dict(op=op, prompt=str(path), steps=a.bench_steps if op == 'bench' else 1 if op == 'ttft' else a.steps)
-                        expected_tile = None
-                        if op == 'bench':
-                            command['order'] = item[3]
-                        if op == 'ttft':
-                            tile_req, note = ttft_tile(item[3] if len(item) > 3 else None, allocated if type(allocated) is int else 0)
-                            if tile_req:
-                                command['row_tile'] = tile_req
-                            expected_tile = tile_req or allocated  # the effective requested tile
-                            entry.update(row_tile_requested=item[3] if len(item) > 3 and item[3] else 'allocated', row_tile_note=note)
-                        if op == 'qualify' and n == 1024:
-                            command['export_dir'] = str(seg / 'export-1024')
+                        command, expected_tile, extra = decode_command(a, item, allocated, ready['health'], seg)
+                        entry.update(extra)
                         begin = time.monotonic()
                         service.send(command)
                         rec = service.read(deadline)
                         observed.setdefault((op, n), []).append(time.monotonic() - begin)
+                        entry.update(prefill_tiles(rec))
                         try:  # materialization: a defect here makes THIS case NO-REFERENCE, the run continues
                             plan_gaps += [f'{path.name}: {g}' for g in memory_gate(rec, a, peaks)]
                             (seg / f'{op}-{path.stem}.json').write_text(json.dumps(rec, indent=2))
@@ -937,8 +1079,11 @@ def materialize(a, op, n, item, rec, entry, seg, wall_s, expected_tile, allocate
     if op == 'ttft':
         v, problems = judge_ttft(rec, n, expected_tile, allocated)
         ev = evidence_ttft(rec, n, expected_tile, allocated) if v == 'EXACT' else None
+        traffic = {k: rec[k] for k in ('prefill_file_reads', 'prefill_file_bytes', 'prefill_file_read_ns', 'prefill_misses',
+                                       'prefill_fetched', 'prefill_h2d_bytes', 'prefill_cache', 'make_resident_ms_total',
+                                       'decode_restore') if isinstance(rec, dict) and k in rec}
         return dict(entry, verdict=v, problems=problems, missing=[], evidence=ev, row_tile=ev and ev['row_tile'],
-                    ttft_s=ev and ev['ttft_s'], prefill_s=ev and ev['prefill_s'], token=ev and ev['token'], wall_s=wall_s)
+                    ttft_s=ev and ev['ttft_s'], prefill_s=ev and ev['prefill_s'], token=ev and ev['token'], wall_s=wall_s, **traffic)
     if op == 'compare':
         v, problems = judge_compare(rec, a.steps, n)
         return dict(entry, verdict=v, problems=problems, missing=[], tokens_compared=a.steps, timed=False)  # exactness only
@@ -968,12 +1113,22 @@ def finalize(a, out, results, plan_gaps, peaks, startup_s, starts, segments, don
         failure = dict(failure or {}, finalize_error=str(exc))
     builder_errors = []  # every summary-stage error is a structured run failure (non-zero exit)
     try:
-        summary = summarize(results, plan_gaps)
+        summary = summarize(results, plan_gaps, gate=not getattr(a, 'ttft_only', False))
     except Exception as exc:  # noqa: BLE001 - a summary is always printed
         summary = dict(verdict='NO-REFERENCE', exactness_of_completed='NO-REFERENCE', completion='UNKNOWN', gaps=list(plan_gaps),
                        summary_error=f'summarize: {exc}')
         builder_errors.append(f'summarize: {type(exc).__name__}: {exc}')
     builders = [('tile_compare', lambda: tile_compare(results))]
+    if getattr(a, 'ttft_only', False):
+        builders.append(('ttft_repeats', lambda: repeat_compare(results)))
+    if getattr(a, 'tile_requests', None):
+        def tile_requests_summary():
+            compare = tile_compare(results)
+            allocated = starts[0]['allocated_row_tile'] if starts else None
+            return dict(tiles=list(a.tile_requests), lengths=list(TILE_REQUEST_LENGTHS), starts=starts, comparison=compare,
+                        crossover_service=starts[0].get('prefill_tile_crossover') if starts else None,
+                        crossover_estimate=crossover_estimate(compare, allocated))
+        builders.append(('tile_requests', tile_requests_summary))
     if sweep:
         builders.append(('tile_sweep', lambda: dict(tiles=list(a.tile_sweep), note=getattr(a, 'sweep_note', ''), starts=starts,
                                                     comparison=sweep_compare(results))))
@@ -1014,8 +1169,8 @@ def worker_options(a):
     """Every run option the worker re-parses: caps, tiers, placement, the startup tile,
     the fitted tile sweep (and the note of an arm the parent dropped)."""
     argv = []
-    for name in ('capacity', 'vram_total_gib', 'ram_total_gib', 'tier_vram_gib', 'tier_ram_gib', 'tier_spare_percent',
-                 'tier_policy', 'tier_predict', 'tier_flush_ready', 'skip_empty_expert_groups', 'persistent_dense_fp16', 'decode_row_kernels', 'expert_residency', 'expert_routes', 'routes_out', 'row_tile', 'profile'):
+    for name in ('capacity', 'vram_total_gib', 'ram_total_gib', 'tier_vram_gib', 'tier_ram_gib', 'tier_spare_percent', 'tier_spare_slots', 'restore_decode_residency',
+                 'tier_policy', 'tier_predict', 'tier_flush_ready', 'skip_empty_expert_groups', 'persistent_dense_fp16', 'decode_row_kernels', 'expert_residency', 'expert_routes', 'routes_out', 'row_tile', 'profile', 'prefill_tile_crossover'):
         if getattr(a, name, None) is not None:
             argv += ['--' + name.replace('_', '-'), str(getattr(a, name))]
     if getattr(a, 'full_card', False):
@@ -1024,6 +1179,10 @@ def worker_options(a):
         argv += ['--allow-pending']
     if getattr(a, 'decode_profile', False):
         argv += ['--decode-profile']
+    if getattr(a, 'ttft_only', False):
+        argv += ['--ttft-only']
+    if getattr(a, 'tile_requests', None):
+        argv += ['--tile-requests', ','.join(str(x) for x in a.tile_requests)]
     if getattr(a, 'tile_sweep', None):
         argv += ['--tile-sweep', ','.join(str(x) for x in a.tile_sweep)]
         if getattr(a, 'sweep_note', ''):
@@ -1109,6 +1268,10 @@ def arguments(argv=None):
     # Placement / retention / prefetch (service defaults when omitted: 5% spares,
     # SCORED_AUTO, predict off, residency file <unit-file>.residency, no census).
     p.add_argument('--tier-spare-percent', type=float, help='arena spares as a percent of the arena (default 5)')
+    p.add_argument('--tier-spare-slots', type=int, help='exact arena spare slots (overrides the percent share; kept even when the plan has '
+                   'file units, e.g. 290 = a 5%% share of a ~5,800-slot arena)')
+    p.add_argument('--restore-decode-residency', choices=['0', '1'], help='after each prefill make the open decode placement '
+                   'resident again (default 1 = profile row; inside the prefill/TTFT time)')
     p.add_argument('--tier-policy', choices=['lru', 'scored', 'auto'], help='boundary victims (default auto = SCORED_AUTO)')
     p.add_argument('--tier-predict', choices=['0', '1'], help='overlapped next-layer prefetch (default 0)')
     p.add_argument('--tier-flush-ready', choices=['0', '1'], help='flush the cache demand stream after each ready signal (WDDM submission; default 1 = profile row flush_ready)')
@@ -1122,6 +1285,15 @@ def arguments(argv=None):
     p.add_argument('--tile-sweep', help='full card: comma-separated startup row tiles (e.g. 2048,4096,8192), one service '
                    'start each; the exactness gate on the first, TTFT 8K/32K and the decode bench on every tile; the 4096 arm '
                    'is dropped first if the whole sweep does not fit --timeout')
+    p.add_argument('--tile-requests', help='full card: comma-separated per-request prefill tiles (e.g. 2048,4096,8192) in ONE '
+                   'service load at the default allocation: the exactness gate, then TTFT 8K/16K/32K at every tile (capped '
+                   'at the allocation) plus the auto arm; per-length bitwise compare and the crossover estimate')
+    p.add_argument('--ttft-only', action='store_true',
+                   help='full card: ONE service load, no exactness gate (proven on the binary\'s gate run): TTFT 8K and 32K at the '
+                        'allocated tile, 2 repeats each, repeats compared bitwise, prefill phases per arm (A/B windows)')
+    p.add_argument('--prefill-tile-crossover', type=int,
+                   help='service: prefill rows below which a request runs at min(4096, allocated tile) (default: the '
+                        'profile row prefill_tile_crossover, 0 = always the allocated tile (the one-load tile sweep: 8192 fastest at every length); --tile-sweep sets 0)')
     p.add_argument('--profile', choices=['default', 'fast', 'quality'],
                    help='the service profile (one switch for every lever; default = today; per-lever options override)')
     p.add_argument('--skip-empty-expert-groups', choices=['0', '1'], help='routed MoE: launch only expert groups holding routed rows (exact; pending row)')
@@ -1161,6 +1333,26 @@ def arguments(argv=None):
         p.error('--capacity: a multiple of 32 in 8320..131072 (>= 32768 with --full-card for the 32K TTFT)')
     if a.row_tile is not None and (a.row_tile % 32 or not 32 <= a.row_tile <= min(a.capacity, 32768)):
         p.error('--row-tile: a multiple of 32 in 32..min(capacity, 32768)')
+    if a.tier_spare_slots is not None and a.tier_spare_percent is not None:
+        p.error('--tier-spare-slots and --tier-spare-percent are exclusive')
+    if a.tier_spare_slots is not None and not 0 <= a.tier_spare_slots <= 100000:
+        p.error('--tier-spare-slots: 0..100000')
+    if a.prefill_tile_crossover is not None and not 0 <= a.prefill_tile_crossover <= 131072:
+        p.error('--prefill-tile-crossover: rows in 0..131072')
+    if a.ttft_only and (not a.full_card or a.tile_requests is not None or a.tile_sweep is not None):
+        p.error('--ttft-only needs --full-card and excludes --tile-requests / --tile-sweep')
+    if a.tile_requests is not None:
+        try:
+            req = [int(x) for x in a.tile_requests.split(',') if x.strip()]
+        except ValueError:
+            p.error('--tile-requests: comma-separated integers')
+        if not a.full_card or a.tile_sweep is not None:
+            p.error('--tile-requests needs --full-card and excludes --tile-sweep')
+        if len(req) < 2 or len(set(req)) != len(req) or any(x % 32 or not 32 <= x <= min(a.capacity, 32768) for x in req):
+            p.error('--tile-requests: two or more distinct multiples of 32 in 32..min(capacity, 32768)')
+        a.tile_requests = req
+        if expected_seconds(a) > a.timeout:
+            p.error(f'--tile-requests {req} needs {expected_seconds(a)} s > --timeout {a.timeout} s')
     if a.tile_sweep is not None:
         try:
             tiles = [int(x) for x in a.tile_sweep.split(',') if x.strip()]
