@@ -206,13 +206,20 @@ no model, no CUDA), and the suite feeds it every command the harness's
 own expert cache traffic (`prefill_expert_cache`: file reads/bytes, misses,
 copies); TTFT records carry `prefill_file_reads`/`prefill_file_bytes`, and
 the first decode token now counts only its own traffic.
-TTFT records also carry `prefill_cache` (the prefill's own evictions,
-write-backs, make_resident units/bytes/ns), `make_resident_ms_per_layer` /
-`_total`, and `decode_restore`: the decode residency restore that runs
-inside the prefill (wall ms, units, its own evictions/write-backs; `off`
-with `--restore-decode-residency 0`). `--ttft-only` (full card) runs one
-load without the gate: TTFT 8K and 32K at the allocated tile, 2 repeats
-each, compared bitwise (`ttft_repeats`).
+Decode residency restore (placement only; exact): deferred, it runs before
+the next decode token (or untimed after a TTFT prefill) and only for the
+planned units the prefill displaced (slot-table readback; the still-resident
+ones are held first so the copies can only evict prefill leftovers). TTFT
+records carry `decode_restore` (wall ms, displaced/copied units and bytes,
+cache evictions/write-backs), `prefill_cache` (the prefill's own evictions,
+write-backs, make_resident units/bytes/ns) and `make_resident_ms_per_layer`.
+Under a file tier the arena spares are sized from the plan (`spare_policy`:
+288 - residents per layer, so a prefill layer's make_resident fits without
+evicting decode residents; the trade vs the percent share and the minimum is
+listed). `--ttft-only` (full card) runs one load without the gate: TTFT 8K
+and 32K at the allocated tile, 2 repeats each, compared bitwise
+(`ttft_repeats`). Workaround on older builds: `--restore-decode-residency 0`
+or `STRIX_GLM_RTX_RESTORE_RESIDENCY=0` (only `0`/`off` turn it off).
 `--tile-sweep 2048,4096,8192` (full card) lets the data pick: one service start
 per tile (`--row-tile T`; `startup_s` per start, later starts recall the
 unit-file record), the exactness gate (q1024 + q8192 + the untimed q1024

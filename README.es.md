@@ -30,8 +30,9 @@ Entre las mediciones publicadas se incluyen:
 - **GLM-5.3 Flash:** la autoespeculación MTP exacta predeterminada alcanza
   37.1 / 44.5 / 40.0 tok/s en chat / código / JSON.
 - **GLM-5.3 Flash en una RTX PRO 6000, presupuestos de todo el dispositivo:** prefill y decode exactos con una caché de
-  expertos repartida entre VRAM, RAM pinned y disco. Tarjeta completa: TTFT 17.7 s con 8K y 41.2 s con 32K (vea la nota
-  más abajo: unos 10-15 s más por prefill en la rama main actual hasta que llegue una corrección); decode de 6.0 / 6.2
+  expertos repartida entre VRAM, RAM pinned y disco. Tarjeta completa, tile de 8192: TTFT 19.7 s con 8K y 41.7 s con 32K
+  (exacto; la restauración de la residencia del decode se ejecuta ahora después del prefill, fuera del tiempo hasta el
+  primer token, y solo cuando sigue un decode); decode de 6.0 / 6.2
   tok/s en caliente con 1K / 8K con los kernels de decode de pocas filas (2.4 tok/s con ellos desactivados, misma
   carga). Ahora también funciona de forma exacta con 24 GiB de VRAM + 32 GiB de RAM del host
   (expertos leídos del disco): TTFT 64.8 s con 1K y 76.7 s con 8K; decode de 0.67 tok/s en caliente (0.63 en frío).
@@ -547,8 +548,9 @@ los límites de intercambio requiere captura segmentada; los kernels de disposit
 compartidos se quedan en la tarjeta; los 43 x 288 expertos enrutados los sirve la caché con compuerta en el dispositivo
 de [tierstream](https://github.com/hyukudan/tierstream), y el prefill los lee a través de la misma caché, así que la
 tarjeta guarda una sola copia de cada experto. El prefill y el decode son exactos (digests bit a bit de logits y
-estado; estado del prefill igual con tiles de 2048 / 4096 / 8192 filas). Tarjeta completa: TTFT **17.7 s** con 8K y
-**41.2 s** con 32K con el mejor tile (17.7-22.7 s / 41-55 s según el tile); decode de **6.00 / 6.15 tok/s** en caliente
+estado; estado del prefill igual con tiles de 2048 / 4096 / 8192 filas). Tarjeta completa, tile de 8192: TTFT **19.7 s** con 8K y
+**41.7 s** con 32K (exacto; la restauración de la residencia del decode se ejecuta ahora después del prefill, fuera del
+tiempo hasta el primer token, y solo cuando sigue un decode); decode de **6.00 / 6.15 tok/s** en caliente
 con 1K / 8K (3.75 / 3.70 en frío) con los kernels de decode de pocas filas activados por defecto, frente a 2.43 / 2.36
 tok/s con ellos desactivados en la misma carga del servicio (tarjeta completa; la RAM del host dejó 1,098 unidades de
 expertos en el archivo de unidades, así que se incluyen los fallos de archivo por token; prueba de 24 tokens). Los
@@ -559,19 +561,6 @@ directamente en fragmentos de tensor cores y mantienen el orden de acumulación 
 Con 24 GiB de VRAM + 32 GiB de
 RAM del host (la mayoría de los expertos leídos del archivo de unidades en disco) también funciona de forma exacta: TTFT
 **64.8 s** con 1K y **76.7 s** con 8K; decode de **0.67 tok/s** en caliente (0.63 en frío). Compilación, archivo de unidades y opciones: [guía de GLM RTX](src/glm/rtxpf/README.md).
-
-> **Regresión conocida en la rama main actual (TTFT con la tarjeta completa):** desde #202 la restauración de la
-> residencia del decode se ejecuta dentro de cada prefill y, con un nivel de archivo, vuelve a copiar unidades de
-> expertos desalojadas; además, una reserva de huecos libres menor con un nivel de archivo
-> cuesta unos segundos más. En total añade unos 10-15 s por prefill (unos 29 s con 8K y unos 54 s con 32K en lugar de 17.7 /
-> 41.2 s). Las salidas no cambian y siguen siendo exactas. Hay en curso una corrección que restaura de forma diferida
-> antes del primer paso de decode. Solución temporal (exacta; prevista a partir de las mediciones del host, aún no
-> confirmada en la GPU): `STRIX_GLM_RTX_RESTORE_RESIDENCY=0` (o `--restore-decode-residency 0`) elimina la
-> restauración, unos 10-11 s del total, cuando el host tiene RAM libre suficiente (unos 80 GB) para una apertura en dos
-> niveles; el decode justo después de un prefill falla entonces más a menudo en la caché de expertos. Con menos RAM
-> libre en el host, la tarjeta se abre con muchas más unidades de expertos en el nivel de archivo, cada prefill vuelve a
-> escribir desde la GPU las unidades desalojadas y el TTFT es mucho mayor con o sin el interruptor (8K 45-72 s medidos);
-> está prevista una corrección de ese coste de escritura.
 
 ### Nemotron 3.5 Bolt E4B
 

@@ -395,11 +395,9 @@ struct Runtime::Impl {
     unsigned requested_tile=0,tile_crossover=default_prefill_tile_crossover;std::string tile_choice="allocated (startup)";bool pin_tile=false;
     void choose_tile(std::size_t tokens){if(pin_tile||tokens<2||!allocated_tile)return; /* before the allocation is recorded: the startup tile */const unsigned P=unsigned(tokens-1);
         if(requested_tile){tile=requested_tile;tile_choice="request override (row_tile)";}else{tile=select_prefill_tile(P,allocated_tile,tile_crossover);tile_choice=prefill_tile_reason(P,tile_crossover);}}
-    // The prefill's own expert cache traffic (start -> before the restore), per-layer make_resident host ms, and the
-    // in-prefill decode residency restore (wall ms, units, its own counters) or "off".
-    void record_prefill_cache(){if(!prefill_via_cache||!ts_tier)return;last_timings.set("prefill_cache",counter_delta(prefill_counters0,prefill_counters1));
+    void record_prefill_cache(){if(!prefill_via_cache||!ts_tier)return;last_timings.set("prefill_cache",counter_delta(prefill_counters0,cache_counters()));
         auto a=Json::array();double total=0;for(double x:ts_tier->acquire_ms){a.push(x);total+=x;}last_timings.set("make_resident_ms_per_layer",a);last_timings.set("make_resident_ms_total",total);
-        if(residency_restore.is_object()&&residency_restore.find("wall_ms"))last_timings.set("decode_restore",residency_restore);else last_timings.set("decode_restore","off");}
+        last_timings.set("decode_restore",restore_pending?"deferred to the next decode token":"off");}
     void record_tile(){last_timings.set("row_tile",int(tile));last_timings.set("allocated_row_tile",int(allocated_tile));last_timings.set("row_tile_choice",tile_choice);last_timings.set("prefill_tile_crossover",int(tile_crossover));}
     Stream compute,h2d,decode;CutlassExecution exec{};std::vector<cudaEvent_t> exec_events;
     std::map<std::string,std::unique_ptr<Blob>> blobs;std::vector<std::unique_ptr<Layer>> layers;
@@ -444,7 +442,7 @@ struct Runtime::Impl {
                     persist_note=!tp.refused.empty()?"off: the whole-device plan cannot afford the persistent FP16 copies ("+tp.refused+")"
                         :"off: the persistent FP16 copies would move "+std::to_string(tp.plan.tier.disk-tp2.plan.tier.disk)+" expert units to the file tier";
                     tp=std::move(tp2);}}
-            spares_reduced=tp.spares_reduced;tile=rows=tp.tile;budget_in=tp.in;const auto& planned=tp.plan;startup_budget=tp.json;
+            spares_reduced=tp.spares_reduced;planned_spare_slots=tp.spare_slots;tile=rows=tp.tile;budget_in=tp.in;const auto& planned=tp.plan;startup_budget=tp.json;
             need(valid_schedule(cap,rows),"capacity 4-aligned <=131072; tile 32-aligned <=min(capacity,32768)");
             startup_budget.set("mode",whole_device?"whole-device caps (--vram-total-gib/--ram-total-gib)":"device room (no whole-device cap)");
             std::cerr<<"INFO decode budget plan: "<<startup_budget.dump()<<"\n";
@@ -500,7 +498,7 @@ struct Runtime::Impl {
         else {for(std::size_t off=0;off<base.bytes;){auto n=std::min<std::size_t>(staging.bytes,base.bytes-off);base.file->read_at(off,staging.p,n);ck(cudaMemcpyAsync(base.device.as<char>()+off,staging.p,n,cudaMemcpyHostToDevice,h2d.s));ck(cudaStreamSynchronize(h2d.s));off+=n;}}
         // Decode allocations precede expert admission: the device budget below
         // is measured after them (session, replay, head, bounded expert slots).
-        dopt=dopts;if(persist_refused)dopt.persistent_dense_fp16=false;if(spares_reduced)dopt.tier_spare_permille=0;if(decode_on)prepare_decode(staging,dopt.expert_tier,floor_gib);
+        dopt=dopts;if(persist_refused)dopt.persistent_dense_fp16=false;if(spares_reduced){dopt.tier_spare_permille=0;if(planned_spare_slots)dopt.tier_spare_slots=planned_spare_slots;}if(decode_on)prepare_decode(staging,dopt.expert_tier,floor_gib);
         const auto init=prefill_init(prefill_via_cache);
         if(init.rings){Charge c(ring_part);for(auto& r:ring){r.device.allocate(largest);r.host.allocate(largest,true);}}
         Charge layer_charge("prefill expert layers (resident/pinned) + descriptors");
@@ -713,14 +711,9 @@ struct Runtime::Impl {
         }
         if(prefill_via_cache)prefill_end(45);
         // The decode placement again (the prefill's whole-layer sets displaced it); placement only.
-        // The decode residency restore runs here, inside the prefill: timed on its own (after the prefill's
-        // queued work drained) with its own cache counters, reported in the prefill timings (decode_restore).
-        residency_restore=Json::object();
-        if(prefill_via_cache&&ts_tier&&ts_tier->restore){ck(cudaStreamSynchronize(compute.s));prefill_counters1=cache_counters();const auto r0=std::chrono::steady_clock::now();
-            residency_restore=ts_tier->restore_residency(compute.s);
-            residency_restore.set("wall_ms",std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-r0).count());
-            residency_restore.set("cache",counter_delta(prefill_counters1,cache_counters()));residency_restore.set("inside_prefill",true);}
-        else prefill_counters1=cache_counters();
+        // The decode residency restore is deferred (restore_pending): it runs before the next decode
+        // token (or explicitly, untimed, after a TTFT prefill); a prefill-only request never pays it.
+        if(prefill_via_cache&&ts_tier&&ts_tier->restore)restore_pending=true;
         ck(cudaEventRecord(ring[1].retired.e,compute.s));if(!in_session)export_state(45,P,sink);ck(cudaStreamSynchronize(compute.s));ck(cudaGetLastError());
         if(in_session){unsigned bad=0;ck(cudaMemcpy(&bad,flag.p,4,cudaMemcpyDeviceToHost));need(!bad,"nonfinite session prefill");}
         unsigned read_mask=(file_ring_bytes[0]?1u:0u)|(file_ring_bytes[1]?2u:0u);
@@ -756,11 +749,16 @@ struct Runtime::Impl {
                 return j;}catch(...){return Json::object();}}
     } timeline;
     Json failed_timeline; // the last failed decode token's partial timeline (--decode-profile)
-    Json residency_restore; // the last prefill's restore of the decode placement
-    Json prefill_counters0,prefill_counters1; // raw cache counters at prefill start / before the restore
+    Json residency_restore; // the last restore of the decode placement (deferred: before the next decode token)
+    bool restore_pending=false;Json prefill_counters0;
     Json cache_counters(){return prefill_via_cache&&ts_tier?ts_tier->api->counters():Json::object();}
     static Json counter_delta(const Json& a,const Json& b){auto j=Json::object();if(!a.is_object()||!b.is_object())return j;
         for(const auto& [k,v]:b.as_object()){auto* x=a.find(k);if(x&&v.is_number()&&x->is_number()){const auto d=v.as_int()-x->as_int();j.set(k,std::uint64_t(d>0?d:0));}}return j;}
+    // The pending restore (placement only), timed and counted on its own.
+    Json run_pending_restore(){if(!restore_pending||!ts_tier)return Json();restore_pending=false;
+        const auto c0=cache_counters();const auto t0=std::chrono::steady_clock::now();auto r=ts_tier->restore_residency(compute.s);
+        r.set("wall_ms",std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-t0).count());r.set("cache",counter_delta(c0,cache_counters()));
+        residency_restore=r;return r;}
     Json failed_slots;    // the slot census after the last failed decode token (always; best effort)
     void failed_census()noexcept{try{if(ts_tier&&tier.get()==ts_tier)failed_slots=ts_tier->census(compute.s);}catch(...){cudaGetLastError();}}
     bool decode_mode=false;SessionFrontier sess;std::unique_ptr<ExpertCatalog> catalog;std::unique_ptr<UnitBinding> unit_binding;std::unique_ptr<ExpertTier> tier;
@@ -788,7 +786,7 @@ struct Runtime::Impl {
     static constexpr const char* persist_part="persistent FP16 shared + dense experts (decode)";
     // Shared experts of layers 3..44 (H x 2048 gate/up, 2048 x H down) and the dense FFNs of 0..2 (H x 12288).
     static constexpr std::uint64_t persist_bytes=42ULL*3*4096*2048*2+3ULL*3*4096*12288*2;
-    bool persist_refused=false;std::string persist_note;bool spares_reduced=false; // the startup plan dropped the spare share (file tier)
+    bool persist_refused=false;std::string persist_note;bool spares_reduced=false;unsigned planned_spare_slots=0; // the startup plan dropped the spare share (file tier)
     static constexpr const char* staging_part="startup staging + small host buffers";
     // Our host commit (process private bytes minus our WDDM device backing).
     static std::uint64_t process_host_bytes(){const auto c=process_host_commit();need(c.raw_private!=~0ULL,"process memory counters");return c.host;}
@@ -826,17 +824,31 @@ struct Runtime::Impl {
     // by default; activations and workspaces grow with the tile and come out of
     // the expert arena); --row-tile is planned exactly. The refusal of the
     // smallest candidate is returned when none fits.
-    struct TilePlan {unsigned tile=0;WholeDeviceIn in;WholeDevicePlan plan;Json json;std::string refused;bool spares_reduced=false;std::uint64_t file_units_kept_off=0;};
+    struct TilePlan {unsigned tile=0;WholeDeviceIn in;WholeDevicePlan plan;Json json;std::string refused;bool spares_reduced=false;std::uint64_t file_units_kept_off=0;unsigned spare_slots=0;};
     static TilePlan plan_tile(const Json& m,unsigned cap,unsigned requested,const DecodeOptions& d,std::uint64_t context,std::uint64_t host_avail,std::uint64_t proc,bool rings,std::uint64_t hard){
         auto with=[&](unsigned t,const DecodeOptions& dd){TilePlan p;p.tile=t;p.in=budget_inputs(m,cap,t,dd,context,host_avail,proc,rings);if(!p.in.vram_total)p.in.vram_total=hard;
             need(p.in.vram_total<=hard,("--vram-total-gib "+gib_text(p.in.vram_total)+" exceeds this device's usable "+gib_text(hard)+" (99.86 GB cap)").c_str());
             p.plan=plan_whole_device(p.in);p.json=whole_device_json(p.in,p.plan);p.refused=plan_refusal(p.in,p.plan,p.json.find("summary")->as_string());return p;};
-        // The arena spare share (placement only) yields to device residents when it would put
-        // expert units on the file tier that the minimum spares keep in device or pinned memory.
+        // Under a file tier the arena spares are sized from the plan (placement only): enough free
+        // slots that a prefill layer's make_resident(288) does not evict other layers' decode residents
+        // (prefill_spares_needed: 288 - residents per layer, re-planned until it holds), instead of the
+        // percent share (more file units) or the minimum (every prefill layer evicts, and the decode
+        // residency restore copies them back). The trade (file units at share / plan-sized / minimum)
+        // is recorded in the plan.
         auto one=[&](unsigned t){auto p=with(t,d);
-            if(p.refused.empty()&&p.plan.tier.disk>0&&d.tier_spare_permille>0){auto d2=d;d2.tier_spare_permille=0;auto p2=with(t,d2);
-                if(p2.refused.empty()&&p2.plan.tier.disk<p.plan.tier.disk){p2.spares_reduced=true;p2.file_units_kept_off=p.plan.tier.disk-p2.plan.tier.disk;
-                    p2.json.set("spare_share_note","the "+std::to_string(d.tier_spare_permille/10)+"% arena spare share would put "+std::to_string(p2.file_units_kept_off)+" more expert units on the file tier: minimum spares");return p2;}}
+            if(p.refused.empty()&&p.plan.tier.disk>0&&d.tier_spare_permille>0){auto d2=d;d2.tier_spare_permille=0;
+                auto pmin=with(t,d2);unsigned x=std::max<unsigned>(d.tier_spare_slots,prefill_spares_needed(p.plan.tier.resident));TilePlan p2;
+                for(int it=0;it<8;++it){d2.tier_spare_slots=x;p2=with(t,d2);if(!p2.refused.empty())break;
+                    const unsigned want=std::max<unsigned>(d.tier_spare_slots,prefill_spares_needed(p2.plan.tier.resident));if(want<=x)break;x=want;}
+                if(p2.refused.empty()&&p2.plan.tier.spare_slots<p.plan.tier.spare_slots){p2.spares_reduced=true;p2.spare_slots=x;
+                    p2.file_units_kept_off=p.plan.tier.disk>p2.plan.tier.disk?p.plan.tier.disk-p2.plan.tier.disk:0;
+                    auto tr=Json::object();tr.set("spares_needed_per_prefill_layer",int(prefill_spares_needed(p2.plan.tier.resident)));
+                    auto arm=[&](const TilePlan& q,const char* role){auto a=Json::object();a.set("role",role);a.set("spare_slots",q.plan.tier.spare_slots);
+                        a.set("resident_units",q.plan.tier.resident);a.set("pinned_units",q.plan.tier.pinned);a.set("file_units",q.plan.tier.disk);a.set("admitted",q.refused.empty());return a;};
+                    auto arms=Json::array();arms.push(arm(p,"percent share"));arms.push(arm(p2,"plan-sized (chosen)"));arms.push(arm(pmin,"minimum"));tr.set("arms",arms);
+                    p2.json.set("spare_policy",tr);
+                    p2.json.set("spare_share_note","file tier: "+std::to_string(x)+" plan-sized arena spares (a prefill layer's 288 units fit without evicting decode residents; "
+                        +std::to_string(p.plan.tier.spare_slots)+" at the "+std::to_string(d.tier_spare_permille/10)+"% share, "+std::to_string(pmin.plan.tier.spare_slots)+" minimum)");return p2;}}
             return p;};
         // The trade at a tile: expert arena, residents and the other tiers, as planned.
         auto trade=[&](const TilePlan& p,const char* role){auto x=Json::object();x.set("row_tile",int(p.tile));x.set("role",role);x.set("verdict",p.refused.empty()?"ADMITTED":"REFUSED");
@@ -1191,13 +1203,25 @@ struct Runtime::Impl {
         std::vector<std::vector<std::int32_t>> planned;bool restore=false;std::vector<std::uint32_t> open_persistent;std::vector<double> acquire_ms; // per prefill layer make_resident host ms
         Json restore_residency(cudaStream_t s){
             auto j=Json::object();const auto begin=std::chrono::steady_clock::now();ck(cudaStreamSynchronize(s));
-            std::vector<unsigned> held;std::uint64_t units=0;std::string refused;
-            try{for(unsigned g=0;g<planned.size();++g){if(planned[g].empty())continue;
-                    if(!site.try_make_resident(g,planned[g].data(),unsigned(planned[g].size()))){refused="gated layer "+std::to_string(g)+" (SS_E_CAPACITY)";break;}
-                    held.push_back(g);units+=planned[g].size();}}
+            // Only what the prefill displaced: the slot table says which planned units are still on the
+            // device. Pass 1 holds those (no copies) so pass 2 can only evict prefill leftovers; pass 2
+            // makes the full planned set resident on the layers that lost units (copies the missing ones).
+            const auto v=api->view();std::vector<std::int32_t> base(v.n_gated),slot(std::size_t(v.n_gated)*v.units);
+            ck(cudaMemcpy(base.data(),v.unit_base,base.size()*4,cudaMemcpyDeviceToHost));ck(cudaMemcpy(slot.data(),v.slot_of,slot.size()*4,cudaMemcpyDeviceToHost));
+            std::vector<std::vector<std::int32_t>> present(planned.size());std::vector<unsigned> missing(planned.size(),0);std::uint64_t displaced=0;
+            for(unsigned g=0;g<planned.size()&&g<v.n_gated;++g)for(auto id:planned[g]){const auto k=std::size_t(base[g])+std::size_t(id);
+                if(k<slot.size()&&slot[k]>=0)present[g].push_back(id);else{++missing[g];++displaced;}}
+            std::vector<unsigned> held;std::uint64_t units=0,layers_copied=0;std::string refused;
+            try{if(displaced){
+                    for(unsigned g=0;g<planned.size()&&refused.empty();++g){if(present[g].empty())continue;
+                        if(!site.try_make_resident(g,present[g].data(),unsigned(present[g].size()))){refused="gated layer "+std::to_string(g)+" hold (SS_E_CAPACITY)";break;}held.push_back(g);}
+                    for(unsigned g=0;g<planned.size()&&refused.empty();++g){if(!missing[g])continue;
+                        if(!site.try_make_resident(g,planned[g].data(),unsigned(planned[g].size()))){refused="gated layer "+std::to_string(g)+" (SS_E_CAPACITY)";break;}
+                        if(present[g].empty())held.push_back(g);units+=missing[g];++layers_copied;}}}
             catch(...){for(auto g:held)try{site.release_resident(g);}catch(...){}throw;}
             for(auto g:held)site.release_resident(g);
-            j.set("ms",std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-begin).count());j.set("layers",std::uint64_t(held.size()));j.set("units",units);
+            j.set("displaced_units",displaced);j.set("units_copied",units);j.set("bytes_copied",units*std::uint64_t(v.stride));j.set("layers_copied",layers_copied);
+            j.set("ms",std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-begin).count());j.set("layers_held",std::uint64_t(held.size()));
             if(!refused.empty())j.set("refused",refused);
             // Every layer holds at least its open count again. (make_resident fills the free slots
             // first and evicts only what it needs, so up to the spare target of prefill units stay
@@ -1239,6 +1263,9 @@ struct Runtime::Impl {
     // KDA replays the open B32 block from its checkpoint; DSA appends rows=1 at
     // the absolute position; MTP pairs (hidden[P],y) on its own state.
     Json decode_one(bool qualification){
+        Json restored;if(restore_pending&&decode_mode&&sess.open())restored=run_pending_restore();
+        auto out=decode_step(qualification);if(restored.is_object())out.set("deferred_restore",restored);return out;}
+    Json decode_step(bool qualification){
         need(decode_mode,"decode not enabled");const unsigned P=sess.position();const U32 pending=sess.pending();
         try{
             auto begin=std::chrono::steady_clock::now();timeline.start(compute.s);ck(cudaMemsetAsync(flag.p,0,4,compute.s));
@@ -1385,7 +1412,9 @@ void Runtime::restore_session(){p_->restore_session();}
 void Runtime::reset_session(){p_->sess.reset();}
 void Runtime::select_expert_tier(const std::string& name){need(p_->decode_mode,"decode not enabled");p_->select_tier(name);p_->sess.reset();}
 std::string Runtime::expert_tier()const{return p_->tier?p_->tier->backend():"none";}
-void Runtime::reset_expert_cache(bool open){need(p_->decode_mode,"decode not enabled");p_->tier->reset_cache(open);}
+void Runtime::reset_expert_cache(bool open){need(p_->decode_mode,"decode not enabled");p_->tier->reset_cache(open);if(open)p_->restore_pending=false;}
+std::string Runtime::restore_decode_residency(){auto r=p_->run_pending_restore();return r.is_object()?r.dump():std::string("{}");}
+bool Runtime::decode_restore_pending()const{return p_->restore_pending;}
 std::string Runtime::generate(std::span<const U32> prompt,unsigned max_new,std::span<const U32> stop,bool qualification){
     need(p_->decode_mode,"decode not enabled");SessionFrontier::validate_prompt(prompt,p_->capacity);SessionFrontier::validate_generation(prompt.size(),max_new,p_->capacity);
     for(auto t:stop)need(t<vocab_size,"stop token outside vocabulary");

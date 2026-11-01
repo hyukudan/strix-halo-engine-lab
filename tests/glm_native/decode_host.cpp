@@ -258,6 +258,15 @@ void mtp_tile_tests(){
 // at/above it the allocated tile, crossover 0 = always allocated; both tiles cover the same rows once
 // (exact: only the chunking changes); the two-slot graph template cache keyed by prefill_binding never
 // replays a template captured for another shape when tiles alternate between requests.
+// Plan-sized arena spares under a file tier (expert_tier.hpp prefill_spares_needed): one prefill layer's
+// 288 units fit in free slots when spares >= 288 - residents per layer (for example 5955 residents -> 150).
+void prefill_spares_tests(){
+    check(prefill_spares_needed(5955)==150&&prefill_spares_needed(5493)==161&&prefill_spares_needed(0)==288,"spares needed = 288 - residents/43");
+    check(prefill_spares_needed(43ULL*288)==0&&prefill_spares_needed(43ULL*300)==0,"all units resident: no spares needed");
+    // the planner's fixed point: x spares leave (slots - x) residents; x >= 288 - (slots - x)/43
+    for(std::uint64_t slots:{5988ull,5800ull,4000ull}){unsigned x=16;for(int it=0;it<8;++it){const unsigned want=std::max(16u,prefill_spares_needed(slots-x));if(want<=x)break;x=want;}
+        check(x>=prefill_spares_needed(slots-x)&&x<slots,"plan-sized spares converge to a fixed point");}
+}
 void prefill_tile_selection_tests(){
     check(default_prefill_tile_crossover==0&&small_prefill_tile==4096,"crossover default 0 (always the allocated tile), small tile 4096");
     check(select_prefill_tile(8191,8192,default_prefill_tile_crossover)==8192&&select_prefill_tile(31999,8192,default_prefill_tile_crossover)==8192,"default: every request at the allocation");
@@ -1027,6 +1036,6 @@ int main(int argc,char** argv){try{
 #ifdef GLM_TIERSTREAM_LIBRARY
     tier_budget_tests();
 #endif
-    tier_mapping_tests();prefill_cache_tests();step_plan_tests();decode_timeline_tests();c1_schedule_tests();slot_census_tests();planned_residents_tests();mtp_tile_tests();prefill_tile_selection_tests();host_commit_tests();placement_tests();profile_tests();unit_file_tests(argv[1]);binding_tests(argv[1]);encoding_tests(argv[1]);lifetime_tests(argv[1]);receipt_tests(argc>2?std::filesystem::path(argv[2]):std::filesystem::path());request_tests();
+    tier_mapping_tests();prefill_cache_tests();step_plan_tests();decode_timeline_tests();c1_schedule_tests();slot_census_tests();planned_residents_tests();mtp_tile_tests();prefill_tile_selection_tests();prefill_spares_tests();host_commit_tests();placement_tests();profile_tests();unit_file_tests(argv[1]);binding_tests(argv[1]);encoding_tests(argv[1]);lifetime_tests(argv[1]);receipt_tests(argc>2?std::filesystem::path(argv[2]):std::filesystem::path());request_tests();
     std::cout<<"PASS "<<checks<<" decode host checks: session/frontier, state bytes, KDA open-block replay model, DSA pools, argmax, expert catalog/units, cross-shard reads, guarded slots, generate requests\n";return 0;
 }catch(const std::exception& e){std::cerr<<e.what()<<"\n";return 1;}}

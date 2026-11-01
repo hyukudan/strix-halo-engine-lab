@@ -121,6 +121,10 @@ public:
     void reset_session();
     // Between tokens only: reset the fetched-expert cache to its open state (no-op without a cache).
     void reset_expert_cache(bool open);
+    // The decode residency restore after a prefill through the cache is deferred: it runs before the
+    // next decode token, or here (untimed, e.g. after a TTFT prefill). JSON of the restore, "{}" if none.
+    std::string restore_decode_residency();
+    bool decode_restore_pending()const;
     // "tierstream" or "reference" (with --reference-compare): backend of the next session.
     void select_expert_tier(const std::string& name);
     std::string expert_tier()const;
