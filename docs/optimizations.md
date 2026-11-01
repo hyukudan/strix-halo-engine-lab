@@ -908,6 +908,22 @@ The certified routed-MoE merge+commit handles four adjacent outputs per thread (
 - **Measured gain:** -0.19 ms per T8192 admitted merge call (3.81 vs 3.99 ms, real layers); about -0.02 s at 32K
 - **Implementation / evidence:** [MoE merge+commit](../src/hip_moe_prefill_commit.inc)
 
+<a id="qwen-qsa-cache-only"></a>
+
+### Last-layer cache-only QSA step on headless prefill blocks
+
+**Engine:** `qwen`. **Control:** `STRIX_QSA_CACHE_ONLY`. **Default:** 1.
+
+A headless tiled block already stops after its last state-writing step, the last layer's QSA step. That step now writes only what the session keeps: its input projections run unchanged, then only the k norm/rotation and the raw index-key / KV append (BF16 or int8, with the journal); pooled keys, block scores, selection, union, attention and the output projection are skipped because nothing reads them.
+
+- **Preconditions:** Tiled prefill blocks without a head and without a step observer whose last state-writing step is a QSA layer (STRIX_PREFILL_PIPE bit 64 cut active); the MTP route (step observer) and blocks with a head run the full step.
+- **Automatic selection:** On when unset; `=0`, `--baseline`, `STRIX_QPF2K_DEFAULTS=0` and the GSQ profile run the full step; `--print-effective-config` reports it under `long_context_items`. Persistent state is unchanged, so the value stays out of the prefix/session cache namespace (as the other exact startup settings).
+- **Fallback notice:** Any other block, or a QSA step outside the full-T rows entry, runs the full step.
+- **Exactness evidence:** Exact: plain default command, same binary on/off: full logits of the prefill and of 32 decode steps byte-identical with tokens at 4K (not admitted, one block with a head) and 32K (T8192, three headless blocks); 262K YaRN serial route: 32 generated tokens identical in four alternating runs (no logits/state digest on that route).
+- **Off switch:** STRIX_QSA_CACHE_ONLY=0
+- **Measured gain:** 262K YaRN serial prefill, 2 runs per arm alternating: 191.04 / 193.21 s on vs 194.76 / 200.17 s off (means 192.1 vs 197.5 s; adjacent pairs -1.6 to -7.0 s); 32K: neutral on the current T16384 route (one headless block; +0.04 / +0.07 s mean in two runs per order), -0.41 s on the earlier T8192 route (three headless blocks)
+- **Implementation / evidence:** [QSA launcher](../src/hip_indexed_attention_launcher.hip), [prefill runtime](../src/known_prefix_prefill_runtime.cpp)
+
 <a id="qwen-qsa-score-rows64"></a>
 
 ### QSA scorer R64 above 65,536 blocks

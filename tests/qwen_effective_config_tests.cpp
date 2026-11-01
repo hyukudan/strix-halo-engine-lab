@@ -1236,6 +1236,8 @@ void yarn_admission_tests(const gguf::FileInfo& info, const ModelManifest& manif
             expect(yarn_environment_refusal({{name, "0"}}, 2).empty(), "YaRN accepts the audited serial decode pool controls");
         for (const char* name : {"STRIX_QPF2K_COMPACT_IMAGES", "STRIX_CTX_EXACT_MEMORY", "STRIX_QSA_SCORE_RING", "STRIX_QSA_SCORE_RING_ROWS", "STRIX_TERMINAL_LOGITS_ARENA"})
             expect(yarn_environment_refusal({{name, "0"}}, 2).empty(), "YaRN accepts the compact-memory controls");
+        for (const char* value : {"0", "1"})
+            expect(yarn_environment_refusal({{"STRIX_QSA_CACHE_ONLY", value}}, 2).empty(), "YaRN accepts the cache-only QSA switch");
         expect(effective_prefill_argv(config.options)[2] == "--rope-yarn","YaRN receipt argv retains explicit opt-in");
     }
     // Explicit YMTP shares target organization, with independent serial and pool controls.
@@ -3495,6 +3497,7 @@ int main(int argc, char** arguments) {
             has(plain, "\"STRIX_QSA_DECODE_SELECT\":{\"enabled\":true,\"suppression\":null}") &&
             has(plain, "\"STRIX_QSA_DECODE_POOL_BF16\":{\"enabled\":true,\"suppression\":null}") &&
             has(plain, "\"STRIX_PREFILL_MOE_MERGE_VEC\":{\"enabled\":true,\"suppression\":null}") &&
+            has(plain, "\"STRIX_QSA_CACHE_ONLY\":{\"enabled\":true,\"suppression\":null}") &&
             has(plain, "\"qsa_decode_pool_key_bytes\":2,"), "effective config resolves the long-context items as on");
         ::setenv("STRIX_QSA_DECODE_SELECT", "0", 1);
         ::setenv("STRIX_QSA_DECODE_POOL_BF16", "0", 1);

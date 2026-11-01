@@ -3,6 +3,7 @@
 #include "strix/known_prefill_limits.hpp"
 #include "hip_prefill_pool.hpp"
 #include "strix/qpf2k_defaults.hpp"
+#include "strix/qsa_cache_only.hpp"
 #include "strix/qsa_committed_pool.hpp"
 #include "strix/hip_qwen_rotary_table.hpp"
 #include "strix/hip_qwen_rotary_diagnostic.hpp"
@@ -6118,6 +6119,18 @@ bool qsa_pool_packed_enabled() {
     return !qpf2k::baseline && enabled;
 }
 
+// RoPE table of the grouped norm (up to 1024 rows x 64 pairs); each launch writes it before its norm reads it in stream
+// order. enqueue_qsa_prefill_rows allocates it on its first call: the cache-only step is often the first grouped-norm
+// user, and a hipMalloc there would stall the deep launch queue of a long prefill.
+float2* qsa_group_rope_table() {
+    static float2* const table = [] {
+        void* p = nullptr;
+        check_hip(hipMalloc(&p, std::size_t{1024U} * 64U * sizeof(float2)), "QSA prefill RoPE table allocation");
+        return static_cast<float2*>(p);
+    }();
+    return table;
+}
+
 // parts: 1 input projections, 2 norm/store/selection/attention, 4 output projection. Rows > 8
 // (prefill groups of 8-row tiles) store every row's index key and K/V before any row selects
 // or attends; each row reads only positions at or before its own, so this equals the serial
@@ -6132,9 +6145,9 @@ template <unsigned Rows>
 void enqueue_qsa_known_rows(const QsaKnownRows<Rows>& prepared, const HipIndexedAttentionLauncherConfig& config,
     unsigned parts = 7U, QsaPrefillPool* pool = nullptr, unsigned skip_inputs = 0U,
     const q8_rows::DenseA8Slot* cohort_slot = nullptr, unsigned cohort_row = 0U, unsigned subparts = 127U,
-    const qsa_flash::ScoreGroup<Rows>* staged = nullptr, bool verify_window = false) {
+    const qsa_flash::ScoreGroup<Rows>* staged = nullptr, bool verify_window = false, bool cache_only = false) {
     for(const auto& row:prepared.row)
-        require_qsa_score_source(!row.workspace_layout.block_scores_bytes,!(parts & 2U) || row.workspace.block_scores!=nullptr);
+        require_qsa_score_source(!row.workspace_layout.block_scores_bytes,!(parts & 2U) || cache_only || row.workspace.block_scores!=nullptr);
     if (staged) subparts &= ~7U; // norms, append and scores already completed in stream order
     const auto& model = config.model;
     bind_qwen_pool(pool, model);
@@ -6219,7 +6232,8 @@ void enqueue_qsa_known_rows(const QsaKnownRows<Rows>& prepared, const HipIndexed
         const std::array<float* WorkspacePointers::*, 3> norm_targets{&WorkspacePointers::index_query, &WorkspacePointers::q_gate,
             &WorkspacePointers::current_k};
         // STRIX_QSA_SKIP_INDEX_Q: no index query was projected, so the group has no index heads (the kernel's set 0 is empty).
-        const std::array<std::uint32_t, 3> norm_heads{skip_index_q ? 0U : index_heads, a.attention_heads, a.kv_heads},
+        // STRIX_QSA_CACHE_ONLY: only the k heads (the stored keys).
+        const std::array<std::uint32_t, 3> norm_heads{skip_index_q || cache_only ? 0U : index_heads, cache_only ? 0U : a.attention_heads, a.kv_heads},
             norm_dims{a.index_dim, a.head_dim, a.head_dim},
             norm_strides{a.index_dim, a.head_dim * 2U, a.head_dim};
         const auto type = norm_tensors[0]->manifest->ggml_type;
@@ -6227,11 +6241,7 @@ void enqueue_qsa_known_rows(const QsaKnownRows<Rows>& prepared, const HipIndexed
         for (unsigned s = 0; s < 3U; ++s) fits = fits && norm_tensors[s]->manifest->ggml_type == type && norm_dims[s] <= 256U && norm_dims[s] >= 2U &&
             (norm_dims[s] & (norm_dims[s] - 1U)) == 0U;
         if (fits) {
-            static float2* rope_table = [] {
-                void* p = nullptr;
-                check_hip(hipMalloc(&p, std::size_t{1024U} * 64U * sizeof(float2)), "QSA prefill RoPE table allocation");
-                return static_cast<float2*>(p);
-            }();
+            float2* const rope_table = qsa_group_rope_table();
             static_assert(Rows <= 1024U);
             qsa_index::NormGroupViews<Rows> norm_views{};
             for (unsigned s = 0; s < 3U; ++s) {
@@ -6264,10 +6274,11 @@ void enqueue_qsa_known_rows(const QsaKnownRows<Rows>& prepared, const HipIndexed
         }
     }
     if ((subparts & 1U) && !norm_grouped) {
-    if (!skip_index_q) norm(tensors.index_q_norm, &WorkspacePointers::index_query, index_heads, a.index_dim, a.index_dim, false);
+    if (!skip_index_q && !cache_only) norm(tensors.index_q_norm, &WorkspacePointers::index_query, index_heads, a.index_dim, a.index_dim, false);
     // Without the index norm the q norm is the barrier-ordered one (it follows the input projections).
-    norm(tensors.q_norm, &WorkspacePointers::q_gate, a.attention_heads, a.head_dim, a.head_dim * 2U, any_order && !skip_index_q);
-    norm(tensors.k_norm, &WorkspacePointers::current_k, a.kv_heads, a.head_dim, a.head_dim, any_order);
+    if (!cache_only) norm(tensors.q_norm, &WorkspacePointers::q_gate, a.attention_heads, a.head_dim, a.head_dim * 2U, any_order && !skip_index_q);
+    // Cache-only: the k norm is the first after the projections, so it is barrier-ordered.
+    norm(tensors.k_norm, &WorkspacePointers::current_k, a.kv_heads, a.head_dim, a.head_dim, any_order && !cache_only);
     }
 
     QsaRowsStoreViews<Rows> store{};
@@ -6290,6 +6301,8 @@ void enqueue_qsa_known_rows(const QsaKnownRows<Rows>& prepared, const HipIndexed
         check_hip(hipGetLastError(), "QSA known-window int8 KV append");
     }
     }
+    // STRIX_QSA_CACHE_ONLY: the layer's persistent writes are done; nothing reads this step's rows.
+    if (cache_only) return;
 
     QsaRowsScoreViews<Rows> scores{};
     QsaRowsSelectViews<Rows> select{};
@@ -6981,7 +6994,7 @@ unsigned enqueue_qsa_prefill_dense_inputs(const std::vector<QsaKnownRows<8U>>& t
 template <unsigned W>
 void enqueue_qsa_prefill_projection(const std::vector<QsaKnownRows<8U>>& tiles, std::size_t first,
     const HipIndexedAttentionLauncherConfig& config, unsigned part, QsaPrefillPool* pool = nullptr, unsigned skip_inputs = 0U,
-    const qsa_flash::ScoreGroup<W>* staged = nullptr) {
+    const qsa_flash::ScoreGroup<W>* staged = nullptr, bool cache_only = false) {
     auto combined = std::make_unique<QsaKnownRows<W>>();
     combined->prefetch = tiles[first].prefetch; combined->journal = tiles[first].journal;
     for (unsigned r = 0; r < W; ++r) {
@@ -6989,7 +7002,7 @@ void enqueue_qsa_prefill_projection(const std::vector<QsaKnownRows<8U>>& tiles, 
         combined->row[r] = tile.row[r % 8U]; combined->selection[r] = tile.selection[r % 8U];
         combined->position[r] = tile.position[r % 8U];
     }
-    enqueue_qsa_known_rows<W>(*combined, config, part, pool, skip_inputs, nullptr, 0U, 127U, staged);
+    enqueue_qsa_known_rows<W>(*combined, config, part, pool, skip_inputs, nullptr, 0U, cache_only ? 3U : 127U, staged, false, cache_only);
 }
 // Rows r of [0, rows) at view(row 0) + r * stride, or false.
 template <class View> bool qsa_prefill_uniform(const std::vector<QsaKnownRows<8U>>& tiles, std::uint32_t rows, View&& view, std::uint64_t& stride) {
@@ -7173,7 +7186,8 @@ struct QsaExactScoreLease {
 // runs the serial tiles; STRIX_QSA_PREFILL_SELFCHECK=1 runs both (re-running the input
 // projections in between) and compares every row's attention output bitwise, throwing on a
 // difference; =2 compares the serial tiles with themselves (checks the harness).
-void enqueue_qsa_prefill_rows(const std::vector<QsaKnownRows<8U>>& tiles, const HipIndexedAttentionLauncherConfig& config) {
+void enqueue_qsa_prefill_rows(const std::vector<QsaKnownRows<8U>>& tiles, const HipIndexedAttentionLauncherConfig& config,
+    bool cache_only_step = false) {
     const auto submission=qsa_scratch_gate().enter(HipQsaScratchBackend{}.device());
     const auto submission_stream=hip_execution_stream();
     auto& shared=qsa_scratch_gate();
@@ -7202,6 +7216,10 @@ void enqueue_qsa_prefill_rows(const std::vector<QsaKnownRows<8U>>& tiles, const 
         if (const char* v = std::getenv("STRIX_QSA_PREFILL_TILES"); v && v[0] == '1') return 1U;
         return 0U;
     }();
+    // STRIX_QSA_CACHE_ONLY (see strix/qsa_cache_only.hpp): the input projections exactly as below (their launch routes
+    // depend on the full matrix set), then per group only the k norm/rope and the raw index-key / KV append.
+    const bool cache_only = cache_only_step && mode == 0U;
+    static_cast<void>(qsa_group_rope_table());
     // Pooled block keys (STRIX_QSA_PREFILL_POOLED=0 keeps block_score_rows_kernel): one device
     // buffer for the context's blocks, reused by every layer's call on the execution stream.
     static const bool pooled = [] { const char* v = std::getenv("STRIX_QSA_PREFILL_POOLED"); return !v || v[0] != '0'; }();
@@ -7258,14 +7276,20 @@ void enqueue_qsa_prefill_rows(const std::vector<QsaKnownRows<8U>>& tiles, const 
                 if (const auto done = enqueue_qsa_prefill_tiled_output(tiles, config)) { t = done / 8U; continue; }
             if (part == 1U && dense_wide && left >= 32U && wide_inputs.template operator()<256U>()) continue;
             if (part == 1U && dense_wide && left >= 16U && wide_inputs.template operator()<128U>()) continue;
+            // Cache-only part 2: no pool, staged scores or score source (the groups stop after their appends).
+            const bool stores = cache_only && part == 2U;
+            QsaPrefillPool* const group_pool = part == 2U && !stores ? pool : nullptr;
             if (left >= 8U) {
-                enqueue_qsa_prefill_projection<64U>(tiles, t, config, part, part == 2U ? pool : nullptr, 0U,
-                    stages ? stages->slot->scores + t / 8U : nullptr);
+                enqueue_qsa_prefill_projection<64U>(tiles, t, config, part, group_pool, 0U,
+                    stages && !stores ? stages->slot->scores + t / 8U : nullptr, stores);
                 t += 8U;
             }
-            else if (left >= 4U) { enqueue_qsa_prefill_projection<32U>(tiles, t, config, part, part == 2U ? pool : nullptr); t += 4U; }
-            else if (left >= 2U) { enqueue_qsa_prefill_projection<16U>(tiles, t, config, part, part == 2U ? pool : nullptr); t += 2U; }
-            else { enqueue_qsa_known_rows<8U>(tiles[t], config, part); t += 1U; }
+            else if (left >= 4U) { enqueue_qsa_prefill_projection<32U>(tiles, t, config, part, group_pool, 0U, nullptr, stores); t += 4U; }
+            else if (left >= 2U) { enqueue_qsa_prefill_projection<16U>(tiles, t, config, part, group_pool, 0U, nullptr, stores); t += 2U; }
+            else {
+                enqueue_qsa_known_rows<8U>(tiles[t], config, part, nullptr, 0U, nullptr, 0U, stores ? 3U : 127U, nullptr, false, stores);
+                t += 1U;
+            }
         }
     };
     {
@@ -7285,6 +7309,13 @@ void enqueue_qsa_prefill_rows(const std::vector<QsaKnownRows<8U>>& tiles, const 
             qpf2k_launch_index_side.fetch_add(1U, std::memory_order_relaxed);
         }
         qpf2k_index_flush(main_stream);
+    }
+    if (cache_only) {
+        projections(2U);
+        static std::atomic<unsigned> reported{0};
+        if (reported.fetch_add(1U) == 0U)
+            std::fprintf(stderr, "QSA prefill cache-only: headless last-layer step, %zu rows\n", tiles.size() * 8U);
+        return;
     }
     // STRIX_QSA_ATTEND_BATCH=1: every group's union/attend of part 2 in one launch pair (see QsaFastBatch).
     const auto part2 = [&] {
@@ -7466,7 +7497,7 @@ void indexed_attention_known_prefill_rows_launch(std::span<const ExecutionDispat
 #if defined(STRIX_HAS_EXPERIMENTAL_DENSE_TRELLIS)
     HipDenseTrellisScope arithmetic(config.dense_trellis_projections);
 #endif
-    enqueue_qsa_prefill_rows(prepare_qsa_prefill_rows(rows, config, journal), config);
+    enqueue_qsa_prefill_rows(prepare_qsa_prefill_rows(rows, config, journal), config, qsa_cache_only::active);
 }
 
 void indexed_attention_known_window_rows_preflight(std::span<const ExecutionDispatchContext> rows,

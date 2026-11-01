@@ -491,7 +491,7 @@ int main() {
             set("1");check(absent==strix::session_numerical_config("same CLI"),"operational on must preserve numerical signature");
             set(saved?saved->c_str():nullptr);
         }
-        for (const char* key : {"STRIX_QPF2K_T16K", "STRIX_QPF2K_INDEX_BATCH", "STRIX_EAGER_CODE_LOAD", "HIP_ENABLE_DEFERRED_LOADING", "STRIX_QPF2K_EARLY_SETUP", "STRIX_QPF2K_HC_LOWBAND", "STRIX_QPF2K_COMPACT_IMAGES"}) {
+        for (const char* key : {"STRIX_QPF2K_T16K", "STRIX_QPF2K_INDEX_BATCH", "STRIX_EAGER_CODE_LOAD", "HIP_ENABLE_DEFERRED_LOADING", "STRIX_QPF2K_EARLY_SETUP", "STRIX_QPF2K_HC_LOWBAND", "STRIX_QPF2K_COMPACT_IMAGES", "STRIX_QSA_CACHE_ONLY"}) {
             const char* old = std::getenv(key);
             const std::optional<std::string> saved = old ? std::optional<std::string>{old} : std::nullopt;
             const auto set = [&](const char* value) {
