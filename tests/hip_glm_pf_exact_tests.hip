@@ -214,11 +214,12 @@ struct Env {
 void test_routes() {
     Env x("STRIX_GLM_PF_EXACT_X"), threshold("STRIX_GLM_PF_EXACT_X_MIN_ROWS");
     threshold.set(nullptr);
-    for (const char* value : {static_cast<const char*>(nullptr), "0", "1", "2", "auto"}) {
+    for (const char* value : {static_cast<const char*>(nullptr), "0", "1", "2", "3", "4", "auto"}) {
         x.set(value);
         for (unsigned rows : {2047U, 2048U, 2049U, 4096U}) {
             const auto expected = !value || std::strcmp(value, "0") == 0 ? E::Route::tm :
                 std::strcmp(value, "1") == 0 ? E::Route::x :
+                std::strcmp(value, "3") == 0 ? E::Route::x3 : std::strcmp(value, "4") == 0 ? E::Route::x3r8 :
                 std::strcmp(value, "2") == 0 || rows >= 2048 ? E::Route::x2 : E::Route::tm;
             check(E::route(rows) == expected, std::string("route X=") + (value ? value : "unset") +
                   " rows=" + std::to_string(rows));
@@ -233,7 +234,7 @@ void test_routes() {
         check(threw, std::string("route rejects threshold=") + bad);
     }
     threshold.set(nullptr);
-    for (const char* bad : {"-1", "3", "abc"}) {
+    for (const char* bad : {"-1", "5", "abc"}) {
         x.set(bad);
         bool threw = false;
         try { (void)E::route(4096); } catch (const std::invalid_argument&) { threw = true; }
@@ -248,8 +249,8 @@ void tm_env(unsigned tm) {
     if (setenv("STRIX_GLM_PF_EXACT_TM", v.c_str(), 1) != 0) die("set TM");
 #endif
 }
-void x_env(unsigned variant) {  // 0 TM path, 1 X, 2 X2, 3 auto
-    const char* v = variant == 3 ? "auto" : variant == 2 ? "2" : variant == 1 ? "1" : "0";
+void x_env(unsigned variant) {  // 0 TM path, 1 X, 2 X2, 3 auto, 4 X3, 5 X3 with eight rows per wave
+    const char* v = variant == 5 ? "4" : variant == 4 ? "3" : variant == 3 ? "auto" : variant == 2 ? "2" : variant == 1 ? "1" : "0";
 #ifdef _WIN32
     if (_putenv_s("STRIX_GLM_PF_EXACT_X", v) != 0) die("set X");
 #else
@@ -324,7 +325,7 @@ void exceptional(Ctx& cx) {
             }
         }
         hok(hipMemcpyAsync(x.p, input.data(), input.size() * 4, hipMemcpyHostToDevice, cx.hs), "exception input");
-        for (unsigned variant : {0U, 1U, 2U}) {
+        for (unsigned variant : {0U, 1U, 2U, 4U, 5U}) {
             x_env(variant);
             hok(hipMemsetAsync(y.p, 0xff, std::size_t{rows} * l.N * 4, cx.hs), "exception poison output");
             E::linear_rows(raw, x.f(), l.I, y.f(), l.N, rows, ws.p, E::workspace_bytes(rows, l.I), cx.hs);
@@ -420,9 +421,9 @@ void test_shape(Ctx& cx, const std::string& dir, const Shape& sh, bool synthetic
             std::printf("RESOURCE %s TM=%u private=%zu B/lane\n", tag.c_str(), tm, scratch);
             check(scratch == 0, "zero spills TM=" + std::to_string(tm) + " " + tag);
         }
-        for (unsigned variant : {1U, 2U}) {
+        for (unsigned variant : {1U, 2U, 3U, 4U}) {
             const auto xr = E::x_resources(prepared, variant);
-            const std::string name = variant == 1 ? "X" : "X2";
+            const std::string name = variant == 1 ? "X" : variant == 2 ? "X2" : variant == 3 ? "X3" : "X3R8";
             std::printf("RESOURCE %s %s private=%zu B/lane VGPR=%d LDS=%zu\n", tag.c_str(), name.c_str(),
                         xr.localSizeBytes, xr.numRegs, xr.sharedSizeBytes);
             check(xr.localSizeBytes == 0, "zero spills " + name + " " + tag);
@@ -451,14 +452,14 @@ void test_shape(Ctx& cx, const std::string& dir, const Shape& sh, bool synthetic
                 std::copy_n(input.data() + std::size_t{source + r} * l.I, l.I, staged.data() + (xo + r) * xs + 3U);
             hok(hipMemcpyAsync(xb.p, staged.data(), staged.size() * 4U, hipMemcpyHostToDevice, cx.hs), "padded input");
             for (bool raw_form : {false, true})
-                for (unsigned tm : {16U,32U,64U,0U,1U,2U}) {
-                    // Preserve all original arms; new sizes cover TM16/X/X2/auto on prepared weights.
+                for (unsigned tm : {16U,32U,64U,0U,1U,2U,3U,4U}) {
+                    // Preserve all original arms; new sizes cover TM16/X/X2/auto/X3 on prepared weights.
                     if (added && (raw_form || tm == 32 || tm == 64)) continue;
-                    x_env(tm <= 2 ? tm + 1U : 0U);
-                    tm_env(tm <= 2 ? 16U : tm);
+                    x_env(tm <= 4 ? tm + 1U : 0U);
+                    tm_env(tm <= 4 ? 16U : tm);
                     hok(hipMemsetAsync(yb.p, 0xff, (Mmax + extra) * ys * 4U, cx.hs), "poison output");
                     hok(hipMemsetAsync(ew.p, 0xff, E::workspace_bytes(Mmax, l.I), cx.hs), "poison workspace");
-                    const auto expected_route = tm == 0 ? E::Route::x :
+                    const auto expected_route = tm == 0 ? E::Route::x : tm == 3 ? E::Route::x3 : tm == 4 ? E::Route::x3r8 :
                         tm == 1 || (tm == 2 && m >= E::x_auto_rows()) ? E::Route::x2 : E::Route::tm;
                     const bool selected = E::route(m) == expected_route; // Same environment as the launch below.
                     E::linear_rows(raw_form ? raw : prepared, xb.f() + xo * xs + 3U, xs,
@@ -480,7 +481,7 @@ void test_shape(Ctx& cx, const std::string& dir, const Shape& sh, bool synthetic
                             }
                         } else if (bits(got[q]) != 0xffffffffU) guards = false;
                     }
-                    const std::string suffix = " M=" + std::to_string(m) + " TM=" + (tm <= 2 ? std::string(tm == 0 ? "X" : tm == 1 ? "X2" : "Xauto") : std::to_string(tm)) +
+                    const std::string suffix = " M=" + std::to_string(m) + " TM=" + (tm <= 4 ? std::string(tm == 0 ? "X" : tm == 1 ? "X2" : tm == 2 ? "Xauto" : tm == 3 ? "X3" : "X3R8") : std::to_string(tm)) +
                         (raw_form ? " raw " : " prepared ") + tag;
                     if (!same) std::printf("MISMATCH first=%zu got=%08x ref=%08x max_ulp=%u\n", first, first_got, first_ref, maxulp);
                     check(same && guards && selected, "bitwise+guards+route" + suffix);
@@ -490,7 +491,7 @@ void test_shape(Ctx& cx, const std::string& dir, const Shape& sh, bool synthetic
                         bool split_routes = true;
                         unsigned offset = 0;
                         for (unsigned nr : {2047U, 2049U}) {
-                            const auto expected = tm == 0 ? E::Route::x :
+                            const auto expected = tm == 0 ? E::Route::x : tm == 3 ? E::Route::x3 : tm == 4 ? E::Route::x3r8 :
                                 tm == 1 || (tm == 2 && nr >= E::x_auto_rows()) ? E::Route::x2 : E::Route::tm;
                             split_routes = split_routes && E::route(nr) == expected;
                             E::linear_rows(prepared, xb.f() + (xo + offset) * xs + 3U, xs,
@@ -508,13 +509,13 @@ void test_shape(Ctx& cx, const std::string& dir, const Shape& sh, bool synthetic
         hok(hipMemcpyAsync(xb.p, input.data(), input.size() * 4U, hipMemcpyHostToDevice, cx.hs), "input");
         hipEvent_t a{}, b{};
         hok(hipEventCreate(&a), "event"); hok(hipEventCreate(&b), "event");
-        for (unsigned tm : {16U,32U,64U,0U,1U}) {
-            x_env(tm <= 1 ? tm + 1U : 0U);
-            tm_env(tm <= 1 ? 16U : tm);
+        for (unsigned tm : {16U,32U,64U,0U,1U,3U,4U}) {
+            x_env(tm <= 4 ? tm + 1U : 0U);
+            tm_env(tm <= 4 ? 16U : tm);
             auto exact = [&] { E::linear_rows(prepared, xb.f(), l.I, yb.f(), l.N, Mmax,
                                              ew.p, E::workspace_bytes(Mmax, l.I), cx.hs); };
             auto baseline = [&] {
-                if (tm > 1) reference(xb.f(), yb.f(), Mmax, 8);
+                if (tm > 4) reference(xb.f(), yb.f(), Mmax, 8);
                 else {
                     x_env(false);
                     E::linear_rows(prepared, xb.f(), l.I, yb.f(), l.N, Mmax,
@@ -534,11 +535,12 @@ void test_shape(Ctx& cx, const std::string& dir, const Shape& sh, bool synthetic
             for (unsigned arm = 0; arm < 2; ++arm) {
                 std::sort(ms[arm], ms[arm] + 3);
                 const double seconds = ms[arm][1] * 1e-3;
-                const unsigned reuse = arm == 0 ? (tm <= 1 ? 32U : tm) : (tm <= 1 ? 16U : 8U);
+                const unsigned reuse = arm == 0 ? (tm <= 1 || tm == 3 ? 32U : tm == 4 ? 64U : tm) : (tm <= 4 ? 16U : 8U);
                 const double weights = static_cast<double>(l.I) * l.N * l.bits / 8.0 * ((Mmax + reuse - 1U) / reuse);
                 const double flop = 2.0 * Mmax * l.I * l.N;
                 std::printf("TIME %s TM=%u %s M=2048 %.4f us/row weight-GB/s=%.3f dot2-TFLOP/s=%.3f\n",
-                            tag.c_str(), tm <= 1 ? (arm == 0 ? 32U : 16U) : tm, arm == 0 ? (tm <= 1 ? (tm == 0 ? "X" : "X2") : "exact") : (tm <= 1 ? "TM16" : "gemv8"), seconds * 1e6 / Mmax,
+                            tag.c_str(), tm <= 4 ? (arm == 0 ? (tm == 4 ? 64U : 32U) : 16U) : tm,
+                            arm == 0 ? (tm <= 4 ? (tm == 0 ? "X" : tm == 1 ? "X2" : tm == 3 ? "X3" : "X3R8") : "exact") : (tm <= 4 ? "TM16" : "gemv8"), seconds * 1e6 / Mmax,
                             weights / seconds / 1e9, flop / seconds / 1e12);
             }
         }

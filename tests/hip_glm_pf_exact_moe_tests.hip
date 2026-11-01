@@ -20,6 +20,10 @@ namespace X = strix::glm::pf::exact_moe;
 namespace {
 constexpr unsigned H = 4096, I = 1024, E = 288, Top = 8, MaxR = 4096;
 unsigned checks = 0, failures = 0;
+std::string only_versions;  // --versions a,b,...: gate/exception arms limited to these (split long gates)
+bool selected(const char* version) {
+    return only_versions.empty() || ("," + only_versions + ",").find(std::string(",") + version + ",") != std::string::npos;
+}
 void ok(hipError_t e, const char* what) {
     if (e != hipSuccess) throw std::runtime_error(std::string(what) + ": " + hipGetErrorString(e));
 }
@@ -47,6 +51,14 @@ struct Variant {
         try { set(present ? saved.c_str() : nullptr); } catch (...) {}
     }
 };
+void rcap_env(const char* value) {
+#ifdef _WIN32
+    if (_putenv_s("STRIX_GLM_PF_EXACTMOE_V3_RCAP", value ? value : "") != 0)
+#else
+    if ((value ? setenv("STRIX_GLM_PF_EXACTMOE_V3_RCAP", value, 1) : unsetenv("STRIX_GLM_PF_EXACTMOE_V3_RCAP")) != 0)
+#endif
+        throw std::runtime_error("setting v3 row buckets");
+}
 struct Arena {
     std::vector<void*> p;
     ~Arena() { for (void* v : p) (void)hipFree(v); }
@@ -250,10 +262,14 @@ struct Fixture {
         std::vector<std::uint16_t> at(ar.size());
         bool pass = true;
         Variant variant;
-        for (const char* version : {"1", "2", "3", "6", "7", "auto"}) for (unsigned tm : {16U, 32U}) for (unsigned repeat = 0; repeat < 2; ++repeat) {
-            // Existing checks retain every arm/repeat. Added large cases qualify v3/v6/v7 against the seam.
-            if (added && (std::strcmp(version, "1") == 0 || std::strcmp(version, "2") == 0 || tm != 16 || repeat != 0)) continue;
-            Variant::set(version);
+        for (const char* version : {"1", "2", "3", "3r0", "6", "7", "8", "9", "10", "auto"}) for (unsigned tm : {16U, 32U}) for (unsigned repeat = 0; repeat < 2; ++repeat) {
+            // Existing checks retain every arm/repeat. Added large cases qualify v3/v6/v7/v8/v9 against the seam.
+            if (!selected(version)) continue;
+            if (added && (std::strcmp(version, "3r0") == 0 || std::strcmp(version, "1") == 0 || std::strcmp(version, "2") == 0 || tm != 16 || repeat != 0)) continue;
+            // 3r0 = v3 with its row buckets off (STRIX_GLM_PF_EXACTMOE_V3_RCAP=0, the previous fixed 16 rows).
+            const bool r0 = std::strcmp(version, "3r0") == 0;
+            Variant::set(r0 ? "3" : version);
+            rcap_env(r0 ? "0" : nullptr);
             ok(hipMemsetAsync(ws, 0xff, wsb, stream), "poison workspace");
             ok(hipMemsetAsync(out, 0xff, std::size_t{MaxR} * H * 4, stream), "poison output");
             X::enqueue(view(R, rt), plan, ws, wsb, stream, tm);
@@ -340,7 +356,9 @@ struct Fixture {
             }
             std::vector<float> yr, gr, pr;
             std::vector<std::uint16_t> ar;
-            for (const char* version : {"3", "6", "7"}) {
+            for (const char* version : {"3", "6", "7", "8", "9", "10"}) {
+                // v3 is this case's reference and always runs.
+                if (std::strcmp(version, "3") != 0 && !selected(version)) continue;
                 Variant::set(version);
                 ok(hipMemsetAsync(ws, 0xff, wsb, stream), "exception poison");
                 ok(hipMemsetAsync(out, 0xff, std::size_t{R} * H * 4, stream), "exception poison output");
@@ -465,11 +483,12 @@ int main(int argc, char** argv) {
         for (int i = 1; i < argc; ++i) {
             if (std::strcmp(argv[i], "--no-timing") == 0) timing = false;
             else if (std::strcmp(argv[i], "--timing-only") == 0) timing_only = true;
-            else throw std::invalid_argument("usage: strix-hip-glm5-pf-exact-moe-tests [--no-timing | --timing-only]");
+            else if (std::strcmp(argv[i], "--versions") == 0 && i + 1 < argc) only_versions = argv[++i];
+            else throw std::invalid_argument("usage: strix-hip-glm5-pf-exact-moe-tests [--no-timing | --timing-only] [--versions LIST]");
         }
         if (!timing && timing_only) throw std::invalid_argument("conflicting timing options");
         std::mt19937 rng(0x5eed1234U);
-        for (unsigned variant : {6U, 7U}) for (bool shared : {false, true}) for (unsigned bits : {4U, 6U}) for (bool down : {false, true}) {
+        for (unsigned variant : {6U, 7U, 8U, 9U}) for (bool shared : {false, true}) for (unsigned bits : {4U, 6U}) for (bool down : {false, true}) {
             if (bits == 6 && !shared) continue;
             const auto a = X::x_resources(bits, down, shared, variant);
             const auto name = "v" + std::to_string(variant) + " K" + std::to_string(bits) + (shared ? " shared" : " routed") + (down ? " down" : " gate/up");
@@ -477,7 +496,7 @@ int main(int argc, char** argv) {
             check(a.localSizeBytes == 0, "zero spills " + name);
         }
         {
-            // enqueue dispatches through selected_variant(); auto must pick v7 exactly at the threshold.
+            // enqueue dispatches through selected_variant(); auto must pick v10 exactly at the threshold.
             Variant variant;
             auto min_rows = [](const char* value) {
 #ifdef _WIN32
@@ -490,15 +509,15 @@ int main(int argc, char** argv) {
             min_rows(nullptr);
             Variant::set(nullptr);
             check(X::selected_variant(4096) == 3, "selected variant unset -> 3");
-            for (const char* v : {"1", "2", "3", "6", "7"}) {
+            for (const char* v : {"1", "2", "3", "6", "7", "8", "9", "10"}) {
                 Variant::set(v);
                 check(X::selected_variant(2048) == static_cast<unsigned>(std::atoi(v)), std::string("selected variant ") + v);
             }
             Variant::set("auto");
-            for (unsigned rows : {1U, 512U, 2047U, 2048U, 2049U, 4096U})
-                check(X::selected_variant(rows) == (rows >= 2048 ? 7U : 3U), "selected variant auto rows=" + std::to_string(rows));
+            for (unsigned rows : {1U, 511U, 512U, 513U, 2048U, 4096U})
+                check(X::selected_variant(rows) == (rows >= 512 ? 10U : 3U), "selected variant auto rows=" + std::to_string(rows));
             min_rows("100");
-            check(X::selected_variant(99) == 3 && X::selected_variant(100) == 7, "selected variant auto MIN_ROWS=100");
+            check(X::selected_variant(99) == 3 && X::selected_variant(100) == 10, "selected variant auto MIN_ROWS=100");
             for (const char* bad : {"0", "65537", "abc"}) {
                 min_rows(bad);
                 bool threw = false;
@@ -506,6 +525,14 @@ int main(int argc, char** argv) {
                 check(threw, std::string("auto MIN_ROWS=") + bad + " rejected");
             }
             min_rows(nullptr);
+            check(X::v3_row_buckets(), "v3 row buckets default on");
+            rcap_env("0");
+            check(!X::v3_row_buckets(), "v3 row buckets =0 off");
+            rcap_env("2");
+            bool rcap_threw = false;
+            try { (void)X::v3_row_buckets(); } catch (const std::invalid_argument&) { rcap_threw = true; }
+            check(rcap_threw, "v3 row buckets =2 rejected");
+            rcap_env(nullptr);
             Variant::set("5");
             bool threw = false;
             try { (void)X::selected_variant(1); } catch (const std::invalid_argument&) { threw = true; }

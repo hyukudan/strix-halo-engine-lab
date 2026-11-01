@@ -2768,14 +2768,14 @@ Use raw-only expert storage and the bitwise FastMoe implementation so the TP2 mo
 
 **Engine:** `glm`. **Control:** `STRIX_GLM_PF_EXACTMOE_V`. **Default:** auto.
 
-Grouped expert work in exact chunked prefill; large calls run routed and shared experts through the register-blocked X2 core (v7), smaller calls keep the W2 grouped path (v3).
+Grouped expert work in exact chunked prefill; calls of 512 rows or more run routed and shared experts through the X3 core (v10: activations in scalar registers, LDS only for decoded weights, 32- or 64-row tiles chosen per expert group), smaller calls keep the W2 grouped path (v3), whose tiles compute only the smallest row bucket (1/2/4/8/16) covering their rows.
 
-- **Preconditions:** Exact chunked prefill; auto takes v7 for MoE calls of at least 2048 rows (STRIX_GLM_PF_EXACTMOE_X_MIN_ROWS) and v3 below. 7 forces v7, 3 restores the previous default.
+- **Preconditions:** Exact chunked prefill; auto takes v10 for MoE calls of at least 512 rows (STRIX_GLM_PF_EXACTMOE_X_MIN_ROWS) and v3 below. 7 forces the previous X2 core, 3 forces v3 for every call; STRIX_GLM_PF_EXACTMOE_V3_RCAP=0 makes v3 compute 16 rows per tile again.
 - **Automatic selection:** Unset resolves to auto; the app sets it; the resolver reports it in `--print-effective-config`. Explicit values win; `--baseline` sets 1.
 - **Fallback notice:** Below the row threshold v3 runs; invalid values fail. No silent numerical-identity substitution.
-- **Exactness evidence:** Bitwise for all outputs: v7 routes routed and shared experts through the X2 core with the v3 expert order, gather/scatter and fold; MoE outputs, FP16 down inputs and final rows equal v3 for row tails, 2047/2048/2049 and 4096-row calls, concentrated expert groups, signed zero, FP16 subnormals, +-Inf and NaN payloads; on the real pair decode anchors, speculative oracle and 1K/8K/32K prefill logits equal the v3 path. Internal FP32 gate/up workspace NaN payloads may differ in the FP16 overflow case (+Inf meeting -Inf inside a DOT2 chain; not reachable with finite activations); the payload is discarded at the FP16 down input.
-- **Off switch:** STRIX_GLM_PF_EXACTMOE_V=3 (previous default); 1 for the baseline
-- **Measured gain:** 8K TTFT 28.17 -> 26.85 s (-4.7 %) vs STRIX_GLM_PF_EXACTMOE_V=3 in the same run, 32K 113.7 s, 1K unchanged (3.74 vs 3.76 s, two pairs)
+- **Exactness evidence:** Bitwise for all outputs: v7 and v10 route routed and shared experts through the X2 / X3 cores with the v3 expert order, gather/scatter and fold (X3 keeps the X2 DOT2 chains, reduce4 and split order; only the operand source changes); v3 row buckets run the same statements for every live row; MoE outputs, FP16 down inputs and final rows equal v3 for row tails, 2047/2048/2049 and 4096-row calls, concentrated expert groups, signed zero, FP16 subnormals, +-Inf and NaN payloads; on the real pair decode anchors, speculative oracle and 1K/8K/32K prefill logits equal the v3 path. Internal FP32 gate/up workspace NaN payloads may differ in the FP16 overflow case (+Inf meeting -Inf inside a DOT2 chain; not reachable with finite activations); the payload is discarded at the FP16 down input.
+- **Off switch:** STRIX_GLM_PF_EXACTMOE_V=7 (previous large-call core) or 3; STRIX_GLM_PF_EXACTMOE_V3_RCAP=0; 1 for the baseline
+- **Measured gain:** 8K TTFT 25.24 -> 20.32 s (-19.5 %) and 1K 3.75 -> 3.18 s (-15 %) vs STRIX_GLM_PF_EXACTMOE_V=7 in the same run (two pairs each, 8192-row chunks); MoE call at 4096 rows 125.5 -> 73.1 ms; v3 row buckets -18 to -22 % on calls of 33-100 rows
 - **Implementation / evidence:** [resolver](../apps/glm_rank_defaults.hpp), [MoE](../src/glm/prefill/glm_pf_exact_moe.hip), [tests](../tests/hip_glm_pf_exact_moe_tests.hip)
 
 <a id="glm-pf-exact-x"></a>
