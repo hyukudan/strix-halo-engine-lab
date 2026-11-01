@@ -3220,7 +3220,13 @@ int main(int argc, char** arguments) {
         disk.session_dir=(std::filesystem::temp_directory_path()/"qwen-session-defaults-test").string();
         resolve_session_defaults(disk,model,disk_env,128*gib_bytes);
         expect(disk.session_cache && disk.session_disk && disk.session_disk_bytes>0,"disk default cap and writable directory");
+        // An existing regular file is not a usable session directory. __FILE__ can be build-dir relative (Ninja), so
+        // prefer the reference table's absolute path, which the build passes.
+#ifdef STRIX_QWEN_CACHE_REFERENCE
+        auto bad_disk=route; bad_disk.session_dir=STRIX_QWEN_CACHE_REFERENCE;
+#else
         auto bad_disk=route; bad_disk.session_dir=__FILE__;
+#endif
         resolve_session_defaults(bad_disk,model,disk_env,128*gib_bytes);
         expect(bad_disk.session_cache && !bad_disk.session_disk && !bad_disk.session_disk_off_reason.empty(),"disk failure preserves RAM");
         EffectiveConfig config; config.options=on;
