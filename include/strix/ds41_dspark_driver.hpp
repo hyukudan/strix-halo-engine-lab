@@ -166,6 +166,8 @@ public:
         // `round` (the exchanges of a split draft round)
         std::uint32_t drafters = 1;
         float round = 0.0F;
+        // one drafting request drafted by both ranks together (its exchanges included), instead of draft + round; 0 = none
+        float coop = 0.0F;
     };
     explicit BatchWindowController(std::uint32_t slots);
     void set_costs(const Costs& costs) { costs_ = costs; }

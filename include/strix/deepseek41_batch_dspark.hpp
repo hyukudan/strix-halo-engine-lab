@@ -52,6 +52,9 @@ struct BatchSpecOptions {
     // false: on rank 0 (the server's rank 1 does not see a prompt read in rows before it is read). imported()
     // requests always go to rank slot % 2.
     bool split_started = true;
+    // world 2: a request drafting alone in a step is drafted by both ranks (DeviceDrafter::set_rank); both ranks must
+    // agree (the server compares it in its hello; STRIX_DS41_DSPARK_COOP=0 turns it off)
+    bool coop = true;
     // The wall time of the last target step for the cost model (empty: target.last_stats().seconds). A split decode
     // (ds41_hetero_stage.hpp) passes the step it waited for: the FRONT's boundaries, the forward and the TAIL step.
     std::function<double()> step_seconds;
@@ -64,6 +67,7 @@ struct BatchSpecStats {
     std::uint64_t steps = 0, drafted_steps = 0, windows = 0, plain_rows = 0, drafts_verified = 0, drafts_accepted = 0, rows = 0;
     std::uint64_t decode_steps = 0, decode_tokens = 0;  // steps without prompt rows and the tokens they emitted
     std::uint64_t probe_rows = 0;  // calib: extra rows verified as price-independent probes (every 32nd drafted plan, at most one)
+    std::uint64_t coop_drafts = 0;  // drafts both ranks ran together (one head half each)
     double draft_seconds = 0.0, step_seconds = 0.0, finish_seconds = 0.0, plan_seconds = 0.0;
     double decode_seconds = 0.0;  // wall of the decode-only steps (plan + drafts + step + finish)
     std::array<std::uint64_t, ds41::dspark::block_size + 2U> window_rows{};  // windows by rows (1 = plain row)
@@ -121,7 +125,10 @@ public:
     [[nodiscard]] std::shared_ptr<ParkedPlan> park();
     void resume(const std::shared_ptr<ParkedPlan>& plan);
     // world 2, rank 1: `slot` was reset (a new request comes): its context is no longer this rank's.
-    void release(std::uint32_t slot) { owners_.at(slot) = 0U; }
+    void release(std::uint32_t slot) { owners_.at(slot) = 0U, in_step_.at(slot) = false; }
+    // both ranks: `slot`'s target state was replaced from outside (an imported state): its drafting contexts no longer
+    // follow the same rows on both ranks, no cooperative draft until a new imported() request
+    void forget(std::uint32_t slot) { in_step_.at(slot) = false, coop_pending_.at(slot) = false; }
     static constexpr std::uint32_t round_magic = 0x44524631U;
     static constexpr std::size_t round_bytes = 512;
     [[nodiscard]] std::uint32_t owner(std::uint32_t slot) const noexcept { return owners_[slot]; }
@@ -141,6 +148,12 @@ private:
     void stage(std::uint32_t slot, std::uint32_t first, std::uint32_t count);
     void stage_from(std::uint32_t slot, std::array<const float*, 3> streams, std::uint32_t first, std::uint32_t count, void* stream);
     void flush(std::uint32_t slot);           // staged rows and pending context tokens -> the slot's drafting context
+    // the owner stages a request's kept rows; with coop_ the other rank too while in_step_ (the same rows flushed at the
+    // same steps). Both ranks end in_step_ on a step's group of rows longer than one that was not a cooperative draft
+    // (the same rule on the same rows), rank 1 also when it drafts the request alone, rank 0 on any draft of one rank.
+    [[nodiscard]] bool keeps(std::uint32_t slot) const noexcept { return owners_[slot] == options_.rank || in_step_[slot]; }
+    // world 2: one draft on both ranks, each scanning half the head (DeviceDrafter::set_rank): the same tokens
+    ds41::dspark::Draft coop_draft(std::uint32_t slot, std::uint32_t token);
 
     BatchForward& target_;
     ds41::dspark::DeviceDrafter& drafter_;
@@ -208,6 +221,16 @@ private:
     std::vector<std::vector<std::uint32_t>> prompts_;
     std::vector<std::uint32_t> positions_;
     std::vector<std::uint32_t> owners_;  // the rank that drafts each slot's request
+    // world 2, options_.coop: when one request drafts in a step, both ranks draft it together (half the output head
+    // each). Exact: the tokens equal the one-rank draft. in_step_[slot]: the slot's context got the same rows in the
+    // same flushes on both ranks since imported() (a draft on one rank only ends it: appends of other row counts may
+    // round differently); rank 0 drafts cooperatively only then.
+    bool coop_ = false;
+    std::vector<bool> in_step_;
+    std::vector<bool> coop_pending_;  // drafted by both ranks, its rows not staged yet (plans may queue)
+    double coop_mean_ = 0.0;         // a cooperative draft with its entry exchange (rank 0)
+    std::uint32_t coop_n_ = 0;
+    bool seen_coop_ = false;
     std::array<std::uint32_t, ds41::dspark::BatchWindowController::max_requests> kept_{};  // rank 1: last step's commits (all ones: none)
     std::uint64_t staged_step_ = ~std::uint64_t{0};
     BatchSpecStats stats_;
