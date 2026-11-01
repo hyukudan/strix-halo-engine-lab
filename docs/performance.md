@@ -224,12 +224,13 @@ These are historical 2026-10-22 rows; the overnight snapshot gives the newer exa
 Measured on one Strix Halo node, default route (code `a199c8e0` plus the bundle selection of #137), diverse
 real prose (50 public-domain books in six languages), greedy decoding, automatic storage ladder (no storage
 overrides). TTFT runs from process launch to the first token and includes model load.
-The 262K prefill and decode cells are from build `7b2453fe` (262,144-token prompt, prefill time without model load,
-`--profile default` and `--profile fast` interleaved); the row's other cells are from the build above.
+The 262K prefill cell is from public main `669bcb83` (262,144-token prompt, prefill time without model load,
+`--profile default` and `--profile fast` interleaved, two pairs: 179.07 s and 174.18 s); the 262K decode cells are from
+build `7b2453fe`; the row's other cells are from the build above.
 
 | Context (YaRN factor) | Exact gate (MTP == serial == pool off) | TTFT serial / MTP | Prefill, serial | Decode serial / MTP | MTP acceptance |
 |---|---|---|---|---|---|
-| 262,400 (2) | Full scope | 219 s / 224 s | **1,371 tok/s** `--profile default`; 1,412 tok/s `--profile fast` (`7b2453fe`) | 20.55 / **59.5 tok/s** (2.9x, `7b2453fe`) | 75 % |
+| 262,400 (2) | Full scope | 219 s / 224 s | **1,464 tok/s** `--profile default`; 1,505 tok/s `--profile fast` (`669bcb83`) | 20.55 / **59.5 tok/s** (2.9x, `7b2453fe`) | 75 % |
 | 524,288 (2) | Target scope | 470 s / 508 s | 1,215 tok/s | 19.7 / **60.6 tok/s** (3.1x) | 85 % |
 | 1,048,576 (4) | Full scope, plus the default-path receipt | 1,005 s / 1,096 s | 1,081 tok/s (MTP route about 970) | 18.7 / **55.9 tok/s** (3.0x) | 83 % |
 
