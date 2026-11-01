@@ -21,9 +21,13 @@ namespace strix::gemma4::gpu {
 // tiles and the wide Q6_K tile decode their integer scale products with the
 // full-rate 24-bit multiply (same integers, same bytes).
 [[nodiscard]] bool decode24();
+// STRIX_G4_PREFILL_SHARED_Q6 (read per call; unset or 1 = on, 0 = off): with
+// DECODE24, the wide Q6_K many-row linear uses the shared decoded-weight tile
+// (same bytes).
+[[nodiscard]] bool shared_q6();
 // Tile variants (outputs per wave x rows per workgroup); all have equal bytes.
 // -1 selects STRIX_G4_ROWS_TILE, else the measured default per format.
-inline constexpr int rows_linear_variants = 16;
+inline constexpr int rows_linear_variants = 19;
 // out[r * outputs + o] for rows r < rows; x holds rows * inputs FP32 values.
 // failure (optional) receives the finite flag of every stored value.
 void linear_rows(LinearView w, const float* x, std::uint32_t rows, float* out, Queue queue = nullptr,
