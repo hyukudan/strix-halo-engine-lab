@@ -7,6 +7,8 @@
 #include "expert_tier.hpp"
 #include "decode_timeline.hpp"
 #include "profile.hpp"
+#include "schedule.hpp"
+#include "decode_command.hpp"
 #include "strix/serve/json.hpp"
 #include <atomic>
 #include <cuda.h>
@@ -73,15 +75,15 @@ Json session_digest(p::Runtime& runtime,const std::vector<std::uint32_t>& tokens
 Json qualify(p::Runtime& runtime,const std::vector<std::uint32_t>& prompt,unsigned steps,const std::string& export_dir){
     auto rec=Json::object();rec.set("prompt_tokens",std::uint64_t(prompt.size()));rec.set("steps",int(steps));
     strix::Sha256Fast legacy[2];runtime.prefill(prompt,"glm-pf-rtx-native-v1",[&](unsigned rank,unsigned,unsigned,std::span<const std::byte> b){legacy[rank].update(b);});
-    auto parity=Json::object();for(unsigned r=0;r<2;++r)parity.set("rank"+std::to_string(r)+"_sha256",strix::model_content_identity_hex(legacy[r].finalize()));rec.set("legacy_prefill",parity);
-    auto begin=std::chrono::steady_clock::now();runtime.begin_session(prompt);auto inc=Json::array();auto first=session_digest(runtime,prompt);first.set("t",0);inc.push(first);
+    auto parity=Json::object();for(unsigned r=0;r<2;++r)parity.set("rank"+std::to_string(r)+"_sha256",strix::model_content_identity_hex(legacy[r].finalize()));rec.set("legacy_prefill",parity);rec.set("legacy_prefill_row_tile",int(runtime.prefill_row_tile()));
+    auto begin=std::chrono::steady_clock::now();runtime.begin_session(prompt);rec.set("session_row_tile",int(runtime.prefill_row_tile()));auto inc=Json::array();auto first=session_digest(runtime,prompt);first.set("t",0);inc.push(first);
     std::vector<std::uint32_t> generated;auto stepped=Json::array();
     for(unsigned t=1;t<=steps+1;++t){auto r=strix::serve::parse_json(runtime.decode_one(true));generated.push_back(std::uint32_t(r.find("token")->as_int()));stepped.push(r);
         if(t<=steps){auto seq=runtime.session_tokens();auto d=session_digest(runtime,seq,t==steps?export_dir:std::string{});d.set("t",int(t));inc.push(d);}}
     rec.set("incremental_ms",std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-begin).count());rec.set("incremental_exports",inc);rec.set("incremental_steps",stepped);
     auto gen=Json::array();for(auto y:generated)gen.push(std::uint64_t(y));rec.set("generated",gen);
     auto fresh=Json::array();
-    for(unsigned t=1;t<=steps;++t){auto seq=prompt;seq.insert(seq.end(),generated.begin(),generated.begin()+t);runtime.begin_session(seq);auto d=session_digest(runtime,seq);d.set("t",int(t));
+    for(unsigned t=1;t<=steps;++t){auto seq=prompt;seq.insert(seq.end(),generated.begin(),generated.begin()+t);runtime.begin_session(seq);auto d=session_digest(runtime,seq);d.set("t",int(t));d.set("row_tile",int(runtime.prefill_row_tile()));
         auto r=strix::serve::parse_json(runtime.decode_one(true));d.set("next",r);fresh.push(d);}
     rec.set("fresh",fresh);runtime.reset_session();return rec;
 }
@@ -99,19 +101,24 @@ Json compare(p::Runtime& runtime,const std::vector<std::uint32_t>& prompt,unsign
 // Time to first token on the cached tierstream path, cold cache: prefill of the
 // whole prompt (session) + the first decoded token, host wall time.
 // row_tile (optional, <= the allocated tile) runs this prefill at that tile and
-// restores the allocated one after. The prefill state digest (both ranks' exported
+// restores the per-request rule after (0 = auto: rows vs --prefill-tile-crossover). The prefill state digest (both ranks' exported
 // state) is taken untimed between the prefill and the first token, so tiles can be
 // compared bitwise; ttft_s = prefill_s + first_token_s.
 Json ttft(p::Runtime& runtime,const std::vector<std::uint32_t>& prompt,unsigned row_tile=0){
     w::require(runtime.expert_tier()==std::string("tierstream"),"TTFT runs only on the cached tierstream backend");
-    struct Restore {p::Runtime& r;unsigned t;~Restore(){try{r.use_prefill_row_tile(t);}catch(...){}}} restore{runtime,runtime.prefill_row_tile()};
+    struct Restore {p::Runtime& r;unsigned t;~Restore(){try{r.use_prefill_row_tile(t);}catch(...){}}} restore{runtime,runtime.requested_prefill_row_tile()};
     if(row_tile)runtime.use_prefill_row_tile(row_tile);
     runtime.reset_expert_cache(true);const auto begin=std::chrono::steady_clock::now();
     auto prefill=strix::serve::parse_json(runtime.begin_session(prompt));const auto prefilled=std::chrono::steady_clock::now();
     auto state=session_digest(runtime,runtime.session_tokens());
     const auto first_begin=std::chrono::steady_clock::now();auto first=strix::serve::parse_json(runtime.decode_one(false));const auto done=std::chrono::steady_clock::now();
     auto rec=Json::object();rec.set("prompt_tokens",std::uint64_t(prompt.size()));rec.set("backend",runtime.expert_tier());
-    rec.set("row_tile",int(runtime.prefill_row_tile()));rec.set("allocated_row_tile",int(runtime.allocated_prefill_row_tile()));
+    rec.set("row_tile",int(runtime.prefill_row_tile()));rec.set("allocated_row_tile",int(runtime.allocated_prefill_row_tile()));rec.set("row_tile_requested",int(row_tile));
+    rec.set("prefill_tile_crossover",int(runtime.prefill_tile_crossover()));if(auto* c=prefill.find("row_tile_choice"))rec.set("row_tile_choice",*c);
+    // prefill phases: the prefill's own cache counters, per-layer make_resident ms, the in-prefill decode residency restore
+    if(auto* t=prefill.find("prefill_timings")){for(const char* k:{"prefill_cache","make_resident_ms_total","make_resident_ms_per_layer","decode_restore"})if(auto* v=t->find(k))rec.set(k,*v);}
+    // the prefill's own expert cache traffic (file units read during this prefill; cheap: a counter delta)
+    if(auto* c=prefill.find("prefill_expert_cache"))for(const char* k:{"file_reads","file_bytes","file_read_ns","misses","fetched","h2d_bytes"})if(auto* v=c->find(k))rec.set(std::string("prefill_")+k,*v);
     const double prefill_s=std::chrono::duration<double>(prefilled-begin).count(),first_s=std::chrono::duration<double>(done-first_begin).count();
     rec.set("prefill_s",prefill_s);rec.set("first_token_s",first_s);rec.set("ttft_s",prefill_s+first_s);rec.set("prefill_state",state);
     rec.set("token",first.find("token")->as_int());rec.set("prefill",prefill);runtime.reset_session();return rec;
@@ -176,8 +183,8 @@ int main(int argc,char** argv){try{
     // then still refuses a lazy driver below).
     std::string module_loading;{const char* v=std::getenv("CUDA_MODULE_LOADING");
         if(v&&*v)module_loading=std::string(v)+" (environment)";else{_putenv_s("CUDA_MODULE_LOADING","EAGER");module_loading="EAGER (set by the service)";}}
-    std::string cache,model,manifest_hash,key_file,export_dir,prompt_file,identity="glm-pf-rtx-native-v1",bind="127.0.0.1";unsigned port=8097,capacity=8192,tile=0,host_floor_gib=8,max_device_layers=43,max_pinned_layers=43;bool require_file_tier=false,allow=false,graphs=true,self_check=false,legacy_index=false,serial_stage=false,enable_generate=false,decode_commands=false,decode_profile=false;std::vector<std::string> check_prompts;unsigned decode_tokens=0;p::DecodeOptions dopts;bool plan_budget=false,print_effective=false;double device_total_gib=-1,device_free_gib=-1;
-    for(int i=1;i<argc;++i){std::string a=argv[i];if(a=="--require-file-tier")require_file_tier=true;else if(a=="--legacy-fp32-index")legacy_index=true;else if(a=="--serial-stage")serial_stage=true;else if(a=="--self-check-schedule")self_check=true;else if(a=="--allow-gpu")allow=true;else if(a=="--no-graphs")graphs=false;else if(a=="--enable-generate")enable_generate=true;else if(a=="--decode-commands")decode_commands=true;else if(a=="--reference-compare")dopts.reference_compare=true;else if(a=="--plan-budget")plan_budget=true;else if(a=="--allow-pending"){}else if(a=="--print-effective-config")print_effective=true;else if(a=="--decode-profile")decode_profile=true;else {w::require(i+1<argc,"missing option argument");std::string value=argv[++i];if(a=="--profile"){}else if(a=="--cache")cache=value;else if(a=="--model")model=value;else if(a=="--cache-manifest-sha256")manifest_hash=value;else if(a=="--key-file")key_file=value;else if(a=="--export-state")export_dir=value;else if(a=="--prompt"){prompt_file=value;check_prompts.push_back(value);}else if(a=="--identity")identity=value;else if(a=="--decode"){auto n=std::stoul(value);w::require(n>=1&&n<=131072,"decode token count");decode_tokens=unsigned(n);}else if(a=="--expert-tier")dopts.expert_tier=value;else if(a=="--unit-file")dopts.unit_file=value;else if(a=="--vram-total-gib")dopts.vram_total_gib=std::stod(value);else if(a=="--ram-total-gib")dopts.ram_total_gib=std::stod(value);else if(a=="--device-total-gib")device_total_gib=std::stod(value);else if(a=="--device-free-gib")device_free_gib=std::stod(value);else if(a=="--tier-vram-gib")dopts.tier_vram_gib=std::stod(value);else if(a=="--tier-ram-gib")dopts.tier_ram_gib=std::stod(value);
+    std::string cache,model,manifest_hash,key_file,export_dir,prompt_file,identity="glm-pf-rtx-native-v1",bind="127.0.0.1";unsigned port=8097,capacity=8192,tile=0,host_floor_gib=8,max_device_layers=43,max_pinned_layers=43;bool require_file_tier=false,allow=false,graphs=true,self_check=false,legacy_index=false,serial_stage=false,enable_generate=false,decode_commands=false,decode_profile=false;std::vector<std::string> check_prompts;unsigned decode_tokens=0;p::DecodeOptions dopts;bool plan_budget=false,print_effective=false,check_commands=false;double device_total_gib=-1,device_free_gib=-1;
+    for(int i=1;i<argc;++i){std::string a=argv[i];if(a=="--require-file-tier")require_file_tier=true;else if(a=="--legacy-fp32-index")legacy_index=true;else if(a=="--serial-stage")serial_stage=true;else if(a=="--self-check-schedule")self_check=true;else if(a=="--allow-gpu")allow=true;else if(a=="--no-graphs")graphs=false;else if(a=="--enable-generate")enable_generate=true;else if(a=="--decode-commands")decode_commands=true;else if(a=="--reference-compare")dopts.reference_compare=true;else if(a=="--plan-budget")plan_budget=true;else if(a=="--allow-pending"){}else if(a=="--print-effective-config")print_effective=true;else if(a=="--check-decode-commands")check_commands=true;else if(a=="--decode-profile")decode_profile=true;else {w::require(i+1<argc,"missing option argument");std::string value=argv[++i];if(a=="--profile"){}else if(a=="--cache")cache=value;else if(a=="--model")model=value;else if(a=="--cache-manifest-sha256")manifest_hash=value;else if(a=="--key-file")key_file=value;else if(a=="--export-state")export_dir=value;else if(a=="--prompt"){prompt_file=value;check_prompts.push_back(value);}else if(a=="--identity")identity=value;else if(a=="--decode"){auto n=std::stoul(value);w::require(n>=1&&n<=131072,"decode token count");decode_tokens=unsigned(n);}else if(a=="--expert-tier")dopts.expert_tier=value;else if(a=="--unit-file")dopts.unit_file=value;else if(a=="--vram-total-gib")dopts.vram_total_gib=std::stod(value);else if(a=="--ram-total-gib")dopts.ram_total_gib=std::stod(value);else if(a=="--device-total-gib")device_total_gib=std::stod(value);else if(a=="--device-free-gib")device_free_gib=std::stod(value);else if(a=="--tier-vram-gib")dopts.tier_vram_gib=std::stod(value);else if(a=="--tier-ram-gib")dopts.tier_ram_gib=std::stod(value);
         else if(a=="--tier-spare-slots"){dopts.tier_spare_slots=unsigned(std::stoul(value));dopts.tier_spare_permille=0;}else if(a=="--tier-spare-percent"){const double v=std::stod(value);if(!(v>=0&&v<=50))throw std::runtime_error("--tier-spare-percent must be in [0, 50]");dopts.tier_spare_permille=unsigned(v*10+0.5);}else if(a=="--expert-residency")dopts.expert_residency=value;else if(a=="--expert-routes")dopts.expert_routes=value;else if(a=="--routes-out")dopts.routes_out=value;
         else if(a=="--tier-policy"){w::require(value=="lru"||value=="scored"||value=="auto","--tier-policy must be lru, scored or auto");dopts.tier_policy=value;}else if(a=="--tier-predict"){w::require(value=="0"||value=="1","--tier-predict 0|1");dopts.tier_predict=value=="1";}
         else if(a=="--skip-empty-expert-groups"){w::require(value=="0"||value=="1","--skip-empty-expert-groups 0|1");dopts.skip_empty_expert_groups=value=="1";}
@@ -186,6 +193,7 @@ int main(int argc,char** argv){try{
         else if(a=="--restore-decode-residency"){w::require(value=="0"||value=="1","--restore-decode-residency 0|1");dopts.restore_decode_residency=value=="1";}
         else if(a=="--tier-flush-ready"){w::require(value=="0"||value=="1","--tier-flush-ready 0|1");dopts.tier_flush_ready=value=="1";}
         else if(a=="--tier-host-spares")dopts.tier_host_spares=unsigned(std::stoul(value));else if(a=="--tier-staging")dopts.tier_staging=unsigned(std::stoul(value));
+        else if(a=="--prefill-tile-crossover"){w::require(value=="off"||(!value.empty()&&value.find_first_not_of("0123456789")==std::string::npos&&value.size()<=6&&std::stoul(value)<=131072),"--prefill-tile-crossover: rows 0..131072 or off");}
         else if(a=="--disk-prefetch")dopts.disk_prefetch=value=="1";else if(a=="--unit-manifest-sha256")dopts.unit_manifest_sha256=value;else if(a=="--bind")bind=value;else if(a=="--port")port=unsigned(std::stoul(value));else if(a=="--capacity")capacity=unsigned(std::stoul(value));else if(a=="--row-tile")tile=value=="auto"?0:unsigned(std::stoul(value));else if(a=="--max-device-layers")max_device_layers=p::layer_limit(value);else if(a=="--max-pinned-layers")max_pinned_layers=p::layer_limit(value);else if(a=="--host-floor-gib"){auto n=std::stoul(value);w::require(n<=1024,"host floor range");host_floor_gib=unsigned(n);}else throw std::runtime_error("unknown service option");}}
     // --profile default|fast|quality (profile.hpp, the DS RTX resolver's structure): one switch selects every lever;
     // per-lever options stay expert overrides (CLI > environment > profile > builtin). A pending row never refuses the
@@ -200,6 +208,9 @@ int main(int argc,char** argv){try{
     if(auto* e=use("spare_share"))dopts.tier_spare_permille=unsigned(std::stoul(e->value)*10);
     if(auto* e=use("row_tile"))tile=e->value=="auto"?0u:unsigned(std::stoul(e->value));
     if(auto* e=use("cuda_graphs"))graphs=e->value!="off";
+    // Per-request prefill tile crossover (rows; exact): the profile value or --prefill-tile-crossover (0/off = always the allocated tile).
+    unsigned tile_crossover=p::default_prefill_tile_crossover;
+    if(auto* e=prof.find("prefill_tile_crossover"))tile_crossover=e->value=="off"||e->value.empty()?0u:unsigned(std::stoul(e->value));
     // flush_ready: the profile value, or STRIX_GLM_RTX_FLUSH_READY=0|1 (explicit env); --tier-flush-ready was applied above.
     // The exact decode levers: pending (their builtin, off) until qualified; --allow-pending runs them;
     // the environment (STRIX_GLM_RTX_SKIP_EMPTY_GROUPS / _PERSISTENT_DENSE_FP16) sets them explicitly.
@@ -224,9 +235,19 @@ int main(int argc,char** argv){try{
         if(lever=="decode_row_kernels")return p::row_kernels_name(dopts);
         if(lever=="predicted_prefetch")return dopts.tier_predict?"1":"0";
         if(lever=="prefill_tile_large")return tile>=8192?"8192":"off";
+        if(lever=="prefill_tile_crossover")return tile_crossover?std::to_string(tile_crossover)+" rows (below: min(4096, allocated tile); at/above: the allocated tile)":std::string("off (always the allocated tile)");
         if(lever=="dsa_index_mma")return "fp32";
         return {};};
     const std::string profile_json=prof.json(effective);
+    // --check-decode-commands (CPU only, before any model read or CUDA call): every stdin line through the
+    // service's own decode-command parser; one {"ok":true,...} or {"ok":false,"error":...} per line (the suite
+    // feeds it every request shape the harness plans).
+    if(check_commands){for(std::string line;std::getline(std::cin,line);){auto r=Json::object();
+            try{auto c=p::parse_decode_command(strix::serve::parse_json(line));if(!c.row_kernels.empty()){p::DecodeOptions d;p::set_row_kernels_value(d,c.row_kernels);r.set("row_kernels",p::row_kernels_name(d));}
+                if(c.decode_profile>=0)r.set("decode_profile",c.decode_profile==1);r.set("ok",true);r.set("op",c.op);r.set("steps",int(c.steps));r.set("row_tile",int(c.row_tile));r.set("export_dir",!c.export_dir.empty());r.set("order",c.order);}
+            catch(const std::exception& e){r.set("ok",false);r.set("error",std::string(e.what()));}
+            std::cout<<r.dump()<<"\n"<<std::flush;}
+        return 0;}
     if(print_effective){auto pj=strix::serve::parse_json(profile_json);pj.set("cuda_module_loading",module_loading);std::cout<<pj.dump()<<"\n"<<std::flush;return 0;}
     for(const auto& line:prof.notices())std::cerr<<line<<"\n";
     if(plan_budget){
@@ -255,7 +276,7 @@ int main(int argc,char** argv){try{
     std::unique_ptr<p::VerifiedManifest> manifest_file;
     if(!cache.empty())manifest_file=std::make_unique<p::VerifiedManifest>(std::filesystem::path(cache)/"manifest.json",manifest_hash);
     auto startup_begin=std::chrono::steady_clock::now();
-    p::Runtime runtime(model.empty()?cache:model,capacity,tile,!model.empty(),graphs,host_floor_gib,legacy_index,serial_stage,manifest_file.get(),max_device_layers,max_pinned_layers,require_file_tier,decode,dopts);if(decode_profile)runtime.set_decode_profile(true);auto health_value=strix::serve::parse_json(runtime.health());
+    p::Runtime runtime(model.empty()?cache:model,capacity,tile,!model.empty(),graphs,host_floor_gib,legacy_index,serial_stage,manifest_file.get(),max_device_layers,max_pinned_layers,require_file_tier,decode,dopts);if(decode_profile)runtime.set_decode_profile(true);runtime.set_prefill_tile_crossover(tile_crossover);auto health_value=strix::serve::parse_json(runtime.health());
     {CUmoduleLoadingMode mode{};const bool eager=cuModuleGetLoadingMode(&mode)==CUDA_SUCCESS&&mode==CU_MODULE_EAGER_LOADING;
      health_value.set("cuda_module_loading",module_loading+(eager?"; driver: eager":"; driver: lazy"));
      w::require(eager||!decode||dopts.expert_tier!="tierstream","the tierstream decode service needs eager CUDA module loading (unset CUDA_MODULE_LOADING or set it to EAGER): a lazily loaded kernel launched while the cache's wait kernel spins can stall until the wait deadline");}health_value.set("decode_profile",decode_profile);
@@ -278,24 +299,24 @@ int main(int argc,char** argv){try{
         // harness decides (deadline) whether to send another arm.
         auto ready=Json::object();ready.set("ready",true);identity_fields(ready);std::cout<<ready.dump()<<"\n"<<std::flush;
         for(std::string line;std::getline(std::cin,line);){
-            auto cmd=strix::serve::parse_json(line);fields(cmd,{"op","prompt","steps","order","export_dir","row_kernels","decode_profile"});auto op=field(cmd,"op").as_string();if(op=="quit")break;
+            const auto cmd=p::parse_decode_command(strix::serve::parse_json(line));const auto& op=cmd.op;if(op=="quit")break;
             // Optional per-command decode_row_kernels / decode timeline (in-process A/B over one load); they stay set.
-            if(auto* rk=cmd.find("row_kernels"))runtime.set_row_kernels(rk->as_string());
-            if(auto* dp=cmd.find("decode_profile"))runtime.set_decode_profile(dp->as_bool());
-            auto tokens=read_prompt(field(cmd,"prompt").as_string(),capacity);auto steps=unsigned(field(cmd,"steps").as_int());w::require(steps>=1&&steps<=64&&tokens.size()+steps+1<=capacity,"command steps/capacity");
+            if(!cmd.row_kernels.empty())runtime.set_row_kernels(cmd.row_kernels);
+            if(cmd.decode_profile>=0)runtime.set_decode_profile(cmd.decode_profile==1);
+            auto tokens=read_prompt(cmd.prompt,capacity);const auto steps=cmd.steps;w::require(steps>=1&&steps<=64&&tokens.size()+steps+1<=capacity,"command steps/capacity");
             auto begin=std::chrono::steady_clock::now();Json out;
             try{
-            if(op=="qualify")out=qualify(runtime,tokens,steps,cmd.find("export_dir")?cmd.find("export_dir")->as_string():std::string{});
-            else if(op=="bench")out=bench(runtime,tokens,steps,field(cmd,"order"));
-            else if(op=="compare")out=compare(runtime,tokens,steps);else if(op=="ttft")out=ttft(runtime,tokens,cmd.find("row_tile")?unsigned(cmd.find("row_tile")->as_int()):0u);else throw std::runtime_error("unknown decode command");
+            if(op=="qualify")out=qualify(runtime,tokens,steps,cmd.export_dir);
+            else if(op=="bench")out=bench(runtime,tokens,steps,cmd.order);
+            else if(op=="compare")out=compare(runtime,tokens,steps);else if(op=="ttft")out=ttft(runtime,tokens,cmd.row_tile);else throw std::runtime_error("unknown decode command");
             }catch(const std::exception& e){
                 // The worker exits (its cache may be retired); the failure receipt (error, peaks,
                 // expert cache diagnostics) goes to stderr, which the harness keeps as the service log.
-                auto f=failed_receipt(runtime,e.what(),"request:"+op+" (failed)");f.set("op",op);f.set("prompt",field(cmd,"prompt").as_string());
+                auto f=failed_receipt(runtime,e.what(),"request:"+op+" (failed)");f.set("op",op);f.set("prompt",cmd.prompt);
                 std::cerr<<"FAILED-RECEIPT "<<f.dump()<<"\n"<<std::flush;throw;}
             persist_residency(runtime,out);
             out.set("memory",strix::serve::parse_json(runtime.memory_report("request:"+op))); // measured peaks vs the whole-device caps
-            out.set("op",op);out.set("row_kernels",runtime.row_kernels());out.set("prompt",field(cmd,"prompt").as_string());out.set("wall_ms",std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-begin).count());std::cout<<out.dump()<<"\n"<<std::flush;
+            out.set("op",op);out.set("row_kernels",runtime.row_kernels());out.set("prompt",cmd.prompt);out.set("wall_ms",std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-begin).count());std::cout<<out.dump()<<"\n"<<std::flush;
         }
         return 0;
     }

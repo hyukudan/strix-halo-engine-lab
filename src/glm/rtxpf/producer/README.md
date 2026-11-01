@@ -180,6 +180,39 @@ and records the prefill state digest untimed; the full-card harness compares
 8K at tile 8192 vs 2048 and 32K at the allocated tile vs 2048
 (`tile_compare`: BITWISE-EQUAL, or DIFFERENT, which makes the larger tile a
 FAST-profile lever rather than the default).
+Per-request tile (exact; profile row `prefill_tile_crossover`, default 0 =
+always the allocated tile since the one-load tile sweep had the allocated
+8192 fastest at 8K/16K/32K;
+`--prefill-tile-crossover N` re-enables the rule): the service still allocates the
+largest tile the plan admits, and every prefill picks its tile inside it:
+prefill rows (prompt tokens - 1) below the crossover run at min(4096,
+allocated), at and above it at the allocated tile (`schedule.hpp`
+`select_prefill_tile`). Tiles only change the row chunking; the graph
+templates are keyed by first row and rows, so alternating tiles recapture.
+Every receipt records the chosen tile (`row_tile`, `row_tile_choice` in the
+session prefill, `session_row_tile` / fresh `row_tile` in qualify), and
+health reports `prefill_tile_crossover`. `--tile-requests 4096,8192` (full
+card) measures the crossover in ONE service load: the exactness gate, then
+TTFT at 8K/16K/32K (`q8192`, `ttft-16384`, `ttft-32000`) at every tile via
+the per-request `row_tile` (capped at the allocation) plus the auto arm; the
+summary's `tile_requests` holds the per-length bitwise compare and a
+`crossover_estimate`. The per-start `--tile-sweep` below runs its service
+with the crossover off, so each start measures its own tile.
+The `--decode-commands` protocol is parsed by `decode_command.hpp` (fields
+per op: `op`, `prompt`, `steps`; `order` for bench, `export_dir` for qualify,
+`row_tile` for ttft); `--check-decode-commands` runs that parser alone (CPU,
+no model, no CUDA), and the suite feeds it every command the harness's
+`decode_command()` builds for every run mode. Each session prefill reports its
+own expert cache traffic (`prefill_expert_cache`: file reads/bytes, misses,
+copies); TTFT records carry `prefill_file_reads`/`prefill_file_bytes`, and
+the first decode token now counts only its own traffic.
+TTFT records also carry `prefill_cache` (the prefill's own evictions,
+write-backs, make_resident units/bytes/ns), `make_resident_ms_per_layer` /
+`_total`, and `decode_restore`: the decode residency restore that runs
+inside the prefill (wall ms, units, its own evictions/write-backs; `off`
+with `--restore-decode-residency 0`). `--ttft-only` (full card) runs one
+load without the gate: TTFT 8K and 32K at the allocated tile, 2 repeats
+each, compared bitwise (`ttft_repeats`).
 `--tile-sweep 2048,4096,8192` (full card) lets the data pick: one service start
 per tile (`--row-tile T`; `startup_s` per start, later starts recall the
 unit-file record), the exactness gate (q1024 + q8192 + the untimed q1024

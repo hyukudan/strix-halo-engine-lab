@@ -390,6 +390,17 @@ struct Runtime::Impl {
     // Declared first: destroyed last, after every Buffer released its charge.
     struct LedgerOwner {std::unique_ptr<BudgetLedger> l;~LedgerOwner(){if(g_ledger==l.get())g_ledger=nullptr;}} ledger;
     std::filesystem::path cache;std::unique_ptr<Shards> shards;bool graphs;GraphTemplate graph[46][2];std::map<std::string,const Json*> tensor_index;Json manifest;std::string model_hash;unsigned capacity,tile,allocated_tile=0;
+    // Per-request prefill tile (schedule.hpp select_prefill_tile): requested_tile 0 = auto (rows vs the crossover);
+    // a nonzero request (ttft row_tile, at most the allocation) is used as is; the self-check pins its own tiles.
+    unsigned requested_tile=0,tile_crossover=default_prefill_tile_crossover;std::string tile_choice="allocated (startup)";bool pin_tile=false;
+    void choose_tile(std::size_t tokens){if(pin_tile||tokens<2||!allocated_tile)return; /* before the allocation is recorded: the startup tile */const unsigned P=unsigned(tokens-1);
+        if(requested_tile){tile=requested_tile;tile_choice="request override (row_tile)";}else{tile=select_prefill_tile(P,allocated_tile,tile_crossover);tile_choice=prefill_tile_reason(P,tile_crossover);}}
+    // The prefill's own expert cache traffic (start -> before the restore), per-layer make_resident host ms, and the
+    // in-prefill decode residency restore (wall ms, units, its own counters) or "off".
+    void record_prefill_cache(){if(!prefill_via_cache||!ts_tier)return;last_timings.set("prefill_cache",counter_delta(prefill_counters0,prefill_counters1));
+        auto a=Json::array();double total=0;for(double x:ts_tier->acquire_ms){a.push(x);total+=x;}last_timings.set("make_resident_ms_per_layer",a);last_timings.set("make_resident_ms_total",total);
+        if(residency_restore.is_object()&&residency_restore.find("wall_ms"))last_timings.set("decode_restore",residency_restore);else last_timings.set("decode_restore","off");}
+    void record_tile(){last_timings.set("row_tile",int(tile));last_timings.set("allocated_row_tile",int(allocated_tile));last_timings.set("row_tile_choice",tile_choice);last_timings.set("prefill_tile_crossover",int(tile_crossover));}
     Stream compute,h2d,decode;CutlassExecution exec{};std::vector<cudaEvent_t> exec_events;
     std::map<std::string,std::unique_ptr<Blob>> blobs;std::vector<std::unique_ptr<Layer>> layers;
     Ring ring[2];unsigned device_count=0,host_count=0,file_count=0;bool staged[46]{};bool serial_stage=false,legacy_index=false,require_file_tier=false,both_file_rings=false;unsigned file_ring_mask=0;std::uint64_t file_ring_bytes[2]{};
@@ -639,11 +650,13 @@ struct Runtime::Impl {
     }
     DsaIndex index(const std::string& id){if(id=="glm-pf-rtx-native-v1"||id==dsa_identity)return DsaIndex::fp32;for(auto v:{DsaIndex::mma,DsaIndex::mma_proj_fp32_score,DsaIndex::fp32_proj_mma_score,DsaIndex::tf32x3})if(id==dsa_index_identity(v))return v;throw std::runtime_error("unsupported producer identity");}
     void run(std::span<const U32> input,const std::string& identity,const StateSink& sink){
-        try{run_prefill(input,identity,sink);}
+        choose_tile(input.size());
+        try{run_prefill(input,identity,sink);record_tile();record_prefill_cache();}
         catch(const std::exception& e){if(prefill_via_cache&&ts_tier)ts_tier->abort_prefill(e.what());throw;}
         catch(...){if(prefill_via_cache&&ts_tier)ts_tier->abort_prefill("prefill: non-standard exception");throw;}
     }
     void run_prefill(std::span<const U32> input,const std::string& identity,const StateSink& sink){
+        prefill_counters0=cache_counters();if(ts_tier)ts_tier->acquire_ms.clear();
         request_start=std::chrono::steady_clock::now();releases=Json::array();staging_ms=0;file_read_ms=0;file_bytes=0;file_ring_bytes[0]=file_ring_bytes[1]=0;graph_binding_ms=0;
         // Request-scoped reads: do not silently reuse a previous request's last
         // two host rings, which would leave a forced-file repeat unexercised.
@@ -676,7 +689,7 @@ struct Runtime::Impl {
                     }
                     post(X2.as<float>(),part.as<float>(),X.as<float>()+off*4,n);
                 };
-                auto binding=std::to_string(first)+":"+std::to_string(n)+":"+identity+":"+std::to_string(legacy_index)+session_key(P);
+                auto binding=prefill_binding(first,n,identity,legacy_index,session_key(P));
                 if(graphs){auto& g=graph[l][chunk.bucket];g.launch(compute.s,binding,sequence);graph_binding_ms+=g.binding_ms;}else sequence();
             }
             if(prefill_via_cache&&l>=3)prefill_end(l); // close the layer's step, release its units
@@ -696,11 +709,18 @@ struct Runtime::Impl {
         for(unsigned first=0;first<P;first+=mtp_tile){auto chunk=row_tile(first,P,mtp_tile);unsigned n=chunk.rows;auto off=std::size_t(first)*4096;
             auto sequence=[&]{embed<<<unsigned((std::size_t(n)*4096+255)/256),256,0,compute.s>>>(u16("model.language_model.embed_tokens.weight"),tokens.as<U32>()+first+1,embedding.as<float>(),n,1);
                 MtpCall v{n,first,w.m,dstate(45),embedding.as<float>(),hidden.as<float>()+off,part.as<float>(),flag.as<unsigned>(),mode};v.legacy_fp32_index=legacy_index;ck(enqueue_mtp(v,workspace.p,ws_bytes,compute.s,exec));};
-            auto binding=std::to_string(first)+":"+std::to_string(n)+":"+identity+":"+std::to_string(legacy_index)+session_key(P);if(graphs){auto& g=graph[45][chunk.bucket];g.launch(compute.s,binding,sequence);graph_binding_ms+=g.binding_ms;}else sequence();
+            auto binding=prefill_binding(first,n,identity,legacy_index,session_key(P));if(graphs){auto& g=graph[45][chunk.bucket];g.launch(compute.s,binding,sequence);graph_binding_ms+=g.binding_ms;}else sequence();
         }
         if(prefill_via_cache)prefill_end(45);
         // The decode placement again (the prefill's whole-layer sets displaced it); placement only.
-        residency_restore=Json::object();if(prefill_via_cache&&ts_tier&&ts_tier->restore)residency_restore=ts_tier->restore_residency(compute.s);
+        // The decode residency restore runs here, inside the prefill: timed on its own (after the prefill's
+        // queued work drained) with its own cache counters, reported in the prefill timings (decode_restore).
+        residency_restore=Json::object();
+        if(prefill_via_cache&&ts_tier&&ts_tier->restore){ck(cudaStreamSynchronize(compute.s));prefill_counters1=cache_counters();const auto r0=std::chrono::steady_clock::now();
+            residency_restore=ts_tier->restore_residency(compute.s);
+            residency_restore.set("wall_ms",std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-r0).count());
+            residency_restore.set("cache",counter_delta(prefill_counters1,cache_counters()));residency_restore.set("inside_prefill",true);}
+        else prefill_counters1=cache_counters();
         ck(cudaEventRecord(ring[1].retired.e,compute.s));if(!in_session)export_state(45,P,sink);ck(cudaStreamSynchronize(compute.s));ck(cudaGetLastError());
         if(in_session){unsigned bad=0;ck(cudaMemcpy(&bad,flag.p,4,cudaMemcpyDeviceToHost));need(!bad,"nonfinite session prefill");}
         unsigned read_mask=(file_ring_bytes[0]?1u:0u)|(file_ring_bytes[1]?2u:0u);
@@ -737,6 +757,10 @@ struct Runtime::Impl {
     } timeline;
     Json failed_timeline; // the last failed decode token's partial timeline (--decode-profile)
     Json residency_restore; // the last prefill's restore of the decode placement
+    Json prefill_counters0,prefill_counters1; // raw cache counters at prefill start / before the restore
+    Json cache_counters(){return prefill_via_cache&&ts_tier?ts_tier->api->counters():Json::object();}
+    static Json counter_delta(const Json& a,const Json& b){auto j=Json::object();if(!a.is_object()||!b.is_object())return j;
+        for(const auto& [k,v]:b.as_object()){auto* x=a.find(k);if(x&&v.is_number()&&x->is_number()){const auto d=v.as_int()-x->as_int();j.set(k,std::uint64_t(d>0?d:0));}}return j;}
     Json failed_slots;    // the slot census after the last failed decode token (always; best effort)
     void failed_census()noexcept{try{if(ts_tier&&tier.get()==ts_tier)failed_slots=ts_tier->census(compute.s);}catch(...){cudaGetLastError();}}
     bool decode_mode=false;SessionFrontier sess;std::unique_ptr<ExpertCatalog> catalog;std::unique_ptr<UnitBinding> unit_binding;std::unique_ptr<ExpertTier> tier;
@@ -1148,7 +1172,8 @@ struct Runtime::Impl {
         void prefill_begin(unsigned l,Buffer& d,cudaStream_t s){
             ck(cudaStreamSynchronize(s)); // the previous layer's step ended and nothing reads its units any more
             prefill_active=true;
-            const unsigned g=gated_ordinal(l);residency.acquire(site,g);
+            const unsigned g=gated_ordinal(l);const auto a0=std::chrono::steady_clock::now();residency.acquire(site,g);
+            acquire_ms.push_back(std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-a0).count());
             if(!all_ids.p){Charge c(table_part);all_ids.allocate(PrefillResidency::units*4);ck(cudaMemcpy(all_ids.p,residency.ids.data(),all_ids.bytes,cudaMemcpyHostToDevice));}
             site.begin_layer(g);
             try{api->enqueue_begin(s);ck(cudaMemsetAsync(d.p,0,d.bytes,s));
@@ -1163,7 +1188,7 @@ struct Runtime::Impl {
         // restore_decode_residency: after a prefill through the cache, the open placement again
         // (planned_residents). Placement only: outputs unchanged. Every held set is released
         // before returning, also when a set is refused (the restore stops there, recorded).
-        std::vector<std::vector<std::int32_t>> planned;bool restore=false;std::vector<std::uint32_t> open_persistent;
+        std::vector<std::vector<std::int32_t>> planned;bool restore=false;std::vector<std::uint32_t> open_persistent;std::vector<double> acquire_ms; // per prefill layer make_resident host ms
         Json restore_residency(cudaStream_t s){
             auto j=Json::object();const auto begin=std::chrono::steady_clock::now();ck(cudaStreamSynchronize(s));
             std::vector<unsigned> held;std::uint64_t units=0;std::string refused;
@@ -1189,7 +1214,11 @@ struct Runtime::Impl {
         // Same drain/ring reset as a failed prefill before any reuse.
         try{run(input,"glm-pf-rtx-native-v1",StateSink{});}catch(...){in_session=false;session_failed();
             for(auto& r:ring){r.layer=-1;if(r.read.valid())try{r.read.get();}catch(...){}cudaEventRecord(r.retired.e,compute.s);}cudaStreamSynchronize(compute.s);throw;}
-        in_session=false;sess.begin(input);routes_header("session-"+std::to_string(++route_sessions),input.size());auto j=Json::object();j.set("frontier",int(sess.frontier()));j.set("prefill_ms",std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-begin).count());j.set("prefill_timings",last_timings);return j;
+        in_session=false;sess.begin(input);routes_header("session-"+std::to_string(++route_sessions),input.size());auto j=Json::object();j.set("frontier",int(sess.frontier()));j.set("prefill_ms",std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-begin).count());j.set("prefill_timings",last_timings);j.set("row_tile",int(tile));j.set("row_tile_choice",tile_choice);
+        // The prefill's own expert cache traffic (counter delta since the last read: reset_open or the last token), so
+        // file units read during prefill are visible per request and the first decode token counts only its own traffic.
+        if(prefill_via_cache&&ts_tier&&tier.get()==ts_tier){try{j.set("prefill_expert_cache",ts_tier->collect_stats());}catch(const std::exception& e){j.set("prefill_expert_cache_error",std::string(e.what()));}}
+        return j;
     }
     static void predecoded(Call& v,Layer& w){if(w.fp16_g.p){v.fp16_gate=w.fp16_g.as<U16>();v.fp16_up=w.fp16_u.as<U16>();v.fp16_down=w.fp16_d.as<U16>();}}
     void moe(unsigned l,Layer& w,const float* x,float* y){
@@ -1283,7 +1312,11 @@ Runtime::Runtime(const std::string& path,unsigned cap,unsigned rows,bool source,
 Runtime::~Runtime()=default;
 unsigned Runtime::prefill_row_tile()const{return p_->tile;}
 unsigned Runtime::allocated_prefill_row_tile()const{return p_->allocated_tile;}
-void Runtime::use_prefill_row_tile(unsigned t){need(valid_schedule(p_->capacity,t)&&t<=p_->allocated_tile,"row tile must be 32-aligned and at most the allocated tile");p_->tile=t;}
+void Runtime::use_prefill_row_tile(unsigned t){if(!t){p_->requested_tile=0;return;}
+    need(valid_schedule(p_->capacity,t)&&t<=p_->allocated_tile,"row tile must be 32-aligned and at most the allocated tile");p_->requested_tile=t;p_->tile=t;}
+unsigned Runtime::requested_prefill_row_tile()const{return p_->requested_tile;}
+void Runtime::set_prefill_tile_crossover(unsigned rows){need(rows<=max_capacity,"prefill tile crossover: 0 (off) .. 131072 rows");p_->tile_crossover=rows;}
+unsigned Runtime::prefill_tile_crossover()const{return p_->tile_crossover;}
 void Runtime::Impl::prefill_begin(unsigned l){need(ts_tier!=nullptr,"prefill through the cache needs the open tierstream cache");ts_tier->prefill_begin(l,layers[l]->descriptors,compute.s);}
 void Runtime::Impl::prefill_end(unsigned l){need(ts_tier!=nullptr,"prefill through the cache needs the open tierstream cache");ts_tier->prefill_end(l,compute.s);}
 std::string Runtime::plan_budget(const std::string& model,unsigned cap,unsigned rows,unsigned floor_gib,const DecodeOptions& d,std::uint64_t device_total,std::uint64_t device_free){
@@ -1315,9 +1348,10 @@ std::string Runtime::save_residency(){return p_->save_residency();}
 std::string Runtime::model_sha256()const{return p_->model_hash;}
 std::string Runtime::timings()const{return p_->last_timings.dump();}
 std::string Runtime::self_check(std::span<const U32> input,const std::string& identity,unsigned reference_tile){
+    if(p_->allocated_tile)p_->tile=p_->allocated_tile; // the candidate is the allocation, whatever the last request chose
     need(valid_schedule(p_->capacity,reference_tile)&&reference_tile<=p_->tile,"self-check baseline must fit allocated tile");
     struct Snapshot{unsigned rank,layer,component;std::vector<std::byte> bytes;};std::vector<Snapshot> old;
-    const unsigned candidate_tile=p_->tile;const bool candidate_serial=p_->serial_stage,candidate_legacy=p_->legacy_index;auto report=Json::object();report.set("residency",p_->profile);
+    struct Pin{Impl& i;Pin(Impl& x):i(x){i.pin_tile=true;}~Pin(){i.pin_tile=false;}} pin{*p_};const unsigned candidate_tile=p_->tile;const bool candidate_serial=p_->serial_stage,candidate_legacy=p_->legacy_index;auto report=Json::object();report.set("residency",p_->profile);
     strix::Sha256Fast old_hash[2],new_hash[2];
     try{
         p_->tile=reference_tile;p_->serial_stage=true;p_->legacy_index=true;
@@ -1337,7 +1371,7 @@ std::string Runtime::self_check(std::span<const U32> input,const std::string& id
         return report.dump();
     }catch(...){p_->tile=candidate_tile;p_->serial_stage=candidate_serial;p_->legacy_index=candidate_legacy;throw;}
 }
-std::string Runtime::health()const{auto j=Json::object();j.set("status","ready");j.set("identity","glm-pf-rtx-native-v1");j.set("index_identity",dsa_identity);j.set("qualification","DRAFT");j.set("capacity",int(p_->capacity));j.set("row_tile",int(p_->tile));j.set("model_sha256",p_->model_hash);j.set("cache_key",str(p_->manifest,"cache_key"));j.set("residency",p_->profile);
+std::string Runtime::health()const{auto j=Json::object();j.set("status","ready");j.set("identity","glm-pf-rtx-native-v1");j.set("index_identity",dsa_identity);j.set("qualification","DRAFT");j.set("capacity",int(p_->capacity));j.set("row_tile",int(p_->allocated_tile?p_->allocated_tile:p_->tile));j.set("prefill_tile_crossover",int(p_->tile_crossover));j.set("small_prefill_tile",int(std::min(small_prefill_tile,p_->allocated_tile?p_->allocated_tile:p_->tile)));j.set("model_sha256",p_->model_hash);j.set("cache_key",str(p_->manifest,"cache_key"));j.set("residency",p_->profile);
     if(p_->decode_mode){j.set("decode_identity",decode_identity);j.set("generation","greedy only (no sampling fields)");j.set("max_new_tokens_rule","prompt_length + max_new_tokens <= capacity");}
     return j.dump();}
 bool Runtime::decode_capable()const{return p_->decode_mode;}
