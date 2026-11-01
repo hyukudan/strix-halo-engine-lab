@@ -1854,9 +1854,11 @@ inline Options parse_options(
         }
         // A supplied controller or organization owns its route, including values
         // equal to the incumbent defaults. Arithmetic alone can select a prompt pair.
+        // The opt-in route-dot storage candidate is a product arithmetic switch.
         if (argument.starts_with("--") && argument != "--generate" && !argument.starts_with("--generate=") &&
             argument != "--context" && !argument.starts_with("--context=") && argument != "--unqualified-context" &&
-            !argument.starts_with("--optimization-profile") && !argument.starts_with("--numerical-profile") &&
+            !argument.starts_with("--optimization-profile") && argument != "--prefill-moe-route-bf16" &&
+            !argument.starts_with("--numerical-profile") &&
             !argument.starts_with("--prefill-numerical-profile") && !argument.starts_with("--execution-mode") &&
             !argument.starts_with("--residency") && !operational_session_option(argument)) options.route_owned = true;
 

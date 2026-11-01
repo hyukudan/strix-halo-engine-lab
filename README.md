@@ -399,8 +399,8 @@ Batched MTP drafting remains opt-in. The HTTP server sizes its request slots fro
 
 **MoE route BF16 storage — opt-in candidate, pending qualification.** `STRIX_QPF2K_MOE_ROUTE_BF16=1`
 (or `--prefill-moe-route-bf16 on`) stores the per-route MoE dot products in BF16 and widens them exactly in the
-ordered merge. It is bit-changing (prefill storage identity `fp16-v1+moeroute16`), default OFF, and not part of
-any profile until it passes qualification. Same build, plain CLI, three paired runs each: 32K TTFT
+ordered merge. It is bit-changing (prefill storage identity `fp16-v1+moeroute16`), default OFF, and
+applied only by `--profile fast` as a provisional row until it passes qualification. Same build, plain CLI, three paired runs each: 32K TTFT
 **21.83 → 21.15 s (−3.2 %)**, 16K **10.38 → 10.11 s (−2.3 %)**, every pair faster. See the
 [catalog](docs/optimizations.md#qwen-moe-route-bf16).
 

@@ -43,6 +43,13 @@ inline std::string yarn_environment_refusal(const Environment& environment, unsi
         // provenance mask (0..3), not a boolean execution feature.
         if (name == "STRIX_QPF2K_MOE_DEFAULTED" || name == "STRIX_QPF2K_DEFAULTS" ||
             name == "STRIX_PREFILL_F16") continue;
+        // No rotary: DA16 certificate down (src/hip_moe_prefill_da16.inc:140;
+        // src/hip_moe_da16_down_body.inc:103-104) only rounds route-dot storage;
+        // scalar/vector merge/commit (src/hip_moe_experts_launcher.hip:2768,2773;
+        // src/hip_moe_prefill_commit.inc:18,71,115-117) only widens it before FMA.
+        // Match the candidate parser: empty or any 0-prefix is OFF, all other
+        // nonempty values are ON. Its writer/reader/controller guards still apply.
+        if (name == "STRIX_QPF2K_MOE_ROUTE_BF16") continue;
         // Serial decode pool controls: the pool's only rotary site is block_pool_kernel under with_qwen_rotary
         // (qsa_decode_pool_scores, bound to the table by bind_qwen_pool); the self-check re-derives the scores with
         // block_score_kernel from the same table; selection and key storage perform no rotation.
@@ -240,6 +247,9 @@ inline EffectiveConfig resolve_yarn_config(const RequestedOptions& request,
                 apply_default_known_prefill_tails(o, "12");
                 auto validation = organization;
                 apply_numerical_profile(o, model, manifest, content, capabilities.a8_runtime, validation);
+                // Bind storage arithmetic before compiling the admission identities.
+                resolve_moe_route_bf16(o, result.environment, false, capabilities.fp16_operands, result.error);
+                if (!result.error.empty()) return refuse(result.error);
                 validate_effective_options(o,model);
                 result.admission = {{"ple_credit_verification_attempted",memory.verify_ple_credit?1U:0U},{"context_capacity",o.context_tokens},{"window_capacity_rows",rows},{"mtp_enabled",o.mtp.enabled?1U:0U},
                     {"parked_session_bytes",0},{"capture_bytes",0U},{"restore_peak_bytes",0},{"host_reserve_bytes",o.known_prefill_host_headroom},{"verified_ple_credit_bytes",credit},

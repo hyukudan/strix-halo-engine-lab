@@ -409,7 +409,7 @@ El drafting MTP por batch sigue siendo opt-in. El servidor HTTP dimensiona sus s
 **Almacenamiento BF16 de las rutas MoE: candidato opcional (opt-in), pendiente de cualificación.** `STRIX_QPF2K_MOE_ROUTE_BF16=1`
 (o `--prefill-moe-route-bf16 on`) guarda en BF16 los productos escalares MoE de cada ruta y los amplía de forma exacta en
 la fusión ordenada. Cambia bits (identidad de almacenamiento del prefill `fp16-v1+moeroute16`), está desactivado por
-defecto y no forma parte de ningún perfil hasta que supere la cualificación. Misma compilación, CLI simple, tres
+defecto y solo `--profile fast` lo aplica, como fila provisional, hasta que supere la cualificación. Misma compilación, CLI simple, tres
 ejecuciones emparejadas cada una: TTFT a 32K **21.83 → 21.15 s (−3.2 %)**, a 16K **10.38 → 10.11 s (−2.3 %)**, todos
 los pares más rápidos. Véase el [catálogo](docs/optimizations.md#qwen-moe-route-bf16).
 GSQ, más abajo, es un perfil separado que prioriza la velocidad sobre la calidad.

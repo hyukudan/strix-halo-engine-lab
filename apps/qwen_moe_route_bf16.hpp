@@ -40,8 +40,8 @@ inline void resolve_moe_route_bf16(Options& o, const Environment& env, bool gsq,
         if (rows < 16U || rows % 8U) return decline("known-rows tail writers are unsupported");
     for (const auto rows : o.known_prefix_tail_rows)
         if (rows < 16U || rows % 8U) return decline("known-rows tail writers are unsupported");
-    if (o.rotary.mode() != RotaryMode::native)
-        return decline("native rotary required");
+    if (o.rotary.mode() != RotaryMode::native && o.rotary.mode() != RotaryMode::yarn)
+        return decline("native or YaRN rotary required");
     const auto require = [&](const char* name, std::string_view expected) {
         const auto it = env.find(name); return it == env.end() || std::string_view(it->second) == expected;
     };
