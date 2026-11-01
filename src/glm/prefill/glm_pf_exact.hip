@@ -229,7 +229,7 @@ Route route(unsigned rows) {
     if (std::strcmp(p, "2") == 0) return Route::x2;
     if (std::strcmp(p, "3") == 0) return Route::x3;
     if (std::strcmp(p, "4") == 0) return Route::x3r8;
-    if (std::strcmp(p, "auto") == 0) return rows >= x_auto_rows() ? Route::x2 : Route::tm;
+    if (std::strcmp(p, "auto") == 0) return rows >= x_auto_rows() ? Route::x3r8 : Route::tm;
     throw std::invalid_argument("STRIX_GLM_PF_EXACT_X must be 0, 1, 2, 3, 4 or auto");
 }
 unsigned vector_splits(unsigned input, unsigned output, unsigned bits) {

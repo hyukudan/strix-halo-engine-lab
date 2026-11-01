@@ -15,6 +15,7 @@
 #include <array>
 #include <cmath>
 #include <cstdlib>
+#include <cstring>
 #include <fstream>
 #include <map>
 #include <sstream>
@@ -220,7 +221,9 @@ public:
     std::uint64_t admission_margin() const override { return margin_; }
     std::uint64_t margin_ = std::uint64_t{8} << 30;  // set by make_prefill_path (STRIX_GLM_PF_MARGIN_GIB)
 
-    ~GlmPfPath() override = default;  // own_ frees every device buffer
+    ~GlmPfPath() override {  // own_ frees every device buffer
+        for (auto& t : pinned_tables_) (void)hipHostFree(t.second);
+    }
 
     void kda(const KdaLayerWeights& w, KdaState& st, const CallCtx& c, const float* x, float* y) override {
         const unsigned R = rows(c), H = w.heads, C = H * kKdaDim;
@@ -271,6 +274,36 @@ public:
 
     void moe(const MoeLayerWeights& w, const CallCtx& c, const float* x, const std::uint32_t* ids, const float* wts, float* y) override {
         const unsigned R = rows(c), I = I_;
+        if (tb_ == TierB::gemv && xmoe_ws_ != nullptr && c.flag != nullptr && exact_moe::device_plan(R)) {
+            // Device plan: no route download, host grouping or plan upload. The layer's expert table is kept in
+            // pinned host memory and copied in stream order into the workspace table slot.
+            if (w.experts.size() != moe::kExperts) throw std::invalid_argument("glm pf exact moe: expected 288 experts");
+            for (unsigned e = 0; e < moe::kExperts; ++e) exact_table_[e] = exact_slices(w.experts[e], false);
+            const moe::ExpertSlices shared = exact_slices(w.shared, true);
+            constexpr std::size_t kTableBytes = (moe::kExperts + 1) * sizeof(moe::ExpertSlices);
+            auto& pinned = pinned_tables_[&w];
+            const bool fresh = pinned == nullptr;
+            if (fresh) ok(hipHostMalloc(reinterpret_cast<void**>(&pinned), kTableBytes, hipHostMallocDefault), "pinned expert table");
+            if (fresh || std::memcmp(pinned, exact_table_.data(), moe::kExperts * sizeof(moe::ExpertSlices)) != 0 ||
+                std::memcmp(pinned + moe::kExperts, &shared, sizeof(shared)) != 0) {
+                // A previous copy of this table may still be queued: rewrite it only after the stream drains.
+                if (!fresh) ok(hipStreamSynchronize(c.stream), "expert table change");
+                std::memcpy(pinned, exact_table_.data(), moe::kExperts * sizeof(moe::ExpertSlices));
+                std::memcpy(pinned + moe::kExperts, &shared, sizeof(shared));
+            }
+            auto* table = exact_moe::workspace_table(xmoe_ws_);
+            ok(hipMemcpyAsync(table, pinned, kTableBytes, hipMemcpyHostToDevice, c.stream), "expert table");
+            exact_moe::DeviceView v;
+            v.rows = R;
+            v.table = table;
+            v.shared = shared;
+            v.x = x;
+            v.ids = ids;
+            v.weights = wts;
+            v.out = y;
+            exact_moe::enqueue_device(v, xmoe_plan_, xmoe_ws_, xmoe_wsb_, c.stream, c.flag);
+            return;
+        }
         auto& hid = route_ids_;
         auto& hw = route_weights_;
         hid.resize(static_cast<std::size_t>(R) * kTopE);
@@ -478,6 +511,7 @@ private:
     void* xmoe_ws_ = nullptr;
     std::size_t xmoe_wsb_ = 0;
     std::array<moe::ExpertSlices, moe::kExperts> exact_table_{};
+    std::map<const MoeLayerWeights*, moe::ExpertSlices*> pinned_tables_;  // host-pinned [289] per MoE layer
     std::vector<std::uint32_t> route_ids_;
     std::vector<float> route_weights_;
     float *tq_, *tk_, *tv_, *qkv_, *f_, *g_, *b_, *ta_, *tb128_, *scr_, *beta_, *o_, *y1_;

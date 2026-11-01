@@ -75,9 +75,11 @@ inline const std::vector<EnvItem>& env_items() {
          "Measurement: FastMoe matches DefaultMoe bitwise (real TP2 slices); raw-only experts (fits GTT)"},
         // =7 restores the previous large-call core (X2), =3 v3 for every call; the baseline restores v1.
         {"pf-exact-moe-auto", "STRIX_GLM_PF_EXACTMOE_V", "auto", "1", true, true,
-         "Measurement: exact MoE auto (v10 through the X3 core for calls >= 512 rows, v3 with row buckets below), outputs bitwise; 8K TTFT -19.5 % and 1K -15 % vs the X2 core"},
+         "Measurement: exact MoE auto (v11 through the X3 core with row-bucketed tiles for calls >= 128 rows, v3 with row buckets below), outputs bitwise; 8K TTFT -19.5 % and 1K -15 % vs the X2 core"},
+        {"pf-exact-moe-plan", "STRIX_GLM_PF_EXACTMOE_PLAN", "device", "host", false, true,
+         "Measurement: exact MoE device plan (pairs/tiles/groups built on the GPU, byte-equal to the host plan; no route download or host sync per MoE call)"},
         {"pf-exact-x", "STRIX_GLM_PF_EXACT_X", "auto", "0", true, true,
-         "Measurement: exact register-blocked X2 prefill linear core for calls >= 2048 rows (TM16 below), bitwise"},
+         "Measurement: exact X3 prefill linear core (scalar activations, eight rows per wave) for calls >= 2048 rows (TM16 below), bitwise; 8K TTFT -14.3 % vs X2"},
         {"pf-obar-v5", "STRIX_GLM_PF_OBAR", "5", "2", false, true, "Measurement: MLA o-bar v5 exact, 2.9x"},
         {"pf-scores-v4", "STRIX_GLM_PF_SCORES", "4", "2", false, true, "Measurement: MLA scores v4 bitwise 75/0, -8..-17 % vs v3 (=3 restores v3)"},
         {"pf-indexer-v2", "STRIX_GLM_PF_IDX", "2", "1", false, true, "Measurement: indexer v2 -41 %"},

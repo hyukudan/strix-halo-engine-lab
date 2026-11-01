@@ -2947,30 +2947,30 @@ Use raw-only expert storage and the bitwise FastMoe implementation so the TP2 mo
 
 **Engine:** `glm`. **Control:** `STRIX_GLM_PF_EXACTMOE_V`. **Default:** auto.
 
-Grouped expert work in exact chunked prefill; calls of 512 rows or more run routed and shared experts through the X3 core (v10: activations in scalar registers, LDS only for decoded weights, 32- or 64-row tiles chosen per expert group), smaller calls keep the W2 grouped path (v3), whose tiles compute only the smallest row bucket (1/2/4/8/16) covering their rows.
+Grouped expert work in exact chunked prefill; calls of 128 rows or more run routed and shared experts through the X3 core (v11: activations in scalar registers, LDS only for decoded weights; whole 64-row tiles at eight rows per wave and each group's remainder in 1/2/4-row-per-wave buckets), smaller calls keep the W2 grouped path (v3), whose tiles compute only the smallest row bucket (1/2/4/8/16) covering their rows. The expert plan (pairs, tiles, groups) is built on the GPU from the routed ids, so a MoE call needs no route download, host grouping or plan upload.
 
-- **Preconditions:** Exact chunked prefill; auto takes v10 for MoE calls of at least 512 rows (STRIX_GLM_PF_EXACTMOE_X_MIN_ROWS) and v3 below. 7 forces the previous X2 core, 3 forces v3 for every call; STRIX_GLM_PF_EXACTMOE_V3_RCAP=0 makes v3 compute 16 rows per tile again.
+- **Preconditions:** Exact chunked prefill; auto takes v11 for MoE calls of at least 128 rows (STRIX_GLM_PF_EXACTMOE_X_MIN_ROWS) and v3 below. 10 is the X3 core with 32/64-row tiles per group, 7 the previous X2 core, 3 forces v3 for every call; STRIX_GLM_PF_EXACTMOE_V3_RCAP=0 makes v3 compute 16 rows per tile again. The device plan needs a grouped variant (3, 6-11) and 16-row work tiles; STRIX_GLM_PF_EXACTMOE_PLAN=host keeps the host plan.
 - **Automatic selection:** Unset resolves to auto; the app sets it; the resolver reports it in `--print-effective-config`. Explicit values win; `--baseline` sets 1.
 - **Fallback notice:** Below the row threshold v3 runs; invalid values fail. No silent numerical-identity substitution.
-- **Exactness evidence:** Bitwise for all outputs: v7 and v10 route routed and shared experts through the X2 / X3 cores with the v3 expert order, gather/scatter and fold (X3 keeps the X2 DOT2 chains, reduce4 and split order; only the operand source changes); v3 row buckets run the same statements for every live row; MoE outputs, FP16 down inputs and final rows equal v3 for row tails, 2047/2048/2049 and 4096-row calls, concentrated expert groups, signed zero, FP16 subnormals, +-Inf and NaN payloads; on the real pair decode anchors, speculative oracle and 1K/8K/32K prefill logits equal the v3 path. Internal FP32 gate/up workspace NaN payloads may differ in the FP16 overflow case (+Inf meeting -Inf inside a DOT2 chain; not reachable with finite activations); the payload is discarded at the FP16 down input.
-- **Off switch:** STRIX_GLM_PF_EXACTMOE_V=7 (previous large-call core) or 3; STRIX_GLM_PF_EXACTMOE_V3_RCAP=0; 1 for the baseline
-- **Measured gain:** 8K TTFT 25.24 -> 20.32 s (-19.5 %) and 1K 3.75 -> 3.18 s (-15 %) vs STRIX_GLM_PF_EXACTMOE_V=7 in the same run (two pairs each, 8192-row chunks); MoE call at 4096 rows 125.5 -> 73.1 ms; v3 row buckets -18 to -22 % on calls of 33-100 rows
+- **Exactness evidence:** Bitwise for all outputs: v7, v10 and v11 route routed and shared experts through the X2 / X3 cores with the v3 expert order, gather/scatter and fold (X3 keeps the X2 DOT2 chains, reduce4 and split order; only the operand source changes); v3 and v11 row buckets run the same statements for every live row; the device plan's pairs, tiles and groups are byte-equal to the host plan for every gated call, and invalid ids raise the engine's flag instead of throwing; MoE outputs, FP16 down inputs and final rows equal v3 for row tails, 2047/2048/2049 and 4096-row calls, concentrated expert groups, signed zero, FP16 subnormals, +-Inf and NaN payloads; on the real pair decode anchors, speculative oracle and 1K/8K/32K prefill logits equal the v3 path. Internal FP32 gate/up workspace NaN payloads may differ in the FP16 overflow case (+Inf meeting -Inf inside a DOT2 chain; not reachable with finite activations); the payload is discarded at the FP16 down input.
+- **Off switch:** STRIX_GLM_PF_EXACTMOE_V=10, 7 (previous large-call cores) or 3; STRIX_GLM_PF_EXACTMOE_V3_RCAP=0; STRIX_GLM_PF_EXACTMOE_PLAN=host; 1 for the baseline
+- **Measured gain:** 8K TTFT 25.24 -> 20.32 s (-19.5 %) and 1K 3.75 -> 3.18 s (-15 %) vs STRIX_GLM_PF_EXACTMOE_V=7 in the same run (two pairs each, 8192-row chunks); MoE call v7 -> v11: 128 rows 17.2 -> 10.1 ms, 512 rows 29.2 -> 16.9 ms, 4096 rows 127 -> 75 ms; v3 row buckets -18 to -22 % on calls of 33-100 rows
 - **Implementation / evidence:** [resolver](../apps/glm_rank_defaults.hpp), [MoE](../src/glm/prefill/glm_pf_exact_moe.hip), [tests](../tests/hip_glm_pf_exact_moe_tests.hip)
 
 <a id="glm-pf-exact-x"></a>
 
-### Exact prefill X2 linear core
+### Exact prefill X3 linear core
 
 **Engine:** `glm`. **Control:** `STRIX_GLM_PF_EXACT_X`. **Default:** auto.
 
-Register-blocked exact prefill linear: LDS-decoded weights reused over 32 rows, 4x4 output x row blocks per lane, next-stage register prefetch (X2).
+Register-blocked exact prefill linear: LDS-decoded weights reused over 64 rows, activations read with scalar loads, four outputs x eight rows per lane (X3; X2 = LDS activations over 32 rows with next-stage register prefetch).
 
-- **Preconditions:** Exact chunked prefill linears; auto takes the X2 core for calls of at least 2048 rows (STRIX_GLM_PF_EXACT_X_MIN_ROWS) and the TM16 path below. 1 or 2 force X or X2 for every call.
+- **Preconditions:** Exact chunked prefill linears; auto takes the X3 core with eight rows per wave for calls of at least 2048 rows (STRIX_GLM_PF_EXACT_X_MIN_ROWS) and the TM16 path below. 1, 2, 3 or 4 force X, X2, X3 (four rows per wave) or X3 (eight) for every call.
 - **Automatic selection:** Unset resolves to auto; the app sets it; the resolver reports it in `--print-effective-config`. Explicit values win; `--baseline` sets 0.
 - **Fallback notice:** Below the row threshold the TM16 path runs; invalid values fail. No silent numerical-identity substitution.
-- **Exactness evidence:** Bitwise: X/X2 keep the TM path's DOT2 chains, fold and split order; dense outputs byte-equal TM for row tails 1..32, 2047/2048/2049 and 4096-row calls, signed zero, FP16 subnormals, +-Inf and NaN payloads; on the real pair decode anchors, speculative oracle and 1K/8K/32K prefill logits equal the X=0 path.
-- **Off switch:** STRIX_GLM_PF_EXACT_X=0
-- **Measured gain:** 8K TTFT 29.59 -> 27.93 s (-5.6 %) vs STRIX_GLM_PF_EXACT_X=0 in the same run, 32K 120.3 s, 1K unchanged (3.78 vs 3.84 s, two pairs); logits bitwise on both ranks
+- **Exactness evidence:** Bitwise: X/X2/X3 keep the TM path's DOT2 chains, fold and split order (X3 reads the wave-uniform activation pairs with scalar loads; LDS holds only decoded weights); dense outputs byte-equal TM for row tails 1..32, 2047/2048/2049 and 4096-row calls, signed zero, FP16 subnormals, +-Inf and NaN payloads; on the real pair decode anchors, speculative oracle and 1K/8K/32K prefill logits equal the X=0 path.
+- **Off switch:** STRIX_GLM_PF_EXACT_X=2 (previous X2 core) or 0
+- **Measured gain:** X3: 8K TTFT 21.42 -> 18.37 s (-14.3 %) vs STRIX_GLM_PF_EXACT_X=2 in the same run (two pairs, MoE v10 in both arms); X2 earlier: 8K 29.59 -> 27.93 s (-5.6 %) vs X=0; logits bitwise on both ranks
 - **Implementation / evidence:** [resolver](../apps/glm_rank_defaults.hpp), [X core](../src/glm/prefill/glm_pf_exact_x.hpp), [tests](../tests/hip_glm_pf_exact_tests.hip)
 
 <a id="glm-pf-obar-v5"></a>

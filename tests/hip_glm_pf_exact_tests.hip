@@ -220,13 +220,13 @@ void test_routes() {
             const auto expected = !value || std::strcmp(value, "0") == 0 ? E::Route::tm :
                 std::strcmp(value, "1") == 0 ? E::Route::x :
                 std::strcmp(value, "3") == 0 ? E::Route::x3 : std::strcmp(value, "4") == 0 ? E::Route::x3r8 :
-                std::strcmp(value, "2") == 0 || rows >= 2048 ? E::Route::x2 : E::Route::tm;
+                std::strcmp(value, "2") == 0 ? E::Route::x2 : rows >= 2048 ? E::Route::x3r8 : E::Route::tm;
             check(E::route(rows) == expected, std::string("route X=") + (value ? value : "unset") +
                   " rows=" + std::to_string(rows));
         }
     }
     x.set("auto"); threshold.set("100");
-    check(E::route(99) == E::Route::tm && E::route(100) == E::Route::x2, "route auto threshold=100 at 99/100");
+    check(E::route(99) == E::Route::tm && E::route(100) == E::Route::x3r8, "route auto threshold=100 at 99/100");
     for (const char* bad : {"0", "65537", "abc"}) {
         threshold.set(bad);
         bool threw = false;
@@ -460,7 +460,7 @@ void test_shape(Ctx& cx, const std::string& dir, const Shape& sh, bool synthetic
                     hok(hipMemsetAsync(yb.p, 0xff, (Mmax + extra) * ys * 4U, cx.hs), "poison output");
                     hok(hipMemsetAsync(ew.p, 0xff, E::workspace_bytes(Mmax, l.I), cx.hs), "poison workspace");
                     const auto expected_route = tm == 0 ? E::Route::x : tm == 3 ? E::Route::x3 : tm == 4 ? E::Route::x3r8 :
-                        tm == 1 || (tm == 2 && m >= E::x_auto_rows()) ? E::Route::x2 : E::Route::tm;
+                        tm == 1 ? E::Route::x2 : (tm == 2 && m >= E::x_auto_rows()) ? E::Route::x3r8 : E::Route::tm;
                     const bool selected = E::route(m) == expected_route; // Same environment as the launch below.
                     E::linear_rows(raw_form ? raw : prepared, xb.f() + xo * xs + 3U, xs,
                                    yb.f() + yo * ys + 5U, ys, m, ew.p, E::workspace_bytes(Mmax, l.I), cx.hs);
@@ -492,7 +492,7 @@ void test_shape(Ctx& cx, const std::string& dir, const Shape& sh, bool synthetic
                         unsigned offset = 0;
                         for (unsigned nr : {2047U, 2049U}) {
                             const auto expected = tm == 0 ? E::Route::x : tm == 3 ? E::Route::x3 : tm == 4 ? E::Route::x3r8 :
-                                tm == 1 || (tm == 2 && nr >= E::x_auto_rows()) ? E::Route::x2 : E::Route::tm;
+                                tm == 1 ? E::Route::x2 : (tm == 2 && nr >= E::x_auto_rows()) ? E::Route::x3r8 : E::Route::tm;
                             split_routes = split_routes && E::route(nr) == expected;
                             E::linear_rows(prepared, xb.f() + (xo + offset) * xs + 3U, xs,
                                            yb.f() + (yo + offset) * ys + 5U, ys, nr,
