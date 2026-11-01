@@ -15,6 +15,12 @@ namespace strix::minimax::serve {
 namespace sv = strix::serve;
 // Session commands share the ordinary control channel and run only at an idle boundary.
 // HTTP threads read published metadata or enqueue bounded tasks; the engine owns the cache/device.
+// A stop token ends the request even when it is also the last allowed token; otherwise reaching the limit (max_tokens
+// or the end of the context) is 'length'.
+inline const char* session_finish(std::span<const std::uint32_t> generated, std::size_t limit, std::span<const std::uint32_t> stops) {
+    if (!generated.empty() && std::find(stops.begin(), stops.end(), generated.back()) != stops.end()) return "stop";
+    return generated.size() < limit ? "stop" : "length";
+}
 struct SessionTasks {
     struct Task { std::string body; std::promise<sv::Json> result; bool dispatched = false; };
     std::mutex mutex;
@@ -112,10 +118,15 @@ sv::Json session_execute(Engine& eng, Runtime& rt,
             auto ids = sv::Json::array();
             std::vector<std::uint32_t> stops;
             for (const auto& t : req.find("stops")->as_array()) stops.push_back(static_cast<std::uint32_t>(t.as_int()));
-            const auto n = static_cast<unsigned>(req.find("count")->as_int());
-            for (const auto token : rt.generate(n, {}, stops, publish)) ids.push(sv::Json(std::uint64_t(token)));
+            // Generation stops at the end of the context like a max_tokens limit (finish "length").
+            const auto room = rt.generation_room();
+            if (room == 0) { rt.park(id); throw sv::SessionApiError(400, "context_length_exceeded", "the session fills the context; nothing can be generated"); }
+            const auto n = static_cast<unsigned>(std::min<std::uint64_t>(static_cast<std::uint64_t>(req.find("count")->as_int()), room));
+            const auto generated = rt.generate(n, {}, stops, publish);
+            for (const auto token : generated) ids.push(sv::Json(std::uint64_t(token)));
             rt.park(id);
             reply.set("token_ids", std::move(ids)); reply.set("hit", sv::Json(hit));
+            reply.set("finish", sv::Json(session_finish(generated, n, stops)));
         } else if (op == "checkpoint" || op == "ram_checkpoint") {
             // Finished requests are parked; resume before checkpointing their committed state.
             rt.restore_auto(id);

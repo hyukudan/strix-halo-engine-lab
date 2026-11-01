@@ -67,7 +67,8 @@ inline void session_inventory_live(std::map<std::string, Json>& rows, const std:
     rows.insert_or_assign(id, std::move(row));
 }
 inline SessionApiError session_failure(const std::string& message) {
-    for (const auto& item : {std::pair{"session_not_found", 404}, {"session_budget", 507}, {"session_incompatible", 409}, {"session_corrupt", 422}})
+    for (const auto& item : {std::pair{"session_not_found", 404}, {"session_budget", 507}, {"session_incompatible", 409}, {"session_corrupt", 422},
+                             {"context_length_exceeded", 400}})
         if (message.find(item.first) != std::string::npos) return {item.second, item.first, message};
     if (message.find("budget") != std::string::npos || message.find("allocation") != std::string::npos) return {507, "session_budget", message};
     if (message.find("checksum") != std::string::npos || message.find("truncated") != std::string::npos) return {422, "session_corrupt", message};

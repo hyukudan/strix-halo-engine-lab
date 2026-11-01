@@ -25,16 +25,27 @@ int main() {
         refuses("POST","/v1/sessions/a/checkpoint","{",400);
         for (const auto& id : {std::string(), std::string("bad.id"), std::string("%2e"), std::string(129,'x')})
             refuses("POST","/v1/sessions/"+id+"/park","",400);
-        for (const auto& pair : {std::pair{"session_not_found",404}, {"session_budget",507}, {"session_incompatible",409}, {"session_corrupt",422}}) {
+        for (const auto& pair : {std::pair{"session_not_found",404}, {"session_budget",507}, {"session_incompatible",409}, {"session_corrupt",422},
+                                 {"context_length_exceeded",400}}) {
             const auto error = session_failure(pair.first); check(error.status == pair.second && error.code == pair.first);
             check(session_error(error.code,error.what()).find("error")->find("message")->is_string());
         }
+        // Runtime capacity refusals arrive as prefixed exception text and become a typed client error.
+        const auto full = session_failure("MiniMax session: context_length_exceeded: prompt does not fit the context");
+        check(full.status == 400 && full.code == "context_length_exceeded");
         const auto peer_refusal = session_error("session_budget", "peer session precondition failed", 507);
         check(peer_refusal.find("_status")->as_int() == 507);
         check(peer_refusal.find("error")->find("code")->as_string() == "session_budget");
         // The HTTP writer uses _status and serializes only the public error.
         check(!session_error("session_budget", "peer session precondition failed").find("_status"));
         namespace ms = strix::minimax::serve;
+        {
+            const std::vector<std::uint32_t> stops{7}, ended{1, 2, 7}, limited{1, 2, 3}, early{1, 7};
+            check(std::string(ms::session_finish(ended, 3, stops)) == "stop");      // stop token exactly at the limit
+            check(std::string(ms::session_finish(limited, 3, stops)) == "length");  // limit (max_tokens or context) reached
+            check(std::string(ms::session_finish(early, 3, stops)) == "stop");      // stopped before the limit
+            check(std::string(ms::session_finish(limited, 3, {})) == "length");
+        }
         ms::SessionTasks tasks;
         auto list = Json::object(), stats = Json::object();
         list.set("sessions", Json::array()); stats.set("parked", Json(std::uint64_t(7)));

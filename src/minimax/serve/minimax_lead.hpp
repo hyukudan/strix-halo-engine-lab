@@ -525,7 +525,9 @@ private:
                 std::vector<std::uint32_t> ids;
                 for (const auto& id : reply.find("token_ids")->as_array()) ids.push_back(static_cast<std::uint32_t>(id.as_int()));
                 stats.generated_tokens = ids.size(); stats.cached_tokens = reply.find("hit")->as_bool() ? stats.prompt_tokens : 0;
-                stats.finish = t->ticket->cancelled() ? "cancelled" : ids.size() < t->job.max_tokens ? "stop" : "length";
+                const auto* finish = reply.find("finish");
+                stats.finish = t->ticket->cancelled() ? "cancelled" : finish ? finish->as_string() :
+                               ids.size() < t->job.max_tokens ? "stop" : "length";
                 queue_.finish(*t, stats);
             }
             return true;

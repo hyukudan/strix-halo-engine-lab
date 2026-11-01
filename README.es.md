@@ -983,6 +983,9 @@ El [resolutor](src/minimax/engine/mm_defaults.cpp) activa el conjunto de producc
 incluido el modo de prefill MSA 5. `strix-minimax-serve` usa la admisión automática estructural de DSpark con assets
 locales compatibles; las peticiones elegibles sin contención pueden usar draft, mientras que las peticiones en competencia/agrupadas o no admitidas
 se quedan en simple. Véase [admisión y cualificación](docs/engine/serving/dspark-auto-qualification.md).
+Una petición de sesión con nombre que no cabe en el contexto devuelve HTTP 400 `context_length_exceeded` (la
+sesión sigue aparcada); la generación se detiene al final del contexto con el motivo de fin `length`. Véase
+[caché de sesiones](docs/minimax/session-cache.md).
 
 <a id="glm-pair"></a>
 

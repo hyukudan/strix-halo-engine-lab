@@ -96,10 +96,10 @@ bool Runtime::begin_request(const std::string& id, std::span<const std::uint32_t
   return false;
 }
 void Runtime::start(std::span<const std::uint32_t> prompt) {
-  need(!prompt.empty() && prompt.size() < eng_.capacity() &&
-           std::all_of(prompt.begin(), prompt.end(),
-                       [](auto t) { return t < 200064; }),
-       "prompt bounds/tokens");
+  need(!prompt.empty() && std::all_of(prompt.begin(), prompt.end(),
+                                       [](auto t) { return t < 200064; }),
+       "prompt tokens");
+  need(prompt.size() < eng_.capacity(), "context_length_exceeded: prompt does not fit the context");
   eng_.set_taps(dd_ != nullptr);
   if (dd_)
     dd_->reset_context(slot_);
@@ -154,7 +154,7 @@ void Runtime::suffix(std::span<const std::uint32_t> input) {
        "suffix token");
   need(frontier_.consumed < eng_.capacity() &&
            input.size() < eng_.capacity() - frontier_.consumed,
-       "suffix bounds");
+       "context_length_exceeded: session history plus the new turn does not fit the context");
   // Consume the pending token only when it was emitted; after a suffix the
   // pending prediction is un-emitted.
   if (frontier_.control) {
@@ -183,14 +183,18 @@ std::uint32_t Runtime::draft() {
   auto other = eng_.peer2(std::bit_cast<std::uint32_t>(mine.value), mine.id);
   return dspark::combine(mine, {std::bit_cast<float>(other[0]), other[1]}).id;
 }
+std::uint64_t Runtime::generation_room() const {
+  // generate() keeps a DSpark block plus one row of headroom past the last generated token.
+  const auto used = frontier_.consumed + dspark::block + 1;
+  return active_ && used < eng_.capacity() ? eng_.capacity() - used : 0;
+}
 std::vector<std::uint32_t> Runtime::generate(unsigned count,
                                              const std::string &dump,
     std::span<const std::uint32_t> stops,
     const std::function<bool(std::span<const std::uint32_t>)>& publish) {
   const auto begin = Clock::now();
-  need(active_ && count > 0 &&
-           frontier_.consumed + count + dspark::block < eng_.capacity(),
-       "generation bounds");
+  need(active_ && count > 0, "generation bounds");
+  need(count <= generation_room(), "context_length_exceeded: no room left in the context to generate");
   std::ofstream ids, lg;
   if (!dump.empty()) {
     std::filesystem::create_directories(
