@@ -2393,10 +2393,14 @@ int main(int argc, char** arguments) {
                     "fast profile applies provisional storage through native resolver without permission");
                 expect(moe_prefill_storage_name(got.options.prefill_moe_route_bf16) ==
                     std::string_view(enabled ? "fp16-v1+moeroute16" : "fp16-v1") &&
-                    got.options.product_profile.qualification() == (enabled ? "qualification in progress: moe_route_bf16" : "qualified"),
+                    got.options.product_profile.qualification() == (enabled ? (allow ?
+                        "qualification in progress: moe_route_bf16; unqualified: gdn_fp16_chunk" : "qualification in progress: moe_route_bf16")
+                        : "qualified"),
                     "product receipt and actual storage identity agree");
                 const auto pair = numerical_profile_pair(got.options);
-                expect(got.prefill_option_mask == kPrefillOptionsReady,
+                // fast with --allow-pending also runs the runnable GDN chunk candidate.
+                const unsigned gdn = enabled && allow ? prefill_option_bit(PrefillOption::gdn_fp16_chunk) : 0U;
+                expect(got.prefill_option_mask == (kPrefillOptionsReady | gdn),
                     "every product profile retains the governed HC default");
                 const auto composed = prefill_arithmetic_identity(pair, got.prefill_option_mask, false);
                 for (const bool master : {false, true}) {
@@ -2404,14 +2408,14 @@ int main(int argc, char** arguments) {
                     if (master) restricted.options.prefill_exact_fp16 = true;
                     else restricted.options.prefill_disabled = prefill_option_bit(PrefillOption::hc_output_wmma);
                     const auto off = resolve(restricted, memory);
-                    expect(off.error.empty() && off.prefill_option_mask == 0U &&
+                    expect(off.error.empty() && off.prefill_option_mask == (master ? 0U : gdn) &&
                         off.options.product_profile.json() == got.options.product_profile.json() &&
                         numerical_profile_pair(off.options) == pair,
                         "HC restriction preserves product profile and BF16 route admission");
                     expect(prefill_arithmetic_identity(pair, off.prefill_option_mask, false) != composed,
                         "HC restriction changes composed arithmetic identity independently of BF16 storage");
                     const auto report = serve::parse_json(effective_config_json(off));
-                    expect(report.find("prefill_identity")->as_string() == "fp16-v1" &&
+                    expect(report.find("prefill_identity")->as_string() == (master || !gdn ? "fp16-v1" : "fp16-v1+gdnchunk16") &&
                         report.find("prefill_moe_route_bf16")->as_bool() == enabled,
                         "inspection reports independent HC and BF16 controls");
                 }

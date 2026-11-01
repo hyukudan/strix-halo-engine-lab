@@ -2436,6 +2436,15 @@ if(STRIX_ENABLE_HIP_RUNTIME)
         strix_target_warnings(strix-hip-gdn-wide-projection-tests)
         add_test(NAME strix-hip-gdn-wide-projection-tests COMMAND strix-hip-gdn-wide-projection-tests)
 
+        add_executable(strix-hip-gdn-fp16-chunk-tests tests/hip_gdn_fp16_chunk_tests.hip)
+        set_target_properties(strix-hip-gdn-fp16-chunk-tests PROPERTIES
+            HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES gfx1151)
+        target_compile_options(strix-hip-gdn-fp16-chunk-tests PRIVATE
+            -mno-wavefrontsize64 -fno-fast-math -ffp-contract=off -fdenormal-fp-math=ieee)
+        strix_target_warnings(strix-hip-gdn-fp16-chunk-tests)
+        add_test(NAME strix-hip-gdn-fp16-chunk-tests COMMAND strix-hip-gdn-fp16-chunk-tests)
+        set_tests_properties(strix-hip-gdn-fp16-chunk-tests PROPERTIES SKIP_RETURN_CODE 77)
+
         add_executable(strix-hip-q8-rows-projection-tests tests/hip_q8_rows_projection_tests.hip)
         set_target_properties(strix-hip-q8-rows-projection-tests PROPERTIES
             HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHITECTURES}")

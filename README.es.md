@@ -419,6 +419,16 @@ ejecuciones emparejadas cada una: TTFT a 32K **21.83 → 21.15 s (−3.2 %)**, a
 los pares más rápidos. A 262K (YaRN factor 2, ruta en serie, `--profile default` frente a `--profile fast`, dos pares
 intercalados) el prefill pasó de **191.2 a 185.7 s (−2.9 %, 1,371 → 1,412 tok/s)**, cada ejecución fast más rápida
 que cada ejecución default; el decode no cambia. Véase el [catálogo](docs/optimizations.md#qwen-moe-route-bf16).
+**GDN por bloques en WMMA FP16 en el prefill: candidato opcional (opt-in), pendiente de cualificación.**
+`STRIX_QPF2K_GDN_FP16_CHUNK=1` (o `--gdn-fp16-chunk 1`) ejecuta la convolución, la recurrencia y la norma con puerta de
+las capas GDN en bloques de 32 filas sobre WMMA FP16 con acumulación FP32 y estado FP32 (identidad
+`qwen-gdn-fp16-chunk rev 2`; la proyección de entrada escribe entonces sus valores, ya redondeados a BF16, como filas
+BF16). Cambia bits y está desactivado por defecto; `--profile fast` lo lista como pendiente hasta que supere la
+cualificación de fidelidad (`--allow-pending` lo ejecuta, marcado `unqualified`). Misma compilación, CLI simple, pares
+intercalados: 4K **2.42 → 2.36 s (−2.6 %)**, 32K **19.61 → 18.81 s (−4.1 %)**, 262K **177.9 → 170.0 s (−4.5 %, 1,471 → 1,539 tok/s; un par)**; los primeros tokens
+generados coinciden con la ruta exacta. Sin la variable o con `=0` se usa la ruta exacta. Véase el
+[catálogo](docs/optimizations.md#qwen-gdn-chunk).
+
 GSQ, más abajo, es un perfil separado que prioriza la velocidad sobre la calidad.
 
 <a id="gsq-opt-in-speed-over-quality-profile"></a>
@@ -960,7 +970,8 @@ Un solo interruptor selecciona un perfil de producto para Qwen (CLI, `--http-ser
   stderr informa del cambio de bits y del estado de la cualificación. En las demás rutas, incluidas HTTP y MTP,
   la fila queda `pending` con el motivo del rechazo, mantiene el almacenamiento FP32 y no se exporta ni se marca como aplicada.
   El presupuesto de selección de atención, la recurrencia por fragmentos FP16 y la cabeza de salida FP16 siguen pendientes
-  y mantienen sus rutas internas, con un aviso cada una.
+  y mantienen sus rutas internas, con un aviso cada una; la fila de la recurrencia por fragmentos FP16 ya es ejecutable
+  (`--allow-pending` la ejecuta, marcada `unqualified`).
 - `quality`: no hay paquete de calidad para este modelo, así que ejecuta `default` y lo indica en el recibo.
 
 `--allow-pending` (o `STRIX_QWEN_PROFILE_ALLOW_PENDING=1`) ejecuta las opciones realmente pendientes cuyo código está

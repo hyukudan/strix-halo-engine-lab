@@ -164,6 +164,15 @@ int main() try {
         check(!(off.prefill_option_mask & idx), "index off and master dominate opt-in");
     }
     check(resolve(plain, {{"STRIX_PREFILL_INDEX_PROJ_WMMA","0"}}).prefill_option_mask == 1U, "index env off preserves base");
+    const auto gdn = prefill_option_bit(PrefillOption::gdn_fp16_chunk);
+    check(parse_prefill_option_list("gdn_fp16_chunk") == gdn && !(kPrefillOptionsReady & gdn) && (kPrefillOptionsCandidates & gdn),
+        "GDN chunk option recognized as candidate, not READY");
+    const Environment gdn_optin{{"STRIX_QPF2K_GDN_FP16_CHUNK","1"}};
+    const auto gdn_on = resolve(plain,gdn_optin);
+    check(gdn_on.prefill_option_mask == (1U | gdn) && prefill_identity_name(gdn_on.prefill_option_mask) == "fp16-v1+hcout16+gdnchunk16",
+        "GDN chunk explicit opt-in names its identity");
+    for (const auto* flag : {"--prefill-disable=gdn_fp16_chunk", "--prefill-exact-fp16"})
+        check(!(resolve(parse({"decoder", "model.gguf", "1",flag}),gdn_optin).prefill_option_mask & gdn), "GDN chunk off and master dominate opt-in");
     check(resolve(plain, {{"STRIX_PREFILL_INDEX_PROJ_WMMA","1"},{"STRIX_PREFILL_EXACT_FP16","1"}}).prefill_option_mask == 0U, "env master dominates opt-in");
     check(prefill_identity_fields(index_on.prefill_option_mask).find("index_proj_wmma") != std::string::npos, "effective identity reports candidate");
     check(prefill_identity_hash(1U) == UINT64_C(0xee2cd64684149069) &&

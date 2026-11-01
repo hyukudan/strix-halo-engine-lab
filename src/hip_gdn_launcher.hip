@@ -6,6 +6,7 @@
 #endif
 #include "strix/hip_gdn_launcher.hpp"
 #include "strix/qpersist.hpp"
+#include "strix/prefill_identity.hpp"
 #include "strix/known_window_cohort.hpp"
 #include "hip_q8_rows_gemv.hpp"
 #include "hip_dense_f16_tiled.hpp"
@@ -1148,6 +1149,24 @@ struct GdnInputTiledSite {
         unsigned m; std::uint32_t row;
         static_cast<void>(q8_rows::segment_row(segments, out, width, m, row));
         reinterpret_cast<float*>(output0[m] + r * output_stride)[row] = round_bf16(value);
+    }
+};
+// FAST route qwen-gdn-fp16-chunk: GdnInputTiledSite's outputs as BF16 bits in one compact row (q | k | v, then z at
+// z_offset); GdnInputTiledSite stores these same BF16 values as FP32.
+struct GdnInputTiled16Site {
+    using Input = std::uint16_t;
+    static constexpr unsigned qpf2k_pre_form = GdnInputTiledSite::qpf2k_pre_form;
+    const unsigned char* input0;
+    std::uint64_t input_stride;
+    q8_rows::Segments segments;
+    std::uint32_t width, outputs;
+    std::uint16_t* output;
+    std::uint64_t output_stride;
+    std::uint32_t z_offset;
+    __device__ void store(std::uint32_t out, std::uint32_t r, float value) const {
+        unsigned m; std::uint32_t row;
+        static_cast<void>(q8_rows::segment_row(segments, out, width, m, row));
+        output[r * output_stride + (m ? z_offset + row : row)] = float_to_bf16(value);
     }
 };
 struct GdnOutputTiledSite {
@@ -3112,6 +3131,55 @@ void gdn_prefill_norm_rows_kernel(GdnPrefillRows rows, std::uint32_t count, std:
 }
 #include "hip_gdn_prefill_scan.inc"
 #include "hip_gdn_qpf2k_prefill.inc"
+#include "hip_gdn_fp16_chunk.inc"
+// qwen-gdn-fp16-chunk row epilogue: gdn_prefill_norm_rows_kernel's gated RMSNorm expression (and dense A8) for one row
+// and head of the chunked core, or with core16 the fused core's CORE16 staging (RNE FP16 of the same normed value, no
+// FP32 core row, one overflow count per aligned 8-lane group). z arrives prefetched; weights once per CTA.
+struct GdnFp16NormEpilogue {
+    static constexpr bool kRows = true;
+    GdnPrefillRows rows;
+    const void* norm_weights;
+    SmallWeightKind norm_kind;
+    std::uint32_t head_dim, value_heads;
+    float epsilon;
+    std::int8_t* a8_codes;
+    float* a8_deltas;
+    _Float16* core16;
+    std::uint32_t core16_pitch;
+    unsigned* core16_overflow;
+    __device__ void weights(unsigned lane, float (&w)[4]) const {
+#pragma unroll
+        for (std::uint32_t part = 0; part < 4U; ++part) w[part] = load_small(norm_weights, norm_kind, part * 32U + lane);
+    }
+    __device__ void operator()(std::uint64_t row, unsigned head, const float (&value)[4], const float (&z)[4],
+        const float (&w)[4]) const {
+        const auto lane = static_cast<std::uint32_t>(threadIdx.x) % 32U;
+        const std::uint64_t base = row * rows.stride + head * head_dim;
+        float square[4];
+#pragma unroll
+        for (std::uint32_t part = 0; part < 4U; ++part) square[part] = value[part] * value[part];
+        const float inv = rsqrtf(gdn_window_key_sum(square) / static_cast<float>(head_dim) + epsilon);
+#pragma unroll
+        for (std::uint32_t part = 0; part < 4U; ++part) {
+            const auto channel = part * 32U + lane;
+            const float gate_value = 1.0F / (1.0F + expf(-z[part]));
+            const float result = value[part] * inv * w[part] * gate_value;
+            if (core16) {
+                core16[row * core16_pitch + head * head_dim + channel] = static_cast<_Float16>(result);
+                const auto bad = __ballot(isfinite(result) && !(fabsf(result) <= 65504.0F));
+                if (bad != 0ULL && lane % 8U == 0U && ((bad >> lane) & 0xffULL) != 0ULL) atomicAdd(core16_overflow, 1U);
+                continue;
+            }
+            rows.core[base + channel] = result;
+            if (a8_codes) {
+                constexpr std::uint64_t pitch = q8_rows::kDenseA8WideRows;
+                const std::uint64_t width = static_cast<std::uint64_t>(value_heads) * head_dim, feature = head * head_dim + channel;
+                q8_rows::dense_a8_quantize_lane(result, a8_codes + row * width + feature,
+                    a8_deltas + row / pitch * (width / 32U * pitch) + feature / 32U * pitch + row % pitch);
+            }
+        }
+    }
+};
 // Quantized out-projection input of whole 256-row launches (the norm kernel writes it; prefill steps of up to
 // kGdnFusedA8Rows rows at most kDenseA8MaxWidth wide).
 constexpr std::uint32_t kGdnFusedA8Rows = 2048U;
@@ -5014,6 +5082,26 @@ unsigned qpf2k_gdn_parts() {
     }();
     return qpf2k::suppressed(qpf2k::Item::gdn) ? 0U : parts;
 }
+// STRIX_QPF2K_GDN_FP16_CHUNK=1 (default OFF; FAST, bit-changing; prefill option gdn_fp16_chunk, identity tag gdnchunk16):
+// numerical revision qwen-gdn-fp16-chunk rev 2 (hip_gdn_fp16_chunk.inc) replaces conv + recurrence + gated norm of the
+// prefill row route with the chunked WMMA route. STRIX_PREFILL_EXACT_FP16=1 / --prefill-disable gdn_fp16_chunk turn it
+// off; ignored under the baseline, for GSQ checkpoints and in the GDN check modes (they compare exact routes); shapes it
+// cannot take keep the exact route.
+bool gdn_fp16_chunk_enabled(const GdnKnownWindowRow& first, const GdnPrefillRows& rows) {
+    static const bool requested = [] {
+        const auto on = [](const char* name) { const char* v = std::getenv(name); return v && v[0] == '1'; };
+        return strix::prefill_option_enabled(strix::PrefillOption::gdn_fp16_chunk) && !on("STRIX_QPF2K_GDN_CHECK") &&
+            !on("STRIX_GDN_PREFILL_CHECK");
+    }();
+    if (!requested || qpf2k::baseline || qpf2k::gsq_model) return false;
+    const bool fits = gdn_fp16_chunk_supported(first.head_dim, first.key_heads, first.value_heads, rows);
+    static std::once_flag once;
+    std::call_once(once, [&] {
+        std::fprintf(stderr, fits ? "GDN FAST lever qwen-gdn-fp16-chunk rev 2: ON (bit-changing; STRIX_QPF2K_GDN_FP16_CHUNK=0 is exact)\n"
+                                  : "GDN FAST lever qwen-gdn-fp16-chunk rev 2: requested, shape not supported -> exact recurrence\n");
+    });
+    return fits;
+}
 // Fused core resources: the norm exchange (per stream) and the q/k segment-boundary side buffer.
 constexpr unsigned kQpf2kSegments = 8U, kQpf2kCoreWaves = 4U;
 struct Qpf2kCoreScratch { qpf2k_gdn::NormExchange exchange{}; std::uint16_t* side = nullptr; std::uint64_t side_bytes = 0; };
@@ -5155,10 +5243,13 @@ _Float16* qpf2k_core16_scratch(hipStream_t stream, std::uint32_t rows) {
 }
 void enqueue_gdn_prefill_core_rows(const std::vector<std::array<GdnKnownWindowRow, 8U>>& tiles,
     const GdnPrefillRows& strided, std::uint64_t input_stride, const HipGdnLauncherConfig& config, const q8_rows::DenseA8Slot* fused_a8,
-    unsigned qpf2k = qpf2k_gdn_parts(), Qpf2kCore16Route* core16 = nullptr) {
+    unsigned qpf2k = qpf2k_gdn_parts(), Qpf2kCore16Route* core16 = nullptr, const std::uint16_t* x16 = nullptr) {
     const auto stream = hip_execution_stream();
     const auto& first = tiles[0][0];
     const auto count = static_cast<std::uint32_t>(tiles.size() * 8U);
+    // The FAST chunked route replaces conv + recurrence + norm after the gates: no fused qpf2k core.
+    const bool fp16_chunk = gdn_fp16_chunk_enabled(first, strided);
+    if (fp16_chunk) qpf2k &= ~4U;
     // STRIX_GDN_GATE_HEADS: beta/alpha outputs per gates block (1|2|4, default 2; must divide the head count).
     static const auto gate_heads_env = gdn_prefill_env("STRIX_GDN_GATE_HEADS", 2U, {1U, 2U, 4U});
     const auto gate_heads = first.value_heads % gate_heads_env ? 1U : gate_heads_env;
@@ -5390,6 +5481,36 @@ void enqueue_gdn_prefill_core_rows(const std::vector<std::array<GdnKnownWindowRo
             return;
         }
     }
+    // FAST lever qwen-gdn-fp16-chunk rev 2: conv fused into the chunk prep (q/k) and the scan (v), the gated norm
+    // (+ A8 / CORE16) into the scan.
+    if (fp16_chunk) {
+        auto* matrix = reinterpret_cast<float*>(first.matrix_state.address);
+        auto* conv_state = reinterpret_cast<std::uint16_t*>(first.conv_state.address);
+        const std::uint64_t x16_width = static_cast<std::uint64_t>(first.conv_width) + first.value_width;
+        const void* conv_w = reinterpret_cast<const void*>(first.tensors.conv.runtime->address);
+        const auto conv_kind = small_weight_kind(first.tensors.conv.manifest->ggml_type);
+        GdnFp16NormEpilogue epilogue{strided, reinterpret_cast<const void*>(first.tensors.norm.runtime->address),
+            small_weight_kind(first.tensors.norm.manifest->ggml_type), first.head_dim, first.value_heads,
+            config.model.rms_norm_epsilon, fused_a8 ? fused_a8->codes : nullptr, fused_a8 ? fused_a8->deltas : nullptr,
+            nullptr, 0U, nullptr};
+        if (core16 && !fused_a8) {
+            core16->a16 = qpf2k_core16_scratch(stream, count);
+            epilogue.core16 = core16->a16;
+            epilogue.core16_pitch = q8_rows::tiled::scratch_pitch(6144U);
+            epilogue.core16_overflow = q8_rows::dense_f16_overflow_counter();
+        }
+        if (config.recurrent_storage == GdnRecurrentStorage::value_key)
+            launch_gdn_fp16_chunk_conv_fast<GdnRecurrentStorage::value_key>(strided, count, matrix, conv_state, conv_w, conv_kind,
+                first.key_heads, first.value_heads, config.model.gdn_qk_l2_epsilon, stream, epilogue, x16, x16_width, first.conv_width);
+        else launch_gdn_fp16_chunk_conv_fast<GdnRecurrentStorage::key_value>(strided, count, matrix, conv_state, conv_w, conv_kind,
+            first.key_heads, first.value_heads, config.model.gdn_qk_l2_epsilon, stream, epilogue, x16, x16_width, first.conv_width);
+        qpf2k_gdn_witness(x16 ? (epilogue.core16 ? "recurrence qwen-gdn-fp16-chunk rev 2 (BF16 rows, conv prep + staged scan + norm/CORE16)"
+                                                 : "recurrence qwen-gdn-fp16-chunk rev 2 (BF16 rows, conv prep + staged scan + norm)")
+                              : (epilogue.core16 ? "recurrence qwen-gdn-fp16-chunk rev 2 (conv prep + staged scan + norm/CORE16)"
+                                                 : "recurrence qwen-gdn-fp16-chunk rev 2 (conv prep + staged scan + norm)"), count);
+        check_hip(hipGetLastError(), "GDN fp16 chunk conv/recurrence/norm launch");
+        return;
+    }
     hipLaunchKernelGGL(HIP_KERNEL_NAME(gdn_prefill_conv_kernel<8U, 32U>), dim3(first.key_heads * 2U + first.value_heads),
         dim3(256), 0, stream, strided, count, reinterpret_cast<std::uint16_t*>(first.conv_state.address),
         reinterpret_cast<const void*>(first.tensors.conv.runtime->address), small_weight_kind(first.tensors.conv.manifest->ggml_type),
@@ -5619,6 +5740,16 @@ void enqueue_gdn_prefill_rows(const std::vector<std::array<GdnKnownWindowRow, 8U
     // bits; anything else keeps the launches below.
     const bool tiled_rows = config.dense_f16_prefill && !config.dense_g64_prefill && wide >= 32U && count % 32U == 0U &&
         count >= q8_rows::tiled::min_rows();
+    // Causal core. STRIX_GDN_PREFILL_ROWS=0 keeps the per-tile gates and the serial prepare/recurrence/norm
+    // kernels; STRIX_GDN_PREFILL_CHECK=1 runs both on the same inputs and compares every written byte.
+    static const bool rows_env = [] { const char* v = std::getenv("STRIX_GDN_PREFILL_ROWS"); return !v || v[0] != '0'; }();
+    static const bool check = [] { const char* v = std::getenv("STRIX_GDN_PREFILL_CHECK"); return v && v[0] == '1'; }();
+    const auto input_stride = gdn_prefill_input_stride(tiles);
+    const bool rows = rows_env && input_stride && gdn_prefill_rows_shape(first, strided, count);
+    static const bool qpf2k_check = [] { const char* v = std::getenv("STRIX_QPF2K_GDN_CHECK"); return v && v[0] == '1'; }();
+    // FAST route qwen-gdn-fp16-chunk on the row path: the tiled input projection writes BF16 rows for it.
+    const bool fast16 = rows && !check && !qpf2k_check && gdn_fp16_chunk_enabled(first, strided);
+    const std::uint16_t* x16 = nullptr;
     const auto tiled_in = [&]() {
         if (!tiled_rows || !q8_rows::tiled::site_enabled(1U) || count < q8_rows::tiled::min_rows(1U)) return false;
         std::uint64_t si = 0, sq = 0, sz = 0;
@@ -5626,6 +5757,22 @@ void enqueue_gdn_prefill_rows(const std::vector<std::array<GdnKnownWindowRow, 8U
             !uniform(0U, count, [](const auto& row) { return static_cast<const void*>(row.workspace.qkv); }, sq) ||
             !uniform(0U, count, [](const auto& row) { return static_cast<const void*>(row.workspace.z); }, sz) || sq != sz)
             return false;
+        if (fast16) {
+            // FAST route: the same values as BF16 rows only (its kernels are the only readers of qkv / z).
+            GdnInputTiled16Site in16{};
+            in16.segments = q8_rows::segments({{reinterpret_cast<const void*>(first.tensors.qkv.runtime->address), first.conv_width},
+                {reinterpret_cast<const void*>(first.tensors.z.runtime->address), first.value_width}});
+            in16.width = first.hidden; in16.outputs = first.conv_width + first.value_width;
+            in16.input0 = reinterpret_cast<const unsigned char*>(tiles[0][0].input.address); in16.input_stride = si;
+            in16.output_stride = in16.outputs; in16.z_offset = first.conv_width;
+            if (q8_rows::tiled::supported(in16, count)) {
+                in16.output = gdn_fp16_chunk_input16(stream, count, in16.outputs);
+                q8_rows::tiled::launch(in16, count, stream);
+                check_hip(hipGetLastError(), "GDN prefill tiled BF16 input projection launch");
+                x16 = in16.output;
+                return true;
+            }
+        }
         GdnInputTiledSite in{};
         in.segments = q8_rows::segments({{reinterpret_cast<const void*>(first.tensors.qkv.runtime->address), first.conv_width},
             {reinterpret_cast<const void*>(first.tensors.z.runtime->address), first.value_width}});
@@ -5714,13 +5861,6 @@ void enqueue_gdn_prefill_rows(const std::vector<std::array<GdnKnownWindowRow, 8U
         }
     };
     if (!tiled_in()) each_width(project_in, strided_in);
-    // Causal core. STRIX_GDN_PREFILL_ROWS=0 keeps the per-tile gates and the serial prepare/recurrence/norm
-    // kernels; STRIX_GDN_PREFILL_CHECK=1 runs both on the same inputs and compares every written byte.
-    static const bool rows_env = [] { const char* v = std::getenv("STRIX_GDN_PREFILL_ROWS"); return !v || v[0] != '0'; }();
-    static const bool check = [] { const char* v = std::getenv("STRIX_GDN_PREFILL_CHECK"); return v && v[0] == '1'; }();
-    const auto input_stride = gdn_prefill_input_stride(tiles);
-    const bool rows = rows_env && input_stride && gdn_prefill_rows_shape(first, strided, count);
-    static const bool qpf2k_check = [] { const char* v = std::getenv("STRIX_QPF2K_GDN_CHECK"); return v && v[0] == '1'; }();
     // Decide before the producer: check modes and every fallback must retain FP32 core rows.
     const bool core16_candidate = rows && !check && !qpf2k_check && prepare_core16();
     if (rows && qpf2k_check && qpf2k_gdn_parts() && !check) {
@@ -5747,7 +5887,7 @@ void enqueue_gdn_prefill_rows(const std::vector<std::array<GdnKnownWindowRow, 8U
         if (rows) {
             if (fused_slot.codes) fused_a8 = &fused_slot;
             enqueue_gdn_prefill_core_rows(tiles, strided, input_stride, config, fused_a8, qpf2k_gdn_parts(),
-                core16_candidate ? &core16 : nullptr);
+                core16_candidate ? &core16 : nullptr, x16);
         } else enqueue_gdn_prefill_core_tiles(tiles, strided, config);
         if (!tiled_out()) each_width(project_out, none);
         return;
