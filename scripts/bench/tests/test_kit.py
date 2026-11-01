@@ -406,6 +406,35 @@ class KitTests(unittest.TestCase):
             k.finalize(self.out)
             self.assertEqual(actual_read(self.out / 'results.json')['exactness'][0]['verdict'], 'MISMATCH')
 
+    def test_finalize_exit_status(self):
+        fixture = k.read(HERE / 'fixtures/results.json')
+        identity = copy.deepcopy(fixture)
+        for key in ('measurements', 'exactness', 'prompts'):
+            identity.pop(key)
+        k.dump(self.out / 'identity.json', identity)
+        k.dump(self.out / 'prompts.json', fixture['prompts'])
+        sample = {'prompt_id': 'code', 'mode': 'plain', 'generate_length': 2, 'actual_tokens': 2,
+                  'token_ids_sha256': k.id_hash([1, 2]), 'engine_digest': None,
+                  'values': [40], 'unit': 'tok/s', 'log': 'fixture.log'}
+        def run(samples):
+            for name in ('results.json', 'results.md'):
+                (self.out / name).unlink(missing_ok=True)
+            (self.out / 'samples.jsonl').write_text(''.join(json.dumps(s) + '\n' for s in samples), encoding='utf-8')
+            rc = k.main(['finalize', str(self.out), '0'])
+            self.assertTrue((self.out / 'results.md').is_file())
+            return rc, k.read(self.out / 'results.json')
+        # NO-REFERENCE is not a failure: measure-only and candidate runs exit 0.
+        rc, d = run([sample])
+        self.assertEqual(rc, 0)
+        self.assertEqual(d['status'], 'complete')
+        self.assertEqual([e['verdict'] for e in d['exactness']], ['NO-REFERENCE'])
+        # Spec tokens differing from plain tokens are a MISMATCH: results written, nonzero exit.
+        spec = dict(sample, mode='spec', token_ids_sha256=k.id_hash([2, 3]))
+        rc, d = run([sample, spec])
+        self.assertEqual(rc, 1)
+        self.assertEqual(d['status'], 'mismatch')
+        self.assertEqual([e['verdict'] for e in d['exactness']], ['NO-REFERENCE', 'MISMATCH'])
+
     def test_redaction(self):
         address = '.'.join(['1'] * 4)
         mac = ':'.join(['ab'] * 6)

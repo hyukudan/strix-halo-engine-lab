@@ -468,7 +468,7 @@ The exact single-run contract is [results.schema.json](../scripts/bench/results.
 | Peer inventory | Null or `repo_commit`, `tracked_dirty`, `binary_sha256s`, `model_files`, `models_verified`, `build_options`, `hardware`; no connection details |
 
 `all --json` returns `{"schema_version":1,"engines":[...]}`. Elements are full successful
-results (internal pair engine names include `-pair`), skip records such as
+or `status:"mismatch"` results (internal pair engine names include `-pair`), skip records such as
 `{"engine":"glm","skipped":true,"reasons":["pair requires --peer HOST"]}`, or failed-child
 records `{"engine":"qwen","returncode":1,"dry_run":false}`. `all --md` concatenates child
 Markdown; skips go to stderr. There is no aggregate result file. `all --dry-run --json`
@@ -478,7 +478,10 @@ JSON. Only list-json, check-json and run-json/md have these supported document c
 Exit 0 means successful dispatch/check/run/report (including all skipped). Validation,
 prerequisite, parsing and pair failures normally return 1; native failures may propagate.
 GNU timeout normally returns 124, or 137 after forced KILL; handled interrupts use 130/143.
-`status:"mismatch"` alone does not force nonzero unless candidate writing fails. Inspect
+`run` returns 1 when any exactness verdict is MISMATCH (`status:"mismatch"`), after
+`results.json`/`results.md` are written and the requested JSON/Markdown is printed, so
+`bench.sh run ... && publish` stops; `all` then returns 1. NO-REFERENCE and EXACT verdicts keep
+exit 0, so measure-only and `--write-refs` candidate runs still succeed. Inspect
 status, models_verified, exactness and skips as well as exit status. Initialized failures
 may retain a partial failed result; early failures may leave no document. `report DIR` and
 `python3 scripts/bench/lib/kit.py validate DIR/results.json` validate before use.

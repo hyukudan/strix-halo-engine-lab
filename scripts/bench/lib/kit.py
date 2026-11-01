@@ -1109,6 +1109,9 @@ def main(args):
             d['measurements'].extend(read(out / 'http-measurements.json'))
             dump(out / 'results.json', d)
             report(out / 'results.json')
+        # Results are written first; a MISMATCH verdict must still fail `run`.
+        if read(out / 'results.json')['status'] == 'mismatch':
+            return 1
     elif action == 'report':
         report(Path(args[1]))
     elif action == 'validate':

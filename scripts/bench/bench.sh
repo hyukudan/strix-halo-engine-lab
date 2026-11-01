@@ -134,7 +134,13 @@ fi
 py initialize "$out"
 py prompts "$out"
 profile_run
-py finalize "$out" "$write_refs"
+# A stale result from a reused --out must never be printed for this run.
+rm -f -- "$out/results.json" "$out/results.md"
+finalize_rc=0
+py finalize "$out" "$write_refs" || finalize_rc=$?
+[[ -f $out/results.json ]] || exit "$finalize_rc"
 printf 'Report: %s/results.md\n' "$out" >&2
 if [[ $json == 1 || $md == 1 ]]; then exec 1>&3; fi
 if [[ $json == 1 ]]; then cat "$out/results.json"; elif [[ $md == 1 ]]; then cat "$out/results.md"; fi
+# A MISMATCH verdict (or failed candidate writing) exits 1 after the report is printed.
+exit "$finalize_rc"
