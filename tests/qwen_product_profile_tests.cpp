@@ -67,6 +67,8 @@ void product() {
             const auto json = strix::serve::parse_json_unique(r.json());
             check(json.find("profile")->as_string() == pr::name(profile), "JSON profile name");
             check(json.find("unqualified")->size() == 0U, "provisional is distinct from unqualified rows");
+            check(json.find("provisional")->size() == (provisional ? 1U : 0U) &&
+                (!provisional || json.find("provisional")->as_array()[0].as_string() == "moe_route_bf16"), "JSON provisional list");
             check(json.find("pending")->size() == r.entries.size() - (provisional ? 1U : 0U), "JSON pending rows");
             for (const auto& entry : r.entries) {
                 if (provisional && entry.lever->name == "moe_route_bf16") {

@@ -105,7 +105,7 @@ struct Resolution {
     }
     std::string json() const {
         auto out = serve::Json::object(), rows = serve::Json::object();
-        auto pending = serve::Json::array(), unqualified = serve::Json::array();
+        auto pending = serve::Json::array(), provisional = serve::Json::array(), unqualified = serve::Json::array();
         out.set("profile", serve::Json(name(profile)));
         out.set("qualification", serve::Json(qualification()));
         if (profile == Name::quality) out.set("note", serve::Json("quality: no quality rows for this model, using default"));
@@ -127,10 +127,12 @@ struct Resolution {
                 if (!entry.reason.empty()) item.set("reason", serve::Json(entry.reason));
                 pending.push(std::move(item));
             }
+            if (entry.status == Status::provisional) provisional.push(serve::Json(std::string(lever.name)));
             if (entry.status == Status::unqualified) unqualified.push(serve::Json(std::string(lever.name)));
         }
         out.set("levers", std::move(rows));
         out.set("pending", std::move(pending));
+        out.set("provisional", std::move(provisional));
         out.set("unqualified", std::move(unqualified));
         return out.dump();
     }
