@@ -18,7 +18,8 @@ Route route(unsigned rows);  // STRIX_GLM_PF_EXACT_X and auto threshold, read pe
 void linear_rows(const engine::Linear& l, const float* x, std::size_t x_stride,
                  float* y, std::size_t y_stride, unsigned rows, void* ws,
                  std::size_t ws_bytes, hipStream_t stream);
-// STRIX_GLM_PF_EXACT_X=1 selects X; =2 X2 with register prefetch; =auto X2 for calls >= x_auto_rows().
+// STRIX_GLM_PF_EXACT_X=1 selects X; =2 X2 with register prefetch; =3/4 X3 (scalar activations, four/eight rows per
+// wave); =auto X3 with eight rows per wave for calls >= x_auto_rows().
 hipFuncAttributes x_resources(const engine::Linear& l, unsigned variant = 1);
 std::size_t scratch_bytes(const engine::Linear& l, unsigned tm);
 }  // namespace strix::glm::pf::exact

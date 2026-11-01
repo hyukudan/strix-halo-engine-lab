@@ -14,8 +14,9 @@ namespace {
 namespace d = moe::dev;
 constexpr unsigned H = moe::kHidden, I = moe::kInter, E = moe::kExperts, P = 9;
 constexpr std::size_t align256(std::size_t x) { return (x + 255) & ~std::size_t{255}; }
+constexpr unsigned kPlanRows = 256;  // rows per device-plan block (one thread per row)
 struct Layout {
-    std::size_t table = 0, pairs, tiles, groups, gu, at, output, input, bytes;
+    std::size_t table = 0, pairs, tiles, groups, gu, at, output, input, plan, bytes;
     explicit Layout(unsigned rows) {
         if (rows == 0 || rows > 65536) throw std::invalid_argument("exact moe: max_rows must be 1..65536");
         const std::size_t n = std::size_t{rows} * P;
@@ -27,7 +28,11 @@ struct Layout {
         output = at + align256(n * I * sizeof(std::uint16_t));
         input = output + align256(n * H * sizeof(float));
         // V2/V3 cache both matrix-specific gate/up transforms; V1 leaves this region untouched.
-        bytes = input + align256(n * 2 * H * sizeof(std::uint16_t));
+        plan = input + align256(n * 2 * H * sizeof(std::uint16_t));
+        // Device plan: per-block expert counts/prefixes, per-assignment ranks, expert offsets and the tile count.
+        const std::size_t blocks = (rows + kPlanRows - 1U) / kPlanRows;
+        bytes = plan + align256(blocks * E * sizeof(unsigned)) + align256(std::size_t{rows} * 8U * sizeof(unsigned)) +
+                align256((E + 2) * sizeof(unsigned));
     }
 };
 void ok(hipError_t e, const char* what) {
@@ -48,6 +53,7 @@ struct Args {
     float* output;
     _Float16* input;
     unsigned rcap;  // v3 row buckets on (1) / off (0)
+    const unsigned* ntiles;  // device tile count (device plan) or null (host plan: grid == tiles)
 };
 // One global load from the device table (entry E = the shared expert): selecting a member of a by-value / kernarg
 // struct with a runtime index forces the struct to scratch (328 B/lane in the first draft).
@@ -60,6 +66,7 @@ __device__ __forceinline__ moe::Exl3 matrix(const Args& a, unsigned expert, unsi
 // Each wave transforms one H128 block exactly once per (pair, matrix). The
 // materialized FP16 values have the same boundary as the V1 LDS staging.
 __global__ void input_kernel(Args a) {
+    if (a.ntiles && blockIdx.y >= *a.ntiles) return;
     const Tile tile = a.tiles[blockIdx.y];
     const unsigned wave = threadIdx.x >> 5U, lane = threadIdx.x & 31U;
     const unsigned m = blockIdx.z;
@@ -408,6 +415,63 @@ void launch_linear_s2(Args a, unsigned shared_bits, hipStream_t stream) {
         linear_kernel_s2<4, Down, true><<<dim3(N / 128U, (a.rows + kSharedRows - 1U) / kSharedRows, Down ? 1U : 2U), 256, 0, stream>>>(a);
     ok(hipGetLastError(), "X3 shared linear");
 }
+// V11: each group (or 64-row shared slice) runs its whole 64-row tiles with eight rows per wave in one kernel and
+// its remainder in a second kernel with the smallest bucket per tile (1, 2 or 4 rows per wave, at most 32 rows per
+// tile), so computed row chains track the live rows. The two kernels write disjoint rows; per-row arithmetic is X3's.
+template<int Bits, bool Down, bool Shared>
+__global__ __launch_bounds__(256) void linear_kernel_s3_full(Args a) {
+    __shared__ exact_x::StorageS<8> lds;
+    const unsigned expert = Shared ? E : blockIdx.y;
+    const Tile group = a.groups[expert];
+    const unsigned m = Down ? 2U : blockIdx.z;
+    const unsigned r0 = Shared ? blockIdx.y * kSharedRows : 0U;
+    if (r0 >= group.count) return;
+    const unsigned span = Shared ? (group.count - r0 < kSharedRows ? group.count - r0 : kSharedRows) : group.count;
+    const unsigned full = span / 64U * 64U;
+    if (full == 0) return;  // uniform, before any barrier
+    const auto w = *d::uniform((&a.experts[expert].gate) + m);
+    for (unsigned r = r0; r < r0 + full; r += 64U)
+        exact_x::core_s<Bits, 8>(w, XRows<Down>{a, Tile{expert, group.first + r, 64U}, m}, 64U, Down ? 4U : 32U, false, lds);
+}
+template<int Bits, bool Down, bool Shared>
+__global__ __launch_bounds__(256) void linear_kernel_s3_tail(Args a) {
+    __shared__ exact_x::StorageS<4> lds;
+    const unsigned expert = Shared ? E : blockIdx.y;
+    const Tile group = a.groups[expert];
+    const unsigned m = Down ? 2U : blockIdx.z;
+    const unsigned r0 = Shared ? blockIdx.y * kSharedRows : 0U;
+    if (r0 >= group.count) return;
+    const unsigned span = Shared ? (group.count - r0 < kSharedRows ? group.count - r0 : kSharedRows) : group.count;
+    const unsigned full = span / 64U * 64U;
+    if (full == span) return;  // uniform, before any barrier
+    const auto w = *d::uniform((&a.experts[expert].gate) + m);
+    auto& one = *reinterpret_cast<exact_x::StorageS<1>*>(&lds);
+    auto& two = *reinterpret_cast<exact_x::StorageS<2>*>(&lds);
+    for (unsigned r = r0 + full; r < r0 + span;) {
+        const unsigned n = r0 + span - r < 32U ? r0 + span - r : 32U;
+        const Tile tile{expert, group.first + r, n};
+        if (n <= 8U) exact_x::core_s<Bits, 1>(w, XRows<Down>{a, tile, m}, n, Down ? 4U : 32U, false, one);
+        else if (n <= 16U) exact_x::core_s<Bits, 2>(w, XRows<Down>{a, tile, m}, n, Down ? 4U : 32U, false, two);
+        else exact_x::core_s<Bits, 4>(w, XRows<Down>{a, tile, m}, n, Down ? 4U : 32U, false, lds);
+        r += n;
+    }
+}
+template<bool Down>
+void launch_linear_s3(Args a, unsigned shared_bits, hipStream_t stream) {
+    constexpr unsigned N = Down ? H : I;
+    const dim3 routed(N / 128U, E, Down ? 1U : 2U), shared(N / 128U, (a.rows + kSharedRows - 1U) / kSharedRows, Down ? 1U : 2U);
+    linear_kernel_s3_full<4, Down, false><<<routed, 256, 0, stream>>>(a);
+    linear_kernel_s3_tail<4, Down, false><<<routed, 256, 0, stream>>>(a);
+    ok(hipGetLastError(), "X3 routed linear");
+    if (shared_bits == 6U) {
+        linear_kernel_s3_full<6, Down, true><<<shared, 256, 0, stream>>>(a);
+        linear_kernel_s3_tail<6, Down, true><<<shared, 256, 0, stream>>>(a);
+    } else {
+        linear_kernel_s3_full<4, Down, true><<<shared, 256, 0, stream>>>(a);
+        linear_kernel_s3_tail<4, Down, true><<<shared, 256, 0, stream>>>(a);
+    }
+    ok(hipGetLastError(), "X3 shared linear");
+}
 template<bool Down, unsigned R>
 void launch_linear_s(Args a, unsigned shared_bits, hipStream_t stream) {
     constexpr unsigned N = Down ? H : I;
@@ -420,6 +484,7 @@ void launch_linear_s(Args a, unsigned shared_bits, hipStream_t stream) {
     ok(hipGetLastError(), "X3 shared linear");
 }
 __global__ void activation_kernel(Args a) {
+    if (a.ntiles && blockIdx.y >= *a.ntiles) return;
     const Tile tile = a.tiles[blockIdx.y];
     const unsigned wave = threadIdx.x >> 5U, lane = threadIdx.x & 31U;
     const moe::Exl3 down = matrix(a, tile.expert, 2);
@@ -464,6 +529,142 @@ template<int TM, bool Cached> void launch(Args a, unsigned tiles, hipStream_t st
     combine_kernel<<<dim3(H / 256, a.rows), 256, 0, stream>>>(a);
     ok(hipGetLastError(), "R16");
 }
+// Device plan, byte-equal to the host plan in enqueue(): expert e's pairs in ascending row order (a row holds an
+// expert at most once), shared pairs r*9+8 last, groups[e] = {e, offset, count}, tiles of 16 rows per expert in
+// expert order. A row whose ids are not strictly ascending and < 288 sets *flag and contributes no routed pair.
+struct PlanArgs {
+    unsigned rows;
+    const std::uint32_t* ids;
+    unsigned* blk;    // [blocks][E] counts, then exclusive per-expert block prefixes
+    unsigned* rank;   // [rows][8] rank among the block's earlier rows holding the same expert
+    unsigned* off;    // [E + 1] expert offsets, [E + 1] tile count
+    unsigned* pairs;
+    Tile* tiles;
+    Tile* groups;
+    unsigned* flag;
+};
+__global__ __launch_bounds__(kPlanRows) void plan_rank_kernel(PlanArgs p) {
+    __shared__ unsigned cnt[kPlanRows / 32U][E];
+    const unsigned tid = threadIdx.x, lane = tid & 31U, wave = tid >> 5U, r = blockIdx.x * kPlanRows + tid;
+    for (unsigned i = tid; i < kPlanRows / 32U * E; i += kPlanRows) (&cnt[0][0])[i] = 0;
+    unsigned e[8];
+    bool bad = false;
+#pragma unroll
+    for (unsigned k = 0; k < 8U; ++k) {
+        e[k] = r < p.rows ? p.ids[std::size_t{r} * 8U + k] : E;
+        bad = bad || (r < p.rows && (e[k] >= E || (k && e[k] <= e[k - 1])));
+    }
+    if (bad) {
+        atomicOr(p.flag, 1U);
+#pragma unroll
+        for (unsigned k = 0; k < 8U; ++k) e[k] = E;
+    }
+    __syncthreads();
+    // Wave-local ranks: one pass per distinct expert held by any lane; lanes below hold earlier rows.
+    unsigned rk[8] = {}, done = 0;
+#pragma unroll
+    for (unsigned k = 0; k < 8U; ++k) if (e[k] >= E) done |= 1U << k;
+    for (;;) {
+        const unsigned pending = static_cast<unsigned>(__ballot(done != 0xffU));
+        if (!pending) break;
+        const unsigned leader = static_cast<unsigned>(__builtin_ctz(pending));
+        unsigned mine = E;
+#pragma unroll
+        for (unsigned k = 8U; k-- > 0;) if (!(done >> k & 1U)) mine = e[k];
+        const unsigned x = static_cast<unsigned>(__shfl(static_cast<int>(mine), static_cast<int>(leader)));
+        unsigned slot = 8U;
+#pragma unroll
+        for (unsigned k = 0; k < 8U; ++k) if (e[k] == x) slot = k;
+        const unsigned holders = static_cast<unsigned>(__ballot(slot < 8U));
+        if (slot < 8U) {
+            rk[slot] = cnt[wave][x] + static_cast<unsigned>(__builtin_popcount(holders & ((1U << lane) - 1U)));
+            done |= 1U << slot;
+        }
+        if (lane == leader) cnt[wave][x] += static_cast<unsigned>(__builtin_popcount(holders));
+    }
+    __syncthreads();
+    // Waves cover consecutive rows: prefix the wave counts per expert, publish the block's counts.
+    for (unsigned x = tid; x < E; x += kPlanRows) {
+        unsigned run = 0;
+        for (unsigned w = 0; w < kPlanRows / 32U; ++w) { const unsigned c = cnt[w][x]; cnt[w][x] = run; run += c; }
+        p.blk[std::size_t{blockIdx.x} * E + x] = run;
+    }
+    __syncthreads();
+    if (r < p.rows)
+#pragma unroll
+        for (unsigned k = 0; k < 8U; ++k) p.rank[std::size_t{r} * 8U + k] = e[k] < E ? rk[k] + cnt[wave][e[k]] : 0U;
+}
+__global__ __launch_bounds__(1024) void plan_scan_kernel(PlanArgs p, unsigned blocks) {
+    __shared__ unsigned count[E + 1], tile_off[E + 1];
+    const unsigned tid = threadIdx.x;
+    for (unsigned x = tid; x < E; x += blockDim.x) {
+        unsigned run = 0;
+        for (unsigned b = 0; b < blocks; ++b) {
+            unsigned* c = p.blk + std::size_t{b} * E + x;
+            const unsigned v = *c;
+            *c = run;
+            run += v;
+        }
+        count[x] = run;
+    }
+    if (tid == 0) count[E] = p.rows;
+    __syncthreads();
+    if (tid == 0) {
+        unsigned n = 0, t = 0;
+        for (unsigned x = 0; x <= E; ++x) {
+            p.off[x] = n;
+            tile_off[x] = t;
+            p.groups[x] = {x, n, count[x]};
+            n += count[x];
+            t += (count[x] + 15U) / 16U;
+        }
+        p.off[E + 1] = t;
+    }
+    __syncthreads();
+    for (unsigned x = tid; x <= E; x += blockDim.x)
+        for (unsigned r = 0, t = tile_off[x]; r < count[x]; r += 16U, ++t)
+            p.tiles[t] = {x, p.off[x] + r, count[x] - r < 16U ? count[x] - r : 16U};
+}
+__global__ __launch_bounds__(kPlanRows) void plan_scatter_kernel(PlanArgs p) {
+    const unsigned r = blockIdx.x * kPlanRows + threadIdx.x;
+    if (r >= p.rows) return;
+    unsigned e[8];
+    bool bad = false;
+#pragma unroll
+    for (unsigned k = 0; k < 8U; ++k) {
+        e[k] = p.ids[std::size_t{r} * 8U + k];
+        bad = bad || e[k] >= E || (k && e[k] <= e[k - 1]);
+    }
+    if (!bad)
+#pragma unroll
+        for (unsigned k = 0; k < 8U; ++k)
+            p.pairs[p.off[e[k]] + p.blk[std::size_t{blockIdx.x} * E + e[k]] + p.rank[std::size_t{r} * 8U + k]] = r * P + k;
+    p.pairs[p.off[E] + r] = r * P + 8U;
+}
+// The grouped variants (v3 and the X cores): input transform, gate/up, activation, down, combine. grid_tiles is the
+// tile count (host plan) or its upper bound (device plan; surplus CTAs return on Args::ntiles).
+void launch_grouped(const Args& a, unsigned grid_tiles, unsigned selected, const moe::ExpertSlices& shared, hipStream_t stream) {
+    input_kernel<<<dim3(H / 1024, grid_tiles, 2), 256, 0, stream>>>(a);
+    ok(hipGetLastError(), "v3 gate/up input transform");
+    if (selected == 11) launch_linear_s3<false>(a, shared.gate.bits, stream);
+    else if (selected == 10) launch_linear_s2<false>(a, shared.gate.bits, stream);
+    else if (selected == 9) launch_linear_s<false, 8>(a, shared.gate.bits, stream);
+    else if (selected == 8) launch_linear_s<false, 4>(a, shared.gate.bits, stream);
+    else if (selected == 7) launch_linear_x<false, true>(a, shared.gate.bits, stream);
+    else if (selected == 6) launch_linear_x<false>(a, shared.gate.bits, stream);
+    else launch_linear_v3<false>(a, shared.gate.bits, stream);
+    activation_kernel<<<dim3(I / 128, grid_tiles), 256, 0, stream>>>(a);
+    ok(hipGetLastError(), "v3 R15/down transform");
+    if (selected == 11) launch_linear_s3<true>(a, shared.down.bits, stream);
+    else if (selected == 10) launch_linear_s2<true>(a, shared.down.bits, stream);
+    else if (selected == 9) launch_linear_s<true, 8>(a, shared.down.bits, stream);
+    else if (selected == 8) launch_linear_s<true, 4>(a, shared.down.bits, stream);
+    else if (selected == 7) launch_linear_x<true, true>(a, shared.down.bits, stream);
+    else if (selected == 6) launch_linear_x<true>(a, shared.down.bits, stream);
+    else launch_linear_v3<true>(a, shared.down.bits, stream);
+    combine_kernel<<<dim3(H / 256, a.rows), 256, 0, stream>>>(a);
+    ok(hipGetLastError(), "v3 R16");
+}
 void check_matrix(const moe::Exl3& w, unsigned input, unsigned output, bool shared) {
     if (!w.trellis || !w.suh || !w.svh || w.input != input || w.output != output ||
         (w.bits != 4 && !(shared && w.bits == 6)))
@@ -495,12 +696,40 @@ hipFuncAttributes query_s_resources(unsigned bits, bool down, bool shared) {
 #undef QUERY
     return a;
 }
+hipFuncAttributes query_s2_resources(unsigned bits, bool down, bool shared) {
+    hipFuncAttributes a{};
+#define QUERY(B, D, S) ok(hipFuncGetAttributes(&a, reinterpret_cast<const void*>(&linear_kernel_s2<B, D, S>)), "X3 resources")
+#define SELECT(B) if (down) { if (shared) { QUERY(B, true, true); } else { QUERY(B, true, false); } } \
+                  else { if (shared) { QUERY(B, false, true); } else { QUERY(B, false, false); } }
+    if (bits == 4) { SELECT(4); }
+    else if (bits == 6 && shared) { SELECT(6); }
+    else throw std::invalid_argument("exact moe: X3 resource bits/shared");
+#undef SELECT
+#undef QUERY
+    return a;
+}
+hipFuncAttributes query_s3_resources(unsigned bits, bool down, bool shared, bool tail) {
+    hipFuncAttributes a{};
+#define QUERY(B, D, S) ok(hipFuncGetAttributes(&a, tail ? reinterpret_cast<const void*>(&linear_kernel_s3_tail<B, D, S>) \
+                                                    : reinterpret_cast<const void*>(&linear_kernel_s3_full<B, D, S>)), "X3 resources")
+#define SELECT(B) if (down) { if (shared) { QUERY(B, true, true); } else { QUERY(B, true, false); } } \
+                  else { if (shared) { QUERY(B, false, true); } else { QUERY(B, false, false); } }
+    if (bits == 4) { SELECT(4); }
+    else if (bits == 6 && shared) { SELECT(6); }
+    else throw std::invalid_argument("exact moe: X3 resource bits/shared");
+#undef SELECT
+#undef QUERY
+    return a;
+}
 hipFuncAttributes x_resources(unsigned bits, bool down, bool shared, unsigned variant) {
     if (variant == 6) return query_x_resources<false>(bits, down, shared);
     if (variant == 7) return query_x_resources<true>(bits, down, shared);
     if (variant == 8) return query_s_resources<4>(bits, down, shared);
     if (variant == 9) return query_s_resources<8>(bits, down, shared);
-    throw std::invalid_argument("exact moe: X resources variant must be 6, 7, 8 or 9");
+    if (variant == 10) return query_s2_resources(bits, down, shared);
+    if (variant == 11) return query_s3_resources(bits, down, shared, false);
+    if (variant == 12) return query_s3_resources(bits, down, shared, true);  // V11's tail kernel
+    throw std::invalid_argument("exact moe: X resources variant must be 6..12 (12 = V11 tail kernel)");
 }
 Plan::Plan(unsigned max_rows) : capacity(max_rows) {
     (void)Layout(max_rows);
@@ -524,11 +753,17 @@ const float* pair_output(void* ws, unsigned rows, unsigned pair) {
 unsigned x_auto_rows() {
     // STRIX_GLM_PF_EXACTMOE_X_MIN_ROWS overrides the auto threshold (rows per MoE call).
     const char* p = std::getenv("STRIX_GLM_PF_EXACTMOE_X_MIN_ROWS");
-    if (!p) return 512;
+    if (!p) return 128;
     char* end = nullptr;
     const unsigned long n = std::strtoul(p, &end, 10);
     if (!*p || *end || n == 0 || n > 65536) throw std::invalid_argument("STRIX_GLM_PF_EXACTMOE_X_MIN_ROWS must be 1..65536");
     return static_cast<unsigned>(n);
+}
+unsigned tm_env() {
+    const char* s = std::getenv("STRIX_GLM_PF_EXACTMOE_TM");
+    if (!s || std::string(s) == "16") return 16;
+    if (std::string(s) == "32") return 32;
+    throw std::invalid_argument("STRIX_GLM_PF_EXACTMOE_TM must be 16 or 32");
 }
 bool v3_row_buckets() {
     // Default on: v3 tiles compute only the smallest power-of-two row bucket covering their rows (same bits).
@@ -540,7 +775,7 @@ bool v3_row_buckets() {
 unsigned selected_variant(unsigned rows) {
     const char* variant = std::getenv("STRIX_GLM_PF_EXACTMOE_V");
     // v3 is the measured default (real pair, 1K/8K/32K TTFT logits bitwise == v1 on both ranks, -10..-11 % ms/token);
-    // STRIX_GLM_PF_EXACTMOE_V=1 restores v1. auto: v10 (X3 core) for calls >= x_auto_rows() rows, v3 below (both exact;
+    // STRIX_GLM_PF_EXACTMOE_V=1 restores v1. auto: v11 (X3 core, row-bucketed tiles) for calls >= x_auto_rows() rows, v3 below (both exact;
     // 32-row X tiles mostly pad the small expert groups of short calls).
     if (!variant) return 3;
     const std::string s(variant);
@@ -552,22 +787,18 @@ unsigned selected_variant(unsigned rows) {
     if (s == "8") return 8;
     if (s == "9") return 9;
     if (s == "10") return 10;
-    if (s == "auto") return rows >= x_auto_rows() ? 10 : 3;
-    throw std::invalid_argument("STRIX_GLM_PF_EXACTMOE_V must be 1, 2, 3, 6, 7, 8, 9, 10 or auto");
+    if (s == "11") return 11;
+    if (s == "auto") return rows >= x_auto_rows() ? 11 : 3;
+    throw std::invalid_argument("STRIX_GLM_PF_EXACTMOE_V must be 1, 2, 3, 6, 7, 8, 9, 10, 11 or auto");
 }
 void enqueue(const View& v, Plan& plan, void* ws, std::size_t bytes, hipStream_t stream, unsigned tm) {
     const Layout l(plan.capacity);
     if (!v.rows || v.rows > plan.capacity || !v.experts || !v.x || !v.ids || !v.weights || !v.out || !ws || bytes < l.bytes)
         throw std::invalid_argument("exact moe: invalid view/workspace");
-    if (tm == 0) {
-        const char* s = std::getenv("STRIX_GLM_PF_EXACTMOE_TM");
-        if (!s || std::string(s) == "16") tm = 16;
-        else if (std::string(s) == "32") tm = 32;
-        else throw std::invalid_argument("STRIX_GLM_PF_EXACTMOE_TM must be 16 or 32");
-    }
+    if (tm == 0) tm = tm_env();
     if (tm != 16 && tm != 32) throw std::invalid_argument("exact moe: TM must be 16 or 32");
     const unsigned selected = selected_variant(v.rows);
-    const bool v2 = selected == 2, v3 = selected == 3, v6 = selected == 6, v7 = selected == 7, v8 = selected == 8, v9 = selected == 9, v10 = selected == 10;
+    const bool v2 = selected == 2, v3 = selected == 3, v6 = selected == 6, v7 = selected == 7, v8 = selected == 8, v9 = selected == 9, v10 = selected == 10, v11 = selected == 11;
     for (unsigned e = 0; e <= E; ++e) {
         const auto& ex = e == E ? v.shared : v.experts[e];
         check_matrix(ex.gate, H, I, e == E);
@@ -610,32 +841,15 @@ void enqueue(const View& v, Plan& plan, void* ws, std::size_t bytes, hipStream_t
     ok(hipMemcpyAsync(table + E, &v.shared, sizeof(moe::ExpertSlices), hipMemcpyHostToDevice, stream), "shared expert");
     ok(hipMemcpyAsync(pairs, plan.pairs.data(), plan.pairs.size() * sizeof(unsigned), hipMemcpyHostToDevice, stream), "pairs");
     ok(hipMemcpyAsync(tiles, plan.tiles.data(), plan.tiles.size() * sizeof(Tile), hipMemcpyHostToDevice, stream), "tiles");
-    if (v3 || v6 || v7 || v8 || v9 || v10) ok(hipMemcpyAsync(device_groups, groups.data(), sizeof(groups), hipMemcpyHostToDevice, stream), "expert groups");
+    if (v3 || v6 || v7 || v8 || v9 || v10 || v11) ok(hipMemcpyAsync(device_groups, groups.data(), sizeof(groups), hipMemcpyHostToDevice, stream), "expert groups");
     // Owns host upload lifetimes even when callers immediately reuse their table or Plan.
     ok(hipStreamSynchronize(stream), "plan upload");
     Args a{v.rows, v.x, v.weights, v.out, table, v.shared, pairs, tiles, device_groups,
            reinterpret_cast<float*>(base + l.gu), reinterpret_cast<_Float16*>(base + l.at), reinterpret_cast<float*>(base + l.output),
-           reinterpret_cast<_Float16*>(base + l.input), v3_row_buckets() ? 1U : 0U};
+           reinterpret_cast<_Float16*>(base + l.input), v3_row_buckets() ? 1U : 0U, nullptr};
     const unsigned nt = static_cast<unsigned>(plan.tiles.size());
-    if (v3 || v6 || v7 || v8 || v9 || v10) {
-        input_kernel<<<dim3(H / 1024, nt, 2), 256, 0, stream>>>(a);
-        ok(hipGetLastError(), "v3 gate/up input transform");
-        if (v10) launch_linear_s2<false>(a, v.shared.gate.bits, stream);
-        else if (v9) launch_linear_s<false, 8>(a, v.shared.gate.bits, stream);
-        else if (v8) launch_linear_s<false, 4>(a, v.shared.gate.bits, stream);
-        else if (v7) launch_linear_x<false, true>(a, v.shared.gate.bits, stream);
-        else if (v6) launch_linear_x<false>(a, v.shared.gate.bits, stream);
-        else launch_linear_v3<false>(a, v.shared.gate.bits, stream);
-        activation_kernel<<<dim3(I / 128, nt), 256, 0, stream>>>(a);
-        ok(hipGetLastError(), "v3 R15/down transform");
-        if (v10) launch_linear_s2<true>(a, v.shared.down.bits, stream);
-        else if (v9) launch_linear_s<true, 8>(a, v.shared.down.bits, stream);
-        else if (v8) launch_linear_s<true, 4>(a, v.shared.down.bits, stream);
-        else if (v7) launch_linear_x<true, true>(a, v.shared.down.bits, stream);
-        else if (v6) launch_linear_x<true>(a, v.shared.down.bits, stream);
-        else launch_linear_v3<true>(a, v.shared.down.bits, stream);
-        combine_kernel<<<dim3(H / 256, a.rows), 256, 0, stream>>>(a);
-        ok(hipGetLastError(), "v3 R16");
+    if (v3 || v6 || v7 || v8 || v9 || v10 || v11) {
+        launch_grouped(a, nt, selected, v.shared, stream);
     } else if (v2) {
         if (tm == 16) launch<16, true>(a, nt, stream);
         else launch<32, true>(a, nt, stream);
@@ -643,5 +857,56 @@ void enqueue(const View& v, Plan& plan, void* ws, std::size_t bytes, hipStream_t
         if (tm == 16) launch<16, false>(a, nt, stream);
         else launch<32, false>(a, nt, stream);
     }
+}
+const unsigned* plan_pairs(void* ws, unsigned rows) {
+    return reinterpret_cast<const unsigned*>(static_cast<unsigned char*>(ws) + Layout(rows).pairs);
+}
+const Tile* plan_tiles(void* ws, unsigned rows) {
+    return reinterpret_cast<const Tile*>(static_cast<unsigned char*>(ws) + Layout(rows).tiles);
+}
+const Tile* plan_groups(void* ws, unsigned rows) {
+    return reinterpret_cast<const Tile*>(static_cast<unsigned char*>(ws) + Layout(rows).groups);
+}
+moe::ExpertSlices* workspace_table(void* ws) {
+    return reinterpret_cast<moe::ExpertSlices*>(static_cast<unsigned char*>(ws) + Layout(1).table);
+}
+bool device_plan(unsigned rows, unsigned tm) {
+    // STRIX_GLM_PF_EXACTMOE_PLAN=host keeps the host plan (route download, host grouping, upload).
+    const char* p = std::getenv("STRIX_GLM_PF_EXACTMOE_PLAN");
+    if (p && std::string(p) == "host") return false;
+    if (p && std::string(p) != "device") throw std::invalid_argument("STRIX_GLM_PF_EXACTMOE_PLAN must be device or host");
+    const unsigned s = selected_variant(rows);
+    return (s == 3 || s >= 6) && (tm == 0 ? tm_env() : tm) == 16;
+}
+void enqueue_device(const DeviceView& v, Plan& plan, void* ws, std::size_t bytes, hipStream_t stream, unsigned* flag) {
+    const Layout l(plan.capacity);
+    if (!v.rows || v.rows > plan.capacity || !v.table || !v.x || !v.ids || !v.weights || !v.out || !flag || !ws || bytes < l.bytes)
+        throw std::invalid_argument("exact moe: invalid device view/workspace");
+    const unsigned selected = selected_variant(v.rows);
+    if (!(selected == 3 || selected >= 6)) throw std::invalid_argument("exact moe: device plan needs a grouped variant");
+    check_matrix(v.shared.gate, H, I, true);
+    check_matrix(v.shared.up, H, I, true);
+    check_matrix(v.shared.down, I, H, true);
+    if (v.shared.gate.bits != v.shared.up.bits)
+        throw std::invalid_argument("exact moe: shared gate/up bits must match decode contract");
+    auto* base = static_cast<unsigned char*>(ws);
+    const unsigned blocks = (v.rows + kPlanRows - 1U) / kPlanRows;
+    const std::size_t cap_blocks = (plan.capacity + kPlanRows - 1U) / kPlanRows;
+    auto* blk = reinterpret_cast<unsigned*>(base + l.plan);
+    auto* rank = reinterpret_cast<unsigned*>(base + l.plan + align256(cap_blocks * E * sizeof(unsigned)));
+    auto* off = rank + align256(std::size_t{plan.capacity} * 8U * sizeof(unsigned)) / sizeof(unsigned);
+    const PlanArgs pa{v.rows, v.ids, blk, rank, off, reinterpret_cast<unsigned*>(base + l.pairs),
+                      reinterpret_cast<Tile*>(base + l.tiles), reinterpret_cast<Tile*>(base + l.groups), flag};
+    plan_rank_kernel<<<blocks, kPlanRows, 0, stream>>>(pa);
+    ok(hipGetLastError(), "device plan ranks");
+    plan_scan_kernel<<<1, 1024, 0, stream>>>(pa, blocks);
+    ok(hipGetLastError(), "device plan scan");
+    plan_scatter_kernel<<<blocks, kPlanRows, 0, stream>>>(pa);
+    ok(hipGetLastError(), "device plan scatter");
+    Args a{v.rows, v.x, v.weights, v.out, v.table, v.shared, pa.pairs, pa.tiles, pa.groups,
+           reinterpret_cast<float*>(base + l.gu), reinterpret_cast<_Float16*>(base + l.at), reinterpret_cast<float*>(base + l.output),
+           reinterpret_cast<_Float16*>(base + l.input), v3_row_buckets() ? 1U : 0U, off + E + 1};
+    const auto grid_tiles = static_cast<unsigned>(std::size_t{v.rows} * P / 16U + E + 1U);
+    launch_grouped(a, grid_tiles, selected, v.shared, stream);
 }
 } // namespace strix::glm::pf::exact_moe

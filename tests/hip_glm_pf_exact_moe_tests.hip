@@ -184,6 +184,8 @@ struct Fixture {
     float *x, *weights, *out, *ref_out, *ref_pairs, *ref_gu, *debug_gu;
     std::uint32_t* ids;
     std::uint16_t* ref_at;
+    M::ExpertSlices* device_table;  // [289] for the device plan (entry 288 = shared)
+    unsigned* flag;
     Fixture(std::mt19937& rng) {
         ok(hipStreamCreate(&stream), "stream");
         for (auto& e : experts) e = make_expert(model_mem, rng, 4);
@@ -203,6 +205,8 @@ struct Fixture {
         ref_gu = scratch.alloc<float>(std::size_t{MaxR} * 9 * 2 * I);
         debug_gu = scratch.alloc<float>(std::size_t{M::kMaxPairs} * 2 * I);
         ref_at = scratch.alloc<std::uint16_t>(std::size_t{MaxR} * 9 * I);
+        device_table = scratch.alloc<M::ExpertSlices>(E + 1);
+        flag = scratch.alloc<unsigned>(1);
     }
     ~Fixture() { (void)hipStreamSynchronize(stream); (void)hipStreamDestroy(stream); }
     void upload(unsigned R, const Routes& rt, std::mt19937& rng) {
@@ -262,7 +266,7 @@ struct Fixture {
         std::vector<std::uint16_t> at(ar.size());
         bool pass = true;
         Variant variant;
-        for (const char* version : {"1", "2", "3", "3r0", "6", "7", "8", "9", "10", "auto"}) for (unsigned tm : {16U, 32U}) for (unsigned repeat = 0; repeat < 2; ++repeat) {
+        for (const char* version : {"1", "2", "3", "3r0", "6", "7", "8", "9", "10", "11", "auto"}) for (unsigned tm : {16U, 32U}) for (unsigned repeat = 0; repeat < 2; ++repeat) {
             // Existing checks retain every arm/repeat. Added large cases qualify v3/v6/v7/v8/v9 against the seam.
             if (!selected(version)) continue;
             if (added && (std::strcmp(version, "3r0") == 0 || std::strcmp(version, "1") == 0 || std::strcmp(version, "2") == 0 || tm != 16 || repeat != 0)) continue;
@@ -306,8 +310,74 @@ struct Fixture {
                                         mismatches, first, static_cast<unsigned>(ar[first]), static_cast<unsigned>(at[first]), max_ulp);
             check(mismatches == 0, name + " down-input FP16");
             pass = pass && gu_pass && out_pass && pair_pass && mismatches == 0;
+            if (tm == 16 && repeat == 0 && X::device_plan(R, 16)) pass = device_arm(R, rt, name, yr, gr, pr, ar) && pass;
         }
         return pass;
+    }
+    // Device plan for the same call: plan bytes equal the host plan just built, outputs equal the seam, flag clear.
+    bool device_arm(unsigned R, const Routes& rt, const std::string& name, const std::vector<float>& yr,
+                    const std::vector<float>& gr, const std::vector<float>& pr, const std::vector<std::uint16_t>& ar) {
+        const std::size_t np = plan.pairs.size(), nt = plan.tiles.size();
+        std::vector<unsigned> hp(np);
+        std::vector<X::Tile> ht(nt), hg(E + 1);
+        ok(hipMemcpy(hp.data(), X::plan_pairs(ws, MaxR), np * 4, hipMemcpyDeviceToHost), "host pairs");
+        ok(hipMemcpy(ht.data(), X::plan_tiles(ws, MaxR), nt * sizeof(X::Tile), hipMemcpyDeviceToHost), "host tiles");
+        ok(hipMemcpy(hg.data(), X::plan_groups(ws, MaxR), hg.size() * sizeof(X::Tile), hipMemcpyDeviceToHost), "host groups");
+        std::vector<M::ExpertSlices> table(experts.begin(), experts.end());
+        table.push_back(shared);
+        ok(hipMemcpy(device_table, table.data(), table.size() * sizeof(M::ExpertSlices), hipMemcpyHostToDevice), "device table");
+        ok(hipMemsetAsync(ws, 0xff, wsb, stream), "device poison workspace");
+        ok(hipMemsetAsync(out, 0xff, std::size_t{MaxR} * H * 4, stream), "device poison output");
+        ok(hipMemsetAsync(flag, 0, 4, stream), "flag");
+        X::DeviceView dv;
+        dv.rows = R; dv.table = device_table; dv.shared = shared; dv.x = x; dv.ids = ids; dv.weights = weights; dv.out = out;
+        X::enqueue_device(dv, plan, ws, wsb, stream, flag);
+        ok(hipStreamSynchronize(stream), "device plan");
+        (void)rt;
+        std::vector<unsigned> dp(np);
+        std::vector<X::Tile> dt(nt), dg(E + 1);
+        unsigned f = 1;
+        ok(hipMemcpy(dp.data(), X::plan_pairs(ws, MaxR), np * 4, hipMemcpyDeviceToHost), "device pairs");
+        ok(hipMemcpy(dt.data(), X::plan_tiles(ws, MaxR), nt * sizeof(X::Tile), hipMemcpyDeviceToHost), "device tiles");
+        ok(hipMemcpy(dg.data(), X::plan_groups(ws, MaxR), dg.size() * sizeof(X::Tile), hipMemcpyDeviceToHost), "device groups");
+        ok(hipMemcpy(&f, flag, 4, hipMemcpyDeviceToHost), "flag");
+        const bool plan_same = dp == hp && std::memcmp(dt.data(), ht.data(), nt * sizeof(X::Tile)) == 0 &&
+                               std::memcmp(dg.data(), hg.data(), dg.size() * sizeof(X::Tile)) == 0 && f == 0;
+        check(plan_same, name + " device plan == host plan, flag clear");
+        std::vector<float> y(yr.size()), gu(gr.size()), pairs(pr.size());
+        std::vector<std::uint16_t> at(ar.size());
+        ok(hipMemcpy(y.data(), out, y.size() * 4, hipMemcpyDeviceToHost), "device out");
+        ok(hipMemcpy(pairs.data(), X::pair_output(ws, MaxR, 0), pairs.size() * 4, hipMemcpyDeviceToHost), "device pairs out");
+        ok(hipMemcpy(gu.data(), X::pair_gate_up(ws, MaxR, 0), gu.size() * 4, hipMemcpyDeviceToHost), "device gate/up");
+        ok(hipMemcpy(at.data(), X::pair_down_input(ws, MaxR, 0), at.size() * 2, hipMemcpyDeviceToHost), "device at");
+        const bool out_pass = equal32(yr, y, name + " device-plan R16");
+        const bool gu_pass = equal32(gr, gu, name + " device-plan gate/up");
+        const bool pair_pass = equal32(pr, pairs, name + " device-plan pair-output");
+        const bool at_pass = at == ar;
+        check(at_pass, name + " device-plan down-input FP16");
+        return plan_same && out_pass && gu_pass && pair_pass && at_pass;
+    }
+    // Invalid ids (duplicate within a row, id >= 288) on the device plan set the flag instead of throwing.
+    void device_invalid(std::mt19937& rng) {
+        const unsigned R = 300;
+        Routes rt = routes(R, 0, rng);
+        rt.ids[17 * 8 + 3] = rt.ids[17 * 8 + 2];
+        rt.ids[201 * 8 + 7] = 300;
+        upload(R, rt, rng);
+        std::vector<M::ExpertSlices> table(experts.begin(), experts.end());
+        table.push_back(shared);
+        ok(hipMemcpy(device_table, table.data(), table.size() * sizeof(M::ExpertSlices), hipMemcpyHostToDevice), "device table");
+        ok(hipMemsetAsync(flag, 0, 4, stream), "flag");
+        X::DeviceView dv;
+        dv.rows = R; dv.table = device_table; dv.shared = shared; dv.x = x; dv.ids = ids; dv.weights = weights; dv.out = out;
+        X::enqueue_device(dv, plan, ws, wsb, stream, flag);
+        ok(hipStreamSynchronize(stream), "device invalid");
+        unsigned f = 0;
+        ok(hipMemcpy(&f, flag, 4, hipMemcpyDeviceToHost), "flag");
+        check(f == 1, "device plan invalid ids set the flag");
+        bool threw = false;
+        try { X::enqueue(view(R, rt), plan, ws, wsb, stream, 16); } catch (const std::invalid_argument&) { threw = true; }
+        check(threw, "host plan invalid ids throw");
     }
     void exceptional(std::mt19937& rng) {
         constexpr unsigned R = 33;
@@ -356,7 +426,7 @@ struct Fixture {
             }
             std::vector<float> yr, gr, pr;
             std::vector<std::uint16_t> ar;
-            for (const char* version : {"3", "6", "7", "8", "9", "10"}) {
+            for (const char* version : {"3", "6", "7", "8", "9", "10", "11"}) {
                 // v3 is this case's reference and always runs.
                 if (std::strcmp(version, "3") != 0 && !selected(version)) continue;
                 Variant::set(version);
@@ -488,7 +558,7 @@ int main(int argc, char** argv) {
         }
         if (!timing && timing_only) throw std::invalid_argument("conflicting timing options");
         std::mt19937 rng(0x5eed1234U);
-        for (unsigned variant : {6U, 7U, 8U, 9U}) for (bool shared : {false, true}) for (unsigned bits : {4U, 6U}) for (bool down : {false, true}) {
+        for (unsigned variant : {6U, 7U, 8U, 9U, 10U, 11U, 12U}) for (bool shared : {false, true}) for (unsigned bits : {4U, 6U}) for (bool down : {false, true}) {
             if (bits == 6 && !shared) continue;
             const auto a = X::x_resources(bits, down, shared, variant);
             const auto name = "v" + std::to_string(variant) + " K" + std::to_string(bits) + (shared ? " shared" : " routed") + (down ? " down" : " gate/up");
@@ -496,7 +566,7 @@ int main(int argc, char** argv) {
             check(a.localSizeBytes == 0, "zero spills " + name);
         }
         {
-            // enqueue dispatches through selected_variant(); auto must pick v10 exactly at the threshold.
+            // enqueue dispatches through selected_variant(); auto must pick v11 exactly at the threshold.
             Variant variant;
             auto min_rows = [](const char* value) {
 #ifdef _WIN32
@@ -509,15 +579,15 @@ int main(int argc, char** argv) {
             min_rows(nullptr);
             Variant::set(nullptr);
             check(X::selected_variant(4096) == 3, "selected variant unset -> 3");
-            for (const char* v : {"1", "2", "3", "6", "7", "8", "9", "10"}) {
+            for (const char* v : {"1", "2", "3", "6", "7", "8", "9", "10", "11"}) {
                 Variant::set(v);
                 check(X::selected_variant(2048) == static_cast<unsigned>(std::atoi(v)), std::string("selected variant ") + v);
             }
             Variant::set("auto");
-            for (unsigned rows : {1U, 511U, 512U, 513U, 2048U, 4096U})
-                check(X::selected_variant(rows) == (rows >= 512 ? 10U : 3U), "selected variant auto rows=" + std::to_string(rows));
+            for (unsigned rows : {1U, 127U, 128U, 129U, 2048U, 4096U})
+                check(X::selected_variant(rows) == (rows >= 128 ? 11U : 3U), "selected variant auto rows=" + std::to_string(rows));
             min_rows("100");
-            check(X::selected_variant(99) == 3 && X::selected_variant(100) == 10, "selected variant auto MIN_ROWS=100");
+            check(X::selected_variant(99) == 3 && X::selected_variant(100) == 11, "selected variant auto MIN_ROWS=100");
             for (const char* bad : {"0", "65537", "abc"}) {
                 min_rows(bad);
                 bool threw = false;
@@ -552,6 +622,7 @@ int main(int argc, char** argv) {
                 }
             }
             f.exceptional(rng);
+            f.device_invalid(rng);
             const auto tails = routes(1024, 4, rng);
             bool all_tails = true;
             for (unsigned e = 0; e < 33; ++e)
