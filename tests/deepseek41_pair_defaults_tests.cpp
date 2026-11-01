@@ -439,12 +439,29 @@ void test_profile() {
         fast_env.emplace_back("STRIX_DS41_FAST_MOE", "1");
         check(f.args == base.args && std::is_permutation(f.set_env.begin(), f.set_env.end(), fast_env.begin(), fast_env.end()),
               "fast: applies moe_relaxed only; the pending attention row is never applied");
-        check(f.profile->find("moe_relaxed")->status == pr::Status::set && f.profile->find("moe_relaxed")->value == "1",
-              "fast: moe_relaxed set");
+        check(f.profile->find("moe_relaxed")->status == pr::Status::provisional && f.profile->find("moe_relaxed")->value == "1",
+              "fast: moe_relaxed provisional");
+        check(std::count(f.set_env.begin(), f.set_env.end(), std::pair<std::string, std::string>{"STRIX_DS41_FAST_MOE", "1"}) == 1,
+              "fast: provisional moe_relaxed still runs");
         std::size_t pending = 0;
         for (const auto& e : f.profile->entries) pending += e.status == pr::Status::pending;
-        check(pending == pd::profile_table.size() - 1U && f.notices.size() == base.notices.size() + pending, "fast: one notice per pending row");
-        check(f.profile->qualification() == "qualified", "fast: still qualified");
+        check(pending == pd::profile_table.size() - 1U && f.notices.size() == base.notices.size() + pending + 1U,
+              "fast: one notice per pending row and one for the provisional row");
+        check(std::count(f.notices.begin(), f.notices.end(),
+                         "deepseek41-pair profile fast: moe_relaxed=1 is bit-changing; qualification in progress") == 1,
+              "fast: provisional notice");
+        check(f.profile->qualification() == "qualification in progress: moe_relaxed", "fast: qualification in progress, never qualified");
+        check(f.profile->json().find("\"qualification\":\"qualification in progress: moe_relaxed\"") != std::string::npos &&
+                  f.profile->json().find("\"provisional\":[\"moe_relaxed\"]") != std::string::npos &&
+                  base.profile->json().find("\"provisional\":[]") != std::string::npos,
+              "receipt: provisional stamp and list");
+        check(pd::describe(app, f).find("profile qualification qualification in progress: moe_relaxed\n") != std::string::npos &&
+                  pd::describe(app, f).find("profile lever moe_relaxed 1 (provisional, ") != std::string::npos,
+              "effective config: provisional lines");
+        World ap = w;
+        ap.env["STRIX_DS41_PROFILE_ALLOW_PENDING"] = "1";
+        check(ap.run(app, fast_args).profile->qualification() == "qualification in progress: moe_relaxed; unqualified: attention_f16wmma",
+              "--allow-pending: both stamps");
 
         auto q_args = plain_args;
         q_args.insert(q_args.end(), {"--profile", "quality"});
