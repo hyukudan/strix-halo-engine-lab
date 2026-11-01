@@ -415,6 +415,62 @@ self-generated calibration goldens are not independent references. Numerical pro
 drafts until compiler, native execution, model fidelity and complete-workload gates pass;
 theoretical throughput and external results do not establish local qualification.
 
+### Protocol fields
+
+Every new `results.json` carries these additive fields; older results without them still validate.
+
+- **Cache reuse.** HTTP runs read `usage.prompt_tokens_details.cached_tokens` from every response.
+  Each `http-cN` measurement records `cache_state` (`cold`: every request reported 0; `reused`:
+  any request reported more; `unverified`: the engine did not report it) and `cached_tokens_max`.
+  `cache_policy` in the result compares the largest count with `BENCH_ALLOWED_CACHED_TOKENS`
+  (default 0, the shared prefix a suite may reuse) and sets `nonconforming` when it is exceeded.
+  `BENCH_DECLARED_CACHE_REUSE=1` declares reuse as intended. The default policy flags the run;
+  `BENCH_CACHE_POLICY=refuse` writes the result with `status: failed` and exits 1. Never compare a
+  `reused` arm with a `cold` arm.
+- **Engine counts and rates.** Each HTTP request records the engine's `completion_tokens` (usage)
+  beside `client_token_count` (the received ID vector; they must agree), plus the engine's
+  `strix` `queue_ms`/`prefill_ms`/`decode_ms` when the reply carries them. Engine-timed rows
+  (`engine-decode` tok/s per request, `engine-ttft` = queue + prefill) are added next to the
+  client-clock rows (`rate_source: client-clock` vs `engine`). CLI modes already take rates from
+  the engine receipt, never from the process clock.
+- **Not-run list.** `not_run` is always present: a list of `{item, reason}` for everything
+  this run did not measure (skips, exactness not selected, HTTP replies without engine timings
+  or cache counts, and items added with `kit.py not-run RUN_DIR ITEM REASON`). An empty list is a
+  claim that nothing was left out.
+- **ABBA k-of-n pairs.** Compare two arms from separate runs in ABBA process order:
+
+  ```bash
+  python3 scripts/bench/lib/kit.py pairs pairs.json A=a1/results.json B=b1/results.json \
+    B=b2/results.json A=a2/results.json
+  ```
+
+  Consecutive runs form pairs (AB, BA, ...). For each measurement the output lists the per-pair
+  relative deltas `(B - A) / A`, their median, `k_of_n` (pairs where B is better: higher tok/s,
+  lower seconds) and `sign_agreement`. Every receipt is validated and must have `status:
+  complete`. Arms are refused when they differ in engine, prompt set, models, workload or capacity
+  parameters (generation length, contexts, concurrency, slots), per-measurement `workload` (prompt
+  identities and lengths, including the constituent prompts of `http-cN` rows, and requested
+  generation length; never taken from the optional exactness rows), or cache state (`cache_state` and `cached_tokens_max` must be identical;
+  declaring reuse never makes a cold arm comparable with a reused one). Cache-nonconforming runs
+  are refused unless reuse is declared. A published row in
+  `expected.json` may carry `pairs_faster` and `pairs`; the report then shows `(ABBA k/n)`.
+- **Dispatch census.** `tools/dispatch_census.py` reads a `rocprofv3 --kernel-trace` file (CSV
+  `*_kernel_trace.csv` or JSON `*_results.json`; integer nanoseconds, never rounded through
+  floating point) and reports launches, GPU busy time and host gap share for the whole trace and
+  per window. Launches belong to the window they start in; busy time is the union of dispatch
+  intervals clipped to each window (work carried across a boundary counts where it runs), so the
+  gap share stays in [0, 1], and the largest gap includes idle time at both window edges (an empty
+  window is all gap). A window starts at each
+  dispatch of a boundary kernel (`--window-kernel REGEX`) or at each matching roctx marker
+  (`--markers marker_api_trace.csv --marker-regex REGEX`). `--tokens N` (the engine-reported
+  token count) adds per-token figures; top kernels by count and time are listed. Attach it to a run:
+
+  ```bash
+  python3 scripts/bench/lib/kit.py census bench-results/run TRACE.csv --window-kernel 'marker' --tokens 128
+  ```
+
+  This writes `dispatch-census.json` and a `dispatch_census` field into `results.json`.
+
 ## Machine interface
 
 Stdout is the document channel; diagnostics use stderr. `list --json` returns exactly
@@ -456,14 +512,14 @@ The exact single-run contract is [results.schema.json](../scripts/bench/results.
 
 | Object | Emitted fields / shape |
 |---|---|
-| Result | Required fields above; also `tracked_dirty`, `timestamp_utc`, `suite`, `peer_hardware`, `peer_inventory`, `params`, `prompt_set`, `models_verified`, `wall_s`, `model_loads`, `skipped`, `logs` |
+| Result | Required fields above; also `tracked_dirty`, `timestamp_utc`, `suite`, `peer_hardware`, `peer_inventory`, `params`, `prompt_set`, `models_verified`, `wall_s`, `model_loads`, `skipped`, `logs`, `not_run`; optional `cache_policy`, `dispatch_census` (see Protocol fields) |
 | Identity | `profile`, `build_options`, `environment`, `command_profile_sha256`, `kit_source_sha256s`, `binary_sha256s`, `model_files`, `rocm_version`, `hip_version`, `kernel`, optional `peer_kernel`, `parameters`, `prompt_set` |
 | Binary | `name`, `sha256` |
 | Model | `role`, `name`, `bytes`, nullable `sha256`, nullable `published_sha256` |
 | Params / identity.parameters | Public `engine`, `suite`; integer arrays `contexts`, `concurrency`; integers `gen_tokens`, `repeat`, `warmup`, `timeout`; strings `profile`, `prompts` (`kit`/`file`), `verify_models`; string array `only`; booleans `serve`, `json`, `md`, `write_refs`, `dry_run`, `peer`; path markers `bin_dir`, `model_dir`, `peer_bin_dir`, `peer_model_dir`, `peer_repo` (`default`/`configured`), `out` (`run-directory`) |
 | Prompt set | `name` (`kit`/`file`), exact source-byte `sha256` |
 | Prompt | `id`, `tokens`, token-list `sha256`, `construction` |
-| Measurement | `prompt_id`, `mode`, `unit` (`s`/`tok/s`), `repeat_count`, numeric array `samples`, `median`, `min`, `max` |
+| Measurement | `prompt_id`, `mode`, `unit` (`s`/`tok/s`), `repeat_count`, numeric array `samples`, `median`, `min`, `max`, `workload` (`prompts`: list of `id`/`sha256`/`tokens`, `generate_length`; HTTP rows list their constituent prompts); HTTP rows also `timing_scope`, `rate_source`, `cache_state`, `cached_tokens_max` |
 | Exactness | `prompt_id`, `mode`, `generate_length`, `actual_tokens`, `prompt_sha256`, `token_ids_sha256`, nullable `engine_digest`, boolean `repeat_stable`, `verdict` (`EXACT`/`MISMATCH`/`NO-REFERENCE`); spec with plain peer also has `plain_tokens_equal` |
 | Peer inventory | Null or `repo_commit`, `tracked_dirty`, `binary_sha256s`, `model_files`, `models_verified`, `build_options`, `hardware`; no connection details |
 

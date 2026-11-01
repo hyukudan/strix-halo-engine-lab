@@ -805,6 +805,164 @@ def initialize(out):
                                 'timestamp_utc': datetime.datetime.now(datetime.timezone.utc).isoformat()})
 
 
+# Bench protocol fields. All additive: older results.json files without them still validate.
+def cache_state(values):
+    """cold: every request reported cached_tokens 0; reused: any > 0; unverified: any request lacks the field."""
+    if not values or any(not isinstance(v, int) for v in values): return 'unverified'
+    return 'reused' if any(v > 0 for v in values) else 'cold'
+
+
+def cache_policy(out):
+    """Police prompt/prefix cache reuse from the engine's usage.prompt_tokens_details.cached_tokens.
+
+    BENCH_ALLOWED_CACHED_TOKENS (default 0) is the shared prefix a suite may reuse; BENCH_DECLARED_CACHE_REUSE=1
+    declares reuse as intended; BENCH_CACHE_POLICY=refuse fails an undeclared nonconforming run (default: flag)."""
+    allowed = int(os.environ.get('BENCH_ALLOWED_CACHED_TOKENS', '0'))
+    if allowed < 0: raise ValueError('BENCH_ALLOWED_CACHED_TOKENS must be >= 0')
+    declared = os.environ.get('BENCH_DECLARED_CACHE_REUSE', '0') == '1'
+    mode = os.environ.get('BENCH_CACHE_POLICY', 'flag')
+    if mode not in ('flag', 'refuse'): raise ValueError('BENCH_CACHE_POLICY must be flag or refuse')
+    states, worst, reasons = {}, 0, []
+    for path in sorted(out.glob('http-c*.json')):
+        values = [x.get('cached_tokens') for group in read(path).get('requests', []) for x in group]
+        states[path.stem] = cache_state(values)
+        top = max((v for v in values if isinstance(v, int)), default=0)
+        worst = max(worst, top)
+        if top > allowed:
+            reasons.append(f'{path.stem}: cached_tokens {top} > allowed {allowed}')
+    if not states: return None
+    nonconforming = bool(reasons) and not declared
+    return {'allowed_cached_tokens': allowed, 'declared_reuse': declared, 'policy': mode, 'states': states,
+            'max_cached_tokens': worst, 'nonconforming': nonconforming, 'reasons': reasons,
+            'refused': nonconforming and mode == 'refuse'}
+
+
+def not_run_list(out, data):
+    """Explicit list of what this run did not measure, each with a reason."""
+    items = [dict(item=str(x['item']), reason=str(x['reason'])) for x in (read(out / 'not-run.json') if (out / 'not-run.json').exists() else [])]
+    items += [{'item': 'skipped', 'reason': s} for s in data.get('skipped', [])]
+    if 'exactness' not in data.get('params', {'only': ['exactness']}).get('only', []):
+        items.append({'item': 'exactness', 'reason': 'not selected (--only)'})
+    # HTTP rows are merged into results.json after finalize; read them from their own file too.
+    rows = data.get('measurements', []) + (read(out / 'http-measurements.json') if (out / 'http-measurements.json').exists() else [])
+    modes = {(m['prompt_id'], m['mode']) for m in rows}
+    for path in sorted(out.glob('http-c*.json')):
+        requests = [x for group in read(path).get('requests', []) for x in group]
+        for mode, key in (('engine-decode', 'engine_decode_ms'), ('engine-ttft', 'engine_prefill_ms')):
+            if (path.stem, mode) not in modes:
+                missing = not requests or any(key not in x for x in requests)
+                items.append({'item': f'{path.stem} {mode}', 'reason': 'engine reply carries no strix ' + key if missing else
+                              'engine timing zero or one-token completions'})
+        if cache_state([x.get('cached_tokens') for x in requests]) == 'unverified':
+            items.append({'item': f'{path.stem} cache state', 'reason': 'usage.prompt_tokens_details.cached_tokens absent'})
+    return items
+
+
+def protocol(out, data):
+    policy = cache_policy(out)
+    if policy:
+        data['cache_policy'] = policy
+        if policy['refused']: data['status'] = 'failed'
+    data['not_run'] = not_run_list(out, data)
+    if (out / 'dispatch-census.json').exists():
+        data['dispatch_census'] = read(out / 'dispatch-census.json')
+
+
+def abba_pairs(sequence, higher_is_better=True):
+    """k-of-n pairing over arms in process order. sequence = [(arm 'A'|'B', value), ...]; consecutive entries form
+    pairs (ABBA... gives AB, BA, ...). Delta is (B - A) / A per pair; 'b_better' counts pairs where B wins."""
+    if len(sequence) < 2 or len(sequence) % 2:
+        raise ValueError('ABBA pairing needs an even number (>= 2) of runs')
+    deltas, orders = [], []
+    for (a1, v1), (a2, v2) in zip(sequence[0::2], sequence[1::2]):
+        if {a1, a2} != {'A', 'B'}: raise ValueError('each consecutive pair must hold one A and one B run')
+        stats([v1, v2])
+        a, b = (v1, v2) if a1 == 'A' else (v2, v1)
+        deltas.append((b - a) / a)
+        orders.append(a1 + a2)
+    better = [d > 0 if higher_is_better else d < 0 for d in deltas]
+    k = sum(better)
+    ties = sum(d == 0 for d in deltas)
+    n = len(deltas)
+    return {'n_pairs': n, 'orders': orders, 'ab_pairs': orders.count('AB'), 'ba_pairs': orders.count('BA'),
+            'higher_is_better': higher_is_better, 'deltas': deltas, 'median_delta': statistics.median(deltas),
+            'b_better_pairs': k, 'a_better_pairs': n - k - ties, 'ties': ties, 'k_of_n': f'{k}/{n}',
+            'sign_agreement': f'{max(k, n - k - ties)}/{n}'}
+
+
+# Run parameters that define the workload (generation length, contexts, HTTP concurrency, prompt source, serve) plus
+# any capacity/slot/batch parameter; arms that differ in them are not comparable.
+WORKLOAD_PARAMS = ('gen_tokens', 'contexts', 'concurrency', 'prompts', 'serve')
+
+
+def workload_identity(d):
+    key = d.get('reference_key', {})
+    params = d.get('params') or d.get('identity', {}).get('parameters') or {}
+    chosen = {k: v for k, v in params.items() if k in WORKLOAD_PARAMS or re.search(r'slot|capacity|batch|context|max_tokens', k)}
+    return {'engine': d['engine'], 'prompt_set_sha256': key.get('prompt_set_sha256'),
+            'model_sha256s': sorted(key.get('model_sha256s', [])), 'params': chosen}
+
+
+def measurement_workload(d, m):
+    """Per compared measurement: the recorded workload (constituent prompt identities/lengths and requested generation
+    length, also for synthetic http-cN rows) and cache condition. Never derived from optional exactness rows."""
+    if not isinstance(m.get('workload'), dict):
+        raise ValueError(m['prompt_id'] + '/' + m['mode'] + ': measurement has no workload record (re-run with this kit)')
+    return {'workload': m['workload'], 'cache': (m.get('cache_state'), m.get('cached_tokens_max'))}
+
+
+def pairs(arms):
+    """arms = [('A'|'B', results.json path), ...] in process order -> per-measurement ABBA pair verdicts."""
+    runs = [(arm, read(path)) for arm, path in arms]
+    for arm, d in runs:
+        validate(d)
+        if d['status'] != 'complete':
+            raise ValueError(f"ABBA arm {arm} has status {d['status']}; only complete runs can be paired")
+    first = runs[0][1]
+    if any(workload_identity(d) != workload_identity(first) for _, d in runs):
+        raise ValueError('ABBA arms differ in engine, prompt set, models or workload/capacity parameters')
+    if any(d.get('cache_policy', {}).get('nonconforming') for _, d in runs) and os.environ.get('BENCH_DECLARED_CACHE_REUSE', '0') != '1':
+        raise ValueError('an arm run is cache-nonconforming; declare reuse with BENCH_DECLARED_CACHE_REUSE=1')
+    keys = [(m['prompt_id'], m['mode'], m['unit']) for m in first['measurements']]
+    result, missing = [], []
+    for key in keys:
+        values, workloads = [], []
+        for arm, d in runs:
+            m = next((m for m in d['measurements'] if (m['prompt_id'], m['mode'], m['unit']) == key), None)
+            if m is None: break
+            values.append((arm, m['median']))
+            workloads.append(measurement_workload(d, m))
+        if len(values) != len(runs):
+            missing.append({'item': '/'.join(key[:2]), 'reason': 'not measured in every arm run'})
+            continue
+        if any(w['cache'] != workloads[0]['cache'] for w in workloads):
+            # Declared reuse never makes asymmetric cache conditions comparable.
+            raise ValueError('/'.join(key[:2]) + ': cache state differs between arms ' + str([w['cache'] for w in workloads]))
+        if any(w != workloads[0] for w in workloads):
+            raise ValueError('/'.join(key[:2]) + ': prompt identity or generation length differs between arms')
+        result.append({'prompt_id': key[0], 'mode': key[1], 'unit': key[2], 'cache_state': workloads[0]['cache'][0],
+                       **abba_pairs(values, key[2] == 'tok/s')})
+    return {'schema_version': 1, 'engine': first['engine'], 'arms': [arm for arm, _ in runs],
+            'identity_sha256s': [d['identity_sha256'] for _, d in runs], 'pairs': result, 'not_run': missing}
+
+
+def attach_census(out, trace, args):
+    """Run tools/dispatch_census.py on a rocprofv3 trace and attach it to the run receipt (results.json)."""
+    import importlib.util
+    spec = importlib.util.spec_from_file_location('dispatch_census', ROOT / 'tools' / 'dispatch_census.py')
+    census = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(census)
+    target = out / 'dispatch-census.json'
+    if census.main([str(trace), *args, '-o', str(target)]) != 0:
+        raise ValueError('dispatch census failed')
+    if (out / 'results.json').exists():
+        d = read(out / 'results.json')
+        d['dispatch_census'] = read(target)
+        validate(d)
+        dump(out / 'results.json', d)
+        report(out / 'results.json')
+
+
 def finalize(out, write_refs=False, status='complete'):
     data = read(out / 'identity.json')
     data['wall_s'] = max(0, time.time() - data.pop('start_epoch', time.time()))
@@ -822,6 +980,10 @@ def finalize(out, write_refs=False, status='complete'):
     for (p, mode, length), group in groups.items():
         values = [v for s in group for v in s['values']]
         measurement = {'prompt_id': p, 'mode': mode, 'unit': group[0]['unit'], **stats(values)}
+        # The measured workload, recorded independently of the optional exactness rows (ABBA pairing compares it).
+        record = next((x for x in data['prompts'] if x['id'] == p), {})
+        measurement['workload'] = {'prompts': [{'id': p, 'sha256': record.get('sha256'), 'tokens': record.get('tokens')}],
+                                   'generate_length': length}
         if any('auto_prefill' in s for s in group): measurement['auto_prefill']=[s['auto_prefill'] for s in group]
         if 'timing_scope' in group[0]: measurement['timing_scope']=group[0]['timing_scope']
         data['measurements'].append(measurement)
@@ -859,13 +1021,14 @@ def finalize(out, write_refs=False, status='complete'):
                 e['verdict'] = 'MISMATCH'
     if any(e['verdict'] == 'MISMATCH' for e in data['exactness']):
         data['status'] = 'mismatch'
+    protocol(out, data)
     validate(data)
     dump(out / 'results.json', data)
     report(out / 'results.json')
     if write_refs:
         if any(s['token_ids_sha256'] is None for s in samples):
             raise ValueError('cannot write reference candidates without full token IDs')
-        if status != 'complete' or any(e['verdict'] == 'MISMATCH' for e in data['exactness']):
+        if status != 'complete' or data['status'] != status or any(e['verdict'] == 'MISMATCH' for e in data['exactness']):
             raise ValueError('failed/unstable runs cannot write reference candidates')
         dump(out / 'candidate-refs.json', {'schema_version': 1, 'engine': data['engine'],
                                           'candidate_only': True, 'identity': data['identity'],
@@ -903,6 +1066,8 @@ def validate(d):
     for p in d.get('logs', []):
         if Path(p).name != p or '\\' in p:
             raise ValueError('log path must be basename only')
+    if 'not_run' in d and not all(isinstance(x, dict) and set(x) == {'item', 'reason'} for x in d['not_run']):
+        raise ValueError('not_run entries need item and reason')
 
 
 def baseline(engine, p, mode, profile=None):
@@ -935,6 +1100,8 @@ def report(path):
     for m in d['measurements']:
         b = None if m.get('timing_scope')=='http-end-to-end' and not m['prompt_id'].startswith('http-c') else baseline(d['engine'], m['prompt_id'], m['mode'], d.get('params', {}).get('profile'))
         expected = f"{b['value']:g} {b['unit']}" if b else 'unpublished'
+        if b and 'pairs_faster' in b and 'pairs' in b:
+            expected += f" (ABBA {b['pairs_faster']}/{b['pairs']})"
         ratio = m['median'] / b['value'] if b else None
         within = b and abs(ratio - 1) <= b['tolerance'] and m['unit'] == b['unit']
         check = 'n/a' if not b else 'PASS' if within else 'WARN'
@@ -948,6 +1115,18 @@ def report(path):
     lines += ['', 'NO-REFERENCE is unqualified. Candidate references require maintainer review and an independent run.', '']
     for s in d.get('skipped', []):
         lines.append('Skipped: ' + s)
+    for x in d.get('not_run', []):
+        if x['item'] != 'skipped': lines.append(f"Not run: {x['item']} ({x['reason']})")
+    policy = d.get('cache_policy')
+    if policy:
+        lines.append(f"Cache state: {', '.join(k + ' ' + v for k, v in policy['states'].items())}; max cached_tokens "
+                     f"{policy['max_cached_tokens']} (allowed {policy['allowed_cached_tokens']}"
+                     f"{', reuse declared' if policy['declared_reuse'] else ''})"
+                     f"{'; NONCONFORMING: ' + '; '.join(policy['reasons']) if policy['nonconforming'] else ''}")
+    census = d.get('dispatch_census')
+    if census:
+        lines.append(f"Dispatch census: {census['dispatches']} dispatches, GPU busy {census['trace']['gpu_busy_share']:.1%} of span"
+                     + (f", {census['per_token']['launches']:.1f} launches/token" if 'per_token' in census else ''))
     lines += ['', 'Attach results.json and results.md to a GitHub issue. Review logs before attaching them.', '']
     path.with_suffix('.md').write_text('\n'.join(lines), encoding='utf-8', newline='\n')
 
@@ -982,6 +1161,8 @@ def http(out, port):
         first = None
         tokens = None
         output_ids = None
+        cached = None
+        timing = {}
         with urllib.request.urlopen(req, timeout=300) as response:
             for raw in response:
                 if not raw.startswith(b'data:') or raw.strip() == b'data: [DONE]':
@@ -996,13 +1177,23 @@ def http(out, port):
                     tokens = obj['usage'].get('completion_tokens')
                     if obj['usage'].get('prompt_tokens') != len(prompt_ids[prompt]):
                         raise ValueError('server prompt token count differs from shipped input IDs')
+                    # Prefix/prompt cache reuse is visible only through the engine's usage fields.
+                    details = obj['usage'].get('prompt_tokens_details')
+                    if isinstance(details, dict) and isinstance(details.get('cached_tokens'), int):
+                        cached = details['cached_tokens']
                 if obj.get('strix'):
                     output_ids = obj['strix'].get('token_ids')
+                    for key in ('queue_ms', 'prefill_ms', 'decode_ms'):
+                        if isinstance(obj['strix'].get(key), (int, float)):
+                            timing['engine_' + key] = obj['strix'][key]
         if first is None or not isinstance(tokens, int) or tokens <= 0 or not output_ids or len(output_ids) != tokens:
             raise ValueError('SSE response lacks first content, token IDs or matching completion usage')
         return {'request': index, 'prompt_id': prompt, 'prompt_sha256': id_hash(prompt_ids[prompt]),
                 'token_ids_sha256': id_hash(output_ids), 'ttft_s': first, 'completion_tokens': tokens,
-                'elapsed_s': time.perf_counter() - start}
+                'elapsed_s': time.perf_counter() - start,
+                # completion_tokens is the engine's usage count; the client count is the received ID vector.
+                'client_token_count': len(output_ids), 'cached_tokens': cached,
+                'prompt_tokens': len(prompt_ids[prompt]), **timing}
 
     measurements = []
     for c in map(int, os.environ.get('BENCH_CONCURRENCY', '1,4,8').split(',')):
@@ -1016,8 +1207,24 @@ def http(out, port):
             rates.append(sum(x['completion_tokens'] for x in results) / elapsed)
             ttfts.extend(x['ttft_s'] for x in results)
             requests.append(results)
-        measurements.extend([{'prompt_id': f'http-c{c}', 'mode': 'aggregate-wall', 'unit': 'tok/s', 'timing_scope':'http-end-to-end', **stats(rates)},
-                             {'prompt_id': f'http-c{c}', 'mode': 'ttft', 'unit': 's', 'timing_scope':'http-end-to-end', **stats(ttfts)}])
+        flat = [x for group in requests for x in group]
+        cache = {'cache_state': cache_state([x['cached_tokens'] for x in flat]),
+                 'cached_tokens_max': max((x['cached_tokens'] or 0) for x in flat)}
+        # Constituent prompts and requested generation length of this synthetic http-cN row.
+        cache['workload'] = {'prompts': [dict(id=i, sha256=h, tokens=n) for i, h, n in
+                                         sorted({(x['prompt_id'], x['prompt_sha256'], x['prompt_tokens']) for x in flat})],
+                             'generate_length': int(os.environ.get('BENCH_GEN_TOKENS', '128'))}
+        measurements.extend([{'prompt_id': f'http-c{c}', 'mode': 'aggregate-wall', 'unit': 'tok/s', 'timing_scope':'http-end-to-end', 'rate_source': 'client-clock', **cache, **stats(rates)},
+                             {'prompt_id': f'http-c{c}', 'mode': 'ttft', 'unit': 's', 'timing_scope':'http-end-to-end', 'rate_source': 'client-clock', **cache, **stats(ttfts)}])
+        # Engine-timed rows (strix receipt decode_ms/prefill_ms) beside the client clock; absent rows go to not_run.
+        if flat and all(x.get('engine_decode_ms', 0) > 0 and x['completion_tokens'] > 1 for x in flat):
+            measurements.append({'prompt_id': f'http-c{c}', 'mode': 'engine-decode', 'unit': 'tok/s', 'timing_scope': 'engine',
+                                 'rate_source': 'engine', **cache,
+                                 **stats([x['completion_tokens'] * 1000 / x['engine_decode_ms'] for x in flat])})
+        if flat and all(x.get('engine_prefill_ms', 0) > 0 for x in flat):
+            measurements.append({'prompt_id': f'http-c{c}', 'mode': 'engine-ttft', 'unit': 's', 'timing_scope': 'engine',
+                                 'rate_source': 'engine', **cache,
+                                 **stats([(x.get('engine_queue_ms', 0) + x['engine_prefill_ms']) / 1000 for x in flat])})
         dump(out / f'http-c{c}.json', {'concurrency': c, 'max_tokens': int(os.environ.get('BENCH_GEN_TOKENS', '128')), 'requests': requests})
     dump(out / 'http-measurements.json', measurements)
 
@@ -1109,8 +1316,9 @@ def main(args):
             d['measurements'].extend(read(out / 'http-measurements.json'))
             dump(out / 'results.json', d)
             report(out / 'results.json')
-        # Results are written first; a MISMATCH verdict must still fail `run`.
-        if read(out / 'results.json')['status'] == 'mismatch':
+        # Results are written first; a MISMATCH verdict or a refused cache-reuse run must still fail `run`.
+        final = read(out / 'results.json')
+        if final['status'] == 'mismatch' or final.get('cache_policy', {}).get('refused'):
             return 1
     elif action == 'report':
         report(Path(args[1]))
@@ -1130,6 +1338,21 @@ def main(args):
             raise ValueError('HTTP port must be in 1..65535')
         with socket.socket() as s:
             s.bind(('localhost', port))
+    elif action == 'not-run':
+        path = Path(args[1]) / 'not-run.json'
+        items = read(path) if path.exists() else []
+        items.append({'item': args[2], 'reason': args[3]})
+        dump(path, items)
+    elif action == 'pairs':
+        # pairs OUT.json A=results.json B=results.json B=... A=... (process order)
+        arms = [tuple(x.split('=', 1)) for x in args[2:]]
+        if any(len(x) != 2 or x[0] not in ('A', 'B') for x in arms): raise ValueError('pairs takes ARM=results.json with ARM A or B')
+        result = pairs(arms)
+        dump(args[1], result)
+        print(json.dumps(result))
+    elif action == 'census':
+        # census RUN_DIR TRACE [dispatch_census.py options]
+        attach_census(Path(args[1]), Path(args[2]), args[3:])
     elif action == 'skipped':
         dump(Path(args[1]) / 'skipped.json', [args[2]])
     else:

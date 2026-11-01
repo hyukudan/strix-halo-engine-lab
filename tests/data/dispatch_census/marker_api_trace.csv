@@ -1,0 +1,4 @@
+"Domain","Function","Process_Id","Thread_Id","Correlation_Id","Start_Timestamp","End_Timestamp"
+"MARKER_CORE_API","window",1,100,1,10000,10000
+"MARKER_CORE_API","other",1,100,2,15000,15000
+"MARKER_CORE_API","window",1,100,3,20000,20000
