@@ -93,19 +93,38 @@ __global__ void __launch_bounds__(256) rows_linear_kernel(LinearView w, LinearVi
             }
         }
     }
+    if constexpr (Gate) {
+        // Pair p = t * R + rr is reduced by the whole wave, kept by lane p % 32,
+        // and its gelu_tanh(gate) * up evaluated there: the same scalar
+        // operations as one lane-0 epilogue per pair, 32 pairs per pass.
+        constexpr unsigned pairs = T * R;
 #pragma unroll
-    for (unsigned t = 0; t < T; ++t) {
+        for (unsigned base = 0; base < pairs; base += 32U) {
+            float ga = 0.0F, ub = 0.0F;
 #pragma unroll
-        for (unsigned rr = 0; rr < R; ++rr) {
-            const float sa = wave_sum(acc[t][rr]);
-            float sb = 0.0F;
-            if constexpr (Gate)
-                sb = wave_sum(uacc[t][rr]);
-            if (lane == 0 && first + t < w.outputs && row0 + rr < rows) {
-                const float value = Gate ? gelu_tanh(sa) * sb : sa;
+            for (unsigned p = base; p < pairs && p < base + 32U; ++p) {
+                const float sa = wave_sum(acc[p / R][p % R]), sb = wave_sum(uacc[p / R][p % R]);
+                if (lane == p - base) { ga = sa; ub = sb; }
+            }
+            const unsigned p = base + lane, t = p / R, rr = p % R;
+            if (p < pairs && first + t < w.outputs && row0 + rr < rows) {
+                const float value = gelu_tanh(ga) * ub;
                 out[std::size_t(row0 + rr) * w.outputs + first + t] = value;
                 if (failure)
                     finite_flag(value, failure);
+            }
+        }
+    } else {
+#pragma unroll
+        for (unsigned t = 0; t < T; ++t) {
+#pragma unroll
+            for (unsigned rr = 0; rr < R; ++rr) {
+                const float sa = wave_sum(acc[t][rr]);
+                if (lane == 0 && first + t < w.outputs && row0 + rr < rows) {
+                    out[std::size_t(row0 + rr) * w.outputs + first + t] = sa;
+                    if (failure)
+                        finite_flag(sa, failure);
+                }
             }
         }
     }
@@ -196,9 +215,12 @@ void gate_up_rows(LinearView gate, LinearView up, const float* x, unsigned rows,
         return;
     if (!gate.data || !up.data || gate.outputs != up.outputs || gate.inputs != up.inputs)
         throw std::runtime_error("gate/up geometry");
+    // Fused by default: one tile reads x once for gate and up and evaluates
+    // the GELU product on all 32 lanes (+4-5 % exact prefill at 512/2K over the
+    // split schedule). STRIX_G4_ROWS_GATE_SPLIT=1 restores the split schedule.
     static const bool split_default = [] {
         const auto* p = std::getenv("STRIX_G4_ROWS_GATE_SPLIT");
-        return !p || std::string_view(p) != "0";
+        return p && std::string_view(p) == "1";
     }();
     if (many && scratch && rows > 8U && (split < 0 ? split_default : split != 0)) {
         linear_rows(gate, x, rows, out, q, failure, true, variant);

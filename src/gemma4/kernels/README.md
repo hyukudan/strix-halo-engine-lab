@@ -47,8 +47,13 @@ elements in ascending order, and the 32 lane values meet in `wave_sum`. A
 workgroup of eight waves covers 32 outputs and 16 rows (Q6_K: 16 outputs and 32
 rows); each wave decodes its lane chunk once (the shared `WeightChunk` decoder) and applies
 it to every row, while the rows' FP32 inputs are staged in LDS per 512-element K
-block, half a block per barrier. Gate/up runs as two such linears and the
-separate gelu product (`STRIX_G4_ROWS_GATE_SPLIT=0`: one fused gate/up tile).
+block, half a block per barrier. Gate/up runs as one fused tile that reads x
+once for both matrices; after the two wave sums of each pair, pair p of a wave
+is kept by lane p % 32, which evaluates `gelu_tanh(gate) * up`, so the GELU
+epilogue runs on all 32 lanes instead of lane 0 (same scalar operations, same
+bytes). Exact prefill, Q4_K_M, en_chat, interleaved A/B: 470/448 -> 490/470
+tok/s at 512/2K, 427 -> 444 at 8K (+4-5 %). `STRIX_G4_ROWS_GATE_SPLIT=1` restores two linears
+plus the separate gelu product.
 `STRIX_G4_ROWS_TILE=0..7` forces one tile shape (same bytes);
 `STRIX_G4_PREFILL_EXACT_MANYROW=0` uses the eight-row slices. Calls of at most
 eight rows, unaligned widths and mixed gate/up formats always use the slices.
