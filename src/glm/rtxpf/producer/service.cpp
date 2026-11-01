@@ -111,12 +111,15 @@ Json ttft(p::Runtime& runtime,const std::vector<std::uint32_t>& prompt,unsigned 
     runtime.reset_expert_cache(true);const auto begin=std::chrono::steady_clock::now();
     auto prefill=strix::serve::parse_json(runtime.begin_session(prompt));const auto prefilled=std::chrono::steady_clock::now();
     auto state=session_digest(runtime,runtime.session_tokens());
+    // The deferred decode residency restore runs here, untimed (a prefill-only request never pays it);
+    // its own time, units/bytes copied and cache counters are reported separately.
+    const auto decode_restore=strix::serve::parse_json(runtime.restore_decode_residency());
     const auto first_begin=std::chrono::steady_clock::now();auto first=strix::serve::parse_json(runtime.decode_one(false));const auto done=std::chrono::steady_clock::now();
     auto rec=Json::object();rec.set("prompt_tokens",std::uint64_t(prompt.size()));rec.set("backend",runtime.expert_tier());
     rec.set("row_tile",int(runtime.prefill_row_tile()));rec.set("allocated_row_tile",int(runtime.allocated_prefill_row_tile()));rec.set("row_tile_requested",int(row_tile));
     rec.set("prefill_tile_crossover",int(runtime.prefill_tile_crossover()));if(auto* c=prefill.find("row_tile_choice"))rec.set("row_tile_choice",*c);
-    // prefill phases: the prefill's own cache counters, per-layer make_resident ms, the in-prefill decode residency restore
-    if(auto* t=prefill.find("prefill_timings")){for(const char* k:{"prefill_cache","make_resident_ms_total","make_resident_ms_per_layer","decode_restore"})if(auto* v=t->find(k))rec.set(k,*v);}
+    rec.set("decode_restore",decode_restore);
+    if(auto* t=prefill.find("prefill_timings")){for(const char* k:{"prefill_cache","make_resident_ms_total","make_resident_ms_per_layer"})if(auto* v=t->find(k))rec.set(k,*v);}
     // the prefill's own expert cache traffic (file units read during this prefill; cheap: a counter delta)
     if(auto* c=prefill.find("prefill_expert_cache"))for(const char* k:{"file_reads","file_bytes","file_read_ns","misses","fetched","h2d_bytes"})if(auto* v=c->find(k))rec.set(std::string("prefill_")+k,*v);
     const double prefill_s=std::chrono::duration<double>(prefilled-begin).count(),first_s=std::chrono::duration<double>(done-first_begin).count();

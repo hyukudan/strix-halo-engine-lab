@@ -271,6 +271,11 @@ inline std::vector<std::uint8_t> tier_assignment(const TierBudget& b,std::uint64
 // across ALL layers (expert 0 of layers 3..45, expert 1 of layers 3..45, ...),
 // so every layer holds the same share of the device instead of layer order.
 inline constexpr unsigned routed_gated=routed_last_layer-routed_first_layer+1;
+// Arena spares a prefill needs so that one gated layer's make_resident(288) fits in free slots
+// instead of evicting other layers' decode residents: 288 minus that layer's residents (the
+// placement spreads the residents round-robin: at least resident_units / 43 per layer).
+inline unsigned prefill_spares_needed(std::uint64_t resident_units){
+    const auto per=resident_units/routed_gated;return per>=routed_experts?0u:unsigned(routed_experts-per);}
 inline std::vector<std::uint32_t> round_robin_order(unsigned gated=routed_gated,unsigned units=routed_experts){
     std::vector<std::uint32_t> o;o.reserve(std::size_t(gated)*units);
     for(unsigned u=0;u<units;++u)for(unsigned g=0;g<gated;++g)o.push_back(g*units+u);return o;
