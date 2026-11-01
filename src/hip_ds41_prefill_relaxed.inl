@@ -21,8 +21,8 @@ constexpr unsigned relaxed_down_lds_bytes = relaxed_stage_bytes + relaxed_tile_w
 // batches as fit in 64 rows; block i (batch i) runs the group that starts at batch i, else it has no work. Any batch
 // layout the views accept is covered exactly once (no assumption that batches are full or contiguous).
 struct RelaxedRows { unsigned expert, first, batches, count; };
-__device__ __forceinline__ bool relaxed_rows_of(const PrefillRoutesView& routes, RelaxedRows& b) {
-    const unsigned i = blockIdx.x, total = *routes.batch_total;
+__device__ __forceinline__ bool relaxed_rows_of(const PrefillRoutesView& routes, RelaxedRows& b, unsigned i) {
+    const unsigned total = *routes.batch_total;
     if (i >= total) return false;
     const unsigned e = routes.batch_expert[i];
     unsigned start = i;
@@ -189,13 +189,16 @@ __device__ __forceinline__ void relaxed_products(unsigned char* lds, const unsig
 }
 
 // Gate/up: wave w = 2q + m (matrix m: gate, up; outputs 32 q .. of the block's 128).
-template <WeightFormat Format>
+// Swap (STRIX_DS41_FAST_MOE_ORDER, default 1): the grid's x walks the output blocks and y the batches, so the output blocks of one
+// row group run together and share its activations and its expert's weights in the cache; only the block order changes.
+template <WeightFormat Format, bool Swap>
 __global__ __launch_bounds__(relaxed_threads) void relaxed_gate_up_kernel(PrefillGateUpView view) {
+    const unsigned bx = Swap ? blockIdx.y : blockIdx.x, by = Swap ? blockIdx.x : blockIdx.y;
     __shared__ __attribute__((aligned(16))) unsigned char lds[relaxed_lds_bytes];
     __shared__ unsigned long long grid[Format == WeightFormat::iq2_xxs ? 256 : 1];
     __shared__ unsigned row_of[relaxed_rows], slot_of[relaxed_rows];
     RelaxedRows b;
-    if (!relaxed_rows_of(view.routes, b)) return;
+    if (!relaxed_rows_of(view.routes, b, bx)) return;
     if constexpr (Format == WeightFormat::iq2_xxs) load_grid(grid);
     if (threadIdx.x < b.count) {
         const unsigned entry = relaxed_entry(view.routes, b, threadIdx.x);
@@ -204,7 +207,7 @@ __global__ __launch_bounds__(relaxed_threads) void relaxed_gate_up_kernel(Prefil
     }
     __syncthreads();
     const unsigned wave = threadIdx.x / 32U, lane = threadIdx.x % 32U, m = wave & 1U, q = wave >> 1U, h = lane >> 4U, i16 = lane & 15U;
-    const unsigned out0 = blockIdx.y * 128U;
+    const unsigned out0 = by * 128U;
     const auto* weights = static_cast<const unsigned char*>(m == 0U ? view.gate : view.up) + b.expert * view.expert_stride_bytes +
         static_cast<unsigned long long>(out0 + 32U * q + lane) * view.row_bytes;
     float acc[relaxed_tiles][2][8];
@@ -255,28 +258,29 @@ __global__ __launch_bounds__(relaxed_threads) void relaxed_gate_up_kernel(Prefil
         for (int stride = 16; stride; stride /= 2) sum += __shfl_xor(sum, stride, 32);
         view.act_codes[slot * view.inter + out0 + 32U * gq + lane] = static_cast<signed char>(code);
         if (lane == 0U) {
-            view.act_deltas[slot * groups + blockIdx.y * 4U + gq] = delta;
-            view.act_sums[slot * groups + blockIdx.y * 4U + gq] = sum;
+            view.act_deltas[slot * groups + by * 4U + gq] = delta;
+            view.act_sums[slot * groups + by * 4U + gq] = sum;
         }
     }
 }
 
 // Down: wave w: outputs 32 w .. of the block's 256.
-template <WeightFormat Format>
+template <WeightFormat Format, bool Swap>
 __global__ __launch_bounds__(relaxed_threads) void relaxed_down_kernel(PrefillDownView view) {
+    const unsigned bx = Swap ? blockIdx.y : blockIdx.x, by = Swap ? blockIdx.x : blockIdx.y;
     __shared__ __attribute__((aligned(16))) unsigned char lds[relaxed_down_lds_bytes];
     __shared__ unsigned slot_of[relaxed_rows];
     RelaxedRows b;
-    if (!relaxed_rows_of(view.routes, b)) return;
+    if (!relaxed_rows_of(view.routes, b, bx)) return;
     if (threadIdx.x < b.count) slot_of[threadIdx.x] = view.routes.entry_slots[relaxed_entry(view.routes, b, threadIdx.x)];
     __syncthreads();
     const unsigned wave = threadIdx.x / 32U, lane = threadIdx.x % 32U, h = lane >> 4U, i16 = lane & 15U;
-    const unsigned first = blockIdx.y * 256U + 32U * wave;
+    const unsigned first = by * 256U + 32U * wave;
     const auto* weights = static_cast<const unsigned char*>(view.weights) + b.expert * view.expert_stride_bytes +
         static_cast<unsigned long long>(first + lane) * view.row_bytes;
     float acc[relaxed_tiles][2][8];
     const auto* tile_base = static_cast<const unsigned char*>(view.weights) + b.expert * view.expert_stride_bytes +
-        static_cast<unsigned long long>(blockIdx.y) * 256U * view.row_bytes;
+        static_cast<unsigned long long>(by) * 256U * view.row_bytes;
     relaxed_products<Format>(lds, weights, view.width, slot_of, b.count, view.codes, view.deltas, nullptr, acc, tile_base, view.row_bytes);
 #pragma unroll
     for (unsigned mt = 0; mt < relaxed_tiles; ++mt)

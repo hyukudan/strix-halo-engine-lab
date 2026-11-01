@@ -1398,6 +1398,22 @@ The exact attention combine already forms the A8 operands of o (int8 codes, delt
 - **Measured gain:** Two-node serve TTFT at 8,399 / 32,499 tokens (one binary, cache off, one load per arm, default first): 8.883 / 31.251 s with STRIX_DS41_PREFILL_O_A8_FUSED=0 vs 8.767 / 30.886 s default (-1.3 / -1.2 %); logits and generated ids identical.
 - **Public evidence:** [Prefill attention site](../src/hip_deepseek41_prefill.hip)
 
+<a id="ds-fast-moe-order"></a>
+
+### FAST MoE block order
+
+**Engine:** `deepseek`. **Control:** `STRIX_DS41_FAST_MOE_ORDER`. **Default:** ON (with `STRIX_DS41_FAST_MOE=1`).
+
+The FAST relaxed MoE kernels (gate/up and down, `--profile fast`) are launched with the output blocks fastest, so the output blocks of one row group run together and reuse its activations and its expert's weight slabs from the cache instead of re-reading them for every output block. Only the block order changes.
+
+- **Preconditions:** STRIX_DS41_FAST_MOE=1 (--profile fast) and at most 65,535 route batches per call (else the batch-fastest order).
+- **Automatic selection:** On whenever the FAST relaxed MoE kernels run.
+- **Fallback notice:** None.
+- **Exactness evidence:** The FAST relaxed MoE kernels' outputs are bitwise identical in both block orders: rank-shaped bench (layer 20, 2048 / 4096 / 8192 rows) A8 codes, deltas, sums and raw down vectors, and two-node serve logits and generated ids under --profile fast. The FAST identity itself is unchanged.
+- **Off switch:** STRIX_DS41_FAST_MOE_ORDER=0
+- **Measured gain:** Two-node serve TTFT with STRIX_DS41_FAST_MOE=1 at 8,399 / 32,499 tokens (one binary, cache off, one load per arm, two GPU turns in opposite arm order): 8.279 / 28.34 s with STRIX_DS41_FAST_MOE_ORDER=0 vs 8.107 / 27.65 s default (-2.1 / -2.4 %). Rank-shaped kernel bench: -2..-4 %.
+- **Public evidence:** [FAST relaxed MoE kernels](../src/hip_ds41_prefill_relaxed.inl)
+
 <a id="ds-dense"></a>
 
 ### Exact dense prefill selector
