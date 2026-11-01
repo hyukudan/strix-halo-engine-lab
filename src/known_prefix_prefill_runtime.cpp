@@ -1,5 +1,6 @@
 #include "strix/startup_markers.hpp"
 #include "strix/qpf2k_defaults.hpp"
+#include "strix/qsa_cache_only.hpp"
 #include "strix/known_prefix_prefill.hpp"
 #include "strix/dispatch_resources.hpp"
 #include "strix/execution_arena.hpp"
@@ -216,6 +217,12 @@ KnownWindowResult execute_known_prefix_prefill_eager(const CompiledKnownPrefixPr
         for(std::size_t i=0;i<steps;++i) if(serial.execution.steps[i].writes_state!=PersistentState::none) last_write=i;
         if(last_write+1U<headless_from) headless_from=last_write+1U;
     }
+    // STRIX_QSA_CACHE_ONLY: when that cut leaves an indexed-attention step last, only its persistent writes are needed.
+    std::size_t cache_only_step=SIZE_MAX;
+    if(headless&&!hooks.after_step&&headless_from>=1U&&headless_from<steps&&
+        serial.execution.steps[headless_from-1U].op==SerialOp::indexed_attention&&
+        plan.tile8.mode[headless_from-1U]==KnownWindowStepMode::qsa_rows&&strix::qsa_cache_only::enabled())
+        cache_only_step=headless_from-1U;
     if(!headless) {
         if(hooks.partial_rows) {
             if(plan.output_policy==KnownWindowOutputPolicy::terminal_row) result.logit_row_indices={rows-1U};
@@ -366,6 +373,7 @@ KnownWindowResult execute_known_prefix_prefill_eager(const CompiledKnownPrefixPr
                 const auto contexts_of=[&](std::size_t s) {
                     std::vector<ExecutionDispatchContext> v(rows);for(std::uint32_t r=0;r<rows;++r) v[r]=context(s,r);return v;
                 };
+                const strix::qsa_cache_only::Scope cache_only(step==cache_only_step);
                 // STRIX_QPF2K_SCHED first: its hook enqueues only the detached shared expert itself and records the
                 // side-stream join before every other step, so a step that the HC fold enqueues (below) is ordered after it.
                 if(!(hooks.prefill_step&&hooks.prefill_step(step,all))

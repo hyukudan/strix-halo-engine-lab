@@ -742,6 +742,17 @@
   },
   {
     "engine": "qwen",
+    "name": "Last-layer cache-only QSA step on headless prefill blocks",
+    "flag_or_env": "STRIX_QSA_CACHE_ONLY",
+    "default": "1",
+    "exact": "Exact: plain default command, same binary on/off: full logits of the prefill and of 32 decode steps byte-identical with tokens at 4K (not admitted, one block with a head) and 32K (T8192, three headless blocks); 262K YaRN serial route: 32 generated tokens identical in four alternating runs (no logits/state digest on that route).",
+    "gain": "262K YaRN serial prefill, 2 runs per arm alternating: 191.04 / 193.21 s on vs 194.76 / 200.17 s off (means 192.1 vs 197.5 s; adjacent pairs -1.6 to -7.0 s); 32K: neutral on the current T16384 route (one headless block; +0.04 / +0.07 s mean in two runs per order), -0.41 s on the earlier T8192 route (three headless blocks)",
+    "preconditions": "Tiled prefill blocks without a head and without a step observer whose last state-writing step is a QSA layer (STRIX_PREFILL_PIPE bit 64 cut active); the MTP route (step observer) and blocks with a head run the full step.",
+    "off_switch": "STRIX_QSA_CACHE_ONLY=0",
+    "doc_anchor": "docs/optimizations.md#qwen-qsa-cache-only"
+  },
+  {
+    "engine": "qwen",
     "name": "QSA scorer R64 above 65,536 blocks",
     "flag_or_env": "STRIX_QSA_SCORE_ROWS64",
     "default": "1 (from 65,536 blocks; per-group 64-row scoring follows the policy)",

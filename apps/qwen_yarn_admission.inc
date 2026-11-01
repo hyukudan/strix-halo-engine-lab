@@ -65,6 +65,9 @@ inline std::string yarn_environment_refusal(const Environment& environment, unsi
             name == "STRIX_QSA_DECODE_VALUE_V2") continue;
         // Serial MoE glue launches (clear, route checks, quantizer, merge, scan, commit, status) perform no rotation.
         if (name == "STRIX_MOE_R1_GLUE_FUSE") continue;
+        // Last-layer cache-only QSA step (strix/qsa_cache_only.hpp): its only rotary site is the k norm/rope of the
+        // full step (norm_rope group/wave/per-set kernels under with_qwen_rotary) with the q / index-query heads left out.
+        if (name == "STRIX_QSA_CACHE_ONLY") continue;
         // Compact tiled-prefill memory controls choose where scores, maxima, rounded output images and terminal logits live; the score ring and
         // stage split reuse the same table-bound norm/RoPE, pool and scorer launches, so they add no rotary site.
         if (name == "STRIX_QPF2K_COMPACT_IMAGES" || name == "STRIX_CTX_EXACT_MEMORY" || name == "STRIX_QSA_SCORE_RING" || name == "STRIX_QSA_SCORE_RING_ROWS" ||

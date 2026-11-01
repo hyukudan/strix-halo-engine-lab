@@ -75,6 +75,27 @@ inline std::string without_added_prefill_reports(std::string text) {
     return text;
 }
 
+// Long-context items added after the frozen table ({"enabled":..,"suppression":..} objects): each is
+// reported and tested on its own, so strip it from the frozen comparison.
+inline std::string without_added_long_context_items(std::string text) {
+    for(const char* key:{"STRIX_QSA_CACHE_ONLY"}) {
+        // Only inside "long_context_items" (the requested environment may carry the same name).
+        const auto object=text.find("\"long_context_items\":{");
+        if(object==std::string::npos) return text;
+        const auto close=text.find("}}",object);
+        const auto needle=std::string("\"")+key+"\":{";
+        auto start=text.find(needle,object);
+        if(start==std::string::npos || (close!=std::string::npos && start>close)) continue;
+        auto end=text.find('}',start+needle.size());
+        if(end==std::string::npos) continue;
+        ++end;
+        if(end<text.size() && text[end]==',') ++end;
+        else if(start>0 && text[start-1]==',') --start;
+        text.erase(start,end-start);
+    }
+    return text;
+}
+
 // Public-main resolver output fingerprints. Generation uses the same fixture
 // against the preserved source; expected values are in the adjacent table.
 inline std::vector<std::pair<std::string,std::string>> cache_compatibility_records(const strix::ModelContract& model) {
@@ -89,7 +110,7 @@ inline std::vector<std::pair<std::string,std::string>> cache_compatibility_recor
         auto text=effective_config_json(config);
         // New report is additive; compare every incumbent field, including its
         // original representation/reason, rather than a handpicked subset.
-        text=without_added_prefill_reports(without_prefix_reuse_policy(without_cache_policy(std::move(text))));
+        text=without_added_long_context_items(without_added_prefill_reports(without_prefix_reuse_policy(without_cache_policy(std::move(text)))));
         text+=';'+std::to_string(o.prefix_batch_cert)+';'+std::to_string(o.session_management_requested);
         text+=';'+std::to_string(ordinary_http_batch_slots(o))+';'+std::to_string(o.prefix_cache_every);
         text+=';'+std::to_string(o.prefix_cache_disk_bytes)+';'+o.prefix_cache_dir;
