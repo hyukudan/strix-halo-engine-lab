@@ -410,6 +410,10 @@ struct DevicePrefill::Impl {
     // row_split with staged_half: the MoE input all-gather the same way (packed into the pinned send buffer right after
     // the router, crossing while the shared expert runs). Default on; STRIX_DS41_PREFILL_STAGED_GATHER=0: the copy path.
     bool staged_gather = false;
+    // row_split, final entries: the first chunk's q_b runs before the host waits for the peer's entries (it reads only
+    // this rank's rows), so the wait no longer leaves the GPU idle. Same kernel, same inputs: bitwise identical. Only
+    // when the next unit boundary does not park (m.q is shared). Default on; STRIX_DS41_PREFILL_EARLY_QB=0: after.
+    bool early_q_b = true;
     Dev<std::uint32_t> pack_send, pack_recv;
     // sites run on the dense WMMA kernel instead of the batch kernel (STRIX_DS41_PREFILL_DENSE_SITES, comma list of
     // q_a, kv, q_b, o_a; default q_a,kv, faster on the dense kernel at 512 and 2048 rows; "none" = all on the batch
@@ -973,6 +977,7 @@ DevicePrefill::DevicePrefill(const std::filesystem::path& gguf, const PrefillOpt
             }
             m.staged_gather = m.staged_half;
             if (const char* v = std::getenv("STRIX_DS41_PREFILL_STAGED_GATHER"); v != nullptr && v[0] == '0') m.staged_gather = false;
+            if (const char* v = std::getenv("STRIX_DS41_PREFILL_EARLY_QB"); v != nullptr && v[0] == '0') m.early_q_b = false;
         }
         m.half_own = Dev<float>(half_rows * H);
         m.half_other = Dev<float>(half_rows * H);
@@ -2111,6 +2116,46 @@ PrefillResult DevicePrefill::run_from(std::span<const std::uint32_t> tokens, std
                     attn::hip::enqueue_compress(v, st);
                     L.carry_cur = 1 - L.carry_cur;
                 };
+                // q = q_b(qr) of this rank's chunk at r0 (n rows) into m.q
+                const auto q_b_chunk = [&](std::uint32_t r0, std::uint32_t n) {
+                    const bool fp16_q_b = m.fp16_at(4U, layer, n);
+                    if (fp16_q_b && m.options.fp16_fast) {
+                        ds41::Q8A8DensePrefillView v;
+                        v.weight = q8_rows(m.dev(p + "attn_q_b.weight"), std::size_t{head0} * c.head_dim, QA);
+                        v.width = QA;
+                        v.count = QL;
+                        v.rows = n;
+                        v.x_stride = QA;
+                        v.out = m.q.p;
+                        v.out_stride = QL;
+                        m.fast(&v, 1U, n, m.qr16.p + std::size_t{r0} * QA, QA, nullptr, st);
+                    } else if (fp16_q_b || (m.dense_q_b && n >= m.dense_min_rows)) {
+                        ds41::Q8A8DensePrefillView v;
+                        v.weight = q8_rows(m.dev(p + "attn_q_b.weight"), std::size_t{head0} * c.head_dim, QA);
+                        v.width = QA;
+                        v.count = QL;
+                        v.codes = m.qcodes.p + std::size_t{r0} * QA;
+                        v.deltas = m.qdeltas.p + std::size_t{r0} * QA / 32U;
+                        v.rows = n;
+                        v.x_stride = QA;
+                        v.out = m.q.p;
+                        v.out_stride = QL;
+                        m.dense(v, m.qr.p + std::size_t{r0} * QA, st, fp16_q_b);
+                    } else {
+                        ds41::Q8A8PrefillView v;
+                        v.weight = q8_rows(m.dev(p + "attn_q_b.weight"), std::size_t{head0} * c.head_dim, QA);
+                        v.width = QA;
+                        v.groups = 1;
+                        v.per_group = QL;
+                        v.routes = site_routes(n, 1U);
+                        v.codes = m.qcodes.p + std::size_t{r0} * QA;
+                        v.deltas = m.qdeltas.p + std::size_t{r0} * QA / 32U;
+                        v.out = m.q.p;
+                        ds41::enqueue_q8_0_a8_prefill(v, st);
+                    }
+                };
+                // m.early_q_b: the first chunk's q_b already ran while the final entries crossed (below)
+                bool first_q_b_done = false;
                 // Every window K/V of the layer (rows from k0) and every compressed entry (rows from x0: below k0 only a KV
                 // source in the cone, layer 20, whose entries every decoder layer reads) in row order on the main stream;
                 // a row's index scores, selection and attention read only entries of rows up to its own, so the windows
@@ -2169,6 +2214,13 @@ PrefillResult DevicePrefill::run_from(std::span<const std::uint32_t> tokens, std
                         m.options.communicator->start_staged(st, entry_bytes,
                                                              dist::Tag{static_cast<std::uint32_t>(dist::TagKind::raw_slots), layer, ++exchange_seq});
                         index_projections();  // while the entries cross
+                        // the first chunk's q_b too, unless the task parks at that chunk's boundary (m.q is shared)
+                        if (m.early_q_b && o0 < Tn && (m.task == nullptr || m.task->runs_through(PrefillUnitLevel::finest, 1U))) {
+                            mark_part(0);  // timing: the q_b into its own part, as in the loop
+                            q_b_chunk(o0, std::min(C, Tn - o0));
+                            mark_part(2);
+                            first_q_b_done = true;
+                        }
                         recv_words = static_cast<const std::uint32_t*>(m.options.communicator->finish_staged(st));
                     } else {
                         start_gather();
@@ -2259,41 +2311,7 @@ PrefillResult DevicePrefill::run_from(std::span<const std::uint32_t> tokens, std
                         cut(PrefillUnitLevel::finest, s.layer, "attn.chunk");
                         ++chunks_cut;
                     }
-                    const bool fp16_q_b = m.fp16_at(4U, layer, n);
-                    if (fp16_q_b && m.options.fp16_fast) {
-                        ds41::Q8A8DensePrefillView v;
-                        v.weight = q8_rows(m.dev(p + "attn_q_b.weight"), std::size_t{head0} * c.head_dim, QA);
-                        v.width = QA;
-                        v.count = QL;
-                        v.rows = n;
-                        v.x_stride = QA;
-                        v.out = m.q.p;
-                        v.out_stride = QL;
-                        m.fast(&v, 1U, n, m.qr16.p + std::size_t{r0} * QA, QA, nullptr, st);
-                    } else if (fp16_q_b || (m.dense_q_b && n >= m.dense_min_rows)) {
-                        ds41::Q8A8DensePrefillView v;
-                        v.weight = q8_rows(m.dev(p + "attn_q_b.weight"), std::size_t{head0} * c.head_dim, QA);
-                        v.width = QA;
-                        v.count = QL;
-                        v.codes = m.qcodes.p + std::size_t{r0} * QA;
-                        v.deltas = m.qdeltas.p + std::size_t{r0} * QA / 32U;
-                        v.rows = n;
-                        v.x_stride = QA;
-                        v.out = m.q.p;
-                        v.out_stride = QL;
-                        m.dense(v, m.qr.p + std::size_t{r0} * QA, st, fp16_q_b);
-                    } else {
-                        ds41::Q8A8PrefillView v;
-                        v.weight = q8_rows(m.dev(p + "attn_q_b.weight"), std::size_t{head0} * c.head_dim, QA);
-                        v.width = QA;
-                        v.groups = 1;
-                        v.per_group = QL;
-                        v.routes = site_routes(n, 1U);
-                        v.codes = m.qcodes.p + std::size_t{r0} * QA;
-                        v.deltas = m.qdeltas.p + std::size_t{r0} * QA / 32U;
-                        v.out = m.q.p;
-                        ds41::enqueue_q8_0_a8_prefill(v, st);
-                    }
+                    if (!first_q_b_done || r0 != o0) q_b_chunk(r0, n);
                     mark_part(2);
                     check(hipEventRecord(m.chunk_ready, st), "chunk ready");
                     for (auto& ln : m.lanes) check(hipStreamWaitEvent(ln.stream, m.chunk_ready, 0), "lane wait");
