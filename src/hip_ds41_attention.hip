@@ -1247,9 +1247,10 @@ __device__ __forceinline__ void attention_combine_head(const AttentionView& v, u
     if (v.codes == nullptr) return;
     // A8 of the 32-value group held by lanes 2k, 2k + 1 (16 values each), quantize_a8's bits: the order-free maximum
     // of |y|, delta = amax / 127 (1 for a zero or tiny group), code = rint(y / delta) clamped to +-127, exact sum.
-    float amax = 0.0F;
+    // seeded from the first value (as quantize_a8's per-lane |y|): a group of NaNs keeps a NaN maximum and delta
+    float amax = fabsf(acc[0]);
 #pragma unroll
-    for (unsigned i = 0; i < 16; ++i) amax = fmaxf(amax, fabsf(acc[i]));
+    for (unsigned i = 1; i < 16; ++i) amax = fmaxf(amax, fabsf(acc[i]));
     amax = fmaxf(amax, xor_lane<1>(amax));
     const bool tiny = amax > 0.0F && amax < 0x1p-119F;
     const float delta = amax == 0.0F || tiny ? 1.0F : amax / 127.0F;

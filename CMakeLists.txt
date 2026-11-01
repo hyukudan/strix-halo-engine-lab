@@ -3142,7 +3142,7 @@ if(STRIX_ENABLE_HIP_RUNTIME)
     set(strix_ds41_attention_hip_targets strix_ds41_attention_hip)
     if(BUILD_TESTING)
         add_executable(strix-hip-ds41-attention-tests tests/hip_ds41_attention_tests.hip)
-        target_link_libraries(strix-hip-ds41-attention-tests PRIVATE strix_ds41_attention_hip)
+        target_link_libraries(strix-hip-ds41-attention-tests PRIVATE strix_ds41_attention_hip strix_ds41_hip)
         add_test(NAME strix-hip-ds41-attention-tests COMMAND strix-hip-ds41-attention-tests)
         list(APPEND strix_ds41_attention_hip_targets strix-hip-ds41-attention-tests)
         # FAST lever ds41-attn-f16wmma-v1: error bounds vs the exact attention + timing of both

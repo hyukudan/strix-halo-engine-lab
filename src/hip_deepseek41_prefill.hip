@@ -357,6 +357,11 @@ __global__ void final_entries_kernel(FinalEntries f) {
         else *e = q[i];
     }
 }
+// STRIX_DS41_PREFILL_O_A8_FUSED (read per call; default on, =0 off): the attention combine writes o's A8 operands
+bool prefill_o_a8_fused() {
+    const char* v = std::getenv("STRIX_DS41_PREFILL_O_A8_FUSED");
+    return !(v && v[0] == '0');
+}
 // STRIX_DS41_PREFILL_FINAL_KV=all (default since P17.5: 8K prefill +1.8 %, bitwise) | none | <comma-separated layers>
 bool prefill_final_kv(std::uint32_t layer) {
     static const std::vector<bool> on = [] {
@@ -2315,6 +2320,10 @@ PrefillResult DevicePrefill::run_from(std::span<const std::uint32_t> tokens, std
                     mark_part(2);
                     check(hipEventRecord(m.chunk_ready, st), "chunk ready");
                     for (auto& ln : m.lanes) check(hipStreamWaitEvent(ln.stream, m.chunk_ready, 0), "lane wait");
+                    // STRIX_DS41_PREFILL_O_A8_FUSED (default on, =0 off): the exact attention combine writes o's A8 codes,
+                    // deltas and sums (enqueue_quantize_a8's bits, from the same values it stores) instead of a separate pass
+                    const bool fast_o_a = m.options.fp16_fast && m.fp16_at(8U, layer, n);
+                    const bool o_a8_fused = !fast_o_a && !m.bf16_at(layer) && !m.fast_attn_at(layer) && prefill_o_a8_fused();
                     for (std::uint32_t w0 = r0; w0 < r0 + n; w0 += W) {
                         // local window at w0 = global window wi (positions from wi * W)
                         const std::uint32_t Rw = std::min(W, r0 + n - w0), wi = global_window(w0 / W);
@@ -2386,6 +2395,11 @@ PrefillResult DevicePrefill::run_from(std::span<const std::uint32_t> tokens, std
                         v.partial = ln.attn_partial.p;
                         v.tickets = ln.attn_tickets.p;
                         v.o = m.o.p + std::size_t{w0 - r0} * QL;
+                        if (o_a8_fused) {
+                            v.codes = m.ocodes.p + std::size_t{w0 - r0} * QL;
+                            v.deltas = m.odeltas.p + std::size_t{w0 - r0} * QL / 32U;
+                            v.sums = m.osums.p + std::size_t{w0 - r0} * QL / 32U;
+                        }
                         if(m.bf16_at(layer)) attn::hip::enqueue_attention_bf16_prefill(v,ls);
                         else if (m.fast_attn_at(layer)) attn::hip::enqueue_attention_f16wmma_prefill(v, ls);
                         else attn::hip::enqueue_attention(v, ls);
@@ -2396,8 +2410,7 @@ PrefillResult DevicePrefill::run_from(std::span<const std::uint32_t> tokens, std
                         check(hipStreamWaitEvent(st, ln.done, 0), "chunk join");
                     }
                     mark_part(3);
-                    const bool fast_o_a = m.options.fp16_fast && m.fp16_at(8U, layer, n);
-                    if (!fast_o_a) ds41::enqueue_quantize_a8(m.o.p, QL, n, m.ocodes.p, m.odeltas.p, m.osums.p, st);
+                    if (!fast_o_a && !o_a8_fused) ds41::enqueue_quantize_a8(m.o.p, QL, n, m.ocodes.p, m.odeltas.p, m.osums.p, st);
                     {
                         ds41::Q8A8PrefillView v;
                         v.width = QH / c.o_groups;

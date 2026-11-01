@@ -1382,6 +1382,22 @@ The prefill router's scores kernel takes 32 rows x 32 experts per block (a wave 
 - **Measured gain:** Router kernel (layer 20 weights, 384 experts, scores + selection, interleaved): 20.71 -> 5.87 ms at 8192 rows (-72 %), 5.26 -> 1.52 ms at 2048, 0.58 -> 0.40 ms at 512. Two-node serve TTFT at 8,399 / 32,499 tokens (one binary, cache off, one load per arm, two GPU turns in opposite arm order): 8.876 / 31.852 s with STRIX_DS41_PREFILL_ROUTER_V2=0 vs 8.707 / 31.373 s default (-1.9 / -1.5 %); logits and generated ids identical.
 - **Public evidence:** [Prefill router](../src/hip_ds41_prefill.hip)
 
+<a id="ds-o-a8-fused"></a>
+
+### Attention output A8 from the combine
+
+**Engine:** `deepseek`. **Control:** `STRIX_DS41_PREFILL_O_A8_FUSED`. **Default:** ON.
+
+The exact attention combine already forms the A8 operands of o (int8 codes, deltas and sums per 32 values, enqueue_quantize_a8's arithmetic) from the values it stores; the prefill passes its o operand buffers to the attention calls and skips the separate quantization pass before o_a.
+
+- **Preconditions:** Exact attention (not the BF16 or FP16 WMMA attention) and A8 o_a operands (not the FP16 fast o_a).
+- **Automatic selection:** On for every prefill chunk that meets the preconditions.
+- **Fallback notice:** None; other chunks keep the separate pass.
+- **Exactness evidence:** Bitwise: device attention tests compare the combine's A8 codes, deltas and sums with enqueue_quantize_a8 of the stored o (and a host model), also with an all-NaN head (deltas NaN in both); two-node serve logits and generated ids identical with the switch on and off.
+- **Off switch:** STRIX_DS41_PREFILL_O_A8_FUSED=0
+- **Measured gain:** Two-node serve TTFT at 8,399 / 32,499 tokens (one binary, cache off, one load per arm, default first): 8.883 / 31.251 s with STRIX_DS41_PREFILL_O_A8_FUSED=0 vs 8.767 / 30.886 s default (-1.3 / -1.2 %); logits and generated ids identical.
+- **Public evidence:** [Prefill attention site](../src/hip_deepseek41_prefill.hip)
+
 <a id="ds-dense"></a>
 
 ### Exact dense prefill selector
