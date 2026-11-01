@@ -2949,6 +2949,9 @@ Weights, activations and route weights retain their existing arithmetic.
   32K TTFT median **21.83 → 21.15 s** (per pair −0.78 / −0.68 / −0.66 s, mean **−3.2 %**),
   16K **10.38 → 10.11 s** (−0.19 / −0.27 / −0.27 s, mean **−2.3 %**); every pair faster,
   first generated token equal. The receipt reports the candidate active on the default route.
+  262K YaRN (factor 2, serial route, 262,144-token prompt, `--profile default` vs `--profile fast`,
+  two interleaved pairs, one run per arm): prefill **191.55 / 190.89 → 186.78 / 184.58 s**, mean
+  **191.2 → 185.7 s (−2.9 %)**; decode 20.55-20.60 tok/s in both.
 - **Qualification:** CPU option/identity/suppression tests and the native HIP fixture
   (scalar and vector merge, tunes 80/82/88, nonfinite status) pass. Model-fidelity
   qualification against its own references is pending; until it passes the candidate stays

@@ -411,7 +411,9 @@ El drafting MTP por batch sigue siendo opt-in. El servidor HTTP dimensiona sus s
 la fusión ordenada. Cambia bits (identidad de almacenamiento del prefill `fp16-v1+moeroute16`), está desactivado por
 defecto y solo `--profile fast` lo aplica, como fila provisional, hasta que supere la cualificación. Misma compilación, CLI simple, tres
 ejecuciones emparejadas cada una: TTFT a 32K **21.83 → 21.15 s (−3.2 %)**, a 16K **10.38 → 10.11 s (−2.3 %)**, todos
-los pares más rápidos. Véase el [catálogo](docs/optimizations.md#qwen-moe-route-bf16).
+los pares más rápidos. A 262K (YaRN factor 2, ruta en serie, `--profile default` frente a `--profile fast`, dos pares
+intercalados) el prefill pasó de **191.2 a 185.7 s (−2.9 %, 1,371 → 1,412 tok/s)**, cada ejecución fast más rápida
+que cada ejecución default; el decode no cambia. Véase el [catálogo](docs/optimizations.md#qwen-moe-route-bf16).
 GSQ, más abajo, es un perfil separado que prioriza la velocidad sobre la calidad.
 
 <a id="gsq-opt-in-speed-over-quality-profile"></a>
