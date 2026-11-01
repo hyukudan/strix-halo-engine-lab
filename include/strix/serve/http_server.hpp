@@ -46,7 +46,13 @@ struct HttpServerConfig {
     std::uint64_t max_body_bytes = 64ULL << 20U;
     std::uint64_t max_header_bytes = 64ULL << 10U;
     unsigned max_connections = 64;
-    int idle_timeout_seconds = 300;
+    int idle_timeout_seconds = 300;     // waiting for the next request on a kept-alive connection
+    // A started request must deliver its headers within this many seconds, and its body within that plus one second
+    // per MiB (>= 1 MiB/s); a late request gets 408 and the connection closes. 0 = no request deadline.
+    int request_timeout_seconds = 60;
+    // One send() that makes no progress for this long marks the client gone (a non-reading client cannot hold a
+    // connection or a generation); also the TCP user timeout for unacknowledged data. 0 = no write deadline.
+    int write_timeout_seconds = 60;
     bool cors = false;                  // Access-Control-Allow-* on every response, OPTIONS answered
 };
 

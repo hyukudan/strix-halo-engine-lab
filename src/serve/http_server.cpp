@@ -1,6 +1,9 @@
 #include "strix/serve/http_server.hpp"
 
 #include <algorithm>
+#include <charconv>
+#include <chrono>
+#include <optional>
 #include <arpa/inet.h>
 #include <cerrno>
 #include <condition_variable>
@@ -47,6 +50,35 @@ std::string lower(std::string_view text) {
     std::string out(text);
     for (auto& c : out) if (c >= 'A' && c <= 'Z') c = static_cast<char>(c - 'A' + 'a');
     return out;
+}
+// RFC 9110 token: one or more tchar.
+bool is_token(std::string_view text) {
+    static constexpr std::string_view extra = "!#$%&'*+-.^_`|~";
+    return !text.empty() && std::all_of(text.begin(), text.end(), [](char c) {
+        return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || extra.find(c) != std::string_view::npos;
+    });
+}
+// Closes a connection without discarding the response just sent: unread request bytes would turn the close into a
+// reset that can destroy it, so the write side is shut first and what the client still sends is drained (bounded:
+// 1 s, 1 MiB) until it closes too. A stopping server does not wait for clients.
+void close_gracefully(int fd, const std::atomic<bool>& stopping) {
+    ::shutdown(fd, SHUT_WR);
+    char sink[16384];
+    constexpr std::size_t cap = 1U << 20U;
+    std::size_t drained = 0;
+    const auto until = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+    while (drained < cap && !stopping.load()) {
+        const auto left = std::chrono::duration_cast<std::chrono::milliseconds>(until - std::chrono::steady_clock::now()).count();
+        if (left <= 0) break;
+        pollfd p{fd, POLLIN, 0};
+        const int ready = ::poll(&p, 1, static_cast<int>(std::min<long long>(left, 50)));  // short slices: stop() is seen
+        if (ready < 0) break;
+        if (ready == 0) continue;
+        const auto n = ::recv(fd, sink, std::min(sizeof(sink), cap - drained), MSG_DONTWAIT);
+        if (n <= 0) break;
+        drained += static_cast<std::size_t>(n);
+    }
+    ::close(fd);
 }
 std::string trim(std::string_view text) {
     std::size_t a = 0, b = text.size();
@@ -146,10 +178,20 @@ struct HttpServer::Impl {
     std::set<int> open_fds; // under mutex; stop() shuts them down so blocked reads return
 
     void handle(int fd, std::string peer) {
-        timeval timeout{config.idle_timeout_seconds, 0};
-        ::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
         const int one = 1;
         ::setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+        if (config.write_timeout_seconds > 0) {
+            const timeval write_limit{config.write_timeout_seconds, 0};
+            ::setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &write_limit, sizeof(write_limit));
+            const unsigned user_timeout_ms = static_cast<unsigned>(config.write_timeout_seconds) * 1000U;
+            ::setsockopt(fd, IPPROTO_TCP, TCP_USER_TIMEOUT, &user_timeout_ms, sizeof(user_timeout_ms));
+        }
+        // A peer that vanished without closing is noticed in about a minute instead of the retransmit timeout.
+        const int keep_idle = 30, keep_interval = 10, keep_count = 3;
+        ::setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &one, sizeof(one));
+        ::setsockopt(fd, IPPROTO_TCP, TCP_KEEPIDLE, &keep_idle, sizeof(keep_idle));
+        ::setsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL, &keep_interval, sizeof(keep_interval));
+        ::setsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT, &keep_count, sizeof(keep_count));
         Connection connection(fd, config.cors);
         // Declared after the connection: unregisters the descriptor before the connection closes it.
         struct Registration {
@@ -163,29 +205,83 @@ struct HttpServer::Impl {
         } registration(*this, fd);
         std::string buffer;
         char chunk[16384];
+        using Clock = std::chrono::steady_clock;
+        // Waiting for a request uses the idle timeout; once a request has started, only the remaining request deadline.
+        std::optional<Clock::time_point> deadline;
+        enum class Read { data, closed, late };
+        const auto expired = [&] { return deadline && Clock::now() >= *deadline; };
+        const auto receive = [&]() {
+            for (;;) {
+                timeval limit{config.idle_timeout_seconds, 0};
+                if (deadline) {
+                    const auto left = std::chrono::duration_cast<std::chrono::microseconds>(*deadline - Clock::now()).count();
+                    if (left <= 0) return Read::late;
+                    limit = timeval{static_cast<time_t>(left / 1000000), static_cast<suseconds_t>(left % 1000000)};
+                }
+                ::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &limit, sizeof(limit));
+                const auto n = ::recv(fd, chunk, sizeof(chunk), 0);
+                if (n > 0) { buffer.append(chunk, static_cast<std::size_t>(n)); return Read::data; }
+                if (n < 0 && errno == EINTR) continue;  // the remaining time is recomputed
+                return deadline && n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK) ? Read::late : Read::closed;
+            }
+        };
+        const auto start_request = [&] {
+            if (!deadline && config.request_timeout_seconds > 0)
+                deadline = Clock::now() + std::chrono::seconds(config.request_timeout_seconds);
+        };
+        const auto too_late = [&] {
+            connection.keep_alive = false;
+            connection.send(408, "application/json", R"({"error":{"message":"request not received in time","type":"invalid_request_error"}})");
+        };
         while (!stopping.load()) {
+            connection.reset();  // a refusal of this request (408/431/413/501) is its first response
+            deadline.reset();
+            if (!buffer.empty()) start_request();  // a pipelined request is already arriving
             // Header.
             std::size_t end = std::string::npos;
             while ((end = buffer.find("\r\n\r\n")) == std::string::npos) {
-                if (buffer.size() > config.max_header_bytes) {
+                // Without a terminator the header is at least size - 3 bytes long: the same limit as `end` below,
+                // whatever the read boundaries.
+                if (buffer.size() > config.max_header_bytes + 3U) {
                     connection.keep_alive = false;
                     connection.send(431, "application/json", R"({"error":{"message":"request header too large","type":"invalid_request_error"}})");
                     return;
                 }
-                const auto n = ::recv(fd, chunk, sizeof(chunk), 0);
-                if (n <= 0) { return; }
-                buffer.append(chunk, static_cast<std::size_t>(n));
+                const auto read = receive();
+                if (read == Read::late) { too_late(); return; }
+                if (read == Read::closed) return;
+                start_request();
             }
+            if (expired()) { too_late(); return; }  // the last read may have completed the header after the deadline
+            // The header limit holds even when the terminator arrived in the same read as the bytes beyond the limit.
+            if (end > config.max_header_bytes) {
+                connection.keep_alive = false;
+                connection.send(431, "application/json", R"({"error":{"message":"request header too large","type":"invalid_request_error"}})");
+                return;
+            }
+            // Framing the server cannot read unambiguously is refused and the connection closed, never guessed.
+            const auto bad_request = [&](const std::string& message) {
+                connection.keep_alive = false;
+                connection.send(400, "application/json", R"({"error":{"message":")" + message + R"(","type":"invalid_request_error"}})");
+            };
             HttpRequest request;
             request.peer = peer;
             const std::string_view head(buffer.data(), end);
             const auto line_end = head.find("\r\n");
             const auto first = head.substr(0, line_end);
             const auto s1 = first.find(' '), s2 = first.rfind(' ');
-            if (s1 == std::string_view::npos || s2 == s1) { return; }
+            const auto target = s2 > s1 ? first.substr(s1 + 1U, s2 - s1 - 1U) : std::string_view{};
+            const bool visible_target = !target.empty() && std::all_of(target.begin(), target.end(), [](char c) {
+                return static_cast<unsigned char>(c) > 0x20U && c != 0x7f;  // no whitespace or control bytes
+            });
+            if (s1 == std::string_view::npos || s2 == s1 || !is_token(first.substr(0, s1)) || !visible_target) {
+                bad_request("malformed request line");
+                return;
+            }
             request.method = std::string(first.substr(0, s1));
             request.target = std::string(first.substr(s1 + 1U, s2 - s1 - 1U));
             request.version = std::string(first.substr(s2 + 1U));
+            if (request.version != "HTTP/1.1" && request.version != "HTTP/1.0") { bad_request("unsupported HTTP version"); return; }
             const auto q = request.target.find('?');
             request.path = request.target.substr(0, q);
             if (q != std::string::npos) request.query = request.target.substr(q + 1U);
@@ -194,30 +290,48 @@ struct HttpServer::Impl {
                 if (next == std::string_view::npos) next = head.size();
                 const auto line = head.substr(at, next - at);
                 const auto colon = line.find(':');
-                if (colon != std::string_view::npos) request.headers.emplace_back(lower(line.substr(0, colon)), trim(line.substr(colon + 1U)));
+                // A field name is a token (RFC 9110 tchar): no whitespace or control bytes (this also refuses obsolete
+                // line folding) and never empty.
+                if (colon == std::string_view::npos || !is_token(line.substr(0, colon))) {
+                    bad_request("malformed header field");
+                    return;
+                }
+                request.headers.emplace_back(lower(line.substr(0, colon)), trim(line.substr(colon + 1U)));
                 at = next + 2U;
             }
             buffer.erase(0, end + 4U);
-            if (lower(request.header("transfer-encoding")).find("chunked") != std::string::npos) {
+            if (std::any_of(request.headers.begin(), request.headers.end(), [](const auto& h) { return h.first == "transfer-encoding"; })) {
                 connection.keep_alive = false;
-                connection.send(501, "application/json", R"({"error":{"message":"chunked request bodies are not supported","type":"invalid_request_error"}})");
+                connection.send(501, "application/json", R"({"error":{"message":"transfer-encoded request bodies are not supported","type":"invalid_request_error"}})");
                 return;
             }
-            const auto length_text = request.header("content-length");
-            std::uint64_t length = 0;
-            if (!length_text.empty()) {
-                try { length = std::stoull(length_text); } catch (...) { return; }
+            // Content-Length: plain decimal digits only; repeated fields must agree.
+            std::optional<std::uint64_t> length_field;
+            for (const auto& [key, value] : request.headers) {
+                if (key != "content-length") continue;
+                std::uint64_t parsed = 0;
+                const auto result = std::from_chars(value.data(), value.data() + value.size(), parsed);
+                if (value.empty() || value.find_first_not_of("0123456789") != std::string::npos || result.ec != std::errc{} ||
+                    (length_field && *length_field != parsed)) {
+                    bad_request("invalid or conflicting Content-Length");
+                    return;
+                }
+                length_field = parsed;
             }
+            const std::uint64_t length = length_field.value_or(0);
             if (length > config.max_body_bytes) {
                 connection.keep_alive = false;
                 connection.send(413, "application/json", R"({"error":{"message":"request body too large","type":"invalid_request_error"}})");
                 return;
             }
+            // The body may take one more second per started MiB on top of the request deadline (>= 1 MiB/s).
+            if (deadline) *deadline += std::chrono::seconds(static_cast<long>((length + (1U << 20U) - 1U) >> 20U));
             while (buffer.size() < length) {
-                const auto n = ::recv(fd, chunk, sizeof(chunk), 0);
-                if (n <= 0) { return; }
-                buffer.append(chunk, static_cast<std::size_t>(n));
+                const auto read = receive();
+                if (read == Read::late) { too_late(); return; }
+                if (read == Read::closed) return;
             }
+            if (expired()) { too_late(); return; }
             request.body = buffer.substr(0, static_cast<std::size_t>(length));
             buffer.erase(0, static_cast<std::size_t>(length));
             const auto connection_header = lower(request.header("connection"));
@@ -300,6 +414,7 @@ void HttpServer::serve() {
         char host[NI_MAXHOST] = "";
         ::getnameinfo(reinterpret_cast<sockaddr*>(&peer), size, host, sizeof(host), nullptr, 0, NI_NUMERICHOST);
         if (impl.connections.load() >= impl.config.max_connections) {
+            // Closed at once, not drained: the accept loop never waits on one client (the 503 is best effort).
             const char* busy = "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
             (void)::send(fd, busy, std::strlen(busy), MSG_NOSIGNAL);
             ::close(fd);
@@ -317,7 +432,7 @@ void HttpServer::serve() {
             std::thread([shared = impl_, fd, peer_name = std::string(host), retire] {
                 // A failure inside one connection ends that connection only; handle() has unregistered fd on exit.
                 try { shared->handle(fd, peer_name); } catch (...) {}
-                ::close(fd);
+                close_gracefully(fd, shared->stopping);
                 retire(*shared);
             }).detach();
         } catch (...) {

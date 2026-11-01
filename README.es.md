@@ -1149,7 +1149,11 @@ Los servidores HTTP (`strix-hip-decode-token --http-serve` y `strix-deepseek41-s
 con `--http-api-key-file FILE` todas las rutas de API y de administración (completions, `/admin/drain`, `/admin/import-state`)
 necesitan `Authorization: Bearer <key>` o `x-api-key: <key>`; sin ella, el servidor acepta cualquier cliente. `/health`,
 `/metrics` y `/api/status` responden sin la clave. Los cuerpos, las peticiones en cola y las conexiones abiertas están acotados
-(`--http-max-queue`, `--http-max-connections`). Mantenga los servidores en loopback o en una red privada y ponga
+(`--http-max-queue`, `--http-max-connections`). Los servidores HTTP cierran una petición que no se ha recibido
+por completo en 60 segundos (408; más un segundo por cada MiB de cuerpo) y dan por desaparecido a un cliente que no
+acepta datos durante 60 segundos, cancelando su generación. Las peticiones con un encuadre ambiguo (Content-Length en
+conflicto, cualquier Transfer-Encoding, línea de petición o nombres de cabecera mal formados) se rechazan con 400/501.
+Mantenga los servidores en loopback o en una red privada y ponga
 los clientes remotos tras un front end que autentique, como el router de [TensorMeld](https://github.com/hyukudan/tensormeld)
 o su canal de control; los ranks DeepSeek de dos nodos intercambian tensores por el enlace USB4, y la división RTX
 (puerto TCP de la etapa del pipeline) y los servidores de expertos usan TCP sin más: ninguno de ellos lleva autenticación, por lo que deben

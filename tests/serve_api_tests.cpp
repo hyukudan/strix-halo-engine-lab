@@ -797,6 +797,189 @@ int main() try {
         boom_thread.join();
     }
     {
+        // Request and write deadlines: a stalled request gets 408, a client that stops reading is noticed within the
+        // write timeout, and the request deadline starts only at a request's first byte (idle keep-alive is unchanged).
+        HttpServerConfig timed_config;
+        timed_config.port = 0;
+        timed_config.request_timeout_seconds = 1;
+        timed_config.write_timeout_seconds = 1;
+        std::atomic<int> flood_result{0};  // 0 running, 1 write failed (client gone), 2 wrote everything
+        HttpServer timed(timed_config, [&](const HttpRequest& r, HttpResponseWriter& w) {
+            if (r.path == "/flood") {
+                (void)w.begin_stream(200, "text/event-stream");
+                const std::string block(1U << 16U, 'x');
+                for (int i = 0; i < 4096; ++i)
+                    if (!w.write(block)) { flood_result.store(1); return; }
+                w.end_stream();
+                flood_result.store(2);
+                return;
+            }
+            w.send(200, "text/plain", "ok");
+        });
+        timed.listen();
+        std::thread timed_thread([&] { timed.serve(); });
+        const auto connect_local = [&] {
+            const int fd = ::socket(AF_INET, SOCK_STREAM, 0);
+            sockaddr_in address{};
+            address.sin_family = AF_INET;
+            address.sin_port = htons(timed.port());
+            ::inet_pton(AF_INET, "127.0.0.1", &address.sin_addr);
+            timeval receive_limit{};
+            receive_limit.tv_sec = 20;
+            ::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &receive_limit, sizeof(receive_limit));
+            check(::connect(fd, reinterpret_cast<sockaddr*>(&address), sizeof(address)) == 0, "deadline client connects");
+            return fd;
+        };
+        const auto read_all = [](int fd) {
+            std::string raw;
+            char buffer[4096];
+            for (;;) {
+                const auto n = ::recv(fd, buffer, sizeof(buffer), 0);
+                if (n <= 0) break;
+                raw.append(buffer, static_cast<std::size_t>(n));
+            }
+            return raw;
+        };
+        {
+            const int fd = connect_local();
+            const std::string partial = "GET /ok HTTP/1.1\r\nHo";
+            (void)::send(fd, partial.data(), partial.size(), MSG_NOSIGNAL);
+            const auto raw = read_all(fd);
+            ::close(fd);
+            check(raw.rfind("HTTP/1.1 408", 0) == 0, "stalled request header answers 408");
+        }
+        {
+            // A kept-alive connection: a first request, idle longer than the request deadline, then a second request
+            // that is answered; a third that stalls is refused with 408 even though the connection already responded.
+            const int fd = connect_local();
+            const auto read_response = [&] {
+                std::string raw;
+                char buffer[4096];
+                while (raw.find("\r\n\r\nok") == std::string::npos) {
+                    const auto n = ::recv(fd, buffer, sizeof(buffer), 0);
+                    if (n <= 0) break;
+                    raw.append(buffer, static_cast<std::size_t>(n));
+                }
+                return raw;
+            };
+            const std::string request = "GET /ok HTTP/1.1\r\nHost: x\r\n\r\n";
+            (void)::send(fd, request.data(), request.size(), MSG_NOSIGNAL);
+            check(read_response().rfind("HTTP/1.1 200", 0) == 0, "kept-alive first request answered");
+            std::this_thread::sleep_for(std::chrono::milliseconds(2500));  // idle longer than the request deadline
+            (void)::send(fd, request.data(), request.size(), MSG_NOSIGNAL);
+            check(read_response().rfind("HTTP/1.1 200", 0) == 0, "request deadline starts at the first byte, not while idle");
+            const std::string partial = "GET /ok HTTP/1.1\r\nHo";
+            (void)::send(fd, partial.data(), partial.size(), MSG_NOSIGNAL);
+            const auto raw = read_all(fd);
+            check(raw.rfind("HTTP/1.1 408", 0) == 0, "a stalled request on a kept-alive connection answers 408");
+            ::close(fd);
+        }
+        {
+            // A body that stops arriving is refused once the request deadline passes.
+            const int fd = connect_local();
+            const std::string partial = "POST /ok HTTP/1.1\r\nHost: x\r\nContent-Length: 10\r\n\r\nabc";
+            (void)::send(fd, partial.data(), partial.size(), MSG_NOSIGNAL);
+            const auto raw = read_all(fd);
+            ::close(fd);
+            check(raw.rfind("HTTP/1.1 408", 0) == 0, "stalled request body answers 408");
+        }
+        {
+            // Framing that cannot be read unambiguously is refused and the connection closed (one response only).
+            const auto answer = [&](const std::string& raw_request) {
+                const int fd = connect_local();
+                (void)::send(fd, raw_request.data(), raw_request.size(), MSG_NOSIGNAL);
+                const auto raw = read_all(fd);
+                ::close(fd);
+                std::size_t responses = 0;
+                for (auto at = raw.find("HTTP/1.1 "); at != std::string::npos; at = raw.find("HTTP/1.1 ", at + 1U)) ++responses;
+                return responses == 1U ? raw.substr(9, 3) : "x" + std::to_string(responses);
+            };
+            const std::string get_ok = "GET /ok HTTP/1.1\r\nHost: x\r\n\r\n";
+            check(answer("POST /ok HTTP/1.1\r\nContent-Length: 2\r\nContent-Length: 3\r\n\r\nabc" + get_ok) == "400", "conflicting Content-Length answers 400");
+            check(answer("POST /ok HTTP/1.1\r\nContent-Length: 5abc\r\n\r\nabcde") == "400", "non-decimal Content-Length answers 400");
+            check(answer("POST /ok HTTP/1.1\r\nContent-Length: +5\r\n\r\nabcde") == "400", "signed Content-Length answers 400");
+            check(answer("POST /ok HTTP/1.1\r\nContent-Length : 5\r\n\r\nabcde") == "400", "whitespace before the colon answers 400");
+            check(answer("POST /ok HTTP/1.1\r\nTransfer-Encoding: gzip\r\nContent-Length: 1\r\n\r\na") == "501", "non-identity transfer encoding answers 501");
+            check(answer("GET /ok HTTP/2.0\r\n\r\n") == "400", "unsupported HTTP version answers 400");
+            check(answer("POST /ok HTTP/1.1\r\nTransfer-Encoding:\r\nTransfer-Encoding: chunked\r\nContent-Length: 0\r\n\r\n" + get_ok) == "501",
+                  "every Transfer-Encoding field counts, even an empty first one");
+            check(answer(std::string("POST /ok HTTP/1.1\r\nContent-Length\x0b: 20\r\n\r\n") + get_ok) == "400", "control byte in a field name answers 400");
+            check(answer("GET   HTTP/1.1\r\n\r\n") == "400", "whitespace-only target answers 400");
+            check(answer("GET /o\x0bk HTTP/1.1\r\n\r\n") == "400" && answer("GET /o\x0ck HTTP/1.1\r\n\r\n") == "400", "control bytes in the target answer 400");
+            check(answer("G(T /ok HTTP/1.1\r\n\r\n") == "400", "non-token method answers 400");
+            {
+                // The refusal survives unread request bytes (no reset before the client reads it) and is complete JSON.
+                const int fd = connect_local();
+                const std::string raw_request = "POST /ok HTTP/1.1\r\nContent-Length: x\r\n\r\n" + std::string(200000, 'z');
+                (void)::send(fd, raw_request.data(), raw_request.size(), MSG_NOSIGNAL);
+                const auto raw = read_all(fd);
+                ::close(fd);
+                const auto body_at = raw.find("\r\n\r\n");
+                bool json = false;
+                try { json = body_at != std::string::npos && parse_json(raw.substr(body_at + 4U)).find("error") != nullptr; } catch (...) {}
+                check(raw.rfind("HTTP/1.1 400", 0) == 0 && json, "refusal with unread bytes is delivered whole");
+            }
+            check(answer("POST /ok HTTP/1.1\r\nContent-Length: 3\r\nContent-Length: 3\r\nConnection: close\r\n\r\nabc") == "200", "agreeing Content-Length fields are accepted");
+            // A header beyond the limit is refused even when its terminator arrives in the same read.
+            HttpServerConfig small_config;
+            small_config.port = 0;
+            small_config.max_header_bytes = 1024;
+            HttpServer small(small_config, [](const HttpRequest&, HttpResponseWriter& w) { w.send(200, "text/plain", "ok"); });
+            small.listen();
+            std::thread small_thread([&] { small.serve(); });
+            const int fd = ::socket(AF_INET, SOCK_STREAM, 0);
+            sockaddr_in address{};
+            address.sin_family = AF_INET;
+            address.sin_port = htons(small.port());
+            ::inet_pton(AF_INET, "127.0.0.1", &address.sin_addr);
+            timeval receive_limit{};
+            receive_limit.tv_sec = 20;
+            ::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &receive_limit, sizeof(receive_limit));
+            check(::connect(fd, reinterpret_cast<sockaddr*>(&address), sizeof(address)) == 0, "header-limit client connects");
+            const std::string big = "GET /ok HTTP/1.1\r\nX-Pad: " + std::string(4000, 'a') + "\r\n\r\n";
+            (void)::send(fd, big.data(), big.size(), MSG_NOSIGNAL);
+            const auto raw = read_all(fd);
+            ::close(fd);
+            check(raw.rfind("HTTP/1.1 431", 0) == 0, "header over the limit answers 431 whatever the read sizes");
+            // A header of exactly the limit gets the same answer whole and split inside its terminator.
+            const auto at_limit = [&](std::size_t extra, bool split) {
+                const std::string prefix = "GET /ok HTTP/1.1\r\nConnection: close\r\nX-Pad: ";
+                const std::string head = prefix + std::string(1024U + extra - prefix.size(), 'a');
+                const std::string request = head + "\r\n\r\n";
+                const int c = ::socket(AF_INET, SOCK_STREAM, 0);
+                ::setsockopt(c, SOL_SOCKET, SO_RCVTIMEO, &receive_limit, sizeof(receive_limit));
+                (void)::connect(c, reinterpret_cast<sockaddr*>(&address), sizeof(address));
+                const auto cut = split ? request.size() - 2U : request.size();
+                (void)::send(c, request.data(), cut, MSG_NOSIGNAL);
+                if (split) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+                    (void)::send(c, request.data() + cut, request.size() - cut, MSG_NOSIGNAL);
+                }
+                const auto reply = read_all(c);
+                ::close(c);
+                return reply.substr(0, 12);
+            };
+            check(at_limit(0, false) == "HTTP/1.1 200" && at_limit(0, true) == "HTTP/1.1 200", "a header at the limit is accepted whole or split");
+            check(at_limit(1, false) == "HTTP/1.1 431" && at_limit(1, true) == "HTTP/1.1 431", "one byte over the limit is refused whole or split");
+            small.stop();
+            small_thread.join();
+        }
+        {
+            const int fd = connect_local();
+            const int small = 4096;
+            ::setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &small, sizeof(small));
+            const std::string request = "GET /flood HTTP/1.1\r\nHost: x\r\n\r\n";
+            (void)::send(fd, request.data(), request.size(), MSG_NOSIGNAL);
+            const auto begin = std::chrono::steady_clock::now();
+            while (flood_result.load() == 0 && std::chrono::steady_clock::now() - begin < std::chrono::seconds(30))
+                std::this_thread::sleep_for(std::chrono::milliseconds(50));  // never read: the server's send stalls
+            check(flood_result.load() == 1, "a client that stops reading is marked gone within the write timeout");
+            ::close(fd);
+        }
+        timed.stop();
+        timed_thread.join();
+    }
+    {
         GenerationTicket ticket;
         check(ticket.progress().phase == GenerationPhase::queued, "ticket starts queued");
         for (std::uint64_t n = 0; n <= 100; ++n) ticket.report_progress({GenerationPhase::prefill, n, 10, 110});
