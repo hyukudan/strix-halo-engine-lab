@@ -16,6 +16,11 @@ using dev::DsaSlot;
 using dev::IndexerDev;
 using dev::KdaDev;
 
+// Constant-address-space views for wave-uniform operands read through scalar loads (s_load) into SGPRs.
+using ConstF = const __attribute__((address_space(4))) float;
+typedef float SVec16 __attribute__((ext_vector_type(16)));
+using ConstV16 = const __attribute__((address_space(4))) SVec16;
+
 void ok(hipError_t e, const char* what) {
     if (e != hipSuccess) throw std::runtime_error(std::string(what) + ": " + hipGetErrorString(e));
 }
@@ -320,6 +325,70 @@ __global__ __launch_bounds__(256) void idx_score_rows_v2_kernel(const float* poo
     keys[static_cast<std::size_t>(r) * cap + p] = ordered_key(a2);
 }
 
+// Scores v3: CTA = 64 pools x 8 rows; the pools' keys are staged once in LDS ([pool][dim], padded) and shared by the 8
+// rows; wave w = row r0 + w, lane = pools p0 + lane and p0 + 32 + lane, all 32 heads' dots in registers. qI and wh of
+// the row are wave-uniform and come through scalar loads, so the inner loop is FMAs with an SGPR operand. Per (row,
+// head, pool) the dot chain over i ascending from +0 and per (row, pool) the head chain are v2's: same keys.
+constexpr unsigned kIs3Rows = 8, kIs3Pools = 64, kIs3Pad = kIdxDim + 4, kIs3L = 16;
+__global__ __launch_bounds__(32 * kIs3Rows) void idx_score_rows_v3_kernel(const float* pooled, unsigned t0, unsigned C, const float* qI,
+                                                                         const float* wh, std::uint32_t* keys, unsigned cap) {
+    __shared__ alignas(16) float ks[kIs3Pools][kIs3Pad];  // 33 KB
+    const unsigned p0 = blockIdx.x * kIs3Pools, r0 = blockIdx.y * kIs3Rows, tid = threadIdx.x, lane = tid % 32;
+    const unsigned rlast = (r0 + kIs3Rows < C ? r0 + kIs3Rows : C) - 1;
+    const unsigned Pmax = (t0 + rlast + 1) / kKpool;  // pools of the tile's last row
+    if (p0 >= Pmax || Pmax <= kIdxPools) return;    // uniform per block
+    for (unsigned x = tid; x < kIs3Pools * (kIdxDim / 4); x += 32 * kIs3Rows) {
+        const unsigned pp = x / (kIdxDim / 4), i4 = x % (kIdxDim / 4);
+        float4 v{0.0F, 0.0F, 0.0F, 0.0F};
+        if (p0 + pp < Pmax) v = *reinterpret_cast<const float4*>(pooled + static_cast<std::size_t>(p0 + pp) * kIdxDim + 4 * i4);
+        *reinterpret_cast<float4*>(&ks[pp][4 * i4]) = v;
+    }
+    __syncthreads();
+    const unsigned w = static_cast<unsigned>(__builtin_amdgcn_readfirstlane(static_cast<int>(tid / 32))), r = r0 + w;
+    if (r >= C) return;  // uniform per wave (no barrier follows)
+    const unsigned P = (t0 + r + 1) / kKpool;
+    if (P <= kIdxPools || p0 >= P) return;
+    const auto* qr = (ConstF*)(qI + static_cast<std::size_t>(r) * kIdxHeads * kIdxDim);  // NOLINT: address-space cast
+    float acc[2][kIdxHeads];
+#pragma unroll
+    for (unsigned e = 0; e < 2; ++e)
+#pragma unroll
+        for (unsigned h = 0; h < kIdxHeads; ++h) acc[e][h] = 0.0F;
+    for (unsigned i0 = 0; i0 < kIdxDim; i0 += kIs3L) {
+        float kv[2][kIs3L];
+#pragma unroll
+        for (unsigned e = 0; e < 2; ++e)
+#pragma unroll
+            for (unsigned i = 0; i < kIs3L; i += 4) {
+                const float4 v = *reinterpret_cast<const float4*>(&ks[lane + 32 * e][i0 + i]);
+                kv[e][i] = v.x;
+                kv[e][i + 1] = v.y;
+                kv[e][i + 2] = v.z;
+                kv[e][i + 3] = v.w;
+            }
+#pragma unroll
+        for (unsigned h = 0; h < kIdxHeads; ++h) {
+            const SVec16 q = *reinterpret_cast<ConstV16*>(qr + static_cast<std::size_t>(h) * kIdxDim + i0);
+#pragma unroll
+            for (unsigned i = 0; i < kIs3L; ++i)
+#pragma unroll
+                for (unsigned e = 0; e < 2; ++e) acc[e][h] = __builtin_fmaf(q[i], kv[e][i], acc[e][h]);
+        }
+    }
+    const auto* wr = (ConstF*)(wh + static_cast<std::size_t>(r) * kIdxHeads);  // NOLINT: address-space cast
+#pragma unroll
+    for (unsigned e = 0; e < 2; ++e) {
+        float a2 = 0.0F;
+#pragma unroll
+        for (unsigned h = 0; h < kIdxHeads; ++h) {
+            const float sc = acc[e][h] * kInvSqrt128;
+            a2 = __builtin_fmaf(wr[h], sc > 0.0F ? sc : 0.0F, a2);
+        }
+        const unsigned p = p0 + lane + 32 * e;
+        if (p < P) keys[static_cast<std::size_t>(r) * cap + p] = ordered_key(a2);
+    }
+}
+
 // idx_select_kernel per row (blockIdx.x = row, t = t0 + row). P <= 512: every pool is selected, the list is 0 .. t.
 __global__ __launch_bounds__(1024) void idx_select_rows_kernel(const std::uint32_t* keys_all, unsigned cap, unsigned t0,
                                                                std::uint32_t* tokens_all, std::uint32_t* n_all) {
@@ -401,6 +470,113 @@ __global__ __launch_bounds__(1024) void idx_select_rows_kernel(const std::uint32
     }
     if (l == 0) {
         unsigned n = sh_carry_out * kKpool;
+        for (unsigned pos = P * kKpool; pos <= t; ++pos) tokens[n++] = pos;
+        n_all[row] = n;
+    }
+}
+
+// Select v2: the same list as idx_select_rows_kernel (an integer set/order property: the same top-512 keys, ties broken
+// by ascending pool, pools in ascending order, then the tail), with 256 threads per row. Radix digit search: the 256
+// counts are scanned in parallel (descending digit) instead of by one thread; compaction: 1024 keys per round, 4
+// consecutive pools per thread, exclusive counts from a wave scan plus the per-wave totals (4 barriers per round
+// instead of 40).
+constexpr unsigned kSel2Threads = 256, kSel2Waves = kSel2Threads / 32;
+// Exclusive prefix of v over the CTA in thread order; `total` = the CTA sum. ws: kSel2Waves words of LDS.
+__device__ __forceinline__ unsigned sel2_excl_scan(unsigned v, unsigned* ws, unsigned& total) {
+    const unsigned lane = threadIdx.x % 32, w = threadIdx.x / 32;
+    unsigned x = v;
+#pragma unroll
+    for (unsigned off = 1; off < 32; off <<= 1U) {
+        const unsigned y = __shfl_up(x, off, 32);
+        if (lane >= off) x += y;
+    }
+    if (lane == 31) ws[w] = x;
+    __syncthreads();
+    unsigned before = 0, tot = 0;
+#pragma unroll
+    for (unsigned i = 0; i < kSel2Waves; ++i) {
+        const unsigned s = ws[i];
+        tot += s;
+        before += i < w ? s : 0U;
+    }
+    __syncthreads();  // ws is reused by the next scan
+    total = tot;
+    return before + x - v;
+}
+__global__ __launch_bounds__(kSel2Threads) void idx_select_rows_v2_kernel(const std::uint32_t* keys_all, unsigned cap, unsigned t0,
+                                                                         std::uint32_t* tokens_all, std::uint32_t* n_all) {
+    __shared__ unsigned hist[256];
+    __shared__ unsigned ws[kSel2Waves];
+    __shared__ unsigned sh_digit, sh_rem;
+    const unsigned l = threadIdx.x, row = blockIdx.x, t = t0 + row;
+    const unsigned P = (t + 1) / kKpool;
+    std::uint32_t* tokens = tokens_all + static_cast<std::size_t>(row) * kMaxTokens;
+    if (P <= kIdxPools) {
+        for (unsigned pos = l; pos <= t; pos += kSel2Threads) tokens[pos] = pos;
+        if (l == 0) n_all[row] = t + 1;
+        return;
+    }
+    const std::uint32_t* keys = keys_all + static_cast<std::size_t>(row) * cap;
+    unsigned prefix = 0, mask = 0, rem = kIdxPools;
+    for (int shift = 24; shift >= 0; shift -= 8) {
+        hist[l] = 0;
+        __syncthreads();
+        for (unsigned p = l; p < P; p += kSel2Threads) {
+            const unsigned key = keys[p];
+            if ((key & mask) == prefix) atomicAdd(&hist[(key >> shift) & 255U], 1U);
+        }
+        __syncthreads();
+        // thread l holds digit d = 255 - l; cum = count of matching keys with digit >= d. The chosen digit is the one
+        // where cum first reaches rem (= the descending walk of the v1 kernel); rem becomes rem - (cum - h).
+        const unsigned h = hist[255 - l];
+        unsigned tot;
+        const unsigned above = sel2_excl_scan(h, ws, tot);
+        if (above < rem && above + h >= rem) {
+            sh_digit = 255 - l;
+            sh_rem = rem - above;
+        }
+        __syncthreads();
+        prefix |= sh_digit << shift;
+        mask |= 255U << shift;
+        rem = sh_rem;
+        __syncthreads();  // sh_* and hist are rewritten by the next pass
+    }
+    const unsigned kstar = prefix, take_eq = rem;
+    unsigned carry_eq = 0, carry_out = 0;
+    for (unsigned base = 0; base < P; base += 4 * kSel2Threads) {
+        unsigned key[4], eq_n = 0;
+#pragma unroll
+        for (unsigned i = 0; i < 4; ++i) {
+            const unsigned p = base + 4 * l + i;
+            key[i] = p < P ? keys[p] : 0U;
+            eq_n += (p < P && key[i] == kstar) ? 1U : 0U;
+        }
+        unsigned eq_tot;
+        unsigned eq_rank = carry_eq + sel2_excl_scan(eq_n, ws, eq_tot);
+        bool sel[4];
+        unsigned sel_n = 0;
+#pragma unroll
+        for (unsigned i = 0; i < 4; ++i) {
+            const unsigned p = base + 4 * l + i;
+            const bool eq = p < P && key[i] == kstar;
+            sel[i] = p < P && (key[i] > kstar || (eq && eq_rank < take_eq));
+            eq_rank += eq ? 1U : 0U;
+            sel_n += sel[i] ? 1U : 0U;
+        }
+        unsigned sel_tot;
+        unsigned at = carry_out + sel2_excl_scan(sel_n, ws, sel_tot);
+#pragma unroll
+        for (unsigned i = 0; i < 4; ++i)
+            if (sel[i]) {
+                const unsigned p = base + 4 * l + i;
+                for (unsigned j = 0; j < kKpool; ++j) tokens[at * kKpool + j] = p * kKpool + j;
+                ++at;
+            }
+        carry_eq += eq_tot;
+        carry_out += sel_tot;
+    }
+    if (l == 0) {
+        unsigned n = carry_out * kKpool;
         for (unsigned pos = P * kKpool; pos <= t; ++pos) tokens[n++] = pos;
         n_all[row] = n;
     }
@@ -600,6 +776,89 @@ __global__ __launch_bounds__(256) void mla_gemm_rows_kernel(const float* A, cons
         for (unsigned j = 0; j < 4; ++j) Y[(static_cast<std::size_t>(r) * heads + h) * NC + c0 + tc * 4 + j] = acc[i][j];
     }
 }
+// GEMM v2: mla_gemm_rows_kernel's outputs and per-output chain (k ascending from +0, fmaf(A, W, acc)) with a 128-row x
+// 64-column tile and 8 x 4 outputs per thread. A is staged transposed ([k][row], padded) and W as f32 ([k][col], padded),
+// so one k step is 3 ds_load_b128 + 32 FMAs; the next K stage is loaded into registers while the current one is used.
+constexpr unsigned kG2R = 128, kG2C = 64, kG2K = 32, kG2PadR = kG2R + 4, kG2PadC = kG2C + 4;
+template <bool kOut>
+__global__ __launch_bounds__(256) void mla_gemm_rows_v2_kernel(const float* A, const std::uint16_t* kv_b, unsigned heads, unsigned C, float* Y) {
+    constexpr unsigned K = kOut ? kKvLora : kMlaDim, NC = kOut ? kMlaDim : kKvLora;
+    __shared__ alignas(16) float as[kG2K][kG2PadR];  // 16.5 KB
+    __shared__ alignas(16) float ws[kG2K][kG2PadC];  // 8.5 KB
+    const unsigned r0 = blockIdx.x * kG2R, c0 = blockIdx.y * kG2C, h = blockIdx.z, tid = threadIdx.x, tr = tid / 16, tc = tid % 16;
+    float4 ar[4];
+    uint4 wr;
+    auto load = [&](unsigned k0) {
+#pragma unroll
+        for (unsigned i = 0; i < 4; ++i) {  // A tile [128 rows][32 k]: x -> row x / 8, k quad x % 8 (128 B per row)
+            const unsigned x = tid + 256 * i, rr = x / 8, q = x % 8, r = r0 + rr;
+            ar[i] = r < C ? *reinterpret_cast<const float4*>(A + (static_cast<std::size_t>(r) * heads + h) * K + k0 + 4 * q)
+                          : float4{0.0F, 0.0F, 0.0F, 0.0F};
+        }
+        std::size_t at;
+        if (kOut) {  // column c (kv_b row h*512 + 256 + c), 8 consecutive k
+            const unsigned cc = tid / 4, k8 = tid % 4;
+            at = static_cast<std::size_t>(h * 2 * kMlaDim + kMlaDim + c0 + cc) * kKvLora + k0 + 8 * k8;
+        } else {     // k row (kv_b row h*512 + k), 8 consecutive c
+            const unsigned kk = tid / 8, c8 = tid % 8;
+            at = static_cast<std::size_t>(h * 2 * kMlaDim + k0 + kk) * kKvLora + c0 + 8 * c8;
+        }
+        wr = *reinterpret_cast<const uint4*>(kv_b + at);
+    };
+    auto store = [&]() {
+#pragma unroll
+        for (unsigned i = 0; i < 4; ++i) {
+            const unsigned x = tid + 256 * i, rr = x / 8, q = x % 8;
+            as[4 * q + 0][rr] = ar[i].x;
+            as[4 * q + 1][rr] = ar[i].y;
+            as[4 * q + 2][rr] = ar[i].z;
+            as[4 * q + 3][rr] = ar[i].w;
+        }
+        const std::uint32_t wv[4] = {wr.x, wr.y, wr.z, wr.w};
+        float f[8];
+#pragma unroll
+        for (unsigned ii = 0; ii < 8; ++ii) f[ii] = f16_to_float(static_cast<std::uint16_t>(wv[ii / 2] >> (16 * (ii % 2))));
+        if (kOut) {
+            const unsigned cc = tid / 4, k8 = tid % 4;
+#pragma unroll
+            for (unsigned ii = 0; ii < 8; ++ii) ws[8 * k8 + ii][cc] = f[ii];
+        } else {
+            const unsigned kk = tid / 8, c8 = tid % 8;
+            *reinterpret_cast<float4*>(&ws[kk][8 * c8]) = float4{f[0], f[1], f[2], f[3]};
+            *reinterpret_cast<float4*>(&ws[kk][8 * c8 + 4]) = float4{f[4], f[5], f[6], f[7]};
+        }
+    };
+    float acc[8][4];
+#pragma unroll
+    for (unsigned i = 0; i < 8; ++i)
+#pragma unroll
+        for (unsigned j = 0; j < 4; ++j) acc[i][j] = 0.0F;
+    load(0);
+    for (unsigned k0 = 0; k0 < K; k0 += kG2K) {
+        __syncthreads();  // previous stage consumed; this stage's loads complete
+        store();
+        __syncthreads();
+        if (k0 + kG2K < K) load(k0 + kG2K);
+#pragma unroll 4
+        for (unsigned kk = 0; kk < kG2K; ++kk) {
+            const float4 a0 = *reinterpret_cast<const float4*>(&as[kk][tr * 8]), a1 = *reinterpret_cast<const float4*>(&as[kk][tr * 8 + 4]);
+            const float4 w4 = *reinterpret_cast<const float4*>(&ws[kk][tc * 4]);
+            const float a[8] = {a0.x, a0.y, a0.z, a0.w, a1.x, a1.y, a1.z, a1.w}, w[4] = {w4.x, w4.y, w4.z, w4.w};
+#pragma unroll
+            for (unsigned i = 0; i < 8; ++i)
+#pragma unroll
+                for (unsigned j = 0; j < 4; ++j) acc[i][j] = __builtin_fmaf(a[i], w[j], acc[i][j]);
+        }
+    }
+#pragma unroll
+    for (unsigned i = 0; i < 8; ++i) {
+        const unsigned r = r0 + tr * 8 + i;
+        if (r < C)
+            *reinterpret_cast<float4*>(Y + (static_cast<std::size_t>(r) * heads + h) * NC + c0 + tc * 4) =
+                float4{acc[i][0], acc[i][1], acc[i][2], acc[i][3]};
+    }
+}
+
 // Scores v2: thread = list index j; q-tilde of the row staged transposed [i][H] so 4 heads come in one LDS load; the
 // token's latent read 8 dims at a time. Per (head, token) the chain over l ascending is unchanged.
 template <unsigned H>
@@ -791,6 +1050,72 @@ __global__ __launch_bounds__(256) void mla_scores_v4_kernel(DsaSlot sl, const st
         if (j < n)
 #pragma unroll
             for (unsigned a = 0; a < HPT; ++a) e[static_cast<std::size_t>(hg * HPT + a) * kEStride + j] = acc[sidx][a] * kMlaScale;
+    }
+}
+
+// Scores v5: lane = list entries j and j + 32 of a 64-entry wave tile (one entry for H = 64), every head's accumulator
+// in registers. q-tilde is the same for the whole CTA (one row), so it is read through scalar loads (16 consecutive dims
+// of one head per load) and each inner-loop FMA takes its q operand from an SGPR; the entries' latent comes straight from
+// global memory, 16 bf16 per entry per step, prefetched one step ahead. No LDS, no barriers. Per (head, entry) the chain
+// over l ascending from +0 is v4's fmaf(q, c, acc), times the scale: same bits.
+constexpr unsigned kS5L = 16, kS5Waves = 8;
+template <unsigned H>
+__global__ __launch_bounds__(32 * kS5Waves) void mla_scores_v5_kernel(DsaSlot sl, const std::uint32_t* tokens_all, const std::uint32_t* n_all,
+                                                                      const float* qt, float* e_all) {
+    constexpr unsigned E = 64 / H;  // entries per lane: 2 (TP2) or 1
+    const unsigned r = blockIdx.y, n = n_all[r];
+    const unsigned wave = static_cast<unsigned>(__builtin_amdgcn_readfirstlane(static_cast<int>(threadIdx.x / 32))), lane = threadIdx.x % 32;
+    const unsigned j0 = (blockIdx.x * kS5Waves + wave) * 32 * E;
+    if (j0 >= n) return;  // uniform per wave
+    const std::uint32_t* tok = tokens_all + static_cast<std::size_t>(r) * kMaxTokens;
+    const uint4* lat[E];
+#pragma unroll
+    for (unsigned x = 0; x < E; ++x) {
+        const unsigned j = j0 + lane + 32 * x;  // entries past n read position 0's latent (always cached) and store nothing
+        lat[x] = reinterpret_cast<const uint4*>(sl.latent + static_cast<std::size_t>(j < n ? tok[j] : 0U) * kKvLora);
+    }
+    const auto* qr = (ConstF*)(qt + static_cast<std::size_t>(r) * H * kKvLora);  // NOLINT: address-space cast
+    float acc[E][H];
+#pragma unroll
+    for (unsigned x = 0; x < E; ++x)
+#pragma unroll
+        for (unsigned h = 0; h < H; ++h) acc[x][h] = 0.0F;
+    uint4 raw[E][2];
+#pragma unroll
+    for (unsigned x = 0; x < E; ++x) {
+        raw[x][0] = lat[x][0];
+        raw[x][1] = lat[x][1];
+    }
+    for (unsigned l0 = 0; l0 < kKvLora; l0 += kS5L) {
+        float c[E][kS5L];
+#pragma unroll
+        for (unsigned x = 0; x < E; ++x) {
+            const std::uint32_t wv[8] = {raw[x][0].x, raw[x][0].y, raw[x][0].z, raw[x][0].w, raw[x][1].x, raw[x][1].y, raw[x][1].z, raw[x][1].w};
+#pragma unroll
+            for (unsigned i = 0; i < kS5L; ++i) c[x][i] = bf16_to_float(static_cast<std::uint16_t>(wv[i / 2] >> (16 * (i % 2))));
+        }
+        if (l0 + kS5L < kKvLora)
+#pragma unroll
+            for (unsigned x = 0; x < E; ++x) {
+                raw[x][0] = lat[x][(l0 + kS5L) / 8];
+                raw[x][1] = lat[x][(l0 + kS5L) / 8 + 1];
+            }
+#pragma unroll
+        for (unsigned h = 0; h < H; ++h) {
+            const SVec16 q = *reinterpret_cast<ConstV16*>(qr + static_cast<std::size_t>(h) * kKvLora + l0);
+#pragma unroll
+            for (unsigned i = 0; i < kS5L; ++i)
+#pragma unroll
+                for (unsigned x = 0; x < E; ++x) acc[x][h] = __builtin_fmaf(q[i], c[x][i], acc[x][h]);
+        }
+    }
+    float* e = e_all + static_cast<std::size_t>(r) * H * kEStride;
+#pragma unroll
+    for (unsigned x = 0; x < E; ++x) {
+        const unsigned j = j0 + lane + 32 * x;
+        if (j < n)
+#pragma unroll
+            for (unsigned h = 0; h < H; ++h) e[static_cast<std::size_t>(h) * kEStride + j] = acc[x][h] * kMlaScale;
     }
 }
 
@@ -1113,6 +1438,110 @@ __global__ __launch_bounds__(256) void mla_obar_v6_kernel(DsaSlot sl, const std:
     }
 }
 
+// o-bar v7 (heads 32): v5's lane chains and 256-lane binary-counter merge with another placement. CTA = all 32 heads x
+// 128 latent dims of one row; wave w owns heads 4 w .. 4 w + 3, lane the dims d0 + 4 lane .. + 3 (16 outputs per
+// thread). The probabilities are wave-uniform, so they come through scalar loads from the lane-major layout (9
+// contiguous slots per head and k); the latent of a batch of 4 k (36 slots, 128 dims) is staged in LDS as f32 (the exact
+// bf16 widening, done once per CTA instead of per thread), double buffered, one barrier per batch. Inner step: one LDS
+// read + 16 FMAs with an SGPR operand.
+constexpr unsigned kOb7Dims = 128, kOb7Steps = 4, kOb7Slots = kOb7Steps * kObRounds;  // 36
+constexpr unsigned kOb7LVec = kOb7Slots * kOb7Dims / 8, kOb7Ld = (kOb7LVec + 255) / 256;  // 576 uint4 (8 bf16), 3 per thread
+__global__ __launch_bounds__(256) void mla_obar_v7_kernel(DsaSlot sl, const std::uint32_t* tokens_all, const std::uint32_t* n_all,
+                                                          const float* e_all, float* ob) {
+    __shared__ alignas(16) float lt[2][kOb7Slots][kOb7Dims];  // 36 KB
+    const unsigned d0 = blockIdx.x * kOb7Dims, r = blockIdx.y, n = n_all[r];
+    const unsigned tid = threadIdx.x, lane = tid % 32, w = static_cast<unsigned>(__builtin_amdgcn_readfirstlane(static_cast<int>(tid / 32)));
+    const std::uint32_t* tok = tokens_all + static_cast<std::size_t>(r) * kMaxTokens;
+    const auto* pw = (ConstF*)(e_all + (static_cast<std::size_t>(r) * 32 + 4 * w) * kEStride);  // NOLINT: address-space cast (heads 4 w ..)
+    uint4 lr[kOb7Ld];
+    auto load = [&](unsigned b) {  // batch b (k = 4 b .. 4 b + 3) into registers
+#pragma unroll
+        for (unsigned i = 0; i < kOb7Ld; ++i) {
+            const unsigned x = tid + 256 * i;
+            if (x < kOb7LVec) {
+                const unsigned slot = x / (kOb7Dims / 8), c8 = x % (kOb7Dims / 8);
+                const unsigned t = bitrev8(kOb7Steps * b + slot / kObRounds) + 256 * (slot % kObRounds);
+                lr[i] = t < n ? *reinterpret_cast<const uint4*>(sl.latent + static_cast<std::size_t>(tok[t]) * kKvLora + d0 + 8 * c8)
+                              : uint4{0, 0, 0, 0};
+            }
+        }
+    };
+    auto store = [&](unsigned buf) {
+#pragma unroll
+        for (unsigned i = 0; i < kOb7Ld; ++i) {
+            const unsigned x = tid + 256 * i;
+            if (x < kOb7LVec) {
+                const unsigned slot = x / (kOb7Dims / 8), c8 = x % (kOb7Dims / 8);
+                const std::uint32_t wv[4] = {lr[i].x, lr[i].y, lr[i].z, lr[i].w};
+                float f[8];
+#pragma unroll
+                for (unsigned ii = 0; ii < 8; ++ii) f[ii] = bf16_to_float(static_cast<std::uint16_t>(wv[ii / 2] >> (16 * (ii % 2))));
+                float4* dst = reinterpret_cast<float4*>(&lt[buf][slot][8 * c8]);
+                dst[0] = float4{f[0], f[1], f[2], f[3]};
+                dst[1] = float4{f[4], f[5], f[6], f[7]};
+            }
+        }
+    };
+    float stk[4][4][8];  // binary-counter levels 0..7; the root (level 8) is formed by the last merge (k = 255) and stored
+    load(0);
+    store(0);
+    __syncthreads();
+    for (unsigned b = 0; b < 256 / kOb7Steps; ++b) {
+        const unsigned cur = b & 1U;
+        if (b + 1 < 256 / kOb7Steps) load(b + 1);
+        for (unsigned j = 0; j < kOb7Steps; ++j) {
+            const unsigned k = kOb7Steps * b + j, l = bitrev8(k);
+            float p[4][kObRounds];
+#pragma unroll
+            for (unsigned a = 0; a < 4; ++a)
+#pragma unroll
+                for (unsigned m = 0; m < kObRounds; ++m) p[a][m] = pw[a * kEStride + kObRounds * k + m];  // padding slots are +0
+            float c[4][4];
+#pragma unroll
+            for (unsigned a = 0; a < 4; ++a)
+#pragma unroll
+                for (unsigned q = 0; q < 4; ++q) c[a][q] = 0.0F;
+#pragma unroll
+            for (unsigned m = 0; m < kObRounds; ++m) {
+                if (l + 256 * m < n) {  // uniform; true for a prefix of m
+                    const float4 cv4 = *reinterpret_cast<const float4*>(&lt[cur][kObRounds * j + m][4 * lane]);
+                    const float cv[4] = {cv4.x, cv4.y, cv4.z, cv4.w};
+#pragma unroll
+                    for (unsigned a = 0; a < 4; ++a)
+#pragma unroll
+                        for (unsigned q = 0; q < 4; ++q) c[a][q] = __builtin_fmaf(p[a][m], cv[q], c[a][q]);
+                }
+            }
+            // merge as v5: carry through the set low bits of k (left operand = the stored, lower-k subtree), place at
+            // the first clear bit; k = 255 carries through all 8 levels and its result is the root.
+            bool placed = false;
+#pragma unroll
+            for (unsigned L = 0; L < 8; ++L) {
+                if (placed) continue;
+                if ((k >> L) & 1U) {
+#pragma unroll
+                    for (unsigned a = 0; a < 4; ++a)
+#pragma unroll
+                        for (unsigned q = 0; q < 4; ++q) c[a][q] = stk[a][q][L] + c[a][q];
+                } else {
+#pragma unroll
+                    for (unsigned a = 0; a < 4; ++a)
+#pragma unroll
+                        for (unsigned q = 0; q < 4; ++q) stk[a][q][L] = c[a][q];
+                    placed = true;
+                }
+            }
+            if (!placed)
+#pragma unroll
+                for (unsigned a = 0; a < 4; ++a)
+                    *reinterpret_cast<float4*>(ob + (static_cast<std::size_t>(r) * 32 + 4 * w + a) * kKvLora + d0 + 4 * lane) =
+                        float4{c[a][0], c[a][1], c[a][2], c[a][3]};
+        }
+        if (b + 1 < 256 / kOb7Steps) store(cur ^ 1U);
+        __syncthreads();
+    }
+}
+
 // o-bar v2: grid (latent block of 8 dims, row). The row's latent tile [n][8] bf16 is staged in LDS once; per pass of 4
 // heads, lane j accumulates 4 x 8 fmaf chains over t = j, j + 256, ... (ascending t), then lds_tree<256>'s pairing:
 // levels 128 / 64 / 32 through LDS, levels 16 .. 1 by __shfl_down inside wave 0 (lane l < h receives lane l + h).
@@ -1419,50 +1848,81 @@ bool mla_v1() {
     }();
     return v1;
 }
-bool idx_v1() {  // STRIX_GLM_PF_IDX=1: the v1 indexer score kernel (same bits); default v2
-    static const bool v1 = [] {
-        const char* e = std::getenv("STRIX_GLM_PF_IDX");
-        return e && std::string(e) == "1";
-    }();
-    return v1;
-}
-unsigned obar_version() {  // default 5 (heads 32; heads 64 runs v2); 6 is opt-in pending native qualification
-    // STRIX_GLM_PF_OBAR=2 / 4: v2 / v4 (all same bits;
-    // measurement: v5 18.1 vs v2 53.9 us/row per DSA layer at the 32K chunk, 11.9 vs 32.9 at t0 0; measurement: v4 5 % slower than v2)
+unsigned idx_version() {  // default v3 (bitwise == v2, -35..-44 % at t0 4096..28672); STRIX_GLM_PF_IDX=2 / 1: v2 / v1 (same keys)
     static const unsigned v = [] {
-        const char* e = std::getenv("STRIX_GLM_PF_OBAR");
-        if (e && std::string(e) == "6") return 6U;
-        if (e && std::string(e) == "4") return 4U;
+        const char* e = std::getenv("STRIX_GLM_PF_IDX");
+        if (e && std::string(e) == "1") return 1U;
         if (e && std::string(e) == "2") return 2U;
-        return 5U;
+        return 3U;
     }();
     return v;
 }
-unsigned scores_version() {  // default v4 (measured: bitwise == v3, -8..-17 %); STRIX_GLM_PF_SCORES=3 / 2: v3 / v2 (same bits)
+unsigned select_version() {  // default v2 (same lists as v1, -60..-85 % at t0 4096..28672); STRIX_GLM_PF_SELECT=1: v1
+    static const unsigned v = [] {
+        const char* e = std::getenv("STRIX_GLM_PF_SELECT");
+        return e && std::string(e) == "1" ? 1U : 2U;
+    }();
+    return v;
+}
+unsigned obar_version() {  // default 7 (heads 32; heads 64 runs v2); STRIX_GLM_PF_OBAR=5 / 2 / 4 / 6: v5 / v2 / v4 / v6 (all same bits)
+    // measurement: v7 9.0-10.2 vs v5 16.6-17.3 us/row per DSA layer at t0 4096..28672 (6.6 vs 11.3 at t0 0); v5 18.1 vs v2
+    // 53.9 at the 32K chunk; v4 5 % slower than v2; v6 2.4x slower than v5
+    static const unsigned v = [] {
+        const char* e = std::getenv("STRIX_GLM_PF_OBAR");
+        if (e && std::string(e) == "6") return 6U;
+        if (e && std::string(e) == "5") return 5U;
+        if (e && std::string(e) == "4") return 4U;
+        if (e && std::string(e) == "2") return 2U;
+        return 7U;
+    }();
+    return v;
+}
+unsigned mla_gemm_version() {  // default v2 absorb / out GEMM (same bits, -20..-25 % per call); STRIX_GLM_PF_MLA_GEMM=1: v1
+    static const unsigned v = [] {
+        const char* e = std::getenv("STRIX_GLM_PF_MLA_GEMM");
+        return e && std::string(e) == "1" ? 1U : 2U;
+    }();
+    return v;
+}
+unsigned scores_version() {  // default v5 (bitwise == v4/v3, 8.6-11.5 vs 14.0 us/row at t0 4096..28672); STRIX_GLM_PF_SCORES=4 / 3 / 2
     static const unsigned v = [] {
         const char* e = std::getenv("STRIX_GLM_PF_SCORES");
+        if (e && std::string(e) == "4") return 4U;
         if (e && std::string(e) == "3") return 3U;
         if (e && std::string(e) == "2") return 2U;
-        return 4U;
+        return 5U;
     }();
     return v;
 }
 
 }  // namespace
 
+namespace {
+hipEvent_t* g_kda_prof = nullptr;  // 5 events: before prep, conv commit, scan, out, after
+void kda_mark(unsigned i, hipStream_t s) {
+    if (g_kda_prof) ok(hipEventRecord(g_kda_prof[i], s), "glm pf kda profile event");
+}
+}  // namespace
+void set_kda_profile(hipEvent_t* ev5) { g_kda_prof = ev5; }
+
 void kda_prefill(const KdaDev& k, const float* qkv, const float* f, const float* gate, const float* b, float* S,
                  float* conv_state, float* scratch, float* beta, float* o, float* y, unsigned* flag, unsigned C,
                  hipStream_t s) {
     if (C == 0) return;
     const unsigned channels = 3 * k.heads * kKdaDim;
+    kda_mark(0, s);
     kda_prep_rows_kernel<<<dim3(k.heads, C), 128, 0, s>>>(k, qkv, f, b, conv_state, scratch, beta);
     ok(hipGetLastError(), "glm pf kda_prep_rows");
+    kda_mark(1, s);
     kda_conv_commit_kernel<<<(channels + 255) / 256, 256, 0, s>>>(qkv, conv_state, channels, C);
     ok(hipGetLastError(), "glm pf kda_conv_commit");
+    kda_mark(2, s);
     kda_scan_kernel<<<dim3(k.heads, kKdaDim / kScanV), kScanLanes * kScanV, 0, s>>>(k.heads, S, scratch, beta, o, flag, C);
     ok(hipGetLastError(), "glm pf kda_scan");
+    kda_mark(3, s);
     kda_out_rows_kernel<<<dim3(k.heads, C), 128, 0, s>>>(k, o, gate, y);
     ok(hipGetLastError(), "glm pf kda_out_rows");
+    kda_mark(4, s);
 }
 
 void dsa_append_rows(const DsaSlot& slot, unsigned t0, const float* latent, const float* key, const float* gate,
@@ -1477,24 +1937,47 @@ void dsa_append_rows(const DsaSlot& slot, unsigned t0, const float* latent, cons
     }
 }
 
+namespace {
+hipEvent_t* g_idx_prof = nullptr;  // 3 events: before scores, before select, after
+void idx_mark(unsigned i, hipStream_t s) {
+    if (g_idx_prof) ok(hipEventRecord(g_idx_prof[i], s), "glm pf indexer profile event");
+}
+}  // namespace
+void set_idx_profile(hipEvent_t* ev3) { g_idx_prof = ev3; }
+
 void indexer_select_rows(const DsaSlot& slot, unsigned t0, const float* qI, float* wh, std::uint32_t* keys,
                          unsigned kpool_cap, std::uint32_t* tokens, std::uint32_t* n, unsigned C, hipStream_t s) {
+    indexer_select_rows_versions(slot, t0, qI, wh, keys, kpool_cap, tokens, n, C, s, idx_version(), select_version());
+}
+
+void indexer_select_rows_versions(const DsaSlot& slot, unsigned t0, const float* qI, float* wh, std::uint32_t* keys,
+                                  unsigned kpool_cap, std::uint32_t* tokens, std::uint32_t* n, unsigned C, hipStream_t s,
+                                  unsigned score_v, unsigned select_v) {
+    if ((score_v != 1 && score_v != 2 && score_v != 3) || (select_v != 1 && select_v != 2))
+        throw std::runtime_error("glm pf indexer_select_rows_versions: unsupported versions");
     if (C == 0) return;
+    idx_mark(0, s);
     const unsigned Pmax = (t0 + C) / kKpool;
     if (Pmax > kpool_cap) throw std::runtime_error("glm pf indexer_select_rows: key workspace too small");
     if (Pmax > kIdxPools) {
         scale_kernel<<<(C * kIdxHeads + 255) / 256, 256, 0, s>>>(wh, C * kIdxHeads, kInvSqrt32);
         ok(hipGetLastError(), "glm pf scale");
-        if (idx_v1())
+        if (score_v == 1)
             idx_score_rows_kernel<<<dim3((Pmax + 127) / 128, (C + kScoreRows - 1) / kScoreRows), 128, 0, s>>>(
+                slot.pooled, t0, C, qI, wh, keys, kpool_cap);
+        else if (score_v == 3)
+            idx_score_rows_v3_kernel<<<dim3((Pmax + kIs3Pools - 1) / kIs3Pools, (C + kIs3Rows - 1) / kIs3Rows), 32 * kIs3Rows, 0, s>>>(
                 slot.pooled, t0, C, qI, wh, keys, kpool_cap);
         else
             idx_score_rows_v2_kernel<<<dim3((Pmax + kIs2Pools - 1) / kIs2Pools, (C + kIs2Rows - 1) / kIs2Rows), 256, 0, s>>>(
                 slot.pooled, t0, C, qI, wh, keys, kpool_cap);
         ok(hipGetLastError(), "glm pf idx_score_rows");
     }
-    idx_select_rows_kernel<<<C, 1024, 0, s>>>(keys, kpool_cap, t0, tokens, n);
+    idx_mark(1, s);
+    if (select_v == 2) idx_select_rows_v2_kernel<<<C, kSel2Threads, 0, s>>>(keys, kpool_cap, t0, tokens, n);
+    else idx_select_rows_kernel<<<C, 1024, 0, s>>>(keys, kpool_cap, t0, tokens, n);
     ok(hipGetLastError(), "glm pf idx_select_rows");
+    idx_mark(2, s);
 }
 
 void dense_rows(const float* x, const void* w, dev::WType wt, unsigned in, unsigned o0, unsigned n, float* y, unsigned rows,
@@ -1542,15 +2025,16 @@ void mla_mark(unsigned i, hipStream_t s) {
 }
 }  // namespace
 void set_mla_profile(hipEvent_t* ev6) { g_mla_prof = ev6; }
-bool mla_e_lane_major(unsigned heads) { return !mla_v1() && obar_version() == 5 && heads == 32; }
+bool mla_e_lane_major(unsigned heads) { return !mla_v1() && (obar_version() == 5 || obar_version() == 7) && heads == 32; }
 
 void mla_attention_rows_versions(const DsaSlot& slot, const std::uint32_t* tokens, const std::uint32_t* n, const float* q,
                         const std::uint16_t* kv_b, unsigned heads, float* qt, float* e, float* ob, float* o, unsigned C,
-                        hipStream_t s, unsigned scores_v, unsigned obar_v) {
+                        hipStream_t s, unsigned scores_v, unsigned obar_v, unsigned gemm_v) {
     if (C == 0) return;
     if (heads != 32 && heads != 64) throw std::runtime_error("glm pf mla_attention_rows: heads must be 32 or 64");
-    if ((scores_v != 1 && scores_v != 2 && scores_v != 3 && scores_v != 4) ||
-        (obar_v != 1 && obar_v != 2 && obar_v != 4 && obar_v != 5 && obar_v != 6) ||
+    if (gemm_v != 1 && gemm_v != 2) throw std::runtime_error("glm pf mla_attention_rows_versions: unsupported gemm version");
+    if ((scores_v != 1 && scores_v != 2 && scores_v != 3 && scores_v != 4 && scores_v != 5) ||
+        (obar_v != 1 && obar_v != 2 && obar_v != 4 && obar_v != 5 && obar_v != 6 && obar_v != 7) ||
         ((scores_v == 1) != (obar_v == 1)))
         throw std::runtime_error("glm pf mla_attention_rows_versions: unsupported version pair");
     const bool v1 = scores_v == 1;  // explicit legacy pair
@@ -1562,11 +2046,16 @@ void mla_attention_rows_versions(const DsaSlot& slot, const std::uint32_t* token
         if (heads == 32) mla_scores_rows_kernel<32><<<sg, 256, 0, s>>>(slot, tokens, n, qt, e);
         else mla_scores_rows_kernel<64><<<sg, 256, 0, s>>>(slot, tokens, n, qt, e);
     } else {
-        mla_gemm_rows_kernel<false><<<dim3((C + kGT - 1) / kGT, kKvLora / kGT, heads), 256, 0, s>>>(q, kv_b, heads, C, qt);
+        if (gemm_v == 2) mla_gemm_rows_v2_kernel<false><<<dim3((C + kG2R - 1) / kG2R, kKvLora / kG2C, heads), 256, 0, s>>>(q, kv_b, heads, C, qt);
+        else mla_gemm_rows_kernel<false><<<dim3((C + kGT - 1) / kGT, kKvLora / kGT, heads), 256, 0, s>>>(q, kv_b, heads, C, qt);
         mla_mark(1, s);
         if (scores_v == 2) {
             if (heads == 32) mla_scores_v2_kernel<32><<<sg, 256, 0, s>>>(slot, tokens, n, qt, e);
             else mla_scores_v2_kernel<64><<<sg, 256, 0, s>>>(slot, tokens, n, qt, e);
+        } else if (scores_v == 5) {
+            constexpr unsigned tile = 32 * kS5Waves * 2;  // entries per CTA at H = 32 (half that at H = 64)
+            if (heads == 32) mla_scores_v5_kernel<32><<<dim3((kMaxTokens + tile - 1) / tile, C), 32 * kS5Waves, 0, s>>>(slot, tokens, n, qt, e);
+            else mla_scores_v5_kernel<64><<<dim3((kMaxTokens + tile / 2 - 1) / (tile / 2), C), 32 * kS5Waves, 0, s>>>(slot, tokens, n, qt, e);
         } else {
             const dim3 g3((kMaxTokens + kS3Tok - 1) / kS3Tok, C);
             if (scores_v == 4 && heads == 32) mla_scores_v4_kernel<32><<<g3, 256, 0, s>>>(slot, tokens, n, qt, e);
@@ -1577,8 +2066,8 @@ void mla_attention_rows_versions(const DsaSlot& slot, const std::uint32_t* token
     }
     ok(hipGetLastError(), "glm pf mla absorb/scores");
     mla_mark(2, s);
-    const unsigned obv = v1 ? 1U : obar_v == 5 && heads == 64 ? 2U : obar_v;  // v5: heads 32 only
-    if (obv == 5) mla_softmax_rows_kernel<true><<<dim3(heads, C), 256, 0, s>>>(n, heads, e);
+    const unsigned obv = v1 ? 1U : (obar_v == 5 || obar_v == 7) && heads == 64 ? 2U : obar_v;  // v5 / v7: heads 32 only
+    if (obv == 5 || obv == 7) mla_softmax_rows_kernel<true><<<dim3(heads, C), 256, 0, s>>>(n, heads, e);
     else mla_softmax_rows_kernel<false><<<dim3(heads, C), 256, 0, s>>>(n, heads, e);
     ok(hipGetLastError(), "glm pf mla_softmax_rows");
     mla_mark(3, s);
@@ -1587,12 +2076,14 @@ void mla_attention_rows_versions(const DsaSlot& slot, const std::uint32_t* token
         mla_mark(4, s);
         mla_out_rows_kernel<<<dim3(heads, C), 256, 0, s>>>(ob, kv_b, heads, o);
     } else {
-        if (obv == 6) mla_obar_v6_kernel<<<dim3(heads / kOb6Heads, kKvLora / kOb6Dims, C), 256, 0, s>>>(slot, tokens, n, heads, e, ob);
+        if (obv == 7) mla_obar_v7_kernel<<<dim3(kKvLora / kOb7Dims, C), 256, 0, s>>>(slot, tokens, n, e, ob);
+        else if (obv == 6) mla_obar_v6_kernel<<<dim3(heads / kOb6Heads, kKvLora / kOb6Dims, C), 256, 0, s>>>(slot, tokens, n, heads, e, ob);
         else if (obv == 5) mla_obar_v5_kernel<<<dim3(kKvLora / kOb5Dims, C), 256, 0, s>>>(slot, tokens, n, e, ob);
         else if (obv == 4) mla_obar_v4_kernel<<<dim3(heads / kOb4Heads, kKvLora / kOb4Dims, C), 256, 0, s>>>(slot, tokens, n, heads, e, ob);
         else mla_obar_v2_kernel<<<dim3(kKvLora / kOb2Lat, C), 256, 0, s>>>(slot, tokens, n, heads, e, ob);
         mla_mark(4, s);
-        mla_gemm_rows_kernel<true><<<dim3((C + kGT - 1) / kGT, kMlaDim / kGT, heads), 256, 0, s>>>(ob, kv_b, heads, C, o);
+        if (gemm_v == 2) mla_gemm_rows_v2_kernel<true><<<dim3((C + kG2R - 1) / kG2R, kMlaDim / kG2C, heads), 256, 0, s>>>(ob, kv_b, heads, C, o);
+        else mla_gemm_rows_kernel<true><<<dim3((C + kGT - 1) / kGT, kMlaDim / kGT, heads), 256, 0, s>>>(ob, kv_b, heads, C, o);
     }
     ok(hipGetLastError(), "glm pf mla obar/out");
     mla_mark(5, s);
@@ -1602,7 +2093,7 @@ void mla_attention_rows(const DsaSlot& slot, const std::uint32_t* tokens, const 
                         const std::uint16_t* kv_b, unsigned heads, float* qt, float* e, float* ob, float* o, unsigned C,
                         hipStream_t s) {
     mla_attention_rows_versions(slot, tokens, n, q, kv_b, heads, qt, e, ob, o, C, s,
-                                mla_v1() ? 1U : scores_version(), mla_v1() ? 1U : obar_version());
+                                mla_v1() ? 1U : scores_version(), mla_v1() ? 1U : obar_version(), mla_gemm_version());
 }
 
 }  // namespace strix::glm::pf
