@@ -13,9 +13,13 @@ namespace strix::gemma4::gpu {
 // Startup-cached STRIX_G4_PREFILL_EXACT_MANYROW: unset or 1 = many-row tiles,
 // 0 = the eight-row slices of linear()/gate_up() (identical bytes).
 [[nodiscard]] bool rows_linear_enabled();
+// STRIX_G4_PREFILL_ROWS_TILE_V2 (read per call; unset or 1 = on, 0 = off):
+// per-shape default tiles (two-tile input staging for calls of at least 256
+// rows and more than 512 outputs). Every variant has the same bytes.
+[[nodiscard]] bool rows_tile_v2();
 // Tile variants (outputs per wave x rows per workgroup); all have equal bytes.
 // -1 selects STRIX_G4_ROWS_TILE, else the measured default per format.
-inline constexpr int rows_linear_variants = 8;
+inline constexpr int rows_linear_variants = 12;
 // out[r * outputs + o] for rows r < rows; x holds rows * inputs FP32 values.
 // failure (optional) receives the finite flag of every stored value.
 void linear_rows(LinearView w, const float* x, std::uint32_t rows, float* out, Queue queue = nullptr,

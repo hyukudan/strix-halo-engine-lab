@@ -165,7 +165,12 @@ void bench() {
             auto dx = device(x);
             Buffer out(std::size_t(rows) * s.outputs * sizeof(float));
             Buffer scratch(s.gate ? std::size_t(rows) * s.outputs * sizeof(float) : 0);
-            for (int variant = -2; variant < rows_linear_variants * (s.gate ? 2 : 1); ++variant) {
+            // Two passes, forward then reverse variant order, so clock ramp and
+            // cache state do not favour one end of the list; each prints its own line.
+            const int last = rows_linear_variants * (s.gate ? 2 : 1);
+            for (int pass = 0; pass < 2; ++pass)
+            for (int step = -2; step < last; ++step) {
+                const int variant = pass == 0 ? step : last - 3 - step;
                 // Gate/up variants >= rows_linear_variants run the split schedule.
                 const bool split = variant >= rows_linear_variants;
                 const int tile = split ? variant - rows_linear_variants : variant;
@@ -180,7 +185,7 @@ void bench() {
                 run();
                 synchronize();
                 const auto start = std::chrono::steady_clock::now();
-                const unsigned repeats = variant == -2 ? 2U : 5U;
+                const unsigned repeats = variant == -2 ? 2U : 20U;
                 for (unsigned r = 0; r < repeats; ++r)
                     run();
                 synchronize();
@@ -188,7 +193,7 @@ void bench() {
                     std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count() / repeats;
                 const double macs = double(rows) * s.outputs * s.inputs * (s.gate ? 2.0 : 1.0);
                 std::cout << std::setprecision(6) << "{\"bench\":\"" << s.name << "\",\"rows\":" << rows
-                          << ",\"variant\":\"" << (variant == -2 ? "rows8" : (split ? "split" : "") + std::to_string(tile)) << "\",\"ms\":" << ms
+                          << ",\"pass\":" << pass << ",\"variant\":\"" << (variant == -2 ? "rows8" : (split ? "split" : "") + std::to_string(tile)) << "\",\"ms\":" << ms
                           << ",\"gmac_s\":" << macs / (ms * 1e6) << "}\n";
             }
         }
