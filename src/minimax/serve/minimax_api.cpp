@@ -432,7 +432,7 @@ void MinimaxApi::handle(const sv::HttpRequest& req, sv::HttpResponseWriter& w) {
         }
         if (options_.admin_sched && req.path == "/admin/sched") return send_json(w, 200, options_.admin_sched(req));
         if (req.method != "POST") return send_error(w, 404, "no route " + req.method + " " + req.path);
-        const sv::Json body = sv::parse_json(req.body);
+        const sv::Json body = sv::parse_request_json(req.body);
         if (req.path == "/tokenize") {
             const auto* text = body.find("text");
             if (!text || !text->is_string()) return send_error(w, 400, "text required");

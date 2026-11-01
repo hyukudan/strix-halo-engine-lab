@@ -173,6 +173,7 @@ struct HttpServer::Impl {
     std::uint16_t bound_port = 0;
     std::atomic<bool> stopping{false};
     std::atomic<unsigned> connections{0};
+    std::atomic<std::uint64_t> inflight_body{0};  // Content-Length of requests being received or handled
     std::mutex mutex;
     std::condition_variable idle;
     std::set<int> open_fds; // under mutex; stop() shuts them down so blocked reads return
@@ -324,6 +325,23 @@ struct HttpServer::Impl {
                 connection.send(413, "application/json", R"({"error":{"message":"request body too large","type":"invalid_request_error"}})");
                 return;
             }
+            // Reserved from the shared body budget until the handler has returned (the reservation ends with this
+            // request's iteration).
+            struct BodyReservation {
+                std::atomic<std::uint64_t>& total;
+                std::uint64_t bytes = 0;
+                ~BodyReservation() { total.fetch_sub(bytes); }
+            } reservation{inflight_body};
+            if (length > 0U && config.max_inflight_body_bytes > 0U) {
+                if (inflight_body.fetch_add(length) + length > config.max_inflight_body_bytes) {
+                    inflight_body.fetch_sub(length);
+                    connection.keep_alive = false;
+                    connection.add_response_header("Retry-After", "1");
+                    connection.send(503, "application/json", R"({"error":{"message":"server busy: too many request bytes in flight","type":"server_error"}})");
+                    return;
+                }
+                reservation.bytes = length;
+            }
             // The body may take one more second per started MiB on top of the request deadline (>= 1 MiB/s).
             if (deadline) *deadline += std::chrono::seconds(static_cast<long>((length + (1U << 20U) - 1U) >> 20U));
             while (buffer.size() < length) {
@@ -332,8 +350,13 @@ struct HttpServer::Impl {
                 if (read == Read::closed) return;
             }
             if (expired()) { too_late(); return; }
-            request.body = buffer.substr(0, static_cast<std::size_t>(length));
-            buffer.erase(0, static_cast<std::size_t>(length));
+            if (buffer.size() == length) {
+                request.body = std::move(buffer);  // the usual case: no second copy of a large body
+                buffer.clear();
+            } else {
+                request.body = buffer.substr(0, static_cast<std::size_t>(length));
+                buffer.erase(0, static_cast<std::size_t>(length));
+            }
             const auto connection_header = lower(request.header("connection"));
             connection.keep_alive = request.version == "HTTP/1.1" ? connection_header != "close" : connection_header == "keep-alive";
             connection.reset();

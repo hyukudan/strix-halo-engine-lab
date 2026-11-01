@@ -84,6 +84,12 @@ public:
 
 // Serving parser retains legacy byte and surrogate handling; depth limited to 128.
 [[nodiscard]] Json parse_json(std::string_view text);
+// Values one HTTP request body may hold (every scalar, array and object counts, overwritten ones too): a parsed value
+// costs tens of bytes, so an untrusted body of small values cannot grow into gigabytes (2^21 values ~ 150 MiB parsed;
+// a 1M-token prompt array fits).
+inline constexpr std::size_t kMaxRequestJsonValues = std::size_t{1} << 21U;
+// parse_json for untrusted request bodies: at most kMaxRequestJsonValues values (files and trusted inputs use parse_json).
+[[nodiscard]] Json parse_request_json(std::string_view text);
 // Asset parser also rejects duplicates, invalid UTF-8 and unpaired surrogates.
 [[nodiscard]] Json parse_json_unique(std::string_view text);
 void append_json_string(std::string& out, std::string_view value);

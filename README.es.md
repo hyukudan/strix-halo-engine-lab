@@ -1153,7 +1153,8 @@ necesitan `Authorization: Bearer <key>` o `x-api-key: <key>`; sin ella, el servi
 por completo en 60 segundos (408; más un segundo por cada MiB de cuerpo) y dan por desaparecido a un cliente que no
 acepta datos durante 60 segundos, cancelando su generación. Las peticiones con un encuadre ambiguo (Content-Length en
 conflicto, cualquier Transfer-Encoding, línea de petición o nombres de cabecera mal formados) se rechazan con 400/501.
-Mantenga los servidores en loopback o en una red privada y ponga
+Los cuerpos de petición que se están recibiendo o atendiendo comparten un presupuesto de 256 MiB (503 con Retry-After
+cuando está lleno), y un cuerpo de petición puede contener como máximo 2,097,152 valores JSON. Mantenga los servidores en loopback o en una red privada y ponga
 los clientes remotos tras un front end que autentique, como el router de [TensorMeld](https://github.com/hyukudan/tensormeld)
 o su canal de control; los ranks DeepSeek de dos nodos intercambian tensores por el enlace USB4, y la división RTX
 (puerto TCP de la etapa del pipeline) y los servidores de expertos usan TCP sin más: ninguno de ellos lleva autenticación, por lo que deben

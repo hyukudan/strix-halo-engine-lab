@@ -4,6 +4,8 @@
 #include <cmath>
 #include <cstdio>
 #include <limits>
+#include <string>
+#include <unordered_map>
 
 namespace strix::serve {
 
@@ -148,7 +150,7 @@ std::string Json::dump_spaced() const { std::string out; write(out, true); retur
 namespace {
 class Parser {
 public:
-    explicit Parser(std::string_view text, bool unique = false) : unique_(unique), text_(text) {}
+    Parser(std::string_view text, bool unique, std::size_t max_values) : unique_(unique), max_values_(max_values), text_(text) {}
     Json document() {
         if (unique_) validate_utf8();
         auto value = parse(0);
@@ -188,12 +190,14 @@ private:
     }
     Json parse(unsigned depth) {
         if (depth > 128U) fail("nesting is too deep");
+        if (++values_ > max_values_) fail("too many values");
         skip();
         if (at_ >= text_.size()) fail("unexpected end of input");
         const char c = text_[at_];
         if (c == '{') {
             ++at_;
             Json::Object members;
+            std::unordered_map<std::string, std::size_t> index;  // key -> member, once the object is large
             skip();
             if (at_ < text_.size() && text_[at_] == '}') { ++at_; return Json(std::move(members)); }
             for (;;) {
@@ -204,9 +208,23 @@ private:
                 if (at_ >= text_.size() || text_[at_] != ':') fail("expected ':'");
                 ++at_;
                 auto value = parse(depth + 1U);
-                bool replaced = false;
-                for (auto& member : members) if (member.first == key) { if (unique_) fail("duplicate object key"); member.second = std::move(value); replaced = true; break; }
-                if (!replaced) members.emplace_back(std::move(key), std::move(value));
+                // A repeated key replaces the value in place (or fails the unique parser). Large objects index their
+                // keys: a linear scan per member made them quadratic.
+                std::size_t found = members.size();
+                if (!index.empty()) {
+                    if (const auto it = index.find(key); it != index.end()) found = it->second;
+                } else {
+                    for (std::size_t i = 0; i < members.size(); ++i) if (members[i].first == key) { found = i; break; }
+                }
+                if (found != members.size()) {
+                    if (unique_) fail("duplicate object key");
+                    members[found].second = std::move(value);
+                } else {
+                    members.emplace_back(std::move(key), std::move(value));
+                    if (!index.empty()) index.emplace(members.back().first, members.size() - 1U);
+                    else if (members.size() > kIndexedMembers)
+                        for (std::size_t i = 0; i < members.size(); ++i) index.emplace(members[i].first, i);
+                }
                 skip();
                 if (at_ < text_.size() && text_[at_] == ',') { ++at_; continue; }
                 if (at_ < text_.size() && text_[at_] == '}') { ++at_; return Json(std::move(members)); }
@@ -307,14 +325,19 @@ private:
             }
         }
     }
+    static constexpr std::size_t kIndexedMembers = 32;
     bool unique_;
+    std::size_t max_values_;
+    std::size_t values_ = 0;
     std::string_view text_;
     std::size_t at_ = 0;
 };
 }  // namespace
 
-Json parse_json_unique(std::string_view text) { return Parser(text, true).document(); }
+Json parse_json_unique(std::string_view text) { return Parser(text, true, std::numeric_limits<std::size_t>::max()).document(); }
 
-Json parse_json(std::string_view text) { return Parser(text).document(); }
+Json parse_json(std::string_view text) { return Parser(text, false, std::numeric_limits<std::size_t>::max()).document(); }
+
+Json parse_request_json(std::string_view text) { return Parser(text, false, kMaxRequestJsonValues).document(); }
 
 }  // namespace strix::serve

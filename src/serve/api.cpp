@@ -2169,7 +2169,7 @@ void ApiService::handle(const HttpRequest& request, HttpResponseWriter& raw_resp
         if (request.path == "/v1/responses" && !impl.config.responses)
             throw ApiError(404, "not_found_error", "unknown route " + request.path);
         Json body;
-        try { body = parse_json(request.body); }
+        try { body = parse_request_json(request.body); }
         catch (const JsonError& e) { throw ApiError(400, "invalid_request_error", std::string("invalid JSON body: ") + e.what()); }
         if (!body.is_object()) throw ApiError(400, "invalid_request_error", "the request body must be a JSON object");
         if (request.path == "/v1/chat/completions") impl.chat_completions(request, response, body);

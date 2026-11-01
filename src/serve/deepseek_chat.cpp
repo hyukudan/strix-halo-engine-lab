@@ -141,7 +141,7 @@ std::string call_to_dsml(const Json& call) {
     if (const auto* a = fn->find("arguments")) arguments = *a;
     for (int k = 0; k < 2 && arguments.is_string(); ++k) {  // JSON strings, including double-encoded ones
         try {
-            arguments = parse_json(arguments.as_string());
+            arguments = parse_request_json(arguments.as_string());
         } catch (const JsonError&) {
             break;
         }

@@ -201,7 +201,7 @@ inline bool handle_session_route(bool enabled, const MtpServeRunner& run,
                     if (command.session_operation != "checkpoint" && command.session_operation != "park" && command.session_operation != "resume")
                         throw std::invalid_argument("unknown session operation");
                     if (command.session_operation == "checkpoint") {
-                        const auto body = serve::parse_json(request.body);
+                        const auto body = serve::parse_request_json(request.body);
                         const auto* durability = body.find("durability");
                         if (!durability || !durability->is_string()) throw std::invalid_argument("durability must be ram|disk");
                         command.session_durability = durability->as_string();

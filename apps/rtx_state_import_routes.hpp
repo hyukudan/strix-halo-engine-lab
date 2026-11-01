@@ -262,7 +262,7 @@ inline bool handle_rtx_state_import_route(RtxStateImportRegistry& registry, cons
             const auto id = query("id");
             const auto staging = staging_of(id);
             Json body;
-            try { body = serve::parse_json(request.body); }
+            try { body = serve::parse_request_json(request.body); }
             catch (const serve::JsonError& e) { throw std::invalid_argument(std::string("invalid JSON body: ") + e.what()); }
             const auto* chunks = body.is_object() ? body.find("chunks") : nullptr;
             const auto* bytes = body.is_object() ? body.find("bytes") : nullptr;
