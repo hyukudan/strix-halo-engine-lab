@@ -9,7 +9,8 @@ runnable levers in the [single profile table](../include/strix/qwen_profile_tabl
 Where the route admits it, fast currently applies BF16 MoE route storage by exporting
 `STRIX_QPF2K_MOE_ROUTE_BF16=1`, without `--allow-pending`. This bit-changing row
 changes logits and is selected ahead of its qualification receipt; qualification
-is in progress. Its receipt status is `provisional`, with qualification stamp
+is in progress. Its receipt status is `provisional` and it is listed in
+`profile.provisional`, with qualification stamp
 `qualification in progress: moe_route_bf16`, and exactly one stderr line states
 that it is bit-changing and qualification is in progress. On other routes, including
 HTTP and MTP, the row stays `pending` with the same reason as an explicit request's
@@ -30,8 +31,8 @@ rotary admission stay pending with their reason and are not exported or stamped
 as applied; selection alone cannot cause that refusal. Required assets remain
 mandatory, and explicit requests for unavailable code refuse. Selecting a profile
 does not establish qualification. All receipts, HTTP capabilities/stats and
-effective config report `profile`, `qualification`, `levers`, `pending` and
-`unqualified` inside the `profile` object. Apply profiles at startup and restart
+effective config report `profile`, `qualification`, `levers`, `pending`, `provisional`
+and `unqualified` inside the `profile` object. Apply profiles at startup and restart
 servers to change them.
 See the [command-line contract](getting-started/engine-reference.md#command-line).
 
