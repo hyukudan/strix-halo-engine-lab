@@ -284,7 +284,9 @@ void auto_rows() {
     expect(sc::auto_prefill_rows(49152, t) == 16384U, "auto rows: no drafter");
     t = r;
     t.device_free = gib(20.0);
-    expect(sc::auto_prefill_rows(49152, t) == 2048U, "auto rows: nothing fits -> 2048");
+    expect(sc::auto_prefill_rows(49152, t) == 0U, "auto rows: nothing fits -> 0 (refuse, no unchecked 2048 floor)");
+    t.device_free = gib(26.46 + 0.95);  // reserve 26.46 GiB + the 2048-row piece (0.90 GiB at 49152): only the floor fits
+    expect(sc::auto_prefill_rows(49152, t) == 2048U, "auto rows: only the 2048 floor fits -> 2048");
     t.mem_available = 0;  // unknown MemAvailable: device free alone
     t.device_free = gib(34.4);
     expect(sc::auto_prefill_rows(49152, t) == 16384U, "auto rows: MemAvailable unknown");
@@ -299,7 +301,9 @@ void auto_rows() {
             t = r;
             t.device_free = gib(free);
             const auto rows = sc::auto_prefill_rows(ctx, t);
-            expect(rows >= 32U && rows % 8U == 0U && (rows <= ctx || rows == 32U), "auto rows: valid --prefill-rows value");
+            expect(rows == 0U || (rows >= 32U && rows % 8U == 0U && (rows <= ctx || rows == 32U)), "auto rows: valid --prefill-rows value or no fit");
+            const std::uint64_t avail = std::min(t.device_free, t.mem_available), reserve = t.own_weights + t.drafter + t.margin;
+            expect(rows == 0U || sc::prefill_piece_bytes(rows, ctx) <= avail - std::min(avail, reserve), "auto rows: a returned size always fits (no unchecked floor)");
         }
 }
 
