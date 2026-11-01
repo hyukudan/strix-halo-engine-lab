@@ -1,0 +1,149 @@
+#include "strix/hip_compact_qsa_diagnostic.hpp"
+#include <hip/hip_runtime.h>
+#include "../src/hip_rounded_stage_image.hpp"
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <stdexcept>
+#include <vector>
+
+namespace {
+void check(hipError_t e) { if(e!=hipSuccess) throw std::runtime_error(hipGetErrorString(e)); }
+struct Buffer {
+    void* data=nullptr;
+    explicit Buffer(std::size_t bytes) {check(hipMalloc(&data,bytes));}
+    ~Buffer() {if(data) (void)hipFree(data);}
+    template<class T> T* as() const {return static_cast<T*>(data);}
+};
+constexpr unsigned width=6144U, hidden=2560U, maximum=2052U;
+__global__ void initialize(float* query, std::uint16_t* kv, std::uint32_t* selected,
+    unsigned char* weights, unsigned rows) {
+    const auto i=static_cast<std::uint64_t>(blockIdx.x)*blockDim.x+threadIdx.x;
+    if(i<static_cast<std::uint64_t>(rows)*width*2U) {
+        // BF16-rounded queries and gates, with both signs and zeros.
+        const auto b=static_cast<unsigned>((i*17U+3U)%129U);
+        const float x=(static_cast<float>(b)-64.0F)/256.0F;
+        query[i]=__uint_as_float(__float_as_uint(x)&0xffff0000U);
+    }
+    if(i<32U*1024U) kv[i]=static_cast<std::uint16_t>(0x3c00U+((i*13U)%256U)+(i%2U?0x8000U:0U));
+    if(i<static_cast<std::uint64_t>(rows)*maximum) selected[i]=static_cast<unsigned>(i%maximum)%32U;
+    if(i<hidden*(width/32U)*34U) {
+        const auto at=i%34U;
+        weights[i]=at==0U?0U:at==1U?0x28U:static_cast<unsigned char>(static_cast<int>((i*7U)%17U)-8);
+    }
+}
+__global__ void initialize_float_weights(float* weights) {
+    const auto i=static_cast<std::uint64_t>(blockIdx.x)*blockDim.x+threadIdx.x;
+    if(i<static_cast<std::uint64_t>(width)*hidden) weights[i]=(static_cast<float>(i%17U)-8.0F)/256.0F;
+}
+__global__ void initialize_scores(float* scores, float* query, std::uint64_t elements, bool special) {
+    const auto i=static_cast<std::uint64_t>(blockIdx.x)*blockDim.x+threadIdx.x;
+    if(i<elements) scores[i]=(i%maximum<32U)?1.0F/32.0F:0.0F;
+    if(special && i<16U) {
+        const unsigned words[16]={0U,0x80000000U,0x7f800000U,0xff800000U,0x7fc10000U,0xffc10000U,
+            0x7f810000U,0xff810000U,0x00010000U,0x80010000U,0x7fff0000U,0xffff0000U,
+            0x47800000U,0xc7800000U,0x3f800000U,0xbf800000U};
+        query[256U+i]=__uint_as_float(words[i]);
+        if(i==0U) scores[0]=__uint_as_float(0x7fc10000U);
+    }
+}
+__global__ void initialize_int8(std::uint16_t* kv) {
+    const unsigned token=blockIdx.x,feature=threadIdx.x;
+    auto* row=reinterpret_cast<unsigned char*>(kv)+token*1040U;
+    for(unsigned i=feature;i<1024U;i+=256U) reinterpret_cast<std::int8_t*>(row)[i]=static_cast<std::int8_t>(static_cast<int>(i%17U)-8);
+    if(feature<4U) reinterpret_cast<float*>(row+1024U)[feature]=1.0F/64.0F;
+}
+__global__ void special_bits(std::uint32_t* fp32, std::uint16_t* compact) {
+    const unsigned i=blockIdx.x*blockDim.x+threadIdx.x;
+    if(i>=65536U) return;
+    // Exercise exactly the producer's integer rounding, then both production stores.
+    for(unsigned low=0;low<5U;++low) {
+        const unsigned tails[5]={0U,1U,0x7fffU,0x8000U,0xffffU};
+        const unsigned raw=(i<<16U)|tails[low];
+        const float rounded=__uint_as_float((raw+0x7fffU+((raw>>16U)&1U))&0xffff0000U);
+        strix::RoundedStageImage a(reinterpret_cast<float*>(fp32)),b(reinterpret_cast<float*>(compact),true);
+        a[i*5U+low]=rounded;b[i*5U+low]=rounded;
+    }
+}
+__global__ void read_special_bits(const std::uint16_t* compact, std::uint32_t* widened) {
+    const unsigned i=blockIdx.x*blockDim.x+threadIdx.x;
+    if(i>=65536U*5U) return;
+    strix::RoundedStageImage image(reinterpret_cast<float*>(const_cast<std::uint16_t*>(compact)),true);
+    widened[i]=__float_as_uint(static_cast<float>(image[i]));
+}
+void special_fixture(hipStream_t stream) {
+    Buffer reference(65536U*5U*4U),compact(65536U*5U*2U),widened(65536U*5U*4U);
+    hipLaunchKernelGGL(special_bits,dim3(256),dim3(256),0,stream,reference.as<std::uint32_t>(),compact.as<std::uint16_t>());
+    hipLaunchKernelGGL(read_special_bits,dim3(1280),dim3(256),0,stream,compact.as<std::uint16_t>(),widened.as<std::uint32_t>());
+    std::vector<std::uint32_t> a(65536U*5U),wide(a.size());std::vector<std::uint16_t> b(a.size());
+    check(hipStreamSynchronize(stream));
+    check(hipMemcpy(a.data(),reference.data,a.size()*4U,hipMemcpyDeviceToHost));
+    check(hipMemcpy(b.data(),compact.data,b.size()*2U,hipMemcpyDeviceToHost));
+    check(hipMemcpy(wide.data(),widened.data,wide.size()*4U,hipMemcpyDeviceToHost));
+    if(a!=wide) throw std::runtime_error("device widening changed special bits");
+    for(std::size_t i=0;i<a.size();++i) if(a[i]!=(static_cast<unsigned>(b[i])<<16U))
+        throw std::runtime_error("special value bits differ");
+}
+void run(unsigned rows, hipStream_t stream) {
+    const auto padded=(rows+63U)/64U*64U;
+    const auto image_elements=static_cast<std::size_t>(padded)*width;
+    const auto score_elements=static_cast<std::size_t>(padded)*24U*maximum;
+    Buffer query(image_elements*8U),kv(32U*1024U*2U),selected(static_cast<std::size_t>(padded)*maximum*4U),
+        scores(score_elements*4U),weights(hidden*(width/32U)*34U),float_weights(static_cast<std::size_t>(hidden)*width*4U),
+        ref_image(image_elements*4U+128U),small_image(image_elements*2U+128U),
+        ref_output(static_cast<std::size_t>(padded)*hidden*2U),small_output(static_cast<std::size_t>(padded)*hidden*2U),status(8U),quantized(8U*width+192U*8U*4U);
+    const auto blocks=static_cast<unsigned>((image_elements*2U+255U)/256U);
+    hipLaunchKernelGGL(initialize,dim3(blocks),dim3(256),0,stream,query.as<float>(),kv.as<std::uint16_t>(),
+        selected.as<std::uint32_t>(),weights.as<unsigned char>(),padded);
+    hipLaunchKernelGGL(initialize_float_weights,dim3((hidden*width+255U)/256U),dim3(256),0,stream,float_weights.as<float>());
+    std::vector<std::uint32_t> ref(static_cast<std::size_t>(rows)*width);
+    std::vector<std::uint16_t> small(ref.size()),a(static_cast<std::size_t>(padded)*hidden),b(a.size());
+    for(unsigned mode=0;mode<13U;++mode) for(unsigned projection=0;projection<5U;++projection) {
+        unsigned statuses[2][2]{};
+        std::vector<unsigned char> quantized_a(8U*width+192U*8U*4U),quantized_b(quantized_a.size());
+        if(mode>=10U) hipLaunchKernelGGL(initialize_int8,dim3(32),dim3(256),0,stream,kv.as<std::uint16_t>());
+        for(unsigned arm=0;arm<2U;++arm) {
+            auto& image=arm?small_image:ref_image;auto& output=arm?small_output:ref_output;
+            check(hipMemsetAsync(image.data,0xa5,image_elements*(arm?2U:4U)+128U,stream));
+            check(hipMemsetAsync(output.data,0xa5,a.size()*2U,stream));check(hipMemsetAsync(status.data,0,8U,stream));
+            hipLaunchKernelGGL(initialize_scores,dim3(static_cast<unsigned>((score_elements+255U)/256U)),dim3(256),0,stream,
+                scores.as<float>(),query.as<float>(),score_elements,mode==9U);
+            strix::HipCompactQsaProbe p;
+            p.query=query.as<float>();p.kv=kv.as<std::uint16_t>();p.selected=selected.as<std::uint32_t>();p.scores=scores.as<float>();
+            p.image=image.as<unsigned char>()+64U;p.weights=projection==3U?float_weights.data:weights.data;p.projected=output.as<std::uint16_t>();p.status=status.as<std::uint32_t>();
+            p.quantized=quantized.data;
+            p.rows=rows;p.mode=mode;p.compact=arm!=0U;p.tiled_projection=projection==0U;p.scalar_projection=projection==3U;
+            p.dense_a8_projection=projection==4U;p.fast_f16_projection=projection!=2U;
+            strix::launch_hip_compact_qsa_probe(p,stream);check(hipStreamSynchronize(stream));
+            check(hipMemcpy(statuses[arm],status.data,8U,hipMemcpyDeviceToHost));
+            if(mode==8U) {auto& target=arm?quantized_b:quantized_a;check(hipMemcpy(target.data(),quantized.data,target.size(),hipMemcpyDeviceToHost));}
+            if(arm) check(hipMemcpy(small.data(),p.image,small.size()*2U,hipMemcpyDeviceToHost));
+            else check(hipMemcpy(ref.data(),p.image,ref.size()*4U,hipMemcpyDeviceToHost));
+            auto& target=arm?b:a;check(hipMemcpy(target.data(),output.data,target.size()*2U,hipMemcpyDeviceToHost));
+            std::uint32_t guards[16];
+            for(auto offset:{std::size_t{0},64U+image_elements*(arm?2U:4U)}) {
+                check(hipMemcpy(guards,image.as<unsigned char>()+offset,64U,hipMemcpyDeviceToHost));
+                for(auto word:guards) if(word!=0xa5a5a5a5U) throw std::runtime_error("image guard overwritten");
+            }
+        }
+        for(std::size_t i=0;i<ref.size();++i) if(ref[i]!=(static_cast<unsigned>(small[i])<<16U))
+            throw std::runtime_error("attention image bits differ");
+        if(quantized_a!=quantized_b) throw std::runtime_error("tail quantizer bytes differ");
+        if(a!=b || std::memcmp(statuses[0],statuses[1],sizeof(statuses[0]))!=0) throw std::runtime_error("projection or status bytes differ");
+        std::printf("T%u mode%u projection%u EXACT image/projection/status/range/guards\n",rows,mode,projection);
+    }
+}
+}
+int main() {
+    int count=0;if(hipGetDeviceCount(&count)!=hipSuccess || !count) return 77;
+    hipStream_t stream=nullptr;
+    try {
+        check(hipStreamCreateWithFlags(&stream,hipStreamNonBlocking));
+        special_fixture(stream);run(8192U,stream);run(40U,stream);
+        check(hipStreamDestroy(stream));return 0;
+    } catch(const std::exception& e) {
+        std::fprintf(stderr,"compact image fixture: %s\n",e.what());
+        if(stream) (void)hipStreamDestroy(stream);return 1;
+    }
+}

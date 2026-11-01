@@ -146,9 +146,16 @@ fixed state into the fresh session and republishes the recorded counters and lin
 identity (includes the context), runtime compatibility identity, decode execution and kernel-plan
 identities, prefill (sibling) execution and kernel-plan identities, tiled prefill plan identities,
 prefill and decode numerical profile identities and their pair identity, T, the tail sizes and the context size.
+The canonical `prefix-execution-v5` descriptor includes the resolved prefill option mask,
+option-set identity hash and identity name. The existing v2 cache encoder binds that descriptor
+once through `effective_execution`; certificates and session compatibility inherit it.
 On the MTP route it also covers the sidecar content, the MTP plan and native profile identities and
 the draft-kernel switches (the predictor's cache rows are built with the draft kernels unless
 `--mtp-draft-exact`).
+
+The v4-to-v5 execution descriptor transition changes cache keys even with the option disabled.
+Existing keys become cold misses; numerical state bytes may still match. There is no in-place
+migration of incompatible identity metadata.
 
 `digest_k = SHA-256(digest_{k-1} || tokens of block k)`, `digest_0 = identity`. A digest names one
 identity and one exact token prefix; the stored tokens are compared as well. Why each field matters:

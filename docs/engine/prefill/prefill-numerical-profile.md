@@ -32,7 +32,7 @@ profile must be explicit. One of three prefill routes is required:
   block) runs the prefill profile. The calibration rows, the serial suffix, MTP replay, draft cycles,
   windows and generated rows run the decode profile.
 
-Model copy tiers, final-state export, GDN islands, prepared or overlapped serial execution and the MTP
+Model copy tiers, GDN islands, prepared or overlapped serial execution and the MTP
 metadata diagnostic are rejected with a split pair. Every other admission rule of `--numerical-profile`
 applies to both profiles. Other pairs fail at option parsing.
 
@@ -111,8 +111,12 @@ its own pair identity):
   the normalized rows and the low values are rounded to FP16 as operands; accumulation is FP32 over the
   whole width. The FP32 low values, the injection (FP32 inputs and weights, FP32 FMA chains) and the mix
   (stream order) keep FP32 arithmetic. Steps that do not take the wide path keep the decode profile's
-  kernels. By default the up projection keeps the FP32 lane-chain kernel on the projection's FP32 low values
-  (`STRIX_HCW_OUTPUT=2` selects the FP16 WMMA up projection). Blocks of up to 8192 rows. Diagnostic
+  kernels. The READY `hc_output_wmma` default selects OUT16 on admitted wide calls;
+  see the [guards and restoration controls](../../optimizations.md#bit-changing-prefill-options).
+  `--prefill-exact-fp16`, `--prefill-disable hc_output_wmma` or the corresponding config/environment
+  controls restore the FP32 lane-chain output on the projection's FP32 low values, including
+  when `STRIX_HCW_OUTPUT=2` requests legacy FP16 WMMA output. The legacy selector is governed
+  by the same enabled set. Blocks of up to 8192 rows. Diagnostic
   `STRIX_HCW_NORM16`: 1 = a fast-profile HC norm also writes the normalized rows in FP16 (padded pitch)
   for the projection; 2 = it writes only the FP16 rows and the lane-chain output's stream mix reads them
   too (the injection then runs on the FP16 values widened to FP32). Off by default.
@@ -191,3 +195,21 @@ unchanged, and enabling the candidate adds bit 64 to the pair composition.
 component mask. Inspection also reports the effective boolean and reason;
 HTTP capabilities report the candidate unsupported. Baseline and
 `STRIX_QPF2K_DEFAULTS=0` suppress it, including explicit CLI requests.
+
+Qwen `hc_output_wmma` is default ON. `hc_output_wmma` passed a pre-declared confirmation held-out set; its NLL endpoint is measured against a rounding-equivalent control whose per-case movement is capped at +-0.02 nats/token (a bounded control allowance, not an unbiased estimate of the uncapped difference); the absolute NLL change vs the exact reference also passed (-0.37 % NLL/token, upper bound +0.38 %). The off switch restores the exact output path.
+Controls are server-level only: `STRIX_PREFILL_HC_OUTPUT_WMMA=0`,
+`--prefill-disable hc_output_wmma`, or config `prefill_disable = ["hc_output_wmma"]`;
+master `STRIX_PREFILL_EXACT_FP16=1`, `--prefill-exact-fp16`, or config
+`prefill_exact_fp16 = true`. Restart the server; request-level controls return HTTP 400.
+Fast HC with this option is excluded from MTP and nested admission pending qualification;
+ordinary MTP/HTTP profiles retain their existing arithmetic. OFF restoration compares logits
+and seven state payloads to public main; compiled, lineage and cache identity bytes may differ.
+
+Validation-only split prefill can export `--validation-final-state DIR` after eager
+generation; the manifest records the prefill execution and option identity. This copies
+all seven allocations and invalidates timing. For unmodified public-main references,
+`tests/qwen_prefill_public_controls_gate.py --state-format session` uses `--session-save`:
+all committed KV/index rows plus the five complete fixed components and token frontier.
+It verifies every payload hash and the envelope root while allowing identity metadata to differ.
+Unused cache capacity is outside that committed-state comparison; the final-state export
+checks complete allocations separately.

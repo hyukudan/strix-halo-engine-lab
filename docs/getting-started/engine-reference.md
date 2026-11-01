@@ -135,6 +135,18 @@ before switch readers; provenance markers preserve resolution across a future
 re-exec. Cache identity changes only through the applied arithmetic switches.
 Profile controls are server-level and require a restart.
 
+The governed HC output option is independent of the product profile table.
+`default`, `fast` and `quality` all retain default `hc_output_wmma`;
+`--prefill-disable hc_output_wmma` or `--prefill-exact-fp16` restricts that
+registry without changing the product profile or its BF16 MoE route storage
+selection. To restore FP32 route storage with `fast`, also use
+`--prefill-moe-route-bf16 off`. The declared `prefill_identity` names the
+governed option set, while `prefill_storage_identity` describes MoE storage.
+Compiled prefill arithmetic binds the option mask and hash to the complete
+profile-pair identity, including the BF16 route component and GSQ arithmetic.
+Prefix-cache execution signatures retain rotary identity and effective BF16
+suppression state and also bind the governed option name, mask and hash.
+
 `strix-hip-decode-token` takes a GGUF model and the prompt as token IDs; it has no tokenizer. It writes a JSON
 receipt to stdout that includes `generated_tokens`, cycle counts and timings. `--help` lists the general options;
 the MTP options are documented in [mtp-native-cli.md](../engine/speculative/mtp-native-cli.md).
@@ -153,15 +165,35 @@ Registered mmap residency (`--residency register`) is the default on UMA; it avo
 For the pinned, content-verified Qwen checkpoint on a qualified Strix Halo target with the A8 runtime built,
 at least 16 prompt tokens and positive generation, the resolver selects eager known-prefix full-row tiling,
 routed expert union, router rows and terminal-row output. It chooses the largest prompt-fitting T from
-8192, 4096, 2048, 1024, 256, 64 and 16: T8192 for long prompts and T4096 at 4K. Short tails use the admitted
+8192, 4096, 2048, 1024, 256, 64 and 16, with T16384 tried first when the known prompt has at least
+32,768 tokens: T8192 below that threshold and T4096 at 4K. Short tails use the admitted
 tail ladder and then serial rows. Implicit context is at least 8192 and rounds prompt length plus
 `max(generation, 512)` up to 512 tokens; beyond 8192 it adds `--unqualified-context` automatically.
 An explicit context is preserved and retains its validation requirements.
 
+`STRIX_QPF2K_T16K` unset uses the 32,768-token prompt threshold. Exact `STRIX_QPF2K_T16K=1`
+tries T16384 first for any prompt of at least 16,384 tokens, subject to the same route and memory guards.
+Any value starting with `0` disables T16384; other values except exact `1` also retain the T8192 ladder.
+Ineffective values are omitted from the effective environment: the receipt shows the selected T and
+historical policy, without an unused T16384 request or fallback. Unset prompts below 32,768 retain the
+T8192-first ladder and arithmetic policy, but native-pool pricing at every T can
+lower the admitted tile; previous budget and tile decisions are not guaranteed. When T16384 is tried, `--print-effective-config` adds `t16k_policy`
+with `source` (`automatic` or `explicit`) and `threshold_tokens: 32768`, including after memory fallback.
+The notice reports `automatic T16384` when selected, plus the policy source and threshold; its reason is
+`automatic-t16k` or `opt-in-t16k`. Automatic selection does not inject a T16384 environment override.
+Baseline, `STRIX_QPF2K_DEFAULTS=0*`, GSQ, MTP, HTTP and cohort exclusions still apply to both policies.
+
 Admission needs unambiguous Linux UMA/GTT observations and sufficient simultaneous backing capacity.
-The full-capacity budgets are 8 GiB workspace, 1 GiB metadata, 120 GiB UMA and 4 GiB host headroom;
-smaller available memory scales them down (headroom is at least 1 GiB). This is an admission limit,
-not a promise to allocate that much memory. The receipt uses dense-A8 decode with
+For T8192 and smaller, the full-capacity budgets are 8 GiB workspace, 1 GiB metadata, 120 GiB UMA and 4 GiB host headroom;
+smaller available memory scales them down (headroom starts at at least 1 GiB). Native pools
+are priced at every T under UMA/GTT admission, raising required headroom when necessary
+and potentially lowering the admitted tile. These are admission limits, not promised
+allocations. T16384 prices its compiled main/tail workspace, both metadata copies and
+native pools under the same limits before falling back to the smaller-tile ladder.
+Explicit tiled routes must supply `--known-prefix-host-headroom-bytes` covering the
+reported native host and device pools; zero or insufficient headroom is refused.
+`--baseline` does not restore the old explicit-route acceptance: the pools remain reserved.
+The receipt uses dense-A8 decode with
 `fast-prefill-f16wmma-v1` prefill when FP16 operands and planning are admitted. FP16 prefill is its own
 numerical identity, exact against its own reference, **not bit-identical to dense-A8 serial prefill**.
 FP16 operand/plan refusal keeps dense-A8 tiled prefill with an arithmetic-fallback reason.
@@ -180,9 +212,12 @@ filtered per GSQ owner, so GSQ runs without the former requirement to disable th
 
 Long prompts run with the default command up to the model maximum of 262,144 tokens (prompt plus generation):
 the automatic context is clamped to that maximum, the admission estimate credits the PLE pages that reclaim will
-free, and the tile falls back from T8192 to T4096 and then T2048 before the route declines. A prompt plus generation
+free, and the tile falls back from T16384 (when eligible) to T8192, T4096 and then T2048 before the route declines,
+reporting each failed tile and its reason. A prompt plus generation
 above the maximum is refused (`prompt-exceeds-model-context`); a tile that does not fit the memory budget reports
-`insufficient-memory`. Measured with the plain command: 131,072 tokens 92.34 s, 262,143 tokens 201.13 s.
+`insufficient-memory`. Under the priced native pools, at 131,072 and 262,143 real-text
+tokens the default admits automatic T16384, and with `STRIX_QPF2K_T16K=0` it admits T8192
+as before, with no fallback.
 
 Diagnostic and execution-control variables also decline the auto route (reason
 `explicit-diagnostic-or-execution-control`, with the decline line): `STRIX_PREFILL_LOGITS_DIGEST`,
@@ -201,7 +236,7 @@ Off switches:
 - `STRIX_PREFILL_F16=0`: decline automatic tiling and retain historical resolution.
 - `--prefill-numerical-profile dense-a8`: retain automatic tiling with the dense-A8 prefill identity.
 - `STRIX_QPF2K_DEFAULTS=0` (any value starting with `0`): stop default injection and decline automatic tiling; explicit environment values remain.
-- Individual controlled feature values `=0` also decline automatic tiling, except the six exact prefill
+- Individual controlled feature values `=0` also decline automatic tiling, except the seven exact prefill
   alternatives below, whose `=0` disables only that item and keeps the route. To measure a single operator inside
   the same tiled identity, use an explicit tiled route with the same T, budgets and profile pair.
 - `STRIX_PLE_RECLAIMABLE=0`: keep the original warm PLE pages; `auto` has its own route/setup admission.
@@ -218,7 +253,7 @@ route; declined MTP/serving/cohort/diagnostic/model/memory routes keep historica
 Pre-main initialization retains the historical tiled settings and route-gated PLE reclaim for other clients.
 See the [full catalog](../optimizations.md#qwen-defaults) for every value and guard.
 
-The same decoder admission also defaults six exact prefill alternatives when unset (bitwise identical results;
+The same decoder admission also defaults seven exact prefill alternatives when unset (bitwise identical results;
 deferred at startup, so MTP/HTTP serving, cohorts and other binaries keep their opt-ins; filtered per GSQ owner):
 
 | Default | Operation and retained gate | Off switch |
@@ -229,8 +264,9 @@ deferred at startup, so MTP/HTTP serving, cohorts and other binaries keep their 
 | `STRIX_QPF2K_MOE_MC=1` | Ordered MoE merge + BF16 commit (mode 1) behind the existing DA16/ROUTE=14 certificate. | `STRIX_QPF2K_MOE_MC=0` |
 | `STRIX_QPF2K_MOE_HDR=1` | Gate/up superblock header reuse within the DA16 tune 80/82 path. | `STRIX_QPF2K_MOE_HDR=0` |
 | `STRIX_QPF2K_MOE_XOR64=1` | MoE 64-assignment DA16 tune (automatic tune only) with XOR-permuted LDS rows (three CTAs per WGP) from 3,072 rows; 128-assignment batches (from 4,915 rows for 512 experts, top-10) are unchanged. | `STRIX_QPF2K_MOE_XOR64=0` |
+| `STRIX_QPF2K_HC_LOWBAND=3` | Banded low_t and unused low16-store omission; projection form 4 to FP32 output v3 band 16 only. Output WMMA and other routes keep mode 0. | `STRIX_QPF2K_HC_LOWBAND=0` |
 
-`STRIX_QPF2K_HC_LOWBAND` remains opt-in; MC mode 2 requires an explicit value.
+MC mode 2 requires an explicit value.
 
 The following explicit MTP configuration remains useful for speculative runs. Its low-level flags own that
 route; do not append them to the recommended plain command to request defaults that are already automatic.

@@ -66,11 +66,15 @@ KnownWindowResult execute_known_prefix_prefill_eager(const CompiledKnownPrefixPr
     const void* preflight_key=&launch;
     const bool preflight_known=hooks.preflight_memo&&
         std::find(hooks.preflight_memo->begin(),hooks.preflight_memo->end(),preflight_key)!=hooks.preflight_memo->end();
-    if(!preflight_known) validate_compiled_known_prefix_prefill(plan,serial);
+    const bool static_known=hooks.static_preflight_memo&&
+        std::find(hooks.static_preflight_memo->begin(),hooks.static_preflight_memo->end(),preflight_key)!=hooks.static_preflight_memo->end();
+    require(!hooks.static_preflight_only || (hooks.preflight_only && !hooks.partial_rows && tokens.empty()),
+        "static prefill admission requires a complete plan, no prompt and admission-only mode");
+    if(!preflight_known&&!static_known) validate_compiled_known_prefix_prefill(plan,serial);
     lap("plan");
     // STRIX_QPF2K_SCHED bit 4: a partial block runs the first tokens.size() rows of the compiled T arena.
     const auto rows=hooks.partial_rows?static_cast<std::uint32_t>(tokens.size()):plan.logical_rows;const auto steps=serial.execution.steps.size();
-    require(tokens.size()==rows,"known prefill token count differs from compiled T");
+    require(hooks.static_preflight_only || tokens.size()==rows,"known prefill token count differs from compiled T");
     if(hooks.partial_rows)
         require(rows>=16U&&rows%8U==0U&&rows<=plan.logical_rows&&plan.output_policy!=KnownWindowOutputPolicy::all_rows,
             "known prefill partial block needs 16..T rows in multiples of 8 and a terminal-row or state-only plan");
@@ -178,7 +182,7 @@ KnownWindowResult execute_known_prefix_prefill_eager(const CompiledKnownPrefixPr
         ExecutionDispatchContext c;c.execution_identity=plan.prefill_execution_identity;c.step_id=s.id;c.op=s.op;c.layer=s.layer;
         c.reads=io.reads;c.writes=io.writes;c.temporaries=io.temporaries;c.arena=plan.terminal_logits_arena && s.op==SerialOp::lm_head && row+1U==rows?&terminal_view:&plan.arena.row_view[row];c.memory=&memory;
         c.session_state_layout=resources.session_state_layout;c.session_state_memory=resources.session_state_memory;c.resources=&resources;
-        c.reads_state=s.reads_state;c.writes_state=s.writes_state;c.position=session.next_position+row;c.input_token_id=tokens[row];
+        c.reads_state=s.reads_state;c.writes_state=s.writes_state;c.position=session.next_position+row;c.input_token_id=hooks.static_preflight_only?0U:tokens[row];
         if(!binding.host_or_runtime_step) c.kernel_id=std::string_view(*binding.kernel_id);
         return c;
     };
@@ -187,7 +191,7 @@ KnownWindowResult execute_known_prefix_prefill_eager(const CompiledKnownPrefixPr
     lap("launchers");
     validate_execution_runtime_resources(plan.prefill_execution_identity,plan.arena.physical,resources,session.next_position);
     lap("resources2");
-    EagerExecutionRequest request;request.input_token_id=tokens[0];request.position=session.next_position;request.state=session.state;
+    EagerExecutionRequest request;request.input_token_id=hooks.static_preflight_only?0U:tokens[0];request.position=session.next_position;request.state=session.state;
     validate_eager_execution_preflight(serial.execution,serial.bindings,serial.io,plan.terminal_logits_arena?terminal_view:plan.arena.row_view[0],request,
         resources.session_state_layout,resources.session_state_memory,&resources);
     // Topology/IO/state shape is identical for every R1 view. The immutable
@@ -257,7 +261,12 @@ KnownWindowResult execute_known_prefix_prefill_eager(const CompiledKnownPrefixPr
         // (re-running those costs ~17 ms of idle GPU per 64-row block). Their launchers still admit
         // each context before enqueueing, so an out-of-capacity block fails during launch (session
         // poisoned) instead of before it; capacity and positions are checked above for every block.
-        if(preflight_known||(headless&&step>=headless_from)) continue;
+        const auto op=serial.execution.steps[step].op;
+        const bool dynamic=op==SerialOp::token_embedding || op==SerialOp::position_prepare ||
+            op==SerialOp::ple || op==SerialOp::indexed_attention || reads_position(serial.execution.steps[step].reads_state);
+        if(preflight_known || (headless&&step>=headless_from) ||
+            (hooks.static_preflight_only && dynamic) ||
+            (static_known && !hooks.partial_rows && !dynamic)) continue;
         if(plan.terminal_logits_arena && step+1U==steps) {
             for(const auto row:result.logit_row_indices) {
                 const auto c=context(step,row);launch.steps[step].preflight(c,launch.steps[step].user_data);
@@ -303,7 +312,12 @@ KnownWindowResult execute_known_prefix_prefill_eager(const CompiledKnownPrefixPr
     lap("preflight");
     if(hooks.preflight_plan) hooks.preflight_plan();
     lap("metadata");
+    if(hooks.static_preflight_only) {
+        if(hooks.static_preflight_memo&&!static_known) hooks.static_preflight_memo->push_back(preflight_key);
+        return result;
+    }
     if(hooks.preflight_memo&&!preflight_known) hooks.preflight_memo->push_back(preflight_key);
+    if(hooks.preflight_only) return result;
     startup::first_prefill_tile();
     DirectLaunchDispatcher dispatcher(launch);
     const auto ple=std::find_if(serial.execution.steps.begin(),serial.execution.steps.end(),[](const auto& s){return s.op==SerialOp::ple;});

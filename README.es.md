@@ -1183,6 +1183,112 @@ maestras tienen un alcance específico de cada motor y pueden cambiar la aritmé
 fija la referencia. Véanse [precedencia, protecciones y alternativas](docs/optimizations.md#baselines-inspection-and-exactness)
 y el [catálogo JSON](docs/optimizations.json).
 
+Valores predeterminados exactos de arranque y teselado de Qwen: la preparación estática independiente del prompt precede al
+temporizador de la petición; la carga anticipada del código HIP respeta un ajuste HIP proporcionado por el usuario; el T16384
+automático empieza en 32,768 tokens de prompt, con alternativa por memoria a T8192; el procesamiento por lotes exacto de la proyección
+del indexador es independiente de las opciones numéricas. Los interruptores de desactivación por elemento son
+`STRIX_QPF2K_EARLY_SETUP=0`, `STRIX_EAGER_CODE_LOAD=0`, `STRIX_QPF2K_T16K=0` y
+`STRIX_QPF2K_INDEX_BATCH=0`. La preparación y la carga trasladan trabajo al arranque; no demuestran
+un menor tiempo total del proceso. Véanse el [catálogo](docs/optimizations.md#early-tiled-prefill-geometry-setup)
+y las [puertas nativas del paquete](docs/engine/prefill/hc-output-wmma-qualification.md#bundle-native-gates).
+
+<a id="bit-changing-prefill-options"></a>
+
+### Opciones de prefill que cambian bits
+
+El registro de Qwen es [prefill_identity.hpp](include/strix/prefill_identity.hpp). Cada opción está
+**activada por defecto una vez en READY**, con un interruptor de desactivación individual y un interruptor maestro FP16 exacto.
+El diseño HC de banda baja usa por defecto el modo 3 a través de los valores predeterminados qpf2k del decodificador;
+`STRIX_QPF2K_HC_LOWBAND=0` restaura el diseño anterior. Solo está activo con `hc_output_wmma` desactivado (la ruta de salida FP16 exacta),
+no con la identidad predeterminada de salida WMMA. Solo lo usa la forma 4 de proyección
+qpf2k a salida FP32 v3 banda 16. La salida HC WMMA, el modo de comprobación, normalized16,
+la inversa y las demás rutas conservan su diseño anterior. Las identidades aritméticas y numéricas
+no cambian; reinicie para este control en caché. La CI local nativa superó 132/132 casos
+sin escrituras espurias, incluidos ocho casos T8224 con redondeo del pool a 512 filas, y
+los logits de la última fila a 32K coincidieron bit a bit con el modo 0 con `hc_output_wmma` desactivado. Exacto,
+comprobado bit a bit; sin afirmación de tiempos porque la banda baja está inactiva en la ruta predeterminada.
+Véase la [CI local](docs/engine/prefill/hc-output-wmma-qualification.md#bundle-local-ci-evidence).
+
+Las [imágenes compactas de salida QSA](docs/engine/prefill/compact-stage-images.md) exactas están
+activadas por defecto para los propietarios elegibles del anillo de puntuaciones de T completo;
+`STRIX_QPF2K_COMPACT_IMAGES=0` restaura los contenedores FP32 tras reiniciar.
+El ahorro de memoria calculado es de 96 MiB por propietario T8192. La CI local nativa superó los
+fixtures de host/HIP y la comparación bit a bit de logits de la última fila a 32K. El A/B intercalado a 32K
+fue neutro dentro del ruido (desactivado 19.95 s, n=2, frente a 20.09 s por defecto); no se afirma ninguna
+ganancia de velocidad. Los bits BF16 ya redondeados se amplían de forma idéntica. Las identidades numéricas,
+rotary, del plan de kernels y numéricas del estado guardado/caché no cambian.
+La identidad física de ejecución debe cambiar porque incluye en su hash los tamaños, desplazamientos y strides
+más pequeños del arena; no es una identidad numérica. La configuración efectiva
+informa de la política solicitada; la organización compilada informa de los ahorros admitidos.
+
+La aceptación del staged-gather de PLE ahora registra el consumo independiente correcto de la fila 0
+y acepta la cola diferida ordenada completa solo después de comparar cada ID de fila
+preparada, incluida la fila 0. Esta corrección es incondicional, sin interruptor; la semántica de copia,
+las protecciones de preparación, la alternativa ante errores del worker, los eventos de slot y las identidades no
+cambian. La CI local nativa superó los 11 fixtures de dispositivo/host, incluidas las pruebas del lanzador
+de PLE y del staged-gather. La línea base y `STRIX_QPF2K_DEFAULTS=0` desactivan cada uno
+todos los elementos de organización exacta controlados. A 32K, los logits de la última fila coinciden bit a bit entre
+la configuración predeterminada y cada brazo desactivado (preparación temprana, carga anticipada, T16384, lotes de índice, imágenes
+compactas). Las medianas intercaladas de tres rondas fueron 20.09 s por defecto, 20.48 s con la preparación temprana
+desactivada, 20.34 s con T16384 desactivado y 20.07 s con la carga anticipada desactivada. La preparación temprana y T16384 muestran
+ganancias medidas; la carga anticipada es neutra dentro del ruido. Estas ganancias no son sumables.
+Con 131,072 y 262,143 tokens de texto real, la configuración predeterminada admite T16384 automático y, con
+`STRIX_QPF2K_T16K=0`, admite T8192 como antes, sin alternativa. Las puertas abiertas y no bloqueantes
+son las siete cargas útiles de estado, T16384 a 262K y la alternativa por presión, y los bytes recopilados de PLE con preparación
+frente a sin preparación; véase la [CI local](docs/engine/prefill/hc-output-wmma-qualification.md#bundle-local-ci-evidence).
+
+La máscara READY contiene `hc_output_wmma`. La candidata implementada `index_proj_wmma` queda fuera de READY y está desactivada por defecto a la espera de cualificación. La identidad de prefill predeterminada sigue siendo
+`fp16-v1+hcout16` (`prefill_identity_hash` ee2cd64684149069); `--prefill-exact-fp16` da la identidad
+simple `fp16-v1` (a0094634843e16ee).
+
+| Opción | Qué hace | Ganancia | Cambia bits frente a la identidad FP16 | Calidad medida | Desactivación (CLI / config / API / env) |
+|---|---|---|---|---|---|
+| `hc_output_wmma` (activada) | Salida HC: valores bajos FP16 y coeficientes Q8, acumulación WMMA en orden K16 ascendente, mismo sigmoide y misma mezcla de flujos | Superó un conjunto reservado de confirmación declarado de antemano | sí | `hc_output_wmma` superó un conjunto reservado de confirmación declarado de antemano; su criterio de NLL se mide frente a un control equivalente en redondeo cuyo movimiento por caso está limitado a +-0.02 nats/token (una tolerancia de control acotada, no una estimación insesgada de la diferencia sin límite); el cambio absoluto de NLL frente a la referencia exacta también se superó (-0.37 % NLL/token, límite superior +0.38 %). El interruptor de desactivación restaura la ruta de salida exacta. | `--prefill-disable hc_output_wmma` / `prefill_disable = ["hc_output_wmma"]` / solo a nivel de servidor / `STRIX_PREFILL_HC_OUTPUT_WMMA=0` |
+| `index_proj_wmma` (desactivada; candidata, fuera de READY) | WMMA BF16 de q/k del indexador con paneles K16 independientes y suma ordenada de paneles FP32; etiqueta `idxproj16` | Pendiente de cualificación local | sí | Puertas de compilador, ejecución nativa, fidelidad del modelo y carga de trabajo completa pendientes | Activación opt-in: `STRIX_PREFILL_INDEX_PROJ_WMMA=1`; desactivación: `STRIX_PREFILL_INDEX_PROJ_WMMA=0`, `--prefill-disable index_proj_wmma`, config `prefill_disable = ["index_proj_wmma"]`; el interruptor maestro exacto también la desactiva |
+
+El hash de la identidad de prefill es FNV-1a 64 del nombre de la identidad. La etiqueta del conjunto activado no es
+prueba de la ruta ejecutada: OUT16 requiere el componente HC rápido, la forma ancha cualificada
+(hidden 2560, cuatro flujos, rango 320), la admisión HC de QPF2K, filas normalizadas FP32 y una
+selección de salida compatible. Los sufijos serie, las formas de normalización incompatibles y
+los perfiles no rápidos pueden conservar `hcout16` sin ejecutar OUT16. El testigo de stderr
+emitido una vez por proceso no demuestra la ejecución en cada petición.
+
+Use `--prefill-exact-fp16`, `prefill_exact_fp16 = true` o `STRIX_PREFILL_EXACT_FP16=1`
+para desactivar todas las opciones aritméticas de este registro. `--prefill-disable` acepta nombres separados por comas y puede repetirse;
+los nombres desconocidos o vacíos se rechazan. Las restricciones de CLI/config se combinan con las restricciones del entorno;
+un `false` o una matriz vacía en la configuración no vuelve a activar una opción desactivada por el entorno.
+Estos controles aritméticos conservan la selección automática de ruta.
+
+La aplicación decode-token y su modo `--http-serve` comparten estos controles de arranque.
+`--config FILE` lee las claves aritméticas anteriores y los booleanos de arranque exacto `qpf2k_early_setup` y `eager_code_load` como asignaciones `key = value`,
+una por línea, con booleanos en minúsculas, matrices de una sola línea con nombres entre comillas dobles y comentarios `#`.
+Se rechazan las claves desconocidas o duplicadas y los valores mal formados. Por ejemplo:
+
+```text
+prefill_exact_fp16 = false
+prefill_disable = ["hc_output_wmma"]
+```
+
+Los recibos, `--print-effective-config`, los recibos `strix` de las respuestas HTTP y `GET /v1/capabilities`
+informan de `prefill_identity`, `prefill_identity_hash` (16 dígitos hexadecimales en minúscula) y
+`prefill_options_active` (nombres en el orden del registro). Esto identifica el conjunto de opciones; el par de
+perfiles numéricos existente sigue identificando la aritmética circundante. Cada conjunto activo modificado
+debe volver a cualificarse frente a su propia referencia. El conjunto se declara en todas las rutas, pero
+`hc_output_wmma` solo se ejecuta cuando el prefill usa un perfil de prefill rápido (testigo de stderr
+`qpf2k HC out16 active`); en otras rutas, incluidas `--baseline` y las rutas dense-A8 explícitas,
+es inerte. La equivalencia nunca se basa solo en el conjunto declarado: las claves de la caché de estado de prefijo incluyen la
+línea de comandos efectiva de prefill (ambos perfiles numéricos y `--baseline`), y el estado de sesión
+lleva la identidad de ejecución de prefill compilada, de modo que las rutas con aritmética distinta nunca se consideran iguales.
+
+**Solo a nivel de servidor:** reinicie el servidor para cambiar estas opciones. Los planes de prefill compilados y
+las cachés de estado de prefijo se comparten entre peticiones; el conjunto activado queda vinculado a las claves de ejecución compilada,
+de linaje y de caché persistente. La anulación a nivel de proceso no tiene sincronización por petición.
+Un getter por llamada no basta por sí solo para aislar peticiones concurrentes o reanudadas. Los campos de petición `prefill_exact_fp16` y `prefill_disable` se rechazan con HTTP 400.
+
+La desactivación debe preservar los logits de public-main y los siete componentes de estado en las rutas CLI, MTP, HTTP, anidada, GSQ y de línea base. Los bytes de identidad de ejecución compilada, de linaje y de caché pueden diferir aunque los bytes numéricos coincidan; las puertas de restauración nativas deben comparar las cargas útiles numéricas por separado. La restauración nativa frente a public main sigue siendo una puerta de publicación obligatoria.
+
+Los [comandos de la puerta de publicación nativa](docs/engine/prefill/hc-output-wmma-qualification.md) cubren la restauración public-main/desactivado, la repetibilidad con activación, las exportaciones completas de estado, MTP, HTTP y la planificación anidada.
+
 <a id="optimizations"></a>
 
 ## Optimizaciones
@@ -1194,6 +1300,9 @@ Listas completas de elementos, condiciones previas, avisos y pruebas: [catálogo
 
 | Motor / optimización | Qué | Predeterminado | Ganancia | ¿Exacto? | Interruptor de desactivación |
 |---|---|---|---|---|---|
+| Qwen: aceptación del staged-gather de PLE | Acepta la cola ordenada tras el consumo correcto de la fila 0 | Corrección incondicional | Sin afirmación de velocidad medida | Superan los fixtures de lanzador/staged-gather de la CI local; puerta de bytes recopilados abierta | Sin interruptor |
+| Qwen: imágenes compactas de salida QSA | Almacenamiento BF16 exacto y ampliación a FP32 | Activado para propietarios elegibles de T completo | Calculado -96 MiB/propietario T8192 | Fixtures de la CI local y logits de la última fila a 32K bit a bit; tiempos neutros dentro del ruido | `STRIX_QPF2K_COMPACT_IMAGES=0` |
+| Qwen: diseño HC de banda baja | low_t por bandas, omite escrituras low16 no usadas | Activado (modo 3), ruta de salida FP32 protegida | Sin afirmación de tiempos (inactivo en la ruta predeterminada) | Exacto, comprobado bit a bit en la CI local (132/132 casos y logits de la última fila a 32K) | `STRIX_QPF2K_HC_LOWBAND=0` |
 | Qwen: prefill por tiles | Tile/contexto automáticos, unión de expertos, filas del router | Auto | 32K: 22.03 s, 1,487 tok/s | Referencia FP16 propia; difiere del A8 denso | `STRIX_PREFILL_F16=0` |
 | Qwen: QPF2K + kernels envoltorio | Dense/GDN/QSA/HC/MoE, despacho y trabajo de la cabeza | Activado cuando se admite | Combinado 32K 25.95 → 23.49 s | Dentro del perfil | `STRIX_QPF2K_DEFAULTS=0` |
 | Qwen: puntuación QSA agrupada en la verificación MTP | Puntuación de atención agrupada por cabeza KV en las ventanas de verificación R1–R8 y en el paso de draft (cada fila K se carga una vez para sus 12 cabezas de consulta) | Activado | Decode +3.0 a +5.7 % (código / prosa 1K; ventanas por defecto, R2 y R8), tokens idénticos | Bit a bit, incluidas las cargas NaN | `STRIX_QSA_WINDOW_ATTN_V2=0`; [catálogo](docs/optimizations.md#qsa-grouped-window-attention-score) |

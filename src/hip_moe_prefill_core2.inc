@@ -174,11 +174,10 @@ struct FuseNone {};
 template<bool F> struct f16_fuse_sel { using type=FuseArgs; };
 template<> struct f16_fuse_sel<false> { using type=FuseNone; };
 template<unsigned Core> using FuseArgT=typename f16_fuse_sel<(Core&512U)!=0U>::type;
-inline unsigned* fuse_counter_pool() {
-    static unsigned* const pool=[]{void* p=nullptr;
-        check(hipMalloc(&p,(static_cast<std::size_t>(q51_known_rows::prefill_max_rows)*16U+64U)*sizeof(unsigned)),"fused merge counters");
-        return static_cast<unsigned*>(p);}();
-    return pool;
+inline unsigned* fuse_counter_pool(bool setup = false) {
+    static HipPrefillPool pool;
+    return static_cast<unsigned*>(pool.get((static_cast<std::size_t>(prefill_pool_rows())*16U+64U)*sizeof(unsigned),
+        "fused merge counters",setup));
 }
 __device__ __forceinline__ float fuse_load(const float* p) {
     return __hip_atomic_load(p,__ATOMIC_RELAXED,__HIP_MEMORY_SCOPE_AGENT);

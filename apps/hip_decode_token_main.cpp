@@ -113,6 +113,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <iterator>
 #include <functional>
 #include <future>
 #include <iostream>
@@ -1107,8 +1108,12 @@ static int run_decode_entry(
             "  --mtp-bundle FILE (YaRN MTP pins/policy/budgets; otherwise discover MODEL.gguf.mtp-bundle.json)\n"
             "  --print-cache-family (resolved qualification identity; hashes assets, no inference)\n"
             "  --prefill-numerical-profile dense-a8|fast-prefill-f16wmma-v1 (automatic tiled default: FP16)\n"
+            "  --prefill-exact-fp16 / STRIX_PREFILL_EXACT_FP16=1 (plain FP16 prefill identity)\n"
+            "  --prefill-disable NAME[,NAME...] (disable bit-changing options; server-level only)\n"
+            "  --no-early-setup --no-eager-code-load (exact startup policies; default on)\n"
+            "  --config FILE (prefill_exact_fp16 = true; prefill_disable = [\"hc_output_wmma\"])\n"
             "  STRIX_PREFILL_F16=0 restores historical resolution of the same argv\n"
-            "  --known-prefix-prefill-rows 16..8192; route/full-rows/union/router/prefill-rows accept =0\n"
+            "  --known-prefix-prefill-rows 16..16384; route/full-rows/union/router/prefill-rows accept =0\n"
             "  --host-dispatch-telemetry (host API/commit counters on stderr; profiling only)\n"
             "  --execution-telemetry-trace (bounded 256-event correlated trace; profiling only)\n"
             "  --execution-inventory (include selected host launcher and declared variant metadata)\n"
@@ -1171,6 +1176,27 @@ static int run_decode_entry(
 #if defined(STRIX_MTP_MODEL_QUALIFICATION_RUNNER)
     options.mtp_cli_phase_retirement=false;
 #endif
+    // Before any device/runtime observation. Respect even an empty user value.
+    // Inspection predicts this policy without changing the process environment.
+    // A value set here is already too late for this image, so restart it once with the value in its
+    // environment; the restarted image finds the value set and continues without restarting again.
+    if (!options.print_effective_config && !options.print_cache_family &&
+        strix::decode_cli::apply_eager_code_loading(options.eager_code_load && !options.baseline &&
+            !(std::getenv("STRIX_QPF2K_DEFAULTS") && std::getenv("STRIX_QPF2K_DEFAULTS")[0] == '0'),
+            [](const char* name) { return std::getenv(name); },
+            [](const char* name, const char* value) { return ::setenv(name, value, 0) == 0; })) {
+        std::fflush(nullptr);
+        std::ifstream cmdline("/proc/self/cmdline", std::ios::binary);
+        const auto original = strix::decode_cli::split_process_arguments(
+            std::string((std::istreambuf_iterator<char>(cmdline)), std::istreambuf_iterator<char>()));
+        std::vector<char*> restart;
+        for (const auto& argument : original) restart.push_back(const_cast<char*>(argument.c_str()));
+        restart.push_back(nullptr);
+        ::execv("/proc/self/exe", original.empty() ? argv : restart.data());
+        std::fprintf(stderr, "eager code loading: restart failed (%s); continuing with deferred loading\n",
+            std::strerror(errno));
+    }
+    strix::set_prefill_identity_override(options.prefill_exact_fp16, options.prefill_disabled);
     const auto startup_preflight = strix::emit_qwen_startup_diagnostics(
         options.print_effective_config || options.print_cache_family || strix::decode_cli::yarn_bundle_serial_retry);
     const auto release_assets = strix::decode_cli::verify_http_release_assets(options);
@@ -1186,6 +1212,7 @@ static int run_decode_entry(
             if (arg == "--profile") ++i;
             continue;
         }
+        if (arg == "--no-early-setup" || arg == "--no-eager-code-load") continue;
         if (arg == "--session-live-control" || arg == "--session-validate-only") continue;
         if (session_io_options.count(arg)) { ++i; continue; }
         options.session_effective_cli += std::to_string(arg.size()) + ":" + std::string(arg);
@@ -1459,6 +1486,7 @@ static int run_decode_entry(
 #if defined(STRIX_MTP_MODEL_QUALIFICATION_RUNNER)
     strix::tests::set_mtp_product_profile(options.product_profile);
 #endif
+    strix::set_prefill_identity_override(options.prefill_exact_fp16, options.prefill_disabled);
     session_cache_enabled = !options.session_save.empty() || !options.session_load.empty() || options.session_live_control || options.session_management_requested;
     strix::decode_cli::require_bitcalc_session_route(options, bitcalc.enabled());
     if (bitcalc.enabled() && (options.mtp.enabled || options.mtp.supplied || options.prompt_lookup ||
@@ -1610,6 +1638,7 @@ static int run_decode_entry(
         : std::string{};
     std::string optimization_profile_receipt =
         "  \"profile\":" + options.product_profile.json() + ",\n" +
+        strix::decode_cli::prefill_identity_fields(effective.prefill_option_mask) + ",\n" +
         "  \"optimization_profile_requested\": \"" + optimization_profile.requested + "\",\n" +
         "  \"optimization_profile_selected\": \"" + optimization_profile.selected + "\",\n" +
         "  \"optimization_profile_base_selected\": \"" + base_optimization_profile + "\",\n" +
@@ -2063,16 +2092,10 @@ static int run_decode_entry(
         prefill_binding_request.dense_a8 = prefill_buffer_request.dense_a8 = prefill_dense_a8;
         std::string gsq_moe_receipt;
         if (fast) {
-            auto identity = strix::numerical_profile_pair_identity(profile_pair);
-            // GSQ-RCO routed experts (STRIX_GSQ_Q20_A8=1) under the fast moe component: the effective GSQ expert prefill
-            // arithmetic (STRIX_GSQ_PREFILL_F16) is part of the prefill arithmetic identity, so the prefill execution
-            // identity and everything keyed by it (prefix-cache checkpoints) tell the two apart. Non-GSQ files: unchanged.
-            if (!q4k_a8_layers.q20_layers.empty() && (profile_pair.fast_components & strix::kFastPrefillMoe) != 0U) {
-                for (const std::uint64_t word : {std::uint64_t{0x4753514d4f455046ULL} /* GSQMOEPF */,
-                         strix::moe_q4k_a8::gsq_fast_prefill_moe_identity()})
-                    for (unsigned i = 0; i < 8; ++i) { identity ^= (word >> (8U * i)) & 0xffU; identity *= 0x100000001b3ULL; }
+            const auto identity = strix::prefill_arithmetic_identity(profile_pair,
+                effective.prefill_option_mask, strix::qpf2k::has_gsq_gate(manifest));
+            if (strix::qpf2k::has_gsq_gate(manifest) && (profile_pair.fast_components & strix::kFastPrefillMoe))
                 gsq_moe_receipt = "  \"prefill_gsq_moe_arithmetic\": \"" + std::string(strix::moe_q4k_a8::gsq_fast_prefill_moe_name()) + "\",\n";
-            }
             prefill_binding_request.prefill_arithmetic_identity = identity;
         }
         prefill_catalog_config.numerical_profile = profile_pair.prefill;
@@ -3434,7 +3457,7 @@ static int run_decode_entry(
             for(const auto& arg : strix::decode_cli::effective_prefill_argv(options))
                 execution_cli += std::to_string(arg.size())+":"+arg;
             in.effective_execution = strix::decode_cli::prefix_effective_execution_signature(
-                execution_cli, options.baseline, strix::qpf2k::has_gsq_gate(manifest), model.rotary_identity());
+                execution_cli, options.baseline, strix::qpf2k::has_gsq_gate(manifest), model.rotary_identity(), effective.prefill_option_mask);
             if (!options.prefix_cache_dir.empty()) in.engine_build = strix::decode_cli::prefix_state_cache_engine_build();
             in.state_layout_identity = state_layout.layout_identity;
             in.runtime_compatibility_identity = identities.compatibility_identity;
@@ -4486,6 +4509,9 @@ static int run_decode_entry(
             final.model_content_identity = metadata.model_content_identity;
             final.executable_sha256 = metadata.executable_sha256;
             final.numerical_identity = metadata.numerical_identity;
+            if (compiled_prefill) final.numerical_identity += ";prefill=" +
+                std::to_string(compiled_prefill->execution_identity) + ";" +
+                strix::prefill_identity_name(effective.prefill_option_mask);
             final.output_mode = options.gpu_greedy_token ? std::string(strix::gpu_greedy_output_identity) : "full-logits-cpu-firstmax";
             final.gpu_identity = metadata.gpu_identity;
             final.gpu_architecture = metadata.gpu_architecture;
@@ -5124,6 +5150,25 @@ static int run_decode_entry(
         };
         const bool generation_request_timing_enabled =
             !raw_recording && !final_state_metadata && !options.teacher_forced_score;
+        // Plans, streams, arenas, prepared tensor maps and pool reservations above already
+        // precede this timer. Move only the remaining immutable first-block admission here;
+        // this is startup work, not removed work. No prompt is read or kernel launched.
+        if (options.early_setup && known_prefill_plan && known_prefix_owner &&
+            !options.mtp.enabled && !options.http_serve && !session_cache_enabled && !prefix_state &&
+            !rtx_state_session && options.tokens.size()>=known_prefill_plan->logical_rows &&
+            session.next_position==0 && generation_request_timing_enabled) {
+            const auto setup_start=std::chrono::steady_clock::now();
+            // Use the existing sibling handoff on a copy; the live decode session and
+            // persistent state stay at their original frontier until the real block.
+            auto setup_session=session;
+            if(compiled_prefill)
+                strix::hand_off_serial_session(setup_session,{&compiled,&resources},{&*compiled_prefill,&prefill_resources});
+            known_prefix_owner->prepare_prefill_geometry(setup_session);
+            const char* timing=std::getenv("STRIX_PREFILL_TIMING");
+            if(timing && timing[0]=='1')
+                std::fprintf(stderr,"prefill startup static-setup %.2f ms (outside generation request)\n",
+                    std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-setup_start).count());
+        }
         const auto generation_request_start = generation_request_timing_enabled
             ? std::chrono::steady_clock::now()
             : std::chrono::steady_clock::time_point{};

@@ -203,14 +203,13 @@ __global__ __launch_bounds__(256) void f16_prefill_prologue_v2_certificate(Prefi
 //           counts, exclusive over the CTA's waves, ballot ranks over lanes as the base) -> rows/slots.
 // Each expert's assignments ascend by a exactly as in the base (CTA order, then wave order, then lane order).
 constexpr unsigned csr_mw_span=32U*64U; // assignments per CTA
-inline unsigned csr_mw_blocks_max(){return (q51_known_rows::prefill_max_rows*10U+csr_mw_span-1U)/csr_mw_span;}
+inline unsigned csr_mw_blocks_max(){return (prefill_pool_rows()*10U+csr_mw_span-1U)/csr_mw_span;}
 // Scratch: [0] fail, [1] status, [2..514) repeat[512], then blockcount[blocks_max][512]. The first 514 words are cleared per call.
 constexpr unsigned csr_mw_head=2U+512U;
-inline unsigned* csr_mw_scratch() {
-    static unsigned* const pool=[]{void* p=nullptr;
-        check(hipMalloc(&p,(static_cast<std::size_t>(csr_mw_head)+static_cast<std::size_t>(csr_mw_blocks_max())*512U)*sizeof(unsigned)),"CSR scratch");
-        return static_cast<unsigned*>(p);}();
-    return pool;
+inline unsigned* csr_mw_scratch(bool setup = false) {
+    static HipPrefillPool pool;
+    return static_cast<unsigned*>(pool.get((static_cast<std::size_t>(csr_mw_head)+
+        static_cast<std::size_t>(csr_mw_blocks_max())*512U)*sizeof(unsigned),"CSR scratch",setup));
 }
 __global__ __launch_bounds__(1024) void csr_mw_count(PrefillRows v,unsigned rows,unsigned experts,unsigned top_k,unsigned* scratch) {
     const unsigned t=threadIdx.x,count=rows*top_k,k=blockIdx.x,first=k*csr_mw_span,last=min(count,first+csr_mw_span);

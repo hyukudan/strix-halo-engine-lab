@@ -3,6 +3,7 @@
 #include "strix/indexed_attention_workspace.hpp"
 
 #include "strix/model_contract.hpp"
+#include "strix/known_prefill_limits.hpp"
 
 #include <algorithm>
 #include <limits>
@@ -397,6 +398,24 @@ int main() {
             expect(!strix::ctx_exact_memory_enabled([](const char*)->const char*{return nullptr;},item),"GSQ checkpoints keep the legacy layout");
         }
         expect(strix::ctx_exact_memory_enabled([](const char*)->const char*{return nullptr;},item),"policy restored after the suppressions");
+    }
+    {
+        const auto large = strix::build_known_prefill_arena(aligned, aligned.alignment, 16384U);
+        expect(large.row_view.size() == 16384U && large.physical.total_bytes > UINT32_MAX,
+            "T16384 arena preserves 64-bit extents beyond 4 GiB");
+        for (std::size_t i = 0; i < aligned.allocations.size(); ++i) {
+            const auto& last = large.row_view.back().allocations[i];
+            const auto& physical = large.physical.allocations[i];
+            expect(last.offset == physical.offset + 16383U * large.row_stride[i] &&
+                last.offset + last.bytes <= physical.offset + physical.bytes && last.bytes == aligned.allocations[i].bytes,
+                "T16384 final row keeps exact serial payload and aligned stripe bounds");
+        }
+        for (const auto rows : {16385U,32768U}) {
+            bool rejected = false;
+            try { (void)strix::build_known_prefill_arena(aligned, aligned.alignment, rows); }
+            catch (const std::invalid_argument&) { rejected = true; }
+            expect(rejected, "arena rejects rows beyond the T16384 capacity contract");
+        }
     }
     if (failures == 0) {
         std::cout << "execution arena tests passed\n";

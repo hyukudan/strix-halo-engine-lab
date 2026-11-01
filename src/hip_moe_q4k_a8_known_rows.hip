@@ -2,6 +2,7 @@
 #include "strix/hip_moe_q4k_a8_known_rows.hpp"
 #include "strix/moe_a8_down_contract.hpp"
 #include "strix/qpf2k_defaults.hpp"
+#include "hip_prefill_pool.hpp"
 #if defined(__FAST_MATH__) || (defined(__FINITE_MATH_ONLY__) && __FINITE_MATH_ONLY__)
 #error "A8 CSR gate/up requires strict floating-point semantics"
 #endif
@@ -25,6 +26,8 @@
 
 namespace strix::moe_q4k_a8::known_rows {
 namespace {
+HipPrefillPoolOwner& prefill_pool_owner(){static HipPrefillPoolOwner owner;return owner;}
+unsigned prefill_pool_rows(){return prefill_pool_owner().rows();}
 struct DeviceRows {
     const signed char* codes[max_union_rows]{}; const float* deltas[max_union_rows]{}; const int* sums[max_union_rows]{};
     const unsigned* routes[max_union_rows]{}; unsigned* status[max_union_rows]{}; float* output[max_union_rows]{};
@@ -1949,14 +1952,12 @@ __global__ __launch_bounds__(F16Tile<Tune>::Threads,prefill_core2_min_waves(Tune
 #include "hip_moe_prefill_da16.inc"
 #include "hip_moe_prefill_p1da16.inc"
 #include "hip_moe_prefill_small.inc"
-// MoE tune bit 4: the FP16 images of the prompt rows (prefill_max_rows x max_hidden halves, allocated on first use).
-uint4* f16_prefill_a16() {
-    static uint4* const pool=[]{
-        void* p=nullptr;
-        check(hipMalloc(&p,static_cast<std::size_t>(q51_known_rows::prefill_max_rows)*max_hidden*2U),"FP16 prefill A image allocation");
-        return static_cast<uint4*>(p);
-    }();
-    return pool;
+// MoE tune bit 4: the FP16 images of the prompt rows (configured maximum rows x max_hidden halves, reserved at setup).
+HipPrefillPool& f16_prefill_a16_pool(){static HipPrefillPool pool;return pool;}
+uint4* f16_prefill_a16(bool setup = false) {
+    auto& pool = f16_prefill_a16_pool();
+    return static_cast<uint4*>(pool.get(static_cast<std::size_t>(prefill_pool_rows())*max_hidden*2U,
+        "FP16 prefill A image allocation",setup));
 }
 // Bit 6 self-test: random FP16 scale pairs (every binade, signs, zeros, subnormals, non-finite) and codes; where the
 // check admits the short path, its FP16 words must equal the base conversion's for every code. counts: tested, admitted,
@@ -2248,6 +2249,7 @@ void enqueue_prefill(const Request& request,const PrefillRows& rows,unsigned cou
        request.shape.hidden>max_hidden||request.shape.hidden%256U||request.shape.rows>max_rows||request.shape.rows%128U||
        request.shape.hidden%64U)
         throw std::invalid_argument("A8 prefill geometry/format is invalid");
+    (void)prefill_pool_owner().rows(count);
     // qpf2k/moe-mi ROUTE bits and DA16 are gated on the production Q4_K/Q5_K prefill only: with a GSQ gate type they are
     // refused (fail-closed) until that combination has its own gate.
     // Defaulted (not explicitly set) ROUTE / DA16 are turned off for a GSQ gate type (STRIX_QPF2K_MOE_DEFAULTED, set by the
@@ -2706,8 +2708,24 @@ bool prefill_small_ran(){return prefill_small_flag();}
 bool prefill_da16_ran(){return prefill_da16_flag();}
 bool prefill_certificate_produced(){return prefill_certificate_flag();}
 bool prefill_clear_skipped(){return prefill_clear_skipped_flag();}
-void prefill_test_poison_da16(hipStream_t stream){check(hipMemsetAsync(da16_image(),0xa5,static_cast<std::size_t>(q51_known_rows::prefill_max_rows)*max_top_k*max_rows*2U,stream),"poison DA16 image");}
-void prefill_test_poison_a16(hipStream_t stream){check(hipMemsetAsync(f16_prefill_a16(),0xa5,static_cast<std::size_t>(q51_known_rows::prefill_max_rows)*max_hidden*2U,stream),"poison FP16 prefill A image");}
+void reserve_prefill_pools(unsigned rows) {
+    prefill_pool_owner().setup(rows, [] {
+        (void)f16_prefill_a16(true); (void)da16_image(true);
+        (void)da16_counters(true); (void)p1_counter_pool(true);
+        (void)fuse_counter_pool(true); (void)csr_mw_scratch(true);
+    });
+}
+std::array<std::uint64_t, 2> prefill_test_image_generations() {
+    return {f16_prefill_a16_pool().generation(), da16_image_pool().generation()};
+}
+void prefill_test_poison_da16(hipStream_t stream, unsigned rows) {
+    reserve_prefill_pools(rows);
+    check(hipMemsetAsync(da16_image(),0xa5,static_cast<std::size_t>(prefill_pool_rows())*max_top_k*max_rows*2U,stream),"poison DA16 image");
+}
+void prefill_test_poison_a16(hipStream_t stream, unsigned rows) {
+    reserve_prefill_pools(rows);
+    check(hipMemsetAsync(f16_prefill_a16(),0xa5,static_cast<std::size_t>(prefill_pool_rows())*max_hidden*2U,stream),"poison FP16 prefill A image");
+}
 bool prefill_fused_merge(){return prefill_fused_flag();}
 std::array<unsigned,8> prefill_p1_stats() {
     std::array<unsigned,8> out{};

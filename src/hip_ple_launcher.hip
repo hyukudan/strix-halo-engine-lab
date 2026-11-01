@@ -7,6 +7,7 @@
 #include "strix/prepared_tensor_views.hpp"
 #include "strix/ple_lookup.hpp"
 #include "strix/ple_reclaim.hpp"
+#include "strix/ple_staged_gather.hpp"
 #include "strix/iq4_nl.hpp"
 #include "strix/ple_workspace.hpp"
 #include "strix/graph_ple.hpp"
@@ -2926,6 +2927,7 @@ void HipPleKnownWindow::launch(std::span<const ExecutionDispatchContext> rows) {
         hash_ple_tokens(contract, tokens, std::span<const std::uint32_t>(previous.data(), context_count),
             std::span<PleHashResult>(w.hashes.data(), rows.size()));
     }
+    bool first_row_consumed = false;
     for (std::size_t r = 0; r < rows.size(); ++r) {
         auto* destination = staging + r * w.stride;
         PleHashResult hash;
@@ -2939,6 +2941,7 @@ void HipPleKnownWindow::launch(std::span<const ExecutionDispatchContext> rows) {
             if (prefetch->lookup_bytes > w.stride) throw std::overflow_error("PLE prefetched lookup exceeds window staging");
             hash = finish_ple_lookup_prefetch(rows[0].input_token_id, rows[0].position, backend, *prefetch,
                 std::span<std::byte>(destination, static_cast<std::size_t>(prefetch->lookup_bytes)));
+            first_row_consumed = true;
         } else {
             hash = hash_ple_token(contract, rows[r].input_token_id,
                 std::span<const std::uint32_t>(previous.data(), context_count));
@@ -2961,15 +2964,11 @@ void HipPleKnownWindow::launch(std::span<const ExecutionDispatchContext> rows) {
         std::copy_n(hash.next_context.begin(), context_count, previous.begin());
         w.hashes[r] = hash;
     }
-    if (stage_candidate && reclaim && parallel && deferred.size() == rows.size() &&
+    if (stage_candidate && reclaim && parallel &&
         w.stage.row_bytes == contract.row_bytes && w.stage.table_runtime == prepared[0].tensors.table.runtime) {
-        bool same = true;
-        for (std::size_t r = 0; same && r < rows.size(); ++r) {
-            same = w.hashes[r].row_count == w.stage.heads;
-            for (std::uint32_t h = 0; same && h < w.stage.heads; ++h)
-                same = w.hashes[r].row_ids[h] == w.stage.row_ids[r * w.stage.heads + h];
-        }
-        if (same) { reclaim_receipt.staged_rows = rows.size(); deferred.clear(); }
+        reclaim_receipt.staged_rows = ple_detail::accept_staged_gather(
+            std::span<const PleHashResult>(w.hashes.data(), rows.size()), w.stage.heads,
+            w.stage.row_ids, first_row_consumed, deferred);
     }
     lap("hash");
     if (!w.prefill) ple_window_warm::window(std::span<const PleHashResult>(w.hashes.data(), rows.size()), launch_start);

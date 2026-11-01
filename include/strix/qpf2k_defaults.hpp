@@ -13,7 +13,7 @@ enum class Item : unsigned {
     sched, dense, gdn, gdn_gates_batch, gdn_core16, qsa, qsa_mask,
     hc, hc_mask, hc_output3, hc_output3_band, moe_da16, moe_route, ple_reclaim, dense_rows, pipe, attend_batch, score_park,
     norm_group, index_rows, cohort_lean, rows_lean, dispatch_fuse, score_rows, ple_batch, shared_pre, moe_mc, moe_hdr,
-    moe_xor64,
+    moe_xor64, hc_lowband,
 };
 struct Default {
     Item item;
@@ -50,6 +50,7 @@ inline constexpr std::array defaults{
     Default{Item::moe_mc, "STRIX_QPF2K_MOE_MC", "1"},
     Default{Item::moe_hdr, "STRIX_QPF2K_MOE_HDR", "1"},
     Default{Item::moe_xor64, "STRIX_QPF2K_MOE_XOR64", "1"},
+    Default{Item::hc_lowband, "STRIX_QPF2K_HC_LOWBAND", "3"},
 };
 static_assert(defaults.size() < 32U);
 constexpr unsigned bit(Item item) noexcept { return 1U << static_cast<unsigned>(item); }
@@ -77,6 +78,21 @@ inline const char* long_context_item_suppression(const char* name, bool gsq = gs
 }
 inline bool long_context_item_enabled(const char* name, bool gsq = gsq_model) noexcept {
     return !long_context_item_suppression(name, gsq);
+}
+// Exact cross-group projection batching adds no rotary arithmetic.
+template<class Get>
+inline bool index_batch_enabled(Get get, bool base, bool gsq) {
+    if (base || gsq) return false;
+    if (get("STRIX_QPF2K_QSA_INDEX_SHAPE")) return false;
+    for (const char* name : {"STRIX_QPF2K_INDEX_ROWS", "STRIX_QSA_INDEX_ROWS"})
+        if (const char* value = get(name); value && value[0] == '0') return false;
+    if (const char* mask = get("STRIX_QPF2K_QSA_MASK"); mask && (std::strtoul(mask, nullptr, 0) & 0x100U)) return false;
+    for (const char* name : {"STRIX_QPF2K_DEFAULTS", "STRIX_QPF2K_INDEX_BATCH"})
+        if (const char* value = get(name); value && value[0] == '0') return false;
+    return true;
+}
+inline bool index_batch_enabled() {
+    return index_batch_enabled([](const char* name) { return std::getenv(name); }, baseline, gsq_model);
 }
 class ModelScope {
 public:
@@ -121,7 +137,7 @@ unsigned initialize(Get get, Put put, unsigned allowed = ~0U) {
 inline constexpr unsigned historical_items = bit(Item::moe_route) * 2U - 1U;
 // Exact prefill alternatives keep admission when explicitly disabled one at a time.
 inline constexpr unsigned exact_prefill_items = bit(Item::score_rows) | bit(Item::ple_batch) |
-    bit(Item::shared_pre) | bit(Item::moe_mc) | bit(Item::moe_hdr) | bit(Item::moe_xor64);
+    bit(Item::shared_pre) | bit(Item::moe_mc) | bit(Item::moe_hdr) | bit(Item::moe_xor64) | bit(Item::hc_lowband);
 // L1 has its own registered-mapping, single-session tiled admission (including
 // serving/MTP/cohort exclusions). Other new wrapper items are decoder-only:
 // PIPE also affects MTP priming; COHORT_LEAN affects active serving heads;
@@ -130,6 +146,7 @@ inline constexpr unsigned exact_prefill_items = bit(Item::score_rows) | bit(Item
 // are also deferred to decoder admission so non-decoder clients keep old defaults.
 // SCORE_ROWS, PLE_BATCH, SHARED_PRE, MOE_MC, MOE_HDR and MOE_XOR64 share those prefill
 // launchers (including serving/MTP priming); defer them too, preserving fixture defaults.
+// HC_LOWBAND also waits for decoder admission; its route guard retains unsupported layouts.
 inline constexpr unsigned startup_items = historical_items | bit(Item::ple_reclaim);
 template<class Get, class Put>
 void initialize_before_main(Get get, Put put) {

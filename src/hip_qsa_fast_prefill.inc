@@ -30,6 +30,8 @@ template <unsigned Rows> struct Views {
     float* output[Rows];
     std::uint32_t count[Rows];
     std::uint32_t visible[Rows];
+    bool compact_output = false;
+    __device__ __forceinline__ RoundedStageImage image(unsigned r) const { return {output[r], compact_output}; }
 };
 // Floats of a row's scratch the fast path needs (union_at + union) for TR-row tiles.
 inline std::uint64_t scratch_floats(unsigned tile_rows, unsigned splits, unsigned heads, unsigned maximum_selected) {
@@ -514,7 +516,7 @@ __device__ __forceinline__ void attend_body(const Views<Rows>& v, const std::uin
     if (splits == 1U) {
         // One slice: combine_kernel's arithmetic for one split, in place.
         const float* gate_in = v.q_gate[r] + static_cast<std::uint64_t>(head) * 2U * kDim + kDim;
-        float* out = v.output[r] + static_cast<std::uint64_t>(head) * kDim;
+        auto out = v.image(r) + static_cast<std::uint64_t>(head) * kDim;
 #pragma unroll
         for (unsigned n = 0; n < 8U; ++n)
 #pragma unroll
@@ -829,7 +831,7 @@ __device__ __forceinline__ void attend_occ_body(const Views<Rows>& v, const std:
     if (splits == 1U) {
         // One slice: combine_kernel's arithmetic for one split, in place.
         const float* gate_in = v.q_gate[r] + static_cast<std::uint64_t>(head) * 2U * kDim + kDim;
-        float* out = v.output[r] + static_cast<std::uint64_t>(head) * kDim;
+        auto out = v.image(r) + static_cast<std::uint64_t>(head) * kDim;
 #pragma unroll
         for (unsigned n = 0; n < 8U; ++n)
 #pragma unroll
@@ -879,6 +881,6 @@ __global__ __launch_bounds__(256) void combine_kernel(Views<Rows> v, std::uint32
         }
     const float attn = round_bf16(l > 0.0F ? o / l : 0.0F);
     const float gate = round_bf16(1.0F / (1.0F + expf(-v.q_gate[r][static_cast<std::uint64_t>(head) * 2U * kDim + kDim + d])));
-    v.output[r][static_cast<std::uint64_t>(head) * kDim + d] = round_bf16(attn * gate);
+    v.image(r)[static_cast<std::uint64_t>(head) * kDim + d] = round_bf16(attn * gate);
 }
 } // namespace qsa_fast

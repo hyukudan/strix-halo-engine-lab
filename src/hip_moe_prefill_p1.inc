@@ -58,15 +58,13 @@ __device__ __forceinline__ void down_f16x_body(const unsigned char* weights,cons
 // Counter pool: [0] ticket counter, [1 .. batches] done[b], [batches + 1] all finished gate/up items (strict control), last
 // p1_stats_words words: wait statistics (tests, STRIX_QPF2K_MOE_P1STATS=1). Sized for the largest admitted batch bound (prefill_max_rows x top_k 10 / cap 64
 // + 512 experts, rounded up).
-inline unsigned p1_pool_words(){return static_cast<unsigned>(q51_known_rows::prefill_max_rows*10U/64U+1024U);}
+inline unsigned p1_pool_words(){return static_cast<unsigned>(prefill_pool_rows()*10U/64U+1024U);}
 // Largest batch bound the pool admits: ticket counter + done[0..batches] + the stats words.
 inline unsigned p1_max_batches(){return p1_pool_words()-2U-p1_stats_words;}
-inline unsigned* p1_counter_pool() {
-    static unsigned* const pool=[]{void* p=nullptr;
-        check(hipMalloc(&p,static_cast<std::size_t>(p1_pool_words())*sizeof(unsigned)),"P1 counters");
-        check(hipMemset(p,0,static_cast<std::size_t>(p1_pool_words())*sizeof(unsigned)),"P1 counters init");
-        return static_cast<unsigned*>(p);}();
-    return pool;
+inline unsigned* p1_counter_pool(bool setup = false) {
+    static HipPrefillPool pool;
+    return static_cast<unsigned*>(pool.get(static_cast<std::size_t>(p1_pool_words())*sizeof(unsigned),
+        "P1 counters",setup,true));
 }
 // STRIX_QPF2K_MOE_LAG (tests / measurement; 1..65535, default 6): the lag L in batches (>= the batch count: every gate/up
 // ticket before every down ticket; 65535: the strict control, see P1Args).

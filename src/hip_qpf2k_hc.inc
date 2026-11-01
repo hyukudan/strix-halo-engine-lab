@@ -241,7 +241,7 @@ unsigned qpf2k_hc_output3_band() {
     }();
     return qpf2k::suppressed(qpf2k::Item::hc_output3_band) ? 0U : band;
 }
-// STRIX_QPF2K_HC_LOWBAND (default 0; decimal 0..3, anything else = 0), with the qpf2k projection (mask bit 3) and output v3
+// STRIX_QPF2K_HC_LOWBAND (decoder default 3 through qpf2k defaults; decimal 0..3, anything else = 0), with the qpf2k projection (mask bit 3) and output v3
 // band 16 (the defaults); same values, same chains, only where the low values are stored:
 //  bit 0  the projection writes low_t in 512-row bands, low_t[(r / 512) * 320 * 512 + k * 512 + r % 512]: the output's rank
 //         stride is 2 KiB instead of the padded row count times 4 bytes (32 KiB at 8192 rows). A band-16 CTA's 32 rows lie in
@@ -257,7 +257,7 @@ unsigned qpf2k_hc_lowband() {
         if (!v || !v[0] || v[1] || v[0] < '0' || v[0] > '3') return 0U;
         return static_cast<unsigned>(v[0] - '0');
     }();
-    return qpf2k_hc_mask() != 0U ? mode : 0U;
+    return !qpf2k::suppressed(qpf2k::Item::hc_lowband) && qpf2k_hc_mask() != 0U ? mode : 0U;
 }
 __device__ __forceinline__ std::uint64_t qpf2k_low_band_index(std::uint32_t k, std::uint32_t r) {
     return static_cast<std::uint64_t>(r / kQpf2kLowBandRows) * (kHcwRank * kQpf2kLowBandRows) + k * kQpf2kLowBandRows +

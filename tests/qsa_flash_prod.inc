@@ -11,6 +11,7 @@
 #include "strix/qpf2k_defaults.hpp"
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
+#include "../src/hip_rounded_stage_image.hpp"
 #include <algorithm>
 #include <chrono>
 #include <cmath>

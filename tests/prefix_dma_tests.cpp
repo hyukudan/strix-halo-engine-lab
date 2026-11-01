@@ -275,6 +275,9 @@ void prefix_dma_tests() {
         in.model_content=sha256_bytes(std::as_bytes(std::span("model",5)));
         in.block_rows=1024; in.state_layout_identity=1; in.runtime_compatibility_identity=2;
         in.decode_execution_identity=3; in.prefill_execution_identity=4; in.tiled_execution_identity=5;
+        require(prefix_effective_execution_signature("effective-cli",false,false,{},0U) !=
+                prefix_effective_execution_signature("effective-cli",false,false,{},1U),
+                "v5 canonical signature must bind the resolved prefill mask");
         const auto signature=[&] {return prefix_effective_execution_signature("effective-cli",false,false);};
         in.effective_execution=signature();
         const auto original=prefix_state_cache_identity(in);

@@ -1379,3 +1379,12 @@ complete IDs against the exactness reference, and requires no slower producer,
 joiner or unrelated-short median TTFT and no lower complete-workload throughput.
 Keep capacity and startup settings fixed across arms; retain the private receipts.
 No timing or native exactness claim is established by the host tests in this change.
+
+Qwen `hc_output_wmma` is default ON. `hc_output_wmma` passed a pre-declared confirmation held-out set; its NLL endpoint is measured against a rounding-equivalent control whose per-case movement is capped at +-0.02 nats/token (a bounded control allowance, not an unbiased estimate of the uncapped difference); the absolute NLL change vs the exact reference also passed (-0.37 % NLL/token, upper bound +0.38 %). The off switch restores the exact output path.
+Controls are server-level only: `STRIX_PREFILL_HC_OUTPUT_WMMA=0`,
+`--prefill-disable hc_output_wmma`, or config `prefill_disable = ["hc_output_wmma"]`;
+master `STRIX_PREFILL_EXACT_FP16=1`, `--prefill-exact-fp16`, or config
+`prefill_exact_fp16 = true`. Restart the server; request-level controls return HTTP 400.
+Fast HC with this option is excluded from MTP and nested admission pending qualification;
+ordinary MTP/HTTP profiles retain their existing arithmetic. OFF restoration compares logits
+and seven state payloads to public main; compiled, lineage and cache identity bytes may differ.

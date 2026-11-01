@@ -169,9 +169,27 @@ int main(int argc,char** argv) try {
     // Admission, preflight and bridge setup use the same retry seam. Fresh serial
     // resolution must see the caller's environment, not the failed MTP defaults.
     write(sidecar,"abc");
+    const MtpBundleSetupRetry identity_test_state;
+    detail::prefill_identity_override()={};
+    env("STRIX_PREFILL_EXACT_FP16","");env("STRIX_PREFILL_HC_OUTPUT_WMMA","1");
+    const auto resolve_identity=[&](const Options& options) {
+        return resolve_effective_config({options,requested_prefill_environment()},model,{}, {},"",{},{});
+    };
+    const auto fresh_serial=[&] {
+        YarnBundleSerialRetry retry;
+        return resolve_identity(parse(base));
+    }();
+    require(fresh_serial.prefill_option_mask==kPrefillOptionsReady,"fresh serial retains READY arithmetic");
     for(const auto* failure:{"admission refusal","preflight failure","bridge setup failure","golden dump failure"}) {
         env("STRIX_PREFILL_PIPE","0");env("STRIX_QSA_SCORE_RING_ROWS","");
         MtpBundleSetupRetry state;state.selected=true;
+        auto attempt=parse(base);
+        require(attempt.mtp.enabled,"automatic YaRN bundle selected before setup");
+        set_prefill_identity_override(attempt.prefill_exact_fp16,attempt.prefill_disabled);
+        const auto resolved=resolve_identity(attempt);
+        set_prefill_identity_override(resolved.options.prefill_exact_fp16,resolved.options.prefill_disabled);
+        require(resolved.prefill_option_mask==0U && prefill_options_active()==0U,
+            "automatic YaRN MTP resolution installs runtime arithmetic restrictions");
         env("STRIX_PREFILL_PIPE","1");env("STRIX_QSA_SCORE_RING_ROWS","64");
         const auto previous_defaulted=qpf2k::defaulted_items;
         qpf2k::defaulted_items=~previous_defaulted;
@@ -183,6 +201,16 @@ int main(int argc,char** argv) try {
             require(std::string(std::getenv("STRIX_PREFILL_PIPE"))=="0" && !std::getenv("STRIX_QSA_SCORE_RING_ROWS"),"retry restores requested environment");
             require(qpf2k::defaulted_items==previous_defaulted,"retry restores default provenance");
             require(!parse(base).mtp.enabled,"bundle failure retries serial even with adjacent bundle");
+            const auto serial_config=resolve_identity(parse(base));
+            set_prefill_identity_override(serial_config.options.prefill_exact_fp16,serial_config.options.prefill_disabled);
+            require(detail::prefill_identity_override().disabled==fresh_serial.options.prefill_disabled &&
+                detail::prefill_identity_override().exact==fresh_serial.options.prefill_exact_fp16 &&
+                prefill_options_active()==fresh_serial.prefill_option_mask,
+                "failed setup restores the fresh serial override and runtime mask");
+            require(serial_config.prefill_option_mask==prefill_options_active() &&
+                serial_config.options.resolved_prefill_option_mask==prefill_options_active() &&
+                effective_config_json(serial_config).find(prefill_identity_fields(prefill_options_active()))!=std::string::npos,
+                "serial retry receipt and executed arithmetic declare the same identity");
             require(!retry_mtp_bundle_setup(state,error,[&] {++attempts;return 1;}),"serial failure cannot recurse");
             return 17;
         });
@@ -197,6 +225,7 @@ int main(int argc,char** argv) try {
         require(!retry_mtp_bundle_setup(state,error,[]{return 1;}),"explicit MTP keeps refusal");
     }
     env("STRIX_PREFILL_PIPE","");
+    identity_test_state.restore();
     // Bundle parsing/setup errors retain their retry classification. Explicit
     // argv errors remain ordinary refusals and never acquire bundle selection.
     write(sidecar,"bad");

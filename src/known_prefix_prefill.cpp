@@ -1,4 +1,5 @@
 #include "strix/known_prefix_prefill.hpp"
+#include "strix/compact_stage_images.hpp"
 #include "strix/known_prefill_limits.hpp"
 #include "strix/ctx_exact_memory.hpp"
 #include "strix/indexed_attention_workspace.hpp"
@@ -89,6 +90,13 @@ CompiledKnownPrefixPrefill compile_known_prefix_prefill(const ModelContract& mod
         plan.qsa_score_ring_rows=geometry.rows;
         plan.qsa_score_ring_workspace_bytes=geometry.total_bytes();
     }
+    // Only the full-T QSA owner may bind the smaller image. Closed windows,
+    // decode, MTP, capture and optional-entry callers retain their FP32 ABI.
+    if (request.compact_stage_images && model.bytes_fp32==sizeof(float) && plan.external_qsa_score_bytes && serial.arena.alignment==256U && compact_stage_images_enabled()) {
+        const auto fp32 = build_indexed_attention_workspace_layout(model,256,false,1,true);
+        const auto compact = build_indexed_attention_workspace_layout(model,256,false,1,true,true);
+        plan.compact_qsa_output_savings = fp32.total_bytes - compact.total_bytes;
+    }
     const char* dump=std::getenv("STRIX_QRTX_STEP_DUMP");
     plan.terminal_logits_arena=request.exact_memory && !serial.device_graph_inputs &&
         request.output_policy!=KnownWindowOutputPolicy::all_rows && (!dump || !*dump) &&
@@ -98,7 +106,7 @@ CompiledKnownPrefixPrefill compile_known_prefix_prefill(const ModelContract& mod
     require(plan.tile8.arena.physical.total_bytes%8U==0U,"known prefill tile arena cannot be uniformly scaled");
     if(!plan.external_qsa_score_bytes && !plan.terminal_logits_arena && multiply(plan.tile8.arena.physical.total_bytes/8U,request.logical_rows)>request.workspace_budget_bytes)
         throw KnownPrefillBudgetExceeded("known prefill workspace exceeds its explicit arena budget");
-    plan.arena=build_known_prefill_arena(serial.arena,serial.arena.alignment,request.logical_rows,plan.external_qsa_score_bytes,plan.terminal_logits_arena);
+    plan.arena=build_known_prefill_arena(serial.arena,serial.arena.alignment,request.logical_rows,plan.external_qsa_score_bytes,plan.terminal_logits_arena,true,plan.compact_qsa_output_savings);
     if(plan.arena.physical.total_bytes>request.workspace_budget_bytes)
         throw KnownPrefillBudgetExceeded("known prefill workspace exceeds its explicit arena budget");
     for(std::uint32_t row=0;row<request.logical_rows;++row)
@@ -126,8 +134,10 @@ void validate_compiled_known_prefix_prefill(const CompiledKnownPrefixPrefill& pl
     } else require(!plan.qsa_score_ring_workspace_bytes && !plan.qsa_score_ring_rows,"known prefill unexpected score ring storage");
     require(!plan.terminal_logits_arena || (plan.output_policy!=KnownWindowOutputPolicy::all_rows && !serial.device_graph_inputs),
         "known prefill terminal arena policy differs");
+    require(!plan.compact_qsa_output_savings || (plan.external_qsa_score_bytes &&
+        plan.compact_qsa_output_savings % serial.arena.alignment == 0), "compact QSA output admission differs");
     const auto expected=build_known_prefill_arena(serial.arena,serial.arena.alignment,plan.logical_rows,
-        plan.external_qsa_score_bytes,plan.terminal_logits_arena,false);
+        plan.external_qsa_score_bytes,plan.terminal_logits_arena,false,plan.compact_qsa_output_savings);
     const auto same=[](const ExecutionArenaPlan& a,const ExecutionArenaPlan& b) {
         if(a.alignment!=b.alignment || a.total_bytes!=b.total_bytes || a.naive_nonaliased_bytes!=b.naive_nonaliased_bytes ||
             a.allocations.size()!=b.allocations.size()) return false;
@@ -146,7 +156,7 @@ void validate_compiled_known_prefix_prefill(const CompiledKnownPrefixPrefill& pl
         require(original!=nullptr,"known prefill lost source allocation");
         auto bytes=original->bytes;
         if(plan.external_qsa_score_bytes && a.use.buffer.buffer_class==ExecutionBufferClass::indexed_attention_workspace)
-            bytes-=(plan.external_qsa_score_bytes+serial.arena.alignment-1)/serial.arena.alignment*serial.arena.alignment;
+            bytes-=(plan.external_qsa_score_bytes+serial.arena.alignment-1)/serial.arena.alignment*serial.arena.alignment + plan.compact_qsa_output_savings;
         row_bytes.push_back(bytes);
     }
     for(std::uint32_t r=0;r<plan.logical_rows;++r) {
