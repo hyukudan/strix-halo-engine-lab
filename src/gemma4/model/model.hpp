@@ -18,9 +18,12 @@ public:
 private:
     const std::uint8_t* data_ = nullptr;
     std::size_t size_ = 0;
+#ifdef _WIN32
     void* file_ = nullptr;
     void* mapping_ = nullptr;
+#else
     int fd_ = -1;
+#endif
 };
 struct SafeTensor {
     std::string name, dtype;

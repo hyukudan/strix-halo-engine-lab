@@ -572,6 +572,7 @@ bool dispatch(LinearView w, LinearView up, const float* x, unsigned rows, float*
             G4_FORMAT(q4_k);
             G4_FORMAT(q6_k);
 #undef G4_FORMAT
+        default: break; // EXL3 packs have their own linears
         }
         if (launched)
             launch_checked();

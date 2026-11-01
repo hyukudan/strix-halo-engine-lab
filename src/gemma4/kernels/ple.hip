@@ -260,7 +260,7 @@ __global__ void __launch_bounds__(256) norm_residual_fast_kernel(const float* __
     constexpr unsigned width = 256U * W;
     const auto base = std::size_t(blockIdx.x) * width;
     __shared__ float factor;
-    __shared__ float staged[width];
+    __shared__ float row_values[width];
     float b[W], r[W], g[W], h[W];
 #pragma unroll
     for (unsigned j = 0; j < W; ++j) {
@@ -276,10 +276,10 @@ __global__ void __launch_bounds__(256) norm_residual_fast_kernel(const float* __
         scale = norm_weight<F>(scalar, 0);
 #pragma unroll
     for (unsigned j = 0; j < W; ++j)
-        staged[threadIdx.x + 256U * j] = b[j];
+        row_values[threadIdx.x + 256U * j] = b[j];
     __syncthreads();
     if (threadIdx.x < 32U) {
-        const float f = epilogue_factor<true>(staged, width, prefetch, bounded, intervals, seeded);
+        const float f = epilogue_factor<true>(row_values, width, prefetch, bounded, intervals, seeded);
         if (threadIdx.x == 0)
             factor = f;
     }
@@ -299,14 +299,14 @@ __global__ void __launch_bounds__(256) norm_residual_fast_kernel(const float* __
             a8_quantize_lane(value, quant, blockIdx.x, threadIdx.x + 256U * j);
     }
     if constexpr (Next) {
-        // The staged branch was last read by the first wave's reduction, which
+        // The row_values branch was last read by the first wave's reduction, which
         // completed before the barrier above; reuse the staging for the residual.
 #pragma unroll
         for (unsigned j = 0; j < W; ++j)
-            staged[threadIdx.x + 256U * j] = r[j];
+            row_values[threadIdx.x + 256U * j] = r[j];
         __syncthreads();
         if (threadIdx.x < 32U) {
-            const float f = epilogue_factor<true>(staged, width, prefetch, bounded, intervals, seeded);
+            const float f = epilogue_factor<true>(row_values, width, prefetch, bounded, intervals, seeded);
             if (threadIdx.x == 0)
                 factor = f;
         }

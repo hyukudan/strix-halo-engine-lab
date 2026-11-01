@@ -221,16 +221,16 @@ __device__ inline unsigned split_tree(float (&va)[split_rows(Rows)], float (&vb)
 #pragma unroll
             for (unsigned i = 0; i < half; ++i) {
                 const float give = upper ? va[i] : va[i + half], keep = upper ? va[i + half] : va[i];
-                va[i] = keep + __shfl_xor(give, d, 16);
+                va[i] = keep + __shfl_xor(give, int(d), 16);
                 if constexpr (Gate) {
                     const float gb = upper ? vb[i] : vb[i + half], kb = upper ? vb[i + half] : vb[i];
-                    vb[i] = kb + __shfl_xor(gb, d, 16);
+                    vb[i] = kb + __shfl_xor(gb, int(d), 16);
                 }
             }
             row += upper ? half : 0U;
             count = half;
         } else {
-            va[0] = va[0] + __shfl_xor(va[0], d, 16);
+            va[0] = va[0] + __shfl_xor(va[0], int(d), 16);
             if constexpr (Gate)
                 vb[0] = vb[0] + __shfl_xor(vb[0], d, 16);
         }
