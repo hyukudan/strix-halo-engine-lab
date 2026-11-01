@@ -28,6 +28,14 @@ Every value keeps the expression of the separate launches:
 - Routed commit: unchanged; the combine reads the committed routed value (or, after a routed failure, the
   routed row as it is, as the separate combine would).
 
+Every two-operand FP32 step of the folded kernels is operand-pinned (inline `v_add_f32` / `v_fmac_f32` /
+`v_mul_f32`) to the instruction of the separate launch, as read in the gfx1151 ISA: the combine adds
+`shared, routed`; the inject is `v_fmac hyper += gate * hidden`; the norm leaves `v_fmac sum += value * value`;
+the tree adds the upper operand first; the normalised value multiplies `inverse, value` (FP32 streams:
+`value, inverse`) and then the weight; the mean divides by the runtime width. Operand order matters only when
+two NaNs meet (which payload survives), so the folded bytes equal the separate launches for any input, NaN
+payloads included.
+
 ## Ordering and aliasing
 
 - Inject + norm: one workgroup per (row, stream). The streams written may replace the same row's current
@@ -49,6 +57,11 @@ Every value keeps the expression of the separate launches:
 - `strix-hip-known-window-tests --window-folds` (ctest `strix-hip-known-window-fold-tests`): inject + HC and
   combine + inject + HC folds at 2/4/8 rows in the canonical window arena equal the separate rows launches
   over the whole arena (the HC workspace masked). A declined combine fold is checked through its fallback.
+  The same cases then run over NaN-payload corpora (one value in eight special, every value a NaN with its own
+  payload, NaNs of different payloads in different leaves of one stream, NaN norm weights; NaN gates, shared and
+  routed values) and compare every byte, the HC workspace included wherever the fold put it; then
+  `known_moe_commit_combine_selftest` checks the commit + combine kernel against the commit and combine kernels
+  on rows of any bits, row and header failures and in-place combined rows (every byte, CSR header and D1 record).
 - `strix-hip-moe-known-rows-tests` (all profiles): the routed rows launch with the combine folded into its
   commit leaves the arena as the routed launch does and writes BF16(shared + routed) per element.
 

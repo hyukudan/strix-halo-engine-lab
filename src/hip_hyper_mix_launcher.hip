@@ -213,6 +213,36 @@ __device__ void store_activation(
             rounded >> 16U);
 }
 
+// Operand-pinned FP32 operations. IEEE results do not depend on operand order except for which NaN payload survives
+// when two NaN operands meet; the compiler commutes fadd / fmul / fma multiplicands freely, so the fold and
+// persistent kernels pin the base kernels' measured operand order (src0 first; gfx1151 ISA of the separate
+// launches, window and tiled instantiations alike) to equal their bytes for NaN inputs too:
+//   combine_rows_kernel  v_add_f32  shared, routed
+//   inject_rows_kernel   v_fmac_f32 hyper += gate * hidden        (src0 gate)
+//   norm leaves          v_fmac_f32 sum += value * value
+//   norm LDS tree        v_add_f32  r[l + s], r[l]                (upper first, every level)
+//   normalized           v_mul_f32  inverse, value (BF16 rows; FP32 rows: value, inverse); v_mul_f32 (that), weight
+//   output stream mix    v_fmac_f32 mixed += normalized * sig
+__device__ __forceinline__ float qpf2k_add(float src0, float src1) {
+    float d;
+    asm volatile("v_add_f32 %0, %1, %2" : "=v"(d) : "v"(src0), "v"(src1));
+    return d;
+}
+__device__ __forceinline__ float qpf2k_mul(float src0, float src1) {
+    float d;
+    asm volatile("v_mul_f32 %0, %1, %2" : "=v"(d) : "v"(src0), "v"(src1));
+    return d;
+}
+__device__ __forceinline__ float qpf2k_fmac(float acc, float src0, float src1) {
+    asm volatile("v_fmac_f32 %0, %1, %2" : "+v"(acc) : "v"(src0), "v"(src1));
+    return acc;
+}
+// The normalisation's first product in the norm kernel's operand order for the activation format.
+template <typename Storage> __device__ __forceinline__ float qpf2k_scale(float inverse, float value) {
+    if constexpr (std::is_same_v<Storage, float>) return qpf2k_mul(value, inverse);
+    else return qpf2k_mul(inverse, value);
+}
+
 __device__ std::uint8_t iq4_local_scale(
     const IQ4XSBlock& block,
     std::uint32_t subblock) {
@@ -1779,7 +1809,10 @@ __global__ void rows_prepare_hyper_norm_kernel(Rows rows, const void* norm, std:
 // compute the combined hidden row (stored as the combine launch would; the arena may place it in place of
 // its shared input, which only these threads read), then every stream computes its injected slice (stored
 // in the activation format, as the inject launch would: it is this step's input) and normalises the stored
-// values with rows_prepare_hyper_norm_kernel's leaves, tree and product.
+// values with rows_prepare_hyper_norm_kernel's leaves, tree and product. Every two-operand FP32 step is
+// operand-pinned to the separate launch's instruction (qpf2k_add / qpf2k_fmac / qpf2k_mul), and the mean divides
+// by the runtime width as the norm kernel does, so the bytes equal the combine, inject and norm launches for any
+// input, NaN payloads included.
 struct InjectNormRows {
     const void* hyper[kWindowRows];   // inject: current streams
     const void* hidden[kWindowRows];  // inject: hidden row (combine: shared expert output)
@@ -1791,7 +1824,7 @@ constexpr std::uint32_t kInjectNormHidden = 2560U, kInjectNormStreams = 4U;
 // Without the combine, block (stream, row) does one stream (the normalisation kernel's grid).
 template <typename Storage, bool Combine>
 __global__ __launch_bounds__(kThreads * kInjectNormStreams) void rows_inject_hyper_norm_kernel(HyperRows rows, InjectNormRows in,
-    const void* norm, std::uint32_t norm_type, float epsilon) {
+    const void* norm, std::uint32_t norm_type, std::uint32_t hidden_size, float epsilon) {
     constexpr std::uint32_t hidden = kInjectNormHidden;
     const auto row = Combine ? blockIdx.x : blockIdx.y, stream = Combine ? threadIdx.x / kThreads : blockIdx.x;
     const auto lane = threadIdx.x % kThreads, slot = Combine ? stream : 0U;
@@ -1807,8 +1840,8 @@ __global__ __launch_bounds__(kThreads * kInjectNormStreams) void rows_inject_hyp
         if (stream == 0U)
             for (std::uint32_t feature = lane; feature < hidden; feature += kThreads) {
                 Storage value;
-                store_activation(&value, load_activation(static_cast<const Storage*>(in.hidden[row]), feature) +
-                    load_activation(static_cast<const Storage*>(in.routed[row]), feature));
+                store_activation(&value, qpf2k_add(load_activation(static_cast<const Storage*>(in.hidden[row]), feature),
+                    load_activation(static_cast<const Storage*>(in.routed[row]), feature)));
                 combined[feature] = load_activation(&value, 0U);
                 static_cast<Storage*>(in.combined[row])[feature] = value;
             }
@@ -1818,22 +1851,24 @@ __global__ __launch_bounds__(kThreads * kInjectNormStreams) void rows_inject_hyp
     for (std::uint32_t feature = lane; feature < hidden; feature += kThreads) {
         const float h = Combine ? combined[Combine ? feature : 0U] : load_activation(static_cast<const Storage*>(in.hidden[row]), feature);
         Storage stored;
-        store_activation(&stored, load_activation(hyper, base + feature) + h * gate);
+        store_activation(&stored, qpf2k_fmac(load_activation(hyper, base + feature), gate, h));
         streams[base + feature] = stored;
         const float value = load_activation(&stored, 0U);
-        sum += value * value;
+        sum = qpf2k_fmac(sum, value, value);
     }
     reduction[slot][lane] = sum;
     __syncthreads();
     for (std::uint32_t stride = kThreads / 2U; stride > 0; stride >>= 1U) {
-        if (lane < stride) reduction[slot][lane] += reduction[slot][lane + stride];
+        if (lane < stride) reduction[slot][lane] = qpf2k_add(reduction[slot][lane + stride], reduction[slot][lane]);
         __syncthreads();
     }
-    if (lane == 0) inverse[slot] = rsqrtf(reduction[slot][0] / static_cast<float>(hidden) + epsilon);
+    if (lane == 0) inverse[slot] = rsqrtf(reduction[slot][0] / static_cast<float>(hidden_size) + epsilon);
     __syncthreads();
-    for (std::uint32_t feature = lane; feature < hidden; feature += kThreads)
-        normalized[base + feature] = load_activation(streams, base + feature) * inverse[slot] *
-            load_norm_weight(norm, norm_type, stream * hidden + feature);
+    for (std::uint32_t feature = lane; feature < hidden; feature += kThreads) {
+        const float value = load_activation(streams, base + feature);
+        normalized[base + feature] = qpf2k_mul(qpf2k_scale<Storage>(inverse[slot], value),
+            load_norm_weight(norm, norm_type, stream * hidden + feature));
+    }
 }
 
 // Wave w lanes 0..7 own row w and lanes 8..15 row w+4 (output lane%8): each row's
@@ -2393,7 +2428,10 @@ __global__ void rows_lane_chain_hyper_output_regs_kernel(Rows rows, const void* 
 // wave w = tile w) from a queue; C) waves 0..7 of block g run the up chains of features 64g..64g+63, their
 // up rows requested at the end of B. Every value keeps the expression of the three-kernel form: the
 // 256-leaf norm tree, the per-tile lane chain with its xor reduction and ascending 16-tile sum, the
-// per-lane up chain and the ascending stream mix.
+// per-lane up chain and the ascending stream mix. The folded inject, the norm leaves and tree (upper operand
+// first at every level, as rows_prepare_hyper_norm_kernel), the normalised product and the stream mix are
+// operand-pinned to the separate kernels' instructions (qpf2k_add / qpf2k_fmac / qpf2k_mul), so NaN payloads
+// match them too.
 constexpr std::uint32_t kPersistBlocks = 40U, kPersistHidden = 2560U, kPersistStreams = 4U, kPersistRank = 320U;
 constexpr std::uint32_t kPersistWidth = kPersistHidden * kPersistStreams;
 constexpr std::uint32_t kPersistUnitOutputs = 2U; // low outputs per split-K work unit (4 spills at 8 rows)
@@ -2467,8 +2505,8 @@ __global__ __launch_bounds__(512) __attribute__((amdgpu_waves_per_eu(8))) void r
         for (std::uint32_t k = 0; k < kLeaves; ++k) {
             const auto feature = leaf_index + k * kThreads;
             if constexpr (Inject) {
-                const float result = load_activation(static_cast<const Storage*>(injected.hyper[at]), base_feature + feature) +
-                    load_activation(static_cast<const Storage*>(injected.hidden[at]), feature) * injected.weights[at][stream];
+                const float result = qpf2k_fmac(load_activation(static_cast<const Storage*>(injected.hyper[at]), base_feature + feature),
+                    injected.weights[at][stream], load_activation(static_cast<const Storage*>(injected.hidden[at]), feature));
                 Storage stored;
                 store_activation(&stored, result);
                 const_cast<Storage*>(input)[base_feature + feature] = stored;
@@ -2482,7 +2520,7 @@ __global__ __launch_bounds__(512) __attribute__((amdgpu_waves_per_eu(8))) void r
     if (norm_wave) {
         float sum = 0.0F;
 #pragma unroll
-        for (std::uint32_t k = 0; k < kLeaves; ++k) sum += value[k] * value[k];
+        for (std::uint32_t k = 0; k < kLeaves; ++k) sum = qpf2k_fmac(sum, value[k], value[k]);
         leaf[half][leaf_index] = sum;
     }
     persist_lds_barrier();
@@ -2491,15 +2529,15 @@ __global__ __launch_bounds__(512) __attribute__((amdgpu_waves_per_eu(8))) void r
 #pragma unroll
         for (unsigned j = 0; j < 8U; ++j) l[j] = leaf[half][lane + 32U * j];
 #pragma unroll
-        for (unsigned j = 0; j < 4U; ++j) l[j] += l[j + 4U];
+        for (unsigned j = 0; j < 4U; ++j) l[j] = qpf2k_add(l[j + 4U], l[j]);
 #pragma unroll
-        for (unsigned j = 0; j < 2U; ++j) l[j] += l[j + 2U];
-        l[0] += l[1];
+        for (unsigned j = 0; j < 2U; ++j) l[j] = qpf2k_add(l[j + 2U], l[j]);
+        l[0] = qpf2k_add(l[1], l[0]);
         float v = l[0];
 #pragma unroll
         for (unsigned d = 16U; d != 0U; d /= 2U) {
             const float partner = __shfl_down(v, d, 32);
-            if (lane < d) v += partner;
+            if (lane < d) v = qpf2k_add(partner, v);
         }
         if (lane == 0U) inverse_lds[half] = rsqrtf(v / static_cast<float>(kPersistHidden) + epsilon);
     }
@@ -2508,7 +2546,7 @@ __global__ __launch_bounds__(512) __attribute__((amdgpu_waves_per_eu(8))) void r
         const float inverse = inverse_lds[half];
 #pragma unroll
         for (std::uint32_t k = 0; k < kLeaves; ++k)
-            rows.normalized[at][base_feature + leaf_index + k * kThreads] = value[k] * inverse * norm_w[k];
+            rows.normalized[at][base_feature + leaf_index + k * kThreads] = qpf2k_mul(qpf2k_scale<Storage>(inverse, value[k]), norm_w[k]);
     }
     persist_wait_stores();
     if (threadIdx.x == 0U) mark(1U);
@@ -2675,7 +2713,8 @@ __global__ __launch_bounds__(512) __attribute__((amdgpu_waves_per_eu(8))) void r
         for (std::uint32_t t = c_stream; t < Count; t += kPersistStreams) {
             float mixed = 0.0F;
             for (std::uint32_t s2 = 0; s2 < kPersistStreams; ++s2)
-                mixed += rows.normalized[t][static_cast<std::uint64_t>(s2) * kPersistHidden + feature] * sig[t][s2][32U * c_group + lane];
+                mixed = qpf2k_fmac(mixed, rows.normalized[t][static_cast<std::uint64_t>(s2) * kPersistHidden + feature],
+                    sig[t][s2][32U * c_group + lane]);
             store_activation(&static_cast<Storage*>(rows.output[t])[feature], mixed / static_cast<float>(kPersistStreams));
         }
     if (threadIdx.x == 0U) mark(6U);
@@ -2827,8 +2866,8 @@ __global__ __launch_bounds__(512) __attribute__((amdgpu_waves_per_eu(8))) void r
         for (std::uint32_t k = 0; k < kLeaves; ++k) {
             const auto feature = leaf_index + k * kThreads;
             if constexpr (Inject) {
-                const float result = load_activation(static_cast<const Storage*>(injected.hyper[at]), base_feature + feature) +
-                    load_activation(static_cast<const Storage*>(injected.hidden[at]), feature) * injected.weights[at][stream];
+                const float result = qpf2k_fmac(load_activation(static_cast<const Storage*>(injected.hyper[at]), base_feature + feature),
+                    injected.weights[at][stream], load_activation(static_cast<const Storage*>(injected.hidden[at]), feature));
                 Storage stored;
                 store_activation(&stored, result);
                 const_cast<Storage*>(input)[base_feature + feature] = stored;
@@ -2841,7 +2880,7 @@ __global__ __launch_bounds__(512) __attribute__((amdgpu_waves_per_eu(8))) void r
     if (norm_wave) {
         float sum = 0.0F;
 #pragma unroll
-        for (std::uint32_t k = 0; k < kLeaves; ++k) sum += value[k] * value[k];
+        for (std::uint32_t k = 0; k < kLeaves; ++k) sum = qpf2k_fmac(sum, value[k], value[k]);
         leaf[half][leaf_index] = sum;
     }
     persist_lds_barrier();
@@ -2850,15 +2889,15 @@ __global__ __launch_bounds__(512) __attribute__((amdgpu_waves_per_eu(8))) void r
 #pragma unroll
         for (unsigned j = 0; j < 8U; ++j) l[j] = leaf[half][lane + 32U * j];
 #pragma unroll
-        for (unsigned j = 0; j < 4U; ++j) l[j] += l[j + 4U];
+        for (unsigned j = 0; j < 4U; ++j) l[j] = qpf2k_add(l[j + 4U], l[j]);
 #pragma unroll
-        for (unsigned j = 0; j < 2U; ++j) l[j] += l[j + 2U];
-        l[0] += l[1];
+        for (unsigned j = 0; j < 2U; ++j) l[j] = qpf2k_add(l[j + 2U], l[j]);
+        l[0] = qpf2k_add(l[1], l[0]);
         float v = l[0];
 #pragma unroll
         for (unsigned d = 16U; d != 0U; d /= 2U) {
             const float partner = __shfl_down(v, d, 32);
-            if (lane < d) v += partner;
+            if (lane < d) v = qpf2k_add(partner, v);
         }
         if (lane == 0U) inverse_lds[half] = rsqrtf(v / static_cast<float>(kPersistHidden) + epsilon);
     }
@@ -2867,7 +2906,7 @@ __global__ __launch_bounds__(512) __attribute__((amdgpu_waves_per_eu(8))) void r
         const float inverse = inverse_lds[half];
 #pragma unroll
         for (std::uint32_t k = 0; k < kLeaves; ++k)
-            rows.normalized[at][base_feature + leaf_index + k * kThreads] = value[k] * inverse * norm_w[k];
+            rows.normalized[at][base_feature + leaf_index + k * kThreads] = qpf2k_mul(qpf2k_scale<Storage>(inverse, value[k]), norm_w[k]);
     }
     persist_wait_stores();
     if (threadIdx.x == 0U) mark(1U);
@@ -3063,7 +3102,8 @@ __global__ __launch_bounds__(512) __attribute__((amdgpu_waves_per_eu(8))) void r
         for (std::uint32_t t = c_stream; t < Count; t += kPersistStreams) {
             float mixed = 0.0F;
             for (std::uint32_t s2 = 0; s2 < kPersistStreams; ++s2)
-                mixed += rows.normalized[t][static_cast<std::uint64_t>(s2) * kPersistHidden + feature] * sig[t][s2][32U * c_group + lane];
+                mixed = qpf2k_fmac(mixed, rows.normalized[t][static_cast<std::uint64_t>(s2) * kPersistHidden + feature],
+                    sig[t][s2][32U * c_group + lane]);
             store_activation(&static_cast<Storage*>(rows.output[t])[feature], mixed / static_cast<float>(kPersistStreams));
         }
     if (threadIdx.x == 0U) mark(6U);
@@ -4688,8 +4728,10 @@ bool launch_persistent_hyper_rows(const PreparedHyperMix& p, const HyperRows& ro
     persistent_hyper_launches.fetch_add(1U, std::memory_order_relaxed);
     return true;
 }
+// Fixtures: the separate launches as the reference of the persistent form within one process.
+std::atomic<bool> persistent_hyper_testing_off{false};
 bool persistent_hyper_rows_enabled() {
-    return strix_hc_persistent_enabled();
+    return !persistent_hyper_testing_off.load(std::memory_order_relaxed) && strix_hc_persistent_enabled();
 }
 // STRIX_MTP_HC_PERSISTENT=1 (STRIX_DISPATCH_FUSE=1): one HC mix of the draft chain (one row, BF16 streams,
 // F32 norm, Q8_0 down/up, F32 [4][10240] injection or none) as the persistent launch: one dispatch instead of
@@ -4921,6 +4963,7 @@ void launch_hyper_rows(const PreparedHyperRows& prepared, const Rows& rows, cons
 }  // namespace
 
 std::uint64_t hip_hyper_mix_testing_persistent_launches() { return persistent_hyper_launches.load(); }
+void hip_hyper_mix_testing_separate_launches(bool separate) { persistent_hyper_testing_off.store(separate); }
 std::vector<std::uint64_t> hip_hyper_mix_testing_persistent_trace() {
     std::vector<std::uint64_t> out(kPersistBlocks * 24U + 16U);
     if (const auto* trace = persistent_hyper_last_trace.load())
@@ -5025,6 +5068,7 @@ void hyper_mix_known_window_cohort_launch(std::span<const std::span<const Execut
 
 namespace {
 std::atomic<std::uint64_t> folded_launches{0};
+std::atomic<const float*> folded_workspace{nullptr};
 // Owner-held HC workspace per stream for folded launches whose arena workspace aliases a folded input.
 float* folded_hc_workspace(hipStream_t stream, std::uint64_t bytes) {
     struct Buffer { void* memory = nullptr; std::uint64_t bytes = 0; };
@@ -5124,20 +5168,22 @@ bool hyper_mix_known_window_rows_launch_folded(const ElementwiseRowsViews* combi
         if (combine)
             hipLaunchKernelGGL(HIP_KERNEL_NAME(rows_inject_hyper_norm_kernel<Storage, true>), dim3(count), dim3(kThreads * kInjectNormStreams), 0,
                 hip_execution_stream(), used, in, reinterpret_cast<const void*>(p.norm_runtime->address), p.norm_manifest->ggml_type,
-                config.rms_epsilon);
+                config.hidden_size, config.rms_epsilon);
         else
             hipLaunchKernelGGL(HIP_KERNEL_NAME(rows_inject_hyper_norm_kernel<Storage, false>), dim3(kInjectNormStreams, count), dim3(kThreads), 0,
                 hip_execution_stream(), used, in, reinterpret_cast<const void*>(p.norm_runtime->address), p.norm_manifest->ggml_type,
-                config.rms_epsilon);
+                config.hidden_size, config.rms_epsilon);
         check_hip(hipGetLastError(), "known-window folded inject + HC normalisation launch");
     };
     if (config.activation == HipActivationStorage::bf16) launch.template operator()<std::uint16_t>();
     else launch.template operator()<float>();
     launch_hyper_rows(prepared, used, config, 1U, true);
     folded_launches.fetch_add(1U, std::memory_order_relaxed);
+    folded_workspace.store(private_workspace ? used.normalized[0] : nullptr, std::memory_order_relaxed);
     return true;
 }
 std::uint64_t hip_hyper_mix_testing_folded_launches() { return folded_launches.load(); }
+const float* hip_hyper_mix_testing_folded_workspace() { return folded_workspace.load(); }
 
 namespace {
 // All T rows of a prefill step as T/8 tiles of one launch. Each tile is admitted like an

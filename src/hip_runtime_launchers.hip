@@ -1652,5 +1652,16 @@ void moe_combine_known_window_rows_launch(std::span<const ExecutionDispatchConte
             elementwise_rows_stream(), args, config.hidden_size);
     check_hip(hipGetLastError(), "known-window MoE-combine rows launch");
 }
+void moe_combine_known_window_testing_launch(const ElementwiseRowsViews& views, std::uint32_t hidden_size) {
+    if (views.count == 0U || views.count > 8U || hidden_size == 0U)
+        throw std::invalid_argument("known-window MoE-combine testing rows are invalid");
+    ElementwiseRowsArgs args{};
+    for (std::uint32_t r = 0; r < views.count; ++r) {
+        args.first[r] = views.first[r]; args.second[r] = views.second[r]; args.output[r] = views.output[r];
+    }
+    hipLaunchKernelGGL(HIP_KERNEL_NAME(combine_rows_kernel<std::uint16_t>), dim3(prepare_1d_blocks(hidden_size), views.count), dim3(256U), 0,
+        elementwise_rows_stream(), args, hidden_size);
+    check_hip(hipGetLastError(), "known-window MoE-combine testing rows launch");
+}
 
 }  // namespace strix

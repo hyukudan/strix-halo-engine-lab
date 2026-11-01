@@ -97,6 +97,9 @@ void moe_combine_known_window_cohort_rows_launch(std::span<const std::span<const
     const HipElementwiseLauncherConfig& config);
 void moe_combine_known_window_rows_launch(std::span<const ExecutionDispatchContext> rows,
     const HipElementwiseLauncherConfig& config);
+// Testing: the window MoE-combine rows kernel (BF16) over raw row views (first = shared, second = routed) on the
+// current HIP stream; the reference of folds that compute the combine inside another kernel.
+void moe_combine_known_window_testing_launch(const ElementwiseRowsViews& views, std::uint32_t hidden_size);
 // Prefill: all T rows of an inject / MoE-combine step (8-row tiles one stride apart) in one launch.
 void inject_known_prefill_rows_preflight(std::span<const ExecutionDispatchContext> rows,
     const HipElementwiseLauncherConfig& config);

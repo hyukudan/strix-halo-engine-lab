@@ -6,6 +6,7 @@
 #include "strix/hip_generation_output.hpp"
 #include "strix/hip_lm_head_launcher.hpp"
 #include "strix/hip_hyper_mix_launcher.hpp"
+#include "strix/hip_moe_experts_launcher.hpp"
 #include "strix/hip_indexed_attention_launcher.hpp"
 #include "strix/indexed_attention_state.hpp"
 #include "strix/indexed_attention_workspace.hpp"
@@ -1713,11 +1714,93 @@ void family_hyper_rows(SerialOp op, bool splitk, bool lane, std::uint32_t count)
     reject([&] { hyper_mix_known_window_rows_preflight(f.rows, fp64); }, "FP64 HC oracle was admitted as a window entry");
 }
 
+// Fold corpus, BF16 bits (`x` random): 1 one value in eight special (Inf, -0, denormal, the largest finite,
+// NaN of any payload, sign and quiet bit), 2 every value a NaN with its own payload, 3 finite (single NaN / Inf
+// elements are planted per stream), 4 denormals and -0. Flavor 0 keeps `finite`.
+std::uint16_t fold_corpus_bf16(unsigned flavor, std::uint32_t x, std::uint16_t finite) {
+    const auto nan = static_cast<std::uint16_t>((x & 0x8000U) | 0x7f80U | (((x >> 4U) % 0x7fU) + 1U));
+    const auto denormal = static_cast<std::uint16_t>((x & 0x8000U) | (((x >> 8U) % 0x7fU) + 1U));
+    if (flavor == 1U) {
+        switch (x % 16U) {
+        case 0: return 0x7f80U;
+        case 1: return 0xff80U;
+        case 2: return 0x8000U;
+        case 3: return denormal;
+        case 4: return 0x7f7fU;
+        case 5: case 6: return nan;
+        default: return finite;
+        }
+    }
+    if (flavor == 2U) return nan;
+    if (flavor == 4U) return x % 4U == 0U ? denormal : x % 4U == 1U ? static_cast<std::uint16_t>(x & 0x8000U) : finite;
+    return finite;
+}
+std::uint32_t fold_mix(std::uint32_t x) {
+    x ^= x >> 16U; x *= 0x7feb352dU; x ^= x >> 15U; x *= 0x846ca68bU; x ^= x >> 16U;
+    return x;
+}
+
+// The window arena image of a fold / persistent HC fixture: BF16 values everywhere from the LCG `state` (flavor 0
+// finite, else fold_corpus_bf16), then each inject row's four FP32 gates. Flavors 1 and 2 give the gates NaN
+// payloads (quiet / signalling, both signs), Inf, -0 and denormals; 4 denormal gates. Flavors 3 and 5 plant, per
+// row, NaNs of different payloads in many different leaves of one stream (every tree level meets NaN with NaN),
+// two in one leaf of another, a single NaN and an Inf in others, and a NaN in the hidden row.
+std::vector<unsigned char> fold_corpus_seed(std::uint64_t base, std::uint64_t bytes, std::span<const ExecutionDispatchContext> inject_rows,
+    unsigned flavor, std::uint32_t state) {
+    std::vector<unsigned char> seed(static_cast<std::size_t>(bytes));
+    for (std::size_t i = 0; i + 1U < seed.size(); i += 2U) {
+        state = state * 1664525U + 1013904223U;
+        auto value = bf16(static_cast<float>(static_cast<int>(state >> 20U) - 2048) * 0.0007F);
+        if (flavor && flavor != 5U) value = fold_corpus_bf16(flavor, fold_mix(state ^ (flavor << 28U)), value);
+        std::memcpy(seed.data() + i, &value, sizeof(value));
+    }
+    const auto put16 = [&](std::uint64_t address, std::uint16_t bits) { std::memcpy(seed.data() + (address - base), &bits, 2U); };
+    const auto as_float = [](std::uint32_t u) { return std::bit_cast<float>(u); };
+    for (std::uint32_t r = 0; r < inject_rows.size(); ++r) {
+        const auto gates = resolve_dispatch_read(inject_rows[r], 2);
+        float values[4] = {0.75F + 0.01F * static_cast<float>(r), 1.25F, -0.5F, 1.0F / 3.0F};
+        if (flavor == 1U && r % 2U) { values[1] = as_float(0x7fc12345U | (r << 24U)); values[2] = as_float(0xff800000U); values[3] = as_float(1U); }
+        if (flavor == 1U && !(r % 2U)) { values[1] = as_float(0x80000000U); values[2] = as_float(0x7f800001U + (r << 16U)); }
+        if (flavor == 2U)
+            for (std::uint32_t s = 0; s < 4U; ++s) values[s] = as_float((s % 2U ? 0xff800000U : 0x7f800000U) | (0x12345U * (s + 1U) + r));
+        if (flavor == 4U) { values[0] = as_float(3U); values[1] = as_float(0x80000005U); values[2] = as_float(0x007fffffU); }
+        std::memcpy(seed.data() + (gates.address - base), values, sizeof(values));
+        if (flavor == 3U || flavor == 5U) {
+            const auto hyper = resolve_dispatch_read(inject_rows[r], 0), hidden = resolve_dispatch_read(inject_rows[r], 1);
+            const std::uint64_t f = (static_cast<std::uint64_t>(r) * 397U + 11U) % 2560U;
+            const auto at = [&](std::uint32_t stream, std::uint64_t feature) { return hyper.address + 2U * ((stream % 4U) * 2560U + feature % 2560U); };
+            put16(at(r, f), static_cast<std::uint16_t>(0x7fa0U + r));
+            put16(at(r + 1U, f), 0xff80U);
+            put16(at(r + 1U, f + 512U), 0xffd7U);
+            // Leaves f, f + 1, f + 2, ..., f + 128 of one stream: distinct payloads, both signs, quiet and signalling.
+            for (std::uint32_t d = 0; d < 9U; ++d)
+                put16(at(r + 2U, f + (d ? 1U << (d - 1U) : 0U)), static_cast<std::uint16_t>((d % 2U ? 0xff80U : 0x7f80U) | (0x11U * d + r + 1U)));
+            put16(at(r + 3U, f), 0x7fe1U);
+            put16(at(r + 3U, f + 256U), 0xff83U);
+            put16(hidden.address + 2U * ((f + 512U) % 2560U), 0x7fb3U);
+        }
+    }
+    return seed;
+}
+// HC norm weights (FP32): flavor 5 sets NaNs of different payloads (and an Inf) in every stream.
+std::vector<unsigned char> fold_norm_weights(unsigned flavor) {
+    auto bytes = f32(10240U, 1.0F, 0.04F);
+    if (flavor == 5U)
+        for (std::uint32_t i = 0; i < 10240U; i += 97U) {
+            const std::uint32_t bits = i % 5U == 0U ? 0x7f800000U : ((i % 2U ? 0xff800000U : 0x7f800000U) | (0x10001U + i));
+            std::memcpy(bytes.data() + 4U * i, &bits, 4U);
+        }
+    return bytes;
+}
+
 // Folded window HC steps in the real window arena: the inject rows step (and, with `combine`, the MoE-combine
 // rows step before it) folded into the HC rows step equals the separate rows launches over the whole arena;
 // only the HC workspace (dead after its step) may differ, as the fold moves it when the arena aliases it.
+// `flavor` selects the input corpus (0: finite; see fold_corpus_bf16) and the gates; `strict` also requires
+// the HC workspace (normalised rows, low values) to equal the separate launches', wherever the fold put it.
 // Returns false when the fold declined (nothing enqueued).
-bool family_window_fold(SerialOp inject_op, std::uint32_t inject_layer, bool combine, std::uint32_t count) {
+bool family_window_fold(SerialOp inject_op, std::uint32_t inject_layer, bool combine, std::uint32_t count,
+    unsigned flavor = 0U, bool strict = false) {
     Owner owner;
     const auto model = ModelContract::qwen38_flash_next();
     const auto execution = build_serial_decode_execution_plan(model);
@@ -1754,7 +1837,7 @@ bool family_window_fold(SerialOp inject_op, std::uint32_t inject_layer, bool com
         manifest.tensors.push_back(std::move(tensor));
         runtime.tensors.push_back({index, RuntimeTensorStorage::resident, device.address, device.bytes, 7U, 0U});
     };
-    add("hc_norm.weight", 0U, {10240}, f32(10240U, 1.0F, 0.04F));
+    add("hc_norm.weight", 0U, {10240}, fold_norm_weights(flavor));
     add("hc_down.weight", 8U, {10240, 320}, q8(10240, 320, 23U));
     add("hc_up.weight", 8U, {320, 10240}, q8(320, 10240, 19U));
     if (!final_mix) add("hc_inject.weight", 0U, {10240, 4}, f32(40960U, 0.0004F, 0.0002F));
@@ -1793,19 +1876,9 @@ bool family_window_fold(SerialOp inject_op, std::uint32_t inject_layer, bool com
     const auto combine_rows = contexts(combine_step, combine_launcher.key);
     const auto inject_rows = contexts(*inject_step, inject_launcher.key);
     const auto mix_rows = contexts(mix_step, mix_id);
-    // Finite BF16 everywhere, then FP32 injection gates per row.
-    std::vector<unsigned char> seed(static_cast<std::size_t>(scratch.bytes));
-    std::uint32_t state = 0x2545f491U ^ count ^ (static_cast<std::uint32_t>(inject_op) << 8U) ^ (combine ? 0x10000U : 0U);
-    for (std::size_t i = 0; i + 1U < seed.size(); i += 2U) {
-        state = state * 1664525U + 1013904223U;
-        const auto value = bf16(static_cast<float>(static_cast<int>(state >> 20U) - 2048) * 0.0007F);
-        std::memcpy(seed.data() + i, &value, sizeof(value));
-    }
-    for (std::uint32_t r = 0; r < count; ++r) {
-        const auto gates = resolve_dispatch_read(inject_rows[r], 2);
-        const float values[4] = {0.75F + 0.01F * static_cast<float>(r), 1.25F, -0.5F, 1.0F / 3.0F};
-        std::memcpy(seed.data() + (gates.address - scratch.address), values, sizeof(values));
-    }
+    // Finite BF16 everywhere (or the flavor's corpus), then FP32 injection gates per row.
+    const auto seed = fold_corpus_seed(scratch.address, scratch.bytes, inject_rows, flavor,
+        0x2545f491U ^ count ^ (static_cast<std::uint32_t>(inject_op) << 8U) ^ (combine ? 0x10000U : 0U));
     HipLaunchContext scope; scope.stream = owner.stream;
     const auto run = [&](auto&& work) {
         write(scratch, seed);
@@ -1848,13 +1921,36 @@ bool family_window_fold(SerialOp inject_op, std::uint32_t inject_layer, bool com
         return arena;
     };
     require(masked(candidate) == masked(reference), "folded HC rows differ from the separate rows launches");
+    if (strict) {
+        // The HC workspace too: in the arena, or moved to the owner-held buffer (the arena's then holds whatever
+        // the folded input there became, which the masked comparison above covers).
+        const auto* moved = hip_hyper_mix_testing_folded_workspace();
+        if (!moved) require(candidate == reference, "folded HC workspace (normalised rows, low values) differs");
+        else {
+            constexpr std::uint64_t bytes = (10240U + 320U) * sizeof(float);
+            for (std::uint32_t t = 0; t < count; ++t) {
+                const auto view = resolve_dispatch_temporary(mix_rows[t], 0);
+                const auto offset = static_cast<std::ptrdiff_t>(view.address - scratch.address);
+                require(view.bytes >= bytes, "HC workspace view is smaller than the normalised row and low values");
+                std::vector<unsigned char> workspace(static_cast<std::size_t>(bytes));
+                check(hipMemcpy(workspace.data(), moved + static_cast<std::size_t>(t) * (10240U + 320U), workspace.size(),
+                    hipMemcpyDeviceToHost), "read moved HC workspace");
+                require(std::equal(workspace.begin(), workspace.end(), reference.begin() + offset),
+                    "moved folded HC workspace (normalised rows, low values) differs");
+            }
+        }
+    }
     if (launched) require(run([&] { (void)folded(); }) == candidate, "folded HC rows are not deterministic");
     return launched;
 }
 // An inject rows step and the HC rows step that reads its streams, in the real window arena: the
 // persistent launch with the inject folded in equals the two launches byte for byte over the arena.
+// `flavor` selects the input corpus and gates (fold_corpus_seed) and the norm weights (fold_norm_weights).
+// With `separate` the reference is the separate launches (inject, norm, split-K, output; persistent HC off) and
+// the persistent HC step without the fold must also equal it over the whole arena, HC workspace included.
 // Returns false when the folded launch declined the pair (nothing enqueued).
-bool family_hyper_inject_rows(SerialOp inject_op, std::uint32_t inject_layer, std::uint32_t count) {
+bool family_hyper_inject_rows(SerialOp inject_op, std::uint32_t inject_layer, std::uint32_t count, unsigned flavor = 0U,
+    bool separate = false) {
     Owner owner;
     const auto model = ModelContract::qwen38_flash_next();
     const auto execution = build_serial_decode_execution_plan(model);
@@ -1889,7 +1985,7 @@ bool family_hyper_inject_rows(SerialOp inject_op, std::uint32_t inject_layer, st
         manifest.tensors.push_back(std::move(tensor));
         runtime.tensors.push_back({index, RuntimeTensorStorage::resident, device.address, device.bytes, 7U, 0U});
     };
-    add("hc_norm.weight", 0U, {10240}, f32(10240U, 1.0F, 0.04F));
+    add("hc_norm.weight", 0U, {10240}, fold_norm_weights(flavor));
     add("hc_down.weight", 8U, {10240, 320}, q8(10240, 320, 23U));
     add("hc_up.weight", 8U, {320, 10240}, q8(320, 10240, 19U));
     if (!final_mix) add("hc_inject.weight", 0U, {10240, 4}, f32(40960U, 0.0004F, 0.0002F));
@@ -1926,19 +2022,9 @@ bool family_hyper_inject_rows(SerialOp inject_op, std::uint32_t inject_layer, st
     };
     const auto inject_rows = contexts(*inject_step, inject_launcher.key);
     const auto mix_rows = contexts(mix_step, mix_id);
-    // Finite BF16 everywhere, then FP32 injection gates per row.
-    std::vector<unsigned char> seed(static_cast<std::size_t>(scratch.bytes));
-    std::uint32_t state = 0x2545f491U ^ count ^ (static_cast<std::uint32_t>(inject_op) << 8U);
-    for (std::size_t i = 0; i + 1U < seed.size(); i += 2U) {
-        state = state * 1664525U + 1013904223U;
-        const auto value = bf16(static_cast<float>(static_cast<int>(state >> 20U) - 2048) * 0.0007F);
-        std::memcpy(seed.data() + i, &value, sizeof(value));
-    }
-    for (std::uint32_t r = 0; r < count; ++r) {
-        const auto gates = resolve_dispatch_read(inject_rows[r], 2);
-        const float values[4] = {0.75F + 0.01F * static_cast<float>(r), 1.25F, -0.5F, 1.0F / 3.0F};
-        std::memcpy(seed.data() + (gates.address - scratch.address), values, sizeof(values));
-    }
+    // Finite BF16 everywhere (or the flavor's corpus), then FP32 injection gates per row.
+    const auto seed = fold_corpus_seed(scratch.address, scratch.bytes, inject_rows, flavor,
+        0x2545f491U ^ count ^ (static_cast<std::uint32_t>(inject_op) << 8U));
     HipLaunchContext scope; scope.stream = owner.stream;
     const auto run = [&](auto&& work) {
         write(scratch, seed);
@@ -1947,11 +2033,21 @@ bool family_hyper_inject_rows(SerialOp inject_op, std::uint32_t inject_layer, st
         for (const auto& weight : weights) require(read(weight.device) == weight.original, "fused HC rows changed weights");
         return read(scratch);
     };
-    const auto reference = run([&] {
+    const auto separate_launches = [&] {
         inject_known_window_rows_launch(inject_rows, elementwise);
         hyper_mix_known_window_rows_launch(mix_rows, config);
-    });
+    };
+    hip_hyper_mix_testing_separate_launches(separate);
+    const auto reference = run(separate_launches);
+    hip_hyper_mix_testing_separate_launches(false);
     require(reference != seed, "inject + HC rows wrote nothing");
+    if (separate) {
+        // The persistent HC step alone (the inject launched separately): every byte, normalised rows included.
+        const auto before = hip_hyper_mix_testing_persistent_launches();
+        const auto persistent = run(separate_launches);
+        if (hip_hyper_mix_testing_persistent_launches() != before)
+            require(persistent == reference, "persistent HC rows differ from the separate norm, split-K and output launches");
+    }
     bool fused = false;
     const auto candidate = run([&] { fused = hyper_mix_known_window_rows_launch_injected(inject_rows, elementwise, mix_rows, config); });
     if (!fused) { require(candidate == seed, "declined fused HC rows enqueued work"); return false; }
@@ -2603,6 +2699,31 @@ int main(int argc, char** argv) try {
         // Inject folds always apply here; a combine fold declines when another row's streams overlap a row's
         // shared-expert output (the fallback is checked above).
         require(folded >= 9U, "a window inject fold fixture case was declined");
+        // NaN-payload corpora (fold_corpus_seed flavors 1..5: specials, all-NaN, NaNs of different payloads in different
+        // leaves of one stream, NaN norm weights; NaN gates, shared and routed values): every byte, HC workspace included.
+        std::uint32_t nan_folded = 0, nan_cases = 0;
+        for (unsigned flavor = 1; flavor < 6U; ++flavor)
+            for (const auto& [op, layer, combine] : {std::tuple{SerialOp::attn_inject, 0U, false},
+                     std::tuple{SerialOp::mlp_inject, 2U, false}, std::tuple{SerialOp::mlp_inject, last, false},
+                     std::tuple{SerialOp::mlp_inject, 2U, true}, std::tuple{SerialOp::mlp_inject, last, true}})
+                for (std::uint32_t rows : {2U, 4U, 8U}) {
+                    const bool f = family_window_fold(op, layer, combine, rows, flavor, true);
+                    require(f || combine, "a NaN-corpus window inject fold fixture case was declined");
+                    nan_folded += f ? 1U : 0U; ++nan_cases;
+                }
+        std::cout << "window HC folds, NaN corpora: " << nan_folded << " of " << nan_cases
+                  << " cases folded, every byte (HC workspace included) equals the separate launches\n";
+        // The routed commit + MoE combine fold against the commit and combine kernels on rows of any bits.
+        std::uint32_t routed = 0;
+        for (std::uint32_t rows : {2U, 4U, 8U})
+            for (std::uint32_t flavor = 0; flavor < 9U; ++flavor) {
+                const auto r = known_moe_commit_combine_selftest(rows, flavor, 7U + rows * 13U + flavor);
+                if (r[1] != 0.0)
+                    std::cout << "FAIL commit + combine rows " << rows << " flavor " << flavor << ": " << r[1] << " of " << r[0] << " words differ\n";
+                require(r[1] == 0.0, "commit + combine fold differs from the commit and combine kernels");
+                ++routed;
+            }
+        std::cout << "commit + combine fold: " << routed << " cases, every byte equals the commit and combine kernels\n";
         return 0;
     }
     // HC rows only (the persistent ctest runs this with STRIX_HC_PERSISTENT=1 and requires its launches).
@@ -2629,6 +2750,22 @@ int main(int argc, char** argv) try {
         std::cout << "fused inject + HC rows: " << fused << " of " << pairs << " pairs folded, all equal the two launches\n";
         if (on("STRIX_HC_PERSISTENT") && on("STRIX_HC_PERSISTENT_INJECT"))
             require(fused == pairs, "STRIX_HC_PERSISTENT_INJECT=1 declined a fixture pair");
+        // NaN-payload corpora (fold_corpus_seed / fold_norm_weights flavors 1..5) against the separate launches: the
+        // persistent HC step alone over the whole arena, and the persistent inject fold over every live byte.
+        if (on("STRIX_HC_PERSISTENT")) {
+            std::uint32_t nan_fused = 0, nan_pairs = 0;
+            const auto launches = hip_hyper_mix_testing_persistent_launches();
+            for (unsigned flavor = 1; flavor < 6U; ++flavor)
+                for (const auto& [op, layer] : {std::pair{SerialOp::attn_inject, 0U}, std::pair{SerialOp::mlp_inject, 1U},
+                         std::pair{SerialOp::mlp_inject, static_cast<std::uint32_t>(last)}})
+                    for (std::uint32_t rows : {2U, 4U, 8U}) {
+                        nan_fused += family_hyper_inject_rows(op, layer, rows, flavor, true) ? 1U : 0U; ++nan_pairs;
+                    }
+            require(hip_hyper_mix_testing_persistent_launches() > launches, "NaN-corpus persistent cases ran no persistent launch");
+            if (on("STRIX_HC_PERSISTENT_INJECT")) require(nan_fused == nan_pairs, "STRIX_HC_PERSISTENT_INJECT=1 declined a NaN-corpus pair");
+            std::cout << "persistent HC, NaN corpora: " << nan_pairs << " pairs equal the separate launches (" << nan_fused
+                      << " with the inject folded)\n";
+        }
         if (std::getenv("STRIX_HC_ROWS_BENCH"))
             for (bool cold : {false, true}) for (std::uint32_t rows : {2U, 4U, 8U}) {
                 bench_hyper_rows(true, true, rows, cold);

@@ -2413,7 +2413,9 @@ __global__ void known_moe_rows_commit_kernel(KnownMoeRowsDevice view, KnownMoeCs
 
 // The MoE combine folded into the commit (STRIX_WINDOW_COMMIT_COMBINE=1): each output element's thread also
 // stores shared + routed (the routed value just committed, or the existing one after a failure, as the
-// separate combine launch would read it) in the combine's output row.
+// separate combine launch would read it) in the combine's output row. The sum is operand-pinned to
+// combine_rows_kernel's v_add_f32 shared, routed (src0 shared), so two NaN operands keep the shared payload
+// there too; the commit store and the reload are the commit kernel's BF16 transform.
 struct KnownMoeCombineDevice {
     const std::uint16_t* shared[kKnownMoeMaxRows]{};
     std::uint16_t* combined[kKnownMoeMaxRows]{};
@@ -2433,9 +2435,12 @@ __global__ void known_moe_rows_commit_combine_kernel(KnownMoeRowsDevice view, Kn
     const auto out = blockIdx.x * blockDim.x + threadIdx.x;
     if (out >= hidden_size) return;
     if (!failure) store_activation(view.output[blockIdx.y] + out, view.accumulation[blockIdx.y][out]);
-    if constexpr (Combine)
-        store_activation(combine.combined[blockIdx.y] + out,
-            load_activation(combine.shared[blockIdx.y] + out) + load_activation(view.output[blockIdx.y] + out));
+    if constexpr (Combine) {
+        const float shared = load_activation(combine.shared[blockIdx.y] + out), routed = load_activation(view.output[blockIdx.y] + out);
+        float sum;
+        asm volatile("v_add_f32 %0, %1, %2" : "=v"(sum) : "v"(shared), "v"(routed));
+        store_activation(combine.combined[blockIdx.y] + out, sum);
+    }
 }
 
 struct KnownMoeRowsPrepared {
@@ -3186,6 +3191,104 @@ void moe_experts_known_prefill_rows_launch(std::span<const ExecutionDispatchCont
 #else
     (void)rows; (void)config; (void)window; (void)prefill;
     throw std::invalid_argument("known prefill routed rows require built A8 runtime");
+#endif
+}
+std::array<double, 2> known_moe_commit_combine_selftest(std::uint32_t rows, std::uint32_t flavor, std::uint32_t seed) {
+#ifdef STRIX_HAS_EXPERIMENTAL_Q4K_A8_RUNTIME
+    constexpr std::uint32_t hidden = 2560U, header_words = 64U, half = hidden / 2U;
+    if (rows == 0U || rows > 8U || flavor > 8U) throw std::invalid_argument("commit + combine self-test: rows or flavor");
+    std::uint64_t state = 0x9e3779b97f4a7c15ULL ^ (static_cast<std::uint64_t>(seed) << 19U) ^ (static_cast<std::uint64_t>(flavor) << 3U);
+    const auto next = [&] { state ^= state << 13U; state ^= state >> 7U; state ^= state << 17U; return state; };
+    // NaNs keep payload bits above bit 16 (they survive the BF16 store): quiet and signalling, both signs.
+    const auto nan32 = [&] {
+        const auto payload = static_cast<std::uint32_t>(next() % 0x7fU + 1U) << 16U | static_cast<std::uint32_t>(next() & 0xffffU);
+        return (next() % 2U ? 0x80000000U : 0U) | 0x7f800000U | payload;
+    };
+    const auto special32 = [&]() -> std::uint32_t {
+        switch (next() % 8U) {
+        case 0: return 0x7f800000U; case 1: return 0xff800000U; case 2: return static_cast<std::uint32_t>(next() % 0x7fffffU + 1U);
+        case 3: return 0x80000000U; case 4: return 0x7f7fffffU; case 5: return 0x7f7f8000U; default: return nan32();
+        }
+    };
+    const auto finite32 = [&] {
+        const float v = static_cast<float>(static_cast<double>(next() >> 40U) / 16777216.0 * 16.0 - 8.0);
+        std::uint32_t u; std::memcpy(&u, &v, 4); return u;
+    };
+    const bool specials = flavor != 0U;
+    const auto value32 = [&] { return specials && next() % 2U ? special32() : finite32(); };
+    const auto value16 = [&] { return static_cast<std::uint16_t>(value32() >> 16U); };
+    // Per row: status, accumulation (F32), routed output, shared and combined rows (BF16); then the CSR header and D1.
+    const std::uint64_t row_words = 1U + hidden + 3U * half;
+    const std::uint64_t words = row_words * rows + header_words + 2U;
+    std::vector<std::uint32_t> image(words);
+    const auto bad = static_cast<std::uint32_t>(next() % rows);
+    for (std::uint32_t r = 0; r < rows; ++r) {
+        auto* row = image.data() + r * row_words;
+        row[0] = flavor == 3U && r == bad ? 2U : flavor == 5U && r == bad ? 8U : 0U;
+        for (std::uint32_t i = 0; i < hidden; ++i) row[1U + i] = value32();
+        // Flavor 2: BF16 rounding ties, carries into the exponent and overflow to Inf.
+        if (flavor == 2U)
+            for (std::uint32_t i = 0; i < hidden; ++i) {
+                const auto pick = next() % 4U;
+                row[1U + i] = (next() % 2U ? 0x80000000U : 0U) | (pick == 0U ? 0x7f7f8000U : pick == 1U ? 0x3f7fffffU :
+                    0x3f808000U + static_cast<std::uint32_t>(next() % 3U) * 0x8000U);
+            }
+        for (std::uint32_t i = 0; i < 3U * half; ++i) row[1U + hidden + i] = static_cast<std::uint32_t>(value16()) | static_cast<std::uint32_t>(value16()) << 16U;
+    }
+    auto* header = image.data() + row_words * rows;
+    for (std::uint32_t i = 0; i < 24U; ++i) header[i] = i == 0U ? 0U : static_cast<std::uint32_t>(next() % 97U);
+    if (flavor == 4U) header[0] = 1U;
+    // Flavor 8: every shared and routed element is a NaN pair (shared payload vs routed payload).
+    if (flavor == 8U)
+        for (std::uint32_t r = 0; r < rows; ++r) {
+            auto* row = image.data() + r * row_words;
+            for (std::uint32_t i = 0; i < hidden; ++i) row[1U + i] = nan32();
+            for (std::uint32_t i = 0; i < half; ++i)
+                row[1U + hidden + half + i] = (nan32() >> 16U) | (nan32() & 0xffff0000U);
+        }
+    std::uint32_t* device[2] = {};
+    for (auto& d : device) {
+        check_hip(hipMalloc(&d, words * 4U), "commit + combine self-test allocation");
+        check_hip(hipMemcpy(d, image.data(), words * 4U, hipMemcpyHostToDevice), "commit + combine self-test upload");
+    }
+    struct Arm { KnownMoeRowsDevice view{}; KnownMoeCsrDevice csr{}; KnownMoeCombineDevice combine{}; ElementwiseRowsViews views{}; std::uint32_t* record; };
+    const auto arm = [&](std::uint32_t* base) {
+        Arm a{};
+        for (std::uint32_t r = 0; r < rows; ++r) {
+            auto* row = base + r * row_words;
+            a.view.status[r] = row;
+            a.view.accumulation[r] = reinterpret_cast<float*>(row + 1U);
+            a.view.output[r] = reinterpret_cast<std::uint16_t*>(row + 1U + hidden);
+            auto* shared = reinterpret_cast<std::uint16_t*>(row + 1U + hidden + half);
+            // Flavors 6 / 7: the combined row replaces the row's shared / routed row in place.
+            auto* combined = flavor == 6U ? shared : flavor == 7U ? a.view.output[r] : reinterpret_cast<std::uint16_t*>(row + 1U + hidden + 2U * half);
+            a.combine.shared[r] = shared; a.combine.combined[r] = combined;
+            a.views.first[r] = shared; a.views.second[r] = a.view.output[r]; a.views.output[r] = combined;
+        }
+        a.views.count = rows;
+        a.csr.header = base + row_words * rows;
+        a.record = a.csr.header + header_words;
+        return a;
+    };
+    const auto off = arm(device[0]), on = arm(device[1]);
+    const dim3 grid((hidden + 255U) / 256U, rows);
+    hipLaunchKernelGGL(known_moe_rows_commit_kernel, grid, dim3(256), 0, nullptr, off.view, off.csr, rows, hidden, off.record);
+    check_hip(hipGetLastError(), "commit + combine self-test commit");
+    moe_combine_known_window_testing_launch(off.views, hidden);   // no launch scope: the null stream, as the kernels above
+    hipLaunchKernelGGL(known_moe_rows_commit_combine_kernel<true>, grid, dim3(256), 0, nullptr, on.view, on.csr, rows, hidden, on.record,
+        on.combine);
+    check_hip(hipGetLastError(), "commit + combine self-test launch");
+    check_hip(hipDeviceSynchronize(), "commit + combine self-test sync");
+    std::vector<std::uint32_t> x(words), y(words);
+    check_hip(hipMemcpy(x.data(), device[0], words * 4U, hipMemcpyDeviceToHost), "read");
+    check_hip(hipMemcpy(y.data(), device[1], words * 4U, hipMemcpyDeviceToHost), "read");
+    for (auto* d : device) check_hip(hipFree(d), "free");
+    double differing = 0;
+    for (std::uint64_t i = 0; i < words; ++i) if (x[i] != y[i]) differing += 1.0;
+    return {static_cast<double>(words), differing};
+#else
+    (void)rows; (void)flavor; (void)seed;
+    throw std::invalid_argument("commit + combine self-test requires built A8 runtime");
 #endif
 }
 } // namespace strix
