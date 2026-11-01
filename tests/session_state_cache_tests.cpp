@@ -1,5 +1,7 @@
 #include "strix/session_state_cache.hpp"
 #include "strix/model_content_hash.hpp"
+#include "strix/unbuffered_file.hpp"
+#include "state_file_fixtures.inc"
 #include "../apps/hip_decode_options.hpp"
 #include <chrono>
 #include <cstring>
@@ -8,6 +10,14 @@
 #include <stdexcept>
 #include <thread>
 #include <cstdlib>
+#include <iterator>
+#include <optional>
+#if defined(__linux__)
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <sys/vfs.h>
+#include <unistd.h>
+#endif
 
 namespace {
 void check(bool b,const char* why) { if(!b) throw std::runtime_error(why); }
@@ -60,11 +70,229 @@ void session_tail_plan_test() {
     check(a.known_prefix_tail_rows!=b.known_prefix_tail_rows,"non-session pruning changed");
     set(saved?saved->c_str():nullptr);
 }
+namespace {
+void set_env(const char* key,const char* value) {
+#ifdef _WIN32
+    check(_putenv_s(key,value?value:"")==0,"environment update");
+#else
+    check((value?setenv(key,value,1):unsetenv(key))==0,"environment update");
+#endif
+}
+struct EnvGuard {
+    const char* key; std::optional<std::string> saved;
+    explicit EnvGuard(const char* k) : key(k) { if(const char* v=std::getenv(k)) saved=v; }
+    ~EnvGuard() { set_env(key,saved?saved->c_str():nullptr); }
+};
+std::vector<char> file_bytes(const std::filesystem::path& p) {
+    std::ifstream in(p,std::ios::binary); return {std::istreambuf_iterator<char>(in),std::istreambuf_iterator<char>()};
+}
+#if defined(__linux__)
+// Resident pages of a file (mincore over a read-only mapping); {resident, total}.
+std::pair<std::uint64_t,std::uint64_t> resident_pages(const std::filesystem::path& p) {
+    const int fd=::open(p.c_str(),O_RDONLY|O_CLOEXEC); check(fd>=0,"residency open");
+    const auto size=static_cast<std::size_t>(std::filesystem::file_size(p));
+    const auto page=static_cast<std::size_t>(::sysconf(_SC_PAGESIZE));
+    void* map=::mmap(nullptr,size,PROT_READ,MAP_SHARED,fd,0); ::close(fd);
+    check(map!=MAP_FAILED,"residency mmap");
+    std::vector<unsigned char> v((size+page-1)/page);
+    const int rc=::mincore(map,size,v.data()); ::munmap(map,size); check(rc==0,"mincore");
+    std::uint64_t r=0; for(auto b:v) r+=b&1U;
+    return {r,static_cast<std::uint64_t>(v.size())};
+}
+// On tmpfs the page cache is the file: residency there says nothing about write-through.
+bool page_cache_backed(const std::filesystem::path& p) {
+    struct statfs fs{}; return ::statfs(p.c_str(),&fs)==0 && fs.f_type!=0x01021994;
+}
+#endif
+strix::SessionCheckpoint large_checkpoint(const strix::SessionCompatibility& compat,std::uint64_t bytes,unsigned seed) {
+    strix::SessionCheckpoint c; c.compatibility=compat;
+    c.frontier.consumed=2; c.frontier.accepted=2; c.frontier.emitted=1; c.frontier.tokens={5,6};
+    auto payload=heap(bytes);
+    std::uint64_t x=0x9e3779b97f4a7c15ULL*seed+1;
+    for(std::uint64_t i=0;i<bytes;++i) { x^=x<<13; x^=x>>7; x^=x<<17; payload.data.get()[i]=static_cast<std::byte>(x&255U); }
+    c.sections.push_back({"target.kv",payload}); c.sections.push_back({"target.fixed",heap(0)});
+    return c;
+}
+}
+// A session.bin written before unbuffered I/O restores in every read mode, and today's
+// encoder and both writers still produce exactly those bytes.
+void old_format_session_tests(const std::filesystem::path& root) {
+    const auto h=[](const char* s) { return strix::sha256_bytes(std::as_bytes(std::span(s,std::strlen(s)))); };
+    strix::SessionCompatibility compat{h("fixture model"),h("fixture exe"),"fixture numerical config v1",true};
+    strix::SessionCheckpoint c; c.compatibility=compat;
+    c.frontier.consumed=5; c.frontier.accepted=5; c.frontier.emitted=3; c.frontier.predictor=4; c.frontier.pending=77;
+    c.frontier.tokens={11,22,33,44,55};
+    auto kv=heap(5000); for(std::uint64_t i=0;i<kv.bytes;++i) kv.data.get()[i]=static_cast<std::byte>((i*29+7)&255);
+    auto fixed=heap(333); for(std::uint64_t i=0;i<fixed.bytes;++i) fixed.data.get()[i]=static_cast<std::byte>((i*13+1)&255);
+    c.sections.push_back({"target.kv",kv}); c.sections.push_back({"target.fixed",fixed}); c.sections.push_back({"mtp.empty",heap(0)});
+    const std::vector<char> old(reinterpret_cast<const char*>(old_format_session_bin),
+        reinterpret_cast<const char*>(old_format_session_bin)+sizeof(old_format_session_bin));
+    const auto blob=strix::encode_session_checkpoint(c,heap);
+    check(blob.bytes==old.size() && !std::memcmp(blob.data.get(),old.data(),old.size()),"session encoding drifted from the old format");
+    std::filesystem::create_directories(root/"old");
+    { std::ofstream out(root/"old"/"session.bin",std::ios::binary); out.write(old.data(),static_cast<std::streamsize>(old.size())); }
+    EnvGuard d("STRIX_SESSION_DIRECT_IO"), a("STRIX_SESSION_READAHEAD"), k("STRIX_SESSION_CHUNKED");
+    for(const char* direct:{"0","1"}) for(const char* chunked:{"0","1"}) {
+        set_env("STRIX_SESSION_DIRECT_IO",direct); set_env("STRIX_SESSION_CHUNKED",chunked);
+        strix::SessionCheckpoint back;
+        (void)strix::read_session_checkpoint(root/"old",compat,heap,old.size(),nullptr,&back);
+        check(back.frontier.tokens==c.frontier.tokens && back.frontier.pending==77U && back.frontier.predictor==4 &&
+            back.sections.size()==3 && back.sections[0].payload.bytes==5000 &&
+            !std::memcmp(back.sections[0].payload.data.get(),kv.data.get(),5000) &&
+            !std::memcmp(back.sections[1].payload.data.get(),fixed.data.get(),333),"old-format session restore differs");
+        strix::publish_session_checkpoint(root/"new",blob);
+        check(file_bytes(root/"new"/"session.bin")==old,"publication no longer writes the old-format bytes");
+    }
+    std::filesystem::remove_all(root);
+}
+// Chunked reader with and without read-ahead: same bytes for any read sizes, truncation
+// refused, growth after the opened size detected.
+void sequential_reader_tests(const std::filesystem::path& root) {
+#if defined(__linux__)
+    namespace io=strix::state_file_io;
+    std::filesystem::create_directories(root);
+    const auto file=root/"stream.bin";
+    const std::uint64_t size=3*io::chunk_bytes+12345;
+    std::vector<char> data(static_cast<std::size_t>(size));
+    std::uint64_t x=88172645463325252ULL;
+    for(auto& c:data) { x^=x<<13; x^=x>>7; x^=x<<17; c=static_cast<char>(x&255U); }
+    { std::ofstream out(file,std::ios::binary); out.write(data.data(),static_cast<std::streamsize>(data.size())); }
+    for(const bool ahead:{false,true}) for(const std::uint64_t piece:{std::uint64_t{1}<<20,std::uint64_t{4096*3+17},size}) {
+        io::SequentialReader in(file,ahead);
+        check(in.open() && in.size()==size && in.reading_ahead()==ahead,"reader open");
+        std::vector<char> back(data.size());
+        for(std::uint64_t at=0;at<size;at+=piece) in.read(back.data()+at,std::min(piece,size-at));
+        check(back==data && !in.grew(),"chunked read differs");
+        refused([&]{char c; in.read(&c,1);},"read past the end accepted");
+    }
+    {
+        io::SequentialReader in(file,true);
+        std::vector<char> part(1000); in.read(part.data(),part.size());
+    }  // destroyed while the helper reads ahead
+    {
+        io::SequentialReader in(file,false);
+        { std::ofstream grow(file,std::ios::binary|std::ios::app); grow<<"more"; }
+        std::vector<char> back(data.size()); in.read(back.data(),size);
+        check(in.grew(),"growth after open not detected");
+    }
+    std::filesystem::resize_file(file,size-100);
+    for(const bool ahead:{false,true}) {
+        io::SequentialReader in(file,ahead);
+        std::vector<char> back(data.size());
+        refused([&]{in.read(back.data(),size);},"truncated stream accepted");
+    }
+    std::filesystem::remove_all(root);
+#else
+    static_cast<void>(root);
+#endif
+}
+// Unbuffered publication/restore: same bytes as the buffered path in every mode, old files
+// restore, short writes complete, failed writes leave the published checkpoint intact, and
+// the written file does not stay in the page cache.
+void unbuffered_session_io_tests(const std::filesystem::path& root,const strix::SessionCompatibility& compat) {
+    EnvGuard restore_env("STRIX_SESSION_DIRECT_IO");
+    auto& faults=strix::state_file_io::fault_injection();
+    // Sizes: sub-block, just under one staging chunk, multi-chunk with an unaligned tail.
+    for(const std::uint64_t payload:{std::uint64_t{1000},std::uint64_t{(8U<<20)-600},std::uint64_t{(20U<<20)+12345}}) {
+        const auto blob=strix::encode_session_checkpoint(large_checkpoint(compat,payload,static_cast<unsigned>(payload%97+1)),heap);
+        const auto off=root/"off", on=root/"on";
+        set_env("STRIX_SESSION_DIRECT_IO","0"); strix::publish_session_checkpoint(off,blob);
+        set_env("STRIX_SESSION_DIRECT_IO","1"); strix::publish_session_checkpoint(on,blob);
+        const auto a=file_bytes(off/"session.bin"), b=file_bytes(on/"session.bin");
+        check(a.size()==blob.bytes && a==b && !std::memcmp(a.data(),blob.data.get(),a.size()),"unbuffered publication bytes differ");
+        EnvGuard restore_readahead("STRIX_SESSION_READAHEAD"), restore_chunked("STRIX_SESSION_CHUNKED");
+        for(const char* chunked:{"0","1"}) for(const char* ahead:{"0","1"}) for(const char* mode:{"0","1"}) for(const auto& d:{off,on}) {
+            set_env("STRIX_SESSION_CHUNKED",chunked);
+            set_env("STRIX_SESSION_READAHEAD",ahead);
+            set_env("STRIX_SESSION_DIRECT_IO",mode);
+            strix::SessionCheckpoint decoded;
+            auto back=strix::read_session_checkpoint(d,compat,heap,blob.bytes,nullptr,&decoded);
+            check(back.bytes==blob.bytes && !std::memcmp(back.data.get(),blob.data.get(),static_cast<std::size_t>(blob.bytes)),"restore bytes differ");
+            check(decoded.sections.size()==2 && decoded.sections[0].payload.bytes==payload,"restore decode differs");
+        }
+        set_env("STRIX_SESSION_DIRECT_IO","1");
+        refused([&]{(void)strix::read_session_checkpoint(on,compat,heap,blob.bytes-1);},"unbuffered read admission ignored");
+        // One flipped byte anywhere (late chunk, footer) is refused by name in every read mode.
+        for(const std::uint64_t at:{blob.bytes-blob.bytes/3,blob.bytes-1}) {
+            auto bad=a; bad[static_cast<std::size_t>(at)]^=1;
+            { std::ofstream out(root/"bad.bin",std::ios::binary); out.write(bad.data(),static_cast<std::streamsize>(bad.size())); }
+            std::filesystem::create_directories(root/"bad");
+            std::filesystem::rename(root/"bad.bin",root/"bad"/"session.bin");
+            for(const char* chunked:{"0","1"}) for(const char* mode:{"0","1"}) {
+                set_env("STRIX_SESSION_CHUNKED",chunked); set_env("STRIX_SESSION_DIRECT_IO",mode);
+                bool named=false;
+                try { (void)strix::read_session_checkpoint(root/"bad",compat,heap,blob.bytes); }
+                catch(const std::runtime_error& e) { named=std::string_view(e.what())=="session manifest root mismatch"; }
+                check(named,"corrupt envelope not refused by its manifest root");
+            }
+        }
+        set_env("STRIX_SESSION_DIRECT_IO","1"); set_env("STRIX_SESSION_CHUNKED",nullptr);
+        std::filesystem::remove_all(root/"bad");
+        // Short writes (block-sized and odd-sized) still produce the same file.
+        for(const std::uint64_t cap:{std::uint64_t{3*4096},std::uint64_t{1000}}) {
+            faults.max_syscall_bytes=cap;
+            strix::publish_session_checkpoint(root/"short",blob);
+            faults.max_syscall_bytes=0;
+            check(file_bytes(root/"short"/"session.bin")==a,"short-write publication differs");
+        }
+        // A failing write keeps the previous publication and removes its temporary.
+        faults.fail_at_offset=blob.bytes/2;
+        refused([&]{strix::publish_session_checkpoint(on,blob);},"failed unbuffered write accepted");
+        faults.fail_at_offset=UINT64_MAX;
+        check(file_bytes(on/"session.bin")==a,"failed write replaced the publication");
+        for(const auto& e:std::filesystem::directory_iterator(on))
+            check(e.path().filename()=="session.bin","failed write left a temporary");
+        // Truncated files are refused on the unbuffered read as on the buffered one.
+        std::filesystem::resize_file(on/"session.bin",blob.bytes-7);
+        refused([&]{(void)strix::read_session_checkpoint(on,compat,heap,blob.bytes);},"unbuffered truncated file accepted");
+        std::filesystem::remove_all(off); std::filesystem::remove_all(on); std::filesystem::remove_all(root/"short");
+    }
+#if defined(__linux__)
+    // Page cache: a resident read-mostly table stays resident across a large save, and the
+    // saved file itself is not left in the page cache (direct writes, or the fallback's drops).
+    for(const bool refuse:{false,true}) {
+        faults.refuse_direct=refuse;
+        const auto table=root/"resident-table.bin";
+        { std::ofstream t(table,std::ios::binary); std::vector<char> z(1U<<20,'p'); for(int i=0;i<64;++i) t.write(z.data(),static_cast<std::streamsize>(z.size())); }
+        { auto bytes=file_bytes(table); check(bytes.size()==(64U<<20),"table size"); }  // make it resident
+        const auto before=resident_pages(table);
+        const auto blob=strix::encode_session_checkpoint(large_checkpoint(compat,std::uint64_t{256}<<20,7),heap);
+        set_env("STRIX_SESSION_DIRECT_IO","1");
+        const auto writes=strix::state_file_io::io_counters().direct_writes.load();
+        strix::publish_session_checkpoint(root/"big",blob);
+        const bool direct=strix::state_file_io::io_counters().direct_writes.load()>writes;
+        const auto after=resident_pages(table), saved=resident_pages(root/"big"/"session.bin");
+        set_env("STRIX_SESSION_DIRECT_IO","0");
+        strix::publish_session_checkpoint(root/"big-off",blob);
+        const auto saved_off=resident_pages(root/"big-off"/"session.bin");
+        std::cout<<"residency (refuse_direct="<<refuse<<"): table "<<before.first<<"/"<<before.second<<" -> "<<after.first<<"/"<<after.second
+                 <<"; saved file direct="<<direct<<" resident "<<saved.first<<"/"<<saved.second
+                 <<"; buffered save resident "<<saved_off.first<<"/"<<saved_off.second<<'\n';
+        check(after.first>=before.first,"save evicted resident table pages");
+        check(direct!=refuse,"fallback selection");
+        // EINVAL when O_DIRECT is set on the created file (no direct I/O here): exclusive creation
+        // still publishes, buffered, and leaves no temporary behind.
+        for(const auto& e:std::filesystem::directory_iterator(root/"big"))
+            check(e.path().filename()=="session.bin","fallback publication left a temporary");
+        if(page_cache_backed(root)) check(saved.first*100<=saved.second,"unbuffered save left the file in the page cache");
+        else std::cout<<"residency: tmpfs, saved-file residency not meaningful\n";
+        // Either reader restores the same bytes from a fallback-written file.
+        set_env("STRIX_SESSION_DIRECT_IO","1");
+        auto back=strix::read_session_checkpoint(root/"big",compat,heap,blob.bytes);
+        check(!std::memcmp(back.data.get(),blob.data.get(),static_cast<std::size_t>(blob.bytes)),"fallback restore differs");
+        faults.refuse_direct=false;
+        std::filesystem::remove(table); std::filesystem::remove_all(root/"big"); std::filesystem::remove_all(root/"big-off");
+    }
+#endif
+}
 int main() {
     const auto dir=std::filesystem::temp_directory_path()/
         ("strix-session-tests-"+std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
     try {
         session_tail_plan_test();
+        sequential_reader_tests(dir/"reader");
+        old_format_session_tests(dir/"old-format");
+        unbuffered_session_io_tests(dir/"unbuffered",strix::SessionCompatibility{hash("full model content"),hash("exe"),"compiled plan;all env",false});
         const auto aligned=strix::plan_session_suffix(32768,1024,1024,true);
         check(aligned.tiled && aligned.serial_rows==0,"aligned suffix did not tile");
         const auto unaligned=strix::plan_session_suffix(32769,2047,1024,true);
@@ -247,7 +475,8 @@ int main() {
             set(nullptr); check(!one.starts_with(strix::session_numerical_config("cli")),"removed runtime env accepted as prefix");
             set(saved ? saved->c_str() : nullptr);
         }
-        for(const auto* key:{"STRIX_PREFIX_CACHE_INFLIGHT","STRIX_PREFIX_CACHE_DISK","STRIX_PREFIX_CACHE_DURABLE"}) {
+        for(const auto* key:{"STRIX_PREFIX_CACHE_INFLIGHT","STRIX_PREFIX_CACHE_DISK","STRIX_PREFIX_CACHE_DURABLE",
+                "STRIX_SESSION_DIRECT_IO","STRIX_SESSION_READAHEAD","STRIX_SESSION_CHUNKED"}) {
             const char* previous=std::getenv(key);
             const std::optional<std::string> saved=previous?std::optional<std::string>{previous}:std::nullopt;
             const auto set=[&](const char* value) {

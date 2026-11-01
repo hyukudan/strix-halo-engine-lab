@@ -2,6 +2,8 @@
 #include "strix/model_content_hash.hpp"
 #include "../apps/prefix_state_cache_identity.hpp"
 #include "strix/arithmetic_lineage.hpp"
+#include "strix/unbuffered_file.hpp"
+#include "state_file_fixtures.inc"
 
 #include <chrono>
 #include <cstring>
@@ -12,8 +14,10 @@
 #include <string>
 #include <thread>
 #include <atomic>
+#include <array>
 #include <cstdlib>
 #include <new>
+#include <iterator>
 #include <optional>
 #include <set>
 
@@ -127,6 +131,136 @@ bool same_payloads(const strix::PrefixCacheCheckpoint& a, const strix::PrefixCac
 }
 }  // namespace
 
+namespace {
+void prefix_set_env(const char* key, const char* value) {
+#ifdef _WIN32
+    require(_putenv_s(key, value ? value : "") == 0, "environment update");
+#else
+    require((value ? setenv(key, value, 1) : unsetenv(key)) == 0, "environment update");
+#endif
+}
+std::vector<char> prefix_file_bytes(const std::filesystem::path& p) {
+    std::ifstream in(p, std::ios::binary);
+    return {std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>()};
+}
+}  // namespace
+
+// Unbuffered segment/checkpoint files: byte-identical to the buffered writer, restorable by
+// either reader (old files keep working), multi-chunk payloads with unaligned tails.
+void prefix_unbuffered_io_tests(const std::filesystem::path& root) {
+    const char* previous = std::getenv("STRIX_SESSION_DIRECT_IO");
+    const std::optional<std::string> saved = previous ? std::optional<std::string>{previous} : std::nullopt;
+    const auto id = identity_of("unbuffered identity");
+    std::vector<std::uint32_t> tokens;
+    for (std::uint32_t i = 0; i < 2 * T; ++i) tokens.push_back(900 + i);
+    const std::uint64_t big_segment = (9ULL << 20) + 77, big_fixed = (1ULL << 20) + 5;
+    const auto make = [&](strix::PrefixStateCache& cache) {
+        std::vector<std::shared_ptr<const strix::PrefixCacheSegment>> segments;
+        auto parent = id;
+        std::shared_ptr<strix::PrefixCacheCheckpoint> checkpoint;
+        for (std::uint64_t k = 0; k < 2; ++k) {
+            auto segment = std::make_shared<strix::PrefixCacheSegment>();
+            segment->identity = id; segment->parent = parent; segment->block_index = k; segment->block_rows = T;
+            segment->tokens.assign(tokens.begin() + static_cast<std::ptrdiff_t>(k * T), tokens.begin() + static_cast<std::ptrdiff_t>((k + 1) * T));
+            segment->digest = strix::prefix_cache_block_digest(parent, segment->tokens);
+            segment->payload = cache.allocate(big_segment + k);
+            for (std::uint64_t i = 0; i < segment->payload.bytes; ++i) segment->payload.data.get()[i] = pattern(k + 77, i * 3 + (i >> 9));
+            parent = segment->digest; segments.push_back(segment);
+        }
+        checkpoint = std::make_shared<strix::PrefixCacheCheckpoint>();
+        checkpoint->identity = id; checkpoint->digest = parent; checkpoint->block_rows = T; checkpoint->position = 2 * T;
+        checkpoint->segments = segments;
+        checkpoint->fixed = cache.allocate(big_fixed);
+        for (std::uint64_t i = 0; i < big_fixed; ++i) checkpoint->fixed.data.get()[i] = pattern(5, i + (i >> 11));
+        checkpoint->metadata.assign(11, std::byte{0x5a});
+        return checkpoint;
+    };
+    for (const char* writer : {"0", "1"}) {
+        prefix_set_env("STRIX_SESSION_DIRECT_IO", writer);
+        strix::PrefixStateCache cache({1ULL << 30, root / writer, 0}, heap);
+        require(cache.insert(make(cache)), "unbuffered seed insert");
+        cache.flush();
+        require(cache.counters().disk_writes == 1 && cache.counters().disk_write_failures == 0, "unbuffered seed write");
+    }
+    std::size_t files = 0;
+    for (const auto& entry : std::filesystem::directory_iterator(root / "0")) {
+        const auto twin = root / "1" / entry.path().filename();
+        require(std::filesystem::exists(twin) && prefix_file_bytes(entry.path()) == prefix_file_bytes(twin),
+            "unbuffered prefix file differs from the buffered writer");
+        ++files;
+    }
+    require(files == 3, "unbuffered prefix file set");
+    strix::PrefixStateCache reference({1ULL << 30, {}, 0}, heap);
+    const auto expected = make(reference);
+    for (const char* reader : {"0", "1"}) for (const char* writer : {"0", "1"}) {
+        prefix_set_env("STRIX_SESSION_DIRECT_IO", reader);
+        strix::PrefixStateCache cache({1ULL << 30, root / writer, 0}, heap);
+        const auto hit = cache.find_longest(id, tokens, T, tokens.size());
+        require(hit && hit->position == 2 * T && same_payloads(*hit, *expected), "unbuffered prefix restore differs");
+        require(cache.counters().disk_hits == 1 && cache.counters().disk_read_failures == 0, "unbuffered prefix disk hit");
+    }
+    prefix_set_env("STRIX_SESSION_DIRECT_IO", saved ? saved->c_str() : nullptr);
+    std::filesystem::remove_all(root);
+}
+
+// Prefix files written before unbuffered I/O restore in both read modes, and today's writer
+// (either mode) produces exactly those files.
+void old_format_prefix_tests(const std::filesystem::path& root) {
+    const char* previous = std::getenv("STRIX_SESSION_DIRECT_IO");
+    const std::optional<std::string> saved = previous ? std::optional<std::string>{previous} : std::nullopt;
+    const auto id = identity_of("fixture prefix identity");
+    const std::uint32_t rows = 4;
+    const std::vector<std::uint32_t> toks{101, 102, 103, 104, 201, 202, 203, 204};
+    const auto make = [&](strix::PrefixStateCache& cache) {
+        auto checkpoint = std::make_shared<strix::PrefixCacheCheckpoint>();
+        checkpoint->identity = id; checkpoint->block_rows = rows; checkpoint->position = 8;
+        auto parent = id;
+        for (std::uint64_t k = 0; k < 2; ++k) {
+            auto segment = std::make_shared<strix::PrefixCacheSegment>();
+            segment->identity = id; segment->parent = parent; segment->block_index = k; segment->block_rows = rows;
+            segment->tokens.assign(toks.begin() + static_cast<std::ptrdiff_t>(k * rows), toks.begin() + static_cast<std::ptrdiff_t>((k + 1) * rows));
+            segment->digest = strix::prefix_cache_block_digest(parent, segment->tokens);
+            segment->payload = cache.allocate(700 + k);
+            for (std::uint64_t i = 0; i < segment->payload.bytes; ++i) segment->payload.data.get()[i] = static_cast<std::byte>((i * 5 + k * 3) & 255);
+            parent = segment->digest; checkpoint->segments.push_back(segment);
+        }
+        checkpoint->digest = parent;
+        checkpoint->fixed = cache.allocate(259);
+        for (std::uint64_t i = 0; i < 259; ++i) checkpoint->fixed.data.get()[i] = static_cast<std::byte>((i * 3 + 9) & 255);
+        checkpoint->metadata.assign(6, std::byte{0x42});
+        return checkpoint;
+    };
+    const std::span<const unsigned char> files[] = {old_format_prefix_file0, old_format_prefix_file1, old_format_prefix_file2};
+    std::filesystem::create_directories(root / "old");
+    for (std::size_t i = 0; i < 3; ++i) {
+        std::ofstream out(root / "old" / old_format_prefix_names[i], std::ios::binary);
+        out.write(reinterpret_cast<const char*>(files[i].data()), static_cast<std::streamsize>(files[i].size()));
+    }
+    strix::PrefixStateCache reference({1ULL << 20, {}, 0}, heap);
+    const auto expected = make(reference);
+    for (const char* mode : {"0", "1"}) {
+        prefix_set_env("STRIX_SESSION_DIRECT_IO", mode);
+        {
+            strix::PrefixStateCache cache({1ULL << 20, root / "old", 0}, heap);
+            const auto hit = cache.find_longest(id, toks, rows, toks.size(), false);
+            require(hit && hit->position == 8 && same_payloads(*hit, *expected), "old-format prefix restore differs");
+        }
+        const auto fresh = root / (std::string("new") + mode);
+        {
+            strix::PrefixStateCache cache({1ULL << 20, fresh, 0}, heap);
+            require(cache.insert(make(cache)), "old-format rewrite insert");
+            cache.flush();
+        }
+        for (std::size_t i = 0; i < 3; ++i) {
+            const auto bytes = prefix_file_bytes(fresh / old_format_prefix_names[i]);
+            require(bytes.size() == files[i].size() && !std::memcmp(bytes.data(), files[i].data(), bytes.size()),
+                "prefix writer no longer produces the old-format files");
+        }
+    }
+    prefix_set_env("STRIX_SESSION_DIRECT_IO", saved ? saved->c_str() : nullptr);
+    std::filesystem::remove_all(root);
+}
+
 void prefix_dma_tests();
 
 int main(int argc, char** argv) {
@@ -222,6 +356,8 @@ int main(int argc, char** argv) {
         require(digests.size() == 4, "digest count");
         require(digests[1] == strix::prefix_cache_block_digest(digests[0], std::span(tokens).subspan(4, 4)), "digest chain");
         require(strix::prefix_cache_block_digests(other, tokens, T, 100)[0] != digests[0], "identity changes digests");
+        prefix_unbuffered_io_tests(dir / "unbuffered");
+        old_format_prefix_tests(dir / "old-format");
 
         {
             strix::PrefixStateCache cache({1ULL << 20, dir, 0}, heap);
