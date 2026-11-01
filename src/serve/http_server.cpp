@@ -170,10 +170,10 @@ struct HttpServer::Impl {
                 if (buffer.size() > config.max_header_bytes) {
                     connection.keep_alive = false;
                     connection.send(431, "application/json", R"({"error":{"message":"request header too large","type":"invalid_request_error"}})");
-                    ::close(fd); return;
+                    return;
                 }
                 const auto n = ::recv(fd, chunk, sizeof(chunk), 0);
-                if (n <= 0) { ::close(fd); return; }
+                if (n <= 0) { return; }
                 buffer.append(chunk, static_cast<std::size_t>(n));
             }
             HttpRequest request;
@@ -182,7 +182,7 @@ struct HttpServer::Impl {
             const auto line_end = head.find("\r\n");
             const auto first = head.substr(0, line_end);
             const auto s1 = first.find(' '), s2 = first.rfind(' ');
-            if (s1 == std::string_view::npos || s2 == s1) { ::close(fd); return; }
+            if (s1 == std::string_view::npos || s2 == s1) { return; }
             request.method = std::string(first.substr(0, s1));
             request.target = std::string(first.substr(s1 + 1U, s2 - s1 - 1U));
             request.version = std::string(first.substr(s2 + 1U));
@@ -201,21 +201,21 @@ struct HttpServer::Impl {
             if (lower(request.header("transfer-encoding")).find("chunked") != std::string::npos) {
                 connection.keep_alive = false;
                 connection.send(501, "application/json", R"({"error":{"message":"chunked request bodies are not supported","type":"invalid_request_error"}})");
-                ::close(fd); return;
+                return;
             }
             const auto length_text = request.header("content-length");
             std::uint64_t length = 0;
             if (!length_text.empty()) {
-                try { length = std::stoull(length_text); } catch (...) { ::close(fd); return; }
+                try { length = std::stoull(length_text); } catch (...) { return; }
             }
             if (length > config.max_body_bytes) {
                 connection.keep_alive = false;
                 connection.send(413, "application/json", R"({"error":{"message":"request body too large","type":"invalid_request_error"}})");
-                ::close(fd); return;
+                return;
             }
             while (buffer.size() < length) {
                 const auto n = ::recv(fd, chunk, sizeof(chunk), 0);
-                if (n <= 0) { ::close(fd); return; }
+                if (n <= 0) { return; }
                 buffer.append(chunk, static_cast<std::size_t>(n));
             }
             request.body = buffer.substr(0, static_cast<std::size_t>(length));
@@ -227,18 +227,25 @@ struct HttpServer::Impl {
             else {
                 try { handler(request, connection); }
                 catch (const std::exception& error) {
+                    // A failed handler may have left a response half written (e.g. an open chunked stream): never
+                    // reuse this connection for another request.
+                    connection.keep_alive = false;
                     if (!connection.responded()) {
                         std::string body = R"({"error":{"message":")";
                         for (const char c : std::string(error.what())) { if (c == '"' || c == '\\') body.push_back('\\'); body.push_back(c >= 0x20 ? c : ' '); }
                         body += R"(","type":"server_error"}})";
                         connection.send(500, "application/json", body);
                     }
+                } catch (...) {
+                    // Any thrown type is a failed request, never a dead server.
+                    connection.keep_alive = false;
+                    if (!connection.responded())
+                        connection.send(500, "application/json", R"({"error":{"message":"internal error","type":"server_error"}})");
                 }
                 if (!connection.responded()) connection.send(500, "application/json", R"({"error":{"message":"no response","type":"server_error"}})");
             }
             if (!connection.keep_alive || connection.client_gone()) break;
         }
-        ::close(fd);
     }
 };
 
@@ -299,14 +306,27 @@ void HttpServer::serve() {
             continue;
         }
         ++impl.connections;
-        std::thread([shared = impl_, fd, peer_name = std::string(host)] {
-            shared->handle(fd, peer_name);
+        const auto retire = [](Impl& shared) {
             {
-                const std::lock_guard lock(shared->mutex);
-                --shared->connections;
+                const std::lock_guard lock(shared.mutex);
+                --shared.connections;
             }
-            shared->idle.notify_all();
-        }).detach();
+            shared.idle.notify_all();
+        };
+        try {
+            std::thread([shared = impl_, fd, peer_name = std::string(host), retire] {
+                // A failure inside one connection ends that connection only; handle() has unregistered fd on exit.
+                try { shared->handle(fd, peer_name); } catch (...) {}
+                ::close(fd);
+                retire(*shared);
+            }).detach();
+        } catch (...) {
+            // No thread for this connection (e.g. EAGAIN): refuse it like a full server and keep serving.
+            const char* busy = "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+            (void)::send(fd, busy, std::strlen(busy), MSG_NOSIGNAL);
+            ::close(fd);
+            retire(impl);
+        }
     }
 }
 
