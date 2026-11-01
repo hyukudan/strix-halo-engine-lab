@@ -1238,8 +1238,16 @@ desactivada, 20.34 s con T16384 desactivado y 20.07 s con la carga anticipada de
 ganancias medidas; la carga anticipada es neutra dentro del ruido. Estas ganancias no son sumables.
 Con 131,072 y 262,143 tokens de texto real, la configuración predeterminada admite T16384 automático y, con
 `STRIX_QPF2K_T16K=0`, admite T8192 como antes, sin alternativa. Las puertas abiertas y no bloqueantes
-son las siete cargas útiles de estado, T16384 a 262K y la alternativa por presión, y los bytes recopilados de PLE con preparación
-frente a sin preparación; véase la [CI local](docs/engine/prefill/hc-output-wmma-qualification.md#bundle-local-ci-evidence).
+son las siete cargas útiles de estado y T16384 a 262K con la alternativa por presión; véase la
+[CI local](docs/engine/prefill/hc-output-wmma-qualification.md#bundle-local-ci-evidence).
+La corrección de la aceptación del staged-gather se midió con un mismo binario, con preparación frente a la regla de
+aceptación anterior: logits completos iguales con 4K y 32K, tokens iguales con 4K, 32K y 262K; prefill 4K -1.1 %, 32K
+-1.9 % (-0.40 s) y 262K (YaRN factor 2, bloques T8192) 198.19 -> 185.49 s (-6.4 %, media de dos pares), con el tiempo
+inactivo de la GPU en ese prompt reducido de 10.2 s a 1.56 s.
+En conjunto, con un mismo binario en la ruta CLI predeterminada (ejecuciones alternas), los valores predeterminados
+anteriores frente a todos sus interruptores de desactivación: 4K 2.548 -> 2.397 s (-5.9 %), 32K 20.57 -> 19.05 s (-7.4 %;
+T16384 frente a T8192). La rama desactivada reproduce byte a byte los logits anteriores y los tokens generados son
+iguales en todas las ramas.
 
 La máscara READY contiene `hc_output_wmma`. La candidata implementada `index_proj_wmma` queda fuera de READY y está desactivada por defecto a la espera de cualificación. La identidad de prefill predeterminada sigue siendo
 `fp16-v1+hcout16` (`prefill_identity_hash` ee2cd64684149069); `--prefill-exact-fp16` da la identidad
@@ -1304,7 +1312,7 @@ Listas completas de elementos, condiciones previas, avisos y pruebas: [catálogo
 
 | Motor / optimización | Qué | Predeterminado | Ganancia | ¿Exacto? | Interruptor de desactivación |
 |---|---|---|---|---|---|
-| Qwen: aceptación del staged-gather de PLE | Acepta la cola ordenada tras el consumo correcto de la fila 0 | Corrección incondicional | Sin afirmación de velocidad medida | Superan los fixtures de lanzador/staged-gather de la CI local; puerta de bytes recopilados abierta | Sin interruptor |
+| Qwen: aceptación del staged-gather de PLE | Acepta la cola ordenada tras el consumo correcto de la fila 0 | Corrección incondicional | Prefill 4K -1.1 %, 32K -1.9 %, 262K (YaRN) 198.19 -> 185.49 s (-6.4 %, dos pares), con preparación frente a la regla anterior, mismo binario | Logits completos iguales con 4K/32K; tokens iguales con 4K/32K/262K | Sin interruptor |
 | Qwen: imágenes compactas de salida QSA | Almacenamiento BF16 exacto y ampliación a FP32 | Activado para propietarios elegibles de T completo | Calculado -96 MiB/propietario T8192 | Fixtures de la CI local y logits de la última fila a 32K bit a bit; tiempos neutros dentro del ruido | `STRIX_QPF2K_COMPACT_IMAGES=0` |
 | Qwen: diseño HC de banda baja | low_t por bandas, omite escrituras low16 no usadas | Activado (modo 3), ruta de salida FP32 protegida | Sin afirmación de tiempos (inactivo en la ruta predeterminada) | Exacto, comprobado bit a bit en la CI local (132/132 casos y logits de la última fila a 32K) | `STRIX_QPF2K_HC_LOWBAND=0` |
 | Qwen: prefill por tiles | Tile/contexto automáticos, unión de expertos, filas del router | Auto | 32K: 22.03 s, 1,487 tok/s | Referencia FP16 propia; difiere del A8 denso | `STRIX_PREFILL_F16=0` |
