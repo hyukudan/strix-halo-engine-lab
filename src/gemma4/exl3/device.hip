@@ -1218,10 +1218,14 @@ __global__ __launch_bounds__(256) void rows_lane_kernel(LinearView w, const _Flo
 }
 // Eight waves = eight tile columns (128 outputs) of one split x R rows. Chunks
 // of the split are staged 32 at a time as [row][chunk][pair].
-template <unsigned K, unsigned R>
+// Paired: each staged chunk keeps lane a's low/high activation words adjacent
+// (one 64-bit LDS read per row with an immediate row offset) and the next
+// chunk's raw trellis words are fetched before the current chunk's FMAs. Same
+// values in the same chains and order as Paired = false.
+template <unsigned K, unsigned R, bool Paired = false>
 __global__ __launch_bounds__(256) void rows_coop_kernel(LinearView w, const _Float16* x, unsigned rows, float* out,
                                                         float* partial, unsigned splits, unsigned* failure) {
-    __shared__ std::uint32_t staged[R * 32 * 8];
+    __shared__ alignas(8) std::uint32_t staged[R * 32 * 8];
     const unsigned wave = threadIdx.x / 32, lane = threadIdx.x % 32, row0 = blockIdx.x * R;
     const unsigned tile = blockIdx.y * 8 + wave, split = blockIdx.z, tiles = w.outputs / 16;
     const unsigned a = lane & 3U, column = lane >> 2U, chunks = w.inputs / 16, span = chunks / splits;
@@ -1237,10 +1241,40 @@ __global__ __launch_bounds__(256) void rows_coop_kernel(LinearView w, const _Flo
         for (unsigned i = 0; i < R * 32 * 8 / 256; ++i) {
             const unsigned j = threadIdx.x + 256 * i, r = j / 256, kk = (j / 8) % 32, p = j % 8;
             if (kk < count)
-                staged[(r * 32 + kk) * 8 + p] = words[(std::size_t(min(row0 + r, rows - 1)) * w.inputs + (k0 + kk) * 16) / 2 + p];
+                staged[(r * 32 + kk) * 8 + (Paired ? 2 * (p & 3U) + (p >> 2U) : p)] =
+                    words[(std::size_t(min(row0 + r, rows - 1)) * w.inputs + (k0 + kk) * 16) / 2 + p];
         }
         __syncthreads();
         if (!active_tile) continue;
+        if constexpr (Paired) {
+            using Pair = std::uint32_t __attribute__((ext_vector_type(2)));
+            CoopWords<K> next;
+            next.fetch(core + (std::size_t(k0) * tiles + tile) * (8 * K), lane);
+            for (unsigned kk = 0; kk < count; ++kk) {
+                CoopLane<K> t;
+                t.align(next.a, next.b, next.c, lane);
+                if (kk + 1 < count) next.fetch(core + (std::size_t(k0 + kk + 1) * tiles + tile) * (8 * K), lane);
+                const float c0 = float(codebook_half(t.template state<0>())), c1 = float(codebook_half(t.template state<1>()));
+                const float c2 = float(codebook_half(t.template state<2>())), c3 = float(codebook_half(t.template state<3>()));
+                const float c4 = float(codebook_half(t.template state<4>())), c5 = float(codebook_half(t.template state<5>()));
+                const float c6 = float(codebook_half(t.template state<6>())), c7 = float(codebook_half(t.template state<7>()));
+                const auto* chunk = reinterpret_cast<const Pair*>(staged + kk * 8 + 2 * a);
+#pragma unroll
+                for (unsigned r = 0; r < R; ++r) {
+                    const Pair pair = chunk[r * 32 * 8 / 2];
+                    const std::uint32_t low = pair.x, high = pair.y;
+                    const float x0 = float(__builtin_bit_cast(_Float16, std::uint16_t(low))),
+                                x1 = float(__builtin_bit_cast(_Float16, std::uint16_t(low >> 16U)));
+                    const float x8 = float(__builtin_bit_cast(_Float16, std::uint16_t(high))),
+                                x9 = float(__builtin_bit_cast(_Float16, std::uint16_t(high >> 16U)));
+                    acc[0][r] = __builtin_fmaf(c0, x0, acc[0][r]); acc[0][r] = __builtin_fmaf(c1, x1, acc[0][r]);
+                    acc[0][r] = __builtin_fmaf(c2, x8, acc[0][r]); acc[0][r] = __builtin_fmaf(c3, x9, acc[0][r]);
+                    acc[1][r] = __builtin_fmaf(c4, x0, acc[1][r]); acc[1][r] = __builtin_fmaf(c5, x1, acc[1][r]);
+                    acc[1][r] = __builtin_fmaf(c6, x8, acc[1][r]); acc[1][r] = __builtin_fmaf(c7, x9, acc[1][r]);
+                }
+            }
+            continue;
+        }
         for (unsigned kk = 0; kk < count; ++kk) {
             CoopLane<K> t;
             t.load(core + (std::size_t(k0 + kk) * tiles + tile) * (8 * K), lane);
@@ -1335,12 +1369,20 @@ std::size_t partial_bytes(LinearView w, unsigned rows) {
     const unsigned splits = v2_splits(w.inputs, w.outputs);
     return splits > 1 ? std::size_t(splits) * rows * w.outputs * sizeof(float) : 0;
 }
+// Paired LDS layout + next-chunk raw codec prefetch in the many-row core (same
+// bytes); STRIX_G4_EXL3_ROWS_PAIRED=0 runs the previous schedule.
+bool rows_paired() {
+    static const bool enabled = env_on("STRIX_G4_EXL3_ROWS_PAIRED");
+    return enabled;
+}
 // v2/v3 many-row core: raw values into out (one split) or split partials.
 void rows_core(LinearView w, const _Float16* transformed, unsigned rows, float* out, float* partial, unsigned splits,
                unsigned* failure, hipStream_t q) {
     const dim3 grid((rows + rows_v2 - 1) / rows_v2, (w.outputs / 16 + 7) / 8, splits);
     switch (bits(w)) {
-#define G4_EXL3_RC(K) case K: hipLaunchKernelGGL((rows_coop_kernel<K, rows_v2>), grid, dim3(256), 0, q, w, transformed, rows, out, partial, splits, failure); break
+#define G4_EXL3_RC(K) case K: \
+        if (rows_paired()) hipLaunchKernelGGL((rows_coop_kernel<K, rows_v2, true>), grid, dim3(256), 0, q, w, transformed, rows, out, partial, splits, failure); \
+        else hipLaunchKernelGGL((rows_coop_kernel<K, rows_v2>), grid, dim3(256), 0, q, w, transformed, rows, out, partial, splits, failure); break
         G4_EXL3_RC(4); G4_EXL3_RC(5); G4_EXL3_RC(6); G4_EXL3_RC(8);
 #undef G4_EXL3_RC
     }
