@@ -5566,7 +5566,14 @@ unsigned qpf2k_qsa_mask() {
         const char* v = std::getenv("STRIX_QPF2K_QSA");
         if (!v || v[0] != '1') return 0U;
         const char* m = std::getenv("STRIX_QPF2K_QSA_MASK");
-        return m ? static_cast<unsigned>(std::strtoul(m, nullptr, 0)) : 0x3U; // default: the qualified parts (scorer, selection)
+        unsigned bits = m ? static_cast<unsigned>(std::strtoul(m, nullptr, 0)) : 0x3U; // default: the qualified parts (scorer, selection)
+        // Bit 5 (global FP16 KV shadow attend) is declined: at 32K its logits differed from the default attend and
+        // between runs, so it is not an exact variant. The default attend dispatch runs instead.
+        if (bits & 32U) {
+            std::fprintf(stderr, "qpf2k qsa mask bit 5 (FP16 KV shadow attend) declined: not byte-exact; default attend runs\n");
+            bits &= ~32U;
+        }
+        return bits;
     }();
     return qpf2k::suppressed(qpf2k::Item::qsa) ? 0U : mask;
 }
@@ -5830,7 +5837,7 @@ void qsa_fast_batch_flush(hipStream_t stream) {
     else
         hipLaunchKernelGGL(HIP_KERNEL_NAME(qsa_fast::union_multi_kernel<64U, TR, false>), dim3(n * (64U / TR)), dim3(256), 0, stream,
             slot.views, b.union_at);
-    // STRIX_QPF2K_QSA bit 5: the batch's KV prefix (tokens [0, max visible)) converted once to FP16 with the loaders'
+    // STRIX_QPF2K_QSA bit 5 (declined by qpf2k_qsa_mask, so not reached; kept for investigation): the batch's KV prefix (tokens [0, max visible)) converted once to FP16 with the loaders'
     // bf16x2_to_f16x2 (same bits), then the attend without per-chunk conversion (qsa_fast::attend_shadow_multi_kernel).
     // Memory: one layer's prefix, 4 x kv_heads x 256 bytes per token (2 KiB with 2 KV heads: 64 MiB at 32K, 256 MiB at
     // 128K), stream-ordered (hipMallocAsync before the conversion, hipFreeAsync after the attend): it lives only while
