@@ -3241,7 +3241,8 @@ std::unique_ptr<strix::dist::Transport> open_transport(const std::string& spec, 
 // --prefill-rows auto (the pair default): the largest piece of 16384 / 8192 / 4096 rows (at most the context) that both
 // ranks admit after the batch forward's weights (sched::auto_prefill_rows: the piece's scratch, the prefill's own weights
 // from the tensor inventory, the drafter's peak on a drafting rank and a margin, against min(device free, MemAvailable)),
-// else 2048; both ranks take the smaller choice. Emulation (both ranks in one process, one device) keeps 2048. OFF: an
+// else 2048 when that fits; both ranks take the smaller choice, and when either rank fits no piece both refuse before
+// READY with the numbers (an explicit --prefill-rows N skips the check). Emulation (both ranks in one process, one device) keeps 2048. OFF: an
 // explicit --prefill-rows N. Pair, context 49152, fresh prompts: 16384 vs 2048 rows, 8,399 tokens 14.57 -> 10.34 s,
 // 32,499 tokens 60.8 -> 39.1 s, the same logits and tokens.
 std::uint32_t auto_prefill_rows(const Args& a, BatchForward& fwd, strix::dist::Communicator& comm, std::uint32_t rank) {
@@ -3265,6 +3266,11 @@ std::uint32_t auto_prefill_rows(const Args& a, BatchForward& fwd, strix::dist::C
                  "drafter %.1f, margin %.1f GiB)%s\n", rank, agreed, rows, static_cast<double>(room.device_free) / g,
                  static_cast<double>(room.mem_available) / g, static_cast<double>(room.own_weights) / g, static_cast<double>(room.drafter) / g,
                  static_cast<double>(room.margin) / g, a.transport == "emulate" ? " [emulate: fixed]" : "");
+    if (agreed == 0U)  // both ranks see the same min: both refuse here, before the drafter loads and before READY
+        throw std::runtime_error("--prefill-rows auto: no prefill piece fits on " + std::string(rows == 0U ? "this rank" : "the peer rank") +
+                                 " (even " + std::to_string(std::max<std::uint32_t>(32U, std::min(sc::kAutoPrefillFallback, a.context / 8U * 8U))) +
+                                 " rows need more than min(device free, MemAvailable) less the reserved weights, drafter and margin above);"
+                                 " free memory, lower --context, or pass an explicit --prefill-rows N");
     return agreed;
 }
 

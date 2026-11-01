@@ -153,14 +153,16 @@ struct AutoPrefillRoom {
 inline constexpr std::uint32_t kAutoPrefillRows[] = {16384U, 8192U, 4096U};
 inline constexpr std::uint32_t kAutoPrefillFallback = 2048U;
 // The largest candidate (at most the context) whose scratch fits in min(device free, MemAvailable) less the prefill's
-// own weights, the drafter's peak and the margin; else min(2048, the context) (at least 32 rows, a multiple of 8).
+// own weights, the drafter's peak and the margin; else min(2048, the context) (at least 32 rows, a multiple of 8) when that
+// fits too; else 0: no piece size fits (the serve refuses before READY instead of overcommitting into the margin).
 [[nodiscard]] inline std::uint32_t auto_prefill_rows(std::uint32_t context, const AutoPrefillRoom& r) noexcept {
     std::uint64_t room = r.mem_available != 0U ? std::min(r.device_free, r.mem_available) : r.device_free;
     const std::uint64_t reserve = r.own_weights + r.drafter + r.margin;
     room = room > reserve ? room - reserve : 0U;
     for (const auto rows : kAutoPrefillRows)
         if (rows <= context && prefill_piece_bytes(rows, context) <= room) return rows;
-    return std::max<std::uint32_t>(32U, std::min(kAutoPrefillFallback, context / 8U * 8U));
+    const std::uint32_t fallback = std::max<std::uint32_t>(32U, std::min(kAutoPrefillFallback, context / 8U * 8U));
+    return prefill_piece_bytes(fallback, context) <= room ? fallback : 0U;
 }
 // The drafter's peak on a drafting rank, from its file: the device copy (weights + scratch + contexts + staging) while
 // the host copy of the loaded file is still alive (UMA: the same memory). Measured: a 7.42 GiB draft file took 15.1 GiB.
