@@ -240,6 +240,12 @@ void product_table() {
     r = pr::resolve(pr::Name::quality, pr::App::engine, in({{"exl3_route", "/m4"}}));
     check(status(r, "exl3_identity") == pr::Status::builtin && value(r, "exl3_identity") == "auto" &&
           r.qualification() == "qualified", "QUALITY auto-selects the EXL3 identity per pack and session");
+    // The EXL3 panel prefill is pending in QUALITY: exact runs, the receipt names the target identity.
+    check(status(r, "exl3_prefill") == pr::Status::pending && value(r, "exl3_prefill") == "exact" &&
+          r.find("exl3_prefill")->target == "g4-exl3-wmma-pf-v1" && !r.active("exl3_prefill"), "QUALITY EXL3 prefill pending");
+    check(!pr::resolve(pr::Name::standard, pr::App::engine, in()).find("exl3_prefill"), "DEFAULT leaves the EXL3 prefill alone");
+    r = pr::resolve(pr::Name::quality, pr::App::engine, in({{"exl3_route", "/m4"}}, {}, lookup({{"STRIX_G4_EXL3_PREFILL", "wmma"}})));
+    check(status(r, "exl3_prefill") == pr::Status::explicit_env && value(r, "exl3_prefill") == "wmma", "EXL3 panel prefill explicit");
 }
 
 // Invariant: without --allow-pending no pending or unqualified implementation ever executes. Every profile x app

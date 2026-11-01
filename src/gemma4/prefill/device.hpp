@@ -35,6 +35,23 @@ void linear(LinearView weights, const float* x, unsigned rows, float* out, void*
 [[nodiscard]] bool gelu_pair_supported(const PreparedLinear& gate, const PreparedLinear& up);
 void gelu_pair(const PreparedLinear& gate, const PreparedLinear& up, const float* x, unsigned rows, void* scratch,
                void* product, std::uint32_t* failure, std::uint32_t* maximum, gpu::Queue queue = nullptr);
+// EXL3 packs on prepared panels (g4-exl3-wmma-pf-v1): the pack's input
+// transform writes the [K16][row][16] input panels, the panel GEMMs above run
+// unchanged, then the pack's output transform. Every output keeps one
+// increasing K16 WMMA chain on the same FP16 operands, so the bytes equal the
+// pack's own 64x64 WMMA kernel; STRIX_G4_EXL3_PREFILL_GEMM=0 restores it.
+[[nodiscard]] bool exl3_gemm_enabled();
+// EXL3 FFN on the panel route: gate and up GEMMs keep raw core values in
+// gate_core/up_core (rows x outputs floats), then one launch applies their
+// output transforms, gelu_tanh(gate) * up and down's input transform into
+// product (down's FP16 input panels; call linear(down, ..., converted = true)
+// with product as scratch). Bytes equal linear(gate), linear(up),
+// gpu::gelu_product and linear(down); maximum[0..2] as gelu_pair. scratch holds
+// rows * inputs FP16 values. STRIX_G4_PREFILL_FUSE_FFN=0 keeps the separate steps.
+[[nodiscard]] bool exl3_gelu_pair_supported(const PreparedLinear& gate, const PreparedLinear& up, LinearView down);
+void exl3_gelu_pair(const PreparedLinear& gate, const PreparedLinear& up, LinearView down, const float* x, unsigned rows,
+                    void* scratch, float* gate_core, float* up_core, void* product, std::uint32_t* failure,
+                    std::uint32_t* maximum, gpu::Queue queue = nullptr);
 // Opt-in attention sub-profile. Descriptors use B's immutable snapshot
 // and unpublished overlay contract. Queries are consecutive absolute positions
 // in one stream, with identical cache/overlay descriptors except position.
@@ -90,7 +107,7 @@ struct Range {
     float input_maximum = 0.0F;
 };
 struct Stats {
-    double linear_ms = 0.0, attention_ms = 0.0; // cumulative, only when profiling
+    double linear_ms = 0.0, attention_ms = 0.0, other_ms = 0.0; // cumulative, only when profiling
     struct Kernel {
         double ms = 0.0, conversion_ms = 0.0, matrix_ms = 0.0, flops = 0.0, bytes = 0.0;
         std::uint64_t calls = 0;

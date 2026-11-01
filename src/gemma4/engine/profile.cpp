@@ -48,6 +48,13 @@ constexpr Lever table[] = {
      .kind = Kind::bit_changing, .apps = engine, .target = "g4-wmma-pf-v2",
      .source = "pending: g4-wmma-pf-v2 qualification; the engine runs prefill-exact as many-row chunks "
                "(STRIX_G4_PREFILL_EXACT_MANYROW=0 = eight-row passes) until then"},
+    // EXL3 packs: the pack's held-out bands were measured on g4-exl3-wmma-pf-v1 prompts (panel WMMA linears,
+    // canonical attention); QUALITY targets that identity once its receipt lands, exact runs until then.
+    {.name = "exl3_prefill", .env = "STRIX_G4_EXL3_PREFILL", .value = {"", "", "wmma"}, .builtin = "exact",
+     .required = {false, false, false}, .ready = {false, false, false}, .runnable = {false, false, true},
+     .kind = Kind::bit_changing, .apps = engine, .target = "g4-exl3-wmma-pf-v1",
+     .source = "pending: g4-exl3-wmma-pf-v1 qualification receipt (EXL3 FP16 panels on the WMMA prefill GEMMs); "
+               "exact runs the many-row EXL3 core until then"},
     // The prefill bench (DevicePrefill) implements only g4-wmma-pf-v1 linears: its builtin is unqualified, so the
     // bench refuses every profile without --allow-pending (measure exact prefill through the decode app's prompt).
     {.name = "prefill_linears", .env = "STRIX_G4_PREFILL", .value = {"exact", "wmma", "exact"}, .builtin = "wmma",

@@ -6,6 +6,7 @@
 #include <cmath>
 #include <cstring>
 #include <iomanip>
+#include <algorithm>
 #include <iostream>
 #include <random>
 #include <string_view>
@@ -76,6 +77,46 @@ void compare(const Pack& w, unsigned rows, unsigned seed) {
         }
     ++cases;
 }
+// Many-row FFN (fused middle stage) against eight-row gate/up linears,
+// gpu::gelu_product and eight-row down linears: output bytes and failure bits.
+std::size_t ffn_cases = 0;
+void compare_ffn(const Pack& gate, const Pack& up, const Pack& down, unsigned rows, unsigned seed) {
+    const unsigned hidden = gate.view.inputs, inter = gate.view.outputs;
+    const auto x = inputs(std::size_t(rows) * hidden, seed);
+    gpu::Buffer dx(x.size() * 4); dx.upload(x.data(), x.size() * 4);
+    const auto count = std::size_t(rows) * hidden;
+    gpu::Buffer g(std::size_t(rows) * inter * 4), u(std::size_t(rows) * inter * 4), reference(count * 4), candidate(count * 4);
+    gpu::Buffer failure(8), scratch(std::max(ex::device_scratch_bytes, ex::ffn_rows_scratch_bytes(gate.view, up.view, down.view, rows)));
+    const std::vector<float> poison(count, g4::bit_cast<float>(0x7fc0deadU));
+    reference.upload(poison.data(), count * 4); candidate.upload(poison.data(), count * 4);
+    failure.zero();
+    auto* f = failure.as<unsigned>();
+    for (unsigned r = 0; r < rows; r += 8) {
+        const auto n = std::min(8U, rows - r);
+        ex::device_linear(gate.view, dx.as<float>() + std::size_t(r) * hidden, n, g.as<float>() + std::size_t(r) * inter, scratch.data(), f);
+        ex::device_linear(up.view, dx.as<float>() + std::size_t(r) * hidden, n, u.as<float>() + std::size_t(r) * inter, scratch.data(), f);
+        gpu::gelu_product(g.as<float>() + std::size_t(r) * inter, u.as<float>() + std::size_t(r) * inter, n * inter);
+        ex::device_linear(down.view, g.as<float>() + std::size_t(r) * inter, n, reference.as<float>() + std::size_t(r) * hidden,
+                          scratch.data(), f);
+    }
+    if (!ex::device_ffn_rows(gate.view, up.view, down.view, dx.as<float>(), rows, g.as<float>(), u.as<float>(), candidate.as<float>(),
+                             scratch.data(), scratch.size(), f + 1)) {
+        if (rows > 8 && ex::v2_active()) throw std::runtime_error("many-row FFN declined");
+        return;
+    }
+    gpu::synchronize();
+    unsigned flags[2] = {}; failure.download(flags, 8);
+    if (flags[0] != flags[1]) throw std::runtime_error("many-row FFN failure bits differ");
+    std::vector<float> a(count), b(count);
+    reference.download(a.data(), count * 4); candidate.download(b.data(), count * 4);
+    for (std::size_t i = 0; i < count; ++i)
+        if (std::memcmp(&a[i], &b[i], 4)) {
+            std::cerr << "ffn mismatch " << ex::active_identity() << " hidden " << hidden << " inter " << inter << " rows " << rows
+                      << " at " << i << ": " << std::hexfloat << a[i] << " vs " << b[i] << '\n';
+            throw std::runtime_error("EXL3 many-row FFN byte mismatch");
+        }
+    ++ffn_cases;
+}
 void tests() {
     struct Shape { unsigned in, out; };
     // Family shapes (q, k/v, o, gate/up, down, PLE) and split edge cases.
@@ -94,6 +135,42 @@ void tests() {
             for (const auto rows : few) compare(w, rows, seed * 131 + rows);
         }
         std::cout << "{\"identity\":\"" << ex::active_identity() << "\",\"k\":" << k << ",\"cases\":" << cases << "}\n";
+    }
+    // FFN: family shape and small split edge cases (gate/up 4-bit, mixed widths).
+    struct Ffn { unsigned hidden, inter, k; };
+    const Ffn ffns[] = {{256, 512, 4}, {512, 256, 5}, {2560, 1024, 4}, {1024, 2560, 6}, {2560, 10240, 4}};
+    for (const auto& f : ffns) {
+        const Pack gate(f.hidden, f.inter, f.k, seed++), up(f.hidden, f.inter, f.k, seed++), down(f.inter, f.hidden, f.k, seed++);
+        for (const auto rows : few) compare_ffn(gate, up, down, rows, seed * 131 + rows);
+        if (f.hidden < 2560) for (const auto rows : {16U, 17U, 64U, 65U}) compare_ffn(gate, up, down, rows, seed * 137 + rows);
+    }
+    std::cout << "{\"identity\":\"" << ex::active_identity() << "\",\"ffn_cases\":" << ffn_cases << "}\n";
+}
+void bench_ffn() {
+    const unsigned rows = 512, hidden = 2560, inter = 10240;
+    const Pack gate(hidden, inter, 4, 7), up(hidden, inter, 4, 8), down(inter, hidden, 4, 9);
+    const auto x = inputs(std::size_t(rows) * hidden, 3);
+    gpu::Buffer dx(x.size() * 4), g(std::size_t(rows) * inter * 4), u(std::size_t(rows) * inter * 4), out(std::size_t(rows) * hidden * 4), failure(4);
+    const auto bytes = std::max({ex::ffn_rows_scratch_bytes(gate.view, up.view, down.view, rows), ex::rows_scratch_bytes(gate.view, rows),
+                                 ex::rows_scratch_bytes(down.view, rows)});
+    gpu::Buffer scratch(bytes);
+    dx.upload(x.data(), x.size() * 4);
+    for (const bool fused : {false, true}) {
+        const auto run = [&] {
+            auto* f = failure.as<unsigned>();
+            if (fused) { (void)ex::device_ffn_rows(gate.view, up.view, down.view, dx.as<float>(), rows, g.as<float>(), u.as<float>(), out.as<float>(), scratch.data(), scratch.size(), f); return; }
+            (void)ex::device_linear_rows(gate.view, dx.as<float>(), rows, g.as<float>(), scratch.data(), scratch.size(), f);
+            (void)ex::device_linear_rows(up.view, dx.as<float>(), rows, u.as<float>(), scratch.data(), scratch.size(), f);
+            gpu::gelu_product(g.as<float>(), u.as<float>(), rows * inter);
+            (void)ex::device_linear_rows(down.view, g.as<float>(), rows, out.as<float>(), scratch.data(), scratch.size(), f);
+        };
+        run(); gpu::synchronize();
+        const auto start = std::chrono::steady_clock::now();
+        for (unsigned i = 0; i < 3; ++i) run();
+        gpu::synchronize();
+        const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count() / 3;
+        std::cout << std::setprecision(5) << "{\"bench\":\"ffn\",\"identity\":\"" << ex::active_identity() << "\",\"route\":\""
+                  << (fused ? "fused" : "separate") << "\",\"ms\":" << ms << "}\n";
     }
 }
 void bench() {
@@ -129,10 +206,10 @@ void bench() {
 int main(int argc, char** argv) {
     try {
         gpu::require_device();
-        if (argc == 2 && std::string_view(argv[1]) == "bench") { bench(); return 0; }
+        if (argc == 2 && std::string_view(argv[1]) == "bench") { bench(); bench_ffn(); return 0; }
         tests();
         std::cout << "{\"gate\":\"exl3-rows-vs-rows8\",\"identity\":\"" << ex::active_identity() << "\",\"cases\":" << cases
-                  << ",\"verdict\":\"EXACT\"}\n";
+                  << ",\"ffn_cases\":" << ffn_cases << ",\"verdict\":\"EXACT\"}\n";
         return 0;
     } catch (const std::exception& e) {
         std::cerr << e.what() << '\n';
