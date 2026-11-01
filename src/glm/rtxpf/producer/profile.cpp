@@ -53,6 +53,13 @@ constexpr Lever kTable[] = {
      .value = {"1", "1", "1"}, .builtin = "0", .ready = none, .runnable = all, .kind = Kind::exact, .apps = service,
      .source = "pending: the bitwise digest compare in a PRO window (exact by construction: shared experts and dense FFNs keep "
                "the FP16 operands the decode window writes, decoded once; ~2.8 GiB in the whole-device plan, off when it does not fit)"},
+    {.name = "decode_row_kernels", .env = "STRIX_GLM_RTX_ROW_KERNELS", .options = {{{"--decode-row-kernels", "*"}}},
+     .value = {"1", "1", "1"}, .builtin = "1", .ready = all, .runnable = all, .kind = Kind::exact, .apps = service,
+     .source = "few-row decode kernels, each output's arithmetic unchanged: MoE / KDA / DSA / MTP trellis GEMMs as "
+               "register-decoded m16n8k16 chains in the CUTLASS K order (no per-token FP16 decode), hyper-connection and "
+               "router chains from shared memory, the router's top 8 by rank. Full card, 1K/8K: tokens, every logits "
+               "digest and the final state equal with it off; qualify PASS; decode 2.4 -> 6.0-6.2 tok/s warm. OFF: 0; "
+               "a subset such as moe+hc+router+kda+dsa selects kernels"},
     // fast-only, pending
     {.name = "prefill_tile_large", .value = {"", "8192", ""}, .builtin = "off", .ready = none,
      .runnable = {false, true, false}, .kind = Kind::bit_changing, .apps = service,

@@ -34,6 +34,10 @@ struct Call {
     // CUTLASS path, one expert (shared / dense): its FP16 B operands decoded once by
     // decode_expert_fp16 (the decode window's exact values); the per-call decode is skipped.
     const U16 *fp16_gate=nullptr,*fp16_up=nullptr,*fp16_down=nullptr;
+    // CUTLASS path, rows <= 4 (decode, verify): the C1 GEMMs as register-decoded m16n8k16 chains over the
+    // packed tiles (no FP16 decode window, no grouped GEMM, routed experts only). Same per-output
+    // accumulation as the 32-row CUTLASS kernel, so the same bits; the FP16 operands are not used.
+    bool row_gemv=false;
 };
 struct Profile {
     cudaEvent_t begin[18], decoded[18], gate_up[18], down[18];

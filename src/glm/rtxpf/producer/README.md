@@ -692,6 +692,27 @@ boundary), and with `--decode-profile` each exported layer's decode misses
 (its ids absent from the table when it exported; tierstream counts misses only at
 `ss_end`). Read-only kernels; outputs unchanged.
 
+**Few-row decode kernels (`decode_row_kernels`, on in every profile).** Decode runs one
+row (two to four for routed and shared MoE, up to 32 for the KDA replay rows), so the
+grouped CUTLASS GEMMs and the per-token FP16 decode of whole weight matrices are
+replaced, for those row counts, by `row_mma.cuh`: one warp per 16-column strip decodes
+each lane's eight weights straight from the packed tile (the tile is stored in
+m16n8k16 B-fragment order) and runs one m16n8k16 chain per output in ascending K from
++0, with no split-K. That is how the pinned CUTLASS kernels (instruction 16x8x16, K
+tiles of 32, `OpMultiplyAdd`, beta 0) accumulate each output, so the FP32 results are
+the same bits. Sites: routed, shared and dense MoE (`Call::row_gemv`), the KDA qkv and
+out projections (`KdaCall::row_kernels`), the DSA kva, qb and out projections
+(`DsaCall::row_kernels`; qa and iq stay decoded for the FP32 index) and the MTP layer
+(`MtpCall::row_proj`, `row_moe`). Two more kernels keep their arithmetic and change
+only where operands come from: `hc_pre_staged` feeds the 24 serial mix chains from
+shared memory, and `router_scores` + `router_select` run the router chains on 9 CTAs
+and pick the same top 8 by rank (key descending, index ascending), then sum them in
+index order. `--decode-row-kernels 0|1|<subset>` (`moe`, `hc`, `router`, `kda`, `dsa`
+joined by `+`) or `STRIX_GLM_RTX_ROW_KERNELS` selects them; decode commands take a
+`row_kernels` field for an in-process A/B. `bench/row_mma_test.cu`
+(`glm_row_mma_test`, run by hand on a GPU) compares the strips with the CUTLASS paths
+on random tiles of every rate.
+
 **Exact decode levers (pending rows).** `skip_empty_expert_groups`
 (`--skip-empty-expert-groups 0|1`, `STRIX_GLM_RTX_SKIP_EMPTY_GROUPS`): the routed
 MoE call lists the experts holding routed rows first on the device

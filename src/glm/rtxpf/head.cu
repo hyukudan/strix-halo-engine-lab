@@ -1,5 +1,6 @@
 #include "head.cuh"
 #include "producer/head_select.hpp"
+#include "row_mma.cuh"
 #include <cutlass/gemm/device/gemm_grouped.h>
 #include <cutlass/gemm/kernel/default_gemm_grouped.h>
 #include <cutlass/epilogue/thread/linear_combination.h>

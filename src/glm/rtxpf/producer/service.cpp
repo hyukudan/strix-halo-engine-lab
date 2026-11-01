@@ -182,6 +182,7 @@ int main(int argc,char** argv){try{
         else if(a=="--tier-policy"){w::require(value=="lru"||value=="scored"||value=="auto","--tier-policy must be lru, scored or auto");dopts.tier_policy=value;}else if(a=="--tier-predict"){w::require(value=="0"||value=="1","--tier-predict 0|1");dopts.tier_predict=value=="1";}
         else if(a=="--skip-empty-expert-groups"){w::require(value=="0"||value=="1","--skip-empty-expert-groups 0|1");dopts.skip_empty_expert_groups=value=="1";}
         else if(a=="--persistent-dense-fp16"){w::require(value=="0"||value=="1","--persistent-dense-fp16 0|1");dopts.persistent_dense_fp16=value=="1";}
+        else if(a=="--decode-row-kernels")p::set_row_kernels_value(dopts,value);
         else if(a=="--restore-decode-residency"){w::require(value=="0"||value=="1","--restore-decode-residency 0|1");dopts.restore_decode_residency=value=="1";}
         else if(a=="--tier-flush-ready"){w::require(value=="0"||value=="1","--tier-flush-ready 0|1");dopts.tier_flush_ready=value=="1";}
         else if(a=="--tier-host-spares")dopts.tier_host_spares=unsigned(std::stoul(value));else if(a=="--tier-staging")dopts.tier_staging=unsigned(std::stoul(value));
@@ -204,6 +205,7 @@ int main(int argc,char** argv){try{
     // the environment (STRIX_GLM_RTX_SKIP_EMPTY_GROUPS / _PERSISTENT_DENSE_FP16) sets them explicitly.
     for(auto [lever,flag]:{std::pair<const char*,bool*>{"skip_empty_expert_groups",&dopts.skip_empty_expert_groups},{"persistent_dense_fp16",&dopts.persistent_dense_fp16}})
         if(auto* e=prof.find(lever);e&&e->status!=rp::Status::explicit_cli&&e->status!=rp::Status::pending)*flag=e->value!="off"&&e->value!="0";
+    if(auto* e=prof.find("decode_row_kernels");e&&e->status!=rp::Status::explicit_cli&&e->status!=rp::Status::pending)p::set_row_kernels_value(dopts,e->value);
     if(auto* e=prof.find("restore_decode_residency");e&&e->status!=rp::Status::explicit_cli)dopts.restore_decode_residency=e->value!="off"&&e->value!="0";
     if(auto* e=prof.find("flush_ready");e&&e->status!=rp::Status::explicit_cli)dopts.tier_flush_ready=e->value!="off"&&e->value!="0";
     if(auto* e=prof.find("predicted_prefetch");e&&(e->status==rp::Status::pending||e->status==rp::Status::profile||e->status==rp::Status::unqualified))dopts.tier_predict=e->value=="1";
@@ -219,6 +221,7 @@ int main(int argc,char** argv){try{
         if(lever=="restore_decode_residency")return dopts.restore_decode_residency?"on":"off";
         if(lever=="skip_empty_expert_groups")return dopts.skip_empty_expert_groups?"1":"0";
         if(lever=="persistent_dense_fp16")return dopts.persistent_dense_fp16?"1 (dropped at startup if the plan cannot afford it)":"0";
+        if(lever=="decode_row_kernels")return p::row_kernels_name(dopts);
         if(lever=="predicted_prefetch")return dopts.tier_predict?"1":"0";
         if(lever=="prefill_tile_large")return tile>=8192?"8192":"off";
         if(lever=="dsa_index_mma")return "fp32";
@@ -275,7 +278,10 @@ int main(int argc,char** argv){try{
         // harness decides (deadline) whether to send another arm.
         auto ready=Json::object();ready.set("ready",true);identity_fields(ready);std::cout<<ready.dump()<<"\n"<<std::flush;
         for(std::string line;std::getline(std::cin,line);){
-            auto cmd=strix::serve::parse_json(line);fields(cmd,{"op","prompt","steps","order","export_dir"});auto op=field(cmd,"op").as_string();if(op=="quit")break;
+            auto cmd=strix::serve::parse_json(line);fields(cmd,{"op","prompt","steps","order","export_dir","row_kernels","decode_profile"});auto op=field(cmd,"op").as_string();if(op=="quit")break;
+            // Optional per-command decode_row_kernels / decode timeline (in-process A/B over one load); they stay set.
+            if(auto* rk=cmd.find("row_kernels"))runtime.set_row_kernels(rk->as_string());
+            if(auto* dp=cmd.find("decode_profile"))runtime.set_decode_profile(dp->as_bool());
             auto tokens=read_prompt(field(cmd,"prompt").as_string(),capacity);auto steps=unsigned(field(cmd,"steps").as_int());w::require(steps>=1&&steps<=64&&tokens.size()+steps+1<=capacity,"command steps/capacity");
             auto begin=std::chrono::steady_clock::now();Json out;
             try{
@@ -289,7 +295,7 @@ int main(int argc,char** argv){try{
                 std::cerr<<"FAILED-RECEIPT "<<f.dump()<<"\n"<<std::flush;throw;}
             persist_residency(runtime,out);
             out.set("memory",strix::serve::parse_json(runtime.memory_report("request:"+op))); // measured peaks vs the whole-device caps
-            out.set("op",op);out.set("prompt",field(cmd,"prompt").as_string());out.set("wall_ms",std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-begin).count());std::cout<<out.dump()<<"\n"<<std::flush;
+            out.set("op",op);out.set("row_kernels",runtime.row_kernels());out.set("prompt",field(cmd,"prompt").as_string());out.set("wall_ms",std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-begin).count());std::cout<<out.dump()<<"\n"<<std::flush;
         }
         return 0;
     }

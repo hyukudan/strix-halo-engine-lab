@@ -6,6 +6,7 @@
 #include <string>
 #include <vector>
 #include <cstdint>
+#include <stdexcept>
 #include "verified_manifest.hpp"
 namespace strix::glm::rtxpf::producer {
 // Decode expert-tier selection and tierstream startup budget (decode only).
@@ -35,6 +36,11 @@ struct DecodeOptions {
     // shared experts and dense FFNs keep a persistent FP16 copy decoded once at startup
     // (a named whole-device plan part; dropped when the plan cannot afford it).
     bool skip_empty_expert_groups=false,persistent_dense_fp16=false;
+    // Exact one-row decode kernels (profile row decode_row_kernels, pending until a window shows equal
+    // digests): routed/shared/dense MoE as register-decoded MMA chains (row_moe), the hyper-connection
+    // mix chains from shared memory (row_hc), the router over 9 CTAs + a parallel top 8 (row_router),
+    // the KDA qkv/out and DSA kva/qb/out trellis projections as the same MMA chains (row_kda, row_dsa).
+    bool row_moe=false,row_hc=false,row_router=false,row_kda=false,row_dsa=false;
     // After each prefill through the cache, the open decode placement is made resident again
     // (placement only); without it the last prefilled layers own the arena (profile row).
     bool restore_decode_residency=true;
@@ -42,6 +48,20 @@ struct DecodeOptions {
     bool reference_compare=false;        // tierstream: also keep the uncached reference tier for same-window comparison
     std::string unit_manifest_sha256;    // pinned digest of PRIMARY.units.json (trusted manifest)
 };
+// decode_row_kernels value: 0/off, 1/on (all), or a '+'-separated subset of moe, hc, router, kda, dsa.
+inline void set_row_kernels_value(DecodeOptions& d,const std::string& v){
+    bool* f[]={&d.row_moe,&d.row_hc,&d.row_router,&d.row_kda,&d.row_dsa};const char* k[]={"moe","hc","router","kda","dsa"};
+    const bool all=v=="1"||v=="on",none=v=="0"||v=="off";for(auto* p:f)*p=all;
+    if(all||none)return;
+    for(std::size_t b=0;b<=v.size();){auto e=v.find('+',b);if(e==std::string::npos)e=v.size();const auto name=v.substr(b,e-b);bool known=false;
+        for(unsigned j=0;j<5;++j)if(name==k[j]){*f[j]=true;known=true;}
+        if(!known)throw std::runtime_error("--decode-row-kernels: 0, 1 or a '+'-separated subset of moe, hc, router, kda, dsa");b=e+1;}
+}
+inline std::string row_kernels_name(const DecodeOptions& d){
+    const bool f[]={d.row_moe,d.row_hc,d.row_router,d.row_kda,d.row_dsa};const char* k[]={"moe","hc","router","kda","dsa"};
+    std::string s;unsigned n=0;for(unsigned j=0;j<5;++j)if(f[j]){s+=(s.empty()?"":"+")+std::string(k[j]);++n;}
+    return n==5?"1":n==0?"0":s;
+}
 using StateSink=std::function<void(unsigned rank,unsigned layer,unsigned component,std::span<const std::byte>)>;
 // Constructor is the first device work. The service validates the UUID and all
 // host arguments before constructing it. No CPU emulation hides a CUDA failure.
@@ -63,6 +83,8 @@ public:
     std::string expert_diagnostics();
     // Opt-in decode timeline: every decode_one record then carries "timeline" (CUDA events per phase; outputs unchanged).
     void set_decode_profile(bool on);
+    void set_row_kernels(const std::string& value); // decode_row_kernels between requests (no session work in flight)
+    std::string row_kernels()const;
     // Writes the cache residency (most recent first) to the residency file; "" when off. Between requests.
     std::string save_residency();
     std::string model_sha256()const;

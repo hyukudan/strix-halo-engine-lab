@@ -43,6 +43,9 @@ struct DsaCall {
     const U32 *compare2_tokens=nullptr,*compare2_counts=nullptr;
     DsaDiagnostics* diagnostics2=nullptr;
     bool mma_index=false; // opt-in BF16 scorer and reduced-precision index projections
+    // rows <= 32 (decode): the CUTLASS trellis projections (kva, qb, out; qa outside the FP32 index) as
+    // row_mma.cuh strips from the packed tiles, without their layer decode; the same bits.
+    bool row_kernels=false;
     float near_tie_abs=1.e-3f,near_tie_rel=1.e-3f;
 };
 // Caller creates timing events for phase*dsa_max_windows+window. decode/pool

@@ -88,6 +88,9 @@ add_executable(glm_kda_bench "${BENCH}/kda_bench.cu")
 target_link_libraries(glm_kda_bench PRIVATE producer_kda)
 add_executable(glm_dsa_bench "${BENCH}/dsa_bench.cu")
 target_link_libraries(glm_dsa_bench PRIVATE producer_dsa producer_native)
+# GPU exactness of the few-row trellis kernels (row_mma.cuh) vs the CUTLASS paths; run by hand on a GPU.
+add_executable(glm_row_mma_test "${BENCH}/row_mma_test.cu")
+target_link_libraries(glm_row_mma_test PRIVATE producer_native)
 # The shared tierstream cache library built from its read-only source into
 # this build directory: a CUDA build for the service, a CPU-only build for the
 # CPU admission tests (no test process loads the CUDA driver). The archive is

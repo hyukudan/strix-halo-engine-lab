@@ -16,6 +16,9 @@ struct KdaCall {
     KdaWeights w;
     const float* x;
     float *y,*state,*conv; // state [H,128,128], conv [3*H*128,3], in/out
+    // rows <= 32 (decode replay): the qkv/out trellis projections as row_mma.cuh strips from the
+    // packed tiles (no FP16 layer decode); the same bits as the CUTLASS projection.
+    bool row_kernels=false;
 };
 // No allocation, device discovery or synchronization. Single caller-owned
 // stream, nonaliasing buffers; initial state/conv may be nonzero.

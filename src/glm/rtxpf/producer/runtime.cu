@@ -46,29 +46,9 @@ __device__ float sigmoid(float x){return 1.f/(1.f+declared_exp(-x));}
 __device__ U32 ordered(float v){U32 bits=__float_as_uint(v);if((bits&0x7fffffffu)==0)bits=0;return bits&0x80000000u?~bits:bits^0x80000000u;}
 __device__ void flag_if(unsigned* f,float x){if(f&&!isfinite(x))atomicOr(f,1u);}
 template<unsigned L> __device__ float lds_tree(float* s,float a){unsigned l=threadIdx.x;s[l]=a;__syncthreads();for(unsigned h=L/2;h;h/=2){if(l<h)s[l]+=s[l+h];__syncthreads();}float v=s[0];__syncthreads();return v;}
-__global__ __launch_bounds__(256) void hc_pre_kernel(const float* X, const float* fn, const float* base,
-                                                     const float* scale, float* F, float* mix, float* xc) {
-    constexpr unsigned n = kHc * kHidden;
-    __shared__ float s[256];
-    __shared__ float z[kHcMix];
-    __shared__ float m[kHcMix];
-    const unsigned r = blockIdx.x, l = threadIdx.x;
-    const float* Xr = X + static_cast<std::size_t>(r) * n;
-    float* Fr = F + static_cast<std::size_t>(r) * n;
-    float a = 0.0F;
-    for (unsigned i = l; i < n; i += 256) a = __fmaf_rn(Xr[i], Xr[i], a);
-    const float ss = lds_tree<256>(s, a);
-    const float rr = inv_sqrt(ss / static_cast<float>(n) + kEps);
-    for (unsigned i = l; i < n; i += 256) Fr[i] = Xr[i] * rr;
-    __syncthreads();
-    if (l < kHcMix) {  // 24 chains over the normalized streams (each lane reads the F values it did not write: the
-                       // __syncthreads above orders global writes within the block)
-        float acc = 0.0F;
-        const float* row = fn + static_cast<std::size_t>(l) * n;
-        for (unsigned i = 0; i < n; ++i) acc = __fmaf_rn(Fr[i], row[i], acc);
-        z[l] = acc;
-    }
-    __syncthreads();
+// The mix (lane 0, R6 in the host hc_mix order) and the collapsed row, shared by both hc_pre kernels.
+__device__ void hc_mix_finish(const float* z, float* m, const float* base, const float* scale, const float* Xr, float* mix, float* xc,
+                              unsigned r, unsigned l) {
     if (l == 0) {  // R6 on lane 0 (host hc_mix order)
         for (unsigned j = 0; j < kHc; ++j) m[j] = sigmoid(z[j] * scale[0] + base[j]) + kHcEps;
         for (unsigned j = 0; j < kHc; ++j) m[kHc + j] = 2.0F * sigmoid(z[kHc + j] * scale[1] + base[kHc + j]);
@@ -102,6 +82,75 @@ __global__ __launch_bounds__(256) void hc_pre_kernel(const float* X, const float
     float* xr = xc + static_cast<std::size_t>(r) * kHidden;
     for (unsigned d = l; d < kHidden; d += 256)
         xr[d] = ((m[0] * Xr[d] + m[1] * Xr[kHidden + d]) + m[2] * Xr[2 * kHidden + d]) + m[3] * Xr[3 * kHidden + d];
+}
+__global__ __launch_bounds__(256) void hc_pre_kernel(const float* X, const float* fn, const float* base,
+                                                     const float* scale, float* F, float* mix, float* xc) {
+    constexpr unsigned n = kHc * kHidden;
+    __shared__ float s[256];
+    __shared__ float z[kHcMix];
+    __shared__ float m[kHcMix];
+    const unsigned r = blockIdx.x, l = threadIdx.x;
+    const float* Xr = X + static_cast<std::size_t>(r) * n;
+    float* Fr = F + static_cast<std::size_t>(r) * n;
+    float a = 0.0F;
+    for (unsigned i = l; i < n; i += 256) a = __fmaf_rn(Xr[i], Xr[i], a);
+    const float ss = lds_tree<256>(s, a);
+    const float rr = inv_sqrt(ss / static_cast<float>(n) + kEps);
+    for (unsigned i = l; i < n; i += 256) Fr[i] = Xr[i] * rr;
+    __syncthreads();
+    if (l < kHcMix) {  // 24 chains over the normalized streams (each lane reads the F values it did not write: the
+                       // __syncthreads above orders global writes within the block)
+        float acc = 0.0F;
+        const float* row = fn + static_cast<std::size_t>(l) * n;
+        for (unsigned i = 0; i < n; ++i) acc = __fmaf_rn(Fr[i], row[i], acc);
+        z[l] = acc;
+    }
+    __syncthreads();
+    hc_mix_finish(z, m, base, scale, Xr, mix, xc, r, l);
+}
+
+// hc_pre_kernel with the 24 chains fed from shared memory: all 256 threads stage F (recomputed as
+// Xr[i]*rr, the value F holds) and the 24 rows in 256-column chunks, the next chunk in registers
+// while lanes 0..23 run the same ascending __fmaf_rn chains. Every value is hc_pre_kernel's.
+__global__ __launch_bounds__(256) void hc_pre_staged(const float* X, const float* fn, const float* base,
+                                                     const float* scale, float* F, float* mix, float* xc) {
+    constexpr unsigned n = kHc * kHidden, C = 256;
+    __shared__ float s[256];
+    __shared__ float z[kHcMix];
+    __shared__ float m[kHcMix];
+    __shared__ float sf[C];
+    __shared__ float srow[kHcMix][C + 1];
+    const unsigned r = blockIdx.x, l = threadIdx.x;
+    const float* Xr = X + static_cast<std::size_t>(r) * n;
+    float* Fr = F + static_cast<std::size_t>(r) * n;
+    float a = 0.0F;
+    for (unsigned i = l; i < n; i += 256) a = __fmaf_rn(Xr[i], Xr[i], a);
+    const float ss = lds_tree<256>(s, a);
+    const float rr = inv_sqrt(ss / static_cast<float>(n) + kEps);
+    for (unsigned i = l; i < n; i += 256) Fr[i] = Xr[i] * rr;
+    float pf = Xr[l] * rr, pr[kHcMix];
+#pragma unroll
+    for (unsigned q = 0; q < kHcMix; ++q) pr[q] = fn[static_cast<std::size_t>(q) * n + l];
+    float acc = 0.0F;
+    for (unsigned c = 0; c < n; c += C) {
+        sf[l] = pf;
+#pragma unroll
+        for (unsigned q = 0; q < kHcMix; ++q) srow[q][l] = pr[q];
+        __syncthreads();
+        if (c + C < n) {
+            pf = Xr[c + C + l] * rr;
+#pragma unroll
+            for (unsigned q = 0; q < kHcMix; ++q) pr[q] = fn[static_cast<std::size_t>(q) * n + c + C + l];
+        }
+        if (l < kHcMix) {
+#pragma unroll 16
+            for (unsigned i = 0; i < C; ++i) acc = __fmaf_rn(sf[i], srow[l][i], acc);
+        }
+        __syncthreads();
+    }
+    if (l < kHcMix) z[l] = acc;
+    __syncthreads();
+    hc_mix_finish(z, m, base, scale, Xr, mix, xc, r, l);
 }
 
 __global__ void hc_expand_kernel(const float* X, const float* mix, const float* y, float* Xo, unsigned* flag, unsigned flag_stride) {
@@ -147,6 +196,43 @@ __global__ void router(const float* x,const U16* w,const float* bias,U32* ids,fl
     for(unsigned j=1;j<8;++j)for(unsigned k=j;k&&pick[k-1]>pick[k];--k){unsigned t=pick[k-1];pick[k-1]=pick[k];pick[k]=t;}
     float den=0;for(unsigned j=0;j<8;++j)den+=sg[pick[j]];den+=1.e-20f;
     for(unsigned j=0;j<8;++j){ids[std::size_t(r)*8+j]=pick[j];rates[std::size_t(r)*8+j]=sg[pick[j]]/den*2.5f;}
+}
+// router for one row, same values: 9 CTAs of 32 experts; each expert's ascending __fmaf_rn chain over
+// 4096 inputs reads 128-column chunks staged in shared memory (the next chunk in registers), then
+// router_select picks the same top 8 as router's greedy scan + index sort (the eight largest keys,
+// ties to the lower index, ascending) and normalizes them in the same order.
+__global__ __launch_bounds__(128) void router_scores(const float* x,const U16* w,const float* bias,float* sg,U32* keys,unsigned* flag){
+    constexpr unsigned C=128,E=32,W=C/2+1; // row stride W words: lane e reads its row conflict-free
+    __shared__ U32 sw[E*W];__shared__ float sx[C];
+    const unsigned t=threadIdx.x,e0=blockIdx.x*E;
+    const U32* rows=reinterpret_cast<const U32*>(w+std::size_t(e0)*4096);
+    U32 pw[16];float px=x[t];
+    #pragma unroll
+    for(unsigned q=0;q<16;++q){unsigned j=t+128*q;pw[q]=rows[std::size_t(j/64)*2048+j%64];}
+    float v=0;
+    for(unsigned c=0;c<4096;c+=C){
+        #pragma unroll
+        for(unsigned q=0;q<16;++q){unsigned j=t+128*q;sw[j/64*W+j%64]=pw[q];}
+        sx[t]=px;__syncthreads();
+        if(c+C<4096){px=x[c+C+t];
+            #pragma unroll
+            for(unsigned q=0;q<16;++q){unsigned j=t+128*q;pw[q]=rows[std::size_t(j/64)*2048+(c+C)/2+j%64];}}
+        if(t<E){const U16* r=reinterpret_cast<const U16*>(sw+t*W);
+            #pragma unroll 16
+            for(unsigned k=0;k<C;++k)v=__fmaf_rn(sx[k],hf(r[k]),v);}
+        __syncthreads();
+    }
+    if(t<E){const unsigned e=e0+t;flag_if(flag,v);const float g=sigmoid(v);sg[e]=g;keys[e]=ordered(g+bias[e]);}
+}
+__global__ __launch_bounds__(288) void router_select(const float* sg,const U32* keys,U32* ids,float* rates){
+    __shared__ U32 k[288];__shared__ unsigned chosen[288];__shared__ unsigned pick[8];
+    const unsigned e=threadIdx.x;k[e]=keys[e];__syncthreads();
+    unsigned rank=0;for(unsigned j=0;j<288;++j)rank+=k[j]>k[e]||(k[j]==k[e]&&j<e);
+    chosen[e]=rank<8;__syncthreads();
+    if(chosen[e]){unsigned pos=0;for(unsigned j=0;j<e;++j)pos+=chosen[j];pick[pos]=e;}
+    __syncthreads();if(e)return;
+    float den=0;for(unsigned j=0;j<8;++j)den+=sg[pick[j]];den+=1.e-20f;
+    for(unsigned j=0;j<8;++j){ids[j]=pick[j];rates[j]=sg[pick[j]]/den*2.5f;}
 }
 __global__ void check_finite(const float* x,std::size_t n,unsigned* flag){auto j=std::size_t(blockIdx.x)*256+threadIdx.x;if(j<n)flag_if(flag,x[j]);}
 // Tierstream adapter: guarded slot -> GLM descriptor for each selected ID,
@@ -525,7 +611,8 @@ struct Runtime::Impl {
     std::string session_key(unsigned P)const{return in_session?":s"+std::to_string(kda_block_start(P))+"/"+std::to_string(kda_open_rows(P)):"";}
     void zero_state(){for(Buffer* b:{&state,&conv,&latent,&key,&gate,&pooled})ck(cudaMemsetAsync(b->p,0,b->bytes,compute.s));}
     void pre(const Hc& hc,const U16* weight,const float* x,float* normalized_out,unsigned n){
-        hc_pre_kernel<<<n,256,0,compute.s>>>(x,hc.fn,hc.base,hc.scale,F.as<float>(),mix.as<float>(),collapsed.as<float>());
+        if(n==1&&dopt.row_hc)hc_pre_staged<<<1,256,0,compute.s>>>(x,hc.fn,hc.base,hc.scale,F.as<float>(),mix.as<float>(),collapsed.as<float>());
+        else hc_pre_kernel<<<n,256,0,compute.s>>>(x,hc.fn,hc.base,hc.scale,F.as<float>(),mix.as<float>(),collapsed.as<float>());
         norm<<<n,256,0,compute.s>>>(collapsed.as<float>(),weight,normalized_out,n);
     }
     void post(const float* x,const float* y,float* out,unsigned n){hc_expand_kernel<<<dim3(16,n),256,0,compute.s>>>(x,mix.as<float>(),y,out,flag.as<unsigned>(),0);}
@@ -653,7 +740,7 @@ struct Runtime::Impl {
     Json failed_slots;    // the slot census after the last failed decode token (always; best effort)
     void failed_census()noexcept{try{if(ts_tier&&tier.get()==ts_tier)failed_slots=ts_tier->census(compute.s);}catch(...){cudaGetLastError();}}
     bool decode_mode=false;SessionFrontier sess;std::unique_ptr<ExpertCatalog> catalog;std::unique_ptr<UnitBinding> unit_binding;std::unique_ptr<ExpertTier> tier;
-    Buffer kda_s,kda_c,ck_s,ck_c,tail,dlat,dkey,dgate,dpool,head_dec,head_suh,head_svh,head_ws,logits,argres,rx,rx2,hrow,emb,route,mtp_out,host_small;
+    Buffer kda_s,kda_c,ck_s,ck_c,tail,dlat,dkey,dgate,dpool,head_dec,head_suh,head_svh,head_ws,logits,argres,rx,rx2,hrow,emb,route,mtp_out,host_small,route_sg,route_keys;
     std::vector<std::vector<std::byte>> snapshot;std::vector<std::uint32_t> snapshot_tokens;
     static void check_device(){
         int count=0;ck(cudaGetDeviceCount(&count));need(count==1,"one visible device required");cudaDeviceProp prop{};ck(cudaGetDeviceProperties(&prop,0));
@@ -790,7 +877,7 @@ struct Runtime::Impl {
         const std::size_t c=capacity;Charge kv_charge(kv_part);
         kda_s.allocate(kda_layer_count*kda_state_bytes);kda_c.allocate(kda_layer_count*kda_conv_bytes);ck_s.allocate(kda_layer_count*kda_state_bytes);ck_c.allocate(kda_layer_count*kda_conv_bytes);tail.allocate(kda_layer_count*kda_block*kda_row_bytes);
         dlat.allocate(dsa_layer_count*c*1024);dkey.allocate(dsa_layer_count*c*256);dgate.allocate(dsa_layer_count*c*256);dpool.allocate(dsa_layer_count*(c/4)*512);
-        rx.allocate(65536);rx2.allocate(65536);hrow.allocate(16384);emb.allocate(16384);mtp_out.allocate(16384);route.allocate(256);argres.allocate(256);host_small.allocate(65536,true);
+        rx.allocate(65536);rx2.allocate(65536);hrow.allocate(16384);emb.allocate(16384);mtp_out.allocate(16384);route.allocate(256);route_sg.allocate(288*4);route_keys.allocate(288*4);argres.allocate(256);host_small.allocate(65536,true);
         // Head: stream head.bin to the device once, decode K6 -> FP16, keep scales, free the compressed blob.
         auto& hb=*blobs.at("head.bin");{Charge h(head_blob_part);load_blob_device(hb,staging);}
         auto hm=matrix("lm_head",head_hidden,head_vocab);need(hm.bits==6,"lm_head must be K6");
@@ -1106,12 +1193,14 @@ struct Runtime::Impl {
     }
     static void predecoded(Call& v,Layer& w){if(w.fp16_g.p){v.fp16_gate=w.fp16_g.as<U16>();v.fp16_up=w.fp16_u.as<U16>();v.fp16_down=w.fp16_d.as<U16>();}}
     void moe(unsigned l,Layer& w,const float* x,float* y){
-        router<<<1,320,0,compute.s>>>(x,w.router,w.bias,ids.as<U32>(),rates.as<float>(),flag.as<unsigned>());timeline.mark(int(l),DecodePhase::router,compute.s);
+        if(dopt.row_router){router_scores<<<9,128,0,compute.s>>>(x,w.router,w.bias,route_sg.as<float>(),route_keys.as<U32>(),flag.as<unsigned>());router_select<<<1,288,0,compute.s>>>(route_sg.as<float>(),route_keys.as<U32>(),ids.as<U32>(),rates.as<float>());}
+        else router<<<1,320,0,compute.s>>>(x,w.router,w.bias,ids.as<U32>(),rates.as<float>(),flag.as<unsigned>());
+        timeline.mark(int(l),DecodePhase::router,compute.s);
         tier->acquire(l,ids.as<U32>(),8,compute.s);timeline.mark(int(l),DecodePhase::export_wait,compute.s);
         if(ts_tier&&tier.get()==ts_tier&&ts_tier->predict){ts_tier->predict_next(l,x,compute.s);timeline.mark(int(l),DecodePhase::predict,compute.s);}
         auto* d=static_cast<const Expert*>(tier->bind_selected_descriptors(l,compute.s));
-        Call v{1,288,4096,2048,x,ids.as<U32>(),rates.as<float>(),d,routed.as<float>()};v.compact_groups=dopt.skip_empty_expert_groups;ck(enqueue_cutlass(v,workspace.p,ws_bytes,compute.s,exec));timeline.mark(int(l),DecodePhase::routed_moe,compute.s);
-        Call sh{1,1,4096,2048,x,nullptr,nullptr,w.shared_descriptor.as<Expert>(),shared.as<float>()};predecoded(sh,w);ck(enqueue_cutlass(sh,workspace.p,ws_bytes,compute.s,exec));timeline.mark(int(l),DecodePhase::shared_expert,compute.s);
+        Call v{1,288,4096,2048,x,ids.as<U32>(),rates.as<float>(),d,routed.as<float>()};v.compact_groups=dopt.skip_empty_expert_groups;v.row_gemv=dopt.row_moe;ck(enqueue_cutlass(v,workspace.p,ws_bytes,compute.s,exec));timeline.mark(int(l),DecodePhase::routed_moe,compute.s);
+        Call sh{1,1,4096,2048,x,nullptr,nullptr,w.shared_descriptor.as<Expert>(),shared.as<float>()};predecoded(sh,w);sh.row_gemv=dopt.row_moe;ck(enqueue_cutlass(sh,workspace.p,ws_bytes,compute.s,exec));timeline.mark(int(l),DecodePhase::shared_expert,compute.s);
         add<<<16,256,0,compute.s>>>(routed.as<float>(),shared.as<float>(),y,4096,flag.as<unsigned>());tier->release(l,compute.s);timeline.mark(int(l),DecodePhase::combine,compute.s);
     }
     // Session working KDA state (export/replay target); the prefill writes it through kst/kcv.
@@ -1133,13 +1222,13 @@ struct Runtime::Impl {
                 if(is_kda_layer(l)){
                     ck(cudaMemcpyAsync(tl(l)+std::size_t(n-1)*4096,normalized.p,kda_row_bytes,cudaMemcpyDeviceToDevice,compute.s));
                     ck(cudaMemcpyAsync(kst2(l),cks(l),kda_state_bytes,cudaMemcpyDeviceToDevice,compute.s));ck(cudaMemcpyAsync(kcv2(l),ckc(l),kda_conv_bytes,cudaMemcpyDeviceToDevice,compute.s));
-                    KdaCall v{n,w.k,tl(l),part.as<float>(),kst2(l),kcv2(l)};ck(enqueue_kda(v,workspace.p,ws_bytes,compute.s));yrow=part.as<float>()+std::size_t(n-1)*4096;
+                    KdaCall v{n,w.k,tl(l),part.as<float>(),kst2(l),kcv2(l)};v.row_kernels=dopt.row_kda;ck(enqueue_kda(v,workspace.p,ws_bytes,compute.s));yrow=part.as<float>()+std::size_t(n-1)*4096;
                     if(kda_promotes(P)){ck(cudaMemcpyAsync(cks(l),kst2(l),kda_state_bytes,cudaMemcpyDeviceToDevice,compute.s));ck(cudaMemcpyAsync(ckc(l),kcv2(l),kda_conv_bytes,cudaMemcpyDeviceToDevice,compute.s));}
                     timeline.mark(int(l),DecodePhase::kda,compute.s);
-                }else{DsaCall v{};v.rows=1;v.first=P;v.w=w.d;v.state=sdstate(l);v.x=normalized.as<float>();v.y=part.as<float>();v.nonfinite=flag.as<unsigned>();v.index=DsaIndex::fp32;ck(enqueue_dsa(v,workspace.p,ws_bytes,compute.s));timeline.mark(int(l),DecodePhase::dsa,compute.s);}
+                }else{DsaCall v{};v.rows=1;v.first=P;v.w=w.d;v.state=sdstate(l);v.x=normalized.as<float>();v.y=part.as<float>();v.nonfinite=flag.as<unsigned>();v.index=DsaIndex::fp32;v.row_kernels=dopt.row_dsa;ck(enqueue_dsa(v,workspace.p,ws_bytes,compute.s));timeline.mark(int(l),DecodePhase::dsa,compute.s);}
                 post(rx.as<float>(),yrow,rx2.as<float>(),1);timeline.mark(int(l),DecodePhase::hc_post_attn,compute.s);
                 pre(w.ffn,w.post,rx2.as<float>(),normalized.as<float>(),1);timeline.mark(int(l),DecodePhase::hc_pre_ffn,compute.s);
-                if(l<3){Call v{1,1,4096,12288,normalized.as<float>(),nullptr,nullptr,w.shared_descriptor.as<Expert>(),part.as<float>()};predecoded(v,w);ck(enqueue_cutlass(v,workspace.p,ws_bytes,compute.s,exec));timeline.mark(int(l),DecodePhase::dense_ffn,compute.s);}
+                if(l<3){Call v{1,1,4096,12288,normalized.as<float>(),nullptr,nullptr,w.shared_descriptor.as<Expert>(),part.as<float>()};predecoded(v,w);v.row_gemv=dopt.row_moe;ck(enqueue_cutlass(v,workspace.p,ws_bytes,compute.s,exec));timeline.mark(int(l),DecodePhase::dense_ffn,compute.s);}
                 else moe(l,w,normalized.as<float>(),part.as<float>());
                 post(rx2.as<float>(),part.as<float>(),rx.as<float>(),1);timeline.mark(int(l),DecodePhase::hc_post_ffn,compute.s);
             }
@@ -1159,7 +1248,7 @@ struct Runtime::Impl {
             hs[8]=y;ck(cudaMemcpyAsync(tokens.as<U32>()+P+1,hs+8,4,cudaMemcpyHostToDevice,compute.s));
             embed<<<16,256,0,compute.s>>>(u16("model.language_model.embed_tokens.weight"),tokens.as<U32>()+P+1,emb.as<float>(),1,1);
             auto& w=*layers[45];
-            MtpCall m1{1,P,w.m,sdstate(45),emb.as<float>(),hrow.as<float>(),mtp_out.as<float>(),flag.as<unsigned>(),DsaIndex::fp32};m1.phase=1;m1.route_ids=route.as<U32>();ck(enqueue_mtp(m1,workspace.p,ws_bytes,compute.s,exec));
+            MtpCall m1{1,P,w.m,sdstate(45),emb.as<float>(),hrow.as<float>(),mtp_out.as<float>(),flag.as<unsigned>(),DsaIndex::fp32};m1.phase=1;m1.route_ids=route.as<U32>();m1.row_proj=dopt.row_dsa;m1.row_moe=dopt.row_moe;ck(enqueue_mtp(m1,workspace.p,ws_bytes,compute.s,exec));
             tier->acquire(45,route.as<U32>(),8,compute.s);auto m2=m1;m2.phase=2;m2.route_ids=nullptr;m2.w.experts=static_cast<const Expert*>(tier->bind_selected_descriptors(45,compute.s));ck(enqueue_mtp(m2,workspace.p,ws_bytes,compute.s,exec));
             tier->release(45,compute.s);ck(cudaMemcpyAsync(hs+4,flag.p,4,cudaMemcpyDeviceToHost,compute.s));timeline.mark(-1,DecodePhase::mtp,compute.s);ck(cudaStreamSynchronize(compute.s));ck(cudaGetLastError());need(!hs[4],"nonfinite MTP activation; session invalidated");
             tier->end_token();sess.commit(y);
@@ -1216,6 +1305,8 @@ std::string Runtime::plan_budget(const std::string& model,unsigned cap,unsigned 
 }
 std::string Runtime::memory_report(const std::string& stage){return p_->memory_json(stage).dump();}
 void Runtime::set_decode_profile(bool on){if(on)p_->timeline.enable();else p_->timeline.on=false;if(p_->ts_tier){if(on)p_->ts_tier->enable_census();else p_->ts_tier->census_on=false;}}
+void Runtime::set_row_kernels(const std::string& v){ck(cudaStreamSynchronize(p_->compute.s));set_row_kernels_value(p_->dopt,v);}
+std::string Runtime::row_kernels()const{return row_kernels_name(p_->dopt);}
 std::string Runtime::expert_diagnostics(){auto j=Json::object();if(!p_->ts_tier)return j.dump();j=p_->ts_tier->api->diagnostics();
     if(p_->failed_timeline.find("timeline"))j.set("decode_timeline_at_failure",p_->failed_timeline);
     if(p_->failed_slots.find("layers"))j.set("slot_census_at_failure",p_->failed_slots);

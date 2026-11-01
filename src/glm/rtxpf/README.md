@@ -104,8 +104,15 @@ Main options:
   prefill state is bitwise equal across row tiles 2048, 4096 and 8192.
 - Time to first token: 8K prompt 17.7-22.7 s, 32K prompt 41-55 s, depending on
   the row tile (best: 17.7 s at 8K and 41.2 s at 32K, with tiles 4096 and 8192).
-- Decode: about 3.3 tokens/s warm, 2.5 tokens/s cold. Every expert lookup hits
-  the device and nothing is copied from the host per token. Decode is bound by
-  compute and launch overhead; optimizing it is in progress.
+- Decode with the few-row decode kernels (`decode_row_kernels`, on by default):
+  6.0 tokens/s warm at 1K and 6.2 tokens/s at 8K (3.7 cold), from 2.4 tokens/s
+  with them off, measured in one service load on a full-card open whose plan put
+  1,098 expert units on the unit file (host RAM was short), so per-token file
+  misses are still in these numbers. Tokens, every logits digest and the final
+  session state are bitwise equal with the kernels on and off, and the 1K/8K
+  qualification passes with them on. Per token, the routed MoE went from 137 to
+  12 ms, KDA from 53 to 21 ms, the hyper-connection mixes from 56 to 11 ms and the
+  router from 21 to 1 ms. Turn them off with `--decode-row-kernels 0` or
+  `STRIX_GLM_RTX_ROW_KERNELS=0`.
 - Smaller memory configurations, such as 24 GiB VRAM + 32 GiB RAM with most
   experts read from the unit file, do not work yet.
