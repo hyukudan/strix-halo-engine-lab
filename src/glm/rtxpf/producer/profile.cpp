@@ -31,6 +31,10 @@ constexpr Lever kTable[] = {
      .source = "the planner rule: the largest tile <= 8192 whose growth over 2048 costs <= 5% of the expert arena"},
     {.name = "cuda_graphs", .options = {{{"--no-graphs", "off"}}}, .value = {"on", "on", "on"}, .builtin = "on", .ready = all,
      .runnable = all, .kind = Kind::exact, .apps = service, .source = "prefill CUDA graph templates (full tile + exact tail)"},
+    {.name = "restore_decode_residency", .env = "STRIX_GLM_RTX_RESTORE_RESIDENCY", .options = {{{"--restore-decode-residency", "*"}}},
+     .value = {"on", "on", "on"}, .builtin = "on", .ready = all, .runnable = all, .kind = Kind::exact, .apps = service,
+     .source = "placement only: after every prefill through the cache the open decode placement is made resident again (held "
+               "make_resident sets, then released); without it the last prefilled layers own the arena and decode misses everywhere"},
     {.name = "flush_ready", .env = "STRIX_GLM_RTX_FLUSH_READY", .options = {{{"--tier-flush-ready", "*"}}},
      .value = {"on", "on", "on"}, .builtin = "on", .ready = all, .runnable = all, .kind = Kind::exact, .apps = service,
      .source = "tierstream dg_flush_ready as the DS tier site: the demand stream is flushed after each ready signal so WDDM "
@@ -40,6 +44,15 @@ constexpr Lever kTable[] = {
      .ready = none, .runnable = all, .kind = Kind::exact, .apps = service,
      .source = "pending: the untimed q1024 compare with --tier-predict 1 in a PRO window (exact by construction: the "
                "predicted branch reads its own input copy and only prefetches; unmeasured)"},
+    // exact decode levers, pending in every profile until a window shows equal digests
+    {.name = "skip_empty_expert_groups", .env = "STRIX_GLM_RTX_SKIP_EMPTY_GROUPS", .options = {{{"--skip-empty-expert-groups", "*"}}},
+     .value = {"1", "1", "1"}, .builtin = "0", .ready = none, .runnable = all, .kind = Kind::exact, .apps = service,
+     .source = "pending: the bitwise digest compare in a PRO window (exact by construction: the routed experts are compacted on "
+               "the device and only the 16-expert groups that can hold routed rows run; per-expert arithmetic unchanged)"},
+    {.name = "persistent_dense_fp16", .env = "STRIX_GLM_RTX_PERSISTENT_DENSE_FP16", .options = {{{"--persistent-dense-fp16", "*"}}},
+     .value = {"1", "1", "1"}, .builtin = "0", .ready = none, .runnable = all, .kind = Kind::exact, .apps = service,
+     .source = "pending: the bitwise digest compare in a PRO window (exact by construction: shared experts and dense FFNs keep "
+               "the FP16 operands the decode window writes, decoded once; ~2.8 GiB in the whole-device plan, off when it does not fit)"},
     // fast-only, pending
     {.name = "prefill_tile_large", .value = {"", "8192", ""}, .builtin = "off", .ready = none,
      .runnable = {false, true, false}, .kind = Kind::bit_changing, .apps = service,

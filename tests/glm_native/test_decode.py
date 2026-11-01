@@ -923,6 +923,20 @@ class WindowTests(unittest.TestCase):
                                   '--row-tile', '8192', '--check-inputs'])
             self.assertEqual(dw.worker_options(c)[dw.worker_options(c).index('--row-tile') + 1], '8192')
 
+    def test_service_sets_eager_module_loading(self):
+        """The service sets CUDA_MODULE_LOADING=EAGER at the top of main, before any CUDA call
+        (--print-effective-config exits before the first one and reports it); an explicit value is kept."""
+        exe = BUILD / 'glm_native_service.exe'
+        if not exe.is_file():
+            self.skipTest('service not built')
+        env = {k: v for k, v in os.environ.items() if k != 'CUDA_MODULE_LOADING'}
+        out = subprocess.run([str(exe), '--print-effective-config'], capture_output=True, text=True, env=env, timeout=60)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertEqual(json.loads(out.stdout.strip().splitlines()[-1])['cuda_module_loading'], 'EAGER (set by the service)')
+        env['CUDA_MODULE_LOADING'] = 'LAZY'
+        out = subprocess.run([str(exe), '--print-effective-config'], capture_output=True, text=True, env=env, timeout=60)
+        self.assertEqual(json.loads(out.stdout.strip().splitlines()[-1])['cuda_module_loading'], 'LAZY (environment)')
+
     def test_profile_switch_through_harness(self):
         """--profile / --allow-pending reach the service and the worker; --print-effective-config runs the service's
         print mode (no model read, no CUDA call) and relays its JSON; the summary records the ready event's profile."""
@@ -935,6 +949,12 @@ class WindowTests(unittest.TestCase):
         opts = dw.worker_options(a)
         self.assertEqual(opts[opts.index('--profile') + 1], 'fast')
         self.assertIn('--allow-pending', opts)
+        self.assertNotIn('--decode-profile', cmd)
+        with patch.object(dw, 'host_total_gib', return_value=191.6):
+            prof = dw.arguments(['--build', '.', '--model', 'M', '--prompt-dir', 'P', '--full-card', '--decode-profile'])
+        prof.unit_file, prof.unit_manifest_sha256 = Path('U'), 'f'*64
+        self.assertIn('--decode-profile', dw.service_command(prof, Path('svc.exe')))
+        self.assertIn('--decode-profile', dw.worker_options(prof))
         with patch.object(dw, 'host_total_gib', return_value=191.6), self.assertRaises(SystemExit), contextlib.redirect_stderr(io.StringIO()):
             dw.arguments(['--build', '.', '--model', 'M', '--prompt-dir', 'P', '--profile', 'turbo'])
         plain = dw.service_command(dw.arguments(['--build', '.', '--model', 'M', '--prompt-dir', 'P']), Path('svc.exe'))
@@ -1072,10 +1092,10 @@ class PlacementInputTests(unittest.TestCase):
         a = argparse.Namespace(model=Path('m'), cache=None, expert_tier='tierstream', unit_file=Path('u.bin'),
                                unit_manifest_sha256='a' * 64, vram_total_gib=93.0, ram_total_gib=None,
                                tier_vram_gib=None, tier_ram_gib=None, tier_spare_percent=5.0, tier_policy='auto',
-                               tier_predict='1', tier_flush_ready='0', expert_residency=None, expert_routes='r.txt', routes_out='o.txt',
+                               tier_predict='1', tier_flush_ready='0', skip_empty_expert_groups='1', persistent_dense_fp16='0', expert_residency=None, expert_routes='r.txt', routes_out='o.txt',
                                capacity=None, full_card=False)
         cmd = dw.service_command(a, Path('svc.exe'))
-        for flag, value in (('--tier-spare-percent', '5.0'), ('--tier-policy', 'auto'), ('--tier-predict', '1'), ('--tier-flush-ready', '0'),
+        for flag, value in (('--tier-spare-percent', '5.0'), ('--tier-policy', 'auto'), ('--tier-predict', '1'), ('--tier-flush-ready', '0'), ('--skip-empty-expert-groups', '1'), ('--persistent-dense-fp16', '0'),
                             ('--expert-routes', 'r.txt'), ('--routes-out', 'o.txt')):
             self.assertEqual(cmd[cmd.index(flag) + 1], value)
         self.assertNotIn('--expert-residency', cmd)

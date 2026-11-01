@@ -57,12 +57,12 @@ add_test(NAME producer_receiver_host COMMAND glm_native_receiver)
 add_test(NAME producer_shard_sources COMMAND python -B "${REPO}/tests/glm_native/test_shards.py" --build "${CMAKE_BINARY_DIR}")
 # The tierstream descriptor test compiles the real desc-v1 parser from a
 # read-only tierstream source tree; absent -> the test reports SKIP for that part.
-set(GLM_TIERSTREAM_SRC "${REPO}/../tierstream-f6e4167" CACHE PATH "private tierstream snapshot (git archive of tierstream f6e4167 + STAMP): cache library, budget planner/ledger, desc parser")
+set(GLM_TIERSTREAM_SRC "${REPO}/../tierstream-602702b" CACHE PATH "private tierstream snapshot (git archive of tierstream 602702b + STAMP): cache library, budget planner/ledger, desc parser")
 # The tierstream commit this producer is qualified against (bound opens with
 # expected source identities, ss_budget_plan / ss_budget_ledger). The source is a
 # `git archive` export of that commit (not a moving checkout); its STAMP
 # file names the exported commit and must match the pin, or configuration fails.
-set(GLM_TIERSTREAM_PIN "f6e4167" CACHE STRING "required tierstream commit (prefix)")
+set(GLM_TIERSTREAM_PIN "602702b" CACHE STRING "required tierstream commit (prefix)")
 # The host test publishes the service-shaped receipt arm (fresh each run) that the
 # Python test reads: an explicit fixture pair, never a stale or racing artifact.
 set(GLM_DECODE_RECEIPT "${CMAKE_BINARY_DIR}/ctest-fixtures/decode-receipt-arm.json")
@@ -115,13 +115,15 @@ if(EXISTS "${GLM_TIERSTREAM_SRC}/CMakeLists.txt" AND EXISTS "${GLM_TIERSTREAM_SR
     else()
       set(ts_cuda OFF)
     endif()
+    # The sub-build runs as many jobs as the producer build (build.ps1 -Parallel), default one.
+    set(GLM_TS_PARALLEL 1 CACHE STRING "parallel jobs of the tierstream sub-build")
     set(ts_dir "${CMAKE_BINARY_DIR}/tierstream-${flavor}")
     ExternalProject_Add(tierstream_${flavor}
       SOURCE_DIR "${GLM_TIERSTREAM_SRC}" BINARY_DIR "${ts_dir}" DOWNLOAD_COMMAND "" UPDATE_COMMAND "" INSTALL_COMMAND ""
       CMAKE_ARGS -DCMAKE_BUILD_TYPE=Release -DTS_CUDA=${ts_cuda} -DTS_TESTS=OFF -DCMAKE_CUDA_ARCHITECTURES=120
                  -DCMAKE_C_COMPILER=cl -DCMAKE_CXX_COMPILER=cl "-DCMAKE_CUDA_COMPILER=${CMAKE_CUDA_COMPILER}"
                  -DCMAKE_CXX_COMPILER_LAUNCHER= -DCMAKE_CUDA_COMPILER_LAUNCHER=
-      BUILD_COMMAND ${CMAKE_COMMAND} --build "${ts_dir}" --target tierstream --parallel 2
+      BUILD_COMMAND ${CMAKE_COMMAND} --build "${ts_dir}" --target tierstream --parallel ${GLM_TS_PARALLEL}
       BUILD_BYPRODUCTS "${ts_dir}/tierstream.lib")
     add_library(glm_tierstream_${flavor} STATIC IMPORTED)
     set_target_properties(glm_tierstream_${flavor} PROPERTIES IMPORTED_LOCATION "${ts_dir}/tierstream.lib")

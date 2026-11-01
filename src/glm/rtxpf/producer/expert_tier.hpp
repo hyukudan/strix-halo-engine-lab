@@ -45,11 +45,44 @@ public:
 };
 // ---- tierstream device-gated view (GLM-side mirror; replaced by the shared
 // header when it is available). One opaque part per unit: base + slot*stride.
+// The cache's per-step export plan, the library's DgSteps rule (dg_steps.hpp): a step
+// exports gated layer g when its rows name g (an all-layer token names every layer)
+// and g holds no make_resident set. The service waits for a layer's prediction flag
+// only when that layer's export promised ids AND the step exports the next layer,
+// so GLM promises (and enqueues) a prediction for g+1 only when the step exports it:
+// never for a layer the step skips (rows 0) or holds (a kept prefill set).
+struct StepPlan {
+    std::vector<std::uint8_t> held,run;
+    void init(unsigned gated){held.assign(gated,0);run.assign(gated,0);}
+    void hold(unsigned g){held.at(g)=1;}
+    void release(unsigned g){held.at(g)=0;}
+    void reset(){std::fill(held.begin(),held.end(),std::uint8_t(0));}
+    void begin_all(){for(std::size_t g=0;g<run.size();++g)run[g]=std::uint8_t(!held[g]);}
+    void begin_layer(unsigned g){for(std::size_t h=0;h<run.size();++h)run[h]=std::uint8_t(h==g&&!held[h]);}
+    bool exports(unsigned g)const{return g<run.size()&&run[g]!=0;}
+    // Predicted ids promised at g's export (n per layer through gated layer `through`, exclusive).
+    unsigned promise(unsigned g,unsigned n,unsigned through)const{return n&&g<through&&exports(g)&&exports(g+1)?n:0;}
+};
 struct TierView {
     const std::int32_t* slot_of=nullptr;const std::uint32_t* unit_base=nullptr;const std::uint32_t* abort=nullptr;
     std::uint32_t* absent_err=nullptr;std::uint32_t guard_slot=0,n_gated=0,units=0;
     const void* base=nullptr;std::uint64_t stride=0;
 };
+// Slot census (diagnostics, read-only). The library's slots: persistent_slots (residents +
+// spares) first, then two banks of max_ids alias slots, then the guard (dg_layout.cpp):
+// persistent = guard_slot - 2 * max_ids. Per gated layer: units on a persistent slot, on a
+// bank slot, absent; the decode miss count is the exported ids absent when the layer exported.
+struct LayerCensus {std::uint32_t persistent=0,bank=0,absent=0;};
+GLM_HOST_DEVICE inline LayerCensus census_layer(const std::int32_t* slot_of_layer,std::uint32_t units,std::uint32_t persistent_slots){
+    LayerCensus c;for(std::uint32_t u=0;u<units;++u){const std::int32_t s=slot_of_layer[u];if(s<0)++c.absent;else if(std::uint32_t(s)<persistent_slots)++c.persistent;else ++c.bank;}return c;}
+// misses[g] = 0xFFFFFFFF: the layer did not export this token.
+inline Json census_json(const std::vector<LayerCensus>& layers,const std::vector<std::uint32_t>& misses,std::uint32_t persistent_slots){
+    auto j=Json::object();auto a=Json::array();std::uint64_t used=0,bank=0,miss=0;
+    for(std::size_t g=0;g<layers.size();++g){auto o=Json::object();o.set("gated",std::uint64_t(g));o.set("persistent",std::uint64_t(layers[g].persistent));o.set("bank",std::uint64_t(layers[g].bank));
+        o.set("absent",std::uint64_t(layers[g].absent));if(g<misses.size()&&misses[g]!=0xFFFFFFFFu){o.set("misses",std::uint64_t(misses[g]));miss+=misses[g];}
+        used+=layers[g].persistent;bank+=layers[g].bank;a.push(o);}
+    j.set("persistent_slots",std::uint64_t(persistent_slots));j.set("persistent_used",used);j.set("persistent_free",used<=persistent_slots?persistent_slots-used:0);
+    j.set("bank_used",bank);j.set("misses",miss);j.set("layers",a);return j;}
 // Guarded lookup, exactly ss_dg_slot (ss.h, tierstream): abort -> guard; id beyond
 // the gated layer's unit count (unit_base[g+1]-unit_base[g]) -> guard; absent
 // entry (< 0) flags absent_err and returns the guard slot (token discarded).
@@ -74,6 +107,8 @@ public:
     virtual Json stats()=0;
     // Best effort, for failure receipts: raw counters and the last token error (empty: none).
     virtual Json diagnostics(){return Json::object();}
+    // Whether the open step exports gated layer g (StepPlan above); a cache without steps exports every layer.
+    virtual bool step_exports(unsigned)const{return true;}
     // Between tokens: device-resident keys, most recent first (ss_dg_residency;
     // written at shutdown, it seeds the next open). Empty when unsupported.
     virtual std::vector<std::uint32_t> residency(){return {};}
@@ -126,6 +161,16 @@ TierBudget tier_budget(const TierBudgetIn& in);
 // parts in, the expert tiers get what is left (ss_budget_plan), with the smallest
 // caps that would hold the fixed parts.
 struct BudgetPart {std::string name;std::uint64_t bytes=0;};
+// Host memory that grows after the cache opens and the measured process commit misses:
+// the decode bench's session snapshot (a host copy of the session state + replay, held
+// across its arms) and the CUDA driver's later host allocations (graph instantiation,
+// module data, per-request buffers). The 24/32 8K bench peaked 1.10 GB over the plan at
+// open: 0.49 GB snapshot + 0.61 GB driver/other, so the headroom is 768 MiB.
+inline constexpr const char* session_snapshot_part="decode session snapshot (host copy of session state + replay, bench restores)";
+inline constexpr const char* host_growth_part="host growth after open (CUDA driver / graph instantiation / request buffers, headroom)";
+inline constexpr std::uint64_t host_growth_headroom=768ULL<<20;
+struct BudgetPart;
+inline void add_host_growth_parts(std::vector<BudgetPart>& pageable,std::uint64_t session_snapshot_bytes);
 struct WholeDeviceIn {
     std::uint64_t vram_total=0,ram_total=0,context=0;        // caps (0 = uncapped), measured device context
     std::uint64_t vram_margin=0,ram_margin=0;                 // kept free under each cap (graphs, warm-up, allocator slack)
@@ -135,6 +180,7 @@ struct WholeDeviceIn {
     std::uint64_t min_resident=1;                             // smallest arena accepted (prefill through the cache: 288 + spares)
     TierBudgetIn tier;                                        // keys, unit stride, spares, staging, ring
 };
+inline void add_host_growth_parts(std::vector<BudgetPart>& pageable,std::uint64_t session_snapshot_bytes){pageable.push_back({session_snapshot_part,session_snapshot_bytes});pageable.push_back({host_growth_part,host_growth_headroom});}
 struct WholeDevicePlan {
     TierBudget tier;std::vector<BudgetPart> device,pinned;    // the parts as planned (library parts added)
     std::uint64_t device_fixed=0,device_planned=0,host_fixed=0,host_planned=0,min_vram_total=0,min_ram_total=0;
@@ -316,6 +362,12 @@ public:
     // Prefill residency, only between accepted tokens. ANY unsuccessful call,
     // a capacity refusal included, retires the worker irreversibly: later
     // requests report the original error (the request it served is discarded).
+    // As make_resident, but SS_E_CAPACITY returns false WITHOUT retiring (nothing changed;
+    // the residency restore after a prefill stops there); any other failure retires.
+    bool try_make_resident(unsigned g,const std::int32_t* ids,unsigned n){
+        between_tokens("residency restore only between accepted tokens");
+        if(!api_.supports_make_resident())return false;
+        try{return api_.make_resident(g,ids,n);}catch(const std::exception& e){retire(e.what());throw;}catch(...){retire("make_resident: non-standard exception");throw;}}
     void make_resident(unsigned g,const std::int32_t* ids,unsigned n){
         between_tokens("prefill residency only between accepted tokens");
         if(!api_.supports_make_resident()){const std::string m="this tierstream library has no make_resident (reader/resident requested)";retire(m);throw std::runtime_error(m);}
@@ -347,6 +399,16 @@ public:
 // cache does none of these (descriptors are zeroed, then bound per layer).
 struct PrefillInit {bool rings=true,admit_layers=true,startup_descriptors=true;};
 inline PrefillInit prefill_init(bool via_cache){return via_cache?PrefillInit{false,false,false}:PrefillInit{};}
+// The decode placement planned at open (the tier array's residents, per gated layer, in
+// ascending unit order): restored after every prefill through the cache, whose whole-layer
+// make_resident sets otherwise stay in the persistent slots (ordinary residents once
+// released) and leave the decode residency to the last prefilled layers. Restore = one held
+// make_resident set per layer in order (each set protects the previous ones; the planned
+// residents + the spare target fit the persistent slots by the plan), then every set released.
+inline std::vector<std::vector<std::int32_t>> planned_residents(const std::vector<std::uint8_t>& tiers,std::uint8_t resident_tier,unsigned gated,unsigned units){
+    std::vector<std::vector<std::int32_t>> p(gated);
+    for(std::size_t k=0;k<tiers.size()&&k<std::size_t(gated)*units;++k)if(tiers[k]==resident_tier)p[k/units].push_back(std::int32_t(k%units));
+    return p;}
 struct PrefillResidency {
     static constexpr unsigned units=288;
     std::vector<std::int32_t> ids;
