@@ -6,13 +6,16 @@
 prefill, MTP and HTTP serving. `default` preserves current production behavior
 without exporting profile switches. `fast` applies ready and explicitly provisional
 runnable levers in the [single profile table](../include/strix/qwen_profile_table.hpp).
-It currently applies BF16 MoE route storage by exporting
+Where the route admits it, fast currently applies BF16 MoE route storage by exporting
 `STRIX_QPF2K_MOE_ROUTE_BF16=1`, without `--allow-pending`. This bit-changing row
 changes logits and is selected ahead of its qualification receipt; qualification
 is in progress. Its receipt status is `provisional`, with qualification stamp
 `qualification in progress: moe_route_bf16`, and exactly one stderr line states
-that it is bit-changing and qualification is in progress. Attention budget,
-FP16 recurrent chunks and output head remain pending: builtin paths continue,
+that it is bit-changing and qualification is in progress. On other routes, including
+HTTP and MTP, the row stays `pending` with the same reason as an explicit request's
+decline, keeps FP32 route storage and is not exported or stamped as applied. If no
+provisional or unqualified row runs, the qualification stamp is `qualified`.
+Attention budget, FP16 recurrent chunks and output head remain pending: builtin paths continue,
 with one notice per row and declared targets in `profile.pending`.
 `quality` runs default settings with one notice because no quality pack exists.
 

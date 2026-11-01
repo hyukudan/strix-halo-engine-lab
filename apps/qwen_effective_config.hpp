@@ -1167,12 +1167,27 @@ inline void finalize_cache_family(Options& o, CacheRunner runner, std::uint32_t 
 inline EffectiveConfig resolve_effective_config(const RequestedOptions& request,
     const ModelContract& model, const gguf::FileInfo& info, const ModelManifest& manifest,
     std::string_view content, const PrefillCapabilities& capabilities, const PrefillMemory& memory) {
-    auto result=resolve_prefill_effective_config(request,model,info,manifest,content,capabilities,memory);
+    // Stage proposals locally. Route admission needs resolved prefill/serving
+    // options and model writers; no candidate reaches process switch readers yet.
+    auto proposed = request;
+    admit_product_profile(proposed.options);
+    qwen::profile::apply(proposed.options.product_profile, [&](const char* key, const char* value) {
+        if (!qwen::profile::metadata_environment(key)) proposed.environment[key] = value;
+        return true;
+    });
+    auto result=resolve_prefill_effective_config(proposed,model,info,manifest,content,capabilities,memory);
     resolve_serve_prefill(result,model,content,capabilities,memory);
     resolve_session_defaults(result.options,model,request.environment,memory.available);
     resolve_prefix_defaults(result.options,model,request.environment,memory.available);
     auto& o = result.options;
-    resolve_moe_route_bf16(o, result.environment, result.gsq_owner, capabilities.fp16_operands, result.error);
+    // A profile proposal may fall back to builtin storage. Explicit requests
+    // retain the hard-refusal contract, including native CLI precedence.
+    const auto* route_row = o.product_profile.find("moe_route_bf16");
+    const bool profile_route = !o.prefill_moe_route_bf16_requested.has_value() && route_row &&
+        (route_row->status == qwen::profile::Status::set || route_row->status == qwen::profile::Status::unqualified ||
+         route_row->status == qwen::profile::Status::provisional);
+    std::string route_error;
+    resolve_moe_route_bf16(o, result.environment, result.gsq_owner, capabilities.fp16_operands, route_error);
     if (o.prefill_moe_route_bf16) {
         const bool geometry = model.hidden_size == 2560U && model.moe_intermediate_size % 128U == 0U &&
             model.moe_intermediate_size >= 320U && model.moe_intermediate_size <= 640U &&
@@ -1187,9 +1202,18 @@ inline EffectiveConfig resolve_effective_config(const RequestedOptions& request,
         if (!geometry || !formats) {
             o.prefill_moe_route_bf16 = false;
             o.prefill_moe_route_bf16_reason = "unsupported DA16 geometry or writer format";
-            result.error = "MoE route BF16 candidate declined: " + o.prefill_moe_route_bf16_reason;
+            route_error = "MoE route BF16 candidate declined: " + o.prefill_moe_route_bf16_reason;
         }
     }
+    if (profile_route && !o.prefill_moe_route_bf16) {
+        for (auto& entry : o.product_profile.entries) if (entry.lever->name == "moe_route_bf16") {
+            entry.status = qwen::profile::Status::pending;
+            entry.target = std::string(entry.lever->target);
+            entry.value = std::string(entry.lever->builtin);
+            entry.reason = o.prefill_moe_route_bf16_reason;
+            result.environment.erase(std::string(entry.lever->env));
+        }
+    } else if (!route_error.empty()) result.error = std::move(route_error);
     if (!result.error.empty()) result.admitted = false;
     if (o.http_serve && !o.baseline && o.prefix_cache && o.prefix_cache_host_bytes &&
         !o.prefix_cache_block_rows_explicit && o.known_prefix_prefill_rows >= 1024 &&

@@ -904,12 +904,13 @@ las copias de checkpoints siguen los límites de bloque existentes.
 Un solo interruptor selecciona un perfil de producto para Qwen (CLI, `--http-serve` y el ejecutor MTP):
 
 - `default`: el valor exacto predeterminado descrito arriba; no cambia nada.
-- `fast`: aplica por ahora el almacenamiento BF16 de las rutas MoE (`STRIX_QPF2K_MOE_ROUTE_BF16=1`) antes de su
-  recibo de cualificación, sin `--allow-pending`. Cambia bits y modifica los logits; la cualificación está en curso.
+- `fast`: aplica por ahora el almacenamiento BF16 de las rutas MoE (`STRIX_QPF2K_MOE_ROUTE_BF16=1`) donde la ruta lo admite,
+  antes de su recibo de cualificación, sin `--allow-pending`. Cambia bits y modifica los logits; la cualificación está en curso.
   El recibo indica `qualification in progress: moe_route_bf16` y marca la fila como `provisional`; una línea de
-  stderr informa del cambio de bits y del estado de la cualificación. El presupuesto de selección de atención, la
-  recurrencia por fragmentos FP16 y la cabeza de salida FP16 siguen pendientes y mantienen sus rutas internas, con un
-  aviso cada una.
+  stderr informa del cambio de bits y del estado de la cualificación. En las demás rutas, incluidas HTTP y MTP,
+  la fila queda `pending` con el motivo del rechazo, mantiene el almacenamiento FP32 y no se exporta ni se marca como aplicada.
+  El presupuesto de selección de atención, la recurrencia por fragmentos FP16 y la cabeza de salida FP16 siguen pendientes
+  y mantienen sus rutas internas, con un aviso cada una.
 - `quality`: no hay paquete de calidad para este modelo, así que ejecuta `default` y lo indica en el recibo.
 
 `--allow-pending` (o `STRIX_QWEN_PROFILE_ALLOW_PENDING=1`) ejecuta las opciones realmente pendientes cuyo código está

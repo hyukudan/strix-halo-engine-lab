@@ -715,6 +715,17 @@ void yarn_admission_tests(const gguf::FileInfo& info, const ModelManifest& manif
         auto plain = request; plain.options.tokens.resize(262144U,1U);
         const auto off = resolve(plain,memory);
         expect(off.admitted && !off.options.prefill_moe_route_bf16,"YaRN long prompt candidate defaults off");
+        auto fast = plain;
+        fast.options.product_profile = qwen::profile::resolve(qwen::profile::Name::fast, {});
+        const auto fast_config = resolve(fast, memory);
+        Environment exported;
+        qwen::profile::apply(fast_config.options.product_profile, [&](const char* name, const char* value) {
+            exported[name] = value; return true;
+        });
+        expect(fast_config.admitted && fast_config.options.prefill_moe_route_bf16 &&
+            fast_config.options.product_profile.find("moe_route_bf16")->status == qwen::profile::Status::provisional &&
+            exported.at(key) == "1" && exported.at("STRIX_QWEN_PROFILE_OWNED_moe_route_bf16") == "fast:provisional:1",
+            "fast YaRN long CLI still admits and exports provisional storage");
         const auto off_pair = numerical_profile_pair(off.options);
         // Exercise the host compiler with synthetic kernels, without HIP. The
         // production prefix key includes this execution identity and pair hash.
@@ -1797,13 +1808,15 @@ int main(int argc, char** arguments) {
                 inputs.env = [](const char*) -> const char* { return nullptr; };
                 inputs.allow_pending = allow;
                 selected.options.product_profile = qwen::profile::resolve(profile, inputs);
-                admit_product_profile(selected.options);
-                qwen::profile::apply(selected.options.product_profile, [&](const char* key, const char* value) {
-                    if (!qwen::profile::metadata_environment(key)) selected.environment[key] = value;
-                    return true;
-                });
                 const auto got = resolve(selected, memory);
                 const bool enabled = profile == qwen::profile::Name::fast;
+                Environment exported;
+                qwen::profile::apply(got.options.product_profile, [&](const char* key, const char* value) {
+                    exported[key] = value; return true;
+                });
+                expect(enabled ? exported.at(candidate_key) == "1" &&
+                    exported.at("STRIX_QWEN_PROFILE_OWNED_moe_route_bf16") == "fast:provisional:1" : exported.empty(),
+                    "native CLI exports storage only after route admission");
                 expect(got.error.empty() && got.options.prefill_moe_route_bf16 == enabled,
                     "fast profile applies provisional storage through native resolver without permission");
                 expect(moe_prefill_storage_name(got.options.prefill_moe_route_bf16) ==
@@ -1915,6 +1928,75 @@ int main(int argc, char** arguments) {
     }
     {
         auto argv=mtp_fixture(); argv.insert(argv.begin()+5,13,"1");
+        // Exercise the standard serving argv and MTP CLI through the same
+        // inspection resolution used before any profile process exports.
+        for (const auto batch : {"cli", "auto", "0", "2"}) {
+            auto args = argv;
+            const bool http = std::string_view(batch) != "cli";
+            if (http) *std::next(std::find(args.begin(), args.end(), "--mtp-candidate-depth")) = "7";
+            if (http) args.insert(args.end(), {"--http-serve", "--mtp-window-prefix",
+                "--mtp-draft-chain", "--mtp-target-window-rows-set", "2,4,8",
+                "--mtp-window-arena-bytes", "2147483648", "--mtp-window-capture-bytes", "67108864",
+                "--mtp-window-checkpoint-bytes", "8589934592", "--mtp-window-total-bytes", "17179869184",
+                "--mtp-window-history-intervals", "8192"});
+            if (http && std::string_view(batch) != "auto")
+                args.insert(args.end(), {"--http-batch", batch});
+            args.insert(args.end(), {"--profile", "fast", "--print-effective-config"});
+            auto selected = RequestedOptions{parse(args), {}};
+            const auto got = resolve(selected, memory);
+            expect(got.error.empty() && !got.options.prefill_moe_route_bf16,
+                "fast HTTP and MTP inspection softly decline candidate storage");
+            const auto* row = got.options.product_profile.find("moe_route_bf16");
+            const auto reason = got.options.prefill_moe_route_bf16_reason;
+            expect(row && row->status == qwen::profile::Status::pending && row->value == "0" &&
+                row->reason == reason && !reason.empty() && reason != "off" &&
+                got.options.product_profile.qualification() == "qualified",
+                "declined row reports builtin, pending and the storage decline reason");
+            Environment exported;
+            qwen::profile::apply(got.options.product_profile, [&](const char* key, const char* value) {
+                exported[key] = value; return true;
+            });
+            expect(!exported.contains("STRIX_QPF2K_MOE_ROUTE_BF16") &&
+                !exported.contains("STRIX_QWEN_PROFILE_OWNED_moe_route_bf16") &&
+                !got.environment.contains("STRIX_QPF2K_MOE_ROUTE_BF16"),
+                "declined candidate is never exported");
+            const auto json = serve::parse_json_unique(effective_config_json(got));
+            const auto* receipt = json.find("profile")->find("levers")->find("moe_route_bf16");
+            expect(receipt->find("status")->as_string() == "pending" &&
+                receipt->find("reason")->as_string() == reason,
+                "inspection profile reports the final route admission");
+            unsigned notices = 0;
+            for (const auto& notice : got.options.product_profile.notices())
+                if (notice.find("moe_route_bf16") != std::string::npos) {
+                    ++notices;
+                    expect(notice.find(" pending ") != std::string::npos && notice.find(reason) != std::string::npos &&
+                        notice.find("is bit-changing") == std::string::npos,
+                        "startup notice reports pending rather than applied storage");
+                }
+            expect(notices == 1, "one final candidate notice");
+            if (http) validate_effective_startup(got);
+            for (const bool cli : {false, true}) {
+                auto explicit_args = args;
+                if (cli) explicit_args.insert(explicit_args.end(), {"--prefill-moe-route-bf16", "on"});
+                auto explicit_request = RequestedOptions{parse(explicit_args), {}};
+                if (!cli) {
+                    explicit_request.environment["STRIX_QPF2K_MOE_ROUTE_BF16"] = "1";
+                    qwen::profile::Inputs inputs;
+                    inputs.env = [](const char* key) -> const char* {
+                        return std::string_view(key) == "STRIX_QPF2K_MOE_ROUTE_BF16" ? "1" : nullptr;
+                    };
+                    explicit_request.options.product_profile = qwen::profile::resolve(qwen::profile::Name::fast, inputs);
+                }
+                const auto refused = resolve(explicit_request, memory);
+                expect(!refused.options.prefill_moe_route_bf16 &&
+                    refused.error == "MoE route BF16 candidate declined: " + reason,
+                    "explicit CLI and unowned environment keep the hard refusal");
+                explicit_request.options.prefill_moe_route_bf16_requested = false;
+                const auto off = resolve(explicit_request, memory);
+                expect(off.error.empty() && !off.options.prefill_moe_route_bf16 &&
+                    off.options.prefill_moe_route_bf16_reason == "off", "explicit OFF preserves FP32 storage");
+            }
+        }
         argv.insert(argv.end(),{"--http-serve","--http-batch","0"});
         auto served=RequestedOptions{parse(argv),{}};
         const auto resolved=resolve(served,memory);

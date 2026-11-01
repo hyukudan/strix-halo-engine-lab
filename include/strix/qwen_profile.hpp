@@ -194,6 +194,7 @@ inline Resolution resolve(Name profile, const Inputs& inputs = {}, std::span<con
     return out;
 }
 using Export = std::function<bool(const char*, const char*)>;
+using Erase = std::function<bool(const char*)>;
 inline bool export_environment(const char* key, const char* value) {
 #ifdef _WIN32
     return _putenv_s(key, value) == 0;
@@ -201,7 +202,30 @@ inline bool export_environment(const char* key, const char* value) {
     return ::setenv(key, value, 1) == 0;
 #endif
 }
-// Apply immediately after parsing, before any switch readers. Emit notices
+inline bool erase_environment(const char* key) {
+#ifdef _WIN32
+    return _putenv_s(key, "") == 0;
+#else
+    return ::unsetenv(key) == 0;
+#endif
+}
+// A re-exec can inherit a proposal that its new route declines. Remove only
+// switches whose matching marker proves profile ownership; explicit env wins.
+inline void withdraw_declined(const Resolution& resolution, const Lookup& get = {}, const Erase& erase = erase_environment) {
+    for (const auto& entry : resolution.entries) {
+        if (entry.status != Status::pending || entry.reason.empty() || entry.lever->env.empty()) continue;
+        const auto key = std::string(entry.lever->env), owned_key = marker_key(*entry.lever);
+        const char* value = environment(get, key);
+        const char* owned = environment(get, owned_key);
+        if (!value || !owned) continue;
+        bool inherited = false;
+        for (const auto status : {Status::set, Status::unqualified, Status::provisional})
+            inherited |= std::string_view(owned) == marker(resolution.profile, status, value);
+        if (inherited && (!erase(key.c_str()) || !erase(owned_key.c_str())))
+            throw std::runtime_error("cannot withdraw profile switch " + key);
+    }
+}
+// Apply after route admission, before device switch readers. Emit notices
 // once at startup; if a re-exec is added, emit them in its final process image.
 inline void apply(const Resolution& resolution, const Export& put = export_environment) {
     for (const auto& entry : resolution.entries) {
