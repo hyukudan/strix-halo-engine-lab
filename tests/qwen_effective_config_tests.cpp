@@ -3065,9 +3065,15 @@ int main(int argc, char** arguments) {
             for(const auto& [name,digest]:records) std::cout<<name<<' '<<digest<<'\n';
             return 0;
         }
+        // The build passes the table's absolute path: __FILE__ can be relative to the build directory (Ninja), so
+        // running the binary from another directory would otherwise miss the table and report every case.
+#ifdef STRIX_QWEN_CACHE_REFERENCE
+        std::ifstream reference(STRIX_QWEN_CACHE_REFERENCE);
+#else
         std::ifstream reference(std::filesystem::path(__FILE__).parent_path()/"qwen_cache_public_main_reference.txt");
+#endif
         expect(bool(reference),"public-main reference table exists");
-        for(const auto& [name,digest]:records) {
+        if(reference) for(const auto& [name,digest]:records) {
             std::string expected_name,expected_digest;reference>>expected_name>>expected_digest;
             if(expected_name!=name || expected_digest!=digest) std::cerr<<"reference mismatch "<<name<<'\n';
             expect(expected_name==name && expected_digest==digest,"explicit resolver output matches public main");
