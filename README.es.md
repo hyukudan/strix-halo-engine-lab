@@ -1119,12 +1119,13 @@ serial, no a la rotatoria nativa, y no cualifican la fidelidad general del model
 Medido en un nodo Strix Halo, ruta por defecto (código `a199c8e0` más la selección de bundle de #137), prosa real
 diversa (50 libros de dominio público en seis idiomas), decodificación greedy y escalera de almacenamiento automática (sin
 ajustes manuales de almacenamiento). El TTFT va desde el arranque del proceso hasta el primer token e incluye la carga del modelo.
-Las celdas de prefill y decode a 262K proceden del build `7b2453fe` (prompt de 262,144 tokens, tiempo de prefill sin la carga del modelo,
-`--profile default` y `--profile fast` intercalados); las demás celdas de la fila proceden del build indicado arriba.
+La celda de prefill a 262K procede de la rama main pública `669bcb83` (prompt de 262,144 tokens, tiempo de prefill sin la
+carga del modelo, `--profile default` y `--profile fast` intercalados, dos pares: 179.07 s y 174.18 s); las celdas de decode a
+262K proceden del build `7b2453fe`; las demás celdas de la fila proceden del build indicado arriba.
 
 | Contexto (factor YaRN) | Gate exacto (MTP == serial == pool desactivado) | TTFT serial / MTP | Prefill, serial | Decode serial / MTP | Aceptación MTP |
 |---|---|---|---|---|---|
-| 262,400 (2) | Alcance completo | 219 s / 224 s | **1,371 tok/s** `--profile default`; 1,412 tok/s `--profile fast` (`7b2453fe`) | 20.55 / **59.5 tok/s** (2.9x, `7b2453fe`) | 75 % |
+| 262,400 (2) | Alcance completo | 219 s / 224 s | **1,464 tok/s** `--profile default`; 1,505 tok/s `--profile fast` (`669bcb83`) | 20.55 / **59.5 tok/s** (2.9x, `7b2453fe`) | 75 % |
 | 524,288 (2) | Alcance objetivo | 470 s / 508 s | 1,215 tok/s | 19.7 / **60.6 tok/s** (3.1x) | 85 % |
 | 1,048,576 (4) | Alcance completo, más el recibo de la ruta por defecto | 1,005 s / 1,096 s | 1,081 tok/s (ruta MTP unos 970) | 18.7 / **55.9 tok/s** (3.0x) | 83 % |
 
