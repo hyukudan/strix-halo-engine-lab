@@ -423,12 +423,70 @@ void a8_down_runtime_admission() {
 
 }  // namespace
 
+#ifdef STRIX_HAS_EXPERIMENTAL_Q4K_A8_RUNTIME
+// STRIX_MOE_R1_GLUE_FUSE tail: the fused launch against the incumbent merge, finite scan, BF16 commit and deferred
+// publication on poisoned buffers: accumulation, output, status and first-error record bytes equal. Cases: finite,
+// sticky input status, +inf / NaN / BF16-overflowing merge results, an invalid route and an already-set record.
+static void r1_glue_tail() {
+    constexpr std::uint32_t hidden = 2560U, experts = 512U, top_k = 10U;
+    float *rawdots = nullptr, *weights = nullptr, *accumulation = nullptr; std::uint32_t *routes = nullptr, *status = nullptr;
+    std::uint16_t* output = nullptr; void* record = nullptr;
+    check(hipMalloc(&rawdots, top_k * hidden * 4U), "tail rawdots"); check(hipMalloc(&weights, top_k * 4U), "tail weights");
+    check(hipMalloc(&accumulation, hidden * 4U), "tail accumulation"); check(hipMalloc(&routes, top_k * 4U), "tail routes");
+    check(hipMalloc(&status, 4U), "tail status"); check(hipMalloc(&output, hidden * 2U), "tail output"); check(hipMalloc(&record, 8U), "tail record");
+    std::uint32_t seed = 0x5eedU;
+    const auto next = [&] { seed = seed * 1664525U + 1013904223U; return seed; };
+    for (unsigned c = 0; c < 8U; ++c) {
+        std::vector<float> dots(top_k * hidden), w(top_k);
+        std::vector<std::uint32_t> r(top_k);
+        for (auto& d : dots) d = std::ldexp(static_cast<float>(static_cast<int>(next() % 2001U) - 1000), -8);
+        for (unsigned i = 0; i < top_k; ++i) { r[i] = next() % experts; w[i] = std::ldexp(static_cast<float>(next() % 1000U + 1U), -10); }
+        std::uint32_t initial = c == 1U ? 2U : 0U;
+        if (c == 2U) dots[3U * hidden + 7U] = std::numeric_limits<float>::infinity();
+        if (c == 3U) dots[9U * hidden + hidden - 1U] = std::bit_cast<float>(0x7fc00123U);
+        if (c == 4U) { dots[5U] = 3.4e38F; w[0] = 1.0F; }
+        if (c == 5U) r[6] = experts;
+        std::array<std::uint32_t, 2> preset{0U, 0U};
+        if (c == 6U) { preset = {3U, 1U}; dots[11U] = -std::numeric_limits<float>::infinity(); }
+        if (c == 7U) for (auto& d : dots) d = -0.0F;
+        std::array<std::vector<unsigned char>, 4> result[2];
+        for (const bool fused : {false, true}) {
+            check(hipMemcpy(rawdots, dots.data(), dots.size() * 4U, hipMemcpyHostToDevice), "tail dots");
+            check(hipMemcpy(weights, w.data(), w.size() * 4U, hipMemcpyHostToDevice), "tail weights up");
+            check(hipMemcpy(routes, r.data(), r.size() * 4U, hipMemcpyHostToDevice), "tail routes up");
+            check(hipMemset(accumulation, 0xa5, hidden * 4U), "tail poison");
+            if (c != 5U) check(hipMemset(accumulation, 0, hidden * 4U), "tail clear");
+            check(hipMemset(output, 0x5a, hidden * 2U), "tail output poison");
+            check(hipMemcpy(status, &initial, 4U, hipMemcpyHostToDevice), "tail status");
+            check(hipMemcpy(record, preset.data(), 8U, hipMemcpyHostToDevice), "tail record");
+            strix::enqueue_q4k_a8_serial_tail_for_test(fused, rawdots, routes, weights, hidden, experts, top_k, accumulation, output,
+                status, record, nullptr);
+            check(hipDeviceSynchronize(), "tail run");
+            auto& out = result[fused ? 1 : 0];
+            out[0].resize(hidden * 4U); out[1].resize(hidden * 2U); out[2].resize(4U); out[3].resize(8U);
+            check(hipMemcpy(out[0].data(), accumulation, out[0].size(), hipMemcpyDeviceToHost), "tail read");
+            check(hipMemcpy(out[1].data(), output, out[1].size(), hipMemcpyDeviceToHost), "tail read");
+            check(hipMemcpy(out[2].data(), status, 4U, hipMemcpyDeviceToHost), "tail read");
+            check(hipMemcpy(out[3].data(), record, 8U, hipMemcpyDeviceToHost), "tail read");
+        }
+        std::uint32_t bits = 0; std::memcpy(&bits, result[1][2].data(), 4U);
+        expect(result[0] == result[1], "R1 glue tail differs from the incumbent launches");
+        std::printf("r1 glue tail case %u status %u %s\n", c, bits, result[0] == result[1] ? "SAME" : "DIFFER");
+    }
+    for (void* p : {static_cast<void*>(rawdots), static_cast<void*>(weights), static_cast<void*>(accumulation), static_cast<void*>(routes),
+            static_cast<void*>(status), static_cast<void*>(output), record}) check(hipFree(p), "tail free");
+}
+#endif
 int main(int argc, char** argv) try {
     const unsigned int requested_mode = argc > 1 ? static_cast<unsigned int>(std::stoul(argv[1])) : 0U;
     if (requested_mode > 7U) throw std::invalid_argument("invalid K-quant test mode");
 #ifdef STRIX_HAS_EXPERIMENTAL_Q4K_A8_RUNTIME
     if (argc > 2 && std::string(argv[2]) == "a8-down-runtime-admission") {
         a8_down_runtime_admission();
+        return failures == 0 ? 0 : 1;
+    }
+    if (argc > 2 && std::string(argv[2]) == "r1-glue-tail") {
+        r1_glue_tail();
         return failures == 0 ? 0 : 1;
     }
 #endif

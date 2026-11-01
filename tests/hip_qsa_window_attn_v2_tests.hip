@@ -330,6 +330,22 @@ void fixture_case(unsigned rows, unsigned count, bool sparse, Pattern pattern, b
             "probability bytes differ, draft v2 vs attention_score_kernel: " + label);
         strict(o.read(d[0].output, width * sizeof(float)), o.read(d[1].output, width * sizeof(float)),
             "output bytes differ, draft v2 vs attention_score_kernel: " + label);
+        // Plain one-row decode (STRIX_QSA_DECODE_VALUE_V2): the v2 score, the same attention_softmax_kernel and the two-launch
+        // value kernels (v2 = attention_value_draft_kernel<1, 2, 32>, v4 = <4, 8, 16>) against attention_score_kernel +
+        // attention_softmax_kernel + attention_output_kernel (arm 0): probability and output bytes equal.
+        for (const char* variant : {"v2", "v4"}) {
+            DraftAttention v = d[1];
+            v.scores = o.allocate<float>(static_cast<std::size_t>(kHeads) * kMaximum, poison);
+            v.output = o.allocate<float>(width, poison);
+            require(draft_attention_admitted(v, "w4", variant), std::string("plain value ") + variant + " not admitted: " + label);
+            enqueue_draft_one_block(v, true, false, o.stream);
+            enqueue_draft_tail_stage(v, variant, false, o.stream);
+            enqueue_draft_tail_stage(v, variant, true, o.stream);
+            strict(o.read(d[0].scores, score_bytes), o.read(v.scores, score_bytes),
+                std::string("probability bytes differ, plain value ") + variant + ": " + label);
+            strict(o.read(d[0].output, width * sizeof(float)), o.read(v.output, width * sizeof(float)),
+                std::string("output bytes differ, plain value ") + variant + " vs attention_output_kernel: " + label);
+        }
     }
     o.guards();
     ++compared;
@@ -454,6 +470,14 @@ int bench(unsigned reps) {
             const auto lds = b.time([&] { enqueue_draft_one_block(b.d, false, false, o.stream); });
             const auto draft = b.time([&] { enqueue_draft_one_block(b.d, true, false, o.stream); });
             std::printf("  draft: attention_score_kernel %.1f, draft v2 %.1f (saved %.1f)\n", lds, draft, lds - draft);
+            // Plain one-row decode step: v2 score + softmax + value kernel (incumbent attention_output_kernel vs v2 / v4).
+            const auto incumbent = b.time([&] { enqueue_draft_one_block(b.d, true, true, o.stream); });
+            const auto value = [&](const char* variant) {
+                return b.time([&] { enqueue_draft_one_block(b.d, true, false, o.stream); enqueue_draft_tail_stage(b.d, variant, false, o.stream);
+                    enqueue_draft_tail_stage(b.d, variant, true, o.stream); });
+            };
+            const auto v2 = value("v2"), v4 = value("v4");
+            std::printf("  plain step: score+softmax+attention_output_kernel %.1f, value v2 %.1f, value v4 %.1f\n", incumbent, v2, v4);
         }
     }
     return 0;

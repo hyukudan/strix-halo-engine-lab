@@ -3179,11 +3179,12 @@ struct PreparedIndexedSelection {
 // (defined after HipQsaWindowPool). False when the pool cannot serve this step; the caller then runs block_score_kernel.
 bool qsa_decode_pool_scores(const PreparedIndexedLaunch& a, const HipIndexedAttentionLauncherConfig& config, std::uint64_t position,
     std::uint32_t complete_blocks, std::uint32_t ratio, QsaPrefillPool* borrowed = nullptr,
-    const std::shared_ptr<HipQsaCommittedPool>& committed_owner = {});
+    const std::shared_ptr<HipQsaCommittedPool>& committed_owner = {}, bool dynamic_position = true,
+    const float** fused_maxima = nullptr);
 // After qsa_decode_pool_scores: the selection from the scores' 4-block group maxima (qsa_flash::select_row_body, the
 // selected set, order and -inf writes of select_blocks_kernel). False when not enabled or no maxima scratch.
 bool qsa_decode_pool_select(const PreparedIndexedLaunch& a, const HipIndexedAttentionLauncherConfig& config,
-    const PreparedIndexedSelection& selection);
+    const PreparedIndexedSelection& selection, const float* fused_maxima = nullptr);
 
 PreparedIndexedLaunch prepare_indexed_attention_launch(
     const ExecutionDispatchContext& context, const HipIndexedAttentionLauncherConfig* config_ptr) {
@@ -3679,6 +3680,16 @@ void launch_qsa_dense_a8_inputs(const std::array<const TensorPair*, 5>& matrices
     const std::array<float*, 5>& targets, const ExecutionBufferAddress& input, std::uint32_t hidden, hipStream_t stream, unsigned skip = 0U);
 void launch_qsa_dense_a8_output(const TensorPair& weights, const float* input, const ExecutionBufferAddress& output,
     std::uint32_t width, std::uint32_t hidden, hipStream_t stream);
+// Plain R1 attention score with four query heads per K row (defined with the draft v2 score below); false = not
+// admitted, the caller launches attention_score_kernel.
+bool launch_decode_r1_scores_v2(const float* q_gate, const std::uint16_t* kv, const std::uint32_t* selected, float* scores,
+    std::uint32_t count, std::uint32_t maximum, std::uint32_t heads, std::uint32_t kv_heads, std::uint32_t dim,
+    const GraphSelectionArguments& selection, bool device_graph, hipStream_t stream);
+// Plain R1 value/gate on the softmax's probabilities with the draft step's two-launch value kernel (defined with it);
+// false = not admitted, the caller launches attention_output_kernel.
+bool launch_decode_r1_value_v2(const float* q_gate, const std::uint16_t* kv, const std::uint32_t* selected, const float* scores,
+    std::uint32_t count, std::uint32_t maximum, std::uint32_t heads, std::uint32_t kv_heads, std::uint32_t dim, float* output,
+    const GraphSelectionArguments& selection, bool device_graph, hipStream_t stream);
 
 void launch_indexed_attention(const ExecutionDispatchContext& context, void* user_data) {
     const auto prepared = prepare_indexed_attention_launch(context,
@@ -3808,9 +3819,11 @@ void launch_indexed_attention(const ExecutionDispatchContext& context, void* use
                 "HIP hierarchical QSA local status reset");
             score_selection.position.status = workspace.selection_status;
         }
+        const float* fused_maxima = nullptr;
         const bool decode_pooled = !device_graph && !config.qsa_hierarchical_selection && (config.decode_pool || committed_access) &&
             qsa_decode_pool_scores(prepared, config, context.position, complete_blocks, ratio,
-                committed_access ? static_cast<QsaPrefillPool*>(committed_access->storage()) : nullptr,committed_pool);
+                committed_access ? static_cast<QsaPrefillPool*>(committed_access->storage()) : nullptr,committed_pool,
+                dynamic_selection.position.position != nullptr, &fused_maxima);
         if (!decode_pooled)
         launch_block_scores(
             workspace,
@@ -3835,7 +3848,7 @@ void launch_indexed_attention(const ExecutionDispatchContext& context, void* use
                 config.selection_stats->submissions.fetch_add(1, std::memory_order_relaxed);
                 config.selection_stats->layer_submissions[*context.layer].fetch_add(1, std::memory_order_relaxed);
             }
-        } else if (!decode_pooled || !qsa_decode_pool_select(prepared, config, selection)) {
+        } else if (!decode_pooled || !qsa_decode_pool_select(prepared, config, selection, fused_maxima)) {
         hipLaunchKernelGGL(
             select_blocks_kernel,
             dim3(1),
@@ -3948,7 +3961,10 @@ void launch_indexed_attention(const ExecutionDispatchContext& context, void* use
         hip_execution_stream(), workspace.q_gate, reinterpret_cast<const std::uint16_t*>(kv_state.address), workspace.selected_indices,
         selected_count, checked_u32(workspace_layout.maximum_selected_tokens, "maximum_selected_tokens"), attention_heads, kv_heads,
         head_dim, workspace.attention_scores, dynamic_selection);
-    else hipLaunchKernelGGL(
+    else if (!launch_decode_r1_scores_v2(workspace.q_gate, reinterpret_cast<const std::uint16_t*>(kv_state.address),
+            workspace.selected_indices, workspace.attention_scores, selected_count,
+            checked_u32(workspace_layout.maximum_selected_tokens, "maximum_selected_tokens"), attention_heads, kv_heads, head_dim,
+            dynamic_selection, device_graph, hip_execution_stream())) hipLaunchKernelGGL(
         attention_score_kernel,
         dim3(
             static_cast<std::uint32_t>(
@@ -3992,7 +4008,10 @@ void launch_indexed_attention(const ExecutionDispatchContext& context, void* use
         workspace.q_gate, reinterpret_cast<const std::uint16_t*>(kv_state.address), workspace.selected_indices,
         workspace.attention_scores, selected_count, checked_u32(workspace_layout.maximum_selected_tokens, "maximum_selected_tokens"),
         attention_heads, kv_heads, head_dim, workspace.attention_output, dynamic_selection);
-    else hipLaunchKernelGGL(
+    else if (!launch_decode_r1_value_v2(workspace.q_gate, reinterpret_cast<const std::uint16_t*>(kv_state.address),
+            workspace.selected_indices, workspace.attention_scores, selected_count,
+            checked_u32(workspace_layout.maximum_selected_tokens, "maximum_selected_tokens"), attention_heads, kv_heads, head_dim,
+            workspace.attention_output, dynamic_selection, device_graph, hip_execution_stream())) hipLaunchKernelGGL(
         attention_output_kernel,
         dim3(attention_heads),
         dim3(head_dim),
@@ -5172,6 +5191,20 @@ void launch_draft_attention_value(DraftTailVariant variant, const float* q_gate,
     else throw std::invalid_argument("draft attention value launch needs a two-launch tail variant");
     check_hip(hipGetLastError(), "MTP draft attention value enqueue");
 }
+bool qsa_decode_value_v2_enabled() {
+    static const bool on = qpf2k::long_context_item_enabled("STRIX_QSA_DECODE_VALUE_V2", false);
+    return on && !qpf2k::baseline && !qpf2k::gsq_model;
+}
+bool launch_decode_r1_value_v2(const float* q_gate, const std::uint16_t* kv, const std::uint32_t* selected, const float* scores,
+    std::uint32_t count, std::uint32_t maximum, std::uint32_t heads, std::uint32_t kv_heads, std::uint32_t dim, float* output,
+    const GraphSelectionArguments& selection, bool device_graph, hipStream_t stream) {
+    if (!qsa_decode_value_v2_enabled() || device_graph || selection.position.position || selection.position.status || !count ||
+        maximum > kDraftAttentionSlots || !draft_attention_admitted(DraftScoreVariant::w4, DraftTailVariant::v4, heads, kv_heads, dim, count))
+        return false;
+    launch_draft_attention_value(DraftTailVariant::v4, q_gate, kv, selected, scores, count, maximum, heads, kv_heads, dim, output,
+        selection, stream);
+    return true;
+}
 void launch_draft_attention_tail(DraftTailVariant variant, const float* q_gate, const std::uint16_t* kv,
     const std::uint32_t* selected, float* scores, std::uint32_t count, std::uint32_t maximum, std::uint32_t heads,
     std::uint32_t kv_heads, std::uint32_t dim, float* output, GraphSelectionArguments dynamic, hipStream_t stream) {
@@ -5270,6 +5303,36 @@ void launch_draft_one_block_scores(bool v2, const float* q_gate, const std::uint
     } else hipLaunchKernelGGL(attention_score_kernel, dim3(checked_u32(static_cast<std::uint64_t>(heads) * count, "MTP attention score grid")),
         dim3(kThreads), 0, stream, q_gate, kv, selected, count, maximum, heads, kv_heads, dim, scores, selection);
     check_hip(hipGetLastError(), "MTP attention scores enqueue");
+}
+// STRIX_QSA_DECODE_ATTN_V2 (default on): the plain one-row QSA step (launch_indexed_attention, eager) scores with the
+// draft step's attention_score_rows_pinned_kernel<1, 4, 16, lds_tree> in place of attention_score_kernel: the four query
+// heads of one KV head share each K row, every product and addition operand-pinned to attention_score_kernel's tree, so the
+// scores are byte-identical (NaN payloads included). Device graphs, graph-position selection and a non-finite status
+// word keep attention_score_kernel (the pinned kernel reads neither). Off with STRIX_QSA_DECODE_ATTN_V2=0, under the
+// baseline, STRIX_QPF2K_DEFAULTS=0 and GSQ checkpoints.
+bool qsa_decode_attn_v2_enabled() {
+    // Environment policy once; the GSQ exclusion per call (the model is a thread-local scope).
+    static const bool on = qpf2k::long_context_item_enabled("STRIX_QSA_DECODE_ATTN_V2", false);
+    return on && !qpf2k::baseline && !qpf2k::gsq_model;
+}
+bool decode_r1_attn_v2_route(bool enabled, bool device_graph, const GraphSelectionArguments& selection, std::uint32_t count,
+    std::uint32_t heads, std::uint32_t kv_heads, std::uint32_t dim) {
+    return enabled && !device_graph && !selection.position.position && !selection.position.status && count &&
+        window_attn_v2_admitted(kDraftV2Group, heads, kv_heads, dim);
+}
+// STRIX_QSA_DECODE_VALUE_V2 (default on): after attention_softmax_kernel the plain one-row step forms value/gate with the
+// draft step's attention_value_draft_kernel<4, 8, 16> (four query heads of one KV head per value load, eight feature slices,
+// 16 slots per register block) in place of attention_output_kernel: per (head, feature) the same ascending-slot fma chain
+// over the published probabilities and attention_output_body's BF16 epilogue, so the bytes are equal. Same admission as the
+// v2 score (eager, no graph position or status) plus the draft value bounds. Off with STRIX_QSA_DECODE_VALUE_V2=0, under
+// the baseline, STRIX_QPF2K_DEFAULTS=0 and GSQ checkpoints.
+bool qsa_decode_value_v2_enabled();
+bool launch_decode_r1_scores_v2(const float* q_gate, const std::uint16_t* kv, const std::uint32_t* selected, float* scores,
+    std::uint32_t count, std::uint32_t maximum, std::uint32_t heads, std::uint32_t kv_heads, std::uint32_t dim,
+    const GraphSelectionArguments& selection, bool device_graph, hipStream_t stream) {
+    if (!decode_r1_attn_v2_route(qsa_decode_attn_v2_enabled(), device_graph, selection, count, heads, kv_heads, dim)) return false;
+    launch_draft_one_block_scores(true, q_gate, kv, selected, scores, count, maximum, heads, kv_heads, dim, selection, stream);
+    return true;
 }
 
 #include "hip_qsa_pooled_score.inc"
@@ -7547,9 +7610,21 @@ std::shared_ptr<HipQsaWindowPool> make_hip_qsa_decode_pool(bool bf16_keys) { ret
 // block scores (STRIX_QSA_DECODE_POOL_CHECK=1 recomputes them with block_score_kernel and compares, synchronizing per
 // step). The selection that follows is unchanged. get() drops every block at or after floor(position / ratio).
 namespace {
+// STRIX_QSA_DECODE_FUSED_MAXIMA (default on): where the maxima selection below will run (the serial decode pool's own
+// scores, ratio 4, no graph position), the scorer also writes the 4-block group maxima (block_score_pooled_decode_maxima_kernel,
+// row_maxima_kernel's expression over the same stored scores) and *fused_maxima returns them; the selection then skips
+// row_maxima_kernel. Off with STRIX_QSA_DECODE_FUSED_MAXIMA=0, under the baseline, STRIX_QPF2K_DEFAULTS=0 and GSQ checkpoints.
+bool qsa_decode_fused_maxima_enabled() {
+    // Environment policy once; the GSQ exclusion per call. STRIX_QSA_DECODE_POOL_CHECK=1 rewrites the scores after
+    // scoring, so the maxima are then formed from the rewritten scores by row_maxima_kernel as before.
+    static const bool on = qpf2k::long_context_item_enabled("STRIX_QSA_DECODE_FUSED_MAXIMA", false) &&
+        qpf2k::long_context_item_enabled("STRIX_QSA_DECODE_SELECT", false) &&
+        !(std::getenv("STRIX_QSA_DECODE_POOL_CHECK") && std::getenv("STRIX_QSA_DECODE_POOL_CHECK")[0] == '1');
+    return on && !qpf2k::baseline && !qpf2k::gsq_model;
+}
 bool qsa_decode_pool_scores(const PreparedIndexedLaunch& a, const HipIndexedAttentionLauncherConfig& config, std::uint64_t position,
     std::uint32_t complete_blocks, std::uint32_t ratio, QsaPrefillPool* borrowed,
-    const std::shared_ptr<HipQsaCommittedPool>& committed_owner) {
+    const std::shared_ptr<HipQsaCommittedPool>& committed_owner, bool dynamic_position, const float** fused_maxima) {
     const auto& model = config.model;
     if ((!config.decode_pool && !borrowed) || a.index_dim != 128U || model.indexer_n_heads != 4U || !ratio || !complete_blocks) return false;
     auto* pool = borrowed ? borrowed : config.decode_pool->get(a, ratio, position);
@@ -7582,7 +7657,15 @@ bool qsa_decode_pool_scores(const PreparedIndexedLaunch& a, const HipIndexedAtte
     views.block_scores[0] = a.workspace.block_scores;
     views.blocks[0] = complete_blocks;
     const auto waves = (complete_blocks + 31U) / 32U;
-    if (pool->packed) {
+    float* const maxima = fused_maxima && !borrowed && !dynamic_position && ratio == qsa_flash::kGroup && qsa_decode_fused_maxima_enabled()
+        ? config.decode_pool->maxima((complete_blocks + qsa_flash::kGroup - 1U) / qsa_flash::kGroup) : nullptr;
+    if (maxima) {
+        if (pool->packed) hipLaunchKernelGGL(HIP_KERNEL_NAME(block_score_pooled_decode_maxima_kernel<std::uint16_t>), dim3((waves + 7U) / 8U),
+            dim3(kThreads), 0, stream, views, static_cast<const std::uint16_t*>(pool->packed), complete_blocks, a.index_dim, maxima);
+        else hipLaunchKernelGGL(HIP_KERNEL_NAME(block_score_pooled_decode_maxima_kernel<float>), dim3((waves + 7U) / 8U), dim3(kThreads), 0,
+            stream, views, static_cast<const float*>(pool->keys), complete_blocks, a.index_dim, maxima);
+        *fused_maxima = maxima;
+    } else if (pool->packed) {
         hipLaunchKernelGGL(HIP_KERNEL_NAME(block_score_pooled_rows_kernel<1U, 1U, std::uint16_t>), dim3((waves + 7U) / 8U), dim3(kThreads), 0, stream,
             views, static_cast<const std::uint16_t*>(pool->packed), complete_blocks, a.index_dim);
     } else {
@@ -7620,13 +7703,13 @@ bool qsa_decode_pool_scores(const PreparedIndexedLaunch& a, const HipIndexedAtte
     return true;
 }
 bool qsa_decode_pool_select(const PreparedIndexedLaunch& a, const HipIndexedAttentionLauncherConfig& config,
-    const PreparedIndexedSelection& selection) {
+    const PreparedIndexedSelection& selection, const float* fused_maxima) {
     static const bool enabled = qpf2k::long_context_item_enabled("STRIX_QSA_DECODE_SELECT");
     if (!enabled || !config.decode_pool || selection.ratio != qsa_flash::kGroup || selection.dynamic_selection.position.position) return false;
     const auto groups = (selection.complete_blocks + qsa_flash::kGroup - 1U) / qsa_flash::kGroup;
     const auto stream = hip_execution_stream();
     float* const maxima = config.decode_pool->maxima(groups);
-    if (!maxima) return false;
+    if (!maxima || (fused_maxima && fused_maxima != maxima)) return false;
     // STRIX_QSA_DECODE_POOL_CHECK=1 also runs select_blocks_kernel on a copy of the scores and compares the selected list
     // and the post-selection scores bitwise (synchronizes per layer-step).
     static const bool check = [] { const char* v = std::getenv("STRIX_QSA_DECODE_POOL_CHECK"); return v && v[0] == '1'; }();
@@ -7637,7 +7720,7 @@ bool qsa_decode_pool_select(const PreparedIndexedLaunch& a, const HipIndexedAtte
         check_hip(hipMemcpyAsync(before.data(), a.workspace.block_scores, blocks * sizeof(float), hipMemcpyDeviceToHost, stream), "QSA decode select check copy");
         check_hip(hipStreamSynchronize(stream), "QSA decode select check sync");
     }
-    hipLaunchKernelGGL(qsa_flash::row_maxima_kernel, dim3((groups + 255U) / 256U), dim3(256), 0, stream,
+    if (!fused_maxima) hipLaunchKernelGGL(qsa_flash::row_maxima_kernel, dim3((groups + 255U) / 256U), dim3(256), 0, stream,
         static_cast<const float*>(a.workspace.block_scores), selection.complete_blocks, maxima);
     hipLaunchKernelGGL(qsa_flash::select_one_kernel, dim3(1), dim3(kSelectThreads), 0, stream,
         a.workspace.block_scores, a.workspace.selected_indices, selection.visible, static_cast<const float*>(maxima),

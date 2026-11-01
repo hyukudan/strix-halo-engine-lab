@@ -57,9 +57,14 @@ inline std::string yarn_environment_refusal(const Environment& environment, unsi
         if (name == "STRIX_QPF2K_MOE_ROUTE_BF16") continue;
         // Serial decode pool controls: the pool's only rotary site is block_pool_kernel under with_qwen_rotary
         // (qsa_decode_pool_scores, bound to the table by bind_qwen_pool); the self-check re-derives the scores with
-        // block_score_kernel from the same table; selection and key storage perform no rotation.
+        // block_score_kernel from the same table; selection and key storage perform no rotation. The fused maxima and the
+        // decode attention score only reorganize the launches of already-rotated keys and queries.
         if (name == "STRIX_QSA_DECODE_POOL" || name == "STRIX_QSA_DECODE_POOL_CHECK" ||
-            name == "STRIX_QSA_DECODE_POOL_BF16" || name == "STRIX_QSA_DECODE_SELECT") continue;
+            name == "STRIX_QSA_DECODE_POOL_BF16" || name == "STRIX_QSA_DECODE_SELECT" ||
+            name == "STRIX_QSA_DECODE_FUSED_MAXIMA" || name == "STRIX_QSA_DECODE_ATTN_V2" ||
+            name == "STRIX_QSA_DECODE_VALUE_V2") continue;
+        // Serial MoE glue launches (clear, route checks, quantizer, merge, scan, commit, status) perform no rotation.
+        if (name == "STRIX_MOE_R1_GLUE_FUSE") continue;
         // Compact tiled-prefill memory controls choose where scores, maxima, rounded output images and terminal logits live; the score ring and
         // stage split reuse the same table-bound norm/RoPE, pool and scorer launches, so they add no rotary site.
         if (name == "STRIX_QPF2K_COMPACT_IMAGES" || name == "STRIX_CTX_EXACT_MEMORY" || name == "STRIX_QSA_SCORE_RING" || name == "STRIX_QSA_SCORE_RING_ROWS" ||

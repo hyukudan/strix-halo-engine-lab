@@ -836,6 +836,34 @@ evidence below was measured with FP32 pools.
 - **Measured gain:** plain serial CLI decode at 262K 75.7 to 53.0 ms/step (-30 %), at 131K -14.7 % (measured with decode selection also on; the separate MTP shared service has no measured gain)
 - **Implementation / evidence:** [QSA launcher](../src/hip_indexed_attention_launcher.hip)
 
+<a id="qwen-plain-decode-step"></a>
+
+### Plain decode step: grouped QSA attention, fused selection maxima, two-launch MoE glue
+
+**Engine:** `qwen`. **Controls:** `STRIX_QSA_DECODE_ATTN_V2`, `STRIX_QSA_DECODE_VALUE_V2`, `STRIX_QSA_DECODE_FUSED_MAXIMA`, `STRIX_MOE_R1_GLUE_FUSE`. **Default:** 1 each.
+
+Four exact changes to the one-row (plain, non-MTP) decode step, each with its own switch:
+
+- `STRIX_QSA_DECODE_ATTN_V2`: the QSA attention score runs the draft step's grouped form (four query heads of one KV head
+  share each K row, one wave per 16 slots) instead of one 256-thread workgroup per (head, slot). Every product and
+  addition is operand-pinned to `attention_score_kernel`'s tree.
+- `STRIX_QSA_DECODE_VALUE_V2`: after the same softmax, value/gate runs the draft step's two-launch value kernel (four
+  query heads per value load, eight feature slices) instead of one workgroup per head; the same ascending-slot fma
+  chain per (head, feature) and the same BF16 epilogue.
+- `STRIX_QSA_DECODE_FUSED_MAXIMA`: the pooled indexer scorer also writes the 4-block group maxima the selection reads
+  (the same `fmaxf` expression over the stored scores), so the separate maxima launch is gone.
+- `STRIX_MOE_R1_GLUE_FUSE`: the routed experts step with A8 down runs its glue in two launches instead of nine (one CTA
+  clears the accumulation, checks routes and weights and quantizes; one CTA merges, scans for non-finite values,
+  commits and publishes the first-error record), with the same per-element work and status semantics.
+
+- **Preconditions:** Eager plain one-row decode (CLI serial route, either rope route); BF16 KV, head_dim 256, a multiple of four query heads per KV head; no device graph, graph position or status word. The fused maxima need the serial decode pool's own scores with the maxima selection (`STRIX_QSA_DECODE_SELECT`) and are declined under `STRIX_QSA_DECODE_POOL_CHECK=1`. The MoE glue needs the A8 down profile with deferred MoE status. MTP windows, prefill tiles and cohorts are untouched.
+- **Automatic selection:** On when unset; `=0`, `--baseline`, `STRIX_BASELINE=1` and `STRIX_QPF2K_DEFAULTS=0` turn each off; GSQ checkpoints keep the three QSA items off. All four are allowed on the explicit YaRN route.
+- **Fallback notice:** Unadmitted shapes and routes run the previous kernels without a notice.
+- **Exactness evidence:** Byte-identical by construction and fixture: `strix-hip-qsa-window-attn-v2-tests` (score, probabilities and value/gate output vs `attention_score_kernel` + `attention_softmax_kernel` + `attention_output_kernel`, NaN keys and queries), `strix-hip-qsa-decode-pool-bf16-tests` (scores and group maxima vs the scorer plus `row_maxima_kernel`, 1..262,144 blocks, non-finite keys, canaries), `strix-hip-q4k-a8-probe-tests` (serial prologue vs clear + route checks + quantizer for every error class) and `strix-hip-moe-r1-glue-tail-tests` (tail vs merge, finite scan, commit and publication: sticky status, +-inf, NaN payloads, BF16 overflow, invalid route, preset record). Full model: a 2,304-token prompt (576 complete blocks, above the 512-block selection) and a 32,768-token prompt (64 steps) give byte-identical full FP32 logits for every decode step ON vs OFF vs ON, tokens identical at 1K and 32K.
+- **Off switch:** STRIX_QSA_DECODE_ATTN_V2=0, STRIX_QSA_DECODE_VALUE_V2=0, STRIX_QSA_DECODE_FUSED_MAXIMA=0, STRIX_MOE_R1_GLUE_FUSE=0
+- **Measured gain:** plain decode, prose prompt, 256 tokens, ON vs all four switches off, interleaved ABAB on one node: 1K 43.95 -> 41.59 ms/step (-5.4 %), 32K 46.75 -> 43.92 ms/step (-6.1 %), 262K (explicit YaRN factor 2, default prefill, 128 tokens) 49.46 -> 45.91 ms/step (-7.2 %, 20.2 -> 21.8 tok/s); tokens identical in every pair
+- **Implementation / evidence:** [QSA launcher](../src/hip_indexed_attention_launcher.hip), [pooled scorer](../src/hip_qsa_pooled_score.inc), [MoE experts launcher](../src/hip_moe_experts_launcher.hip), [A8 probe](../src/hip_moe_q4k_a8_probe.hip)
+
 <a id="qwen-qsa-mtp-pool"></a>
 
 ### QSA MTP committed BF16 key service

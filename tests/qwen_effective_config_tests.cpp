@@ -1231,7 +1231,8 @@ void yarn_admission_tests(const gguf::FileInfo& info, const ModelManifest& manif
         auto unknown = request; unknown.environment["STRIX_QPF2K_SHADOW_MAX_TOKENS"] = "300000";
         expect(resolve(unknown,memory).error.find("YaRN execution environment not supported") != std::string::npos,
             "YaRN unbounded alternate launcher controls refuse");
-        for (const char* name : {"STRIX_QPF2K_T16K", "STRIX_QSA_DECODE_POOL", "STRIX_QSA_DECODE_POOL_CHECK", "STRIX_QSA_DECODE_POOL_BF16", "STRIX_QSA_DECODE_SELECT"})
+        for (const char* name : {"STRIX_QPF2K_T16K", "STRIX_QSA_DECODE_POOL", "STRIX_QSA_DECODE_POOL_CHECK", "STRIX_QSA_DECODE_POOL_BF16", "STRIX_QSA_DECODE_SELECT",
+                "STRIX_QSA_DECODE_FUSED_MAXIMA", "STRIX_QSA_DECODE_ATTN_V2", "STRIX_QSA_DECODE_VALUE_V2", "STRIX_MOE_R1_GLUE_FUSE"})
             expect(yarn_environment_refusal({{name, "0"}}, 2).empty(), "YaRN accepts the audited serial decode pool controls");
         for (const char* name : {"STRIX_QPF2K_COMPACT_IMAGES", "STRIX_CTX_EXACT_MEMORY", "STRIX_QSA_SCORE_RING", "STRIX_QSA_SCORE_RING_ROWS", "STRIX_TERMINAL_LOGITS_ARENA"})
             expect(yarn_environment_refusal({{name, "0"}}, 2).empty(), "YaRN accepts the compact-memory controls");

@@ -9,6 +9,11 @@ inline constexpr unsigned invalid_route = 1U, nonfinite_activation = 2U, invalid
 // After an enqueue exception, every writable view is indeterminate even if status is0.
 // Read-only data stays immutable; mutable views/status have exclusive stream ownership.
 void enqueue_probe(const Request&, const Bindings&, hipStream_t stream = nullptr);
+// One serial row in two launches: one CTA clears clear_words floats of the caller's accumulation, validates the routes
+// and route weights and quantizes (the same status, codes, deltas and sums as clearing the accumulation and status,
+// validate_routes_kernel and enqueue_probe's validation and quantizer), then enqueue_probe's projection.
+void enqueue_serial_prologue_probe(const Request&, const Bindings&, float* clear, unsigned clear_words,
+    const float* route_weights, hipStream_t stream);
 // Exact incumbent route validation and quantizer only. Produces one A8 image;
 // projection output is admitted but untouched. No reset/allocation/sync.
 void enqueue_quantize_only(const Request&, const Bindings&, hipStream_t stream);
