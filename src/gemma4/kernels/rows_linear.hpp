@@ -17,9 +17,13 @@ namespace strix::gemma4::gpu {
 // per-shape default tiles (two-tile input staging for calls of at least 256
 // rows and more than 512 outputs). Every variant has the same bytes.
 [[nodiscard]] bool rows_tile_v2();
+// STRIX_G4_PREFILL_DECODE24 (read per call; unset or 1 = on, 0 = off): Q4_K
+// tiles and the wide Q6_K tile decode their integer scale products with the
+// full-rate 24-bit multiply (same integers, same bytes).
+[[nodiscard]] bool decode24();
 // Tile variants (outputs per wave x rows per workgroup); all have equal bytes.
 // -1 selects STRIX_G4_ROWS_TILE, else the measured default per format.
-inline constexpr int rows_linear_variants = 12;
+inline constexpr int rows_linear_variants = 16;
 // out[r * outputs + o] for rows r < rows; x holds rows * inputs FP32 values.
 // failure (optional) receives the finite flag of every stored value.
 void linear_rows(LinearView w, const float* x, std::uint32_t rows, float* out, Queue queue = nullptr,

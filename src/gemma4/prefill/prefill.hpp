@@ -31,6 +31,7 @@ enum Lever : std::uint32_t {
     lever_fuse_epilogue = 1U << 2U, // FUSE_EPILOGUE: norm+residual+finite(+next norm), gelu/PLE/RoPE/gather + finite in one launch
     lever_side_stream = 1U << 3U, // SIDE_STREAM: K/V projections and the chunk's PLE projection on a second queue
     lever_rows_tile_v2 = 1U << 4U, // ROWS_TILE_V2: per-shape many-row linear tiles (two-tile input staging)
+    lever_decode24 = 1U << 5U, // DECODE24: Q4_K/Q6_K many-row decoders use the 24-bit integer multiply
 };
 struct LeverName {
     Lever bit;
@@ -43,6 +44,7 @@ inline constexpr LeverName lever_names[] = {
     {lever_fuse_epilogue, "fuse_epilogue", "STRIX_G4_PREFILL_FUSE_EPILOGUE"},
     {lever_side_stream, "side_stream", "STRIX_G4_PREFILL_SIDE_STREAM"},
     {lever_rows_tile_v2, "rows_tile_v2", "STRIX_G4_PREFILL_ROWS_TILE_V2"},
+    {lever_decode24, "decode24", "STRIX_G4_PREFILL_DECODE24"},
 };
 [[nodiscard]] inline bool lever_enabled(Lever bit) {
     for (const auto& l : lever_names)
