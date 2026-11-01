@@ -7,6 +7,7 @@
 #include <string_view>
 #include <algorithm>
 #include <cfenv>
+#include <chrono>
 #include <map>
 #include <stdexcept>
 
@@ -21,36 +22,53 @@ void checked(hipError_t e) {
     if (e != hipSuccess) throw std::runtime_error(hipGetErrorString(e));
 }
 void launched() { checked(hipGetLastError()); }
-__global__ void gather(LinearView table, const unsigned* tokens, unsigned rows, float scale, float* out) {
+// FUSE_EPILOGUE: the producer flags its own stored values (gpu::check_finite's
+// rule); a null failure keeps the unfused kernel followed by check_finite.
+__device__ inline void flag(float x, unsigned* failure) {
+    if (failure && (bit_cast<std::uint32_t>(x) & 0x7f800000U) == 0x7f800000U) atomicOr(failure, 1U);
+}
+__global__ void gather(LinearView table, const unsigned* tokens, unsigned rows, float scale, float* out, unsigned* failure) {
     const auto i = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
-    if (i < std::size_t(rows) * table.inputs)
-        out[i] = embedding_value(gpu::coefficient(table, tokens[i / table.inputs], unsigned(i % table.inputs)), scale);
+    if (i < std::size_t(rows) * table.inputs) {
+        const float value = embedding_value(gpu::coefficient(table, tokens[i / table.inputs], unsigned(i % table.inputs)), scale);
+        out[i] = value;
+        flag(value, failure);
+    }
 }
 __global__ void scale_ple(float* x, unsigned count) {
     const auto i = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
     if (i < count) x[i] = x[i] * model_ple_scale;
 }
-__global__ void combine_ple(float* x, LinearView table, const unsigned* tokens, unsigned count) {
+__global__ void combine_ple(float* x, LinearView table, const unsigned* tokens, unsigned count, unsigned* failure) {
     const auto i = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
     if (i < count) {
         const float v = embedding_value(gpu::coefficient(table, tokens[i / table.inputs], unsigned(i % table.inputs)), ple_embedding_scale);
-        x[i] = (x[i] + v) * ple_combine_scale;
+        const float value = (x[i] + v) * ple_combine_scale;
+        x[i] = value;
+        flag(value, failure);
     }
 }
 __global__ void rotate(float* x, const std::uint64_t* positions, const float* table, unsigned rows, unsigned heads_count,
-                        unsigned dim, bool global) {
+                        unsigned dim, bool global, unsigned* failure) {
     const unsigned active = min(dim / 2U, global ? 64U : 128U);
     const auto i = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
     if (i >= std::size_t(rows) * heads_count * active) return;
     const auto rh = i / active, pair = i % active;
     const auto index = rh * dim + pair, t = std::size_t(positions[rh / heads_count]) * (global ? 512U : 256U) + pair * 2;
     const float a = x[index], b = x[index + dim / 2], cs = table[t], sn = table[t + 1];
-    x[index] = a * cs - b * sn;
-    x[index + dim / 2] = b * cs + a * sn;
+    const float first = a * cs - b * sn, second = b * cs + a * sn;
+    x[index] = first;
+    x[index + dim / 2] = second;
+    flag(first, failure); flag(second, failure);
 }
-__global__ void ple_product(float* g, const float* ple, unsigned count, unsigned width, unsigned layers_count, unsigned layer) {
+__global__ void ple_product(float* g, const float* ple, unsigned count, unsigned width, unsigned layers_count, unsigned layer,
+                            unsigned* failure) {
     const auto i = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
-    if (i < count) g[i] = gelu_tanh(g[i]) * ple[(i / width * layers_count + layer) * width + i % width];
+    if (i < count) {
+        const float value = gelu_tanh(g[i]) * ple[(i / width * layers_count + layer) * width + i % width];
+        g[i] = value;
+        flag(value, failure);
+    }
 }
 } // namespace
 struct DevicePrefill::Impl {
@@ -68,7 +86,58 @@ struct DevicePrefill::Impl {
     bool profile = false, fuse_ffn = false;
     hipEvent_t start = nullptr, stop = nullptr, converted = nullptr;
     hipStream_t queue = nullptr;
+    // PINNED_TAPS: pinned host rows and the copy queue that fills them.
+    hipStream_t copy_queue = nullptr;
+    hipEvent_t tapped = nullptr, copied = nullptr;
+    float* pinned_taps = nullptr;
+    float* pinned_hidden = nullptr;
+    std::size_t pinned_taps_floats = 0, pinned_hidden_floats = 0;
+    // SIDE_STREAM: second queue with its own linear scratch; work moves there by
+    // swapping queue and scratch, so every helper keeps its single-queue code.
+    hipStream_t side_queue = nullptr;
+    hipEvent_t forked = nullptr, joined = nullptr, ple_done = nullptr;
+    Buffer side_halves, side_exl3;
+    // Every EXL3 scratch a chunk may need, sized before the side queue copies its size.
+    void reserve_exl3(unsigned rows) {
+        std::size_t need = 0;
+        for (const auto& y : w.layer) {
+            for (const auto& m : {y.q, y.k, y.v, y.o, y.gate, y.up, y.down, y.ple_gate, y.ple_projection})
+                if (m.data && m.format == WeightFormat::exl3_mul1) need = std::max({need, exl3::device_scratch_bytes, exl3::rows_scratch_bytes(m, rows)});
+            if (y.gate.format == WeightFormat::exl3_mul1 && y.up.format == WeightFormat::exl3_mul1 && y.down.format == WeightFormat::exl3_mul1)
+                need = std::max(need, exl3::ffn_rows_scratch_bytes(y.gate, y.up, y.down, rows));
+        }
+        if (exl3_scratch.size() < need) exl3_scratch.resize(need);
+    }
+    void side_ready() {
+        if (!side_queue) {
+            checked(hipStreamCreateWithFlags(&side_queue, hipStreamNonBlocking));
+            for (auto* e : {&forked, &joined, &ple_done}) checked(hipEventCreateWithFlags(e, hipEventDisableTiming));
+        }
+        if (side_halves.size() < halves.size()) side_halves.resize(halves.size());
+        if (side_exl3.size() < exl3_scratch.size()) side_exl3.resize(exl3_scratch.size());
+    }
+    // body runs on the side queue after the queue's last fork() mark; done marks its end.
+    void fork() { checked(hipEventRecord(forked, queue)); }
+    template <class F> void on_side(hipEvent_t done, F body) {
+        checked(hipStreamWaitEvent(side_queue, forked, 0));
+        std::swap(queue, side_queue); std::swap(halves, side_halves); std::swap(exl3_scratch, side_exl3);
+        try { body(); } catch (...) {
+            std::swap(queue, side_queue); std::swap(halves, side_halves); std::swap(exl3_scratch, side_exl3); throw;
+        }
+        std::swap(queue, side_queue); std::swap(halves, side_halves); std::swap(exl3_scratch, side_exl3);
+        checked(hipEventRecord(done, side_queue));
+    }
     ~Impl() {
+        if (side_queue) (void)hipStreamSynchronize(side_queue);
+        for (auto* e : {forked, joined, ple_done}) if (e) (void)hipEventDestroy(e);
+        if (side_queue) (void)hipStreamDestroy(side_queue);
+        if (copy_queue) (void)hipStreamSynchronize(copy_queue);
+        if (queue) (void)hipStreamSynchronize(queue);
+        if (pinned_taps) (void)hipHostFree(pinned_taps);
+        if (pinned_hidden) (void)hipHostFree(pinned_hidden);
+        if (tapped) (void)hipEventDestroy(tapped);
+        if (copied) (void)hipEventDestroy(copied);
+        if (copy_queue) (void)hipStreamDestroy(copy_queue);
         if (queue) (void)hipStreamDestroy(queue);
         if (start) (void)hipEventDestroy(start);
         if (stop) (void)hipEventDestroy(stop);
@@ -95,6 +164,28 @@ struct DevicePrefill::Impl {
         view.data = storage.back().as<std::uint8_t>();
         uploaded.emplace(original, view);
         return view;
+    }
+    static float* host_rows(float*& rows, std::size_t& have, std::size_t floats) {
+        if (have < floats) {
+            if (rows) { checked(hipHostFree(rows)); rows = nullptr; have = 0; }
+            void* p = nullptr;
+            checked(hipHostMalloc(&p, floats * sizeof(float), hipHostMallocDefault));
+            rows = static_cast<float*>(p); have = floats;
+        }
+        return rows;
+    }
+    void copy_ready() {
+        if (!copy_queue) {
+            checked(hipStreamCreateWithFlags(&copy_queue, hipStreamNonBlocking));
+            checked(hipEventCreateWithFlags(&tapped, hipEventDisableTiming));
+            checked(hipEventCreateWithFlags(&copied, hipEventDisableTiming));
+        }
+    }
+    // Copy queue: taps rows [0, rows) into pinned memory once the queue has written them.
+    void drain_taps(unsigned rows, unsigned width) {
+        checked(hipEventRecord(tapped, queue)); checked(hipStreamWaitEvent(copy_queue, tapped, 0));
+        checked(hipMemcpyAsync(pinned_taps, taps.data(), std::size_t(rows) * width * sizeof(float), hipMemcpyDeviceToHost, copy_queue));
+        checked(hipEventRecord(copied, copy_queue));
     }
     void finite(const Buffer& b, std::size_t count) { gpu::check_finite(b.as<float>(), count, failure.as<unsigned>(), queue); }
     // Fused gate/up/product/convert: leaves the down input panels in halves
@@ -196,17 +287,29 @@ struct DevicePrefill::Impl {
     void norm(const Buffer& input, LinearView weight, Buffer& output, unsigned vectors, unsigned width) {
         gpu::norm(input.as<float>(), weight, output.as<float>(), vectors, width, queue, failure.as<unsigned>());
     }
+    // FUSE_EPILOGUE for this chunk: the flag of a fused producer, else null (separate check).
+    bool fuse = false;
+    [[nodiscard]] unsigned* fused_flag() const { return fuse ? failure.as<unsigned>() : nullptr; }
     void head(Buffer& b, LinearView norm, unsigned rows, unsigned count, unsigned dim, bool is_global) {
+        // The norm flags every value; the fused rotation flags the pairs it rewrites.
         gpu::norm(b.as<float>(), norm, b.as<float>(), rows * count, dim, queue, failure.as<unsigned>());
         const auto total = rows * count * std::min(dim / 2, is_global ? 64U : 128U);
         hipLaunchKernelGGL(rotate, dim3((total + 255U) / 256U), dim3(256), 0, queue, b.as<float>(), positions.as<std::uint64_t>(),
-                           is_global ? global.as<float>() : sliding.as<float>(), rows, count, dim, is_global);
-        launched(); finite(b, std::size_t(rows) * count * dim);
+                           is_global ? global.as<float>() : sliding.as<float>(), rows, count, dim, is_global, fused_flag());
+        launched();
+        if (!fuse) finite(b, std::size_t(rows) * count * dim);
     }
-    void add(const Buffer& branch, LinearView norm, unsigned rows, LinearView scalar = {}) {
+    // residual += norm(branch) [* scalar], finite-checked; with next, x = norm(residual, next)
+    // in the same launch when fused. Returns whether x now holds that next norm.
+    bool add(const Buffer& branch, LinearView norm, unsigned rows, LinearView scalar = {}, LinearView next = {}) {
+        if (fuse && norm.data &&
+            gpu::norm_residual_rows(branch.as<float>(), norm, residual.as<float>(), rows, w.config.hidden, scalar,
+                                    next.data ? x.as<float>() : nullptr, next, failure.as<unsigned>(), queue))
+            return next.data != nullptr;
         this->norm(branch, norm, x, rows, w.config.hidden);
         gpu::residual(residual.as<float>(), x.as<float>(), rows * w.config.hidden, scalar, queue);
         finite(residual, std::size_t(rows) * w.config.hidden);
+        return false;
     }
 };
 DevicePrefill::DevicePrefill(HostWeights weights, RopeTables t, Residency residency, bool profile, AttentionMode attention,
@@ -280,7 +383,11 @@ void DevicePrefill::set_profile(bool enabled) {
 void DevicePrefill::use_canonical_kernel(bool enabled) {
     impl_->stats.canonical_kernel = impl_->stats.attention == AttentionMode::canonical && enabled;
 }
-ChunkResult DevicePrefill::forward(KvTxn& transaction, std::span<const unsigned> input, bool all_logits, bool logits, bool hidden) {
+ChunkResult DevicePrefill::forward(KvTxn& transaction, std::span<const unsigned> input, bool all_logits, bool logits, bool hidden,
+                                   bool taps, bool views) {
+    using Clock = std::chrono::steady_clock;
+    const auto entered = Clock::now();
+    auto launched_at = entered, synced_at = entered;
     auto& b = *impl_; const auto& w = b.w; const auto& c = w.config;
     auto* tx = dynamic_cast<gpu::DeviceStream::Impl::Txn*>(&transaction);
     const auto n = unsigned(input.size());
@@ -291,13 +398,29 @@ ChunkResult DevicePrefill::forward(KvTxn& transaction, std::span<const unsigned>
         throw std::invalid_argument("prefill row or position bounds");
     for (const auto t : input) if (t >= c.vocab) throw std::invalid_argument("prefill token out of range");
     ChunkResult result; result.rows = n; result.vocab = c.vocab; result.tap_width = 5 * c.hidden;
+    // PINNED_TAPS: unconsumed taps are never copied; consumed taps and hidden
+    // rows land in pinned memory through asynchronous copies. Off: as before.
+    const bool pinned = views && lever_enabled(lever_pinned_taps), want_taps = taps || !pinned;
+    unsigned last_tap = 0;
+    for (const auto t : tap_layers) last_tap = std::max(last_tap, unsigned(t));
+    bool taps_issued = false;
+    // DEVICE_FINITE: one finite check over the returned taps rows, inside the
+    // failure fence, replaces the consumer's host scan of the same values.
+    const bool device_finite = lever_enabled(lever_device_finite);
+    bool taps_checked = false;
     try {
         tx->rows = n;
         for (unsigned l = 0; l < c.layers; ++l) {
             const auto bytes = std::size_t(n) * tx->stream->cache[l].width * sizeof(float);
             if (bytes > tx->overlay[l].k.size()) { tx->overlay[l].k.resize(bytes); tx->overlay[l].v.resize(bytes); }
         }
-        b.ranges.clear(); b.maximum.zero(); b.failure.zero(); b.taps.zero();
+        b.ranges.clear(); b.maximum.zero(); b.failure.zero();
+        if (!pinned) b.taps.zero(); // pinned copies only the rows this chunk writes
+        if (pinned) {
+            b.copy_ready();
+            if (want_taps) Impl::host_rows(b.pinned_taps, b.pinned_taps_floats, std::size_t(chunk_rows) * result.tap_width);
+            if (hidden) Impl::host_rows(b.pinned_hidden, b.pinned_hidden_floats, std::size_t(chunk_rows) * c.hidden);
+        }
         b.tokens.upload(input.data(), input.size_bytes());
         std::vector<std::uint64_t> positions(n);
         for (unsigned r = 0; r < n; ++r) positions[r] = tx->start + r;
@@ -322,16 +445,32 @@ ChunkResult DevicePrefill::forward(KvTxn& transaction, std::span<const unsigned>
             const auto packed = canonical_packed_floats(chunk_rows, c.heads, 512, stride) * sizeof(float);
             if (canonical_pack_enabled() && packed > b.canonical_packed.size()) b.canonical_packed.resize(packed);
         }
+        b.fuse = lever_enabled(lever_fuse_epilogue);
+        if (b.fuse) result.levers |= lever_fuse_epilogue;
         hipLaunchKernelGGL(gather, dim3((n * c.hidden + 255U) / 256U), dim3(256), 0, b.queue, w.embedding,
-                           b.tokens.as<unsigned>(), n, embedding_scale, b.residual.as<float>());
-        launched(); b.finite(b.residual, std::size_t(n) * c.hidden);
-        b.dot("ple_model", w.ple_model, b.residual.as<float>(), b.ple.as<float>(), n);
+                           b.tokens.as<unsigned>(), n, embedding_scale, b.residual.as<float>(), b.fused_flag());
+        launched(); launched_at = Clock::now();
+        if (!b.fuse) b.finite(b.residual, std::size_t(n) * c.hidden);
+        // SIDE_STREAM: independent work of the same bytes on a second queue. The
+        // chunk's PLE projection reads the embedded rows until layer 0 first
+        // writes the residual; producer layers' K/V run beside q and its head.
+        // The PLE projection queues behind layer 0's K/V, so attention does not
+        // wait for it.
+        const bool side = !b.profile && lever_enabled(lever_side_stream);
+        if (side) { b.reserve_exl3(n); b.side_ready(); result.levers |= lever_side_stream; }
         const auto pn = n * c.layers * c.ple_dim;
-        hipLaunchKernelGGL(scale_ple, dim3((pn + 255U) / 256U), dim3(256), 0, b.queue, b.ple.as<float>(), pn);
-        launched();
-        gpu::norm(b.ple.as<float>(), w.ple_model_norm, b.ple.as<float>(), n * c.layers, c.ple_dim, b.queue, b.failure.as<unsigned>());
-        hipLaunchKernelGGL(combine_ple, dim3((pn + 255U) / 256U), dim3(256), 0, b.queue, b.ple.as<float>(), w.ple_table, b.tokens.as<unsigned>(), pn);
-        launched(); b.finite(b.ple, pn);
+        const auto ple_stage = [&] {
+            b.dot("ple_model", w.ple_model, b.residual.as<float>(), b.ple.as<float>(), n);
+            hipLaunchKernelGGL(scale_ple, dim3((pn + 255U) / 256U), dim3(256), 0, b.queue, b.ple.as<float>(), pn);
+            launched();
+            gpu::norm(b.ple.as<float>(), w.ple_model_norm, b.ple.as<float>(), n * c.layers, c.ple_dim, b.queue, b.failure.as<unsigned>());
+            hipLaunchKernelGGL(combine_ple, dim3((pn + 255U) / 256U), dim3(256), 0, b.queue, b.ple.as<float>(), w.ple_table, b.tokens.as<unsigned>(), pn,
+                               b.fused_flag());
+            launched();
+            if (!b.fuse) b.finite(b.ple, pn);
+        };
+        bool ple_pending = side, ple_queued = !side;
+        if (!side) ple_stage();
         // Descriptors are immutable for the chunk: upload every layer's reads
         // and the producers' writes once instead of draining the queue before a
         // synchronous upload in each layer. The canonical kernel also reads the
@@ -353,18 +492,29 @@ ChunkResult DevicePrefill::forward(KvTxn& transaction, std::span<const unsigned>
         // Sliding and global layers pack into separate buffers, so a layer that
         // reads its producer's KV (layers >= 24) reuses that producer's pack.
         unsigned packed_producer[2] = {~0U, ~0U};
+        bool x_ready = false; // FUSE_EPILOGUE: x already holds this layer's input norm
         for (unsigned l = 0; l < c.layers; ++l) {
             const auto& y = w.layer[l]; const auto& a = c.layer[l]; const auto d = a.head_dim;
             auto* layer_reads = b.reads.as<gpu::KvRead>() + std::size_t(l) * n;
             const bool global = a.attention == AttentionKind::global;
             const auto name = "layer." + std::to_string(l) + ".";
-            b.norm(b.residual, y.input_norm, b.x, n, c.hidden);
-            b.dot(name + "q", y.q, b.x.as<float>(), b.q.as<float>(), n); b.head(b.q, y.q_norm, n, c.heads, d, global);
-            if (a.producer == l) {
+            if (!x_ready) b.norm(b.residual, y.input_norm, b.x, n, c.hidden);
+            x_ready = false;
+            const auto kv = [&] {
                 b.dot(name + "k", y.k, b.x.as<float>(), b.k.as<float>(), n); b.dot(name + "v", y.v, b.x.as<float>(), b.v.as<float>(), n);
                 b.head(b.k, y.k_norm, n, c.kv_heads, d, global);
                 gpu::norm(b.v.as<float>(), {}, b.v.as<float>(), n * c.kv_heads, d, b.queue, b.failure.as<unsigned>());
                 gpu::store_overlay(b.k.as<float>(), b.v.as<float>(), b.writes.as<gpu::KvWrite>() + std::size_t(l) * n, n, c.kv_heads * d, b.queue);
+            };
+            // The side queue forks after the input norm; ranges keep the order q, k, v.
+            if (side && a.producer == l) b.fork();
+            b.dot(name + "q", y.q, b.x.as<float>(), b.q.as<float>(), n); b.head(b.q, y.q_norm, n, c.heads, d, global);
+            if (a.producer == l) {
+                if (side) {
+                    b.on_side(b.joined, kv); checked(hipStreamWaitEvent(b.queue, b.joined, 0));
+                    if (!ple_queued) { b.on_side(b.ple_done, ple_stage); ple_queued = true; }
+                }
+                else kv();
             }
             b.timing(b.stats.attention_ms, [&] {
             if (b.stats.attention == AttentionMode::wmma) {
@@ -387,8 +537,10 @@ ChunkResult DevicePrefill::forward(KvTxn& transaction, std::span<const unsigned>
             }
             }
             });
-            b.dot(name + "o", y.o, b.att.as<float>(), b.out.as<float>(), n); b.add(b.out, y.post_attention_norm, n);
-            b.norm(b.residual, y.pre_ffn_norm, b.x, n, c.hidden);
+            b.dot(name + "o", y.o, b.att.as<float>(), b.out.as<float>(), n);
+            if (!ple_queued) { b.fork(); b.on_side(b.ple_done, ple_stage); ple_queued = true; }
+            if (ple_pending) { checked(hipStreamWaitEvent(b.queue, b.ple_done, 0)); ple_pending = false; }
+            if (!b.add(b.out, y.post_attention_norm, n, {}, y.pre_ffn_norm)) b.norm(b.residual, y.pre_ffn_norm, b.x, n, c.hidden);
             if (b.stats.linears == Linears::exact && b.exl3_ffn(name, y.gate, y.up, y.down, n)) {
                 // EXL3 many-row FFN, down included.
             } else if (b.stats.linears == Linears::exact) {
@@ -402,7 +554,7 @@ ChunkResult DevicePrefill::forward(KvTxn& transaction, std::span<const unsigned>
                     b.ranges.push_back({name + "gate", 0.0F}); b.ranges.push_back({name + "up", 0.0F});
                     b.record(name + "gate_up", [&] {
                         gpu::gate_up_rows(y.gate, y.up, b.x.as<float>(), n, b.gate.as<float>(), b.queue, b.failure.as<unsigned>(),
-                                          gpu::rows_linear_enabled(), -1, b.up.as<float>());
+                                          gpu::rows_linear_enabled(), -1, b.up.as<float>(), -1, b.fuse);
                     }, 4.0 * n * y.gate.inputs * y.gate.outputs, true);
                 }
                 b.dot(name + "down", y.down, b.gate.as<float>(), b.out.as<float>(), n);
@@ -413,20 +565,27 @@ ChunkResult DevicePrefill::forward(KvTxn& transaction, std::span<const unsigned>
                 b.dot(name + "down", y.down, b.gate.as<float>(), b.out.as<float>(), n, true);
             } else {
                 b.dot(name + "gate", y.gate, b.x.as<float>(), b.gate.as<float>(), n); b.dot(name + "up", y.up, b.x.as<float>(), b.up.as<float>(), n);
-                gpu::gelu_product(b.gate.as<float>(), b.up.as<float>(), n * c.inter, b.queue); b.finite(b.gate, std::size_t(n) * c.inter);
+                if (b.fuse) gpu::gelu_product_finite(b.gate.as<float>(), b.up.as<float>(), n * c.inter, b.failure.as<unsigned>(), b.queue);
+                else { gpu::gelu_product(b.gate.as<float>(), b.up.as<float>(), n * c.inter, b.queue); b.finite(b.gate, std::size_t(n) * c.inter); }
                 b.dot(name + "down", y.down, b.gate.as<float>(), b.out.as<float>(), n);
             }
             b.add(b.out, y.post_ffn_norm, n);
             b.dot(name + "ple_gate", y.ple_gate, b.residual.as<float>(), b.gate.as<float>(), n);
             hipLaunchKernelGGL(ple_product, dim3((n * c.ple_dim + 255U) / 256U), dim3(256), 0, b.queue, b.gate.as<float>(),
-                               b.ple.as<float>(), n * c.ple_dim, c.ple_dim, c.layers, l);
-            launched(); b.finite(b.gate, std::size_t(n) * c.ple_dim);
-            b.dot(name + "ple_projection", y.ple_projection, b.gate.as<float>(), b.out.as<float>(), n); b.add(b.out, y.post_ple_norm, n, y.scalar);
-            for (unsigned t = 0; t < 5; ++t) if (tap_layers[t] == l)
+                               b.ple.as<float>(), n * c.ple_dim, c.ple_dim, c.layers, l, b.fused_flag());
+            launched();
+            if (!b.fuse) b.finite(b.gate, std::size_t(n) * c.ple_dim);
+            b.dot(name + "ple_projection", y.ple_projection, b.gate.as<float>(), b.out.as<float>(), n); x_ready = b.add(b.out, y.post_ple_norm, n, y.scalar, l + 1 < c.layers ? w.layer[l + 1].input_norm : w.final_norm);
+            if (want_taps) for (unsigned t = 0; t < 5; ++t) if (tap_layers[t] == l)
                 checked(hipMemcpy2DAsync(b.taps.as<float>() + t * c.hidden, 5ULL * c.hidden * sizeof(float), b.residual.data(),
                                         std::size_t(c.hidden) * sizeof(float), std::size_t(c.hidden) * sizeof(float), n, hipMemcpyDeviceToDevice, b.queue));
+            if (want_taps && device_finite && l == last_tap) { b.finite(b.taps, std::size_t(n) * result.tap_width); taps_checked = true; }
+            // The copy queue drains the taps while the remaining layers run.
+            if (pinned && want_taps && l == last_tap) { b.drain_taps(n, result.tap_width); taps_issued = true; }
         }
-        b.norm(b.residual, w.final_norm, b.x, n, c.hidden);
+        if (want_taps && device_finite && !taps_checked) { b.finite(b.taps, std::size_t(n) * result.tap_width); taps_checked = true; }
+        if (pinned && want_taps && !taps_issued) { b.drain_taps(n, result.tap_width); taps_issued = true; }
+        if (!x_ready) b.norm(b.residual, w.final_norm, b.x, n, c.hidden);
         // Last-row-only head uses the same WMMA tile and K order. Qualification
         // can request every row without changing any already computed state.
         const unsigned head_rows = all_logits ? n : 1;
@@ -439,7 +598,11 @@ ChunkResult DevicePrefill::forward(KvTxn& transaction, std::span<const unsigned>
             checked(hipMemcpyAsync(b.last_row.data(), b.x.as<float>() + std::size_t(n - 1) * c.hidden, std::size_t(c.hidden) * sizeof(float),
                                    hipMemcpyDeviceToDevice, b.queue));
         }
+        if (pinned && hidden)
+            checked(hipMemcpyAsync(b.pinned_hidden, b.x.data(), std::size_t(n) * c.hidden * sizeof(float), hipMemcpyDeviceToHost, b.queue));
         gpu::synchronize(b.queue);
+        if (taps_issued) checked(hipEventSynchronize(b.copied));
+        synced_at = Clock::now();
         unsigned failure = 0; b.failure.download(&failure, sizeof(failure));
         std::vector<unsigned> maxima(b.ranges.size()); b.maximum.download(maxima.data(), maxima.size() * sizeof(unsigned));
         std::string overflow;
@@ -453,12 +616,24 @@ ChunkResult DevicePrefill::forward(KvTxn& transaction, std::span<const unsigned>
         }
         if (failure) throw std::runtime_error("prefill failed: nonfinite arithmetic, FP16 overflow or missing KV (mask " + std::to_string(failure) + ")" + overflow);
         if (head) { result.last_logits.resize(c.vocab); b.logits.download(result.last_logits.data(), c.vocab * sizeof(float), std::size_t(head_rows - 1) * c.vocab * sizeof(float)); }
-        result.taps.resize(std::size_t(n) * result.tap_width); b.taps.download(result.taps.data(), result.taps.size() * sizeof(float));
+        if (pinned) {
+            if (want_taps) result.pinned_taps = {b.pinned_taps, std::size_t(n) * result.tap_width};
+            result.levers |= lever_pinned_taps;
+        } else {
+            result.taps.resize(std::size_t(n) * result.tap_width); b.taps.download(result.taps.data(), result.taps.size() * sizeof(float));
+        }
+        if (taps_checked) result.levers |= lever_device_finite;
         if (all_logits) { result.all_logits.resize(std::size_t(n) * c.vocab); b.logits.download(result.all_logits.data(), result.all_logits.size() * sizeof(float)); }
-        if (hidden) { result.hidden.resize(std::size_t(n) * c.hidden); b.x.download(result.hidden.data(), result.hidden.size() * sizeof(float)); }
+        if (hidden && pinned) result.pinned_hidden = {b.pinned_hidden, std::size_t(n) * c.hidden};
+        else if (hidden) { result.hidden.resize(std::size_t(n) * c.hidden); b.x.download(result.hidden.data(), result.hidden.size() * sizeof(float)); }
         tx->evaluated = true;
+        const auto ms = [](auto d) { return std::chrono::duration<double, std::milli>(d).count(); };
+        result.host_ms = ms(launched_at - entered) + ms(Clock::now() - synced_at);
     } catch (...) {
-        (void)hipStreamSynchronize(b.queue); tx->failed = true; throw;
+        (void)hipStreamSynchronize(b.queue);
+        if (b.copy_queue) (void)hipStreamSynchronize(b.copy_queue);
+        if (b.side_queue) (void)hipStreamSynchronize(b.side_queue);
+        tx->failed = true; throw;
     }
     return result;
 }

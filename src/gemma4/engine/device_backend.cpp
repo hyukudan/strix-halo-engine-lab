@@ -74,11 +74,12 @@ public:
             metadata_.set("identity",std::string(selected));
     }
     std::size_t prefill_chunk_rows() const override { return prefill_ ? prefill::chunk_rows : 0; }
-    PrefillRows prefill_rows(KvTxn& transaction, std::span<const std::uint32_t> tokens, bool hidden) override {
+    PrefillRows prefill_rows(KvTxn& transaction, std::span<const std::uint32_t> tokens, bool hidden, bool taps) override {
         if (!prefill_) throw std::logic_error("many-row prefill is off");
-        auto chunk = prefill_->forward(transaction,tokens,false,false,hidden);
+        auto chunk = prefill_->forward(transaction,tokens,false,false,hidden,taps,true);
         PrefillRows out;
         out.taps = std::move(chunk.taps); out.hidden = std::move(chunk.hidden); out.tap_width = chunk.tap_width;
+        out.tap_view = chunk.pinned_taps; out.hidden_view = chunk.pinned_hidden; out.levers = chunk.levers; out.host_ms = chunk.host_ms;
         return out;
     }
     bool head_logits(std::span<const float> hidden, std::vector<float>& logits) override {

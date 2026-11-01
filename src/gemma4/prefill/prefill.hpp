@@ -3,6 +3,7 @@
 // g4-wmma-pf-v1 is a distinct prefill identity. Decode remains g4-v1 relative
 // to its committed state. Admission requires native arithmetic and fidelity gates.
 #include "gemma4/contracts/g4_types.hpp"
+#include <cstdlib>
 #include <string_view>
 
 namespace strix::gemma4::prefill {
@@ -20,11 +21,48 @@ struct Chunk {
 };
 [[nodiscard]] std::vector<Chunk> plan(std::uint64_t frontier, std::size_t rows,
                                       std::uint32_t admitted_context = max_positions);
+// Host/runtime levers of the exact prefill chunk. Each one leaves every output
+// byte unchanged; a set bit in ChunkResult::levers says the lever ran for that
+// chunk (receipt engagement counter). Each is default on; STRIX_G4_PREFILL_<NAME>=0
+// turns it off. The switches are read per chunk so one process can A/B them.
+enum Lever : std::uint32_t {
+    lever_pinned_taps = 1U << 0U, // PINNED_TAPS: taps/hidden through pinned asynchronous copies, only when consumed
+    lever_device_finite = 1U << 1U, // DEVICE_FINITE: taps checked finite on the device, inside the failure fence
+    lever_fuse_epilogue = 1U << 2U, // FUSE_EPILOGUE: norm+residual+finite(+next norm), gelu/PLE/RoPE/gather + finite in one launch
+    lever_side_stream = 1U << 3U, // SIDE_STREAM: K/V projections and the chunk's PLE projection on a second queue
+};
+struct LeverName {
+    Lever bit;
+    const char* name;   // receipt counter
+    const char* toggle; // OFF switch
+};
+inline constexpr LeverName lever_names[] = {
+    {lever_pinned_taps, "pinned_taps", "STRIX_G4_PREFILL_PINNED_TAPS"},
+    {lever_device_finite, "device_finite", "STRIX_G4_PREFILL_DEVICE_FINITE"},
+    {lever_fuse_epilogue, "fuse_epilogue", "STRIX_G4_PREFILL_FUSE_EPILOGUE"},
+    {lever_side_stream, "side_stream", "STRIX_G4_PREFILL_SIDE_STREAM"},
+};
+[[nodiscard]] inline bool lever_enabled(Lever bit) {
+    for (const auto& l : lever_names)
+        if (l.bit == bit) {
+            const auto* p = std::getenv(l.toggle);
+            return !p || std::string_view(p) != "0";
+        }
+    return false;
+}
 struct ChunkResult {
     unsigned rows = 0, vocab = 0, tap_width = 0;
     std::vector<float> last_logits, taps;
     std::vector<float> all_logits;
     std::vector<float> hidden; // rows x hidden final-norm rows, only when requested
+    // PINNED_TAPS: views of the prefill object's pinned host rows instead of
+    // taps/hidden, valid until its next forward(). Use tap_rows()/hidden_rows().
+    std::span<const float> pinned_taps, pinned_hidden;
+    std::uint32_t levers = 0;
+    // Host time of this call outside the device's work: before the first launch and after the final sync.
+    double host_ms = 0.0;
+    [[nodiscard]] std::span<const float> tap_rows() const { return pinned_taps.empty() ? std::span<const float>(taps) : pinned_taps; }
+    [[nodiscard]] std::span<const float> hidden_rows() const { return pinned_hidden.empty() ? std::span<const float>(hidden) : pinned_hidden; }
 };
 struct Result {
     std::uint64_t frontier = 0;

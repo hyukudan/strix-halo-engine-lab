@@ -1,4 +1,5 @@
 #include "gemma4/engine/runtime.hpp"
+#include "gemma4/prefill/prefill.hpp"
 #include "../gemma4_dflash/fixture.hpp"
 
 #include <algorithm>
@@ -204,6 +205,7 @@ void device_tests() {
     std::cout << "device: coordinator C1/C4/C8 and verify all-accept/reject match host IDs and state bytes\n";
 }
 #endif
+void prefill_taps_tests();
 void host_tests(bool off) {
     const auto model = tiny(); const Tables tables; CountBackend backend(model,tables.view());
     auto r = request(); const auto reference = serial(backend,r);
@@ -333,7 +335,111 @@ void host_tests(bool off) {
     e::Coordinator cancelled(backend); const auto cancelled_slot = cancelled.submit(r); const auto before_cancel = backend.calls;
     cancelled.cancel(cancelled_slot); cancelled.run(); CHECK(backend.calls == before_cancel);
     CHECK(cancelled.result(cancelled_slot).status == e::Status::cancelled);
-    std::cout << "host: C1..C8, shared calls, unequal prompts, cancellation/reuse, DFlash windows/seeds/stops, sampling and costs passed\n";
+    if (!off) prefill_taps_tests();
+    std::cout << "host: C1..C8, shared calls, unequal prompts, cancellation/reuse, DFlash windows/seeds/stops, sampling, costs and prompt taps passed\n";
+}
+
+// Many-row prompt prefill as a backend may implement it (eight-row chunks here,
+// the host target's bytes). With PINNED_TAPS on, taps that the session does not
+// consume are omitted and consumed taps arrive as a view of backend memory, like
+// the device backend; off, every call returns taps as a vector.
+class PrefillBackend final : public e::Backend {
+public:
+    PrefillBackend(const g4::ModelManifest& m, g4::RopeTables t) : host(m,t,1) {}
+    std::unique_ptr<e::StreamState> create_stream() override { return host.create_stream(); }
+    g4::ForwardResult forward_rows(std::span<const g4::RowPlan> rows) override { return host.forward_rows(rows); }
+    const g4::ModelConfig& config() const override { return host.config(); }
+    Json identity() const override { return host.identity(); }
+    std::size_t prefill_chunk_rows() const override { return 8; }
+    e::PrefillRows prefill_rows(g4::KvTxn& tx, std::span<const std::uint32_t> tokens, bool hidden, bool taps) override {
+        requested.push_back(taps);
+        std::vector<g4::RowPlan> rows;
+        for (std::size_t i = 0; i < tokens.size(); ++i) rows.push_back({0,0,tx.frontier()+i,tokens[i],&tx,i,true,hidden});
+        auto pass = host.forward_rows(rows);
+        e::PrefillRows out; out.tap_width = pass.tap_width;
+        if (hidden) out.hidden = std::move(pass.hidden);
+        if (!g4::prefill::lever_enabled(g4::prefill::lever_pinned_taps)) { out.taps = std::move(pass.taps); return out; }
+        out.levers = g4::prefill::lever_pinned_taps;
+        if (taps) { held = std::move(pass.taps); out.tap_view = held; }
+        return out;
+    }
+    e::HostBackend host;
+    std::vector<bool> requested;
+    std::vector<float> held;
+};
+struct StageLog { std::vector<float> taps, hidden; std::vector<std::uint64_t> positions; std::size_t empty_taps = 0; };
+// Session shapes of the three drafter families: DFlash consumes taps through
+// stage(); EAGLE consumes taps and final hidden rows through stage_rows(); MTP
+// keeps only final hidden rows and declares wants_taps() false.
+class ShapeDraft final : public e::DraftSession {
+public:
+    ShapeDraft(int family, std::vector<std::uint32_t> gold, std::size_t base, std::shared_ptr<StageLog> log)
+        : family_(family), gold_(std::move(gold)), base_(base), log_(std::move(log)) {}
+    bool wants_hidden() const override { return family_ != 0; }
+    bool wants_taps() const override { return family_ != 2; }
+    void append(std::span<const float> taps, std::span<const std::uint64_t> positions) override {
+        log_->taps.insert(log_->taps.end(),taps.begin(),taps.end());
+        log_->positions.insert(log_->positions.end(),positions.begin(),positions.end());
+    }
+    void stage_rows(std::span<const float> taps, std::span<const float> hidden, std::span<const std::uint32_t> next,
+                    std::span<const std::uint64_t> positions) override {
+        if (family_ == 0) { e::DraftSession::stage_rows(taps,hidden,next,positions); return; }
+        CHECK(hidden.size() == positions.size()*16);
+        if (family_ == 2 && taps.empty()) ++log_->empty_taps;
+        else CHECK(taps.size() == positions.size()*80);
+        log_->hidden.insert(log_->hidden.end(),hidden.begin(),hidden.end());
+        e::DraftSession::stage(taps,positions);
+    }
+    std::array<std::uint32_t,7> propose(std::uint32_t, std::uint64_t position) override {
+        std::array<std::uint32_t,7> result{};
+        for (std::size_t d = 0; d < 7; ++d) { const auto i = std::size_t(position)-base_+d; result[d] = i < gold_.size() ? gold_[i] : 0; }
+        return result;
+    }
+private:
+    int family_;
+    std::vector<std::uint32_t> gold_;
+    std::size_t base_;
+    std::shared_ptr<StageLog> log_;
+};
+void set_env(const char* name, const char* value) {
+#ifdef _WIN32
+    (void)_putenv_s(name, value ? value : "");
+#else
+    if (value) (void)setenv(name, value, 1); else (void)unsetenv(name);
+#endif
+}
+void prefill_taps_tests() {
+    const auto model = tiny(); const Tables tables;
+    PrefillBackend backend(model,tables.view());
+    auto r = request(29); const auto reference = serial(backend,r);
+    for (int family = 0; family < 3; ++family) {
+        std::array<std::shared_ptr<StageLog>,2> logs;
+        std::array<e::Result,2> results;
+        std::array<Json,2> receipts;
+        for (int on = 0; on < 2; ++on) {
+            set_env("STRIX_G4_PREFILL_PINNED_TAPS", on ? nullptr : "0");
+            backend.requested.clear();
+            auto log = logs[on] = std::make_shared<StageLog>();
+            e::DraftFactory factory = [=] { return std::make_unique<ShapeDraft>(family,reference.ids,r.prompt.size()-1,log); };
+            auto req = r; req.dflash = e::DraftMode::on;
+            e::Coordinator c(backend,factory); const auto s = c.submit(req); c.run();
+            check_equal(c.result(s),reference);
+            results[on] = c.result(s); receipts[on] = c.receipt(s);
+            CHECK(!backend.requested.empty());
+            for (const bool asked : backend.requested) CHECK(asked == (family != 2));
+            const auto* taps = receipts[on].find("prefill_taps");
+            if (!on) CHECK(!taps);
+            else CHECK(taps && taps->as_string() == (family == 2 ? "skipped (no consumer)" : "pinned-async"));
+        }
+        // Same outputs and the same staged drafter inputs with the lever on and off.
+        CHECK(results[0].ids == results[1].ids && results[0].digest == results[1].digest);
+        CHECK(results[0].acceptance.accepted == results[1].acceptance.accepted);
+        CHECK(logs[0]->hidden == logs[1]->hidden && logs[0]->positions == logs[1]->positions);
+        if (family != 2) CHECK(logs[0]->taps == logs[1]->taps); // MTP never reads them
+        if (family != 2) CHECK(!logs[1]->taps.empty());
+        if (family == 2) CHECK(logs[1]->empty_taps > 0);
+    }
+    set_env("STRIX_G4_PREFILL_PINNED_TAPS", nullptr);
 }
 
 class ScriptState final : public e::StreamState {

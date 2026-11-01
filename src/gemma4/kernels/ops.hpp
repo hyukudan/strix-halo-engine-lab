@@ -80,6 +80,14 @@ bool norm(const float* x, LinearView weight, float* out, std::uint32_t vectors, 
 // nonfinite checks remain observable through failure before publication.
 // quant (g4-a8-v1): A8G32 rows of next, or of the new residual when next is null; returns whether the
 // selected schedule wrote them.
+// Any row count (prompt chunks): the staged parallel norm_residual schedule, whose
+// bytes and finite flags equal norm(branch) + residual() + check_finite(residual)
+// [+ norm(residual, next_weight) into next]. false, enqueueing nothing, when the
+// selected norm() schedule is another one (STRIX_G4_NORM_GROUP/SEARCH/STAGE).
+bool norm_residual_rows(const float* branch, LinearView weight, float* residual, std::uint32_t rows, std::uint32_t width,
+                        LinearView scalar, float* next, LinearView next_weight, std::uint32_t* failure, Queue queue = nullptr);
+// gelu_product followed by check_finite(gate) in one launch (same bytes and flags).
+void gelu_product_finite(float* gate, const float* up, std::uint32_t count, std::uint32_t* failure, Queue queue = nullptr);
 bool norm_residual(const float* branch, LinearView weight, float* residual, std::uint32_t rows, std::uint32_t width,
                    LinearView scalar, float* next, LinearView next_weight, std::uint32_t* failure,
                    Queue queue = nullptr, A8Rows quant = {});

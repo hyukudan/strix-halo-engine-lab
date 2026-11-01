@@ -23,8 +23,9 @@ void linear_rows(LinearView w, const float* x, std::uint32_t rows, float* out, Q
 // out = gelu_tanh(x . gate) * (x . up), as gate_up(); formats may differ.
 // With scratch (rows * outputs floats), split = 1 evaluates gate and up as two
 // linear_rows calls and then gelu_product (the unfused decode schedule, same
-// bytes); -1 selects STRIX_G4_ROWS_GATE_SPLIT (default 1).
+// bytes); -1 selects STRIX_G4_ROWS_GATE_SPLIT (default 1). fuse_finite: the split
+// schedule's product and its finite check run as one launch (same bytes, same flags).
 void gate_up_rows(LinearView gate, LinearView up, const float* x, std::uint32_t rows, float* out, Queue queue = nullptr,
                   std::uint32_t* failure = nullptr, bool many = rows_linear_enabled(), int variant = -1,
-                  float* scratch = nullptr, int split = -1);
+                  float* scratch = nullptr, int split = -1, bool fuse_finite = false);
 } // namespace strix::gemma4::gpu

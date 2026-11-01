@@ -92,6 +92,7 @@ void session(const Table& table) {
     const std::uint32_t next[] = {10, 11, 12};
     const std::uint64_t positions[] = {497, 498, 499};
     EAGLE_CHECK(s.propose_window(12, 500, 3) == (std::array<std::uint32_t, 7>{}), "no hidden yet: empty proposal");
+    EAGLE_CHECK(!s.wants_taps(), "MTP sessions never read target taps (prompt prefill may skip them)");
     s.stage_rows(taps, hidden, next, positions);
     s.publish();
     EAGLE_CHECK(s.propose_window(12, 500, 3) == (std::array<std::uint32_t, 7>{}), "no KV source: empty proposal");

@@ -1,5 +1,6 @@
 #include "coordinator.hpp"
 #include "strix/model_content_hash.hpp"
+#include "gemma4/prefill/prefill.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -276,12 +277,20 @@ bool Coordinator::step() {
                 auto tx = s.state->begin();
                 const auto position = tx->frontier();
                 const auto n = std::min<std::size_t>(s.request.prompt.size()-1-s.prompt_processed, chunk-position%chunk);
-                const bool hidden = s.draft && s.draft->wants_hidden();
-                const auto rows = backend_.prefill_rows(*tx,{s.request.prompt.data()+s.prompt_processed,n},hidden);
+                const bool hidden = s.draft && s.draft->wants_hidden(), taps = s.draft && s.draft->wants_taps();
+                const auto call = Clock::now();
+                const auto rows = backend_.prefill_rows(*tx,{s.request.prompt.data()+s.prompt_processed,n},hidden,taps);
+                const auto call_ms = elapsed(call);
                 const auto width = std::size_t(backend_.config().hidden);
-                require(rows.tap_width == 5*width && rows.taps.size() == n*rows.tap_width &&
-                    (!hidden || rows.hidden.size() == n*width), "invalid backend prefill layout");
-                for (const auto x : rows.taps) require(std::isfinite(x), "nonfinite backend taps");
+                const auto tap_rows = rows.tap_rows(), hidden_rows = rows.hidden_rows();
+                // Taps nobody consumes may be omitted. Returned taps are scanned
+                // here unless the backend checked them on the device before its failure fence.
+                require(rows.tap_width == 5*width && (tap_rows.size() == n*rows.tap_width || (!taps && tap_rows.empty())) &&
+                    (!hidden || hidden_rows.size() == n*width), "invalid backend prefill layout");
+                if (!(rows.levers & prefill::lever_device_finite))
+                    for (const auto x : tap_rows) require(std::isfinite(x), "nonfinite backend taps");
+                for (const auto& lever : prefill::lever_names) if (rows.levers & lever.bit) ++s.out.prefill_levers[lever.name];
+                if (rows.levers & prefill::lever_pinned_taps) s.out.prefill_taps = tap_rows.empty() ? "skipped (no consumer)" : "pinned-async";
                 std::size_t staged = 0;
                 const auto stage = [&] {
                     const auto first = staged, count = std::min<std::size_t>(8,n-first);
@@ -291,8 +300,8 @@ bool Coordinator::step() {
                         positions.push_back(position+r);
                         next.push_back(s.request.prompt[s.prompt_processed+r+1]);
                     }
-                    s.draft->stage_rows({rows.taps.data()+first*rows.tap_width,count*rows.tap_width},
-                        hidden ? std::span<const float>(rows.hidden.data()+first*width,count*width) : std::span<const float>{},
+                    s.draft->stage_rows(tap_rows.empty() ? std::span<const float>{} : tap_rows.subspan(first*rows.tap_width,count*rows.tap_width),
+                        hidden ? hidden_rows.subspan(first*width,count*width) : std::span<const float>{},
                         next,positions);
                     staged += count;
                 };
@@ -313,6 +322,7 @@ bool Coordinator::step() {
                 s.out.frontier = s.state->frontier();
                 s.prompt_processed += n;
                 s.out.prefill_ms += elapsed(begin);
+                ++s.out.prefill_calls; s.out.prefill_host_ms += elapsed(begin)-call_ms+rows.host_ms;
                 prefilled[i] = true;
                 --rowed;
             }
@@ -524,8 +534,15 @@ Json Coordinator::receipt(std::size_t slot) const {
     j.set("auto_evidence",s.policy.receipt());
     if (multi_.config().enabled) j.set("multistream_evidence",multi_.receipt());
     j.set("acceptance",acceptance);
+    if (!r.prefill_levers.empty()) {
+        auto levers = Json::object();
+        for (const auto& [name,chunks] : r.prefill_levers) levers.set(name,chunks);
+        j.set("prefill_levers",levers);
+    }
+    if (!r.prefill_taps.empty()) j.set("prefill_taps",r.prefill_taps);
     timings.set("prefill_ms",r.prefill_ms); timings.set("decode_ms",r.decode_ms); timings.set("draft_ms",r.draft_ms); timings.set("context_ms",r.context_ms);
     timings.set("verify_ms",r.verify_ms); timings.set("commit_ms",r.commit_ms);
+    if (r.prefill_calls) timings.set("prefill_host_ms",r.prefill_host_ms);
     timings.set("session_setup_ms",r.setup_ms);
     timings.set("state_hash_scope","completion/cancellation or explicit receipt; outside decode_ms");
     j.set("timings",timings);

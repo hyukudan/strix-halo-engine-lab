@@ -139,8 +139,12 @@ class DevicePrefill {
     // same logits later if that chunk turns out to be the last one.
     // hidden=true also returns every row's final-norm output (the decode
     // target's RowPlan::export_hidden row).
+    // views=true admits PINNED_TAPS: taps (only when taps=true) and hidden rows
+    // arrive as ChunkResult views of pinned host memory, copied asynchronously
+    // (taps overlap the layers after the last tap layer). With the lever off,
+    // or views=false, taps and hidden are vectors as before.
     ChunkResult forward(KvTxn& transaction, std::span<const std::uint32_t> tokens, bool all_logits = false, bool logits = true,
-                        bool hidden = false);
+                        bool hidden = false, bool taps = true, bool views = false);
     [[nodiscard]] std::vector<float> last_logits();
     // Commits canonical chunks and returns last-row logits and recent committed taps.
     Result run(gpu::DeviceStream& stream, std::span<const std::uint32_t> tokens, DraftContext* context = nullptr);

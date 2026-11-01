@@ -191,7 +191,7 @@ void linear_rows(LinearView w, const float* x, unsigned rows, float* out, Queue 
                failure);
 }
 void gate_up_rows(LinearView gate, LinearView up, const float* x, unsigned rows, float* out, Queue q, unsigned* failure,
-                  bool many, int variant, float* scratch, int split) {
+                  bool many, int variant, float* scratch, int split, bool fuse_finite) {
     if (!rows)
         return;
     if (!gate.data || !up.data || gate.outputs != up.outputs || gate.inputs != up.inputs)
@@ -203,6 +203,10 @@ void gate_up_rows(LinearView gate, LinearView up, const float* x, unsigned rows,
     if (many && scratch && rows > 8U && (split < 0 ? split_default : split != 0)) {
         linear_rows(gate, x, rows, out, q, failure, true, variant);
         linear_rows(up, x, rows, scratch, q, failure, true, variant);
+        if (failure && fuse_finite) {
+            gelu_product_finite(out, scratch, rows * gate.outputs, failure, q);
+            return;
+        }
         gelu_product(out, scratch, rows * gate.outputs, q);
         if (failure)
             check_finite(out, std::size_t(rows) * gate.outputs, failure, q);

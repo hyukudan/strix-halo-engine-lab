@@ -452,6 +452,7 @@ void session_adapter() {
     EAGLE_CHECK(throws([&] { session->stage(rows.taps, rows.positions); }), "legacy stage refuses without next tokens");
     EAGLE_CHECK(session->propose(9, 0) == (std::array<std::uint32_t, 7>{}), "no committed rows: empty proposal");
     EAGLE_CHECK(eagle_session->wants_hidden(), "tap set C wants the final hidden row");
+    EAGLE_CHECK(eagle_session->wants_taps(), "EAGLE sessions consume target taps (prompt prefill must keep them)");
     eagle_session->stage_rows(rows.taps, rows.hidden, rows.next, rows.positions);
     session->publish();
     const auto p = eagle_session->propose_window(5, 3, 3);

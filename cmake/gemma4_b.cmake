@@ -79,6 +79,12 @@ if(STRIX_ENABLE_HIP_RUNTIME)
             list(APPEND gemma4_b_hip_targets strix-gemma4-device-rows-linear-tests)
             add_test(NAME strix-gemma4-device-rows-linear-tests COMMAND strix-gemma4-device-rows-linear-tests)
             set_tests_properties(strix-gemma4-device-rows-linear-tests PROPERTIES TIMEOUT 120 LABELS "gpu;gemma4")
+            # Prompt-prefill fused epilogues: byte gate against the separate launches (odd and chunk row counts).
+            add_executable(strix-gemma4-device-fused-epilogue-tests tests/gemma4_gpu/fused_epilogue.hip)
+            target_link_libraries(strix-gemma4-device-fused-epilogue-tests PRIVATE strix_gemma4_device)
+            list(APPEND gemma4_b_hip_targets strix-gemma4-device-fused-epilogue-tests)
+            add_test(NAME strix-gemma4-device-fused-epilogue-tests COMMAND strix-gemma4-device-fused-epilogue-tests)
+            set_tests_properties(strix-gemma4-device-fused-epilogue-tests PROPERTIES TIMEOUT 120 LABELS "gpu;gemma4")
             # Long-span decode attention: shared key/value chunks against the chunk-fastest launches.
             add_executable(strix-gemma4-device-attention-shared-tests tests/gemma4_gpu/attention_shared.hip)
             target_link_libraries(strix-gemma4-device-attention-shared-tests PRIVATE strix_gemma4_device)
