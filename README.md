@@ -1100,7 +1100,8 @@ needs `Authorization: Bearer <key>` or `x-api-key: <key>`; without it the server
 (`--http-max-queue`, `--http-max-connections`). The HTTP servers close a request that is not fully received
 within 60 seconds (408; plus one second per MiB of body) and treat a client that accepts no data for 60 seconds as
 gone, cancelling its generation. Ambiguous request framing (conflicting Content-Length, any Transfer-Encoding,
-malformed request line or header names) is refused with 400/501. Keep the servers on loopback or a private network and put
+malformed request line or header names) is refused with 400/501. Request bodies being received or handled share a
+256 MiB budget (503 with Retry-After when full), and one request body may hold at most 2,097,152 JSON values. Keep the servers on loopback or a private network and put
 remote clients behind an authenticating front end such as the [TensorMeld](https://github.com/hyukudan/tensormeld)
 router or its control channel; the two-node DeepSeek ranks exchange tensors over the USB4 link, and the RTX split
 (pipeline stage TCP port) and the expert servers talk plain TCP: none of these carry authentication, so they must

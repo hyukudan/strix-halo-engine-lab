@@ -44,6 +44,10 @@ struct HttpServerConfig {
     std::string bind_address = "127.0.0.1";
     std::uint16_t port = 8080;          // 0 = any free port (see HttpServer::port)
     std::uint64_t max_body_bytes = 64ULL << 20U;
+    // The bodies of all requests being received or handled share this budget: past it a request is refused with 503
+    // before its body is read, which bounds the memory of concurrent large bodies and of what is parsed from them.
+    // 0 = no shared budget.
+    std::uint64_t max_inflight_body_bytes = 256ULL << 20U;
     std::uint64_t max_header_bytes = 64ULL << 10U;
     unsigned max_connections = 64;
     int idle_timeout_seconds = 300;     // waiting for the next request on a kept-alive connection

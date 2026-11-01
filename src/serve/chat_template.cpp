@@ -61,7 +61,7 @@ Json call_arguments(const Json& call, const std::string& name) {
     if (arguments->is_string()) {
         if (strip(arguments->as_string()).empty()) return Json::object();
         Json parsed;
-        try { parsed = parse_json(arguments->as_string()); }
+        try { parsed = parse_request_json(arguments->as_string()); }
         catch (const JsonError&) { raise("Tool call arguments for function \"" + name + "\" are not valid JSON."); }
         if (!parsed.is_object()) raise("Tool call arguments for function \"" + name + "\" must be a JSON object.");
         return parsed;

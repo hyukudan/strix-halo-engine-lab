@@ -751,6 +751,58 @@ void test_scoring_transforms(const std::shared_ptr<const BpeTokenizer>& tokenize
 
 int main() try {
     {
+        // Large objects: repeated keys keep their first position and the last value (serving parser) or fail (unique
+        // parser), with or without the key index; a large object parses in linear time.
+        std::string wide = "{";
+        for (int i = 0; i < 200; ++i) wide += (i ? ",\"k" : "\"k") + std::to_string(i) + "\":" + std::to_string(i);
+        const auto replaced = parse_json(wide + ",\"k5\":-5,\"k150\":-150}");
+        check(replaced.size() == 200U && replaced.as_object()[5].first == "k5" && replaced.find("k5")->as_int() == -5 &&
+                  replaced.as_object()[150].second.as_int() == -150, "indexed object replaces repeated keys in place");
+        check(parse_json(R"({"a":1,"b":2,"a":3})").find("a")->as_int() == 3, "small object replaces repeated keys");
+        bool unique_refused = false;
+        try { (void)parse_json_unique(wide + ",\"k150\":1}"); } catch (const JsonError&) { unique_refused = true; }
+        check(unique_refused, "unique parser refuses a repeated key in an indexed object");
+        std::string huge = "{";
+        for (int i = 0; i < 200000; ++i) huge += (i ? ",\"m" : "\"m") + std::to_string(i) + "\":0";
+        huge += "}";
+        const auto begin = std::chrono::steady_clock::now();
+        check(parse_json(huge).size() == 200000U && parse_json_unique(huge).size() == 200000U, "200k-member object parses");
+        check(std::chrono::steady_clock::now() - begin < std::chrono::seconds(10), "200k-member object parses in linear time");
+        // A request body holds at most kMaxRequestJsonValues values (parse_request_json).
+        std::string many = "[0";
+        many.reserve(2U * kMaxRequestJsonValues + 2U);
+        for (std::size_t i = 1; i < kMaxRequestJsonValues - 1U; ++i) many += ",0";
+        check(parse_request_json(many + "]").size() == kMaxRequestJsonValues - 1U, "a document at the value limit parses");
+        bool over = false;
+        try { (void)parse_request_json(many + ",0]"); } catch (const JsonError&) { over = true; }
+        check(over, "a request body over the value limit is refused");
+        check(parse_json(many + ",0]").size() == kMaxRequestJsonValues, "files and trusted inputs keep no value limit");
+    }
+    {
+        // Request bodies share one in-flight budget: a request that does not fit is refused with 503 before its body
+        // is read; the budget is returned when the handler finishes.
+        HttpServerConfig budget_config;
+        budget_config.port = 0;
+        budget_config.max_inflight_body_bytes = 1000;
+        std::atomic<bool> release{false};
+        HttpServer budget(budget_config, [&](const HttpRequest& r, HttpResponseWriter& w) {
+            if (r.path == "/hold") while (!release.load()) std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            w.send(200, "text/plain", "ok");
+        });
+        budget.listen();
+        std::thread budget_thread([&] { budget.serve(); });
+        std::thread holder([&] { (void)http(budget.port(), "POST", "/hold", std::string(800, 'x')); });
+        std::this_thread::sleep_for(std::chrono::milliseconds(300));  // the 800-byte body is held by its handler
+        check(http(budget.port(), "POST", "/ok", std::string(300, 'y')).status == 503, "a body over the shared budget answers 503");
+        check(http(budget.port(), "POST", "/ok", std::string(150, 'y')).status == 200, "a body within the remaining budget is served");
+        check(http(budget.port(), "GET", "/ok", "").status == 200, "a request without a body always fits");
+        release.store(true);
+        holder.join();
+        check(http(budget.port(), "POST", "/ok", std::string(900, 'z')).status == 200, "the budget is returned after the handler");
+        budget.stop();
+        budget_thread.join();
+    }
+    {
         // A handler that throws a non-standard type fails that request with 500; the server keeps serving.
         HttpServerConfig boom_config;
         boom_config.port = 0;

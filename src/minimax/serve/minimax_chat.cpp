@@ -344,7 +344,7 @@ std::string render_minimax_chat(const Json& messages, const Json* tools, const M
                     const auto* args = member(*call, "arguments");
                     Json parsed;
                     if (args && args->is_string()) {  // extension: OpenAI wire format
-                        parsed = strix::serve::parse_json(args->as_string());
+                        parsed = strix::serve::parse_request_json(args->as_string());
                         args = &parsed;
                     }
                     if (!args || !args->is_object()) throw MinimaxChatError("minimax chat: tool call arguments must be an object");

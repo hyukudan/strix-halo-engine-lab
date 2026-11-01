@@ -42,7 +42,7 @@ inline Json session_command(std::string_view method, std::string_view path, std:
     if (op.empty()) throw SessionApiError(404, "not_found", "unknown session route");
     if (op == "checkpoint") {
         Json input;
-        try { input = parse_json(body); } catch (const std::exception& e) { throw SessionApiError(400, "invalid_request", e.what()); }
+        try { input = parse_request_json(body); } catch (const std::exception& e) { throw SessionApiError(400, "invalid_request", e.what()); }
         const auto* d = input.find("durability");
         if (!input.is_object() || !d || !d->is_string() || (d->as_string() != "ram" && d->as_string() != "disk"))
             throw SessionApiError(400, "invalid_request", "durability must be ram or disk");

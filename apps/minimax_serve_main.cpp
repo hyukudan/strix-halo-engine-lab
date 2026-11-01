@@ -689,7 +689,7 @@ std::string mm_metric_lines(const sv::QueueSnapshot& s, Shared& shared) {
 // GET / POST /admin/sched (with --admin): the policy and counters; POST changes them (a bad value throws: a 400).
 sv::Json admin_sched(const sv::HttpRequest& req, Shared& shared, bool drafter) {
     if (req.method == "POST") {
-        const sv::Json body = sv::parse_json(req.body);
+        const sv::Json body = sv::parse_request_json(req.body);
         std::lock_guard<std::mutex> l(shared.m);
         Policy p = shared.policy;
         if (const auto* v = body.find("sched"); v && v->is_string()) {
