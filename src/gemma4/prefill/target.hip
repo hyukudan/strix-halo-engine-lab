@@ -112,6 +112,20 @@ struct DevicePrefill::Impl {
                                failure.as<unsigned>(), maximum.as<unsigned>() + index, queue);
         });
     }
+    // EXL3 FFN on prepared panels (g4-exl3-wmma-pf-v1): down's input panels in halves.
+    bool exl3_pair(const std::string& name, LinearView wg, LinearView wu, LinearView wd, unsigned rows) {
+        if (!fuse_ffn || wg.format != WeightFormat::exl3_mul1) return false;
+        const auto g = prepared.find(wg.data), u = prepared.find(wu.data);
+        if (g == prepared.end() || u == prepared.end() || !prepared.contains(wd.data) ||
+            !exl3_gelu_pair_supported(*g->second, *u->second, wd)) return false;
+        const auto index = unsigned(ranges.size());
+        ranges.push_back({name + "gate", 0.0F}); ranges.push_back({name + "up", 0.0F});
+        record(name + "gate_up", [&] {
+            prefill::exl3_gelu_pair(*g->second, *u->second, wd, x.as<float>(), rows, pair_halves.data(), gate.as<float>(),
+                                    up.as<float>(), halves.data(), failure.as<unsigned>(), maximum.as<unsigned>() + index, queue);
+        }, 4.0 * rows * wg.inputs * wg.outputs, true);
+        return true;
+    }
     // g4-v1 rows linear, or the EXL3 pack's own identity: many-row core for
     // chunks, its eight-row decode linear otherwise (same bytes either way).
     void exact_linear(LinearView matrix, const float* input, unsigned rows, float* output) {
@@ -126,6 +140,29 @@ struct DevicePrefill::Impl {
         for (unsigned r = 0; r < rows; r += 8)
             exl3::device_linear(matrix, input + std::size_t(r) * matrix.inputs, std::min(8U, rows - r),
                                 output + std::size_t(r) * matrix.outputs, exl3_scratch.data(), failure.as<unsigned>(), true, queue);
+    }
+    // EXL3 many-row FFN (gate, up, fused middle stage, down) into out; false,
+    // enqueueing nothing, when the pack, identity or switches select the separate linears.
+    bool exl3_ffn(const std::string& name, LinearView wg, LinearView wu, LinearView wd, unsigned rows) {
+        if (wg.format != WeightFormat::exl3_mul1 || wu.format != WeightFormat::exl3_mul1 || wd.format != WeightFormat::exl3_mul1)
+            return false;
+        const auto bytes = exl3::ffn_rows_scratch_bytes(wg, wu, wd, rows);
+        if (!bytes) return false;
+        if (exl3_scratch.size() < bytes) exl3_scratch.resize(bytes);
+        bool done = false;
+        record(name + "ffn", [&] {
+            done = exl3::device_ffn_rows(wg, wu, wd, x.as<float>(), rows, gate.as<float>(), up.as<float>(), out.as<float>(),
+                                         exl3_scratch.data(), exl3_scratch.size(), failure.as<unsigned>(), queue);
+        }, 2.0 * rows * (2.0 * wg.inputs * wg.outputs + double(wd.inputs) * wd.outputs), true);
+        if (done) { ranges.push_back({name + "gate", 0.0F}); ranges.push_back({name + "up", 0.0F}); ranges.push_back({name + "down", 0.0F}); }
+        return done;
+    }
+    // Profiled stage outside dot(): its own kernel record (linear time when linear).
+    template <class F> void record(const std::string& name, F body, double flops = 0.0, bool linear = false) {
+        double elapsed = 0.0;
+        timing(elapsed, body);
+        (linear ? stats.linear_ms : stats.other_ms) += elapsed;
+        if (profile) { auto& p = stats.kernels[name]; ++p.calls; p.ms += elapsed; p.matrix_ms += linear ? elapsed : 0.0; p.flops += flops; }
     }
     void dot(const std::string& name, LinearView matrix, const float* input, float* output, unsigned rows, bool preconverted = false) {
         const auto index = unsigned(ranges.size());
@@ -352,20 +389,25 @@ ChunkResult DevicePrefill::forward(KvTxn& transaction, std::span<const unsigned>
             });
             b.dot(name + "o", y.o, b.att.as<float>(), b.out.as<float>(), n); b.add(b.out, y.post_attention_norm, n);
             b.norm(b.residual, y.pre_ffn_norm, b.x, n, c.hidden);
-            if (b.stats.linears == Linears::exact) {
+            if (b.stats.linears == Linears::exact && b.exl3_ffn(name, y.gate, y.up, y.down, n)) {
+                // EXL3 many-row FFN, down included.
+            } else if (b.stats.linears == Linears::exact) {
                 // The decode target's gate_up: gelu_tanh(gate) * up stored per element.
-                b.ranges.push_back({name + "gate", 0.0F}); b.ranges.push_back({name + "up", 0.0F});
-                b.timing(b.stats.linear_ms, [&] {
-                    if (y.gate.format == WeightFormat::exl3_mul1 || y.up.format == WeightFormat::exl3_mul1) {
-                        // EXL3 packs: separate linears, then the decode target's gelu product.
-                        b.exact_linear(y.gate, b.x.as<float>(), n, b.gate.as<float>());
-                        b.exact_linear(y.up, b.x.as<float>(), n, b.up.as<float>());
-                        gpu::gelu_product(b.gate.as<float>(), b.up.as<float>(), n * c.inter, b.queue);
-                    } else
+                if (y.gate.format == WeightFormat::exl3_mul1 || y.up.format == WeightFormat::exl3_mul1) {
+                    // EXL3 packs: separate linears (each profiled), then the decode target's gelu product.
+                    b.dot(name + "gate", y.gate, b.x.as<float>(), b.gate.as<float>(), n);
+                    b.dot(name + "up", y.up, b.x.as<float>(), b.up.as<float>(), n);
+                    b.record(name + "gelu_product", [&] { gpu::gelu_product(b.gate.as<float>(), b.up.as<float>(), n * c.inter, b.queue); });
+                } else {
+                    b.ranges.push_back({name + "gate", 0.0F}); b.ranges.push_back({name + "up", 0.0F});
+                    b.record(name + "gate_up", [&] {
                         gpu::gate_up_rows(y.gate, y.up, b.x.as<float>(), n, b.gate.as<float>(), b.queue, b.failure.as<unsigned>(),
                                           gpu::rows_linear_enabled(), -1, b.up.as<float>());
-                });
+                    }, 4.0 * n * y.gate.inputs * y.gate.outputs, true);
+                }
                 b.dot(name + "down", y.down, b.gate.as<float>(), b.out.as<float>(), n);
+            } else if (b.exl3_pair(name, y.gate, y.up, y.down, n)) {
+                b.dot(name + "down", y.down, b.gate.as<float>(), b.out.as<float>(), n, true);
             } else if (b.fused(y.gate, y.up, y.down)) {
                 b.gelu_pair(name, y.gate, y.up, n);
                 b.dot(name + "down", y.down, b.gate.as<float>(), b.out.as<float>(), n, true);

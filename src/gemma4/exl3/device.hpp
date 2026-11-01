@@ -33,10 +33,34 @@ void device_core(LinearView w, const void* transformed, unsigned rows, float* ou
 [[nodiscard]] std::size_t rows_scratch_bytes(LinearView w, unsigned rows);
 bool device_linear_rows(LinearView w, const float* x, unsigned rows, float* out, void* scratch, std::size_t scratch_bytes,
                         std::uint32_t* failure, gpu::Queue queue = nullptr);
+// Many-row FFN under the v2/v3 identities: out = down(gelu_tanh(gate(x)) * up(x)),
+// the bytes of device_linear_rows(gate), (up), gpu::gelu_product and
+// device_linear_rows(down), with the gate/up output transforms, the product and
+// down's input transform in one launch. gate_out/up_out (rows * gate.outputs
+// floats) hold raw core values. Returns false (nothing enqueued) for rows <= 8,
+// the v1 identity, STRIX_G4_PREFILL_EXACT_MANYROW=0 or STRIX_G4_EXL3_FFN_FUSE=0.
+[[nodiscard]] std::size_t ffn_rows_scratch_bytes(LinearView gate, LinearView up, LinearView down, unsigned rows);
+bool device_ffn_rows(LinearView gate, LinearView up, LinearView down, const float* x, unsigned rows, float* gate_out,
+                     float* up_out, float* out, void* scratch, std::size_t scratch_bytes, std::uint32_t* failure,
+                     gpu::Queue queue = nullptr);
 // Input transform only: rows*inputs FP16 values into scratch (tests/benchmarks).
 void device_input(LinearView w, const float* x, unsigned rows, void* scratch, std::uint32_t* failure, gpu::Queue queue = nullptr);
 // Writes the lane-tile packed decode of all 65,536 states (FP16 bits) for tests.
 void device_codebook_table(void* out65536, gpu::Queue queue = nullptr);
+// Pieces of device_prefill for the prefill GEMMs (prefill/linear.hip): the
+// input transform into [K16][row][16] FP16 panels (maximum, optional, gets the
+// abs bits of x), and the output transform and scale of raw core values in out.
+void device_input_panels(LinearView w, const float* x, unsigned rows, void* scratch, std::uint32_t* failure,
+                         std::uint32_t* maximum, gpu::Queue queue = nullptr);
+void device_output(LinearView w, float* out, unsigned rows, std::uint32_t* failure, gpu::Queue queue = nullptr);
+// device_ffn_rows' middle stage on raw gate/up core values (rows x gate.outputs
+// floats each): output transforms, gelu_tanh(gate) * up and down's input
+// transform, into down's [K16][row][16] FP16 panels. The bytes equal
+// device_output(gate), device_output(up), gpu::gelu_product and
+// device_input_panels(down); maximum (optional) gets the product's abs bits.
+void device_ffn_middle_panels(LinearView gate, LinearView up, LinearView down, const float* gate_core, const float* up_core,
+                              unsigned rows, void* product, std::uint32_t* failure, std::uint32_t* maximum,
+                              gpu::Queue queue = nullptr);
 // Optional panels use [N16][K16][N][K] rotated FP16 coefficients. Packed and
 // prepared paths issue the identical increasing K16 WMMA instruction sequence.
 void device_prefill(LinearView w, const float* x, unsigned rows, float* out, void* scratch,

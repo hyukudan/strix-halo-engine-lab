@@ -55,7 +55,8 @@ Args arguments(int argc, char** argv) {
         } else throw std::invalid_argument("unknown option: " + key);
     }
     if (a.model.empty() || a.rope.empty() || !a.steps || !a.limit || a.steps > 1024 ||
-        (a.mode != "gate" && a.mode != "speed" && a.mode != "speed-all" && a.mode != "quality" && a.mode != "quality-decode")) throw std::invalid_argument("invalid check arguments");
+        (a.mode != "gate" && a.mode != "speed" && a.mode != "speed-all" && a.mode != "quality" && a.mode != "quality-decode" &&
+         a.mode != "quality-exact")) throw std::invalid_argument("invalid check arguments");
     return a;
 }
 void print(Json value) { std::cout << value.dump() << std::endl; }
@@ -243,6 +244,10 @@ void quality(const g4::HostWeights& w, g4::RopeTables rope, const Args& args, bo
     std::unique_ptr<g4::prefill::DevicePrefill> prompt_owner;
     std::unique_ptr<gpu::DeviceTarget> target;
     if (decode) target = std::make_unique<gpu::DeviceTarget>(w, rope);
+    // quality-exact: the engine's prompt prefill (exact many-row linears, canonical attention).
+    else if (args.mode == "quality-exact")
+        prompt_owner = std::make_unique<g4::prefill::DevicePrefill>(w, rope, g4::prefill::Residency::host, false,
+                                                                    g4::prefill::AttentionMode::canonical, g4::prefill::Linears::exact);
     else prompt_owner = std::make_unique<g4::prefill::DevicePrefill>(w, rope);
     std::vector<std::filesystem::path> paths;
     for (const auto& e : std::filesystem::directory_iterator(args.teacher)) if (e.path().extension() == ".npz") paths.push_back(e.path());
@@ -326,7 +331,7 @@ int main(int argc, char** argv) {
         const auto rope = g4::load_rope_tables(args.rope); const auto weights = g4::bind_host_weights(model);
         auto meta = Json::object(); meta.set("identity", model.identity); meta.set("model_hash", model.model_hash);
         meta.set("rope_hash", rope.view.hash); meta.set("mode", args.mode); meta.set("qualified", false);
-        meta.set("prefill_identity", args.mode == "gate" ? "prefill-exact" : args.mode == "quality-decode" ? "decode-path"
+        meta.set("prefill_identity", args.mode == "gate" ? "prefill-exact" : args.mode == "quality-decode" ? "decode-path" : args.mode == "quality-exact" ? "prefill-exact"
                  : model.identity == ex::identity || model.identity == ex::identity_v2 || model.identity == ex::identity_v3 ? ex::prefill_identity : g4::prefill::identity);
         meta.set("load_s", elapsed(t));
         auto switches = Json::object();

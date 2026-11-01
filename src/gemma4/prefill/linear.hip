@@ -464,6 +464,56 @@ unsigned direct_mode() {
     }();
     return mode;
 }
+namespace {
+// Every panel GEMM issues the same increasing K16 WMMA chain per output.
+void panel_gemm(const PreparedLinear& prepared, const _Float16* x, unsigned rows, float* out, unsigned* failure,
+                hipStream_t q, unsigned mode) {
+    const auto w = prepared.weights();
+    const auto stride = ((w.inputs + 15U) / 16U) * 16U;
+    // The staged kernel measured faster only for long-K projections (down:
+    // 33 vs 29 TF at M512); wide outputs keep the register-only tiles.
+    const bool staged = mode >= 3 && staged_enabled() && stride % 32 == 0 && stride >= 8192 && w.outputs > 1024 && w.outputs <= 4096 && rows > 8;
+    const auto direct = mode == 4 ? 3U : mode;
+    if (staged && w.outputs >= 4096)
+        hipLaunchKernelGGL(staged_gemm<4>, dim3((w.outputs + 255U) / 256U, (rows + 127U) / 128U), dim3(256), 0, q,
+                           prepared.panels().as<_Float16>(), x, rows, w.outputs, stride, out, failure);
+    else if (staged)
+        hipLaunchKernelGGL(staged_gemm<2>, dim3((w.outputs + 127U) / 128U, (rows + 127U) / 128U), dim3(128), 0, q,
+                           prepared.panels().as<_Float16>(), x, rows, w.outputs, stride, out, failure);
+    else if (direct == 3 && rows <= 8)
+        hipLaunchKernelGGL(prepared_rows, dim3((w.outputs + 15U) / 16U, (rows + 15U) / 16U), dim3(32), 0, q,
+                           prepared.panels().as<_Float16>(), x, rows, w.outputs, stride, out, failure);
+    else if (direct == 3 && w.outputs <= 1024)
+        hipLaunchKernelGGL(narrow_gemm, dim3((w.outputs + 63U) / 64U, (rows + 63U) / 64U), dim3(128), 0, q,
+                           prepared.panels().as<_Float16>(), x, rows, w.outputs, stride, out, failure);
+    else if (direct == 3 && w.outputs >= 8192)
+        hipLaunchKernelGGL((direct_gemm<4, true>), dim3((w.outputs + 127U) / 128U, (rows + 255U) / 256U), dim3(256), 0, q,
+                           prepared.panels().as<_Float16>(), x, rows, w.outputs, stride, out, failure);
+    else if (direct == 3)
+        hipLaunchKernelGGL((direct_gemm<2, true>), dim3((w.outputs + 127U) / 128U, (rows + 127U) / 128U), dim3(128), 0, q,
+                           prepared.panels().as<_Float16>(), x, rows, w.outputs, stride, out, failure);
+    else if (direct == 2 && w.outputs > 512)
+        hipLaunchKernelGGL((direct_gemm<4>), dim3((w.outputs + 127U) / 128U, (rows + 255U) / 256U), dim3(256), 0, q,
+                           prepared.panels().as<_Float16>(), x, rows, w.outputs, stride, out, failure);
+    else if (direct)
+        hipLaunchKernelGGL((direct_gemm<2>), dim3((w.outputs + 127U) / 128U, (rows + 127U) / 128U), dim3(128), 0, q,
+                           prepared.panels().as<_Float16>(), x, rows, w.outputs, stride, out, failure);
+    else
+        hipLaunchKernelGGL(prepared_gemm, dim3((w.outputs + 63U) / 64U, (rows + 63U) / 64U), dim3(128), 0, q,
+                           prepared.panels().as<_Float16>(), x, rows, w.outputs, stride, out, failure);
+    checked();
+}
+bool exl3_panel_route(const PreparedLinear* prepared, bool tiled) {
+    return prepared && tiled && tiled_enabled() && direct_mode() >= 3 && exl3_gemm_enabled();
+}
+} // namespace
+bool exl3_gemm_enabled() {
+    static const bool enabled = [] {
+        const auto* p = std::getenv("STRIX_G4_EXL3_PREFILL_GEMM");
+        return !p || std::string_view(p) != "0";
+    }();
+    return enabled;
+}
 PreparedLinear::PreparedLinear(LinearView w, gpu::Queue queue) : weights_(w) {
     if (!w.data || !w.inputs || w.inputs > 10752 || !w.outputs || w.outputs > vocab ||
         (w.format == WeightFormat::exl3_mul1 ? !exl3::geometry(w) : w.row_bytes < packed_row_bytes(w.format, w.inputs))) throw std::invalid_argument("prepared linear geometry");
@@ -492,6 +542,17 @@ void linear(LinearView w, const float* x, unsigned rows, float* out, void* scrat
             if (p.data != w.data || p.inputs != w.inputs || p.outputs != w.outputs || p.row_bytes != w.row_bytes || p.format != w.format)
                 throw std::invalid_argument("EXL3 prepared linear mismatch");
         }
+        if (exl3_panel_route(prepared, tiled)) {
+            const auto q = static_cast<hipStream_t>(queue);
+            if (!converted) exl3::device_input_panels(w, x, rows, scratch, failure, maximum, queue);
+            if (converted_event)
+                if (const auto e = hipEventRecord(static_cast<hipEvent_t>(converted_event), q); e != hipSuccess)
+                    throw std::runtime_error(hipGetErrorString(e));
+            panel_gemm(*prepared, static_cast<const _Float16*>(scratch), rows, out, failure, q, direct_mode());
+            exl3::device_output(w, out, rows, failure, queue);
+            return;
+        }
+        if (converted) throw std::invalid_argument("pre-converted EXL3 input requires panel GEMMs");
         exl3::device_prefill(w, x, rows, out, scratch, failure, maximum,
             prepared ? prepared->panels().data() : nullptr, queue, converted_event);
         return;
@@ -507,9 +568,6 @@ void linear(LinearView w, const float* x, unsigned rows, float* out, void* scrat
     const auto q = static_cast<hipStream_t>(queue);
     tiled &= tiled_enabled();
     const auto mode = prepared && tiled ? direct_mode() : 0;
-    // The staged kernel measured faster only for long-K projections (down:
-    // 33 vs 29 TF at M512); wide outputs keep the register-only tiles.
-    const bool staged = mode >= 3 && staged_enabled() && stride % 32 == 0 && stride >= 8192 && w.outputs > 1024 && w.outputs <= 4096 && rows > 8;
     const auto direct = mode == 4 ? 3U : mode;
     if (converted && direct != 3) throw std::invalid_argument("pre-converted input requires panel GEMMs");
     if (converted) {}
@@ -527,34 +585,8 @@ void linear(LinearView w, const float* x, unsigned rows, float* out, void* scrat
         const auto p = prepared->weights();
         if (p.data != w.data || p.inputs != w.inputs || p.outputs != w.outputs || p.row_bytes != w.row_bytes || p.format != w.format)
             throw std::invalid_argument("prepared linear tensor mismatch");
-        if (staged && w.outputs >= 4096)
-            hipLaunchKernelGGL(staged_gemm<4>, dim3((w.outputs + 255U) / 256U, (rows + 127U) / 128U), dim3(256), 0, q,
-                               prepared->panels().as<_Float16>(), static_cast<const _Float16*>(scratch), rows, w.outputs, stride, out, failure);
-        else if (staged)
-            hipLaunchKernelGGL(staged_gemm<2>, dim3((w.outputs + 127U) / 128U, (rows + 127U) / 128U), dim3(128), 0, q,
-                               prepared->panels().as<_Float16>(), static_cast<const _Float16*>(scratch), rows, w.outputs, stride, out, failure);
-        else if (direct == 3 && rows <= 8)
-            hipLaunchKernelGGL(prepared_rows, dim3((w.outputs + 15U) / 16U, (rows + 15U) / 16U), dim3(32), 0, q,
-                               prepared->panels().as<_Float16>(), static_cast<const _Float16*>(scratch), rows, w.outputs, stride, out, failure);
-        else if (direct == 3 && w.outputs <= 1024)
-            hipLaunchKernelGGL(narrow_gemm, dim3((w.outputs + 63U) / 64U, (rows + 63U) / 64U), dim3(128), 0, q,
-                               prepared->panels().as<_Float16>(), static_cast<const _Float16*>(scratch), rows, w.outputs, stride, out, failure);
-        else if (direct == 3 && w.outputs >= 8192)
-            hipLaunchKernelGGL((direct_gemm<4, true>), dim3((w.outputs + 127U) / 128U, (rows + 255U) / 256U), dim3(256), 0, q,
-                               prepared->panels().as<_Float16>(), static_cast<const _Float16*>(scratch), rows, w.outputs, stride, out, failure);
-        else if (direct == 3)
-            hipLaunchKernelGGL((direct_gemm<2, true>), dim3((w.outputs + 127U) / 128U, (rows + 127U) / 128U), dim3(128), 0, q,
-                               prepared->panels().as<_Float16>(), static_cast<const _Float16*>(scratch), rows, w.outputs, stride, out, failure);
-        else if (direct == 2 && w.outputs > 512)
-            hipLaunchKernelGGL((direct_gemm<4>), dim3((w.outputs + 127U) / 128U, (rows + 255U) / 256U), dim3(256), 0, q,
-                               prepared->panels().as<_Float16>(), static_cast<const _Float16*>(scratch), rows, w.outputs, stride, out, failure);
-        else if (direct)
-            hipLaunchKernelGGL((direct_gemm<2>), dim3((w.outputs + 127U) / 128U, (rows + 127U) / 128U), dim3(128), 0, q,
-                               prepared->panels().as<_Float16>(), static_cast<const _Float16*>(scratch), rows, w.outputs, stride, out, failure);
-        else
-            hipLaunchKernelGGL(prepared_gemm, dim3((w.outputs + 63U) / 64U, (rows + 63U) / 64U), dim3(128), 0, q,
-                               prepared->panels().as<_Float16>(), static_cast<const _Float16*>(scratch), rows, w.outputs, stride, out, failure);
-        checked(); return;
+        panel_gemm(*prepared, static_cast<const _Float16*>(scratch), rows, out, failure, q, mode);
+        return;
     }
     switch (w.format) {
 #define G4_PF_FORMAT(F) case WeightFormat::F: \
@@ -602,5 +634,26 @@ void gelu_pair(const PreparedLinear& gate, const PreparedLinear& up, const float
                        gate.panels().as<_Float16>(), up.panels().as<_Float16>(), static_cast<const _Float16*>(scratch),
                        rows, g.outputs, stride, static_cast<_Float16*>(product), failure, maximum + 2);
     checked();
+}
+bool exl3_gelu_pair_supported(const PreparedLinear& gate, const PreparedLinear& up, LinearView down) {
+    const auto g = gate.weights(), u = up.weights();
+    return fused_ffn_enabled() && exl3_panel_route(&gate, true) && g.format == WeightFormat::exl3_mul1 &&
+           u.format == WeightFormat::exl3_mul1 && down.format == WeightFormat::exl3_mul1 && g.inputs == u.inputs &&
+           g.outputs == u.outputs && down.inputs == g.outputs && exl3::geometry(g) && exl3::geometry(u) && exl3::geometry(down);
+}
+void exl3_gelu_pair(const PreparedLinear& gate, const PreparedLinear& up, LinearView down, const float* x, unsigned rows,
+                    void* scratch, float* gate_core, float* up_core, void* product, unsigned* failure, unsigned* maximum,
+                    gpu::Queue queue) {
+    if (!rows || rows > chunk_rows || !x || !scratch || !gate_core || !up_core || !product || !failure || !maximum ||
+        !exl3_gelu_pair_supported(gate, up, down))
+        throw std::invalid_argument("EXL3 fused gate/up geometry");
+    const auto q = static_cast<hipStream_t>(queue);
+    const auto g = gate.weights(), u = up.weights();
+    // gate and up scale the input differently: one transform each, one scratch in stream order.
+    exl3::device_input_panels(g, x, rows, scratch, failure, maximum, queue);
+    panel_gemm(gate, static_cast<const _Float16*>(scratch), rows, gate_core, failure, q, direct_mode());
+    exl3::device_input_panels(u, x, rows, scratch, failure, maximum + 1, queue);
+    panel_gemm(up, static_cast<const _Float16*>(scratch), rows, up_core, failure, q, direct_mode());
+    exl3::device_ffn_middle_panels(g, u, down, gate_core, up_core, rows, product, failure, maximum + 2, queue);
 }
 } // namespace strix::gemma4::prefill

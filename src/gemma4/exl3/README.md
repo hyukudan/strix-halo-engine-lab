@@ -71,11 +71,34 @@ decodes each lane's coefficients once and applies them to 16 (v1) or 32
 (v2/v3) rows whose transformed FP16 inputs are staged in LDS; every output
 keeps its identity's order (v1 lane chunks and butterfly, v2/v3 split ranges,
 quad reduction and increasing split sum), so the bytes equal `device_linear`
-over eight-row slices. `strix-gemma4-exl3-rows-tests` (ctest per identity)
+over eight-row slices. Under v2/v3 the prefill FFN uses `device_ffn_rows`:
+the gate and up cores, then one launch that forms both output transforms,
+`gelu_tanh(gate) * up` and the down input transform in registers (the same
+operations as the separate output launches, `gelu_product` and the input
+transform), then the down core; `STRIX_G4_EXL3_FFN_FUSE=0` runs the separate
+linears. `strix-gemma4-exl3-rows-tests` (ctest per identity)
 compares them by memcmp; `STRIX_G4_PREFILL_EXACT_MANYROW=0` keeps the slices.
 
+`g4-exl3-wmma-pf-v1` prompts run on the prefill GEMMs over FP16 panels decoded
+once at load (`PreparedLinear`): the pack's input transform writes the GEMMs'
+K16 input panels, the GEMMs run unchanged, then the pack's output transform.
+Every output keeps one increasing K16 WMMA chain on the same FP16 operands, so
+the bytes equal the pack's own 64x64 WMMA kernel (`STRIX_G4_EXL3_PREFILL_GEMM=0`
+restores it). The FFN keeps raw gate/up GEMM values and forms the middle stage
+above into down's input panels in one launch (`STRIX_G4_PREFILL_FUSE_FFN=0` runs
+the separate linears). `strix-gemma4-exl3-panels-tests` compares both by memcmp.
+Decode cores (rows <= 8) keep two chunks of trellis words in flight per wave
+(the single-chunk core was latency-bound); chunks are consumed in the same order
+with the same arithmetic, so the bytes are unchanged (`STRIX_G4_EXL3_COOP_DEPTH=1`
+restores one chunk, `4` keeps four).
+
+The engine selects this identity with `STRIX_G4_EXL3_PREFILL=wmma` (profile row
+`exl3_prefill`, pending in QUALITY until its qualification receipt; the panels
+add about 2 bytes per weight of device memory).
+
 The separate `strix-gemma4-exl3-check` CLI runs full-model gates, bounded
-speed trials (`--mode speed`) or teacher-forced prefill (`--mode quality`).
+speed trials (`--mode speed`) or teacher-forced prefill (`--mode quality` on
+`g4-exl3-wmma-pf-v1`, `--mode quality-exact` on the engine's exact prefill).
 It accepts `--model ARM_DIR --bf16 BF16_DIR --rope TABLE_DIR`, or a GGUF
 file for same-corpus qualification. Quality uses `--teacher TEACHER_DIR`,
 with resumable `--skip N --limit N` parent ranges. It validates ordinary

@@ -46,8 +46,9 @@ __device__ void transform(float (&values)[4], unsigned* failure) {
 #pragma unroll
     for (unsigned j = 0; j < 4; ++j) { values[j] = values[j] * hscale; flag(values[j], failure); }
 }
+// panels = false: rows x inputs; true: the prefill GEMMs' [K16][row][16] input panels.
 __device__ __forceinline__ void input_body(LinearView w, const float* x, unsigned rows, _Float16* out,
-                                           unsigned* failure, unsigned* maximum, std::size_t group) {
+                                           unsigned* failure, unsigned* maximum, std::size_t group, bool panels = false) {
     if (group >= std::size_t(rows) * (w.inputs / 128)) return;
     const auto row = unsigned(group / (w.inputs / 128)), begin = unsigned(group % (w.inputs / 128)) * 128;
     const auto lane = threadIdx.x % 32;
@@ -62,12 +63,25 @@ __device__ __forceinline__ void input_body(LinearView w, const float* x, unsigne
     }
     transform(v, failure);
 #pragma unroll
-    for (unsigned j = 0; j < 4; ++j)
-        out[std::size_t(row) * w.inputs + begin + lane + 32 * j] = half(v[j], failure);
+    for (unsigned j = 0; j < 4; ++j) {
+        const auto i = begin + lane + 32 * j;
+        out[panels ? std::size_t(i / 16) * rows * 16 + row * 16 + i % 16 : std::size_t(row) * w.inputs + i] = half(v[j], failure);
+    }
 }
+template <bool Panels = false>
 __global__ void input_kernel(LinearView w, const float* x, unsigned rows, _Float16* out,
                              unsigned* failure, unsigned* maximum) {
-    input_body(w, x, rows, out, failure, maximum, std::size_t(blockIdx.x) * 4 + threadIdx.x / 32);
+    input_body(w, x, rows, out, failure, maximum, std::size_t(blockIdx.x) * 4 + threadIdx.x / 32, Panels);
+}
+// Output transform and scale of one row's 128 core values v[j] (output begin + lane + 32j).
+__device__ __forceinline__ void output_values(LinearView w, unsigned begin, float (&v)[4], unsigned* failure) {
+    const auto lane = threadIdx.x % 32;
+    transform(v, failure);
+#pragma unroll
+    for (unsigned j = 0; j < 4; ++j) {
+        v[j] = v[j] * fp16_value(load16(w.data + 2ULL * (w.inputs + begin + lane + 32 * j)));
+        flag(v[j], failure);
+    }
 }
 __device__ __forceinline__ void output_body(LinearView w, float* out, unsigned rows, unsigned* failure, std::size_t group) {
     if (group >= std::size_t(rows) * (w.outputs / 128)) return;
@@ -76,13 +90,9 @@ __device__ __forceinline__ void output_body(LinearView w, float* out, unsigned r
     float v[4];
 #pragma unroll
     for (unsigned j = 0; j < 4; ++j) v[j] = out[std::size_t(row) * w.outputs + begin + lane + 32 * j];
-    transform(v, failure);
+    output_values(w, begin, v, failure);
 #pragma unroll
-    for (unsigned j = 0; j < 4; ++j) {
-        const auto o = begin + lane + 32 * j;
-        const float value = v[j] * fp16_value(load16(w.data + 2ULL * (w.inputs + o)));
-        out[std::size_t(row) * w.outputs + o] = value; flag(value, failure);
-    }
+    for (unsigned j = 0; j < 4; ++j) out[std::size_t(row) * w.outputs + begin + lane + 32 * j] = v[j];
 }
 __global__ void output_kernel(LinearView w, float* out, unsigned rows, unsigned* failure) {
     output_body(w, out, rows, failure, std::size_t(blockIdx.x) * 4 + threadIdx.x / 32);
@@ -266,12 +276,61 @@ template <unsigned K> struct CoopLane {
 };
 // Accumulates one split of one tile column; returns the quad-reduced value in
 // lane a == 0 (lanes 4c..4c+3 hold output column c and c+8 in acc[0]/acc[1]).
+// One chunk of the cooperative core: lane chains in the identity's order.
 template <unsigned K, unsigned Rows>
+__device__ __forceinline__ void coop_chunk(const CoopLane<K>& t, const _Float16 (&xs)[Rows][4], float (&acc)[2][Rows]) {
+    const float c0 = float(codebook_half(t.template state<0>())), c1 = float(codebook_half(t.template state<1>()));
+    const float c2 = float(codebook_half(t.template state<2>())), c3 = float(codebook_half(t.template state<3>()));
+    const float c4 = float(codebook_half(t.template state<4>())), c5 = float(codebook_half(t.template state<5>()));
+    const float c6 = float(codebook_half(t.template state<6>())), c7 = float(codebook_half(t.template state<7>()));
+#pragma unroll
+    for (unsigned r = 0; r < Rows; ++r) {
+        const float x0 = float(xs[r][0]), x1 = float(xs[r][1]), x8 = float(xs[r][2]), x9 = float(xs[r][3]);
+        acc[0][r] = __builtin_fmaf(c0, x0, acc[0][r]); acc[0][r] = __builtin_fmaf(c1, x1, acc[0][r]);
+        acc[0][r] = __builtin_fmaf(c2, x8, acc[0][r]); acc[0][r] = __builtin_fmaf(c3, x9, acc[0][r]);
+        acc[1][r] = __builtin_fmaf(c4, x0, acc[1][r]); acc[1][r] = __builtin_fmaf(c5, x1, acc[1][r]);
+        acc[1][r] = __builtin_fmaf(c6, x8, acc[1][r]); acc[1][r] = __builtin_fmaf(c7, x9, acc[1][r]);
+    }
+}
+// Depth > 1 keeps Depth chunks of trellis words in flight per wave (decode is
+// latency-bound at one chunk); chunks are consumed in the same order with the
+// same arithmetic, so the bytes equal Depth 1. Spans not divisible by Depth
+// use Depth 1.
+template <unsigned K, unsigned Rows, unsigned Depth = 1>
 __device__ __forceinline__ void coop_body(LinearView w, const _Float16* x, unsigned tile, unsigned split, unsigned splits,
                                           unsigned lane, float (&acc)[2][Rows]) {
     const unsigned a = lane & 3U, chunks = w.inputs / 16, span = chunks / splits;
     const unsigned begin = split * span, end = begin + span, tiles = w.outputs / 16;
     const auto* core = reinterpret_cast<const std::uint32_t*>(w.data + 2ULL * (w.inputs + w.outputs));
+    if constexpr (Depth > 1) {
+        if (span % Depth == 0) {
+            CoopLane<K> pipe[Depth];
+#pragma unroll
+            for (unsigned j = 0; j < Depth; ++j) pipe[j].load(core + (std::size_t(begin + j) * tiles + tile) * (8 * K), lane);
+            for (unsigned k = begin; k < end; k += Depth) {
+#pragma unroll
+                for (unsigned j = 0; j < Depth; ++j) {
+                    _Float16 xs[Rows][4];
+#pragma unroll
+                    for (unsigned r = 0; r < Rows; ++r) {
+                        const auto* row = x + std::size_t(r) * w.inputs + (k + j) * 16 + 2 * a;
+                        xs[r][0] = row[0]; xs[r][1] = row[1]; xs[r][2] = row[8]; xs[r][3] = row[9];
+                    }
+                    const CoopLane<K> t = pipe[j];
+                    if (k + j + Depth < end) pipe[j].load(core + (std::size_t(k + j + Depth) * tiles + tile) * (8 * K), lane);
+                    coop_chunk<K, Rows>(t, xs, acc);
+                }
+            }
+#pragma unroll
+            for (unsigned h = 0; h < 2; ++h)
+#pragma unroll
+                for (unsigned r = 0; r < Rows; ++r) {
+                    acc[h][r] = acc[h][r] + __shfl_down(acc[h][r], 2, 4);
+                    acc[h][r] = acc[h][r] + __shfl_down(acc[h][r], 1, 4);
+                }
+            return;
+        }
+    }
     // The next chunk's words are requested after this chunk's activations, so
     // waiting on the activations never drains the prefetch.
     CoopLane<K> t;
@@ -285,18 +344,7 @@ __device__ __forceinline__ void coop_body(LinearView w, const _Float16* x, unsig
         }
         CoopLane<K> next;
         if (k + 1 < end) next.load(core + (std::size_t(k + 1) * tiles + tile) * (8 * K), lane);
-        const float c0 = float(codebook_half(t.template state<0>())), c1 = float(codebook_half(t.template state<1>()));
-        const float c2 = float(codebook_half(t.template state<2>())), c3 = float(codebook_half(t.template state<3>()));
-        const float c4 = float(codebook_half(t.template state<4>())), c5 = float(codebook_half(t.template state<5>()));
-        const float c6 = float(codebook_half(t.template state<6>())), c7 = float(codebook_half(t.template state<7>()));
-#pragma unroll
-        for (unsigned r = 0; r < Rows; ++r) {
-            const float x0 = float(xs[r][0]), x1 = float(xs[r][1]), x8 = float(xs[r][2]), x9 = float(xs[r][3]);
-            acc[0][r] = __builtin_fmaf(c0, x0, acc[0][r]); acc[0][r] = __builtin_fmaf(c1, x1, acc[0][r]);
-            acc[0][r] = __builtin_fmaf(c2, x8, acc[0][r]); acc[0][r] = __builtin_fmaf(c3, x9, acc[0][r]);
-            acc[1][r] = __builtin_fmaf(c4, x0, acc[1][r]); acc[1][r] = __builtin_fmaf(c5, x1, acc[1][r]);
-            acc[1][r] = __builtin_fmaf(c6, x8, acc[1][r]); acc[1][r] = __builtin_fmaf(c7, x9, acc[1][r]);
-        }
+        coop_chunk<K, Rows>(t, xs, acc);
         t = next;
     }
 #pragma unroll
@@ -307,14 +355,14 @@ __device__ __forceinline__ void coop_body(LinearView w, const _Float16* x, unsig
             acc[h][r] = acc[h][r] + __shfl_down(acc[h][r], 1, 4);
         }
 }
-template <unsigned K, unsigned Rows>
+template <unsigned K, unsigned Rows, unsigned Depth = 1>
 __global__ __launch_bounds__(128) void coop_kernel(LinearView w, const _Float16* x, float* out, float* partial,
                                                    unsigned splits, unsigned* failure) {
     const unsigned tile = blockIdx.x * 4 + threadIdx.x / 32, lane = threadIdx.x % 32;
     if (tile >= w.outputs / 16) return;
     const unsigned a = lane & 3U, column = lane >> 2U;
     float acc[2][Rows] = {};
-    coop_body<K, Rows>(w, x, tile, blockIdx.y, splits, lane, acc);
+    coop_body<K, Rows, Depth>(w, x, tile, blockIdx.y, splits, lane, acc);
 #pragma unroll
     for (unsigned h = 0; h < 2; ++h)
 #pragma unroll
@@ -334,15 +382,17 @@ __global__ void coop_output_kernel(LinearView w, const float* partial, unsigned 
     if (group >= std::size_t(rows) * (w.outputs / 128)) return;
     const auto row = unsigned(group / (w.outputs / 128)), begin = unsigned(group % (w.outputs / 128)) * 128;
     const auto lane = threadIdx.x % 32;
+    float v[4];
 #pragma unroll
     for (unsigned j = 0; j < 4; ++j) {
         const auto o = begin + lane + 32 * j;
-        float v = partial[std::size_t(row) * w.outputs + o];
-        for (unsigned s = 1; s < splits; ++s) v = v + partial[(std::size_t(s) * rows + row) * w.outputs + o];
-        flag(v, failure);
-        out[std::size_t(row) * w.outputs + o] = v;
+        v[j] = partial[std::size_t(row) * w.outputs + o];
+        for (unsigned s = 1; s < splits; ++s) v[j] = v[j] + partial[(std::size_t(s) * rows + row) * w.outputs + o];
+        flag(v[j], failure);
     }
-    output_body(w, out, rows, failure, group);
+    output_values(w, begin, v, failure);
+#pragma unroll
+    for (unsigned j = 0; j < 4; ++j) out[std::size_t(row) * w.outputs + begin + lane + 32 * j] = v[j];
 }
 // Fused v2 linear: one block owns 128 outputs (eight tile columns) and all
 // S splits (8*S waves). With In it first forms the transformed FP16 rows in
@@ -440,11 +490,27 @@ __global__ void coop_output_group_kernel(CoopGroup g, unsigned rows, unsigned* f
     }
     output_body(w, g.out[t], rows, failure, group);
 }
+// Trellis prefetch depth of the decode cores: 2 by default (measured C1 decode
+// gain; 4 measured the same), STRIX_G4_EXL3_COOP_DEPTH=1 restores one chunk.
+unsigned coop_depth() {
+    static const unsigned depth = [] {
+        const auto* p = std::getenv("STRIX_G4_EXL3_COOP_DEPTH");
+        if (!p || std::string_view(p) == "2") return 2U;
+        if (std::string_view(p) == "1") return 1U;
+        if (std::string_view(p) == "4") return 4U;
+        throw std::invalid_argument("STRIX_G4_EXL3_COOP_DEPTH must be 1, 2 or 4");
+    }();
+    return depth;
+}
 template <unsigned Rows> void launch_coop(LinearView w, const _Float16* x, float* out, float* partial, unsigned splits,
                                           unsigned* failure, hipStream_t q) {
     const dim3 grid((w.outputs / 16 + 3) / 4, splits);
+    const unsigned depth = coop_depth();
     switch (bits(w)) {
-#define G4_EXL3_COOP(K) case K: hipLaunchKernelGGL((coop_kernel<K, Rows>), grid, dim3(128), 0, q, w, x, out, partial, splits, failure); break
+#define G4_EXL3_COOP(K) case K: \
+        if (depth == 4) hipLaunchKernelGGL((coop_kernel<K, Rows, 4>), grid, dim3(128), 0, q, w, x, out, partial, splits, failure); \
+        else if (depth == 2) hipLaunchKernelGGL((coop_kernel<K, Rows, 2>), grid, dim3(128), 0, q, w, x, out, partial, splits, failure); \
+        else hipLaunchKernelGGL((coop_kernel<K, Rows>), grid, dim3(128), 0, q, w, x, out, partial, splits, failure); break
         G4_EXL3_COOP(4); G4_EXL3_COOP(5); G4_EXL3_COOP(6); G4_EXL3_COOP(8);
 #undef G4_EXL3_COOP
     }
@@ -844,7 +910,7 @@ void device_linear_v2(LinearView w, const float* x, unsigned rows, float* out, v
     }();
     if (fused && shared && w.outputs <= 65536 && coop_fused(w, nullptr, x, rows, out, failure, q)) return;
     auto* transformed = static_cast<_Float16*>(scratch);
-    hipLaunchKernelGGL(input_kernel, dim3((rows * (w.inputs / 128) + 3) / 4), dim3(128), 0, q, w, x, rows, transformed,
+    hipLaunchKernelGGL(input_kernel<>, dim3((rows * (w.inputs / 128) + 3) / 4), dim3(128), 0, q, w, x, rows, transformed,
                        failure, nullptr);
     checked();
     const unsigned splits = v2_splits(w.inputs, w.outputs);
@@ -966,7 +1032,7 @@ bool group_launch(const LinearView* w, unsigned count, const float* x, unsigned 
 }
 void device_input(LinearView w, const float* x, unsigned rows, void* scratch, unsigned* failure, gpu::Queue queue) {
     if (!geometry(w) || !rows || rows > 8 || !x || !scratch || !failure) throw std::invalid_argument("EXL3 device input arguments");
-    hipLaunchKernelGGL(input_kernel, dim3((rows * (w.inputs / 128) + 3) / 4), dim3(128), 0, static_cast<hipStream_t>(queue), w, x,
+    hipLaunchKernelGGL(input_kernel<>, dim3((rows * (w.inputs / 128) + 3) / 4), dim3(128), 0, static_cast<hipStream_t>(queue), w, x,
                        rows, static_cast<_Float16*>(scratch), failure, nullptr);
     checked();
 }
@@ -993,7 +1059,7 @@ void device_linear(LinearView w, const float* x, unsigned rows, float* out, void
     const auto q = static_cast<hipStream_t>(queue);
     if (v2_active()) { device_linear_v2(w, x, rows, out, scratch, failure, shared, q); return; }
     if (shared && fused_core(w, nullptr, x, rows, out, failure, q)) return;
-    hipLaunchKernelGGL(input_kernel, dim3((rows * (w.inputs / 128) + 3) / 4), dim3(128), 0, q, w, x, rows,
+    hipLaunchKernelGGL(input_kernel<>, dim3((rows * (w.inputs / 128) + 3) / 4), dim3(128), 0, q, w, x, rows,
                        static_cast<_Float16*>(scratch), failure, nullptr);
     checked();
     core_output(w, static_cast<_Float16*>(scratch), rows, out, failure, shared, queue, true);
@@ -1198,8 +1264,73 @@ __global__ __launch_bounds__(256) void rows_coop_kernel(LinearView w, const _Flo
             }
         }
 }
+// FFN middle stage of the many-row route: gate and up core values (split
+// partials summed in increasing split order), their output transforms, then
+// gelu_tanh(gate) * up and down's input transform, all in registers. The
+// operations are coop_output/output_kernel's, gpu::gelu_product's and
+// input_kernel's, without their FP32 round trips through memory.
+__device__ __forceinline__ void core_values(LinearView w, const float* source, unsigned splits, unsigned rows, unsigned row,
+                                            unsigned begin, float (&v)[4], unsigned* failure) {
+    const auto lane = threadIdx.x % 32;
+#pragma unroll
+    for (unsigned j = 0; j < 4; ++j) {
+        const auto o = begin + lane + 32 * j;
+        v[j] = source[std::size_t(row) * w.outputs + o];
+        if (splits > 1) {
+            for (unsigned s = 1; s < splits; ++s) v[j] = v[j] + source[(std::size_t(s) * rows + row) * w.outputs + o];
+            flag(v[j], failure);
+        }
+    }
+    output_values(w, begin, v, failure);
+}
+// Panels/maximum: down's input as the prefill GEMMs' [K16][row][16] panels and
+// the product's abs-bits maximum (input_kernel's record of an FP32 product).
+template <bool Panels = false>
+__global__ void ffn_middle_kernel(LinearView gate, LinearView up, LinearView down, const float* g, unsigned gate_splits,
+                                  const float* u, unsigned up_splits, unsigned rows, _Float16* out, unsigned* failure,
+                                  unsigned* maximum = nullptr) {
+    const auto group = std::size_t(blockIdx.x) * 4 + threadIdx.x / 32;
+    if (group >= std::size_t(rows) * (down.inputs / 128)) return;
+    const auto row = unsigned(group / (down.inputs / 128)), begin = unsigned(group % (down.inputs / 128)) * 128;
+    const auto lane = threadIdx.x % 32;
+    float a[4], b[4], v[4];
+    core_values(gate, g, gate_splits, rows, row, begin, a, failure);
+    core_values(up, u, up_splits, rows, row, begin, b, failure);
+#pragma unroll
+    for (unsigned j = 0; j < 4; ++j) {
+        const auto i = begin + lane + 32 * j;
+        const float product = gelu_tanh(a[j]) * b[j];
+        if (maximum) atomicMax(maximum, bit_cast<unsigned>(product) & 0x7fffffffU);
+        v[j] = float(half(materialize(product * fp16_value(load16(down.data + 2ULL * i))), failure));
+    }
+    transform(v, failure);
+#pragma unroll
+    for (unsigned j = 0; j < 4; ++j) {
+        const auto i = begin + lane + 32 * j;
+        out[Panels ? std::size_t(i / 16) * rows * 16 + row * 16 + i % 16 : std::size_t(row) * down.inputs + i] = half(v[j], failure);
+    }
+}
 std::size_t transformed_bytes(LinearView w, unsigned rows) {
     return (std::size_t(rows) * w.inputs * sizeof(_Float16) + 255) / 256 * 256;
+}
+std::size_t partial_bytes(LinearView w, unsigned rows) {
+    const unsigned splits = v2_splits(w.inputs, w.outputs);
+    return splits > 1 ? std::size_t(splits) * rows * w.outputs * sizeof(float) : 0;
+}
+// v2/v3 many-row core: raw values into out (one split) or split partials.
+void rows_core(LinearView w, const _Float16* transformed, unsigned rows, float* out, float* partial, unsigned splits,
+               unsigned* failure, hipStream_t q) {
+    const dim3 grid((rows + rows_v2 - 1) / rows_v2, (w.outputs / 16 + 7) / 8, splits);
+    switch (bits(w)) {
+#define G4_EXL3_RC(K) case K: hipLaunchKernelGGL((rows_coop_kernel<K, rows_v2>), grid, dim3(256), 0, q, w, transformed, rows, out, partial, splits, failure); break
+        G4_EXL3_RC(4); G4_EXL3_RC(5); G4_EXL3_RC(6); G4_EXL3_RC(8);
+#undef G4_EXL3_RC
+    }
+    checked();
+}
+bool ffn_fuse_enabled() {
+    static const bool enabled = env_on("STRIX_G4_EXL3_FFN_FUSE");
+    return enabled;
 }
 } // namespace
 std::size_t rows_scratch_bytes(LinearView w, unsigned rows) {
@@ -1213,19 +1344,13 @@ bool device_linear_rows(LinearView w, const float* x, unsigned rows, float* out,
         throw std::invalid_argument("EXL3 many-row arguments");
     const auto q = static_cast<hipStream_t>(queue);
     auto* transformed = static_cast<_Float16*>(scratch);
-    hipLaunchKernelGGL(input_kernel, dim3((rows * (w.inputs / 128) + 3) / 4), dim3(128), 0, q, w, x, rows, transformed,
+    hipLaunchKernelGGL(input_kernel<>, dim3((rows * (w.inputs / 128) + 3) / 4), dim3(128), 0, q, w, x, rows, transformed,
                        failure, nullptr);
     checked();
     if (v2_active()) {
         const unsigned splits = v2_splits(w.inputs, w.outputs);
         auto* partial = reinterpret_cast<float*>(static_cast<std::uint8_t*>(scratch) + transformed_bytes(w, rows));
-        const dim3 grid((rows + rows_v2 - 1) / rows_v2, (w.outputs / 16 + 7) / 8, splits);
-        switch (bits(w)) {
-#define G4_EXL3_RC(K) case K: hipLaunchKernelGGL((rows_coop_kernel<K, rows_v2>), grid, dim3(256), 0, q, w, transformed, rows, out, partial, splits, failure); break
-            G4_EXL3_RC(4); G4_EXL3_RC(5); G4_EXL3_RC(6); G4_EXL3_RC(8);
-#undef G4_EXL3_RC
-        }
-        checked();
+        rows_core(w, transformed, rows, out, partial, splits, failure, q);
         if (splits > 1)
             hipLaunchKernelGGL(coop_output_kernel, dim3((rows * (w.outputs / 128) + 3) / 4), dim3(128), 0, q, w, partial, splits,
                                out, rows, failure);
@@ -1245,12 +1370,76 @@ bool device_linear_rows(LinearView w, const float* x, unsigned rows, float* out,
     checked();
     return true;
 }
+std::size_t ffn_rows_scratch_bytes(LinearView gate, LinearView up, LinearView down, unsigned rows) {
+    if (!v2_active()) return 0;
+    return transformed_bytes(gate, rows) + transformed_bytes(up, rows) + transformed_bytes(down, rows) +
+           partial_bytes(gate, rows) + partial_bytes(up, rows) + partial_bytes(down, rows);
+}
+bool device_ffn_rows(LinearView gate, LinearView up, LinearView down, const float* x, unsigned rows, float* gate_out,
+                     float* up_out, float* out, void* scratch, std::size_t scratch_bytes, unsigned* failure, gpu::Queue queue) {
+    if (!rows_enabled() || !ffn_fuse_enabled() || !v2_active() || rows <= 8 || !geometry(gate) || !geometry(up) ||
+        !geometry(down) || gate.inputs != up.inputs || gate.outputs != up.outputs || down.inputs != gate.outputs)
+        return false;
+    if (!x || !gate_out || !up_out || !out || !scratch || !failure || scratch_bytes < ffn_rows_scratch_bytes(gate, up, down, rows))
+        throw std::invalid_argument("EXL3 many-row FFN arguments");
+    const auto q = static_cast<hipStream_t>(queue);
+    auto* at = static_cast<std::uint8_t*>(scratch);
+    const auto take = [&](std::size_t bytes) { auto* p = at; at += bytes; return p; };
+    auto* tg = reinterpret_cast<_Float16*>(take(transformed_bytes(gate, rows)));
+    auto* tu = reinterpret_cast<_Float16*>(take(transformed_bytes(up, rows)));
+    auto* td = reinterpret_cast<_Float16*>(take(transformed_bytes(down, rows)));
+    auto* pg = reinterpret_cast<float*>(take(partial_bytes(gate, rows)));
+    auto* pu = reinterpret_cast<float*>(take(partial_bytes(up, rows)));
+    auto* pd = reinterpret_cast<float*>(take(partial_bytes(down, rows)));
+    const unsigned sg = v2_splits(gate.inputs, gate.outputs), su = v2_splits(up.inputs, up.outputs);
+    const unsigned sd = v2_splits(down.inputs, down.outputs);
+    hipLaunchKernelGGL(input_kernel<>, dim3((rows * (gate.inputs / 128) + 3) / 4), dim3(128), 0, q, gate, x, rows, tg, failure, nullptr);
+    hipLaunchKernelGGL(input_kernel<>, dim3((rows * (up.inputs / 128) + 3) / 4), dim3(128), 0, q, up, x, rows, tu, failure, nullptr);
+    checked();
+    rows_core(gate, tg, rows, gate_out, pg, sg, failure, q);
+    rows_core(up, tu, rows, up_out, pu, su, failure, q);
+    hipLaunchKernelGGL(ffn_middle_kernel<>, dim3((rows * (down.inputs / 128) + 3) / 4), dim3(128), 0, q, gate, up, down,
+                       sg > 1 ? pg : gate_out, sg, su > 1 ? pu : up_out, su, rows, td, failure);
+    checked();
+    rows_core(down, td, rows, out, pd, sd, failure, q);
+    if (sd > 1)
+        hipLaunchKernelGGL(coop_output_kernel, dim3((rows * (down.outputs / 128) + 3) / 4), dim3(128), 0, q, down, pd, sd, out,
+                           rows, failure);
+    else
+        hipLaunchKernelGGL(output_kernel, dim3((rows * (down.outputs / 128) + 3) / 4), dim3(128), 0, q, down, out, rows, failure);
+    checked();
+    return true;
+}
+void device_input_panels(LinearView w, const float* x, unsigned rows, void* scratch, unsigned* failure, unsigned* maximum,
+                         gpu::Queue queue) {
+    if (!geometry(w) || !rows || rows > prefill::chunk_rows || !x || !scratch || !failure)
+        throw std::invalid_argument("EXL3 panel input arguments");
+    hipLaunchKernelGGL(input_kernel<true>, dim3((rows * (w.inputs / 128) + 3) / 4), dim3(128), 0, static_cast<hipStream_t>(queue),
+                       w, x, rows, static_cast<_Float16*>(scratch), failure, maximum);
+    checked();
+}
+void device_output(LinearView w, float* out, unsigned rows, unsigned* failure, gpu::Queue queue) {
+    if (!geometry(w) || !rows || !out || !failure) throw std::invalid_argument("EXL3 output arguments");
+    hipLaunchKernelGGL(output_kernel, dim3((rows * (w.outputs / 128) + 3) / 4), dim3(128), 0, static_cast<hipStream_t>(queue),
+                       w, out, rows, failure);
+    checked();
+}
+void device_ffn_middle_panels(LinearView gate, LinearView up, LinearView down, const float* gate_core, const float* up_core,
+                              unsigned rows, void* product, unsigned* failure, unsigned* maximum, gpu::Queue queue) {
+    if (!geometry(gate) || !geometry(up) || !geometry(down) || gate.inputs != up.inputs || gate.outputs != up.outputs ||
+        down.inputs != gate.outputs || !rows || rows > prefill::chunk_rows || !gate_core || !up_core || !product || !failure)
+        throw std::invalid_argument("EXL3 FFN middle arguments");
+    hipLaunchKernelGGL(ffn_middle_kernel<true>, dim3((rows * (down.inputs / 128) + 3) / 4), dim3(128), 0,
+                       static_cast<hipStream_t>(queue), gate, up, down, gate_core, 1U, up_core, 1U, rows,
+                       static_cast<_Float16*>(product), failure, maximum);
+    checked();
+}
 void device_prefill(LinearView w, const float* x, unsigned rows, float* out, void* scratch,
                     unsigned* failure, unsigned* maximum, const void* panels, gpu::Queue queue, void* converted_event) {
     if (!geometry(w) || !rows || rows > prefill::chunk_rows || !x || !out || !scratch || !failure || !maximum)
         throw std::invalid_argument("EXL3 WMMA arguments");
     const auto q = static_cast<hipStream_t>(queue);
-    hipLaunchKernelGGL(input_kernel, dim3((rows * (w.inputs / 128) + 3) / 4), dim3(128), 0, q, w, x, rows,
+    hipLaunchKernelGGL(input_kernel<>, dim3((rows * (w.inputs / 128) + 3) / 4), dim3(128), 0, q, w, x, rows,
                        static_cast<_Float16*>(scratch), failure, maximum);
     checked();
     if (converted_event) {

@@ -40,22 +40,33 @@ public:
                 "STRIX_G4_KV_POOL","STRIX_G4_OUTPUT_TILE","STRIX_G4_KV_PUBLISH",
                 "STRIX_G4_LINEAR_FINITE","STRIX_G4_NORM_PREFETCH","STRIX_G4_NORM_FINITE",
                 "STRIX_G4_EXL3_OUTPUT_TILE","STRIX_G4_EXL3_COLUMN_CACHE",
-                "STRIX_G4_PREFILL_EXACT_MANYROW","STRIX_G4_ATTN_KV_SHARED"}) switches.set(name,enabled(name));
+                "STRIX_G4_PREFILL_EXACT_MANYROW","STRIX_G4_ATTN_KV_SHARED","STRIX_G4_EXL3_FFN_FUSE"}) switches.set(name,enabled(name));
         const auto* tiling = std::getenv("STRIX_G4_OUTPUT_TILE");
         switches.set("STRIX_G4_OUTPUT_TILE",enabled("STRIX_G4_CHUNK_DECODE") && tiling && std::string(tiling) == "1");
         switches.set("STRIX_G4_HOST_PARALLEL","not used by device target or device drafter");
+        const auto* depth = std::getenv("STRIX_G4_EXL3_COOP_DEPTH");
+        switches.set("STRIX_G4_EXL3_COOP_DEPTH",std::string(depth && *depth ? depth : "2"));
         metadata_.set("off_switches",switches);
         // Prompt prefill: exact many-row chunks (same bytes as the eight-row
         // passes; EXL3 packs keep their identity's core order);
         // STRIX_G4_PREFILL_EXACT_MANYROW=0 keeps the passes.
         const bool many_row = enabled("STRIX_G4_PREFILL_EXACT_MANYROW");
-        metadata_.set("prefill_route",many_row ? "many-row" : "rows8");
+        // EXL3 packs: STRIX_G4_EXL3_PREFILL=wmma selects the pack's qualified held-out
+        // prefill identity g4-exl3-wmma-pf-v1 (FP16 panels decoded once, WMMA
+        // GEMMs, canonical attention); bit-changing against the exact route.
+        const auto* exl3_route = std::getenv("STRIX_G4_EXL3_PREFILL");
+        if (exl3_route && *exl3_route && std::string(exl3_route) != "exact" && std::string(exl3_route) != "wmma")
+            throw std::invalid_argument("STRIX_G4_EXL3_PREFILL must be exact or wmma");
+        const bool exl3_wmma = many_row && exl3_route && std::string(exl3_route) == "wmma" &&
+                               bind_host_weights(model).layer.front().gate.format == WeightFormat::exl3_mul1;
+        metadata_.set("prefill_route",exl3_wmma ? exl3::prefill_identity : many_row ? "many-row" : "rows8");
         // Read-only inspection must never initialize HIP or upload weights.
         if (!inspect) {
             target_ = std::make_unique<gpu::DeviceTarget>(bind_host_weights(model),tables);
             if (many_row)
                 prefill_ = std::make_unique<prefill::DevicePrefill>(target_->borrow_device_weights(),tables,
-                    prefill::Residency::device,false,prefill::AttentionMode::canonical,prefill::Linears::exact);
+                    prefill::Residency::device,false,prefill::AttentionMode::canonical,
+                    exl3_wmma ? prefill::Linears::wmma : prefill::Linears::exact);
         }
         // Report the identity the device resolved (STRIX_G4_IDENTITY may select g4-a8-v1), not the static model one.
         if (target_) metadata_.set("identity",target_->stats().identity);
