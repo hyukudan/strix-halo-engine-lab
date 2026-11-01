@@ -557,8 +557,11 @@ RAM del host (la mayoría de los expertos leídos del archivo de unidades en dis
 > 41.2 s). Las salidas no cambian y siguen siendo exactas. Hay en curso una corrección que restaura de forma diferida
 > antes del primer paso de decode. Solución temporal (exacta; prevista a partir de las mediciones del host, aún no
 > confirmada en la GPU): `STRIX_GLM_RTX_RESTORE_RESIDENCY=0` (o `--restore-decode-residency 0`) elimina la
-> restauración, unos 10-11 s del total; el decode justo después de un prefill falla entonces más a menudo en la caché
-> de expertos.
+> restauración, unos 10-11 s del total, cuando el host tiene RAM libre suficiente (unos 80 GB) para una apertura en dos
+> niveles; el decode justo después de un prefill falla entonces más a menudo en la caché de expertos. Con menos RAM
+> libre en el host, la tarjeta se abre con muchas más unidades de expertos en el nivel de archivo, cada prefill vuelve a
+> escribir desde la GPU las unidades desalojadas y el TTFT es mucho mayor con o sin el interruptor (8K 45-72 s medidos);
+> está prevista una corrección de ese coste de escritura.
 
 ### Nemotron 3.5 Bolt E4B
 

@@ -544,8 +544,10 @@ With 24 GiB VRAM + 32 GiB host RAM (most experts streamed from the unit file on 
 > costs a few seconds more. In all it adds about 10-15 s per prefill (8K about 29 s, 32K about 54 s instead of 17.7 / 41.2 s).
 > Outputs are unchanged and exact. A fix that restores lazily before the first decode step is in progress. Workaround
 > (exact; expected from the host-side measurements, not yet confirmed on the GPU): `STRIX_GLM_RTX_RESTORE_RESIDENCY=0`
-> (or `--restore-decode-residency 0`) removes the restore, about 10-11 s of it; decode right after a prefill then
-> misses the expert cache more often.
+> (or `--restore-decode-residency 0`) removes the restore, about 10-11 s of it, when the host has enough free RAM (about 80 GB) for a
+> two-tier open; decode right after a prefill then misses the expert cache more often. With less free host RAM the
+> card opens with many more expert units on the file tier, every prefill writes evicted units back from the GPU, and
+> TTFT is much higher with or without the switch (8K 45-72 s measured); a fix for that write-back cost is planned.
 
 ### Nemotron 3.5 Bolt E4B
 
