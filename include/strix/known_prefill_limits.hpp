@@ -7,9 +7,13 @@
 
 namespace strix {
 // Largest T of one tiled known-prompt prefill block (--known-prefix-prefill-rows). Every T-row
-// prefill operator works in row groups or 64-bit row strides; the routed MoE CSR of T * top_k
-// assignments is built by one CTA (its wave counters bound T * top_k, see build_prefill_csr_waves).
-inline constexpr std::uint32_t known_prefill_max_rows = 8192;
+// prefill operator works in row groups or 64-bit row strides; production CSR uses multi-CTA scans.
+inline constexpr std::uint32_t known_prefill_max_rows = 16384;
+// Preserve historical extents when setup reserves a configured maximum T <= 8192.
+inline constexpr std::uint32_t known_prefill_pool_rows(std::uint32_t rows) { return (std::max(8192U, rows) + 511U) / 512U * 512U; }
+inline constexpr std::uint32_t known_prefill_stage_groups(std::uint32_t rows) {
+    return (known_prefill_pool_rows(rows) + 63U) / 64U;
+}
 inline std::string known_prefill_rows_range() { return "16.." + std::to_string(known_prefill_max_rows); }
 // STRIX_QPF2K_SCHED block plans (bit 4 merged tails, bit 16 balanced blocks). A row's arithmetic depends on the launches
 // it lands in: dense projections of < 32-row launches take the dense A8 form, and the QSA part-1 input projections run

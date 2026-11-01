@@ -1606,6 +1606,11 @@ private:
     }
     const char* nested_decline(const Slot& s) const {
         const auto pair=numerical_profile_pair(options_);
+        // Fast HC output has no nested scheduling qualification yet.
+        if ((pair.fast_components & kFastPrefillHc) && prefill_option_enabled(PrefillOption::hc_output_wmma))
+            return "hc-output-wmma-unqualified";
+        if (index_wmma_unqualified_route(prefill_options_active(), pair.fast_components))
+            return "index-proj-wmma-unqualified";
         const bool qualified=numerical_profile_dense_a8(pair.prefill) && !numerical_profile_dense_trellis(pair.prefill) &&
             !numerical_profile_dense_trellis(pair.decode) && pair.fast_components==0U;
         const auto recipe=s.prefill->nested_recipe(nest_rows_,qualified && !s.parents->tiled.blocks->gsq_model());
@@ -2192,7 +2197,7 @@ inline void run_mtp_decode_bridge(const Options& options,const ModelContract& mo
     auto runtime=std::make_shared<HipMtpRuntime>(native);
     if(m.metadata_only){
         assets->validate_assets_unchanged();
-        output<<"{\"mode\":\"mtp-metadata-only\",\"mtp_executed\":false,\"mtp_activated\":false,\"mtp_qualified\":false,"
+        output<<'{'<<prefill_identity_fields(prefill_options_active())<<",\"mode\":\"mtp-metadata-only\",\"mtp_executed\":false,\"mtp_activated\":false,\"mtp_qualified\":false,"
             <<"\"proposal_identity\":"<<assets->compiled().proposal_identity<<",\"plan_identity\":"<<assets->compiled().plan_identity
             <<",\"semantic_identity\":"<<assets->compiled().forward_semantics.contract_identity<<",\"native_profile_identity\":"<<runtime->numerical_profile_identity()
             <<",\"head_profile_identity\":"<<hip_mtp_lm_head_profile_identity(model,native->tensors().lm_head)
@@ -2305,7 +2310,7 @@ inline void run_mtp_decode_bridge(const Options& options,const ModelContract& mo
             assets->validate_assets_unchanged();
             const auto memory_receipt=yarn_memory_receipt();
             publish_yarn_output([&] {
-            output<<"{"<<memory_receipt<<"\"mode\":\"mtp-self-generated-golden-dump\",\"mtp_reference_independence\":\"self-generated-native-forward-not-independent\","
+            output<<"{"<<prefill_identity_fields(prefill_options_active())<<","<<memory_receipt<<"\"mode\":\"mtp-self-generated-golden-dump\",\"mtp_reference_independence\":\"self-generated-native-forward-not-independent\","
                 <<"\"mtp_golden_path\":\""<<decode_receipt::escape_json_string(m.golden_dump)<<"\",\"mtp_golden_sha256\":\""<<model_content_identity_hex(sha)
                 <<"\",\"mtp_golden_rows\":"<<golden.rows.size()<<",\"mtp_golden_payload_sha256\":\""<<model_content_identity_hex(hip_mtp_forward_golden_payload_identity(golden))
                 <<"\",\"mtp_independent_source_content\":\""<<model_content_identity_hex(golden.independent_source_content)
@@ -2702,7 +2707,7 @@ inline void run_mtp_decode_bridge(const Options& options,const ModelContract& mo
                 assets->validate_assets_unchanged();
                 if(!options.http_serve) return; // the cohort run wrote its own receipt
                 const auto& st=runner.stats();
-                output<<"{\"mode\":\"native-mtp-batch\",\"slots\":"<<runner.slots()
+                output<<'{'<<prefill_identity_fields(prefill_options_active())<<",\"mode\":\"native-mtp-batch\",\"slots\":"<<runner.slots()
                     <<",\"slots_built\":"<<runner.slots()<<",\"slots_capacity\":"<<runner.slots_capacity
                     <<",\"lazy_slot_builds\":"<<st.lazy_slot_builds<<",\"lazy_slot_ms\":{\"sum\":"<<st.lazy_slot_ms
                     <<",\"max\":"<<st.lazy_slot_max_ms<<"},\"lazy_slot_memory_declined\":"<<(st.lazy_slot_memory_declined?"true":"false")
@@ -3030,7 +3035,7 @@ inline void run_mtp_decode_bridge(const Options& options,const ModelContract& mo
             if(parents->serve) {
                 parents->serve(ordinary_request,options.http_selection_mtp && window && window->policy_selection_admitted());
                 assets->validate_assets_unchanged();
-                output<<"{\"mode\":\"native-mtp-http-serve\",\"served_requests\":"<<served
+                output<<'{'<<prefill_identity_fields(prefill_options_active())<<",\"mode\":\"native-mtp-http-serve\",\"served_requests\":"<<served
                     <<",\"calibration_rows\":"<<calibration_rows<<",\"calibration_ms\":"<<calibration_ms;
                 if(prefix_batch_cert_execution_mode(options) && !options.baseline && parents->tiled.cache && parents->tiled.cache->has_store()) {
                     PrefixAsyncCapture::reap();
@@ -3160,7 +3165,7 @@ inline void run_mtp_decode_bridge(const Options& options,const ModelContract& mo
             : std::string{};
         const auto completed_receipt=yarn_memory_receipt()+(completion_receipt?completion_receipt():std::string{});
         publish_yarn_output([&] {
-        output<<"{\n"<<completed_receipt<<mtp_d1_inventory<<union_receipt.str()<<"  \"mode\":\"native-mtp-independent-replay-then-target-verified-greedy\",\n"
+        output<<"{\n"<<prefill_identity_fields(prefill_options_active())<<",\n"<<completed_receipt<<mtp_d1_inventory<<union_receipt.str()<<"  \"mode\":\"native-mtp-independent-replay-then-target-verified-greedy\",\n"
             <<"  \"mtp_native_hardware_qualified\":false,\n  \"mtp_performance_qualified\":false,\n"
             <<"  \"optimization_profile_selected\":\""<<decode_receipt::escape_json_string(resolved_profile)<<"\",\n"
             <<"  \"mtp_target_verification\":\""<<mtp_target_verification_name(window_attempts)<<"\",\n"

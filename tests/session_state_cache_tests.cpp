@@ -262,6 +262,23 @@ int main() {
             set("1");check(absent==strix::session_numerical_config("same CLI"),"operational on must preserve numerical signature");
             set(saved?saved->c_str():nullptr);
         }
+        for (const char* key : {"STRIX_QPF2K_T16K", "STRIX_QPF2K_INDEX_BATCH", "STRIX_EAGER_CODE_LOAD", "HIP_ENABLE_DEFERRED_LOADING", "STRIX_QPF2K_EARLY_SETUP", "STRIX_QPF2K_HC_LOWBAND", "STRIX_QPF2K_COMPACT_IMAGES"}) {
+            const char* old = std::getenv(key);
+            const std::optional<std::string> saved = old ? std::optional<std::string>{old} : std::nullopt;
+            const auto set = [&](const char* value) {
+#ifdef _WIN32
+                check(_putenv_s(key,value?value:"")==0,"startup environment update failed");
+#else
+                check((value?setenv(key,value,1):unsetenv(key))==0,"startup environment update failed");
+#endif
+            };
+            set(nullptr); const auto before = strix::session_numerical_config("cli");
+            for (const char* value : {"0","1"}) {
+                set(value);
+                check(before == strix::session_numerical_config("cli"),"exact startup setting changed numerical session identity");
+            }
+            set(saved ? saved->c_str() : nullptr);
+        }
         std::filesystem::remove_all(dir);
         std::cout<<"session_state_cache_tests PASS\n"; return 0;
     } catch(const std::exception& e) {

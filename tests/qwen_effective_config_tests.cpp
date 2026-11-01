@@ -3,6 +3,8 @@
 #include "../apps/mtp_asset_verification.hpp"
 #include "../apps/qwen_cache_family_contract.hpp"
 #include "strix/mtp_selection_transaction.hpp"
+#include "../apps/qwen_prefill_plan.hpp"
+#include "../apps/prefix_state_cache_identity.hpp"
 #include "qwen_prefill_contract.hpp"
 #include "rotary_mock.hpp"
 #include "strix/memory_plan.hpp"
@@ -23,6 +25,8 @@
 #include <limits>
 #include <set>
 #include "strix/q8_projection_organization.hpp"
+#include <filesystem>
+#include <chrono>
 
 using namespace strix;
 using namespace strix::decode_cli;
@@ -197,6 +201,15 @@ void resident_fallback_tests() {
         catch(const std::runtime_error& error) { refused=std::string(error.what()).find("before prompt mutation")!=std::string::npos; }
         expect(refused,"resident fallback refuses unavailable/insufficient capacity before warming");
     }
+}
+// Retain the pre-existing T8192 ladder cases independently of automatic T16384.
+EffectiveConfig resolve_w7_case(const RequestedOptions& request, const ModelContract& model,
+    const gguf::FileInfo& info, const ModelManifest& manifest, std::string_view content,
+    const PrefillCapabilities& capabilities, const PrefillMemory& memory) {
+    auto historical = request;
+    if (!historical.environment.contains("STRIX_QPF2K_T16K"))
+        historical.environment["STRIX_QPF2K_T16K"] = "0";
+    return resolve_effective_config(historical,model,info,manifest,content,capabilities,memory);
 }
 // The source command did not enable MTP or cohorts. Their inactive controls
 // and disabled experiments are excluded. The logits digest is diagnostic output,
@@ -842,6 +855,11 @@ void yarn_admission_tests(const gguf::FileInfo& info, const ModelManifest& manif
             prefill_checked_add(state.host_total_bytes,prefill_checked_add(state.host_total_bytes,state.host_alignment-1U)));
         required.model_backing = 111334654400ULL;
         append_yarn_owner_requirements(sized,model,state,required.model_backing,required);
+        const auto native = prefill_native_pools(sized,model);
+        expect(required.owners.at("native_setup_growth_peak") == native.bytes.at("native_setup_growth_peak") &&
+            required.owners.at("dense_tiled_f16") == native.bytes.at("native_dense_operands") &&
+            required.owners.at("ple_packed_growth_peak") == native.bytes.at("native_ple_packed_peak"),
+            "YaRN inventory prices bundle setup, dense and retained packed PLE owners");
         expect(required.owners.at("target_kv") == 7372800000ULL && required.owners.at("target_raw_index") == 921600000ULL,
             "YaRN exact target KV and raw index owners at C300000");
         expect(required.owners.at("qsa_shared_prefill_pool") == 38400000U &&
@@ -1213,9 +1231,9 @@ void yarn_admission_tests(const gguf::FileInfo& info, const ModelManifest& manif
         auto unknown = request; unknown.environment["STRIX_QPF2K_SHADOW_MAX_TOKENS"] = "300000";
         expect(resolve(unknown,memory).error.find("YaRN execution environment not supported") != std::string::npos,
             "YaRN unbounded alternate launcher controls refuse");
-        for (const char* name : {"STRIX_QSA_DECODE_POOL", "STRIX_QSA_DECODE_POOL_CHECK", "STRIX_QSA_DECODE_POOL_BF16", "STRIX_QSA_DECODE_SELECT"})
+        for (const char* name : {"STRIX_QPF2K_T16K", "STRIX_QSA_DECODE_POOL", "STRIX_QSA_DECODE_POOL_CHECK", "STRIX_QSA_DECODE_POOL_BF16", "STRIX_QSA_DECODE_SELECT"})
             expect(yarn_environment_refusal({{name, "0"}}, 2).empty(), "YaRN accepts the audited serial decode pool controls");
-        for (const char* name : {"STRIX_CTX_EXACT_MEMORY", "STRIX_QSA_SCORE_RING", "STRIX_QSA_SCORE_RING_ROWS", "STRIX_TERMINAL_LOGITS_ARENA"})
+        for (const char* name : {"STRIX_QPF2K_COMPACT_IMAGES", "STRIX_CTX_EXACT_MEMORY", "STRIX_QSA_SCORE_RING", "STRIX_QSA_SCORE_RING_ROWS", "STRIX_TERMINAL_LOGITS_ARENA"})
             expect(yarn_environment_refusal({{name, "0"}}, 2).empty(), "YaRN accepts the compact-memory controls");
         expect(effective_prefill_argv(config.options)[2] == "--rope-yarn","YaRN receipt argv retains explicit opt-in");
     }
@@ -1428,6 +1446,239 @@ void mtp_reservation_arithmetic_tests() {
     catch (const std::overflow_error&) { overflow = true; }
     expect(overflow, "shared reservation additions reject overflow");
 }
+void t16k_admission_tests(const RequestedOptions& original, const ModelContract& model,
+    const gguf::FileInfo& info, const ModelManifest& manifest, const PrefillCapabilities& capabilities) {
+    const auto resolve = [&](const RequestedOptions& request, const PrefillMemory& memory) {
+        return resolve_effective_config(request,model,info,manifest,validated_model_content_identity,capabilities,memory);
+    };
+    auto memory = ample_memory();
+    memory.estimate = [](const Options& options) {
+        PrefillRequirements r{70U*gib_bytes,8U*gib_bytes,gib_bytes,0U,0U,gib_bytes/8U,0U,9U*gib_bytes};
+        r.workspace = static_cast<std::uint64_t>(options.known_prefix_prefill_rows) * 998400U + 65552U;
+        r.metadata = 2U * (static_cast<std::uint64_t>(options.known_prefix_prefill_rows) * 34888U + 41808U + 4U);
+        for (const auto rows : options.known_prefix_tail_rows) {
+            r.tails += static_cast<std::uint64_t>(rows) * 998400U + 65552U;
+            r.metadata += 2U * (static_cast<std::uint64_t>(rows) * 34888U + 41808U + 4U);
+        }
+        return r;
+    };
+    const auto estimate = memory.estimate;
+    for (const auto count : {32767U,32768U,65535U,65536U,131072U,262143U}) {
+        auto request = original;
+        request.options.tokens.resize(count,1U); request.options.generate_tokens = 1U;
+        request.environment["STRIX_QPF2K_T16K"] = "0";
+        const auto legacy = resolve(request,memory);
+        expect(legacy.admitted && legacy.options.known_prefix_prefill_rows == 8192U,
+            "T16K off retains the historical T8192 ladder at every policy boundary");
+        const auto small_pools = prefill_native_pools(legacy.options, model);
+        expect(legacy.host_compilation.at("native_device_bytes") == small_pools.device &&
+            legacy.options.known_prefill_host_headroom >= small_pools.host + small_pools.device &&
+            small_pools.bytes.at("native_setup_growth_peak") == small_pools.bytes.at("native_hc_norm16"),
+            "T8192 admission prices every native pool and the largest setup replacement overlap");
+        if (count == 32767U) {
+            auto explicit_group = request;
+            explicit_group.options = legacy.options;
+            explicit_group.options.known_prefill_host_headroom = 1U;
+            explicit_group.environment["STRIX_PROMPT_BATCH_ROWS"] = "16384";
+            const auto declined = resolve(explicit_group,memory);
+            expect(declined.error.find("native pools exceed") != std::string::npos &&
+                declined.host_compilation.at("native_moe_a16_da16") == UINT64_C(16384) * 2U * (2560U + 10U * 640U) &&
+                declined.host_compilation.at("native_device_bytes") > small_pools.device &&
+                declined.host_compilation.at("native_ple_staging") > small_pools.bytes.at("native_ple_staging"),
+                "explicit MTP group capacity and retained main owner are priced before native setup");
+        }
+        request.environment.erase("STRIX_QPF2K_T16K");
+        const auto automatic = resolve(request,memory);
+        const bool wide = count >= 32768U;
+        expect(automatic.admitted && automatic.options.known_prefix_prefill_rows == (wide ? 16384U : 8192U) &&
+            automatic.t16k_policy_source == (wide ? std::optional{OptionSource::automatic} : std::nullopt) &&
+            automatic.reason == (wide ? "automatic-t16k" : "qualified-prompt"),
+            "unset T16K tries T16384 only at and above 32768 prompt tokens");
+        expect(!automatic.environment.contains("STRIX_QPF2K_T16K"), "automatic policy does not invent an environment override");
+        if (!wide)
+            expect(effective_config_json(automatic) == effective_config_json(legacy) &&
+                effective_config_notice(automatic) == effective_config_notice(legacy),
+                "below-threshold default preserves every legacy receipt byte");
+        else
+            expect(effective_config_json(automatic).find("\"t16k_policy\":{\"source\":\"automatic\",\"threshold_tokens\":32768}") != std::string::npos &&
+                effective_config_notice(automatic).find("automatic T16384 ") != std::string::npos &&
+                effective_config_notice(automatic).find("T16384 policy=automatic threshold=32768") != std::string::npos,
+                "automatic T16384 notice and JSON report provenance and threshold");
+        request.environment["STRIX_QPF2K_T16K"] = "1";
+        const auto config = resolve(request,memory);
+        expect(config.admitted && config.options.known_prefix_prefill_rows == 16384U && config.reason == "opt-in-t16k" &&
+            config.ple_reclaim_credit == 0U && config.options.known_prefill_uma_budget == 120U*gib_bytes,
+            "T16K override admits every large planner class with capacity and no invented reclaim credit");
+        expect(config.t16k_policy_source == OptionSource::explicit_value &&
+            effective_config_json(config).find("\"t16k_policy\":{\"source\":\"explicit\",\"threshold_tokens\":32768}") != std::string::npos &&
+            effective_config_notice(config).find("automatic T16384 ") != std::string::npos &&
+            effective_config_notice(config).find("T16384 policy=explicit threshold=32768") != std::string::npos,
+            "override T16384 notice and JSON report explicit provenance and the automatic threshold");
+        if (wide) {
+            auto expected = config;
+            expected.environment.erase("STRIX_QPF2K_T16K");
+            expected.reason = "automatic-t16k";
+            expected.t16k_policy_source = OptionSource::automatic;
+            expect(effective_config_json(automatic) == effective_config_json(expected),
+                "automatic and explicit T16384 share all execution, budget and compiler decisions");
+        }
+        const auto required = estimate(config.options);
+        const auto pools = prefill_native_pools(config.options,model);
+        expect(config.options.known_prefill_workspace_budget == required.workspace + required.tails &&
+            config.options.known_prefill_metadata_budget == required.metadata && required.metadata > gib_bytes &&
+            config.options.known_prefill_host_headroom == pools.host + pools.device &&
+            config.options.known_prefix_tail_rows == legacy.options.known_prefix_tail_rows,
+            "T16K budgets cover both compiled metadata copies, retained tails and explicit native pools");
+        expect(pools.bytes.at("native_qsa_maxima_peak") == 3U * UINT64_C(16384) *
+            ((config.options.context_tokens / 4U + 3U) / 4U) * 4U &&
+            config.host_compilation.at("native_device_bytes") == pools.device,
+            "T16K receipt prices two QSA ring slots plus conservative maxima headroom");
+        // One byte below device admission: model backing credit cannot pay GTT.
+        auto tight = memory;
+        tight.gtt_limit = required.device_base + required.workspace + required.tails + pools.device + pools.mapped - 1U;
+        const auto fallback = resolve(request,tight);
+        auto expected_fallback = legacy;
+        expected_fallback.environment["STRIX_QPF2K_T16K"] = "1";
+        expected_fallback.t16k_policy_source = OptionSource::explicit_value;
+        expected_fallback.tile_fallback = "T16384:insufficient-memory";
+        expect(fallback.admitted && fallback.options.known_prefix_prefill_rows == 8192U &&
+            fallback.tile_fallback == "T16384:insufficient-memory" &&
+            effective_config_json(fallback) == effective_config_json(expected_fallback) &&
+            effective_prefill_argv(fallback.options) == effective_prefill_argv(legacy.options),
+            "T16K GTT fallback preserves every T8192 argv/budget/tail/environment decision and reports reason");
+        if (wide) {
+            request.environment.erase("STRIX_QPF2K_T16K");
+            const auto auto_fallback = resolve(request,tight);
+            expected_fallback.environment.erase("STRIX_QPF2K_T16K");
+            expected_fallback.t16k_policy_source = OptionSource::automatic;
+            expect(effective_config_json(auto_fallback) == effective_config_json(expected_fallback) &&
+                effective_prefill_argv(auto_fallback.options) == effective_prefill_argv(legacy.options),
+                "automatic memory decline restores the exact historical T8192 configuration with policy and reason");
+            request.environment["STRIX_QPF2K_T16K"] = "1";
+        }
+        auto uma_tight = memory;
+        uma_tight.estimate = [&](const Options& options) {
+            auto r = estimate(options);
+            // Charge exactly one byte beyond 120 GiB at T16384, without L1 support.
+            r.model_backing = 120U*gib_bytes + 1U - required.state_d1 - required.serial_scratch -
+                required.workspace - required.tails - required.metadata - required.runtime_payload - pools.host - pools.device;
+            return r;
+        };
+        const auto uma_fallback = resolve(request,uma_tight);
+        expect(uma_fallback.admitted && uma_fallback.options.known_prefix_prefill_rows == 8192U &&
+            uma_fallback.tile_fallback == "T16384:insufficient-memory",
+            "T16K native pools participate in UMA admission exactly once; no reference credit is assumed");
+        if (wide) {
+            request.environment.erase("STRIX_QPF2K_T16K");
+            auto expected = uma_fallback;
+            expected.environment.erase("STRIX_QPF2K_T16K");
+            expected.t16k_policy_source = OptionSource::automatic;
+            expect(effective_config_json(resolve(request,uma_tight)) == effective_config_json(expected),
+                "automatic and explicit T16384 share UMA fallback and restore T8192 budgets");
+        }
+        for (const auto* value : {"", "0", "00", "0disabled", "true", "01", "2", "1 ", "-1"}) {
+            request.environment["STRIX_QPF2K_T16K"] = value;
+            auto off = resolve(request,memory);
+            expect(!off.environment.contains("STRIX_QPF2K_T16K"), "ineffective T16K values are absent from the receipt");
+            expect(effective_config_json(off) == effective_config_json(legacy), "only the exact T16K value 1 opts in");
+            expect(effective_config_notice(off) == effective_config_notice(legacy), "ineffective T16K controls do not change notices");
+        }
+    }
+    auto request = original; request.environment["STRIX_QPF2K_T16K"] = "1";
+    auto tight = memory;
+    std::vector<std::uint32_t> attempts;
+    tight.estimate = [&](const Options& options) {
+        attempts.push_back(options.known_prefix_prefill_rows);
+        if (options.known_prefix_prefill_rows > 2048U) throw KnownPrefillBudgetExceeded("fixture budget");
+        return estimate(options);
+    };
+    const auto fallback = resolve(request,tight);
+    expect(fallback.admitted && fallback.options.known_prefix_prefill_rows == 2048U &&
+        attempts == std::vector<std::uint32_t>{16384U,16384U,8192U,8192U,4096U,4096U,2048U} &&
+        fallback.tile_fallback == "T16384:insufficient-memory,T8192:insufficient-memory,T4096:insufficient-memory" &&
+        fallback.options.known_prefix_tail_rows == std::vector<std::uint32_t>{256U,16U},
+        "T16K retry chain preserves FP16/dense retries and historical T2048 tails");
+    // Both policy sources retain arithmetic retries, the entire ladder and all decline reasons.
+    for (const bool explicit_t16k : {false,true}) for (const auto chosen : {8192U,4096U,2048U,0U}) {
+        auto chain = original;
+        chain.options.tokens.resize(65536U,1U);
+        chain.options.generate_tokens = 1U;
+        if (explicit_t16k) chain.environment["STRIX_QPF2K_T16K"] = "1";
+        attempts.clear();
+        tight.estimate = [&](const Options& options) {
+            attempts.push_back(options.known_prefix_prefill_rows);
+            if (options.known_prefix_prefill_rows > chosen) throw KnownPrefillBudgetExceeded("fixture budget");
+            return estimate(options);
+        };
+        const auto config = resolve(chain,tight);
+        std::vector<std::uint32_t> expected_attempts;
+        std::string expected_reasons;
+        for (const auto rows : {16384U,8192U,4096U,2048U}) {
+            expected_attempts.push_back(rows);
+            if (rows == chosen) break;
+            expected_attempts.push_back(rows); // FP16 then dense-A8 compiler retry.
+            if (!expected_reasons.empty()) expected_reasons += ',';
+            expected_reasons += "T" + std::to_string(rows) + ":insufficient-memory";
+        }
+        expect(config.admitted == (chosen != 0U) && attempts == expected_attempts && config.tile_fallback == expected_reasons &&
+            (!chosen || config.options.known_prefix_prefill_rows == chosen) &&
+            config.t16k_policy_source == (explicit_t16k ? OptionSource::explicit_value : OptionSource::automatic),
+            "automatic/explicit T16384 keep the complete fallback ladder and its memory reasons");
+        if (chosen == 2048U)
+            expect(config.options.known_prefix_tail_rows == std::vector<std::uint32_t>{256U,16U},
+                "automatic/explicit T16384 retain historical T2048 tails");
+    }
+    const auto captured = requested_prefill_environment([](const char* name) {
+        return std::string_view(name) == "STRIX_QPF2K_T16K" ? "1" : nullptr;
+    });
+    expect(captured.at("STRIX_QPF2K_T16K") == "1", "runtime environment capture sees the opt-in without injecting it");
+    auto explicit_args = effective_prefill_argv(resolve(request,memory).options);
+    explicit_args.insert(explicit_args.begin(), {"decoder","MODEL","1"});
+    const auto explicit_route = parse(explicit_args);
+    expect(explicit_route.known_prefix_prefill_explicit && explicit_route.known_prefix_prefill_rows == 16384U &&
+        explicit_route.known_prefix_window && explicit_route.known_prefix_full_rows,
+        "explicit T16384 window/full-rows argv round-trips through CLI validation");
+    for (const auto count : {16U,64U,256U,1024U,2048U,4096U,8192U,16383U,16384U}) {
+        request.options.tokens.resize(count,1U);
+        auto absent = request; absent.environment.clear();
+        auto expected = resolve(absent,memory);
+        const auto on = resolve(request,memory);
+        if (count == 16384U)
+            expect(on.admitted && on.options.known_prefix_prefill_rows == 16384U &&
+                on.t16k_policy_source == OptionSource::explicit_value, "override admits T16384 at its minimum prompt length");
+        else {
+            expected.environment["STRIX_QPF2K_T16K"] = "1";
+            expect(effective_config_json(on) == effective_config_json(expected), "T16K opt-in preserves smaller routes and records the request");
+        }
+    }
+    // Global/owner exclusions are evaluated before any T16384 setup or memory estimate.
+    tight.estimate = [&](const Options& options) {
+        attempts.push_back(options.known_prefix_prefill_rows);
+        return estimate(options);
+    };
+    for (const bool explicit_t16k : {false,true}) for (unsigned excluded = 0; excluded < 6U; ++excluded) {
+        auto blocked = original;
+        blocked.options.tokens.resize(131072U,1U); blocked.options.generate_tokens = 1U;
+        if (explicit_t16k) blocked.environment["STRIX_QPF2K_T16K"] = "1";
+        auto layout = manifest;
+        if (excluded == 0U) blocked.options.baseline = true;
+        if (excluded == 1U) blocked.environment["STRIX_BASELINE"] = "1";
+        if (excluded == 2U) blocked.environment["STRIX_QPF2K_DEFAULTS"] = "0";
+        if (excluded == 3U) blocked.environment["STRIX_QPF2K_DEFAULTS"] = "00";
+        if (excluded == 4U) blocked.environment["STRIX_QPF2K_DEFAULTS"] = "0disabled";
+        if (excluded == 5U) {
+            ManifestTensor gate;
+            gate.name = "blk.0.ffn_gate_exps.weight"; gate.ggml_type = gsq_a8::type_q2_0;
+            layout.tensors.push_back(gate);
+            layout.layout_identity = model_manifest_layout_identity(layout);
+        }
+        attempts.clear();
+        const auto config = resolve_effective_config(blocked,model,info,layout,validated_model_content_identity,capabilities,tight);
+        expect(!config.admitted && !config.t16k_policy_source && attempts.empty() && config.tile_fallback.empty() &&
+            config.reason == (excluded < 2U ? "baseline" : excluded < 5U ? "feature-disabled" : "checkpoint-content-not-qualified"),
+            "baseline, defaults-off and GSQ exclude automatic and override T16384 before setup");
+    }
+}
 void long_context_admission_tests(const RequestedOptions& original, const ModelContract& model,
     const gguf::FileInfo& info, ModelManifest manifest, const PrefillCapabilities& capabilities) {
     const auto contract = build_ple_hash_contract(model);
@@ -1459,7 +1710,7 @@ void long_context_admission_tests(const RequestedOptions& original, const ModelC
         return required;
     };
     const auto resolve = [&](const RequestedOptions& request, const PrefillMemory& memory) {
-        return resolve_effective_config(request,model,info,manifest,validated_model_content_identity,capabilities,memory);
+        return resolve_w7_case(request,model,info,manifest,validated_model_content_identity,capabilities,memory);
     };
     {
         ple_reclaim::Config config;
@@ -1527,7 +1778,12 @@ void long_context_admission_tests(const RequestedOptions& original, const ModelC
     const auto estimate = observed.estimate;
     for (const auto chosen : {4096U,2048U,0U}) {
         auto tight = observed;
-        tight.gtt_limit = 2U*gib_bytes + 40U*gib_bytes + (chosen == 4096U ? 3U*gib_bytes : chosen == 2048U ? 2U*gib_bytes : gib_bytes / 2U);
+        auto priced = resolve(request,observed).options;
+        priced.known_prefix_prefill_rows = chosen ? chosen : 2048U;
+        priced.known_prefix_tail_rows.clear();
+        const auto pools = prefill_native_pools(priced,model);
+        tight.gtt_limit = 2U*gib_bytes + 40U*gib_bytes + pools.device + pools.mapped +
+            (chosen == 4096U ? 3U*gib_bytes : chosen == 2048U ? 2U*gib_bytes : gib_bytes / 2U);
         std::vector<std::uint32_t> attempts;
         tight.estimate = [&](const Options& candidate) {
             attempts.push_back(candidate.known_prefix_prefill_rows);
@@ -1624,6 +1880,38 @@ void long_context_admission_tests(const RequestedOptions& original, const ModelC
     // These pure route checks share the runtime gate, including graph/copy/MTP/IO exclusions.
     const auto admitted = resolve(request,observed);
     expect(admitted.admitted, "long_context_reclaim_route_fixture");
+    {
+        auto wide = request; wide.environment["STRIX_QPF2K_T16K"] = "1";
+        const auto resolve_wide = [&](const PrefillMemory& memory) {
+            return resolve_effective_config(wide,model,info,manifest,validated_model_content_identity,capabilities,memory);
+        };
+        auto wide_observed = observed;
+        wide_observed.estimate = [&](const Options& candidate) {
+            auto required = observed.estimate(candidate);
+            // Isolate the wide-pool boundary while retaining upstream rolling metadata.
+            required.model_backing -= 8U*gib_bytes;
+            return required;
+        };
+        const auto config = resolve_wide(wide_observed);
+        expect(config.admitted && config.options.known_prefix_prefill_rows == 16384U &&
+            config.ple_reclaim_credit == admitted.ple_reclaim_credit,
+            "T16K uses the same prompt-specific reclaim proof as T8192");
+        auto tight = wide_observed; tight.available = 120U*gib_bytes;
+        const auto r = wide_observed.estimate(config.options);
+        const auto pools = prefill_native_pools(config.options,model);
+        const auto other = r.state_d1 + r.serial_scratch + r.workspace + r.tails + r.metadata +
+            r.runtime_payload + pools.host + pools.device +
+            prefill_rolling_owner_bytes(config.options,model,manifest,wide.environment,tight.ple_reclaim_page);
+        tight.estimate = [&](const Options& options) {
+            auto required = observed.estimate(options);
+            required.model_backing = 120U*gib_bytes + config.ple_reclaim_credit + 1U - other;
+            return required;
+        };
+        const auto fallback = resolve_wide(tight);
+        expect(fallback.admitted && fallback.options.known_prefix_prefill_rows == 8192U &&
+            fallback.tile_fallback == "T16384:insufficient-memory",
+            "T16K charges native pools once and subtracts verified-eligible model backing credit only once");
+    }
     if (admitted.admitted) {
         const auto credit = [&](const Options& options, const Environment& environment, const ModelManifest& layout) {
             return prefill_reclaim_credit(options,model,layout,environment,observed.ple_reclaim_page);
@@ -1778,9 +2066,250 @@ void long_context_admission_tests(const RequestedOptions& original, const ModelC
 }
 
 }
+void prefill_identity_plumbing_tests() {
+    const auto saved = detail::prefill_identity_override();
+    detail::prefill_identity_override() = {};
+    const auto options = parse({"decoder", "model.gguf", "1", "--prefill-exact-fp16",
+        "--prefill-disable", "hc_output_wmma", "--prefill-disable=hc_output_wmma"});
+    expect(options.prefill_exact_fp16 && options.prefill_disabled == 1U && !options.route_owned,
+        "prefill switches parse without owning the automatic route");
+    expect(parse_prefill_option_list("hc_output_wmma") == 1U, "all declared option names are recognized");
+    for (const auto* value : {"unknown", "", "hc_output_wmma,", ",hc_output_wmma", "hc_output_wmma,,hc_output_wmma"}) {
+        bool rejected = false;
+        try { (void)parse({"decoder", "model.gguf", "1", "--prefill-disable", value}); }
+        catch (const std::invalid_argument&) { rejected = true; }
+        expect(rejected, "malformed CLI prefill lists are rejected");
+    }
+    for (const auto* flag : {"--config", "--prefill-disable"}) {
+        bool rejected = false;
+        try { (void)parse({"decoder", "model.gguf", "1", flag}); }
+        catch (const std::invalid_argument&) { rejected = true; }
+        expect(rejected, "prefill startup flags require values");
+    }
+    bool exact = false; unsigned disabled = 0U;
+    std::istringstream config("# startup identity\nprefill_exact_fp16 = true\nprefill_disable = [\"hc_output_wmma\", \"hc_output_wmma\"] # off\n");
+    read_prefill_config(config, exact, disabled);
+    expect(exact && disabled == 1U, "startup config parses bool and quoted option array");
+    const auto config_root = [] {
+        for (unsigned attempt = 0;; ++attempt) {
+            const auto path = std::filesystem::temp_directory_path() / ("qwen-prefill-startup-test-" +
+                std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()) + "-" + std::to_string(attempt));
+            if (std::filesystem::create_directory(path)) return path;
+        }
+    }();
+    const auto config_path = config_root / "startup.conf";
+    struct RemoveConfig {
+        std::filesystem::path path;
+        ~RemoveConfig() {
+            std::error_code error;
+            std::filesystem::remove(path, error);
+            std::filesystem::remove(path.parent_path(), error);
+        }
+    } cleanup{config_path};
+    {
+        std::ofstream file(config_path);
+        file << "prefill_exact_fp16 = false\nprefill_disable = [\"hc_output_wmma\"]\n";
+    }
+    for (const bool config_first : {true, false}) {
+        auto argv = std::vector<std::string>{"decoder", "model.gguf", "1"};
+        const auto config_args = std::vector<std::string>{"--config", config_path.string()};
+        const auto cli_args = std::vector<std::string>{"--prefill-exact-fp16", "--prefill-disable=hc_output_wmma"};
+        const auto& first = config_first ? config_args : cli_args;
+        const auto& second = config_first ? cli_args : config_args;
+        argv.insert(argv.end(), first.begin(), first.end());
+        argv.insert(argv.end(), second.begin(), second.end());
+        const auto loaded = parse(argv);
+        expect(loaded.prefill_exact_fp16 && loaded.prefill_disabled == 1U && !loaded.route_owned,
+            "config file and CLI restrictions combine regardless of argument order");
+    }
+    expect(parse({"decoder", "model.gguf", "1", "--config=" + config_path.string()}).prefill_disabled == 1U,
+        "config supports equals syntax");
+    const auto captured = requested_prefill_environment([](const char* name) -> const char* {
+        const std::string_view key(name);
+        if (key == "STRIX_QPF2K_EARLY_SETUP") return "0";
+        if (key == "STRIX_PREFILL_EXACT_FP16") return "1";
+        for (const auto& option : kPrefillOptions) if (key == option.env) return "0";
+        return nullptr;
+    });
+    expect(captured.size() == kPrefillOptions.size() + 2U && captured.at("STRIX_PREFILL_EXACT_FP16") == "1" &&
+        captured.at("STRIX_QPF2K_EARLY_SETUP") == "0",
+        "effective config captures setup order, master, diagnostic and every option environment control");
+    for (const auto* text : {"prefill_exact_fp16 = 1", "unknown = true", "prefill_disable = [\"unknown\"]",
+        "prefill_disable = [\"hc_output_wmma\",]", "prefill_disable = [hc_output_wmma]",
+        "prefill_disable = [\"\"]", "prefill_exact_fp16 = false\nprefill_exact_fp16 = true"}) {
+        bool rejected = false; bool test_exact = false; unsigned test_disabled = 0U;
+        std::istringstream input(text);
+        try { read_prefill_config(input, test_exact, test_disabled); }
+        catch (const std::invalid_argument&) { rejected = true; }
+        expect(rejected, "malformed or unknown startup config is rejected");
+    }
+    const auto resolved = [&](Options parsed, Environment env) {
+        return resolve_effective_config({std::move(parsed), std::move(env)},
+            ModelContract::qwen38_flash_next(), {}, {}, "", {}, {});
+    };
+    const char* old_env = std::getenv("STRIX_PREFILL_HC_OUTPUT_WMMA");
+    const std::optional<std::string> saved_env = old_env ? std::optional<std::string>(old_env) : std::nullopt;
+    const auto set_option_env = [](const char* value) {
+#ifdef _WIN32
+        _putenv_s("STRIX_PREFILL_HC_OUTPUT_WMMA", value ? value : "");
+#else
+        if (value) ::setenv("STRIX_PREFILL_HC_OUTPUT_WMMA", value, 1);
+        else ::unsetenv("STRIX_PREFILL_HC_OUTPUT_WMMA");
+#endif
+    };
+    set_option_env("0");
+    const auto plain_options = parse({"decoder", "model.gguf", "1"});
+    const auto enabled = resolved(plain_options, {});
+    expect(kPrefillOptionsReady == 1U && enabled.prefill_option_mask == kPrefillOptionsReady &&
+        prefill_identity_hash(1U) == UINT64_C(17162327878354112617) &&
+        effective_config_json(enabled).find(prefill_identity_fields(1U)) != std::string::npos,
+        "clean supplied environment reports real READY default ON name/hash/options");
+    for (const auto rows : {4096U, 32768U}) {
+        for (unsigned policy = 0; policy < 3U; ++policy) {
+            auto baseline_options = plain_options;
+            baseline_options.tokens.resize(rows, 1U);
+            baseline_options.baseline = policy == 0U;
+            Environment env{{"STRIX_QPF2K_HC_LOWBAND", "3"}};
+            if (policy == 1U) env["STRIX_BASELINE"] = "1";
+            if (policy == 2U) env["STRIX_QPF2K_DEFAULTS"] = "0";
+            const auto initialized = initialize_prefill_config({baseline_options, env});
+            expect(initialized.options.prefill_disabled == baseline_options.prefill_disabled &&
+                initialized.environment.at("STRIX_QPF2K_HC_LOWBAND") == "3",
+                "bundle masters add no governed restrictions or initializer low-band override");
+            const auto on = resolved(baseline_options, env);
+            const auto repeated = resolved(baseline_options, env);
+            expect(on.prefill_option_mask == kPrefillOptionsReady &&
+                on.options.resolved_prefill_option_mask == kPrefillOptionsReady &&
+                repeated.prefill_option_mask == on.prefill_option_mask &&
+                effective_config_json(on).find(prefill_identity_fields(kPrefillOptionsReady)) != std::string::npos,
+                "4K/32K baseline and defaults-off ON runs repeat the public fp16-v1+hcout16 identity");
+            if (policy == 2U)
+                expect(on.environment.at("STRIX_QPF2K_HC_LOWBAND") == "3",
+                    "defaults-off preserves an explicit low-band policy");
+        }
+    }
+    set_option_env("1");
+    for (const auto& env : {Environment{{"STRIX_PREFILL_HC_OUTPUT_WMMA", "0"}},
+             Environment{{"STRIX_PREFILL_EXACT_FP16", "1"}}}) {
+        const auto off = resolved(plain_options, env);
+        expect(off.prefill_option_mask == 0U &&
+            effective_config_json(off).find(prefill_identity_fields(0U)) != std::string::npos,
+            "captured individual/master OFF determines serialized identity");
+    }
+    for (const char* flag : {"--prefill-exact-fp16", "--prefill-disable=hc_output_wmma"})
+        expect(resolved(parse({"decoder", "model.gguf", "1", flag}), {}).prefill_option_mask == 0U,
+            "public CLI controls resolve OFF with real READY mask");
+    for (const char* body : {"prefill_disable = [\"hc_output_wmma\"]\n", "prefill_exact_fp16 = true\n"}) {
+        { std::ofstream file(config_path); file << body; }
+        expect(resolved(parse({"decoder", "model.gguf", "1", "--config", config_path.string()}), {}).prefill_option_mask == 0U,
+            "config-file individual/master controls resolve OFF");
+    }
+    expect(governed_hc_output_kernel(2U, 0U) == 1U && governed_hc_output_kernel(2U, 1U) == 2U,
+        "legacy output selector obeys public OFF controls");
+    set_prefill_identity_override(false, 1U);
+    set_prefill_identity_override(true, 8U);
+    expect(detail::prefill_identity_override().exact && detail::prefill_identity_override().disabled == 9U &&
+        prefill_options_active() == 0U, "startup overrides accumulate and master restores FP16");
+    expect(resolved(plain_options, {}).prefill_option_mask == 1U &&
+        effective_config_json(enabled).find(prefill_identity_fields(1U)) != std::string::npos,
+        "global master override and later process state cannot suppress captured READY configuration");
+    expect(prefill_identity_name() == "fp16-v1" && prefill_identity_hash() == prefill_identity_hash(0U) && prefill_identity_hash(0U) == UINT64_C(11531825512229770990),
+        "plain FP16 name and hash agree with the active set");
+    expect(prefill_identity_name(1U) == "fp16-v1+hcout16",
+        "identity components follow enum order");
+    std::set<std::uint64_t> hashes;
+    for (unsigned mask = 0; mask < 2U; ++mask) hashes.insert(prefill_identity_hash(mask));
+    expect(hashes.size() == 2U, "every declared combination has a distinct identity hash");
+    const auto fields = prefill_identity_fields(0U);
+    const auto hash_begin = fields.find("\"prefill_identity_hash\":\"") + std::string("\"prefill_identity_hash\":\"").size();
+    expect(fields.substr(hash_begin, 16U).find_first_not_of("0123456789abcdef") == std::string::npos &&
+        fields[hash_begin + 16U] == '"' && fields.find("\"prefill_options_active\":[]") != std::string::npos,
+        "receipt hash is 16 lowercase hex digits and inactive options form an empty array");
+    expect(prefill_identity_fields(1U).find("\"hc_output_wmma\"") != std::string::npos,
+        "receipt active option names follow enum order");
+    EffectiveConfig effective;
+    effective.options = options;
+    expect(effective_config_json(effective).find(fields) != std::string::npos,
+        "effective config reports the same identity fields as receipts");
+    const auto replay = effective_prefill_argv(options);
+    expect(std::find(replay.begin(), replay.end(), "--prefill-exact-fp16") != replay.end(),
+        "effective argv preserves the master switch");
+    for (unsigned mask : {0U, 1U}) {
+        auto requested = plain_options;
+        requested.rotary = RotaryDescriptor::yarn(2U);
+        requested.prefill_disabled = mask ? 0U : 1U;
+        const RequestedOptions request{requested, {}};
+        const auto direct = resolve_yarn_config(request, ModelContract::qwen38_flash_next(), {}, {}, "", {}, {});
+        expect(direct.prefill_option_mask == mask && direct.options.resolved_prefill_option_mask == mask,
+            "direct YaRN resolver initializes options even before a refusal");
+        const auto native = initialize_prefill_config(request);
+        expect(native.prefill_option_mask == direct.prefill_option_mask, "both resolvers use one initializer");
+    }
+    auto bundled_mtp = plain_options;
+    bundled_mtp.mtp.enabled = true;
+    bundled_mtp.mtp_bundle_path = "model.mtp-bundle.json";
+    const auto bundled = initialize_prefill_config({bundled_mtp, {}});
+    expect(bundled.prefill_option_mask == 0U &&
+        (bundled.options.prefill_disabled & prefill_option_bit(PrefillOption::hc_output_wmma)),
+        "automatic YaRN MTP bundle retains its qualified prefill arithmetic");
+    auto split = plain_options;
+    split.numerical_profile = dense_a8_profile;
+    split.numerical_profile_explicit = true;
+    split.prefill_numerical_profile = DecodeNumericalProfile::fast_prefill_f16wmma_v1;
+    split.known_prefix_window = split.known_prefix_full_rows = true;
+    split.known_prefix_prefill_rows = 2048U;
+    split.validation_final_state_path = "private-state";
+    validate_prefill_numerical_profile_cli(split);
+    const auto pair = numerical_profile_pair(split);
+    const auto on_identity = prefill_arithmetic_identity(pair, 1U, false);
+    expect(on_identity != prefill_arithmetic_identity(pair, 0U, false), "host/runtime arithmetic binds option mask");
+    expect(on_identity != prefill_arithmetic_identity(pair, 1U, true), "host/runtime arithmetic binds GSQ");
+    set_option_env(saved_env ? saved_env->c_str() : nullptr);
+    detail::prefill_identity_override() = saved;
+    expect((prefill_options_active() & ~kPrefillOptionsReady) == 0U,
+        "unready options never appear in the active identity");
+}
+
+// Receipt contract: hcout16 declares the governed option on every route, but HC output WMMA executes only
+// with a fast prefill pair. Equivalence must therefore never key on the declared mask alone.
+void prefill_identity_equivalence_tests() {
+    const auto route = [](std::vector<std::string> extra) {
+        std::vector<std::string> args{"decoder", "model.gguf", "1", "--numerical-profile",
+            "hc-splitk-f32+q51-q80-a8-down+q5k-a8-gateup+dense-a8-v1", "--known-prefix-window",
+            "--known-prefix-full-rows", "--known-prefix-workspace-budget-bytes", "8589934592",
+            "--known-prefix-host-metadata-budget-bytes", "1073741824", "--known-prefix-uma-budget-bytes",
+            "128849018880", "--known-prefix-host-headroom-bytes", "4294967296", "--known-prefix-prefill-rows", "4096"};
+        args.insert(args.end(), extra.begin(), extra.end());
+        return parse(args);
+    };
+    const auto fast = route({"--prefill-numerical-profile", "fast-prefill-f16wmma-v1"});
+    const auto plain = route({});
+    const auto baseline = route({"--baseline"});
+    expect(numerical_profile_pair(fast).fast_components != 0U && numerical_profile_pair(plain).fast_components == 0U &&
+        numerical_profile_pair(baseline).fast_components == 0U, "routes resolve to one fast and two non-fast prefill pairs");
+    const auto key = [](const Options& o) {
+        std::string cli;
+        for (const auto& arg : effective_prefill_argv(o)) cli += std::to_string(arg.size()) + ":" + arg;
+        return prefix_effective_execution_signature(cli, o.baseline, false, {}, kPrefillOptionsReady);
+    };
+    expect(key(fast) != key(plain) && key(fast) != key(baseline) && key(plain) != key(baseline),
+        "prefix-cache keys of non-fast and baseline routes never equal the fast-pair key under the same declared mask");
+    const auto arithmetic = [](const Options& o, unsigned mask) {
+        return prefill_arithmetic_identity(numerical_profile_pair(o), mask, false);
+    };
+    expect(arithmetic(plain, kPrefillOptionsReady) == arithmetic(plain, 0U) &&
+        arithmetic(baseline, kPrefillOptionsReady) == arithmetic(baseline, 0U),
+        "on non-fast pairs the declared mask is inert in the compiled prefill identity");
+    expect(arithmetic(fast, kPrefillOptionsReady) != arithmetic(fast, 0U) &&
+        arithmetic(fast, kPrefillOptionsReady) != arithmetic(plain, kPrefillOptionsReady),
+        "the session identity follows the executed arithmetic, not the declared name");
+}
+
 int main(int argc, char** arguments) {
     resident_fallback_tests();
     mtp_reservation_arithmetic_tests();
+    prefill_identity_plumbing_tests();
+    prefill_identity_equivalence_tests();
     const auto model = ModelContract::qwen38_flash_next();
     gguf::FileInfo info;
     ModelManifest manifest;
@@ -1835,7 +2364,7 @@ int main(int argc, char** arguments) {
     plain_argv.insert(plain_argv.end(),{"--generate","32"});
     auto request = RequestedOptions{parse(std::move(plain_argv)),{}};
     const auto resolve = [&](const RequestedOptions& value, const PrefillMemory& observation) {
-        return resolve_effective_config(value,model,info,manifest,validated_model_content_identity,capabilities,observation);
+        return resolve_w7_case(value,model,info,manifest,validated_model_content_identity,capabilities,observation);
     };
     {
         constexpr auto candidate_key = "STRIX_QPF2K_MOE_ROUTE_BF16";
@@ -1863,6 +2392,26 @@ int main(int argc, char** arguments) {
                     std::string_view(enabled ? "fp16-v1+moeroute16" : "fp16-v1") &&
                     got.options.product_profile.qualification() == (enabled ? "qualification in progress: moe_route_bf16" : "qualified"),
                     "product receipt and actual storage identity agree");
+                const auto pair = numerical_profile_pair(got.options);
+                expect(got.prefill_option_mask == kPrefillOptionsReady,
+                    "every product profile retains the governed HC default");
+                const auto composed = prefill_arithmetic_identity(pair, got.prefill_option_mask, false);
+                for (const bool master : {false, true}) {
+                    auto restricted = selected;
+                    if (master) restricted.options.prefill_exact_fp16 = true;
+                    else restricted.options.prefill_disabled = prefill_option_bit(PrefillOption::hc_output_wmma);
+                    const auto off = resolve(restricted, memory);
+                    expect(off.error.empty() && off.prefill_option_mask == 0U &&
+                        off.options.product_profile.json() == got.options.product_profile.json() &&
+                        numerical_profile_pair(off.options) == pair,
+                        "HC restriction preserves product profile and BF16 route admission");
+                    expect(prefill_arithmetic_identity(pair, off.prefill_option_mask, false) != composed,
+                        "HC restriction changes composed arithmetic identity independently of BF16 storage");
+                    const auto report = serve::parse_json(effective_config_json(off));
+                    expect(report.find("prefill_identity")->as_string() == "fp16-v1" &&
+                        report.find("prefill_moe_route_bf16")->as_bool() == enabled,
+                        "inspection reports independent HC and BF16 controls");
+                }
             }
         }
         expect(moe_prefill_storage_identity(false) == 0xa0094634843e16eeULL &&
@@ -2337,6 +2886,15 @@ int main(int argc, char** arguments) {
             validated_model_content_identity,true,input.permit_generation_defaults);
         auto normalized = actual.options;
         normalized.baseline = old.baseline; // The policy marker itself is new.
+        const bool master_off = input.options.baseline || env_is(input.environment,"STRIX_BASELINE","1") ||
+            (input.environment.contains("STRIX_QPF2K_DEFAULTS") && input.environment.at("STRIX_QPF2K_DEFAULTS").starts_with('0'));
+        if (master_off) {
+            expect(actual.prefill_option_mask == resolve_prefill_options([&](const char* name) -> const char* {
+                const auto it = input.environment.find(name);
+                return it == input.environment.end() ? nullptr : it->second.c_str();
+            }, old.prefill_exact_fp16, old.prefill_disabled) && actual.options.prefill_disabled == old.prefill_disabled,
+                "bundle masters preserve governed arithmetic controls and the public ON identity");
+        }
         expect(!actual.admitted && effective_prefill_argv(normalized) == effective_prefill_argv(old) &&
             normalized.known_prefix_tail_rows == old.known_prefix_tail_rows &&
             normalized.known_prefix_ladder_tail_rows == old.known_prefix_ladder_tail_rows &&
@@ -2344,6 +2902,9 @@ int main(int argc, char** arguments) {
             actual.organization.automatic_applied == expected.automatic_applied,
             "complete fallback resolution equals the frozen historical resolver");
         Environment expected_env = input.environment;
+        if (master_off) expected_env["STRIX_QPF2K_COMPACT_IMAGES"] = "0";
+        if (!master_off && input.options.eager_code_load && !env_is(input.environment,"STRIX_EAGER_CODE_LOAD","0") &&
+            !expected_env.contains("HIP_ENABLE_DEFERRED_LOADING")) expected_env["HIP_ENABLE_DEFERRED_LOADING"] = "0";
         const bool baseline = input.options.baseline || env_is(input.environment,"STRIX_BASELINE","1");
         if (baseline) {
             for (const auto& entry : qpf2k::defaults) expected_env[entry.name] = "0";
@@ -2451,6 +3012,7 @@ int main(int argc, char** arguments) {
             "--serve-memory-budget-bytes","8192","--serve-request-budget-bytes","1024","--serve-headroom-bytes","1024"});
         if (route == 3) {
             owned.options = manual;
+            owned.options.prefill_disabled = 1U; // fast HC MTP requires explicit OFF until qualified
             owned.options.mtp = parse(mtp_fixture()).mtp;
             auto& m = owned.options.mtp;
             m.window_rows = 8U; m.window_rows_set = {2U,4U,8U}; m.candidate_depth = 7U;
@@ -2478,6 +3040,18 @@ int main(int argc, char** arguments) {
                 "default HTTP route does not inject window-only folds");
             const auto policy=resolve_mtp_selection_route(absent.options.http_selection_mtp,true,true);
             expect(policy.mtp && !policy.fallback,"default HTTP policy uses an admitted serial-equivalent owner");
+        }
+        for (const bool explicit_t16k : {false,true}) {
+            auto blocked = owned;
+            if (explicit_t16k) blocked.environment["STRIX_QPF2K_T16K"] = "1";
+            auto no_setup = memory;
+            unsigned estimates = 0;
+            no_setup.estimate = [&](const Options&) { ++estimates; return PrefillRequirements{}; };
+            const auto excluded = resolve_effective_config(blocked,model,info,manifest,
+                validated_model_content_identity,capabilities,no_setup);
+            expect(!excluded.admitted && excluded.reason == "explicit-route" && !excluded.t16k_policy_source &&
+                excluded.tile_fallback.empty() && estimates == 0U,
+                "MTP, HTTP, serving prefixes and cohort never attempt automatic or override T16384 setup");
         }
     }
     auto dense_baseline = baseline;
@@ -2515,7 +3089,7 @@ int main(int argc, char** arguments) {
     auto diagnostic = request; diagnostic.environment["STRIX_RTX_EXPORT_STATE"] = "1";
     expect(!resolve(diagnostic,memory).admitted, "explicit state-export control owns its existing execution route");
     auto no_target = capabilities; no_target.target_qualified = false;
-    expect(!resolve_effective_config(request,model,info,manifest,validated_model_content_identity,no_target,memory).admitted,
+    expect(!resolve_w7_case(request,model,info,manifest,validated_model_content_identity,no_target,memory).admitted,
         "unqualified target declines before estimating");
     auto f16_failure = memory;
     f16_failure.estimate = [&](const Options& candidate) {
@@ -2539,7 +3113,7 @@ int main(int argc, char** arguments) {
     const auto untouched = resolve(explicit_route,memory);
     expect(!untouched.admitted && effective_prefill_argv(untouched.options) == effective_prefill_argv(manual),
         "explicit route flags are untouched");
-    const auto absent_build = resolve_effective_config(request,model,info,manifest,validated_model_content_identity,
+    const auto absent_build = resolve_w7_case(request,model,info,manifest,validated_model_content_identity,
         {false,true,true},memory);
     expect(!absent_build.admitted, "missing A8 capability declines");
     {
@@ -2771,11 +3345,11 @@ int main(int argc, char** arguments) {
     gsq_gate.name = "blk.0.ffn_gate_exps.weight"; gsq_gate.ggml_type = gsq_a8::type_q2_0;
     gsq_manifest.tensors.push_back(gsq_gate);
     gsq_manifest.layout_identity = model_manifest_layout_identity(gsq_manifest);
-    const auto gsq_decline = resolve_effective_config(request,model,info,gsq_manifest,
+    const auto gsq_decline = resolve_w7_case(request,model,info,gsq_manifest,
         validated_model_content_identity,capabilities,memory);
-    const auto nonqwen = resolve_effective_config(request,model,info,manifest,"unqualified-content",capabilities,memory);
+    const auto nonqwen = resolve_w7_case(request,model,info,manifest,"unqualified-content",capabilities,memory);
     auto other_model = model; other_model.hidden_size += 32U;
-    const auto noncanonical = resolve_effective_config(request,other_model,info,manifest,
+    const auto noncanonical = resolve_w7_case(request,other_model,info,manifest,
         validated_model_content_identity,capabilities,memory);
     for (const auto& config : {absent_build, gsq_decline, nonqwen, noncanonical, declined, resolve(request,missing)}) {
         expect(!config.admitted && config.environment == export_config.environment,
@@ -2783,7 +3357,7 @@ int main(int argc, char** arguments) {
         expect(effective_config_notice(config).find("unqualified-context") == std::string::npos,
             "automatic long-context qualification notice stays confined to admission");
     }
-    const auto baseline_absent = resolve_effective_config(baseline,model,info,manifest,
+    const auto baseline_absent = resolve_w7_case(baseline,model,info,manifest,
         "unqualified-content",{false,false,false},missing);
     expect(!baseline_absent.admitted && baseline_absent.options.numerical_profile == DecodeNumericalProfile::exact_v5 &&
         !baseline_absent.options.prefill_numerical_profile && baseline_absent.options.context_tokens == request.options.context_tokens,
@@ -2914,14 +3488,14 @@ int main(int argc, char** arguments) {
             has(plain, "\"STRIX_QSA_DECODE_SELECT\":{\"enabled\":true,\"suppression\":null}") &&
             has(plain, "\"STRIX_QSA_DECODE_POOL_BF16\":{\"enabled\":true,\"suppression\":null}") &&
             has(plain, "\"STRIX_PREFILL_MOE_MERGE_VEC\":{\"enabled\":true,\"suppression\":null}") &&
-            has(plain, "\"qsa_decode_pool_key_bytes\":2}"), "effective config resolves the long-context items as on");
+            has(plain, "\"qsa_decode_pool_key_bytes\":2,"), "effective config resolves the long-context items as on");
         ::setenv("STRIX_QSA_DECODE_SELECT", "0", 1);
         ::setenv("STRIX_QSA_DECODE_POOL_BF16", "0", 1);
         plain = items(sized, false);
         expect(has(plain, "\"STRIX_QSA_DECODE_SELECT\":{\"enabled\":false,\"suppression\":\"explicit-off\"}") &&
             has(plain, "\"STRIX_QSA_DECODE_POOL_BF16\":{\"enabled\":false,\"suppression\":\"explicit-off\"}") &&
             has(plain, "\"STRIX_QSA_DECODE_POOL\":{\"enabled\":true,\"suppression\":null}") &&
-            has(plain, "\"qsa_decode_pool_key_bytes\":4}") &&
+            has(plain, "\"qsa_decode_pool_key_bytes\":4,") &&
             has(requested_prefill_environment().at("STRIX_QSA_DECODE_SELECT"), "0"),
             "explicit item switches resolve off while the request stays in the environment");
         ::unsetenv("STRIX_QSA_DECODE_SELECT");
@@ -2933,7 +3507,7 @@ int main(int argc, char** arguments) {
         const auto gsq_text = items(sized, true);
         expect(has(gsq_text, "\"STRIX_QSA_SCORE_ROWS64\":{\"enabled\":false,\"suppression\":\"gsq\"}") &&
             has(gsq_text, "\"STRIX_QSA_DECODE_SELECT\":{\"enabled\":false,\"suppression\":\"gsq\"}") &&
-            has(gsq_text, "\"qsa_decode_pool_key_bytes\":0}"), "GSQ owners report the gsq suppression");
+            has(gsq_text, "\"qsa_decode_pool_key_bytes\":0,"), "GSQ owners report the gsq suppression");
         qpf2k::baseline = true;
         expect(has(items(sized, false), "\"STRIX_QSA_DECODE_POOL\":{\"enabled\":false,\"suppression\":\"baseline\"}"),
             "--baseline is the reported suppression");
@@ -3906,6 +4480,8 @@ int main(int argc, char** arguments) {
         auto capture=batch;capture.prefix_batch_cert=2;
         expect(prefix_cache_inflight_state(capture).reason=="batch-cert-not-strict-l0","capture-only cert does not arm joining");
     }
+
+    t16k_admission_tests(request,model,info,manifest,capabilities);
     std::cout << "qwen effective config: " << failures << " failures\n";
     return failures ? 1 : 0;
 }

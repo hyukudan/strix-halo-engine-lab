@@ -74,7 +74,7 @@ void append(
 IndexedAttentionWorkspaceLayout
 build_indexed_attention_workspace_layout(
     const ModelContract& model,
-    std::uint64_t alignment, bool hierarchical_selection, std::uint32_t gqa_heads_per_block, bool external_block_scores) {
+    std::uint64_t alignment, bool hierarchical_selection, std::uint32_t gqa_heads_per_block, bool external_block_scores, bool compact_attention_output) {
     if (const auto error =
             model.validate();
         !error.empty()) {
@@ -86,8 +86,11 @@ build_indexed_attention_workspace_layout(
             "indexed-attention workspace alignment must be non-zero");
     }
 
+    if (compact_attention_output && model.bytes_fp32 != sizeof(float))
+        throw std::invalid_argument("compact QSA output requires FP32 containers");
     (void)qsa_gqa_organization_marker(gqa_heads_per_block);
     IndexedAttentionWorkspaceLayout layout;
+    layout.compact_attention_output = compact_attention_output;
     layout.alignment =
         alignment;
     layout.maximum_blocks =
@@ -198,7 +201,7 @@ build_indexed_attention_workspace_layout(
         cursor,
         checked_mul(
             attention_width,
-            model.bytes_fp32),
+            compact_attention_output ? sizeof(std::uint16_t) : model.bytes_fp32),
         alignment,
         layout.attention_output_offset,
         layout.attention_output_bytes);

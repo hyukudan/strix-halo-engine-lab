@@ -20,6 +20,10 @@ namespace strix {
 
 // STRIX_BATCH_SERVICE_MS: diagnostic closure certificate after a complete launcher returns.
 [[nodiscard]] bool qsa_prefill_bundle_closed() noexcept;
+// Reserve the stage ring for the process maximum T/context before any submission.
+void reserve_indexed_attention_prefill_pools(std::uint32_t rows, std::uint64_t context_tokens,
+    std::uint32_t ratio, bool compact_scores = false);
+
 class HipQsaWindowPool;
 class HipQsaExactScoreOwner;
 // Allocate the complete admitted ring during setup, before prompt execution.

@@ -225,7 +225,7 @@ __device__ __forceinline__ void attend_pipe_body(const Views<Rows>& v, const std
         }
     }
     const float* gate_in = v.q_gate[r] + static_cast<std::uint64_t>(head) * 2U * kDim + kDim;
-    float* out = v.output[r] + static_cast<std::uint64_t>(head) * kDim;
+    auto out = v.image(r) + static_cast<std::uint64_t>(head) * kDim;
 #pragma unroll
     for (unsigned n = 0; n < 8U; ++n)
 #pragma unroll

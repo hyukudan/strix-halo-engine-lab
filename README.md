@@ -1128,6 +1128,110 @@ baselines have engine-specific scope and may change arithmetic; they are not a u
 the reference fixed. See [precedence, guards and fallbacks](docs/optimizations.md#baselines-inspection-and-exactness)
 and the [JSON catalog](docs/optimizations.json).
 
+Exact Qwen startup and tiling defaults: prompt-independent static setup precedes the
+request timer; eager HIP code loading preserves a user-supplied HIP setting; automatic
+T16384 starts at 32,768 prompt tokens with memory fallback to T8192; exact indexer
+projection batching is independent of numerical options. Per-item OFF switches are
+`STRIX_QPF2K_EARLY_SETUP=0`, `STRIX_EAGER_CODE_LOAD=0`, `STRIX_QPF2K_T16K=0` and
+`STRIX_QPF2K_INDEX_BATCH=0`. Setup/loading move work into startup; they do not establish
+lower process wall time. See the [catalog](docs/optimizations.md#early-tiled-prefill-geometry-setup)
+and [native bundle gates](docs/engine/prefill/hc-output-wmma-qualification.md#bundle-native-gates).
+
+### Bit-changing prefill options
+
+Qwen's registry is [prefill_identity.hpp](include/strix/prefill_identity.hpp). Each option is
+**on by default once READY**, with an individual off switch and a master exact-FP16 switch.
+HC low-band layout defaults to mode 3 through decoder qpf2k defaults;
+`STRIX_QPF2K_HC_LOWBAND=0` restores the old layout. It is live only with `hc_output_wmma` OFF (the exact-FP16 output route),
+not with the default output WMMA identity. Only the qpf2k projection
+form 4 to FP32 output v3 band 16 uses it. HC output WMMA, check mode, normalized16,
+inverse and other routes retain their old layout. Arithmetic and numerical identities
+are unchanged; restart for this cached control. Native local CI passed 132/132 cases
+without stray stores, including eight T8224 cases with 512-row pool rounding, and
+32K last-row logits matched mode 0 bitwise with `hc_output_wmma` OFF. Exact,
+bitwise-checked; no timing claim because low-band is inactive on the default route.
+See [local CI](docs/engine/prefill/hc-output-wmma-qualification.md#bundle-local-ci-evidence).
+
+Exact [compact QSA output images](docs/engine/prefill/compact-stage-images.md)
+default ON for eligible full-T score-ring owners;
+`STRIX_QPF2K_COMPACT_IMAGES=0` restores FP32 containers after restart.
+Calculated memory saving is 96 MiB per T8192 owner. Native local CI passed the
+host/HIP fixtures and 32K last-row bitwise logit comparison. Interleaved 32K A/B
+was neutral within noise (OFF 19.95 s, n=2, versus default 20.09 s); no speed
+gain claimed. Already rounded BF16 bits widen identically. Numerical,
+rotary, kernel-plan and saved-state/cache numerical identities are unchanged.
+The physical execution identity must change because it hashes the smaller arena
+sizes, offsets and strides; it is not a numerical identity. Effective config
+reports the requested policy; compiled organization reports admitted savings.
+
+PLE staged-gather acceptance now tracks successful independent row-0 consumption
+and accepts the complete ordered deferred tail only after comparing every staged
+row ID, including row 0. This bug fix is unconditional, with no switch; copy
+semantics, staging guards, worker-error fallback, slot events and identities stay
+unchanged. Native local CI passed all 11 device/host fixtures, including the PLE
+launcher and staged-gather tests. Baseline and `STRIX_QPF2K_DEFAULTS=0` each turn
+every controlled exact organization item off. At 32K, last-row logits match bitwise between
+default and each OFF arm (early setup, eager loading, T16384, index batching, compact
+images). Three-round interleaved medians were 20.09 s default, 20.48 s early setup
+OFF, 20.34 s T16384 OFF and 20.07 s eager loading OFF. Early setup and T16384 show
+measured gains; eager loading is neutral within noise. These gains are not additive.
+At 131,072 and 262,143 real-text tokens the default admits automatic T16384, and with
+`STRIX_QPF2K_T16K=0` it admits T8192 as before, with no fallback. Open, nonblocking gates
+are the seven state payloads, T16384 at 262K and pressure fallback, and staged versus
+unstaged PLE gathered bytes; see [local CI](docs/engine/prefill/hc-output-wmma-qualification.md#bundle-local-ci-evidence).
+
+The READY mask contains `hc_output_wmma`. The implemented candidate `index_proj_wmma` stays outside READY and is default OFF pending qualification. The default prefill identity remains
+`fp16-v1+hcout16` (`prefill_identity_hash` ee2cd64684149069); `--prefill-exact-fp16` gives the plain
+`fp16-v1` identity (a0094634843e16ee).
+
+| Option | What it does | Gain | Changes bits vs FP16 identity | Measured quality | Switch off (CLI / config / API / env) |
+|---|---|---|---|---|---|
+| `hc_output_wmma` (on) | HC output: FP16 low values and Q8 coefficients, WMMA accumulation in ascending K16 order, same sigmoid and stream mix | Passed a pre-declared confirmation held-out set | yes | `hc_output_wmma` passed a pre-declared confirmation held-out set; its NLL endpoint is measured against a rounding-equivalent control whose per-case movement is capped at +-0.02 nats/token (a bounded control allowance, not an unbiased estimate of the uncapped difference); the absolute NLL change vs the exact reference also passed (-0.37 % NLL/token, upper bound +0.38 %). The off switch restores the exact output path. | `--prefill-disable hc_output_wmma` / `prefill_disable = ["hc_output_wmma"]` / server-level only / `STRIX_PREFILL_HC_OUTPUT_WMMA=0` |
+| `index_proj_wmma` (off; candidate, outside READY) | BF16 indexer q/k WMMA with independent K16 panels and ordered FP32 panel addition; tag `idxproj16` | Pending local qualification | yes | Compiler, native execution, model fidelity and complete-workload gates pending | Opt in: `STRIX_PREFILL_INDEX_PROJ_WMMA=1`; off: `STRIX_PREFILL_INDEX_PROJ_WMMA=0`, `--prefill-disable index_proj_wmma`, config `prefill_disable = ["index_proj_wmma"]`; master exact switch also disables |
+
+The prefill identity hash is FNV-1a 64 of the identity name. The enabled-set tag is not
+executed-path evidence: OUT16 requires the fast HC component, the qualified wide shape
+(hidden 2560, four streams, rank 320), QPF2K HC admission, FP32 normalized rows and
+compatible output selection. Serial suffixes, incompatible normalization forms and
+non-fast profiles can retain `hcout16` without executing OUT16. The once-per-process
+stderr witness does not establish execution for every request.
+
+Use `--prefill-exact-fp16`, `prefill_exact_fp16 = true`, or `STRIX_PREFILL_EXACT_FP16=1`
+to switch all arithmetic options in this registry off. `--prefill-disable` accepts comma-separated names and can be repeated;
+unknown or empty names are rejected. CLI/config restrictions combine with environment restrictions;
+a config `false` or empty array does not re-enable an environment-disabled option.
+These arithmetic controls preserve automatic route selection.
+
+The decode-token app and its `--http-serve` mode share these startup controls.
+`--config FILE` reads the arithmetic keys above and the exact startup booleans `qpf2k_early_setup` and `eager_code_load` as `key = value` assignments,
+one per line, with lowercase booleans, single-line arrays of double-quoted names and `#` comments.
+Unknown/duplicate keys and malformed values are rejected. For example:
+
+```text
+prefill_exact_fp16 = false
+prefill_disable = ["hc_output_wmma"]
+```
+
+Receipts, `--print-effective-config`, HTTP response `strix` receipts and `GET /v1/capabilities`
+report `prefill_identity`, `prefill_identity_hash` (16 lowercase hex digits), and
+`prefill_options_active` (names in registry order). This identifies the option set; the existing
+numerical profile pair still identifies the surrounding arithmetic. Every changed active set
+must be re-qualified against its own reference. The set is declared on every route, but
+`hc_output_wmma` executes only when prefill runs a fast prefill profile (stderr witness
+`qpf2k HC out16 active`); on other routes, including `--baseline` and explicit dense-A8 routes,
+it is inert. Equivalence never uses the declared set alone: prefix-state cache keys include the
+effective prefill command line (both numerical profiles and `--baseline`), and session state
+carries the compiled prefill execution identity, so routes with different arithmetic never compare equal.
+
+**Server-level only:** restart the server to change these options. Compiled prefill plans and
+prefix-state caches are shared across requests; the enabled set is bound into compiled execution,
+lineage and persistent-cache keys. The process-wide override has no request-scoped synchronization.
+A per-call getter alone cannot isolate concurrent or resumed requests. Request fields `prefill_exact_fp16` and `prefill_disable` are refused with HTTP 400.
+
+OFF is required to preserve public-main logits and all seven state components across CLI, MTP, HTTP, nested, GSQ and baseline routes. Compiled execution, lineage and cache identity bytes may differ even when numerical bytes match; native restoration gates must compare numerical payloads separately. Native restoration against public main remains a required release gate.
+
+The [native release gate commands](docs/engine/prefill/hc-output-wmma-qualification.md) cover public-main/OFF restoration, ON repeatability, full state exports, MTP, HTTP and nested scheduling.
+
 ## Optimizations
 
 The fast path is the default for all five engines. `auto` applies the documented admission guards;
@@ -1137,6 +1241,9 @@ Full item lists, preconditions, notices and evidence: [optimization catalog](doc
 
 | Engine / optimization | What | Default | Gain | Exact? | Off switch |
 |---|---|---|---|---|---|
+| Qwen: PLE staged-gather acceptance | Accept ordered tail after successful row-0 consumption | Unconditional bug fix | No measured speed claim | Local CI launcher/staged-gather fixtures pass; gathered-byte gate open | No switch |
+| Qwen: compact QSA output images | Exact BF16 storage and FP32 widening | On for eligible full-T owners | Calculated -96 MiB/T8192 owner | Local CI fixtures and 32K last-row logits bitwise; timing neutral within noise | `STRIX_QPF2K_COMPACT_IMAGES=0` |
+| Qwen: HC low-band layout | Banded low_t, skip unused low16 stores | On (mode 3), guarded FP32 output route | No timing claim (inactive on default route) | Exact, bitwise-checked in local CI (132/132 cases and 32K last-row logits) | `STRIX_QPF2K_HC_LOWBAND=0` |
 | Qwen: tiled prefill | Auto tile/context, expert union, router rows | Auto | 32K: 22.03 s, 1,487 tok/s | Own FP16 reference; differs from dense A8 | `STRIX_PREFILL_F16=0` |
 | Qwen: QPF2K + wrapper kernels | Dense/GDN/QSA/HC/MoE, dispatch and head work | On when admitted | Combined 32K 25.95 → 23.49 s | Within profile | `STRIX_QPF2K_DEFAULTS=0` |
 | Qwen: grouped QSA score in MTP verify | KV-head-grouped attention score in the R1–R8 verify windows and the draft step (each K row loaded once for its 12 query heads) | On | Decode +3.0 to +5.7 % (code / prose 1K; default, R2 and R8 windows), tokens identical | Bitwise, NaN payloads included | `STRIX_QSA_WINDOW_ATTN_V2=0`; [catalog](docs/optimizations.md#qsa-grouped-window-attention-score) |

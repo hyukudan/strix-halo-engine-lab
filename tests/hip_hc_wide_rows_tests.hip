@@ -3,6 +3,7 @@
 // (low values, injection, output) plus guard bytes, for BF16 and FP32 outputs, several row counts
 // and input flavors. STRIX_HC_WIDE_BENCH=1 adds per-kernel timings at 2048 rows.
 #include "strix/hip_hc_wide_rows_tests.hpp"
+#include "strix/prefill_identity.hpp"
 #include <hip/hip_runtime.h>
 #include <algorithm>
 #include <array>
@@ -47,6 +48,10 @@ std::vector<std::uint8_t> q8_weights(std::uint32_t rows, std::uint32_t width, un
         if (flavor == 1U && b % 7U == 3U) scale = special[(b / 7U) % special.size()];
         constexpr std::array<std::uint16_t, 6> nonfinite{0x7c00, 0xfc00, 0x7e00, 0xfe01, 0x7d55, 0x0000};
         if (flavor == 3U && b % 11U == 4U) scale = nonfinite[(b / 11U) % nonfinite.size()];
+        // Normalized N(0,1) inputs with model-like small projection weights and
+        // nonsaturated low/output gates. Synthetic distribution, not captured data.
+        if (flavor == 4U) scale = static_cast<std::uint16_t>(((width == kRank ? 6U : 2U) << 10U) |
+            static_cast<unsigned>(mant(rng)) | (rng() & 1U ? 0x8000U : 0U));
         w[b * 34U] = static_cast<std::uint8_t>(scale & 255U);
         w[b * 34U + 1U] = static_cast<std::uint8_t>(scale >> 8U);
         for (unsigned k = 0; k < 32U; ++k) w[b * 34U + 2U + k] = static_cast<std::uint8_t>(code(rng));
@@ -402,7 +407,9 @@ void compare_lowband(std::uint32_t rows, bool bf16, unsigned flavor, hipStream_t
     const auto c = config(bf16);
     auto v = f.views();
     v.output3_band = 16U;
-    constexpr std::size_t kTable = std::size_t{kRank} * 8192U, kLow16 = std::size_t{kRank} * 8192U;
+    // Pools hold whole 512-row blocks; a banded table of rows > 8192 (8224) reaches past 8192 rows.
+    const std::size_t table_rows = std::max<std::size_t>(8192U, (std::size_t{rows} + 511U) / 512U * 512U);
+    const std::size_t kTable = std::size_t{kRank} * table_rows, kLow16 = std::size_t{kRank} * table_rows;
     auto* table = const_cast<float*>(strix::testing::wide_hyper_rows_test_low_t());
     auto* low16 = const_cast<void*>(strix::testing::wide_hyper_rows_test_low16());
     const std::uint64_t out_bytes = kHidden * (bf16 ? 2U : 4U);
@@ -647,8 +654,143 @@ void bench(hipStream_t stream) {
         std::cout << "bench rows " << n << " output " << output << ": " << us << " us (" << flop_out / us / 1e6 << " TFLOPS)\n";
     }
 }
+// Isolated output arithmetic: finite unsaturated dots and a separate special-value
+// case. Synthetic normalized rows / Q8 weights are representative distributions,
+// not a model capture or a model-quality qualification.
+void fixtures_out16(hipStream_t stream) {
+    for (const bool bf16 : {true, false}) {
+        for (unsigned flavor = 0; flavor < 5U; ++flavor)
+            compare(8192U, bf16, flavor, 4U, 14U, stream, 2U, 2U);
+        for (const std::uint32_t rows : {8U, 33U, 513U, 8191U, 8192U}) {
+            Fixture f(rows, bf16, 0U, 808U);
+            const auto c = config(bf16);
+            f.reset(0xa5);
+            strix::testing::enqueue_wide_hyper_rows_test(c, f.views(), 4U, 255U, stream);
+            check(hipStreamSynchronize(stream), "out16 low allocation");
+            std::mt19937 rng(901U);
+            std::normal_distribution<float> normal(0.0F, 0.08F);
+            std::vector<_Float16> lows(static_cast<std::size_t>(rows) * kRank);
+            for (auto& v : lows) v = static_cast<_Float16>(normal(rng));
+            auto up = q8_weights(kStreams * kHidden, kRank, 0U, rng);
+            // Small finite Q8 scales keep gates away from saturation.
+            for (std::size_t b = 0; b < up.size() / 34U; ++b) { up[34U * b] = 0U; up[34U * b + 1U] = 0x18U; }
+            for (unsigned special = 0; special < 3U; ++special) {
+                if (special == 1U) {
+                    // Half subnormal, signed zero, infinity and NaN payloads in lows;
+                    // FP32 specials in the normalized mix, including finite-dot rows.
+                    constexpr std::array<std::uint16_t, 8> h{0U, 0x8000U, 1U, 0x8001U, 0x7c00U, 0xfc00U, 0x7e01U, 0xfe55U};
+                    constexpr std::array<std::uint32_t, 8> x{0U, 0x80000000U, 1U, 0x80000001U, 0x7f800000U, 0xff800000U, 0x7fc00001U, 0xffc00123U};
+                    for (unsigned i = 0; i < h.size(); ++i) {
+                        std::memcpy(&lows[static_cast<std::size_t>(i) * kRank + i], &h[i], 2U);
+                        for (unsigned s = 0; s < kStreams; ++s)
+                            std::memcpy(f.normalized_host.data() + static_cast<std::size_t>((i + 1U) % rows) * kNormalizedStride +
+                                (s * kHidden + i) * 4U, &x[i], 4U);
+                    }
+                } else if (special == 2U) {
+                    // Decode special Q8 scales through the actual HCW2 pack expression.
+                    constexpr std::array<std::uint16_t, 8> h{0U, 0x8000U, 1U, 0x8001U, 0x7c00U, 0xfc00U, 0x7e01U, 0xfe55U};
+                    for (unsigned i = 0; i < h.size(); ++i) {
+                        const std::size_t b = static_cast<std::size_t>(i * 163U) * 34U;
+                        up[b] = static_cast<std::uint8_t>(h[i] & 255U);
+                        up[b + 1U] = static_cast<std::uint8_t>(h[i] >> 8U);
+                    }
+                }
+                f.up.upload(up);
+                check(hipMemcpy(const_cast<void*>(strix::testing::wide_hyper_rows_test_low16()), lows.data(), lows.size() * 2U,
+                    hipMemcpyHostToDevice), "out16 synthetic lows");
+                f.reset(0xa5);
+                strix::testing::enqueue_wide_hyper_rows_test(c, f.views(), 255U, 2U, stream);
+                check(hipStreamSynchronize(stream), "out16 reference");
+                const auto expected = f.output.download();
+                f.reset(0x5a);
+                strix::testing::enqueue_wide_hyper_rows_test(c, f.views(), 255U, 14U, stream);
+                check(hipStreamSynchronize(stream), "out16 candidate");
+                const auto actual = f.output.download();
+                // Compare every active byte exactly (including NaN payloads and -0);
+                // padding must retain the distinct poison in each arm.
+                const std::size_t active = kHidden * (bf16 ? 2U : 4U);
+                for (unsigned r = 0; r < rows; ++r)
+                    for (std::size_t b = 0; b < f.output_stride; ++b) {
+                        const std::size_t i = static_cast<std::size_t>(r) * f.output_stride + b;
+                        if (b < active ? expected[i] != actual[i] : (expected[i] != 0xa5U || actual[i] != 0x5aU))
+                            throw std::runtime_error("out16 != HCW2 at byte " + std::to_string(i));
+                    }
+                std::cout << "out16 == HCW2 rows " << rows << " bf16 " << bf16 << " specials " << special << '\n';
+            }
+        }
+    }
+    // Run separately with HC=1 / LOWBAND=3 (hc_output_wmma on by default): exercise the production
+    // selector (2/1), proving it retains low16 despite the default lowband mode.
+    if (strix::prefill_option_enabled(strix::PrefillOption::hc_output_wmma)) {
+        Fixture f(8192U, true, 4U, 611U);
+        auto c = config(true);
+        c.fast_prefill_wmma = true;
+        f.reset(0xa5);
+        strix::testing::enqueue_wide_hyper_rows_test(c, f.views(), 2U, 2U, stream);
+        check(hipStreamSynchronize(stream), "out16 automatic reference");
+        const auto expected = f.written();
+        f.reset(0xa5);
+        strix::testing::enqueue_wide_hyper_rows_test(c, f.views(), 2U, 1U, stream);
+        check(hipStreamSynchronize(stream), "out16 automatic candidate");
+        if (expected != f.written()) throw std::runtime_error("automatic out16 route != HCW2");
+        std::cout << "automatic out16 route == HCW2 rows 8192\n";
+    }
+}
+
+void bench_out16(hipStream_t stream) {
+    constexpr unsigned rows = 8192U;
+    const unsigned n = [] {
+        const char* v = std::getenv("STRIX_HC_OUT16_BENCH_N");
+        const int value = v ? std::atoi(v) : 31;
+        if (value < 3 || value > 10000) throw std::invalid_argument("OUT16 bench N must be 3..10000");
+        return static_cast<unsigned>(value);
+    }();
+    Fixture f(rows, true, 4U, 99U);  // nonsaturated model-like gates
+    auto c = config(true);
+    c.fast_prefill_wmma = true;  // output3 includes its production up-copy
+    auto v = f.views();
+    v.low_band = 0U;  // output-only arms share both complete low images
+    v.output3_band = 16U;
+    strix::testing::enqueue_wide_hyper_rows_test(c, v, 4U, 7U, stream);
+    check(hipStreamSynchronize(stream), "bench lows");
+    hipEvent_t a, b;
+    check(hipEventCreate(&a), "event"); check(hipEventCreate(&b), "event");
+    // Both output-only speed gate and matched projection+output transaction.
+    // Interleave arms each iteration, rotate order, discard five warmups per arm.
+    for (const unsigned projection : {255U, 4U}) {
+        std::array<std::vector<float>, 3> samples;
+        constexpr std::array<unsigned, 3> forms{7U, 2U, 14U};
+        for (unsigned it = 0; it < n + 5U; ++it)
+            for (unsigned q = 0; q < 3U; ++q) {
+                const unsigned arm = (q + it) % 3U;
+                v.output3_band = arm == 0U ? 16U : UINT32_MAX;
+                // Full transactions use today's default lowband=3 for output3;
+                // WMMA arms must retain low16. Output-only uses common flat lows.
+                v.low_band = projection == 4U && arm == 0U ? 3U : 0U;
+                check(hipEventRecord(a, stream), "record");
+                strix::testing::enqueue_wide_hyper_rows_test(c, v, projection, forms[arm], stream);
+                check(hipEventRecord(b, stream), "record");
+                check(hipEventSynchronize(b), "sync");
+                float ms = 0;
+                check(hipEventElapsedTime(&ms, a, b), "elapsed");
+                if (it >= 5U) samples[arm].push_back(ms * 1000.0F);
+            }
+        std::array<float, 3> medians{};
+        for (unsigned arm = 0; arm < 3U; ++arm) {
+            auto& s = samples[arm];
+            std::sort(s.begin(), s.end());
+            medians[arm] = s.size() % 2U ? s[s.size() / 2U] : (s[s.size() / 2U - 1U] + s[s.size() / 2U]) * 0.5F;
+            std::cout << "out16 bench rows " << rows << " projection " << projection << " output " << forms[arm]
+                      << " lowband " << (projection == 4U && arm == 0U ? 3U : 0U)
+                      << " median_us " << medians[arm] << " N " << n << '\n';
+        }
+        std::cout << "out16 speedup_vs_output3 " << medians[0] / medians[2] << " projection " << projection << '\n';
+    }
+    check(hipEventDestroy(a), "event destroy"); check(hipEventDestroy(b), "event destroy");
+}
+
 void fixtures_lowband(hipStream_t stream) {
-    for (const std::uint32_t rows : {8U, 32U, 480U, 511U, 512U, 513U, 544U, 1000U, 1032U, 4097U, 8191U, 8192U})
+    for (const std::uint32_t rows : {8U, 32U, 480U, 511U, 512U, 513U, 544U, 1000U, 1032U, 4097U, 8191U, 8192U, 8224U})
         for (const unsigned flavor : {0U, 3U}) compare_lowband(rows, true, flavor, stream);
     for (const std::uint32_t rows : {513U, 8192U})
         for (const unsigned flavor : {1U, 2U}) compare_lowband(rows, true, flavor, stream);
@@ -680,8 +822,17 @@ void fixtures_v3(hipStream_t stream) {
 }  // namespace
 
 int main() try {
+    const char* configured_rows = std::getenv("STRIX_HC_WIDE_BENCH_ROWS");
+    const auto pool_rows = configured_rows ? static_cast<std::uint32_t>(std::stoul(configured_rows)) : 8192U;
+    strix::reserve_hyper_mix_prefill_pools(std::max(8224U, pool_rows));
     hipStream_t stream = nullptr;
     check(hipStreamCreateWithFlags(&stream, hipStreamNonBlocking), "stream");
+    if (std::getenv("STRIX_HC_OUT16_FIXTURES_ONLY")) {
+        fixtures_out16(stream);
+        if (std::getenv("STRIX_HC_WIDE_BENCH")) bench_out16(stream);
+        check(hipStreamDestroy(stream), "stream");
+        return 0;
+    }
     // STRIX_HC_WIDE_LOWBAND_FIXTURES_ONLY=1: only the STRIX_QPF2K_HC_LOWBAND fixtures (then the bench if requested).
     if (std::getenv("STRIX_HC_WIDE_LOWBAND_FIXTURES_ONLY")) {
         fixtures_lowband(stream);

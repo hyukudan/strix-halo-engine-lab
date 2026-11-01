@@ -1,6 +1,8 @@
 #include "strix/batch_nested_prefill.hpp"
 #include "strix/hip_known_prefix_window.hpp"
 #include "strix/hip_qwen_rotary_table.hpp"
+#include "strix/hip_moe_q4k_a8_known_rows.hpp"
+#include "hip_prefill_pool.hpp"
 #include "strix/dispatch_fuse.hpp"
 #include "strix/qpf2k_defaults.hpp"
 #include "strix/hip_mtp_target_window.hpp"
@@ -218,7 +220,7 @@ struct HipKnownPrefixWindow::Impl {
     std::vector<ExecutionDispatchContext> gdn_commit_rows; // one row context per GDN layer (stable plan views)
     std::deque<ExecutionRuntimeResources> gdn_commit_resources; // owned copies: the window's are call-local
     std::unique_ptr<HipPleKnownWindow> ple_window;
-    std::vector<const void*> preflight_memo;
+    std::vector<const void*> preflight_memo, static_preflight_memo;
     std::vector<std::pair<const void*, std::array<std::uint64_t, 2>>> recipe_memo;
     std::vector<std::array<std::uintptr_t, 2>> preflight_slots;
     ArenaLookupIndex arena_index; // the immutable compiled window's arena views
@@ -311,6 +313,21 @@ struct HipKnownPrefixWindow::Impl {
             *resources.model_manifest, *resources.model_weights, *resources.tensor_access, actual_owner);
         validate_execution_memory_binding(execution_identity(), physical_arena(), scratch);
         validate_scope();
+        if (prefill) {
+            // The caller constructs the largest compiled T owner before tails. The
+            // device arena identifies the owner; never reserve on an unrelated device.
+            hipPointerAttribute_t attributes{};
+            check(hipPointerGetAttributes(&attributes, reinterpret_cast<const void*>(scratch.arena_base)),
+                "query prefill arena device");
+            if (attributes.device != hip_prefill_device())
+                throw std::invalid_argument("prefill setup requires the window's owning device");
+#if defined(STRIX_HAS_EXPERIMENTAL_Q4K_A8_RUNTIME)
+            moe_q4k_a8::known_rows::reserve_prefill_pools(prefill->logical_rows);
+#endif
+            reserve_hyper_mix_prefill_pools(prefill->logical_rows);
+            reserve_indexed_attention_prefill_pools(prefill->logical_rows,
+                original_state_layout.context_tokens, u32(model.indexer_compress_ratio), prefill->qsa_score_ring_workspace_bytes != 0U);
+        }
         const auto launcher_rows=prefill?1U:window.logical_rows;
         row_resources.resize(launcher_rows);
         catalogs.resize(launcher_rows);
@@ -1132,7 +1149,7 @@ struct HipKnownPrefixWindow::Impl {
         if(primary.gdn_deferred==gdn_deferred) return;
         gdn_deferred=primary.gdn_deferred;
         bind_deferred();
-        preflight_memo.clear(); recipe_memo.clear(); preflight_slots.clear();
+        preflight_memo.clear(); static_preflight_memo.clear(); recipe_memo.clear(); preflight_slots.clear();
     }
     void setup_head_rows() {
         if(!window.lm_head_rows_steps) return;
@@ -1431,8 +1448,8 @@ struct HipKnownPrefixWindow::Impl {
         throw std::invalid_argument("MTP target capture has no prepared plans on this actual known-window owner");
     }
     // Setup-time admission of the owner's own launch plans (see preflight_admission()).
-    void preflight_admission(SerialSessionContext session, std::span<const std::uint32_t> tokens) {
-        if (failed || prefill || executing || current_hip_launch_context() || tokens.size() != logical_rows())
+    void preflight_admission(SerialSessionContext session, std::span<const std::uint32_t> tokens, bool static_only=false) {
+        if (failed || (static_only ? (!prefill || !tokens.empty()) : (prefill || tokens.size() != logical_rows())) || executing || current_hip_launch_context())
             throw std::invalid_argument("known-window setup admission requires an idle closed window owner");
         struct ExecutionLease {
             bool& active;
@@ -1451,6 +1468,13 @@ struct HipKnownPrefixWindow::Impl {
             hooks.preflight_memo=&preflight_memo;hooks.recipe_memo=&recipe_memo;hooks.preflight_slots=&preflight_slots;
             hooks.arena_index=&arena_index;
             hooks.preflight_only = true;
+            if(static_only) {
+                hooks.static_preflight_only=true;
+                hooks.static_preflight_memo=&static_preflight_memo;
+                (void)execute_known_prefix_prefill_eager(*prefill,serial,resources,scratch,session,{},
+                    launch_plans.front(),r2_entries,rows_entries,hooks,prefill_entries);
+                return;
+            }
             (void)execute_known_prefix_window_eager(window, serial, resources, scratch, session, tokens,
                 std::span<const CompiledLaunchPlan* const>(launch_pointers), std::span<const KnownWindowR2Entry>(r2_entries),
                 std::span<const KnownWindowRowsEntry>(rows_entries), hooks);
@@ -2084,6 +2108,7 @@ struct HipKnownPrefixWindow::Impl {
                     if(detach && detach_shared(i,contexts)) return true;
                     return fold && fold_window_steps(i,contexts);
                 };
+            hooks.static_preflight_memo=&static_preflight_memo;
             hooks.skip_head=skip_head;
             hooks.partial_rows=partial;
             prefill_folded.clear();
@@ -2285,6 +2310,9 @@ KnownWindowResult HipKnownPrefixWindow::execute(SerialSessionContext& session, s
 }
 KnownWindowResult HipKnownPrefixWindow::execute(SerialSessionContext& session, std::span<const std::uint32_t> tokens) {
     return impl_->execute(session,tokens);
+}
+void HipKnownPrefixWindow::prepare_prefill_geometry(const SerialSessionContext& session) {
+    impl_->preflight_admission(session, {}, true);
 }
 void HipKnownPrefixWindow::preflight_admission(const SerialSessionContext& session, std::span<const std::uint32_t> tokens) {
     impl_->preflight_admission(session, tokens);

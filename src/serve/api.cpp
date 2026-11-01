@@ -494,6 +494,8 @@ struct ApiService::Impl {
             throw ApiError(400, "invalid_request_error", what + " is not supported by this server yet (see /v1/capabilities)", param);
         };
         const auto set = [&](const char* key) -> const Json* { const auto* v = body.find(key); return v && !v->is_null() ? v : nullptr; };
+        for (const char* key : {"prefill_exact_fp16", "prefill_disable"})
+            if (set(key)) refuse(key, "prefill identity overrides are server-level only");
         if (!allow_selection) {
             for (const char* key : {"presence_penalty", "frequency_penalty"})
                 if (const auto* v = set(key); v && (!v->is_number() || v->as_double() != 0.0)) refuse(key, key);

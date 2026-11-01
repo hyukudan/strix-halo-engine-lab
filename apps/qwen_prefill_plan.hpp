@@ -44,7 +44,11 @@ inline PrefillRequirements compile_prompt_requirements(const Options& options,
     }
     const auto pair = numerical_profile_pair(options);
     if (pair.split()) {
-        binding_request.prefill_arithmetic_identity = numerical_profile_pair_identity(pair);
+        if (numerical_profile_fast_prefill(pair.prefill))
+            binding_request.prefill_arithmetic_identity = prefill_arithmetic_identity(pair,
+                options.resolved_prefill_option_mask.value_or(resolve_prefill_options(
+                    [](const char* name) { return std::getenv(name); }, options.prefill_exact_fp16, options.prefill_disabled)),
+                qpf2k::has_gsq_gate(manifest));
         catalog_config.numerical_profile = pair.prefill;
         catalog_config.fast_prefill_components = pair.fast_components;
         kernels::KernelRegistry prefill_registry;
@@ -122,6 +126,8 @@ inline PrefillRequirements compile_prompt_requirements(const Options& options,
         collect_geometry(tail);
         result.tails = add(result.tails, add(add(tail.arena.physical.total_bytes, 65552U),tail.qsa_score_ring_workspace_bytes));
         result.metadata = add(result.metadata, add(tail.host_metadata_payload_bytes, tail.host_metadata_payload_bytes));
+        if (options.known_prefix_prefill_rows == 16384U)
+            result.metadata = add(result.metadata, static_cast<std::uint64_t>(tail.logit_row_indices.size()) * 2U * sizeof(std::uint32_t));
     }
     if (full_owners)
         append_yarn_owner_requirements(options,model,state,model_bytes,result,geometry);
@@ -174,6 +180,7 @@ inline PrefillRequirements compile_prompt_requirements(const Options& options,
         {"prefill_metadata_bytes",plan.host_metadata_payload_bytes},
         {"qsa_decode_pool_bytes",decode_pool},
         {"qsa_decode_pool_key_bytes",qsa_decode_pool_key_bytes(options, gsq)}});
+    if(plan.compact_qsa_output_savings) result.organization.emplace("compact_qsa_output_savings_per_row",plan.compact_qsa_output_savings);
     if(plan.terminal_logits_arena) result.organization.emplace("terminal_logits_arena",1U);
     if(plan.qsa_score_ring_workspace_bytes) {
         result.organization.emplace("qsa_score_ring_workspace_bytes",plan.qsa_score_ring_workspace_bytes);

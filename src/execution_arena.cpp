@@ -300,7 +300,7 @@ ExecutionArenaPlan build_serial_execution_arena_plan(
 namespace {
 KnownWindowArena build_known_rows_arena(
     const ExecutionArenaPlan& serial, std::uint64_t alignment, std::uint32_t logical_rows,
-    std::uint64_t external_qsa_score_bytes = 0, bool terminal_logits = false, bool materialize_views = true) {
+    std::uint64_t external_qsa_score_bytes = 0, bool terminal_logits = false, bool materialize_views = true, std::uint64_t compact_qsa_output_savings = 0) {
     if (!serial.alignment || !alignment || alignment % serial.alignment != 0 ||
         !serial.total_bytes || serial.allocations.empty()) {
         throw std::invalid_argument("known window requires a complete aligned serial arena");
@@ -339,8 +339,8 @@ KnownWindowArena build_known_rows_arena(
             throw std::invalid_argument("terminal arena requires exactly one logits generation");
     }
     for (auto& allocation : result.physical.allocations) {
-        if (external_qsa_score_bytes && allocation.use.buffer.buffer_class == ExecutionBufferClass::indexed_attention_workspace) {
-            const auto removed=align_up(external_qsa_score_bytes,alignment);
+        if ((external_qsa_score_bytes || compact_qsa_output_savings) && allocation.use.buffer.buffer_class == ExecutionBufferClass::indexed_attention_workspace) {
+            const auto removed=checked_add(external_qsa_score_bytes ? align_up(external_qsa_score_bytes,alignment) : 0U, compact_qsa_output_savings);
             if (allocation.bytes<=removed) throw std::invalid_argument("score-free QSA workspace is undersized");
             allocation.bytes-=removed;
         }
@@ -401,8 +401,8 @@ KnownWindowArena build_known_rows_arena(
             auto& allocation = result.row_view[row].allocations[i];
             allocation.offset = checked_add(physical.offset, static_cast<std::uint64_t>(row)*stride);
             allocation.bytes = terminal_use && row+1U!=logical_rows?0U:original->bytes;
-            if (external_qsa_score_bytes && allocation.use.buffer.buffer_class == ExecutionBufferClass::indexed_attention_workspace)
-                allocation.bytes-=align_up(external_qsa_score_bytes,alignment);
+            if ((external_qsa_score_bytes || compact_qsa_output_savings) && allocation.use.buffer.buffer_class == ExecutionBufferClass::indexed_attention_workspace)
+                allocation.bytes-=checked_add(external_qsa_score_bytes ? align_up(external_qsa_score_bytes,alignment) : 0U, compact_qsa_output_savings);
         }
     }
     return result;
@@ -417,10 +417,10 @@ KnownWindowArena build_known_window_arena(
 }
 KnownWindowArena build_known_prefill_arena(
     const ExecutionArenaPlan& serial,std::uint64_t alignment,std::uint32_t logical_rows,
-    std::uint64_t external_qsa_score_bytes, bool terminal_logits, bool materialize_views) {
+    std::uint64_t external_qsa_score_bytes, bool terminal_logits, bool materialize_views, std::uint64_t compact_qsa_output_savings) {
     if(logical_rows<16U||logical_rows>known_prefill_max_rows)
         throw std::invalid_argument("known prefill rows must be within "+known_prefill_rows_range());
-    return build_known_rows_arena(serial,alignment,logical_rows,external_qsa_score_bytes,terminal_logits,materialize_views);
+    return build_known_rows_arena(serial,alignment,logical_rows,external_qsa_score_bytes,terminal_logits,materialize_views,compact_qsa_output_savings);
 }
 
 namespace {

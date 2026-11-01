@@ -34,6 +34,11 @@ struct KnownWindowExecutionHooks {
     // Admission only: every check and preflight, the memo/slot updates, then return before the
     // lineage, PLE lookup or any launch. Nothing is enqueued and the session is not changed.
     bool preflight_only = false;
+    // Tiled owner setup: validate the immutable geometry and only token/position-independent
+    // launchers, using token zero without reading a prompt. Requires preflight_only and no
+    // partial rows. The separate memo never suppresses the first live PLE/QSA/token admission.
+    bool static_preflight_only = false;
+    std::vector<const void*>* static_preflight_memo = nullptr;
     // Metadata/config/resource owners cannot change via aliases during a call.
     std::function<void()> preflight_plan;
     std::function<void()> preflight_scope;

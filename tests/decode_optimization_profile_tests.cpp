@@ -234,7 +234,7 @@ void prefill_profile_contract() {
     validate_prefill_numerical_profile_cli(both); // tiled MTP prompt (serving route) admitted
     auto mtp_window_only = window_only; mtp_window_only.mtp.enabled = true;
     validate_prefill_numerical_profile_cli(mtp_window_only); // serial MTP prompt (no tiled blocks) admitted
-    const std::string_view exclusion_message = "prefill numerical profile excludes model copy tiers, final-state export, GDN islands, "
+    const std::string_view exclusion_message = "prefill numerical profile excludes model copy tiers, GDN islands, "
         "prepared/overlapped serial execution and MTP metadata diagnostics";
     for (int which = 0; which < 12; ++which) {
         // The same exclusions on the tiled route (and the MTP prompt), then on the tiled MTP prompt.
@@ -250,7 +250,8 @@ void prefill_profile_contract() {
         if (which == 8) excluded.gdn_islands = true;
         if (which == 9) excluded.prepared_eager = true;
         if (which == 10) excluded.moe_shared_overlap = true;
-        rejects([&] { validate_prefill_numerical_profile_cli(excluded); }, exclusion_message);
+        if (which == 1 || which == 7) validate_prefill_numerical_profile_cli(excluded);
+        else rejects([&] { validate_prefill_numerical_profile_cli(excluded); }, exclusion_message);
     }
     auto implicit = plain; implicit.numerical_profile_explicit = false;
     rejects([&] { validate_prefill_numerical_profile_cli(implicit); }, pair_message);
@@ -274,6 +275,13 @@ void prefill_profile_contract() {
         numerical_profile_fast_prefill(profile(fast)) && numerical_profile_dense_a8(profile(fast)) &&
         numerical_profile_hc_splitk(profile(fast)) && !numerical_profile_hc_deferred_norm(profile(fast)),
         "the fast prefill profile pairs with the dense-A8 split-K profile and mirrors its recipe predicates");
+    auto fast_mtp = all;
+    fast_mtp.mtp.enabled = true;
+    fast_mtp.resolved_prefill_option_mask = 1U;
+    rejects([&] { validate_prefill_numerical_profile_cli(fast_mtp); },
+        "MTP fast HC output WMMA is unqualified; use --prefill-disable hc_output_wmma");
+    fast_mtp.resolved_prefill_option_mask = 0U;
+    validate_prefill_numerical_profile_cli(fast_mtp);
     const auto hc_only = numerical_profile_pair(with_components(std::string(a8), "hc"));
     const auto dense_moe = numerical_profile_pair(with_components(std::string(a8), "moe,dense"));
     const auto spelled_all = numerical_profile_pair(with_components(std::string(a8), "dense,router,hc,qsa,moe"));

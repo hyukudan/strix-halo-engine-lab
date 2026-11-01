@@ -1,5 +1,6 @@
 #pragma once
 #include "strix/model_content_hash.hpp"
+#include "strix/prefill_identity.hpp"
 #include "strix/qpf2k_defaults.hpp"
 #include <map>
 #include <optional>
@@ -77,6 +78,7 @@ public:
         for(const auto& [name,value]:environment_) set(name,value);
         qpf2k::baseline=baseline_;qpf2k::defaulted_items=defaulted_;
         qpf2k::pre_injected=injected_;qpf2k::pre_injected_moe_marker=marker_;
+        detail::prefill_identity_override()=prefill_identity_;
     }
 private:
     static void set(const std::string& name,const std::string& value,bool erase=false) {
@@ -90,6 +92,7 @@ private:
     std::map<std::string,std::string> environment_;
     bool baseline_=qpf2k::baseline,marker_=qpf2k::pre_injected_moe_marker;
     unsigned defaulted_=qpf2k::defaulted_items,injected_=qpf2k::pre_injected;
+    detail::PrefillIdentityOverride prefill_identity_=detail::prefill_identity_override();
 };
 inline std::optional<int> retry_mtp_bundle_setup(const MtpBundleSetupRetry& state,
     const std::exception& error,const std::function<int()>& run) {

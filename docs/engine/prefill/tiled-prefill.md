@@ -89,6 +89,8 @@ GSQ checkpoints compile the legacy layout. `STRIX_QSA_SCORE_RING=0` and
 `STRIX_TERMINAL_LOGITS_ARENA=0` independently restore their legacy layouts;
 `STRIX_CTX_EXACT_MEMORY=0` disables both. With both off, physical plans,
 offsets, allocation sizes and printed byte receipts retain the legacy values.
+The eligible full-T owner also uses an exact [compact rounded QSA output](compact-stage-images.md);
+`STRIX_QPF2K_COMPACT_IMAGES=0` restores its FP32 containers independently.
 Admission and effective configuration use the compiler's arena and ring
 formula. GPU gates: the ring and stage split are byte-identical to the legacy
 layout in fixtures up to 262,144 blocks and in the 262,143-token QSA trace.
@@ -118,3 +120,37 @@ logical weight-byte/launch-saving totals are not populated for this new T route;
 zero in those legacy totals is not a measured traffic estimate. Full-model
 serial/chunk fidelity, native/compiler gates, memory peaks, TTFT and throughput
 remain to be assessed. No T size or speed gain is qualified by source admission.
+
+## Process scratch ownership
+
+Tiled Qwen prefill uses one process scheduler on one device. Construct the owner
+with the largest compiled call size T before smaller tail or cohort owners, and
+before submitting work. Setup checks the window arena's device and reserves the
+MoE A16/DA16 images, P1/DA16/core2 counters and CSR scratch, HC transposed lows,
+packed low16/overflow, inverses and norm16 to the 512-row-rounded maximum. T <= 8192 keeps
+the historical 8192-row extents. Pool metadata is protected by mutexes and retains
+the device ID; setup and execution reject another device. Larger owners may grow reservations
+at setup after draining previous consumers; execution never grows or replaces
+these pools. Smaller owners retain the high-water capacity and indexing stride.
+
+When QSA stage batching is enabled, setup also reserves both pinned descriptor
+slots, private RoPE tables and maxima slabs for the configured maximum T and
+session context. Group capacity remains the setup high-water mark through smaller
+calls. A mutex covers descriptor preparation through submission, and each ring
+slot's completion event covers its last reader, including deferred selection,
+before the next descriptor write. Allocation pressure or a later owner with mismatched capacity/compact policy
+declines the optional stage ring to the per-group path before any stage launch.
+The existing ring is never replaced.
+
+The mutexes protect host state; they do not authorize overlapping GPU consumers
+of shared scratch. The single scheduler must order scratch reuse through actual
+completion and retain the owners while work is pending. Direct operator fixtures
+must call the corresponding reservation API before their first submission.
+Poison hooks take the intended call rows, reserve first, and poison the retained
+image. The native MoE `pool16k` fixture compares full output digests for
+16384/8192/16384/1320 rows and checks that image generations survive submission.
+All T routes account for the reserved native pools in admission; optional
+normalized16 and unused A16/DA16 reservations are conservatively priced. See
+[reservation contract](../../optimizations.md#exact-bundle-control-and-reservation-contract).
+Host mock tests exercise reservation, device binding, growth, rejection and generation
+contracts without GPU work; they do not qualify native kernels or byte exactness.

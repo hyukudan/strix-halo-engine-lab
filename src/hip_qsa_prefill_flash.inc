@@ -412,6 +412,7 @@ __global__ __launch_bounds__(kSelectThreads) void select_one_kernel(float* score
 // rows and calls of the process (acc[kind]), so an OFF and an ON process can be compared on every QSA intermediate.
 template <unsigned Rows> struct TraceViews {
     const std::uint32_t* data[Rows];
+    bool compact[Rows]{};
     std::uint32_t count[Rows];
     std::uint64_t position[Rows];
 };
@@ -427,7 +428,7 @@ __global__ __launch_bounds__(256) void trace_kernel(TraceViews<Rows> views, std:
     __shared__ unsigned long long partial[256];
     const auto r = blockIdx.x, t = threadIdx.x;
     std::uint64_t h = 0;
-    for (std::uint32_t i = t; i < views.count[r]; i += 256U) h += mix64((static_cast<std::uint64_t>(views.data[r][i]) << 32U) | i);
+    for (std::uint32_t i = t; i < views.count[r]; i += 256U) h += mix64((static_cast<std::uint64_t>(views.compact[r] ? static_cast<unsigned>(reinterpret_cast<const std::uint16_t*>(views.data[r])[i]) << 16U : views.data[r][i]) << 32U) | i);
     partial[t] = h;
     __syncthreads();
     for (unsigned d = 128U; d > 0U; d >>= 1U) { if (t < d) partial[t] += partial[t + d]; __syncthreads(); }

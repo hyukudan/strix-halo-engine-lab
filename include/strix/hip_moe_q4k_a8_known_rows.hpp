@@ -140,13 +140,16 @@ bool prefill_da16_ran();
 bool prefill_clear_skipped();
 // True only after all three certificate producer specializations were enqueued for this call.
 bool prefill_certificate_produced();
-void prefill_test_poison_da16(hipStream_t stream);
+// Reserve once before any prefill submission; largest compiled T first, on its device.
+void reserve_prefill_pools(unsigned rows);
+std::array<std::uint64_t, 2> prefill_test_image_generations();
+void prefill_test_poison_da16(hipStream_t stream, unsigned rows);
 // qpf2k/moe-mi test hooks: STRIX_QPF2K_MOE_SMALL override (batches with <= rows assignments take the depth-3 body; 0 = off,
 // -1 = environment) and whether the last enqueue_prefill of this thread took that path.
 void set_prefill_small(int rows);
 bool prefill_small_ran();
 // qpf2k/moe-mi test hook: fills the FP16 prefill A image (MoE tune bit 4) with 0xa5 bytes, so a gate sees missing writes.
-void prefill_test_poison_a16(hipStream_t stream);
+void prefill_test_poison_a16(hipStream_t stream, unsigned rows);
 // True when the last enqueue_prefill of this thread fused the ordered merge into the down (STRIX_QPF2K_MOE bit 9): the caller
 // then launches enqueue_prefill_merge_check instead of its merge kernel (same accumulation, status and header bits).
 bool prefill_fused_merge();

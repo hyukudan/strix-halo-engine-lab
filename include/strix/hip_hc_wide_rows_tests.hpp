@@ -28,6 +28,7 @@ struct WideHyperRowsTestViews {
     bool output3_zero_low_rank_stride = false;  // bench-only output 7 / band 0 / projection skipped; outputs discarded
     unsigned low_band = UINT32_MAX;         // STRIX_QPF2K_HC_LOWBAND override 0..3 (projection 4, output 7, band 16); UINT32_MAX uses it
 };
+// Output form 14: qpf2k OUT16 (HCW2 arithmetic), paired with projection 4 or output-only 255.
 void enqueue_wide_hyper_rows_test(const HipHyperMixLauncherConfig& config, const WideHyperRowsTestViews& views,
     unsigned projection_kernel, unsigned output_kernel, hipStream_t stream);
 // The transposed low table the last lane-chain-output test call used (320 x 8192 FP32 values, layout per that call).

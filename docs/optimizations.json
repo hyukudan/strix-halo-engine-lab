@@ -1,6 +1,105 @@
 [
   {
     "engine": "qwen",
+    "name": "PLE staged-gather acceptance fix",
+    "flag_or_env": "Unconditional bug fix",
+    "default": "ON",
+    "exact": "Copy semantics and identities unchanged; every staged row ID checked, including consumed row 0. Native local CI passed launcher and staged-gather fixtures; staged versus unstaged gathered-byte comparison remains open and nonblocking.",
+    "gain": "Avoids redundant deferred copies after successful row-0 prefetch; no measured speed claim.",
+    "preconditions": "Existing stage candidate, reclaim, parallel, worker success, source, extent and slot/event guards remain.",
+    "off_switch": "None; correctness fix.",
+    "doc_anchor": "docs/optimizations.md#ple-staged-gather-acceptance-fix"
+  },
+  {
+    "engine": "qwen",
+    "name": "Exact compact QSA attention output",
+    "flag_or_env": "STRIX_QPF2K_COMPACT_IMAGES",
+    "default": "ON for eligible full-T score-ring owners",
+    "exact": "Already rounded BF16 bits, exact FP32 widening; unchanged numerical identity. Native local CI passed host/HIP fixtures and 32K last-row bitwise logit equality with compact images OFF. Seven-state-payload comparison open and nonblocking.",
+    "gain": "Calculated memory saving 96 MiB per T8192 owner; neutral within noise (OFF 19.95 s n=2 vs default 20.09 s); no speed gain claimed.",
+    "preconditions": "Full-T score-ring QSA entry, 256-byte arena alignment; decode, MTP, closed windows, capture and raw projection layouts retain FP32.",
+    "off_switch": "STRIX_QPF2K_COMPACT_IMAGES=0 before startup; other memory policies remain independent.",
+    "doc_anchor": "docs/optimizations.md#exact-compact-qsa-attention-output"
+  },
+  {
+    "engine": "qwen",
+    "name": "HC low-band layout",
+    "flag_or_env": "STRIX_QPF2K_HC_LOWBAND",
+    "default": "ON (3) through decoder qpf2k defaults",
+    "exact": "Same arithmetic chains; only addresses and unused stores change. Native local CI: 132/132 cases equal without stray stores, including eight T8224 cases; 32K last-row logits bitwise mode 3 == mode 0 with hc_output_wmma OFF.",
+    "gain": "Exact, bitwise-checked, no timing claim; inactive on the default hc_output_wmma route.",
+    "preconditions": "hc_output_wmma OFF only (exact-FP16 output route); projection form 4 to FP32 output v3 band 16 only; existing route guard retains all other layouts. Restart; baseline/defaults-off and injected GSQ suppression apply.",
+    "off_switch": "STRIX_QPF2K_HC_LOWBAND=0",
+    "doc_anchor": "docs/optimizations.md#hc-low-band-layout"
+  },
+  {
+    "engine": "qwen",
+    "name": "Indexer projection BF16 WMMA candidate",
+    "flag_or_env": "STRIX_PREFILL_INDEX_PROJ_WMMA; --prefill-disable index_proj_wmma; config prefill_disable",
+    "default": "OFF; opt in with STRIX_PREFILL_INDEX_PROJ_WMMA=1",
+    "exact": "Bit-changing idxproj16; outside READY pending compiler, native execution, model fidelity and complete-workload gates.",
+    "gain": "Pending qualification.",
+    "preconditions": "Fast indexer supported gfx1151 wave32 q/k layout; unsupported layouts retain exact arithmetic; MTP and nested excluded; server-level only.",
+    "off_switch": "STRIX_PREFILL_INDEX_PROJ_WMMA=0 / --prefill-disable index_proj_wmma / prefill_disable = [\"index_proj_wmma\"]; master exact switch",
+    "doc_anchor": "docs/optimizations.md#bit-changing-prefill-options"
+  },
+  {
+    "engine": "qwen",
+    "name": "Exact indexer projection batching",
+    "flag_or_env": "STRIX_QPF2K_INDEX_BATCH",
+    "default": "ON",
+    "exact": "Same FP32 chains and BF16 rounding; native local CI passed the index-batch fixture and 32K last-row bitwise logit equality with batching OFF.",
+    "gain": "No new local throughput claim.",
+    "preconditions": "Eligible ordinary prefill; baseline, GSQ and defaults=0 suppress independent default; explicit index rows OFF, index shape and side-stream mask suppress automatic batching.",
+    "off_switch": "STRIX_QPF2K_INDEX_BATCH=0",
+    "doc_anchor": "docs/optimizations.md#exact-indexer-projection-batching"
+  },
+  {
+    "engine": "qwen",
+    "name": "Automatic T16384 prefill",
+    "flag_or_env": "STRIX_QPF2K_T16K",
+    "default": "ON from 32768 prompt tokens",
+    "exact": "Native local CI: 32K last-row logits bitwise T16384/T8192. T16384 at 262K and memory-pressure fallback remain open and nonblocking.",
+    "gain": "Local CI three-round interleaved 32K medians: default 20.09 s vs T16384 OFF 20.34 s; measured gain, not additive.",
+    "preconditions": "Qualified automatic route; full UMA/GTT and native pool admission; decline to T8192 then smaller tiles. Exact 1 forces a trial from 16384.",
+    "off_switch": "STRIX_QPF2K_T16K=0",
+    "doc_anchor": "docs/optimizations.md#automatic-t16384-prefill"
+  },
+  {
+    "engine": "qwen",
+    "name": "Eager code-object loading",
+    "flag_or_env": "STRIX_EAGER_CODE_LOAD; --no-eager-code-load; config eager_code_load",
+    "default": "ON",
+    "exact": "Exact loading policy; native local CI passed 32K last-row bitwise logit equality with loading OFF.",
+    "gain": "Local CI three-round interleaved 32K medians: default 20.09 s vs OFF 20.07 s, neutral within noise; no speed gain claimed. Loading moves into startup.",
+    "preconditions": "Before first HIP call; never override a user-set HIP_ENABLE_DEFERRED_LOADING. Inspection reports effective value without HIP initialization.",
+    "off_switch": "STRIX_EAGER_CODE_LOAD=0 / --no-eager-code-load / eager_code_load = false",
+    "doc_anchor": "docs/optimizations.md#eager-code-object-loading"
+  },
+  {
+    "engine": "qwen",
+    "name": "HC output FP16 WMMA",
+    "flag_or_env": "STRIX_PREFILL_HC_OUTPUT_WMMA; --prefill-disable hc_output_wmma; config prefill_disable",
+    "default": "ON",
+    "exact": "hc_output_wmma passed a pre-declared confirmation held-out set; its NLL endpoint is measured against a rounding-equivalent control whose per-case movement is capped at +-0.02 nats/token (a bounded control allowance, not an unbiased estimate of the uncapped difference); the absolute NLL change vs the exact reference also passed (-0.37 % NLL/token, upper bound +0.38 %). The off switch restores the exact output path.",
+    "gain": "No new throughput claim.",
+    "preconditions": "Fast HC admitted wide shape, FP32 normalized rows and compatible output selector. Fast HC option excluded from MTP and nested admission pending qualification. Server-level only.",
+    "off_switch": "STRIX_PREFILL_HC_OUTPUT_WMMA=0 / --prefill-disable hc_output_wmma / prefill_disable = [\"hc_output_wmma\"]; master STRIX_PREFILL_EXACT_FP16=1 / --prefill-exact-fp16 / prefill_exact_fp16 = true",
+    "doc_anchor": "docs/optimizations.md#bit-changing-prefill-options"
+  },
+  {
+    "engine": "qwen",
+    "name": "Early tiled-prefill geometry setup",
+    "flag_or_env": "STRIX_QPF2K_EARLY_SETUP; --no-early-setup; config qpf2k_early_setup",
+    "default": "ON for eligible fresh plain-command full tiled blocks",
+    "exact": "Host admission order only; separate static memo retains first live token/position/PLE/QSA admission. CPU oracle and native local-CI 32K last-row bitwise logit check passed.",
+    "gain": "Local CI three-round interleaved 32K medians: default 20.09 s vs OFF 20.48 s; measured request-time gain, not additive; no process wall-time gain established.",
+    "preconditions": "Fresh CLI generation with a full configured tiled block; no MTP, HTTP, prefix cache, session restore or RTX state session. Partial blocks retain live geometry admission.",
+    "off_switch": "STRIX_QPF2K_EARLY_SETUP=0 / --no-early-setup / qpf2k_early_setup = false",
+    "doc_anchor": "docs/optimizations.md#early-tiled-prefill-geometry-setup"
+  },
+  {
+    "engine": "qwen",
     "name": "Cohort-gated calibrated joint plan rule",
     "flag_or_env": "STRIX_MTP_JOINT_PLAN; STRIX_MTP_JOINT_RULE_FILE",
     "default": "calibrated-c3 when STRIX_MTP_BATCH_JOINT=1: calibrated at >=3 members, production at 1-2",
@@ -263,7 +362,7 @@
     "default": "1",
     "exact": "The qualification campaign compared 1K code and 8K prose receipts, terminal FP32 logits FNV and generated tokens against the unchanged reference. Repeat with the same prefill/decode identity; changing arithmetic profiles is a separate quality comparison. Stage-batching qualification additionally compared terminal logits and 1K code/8K prose receipts.",
     "gain": "Stage batching: 32K mean -0.39 s (-1.7%); published-build ABBA -0.17 s; 64K -1.6%",
-    "preconditions": "Stage batching requires mask bits 0x3 as well as 0x200; normal eager prefill, 1..128 complete 64-row groups with no partial tiles, grouped norm enabled, BF16 KV and pooled-key storage. Index geometry is four heads of dimension 128, 16-byte aligned queries and prefixes bounded by pool capacity and 65536 blocks. The norm tensors share a weight format, have power-of-two dimensions 2..256, and admit the rotary geometry (half rotary dimension <=64). Rows need contiguous positions and common raw/KV owners, geometry, norm owners, journal, compression ratio and top-k. Private device tables/maxima and pinned descriptors must allocate before any launch/state write. Windows, cohorts, graphs, int8 KV, explicit tiled diagnostics and self-check modes keep their existing paths.",
+    "preconditions": "Stage batching requires mask bits 0x3 as well as 0x200; normal eager prefill, 1..256 complete 64-row groups with no partial tiles, grouped norm enabled, BF16 KV and pooled-key storage. Index geometry is four heads of dimension 128, 16-byte aligned queries and prefixes bounded by pool capacity and 65536 blocks. The norm tensors share a weight format, have power-of-two dimensions 2..256, and admit the rotary geometry (half rotary dimension <=64). Rows need contiguous positions and common raw/KV owners, geometry, norm owners, journal, compression ratio and top-k. Private device tables/maxima and pinned descriptors must allocate before any launch/state write. Windows, cohorts, graphs, int8 KV, explicit tiled diagnostics and self-check modes keep their existing paths.",
     "off_switch": "STRIX_QPF2K_QSA=0",
     "doc_anchor": "docs/optimizations.md#qwen-qsa"
   },
@@ -274,7 +373,7 @@
     "default": "0x2257",
     "exact": "The qualification campaign compared 1K code and 8K prose receipts, terminal FP32 logits FNV and generated tokens against the unchanged reference. Repeat with the same prefill/decode identity; changing arithmetic profiles is a separate quality comparison. Stage-batching qualification additionally compared terminal logits and 1K code/8K prose receipts. Attend occupancy (bit 13): its kernel copy is byte-compared with the production attend kernel in 460 fixture cases (single and multiple 64-row groups, causal/visible tails, padded union chunks); terminal logits FNV and tokens equal at 4K, 17.7K, 32K and 131K.",
     "gain": "Stage batching: 32K mean -0.39 s (-1.7%); published-build ABBA -0.17 s; 64K -1.6%; attend occupancy: 8192-row attend -8..-17 %, TTFT 32K 22.17 -> 22.03 s, 131K 95.40 -> 93.89 s (-1.5 %)",
-    "preconditions": "Stage batching requires mask bits 0x3 as well as 0x200; normal eager prefill, 1..128 complete 64-row groups with no partial tiles, grouped norm enabled, BF16 KV and pooled-key storage. Index geometry is four heads of dimension 128, 16-byte aligned queries and prefixes bounded by pool capacity and 65536 blocks. The norm tensors share a weight format, have power-of-two dimensions 2..256, and admit the rotary geometry (half rotary dimension <=64). Rows need contiguous positions and common raw/KV owners, geometry, norm owners, journal, compression ratio and top-k. Private device tables/maxima and pinned descriptors must allocate before any launch/state write. Windows, cohorts, graphs, int8 KV, explicit tiled diagnostics and self-check modes keep their existing paths.",
+    "preconditions": "Stage batching requires mask bits 0x3 as well as 0x200; normal eager prefill, 1..256 complete 64-row groups with no partial tiles, grouped norm enabled, BF16 KV and pooled-key storage. Index geometry is four heads of dimension 128, 16-byte aligned queries and prefixes bounded by pool capacity and 65536 blocks. The norm tensors share a weight format, have power-of-two dimensions 2..256, and admit the rotary geometry (half rotary dimension <=64). Rows need contiguous positions and common raw/KV owners, geometry, norm owners, journal, compression ratio and top-k. Private device tables/maxima and pinned descriptors must allocate before any launch/state write. Windows, cohorts, graphs, int8 KV, explicit tiled diagnostics and self-check modes keep their existing paths.",
     "off_switch": "STRIX_QPF2K_QSA_MASK=0",
     "doc_anchor": "docs/optimizations.md#qwen-qsa"
   },

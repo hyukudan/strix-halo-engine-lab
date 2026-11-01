@@ -1,5 +1,7 @@
 #pragma once
 #include "qwen_yarn_memory.hpp"
+
+#include "strix/compact_stage_images.hpp"
 #include "hip_decode_options.hpp"
 #include "known_prefill_reservation.hpp"
 #include "qwen_moe_route_bf16.hpp"
@@ -7,6 +9,7 @@
 #include "qwen_prefill_external_memory.hpp"
 #include "strix/known_prefix_prefill.hpp"
 #include "strix/ctx_exact_memory.hpp"
+#include "strix/q51_known_rows.hpp"
 #include "strix/linux_uma_observation.hpp"
 #include "strix/uma_owner_inventory.hpp"
 #include <map>
@@ -21,6 +24,7 @@
 namespace strix::decode_cli {
 using Environment = std::map<std::string, std::string>;
 enum class OptionSource { explicit_value, automatic, baseline };
+inline constexpr std::size_t t16k_prompt_threshold = 32768U;
 struct RequestedOptions {
     Options options;
     Environment environment;
@@ -69,6 +73,7 @@ inline void validate_http_serving_memory(const Options& o,const PrefillMemory& m
 }
 struct EffectiveConfig {
     Options options;
+    unsigned prefill_option_mask = 0U;
     OptimizationProfileResolution organization;
     Environment environment;
     std::map<std::string, OptionSource> sources;
@@ -76,6 +81,8 @@ struct EffectiveConfig {
     std::string arithmetic_fallback;
     std::string tile_fallback;
     std::string serve_prefill_notice;
+    // Present only when T16384 is tried; older/smaller-route receipts stay frozen.
+    std::optional<OptionSource> t16k_policy_source;
     std::string error;
     std::uint64_t ple_reclaim_credit = 0;
     std::uint64_t ple_rolling_h = 0, ple_rolling_bound = 0, ple_rolling_cap = 0;
@@ -121,10 +128,10 @@ inline Environment requested_prefill_environment(Get get) {
             "STRIX_KNOWN_PREFIX_WINDOW", "STRIX_KNOWN_PREFIX_FULL_ROWS", "STRIX_KNOWN_PREFIX_EXPERT_UNION",
             "STRIX_KNOWN_WINDOW_ROUTER_ROWS", "STRIX_KNOWN_PREFIX_PREFILL_ROWS",
             "STRIX_RTX_EXPORT_STATE", "STRIX_QRTX_STEP_DUMP", "STRIX_PROMPT_BATCH_ROWS", "STRIX_PREFILL_LOGITS_DIGEST",
-            "STRIX_MODEL_COPY_ALL", "STRIX_PLE_RECLAIM_DECODE_BYTES",
+            "STRIX_PREFILL_EXACT_FP16", "STRIX_QPF2K_T16K", "STRIX_MODEL_COPY_ALL", "STRIX_PLE_RECLAIM_DECODE_BYTES",
             "STRIX_QSA_UNION_MERGE", "STRIX_QSA_SCORE_ROWS64", "STRIX_QSA_POOL_PACKED", "STRIX_QSA_DECODE_POOL",
             "STRIX_QSA_DECODE_SELECT", "STRIX_QSA_DECODE_POOL_BF16", "STRIX_QSA_DECODE_POOL_CHECK", "STRIX_PREFILL_MOE_MERGE_VEC",
-            "STRIX_CTX_EXACT_MEMORY", "STRIX_QSA_SCORE_RING", "STRIX_QSA_SCORE_RING_ROWS", "STRIX_TERMINAL_LOGITS_ARENA",
+            "STRIX_QPF2K_COMPACT_IMAGES", "STRIX_QPF2K_INDEX_BATCH", "STRIX_EAGER_CODE_LOAD", "HIP_ENABLE_DEFERRED_LOADING", "STRIX_QPF2K_EARLY_SETUP", "STRIX_CTX_EXACT_MEMORY", "STRIX_QSA_SCORE_RING", "STRIX_QSA_SCORE_RING_ROWS", "STRIX_TERMINAL_LOGITS_ARENA",
             "STRIX_SESSION_CACHE", "STRIX_SESSION_DISK", "XDG_CACHE_HOME", "HOME",
             "STRIX_PREFIX_BATCH_CERT", "STRIX_QWEN_YARN_MTP", "STRIX_QWEN_YARN_HOST_RESERVE", "STRIX_PLE_ROLLING_CAP_BYTES", "STRIX_PLE_ROLLING", "STRIX_PLE_ROLLING_POSITIONS", "STRIX_PREFIX_CACHE", "STRIX_PREFIX_CACHE_RETENTION",
             "STRIX_PREFIX_CACHE_INFLIGHT", "STRIX_PREFIX_CACHE_DISK", "STRIX_PREFIX_CACHE_DURABLE",
@@ -137,6 +144,8 @@ inline Environment requested_prefill_environment(Get get) {
     // OFF keeps the complete historical inspection image, including its environment map.
     for(const char* name:{"STRIX_QSA_MTP_POOL","STRIX_QSA_MTP_POOL_CHECK","STRIX_MTP_LOGITS_DIGEST","STRIX_MTP_STEP_LOGITS_DIGEST"})
         if(const char* value=get(name); value && value[0]!='0') env.emplace(name,value);
+    for (const auto& option : kPrefillOptions)
+        if (const char* value = get(option.env.data())) env.emplace(option.env, value);
     return env;
 }
 inline Environment requested_prefill_environment() {
@@ -174,6 +183,68 @@ inline void account_http_registered_target(PrefillRequirements& result,const Opt
     result.device_base=prefill_checked_add(result.device_base,committed);
     result.organization["target_mapped_file_bytes"]=file_bytes;
     result.organization["target_registered_backing_bytes"]=committed;
+}
+inline std::uint64_t prefill_checked_multiply(std::uint64_t a, std::uint64_t b) {
+    if (b && a > UINT64_MAX / b) throw std::overflow_error("prefill reservation overflow");
+    return a * b;
+}
+struct PrefillNativePools {
+    std::uint64_t host = 0, device = 0, mapped = 0;
+    std::map<std::string, std::uint64_t> bytes;
+};
+// Canonical single-stream prompt route. Price cached high-water capacities and
+// allocation replacement peaks, independently of reclaimable model backing.
+inline PrefillNativePools prefill_native_pools(const Options& o, const ModelContract& m) {
+    PrefillNativePools result;
+    const auto add = prefill_checked_add, mul = prefill_checked_multiply;
+    const std::uint64_t t = known_prefill_pool_rows(o.known_prefix_prefill_rows);
+    const auto charge = [&](const char* name, std::uint64_t bytes, bool device = true, bool mapped = false) {
+        result.bytes.emplace(name, bytes);
+        auto& total = device ? result.device : result.host;
+        total = add(total, bytes);
+        if (mapped) result.mapped = add(result.mapped, bytes); // alias: GTT only, never a second UMA charge
+    };
+    charge("native_moe_a16_da16", mul(t, 2U * (2560U + 10U * 640U)));
+    const auto counters = mul(2U * (t * 10U / 64U + 1024U) + t * 16U + 64U +
+        514U + (t * 10U + 2047U) / 2048U * 512U, 4U);
+    charge("native_moe_counters_csr", counters);
+    std::uint64_t csr = q51_known_rows::prefill_scratch_bytes(o.known_prefix_prefill_rows, 512U, 10U);
+    for (const auto rows : o.known_prefix_tail_rows)
+        csr = add(csr, q51_known_rows::prefill_scratch_bytes(rows, 512U, 10U));
+    charge("native_moe_owner_csr", mul(csr, 2U)); // full owners plus a merged partial union
+    charge("native_hc_fold", mul(t, 42240U));
+    charge("native_hc_lows_packs_inverse", add(mul(t, 320U * 6U + 4U * 4U), 2U * 2U * 320U * 10240U + 256U));
+    charge("native_hc_norm16", mul(t, (10240U + 64U) * 2U)); // optional, conservatively reserved
+    // Setup replaces one scratch allocation at a time after draining readers.
+    // The largest old pool (normalized16) can coexist with its replacement.
+    charge("native_setup_growth_peak", mul(t, (10240U + 64U) * 2U));
+    charge("native_gdn_core16", mul(t, (6144U + 64U) * 2U));
+    charge("native_shared_pre", mul(t, (640U + 64U) * 2U));
+    // Two maximum-width tiled operand images; preserve each launch's <4 GiB guards.
+    charge("native_dense_operands", mul(t, 2U * (10240U + 64U) * 2U));
+    std::uint64_t ple_rows = o.known_prefix_prefill_rows;
+    for (const auto rows : o.known_prefix_tail_rows) ple_rows = add(ple_rows, rows);
+    charge("native_ple_staging", mul(ple_rows, 2U * PleHashContract::maximum_heads * 512U), false, true);
+    charge("native_ple_hashes", mul(ple_rows, sizeof(PleHashResult)), false);
+    charge("native_ple_projections_gates", mul(ple_rows, add(mul(m.hidden_size, m.hc_count + 1U), m.hc_count) * 4U));
+    const auto conv = mul(mul(mul(m.hidden_size, m.hc_count), m.ple_conv_kernel_size - 1U), m.ngram_size * m.bytes_bf16);
+    charge("native_ple_snapshots", mul(conv, o.known_prefix_tail_rows.size() + 1U));
+    // Each PLE owner retains its packed slab; one replacing allocation can coexist.
+    charge("native_ple_packed_peak", mul(add(ple_rows, o.known_prefix_prefill_rows), mul(m.ple_embed_dim, 4U)));
+    const auto groups = known_prefill_stage_groups(o.known_prefix_prefill_rows);
+    if (!m.indexer_compress_ratio) throw std::invalid_argument("prefill indexer ratio is zero");
+    const auto blocks = o.context_tokens / m.indexer_compress_ratio;
+    // Two fixed ring slots; retain the historical third-slab admission margin.
+    charge("native_qsa_maxima_peak", mul(mul(3U * t, (blocks + 3U) / 4U), 4U));
+    charge("native_qsa_tables", mul(2U * groups, 64U * 64U * 8U));
+    // Includes two pinned slots plus the temporary preparation vectors. HIP asserts
+    // the descriptor sum fits this per-group upper bound.
+    charge("native_qsa_descriptors", mul(3U * groups, 20480U), false, true);
+    charge("native_qsa_keys_ranges", mul(blocks, m.indexer_head_dim * 4U + 8U));
+    // Residual packs, driver and small host vectors; replaces the old 4 GiB
+    // catch-all. None of the explicitly priced pools above are paid from it.
+    charge("native_residual", UINT64_C(1) << 30U);
+    return result;
 }
 // Predict only the route's reclaim credit. Runtime still verifies the drop and
 // admits allocations against the actual credit, including zero on setup failure.
@@ -326,6 +397,37 @@ inline void select_mtp_bundle_golden(Options& options, const ModelContract& mode
     const auto cached=std::filesystem::is_regular_file(shipped)?shipped:mtp_golden_cache_dir()/(identity+".golden");
     options.mtp.golden=std::filesystem::is_regular_file(cached)?cached.string():std::string{};
 }
+inline EffectiveConfig initialize_prefill_config(const RequestedOptions& request) {
+    EffectiveConfig result;
+    result.options = request.options;
+    result.environment = request.environment;
+    const bool exact_defaults = !request.options.baseline && !env_is(request.environment, "STRIX_BASELINE", "1") &&
+        !(request.environment.contains("STRIX_QPF2K_DEFAULTS") && request.environment.at("STRIX_QPF2K_DEFAULTS").starts_with('0'));
+    if (!exact_defaults) result.environment["STRIX_QPF2K_COMPACT_IMAGES"] = "0";
+    const auto enabled = [&](const char* name) {
+        const auto it = request.environment.find(name);
+        return it == request.environment.end() || !it->second.starts_with('0');
+    };
+    result.options.early_setup = exact_defaults && request.options.early_setup && enabled("STRIX_QPF2K_EARLY_SETUP");
+    result.options.eager_code_load = exact_defaults && request.options.eager_code_load && enabled("STRIX_EAGER_CODE_LOAD");
+    if (result.options.eager_code_load && !result.environment.contains("HIP_ENABLE_DEFERRED_LOADING"))
+        result.environment["HIP_ENABLE_DEFERRED_LOADING"] = "0";
+    result.prefill_option_mask = resolve_prefill_options([&](const char* name) -> const char* {
+        const auto it = result.environment.find(name);
+        return it == result.environment.end() ? nullptr : it->second.c_str();
+    }, result.options.prefill_exact_fp16, result.options.prefill_disabled);
+    // Automatic YaRN MTP profiles and verified bundles retain upstream arithmetic.
+    // Governed candidates remain excluded until their MTP gates pass.
+    if (result.options.mtp.enabled && (!result.options.mtp_bundle_path.empty() ||
+        (result.options.rotary.mode() == RotaryMode::yarn && !result.options.prefill_numerical_profile))) {
+        const auto excluded = prefill_option_bit(PrefillOption::hc_output_wmma) |
+            prefill_option_bit(PrefillOption::index_proj_wmma);
+        result.options.prefill_disabled |= excluded;
+        result.prefill_option_mask &= ~excluded;
+    }
+    result.options.resolved_prefill_option_mask = result.prefill_option_mask;
+    return result;
+}
 #include "qwen_yarn_admission.inc"
 
 // Test proposed exports against the actual YaRN environment admission before
@@ -352,12 +454,11 @@ inline EffectiveConfig resolve_prefill_effective_config(const RequestedOptions& 
     if (request.options.rotary.mode() == RotaryMode::yarn && !request.options.baseline &&
         !env_is(request.environment, "STRIX_BASELINE", "1"))
         return resolve_yarn_config(request, model, info, manifest, verified_content, capabilities, memory);
-    EffectiveConfig result;
-    result.options = request.options;
+    auto result = initialize_prefill_config(request);
     result.options.ple_rolling_explicit_opt_in=env_is(request.environment,"STRIX_PLE_ROLLING","1");
     result.options.qsa_mtp_pool_explicit_opt_in=env_is(request.environment,"STRIX_QSA_MTP_POOL","1");
     result.gsq_owner = qpf2k::has_gsq_gate(manifest);
-    result.environment = request.environment;
+    if (!env_is(result.environment, "STRIX_QPF2K_T16K", "1")) result.environment.erase("STRIX_QPF2K_T16K");
     for (const auto& name : request.options.supplied_options) result.sources[name] = OptionSource::explicit_value;
     auto& o = result.options;
     const bool baseline = o.baseline || env_is(request.environment, "STRIX_BASELINE", "1");
@@ -413,6 +514,27 @@ inline EffectiveConfig resolve_prefill_effective_config(const RequestedOptions& 
         auto validation_organization = result.organization;
         apply_numerical_profile(o, model, manifest, verified_content, capabilities.a8_runtime, validation_organization);
         if (!http_prefill_pending(o)) validate_effective_options(o, model);
+        if (o.known_prefix_prefill_rows) {
+            auto pool_options = o;
+            if (const auto group = result.environment.find("STRIX_PROMPT_BATCH_ROWS"); group != result.environment.end()) {
+                const auto rows = std::strtoull(group->second.c_str(), nullptr, 10);
+                if (rows > known_prefill_max_rows || (rows && rows % 8U))
+                    throw std::invalid_argument("STRIX_PROMPT_BATCH_ROWS must be a multiple of 8 up to 16384");
+                if (rows > o.known_prefix_prefill_rows) {
+                    // The group owner coexists with the original main owner.
+                    pool_options.known_prefix_tail_rows.push_back(o.known_prefix_prefill_rows);
+                    pool_options.known_prefix_prefill_rows = static_cast<std::uint32_t>(rows);
+                }
+            }
+            const auto pools = prefill_native_pools(pool_options, model);
+            result.host_compilation.insert(pools.bytes.begin(), pools.bytes.end());
+            result.host_compilation["native_host_bytes"] = pools.host;
+            result.host_compilation["native_device_bytes"] = pools.device;
+            result.host_compilation["native_gtt_bytes"] = prefill_checked_add(pools.device, pools.mapped);
+            if (o.known_prefill_host_headroom < prefill_checked_add(pools.host, pools.device))
+                result.error = "known prefill native pools exceed --known-prefix-host-headroom-bytes; required " +
+                    std::to_string(prefill_checked_add(pools.host, pools.device));
+        }
         if (result.reason == "prompt-exceeds-model-context")
             result.error = "Qwen auto-prefill declined: prompt-exceeds-model-context (prompt + generation exceeds " +
                 std::to_string(model.max_position_embeddings) + ")";
@@ -473,6 +595,12 @@ inline EffectiveConfig resolve_prefill_effective_config(const RequestedOptions& 
         candidate.known_prefix_output_policy = KnownWindowOutputPolicy::terminal_row;
         for (const auto rows : {8192U,4096U,2048U,1024U,256U,64U,16U})
             if (rows <= candidate.tokens.size()) { candidate.known_prefix_prefill_rows = rows; break; }
+        const bool explicit_t16k = env_is(request.environment, "STRIX_QPF2K_T16K", "1");
+        if (candidate.tokens.size() >= 16384U && (explicit_t16k ||
+            (!request.environment.contains("STRIX_QPF2K_T16K") && candidate.tokens.size() >= t16k_prompt_threshold))) {
+            candidate.known_prefix_prefill_rows = 16384U;
+            result.t16k_policy_source = explicit_t16k ? OptionSource::explicit_value : OptionSource::automatic;
+        }
         if (!o.context_explicit) {
             const auto needed = prefill_checked_add(static_cast<std::uint64_t>(o.tokens.size()), std::max(o.generate_tokens, UINT64_C(512)));
             candidate.context_tokens = std::min(model.max_position_embeddings,
@@ -503,6 +631,7 @@ inline EffectiveConfig resolve_prefill_effective_config(const RequestedOptions& 
         const auto credit = prefill_reclaim_credit(candidate, model, manifest, request.environment, memory.ple_reclaim_page,
             &rolling_h, &rolling_bound, &rolling_cap);
         std::vector<std::uint32_t> trials{primary_rows};
+        if (primary_rows == 16384U) trials.push_back(8192U);
         for (const auto rows : {4096U,2048U}) if (rows < primary_rows) trials.push_back(rows);
         std::string failed_reason = "insufficient-memory";
         for (const auto rows : trials) {
@@ -518,6 +647,19 @@ inline EffectiveConfig resolve_prefill_effective_config(const RequestedOptions& 
                     result.environment.at("STRIX_QPF2K_SCHED").c_str() : "12");
                 if (candidate.known_prefix_ladder_tail_rows.empty())
                     candidate.known_prefix_ladder_tail_rows = candidate.known_prefix_tail_rows;
+                if (rows == 16384U) {
+                    // Compile under the UMA ceiling, then replace these sizing
+                    // bounds with the actual main+tail requirements below.
+                    candidate.known_prefill_workspace_budget = uma;
+                    candidate.known_prefill_metadata_budget = uma;
+                    const auto pools = prefill_native_pools(candidate, model);
+                    candidate.known_prefill_host_headroom = prefill_checked_add(pools.host, pools.device);
+                }
+                if (rows != 16384U) {
+                    const auto pools = prefill_native_pools(candidate, model);
+                    candidate.known_prefill_host_headroom = std::max(candidate.known_prefill_host_headroom,
+                        prefill_checked_add(pools.host, pools.device));
+                }
                 validate_known_prefill_options(candidate);
                 validate_numerical_profile_cli(candidate);
                 validate_prefill_numerical_profile_cli(candidate);
@@ -535,6 +677,28 @@ inline EffectiveConfig resolve_prefill_effective_config(const RequestedOptions& 
                     required = memory.estimate(candidate);
                 }
                 const auto add = prefill_checked_add;
+                std::uint64_t native_gtt = 0;
+                if (rows == 16384U) {
+                    candidate.known_prefill_workspace_budget = add(required.workspace, required.tails);
+                    candidate.known_prefill_metadata_budget = required.metadata;
+                    const auto pools = prefill_native_pools(candidate, model);
+                    native_gtt = add(pools.device, pools.mapped);
+                    required.organization.insert(pools.bytes.begin(), pools.bytes.end());
+                    required.organization["native_host_bytes"] = pools.host;
+                    required.organization["native_device_bytes"] = pools.device;
+                    required.organization["native_gtt_bytes"] = native_gtt;
+                    required.organization["prefill_workspace_with_tails_bytes"] = candidate.known_prefill_workspace_budget;
+                    required.organization["prefill_metadata_copies_bytes"] = required.metadata;
+                }
+                if (rows != 16384U) {
+                    const auto pools = prefill_native_pools(candidate, model);
+                    native_gtt = add(pools.device, pools.mapped);
+                    candidate.known_prefill_host_headroom = std::max(candidate.known_prefill_host_headroom, add(pools.host, pools.device));
+                    required.organization.insert(pools.bytes.begin(), pools.bytes.end());
+                    required.organization["native_host_bytes"] = pools.host;
+                    required.organization["native_device_bytes"] = pools.device;
+                    required.organization["native_gtt_bytes"] = native_gtt;
+                }
                 auto live = UmaOwnerInventory{};
                 live.reservation_upper_bound_bytes = add(required.model_backing - std::min(required.model_backing, credit),
                     add(required.state_d1, required.serial_scratch));
@@ -544,7 +708,7 @@ inline EffectiveConfig resolve_prefill_effective_config(const RequestedOptions& 
                     add(required.metadata, add(required.tails, candidate.known_prefill_host_headroom))));
                 if (!required.workspace || !required.metadata || add(required.workspace, required.tails) > candidate.known_prefill_workspace_budget ||
                     required.metadata > candidate.known_prefill_metadata_budget || *memory.gtt_used > *memory.gtt_limit ||
-                    add(required.device_base, add(required.workspace, required.tails)) > *memory.gtt_limit - *memory.gtt_used)
+                    add(required.device_base, add(add(required.workspace, required.tails), native_gtt)) > *memory.gtt_limit - *memory.gtt_used)
                     throw std::runtime_error("insufficient-memory");
                 if (add(add(live.reservation_upper_bound_bytes, growth), required.runtime_payload) > uma)
                     throw std::runtime_error("insufficient-memory");
@@ -578,7 +742,7 @@ inline EffectiveConfig resolve_prefill_effective_config(const RequestedOptions& 
                 if (rows == 2048U && rows != primary_rows) result.sources["--known-prefix-tail-rows"] = OptionSource::automatic;
                 result.options = std::move(candidate);
                 result.organization = std::move(organization);
-                result.reason = "qualified-prompt";
+                result.reason = rows == 16384U ? (explicit_t16k ? "opt-in-t16k" : "automatic-t16k") : "qualified-prompt";
                 result.admitted = true;
                 inject(~0U);
                 return result;
@@ -1375,6 +1539,9 @@ inline std::string effective_config_notice(const EffectiveConfig& config) {
         std::string line = "Qwen auto-prefill: automatic T" + std::to_string(config.options.known_prefix_prefill_rows) +
             " context=" + std::to_string(config.options.context_tokens);
         line += "; reason=" + config.reason;
+        if (config.t16k_policy_source)
+            line += "; T16384 policy=" + std::string(*config.t16k_policy_source == OptionSource::automatic ? "automatic" : "explicit") +
+                " threshold=" + std::to_string(t16k_prompt_threshold);
         if (!config.tile_fallback.empty()) line += "; " + config.tile_fallback;
         if (config.options.context_tokens > 8192U)
             line += "; unqualified-context (beyond qualified 8192; " +
@@ -1390,6 +1557,9 @@ inline std::string effective_config_notice(const EffectiveConfig& config) {
 inline std::vector<std::string> effective_prefill_argv(const Options& o) {
     std::vector<std::string> args{"--context", std::to_string(o.context_tokens)};
     if (o.rotary.mode() == RotaryMode::yarn) args.insert(args.end(), {"--rope-yarn",std::to_string(o.rotary.factor())});
+    if (o.prefill_exact_fp16) args.emplace_back("--prefill-exact-fp16");
+    for (unsigned i = 0; i < kPrefillOptions.size(); ++i)
+        if (o.prefill_disabled & (1U << i)) args.insert(args.end(), {"--prefill-disable", std::string(kPrefillOptions[i].name)});
     if (o.unqualified_context) args.emplace_back("--unqualified-context");
     args.insert(args.end(), {"--execution-mode", o.execution.mode == DecodeExecutionMode::eager ? "eager" : "graph",
         "--residency", o.residency == HipModelResidencyMode::registered_file_mapping ? "register" : "copy",
@@ -1566,6 +1736,7 @@ inline std::string effective_config_json(const EffectiveConfig& config) {
     }
     if (!o.baseline) out << "\"prefix_cache\":" << prefix.dump() << ",";
     out << "\"cache_policy\":" << cache_activation_json(o).dump() << ",";
+    out << prefill_identity_fields(config.prefill_option_mask) << ",";
     out << "\"session_cache\":" << session.dump() << ",\"http_slots\":{";
     out << "\"mode\":\"" << (o.http_batch_explicit ? (o.http_batch_cap ? "cap" : "single") : "auto")
         << "\",\"cap\":" << o.http_batch_cap << ",\"slots\":";
@@ -1668,7 +1839,27 @@ inline std::string effective_config_json(const EffectiveConfig& config) {
     item("STRIX_QSA_DECODE_SELECT", select_off, true);
     item("STRIX_QSA_DECODE_POOL_BF16", bf16_off, true);
     item("STRIX_PREFILL_MOE_MERGE_VEC", qpf2k::long_context_item_suppression("STRIX_PREFILL_MOE_MERGE_VEC", config.gsq_owner), false);
-    out << "},\"qsa_decode_pool_key_bytes\":" << (pool_off ? 0U : qsa_decode_pool_key_bytes(o, config.gsq_owner)) << "}\n";
+    out << "},\"qsa_decode_pool_key_bytes\":" << (pool_off ? 0U : qsa_decode_pool_key_bytes(o, config.gsq_owner));
+    if (config.t16k_policy_source)
+        out << ",\"t16k_policy\":{\"source\":\"" << (*config.t16k_policy_source == OptionSource::automatic ? "automatic" : "explicit")
+            << "\",\"threshold_tokens\":" << t16k_prompt_threshold << '}';
+    const auto index_batch = qpf2k::index_batch_enabled([&](const char* name) -> const char* {
+        const auto it = config.environment.find(name);
+        return it == config.environment.end() ? nullptr : it->second.c_str();
+    }, o.baseline || env_is(config.environment, "STRIX_BASELINE", "1"), config.gsq_owner);
+    out << ",\"compact_stage_images_requested\":" << (compact_stage_images_requested(config.environment.contains("STRIX_QPF2K_COMPACT_IMAGES") ?
+        config.environment.at("STRIX_QPF2K_COMPACT_IMAGES").c_str() : nullptr) ? "true" : "false");
+    out << ",\"hc_lowband_policy\":" << (config.environment.contains("STRIX_QPF2K_HC_LOWBAND") ?
+        std::strtoul(config.environment.at("STRIX_QPF2K_HC_LOWBAND").c_str(), nullptr, 0) : 0U);
+    out << ",\"hc_lowband_route\":\"exact-fp16-output-only\"";
+    out << ",\"index_batch\":" << (index_batch ? "true" : "false");
+    out << ",\"early_setup\":" << (o.early_setup ? "true" : "false")
+        << ",\"eager_code_load\":" << (o.eager_code_load ? "true" : "false")
+        << ",\"hip_enable_deferred_loading\":";
+    if (const auto it = config.environment.find("HIP_ENABLE_DEFERRED_LOADING"); it != config.environment.end())
+        out << serve::Json(it->second).dump();
+    else out << "null";
+    out << "}\n";
     return out.str();
 }
 } // namespace strix::decode_cli

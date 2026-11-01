@@ -10,7 +10,7 @@ inline YarnEnvironmentPath yarn_environment_path(qpf2k::Item item) {
         // hip_qsa_prefill_batch.inc:193-220 (batched table/norm/pool).
         return YarnEnvironmentPath::b3_rotary;
     case sched: case dense: case gdn: case gdn_gates_batch: case gdn_core16:
-    case hc: case hc_mask: case hc_output3: case hc_output3_band:
+    case hc: case hc_mask: case hc_output3: case hc_output3_band: case hc_lowband:
     case moe_da16: case moe_route: case ple_reclaim: case dense_rows: case pipe:
     case attend_batch: case score_park: case index_rows: case cohort_lean:
     case rows_lean: case dispatch_fuse:
@@ -28,13 +28,18 @@ inline std::string yarn_environment_refusal(const Environment& environment, unsi
         return "YaRN requires STRIX_QPF2K_SCHED=12; got " + it->second;
     for (const auto& [name, value] : environment) {
         if (storage_location_environment(name)) continue;
+        // Bundle scheduling and projection controls add no rotary work.
+        // Route validation separately excludes unqualified MTP arithmetic.
+        if (name == "STRIX_QPF2K_T16K" || name == "STRIX_QPF2K_INDEX_BATCH" || name == "STRIX_QPF2K_EARLY_SETUP" || name == "STRIX_EAGER_CODE_LOAD" ||
+            name == "HIP_ENABLE_DEFERRED_LOADING" || name == "STRIX_PREFILL_INDEX_PROJ_WMMA") continue;
         // Operational policies add no rotary work. Prefix policy uses the
         // shared parser (validates the value and applies CLI precedence);
         // serving tile/unit controls cannot execute here because the route
         // guard separately bounds explicit MTP and refuses caching and HTTP.
         if (name == "STRIX_PREFIX_BATCH_CERT" || name == "STRIX_SERVE_PREFILL" || name == "STRIX_BATCH_PROMPT_SMALL" ||
             name == "STRIX_PREFIX_CACHE_INFLIGHT" || name == "STRIX_PREFIX_CACHE_DISK" ||
-            name == "STRIX_PREFIX_CACHE_DURABLE") continue;
+            name == "STRIX_PREFIX_CACHE_DURABLE" || name == "STRIX_PREFILL_EXACT_FP16" ||
+            name == "STRIX_PREFILL_HC_OUTPUT_WMMA") continue;
         const auto entry = std::find_if(qpf2k::defaults.begin(), qpf2k::defaults.end(),
             [&](const auto& item) { return name == item.name; });
         if (entry != qpf2k::defaults.end() &&
@@ -55,9 +60,9 @@ inline std::string yarn_environment_refusal(const Environment& environment, unsi
         // block_score_kernel from the same table; selection and key storage perform no rotation.
         if (name == "STRIX_QSA_DECODE_POOL" || name == "STRIX_QSA_DECODE_POOL_CHECK" ||
             name == "STRIX_QSA_DECODE_POOL_BF16" || name == "STRIX_QSA_DECODE_SELECT") continue;
-        // Compact tiled-prefill memory controls choose where scores, maxima and terminal logits live; the score ring and
+        // Compact tiled-prefill memory controls choose where scores, maxima, rounded output images and terminal logits live; the score ring and
         // stage split reuse the same table-bound norm/RoPE, pool and scorer launches, so they add no rotary site.
-        if (name == "STRIX_CTX_EXACT_MEMORY" || name == "STRIX_QSA_SCORE_RING" || name == "STRIX_QSA_SCORE_RING_ROWS" ||
+        if (name == "STRIX_QPF2K_COMPACT_IMAGES" || name == "STRIX_CTX_EXACT_MEMORY" || name == "STRIX_QSA_SCORE_RING" || name == "STRIX_QSA_SCORE_RING_ROWS" ||
             name == "STRIX_TERMINAL_LOGITS_ARENA") continue;
         // M1 target/predictor producers and raw checks bind with_qwen_rotary;
         // packed consumers read those already-rotated keys. No second rotation.
@@ -115,11 +120,9 @@ inline EffectiveConfig resolve_yarn_config(const RequestedOptions& request,
     const ModelContract& model, const gguf::FileInfo& info, const ModelManifest& manifest,
     std::string_view content, const PrefillCapabilities& capabilities, const PrefillMemory& memory) {
     constexpr std::uint64_t gib = UINT64_C(1) << 30U;
-    EffectiveConfig result;
-    result.options = request.options;
+    auto result = initialize_prefill_config(request);
     result.options.ple_rolling_explicit_opt_in=env_is(request.environment,"STRIX_PLE_ROLLING","1");
     result.options.qsa_mtp_pool_explicit_opt_in=env_is(request.environment,"STRIX_QSA_MTP_POOL","1");
-    result.environment = request.environment;
     for (const auto& name : request.options.supplied_options) result.sources[name] = OptionSource::explicit_value;
     result.rotary_identity = model.rotary_identity();
     auto& o = result.options;

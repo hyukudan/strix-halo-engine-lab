@@ -26,6 +26,7 @@ struct IndexedAttentionWorkspaceLayout {
     std::uint64_t attention_scores_bytes = 0;
     std::uint64_t attention_output_offset = 0;
     std::uint64_t attention_output_bytes = 0;
+    bool compact_attention_output = false;
     std::uint64_t total_bytes = 0;
 
     std::uint64_t maximum_blocks = 0;
@@ -39,6 +40,6 @@ struct IndexedAttentionWorkspaceLayout {
 [[nodiscard]] IndexedAttentionWorkspaceLayout
 build_indexed_attention_workspace_layout(
     const ModelContract& model,
-    std::uint64_t alignment = 256, bool hierarchical_selection = false, std::uint32_t gqa_heads_per_block = 1, bool external_block_scores = false);
+    std::uint64_t alignment = 256, bool hierarchical_selection = false, std::uint32_t gqa_heads_per_block = 1, bool external_block_scores = false, bool compact_attention_output = false);
 
 }  // namespace strix

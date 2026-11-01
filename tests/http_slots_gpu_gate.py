@@ -300,6 +300,7 @@ def main():
     parser.add_argument("--suffix-token", type=int)
     parser.add_argument("--prompt", action="append", required=True, help="token ID file; repeat for varied prompts")
     parser.add_argument("--out", type=Path, required=True)
+    parser.add_argument("--reference", type=Path, help="prior single-reference.json for cross-build restoration")
     parser.add_argument("--port", type=int, default=18080)
     parser.add_argument("--generate", type=int, default=256)
     parser.add_argument("--startup-timeout", type=float, default=1800)
@@ -321,6 +322,10 @@ def main():
         return
     with server(args, "single-reference", "0"):
         reference = [signature(completion(args.port, p, args.generate)) for p in prompts]
+    (args.out / "single-reference.json").write_text(json.dumps(reference, indent=2) + "\n")
+    if args.reference:
+        require(reference == json.loads(args.reference.read_text()),
+                "MISMATCH: single HTTP differs from cross-build reference")
     # One server per mode; every client count runs against it (a server start costs minutes on this model).
     lazy_witness = False
     for mode in args.modes.split(","):
