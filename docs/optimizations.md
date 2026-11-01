@@ -1317,6 +1317,22 @@ Uses the qualified split gate/up MoE prefill schedule.
 - **Measured gain:** -
 - **Public evidence:** [Two-node defaults](models/deepseek-v4.1/production-defaults.md)
 
+<a id="ds-engram-split-read"></a>
+
+### Split Engram read of a prefill piece
+
+**Engine:** `deepseek`. **Control:** `STRIX_DS41_ENGRAM_SPLIT_READ`. **Default:** ON.
+
+A prefill piece reads the Engram rows of all its Engram layers on a thread while the layers before the first Engram layer run. The thread now reads the first Engram layer's rows first and signals them; the first Engram layer waits only for those, and the later Engram layers' rows keep arriving while the layers in between run. Before, the first Engram layer waited for every Engram layer's rows (about 1.5 s for a cold 16,384-row piece, with layer 0 covering about 0.7 s of it).
+
+- **Preconditions:** Device prefill with the overlapped Engram read (the default) and at least two Engram layers.
+- **Automatic selection:** On for every prefill run that reads Engram rows.
+- **Fallback notice:** None.
+- **Exactness evidence:** Bitwise: the same rows land in the same buffer; two-node serve logits and generated ids identical to the published references at 8,399 / 32,499 / 44,699 tokens with the lever on and off.
+- **Off switch:** STRIX_DS41_ENGRAM_SPLIT_READ=0
+- **Measured gain:** Two-node serve TTFT, two GPU turns in A/B and B/A order, one load per arm: 9.01 / 31.87 / 45.04 s off vs 8.50 / 30.79 / 44.41 s on at 8,399 / 32,499 / 44,699 tokens (-5.6 / -3.4 / -1.4 %).
+- **Public evidence:** [Two-node defaults](models/deepseek-v4.1/production-defaults.md)
+
 <a id="ds-engram-lookahead"></a>
 
 ### Engram lookahead between prefill pieces

@@ -1684,6 +1684,10 @@ PrefillResult DevicePrefill::run_from(std::span<const std::uint32_t> tokens, std
     std::vector<std::uint32_t> engram_layers;
     std::vector<ds41::EngramRowRequest> requests;
     std::future<double> engram_job;  // declared after `requests`: destroyed (joined) first
+    // STRIX_DS41_ENGRAM_SPLIT_READ (default on, =0 off): the read thread signals once the first Engram layer's rows are
+    // in, and the first Engram layer waits only for those (the other layers' rows keep arriving while it runs; same bytes)
+    std::shared_future<void> engram_first;
+    std::uint32_t engram_first_layer = 0xFFFFFFFFU;
     m.join_engram_ahead();  // the previous run's lookahead: its rows are in the payload cache (or it failed: read below)
     const std::vector<std::uint32_t> engram_next = std::exchange(m.engram_next, {});
     {
@@ -1757,13 +1761,33 @@ PrefillResult DevicePrefill::run_from(std::span<const std::uint32_t> tokens, std
             }
             engram_data = m.engram_pinned;
             if (!requests.empty())
-                engram_job = std::async(std::launch::async, [&m, &requests, bytes, start_ahead] {
+            {
+                static const bool split_read = [] { const char* v = std::getenv("STRIX_DS41_ENGRAM_SPLIT_READ"); return !(v && std::strcmp(v, "0") == 0); }();
+                // requests are [Engram layer][row][column]: the first layer's block is the first Tn * engram_cols of them
+                const std::size_t first = split_read && engram_layers.size() >= 2U ? std::size_t{Tn} * engram_cols : 0U;
+                std::promise<void> first_in;
+                if (first != 0U) {
+                    engram_first = first_in.get_future().share();
+                    engram_first_layer = m.model.engram.layer_ids[engram_layers[0]];
+                }
+                engram_job = std::async(std::launch::async, [&m, &requests, bytes, first, start_ahead, first_in = std::move(first_in)]() mutable {
                     const auto t1 = std::chrono::steady_clock::now();
-                    m.engram_reader->read(requests, std::span<std::uint8_t>(m.engram_pinned, bytes));
+                    const std::span<const ds41::EngramRowRequest> all(requests);
+                    if (first != 0U) {
+                        try {
+                            m.engram_reader->read(all.first(first), std::span<std::uint8_t>(m.engram_pinned, first * 264U));
+                        } catch (...) {
+                            first_in.set_exception(std::current_exception());
+                            throw;
+                        }
+                        first_in.set_value();
+                    }
+                    m.engram_reader->read(all.subspan(first), std::span<std::uint8_t>(m.engram_pinned + first * 264U, bytes - first * 264U));
                     const double s = seconds_since(t1);
                     start_ahead();
                     return s;
                 });
+            }
         } else {
             engram_bytes.resize(bytes);
             if (!requests.empty()) m.engram_reader->read(requests, engram_bytes);
@@ -1772,11 +1796,16 @@ PrefillResult DevicePrefill::run_from(std::span<const std::uint32_t> tokens, std
         }
         result.engram_seconds = seconds_since(t0);
     }
-    const auto join_engram = [&] {  // overlap: the read done (its wall time into engram_seconds, the wait into engram_wait_seconds)
+    const auto join_engram = [&](std::uint32_t layer) {  // overlap: the rows of `layer` (any other value: the whole read) in
         if (!engram_job.valid()) return;
         const auto t0 = std::chrono::steady_clock::now();
-        result.engram_seconds += engram_job.get();
-        result.engram_wait_seconds = seconds_since(t0);
+        if (layer == engram_first_layer && engram_first.valid()) {  // split read: this layer's block only
+            engram_first.get();
+            result.engram_wait_seconds += seconds_since(t0);
+            return;
+        }
+        result.engram_seconds += engram_job.get();  // the read's wall time into engram_seconds, the waits into engram_wait_seconds
+        result.engram_wait_seconds += seconds_since(t0);
     };
     const auto engram_slice = [&](std::uint32_t layer) -> const std::uint8_t* {  // [token][column] x 264 B of an Engram layer
         const auto& ids = m.model.engram.layer_ids;
@@ -1865,7 +1894,7 @@ PrefillResult DevicePrefill::run_from(std::span<const std::uint32_t> tokens, std
             m.identity_pre = true;
             break;
         case Op::engram: {  // encoder layers only: every row
-            join_engram();
+            join_engram(layer);
             const std::uint8_t* erow = engram_slice(layer);
             // pieces of E rows (C; a task: its engram_rows, every kernel here is per row: same bits); task units: one per
             // piece (padded to the rank with more pieces)
@@ -2850,7 +2879,7 @@ PrefillResult DevicePrefill::run_from(std::span<const std::uint32_t> tokens, std
         }
         }
     }
-    join_engram();
+    join_engram(0xFFFFFFFFU);
     if (seed_n != 0U) {  // every seed row on both ranks, in position order (row_split: 8-row windows alternate)
         const std::size_t rb = std::size_t{hc} * H * 4U;
         for (std::uint32_t j = 0; j < 3U; ++j) {
