@@ -3,6 +3,7 @@
 // code path), single and concurrent streams, DraftMode::on with k = 1..7; ids must equal OFF exactly.
 #include "common.hpp"
 #include "gemma4/eagle/session.hpp"
+#include "gemma4/eagle/mtp/session.hpp"
 #include "gemma4/engine/coordinator.hpp"
 #include "mock.hpp"
 
@@ -22,6 +23,8 @@ struct State final : en::StreamState {
     std::unique_ptr<KvTxn> begin() override { return s.begin(); }
     std::uint64_t frontier() const override { return s.tokens.size(); }
     std::string digest() const override { return std::to_string(s.hashes.back()); }
+    // MTP sessions need a KV view to draft; the scripted MTP drafter below never reads it (eagle sessions ignore it).
+    bool kv_view(std::uint32_t, const KvTxn*, KvView& out) const override { out = {}; return true; }
 };
 struct Backend final : en::Backend {
     MockTarget target;
@@ -73,6 +76,75 @@ struct MultiCandidate final : en::DraftSession {
     bool multi_stream_candidate() const override { return candidate; }
 };
 #endif
+#if defined(STRIX_G4_DRAFT_CONFIDENCE_API) && defined(STRIX_G4_DRAFT_MULTI_API)
+namespace mt = strix::gemma4::eagle::mtp;
+// MTP-like scripted drafter: the mock target's greedy continuation with injected errors and scripted top-1
+// probabilities, all functions of the chain hash (deterministic, so extend() == draft() from scratch). Logs every
+// draft/extend call (depth after the call; extend uses mt::Drafter's default re-run).
+struct ScriptedMtp final : mt::Drafter {
+    const MockTarget& t;
+    MockStream& s;
+    mt::Config c;
+    mt::Timings times;
+    std::vector<std::pair<bool, std::uint32_t>>* log;
+    ScriptedMtp(const MockTarget& target, MockStream& stream, std::vector<std::pair<bool, std::uint32_t>>* calls)
+        : t(target), s(stream), log(calls) { c.backbone = target.hidden; }
+    const mt::Config& config() const override { return c; }
+    const mt::Timings& timings() const override { return times; }
+    mt::Draft draft(const mt::Inputs& in, std::uint32_t k) override {
+        remember(in, k);
+        mt::Draft d;
+        d.depth = k;
+        std::uint64_t h = MockStream::mix(s.hashes.at(in.position), in.anchor);
+        static constexpr float script[] = {0.97F, 0.92F, 0.85F, 0.7F, 0.45F, 0.2F};
+        for (std::uint32_t i = 0; i < k; ++i) {
+            const auto g = t.greedy(h);
+            d.prob[i] = script[(h >> 20U) % 6];
+            d.tokens[i] = d.prob[i] < 0.5F && (h >> 9U) % 3 == 0 ? (g + 7) % t.vocab : g; // low confidence: some errors
+            h = MockStream::mix(h, d.tokens[i]);
+        }
+        if (log) log->push_back({false, k});
+        return d;
+    }
+    mt::Draft extend(std::uint32_t k) override {
+        auto d = mt::Drafter::extend(k); // the default re-runs draft(), which logs; re-tag that entry as an extension
+        if (log) log->back().first = true;
+        return d;
+    }
+};
+struct ConfidentRecord {
+    std::array<float, 7> prob{};
+    std::uint32_t kmax = 0, window = 0, drafted = 0;
+};
+// Forwards to an mtp::Session and records each confident proposal with the drafter's probabilities.
+struct Recording final : en::DraftSession {
+    std::unique_ptr<mt::Session> inner;
+    std::vector<ConfidentRecord>* records;
+    Recording(std::unique_ptr<mt::Session> s, std::vector<ConfidentRecord>* r) : inner(std::move(s)), records(r) {}
+    std::array<std::uint32_t, 7> propose(std::uint32_t a, std::uint64_t p) override { return inner->propose(a, p); }
+    std::array<std::uint32_t, 7> propose_window(std::uint32_t a, std::uint64_t p, std::uint32_t k) override {
+        return inner->propose_window(a, p, k);
+    }
+    void append(std::span<const float> t, std::span<const std::uint64_t> p) override { inner->append(t, p); }
+    void attach(en::StreamState& state) override { inner->attach(state); }
+    bool wants_hidden() const override { return inner->wants_hidden(); }
+    void stage_rows(std::span<const float> t, std::span<const float> h, std::span<const std::uint32_t> n,
+                    std::span<const std::uint64_t> p) override { inner->stage_rows(t, h, n, p); }
+    void stage(std::span<const float> t, std::span<const std::uint64_t> p) override { inner->stage(t, p); }
+    void publish() override { inner->publish(); }
+    void discard() noexcept override { inner->discard(); }
+    bool multi_stream_candidate() const override { return inner->multi_stream_candidate(); }
+    bool confidence_capable() const override { return inner->confidence_capable(); }
+    Confident propose_confident(std::uint32_t a, std::uint64_t p, std::uint32_t kmax, const en::ConfidenceConfig& c) override {
+        const auto out = inner->propose_confident(a, p, kmax, c);
+        ConfidentRecord r;
+        r.kmax = kmax; r.window = out.window; r.drafted = out.drafted;
+        for (std::uint32_t i = 0; i < out.drafted; ++i) r.prob[i] = inner->last_draft().prob[i];
+        records->push_back(r);
+        return out;
+    }
+};
+#endif
 std::vector<std::vector<std::uint32_t>> decode(Backend& backend, en::DraftFactory drafts, const std::vector<std::vector<std::uint32_t>>& prompts,
                                                std::uint32_t k, en::DraftMode mode, dflash::Acceptance* total) {
     en::Coordinator coordinator(backend, std::move(drafts));
@@ -100,6 +172,9 @@ std::vector<std::vector<std::uint32_t>> decode(Backend& backend, en::DraftFactor
 
 int main() {
     try {
+        // The confidence window is DEFAULT ON for MTP sessions; every section except the confidence one below checks the
+        // AutoPolicy path, so it runs with the OFF switch.
+        set_env("STRIX_G4_MTP_CONF", "0");
         Fixture fx;
         Rng r{41};
         // Prompt lengths at the prefill-window edges (the coordinator prefills prompt[0..n-2] in <= 8-row windows; the
@@ -181,6 +256,118 @@ int main() {
                             int(candidate), env ? env : "unset", (unsigned long long)proposals, (unsigned long long)cycles);
             }
         set_env("STRIX_G4_DRAFT_MULTI", nullptr);
+#endif
+#if defined(STRIX_G4_DRAFT_CONFIDENCE_API) && defined(STRIX_G4_DRAFT_MULTI_API)
+        // Drafter-confidence-gated C1 window through the real coordinator and mtp::Session (chunked draft/extend).
+        // ON: ids == OFF, no probes, every cycle's window/drafted depth follows the rule (recomputed here from the
+        // recorded probabilities), drafting starts with the first chunk and extends one depth at a time.
+        // Unset = DEFAULT ON per drafter (scripted weights: no config key, unknown hash -> builtin tau 0.6, max_k 7).
+        // OFF ("0"/"off"): the confident hook is never called, no confidence counters/receipt fields; ids == OFF.
+        for (const char* tau : {"0.5", static_cast<const char*>(nullptr), "off", "0"}) {
+            set_env("STRIX_G4_MTP_CONF", tau);
+            std::vector<ConfidentRecord> records;
+            std::vector<std::pair<bool, std::uint32_t>> calls;
+            std::array<std::uint64_t, 8> windows{};
+            std::uint64_t probes = 0, cycles = 0, drafted = 0, unverified = 0;
+            bool receipt_field = false, receipt_counters = false;
+            std::string source;
+            for (std::size_t i = 0; i < prompts.size(); ++i) {
+                Backend b6;
+                en::DraftFactory f = [&b6, &records, &calls]() -> std::unique_ptr<en::DraftSession> {
+                    return std::make_unique<Recording>(
+                        std::make_unique<mt::Session>(std::make_unique<ScriptedMtp>(b6.target, b6.last->s, &calls),
+                                                      std::pair<std::uint32_t, std::uint32_t>{22, 23}), &records);
+                };
+                en::Coordinator coordinator(b6, f);
+                en::Request req;
+                req.prompt = prompts[i];
+                req.max_tokens = 150;
+                req.dflash = en::DraftMode::automatic;
+                const auto slot = coordinator.submit(req);
+                coordinator.run();
+                const auto& res = coordinator.result(slot);
+                EAGLE_CHECK(res.ids == off[i], "confidence %s prompt %zu ids differ from OFF", tau ? tau : "unset", i);
+                for (std::size_t k = 0; k < 8; ++k) windows[k] += res.windows[k];
+                probes += res.probes; cycles += res.confidence_cycles; drafted += res.confidence_drafted;
+                unverified += res.confidence_unverified;
+                const auto receipt = coordinator.receipt(slot);
+                receipt_field = receipt_field || receipt.find("mtp_confidence") || receipt.find("mtp_confidence_resolved");
+                if (const auto* resolved = receipt.find("mtp_confidence_resolved")) {
+                    source = resolved->find("source")->as_string();
+                    EAGLE_CHECK(resolved->find("tau")->as_double() == (tau ? 0.5 : 0.6), "resolved tau");
+                }
+                receipt_counters = receipt_counters || receipt.find("acceptance")->find("confidence_cycles");
+            }
+            const bool on = !tau || std::string(tau) == "0.5";
+            const double rule_tau = tau ? 0.5 : 0.6;
+            if (!on) {
+                EAGLE_CHECK(records.empty() && cycles == 0 && drafted == 0 && !receipt_field && !receipt_counters,
+                            "confidence %s: disabled path must be untouched", tau ? tau : "unset");
+                std::printf("coordinator: STRIX_G4_MTP_CONF=%s: confident hook never called, no receipt fields, ids == OFF (%llu probes)\n",
+                            tau ? tau : "unset", (unsigned long long)probes);
+                continue;
+            }
+            EAGLE_CHECK(probes == 0, "confidence window: no calibration probes (%llu)", (unsigned long long)probes);
+            EAGLE_CHECK(receipt_field && receipt_counters, "confidence receipt fields");
+            EAGLE_CHECK(source == (tau ? "env" : "builtin"), "resolved tau source %s", source.c_str());
+            EAGLE_CHECK(cycles == records.size() && cycles > 0, "confidence cycles %llu records %zu", (unsigned long long)cycles,
+                        records.size());
+            std::array<std::uint64_t, 8> expected_windows{};
+            std::uint64_t expected_drafted = 0, expected_unverified = 0, extends = 0;
+            std::size_t call = 0;
+            for (const auto& rec : records) {
+                // Independent restatement of the rule (tau 0.5 env / 0.6 builtin, K 7, first 2, step 1, min1 0).
+                EAGLE_CHECK(rec.kmax >= 1 && rec.kmax <= 7, "kmax %u outside 1..STRIX_G4_MTP_CONF_K default 7", rec.kmax);
+                const auto kmax = rec.kmax;
+                std::uint32_t d = 0, wnd = 0;
+                if (rec.drafted) {
+                    const auto cum = [&](std::uint32_t n) { double p = 1; for (std::uint32_t j = 0; j < n; ++j) p *= double(rec.prob[j]); return p; };
+                    d = std::min(2U, kmax);
+                    while (d < kmax && cum(d) >= rule_tau) ++d;
+                    while (wnd < d && cum(wnd + 1) >= rule_tau) ++wnd;
+                    wnd = std::max(wnd, 1U);
+                    // Drafter calls: draft(first chunk), then extend(+1) per extension.
+                    EAGLE_CHECK(call < calls.size() && !calls[call].first && calls[call].second == std::min(2U, kmax), "first chunk");
+                    ++call;
+                    for (std::uint32_t e = std::min(2U, kmax) + 1; e <= d; ++e, ++call, ++extends)
+                        EAGLE_CHECK(call < calls.size() && calls[call].first && calls[call].second == e, "extend to %u", e);
+                }
+                EAGLE_CHECK(rec.drafted == d && rec.window == wnd, "rule: drafted %u (want %u) window %u (want %u)", rec.drafted, d, rec.window, wnd);
+                ++expected_windows[rec.window];
+                expected_drafted += rec.drafted; expected_unverified += rec.drafted - rec.window;
+            }
+            EAGLE_CHECK(call == calls.size(), "no other drafter calls (%zu of %zu)", call, calls.size());
+            for (std::size_t k = 1; k < 8; ++k)
+                EAGLE_CHECK(windows[k] == expected_windows[k], "window %zu histogram %llu want %llu", k, (unsigned long long)windows[k],
+                            (unsigned long long)expected_windows[k]);
+            EAGLE_CHECK(drafted == expected_drafted && unverified == expected_unverified, "drafted/unverified counters");
+            std::size_t distinct = 0;
+            for (std::size_t k = 1; k < 8; ++k) distinct += expected_windows[k] ? 1 : 0;
+            EAGLE_CHECK(distinct >= 3 && expected_windows[3] + expected_windows[4] + expected_windows[5] > 0 && extends > 0,
+                        "scripted probabilities exercise several windows");
+            std::printf("coordinator: STRIX_G4_MTP_CONF=%s: ids == OFF, 0 probes, %llu cycles, windows k1..k5 %llu/%llu/%llu/%llu/%llu, %llu drafted (%llu unverified), %llu extends\n",
+                        tau ? tau : "unset (builtin 0.6)", (unsigned long long)cycles, (unsigned long long)windows[1], (unsigned long long)windows[2],
+                        (unsigned long long)windows[3], (unsigned long long)windows[4], (unsigned long long)windows[5],
+                        (unsigned long long)drafted, (unsigned long long)unverified, (unsigned long long)extends);
+        }
+        {   // Enabled, but DraftMode::on and non-capable (eagle) sessions keep their paths.
+            set_env("STRIX_G4_MTP_CONF", "0.5");
+            Backend b7;
+            std::vector<ConfidentRecord> records;
+            en::DraftFactory f = [&b7, &records]() -> std::unique_ptr<en::DraftSession> {
+                return std::make_unique<Recording>(
+                    std::make_unique<mt::Session>(std::make_unique<ScriptedMtp>(b7.target, b7.last->s, nullptr),
+                                                  std::pair<std::uint32_t, std::uint32_t>{22, 23}), &records);
+            };
+            const auto forced = decode(b7, f, {prompts[0]}, 4, en::DraftMode::on, nullptr);
+            EAGLE_CHECK(forced[0] == off[0] && records.empty(), "DraftMode::on ignores the confidence window");
+            Backend b8;
+            const auto eagle = decode(b8, [&b8]() -> std::unique_ptr<en::DraftSession> {
+                return std::make_unique<eg::Session>(std::make_unique<Oracle>(b8.target, b8.last->s, small_config()));
+            }, {prompts[0]}, 7, en::DraftMode::automatic, nullptr);
+            EAGLE_CHECK(eagle[0] == off[0], "non-capable session under STRIX_G4_MTP_CONF: ids == OFF");
+            set_env("STRIX_G4_MTP_CONF", "0");
+        }
 #endif
         std::printf("coordinator: eagle sessions == OFF for k in {1,4,7}, prompt lengths 1/2/8/9/16/17/random, 1 and 3 streams; oracle accepted %llu/%llu, host drafter (1 and 3 streams) %llu/%llu\n",
                     (unsigned long long)oracle_stats.accepted, (unsigned long long)oracle_stats.attempted,

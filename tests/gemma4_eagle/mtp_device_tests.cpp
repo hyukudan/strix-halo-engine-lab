@@ -76,6 +76,35 @@ void device_vs_host(const Table& table, const gpu::Buffer& dtable, WeightFormat 
         k = k % 7 + 1;
     }
     std::printf("device == host (%s): %zu depths bit-identical, graphs on and off\n", name, depths);
+    // extend(k) continues the device chain ([depth, k) segment graphs): bit-identical to the host chain from scratch
+    // (= device draft(in, k) from scratch), graphs on and off, for several chunkings, launches = 44 x new depths.
+    std::size_t extended = 0;
+    for (const std::uint64_t p : {1ULL, 65ULL, 513ULL, 799ULL}) {
+        const auto anchor = r.below(strix::gemma4::vocab);
+        const auto hrow = std::span<const float>(hidden).subspan((p - 1) * 2560, 2560);
+        const auto h = host.draft({anchor, p, hrow, kv.ring(p), kv.full()}, 7);
+        const auto views = dkv.at(kv, p);
+        const mt::Inputs din{anchor, p, hrow, views.first, views.second};
+        for (auto* d : {&graphed, &plain}) {
+            for (const auto& chain : {std::vector<std::uint32_t>{1, 2, 4, 7}, std::vector<std::uint32_t>{2, 3, 5}, std::vector<std::uint32_t>{3, 7}}) {
+                auto x = d->draft(din, chain[0]);
+                for (std::size_t c = 1; c < chain.size(); ++c) {
+                    x = d->extend(chain[c]);
+                    EAGLE_CHECK(x.depth == chain[c] && d->timings().launches == 44ULL * (chain[c] - chain[c - 1]),
+                                "%s extend %u->%u depth %u launches %llu", name, chain[c - 1], chain[c], x.depth,
+                                (unsigned long long)d->timings().launches);
+                    for (std::uint32_t i = 0; i < chain[c]; ++i)
+                        EAGLE_CHECK(x.tokens[i] == h.tokens[i] && same(x.prob[i], h.prob[i]) && same(x.margin[i], h.margin[i]),
+                                    "%s %s extend %u->%u p %llu depth %u: device %u/%a host %u/%a", name,
+                                    d == &graphed ? "graph" : "plain", chain[c - 1], chain[c], (unsigned long long)p, i + 1,
+                                    x.tokens[i], double(x.prob[i]), h.tokens[i], double(h.prob[i]));
+                    ++extended;
+                }
+                EAGLE_CHECK(throws([&] { (void)d->extend(chain.back()); }), "%s extend to the same depth refuses", name);
+            }
+        }
+    }
+    std::printf("device extend == draft from scratch (%s): %zu extensions bit-identical, graphs on and off\n", name, extended);
 }
 
 void device_fixture(const std::filesystem::path& dir, const std::filesystem::path& model_dir, const gpu::Buffer& dtable) {

@@ -112,6 +112,65 @@ void session(const Table& table) {
     const auto layers = mt::shared_kv_layers(t);
     EAGLE_CHECK(layers.first == 22 && layers.second == 23, "E4B shared KV layers %u %u", layers.first, layers.second);
 }
+bool same_bits(float a, float b) { return bit_cast<std::uint32_t>(a) == bit_cast<std::uint32_t>(b); }
+// Drafter::extend(k) continues the last draft() to depth k: bit-identical to draft(in, k) from scratch.
+void extend(const Table& table) {
+    const auto w = mt::Weights::random(mt::Config{}, 9);
+    Rope rope(1024);
+    TargetKv kv(600, 4);
+    std::vector<float> hidden(2560);
+    Rng r{12};
+    for (auto& x : hidden) x = 2 * r.uniform();
+    mt::HostDrafter d(w, rope.view(), table.view()), fresh(w, rope.view(), table.view());
+    const mt::Inputs in{77, 513, hidden, kv.ring(513), kv.full()};
+    EAGLE_CHECK(throws([&] { (void)d.extend(2); }), "extend without a previous draft refuses");
+    const auto equal = [](const mt::Draft& a, const mt::Draft& b, std::uint32_t k) {
+        bool ok = a.depth == k && b.depth == k;
+        for (std::uint32_t i = 0; i < k; ++i)
+            ok = ok && a.tokens[i] == b.tokens[i] && same_bits(a.prob[i], b.prob[i]) && same_bits(a.margin[i], b.margin[i]);
+        return ok;
+    };
+    std::size_t checked = 0;
+    for (const auto& chain : {std::vector<std::uint32_t>{1, 3, 7}, std::vector<std::uint32_t>{2, 5}, std::vector<std::uint32_t>{2, 3, 4}}) {
+        auto x = d.draft(in, chain[0]);
+        EAGLE_CHECK(equal(x, fresh.draft(in, chain[0]), chain[0]), "draft(%u) repeatable", chain[0]);
+        for (std::size_t i = 1; i < chain.size(); ++i) {
+            x = d.extend(chain[i]);
+            EAGLE_CHECK(equal(x, fresh.draft(in, chain[i]), chain[i]), "extend(%u) after %u == draft(in, %u)", chain[i], chain[i - 1], chain[i]);
+            ++checked;
+        }
+        EAGLE_CHECK(throws([&] { (void)d.extend(chain.back()); }), "extend to the same depth refuses");
+    }
+    std::printf("mtp extend == draft from scratch: %zu extensions bit-identical (tokens, prob, margin)\n", checked);
+#if defined(STRIX_G4_DRAFT_CONFIDENCE_API)
+    // Session::propose_confident: chunked drafting through extend(); tokens are a prefix of the full chain.
+    mt::Session s(std::make_unique<mt::HostDrafter>(w, rope.view(), table.view()), {22, 23});
+    std::vector<float> taps(5 * 2560, 0.0F);
+    const std::uint32_t next[] = {77};
+    const std::uint64_t positions[] = {512};
+    s.set_source([&](std::uint32_t layer, mt::KvLayer& out) {
+        out = layer == 22 ? kv.ring(513) : kv.full();
+        return true;
+    });
+    s.stage_rows(taps, hidden, next, positions);
+    s.publish();
+    const auto full = fresh.draft(in, 7);
+    strix::gemma4::engine::ConfidenceConfig c;
+    c.tau = 1e-30; c.max_k = 7;
+    auto out = s.propose_confident(77, 513, 6, c);
+    EAGLE_CHECK(out.drafted == 6 && out.window == 6, "tiny tau: drafted %u window %u", out.drafted, out.window);
+    for (std::uint32_t i = 0; i < 6; ++i) EAGLE_CHECK(out.tokens[i] == full.tokens[i], "confident token %u", i);
+    EAGLE_CHECK(out.tokens[6] == 0, "beyond the window: zero");
+    c.tau = 1; // never reached by a random-weight drafter: first chunk only, window 1
+    out = s.propose_confident(77, 513, 6, c);
+    EAGLE_CHECK(out.drafted == 2 && out.window == 1 && out.tokens[0] == full.tokens[0] && out.tokens[1] == 0,
+                "tau 1: drafted %u window %u", out.drafted, out.window);
+    c.min1 = 1; c.tau = 1e-30;
+    out = s.propose_confident(77, 513, 6, c);
+    EAGLE_CHECK(out.window == 0 && out.tokens[0] == 0, "min1: no verified draft");
+    EAGLE_CHECK(s.propose_confident(78, 513, 6, c).drafted == 0, "anchor mismatch: nothing drafted");
+#endif
+}
 // Release layout: <model dir>/drafter-mtp/model.safetensors; absent drafter -> empty path (decode runs exact).
 void layout() {
     namespace fs = std::filesystem;
@@ -129,16 +188,37 @@ void layout() {
     EAGLE_CHECK(throws([&] { (void)mt::Weights::load(root / "empty"); }), "load refuses an absent drafter");
     fs::remove_all(root);
 }
+// Confidence-window defaults per drafter: config.json keys (validated) and the builtin tau of known weights.
+void confidence_defaults() {
+    const auto k = mt::confidence_keys(R"({"model_type":"gemma4_assistant","confidence_tau":0.35,"confidence_max_k":6,"confidence_first":1})");
+    EAGLE_CHECK(k.tau == 0.35F && k.max_k == 6 && k.first == 1, "config keys");
+    const auto none = mt::confidence_keys(R"({"model_type":"gemma4_assistant"})");
+    EAGLE_CHECK(none.tau == 0 && none.max_k == 0 && none.first == 0, "absent keys");
+    for (const char* bad : {R"({"confidence_tau":0})", R"({"confidence_tau":1.5})", R"({"confidence_tau":"x"})",
+                            R"({"confidence_max_k":8})", R"({"confidence_first":0})", R"({"confidence_max_k":2.5})"})
+        EAGLE_CHECK(throws([&] { (void)mt::confidence_keys(bad); }), "rejects %s", bad);
+    EAGLE_CHECK(mt::builtin_confidence_tau("12875062fc25c51e8fa9b62abd2de7ad48b7d63f8559d5d604fbd5a3d6bcff16") > 0, "untuned builtin");
+    EAGLE_CHECK(mt::builtin_confidence_tau("19594909271ef877aa") > 0, "ft1 builtin");
+    EAGLE_CHECK(mt::builtin_confidence_tau("deadbeef") == 0, "unknown weights");
+#if defined(STRIX_G4_DRAFT_CONFIDENCE_API)
+    strix::gemma4::engine::ConfidenceConfig env; env.tau = 0.6; env.per_drafter = true; env.source = strix::gemma4::engine::ConfidenceConfig::Source::builtin;
+    const auto r = env.resolved(k.tau, k.max_k, k.first, 0.3);
+    EAGLE_CHECK(r.tau == double(0.35F) && r.max_k == 6 && r.first == 1, "config keys win");
+#endif
+    std::printf("mtp: confidence defaults (config keys, builtin per-weights tau, precedence) OK\n");
+}
 } // namespace
 
 int main(int argc, char** argv) {
     try {
         recipes();
         layout();
+        confidence_defaults();
         const Table table;
         if (argc > 2) fixture(argv[1], argv[2], table);
         else std::printf("SKIP fixture (usage: fixture_dir assistant_dir)\n");
         session(table);
+        extend(table);
         for (int i = 3; i < argc; ++i) { // optional extra checkpoints (e.g. fine-tuned exports): load + validate
             const auto w = mt::Weights::load(argv[i]);
             std::printf("loaded %s: hidden %u ffn %u full=%d%d%d%d scalars %.4g %.4g %.4g %.4g\n", argv[i], w.config.hidden,

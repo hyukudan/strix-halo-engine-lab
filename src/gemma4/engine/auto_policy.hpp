@@ -77,6 +77,65 @@ struct MultiStreamConfig {
     [[nodiscard]] static MultiStreamConfig from_environment();
     [[nodiscard]] strix::serve::Json json() const;
 };
+// Drafter-confidence-gated C1 window (MTP; drafters that report a per-depth top-1 probability). Replaces the C1
+// AutoPolicy window choice (no probes, no plain refresh) for confidence-capable sessions in auto mode. Exactness: the
+// window only decides how many drafted tokens are verified; greedy verification decides every emitted token, so ids
+// equal drafting off for any window. Env read once per Coordinator. DEFAULT ON: with STRIX_G4_MTP_CONF unset the
+// session resolves tau (and max_k/first unless their env is set) from its drafter: drafter-mtp/config.json keys
+// confidence_tau / confidence_max_k / confidence_first, else the builtin per-drafter default. "0"/"off" = OFF switch.
+struct ConfidenceConfig {
+    enum class Source : std::uint8_t { off, env, drafter_config, builtin };
+    static constexpr double builtin_tau = 0.6; // unknown drafter (no config key, no builtin entry)
+    double tau = 0;                // STRIX_G4_MTP_CONF (0..1]: cumulative top-1 probability threshold; 0 = disabled
+    std::uint32_t max_k = 7;       // STRIX_G4_MTP_CONF_K (1..7): window cap (also capped by the request limit)
+    std::uint32_t first = 2;       // STRIX_G4_MTP_CONF_FIRST (1..7): depths drafted before the first check
+    std::uint32_t step = 1;        // STRIX_G4_MTP_CONF_STEP (1..7): depths drafted per extension
+    double min1 = 0;               // STRIX_G4_MTP_CONF_MIN1 [0..1]: depth-1 probability below this verifies no draft
+    Source source = Source::off;   // where tau came from (receipts)
+    bool per_drafter = false;      // env unset: resolved() takes the drafter's values
+    bool max_k_env = false, first_env = false;
+    [[nodiscard]] bool enabled() const { return tau > 0; }
+    // Session-side resolution when the env leaves the choice to the drafter: config-file values (> 0) win, else the
+    // drafter's builtin tau; max_k / first only when their env is unset. Explicit env configs are returned unchanged.
+    [[nodiscard]] ConfidenceConfig resolved(double config_tau, std::uint32_t config_max_k, std::uint32_t config_first,
+                                            double drafter_builtin_tau) const {
+        if (!per_drafter) return *this;
+        auto c = *this;
+        c.per_drafter = false;
+        if (config_tau > 0) { c.tau = config_tau; c.source = Source::drafter_config; }
+        else { c.tau = drafter_builtin_tau > 0 ? drafter_builtin_tau : builtin_tau; c.source = Source::builtin; }
+        if (!max_k_env && config_max_k) c.max_k = config_max_k;
+        if (!first_env && config_first) c.first = config_first;
+        return c;
+    }
+    // P_d = prod_{i<=d} prob_i over the drafted depths (prob.size() = drafted). Next total depth to draft: the first
+    // chunk when nothing is drafted, then +step while P at the last drafted depth >= tau and depth < kmax; returns
+    // prob.size() when drafting stops. (Inline: drafter sessions use it without linking the engine.)
+    [[nodiscard]] std::uint32_t next_depth(std::span<const float> prob, std::uint32_t kmax) const {
+        const auto drafted = std::uint32_t(prob.size());
+        kmax = kmax < 7 ? kmax : 7;
+        if (!drafted) return first < kmax ? first : kmax;
+        if (drafted >= kmax) return drafted;
+        double cumulative = 1;
+        for (const auto p : prob) cumulative *= double(p);
+        return cumulative >= tau ? (drafted+step < kmax ? drafted+step : kmax) : drafted;
+    }
+    // Verified window: leading depths with P_d >= tau, at least 1 (0 when nothing is drafted or prob_1 < min1).
+    [[nodiscard]] std::uint32_t window(std::span<const float> prob) const {
+        if (prob.empty() || double(prob[0]) < min1) return 0;
+        std::uint32_t k = 0;
+        double cumulative = 1;
+        for (const auto p : prob) {
+            cumulative *= double(p);
+            if (!(cumulative >= tau)) break;
+            ++k;
+        }
+        return k ? k : 1;
+    }
+    [[nodiscard]] static ConfidenceConfig from_environment();
+    [[nodiscard]] static const char* source_name(Source source);
+    [[nodiscard]] strix::serve::Json json() const;
+};
 // One live decode stream as seen by the batch planner, in slot order.
 struct StreamCandidate {
     const AutoPolicy* policy = nullptr; // nullptr: never drafts at >1 stream (DFlash, no drafter, sampling, off)

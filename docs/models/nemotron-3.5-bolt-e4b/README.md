@@ -46,8 +46,8 @@ With more than one active request the drafter is admitted only where its measure
 
 ## Measured (one Strix Halo, gfx1151, 128 GB, Q4_K_M)
 
-Decode tok/s, `default` profile, 256-token English chat: C1 55.9 plain, 85.1 with the MTP drafter (ids identical to
-drafter off); C4 169.3 aggregate; C8 237.9 aggregate. Exact prefill uses FP32 arithmetic without contraction and is
+Decode tok/s, `default` profile, 256-token English chat: C1 56.0 plain, 92.9 with the MTP drafter (ids identical to
+drafter off); C4 169.3 aggregate; C8 238.5 aggregate. Exact prefill uses FP32 arithmetic without contraction and is
 compute-bound (471 tok/s at 512 tokens, 358 at 32K); the WMMA prefill of the `fast` profile is pending qualification.
 All profiles, prefill lengths and the same-machine llama.cpp reference are in the
 [main README](../../../README.md#nemotron-35-bolt-e4b).

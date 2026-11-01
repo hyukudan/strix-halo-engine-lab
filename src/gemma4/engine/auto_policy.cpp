@@ -183,6 +183,42 @@ strix::serve::Json MultiStreamConfig::json() const {
     return strix::serve::Json(strix::serve::Json::Object{{"enabled",enabled},{"max_k",std::uint64_t(max_k)},
         {"max_draft_share",max_draft_share},{"min_gain",min_gain}});
 }
+ConfidenceConfig ConfidenceConfig::from_environment() {
+    ConfidenceConfig c;
+    const auto* v = std::getenv("STRIX_G4_MTP_CONF");
+    if (v && (std::string(v) == "0" || std::string(v) == "off")) return c; // the OFF switch
+    if (!v || !*v || std::string(v) == "auto") { c.tau = builtin_tau; c.source = Source::builtin; c.per_drafter = true; } // default ON, per drafter
+    else {
+        c.tau = env_number("STRIX_G4_MTP_CONF",0,0,1);
+        if (!(c.tau > 0)) return ConfidenceConfig{}; // "0.0": disabled, as "0"
+        c.source = Source::env;
+    }
+    const auto integer = [](const char* name, std::uint32_t fallback) {
+        const double x = env_number(name,fallback,1,7);
+        if (x != std::floor(x)) throw std::invalid_argument(std::string(name)+" must be an integer 1..7");
+        return std::uint32_t(x);
+    };
+    const auto set = [](const char* name) { const auto* e = std::getenv(name); return e && *e; };
+    c.max_k_env = set("STRIX_G4_MTP_CONF_K"); c.first_env = set("STRIX_G4_MTP_CONF_FIRST");
+    c.max_k = integer("STRIX_G4_MTP_CONF_K",c.max_k);
+    c.first = integer("STRIX_G4_MTP_CONF_FIRST",c.first);
+    c.step = integer("STRIX_G4_MTP_CONF_STEP",c.step);
+    c.min1 = env_number("STRIX_G4_MTP_CONF_MIN1",c.min1,0,1);
+    return c;
+}
+const char* ConfidenceConfig::source_name(Source s) {
+    switch (s) {
+    case Source::env: return "env";
+    case Source::drafter_config: return "drafter-config";
+    case Source::builtin: return "builtin";
+    default: return "off";
+    }
+}
+strix::serve::Json ConfidenceConfig::json() const {
+    return strix::serve::Json(strix::serve::Json::Object{{"enabled",enabled()},{"tau",tau},{"max_k",std::uint64_t(max_k)},
+        {"first",std::uint64_t(first)},{"step",std::uint64_t(step)},{"min1",min1},{"source",source_name(source)},
+        {"per_drafter",per_drafter}});
+}
 MultiStreamPolicy::MultiStreamPolicy(MultiStreamConfig config) : config_(config) {
     if (config_.max_k < 1 || config_.max_k > 7 || !(config_.max_draft_share >= 0) || !(config_.min_gain >= 1))
         throw std::invalid_argument("invalid multi-stream policy config");

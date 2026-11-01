@@ -271,23 +271,28 @@ struct DeviceDrafter::Impl {
     hipStream_t stream = nullptr;
     hipEvent_t start = nullptr, stop = nullptr;
     Buffer cat, x, a, y, o, q, att, g, cl, top, z, ids, part, kv, pos, token, result, failure;
-    std::array<hipGraphExec_t, max_depth + 1> graphs{};
-    std::array<hipGraph_t, max_depth + 1> sources{};
+    // Graphs per depth segment [from, to): draft(k) replays [0, k), extend(k) replays [depth, k).
+    std::array<std::array<hipGraphExec_t, max_depth + 1>, max_depth + 1> graphs{};
+    std::array<std::array<hipGraph_t, max_depth + 1>, max_depth + 1> sources{};
     bool use_graphs = true;
+    std::uint32_t chain = 0; // depth of the chain held in the device buffers (0: none / invalid)
     Timings times;
     ~Impl() {
-        for (auto& e : graphs) if (e) (void)hipGraphExecDestroy(e);
-        for (auto& g0 : sources) if (g0) (void)hipGraphDestroy(g0);
+        for (auto& row : graphs) for (auto& e : row) if (e) (void)hipGraphExecDestroy(e);
+        for (auto& row : sources) for (auto& g0 : row) if (g0) (void)hipGraphDestroy(g0);
         if (start) (void)hipEventDestroy(start);
         if (stop) (void)hipEventDestroy(stop);
         if (stream) (void)hipStreamDestroy(stream);
     }
     unsigned* fail() const { return failure.as<unsigned>(); }
     void count() { ++times.launches; }
-    void enqueue(std::uint32_t k) {
+    // Depths [from, to) of the chain. The depth index only selects select_kernel's result slot; every other input of a
+    // depth (token, cat backbone half, p, KV descriptors) is device state left by the previous depth, so a segment
+    // [d, k) after [0, d) computes exactly what [0, k) does.
+    void enqueue(std::uint32_t from, std::uint32_t to) {
         const auto H = c.hidden, B = c.backbone;
         const gpu::Queue qu = stream;
-        for (std::uint32_t depth = 0; depth < k; ++depth) {
+        for (std::uint32_t depth = from; depth < to; ++depth) {
             gpu::embedding(m->embedding, token.as<unsigned>(), 1, cat.as<float>(), c.embedding_scale, qu); count();
             gpu::linear(m->pre, cat.as<float>(), 1, x.as<float>(), true, qu, fail()); count();
             gpu::norm(x.as<float>(), m->layer[0].input_norm, a.as<float>(), 1, H, qu, fail()); count();
@@ -323,6 +328,44 @@ struct DeviceDrafter::Impl {
                                token.as<unsigned>(), result.as<Result>(), fail());
             launched(); count();
         }
+    }
+    // Runs [from, to) on the stream (graph capture on first use, replay after) between the start/stop events, then
+    // one sync and one download of all result slots.
+    Draft run(std::uint32_t from, std::uint32_t to) {
+        chain = 0;
+        checked(hipMemsetAsync(failure.data(), 0, sizeof(unsigned), stream));
+        checked(hipEventRecord(start, stream));
+        times.launches = 0;
+        times.graph = use_graphs;
+        if (use_graphs) {
+            auto& exec = graphs[from][to];
+            if (!exec) {
+                checked(hipStreamBeginCapture(stream, hipStreamCaptureModeThreadLocal));
+                try { enqueue(from, to); } catch (...) { hipGraph_t g0 = nullptr; (void)hipStreamEndCapture(stream, &g0); if (g0) (void)hipGraphDestroy(g0); throw; }
+                checked(hipStreamEndCapture(stream, &sources[from][to]));
+                checked(hipGraphInstantiate(&exec, sources[from][to], nullptr, nullptr, 0));
+            } else {
+                times.launches = 44ULL * (to - from); // replayed graph nodes
+            }
+            checked(hipGraphLaunch(exec, stream));
+        } else {
+            enqueue(from, to);
+        }
+        checked(hipEventRecord(stop, stream));
+        Result r{};
+        unsigned failed = 0;
+        checked(hipMemcpyAsync(&r, result.data(), sizeof(r), hipMemcpyDeviceToHost, stream));
+        checked(hipMemcpyAsync(&failed, failure.data(), sizeof(failed), hipMemcpyDeviceToHost, stream));
+        checked(hipStreamSynchronize(stream));
+        if (failed) throw std::runtime_error("device mtp: draft failed (nonfinite=1, missing target KV tag=2): " + std::to_string(failed));
+        float ms = 0;
+        checked(hipEventElapsedTime(&ms, start, stop));
+        times.draft_ms = ms;
+        Draft out;
+        out.depth = to;
+        for (std::uint32_t i = 0; i < to; ++i) { out.tokens[i] = r.tokens[i]; out.prob[i] = r.prob[i]; out.margin[i] = r.margin[i]; }
+        chain = to;
+        return out;
     }
 };
 
@@ -361,41 +404,17 @@ Draft DeviceDrafter::draft(const Inputs& in, std::uint32_t k) {
             in.sliding.width >= c.kv_heads * c.sliding_dim && in.full.width >= c.kv_heads * c.full_dim, "target KV views");
     const KvLayer kvs[2] = {in.sliding, in.full};
     const std::uint32_t anchor = in.anchor;
+    d.chain = 0;
     checked(hipMemcpyAsync(d.cat.as<float>() + c.backbone, in.hidden.data(), c.backbone * 4ULL, hipMemcpyHostToDevice, d.stream));
     checked(hipMemcpyAsync(d.kv.data(), kvs, sizeof(kvs), hipMemcpyHostToDevice, d.stream));
     checked(hipMemcpyAsync(d.pos.data(), &p, sizeof(p), hipMemcpyHostToDevice, d.stream));
     checked(hipMemcpyAsync(d.token.data(), &anchor, sizeof(anchor), hipMemcpyHostToDevice, d.stream));
-    checked(hipMemsetAsync(d.failure.data(), 0, sizeof(unsigned), d.stream));
-    checked(hipEventRecord(d.start, d.stream));
-    d.times.launches = 0;
-    d.times.graph = d.use_graphs;
-    if (d.use_graphs) {
-        if (!d.graphs[k]) {
-            checked(hipStreamBeginCapture(d.stream, hipStreamCaptureModeThreadLocal));
-            try { d.enqueue(k); } catch (...) { hipGraph_t g0 = nullptr; (void)hipStreamEndCapture(d.stream, &g0); if (g0) (void)hipGraphDestroy(g0); throw; }
-            checked(hipStreamEndCapture(d.stream, &d.sources[k]));
-            checked(hipGraphInstantiate(&d.graphs[k], d.sources[k], nullptr, nullptr, 0));
-        } else {
-            d.times.launches = 44ULL * k; // replayed graph nodes
-        }
-        checked(hipGraphLaunch(d.graphs[k], d.stream));
-    } else {
-        d.enqueue(k);
-    }
-    checked(hipEventRecord(d.stop, d.stream));
-    Result r{};
-    unsigned failed = 0;
-    checked(hipMemcpyAsync(&r, d.result.data(), sizeof(r), hipMemcpyDeviceToHost, d.stream));
-    checked(hipMemcpyAsync(&failed, d.failure.data(), sizeof(failed), hipMemcpyDeviceToHost, d.stream));
-    checked(hipStreamSynchronize(d.stream));
-    if (failed) throw std::runtime_error("device mtp: draft failed (nonfinite=1, missing target KV tag=2): " + std::to_string(failed));
-    float ms = 0;
-    checked(hipEventElapsedTime(&ms, d.start, d.stop));
-    d.times.draft_ms = ms;
-    Draft out;
-    out.depth = k;
-    for (std::uint32_t i = 0; i < k; ++i) { out.tokens[i] = r.tokens[i]; out.prob[i] = r.prob[i]; out.margin[i] = r.margin[i]; }
-    return out;
+    return d.run(0, k);
+}
+Draft DeviceDrafter::extend(std::uint32_t k) {
+    auto& d = *impl_;
+    require(d.chain && k > d.chain && k <= max_depth, "extend needs a previous shallower draft");
+    return d.run(d.chain, k);
 }
 
 } // namespace strix::gemma4::eagle::mtp

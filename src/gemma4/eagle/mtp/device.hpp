@@ -7,7 +7,8 @@
 //   (* layer_scalar, + next norm);
 //   post_projection (writes the next depth's backbone half in place), centroids, top-32, 4096 candidate dots, select.
 // Every per-call value (p, anchor, hidden row, KV descriptors) lives in device memory, so the k-depth chain is captured
-// once per k as a HIP graph (STRIX_G4_MTP_GRAPHS=0 disables) and replayed. One H2D batch, one sync, one download.
+// once per depth segment [from, to) as a HIP graph (STRIX_G4_MTP_GRAPHS=0 disables) and replayed. One H2D batch,
+// one sync, one download per draft(); extend() continues the chain with one more segment, sync and download.
 #include "mtp.hpp"
 #include "gemma4/kernels/ops.hpp"
 
@@ -39,6 +40,9 @@ public:
     [[nodiscard]] const Config& config() const override;
     [[nodiscard]] const Timings& timings() const override;
     Draft draft(const Inputs& inputs, std::uint32_t k) override;
+    // Real continuation: the chain state (last token, next depth's backbone half, p, anchor, KV descriptors) stays in
+    // device buffers, so depths [depth, k) run as one more (cached graph) segment; one sync + download.
+    Draft extend(std::uint32_t k) override;
 private:
     struct Impl;
     std::unique_ptr<Impl> impl_;

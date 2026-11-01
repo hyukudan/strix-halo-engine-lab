@@ -28,21 +28,47 @@ Session::~Session() {
 std::array<std::uint32_t, 7> Session::propose(std::uint32_t anchor, std::uint64_t position) {
     return propose_window(anchor, position, max_depth);
 }
+bool Session::inputs(std::uint32_t anchor, std::uint64_t position, Inputs& in) const {
+    if (!have_ || position != position_ + 1 || anchor != next_ || !source_) return false;
+    in.anchor = anchor;
+    in.position = position;
+    in.hidden = hidden_;
+    return source_(layers_.first, in.sliding) && source_(layers_.second, in.full);
+}
 std::array<std::uint32_t, 7> Session::propose_window(std::uint32_t anchor, std::uint64_t position, std::uint32_t k) {
     std::array<std::uint32_t, 7> out{};
     last_ = {};
     k = std::min(k, max_depth);
     // Exact verification makes any proposal safe; without the previous row's hidden or the KV views, propose zeros.
-    if (!k || !have_ || position != position_ + 1 || anchor != next_ || !source_) return out;
     Inputs in;
-    in.anchor = anchor;
-    in.position = position;
-    in.hidden = hidden_;
-    if (!source_(layers_.first, in.sliding) || !source_(layers_.second, in.full)) return out;
+    if (!k || !inputs(anchor, position, in)) return out;
     last_ = drafter_->draft(in, k);
     for (std::uint32_t i = 0; i < k; ++i) out[i] = last_.tokens[i];
     return out;
 }
+#if defined(STRIX_G4_DRAFT_CONFIDENCE_API)
+engine::DraftSession::Confident Session::propose_confident(std::uint32_t anchor, std::uint64_t position, std::uint32_t kmax,
+                                                           const engine::ConfidenceConfig& config) {
+    Confident out;
+    last_ = {};
+    kmax = std::min(kmax, max_depth);
+    Inputs in;
+    if (!kmax || !inputs(anchor, position, in)) return out;
+    // Numerics are draft(in, d) for the final d whether reached at once or by extension (Drafter::extend contract);
+    // the window only selects how many of these tokens the greedy verification sees.
+    auto depth = config.next_depth({}, kmax);
+    last_ = drafter_->draft(in, depth);
+    for (auto next = config.next_depth({last_.prob.data(), depth}, kmax); next > depth;
+         next = config.next_depth({last_.prob.data(), depth}, kmax)) {
+        last_ = drafter_->extend(next);
+        depth = next;
+    }
+    out.drafted = depth;
+    out.window = std::min(config.window({last_.prob.data(), depth}), depth);
+    for (std::uint32_t i = 0; i < out.window; ++i) out.tokens[i] = last_.tokens[i];
+    return out;
+}
+#endif
 void Session::stage_rows(std::span<const float>, std::span<const float> hidden, std::span<const std::uint32_t> next_tokens,
                          std::span<const std::uint64_t> positions) {
     require(!staged_, "previous stage not published/discarded");

@@ -203,12 +203,76 @@ void multi_stream() {
         set_env("STRIX_G4_DRAFT_MULTI",nullptr); set_env("STRIX_G4_DRAFT_MULTI_K",nullptr); set_env("STRIX_G4_DRAFT_MULTI_COST",nullptr);
     }
 }
+// Drafter-confidence window config (STRIX_G4_MTP_CONF*): default ON per drafter, OFF switch, bounds, resolution
+// precedence (env > drafter config > drafter builtin > builtin_tau), and the chunked window rule.
+void confidence() {
+    const char* names[] = {"STRIX_G4_MTP_CONF","STRIX_G4_MTP_CONF_K","STRIX_G4_MTP_CONF_FIRST","STRIX_G4_MTP_CONF_STEP","STRIX_G4_MTP_CONF_MIN1"};
+    for (const auto* n : names) set_env(n,nullptr);
+    const auto rejected = [] { try { (void)e::ConfidenceConfig::from_environment(); } catch (const std::invalid_argument&) { return true; } return false; };
+    const auto dflt = e::ConfidenceConfig::from_environment();
+    CHECK(dflt.enabled() && dflt.per_drafter && dflt.tau == e::ConfidenceConfig::builtin_tau && dflt.max_k == 7 &&
+          dflt.first == 2 && dflt.step == 1 && dflt.min1 == 0 && dflt.source == e::ConfidenceConfig::Source::builtin);
+    set_env("STRIX_G4_MTP_CONF","auto"); CHECK(e::ConfidenceConfig::from_environment().per_drafter);
+    set_env("STRIX_G4_MTP_CONF",nullptr);
+    {   // Resolution precedence.
+        const auto a = dflt.resolved(0.3,5,1,0.6);            // config keys win over the drafter builtin
+        CHECK(a.tau == 0.3 && a.max_k == 5 && a.first == 1 && a.source == e::ConfidenceConfig::Source::drafter_config && !a.per_drafter);
+        const auto b = dflt.resolved(0,0,0,0.3);              // no keys: the drafter's builtin tau
+        CHECK(b.tau == 0.3 && b.max_k == 7 && b.first == 2 && b.source == e::ConfidenceConfig::Source::builtin);
+        const auto c0 = dflt.resolved(0,0,0,0);               // unknown drafter: builtin_tau
+        CHECK(c0.tau == e::ConfidenceConfig::builtin_tau);
+        set_env("STRIX_G4_MTP_CONF_K","4");
+        const auto k = e::ConfidenceConfig::from_environment().resolved(0.3,6,0,0); // env K wins over config max_k
+        CHECK(k.max_k == 4 && k.tau == 0.3);
+        set_env("STRIX_G4_MTP_CONF_K",nullptr);
+        set_env("STRIX_G4_MTP_CONF","0.45");
+        const auto env = e::ConfidenceConfig::from_environment();
+        const auto r = env.resolved(0.3,5,1,0.6);              // explicit env tau ignores the drafter entirely
+        CHECK(r.tau == 0.45 && r.max_k == 7 && r.first == 2 && r.source == e::ConfidenceConfig::Source::env);
+        CHECK(std::string(r.json().find("source")->as_string()) == "env");
+        set_env("STRIX_G4_MTP_CONF",nullptr);
+    }
+    for (const char* v : {"0","off","0.0"}) { set_env("STRIX_G4_MTP_CONF",v); CHECK(!e::ConfidenceConfig::from_environment().enabled()); }
+    set_env("STRIX_G4_MTP_CONF_K","9"); // ignored while disabled
+    set_env("STRIX_G4_MTP_CONF","off"); CHECK(!e::ConfidenceConfig::from_environment().enabled());
+    set_env("STRIX_G4_MTP_CONF","0.4"); CHECK(rejected());
+    set_env("STRIX_G4_MTP_CONF_K","0"); CHECK(rejected());
+    set_env("STRIX_G4_MTP_CONF_K","2.5"); CHECK(rejected());
+    set_env("STRIX_G4_MTP_CONF_K","7"); set_env("STRIX_G4_MTP_CONF_FIRST","1"); set_env("STRIX_G4_MTP_CONF_STEP","3");
+    set_env("STRIX_G4_MTP_CONF_MIN1","0.2");
+    const auto tuned = e::ConfidenceConfig::from_environment();
+    CHECK(tuned.enabled() && tuned.tau == 0.4 && tuned.max_k == 7 && tuned.first == 1 && tuned.step == 3 && tuned.min1 == 0.2);
+    CHECK(tuned.json().find("enabled")->as_bool() && tuned.json().find("max_k")->as_int() == 7);
+    set_env("STRIX_G4_MTP_CONF_FIRST","8"); CHECK(rejected());
+    set_env("STRIX_G4_MTP_CONF_FIRST",nullptr); set_env("STRIX_G4_MTP_CONF_STEP","0"); CHECK(rejected());
+    set_env("STRIX_G4_MTP_CONF_STEP",nullptr); set_env("STRIX_G4_MTP_CONF_MIN1","1.5"); CHECK(rejected());
+    set_env("STRIX_G4_MTP_CONF_MIN1",nullptr);
+    set_env("STRIX_G4_MTP_CONF","1.01"); CHECK(rejected());
+    set_env("STRIX_G4_MTP_CONF","-0.1"); CHECK(rejected());
+    set_env("STRIX_G4_MTP_CONF","x"); CHECK(rejected());
+    set_env("STRIX_G4_MTP_CONF","1"); CHECK(e::ConfidenceConfig::from_environment().tau == 1);
+    for (const auto* n : names) set_env(n,nullptr);
+    // Rule: tau 0.5, first 2, step 1. P = 0.9, 0.72, 0.504, 0.252 -> extend while P(last) >= 0.5, window = 3.
+    e::ConfidenceConfig c; c.tau = 0.5;
+    const std::vector<float> p{0.9F,0.8F,0.7F,0.5F,0.9F,0.9F,0.9F};
+    const auto sub = [&](std::uint32_t n) { return std::span<const float>(p.data(),n); };
+    CHECK(c.next_depth({},5) == 2 && c.next_depth({},1) == 1);
+    CHECK(c.next_depth(sub(2),5) == 3 && c.next_depth(sub(3),5) == 4 && c.next_depth(sub(4),5) == 4);
+    CHECK(c.next_depth(sub(3),3) == 3); // capped by kmax
+    CHECK(c.window(sub(4)) == 3 && c.window(sub(2)) == 2 && c.window({}) == 0);
+    const std::vector<float> low{0.3F,0.9F};
+    CHECK(c.window(low) == 1 && c.next_depth(low,5) == 2); // at least one verified depth; no extension below tau
+    c.min1 = 0.4; CHECK(c.window(low) == 0);                 // MIN1: no draft verified
+    c.min1 = 0; c.step = 2; CHECK(c.next_depth(sub(2),5) == 4 && c.next_depth(sub(4),7) == 4);
+    c.tau = 1; CHECK(c.window(sub(4)) == 1 && c.next_depth(sub(2),7) == 2);
+}
 }
 int main() {
     try {
         simulate(true,false); simulate(false,false); simulate(true,true);
         measured_profile();
         multi_stream();
+        confidence();
         e::AutoPolicy changing;
         for (unsigned c = 0; c < 512; ++c) {
             const unsigned k = c%2 ? 2 : 0;

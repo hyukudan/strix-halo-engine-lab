@@ -164,6 +164,15 @@ void product_table() {
     check(status(r, "draft_mode") == pr::Status::off, "--dflash off");
     r = pr::resolve(pr::Name::standard, pr::App::engine, in({}, {}, lookup({{"STRIX_G4_DFLASH", "0"}})));
     check(status(r, "draft_mode") == pr::Status::off, "STRIX_G4_DFLASH=0");
+    // C1 MTP confidence window: exact, auto (per drafter) in all three profiles; STRIX_G4_MTP_CONF=0 is the switch.
+    for (const auto p : {pr::Name::standard, pr::Name::fast, pr::Name::quality}) {
+        r = pr::resolve(p, pr::App::engine, in({{"exl3_route", "/m4"}}));
+        check(status(r, "draft_window") == pr::Status::builtin && value(r, "draft_window") == "auto", "confidence window auto");
+    }
+    r = pr::resolve(pr::Name::standard, pr::App::engine, in({}, {}, lookup({{"STRIX_G4_MTP_CONF", "0"}})));
+    check(status(r, "draft_window") == pr::Status::off, "STRIX_G4_MTP_CONF=0");
+    r = pr::resolve(pr::Name::standard, pr::App::engine, in({}, {}, lookup({{"STRIX_G4_MTP_CONF", "0.45"}})));
+    check(status(r, "draft_window") == pr::Status::explicit_env && value(r, "draft_window") == "0.45", "STRIX_G4_MTP_CONF=0.45");
     // The prefill bench only has WMMA linears: DEFAULT and QUALITY refuse there instead of running them.
     refuses([] { (void)pr::resolve(pr::Name::standard, pr::App::prefill_bench, in()); }, "prefill-exact",
             "default refuses the WMMA-only prefill bench");
