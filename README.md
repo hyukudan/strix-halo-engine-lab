@@ -29,7 +29,8 @@ Published measurements include:
 - **GLM-5.3 Flash:** default exact MTP self-speculation reaches
   37.1 / 44.5 / 40.0 tok/s on chat / code / JSON.
 - **GLM-5.3 Flash on one RTX PRO 6000, whole-device budgets:** exact prefill and decode with an expert cache across
-  VRAM, pinned RAM and disk. Full card unchanged: TTFT 17.7 s at 8K, 41.2 s at 32K; decode 3.3 tok/s warm. Now also
+  VRAM, pinned RAM and disk. Full card: TTFT 17.7 s at 8K, 41.2 s at 32K (see the note below: about 10-15 s higher per prefill on current
+  main until a fix lands); decode 3.3 tok/s warm. Now also
   runs exact with 24 GiB VRAM + 32 GiB host RAM (experts streamed from disk): TTFT 64.8 s at 1K, 76.7 s at 8K;
   decode 0.67 tok/s warm (0.63 cold). Exact = every state/logit digest equals a fresh prefill of prompt+t.
 
@@ -537,6 +538,14 @@ Prefill and decode are exact (bitwise digests of logits and state; prefill state
 tiles); decode about **3.3 tok/s** warm (2.5 cold), bound by compute and launch overhead and still being optimised.
 With 24 GiB VRAM + 32 GiB host RAM (most experts streamed from the unit file on disk) it also runs exact: TTFT
 **64.8 s** at 1K and **76.7 s** at 8K; decode **0.67 tok/s** warm (0.63 cold). Build, unit file and options: [GLM RTX guide](src/glm/rtxpf/README.md).
+
+> **Known regression on current main (full card TTFT):** since #202 the decode-residency restore runs inside each
+> prefill and, with a file tier, re-copies evicted expert units; a smaller spare share under a file tier
+> costs a few seconds more. In all it adds about 10-15 s per prefill (8K about 29 s, 32K about 54 s instead of 17.7 / 41.2 s).
+> Outputs are unchanged and exact. A fix that restores lazily before the first decode step is in progress. Workaround
+> (exact; expected from the host-side measurements, not yet confirmed on the GPU): `STRIX_GLM_RTX_RESTORE_RESIDENCY=0`
+> (or `--restore-decode-residency 0`) removes the restore, about 10-11 s of it; decode right after a prefill then
+> misses the expert cache more often.
 
 ### Nemotron 3.5 Bolt E4B
 
