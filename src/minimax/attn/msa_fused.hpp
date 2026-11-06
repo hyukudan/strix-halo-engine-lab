@@ -124,6 +124,9 @@ unsigned attend_version(const DecodeView& v);  // attend kernel version the laun
 // Persistent index grid cap (default 160 blocks = 4 per WGP); STRIX_MMATTN_INDEX_GRID overrides it (bench only).
 unsigned index_grid_cap();
 void set_index_grid_cap(unsigned cap);  // tests and bench only (changes the grid: recapture graphs)
+// Decode index launch split by index head (STRIX_MMATTN_INDEX_SPLIT=1, opt-in, default OFF; bitwise-identical scores and caches).
+bool index_split();
+void set_index_split(bool on);  // tests and bench only (changes the grid: recapture graphs)
 void set_attend_lds_min(std::size_t bytes);  // bench only: minimum dynamic LDS of the v2/v3 attend (occupancy A/B);
                                              // a view with lds_diet whose selection fits the tile ignores it
 

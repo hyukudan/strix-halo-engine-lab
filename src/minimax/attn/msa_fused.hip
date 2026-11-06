@@ -4,7 +4,9 @@
 // it (fewer launches, N sequences per launch) and how the caches are read (coalesced tiles through LDS).
 #include "msa_fused.hpp"
 
+#include <atomic>
 #include <cstdlib>
+#include <cstring>
 #include <stdexcept>
 #include <string>
 #include <type_traits>
@@ -111,20 +113,31 @@ __device__ __forceinline__ Item item_of(const DecodeView& v, unsigned item) {
     return it;
 }
 // First item >= item (stepping by the grid) whose block holds visible positions; items when none.
-__device__ __forceinline__ unsigned next_valid(const DecodeView& v, unsigned item, unsigned items) {
-    for (; item < items; item += gridDim.x) {
+__device__ __forceinline__ unsigned next_valid(const DecodeView& v, unsigned item, unsigned items, unsigned stride) {
+    for (; item < items; item += stride) {
         const Item it = item_of(v, item);
         if (it.b * kBlock < it.count) return item;
     }
     return items;
 }
+__device__ __forceinline__ unsigned next_valid(const DecodeView& v, unsigned item, unsigned items) {
+    return next_valid(v, item, items, gridDim.x);
+}
+// OLD_ONLY: read cached rows only below the sequence's first new position (rows >= pos[s*W] are patched from raw ik
+// by the caller). The split decode launch needs it: copy 0 stores those rows while the other copies load the tile.
+template <bool OLD_ONLY = false>
 __device__ __forceinline__ void load_tile(const DecodeView& v, unsigned item, uint4* pre) {
     const Item it = item_of(v, item);
     const uint4* src = reinterpret_cast<const uint4*>(v.ik_cache[it.s] + it.b * kBlock * kIdxDim);
+    std::uint64_t limit = it.count;
+    if constexpr (OLD_ONLY) {
+        const std::uint64_t first_new = v.pos[it.s * v.rows_per_seq];
+        limit = first_new < limit ? first_new : limit;
+    }
 #pragma unroll
     for (unsigned i = 0; i < kChunks16 / kIdxThreads; ++i) {
         const unsigned e = i * kIdxThreads + threadIdx.x;
-        pre[i] = it.b * kBlock + (e >> 4U) < it.count ? src[e] : make_uint4(0U, 0U, 0U, 0U);
+        pre[i] = it.b * kBlock + (e >> 4U) < limit ? src[e] : make_uint4(0U, 0U, 0U, 0U);
     }
 }
 
@@ -214,7 +227,10 @@ __global__ __launch_bounds__(kIdxThreads) void prefill_prep_kernel(PrefillView p
     }
 }
 
-template <class View>
+// SPLIT (decode, STRIX_MMATTN_INDEX_SPLIT=1, opt-in, default OFF): the grid is idx_heads copies of the item grid; copy h0 scores
+// only index head h0 of the same items. Per-head dot, wave max and in-order max over waves are unchanged, so every
+// score is bitwise the same; new index-key rows are stored to the cache by copy 0 only (all copies patch their tile).
+template <class View, bool SPLIT = false>
 __global__ __launch_bounds__(kIdxThreads) void index_kernel(View input) {
     const DecodeView v = kernel_view(input, blockIdx.y);
     extern __shared__ uint4 smem[];
@@ -225,12 +241,15 @@ __global__ __launch_bounds__(kIdxThreads) void index_kernel(View input) {
     const unsigned W = v.rows_per_seq, H = v.idx_heads, rows = v.seqs * W;
     const unsigned local = (v.max_blocks + v.shard_count - 1 - v.shard_rank) / v.shard_count;
     const unsigned items = v.seqs * local;
-    std::uint64_t* ph = v.phase_index != nullptr && tid == 0 ? v.phase_index + static_cast<std::size_t>(blockIdx.x) * 4 : nullptr;
+    const unsigned gx = SPLIT ? gridDim.x / H : gridDim.x, bx = SPLIT ? blockIdx.x % gx : blockIdx.x;
+    const unsigned h0 = SPLIT ? blockIdx.x / gx : 0U, h_begin = SPLIT ? h0 : 0U, h_end = SPLIT ? h0 + 1 : H;
+    // Split launch: phase stamps come from the head-0 copy of each block only (slot layout unchanged, bx-indexed).
+    std::uint64_t* ph = v.phase_index != nullptr && tid == 0 && h0 == 0 ? v.phase_index + static_cast<std::size_t>(bx) * 4 : nullptr;
     if (ph != nullptr) ph[0] = static_cast<std::uint64_t>(wall_clock64());
     std::uint64_t n_items = 0;
     if constexpr (!prefill_kernel<View>) prep_kv(v);
-    for (unsigned n = wave; n < rows * H; n += kIdxThreads / 32) {  // normed index q of every row, once per block
-        const unsigned r = n / H;
+    for (unsigned m = wave; m < rows * (h_end - h_begin); m += kIdxThreads / 32) {  // normed index q, once per block
+        const unsigned r = m / (h_end - h_begin), n = r * H + h_begin + m % (h_end - h_begin);
         float x[kDimsPerLane];
         load4(x, v.iq + static_cast<std::size_t>(n) * kIdxDim, lane);
         norm_rope_lane(x, v.iq_w, v.rope[r], lane);
@@ -240,12 +259,12 @@ __global__ __launch_bounds__(kIdxThreads) void index_kernel(View input) {
     if (ph != nullptr) ph[1] = static_cast<std::uint64_t>(wall_clock64());
     // No register prefetch of the next tile: with the grid cap enough blocks are resident to cover the latency, and
     // the 64 extra VGPRs made the compiler spill.
-    for (unsigned item = next_valid(v, blockIdx.x, items); item < items; item = next_valid(v, item + gridDim.x, items)) {
+    for (unsigned item = next_valid(v, bx, items, gx); item < items; item = next_valid(v, item + gx, items, gx)) {
         const Item it = item_of(v, item);
         ++n_items;
         {
             uint4 pre[kChunks16 / kIdxThreads];
-            load_tile(v, item, pre);
+            load_tile<SPLIT>(v, item, pre);
 #pragma unroll
             for (unsigned i = 0; i < kChunks16 / kIdxThreads; ++i) {
                 const unsigned e = i * kIdxThreads + tid;
@@ -264,7 +283,7 @@ __global__ __launch_bounds__(kIdxThreads) void index_kernel(View input) {
             norm_rope_lane(x, v.ik_w, v.rope[r], lane);
             const uint2 packed = pack4(x);
             if constexpr (!prefill_kernel<View>)
-                *reinterpret_cast<uint2*>(v.ik_cache[it.s] + p * kIdxDim + lane * kDimsPerLane) = packed;
+                if (h0 == 0) *reinterpret_cast<uint2*>(v.ik_cache[it.s] + p * kIdxDim + lane * kDimsPerLane) = packed;
             const unsigned t = static_cast<unsigned>(p - it.b * kBlock);
             reinterpret_cast<uint2*>(tile + swz(t, lane >> 1U))[lane & 1U] = packed;
         }
@@ -278,7 +297,7 @@ __global__ __launch_bounds__(kIdxThreads) void index_kernel(View input) {
             const std::uint64_t count = v.pos[r] + 1;
             if (it.b * kBlock >= count) continue;  // uniform over the block
 #pragma unroll 1
-            for (unsigned h = 0; h < H; ++h) {
+            for (unsigned h = h_begin; h < h_end; ++h) {
                 float sc = -__builtin_inff();
                 if (t < count) {
                     // Opaque to the optimizer: the conversions stay inside the dot instead of being hoisted.
@@ -290,10 +309,10 @@ __global__ __launch_bounds__(kIdxThreads) void index_kernel(View input) {
             }
         }
         __syncthreads();
-        if (tid < W * H) {
-            const unsigned rr = tid / H, h = tid % H, r = it.s * W + rr;
+        if (tid < W * (h_end - h_begin)) {
+            const unsigned rr = tid / (h_end - h_begin), h = h_begin + tid % (h_end - h_begin), r = it.s * W + rr;
             if (it.b * kBlock < v.pos[r] + 1) {
-                const float* wm = wave_max + tid * (kIdxThreads / 32);
+                const float* wm = wave_max + (rr * H + h) * (kIdxThreads / 32);
                 float m = wm[0];
                 for (unsigned w = 1; w < kIdxThreads / 32; ++w) m = max_of(m, wm[w]);
                 v.scores[(static_cast<std::size_t>(r) * H + h) * v.max_blocks + it.j] = m;
@@ -1849,6 +1868,24 @@ unsigned g_index_grid_cap = [] {
 }  // namespace
 unsigned index_grid_cap() { return g_index_grid_cap; }
 void set_index_grid_cap(unsigned cap) { g_index_grid_cap = cap > 0 ? cap : 1U; }
+namespace {
+// STRIX_MMATTN_INDEX_SPLIT=1 (opt-in; absent or any other value keeps the old launch: one block per item scores every
+// index head). Read at the first decode index
+// launch (after the engine resolver exported defaults / baseline), not at load.
+// Atomic: decode launches may come from several host threads; racing first reads resolve the same env value.
+std::atomic<int> g_index_split{-1};
+}  // namespace
+bool index_split() {
+    int on = g_index_split.load(std::memory_order_relaxed);
+    if (on < 0) {
+        const char* e = std::getenv("STRIX_MMATTN_INDEX_SPLIT");
+        int expected = -1;
+        const int resolved = e != nullptr && std::strcmp(e, "1") == 0 ? 1 : 0;
+        on = g_index_split.compare_exchange_strong(expected, resolved, std::memory_order_relaxed) ? resolved : expected;
+    }
+    return on != 0;
+}
+void set_index_split(bool on) { g_index_split.store(on ? 1 : 0, std::memory_order_relaxed); }
 
 void enqueue_index(const DecodeView& v, hipStream_t stream) {
     const unsigned rows = v.seqs * v.rows_per_seq;
@@ -1859,7 +1896,10 @@ void enqueue_index(const DecodeView& v, hipStream_t stream) {
     const unsigned items = v.seqs * local;
     const unsigned cap = index_grid_cap(), grid = items == 0 ? 1U : items < cap ? items : cap;  // >= 1: K/V rows
     const std::size_t lds = kChunks16 * sizeof(uint4) + static_cast<std::size_t>(rows) * v.idx_heads * kIdxDim * sizeof(float);
-    hipLaunchKernelGGL((index_kernel<DecodeView>), dim3(grid), dim3(kIdxThreads), lds, stream, v);
+    if (index_split() && v.idx_heads > 1)
+        hipLaunchKernelGGL((index_kernel<DecodeView, true>), dim3(grid * v.idx_heads), dim3(kIdxThreads), lds, stream, v);
+    else
+        hipLaunchKernelGGL((index_kernel<DecodeView>), dim3(grid), dim3(kIdxThreads), lds, stream, v);
     check(hipGetLastError(), "minimax fused index");
 }
 

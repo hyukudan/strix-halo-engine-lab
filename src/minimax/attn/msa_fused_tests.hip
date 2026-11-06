@@ -448,6 +448,17 @@ void run_case(const Case& c, std::mt19937& rng) {
         mf::enqueue_decode(new_view(d, x), nullptr);
         hip_ok(hipDeviceSynchronize(), "sync B3");
         same_out(d, a, read_out(d, x), "fused grid 3");
+        // Index launch split by head off (the old one-block-per-item launch) and on, grid 3 and default grid.
+        const bool split = mf::index_split();
+        for (unsigned arm = 0; arm < 3; ++arm) {
+            mf::set_index_split(arm != 0);
+            mf::set_index_grid_cap(arm == 1 ? 3U : saved);
+            reset_caches(d, x);
+            mf::enqueue_decode(new_view(d, x), nullptr);
+            hip_ok(hipDeviceSynchronize(), "sync split");
+            same_out(d, a, read_out(d, x), ("fused index split arm " + std::to_string(arm)).c_str());
+        }
+        mf::set_index_split(split);
         mf::set_index_grid_cap(saved);
     }
     // Precomputed selection (select = false): idx/cnt from A as inputs.
@@ -504,23 +515,29 @@ void run_case(const Case& c, std::mt19937& rng) {
             const auto sa = host(x.scores, n);
             const auto ka = host(x.kc[0], d.kc[0].size()), va = host(x.vc[0], d.vc[0].size()),
                        ia = host(x.ikc[0], d.ikc[0].size());
-            reset_caches(d, x);
-            mf::DecodeView v = new_view(d, x);
-            v.shard_rank = sh;
-            v.shard_count = 2;
-            mf::enqueue_index(v, nullptr);
-            hip_ok(hipDeviceSynchronize(), "sync shard B");
-            const auto sb = host(x.scores, n);
-            bool ok = same(ka, host(x.kc[0], d.kc[0].size())) && same(va, host(x.vc[0], d.vc[0].size())) &&
-                      same(ia, host(x.ikc[0], d.ikc[0].size()));
-            for (unsigned r = 0; r < x.R; ++r) {
-                const std::uint64_t nb = msa::block_count(d.pos[r] + 1);
-                const std::uint64_t local = nb > sh ? (nb - sh + 1) / 2 : 0;
-                for (unsigned h = 0; h < c.idx_heads; ++h)
-                    ok &= std::memcmp(&sa[(r * c.idx_heads + h) * d.max_blocks], &sb[(r * c.idx_heads + h) * d.max_blocks],
-                                      local * 4) == 0;
+            // Both index launches (split by index head and the old one) must equal the reference shard.
+            const bool split_saved = mf::index_split();
+            for (unsigned sp = 0; sp < 2; ++sp) {
+                mf::set_index_split(sp != 0);
+                reset_caches(d, x);
+                mf::DecodeView v = new_view(d, x);
+                v.shard_rank = sh;
+                v.shard_count = 2;
+                mf::enqueue_index(v, nullptr);
+                hip_ok(hipDeviceSynchronize(), "sync shard B");
+                const auto sb = host(x.scores, n);
+                bool ok = same(ka, host(x.kc[0], d.kc[0].size())) && same(va, host(x.vc[0], d.vc[0].size())) &&
+                          same(ia, host(x.ikc[0], d.ikc[0].size()));
+                for (unsigned r = 0; r < x.R; ++r) {
+                    const std::uint64_t nb = msa::block_count(d.pos[r] + 1);
+                    const std::uint64_t local = nb > sh ? (nb - sh + 1) / 2 : 0;
+                    for (unsigned h = 0; h < c.idx_heads; ++h)
+                        ok &= std::memcmp(&sa[(r * c.idx_heads + h) * d.max_blocks],
+                                          &sb[(r * c.idx_heads + h) * d.max_blocks], local * 4) == 0;
+                }
+                check(ok, std::string(c.name) + " shard " + std::to_string(sh) + " split " + std::to_string(sp));
             }
-            check(ok, std::string(c.name) + " shard " + std::to_string(sh));
+            mf::set_index_split(split_saved);
         }
     }
     std::printf("case %-14s seqs %u W %u heads %u/%u/%u last_pos %llu..: %s\n", c.name, c.seqs, c.W, c.q_heads, c.kv_heads,

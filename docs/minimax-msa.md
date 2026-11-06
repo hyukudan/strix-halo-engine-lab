@@ -169,6 +169,16 @@ is qualified by launch-count estimates.
   (12) No kernel publishes a flag to another block: completion is always the kernel boundary on the stream (the
   combine is its own launch), so no store-drain/fence protocol is needed yet; a ticket-based fused combine would have
   to drain its stores (`s_waitcnt vmcnt(0)` + release fence at agent scope) before the ticket.
+- **Decode index split by index head.** `STRIX_MMATTN_INDEX_SPLIT=1` (opt-in; absent keeps the old launch) runs
+  the decode `index_kernel` on grid x index-heads blocks, one index head per block, instead of one block scoring all
+  heads. Every block reads cached index-key rows only below the step's first new position and patches the new rows
+  from the raw index keys, so no block reads a row another block is writing; only the head-0 block of each grid slot
+  stores the new rows. Each score keeps the same dot order, scale and maximum tree, so scores, selections and outputs
+  are bitwise equal (the fused MSA tests byte-compare split 0 and 1, sharded and unsharded). Measured on the two-node
+  pair, 8K context, 48 decode steps, A B A B: 44.26 -> 44.15 ms/token, tokens identical in every run.
+  A later single-stream (C1) audit at 8K context found the split slower, about +0.5 ms/token, because every
+  index-head block repeats the item's tile work; that is why it stays off by default until the duplicated
+  tiles are removed.
 
 ## Prefill index query tiles
 

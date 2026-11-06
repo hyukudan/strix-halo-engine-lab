@@ -2967,6 +2967,19 @@ On two single-row sparse decode sequences at 8K positions or more, the v3 attend
 - **Measured gain:** Same binary/process bench on current main kernels (msa_fused_tests, STRIX_MMATTN_BENCH_DIET=1, graph, cache rotation; v3-full / v3 32 KB diet / v4 one head per wave): sparse N2/W1 8K 74.4 / 69.9 / 71.0, 32K 133.5 / 130.7 / 131.4, 128K 343.1 / 342.1 / 342.6 us/layer; the diet is chosen first. Controls: 8K N4 v3-full 122.8 vs diet 129.3 (stays v3). Earlier t9: 8K 83.9 -> 76.2 us
 - **Implementation / evidence:** [38-item resolver](../src/minimax/engine/mm_defaults.cpp), [rank gates](../apps/minimax_rank_main.cpp)
 
+<a id="mm-index-split"></a>
+
+### Decode index split by index head
+**Engine:** `minimax`. **Control:** `STRIX_MMATTN_INDEX_SPLIT`. **Default:** 0 (off; opt-in with `=1`).
+
+The decode MSA `index_kernel` launches grid x index-heads blocks, one index head per block, instead of one block scoring all index heads. Every block reads cached index-key rows only below the step's first new position and patches the new rows from the raw index keys, so no block reads a row another block is writing; only the head-0 block of each grid slot stores the new rows.
+
+- **Preconditions:** Decode index launches (prefill index query tiles are unchanged).
+- **Exactness evidence:** msa_fused_tests byte-compare split 0 and 1, sharded and unsharded (scores, selections, outputs); each score keeps the same dot order, scale and maximum tree; tokens identical in every pair run.
+- **Off switch:** STRIX_MMATTN_INDEX_SPLIT unset or =0
+- **Measured gain:** Opt-in, slower at C1 / 8K today: a later audit measured about +0.5 ms/token (duplicated index tiles); an earlier two-node pair run, 8K context, 48 decode steps, A B A B, measured 44.26 -> 44.15 ms/token.
+- **Implementation / evidence:** [fused MSA kernels](../src/minimax/attn/msa_fused.hip), [tests](../src/minimax/attn/msa_fused_tests.hip), [MSA notes](minimax-msa.md)
+
 <a id="mm-attend4-decode"></a>
 
 ### Decode attention v4, one head per wave

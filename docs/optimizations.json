@@ -1952,6 +1952,17 @@
   },
   {
     "engine": "minimax",
+    "name": "Decode index split by index head",
+    "flag_or_env": "STRIX_MMATTN_INDEX_SPLIT",
+    "default": "0",
+    "exact": "msa_fused_tests byte-compare split 0 and 1, sharded and unsharded (scores, selections, outputs); same dot order, scale and maximum tree; tokens identical in every pair run.",
+    "gain": "Opt-in, slower at C1 / 8K today: a later audit measured about +0.5 ms/token (duplicated index tiles); an earlier two-node pair run, 8K context, 48 decode steps, A B A B, measured 44.26 -> 44.15 ms/token",
+    "preconditions": "Decode index launches; prefill index query tiles are unchanged.",
+    "off_switch": "STRIX_MMATTN_INDEX_SPLIT unset or =0",
+    "doc_anchor": "docs/optimizations.md#mm-index-split"
+  },
+  {
+    "engine": "minimax",
     "name": "Decode attention v4, one head per wave",
     "flag_or_env": "STRIX_MM_ATTEND4_DECODE",
     "default": "1",
