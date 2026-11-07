@@ -3834,6 +3834,25 @@ read back. Covers the plain sites and the sites already fed by the fused expand 
 - **Measured gain:** Two-node pair TTFT, alternating arms: 8,192 tokens 15.07 -> 14.95 s (544 -> 548 tok/s, -0.8 %), 32,768 tokens 63.23 -> 62.23 s (518 -> 527 tok/s, -1.6 %)
 - **Implementation / evidence:** [resolver](../apps/glm_rank_defaults.hpp), [prefill kernels](../src/glm/prefill/glm_prefill.hip)
 
+<a id="glm-pf-hc-expand-rows"></a>
+
+### Prefill mHC expand + norm, two rows per block
+
+**Engine:** `glm`. **Control:** `STRIX_GLM_PF_HC_EXPAND_ROWS`. **Default:** 2.
+
+The fused hyper-connection expand + next-site norm of the exact prefill processes two token rows per thread block
+instead of one, on the plain path and on the TP2 path that forms the pair sum on load. Each row keeps the same lane
+mapping, reduction order and rounding as the one-row kernel; only the block placement changes, which halves the
+block count and shares the mixing weights between the two rows.
+
+- **Preconditions:** Exact chunked prefill with the fused expand + norm (`STRIX_GLM_PF_HC_FUSE=1`, the default).
+- **Automatic selection:** The engine default sets 2; the resolver reports it. Explicit values win; values other than 1 and 2 are rejected.
+- **Fallback notice:** None.
+- **Exactness evidence:** Host and device gates bitwise against the one-row kernel, including the pair-sum path; pair logits bitwise equal the anchors on both ranks at 8K.
+- **Off switch:** STRIX_GLM_PF_HC_EXPAND_ROWS=1, or --baseline
+- **Measured gain:** Two-node pair, alternating arms, 8,192 tokens: TTFT 13.671 -> 13.611 s (-0.44 %), measured with the other exact prefill levers of that build enabled.
+- **Implementation / evidence:** [resolver](../apps/glm_rank_defaults.hpp), [prefill kernels](../src/glm/prefill/glm_prefill.hip), [CTA kernel](../src/glm/prefill/glm_hc_expand_cta.inc)
+
 <a id="glm-pf-staged"></a>
 
 ### Staged prefill exchange

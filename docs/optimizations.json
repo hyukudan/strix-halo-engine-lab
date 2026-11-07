@@ -2458,6 +2458,17 @@
   },
   {
     "engine": "glm",
+    "name": "Prefill mHC expand + norm, two rows per block",
+    "flag_or_env": "STRIX_GLM_PF_HC_EXPAND_ROWS",
+    "default": "2",
+    "exact": "Host and device gates bitwise against the one-row kernel (including the TP2 pair-sum path); pair logits bitwise equal the anchors on both ranks at 8K.",
+    "gain": "Two-node pair, alternating arms, 8,192 tokens: TTFT 13.671 -> 13.611 s (-0.44 %), measured with the other exact prefill levers of that build enabled",
+    "preconditions": "Exact chunked prefill with the fused expand + norm (STRIX_GLM_PF_HC_FUSE=1, the default).",
+    "off_switch": "STRIX_GLM_PF_HC_EXPAND_ROWS=1, or --baseline",
+    "doc_anchor": "docs/optimizations.md#glm-pf-hc-expand-rows"
+  },
+  {
+    "engine": "glm",
     "name": "Staged prefill exchange",
     "flag_or_env": "STRIX_GLM_PF_STAGED",
     "default": "1",

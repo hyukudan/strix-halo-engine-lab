@@ -111,7 +111,7 @@ void test_plain_equals_receipt() {
 }
 
 void test_apply_env_default() {
-    CHECK(rd::env_items().size() == 35);  // + pf-dense-rows-v3, pf-mixnorm, pf-sumexp, pf-hc-hoist; pf-mla-gemm-v3 replaces v2 (one item per environment selector)
+    CHECK(rd::env_items().size() == 36);  // + pf-dense-rows-v3, pf-mixnorm, pf-sumexp, pf-hc-hoist, pf-hc-expand-rows; pf-mla-gemm-v3 replaces v2 (one item per environment selector)
     CHECK(resolve({}, {}).env.at("STRIX_GLM_PF_DENSE_ROWS").value == "3");
     CHECK(resolve({"--baseline"}, {}).env.at("STRIX_GLM_PF_DENSE_ROWS").value == "1");
     for (const char* v : {"1", "2", "3"})

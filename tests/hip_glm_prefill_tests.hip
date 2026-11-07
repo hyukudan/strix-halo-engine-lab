@@ -1767,6 +1767,7 @@ void bench_hc_seam(std::mt19937& g) {
     hok(hipHostFree(hQ), "host free");
     free_all();
 }
+#include "hip_glm_hc_expand_cta_fixture.inc"
 
 int main(int argc, char** argv) {
     if (argc < 2) {
@@ -1775,6 +1776,20 @@ int main(int argc, char** argv) {
     }
     const bool want_timing = !(argc > 2 && std::string(argv[2]) == "--no-timing");
     std::mt19937 g(20261025);
+    if (const char* only = std::getenv("STRIX_GLM_PF_TEST_ONLY"); only != nullptr) {
+        const std::string mode(only);
+        if (mode == "hcexpand-config") {
+            try { std::printf("hc-expand-rows=%u\n", P::hc_expand_cta_rows()); }
+            catch (const std::invalid_argument& e) { std::fprintf(stderr, "%s\n", e.what()); return 2; }
+            return 0;  // no allocation or device work
+        }
+        if (mode == "hcexpand" || mode == "hcexpandbench") {
+            test_hc_expand_cta(g, false);
+            if (failures == 0 && want_timing && mode == "hcexpandbench") test_hc_expand_cta(g, true);
+            std::printf("checks: %d failures: %d\n", checks, failures);
+            return failures ? 1 : 0;
+        }
+    }
     const char* dense_bench = std::getenv("STRIX_GLM_PF_DENSE_BENCH");
     const bool bench_dense = want_timing && dense_bench != nullptr && std::string(dense_bench) == "1";
     if (const char* only = std::getenv("STRIX_GLM_PF_TEST_ONLY"); only != nullptr && std::string(only) == "dense") {

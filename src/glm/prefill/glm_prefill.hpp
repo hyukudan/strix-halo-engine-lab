@@ -104,6 +104,18 @@ bool hc_expand_norm_split();
 void hc_norm_factor_rows(const float* X, float* rr, unsigned rows, hipStream_t s);
 void hc_expand_norm_rows(const float* X, const float* mix, const float* y, float* Xo, float* rr, unsigned* flag, unsigned rows,
                          hipStream_t s);
+// Two-row expand CTA: strict cached STRIX_GLM_PF_HC_EXPAND_ROWS=1 (kernel default) / 2 (rank default).
+// Default keeps the existing kernel. Explicit gate API bypasses the selector: each row
+// uses 256 threads and its own ordered tree. y1 != nullptr forms rank-ordered y + y1
+// before multiplication; hoist 0/1/2 are the existing load-placement controls.
+// Hoist 2 requires disjoint X/Xo. No resource, payload or performance qualification implied.
+unsigned hc_expand_cta_rows();
+void hc_expand_norm_rows_cta(unsigned cta_rows, unsigned hoist, const float* X, const float* mix,
+                             const float* y, const float* y1, float* Xo, float* rr, unsigned* flag,
+                             unsigned rows, hipStream_t s);
+// Gate/bench only: prints all variants' attributes and occupancy; false on spills or
+// an unlaunchable block. Does device work, unlike reading hc_expand_cta_rows().
+bool hc_expand_cta_resources();
 void hc_pre_rows_normed(const float* X, const float* fn, const float* base, const float* scale, const float* rr, float* z, float* mix,
                         float* xc, unsigned rows, hipStream_t s);
 // STRIX_GLM_PF_SUMEXP (default 1; =0 restores the exchange's sum2 then hc_expand_norm_rows): the pipelined TP2 seam hands

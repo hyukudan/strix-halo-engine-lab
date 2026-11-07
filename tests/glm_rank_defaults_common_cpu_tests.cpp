@@ -28,7 +28,7 @@ void test_common_default_rows() {
     static_assert(std::is_same_v<rd::EnvItem, profile::DefaultItem>);
     const Env absent;
     const auto empty = lookup(absent);
-    CHECK(rd::env_items().size() == 35);
+    CHECK(rd::env_items().size() == 36);
     for (const auto& row : rd::env_items()) {
         using Source = profile::DefaultSource;
         auto value = profile::resolve_default(row, false, empty);
