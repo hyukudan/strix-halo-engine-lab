@@ -509,7 +509,7 @@ int main(int argc, char** argv) {
             for (auto& ev : pe) hok(hipEventCreate(&ev), "ev");
             // Paired stage timings, independent of environment selection. Run with
             // 2048 0 2048 6144 2048 30720 to cover the three qualification positions.
-            const unsigned sv[4] = {6, 7, 6, 7}, ov[4] = {7, 7, 7, 7}, gv[4] = {2, 2, 3, 3};  // GEMM v2/v3 paired at each scores version, o-bar fixed
+            const unsigned sv[4] = {7, 7, 7, 7}, ov[4] = {7, 10, 7, 10}, gv[4] = {3, 3, 3, 3};  // o-bar v7 / v10 (default: batch of 2 k, 18 KB LDS) ABAB
             float stage_us[4][3][5]{};
             for (unsigned rep = 0; rep < 4; ++rep) {
                 // Alternate pair order to limit systematic warm-cache/clock bias.

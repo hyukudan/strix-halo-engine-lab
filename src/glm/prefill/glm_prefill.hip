@@ -1762,23 +1762,29 @@ __global__ __launch_bounds__(256) void mla_obar_v6_kernel(DsaSlot sl, const std:
 // contiguous slots per head and k); the latent of a batch of 4 k (36 slots, 128 dims) is staged in LDS as f32 (the exact
 // bf16 widening, done once per CTA instead of per thread), double buffered, one barrier per batch. Inner step: one LDS
 // read + 16 FMAs with an SGPR operand.
-constexpr unsigned kOb7Dims = 128, kOb7Steps = 4, kOb7Slots = kOb7Steps * kObRounds;  // 36
-constexpr unsigned kOb7LVec = kOb7Slots * kOb7Dims / 8, kOb7Ld = (kOb7LVec + 255) / 256;  // 576 uint4 (8 bf16), 3 per thread
+constexpr unsigned kOb7Dims = 128, kOb7Steps = 4;  // batch of 4 k = 36 slots, 576 uint4 (8 bf16), 3 per thread
+constexpr unsigned kOb7Tiles = kKvLora / kOb7Dims;
+// o-bar v10 = v7 with S = 2 (batches of 2 k): LDS 18 KB instead of 36 KB, so 4 CTAs fit per WGP instead of 3. Same k
+// order, chains and merge as v7 (same bits); only the staging batch size and barrier count change. Default (=7 restores
+// v7). S = 1 (9 KB LDS, one barrier per k) measured 3-10 % slower than S = 2; a grid with rows fastest inside groups of
+// 32 / 256 rows was 2-120 % slower (each tile CTA re-reads the row's 295 KB probability row from DRAM instead of L2).
+template <unsigned S>
 __global__ __launch_bounds__(256) void mla_obar_v7_kernel(DsaSlot sl, const std::uint32_t* tokens_all, const std::uint32_t* n_all,
                                                           const float* e_all, float* ob) {
-    __shared__ alignas(16) float lt[2][kOb7Slots][kOb7Dims];  // 36 KB
-    const unsigned d0 = blockIdx.x * kOb7Dims, r = blockIdx.y, n = n_all[r];
+    constexpr unsigned Sl = S * kObRounds, LV = Sl * kOb7Dims / 8, LD = (LV + 255) / 256;
+    __shared__ alignas(16) float lt[2][Sl][kOb7Dims];  // 36 KB (S = 4), 18 KB (S = 2, v10)
+    const unsigned r = blockIdx.y, d0 = blockIdx.x * kOb7Dims, n = n_all[r];
     const unsigned tid = threadIdx.x, lane = tid % 32, w = static_cast<unsigned>(__builtin_amdgcn_readfirstlane(static_cast<int>(tid / 32)));
     const std::uint32_t* tok = tokens_all + static_cast<std::size_t>(r) * kMaxTokens;
     const auto* pw = (ConstF*)(e_all + (static_cast<std::size_t>(r) * 32 + 4 * w) * kEStride);  // NOLINT: address-space cast (heads 4 w ..)
-    uint4 lr[kOb7Ld];
+    uint4 lr[LD];
     auto load = [&](unsigned b) {  // batch b (k = 4 b .. 4 b + 3) into registers
 #pragma unroll
-        for (unsigned i = 0; i < kOb7Ld; ++i) {
+        for (unsigned i = 0; i < LD; ++i) {
             const unsigned x = tid + 256 * i;
-            if (x < kOb7LVec) {
+            if (x < LV) {
                 const unsigned slot = x / (kOb7Dims / 8), c8 = x % (kOb7Dims / 8);
-                const unsigned t = bitrev8(kOb7Steps * b + slot / kObRounds) + 256 * (slot % kObRounds);
+                const unsigned t = bitrev8(S * b + slot / kObRounds) + 256 * (slot % kObRounds);
                 lr[i] = t < n ? *reinterpret_cast<const uint4*>(sl.latent + static_cast<std::size_t>(tok[t]) * kKvLora + d0 + 8 * c8)
                               : uint4{0, 0, 0, 0};
             }
@@ -1786,9 +1792,9 @@ __global__ __launch_bounds__(256) void mla_obar_v7_kernel(DsaSlot sl, const std:
     };
     auto store = [&](unsigned buf) {
 #pragma unroll
-        for (unsigned i = 0; i < kOb7Ld; ++i) {
+        for (unsigned i = 0; i < LD; ++i) {
             const unsigned x = tid + 256 * i;
-            if (x < kOb7LVec) {
+            if (x < LV) {
                 const unsigned slot = x / (kOb7Dims / 8), c8 = x % (kOb7Dims / 8);
                 const std::uint32_t wv[4] = {lr[i].x, lr[i].y, lr[i].z, lr[i].w};
                 float f[8];
@@ -1804,11 +1810,11 @@ __global__ __launch_bounds__(256) void mla_obar_v7_kernel(DsaSlot sl, const std:
     load(0);
     store(0);
     __syncthreads();
-    for (unsigned b = 0; b < 256 / kOb7Steps; ++b) {
+    for (unsigned b = 0; b < 256 / S; ++b) {
         const unsigned cur = b & 1U;
-        if (b + 1 < 256 / kOb7Steps) load(b + 1);
-        for (unsigned j = 0; j < kOb7Steps; ++j) {
-            const unsigned k = kOb7Steps * b + j, l = bitrev8(k);
+        if (b + 1 < 256 / S) load(b + 1);
+        for (unsigned j = 0; j < S; ++j) {
+            const unsigned k = S * b + j, l = bitrev8(k);
             float p[4][kObRounds];
 #pragma unroll
             for (unsigned a = 0; a < 4; ++a)
@@ -1855,7 +1861,7 @@ __global__ __launch_bounds__(256) void mla_obar_v7_kernel(DsaSlot sl, const std:
                     *reinterpret_cast<float4*>(ob + (static_cast<std::size_t>(r) * 32 + 4 * w + a) * kKvLora + d0 + 4 * lane) =
                         float4{c[a][0], c[a][1], c[a][2], c[a][3]};
         }
-        if (b + 1 < 256 / kOb7Steps) store(cur ^ 1U);
+        if (b + 1 < 256 / S) store(cur ^ 1U);
         __syncthreads();
     }
 }
@@ -2559,16 +2565,18 @@ unsigned select_version() {  // default v2 (same lists as v1, -60..-85 % at t0 4
     }();
     return v;
 }
-unsigned obar_version() {  // default 7 (heads 32; heads 64 runs v2); STRIX_GLM_PF_OBAR=5 / 2 / 4 / 6: v5 / v2 / v4 / v6 (all same bits)
-    // measurement: v7 9.0-10.2 vs v5 16.6-17.3 us/row per DSA layer at t0 4096..28672 (6.6 vs 11.3 at t0 0); v5 18.1 vs v2
+unsigned obar_version() {  // default 10 (heads 32; heads 64 runs v2); STRIX_GLM_PF_OBAR=7 / 5 / 2 / 4 / 6: v7 / v5 / v2 / v4 / v6 (all same bits)
+    // measurement: v10 7.1 / 8.5 / 8.5 / 9.5 vs v7 7.9 / 9.3 / 9.3 / 10.3 us/row per DSA layer at t0 0 / 4096 / 12288 / 28672
+    // (-8..-10 %); v7 9.0-10.2 vs v5 16.6-17.3 us/row at t0 4096..28672 (6.6 vs 11.3 at t0 0); v5 18.1 vs v2
     // 53.9 at the 32K chunk; v4 5 % slower than v2; v6 2.4x slower than v5
     static const unsigned v = [] {
         const char* e = std::getenv("STRIX_GLM_PF_OBAR");
+        if (e && std::string(e) == "7") return 7U;
         if (e && std::string(e) == "6") return 6U;
         if (e && std::string(e) == "5") return 5U;
         if (e && std::string(e) == "4") return 4U;
         if (e && std::string(e) == "2") return 2U;
-        return 7U;
+        return 10U;
     }();
     return v;
 }
@@ -2928,7 +2936,10 @@ void mla_mark(unsigned i, hipStream_t s) {
 }
 }  // namespace
 void set_mla_profile(hipEvent_t* ev6) { g_mla_prof = ev6; }
-bool mla_e_lane_major(unsigned heads) { return !mla_v1() && (obar_version() == 5 || obar_version() == 7) && heads == 32; }
+bool mla_e_lane_major(unsigned heads) {
+    const unsigned v = obar_version();
+    return !mla_v1() && (v == 5 || v == 7 || v == 10) && heads == 32;
+}
 
 void mla_attention_rows_versions(const DsaSlot& slot, const std::uint32_t* tokens, const std::uint32_t* n, const float* q,
                         const std::uint16_t* kv_b, unsigned heads, float* qt, float* e, float* ob, float* o, unsigned C,
@@ -2937,7 +2948,7 @@ void mla_attention_rows_versions(const DsaSlot& slot, const std::uint32_t* token
     if (heads != 32 && heads != 64) throw std::runtime_error("glm pf mla_attention_rows: heads must be 32 or 64");
     if (gemm_v != 1 && gemm_v != 2 && gemm_v != 3) throw std::runtime_error("glm pf mla_attention_rows_versions: unsupported gemm version");
     if ((scores_v != 1 && scores_v != 2 && scores_v != 3 && scores_v != 4 && scores_v != 5 && scores_v != 6 && scores_v != 7) ||
-        (obar_v != 1 && obar_v != 2 && obar_v != 4 && obar_v != 5 && obar_v != 6 && obar_v != 7) ||
+        (obar_v != 1 && obar_v != 2 && obar_v != 4 && obar_v != 5 && obar_v != 6 && obar_v != 7 && obar_v != 10) ||
         ((scores_v == 1) != (obar_v == 1)))
         throw std::runtime_error("glm pf mla_attention_rows_versions: unsupported version pair");
     const bool v1 = scores_v == 1;  // explicit legacy pair
@@ -2974,8 +2985,9 @@ void mla_attention_rows_versions(const DsaSlot& slot, const std::uint32_t* token
     }
     ok(hipGetLastError(), "glm pf mla absorb/scores");
     mla_mark(2, s);
-    const unsigned obv = v1 ? 1U : (obar_v == 5 || obar_v == 7) && heads == 64 ? 2U : obar_v;  // v5 / v7: heads 32 only
-    if (obv == 5 || obv == 7) mla_softmax_rows_kernel<true><<<dim3(heads, C), 256, 0, s>>>(n, heads, e);
+    const bool lane_major_ob = obar_v == 5 || obar_v == 7 || obar_v == 10;  // v5 / v7 / v10: heads 32 only
+    const unsigned obv = v1 ? 1U : lane_major_ob && heads == 64 ? 2U : obar_v;
+    if (obv == 5 || obv == 7 || obv == 10) mla_softmax_rows_kernel<true><<<dim3(heads, C), 256, 0, s>>>(n, heads, e);
     else mla_softmax_rows_kernel<false><<<dim3(heads, C), 256, 0, s>>>(n, heads, e);
     ok(hipGetLastError(), "glm pf mla_softmax_rows");
     mla_mark(3, s);
@@ -2984,7 +2996,8 @@ void mla_attention_rows_versions(const DsaSlot& slot, const std::uint32_t* token
         mla_mark(4, s);
         mla_out_rows_kernel<<<dim3(heads, C), 256, 0, s>>>(ob, kv_b, heads, o);
     } else {
-        if (obv == 7) mla_obar_v7_kernel<<<dim3(kKvLora / kOb7Dims, C), 256, 0, s>>>(slot, tokens, n, e, ob);
+        if (obv == 10) mla_obar_v7_kernel<2><<<dim3(kOb7Tiles, C), 256, 0, s>>>(slot, tokens, n, e, ob);
+        else if (obv == 7) mla_obar_v7_kernel<kOb7Steps><<<dim3(kOb7Tiles, C), 256, 0, s>>>(slot, tokens, n, e, ob);
         else if (obv == 6) mla_obar_v6_kernel<<<dim3(heads / kOb6Heads, kKvLora / kOb6Dims, C), 256, 0, s>>>(slot, tokens, n, heads, e, ob);
         else if (obv == 5) mla_obar_v5_kernel<<<dim3(kKvLora / kOb5Dims, C), 256, 0, s>>>(slot, tokens, n, e, ob);
         else if (obv == 4) mla_obar_v4_kernel<<<dim3(heads / kOb4Heads, kKvLora / kOb4Dims, C), 256, 0, s>>>(slot, tokens, n, heads, e, ob);

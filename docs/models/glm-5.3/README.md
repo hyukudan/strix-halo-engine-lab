@@ -27,7 +27,7 @@ same `MODEL_DIR/tokenizer.json` the server loads) on the command line. `--identi
 8192 rows if both ranks admit them, otherwise 4096. See the [resolver](../../../apps/glm_rank_defaults.hpp),
 [model families](../model-families.md) and [qualification/performance](../../performance.md).
 
-Prefill MLA switches: `STRIX_GLM_PF_SCORES=6` and `STRIX_GLM_PF_OBAR=5` restore earlier stages; `STRIX_GLM_PF_MLA_GEMM=2` restores GEMM v2 (`=1` legacy); default v3 keeps the ascending-k FMA chains (pair logits and state bitwise equal to v2 at 8K and 32K; MLA GEMM time 41-43 % lower, TTFT 8K -1.9 %, 32K -2.3 %).
+Prefill MLA switches: `STRIX_GLM_PF_SCORES=6` and `STRIX_GLM_PF_OBAR=7` (o-bar v7; `=5` v5) restore earlier stages; default o-bar v10 stages 2 k per batch with the same chains (pair logits bitwise equal to v7 at 8K and 32K; o-bar time 7-9 % lower, TTFT 8K -0.7 %, 32K -0.3 %). `STRIX_GLM_PF_MLA_GEMM=2` restores GEMM v2 (`=1` legacy); default v3 keeps the ascending-k FMA chains (pair logits and state bitwise equal to v2 at 8K and 32K; MLA GEMM time 41-43 % lower, TTFT 8K -1.9 %, 32K -2.3 %).
 
 <a id="glm-serve"></a>
 

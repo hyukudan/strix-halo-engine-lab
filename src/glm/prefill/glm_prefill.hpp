@@ -54,11 +54,11 @@ void mla_attention_rows(const dev::DsaSlot& slot, const std::uint32_t* tokens, c
                         const std::uint16_t* kv_b, unsigned heads, float* qt, float* e, float* ob, float* o, unsigned C,
                         hipStream_t s);
 
-// Scores v7 (heads 32; heads 64 runs v5) and o-bar v7 are the defaults (STRIX_GLM_PF_SCORES=6 / STRIX_GLM_PF_OBAR=5
+// Scores v7 (heads 32; heads 64 runs v5) and o-bar v10 are the defaults (STRIX_GLM_PF_SCORES=6 / STRIX_GLM_PF_OBAR=7
 // restore the previous ones); STRIX_GLM_PF_OBAR=6 opts into o-bar v6 (exact, slower: not a default).
 // Explicit selectors for bitwise gates and paired stage timing, independent of cached environment values.
-// scores: 2/3/4/5/6/7; o-bar: 2/4/5/6/7 (5 and 7 fall back to 2 for heads=64); legacy pair: 1/1.
-// o-bar 5 or 7 with heads=32 uses lane-major e; all other pairs use token-order e. gemm (absorb / out): 1 / 2 / 3
+// scores: 2/3/4/5/6/7; o-bar: 2/4/5/6/7/10 (5, 7 and 10 fall back to 2 for heads=64); legacy pair: 1/1.
+// o-bar 5, 7 or 10 with heads=32 uses lane-major e; all other pairs use token-order e. gemm (absorb / out): 1 / 2 / 3
 // (same per-output chain; the legacy pair has its own). The default entry point runs 3; STRIX_GLM_PF_MLA_GEMM=2
 // restores v2, =1 the legacy tiled GEMM. V3 is bitwise equal to v2 on the pair at 8K and 32K.
 void mla_attention_rows_versions(const dev::DsaSlot& slot, const std::uint32_t* tokens, const std::uint32_t* n, const float* q,

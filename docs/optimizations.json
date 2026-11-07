@@ -2293,13 +2293,13 @@
   },
   {
     "engine": "glm",
-    "name": "Prefill MLA o-bar v7",
+    "name": "Prefill MLA o-bar v10",
     "flag_or_env": "STRIX_GLM_PF_OBAR",
-    "default": "7",
-    "exact": "Bitwise equal to v5 and the decode kernel on the prefill gate (incl. NaN/Inf/subnormal latents, lists 1..2051).",
-    "gain": "9.0-10.2 vs 16.6-17.3 us/row per DSA layer at chunk positions 4096..28672",
+    "default": "10",
+    "exact": "Bitwise equal to v7 / v5 and the decode kernel on the prefill gate (incl. NaN/Inf/subnormal latents, lists 1..2051); same k order and merge, latent staged 2 k per batch (18 KB LDS, 4 CTAs per WGP).",
+    "gain": "7.1 / 8.5 / 8.5 / 9.5 vs v7 7.9 / 9.3 / 9.3 / 10.3 us/row per DSA layer at chunk positions 0 / 4096 / 12288 / 28672 (v7: 9.0-10.2 vs v5 16.6-17.3)",
     "preconditions": "Exact chunked prefill, 32 MLA heads per rank (64 heads use v2).",
-    "off_switch": "STRIX_GLM_PF_OBAR=5 (or 2)",
+    "off_switch": "STRIX_GLM_PF_OBAR=7 (v7; =5 v5, =2 v2)",
     "doc_anchor": "docs/optimizations.md#glm-pf-obar-v5"
   },
   {

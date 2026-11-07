@@ -42,10 +42,10 @@ namespace P = strix::glm::pf;
 
 namespace {
 // Explicit MLA {scores, o-bar, gemm} versions gated bitwise against the 3/5/1 reference (intermediates, decode outputs).
-constexpr unsigned kMlaPairs = 15;
+constexpr unsigned kMlaPairs = 16;
 constexpr unsigned kMlaPair[kMlaPairs][3] = {{4, 5, 1}, {3, 6, 1}, {4, 6, 1}, {5, 5, 1}, {4, 7, 1}, {5, 7, 1},
                                              {5, 7, 2}, {4, 5, 2}, {4, 6, 2}, {6, 7, 2}, {6, 5, 1}, {7, 7, 2},
-                                             {7, 5, 1}, {7, 7, 3}, {4, 6, 3}};
+                                             {7, 5, 1}, {7, 7, 3}, {4, 6, 3}, {7, 10, 3}};
 
 int failures = 0, checks = 0;
 void check(bool ok, const std::string& what) {
@@ -515,7 +515,7 @@ void dsa_case(const DsaFix& fx, const std::string& label, unsigned T, const std:
                                     const unsigned lane = P::kObRounds * rev + j / 256;
                                     const std::size_t base = (static_cast<std::size_t>(rr) * H + h) * P::kEStride;
                                     same &= std::memcmp(&e_ref[base + (H == 32 ? lane : j)],
-                                                        &ep[base + (H == 32 && (ov == 5 || ov == 7) ? lane : j)], 4) == 0;
+                                                        &ep[base + (H == 32 && (ov == 5 || ov == 7 || ov == 10) ? lane : j)], 4) == 0;
                                 }
                         versions_ok[v] &= same;
                     }
@@ -1345,7 +1345,7 @@ void test_dsa(const std::string& cases, std::mt19937& g) {
                                 for (unsigned bit = 0; bit < 8; ++bit) rev |= ((j >> bit) & 1U) << (7 - bit);
                                 const unsigned lane = P::kObRounds * rev + j / 256;
                                 const std::size_t base = (static_cast<std::size_t>(r) * H + h) * P::kEStride;
-                                same &= std::memcmp(&er[base + (H == 32 ? lane : j)], &eo[base + (H == 32 && (ov == 5 || ov == 7) ? lane : j)], 4) == 0;
+                                same &= std::memcmp(&er[base + (H == 32 ? lane : j)], &eo[base + (H == 32 && (ov == 5 || ov == 7 || ov == 10) ? lane : j)], 4) == 0;
                             }
                     for (unsigned j = 0; j < 17; ++j) {
                         std::uint32_t u;
@@ -1354,7 +1354,7 @@ void test_dsa(const std::string& cases, std::mt19937& g) {
                     }
                 }
                 // Byte comparisons deliberately include NaN payloads and the output guard regions.
-                check(same, "MLA explicit scores/obar/gemm (incl. 7/7/3, 4/6/3) == 3/5/1 bitwise intermediates/output/guards H=" + std::to_string(H) +
+                check(same, "MLA explicit scores/obar/gemm (incl. 7/7/3, 4/6/3, 7/10/3) == 3/5/1 bitwise intermediates/output/guards H=" + std::to_string(H) +
                       (ieee ? " NaN/+Inf/-Inf latent" : " signed-zero/subnormal latent") + ", n=1..2051 tile boundaries");
             }
         }
