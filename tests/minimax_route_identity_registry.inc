@@ -50,6 +50,8 @@
 {"prefill-fuse", 'a', "single-split WMMA+epilogue contract", "prefill gufuse intermediate/producer debug gate in hip-mmx-moe-bench; default OFF; combinations outside gate remain unqualified", ""},
 // src/minimax/moe/mmx_prefill.hip:416
 {"prefill-table", 'a', "identical item table bytes", "prefill table ring event ownership; A/B pftab gate in rank app (1K/8K state identical); default ON in strix-minimax-rank only (serve off)", ""},
+// src/minimax/attn/msa_fused.hip: attend4_kernel INBLOCK; engine and rank A/B opt-in selectors
+{"prefill-msa-inblock", 'a', "fixed row+KV head+selected chunk IDs; mode-8 tile arithmetic and ascending FP32 chunk combine", "UNCOVERED native mode 10: msa_fused_tests.hip complete output/cache/selection bytes, graph replay, untouched partial scratch; rank 8K mode8/10 state+final-row FNV on both ranks; strict compiler/resource and full-workload gates pending", ""},
 // src/minimax/attn/msa_fused.hip:1714
 {"msa-attend", 'a', "MSA block128/chunk/FP32 combine contract", "msa_fused_tests.hip:run_case versions/head counts/graph replay", ""},
 // src/minimax/engine/engine.hip: route::attend_n2_sparse; src/minimax/attn/msa_fused.hip: launch_attend

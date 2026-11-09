@@ -206,6 +206,12 @@ void decode_and_verify() {
     gated_difference("decode-wide", "router_shared/gate_up wide columns at N2..4");
 }
 void prefill_cuts() {
+    // Mode 10 changes physical ownership only; native qualification stays open.
+    const auto& inblock = allow("prefill-msa-inblock");
+    require(inblock.category == 'a' && std::string_view(inblock.gate).find("UNCOVERED") != std::string_view::npos,
+            "in-block native gate must remain explicit until qualified");
+    compare_tuple("prefill-msa-inblock", {8, 16, 1, 1}, {10, 1, 0, 0});
+    gated_difference("prefill-msa-inblock", "global chunk partials+ticket tail -> register history+in-block ordered combine");
     // The production group builder sees the same row's four expert IDs, while
     // all companion rows either share expert 3 or avoid it.
     for (unsigned n : {1U,2U,4U,8U,9U,15U,16U,17U,31U,32U,33U,63U,64U,65U,127U,128U,129U,255U,256U,257U}) {
@@ -302,6 +308,15 @@ void config_receipts() {
         return std::string_view(key) == kBaselineEnv ? "1" : nullptr;
     };
     require(resolve(empty).size() == items().size(), "defaults registry");
+    for (const auto& resolved : resolve(empty))
+        if (std::string_view(resolved.item->env) == "STRIX_MM_PF_MSA_REWORK")
+            require(resolved.value == "10", "in-block mode 10 is the default");
+    const auto inblock_env = [](const char* name) -> const char* {
+        return std::string_view(name) == "STRIX_MM_PF_MSA_REWORK" ? "10" : nullptr;
+    };
+    for (const auto& resolved : resolve(inblock_env))
+        if (std::string_view(resolved.item->env) == "STRIX_MM_PF_MSA_REWORK")
+            require(resolved.value == "10", "explicit in-block mode must survive resolution");
     for (const auto& resolved : resolve(empty)) require(!resolved.value.empty(), "empty effective setting");
     require(effective_config(Cli{}, empty) != effective_config(Cli{}, baseline_env), "baseline receipt");
     std::ifstream receipt(fs::path(STRIX_ROUTE_SOURCE_DIR) / "tests/fixtures/minimax_production_receipt.txt");

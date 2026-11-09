@@ -3,6 +3,7 @@
 // src/hip_minimax_msa.hip (K1-K4) in the same order, so the outputs are bit-identical; what changes is who computes
 // it (fewer launches, N sequences per launch) and how the caches are read (coalesced tiles through LDS).
 #include "msa_fused.hpp"
+#include "msa_inblock_layout.hpp"
 
 #include <atomic>
 #include <cstdlib>
@@ -18,6 +19,8 @@ constexpr unsigned kIdxThreads = kBlock;    // index launch: thread = position o
 constexpr unsigned kPhases = 16;             // per attend block: 8 wall-clock stamps, then 8 shader-cycle stamps
 constexpr unsigned kChunks16 = kBlock * kHeadDim * 2 / 16;  // 16-byte pieces of a 128-key BF16 tile (2048)
 constexpr unsigned kPartial = 2 + kHeadDim;
+using InblockLayout = inblock::Layout<kHeadDim, kMaxChunks, kGroup, kTile>;
+static_assert(InblockLayout::kSharedBytes == 18496);
 constexpr unsigned kCountMax = 256;         // selection: rank by counting up to this many candidates, else radix
 
 __device__ __forceinline__ float butterfly_sum(float v) {
@@ -1299,8 +1302,207 @@ __global__ __launch_bounds__(256) void prefill_combine_kernel(PrefillView p) {
 }
 
 template <unsigned HPW, bool DENSE, class View = DecodeView, bool SEPARATE = false, bool STREAM = false, bool COMPACT = SEPARATE, bool PACKED = false,
-          bool CORRPACK = false, bool TAIL = !SEPARATE, unsigned TREE = 0>
-__global__ __launch_bounds__(kGroup / HPW * 32) void attend4_kernel(View input, int select) {
+          bool CORRPACK = false, bool TAIL = !SEPARATE, unsigned TREE = 0, bool INBLOCK = false>
+// HIP's second bound is minimum waves per execution unit. On gfx1151 wave32,
+// 12 waves target <=128 VGPR; removing history should approach mode 8's ~96.
+// Other specializations retain the default minimum of one wave.
+__global__ __launch_bounds__(kGroup / HPW * 32, INBLOCK ? 12 : 1) void attend4_kernel(View input, int select) {
+    if constexpr (INBLOCK) {
+        static_assert(HPW == 2 && repaired_prefill<View> && SEPARATE && STREAM && COMPACT && PACKED && CORRPACK && !TAIL && TREE == 1);
+        // Mode 10 v2: one live chunk accumulator set. LDS holds block IDs and
+        // m/l partials; numerators use existing scratch, with no tickets/fences.
+        constexpr unsigned NT = 256;
+        const unsigned row = input.first_window * kMaxRows + blockIdx.x / input.window.kv_heads;
+        const unsigned window = row / kMaxRows - input.first_window;
+        const DecodeView v = kernel_view(input, window);
+        const unsigned rg = (row % kMaxRows) * v.kv_heads + blockIdx.x % v.kv_heads;
+        if (rg >= v.rows_per_seq * v.kv_heads) return;
+        extern __shared__ uint4 dyn_smem[];
+        uint4* const tile_mem = dyn_smem;
+        auto* const block_ids = reinterpret_cast<std::uint32_t*>(reinterpret_cast<unsigned char*>(dyn_smem) + InblockLayout::kTileBytes);
+        auto* const stats = reinterpret_cast<float*>(reinterpret_cast<unsigned char*>(dyn_smem) + InblockLayout::kStatsOffset);
+        const unsigned tid = threadIdx.x, lane = tid & 31U, wave = tid >> 5U;
+        const unsigned r = rg / v.kv_heads, g = rg % v.kv_heads, s = r / v.rows_per_seq, q_heads = v.kv_heads * kGroup;
+        const unsigned qh0 = g * kGroup + wave * HPW;
+        const std::uint64_t count = v.pos[r] + 1;
+        float q[HPW][kDimsPerLane];
+    #pragma unroll
+        for (unsigned h = 0; h < HPW; ++h) load4(q[h], v.q + (static_cast<std::size_t>(r) * q_heads + qh0 + h) * kHeadDim, lane);
+        const std::uint32_t nb = static_cast<std::uint32_t>(block_count(count));
+        const bool all = DENSE || nb <= kTopK;
+        const std::uint32_t cnt = all ? nb : v.idx_count[rg];
+        if (cnt == 0) return;
+        const std::uint32_t* const ids = v.idx + static_cast<std::size_t>(rg) * kTopK;
+        if (tid < cnt) block_ids[tid] = all ? tid : ids[tid];
+        __syncthreads();
+        std::uint16_t* kc = v.k_cache[s];
+        std::uint16_t* vc = v.v_cache[s];
+    #pragma unroll
+        for (unsigned h = 0; h < HPW; ++h) norm_rope_lane(q[h], v.q_w, v.rope[r], lane);
+        auto keys_of = [&](unsigned c, std::uint64_t& lo) {
+            lo = static_cast<std::uint64_t>(block_ids[c]) * kBlock;
+            return static_cast<unsigned>((count < lo + kBlock ? count : lo + kBlock) - lo);
+        };
+        const unsigned key = tid / 16, piece = tid % 16;
+        auto fetch = [&](std::uint64_t lo, unsigned nk, unsigned t, uint4& kk, uint4& vv) {
+            const unsigned k = t * kTile + key;
+            kk = k < nk ? *reinterpret_cast<const uint4*>(kc + ((lo + k) * v.kv_heads + g) * kHeadDim + piece * 8)
+                        : make_uint4(0U, 0U, 0U, 0U);
+            vv = k < nk ? *reinterpret_cast<const uint4*>(vc + ((lo + k) * v.kv_heads + g) * kHeadDim + piece * 8)
+                        : make_uint4(0U, 0U, 0U, 0U);
+        };
+        std::uint64_t lo = 0;
+        unsigned n_keys = keys_of(0, lo);
+        {
+            uint4 k0, v0;
+            fetch(lo, n_keys, 0, k0, v0);
+            tile_mem[tid] = k0;
+            tile_mem[NT + tid] = v0;
+        }
+        unsigned slot = 0;  // K/V buffer of the current tile, continued across chunks
+    #pragma unroll 1
+        for (unsigned c = 0; c < cnt; ++c) {
+            float acc[HPW][kDimsPerLane], m[HPW], l[HPW], sv[HPW][2];
+    #pragma unroll
+            for (unsigned h = 0; h < HPW; ++h) {
+                for (unsigned i = 0; i < kDimsPerLane; ++i) acc[h][i] = 0.0F;
+                m[h] = -__builtin_inff();
+                l[h] = 0.0F;
+            }
+            const unsigned tiles = (n_keys + kTile - 1) / kTile;
+            std::uint64_t next_lo = lo;
+            unsigned next_keys = n_keys;
+            if (c + 1 < cnt) next_keys = keys_of(c + 1, next_lo);
+    #pragma unroll 1
+            for (unsigned t = 0; t < tiles; ++t, slot ^= 1U) {
+                uint4 next_k{}, next_v{};
+                uint4* const current = tile_mem + slot * (2 * NT);
+                __syncthreads();  // Publish the tile staged by the previous iteration.
+                const bool more = t + 1 < tiles || c + 1 < cnt;
+                if (t + 1 < tiles) fetch(lo, n_keys, t + 1, next_k, next_v);
+                else if (c + 1 < cnt) fetch(next_lo, next_keys, 0, next_k, next_v);
+    #pragma unroll
+                for (unsigned grp = 0; grp < 2; ++grp) {
+                    float sc[HPW];
+                    group_scores_h<HPW>(reinterpret_cast<const uint2*>(current), grp, q, lane, sc);
+                    const unsigned my_key = ((lane >> 4U) & 1U) * 4U + ((lane >> 3U) & 1U) * 2U + ((lane >> 2U) & 1U);
+    #pragma unroll
+                    for (unsigned h = 0; h < HPW; ++h)
+                        sv[h][grp] = t * kTile + grp * 8 + my_key < n_keys ? sc[h] : -__builtin_inff();
+                }
+                const uint2* const t2 = reinterpret_cast<const uint2*>(current + NT);
+                auto tile4 = [&](auto ntc) {  // mode 8's tile body (PACKED, CORRPACK, TREE 1)
+                    constexpr unsigned NTC = decltype(ntc)::value;
+                    const unsigned t0 = t * kTile;
+                    const unsigned nt = NTC != 0 ? NTC : (n_keys - t0 < kTile ? n_keys - t0 : kTile);
+                    float p0[HPW], p1[HPW], mprev[HPW];
+    #pragma unroll
+                    for (unsigned h = 0; h < HPW; ++h) {
+                        const float tm = tile_max_tree<1>(sv[h][0], sv[h][1]);
+                        const float mn = max_of(m[h], tm);
+                        mprev[h] = m[h];
+                        m[h] = mn;
+                    }
+                    const float mn = (lane & 1U) != 0U ? m[1] : m[0];
+    #pragma unroll
+                    for (unsigned half = 0; half < 2; ++half) {
+                        const float s0 = u2f(static_cast<std::uint32_t>(__builtin_amdgcn_ds_swizzle(
+                            static_cast<int>(f2u(sv[0][half])), 0x1c)));
+                        const float s1 = u2f(static_cast<std::uint32_t>(__builtin_amdgcn_ds_swizzle(
+                            static_cast<int>(f2u(sv[1][half])), 0x1c)));
+                        const float score = (lane & 1U) != 0U ? s1 : s0;
+                        const float mprev_lane = (lane & 1U) != 0U ? mprev[1] : mprev[0];
+                        const float arg = half == 0 && (lane & 2U) != 0U ? mprev_lane - mn : score - mn;
+                        const float probability = exp_f(arg);
+                        if (half == 0) p0[0] = probability;
+                        else p1[0] = probability;
+                    }
+    #pragma unroll
+                    for (unsigned h = 0; h < HPW; ++h) {
+                        const float corr = t == 0 ? 0.0F : rl(p0[0], 2 + static_cast<int>(h));
+                        l[h] = l[h] * corr;
+                        for (unsigned i = 0; i < kDimsPerLane; ++i) acc[h][i] = acc[h][i] * corr;
+                    }
+                    uint2 vrow[kTile];
+                    if constexpr (NTC != 0) {
+    #pragma unroll
+                        for (unsigned j = 0; j < kTile; ++j) vrow[j] = t2[j * 32 + lane];
+                        __builtin_amdgcn_sched_barrier(0);
+                    }
+    #pragma unroll
+                    for (unsigned j = 0; j < kTile; ++j) {
+                        if (NTC != 0 || j < nt) {
+                            const uint2 raw = NTC != 0 ? vrow[j] : t2[j * 32 + lane];
+                            const float v0 = lo_bf16(raw.x), v1 = hi_bf16(raw.x), v2 = lo_bf16(raw.y), v3 = hi_bf16(raw.y);
+    #pragma unroll
+                            for (unsigned h = 0; h < HPW; ++h) {
+                                const float pj = rl(j < 8 ? p0[0] : p1[0], key_lane(j % 8) + static_cast<int>(h));
+                                l[h] = l[h] + pj;
+                                acc[h][0] = __builtin_fmaf(pj, v0, acc[h][0]);
+                                acc[h][1] = __builtin_fmaf(pj, v1, acc[h][1]);
+                                acc[h][2] = __builtin_fmaf(pj, v2, acc[h][2]);
+                                acc[h][3] = __builtin_fmaf(pj, v3, acc[h][3]);
+                            }
+                        }
+                    }
+                };
+                if (v.pv_full_tiles != 0 && t * kTile + kTile <= n_keys) tile4(std::integral_constant<unsigned, kTile>{});
+                else if (t * kTile < n_keys) tile4(std::integral_constant<unsigned, 0>{});
+                if (more) {
+                    uint4* const next = tile_mem + (slot ^ 1U) * (2 * NT);
+                    next[tid] = next_k;
+                    next[NT + tid] = next_v;
+                }
+            }
+    #pragma unroll
+            for (unsigned h = 0; h < HPW; ++h) {
+                if (lane == 0) {
+                    stats[InblockLayout::stats_index(wave * HPW + h, 0, c)] = m[h];
+                    stats[InblockLayout::stats_index(wave * HPW + h, 1, c)] = l[h];
+                }
+    #pragma unroll
+                for (unsigned i = 0; i < kDimsPerLane; ++i)
+                    v.partial[InblockLayout::numerator_index(static_cast<std::size_t>(r) * q_heads + qh0 + h, c, lane, i)] = acc[h][i];
+            }
+            lo = next_lo;
+            n_keys = next_keys;
+        }
+        // Publish scalar partials from lane 0 to lane c. Numerators are read by
+        // their writer, so they need no cross-thread/global-memory fence.
+        __syncthreads();
+        // Same expressions/order as mode 8: max, exp, denominator FMA, numerator
+        // FMA, division. FP32 scratch stores preserve all accumulator bits.
+    #pragma unroll 1
+        for (unsigned h = 0; h < HPW; ++h) {
+            const float mc = lane < cnt ? stats[InblockLayout::stats_index(wave * HPW + h, 0, lane)] : -__builtin_inff();
+            const float lc = lane < cnt ? stats[InblockLayout::stats_index(wave * HPW + h, 1, lane)] : 0.0F;
+            float big = -__builtin_inff();
+    #pragma unroll
+            for (unsigned k = 0; k < kMaxChunks; ++k)
+                if (k < cnt) big = max_of(big, rl(mc, static_cast<int>(k)));
+            const float ec_own = exp_f(mc - big);
+            float L = 0.0F;
+    #pragma unroll 1
+            for (unsigned k = 0; k < cnt; ++k) {
+                const float e = rl(ec_own, static_cast<int>(k));
+                L = __builtin_fmaf(rl(lc, static_cast<int>(k)), e, L);
+            }
+            // Reuse the same broadcast e for four independent ordered FMA
+            // chains. No dynamically indexed register history or e[] array.
+            float a[kDimsPerLane]{};
+    #pragma unroll 1
+            for (unsigned k = 0; k < cnt; ++k) {
+                const float e = rl(ec_own, static_cast<int>(k));
+    #pragma unroll
+                for (unsigned i = 0; i < kDimsPerLane; ++i)
+                    a[i] = __builtin_fmaf(
+                        v.partial[InblockLayout::numerator_index(static_cast<std::size_t>(r) * q_heads + qh0 + h, k, lane, i)], e, a[i]);
+            }
+            float* o = v.o + (static_cast<std::size_t>(r) * q_heads + qh0 + h) * kHeadDim;
+    #pragma unroll
+            for (unsigned i = 0; i < kDimsPerLane; ++i) o[lane * kDimsPerLane + i] = a[i] / L;
+        }
+    } else {
     constexpr bool REPAIR = repaired_prefill<View>;
     static_assert(TREE == 0 || STREAM);  // the tree relies on STREAM's -inf scores for keys >= nt
     static_assert(!PACKED || (HPW == 2 && REPAIR && SEPARATE && STREAM && COMPACT));
@@ -1672,6 +1874,7 @@ __global__ __launch_bounds__(kGroup / HPW * 32) void attend4_kernel(View input, 
         }
         stamp(v.phase, 7);
     }
+    }  // !INBLOCK: preserve the existing attend specializations.
 }
 
 // R16 tile-major producer: four banks of eight waves, four scalarized row
@@ -2013,6 +2216,16 @@ template <bool DENSE> void launch_prefill_attend(const PrefillView& p, unsigned 
         }
         const auto chunks = prefill_chunk_prefix(p.pos0 + scheduled.rows) -
                             prefill_chunk_prefix(p.pos0 + p.first_window * kMaxRows);
+        if (p.msa_rework == 10) {
+            // Mode 8 producer/combine in one block per (row, group); v2 uses
+            // reserved numerator scratch and LDS scalar partials/IDs.
+            const RepairedPrefillView repaired{scheduled};
+            hipLaunchKernelGGL((attend4_kernel<2, DENSE, RepairedPrefillView, true, true, true, true, true, false, 1, true>),
+                               dim3((scheduled.rows - p.first_window * kMaxRows) * v.kv_heads), dim3(256),
+                               InblockLayout::kSharedBytes, stream, repaired, 0);
+            check(hipGetLastError(), "minimax prefill in-block attend");
+            return;
+        }
         if (p.msa_rework == 8 || p.msa_rework == 9) {
             // Mode 7 with the 16-key tile max as an exact lane tree (8: ds_swizzle, 9: DPP/permlanex16).
             const RepairedPrefillView repaired{scheduled};
@@ -2105,9 +2318,9 @@ template <bool DENSE> void launch_prefill_partials(const PrefillView& p, unsigne
         const unsigned blocks = static_cast<unsigned>(block_count(p.pos0 + p.rows));
         hipLaunchKernelGGL((prefill_r16_kernel<DENSE>), dim3(blocks, v.kv_heads, windows), dim3(1024),
                            4 * kTile * kHeadDim * sizeof(std::uint16_t), stream, p);
-    } else if (p.msa_rework == 8 || p.msa_rework == 9) {  // diagnostic: modes 8/9 = mode 6 producer with the tree max
+    } else if (p.msa_rework == 8 || p.msa_rework == 9 || p.msa_rework == 10) {  // diagnostic: modes 8/9 = mode 6 producer with the tree max (10 keeps 8's partials in registers)
         const RepairedPrefillView repaired{p};
-        if (p.msa_rework == 8)
+        if (p.msa_rework != 9)
             hipLaunchKernelGGL((attend4_kernel<2, DENSE, RepairedPrefillView, true, true, true, true, true, false, 1>),
                                dim3(static_cast<unsigned>(chunks * v.kv_heads)), dim3(256),
                                4 * kTile * kHeadDim * sizeof(std::uint16_t), stream, repaired, 0);
@@ -2143,7 +2356,7 @@ namespace {
 void validate_prefill_diagnostic(const PrefillView& p) {
     const DecodeView& v = p.window;
     const unsigned windows = p.rows == 0 ? 0 : (p.rows - 1) / kMaxRows + 1;
-    if (p.msa_rework > 9 || windows == 0 || windows > 65535U || p.first_window != 0 ||
+    if (p.msa_rework > 10 || windows == 0 || windows > 65535U || p.first_window != 0 ||
         p.scratch_windows == 0 || windows > p.scratch_windows ||
         v.rows_per_seq != (p.rows < kMaxRows ? p.rows : kMaxRows) || v.seqs != 1 ||
         v.q_heads != 32 || v.kv_heads != 2 || v.max_blocks == 0 || v.max_blocks > kMaxBlocks ||
@@ -2227,7 +2440,7 @@ void enqueue_prefill_index(const PrefillView& p, hipStream_t stream) {
 
 void enqueue_prefill(const PrefillView& p, hipStream_t stream, PrefillStageMarker marker, void* user) {
     const DecodeView& v = p.window;
-    if (p.msa_rework > 9 || (p.index_rows != 16 && p.index_rows != 32 && p.index_rows != 64) ||
+    if (p.msa_rework > 10 || (p.index_rows != 16 && p.index_rows != 32 && p.index_rows != 64) ||
         p.rows == 0 || p.scratch_windows == 0 || p.first_window != 0 || v.seqs != 1 ||
         v.q_heads != 32 || v.kv_heads != 2 || v.idx_heads != 2 || v.shard_count != 1 || v.shard_rank != 0 ||
         v.max_blocks == 0 || v.max_blocks > kMaxBlocks || (attend_version(v) != 3 && attend_version(v) != 4) ||
