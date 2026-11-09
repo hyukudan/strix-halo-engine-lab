@@ -874,7 +874,7 @@ bool prefill_p1_packed() {
         // Default on: the packed decode is bitwise-equal to the scalar decode (exhaustive E1, K3..K6) and faster on
         // PAIR/PIPE; STRIX_PF_P1=0 restores the scalar decode. Empty means unset.
         const char* value = std::getenv("STRIX_PF_P1");
-        if (value == nullptr || value[0] == ' ') return true;
+        if (value == nullptr || value[0] == '\0') return true;
         char* end = nullptr;
         errno = 0;
         const unsigned long mask = std::strtoul(value, &end, 0);
