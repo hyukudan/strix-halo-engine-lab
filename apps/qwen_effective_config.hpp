@@ -1,4 +1,6 @@
 #pragma once
+
+#include "strix/deploy/device.hpp"
 #include "qwen_yarn_memory.hpp"
 
 #include "strix/compact_stage_images.hpp"
@@ -1661,41 +1663,11 @@ inline PrefillMemory observe_prefill_memory(PrefillCapabilities& capabilities, b
     if (page > 0) result.ple_reclaim_page = static_cast<std::uint64_t>(page);
     for (const char* name : {"HIP_VISIBLE_DEVICES", "ROCR_VISIBLE_DEVICES", "GPU_DEVICE_ORDINAL"})
         if (const char* value = std::getenv(name); value && *value) return result;
-    std::error_code error;
-    const std::filesystem::path nodes("/sys/class/kfd/kfd/topology/nodes");
-    std::optional<std::uint64_t> minor;
-    std::uint64_t gfx = 0;
-    unsigned node_count = 0;
-    for (std::filesystem::directory_iterator node(nodes, error), end; !error && node != end; node.increment(error)) {
-        if (++node_count > 256U) return result;
-        std::ifstream properties_file(node->path() / "properties", std::ios::binary);
-        std::array<char, 65537U> payload{};
-        properties_file.read(payload.data(), static_cast<std::streamsize>(payload.size()));
-        const auto bytes = properties_file.gcount();
-        if (bytes < 0 || bytes > 65536) return result;
-        std::istringstream properties(std::string(payload.data(), static_cast<std::size_t>(bytes)));
-        std::string key;
-        std::uint64_t value = 0, render = 0, target = 0;
-        while (properties >> key >> value) {
-            if (key == "drm_render_minor") render = value;
-            if (key == "gfx_target_version") target = value;
-        }
-        if (!render) continue;
-        if (minor) return result;
-        minor = render; gfx = target;
-    }
-    if (!minor || error) return result;
-    const auto device = std::filesystem::path("/sys/class/drm") / ("renderD" + std::to_string(*minor)) / "device";
-    const auto read = [&](const char* name) -> std::optional<std::uint64_t> {
-        std::ifstream file(device / name);
-        std::string text;
-        if (!std::getline(file, text) || text.size() > 32U) return {};
-        try { return parse_u64(text, "GTT observation"); } catch (const std::exception&) { return {}; }
-    };
-    result.gtt_limit = read("mem_info_gtt_total");
-    result.gtt_used = read("mem_info_gtt_used");
-    result.gfx_target=gfx;
-    capabilities.target_qualified = gfx == 110501U;
+    const auto device = strix::deploy::probe_device();
+    result.gtt_limit = device.gtt_total_bytes;
+    result.gtt_used = device.gtt_used_bytes;
+    result.gfx_target = device.gfx_target_version;
+    capabilities.target_qualified = device.gfx_target_version == 110501U;
     capabilities.fp16_operands = capabilities.target_qualified;
 #endif
     return result;

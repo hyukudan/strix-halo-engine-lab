@@ -116,6 +116,7 @@
 #include "strix/deepseek41_session_cache.hpp"
 #include "strix/serve/session_api.hpp"
 #include "strix/deepseek41_describe.hpp"
+#include "strix/deploy/plan.hpp"
 #include "strix/deepseek41_serve_observe.hpp"
 #include "strix/deepseek41_serve_sched.hpp"
 #include "strix/ds41_expert_tp.hpp"
@@ -198,6 +199,10 @@ struct Args : strix::deepseek41::ServeCachePolicy {
     std::uint32_t dspark_seed_rows = 128;  // the device prefill keeps the inputs of its last rows for the drafter (0: none)
     std::string hetero_listen, hetero_token;  // split decode (ds41_hetero_stage.hpp)
     std::uint32_t hetero_cut = 22, hetero_groups = 2;
+    std::string deploy;
+    bool deploy_check = false;
+    std::shared_ptr<const strix::deploy::Spec> deploy_spec;
+    std::shared_ptr<const strix::deploy::Plan> deployment_plan;
 };
 
 // Fill only compatible implicit settings, then apply order-independent OFF vetoes.
@@ -408,7 +413,7 @@ std::string dspark_markov_identity(const Args& a) {
 Control hello(const Args& a) {
     Control c;
     c.command = static_cast<std::uint32_t>(Command::hello);
-    c.group_hash = fnv(a.group_id);
+    c.group_hash = fnv(a.deployment_plan ? a.group_id + "/" + a.deployment_plan->hash() : a.group_id);
     c.epoch = a.epoch;
     c.model_bytes = std::filesystem::file_size(a.model);
     c.exe_hash = fnv(executable_sha256());
@@ -3316,7 +3321,10 @@ std::uint32_t auto_prefill_rows(const Args& a, BatchForward& fwd, strix::dist::C
     return agreed;
 }
 
+#include "deepseek41_deploy.inc"
+
 void run_rank(Args a, std::uint32_t rank, std::unique_ptr<strix::dist::Transport> transport) {
+    if (a.deploy_spec) resolve_live_deployment(a, rank, *transport);
     // the device prefill exchanges a chunk's MoE half sums (<= 21 MB) in one message
     strix::dist::Communicator comm(strix::dist::Group{rank, 2U, a.epoch, fnv(a.group_id)}, std::move(transport), std::move(gpu_direct),
                                    a.device_prefill ? std::size_t{22} << 20U : std::size_t{4} << 20U);
@@ -3407,8 +3415,7 @@ void describe(const Args& a) {
     std::shared_ptr<const strix::ds41::dspark::LoadedWeights> dw;
     if (!a.dspark.empty()) dw = strix::ds41::dspark::load_weights(a.model, a.dspark);
     for (std::uint32_t r = 0; r < 2U; ++r) {
-        auto o = forward_options(a, nullptr, r);
-        const auto f = BatchForward::footprint(a.model, o);
+        const auto f = Ds41FootprintProvider(a).native_footprint(a.context, a.slots, r);
         serve::Json mem = serve::Json::object();
         mem.set("rank", serve::Json(static_cast<std::uint64_t>(r)));
         mem.set("resident_weights_bytes", serve::Json(f.weights));
@@ -3471,7 +3478,9 @@ int main(int argc, char** argv) try {
             return std::string(argv[++i]);
         };
         const auto u32 = [&] { return static_cast<std::uint32_t>(std::stoul(next())); };
-        if (s == "--rank") a.rank = u32();
+        if (s == "--deploy") a.deploy = next();
+        else if (s == "--deploy-check") a.deploy_check = true;
+        else if (s == "--rank") a.rank = u32();
         else if (s == "--transport") a.transport = next();
         else if (s == "--group-manifest") a.manifest = next();
         else if (s == "--layers") a.layers = u32();
@@ -3552,8 +3561,10 @@ int main(int argc, char** argv) try {
         else throw std::invalid_argument("unknown argument " + s);
     }
     (void)tp_set;
-    if (a.model.empty()) throw std::invalid_argument("usage: strix-deepseek41-serve MODEL.gguf --rank R --transport T | --group-manifest FILE | --describe-json");
+    if (a.model.empty()) throw std::invalid_argument("usage: strix-deepseek41-serve MODEL.gguf --rank R --transport T | --group-manifest FILE | --describe-json | --deploy FILE|auto [--deploy-check]");
     if (!a.manifest.empty()) apply_manifest(a);
+    if (a.deploy_check && a.deploy.empty()) a.deploy = "auto";
+    if (!a.deploy.empty()) prepare_deployment(a);
     if (a.session_ram_bytes && a.session_ram_bytes < (16ULL << 20U) + std::uint64_t{a.context} * 2048ULL) {
         a.session_ram_bytes = 0; a.session_dir.clear();
         std::fprintf(stderr, "session cache: off (effective manifest context exceeds RAM budget)\n");
@@ -3561,6 +3572,15 @@ int main(int argc, char** argv) try {
     // The device prefill runs the expert-TP identity too (d647d6d4) and the cache namespace records the decode identity
     // (prefix_namespace_from_env), so the agent profile applies with STRIX_DS41_EXPERT_TP=1 as well.
     apply_cache_profile(a);
+    if (a.deploy_check) {
+        strix::ds41::expert_tp::set_decode_default(false);
+        if (a.device_prefill && strix::ds41::expert_tp::enabled_from_env()) strix::ds41::expert_tp::set_packed(0);
+        auto facts = a.deploy_spec->devices;
+        if (facts.empty()) facts.push_back(strix::deploy::probe_device());
+        const auto plan = strix::deploy::resolve(*a.deploy_spec, facts, Ds41FootprintProvider(a));
+        std::printf("%s\n", plan.to_json().c_str());
+        return plan.refused ? 2 : 0;
+    }
     std::fprintf(stderr, "prefix policy: profile %s, host %llu MiB/rank, block %u, reserve %llu MiB after predicted allocations, inrun %u reach %u, before-tail %u, session %u, disk %s limit %s\n",
                  a.cache_profile.c_str(), static_cast<unsigned long long>(a.prefix_cache_mb), a.prefix_block,
                  static_cast<unsigned long long>(a.prefix_reserve_mb), a.prefix_inrun ? 1U : 0U, a.prefix_inrun_reach,
@@ -3582,7 +3602,7 @@ int main(int argc, char** argv) try {
     if (a.prefix_inrun && a.prefix_cache_mb == 0U) throw std::invalid_argument("--prefix-inrun-snapshots needs --prefix-cache-mb (or --cache-profile agent)");
     if (a.prefix_session && !a.dspark.empty())
         throw std::invalid_argument("--prefix-session-snapshots is not exact with --dspark (verify-window rows leave another state than the prefill)");
-    if (a.describe_parts) {
+    if (a.describe_parts && !a.deploy_check) {
         strix::deepseek41::EngineDescribeOptions o;
         o.engine_name = "strix-deepseek41-serve";
         o.backend = "hip";
@@ -3607,7 +3627,7 @@ int main(int argc, char** argv) try {
     // tensors (read in place, no second copy): prefill and decode give the same bits as the expert-TP decode alone.
     strix::ds41::expert_tp::set_decode_default(false);
     if (a.device_prefill && strix::ds41::expert_tp::enabled_from_env()) strix::ds41::expert_tp::set_packed(0);
-    if (a.describe) {
+    if (a.describe && !a.deploy_check) {
         describe(a);
         return 0;
     }
