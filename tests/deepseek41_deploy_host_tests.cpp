@@ -40,6 +40,7 @@ struct BatchForward {
     static Footprint footprint(const std::string&, const NativeOptions& o) {
         return {40ULL << 30, std::uint64_t{o.context} * 1024, 1ULL << 30, 0, 0};
     }
+    static std::map<std::string, std::uint64_t> file_form_weight_sizes(const std::string&, const NativeOptions&) { return {}; }
 };
 #include "../apps/deepseek41_deploy.inc"
 

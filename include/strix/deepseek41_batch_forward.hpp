@@ -173,6 +173,10 @@ public:
     // device prefill in the same process reads them instead of loading a second copy (PrefillOptions::shared_weights).
     // Tensors held in another form (the F8 Engram KV, the BF16 routers, packed overlay sites) are left out.
     [[nodiscard]] std::map<std::string, std::pair<const void*, std::uint64_t>> file_form_weights() const;
+    // Host-only, before load: names and bytes file_form_weights() can return for these options (tensors a load
+    // may convert are left out). A deployment sizes the device prefill's own weights against it.
+    [[nodiscard]] static std::map<std::string, std::uint64_t> file_form_weight_sizes(const std::filesystem::path& gguf,
+                                                                                    const BatchForwardOptions& options);
     [[nodiscard]] const TargetModel& model() const noexcept;
     // The decode identity: true when the routed experts run expert TP (ds41-expert-tp2-i1152-v1), false expert parallel.
     [[nodiscard]] bool expert_tp() const noexcept;

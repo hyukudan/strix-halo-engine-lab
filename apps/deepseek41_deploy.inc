@@ -45,9 +45,13 @@ public:
             if (po.max_rows > sc::kAutoPrefillRows[0]) throw std::invalid_argument("prefill rows exceed measured workspace estimate range");
             const auto scratch = sc::prefill_piece_bytes(po.max_rows, c.context);
             out.workspace = strix::deploy::checked_add(out.workspace, scratch);
-            // Empty shared_weights deliberately counts every prefill-owned weight. This
-            // is conservative: live prefill can share some BatchForward tensors.
-            out.extra.emplace_back("prefill_weights_upper_bound", strix::deepseek41::DevicePrefill::owned_weight_bytes(a_.model, po));
+            // The live serve passes BatchForward::file_form_weights() as shared_weights: the
+            // prefill reads those in place and loads only the rest (the same rule, host-side).
+            Args selected = a_;
+            selected.context = c.context; selected.slots = c.slots;
+            for (const auto& [name, bytes] : BatchForward::file_form_weight_sizes(a_.model, forward_options(selected, nullptr, rank)))
+                po.shared_weights.emplace(name, std::make_pair(static_cast<const void*>(nullptr), bytes));
+            out.extra.emplace_back("prefill_own_weights", strix::deepseek41::DevicePrefill::owned_weight_bytes(a_.model, po));
         }
         return out;
     }

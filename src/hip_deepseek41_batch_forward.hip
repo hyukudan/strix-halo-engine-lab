@@ -294,7 +294,8 @@ double seconds_since(std::chrono::steady_clock::time_point t) {
 }
 
 // Bytes this rank keeps resident for `options` (the loader's slicing: its expert range, its vocabulary slice).
-std::uint64_t resident_weight_bytes(const TargetModel& model, const Plan& plan, const BatchForwardOptions& options) {
+// Per tensor: the bytes this rank keeps resident in file form before any load-time conversion.
+std::map<std::string, std::uint64_t> resident_weight_sizes(const TargetModel& model, const Plan& plan, const BatchForwardOptions& options) {
     std::map<std::string, const ManifestTensor*> tensors;
     for (const auto& t : model.manifest.tensors) tensors.emplace(t.name, &t);
     std::set<std::string> names;
@@ -303,15 +304,20 @@ std::uint64_t resident_weight_bytes(const TargetModel& model, const Plan& plan, 
             if (w.find("engram_embd") == std::string::npos) names.insert(w);
     const auto& c = model.config;
     const auto head = options.world == 2U ? ds41::vocab_slice(c.vocab_size, 2U, options.rank) : ds41::VocabSlice{0U, c.vocab_size};
-    std::uint64_t total = 0;
+    std::map<std::string, std::uint64_t> sizes;
     for (const auto& n : names) {
         const std::uint64_t bytes = tensors.at(n)->byte_size;
         if (n.ends_with("_exps.weight") && ds41::expert_tp::decode_enabled(options.world, c.moe_intermediate_size, false))  // every expert's part
-            total += ds41::expert_tp::part_bytes(bytes, c.n_routed_experts, n.ends_with("ffn_down_exps.weight"), c.hidden_size);
-        else if (n.ends_with("_exps.weight")) total += bytes / c.n_routed_experts * (c.n_routed_experts / options.world);
-        else if (n == "output.weight") total += bytes / c.vocab_size * head.count;
-        else total += bytes;
+            sizes[n] = ds41::expert_tp::part_bytes(bytes, c.n_routed_experts, n.ends_with("ffn_down_exps.weight"), c.hidden_size);
+        else if (n.ends_with("_exps.weight")) sizes[n] = bytes / c.n_routed_experts * (c.n_routed_experts / options.world);
+        else if (n == "output.weight") sizes[n] = bytes / c.vocab_size * head.count;
+        else sizes[n] = bytes;
     }
+    return sizes;
+}
+std::uint64_t resident_weight_bytes(const TargetModel& model, const Plan& plan, const BatchForwardOptions& options) {
+    std::uint64_t total = 0;
+    for (const auto& entry : resident_weight_sizes(model, plan, options)) total += entry.second;
     return total;
 }
 
@@ -1328,6 +1334,27 @@ std::uint64_t BatchForward::weight_bytes() const noexcept {
 }
 
 bool BatchForward::expert_tp() const noexcept { return impl_->expert_tp; }
+
+std::map<std::string, std::uint64_t> BatchForward::file_form_weight_sizes(const std::filesystem::path& gguf, const BatchForwardOptions& options) {
+    const auto model = validate_target(read_file(gguf));
+    auto sizes = resident_weight_sizes(model, build_decode_plan(model, 0, options.layers), options);
+    // Host-side mirror of file_form_weights(): drop every tensor the load may convert (the same default-on
+    // switches as Impl's load; an overlay may pack any site), so the result never claims a converted tensor.
+    const auto env_on = [](const char* name) { const char* v = std::getenv(name); return !(v && *v == '0'); };
+    const char* overlay = std::getenv("STRIX_DS41_OVERLAY");
+    const bool may_pack = (!options.weights_overlay.empty() || (overlay != nullptr && *overlay != 0 && std::string(overlay) != "0")) &&
+                          env_on("STRIX_DS41_BATCH_PACKED");
+    const bool router_bf16 = env_on("STRIX_DS41_ROUTER_BF16"), f16_as_f8 = env_on("STRIX_DS41_F16_AS_F8");
+    std::erase_if(sizes, [&](const auto& entry) {
+        const std::string& n = entry.first;
+        if (router_bf16 && n.ends_with("ffn_gate_inp.weight")) return true;
+        if (f16_as_f8 && n.ends_with("engram_kv.weight")) return true;
+        return may_pack && (n.ends_with("attn_q_a.weight") || n.ends_with("attn_q_b.weight") || n.ends_with("attn_kv.weight") ||
+                            n.ends_with("attn_output_a.weight") || n.ends_with("attn_output_b.weight") || n == "output.weight" ||
+                            n.ends_with("_shexp.weight"));
+    });
+    return sizes;
+}
 
 std::map<std::string, std::pair<const void*, std::uint64_t>> BatchForward::file_form_weights() const {
     const auto& m = *impl_;
