@@ -29,8 +29,12 @@ struct GlmDeployment {
             refusal = "GLM deployment: pipeline-2 peak workspace not bound";
         if (opt.slots > 65536) throw std::invalid_argument("deployment slots exceed provider limit");
         strix::glm::load::Index index(opt.model_dir);
-        const auto owners = strix::glm::deployment::header_owners(index.tensors(), opt.mtp,
-            eff.env.at("STRIX_GLM_MOE").value == "fast");
+        // The loader's routes (engine.hip moe_fast / attn_tierb, Options::raw_linears).
+        strix::glm::deployment::Routes routes;
+        routes.fast_moe = eff.env.at("STRIX_GLM_MOE").value == "fast";
+        routes.attn_raw = eff.env.at("STRIX_GLM_ATTN").value != "ref" && eff.env.at("STRIX_GLM_TIERB").value != "lib";
+        routes.keep_raw = opt.raw_linears;
+        const auto owners = strix::glm::deployment::header_owners(index.tensors(), opt.mtp, routes);
         strix::glm::deployment::Options po;
         po.slots = opt.slots; po.mtp = opt.mtp; po.spec = opt.spec; po.refusal = std::move(refusal);
         std::uint64_t configuration = 14695981039346656037ULL;

@@ -49,16 +49,18 @@ int main() {
         s.slots=1; s.context=8193;
         check(dp::resolve(s,{device(128),device(128)},provider).refused,"unaligned context refuses");
         struct Tensor { std::uint64_t bytes; };
-        std::map<std::string, Tensor> tensors{
-            {"model.language_model.layers.3.mlp.experts.0.gate_proj.trellis",{8ULL<<20}},
-            {"model.language_model.layers.3.mlp.experts.0.gate_proj.suh",{8192}},
-            {"model.language_model.layers.3.mlp.experts.0.gate_proj.svh",{4096}},
-            {"model.language_model.embed_tokens.weight",{1ULL<<30}}};
-        const auto fast = gd::header_owners(tensors,true,true), ref = gd::header_owners(tensors,true,false);
+        std::map<std::string, Tensor> tensors{{"model.language_model.embed_tokens.weight",{1ULL<<30}}};
+        for (int e = 0; e < 16; ++e) {
+            const auto p = "model.language_model.layers.3.mlp.experts." + std::to_string(e) + ".gate_proj.";
+            tensors[p + "trellis"] = {8ULL<<20}; tensors[p + "suh"] = {8192}; tensors[p + "svh"] = {4096};
+        }
+        const auto fast = gd::header_owners(tensors,true,{true,true,false}), ref = gd::header_owners(tensors,true,{false,true,false});
+        const auto kept = gd::header_owners(tensors,true,{false,true,true});
+        check(kept.weights > ref.weights, "--raw-linears adds the raw arena copy");
         check(ref.weights > fast.weights && fast.staging >= (1ULL<<30), "header bounds include prepared route and staging");
-        tensors.begin()->second.bytes=UINT64_MAX;
+        tensors.at("model.language_model.layers.3.mlp.experts.0.gate_proj.trellis").bytes=UINT64_MAX;
         bool overflow=false;
-        try { (void)gd::header_owners(tensors,true,true); } catch(const std::overflow_error&) { overflow=true; }
+        try { (void)gd::header_owners(tensors,true,{true,true,false}); } catch(const std::overflow_error&) { overflow=true; }
         check(overflow,"header overflow refuses");
         gd::Options pending=o; pending.profile="fast";
         gd::Provider selected(weights,pending,workspace);
