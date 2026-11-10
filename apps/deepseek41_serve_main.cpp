@@ -1855,6 +1855,10 @@ void lead(const Args& initial, BatchForward& fwd, strix::dist::Communicator& com
     state.comm = comm.stats();  // the start-up exchanges, before any HTTP thread reads the copy
     if (a.pool != 0U) state.pool_free = fwd.pool_free_positions();
     serve::GenerationQueue queue(a.max_queue);
+    if (a.deployment_plan) {  // --deploy: the agreed plan, immutable for the life of the process
+        config.deployment.deployment_json = [plan = a.deployment_plan] { return plan->to_json(); };
+        config.deployment.deployment_id = [plan = a.deployment_plan] { return plan->hash(); };
+    }
     config.deployment.capacity_provider = [&] {
         const auto q = queue.snapshot();
         const std::lock_guard lock(state.mutex);
