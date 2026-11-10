@@ -51,8 +51,8 @@ int main() {
         struct Tensor { std::uint64_t bytes; };
         std::map<std::string, Tensor> tensors{{"model.language_model.embed_tokens.weight",{1ULL<<30}}};
         for (int e = 0; e < 16; ++e) {
-            const auto p = "model.language_model.layers.3.mlp.experts." + std::to_string(e) + ".gate_proj.";
-            tensors[p + "trellis"] = {8ULL<<20}; tensors[p + "suh"] = {8192}; tensors[p + "svh"] = {4096};
+            const auto pre = "model.language_model.layers.3.mlp.experts." + std::to_string(e) + ".gate_proj.";
+            tensors[pre + "trellis"] = {8ULL<<20}; tensors[pre + "suh"] = {8192}; tensors[pre + "svh"] = {4096};
         }
         const auto fast = gd::header_owners(tensors,true,{true,true,false}), ref = gd::header_owners(tensors,true,{false,true,false});
         const auto kept = gd::header_owners(tensors,true,{false,true,true});
