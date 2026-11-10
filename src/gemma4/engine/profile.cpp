@@ -15,6 +15,12 @@ constexpr unsigned engine = unsigned(App::engine), decode_bench = unsigned(App::
 // non-EXL3 packs (prefill_route). Empty = pending: fast runs prefill-exact.
 constexpr std::string_view fast_prefill_receipt =
     "g4-wmma-pf-v1 teacher-v4 FAST gate 168ebaec (bands 9ba0cf53) + v1/a8 pair receipt 380f384e";
+// Receipt of g4-flash-attn-v1 prompt attention on the fast route (g4-wmma-pf-v1 linears, Q4_K_M; shared dense flash
+// core src/attn_core): same-weight KL/top-1 of all prompt rows against exact g4-v1 decode rows over chat/code/json,
+// plus greedy-128 continuations against g4-wmma-attn-v1. Empty = pending: fast keeps canonical attention.
+constexpr std::string_view fast_prefill_attention_receipt =
+    "g4-flash-attn-v1 same-weight 7,827 positions (mean KL 3.1e-6, top-1 99.95 %; wmma 3.0e-6 / 99.92 %) + greedy-128 "
+    "vs g4-wmma-attn-v1: chat/code identical, json near-tie flip at token 31";
 // Receipt of the a8 prompt prefill (fast on non-Q4_K_M packs): the g4-a8-v1 held-out receipt (bands 9ba0cf53) applies
 // because a8 prefill rows are byte-identical to g4-a8-v1 decode rows (byte receipt 4e914dcf: KV and per-row logits on
 // 56/56 teacher-v2 parents; served ids equal to decode-fed rows at C1/C4).
@@ -99,6 +105,14 @@ constexpr Lever table[] = {
                "vs exact prefill), a8 on other non-EXL3 packs; =a8 keeps the previous fast route; default and quality run "
                "prefill-exact as many-row chunks (STRIX_G4_PREFILL_EXACT_MANYROW=0 = eight-row passes); =v1 / =v2 select "
                "g4-wmma-pf-v1 / -v2 on any non-EXL3 pack"},
+    // Engine prompt attention on the WMMA prefill routes (v1/v2 only; exact, a8 and EXL3 routes ignore it):
+    // fast runs g4-flash-attn-v1 (shared dense flash core: big query tiles, K/V once per work-group in LDS, FP16
+    // WMMA, FP32 online softmax); =wmma selects g4-wmma-attn-v1, =canonical is the OFF switch.
+    {.name = "prefill_route_attention", .env = "STRIX_G4_PREFILL_ATTN", .value = {"canonical", "flash", "canonical"},
+     .builtin = "canonical", .required = {false, false, false}, .ready = {true, !fast_prefill_attention_receipt.empty(), true},
+     .runnable = {true, true, true}, .kind = Kind::bit_changing, .apps = engine, .target = "g4-flash-attn-v1",
+     .source = "fast: g4-flash-attn-v1 prompt attention on the g4-wmma-pf-v1 route (Q4_K_M); =wmma selects "
+               "g4-wmma-attn-v1, =canonical keeps the canonical attention; default and quality never reach a WMMA prefill route"},
     // EXL3 packs: the pack's held-out bands were measured on g4-exl3-wmma-pf-v1 prompts (panel WMMA linears,
     // canonical attention); QUALITY targets that identity once its receipt lands, exact runs until then.
     {.name = "exl3_prefill", .env = "STRIX_G4_EXL3_PREFILL", .value = {"", "", "wmma"}, .builtin = "exact",

@@ -5,6 +5,7 @@
 
 namespace strix::gemma4::gpu {
 struct Fp16Mirror; // kv/fp16_mirror.hpp
+struct FlashPrefillPack; // prefill/target.hip (STRIX_G4_PREFILL_ATTN=flash)
 // One immutable snapshot and one unpublished overlay per transaction/producer.
 struct KvRead {
     const float* k = nullptr;
@@ -121,6 +122,9 @@ struct DeviceStream::Impl {
     // FAST readers only (kv/fp16_mirror.hpp): FP16 halves of the committed global rows; empty on a new or forked
     // stream, never read by the exact routes.
     std::shared_ptr<Fp16Mirror> fp16_mirror;
+    // FAST flash prefill only: FP16 K / V^T packs of the global producers, rows [0, packed) valid (same append-only
+    // rule as the mirror); empty on a new or forked stream.
+    std::shared_ptr<FlashPrefillPack> flash_pack;
     Impl() = default;
     Impl(const Impl&) = delete;
     Impl& operator=(const Impl&) = delete;

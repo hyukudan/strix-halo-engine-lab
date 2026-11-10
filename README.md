@@ -22,7 +22,7 @@ off switches are in [performance](docs/performance.md) and [measured gains](docs
 | DeepSeek V4.1 Flash | pair | 70.6 tok/s (DSpark, code) | 1,057 tok/s at 8.4K, 1,172 at 32.5K (exact) |
 | MiniMax M3.1 Flash | pair | 23.10 tok/s (1K) | 596 tok/s at 8K, 529 at 32K (exact) |
 | GLM-5.3 Flash | pair | 44.5 tok/s (MTP, code) | 541 tok/s at 8K, 529 at 32K (exact) |
-| Nemotron 3.5 Bolt E4B | 1 node | 91.9 tok/s (C1) | 2,494 tok/s at 2K, 2,094 at 8K (`fast`) |
+| Nemotron 3.5 Bolt E4B | 1 node | 91.9 tok/s (C1) | 2,780 tok/s at 8K, 2,336 at 32K (`fast`) |
 | MiniMax H3 | pair | 5 s 1344x768 clip with audio in 405.5 s | - |
 
 <a id="hardware"></a>

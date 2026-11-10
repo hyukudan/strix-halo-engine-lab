@@ -152,6 +152,18 @@ decode `STRIX_G4_IDENTITY=g4-a8-v1`; otherwise prefill-exact runs with a log lin
 Prompt KV and logits equal the a8 decode of the same rows, byte for byte,
 on 512-row chunks. Attention stays canonical.
 
+`STRIX_G4_PREFILL_ATTN=flash` (or `g4-flash-attn-v1`) selects the shared FAST
+dense flash core (`src/attn_core/dense_flash_prefill.hpp`, judged on end
+metrics, not bitwise). One work-group holds one KV head, its four query heads
+and 16 positions. Each 16-key K/V tile is staged in LDS once per work-group.
+Softmax is online FP32 (exp2), QK and PV run on f16 WMMA, and causal/window
+block skip applies. Split-K kicks in for long contexts
+(`STRIX_G4_PREFILL_FLASH_SPLITS=n` forces n), and the kernel is capped at 192
+VGPRs so two work-groups share a WGP. Global layers read a stream-owned FP16
+pack, so each pass converts only its new rows. The KV cache stays FP32 and
+authoritative. The fast profile runs it on the `g4-wmma-pf-v1` route;
+`STRIX_G4_PREFILL_ATTN=wmma` selects `g4-wmma-attn-v1` instead.
+
 `STRIX_G4_PREFILL_ATTN=wmma` (or `g4-wmma-attn-v1`) selects an additional,
 opt-in attention identity. Empty, `auto`, and `canonical` retain canonical
 attention; unknown settings fail. This setting is cached at startup. The

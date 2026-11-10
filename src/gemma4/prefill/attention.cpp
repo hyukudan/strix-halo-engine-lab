@@ -8,7 +8,11 @@ namespace strix::gemma4::prefill {
 AttentionMode resolve_attention(std::string_view value) {
     if (value.empty() || value == "auto" || value == "canonical") return AttentionMode::canonical;
     if (value == "wmma" || value == attention_identity) return AttentionMode::wmma;
+    if (value == "flash" || value == flash_attention_identity) return AttentionMode::flash;
     throw std::invalid_argument("unknown prefill attention identity");
+}
+const char* attention_name(AttentionMode mode) {
+    return mode == AttentionMode::wmma ? attention_identity : mode == AttentionMode::flash ? flash_attention_identity : "canonical";
 }
 AttentionMode attention_mode() {
     static const auto mode = [] { const auto* p = std::getenv("STRIX_G4_PREFILL_ATTN"); return resolve_attention(p ? p : ""); }();

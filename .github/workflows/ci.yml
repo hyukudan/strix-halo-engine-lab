@@ -15,6 +15,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Reject raw NUL bytes in sources
+        shell: bash
+        run: python3 tools/ci/check_source_bytes.py
+
       # The option qualification kit tests (ctest) need numpy for the system python3.
       - name: Install Python test dependency
         shell: bash

@@ -17,6 +17,17 @@
 #include <sstream>
 #include <stdexcept>
 
+namespace strix::gemma4::gpu {
+struct FlashPrefillPack {
+    struct Layer {
+        Buffer buffer;              // FP16 K [capacity][width] then V^T [width][capacity] (prefill::attention_flash)
+        std::uint64_t packed = 0;   // rows [0, packed) valid
+        std::uint64_t pending = 0;  // rows written by the current pass, valid once it completes
+        std::uint32_t capacity = 0; // the stream's admitted context rounded up to 16
+    };
+    std::vector<Layer> layer; // by producer layer (global producers only are used)
+};
+} // namespace strix::gemma4::gpu
 namespace strix::gemma4::prefill {
 namespace {
 // STRIX_G4_PREFILL_QUEUE_IO (default on, read per pass): every per-pass upload, clear and download of the
@@ -98,7 +109,7 @@ struct DevicePrefill::Impl {
     Buffer a8_scratch;
     Buffer sliding, global, residual, x, q, k, v, att, out, gate, up, ple, logits, taps;
     Buffer tokens, positions, reads, writes, scores, maxima, partials, failure, halves, maximum, attention_halves, global_halves, pair_halves, last_row;
-    Buffer canonical_scores, canonical_denominators, canonical_packed, exl3_scratch;
+    Buffer canonical_scores, canonical_denominators, canonical_packed, exl3_scratch, flash_workspace;
     unsigned table_positions = 0, stride = 0;
     // QUEUE_IO: pinned staging for one pass's uploads (reused once the pass has synchronized).
     void* staging = nullptr;
@@ -475,7 +486,7 @@ DevicePrefill::DevicePrefill(HostWeights weights, RopeTables t, Residency reside
     auto& b = *impl_;
     b.profile = profile;
     b.stats.attention = attention;
-    b.stats.attention_packed = attention == AttentionMode::wmma && attention_pack_enabled();
+    b.stats.attention_packed = attention == AttentionMode::flash || (attention == AttentionMode::wmma && attention_pack_enabled());
     b.stats.canonical_kernel = attention == AttentionMode::canonical && canonical_kernel_enabled();
     b.stats.linears = linears;
     b.stats.tiled = linears == Linears::wmma && tiled_enabled();
@@ -738,7 +749,35 @@ std::vector<ChunkResult> DevicePrefill::pass(std::span<const PrefillSegment> seg
             auto* q = b.q.as<float>() + std::size_t(p.first) * c.heads * d;
             auto* att = b.att.as<float>() + std::size_t(p.first) * c.heads * d;
             const auto* reads = layer_reads + p.first;
-            if (b.stats.attention == AttentionMode::wmma) {
+            if (b.stats.attention == AttentionMode::flash && global) {
+                // Stream-owned pack of the producer: rows [0, packed) are converted committed rows; this pass adds
+                // [min(packed, start), start + rows) once, at the producer layer (sharing layers read it as is).
+                auto& stream = *p.tx->stream;
+                if (!stream.flash_pack) {
+                    stream.flash_pack = std::make_shared<gpu::FlashPrefillPack>();
+                    stream.flash_pack->layer.resize(c.layers);
+                }
+                auto& fp = stream.flash_pack->layer[a.producer];
+                const auto width = c.kv_heads * d, capacity = (stream.admitted + 15U) / 16U * 16U;
+                if (fp.capacity != capacity) {
+                    fp.buffer.resize(flash_packed_bytes(capacity, width));
+                    fp.capacity = capacity; fp.packed = fp.pending = 0;
+                }
+                const bool pack = a.producer == l;
+                const auto from = std::min<std::uint64_t>(fp.packed, p.tx->start);
+                if (pack) fp.pending = p.tx->start + rows;
+                b.grow(b.flash_workspace, flash_workspace_bytes(chunk_rows, c.heads, 512));
+                prefill::attention_flash(q, reads, rows, c.heads, d, att, b.failure.as<unsigned>(), b.queue, fp.buffer.data(),
+                                         capacity, unsigned(p.tx->start + rows - from / 16U * 16U), pack, from,
+                                         unsigned(p.tx->start + rows), b.flash_workspace.data(), b.flash_workspace.size());
+            } else if (b.stats.attention == AttentionMode::flash) {
+                // Sliding layers: the window's keys, repacked per pass into the shared buffer (cheap).
+                auto& owner = packed_producer[0];
+                const bool pack = owner != a.producer || !pack_reuse_enabled() || parts.size() > 1;
+                owner = a.producer;
+                prefill::attention_flash(q, reads, rows, c.heads, d, att, b.failure.as<unsigned>(), b.queue,
+                                         b.attention_halves.data(), p.stride, std::min(p.stride, c.window + rows - 1), pack);
+            } else if (b.stats.attention == AttentionMode::wmma) {
                 // Packs are reused across layers only within a one-segment pass: segments share the pack buffers.
                 auto& owner = packed_producer[global ? 1 : 0];
                 const bool pack = !b.stats.attention_packed || owner != a.producer || !pack_reuse_enabled() || parts.size() > 1;
@@ -857,6 +896,10 @@ std::vector<ChunkResult> DevicePrefill::pass(std::span<const PrefillSegment> seg
         if (hidden && pinned) result.pinned_hidden = {b.pinned_hidden, std::size_t(n) * c.hidden};
         else if (hidden) { result.hidden.resize(std::size_t(n) * c.hidden); b.get(result.hidden.data(), b.x, result.hidden.size() * sizeof(float)); }
         for (const auto& p : parts) p.tx->evaluated = true;
+        // The pass completed with a zero failure word: its flash pack rows are valid (as fp16_mirror_confirm).
+        for (const auto& p : parts)
+            if (p.tx->stream->flash_pack)
+                for (auto& fp : p.tx->stream->flash_pack->layer) fp.packed = std::max(fp.packed, fp.pending);
         const auto ms = [](auto d) { return std::chrono::duration<double, std::milli>(d).count(); };
         result.host_ms = ms(launched_at - entered) + ms(Clock::now() - synced_at);
     } catch (...) {

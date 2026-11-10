@@ -65,6 +65,17 @@ void exl3_gelu_pair(const PreparedLinear& gate, const PreparedLinear& up, Linear
 void attention(const float* q, const gpu::KvRead* reads, unsigned rows, unsigned heads, unsigned dim,
                float* out, std::uint32_t* failure, gpu::Queue queue = nullptr, void* packed = nullptr,
                unsigned packed_stride = 0, unsigned key_capacity = 0, bool repack = true);
+// STRIX_G4_PREFILL_ATTN=flash: the shared dense flash core (src/attn_core) on the same descriptors and packed
+// buffer (plain FP16 V^T layout, so a pack is never shared with attention()). Head dims 256/512.
+void attention_flash(const float* q, const gpu::KvRead* reads, unsigned rows, unsigned heads, unsigned dim,
+                     float* out, std::uint32_t* failure, gpu::Queue queue, void* packed, unsigned packed_stride,
+                     unsigned key_capacity, bool repack, std::uint64_t pack_from = 0, unsigned context = 0,
+                     void* workspace = nullptr, std::size_t workspace_bytes = 0);
+// context (last position + 1) and an FP32 workspace of flash_workspace_bytes enable split-K for long contexts.
+[[nodiscard]] std::size_t flash_workspace_bytes(unsigned rows, unsigned heads, unsigned dim);
+// pack_from > 0: positions below it already hold their packed operands (an incremental pack of a stream-owned buffer:
+// key_capacity then only needs to cover [pack_from rounded down to 16, last]). flash_packed_bytes: K + V^T bytes.
+[[nodiscard]] std::size_t flash_packed_bytes(unsigned packed_stride, unsigned width);
 // Bytes required for packed at packed_stride positions of width KV components.
 // The default split operand layout (STRIX_G4_PREFILL_ATTN_SPLIT=0 restores the
 // original kernel; identical bits) needs more than the original 2*stride*width.

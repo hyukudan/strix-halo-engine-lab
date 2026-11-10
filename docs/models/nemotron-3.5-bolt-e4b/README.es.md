@@ -24,7 +24,7 @@ declarado y una línea de stderr lo indica. Un perfil solo rechaza por un asset 
 | Perfil | Decode | Prefill | Garantía |
 |---|---|---|---|
 | `default` | `g4-v1` (activaciones FP32, pesos Q4_K_M) + drafter MTP en C1 | `prefill-exact` | Exacto: los bytes de salida son iguales a la ruta serial declarada para cualquier tamaño de batch (C4 == C1) y con el drafter activado o desactivado |
-| `fast` | `g4-a8-v1` (activaciones int8, cualificado) + drafter MTP; atención de decode en profundidad `g4-dattn-f2` (copias int8 de la KV de las capas globales): cualificación pendiente, hasta entonces se ejecuta la atención exacta | prefill de prompts `g4-wmma-pf-v1` en paquetes Q4_K_M (lineales WMMA FP16, atención canónica; las últimas <= 8 filas del prompt y el ancla usan el decode `g4-a8-v1`; cualificado con los mismos pesos frente al prefill exacto), `a8` en los demás paquetes no EXL3 (las filas del prompt son iguales a las filas de decode a8); ninguno es idéntico bit a bit al prefill exacto; `STRIX_G4_PREFILL_IDENTITY=a8` mantiene la ruta anterior, `=exact` restaura el prefill exacto | Perfil con nombre, cualificado contra bandas de fidelidad congeladas |
+| `fast` | `g4-a8-v1` (activaciones int8, cualificado) + drafter MTP; atención de decode en profundidad `g4-dattn-f2` (copias int8 de la KV de las capas globales): cualificación pendiente, hasta entonces se ejecuta la atención exacta | prefill de prompts `g4-wmma-pf-v1` en paquetes Q4_K_M (lineales WMMA FP16, atención de prompt `g4-flash-attn-v1`; las últimas <= 8 filas del prompt y el ancla usan el decode `g4-a8-v1`; cualificado con los mismos pesos frente al prefill exacto), `a8` en los demás paquetes no EXL3 (las filas del prompt son iguales a las filas de decode a8); ninguno es idéntico bit a bit al prefill exacto; `STRIX_G4_PREFILL_IDENTITY=a8` mantiene la ruta anterior, `=exact` restaura el prefill exacto | Perfil con nombre, cualificado contra bandas de fidelidad congeladas |
 | `quality` | Paquete EXL3 (`--exl3-arm DIR`), identidad elegida una vez por paquete y sesión (`g4-exl3-v1`/`v3`) | `prefill-exact` | Exacto dentro de su identidad EXL3; mayor fidelidad que Q4_K_M con un tamaño similar |
 
 La identidad de la ruta EXL3 se fija al arrancar a partir del paquete y de `--streams`, nunca por paso, así que la
@@ -278,11 +278,27 @@ solo reutiliza estados en un límite de 512 filas del prompt, nunca respuestas; 
 ejecución, el mismo binario, 2K y 8K en el orden exacto, a8, v1, v1, a8, exacto, 32K en los dos órdenes; tok/s de
 prefill (tiempo del prompt):
 
-| Prompt | exacto (`default`) | `a8` (`fast` anterior) | **`g4-wmma-pf-v1` (`fast`)** |
+| Prompt | exacto (`default`) | `a8` (`fast` anterior) | `g4-wmma-pf-v1`, atención canónica |
 |---|---:|---:|---:|
-| 2K | 539 (3.80 s) | 1,842 (1.11 s) | **2,494 (0.82 s)** |
-| 8K | 509 (16.08 s) | 1,609 (5.09 s) | **2,094 (3.91 s)** |
-| 32K | 420 (78.0 s) | 1,035 (31.7 s) | **1,231 (26.6 s)** |
+| 2K | 539 (3.80 s) | 1,842 (1.11 s) | 2,494 (0.82 s) |
+| 8K | 509 (16.08 s) | 1,609 (5.09 s) | 2,094 (3.91 s) |
+| 32K | 420 (78.0 s) | 1,035 (31.7 s) | 1,231 (26.6 s) |
+
+La atención de prompt de `fast` en esa ruta es `g4-flash-attn-v1`, el núcleo flash denso compartido
+(`src/attn_core`): un grupo de trabajo contiene una cabeza KV, sus cuatro cabezas de consulta y 16 posiciones, y carga
+cada tesela K/V en LDS una sola vez. Añade split-K para prompts largos y una copia FP16 de la KV de las capas globales
+propia del stream. `STRIX_G4_PREFILL_ATTN=wmma` selecciona la anterior `g4-wmma-attn-v1`, `=canonical` la atención
+canónica. Con los mismos pesos frente a las filas de decode exacto en las 7,827 posiciones: KL media 3.1e-6, top-1
+99.95 % (`wmma` 3.0e-6 / 99.92 %). Greedy de 128 tokens frente a `wmma`: chat y código idénticos, json difiere por
+primera vez en el token 31, un casi empate (top-2 de logits exactos 29.1818 / 29.1796). Q4_K_M, un nodo, proceso nuevo
+por ejecución, los dos órdenes, tok/s de prefill (tiempo del prompt):
+
+| Prompt | atención `wmma` | **`g4-flash-attn-v1` (`fast`)** |
+|---|---:|---:|
+| 2K | 2,681 (0.764 s) | **2,880 (0.711 s)** |
+| 8K | 2,224 (3.68 s) | **2,780 (2.95 s)** |
+| 32K | 1,312 (24.97 s) | **2,336 (14.03 s)** |
+| 64K (65,024) | 842 (77.26 s) | **1,899 (34.24 s)** |
 
 El decode tras el prompt (128 tokens) no cambia: 2K / 8K / 32K 47.3 / 42.1 / 29.5 tok/s tras `a8`, 47.3 / 42.1 / 29.4
 tras v1.

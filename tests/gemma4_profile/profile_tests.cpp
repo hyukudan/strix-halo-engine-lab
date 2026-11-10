@@ -230,6 +230,27 @@ void product_table() {
         check(status(e, "prefill_route") == pr::Status::explicit_env && value(e, "prefill_route") == v,
               "explicit prefill route under fast");
     }
+    // Prompt attention of the WMMA prefill routes: fast runs g4-flash-attn-v1 once its receipt lands (pending: canonical
+    // runs, still qualified); default keeps the canonical builtin; =canonical is the OFF switch under fast.
+    {
+        const bool attention_ready = [] {
+            for (const auto& lever : pr::levers()) if (lever.name == "prefill_route_attention") return lever.ready[1];
+            return false;
+        }();
+        const auto f = pr::resolve(pr::Name::fast, pr::App::engine, in());
+        if (attention_ready)
+            check(status(f, "prefill_route_attention") == pr::Status::set && value(f, "prefill_route_attention") == "flash" &&
+                  f.active("prefill_route_attention") && f.qualification() == "qualified", "fast runs flash prompt attention");
+        else
+            check(status(f, "prefill_route_attention") == pr::Status::pending && value(f, "prefill_route_attention") == "canonical" &&
+                  !f.active("prefill_route_attention") && f.qualification() == "qualified", "fast WMMA attention pending");
+        const auto d = pr::resolve(pr::Name::standard, pr::App::engine, in());
+        check(status(d, "prefill_route_attention") == pr::Status::builtin && !d.active("prefill_route_attention"),
+              "default keeps canonical prompt attention");
+        const auto off = pr::resolve(pr::Name::fast, pr::App::engine, in({}, {}, lookup({{"STRIX_G4_PREFILL_ATTN", "canonical"}})));
+        check(status(off, "prefill_route_attention") == pr::Status::explicit_env && value(off, "prefill_route_attention") == "canonical",
+              "STRIX_G4_PREFILL_ATTN=canonical under fast");
+    }
     // DEFAULT keeps prefill-exact (quality's column is exact too; its resolution needs an EXL3 pack).
     check(value(pr::resolve(pr::Name::standard, pr::App::engine, in()), "prefill_route") == "exact",
           "default keeps exact prefill");

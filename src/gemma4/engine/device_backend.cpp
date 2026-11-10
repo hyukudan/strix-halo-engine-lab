@@ -85,6 +85,13 @@ public:
         const bool a8_route = many_row && route == "a8";
         const bool wmma_route = many_row && !exl3_wmma && (route == "v1" || route == "v2");
         const bool v2 = wmma_route && route == "v2";
+        // WMMA prefill routes only: STRIX_G4_PREFILL_ATTN=canonical|wmma|flash picks the prompt attention (the fast
+        // profile exports flash: g4-flash-attn-v1, the shared dense flash core). Exact, a8 and EXL3 routes keep canonical attention
+        // whatever the switch says, so the default and quality profiles stay byte-identical.
+        const auto* attention_switch = std::getenv("STRIX_G4_PREFILL_ATTN");
+        const auto attention = wmma_route ? prefill::resolve_attention(attention_switch ? attention_switch : "")
+                                          : prefill::AttentionMode::canonical;
+        if (wmma_route) metadata_.set("prefill_attention",prefill::attention_name(attention));
         metadata_.set("prefill_route",exl3_wmma ? exl3::prefill_identity : v2 ? prefill::v2_identity : wmma_route ? prefill::identity
                                        : a8_route ? "a8-many-row" : many_row ? "many-row" : "rows8");
         if (a8_route) std::cerr << "gemma4 prefill route a8-many-row (g4-a8-v1 linears, 512-row chunks)\n";
@@ -98,7 +105,7 @@ public:
                 throw std::logic_error("a8 prefill requires g4-a8-v1 decode");
             if (many_row)
                 prefill_ = std::make_unique<prefill::DevicePrefill>(target_->borrow_device_weights(),tables,
-                    prefill::Residency::device,false,prefill::AttentionMode::canonical,linears);
+                    prefill::Residency::device,false,attention,linears);
             // v1: no policy (every WMMA linear on FP16 operands), also over a STRIX_G4_PREFILL_LINEAR_POLICY.
             if (wmma_route) prefill_->set_linear_policy(v2 ? prefill::LinearPolicy::parse(prefill::v2_policy) : prefill::LinearPolicy{});
         }

@@ -23,7 +23,7 @@ build does not contain.
 | Profile | Decode | Prefill | Guarantee |
 |---|---|---|---|
 | `default` | `g4-v1` (FP32 activations, Q4_K_M weights) + MTP drafter at C1 | `prefill-exact` | Exact: output bytes equal the declared serial path for every batch size (C4 == C1) and with the drafter on or off |
-| `fast` | `g4-a8-v1` (int8 activations, qualified) + MTP drafter; decode attention at depth `g4-dattn-f2` (int8 KV copies for the global layers): qualification pending, exact attention runs until then | `g4-wmma-pf-v1` prompt prefill on Q4_K_M packs (FP16 WMMA linears, canonical attention; the last <= 8 prompt rows and the anchor run the `g4-a8-v1` decode; qualified same-weight against exact prefill), `a8` on other non-EXL3 packs (prompt rows equal the a8 decode rows); neither is bitwise vs exact prefill; `STRIX_G4_PREFILL_IDENTITY=a8` keeps the previous route, `=exact` restores exact prefill | Named profile, qualified against frozen fidelity bands |
+| `fast` | `g4-a8-v1` (int8 activations, qualified) + MTP drafter; decode attention at depth `g4-dattn-f2` (int8 KV copies for the global layers): qualification pending, exact attention runs until then | `g4-wmma-pf-v1` prompt prefill on Q4_K_M packs (FP16 WMMA linears, `g4-flash-attn-v1` prompt attention; the last <= 8 prompt rows and the anchor run the `g4-a8-v1` decode; qualified same-weight against exact prefill), `a8` on other non-EXL3 packs (prompt rows equal the a8 decode rows); neither is bitwise vs exact prefill; `STRIX_G4_PREFILL_IDENTITY=a8` keeps the previous route, `=exact` restores exact prefill | Named profile, qualified against frozen fidelity bands |
 | `quality` | EXL3 pack (`--exl3-arm DIR`), identity chosen once per pack and session (`g4-exl3-v1`/`v3`) | `prefill-exact` | Exact within its EXL3 identity; higher fidelity than Q4_K_M at similar size |
 
 The identity of the EXL3 route is fixed at startup from the pack and `--streams`, never per step, so a session's
@@ -261,11 +261,26 @@ the prefix cache reuses only 512-row prompt-boundary states, never answers; in e
 `STRIX_G4_PREFILL_IDENTITY=a8` keeps the previous route. Through the engine, Q4_K_M, one node, fresh process per run,
 same binary, 2K and 8K in the order exact, a8, v1, v1, a8, exact, 32K in both orders; prefill tok/s (prompt time):
 
-| Prompt | exact (`default`) | `a8` (previous `fast`) | **`g4-wmma-pf-v1` (`fast`)** |
+| Prompt | exact (`default`) | `a8` (previous `fast`) | `g4-wmma-pf-v1`, canonical attention |
 |---|---:|---:|---:|
-| 2K | 539 (3.80 s) | 1,842 (1.11 s) | **2,494 (0.82 s)** |
-| 8K | 509 (16.08 s) | 1,609 (5.09 s) | **2,094 (3.91 s)** |
-| 32K | 420 (78.0 s) | 1,035 (31.7 s) | **1,231 (26.6 s)** |
+| 2K | 539 (3.80 s) | 1,842 (1.11 s) | 2,494 (0.82 s) |
+| 8K | 509 (16.08 s) | 1,609 (5.09 s) | 2,094 (3.91 s) |
+| 32K | 420 (78.0 s) | 1,035 (31.7 s) | 1,231 (26.6 s) |
+
+`fast` prompt attention on that route is `g4-flash-attn-v1`, the shared dense flash core (`src/attn_core`): one
+work-group holds a KV head, its four query heads and 16 positions, and stages every K/V tile in LDS once. It adds
+split-K for long prompts and a stream-owned FP16 copy of the global-layer KV. `STRIX_G4_PREFILL_ATTN=wmma` selects the
+previous `g4-wmma-attn-v1`, `=canonical` the canonical attention. Same-weight against exact decode rows over the 7,827
+positions: mean KL 3.1e-6, top-1 99.95 % (`wmma` 3.0e-6 / 99.92 %). Greedy 128 tokens against `wmma`: chat and code
+identical, json first differs at token 31, a near-tie (exact top-2 logits 29.1818 / 29.1796). Q4_K_M, one node, fresh
+process per run, both orders, prefill tok/s (prompt time):
+
+| Prompt | `wmma` attention | **`g4-flash-attn-v1` (`fast`)** |
+|---|---:|---:|
+| 2K | 2,681 (0.764 s) | **2,880 (0.711 s)** |
+| 8K | 2,224 (3.68 s) | **2,780 (2.95 s)** |
+| 32K | 1,312 (24.97 s) | **2,336 (14.03 s)** |
+| 64K (65,024) | 842 (77.26 s) | **1,899 (34.24 s)** |
 
 Decode after the prompt (128 tokens) is unchanged: 2K / 8K / 32K 47.3 / 42.1 / 29.5 tok/s after `a8`, 47.3 / 42.1 /
 29.4 after v1.
