@@ -658,6 +658,7 @@ add_library(strix_serve STATIC
     src/serve/http_server.cpp
     src/serve/engine.cpp
     src/serve/api.cpp
+    src/serve/deployment.cpp
     src/serve/request_fields.cpp
     src/serve/health.cpp
 )
@@ -777,6 +778,11 @@ endif()
 
 if(BUILD_TESTING)
     add_executable(strix-serve-health-tests tests/serve_health_test.cpp)
+    add_executable(strix-serve-deployment-tests tests/serve_deployment_tests.cpp)
+    target_link_libraries(strix-serve-deployment-tests PRIVATE strix_serve)
+    strix_target_warnings(strix-serve-deployment-tests)
+    add_test(NAME strix-serve-deployment-tests COMMAND strix-serve-deployment-tests)
+    set_tests_properties(strix-serve-deployment-tests PROPERTIES TIMEOUT 60)
     target_link_libraries(strix-serve-health-tests PRIVATE strix_serve strix_assets)
     target_include_directories(strix-serve-health-tests PRIVATE apps)
     strix_target_warnings(strix-serve-health-tests)

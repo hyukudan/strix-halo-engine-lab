@@ -1850,6 +1850,11 @@ void lead(const Args& initial, BatchForward& fwd, strix::dist::Communicator& com
     state.comm = comm.stats();  // the start-up exchanges, before any HTTP thread reads the copy
     if (a.pool != 0U) state.pool_free = fwd.pool_free_positions();
     serve::GenerationQueue queue(a.max_queue);
+    config.deployment.capacity_provider = [&] {
+        const auto q = queue.snapshot();
+        const std::lock_guard lock(state.mutex);
+        return serve::ServeCapacity{a.slots, state.busy, std::nullopt, q.queued};
+    };
     config.on_drain = [&] {
         state.draining.store(true);
         queue.shutdown();  // queued requests end, new ones are refused; running ones finish
