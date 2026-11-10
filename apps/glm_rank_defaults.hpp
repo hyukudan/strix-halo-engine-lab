@@ -158,6 +158,7 @@ inline Request scan(const std::vector<std::string>& args) {
     for (std::size_t i = 0; i < args.size(); ++i) {
         const std::string& a = args[i];
         if (is_reference_gate(a)) r.reference_gate = true;
+        if (a == "--deploy-check") continue;
         if (is_value_free(a)) {
             if (a == "--mem-plan") r.mem_plan = true;
             else if (a == "--baseline") r.baseline_flag = true;

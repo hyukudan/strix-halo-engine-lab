@@ -9,6 +9,7 @@
 #include "http_slot_capacity.hpp"
 #include "strix/hip_mtp_native_validation.hpp"
 #include "qwen_prefill_plan.hpp"
+#include "qwen_deploy_provider.hpp"
 #include "qwen_model_description_hook.hpp"
 #include "../src/model_graph/qwen_adapter.hpp"
 #include "qwen_yarn_registered_admission.hpp"
@@ -142,6 +143,7 @@
 #include <vector>
 
 namespace {
+#include "qwen_deploy.inc"
 // File-backed tensors (the PLE n-gram table) are read row by row on the host during decode.
 // Another process can evict them, turning those reads into random disk I/O while the GPU waits
 // (and every fault pulls a whole readahead window for a ~100-byte row). Mark them random-access
@@ -1196,6 +1198,7 @@ static int run_decode_entry(
     if (argc == 2 && std::string_view(argv[1]) == "--help") {
         std::cout << "Usage: strix-hip-decode-token MODEL.gguf TOKEN_ID ... [options]\n"
             "  --context N --generate N --eos-token ID --residency register|copy\n"
+            "  --deploy FILE|auto --deploy-check (host-only deployment JSON; includes effective config)\n"
             "  --profile default|fast|quality (default: current qualified settings)\n"
             "  --allow-pending (benchmark runnable pending profile rows; unqualified)\n"
             "  --optimization-profile auto|manual (default auto, qualified checkpoint only)\n"
@@ -1271,7 +1274,10 @@ static int run_decode_entry(
     if (strix::qwen_pp::decode_enabled() && !strix::qwen_pp::pipe_enabled())
         throw std::invalid_argument("pair handoff decode requires STRIX_QWEN_PF_PIPE=1");
     std::vector<char*> pair_arguments;
-    if (strix::qwen_pp::pipe_enabled()) {
+    const bool deploy_requested = std::any_of(argv + 1, argv + argc, [](const char* a) {
+        return std::string_view(a) == "--deploy" || std::string_view(a) == "--deploy-check";
+    });
+    if (strix::qwen_pp::pipe_enabled() || deploy_requested) {
         pair_arguments.push_back(argv[0]);
         bool pair_rank_seen = false;
         const auto pair_setenv = [](const char* key, const char* value) {
@@ -1294,7 +1300,7 @@ static int run_decode_entry(
                 } else pair_setenv(pair_argument == "--peer" ? "STRIX_QWEN_PF_PIPE_PEER" : "STRIX_QWEN_PF_PIPE_TRANSPORT", pair_value);
             } else pair_arguments.push_back(argv[pair_index]);
         }
-        if (!pair_rank_seen) {
+        if (!pair_rank_seen && strix::qwen_pp::pipe_enabled()) {
             const char* pair_inherited_rank = std::getenv("STRIX_QWEN_PF_PIPE_RANK");
             if (!pair_inherited_rank || (std::string_view(pair_inherited_rank) != "0" && std::string_view(pair_inherited_rank) != "1"))
                 throw std::invalid_argument("pair prefill requires --rank 0|1");
@@ -1307,6 +1313,14 @@ static int run_decode_entry(
         parse_options(
             argc,
             argv, true);
+    QwenDeployment deployment;
+    if (options.deployment_spec && options.deployment_spec->topology == "pipeline") {
+        const char* r = std::getenv("STRIX_QWEN_PF_PIPE_RANK");
+        if (!r || (std::string_view(r) != "0" && std::string_view(r) != "1"))
+            throw std::invalid_argument("deployment pipeline requires --rank 0|1");
+        (void)::setenv("STRIX_QWEN_PF_PIPE", "1", 1);
+        (void)::setenv("STRIX_QWEN_PF_PIPE_DECODE", "1", 1);
+    }
     if (options.print_model_graph || options.print_plan) {
         auto described_model = strix::ModelContract::qwen38_flash_next();
         described_model.attention_kv_storage = options.attention_kv_storage;
@@ -1392,7 +1406,7 @@ static int run_decode_entry(
     const std::set<std::string_view> session_io_options{"--session-save", "--session-load", "--session-then-prompt", "--session-logits",
         "--session-cache", "--session-disk", "--session-disk-bytes", "--session-first-generate", "--session-capture-host-bytes", "--session-dir", "--session-ram-bytes", "--session-max-parked", "--http-port",
         "--generate", "--tokens-file", "--record-raw", "--reference", "--teacher-logits-file",
-        "--prefix-cache-inflight", "--prefix-cache-disk", "--prefix-cache-durable"};
+        "--prefix-cache-inflight", "--prefix-cache-disk", "--prefix-cache-durable", "--deploy", "--deploy-check"};
     // Not part of the window-cost table key: prompts, per-run outputs and HTTP front-end settings.
     const std::set<std::string_view> cost_table_skip{"--prompt-ids", "--seqs-file", "--json", "--qual-dump", "--session-dump",
         "--state-out", "--logprob-token", "--chat-logits", "--http-api-key-file", "--http-bind", "--http-model-id",
@@ -1743,8 +1757,19 @@ static int run_decode_entry(
         strix::decode_cli::validate_effective_startup(effective);
     strix::decode_cli::validate_http_serving_memory(options,prompt_memory);
     if (options.print_effective_config) {
+        if (options.deployment_spec) {
+            deployment.resolve(effective, model, manifest, mapped.bytes(),
+                options.http_serve && prompt_memory.serving ? prompt_memory.serving(options) : strix::decode_cli::HttpServingMemory{});
+            std::cout << deployment.json() << '\n';
+            return deployment.plan->refused ? 2 : 0;
+        }
         std::cout << strix::decode_cli::effective_config_json(effective);
         return 0;
+    }
+    if (options.deployment_spec) {
+        deployment.resolve(effective, model, manifest, mapped.bytes(),
+            options.http_serve && prompt_memory.serving ? prompt_memory.serving(options) : strix::decode_cli::HttpServingMemory{});
+        strix::deploy::require_plan(*deployment.plan);
     }
     strix::decode_cli::require_effective_prefill_execution(effective);
     std::unique_ptr<strix::decode_cli::YarnMemoryWatchdog> yarn_watchdog;
@@ -4626,7 +4651,7 @@ static int run_decode_entry(
             parents->serve_batch = options.http_serve
                 ? strix::decode_cli::make_http_batch_serve(options, "native MTP batched decode (" + std::to_string(batch_slots) +
                     " slots), profile " + std::string(optimization_profile.selected) + ", context " + std::to_string(options.context_tokens),
-                    startup_preflight, release_assets, {}, rewarm_before_listen)
+                    startup_preflight, release_assets, {}, rewarm_before_listen, deployment.callbacks())
                 : strix::decode_cli::make_cohort_tiled_run(options, model, std::cout);
         }
         if(strix::decode_cli::mtp_prompt_phase_separation(options)) {
@@ -4647,7 +4672,7 @@ static int run_decode_entry(
         if (options.http_serve && !batch_slots)
             parents->serve = strix::decode_cli::make_http_serve(options, "native MTP greedy decode, profile " +
                 std::string(optimization_profile.selected) + ", context " + std::to_string(options.context_tokens),
-                parents->tiled.rtx_import, startup_preflight, release_assets, rewarm_before_listen);
+                parents->tiled.rtx_import, startup_preflight, release_assets, rewarm_before_listen, deployment.callbacks());
         setup_phase.reset();
         // --mtp-sample-repeats N: N independent requests (seeds seed..seed+N-1), each from a fresh
         // session over the same loaded model; one receipt per request.
@@ -5603,8 +5628,9 @@ static int run_decode_entry(
                 pair_prediction.b * static_cast<double>(options.tokens.size()), pair_cost_env ? "compute-only" : "unavailable");
             const char* pair_transport_env = std::getenv("STRIX_QWEN_PF_PIPE_TRANSPORT");
             const std::string_view pair_transport = pair_transport_env ? pair_transport_env : "usb4auto";
-            std::unique_ptr<strix::dist::Transport> pair_link;
-            if (pair_transport == "usb4auto" || pair_transport == "usb4-auto") {
+            std::unique_ptr<strix::dist::Transport> pair_link = std::move(deployment.pair_link);
+            if (pair_link) { /* Deployment already exchanged measured facts and plan IDs. */ }
+            else if (pair_transport == "usb4auto" || pair_transport == "usb4-auto") {
                 strix::dist::Usb4AutoOptions pair_usb;
                 pair_usb.rank = pair_rank;
                 pair_link = strix::dist::usb4_host_auto(pair_usb);

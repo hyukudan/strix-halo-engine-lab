@@ -652,6 +652,13 @@ if(BUILD_TESTING)
     endif()
     strix_target_warnings(strix-deepseek41-deploy-host-tests)
     add_test(NAME strix-deepseek41-deploy-host-tests COMMAND strix-deepseek41-deploy-host-tests)
+    foreach(engine glm qwen)
+        add_executable(strix-${engine}-deploy-host-tests tests/${engine}_deploy_host_tests.cpp)
+        target_include_directories(strix-${engine}-deploy-host-tests PRIVATE src)
+        target_link_libraries(strix-${engine}-deploy-host-tests PRIVATE strix_deploy)
+        strix_target_warnings(strix-${engine}-deploy-host-tests)
+        add_test(NAME strix-${engine}-deploy-host-tests COMMAND strix-${engine}-deploy-host-tests)
+    endforeach()
 endif()
 
 add_library(strix_model_registry STATIC src/model_registry.cpp)
@@ -5068,6 +5075,7 @@ if(STRIX_FAMILY_GLM5)
                 src/glm/xfer/glm_xfer.hip src/glm/xfer/glm_xfer_exchange.hip src/glm/xfer/glm_post_exchange.hip
                 src/glm/prefill/glm_pf_moe.hip src/glm/prefill/glm_pf_path.hip src/glm/prefill/glm_pf_exact.hip src/glm/prefill/glm_pf_exact_moe.hip)
             target_link_libraries(strix_glm5_engine PUBLIC strix_xport strix_glm5_kernels strix_glm5_model_description strix_dist strix_deploy "${strix_glm5_trellis_lib}")
+            target_sources(strix_glm5_engine PRIVATE src/glm/load/glm_rank_plan.cpp)
             set_source_files_properties(src/glm/engine/glm_kvshard.hip PROPERTIES
                 COMPILE_OPTIONS "-Werror;-Wshadow;-Wsign-conversion;-Wunused-function;-Wcuda-compat")
             target_include_directories(strix_glm5_engine PUBLIC include src "${STRIX_HIP_INCLUDE_DIR}"
