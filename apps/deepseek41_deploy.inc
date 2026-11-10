@@ -1,4 +1,5 @@
 // Included in the serve app's anonymous namespace, after its options and host sizing helpers.
+// Needs strix/deploy/binding.hpp included before this file (outside any namespace).
 // No device allocation or weight loading is permitted in this provider.
 class Ds41FootprintProvider final : public strix::deploy::FootprintProvider {
 public:

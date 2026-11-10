@@ -1,5 +1,5 @@
 // Compile the actual serve binding against host sizing/transport doubles. No HIP headers or model weights.
-#include "strix/deploy/plan.hpp"
+#include "strix/deploy/binding.hpp"
 #include "strix/deepseek41_prefill.hpp"
 #include "strix/deepseek41_serve_sched.hpp"
 #include "strix/dist/transport.hpp"
@@ -61,7 +61,7 @@ public:
     void exchange(std::span<const std::byte> out, std::span<std::byte> in) override {
         require(out.size() == in.size(), "exchange size");
         std::copy(out.begin(), out.end(), in.begin());
-        if (out.size() == 120) {
+        if (out.size() > 16) { // device-facts packet (shared binding wire)
             std::uint64_t rank = 0;
             std::memcpy(&rank, out.data() + 8, 8);
             rank = 1 - rank;

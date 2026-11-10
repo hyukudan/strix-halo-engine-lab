@@ -42,12 +42,9 @@ int main(int argc, char** argv) {
             if (!strix::deploy::pinned(spec,"slots") && streams_given) spec.slots = options.streams;
             const auto model = e::deployment_model(options.model);
             if (!strix::deploy::pinned(spec,"context")) spec.context = model.max_context;
-            auto facts = spec.devices;
-            if (facts.empty()) facts.push_back(strix::deploy::probe_device());
             // Replicas are independent launches. The spec supplies measured peer
-            // facts; each process replaces its own indexed observation at launch.
-            if (options.deploy_node >= facts.size()) throw std::invalid_argument("deployment node index outside inventory");
-            if (!options.deploy_check) facts[options.deploy_node] = strix::deploy::probe_device();
+            // facts; each process (and its inspection) replaces its own indexed observation.
+            const auto facts = strix::deploy::inspection_devices(spec,options.deploy_node,strix::deploy::probe_device());
             std::uint64_t prefix_bytes = 4ULL<<30;
             if (const auto* mb = std::getenv("STRIX_G4_SERVE_PREFIX_MB")) {
                 std::size_t end = 0; const auto n = std::stoull(mb,&end);
@@ -66,8 +63,7 @@ int main(int argc, char** argv) {
                 (identity && std::string_view(identity) == "g4-a8-v1");
             auto plan = strix::deploy::resolve(spec,facts,e::FootprintProvider(model,facts.size()>1,prefix_bytes,prepared));
             if (options.deploy_check) { std::cout << plan.to_json() << '\n'; return plan.refused ? 2 : 0; }
-            if (plan.refused) throw std::invalid_argument("deployment refused: "+plan.refusal+
-                (plan.reasons.empty() ? "" : "; "+plan.reasons.back()));
+            strix::deploy::require_plan(plan);
             options.deployment_context = plan.chosen.context; options.streams = plan.chosen.slots;
 #ifdef _WIN32
             _putenv_s("STRIX_G4_SERVE_SLOTS",std::to_string(options.streams).c_str());
