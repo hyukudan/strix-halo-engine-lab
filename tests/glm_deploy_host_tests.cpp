@@ -28,7 +28,7 @@ int main() {
         check(dp::resolve(s, {device(32,false),device(32,false)}, provider).refused, "discrete bytes, no named tier");
         s.format.prefill = "int4-stored";
         const auto i4 = dp::resolve(s, {device(192),device(192)}, provider);
-        check(i4.refused && !i4.reasons.empty() && i4.reasons.back().find("unavailable") != std::string::npos, "absent INT4 implementation refuses");
+        check(i4.refused && i4.refusal.find("no supported candidate") != std::string::npos, "absent INT4 runtime advertises no INT4 candidate");
         s.format.prefill = "auto";
         o.mtp = false; o.kv_shard = "1";
         gd::Provider shard(weights,o,workspace);

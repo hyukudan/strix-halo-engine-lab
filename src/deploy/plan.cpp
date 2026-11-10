@@ -1,4 +1,5 @@
 #include "strix/deploy/plan.hpp"
+#include "strix/deploy/binding.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -10,14 +11,6 @@
 
 namespace strix::deploy {
 namespace {
-std::uint64_t add(std::uint64_t a, std::uint64_t b) {
-    if (a > std::numeric_limits<std::uint64_t>::max() - b) throw std::overflow_error("footprint byte overflow");
-    return a + b;
-}
-std::uint64_t mul(std::uint64_t a, std::uint64_t b) {
-    if (b && a > std::numeric_limits<std::uint64_t>::max() / b) throw std::overflow_error("KV byte overflow");
-    return a * b;
-}
 std::string quote(const std::string& s) {
     static constexpr char hex[] = "0123456789abcdef";
     std::string out = "\"";
@@ -163,15 +156,15 @@ Plan resolve(const Spec& input, const std::vector<DeviceFacts>& devices, const F
                         try {
                             b.footprint = provider.footprint(input, c, rank);
                             const auto& f = b.footprint;
-                            b.kv_bytes = f.kv_total ? f.kv_total : mul(mul(f.kv_per_token, c.context), c.slots);
+                            b.kv_bytes = f.kv_total ? f.kv_total : checked_mul(checked_mul(f.kv_per_token, c.context), c.slots);
                             auto needed = b.kv_bytes;
                             if (b.reason.empty() && needed > b.budget_bytes) b.reason = "KV reservation exceeds budget";
                             b.after_kv_bytes = needed <= b.budget_bytes ? b.budget_bytes - needed : 0;
-                            needed = add(needed, f.workspace);
+                            needed = checked_add(needed, f.workspace);
                             if (b.reason.empty() && needed > b.budget_bytes) b.reason = "workspace exceeds remaining budget";
                             b.after_workspace_bytes = needed <= b.budget_bytes ? b.budget_bytes - needed : 0;
-                            needed = add(add(needed, f.weights), f.staging);
-                            for (const auto& extra : f.extra) needed = add(needed, extra.second);
+                            needed = checked_add(checked_add(needed, f.weights), f.staging);
+                            for (const auto& extra : f.extra) needed = checked_add(needed, extra.second);
                             b.required_bytes = needed;
                             b.fits = b.free_bytes >= margin && needed <= b.budget_bytes;
                             if (!b.fits && b.reason.empty()) b.reason = "weights/staging/extras exceed remaining budget";

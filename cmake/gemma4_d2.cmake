@@ -7,7 +7,7 @@ add_library(strix_gemma4_engine STATIC
     src/gemma4/engine/api.cpp
     src/serve/deployment.cpp
     src/gemma4/engine/runtime.cpp)
-target_link_libraries(strix_gemma4_engine PUBLIC strix_gemma4_ref strix_gemma4_dflash strix_gemma4_eagle)
+target_link_libraries(strix_gemma4_engine PUBLIC strix_gemma4_ref strix_gemma4_dflash strix_gemma4_eagle strix_engine_deploy)
 strix_target_warnings(strix_gemma4_engine)
 if(MSVC)
     target_compile_definitions(strix_gemma4_engine PRIVATE _CRT_SECURE_NO_WARNINGS)
@@ -42,6 +42,13 @@ if(NOT WIN32)
     strix_target_warnings(strix-gemma4-serve)
 endif()
 if(BUILD_TESTING)
+    if(WIN32)
+        # The socket server is native-only; still compile its deployment binding
+        # in host CI without linking or allocating an accelerator.
+        add_library(strix-gemma4-deploy-cli-compile OBJECT apps/gemma4_serve_main.cpp)
+        target_link_libraries(strix-gemma4-deploy-cli-compile PRIVATE strix_gemma4_engine)
+        strix_target_warnings(strix-gemma4-deploy-cli-compile)
+    endif()
     add_executable(strix-gemma4-integration-tests tests/gemma4_integration/integration.cpp)
     target_link_libraries(strix-gemma4-integration-tests PRIVATE strix_gemma4_engine)
     strix_target_warnings(strix-gemma4-integration-tests)

@@ -18,11 +18,11 @@ struct GlmDeployment {
         const auto link = transport.starts_with("tcp-") ? std::string("tcp") : transport;
         if (spec.link == "auto") spec.link = link.empty() ? "usb4-auto" : link;
         else if (!link.empty() && spec.link != link) refusal = "link pin differs from --transport";
-        if (!spec.pins.contains("context") && !spec.pins.contains("memory.context")) {
+        if (!strix::deploy::pinned(spec, "context")) {
             if (opt.capacity > UINT32_MAX) throw std::invalid_argument("deployment context exceeds u32");
             spec.context = static_cast<std::uint32_t>(opt.capacity);
         }
-        if (!spec.pins.contains("slots") && !spec.pins.contains("memory.slots")) spec.slots = opt.slots;
+        if (!strix::deploy::pinned(spec, "slots")) spec.slots = opt.slots;
         opt.capacity = spec.context; opt.slots = spec.slots ? spec.slots : opt.slots;
         if (opt.world != 2 || opt.layers != 45 || opt.external_exchange) refusal = "GLM deployment requires the complete TP2 communicator route";
         if (const char* pipeline = std::getenv("STRIX_GLM_PF_PIPELINE"); pipeline && std::string(pipeline) != "1")

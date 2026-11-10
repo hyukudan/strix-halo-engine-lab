@@ -13,6 +13,9 @@ struct Options {
     unsigned slots = 1;
     bool mtp = true, spec = false;
     std::string kv_shard = "0", profile = "default", refusal, configuration_id;
+    // deploy::int4_moe_formats hook: true only once the FAST_I4 stored/JIT loader
+    // and its controls are linked; footprint() then needs its header-only sizing.
+    bool int4_runtime = false;
 };
 class Provider final : public deploy::FootprintProvider {
 public:
@@ -22,16 +25,18 @@ public:
     std::string model() const override { return "glm-5.3"; }
     std::vector<std::string> topologies() const override { return {"tp2"}; }
     std::vector<deploy::Format> formats(const std::string&) const override {
-        // The stored INT4 loader is not in this checkout. Keep an explicit pin
-        // inspectable with a named refusal instead of pretending EXL3 is INT4.
-        return {{"exl3", "int4-stored", 42, 42, 0}, {"exl3", "exl3"}};
+        // Only executable formats: INT4 candidates come from the shared hook.
+        if (!options_.int4_runtime) return {{"exl3", "exl3"}};
+        auto out = deploy::int4_moe_formats("exl3", 42, 2);
+        out.push_back({"exl3", "exl3"});
+        return out;
     }
     std::uint32_t max_slots() const override { return options_.slots; }
     deploy::Footprint footprint(const deploy::Spec& s, const deploy::Candidate& c, std::uint32_t rank) const override {
         if (!options_.refusal.empty()) throw std::invalid_argument(options_.refusal);
         if (s.profile != "auto" && s.profile != options_.profile) throw std::invalid_argument("profile pin differs from active profile");
-        if (c.format.prefill == "int4-stored")
-            throw std::invalid_argument("FAST_I4 int4-stored loader/controls unavailable in this build");
+        if (c.format.prefill != "exl3")
+            throw std::invalid_argument("GLM INT4 header-only sizing not bound yet (FAST_I4 hook)");
         if (rank > 1 || !c.context || c.context % 4) throw std::invalid_argument("GLM context must be a positive multiple of 4");
         if (options_.kv_shard != "0" && options_.kv_shard != "1" && options_.kv_shard != "auto")
             throw std::invalid_argument("STRIX_GLM_KV_SHARD must be 0, 1 or auto");

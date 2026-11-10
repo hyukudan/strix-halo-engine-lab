@@ -116,7 +116,7 @@
 #include "strix/deepseek41_session_cache.hpp"
 #include "strix/serve/session_api.hpp"
 #include "strix/deepseek41_describe.hpp"
-#include "strix/deploy/plan.hpp"
+#include "strix/deploy/binding.hpp"
 #include "strix/deepseek41_serve_observe.hpp"
 #include "strix/deepseek41_serve_sched.hpp"
 #include "strix/ds41_expert_tp.hpp"
@@ -3580,9 +3580,9 @@ int main(int argc, char** argv) try {
     if (a.deploy_check) {
         strix::ds41::expert_tp::set_decode_default(false);
         if (a.device_prefill && strix::ds41::expert_tp::enabled_from_env()) strix::ds41::expert_tp::set_packed(0);
-        auto facts = a.deploy_spec->devices;
-        if (facts.empty()) facts.push_back(strix::deploy::probe_device());
-        const auto plan = strix::deploy::resolve(*a.deploy_spec, facts, Ds41FootprintProvider(a));
+        // Pair inspection needs the orchestrator's measured peer entry; never invented.
+        const auto plan = strix::deploy::resolve(*a.deploy_spec,
+            strix::deploy::inspection_devices(*a.deploy_spec, a.rank, strix::deploy::probe_device()), Ds41FootprintProvider(a));
         std::printf("%s\n", plan.to_json().c_str());
         return plan.refused ? 2 : 0;
     }

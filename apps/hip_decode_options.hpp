@@ -1,5 +1,5 @@
 #include "strix/ctx_exact_memory.hpp"
-#include "strix/deploy/spec.hpp"
+#include "strix/deploy/binding.hpp"
 #pragma once
 #include "strix/rotary_descriptor.hpp"
 #include "strix/qsa_committed_pool.hpp"
@@ -3348,7 +3348,7 @@ inline Options parse_options(
     }
     if (!options.deploy_file.empty() || options.deploy_check) {
         auto spec = strix::deploy::load_spec(options.deploy_file.empty() ? "auto" : options.deploy_file);
-        if (spec.pins.contains("context") || spec.pins.contains("memory.context")) {
+        if (strix::deploy::pinned(spec, "context")) {
             if (options.context_explicit && options.context_tokens != spec.context)
                 throw std::invalid_argument("deployment context pin differs from --context");
             options.context_tokens = spec.context; options.context_explicit = true;

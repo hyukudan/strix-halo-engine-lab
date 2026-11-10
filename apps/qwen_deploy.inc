@@ -14,7 +14,7 @@ struct QwenDeployment {
         namespace dc = strix::decode_cli;
         const auto& o = effective.options;
         auto spec = *o.deployment_spec;
-        if (!spec.pins.contains("context") && !spec.pins.contains("memory.context")) {
+        if (!strix::deploy::pinned(spec, "context")) {
             if (o.context_tokens > UINT32_MAX) throw std::invalid_argument("deployment context exceeds u32");
             spec.context = static_cast<std::uint32_t>(o.context_tokens);
         }
