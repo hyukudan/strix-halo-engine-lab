@@ -8,24 +8,26 @@ an admitted memory plan does not add kernel support for a different architecture
 
 ## Availability
 
-The deployment core provides probing, TOML parsing, per-rank budgeting and DeepSeek
-inspection. The serving and engine bindings described below require a build that
-includes those integrations; a core-only build does not expose every endpoint or
-engine adapter. Host tests cover the contracts. Native application compilation,
-allocation peaks, served execution and complete token/logit/state qualification on
-new hardware remain required. A successful inspection is not that qualification.
+Checked on the lab's two gfx1151 nodes (117.2 GiB device-usable memory each): strict
+native builds of every engine app below, the host tests, `--deploy-check` on both
+ranks (no device opened, no peer connection) and with simulated memory sizes. The
+last column says what a served `--deploy auto` run on those nodes has shown. Complete
+token/logit/state qualification and allocation peaks on other hardware remain
+required; a successful inspection is not that qualification.
 
-| Engine | Implemented deployment choices | Current limits |
-|---|---|---|
-| Qwen | Native encoding; single node, two replicas, explicit two-node pipelined prefill | Registered eager tiled route; one HTTP slot per replica. Pipeline is CLI prefill with rank-0 continuation, not HTTP. YaRN, copy and graph routes refuse. |
-| Nemotron | Q4_K_M; single node or independent replicas | Disable drafts with `--draft off`. EXL3/drafter sizing and pair execution are unavailable in this binding. |
-| DeepSeek | Native encoding; TP2 | Disable the default cache with `--cache-profile off`, and session RAM, DSpark and heterogeneous stages; trellis workspace is not sized. Unsupported prefill estimates refuse. |
-| GLM | EXL3; TP2 | Current default profile only. Prefix cache/import, pipeline, external exchange and truncated stacks refuse. Stored INT4 execution is pending. |
-| MiniMax | EXL3; TP2 | Disable DSpark and session caching/save/restore; max rows must not exceed 4096. INT4 execution is pending. |
+| Engine | Deployment choices | Launch requirements under `--deploy` | Checked on the lab nodes |
+|---|---|---|---|
+| Qwen | Native encoding; single node, two replicas, explicit two-node pipelined prefill | Registered eager tiled route; HTTP needs the tiled MTP serving arguments and runs one HTTP slot per replica (no `--http-batch`). The default session RAM is charged; on a 117 GiB node pass `--session-ram-bytes 0` (or a smaller `memory.margin_gib`) to fit. Pipeline is CLI prefill with rank-0 continuation, not HTTP. YaRN, copy and graph routes refuse. | Served (`--deploy auto`, HTTP): plan, `deployment_id`, capacity and drain as specified; 24 greedy tokens equal to the same launch without `--deploy`. It admits 1 HTTP slot where the plain launch serves 4. |
+| Nemotron | Q4_K_M; single node or independent replicas | `--draft off`. EXL3/drafter sizing and pair execution are not bound. The prefill prepared-panel bound is conservative. | Served (`--deploy auto`, single node): 8 slots at 65,536 context, the same as the plain launch; plan, `deployment_id`, capacity and drain as specified; 24 greedy tokens equal to the launch without `--deploy`. |
+| DeepSeek | Native encoding; TP2 | `--cache-profile off`, `--no-dspark`, no session RAM or heterogeneous stage, trellis off (`STRIX_DS41_TRELLIS=0`: its workspace is not sized). Unsupported prefill estimates refuse. | Served pair (`--deploy auto`): one agreed plan (84.6 GiB required per rank; the load reports 79.8 GiB of weights and 0.88 GiB of prefill-owned weights); capacity and drain as specified; 24 greedy tokens equal to the launch without `--deploy`. That build did not yet publish the plan on `GET /v1/deployment` or `/health`; fixed afterwards (strict build passes), served re-check pending. |
+| GLM | EXL3; TP2 | Default profile only; `--prefix-cache-gib 0`. Prefix import, an explicit `STRIX_GLM_PF_PIPELINE` override, external exchange and truncated stacks refuse. | Served pair (`--deploy auto`): one agreed plan (94.0 GiB required per rank; the engine's own load plan is 81.3 GiB physical); plan, `deployment_id`, capacity and drain as specified; 24 greedy tokens equal to the launch without `--deploy`. |
+| MiniMax | EXL3; TP2 | `--dspark-mode off` (DSpark is found next to the model otherwise), `STRIX_SESSION_CACHE=0` and no session save/restore; `--max-rows` at most 4096. | Served pair (`--deploy auto`): both ranks agreed on one plan (100.0 GiB required per rank against 109.2 GiB budget; the load reports 90.3 GiB device used); plan, `deployment_id`, capacity and drain as specified; 24 greedy tokens equal to the launch without `--deploy`. |
 
-GLM and MiniMax can describe INT4 candidates but refuse unavailable execution.
-MiniMax INT4 inspection can retain placement arithmetic in a **refused** plan.
-Neither an INT4 pin nor `profile.allow_pending` enables a missing runtime.
+INT4 (FAST_I4) formats are not offered: their runtimes are not in this build, so no
+plan can select them and a `format.prefill = "int4-stored"` or `"int4-jit"` pin
+refuses with "no supported candidate". The providers keep a hook
+(`deploy::int4_moe_formats`) that adds these candidates once an engine links its
+INT4 runtime and controls. `profile.allow_pending` does not enable a missing runtime.
 Disaggregated prefill is a schema vocabulary item, not an executable deployment
 choice in these bindings. Existing launches without deployment retain their own
 defaults and admission contracts.

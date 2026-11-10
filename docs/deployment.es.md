@@ -9,27 +9,29 @@ kernels para otra arquitectura.
 
 ## Disponibilidad
 
-El núcleo de despliegue ofrece sondeo, lectura TOML, presupuestos por rango e
-inspección de DeepSeek. Las interfaces HTTP y las adaptaciones de motores descritas
-aquí requieren una compilación que incluya esas integraciones; una compilación
-solo del núcleo no incorpora todas las interfaces. Las pruebas de host cubren
-los contratos. Siguen siendo necesarias la compilación nativa, la comprobación
-de picos de memoria, la ejecución del servidor y la cualificación completa de
-tokens, logits y estado en el hardware nuevo. Una inspección admitida no demuestra
-esa cualificación.
+Comprobado en los dos nodos gfx1151 del laboratorio (117,2 GiB de memoria utilizable
+por el dispositivo en cada uno): compilación nativa estricta de cada aplicación de la
+tabla, pruebas de host, `--deploy-check` en ambos rangos (sin abrir el dispositivo ni
+conectar con el par) y con tamaños de memoria simulados. La última columna indica lo
+que ha mostrado una ejecución servida con `--deploy auto` en esos nodos. Siguen siendo
+necesarias la cualificación completa de tokens, logits y estado y la medida de picos
+de memoria en otro hardware; una inspección admitida no es esa cualificación.
 
-| Motor | Opciones de despliegue implementadas | Límites actuales |
-|---|---|---|
-| Qwen | Codificación nativa; un nodo, dos réplicas, prefill explícito en pipeline de dos nodos | Ruta eager tiled registrada; un slot HTTP por réplica. Pipeline solo para prefill CLI y continuación en rango 0, no HTTP. YaRN y las rutas copy/graph se rechazan. |
-| Nemotron | Q4_K_M; un nodo o réplicas independientes | Desactive borradores con `--draft off`. No están disponibles el dimensionamiento EXL3/con borradores ni la ejecución en par en esta adaptación. |
-| DeepSeek | Codificación nativa; TP2 | Desactive la caché predeterminada con `--cache-profile off`, además de RAM de sesión, DSpark y etapas heterogéneas. Falta dimensionar workspace de trellis. Las estimaciones de prefill no admitidas se rechazan. |
-| GLM | EXL3; TP2 | Solo el perfil default actual. Se rechazan caché/importación de prefijos, pipeline, intercambio externo y pilas truncadas. INT4 almacenado pendiente. |
-| MiniMax | EXL3; TP2 | Desactive DSpark y caché/guardado/restauración de sesión; máximo 4096 filas. Ejecución INT4 pendiente. |
+| Motor | Opciones de despliegue | Requisitos de arranque con `--deploy` | Comprobado en los nodos |
+|---|---|---|---|
+| Qwen | Codificación nativa; un nodo, dos réplicas, prefill explícito en pipeline de dos nodos | Ruta eager tiled registrada; HTTP necesita los argumentos del servidor MTP tiled y usa un slot HTTP por réplica (sin `--http-batch`). Se cuenta la RAM de sesión predeterminada; en un nodo de 117 GiB use `--session-ram-bytes 0` (o un `memory.margin_gib` menor) para que quepa. Pipeline solo para prefill CLI con continuación en rango 0, no HTTP. YaRN y las rutas copy/graph se rechazan. | Servido (`--deploy auto`, HTTP): plan, `deployment_id`, capacidad y drenado según lo especificado; 24 tokens greedy idénticos a los del mismo arranque sin `--deploy`. Admite 1 slot HTTP donde el arranque normal sirve 4. |
+| Nemotron | Q4_K_M; un nodo o réplicas independientes | `--draft off`. No están ligados el dimensionamiento EXL3/con borradores ni la ejecución en par. La cota de paneles preparados del prefill es conservadora. | Servido (`--deploy auto`, un nodo): 8 slots con contexto 65.536, igual que el arranque normal; plan, `deployment_id`, capacidad y drenado según lo especificado; 24 tokens greedy idénticos sin `--deploy`. |
+| DeepSeek | Codificación nativa; TP2 | `--cache-profile off`, `--no-dspark`, sin RAM de sesión ni etapa heterogénea, trellis desactivado (`STRIX_DS41_TRELLIS=0`: su workspace no está dimensionado). Las estimaciones de prefill no admitidas se rechazan. | Par servido (`--deploy auto`): un plan acordado (84,6 GiB requeridos por rango; la carga indica 79,8 GiB de pesos y 0,88 GiB propios del prefill); capacidad y drenado según lo especificado; 24 tokens greedy idénticos sin `--deploy`. Esa compilación aún no publicaba el plan en `GET /v1/deployment` ni en `/health`; corregido después (la compilación estricta pasa), comprobación servida pendiente. |
+| GLM | EXL3; TP2 | Solo el perfil default; `--prefix-cache-gib 0`. Se rechazan importación de prefijos, un `STRIX_GLM_PF_PIPELINE` explícito, intercambio externo y pilas truncadas. | Par servido (`--deploy auto`): un plan acordado (94,0 GiB requeridos por rango; el plan de carga del motor son 81,3 GiB físicos); plan, `deployment_id`, capacidad y drenado según lo especificado; 24 tokens greedy idénticos sin `--deploy`. |
+| MiniMax | EXL3; TP2 | `--dspark-mode off` (si no, DSpark se detecta junto al modelo), `STRIX_SESSION_CACHE=0` y sin guardar/restaurar sesiones; `--max-rows` como máximo 4096. | Par servido (`--deploy auto`): ambos rangos acordaron un plan (100,0 GiB requeridos por rango frente a 109,2 GiB de presupuesto; la carga indica 90,3 GiB usados); plan, `deployment_id`, capacidad y drenado según lo especificado; 24 tokens greedy idénticos sin `--deploy`. |
 
-GLM y MiniMax pueden describir candidatos INT4, pero rechazan su ejecución no
-disponible. La inspección INT4 de MiniMax puede conservar el cálculo de colocación
-en un plan **rechazado**. Ni fijar INT4 ni `profile.allow_pending` habilita un
-runtime ausente. El prefill desagregado forma parte del vocabulario del esquema,
+No se ofrecen formatos INT4 (FAST_I4): sus runtimes no están en esta compilación, así
+que ningún plan puede elegirlos y fijar `format.prefill = "int4-stored"` o `"int4-jit"`
+se rechaza con "no supported candidate". Los proveedores mantienen un punto de
+extensión (`deploy::int4_moe_formats`) que añade esos candidatos cuando un motor
+enlaza su runtime INT4 y sus controles. `profile.allow_pending` no habilita un
+runtime ausente.
+El prefill desagregado forma parte del vocabulario del esquema,
 pero estas adaptaciones no lo ejecutan. Los comandos sin despliegue mantienen sus
 valores predeterminados y contratos de admisión propios.
 
