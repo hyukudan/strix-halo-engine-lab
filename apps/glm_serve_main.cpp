@@ -1371,6 +1371,10 @@ int main(int argc, char** argv) {
         config.model_id = model_id;
         config.default_max_tokens = max_tokens;
         config.http_slots = serial ? 1U : opt.slots;
+        config.deployment.capacity_provider = [&lead, &queue, slots = config.http_slots] {
+            const auto q = queue.snapshot();
+            return sv::ServeCapacity{slots, lead.stats().active, std::nullopt, q.queued};
+        };
         config.default_thinking = true;  // the GLM generation prompt ends inside <think>
         config.sampling_policy = "greedy";
         config.chat_renderer = [](const sv::ChatTemplateInput& in) { return sv::render_glm_chat(in); };

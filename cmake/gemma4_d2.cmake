@@ -5,6 +5,7 @@ add_library(strix_gemma4_engine STATIC
     src/gemma4/engine/host_backend.cpp
     src/gemma4/engine/chat_runner.cpp
     src/gemma4/engine/api.cpp
+    src/serve/deployment.cpp
     src/gemma4/engine/runtime.cpp)
 target_link_libraries(strix_gemma4_engine PUBLIC strix_gemma4_ref strix_gemma4_dflash strix_gemma4_eagle)
 strix_target_warnings(strix_gemma4_engine)
@@ -47,6 +48,15 @@ if(BUILD_TESTING)
     add_test(NAME gemma4-integration-host COMMAND strix-gemma4-integration-tests)
     add_test(NAME gemma4-integration-off COMMAND strix-gemma4-integration-tests --off)
     set_tests_properties(gemma4-integration-host gemma4-integration-off PROPERTIES TIMEOUT 60)
+    find_package(Python3 COMPONENTS Interpreter QUIET)
+    if(Python3_Interpreter_FOUND)
+        set(deployment_tokenizer "${CMAKE_CURRENT_BINARY_DIR}/gemma4-deployment-tokenizer.json")
+        add_test(NAME gemma4-deployment-fixture COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/gemma4_serve/make_deployment_fixture.py ${deployment_tokenizer})
+        set_tests_properties(gemma4-deployment-fixture PROPERTIES FIXTURES_SETUP gemma4_deployment TIMEOUT 60)
+        add_test(NAME gemma4-deployment-http-host COMMAND strix-gemma4-integration-tests --chat ${deployment_tokenizer})
+        set_tests_properties(gemma4-deployment-http-host PROPERTIES FIXTURES_REQUIRED gemma4_deployment TIMEOUT 60)
+    endif()
     set_tests_properties(gemma4-integration-off PROPERTIES ENVIRONMENT "STRIX_G4_DFLASH=0")
     if(STRIX_GEMMA4_DEVICE_BACKEND)
         add_test(NAME gemma4-integration-device COMMAND strix-gemma4-integration-tests --device)

@@ -1003,6 +1003,11 @@ int main(int argc, char** argv) {
         oi.draft = drafter != nullptr;
         ms::Observer observer(std::move(oi));
         ms::MinimaxApiOptions ao;
+        ao.http_slots = opt.slots;
+        ao.deployment.capacity_provider = [&queue, slots = opt.slots] {
+            const auto q = queue.snapshot();
+            return sv::ServeCapacity{slots, q.running, std::nullopt, q.queued};
+        };
         ao.session_enabled = session_runtime != nullptr;
         ao.model_id = model_id;
         ao.default_max_tokens = max_tokens;
