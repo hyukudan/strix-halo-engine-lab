@@ -1425,8 +1425,7 @@ private:
         } else make_prefill(false);
         if(fork_on_) {
             if(fork.hit) {++stats_.prefix_fork_hits;stats_.prefix_fork_restored_tokens+=s.prefill->restored();}
-            std::fprintf(stderr,"prefix fork slot=%zu restored=%llu prompt=%zu hit=%d reason=%s
-",static_cast<std::size_t>(free-slots_.begin()),
+            std::fprintf(stderr,"prefix fork slot=%zu restored=%llu prompt=%zu hit=%d reason=%s\n",static_cast<std::size_t>(free-slots_.begin()),
                 static_cast<unsigned long long>(fork.hit?s.prefill->restored():0ULL),s.request.prompt.size(),fork.hit?1:0,fork.reason);
         }
         static_cast<void>(m);
