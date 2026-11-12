@@ -550,6 +550,7 @@ struct Engine::Impl {
     bool pf_force_comm = false;                // STRIX_MM_PF_INTERLEAVE=comm: the communicator backend even with the module on
     bool pf_router_batch = true;               // STRIX_MM_PF_ROUTER_BATCH: prefill only, default ON (prefill measurement exact); =0 off
     unsigned pf_router_rows = 32;               // STRIX_MM_PF_ROUTER_ROWS: 32 (default: tiled scores, weights read once per 16 rows), 4 or 8; same bits
+    unsigned pf_post_router = 1;               // STRIX_MM_PF_POST_ROUTER: 1 (default) post-exchange + router scores in one launch on the piece sizes where it wins, 2 on every piece, 0 two launches; same bits
     float* router_scratch = nullptr;           // tiled router scores [2][128][rows] (STRIX_MM_PF_ROUTER_ROWS=32)
     bool pf_tx_uncached = false;              // STRIX_MM_PF_TX_UNCACHED: prefill producers write uncached TX
     bool pf_inplace = false;                   // STRIX_MM_PFX_INPLACE: o_proj / FFN outputs written straight into the TX slot
@@ -770,6 +771,11 @@ struct Engine::Impl {
             const std::string mode(rr);
             if (mode != "4" && mode != "8" && mode != "32") throw std::invalid_argument("STRIX_MM_PF_ROUTER_ROWS must be 4, 8 or 32");
             pf_router_rows = mode == "4" ? 4U : mode == "8" ? 8U : 32U;
+        }
+        if (const char* pr = std::getenv("STRIX_MM_PF_POST_ROUTER"); pr != nullptr && *pr != '\0') {
+            const std::string mode(pr);
+            if (mode != "0" && mode != "1" && mode != "2") throw std::invalid_argument("STRIX_MM_PF_POST_ROUTER must be 0, 1 or 2");
+            pf_post_router = static_cast<unsigned>(mode[0] - '0');
         }
         pf_inplace = env_flag("STRIX_MM_PFX_INPLACE", false);
         pf_tx_uncached = env_flag("STRIX_MM_PF_TX_UNCACHED", true);  // ON (measurement: exact, send 0.23 -> 0.002 s); =0
@@ -1382,11 +1388,22 @@ struct Engine::Impl {
         ++xb_warm_o_count;
     }
 
+    // Whether a piece of `rows` rows takes the fused post + router launch. Per-regime selection from the unit A/B/A
+    // receipts (fused / two launches: 64 rows 0.77, 1024 0.79, 2048 0.89, 3072 1.00, 4096 1.29): on up to 2048 rows.
+    static constexpr std::uint32_t kPostRouterMinRows = 64, kPostRouterMaxRows = 2048;
+    bool post_router_fused(std::uint32_t rows) const {
+        if (pf_post_router == 0 || rows <= 8) return false;
+        return pf_post_router == 2 || (rows >= kPostRouterMinRows && rows <= kPostRouterMaxRows);
+    }
     // Every post-exchange launch of the engine (STRIX_MM_XB_POSTILP selects the loads-first form, same bits).
     void enqueue_post(moe::hip::PostExchangeView view, hipStream_t stream) {
         view.ilp = xb_postilp ? xb_postilp_mode : 0U;
         if (xb_postilp) ++xb_count[5];
-        if (pf_router_batch && view.rows > 8 && view.router_w != nullptr) {
+        if (pf_router_batch && pf_router_rows == 32 && router_scratch != nullptr && view.router_w != nullptr &&
+            view.rx_flag == nullptr && view.prep_jobs == 0 && post_router_fused(view.rows)) {
+            // One launch: the router reads each normed row from the chunk the post-exchange chain just wrote (no second pass over y).
+            moe::hip::enqueue_post_router(view, router_scratch, stream);
+        } else if (pf_router_batch && view.rows > 8 && view.router_w != nullptr) {
             const float* router_w = view.router_w;
             view.router_w = nullptr;
             moe::hip::enqueue_post_exchange(view, stream);
@@ -3364,6 +3381,13 @@ void Engine::set_prefill_core8(int value) {
     impl_->no_task("set_prefill_core8");
     moe::opt::set_prefill_core8(value);
 }
+
+void Engine::set_prefill_post_router(unsigned mode) {
+    impl_->no_task("set_prefill_post_router");
+    if (mode > 2) throw std::invalid_argument("minimax engine: prefill post-router mode must be 0, 1 or 2");
+    impl_->pf_post_router = mode;
+}
+unsigned Engine::prefill_post_router() const { return impl_->pf_post_router; }
 
 void Engine::set_prefill_router_batch(bool on) {
     impl_->no_task("set_prefill_router_batch");

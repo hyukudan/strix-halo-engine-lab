@@ -321,6 +321,123 @@ __global__ __launch_bounds__(256) void router_select_kernel(std::uint32_t rows, 
     }
 }
 
+// Prefill attention post + router in one launch (enqueue_post_router): CTA = 16 rows x all experts, 1024 threads.
+// Phase A is the post-exchange chain of every row (thread group g owns rows 4g..4g+3: x = h + (p0 + p1), the per-thread
+// fmaf sum of squares, the same pairwise tree); phase B walks the rows in 256-column chunks: the owner thread of
+// column c0 + t reads x back from h, writes y = (x * rs) * (1 + w) to global and to a double-buffered LDS chunk (one
+// barrier per chunk), and the router lanes read it from there. Per (row, expert) lane L still runs
+// a = fmaf(y[j], w[e][j], a) over j = L, L + 32, ... ascending from 0.0F, then the same xor butterfly, sigmoid and
+// bias; scores land in the tiled scratch layout and router_select_kernel is unchanged: the same bits as
+// post_exchange_kernel + router_tiled_kernel, without the second pass over y and with a quarter of the LDS per row.
+// The wave index is made wave-uniform (readfirstlane), so the expert rows of a wave are SGPR bases with one 32-bit
+// lane offset; the router weights are read once per 16 rows, as in the tiled kernel.
+constexpr unsigned kPrGroupRows = 4, kPrGroups = 4, kPrRows = kPrGroupRows * kPrGroups, kPrThreads = kNormThreads * kPrGroups;
+constexpr unsigned kPrWaves = kPrThreads / 32, kPrPerWave = kExperts / kPrWaves;
+static_assert(kExperts % kPrWaves == 0 && kNormThreads % kRouterLanes == 0 && kRouterLanes == 32 && kPrThreads <= 1024);
+
+__device__ __forceinline__ float pr_load(const float* base, std::uint32_t byte) {
+    return *reinterpret_cast<const float*>(reinterpret_cast<const char*>(base) + byte);
+}
+__device__ __forceinline__ void pr_store(float* base, std::uint32_t byte, float x) {
+    *reinterpret_cast<float*>(reinterpret_cast<char*>(base) + byte) = x;
+}
+
+__global__ __launch_bounds__(kPrThreads) void post_router_kernel(PostExchangeView v, float* scores) {
+    constexpr unsigned kPer = kHidden / kNormThreads;
+    __shared__ float part[kPrRows][kNormThreads];
+    __shared__ float ys[2][kPrRows][kNormThreads];
+    const unsigned t = threadIdx.x, lane = t & 31U, tl = t % kNormThreads, row0 = t / kNormThreads * kPrGroupRows;
+    const unsigned wave = static_cast<unsigned>(__builtin_amdgcn_readfirstlane(static_cast<int>(t >> 5U)));
+    const unsigned first = blockIdx.x * kPrRows;
+    const unsigned valid = v.rows - first < kPrRows ? v.rows - first : kPrRows;
+#pragma unroll
+    for (unsigned i = 0; i < kPrGroupRows; ++i) {
+        float acc = 0.0F;
+        if (row0 + i < valid) {
+            const std::size_t at = static_cast<std::size_t>(first + row0 + i) * kHidden;
+            float* h = v.h + at;
+            const float *p0 = v.part0 + at, *p1 = v.part1 + at;
+            float a[kPer], b[kPer], c[kPer];  // every load before the first store (enqueue checks h is disjoint)
+#pragma unroll
+            for (unsigned q = 0; q < kPer; ++q) {
+                const std::uint32_t byte = (tl + q * kNormThreads) * 4U;
+                a[q] = pr_load(h, byte);
+                b[q] = pr_load(p0, byte);
+                c[q] = pr_load(p1, byte);
+            }
+#pragma unroll
+            for (unsigned q = 0; q < kPer; ++q) {
+                const float x = a[q] + (b[q] + c[q]);
+                pr_store(h, (tl + q * kNormThreads) * 4U, x);
+                acc = __builtin_fmaf(x, x, acc);
+            }
+        }
+        part[row0 + i][tl] = acc;
+    }
+    __syncthreads();
+    for (unsigned s = kNormThreads / 2; s >= 1; s >>= 1U) {
+        if (tl < s) {
+#pragma unroll
+            for (unsigned i = 0; i < kPrGroupRows; ++i) part[row0 + i][tl] = part[row0 + i][tl] + part[row0 + i][tl + s];
+        }
+        __syncthreads();
+    }
+    float rs[kPrGroupRows];
+#pragma unroll
+    for (unsigned i = 0; i < kPrGroupRows; ++i)
+        rs[i] = 1.0F / __builtin_sqrtf(part[row0 + i][0] / static_cast<float>(kHidden) + kNormEps);
+    float a[kPrPerWave][kPrRows];
+    const float* w[kPrPerWave];
+#pragma unroll
+    for (unsigned p = 0; p < kPrPerWave; ++p) {
+        w[p] = v.router_w + static_cast<std::size_t>(wave + p * kPrWaves) * kHidden;
+#pragma unroll
+        for (unsigned row = 0; row < kPrRows; ++row) a[p][row] = 0.0F;
+    }
+    for (unsigned q = 0; q < kPer; ++q) {
+        const unsigned buf = q & 1U;
+        const std::uint32_t byte = (tl + q * kNormThreads) * 4U;
+        const float g = 1.0F + pr_load(v.norm_w, byte);
+#pragma unroll
+        for (unsigned i = 0; i < kPrGroupRows; ++i) {
+            float o = 0.0F;
+            if (row0 + i < valid) {
+                const std::size_t at = static_cast<std::size_t>(first + row0 + i) * kHidden;
+                o = (pr_load(v.h + at, byte) * rs[i]) * g;
+                pr_store(v.y + at, byte, o);
+            }
+            ys[buf][row0 + i][tl] = o;
+        }
+        __syncthreads();  // one barrier per chunk: the buffer written two chunks later is free once every thread is here
+        for (unsigned j = lane; j < kNormThreads; j += kRouterLanes) {
+            const std::uint32_t wb = (q * kNormThreads + j) * 4U;
+            float wj[kPrPerWave];
+#pragma unroll
+            for (unsigned p = 0; p < kPrPerWave; ++p) wj[p] = pr_load(w[p], wb);
+#pragma unroll
+            for (unsigned row = 0; row < kPrRows; ++row) {
+                const float yv = ys[buf][row][j];
+#pragma unroll
+                for (unsigned p = 0; p < kPrPerWave; ++p) a[p][row] = __builtin_fmaf(yv, wj[p], a[p][row]);
+            }
+        }
+    }
+#pragma unroll
+    for (unsigned p = 0; p < kPrPerWave; ++p) {
+        const unsigned e = wave + p * kPrWaves;
+#pragma unroll
+        for (unsigned row = 0; row < kPrRows; ++row) {
+            float s = a[p][row];
+            for (unsigned d = 16; d >= 1; d >>= 1U) s = s + __shfl_xor(s, static_cast<int>(d), 32);
+            if (lane == 0 && row < valid) {
+                const float sv = 1.0F / (1.0F + msa::exp_f(-s));
+                scores[static_cast<std::size_t>(e) * v.rows + first + row] = sv;
+                scores[(static_cast<std::size_t>(kExperts) + e) * v.rows + first + row] = sv + v.bias[e];
+            }
+        }
+    }
+}
+
 }  // namespace
 
 void enqueue_post_exchange(const PostExchangeView& v, hipStream_t stream) {
@@ -365,6 +482,22 @@ void enqueue_router_tiled(std::uint32_t rows, const float* y, const float* route
     hipLaunchKernelGGL(router_select_kernel, dim3((rows + 255) / 256), dim3(256), 0, stream, rows, scratch, ids, weights);
     const hipError_t e = hipGetLastError();
     if (e != hipSuccess) throw std::runtime_error(std::string("minimax router tiled: ") + hipGetErrorString(e));
+}
+
+void enqueue_post_router(const PostExchangeView& v, float* scratch, hipStream_t stream) {
+    if (v.router_w == nullptr || v.bias == nullptr || scratch == nullptr || v.rx_flag != nullptr || v.prep_jobs != 0)
+        throw std::invalid_argument("minimax post-router: router, scratch, no in-kernel wait and no prepare fold are required");
+    const auto* hb = reinterpret_cast<const char*>(v.h);
+    const auto* he = hb + std::size_t{v.rows} * kHidden * sizeof(float);
+    for (const float* p : {v.part0, v.part1, static_cast<const float*>(v.y)}) {
+        const auto* pb = reinterpret_cast<const char*>(p);
+        const auto* pe = pb + std::size_t{v.rows} * kHidden * sizeof(float);
+        if (pb < he && hb < pe) throw std::invalid_argument("minimax post-router: h overlaps a partial or y");
+    }
+    hipLaunchKernelGGL(post_router_kernel, dim3((v.rows + kPrRows - 1) / kPrRows), dim3(kPrThreads), 0, stream, v, scratch);
+    hipLaunchKernelGGL(router_select_kernel, dim3((v.rows + 255) / 256), dim3(256), 0, stream, v.rows, scratch, v.ids, v.weights);
+    const hipError_t e = hipGetLastError();
+    if (e != hipSuccess) throw std::runtime_error(std::string("minimax post-router: ") + hipGetErrorString(e));
 }
 
 }  // namespace strix::minimax::moe::hip

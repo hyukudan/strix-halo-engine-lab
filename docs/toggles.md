@@ -264,6 +264,7 @@ Follow the link for the gain, preconditions and off switch. Defaults are shorten
 | `STRIX_MM_PF_MSA_BATCH` | minimax | 1 | [mm-pf-msa-batch](optimizations.md#mm-pf-msa-batch) |
 | `STRIX_MM_PF_MSA_REWORK` | minimax | 5 | [mm-pf-msa-rework](optimizations.md#mm-pf-msa-rework) |
 | `STRIX_MM_PF_MSA_SCRATCH_MB` | minimax | 1152 | [mm-pf-msa-scratch](optimizations.md#mm-pf-msa-scratch) |
+| `STRIX_MM_PF_POST_ROUTER` | minimax | 1 | [mm-pf-post-router](optimizations.md#mm-pf-post-router) |
 | `STRIX_MM_PF_ROUTER_BATCH` | minimax | 1 | [mm-pf-router-batch](optimizations.md#mm-pf-router-batch) |
 | `STRIX_MM_PF_ROUTER_ROWS` | minimax | 32 | [mm-pf-router-v2](optimizations.md#mm-pf-router-v2) |
 | `STRIX_MM_PF_TABLE_RING` | minimax | 1 in strix-minimax-rank; 0 in strix-m... | [mm-pf-table-ring](optimizations.md#mm-pf-table-ring) |

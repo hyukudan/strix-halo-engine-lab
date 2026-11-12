@@ -46,5 +46,9 @@ void enqueue_router_batch(std::uint32_t rows, const float* y, const float* route
 inline constexpr std::size_t router_tiled_scratch_floats(std::uint32_t rows) { return std::size_t{rows} * 2 * kExperts; }
 void enqueue_router_tiled(std::uint32_t rows, const float* y, const float* router_w, const float* bias,
                           std::uint32_t* ids, float* weights, float* scratch, hipStream_t stream);
+// Post-exchange and router of v in one launch for prefill pieces: the same h / y / ids / weights bytes as
+// enqueue_post_exchange followed by enqueue_router_tiled, without the second pass over y. v needs the router fields,
+// no in-kernel wait and no prepare fold; h must not overlap the partials or y; scratch as for the tiled router.
+void enqueue_post_router(const PostExchangeView& v, float* scratch, hipStream_t stream);
 
 }  // namespace strix::minimax::moe::hip

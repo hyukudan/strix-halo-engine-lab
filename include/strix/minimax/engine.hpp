@@ -296,6 +296,8 @@ public:
     [[nodiscard]] bool prefill_router_batch() const;
     void set_prefill_router_rows(unsigned rows);  // batch router form: 4, 8 or 32 (tiled scores); same bits
     [[nodiscard]] unsigned prefill_router_rows() const;
+    void set_prefill_post_router(unsigned mode);  // 0 two launches, 1 post-exchange + router in one launch on pieces of 64..2048 rows, 2 on every piece; same bits
+    [[nodiscard]] unsigned prefill_post_router() const;
     // STRIX_MM_PF_INTERLEAVE=1 (runtime; needs the module on): the max_rows chunks of a prompt run layer-interleaved in
     // groups of STRIX_MM_PF_GROUP (default 2): each chunk's exchange overlaps the other chunk's compute (same kernel
     // calls). =comm: the same schedule over the communicator's start()/finish() (module off; attribution arm).

@@ -52,10 +52,16 @@ Out run_device(unsigned rows, const std::vector<float>& h0, const std::vector<fl
     constexpr unsigned guard = 8 * moe::kTopE;
     float* dw = dev(std::vector<float>(rows * moe::kTopE + guard, -99.25F));
     auto* di = dev(std::vector<std::uint32_t>(rows * moe::kTopE + guard, 0xdeadbeefU));
-    float* scratch = batch_rows == 32 ? dev(std::vector<float>(moe::hip::router_tiled_scratch_floats(rows), -77.5F)) : nullptr;
+    float* scratch = batch_rows >= 32 ? dev(std::vector<float>(moe::hip::router_tiled_scratch_floats(rows), -77.5F)) : nullptr;
     const auto launch = [&] {
         moe::hip::PostExchangeView view{rows, dh, dp0, dp1, dnw, dy, route && batch_rows == 0 ? drw : nullptr, db, di, dw};
         view.ilp = ilp;
+        if (route && batch_rows == 64) {  // the fused post + router launch
+            view.router_w = drw;
+            view.ilp = 0;
+            moe::hip::enqueue_post_router(view, scratch, nullptr);
+            return;
+        }
         moe::hip::enqueue_post_exchange(view, nullptr);
         if (route && batch_rows == 32)
             moe::hip::enqueue_router_tiled(rows, dy, drw, db, di, dw, scratch, nullptr);
@@ -99,7 +105,7 @@ Out run_device(unsigned rows, const std::vector<float>& h0, const std::vector<fl
 void router_batch_tests() {
     std::mt19937 rng(29);
     std::uniform_real_distribution<float> random(-1.0F, 1.0F);
-    for (unsigned rows : {1U, 7U, 8U, 9U, 15U, 16U, 17U, 31U, 32U, 33U, 100U, 1024U, 4096U}) {
+    for (unsigned rows : {1U, 2U, 3U, 4U, 5U, 7U, 8U, 9U, 15U, 16U, 17U, 31U, 32U, 33U, 100U, 1024U, 4096U}) {
         const std::size_t size = std::size_t{rows} * moe::kHidden;
         std::vector<float> h(size), p0(size), p1(size), nw(moe::kHidden), rw(moe::kExperts * moe::kHidden), bias(moe::kExperts);
         for (unsigned kind = 0; kind < 5; ++kind) {
@@ -129,7 +135,7 @@ void router_batch_tests() {
             for (unsigned ilp = 0; ilp < modes; ++ilp) {
                 const bool timing = kind == 0 && ilp == 0 && (rows == 1024 || rows == 4096);
                 const Out old = run_device(rows, h, p0, p1, nw, rw, bias, true, 0, ilp, timing);
-                for (unsigned batch : {4U, 8U, 32U}) {
+                for (unsigned batch : {4U, 8U, 32U, 64U}) {
                     const Out split = run_device(rows, h, p0, p1, nw, rw, bias, true, batch, ilp, timing);
                     const bool equal = std::memcmp(old.h.data(), split.h.data(), size * sizeof(float)) == 0 &&
                         std::memcmp(old.y.data(), split.y.data(), size * sizeof(float)) == 0 &&
@@ -147,9 +153,71 @@ void router_batch_tests() {
     }
 }
 
+// STRIX_MM_POSTEX_BENCH=1: timing only (median of 15 launches per cell, three passes over the arms in the same order).
+// P post alone, R tiled router alone, T post + tiled router, F the fused launch.
+void postex_bench() {
+    std::mt19937 rng(31);
+    std::uniform_real_distribution<float> random(-1.0F, 1.0F);
+    std::vector<float> nw(moe::kHidden), rw(moe::kExperts * moe::kHidden), bias(moe::kExperts);
+    for (auto& x : nw) x = random(rng) * 0.3F;
+    for (auto& x : rw) x = random(rng) * 0.02F;
+    for (auto& x : bias) x = random(rng);
+    float *dnw = dev(nw), *drw = dev(rw), *db = dev(bias);
+    hipEvent_t begin = nullptr, end = nullptr;
+    hip_ok(hipEventCreate(&begin), "event create");
+    hip_ok(hipEventCreate(&end), "event create");
+    for (unsigned rows : {64U, 256U, 1024U, 2048U, 3072U, 4096U}) {
+        const std::size_t size = std::size_t{rows} * moe::kHidden;
+        std::vector<float> h(size), p(size);
+        for (auto& x : h) x = random(rng);
+        for (auto& x : p) x = random(rng) * 1.0e-3F;
+        float *dh = dev(h), *dp0 = dev(p), *dp1 = dev(p), *dy = dev(h);
+        float* dw = dev(std::vector<float>(rows * moe::kTopE, 0.0F));
+        auto* di = dev(std::vector<std::uint32_t>(rows * moe::kTopE, 0U));
+        float* scratch = dev(std::vector<float>(moe::hip::router_tiled_scratch_floats(rows), 0.0F));
+        const moe::hip::PostExchangeView routed{rows, dh, dp0, dp1, dnw, dy, drw, db, di, dw};
+        moe::hip::PostExchangeView plain = routed;
+        plain.router_w = nullptr;
+        const auto cell = [&](const char* name, unsigned pass, const auto& launch) {
+            std::vector<float> ms;
+            for (unsigned it = 0; it < 15; ++it) {
+                hip_ok(hipEventRecord(begin, nullptr), "event begin");
+                launch();
+                hip_ok(hipEventRecord(end, nullptr), "event end");
+                hip_ok(hipEventSynchronize(end), "event sync");
+                float elapsed = 0.0F;
+                hip_ok(hipEventElapsedTime(&elapsed, begin, end), "elapsed");
+                ms.push_back(elapsed);
+            }
+            std::sort(ms.begin(), ms.end());
+            std::printf("postex rows=%u pass=%u %s median15=%.3f ms min=%.3f\n", rows, pass, name, ms[7], ms[0]);
+        };
+        for (unsigned pass = 0; pass < 3; ++pass) {
+            cell("P", pass, [&] { moe::hip::enqueue_post_exchange(plain, nullptr); });
+            cell("R", pass, [&] { moe::hip::enqueue_router_tiled(rows, dy, drw, db, di, dw, scratch, nullptr); });
+            cell("T", pass, [&] {
+                moe::hip::enqueue_post_exchange(plain, nullptr);
+                moe::hip::enqueue_router_tiled(rows, dy, drw, db, di, dw, scratch, nullptr);
+            });
+            cell("F", pass, [&] { moe::hip::enqueue_post_router(routed, scratch, nullptr); });
+        }
+        for (void* q : {static_cast<void*>(dh), static_cast<void*>(dp0), static_cast<void*>(dp1), static_cast<void*>(dy),
+                        static_cast<void*>(dw), static_cast<void*>(di), static_cast<void*>(scratch)})
+            (void)hipFree(q);
+    }
+    hip_ok(hipEventDestroy(begin), "event destroy");
+    hip_ok(hipEventDestroy(end), "event destroy");
+    for (float* q : {dnw, drw, db}) (void)hipFree(q);
+    std::fflush(stdout);
+}
+
 }  // namespace
 
 int main() {
+    if (const char* b = std::getenv("STRIX_MM_POSTEX_BENCH"); b != nullptr && b[0] == '1') {
+        postex_bench();
+        return 0;
+    }
     std::mt19937 rng(7);
     std::normal_distribution<float> n(0.0F, 1.0F);
     const unsigned R = 8, D = moe::kHidden;

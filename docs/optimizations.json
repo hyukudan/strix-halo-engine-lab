@@ -1887,6 +1887,17 @@
   },
   {
     "engine": "minimax",
+    "name": "Prefill post-exchange and router in one launch",
+    "flag_or_env": "STRIX_MM_PF_POST_ROUTER",
+    "default": "1",
+    "exact": "Exact: residual, normed rows, routes and weights byte-identical to the two-launch path for every input kind on boundary and tail row counts (1 to 4096).",
+    "gain": "post-exchange + router per piece 0.30 -> 0.19 ms at 256 rows, 1.57 -> 1.23 ms at 1024 rows, 2.70 -> 2.42 ms at 2048 rows (unit A/B/A); 3072 rows equal, 4096 rows slower (5.4-6.2 vs 4.8 ms), so those pieces keep two launches",
+    "preconditions": "Tiled router (the default) and prefill pieces of 64 to 2048 rows; other piece sizes keep the two launches.",
+    "off_switch": "STRIX_MM_PF_POST_ROUTER=0",
+    "doc_anchor": "docs/optimizations.md#mm-pf-post-router"
+  },
+  {
+    "engine": "minimax",
     "name": "Prefill MSA scratch for whole pieces",
     "flag_or_env": "STRIX_MM_PF_MSA_SCRATCH_MB",
     "default": "1152",

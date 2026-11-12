@@ -2948,6 +2948,22 @@ Compute the prefill router scores in tiles of 16 rows by 32 experts, so the rout
 - **Measured gain:** post-exchange + router per 4096-row piece 5.40 -> 4.82 ms; TTFT 1K -0.9 %, 8K -0.8 % (in-process A/B/A, two Strix Halo nodes).
 - **Implementation / evidence:** [router kernels](../src/hip_minimax_moe.hip), [resolver](../src/minimax/engine/mm_defaults.cpp), [router tests](../tests/hip_minimax_moe_tests.hip)
 
+<a id="mm-pf-post-router"></a>
+
+### Prefill post-exchange and router in one launch
+
+**Engine:** `minimax`. **Control:** `STRIX_MM_PF_POST_ROUTER`. **Default:** 1.
+
+After the attention exchange, add the two partials to the residual, normalise and compute the router scores in one kernel: 16 rows per block, the normed row goes through a double-buffered 256-column shared-memory chunk straight into the router lanes, so the router does not read the normed rows from memory again. The expert selection kernel is unchanged.
+
+- **Preconditions:** Tiled router (the default) and prefill pieces of 64 to 2048 rows; larger and smaller pieces keep the two launches.
+- **Automatic selection:** By piece size. `STRIX_MM_PF_POST_ROUTER=2` forces the fused launch on every piece of more than 8 rows.
+- **Fallback notice:** None: both paths produce the same bytes.
+- **Exactness evidence:** Exact: residual, normed rows, routes and weights byte-identical to the two-launch path for every input kind (ties, zeros, denormals, huge values) on boundary and tail row counts (1 to 4096).
+- **Off switch:** STRIX_MM_PF_POST_ROUTER=0
+- **Measured gain:** Post-exchange + router per piece 0.30 -> 0.19 ms at 256 rows, 1.57 -> 1.23 ms at 1024 rows, 2.70 -> 2.42 ms at 2048 rows (unit A/B/A); 3072 rows equal, 4096 rows slower (5.4-6.2 vs 4.8 ms), so those pieces keep two launches. Pieces of 4096 rows (8K and 32K prompts) are not affected.
+- **Implementation / evidence:** [kernels](../src/hip_minimax_moe.hip), [engine site](../src/minimax/engine/engine.hip), [resolver](../src/minimax/engine/mm_defaults.cpp), [tests](../tests/hip_minimax_moe_tests.hip)
+
 <a id="mm-pf-msa-scratch"></a>
 
 ### Prefill MSA scratch for whole pieces

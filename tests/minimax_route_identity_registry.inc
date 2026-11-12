@@ -41,6 +41,8 @@
 {"prefill-dense-qkv", 'a', "EXL3 matrix+library gemm_splits+per-row WMMA chain+ordered split finish", "hip-mmx-moe-bench test_prefill_dense == strix_gemm bitwise (q/k/v/o, q+k+v, T 9..4096); bits 3/4/5/6/8 only, else the library call; mm_defaults.cpp pf_dense_qkv", ""},
 // src/minimax/engine/engine.hip: enqueue_post (STRIX_MM_PF_ROUTER_ROWS=32 -> enqueue_router_tiled)
 {"prefill-router-tiled", 'a', "router lane chain (j = lane mod 32 ascending) + xor butterfly + ordered top-4 scan", "hip-minimax-moe-tests router_batch_tests: tiled 32 vs fused/4/8 bytes for every kind and tail; mm_defaults.cpp pf_router_rows (default 32 = tiled v2)", ""},
+// src/minimax/engine/engine.hip: enqueue_post (STRIX_MM_PF_POST_ROUTER -> enqueue_post_router on 64..2048-row pieces)
+{"prefill-post-router", 'a', "post-exchange chain (x = h + (p0 + p1), per-thread fmaf squares, pairwise tree, y = (x * rs) * (1 + w)) + router lane chain + xor butterfly + ordered top-4 scan", "hip-minimax-moe-tests router_batch_tests: fused launch vs post + fused/4/8/tiled router, h/y/ids/weights bytes for every kind and tail; mm_defaults.cpp pf_post_router", ""},
 // src/minimax/engine/engine.hip: dense_o (STRIX_MM_PF_DENSE_O) - o_proj through enqueue_prefill_dense on full pieces
 {"prefill-dense-o", 'a', "EXL3 matrix+library gemm_splits+per-row WMMA chain+ordered split finish", "hip-mmx-moe-bench test_prefill_dense o == strix_gemm bitwise (T 9..4096); 4096-row pieces only; mm_defaults.cpp pf_dense_o", ""},
 // src/minimax/engine/engine.hip: MSA scratch cap (STRIX_MM_PF_MSA_SCRATCH_MB) - windows per batch only
