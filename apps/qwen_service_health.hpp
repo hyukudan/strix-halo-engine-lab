@@ -100,6 +100,7 @@ inline serve::Json verify_http_release_assets(const Options& options) {
         }
         bound(options.dense_q6p_pack_path, "profile");
         bound(options.dense_trellis_pack_path, "profile");
+        bound(options.dense_fast_pack_path, "profile");
         bound(options.offline_tuning_cache_path, "profile");
         // The API-key file is an operator secret, not a release asset: never bound or hashed.
         return verified;

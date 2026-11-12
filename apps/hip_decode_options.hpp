@@ -392,6 +392,8 @@ struct Options {
     std::string teacher_logits_path;
     // Dense Q6P32 pack of an emulated checkpoint (strix/hip_q6p_pack.hpp).
     std::string dense_q6p_pack_path;
+    // Dense FAST pack: Q4_K / Q5_K copies read by the 1..8-row dense A8 windows (strix/hip_dense_fast_pack.hpp).
+    std::string dense_fast_pack_path;
     std::string dense_trellis_pack_path;
     bool known_prefix_expert_union = false;
     // Router + combine/inject rows entries in the known-prefix or MTP window.
@@ -1732,7 +1734,7 @@ inline std::string yarn_route_refusal(const Options& o) {
     if ((!o.mtp.enabled && (o.any_low_level_flag || o.route_owned || o.known_prefix_window || o.numerical_profile_explicit ||
         o.prefill_numerical_profile)) || o.residency != HipModelResidencyMode::registered_file_mapping ||
         o.execution.integer_head != DecodeIntegerHead::none || o.ple_cache_rows ||
-        !o.dense_q6p_pack_path.empty() || !o.dense_trellis_pack_path.empty())
+        !o.dense_q6p_pack_path.empty() || !o.dense_trellis_pack_path.empty() || !o.dense_fast_pack_path.empty())
         return "YaRN explicit execution route not yet qualified";
     return {};
 }
@@ -1852,10 +1854,11 @@ inline Options parse_options(
                 if (value_next) {
                     value_next=false;
                     if (argv[i-1]==std::string_view("--generate")) generate=std::strtoull(arg.c_str(),nullptr,10);
-                } else if (arg=="--generate" || arg=="--context") value_next=true;
+                } else if (arg=="--generate" || arg=="--context" || arg=="--dense-fast-pack") value_next=true;
                 else if (arg.starts_with("--generate=")) generate=std::strtoull(arg.c_str()+11,nullptr,10);
                 else if (arg.starts_with("--")) plain &= arg.starts_with("--context=") || arg=="--unqualified-context" ||
-                    arg=="--print-effective-config" || arg=="--mtp-bundle" || arg.starts_with("--mtp-bundle=");
+                    arg=="--print-effective-config" || arg=="--mtp-bundle" || arg.starts_with("--mtp-bundle=") ||
+                    arg.starts_with("--dense-fast-pack=");  // a weight overlay keeps the plain command plain
                 else ++prompt_tokens;
             }
             if (arg=="--mtp-bundle" || arg.starts_with("--mtp-bundle=")) {
@@ -1929,7 +1932,7 @@ inline Options parse_options(
             "[--mtp --mtp-sidecar FILE --mtp-sidecar-sha256 HEX (--mtp-golden FILE --mtp-golden-sha256 HEX | --mtp-golden-dump FILE) [--mtp-window-expert-union --mtp-window-expert-union-bytes N] [--mtp-window-hyper-mix] [--mtp-window-qsa-rows] [--mtp-window-prefix] [--mtp-draft-chain [--mtp-draft-vocab FILE[,FILE...]|auto:DIR] [--mtp-draft-context-vocab N] [--mtp-draft-exact] [--mtp-draft-q4] [--mtp-ngram-draft[=on|off|auto|ctx|copy|wide]]] [--mtp-draft-profile base|distill-d|distill-g] (explicit source/conversion/cast/budget options required)] "
             "[--profile default|fast|quality] [--allow-pending] [--optimization-profile auto|manual] [--prefill-moe-route-bf16 on|off] [--baseline] [--print-effective-config] [--prefill-exact-fp16] [--prefill-disable NAME[,NAME...]] [--config FILE] [--execution-inventory] [--host-dispatch-telemetry] [--execution-telemetry-trace] [--device-queue-trace] "
             "[--numerical-profile exact-v5|hc-splitk-f32-v1|q51-a8-down-v1|hc-splitk-f32+q51-a8-down-v1|q51-q80-a8-down-v1|hc-splitk-f32+q51-q80-a8-down-v1|hc-splitk-f32+q51-q80-a8-down+q5k-a8-gateup-v1|hc-deferred-norm-f32+q51-q80-a8-down-v1|hc-deferred-norm-f32+q51-q80-a8-down+q5k-a8-gateup-v1|hc-splitk-f32+q51-q80-a8-down+q5k-a8-gateup+dense-a8-v1|hc-deferred-norm-f32+q51-q80-a8-down+q5k-a8-gateup+dense-a8-v1] [--prefill-numerical-profile NAME] "
-            "[--teacher-forced-score --generate 1 [--teacher-logits-file PATH]] [--dense-q6p-pack PATH] [--dense-trellis-pack PATH] "
+            "[--teacher-forced-score --generate 1 [--teacher-logits-file PATH]] [--dense-q6p-pack PATH] [--dense-trellis-pack PATH] [--dense-fast-pack PATH] "
             "[--gpu-greedy-token] [--logprob-token ID ...] [--offline-tuning-cache FILE [--offline-compile-provenance FILE]] [--gdn-recurrent-layout baseline|stride32|stride33|transposed] [--gdn-recurrent-storage key-value|value-key] [--attention-kv-storage bf16|kv-int8-tok-v1] [--known-prefix-window --known-prefix-rows 2|4|8 --known-prefix-expert-union] [--known-window-router-rows] [--known-prefix-prefill-rows 16..16384 --known-prefix-workspace-budget-bytes N --known-prefix-host-metadata-budget-bytes N --known-prefix-uma-budget-bytes N --known-prefix-host-headroom-bytes N] [--prompt-lookup [--prompt-lookup-depth 0|1|2 | --prompt-lookup-adaptive] [--prompt-lookup-snapshot occupied-kv-v1 --prompt-lookup-snapshot-bytes N]] [--serve-prefix-u32le FILE ... --serve-concurrency 1|2|4 [--serve-tensor-cohort-rows 2|4 | --serve-prefill-rows 2|4|8|16..2048 --serve-prefill-workspace-budget-bytes N --serve-prefill-host-metadata-budget-bytes N] --serve-memory-budget-bytes N --serve-request-budget-bytes N --serve-headroom-bytes N] [--gdn-islands] [--qsa-hierarchical-selection] [--qsa-gqa-heads-per-block 1|2|4] [--prepared-eager] [--moe-shared-overlap [--moe-token-cost-policy]] [--moe-overlap-arena-budget-bytes N] [--batched-moe-activation] [--validation-final-state DIR] [--validation-final-state-max-bytes N] [--reference FILE] [--max-logit-error X] "
             "[--context N [--unqualified-context]] [--residency register|copy] [--coalesce-gap BYTES] [--model-copy-tier none|normalization|hot_nonexpert|experts --model-copy-payload-bytes N --model-retained-budget N --model-setup-peak-budget N] "
             "[--planned-ple-io] [--ple-cpu-helper-threads 1..8] [--ple-cache-rows N --ple-cache-budget-bytes N] [--ple-max-rows-per-io N] [--ple-max-inflight-ios N] "
@@ -2042,6 +2045,7 @@ inline Options parse_options(
         if (argument.starts_with("--") && argument != "--generate" && !argument.starts_with("--generate=") &&
             argument != "--context" && !argument.starts_with("--context=") && argument != "--unqualified-context" &&
             !argument.starts_with("--optimization-profile") && argument != "--prefill-moe-route-bf16" &&
+            !argument.starts_with("--dense-fast-pack") &&  // FAST weight overlay on whichever route is selected
             !argument.starts_with("--numerical-profile") &&
             !argument.starts_with("--prefill-numerical-profile") && !argument.starts_with("--execution-mode") &&
             !argument.starts_with("--residency") && !operational_session_option(argument)) {
@@ -2093,6 +2097,14 @@ inline Options parse_options(
             if (value.empty() || value.starts_with("--"))
                 throw std::invalid_argument("dense Q6P32 pack requires a nonempty path");
             options.dense_q6p_pack_path = value;
+            continue;
+        }
+        if (argument == "--dense-fast-pack" || argument.starts_with("--dense-fast-pack=")) {
+            if (!options.dense_fast_pack_path.empty()) throw std::invalid_argument("duplicate dense FAST pack option");
+            const auto value = argument == "--dense-fast-pack" ?
+                (index + 1 < argc ? std::string_view(argv[++index]) : std::string_view{}) : argument.substr(std::string_view("--dense-fast-pack=").size());
+            if (value.empty() || value.starts_with("--")) throw std::invalid_argument("dense FAST pack requires a nonempty path");
+            options.dense_fast_pack_path = value;
             continue;
         }
         if (argument == "--dense-trellis-pack" || argument.starts_with("--dense-trellis-pack=")) {
@@ -3462,6 +3474,10 @@ inline Options parse_options(
         throw std::invalid_argument("dense trellis requires an explicit profile and excludes a Q6P32 overlay");
     if (!options.dense_trellis_pack_path.empty() && (options.http_serve || options.http_batch || !options.mtp.cohort.empty()))
         throw std::invalid_argument("the experimental dense trellis route is one-shot C1 only");
+    if (!options.dense_fast_pack_path.empty() && (!options.dense_q6p_pack_path.empty() || !options.dense_trellis_pack_path.empty()))
+        throw std::invalid_argument("the dense FAST pack excludes the Q6P32 and trellis packs");
+    if (!options.dense_fast_pack_path.empty() && (options.http_serve || options.http_batch || !options.mtp.cohort.empty()))
+        throw std::invalid_argument("the dense FAST pack route is one-shot C1 only");
 #if !defined(STRIX_HAS_EXPERIMENTAL_DENSE_TRELLIS)
     if (!options.dense_trellis_pack_path.empty())
         throw std::invalid_argument("dense trellis runtime is disabled in this build");

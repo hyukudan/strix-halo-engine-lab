@@ -53,6 +53,7 @@
 
 #include "hip_q6p_weights.hpp"
 #include "strix/q6p_registry.hpp"
+#include "strix/dense_fast_registry.hpp"
 #include "strix/hip_gsq_a8_groups.hpp"
 
 namespace strix {
@@ -1668,6 +1669,23 @@ template <class Site> bool q6_site(const Site& site, Site& result) {
     return true;
 }
 
+// Dense FAST pack (--dense-fast-pack): the site with every Q8_0 segment that has a registered
+// 4/5-bit copy of its shape switched to that copy and its type; false when no segment has one.
+// The typed dense A8 kernel then reads the copies (segments without a copy keep their Q8 bits).
+template <class Site> bool dense_fast_site(const Site& site, Site& result) {
+    if (!dense_fast::registered_count() || gsq_segments(site.segments)) return false;
+    bool any = false;
+    result = site;
+    for (unsigned m = 0; m < site.segments.count; ++m) {
+        const auto* t = dense_fast::find(site.segments.weights[m], Site::rows);
+        if (!t || t->cols != site.width || t->rows != site.segments.first[m + 1U] - site.segments.first[m]) continue;
+        result.segments.weights[m] = t->base;
+        result.segments.types[m] = t->type;
+        any = true;
+    }
+    return any;
+}
+
 // Rows > 8 tuning overrides: STRIX_Q8_ROWS_WIDE_KERNEL = 0 (one output group per wave,
 // project_wide_rows_kernel), 1 (shared coefficients, C++ FMA chains) or 2 (default:
 // the VOPD kernels where the site allows them); STRIX_Q8_ROWS_WIDE_SUB = 2/4/8/16 rows
@@ -1845,6 +1863,10 @@ template <class Site> void launch_dense_a8(const Site& site, hipStream_t stream,
             throw std::invalid_argument("q8_rows: dense A8 fixed-width contract differs");
     if (!dense_a8_width(site.width))
         throw std::invalid_argument("q8_rows: dense A8 requires a width that is a positive multiple of 64, at most 8192");
+    if constexpr (Site::rows <= 8U) {
+        Site fast;
+        if (dense_fast_site(site, fast)) { launch_dense_a8(fast, stream, any_order); return; }
+    }
     if (gsq_segments(site.segments)) {
         if constexpr (Site::rows <= 8U) {
             const auto slot = dense_a8_slot(a8_family_of<Site>());
@@ -1918,6 +1940,10 @@ template <class Site> void launch_dense_a8_quantized(const Site& site, const Den
     for (unsigned m = 0; m < site.segments.count; ++m)
         if (reinterpret_cast<std::uintptr_t>(site.segments.weights[m]) % 4U)
             throw std::invalid_argument("q8_rows: dense A8 requires dword-aligned Q8 weights");
+    if constexpr (Site::rows <= 8U) {
+        Site fast;
+        if (dense_fast_site(site, fast)) { launch_dense_a8_gsq(fast, slot, stream); return; }
+    }
     if (gsq_segments(site.segments)) {
         if constexpr (Site::rows <= 8U) { launch_dense_a8_gsq(site, slot, stream); return; }
         else throw std::invalid_argument("q8_rows: GSQ dense A8 supports 1..8 rows");

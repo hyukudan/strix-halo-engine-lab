@@ -2822,7 +2822,7 @@ inline void run_mtp_decode_bridge(const Options& options,const ModelContract& mo
                 std::string roots;
                 std::vector<std::pair<std::string,ModelContentIdentity>> files;
                 for(const auto& path:{options.model_path,m.sidecar,m.golden,options.dense_q6p_pack_path,
-                        options.dense_trellis_pack_path,options.offline_tuning_cache_path,options.offline_compile_provenance_path}) {
+                        options.dense_trellis_pack_path,options.dense_fast_pack_path,options.offline_tuning_cache_path,options.offline_compile_provenance_path}) {
                     if(path.empty())continue;
                     const auto hash=session_cached_file_hash(path);files.emplace_back(path,hash);
                     roots+=std::to_string(path.size())+":"+path+model_content_identity_hex(hash);

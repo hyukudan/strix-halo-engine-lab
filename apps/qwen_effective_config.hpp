@@ -496,6 +496,21 @@ inline std::string mtp_bundle_golden_identity(const Options& options, const Mode
     const auto calibration_tokens=mtp_tiled_prompt(options)
         ? mtp_calibration_rows(options)+1U : options.tokens.size();
     for (std::size_t i=0;i<calibration_tokens;++i) identity_text += ":"+std::to_string(options.tokens[i]);
+    // A dense FAST pack changes the target hidden rows the calibration records: its goldens are its own.
+    // Key: size plus the head (GGUF header: spec, pinned target, tensor table) and tail of the pack file;
+    // a stale golden fails the replay check, it is never accepted silently.
+    if (!options.dense_fast_pack_path.empty()) {
+        std::ifstream pack(options.dense_fast_pack_path,std::ios::binary|std::ios::ate);
+        if (!pack) throw std::runtime_error("cannot read the dense FAST pack");
+        const auto size=static_cast<std::uint64_t>(pack.tellg());
+        const auto part=static_cast<std::streamsize>(std::min<std::uint64_t>(size,1U<<16U));
+        std::string bytes(static_cast<std::size_t>(part)*2U,'\0');
+        pack.seekg(0); pack.read(bytes.data(),part);
+        pack.seekg(static_cast<std::streamoff>(size)-part); pack.read(bytes.data()+part,part);
+        if (!pack) throw std::runtime_error("cannot read the dense FAST pack");
+        identity_text += ":dense-fast:"+std::to_string(size)+":"+model_content_identity_hex(sha256_bytes(
+            std::as_bytes(std::span<const char>(bytes.data(),bytes.size()))));
+    }
     return model_content_identity_hex(sha256_bytes(
         std::as_bytes(std::span<const char>(identity_text.data(),identity_text.size()))));
 }

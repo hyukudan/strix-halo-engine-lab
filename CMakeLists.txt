@@ -262,6 +262,7 @@ add_library(strix_core STATIC
     src/iq4_nl.cpp
     src/ggml_dequant.cpp
     src/q6p_registry.cpp
+    src/dense_fast_registry.cpp
     src/launch_dispatch.cpp
     src/low_precision.cpp
     src/memory_plan.cpp
@@ -2416,6 +2417,7 @@ int main() { return 0; }"
         src/hip_host_upload_backend.cpp
         src/hip_qwen_moe_prepared.cpp
         src/hip_q6p_pack.cpp
+        src/hip_dense_fast_pack.cpp
         src/hip_qwen_router_bf16.cpp
         src/hip_dense_trellis_pack.cpp
         src/hip_runtime_allocator.cpp

@@ -26,6 +26,8 @@
 #include "strix/compiled_execution.hpp"
 #include "strix/teacher_logit_spool.hpp"
 #include "strix/hip_q6p_pack.hpp"
+#include "strix/hip_dense_fast_pack.hpp"
+#include "strix/dense_fast_registry.hpp"
 #include "strix/hip_qwen_router_bf16.hpp"
 #include "strix/qwen_router_bf16.hpp"
 #include "strix/hip_dense_trellis_pack.hpp"
@@ -2570,8 +2572,30 @@ static int run_decode_entry(
                   << " BF16 tensors, " << dense_q6p_pack->q6p_bytes << " bytes replace " << dense_q6p_pack->replaced_bytes
                   << (strix::q6p::kernels_enabled() ? "" : " (STRIX_Q6P=0: not read)") << '\n';
     }
+    std::shared_ptr<const strix::HipDenseFastPack> dense_fast_pack;
+    if (!options.dense_fast_pack_path.empty()) {
+        dense_fast_pack = strix::load_hip_dense_fast_pack(options.dense_fast_pack_path, mapped, manifest,
+            model_residency.binding(), generations);
+        std::cerr << "dense FAST pack: " << dense_fast_pack->tensors << " tensors, " << dense_fast_pack->packed_bytes
+                  << " bytes replace " << dense_fast_pack->replaced_bytes
+                  << (strix::dense_fast::kernels_enabled() ? "" : " (STRIX_DENSE_FAST=0: not read)") << '\n';
+        optimization_profile_receipt += "  \"dense_fast_pack_sha256\":\"" + dense_fast_pack->sha256 + "\",\n" +
+            "  \"dense_fast_spec\":\"" + dense_fast_pack->spec + "\",\n" +
+            "  \"dense_fast_scope\":\"decode-dense-a8-windows-by-row-mask\",\n" +
+            "  \"dense_fast_enabled\":" + (strix::dense_fast::kernels_enabled() ? "true" : "false") + ",\n" +
+            "  \"dense_fast_tensors\":" + std::to_string(dense_fast_pack->tensors) + ",\n" +
+            "  \"dense_fast_packed_bytes\":" + std::to_string(dense_fast_pack->packed_bytes) + ",\n" +
+            "  \"dense_fast_replaced_q8_bytes\":" + std::to_string(dense_fast_pack->replaced_bytes) + ",\n" +
+            "  \"dense_fast_qualification\":\"experimental-fast-gate-not-passed\",\n";
+    }
     const auto router_reservation = strix::qwen_router_bf16_reservation(manifest, options.qwen_router_bf16);
     auto shared_model_inventory = model_residency.owner_inventory(model_owner, mapped_owner);
+    if (dense_fast_pack) {
+        const auto pack_inventory = dense_fast_pack->residency->owner_inventory(dense_fast_pack->residency, dense_fast_pack->mapped);
+        auto views = shared_model_inventory.pinned_views;
+        views.insert(views.end(), pack_inventory.pinned_views.begin(), pack_inventory.pinned_views.end());
+        shared_model_inventory = strix::build_uma_owner_inventory(views);
+    }
     if (dense_q6p_pack) {
         const auto pack_inventory = dense_q6p_pack->residency->owner_inventory(dense_q6p_pack->residency, dense_q6p_pack->mapped);
         auto views = shared_model_inventory.pinned_views;
@@ -2621,8 +2645,14 @@ static int run_decode_entry(
     }
 #endif
     const auto dense_trellis_completed_receipt = [&] {
-        if (!dense_trellis_pack) return std::string{};
-        return "  \"dense_trellis_used_layer_mask\":" + std::to_string(strix::hip_dense_trellis_used_layers()) + ",\n" +
+        std::string fast;
+        if (dense_fast_pack)
+            fast = "  \"dense_fast_launches\":" + std::to_string(strix::dense_fast::hits()) + ",\n" +
+                "  \"dense_fast_launch_bytes\":" + std::to_string(strix::dense_fast::read_bytes()) + ",\n" +
+                "  \"dense_fast_launch_q8_bytes\":" + std::to_string(strix::dense_fast::replaced_q8_bytes()) + ",\n";
+        if (!dense_trellis_pack) return fast;
+        return fast +
+            "  \"dense_trellis_used_layer_mask\":" + std::to_string(strix::hip_dense_trellis_used_layers()) + ",\n" +
             "  \"dense_trellis_usage_scope\":\"host-entry-coverage-including-capture-not-cycle-counts\",\n";
     };
     // Auto tries the same admission as =1, falling back silently to the warm path if setup cannot establish it.
@@ -5497,7 +5527,7 @@ static int run_decode_entry(
             std::cerr << "session model_hash=reused_mapped_full_digest\n";
             session_files.emplace_back("/proc/self/exe", session_compatibility.executable);
             std::string session_assets = "target=" + strix::model_content_identity_hex(session_compatibility.model);
-            for (const auto& path : {options.dense_q6p_pack_path, options.dense_trellis_pack_path,
+            for (const auto& path : {options.dense_q6p_pack_path, options.dense_trellis_pack_path, options.dense_fast_pack_path,
                     options.offline_tuning_cache_path, options.offline_compile_provenance_path})
                 if (!path.empty()) {
                     const auto digest = strix::session_cached_file_hash(path);
