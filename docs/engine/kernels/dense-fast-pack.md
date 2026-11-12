@@ -55,6 +55,9 @@ A pack is a derived model artifact: build it locally from your own copy of the m
   default `0x6` admits 1 and 2 rows, the sizes where the typed kernel measured faster; `0x1fe`
   admits every size up to 8 rows. With a mask that admits only some sizes, a row is computed with
   the copies in the admitted windows and with the Q8_0 values in the others.
+- `STRIX_DENSE_FAST_Q8_TYPED=1` (diagnostic): the tensors that have a copy run the typed kernel on
+  their own Q8_0 bits. The logits must then equal the default bitwise; it separates the kernel route
+  from the values of a pack.
 - Receipt: `dense_fast_pack_sha256`, `dense_fast_spec`, `dense_fast_tensors`,
   `dense_fast_packed_bytes`, `dense_fast_replaced_q8_bytes`, and per run `dense_fast_launches`,
   `dense_fast_launch_bytes` (bytes the typed launches cover) against `dense_fast_launch_q8_bytes`.
@@ -75,14 +78,30 @@ the same command without the pack).
 | Q5_K, GDN matrices only | - | - | 0.0675 | - | - | - | - |
 | Q5_K, indexed-attention matrices only | - | - | 0.0317 | - | - | - | - |
 
-The error is spread, not localised: the logit error does not grow along the sequence, the KL of a
-row follows the entropy of the reference distribution, and top-1 changes sit at rows whose reference
-margin is small. On prose-like text the KL falls with the weight error as expected (chat: 0.041,
-0.011, 0.006). On JSON it does not (0.18, 0.10, 0.13 at 8 %, 4 % and 2 % weight error): a few rows
-carry 40-55 % of the total. That is consistent with a discrete decision (such as the block selection
-of indexed attention) flipping under any perturbation of the hidden state rather than with bit
-depth; the selection itself was not dumped, so this is a hypothesis. Greedy
-text diverges from the reference early (token 4 at 1K, token 23 at 8K).
+Implementation review of the failure (same node, same commands):
+
+- The route is exact. `STRIX_DENSE_FAST_Q8_TYPED=1` (diagnostic) runs the typed kernel and its
+  separate activation quantiser on the Q8_0 bits of every tensor that has a copy: the JSON logits are
+  bitwise equal to the reference. So are a second reference run and a run with the pack loaded and
+  `STRIX_DENSE_FAST=0`, and a Q6_K run repeats bitwise. Every difference in the table comes from the
+  values of the copies, not from the loader, the type dispatch, the block layout or the kernel.
+- The quantiser is at the precision of its formats. Against the Q8_0 values the copies differ by
+  7.5-8.5 % (Q4_K), 3.7-4.2 % (Q5_K) and 2.0-2.3 % (Q6_K) relative RMS; in a sample of the tensors, per output row at most
+  5.5 % and 3.9 % for Q5_K and Q6_K, with a gain of 0.9992-0.9996 (no systematic shrink). Q6_K is
+  not near-lossless here: 64 levels per 16 weights give about 2 %, against about 0.5 % for Q8_0.
+  The only blocks stored as zero are blocks whose source values are below 2e-4 of the tensor RMS.
+  The copies are made from the Q8_0 values because those are what the reference arm computes with.
+- The JSON number is dominated by a few rows that flip under any perturbation. The dense A8
+  activation path of the default profile, compared with the profile before it
+  (`hc-splitk-f32+q51-q80-a8-down+q5k-a8-gateup-v1`), gives JSON KL 0.148 on the same sequence:
+  five rows carry 88 % of it, among them rows 63 and 2, which also lead the Q6_K run. The same three-prompt gate would therefore also reject a step that is already the default.
+- Without those rows the packs are still above the step that is default: the JSON mean without the
+  ten largest rows is 0.008 for the A8 step, 0.031 for Q6_K, 0.034 for Q5_K and 0.056 for Q4_K, and
+  the median row KL is 0.0002 against 0.0005, 0.0007 and 0.0012.
+
+So the failure is precision, not a defect: no K-quant depth that the typed kernel reads is within
+the limit on this content. Greedy text diverges from the reference early (token 4 at 1K, token 23
+at 8K).
 
 Speed, Q4_K pack with every size admitted (`STRIX_DENSE_FAST_ROWS=0x1fe`), cycle cost per verify
 window size (controller EMA, ms; default / pack):
@@ -97,3 +116,8 @@ Plain decode (`--no-mtp`, one row per step) at 1K: 41.96 -> 40.77 ms per step. T
 and decodes more per weight (read from the code, not traced), and the measured gain is 1-4 ms at 1 and 2 rows and nothing at 4 and 8.
 End-to-end tok/s follows the acceptance of the changed text, not the kernel. The row-mask default
 (`0x6`) follows this table and has not been timed on its own.
+
+Q6_K, the depth closest to the limit, is not faster. Serial decode at 1K (one row per step, the
+draft bundle not admitted in that run, default row mask), A B B A: 21.70 and 21.75 tok/s without
+the pack, 21.26 and 21.50 tok/s with it. The Q6_K copies are 23 % smaller than the Q8_0 tensors,
+and the typed decode costs more than that saves. Not measured with the draft bundle.

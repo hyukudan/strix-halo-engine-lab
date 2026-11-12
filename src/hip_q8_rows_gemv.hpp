@@ -1672,6 +1672,9 @@ template <class Site> bool q6_site(const Site& site, Site& result) {
 // Dense FAST pack (--dense-fast-pack): the site with every Q8_0 segment that has a registered
 // 4/5-bit copy of its shape switched to that copy and its type; false when no segment has one.
 // The typed dense A8 kernel then reads the copies (segments without a copy keep their Q8 bits).
+// STRIX_DENSE_FAST_Q8_TYPED=1 (diagnostic): the sites that have a copy run the typed kernel on their own Q8_0
+// bits, so a logit difference against the default comes from the kernel route and not from the copies' values.
+inline bool dense_fast_q8_typed() { static const bool on = strix::env_number<unsigned>("STRIX_DENSE_FAST_Q8_TYPED", 0U) == 1U; return on; }
 template <class Site> bool dense_fast_site(const Site& site, Site& result) {
     if (!dense_fast::registered_count() || gsq_segments(site.segments)) return false;
     bool any = false;
@@ -1679,9 +1682,10 @@ template <class Site> bool dense_fast_site(const Site& site, Site& result) {
     for (unsigned m = 0; m < site.segments.count; ++m) {
         const auto* t = dense_fast::find(site.segments.weights[m], Site::rows);
         if (!t || t->cols != site.width || t->rows != site.segments.first[m + 1U] - site.segments.first[m]) continue;
+        any = true;
+        if (dense_fast_q8_typed()) continue;
         result.segments.weights[m] = t->base;
         result.segments.types[m] = t->type;
-        any = true;
     }
     return any;
 }
@@ -1865,7 +1869,13 @@ template <class Site> void launch_dense_a8(const Site& site, hipStream_t stream,
         throw std::invalid_argument("q8_rows: dense A8 requires a width that is a positive multiple of 64, at most 8192");
     if constexpr (Site::rows <= 8U) {
         Site fast;
-        if (dense_fast_site(site, fast)) { launch_dense_a8(fast, stream, any_order); return; }
+        if (dense_fast_site(site, fast)) {
+            const auto slot = dense_a8_slot(a8_family_of<Site>());
+            hipLaunchKernelGGL(dense_a8_quantize_kernel<Site>, dim3((Site::rows * (site.width / 8U) + kThreads - 1U) / kThreads), dim3(kThreads), 0,
+                stream, fast, slot.codes, slot.deltas);
+            launch_dense_a8_gsq(fast, slot, stream);
+            return;
+        }
     }
     if (gsq_segments(site.segments)) {
         if constexpr (Site::rows <= 8U) {
