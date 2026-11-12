@@ -59,6 +59,7 @@
 #include <memory>
 #include <optional>
 #include "strix/serve/constraint_selection.hpp"
+#include "strix/serve/prefix_directory.hpp"
 #include <span>
 #include <string>
 #include <vector>
@@ -1170,6 +1171,12 @@ public:
         std::chrono::steady_clock::time_point decode_start;
         std::array<std::uint64_t, 9> chosen_rows{};
         std::uint64_t draft_rows_begin=0;
+        // STRIX_SERVE_PREFIX_FORK: tokens this request emitted, and the retained frontier of a finished request.
+        // retained = consumed history H (prompt + emitted - last); retained_pending = the last emitted token (not consumed).
+        std::vector<std::uint32_t> emitted_log,retained;
+        std::uint32_t retained_pending=0;
+        bool retained_valid=false;
+        std::uint64_t fork_entry=0,retained_stamp=0;
     };
     struct Stats : BatchServiceStats {
         std::uint64_t admitted = 0, finished = 0, steps = 0, cohort_steps = 0, solo_steps = 0, max_active = 0, prompt_steps = 0;
@@ -1178,6 +1185,7 @@ public:
         double prompt_group_ms = 0.0;
         std::uint64_t lazy_slot_builds = 0;
         std::uint64_t inflight_waits=0,inflight_wait_tokens=0,inflight_restored_tokens=0;
+        std::uint64_t prefix_fork_hits=0,prefix_fork_restored_tokens=0,prefix_fork_retained=0,prefix_fork_refused=0;
         double lazy_slot_ms = 0.0, lazy_slot_max_ms = 0.0;
         bool lazy_slot_memory_declined = false;
         // Prompt window cohorts (STRIX_PROMPT_WINDOW_COHORT=1): steps that ran known-row windows, and their windows.
@@ -1315,8 +1323,10 @@ private:
     }
     std::size_t prepare_admission(MtpBatchRequest request) {
         if(!engine_call_ || (paused_owner_ && !service_mode_)) throw std::logic_error("invalid admission mode");
-        const auto free = std::find_if(slots_.begin(), slots_.end(), [](const auto& s) { return !s->active; });
+        auto free = std::find_if(slots_.begin(), slots_.end(), [](const auto& s) { return !s->active; });
         if (free == slots_.end()) throw std::logic_error("batched MTP admission without a free slot");
+        ForkChoice fork;
+        if(fork_on_) {fork=fork_choose(request,free-slots_.begin());free=slots_.begin()+static_cast<std::ptrdiff_t>(fork.index);}
         const auto vocabulary = model_.vocab_size;
         if (request.prompt.empty() || request.prompt.size() >= options_.context_tokens || !request.max_tokens || !request.on_tokens)
             throw std::invalid_argument("batched request needs a prompt shorter than the context, a token budget and a sink");
@@ -1368,25 +1378,57 @@ private:
                     std::chrono::system_clock::now().time_since_epoch()).count()), joint_.rule().calibrated_min_members);
         // Exactly the single request's start: fresh target state and session, fresh predictor, no
         // deferred window rows, the request's sampler on the final prompt row and every later row.
-        s.greedy.reset();
-        s.output_chain={};
-        s.pending = {};
-        s.runtime = std::make_shared<HipMtpRuntime>(s.native);
-        if(s.parents->resources.qsa_committed_pool) s.parents->resources.qsa_committed_pool->begin_epoch();
-        s.parents->tiled.reset_state();
-        *s.session = s.parents->tiled.fresh;
-        if (s.window) s.window->begin_session();
-        s.target->replace_token_sampler({});
-        // Predictor priming and cache checkpoints use the configured draft identity for every prompt.
-        enable_draft_(*s.runtime, s.request.prompt, s.request.sampler);
+        if(fork_on_) fork_withdraw(s);
+        s.emitted_log.clear();
+        const auto cold_reset=[&] {
+            s.greedy.reset();
+            s.output_chain={};
+            s.pending = {};
+            s.runtime = std::make_shared<HipMtpRuntime>(s.native);
+            if(s.parents->resources.qsa_committed_pool) s.parents->resources.qsa_committed_pool->begin_epoch();
+            s.parents->tiled.reset_state();
+            *s.session = s.parents->tiled.fresh;
+            if (s.window) s.window->begin_session();
+            s.target->replace_token_sampler({});
+        };
+        if(fork.hit) {
+            // Resume the retained frontier: target state, held row h[p0-1] and predictor durable rows are kept.
+            s.greedy.reset();s.output_chain={};s.pending={};
+            s.runtime.reset();s.runtime=std::make_shared<HipMtpRuntime>(s.native);
+            if(s.parents->resources.qsa_committed_pool) s.parents->resources.qsa_committed_pool->begin_epoch();
+            if (s.window) s.window->begin_session();
+            s.target->replace_token_sampler({});
+        } else cold_reset();
         s.prompt_start = start;
         s.waits_for=nullptr;s.join_wait={};
         if (s.parents->tiled.cache) s.parents->tiled.cache->set_retention(s.request.cache_retention != serve::CacheRetention::no_store);
-        s.prefill = std::make_unique<TiledMtpPrompt>(s.request.prompt, model_, compiled_, s.parents->tiled, *s.session, *s.target,
-            *s.runtime, qualified_, activated_, s.parents->resources, *s.dispatcher, s.held, s.request.sampler,
-            s.request.constraint?HipMtpHostRowSelector{[state=s.request.constraint](auto row){return state->select(row);}}:HipMtpHostRowSelector{},
-            s.request.on_progress,false,true,true,batch_cert_context(s),
-            options_.prefix_cache_inflight && interleave_ && !service_mode_);
+        const auto make_prefill=[&](bool resume) {
+            // Predictor priming and cache checkpoints use the configured draft identity for every prompt.
+            enable_draft_(*s.runtime, s.request.prompt, s.request.sampler);
+            // Resume: the fresh predictor takes the durable rows [0,p0-1) kept by the slot's resources, as the
+            // single runner does at a committed-turn boundary. tiled_suffix=true: aligned tiled blocks for a long
+            // suffix (plan_session_suffix), serial rows only for a short or unaligned remainder.
+            if(resume) s.runtime->restore_cache_frontier(qualified_,activated_,fork.restored-1U);
+            s.prefill = std::make_unique<TiledMtpPrompt>(s.request.prompt, model_, compiled_, s.parents->tiled, *s.session, *s.target,
+                *s.runtime, qualified_, activated_, s.parents->resources, *s.dispatcher, s.held, s.request.sampler,
+                s.request.constraint?HipMtpHostRowSelector{[state=s.request.constraint](auto row){return state->select(row);}}:HipMtpHostRowSelector{},
+                s.request.on_progress,resume,true,true,batch_cert_context(s),
+                options_.prefix_cache_inflight && interleave_ && !service_mode_);
+        };
+        if(fork.hit) {
+            try {make_prefill(true);}
+            catch(const std::invalid_argument&) {
+                // Frontier refused before any device work: admit cold on the same slot.
+                s.prefill.reset();fork.hit=false;fork.reason="resume-refused";++stats_.prefix_fork_refused;
+                cold_reset();make_prefill(false);
+            }
+        } else make_prefill(false);
+        if(fork_on_) {
+            if(fork.hit) {++stats_.prefix_fork_hits;stats_.prefix_fork_restored_tokens+=s.prefill->restored();}
+            std::fprintf(stderr,"prefix fork slot=%zu restored=%llu prompt=%zu hit=%d reason=%s
+",static_cast<std::size_t>(free-slots_.begin()),
+                static_cast<unsigned long long>(fork.hit?s.prefill->restored():0ULL),s.request.prompt.size(),fork.hit?1:0,fork.reason);
+        }
         static_cast<void>(m);
         ++stats_.admitted;
         s.order = stats_.admitted;
@@ -1628,6 +1670,7 @@ public:
             s->prefill.reset();
             s->greedy.reset();
             s->pending = {};
+            if(fork_on_) {try{fork_withdraw(*s);}catch(...){}}
             if (was_active && s->runtime) s->runtime->cancel();
             s->request={};
         }
@@ -2066,6 +2109,7 @@ private:
     }
     // Publishes tokens and ends the request at a stop token, its budget, the context, or a cancel.
     void emitted(Slot& s, std::span<const std::uint32_t> tokens) {
+        if(fork_on_) s.emitted_log.insert(s.emitted_log.end(),tokens.begin(),tokens.end());
         const auto& stops = s.request.stop_tokens;
         if (!s.request.on_tokens(tokens)) s.result.finish = "cancelled";
         else if (std::find(stops.begin(), stops.end(), tokens.back()) != stops.end()) s.result.finish = "stop";
@@ -2140,10 +2184,87 @@ private:
         s.result.finish="constraint_failure";s.result.error=e.what();
         finish(s);
     }
+    // ---- STRIX_SERVE_PREFIX_FORK: follow-up reuse of a retained free slot ----
+    struct ForkChoice {
+        std::size_t index=0;
+        bool hit=false;
+        std::uint64_t restored=0;
+        const char* reason="off";
+    };
+    // The slot's retained frontier leaves the directory (reused cold, cancelled, failed or abandoned).
+    void fork_withdraw(Slot& s) {
+        if(s.fork_entry) fork_dir_.withdraw(s.fork_entry);
+        s.fork_entry=0;s.retained_valid=false;s.retained.clear();
+    }
+    // Chooses the admission slot without side effects. first_free is today's choice.
+    ForkChoice fork_choose(const MtpBatchRequest& request,std::size_t first_free) {
+        ForkChoice c;c.index=first_free;c.reason="miss";
+        // Nested service admission validates the first free slot only: keep today's choice there.
+        if(service_mode_ || paused_owner_) {c.reason="service-mode";return c;}
+        if(request.constraint || request.sampler) {c.reason="not-greedy";return c;}
+        const auto match=fork_dir_.lookup(fork_key_,request.prompt);
+        if(match.entry && !match.inflight) {
+            for(std::size_t i=0;i<slots_.size();++i) {
+                const auto& s=*slots_[i];
+                if(s.fork_entry!=match.entry) continue;
+                if(s.active || !s.retained_valid || s.retained.size()!=match.tokens || match.tokens>=request.prompt.size() ||
+                   !std::equal(s.retained.begin(),s.retained.end(),request.prompt.begin())) {c.reason="stale-entry";break;}
+                if(request.prompt[static_cast<std::size_t>(match.tokens)]!=s.retained_pending) {c.reason="pending-mismatch";break;}
+                c.index=i;c.hit=true;c.restored=match.tokens;c.reason="match";return c;
+            }
+        }
+        // Cold: a free slot without retained state first, else the least recently retained one.
+        std::size_t best=slots_.size();
+        for(std::size_t i=0;i<slots_.size();++i) {
+            const auto& s=*slots_[i];
+            if(s.active) continue;
+            if(best==slots_.size() || (!s.retained_valid && slots_[best]->retained_valid) ||
+               (s.retained_valid==slots_[best]->retained_valid && s.retained_stamp<slots_[best]->retained_stamp)) best=i;
+        }
+        if(best!=slots_.size()) c.index=best;
+        return c;
+    }
+    // Called from finish() before the pending ticket is dropped. Never throws; any failed check keeps nothing.
+    void fork_retain(Slot& s) noexcept {
+        try {
+            fork_withdraw(s);
+            const auto& reason=s.result.finish;
+            if((reason!="stop" && reason!="length") || s.request.constraint || s.request.sampler ||
+               s.request.cache_retention==serve::CacheRetention::no_store || !s.pending.valid() || s.emitted_log.empty() ||
+               s.emitted_log.size()!=s.result.generated_tokens || !s.runtime || !s.session) {++stats_.prefix_fork_refused;return;}
+            const auto& session=*s.session;
+            // Consumed history: the prompt and every emitted token except the last (pending, not yet consumed).
+            const std::uint64_t consumed=s.request.prompt.size()+s.emitted_log.size()-1U;
+            if(session.health!=SerialSessionHealth::ready || session.arithmetic_lineage.tainted || session.next_position!=consumed ||
+               session.committed_tokens!=consumed || consumed>=options_.context_tokens ||
+               !arithmetic_lineage_valid(session.arithmetic_lineage,consumed) ||
+               s.runtime->next_source_position()+1U!=consumed || s.emitted_log.back()!=s.pending.predicted_token()) {++stats_.prefix_fork_refused;return;}
+            const auto view=s.pending.view();
+            check_service(hipDeviceSynchronize(),"prefix fork final cycle completion");
+            // h[p-1]: the held row the next prompt row primes the predictor from (the single runner's turn boundary copy).
+            hip_check(hipMemcpy(s.held,reinterpret_cast<const void*>(view.address),static_cast<std::size_t>(view.bytes),hipMemcpyDeviceToDevice),
+                "prefix fork held hidden row");
+            if(s.window && s.window->pending_window()) s.window->flush_pending_window();
+            check_service(hipDeviceSynchronize(),"prefix fork committed state completion");
+            std::vector<std::uint32_t> history(s.request.prompt.begin(),s.request.prompt.end());
+            history.insert(history.end(),s.emitted_log.begin(),s.emitted_log.end()-1);
+            const auto lane=static_cast<std::uint32_t>(std::find_if(slots_.begin(),slots_.end(),[&](const auto& x){return x.get()==&s;})-slots_.begin());
+            const auto entry=fork_dir_.announce(fork_key_,history,lane);
+            if(!entry) {++stats_.prefix_fork_refused;return;}
+            fork_dir_.publish(entry,history.size());
+            s.fork_entry=entry;s.retained=std::move(history);s.retained_pending=s.emitted_log.back();
+            s.retained_valid=true;s.retained_stamp=++fork_clock_;
+            ++stats_.prefix_fork_retained;
+        } catch(...) {
+            try {fork_withdraw(s);} catch(...) {}
+        }
+    }
+
     void finish(Slot& s) {
         s.waits_for=nullptr;s.join_wait={};
         if(s.request.constraint) s.result.constraint=s.request.constraint->verdict(s.result.finish);
         s.prefill.reset();s.prefilling=false;
+        if(fork_on_) fork_retain(s);
         s.active = false;
         s.greedy.reset();
         s.output_chain={};
@@ -2181,6 +2302,7 @@ private:
         };
         const auto raw = [](const char* name) { const char* v = std::getenv(name); return std::string(v && *v ? v : "unset"); };
         line("receipt", "STRIX_SERVE_RECEIPT", true, "1");
+        line("prefix_fork", "STRIX_SERVE_PREFIX_FORK", fork_on_, fork_on_ ? "1" : "0");
         for (const auto& l : hip_mtp_serve_levers()) line(l.name, l.env.c_str(), l.active, l.value);
         line("prompt_small", "STRIX_BATCH_PROMPT_SMALL", batch_prompt_small(options_), batch_prompt_small(options_) ? "1" : "0");
         line("prompt_share", "STRIX_BATCH_PROMPT_SHARE", prompt_share_ > 0.0, std::to_string(prompt_share_));
@@ -2198,6 +2320,10 @@ private:
     unsigned lookahead_=[] {const char* v=std::getenv("STRIX_BATCH_SERVICE_LOOKAHEAD");return v?static_cast<unsigned>(std::clamp(std::atol(v),0L,64L)):2U;}();
     bool cancel_points_=strix::envcfg::flag("STRIX_BATCH_CANCEL_POINTS", true);
     bool engine_call_=false;
+    bool fork_on_=serve::prefix_fork_enabled_from_env();
+    serve::PrefixDirectory fork_dir_;
+    serve::PrefixKey fork_key_{1,1,1}; // constant per server: one model, template and format
+    std::uint64_t fork_clock_=0;
     int device_=0;
     std::uint64_t nest_rows_=[] {const char* v=std::getenv("STRIX_BATCH_NEST_ROWS");return v?std::strtoull(v,nullptr,10):2048ULL;}();
     bool service_mode_=false;
@@ -2861,6 +2987,8 @@ inline void run_mtp_decode_bridge(const Options& options,const ModelContract& mo
                     <<",\"prompt_groups\":"<<st.prompt_groups<<",\"prompt_window_cohorts\":"<<st.prompt_window_cohorts
                     <<",\"inflight_waits\":"<<st.inflight_waits<<",\"inflight_wait_tokens\":"<<st.inflight_wait_tokens
                     <<",\"inflight_restored_tokens\":"<<st.inflight_restored_tokens
+                    <<",\"prefix_fork_hits\":"<<st.prefix_fork_hits<<",\"prefix_fork_restored_tokens\":"<<st.prefix_fork_restored_tokens
+                    <<",\"prefix_fork_retained\":"<<st.prefix_fork_retained<<",\"prefix_fork_refused\":"<<st.prefix_fork_refused
                     <<",\"prompt_window_members\":"<<st.prompt_window_members<<","<<batch_service_receipt(st)
                     <<",\"calibration_rows\":"<<calibration_rows<<",\"calibration_ms\":"<<calibration_ms;
                 if(prefix_batch_cert_execution_mode(options) && !options.baseline && parents->tiled.cache && parents->tiled.cache->has_store()) {
