@@ -13,6 +13,7 @@
 #include "hip_prefill_pool.hpp"
 #include "strix/dispatch_fuse.hpp"
 #include "strix/qpf2k_defaults.hpp"
+#include "strix/prefill_identity.hpp"
 #include "strix/hip_mtp_target_window.hpp"
 #include "strix/hip_ple_launcher.hpp"
 #if defined(STRIX_HAS_EXPERIMENTAL_Q4K_A8_RUNTIME)
