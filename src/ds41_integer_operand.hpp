@@ -48,7 +48,10 @@ using Contract = strix::core::IntegerContract<strix::core::IntegerOperand<Ds41Pr
     std::conditional_t<!Fast && !Relaxed && F != WeightFormat::mxfp4,
         // split stage for down only (rank fixture: Q2_K down from +2..+6 % to +1 %, Q8_0 down -5 -> -7 % against the DeepSeek
         // kernels; gate/up loses ~1 % with it)
-        strix::core::GroupedIntegerPlan<Down ? STRIX_DS41_SPLIT_DOWN_WAVES : STRIX_DS41_SPLIT_WAVES, Down, Down>,
+        // no LDS weight tile for the routed codecs (rank fixture, 2048 / 4096 / 8192 rows: IQ2_XXS gate/up -7..-8 %, Q2_K
+        // down -2..-3 % against the DeepSeek kernels, every arm the same bits); Q8_0 is direct by its operand
+        strix::core::GroupedIntegerPlan<Down ? STRIX_DS41_SPLIT_DOWN_WAVES : STRIX_DS41_SPLIT_WAVES, Down, Down,
+            F == WeightFormat::q8_0>,
         strix::core::IntegerPlan>>, Relaxed>;
 // Header instantiation only: no separate archive or library device link is needed.
 template<class C, int BN, class Adapter>
