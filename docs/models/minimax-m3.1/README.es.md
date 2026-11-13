@@ -35,7 +35,10 @@ Ejecute una vez por nodo con `R` establecido en 0 o 1 y assets EXL3 coincidentes
 
 El [resolutor](../../../src/minimax/engine/mm_defaults.cpp) activa el conjunto de producción de decode/prefill/intercambio,
 incluido el modo de prefill MSA 10 (bucle de chunks dentro del bloque con lista de bloques y parciales en LDS, sin
-parciales globales; `STRIX_MM_PF_MSA_REWORK=8` restablece el modo anterior, valores válidos de 0 a 10). `strix-minimax-serve` usa la admisión automática estructural de DSpark con assets
+parciales globales; `STRIX_MM_PF_MSA_REWORK=8` restablece el modo anterior, valores válidos de 0 a 10). Identidad FAST opcional: `STRIX_MM_PF_MSA_FLASH=1` (operandos BF16 de un término) o
+`2` (dos términos) ejecuta la atención MSA del prefill de las capas 40-59 en el núcleo flash compartido de WMMA
+dividido por claves (`STRIX_MM_PF_MSA_FLASH_LAYERS` elige las capas; ver
+[mm-pf-msa-flash](../../optimizations.md#mm-pf-msa-flash) para la puerta de calidad por conjunto de capas). `strix-minimax-serve` usa la admisión automática estructural de DSpark con assets
 locales compatibles; las peticiones elegibles sin contención pueden usar draft, mientras que las peticiones en competencia/agrupadas o no admitidas
 se quedan en simple. Véase [admisión y cualificación](../../engine/serving/dspark-auto-qualification.md).
 Una petición de sesión con nombre que no cabe en el contexto devuelve HTTP 400 `context_length_exceeded` (la

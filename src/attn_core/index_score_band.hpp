@@ -28,7 +28,22 @@ __host__ __device__ constexpr bool in_band(float score, float threshold, float d
     return score >= threshold - 2.0F * delta && score <= threshold + 2.0F * delta;
 }
 
-// Work-group reduction of one value per thread (blockDim.x a multiple of 32, at most 256): wave shuffles, then one
+// delta for the FP16 WMMA dot with both FP32 operands rounded to FP16 (GLM), vectors of at most 256 elements, every
+// |x| < kF16Safe (above it the conversion can overflow: the engine then rescores everything):
+//   operand error   |fl16(x) - x| <= 2^-11 |x| + 2^-25 (the second term covers FP16 subnormals), so per vector
+//                   |dq|_2 <= eq = 2^-11 |q|_2 + 2^-21, and |q~ . k~ - q . k| <= eq |k| + (|q| + eq) ek
+//   accumulation    FP16 products are exact in FP32; the FP32 additions of the WMMA chain, the exact kernel's own FMA
+//                   chain against the real dot and both head epilogues stay below 2^-16 |q~|_2 |k~|_2;
+//                   kF16AccumRel = 2^-13 leaves a factor of eight over that.
+// Streaming top-k (scores arrive in windows and only the retained top-k survives a window): rescore every score
+// >= threshold - 2 delta instead of the band, so the retained values are exact ones (delta 0) in the next window.
+inline constexpr float kF16Safe = 65504.0F, kF16RoundRel = 0x1p-11F, kF16RoundAbs = 0x1p-21F, kF16AccumRel = 0x1p-13F;
+__host__ __device__ constexpr float f16_dot_error(float qn, float kn) {  // qn = |q|_2, kn = |k|_2 (or an upper bound)
+    const float eq = kF16RoundRel * qn + kF16RoundAbs, ek = kF16RoundRel * kn + kF16RoundAbs;
+    return eq * kn + (qn + eq) * ek + kF16AccumRel * (qn + eq) * (kn + ek);
+}
+
+// Work-group reduction of one value per thread (blockDim.x a multiple of 32, one slot per wave): wave shuffles, then one
 // LDS slot per wave. Two barriers; every thread returns the same value.
 template <class T, class Op> __device__ __forceinline__ T group_reduce(T x, T* slots, Op op) {
 #pragma unroll

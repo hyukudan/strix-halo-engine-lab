@@ -1,6 +1,7 @@
 #include "strix/device/hip_gate.hpp"
 
 #include "strix/device/hip_enumerator.hpp"
+#include "strix/power/sampler.hpp"
 
 #include <cstdlib>
 #include <exception>
@@ -36,6 +37,7 @@ const Bound& bind_hip(Request request, const std::string& devices_path, std::FIL
             std::fflush(receipt);
         }
         state.bound = std::move(chosen);
+        power::start_process_sampler();  // shared power receipt: every binary that binds a device samples from here on
     } else if (const auto status = hipSetDevice(state.bound->visible.ordinal); status != hipSuccess) {
         fail(std::string("hipSetDevice failed: ") + hipGetErrorString(status));
     }
@@ -53,6 +55,20 @@ void bind_hip_main(int& argc, char** argv, std::FILE* receipt) {
         std::fflush(stderr);
         std::exit(2);
     }
+}
+
+HostWait set_host_wait(HostWait engine_choice, std::FILE* receipt) {
+    const char* text = std::getenv("STRIX_HOST_WAIT");
+    const auto policy = resolve_host_wait(engine_choice, text);
+    if (policy != HostWait::runtime) {
+        const unsigned flag = policy == HostWait::spin ? hipDeviceScheduleSpin : policy == HostWait::yield ? hipDeviceScheduleYield : hipDeviceScheduleBlockingSync;
+        if (const auto status = hipSetDeviceFlags(flag); status != hipSuccess) fail(std::string("host wait: hipSetDeviceFlags failed: ") + hipGetErrorString(status));
+    }
+    if (receipt) {
+        std::fprintf(receipt, "host wait: %s (%s)\n", host_wait_name(policy), text && *text ? "STRIX_HOST_WAIT" : "engine");
+        std::fflush(receipt);
+    }
+    return policy;
 }
 
 const Bound* hip_bound() noexcept {

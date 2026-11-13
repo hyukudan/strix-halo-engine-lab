@@ -38,6 +38,20 @@ request larger than the burst is legal. `acquire()` is the blocking form and ret
 decode ends. `governed_slices()` walks a range in slices so a long pass reacts to a decode that starts
 in the middle of it.
 
+## Governed background work
+
+- The session runtime marks every decode (and mixed) round on the process-wide budget.
+- Checkpoint publication and reads (`strix::session::checkpoint_io`, the path used by session park, prefix
+  checkpoints and their restores in every engine) draw each chunk they move from the budget.
+  `atomic_write_background()` runs a publication as a background lane job.
+- Prefix-cache key hashing draws its bytes from the budget.
+
+Outside decode none of this waits. Test: `strix-governed-checkpoint-io-tests`.
+
+`strix-host-lane-tests --load SECONDS THREADS CAP_GBPS [BUFFER_MIB]` is a load generator: background lane
+jobs that read memory under the budget with decode marked active (`CAP_GBPS` 0: uncapped). It is used to
+measure decode speed next to capped and uncapped background work.
+
 ## Configuration
 
 The process-wide lane (`shared_host_lane()`) is on by default and reads:

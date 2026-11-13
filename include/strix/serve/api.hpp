@@ -28,6 +28,7 @@ struct ApiChatPrompt {
     Json tools;
     std::uint32_t stable_prefix = 0;
     std::shared_ptr<GenerationContext> context = {};
+    bool tools_off = false;  // tool_choice "none" (set by the shared layer): a call the model still emits is withheld
 };
 
 // Terminal domain data is frozen after the accepted ticket finishes. Hooks never
@@ -83,6 +84,12 @@ struct ApiConfig {
     std::function<std::string(const ChatTemplateInput&)> chat_renderer;
     std::function<AssistantOutput(const std::string& text, bool thinking, const Json& tools)> output_parser;
     std::string tool_call_marker = "<tool_call>";  // streaming: content from this marker on is kept for the tool parse
+    // tool_choice "none" after a history with tool calls: the closing instruction added to the prompt.
+    // Unset: serve::no_tools_hint. Requests without tool_choice "none" never see it.
+    std::optional<std::string> no_tools_hint = {};
+    // tool_choice "none": the reply is cut from this marker on (a family whose call frame differs from
+    // tool_call_marker, or whose parser leaves calls in the text). Empty: tool_call_marker.
+    std::string tools_off_marker = {};
     // Engine members added to /api/status (memory, slots, group) and lines added to /metrics.
     std::function<void(Json& status)> status_extra;
     std::function<std::string()> metrics_extra;

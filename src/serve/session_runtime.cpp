@@ -1,9 +1,11 @@
 #include "strix/serve/session_runtime.hpp"
+#include "../core/byte_budget.hpp"
 
 #include <algorithm>
 #include <atomic>
 #include <cmath>
 #include <map>
+#include <optional>
 #include <set>
 #include <stop_token>
 
@@ -249,14 +251,42 @@ struct SessionRuntime::Impl {
         // and their accounting survive all subsequent errors.
         finish(l, error);
     }
+    // Open prompts (GenerationJob::prompt_tail). All of this runs on the runtime thread.
+    static void settle_prompt(GenerationJob& job) {
+        if (!job.prompt_tail) return;
+        while (!job.prompt_tail->take(job.prompt, true)) {}
+        job.prompt_tail.reset();
+    }
+    void grow_prompt(Lane& l, bool wait) {
+        try {
+            if (l.taken.job.prompt_tail->take(l.taken.job.prompt, wait)) l.taken.job.prompt_tail.reset();
+            l.stats.prompt_tokens = l.taken.job.prompt.size();
+        } catch (const std::exception& e) {
+            l.taken.job.prompt_tail.reset();
+            fail(l, e.what());
+        }
+    }
     void admit(TakenJob taken) {
         auto l = std::make_unique<Lane>();
         l->taken = std::move(taken);
+        std::string tail_error;
+        if (l->taken.job.prompt_tail) {
+            // A cache lookup or an owner-controlled turn decides on the whole prompt: wait for it. Otherwise the
+            // lane is admitted on the ids that are final now and grows before each round.
+            try {
+                if (caching() || turn_caching() || caps.owner_control) settle_prompt(l->taken.job);
+                else if (l->taken.job.prompt_tail->take(l->taken.job.prompt, l->taken.job.prompt.empty())) l->taken.job.prompt_tail.reset();
+            } catch (const std::exception& e) {
+                tail_error = e.what();
+                l->taken.job.prompt_tail.reset();
+            }
+        }
         l->stats.prompt_tokens = l->taken.job.prompt.size();
         l->stats.sampling = l->taken.job.sampling.temperature > 0 ? "sample" : "greedy";
         l->phase_remaining = l->taken.job.max_tokens;
         bool preflight = true;
         try {
+            if (!tail_error.empty()) throw std::runtime_error(tail_error);
             admission(l->taken.job, caps, hooks);
             if(l->taken.job.family_context && !hooks.validate) throw std::invalid_argument("unvalidated family context");
             if (hooks.validate) hooks.validate(l->taken.job);
@@ -568,11 +598,37 @@ struct SessionRuntime::Impl {
                 queue.wait_for_work_until(std::chrono::steady_clock::now() + hooks.idle_interval, !blocked);
             return !queue.stopping();
         }
+        // Open prompts take the ids that became final; a lane that has used all of its ids waits for more, so no
+        // round ever sees an open prompt as complete.
+        bool grew = false;
+        for (auto& l : lanes)
+            if (!l->done && l->taken.job.prompt_tail) {
+                grow_prompt(*l, l->offset == l->taken.job.prompt.size());
+                grew = true;
+            }
+        if (grew) {
+            std::erase_if(lanes, [](const auto& l) { return l->done; });
+            if (lanes.empty()) return !queue.stopping();
+        }
         std::vector<SessionView> views;
         for (auto& l : lanes) views.push_back(l->view());
         try {
             const auto work = hooks.schedule ? hooks.schedule(views) : basic_host_schedule(views, caps);
             require(!work.empty(), "session schedule made no progress");
+            // A plan that would use every id an open prompt holds (or leave prefill) was made on a prompt that is
+            // still growing: wait for more ids and plan again. A chunk strictly inside the held ids is final.
+            bool replan = false;
+            for (const auto& w : work)
+                for (std::size_t n = 0; n < w.lanes.size(); ++n) {
+                    if (w.lanes[n] >= lanes.size()) continue;
+                    auto& l = *lanes[w.lanes[n]];
+                    if (l.done || !l.taken.job.prompt_tail) continue;
+                    if (w.phase == SessionPhase::prefill && n < w.chunks.size() &&
+                        w.chunks[n] < l.taken.job.prompt.size() - l.offset) continue;
+                    grow_prompt(l, true);
+                    replan = true;
+                }
+            if (replan) return true;
             std::set<std::size_t> used;
             for (const auto& w : work) {
                 require(w.phase == SessionPhase::prefill || w.phase == SessionPhase::decode || w.phase == SessionPhase::mixed, "invalid session phase");
@@ -588,6 +644,9 @@ struct SessionRuntime::Impl {
                 }
             }
             for (const auto& w : work) {
+                // Decode marks the byte budget: background host work is capped while sessions decode.
+                std::optional<::strix::core::ByteBudget::DecodeScope> decoding;
+                if (w.phase != SessionPhase::prefill) decoding.emplace(::strix::core::shared_byte_budget());
                 try { execute(w); }
                 catch (const std::exception& e) { for (auto i : w.lanes) if (!lanes[i]->done) fail(*lanes[i], e.what()); }
                 catch (...) { for (auto i : w.lanes) if (!lanes[i]->done) fail(*lanes[i], "session phase failed"); }
@@ -651,17 +710,20 @@ bool SessionRuntime::reserve(QueueSelection selection,
     if (!impl_->hooks.control_turn) throw std::logic_error("native reservation requires a control planner");
     if (!impl_->reserved && !stopping())
         impl_->reserved = impl_->queue.take(false, selection, {}, reorder, eligible, blocked);
+    if (impl_->reserved) Impl::settle_prompt(impl_->reserved->job); // native reservations plan on whole prompts
     return impl_->reserved.has_value();
 }
 bool SessionRuntime::reserve_fifo(bool wait, bool short_first) {
     if (!impl_->hooks.control_turn) throw std::logic_error("native reservation requires a control planner");
     if (!impl_->reserved && !stopping()) impl_->reserved = impl_->queue.take(wait && impl_->control_wait, short_first);
+    if (impl_->reserved) Impl::settle_prompt(impl_->reserved->job); // native reservations plan on whole prompts
     return impl_->reserved.has_value();
 }
 bool SessionRuntime::reserve_serial(bool wait) {
     if (!impl_->hooks.control_turn || !impl_->hooks.serial_queue_protocol)
         throw std::logic_error("serial reservation requires the serial queue protocol");
     if (!impl_->reserved) impl_->reserved = impl_->queue.take_serial(wait && impl_->control_wait);
+    if (impl_->reserved) Impl::settle_prompt(impl_->reserved->job); // native reservations plan on whole prompts
     return impl_->reserved.has_value();
 }
 void SessionRuntime::refuse(GenerationStats stats, std::string error) {

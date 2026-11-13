@@ -732,6 +732,17 @@
   },
   {
     "engine": "qwen",
+    "name": "Uniform DA16 activation issue (expert down)",
+    "flag_or_env": "STRIX_QPF2K_MOE_DA16_ISSUE",
+    "default": "automatic (on for the XOR-row tune 88)",
+    "exact": "Bitwise: routed-expert fixture (every written view, the CSR words and the certificate word; header reuse on and off; certificate off, armed and unproven; DA16 image poisoned before each run) identical with the item on and off on a real layer at 4,096 and 8,192 rows and on synthetic layers; 8K and 32K terminal FP32 logits and generated tokens identical with =0, unset and =1.",
+    "gain": "down phase -0.7 % to -1.5 % at 3,072 to 4,864 rows per chunk (routed call -0.26 % to -0.39 %; real layer, ABBA); no repeatable change at 2,048 rows or at 6,144 and 8,192-row chunks",
+    "preconditions": "DA16 expert down entries (base, certificate, BF16 route, one-byte route), automatic for tune 88 (64-assignment batches with XOR rows), =1 for every tune; LDS-epilogue tiers, the tile-64 remainder and the P1 item keep the masked issue.",
+    "off_switch": "STRIX_QPF2K_MOE_DA16_ISSUE=0",
+    "doc_anchor": "docs/optimizations.md#qwen-moe-da16-issue"
+  },
+  {
+    "engine": "qwen",
     "name": "QSA attend-union merge",
     "flag_or_env": "STRIX_QSA_UNION_MERGE",
     "default": "1 (from 49,152 blocks; range form below)",
@@ -861,6 +872,28 @@
     "preconditions": "Tiled prefill blocks without a head and without a step observer whose last state-writing step is a QSA layer (STRIX_PREFILL_PIPE bit 64 cut active); the MTP route (step observer) and blocks with a head run the full step.",
     "off_switch": "STRIX_QSA_CACHE_ONLY=0",
     "doc_anchor": "docs/optimizations.md#qwen-qsa-cache-only"
+  },
+  {
+    "engine": "qwen",
+    "name": "Final-block cone: final hyper mix on the trailing rows only",
+    "flag_or_env": "STRIX_PREFILL_FINAL_CONE",
+    "default": "1",
+    "exact": "Exact: plain default command, same binary on/off: prefill logits byte-identical with the token at 8K (five arms) and, at 32K, the full logits of the prefill and of 48 MTP decode steps byte-identical with the tokens. A first form that ran the final mix through the 8-row tile entry was rejected: its prefill logits differed (up to 0.0044) because the full-T entry uses the FP16-output route.",
+    "gain": "8K single node, three alternating off/on pairs: 4,764.0 / 4,752.7 / 4,727.8 ms off vs 4,707.7 / 4,717.4 / 4,677.9 ms on (means 4,748.2 vs 4,701.0 ms, -1.0 %; adjacent pairs -56 / -35 / -50 ms); 32K with 48 decode steps, one pair: 21.11 s off vs 21.00 s on (within run noise)",
+    "preconditions": "A tiled prefill block that keeps its head (the final block), whole 8-row tiles and more than STRIX_PREFILL_FINAL_CONE_ROWS rows (default 128; the HIP hyper-mix entry needs at least 16). The MTP predictor reads the tap (last MLP injection) of every prompt row, so the last layer's MoE and injection still run on all rows; only the final mix, read by the head alone, is coned. =2 (opt-in, host-test evidence only) also cones every other trailing step that touches no session state and has no step observer.",
+    "off_switch": "STRIX_PREFILL_FINAL_CONE=0",
+    "doc_anchor": "docs/optimizations.md#qwen-prefill-final-cone"
+  },
+  {
+    "engine": "qwen",
+    "name": "Blocking host wait (shared host wait policy)",
+    "flag_or_env": "STRIX_HOST_WAIT",
+    "default": "block (Qwen decode app); other engines keep the runtime schedule unless they select one",
+    "exact": "Exact: the policy only changes how the host thread waits for the device. Prefill logits and tokens byte-identical between spin, block and the runtime schedule at 8K and between spin and block at 32K.",
+    "gain": "Host CPU time, not speed. 8K: host user CPU 2.3 s (block) vs 5.8-6.1 s (spin / runtime schedule), busiest thread 61-68 % vs 97-98 %; request 1,730 / 1,762 / 1,729 tok/s block vs 1,723 / 1,738 / 1,770 spin (three pairs, no ordered difference). 32K, two pairs: 18.90 / 18.84 s block vs 19.00 / 18.89 s spin, host user CPU 11.5 / 10.7 s vs 19.4 / 18.9 s. Power: the device power sensor (0.5 s samples) does not separate the arms (32K 135 / 137 W block vs 138 / 136 W spin; 8K 113-122 W both), so no watt saving is claimed.",
+    "preconditions": "Any HIP binary that calls the shared policy after the device bind (strix::device::set_host_wait). The HIP runtime's own schedule busy-waits on device completion, which keeps one host core at 100 % for the whole prefill.",
+    "off_switch": "STRIX_HOST_WAIT=runtime (or spin)",
+    "doc_anchor": "docs/optimizations.md#host-wait-policy"
   },
   {
     "engine": "qwen",
@@ -1854,6 +1887,17 @@
   },
   {
     "engine": "minimax",
+    "name": "Tiled core: the load schedule is a contract trait",
+    "flag_or_env": "none",
+    "default": "on",
+    "exact": "Code motion behind a compile-time trait; gfx1151 assembly of the tiled-core library unit is instruction-identical before and after (392 kernels); strix-hip-iu4-load-cohort-tests pins I32 group sums, FP32 outputs and kernel resources and requires identical bits under late-issue schedules.",
+    "gain": "None claimed. Routed replay of the fixture (4,096 token rows x top-8 over 288 groups, gate/up + down, 41 interleaved rounds): 24.06 / 23.78 ms before, 23.91 ms after. The same kernel with the weights issued late is +7.3 % slower, with every load issued late +9.1 %: that is what the existing overlap is worth, and it was already in place.",
+    "preconditions": "none",
+    "off_switch": "none",
+    "doc_anchor": "docs/optimizations.md#core-load-cohort-schedule"
+  },
+  {
+    "engine": "minimax",
     "name": "Prefill MoE token-major gather",
     "flag_or_env": "STRIX_MMX_PREFILL_GATHER_TOK",
     "default": "1",
@@ -2360,6 +2404,17 @@
   },
   {
     "engine": "glm",
+    "name": "Producer exchange publish (GLM decode)",
+    "flag_or_env": "STRIX_GLM_XB_PUBLISH",
+    "default": "1",
+    "exact": "In-process A B A at 1K: identical tokens, last logits and state digests; fresh-process arms at 8K, plain and speculative: identical token digests.",
+    "gain": "plain decode 1K 39.05 -> 38.42 ms/token (-1.6 %); 8K plain 39.88 -> 39.33 (-1.4 %), speculative 23.28 -> 22.84 (-1.9 %)",
+    "preconditions": "Pair decode on the Xfer exchange with the fused boundary, fast attention and fast MoE seams.",
+    "off_switch": "STRIX_GLM_XB_PUBLISH=0",
+    "doc_anchor": "docs/optimizations.md#glm-xfer-producer-publish"
+  },
+  {
+    "engine": "glm",
     "name": "Fast raw-expert MoE",
     "flag_or_env": "STRIX_GLM_MOE",
     "default": "fast",
@@ -2434,6 +2489,17 @@
     "preconditions": "Exact chunked prefill (the legacy MLA pair keeps its own kernels).",
     "off_switch": "STRIX_GLM_PF_MLA_GEMM=2 (v2) or 1 (legacy tiled GEMM); --baseline selects v2",
     "doc_anchor": "docs/optimizations.md#glm-pf-mla-gemm-v3"
+  },
+  {
+    "engine": "glm",
+    "name": "Prefill dense rows v4 (shared pipelined FMA-rows core)",
+    "flag_or_env": "STRIX_GLM_PF_DENSE_ROWS=4, STRIX_GLM_PF_DENSE_FORM",
+    "default": "off (3)",
+    "exact": "Device test strix-hip-fma-rows-tests: every form byte-identical to v3 over ragged groups, row and column tails, F16 / BF16 / F32 weights, weight row offsets and the production shapes, guard rows untouched (388 + 424 checks on a second node with the final selection, 0 failures); two-node FAST run at 8,192 tokens: logits and state hashes equal to version 3",
+    "gain": "Kernel fixture (one node, interleaved whole-call medians, outputs byte-identical to v3): KDA f_a + g_a + b (4096 inputs, 320 outputs) 3.17 -> 2.56 ms at 4096 rows and 7.04 -> 5.00 ms at 8192 rows; KDA f_b (128 inputs, 8192 outputs, 4096 rows) 4.09 -> 1.71 ms, g_b (4096 outputs) 2.18 -> 0.96 ms; router (4096 inputs, 288 outputs, 4096 rows) 3.03 -> 2.74 ms, at 8192 rows 6.76 -> 4.88 ms; f_b at 8192 rows 12.87 -> 3.14 ms; grouped call at 1024 rows 0.56 -> 0.37 ms and at 256 rows 0.38 -> 0.15 ms. End to end: the two-node FAST run at 8,192 tokens gives the same logits and state hashes with version 4 (that path only runs the router and indexer projections here, so no TTFT change is claimed); the exact-mode end-to-end run is pending, which is why the default stays 3",
+    "preconditions": "Exact chunked prefill; chains of at most 4096 inputs.",
+    "off_switch": "STRIX_GLM_PF_DENSE_ROWS=3",
+    "doc_anchor": "docs/optimizations.md#glm-pf-dense-rows-v4"
   },
   {
     "engine": "glm",
@@ -2632,6 +2698,17 @@
     "preconditions": "Dense calls of 2048+ rows (X3 route); MoE calls on V11/V14.",
     "off_switch": "STRIX_GLM_PF_WMMA=0 (overrides --profile fast); unset stays off without fast",
     "doc_anchor": "docs/optimizations.md#glm-pf-wmma-x"
+  },
+  {
+    "engine": "glm",
+    "name": "Folded F16 WMMA core: skip row fragments that hold no row",
+    "flag_or_env": "STRIX_GLM_PF_WMMA_LIVE_FRAG",
+    "default": "on wherever the FAST WMMA prefill cores run",
+    "exact": "Bitwise to the glm-pf-wmma-x identity (all-fragments form equal on every buffer; pair 8K logits, state and token hashes equal the previous binary).",
+    "gain": "Whole MoE call, one node, uniform rows per expert, skip vs all fragments: 33 rows -11 %, 48 -11 %, 65 -18 %, 80 -21 %, 96 -10 %, 112 -4 %. Lognormal routing: 2048 rows 26.80 vs 27.51 ms (-2.6 %), 4096 rows 48.62 vs 50.10 ms (-3.0 %); full tiles are unchanged (all-fragments form equals the previous binary within run noise).",
+    "preconditions": "STRIX_GLM_PF_WMMA=1 (FAST prefill); ragged tiles of routed MoE groups, shared slices and dense calls.",
+    "off_switch": "STRIX_GLM_PF_WMMA_LIVE_FRAG=0 (computes every fragment, same bits)",
+    "doc_anchor": "docs/optimizations.md#glm-pf-wmma-live-fragments"
   },
   {
     "engine": "glm",
@@ -2973,6 +3050,17 @@
     "preconditions": "Kernel with AMD's PerfOpt patches (Linux 7.4 or the IOMMU tree) and the GPU in an identity domain; dedicated inference host without GPU unbind, VFIO, kexec/kdump or suspend.",
     "off_switch": "options amdgpu iommu_perfopt=0, or boot the previous kernel",
     "doc_anchor": "docs/optimizations.md#platform-perfopt"
+  },
+  {
+    "engine": "platform",
+    "name": "Shared power and energy receipt",
+    "flag_or_env": "STRIX_POWER_SAMPLER",
+    "default": "ON when a power source is readable (sampler thread at 100 ms, STRIX_POWER_SAMPLE_MS); every engine CLI and the server report the block strix-power-receipt-v1",
+    "exact": "Host-only measurement: no device call, no arithmetic. Qwen 8K prefill, sampler on vs off: logits file and generated tokens byte-identical.",
+    "gain": "Measurement, not a speed lever. Qwen 8K real-text prefill, one node, default exact route, sampler on/off interleaved (ABAB): 1,755.9 / 1,744.5 tok/s on vs 1,752.9 / 1,733.5 off (no slowdown), logits and tokens identical. First receipts: prefill 577-588 J, 123.5-125.4 W mean, 150-152 W peak, 13.9-14.2 tok/J, median GPU clock 2,512-2,524 MHz, 84-92 C; serial greedy decode 128 tokens: 544 J, 95.7 W mean, 0.235 tok/J, 2,873 MHz.",
+    "preconditions": "A readable source: amdgpu hwmon (power, clock, temperature), a readable powercap package energy counter, cpufreq. A missing or unreadable source is reported as unavailable with the reason; the run continues.",
+    "off_switch": "STRIX_POWER_SAMPLER=0",
+    "doc_anchor": "docs/optimizations.md#platform-power-receipt"
   },
   {
     "engine": "minimax",

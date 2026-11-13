@@ -1145,6 +1145,18 @@ struct GdnInputTiledSite {
         static_cast<void>(q8_rows::segment_row(segments, out, width, m, row));
         reinterpret_cast<float*>(output0[m] + r * output_stride)[row] = round_bf16(value);
     }
+    bool vector_store_supported() const {
+        if (output_stride % 16U || outputs % 4U) return false;
+        for (unsigned m = 0; m < segments.count; ++m)
+            if (reinterpret_cast<std::uintptr_t>(output0[m]) % 16U || segments.first[m] % 4U) return false;
+        return true;
+    }
+    __device__ void store4(std::uint32_t out, std::uint32_t r, q8_rows::tiled::f4 value) const {
+        unsigned m; std::uint32_t row;
+        static_cast<void>(q8_rows::segment_row(segments, out, width, m, row));
+        const q8_rows::tiled::f4 rounded{round_bf16(value.x), round_bf16(value.y), round_bf16(value.z), round_bf16(value.w)};
+        *reinterpret_cast<q8_rows::tiled::f4*>(output0[m] + r * output_stride + 4ULL * row) = rounded;
+    }
 };
 // FAST route qwen-gdn-fp16-chunk: GdnInputTiledSite's outputs as BF16 bits in one compact row (q | k | v, then z at
 // z_offset); GdnInputTiledSite stores these same BF16 values as FP32.

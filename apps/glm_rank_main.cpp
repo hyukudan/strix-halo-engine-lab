@@ -382,9 +382,12 @@ int main(int argc, char** argv) {
             throw std::invalid_argument("STRIX_GLM_PF_WMMA=1 with --world 2 needs the startup agreement (--decode N or --tf, "
                                         "comm exchange) so both ranks are checked to run the same prefill identity");
         // FAST indexer scores (STRIX_IDX_WMMA) change the DSA selection: the same agreement rule as glm-pf-wmma-x.
-        const unsigned idx_wmma = strix::attn_core::idx::wmma_mode();
-        if (idx_wmma > strix::attn_core::idx::kModeF16)
-            throw std::invalid_argument("STRIX_IDX_WMMA: GLM takes bf16 or f16 (bf16x2 and exact need BF16 keys)");
+        // Unset or exact: WMMA scores with exact rescoring of the cut-off, the pool lists of the exact kernels, so it is
+        // not an identity of its own (agreement value 0, like STRIX_IDX_WMMA=0).
+        const unsigned idx_mode = strix::attn_core::idx::wmma_mode(strix::glm::pf::kIndexerWmmaUnsetMode);
+        if (idx_mode == strix::attn_core::idx::kModeBf16x2)
+            throw std::invalid_argument("STRIX_IDX_WMMA: GLM takes 0, bf16, f16 or exact (bf16x2 needs BF16 keys)");
+        const unsigned idx_wmma = idx_mode == strix::attn_core::idx::kModeExact ? 0U : idx_mode;
         if (opt.world == 2 && !startup_handshake && idx_wmma != 0)
             throw std::invalid_argument("STRIX_IDX_WMMA with --world 2 needs the startup agreement (--decode N or --tf, comm exchange) "
                                         "so both ranks are checked to run the same indexer identity");
@@ -1207,11 +1210,23 @@ int main(int argc, char** argv) {
             namespace FA = strix::glm::fast;
             const std::size_t pe = std::min(prompt.find(','), prompt.size());
             const auto toks = read_u32(prompt.substr(0, pe));
-            for (int k = 0; k < 7; ++k) {
+            // STRIX_GLM_ABA_RUNS=n (odd, 3..7; default 7): shorter series for long prompts (each run prefills again).
+            const int aba_runs = std::getenv("STRIX_GLM_ABA_RUNS") != nullptr ? std::clamp(std::atoi(std::getenv("STRIX_GLM_ABA_RUNS")) | 1, 3, 7) : 7;
+            for (int k = 0; k < aba_runs; ++k) {
                 const bool b = k % 2 == 1;
-                TB::set_table_enabled(b);
-                if (b) FA::set_scores_auto();
-                else FA::set_scores_schedule(FA::DenseSchedule::kLane);
+                // STRIX_GLM_ABA_XBPUB=1: the same series over the decode producer publication instead (A off, B on).
+                static const bool xbpub = std::getenv("STRIX_GLM_ABA_XBPUB") != nullptr && std::string(std::getenv("STRIX_GLM_ABA_XBPUB")) == "1";
+                // STRIX_GLM_ABA_FOLD=1: the same series over the exchange row fold (A off, B on; needs STRIX_GLMX_FOLD=rows).
+                static const bool xfold = std::getenv("STRIX_GLM_ABA_FOLD") != nullptr && std::string(std::getenv("STRIX_GLM_ABA_FOLD")) == "1";
+                if (xbpub) {
+                    ge::set_decode_producer_publish(b ? 1 : 0);
+                } else if (xfold) {
+                    strix::glm::xfer::XferExchange::set_fold_enabled(b);
+                } else {
+                    TB::set_table_enabled(b);
+                    if (b) FA::set_scores_auto();
+                    else FA::set_scores_schedule(FA::DenseSchedule::kLane);
+                }
                 eng.reset(0);
                 std::uint32_t nx = eng.prefill(0, toks, 0);
                 std::vector<std::uint32_t> out{nx};
@@ -1235,6 +1250,8 @@ int main(int argc, char** argv) {
             }
             TB::set_table_enabled(true);
             FA::set_scores_auto();
+            ge::set_decode_producer_publish(-1);
+            strix::glm::xfer::XferExchange::set_fold_enabled(true);
         }
         // --aba-xch N: in-process A B A B A B A of the decode exchange, A = CommExchange (the Communicator), B =
         // XferExchange borrowing the communicator's transport (one load, same session). Per run: reset slots 0..R-1 and

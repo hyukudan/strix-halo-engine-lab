@@ -177,6 +177,15 @@ inline int integer(const char* name, int fallback) {
     return v;
 }
 
+// Number in [lo, hi], strict (env_number: unset or empty gives `fallback`, anything else must parse whole and
+// lie in range, or std::invalid_argument names the variable), recorded with the value it resolved to.
+template <class T>
+T number(const char* name, T fallback, T lo = std::numeric_limits<T>::lowest(), T hi = std::numeric_limits<T>::max()) {
+    const T v = env_number<T>(name, fallback, lo, hi);
+    record(name, std::getenv(name), std::to_string(v));
+    return v;
+}
+
 // Raw text switch (nullptr when unset), recorded for the effective config.
 inline const char* text(const char* name) {
     const char* raw = std::getenv(name);

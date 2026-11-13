@@ -199,7 +199,8 @@ float key_value(std::uint32_t k) {  // inverse of ordered_key
     std::memcpy(&f, &u, 4);
     return f;
 }
-void glm_case(unsigned t0, unsigned C, bool timing, bool bounded) {
+// staged: the bounded call gets its pools one window at a time (the earlier windows are not addressable later).
+void glm_case(unsigned t0, unsigned C, bool timing, bool bounded, bool staged = false) {
     const unsigned Pmax = (t0 + C) / kKpool, kcap = bounded ? P::kIndexerKeyStride : Pmax;
     Clusters cl(kIdxDim);
     std::uniform_int_distribution<unsigned> pick(0, 15);
@@ -218,13 +219,17 @@ void glm_case(unsigned t0, unsigned C, bool timing, bool bounded) {
     std::uint32_t* cnt = dev(std::vector<std::uint32_t>(C));
     const auto run = [&] {
         hok(hipMemcpy(dwh, wh.data(), wh.size() * sizeof(float), hipMemcpyHostToDevice), "wh");
-        if (bounded) P::indexer_select_rows_bounded(slot, t0, dq, dwh, keys, tok, cnt, C, nullptr);
+        if (bounded && staged)
+            P::indexer_select_rows_bounded(slot, t0, dq, dwh, keys, tok, cnt, C, nullptr, 0, [&](unsigned begin, unsigned) {
+                return static_cast<const float*>(slot.pooled) + std::size_t{begin} * kIdxDim;
+            });
+        else if (bounded) P::indexer_select_rows_bounded(slot, t0, dq, dwh, keys, tok, cnt, C, nullptr);
         else P::indexer_select_rows_versions(slot, t0, dq, dwh, keys, kcap, tok, cnt, C, nullptr, 3, 2);
     };
-    const char* modes[3] = {"0", "1", "f16"};
-    std::vector<std::uint32_t> k[3], t[3], c[3];
-    float ms[3]{};
-    for (unsigned m = 0; m < 3; ++m) {
+    const char* modes[4] = {"0", "1", "f16", "exact"};
+    std::vector<std::uint32_t> k[4], t[4], c[4];
+    float ms[4]{};
+    for (unsigned m = 0; m < 4; ++m) {
         set_mode(modes[m]);
         hok(hipMemset(keys, 0xa5, std::size_t{C} * kcap * 4), "sentinel");
         run();
@@ -253,6 +258,17 @@ void glm_case(unsigned t0, unsigned C, bool timing, bool bounded) {
     for (unsigned r = 0; r < C; ++r) {
         const unsigned Pr = (t0 + r + 1) / kKpool;
         if (Pr > kIdxPools) flops += 2.0 * kIdxHeads * kIdxDim * Pr;
+    }
+    {  // exact: the token lists of the v3 path, entry for entry (WMMA scores + exact rescoring of the cut-off)
+        std::size_t bad = 0;
+        for (unsigned r = 0; r < C; ++r) {
+            bad += c[0][r] != c[3][r] ? 1U : 0U;
+            for (unsigned i = 0; i < c[0][r] && i < P::kMaxTokens; ++i)
+                bad += t[0][std::size_t{r} * P::kMaxTokens + i] != t[3][std::size_t{r} * P::kMaxTokens + i] ? 1U : 0U;
+        }
+        check(bad == 0, std::string("glm exact mode: token lists equal to v3, t0=") + std::to_string(t0) + ", differing entries " +
+                            std::to_string(bad));
+        std::printf("glm %s t0=%u C=%u op=exact: token lists identical to v3 (%u rows)\n", staged ? "staged" : bounded ? "bounded" : "single", t0, C, C);
     }
     for (unsigned m = 1; m < 3; ++m) {
         strix::attn_core::idx::Audit audit;
@@ -286,8 +302,9 @@ void glm_case(unsigned t0, unsigned C, bool timing, bool bounded) {
                     t0, C, modes[m], rel, rows > 0 ? tok_recall / rows : 1.0, rows, audit.line("glm").c_str());
     }
     if (timing)
-        std::printf("glm %s t0=%u C=%u scores: exact v3 %.3f ms (%.2f TF/s), wmma bf16 %.3f ms (%.2f TF/s, %.2fx), f16 %.3f ms (%.2fx)\n",
-                    bounded ? "bounded" : "single", t0, C, ms[0], flops / ms[0] / 1e9, ms[1], flops / ms[1] / 1e9, ms[0] / ms[1], ms[2], ms[0] / ms[2]);
+        std::printf("glm %s t0=%u C=%u scores: exact v3 %.3f ms (%.2f TF/s), wmma bf16 %.3f ms (%.2f TF/s, %.2fx), f16 %.3f ms (%.2fx), exact %.3f ms (%.2fx)\n",
+                    staged ? "staged" : bounded ? "bounded" : "single", t0, C, ms[0], flops / ms[0] / 1e9, ms[1], flops / ms[1] / 1e9, ms[0] / ms[1], ms[2], ms[0] / ms[2],
+                    ms[3], ms[0] / ms[3]);
     for (void* q : {static_cast<void*>(slot.pooled), static_cast<void*>(dq), static_cast<void*>(dwh), static_cast<void*>(keys),
                     static_cast<void*>(tok), static_cast<void*>(cnt)})
         hok(hipFree(q), "free");
@@ -306,7 +323,9 @@ int main(int argc, char** argv) {
     glm_case(2000, 300, false, false);   // rows below / above the 512-pool threshold
     glm_case(4096, 2048, true, false);
     glm_case(20000, 1000, false, true);  // windowed (pools > 4096)
+    glm_case(20000, 1000, false, true, true);  // windowed, pools staged per window
     if (!quick) glm_case(28672, 2048, true, true);
+    if (!quick) glm_case(28672, 2048, true, true, true);
 #endif
     std::printf("%s\n", failures ? "IDX-WMMA FAIL" : "IDX-WMMA PASS");
     return failures ? 1 : 0;

@@ -14,6 +14,9 @@
 #include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
 
+#include "../core/hadamard.hpp"
+#include "../core/packed_decoder.hpp"
+
 namespace strix::moe_core {
 
 using Half2 = _Float16 __attribute__((ext_vector_type(2)));
@@ -23,36 +26,11 @@ __host__ __device__ constexpr unsigned vector_splits(unsigned input, unsigned ou
     return output <= 1024 ? 32U : (output <= 4096 && input >= 4096 ? 16U : 4U);
 }
 
-// RN32 boundary before a later RN16 conversion (hadamard.hpp materialize_fp32).
-__device__ __forceinline__ float materialize(float v) {
-    asm volatile("" : "+v"(v));
-    return v;
-}
+// RN32 boundary before a later RN16 conversion: the one core/hadamard.hpp materialize_fp32.
+__device__ __forceinline__ float materialize(float v) { return strix::core::materialize_fp32(v); }
 
-// H32 over 128 values held as lane + 32 j (hadamard.hpp hadamard128): strides 1..16 across lanes, 32 and 64 in
-// registers, then one multiply by RN32(1/sqrt(128)).
-__device__ __forceinline__ void hadamard128(float (&v)[4], unsigned lane) {
-#pragma unroll
-    for (int stride = 1; stride < 32; stride *= 2) {
-#pragma unroll
-        for (int j = 0; j < 4; ++j) {
-            const float peer = __shfl_xor(v[j], stride, 32);
-            v[j] = (lane & static_cast<unsigned>(stride)) ? peer - v[j] : v[j] + peer;
-        }
-    }
-#pragma unroll
-    for (int stride = 1; stride < 4; stride *= 2) {
-#pragma unroll
-        for (int j = 0; j < 4; ++j)
-            if (!(j & stride)) {
-                const float l = v[j], r = v[j + stride];
-                v[j] = l + r;
-                v[j + stride] = l - r;
-            }
-    }
-#pragma unroll
-    for (int j = 0; j < 4; ++j) v[j] = materialize(v[j] * 0x1.6a09e6p-4F);
-}
+// H32 over 128 values held as lane + 32 j: the one core/hadamard.hpp hadamard128 (lane overload).
+using strix::core::hadamard128;
 
 __device__ __forceinline__ float half_bits(std::uint16_t h) { return __half2float(__ushort_as_half(h)); }
 
@@ -109,29 +87,17 @@ __device__ __forceinline__ void transform_values(const float* x, const std::uint
 // against trellis_optimized.hpp mul1_half2)
 template <std::uint32_t Multiplier> __host__ __device__ __forceinline__ std::uint32_t hash16(std::uint32_t state) {
 #if defined(__HIP_DEVICE_COMPILE__)
-    constexpr std::uint32_t adjusted = Multiplier - 1U;
-    constexpr std::uint32_t upper = (adjusted & 0xffff0000U) | 1U;
-    constexpr std::uint32_t lower = adjusted & 65535U;
-    std::uint32_t high, result;
-    asm("v_pk_mul_lo_u16 %0, %1, %2 op_sel:[0,0] op_sel_hi:[0,1]" : "=v"(high) : "v"(state), "s"(upper));
-    asm("v_mad_u32_u16 %0, %1, %2, %1" : "=v"(result) : "v"(high), "s"(lower));
-    return result;
+    return core::packed_decode::hash16_isa<Multiplier>(state);
 #else
     // Emulate the low-u16 operands of the two packed ISA instructions.
     return (state & 65535U) * Multiplier;
 #endif
 }
 __host__ __device__ __forceinline__ Half2 mul1_pair(std::uint32_t first, std::uint32_t second) {
-    const std::uint32_t a = hash16<0x83dcd12dU>(first), b = hash16<0x83dcd12dU>(second);
 #if defined(__HIP_DEVICE_COMPILE__)
-    std::uint32_t low, both;
-    constexpr std::uint32_t seed = 0x64006400U;
-    asm("v_sad_u8 %0, %1, 0, %2" : "=v"(low) : "v"(a), "s"(seed));
-    asm("v_sad_hi_u8 %0, %1, 0, %2" : "=v"(both) : "v"(b), "v"(low));
-    const __half2 d = __hfma2(__builtin_bit_cast(__half2, both), __builtin_bit_cast(__half2, 0x1eee1eeeU),
-                              __builtin_bit_cast(__half2, 0xc931c931U));
-    return __builtin_bit_cast(Half2, d);
+    return __builtin_bit_cast(Half2, core::packed_decode::mul1_half2(first, second));
 #else
+    const std::uint32_t a = hash16<0x83dcd12dU>(first), b = hash16<0x83dcd12dU>(second);
     const auto packed_input = [](std::uint32_t product) {
         const unsigned sum = (product & 255U) + ((product >> 8U) & 255U) +
                              ((product >> 16U) & 255U) + (product >> 24U);
@@ -567,16 +533,15 @@ template <int Bits> struct Exl3Trellis {
     using Norm = moe_core::Norm<Bits>;
     using InputTransform = Exl3Trellis<Bits>;
     static __host__ __device__ __forceinline__ float codebook_value(std::uint32_t state, Mul1 = {}) {
-  // library mul1 codebook (gemm.hip)
-    const std::uint32_t product = state * 0x83dcd12dU;
 #if defined(__HIP_DEVICE_COMPILE__)
-    const unsigned sum = __builtin_amdgcn_udot4(product, 0x01010101U, 0, false);
+    return core::codebook_value(state, 2);
 #else
+    const std::uint32_t product = state * 0x83dcd12dU;
     const unsigned sum = (product & 255U) + ((product >> 8U) & 255U) +
                          ((product >> 16U) & 255U) + (product >> 24U);
-#endif
     return __half2float(__float2half_rn(fmaf(static_cast<float>(1024 + sum), __half2float(__ushort_as_half(0x1eee)),
                                              __half2float(__ushort_as_half(0xc931)))));
+#endif
     }
 static __device__ __forceinline__ float codebook_value_v2(std::uint32_t state) {
     const std::uint32_t product = state * 0x83dcd12dU;

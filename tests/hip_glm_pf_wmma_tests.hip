@@ -16,6 +16,7 @@
 #include <random>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace M = strix::glm::moe;
@@ -47,12 +48,13 @@ M::Exl3 make_matrix(std::mt19937& rng, unsigned K, unsigned N, unsigned bits) {
     ok(hipMemcpy(dv, svh.data(), N * 2, hipMemcpyHostToDevice), "v");
     return {dt, ds, dv, K, N, bits};
 }
-struct Drift { double rel_l2 = 0, max_rel = 0; std::size_t equal = 0, n = 0; bool finite = true; };
+struct Drift { double rel_l2 = 0, max_rel = 0; std::size_t equal = 0, n = 0, nonfinite = 0, first_nonfinite = 0; bool finite = true; };
 Drift drift(const std::vector<float>& ref, const std::vector<float>& got) {
     Drift d;
     double num = 0, den = 0, amax = 0, dmax = 0;
     for (std::size_t i = 0; i < ref.size(); ++i) {
         d.finite = d.finite && std::isfinite(ref[i]) && std::isfinite(got[i]);
+        if (!std::isfinite(ref[i]) || !std::isfinite(got[i])) { if (!d.nonfinite++) d.first_nonfinite = i; continue; }
         const double e = static_cast<double>(got[i]) - ref[i];
         num += e * e; den += static_cast<double>(ref[i]) * ref[i];
         amax = std::max(amax, std::fabs(static_cast<double>(ref[i])));
@@ -72,6 +74,7 @@ constexpr double kLinL2 = 2e-6, kLinMax = 5e-6, kF16L2 = 1e-4, kF16Max = 1e-3;
 bool gate(const Drift& d, const std::string& name, double l2 = kLinL2, double mx = kLinMax) {
     std::printf("DRIFT %s rel_l2=%.3e max_rel=%.3e bitequal=%.4f n=%zu\n", name.c_str(), d.rel_l2, d.max_rel,
                 d.n ? static_cast<double>(d.equal) / static_cast<double>(d.n) : 0.0, d.n);
+    if (!d.finite) std::printf("NONFINITE %s count=%zu first=%zu\n", name.c_str(), d.nonfinite, d.first_nonfinite);
     const bool pass = d.finite && d.rel_l2 <= l2 && d.max_rel <= mx;
     check(pass, name + " drift band");
     return pass;
@@ -104,15 +107,17 @@ __global__ void dot64_kernel(const _Float16* t, const float* w, unsigned K, unsi
 // Arms: 0 exact X3 / V11, 1 WMMA 64-row tiles, 2 WMMA default (128-row tiles, two output tiles per wave, MoE remainders
 // of 65..127 rows on a 128-row tile), 3 the same with those remainders on the 64-row tail kernel, 4 default with each
 // group's 128-row tiles in one CTA instead of two (the default), 5 default with one output tile per wave (CP 1).
-// Arms 1-5: same bits. Every arm sets every knob explicitly (arm 0 sets WMMA=0), so inherited settings cannot
+// Arm 6: default with the WMMA chains of row fragments past a ragged tile's rows computed (LIVE_FRAG=0).
+// Arms 1-6: same bits. Every arm sets every knob explicitly (arm 0 sets WMMA=0), so inherited settings cannot
 // collapse two arms into one.
-constexpr unsigned kArms = 6;
+constexpr unsigned kArms = 7;
 void arm_env(unsigned arm) {
     env("STRIX_GLM_PF_WMMA", arm ? "1" : "0");
     env("STRIX_GLM_PF_WMMA_ROWS", arm == 1 ? "64" : "128");
     env("STRIX_GLM_PF_WMMA_TAIL128", arm == 3 ? "0" : "1");
     env("STRIX_GLM_PF_WMMA_SPLIT", arm == 4 ? "1" : "2");
     env("STRIX_GLM_PF_WMMA_CP", arm == 5 ? "1" : "2");
+    env("STRIX_GLM_PF_WMMA_LIVE_FRAG", arm == 6 ? "0" : "1");
     env("STRIX_GLM_PF_EXACTMOE_TM", nullptr);
     env("STRIX_GLM_PF_EXACTMOE_PLAN", nullptr);
 }
@@ -226,7 +231,7 @@ void dense(std::mt19937& rng, hipStream_t s, unsigned reps) {
     }
 }
 
-void moe(std::mt19937& rng, hipStream_t s, unsigned reps) {
+void moe(std::mt19937& rng, hipStream_t s, unsigned reps, bool classes_only) {
     constexpr unsigned MaxR = 4096;
     std::vector<M::ExpertSlices> experts(E);
     for (auto& e : experts) e = {make_matrix(rng, H, I, 4), make_matrix(rng, H, I, 4), make_matrix(rng, I, H, 4)};
@@ -246,7 +251,12 @@ void moe(std::mt19937& rng, hipStream_t s, unsigned reps) {
     // Mode 2 forced group sizes: the 64/128-row tile edges, the 65..127 remainder promotion, split-2 ownership, and one
     // hot expert spanning several split iterations (1100 rows; sizes that do not fit in R are skipped).
     const unsigned forced[] = {64U, 65U, 127U, 128U, 129U, 192U, 193U, 255U, 256U, 257U, 1100U};
-    for (unsigned R : {128U, 333U, 2048U, 4096U}) for (unsigned mode : {0U, 1U, 2U}) {
+    // Mode 3 (row classes): every expert holds exactly R / 36 rows, so every routed tile is the same ragged tile:
+    // 33, 40, 48 rows (64-row tiles, MT 4: 3 of 4 row fragments live), 65, 80, 96, 112 rows (128-row tiles: 5..7 of 8).
+    std::vector<std::pair<unsigned, unsigned>> cases;
+    if (!classes_only) for (unsigned R : {128U, 333U, 2048U, 4096U}) for (unsigned mode : {0U, 1U, 2U}) cases.emplace_back(R, mode);
+    for (unsigned c : {33U, 40U, 48U, 65U, 80U, 96U, 112U}) cases.emplace_back(c * 36U, 3U);
+    for (const auto& [R, mode] : cases) {
         // mode 0 lognormal popularity, mode 1 group sizes 1..64 first (every tail bucket), mode 2 forced sizes, then
         // lognormal
         std::vector<double> pop(E); std::normal_distribution<double> nd(0.0, 1.2);
@@ -254,6 +264,7 @@ void moe(std::mt19937& rng, hipStream_t s, unsigned reps) {
         std::discrete_distribution<unsigned> dd(pop.begin(), pop.end());
         std::vector<std::vector<unsigned>> rows(R);
         if (mode == 1) { unsigned first = 0; for (unsigned c = 1; c <= 64 && first + c <= R; ++c) { for (unsigned r = first; r < first + c; ++r) rows[r].push_back(c - 1); first += c; } }
+        if (mode == 3) for (unsigned r = 0; r < R; ++r) for (unsigned j = 0; j < Top; ++j) rows[r].push_back((r * Top + j) % E);
         if (mode == 2) {
             // Experts 0..10 get exactly the forced sizes (each row takes at most one of them; the rest of the row
             // draws from 64..287, so no other row lands in a forced group).
@@ -303,13 +314,21 @@ void moe(std::mt19937& rng, hipStream_t s, unsigned reps) {
             check(std::all_of(tail, tail + 64, [](std::uint32_t t) { return t == 0xffffffffU; }), name + " arm=" + std::to_string(arm) + " padding untouched");
         }
         gate(drift(res[0][1], res[1][1]), name + " gate/up");
-        gate(drift(res[0][2], res[1][2]), name + " pair-output", kF16L2, kF16Max);
+        // Routed slots only: with the combine in the shared down's epilogue (the default) neither route writes a
+        // pair-output row for the shared slot (slot 8 of each row keeps the poison), so that slot has nothing to gate.
+        const auto routed = [&](const std::vector<float>& v) {
+            std::vector<float> o;
+            o.reserve(std::size_t{R} * 8 * H);
+            for (unsigned r = 0; r < R; ++r) o.insert(o.end(), v.begin() + static_cast<std::ptrdiff_t>(std::size_t{r} * 9 * H), v.begin() + static_cast<std::ptrdiff_t>((std::size_t{r} * 9 + 8) * H));
+            return o;
+        };
+        gate(drift(routed(res[0][2]), routed(res[1][2])), name + " pair-output", kF16L2, kF16Max);
         gate(drift(res[0][0], res[1][0]), name + " R16", kF16L2, kF16Max);
         for (unsigned arm = 0; arm < kArms; ++arm)
             if (!res_dev[arm].empty()) same_bits(res[arm][0], res_dev[arm], name + " arm " + std::to_string(arm) + " device plan");
         for (unsigned arm = 2; arm < kArms; ++arm)
             for (unsigned b = 0; b < 3; ++b) same_bits(res[1][b], res[arm][b], name + " arm " + std::to_string(arm) + " buffer " + std::to_string(b));
-        if (reps && R >= 2048) {
+        if (reps && (R >= 2048 || mode == 3)) {
             double t[kArms][2];
             for (unsigned rep = 0; rep < 2; ++rep) for (unsigned o = 0; o < kArms; ++o) {
                 const unsigned arm = rep ? kArms - 1U - o : o;  // ABCD DCBA
@@ -321,6 +340,9 @@ void moe(std::mt19937& rng, hipStream_t s, unsigned reps) {
             const double tf = static_cast<double>(R) * 9.0 * 6.0 * H * I / 1e9;
             std::printf("TIME %s whole-call V11 %.3f ms (%.2f TF) wmma-64 %.3f ms (%.2f TF) ratio %.3f wmma-default %.3f ms (%.2f TF) ratio %.3f wmma-tail64 %.3f ms ratio %.3f wmma-split1 %.3f ms ratio %.3f wmma-cp1 %.3f ms ratio %.3f\n",
                         name.c_str(), a, tf / a, b, tf / b, b / a, c8, tf / c8, c8 / a, c1, c1 / a, c2, c2 / a, c5, c5 / a);
+            const double c6 = std::min(t[6][0], t[6][1]);
+            std::printf("TIME %s rows/expert %u live-fragments %.3f ms all-fragments %.3f ms ratio %.4f (pairs %.4f %.4f)\n", name.c_str(),
+                        mode == 3 ? R / 36U : 0U, c8, c6, c8 / c6, t[2][0] / t[6][0], t[2][1] / t[6][1]);
         }
         arm_env(0);
         env("STRIX_GLM_PF_EXACTMOE_V", nullptr);
@@ -331,17 +353,18 @@ void moe(std::mt19937& rng, hipStream_t s, unsigned reps) {
 int main(int argc, char** argv) {
     try {
         unsigned reps = 7;
-        bool do_dense = true, do_moe = true;
+        bool do_dense = true, do_moe = true, classes = false;
         for (int i = 1; i < argc; ++i) {
             if (std::strcmp(argv[i], "--no-timing") == 0) reps = 0;
             else if (std::strcmp(argv[i], "--dense") == 0) do_moe = false;
             else if (std::strcmp(argv[i], "--moe") == 0) do_dense = false;
-            else throw std::invalid_argument("usage: strix-hip-glm5-pf-wmma-tests [--no-timing] [--dense | --moe]");
+            else if (std::strcmp(argv[i], "--moe-classes") == 0) { do_dense = false; classes = true; }
+            else throw std::invalid_argument("usage: strix-hip-glm5-pf-wmma-tests [--no-timing] [--dense | --moe | --moe-classes]");
         }
         std::mt19937 rng(0x77a11ee5U);
         hipStream_t s; ok(hipStreamCreate(&s), "stream");
         if (do_dense) dense(rng, s, reps);
-        if (do_moe) moe(rng, s, reps);
+        if (do_moe) moe(rng, s, reps, classes);
         ok(hipStreamDestroy(s), "stream");
     } catch (const std::exception& e) {
         check(false, e.what());

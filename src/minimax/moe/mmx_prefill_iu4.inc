@@ -89,10 +89,8 @@ void launch_i4_chain(const Tables& t,const I4Layer& q,const float* x,float* out,
     // call runs at most plan 1 on its own tile list. GSave keeps the pass-0 gate in a global FP32
     // scratch (exact, L2-resident, same thread reads it back) so both calls share the selected plan.
     const bool gsv=st::moe_i4::gsave_enabled();
-    const int plan=iu4_plan(t.pairs,strix::core::moe_i4::kPlan2Rows), pplan=gsv||plan<1 ? plan : 1;
-    const auto ptiles=static_cast<unsigned>(st::iu4_grouped_max_tiles(t.pairs,kI4Experts,pplan));
-    const auto dtiles=static_cast<unsigned>(st::iu4_grouped_max_tiles(t.pairs,kI4Experts,plan));
-    const unsigned max_tiles=ptiles>dtiles ? ptiles : dtiles;
+    const auto cp=st::moe_i4::chain_plan<I4Binding>(iu4_plan(t.pairs,strix::core::moe_i4::kPlan2Rows),gsv ? std::size_t(t.pairs)*kInter : 0,t.pairs);
+    const unsigned max_tiles=st::moe_i4::chain_max_tiles(cp,t.pairs,kI4Experts);
     const std::size_t tile_bytes=align256(max_tiles*sizeof(st::IU4GroupTile));
     const std::size_t qbytes=align256(std::size_t(t.pairs)*(kInter/2));
     const std::size_t sbytes=align256(std::size_t(t.pairs)*(kInter/64)*4);
@@ -121,11 +119,9 @@ void launch_i4_chain(const Tables& t,const I4Layer& q,const float* x,float* out,
         (I4ReferenceSchedule{{x,out,t,false,true},gq,gs}));
     iu4_ok(hipGetLastError(),"chain gather + quantiser");
     mark("gather",stream);
-    iu4_ok(st::build_iu4_grouped_tiles(groups,kI4Experts,pplan,tiles,ntiles,ptiles,stream),"chain tiles");
-    iu4_ok(st::moe_i4::launch<true>(pplan,b,w,tiles,ntiles,ptiles,gq,gs,aq,as,stream,gv),"chain paired gate/up");
-    mark("gate_up",stream);
-    if(pplan!=plan) iu4_ok(st::build_iu4_grouped_tiles(groups,kI4Experts,plan,tiles,ntiles,dtiles,stream),"chain down tiles");
-    iu4_ok(st::moe_i4::launch<false>(plan,b,w,tiles,ntiles,dtiles,nullptr,nullptr,aq,as,stream),"chain down");
+    const auto run=st::moe_i4::launch_chain(cp,b,w,groups,kI4Experts,tiles,ntiles,t.pairs,gq,gs,aq,as,gv,stream,
+        [&] { mark("gate_up",stream); });
+    iu4_ok(run.status,run.stage);
     mark("down",stream);
     // Ordered combine of the control: ascending top-k FMA, shared expert last. Deterministic.
     hipLaunchKernelGGL((st::moe_i4::reference_combine_kernel<I4Binding>),dim3((t.rows*kHB+7)/8),dim3(256),0,stream,b,dn,t.rows,kTopE);

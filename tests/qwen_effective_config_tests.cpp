@@ -3371,14 +3371,13 @@ int main(int argc, char** arguments) {
                     "fast profile applies provisional storage through native resolver without permission");
                 expect(moe_prefill_storage_name(got.options.prefill_moe_route_bf16) ==
                     std::string_view(enabled ? "fp16-v1+moeroute16" : "fp16-v1") &&
-                    got.options.product_profile.qualification() == (enabled ? (allow ?
-                        "qualification in progress: qsa_budget,moe_route_bf16; unqualified: gdn_fp16_chunk" :
-                        "qualification in progress: qsa_budget,moe_route_bf16")
+                    got.options.product_profile.qualification() == (enabled ?
+                        "qualification in progress: qsa_budget,moe_route_bf16,gdn_fp16_chunk"
                         : "qualified"),
                     "product receipt and actual storage identity agree");
                 const auto pair = numerical_profile_pair(got.options);
-                // fast with --allow-pending also runs the runnable GDN chunk candidate.
-                const unsigned gdn = enabled && allow ? prefill_option_bit(PrefillOption::gdn_fp16_chunk) : 0U;
+                // fast also runs the provisional GDN chunk candidate.
+                const unsigned gdn = enabled ? prefill_option_bit(PrefillOption::gdn_fp16_chunk) : 0U;
                 expect(got.prefill_option_mask == (kPrefillOptionsReady | gdn),
                     "every product profile retains the governed HC default");
                 const auto composed = prefill_arithmetic_identity(pair, got.prefill_option_mask, false);
@@ -3531,7 +3530,7 @@ int main(int argc, char** arguments) {
             const auto reason = got.options.prefill_moe_route_bf16_reason;
             expect(row && row->status == qwen::profile::Status::pending && row->value == "0" &&
                 row->reason == reason && !reason.empty() && reason != "off" &&
-                got.options.product_profile.qualification() == "qualification in progress: qsa_budget",
+                got.options.product_profile.qualification() == "qualification in progress: qsa_budget,gdn_fp16_chunk",
                 "declined row reports builtin, pending and the storage decline reason");
             Environment exported;
             qwen::profile::apply(got.options.product_profile, [&](const char* key, const char* value) {

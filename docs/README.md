@@ -103,6 +103,7 @@ work as it stood on their date; documents marked **Superseded** name their repla
 ## Engine: decode
 
 - [Int8 attention KV cache (kv-int8-tok-v1)](engine/decode/attention-kv-int8.md): Opt-in int8 per-token-scaled QSA attention KV cache (kv-int8-tok-v1): storage layout, admission, validation.
+- [Exchange row fold](engine/decode/exchange-row-fold.md): Opt-in CPU fold of the one-row decode all-reduce on the exchange progress thread; switches, exactness gates and the work/wait measurement ([es](engine/decode/exchange-row-fold.es.md)).
 - [Deferred eager MoE status](engine/decode/deferred-moe-status.md): Deferred eager MoE completion-status policy; included in adopted automatic v3 profile.
 - [Requested generation output](engine/decode/generation-output.md): --logprob-token: requested token logprobs during serial --generate via bounded ledger.
 - [Experimental scalar greedy output](engine/decode/gpu-greedy-output.md): Experimental --gpu-greedy-token: on-GPU argmax over full LM-head output with validated reply.

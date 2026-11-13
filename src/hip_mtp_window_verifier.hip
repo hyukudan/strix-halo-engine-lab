@@ -671,7 +671,7 @@ std::vector<HipMtpVerifiedTargetRows> HipMtpWindowVerifier::verify_cohort(std::s
         members[a]={owner->window.get(),q.session,p.inputs,p.capture};
         if(q.transaction) {
             require(!sampler && q.verifier->policy_selection_admitted(),"MTP cohort policy route is not serial equivalent");
-            q.transaction->reset();
+            q.transaction->reset();q.transaction->expect(q.candidates);
             p.capture->set_transaction_selection(i.transaction_selection(*q.transaction,p.capture->source_stream(),q.candidates,q.rows,q.budget,q.eos));
         }
         if(sampler) p.capture->set_row_selection(i.sampled_selection(sampler,session.next_position+1U,p.capture->source_stream(),
@@ -1034,7 +1034,7 @@ HipMtpVerifiedTargetRows HipMtpWindowVerifier::verify(SerialSessionContext& sess
     };
     std::shared_ptr<HipMtpTargetWindowCapture> capture;
     struct ClearSelection {std::shared_ptr<HipMtpTargetWindowCapture>& c;~ClearSelection(){if(c){c->set_row_selection({});c->set_transaction_selection({});}}} clear_selection{capture};
-    if(transaction) {require(!sampler && policy_selection_admitted(),"MTP policy route is not serial equivalent");transaction->reset();}
+    if(transaction) {require(!sampler && policy_selection_admitted(),"MTP policy route is not serial equivalent");transaction->reset();transaction->expect(candidates);}
     if(use_window) {
         for(const auto& pool:owner->captures)if(pool->ready_for_reuse()){capture=pool;break;}
         require(!!capture,"MTP window capture pools are retained by previous batch readers");

@@ -257,6 +257,10 @@ public:
     // linears skip their prepare launch (same bits); xb_prep_count = layers that took it.
     void set_xb_prep(bool on);
     [[nodiscard]] bool xb_prep() const;
+    // Exchange row fold (xport/row_fold.hpp, STRIX_MMX_FOLD=rows on the exchange module): when on (default) and the
+    // module has fold slots for the message, the pair sum is computed by its progress thread. Same bits.
+    void set_xb_fold(bool on);
+    [[nodiscard]] bool xb_fold() const;
     [[nodiscard]] std::uint64_t xb_prep_count() const;
     // STRIX_MM_XB_PUBLISH=1 (with XB_INPLACE): the in-place producers (o_proj v4 core, MoE down4, dense down) publish
     // their exchange message themselves (lean form), no publish launch; xb_publish_count = exchanges that took it.

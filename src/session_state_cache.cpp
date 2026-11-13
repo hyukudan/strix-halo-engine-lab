@@ -121,6 +121,8 @@ static std::string numerical_config(std::string_view cli, const RotaryIdentity& 
             value.starts_with("STRIX_QPF2K_COMPACT_IMAGES=")) continue;
         // The last-layer cache-only QSA step writes the same persistent state as the full step.
         if (value.starts_with("STRIX_QSA_CACHE_ONLY=")) continue;
+        // The final-block cone skips rows nothing reads; the host wait policy only changes how the host waits.
+        if (value.starts_with("STRIX_PREFILL_FINAL_CONE=") || value.starts_with("STRIX_HOST_WAIT=")) continue;
         if (value.starts_with("GPU_TURN_") || value.starts_with("GPU_WINDOW=") || value.starts_with("STRIX_HASH_CACHE=")) continue;
         // Startup provenance of injected defaults (qpf2k::pre_injected_env); the values themselves stay bound.
         if (value.starts_with("STRIX_QPF2K_PRE_INJECTED=")) continue;

@@ -29,6 +29,19 @@ inline bool prefill_xor64(bool gsq) {
     const int o=prefill_xor64_override();
     return !qpf2k::suppressed(qpf2k::Item::moe_xor64,gsq)&&(o<0?env:o!=0);
 }
+// Uniform DA16 activation issue (STRIX_QPF2K_MOE_DA16_ISSUE: unset = automatic, 1 = every tune, 0 = the masked issue):
+// every lane issues both image loads of its part through the clamped pointer (moe_core/grouped_f16.hpp). Same operands
+// and stores for every live row. Automatic: the XOR-row tune (88, 3072 to 4914 rows for 512 experts, top-10), where the
+// down phase is 0.7 to 1.5 % shorter; tunes 80 and 82 measured no repeatable change and keep the masked issue.
+inline int& prefill_da16_issue_override(){static int v=-1;return v;}
+inline bool prefill_da16_uniform_issue(unsigned tune) {
+    static const int env=strix::envcfg::integer("STRIX_QPF2K_MOE_DA16_ISSUE", -1);
+    const int o=prefill_da16_issue_override();
+    const int v=o<0?env:o;
+    return v<0?tune==88U:v!=0;
+}
+// The kernel of a DA16 down entry for the selected issue policy (Tune is the caller's): K<Args..., true> or K<Args..., false>.
+#define STRIX_DA16_ISSUE_KERNEL(K,...) (prefill_da16_uniform_issue(Tune)?K<__VA_ARGS__,true>:K<__VA_ARGS__,false>)
 inline int& prefill_da16_override(){static int v=-1;return v;}
 inline bool prefill_da16() {
     if(prefill_moe_gsq_off()&1U)return false;
@@ -106,21 +119,23 @@ __global__ __launch_bounds__((F16TileX<Tune,0U>::Threads)) void project_prefill_
     project_prefill_f16x_da16_entry<Q5K,Tune,true>(gate,up,view,hidden,outputs,a16,arrive,image);
 }
 // Down: down_prefill_f16x (Core 0, no probe bits) with A staged from the image. B, the K chain and the epilogue are the base's.
-template<bool Q51,unsigned Tune>
+template<bool Q51,unsigned Tune,bool UniformA>
 __global__ __launch_bounds__(F16Tile<Tune>::Threads) void down_prefill_f16x_da16(const unsigned char* weights,PrefillRows view,
     unsigned hidden,unsigned width,const uint4* image) {
 #define STRIX_DA16_BATCH_TILE const unsigned batch=blockIdx.y,tile=blockIdx.x;
 #define STRIX_DA16_GUARD if(csr.summary[0]||batch>=csr.summary[2])return;
 #define STRIX_DA16_LDS(S,R) __shared__ __align__(16) S sb[1]; __shared__ R rows;
 #include "strix/env_flags.hpp"
+#define STRIX_DA16_UNIFORM_A UniformA
 #include "hip_moe_da16_down_body.inc"
+#undef STRIX_DA16_UNIFORM_A
 #undef STRIX_DA16_BATCH_TILE
 #undef STRIX_DA16_GUARD
 #undef STRIX_DA16_LDS
 }
 
 // Certificate entry only; base entry and the K pipeline remain unchanged.
-template<bool Q51,unsigned Tune>
+template<bool Q51,unsigned Tune,bool UniformA>
 __global__ __launch_bounds__(F16Tile<Tune>::Threads) void down_prefill_f16x_da16_certificate(const unsigned char* weights,PrefillRows view,
     unsigned hidden,unsigned width,const uint4* image) {
     constexpr bool RouteBF16=false,RouteI8=false;
@@ -129,7 +144,9 @@ __global__ __launch_bounds__(F16Tile<Tune>::Threads) void down_prefill_f16x_da16
 #define STRIX_DA16_GUARD if(csr.summary[0]||batch>=csr.summary[2])return;
 #define STRIX_DA16_LDS(S,R) __shared__ __align__(16) S sb[1]; __shared__ R rows;
 #define STRIX_DA16_CERTIFICATE
+#define STRIX_DA16_UNIFORM_A UniformA
 #include "hip_moe_da16_down_body.inc"
+#undef STRIX_DA16_UNIFORM_A
 #undef STRIX_DA16_CERTIFICATE
 #undef STRIX_DA16_BATCH_TILE
 #undef STRIX_DA16_GUARD
@@ -137,7 +154,7 @@ __global__ __launch_bounds__(F16Tile<Tune>::Threads) void down_prefill_f16x_da16
 }
 
 // Candidate-only entry; the incumbent certificate kernel retains its name and specialization.
-template<bool Q51,unsigned Tune>
+template<bool Q51,unsigned Tune,bool UniformA>
 __global__ __launch_bounds__(F16Tile<Tune>::Threads) void down_prefill_f16x_da16_certificate_bf16(const unsigned char* weights,PrefillRows view,
     unsigned hidden,unsigned width,const uint4* image) {
     constexpr bool RouteBF16=true,RouteI8=false;
@@ -146,14 +163,16 @@ __global__ __launch_bounds__(F16Tile<Tune>::Threads) void down_prefill_f16x_da16
 #define STRIX_DA16_GUARD if(csr.summary[0]||batch>=csr.summary[2])return;
 #define STRIX_DA16_LDS(S,R) __shared__ __align__(16) S sb[1]; __shared__ R rows;
 #define STRIX_DA16_CERTIFICATE
+#define STRIX_DA16_UNIFORM_A UniformA
 #include "hip_moe_da16_down_body.inc"
+#undef STRIX_DA16_UNIFORM_A
 #undef STRIX_DA16_CERTIFICATE
 #undef STRIX_DA16_BATCH_TILE
 #undef STRIX_DA16_GUARD
 #undef STRIX_DA16_LDS
 }
 
-template<bool Q51,unsigned Tune>
+template<bool Q51,unsigned Tune,bool UniformA>
 __global__ __launch_bounds__(F16Tile<Tune>::Threads) void down_prefill_f16x_da16_certificate_i8(const unsigned char* weights,PrefillRows view,
     unsigned hidden,unsigned width,const uint4* image,unsigned route_top_k) {
     constexpr bool RouteBF16=true,RouteI8=true;
@@ -161,7 +180,9 @@ __global__ __launch_bounds__(F16Tile<Tune>::Threads) void down_prefill_f16x_da16
 #define STRIX_DA16_GUARD if(csr.summary[0]||batch>=csr.summary[2])return;
 #define STRIX_DA16_LDS(S,R) __shared__ __align__(16) S sb[1]; __shared__ R rows;
 #define STRIX_DA16_CERTIFICATE
+#define STRIX_DA16_UNIFORM_A UniformA
 #include "hip_moe_da16_down_body.inc"
+#undef STRIX_DA16_UNIFORM_A
 #undef STRIX_DA16_CERTIFICATE
 #undef STRIX_DA16_BATCH_TILE
 #undef STRIX_DA16_GUARD

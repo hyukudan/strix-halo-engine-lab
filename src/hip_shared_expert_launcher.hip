@@ -10,6 +10,7 @@
 #include "hip_q8_rows_gemv.hpp"
 #include "hip_dense_f16_tiled.hpp"
 #include "strix/hip_shared_serving_cohort.hpp"
+#include "strix/known_window_cohort.hpp"
 #include "strix/q8_projection_organization.hpp"
 #include "strix/shared_expert_rows_diagnostic_contract.hpp"
 #if defined(STRIX_BUILD_SHARED_EXPERT_ROWS_DIAGNOSTIC)
@@ -582,6 +583,37 @@ __global__ void __launch_bounds__(kThreads) rows_shared_activation_scalar_kernel
     }
     if (blockIdx.x != 0) return;
     const auto* input = reinterpret_cast<const std::uint16_t*>(input_base + blockIdx.y * input_stride);
+    float sum = 0.0F;
+    for (std::uint32_t feature = static_cast<std::uint32_t>(threadIdx.x); feature < input_width; feature += kThreads)
+        sum += load_activation(&input[feature]) * load_weight<WeightKind::f32>(scalar_weights, input_width, 0, feature);
+    scratch[threadIdx.x] = sum;
+    __syncthreads();
+    for (std::uint32_t stride = kThreads / 2U; stride > 0; stride >>= 1U) {
+        if (threadIdx.x < stride) scratch[threadIdx.x] += scratch[threadIdx.x + stride];
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) workspace[intermediate_size] = 1.0F / (1.0F + expf(-scratch[0]));
+}
+
+// Cohort rows: the same activation and scalar gate as rows_shared_activation_scalar_kernel for rows that are not
+// one strided run (the sessions of a cohort), through per-row addresses: one launch for every session's rows.
+struct SharedActivationRowsSite {
+    std::uint64_t workspace[32];
+    std::uint64_t input[32];
+};
+__global__ void __launch_bounds__(kThreads) rows_shared_activation_scalar_site_kernel(
+    SharedActivationRowsSite site, const void* scalar_weights, std::uint32_t intermediate_size,
+    std::uint32_t input_width) {
+    __shared__ float scratch[kThreads];
+    auto* workspace = reinterpret_cast<float*>(site.workspace[blockIdx.y]);
+    const auto index = static_cast<std::uint32_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (index < intermediate_size) {
+        const float gate = workspace[index];
+        const float up = workspace[intermediate_size + index];
+        workspace[index] = (gate / (1.0F + expf(-gate))) * up;
+    }
+    if (blockIdx.x != 0) return;
+    const auto* input = reinterpret_cast<const std::uint16_t*>(site.input[blockIdx.y]);
     float sum = 0.0F;
     for (std::uint32_t feature = static_cast<std::uint32_t>(threadIdx.x); feature < input_width; feature += kThreads)
         sum += load_activation(&input[feature]) * load_weight<WeightKind::f32>(scalar_weights, input_width, 0, feature);
@@ -2475,7 +2507,24 @@ void known_shared_cohort_enqueue(std::span<const KnownSharedR2Views> segments, s
         q8_rows::launch(site, config.dense_a8_projections, stream, false);
         check_hip(hipGetLastError(), "known-window cohort shared gate/up launch");
     }
-    for (std::size_t k = 0; k < segments.size(); ++k) {
+    // One launch for the rows of every session (STRIX_COHORT_SHARED_ACT_MERGED=0: one launch per session;
+    // in-process A/B: STRIX_COHORT_AB_OFF=sharedact).
+    static const bool merged_activation = strix::envcfg::flag("STRIX_COHORT_SHARED_ACT_MERGED", true);
+    unsigned activation_rows = 0;
+    for (std::size_t k = 0; k < segments.size(); ++k) activation_rows += counts[k];
+    if (merged_activation && activation_rows <= 32U && !known_window_cohort_feature_off("sharedact")) {
+        SharedActivationRowsSite site{};
+        unsigned row = 0;
+        for (std::size_t k = 0; k < segments.size(); ++k)
+            for (unsigned r = 0; r < counts[k]; ++r, ++row) {
+                site.workspace[row] = at(segments[k].workspace, segments[k].shape.workspace_stride_bytes, r);
+                site.input[row] = at(segments[k].input, segments[k].shape.input_stride_bytes, r);
+            }
+        hipLaunchKernelGGL(rows_shared_activation_scalar_site_kernel,
+            dim3((config.intermediate_size + kThreads - 1U) / kThreads, activation_rows), dim3(kThreads), 0, stream, site,
+            reinterpret_cast<const void*>(weights.shared_gate_f32.address), config.intermediate_size, config.hidden_size);
+        check_hip(hipGetLastError(), "known-window cohort shared activation/scalar rows launch");
+    } else for (std::size_t k = 0; k < segments.size(); ++k) {
         const auto& views = segments[k];
         hipLaunchKernelGGL(rows_shared_activation_scalar_kernel, dim3((config.intermediate_size + kThreads - 1U) / kThreads, counts[k]),
             dim3(kThreads), 0, stream, views.workspace.address, views.shape.workspace_stride_bytes, views.input.address,

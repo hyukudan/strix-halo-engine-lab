@@ -12,7 +12,7 @@ target_include_directories(strix_model_description PUBLIC "${REPO_ROOT}/include"
 target_compile_features(strix_model_description PUBLIC cxx_std_20)
 add_library(strix_model_registry STATIC "${REPO_ROOT}/src/model_registry.cpp")
 target_link_libraries(strix_model_registry PUBLIC strix_model_description)
-set(serve_sources json json_constraint constraint_selection bpe_tokenizer chat_template
+set(serve_sources json json_constraint constraint_selection bpe_tokenizer prompt_stream chat_template
     deepseek_chat glm_chat http_server engine api deployment request_fields health)
 add_library(strix_serve STATIC)
 set(STRIX_BUILD_JSON "{\"format\":\"strix-build\",\"revision\":1,\"status\":\"unavailable\"}")
@@ -25,6 +25,7 @@ foreach(source IN LISTS serve_sources)
     target_sources(strix_serve PRIVATE "${REPO_ROOT}/src/serve/${source}.cpp")
 endforeach()
 target_include_directories(strix_serve PUBLIC "${REPO_ROOT}/include")
+target_include_directories(strix_serve PRIVATE "${REPO_ROOT}/src")
 target_compile_features(strix_serve PUBLIC cxx_std_20)
 target_link_libraries(strix_serve PUBLIC Threads::Threads)
 if(WIN32)

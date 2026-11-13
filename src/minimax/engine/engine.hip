@@ -506,6 +506,7 @@ struct Engine::Impl {
     std::vector<hipEvent_t> xb_attn_ev;  // per layer: q/k/v and index projections done (the warm's gate), re-recorded each step
     std::uint64_t xb_warm_o_count = 0;
     bool xb_prep = false;      // STRIX_MM_XB_PREP=1: the FFN post_exchange writes the next layer's q/k/v input transform (no prepare launch)
+    bool xb_fold = true;       // exchange row fold when the module has fold slots (STRIX_MMX_FOLD=rows)
     bool xb_prepped = false;   // the next q/k/v call's inputs were transformed by the post_exchange just enqueued
     unsigned xb_layers = 0;    // layers of the current layers_forward call (the fold needs a next layer)
     bool index_attn = true;  // STRIX_MM_INDEX_PROJ (runtime; default attn = index_proj, decode and prefill)
@@ -524,6 +525,11 @@ struct Engine::Impl {
     bool pf_dense_qkv = true;  // STRIX_MM_PF_DENSE_QKV (default ON): prefill q/k/v in one v4-core call from 1024 rows (same bits as strix_gemm); =0 library
     unsigned pf_idx_rows = 32;
     unsigned pf_msa_rework = 10;  // STRIX_MM_PF_MSA_REWORK: prefill only, default 10 (in-block chunk loop, LDS-staged block list/partials, no global partials); =8 (= 7 with the 16-key tile max as an exact ds_swizzle lane tree) / =7 / =6 / =5 / =3 previous defaults, =0 original, =9 DPP diagnostic
+    // STRIX_MM_PF_MSA_FLASH (FAST, lossy, opt-in; 1 | 2): prefill MSA attention of windows > 8 rows on the shared BF16 WMMA key-split
+    // flash core instead of the exact in-block kernel; selection, block lists and K/V caches unchanged.
+    unsigned pf_msa_flash = 0;
+    static constexpr const char* kMsaFlashLayers = "40-59";  // measured on the EXL3 format: passes the 8K FAST gate with either operand form; 20-59 does not
+    strix::core::LayerSet pf_msa_flash_layers;  // STRIX_MM_PF_MSA_FLASH_LAYERS: layers that use it (unset: kMsaFlashLayers)
     bool pf_msa_batch = true;  // STRIX_MM_PF_MSA_BATCH (default ON, exact measurement): independent scratch per prefill window
     unsigned pf_msa_windows = 0;
     float *pf_scores = nullptr, *pf_partial = nullptr;
@@ -797,6 +803,21 @@ struct Engine::Impl {
             else if (m != "exl3") throw std::invalid_argument("STRIX_MMX_MODEL_FORMAT must be exl3 or fast_i4");
         }
         i4_shadow = env_flag("STRIX_MMX_FAST_I4_SHADOW", false);
+        // FAST identity (lossy): 1 = one-term BF16 operands, 2 = two-term (hi + lo) queries and probabilities, 0 = the
+        // exact in-block kernel (default: opt-in, also with the FAST_I4 format, whose INT4 layers amplify the change
+        // past the gate). The layer set defaults to the deepest layers (kMsaFlashLayers): the quality gate fails
+        // when shallower layers use it, because every later block selection sees the changed activations.
+        if (const char* fl = std::getenv("STRIX_MM_PF_MSA_FLASH")) {
+            const std::string mode = fl;
+            if (mode != "0" && mode != "1" && mode != "2") throw std::invalid_argument("STRIX_MM_PF_MSA_FLASH must be 0, 1 or 2");
+            pf_msa_flash = static_cast<unsigned>(mode[0] - '0');
+        }
+        {
+            const char* fl = std::getenv("STRIX_MM_PF_MSA_FLASH_LAYERS");
+            pf_msa_flash_layers = strix::core::parse_layer_set(fl == nullptr || fl[0] == 0 ? kMsaFlashLayers : fl, 0, kLayers, "STRIX_MM_PF_MSA_FLASH_LAYERS");
+        }
+        if (pf_msa_flash != 0)
+            std::fprintf(stderr, "prefill identity mm-pf-msa-flash FAST (bf16 WMMA key-split MSA attend, %u-term operands, %u layers)\n", pf_msa_flash, pf_msa_flash_layers.count());
         if (i4_shadow && !model_fast_i4)
             throw std::invalid_argument("STRIX_MMX_FAST_I4_SHADOW needs STRIX_MMX_MODEL_FORMAT=fast_i4");
         if (model_fast_i4) {
@@ -1458,6 +1479,9 @@ struct Engine::Impl {
             xb_tx = nullptr;
             xb_pt = {};
             xb_published = false;
+            // STRIX_MMX_FOLD=N (xport row fold): for at most N rows the pair sum p0 + p1 is computed by the exchange
+            // progress thread before the RX flag; post_exchange reads one folded slot (x = h + folded, same bits).
+            if (xb_fold && xf->can_fold(bytes)) xf->fold_next(strix::xport::RowFold::sum_f32);
             const auto xticket = inplace
                 ? backend.post_publish(tag, bytes, self_pub ? mx::Publish::producer : mx::Publish::kernel)
                 : backend.post_copy(tag, local, bytes);
@@ -1480,6 +1504,10 @@ struct Engine::Impl {
             wts4_d = reinterpret_cast<float*>(route_d + n * kTopE);
             pv.part0 = opt.rank == 0 ? local : peer;
             pv.part1 = opt.rank == 0 ? peer : local;
+            if (const void* folded = xf->last_folded()) {
+                pv.part0 = static_cast<const float*>(folded);
+                pv.part1 = nullptr;
+            }
             pv.weights = wts4_d;
             xb_prepped = false;
             if (xb_prep && which == 1 && layer + 1 < xb_layers && linears_opt) {  // fold the next layer's q/k/v prepare
@@ -1819,7 +1847,7 @@ struct Engine::Impl {
                         dv.idx_count = pf_cnt;
                         dv.partial = pf_partial;
                         dv.ticket = pf_ticket;
-                        mfused::enqueue_prefill({dv, static_cast<std::uint32_t>(n), pos0, pf_msa_windows, 0, pf_idx_tile && n > 8, pf_idx_rows, n > 8 ? pf_msa_rework : 0U}, nullptr, tl ? PrefillTimeline::msa_mark : nullptr, tl);
+                        mfused::enqueue_prefill({dv, static_cast<std::uint32_t>(n), pos0, pf_msa_windows, 0, pf_idx_tile && n > 8, pf_idx_rows, n > 8 ? (pf_msa_flash != 0 && pf_msa_rework != 0 && pf_msa_flash_layers.test(L) ? 10U + pf_msa_flash : pf_msa_rework) : 0U}, nullptr, tl ? PrefillTimeline::msa_mark : nullptr, tl);
                         break;
                     }
                     mfused::enqueue_decode(dv, nullptr);
@@ -3367,6 +3395,8 @@ void Engine::set_xb_inplace(bool on) { impl_->xb_inplace = on; }
 bool Engine::xb_inplace() const { return impl_->xb_inplace; }
 std::pair<std::uint64_t, std::uint64_t> Engine::xb_counts() const { return {impl_->xb_count[0], impl_->xb_count[1]}; }
 void Engine::set_xb_prep(bool on) { impl_->xb_prep = on; }
+void Engine::set_xb_fold(bool on) { impl_->xb_fold = on; }
+bool Engine::xb_fold() const { return impl_->xb_fold; }
 bool Engine::xb_prep() const { return impl_->xb_prep; }
 std::uint64_t Engine::xb_prep_count() const { return impl_->xb_count[2]; }
 void Engine::set_xb_publish(bool on) {

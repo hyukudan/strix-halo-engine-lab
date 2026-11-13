@@ -29,6 +29,18 @@ public:
 
     // parse_special: control and user-defined token texts in `text` become their IDs.
     [[nodiscard]] std::vector<std::uint32_t> encode(std::string_view text, bool parse_special = true) const;
+    // Incremental form of encode(). The caller keeps `text` unchanged and a cursor that starts at zero; each call
+    // encodes about `slice_bytes` more text and appends the ids, which are final: the ids appended over all calls are
+    // exactly encode(text, parse_special). Returns false (and appends nothing) once the text is fully encoded.
+    // A slice ends at a special token or between an ASCII letter and a following space, where every implemented
+    // pre-tokenizer starts a new piece whatever follows; a text without such places is encoded in one final call.
+    struct EncodeCursor {
+        std::size_t encoded = 0;  // bytes [0, encoded) are encoded
+        std::size_t scanned = 0;  // bytes [encoded, scanned) hold no special token start
+        std::size_t searched = 0; // no slice end exists in (encoded, searched]
+    };
+    bool encode_some(std::string_view text, bool parse_special, EncodeCursor& cursor, std::size_t slice_bytes,
+                     std::vector<std::uint32_t>& out) const;
     // Raw bytes of the tokens; control tokens are rendered as their text unless skip_control.
     [[nodiscard]] std::string decode(std::span<const std::uint32_t> ids, bool skip_control = false) const;
     [[nodiscard]] std::string token_bytes(std::uint32_t id) const;

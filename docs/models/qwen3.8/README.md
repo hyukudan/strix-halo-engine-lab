@@ -79,8 +79,8 @@ One switch selects a product profile for Qwen (CLI, `--http-serve` and the MTP r
   in progress. The receipt stamps `qualification in progress: moe_route_bf16` and marks the row `provisional`;
   one stderr line discloses the bit change and qualification status. Elsewhere, including HTTP and MTP,
   the row stays `pending` with the decline reason, keeps FP32 route storage and is not exported or stamped as applied.
-  Attention selection budget, FP16 chunked recurrence and FP16 output head remain pending and keep their builtin paths,
-  with one notice each; the FP16 chunked recurrence row is runnable (`--allow-pending` runs it, stamped `unqualified`).
+  The attention selection budget (1536) and the FP16 chunked recurrence (`STRIX_QPF2K_GDN_FP16_CHUNK=1`) are provisional
+  rows too and are applied the same way; the FP16 output head remains pending and keeps its builtin path, with one notice.
 - `quality`: there is no quality pack for this model, so it runs `default` and says so in the receipt.
 
 `--allow-pending` (or `STRIX_QWEN_PROFILE_ALLOW_PENDING=1`) runs genuinely pending options whose code is in
@@ -305,8 +305,8 @@ serial route, `--profile default` vs `--profile fast`, two interleaved pairs) pr
 **Chunked GDN prefill on FP16 WMMA — opt-in candidate, pending qualification.** `STRIX_QPF2K_GDN_FP16_CHUNK=1`
 (or `--gdn-fp16-chunk 1`) runs the GDN layers' conv, recurrence and gated norm as 32-row chunks on FP16 WMMA with FP32
 accumulation and FP32 state (identity `qwen-gdn-fp16-chunk rev 2`; the input projection then writes its BF16-rounded
-values as BF16 rows). It is bit-changing, default OFF; `--profile fast` lists it as pending until it passes fidelity
-qualification (`--allow-pending` runs it, stamped `unqualified`). Same build, plain CLI, interleaved pairs: 4K
+values as BF16 rows). It is bit-changing, default OFF; `--profile fast` applies it as a provisional row
+(qualification in progress; 8K screen with the other fast rows: KL 0.0040, top-1 97.5 %). Same build, plain CLI, interleaved pairs: 4K
 **2.42 → 2.36 s (−2.6 %)**, 32K **19.61 → 18.81 s (−4.1 %)**, 262K **177.9 → 170.0 s (−4.5 %, 1,471 → 1,539 tok/s; one pair)**; the first generated tokens match the
 exact route. Unset or `=0` is the exact route. See the [catalog](../../optimizations.md#qwen-gdn-chunk).
 

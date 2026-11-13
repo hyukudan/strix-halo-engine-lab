@@ -13,6 +13,7 @@
 #include <type_traits>
 #include "integer_operand.hpp"
 #include "integer_grouped_schedule.hpp"
+#include "load_cohort.hpp"
 
 namespace strix::core {
 namespace wmma_tiled {
@@ -301,7 +302,14 @@ __attribute__((amdgpu_waves_per_eu(core_waves_per_eu<Contract>()))) void tiled_c
             if (chunk < G::a_chunks && row < rows) a_ptr[i] = ad.a_row(at, row);
         }
     }
-    auto fetch = [&](int stage) {
+    // Raw loads of one stage. cohort_a: activations (+ IU4 row scales); cohort_b: weights (+ IU4 column
+    // scales). No destination register is read here; store() is each cohort's first use. Which cohorts
+    // are issued before the stage's matrix work is the contract's load schedule (load_cohort.hpp).
+    using Schedule = typename pipeline::contract_schedule<Contract>::type;
+    static_assert(Schedule::lookahead == 1 && Schedule::lds_stages * G::stage_bytes == G::lds_bytes,
+        "one register stage of lookahead, two LDS stage buffers");
+    auto fetch = [&](int stage, auto cohort_set) {
+        using Cohorts = decltype(cohort_set);
         if constexpr (Probe == 3) return;
         const int k0 = begin + stage * KT;
         if constexpr (IU4) {
@@ -310,6 +318,7 @@ __attribute__((amdgpu_waves_per_eu(core_waves_per_eu<Contract>()))) void tiled_c
             static_assert(G::a_chunks % G::threads == 0 && b_chunks % G::threads == 0);
             const int groups = inputs / IU4Group;
             const auto* wq = reinterpret_cast<const uint8_t*>(packed);
+            if constexpr (pipeline::has<Cohorts>(pipeline::cohort_a))
             #pragma unroll
             for (int i = 0; i < G::a_per_thread; ++i) {
                 const int chunk = thread + i * G::threads;
@@ -322,6 +331,7 @@ __attribute__((amdgpu_waves_per_eu(core_waves_per_eu<Contract>()))) void tiled_c
                 a_reg[i] = *reinterpret_cast<const U4*>(a_q + (uint32_t(row) * uint32_t(inputs / 2) + uint32_t(kk / 2)));
             }
 
+            if constexpr (pipeline::has<Cohorts>(pipeline::cohort_b))
             #pragma unroll
             for (int i = 0; i < b_per_thread; ++i) {
                 const int chunk = thread + i * G::threads;
@@ -337,6 +347,7 @@ __attribute__((amdgpu_waves_per_eu(core_waves_per_eu<Contract>()))) void tiled_c
                 }
             }
             
+            if constexpr (pipeline::has<Cohorts>(pipeline::cohort_a))
             #pragma unroll
             for (int i = 0; i < sa_per_thread; ++i) {
                 const int e = thread + i * G::threads;
@@ -349,6 +360,7 @@ __attribute__((amdgpu_waves_per_eu(core_waves_per_eu<Contract>()))) void tiled_c
                     sa_reg[i] = a_scale[uint32_t(row) * uint32_t(groups) + uint32_t(g)];
                 }
             }
+            if constexpr (pipeline::has<Cohorts>(pipeline::cohort_b))
             #pragma unroll
             for (int i = 0; i < sw_per_thread; ++i) {
                 const int e = thread + i * G::threads;
@@ -359,6 +371,7 @@ __attribute__((amdgpu_waves_per_eu(core_waves_per_eu<Contract>()))) void tiled_c
                 }
             }
         } else {
+        if constexpr (pipeline::has<Cohorts>(pipeline::cohort_a))
         #pragma unroll
         for (int i = 0; i < G::a_per_thread; ++i) {
             const int chunk = thread + i * G::threads;
@@ -370,6 +383,7 @@ __attribute__((amdgpu_waves_per_eu(core_waves_per_eu<Contract>()))) void tiled_c
             a_reg[i] = valid ? *reinterpret_cast<const U4*>(input + size_t(row) * size_t(inputs) + size_t(k0) * 16U + size_t(part) * 8U) : U4{0, 0, 0, 0};
         }
         if constexpr (DenseF16) {
+            if constexpr (pipeline::has<Cohorts>(pipeline::cohort_b))
             #pragma unroll
             for (int i = 0; i < b_per_thread; ++i) {
                 const int chunk = thread + i * G::threads;
@@ -388,6 +402,7 @@ __attribute__((amdgpu_waves_per_eu(core_waves_per_eu<Contract>()))) void tiled_c
                 q_reg[i] = values;
             }
         } else {
+        if constexpr (pipeline::has<Cohorts>(pipeline::cohort_b))
         #pragma unroll
         for (int i = 0; i < G::q_per_wave; ++i) {
             const int t = wave + i * G::waves;            // wave-uniform
@@ -398,12 +413,15 @@ __attribute__((amdgpu_waves_per_eu(core_waves_per_eu<Contract>()))) void tiled_c
         }
         }
     };
-    auto store = [&](int stage, int buffer) {
+    // Publication of one stage into LDS buffer `buffer`: the first use of the cohorts' registers.
+    auto store = [&](int stage, int buffer, auto cohort_set) {
+        using Cohorts = decltype(cohort_set);
         if constexpr (Probe == 3) return;
         const int k0 = begin + stage * KT;
         auto* ab = lds + buffer * G::stage_bytes;
         _Float16* as = reinterpret_cast<_Float16*>(ab);
         _Float16* bs = as + BM * STRIDE;
+        if constexpr (pipeline::has<Cohorts>(pipeline::cohort_a))
         #pragma unroll
         for (int i = 0; i < G::a_per_thread; ++i) {
             const int chunk = thread + i * G::threads;
@@ -416,7 +434,7 @@ __attribute__((amdgpu_waves_per_eu(core_waves_per_eu<Contract>()))) void tiled_c
             }
         }
         if constexpr (IU4 || DenseF16) {
-
+            if constexpr (pipeline::has<Cohorts>(pipeline::cohort_b))
             #pragma unroll
             for (int i = 0; i < b_per_thread; ++i) {
                 const int chunk = thread + i * G::threads;
@@ -432,6 +450,7 @@ __attribute__((amdgpu_waves_per_eu(core_waves_per_eu<Contract>()))) void tiled_c
             
             if constexpr (IU4) {
                 float* sl = reinterpret_cast<float*>(ab + (BM + BN) * G::row_bytes);
+                if constexpr (pipeline::has<Cohorts>(pipeline::cohort_a))
                 #pragma unroll
                 for (int i = 0; i < sa_per_thread; ++i) {
                     const int e = thread + i * G::threads;
@@ -441,6 +460,7 @@ __attribute__((amdgpu_waves_per_eu(core_waves_per_eu<Contract>()))) void tiled_c
                         sl[(e % SLOTS) * BM + (r & ~15) + (r & 1) * 8 + ((r & 15) >> 1)] = sa_reg[i];
                     }
                 }
+                if constexpr (pipeline::has<Cohorts>(pipeline::cohort_b))
                 #pragma unroll
                 for (int i = 0; i < sw_per_thread; ++i) {
                     const int e = thread + i * G::threads;
@@ -448,6 +468,7 @@ __attribute__((amdgpu_waves_per_eu(core_waves_per_eu<Contract>()))) void tiled_c
                 }
             }
         } else {
+        if constexpr (pipeline::has<Cohorts>(pipeline::cohort_b))
         #pragma unroll
         for (int i = 0; i < G::q_per_wave; ++i) {
             const int t = wave + i * G::waves;
@@ -477,13 +498,13 @@ __attribute__((amdgpu_waves_per_eu(core_waves_per_eu<Contract>()))) void tiled_c
     using IU4Sum = int32_t __attribute__((ext_vector_type(8)));
     [[maybe_unused]] IU4Sum sum[IU4 ? MT : 1][IU4 ? NT : 1] = {};
     if (stages > 0) {
-        fetch(0);
-        store(0, 0);
+        fetch(0, pipeline::Set<pipeline::cohort_all>{});
+        store(0, 0, pipeline::Set<pipeline::cohort_all>{});
         __syncthreads();
     }
     for (int stage = 0; stage < stages; ++stage) {
         const int buffer = stage & 1;
-        if (stage + 1 < stages) fetch(stage + 1);
+        if constexpr (Schedule::early != 0U) { if (stage + 1 < stages) fetch(stage + 1, pipeline::Set<Schedule::early>{}); }
         const auto* ab = lds + buffer * G::stage_bytes;
         const _Float16* as = reinterpret_cast<const _Float16*>(ab);
         const _Float16* bs = as + BM * STRIDE;
@@ -596,7 +617,10 @@ __attribute__((amdgpu_waves_per_eu(core_waves_per_eu<Contract>()))) void tiled_c
             }
         }
         }
-        if (stage + 1 < stages) store(stage + 1, buffer ^ 1);
+        if (stage + 1 < stages) {
+            if constexpr (Schedule::late != 0U) fetch(stage + 1, pipeline::Set<Schedule::late>{});
+            store(stage + 1, buffer ^ 1, pipeline::Set<pipeline::cohort_all>{});
+        }
         __syncthreads();
     }
 

@@ -167,6 +167,159 @@ template <class P> inline hipError_t enqueue(const Args<P>& a, hipStream_t strea
     return hipGetLastError();
 }
 
+// Packed-assignment schedule of the same route planner. Unlike the row-rank schedule above, it accepts repeated
+// experts within a row, runtime experts/top-k and whole-plan failure, and keeps ranks in packed 16-bit LDS counters
+// during scatter (no per-assignment rank scratch). Each expert's output still ascends by row, then original slot.
+// This schedule preserves the count/scan/scatter loop structure of its original implementation.
+// Policy contract:
+//   kExperts (even, power of two): table capacity; kTopK: scratch capacity bound, actual values passed to enqueue.
+//   kThreads (multiple of 32), kAssignmentsPerWave: launch/partition policy, kCountLimit (65535): packed counter limit.
+//   kHistogramBins: capped unique-row and batch-size histogram bins; kInvalid: whole-plan failure bit.
+//   View; tables(View): offsets, touched, experts, begins, rows, slots pointers (only live words are written).
+//   routes(View,row), expert(View,row,slot), status(View,row), invalid<Certificate>(View,row,slot,expert,experts,bool& unsafe).
+//   certificate(View): mark an unsafe wave; failure(View,tid,bits,count,rows) and summary(View,tid,status,
+//   touched,batches,count,duplicates,maximum,rows,hist): engine summary adapters, including all reserved words.
+// Histograms count unique rows per touched expert and assignments per batch, with the last bin saturated.
+template<class P> struct PackedPlan {
+    static constexpr unsigned kSpan=P::kThreads/32U*P::kAssignmentsPerWave;
+    static constexpr unsigned kHead=2U+P::kExperts; // fail, status, repeat[experts], block counts
+    static_assert(P::kExperts%2U==0U && (P::kExperts&(P::kExperts-1U))==0U);
+    static_assert(P::kThreads%32U==0U && P::kThreads<=1024U && P::kExperts<=P::kThreads);
+    static_assert(P::kHistogramBins>0U && 2U*P::kHistogramBins<=P::kThreads);
+    static_assert(P::kAssignmentsPerWave%32U==0U && kSpan<=65535U);
+    static_assert(P::kCountLimit==65535U); // two 16-bit counters in every LDS word
+    static constexpr unsigned blocks_for(unsigned rows,unsigned top_k) { return (rows*top_k+kSpan-1U)/kSpan; }
+    static constexpr std::size_t scratch_bytes(unsigned capacity) {
+        return (std::size_t{kHead}+std::size_t{blocks_for(capacity,P::kTopK)}*P::kExperts)*sizeof(unsigned);
+    }
+    // Scratch is reserved once for capacity; enqueue never allocates. rows/top_k must fit that capacity.
+    static hipError_t enqueue(typename P::View v,unsigned rows,unsigned experts,unsigned top_k,unsigned cap,
+                              unsigned* scratch,hipStream_t stream,bool certificate=false);
+};
+
+template<class P,bool Certificate=false>
+__global__ __launch_bounds__(P::kThreads) void csr_count_kernel(typename P::View v,unsigned rows,unsigned experts,unsigned top_k,unsigned* scratch) {
+    const unsigned t=threadIdx.x,count=rows*top_k,k=blockIdx.x,first=k*PackedPlan<P>::kSpan,last=min(count,first+PackedPlan<P>::kSpan);
+    __shared__ unsigned n_of[P::kExperts],failure,status;
+    if(t<P::kExperts)n_of[t]=0U;
+    if(t==0U){failure=0U;status=0U;}
+    __syncthreads();
+    bool unsafe=false;
+    for(unsigned a=first+t;a<last;a+=P::kThreads) {
+        const unsigned r=a/top_k,s=a%top_k,e=P::expert(v,r,s);
+        if(P::template invalid<Certificate>(v,r,s,e,experts,unsafe))atomicOr(&failure,P::kInvalid);
+        else {
+            atomicAdd(&n_of[e],1U);
+            const unsigned* const route=P::routes(v,r);
+            bool repeat=false;
+            for(unsigned q=0;q<s;++q)repeat|=route[q]==e;
+            if(repeat)atomicAdd(scratch+2U+e,1U);
+        }
+    }
+    if constexpr(Certificate) {
+        const unsigned bad=static_cast<unsigned>(__ballot(unsafe));
+        if(bad&&(t&31U)==0U)P::certificate(v);
+    }
+    const unsigned per=(rows+gridDim.x-1U)/gridDim.x;
+    for(unsigned r=k*per+t;r<min(rows,(k+1U)*per);r+=P::kThreads){const unsigned s=P::status(v,r);if(s)atomicOr(&status,s);}
+    __syncthreads();
+    if(t==0U){if(failure)atomicOr(scratch,failure);if(status)atomicOr(scratch+1U,status);}
+    if(t<P::kExperts)scratch[PackedPlan<P>::kHead+k*P::kExperts+t]=n_of[t];
+}
+template<class P>
+__global__ __launch_bounds__(P::kThreads) void csr_scan_kernel(typename P::View v,unsigned rows,unsigned experts,unsigned top_k,unsigned cap,unsigned blocks,unsigned* scratch) {
+    const auto& csr=P::tables(v);
+    const unsigned t=threadIdx.x,count=rows*top_k;
+    __shared__ unsigned n_of[P::kExperts],scan[3][P::kExperts],hist[2U*P::kHistogramBins],failure,status,duplicates,maximum;
+    if(t==0){failure=scratch[0];status=scratch[1];duplicates=0U;maximum=0U;}
+    if(t<2U*P::kHistogramBins)hist[t]=0U;
+    __syncthreads();
+    if(failure){P::failure(v,t,failure|status,count,rows);return;}
+    if(t<P::kExperts) {
+        unsigned n=0U;
+        for(unsigned k=0;k<blocks;++k){unsigned* const c=scratch+PackedPlan<P>::kHead+k*P::kExperts+t;const unsigned x=*c;*c=n;n+=x;}
+        if(n>P::kCountLimit)atomicOr(&failure,P::kInvalid);
+        n_of[t]=n;
+    }
+    __syncthreads();
+    if(failure){if(t==0U)atomicOr(scratch,failure);P::failure(v,t,failure|status,count,rows);return;}
+    const unsigned n=t<P::kExperts?n_of[t]:0U,nb=(n+cap-1U)/cap;
+    if(t<P::kExperts){scan[0][t]=n;scan[1][t]=n!=0U;scan[2][t]=nb;}
+    __syncthreads();
+    for(unsigned d=1U;d<P::kExperts;d<<=1U) {
+        unsigned x[3]={};
+        if(t>=d&&t<P::kExperts)for(unsigned k=0;k<3U;++k)x[k]=scan[k][t-d];
+        __syncthreads();
+        if(t>=d&&t<P::kExperts)for(unsigned k=0;k<3U;++k)scan[k][t]+=x[k];
+        __syncthreads();
+    }
+    if(t<experts) {
+        const unsigned off=scan[0][t]-n,touched=scan[1][t]-(n!=0U),batch=scan[2][t]-nb;
+        csr.offsets[t]=off;
+        if(t==experts-1U)csr.offsets[experts]=off+n;
+        if(n) {
+            csr.touched[touched]=t;atomicMax(&maximum,n);
+            for(unsigned b=0;b<nb;++b){csr.experts[batch+b]=t;csr.begins[batch+b]=off+b*cap;atomicAdd(&hist[P::kHistogramBins+min(P::kHistogramBins,min(cap,n-b*cap))-1U],1U);}
+            const unsigned unique=n-scratch[2U+t];
+            atomicAdd(&hist[min(P::kHistogramBins,unique)-1U],1U);atomicAdd(&duplicates,n-unique);
+        }
+    }
+    __syncthreads();
+    if(t==0U)csr.begins[scan[2][P::kExperts-1U]]=count;
+    P::summary(v,t,status,scan[1][P::kExperts-1U],scan[2][P::kExperts-1U],count,duplicates,maximum,rows,hist);
+}
+template<class P>
+__global__ __launch_bounds__(P::kThreads) void csr_scatter_kernel(typename P::View v,unsigned rows,unsigned top_k,const unsigned* scratch) {
+    constexpr unsigned Waves=P::kThreads/32U;
+    const auto& csr=P::tables(v);
+    if(*reinterpret_cast<const volatile unsigned*>(scratch))return; // a failed CSR writes no rows / slots (as the base)
+    const unsigned t=threadIdx.x,lane=t&31U,wave=t/32U,count=rows*top_k,k=blockIdx.x;
+    const unsigned first=min(count,k*PackedPlan<P>::kSpan+wave*P::kAssignmentsPerWave),last=min(count,first+P::kAssignmentsPerWave);
+    __shared__ unsigned position[Waves][P::kExperts/2U];
+    for(unsigned x=t;x<Waves*(P::kExperts/2U);x+=P::kThreads)position[x/(P::kExperts/2U)][x%(P::kExperts/2U)]=0U;
+    __syncthreads();
+    const auto expert_at=[&](unsigned a){return P::expert(v,a/top_k,a%top_k);};
+    for(unsigned a=first+lane;a<last;a+=32U)atomicAdd(&position[wave][expert_at(a)/2U],1U<<(16U*(expert_at(a)&1U)));
+    __syncthreads();
+    if(t<(P::kExperts/2U)) {
+        unsigned lo=0U,hi=0U;
+        for(unsigned w=0;w<Waves;++w){const unsigned c=position[w][t];position[w][t]=lo|hi<<16U;lo+=c&P::kCountLimit;hi+=c>>16U;}
+    }
+    __syncthreads();
+    const unsigned* const base=scratch+PackedPlan<P>::kHead+k*P::kExperts;
+    for(unsigned step=first;step<last;step+=32U) {
+        const unsigned a=step+lane;
+        const bool valid=a<last;
+        const unsigned e=valid?expert_at(a):0U;
+        unsigned active=static_cast<unsigned>(__ballot(valid)),peers=0U;
+        while(active) {
+            const unsigned leader_e=static_cast<unsigned>(__shfl(static_cast<int>(e),__ffs(active)-1,32));
+            const unsigned same=static_cast<unsigned>(__ballot(valid&&e==leader_e))&active;
+            if(valid&&e==leader_e)peers=same;
+            active&=~same;
+        }
+        if(valid) {
+            const unsigned slot=csr.offsets[e]+base[e]+((position[wave][e/2U]>>(16U*(e&1U)))&P::kCountLimit);
+            const unsigned at_pos=slot+static_cast<unsigned>(__popc(peers&((1U<<lane)-1U)));
+            csr.rows[at_pos]=a/top_k;csr.slots[at_pos]=a%top_k;
+            if((peers&((1U<<lane)-1U))==0U)atomicAdd(&position[wave][e/2U],static_cast<unsigned>(__popc(peers))<<(16U*(e&1U)));
+        }
+    }
+}
+
+template<class P>
+inline hipError_t PackedPlan<P>::enqueue(typename P::View v,unsigned rows,unsigned experts,unsigned top_k,unsigned cap,
+                                        unsigned* scratch,hipStream_t stream,bool certificate) {
+    const unsigned blocks=blocks_for(rows,top_k);
+    hipError_t e=hipMemsetAsync(scratch,0,kHead*sizeof(unsigned),stream);
+    if(e!=hipSuccess)return e;
+    if(certificate)csr_count_kernel<P,true><<<blocks,P::kThreads,0,stream>>>(v,rows,experts,top_k,scratch);
+    else csr_count_kernel<P><<<blocks,P::kThreads,0,stream>>>(v,rows,experts,top_k,scratch);
+    csr_scan_kernel<P><<<1,P::kThreads,0,stream>>>(v,rows,experts,top_k,cap,blocks,scratch);
+    csr_scatter_kernel<P><<<blocks,P::kThreads,0,stream>>>(v,rows,top_k,scratch);
+    return hipGetLastError();
+}
+
 // ---------------------------------------------------------------- device item queue
 // A grouped launch whose item table (cta_begin prefixes ascending, `*count` items, `*total` CTAs) was built on the
 // device. The grid is a host bound of `*total` (the planner flags a total above it); virtual CTA = blockIdx.x and the

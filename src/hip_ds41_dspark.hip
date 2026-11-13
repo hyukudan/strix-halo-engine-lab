@@ -6,6 +6,7 @@
 
 #include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
+#include "moe_core/route.hpp"
 
 #include "strix/hip_ds41_formats.hpp"
 
@@ -249,40 +250,32 @@ __global__ __launch_bounds__(256) void draft_router_scores_kernel(const float* x
     acc = butterfly(acc);
     if (lane == 0U) scores[static_cast<std::size_t>(r) * experts + e] = router_score(acc);
 }
+struct DraftRoutePolicy {
+    static constexpr unsigned threads = 128, max_top_k = top_k, expert_count = experts;
+    const float* sc;
+    float biased;
+    std::uint32_t* ids;
+    float* weights;
+    __device__ unsigned get_experts() const { return expert_count; }
+    __device__ unsigned get_top_k() const { return max_top_k; }
+    __device__ float score(unsigned e) const { return sc[e]; }
+    __device__ void seed(unsigned t, unsigned k, const unsigned* chosen, float& value, unsigned& index) const {
+        bool taken = false;
+        for (unsigned j = 0; j < k; ++j) taken = taken || chosen[j] == t;
+        value = biased;
+        index = taken ? get_experts() : t;
+    }
+    __device__ void write(unsigned r, unsigned k, unsigned id, float denominator) const {
+        ids[r * get_top_k() + k] = id;
+        weights[r * get_top_k() + k] = sc[id] / denominator * route_scale;
+    }
+};
+
 __global__ __launch_bounds__(128) void draft_router_select_kernel(const float* scores, const float* bias, std::uint32_t* ids, float* weights) {
-    __shared__ float value[128];
-    __shared__ unsigned index[128];
-    __shared__ unsigned chosen[top_k];
     const unsigned r = blockIdx.x, t = threadIdx.x;
     const float* sc = scores + static_cast<std::size_t>(r) * experts;
     const float biased = sc[t] + bias[t];
-    for (unsigned k = 0; k < top_k; ++k) {
-        bool taken = false;
-        for (unsigned j = 0; j < k; ++j) taken = taken || chosen[j] == t;
-        value[t] = biased;
-        index[t] = taken ? experts : t;
-        __syncthreads();
-        for (unsigned h = 64; h != 0U; h /= 2U) {
-            if (t < h) {
-                const float ov = value[t + h];
-                const unsigned oi = index[t + h];
-                const bool take = oi != experts && (index[t] == experts || ov > value[t] || (ov == value[t] && oi < index[t]));
-                if (take) { value[t] = ov; index[t] = oi; }
-            }
-            __syncthreads();
-        }
-        if (t == 0U) chosen[k] = index[0];
-        __syncthreads();
-    }
-    if (t == 0U) {
-        float sum = 0.0F;
-        for (unsigned k = 0; k < top_k; ++k) sum = sum + sc[chosen[k]];
-        const float denominator = sum + 1e-20F;
-        for (unsigned k = 0; k < top_k; ++k) {
-            ids[r * top_k + k] = chosen[k];
-            weights[r * top_k + k] = sc[chosen[k]] / denominator * route_scale;
-        }
-    }
+    strix::moe_core::route_block_topk(DraftRoutePolicy{sc, biased, ids, weights}, r, t);
 }
 
 // ---- MoE routes built on the device (build_window_routes of ds41_moe.hpp, one thread) ----

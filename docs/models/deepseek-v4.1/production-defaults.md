@@ -232,6 +232,8 @@ mixed-load qualification; the P17.1 figures above do not qualify them. See the
 While no request decodes and no other prompt waits for its prefill, the pending prefill runs the rest of its
 piece at once instead of 250 ms units (same bits; a request that arrives meanwhile waits for that piece);
 `STRIX_DS41_SERVE_IDLE_WHOLE=0` keeps the bounded units while idle.
+From five live requests the serve prefills waiting prompts before the next decode step (admit-first, same tokens);
+`STRIX_SERVE_ADMIT_FIRST=0` keeps decode first.
 Use `STRIX_DS41_SERVE_SERVICE_MS=0` for coarse row budgeting and
 `STRIX_DS41_SERVE_SHORT_FIRST=0` for FIFO; restart both ranks when changing settings.
 

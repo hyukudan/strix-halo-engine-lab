@@ -39,6 +39,7 @@
 #include "strix/mtp_forward_golden_file.hpp"
 #include "strix/hip_mtp_greedy_runtime.hpp"
 #include "strix/serve/cycle_receipt.hpp"
+#include "strix/serve/prompt_join.hpp"
 #include "strix/mtp_batch_window_controller.hpp"
 #include "hip_session_store.hpp"
 #include <mutex>
@@ -1787,6 +1788,7 @@ private:
             auto& s=*slot;
             if(!s.prefilling || s.waits_for || &s==paused_) continue;
             if(const auto reason=nested_decline(s)) {skip(&s,reason);continue;}
+            if(joins_group(s)) {skip(&s,"group");continue;}
             if(!candidate || s.order<candidate->order) candidate=&s;
         }
         if(!candidate) return;
@@ -1864,7 +1866,7 @@ private:
             const bool decode_due=service_ms_>0.0 && decoding && (completed_ms+static_cast<double>(boundary-retired)*last_bundle_ms>=service_ms_ ||
                 std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-last_decode_round_).count()>=service_ms_);
             const bool nest_due=nest_rows_ && slot &&
-                (std::any_of(slots_.begin(),slots_.end(),[&](const auto& s){return s.get()!=slot && s->prefilling && !nested_decline(*s);}) ||
+                (std::any_of(slots_.begin(),slots_.end(),[&](const auto& s){return s.get()!=slot && s->prefilling && !nested_decline(*s) && !joins_group(*s);}) ||
                  (has_free_slot() && has_queued_work_ && has_queued_work_() != 0U));
             if(!decode_due && !nest_due) return;
             prepare();retire(boundary);
@@ -1911,6 +1913,10 @@ private:
         static const bool on = strix::envcfg::flag("STRIX_PROMPT_BATCH", true);
         return on;
     }
+    static bool prompt_batch_partial() {
+        static const bool on = strix::envcfg::flag("STRIX_PROMPT_BATCH_PARTIAL", true);
+        return on;
+    }
     static std::uint32_t prompt_batch_rows() {
         static const std::uint32_t rows = [] {
             const char* v = std::getenv("STRIX_PROMPT_BATCH_ROWS");
@@ -1942,7 +1948,13 @@ private:
     }
     static constexpr std::size_t prompt_batch_idle_members = 4U;
     bool run_prompt_group(Slot& oldest) {
-        if (!prompt_batch_enabled() || prefilling() < 2U) return false;
+        // STRIX_PROMPT_BATCH_LOG=2: also one stderr line for every prompt unit that found no group, with the reason.
+        static const bool why = [] { const char* v = std::getenv("STRIX_PROMPT_BATCH_LOG"); return v && v[0] == '2'; }();
+        const auto none = [&](const char* reason, std::uint64_t a = 0, std::uint64_t b = 0) {
+            if (why) std::cerr << "prompt group none: " << reason << " prefilling " << prefilling() << " a " << a << " b " << b << std::endl;
+            return false;
+        };
+        if (!prompt_batch_enabled() || prefilling() < 2U) return none("single");
         const auto& lead = slots_.front()->parents->tiled;
         auto& group = lead.group ? *lead.group : *lead.blocks;
         const auto budget = std::min(lead.group ? lead.group_owner->logical_rows() : lead.rows, prompt_batch_rows());
@@ -1954,24 +1966,30 @@ private:
         const auto join = [&](Slot& s) {
             if(s.waits_for || members.size() >= max_members) return;
             const auto block = s.prefill->next_block();
-            // A balanced partial block (STRIX_QPF2K_SCHED bit 4) runs alone.
-            if (!block || block->rows > budget - rows || block->rows != block->backend->logical_rows()) return;
+            // A balanced partial block (STRIX_QPF2K_SCHED bit 4: the first rows of the prompt's T owner) is a segment like
+            // any other block: the segmented forward runs each segment's rows as its block alone. STRIX_PROMPT_BATCH_PARTIAL=0
+            // runs partial blocks alone as before (then the first unit of every prompt below T rows is never grouped).
+            if (!block || block->rows > budget - rows || (block->rows != block->backend->logical_rows() && !prompt_batch_partial())) {
+                if (why) std::cerr << "prompt group skip: slot order " << s.order << " block " << (block ? block->rows : 0U) << " owner rows "
+                    << (block ? block->backend->logical_rows() : 0U) << " budget " << budget << " used " << rows << " left " << s.prefill->remaining() << std::endl;
+                return;
+            }
             members.push_back({&s, *block});
             rows += block->rows;
         };
         join(oldest);
-        if (members.empty()) return false;
+        if (members.empty()) return none("oldest", budget);
         std::vector<Slot*> others;
         for (auto& s : slots_) if (s.get() != &oldest && s->prefilling && !s->waits_for) others.push_back(s.get());
         std::sort(others.begin(), others.end(), [](const Slot* a, const Slot* b) { return a->order < b->order; });
         for (auto* s : others) join(*s);
-        if (members.size() < 2U) return false;
+        if (members.size() < 2U) return none("alone", budget, others.size());
         const auto t0 = std::chrono::steady_clock::now();
         std::vector<HipKnownPromptBackend::GroupMember> group_members;
         group_members.reserve(members.size());
         for (const auto& m : members)
             group_members.push_back({m.block.backend, m.slot->prefill->block_tokens(m.block), m.slot->prefill->position(), m.block.final,
-                m.slot->prefill->block_observer(m.block.rows)});
+                m.slot->prefill->block_observer(m.block.rows), m.block.rows != m.block.backend->logical_rows()});
         std::vector<std::vector<float>> logits;
         for(const auto& member:members)
             member.slot->prefill->before_writer((lead.group?lead.group_owner:lead.block_owner)->producer_stream());
@@ -2326,6 +2344,16 @@ private:
     std::uint64_t fork_clock_=0;
     int device_=0;
     std::uint64_t nest_rows_=[] {const char* v=std::getenv("STRIX_BATCH_NEST_ROWS");return v?std::strtoull(v,nullptr,10):2048ULL;}();
+    // STRIX_BATCH_NEST_RATIO (default 4; 0 = always nest, the previous behaviour): serve::prompt_join. A prompt with more
+    // than 1/ratio of the parked unit's rows left is not nested whole and alone at a service point: it waits for the unit
+    // boundary, where its blocks join the other prompts' next blocks in one forward (run_prompt_group). A burst of
+    // prompts was a serial stack of nested prompts before. Scheduling only: the units, rows and bits of each prompt are
+    // those of a solo run either way.
+    std::uint32_t nest_ratio_=[] {const char* v=std::getenv("STRIX_BATCH_NEST_RATIO");return v?static_cast<std::uint32_t>(std::clamp(std::atol(v),0L,1L<<20)):4U;}();
+    [[nodiscard]] bool joins_group(const Slot& s) const {
+        return paused_owner_ && serve::prompt_join(paused_owner_->logical_rows(),s.prefill->remaining(),
+            serve::PromptJoinLimits{prompt_batch_enabled(),nest_ratio_})==serve::PromptJoin::group;
+    }
     bool service_mode_=false;
     Slot* leaf_=nullptr;
     std::function<std::size_t()> has_queued_work_;

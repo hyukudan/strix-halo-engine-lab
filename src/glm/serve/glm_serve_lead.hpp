@@ -84,6 +84,7 @@ struct LeadConfig {
     std::uint64_t capacity = 8192;
     std::uint64_t prefix_cache_bytes = 0, prefix_identity = 0;
     bool batch = true;               // false: serial admission (one request at a time)
+    bool short_first = true;         // admit the shortest waiting prompt first (bounded overtakes); false: FIFO
     double heartbeat_seconds = 1.0;  // idle: one heartbeat round per interval keeps rank 1 and the link alive
     std::vector<std::uint32_t> stops = default_stop_ids();
     // C1 MTP self-speculation: with exactly one request in flight (and none waiting in batched mode) it decodes through
@@ -309,7 +310,8 @@ private:
         }
         // admission: one prompt in prefill at a time (+ at most one waiting for its RTX state)
         if (!pf_ && !table_.full() && (cfg_.batch || table_.live() == 0)) {
-            if (runtime().reserve_fifo()) {
+            // short_first only reorders admission (shared select_waiting, 8-overtake bound); a request's tokens never change
+            if (runtime().reserve_fifo(false, cfg_.short_first)) {
                 admit();
                 last_round_ = Clock::now();
             }

@@ -2610,6 +2610,11 @@ struct HipKnownPrefixWindow::Impl {
         bool head = false;
         HipKnownPrefixWindow::PrefillStepObserver observer;
     };
+    // A segment is its owner's whole block, or a partial block of it (the first rows of the owner's T arena run alone:
+    // 16..T rows in multiples of 8, as execute_partial admits).
+    [[nodiscard]] static bool segment_rows_admitted(std::size_t rows, std::uint32_t owner_rows) noexcept {
+        return rows == owner_rows || (rows >= 16U && rows % 8U == 0U && rows < owner_rows);
+    }
     std::vector<KnownWindowResult> execute_segments(std::span<const PrefillSegment> requests, bool stage_ple) {
         if (failed) throw std::logic_error("known-window native owner cannot be reused after an exception");
         if (executing) throw std::logic_error("known-window native owner cannot execute recursively");
@@ -2624,7 +2629,7 @@ struct HipKnownPrefixWindow::Impl {
             for (std::size_t s = 0; s < requests.size(); ++s) {
                 const auto& r = requests[s];
                 if (!r.own || !r.session || !r.own->prefill || r.own->failed || (r.own->executing && r.own != this) ||
-                    r.tokens.size() != r.own->logical_rows() || r.own->serial.execution_identity != serial.execution_identity ||
+                    !segment_rows_admitted(r.tokens.size(), r.own->logical_rows()) || r.own->serial.execution_identity != serial.execution_identity ||
                     !same_model(r.own->resources, resources) || r.own->config.fast_prefill_components != config.fast_prefill_components ||
                     r.own->config.dense_a8 != config.dense_a8 || (r.head && r.own->prefill->output_policy == KnownWindowOutputPolicy::state_only))
                     throw std::invalid_argument("segmented prefill member needs its own idle tiled owner of its rows, of this owner's execution and profile");

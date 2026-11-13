@@ -549,6 +549,58 @@ std::vector<std::uint32_t> BpeTokenizer::encode(std::string_view text, bool pars
     return out;
 }
 
+bool BpeTokenizer::encode_some(std::string_view text, bool parse_special, EncodeCursor& cursor, std::size_t slice_bytes,
+                               std::vector<std::uint32_t>& out) const {
+    if (cursor.encoded > cursor.scanned || cursor.scanned > text.size()) throw std::invalid_argument("tokenizer: invalid encode cursor");
+    if (cursor.encoded == text.size()) return false;
+    if (slice_bytes == 0U) slice_bytes = 1U;
+    // The same special-token scan as encode(): positions below `scanned` start no special token, so every position
+    // in (encoded, scanned) lies inside one plain segment of the one-shot encoding.
+    const bool glm = impl_->pre_kind == PreTokenizer::glm4;
+    const bool scan_specials = parse_special || glm;
+    const auto ascii_letter = [&](std::size_t k) {
+        const auto b = static_cast<unsigned char>(text[k]);
+        return (b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z');
+    };
+    std::size_t target = cursor.encoded + std::min(slice_bytes, text.size() - cursor.encoded);
+    for (;;) {
+        while (cursor.scanned < target) {
+            const std::size_t i = cursor.scanned;
+            if (scan_specials && impl_->special_start[static_cast<unsigned char>(text[i])]) {
+                for (const auto id : impl_->specials) {
+                    if (!parse_special && static_cast<TokenType>(impl_->types[id]) != TokenType::user_defined) continue;
+                    const auto& s = impl_->tokens[id];
+                    if (!s.empty() && text.compare(i, s.size(), s) == 0) {
+                        if (i > cursor.encoded) impl_->encode_plain(text.substr(cursor.encoded, i - cursor.encoded), out);
+                        out.push_back(id);
+                        cursor.encoded = cursor.scanned = cursor.searched = i + s.size();
+                        return true;
+                    }
+                }
+            }
+            ++cursor.scanned;
+        }
+        if (cursor.scanned == text.size()) {
+            impl_->encode_plain(text.substr(cursor.encoded), out);
+            cursor.encoded = cursor.searched = text.size();
+            return true;
+        }
+        // A piece boundary that no later text can move: an ASCII letter followed by a space. The letter ends a piece
+        // in every pre-tokenizer (letter runs stop at the space, nothing else contains a letter), no piece before it
+        // reads past the space, and the scanners never look behind a piece start, so the two sides encode alone.
+        const std::size_t floor = std::max(cursor.encoded, cursor.searched);
+        for (std::size_t q = cursor.scanned - 1U; q > floor; --q) {
+            if (text[q] == ' ' && ascii_letter(q - 1U)) {
+                impl_->encode_plain(text.substr(cursor.encoded, q - cursor.encoded), out);
+                cursor.encoded = cursor.searched = q;
+                return true;
+            }
+        }
+        cursor.searched = cursor.scanned - 1U;
+        target = cursor.scanned + std::min(slice_bytes, text.size() - cursor.scanned);
+    }
+}
+
 std::string BpeTokenizer::token_bytes(std::uint32_t id) const {
     if (id >= impl_->tokens.size()) throw std::out_of_range("tokenizer: token ID outside the vocabulary");
     const auto t = static_cast<TokenType>(impl_->types[id]);

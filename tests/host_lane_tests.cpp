@@ -2,6 +2,10 @@
 
 #include <atomic>
 #include <chrono>
+#include <csignal>
+#include <cstddef>
+#include <cstdint>
+#include <future>
 #include <iostream>
 #include <stdexcept>
 #include <string>
@@ -225,10 +229,54 @@ void lane_pins_to_declared_cores() {
             "background threads must stay off the critical core");
 #endif
 }
+volatile std::sig_atomic_t load_stop = 0;
+extern "C" void stop_load(int) { load_stop = 1; }
+
+// --load SECONDS THREADS CAP_GBPS [BUFFER_MIB]: background lane jobs that read memory under the byte budget with
+// decode marked active (CAP_GBPS 0: uncapped). Stops after SECONDS or on SIGTERM/SIGINT and prints the achieved rate;
+// a load generator, not a test.
+int load(double seconds, unsigned threads, double cap_gbps, std::size_t buffer_mib) {
+    std::signal(SIGTERM, stop_load);
+    std::signal(SIGINT, stop_load);
+    HostLaneConfig config;
+    config.critical_threads = 0;
+    config.background_threads = threads;
+    config.byte_cap_gbytes_ps = cap_gbps;
+    HostLane lane(config);
+    lane.budget().decode_begin();
+    std::atomic<std::uint64_t> bytes{0}, checksum{0};
+    std::vector<std::future<void>> jobs;
+    const auto begin = Clock::now();
+    const auto until = begin + std::chrono::duration_cast<Clock::duration>(std::chrono::duration<double>(seconds));
+    for (unsigned t = 0; t < threads; ++t)
+        jobs.push_back(lane.submit(HostPriority::background, [&, t] {
+            std::vector<std::uint64_t> buffer(buffer_mib * (std::size_t{1} << 17U), 0x9E3779B97F4A7C15ULL * (t + 1U));
+            const std::uint64_t total = buffer.size() * sizeof(std::uint64_t);
+            while (Clock::now() < until && !load_stop)
+                strix::core::governed_slices(lane.budget(), total, std::uint64_t{4} << 20U, [&](std::uint64_t offset, std::uint64_t length) {
+                    if (Clock::now() >= until || load_stop) return;
+                    std::uint64_t x = 0;
+                    const std::uint64_t* p = buffer.data() + offset / sizeof(std::uint64_t);
+                    for (std::uint64_t i = 0; i < length / sizeof(std::uint64_t); ++i) x ^= p[i];
+                    checksum.fetch_xor(x, std::memory_order_relaxed);
+                    bytes.fetch_add(length, std::memory_order_relaxed);
+                });
+        }));
+    for (auto& job : jobs) job.get();
+    lane.budget().decode_end();
+    const double elapsed = std::chrono::duration<double>(Clock::now() - begin).count();
+    std::cout << "load threads " << threads << " cap_gbps " << cap_gbps << " seconds " << elapsed << " read_gb "
+              << static_cast<double>(bytes.load()) / 1e9 << " rate_gbps " << static_cast<double>(bytes.load()) / 1e9 / elapsed
+              << " checksum " << checksum.load() << ' ' << lane.receipt_json() << std::endl;
+    return 0;
+}
 } // namespace
 
-int main() {
+int main(int argc, char** argv) {
     try {
+        if (argc >= 5 && std::string(argv[1]) == "--load")
+            return load(std::stod(argv[2]), static_cast<unsigned>(std::stoul(argv[3])), std::stod(argv[4]),
+                        argc >= 6 ? static_cast<std::size_t>(std::stoull(argv[5])) : 256U);
         budget_is_unlimited_without_decode();
         budget_caps_during_decode();
         budget_long_run_rate_stays_under_the_cap();

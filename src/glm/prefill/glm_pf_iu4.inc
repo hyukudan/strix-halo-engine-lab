@@ -1,5 +1,5 @@
-// Included inside glm_pf_exact_moe.hip's anonymous namespace (Args, Tile, E, H, I, P, ok, activation_kernel,
-// combine_kernel, launch_linear_w): the FAST_I4 stored routed experts on the strix-trellis grouped
+// Included inside glm_pf_exact_moe.hip's anonymous namespace (Args, Tile, E, H, I, P, ok, I4Binding,
+// I4ReferenceSchedule, combine_kernel, launch_linear_w): the FAST_I4 stored routed experts on the strix-trellis grouped
 // IU4 (W4A4, g64) core. Lossy, a new identity on top of glm-pf-wmma-x; shared expert and every other linear unchanged.
 //   weights: EXL3 tiles decoded with the engine's own mul1_pair (the FP16 values the WMMA-X cores multiply), then per
 //            output column and K64 group s = FP16(max|w| / 7), q = RNE(w / s) in [-7, 7], nibbles in the trellis K16 x N16
@@ -32,50 +32,24 @@ bool iu4_fuse_quant() {
     if (std::strcmp(p, "0") == 0) return false;
     throw std::invalid_argument("STRIX_GLM_PF_IU4_FUSEQ must be 0 or 1");
 }
-// Model binding only; the A-load and paired SwiGLU/A4 and down epilogues are shared.
-struct I4Binding {
-    static constexpr unsigned H=::strix::glm::pf::exact_moe::H, I=::strix::glm::pf::exact_moe::I;
-    const float* x; float* out; Args a;
-    __host__ __device__ __forceinline__ const unsigned* map() const { return a.pairs; }
-    __device__ __forceinline__ unsigned pair(unsigned pos) const { return a.pairs[pos]; }
-    __device__ __forceinline__ unsigned token(unsigned p) const { return p/P; }
-    __device__ __forceinline__ float weight(unsigned p) const { return a.weights[(p/P)*8+p%P]; }
-    __device__ __forceinline__ float* contribution(unsigned p) const { return a.output+size_t(p)*H; }
-    __device__ __forceinline__ float suh(unsigned e,unsigned m,unsigned c) const { return d::half_bits(matrix(a,e,m).suh[c]); }
-    __device__ __forceinline__ float activation(float g,float u) const {
-        const float gg=g>kClamp ? kClamp : g, uu=u>kClamp ? kClamp : (u < -kClamp ? -kClamp : u);
-        return silu(gg)*uu;
-    }
-};
-struct I4ReferenceSchedule {
-    using Binding=I4Binding;
-    static constexpr bool kCachedInput=false;
-    Binding b; uint8_t* aq; float* as;
-    __device__ __forceinline__ unsigned source_pair(unsigned row) const { return row/2; }
-    __device__ __forceinline__ bool input(unsigned i,strix::core::moe_i4::ReferenceRow& r) const {
-        const auto& a=b.a;
-        if(a.ntiles && blockIdx.y>=*a.ntiles) return false;
-        const auto tile=a.tiles[blockIdx.y];if(i>=tile.count) return false;
-        const unsigned p=a.pairs[tile.first+i],m=blockIdx.z;
-        r={tile.expert,2*p+m,m,(blockIdx.x*8+threadIdx.x/32)*128,H,nullptr,tile.expert==E ? nullptr:aq,as,a.input};return true;
-    }
-    __device__ __forceinline__ bool activation(unsigned i,strix::core::moe_i4::ReferenceRow& r) const {
-        const auto& a=b.a;
-        if(a.ntiles && blockIdx.y>=*a.ntiles) return false;
-        const auto tile=a.tiles[blockIdx.y];const unsigned row=threadIdx.x/32+8*i;if(row>=tile.count) return false;
-        const unsigned p=a.pairs[tile.first+row];
-        r={tile.expert,p,2,blockIdx.x*128,I,a.gu,tile.expert==E ? nullptr:aq,as,a.at};return true;
-    }
-};
 
+// STRIX_GLM_I4_CHAIN_GSAVE=1 (default off): the full INT4 chain lends its gate/up rows as the paired GEMM's pass-0
+// gate scratch, so gate/up and down share one plan and one tile list (STRIX_MOE_I4_CHAIN_GSAVE=0 still forces the
+// register save). Same integers and bits in both forms.
+bool iu4_chain_gsave() { return strix::envcfg::flag("STRIX_GLM_I4_CHAIN_GSAVE", false); }
 void launch_i4_chain(Args a,unsigned grid_tiles,const moe::ExpertSlices& shared,const iu4::Layer& q,
     const iu4::Scratch& s,hipStream_t stream) {
     namespace st=strix::core;
-    // Plan 2 (BM128) paired gate/up spills on gfx1151: the paired call runs at most plan 1 on its own tile list.
-    const int plan=iu4_plan(a.rows*8U,strix::core::moe_i4::kPlan2Rows), pplan=plan<1 ? plan : 1;
-    const auto ptiles=unsigned(st::iu4_grouped_max_tiles(size_t(a.rows)*8,E,pplan));
-    const auto dtiles=unsigned(st::iu4_grouped_max_tiles(size_t(a.rows)*8,E,plan));
-    if(a.rows>s.max_rows || ptiles>s.max_tiles || dtiles>s.max_tiles) throw std::logic_error("glm chain scratch too small");
+    // Plan policy of the shared chain (moe_i4::chain_plan). Gate scratch on offer: a.gu, the call's FP32 gate/up rows
+    // (2 * I floats per pair slot, rows * P slots). The chain writes no routed gate/up rows there; the paired kernel
+    // stores gate row pair * I and the same thread reads it back in pass 1, and the shared expert's gate/up below
+    // overwrites its rows before anything reads them (one stream, as in the gate/up-only call). With the scratch the
+    // paired GEMM takes the down's plan and tile list. On this geometry (K 4096, N 1024) that form measured slower than
+    // the register save (paired BM64, down BM128) at 64..192 rows per expert and on skewed routing, so the scratch is
+    // lent only on request (iu4_chain_gsave()); the default keeps the register save.
+    const size_t slots=size_t(a.rows)*P;
+    const auto cp=st::moe_i4::chain_plan<I4Binding>(iu4_plan(a.rows*8U,strix::core::moe_i4::kPlan2Rows),iu4_chain_gsave() ? slots*2*I : 0,slots);
+    if(a.rows>s.max_rows || st::moe_i4::chain_max_tiles(cp,size_t(a.rows)*8,E)>s.max_tiles) throw std::logic_error("glm chain scratch too small");
     auto* tiles=static_cast<st::IU4GroupTile*>(s.tiles);
     st::moe_i4::Weights w{};
     for(unsigned m=0;m<3;++m) {
@@ -89,10 +63,8 @@ void launch_i4_chain(Args a,unsigned grid_tiles,const moe::ExpertSlices& shared,
     // input rows. Quantised once per row instead of once per N tile inside the paired K-loop.
     st::moe_i4::reference_input_kernel<<<dim3(H/1024,grid_tiles,2),256,0,stream>>>(I4ReferenceSchedule{{a.x,a.out,a},s.aq_gu,s.as_gu});
     ok(hipGetLastError(),"chain gate/up input transform + quantiser");
-    iu4_ok(st::build_iu4_grouped_tiles(groups,E,pplan,tiles,s.ntiles,ptiles,stream),"chain tiles");
-    iu4_ok(st::moe_i4::launch<true>(pplan,b,w,tiles,s.ntiles,ptiles,s.aq_gu,s.as_gu,s.aq_down,s.as_down,stream),"chain paired gate/up");
-    if(pplan!=plan) iu4_ok(st::build_iu4_grouped_tiles(groups,E,plan,tiles,s.ntiles,dtiles,stream),"chain down tiles");
-    iu4_ok(st::moe_i4::launch<false>(plan,b,w,tiles,s.ntiles,dtiles,nullptr,nullptr,s.aq_down,s.as_down,stream),"chain down");
+    const auto run=st::moe_i4::launch_chain(cp,b,w,groups,E,tiles,s.ntiles,size_t(a.rows)*8,s.aq_gu,s.as_gu,s.aq_down,s.as_down,a.gu,stream);
+    iu4_ok(run.status,run.stage);
     // Shared expert retains its existing exact FP16 operand and WMMA-X arithmetic; the combine is the
     // control's ordered one (shared-down aux epilogue, or R16), not atomics.
     a.aux_act=false; a.aux_combine=aux::enabled_default_on("STRIX_GLM_PF_AUX_COMBINE");
@@ -118,8 +90,9 @@ void launch_i4_gate_up(Args a,unsigned grid_tiles,const moe::ExpertSlices& share
     wmma_x::iu4_moe_calls.fetch_add(1,std::memory_order_relaxed);
     a.aux_act=false; a.aux_combine=aux::enabled_default_on("STRIX_GLM_PF_AUX_COMBINE");
     const unsigned pairs=a.rows*P;
-    const bool gsave=st::moe_i4::gsave_enabled();
-    const int full=iu4_plan(pairs), plan=gsave || full<1 ? full : 1;
+    const auto cp=st::moe_i4::chain_plan<I4Binding>(iu4_plan(pairs),size_t(pairs)*2*I,pairs);
+    const bool gsave=cp.gsave;
+    const int plan=cp.paired;
     const auto max_tiles=unsigned(st::iu4_grouped_max_tiles(size_t(a.rows)*8,E,plan));
     if(pairs>s.max_rows*P || max_tiles>s.max_tiles) throw std::logic_error("glm pf iu4: scratch smaller than the call");
     auto* tiles=static_cast<st::IU4GroupTile*>(s.tiles);
@@ -168,7 +141,7 @@ void launch_iu4(Args a, unsigned grid_tiles, const moe::ExpertSlices& shared, co
         st::moe_i4::reference_input_kernel<<<dim3(H/1024,grid_tiles,2),256,0,stream>>>(I4ReferenceSchedule{{a.x,a.out,a},s.aq_gu,s.as_gu});
         ok(hipGetLastError(), "iu4 gate/up input transform + quantiser");
     } else {
-        input_kernel<<<dim3(H / 1024, grid_tiles, 2), 256, 0, stream>>>(a);
+        st::moe_i4::reference_input_kernel<<<dim3(H / 1024, grid_tiles, 2), 256, 0, stream>>>(I4ReferenceSchedule{{a.x,a.out,a},nullptr,nullptr});
         ok(hipGetLastError(), "iu4 gate/up input transform");
         iu4_ok(st::quantise_wmma_iu4_activations(a.input, s.aq_gu, s.as_gu, static_cast<int>(H), static_cast<int>(pairs * 2U), stream, 64),
                "iu4 gate/up activation quantiser");
@@ -185,7 +158,7 @@ void launch_iu4(Args a, unsigned grid_tiles, const moe::ExpertSlices& shared, co
     }
     launch_linear_w<false, false>(a, shared.gate.bits, stream);  // shared expert only
     if (q.wq[2] == nullptr) {  // scope gate_up: the routed down keeps its EXL3 weights (FP16 down input, the WMMA-X down call)
-        activation_kernel<<<dim3(I / 128, grid_tiles), 256, 0, stream>>>(a);
+        st::moe_i4::reference_activation_kernel<<<dim3(I / 128, grid_tiles), 256, 0, stream>>>(I4ReferenceSchedule{{a.x,a.out,a},nullptr,nullptr});
         ok(hipGetLastError(), "iu4 R15/down transform (FP16 down input)");
         launch_linear_w<true>(a, shared.down.bits, stream);
         if (!a.aux_combine) {
@@ -198,7 +171,7 @@ void launch_iu4(Args a, unsigned grid_tiles, const moe::ExpertSlices& shared, co
         st::moe_i4::reference_activation_kernel<<<dim3(I/128,grid_tiles),256,0,stream>>>(I4ReferenceSchedule{{a.x,a.out,a},s.aq_down,s.as_down});
         ok(hipGetLastError(), "iu4 R15/down transform + quantiser");
     } else {
-        activation_kernel<<<dim3(I / 128, grid_tiles), 256, 0, stream>>>(a);
+        st::moe_i4::reference_activation_kernel<<<dim3(I / 128, grid_tiles), 256, 0, stream>>>(I4ReferenceSchedule{{a.x,a.out,a},nullptr,nullptr});
         ok(hipGetLastError(), "iu4 R15/down transform");
         iu4_ok(st::quantise_wmma_iu4_activations(a.at, s.aq_down, s.as_down, static_cast<int>(I), static_cast<int>(pairs), stream, 64),
                "iu4 down activation quantiser");

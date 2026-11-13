@@ -581,6 +581,21 @@ PairRun run_pair(unsigned n, std::uint32_t slots, bool batch, std::uint32_t toke
 }  // namespace
 
 int main() {
+    // ---- admission order: LeadConfig::short_first feeds SessionRuntime::reserve_fifo(wait, short_first), which takes
+    // from the shared queue with this selection; off keeps FIFO
+    {
+        CHECK(gs::LeadConfig{}.short_first);
+        for (const bool on : {true, false}) {
+            strix::serve::GenerationQueue q;
+            strix::serve::GenerationJob lng, shrt;
+            lng.prompt.resize(2000);
+            shrt.prompt.resize(10);
+            const auto tl = q.submit(std::move(lng));
+            const auto ts = q.submit(std::move(shrt));
+            auto first = q.take(false, on);
+            CHECK(first && first->ticket == (on ? ts : tl));
+        }
+    }
     // ---- prefix key semantics, byte LRU, full-token collision checks and admission parsing
     {
         auto entry = [](std::uint64_t id, std::vector<std::uint32_t> ids, bool mtp = false, std::uint64_t identity = 7) {

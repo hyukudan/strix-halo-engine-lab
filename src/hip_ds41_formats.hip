@@ -8,6 +8,7 @@
 
 #include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
+#include "moe_core/route.hpp"
 
 #include "strix/ds41_moe.hpp"
 #include "strix/dist/staged_ready.hpp"
@@ -1356,17 +1357,17 @@ __global__ __launch_bounds__(32U * router_row_waves) void router_row_kernel(Rout
 
 // Top-k selection of one row per block: repeated arg-max of score + bias (larger value, then lower
 // id), then the normalized and scaled weights computed by one thread in selection order.
-__device__ __forceinline__ void router_select_body(const RouterView& view, const float* __restrict__ scores,
-                                                   const float* __restrict__ bias, std::uint32_t* __restrict__ ids,
-                                                   float* __restrict__ weights) {
-    __shared__ float biased[1024];
-    __shared__ float best_value[256];
-    __shared__ unsigned best_index[256];
-    __shared__ unsigned chosen[16];
-    const unsigned r = blockIdx.x, t = threadIdx.x;
-    for (unsigned e = t; e < view.experts; e += 256U) biased[e] = scores[e] + bias[e];
-    __syncthreads();
-    for (unsigned k = 0; k < view.top_k; ++k) {
+struct BlockRoutePolicy {
+    static constexpr unsigned threads = 256, max_top_k = 16;
+    const RouterView& view;
+    const float* scores;
+    const float* biased;
+    std::uint32_t* ids;
+    float* weights;
+    __device__ unsigned get_experts() const { return view.experts; }
+    __device__ unsigned get_top_k() const { return view.top_k; }
+    __device__ float score(unsigned e) const { return scores[e]; }
+    __device__ void seed(unsigned t, unsigned k, const unsigned* chosen, float& value, unsigned& out_index) const {
         float v = 0.0F;
         unsigned index = view.experts;
         for (unsigned e = t; e < view.experts; e += 256U) {
@@ -1375,31 +1376,23 @@ __device__ __forceinline__ void router_select_body(const RouterView& view, const
             if (taken) continue;
             if (index == view.experts || biased[e] > v) { v = biased[e]; index = e; }
         }
-        best_value[t] = v; best_index[t] = index;
-        __syncthreads();
-        for (unsigned stride = 128U; stride; stride /= 2U) {
-            if (t < stride) {
-                const float ov = best_value[t + stride];
-                const unsigned oi = best_index[t + stride];
-                const bool better = oi != view.experts &&
-                    (best_index[t] == view.experts || ov > best_value[t] || (ov == best_value[t] && oi < best_index[t]));
-                if (better) { best_value[t] = ov; best_index[t] = oi; }
-            }
-            __syncthreads();
-        }
-        if (t == 0U) chosen[k] = best_index[0];
-        __syncthreads();
+        value = v; out_index = index;
     }
-    if (t == 0U) {
-        float sum = 0.0F;
-        for (unsigned k = 0; k < view.top_k; ++k) sum = sum + scores[chosen[k]];
-        const float denominator = sum + 1e-20F;
-        for (unsigned k = 0; k < view.top_k; ++k) {
-            const float s = scores[chosen[k]];
-            ids[r * view.top_k + k] = chosen[k];
-            weights[r * view.top_k + k] = (view.top_k > 1U ? s / denominator : s) * view.route_scale;
-        }
+    __device__ void write(unsigned r, unsigned k, unsigned id, float denominator) const {
+        const float s = scores[id];
+        ids[r * view.top_k + k] = id;
+        weights[r * view.top_k + k] = (view.top_k > 1U ? s / denominator : s) * view.route_scale;
     }
+};
+
+__device__ __forceinline__ void router_select_body(const RouterView& view, const float* __restrict__ scores,
+                                                   const float* __restrict__ bias, std::uint32_t* __restrict__ ids,
+                                                   float* __restrict__ weights) {
+    __shared__ float biased[1024];
+    const unsigned r = blockIdx.x, t = threadIdx.x;
+    for (unsigned e = t; e < view.experts; e += 256U) biased[e] = scores[e] + bias[e];
+    __syncthreads();
+    strix::moe_core::route_block_topk(BlockRoutePolicy{view, scores, biased, ids, weights}, r, t);
 }
 __global__ __launch_bounds__(256) void router_select_kernel(RouterView view) {
     const unsigned r = blockIdx.x;

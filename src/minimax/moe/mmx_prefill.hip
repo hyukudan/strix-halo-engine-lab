@@ -5,6 +5,7 @@
 #include "minimax/moe/mmx_prefill_core.hpp"
 #include "minimax/moe/mmx_trellis_device.hpp"
 #include "core/activation_quant.hpp"
+#include "core/trellis_device.hpp"
 #ifndef STRIX_MMX_IU4_LIB
 #define STRIX_MMX_IU4_LIB 0
 #endif
@@ -44,38 +45,7 @@ constexpr unsigned kHB = kHidden / 128, kIB = kInter / 128;  // 48, 12
 
 
 // ---------------------------------------------------------------- library WMMA core pieces (gemm.hip, trellis_device.hpp)
-__device__ __forceinline__ float codebook_mul1(std::uint32_t state) {
-    const std::uint32_t product = state * 0x83dcd12dU;
-    const unsigned sum = __builtin_amdgcn_udot4(product, 0x01010101U, 0, false);
-    return __half2float(__float2half_rn(fmaf(static_cast<float>(1024 + sum), __half2float(__ushort_as_half(0x1eee)),
-                                             __half2float(__ushort_as_half(0xc931)))));
-}
-template <int Bits> struct WaveTile {
-    std::uint32_t lo, hi;
-    static constexpr int words = Bits * 8;
-    __device__ explicit WaveTile(const std::uint32_t* data) {
-        const int lane = static_cast<int>(threadIdx.x & 31U);
-        lo = lane < words ? data[lane] : 0;
-        if constexpr (words > 32) hi = lane + 32 < words ? data[lane + 32] : 0;
-        else hi = 0;
-    }
-    __device__ __forceinline__ std::uint32_t word(int index) const {
-        const std::uint32_t first = __shfl(lo, index & 31, 32);
-        if constexpr (words > 32) {
-            const std::uint32_t second = __shfl(hi, index & 31, 32);
-            return index < 32 ? first : second;
-        }
-        return first;
-    }
-    __device__ __forceinline__ std::uint32_t state(int position) const {
-        const int end = (position + 1) * Bits + 256 * Bits;
-        const int start = end - 16;
-        const std::uint32_t earlier = word((start / 32) % words);
-        const std::uint32_t later = word(((end - 1) / 32) % words);
-        const std::uint64_t pair = (static_cast<std::uint64_t>(earlier) << 32) | later;
-        return static_cast<std::uint32_t>(pair >> ((32 - (end & 31)) & 31)) & 65535U;
-    }
-};
+using strix::core::WaveTile;
 using Half16 = _Float16 __attribute__((ext_vector_type(16)));
 using Float8 = float __attribute__((ext_vector_type(8)));
 
@@ -111,7 +81,7 @@ __device__ void wmma_item(const WItem& it, unsigned bx, unsigned by, unsigned bz
             for (int j = 0; j < 8; ++j) {
                 const int r = 2 * (lane % 4) + (j % 2) + 8 * ((j / 2) % 2);
                 const int c = lane / 4 + 8 * (j / 4);
-                q[wave * 256 + r * 16 + c] = static_cast<_Float16>(codebook_mul1(tile.state(8 * lane + j)));
+                q[wave * 256 + r * 16 + c] = static_cast<_Float16>(strix::core::codebook_value(tile.state(8 * lane + j), 2));
             }
         }
         __syncthreads();

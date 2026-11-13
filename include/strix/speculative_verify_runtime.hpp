@@ -159,6 +159,9 @@ struct KnownWindowResult {
     std::array<std::uint32_t, known_window_r2_variant_slots> r2_variant_dispatches{};
     std::vector<std::uint32_t> logit_row_indices;
     std::uint32_t omitted_lm_heads = 0;
+    // Final-block cone (STRIX_PREFILL_FINAL_CONE): first row the coned trailing steps ran from (0: no cone), the
+    // number of coned steps and the 8-row tiles they did not launch.
+    std::uint32_t final_cone_first_row = 0, final_cone_steps = 0, final_cone_skipped_tiles = 0;
 };
 
 // Compatibility entry for two KNOWN input tokens only. This API neither predicts a future greedy token
