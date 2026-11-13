@@ -2428,7 +2428,7 @@ private:
     bool cancel_points_=strix::envcfg::flag("STRIX_BATCH_CANCEL_POINTS", true);
     bool engine_call_=false;
     // Follow-up reuse of a retained slot: on unless STRIX_SERVE_PREFIX_FORK=0 or the baseline mode.
-    bool fork_on_=[this]{const char* v=std::getenv("STRIX_SERVE_PREFIX_FORK");return !(v && v[0]=='0' && v[1]==0) && !options_.baseline;}();
+    bool fork_on_=strix::envcfg::flag("STRIX_SERVE_PREFIX_FORK",true,strix::EnvFlagMatch::exact) && !options_.baseline;
     serve::PrefixDirectory fork_dir_;
     serve::PrefixKey fork_key_{1,1,1}; // constant per server: one model, template and format
     std::uint64_t fork_clock_=0;
