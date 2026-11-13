@@ -307,6 +307,13 @@ los pares más rápidos. A 262K (YaRN factor 2, ruta en serie, `--profile defaul
 intercalados) el prefill pasó de **191.2 a 185.7 s (−2.9 %, 1,371 → 1,412 tok/s)**, cada ejecución fast más rápida
 que cada ejecución default; el decode no cambia. Véase el [catálogo](../../optimizations.md#qwen-moe-route-bf16).
 
+**Poda de rutas MoE: conmutador opcional, desactivado por defecto, fuera de todos los perfiles.**
+`STRIX_QPF2K_MOE_ROUTE_PRUNE=cap9` (o `--prefill-moe-route-prune cap9`) descarta el experto de menor peso de cada fila
+del prefill antes de construir el plan de rutas: alrededor de un 2 % menos de tiempo de prefill a 8,192 y 32,768
+tokens, dentro de la puerta FAST compuesta en ambas longitudes. `cap8` da un 4-5 % y sale de la puerta a 32,768 tokens.
+Cambia los logits y añade `+rp<spec>` a la identidad del prefill; para volver atrás, quite la variable y reinicie.
+Cifras y gramática: [moe-route-prune](../../engine/kernels/moe-route-prune.md).
+
 **GDN por bloques en WMMA FP16 en el prefill: candidato opcional (opt-in), pendiente de cualificación.**
 `STRIX_QPF2K_GDN_FP16_CHUNK=1` (o `--gdn-fp16-chunk 1`) ejecuta la convolución, la recurrencia y la norma con puerta de
 las capas GDN en bloques de 32 filas sobre WMMA FP16 con acumulación FP32 y estado FP32 (identidad
