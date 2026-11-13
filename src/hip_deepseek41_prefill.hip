@@ -1816,6 +1816,12 @@ PrefillResult DevicePrefill::run_from(std::span<const std::uint32_t> tokens, std
     std::vector<std::shared_future<void>> engram_futures;
     std::future<double> engram_job;  // destroyed (joined) before gates, promises and requests
     bool engram_split_read = true, engram_layer_blocks = false;
+    // Engram rows read in pieces (one read-ahead block per Engram chunk of every layer, in the order the layer runs them):
+    // a chunk's kernels wait only for their own rows, so the first Engram layer runs while the rest of its rows still
+    // come off the disk (a new prompt's rows are random 4 KiB reads; the layer used to wait for all of them). Same rows,
+    // same kernels: bitwise identical. Default on; STRIX_DS41_ENGRAM_PIECE_READ=0: one block per layer / first + rest.
+    std::size_t engram_piece_blocks = 0;  // blocks per layer (0: off)
+    std::uint32_t engram_piece_rows = 0;
     m.join_engram_ahead();  // the previous run's lookahead: its rows are in the payload cache (or it failed: read below)
     const std::vector<std::uint32_t> engram_next = std::exchange(m.engram_next, {});
     {
@@ -1917,7 +1923,14 @@ PrefillResult DevicePrefill::run_from(std::span<const std::uint32_t> tokens, std
                 // the same shared read-ahead loop to independently ready layers.
                 const std::size_t layer_requests = std::size_t{Tn} * engram_cols;
                 std::vector<std::size_t> offsets{0};
-                if (engram_split_read) {
+                const char* piece_env = std::getenv("STRIX_DS41_ENGRAM_PIECE_READ");
+                if (engram_split_read && !engram_layer_blocks && Tn > 0U && !(piece_env && std::strcmp(piece_env, "0") == 0)) {
+                    engram_piece_rows = m.task != nullptr && m.task->opt.engram_rows != 0U ? std::min(m.task->opt.engram_rows, C) : C;
+                    engram_piece_blocks = (Tn + engram_piece_rows - 1U) / engram_piece_rows;
+                    offsets.clear();
+                    for (std::size_t at = 0; at < requests.size(); at += layer_requests)
+                        for (std::size_t r0 = 0; r0 < Tn; r0 += engram_piece_rows) offsets.push_back(at + r0 * engram_cols);
+                } else if (engram_split_read) {
                     if (engram_layer_blocks)
                         for (std::size_t at = layer_requests; at < requests.size(); at += layer_requests) offsets.push_back(at);
                     else if (engram_layers.size() >= 2U) offsets.push_back(layer_requests);
@@ -1957,14 +1970,16 @@ PrefillResult DevicePrefill::run_from(std::span<const std::uint32_t> tokens, std
         }
         result.engram_seconds = seconds_since(t0);
     }
-    const auto join_engram = [&](std::uint32_t layer) {
+    const auto join_engram = [&](std::uint32_t layer, std::uint32_t row = 0xFFFFFFFFU) {  // row: the piece starting there
         if (!engram_job.valid()) return;
+        if (layer != 0xFFFFFFFFU && (engram_piece_blocks != 0U) != (row != 0xFFFFFFFFU)) return;  // pieces: joined per piece
         const auto t0 = std::chrono::steady_clock::now();
         if (layer != 0xFFFFFFFFU) {
             const auto& ids = m.model.engram.layer_ids;
             const auto li = static_cast<std::uint32_t>(std::find(ids.begin(), ids.end(), layer) - ids.begin());
             const auto at = static_cast<std::size_t>(std::find(engram_layers.begin(), engram_layers.end(), li) - engram_layers.begin());
-            const auto block = !engram_split_read ? 0U : engram_layer_blocks ? at : std::min<std::size_t>(at, 1U);
+            const auto block = engram_piece_blocks != 0U ? at * engram_piece_blocks + row / engram_piece_rows
+                               : !engram_split_read ? 0U : engram_layer_blocks ? at : std::min<std::size_t>(at, 1U);
             if (engram_ready) engram_ready->wait(block, st);
             else engram_futures.at(block).get();
         } else {
@@ -2151,6 +2166,7 @@ PrefillResult DevicePrefill::run_from(std::span<const std::uint32_t> tokens, std
                 const std::uint32_t n = std::min(E, Tn - r0);
                 cut(PrefillUnitLevel::finest, s.layer, "engram");
                 ++engram_cut;
+                join_engram(layer, r0);  // piece blocks: this chunk's rows only (else joined above)
                 check(hipMemcpyAsync(m.erows.p, erow + std::size_t{r0} * engram_cols * 264U, std::size_t{n} * engram_cols * 264U,
                                      hipMemcpyHostToDevice, st), "engram rows");
                 ds41::enqueue_engram_rows_bf16(m.erows.p, n * engram_cols, m.emb.p, st);
