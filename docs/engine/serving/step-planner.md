@@ -22,7 +22,10 @@ Both are printed as `serve lever` lines at the first decode round (`step_planner
   service) to the debt; the decode round and constrained serial work pay it back. With no prompt waiting,
   the debt is cleared.
 - Decode gap: with `STRIX_SERVE_DECODE_GAP_MS` set, the unit is chosen from the certified sizes (tail
-  unit or full block) using the observed per-row prompt cost.
+  unit or full block) using only observed single tiled-unit cost (a conservative prior until
+  measured). Serial, alignment, window and grouped work do not train that estimate. A bounded
+  step does not group tiled units. Debt accounting uses actual position deltas across all
+  executed prompt lanes, including grouped and window lanes, before completion releases them.
 
 With the default gap (`0`) the sequence of prompt units and decode rounds equals the loop's own policy,
 except that the eight-overtake starvation bound is enforced.

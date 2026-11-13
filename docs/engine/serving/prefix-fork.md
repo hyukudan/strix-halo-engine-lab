@@ -1,8 +1,9 @@
 # Prefix fork: follow-up reuse of a retained batch slot
 
-The batched Qwen MTP HTTP server answers a follow-up turn without prefilling the part of
-the prompt that a finished request already consumed. `STRIX_SERVE_PREFIX_FORK=0` (or the
-baseline mode) keeps every admission cold.
+The batched Qwen MTP HTTP server can experimentally reuse the part of a follow-up prompt
+that a finished request already consumed. This is OFF by default;
+`STRIX_SERVE_PREFIX_FORK=1` opts in for matching prefill/decode profiles only. Split profiles
+and baseline mode always decline reuse. `STRIX_SERVE_PREFIX_FORK=0` keeps admissions cold.
 
 ## What it does
 
@@ -50,7 +51,9 @@ Frontiers shorter than 256 tokens are not retained (the directory minimum).
 
 ## Exactness
 
-Token ids equal a cold run of the same prompt (device gate). The state of a resumed slot was
-produced partly by decode rows and partly by prefill, so its arithmetic lineage differs from a
-cold prefill; the gate compares generated ids and the final-state digests
-(`STRIX_FINAL_STATE_DIGEST`) against a cold run.
+Cold equivalence is unqualified. The retained history includes decode-produced rows, and
+the resumed suffix can assign different arithmetic to rows than a cold prefill. Frontier and
+lineage validity do not establish equivalence to that cold schedule. Automatic reuse remains
+OFF pending a native gate that requires observed hits and restored tokens, then compares
+complete output token IDs, logits and state payloads against OFF, with unchanged capacity
+and interleaved cold-cost and warm-reuse measurements.

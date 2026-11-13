@@ -12,6 +12,7 @@
 #include "strix/dist/communicator.hpp"
 #include "qwen_tiled_prompt_plan.hpp"
 #include "strix/serve/engine.hpp"
+#include "strix/mtp_cohort_partition.hpp"
 #include "strix/qpf2k_defaults.hpp"
 #include "strix/hip_indexed_attention_launcher.hpp"
 #include "strix/serve/health.hpp"
@@ -440,6 +441,7 @@ public:
     TiledMtpPrompt& operator=(const TiledMtpPrompt&)=delete;
     [[nodiscard]] bool done() const noexcept {return phase_==Phase::done;}
     [[nodiscard]] std::uint64_t position() const noexcept {return pos_;}
+    [[nodiscard]] std::uint64_t tiled_units() const noexcept {return blocks_+tail_blocks_;}
     [[nodiscard]] std::uint64_t remaining() const noexcept {return n_-pos_;}
     [[nodiscard]] std::uint64_t restored() const noexcept {return restored_;}
     [[nodiscard]] bool lookup_deferred() const noexcept {return deferred_lookup_;}
@@ -1499,6 +1501,8 @@ public:
             return sa!=sb?sa:a.order<b.order;
         };
         step_decode_ms_ = 0.0;step_prompt_ms_ = 0.0;step_suspended_ms_ = 0.0;
+        step_prompt_rows_ = 0;
+        bool solo_tiled = false;
         const bool planner_on = step_planner_enabled();
         std::uint32_t plan_rows = 0, plan_small_unit = 0, plan_block_unit = 0;
         bool plan_gap = false;
@@ -1532,14 +1536,17 @@ public:
             limits.co_forward = false;
             limits.prompt_share = prompt_share_;
             limits.short_first_rows = short_rows;
+            // The debt ledger counts all executed rows, but serial/window/group throughput
+            // must not train the cost used to choose a single tiled unit.
+            const serve::StepPlan plan = step_planner_.plan(lanes, limits);
+            limits.prompt_share = 0.0;
             limits.max_decode_gap_ms = step_decode_gap_ms_;
             limits.prompt_row_ms = 1.9;
             if (plan_block_unit > plan_small_unit) limits.prompt_units = std::span<const std::uint32_t>(units, 2);
-            const serve::StepPlan plan = step_planner_.plan(lanes, limits);
             plan_gap = step_decode_gap_ms_ > 0.0 && decoding;
             if (plan.prompt_before_decode && !plan.prompt.empty()) {
                 prompt = slots_[plan.prompt[0].lane].get();
-                plan_rows = plan.prompt[0].rows;
+                plan_rows = tiled_step_planner_.plan(lanes, limits).prompt.front().rows;
                 for (const auto lane : plan.overtaken) ++slots_[lane]->overtakes;
             }
         } else {
@@ -1561,8 +1568,14 @@ public:
             const auto t0 = clock::now();const auto suspended_before=stats_.service_ms_suspended;
             try {
                 if(cancel_requested(*prompt)) cancel_prefill(*prompt,false);
-                else if (!run_prompt_group(*prompt) && !run_prompt_windows(*prompt)) {
+                // A grouped launch can exceed the single unit's decode-gap budget.
+                else if ((plan_gap || !run_prompt_group(*prompt)) && !run_prompt_windows(*prompt)) {
+                    const auto tiled_before = prompt->prefill->tiled_units();
+                    const auto before = prompt->prefill->position();
                     prompt->prefill->step(serial_rows_per_step_);
+                    const auto rows = prompt->prefill->position() - before;
+                    step_prompt_rows_ += rows;
+                    solo_tiled = prompt->prefill->tiled_units() > tiled_before;
                     if(cancel_requested(*prompt)) cancel_prefill(*prompt,false);
                     else if (prompt->prefill->done()) complete_prompt(*prompt);
                 }
@@ -1597,7 +1610,11 @@ public:
             if constexpr (track_completion) serial_completed |= s.result.cycles != previous_cycles;
         }
         const auto account_step=[&] {
-            if (planner_on) step_planner_.account(step_prompt_ms_, step_decode_ms_, step_suspended_ms_, step_prompt_ms_ > 0.0 ? plan_rows : 0);
+            if (planner_on) {
+                step_planner_.account(step_prompt_ms_, step_decode_ms_, step_suspended_ms_, step_prompt_rows_);
+                if (solo_tiled && step_prompt_rows_)
+                    tiled_step_planner_.account(step_prompt_ms_, 0.0, step_suspended_ms_, step_prompt_rows_);
+            }
         };
         if constexpr (track_completion) {
             const bool round = run_decode_round();
@@ -1712,7 +1729,22 @@ private:
         // The row budget (on unless STRIX_SERVE_ROW_BUDGET=0 or the baseline mode) runs the joint cycle: its
         // controller then plans with the budget rule.
         const bool joint=strix::envcfg::flag("STRIX_MTP_BATCH_JOINT", false) || (mtp_serve_row_budget_enabled() && !options_.baseline);
-        auto results = hip_mtp_greedy_cohort_cycle(members, &stats_.cohort,joint?&joint_:nullptr,joint?&policy_joint_:nullptr);
+        auto results = [&] {
+            // Joint owners have at least two physical rows. Until that runtime carries
+            // draft demand separately, use the cap-respecting ordinary route for zero demand.
+            if (!joint || std::any_of(members.begin(), members.end(), [](const auto& c) { return c.maximum_candidates == 0U; }))
+                return hip_mtp_greedy_cohort_cycle(members, &stats_.cohort, nullptr, nullptr);
+            std::vector<HipMtpGreedyCycleResult> out(members.size());
+            // Bound the input before the runtime splits policy and ordinary histories;
+            // its policy branch otherwise bypasses the ordinary cohort partitioner.
+            for (const auto& group : mtp_cohort_partition(members.size(), joint_group_start_++)) {
+                std::vector<HipMtpGreedyCohortMember> part;
+                for (const auto index : group) part.push_back(members[index]);
+                auto chunk = hip_mtp_greedy_cohort_cycle(part, &stats_.cohort, &joint_, &policy_joint_);
+                for (std::size_t k = 0; k < group.size(); ++k) out[group[k]] = std::move(chunk[k]);
+            }
+            return out;
+        }();
         runtime_done(results);
         for (std::size_t k = 0; k < live.size(); ++k) live[k]->result.shared_execution.add(results[k].shared);
         for (std::size_t k = 0; k < live.size(); ++k) apply(*live[k], std::move(results[k]));
@@ -2073,7 +2105,9 @@ private:
         for (std::size_t k = 0; k < members.size(); ++k) {
             auto& s = *members[k].slot;
             try {
+                const auto before = s.prefill->position();
                 s.prefill->finish_block(members[k].block, logits[k], true,(lead.group?lead.group_owner:lead.block_owner).get());
+                step_prompt_rows_ += s.prefill->position() - before;
                 if(cancel_requested(s)) cancel_prefill(s,false);
                 else if (s.prefill->done()) complete_prompt(s);
             } catch(const serve::ConstraintError& e) {constraint_failed(s,e);}
@@ -2120,7 +2154,9 @@ private:
         auto tickets=HipMtpWindowVerifier::prompt_rows_cohort(requests);
         for (std::size_t k = 0; k < members.size(); ++k) {
             auto& s = *members[k];
+            const auto before = s.prefill->position();
             s.prefill->finish_window(std::move(tickets[k]),members.size()>1U);
+            step_prompt_rows_ += s.prefill->position() - before;
             if(cancel_requested(s)) cancel_prefill(s,false);
             else if (s.prefill->done()) complete_prompt(s);
         }
@@ -2380,7 +2416,9 @@ private:
     // Interleaved admission: decode time owed to the requests past their prompt for the prompt units run.
     double prompt_debt_ms_ = 0.0;
     // STRIX_SERVE_STEP_PLANNER=1: the shared planner owns the debt ledger; per-step times feed its account().
-    serve::StepPlanner step_planner_;
+    serve::StepPlanner step_planner_, tiled_step_planner_;
+    std::uint64_t step_prompt_rows_ = 0;
+    std::size_t joint_group_start_ = 0;
     double step_decode_ms_ = 0.0, step_prompt_ms_ = 0.0, step_suspended_ms_ = 0.0;
     // The shared step planner: on unless STRIX_SERVE_STEP_PLANNER=0 or the baseline mode.
     bool step_planner_enabled() const {
@@ -2425,8 +2463,13 @@ private:
     unsigned lookahead_=[] {const char* v=std::getenv("STRIX_BATCH_SERVICE_LOOKAHEAD");return v?static_cast<unsigned>(std::clamp(std::atol(v),0L,64L)):2U;}();
     bool cancel_points_=strix::envcfg::flag("STRIX_BATCH_CANCEL_POINTS", true);
     bool engine_call_=false;
-    // Follow-up reuse of a retained slot: on unless STRIX_SERVE_PREFIX_FORK=0 or the baseline mode.
-    bool fork_on_=strix::envcfg::flag("STRIX_SERVE_PREFIX_FORK",true,strix::EnvFlagMatch::exact) && !options_.baseline;
+    // Retained decode rows and resumed suffixes need cold-schedule qualification.
+    // Keep reuse explicit-only, and decline split arithmetic even when requested.
+    bool fork_on_=[&] {
+        const auto pair = numerical_profile_pair(options_);
+        return !options_.baseline && pair.prefill == pair.decode &&
+            strix::envcfg::flag("STRIX_SERVE_PREFIX_FORK", false, strix::EnvFlagMatch::exact);
+    }();
     serve::PrefixDirectory fork_dir_;
     serve::PrefixKey fork_key_{1,1,1}; // constant per server: one model, template and format
     std::uint64_t fork_clock_=0;
