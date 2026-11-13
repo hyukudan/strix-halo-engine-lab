@@ -1,24 +1,35 @@
 // Energy and power as a shared measurement: host only, model agnostic, no device runtime.
 //
-// A Sampler owns a list of Sources and a background thread that reads them at a fixed period into a fixed ring of
+// A Sampler owns a list of Sources and one worker thread that reads them at a fixed period into a fixed ring of
 // Samples. Nothing here needs elevated rights or changes a system setting: a source reads what the machine already
 // exposes, and a source that is missing or unreadable reports "unavailable" with the reason and is skipped. A run never
 // fails because of this file.
 //
-// Receipt: summarize(t0, t1, tokens) turns a time window of the ring into energy_j, avg_w, peak_w, tok_per_j, the
-// median GPU clock and the maximum temperature. Energy comes from a package energy counter when one is readable
-// (counter difference, wrap handled by the source), otherwise from the trapezoid integral of the power samples. The
-// window edges are interpolated between the neighbouring samples, so a caller only needs the timestamps it already has.
+// Domains: every energy counter and power reading belongs to one Domain (package, accelerator, system). Energy of a
+// window is computed per domain (the counter when it covers at least as much of the window as the power readings of the
+// same domain, otherwise the trapezoid integral of the power readings) and the disjoint domains are added. A receipt
+// names what it covers ("package:counter+accelerator:power-integral"): it is the energy of those domains, not of the
+// whole machine, unless the coverage says "system".
+//
+// Coverage: nothing is extended or invented. A stretch between two valid readings of a channel is covered when they are
+// at most Options::max_gap_ms apart (linear interpolation inside it); anything else (a failed read, a window older than
+// the ring, a window that ends after the last sample) is not covered. A receipt carries covered_ms and complete; an
+// incomplete receipt reports the energy of the covered part only and no tok_per_j.
+//
+// Threads: the sources are read by one thread at a time (the worker, or a caller of sample_now/sample_at). Readers of
+// the ring never touch a sensor: status and receipts use what the worker stored. cover() asks the worker for one
+// closing sample and waits a bounded time for it; the worker never samples faster than Options::min_interval_ms.
 //
 // Process sampler: start_process_sampler() starts one sampler per process (the device gate calls it, so an engine does
-// not). request_block() / block_json() build the one shared receipt block "strix-power-receipt-v1" that every CLI and
-// the server print. Switch: STRIX_POWER_SAMPLER=0 turns the sampler and every receipt off; STRIX_POWER_SAMPLE_MS sets
-// the period (default 100, range 10..10000).
+// not). The receipt block "strix-power-receipt-v1" is what every CLI and the server print. Switch:
+// STRIX_POWER_SAMPLER=0 turns the sampler and every receipt member off; STRIX_POWER_SAMPLE_MS sets the period (default
+// 100, range 10..10000).
 //
-// A new device (a discrete card, an accelerator, another OS) is one Source subclass plus one register_source() call;
-// no caller changes. See docs/engine/power-receipt.md.
+// A new device (a discrete card, an accelerator, a wall meter, another OS) is one Source subclass plus one
+// register_source() call; no caller changes. See docs/engine/power-receipt.md.
 #pragma once
 
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -29,6 +40,7 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <vector>
 
@@ -36,26 +48,48 @@ namespace strix::power {
 
 inline constexpr double kAbsent = std::numeric_limits<double>::quiet_NaN();
 
+// What a counter or a power reading measures. package: the CPU or SoC package (an integrated GPU is inside it);
+// accelerator: discrete cards, outside every package; system: the whole machine (a wall or board meter), which
+// replaces the other two when present.
+enum class Domain : std::uint8_t { package = 0, accelerator = 1, system = 2 };
+inline constexpr std::size_t kDomains = 3;
+[[nodiscard]] const char* domain_name(Domain domain) noexcept;
+
 // One reading of every channel. A channel nobody filled stays NaN.
 struct Sample {
-    std::int64_t t_ns = 0;        // steady clock
-    double energy_j = kAbsent;    // cumulative package energy since the source's first read (sum over packages)
-    double power_w = kAbsent;     // instantaneous power, summed over the sources that report a power domain
+    std::int64_t t_ns = 0;  // steady clock
+    std::array<double, kDomains> energy_j{kAbsent, kAbsent, kAbsent};  // cumulative since the source's first read
+    std::array<double, kDomains> power_w{kAbsent, kAbsent, kAbsent};   // instantaneous
     double gpu_clock_mhz = kAbsent;
     double temp_c = kAbsent;      // maximum over the sources that report one
     double cpu_mhz = kAbsent;     // mean over the CPU frequency policies
     double gpu_busy_pct = kAbsent;
+    std::uint8_t energy_bad = 0, power_bad = 0;  // domains a source failed to read in this sample (bit = domain)
+
+    // Sources of one domain add up. A negative or non-finite value is a failed read.
+    void add_power(Domain domain, double watts) noexcept;
+    void add_energy(Domain domain, double joules) noexcept;
+    // A source that owns part of a domain and could not read it: the domain is absent from this sample, never partial.
+    void fail_power(Domain domain) noexcept { power_bad = static_cast<std::uint8_t>(power_bad | (1U << static_cast<unsigned>(domain))); }
+    void fail_energy(Domain domain) noexcept { energy_bad = static_cast<std::uint8_t>(energy_bad | (1U << static_cast<unsigned>(domain))); }
+    // Sum of the power domains read (system alone when present); NaN when none.
+    [[nodiscard]] double total_power_w() const noexcept;
 };
+
+// One sysfs-style number: an optional sign and decimal digits, then only blanks or line ends. Anything else (a
+// numeric prefix followed by other bytes, an empty text, more than 18 digits) is not a number.
+[[nodiscard]] bool parse_value(std::string_view text, double& value) noexcept;
 
 struct SourceStatus {
     std::string name;      // "amdgpu-hwmon", "rapl", "cpufreq", ...
     bool available = false;
-    std::string detail;    // available: what is read (channels); unavailable: the reason
+    std::string detail;    // available: what is read (channels, domain); unavailable: the reason
 };
 
 // A device or counter. probe() runs once before the first read and must not throw; read() adds what it has to the
-// sample (energy and power are added to what is there, temperature takes the maximum, the clocks are set when absent)
-// and must be cheap: it runs on the sampler thread every period.
+// sample (add_power / add_energy with its domain, fail_* when a channel it owns could not be read, temperature takes
+// the maximum, the clocks are set when absent) and must be cheap: it runs on the sampler thread every period. Calls
+// are serialized by the sampler: a source needs no lock of its own.
 class Source {
 public:
     virtual ~Source() = default;
@@ -75,15 +109,22 @@ struct Receipt {
     std::string reason;            // when not available
     double duration_ms = 0.0, energy_j = 0.0, avg_w = 0.0, peak_w = 0.0;
     std::uint64_t tokens = 0;
-    double tok_per_j = 0.0;        // 0 when tokens or energy is 0
+    double tok_per_j = 0.0;        // 0 when tokens or energy is 0, or the receipt is not complete
     double gpu_clock_mhz_median = 0.0, temp_c_max = 0.0, cpu_mhz_median = 0.0, gpu_busy_pct_mean = 0.0;
     std::size_t samples = 0;       // samples inside the window
-    std::string energy_source;     // "counter" | "power-integral"
+    std::string energy_source;     // "counter" | "power-integral" | "mixed"
+    // complete: every domain the sampler measures covers the whole window. Otherwise energy_j is the energy of the
+    // covered part only, avg_w its mean power, and covered_ms the part every domain covers.
+    bool complete = false;
+    double covered_ms = 0.0;
+    std::string coverage;          // "package:counter+accelerator:power-integral"; ":none" for a domain with no reading
 };
 
 struct Options {
     int period_ms = 100;
     std::size_t capacity = 1U << 16;  // ring size in samples
+    int max_gap_ms = 0;       // longest stretch between two valid readings that still counts as covered; 0: max(1000, 3 periods)
+    int min_interval_ms = 0;  // shortest spacing of worker samples when cover() asks for one; 0: period / 10 within 1..10
 };
 
 class Sampler {
@@ -97,17 +138,26 @@ public:
     [[nodiscard]] bool available() const noexcept { return usable_; }
     [[nodiscard]] const std::vector<SourceStatus>& sources() const noexcept { return status_; }
 
-    void start();  // background thread; no-op when nothing is available or already started
+    void start();  // worker thread; no-op when nothing is available or already started
     void stop();
-    // Reads every source now on the calling thread and stores the sample (used at window edges and by tests, which pass
-    // the timestamp).
+    // Reads every source on the calling thread and stores the sample (tests pass the timestamp). Serialized with the
+    // worker; a timestamp that is not newer than the last sample is refused before any source is read.
     void sample_now();
     void sample_at(std::int64_t t_ns);
+    // Makes the ring reach t_ns: asks the worker for one sample (never faster than min_interval_ms) and waits at most
+    // timeout_ms for it. True when a sample at or after t_ns is stored. Without a worker it only reports.
+    bool cover(std::int64_t t_ns, int timeout_ms);
     [[nodiscard]] Sample latest() const;
     [[nodiscard]] std::size_t sample_count() const;
-    // Energy and time over every sample taken so far (not limited by the ring).
-    void lifetime(double& joules, double& seconds) const;
+    // True once any domain delivered an energy counter or a power reading.
+    [[nodiscard]] bool energy_available() const;
+    // Every stretch measured since the first sample (not limited by the ring): duration_ms is the span first..last
+    // sample, covered_ms / complete as in a window receipt.
+    [[nodiscard]] Receipt lifetime_receipt() const;
+    void lifetime(double& joules, double& seconds) const;  // energy and covered time of lifetime_receipt()
     [[nodiscard]] Receipt summarize(std::int64_t t0_ns, std::int64_t t1_ns, std::uint64_t tokens) const;
+    [[nodiscard]] int period_ms() const noexcept { return options_.period_ms; }
+    [[nodiscard]] int min_interval_ms() const noexcept { return options_.min_interval_ms; }
 
     [[nodiscard]] static std::int64_t now_ns() noexcept {
         return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
@@ -116,8 +166,14 @@ public:
         return std::chrono::duration_cast<std::chrono::nanoseconds>(t.time_since_epoch()).count();
     }
 
+    // One channel of one domain: joules and nanoseconds over its covered stretches, the steepest reading, and the last
+    // valid reading (lifetime only).
+    struct Cover { double joules = 0.0; std::int64_t ns = 0; double peak = 0.0; std::int64_t last_t = 0; double last_v = kAbsent; };
+    using Covers = std::array<std::array<Cover, kDomains>, 2>;  // [0] counter, [1] power
+
 private:
     void run();
+    void sample_locked(std::int64_t t_ns);  // read_mutex_ held
     [[nodiscard]] std::vector<Sample> window_locked(std::int64_t t0_ns, std::int64_t t1_ns, std::size_t& inside, bool& lead) const;
 
     std::vector<std::unique_ptr<Source>> sources_;
@@ -125,23 +181,21 @@ private:
     std::vector<Source*> live_;
     Options options_;
     bool usable_ = false;
-    mutable std::mutex mutex_;       // ring
+    mutable std::mutex mutex_;       // ring, lifetime
     std::mutex read_mutex_;          // one reader of the sources at a time
     std::vector<Sample> ring_;
     std::size_t head_ = 0, size_ = 0;
-    double lifetime_j_ = 0.0, lifetime_s_ = 0.0;
+    Covers life_{};
+    std::int64_t first_ns_ = 0, last_ns_ = 0;
+    std::uint8_t seen_energy_ = 0, seen_power_ = 0;
     std::thread thread_;
     std::mutex wake_mutex_;
-    std::condition_variable wake_;
+    std::condition_variable wake_, sampled_;
+    std::int64_t want_ns_ = 0, stored_ns_ = 0;  // wake_mutex_: newest timestamp asked for / stored by the worker
     bool stopping_ = false, started_ = false;
 };
 
 // ---- the shared receipt block -------------------------------------------------------------------------------------
-
-struct Phase {
-    double ms = 0.0;           // wall time of the phase
-    std::uint64_t tokens = 0;  // tokens the phase produced (prefill: prompt tokens computed; decode: tokens emitted)
-};
 
 struct Block {
     bool enabled = false;      // false: STRIX_POWER_SAMPLER=0
@@ -163,15 +217,28 @@ void mark_first_token() noexcept;
 void reset_first_token() noexcept;
 [[nodiscard]] std::int64_t first_token_ns() noexcept;  // 0 when not marked
 
-// Block for a request that ended at end_ns: decode is the last decode.ms, prefill the prefill.ms before it.
-[[nodiscard]] Block request_block(std::int64_t end_ns, Phase prefill, Phase decode);
+// The receipt of the windows [p0, d0] (prefill, absent when d0 <= p0), [d0, end] (decode, absent when end <= d0) and
+// [p0, end] (request) of one sampler. Reads the ring only; call Sampler::cover(end) first for a window that just ended.
+[[nodiscard]] Block window_block(const Sampler& sampler, std::int64_t p0_ns, std::int64_t d0_ns, std::int64_t end_ns,
+                                 std::uint64_t prefill_tokens, std::uint64_t decode_tokens);
+// Block of a request the process executed over [begin, end] (the execution timestamps, never the time a response is
+// rendered): decode is its last decode_ms, prefill everything before. Time inside the span in which the machine ran
+// other requests belongs to the window: the receipt is machine energy over the span. Asks the worker for one closing
+// sample (bounded wait). Build it once per request and reuse the result.
+[[nodiscard]] Block execution_block(std::int64_t begin_ns, std::int64_t end_ns, double decode_ms,
+                                    std::uint64_t prefill_tokens, std::uint64_t decode_tokens);
 // Block for a request [start, stop]: split at the first-token mark when it lies inside (prefill includes the first
 // token, as the request timing does; decode is the remaining generated - 1 tokens), otherwise one prefill phase.
 [[nodiscard]] Block request_block(std::chrono::steady_clock::time_point start, std::chrono::steady_clock::time_point stop,
                                   std::uint64_t prompt_tokens, std::uint64_t generated_tokens);
 // {"schema":"strix-power-receipt-v1",...}; one line, no trailing newline.
 [[nodiscard]] std::string block_json(const Block& block);
-// Process view for a status page: sources, the latest reading and the totals since the sampler started.
+// "power":{...} for a JSON object a CLI prints, or empty when the sampler is switched off: the member is then absent
+// and the output has the shape it had before the receipt existed.
+[[nodiscard]] std::string block_member(const Block& block);
+// Process view for a status page: sources, the latest stored reading and the totals since the sampler started. Reads
+// no sensor. A channel without a reading is null, never 0; energy_available tells a clock-only host apart.
 [[nodiscard]] std::string status_json();
+[[nodiscard]] std::string status_json(const Sampler* sampler, bool enabled, const std::vector<SourceStatus>& sources);
 
 }  // namespace strix::power

@@ -4707,12 +4707,14 @@ by the IOMMU.
 One host sampler thread reads what the machine exposes without elevated rights (amdgpu hwmon power, clock and
 temperature; the powercap package energy counter when readable; cpufreq) and every engine reports the same block,
 `strix-power-receipt-v1`: `energy_j`, `avg_w`, `peak_w` and `tok_per_j` for prefill and decode, the median GPU
-clock, the maximum temperature, the sample count and the sources used. See
+clock, the maximum temperature, the sample count and the sources used. The energy is computed per domain
+(package, accelerator, system) and the receipt names what it covers (`coverage`) and whether the window is fully
+measured (`complete`, `covered_ms`); nothing is extended over a failed read or past the ring. See
 [engine/power-receipt.md](engine/power-receipt.md).
 
 - **Preconditions:** A readable source. A missing or unreadable source is reported as unavailable with the reason; the run continues.
 - **Automatic selection:** Started by the device gate and by the HTTP server; an engine adds nothing.
-- **Fallback notice:** `"available":false` with the reason per source in the receipt block.
+- **Fallback notice:** `"available":false` with the reason per source in the receipt block; `"complete":false` with `covered_ms` when only part of the window was measured.
 - **Exactness evidence:** Host-only measurement: no device call, no arithmetic. Qwen 8K prefill, sampler on vs off: logits file and generated tokens byte-identical.
 - **Measured:** Measurement, not a speed lever. Qwen 8K real-text prefill, one node, default exact route, sampler on/off interleaved (ABAB): 1,755.9 / 1,744.5 tok/s on vs 1,752.9 / 1,733.5 off (no slowdown), logits and tokens identical. First receipts: prefill 577-588 J, 123.5-125.4 W mean, 150-152 W peak, 13.9-14.2 tok/J, median GPU clock 2,512-2,524 MHz, 84-92 C; serial greedy decode 128 tokens: 544 J, 95.7 W mean, 0.235 tok/J, 2,873 MHz.
 - **Off switch:** `STRIX_POWER_SAMPLER=0`.

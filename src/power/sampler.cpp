@@ -38,13 +38,15 @@ public:
     ValueFile() = default;
     ValueFile(const ValueFile&) = delete;
     ValueFile& operator=(const ValueFile&) = delete;
-    ValueFile(ValueFile&& other) noexcept : path_(std::move(other.path_)), fd_(other.fd_) { other.fd_ = -1; }
+    ValueFile(ValueFile&& other) noexcept : path_(std::move(other.path_)), fd_(other.fd_), signed_(other.signed_) { other.fd_ = -1; }
     ~ValueFile() { close_fd(); }
 
     // False with the reason when the file cannot be opened or does not hold a number.
-    bool open(const std::string& path, std::string& why) {
+    // signed_value: the channel can be negative (a temperature); every other channel refuses a negative number.
+    bool open(const std::string& path, std::string& why, bool signed_value = false) {
         close_fd();
         path_ = path;
+        signed_ = signed_value;
 #if STRIX_POWER_POSIX
         fd_ = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
         if (fd_ < 0) { why = errno_reason(errno, path); path_.clear(); return false; }
@@ -58,6 +60,7 @@ public:
         return true;
     }
     [[nodiscard]] bool is_open() const noexcept { return !path_.empty() && (STRIX_POWER_POSIX ? fd_ >= 0 : true); }
+    // A complete number only (parse_value).
     bool read(double& value) const noexcept {
         char text[64];
         std::size_t got = 0;
@@ -74,10 +77,11 @@ public:
         std::fclose(file);
         if (!got) return false;
 #endif
-        text[got] = '\0';
-        char* end = nullptr;
-        const double parsed = std::strtod(text, &end);
-        if (end == text || !std::isfinite(parsed)) { errno = 0; return false; }
+        errno = 0;
+        double parsed = 0.0;
+        // A text that fills the buffer may be cut short: not a number.
+        if (got >= sizeof(text) - 1 || !parse_value(std::string_view(text, got), parsed)) return false;
+        if (parsed < 0.0 && !signed_) return false;
         value = parsed;
         return true;
     }
@@ -91,6 +95,7 @@ private:
     }
     std::string path_;
     int fd_ = -1;
+    bool signed_ = false;
 };
 
 std::string read_word(const fs::path& path) {
@@ -112,7 +117,7 @@ std::vector<fs::path> children(const fs::path& directory) {
     return out;
 }
 
-void add(double& slot, double value) noexcept { slot = finite(slot) ? slot + value : value; }
+bool present(const fs::path& path) { std::error_code error; return fs::exists(path, error); }
 void set_max(double& slot, double value) noexcept { slot = finite(slot) ? std::max(slot, value) : value; }
 void set_if_absent(double& slot, double value) noexcept { if (!finite(slot)) slot = value; }
 
@@ -134,9 +139,15 @@ public:
             else if (first_problem.empty()) first_problem = why;
             if (const auto label = read_word(dir / "power1_label"); card.power.is_open() && !label.empty()) what += "(" + label + ")";
             if (card.clock.open((dir / "freq1_input").string(), why)) what += " freq1_input";
-            if (card.temp.open((dir / "temp1_input").string(), why)) what += " temp1_input";
+            if (card.temp.open((dir / "temp1_input").string(), why, true)) what += " temp1_input";
             if (card.busy.open((dir / "device" / "gpu_busy_percent").string(), why)) what += " gpu_busy_percent";
             if (!card.power.is_open() && !card.clock.is_open() && !card.temp.is_open()) continue;
+            // The driver shows in1 (vddnb) on an integrated device only and a fan on a card only. An integrated
+            // device's power is the SoC package (the same domain as a package counter); a card is its own domain.
+            // Neither marker: taken as package, so a package counter is never added to it twice.
+            const bool integrated = present(dir / "in1_input"), card_fan = present(dir / "fan1_input") || present(dir / "pwm1");
+            card.domain = !integrated && card_fan ? Domain::accelerator : Domain::package;
+            if (card.power.is_open()) what += std::string(" domain=") + domain_name(card.domain) + (integrated || card_fan ? "" : "(assumed)");
             status.detail += (status.detail.empty() ? "" : "; ") + what;
             cards_.push_back(std::move(card));
         }
@@ -148,15 +159,15 @@ public:
     void read(Sample& sample) noexcept override {
         for (const auto& card : cards_) {
             double v = 0.0;
-            if (card.power.read(v)) add(sample.power_w, v * 1e-6);
+            if (card.power.is_open()) { if (card.power.read(v)) sample.add_power(card.domain, v * 1e-6); else sample.fail_power(card.domain); }
             if (card.clock.read(v)) set_if_absent(sample.gpu_clock_mhz, v * 1e-6);
             if (card.temp.read(v)) set_max(sample.temp_c, v * 1e-3);
-            if (card.busy.read(v)) set_if_absent(sample.gpu_busy_pct, v);
+            if (card.busy.read(v) && v <= 100.0) set_if_absent(sample.gpu_busy_pct, v);
         }
     }
 
 private:
-    struct Card { ValueFile power, clock, temp, busy; };
+    struct Card { ValueFile power, clock, temp, busy; Domain domain = Domain::package; };
     std::string root_;
     std::vector<Card> cards_;
 };
@@ -188,17 +199,20 @@ public:
         return status;
     }
     void read(Sample& sample) noexcept override {
-        bool any = false;
+        // Each zone keeps its own baseline, so the cumulative total is right again as soon as every zone has been
+        // read: a zone that failed for a while adds the energy of that while at its next read. A sample in which any
+        // zone failed carries no counter at all (never the sum of the zones that happened to answer), so a window
+        // that ends inside the failure is not covered by the counter instead of being short.
+        bool all = true;
         for (auto& z : zones_) {
             double now = 0.0;
-            if (!z.energy.read(now)) continue;
+            if (!z.energy.read(now) || (z.range_uj > 0.0 && now > z.range_uj)) { all = false; continue; }
             // The counter wraps at max_energy_range_uj. A drop with no known range is a reset: nothing is added.
             const double delta = now >= z.last_uj ? now - z.last_uj : (z.range_uj > 0.0 ? now + z.range_uj - z.last_uj : 0.0);
             z.last_uj = now;
             total_j_ += delta * 1e-6;
-            any = true;
         }
-        if (any) add(sample.energy_j, total_j_);
+        if (all) sample.add_energy(Domain::package, total_j_); else sample.fail_energy(Domain::package);
     }
 
 private:
@@ -257,21 +271,75 @@ struct Registry {
 };
 Registry& registry() { static Registry r; return r; }
 
-double lerp(double a, double b, double f) noexcept {
-    if (finite(a) && finite(b)) return a + (b - a) * f;
-    return finite(a) ? a : b;
+using Cover = Sampler::Cover;
+using Covers = Sampler::Covers;
+constexpr std::int64_t kNoLo = std::numeric_limits<std::int64_t>::min(), kNoHi = std::numeric_limits<std::int64_t>::max();
+
+// Adds the stretch between two valid readings (ta, va) and (tb, vb) of one channel, clipped to [t0, t1]. A stretch
+// longer than the gap limit, or a counter that went down (a reset), is not covered: nothing is added.
+void stretch(Cover& c, bool counter, std::int64_t ta, double va, std::int64_t tb, double vb, std::int64_t t0, std::int64_t t1,
+             std::int64_t gap_ns) noexcept {
+    if (tb <= ta || tb - ta > gap_ns || (counter && vb < va)) return;
+    const auto lo = std::max(ta, t0), hi = std::min(tb, t1);
+    if (hi <= lo) return;
+    const double span = static_cast<double>(tb - ta);
+    if (counter) {
+        c.joules += (vb - va) * (static_cast<double>(hi - lo) / span);
+        c.peak = std::max(c.peak, (vb - va) / (span * 1e-9));
+    } else {
+        const double pa = va + (vb - va) * (static_cast<double>(lo - ta) / span);
+        const double pb = va + (vb - va) * (static_cast<double>(hi - ta) / span);
+        c.joules += 0.5 * (pa + pb) * static_cast<double>(hi - lo) * 1e-9;
+        c.peak = std::max({c.peak, pa, pb});
+    }
+    c.ns += hi - lo;
 }
-Sample between(const Sample& a, const Sample& b, std::int64_t t) noexcept {
-    const double f = b.t_ns > a.t_ns ? static_cast<double>(t - a.t_ns) / static_cast<double>(b.t_ns - a.t_ns) : 0.0;
-    Sample out;
-    out.t_ns = t;
-    out.energy_j = lerp(a.energy_j, b.energy_j, f);
-    out.power_w = lerp(a.power_w, b.power_w, f);
-    out.gpu_clock_mhz = lerp(a.gpu_clock_mhz, b.gpu_clock_mhz, f);
-    out.temp_c = lerp(a.temp_c, b.temp_c, f);
-    out.cpu_mhz = lerp(a.cpu_mhz, b.cpu_mhz, f);
-    out.gpu_busy_pct = lerp(a.gpu_busy_pct, b.gpu_busy_pct, f);
-    return out;
+// The next valid reading of one channel: closes the stretch from the previous one.
+void feed(Cover& c, bool counter, std::int64_t t, double v, std::int64_t t0, std::int64_t t1, std::int64_t gap_ns) noexcept {
+    if (!finite(v)) return;
+    if (finite(c.last_v)) stretch(c, counter, c.last_t, c.last_v, t, v, t0, t1, gap_ns);
+    c.last_t = t;
+    c.last_v = v;
+}
+void feed(Covers& covers, const Sample& s, std::int64_t t0, std::int64_t t1, std::int64_t gap_ns) noexcept {
+    for (std::size_t d = 0; d < kDomains; ++d) {
+        feed(covers[0][d], true, s.t_ns, s.energy_j[d], t0, t1, gap_ns);
+        feed(covers[1][d], false, s.t_ns, s.power_w[d], t0, t1, gap_ns);
+    }
+}
+
+// Energy of a window of window_ns from the per-domain covers. `seen` is the set of domains the sampler measures (a bit
+// per domain): each of them must cover the window for the receipt to be complete. False: nothing covers any of it.
+bool combine(const Covers& covers, unsigned seen, std::int64_t window_ns, Receipt& r) {
+    const unsigned whole = 1U << static_cast<unsigned>(Domain::system);
+    const unsigned used = seen & whole ? whole : seen;
+    bool any = false, by_counter = false, by_power = false;
+    r.complete = true;
+    std::int64_t covered = window_ns;
+    for (std::size_t d = 0; d < kDomains; ++d) {
+        if (!(used & (1U << d))) continue;
+        const Cover& c = covers[0][d];
+        const Cover& p = covers[1][d];
+        // The counter unless the power readings of the same domain cover more of the window.
+        const bool counter = c.ns > 0 && c.ns >= p.ns;
+        const Cover& u = counter ? c : p;
+        r.coverage += (r.coverage.empty() ? "" : "+") + std::string(domain_name(static_cast<Domain>(d))) + ":" +
+            (u.ns <= 0 ? "none" : counter ? "counter" : "power-integral");
+        covered = std::min(covered, u.ns);
+        if (u.ns != window_ns) r.complete = false;
+        if (u.ns <= 0) continue;
+        any = true;
+        (counter ? by_counter : by_power) = true;
+        r.energy_j += u.joules;
+        r.avg_w += u.joules / (static_cast<double>(u.ns) * 1e-9);
+        r.peak_w += p.ns > 0 ? p.peak : c.peak;  // sum of the domains' peaks (an upper bound with several domains)
+    }
+    if (!any) return false;
+    r.available = true;
+    r.covered_ms = static_cast<double>(std::max<std::int64_t>(covered, 0)) * 1e-6;
+    r.energy_source = by_counter && by_power ? "mixed" : by_counter ? "counter" : "power-integral";
+    r.peak_w = std::max(r.peak_w, r.avg_w);
+    return true;
 }
 double median(std::vector<double>& values) noexcept {
     if (values.empty()) return 0.0;
@@ -295,6 +363,11 @@ void json_number(std::string& out, double value) {
     out += text;
 }
 void json_member(std::string& out, const char* key, double value) { out += ",\""; out += key; out += "\":"; json_number(out, value); }
+// A reading that may be absent: null, never a 0 that reads as a measured idle value.
+void json_reading(std::string& out, const char* key, double value) {
+    out += ",\""; out += key; out += "\":";
+    if (finite(value)) json_number(out, value); else out += "null";
+}
 void receipt_json(std::string& out, const Receipt& r) {
     if (!r.available) { out += "{\"available\":false,\"reason\":"; json_text(out, r.reason); out += '}'; return; }
     out += "{\"available\":true";
@@ -310,6 +383,10 @@ void receipt_json(std::string& out, const Receipt& r) {
     json_member(out, "gpu_busy_pct_mean", r.gpu_busy_pct_mean);
     out += ",\"samples\":" + std::to_string(r.samples) + ",\"energy_source\":";
     json_text(out, r.energy_source);
+    out += r.complete ? ",\"complete\":true" : ",\"complete\":false";
+    json_member(out, "covered_ms", r.covered_ms);
+    out += ",\"coverage\":";
+    json_text(out, r.coverage);
     out += '}';
 }
 void sources_json(std::string& out, const std::vector<SourceStatus>& sources) {
@@ -347,11 +424,11 @@ void exit_line() noexcept {
     try {
         auto& p = process();
         if (auto* s = p.live.load()) {
-            s->sample_now();
+            s->cover(Sampler::now_ns(), 2 * s->min_interval_ms() + 20);
             Block block;
             block.enabled = true;
             block.sources = p.sources;
-            block.request = s->summarize(p.start_ns, Sampler::now_ns(), 0);
+            block.request = s->lifetime_receipt();  // the running totals: the ring may have dropped the early samples
             block.prefill = block.decode = unavailable("process total");
             std::fprintf(stderr, "strix power: %s\n", block_json(block).c_str());
         }
@@ -379,9 +456,51 @@ std::vector<std::unique_ptr<Source>> make_sources(const std::string& root) {
     return out;
 }
 
+const char* domain_name(Domain domain) noexcept {
+    return domain == Domain::package ? "package" : domain == Domain::accelerator ? "accelerator" : "system";
+}
+
+void Sample::add_power(Domain domain, double watts) noexcept {
+    if (!(watts >= 0.0) || !finite(watts)) { fail_power(domain); return; }
+    double& slot = power_w[static_cast<std::size_t>(domain)];
+    slot = finite(slot) ? slot + watts : watts;
+}
+void Sample::add_energy(Domain domain, double joules) noexcept {
+    if (!(joules >= 0.0) || !finite(joules)) { fail_energy(domain); return; }
+    double& slot = energy_j[static_cast<std::size_t>(domain)];
+    slot = finite(slot) ? slot + joules : joules;
+}
+double Sample::total_power_w() const noexcept {
+    const double whole = power_w[static_cast<std::size_t>(Domain::system)];
+    if (finite(whole)) return whole;
+    double sum = kAbsent;
+    for (const double w : power_w) if (finite(w)) sum = finite(sum) ? sum + w : w;
+    return sum;
+}
+
+bool parse_value(std::string_view text, double& value) noexcept {
+    std::size_t i = 0;
+    const bool negative = !text.empty() && text[0] == '-';
+    if (negative || (!text.empty() && text[0] == '+')) i = 1;
+    const std::size_t first = i;
+    std::uint64_t magnitude = 0;
+    for (; i < text.size() && text[i] >= '0' && text[i] <= '9'; ++i) {
+        if (i - first >= 18) return false;  // past any channel's range, and past what a double holds exactly
+        magnitude = magnitude * 10 + static_cast<std::uint64_t>(text[i] - '0');
+    }
+    if (i == first) return false;
+    for (; i < text.size(); ++i)
+        if (text[i] != ' ' && text[i] != '\t' && text[i] != '\n' && text[i] != '\r') return false;
+    value = negative ? -static_cast<double>(magnitude) : static_cast<double>(magnitude);
+    return true;
+}
+
 Sampler::Sampler(std::vector<std::unique_ptr<Source>> sources, Options options) : sources_(std::move(sources)), options_(options) {
     options_.period_ms = std::clamp(options_.period_ms, 1, 10000);
     options_.capacity = std::max<std::size_t>(options_.capacity, 4);
+    if (options_.max_gap_ms <= 0) options_.max_gap_ms = std::max(1000, 3 * options_.period_ms);
+    if (options_.min_interval_ms <= 0) options_.min_interval_ms = std::clamp(options_.period_ms / 10, 1, 10);
+    options_.min_interval_ms = std::min(options_.min_interval_ms, options_.period_ms);
     for (auto& source : sources_) {
         SourceStatus status;
         try { status = source->probe(); } catch (const std::exception& e) { status.available = false; status.detail = e.what(); }
@@ -410,41 +529,77 @@ void Sampler::stop() {
         stopping_ = true;
     }
     wake_.notify_all();
+    sampled_.notify_all();
     if (thread_.joinable()) thread_.join();
     const std::lock_guard<std::mutex> lock(wake_mutex_);
     started_ = false;
 }
 
+// One sample per period. cover() can ask for an earlier one; the worker then waits until min_interval_ms have passed
+// since its last sample, so callers cannot drive the sensors (or the ring) faster than that.
 void Sampler::run() {
+    using clock = std::chrono::steady_clock;
     std::unique_lock<std::mutex> lock(wake_mutex_);
     while (!stopping_) {
         lock.unlock();
+        const auto began = clock::now();
         sample_now();
+        const auto stored = latest().t_ns;
         lock.lock();
-        wake_.wait_for(lock, std::chrono::milliseconds(options_.period_ms), [this] { return stopping_; });
+        stored_ns_ = stored;
+        sampled_.notify_all();
+        const auto asked = [this] { return stopping_ || want_ns_ > stored_ns_; };
+        wake_.wait_until(lock, began + std::chrono::milliseconds(options_.period_ms), asked);
+        if (!stopping_ && want_ns_ > stored_ns_)
+            wake_.wait_until(lock, began + std::chrono::milliseconds(options_.min_interval_ms), [this] { return stopping_; });
     }
+}
+
+bool Sampler::cover(std::int64_t t_ns, int timeout_ms) {
+    if (!usable_) return false;
+    std::unique_lock<std::mutex> lock(wake_mutex_);
+    if (!started_ || stopping_) { lock.unlock(); return latest().t_ns >= t_ns; }
+    if (stored_ns_ >= t_ns) return true;
+    want_ns_ = std::max(want_ns_, t_ns);
+    wake_.notify_all();
+    return sampled_.wait_for(lock, std::chrono::milliseconds(std::max(timeout_ms, 0)), [&] { return stopping_ || stored_ns_ >= t_ns; }) &&
+        stored_ns_ >= t_ns;
 }
 
 void Sampler::sample_now() {
     if (!usable_) return;
     const std::lock_guard<std::mutex> lock(read_mutex_);
-    sample_at(now_ns());
+    sample_locked(now_ns());
 }
 
 void Sampler::sample_at(std::int64_t t_ns) {
     if (!usable_) return;
+    const std::lock_guard<std::mutex> lock(read_mutex_);
+    sample_locked(t_ns);
+}
+
+void Sampler::sample_locked(std::int64_t t_ns) {
+    {
+        // Refused before any source is read: a stateful source (a counter baseline, a cache) must not advance for a
+        // sample that will not be stored. read_mutex_ keeps the answer valid until the sample is stored below.
+        const std::lock_guard<std::mutex> lock(mutex_);
+        if (size_ && last_ns_ >= t_ns) return;
+    }
     Sample sample;
     sample.t_ns = t_ns;
     for (auto* source : live_) source->read(sample);
-    const std::lock_guard<std::mutex> lock(mutex_);
-    if (size_) {
-        const Sample& last = ring_[(head_ + ring_.size() - 1) % ring_.size()];
-        if (last.t_ns >= t_ns) return;  // keep the ring ordered
-        const double dt = static_cast<double>(t_ns - last.t_ns) * 1e-9;
-        if (finite(sample.energy_j) && finite(last.energy_j)) lifetime_j_ += sample.energy_j - last.energy_j;
-        else if (finite(sample.power_w) && finite(last.power_w)) lifetime_j_ += 0.5 * (sample.power_w + last.power_w) * dt;
-        lifetime_s_ += dt;
+    for (std::size_t d = 0; d < kDomains; ++d) {
+        if (sample.energy_bad & (1U << d)) sample.energy_j[d] = kAbsent;
+        if (sample.power_bad & (1U << d)) sample.power_w[d] = kAbsent;
     }
+    const std::lock_guard<std::mutex> lock(mutex_);
+    for (std::size_t d = 0; d < kDomains; ++d) {
+        if (finite(sample.energy_j[d])) seen_energy_ = static_cast<std::uint8_t>(seen_energy_ | (1U << d));
+        if (finite(sample.power_w[d])) seen_power_ = static_cast<std::uint8_t>(seen_power_ | (1U << d));
+    }
+    feed(life_, sample, kNoLo, kNoHi, static_cast<std::int64_t>(options_.max_gap_ms) * 1'000'000LL);
+    if (!size_) first_ns_ = t_ns;
+    last_ns_ = t_ns;
     ring_[head_] = sample;
     head_ = (head_ + 1) % ring_.size();
     size_ = std::min(size_ + 1, ring_.size());
@@ -455,10 +610,35 @@ Sample Sampler::latest() const {
     return size_ ? ring_[(head_ + ring_.size() - 1) % ring_.size()] : Sample{};
 }
 
-void Sampler::lifetime(double& joules, double& seconds) const {
+bool Sampler::energy_available() const {
     const std::lock_guard<std::mutex> lock(mutex_);
-    joules = lifetime_j_;
-    seconds = lifetime_s_;
+    return (seen_energy_ | seen_power_) != 0;
+}
+
+Receipt Sampler::lifetime_receipt() const {
+    if (!usable_) return unavailable("no readable source");
+    Covers covers;
+    unsigned seen = 0;
+    std::int64_t span = 0;
+    {
+        const std::lock_guard<std::mutex> lock(mutex_);
+        covers = life_;
+        seen = static_cast<unsigned>(seen_energy_ | seen_power_);
+        span = last_ns_ - first_ns_;
+    }
+    if (!seen) return unavailable("no power or energy channel");
+    if (span <= 0) return unavailable("no samples");
+    Receipt r;
+    if (!combine(covers, seen, span, r)) return unavailable("no covered stretch since the sampler started");
+    r.duration_ms = static_cast<double>(span) * 1e-6;
+    r.energy_source += "-lifetime";
+    return r;
+}
+
+void Sampler::lifetime(double& joules, double& seconds) const {
+    const auto r = lifetime_receipt();
+    joules = r.available ? r.energy_j : 0.0;
+    seconds = r.available ? r.covered_ms * 1e-3 : 0.0;
 }
 
 std::size_t Sampler::sample_count() const {
@@ -466,35 +646,20 @@ std::size_t Sampler::sample_count() const {
     return size_;
 }
 
-// The samples of [t0, t1] in time order, with an interpolated (or held) point at each edge; `inside` is the number of
-// real samples. Empty when the ring has nothing to say about the window.
+// The stored samples that say something about [t0, t1], in time order: the newest one before t0 (`lead`), the
+// `inside` ones within the window, and the oldest one after t1. Nothing is extended or interpolated here.
 std::vector<Sample> Sampler::window_locked(std::int64_t t0_ns, std::int64_t t1_ns, std::size_t& inside, bool& lead) const {
     inside = 0;
     lead = false;
     std::vector<Sample> newest_first;
-    const Sample* after = nullptr;
-    const Sample* before = nullptr;
     for (std::size_t k = 0; k < size_; ++k) {
         const Sample& s = ring_[(head_ + ring_.size() - 1 - k) % ring_.size()];
-        if (s.t_ns > t1_ns) { after = &s; continue; }
-        if (s.t_ns < t0_ns) { before = &s; break; }
+        if (s.t_ns > t1_ns) { if (!newest_first.empty()) newest_first.clear(); newest_first.push_back(s); continue; }
         newest_first.push_back(s);
+        if (s.t_ns < t0_ns) { lead = true; break; }
+        ++inside;
     }
-    inside = newest_first.size();
-    std::vector<Sample> points;
-    if (!inside && !before && !after) return points;
-    points.reserve(inside + 2);
-    const auto edge = [&](std::int64_t t, const Sample* left, const Sample* right) {
-        Sample out = left && right ? between(*left, *right, t) : left ? *left : *right;
-        out.t_ns = t;
-        return out;
-    };
-    const Sample* first_in = inside ? &newest_first.back() : nullptr;
-    const Sample* last_in = inside ? &newest_first.front() : nullptr;
-    if (!first_in || first_in->t_ns > t0_ns) { points.push_back(edge(t0_ns, before, first_in ? first_in : after)); lead = true; }
-    for (auto it = newest_first.rbegin(); it != newest_first.rend(); ++it) points.push_back(*it);
-    if (!last_in || last_in->t_ns < t1_ns) points.push_back(edge(t1_ns, last_in ? last_in : before, after));
-    return points;
+    return {newest_first.rbegin(), newest_first.rend()};
 }
 
 Receipt Sampler::summarize(std::int64_t t0_ns, std::int64_t t1_ns, std::uint64_t tokens) const {
@@ -502,39 +667,25 @@ Receipt Sampler::summarize(std::int64_t t0_ns, std::int64_t t1_ns, std::uint64_t
     if (t1_ns <= t0_ns) return unavailable("empty window");
     std::size_t inside = 0;
     bool lead = false;
+    unsigned seen = 0;
     std::vector<Sample> points;
     {
         const std::lock_guard<std::mutex> lock(mutex_);
         points = window_locked(t0_ns, t1_ns, inside, lead);
+        seen = static_cast<unsigned>(seen_energy_ | seen_power_);
     }
-    if (points.size() < 2) return unavailable("no samples");
+    if (!seen) return unavailable("no power or energy channel");
+    if (points.empty()) return unavailable("no samples");
+    Covers covers;
+    const auto gap_ns = static_cast<std::int64_t>(options_.max_gap_ms) * 1'000'000LL;
+    for (const auto& p : points) feed(covers, p, t0_ns, t1_ns, gap_ns);
     Receipt r;
+    if (!combine(covers, seen, t1_ns - t0_ns, r)) return unavailable("window not covered by the stored samples");
     r.samples = inside;
     r.tokens = tokens;
-    const double seconds = static_cast<double>(t1_ns - t0_ns) * 1e-9;
-    r.duration_ms = seconds * 1e3;
-    const bool counter = finite(points.front().energy_j) && finite(points.back().energy_j);
-    double integral = 0.0, peak = 0.0;
-    bool any_power = false;
-    for (std::size_t i = 0; i < points.size(); ++i) {
-        const auto& p = points[i];
-        if (finite(p.power_w)) { any_power = true; peak = std::max(peak, p.power_w); }
-        if (!i) continue;
-        const auto& q = points[i - 1];
-        const double dt = static_cast<double>(p.t_ns - q.t_ns) * 1e-9;
-        if (finite(p.power_w) && finite(q.power_w)) integral += 0.5 * (p.power_w + q.power_w) * dt;
-        else if (finite(p.power_w) || finite(q.power_w)) integral += (finite(p.power_w) ? p.power_w : q.power_w) * dt;
-        // No power channel: the steepest counter segment is the peak.
-        if (counter && !any_power && dt > 0.0 && finite(p.energy_j) && finite(q.energy_j)) peak = std::max(peak, (p.energy_j - q.energy_j) / dt);
-    }
-    if (counter) { r.energy_j = points.back().energy_j - points.front().energy_j; r.energy_source = "counter"; }
-    else if (any_power) { r.energy_j = integral; r.energy_source = "power-integral"; }
-    else return unavailable("no power or energy channel");
-    r.available = true;
-    r.avg_w = seconds > 0.0 ? r.energy_j / seconds : 0.0;
-    r.peak_w = std::max(peak, any_power ? 0.0 : r.avg_w);
-    r.tok_per_j = tokens && r.energy_j > 0.0 ? static_cast<double>(tokens) / r.energy_j : 0.0;
-    // Clock, temperature and load over the real samples; the edge points stand in when the window has none.
+    r.duration_ms = static_cast<double>(t1_ns - t0_ns) * 1e-6;
+    r.tok_per_j = r.complete && tokens && r.energy_j > 0.0 ? static_cast<double>(tokens) / r.energy_j : 0.0;
+    // Clock, temperature and load over the samples inside the window; its neighbours stand in when it has none.
     const std::size_t lo = inside && lead ? 1 : 0;
     const std::size_t hi = inside ? lo + inside : points.size();
     std::vector<double> clock, cpu;
@@ -598,29 +749,41 @@ void reset_first_token() noexcept { process().first_token.store(0); }
 std::int64_t first_token_ns() noexcept { return process().first_token.load(); }
 
 namespace {
-Block spans_block(std::int64_t p0, std::int64_t d0, std::int64_t end, std::uint64_t prefill_tokens, std::uint64_t decode_tokens) {
-    Block block;
-    block.enabled = sampler_enabled();
-    block.sources = process().sources;
+std::int64_t ms_ns(double ms) noexcept { return finite(ms) && ms > 0.0 ? static_cast<std::int64_t>(ms * 1e6) : 0; }
+
+// A block of the process sampler, after asking its worker for the closing sample of the window.
+Block process_block(std::int64_t p0, std::int64_t d0, std::int64_t end, std::uint64_t prefill_tokens, std::uint64_t decode_tokens) {
+    const bool enabled = sampler_enabled();
     auto* s = process_sampler();
     if (!s) {
-        const auto why = unavailable(block.enabled ? "no readable source" : "STRIX_POWER_SAMPLER=0");
-        block.request = block.prefill = block.decode = why;
+        Block block;
+        block.enabled = enabled;
+        block.sources = process().sources;
+        block.request = block.prefill = block.decode = unavailable(enabled ? "no readable source" : "STRIX_POWER_SAMPLER=0");
         return block;
     }
-    // A window that ends now needs a closing sample; one that ended long ago already has its neighbours.
-    if (Sampler::now_ns() - end < 2'000'000LL * process().period_ms) s->sample_now();
-    block.request = s->summarize(p0, end, prefill_tokens + decode_tokens);
-    block.prefill = d0 > p0 ? s->summarize(p0, d0, prefill_tokens) : unavailable("no prefill phase");
-    block.decode = end > d0 ? s->summarize(d0, end, decode_tokens) : unavailable("no decode phase");
-    return block;
+    // Bounded: the worker answers within its minimum spacing; a sensor that hangs costs this wait once, and the
+    // receipt then says the tail of the window is not covered.
+    s->cover(end, 2 * s->min_interval_ms() + 20);
+    return window_block(*s, p0, d0, end, prefill_tokens, decode_tokens);
 }
-std::int64_t ms_ns(double ms) noexcept { return finite(ms) && ms > 0.0 ? static_cast<std::int64_t>(ms * 1e6) : 0; }
 }  // namespace
 
-Block request_block(std::int64_t end_ns, Phase prefill, Phase decode) {
-    const auto d0 = end_ns - ms_ns(decode.ms);
-    return spans_block(d0 - ms_ns(prefill.ms), d0, end_ns, prefill.tokens, decode.tokens);
+Block window_block(const Sampler& sampler, std::int64_t p0, std::int64_t d0, std::int64_t end, std::uint64_t prefill_tokens,
+                   std::uint64_t decode_tokens) {
+    Block block;
+    block.enabled = true;
+    block.sources = sampler.sources();
+    d0 = std::clamp(d0, p0, std::max(p0, end));
+    block.request = sampler.summarize(p0, end, prefill_tokens + decode_tokens);
+    block.prefill = d0 > p0 ? sampler.summarize(p0, d0, prefill_tokens) : unavailable("no prefill phase");
+    block.decode = end > d0 ? sampler.summarize(d0, end, decode_tokens) : unavailable("no decode phase");
+    return block;
+}
+
+Block execution_block(std::int64_t begin_ns, std::int64_t end_ns, double decode_ms, std::uint64_t prefill_tokens,
+                      std::uint64_t decode_tokens) {
+    return process_block(begin_ns, end_ns - ms_ns(decode_ms), end_ns, prefill_tokens, decode_tokens);
 }
 
 Block request_block(std::chrono::steady_clock::time_point start, std::chrono::steady_clock::time_point stop,
@@ -628,11 +791,12 @@ Block request_block(std::chrono::steady_clock::time_point start, std::chrono::st
     const auto p0 = Sampler::to_ns(start), end = Sampler::to_ns(stop);
     const auto first = first_token_ns();
     const bool split = first > p0 && first < end && generated_tokens > 1;
-    auto block = spans_block(p0, split ? first : end, end, prompt_tokens, split ? generated_tokens - 1 : 0);
+    auto block = process_block(p0, split ? first : end, end, prompt_tokens, split ? generated_tokens - 1 : 0);
     // Several tokens but no first-token mark on this route: only the request total is honest.
     if (!split && generated_tokens > 1 && block.request.available) {
         block.request.tokens = prompt_tokens + generated_tokens;
-        block.request.tok_per_j = block.request.energy_j > 0.0 ? static_cast<double>(block.request.tokens) / block.request.energy_j : 0.0;
+        block.request.tok_per_j = block.request.complete && block.request.energy_j > 0.0
+            ? static_cast<double>(block.request.tokens) / block.request.energy_j : 0.0;
         block.prefill = block.decode = unavailable("first token not marked on this route");
     }
     return block;
@@ -651,31 +815,50 @@ std::string block_json(const Block& block) {
     return out;
 }
 
+std::string block_member(const Block& block) { return block.enabled ? "\"power\":" + block_json(block) : std::string(); }
+
 std::string status_json() {
     const bool enabled = sampler_enabled();
-    auto& p = process();
-    auto* s = process_sampler();
+    return status_json(process_sampler(), enabled, process().sources);
+}
+
+std::string status_json(const Sampler* s, bool enabled, const std::vector<SourceStatus>& sources) {
+    // `available`: a sampler is running. `energy_available`: it has an energy counter or a power reading; a host
+    // that only exposes clocks has the first and not the second, and its power members are null.
+    const bool energy = s && s->energy_available();
     std::string out = "{\"schema\":\"strix-power-status-v1\",\"enabled\":";
     out += enabled ? "true" : "false";
     out += ",\"available\":";
-    out += s ? "true," : "false,";
-    sources_json(out, p.sources);
+    out += s ? "true" : "false";
+    out += ",\"energy_available\":";
+    out += energy ? "true," : "false,";
+    sources_json(out, sources);
     if (s) {
-        s->sample_now();
-        const auto last = s->latest();
-        out += ",\"period_ms\":" + std::to_string(p.period_ms) + ",\"samples\":" + std::to_string(s->sample_count()) + ",\"latest\":{\"power_w\":";
-        json_number(out, last.power_w);
-        json_member(out, "gpu_clock_mhz", last.gpu_clock_mhz);
-        json_member(out, "temp_c", last.temp_c);
-        json_member(out, "cpu_mhz", last.cpu_mhz);
-        json_member(out, "gpu_busy_pct", last.gpu_busy_pct);
-        double joules = 0.0, seconds = 0.0;
-        s->lifetime(joules, seconds);
-        out += "},\"since_start\":{\"energy_j\":";
-        json_number(out, joules);
-        json_member(out, "duration_s", seconds);
-        json_member(out, "avg_w", seconds > 0.0 ? joules / seconds : 0.0);
-        out += '}';
+        const auto last = s->latest();  // what the worker stored: a status request reads no sensor
+        out += ",\"period_ms\":" + std::to_string(s->period_ms()) + ",\"samples\":" + std::to_string(s->sample_count()) + ",\"latest\":{\"age_ms\":";
+        json_number(out, last.t_ns ? static_cast<double>(Sampler::now_ns() - last.t_ns) * 1e-6 : 0.0);
+        json_reading(out, "power_w", last.total_power_w());
+        json_reading(out, "gpu_clock_mhz", last.gpu_clock_mhz);
+        json_reading(out, "temp_c", last.temp_c);
+        json_reading(out, "cpu_mhz", last.cpu_mhz);
+        json_reading(out, "gpu_busy_pct", last.gpu_busy_pct);
+        const auto total = s->lifetime_receipt();
+        out += "},\"since_start\":";
+        if (total.available) {
+            out += "{\"energy_j\":";
+            json_number(out, total.energy_j);
+            json_member(out, "duration_s", total.duration_ms * 1e-3);
+            json_member(out, "covered_s", total.covered_ms * 1e-3);
+            json_member(out, "avg_w", total.avg_w);
+            out += total.complete ? ",\"complete\":true" : ",\"complete\":false";
+            out += ",\"coverage\":";
+            json_text(out, total.coverage);
+            out += '}';
+        } else {
+            out += "{\"energy_j\":null,\"reason\":";
+            json_text(out, total.reason);
+            out += '}';
+        }
     }
     out += '}';
     return out;

@@ -6567,8 +6567,10 @@ static int run_decode_entry(
                 << "  \"known_prefix_source_projection_launches_saved_per_window\":" << (known_prefill_plan ? 0U : known_prefix_plan->projection_launches_saved) << ",\n"
                 << "  \"known_prefix_source_logical_weight_bytes_avoided_per_window\":" << (known_prefill_plan ? 0U : known_prefix_plan->logical_projection_weight_bytes_avoided) << ",\n";
         }
-        if (generation_request_timing_enabled)  // shared power receipt of the timed request (strix/power/sampler.hpp)
-            std::cout << "  \"power\":" << strix::power::block_json(strix::power::request_block(generation_request_start, generation_request_stop, options.tokens.size(), result.generated_tokens.size())) << ",\n";
+        // Shared power receipt of the timed request (strix/power/sampler.hpp); no member with STRIX_POWER_SAMPLER=0.
+        if (generation_request_timing_enabled && strix::power::sampler_enabled())
+            if (const auto member = strix::power::block_member(strix::power::request_block(generation_request_start, generation_request_stop, options.tokens.size(), result.generated_tokens.size())); !member.empty())
+                std::cout << "  " << member << ",\n";
         if (generation_request_timing_enabled)
             std::cout << "  \"generation_request_elapsed_ms\":" << generation_request_elapsed_ms << ",\n"
                       << "  \"generation_request_output_tokens\":" << result.generated_tokens.size() << ",\n"

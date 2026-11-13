@@ -1019,7 +1019,8 @@ struct ApiService::Impl {
     struct Outcome { std::string text; GenerationStats stats; std::string finish; std::string matched; std::string error; std::uint64_t output_tokens = 0;
         std::vector<std::uint32_t> token_ids; bool observed = false;
         Json scores = Json::array(), answer_scores = Json::array();
-        std::shared_ptr<const ConstraintSpec> constraint; std::string reasoning; std::shared_ptr<GenerationOutput> family; bool streamed_tools = false; };
+        std::shared_ptr<const ConstraintSpec> constraint; std::string reasoning; std::shared_ptr<GenerationOutput> family; bool streamed_tools = false;
+        std::string power; };  // shared power receipt, built once in drive() from the execution span; empty: none
     Outcome drive(const std::shared_ptr<GenerationTicket>& ticket, const std::vector<std::string>& stops,
         const std::function<bool(const std::string&)>& on_text, const std::function<bool()>& client_alive,
         const std::function<bool()>& idle = {}, std::shared_ptr<const ConstraintSpec> spec = {},
@@ -1148,6 +1149,7 @@ struct ApiService::Impl {
             out.stats.constraint = std::move(v);
         }
         if (spec && out.stats.constraint->status == "failed" && out.error.empty()) out.error = "constraint selection failed";
+        out.power = power_receipt(out, power::Sampler::now_ns());
         out.finish = out.family && out.matched.empty() ? out.stats.finish : !out.matched.empty() ? "stop" : out.stats.finish == "stop" ? "stop" : out.stats.finish == "cancelled" ? "cancelled" : "length";
         return out;
     }
@@ -1260,17 +1262,21 @@ struct ApiService::Impl {
         if (!config.compact_chat_envelope || config.timed_completion_envelope) usage.set("prompt_tokens_details", std::move(details));
         return usage;
     }
-    // Shared power receipt of a finished request: its decode and prefill windows, counted back from now.
-    static std::string power_receipt(const Outcome& o) {
-        if (!power::process_sampler()) return {};
+    // Shared power receipt of a finished request, over the span the queue stamped on its stats (execution begin and
+    // end). drive() builds it once; the response and the status record both print that text. `observed_ns` is when
+    // drive() saw the job finished: the end of the span only for an engine that finishes its ticket unstamped.
+    static std::string power_receipt(const Outcome& o, std::int64_t observed_ns) {
+        if (!power::process_sampler() || !o.error.empty()) return {};
         const auto computed = o.stats.prompt_tokens - std::min(o.stats.prompt_tokens, o.stats.cached_tokens + o.stats.imported_tokens);
-        return power::block_json(power::request_block(power::Sampler::now_ns(), power::Phase{o.stats.prefill_ms, computed},
-                                                      power::Phase{o.stats.decode_ms, o.output_tokens}));
+        const auto end = o.stats.exec_end_ns ? o.stats.exec_end_ns : observed_ns;
+        const auto begin = o.stats.exec_begin_ns ? o.stats.exec_begin_ns
+            : end - static_cast<std::int64_t>((std::max(o.stats.prefill_ms, 0.0) + std::max(o.stats.decode_ms, 0.0)) * 1e6);
+        return power::block_json(power::execution_block(begin, end, o.stats.decode_ms, computed, o.output_tokens));
     }
     Json timing_data(const std::string& note, const Outcome* o = nullptr) const {
         auto data = api_request_scope ? api_request_scope->observation.terminal.timings : Json::object();
         if (!note.empty()) data.set("sampling_note", Json(note));
-        if (o && data.is_object()) if (const auto text = power_receipt(*o); !text.empty()) data.set("power", parse_json(text));
+        if (o && data.is_object() && !o->power.empty()) data.set("power", parse_json(o->power));
         return data;
     }
     void completion_data(Json& out, const Outcome& o, const Json& body, const std::string& note, bool timings = true) const {
@@ -2296,7 +2302,7 @@ struct ApiService::Impl {
         entry.queue_ms = o.stats.queue_ms; entry.prefill_ms = o.stats.prefill_ms; entry.decode_ms = o.stats.decode_ms;
         entry.imported = o.stats.imported_tokens;  // every record (its prefill rate); reported as a field only when observed
         if (o.observed) { entry.armed = true; entry.first_token_ms = o.stats.first_token_ms; }
-        if (o.error.empty()) entry.power = power_receipt(o);
+        entry.power = o.power;  // the receipt drive() built: the same text the response carried
         record(entry);
     }
 
@@ -2305,7 +2311,8 @@ struct ApiService::Impl {
     void arm() {
         if (observe_arm(expiry_seconds)) { const std::lock_guard lock(mutex); armed_unix = unix_now(); }
     }
-    Json status() {
+    // with_power: the request carries the API key (or none is configured); host power telemetry is left out otherwise.
+    Json status(bool with_power = true) {
         const auto q = queue.snapshot();
         const bool armed = observe_armed();
         const auto ob = armed ? queue.observed() : ObserveSnapshot{};
@@ -2346,7 +2353,7 @@ struct ApiService::Impl {
                 e.set("first_token_ms", r.first_token_ms ? Json(*r.first_token_ms) : Json());
                 if (!r.response_id.empty()) e.set("response_id", Json(r.response_id));
             }
-            if (!r.power.empty()) e.set("power", parse_json(r.power));
+            if (with_power && !r.power.empty()) e.set("power", parse_json(r.power));
             list.push(std::move(e));
         }
         out.set("requests", std::move(list));
@@ -2482,12 +2489,16 @@ void ApiService::handle(const HttpRequest& request, HttpResponseWriter& raw_resp
         if (request.method == "GET" && request.path == "/api/status") {
             const bool detail = detail_requested(request.query, bool(impl.config.status_data));
             if (detail) impl.arm();
-            auto data = impl.config.status_data ? impl.config.status_data(impl.queue.snapshot(), impl.queue.stopping(), detail) : impl.status();
+            // Host power telemetry (the process view below and the receipt of each recent request) is not part of the
+            // open status: with an API key configured it needs the key. Everything else is served as before.
+            bool keyed = true;
+            try { impl.authorize(request); } catch (const ApiError&) { keyed = false; }
+            auto data = impl.config.status_data ? impl.config.status_data(impl.queue.snapshot(), impl.queue.stopping(), detail) : impl.status(keyed);
             if (impl.config.status_data) deployment_status(data, impl.config.deployment, impl.queue, impl.config.status_slots.value_or(impl.config.http_slots));
             // STRIX_SERVE_RECEIPT=1: the engine's cycle ledger (tools/serve_bench.py finds it by its schema value).
             if (cycle_receipt_enabled() && data.is_object() && cycle_ledger().totals().cycles) data.set("cycle_ledger", parse_json(cycle_ledger().json()));
-            // Shared power view (sources, latest reading, totals since start); absent with STRIX_POWER_SAMPLER=0.
-            if (data.is_object() && power::sampler_enabled()) data.set("power", parse_json(power::status_json()));
+            // Shared power view (sources, latest stored reading, totals since start); absent with STRIX_POWER_SAMPLER=0.
+            if (keyed && data.is_object() && power::sampler_enabled()) data.set("power", parse_json(power::status_json()));
             response.send(200, "application/json", data.dump());
             return;
         }

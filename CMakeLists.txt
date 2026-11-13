@@ -697,6 +697,9 @@ endif()
 include(cmake/StrixDevice.cmake)
 # Every HIP app calls the start gate first; the core library carries it to all of them.
 target_link_libraries(strix_core PUBLIC strix_device_hip)
+# strix_core (src/serial_request.cpp) and strix_serve (src/serve/api.cpp) call the shared power sampler themselves
+# and link it by name (cmake/StrixPower.cmake), not through the gate.
+target_link_libraries(strix_core PUBLIC strix_power)
 # Effective-config headers are consumed by the core CLI and its host tests.
 target_link_libraries(strix_core PUBLIC strix_deploy)
 if(BUILD_TESTING)
@@ -708,6 +711,12 @@ if(BUILD_TESTING)
     target_link_libraries(strix-power-sampler-tests PRIVATE strix_power strix_serve_json)
     strix_target_warnings(strix-power-sampler-tests)
     add_test(NAME strix-power-sampler-tests COMMAND strix-power-sampler-tests)
+    # The serving graph of the standalone CUDA Qwen configuration, linked on the host without the gate or the core.
+    include(cmake/StrixServeStandalone.cmake)
+    strix_add_standalone_serve(strix_serve_standalone_check strix_serve_standalone_handoff_check)
+    add_executable(strix-serve-standalone-link-tests tests/serve_standalone_link_tests.cpp)
+    target_link_libraries(strix-serve-standalone-link-tests PRIVATE strix_serve_standalone_check)
+    add_test(NAME strix-serve-standalone-link-tests COMMAND strix-serve-standalone-link-tests)
     add_executable(strix-deepseek41-deploy-host-tests tests/deepseek41_deploy_host_tests.cpp)
     target_link_libraries(strix-deepseek41-deploy-host-tests PRIVATE strix_deploy)
     if(MSVC)
@@ -760,7 +769,7 @@ add_library(strix_serve STATIC
 )
 target_include_directories(strix_serve PUBLIC include PRIVATE src/serve src)
 target_compile_features(strix_serve PUBLIC cxx_std_20)
-target_link_libraries(strix_serve PUBLIC Threads::Threads strix_core strix_serve_json)
+target_link_libraries(strix_serve PUBLIC Threads::Threads strix_core strix_serve_json strix_power)
 if(WIN32)
     target_link_libraries(strix_serve PUBLIC ws2_32)
 endif()

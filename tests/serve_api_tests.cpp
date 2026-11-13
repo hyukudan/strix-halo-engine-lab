@@ -2,6 +2,7 @@
 // HTTP API contract tests with a scripted engine (no GPU): OpenAI chat/completions (plain and
 // SSE), tool calls, stop strings, Anthropic messages (plain and events), errors and API keys,
 // two concurrent clients through the FIFO queue, and cancellation when a client disconnects.
+#include "strix/power/sampler.hpp"
 #include "strix/serve/api.hpp"
 #include "strix/serve/constraint_selection.hpp"
 
@@ -1902,6 +1903,14 @@ int main() try {
         check(at(incomplete, "status").as_string() == "incomplete" && at(at(incomplete, "incomplete_details"), "reason").as_string() == "max_output_tokens", "responses non-stream incomplete");
         const auto status = parse_json(http(port, "GET", "/api/status", "").body);
         check(at(at(status, "requests").as_array()[0], "route").as_string() == "responses", "responses recent request route");
+        // Host power telemetry is not part of the open status: with an API key configured it needs the key.
+        check(!status.find("power"), "power telemetry served without the API key");
+        for (const auto& recent : at(status, "requests").as_array()) check(!recent.find("power"), "request power receipt served without the API key");
+        if (strix::power::sampler_enabled()) {
+            const auto keyed = parse_json(http(port, "GET", "/api/status", "", auth).body);
+            check(keyed.find("power") && at(*keyed.find("power"), "schema").as_string() == "strix-power-status-v1", "power view with the API key");
+            check(!parse_json(http(port, "GET", "/api/status", "", "Authorization: Bearer wrong\r\n").body).find("power"), "power telemetry with a wrong key");
+        }
         for (const char* input : {"Hi", "TOOL", "ENGINE_ERROR", "length"}) {
             Json request = Json::object(); request.set("input", Json(input)); request.set("stream", Json(true));
             if (std::string(input) == "TOOL") request.set("tools", parse_json(R"([{"type":"function","name":"get_weather","parameters":{"type":"object","properties":{"days":{"type":"integer"}}}}])"));

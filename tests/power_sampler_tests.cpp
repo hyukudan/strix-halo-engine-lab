@@ -6,11 +6,14 @@
 #include <cmath>
 #include <cstdio>
 #include <filesystem>
+#include <atomic>
 #include <fstream>
+#include <functional>
 #include <iostream>
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <vector>
 
 #if defined(__unix__) || defined(__APPLE__)
 #include <sys/stat.h>
@@ -112,9 +115,11 @@ void power_integral() {
     r = sampler.summarize(10 * kSecond + kSecond / 4, 10 * kSecond + 3 * kSecond / 4, 0);
     require(r.available && near(r.energy_j, 75.0) && near(r.peak_w, 175.0) && r.samples == 0, "interpolated window");
     require(r.tok_per_j == 0.0, "no tokens, no tok/J");
-    // A window past the last sample holds the last reading.
+    // A window past the last sample has no reading: nothing is held or extended into it.
     r = sampler.summarize(12 * kSecond, 13 * kSecond, 0);
-    require(r.available && near(r.energy_j, 200.0), "held edge");
+    require(!r.available && r.reason.find("not covered") != std::string::npos, "window past the last sample");
+    r = sampler.summarize(11 * kSecond, 13 * kSecond, 7);
+    require(r.available && !r.complete && near(r.covered_ms, 1000.0) && near(r.energy_j, 200.0) && r.tok_per_j == 0.0, "half covered window");
     require(!sampler.summarize(11 * kSecond, 11 * kSecond, 1).available, "empty window");
     // An older timestamp does not enter the ring.
     sampler.sample_at(5 * kSecond);
@@ -225,7 +230,7 @@ void permission_denied_and_partial() {
 struct FakeCard final : Source {
     SourceStatus probe() override { return {"fake-card", true, "power temp"}; }
     void read(Sample& s) noexcept override {
-        s.power_w = std::isfinite(s.power_w) ? s.power_w + 300.0 : 300.0;
+        s.add_power(Domain::accelerator, 300.0);
         s.temp_c = std::isfinite(s.temp_c) ? std::max(s.temp_c, 75.0) : 75.0;
     }
 };
@@ -260,8 +265,9 @@ void thread_and_ring() {
     sampler.stop();
     const auto t1 = Sampler::now_ns();
     require(sampler.sample_count() == 8, "ring full after wrap");
-    const auto r = sampler.summarize(t1 - 10'000'000, t1, 0);
-    require(r.available && near(r.avg_w, 120.0, 1e-3) && near(r.gpu_clock_mhz_median, 2600.0), "threaded receipt");
+    const auto last = sampler.latest().t_ns;
+    const auto r = sampler.summarize(last - 1'000'000, last, 0);
+    require(r.available && r.complete && near(r.avg_w, 120.0, 1e-3) && near(r.gpu_clock_mhz_median, 2600.0), "threaded receipt");
     double joules = 0.0, seconds = 0.0;
     sampler.lifetime(joules, seconds);
     require(seconds > 0.1 && seconds < static_cast<double>(t1 - t0) * 1e-9 + 1e-3 && near(joules / seconds, 120.0, 1e-3), "lifetime beyond the ring");
@@ -317,6 +323,312 @@ void block_rendering() {
     require(near(json.find("request")->find("energy_j")->as_double(), 1400.0), "request energy");
 }
 
+// ---- audit regressions ---------------------------------------------------------------------------------------------
+
+// A source driven by the test: counts its reads and notices two threads inside read() at once.
+struct Scripted final : Source {
+    std::function<void(Sample&)> fn;
+    std::atomic<int> reads{0}, inside{0};
+    std::atomic<bool> overlap{false};
+    SourceStatus probe() override { return {"scripted", true, "test"}; }
+    void read(Sample& s) noexcept override {
+        if (inside.fetch_add(1) != 0) overlap = true;
+        ++reads;
+        if (fn) fn(s);
+        std::this_thread::yield();  // widen the window in which a second reader would be caught
+        inside.fetch_sub(1);
+    }
+};
+std::unique_ptr<Sampler> scripted(Scripted*& source, std::function<void(Sample&)> fn, Options options = {}) {
+    auto owned = std::make_unique<Scripted>();
+    owned->fn = std::move(fn);
+    source = owned.get();
+    std::vector<std::unique_ptr<Source>> sources;
+    sources.push_back(std::move(owned));
+    return std::make_unique<Sampler>(std::move(sources), options);
+}
+double seconds_of(const Sample& s) { return static_cast<double>(s.t_ns) * 1e-9; }
+
+// Finding 2: sample_at() from other threads while the worker runs never enters a source twice at once, and a
+// timestamp that will not be stored does not advance a stateful source.
+void serialized_reads() {
+    Scripted* source = nullptr;
+    Options options;
+    options.period_ms = 1;
+    auto sampler = scripted(source, [](Sample& s) { s.add_power(Domain::package, 10.0); }, options);
+    sampler->start();
+    std::vector<std::thread> threads;
+    for (int t = 0; t < 4; ++t)
+        threads.emplace_back([&] { for (int i = 0; i < 2000; ++i) { if (i % 2) sampler->sample_at(Sampler::now_ns()); else sampler->sample_now(); } });
+    for (auto& thread : threads) thread.join();
+    sampler->stop();
+    require(!source->overlap.load(), "two threads read a source at the same time");
+    const int before = source->reads.load();
+    sampler->sample_at(sampler->latest().t_ns - 5);
+    sampler->sample_at(sampler->latest().t_ns);
+    require(source->reads.load() == before, "a refused timestamp still read the sources");
+}
+
+// Finding 4: a status view and a receipt read no sensor, and cover() cannot drive the worker past its minimum spacing.
+void status_and_receipts_read_no_sensor() {
+    Scripted* source = nullptr;
+    Options options;
+    options.period_ms = 1000;
+    options.min_interval_ms = 20;
+    auto sampler = scripted(source, [](Sample& s) { s.add_power(Domain::package, 10.0); }, options);
+    sampler->sample_at(Sampler::now_ns() - kSecond / 2);
+    sampler->sample_at(Sampler::now_ns());
+    const int before = source->reads.load();
+    const auto end = sampler->latest().t_ns;
+    for (int i = 0; i < 200; ++i) {
+        (void)status_json(sampler.get(), true, sampler->sources());
+        (void)block_json(window_block(*sampler, end - kSecond / 4, end - kSecond / 8, end, 1, 1));
+    }
+    require(source->reads.load() == before, "status or receipt rendering read a sensor");
+    require(sampler->cover(end, 0) && !sampler->cover(end + kSecond, 0), "cover without a worker only reports");
+    require(source->reads.load() == before, "cover without a worker read a sensor");
+    sampler->start();
+    const auto t0 = Sampler::now_ns();
+    int covered = 0;
+    for (int i = 0; i < 400 && Sampler::now_ns() - t0 < 300'000'000LL; ++i) covered += sampler->cover(Sampler::now_ns(), 200) ? 1 : 0;
+    const double elapsed_ms = static_cast<double>(Sampler::now_ns() - t0) * 1e-6;
+    sampler->stop();
+    const int worker_reads = source->reads.load() - before;
+    require(covered > 0, "cover never obtained a closing sample");
+    require(worker_reads <= static_cast<int>(elapsed_ms / 20.0) + 3,
+            "worker sampled faster than its minimum spacing: " + std::to_string(worker_reads) + " reads in " + std::to_string(elapsed_ms) + " ms");
+}
+
+// Finding 5: the block of an execution span depends on the span alone: built again later, after more samples, it is
+// the same text; and it is the energy of that span, not of a window counted back from "now".
+void execution_window_is_immutable() {
+    Scripted* source = nullptr;
+    auto sampler = scripted(source, [](Sample& s) { s.add_power(Domain::package, seconds_of(s) < 8.5 ? 100.0 : 900.0); });
+    for (int i = 0; i <= 8; ++i) sampler->sample_at(i * kSecond);
+    const auto first = block_json(window_block(*sampler, 2 * kSecond, 6 * kSecond, 8 * kSecond, 4000, 60));
+    for (int i = 9; i <= 20; ++i) sampler->sample_at(i * kSecond);  // the response is rendered 12 s later, under load
+    const auto later = block_json(window_block(*sampler, 2 * kSecond, 6 * kSecond, 8 * kSecond, 4000, 60));
+    require(first == later, "the receipt of one execution span changed with the time it was rendered");
+    const auto json = strix::serve::parse_json(first);
+    require(near(json.find("request")->find("energy_j")->as_double(), 600.0) && json.find("request")->find("complete")->as_bool(), "request span");
+    require(near(json.find("prefill")->find("energy_j")->as_double(), 400.0) && near(json.find("decode")->find("energy_j")->as_double(), 200.0), "phase spans");
+    require(near(json.find("decode")->find("tok_per_j")->as_double(), 60.0 / 200.0), "decode tok/J");
+}
+
+// Finding 6: a window older than the ring is not filled in from the oldest retained sample; the totals since the start
+// come from the running accumulator, not from the ring.
+void expired_history() {
+    Scripted* source = nullptr;
+    Options options;
+    options.capacity = 4;
+    auto sampler = scripted(source, [](Sample& s) { s.add_energy(Domain::package, 100.0 * seconds_of(s)); }, options);
+    for (int i = 1; i <= 10; ++i) sampler->sample_at(i * kSecond);  // 100 W for 9 s; the ring keeps 7..10 s
+    auto r = sampler->summarize(1 * kSecond, 10 * kSecond, 90);
+    require(r.available && !r.complete, "a window reaching past the ring must not be complete");
+    require(near(r.energy_j, 300.0) && near(r.covered_ms, 3000.0) && near(r.avg_w, 100.0) && r.tok_per_j == 0.0, "only the retained 3 s are reported");
+    r = sampler->summarize(1 * kSecond, 3 * kSecond, 0);
+    require(!r.available && r.reason.find("not covered") != std::string::npos, "an expired window is unavailable");
+    const auto total = sampler->lifetime_receipt();
+    require(total.available && total.complete && near(total.energy_j, 900.0) && near(total.duration_ms, 9000.0) && near(total.avg_w, 100.0), "process total");
+    require(total.energy_source == "counter-lifetime", "process total source");
+}
+
+// Finding 7: a package counter does not hide a card. Disjoint domains add up and the receipt names both; inside one
+// domain the counter replaces the power reading instead of being added to it.
+void disjoint_domains() {
+    Scripted* source = nullptr;
+    auto sampler = scripted(source, [](Sample& s) {
+        s.add_energy(Domain::package, 50.0 * seconds_of(s));
+        s.add_power(Domain::package, 55.0);       // the same package through its power reading: not added
+        s.add_power(Domain::accelerator, 300.0);  // a card outside the package
+    });
+    for (int i = 1; i <= 3; ++i) sampler->sample_at(i * kSecond);
+    const auto r = sampler->summarize(1 * kSecond, 3 * kSecond, 700);
+    require(r.available && r.complete && near(r.energy_j, 700.0) && near(r.avg_w, 350.0), "package counter plus card integral");
+    require(r.coverage == "package:counter+accelerator:power-integral" && r.energy_source == "mixed", "coverage: " + r.coverage);
+    require(near(r.peak_w, 355.0) && near(r.tok_per_j, 1.0), "peak and tok/J over both domains");
+    require(near(sampler->latest().total_power_w(), 355.0), "latest power sums the domains");
+    // A whole-machine meter replaces the parts.
+    auto metered = scripted(source, [](Sample& s) { s.add_power(Domain::system, 400.0); s.add_power(Domain::accelerator, 300.0); });
+    metered->sample_at(kSecond);
+    metered->sample_at(2 * kSecond);
+    const auto m = metered->summarize(kSecond, 2 * kSecond, 0);
+    require(near(m.energy_j, 400.0) && m.coverage == "system:power-integral", "system domain");
+    // A domain the sampler measures but that has no reading in the window is named, and the receipt is not complete.
+    auto lost = scripted(source, [](Sample& s) {
+        s.add_power(Domain::package, 50.0);
+        if (seconds_of(s) < 2.5) s.add_power(Domain::accelerator, 300.0);
+    });
+    for (int i = 1; i <= 6; ++i) lost->sample_at(i * kSecond);
+    const auto l = lost->summarize(4 * kSecond, 6 * kSecond, 10);
+    require(l.available && !l.complete && near(l.energy_j, 100.0) && l.coverage == "package:power-integral+accelerator:none" && l.tok_per_j == 0.0,
+            "lost domain: " + l.coverage);
+}
+
+// Finding 8: a counter made of several zones is published only when every zone was read. A sample in which one zone
+// failed carries no counter (it is not the sum of the zones that answered), and the energy that zone used meanwhile
+// is not moved into the stretch in which it recovers.
+void partial_counter_failure() {
+    // Any source: a failed part of a domain removes the domain from the sample.
+    Scripted* source = nullptr;
+    auto sampler = scripted(source, [](Sample& s) {
+        s.add_energy(Domain::package, 10.0 * seconds_of(s));
+        if (seconds_of(s) > 1.5 && seconds_of(s) < 2.5) s.fail_energy(Domain::package);  // the second zone did not answer
+        else s.add_energy(Domain::package, 10.0 * seconds_of(s));
+    });
+    for (int i = 1; i <= 4; ++i) sampler->sample_at(i * kSecond);
+    auto r = sampler->summarize(1 * kSecond, 2 * kSecond, 0);
+    require(!r.available, "a window ending in the failure reported a partial counter");
+    r = sampler->summarize(3 * kSecond, 4 * kSecond, 0);
+    require(r.available && r.complete && near(r.energy_j, 20.0), "after the failure");
+    r = sampler->summarize(1 * kSecond, 4 * kSecond, 0);
+    require(r.available && !r.complete && near(r.energy_j, 20.0) && near(r.covered_ms, 1000.0), "the failure is a gap, not energy");
+
+    // The built-in package counter, two zones (zone names need ':').
+#ifndef _WIN32
+    Tree tree("zones");
+    const auto zone = [&](int index, long long uj) {
+        const auto dir = "sys/class/powercap/intel-rapl:" + std::to_string(index) + "/";
+        tree.put(dir + "name", "package-" + std::to_string(index));
+        tree.put(dir + "max_energy_range_uj", "1000000000");
+        tree.put(dir + "energy_uj", std::to_string(uj));
+    };
+    zone(0, 0); zone(1, 0);
+    Options options;
+    options.max_gap_ms = 2500;
+    Sampler rapl(make_sources(tree.path()), options);
+    require(status_of(rapl, "rapl").available, "two zones");
+    rapl.sample_at(1 * kSecond);
+    zone(0, 10'000'000);
+    tree.put("sys/class/powercap/intel-rapl:1/energy_uj", "");  // zone 1 cannot be read at 2 s
+    rapl.sample_at(2 * kSecond);
+    require(!std::isfinite(rapl.latest().energy_j[0]), "partial package total published");
+    zone(0, 20'000'000); zone(1, 20'000'000);
+    rapl.sample_at(3 * kSecond);
+    zone(0, 30'000'000); zone(1, 30'000'000);
+    rapl.sample_at(4 * kSecond);
+    r = rapl.summarize(1 * kSecond, 2 * kSecond, 0);
+    require(r.available && near(r.energy_j, 20.0), "first second: both zones, 20 J (not the 10 J of the zone that answered)");
+    r = rapl.summarize(2 * kSecond, 3 * kSecond, 0);
+    require(r.available && near(r.energy_j, 20.0), "recovery second: 20 J (not 30 J with the other second's energy)");
+    r = rapl.summarize(3 * kSecond, 4 * kSecond, 0);
+    require(r.available && near(r.energy_j, 20.0), "after recovery");
+    // A value past the counter's range is a failed read.
+    zone(0, 2'000'000'000LL);
+    rapl.sample_at(5 * kSecond);
+    require(!std::isfinite(rapl.latest().energy_j[0]), "counter value past its range accepted");
+#endif
+}
+
+// Finding 9: failed power reads in the middle of a window are a gap in the receipt, not silence.
+void missing_power_interval() {
+    Scripted* source = nullptr;
+    auto sampler = scripted(source, [](Sample& s) {
+        const double t = seconds_of(s);
+        if (t > 1.5 && t < 3.5) s.fail_power(Domain::package); else s.add_power(Domain::package, 100.0);
+    });
+    for (int i = 0; i <= 5; ++i) sampler->sample_at(i * kSecond);
+    const auto r = sampler->summarize(0, 5 * kSecond, 500);
+    require(r.available && !r.complete, "a window with failed reads must not be complete");
+    require(near(r.energy_j, 200.0) && near(r.covered_ms, 2000.0) && near(r.avg_w, 100.0) && near(r.duration_ms, 5000.0), "covered part only");
+    require(r.tok_per_j == 0.0, "tok/J of a partial energy");
+    const auto json = strix::serve::parse_json(block_json(window_block(*sampler, 0, 5 * kSecond, 5 * kSecond, 500, 0)));
+    require(!json.find("request")->find("complete")->as_bool() && near(json.find("request")->find("covered_ms")->as_double(), 2000.0), "block says so");
+    // A gap no longer than the limit is interpolated (one bounded rule, stated in Options::max_gap_ms).
+    Options options;
+    options.max_gap_ms = 3000;
+    auto bridged = scripted(source, [](Sample& s) {
+        const double t = seconds_of(s);
+        if (t > 1.5 && t < 3.5) s.fail_power(Domain::package); else s.add_power(Domain::package, 100.0);
+    }, options);
+    for (int i = 0; i <= 5; ++i) bridged->sample_at(i * kSecond);
+    const auto b = bridged->summarize(0, 5 * kSecond, 500);
+    require(b.complete && near(b.energy_j, 500.0) && near(b.tok_per_j, 1.0), "bounded interpolation");
+}
+
+// Finding 10: a host that exposes clocks but no power is not a host that draws 0 W.
+void clock_only_status() {
+    Tree tree("clocks");
+    tree.cpu(3'000'000);
+    Sampler sampler(make_sources(tree.path()));
+    require(sampler.available() && !sampler.energy_available(), "clock-only sampler");
+    sampler.sample_at(kSecond);
+    sampler.sample_at(2 * kSecond);
+    const auto json = strix::serve::parse_json(status_json(&sampler, true, sampler.sources()));
+    require(json.find("available")->as_bool() && !json.find("energy_available")->as_bool(), "energy_available must be false");
+    require(json.find("latest")->find("power_w")->is_null() && json.find("latest")->find("gpu_clock_mhz")->is_null(), "absent readings are null");
+    require(near(json.find("latest")->find("cpu_mhz")->as_double(), 3001.0), "the clock that is there");
+    require(json.find("since_start")->find("energy_j")->is_null(), "no energy total");
+    require(!sampler.summarize(kSecond, 2 * kSecond, 1).available, "no receipt");
+    // With a power channel the same view carries numbers.
+    Tree full("clocks-power");
+    full.gpu(60.0, 2000.0, 50.0);
+    Sampler powered(make_sources(full.path()));
+    powered.sample_at(kSecond);
+    powered.sample_at(2 * kSecond);
+    const auto ok = strix::serve::parse_json(status_json(&powered, true, powered.sources()));
+    require(ok.find("energy_available")->as_bool() && near(ok.find("latest")->find("power_w")->as_double(), 60.0), "power status");
+    require(near(ok.find("since_start")->find("energy_j")->as_double(), 60.0), "energy total");
+    const auto off = strix::serve::parse_json(status_json(nullptr, false, {}));
+    require(!off.find("enabled")->as_bool() && !off.find("available")->as_bool() && !off.find("latest"), "off status");
+}
+
+// Finding 11: with the sampler switched off a CLI prints no "power" member at all.
+void off_switch_member() {
+    Block block;
+    require(block_member(block).empty(), "a disabled block must print nothing");
+    block.enabled = true;
+    block.request = block.prefill = block.decode = Receipt{};
+    const auto member = block_member(block);
+    require(member.rfind("\"power\":{\"schema\":\"strix-power-receipt-v1\"", 0) == 0, "enabled member: " + member);
+}
+
+// Finding 12: a value file holds one complete non-negative number or it is not read.
+void strict_parsing() {
+    double v = -1.0;
+    require(parse_value("100000000\n", v) && v == 100000000.0, "plain number");
+    require(parse_value("0", v) && v == 0.0 && parse_value("-5000\n", v) && v == -5000.0, "zero and sign");
+    for (const char* bad : {"100000000garbage", "", "\n", "-", "12 34", "1e3", "0x10", "nan", "inf", "1.5", "1234567890123456789012", " 5"})
+        require(!parse_value(bad, v), std::string("accepted: '") + bad + "'");
+    const auto card = [](const char* tag, const std::string& power) {
+        auto tree = std::make_unique<Tree>(tag);
+        tree->put("sys/class/hwmon/hwmon0/name", "amdgpu");
+        tree->put("sys/class/hwmon/hwmon0/power1_average", power);
+        return tree;
+    };
+    {
+        const auto tree = card("prefix", "100000000garbage");
+        Sampler sampler(make_sources(tree->path()));
+        require(!status_of(sampler, "amdgpu-hwmon").available, "numeric prefix accepted as 100 W");
+    }
+    {
+        const auto tree = card("negative", "-100000000");
+        Sampler sampler(make_sources(tree->path()));
+        require(!status_of(sampler, "amdgpu-hwmon").available, "negative power accepted");
+    }
+    {
+        const auto tree = card("turns-bad", "100000000");
+        Sampler sampler(make_sources(tree->path()));
+        require(status_of(sampler, "amdgpu-hwmon").available, "good card");
+        sampler.sample_at(kSecond);
+        tree->put("sys/class/hwmon/hwmon0/power1_average", "-100000000");
+        sampler.sample_at(2 * kSecond);
+        require(!std::isfinite(sampler.latest().power_w[0]), "negative reading stored");
+        tree->put("sys/class/hwmon/hwmon0/power1_average", "100000000 W");
+        sampler.sample_at(3 * kSecond);
+        require(!std::isfinite(sampler.latest().power_w[0]), "trailing bytes stored");
+        const auto r = sampler.summarize(kSecond, 3 * kSecond, 0);
+        require(!r.available, "a receipt from invalid readings");
+    }
+    // A negative temperature is a temperature.
+    Tree cold("cold");
+    cold.put("sys/class/hwmon/hwmon0/name", "amdgpu");
+    cold.put("sys/class/hwmon/hwmon0/temp1_input", "-5000");
+    Sampler sampler(make_sources(cold.path()));
+    sampler.sample_at(kSecond);
+    require(near(sampler.latest().temp_c, -5.0), "negative temperature");
+}
+
 }  // namespace
 
 int main() {
@@ -329,6 +641,16 @@ int main() {
         registered_source();
         thread_and_ring();
         block_rendering();
+        serialized_reads();
+        status_and_receipts_read_no_sensor();
+        execution_window_is_immutable();
+        expired_history();
+        disjoint_domains();
+        partial_counter_failure();
+        missing_power_interval();
+        clock_only_status();
+        off_switch_member();
+        strict_parsing();
         real_machine_root();
         std::cout << "power sampler tests passed\n";
         return 0;
