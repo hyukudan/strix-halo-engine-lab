@@ -8,6 +8,16 @@ STRIX_QPF2K_MOE_ROUTE_PRUNE=cap9        # or: --prefill-moe-route-prune cap9
 ```
 
 Rollback: unset the variable (or pass `off`) and restart the process. The request is read once per process.
+The master `--prefill-exact-fp16`, config `prefill_exact_fp16 = true`, or
+`STRIX_PREFILL_EXACT_FP16=1` disables pruning in both execution and identity.
+Values use decimal notation without whitespace or control characters; identity tags
+use the canonical spelling of the parsed policy (for example, `cap09` becomes `cap9`).
+
+`STRIX_MOE_ROUTE_CENSUS=<file>` is a diagnostic capture: synchronization, host copies,
+allocation and flushed I/O perturb every captured call. Disable it for performance
+qualification. Records from one process are serialized; use a separate file per process.
+Open, short-write and flush failures raise a path-specific error and permanently stop
+further appends to that writer; discard a failed capture before restarting.
 
 ## What it does
 

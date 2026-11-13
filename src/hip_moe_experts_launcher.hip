@@ -3158,10 +3158,8 @@ static void known_moe_route_census(std::uint32_t count, const HipMoeExpertsLaunc
     };
     pull(p.rows.route_weights.base, p.rows.route_weights.stride, w.data());
     pull(p.rows.routes.base, p.rows.routes.stride, e.data());
-    static std::FILE* const f = std::fopen(path, "ab");
-    if (!f) throw std::runtime_error("route census: cannot open file");
-    const std::uint32_t head[4]{0x52434e53U, count, k, static_cast<std::uint32_t>(config.expert_count)};
-    std::fwrite(head, 4, 4, f); std::fwrite(w.data(), 4, w.size(), f); std::fwrite(e.data(), 4, e.size(), f); std::fflush(f);
+    static moe_core::RouteCensusWriter<> writer(path);
+    writer.append(count, k, static_cast<std::uint32_t>(config.expert_count), w.data(), e.data());
 }
 void known_moe_prefill_enqueue(std::uint32_t count, const HipMoeExpertsLauncherConfig& config, const KnownMoePrefillPrepared& p) {
     const auto stream = hip_execution_stream();

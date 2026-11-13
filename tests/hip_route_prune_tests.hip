@@ -47,6 +47,11 @@ struct Policy {
     }
 };
 using Plan = strix::moe_core::device_plan::PackedPlan<Policy>;
+// A legacy unpruned policy need not implement the optional kept hook.
+struct UnprunedPolicy : Policy {
+    __device__ static bool kept(View, unsigned, unsigned) = delete;
+};
+using UnprunedPlan = strix::moe_core::device_plan::PackedPlan<UnprunedPolicy>;
 
 int failures = 0;
 void expect(bool ok, const char* what) { if (!ok) { ++failures; std::fprintf(stderr, "FAIL: %s\n", what); } }
@@ -131,7 +136,12 @@ int main() {
             check(strix::moe_core::enqueue_route_prune(d_weights, k * sizeof(float), rows, k, p, nullptr), "prune");
             want = host_prune(weights, rows, k, p);
         }
-        check(Plan::enqueue(view, rows, experts, k, cap, scratch, nullptr, false, p.active()), "plan");
+        if (p.active()) check(Plan::enqueue(view, rows, experts, k, cap, scratch, nullptr, false, true), "plan");
+        else {
+            expect(UnprunedPlan::enqueue(view, rows, experts, k, cap, scratch, nullptr, false, true) == hipErrorInvalidValue,
+                   "pruning without kept must be refused");
+            check(UnprunedPlan::enqueue(view, rows, experts, k, cap, scratch, nullptr, false, false), "legacy plan");
+        }
         check(hipDeviceSynchronize(), "sync");
         const auto got = down(d_weights, count);
         unsigned differ = 0U, kept = 0U;

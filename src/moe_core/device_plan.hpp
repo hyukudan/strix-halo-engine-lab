@@ -321,12 +321,16 @@ inline hipError_t PackedPlan<P>::enqueue(typename P::View v,unsigned rows,unsign
     hipError_t e=hipMemsetAsync(scratch,0,kHead*sizeof(unsigned),stream);
     if(e!=hipSuccess)return e;
     if(prune) {
-        // Pruned plan (P::kept): the same three launches over the kept assignments; the default instantiations are untouched.
-        if(certificate)csr_count_kernel<P,true,true><<<blocks,P::kThreads,0,stream>>>(v,rows,experts,top_k,scratch);
-        else csr_count_kernel<P,false,true><<<blocks,P::kThreads,0,stream>>>(v,rows,experts,top_k,scratch);
-        csr_scan_kernel<P,true><<<1,P::kThreads,0,stream>>>(v,rows,experts,top_k,cap,blocks,scratch);
-        csr_scatter_kernel<P,true><<<blocks,P::kThreads,0,stream>>>(v,rows,top_k,scratch);
-        return hipGetLastError();
+        if constexpr(requires { P::kept(v,0U,0U); }) {
+            // Pruned plan (P::kept): the same three launches over the kept assignments; the default instantiations are untouched.
+            if(certificate)csr_count_kernel<P,true,true><<<blocks,P::kThreads,0,stream>>>(v,rows,experts,top_k,scratch);
+            else csr_count_kernel<P,false,true><<<blocks,P::kThreads,0,stream>>>(v,rows,experts,top_k,scratch);
+            csr_scan_kernel<P,true><<<1,P::kThreads,0,stream>>>(v,rows,experts,top_k,cap,blocks,scratch);
+            csr_scatter_kernel<P,true><<<blocks,P::kThreads,0,stream>>>(v,rows,top_k,scratch);
+            return hipGetLastError();
+        } else {
+            return hipErrorInvalidValue;  // Optional policy hook: ordinary plans need not provide it.
+        }
     }
     if(certificate)csr_count_kernel<P,true><<<blocks,P::kThreads,0,stream>>>(v,rows,experts,top_k,scratch);
     else csr_count_kernel<P><<<blocks,P::kThreads,0,stream>>>(v,rows,experts,top_k,scratch);
