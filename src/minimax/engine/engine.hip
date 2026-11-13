@@ -664,9 +664,8 @@ struct Engine::Impl {
     struct JitTiming {
         hipEvent_t convert0 = nullptr, convert1 = nullptr, moe0 = nullptr, moe1 = nullptr;
         bool convert_pending = false, moe_pending = false, moe_started = false;
-        std::uint64_t converts = 0, moes = 0, i4_calls = 0, exl3_calls = 0;  // calls: MoE launches (one per chunk or group)
-        double convert_ms = 0, moe_ms = 0;
-    };
+        bool moe_i4 = false;  // arithmetic of the sampled MoE group
+    };  // event handles only: counts and sampled times belong to the task (PfTask::i4_stats)
     std::array<JitTiming, kLayers> jit_timing{};
     float *f32_xt = nullptr, *f32_raw = nullptr, *f32_g = nullptr, *f32_u = nullptr, *f32_ye = nullptr;
     rtxpf::F32Job *f32_jobs_h = nullptr, *f32_jobs_d = nullptr;
@@ -1039,41 +1038,51 @@ struct Engine::Impl {
     bool i4_jit_layer(unsigned L) const { return model_fast_i4 && L >= kFirstMoe && L < kLayers && !i4_exl3_layers.test(L); }
     // Timing collection is nonblocking. At prompt completion the existing prefill fence makes
     // every sample available; no host fence is introduced for conversion or prefetch.
+    // Samples and counts go to the current task. A task switch settles first (jit_settle), so a pending sample is never
+    // charged to another task.
     void jit_collect(bool report = false) {
         if (!jit_stats) return;
         double sum_i4 = 0, sum_exl3 = 0, sum_convert = 0;
         for (unsigned L = kFirstMoe; L < kLayers; ++L) {
             auto& t = jit_timing[L];
-            auto collect = [&](bool& pending, hipEvent_t a, hipEvent_t b, double& total, std::uint64_t& count) {
+            auto& s = task.i4_stats.layer[L];
+            auto collect = [&](bool& pending, hipEvent_t a, hipEvent_t b, auto&& add) {
                 if (!pending) return;
                 const auto status = hipEventQuery(b);
                 if (status == hipErrorNotReady) return;
                 hip_ok(status, "fast_i4 timing query");
                 float ms = 0;
                 hip_ok(hipEventElapsedTime(&ms, a, b), "fast_i4 timing");
-                total += ms;
-                ++count;
+                add(static_cast<double>(ms));
                 pending = false;
             };
-            collect(t.convert_pending, t.convert0, t.convert1, t.convert_ms, t.converts);
-            collect(t.moe_pending, t.moe0, t.moe1, t.moe_ms, t.moes);
+            collect(t.convert_pending, t.convert0, t.convert1, [&](double ms) { s.converted(ms); });
+            collect(t.moe_pending, t.moe0, t.moe1, [&](double ms) { s.sample(t.moe_i4, ms); });
             if (!report) continue;
-            if (t.moes != 0) {
-                const bool i4 = t.i4_calls != 0;
-                std::printf("rank %u fast_i4 L%u: %s, converter %.3f ms/layer (%llu), MoE group %.3f ms/layer (%llu), launches IU4 %llu EXL3 %llu\n",
-                            opt.rank, L, i4 ? "IU4" : "EXL3", t.converts != 0 ? t.convert_ms / static_cast<double>(t.converts) : 0.0,
-                            static_cast<unsigned long long>(t.converts), t.moe_ms / static_cast<double>(t.moes),
-                            static_cast<unsigned long long>(t.moes), static_cast<unsigned long long>(t.i4_calls),
-                            static_cast<unsigned long long>(t.exl3_calls));
-                (i4 ? sum_i4 : sum_exl3) += t.moe_ms;
-                sum_convert += t.convert_ms;
+            if (s.any()) {  // launch counts print without a timing sample (a prompt under the row gate has only EXL3 launches)
+                using S = fast_i4::LayerStats;
+                std::printf("rank %u fast_i4 L%u: launches IU4 %llu EXL3 %llu, MoE group IU4 %.3f ms (%llu) EXL3 %.3f ms (%llu), "
+                            "converter %.3f ms (%llu)\n",
+                            opt.rank, L, static_cast<unsigned long long>(s.i4_calls), static_cast<unsigned long long>(s.exl3_calls),
+                            S::mean(s.i4_ms, s.i4_samples), static_cast<unsigned long long>(s.i4_samples),
+                            S::mean(s.exl3_ms, s.exl3_samples), static_cast<unsigned long long>(s.exl3_samples),
+                            S::mean(s.convert_ms, s.converts), static_cast<unsigned long long>(s.converts));
+                sum_i4 += s.i4_ms;
+                sum_exl3 += s.exl3_ms;
+                sum_convert += s.convert_ms;
             }
-            t.converts = t.moes = t.i4_calls = t.exl3_calls = 0;  // one prompt per report
-            t.convert_ms = t.moe_ms = 0;
+            s = {};  // one prompt per report
         }
         if (report)
             std::printf("rank %u fast_i4 prompt: sampled MoE group time IU4 %.1f ms, EXL3 %.1f ms, converter %.1f ms\n", opt.rank,
                         sum_i4, sum_exl3, sum_convert);
+    }
+    // Task switch (park, begin, resume). own: the device is idle, so every pending sample is ready and goes to the
+    // current task. Anything still pending afterwards belongs to no live task and is dropped.
+    void jit_settle(bool own) {
+        if (!jit_stats) return;
+        if (own) jit_collect();
+        for (auto& t : jit_timing) t.convert_pending = t.moe_pending = t.moe_started = false;
     }
     void jit_begin() { jit_collect(); jit_schedule.begin(); }
     const mmoe::I4Layer* jit_acquire(unsigned L, unsigned end) {
@@ -1093,14 +1102,17 @@ struct Engine::Impl {
                 if (side) hip_ok(hipEventRecord(j.ready, stream), "fast_i4 prefetch ready");
             },
             [&](unsigned slot) { hip_ok(hipStreamWaitEvent(nullptr, jit[slot].ready, 0), "fast_i4 wait ready"); });
-        jit_moe_begin(L);
+        jit_moe_begin(L, true);
         return &jit[s].weights;
     }
     // STATS: the same group timer and launch counts for the layers kept on EXL3, so one run gives both sides.
-    void jit_moe_begin(unsigned L) {
+    void jit_moe_begin(unsigned L, bool i4 = false) {
         auto& t = jit_timing[L];
         t.moe_started = jit_stats && t.moe0 != nullptr && !t.moe_pending;
-        if (t.moe_started) hip_ok(hipEventRecord(t.moe0, nullptr), "fast_i4 MoE begin");
+        if (t.moe_started) {
+            t.moe_i4 = i4;
+            hip_ok(hipEventRecord(t.moe0, nullptr), "fast_i4 MoE begin");
+        }
     }
     void jit_moe_end(unsigned L) {
         if (jit_timing[L].moe_started) {
@@ -1111,7 +1123,7 @@ struct Engine::Impl {
     }
     void jit_count(unsigned L, bool i4, std::size_t calls = 1) {
         if (!jit_stats) return;
-        (i4 ? jit_timing[L].i4_calls : jit_timing[L].exl3_calls) += calls;
+        task.i4_stats.layer[L].count(i4, calls);
     }
     void jit_release(unsigned L) {
         jit_moe_end(L);
@@ -1694,7 +1706,9 @@ struct Engine::Impl {
         xb_layers = L1;
         xb_prepped = false;
         const bool i4_on = !gemv && model_fast_i4 && task.i4.on && mmoe::prefill_iu4();
+        const bool pf_stats = !gemv && task.open;  // STATS are the prefill task's: decode steps and probes stay out
         if (i4_on) jit_begin();
+        else if (pf_stats) jit_collect();
         for (unsigned L = L0; L < L1; ++L) {
             const Layer& y = layers[L];
             float* out = send_buffer(n);
@@ -1707,9 +1721,9 @@ struct Engine::Impl {
                                       hipMemcpyDeviceToDevice, nullptr), "trace ids");
             out = send_buffer(n);
             const auto* i4 = i4_on && i4_jit_layer(L) ? jit_acquire(L, L1) : nullptr;
-            if (i4 == nullptr && i4_on && y.moe) jit_moe_begin(L);
+            if (i4 == nullptr && pf_stats && y.moe) jit_moe_begin(L);  // EXL3 timing does not depend on the row gate
             stage_ffn(L, n, out, i4);
-            if (y.moe) jit_count(L, i4 != nullptr);
+            if (y.moe && pf_stats) jit_count(L, i4 != nullptr);
             if (i4 != nullptr) jit_release(L); else jit_moe_end(L);
             exchange_post(n, L, 1, out, y.w_next, nullptr, nullptr);
             tmark(tmark_at(L, 5));
@@ -2250,6 +2264,7 @@ struct Engine::Impl {
         std::uint64_t generation = 0;
         std::unique_ptr<strix::core::i4_shadow::Accumulator<kLayers>> shadow;
         fast_i4::RowGate i4;  // per task: a nested child's begin must not change the parked parent's INT4 decision
+        fast_i4::TaskStats<kLayers> i4_stats;  // per task: a nested child's report must not print or clear the parent's
     } task, parked;
     struct ActivationBank { float *h = nullptr, *hn = nullptr, *taps = nullptr; } base_bank, nest_bank;
     bool child_bank = false;
@@ -2270,6 +2285,7 @@ struct Engine::Impl {
     void prefill_begin(std::uint32_t slot, std::span<const std::uint32_t> toks, std::uint64_t pos0) {
         if (task.open) throw std::logic_error("prefill: active task");
         if (slot >= opt.slots || toks.empty() || pos0 + toks.size() > opt.capacity) throw std::invalid_argument("prefill: bad slot / range");
+        jit_settle(false);
         task = PfTask{};
         if (i4_shadow) task.shadow = std::make_unique<strix::core::i4_shadow::Accumulator<kLayers>>();
         last_out = {};
@@ -2436,6 +2452,7 @@ struct Engine::Impl {
         retire_prefill();
         if (task.saved) restore_rows();
         hip_ok(hipDeviceSynchronize(), "prefill freeze");
+        jit_settle(true);  // the parent's pending samples, before the child runs
         base_bank = {h, hn, taps_d};
         parked = std::move(task);
         task = PfTask{};
@@ -2445,6 +2462,7 @@ struct Engine::Impl {
         if (task.open || !parked.open || parked.id != id)
             throw std::logic_error("prefill unpark: task identity");
         retire_prefill();
+        jit_settle(false);
         task = std::move(parked);
         parked = PfTask{};
         tap_sink = std::move(parked_sink);
@@ -2629,7 +2647,9 @@ struct Engine::Impl {
             hipLaunchKernelGGL(rmsnorm_gemma_kernel, dim3(static_cast<unsigned>(N[c])), dim3(256), 0, nullptr, h, w_in0, hn, kHidden);
         }
         const bool i4_on = model_fast_i4 && task.i4.on && mmoe::prefill_iu4();
+        const bool pf_stats = task.open;
         if (i4_on) jit_begin();
+        else if (pf_stats) jit_collect();
         for (unsigned L = L0; L < L1; ++L) {
             const Layer& y = layers[L];
             if (tl) tl->context(task.c, L);
@@ -2656,7 +2676,7 @@ struct Engine::Impl {
                 if (tl) tl->mark("attention-post-router", false);
             };
             const std::size_t moe_w = pf_moe_width(L, i4 != nullptr, m);
-            if (i4 == nullptr && i4_on && y.moe) jit_moe_begin(L);
+            if (i4 == nullptr && pf_stats && y.moe) jit_moe_begin(L);  // EXL3 timing does not depend on the row gate
             for (std::size_t c0 = 0; c0 < m;) {
                 // A sub-group runs as one group-wide MoE call when every member writes its own output buffer (the
                 // module's TX slots in place, or the communicator's per-member partials) and has the rows the

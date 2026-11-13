@@ -76,7 +76,7 @@
 {"src/minimax/engine/mm_common.hpp", 0xee32a1b26836712fULL},
 {"src/minimax/engine/mm_defaults.cpp", 0x8a58312778d31bb6ULL},
 {"src/minimax/engine/mm_defaults.hpp", 0xf65f96d194bb7577ULL},
-{"src/minimax/engine/mm_fast_i4.hpp", 0x6bf7da3ce8ba4328ULL},
+{"src/minimax/engine/mm_fast_i4.hpp", 0x873b1bb7b7177f59ULL},
 {"src/minimax/engine/mm_kernels.hpp", 0x434413100dddc9edULL},
 {"src/minimax/engine/mm_pack.cpp", 0xbc1d7d94ce76263bULL},
 {"src/minimax/engine/prefill_timeline.hpp", 0x2911755ae15611b9ULL},
