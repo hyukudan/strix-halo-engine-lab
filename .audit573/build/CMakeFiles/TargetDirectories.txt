@@ -1,8 +1,0 @@
-D:/tmp/fix-pr573/.audit573/build/CMakeFiles/Experimental.dir
-D:/tmp/fix-pr573/.audit573/build/CMakeFiles/Nightly.dir
-D:/tmp/fix-pr573/.audit573/build/CMakeFiles/Continuous.dir
-D:/tmp/fix-pr573/.audit573/build/CMakeFiles/NightlyMemoryCheck.dir
-D:/tmp/fix-pr573/.audit573/build/CMakeFiles/ds41_step_digest_tests.dir
-D:/tmp/fix-pr573/.audit573/build/CMakeFiles/RUN_TESTS.dir
-D:/tmp/fix-pr573/.audit573/build/CMakeFiles/ALL_BUILD.dir
-D:/tmp/fix-pr573/.audit573/build/CMakeFiles/ZERO_CHECK.dir
