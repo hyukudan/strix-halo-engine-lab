@@ -508,11 +508,14 @@ void partial_counter_failure() {
     zone(0, 30'000'000); zone(1, 30'000'000);
     rapl.sample_at(4 * kSecond);
     r = rapl.summarize(1 * kSecond, 2 * kSecond, 0);
-    require(r.available && near(r.energy_j, 20.0), "first second: both zones, 20 J (not the 10 J of the zone that answered)");
+    require(!r.available, "the second that ends in the failed read reported the 10 J of the zone that answered");
     r = rapl.summarize(2 * kSecond, 3 * kSecond, 0);
-    require(r.available && near(r.energy_j, 20.0), "recovery second: 20 J (not 30 J with the other second's energy)");
+    require(!r.available, "the recovery second reported energy (30 J with the other second's energy before the fix)");
     r = rapl.summarize(3 * kSecond, 4 * kSecond, 0);
-    require(r.available && near(r.energy_j, 20.0), "after recovery");
+    require(r.available && r.complete && near(r.energy_j, 20.0), "after recovery");
+    require(near(rapl.latest().energy_j[0], 60.0), "the cumulative total holds both zones again");
+    r = rapl.summarize(1 * kSecond, 4 * kSecond, 0);
+    require(r.available && !r.complete && near(r.energy_j, 20.0) && near(r.covered_ms, 1000.0), "the failure is not bridged within the gap limit");
     // A value past the counter's range is a failed read.
     zone(0, 2'000'000'000LL);
     rapl.sample_at(5 * kSecond);
@@ -534,16 +537,107 @@ void missing_power_interval() {
     require(r.tok_per_j == 0.0, "tok/J of a partial energy");
     const auto json = strix::serve::parse_json(block_json(window_block(*sampler, 0, 5 * kSecond, 5 * kSecond, 500, 0)));
     require(!json.find("request")->find("complete")->as_bool() && near(json.find("request")->find("covered_ms")->as_double(), 2000.0), "block says so");
-    // A gap no longer than the limit is interpolated (one bounded rule, stated in Options::max_gap_ms).
+    // A failed read is never bridged, however short and whatever the gap limit: at the default 100 ms period, valid
+    // readings at 0 and 200 ms around a failed one at 100 ms cover nothing.
+    constexpr std::int64_t kTick = 100'000'000LL;
     Options options;
     options.max_gap_ms = 3000;
-    auto bridged = scripted(source, [](Sample& s) {
-        const double t = seconds_of(s);
-        if (t > 1.5 && t < 3.5) s.fail_power(Domain::package); else s.add_power(Domain::package, 100.0);
+    for (const Options& each : {Options{}, options}) {
+        auto cadence = scripted(source, [](Sample& s) {
+            if (s.t_ns == kTick) s.fail_power(Domain::package); else s.add_power(Domain::package, 100.0);
+        }, each);
+        for (int i = 0; i <= 3; ++i) cadence->sample_at(i * kTick);
+        require(!cadence->summarize(0, 2 * kTick, 20).available, "a failed read between two valid ones was bridged");
+        const auto c = cadence->summarize(0, 3 * kTick, 30);
+        require(c.available && !c.complete && near(c.energy_j, 10.0) && near(c.covered_ms, 100.0) && c.tok_per_j == 0.0, "only 200..300 ms is covered");
+        double joules = 0.0, seconds = 0.0;
+        cadence->lifetime(joules, seconds);
+        require(near(joules, 10.0) && near(seconds, 0.1), "lifetime bridges no failed read either");
+    }
+    // The gap limit still bounds two consecutive valid samples that are far apart.
+    auto sparse = scripted(source, [](Sample& s) { s.add_power(Domain::package, 100.0); }, options);
+    sparse->sample_at(0);
+    sparse->sample_at(2 * kSecond);
+    sparse->sample_at(6 * kSecond);
+    require(sparse->summarize(0, 2 * kSecond, 0).complete && !sparse->summarize(2 * kSecond, 6 * kSecond, 0).available, "gap limit");
+}
+
+// A domain whose source is there but whose reads all fail stays in the receipt: the receipt is not complete and carries
+// no tok/J, instead of reporting the other domain as the whole.
+void failing_domain_stays_expected() {
+    Scripted* source = nullptr;
+    auto sampler = scripted(source, [](Sample& s) { s.add_power(Domain::package, 50.0); s.fail_power(Domain::accelerator); });
+    for (int i = 1; i <= 3; ++i) sampler->sample_at(i * kSecond);
+    const auto r = sampler->summarize(1 * kSecond, 3 * kSecond, 100);
+    require(r.available && !r.complete, "a domain that only fails dropped out of the receipt");
+    require(r.coverage == "package:power-integral+accelerator:none" && near(r.energy_j, 100.0), "coverage: " + r.coverage);
+    require(r.covered_ms == 0.0 && r.tok_per_j == 0.0, "no common coverage, no tok/J");
+    const auto total = sampler->lifetime_receipt();
+    require(total.available && !total.complete && total.covered_ms == 0.0, "lifetime keeps the failing domain");
+    require(sampler->energy_available(), "energy_available is about readings that succeeded");
+    // Only failures: nothing to report, but still a measured domain.
+    auto dead = scripted(source, [](Sample& s) { s.fail_energy(Domain::package); });
+    dead->sample_at(kSecond);
+    dead->sample_at(2 * kSecond);
+    require(!dead->energy_available() && dead->summarize(kSecond, 2 * kSecond, 0).reason.find("not covered") != std::string::npos, "all reads failed");
+}
+
+// covered_ms is the time every domain covers at once (the intersection), not the shortest of their covered times.
+void covered_time_is_the_intersection() {
+    constexpr std::int64_t kTick = 100'000'000LL;
+    Scripted* source = nullptr;
+    // package covers 0..100 ms, the card 200..300 ms: no instant has both.
+    auto apart = scripted(source, [](Sample& s) {
+        if (s.t_ns <= kTick) s.add_power(Domain::package, 50.0); else s.fail_power(Domain::package);
+        if (s.t_ns >= 2 * kTick) s.add_power(Domain::accelerator, 300.0); else s.fail_power(Domain::accelerator);
+    });
+    for (int i = 0; i <= 3; ++i) apart->sample_at(i * kTick);
+    auto r = apart->summarize(0, 3 * kTick, 0);
+    require(r.available && !r.complete && near(r.energy_j, 35.0), "both parts are reported");
+    require(r.covered_ms == 0.0, "disjoint coverage reported as common: " + std::to_string(r.covered_ms));
+    double joules = 0.0, seconds = 0.0;
+    apart->lifetime(joules, seconds);
+    require(near(joules, 35.0) && seconds == 0.0, "lifetime common coverage of disjoint domains");
+    // package covers 0..200 ms, the card 100..300 ms: 100 ms in common.
+    auto overlap = scripted(source, [](Sample& s) {
+        if (s.t_ns <= 2 * kTick) s.add_power(Domain::package, 50.0); else s.fail_power(Domain::package);
+        if (s.t_ns >= kTick) s.add_power(Domain::accelerator, 300.0); else s.fail_power(Domain::accelerator);
+    });
+    for (int i = 0; i <= 3; ++i) overlap->sample_at(i * kTick);
+    r = overlap->summarize(0, 3 * kTick, 0);
+    require(!r.complete && near(r.energy_j, 70.0) && near(r.covered_ms, 100.0), "partial overlap: " + std::to_string(r.covered_ms));
+    overlap->lifetime(joules, seconds);
+    require(near(seconds, 0.1), "lifetime partial overlap");
+    r = overlap->summarize(kTick, 2 * kTick, 0);
+    require(r.complete && near(r.covered_ms, 100.0) && near(r.energy_j, 35.0), "the common part alone is complete");
+}
+
+// The closing wait is a deadline: a sensor that hangs costs a request at most kClosingWaitMs, and the receipt then says
+// the tail is not covered.
+void closing_wait_has_a_deadline() {
+    require(kClosingWaitMs <= 10, "closing wait above 10 ms");
+    Scripted* source = nullptr;
+    std::atomic<bool> slow{false};
+    Options options;
+    options.period_ms = 20;
+    auto sampler = scripted(source, [&](Sample& s) {
+        s.add_power(Domain::package, 100.0);
+        if (slow.load()) std::this_thread::sleep_for(std::chrono::milliseconds(400));
     }, options);
-    for (int i = 0; i <= 5; ++i) bridged->sample_at(i * kSecond);
-    const auto b = bridged->summarize(0, 5 * kSecond, 500);
-    require(b.complete && near(b.energy_j, 500.0) && near(b.tok_per_j, 1.0), "bounded interpolation");
+    sampler->start();
+    std::this_thread::sleep_for(std::chrono::milliseconds(120));
+    slow = true;
+    std::this_thread::sleep_for(std::chrono::milliseconds(60));  // the worker is now inside a slow read
+    const auto begin = Sampler::now_ns() - 50'000'000LL;
+    const auto end = Sampler::now_ns();
+    const bool reached = sampler->cover(end, kClosingWaitMs);
+    const double waited_ms = static_cast<double>(Sampler::now_ns() - end) * 1e-6;
+    const auto r = sampler->summarize(begin, end, 5);
+    slow = false;
+    sampler->stop();
+    require(!reached, "a blocked sensor cannot have delivered the closing sample");
+    require(waited_ms < 100.0, "the closing wait ran past its deadline: " + std::to_string(waited_ms) + " ms");
+    require(!r.complete && r.tok_per_j == 0.0, "a receipt without its closing sample must be incomplete");
 }
 
 // Finding 10: a host that exposes clocks but no power is not a host that draws 0 W.
@@ -648,6 +742,9 @@ int main() {
         disjoint_domains();
         partial_counter_failure();
         missing_power_interval();
+        failing_domain_stays_expected();
+        covered_time_is_the_intersection();
+        closing_wait_has_a_deadline();
         clock_only_status();
         off_switch_member();
         strict_parsing();

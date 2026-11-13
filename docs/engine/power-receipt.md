@@ -9,8 +9,10 @@ dependency.
 
 - One worker thread reads the registered sources every 100 ms (`STRIX_POWER_SAMPLE_MS`, 10..10000) into a fixed
   ring (65,536 samples, about 1.8 hours at the default period). A finished request can ask the worker for one
-  closing sample; the worker never samples closer together than a tenth of the period (10 ms at most), so the
-  ring holds at least 11 minutes even under a flood of completions. Nothing else reads a sensor: a status
+  closing sample and waits for it for at most 10 ms (a stream does not wait at all: its terminal chunk carries
+  what the ring holds); when the deadline expires the receipt says its tail is not covered. The worker never
+  samples closer together than a tenth of the period (5 ms at most), so the ring holds at least 5 minutes even
+  under a flood of completions. Nothing else reads a sensor: a status
   request and a receipt only read the ring.
 - It needs no elevated rights and changes no system setting. A source that is missing or unreadable is reported as
   unavailable with the reason and skipped. A run never fails because of the sampler.
@@ -18,10 +20,12 @@ dependency.
   engine adds nothing to be sampled.
 - A receipt is a time window of the ring. The window edges are interpolated between the neighbouring samples, so the
   caller only passes timestamps it already has.
-- Nothing is invented. A stretch between two valid readings of a channel is covered when they are at most
-  `max(1000 ms, 3 periods)` apart; a failed read, a window older than the ring or a window that ends after the last
-  sample is not covered. The receipt then says `complete: false`, reports the energy of the covered part only
-  (`covered_ms`) and no `tok_per_j`. A window with no covered part is `available: false`.
+- Nothing is invented. A channel covers the stretch between two consecutive samples when both hold a valid
+  reading and they are at most `max(1000 ms, 3 periods)` apart. A failed read is never bridged: the stretches on
+  both sides of it are not covered. Neither is a window older than the ring or one that ends after the last
+  sample. The receipt then says `complete: false`, reports the energy of the covered parts only and no
+  `tok_per_j`. `covered_ms` is the time every measured domain covers at once. A window with no covered part is
+  `available: false`.
 
 ## Sources
 
@@ -48,7 +52,8 @@ detail says `domain=package(assumed)`, so a package counter is never added to it
 Energy is computed per domain: the counter when it covers at least as much of the window as the power readings of
 the same domain, otherwise the trapezoid integral of the power readings. Disjoint domains are added. `coverage`
 names what the number describes, for example `package:counter+accelerator:power-integral`; a domain the sampler
-measures but that has no reading in the window appears as `accelerator:none` and the receipt is not complete.
+measures but that has no reading in the window appears as `accelerator:none` and the receipt is not complete;
+that holds from the first read of the domain on, also when every read of it fails.
 The energy is the energy of the listed domains. It is the whole machine only when the coverage says `system`:
 memory, storage, fans and conversion losses outside the listed domains are not in it.
 
@@ -93,7 +98,7 @@ Each of `request`, `prefill` and `decode` is either `{"available":false,"reason"
 | `cpu_mhz_median`, `gpu_busy_pct_mean` | CPU clock and GPU load |
 | `samples` | samples inside the window |
 | `energy_source` | `counter`, `power-integral` or `mixed` |
-| `complete`, `covered_ms` | whether every measured domain covers the whole window, and the part all of them cover |
+| `complete`, `covered_ms` | whether every measured domain covers the whole window, and the time all of them cover at once |
 | `coverage` | the domains in `energy_j` and how each was measured |
 
 The energy of a window is the energy of the covered domains during that window. Requests that overlap in time

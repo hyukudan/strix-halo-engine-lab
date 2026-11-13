@@ -273,15 +273,16 @@ Registry& registry() { static Registry r; return r; }
 
 using Cover = Sampler::Cover;
 using Covers = Sampler::Covers;
+using Joint = Sampler::Joint;
 constexpr std::int64_t kNoLo = std::numeric_limits<std::int64_t>::min(), kNoHi = std::numeric_limits<std::int64_t>::max();
 
-// Adds the stretch between two valid readings (ta, va) and (tb, vb) of one channel, clipped to [t0, t1]. A stretch
-// longer than the gap limit, or a counter that went down (a reset), is not covered: nothing is added.
-void stretch(Cover& c, bool counter, std::int64_t ta, double va, std::int64_t tb, double vb, std::int64_t t0, std::int64_t t1,
+// Adds the stretch between two consecutive samples' readings (ta, va) and (tb, vb) of one channel, clipped to [t0, t1].
+// False (nothing added) when it is longer than the gap limit or the counter went down (a reset).
+bool stretch(Cover& c, bool counter, std::int64_t ta, double va, std::int64_t tb, double vb, std::int64_t t0, std::int64_t t1,
              std::int64_t gap_ns) noexcept {
-    if (tb <= ta || tb - ta > gap_ns || (counter && vb < va)) return;
+    if (tb <= ta || tb - ta > gap_ns || (counter && vb < va)) return false;
     const auto lo = std::max(ta, t0), hi = std::min(tb, t1);
-    if (hi <= lo) return;
+    if (hi <= lo) return false;
     const double span = static_cast<double>(tb - ta);
     if (counter) {
         c.joules += (vb - va) * (static_cast<double>(hi - lo) / span);
@@ -293,29 +294,33 @@ void stretch(Cover& c, bool counter, std::int64_t ta, double va, std::int64_t tb
         c.peak = std::max({c.peak, pa, pb});
     }
     c.ns += hi - lo;
+    return true;
 }
-// The next valid reading of one channel: closes the stretch from the previous one.
-void feed(Cover& c, bool counter, std::int64_t t, double v, std::int64_t t0, std::int64_t t1, std::int64_t gap_ns) noexcept {
-    if (!finite(v)) return;
-    if (finite(c.last_v)) stretch(c, counter, c.last_t, c.last_v, t, v, t0, t1, gap_ns);
-    c.last_t = t;
-    c.last_v = v;
-}
-void feed(Covers& covers, const Sample& s, std::int64_t t0, std::int64_t t1, std::int64_t gap_ns) noexcept {
+// The stretch between two consecutive samples. A channel covers it only when both samples hold a valid reading: a
+// failed or absent reading ends the stretch before it and starts none after it, so nothing is interpolated across a
+// failed read. `joint` adds the clipped length under the set of channels that cover it (bit = channel * kDomains +
+// domain), which is what the time covered by several domains at once is read from.
+void span(Covers& covers, Joint& joint, const Sample& a, const Sample& b, std::int64_t t0, std::int64_t t1, std::int64_t gap_ns) noexcept {
+    const auto lo = std::max(a.t_ns, t0), hi = std::min(b.t_ns, t1);
+    if (hi <= lo) return;
+    unsigned mask = 0;
     for (std::size_t d = 0; d < kDomains; ++d) {
-        feed(covers[0][d], true, s.t_ns, s.energy_j[d], t0, t1, gap_ns);
-        feed(covers[1][d], false, s.t_ns, s.power_w[d], t0, t1, gap_ns);
+        if (finite(a.energy_j[d]) && finite(b.energy_j[d]) && stretch(covers[0][d], true, a.t_ns, a.energy_j[d], b.t_ns, b.energy_j[d], t0, t1, gap_ns))
+            mask |= 1U << d;
+        if (finite(a.power_w[d]) && finite(b.power_w[d]) && stretch(covers[1][d], false, a.t_ns, a.power_w[d], b.t_ns, b.power_w[d], t0, t1, gap_ns))
+            mask |= 1U << (kDomains + d);
     }
+    joint[mask] += hi - lo;
 }
 
-// Energy of a window of window_ns from the per-domain covers. `seen` is the set of domains the sampler measures (a bit
-// per domain): each of them must cover the window for the receipt to be complete. False: nothing covers any of it.
-bool combine(const Covers& covers, unsigned seen, std::int64_t window_ns, Receipt& r) {
+// Energy of a window of window_ns from the per-domain covers. `expected` is the set of domains the sampler measures (a
+// bit per domain, a domain whose reads only fail included): each of them must cover the window for the receipt to be
+// complete. covered_ms is the time all of them cover at once. False: nothing covers any of it.
+bool combine(const Covers& covers, const Joint& joint, unsigned expected, std::int64_t window_ns, Receipt& r) {
     const unsigned whole = 1U << static_cast<unsigned>(Domain::system);
-    const unsigned used = seen & whole ? whole : seen;
-    bool any = false, by_counter = false, by_power = false;
-    r.complete = true;
-    std::int64_t covered = window_ns;
+    const unsigned used = expected & whole ? whole : expected;
+    bool any = false, all = true, by_counter = false, by_power = false;
+    unsigned need = 0;
     for (std::size_t d = 0; d < kDomains; ++d) {
         if (!(used & (1U << d))) continue;
         const Cover& c = covers[0][d];
@@ -325,9 +330,8 @@ bool combine(const Covers& covers, unsigned seen, std::int64_t window_ns, Receip
         const Cover& u = counter ? c : p;
         r.coverage += (r.coverage.empty() ? "" : "+") + std::string(domain_name(static_cast<Domain>(d))) + ":" +
             (u.ns <= 0 ? "none" : counter ? "counter" : "power-integral");
-        covered = std::min(covered, u.ns);
-        if (u.ns != window_ns) r.complete = false;
-        if (u.ns <= 0) continue;
+        if (u.ns <= 0) { all = false; continue; }
+        need |= 1U << ((counter ? 0 : kDomains) + d);
         any = true;
         (counter ? by_counter : by_power) = true;
         r.energy_j += u.joules;
@@ -335,8 +339,11 @@ bool combine(const Covers& covers, unsigned seen, std::int64_t window_ns, Receip
         r.peak_w += p.ns > 0 ? p.peak : c.peak;  // sum of the domains' peaks (an upper bound with several domains)
     }
     if (!any) return false;
+    std::int64_t covered = 0;  // the stretches every chosen channel covers: the intersection, not the shortest one
+    if (all) for (unsigned mask = 0; mask < joint.size(); ++mask) if ((mask & need) == need) covered += joint[mask];
     r.available = true;
-    r.covered_ms = static_cast<double>(std::max<std::int64_t>(covered, 0)) * 1e-6;
+    r.complete = covered == window_ns;
+    r.covered_ms = static_cast<double>(covered) * 1e-6;
     r.energy_source = by_counter && by_power ? "mixed" : by_counter ? "counter" : "power-integral";
     r.peak_w = std::max(r.peak_w, r.avg_w);
     return true;
@@ -424,7 +431,7 @@ void exit_line() noexcept {
     try {
         auto& p = process();
         if (auto* s = p.live.load()) {
-            s->cover(Sampler::now_ns(), 2 * s->min_interval_ms() + 20);
+            s->cover(Sampler::now_ns(), kClosingWaitMs);
             Block block;
             block.enabled = true;
             block.sources = p.sources;
@@ -499,7 +506,7 @@ Sampler::Sampler(std::vector<std::unique_ptr<Source>> sources, Options options) 
     options_.period_ms = std::clamp(options_.period_ms, 1, 10000);
     options_.capacity = std::max<std::size_t>(options_.capacity, 4);
     if (options_.max_gap_ms <= 0) options_.max_gap_ms = std::max(1000, 3 * options_.period_ms);
-    if (options_.min_interval_ms <= 0) options_.min_interval_ms = std::clamp(options_.period_ms / 10, 1, 10);
+    if (options_.min_interval_ms <= 0) options_.min_interval_ms = std::clamp(options_.period_ms / 10, 1, 5);
     options_.min_interval_ms = std::min(options_.min_interval_ms, options_.period_ms);
     for (auto& source : sources_) {
         SourceStatus status;
@@ -597,7 +604,12 @@ void Sampler::sample_locked(std::int64_t t_ns) {
         if (finite(sample.energy_j[d])) seen_energy_ = static_cast<std::uint8_t>(seen_energy_ | (1U << d));
         if (finite(sample.power_w[d])) seen_power_ = static_cast<std::uint8_t>(seen_power_ | (1U << d));
     }
-    feed(life_, sample, kNoLo, kNoHi, static_cast<std::int64_t>(options_.max_gap_ms) * 1'000'000LL);
+    // A domain a source owns is expected from its first read on, failed or not: one that only ever fails stays in
+    // every receipt as "none" instead of dropping out of it.
+    expected_ = static_cast<std::uint8_t>(expected_ | seen_energy_ | seen_power_ | sample.energy_bad | sample.power_bad);
+    if (size_)
+        span(life_, life_joint_, ring_[(head_ + ring_.size() - 1) % ring_.size()], sample, kNoLo, kNoHi,
+             static_cast<std::int64_t>(options_.max_gap_ms) * 1'000'000LL);
     if (!size_) first_ns_ = t_ns;
     last_ns_ = t_ns;
     ring_[head_] = sample;
@@ -618,19 +630,21 @@ bool Sampler::energy_available() const {
 Receipt Sampler::lifetime_receipt() const {
     if (!usable_) return unavailable("no readable source");
     Covers covers;
-    unsigned seen = 0;
-    std::int64_t span = 0;
+    Joint joint;
+    unsigned expected = 0;
+    std::int64_t total = 0;
     {
         const std::lock_guard<std::mutex> lock(mutex_);
         covers = life_;
-        seen = static_cast<unsigned>(seen_energy_ | seen_power_);
-        span = last_ns_ - first_ns_;
+        joint = life_joint_;
+        expected = expected_;
+        total = last_ns_ - first_ns_;
     }
-    if (!seen) return unavailable("no power or energy channel");
-    if (span <= 0) return unavailable("no samples");
+    if (!expected) return unavailable("no power or energy channel");
+    if (total <= 0) return unavailable("no samples");
     Receipt r;
-    if (!combine(covers, seen, span, r)) return unavailable("no covered stretch since the sampler started");
-    r.duration_ms = static_cast<double>(span) * 1e-6;
+    if (!combine(covers, joint, expected, total, r)) return unavailable("no covered stretch since the sampler started");
+    r.duration_ms = static_cast<double>(total) * 1e-6;
     r.energy_source += "-lifetime";
     return r;
 }
@@ -667,20 +681,21 @@ Receipt Sampler::summarize(std::int64_t t0_ns, std::int64_t t1_ns, std::uint64_t
     if (t1_ns <= t0_ns) return unavailable("empty window");
     std::size_t inside = 0;
     bool lead = false;
-    unsigned seen = 0;
+    unsigned expected = 0;
     std::vector<Sample> points;
     {
         const std::lock_guard<std::mutex> lock(mutex_);
         points = window_locked(t0_ns, t1_ns, inside, lead);
-        seen = static_cast<unsigned>(seen_energy_ | seen_power_);
+        expected = expected_;
     }
-    if (!seen) return unavailable("no power or energy channel");
+    if (!expected) return unavailable("no power or energy channel");
     if (points.empty()) return unavailable("no samples");
     Covers covers;
+    Joint joint{};
     const auto gap_ns = static_cast<std::int64_t>(options_.max_gap_ms) * 1'000'000LL;
-    for (const auto& p : points) feed(covers, p, t0_ns, t1_ns, gap_ns);
+    for (std::size_t i = 1; i < points.size(); ++i) span(covers, joint, points[i - 1], points[i], t0_ns, t1_ns, gap_ns);
     Receipt r;
-    if (!combine(covers, seen, t1_ns - t0_ns, r)) return unavailable("window not covered by the stored samples");
+    if (!combine(covers, joint, expected, t1_ns - t0_ns, r)) return unavailable("window not covered by the stored samples");
     r.samples = inside;
     r.tokens = tokens;
     r.duration_ms = static_cast<double>(t1_ns - t0_ns) * 1e-6;
@@ -751,8 +766,9 @@ std::int64_t first_token_ns() noexcept { return process().first_token.load(); }
 namespace {
 std::int64_t ms_ns(double ms) noexcept { return finite(ms) && ms > 0.0 ? static_cast<std::int64_t>(ms * 1e6) : 0; }
 
-// A block of the process sampler, after asking its worker for the closing sample of the window.
-Block process_block(std::int64_t p0, std::int64_t d0, std::int64_t end, std::uint64_t prefill_tokens, std::uint64_t decode_tokens) {
+// A block of the process sampler. wait: ask its worker for the closing sample of the window first.
+Block process_block(std::int64_t p0, std::int64_t d0, std::int64_t end, std::uint64_t prefill_tokens, std::uint64_t decode_tokens,
+                    bool wait) {
     const bool enabled = sampler_enabled();
     auto* s = process_sampler();
     if (!s) {
@@ -762,9 +778,10 @@ Block process_block(std::int64_t p0, std::int64_t d0, std::int64_t end, std::uin
         block.request = block.prefill = block.decode = unavailable(enabled ? "no readable source" : "STRIX_POWER_SAMPLER=0");
         return block;
     }
-    // Bounded: the worker answers within its minimum spacing; a sensor that hangs costs this wait once, and the
-    // receipt then says the tail of the window is not covered.
-    s->cover(end, 2 * s->min_interval_ms() + 20);
+    // A hard deadline (kClosingWaitMs): the worker answers within its minimum spacing; when a sensor is slow the
+    // deadline expires and the receipt says the tail of the window is not covered. Without `wait` the receipt is what
+    // the ring holds now.
+    if (wait) s->cover(end, kClosingWaitMs);
     return window_block(*s, p0, d0, end, prefill_tokens, decode_tokens);
 }
 }  // namespace
@@ -782,8 +799,8 @@ Block window_block(const Sampler& sampler, std::int64_t p0, std::int64_t d0, std
 }
 
 Block execution_block(std::int64_t begin_ns, std::int64_t end_ns, double decode_ms, std::uint64_t prefill_tokens,
-                      std::uint64_t decode_tokens) {
-    return process_block(begin_ns, end_ns - ms_ns(decode_ms), end_ns, prefill_tokens, decode_tokens);
+                      std::uint64_t decode_tokens, bool wait) {
+    return process_block(begin_ns, end_ns - ms_ns(decode_ms), end_ns, prefill_tokens, decode_tokens, wait);
 }
 
 Block request_block(std::chrono::steady_clock::time_point start, std::chrono::steady_clock::time_point stop,
@@ -791,7 +808,7 @@ Block request_block(std::chrono::steady_clock::time_point start, std::chrono::st
     const auto p0 = Sampler::to_ns(start), end = Sampler::to_ns(stop);
     const auto first = first_token_ns();
     const bool split = first > p0 && first < end && generated_tokens > 1;
-    auto block = process_block(p0, split ? first : end, end, prompt_tokens, split ? generated_tokens - 1 : 0);
+    auto block = process_block(p0, split ? first : end, end, prompt_tokens, split ? generated_tokens - 1 : 0, true);
     // Several tokens but no first-token mark on this route: only the request total is honest.
     if (!split && generated_tokens > 1 && block.request.available) {
         block.request.tokens = prompt_tokens + generated_tokens;

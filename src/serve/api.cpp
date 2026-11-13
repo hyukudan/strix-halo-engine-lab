@@ -1149,7 +1149,8 @@ struct ApiService::Impl {
             out.stats.constraint = std::move(v);
         }
         if (spec && out.stats.constraint->status == "failed" && out.error.empty()) out.error = "constraint selection failed";
-        out.power = power_receipt(out, power::Sampler::now_ns());
+        // A stream gets the receipt the ring holds now: its terminal chunk never waits for a closing sample.
+        out.power = power_receipt(out, power::Sampler::now_ns(), !on_text && !on_delta);
         out.finish = out.family && out.matched.empty() ? out.stats.finish : !out.matched.empty() ? "stop" : out.stats.finish == "stop" ? "stop" : out.stats.finish == "cancelled" ? "cancelled" : "length";
         return out;
     }
@@ -1265,13 +1266,13 @@ struct ApiService::Impl {
     // Shared power receipt of a finished request, over the span the queue stamped on its stats (execution begin and
     // end). drive() builds it once; the response and the status record both print that text. `observed_ns` is when
     // drive() saw the job finished: the end of the span only for an engine that finishes its ticket unstamped.
-    static std::string power_receipt(const Outcome& o, std::int64_t observed_ns) {
+    static std::string power_receipt(const Outcome& o, std::int64_t observed_ns, bool wait) {
         if (!power::process_sampler() || !o.error.empty()) return {};
         const auto computed = o.stats.prompt_tokens - std::min(o.stats.prompt_tokens, o.stats.cached_tokens + o.stats.imported_tokens);
         const auto end = o.stats.exec_end_ns ? o.stats.exec_end_ns : observed_ns;
         const auto begin = o.stats.exec_begin_ns ? o.stats.exec_begin_ns
             : end - static_cast<std::int64_t>((std::max(o.stats.prefill_ms, 0.0) + std::max(o.stats.decode_ms, 0.0)) * 1e6);
-        return power::block_json(power::execution_block(begin, end, o.stats.decode_ms, computed, o.output_tokens));
+        return power::block_json(power::execution_block(begin, end, o.stats.decode_ms, computed, o.output_tokens, wait));
     }
     Json timing_data(const std::string& note, const Outcome* o = nullptr) const {
         auto data = api_request_scope ? api_request_scope->observation.terminal.timings : Json::object();

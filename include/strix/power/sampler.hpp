@@ -11,14 +11,17 @@
 // names what it covers ("package:counter+accelerator:power-integral"): it is the energy of those domains, not of the
 // whole machine, unless the coverage says "system".
 //
-// Coverage: nothing is extended or invented. A stretch between two valid readings of a channel is covered when they are
-// at most Options::max_gap_ms apart (linear interpolation inside it); anything else (a failed read, a window older than
-// the ring, a window that ends after the last sample) is not covered. A receipt carries covered_ms and complete; an
-// incomplete receipt reports the energy of the covered part only and no tok_per_j.
+// Coverage: nothing is extended or invented. A channel covers the stretch between two consecutive samples when both
+// hold a valid reading of it and they are at most Options::max_gap_ms apart (linear interpolation inside it). Anything
+// else is not covered: a failed read (the stretches on both sides of it), a window older than the ring, a window that
+// ends after the last sample. A domain a source owns is expected in every receipt, also when its reads only fail. A
+// receipt carries complete and covered_ms (the time every expected domain covers at once); an incomplete receipt
+// reports the energy of the covered parts only and no tok_per_j.
 //
 // Threads: the sources are read by one thread at a time (the worker, or a caller of sample_now/sample_at). Readers of
 // the ring never touch a sensor: status and receipts use what the worker stored. cover() asks the worker for one
-// closing sample and waits a bounded time for it; the worker never samples faster than Options::min_interval_ms.
+// closing sample and waits for it up to a deadline (kClosingWaitMs for a request); the worker never samples faster
+// than Options::min_interval_ms.
 //
 // Process sampler: start_process_sampler() starts one sampler per process (the device gate calls it, so an engine does
 // not). The receipt block "strix-power-receipt-v1" is what every CLI and the server print. Switch:
@@ -114,7 +117,8 @@ struct Receipt {
     std::size_t samples = 0;       // samples inside the window
     std::string energy_source;     // "counter" | "power-integral" | "mixed"
     // complete: every domain the sampler measures covers the whole window. Otherwise energy_j is the energy of the
-    // covered part only, avg_w its mean power, and covered_ms the part every domain covers.
+    // covered parts only, avg_w its mean power, and covered_ms the time all of those domains cover at once (the
+    // intersection of their covered stretches; 0 when one of them has no reading).
     bool complete = false;
     double covered_ms = 0.0;
     std::string coverage;          // "package:counter+accelerator:power-integral"; ":none" for a domain with no reading
@@ -123,8 +127,8 @@ struct Receipt {
 struct Options {
     int period_ms = 100;
     std::size_t capacity = 1U << 16;  // ring size in samples
-    int max_gap_ms = 0;       // longest stretch between two valid readings that still counts as covered; 0: max(1000, 3 periods)
-    int min_interval_ms = 0;  // shortest spacing of worker samples when cover() asks for one; 0: period / 10 within 1..10
+    int max_gap_ms = 0;       // longest stretch between two consecutive samples that still counts as covered; 0: max(1000, 3 periods)
+    int min_interval_ms = 0;  // shortest spacing of worker samples when cover() asks for one; 0: period / 10 within 1..5
 };
 
 class Sampler {
@@ -166,10 +170,11 @@ public:
         return std::chrono::duration_cast<std::chrono::nanoseconds>(t.time_since_epoch()).count();
     }
 
-    // One channel of one domain: joules and nanoseconds over its covered stretches, the steepest reading, and the last
-    // valid reading (lifetime only).
-    struct Cover { double joules = 0.0; std::int64_t ns = 0; double peak = 0.0; std::int64_t last_t = 0; double last_v = kAbsent; };
+    // One channel of one domain: joules and nanoseconds over its covered stretches and the steepest reading.
+    struct Cover { double joules = 0.0; std::int64_t ns = 0; double peak = 0.0; };
     using Covers = std::array<std::array<Cover, kDomains>, 2>;  // [0] counter, [1] power
+    // Nanoseconds per set of channels covering a stretch at once (bit = channel * kDomains + domain).
+    using Joint = std::array<std::int64_t, 1U << (2 * kDomains)>;
 
 private:
     void run();
@@ -186,8 +191,10 @@ private:
     std::vector<Sample> ring_;
     std::size_t head_ = 0, size_ = 0;
     Covers life_{};
+    Joint life_joint_{};
     std::int64_t first_ns_ = 0, last_ns_ = 0;
-    std::uint8_t seen_energy_ = 0, seen_power_ = 0;
+    std::uint8_t seen_energy_ = 0, seen_power_ = 0;  // domains that delivered a reading
+    std::uint8_t expected_ = 0;                      // domains a source read or failed to read
     std::thread thread_;
     std::mutex wake_mutex_;
     std::condition_variable wake_, sampled_;
@@ -223,10 +230,13 @@ void reset_first_token() noexcept;
                                  std::uint64_t prefill_tokens, std::uint64_t decode_tokens);
 // Block of a request the process executed over [begin, end] (the execution timestamps, never the time a response is
 // rendered): decode is its last decode_ms, prefill everything before. Time inside the span in which the machine ran
-// other requests belongs to the window: the receipt is machine energy over the span. Asks the worker for one closing
-// sample (bounded wait). Build it once per request and reuse the result.
+// other requests belongs to the window: the receipt is machine energy over the span. wait: ask the worker for one
+// closing sample, for at most kClosingWaitMs; when the deadline expires, or without wait (a stream, whose terminal
+// chunk must not be held back), the receipt is what the ring holds and says the tail is not covered. Build it once
+// per request and reuse the result.
+inline constexpr int kClosingWaitMs = 10;
 [[nodiscard]] Block execution_block(std::int64_t begin_ns, std::int64_t end_ns, double decode_ms,
-                                    std::uint64_t prefill_tokens, std::uint64_t decode_tokens);
+                                    std::uint64_t prefill_tokens, std::uint64_t decode_tokens, bool wait = true);
 // Block for a request [start, stop]: split at the first-token mark when it lies inside (prefill includes the first
 // token, as the request timing does; decode is the remaining generated - 1 tokens), otherwise one prefill phase.
 [[nodiscard]] Block request_block(std::chrono::steady_clock::time_point start, std::chrono::steady_clock::time_point stop,
