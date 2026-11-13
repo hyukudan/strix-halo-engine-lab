@@ -3696,7 +3696,7 @@ int main(int argc, char** arguments) {
                 const auto single_policy=qpf2k::admitted_organization(qpf2k::PrefillOwner::single_request);
                 expect(policy.items==qpf2k::prefill_organization_items && (single_policy.items&policy.items)==policy.items &&
                     !(policy.items&(qpf2k::bit(qpf2k::Item::ple_reclaim)|qpf2k::bit(qpf2k::Item::cohort_lean)|
-                        qpf2k::bit(qpf2k::Item::rows_lean)|qpf2k::bit(qpf2k::Item::dispatch_fuse)|qpf2k::bit(qpf2k::Item::dense_rows))),
+                        qpf2k::bit(qpf2k::Item::rows_lean)|qpf2k::bit(qpf2k::Item::dispatch_fuse))),
                     "server organisation is a subset of the single-request one without reclamation or decoding items");
                 const auto organised=[&](const EffectiveConfig& c,bool want,const char* skip=nullptr) {
                     for(const auto& entry:qpf2k::defaults) {
@@ -3705,19 +3705,36 @@ int main(int argc, char** arguments) {
                         if(policy.items&qpf2k::bit(entry.item)) {
                             if(has!=want) return false;
                             if(want && c.sources.at(entry.name)!=OptionSource::automatic) return false;
-                            if(want && c.environment.at(entry.name)!=(entry.item==qpf2k::Item::pipe?std::string("18"):std::string(entry.on))) return false;
+                            if(want && c.environment.at(entry.name)!=std::string(entry.on)) return false;
                         } else if(!(qpf2k::historical_items&qpf2k::bit(entry.item)) && has) return false;
                     }
                     return true;
                 };
                 const auto shared=resolve(http,memory);
                 expect(shared.options.known_prefix_prefill_rows && organised(shared,true) &&
-                    shared.serve_prefill_notice.find("prefill organization shared with the single-request route (11 items automatic, row pipeline 18)")!=std::string::npos,
+                    shared.serve_prefill_notice.find("prefill organization shared with the single-request route (13 items automatic, row pipeline 255)")!=std::string::npos,
                     "admitted server owner takes the shared prefill organisation and prints it");
                 for(const auto& entry:qpf2k::defaults)
                     if(qpf2k::historical_items&qpf2k::bit(entry.item))
                         expect(!shared.environment.contains(entry.name) || shared.sources.at(entry.name)==OptionSource::automatic,
                             "startup items keep their automatic provenance after the organisation is applied");
+                // ONE RESOLVER: the same request through the single-request entry and the resident entry ends with
+                // the same value of every default, or the difference is named with its reason in the server notice.
+                const auto single=resolve(request,memory);
+                expect(single.options.known_prefix_prefill_rows && single.environment.contains("STRIX_PREFILL_PIPE") &&
+                    single.environment.at("STRIX_PREFILL_PIPE")==shared.environment.at("STRIX_PREFILL_PIPE"),
+                    "both entry points resolve the same row-pipeline value");
+                for(const auto& entry:qpf2k::defaults) {
+                    const auto a=single.environment.find(entry.name),b=shared.environment.find(entry.name);
+                    const bool same=(a==single.environment.end())==(b==shared.environment.end()) &&
+                        (a==single.environment.end() || a->second==b->second);
+                    if(same) continue;
+                    const char* reason=qpf2k::serving_exclusion_reason(entry.item);
+                    expect(reason && shared.serve_prefill_notice.find(std::string(entry.name)+" ("+reason+")")!=std::string::npos,
+                        (std::string("unexplained difference between the entry points: ")+entry.name).c_str());
+                }
+                expect(shared.serve_prefill_notice.find("UNEXPLAINED")==std::string::npos,
+                    "every single-request default the server does not take carries a reason");
                 auto off=http; off.environment["STRIX_SERVE_PREFILL_ORG"]="0";
                 const auto startup_only=resolve(off,memory);
                 expect(organised(startup_only,false) &&
@@ -3730,7 +3747,7 @@ int main(int argc, char** arguments) {
                     item_off.sources.at("STRIX_QSA_NORM_GROUP")==OptionSource::explicit_value &&
                     item_off.sources.at("STRIX_PREFILL_PIPE")==OptionSource::explicit_value &&
                     item_off.environment.at("STRIX_QSA_ATTEND_BATCH")=="1" &&
-                    item_off.serve_prefill_notice.find("(9 items automatic, row pipeline 2)")!=std::string::npos,
+                    item_off.serve_prefill_notice.find("(11 items automatic, row pipeline 2)")!=std::string::npos,
                     "explicit item values survive the shared organisation");
                 off=http; off.environment["STRIX_QPF2K_DEFAULTS"]="0";
                 expect(organised(resolve(off,memory),false),"defaults off switch also suppresses the server organisation");

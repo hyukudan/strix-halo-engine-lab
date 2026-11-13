@@ -186,11 +186,12 @@ inline constexpr unsigned startup_items = historical_items | bit(Item::ple_recla
 // single-request owner and the resident server both apply it through apply_organization, so one cannot drift.
 inline constexpr unsigned prefill_organization_items = bit(Item::pipe) | bit(Item::attend_batch) |
     bit(Item::score_park) | bit(Item::norm_group) | bit(Item::index_rows) | bit(Item::score_rows) |
-    bit(Item::ple_batch) | bit(Item::shared_pre) | bit(Item::moe_mc) | bit(Item::moe_hdr) | bit(Item::moe_xor64);
-// Row-loop steps as registered batches (16) and one strided tap copy (2): the row-pipeline bits measured on the
-// resident owner. The remaining bits (tap double buffering, headless-block skips, worker enqueue, persistent views)
-// stay with the single-request cursor until they pass the serving gate.
-inline constexpr unsigned serving_pipe_mask = 2U | 16U;
+    bit(Item::ple_batch) | bit(Item::shared_pre) | bit(Item::moe_mc) | bit(Item::moe_hdr) | bit(Item::moe_xor64) |
+    bit(Item::dense_rows) | bit(Item::hc_lowband);
+// The resident owner takes the complete row-pipeline value of the single-request cursor. With bits 2|16 only, the
+// per-block binding/scope validation (bit 8) and the per-row view lookups (bit 128) ran on the host inside the block
+// and the device waited for them: 0.4 s of an 8,192-row block, measured on both entry points with the same mask.
+inline constexpr unsigned serving_pipe_mask = ~0U;
 enum class PrefillOwner : unsigned { single_request, resident_server };
 struct Organization {
     unsigned items = 0U;      // defaults this owner may take
@@ -201,6 +202,16 @@ struct Organization {
 constexpr Organization admitted_organization(PrefillOwner owner) noexcept {
     return owner == PrefillOwner::single_request ? Organization{~0U, ~0U}
         : Organization{prefill_organization_items, serving_pipe_mask};
+}
+// Every default the single-request owner takes and the resident server does not, with the reason serving requires
+// it. An item without a reason here is an unexplained difference: the parity host test fails on it.
+constexpr const char* serving_exclusion_reason(Item item) noexcept {
+    switch (item) {
+    case Item::ple_reclaim: return "resident weights stay registered; reclamation keeps its own route admission";
+    case Item::cohort_lean: case Item::rows_lean: case Item::dispatch_fuse:
+        return "decode organisation belongs to the batch runner's own admission";
+    default: return nullptr;
+    }
 }
 // Applies one admitted organisation. Explicit values (including every "0" off control), the baseline and
 // STRIX_QPF2K_DEFAULTS=0 keep their meaning: initialize never overrides them.

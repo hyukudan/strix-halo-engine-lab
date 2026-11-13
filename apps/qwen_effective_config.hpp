@@ -1437,6 +1437,15 @@ inline void resolve_serve_prefill(EffectiveConfig& result, const ModelContract& 
                 const auto pipe = result.environment.find("STRIX_PREFILL_PIPE");
                 arithmetic += "; prefill organization shared with the single-request route (" + std::to_string(count) +
                     " items automatic, row pipeline " + (pipe == result.environment.end() ? std::string("0") : pipe->second) + ")";
+                // Every default of the single-request owner this owner does not take is named with its reason.
+                std::string kept;
+                for (const auto& entry : qpf2k::defaults)
+                    if (!((policy.items | qpf2k::historical_items) & qpf2k::bit(entry.item)) &&
+                        !result.environment.contains(entry.name)) {
+                        const char* reason = qpf2k::serving_exclusion_reason(entry.item);
+                        kept += std::string(kept.empty() ? "" : ", ") + entry.name + " (" + (reason ? reason : "UNEXPLAINED") + ")";
+                    }
+                if (!kept.empty()) arithmetic += "; single-request defaults not taken: " + kept;
             } else arithmetic += "; prefill organization startup items only";
             return notice("automatic T" + std::to_string(rows) + "; " + attempts + arithmetic);
         } catch (const std::exception& error) {

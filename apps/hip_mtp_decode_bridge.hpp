@@ -916,7 +916,12 @@ private:
             if(execute_native) execute_native(owner,launch);else launch();
             owner.set_prefill_step_observer({});
             check_yarn_memory();
+            // STRIX_PREFILL_TIMING=1: host milliseconds of the block's predictor rows, held row and capture (stderr).
+            static const bool timing=strix::envcfg::flag("STRIX_PREFILL_TIMING", false);
+            const auto finish_start=timing?std::chrono::steady_clock::now():std::chrono::steady_clock::time_point{};
             finish_block(block,logits);
+            if(timing) std::fprintf(stderr,"prefill bridge %-10s %8.2f ms (%u rows)\n","predictor",
+                std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-finish_start).count(),block.rows);
         } catch(...) {owner.set_prefill_step_observer({});throw;}
         (block.capture?block_ms_:tail_ms_)+=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-t0).count();
     }

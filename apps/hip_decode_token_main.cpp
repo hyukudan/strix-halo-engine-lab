@@ -1131,6 +1131,15 @@ std::uint32_t prefix_cache_unit(const O& options) {
 // Whether the route owning a prefix-state namespace can execute STRIX_QPF2K_SCHED bit 2. The MTP bridge (CLI --mtp,
 // HTTP, cohorts) never defers; the CLI cursor drops a defaulted bit 2 under a prefix-state cache, but a session/RTX
 // registry without one defers, so a registry keeps the conservative answer (a miss, never a shared key).
+// Immutable first-block admission of a tiled prompt owner (plan and launcher preflight on a copy of the session;
+// no prompt is read and no kernel is launched). The single-request route and every resident slot run it at startup,
+// so neither pays it inside a request.
+template<class Session, class Handoff>
+static void prepare_first_block_admission(strix::HipKnownPrefixWindow& owner, const Session& live, Handoff&& hand_off) {
+    auto setup_session = live;
+    hand_off(setup_session);
+    owner.prepare_prefill_geometry(setup_session);
+}
 static bool prefix_namespace_sched_defers(const strix::decode_cli::Options& options, bool rtx_state_registry) {
     if (options.mtp.enabled || options.http_serve) return false;
     return strix::qpf2k::cli_sched_defers(!rtx_state_registry);
@@ -4367,6 +4376,24 @@ static int run_decode_entry(
             stack.blocks = std::make_unique<strix::HipKnownPromptBackend>(stack.block_owner, stack.session,
                 known_prefix_memory->scratch, model.vocab_size, original_work_device);
             hand_off(*stack.blocks);
+            // The same startup admission as the single-request route (same resolved switch): a resident slot's first
+            // T block finds its plan and launcher preflight done. A refusal leaves the work to the first request.
+            if (options.early_setup && stack.session.next_position == 0) {
+                const auto setup_start = std::chrono::steady_clock::now();
+                try {
+                    prepare_first_block_admission(*stack.block_owner, stack.session, [&](auto& setup_session) {
+                        if (compiled_prefill)
+                            strix::hand_off_serial_session(setup_session, {&compiled, &stack.parents->resources},
+                                {&*compiled_prefill, &stack.prefill_resources});
+                    });
+                    static const bool setup_timing = strix::envcfg::flag("STRIX_PREFILL_TIMING", false);
+                    if (setup_timing)
+                        std::fprintf(stderr, "prefill startup static-setup %.2f ms (resident slot, outside any request)\n",
+                            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - setup_start).count());
+                } catch (const std::exception& error) {
+                    std::fprintf(stderr, "resident slot startup admission left to the first request: %s\n", error.what());
+                }
+            }
             for (std::size_t t = 0; t < known_tail_plans.size(); ++t) {
                 stack.tail_owners.push_back(std::make_shared<strix::HipKnownPrefixWindow>(*known_tail_plans[t], owner_compiled, model,
                     owner_catalog, owner_resources, known_tail_memories[t]->scratch, known_tail_memories[t]->scope,
@@ -6046,10 +6073,10 @@ static int run_decode_entry(
             const auto setup_start=std::chrono::steady_clock::now();
             // Use the existing sibling handoff on a copy; the live decode session and
             // persistent state stay at their original frontier until the real block.
-            auto setup_session=session;
-            if(compiled_prefill)
-                strix::hand_off_serial_session(setup_session,{&compiled,&resources},{&*compiled_prefill,&prefill_resources});
-            known_prefix_owner->prepare_prefill_geometry(setup_session);
+            prepare_first_block_admission(*known_prefix_owner,session,[&](auto& setup_session) {
+                if(compiled_prefill)
+                    strix::hand_off_serial_session(setup_session,{&compiled,&resources},{&*compiled_prefill,&prefill_resources});
+            });
             const char* timing=std::getenv("STRIX_PREFILL_TIMING");
             if(timing && timing[0]=='1')
                 std::fprintf(stderr,"prefill startup static-setup %.2f ms (outside generation request)\n",
