@@ -2433,6 +2433,12 @@ int main() { return 0; }"
             set_target_properties(strix-hip-moe-wmma-prefill-tests PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHS}")
             target_compile_options(strix-hip-moe-wmma-prefill-tests PRIVATE -mno-wavefrontsize64 -fno-fast-math -ffp-contract=off -fhip-fp32-correctly-rounded-divide-sqrt -fdenormal-fp-math=ieee)
             strix_target_warnings(strix-hip-moe-wmma-prefill-tests)
+            add_executable(strix-hip-route-prune-tests tests/hip_route_prune_tests.hip)  # shared RoutePrune policy + pruned CSR plan
+            target_link_libraries(strix-hip-route-prune-tests PRIVATE strix_core)
+            set_target_properties(strix-hip-route-prune-tests PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHS}")
+            target_compile_options(strix-hip-route-prune-tests PRIVATE -mno-wavefrontsize64 -fno-fast-math -ffp-contract=off -fhip-fp32-correctly-rounded-divide-sqrt -fdenormal-fp-math=ieee)
+            strix_target_warnings(strix-hip-route-prune-tests)
+            add_test(NAME strix-hip-route-prune-tests COMMAND strix-hip-route-prune-tests)
             add_test(NAME strix-hip-moe-wmma-prefill-tests COMMAND strix-hip-moe-wmma-prefill-tests)
             add_test(NAME strix-hip-moe-route-bf16-tests COMMAND strix-hip-moe-wmma-prefill-tests route-bf16)
             add_test(NAME strix-hip-moe-prefill-pool16k-tests COMMAND strix-hip-moe-wmma-prefill-tests pool16k)
