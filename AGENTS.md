@@ -58,8 +58,9 @@ Qwen startup prints one `strix-build-info` and one `strix-startup-event` JSON li
 runs; `STRIX_RELEASE_EVENTS=0` switches both off). Advisories in that record are not failures.
 Inspection exits before device work; preserve the engine's required assets and two-rank launch contract
 for execution. Check [all item guards, fallback notices and off switches](docs/optimizations.md) or
-the [JSON catalog](docs/optimizations.json). Qwen automatic FP16 prefill excludes explicit `--mtp` commands and HTTP serving (the default drafter bundle keeps it);
-HTTP resolves T8192 with its existing arithmetic ([defaults](docs/engine/serving/serving.md#default-prompt-prefill)).
+the [JSON catalog](docs/optimizations.json). Qwen automatic FP16 prefill excludes explicit `--mtp` single-request commands (the default drafter bundle keeps it);
+HTTP serving resolves its tile and prefill arithmetic through the same rule as the single-request route
+(`resolve_prompt_route`; [defaults](docs/engine/serving/serving.md#default-prompt-prefill)).
 HTTP servers (Qwen, DeepSeek) describe what they execute at `GET /v1/capabilities`; the `strix` object of each response
 states the applied policy (requested vs effective sampling). Generation fields the server does not execute are refused
 with a 400 naming the field ([list](docs/engine/serving/serving.md#chat-requests)). Qwen executes JSON-constrained

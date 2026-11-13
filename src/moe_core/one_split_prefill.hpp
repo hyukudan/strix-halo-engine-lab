@@ -19,6 +19,8 @@ struct OneSplitPrefill : Traits {
     static __device__ __forceinline__ Half16 as_half16(const std::uint32_t (&f)[8]) {
         return FragmentCore::as_half16(f);
     }
+    // Traits may set kScalarWeightDecode = true to keep the scalar codebook conversion per coefficient.
+    static constexpr bool kScalarWeightDecode = requires { requires Traits::kScalarWeightDecode; };
     static __device__ __forceinline__ float codebook_mul1_v2(std::uint32_t state) {
         return Traits::template WeightDecode<3>::codebook_value_v2(state);
     }
@@ -86,16 +88,22 @@ static __device__ __forceinline__ void item_core(const Item& it, unsigned bx, un
 #pragma unroll
         for (int i = 0; i < NW::kNL - 1; ++i) nrm[i] = __builtin_amdgcn_alignbit(lc[i], lc[i + 1], sh);
         std::uint32_t mine[8];
+        if constexpr (!kScalarWeightDecode) {
+            // The shared codec's packed pair decode (full-rate integer hash, one packed FP16 FMA per two coefficients):
+            // the same FP16 bits as the scalar codebook below for all 65,536 states, with fewer and faster operations.
+            Traits::template WeightDecode<Bits>::Fragment::template decode16<typename Traits::template WeightDecode<Bits>::Codebook>(nrm, mine);
+        } else {
 #pragma unroll
-        for (int r = 0; r < 16; r += 2) {
-            std::uint16_t v[2];
+            for (int r = 0; r < 16; r += 2) {
+                std::uint16_t v[2];
 #pragma unroll
-            for (int i = 0; i < 2; ++i) {
-                const int rr = r + i;
-                const std::uint32_t state = __builtin_amdgcn_alignbit(nrm[NW::g(rr) - 1], nrm[NW::g(rr)], NW::shift(rr)) & 65535U;
-                v[i] = __builtin_bit_cast(std::uint16_t, static_cast<_Float16>(codebook_mul1_v2(state)));
+                for (int i = 0; i < 2; ++i) {
+                    const int rr = r + i;
+                    const std::uint32_t state = __builtin_amdgcn_alignbit(nrm[NW::g(rr) - 1], nrm[NW::g(rr)], NW::shift(rr)) & 65535U;
+                    v[i] = __builtin_bit_cast(std::uint16_t, static_cast<_Float16>(codebook_mul1_v2(state)));
+                }
+                mine[r / 2] = static_cast<std::uint32_t>(v[0]) | (static_cast<std::uint32_t>(v[1]) << 16);
             }
-            mine[r / 2] = static_cast<std::uint32_t>(v[0]) | (static_cast<std::uint32_t>(v[1]) << 16);
         }
         std::uint32_t other[8], f0[8], f1[8];
 #pragma unroll

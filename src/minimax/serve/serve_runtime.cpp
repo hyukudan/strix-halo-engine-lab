@@ -1,3 +1,4 @@
+#include "strix/route_receipt.hpp"
 #include "serve_runtime.hpp"
 #include <stdexcept>
 #ifdef STRIX_MINIMAX_NATIVE
@@ -135,6 +136,11 @@ public:
             eng.abort("DSpark startup mode / assets / protocol mismatch");
             throw std::runtime_error("DSpark startup mode / assets / protocol mismatch");
         }
+        // Shared route receipt: both ranks must have resolved the same numerical route before any product runs.
+        try {
+            const auto route_fp = strix::route::compare_ranks([&](const void* o, void* i, std::size_t n) { eng.exchange_bytes(o, i, n); });
+            std::printf("rank %u: route fingerprint %016llx agreed with the peer\n", opt.rank, static_cast<unsigned long long>(route_fp));
+        } catch (...) { eng.abort("route receipt: numerical-route fingerprint mismatch"); throw; }
         std::printf("rank %u: load %.1f s, device used %.1f GiB\n", opt.rank, lr.seconds, lr.device_gib);
         std::fflush(stdout);
         // DSpark drafter on both ranks (both run every draft command; the target's residual taps are replicated)
@@ -172,12 +178,21 @@ public:
             (std::string(session_switch) == "1" || std::string(session_switch) == "on"));
         bool prefix_agreed = false;
         const bool prefix_requested = session_config.reason != "baseline" && lead::prefix_cache_requested();
+        bool conversation_agreed = false;
+        const bool conversation_requested = prefix_requested && lead::conversation_cache_requested();
         const bool session_vote = ms::session_hello(eng, session_config.reason != "baseline" &&
-            (session_config.enabled || session_explicit), prefix_requested, &prefix_agreed, eng.prefill_reuse_rows());
+            (session_config.enabled || session_explicit), prefix_requested, &prefix_agreed, eng.prefill_reuse_rows(),
+            conversation_requested, &conversation_agreed);
         if (prefix_requested && !prefix_agreed)
             std::printf("minimax serve: prefix reuse off (peer vote or prefill alignment differs)\n");
+        if (conversation_requested && !conversation_agreed)
+            std::printf("minimax serve: conversation cache off (peer vote differs); chunk-aligned reuse stays\n");
         run.prefix_reuse = prefix_agreed;
         shared.prefix_reuse = prefix_agreed;
+        shared.prefill_int4_regime = [&eng](std::uint64_t rows) { return eng.prefill_int4_regime(rows); };
+        run.conversation = conversation_agreed;
+        shared.conversation = conversation_agreed;
+        eng.set_unaligned_resume(conversation_agreed);
         if (prefix_agreed) {
             const auto snapshot = eng.loader_snapshot();
             strix::verify_loader_snapshot(snapshot);

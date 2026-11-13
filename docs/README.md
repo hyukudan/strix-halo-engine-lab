@@ -97,6 +97,7 @@ work as it stood on their date; documents marked **Superseded** name their repla
 - [Experimental virtual Q8 GDN input projection](engine/kernels/virtual-q8-gdn-input.md): Experimental --virtual-q8-gdn-input one-wave Q8 GDN input projection.
 - [Experimental prefetch8 Q8 GDN input variant](engine/kernels/virtual-q8-gdn-prefetch.md): Experimental --prefetch-q8-gdn-input prefetch8 variant of virtual Q8 GDN input.
 - [Verify-window step folds](engine/kernels/window-step-folds.md): Opt-in verify-window step folds (inject/norm, combine/inject, commit/combine) via env switches.
+- [Shared trellis (EXL3) weight codec](engine/kernels/trellis-codec.md): The one reader and codebook for packed trellis weights that GLM, MiniMax, Gemma and the tiled core share.
 - [CUDA compressed-weight linears: design](engine/kernels/cuda-trellis-design.md): Experimental trellis-weight linears on CUDA (`STRIX_ENABLE_CUDA_TRELLIS`, off by default). *Experimental.*
 - [CUDA compressed-weight linears: report](engine/kernels/cuda-trellis-report.md): Implementation report, build and tests of the CUDA prototype. *Experimental.*
 
@@ -114,6 +115,7 @@ work as it stood on their date; documents marked **Superseded** name their repla
 ## Engine: prefill
 
 - [Known input windows](engine/prefill/known-input-windows.md): Known-input windows: layer-major traversal of 2/4/8 known inputs (--known-prefix-window).
+- [Row layout policy](engine/prefill/row-layout.md): physical row stride off page multiples, shared by every row buffer
 - [Explicit known-prefix prefill](engine/prefill/known-prefix-prefill.md): Early source-only note on --known-prefix-prefill-rows T (16..2048) step-major prefill.
 - [Prefill numerical profile](engine/prefill/prefill-numerical-profile.md): --prefill-numerical-profile: separate prefill arithmetic from decode numerical profile; admitted pairs.
 - [Prompt groups: several requests' prompt blocks in one prefill run](engine/prefill/prompt-batch.md): STRIX_PROMPT_BATCH: several requests' tiled prompt blocks in one prefill run.

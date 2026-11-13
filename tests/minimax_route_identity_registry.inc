@@ -144,3 +144,13 @@
 {"decode-warm-o", 'a', "cache state only (side-stream reads, sink store); no consumer of its data", "rank --xb-check cfg o vs -: decode logits bitwise N1/N4/N8 + verify window; --ab xbwarmo matched replay; mm_defaults.cpp xb_warm_o", ""},
 // src/minimax/serve/minimax_lead.hpp: lookup_start / lookup_commit / cycle prompt lookup
 {"serve-prompt-lookup", 'a', "draft source only (rank 0 chooses window rows from strix_lookup); greedy verify decides every token", "minimax_lead_tests prompt lookup emits the tokens of lookup off; serve A/B ids_fnv per workload with STRIX_MM_LOOKUP=0", ""},
+// src/minimax/engine/engine.hip: xb_fold; src/xport/row_fold.hpp. kFoldRows = 0 (minimax_traits.hpp): the exchange has no
+// fold slots unless STRIX_MMX_FOLD=rows is set, so the default route is unchanged.
+{"decode-xport-row-fold", 'a', "STRIX_MMX_FOLD=rows fold slots on the exchange module (default 0 = off)+rows <= slots; the pair sum p0 + p1 moves from the consumer kernel to the channel's progress thread, one IEEE binary32 addition per element", "row_fold.hpp sum_f32 contract (one addition, no contraction); rank --ab xbfold matched replay; UNCOVERED native decode-logit receipt in this census", ""},
+// src/minimax/engine/engine.hip: pf_msa_flash / pf_msa_flash_layers; src/minimax/attn/msa_flash_policy.hpp
+{"prefill-msa-flash", 'b', "STRIX_MM_PF_MSA_FLASH=1|2 (default 0 = off)+STRIX_MM_PF_MSA_FLASH_LAYERS; prefill MSA windows > 8 rows on the BF16 WMMA key-split form", "FAST, lossy, opt-in: a different identity from the exact prefill, never selected by default; msa_fused_tests.hip STRIX_MSA_TEST_FLASH arm; UNCOVERED engine-level quality gate", ""},
+// src/minimax/engine/engine.hip: pf_moe_group (strix/pair/prefill_group.hpp moe_width)
+{"prefill-moe-group", 'a', "STRIX_MM_PF_MOE_GROUP (0 = automatic, 1 = one call per chunk)+group members+start-up buffer cap; chunks per group-wide EXL3 MoE call", "per-row arithmetic independent of the call width (same kernels, row-local chains); UNCOVERED native width-vs-width prefill state receipt in this census", ""},
+// src/core/moe_i4_chain.hpp launch_chain; src/minimax/moe/mmx_prefill_iu4.inc. The resolved STRIX_MOE_I4_CHAIN_GSAVE
+// boolean is read once per call and passed to the shared plan policy.
+{"prefill-i4-chain-plan", 'a', "requested IU4 plan+STRIX_MOE_I4_CHAIN_GSAVE+scratch admission; a scratch-form paired launch the device rejects (spill or residency) retries the register-save form on plan 1, then a second tile list for the down", "moe_i4_chain_host_tests.cpp plan policy (admission, insufficient and zero scratch); every admitted form computes the same integers; UNCOVERED native MiniMax fallback execution", ""},

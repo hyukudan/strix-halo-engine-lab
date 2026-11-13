@@ -12,6 +12,7 @@
 #include "attn_core/index_score_band.hpp"
 #include "attn_core/index_score_wmma.hpp"
 #include "core/fma_rows.hpp"
+#include "strix/route_receipt.hpp"
 
 #include <cstdlib>
 #include <cstdio>
@@ -3060,13 +3061,8 @@ void dense_rows(const float* x, const void* w, dev::WType wt, unsigned in, unsig
 // per shape (rows, chain length, group size). STRIX_GLM_PF_DENSE_FORM=1..7 forces one form where the shape admits it
 // (0 / unset = automatic). Shapes outside the v2 / v3 range (in > 4096) keep the version 3 route.
 static ::strix::core::fma_rows::Form dense_form() {
-    static const auto f = [] {
-        const char* e = std::getenv("STRIX_GLM_PF_DENSE_FORM");
-        if (e == nullptr || *e == 0) return ::strix::core::fma_rows::Form::Auto;
-        const std::string v(e);
-        if (v.size() != 1 || v[0] < '0' || v[0] > '7') throw std::invalid_argument("STRIX_GLM_PF_DENSE_FORM must be 0..7");
-        return static_cast<::strix::core::fma_rows::Form>(static_cast<unsigned>(v[0] - '0'));
-    }();
+    // The governed selector table (glm_pf_variants.hpp): the same parser the rank resolver validates at startup.
+    static const auto f = static_cast<::strix::core::fma_rows::Form>(pf_variant_from_env(*pf_variant_find("STRIX_GLM_PF_DENSE_FORM")));
     return f;
 }
 static ::strix::core::fma_rows::Weight fma_weight(dev::WType wt) {
@@ -3085,10 +3081,13 @@ void dense_rows_versioned(const float* x, const void* w, dev::WType wt, unsigned
             g.count = 1; g.w[0] = w; g.y[0] = y; g.o0[0] = o0; g.n[0] = n;
             ::strix::core::fma_rows::launch_auto(x, fma_weight(wt), in, rows, g, s, dense_form());
             ok(hipGetLastError(), "glm pf dense_rows v4");
+            ::strix::route::launched(::strix::route::Product::dense, ::strix::route::Family::fma_rows, rows);
             return;
         }
+        ::strix::route::bypass(::strix::route::Product::dense, ::strix::route::Family::fma_rows, ::strix::route::Reason::shape, rows);  // in > 4096: older tiles
         version = 3;
     }
+    ::strix::route::launched(::strix::route::Product::dense, ::strix::route::Family::exact, rows);
     // Version 3 only changes grouped calls (dense_rows_group): a single projection measured at parity with v2 (router,
     // KDA f_b), so single calls keep the v2 tile under version 3.
     if (version == 3) version = 2;
@@ -3146,6 +3145,7 @@ void dense_rows_group_versioned(const float* x, dev::WType wt, unsigned in, cons
             if (g.count == 0) return;
             ::strix::core::fma_rows::launch_auto(x, fma_weight(wt), in, rows, g, s, dense_form());
             ok(hipGetLastError(), "glm pf dense_rows v4");
+            ::strix::route::launched(::strix::route::Product::dense, ::strix::route::Family::fma_rows, rows);  // one fused launch for the group
             return;
         }
         version = 3;
@@ -3155,6 +3155,7 @@ void dense_rows_group_versioned(const float* x, dev::WType wt, unsigned in, cons
         return;
     }
     if (rows == 0) return;
+    ::strix::route::launched(::strix::route::Product::dense, ::strix::route::Family::exact, rows);  // grouped v3 tile
     if (in == 0 || in % kGK) throw std::runtime_error("glm pf dense_rows: in must be a positive multiple of 32");
     DenseGroupArgs g{};
     unsigned ns[kDenseGroupMax];

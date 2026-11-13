@@ -23,9 +23,10 @@ inline constexpr unsigned kMin = 2;
 inline constexpr unsigned kMax = 8;      // one 32K prompt of 4096-row chunks as a single group
 inline constexpr unsigned kDefault = 4;
 // Prefix-cache reuse alignment, in chunks. Chunk bits do not depend on the group a chunk is scheduled in (group 2
-// and group 4 produce identical state hashes, and a resumed prefill's tail group is already narrower), but reuse
-// keeps the alignment it had when the default width was 2 until a chunk-granular reuse is qualified on its own.
-inline constexpr unsigned kReuseChunks = 2;
+// and group 4 produce identical state hashes, and a resumed prefill's tail group is already narrower), and a
+// prefill restarted at a multiple of max_rows tiles its chunks exactly as the cold prefill does, so one chunk is the
+// finest alignment that reproduces the cold chunk boundaries by construction.
+inline constexpr unsigned kReuseChunks = 1;
 
 // Width from an environment value (nullptr / empty = default). Throws on an out-of-range explicit value.
 inline unsigned width_from_env(const char* value, const char* name) {

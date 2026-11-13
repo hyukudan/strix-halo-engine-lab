@@ -159,6 +159,11 @@ sv::Json reply_timings(const sv::GenerationStats& st, const RequestExtra& x) {
     timings.set("dspark_reason", sv::Json(x.dspark_reason));
     timings.set("dspark_context", sv::Json(x.context));
     timings.set("sampling", sv::Json("greedy"));
+    if (x.resident_reported) {
+        timings.set("cached_tokens", sv::Json(static_cast<std::int64_t>(st.cached_tokens)));
+        timings.set("prefill_tokens_computed", sv::Json(static_cast<std::int64_t>(x.prefill_computed)));
+        timings.set("cache_reply_extended", sv::Json(x.reply_extended));
+    }
     return timings;
 }
 

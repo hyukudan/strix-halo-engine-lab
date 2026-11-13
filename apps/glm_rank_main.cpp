@@ -1,4 +1,5 @@
 #include "strix/device/hip_gate.hpp"
+#include "strix/env_flags.hpp"
 #include "glm/prefill/glm_pf_aux.hpp"
 #include "glm_deploy_owners.hpp"
 #include "glm/load/glm_rank_plan.hpp"
@@ -59,6 +60,7 @@
 
 #include "strix/dist/communicator.hpp"
 #include "strix/dist/gpu_direct.hpp"
+#include "glm_route_levers.hpp"
 #include "strix/glm/engine.hpp"
 
 #include "glm/attn/glm_attn_fast.hpp"
@@ -395,6 +397,9 @@ int main(int argc, char** argv) {
             std::printf("rank %u prefill identity glm-idx-wmma FAST (STRIX_IDX_WMMA=%s, DSA indexer scores on WMMA)\n", opt.rank,
                         strix::attn_core::idx::wmma_mode_name(idx_wmma));
         ge::Engine eng(opt, comm.get());
+        // Shared route receipt: the same lever keys as the server (apps/glm_route_levers.hpp).
+        (void)strix::glm::record_route_levers("cli", opt.rank, prefill_requested, prefill_mode, ge::identity_mode_name(eng.identity_mode()),
+                                              opt.max_rows);
         // STRIX_GLM_MODEL_FORMAT=fast_i4 (glm-fast-i4, lossy): the routed EXL3 weights are replaced, so the exact /
         // reference identities (decode-row reference prefill, reference gates, identity checks) are refused.
         // --tf scoring (no prompt prefill, verify rows only, no --tf-check) stays available for the quality comparison.
@@ -1217,7 +1222,7 @@ int main(int argc, char** argv) {
                 // STRIX_GLM_ABA_XBPUB=1: the same series over the decode producer publication instead (A off, B on).
                 static const bool xbpub = std::getenv("STRIX_GLM_ABA_XBPUB") != nullptr && std::string(std::getenv("STRIX_GLM_ABA_XBPUB")) == "1";
                 // STRIX_GLM_ABA_FOLD=1: the same series over the exchange row fold (A off, B on; needs STRIX_GLMX_FOLD=rows).
-                static const bool xfold = std::getenv("STRIX_GLM_ABA_FOLD") != nullptr && std::string(std::getenv("STRIX_GLM_ABA_FOLD")) == "1";
+                static const bool xfold = strix::envcfg::flag("STRIX_GLM_ABA_FOLD", false, strix::EnvFlagMatch::exact);
                 if (xbpub) {
                     ge::set_decode_producer_publish(b ? 1 : 0);
                 } else if (xfold) {

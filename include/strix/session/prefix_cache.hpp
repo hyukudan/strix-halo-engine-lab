@@ -52,6 +52,8 @@ struct ResidentPrefix {
   Identity identity;
   KvHandle source;
   std::shared_ptr<const ResidentState> state;
+  // Trailing rows of tokens() that are consumed reply rows rather than prompt rows (0 for a prefill record).
+  std::uint64_t reply_rows = 0;
   [[nodiscard]] std::span<const std::uint32_t> tokens() const noexcept { return state->tokens(); }
 };
 struct ResidentHit {
@@ -100,7 +102,8 @@ public:
   PrefixCache& operator=(const PrefixCache&) = delete;
   [[nodiscard]] const std::shared_ptr<PrefixStateCache>& owner() const noexcept { return owner_; }
   bool admit(std::shared_ptr<const PrefixSnapshot>, PrefixStateCache::Reservation* = nullptr);
-  bool admit_resident(const KvStore&, KvHandle, std::span<const std::uint32_t>, const Identity&);
+  bool admit_resident(const KvStore&, KvHandle, std::span<const std::uint32_t>, const Identity&,
+                      std::uint64_t reply_rows = 0);
   [[nodiscard]] ResidentHit lookup_resident(const KvStore&, std::span<const std::uint32_t>,
       const Identity&, std::uint64_t alignment) const;
   void invalidate_resident(KvHandle) noexcept;

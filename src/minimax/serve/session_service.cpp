@@ -362,7 +362,8 @@ public:
     void listening(const sv::HttpServerConfig& config, std::uint16_t port) override {
         auto& shared=assets_->shared;
         std::printf("minimax serve policy: %s\n",policy_json(shared,assets_->info.draft).dump().c_str());
-        if (shared.prefix_reuse) std::printf("minimax serve: prefix reuse on (STRIX_MM_SERVE_PREFIX=1 on both ranks)\n");
+        if (shared.prefix_reuse) std::printf("minimax serve: prefix reuse on (STRIX_MM_SERVE_PREFIX=1 on both ranks)%s\n",
+            shared.conversation ? "; conversation cache on (STRIX_MM_SERVE_CONVERSATION=1 on both ranks)" : "");
         std::printf("READY rank 0 http://%s:%u model %s slots %u context %llu sched %s gap %.0f ms dspark %s\n",
             config.bind_address.c_str(),static_cast<unsigned>(port),settings_.model_id.c_str(),static_cast<unsigned>(assets_->info.slots),
             static_cast<unsigned long long>(assets_->info.context_tokens),

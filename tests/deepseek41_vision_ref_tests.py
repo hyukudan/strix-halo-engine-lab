@@ -1,6 +1,9 @@
 """Host test of the resume state of tools/vision/ds41_ref.py: a state is continued only by the computation that
 saved it. A small tower in a GGUF file written here; no model file, no network."""
 import argparse
+import contextlib
+import io
+import json
 import os
 import struct
 import sys
@@ -85,6 +88,7 @@ def refused(fn, needle):
 
 
 def main():
+    test_dump_comparison()
     ds41_ref.STATE_SECONDS = 0.0  # a state after every layer
     gh, gw = 2, 3
     patches = np.random.default_rng(7).standard_normal((gh * gw, FEATURES)).astype("<f4")
@@ -149,6 +153,68 @@ def main():
         del g, other  # release the file mappings before the folder goes
     print("deepseek41-vision-ref: %s (%d failures)" % ("PASS" if failures == 0 else "FAIL", failures))
     return 0 if failures == 0 else 1
+
+
+def test_dump_comparison():
+    # Handwritten metadata and arrays exercise the reader independently of its writer.
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as folder:
+        args = argparse.Namespace(out=folder, a="", b="", strict=True, max_rel_l2=0.0)
+
+        def compare():
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                ds41_ref.cmd_compare(args)
+            return output.getvalue()
+
+        for gh, gw, down, last in ((39, 39, 3, False), (5, 7, 2, False), (6, 8, 2, True)):
+            mh, mw = -(-gh // down), -(-gw // down)
+            span = mh * (mw + 1) + 1 + int(last)
+            ds41_ref.write_cases(folder, [["case", gw * 2, gh * 2, gw * 2, gh * 2, gh, gw, span, 0]])
+            widths = {"patches": 12, "hidden": 8, "rows": 5120}
+            metadata = {"downsample": down, "recipe": {"no_last_newline": not last}, "widths": widths}
+            with open(os.path.join(folder, "case.layout.json"), "w") as f:
+                json.dump(metadata, f)
+            for kind, width in widths.items():
+                count = span if kind == "rows" else gh * gw
+                np.ones((count, width), dtype="<f4").tofile(os.path.join(folder, "case." + kind + ".f32"))
+            check("compared 3, skipped 0, outside threshold 0" in compare(), "recorded span/merge self comparison")
+
+            # A wrong width that still divides the span must be refused, even for a self comparison.
+            path = os.path.join(folder, "case.rows.f32")
+            np.ones((span, widths["rows"] + 1), dtype="<f4").tofile(path)
+            check(refused(compare, "feature width"), "divisible but wrong feature width")
+            np.ones((span, widths["rows"]), dtype="<f4").tofile(path)
+
+        args.b = "copy"
+        with open(os.path.join(folder, "copy.cases.txt"), "w") as f:
+            f.write("case %d %d %d %d %d\n" % (gh, gw, mh, mw, span))
+        for kind in widths:
+            values = np.fromfile(os.path.join(folder, "case." + kind + ".f32"), dtype="<f4")
+            values.tofile(os.path.join(folder, "case.copy." + kind + ".f32"))
+        with open(os.path.join(folder, "case.copy.layout.json"), "w") as f:
+            json.dump(metadata, f)
+        path = os.path.join(folder, "case.copy.rows.f32")
+        values = np.ones((span, widths["rows"]), dtype="<f4")
+        values[1, 0] = 2.0  # image row: reported separately from learned special rows
+        values.tofile(path)
+        check(refused(compare, "strict comparison failed"), "strict numerical threshold")
+        args.max_rel_l2 = 1.0
+        check("special rows max abs diff 0" in compare(), "image/special mask")
+        values[0, 0] = 2.0
+        values.tofile(path)
+        check(refused(compare, "strict comparison failed"), "strict special row equality")
+        os.remove(path)
+        check(refused(compare, "strict comparison failed"), "strict missing file coverage")
+        args.strict = False
+        check("compared 2, skipped 1" in compare(), "informational coverage counts")
+        args.strict = True
+        with open(os.path.join(folder, "copy.cases.txt"), "w") as f:
+            f.write("case %d %d %d %d %d\n" % (gh, gw, mh, mw, span - 1))
+        check(refused(compare, "strict comparison failed"), "strict layout mismatch")
+        ds41_ref.write_cases(folder, [])
+        with open(os.path.join(folder, "copy.cases.txt"), "w"):
+            pass
+        check(refused(compare, "strict comparison failed"), "strict empty comparison")
 
 
 if __name__ == "__main__":

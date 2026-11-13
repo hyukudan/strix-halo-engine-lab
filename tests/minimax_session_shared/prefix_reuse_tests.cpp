@@ -14,14 +14,14 @@ struct Rank : FakeEngine {
     std::array<std::vector<unsigned>,8> image;
     std::vector<unsigned> suffix;
     unsigned start=0, writes=0;
-    bool failed=false;
+    bool failed=false, unaligned=false;  // unaligned: conversation mode agreed, a resident restart may open mid-chunk
     void cancel_all() { if(active.open)prefill_cancel(active.id);if(parked.open)prefill_cancel(parked.id); }
     void require_active(std::uint64_t id,unsigned bank) { need(active.open && active.id==id && active.bank==bank,"peer active task"); }
     void prefill_check(std::uint64_t id,unsigned next) {need(!active.open && active.id==id && active.next==next,"peer completed token");}
     std::uint64_t prefill_reuse_rows() const { return 4; }
     void prefill_begin(unsigned s,std::span<const unsigned> p,bool c,std::uint64_t id,
         std::uint64_t parent=0,std::uint64_t generation=0,std::uint64_t resident=0) {
-        need(!resident || (!c && !parent && resident%4==0 && image[s].size()>=resident),"rank validates physical boundary");
+        need(!resident || (!c && !parent && (unaligned || resident%4==0) && image[s].size()>=resident),"rank validates physical boundary");
         start=static_cast<unsigned>(resident);suffix.assign(p.begin(),p.end());
         FakeEngine::prefill_begin(s,p,c,id,parent,generation);
     }
@@ -60,7 +60,7 @@ struct Pair : Rank {
     }
     void send_prompt(std::vector<unsigned>& p) {
         auto receive=[&](std::size_t n){need(n==p.size(),"wire suffix count");return p;};
-        if(!ms::replay_resident_begin(begin,other,other,receive,voted))
+        if(!ms::replay_resident_begin(begin,other,other,receive,voted,other.unaligned))
             (void)ms::replay_command(begin,other,other,receive);
     }
     void invalidate_residents() {}
@@ -75,10 +75,11 @@ struct Hello : FakeEngine {
 struct Fixture {
     Pair pair;sv::GenerationQueue queue;ml::Shared shared;std::atomic<bool> stop{false};
     std::unique_ptr<ml::Lead<Pair,Pair,FakeClock>> lead;
-    Fixture(bool enabled=true,bool draft=false,ms::SessionService* service=nullptr) {
+    Fixture(bool enabled=true,bool draft=false,ms::SessionService* service=nullptr,bool conversation=false) {
         FakeClock::value={};FakeClock::advance=[](double n){FakeClock::value+=std::chrono::milliseconds(static_cast<int>(n));};
         sv::GenerationQueue::test_now=FakeClock::now;
-        shared.prefix_reuse=enabled;shared.prefix_identity={"loaded-weights","profile-tp2","prefill-v1",2};
+        shared.prefix_reuse=enabled;shared.conversation=enabled && conversation;pair.unaligned=pair.other.unaligned=shared.conversation;
+        shared.prefix_identity={"loaded-weights","profile-tp2","prefill-v1",2};
         shared.policy.sched=ms::Sched::off;shared.policy.nest=false;shared.policy.lookup=false;
         if(draft){pair.dd=&pair;shared.policy.dspark_mode=ml::ds::Mode::on;pair.taps=true;}
         lead=std::make_unique<ml::Lead<Pair,Pair,FakeClock>>(pair,pair,queue,shared,4096,draft,stop,
@@ -116,6 +117,15 @@ struct OwnerAssets final : ms::ServiceAssets {
     int follow() override { return 0; }
 };
 int main() try {
+    {
+        // The 6000 -> 9000 / 8192 threshold case scaled to the fixture's four-row chunks.
+        Fixture f; f.shared.prefill_int4_regime = [](std::uint64_t rows) { return rows >= 8; };
+        auto a = f.submit({1,2,3,4,5,6}); f.finish(a);
+        auto b = f.submit({1,2,3,4,5,6,7,8,9}); f.finish(b);
+        need(b->stats().cached_tokens == 0, "threshold crossing must decline the old four-row prefix");
+        auto c = f.submit({1,2,3,4,5,6,7,8,9,10}); f.finish(c);
+        need(c->stats().cached_tokens == 8, "same effective regime still reuses its resident prefix");
+    }
     {
         OwnerAssets assets;
         need(assets.named->owner()==assets.runtime().cache_owner() && assets.cache_owner==assets.named->owner(),
@@ -308,6 +318,100 @@ int main() try {
         store.reset(fresh);store.release(fresh);
         need(frozen->state.sealed() && *std::static_pointer_cast<const unsigned>(frozen->state.ranks[0].owner)==17,"frozen provenance/payload survives physical reuse");
         need(cache.unpin("protected"),"pin controls preserved");
+    }
+    {
+        // Reply-extended resident records through the production runtime/store/engine seam (MiniMax adapter), fake ranks.
+        Pair pair;pair.unaligned=pair.other.unaligned=true;ms::SessionBackend<Pair> backend(pair);
+        ms::SessionEngine engine(backend,8,16384,[](auto){},[&]{return pair.active;});
+        ss::KvStore store(8,2,engine.storage_hooks());engine.attach(store);sv::GenerationQueue q;sv::SessionHooks hooks;
+        hooks.control_turn=[](auto&){};hooks.identity={"weights","profile","rows",2};
+        sv::SessionRuntime runtime(q,engine,store,{},hooks);
+        std::uint64_t task=0;
+        auto open=[&](std::vector<unsigned> prompt,std::uint64_t alignment){sv::GenerationJob j;j.prompt=prompt;j.max_tokens=1;q.submit(j);
+            need(runtime.reserve(sv::QueueSelection::fifo),"reserve");return runtime.activate(alignment);};
+        auto prefill=[&](sv::SessionLease& lease,const std::vector<unsigned>& prompt){
+            const auto reused=lease.stats.cached_tokens;const auto suffix=std::span(prompt).subspan(static_cast<std::size_t>(reused));
+            pair.other.prefill_begin(lease.state.slot,suffix,false,++task,0,lease.state.generation,reused);
+            engine.begin(lease.state,suffix,false,task,0,reused);unsigned next=0;
+            while(!engine.unit(lease.state,60,&next)){};pair.other.prefill_unit(60,&next);
+        };
+        // Two committed reply tokens: commit() consumes the previous anchor, so rows = prompt + 1 and one pending token.
+        auto reply=[&](sv::SessionLease& lease,unsigned slot,std::uint64_t rows){
+            engine.commit(lease.state,50);engine.commit(lease.state,51);
+            pair.image[slot].resize(rows);pair.other.image[slot].resize(rows);
+        };
+        auto a=open(p,4);prefill(a,p);const auto slot=a.state.slot;reply(a,slot,10);
+        need(store.consumed(a.state)==10 && store.pending(a.state)==51u,"decode leaves a pending anchor outside the consumed rows");
+        // Default completion keeps today's refusal: decode rows cannot certify a prefill prefix (slot quarantined).
+        runtime.complete(a.state,{},10);
+        need(runtime.cache_entries()==0,"default completion refuses decode rows");
+        auto probe=open(p,4);need(probe.state.slot!=slot || !probe.stats.cached_tokens,"quarantined slot never reused");runtime.complete(probe.state);
+        // Explicit claim: certified at the exact frontier, with the prompt as the head of the history.
+        auto b=open(p,4);prefill(b,p);const auto slot_b=b.state.slot;reply(b,slot_b,10);
+        runtime.complete(b.state,{},sv::ResidentClaim{10,1});
+        need(runtime.cache_entries()==1,"reply claim keeps one resident record");
+        auto st=runtime.cache_stats();
+        need(st.resident_kept==1 && st.resident_reply_kept==1 && st.resident_claim_refused==0,"kept counters");
+        auto next=p;next.insert(next.end(),{50,60,61});
+        auto c=open(next,1);
+        need(c.state.slot==slot_b && c.stats.cached_tokens==10 && c.resident_reply,"exact-frontier lookup restarts at prompt+reply rows");
+        need(runtime.cache_entries()==0,"the record is removed before the slot is mutated");
+        st=runtime.cache_stats();
+        need(st.resident_hits==1 && st.resident_hit_rows==10 && st.resident_reply_hits==1,"hit counters");
+        prefill(c,next);
+        // The new lane owns the slot; its own claim replaces the old record (tokens = new prompt + reply).
+        reply(c,slot_b,static_cast<std::uint64_t>(next.size()+1));
+        runtime.complete(c.state,{},sv::ResidentClaim{next.size()+1,1});
+        need(runtime.cache_entries()==1 && runtime.cache_stats().resident_reply_kept==2,"second turn keeps a record of its own");
+        // A prompt equal to the record leaves one suffix token; one that diverges inside the reply reuses only the head.
+        auto same=next;same.push_back(50);
+        auto d=open(same,1);need(d.state.slot==slot_b && d.stats.cached_tokens==same.size()-1 && !d.resident_reply,
+                                 "at least one suffix token stays");
+        prefill(d,same);runtime.complete(d.state);
+        // Failed lanes, cancelled work and a frontier that is not the store's keep nothing.
+        auto e=open(p,1);prefill(e,p);const auto slot_e=e.state.slot;reply(e,slot_e,10);
+        runtime.complete(e.state,"failed peer",sv::ResidentClaim{10,1});
+        need(runtime.cache_entries()==0,"failed lane keeps no reply record");
+        auto f=open(p,1);prefill(f,p);reply(f,f.state.slot,10);
+        runtime.complete(f.state,{},sv::ResidentClaim{9,0});
+        need(runtime.cache_entries()==0,"a claim off the store frontier is refused");
+        auto g=open(p,1);prefill(g,p);reply(g,g.state.slot,10);
+        runtime.complete(g.state,{},sv::ResidentClaim{11,2});
+        need(runtime.cache_entries()==0 && runtime.cache_stats().resident_claim_refused==3,"a claim beyond consumed rows is refused");
+        // Slot pressure: a record never holds a slot back. All eight slots live => the record is gone, nothing starves.
+        auto h=open(p,1);prefill(h,p);reply(h,h.state.slot,10);runtime.complete(h.state,{},sv::ResidentClaim{10,1});
+        need(runtime.cache_entries()==1,"record parked on a free slot");
+        std::vector<sv::SessionLease> live;
+        for(unsigned i=0;i<7;++i){std::vector<unsigned> other(9,200+i);  // slot of the default-refused decode rows stays quarantined
+            live.push_back(open(other,1));
+            need(!live.back().stats.cached_tokens,"unrelated prompt reuses nothing");}
+        need(runtime.live()==7 && runtime.cache_entries()==0,"every usable slot live: the record is gone, nothing starves");
+        for(auto& l:live)runtime.complete(l.state);
+        st=runtime.cache_stats();
+        need(st.resident_hits==2 && st.resident_reply_hits==1 && st.resident_hit_rows==22 && st.resident_misses>=5,"stats keep counting");
+        runtime.invalidate_residents();need(runtime.cache_entries()==0,"admin invalidation drops reply records too");
+    }
+    {
+        // Conversation mode through the whole Lead: three turns, each restarts at the previous reply-end frontier on both
+        // ranks (the rank images prove the rows really exist on rank 1), prefilling only the new suffix.
+        Fixture f(true,false,nullptr,true);
+        std::vector<unsigned> t1{1,2,3,4,5,6,7,8,9};
+        auto a=f.submit(t1,sv::CacheRetention::server_policy,3);f.finish(a);need(!a->stats().cached_tokens && f.pair.writes==9,"turn 1 is cold");
+        auto t2=t1;t2.insert(t2.end(),{100,100,100,20,21});
+        auto b=f.submit(t2,sv::CacheRetention::server_policy,3);f.finish(b);
+        need(b->stats().cached_tokens==11 && f.pair.writes==9+3,"turn 2 restarts at prompt + reply rows mid-chunk, writes only the suffix");
+        auto t3=t2;t3.insert(t3.end(),{100,100,100,30});
+        auto c=f.submit(t3,sv::CacheRetention::server_policy,3);f.finish(c);
+        need(c->stats().cached_tokens==16 && f.pair.writes==9+3+2,"turn 3 restarts at turn 2's reply-end frontier");
+        auto st=f.lead->runtime().cache_stats();
+        need(st.resident_reply_hits==2 && st.resident_hits==2 && st.resident_hit_rows==27 && st.resident_reply_kept==3,"reply-extended counters");
+        // Same conversation with the switch OFF on both ranks: chunk-aligned reuse only, a 9-14 row prompt reuses nothing.
+        Fixture g(true,false,nullptr,false);
+        auto x=g.submit(t1,sv::CacheRetention::server_policy,3);g.finish(x);
+        auto y=g.submit(t2,sv::CacheRetention::server_policy,3);g.finish(y);
+        need(!y->stats().cached_tokens || y->stats().cached_tokens%4==0,"conversation OFF restarts only on aligned boundaries");
+        need(g.lead->runtime().cache_stats().resident_reply_hits==0 && g.lead->runtime().cache_stats().resident_reply_kept==0,
+             "conversation OFF never keeps a reply record");
     }
     std::cout<<"PASS resident prefix owner/protocol/rank suffix checks\n";return 0;
 } catch(const std::exception& e){std::cerr<<e.what()<<'\n';return 1;}

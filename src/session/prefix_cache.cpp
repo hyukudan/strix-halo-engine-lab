@@ -136,15 +136,15 @@ bool PrefixCache::admit(std::shared_ptr<const PrefixSnapshot> snapshot, PrefixSt
 }
 
 bool PrefixCache::admit_resident(const KvStore& store, KvHandle source,
-    std::span<const std::uint32_t> tokens, const Identity& identity) {
+    std::span<const std::uint32_t> tokens, const Identity& identity, std::uint64_t reply_rows) {
   if (!policy_.enabled || !policy_.store || !policy_.max_entries || !identity.known() ||
-      identity.ranks != store.ranks() || !store.resident_valid(source, tokens.size())) return false;
+      identity.ranks != store.ranks() || reply_rows > tokens.size() || !store.resident_valid(source, tokens.size())) return false;
   const auto total = charge(identity, nullptr, tokens.size(), 0);
   if (!total || !room(*total, nullptr)) return false;
   const auto certificate = store.resident_prefix(source);
   if (!certificate || certificate->tokens().size() != tokens.size() ||
       prefix_length(certificate->tokens(), tokens) != tokens.size()) return false;
-  auto value = std::make_shared<ResidentPrefix>(ResidentPrefix{identity, source, certificate});
+  auto value = std::make_shared<ResidentPrefix>(ResidentPrefix{identity, source, certificate, reply_rows});
   auto entry = std::make_shared<PrefixCacheCheckpoint>();
   entry->retention = retention(true); entry->charge = *total; entry->resident = std::move(value);
   entry->replacement = "resident:" + std::to_string(source.store) + ":" + std::to_string(source.slot);

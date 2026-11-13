@@ -1,11 +1,18 @@
-// Shared exact FMA-rows core (src/core/fma_rows.hpp) against the GLM dense_rows kernels (versions 3 and 1): every
-// output byte equal, untouched guard rows, then interleaved whole-call timing at the GLM KDA / indexer / router tile
-// sizes and at the MiniMax index-projection size. STRIX_FMA_ROWS_BENCH=<rounds> sets the timing rounds (0 = gate only).
+// Shared exact FMA-rows core (src/core/fma_rows.hpp) against the GLM dense_rows kernels (version 3 is the reference
+// arm): every output byte equal (memcmp against the retained reference bytes), untouched guard rows, then interleaved
+// whole-call timing at the GLM KDA / indexer / router tile sizes and at the MiniMax index-projection size.
+// STRIX_FMA_ROWS_BENCH=<rounds> sets the timing rounds (0 = gate only).
+// The reference arm itself is checked against a host oracle (the same ascending fmaf chain from +0) on sampled rows,
+// so two arms that leave the same output unwritten cannot pass. Gate-only shapes also cover a single 32-input stage,
+// 127 / 128 / 129 stages (4064 / 4096 / 4128 inputs), the 4095 / 4096 / 4097-row selection boundary and the resident
+// block boundaries, with the form launch_auto returns asserted.
 #include "core/fma_rows.hpp"
 #include "glm/prefill/glm_prefill.hpp"
 #include <hip/hip_runtime.h>
 #include <algorithm>
 #include <chrono>
+#include <cmath>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -46,6 +53,7 @@ struct Shape {
     unsigned in, rows, count, n[3];
     D::WType wt;
     unsigned o0;
+    F::Form want = F::Form::Auto;  // form launch_auto must return for this shape (Auto: not asserted)
 };
 
 template <unsigned RT, unsigned C, unsigned NP, unsigned KS, bool DB>
@@ -76,6 +84,7 @@ void run_shape(const Shape& sh, unsigned rounds) {
     float* dx = alloc<float>(hx.size());
     ok(hipMemcpy(dx, hx.data(), hx.size() * sizeof(float), hipMemcpyHostToDevice), "x");
     void* dw[3]{};
+    std::vector<float> hw[3];  // the weights as the kernels widen them (exact)
     std::size_t ybytes[3]{}, total = 0;
     double macs = 0.0;
     for (unsigned p = 0; p < sh.count; ++p) {
@@ -83,16 +92,21 @@ void run_shape(const Shape& sh, unsigned rounds) {
         if (sh.wt == D::WType::F32) {
             std::vector<float> w(wn);
             for (auto& v : w) v = dist(rng) * 0.05F;
+            hw[p] = w;
             dw[p] = alloc<float>(wn);
             ok(hipMemcpy(dw[p], w.data(), wn * sizeof(float), hipMemcpyHostToDevice), "w");
         } else if (sh.wt == D::WType::F16) {
             std::vector<_Float16> w(wn);
             for (auto& v : w) v = static_cast<_Float16>(dist(rng) * 0.05F);
+            hw[p].resize(wn);
+            for (std::size_t i = 0; i < wn; ++i) hw[p][i] = static_cast<float>(w[i]);
             dw[p] = alloc<_Float16>(wn);
             ok(hipMemcpy(dw[p], w.data(), wn * 2, hipMemcpyHostToDevice), "w");
         } else {
             std::vector<std::uint16_t> w(wn);
             for (auto& v : w) v = static_cast<std::uint16_t>(__builtin_bit_cast(std::uint32_t, dist(rng) * 0.05F) >> 16U);
+            hw[p].resize(wn);
+            for (std::size_t i = 0; i < wn; ++i) hw[p][i] = __builtin_bit_cast(float, static_cast<std::uint32_t>(w[i]) << 16U);
             dw[p] = alloc<std::uint16_t>(wn);
             ok(hipMemcpy(dw[p], w.data(), wn * 2, hipMemcpyHostToDevice), "w");
         }
@@ -141,7 +155,18 @@ void run_shape(const Shape& sh, unsigned rounds) {
         for (unsigned p = 0; p < sh.count; ++p) g.n[p] = sh.n[p];
         if (F::admits(sh.in, sh.rows, 32)) std::printf("  auto form for %s: %u\n", sh.name, static_cast<unsigned>(F::select(sh.in, sh.rows, g)));
     }
-    if (glm_shape && sh.in <= 4096)
+    // Automatic selection: the returned form is the contract (and, where the shape names one, the expected form).
+    F::Form auto_form = F::Form::Auto;
+    F::Form* const auto_out = &auto_form;
+    if (F::admits(sh.in, sh.rows, 32))
+        arms.push_back({"form auto", [=](float* const* y) {
+                            F::Group g{};
+                            g.count = sh.count;
+                            for (unsigned p = 0; p < sh.count; ++p) { g.w[p] = dw[p]; g.y[p] = y[p]; g.o0[p] = sh.o0; g.n[p] = sh.n[p]; }
+                            *auto_out = F::launch_auto(dx, static_cast<F::Weight>(static_cast<unsigned>(sh.wt)), sh.in, sh.rows, g, nullptr);
+                        }});
+    // Version 4 of the GLM adapter: the core for chains of <= 4096 inputs, the version 3 route above that (gate only).
+    if (glm_shape && (sh.in <= 4096 || rounds == 0))
         arms.push_back({"glm-v4", [=](float* const* y) {
                             P::DenseProj pr[3];
                             for (unsigned p = 0; p < sh.count; ++p) pr[p] = {dw[p], sh.o0, sh.n[p], y[p]};
@@ -151,8 +176,9 @@ void run_shape(const Shape& sh, unsigned rounds) {
 
     float* dy[3]{};
     for (unsigned p = 0; p < sh.count; ++p) dy[p] = alloc<float>(ybytes[p] / sizeof(float));
-    std::vector<unsigned char> host(total);
+    std::vector<unsigned char> host(total), ref;
     std::vector<std::uint64_t> hash(arms.size());
+    std::vector<char> same(arms.size(), 1);
     std::vector<std::vector<double>> ms(arms.size());
     auto fill_guard = [&] {
         for (unsigned p = 0; p < sh.count; ++p) {
@@ -175,7 +201,38 @@ void run_shape(const Shape& sh, unsigned rounds) {
         }
         hash[a] = fnv(host.data(), total);
         check(guard_ok, std::string(sh.name) + " " + arms[a].name + " guard rows untouched");
-        check(hash[a] == hash[0], std::string(sh.name) + " " + arms[a].name + " bytes equal to glm-v3");
+        if (a == 0) {
+            // Reference arm: host oracle on sampled rows (every row of a small shape), every output of those rows.
+            ref = host;
+            const unsigned step = static_cast<double>(sh.rows) * sh.in <= 262144.0 ? 1U : std::max(1U, sh.rows / 5U);
+            bool oracle_ok = true;
+            std::size_t off = 0;
+            for (unsigned p = 0; p < sh.count; ++p) {
+                const auto* f = reinterpret_cast<const float*>(ref.data() + off);
+                for (unsigned r = 0; r < sh.rows; r = (r + step < sh.rows || r == sh.rows - 1) ? r + step : sh.rows - 1)
+                    for (unsigned o = 0; o < sh.n[p]; ++o) {
+                        float acc = 0.0F;
+                        const float* xr = hx.data() + static_cast<std::size_t>(r) * sh.in;
+                        const float* wr = hw[p].data() + static_cast<std::size_t>(sh.o0 + o) * sh.in;
+                        for (unsigned k = 0; k < sh.in; ++k) acc = std::fmaf(xr[k], wr[k], acc);
+                        oracle_ok = oracle_ok && std::memcmp(&acc, &f[static_cast<std::size_t>(r) * sh.n[p] + o], sizeof(float)) == 0;
+                    }
+                off += ybytes[p];
+            }
+            check(oracle_ok, std::string(sh.name) + " glm-v3 bytes equal to the host fmaf oracle");
+        } else {
+            same[a] = std::memcmp(host.data(), ref.data(), total) == 0;
+            check(same[a] != 0, std::string(sh.name) + " " + arms[a].name + " bytes equal to glm-v3");
+        }
+    }
+    if (F::admits(sh.in, sh.rows, 32)) {
+        F::Group g{};
+        g.count = sh.count;
+        for (unsigned p = 0; p < sh.count; ++p) g.n[p] = sh.n[p];
+        check(auto_form == F::select(sh.in, sh.rows, g) && auto_form != F::Form::Auto, std::string(sh.name) + " launch_auto returns select()");
+        if (sh.want != F::Form::Auto)
+            check(auto_form == sh.want, std::string(sh.name) + " automatic form " + std::to_string(static_cast<unsigned>(auto_form)) +
+                                            " (want " + std::to_string(static_cast<unsigned>(sh.want)) + ")");
     }
     for (unsigned r = 0; r < rounds + 2; ++r)
         for (std::size_t a = 0; a < arms.size(); ++a) {
@@ -190,7 +247,7 @@ void run_shape(const Shape& sh, unsigned rounds) {
         for (std::size_t a = 0; a < arms.size(); ++a) {
             const double m = median(ms[a]), base = median(ms[0]);
             std::printf("  %-20s %8.3f ms  %6.2f TMAC/s  x%.3f  %s\n", arms[a].name.c_str(), m, macs / m * 1e-9, m / base,
-                        hash[a] == hash[0] ? "same" : "DIFF");
+                        same[a] ? "same" : "DIFF");
         }
     for (unsigned p = 0; p < sh.count; ++p) { ok(hipFree(dy[p]), "free"); ok(hipFree(dw[p]), "free"); }
     ok(hipFree(dx), "free");
@@ -208,6 +265,29 @@ int main() {
             {"gate pair f16", 4096, 300, 2, {64, 24, 0}, D::WType::F16, 0},
             {"gate offset rows", 64, 200, 2, {130, 70, 0}, D::WType::F16, 37},
             {"gate offset f32", 4096, 70, 1, {96, 0, 0}, D::WType::F32, 5},
+            // One 32-input stage (no look-ahead load after it), short and resident forms.
+            {"gate one stage", 32, 300, 1, {200, 0, 0}, D::WType::F16, 0, F::Form::Pipe128K16},
+            {"gate one stage group", 32, 4096, 3, {128, 128, 64}, D::WType::F16, 0, F::Form::Xres4},
+            {"gate one stage bf16", 32, 70, 2, {96, 33, 0}, D::WType::BF16, 3, F::Form::Pipe128K16},
+            // 127 / 128 / 129 stages: 4064 and 4096 inputs run the core under GLM version 4, 4128 keeps the version 3 route.
+            {"gate 127 stages", 4064, 300, 2, {64, 24, 0}, D::WType::F16, 0, F::Form::Pipe64},
+            {"gate 129 stages", 4128, 300, 2, {64, 24, 0}, D::WType::F16, 0, F::Form::Pipe64},
+            {"gate 127 stages long", 4064, 4096, 3, {128, 128, 64}, D::WType::F16, 0, F::Form::PipeNp3},
+            {"gate 129 stages long", 4128, 4096, 1, {96, 0, 0}, D::WType::F16, 0, F::Form::Pipe64},
+            // Row selection boundary (kLongRows = 4096): long chains, grouped and single.
+            {"gate group 4095 rows", 4096, 4095, 3, {128, 128, 64}, D::WType::F16, 0, F::Form::Pipe128},
+            {"gate group 4096 rows", 4096, 4096, 3, {128, 128, 64}, D::WType::F16, 0, F::Form::PipeNp3},
+            {"gate group 4097 rows", 4096, 4097, 3, {128, 128, 64}, D::WType::F16, 0, F::Form::PipeNp3},
+            {"gate single 4095 rows", 4096, 4095, 1, {288, 0, 0}, D::WType::F16, 0, F::Form::Pipe128},
+            {"gate single 4096 rows", 4096, 4096, 1, {288, 0, 0}, D::WType::F16, 0, F::Form::Pipe64},
+            // Same boundary on resident chains (<= 128 inputs), then the resident block boundaries at 4096 rows:
+            // 8 / 9 / 16 / 17 column blocks of 64 outputs = 4 / 8 / 8 / 16 blocks per work group.
+            {"gate resident 4095 rows", 128, 4095, 1, {576, 0, 0}, D::WType::F16, 0, F::Form::Pipe128K16},
+            {"gate resident 4097 rows", 128, 4097, 1, {576, 0, 0}, D::WType::F16, 0, F::Form::Xres8},
+            {"gate resident 8 blocks", 128, 4096, 1, {512, 0, 0}, D::WType::F16, 0, F::Form::Xres4},
+            {"gate resident 9 blocks", 128, 4096, 1, {576, 0, 0}, D::WType::F16, 0, F::Form::Xres8},
+            {"gate resident 16 blocks", 128, 4096, 1, {1024, 0, 0}, D::WType::F16, 0, F::Form::Xres8},
+            {"gate resident 17 blocks", 128, 4096, 1, {1088, 0, 0}, D::WType::F16, 0, F::Form::Xres16},
         };
         for (const auto& s : gate) run_shape(s, 0);
         if (rounds && !std::getenv("STRIX_FMA_ROWS_SET2")) {

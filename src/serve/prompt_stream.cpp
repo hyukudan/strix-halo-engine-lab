@@ -16,11 +16,12 @@ std::shared_ptr<PromptStream> PromptStream::start(std::shared_ptr<const ApiToken
     return self;
 }
 
-// One job encodes a bounded number of slices and then queues the next job, so a long prompt does not hold a
-// critical thread against other short jobs.
+// One job encodes a bounded number of slices and then queues the next job as its last action. The chain keeps
+// the slices of one encoder in order, lets the latency workers interleave the prompts of other requests, and
+// lets independent prompts encode on different cores at the same time.
 void PromptStream::run(const std::shared_ptr<PromptStream>& self, const std::shared_ptr<IncrementalEncoding>& encoding,
                        const std::shared_ptr<const ApiTokenizer>& tokenizer, core::HostLane* lane) {
-    (void)lane->submit(core::HostPriority::critical, [self, encoding, tokenizer, lane] {
+    (void)lane->submit(core::HostPriority::latency, [self, encoding, tokenizer, lane] {
         constexpr int slices_per_job = 16;
         std::vector<std::uint32_t> ids;
         try {

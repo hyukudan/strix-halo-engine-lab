@@ -1,12 +1,18 @@
 // FAST_I4 paired chain on the GLM prefill MoE call: plan policy fixture (shared moe_i4::chain_plan / launch_chain).
 // Arms (same integers, so same bits everywhere they are compared):
-//   0 STRIX_GLM_I4_CHAIN_GSAVE=1, gate scratch admitted: paired gate/up and down on the call's plan, one tile list
-//   1 default: register save, paired at most plan 1, second tile list for a plan-2 down
+//   0 gate scratch lent and admitted: paired gate/up and down on the call's plan, one tile list
+//   1 default policy: register save, paired at most plan 1, second tile list for a plan-2 down
 //   2 STRIX_GLM_PF_IU4_PLAN=1 with the scratch: both GEMMs on BM64 tiles
-//   3 the scratch on offer but STRIX_MOE_I4_CHAIN_GSAVE=0: the shared switch keeps the register save
+//   3 the scratch on offer but the shared switch off: the register save is kept
+//   4 STRIX_GLM_PF_IU4_PLAN=0 with the scratch: both GEMMs on BM32 tiles
+// The gate-scratch policy of each arm is explicit (iu4::set_chain_policy_for_test: production resolves it once per
+// process), and every arm asserts the plan the call was enqueued on (iu4::last_chain_run), so a resource fallback
+// to the register save fails the fixture instead of passing the bit comparisons on another route. Arm 1 enqueues
+// the same launches as that fallback (paired plan 1 without the scratch, then the down on its own tile list).
 // Compared: the routed down's A4 image and scales, the final tile list (arms 0 and 1), the ordered combine output.
 // Row classes: every routed expert holds exactly c rows (c * 36 rows of 8 ascending experts out of 288).
 // --lognormal R: R rows routed by a lognormal expert popularity (sigma 1.2), the skew of a real prefill chunk.
+#include "core/moe_i4_chain.hpp"
 #include "core/wmma_tiled.hpp"
 #include "glm/prefill/glm_pf_exact_moe.hpp"
 
@@ -27,7 +33,7 @@
 namespace M = strix::glm::moe;
 namespace X = strix::glm::pf::exact_moe;
 namespace {
-constexpr unsigned H = 4096, I = 1024, E = 288, Top = 8, P = 9, kArms = 4;
+constexpr unsigned H = 4096, I = 1024, E = 288, Top = 8, P = 9, kArms = 5;
 unsigned checks = 0, failures = 0;
 void check(bool c, const std::string& what) {
     ++checks;
@@ -67,9 +73,17 @@ void arm_env(unsigned arm) {
     env("STRIX_GLM_PF_WMMA", "1");
     env("STRIX_GLM_PF_EXACTMOE_V", "11");
     env("STRIX_MOE_I4_CHAIN", "1");
-    env("STRIX_GLM_I4_CHAIN_GSAVE", arm == 1 ? nullptr : "1");
-    env("STRIX_MOE_I4_CHAIN_GSAVE", arm == 3 ? "0" : nullptr);
-    env("STRIX_GLM_PF_IU4_PLAN", arm == 2 ? "1" : nullptr);
+    env("STRIX_GLM_PF_IU4_PLAN", arm == 2 ? "1" : arm == 4 ? "0" : nullptr);
+    const X::iu4::ChainPolicy policy{arm != 3, arm != 1};  // shared switch, scratch lent
+    X::iu4::set_chain_policy_for_test(&policy);
+}
+// Plan the chain must have been enqueued on: requested = the override of arms 2 / 4, else plan 2 from
+// kPlan2Rows rows per routed expert (rows * 8 pairs over 288 experts).
+struct Expected { int paired, down; bool gsave; };
+Expected expected_run(unsigned arm, unsigned rows) {
+    const int requested = arm == 2 ? 1 : arm == 4 ? 0 : rows * 8U >= strix::core::moe_i4::kPlan2Rows * E ? 2 : 1;
+    const bool scratch = arm != 1 && arm != 3;
+    return {scratch || requested < 1 ? requested : 1, requested, scratch};
 }
 template<class F> double median_ms(F&& f, hipStream_t s, unsigned reps) {
     std::vector<double> t;
@@ -151,6 +165,10 @@ void chain(std::mt19937& rng, hipStream_t s, unsigned reps, std::vector<unsigned
             X::enqueue_device(dv, plan, ws, wsb, s, flag); ok(hipStreamSynchronize(s), "run");
             unsigned f = 1; ok(hipMemcpy(&f, flag, 4, hipMemcpyDeviceToHost), "flag");
             check(f == 0, name + " arm " + std::to_string(arm) + " ids valid");
+            const auto ran = X::iu4::last_chain_run(); const auto want = expected_run(arm, R);
+            check(ran.valid && ran.paired == want.paired && ran.down == want.down && ran.gsave == want.gsave,
+                  name + " arm " + std::to_string(arm) + " effective plan paired " + std::to_string(ran.paired) + " down " + std::to_string(ran.down) +
+                      " gsave " + std::to_string(ran.gsave) + " (want " + std::to_string(want.paired) + " " + std::to_string(want.down) + " " + std::to_string(want.gsave) + ")");
             h_out[arm] = device_hash(out, std::size_t{R} * H);
             h_q[arm] = device_hash(scratch.aq_down, slots * (I / 2));
             h_s[arm] = device_hash(scratch.as_down, slots * (I / 64));
@@ -184,6 +202,7 @@ void chain(std::mt19937& rng, hipStream_t s, unsigned reps, std::vector<unsigned
                         name.c_str(), a, b, a / b, t[0][0] / t[1][0], t[0][1] / t[1][1], p1, p1 / b);
         }
     }
+    X::iu4::set_chain_policy_for_test(nullptr);
     X::iu4::release(scratch);
 }
 }  // namespace

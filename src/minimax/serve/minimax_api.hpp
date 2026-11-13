@@ -66,6 +66,10 @@ struct RequestExtra {
     bool nested = false;
     std::uint64_t task_id = 0, parent_request = 0, nest_count = 0;
     double park_wall_ms = 0, nest_service_ms = 0, nest_switch_ms = 0;
+    // Resident-slot reuse (reported only when it is on): prompt rows prefilled for this request, and whether the
+    // reused rows reached into a previous reply (conversation mode).
+    bool resident_reported = false, reply_extended = false;
+    std::uint64_t prefill_computed = 0;
 };
 
 // The reply's "timings" object (non-stream reply and a stream's final chunk), keys in this order: queue_ms,

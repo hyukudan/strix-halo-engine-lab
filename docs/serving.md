@@ -46,6 +46,7 @@ stay on a direct cable or a private network.
 
 - [Serving over HTTP](engine/serving/serving.md): request contracts, batched decoding, default prompt prefill,
   constrained output, measured scheduling policies.
+- [Conversation keep](engine/serving/conversation-keep.md): kept lane states for follow-up turns.
 - [Prefix state cache](engine/serving/prefix-state-cache.md) and
   [serving prefill and prefix-cache composition](engine/serving/serving-prefill-prefix-cache.md).
 - [DeepSeek prefix cache qualification](engine/serving/ds41-prefix-cache-qualification.md),

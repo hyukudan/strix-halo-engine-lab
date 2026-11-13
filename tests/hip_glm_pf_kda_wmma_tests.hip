@@ -94,7 +94,14 @@ void run_case(std::mt19937& rng, unsigned in, const std::vector<unsigned>& ns, u
         }
         for (unsigned o = 0; o < n; ++o) guard = guard && yw[std::size_t{R} * n + o] == kGuard;
         const double drift = std::sqrt(num / std::max(den, 1e-300)), contract = std::sqrt(cnum / std::max(cden, 1e-300));
-        std::printf("CASE %s proj=%u n=%u drift-vs-exact rel-l2 %.3e contract rel-l2 %.3e\n", tag.c_str(), i, n, drift, contract);
+        std::uint64_t fnv = 1469598103934665603ULL;  // FNV-1a of the output bytes, guard row included
+        for (const float v : yw) {
+            std::uint32_t b;
+            std::memcpy(&b, &v, 4);
+            for (unsigned k = 0; k < 4; ++k) fnv = (fnv ^ ((b >> (8U * k)) & 0xFFU)) * 1099511628211ULL;
+        }
+        std::printf("CASE %s proj=%u n=%u drift-vs-exact rel-l2 %.3e contract rel-l2 %.3e fnv %016llx\n", tag.c_str(), i, n, drift, contract,
+                    static_cast<unsigned long long>(fnv));
         check(finite, tag + " finite");
         check(guard, tag + " guard row untouched");
         check(contract < 2e-5, tag + " contract (accumulation error only)");

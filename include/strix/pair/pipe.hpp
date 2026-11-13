@@ -125,6 +125,14 @@ struct PipeStaging {
     // staging keeps the original send/receive path.
     virtual void* device_piece(std::size_t) { return nullptr; }
     virtual void read_device_piece(std::size_t, std::size_t) {}
+    // Device-checked pieces. route_device() installs the engine's size rule (the pieces its transport moves device
+    // to device); a staging that can compute the seam CRC-32C on the device then answers device_routed() for them,
+    // never copies such a piece to the host, and returns its CRC from device_crc() (received: the bytes just landed
+    // in the device snapshot; otherwise the sealed snapshot). The value is the host CRC-32C of the same bytes, so
+    // the wire is unchanged. Only for a pipe whose checksum is CRC-32C (the default one and dist::crc32c).
+    virtual void route_device(std::function<bool(std::size_t bytes)>) {}
+    virtual bool device_routed(std::size_t, std::size_t) { return false; }
+    virtual std::uint32_t device_crc(std::size_t, std::size_t, bool) { throw std::logic_error("pair staging has no device CRC"); }
 };
 std::shared_ptr<PipeStaging> make_hip_pipe_staging(std::size_t capacity);
 using PipeHeader = std::array<std::uint64_t, 48>;
@@ -254,13 +262,20 @@ private:
         for (std::size_t offset = 0; offset < frame.payload.size(); offset += seam_piece_bytes) {
             auto piece = frame.payload.subspan(offset, std::min(seam_piece_bytes, frame.payload.size() - offset));
             std::uint32_t crc = 0;
+            // A device-checked piece never visits the host: its CRC comes from the device snapshot.
+            const bool device = frame.staging && transfer_piece_ && frame.staging->device_routed(offset, piece.size());
             if (rank_ == 0U) {
-                if (frame.staging) timed(sequence, column.d2h_wait, [&] { frame.staging->await_piece(offset); });
-                crc = timed(sequence, column.crc, [&] { return piece_crc(piece); });
+                if (device) crc = timed(sequence, column.crc, [&] { return frame.staging->device_crc(offset, piece.size(), false); });
+                else {
+                    if (frame.staging) timed(sequence, column.d2h_wait, [&] { frame.staging->await_piece(offset); });
+                    crc = timed(sequence, column.crc, [&] { return piece_crc(piece); });
+                }
                 whole.append(crc, piece.size());
                 timed(sequence, column.wire, [&] {
                     send_(std::as_bytes(std::span(&crc, 1)));
-                    if (!(frame.staging && transfer_piece_ && transfer_piece_(true, *frame.staging, offset, piece.size()))) send_(piece);
+                    const bool moved = frame.staging && transfer_piece_ && transfer_piece_(true, *frame.staging, offset, piece.size());
+                    if (device && !moved) throw std::logic_error("pair prefill device-checked piece was not moved by the transport");
+                    if (!moved) send_(piece);
                 });
             } else {
                 const bool routed = timed(sequence, column.wire, [&] {
@@ -269,7 +284,9 @@ private:
                     if (!routed_piece) receive_(piece);
                     return routed_piece;
                 });
-                if (crc != timed(sequence, column.crc, [&] { return piece_crc(piece); }))
+                if (device && !routed) throw std::logic_error("pair prefill device-checked piece was not moved by the transport");
+                if (crc != timed(sequence, column.crc, [&] {
+                        return device ? frame.staging->device_crc(offset, piece.size(), true) : piece_crc(piece); }))
                     throw std::runtime_error("pair prefill seam piece CRC mismatch");
                 whole.append(crc, piece.size());
                 if (frame.staging && !routed)

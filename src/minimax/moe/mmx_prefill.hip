@@ -5,7 +5,7 @@
 #include "minimax/moe/mmx_prefill_core.hpp"
 #include "minimax/moe/mmx_trellis_device.hpp"
 #include "core/activation_quant.hpp"
-#include "core/trellis_device.hpp"
+#include "core/trellis_codec.hpp"
 #ifndef STRIX_MMX_IU4_LIB
 #define STRIX_MMX_IU4_LIB 0
 #endif
@@ -15,6 +15,7 @@
 #endif
 #include "moe_core/device_plan.hpp"
 #include "strix/env_flags.hpp"
+#include "strix/route_receipt.hpp"
 
 
 #include <algorithm>
@@ -45,7 +46,7 @@ constexpr unsigned kHB = kHidden / 128, kIB = kInter / 128;  // 48, 12
 
 
 // ---------------------------------------------------------------- library WMMA core pieces (gemm.hip, trellis_device.hpp)
-using strix::core::WaveTile;
+template <int Bits> using WaveTile = strix::core::trellis::WaveTile<Bits>;
 using Half16 = _Float16 __attribute__((ext_vector_type(16)));
 using Float8 = float __attribute__((ext_vector_type(8)));
 
@@ -81,7 +82,7 @@ __device__ void wmma_item(const WItem& it, unsigned bx, unsigned by, unsigned bz
             for (int j = 0; j < 8; ++j) {
                 const int r = 2 * (lane % 4) + (j % 2) + 8 * ((j / 2) % 2);
                 const int c = lane / 4 + 8 * (j / 4);
-                q[wave * 256 + r * 16 + c] = static_cast<_Float16>(strix::core::codebook_value(tile.state(8 * lane + j), 2));
+                q[wave * 256 + r * 16 + c] = static_cast<_Float16>(strix::core::trellis::codebook_value(tile.state(8 * lane + j), 2));
             }
         }
         __syncthreads();
@@ -1775,6 +1776,7 @@ void enqueue_prefill_moe_device(const PrefillMoeDeviceView& v, void* workspace, 
                                 hipStream_t stream) {
     if (!prefill_moe_device_plan(v.rows)) throw std::invalid_argument("minimax prefill moe: device plan not selected for this call");
     enqueue_device_moe(v, workspace, workspace_bytes, stream);
+    strix::route::launched(strix::route::Product::moe, v.i4 != nullptr ? strix::route::Family::iu4 : strix::route::Family::exact, v.rows);
 }
 
 unsigned prefill_moe_group_min_rows() { return 97; }  // every chunk's shared expert (and class 0) at splits 1
@@ -1782,6 +1784,7 @@ std::size_t prefill_moe_group_workspace_bound(std::uint32_t rows) { return dev_l
 void enqueue_prefill_moe_group(const PrefillMoeGroupView& v, void* workspace, std::size_t workspace_bytes, hipStream_t stream) {
     if (!prefill_moe_device_plan(v.rows)) throw std::invalid_argument("minimax prefill moe: device plan not selected for this call");
     enqueue_group_moe(v, workspace, workspace_bytes, stream);
+    strix::route::launched(strix::route::Product::moe, strix::route::Family::exact, v.rows);  // group-wide calls are EXL3 only
 }
 
 void prefill_moe_device_check() {
@@ -1881,9 +1884,16 @@ void enqueue_prefill_moe(const PrefillMoeView& v, void* workspace, std::size_t w
     if (i4) {
         mark("start", stream);
         launch_iu4(p, t, v, ws, workspace_bytes, stream);
+        // Shared route receipt: scope gate_up keeps the EXL3 down projection.
+        if (v.i4_all) strix::route::launched(strix::route::Product::moe, strix::route::Family::iu4, v.rows);
+        else {
+            strix::route::launched(strix::route::Product::moe_gate_up, strix::route::Family::iu4, v.rows);
+            strix::route::launched(strix::route::Product::moe_down, strix::route::Family::exact, v.rows);
+        }
         return;
     }
 #endif
+    strix::route::launched(strix::route::Product::moe, strix::route::Family::exact, v.rows);  // host-planned EXL3 call
     mark("start", stream);
     // The token gather implements A4 fake quant; force it for the shadow call
     // even when the ordinary path selected the tiled gather.

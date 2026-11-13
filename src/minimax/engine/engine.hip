@@ -1,6 +1,7 @@
 #include "minimax/engine/route_identity.hpp"
 #include "core/layer_set.hpp"
 #include "core/i4_shadow.hpp"
+#include "core/hip_range_weight_loader.hpp"
 #include "minimax/engine/mm_fast_i4.hpp"
 // MiniMax M3.1 Flash engine, TP2 (see include/strix/minimax/engine.hpp and qualification notes).
 //
@@ -30,6 +31,8 @@
 #include "minimax/rtxpf/fp32_identity.hpp"
 #include "minimax/engine/mm_defaults.hpp"
 #include "strix/deploy/device.hpp"
+#include "strix/env_flags.hpp"
+#include "strix/route_receipt.hpp"
 
 #include <strix_trellis.h>
 
@@ -41,6 +44,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
 #include <fstream>
 #include <memory>
 #include <set>
@@ -149,11 +153,12 @@ public:
         st_.hip_stream = nullptr;
     }
     ~Lib() {
+        load_.reset();  // the read workers stop and the copy stream is quiet before any destination goes away
+        if (hash_file_ != nullptr) std::fclose(hash_file_);
         (void)hipDeviceSynchronize();
         for (auto w : all_) (void)strix_weights_destroy(w);
         for (void* p : arenas_) (void)hipFree(p);
         if (ws_) (void)hipFree(ws_);
-        release_staging();
         (void)strix_context_destroy(ctx_);
     }
     struct Lin {
@@ -161,67 +166,130 @@ public:
         std::uint64_t rows = 0, cols = 0;  // N outputs, I inputs
         std::uint64_t bits = 0;
     };
-    // One H128-aligned rank slice of an EXL3 linear assembled in the pinned staging buffer (G4 layout): an output
+    // One H128-aligned rank slice of an EXL3 linear assembled in its ticket's pinned staging (G4 layout): an output
     // slice [o0, o0 + n) keeps those outputs' tiles of every input row and the matching svh; an input slice
     // [i0, i0 + n) keeps the contiguous trellis rows and the matching suh (a partial sum to reduce across ranks).
     struct Staged {
         const std::uint8_t *tr = nullptr, *suh = nullptr, *svh = nullptr;
         std::uint64_t tr_bytes = 0, suh_bytes = 0, svh_bytes = 0, rows = 0, cols = 0, bits = 0;
     };
-    Staged stage_out(const std::string& prefix, std::uint64_t o0, std::uint64_t n) { return stage_out(pack_, prefix, o0, n); }
-    // The same from another pack (a draft-only requant of a target tensor, Engine::attach_draft_head).
-    Staged stage_out(PackReader& pk, const std::string& prefix, std::uint64_t o0, std::uint64_t n) {
+    // A slice as a load-queue manifest (core/weight_load_queue.hpp): its reads, the tile gather of an output slice,
+    // and where each part lands in the ticket's staging. Built here from the pack's metadata; nothing is read yet.
+    struct Plan {
+        strix::core::WeightLoadManifest m;
+        std::uint64_t tr = 0, suh = 0, svh = 0;  // staging offsets
+        std::uint64_t tr_bytes = 0, suh_bytes = 0, svh_bytes = 0, rows = 0, cols = 0, bits = 0;
+    };
+    Plan plan_out(PackReader& pk, const std::string& prefix, std::uint64_t o0, std::uint64_t n) {
         const TensorInfo &tr = pk.info(prefix + ".trellis"), &suh = pk.info(prefix + ".suh"), &svh = pk.info(prefix + ".svh");
         if (o0 % 128 != 0 || n % 128 != 0 || o0 + n > svh.shape[0]) throw std::invalid_argument("bad output slice " + prefix);
         const std::uint64_t in_tiles = tr.shape[0], out_tiles = tr.shape[1], w = tr.shape[2] * 2;  // bytes per tile
-        const std::uint64_t tr_bytes = in_tiles * (n / 16) * w;
-        if (whole_.size() < tr.bytes) whole_.resize(tr.bytes);
-        pk.read(tr, 0, tr.bytes, whole_.data());
-        std::uint8_t* t = stage(tr_bytes + suh.bytes + n * 2);
-        for (std::uint64_t i = 0; i < in_tiles; ++i)
-            std::memcpy(t + i * (n / 16) * w, whole_.data() + (i * out_tiles + o0 / 16) * w, (n / 16) * w);
-        pk.read(suh, 0, suh.bytes, t + tr_bytes);
-        pk.read(svh, o0 * 2, n * 2, t + tr_bytes + suh.bytes);
-        return {t, t + tr_bytes, t + tr_bytes + suh.bytes, tr_bytes, suh.bytes, n * 2, n, suh.shape[0], tr.shape[2] / 16};
+        Plan p;
+        // The whole trellis is read; the gather then packs this slice's tiles of every input row to the front of the
+        // same staging (in place: row i moves down, never over a row not yet moved).
+        p.tr = p.m.read(pk.source(tr), tr.offset, tr.bytes);
+        const std::uint64_t at = p.tr, row = (n / 16) * w, stride = out_tiles * w, first = (o0 / 16) * w;
+        if (row != stride)
+            p.m.convert([=](std::uint8_t* st) {
+                for (std::uint64_t i = 0; i < in_tiles; ++i) std::memmove(st + at + i * row, st + at + i * stride + first, row);
+            });
+        p.suh = p.m.read(pk.source(suh), suh.offset, suh.bytes);
+        p.svh = p.m.read(pk.source(svh), svh.offset + o0 * 2, n * 2);
+        pk.count_read(tr.bytes + suh.bytes + n * 2);
+        p.tr_bytes = in_tiles * row;
+        p.suh_bytes = suh.bytes;
+        p.svh_bytes = n * 2;
+        p.rows = n;
+        p.cols = suh.shape[0];
+        p.bits = tr.shape[2] / 16;
+        return p;
     }
-    Staged stage_in(const std::string& prefix, std::uint64_t i0, std::uint64_t n) {
+    Plan plan_in(const std::string& prefix, std::uint64_t i0, std::uint64_t n) {
         const TensorInfo &tr = pack_.info(prefix + ".trellis"), &suh = pack_.info(prefix + ".suh"), &svh = pack_.info(prefix + ".svh");
         if (i0 % 128 != 0 || n % 128 != 0 || i0 + n > suh.shape[0]) throw std::invalid_argument("bad input slice " + prefix);
-        const std::uint64_t row_bytes = tr.shape[1] * tr.shape[2] * 2, tr_bytes = (n / 16) * row_bytes;
-        std::uint8_t* t = stage(tr_bytes + n * 2 + svh.bytes);
-        pack_.read(tr, (i0 / 16) * row_bytes, tr_bytes, t);
-        pack_.read(suh, i0 * 2, n * 2, t + tr_bytes);
-        pack_.read(svh, 0, svh.bytes, t + tr_bytes + n * 2);
-        return {t, t + tr_bytes, t + tr_bytes + n * 2, tr_bytes, n * 2, svh.bytes, svh.shape[0], n, tr.shape[2] / 16};
+        const std::uint64_t row_bytes = tr.shape[1] * tr.shape[2] * 2;
+        Plan p;
+        p.tr_bytes = (n / 16) * row_bytes;
+        p.suh_bytes = n * 2;
+        p.svh_bytes = svh.bytes;
+        p.tr = p.m.read(pack_.source(tr), tr.offset + (i0 / 16) * row_bytes, p.tr_bytes);
+        p.suh = p.m.read(pack_.source(suh), suh.offset + i0 * 2, p.suh_bytes);
+        p.svh = p.m.read(pack_.source(svh), svh.offset, p.svh_bytes);
+        pack_.count_read(p.tr_bytes + p.suh_bytes + p.svh_bytes);
+        p.rows = svh.shape[0];
+        p.cols = n;
+        p.bits = tr.shape[2] / 16;
+        return p;
     }
-    Lin out_slice(const std::string& prefix, std::uint64_t o0, std::uint64_t n) { return prepared(prefix, stage_out(prefix, o0, n)); }
+    // Prepared linears. The *_later forms only queue the slice: `dst` is filled when its staging is consumed, in
+    // submit order, by a later call or by settle() / publish(), and must stay where it is until then.
+    void out_slice_later(Lin& dst, const std::string& prefix, std::uint64_t o0, std::uint64_t n) { defer(dst, prefix, plan_out(pack_, prefix, o0, n)); }
+    void in_slice_later(Lin& dst, const std::string& prefix, std::uint64_t i0, std::uint64_t n) { defer(dst, prefix, plan_in(prefix, i0, n)); }
+    Lin out_slice(const std::string& prefix, std::uint64_t o0, std::uint64_t n) { return out_slice(pack_, prefix, o0, n); }
+    // The same from another pack (a draft-only requant of a target tensor, Engine::attach_draft_head).
     Lin out_slice(PackReader& pk, const std::string& prefix, std::uint64_t o0, std::uint64_t n) {
-        return prepared(prefix, stage_out(pk, prefix, o0, n));
+        Lin l;
+        defer(l, prefix, plan_out(pk, prefix, o0, n));
+        settle();
+        return l;
     }
-    Lin in_slice(const std::string& prefix, std::uint64_t i0, std::uint64_t n) { return prepared(prefix, stage_in(prefix, i0, n)); }
+    Lin in_slice(const std::string& prefix, std::uint64_t i0, std::uint64_t n) {
+        Lin l;
+        defer(l, prefix, plan_in(prefix, i0, n));
+        settle();
+        return l;
+    }
     // The same slices as raw device buffers in the strix-trellis device layout (= file layout), for the MiniMax MoE
-    // kernels (src/minimax/moe): trellis words, suh / svh FP16.
-    mmoe::Exl3 raw_out(const std::string& prefix, std::uint64_t o0, std::uint64_t n) { return raw(stage_out(prefix, o0, n)); }
+    // kernels (src/minimax/moe): trellis words, suh / svh FP16. The addresses are final at once; the bytes are in
+    // device memory after publish().
+    mmoe::Exl3 raw_out(const std::string& prefix, std::uint64_t o0, std::uint64_t n) { return raw(plan_out(pack_, prefix, o0, n)); }
     // From another pack into its own exact-size device allocation (not the 1 GiB arena chunks: a draft-only copy).
     mmoe::Exl3 raw_out(PackReader& pk, const std::string& prefix, std::uint64_t o0, std::uint64_t n) {
-        return raw(stage_out(pk, prefix, o0, n), true);
+        const mmoe::Exl3 e = raw(plan_out(pk, prefix, o0, n), true);
+        publish();
+        return e;
     }
-    mmoe::Exl3 raw_in(const std::string& prefix, std::uint64_t i0, std::uint64_t n) { return raw(stage_in(prefix, i0, n)); }
-    // Raw bytes of a plain tensor to device memory through the staging buffer.
+    mmoe::Exl3 raw_in(const std::string& prefix, std::uint64_t i0, std::uint64_t n) { return raw(plan_in(prefix, i0, n)); }
+    // Raw bytes of a plain tensor to device memory; in device memory after publish().
     void upload_raw(const std::string& name, void* dst) {
         const TensorInfo& t = pack_.info(name);
-        constexpr std::uint64_t chunk = std::uint64_t{256} << 20;
+        constexpr std::uint64_t chunk = std::uint64_t{64} << 20;
         for (std::uint64_t off = 0; off < t.bytes; off += chunk) {
             const std::uint64_t n = std::min(chunk, t.bytes - off);
-            std::uint8_t* s = stage(n);
-            pack_.read(t, off, n, s);
-            hip_ok(hipMemcpy(static_cast<std::uint8_t*>(dst) + off, s, n, hipMemcpyHostToDevice), "upload");
+            strix::core::WeightLoadManifest m;
+            m.upload(m.read(pack_.source(t), t.offset + off, n), n, static_cast<std::uint8_t*>(dst) + off);
+            (void)loader().queue.submit(std::move(m));
         }
+        pack_.count_read(t.bytes);
+        note_raw("U:" + name, dst, t.bytes, nullptr, 0, nullptr, 0);
     }
+    // Every queued prepared linear is prepared (its `dst` is filled).
+    void settle() {
+        while (!pending_.empty()) consume_front();
+    }
+    // End-of-load publication: settle(), then the one wait for every raw upload.
+    void publish() {
+        if (!load_) return;
+        settle();
+        load_->queue.publish();
+        close_hashes();
+    }
+    // Publishes, then gives the staging (pinned pool, read workers, copy stream) back.
     void release_staging() {
-        if (stage_) (void)hipHostFree(stage_);
-        stage_ = nullptr;
-        std::vector<std::uint8_t>().swap(whole_);
+        if (!load_) return;
+        publish();
+        const auto st = load_->queue.stats();
+        if (st.tickets > 16)
+            std::fprintf(stderr, "strix-minimax %s\n", strix::core::weight_load_line(st, load_->up.peak_pinned_bytes(), load_->queue.options()).c_str());
+        load_.reset();
+    }
+    // Failure-path cleanup (destructors): the queue is cancelled and its copies drained, nothing is prepared or
+    // published and nothing throws. Linears still pending stay unfilled: their owner is being unwound.
+    void drop_staging() noexcept {
+        if (!load_) return;
+        load_->queue.cancel();
+        pending_.clear();
+        load_.reset();
     }
     // out[t][N] = in[t][I] @ W; gemv (the decode entry point) when `gemv`, else gemm.
     void mm(const Lin& l, const float* in, float* out, std::uint64_t t, bool gemv) {
@@ -279,14 +347,84 @@ public:
     [[nodiscard]] std::uint64_t workspace_bytes() const { return ws_bytes_; }
     [[nodiscard]] std::uint64_t workspace_grows() const { return grows_; }
 
+    // Identity gate (STRIX_LOAD_HASH_OUT): one line per loaded slice, in load order.
+    void note_prepared(const std::string& what, std::uint64_t h) {
+        if (hash_file_ != nullptr) std::fprintf(hash_file_, "P %s %016llx\n", what.c_str(), static_cast<unsigned long long>(h));
+    }
+    struct RawNote {
+        std::string name;
+        const void* p[3];
+        std::uint64_t n[3];
+    };
+    void note_raw(const std::string& name, const void* a, std::uint64_t na, const void* b, std::uint64_t nb, const void* c, std::uint64_t nc) {
+        if (hash_file_ != nullptr) raws_.push_back({name, {a, b, c}, {na, nb, nc}});
+    }
+    void open_hashes() {
+        if (hash_file_ != nullptr) return;
+        if (const char* out = strix::envcfg::text("STRIX_LOAD_HASH_OUT")) {
+            hash_file_ = std::fopen(out, hash_opened_ ? "a" : "w");
+            if (hash_file_ == nullptr) throw std::runtime_error("STRIX_LOAD_HASH_OUT: cannot write the hash file");
+            hash_opened_ = true;
+        }
+    }
+    void close_hashes() {  // device read-back of the raw slices, after their uploads completed
+        if (hash_file_ == nullptr) return;
+        for (const auto& r : raws_) {
+            std::fprintf(hash_file_, "R %s", r.name.c_str());
+            for (int k = 0; k < 3; ++k)
+                if (r.p[k] != nullptr)
+                    std::fprintf(hash_file_, " %016llx", static_cast<unsigned long long>(strix::core::device_weight_hash64(r.p[k], r.n[k])));
+            std::fprintf(hash_file_, "\n");
+        }
+        raws_.clear();
+        std::fclose(hash_file_);
+        hash_file_ = nullptr;
+    }
 private:
     bool reserved_ = false;
     std::uint64_t grows_ = 0;
-    static constexpr std::size_t kStage = std::size_t{768} << 20;  // > the largest slice (lm_head half, ~616 MB)
-    std::uint8_t* stage(std::uint64_t bytes) {
-        if (bytes > kStage) throw std::runtime_error("staging buffer too small");
-        if (!stage_) hip_ok(hipHostMalloc(reinterpret_cast<void**>(&stage_), kStage, hipHostMallocDefault), "staging");
-        return stage_;  // prepare_parts / hipMemcpy finish their upload before returning, so the buffer is free again
+    // Resident pinned staging of a load (STRIX_LOAD_STAGING_MIB overrides): the largest ticket is the whole lm_head
+    // trellis (~1.3 GiB with its size class); the rest is read-ahead for the workers.
+    static constexpr std::uint64_t kStageBudget = std::uint64_t{2} << 30;
+    // How many queued prepared linears may wait for the GPU before a submit prepares the oldest itself.
+    static constexpr std::size_t kBacklog = 1024;
+    struct Load {
+        strix::core::HipWeightUploader up;
+        strix::core::WeightLoadQueue queue;
+        explicit Load(const strix::core::WeightLoadOptions& o) : queue(up, o) {}
+    };
+    Load& loader() {
+        if (!load_) {
+            load_ = std::make_unique<Load>(strix::core::weight_load_options_from_environment(kStageBudget));
+            open_hashes();
+        }
+        return *load_;
+    }
+    struct Pending {
+        strix::core::WeightLoadQueue::Ticket ticket;
+        Lin* dst;
+        std::string what;
+        std::uint64_t tr, suh, svh, tr_bytes, suh_bytes, svh_bytes, rows, cols, bits;
+    };
+    void defer(Lin& dst, const std::string& what, Plan p) {
+        p.m.hold();
+        p.m.output(p.tr, p.tr_bytes);
+        p.m.output(p.suh, p.suh_bytes);
+        p.m.output(p.svh, p.svh_bytes);
+        auto& q = loader().queue;
+        pending_.push_back({q.submit(std::move(p.m)), &dst, what, p.tr, p.suh, p.svh, p.tr_bytes, p.suh_bytes, p.svh_bytes, p.rows, p.cols, p.bits});
+        // Prepare what the workers already read (the reads of the slices behind it go on meanwhile); never wait here
+        // unless the backlog is full.
+        while (!pending_.empty() && (pending_.size() > kBacklog || q.read_done(pending_.front().ticket))) consume_front();
+    }
+    void consume_front() {
+        const Pending p = pending_.front();
+        pending_.pop_front();
+        auto& q = load_->queue;
+        const std::uint8_t* st = q.take(p.ticket);  // prepare_parts finishes its upload before returning
+        if (hash_file_ != nullptr) note_prepared(p.what, q.hash(p.ticket));
+        *p.dst = prepared(p.what, Staged{st + p.tr, st + p.suh, st + p.svh, p.tr_bytes, p.suh_bytes, p.svh_bytes, p.rows, p.cols, p.bits});
+        q.release(p.ticket);
     }
     Lin prepared(const std::string& what, const Staged& g) {
         strix_exl3_parts_desc p{};
@@ -325,7 +463,7 @@ private:
         arena_left_ -= bytes;
         return r;
     }
-    mmoe::Exl3 raw(const Staged& g, bool own = false) {
+    mmoe::Exl3 raw(Plan g, bool own = false) {
         const std::uint64_t bytes = g.tr_bytes + 256 + g.suh_bytes + 256 + g.svh_bytes;
         std::uint8_t* d = nullptr;
         if (own) {
@@ -338,9 +476,11 @@ private:
         }
         std::uint8_t* d_suh = d + ((g.tr_bytes + 255) & ~std::uint64_t{255});
         std::uint8_t* d_svh = d_suh + ((g.suh_bytes + 255) & ~std::uint64_t{255});
-        hip_ok(hipMemcpy(d, g.tr, g.tr_bytes, hipMemcpyHostToDevice), "raw trellis");
-        hip_ok(hipMemcpy(d_suh, g.suh, g.suh_bytes, hipMemcpyHostToDevice), "raw suh");
-        hip_ok(hipMemcpy(d_svh, g.svh, g.svh_bytes, hipMemcpyHostToDevice), "raw svh");
+        g.m.upload(g.tr, g.tr_bytes, d);
+        g.m.upload(g.suh, g.suh_bytes, d_suh);
+        g.m.upload(g.svh, g.svh_bytes, d_svh);
+        (void)loader().queue.submit(std::move(g.m));
+        note_raw("#" + std::to_string(raw_seq_++), d, g.tr_bytes, d_suh, g.suh_bytes, d_svh, g.svh_bytes);
         mmoe::Exl3 e;
         e.trellis = reinterpret_cast<const std::uint32_t*>(d);
         e.suh = reinterpret_cast<const std::uint16_t*>(d_suh);
@@ -365,8 +505,12 @@ private:
     strix_stream st_{};
     void* ws_ = nullptr;
     std::uint64_t ws_bytes_ = 0;
-    std::uint8_t* stage_ = nullptr;
-    std::vector<std::uint8_t> whole_;
+    std::unique_ptr<Load> load_;
+    std::deque<Pending> pending_;
+    std::uint64_t raw_seq_ = 0;
+    std::FILE* hash_file_ = nullptr;
+    bool hash_opened_ = false;
+    std::vector<RawNote> raws_;
     std::vector<strix_weights> all_;
     std::vector<void*> arenas_;
     std::uint8_t* arena_next_ = nullptr;
@@ -571,6 +715,7 @@ struct Engine::Impl {
     };
     std::array<PfFences, 2> pf_fences{};
     bool pf_comm_inflight = false;
+    bool unaligned_resume = false;             // conversation mode: a resident prefill may restart mid-chunk
     bool pf_group_explicit = false;            // STRIX_MM_PF_GROUP given (then a narrower exchange depth is an error)
     unsigned pf_group = strix::pair::prefill_group::kDefault;  // STRIX_MM_PF_GROUP: chunks interleaved together (2..8;
                                                // clamped to the prompt's chunk count, and to the exchange depth)
@@ -884,10 +1029,10 @@ struct Engine::Impl {
         static const char* const kMlp[3] = {"gate_proj", "up_proj", "down_proj"};
         static const char* const kExp[3] = {"w1", "w3", "w2"};
         const std::uint32_t rank = opt.rank;
-        auto mlp = [&](const std::string& pre, const char* const* nm, unsigned inter_local) {
-            return Mlp{lib.out_slice(pre + nm[0], rank * inter_local, inter_local),
-                       lib.out_slice(pre + nm[1], rank * inter_local, inter_local),
-                       lib.in_slice(pre + nm[2], rank * inter_local, inter_local)};
+        auto mlp = [&](Mlp& to, const std::string& pre, const char* const* nm, unsigned inter_local) {
+            lib.out_slice_later(to.g, pre + nm[0], rank * inter_local, inter_local);
+            lib.out_slice_later(to.u, pre + nm[1], rank * inter_local, inter_local);
+            lib.in_slice_later(to.d, pre + nm[2], rank * inter_local, inter_local);
         };
         w_in0 = dupload(pack.floats(kP + "layers.0.input_layernorm.weight"));
         {
@@ -900,10 +1045,10 @@ struct Engine::Impl {
         for (unsigned L = 0; L < kLayers; ++L) {
             Layer& y = layers[L];
             const std::string lp = kP + "layers." + std::to_string(L) + ".", a = lp + "self_attn.", b = lp + "block_sparse_moe.";
-            y.q = lib.out_slice(a + "q_proj", rank * kQLocal, kQLocal);
-            y.k = lib.out_slice(a + "k_proj", rank * kKVLocal, kKVLocal);
-            y.v = lib.out_slice(a + "v_proj", rank * kKVLocal, kKVLocal);
-            y.o = lib.in_slice(a + "o_proj", rank * kQLocal, kQLocal);
+            lib.out_slice_later(y.q, a + "q_proj", rank * kQLocal, kQLocal);
+            lib.out_slice_later(y.k, a + "k_proj", rank * kKVLocal, kKVLocal);
+            lib.out_slice_later(y.v, a + "v_proj", rank * kKVLocal, kKVLocal);
+            lib.in_slice_later(y.o, a + "o_proj", rank * kQLocal, kQLocal);
             if (linears_loaded) {
                 y.rq = lib.raw_out(a + "q_proj", rank * kQLocal, kQLocal);
                 y.rk = lib.raw_out(a + "k_proj", rank * kKVLocal, kKVLocal);
@@ -953,7 +1098,7 @@ struct Engine::Impl {
                                                            : kP + "norm.weight"));
             y.moe = L >= kFirstMoe;
             if (!y.moe) {
-                y.dense = mlp(lp + "mlp.", kMlp, kDenseLocal);
+                mlp(y.dense, lp + "mlp.", kMlp, kDenseLocal);
                 if (linears_loaded)
                     y.rdense = mmoe::ExpertSlices{lib.raw_out(lp + "mlp." + kMlp[0], rank * kDenseLocal, kDenseLocal),
                                                   lib.raw_out(lp + "mlp." + kMlp[1], rank * kDenseLocal, kDenseLocal),
@@ -972,25 +1117,27 @@ struct Engine::Impl {
                     y.experts_raw_d = dupload(y.experts_raw);
                     y.shared_raw = raw(b + "shared_experts.", kMlp);
                 } else {
-                    y.experts.reserve(kExperts);
-                    for (unsigned e = 0; e < kExperts; ++e) y.experts.push_back(mlp(b + "experts." + std::to_string(e) + ".", kExp, kExpertLocal));
-                    y.shared = mlp(b + "shared_experts.", kMlp, kExpertLocal);
+                    y.experts.resize(kExperts);  // sized first: the queued slices fill these elements later
+                    for (unsigned e = 0; e < kExperts; ++e) mlp(y.experts[e], b + "experts." + std::to_string(e) + ".", kExp, kExpertLocal);
+                    mlp(y.shared, b + "shared_experts.", kMlp, kExpertLocal);
                 }
             }
-            hip_ok(hipDeviceSynchronize(), "load layer");
+            // No wait per layer: the next layer's slices are read while this one's are prepared and uploaded.
             if (L % 10 == 9) {
-                std::printf("mm rank %u: loaded layers 0-%u, %.1f s, %.1f GiB read, device used %.1f GiB\n", rank, L,
+                std::printf("mm rank %u: queued layers 0-%u, %.1f s, %.1f GiB to read, device used %.1f GiB\n", rank, L,
                             secs(t0, Clock::now()), pack.gib_read(), static_cast<double>(device_used_bytes()) / 1073741824.0);
                 std::fflush(stdout);
             }
         }
         const std::uint64_t v0 = rank == 0 ? 0 : kVocabPad;
         vn = rank == 0 ? kVocabPad : kVocab - kVocabPad;
-        head = lib.out_slice("language_model.lm_head", v0, vn);
+        lib.out_slice_later(head, "language_model.lm_head", v0, vn);
+        lib.publish();  // every linear prepared, every raw slice uploaded: the one wait of the load
         hip_ok(hipDeviceSynchronize(), "load head");
         lib.release_staging();
         alloc();
         if (model_fast_i4) setup_fast_i4();
+        route_levers();  // shared route receipt: requested vs effective, part of the rank fingerprint
         LoadReport r;
         r.seconds = secs(t0, Clock::now());
         r.gib_read = pack.gib_read();
@@ -1036,6 +1183,40 @@ struct Engine::Impl {
         std::fflush(stdout);
     }
     bool i4_jit_layer(unsigned L) const { return model_fast_i4 && L >= kFirstMoe && L < kLayers && !i4_exl3_layers.test(L); }
+    // Shared route receipt (strix/route_receipt.hpp): why a MoE layer's prefill runs IU4 or keeps the EXL3 operator.
+    strix::route::Reason route_i4_reason(unsigned L, bool i4) const {
+        using R = strix::route::Reason;
+        return i4 ? R::selected : !model_fast_i4 || !mmoe::prefill_iu4() ? R::disabled : !task.i4.on ? R::short_call :
+               i4_exl3_layers.test(L) ? R::layer_mask : R::no_match;
+    }
+    void route_levers() const {
+        namespace rr = strix::route;
+        rr::set_engine("minimax");
+        rr::set_rank(static_cast<int>(opt.rank));
+        const char* asked = strix::envcfg::text("STRIX_MMX_MODEL_FORMAT");
+        // Use the same resolved policies as the dispatch sites (including the IU4 override).
+        const bool iu4 = model_fast_i4 && mmoe::prefill_iu4();
+        const auto mask = [](const auto& layers, unsigned first) {
+            std::string value;
+            for (unsigned L = first; L < kLayers; ++L) value += layers.test(L) ? '1' : '0';
+            return value;
+        };
+        std::string effective = "exl3";
+        if (iu4) {
+            effective = std::string("iu4:") + (i4_scope == fast_i4::Scope::all ? "all" : "gate_up") + ":min_rows=" + std::to_string(i4_min_rows) +
+                        ":a8=" + std::to_string(i4_a8) + ":exl3_layers=" + mask(i4_exl3_layers, kFirstMoe);
+            if (i4_a8) effective += ":a8_layers=" + mask(i4_a8_layers, kFirstMoe);
+        }
+        rr::lever("minimax.moe_prefill_format", asked != nullptr && *asked != 0 ? asked : "default", effective,
+                  iu4 ? rr::Reason::selected : rr::Reason::disabled);
+        const unsigned flash = pf_msa_rework != 0 ? pf_msa_flash : 0U;
+        const char* flash_asked = strix::envcfg::text("STRIX_MM_PF_MSA_FLASH");
+        rr::lever("minimax.msa_flash", flash_asked != nullptr ? flash_asked : "default",
+                  std::to_string(flash) + (flash ? ":layers=" + mask(pf_msa_flash_layers, 0) : ""),
+                  flash ? rr::Reason::selected : rr::Reason::disabled);
+        rr::lever("minimax.prefill_identity", fp32_prefill ? "fp32" : "default", fp32_prefill ? "fp32" : "default");
+        rr::lever("minimax.moe_kernels", moe_opt ? "1" : "0", moe_opt ? "1" : "0");
+    }
     // Timing collection is nonblocking. At prompt completion the existing prefill fence makes
     // every sample available; no host fence is introduced for conversion or prefetch.
     // Samples and counts go to the current task. A task switch settles first (jit_settle), so a pending sample is never
@@ -1721,6 +1902,7 @@ struct Engine::Impl {
                                       hipMemcpyDeviceToDevice, nullptr), "trace ids");
             out = send_buffer(n);
             const auto* i4 = i4_on && i4_jit_layer(L) ? jit_acquire(L, L1) : nullptr;
+            const strix::route::LayerScope route_layer(gemv || L < kFirstMoe ? ~0U : L, route_i4_reason(L, i4 != nullptr));
             if (i4 == nullptr && pf_stats && y.moe) jit_moe_begin(L);  // EXL3 timing does not depend on the row gate
             stage_ffn(L, n, out, i4);
             if (y.moe && pf_stats) jit_count(L, i4 != nullptr);
@@ -2294,7 +2476,8 @@ struct Engine::Impl {
         task.toks.assign(toks.begin(), toks.end());
         task.pos0 = pos0;
         pf_i4_chain = mmoe::prefill_i4_chain(toks.size());
-        task.i4.begin(toks.size(), i4_min_rows);
+        // The kernel route is a property of the whole prompt, not of the suffix a resident restart leaves to compute.
+        task.i4.begin(pos0 + toks.size(), i4_min_rows);
         task.chunks = (toks.size() + opt.max_rows - 1) / opt.max_rows;
         const bool module = pf != nullptr && pf_on && !pf_force_comm;
         task.grouped = pf_interleave && (module || pf_comm_interleave) && !profiling && !(taps_on && tap_sink) && task.chunks >= 2;
@@ -2667,6 +2850,7 @@ struct Engine::Impl {
                 send(c, 0, L, o);
             }
             const auto* i4 = i4_on && i4_jit_layer(L) ? jit_acquire(L, L1) : nullptr;
+            const strix::route::LayerScope route_layer(gemv || L < kFirstMoe ? ~0U : L, route_i4_reason(L, i4 != nullptr));
             const auto post_router = [&](std::size_t c) {
                 use(c);
                 const auto view = recv(c);
@@ -3091,7 +3275,7 @@ struct Engine::Impl {
         }
         struct Release {  // the pinned staging buffer and the whole-trellis host copy go on every exit
             Lib& l;
-            ~Release() { l.release_staging(); }
+            ~Release() { l.drop_staging(); }  // a failed attach: no publication here, a destructor must not throw
         } release{lib};
         const std::uint64_t v0 = opt.rank == 0 ? 0 : kVocabPad;
         std::uint64_t bits = 0;
@@ -3117,6 +3301,7 @@ struct Engine::Impl {
             dheads.push_back(std::move(dh));
             bits = l.bits;
         }
+        lib.release_staging();  // success path: the fallible publication happens here, not in ~Release
         dhead_sel = static_cast<int>(dheads.size()) - 1;
         std::printf("rank %u: DSpark draft-only head #%d %s (K%llu, %s, vocabulary [%llu, %llu)), %.1f ms\n", opt.rank, dhead_sel, dir.c_str(),
                     static_cast<unsigned long long>(bits), spec.c_str(), static_cast<unsigned long long>(v0),
@@ -3277,7 +3462,7 @@ void Engine::prefill_begin_task(PfTaskId id, PfTaskId parent, std::uint64_t gene
     auto& m = *impl_;
     if (id == 0 || m.task.open) throw std::logic_error("prefill begin: task identity");
     if (resident > m.opt.capacity || tokens.size() > m.opt.capacity - resident ||
-        (resident != 0 && resident % prefill_reuse_rows() != 0))
+        (resident != 0 && !m.unaligned_resume && resident % prefill_reuse_rows() != 0))
         throw std::invalid_argument("prefill begin: prefix range / alignment");
     if (parent != 0) {
         if (!m.parked.open || m.parked.id != parent || id == parent || slot == m.parked.slot ||
@@ -3313,11 +3498,16 @@ LoaderSnapshot Engine::draft_loader_snapshot() const {
 unsigned Engine::prefill_layer() const { return impl_->task.layer; }
 std::uint64_t Engine::prefill_unit_rows() const { return impl_->task.open ? impl_->task.rows : 0; }
 std::uint64_t Engine::prefill_reuse_rows() const {
-    // A whole group boundary is also a chunk boundary when taps/profiling disable grouping. The alignment stays at
-    // the width the default used to have (2 chunks): a wider group changes the schedule, not the chunk bits
-    // (group 2 and 4 give identical state hashes), and a resumed prefill's first group is already narrower.
+    // One chunk: a restart at a multiple of max_rows tiles exactly like the cold prefill. A wider group changes the
+    // schedule, not the chunk bits (group 2 and 4 give identical state hashes), and a resumed prefill's first group
+    // is already narrower, so the group width does not enter the alignment (kReuseChunks bounds it at one chunk).
     return std::uint64_t{impl_->opt.max_rows} * std::min(impl_->pf_group, strix::pair::prefill_group::kReuseChunks);
 }
+bool Engine::prefill_int4_regime(std::uint64_t prompt_rows) const {
+    return impl_->model_fast_i4 && prompt_rows >= impl_->i4_min_rows && mmoe::prefill_iu4();
+}
+void Engine::set_unaligned_resume(bool on) { impl_->unaligned_resume = on; }
+bool Engine::unaligned_resume() const { return impl_->unaligned_resume; }
 std::uint64_t Engine::prefill_rows_left() const { return impl_->task.open ? impl_->task.toks.size() - impl_->task.c0 : 0; }
 const std::uint16_t* Engine::embed_row(std::uint32_t token) const {
     if (token >= kVocab) throw std::out_of_range("embed_row");

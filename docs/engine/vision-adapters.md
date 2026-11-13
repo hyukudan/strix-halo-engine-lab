@@ -69,22 +69,32 @@ Measured on the tensors: the patch weight is laid out (channel, y, x) (neighbour
 those axes and not along the alternative); the aligner input is channel-major, index `c * 9 + slot` (the column
 norms follow a 3 x 3 pattern in the slot and are flat otherwise).
 
-**Not stated by the file** and not yet compared with the upstream processor and model code. Each is a field of
-`deepseek41::VisionRecipe`, part of the adapter identity, and an option of the reference tool:
+**Not stated by the file.** These come from the reference implementation that ships inside the checkpoint
+(`inference/image_processor.py`, `inference/vision.py`, at the revision named by the file's
+`general.source.url` and `general.source.revision`); `tools/vision/ds41_ref.py upstream` runs that code on the
+vision tensors and `compare` measures our rows against it. Each is a field of `deepseek41::VisionRecipe` or a
+rule of the adapter, and part of the adapter identity:
 
-| Parameter | Value used | Basis |
+| Parameter | Value | Status against the reference code |
 |---|---|---|
-| Resize rule | both sides to multiples of 42, area within [295936, 1024 x 42 x 42], aspect kept | the file's limits; the rounding rule is assumed |
-| Resampler | bicubic with antialias | assumed |
-| Mean, standard deviation | 0.5, 0.5 per channel | assumed |
-| SwiGLU halves | first half of `mlp.w1` is the gate | assumed |
-| Rotary layout | row angles then column angles, pairs `(i, i + 32)` | assumed |
-| Aligner activation | GELU | assumed |
-| Slot order in a 3 x 3 cell | `dy * 3 + dx` | assumed (channel-major is measured) |
-| Span | start, each grid row followed by the row end, end | assumed |
+| Canvas size | an image under 295936 pixels is scaled up (`int()` of each side); each side is rounded up to a multiple of 14, not of 42; a canvas whose span would exceed 1024 rows is shrunk to the largest one that fits; an extreme aspect ratio collapses to one column or one row of cells | was wrong (both sides to multiples of 42, aspect not kept), corrected |
+| Placement | the image keeps its aspect ratio inside the canvas (`ImageOps.pad`): bicubic with antialias, centred, margin grey 127, sizes and offsets rounded half to even | was wrong (stretched to the canvas), corrected |
+| Mean, standard deviation | 0.5, 0.5 per channel, as `(v / 255 - 0.5) / 0.5` with a true division | confirmed; the reciprocal form differed in the last place |
+| Pixel precision | the normalised pixels are rounded to BF16 before the patch embedding | was missing, corrected |
+| Row limit | the whole span (image rows, row ends, start, end) is at most 1024 rows | was wrong (1024 image rows), corrected |
+| Partial cells | a grid that is not a multiple of 3 is completed with zero rows on the right and at the bottom before the aligner | was missing, corrected |
+| SwiGLU halves | first half of `mlp.w1` is the gate | confirmed |
+| Rotary layout | row angles then column angles, 16 frequencies per axis, pairs `(i, i + 32)` | confirmed |
+| Aligner activation | GELU (exact, erf) | confirmed |
+| Slot order in a 3 x 3 cell | `c * 9 + dy * 3 + dx` (`unfold` on channel, y, x) | confirmed |
+| Span | start, each grid row followed by the row end (also the last), end; 1D positions | confirmed |
 
-The gate that compares these rows with the upstream implementation is still owed; until it has run, image
-input for this family is not advertised by any service.
+The reference rounds every linear to BF16; the adapter's FP32 reference rows are compared with the reference code
+run in FP32, and its own BF16 run measures what that arithmetic alone moves (see the status table). The
+transformers package has no model code for this family: the checkpoint's own files are the reference.
+
+Image input for this family is still not advertised by any service: the judge of the device arithmetic on images
+with flat areas (per-row minimum or a language-model gate) is an open decision, see the status table.
 
 ### Gate
 
@@ -92,9 +102,19 @@ input for this family is not advertised by any service.
 python3 tools/vision/ds41_ref.py images --out REF
 python3 tools/vision/ds41_ref.py preprocess --out REF
 python3 tools/vision/ds41_ref.py encode --out REF --model VISION.gguf
+python3 tools/vision/ds41_ref.py upstream --out REF --model-dir CHECKPOINT [--dtype bf16] [--patches ours]
+python3 tools/vision/ds41_ref.py compare --out REF --a "" --b upstream
 strix-deepseek41-vision-gate --model VISION.gguf --ref REF --backend host --only rings_graph
 strix-deepseek41-vision-gate-hip --model VISION.gguf --ref REF --backend hip
 ```
+
+Dump comparison retains the recorded span count, including recipes without a final newline. New dumps
+write per-case `.layout.json` files with merge factor, recipe and feature widths. Legacy untagged dumps
+without that metadata retain the default merge factor of three; regenerate non-default dumps before comparison.
+`compare` reports compared/skipped tensor counts. `--strict --max-rel-l2 LIMIT` requires nonempty,
+complete coverage, recorded feature widths, finite numerical results within that limit and exact special rows
+(the default limit is zero). This checks dump agreement; source and weight provenance still need independent
+verification, particularly when assembling a dump set with `--only`.
 
 `encode` is an independent FP32 implementation in numpy, not the upstream code: it proves the wiring of the
 shared tower and of the adapter, and it is the FP32 reference the device arithmetic (`vision-f16-v1`, class
@@ -110,7 +130,10 @@ cosine at least 0.99999 per row; device backend mean cosine at least 0.9995, min
 | Preprocessing against Pillow, 6 images | patch tensor bit-equal |
 | Host FP32 tower + adapter against the numpy implementation | cosine 1.000000, relative L2 0.00000 (rows differ only by their BF16 storage) |
 | Device arithmetic `vision-f16-v1`, 7 images | single FP16 operands: 4 pass, 3 fail the row minimum; split activations: 1 of the 5 run fails it |
-| Upstream processor and model | not run |
+| Reference processor (checkpoint code), 6 images | patch tensor bit-equal (maximum difference 0), same grids, including grids with partial cells |
+| Reference model in FP32, 7 images, same patches | tower and rows cosine 1.000000, row minimum at least 0.999994, relative L2 at most 0.0002; special rows bit-equal |
+| Reference processor + model in FP32 against `preprocess` + `encode`, 6 images | rows cosine 1.000000, row minimum at least 0.999999, relative L2 at most 0.0001 |
+| Reference model in its own BF16 arithmetic against its FP32 run, 7 images | row minimum 0.69 to 0.997, relative L2 2.4 % to 18 %: no image meets the device thresholds |
 
 The device failures are on images with large flat areas (a smooth gradient, an upscaled 16 x 16 image, smooth
 rings): the mean cosine stays at or above 0.998 while single rows fall far below it (row minimum 0.925, 0.996 and
@@ -132,3 +155,53 @@ and in the attention operands, or a judgement on the language model's output ins
 Measured tower time on one node (warm, no per-layer synchronisation): 111 ms for 1,521 patches (the minimum
 image), 388 ms for 3,888, 1,907 ms for 9,216 (the token cap); about 2.1 x, 1.8 x and 1.4 x that with split
 activations. The aligner adds 22 to 83 ms.
+
+## Image rows in the language model prefill
+
+An encoded image reaches the language model as rows of its hidden width that replace the embedding-table rows of
+part of a prefill run. The mechanism is shared; a family only states its per-row extras.
+
+| Piece | Where | What it does |
+|---|---|---|
+| `vision::span_embed_rows` | `include/strix/vision/embed_span.hpp` | `layout()` + the rows of `encode_cached` become one `session::EmbedRows` (roles, positions, the token id the rows stand for) |
+| `session::resolve_embed_run` | `include/strix/session/embed_splice.hpp` | the ids of one run become vocabulary ids plus an `EmbedSplice`: segments of consecutive run rows that read consecutive provided rows, checked against the family's rules (width, row order, positions, deep rows) |
+| `session::enqueue_embed_splice` | `src/session/embed_splice.hip` | device copy of one segment into the layer-0 input, BF16 or binary16 to FP32, into every residual stream copy of a row; no index arrays |
+
+A run without a virtual id resolves to the same ids and an empty splice, and the embed stage then launches and
+uploads nothing: text prompts are unchanged bit for bit.
+
+### DeepSeek V4.1
+
+`DevicePrefill::set_embed_rows(splice)` names the provided rows of the next run. The run looks every token up as
+before, overwrites the spliced rows, and for segments marked `extras` (every row of an image span: start, image,
+row ends, end)
+
+- sets the per-row image flag, so the routers add their image bias for those rows;
+- treats the rows as dead n-gram positions: no Engram n-gram reads through one, and its own n-grams are padding.
+  A token history kept for the decode engines marks such rows with `ds41::engram_dead_token`.
+
+Positions are the prompt index, as for text; `resolve_embed_run` refuses a span that is not in row order. A
+segment without `extras` is handled exactly as the token rows it replaces, which is what the identity gate uses:
+
+```
+strix-deepseek41-prefill MODEL.gguf --prompt IDS --rows N --layers L --embed-identity A:B
+```
+
+runs the prompt once from the table and then with rows `[A, B)` provided: the table's own rows must reproduce
+every bit (logits, next token, one stream hash per layer, attention state). Shifted rows must change the logits;
+one-row or identical-row controls fail as inconclusive. Rows cut to eight significant bits must give the same
+bits as binary16 and as BF16. The image arm requires finite logits and an observable change, plus independent
+checks: actual dead-position hashes equal a full-padding oracle and differ from plain history; a device router
+fixture using an uploaded image flag selects expert 1 with image bias and expert 0 with text bias. These are
+internal wiring checks, not model-fidelity qualification. Long text after an image run and a shorter text run
+must equal the first run, also when the shorter run has an extras-disabled splice. Choose an interval extending
+beyond the prompt midpoint to exercise the stale-tail case. Stream hashes are enabled automatically.
+The gate rejects `--ttft-timing` and worlds other than 1 before loading assets.
+
+Image serving remains unqualified: span-role and dead-position semantics need model-contract evidence.
+Extend boundaries, cancellation, two-rank splitting and old-binary text equality need separate qualification.
+
+Memory: `deepseek41::vision_memory` (`src/deepseek41/vision_splice.hpp`) lists the device bytes image input adds
+once per rank (tower panels and workspace from `vision::plan`, the aligner panels, the splice staging at the
+longest run plus a conservative second staging allocation during growth) and the host bytes of one largest image; `add_vision_capacity` adds them to the pools of a slot
+capacity report. No served route enables image input yet.

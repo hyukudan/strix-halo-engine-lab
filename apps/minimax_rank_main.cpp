@@ -1,3 +1,4 @@
+#include "strix/route_receipt.hpp"
 #include "strix/device/hip_gate.hpp"
 #include "strix/dist/open_transport.hpp"
 // strix-minimax-rank: one rank of the MiniMax M3.1 Flash TP2 engine (both ranks run the same command line).
@@ -1818,6 +1819,11 @@ int main(int argc, char** argv) {
         if (exchanger) eng.set_exchanger(exchanger.get(), xfer_env == nullptr || std::string(xfer_env) == "on");
         if (pfx) eng.set_prefill_exchanger(pfx.get(), pfx_on);
         const auto lr = eng.load();
+        // Shared route receipt: both ranks must have resolved the same numerical route before any product runs.
+        try {
+            const auto route_fp = strix::route::compare_ranks([&](const void* o, void* i, std::size_t n) { eng.exchange_bytes(o, i, n); });
+            std::printf("rank %u: route fingerprint %016llx agreed with the peer\n", opt.rank, static_cast<unsigned long long>(route_fp));
+        } catch (...) { eng.abort("route receipt: numerical-route fingerprint mismatch"); throw; }
         std::printf("rank %u: load %.1f s, %.1f GiB read (%s), device used %.1f GiB\n", opt.rank, lr.seconds, lr.gib_read,
                     lr.direct_io ? "O_DIRECT" : "buffered", lr.device_gib);
         std::fflush(stdout);

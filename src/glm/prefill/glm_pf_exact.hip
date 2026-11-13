@@ -2,6 +2,7 @@
 #include "glm/moe/glm_trellis_device.hpp"
 #include "glm/prefill/glm_pf_exact_x.hpp"
 #include "glm/prefill/glm_pf_wmma_x.hpp"
+#include "strix/route_receipt.hpp"
 #include <strix_trellis.h>
 #include <algorithm>
 #include <cstdlib>
@@ -247,23 +248,30 @@ void dispatch_tm(unsigned tm, Mat m, const _Float16* t, float* y, std::size_t ys
 }  // namespace
 unsigned x_auto_rows() {
     // STRIX_GLM_PF_EXACT_X_MIN_ROWS overrides the auto threshold (rows per linear call).
-    const char* p = std::getenv("STRIX_GLM_PF_EXACT_X_MIN_ROWS");
+    const char* p = envcfg::text("STRIX_GLM_PF_EXACT_X_MIN_ROWS");
     if (!p) return 2048;
     char* end = nullptr;
     const unsigned long v = std::strtoul(p, &end, 10);
     if (!*p || *end || v == 0 || v > 65536) throw std::invalid_argument("STRIX_GLM_PF_EXACT_X_MIN_ROWS must be 1..65536");
     return static_cast<unsigned>(v);
 }
-Route route(unsigned rows) {
-    const char* p = std::getenv("STRIX_GLM_PF_EXACT_X");
-    if (!p || std::strcmp(p, "0") == 0) return Route::tm;
-    if (std::strcmp(p, "1") == 0) return Route::x;
-    if (std::strcmp(p, "2") == 0) return Route::x2;
-    if (std::strcmp(p, "3") == 0) return Route::x3;
-    if (std::strcmp(p, "4") == 0) return Route::x3r8;
-    if (std::strcmp(p, "auto") == 0) return rows >= x_auto_rows() ? Route::x3r8 : Route::tm;
+struct RouteSelection {
+    Route route;
+    ::strix::route::Reason bypass;
+};
+static RouteSelection select_route(unsigned rows) {
+    using R = ::strix::route::Reason;
+    const char* p = envcfg::text("STRIX_GLM_PF_EXACT_X");
+    if (!p || std::strcmp(p, "0") == 0) return {Route::tm, R::wrong_route};
+    if (std::strcmp(p, "1") == 0) return {Route::x, R::wrong_route};
+    if (std::strcmp(p, "2") == 0) return {Route::x2, R::wrong_route};
+    if (std::strcmp(p, "3") == 0) return {Route::x3, R::wrong_route};
+    if (std::strcmp(p, "4") == 0) return {Route::x3r8, R::shape};
+    if (std::strcmp(p, "auto") == 0) return rows >= x_auto_rows() ?
+        RouteSelection{Route::x3r8, R::shape} : RouteSelection{Route::tm, R::short_call};
     throw std::invalid_argument("STRIX_GLM_PF_EXACT_X must be 0, 1, 2, 3, 4 or auto");
 }
+Route route(unsigned rows) { return select_route(rows).route; }
 unsigned vector_splits(unsigned input, unsigned output, unsigned bits) {
     const unsigned s = bits == 5 && input == 4096 && output == 1024 ? 16U :
         (output <= 1024 ? 32U : (output <= 4096 && input >= 4096 ? 16U : 4U));
@@ -292,13 +300,22 @@ void linear_rows(const engine::Linear& l, const float* x, std::size_t xs, float*
         std::size_t{rows} * (m.input / 128U) > std::size_t{UINT32_MAX} * 4U ||
         std::size_t{rows} > std::numeric_limits<std::size_t>::max() / sizeof(float) / std::max(xs, ys))
         throw std::invalid_argument("glm pf exact: rows, strides or workspace");
-    const Route selected = route(rows);
+    const auto selection = select_route(rows);
+    const Route selected = selection.route;
     const unsigned tm = tile_rows();
     auto* t = static_cast<_Float16*>(ws);
     const auto grid = static_cast<unsigned>((std::size_t{rows} * (m.input / 128U) + 3U) / 4U);
     const unsigned core = selected == Route::x3r8 && wmma_x::enabled() && m.input % 64U == 0 ? 5U : selected == Route::x3r8 ? 4U : selected == Route::x3 ? 3U :
         selected == Route::x2 ? 1U : (selected == Route::x ? 0U : tm);
     if (core == 5U) wmma_x::dense_calls.fetch_add(1, std::memory_order_relaxed);
+    // Shared route receipt (count only): the family of this call, and the reason a requested WMMA identity was bypassed.
+    if (core == 5U) ::strix::route::launched(::strix::route::Product::dense, ::strix::route::Family::f16_wmma, rows);
+    else {
+        ::strix::route::launched(::strix::route::Product::dense, ::strix::route::Family::exact, rows);
+        if (::strix::route::enabled() && wmma_x::enabled())
+            ::strix::route::bypass(::strix::route::Product::dense, ::strix::route::Family::f16_wmma,
+                                   selection.bypass, rows);
+    }
     if (core == 5U && aux::input_admitted(m.output) && aux::enabled("STRIX_GLM_PF_AUX_INPUT")) {
 #define CASE(B) case B: launch_w<B, true>(m, t, y, ys, rows, s, x, xs); break
         switch (m.bits) {

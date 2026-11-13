@@ -1596,7 +1596,9 @@ private:
             members.push_back({s->greedy.get(), &s->pending, depth(*s), budget(*s), s->request.stop_tokens,
                 static_cast<std::uint32_t>(slot),transactions.back().get()});
         }
-        static const bool joint=strix::envcfg::flag("STRIX_MTP_BATCH_JOINT", false);
+        // The row budget (on unless STRIX_SERVE_ROW_BUDGET=0 or the baseline mode) runs the joint cycle: its
+        // controller then plans with the budget rule.
+        const bool joint=strix::envcfg::flag("STRIX_MTP_BATCH_JOINT", false) || (mtp_serve_row_budget_enabled() && !options_.baseline);
         auto results = hip_mtp_greedy_cohort_cycle(members, &stats_.cohort,joint?&joint_:nullptr,joint?&policy_joint_:nullptr);
         runtime_done(results);
         for (std::size_t k = 0; k < live.size(); ++k) live[k]->result.shared_execution.add(results[k].shared);

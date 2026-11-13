@@ -58,7 +58,7 @@ void follow(mm::Engine& eng, Runner& run, strix::minimax::session::Runtime* sess
         if (static_cast<Command>(c.command) == Command::taps) taps = (c.pflags & 1U) != 0;
         if (ms::replay_resident_begin(c, eng, run, [&](std::size_t n) {
                 std::vector<std::uint32_t> prompt; exchange_tokens(eng,prompt,n,false); return prompt;
-            }, run.prefix_reuse)) continue;
+            }, run.prefix_reuse, run.conversation)) continue;
         if (!ms::replay_command(c, eng, run, [&](std::size_t n) {
                 std::vector<std::uint32_t> prompt;
                 exchange_tokens(eng, prompt, n, false);

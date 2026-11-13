@@ -16,6 +16,7 @@
 #include "strix/known_window_rows_binding.hpp"
 #include "hip_q8_rows_gemv.hpp"
 #include "hip_dense_f16_tiled.hpp"
+#include "core/wave_uniform.hpp"
 #include "strix/hip_gdn_islands.hpp"
 #include "strix/hip_model_residency.hpp"
 #include "strix/hip_setup_quiescence.hpp"
@@ -3192,6 +3193,7 @@ void gdn_prefill_norm_rows_kernel(GdnPrefillRows rows, std::uint32_t count, std:
 // FP32 core row, one overflow count per aligned 8-lane group). z arrives prefetched; weights once per CTA.
 struct GdnFp16NormEpilogue {
     static constexpr bool kRows = true;
+    static constexpr bool kWaveRows = true; // rows are wave-uniform: scalar address bases (core/wave_uniform.hpp)
     GdnPrefillRows rows;
     const void* norm_weights;
     SmallWeightKind norm_kind;
@@ -3220,16 +3222,19 @@ struct GdnFp16NormEpilogue {
             const float gate_value = 1.0F / (1.0F + expf(-z[part]));
             const float result = value[part] * inv * w[part] * gate_value;
             if (core16) {
-                core16[row * core16_pitch + head * head_dim + channel] = static_cast<_Float16>(result);
+                _Float16* const part16 = strix::core::wave_row(core16, row * core16_pitch + head * head_dim + part * 32U);
+                part16[lane] = static_cast<_Float16>(result);
                 const auto bad = __ballot(isfinite(result) && !(fabsf(result) <= 65504.0F));
                 if (bad != 0ULL && lane % 8U == 0U && ((bad >> lane) & 0xffULL) != 0ULL) atomicAdd(core16_overflow, 1U);
                 continue;
             }
-            rows.core[base + channel] = result;
+            float* const part32 = strix::core::wave_row(rows.core, base + part * 32U);
+            part32[lane] = result;
             if (a8_codes) {
                 constexpr std::uint64_t pitch = q8_rows::kDenseA8WideRows;
                 const std::uint64_t width = static_cast<std::uint64_t>(value_heads) * head_dim, feature = head * head_dim + channel;
-                q8_rows::dense_a8_quantize_lane(result, a8_codes + row * width + feature,
+                std::int8_t* const part8 = strix::core::wave_row(a8_codes, row * width + head * head_dim + part * 32U);
+                q8_rows::dense_a8_quantize_lane(result, part8 + lane,
                     a8_deltas + row / pitch * (width / 32U * pitch) + feature / 32U * pitch + row % pitch);
             }
         }

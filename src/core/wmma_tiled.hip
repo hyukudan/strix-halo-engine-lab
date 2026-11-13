@@ -8,8 +8,7 @@
 // Explicit PackedIU4 FAST v1 instead rescales signed I32 sums at every K64
 // boundary in ascending group order. It never enters the default resolver.
 #include "wmma_tiled.hpp"
-#include "trellis_device.hpp"
-#include "packed_decoder.hpp"
+#include "trellis_codec.hpp"
 #include "hadamard.hpp"
 #include <atomic>
 #include <cstdlib>

@@ -4,6 +4,8 @@
 
 #include <algorithm>
 #include <atomic>
+#include <bit>
+#include <cstdint>
 #include <exception>
 #include <mutex>
 #include <thread>
@@ -22,6 +24,24 @@ std::vector<float> normalize(const Image& im, std::array<float, 3> mean, std::ar
         const std::size_t c = i % 3;
         out[i] = (float(im.rgb[i]) * (1.0F / 255.0F) - mean[c]) / std[c];
     }
+    return out;
+}
+
+std::vector<float> normalize_div255(const Image& im, std::array<float, 3> mean, std::array<float, 3> std, bool round_bf16) {
+    if (im.width <= 0 || im.height <= 0 || im.rgb.size() != im.pixels() * 3) bad("image size and buffer disagree");
+    std::array<std::array<float, 256>, 3> table{};
+    for (std::size_t c = 0; c < 3; ++c)
+        for (std::size_t level = 0; level < 256; ++level) {
+            float v = (float(level) / 255.0F - mean[c]) / std[c];
+            if (round_bf16) {  // nearest BF16, ties to even (finite values)
+                std::uint32_t u = std::bit_cast<std::uint32_t>(v);
+                u = (u + 0x7FFFU + ((u >> 16) & 1U)) & 0xFFFF0000U;
+                v = std::bit_cast<float>(u);
+            }
+            table[c][level] = v;
+        }
+    std::vector<float> out(im.rgb.size());
+    for (std::size_t i = 0; i < out.size(); ++i) out[i] = table[i % 3][im.rgb[i]];
     return out;
 }
 

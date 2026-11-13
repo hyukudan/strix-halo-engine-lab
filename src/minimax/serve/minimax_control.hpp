@@ -102,6 +102,9 @@ inline constexpr std::uint32_t kHelloSessionVote = 1U;
 // This rank asks for prefix reuse and replays a prefill that opens at pstart. Reuse needs both votes: a peer that
 // does not set the bit (the switch off, or a build that predates pstart) keeps every prefill whole.
 inline constexpr std::uint32_t kHelloPrefixVote = 2U;
+// Conversation mode (needs the prefix vote): a prefill may also restart at a row inside a chunk, at the frontier a
+// finished reply left in the slot. Both ranks must vote; one missing vote keeps chunk-aligned reuse (or none).
+inline constexpr std::uint32_t kHelloConversationVote = 4U;
 
 // Additive runner seam: old runners still execute identical cold commands.
 template<class Runner>
@@ -117,11 +120,11 @@ void resident_begin(Runner& run, std::uint32_t slot, std::span<const std::uint32
 // Only nonzero suffix starts take this additive branch. Cold and all r4/r5
 // commands keep their existing replay, ordering, checks and abort handling.
 template<class Engine, class Runner, class Receive>
-bool replay_resident_begin(const Control& c, Engine& eng, Runner& run, Receive receive, bool agreed) try {
+bool replay_resident_begin(const Control& c, Engine& eng, Runner& run, Receive receive, bool agreed, bool unaligned = false) try {
     if (!c.pstart) return false;
     if (!agreed || c.command != 2 || !c.task_id || c.parent_task_id || c.bank || c.pflags || !c.plen ||
         !c.slot_generation || c.pslot >= eng.slots() || !eng.prefill_reuse_rows() ||
-        c.pstart % eng.prefill_reuse_rows() || c.pstart >= eng.capacity() || c.plen > eng.capacity()-c.pstart)
+        (!unaligned && c.pstart % eng.prefill_reuse_rows()) || c.pstart >= eng.capacity() || c.plen > eng.capacity()-c.pstart)
         throw std::runtime_error("control channel: invalid resident prefill");
     const auto prompt = receive(c.plen);
     if (prompt.size() != c.plen) throw std::runtime_error("control channel: resident suffix length");
@@ -182,13 +185,17 @@ Control exchange(Engine& eng, Control out, strix::pair::Lockstep& lock) {
 // prefix: this rank's prefix-reuse vote; *prefix_agreed (when given) is true only if both ranks voted for it.
 template<class Engine>
 bool session_hello(Engine& eng, bool requested, bool prefix = false, bool* prefix_agreed = nullptr,
-                   std::uint64_t prefix_rows = 1) {
+                   std::uint64_t prefix_rows = 1, bool conversation = false, bool* conversation_agreed = nullptr) {
     Control hello;
-    hello.pflags = (requested ? kHelloSessionVote : 0U) | (prefix ? kHelloPrefixVote : 0U);
+    hello.pflags = (requested ? kHelloSessionVote : 0U) | (prefix ? kHelloPrefixVote : 0U) |
+                   (prefix && conversation ? kHelloConversationVote : 0U);
     hello.dpos[0] = prefix ? prefix_rows : 0U;  // OFF keeps the legacy frame; ON agrees group alignment too
     const auto peer = exchange(eng, hello);
     if (prefix_agreed != nullptr) *prefix_agreed = (hello.pflags & peer.pflags & kHelloPrefixVote) != 0 &&
         hello.dpos[0] != 0 && hello.dpos[0] == peer.dpos[0];
+    if (conversation_agreed != nullptr)
+        *conversation_agreed = prefix && (hello.pflags & peer.pflags & kHelloConversationVote) != 0 &&
+            hello.dpos[0] != 0 && hello.dpos[0] == peer.dpos[0] && (hello.pflags & peer.pflags & kHelloPrefixVote) != 0;
     return ((hello.pflags | peer.pflags) & kHelloSessionVote) != 0;
 }
 }  // namespace strix::minimax::serve
