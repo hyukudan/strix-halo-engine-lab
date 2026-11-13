@@ -273,8 +273,10 @@ int main() {
 #endif
         };
         set_env(nullptr);
-        const auto automatic=Controller::rule_from_env();
-        expect(automatic.calibrated && automatic.calibrated_min_members==3U,"unset env defaults to calibrated-c3");
+        const auto unset_default=Controller::rule_from_env();
+        expect(unset_default.budget && !unset_default.calibrated,"unset env defaults to the row budget");
+        const auto automatic=Controller::parse_rule("calibrated-c3");
+        expect(automatic.calibrated && automatic.calibrated_min_members==3U && !automatic.budget,"calibrated-c3 parses to three plan members");
         expect(!Controller::rule_from_env(true).calibrated,"baseline defaults to production");
         for(const auto* text:{"production","0","calibrated","calibrated-c3"}) {
             set_env(text);
