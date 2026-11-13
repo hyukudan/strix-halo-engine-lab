@@ -8361,7 +8361,14 @@ void indexed_attention_known_window_cohort_launch(std::span<const HipQsaCohortSe
         else if (prepared.count <= 16U) enqueue_qsa_known_rows<16U>(qsa_cohort_rows<16U>(prepared), config, 2U, nullptr, 0U, &slot, 0U, subparts);
         else enqueue_qsa_known_rows<32U>(qsa_cohort_rows<32U>(prepared), config, 2U, nullptr, 0U, &slot, 0U, subparts);
     };
-    static const bool merge_part2 = [] { const char* v = std::getenv("STRIX_COHORT_QSA2_MERGED"); return v && v[0] == '1'; }();
+    // Merged part 2 by regime: with three or more sessions it wins (paired, per cycle: -0.7 ms at three, -2.2 at
+    // four, -4.0 at six, -8.0 at eight); with two sessions of four rows the per-session kernels win by 1.6 ms.
+    // STRIX_COHORT_QSA2_MERGED=1 forces it for every cohort, =0 turns it off.
+    static const int merge_part2_setting = [] {
+        const char* v = std::getenv("STRIX_COHORT_QSA2_MERGED");
+        return !v || !*v ? -1 : v[0] == '1' && v[1] == '\0' ? 1 : 0;
+    }();
+    const bool merge_part2 = merge_part2_setting < 0 ? segments.size() >= 3U : merge_part2_setting == 1;
     // Keep the diagnostic scorer/selection witnesses on their established route.
     const bool pool_checks = [] {
         for (const char* name : {"STRIX_QSA_POOLED_CHECK", "STRIX_QSA_MTP_POOL_CHECK"}) {
@@ -8372,7 +8379,8 @@ void indexed_attention_known_window_cohort_launch(std::span<const HipQsaCohortSe
     // In-process A/B: STRIX_COHORT_AB_OFF=qsa2 (this lever alone) or qsaseg (every part 2 merge).
     if (merge_part2 && !pool_checks && !known_window_cohort_feature_off("qsaseg") && !known_window_cohort_feature_off("qsa2")) {
         static const bool noted = [&] {
-            std::fprintf(stderr, "lever active: STRIX_COHORT_QSA2_MERGED (first launch: %zu segments)\n", segments.size());
+            std::fprintf(stderr, "lever active: STRIX_COHORT_QSA2_MERGED (%s, first launch: %zu segments)\n",
+                merge_part2_setting < 0 ? "automatic" : "forced", segments.size());
             return true;
         }();
         static_cast<void>(noted);

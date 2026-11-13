@@ -2,8 +2,9 @@
 from pathlib import Path
 import re
 files = [
-    'src/core/activation_quant.hpp','src/core/tiled_core.hpp',
+    'src/core/activation_quant.hpp','src/core/tiled_core.hpp','src/core/load_cohort.hpp',
     'src/core/moe_i4_arithmetic.hpp','src/core/moe_i4_chain.hpp',
+    'src/core/moe_i4_chain_plan.hpp',
     'src/moe_core/device_plan.hpp','src/moe_core/device_plan_index.hpp',
     'src/minimax/engine/engine.hip','src/minimax/moe/mmx_prefill.hip',
     'src/minimax/moe/mmx_prefill.hpp','src/minimax/moe/mmx_prefill_iu4.inc',

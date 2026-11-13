@@ -9,10 +9,10 @@ namespace strix::attn_core::idx {
 
 // STRIX_IDX_WMMA = "0" -> 0 (off, exact/default kernels), "1"/"bf16" -> 1 (bf16), "f16" -> 2 (f16) where the engine
 // accepts FP32 inputs for both operands (GLM), "bf16x2" -> 3 (the query as a BF16 hi + lo pair: two WMMA terms per
-// dot, ~2^-16 relative operand error instead of 2^-8; engines with BF16 keys, MiniMax), "exact" -> 4 (bf16x2 scores,
-// then the blocks at the selection cut-off are rescored with the exact kernel arithmetic: the selected set is the
-// exact one, see index_score_band.hpp; MiniMax); other values fail closed.
-// Unset or empty -> the caller's default: off, or "exact" where the engine made it its default (MiniMax).
+// dot, ~2^-16 relative operand error instead of 2^-8; engines with BF16 keys, MiniMax), "exact" -> 4 (WMMA scores,
+// bf16x2 on MiniMax and f16 on GLM, then the blocks at the selection cut-off are rescored with the exact kernel
+// arithmetic: the selected set is the exact one, see index_score_band.hpp); other values fail closed.
+// Unset or empty -> the caller's default: off, or "exact" where the engine made it its default (MiniMax, GLM).
 // Read on every call so a process can A/B the paths. Values 1 and 2 equal tile::Operand.
 inline constexpr unsigned kModeOff = 0U, kModeBf16 = 1U, kModeF16 = 2U, kModeBf16x2 = 3U, kModeExact = 4U;
 inline unsigned wmma_mode(unsigned unset_default = kModeOff) {

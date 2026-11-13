@@ -1,5 +1,6 @@
 #include "strix/session/prefix_cache.hpp"
 #include "strix/model_content_hash.hpp"
+#include "../core/byte_budget.hpp"
 
 #include <algorithm>
 #include <limits>
@@ -128,6 +129,7 @@ bool PrefixCache::admit(std::shared_ptr<const PrefixSnapshot> snapshot, PrefixSt
     }
     const auto ranks = std::as_bytes(std::span(&snapshot->identity.ranks, 1)); key.insert(key.end(), ranks.begin(), ranks.end());
     const auto tokens = std::as_bytes(std::span(snapshot->state.tokens)); key.insert(key.end(), tokens.begin(), tokens.end());
+    ::strix::core::shared_byte_budget().acquire(key.size()); // cache hashing draws from the byte budget
     entry->replacement = "prefix:" + model_content_identity_hex(sha256_bytes(key));
   }
   return owner_->retain(std::move(entry), turn || policy_.replace_duplicates, credit);

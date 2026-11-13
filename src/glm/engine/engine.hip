@@ -1,3 +1,4 @@
+#include <atomic>
 #include <limits>
 #include <array>
 #include <exception>
@@ -559,6 +560,11 @@ void Exchange::merge(MergeRow*, unsigned, MergeCtl&, hipStream_t) {
 std::shared_ptr<PrefillPath> reference_prefill() { return std::make_shared<ReferencePrefill>(); }
 std::shared_ptr<Exchange> local_exchange() { return std::make_shared<LocalExchange>(); }
 
+namespace {
+std::atomic<int> g_xb_publish{-1};
+}  // namespace
+void set_decode_producer_publish(int mode) { g_xb_publish.store(mode, std::memory_order_relaxed); }
+
 struct Engine::Impl {
     // Declared first = destroyed last: the memory watchdog keeps running through the HIP teardown of a failed load.
     mem::Probe probe;
@@ -640,6 +646,15 @@ struct Engine::Impl {
     // STRIX_GLM_STEP_FLAG=0: a plain step syncs for the layers' checkpoints before the head (old path).
     const bool defer_layer_flag = !(std::getenv("STRIX_GLM_STEP_FLAG") != nullptr && std::string(std::getenv("STRIX_GLM_STEP_FLAG")) == "0");
     const bool boundary_fused = !(std::getenv("STRIX_GLM_BOUNDARY") != nullptr && std::string(std::getenv("STRIX_GLM_BOUNDARY")) == "0");
+    // STRIX_GLM_XB_PUBLISH (default on, =0 disables): the decode producers of an exchanged partial (attention o
+    // projection, MoE down) write it into the exchange TX slot and publish it themselves: no copy + publish launch, and
+    // the exchange starts at the end of the producer. Same bits. Needs the fused boundary (STRIX_GLM_BOUNDARY).
+    const bool xb_publish_env = !(std::getenv("STRIX_GLM_XB_PUBLISH") != nullptr && std::string(std::getenv("STRIX_GLM_XB_PUBLISH")) == "0");
+    bool xb_publish_on() const {
+        const int forced = g_xb_publish.load(std::memory_order_relaxed);
+        return forced < 0 ? xb_publish_env : forced != 0;
+    }
+    std::uint64_t xb_publish_count = 0;
     // MoE kernels (TP2 rank slices, I = 1024): default for world 2; STRIX_GLM_MOE=ref = DefaultMoe.
     const bool moe_fast = opt.world == 2 && !(std::getenv("STRIX_GLM_MOE") != nullptr && std::string(std::getenv("STRIX_GLM_MOE")) == "ref");
     // STRIX_GLM_MODEL_FORMAT=exl3 (default) | fast_i4. fast_i4 (lossy FAST identity glm-fast-i4): at load the routed
@@ -1811,8 +1826,9 @@ struct Engine::Impl {
     // Sublayer boundary: TP reduce of `part` + R7 expand into X. The exchange's fused form when it has one and the call
     // supports per-row flags when the exchange provides them (STRIX_GLM_BOUNDARY=0 forces the split form).
     // pfc (chunked prefill rows, up to max_rows): always the split form (the fused kernels take decode rows only).
-    void boundary(unsigned* c1, unsigned c1_stride, unsigned R, bool pfc = false) {
-        if (!pfc && boundary_fused && xch->fused_boundary_rows(part, X, mix, X2, c1, R, c1_stride, stream)) {
+    // `produced`: the partial already written to (and published from) the exchange's TX slot by its producer.
+    void boundary(unsigned* c1, unsigned c1_stride, unsigned R, bool pfc = false, const float* produced = nullptr) {
+        if (!pfc && boundary_fused && xch->fused_boundary_rows(produced != nullptr ? produced : part, X, mix, X2, c1, R, c1_stride, stream)) {
             mark(segXch);  // the fused kernel: exchange wait + R17 + R7
         } else {
             xch->reduce(part, R, stream);
@@ -2228,6 +2244,7 @@ struct Engine::Impl {
         for (unsigned li = 0; li < n_layers; ++li) {
             LayerW& w = layers[li];
             cur_layer = li;
+            const float* attn_produced = nullptr;  // the attention partial when its producer wrote the TX slot
             if (!pfc && r1b && strix::glm::r1b::hc_norm_enabled()) {
                 strix::glm::r1b::hc_pre_norm(X, w.hc_attn.fn, w.hc_attn.base, w.hc_attn.scale, F, mix, xc,
                                           w.in_norm, xn, R, stream);
@@ -2243,13 +2260,23 @@ struct Engine::Impl {
                 if (w.kda) pf->kda(w.kdaw, w.kst, c, xn, part);
                 else if (kv_shard) kv_shard->prefill(*pf, w.dsaw, w.dst, c, xn, part);
                 else pf->dsa(w.dsaw, w.dst, c, xn, part);
-            } else if (w.kda) {
-                attn->kda(w.kdaw, w.kst, c, xn, part);
             } else {
-                attn->dsa(w.dsaw, w.dst, c, xn, part);
+                CallCtx ca = c;
+                float* out = part;
+                if (boundary_fused && xb_publish_on() && attn->publishes()) {  // the o projection writes and publishes the TX slot
+                    const auto slot = xch->producer_slot(R, stream);
+                    if (slot.data != nullptr) {
+                        ca.publish = slot.publish;
+                        out = slot.data;
+                        attn_produced = slot.data;
+                        ++xb_publish_count;
+                    }
+                }
+                if (w.kda) attn->kda(w.kdaw, w.kst, ca, xn, out);
+                else attn->dsa(w.dsaw, w.dst, ca, xn, out);
             }
             mark(w.kda ? segKda : segDsa);
-            boundary(c1, c1_stride, R, pfc);
+            boundary(c1, c1_stride, R, pfc, attn_produced);
             if (!pfc && r1b && strix::glm::r1b::hc_norm_enabled()) {
                 strix::glm::r1b::hc_pre_norm(X, w.hc_ffn.fn, w.hc_ffn.base, w.hc_ffn.scale, F, mix, xc,
                                           w.post_norm, xn, R, stream);
@@ -2261,6 +2288,7 @@ struct Engine::Impl {
                 D::GlmNorm::run(xc, w.post_norm, D::WType::BF16, kHidden, kEps, xn, R, stream);
             }
             mark(segHc);
+            const float* produced = nullptr;  // the FFN partial when its producer wrote the TX slot
             if (w.moe) {
                 if (pfc) {  // chunk rows: the row-tiled router chain (== decode bits) + R14 route
                     glm::pf::dense_rows(xn, w.moew.router, D::WType::F16, kHidden, 0, kExperts, rlog, R, stream);
@@ -2277,7 +2305,18 @@ struct Engine::Impl {
                     }
                 } else {
                     router_route(xn, w.moew, R);
-                    moe->forward(w.moew, c, xn, ids, wts, part);
+                    if (boundary_fused && xb_publish_on() && moe->publishes()) {
+                        // The down kernel writes the partial into the TX slot and publishes it (pair/producer_publish).
+                        const auto slot = xch->producer_slot(R, stream);
+                        if (slot.data != nullptr) {
+                            CallCtx cp = c;
+                            cp.publish = slot.publish;
+                            moe->forward(w.moew, cp, xn, ids, wts, slot.data);
+                            produced = slot.data;
+                            ++xb_publish_count;
+                        }
+                    }
+                    if (produced == nullptr) moe->forward(w.moew, c, xn, ids, wts, part);
                 }
             } else if (pfc) {
                 pf->dense(w.dense, c, xn, dense_i, part);
@@ -2288,7 +2327,7 @@ struct Engine::Impl {
                 lib.run(w.dense.down, da, part, R, stream);
             }
             mark(w.moe ? segMoe : segDense);
-            boundary(c1, c1_stride, R, pfc);
+            boundary(c1, c1_stride, R, pfc, produced);
             if (layer_dump != nullptr)
                 hip_ok(hipMemcpyAsync(layer_dump->data() + static_cast<std::size_t>(li) * kHc * kHidden, X, kHc * kHidden * 4,
                                       hipMemcpyDeviceToHost, stream), "layer dump");

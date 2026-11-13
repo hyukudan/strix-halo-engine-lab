@@ -12,6 +12,8 @@
 // Options (both ranks must pass the same engine options; hello refuses a mismatch):
 //   --slots S (default 8, <= 8 rows per step) --capacity C (positions per slot, default 8192)
 //   --serial or STRIX_GLM_SERVE_BATCH=0: serial admission (one request at a time; the OFF switch of batching)
+//   --short-first on|off or STRIX_GLM_SERVE_SHORT_FIRST=0|1 (default on; flag > env): shortest waiting prompt admitted first
+//   (shared 8-overtake starvation bound); off = FIFO. Reorders admission only, never changes tokens.
 //   --prefill-chunk N (decode-first prefill interleave: while requests decode, one N-token chunk of a new prompt per
 //   decode step, default 512; with nothing decoding the whole prompt in one call; 0 = always whole, the OFF switch) --prefill-chunk-mtp 0|1 (chunk MTP-bootstrap prompts too, default 1)
 //   --heartbeat-ms MS (idle heartbeat, default 1000)
@@ -757,7 +759,8 @@ int main(int argc, char** argv) {
         bool prefill_chunk_mtp = true, selftest_skip_basic = false;
         bool serve_mtp = true;
         std::uint32_t max_tokens = 4096;
-        bool serial = false, print_config = false;
+        bool serial = false, print_config = false, short_first = true;
+        int short_first_flag = -1;  // --short-first on|off (-1: unset); overrides STRIX_GLM_SERVE_SHORT_FIRST
         // RTX prefill route: every rank receives its hand-off on --import-listen; rank 0 asks the RTX producer
         // (--rtx-prefill host:port) for prompts of >= --import-min-tokens and names rank 1's --import-peer endpoint.
         std::string import_listen, import_key_file, import_model_sha, import_node, rtx_prefill, import_peer;
@@ -789,6 +792,11 @@ int main(int argc, char** argv) {
             else if (a == "--slots") opt.slots = static_cast<std::uint32_t>(std::stoul(next()));
             else if (a == "--capacity") opt.capacity = std::stoull(next());
             else if (a == "--serial") serial = true;
+            else if (a == "--short-first") {
+                const std::string v = next();
+                if (v != "on" && v != "off") throw std::invalid_argument("--short-first must be on|off");
+                short_first_flag = v == "on" ? 1 : 0;
+            }
             else if (a == "--mtp-cycles") mtp_cycles = static_cast<unsigned>(std::stoul(next()));
             else if (a == "--prefill-chunk") prefill_chunk = static_cast<unsigned>(std::stoul(next()));
             else if (a == "--prefill-chunk-mtp") prefill_chunk_mtp = std::stoul(next()) != 0;
@@ -825,6 +833,8 @@ int main(int argc, char** argv) {
             else throw std::invalid_argument("unknown option " + a);
         }
         if (const char* b = std::getenv("STRIX_GLM_SERVE_BATCH"); b != nullptr && std::string(b) == "0") serial = true;
+        if (const char* s = std::getenv("STRIX_GLM_SERVE_SHORT_FIRST"); s != nullptr && *s != '\0') short_first = std::string(s) != "0";
+        if (short_first_flag >= 0) short_first = short_first_flag != 0;
         if (const char* m = std::getenv("STRIX_GLM_SERVE_MTP"); m != nullptr && std::string(m) == "0") serve_mtp = false;
         if (strix::session::speculation_environment_off(std::getenv(strix::session::speculation_environment))) serve_mtp = false;
         bool serve_g2 = true;
@@ -868,8 +878,8 @@ int main(int argc, char** argv) {
         }
         if (print_config) {
             std::fputs(rd::print(eff).c_str(), stdout);
-            std::printf("serve slots=%u capacity=%llu batch=%s prefill-chunk=%u (mtp %d) c1-mtp=%s kmax=%u adaptive=%d cycles/round=%u\n",
-                        opt.slots, static_cast<unsigned long long>(opt.capacity), serial ? "serial" : "on", prefill_chunk,
+            std::printf("serve slots=%u capacity=%llu batch=%s short-first=%s prefill-chunk=%u (mtp %d) c1-mtp=%s kmax=%u adaptive=%d cycles/round=%u\n",
+                        opt.slots, static_cast<unsigned long long>(opt.capacity), serial ? "serial" : "on", short_first ? "on" : "off", prefill_chunk,
                         prefill_chunk_mtp ? 1 : 0,
                         mtp_on ? "on" : "off", eff.kmax, eff.adaptive ? 1 : 0, mtp_cycles);
             // The RTX import route (FAST identity glm-pf-rtx-native-v1: imported prompts are not bitwise the pair's own
@@ -1081,6 +1091,7 @@ int main(int argc, char** argv) {
         lc.slots = opt.slots;
         lc.capacity = opt.capacity;
         lc.batch = !serial;
+        lc.short_first = short_first;
         lc.prefix_cache_bytes = prefix_cache_bytes;
         lc.prefix_identity = gs::fnv1a64(&hello.model_hash, sizeof(hello.model_hash), hello.identity_hash);
         lc.prefill_chunk = prefill_chunk;
@@ -1491,8 +1502,8 @@ int main(int argc, char** argv) {
         http.listen();
         std::thread http_thread([&] { http.serve(); });
         api.set_state("ready");
-        std::printf("READY rank 0 http://%s:%u model %s slots %u context %llu batch %s\n", host.c_str(), http.port(), model_id.c_str(),
-                    opt.slots, static_cast<unsigned long long>(opt.capacity), serial ? "serial" : "on");
+        std::printf("READY rank 0 http://%s:%u model %s slots %u context %llu batch %s short-first %s\n", host.c_str(), http.port(), model_id.c_str(),
+                    opt.slots, static_cast<unsigned long long>(opt.capacity), serial ? "serial" : "on", short_first ? "on" : "off");
         try {
             lead.loop();
         } catch (...) {

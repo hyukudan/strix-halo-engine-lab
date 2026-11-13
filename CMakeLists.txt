@@ -361,6 +361,7 @@ strix_target_warnings(strix_core)
 
 include(CTest)
 include(cmake/StrixSession.cmake)
+include(cmake/StrixVisionPreprocess.cmake)
 add_library(strix_ds41_http_session_owner STATIC src/deepseek41/http_session_owner.cpp)
 target_include_directories(strix_ds41_http_session_owner PUBLIC src)
 target_link_libraries(strix_ds41_http_session_owner PUBLIC strix_session_owner)
@@ -388,7 +389,7 @@ target_include_directories(strix_xport INTERFACE "${CMAKE_CURRENT_SOURCE_DIR}/sr
 target_compile_features(strix_xport INTERFACE cxx_std_20)
 target_sources(strix_xport INTERFACE
     src/xport/borrowed_transport.hpp include/strix/dist/transport.hpp
-    src/xport/channel.hpp src/xport/channel_communicator.hpp src/xport/channel_device.hpp src/xport/wire.hpp src/xport/small_progress.hpp
+    src/xport/channel.hpp src/xport/row_fold.hpp src/xport/channel_communicator.hpp src/xport/channel_device.hpp src/xport/wire.hpp src/xport/small_progress.hpp
     src/xport/transport_backend.hpp src/xport/staging.hpp src/xport/stats.hpp src/xport/backend.hpp src/xport/communicator_backend.hpp
     src/xport/ds41_adapter.hpp src/xport/kvshard_channel.hpp src/xport/kvshard_channel_hip.hpp
     include/strix/dist/host_wait.hpp include/strix/dist/transport_caps.hpp)
@@ -514,6 +515,11 @@ if(BUILD_TESTING)
     strix_target_warnings(strix-xport-glm-wire-tests)
     add_test(NAME strix-xport-glm-wire-tests COMMAND strix-xport-glm-wire-tests)
     set_tests_properties(strix-xport-glm-wire-tests PROPERTIES LABELS "cpu;xport;exactness")
+    add_executable(strix-xport-row-fold-tests tests/xport_row_fold_tests.cpp)
+    target_link_libraries(strix-xport-row-fold-tests PRIVATE strix_xport)
+    strix_target_warnings(strix-xport-row-fold-tests)
+    add_test(NAME strix-xport-row-fold-tests COMMAND strix-xport-row-fold-tests)
+    set_tests_properties(strix-xport-row-fold-tests PROPERTIES LABELS "cpu;xport;exactness")
     add_executable(strix-xport-minimax-wire-tests tests/xport_minimax_wire_tests.cpp)
     target_link_libraries(strix-xport-minimax-wire-tests PRIVATE strix_xport)
     strix_target_warnings(strix-xport-minimax-wire-tests)
@@ -698,6 +704,10 @@ if(BUILD_TESTING)
     target_link_libraries(strix-deploy-tests PRIVATE strix_deploy strix_serve_json)
     strix_target_warnings(strix-deploy-tests)
     add_test(NAME strix-deploy-tests COMMAND strix-deploy-tests)
+    add_executable(strix-power-sampler-tests tests/power_sampler_tests.cpp)
+    target_link_libraries(strix-power-sampler-tests PRIVATE strix_power strix_serve_json)
+    strix_target_warnings(strix-power-sampler-tests)
+    add_test(NAME strix-power-sampler-tests COMMAND strix-power-sampler-tests)
     add_executable(strix-deepseek41-deploy-host-tests tests/deepseek41_deploy_host_tests.cpp)
     target_link_libraries(strix-deepseek41-deploy-host-tests PRIVATE strix_deploy)
     if(MSVC)
@@ -736,6 +746,7 @@ add_library(strix_serve STATIC
     src/serve/json_constraint.cpp
     src/serve/constraint_selection.cpp
     src/serve/bpe_tokenizer.cpp
+    src/serve/prompt_stream.cpp
     src/serve/chat_template.cpp
     src/serve/deepseek_chat.cpp
     src/serve/glm_chat.cpp
@@ -747,7 +758,7 @@ add_library(strix_serve STATIC
     src/serve/health.cpp
     src/serve/media.cpp
 )
-target_include_directories(strix_serve PUBLIC include PRIVATE src/serve)
+target_include_directories(strix_serve PUBLIC include PRIVATE src/serve src)
 target_compile_features(strix_serve PUBLIC cxx_std_20)
 target_link_libraries(strix_serve PUBLIC Threads::Threads strix_core strix_serve_json)
 if(WIN32)
@@ -866,6 +877,22 @@ if(BUILD_TESTING)
     target_compile_features(strix-batch-service-handoff-tests PRIVATE cxx_std_20)
     strix_target_warnings(strix-batch-service-handoff-tests)
     add_test(NAME strix-batch-service-handoff-tests COMMAND strix-batch-service-handoff-tests)
+    # Host lane and byte budget: the one host pool (critical / background) and the background byte governor.
+    add_executable(strix-host-lane-tests tests/host_lane_tests.cpp)
+    target_include_directories(strix-host-lane-tests PRIVATE src)
+    target_link_libraries(strix-host-lane-tests PRIVATE Threads::Threads)
+    target_compile_features(strix-host-lane-tests PRIVATE cxx_std_20)
+    strix_target_warnings(strix-host-lane-tests)
+    add_test(NAME strix-host-lane-tests COMMAND strix-host-lane-tests)
+    set_tests_properties(strix-host-lane-tests PROPERTIES LABELS "cpu" TIMEOUT 120)
+    # Checkpoint publication and reads under the process-wide byte budget (the test sets its own small cap).
+    add_executable(strix-governed-checkpoint-io-tests tests/governed_checkpoint_io_tests.cpp)
+    target_include_directories(strix-governed-checkpoint-io-tests PRIVATE src)
+    target_link_libraries(strix-governed-checkpoint-io-tests PRIVATE strix_state_cache Threads::Threads)
+    target_compile_features(strix-governed-checkpoint-io-tests PRIVATE cxx_std_20)
+    strix_target_warnings(strix-governed-checkpoint-io-tests)
+    add_test(NAME strix-governed-checkpoint-io-tests COMMAND strix-governed-checkpoint-io-tests)
+    set_tests_properties(strix-governed-checkpoint-io-tests PROPERTIES LABELS "cpu" TIMEOUT 120)
     add_executable(strix-rotary-descriptor-tests tests/rotary_descriptor_tests.cpp)
     target_link_libraries(strix-rotary-descriptor-tests PRIVATE strix_core strix_serve)
     strix_target_warnings(strix-rotary-descriptor-tests)
@@ -899,6 +926,14 @@ if(BUILD_TESTING)
     strix_target_warnings(strix-serve-frontend-tests)
     add_test(NAME strix-serve-frontend-tests COMMAND strix-serve-frontend-tests
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/data/serve/chat_template_cases.json)
+    # Incremental encoding: ids equal to the one-shot encoding at every slice end, for every pre-tokenizer, and the
+    # prompt stream that runs it on the host lane.
+    add_executable(strix-incremental-tokenizer-tests tests/incremental_tokenizer_tests.cpp)
+    target_link_libraries(strix-incremental-tokenizer-tests PRIVATE strix_serve)
+    target_include_directories(strix-incremental-tokenizer-tests PRIVATE src)
+    strix_target_warnings(strix-incremental-tokenizer-tests)
+    add_test(NAME strix-incremental-tokenizer-tests COMMAND strix-incremental-tokenizer-tests)
+    set_tests_properties(strix-incremental-tokenizer-tests PROPERTIES LABELS "cpu" TIMEOUT 300)
     add_executable(strix-glm-tokenizer-tests tests/glm_tokenizer_tests.cpp)
     target_link_libraries(strix-glm-tokenizer-tests PRIVATE strix_serve)
     strix_target_warnings(strix-glm-tokenizer-tests)
@@ -915,6 +950,10 @@ if(BUILD_TESTING)
     strix_target_warnings(strix-serve-deepseek-chat-tests)
     add_test(NAME strix-serve-deepseek-chat-tests COMMAND strix-serve-deepseek-chat-tests
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/data/serve/deepseek_v41_chat_cases.json)
+    add_executable(strix-serve-tool-choice-none-tests tests/serve_tool_choice_none_tests.cpp)
+    target_link_libraries(strix-serve-tool-choice-none-tests PRIVATE strix_serve)
+    strix_target_warnings(strix-serve-tool-choice-none-tests)
+    add_test(NAME strix-serve-tool-choice-none-tests COMMAND strix-serve-tool-choice-none-tests)
     add_executable(strix-serve-api-tests tests/serve_api_tests.cpp)
     target_link_libraries(strix-serve-api-tests PRIVATE strix_serve strix_core)
     strix_target_warnings(strix-serve-api-tests)
@@ -928,6 +967,8 @@ if(BUILD_TESTING)
     target_link_libraries(strix-mtp-selection-transaction-tests PRIVATE strix_serve)
     strix_target_warnings(strix-mtp-selection-transaction-tests)
     add_test(NAME strix-mtp-selection-transaction-tests COMMAND strix-mtp-selection-transaction-tests)
+    # Its worker/selector gates are bounded; this bounds a wait inside the selection itself.
+    set_tests_properties(strix-mtp-selection-transaction-tests PROPERTIES TIMEOUT 900)
 
     add_executable(strix-serve-json-constraint-tests tests/serve_json_constraint_tests.cpp)
     target_link_libraries(strix-serve-json-constraint-tests PRIVATE strix_serve)
@@ -1042,6 +1083,12 @@ if(BUILD_TESTING)
     target_link_libraries(strix-prefix-state-cache-tests PRIVATE strix_core strix_serve)
     strix_target_warnings(strix-prefix-state-cache-tests)
     add_test(NAME strix-prefix-state-cache-tests COMMAND strix-prefix-state-cache-tests)
+    # Prepared lookups (prepare_lookup + find_longest(ticket)) against recorded one-step lookups.
+    add_executable(strix-prefix-lookup-ticket-tests tests/prefix_lookup_ticket_tests.cpp)
+    target_link_libraries(strix-prefix-lookup-ticket-tests PRIVATE strix_core strix_serve)
+    strix_target_warnings(strix-prefix-lookup-ticket-tests)
+    add_test(NAME strix-prefix-lookup-ticket-tests COMMAND strix-prefix-lookup-ticket-tests)
+    set_tests_properties(strix-prefix-lookup-ticket-tests PROPERTIES LABELS "cpu" TIMEOUT 120)
     add_test(NAME strix-prefill-option-cache-write COMMAND strix-prefix-state-cache-tests
         --write-option-checkpoint "${CMAKE_CURRENT_BINARY_DIR}/prefill-option-cache")
     add_test(NAME strix-prefill-option-cache-read COMMAND strix-prefix-state-cache-tests
@@ -2299,7 +2346,8 @@ if(STRIX_ENABLE_HIP_RUNTIME)
     if(BUILD_TESTING)
         add_executable(strix-hip-iu4-convert-tests tests/hip_iu4_convert_tests.hip)
         add_executable(strix-hip-stored-i4-decode-tests tests/hip_stored_i4_decode_tests.hip)
-        foreach(target strix-hip-iu4-convert-tests strix-hip-stored-i4-decode-tests)
+        add_executable(strix-hip-iu4-load-cohort-tests tests/hip_iu4_load_cohort_tests.hip)
+        foreach(target strix-hip-iu4-convert-tests strix-hip-stored-i4-decode-tests strix-hip-iu4-load-cohort-tests)
             target_link_libraries(${target} PRIVATE strix_tiled_core)
             target_compile_options(${target} PRIVATE -O3 -mno-wavefrontsize64 -ffp-contract=off -fno-fast-math)
             set_target_properties(${target} PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHS}")
@@ -4279,7 +4327,7 @@ endif()
 if(STRIX_ENABLE_HIP_RUNTIME)
     # the HIP backend (routed experts resident on a gfx1151 node) and the server with relay over USB4
     add_library(strix_ds41_xs_hip STATIC src/hip_ds41_expert_backend.hip)
-    target_link_libraries(strix_ds41_xs_hip PUBLIC strix_ds41_xs strix_ds41_hip "${STRIX_HIP_RUNTIME_LIBRARY}")
+    target_link_libraries(strix_ds41_xs_hip PUBLIC strix_ds41_xs strix_ds41_hip strix_device_hip "${STRIX_HIP_RUNTIME_LIBRARY}")
     target_include_directories(strix_ds41_xs_hip PUBLIC include "${STRIX_HIP_INCLUDE_DIR}")
     set_target_properties(strix_ds41_xs_hip PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHS}")
     target_compile_options(strix_ds41_xs_hip PRIVATE -mno-wavefrontsize64 -fno-fast-math -ffp-contract=off
@@ -4897,6 +4945,11 @@ if(STRIX_FAMILY_MINIMAX)
         add_subdirectory(tests/minimax_service)
     endif()
     if(BUILD_TESTING)
+        add_executable(strix-minimax-tool-choice-none-tests tests/serve_tool_choice_none_tests.cpp)
+        target_compile_definitions(strix-minimax-tool-choice-none-tests PRIVATE STRIX_TOOLNONE_MINIMAX)
+        target_link_libraries(strix-minimax-tool-choice-none-tests PRIVATE strix_minimax_serve)
+        strix_target_warnings(strix-minimax-tool-choice-none-tests)
+        add_test(NAME strix-minimax-tool-choice-none-tests COMMAND strix-minimax-tool-choice-none-tests)
         add_executable(strix-minimax-tokenizer-tests tests/minimax_tokenizer_tests.cpp)
         target_link_libraries(strix-minimax-tokenizer-tests PRIVATE strix_minimax_serve)
         strix_target_warnings(strix-minimax-tokenizer-tests)
@@ -5279,9 +5332,16 @@ if(STRIX_FAMILY_GLM5)
             target_link_libraries(strix-hip-glm5-pf-wmma-tests PRIVATE strix_glm5_engine)
             target_include_directories(strix-hip-glm5-pf-wmma-tests PRIVATE "${STRIX_GLM5_TRELLIS_DIR}/include")
             list(APPEND strix_glm5_hip_targets strix-hip-glm5-pf-wmma-tests)
+            add_executable(strix-hip-glm5-pf-iu4-chain-tests tests/hip_glm_pf_iu4_chain_tests.hip)  # FAST_I4 chain plan policy: bits + timing
+            target_link_libraries(strix-hip-glm5-pf-iu4-chain-tests PRIVATE strix_glm5_engine)
+            target_include_directories(strix-hip-glm5-pf-iu4-chain-tests PRIVATE "${STRIX_GLM5_TRELLIS_DIR}/include")
+            list(APPEND strix_glm5_hip_targets strix-hip-glm5-pf-iu4-chain-tests)
             add_executable(strix-hip-glm5-pf-kda-wmma-tests tests/hip_glm_pf_kda_wmma_tests.hip)  # FAST glm-pf-kda-wmma-v1 contract + drift gate + timing
             target_link_libraries(strix-hip-glm5-pf-kda-wmma-tests PRIVATE strix_glm5_engine)
             list(APPEND strix_glm5_hip_targets strix-hip-glm5-pf-kda-wmma-tests)
+            add_executable(strix-hip-fma-rows-tests tests/hip_fma_rows_tests.hip)  # shared exact FMA-rows core: bitwise gate + timing
+            target_link_libraries(strix-hip-fma-rows-tests PRIVATE strix_glm5_engine)
+            list(APPEND strix_glm5_hip_targets strix-hip-fma-rows-tests)
             add_executable(strix-hip-glm5-pf-moe-tests tests/hip_glm_pf_moe_tests.hip)
             target_link_libraries(strix-hip-glm5-pf-moe-tests PRIVATE strix_glm5_engine)
             target_include_directories(strix-hip-glm5-pf-moe-tests PRIVATE "${STRIX_GLM5_TRELLIS_DIR}/include")

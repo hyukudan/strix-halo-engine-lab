@@ -123,6 +123,23 @@ struct PrefillMoeDeviceView {
     PrefillFakeq fakeq_a4 = PrefillFakeq::environment;
 };
 bool prefill_moe_device_plan(std::uint32_t rows);
+// Group-wide device-planned call: the MoE of one layer over all chunks of a prefill group at once (chunk c = rows
+// [c x seg_rows, ...) of the call, every chunk but the last full). An expert's weights are decoded once for the
+// group's rows instead of once per chunk; the plan keeps each row's per-chunk K splits (rows merge per expert and split
+// class), so every chunk's output is bitwise that of its own enqueue_prefill_moe_device call. Every chunk needs at
+// least prefill_moe_group_min_rows() rows; the workspace is prefill_moe_group_workspace_bound(rows). EXL3 only.
+inline constexpr unsigned kPrefillMoeSegments = 8;
+struct PrefillMoeGroupView {
+    std::uint32_t rows = 0, segments = 0, seg_rows = 0;
+    const float* y[kPrefillMoeSegments] = {};               // per chunk: rows x 6144 normed hidden (device)
+    const std::uint32_t* routes[kPrefillMoeSegments] = {};  // per chunk: the router layout of PrefillMoeDeviceView
+    float* out[kPrefillMoeSegments] = {};                   // per chunk: rows x 6144 (device)
+    const ExpertSlices* experts = nullptr;                  // device array [128]
+    ExpertSlices shared{};
+};
+unsigned prefill_moe_group_min_rows();
+std::size_t prefill_moe_group_workspace_bound(std::uint32_t rows);
+void enqueue_prefill_moe_group(const PrefillMoeGroupView& v, void* workspace, std::size_t workspace_bytes, hipStream_t stream);
 // The fused FAST_I4 candidate chain for a prompt of total_rows rows (0: capability/opt-in checks). Default on at
 // every length (8K -1.7 %, 32K -0.9 % with the global gate save). STRIX_MOE_I4_CHAIN=0/1 overrides. Same bits.
 bool prefill_i4_chain(std::size_t total_rows = 0);

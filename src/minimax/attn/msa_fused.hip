@@ -8,6 +8,7 @@
 #include "msa_select_dump.hpp"
 #include "attn_core/index_score_band.hpp"
 #include "attn_core/index_score_wmma.hpp"
+#include "attn_core/sparse_flash_keysplit.hpp"
 
 #include <cstdio>
 #include <cstdlib>
@@ -2221,6 +2222,8 @@ __global__ __launch_bounds__(1024) void prefill_r16_kernel(PrefillView input) {
 // done by one 256-thread block per (row, KV head) instead of by every chunk block. Same order keys, same choose_topk,
 // same ascending compaction with the newest block last, so idx / idx_count are the bytes the attend launch writes
 // with select; the attend launch then runs with select = false.
+#include "minimax/attn/msa_flash_policy.hpp"
+
 template <unsigned NT> __global__ __launch_bounds__(NT) void select_kernel(DecodeView v) {
     extern __shared__ uint4 dyn_smem[];
     SelView<NT> sel(dyn_smem, v.max_blocks);
@@ -2357,6 +2360,18 @@ template <bool DENSE> void launch_prefill_attend(const PrefillView& p, unsigned 
         }
         const auto chunks = prefill_chunk_prefix(p.pos0 + scheduled.rows) -
                             prefill_chunk_prefix(p.pos0 + p.first_window * kMaxRows);
+        if (p.msa_rework == 11 || p.msa_rework == 12) {
+            // FAST: BF16 WMMA key-split flash on the shared core, one block per (row, group); same grid and block
+            // lists as mode 10. 11 = one-term operands, 12 = two-term (hi + lo) queries and probabilities. Not
+            // bit-identical to the exact modes (quality gated by the engine's FAST profile).
+            namespace ks = strix::attn_core::sparse;
+            const dim3 grid((scheduled.rows - p.first_window * kMaxRows) * v.kv_heads), block(ks::KeySplit<kGroup, kHeadDim>::kThreads);
+            const MsaFlashArgs args{scheduled, DENSE ? 1U : 0U};
+            if (p.msa_rework == 12) hipLaunchKernelGGL((ks::flash_rows_keysplit_kernel<MsaFlashPolicy, true>), grid, block, 0, stream, args);
+            else hipLaunchKernelGGL((ks::flash_rows_keysplit_kernel<MsaFlashPolicy, false>), grid, block, 0, stream, args);
+            hip_check(hipGetLastError(), "minimax prefill flash attend");
+            return;
+        }
         if (p.msa_rework == 10) {
             // Mode 8 producer/combine in one block per (row, group); v2 uses
             // reserved numerator scratch and LDS scalar partials/IDs.
@@ -2676,7 +2691,7 @@ void set_select_dump(const char* path) {
 
 void enqueue_prefill(const PrefillView& p, hipStream_t stream, PrefillStageMarker marker, void* user) {
     const DecodeView& v = p.window;
-    if (p.msa_rework > 10 || (p.index_rows != 16 && p.index_rows != 32 && p.index_rows != 64) ||
+    if (p.msa_rework > 12 || (p.index_rows != 16 && p.index_rows != 32 && p.index_rows != 64) ||
         p.rows == 0 || p.scratch_windows == 0 || p.first_window != 0 || v.seqs != 1 ||
         v.q_heads != 32 || v.kv_heads != 2 || v.idx_heads != 2 || v.shard_count != 1 || v.shard_rank != 0 ||
         v.max_blocks == 0 || v.max_blocks > kMaxBlocks || (attend_version(v) != 3 && attend_version(v) != 4) ||

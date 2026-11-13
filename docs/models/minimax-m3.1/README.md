@@ -35,7 +35,10 @@ Run once per node with `R` set to 0 or 1 and matching EXL3 assets:
 
 The [resolver](../../../src/minimax/engine/mm_defaults.cpp) enables the production decode/prefill/exchange set,
 including MSA prefill mode 10 (in-block chunk loop with LDS-staged block list and partials, no global partials;
-`STRIX_MM_PF_MSA_REWORK=8` restores the previous mode, valid values 0..10). `strix-minimax-serve` uses structural DSpark auto admission with compatible
+`STRIX_MM_PF_MSA_REWORK=8` restores the previous mode, valid values 0..10). Opt-in FAST identity: `STRIX_MM_PF_MSA_FLASH=1` (one-term BF16 operands) or `2` (two-term)
+runs the prefill MSA attention of layers 40-59 on the shared WMMA key-split flash core
+(`STRIX_MM_PF_MSA_FLASH_LAYERS` selects the layers; see
+[mm-pf-msa-flash](../../optimizations.md#mm-pf-msa-flash) for the quality gate per layer set). `strix-minimax-serve` uses structural DSpark auto admission with compatible
 local assets; eligible uncontended requests may draft, while competing/grouped or unsupported requests
 stay plain. See [admission and qualification](../../engine/serving/dspark-auto-qualification.md).
 A named session request that does not fit the context returns HTTP 400 `context_length_exceeded` (the

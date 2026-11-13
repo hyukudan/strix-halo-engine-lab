@@ -1805,6 +1805,8 @@ void lead(const Args& initial, BatchForward& fwd, strix::dist::Communicator& com
 
     std::fprintf(stderr, "sched: effective %s, service target %.1f ms, budget source %s, short-first %u, nesting disabled\n",
                  strix::deepseek41::sched::mode_name(sched.mode), sched.service_ms, sched.budget_source(), sched.short_first ? 1U : 0U);
+    std::fprintf(stderr, "sched: admit-first %s (from %zu live requests, decode gap <= %.0f ms)\n", sched.admit_first.name(), sched.admit_first.min_live,
+                 sched.admit_first.max_decode_gap_ms);
     const auto tokenizer = serve::BpeTokenizer::load_gguf(a.model);
     // the drafter is loaded before READY (requests may come as soon as READY is out)
     std::unique_ptr<strix::ds41::dspark::DeviceDrafter> drafter;
@@ -1856,6 +1858,9 @@ void lead(const Args& initial, BatchForward& fwd, strix::dist::Communicator& com
         policy.set("service_target_ms", serve::Json(sched.service_ms));
         policy.set("effective_unit_target_ms", serve::Json(sched.mode == strix::deepseek41::sched::Mode::interleave ? sched.target_ms() : 0.0));
         policy.set("budget_source", serve::Json(sched.budget_source()));
+        policy.set("admit_first", serve::Json(sched.admit_first.name()));
+        policy.set("admit_first_min_live", serve::Json(static_cast<std::uint64_t>(sched.admit_first.min_live)));
+        policy.set("admit_first_max_decode_gap_ms", serve::Json(sched.admit_first.max_decode_gap_ms));
         policy.set("short_first", serve::Json(sched.short_first));
         policy.set("nested_prefill", serve::Json(false));
         policy.set("direct_prefill_below_rows", serve::Json(static_cast<std::uint64_t>(sched.min_rows)));
@@ -2658,6 +2663,11 @@ void lead(const Args& initial, BatchForward& fwd, strix::dist::Communicator& com
     };
     // one batch step of `seqs` on both ranks, then the new tokens published
     double step_ema = 0.0;  // seconds per step (recent), for the deferred admission's W
+    Clock::time_point decode_gap_from = Clock::now();  // throughput policy: when the decoding requests last advanced
+    // STRIX_DS41_SERVE_STEP_TRACE=1: one stderr line per decode step, device prefill and held step (ms since start)
+    const bool step_trace = std::getenv("STRIX_DS41_SERVE_STEP_TRACE") != nullptr && std::string(std::getenv("STRIX_DS41_SERVE_STEP_TRACE")) == "1";
+    const auto trace_t0 = Clock::now();
+    const auto trace_ms = [&](Clock::time_point t) { return std::chrono::duration<double, std::milli>(t - trace_t0).count(); };
     bool worked = false;  // a step or a prefill since the last quiesce (GPU-direct: a receive may be posted early)
     const bool comm_direct = comm.device_exchange() != nullptr;
     strix::deepseek41::serve_observe::StepDraftTally<BatchSequence> tally;  // armed: drafts per request of a step
@@ -2792,6 +2802,13 @@ void lead(const Args& initial, BatchForward& fwd, strix::dist::Communicator& com
         if (++prof.steps % 100U == 0U) prof.print(spec.get());
         const double dt = std::chrono::duration<double>(last_round - t0).count();
         step_ema = step_ema == 0.0 ? dt : 0.8 * step_ema + 0.2 * dt;  // the deferred admission's W
+        if (step_trace) {
+            std::size_t generated = 0;
+            for (const auto* q : seqs) generated += q->generated.size();
+            std::fprintf(stderr, "steptrace step t %.1f running %zu seqs %zu rows %zu decode %u plan_ms %.2f step_ms %.2f end %.1f gen %zu\n",
+                         trace_ms(t_loop), running.size(), seqs.size(), plan.rows.size(), decode,
+                         std::chrono::duration<double, std::milli>(t_planned - t_loop).count(), dt * 1e3, trace_ms(Clock::now()), generated);
+        }
         // a status or metrics read asked for fresh copies (one relaxed load per step otherwise); the pool's free list
         // changes on this thread only, so its scan runs here, before the lock
         const bool wanted = state.stats_wanted.load(std::memory_order_relaxed);
@@ -3235,6 +3252,9 @@ void lead(const Args& initial, BatchForward& fwd, strix::dist::Communicator& com
                                 swapped = true;
                             }
                 if (swapped) publish();
+                // the decode gap starts when requests are ready to step, not while nothing decodes
+                if (std::none_of(running.begin(), running.end(), [](const auto& r) { return !r->device_prefill; })) decode_gap_from = Clock::now();
+                bool prefilled_now = false;
                 if (!active) {
                     std::vector<Running*> waiting;
                     for (auto& r : running)
@@ -3247,7 +3267,12 @@ void lead(const Args& initial, BatchForward& fwd, strix::dist::Communicator& com
                             [](const auto* r) { return r->seq.prompt.size(); },
                             [](auto* r) -> std::uint32_t& { return r->prefill_overtakes; });
                         auto& r = *waiting[pick];
+                        const auto t_pf = Clock::now();
                         device_prefill(r, r.seq.prompt.size() >= sched.min_rows);
+                        if (step_trace)
+                            std::fprintf(stderr, "steptrace prefill t %.1f slot %u tokens %zu end %.1f task %d\n", trace_ms(t_pf), r.seq.slot,
+                                         r.seq.prompt.size(), trace_ms(Clock::now()), active ? 1 : 0);
+                        prefilled_now = true;
                         if (!active) publish();
                     }
                 }
@@ -3255,8 +3280,18 @@ void lead(const Args& initial, BatchForward& fwd, strix::dist::Communicator& com
                 std::vector<BatchSequence*> seqs;
                 for (auto& r : running)
                     if (!r->device_prefill) seqs.push_back(&r->seq);
-                if (!seqs.empty()) {
+                // admit-first (serve::AdmitFirst, selected by the live concurrency): prompts that wait for their prefill go
+                // before the next decode step, on the same prefill path and units, so the tokens are the same. A request
+                // still in the queue after a prefill counts once: the loop admits it before the others step.
+                const std::size_t queued = sched.admit_first.select == serve::AdmitFirst::Select::never ? 0U : static_cast<std::size_t>(queue.snapshot().queued);
+                const auto waiting_prefill = static_cast<std::size_t>(std::count_if(running.begin(), running.end(), [](const auto& r) { return r->device_prefill; }));
+                const bool hold = sched.admit_first.prompt_before_decode(running.size() + queued, waiting_prefill + (prefilled_now && queued != 0U ? 1U : 0U),
+                    seqs.size(), std::chrono::duration<double, std::milli>(Clock::now() - decode_gap_from).count());
+                if (hold) {
+                    if (step_trace) std::fprintf(stderr, "steptrace hold t %.1f seqs %zu waiting %zu queued %zu\n", trace_ms(Clock::now()), seqs.size(), waiting_prefill, queued);
+                } else if (!seqs.empty()) {
                     decode_step(seqs);
+                    decode_gap_from = Clock::now();
                     if (active) ++active->steps_between;
                 }
                 if (active) {

@@ -2,6 +2,7 @@
 #undef NDEBUG
 #endif
 #include "core/moe_i4_arithmetic.hpp"
+#include "core/moe_i4_chain_plan.hpp"
 #include "core/iu4.hpp"
 #include "moe_core/device_plan_index.hpp"
 #include "minimax/engine/route_identity.hpp"
@@ -143,9 +144,25 @@ void planner(unsigned R,unsigned E,unsigned K,bool skew) {
         assert(slot<K);const unsigned pair=r*(K+1)+slot;assert(pair/(K+1)==r && pair%(K+1)==slot);
     }
 }
+// Chain plan policy: the down always runs the requested plan; the paired GEMM shares it only with admitted gate
+// scratch (GSave on and room for every pair slot), else it stays at plan 1 at most and a plan-2 down rebuilds tiles.
+void chain_plans() {
+    using strix::core::moe_i4::chain_plan; using strix::core::moe_i4::chain_gsave_floats;
+    const std::size_t need=chain_gsave_floats(4096*9,1024);
+    assert(need==std::size_t(4096)*9*1024);
+    for(int plan=0;plan<3;++plan) {
+        const auto on=chain_plan(plan,true,2*need,need), exact=chain_plan(plan,true,need,need);
+        assert(on.gsave && on.paired==plan && on.down==plan && !on.rebuild());
+        assert(exact.gsave && exact.paired==plan && !exact.rebuild());
+        for(const auto reg:{chain_plan(plan,false,2*need,need),chain_plan(plan,true,need-1,need),chain_plan(plan,true,0,need),chain_plan(plan,true,need,0)}) {
+            assert(!reg.gsave && reg.down==plan && reg.paired==(plan<1 ? plan : 1) && reg.rebuild()==(plan==2));
+        }
+    }
+}
 int main() {
     arithmetic();
+    chain_plans();
     for(unsigned R:{0U,1U,31U,32U,33U,255U,256U,257U,8192U})
         for(bool skew:{false,true}) { planner(R,128,4,skew);planner(R,288,8,skew); }
-    std::cout<<"PASS: 36 planner row-list cases; 128 input/epilogue/A4 cases; LDS bijections; 1536 combine orders\n";
+    std::cout<<"PASS: 15 chain plan cases; 36 planner row-list cases; 128 input/epilogue/A4 cases; LDS bijections; 1536 combine orders\n";
 }

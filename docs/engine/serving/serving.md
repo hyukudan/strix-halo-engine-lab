@@ -305,6 +305,13 @@ window stream shared by all slots. The calibration replay runs once.
   decode rounds between its units; it then decodes with the others and the long block resumes. One nested
   prompt per pause; T8192 with the default tails and the dense-A8 prefill only (other routes decline, counted
   in `nest_skip_reasons`).
+- Join rule (`include/strix/serve/prompt_join.hpp`, `STRIX_BATCH_NEST_RATIO`, default 4, `0` = always nest): a
+  request is nested only when its uncached rows are at most 1/ratio of the paused unit's rows (a short prompt
+  behind a long block). A larger one waits for the unit boundary, where its blocks join the other prompts' next
+  blocks in one segmented prefill ([prompt groups](../prefill/prompt-batch.md)); it is counted under
+  `nest_skip_reasons.group`. Nesting every arrival made a burst a serial stack of whole prompts, each alone, with
+  the paused prompt waiting for all of them. Scheduling only: a prompt's units, rows and bits are those of a solo
+  run under either choice.
 - Cancellation (`STRIX_BATCH_CANCEL_POINTS`, default 1) is observed at those layer boundaries: the request's
   partial block is discarded (nothing is published to the prefix cache), the shared prefill storage is reset
   and the slot starts fresh. Groups and window cohorts finish their unit first.
@@ -375,7 +382,13 @@ window stream shared by all slots. The calibration replay runs once.
 - The reply is split into `reasoning_content` (the thinking block), `content` and `tool_calls`.
   Parameter values of a tool call are typed by the tool's JSON schema (strings stay strings, other
   types are parsed as JSON); `finish_reason` is `tool_calls` when the reply contains calls.
-- `tool_choice: "none"` renders no tools.
+- `tool_choice: "none"` (Anthropic: `{"type":"none"}`) renders no tool definitions and returns no tool call, on
+  Chat Completions, Responses and Messages alike. Earlier calls and their results stay in the prompt. When the
+  history holds a tool call or a tool result, a closing instruction ("Tools are disabled for this reply. ...") is
+  appended to the last user message, or added as a user message after a closing tool result, so the model does not
+  imitate the earlier calls. A call the model still emits is withheld: the reply keeps the text before it and ends
+  with `[tool call to <name> withheld: tool_choice is "none"]` (streamed as a final text delta), with finish reason
+  `stop` / `end_turn` and no call item. Requests without `tool_choice: "none"` are not affected.
 - Other fields: `max_tokens` / `max_completion_tokens`, `stop` (string or list), `stream`,
   `stream_options.include_usage`, `n` (only 1), `temperature`, `top_p`, `top_k`, `seed`.
 - Generation fields the server does not execute yet are refused with a 400 naming the field, on every route:
@@ -578,6 +591,40 @@ directly. Rows with a nonfinite logit or a refused maximum, and requests with sc
 selected on the full row; token IDs are identical either way. One difference to `--http-selection-fast
 off` (every row walks the full mask): a full walk can stop a request on a mask-walk evaluation limit
 reached by another token, which a membership check does not walk; all routes of one setting behave the same.
+
+Ranked membership extends argmax-first to rows whose maximum is refused. Masked greedy is the first
+admitted token in the order "logit descending, lowest ID among equals", so the row checks the next-best
+logits in that order with the same one-token membership test and takes the first admitted one; no mask is
+walked. It is opt-in: `STRIX_CONSTRAINT_RANKED=N` sets how many next-best logits are checked (a decimal
+number in 0..4096; default 0 = off, the row walks the mask); a row whose N next-best tokens are all
+refused walks the full mask as before. It applies where argmax-first applies (finite row, answer phase,
+no scores or transforms). Token IDs equal those of the mask walk wherever the walk completes. It is off
+by default because refusals are not equal: with argmax-first alone a row whose maximum is refused walks
+the full mask, and that walk stops the request when any token reaches a schema evaluation limit; ranked
+membership only checks the tokens it tries, so such a request continues with the first admitted one.
+Schemas whose walks stay inside their evaluation limits (the usual case) select the same tokens either
+way. A full mask walk visits the whole token trie, which in a permissive state (inside a string) costs
+far more than a decode step, so on such schemas the setting keeps output at plain decode speed. The
+profile reports these rows as `ranked_rows`.
+
+Both settings are read through the shared environment registry: unset or empty means the default, a
+`STRIX_CONSTRAINT_RANKED` value that is not a whole decimal number in range stops the server at startup
+with an error naming the variable, and the resolved values are recorded with the other switches of the run.
+
+Masks one step ahead (default on; `STRIX_CONSTRAINT_MASK_AHEAD=0` turns it off) covers the requests that
+still walk one mask per answer row: scores (`logprobs`), logit transforms, and `--http-selection-fast
+off`. A mask depends only on the schema program, the cursor, the token trie and the stop IDs, and the
+cursors a step can reach are known before its logits are: the committed state for a serial row, the
+committed state advanced over drafts 0..r-1 for row r of an MTP window. When the step is launched those
+walks are handed to a host worker and run while the GPU executes; the row takes the finished mask, waits
+for the one in progress, or walks an unstarted one itself, and a walk whose step is over is abandoned.
+Planning a draft chain stops at the first draft the schema refuses or whose transition reaches an
+evaluation limit; such a limit stops the request only when a row really takes that draft.
+The mask words, the refusals and where they surface are those of the walk on the selecting thread, so
+token IDs and receipts are identical with the switch on or off. Requests in the argmax-first regime do
+not use the worker: their rows almost never walk a mask, and walks nobody takes only load the host. The
+profile adds `ahead_rows` (rows served by the worker; their `mask_ms` is only the wait), `ahead_masks`
+and `ahead_ms` (every mask the worker walked and its own time, including masks no row needed).
 
 Every policy response reports `strix.selection_execution` (`mtp-host` or
 `serial-host`) and `strix.selection_fallback` (null when admitted). Fallbacks are
@@ -1159,6 +1206,18 @@ budget to rank 1. While no request decodes and no other admitted prompt waits, r
 budget 0 instead: both ranks run the rest of the current piece at once (same bits; up to
 16384 rows with `--prefill-rows auto`), so a request that arrives meanwhile, an abort or an
 import waits for that piece. `STRIX_DS41_SERVE_IDLE_WHOLE=0` restores bounded units while idle.
+
+**Admit-first order.** While admitted prompts still wait for their prefill, a decode step runs with fewer rows and
+pays its fixed cost for them. From five live requests (admitted or queued) the lead therefore prefills the waiting
+prompts before the next decode step, and the decoding requests wait at most one second. Below five live requests the
+order is unchanged: drafting fills the spare rows there, so an early step is as productive as a late one. Every prompt
+keeps its prefill path, pieces and units, so the generated tokens are the same in either order. Eight concurrent chat
+prompts of 128 tokens: 92.3 to 94.2 tokens/s against 91.0 to 93.4 (+1.0 to +1.5 %, four pairs), median time to first
+token 1.6 s against 1.8 s; one to four concurrent requests run the same order (no held step).
+`STRIX_SERVE_ADMIT_FIRST=0` keeps decode first at every concurrency, `=1` forces admit-first,
+`STRIX_SERVE_ADMIT_FIRST_MIN_LIVE` moves the crossover and `STRIX_SERVE_ADMIT_FIRST_GAP_MS` the wait bound.
+`STRIX_DS41_SERVE_STEP_TRACE=1` prints one line per decode step, device prefill and held step. The rule is
+`serve::AdmitFirst` in `include/strix/serve/prompt_service.hpp`, engine neutral.
 The ordinary piece endpoints and cache snapshots stay unchanged. Arrivals, status
 and cancellation are inspected between resumes. One indivisible unit, decode sweep,
 state import or allocation can exceed the target; it is not a latency guarantee.

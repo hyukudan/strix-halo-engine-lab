@@ -1,4 +1,5 @@
 #include "strix/device/gate.hpp"
+#include "strix/device/hip_gate.hpp"
 
 #include <cstdlib>
 #include <filesystem>
@@ -377,6 +378,25 @@ void units() {
     bad(gpu + "[devices.host]\nkind = \"cpu\"\ncores = \"15-2\"\n", "reversed range", "reversed cores");
     bad(gpu + "[devices.host]\nkind = \"cpu\"\nbyte_cap_gbytes_ps = 0\n", "must be positive", "zero byte cap");
 }
+
+// The host wait policy text (hip_gate.hpp is free of HIP headers): engine choice, override, refusal.
+void host_wait() {
+    using strix::device::HostWait;
+    using strix::device::resolve_host_wait;
+    require(resolve_host_wait(HostWait::blocking, nullptr) == HostWait::blocking, "host wait: engine choice without override");
+    require(resolve_host_wait(HostWait::spin, "") == HostWait::spin, "host wait: empty override");
+    require(resolve_host_wait(HostWait::spin, "block") == HostWait::blocking, "host wait: block override");
+    require(resolve_host_wait(HostWait::blocking, "spin") == HostWait::spin, "host wait: spin override");
+    require(resolve_host_wait(HostWait::blocking, "yield") == HostWait::yield, "host wait: yield override");
+    require(resolve_host_wait(HostWait::blocking, "runtime") == HostWait::runtime, "host wait: runtime override");
+    bool refused = false;
+    try {
+        (void)resolve_host_wait(HostWait::spin, "1");
+    } catch (const strix::device::Refusal&) {
+        refused = true;
+    }
+    require(refused, "host wait: unknown text is refused");
+}
 } // namespace
 
 int main() {
@@ -392,6 +412,7 @@ int main() {
         gate();
         entry_points();
         units();
+        host_wait();
     } catch (const std::exception& e) {
         std::cerr << "device gate tests: " << e.what() << '\n';
         return 1;

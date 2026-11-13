@@ -73,6 +73,9 @@ public:
 
     // Device pointer of the TX slot of the next send() (producers that write the message themselves).
     [[nodiscard]] void* tx();
+    // TX slot of the send() `ahead` sends after the next one (a producer that writes several messages before the first
+    // send(); tx(0) == tx()). The same slot-reuse contract as tx(), for that later sequence.
+    [[nodiscard]] void* tx(unsigned ahead);
     // Between complete, retired batches only; waits for the stream before replacing TX storage. Returns false (one-line
     // notice, TX stays host-coherent) when uncached device memory cannot be allocated.
     bool set_tx_uncached(bool on);

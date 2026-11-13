@@ -1,4 +1,5 @@
 #include "strix/env_flags.hpp"
+#include "moe_core/route.hpp"
 #include "strix/hip_qwen_dpp_reduce.hpp"
 #include "strix/hip_mtp_native_validation.hpp"
 #include "strix/hip_launch_context.hpp"
@@ -282,6 +283,37 @@ __device__ bool better(
             left_index < right_index);
 }
 
+struct InsertRoutePolicy {
+    static constexpr std::uint32_t max_top_k = kMaxTopK;
+    __device__ static bool better(float lv, std::uint32_t li, float rv, std::uint32_t ri) {
+        return strix::better(lv, li, rv, ri);
+    }
+};
+
+struct WaveRoutePolicy : InsertRoutePolicy {
+    static constexpr std::uint32_t candidates = kWaveCandidates, wave = kRouterWave;
+    template <class T>
+    __device__ static T xor32(T value, int mask) { return strix::qwen_dpp::xor32(value, mask); }
+};
+
+struct BlockWaveRoutePolicy : WaveRoutePolicy {
+    std::uint32_t lane, expert_count;
+    float* best_values;
+    std::uint32_t* best_indices;
+    __device__ void record(std::uint32_t slot, bool has, float best, std::uint32_t index) const {
+        if (lane == 0) { best_values[slot] = has ? best : -INFINITY; best_indices[slot] = has ? index : expert_count; }
+    }
+};
+
+struct LaneWaveRoutePolicy : WaveRoutePolicy {
+    std::uint32_t lane, expert_count;
+    float& mine;
+    std::uint32_t& mine_index;
+    __device__ void record(std::uint32_t slot, bool has, float best, std::uint32_t index) const {
+        if (lane == slot) { mine = has ? best : -INFINITY; mine_index = has ? index : expert_count; }
+    }
+};
+
 template <
     typename Activation,
     RouterWeightKind WeightKind>
@@ -332,151 +364,8 @@ __global__ void moe_route_kernel(
     }
     __syncthreads();
 
-    float local_max =
-        -INFINITY;
-    for (std::uint32_t expert = lane;
-         expert < expert_count;
-         expert += blockDim.x) {
-        local_max =
-            fmaxf(
-                local_max,
-                logits[expert]);
-    }
-    scratch[lane] = local_max;
-    __syncthreads();
-
-    for (std::uint32_t stride =
-             blockDim.x / 2U;
-         stride > 0;
-         stride >>= 1U) {
-        if (lane < stride) {
-            scratch[lane] =
-                fmaxf(
-                    scratch[lane],
-                    scratch[
-                        lane + stride]);
-        }
-        __syncthreads();
-    }
-    const float maximum =
-        scratch[0];
-    // Every wave must retain the maximum before lane zero reuses scratch[0]
-    // for its contribution to the denominator reduction.
-    __syncthreads();
-
-    float local_sum = 0.0F;
-    for (std::uint32_t expert = lane;
-         expert < expert_count;
-         expert += blockDim.x) {
-        const float probability =
-            expf(
-                logits[expert] -
-                maximum);
-        logits[expert] =
-            probability;
-        local_sum += probability;
-    }
-    scratch[lane] = local_sum;
-    __syncthreads();
-
-    for (std::uint32_t stride =
-             blockDim.x / 2U;
-         stride > 0;
-         stride >>= 1U) {
-        if (lane < stride) {
-            scratch[lane] +=
-                scratch[lane + stride];
-        }
-        __syncthreads();
-    }
-    const float denominator =
-        scratch[0];
-
-    for (std::uint32_t expert = lane;
-         expert < expert_count;
-         expert += blockDim.x) {
-        logits[expert] /=
-            denominator;
-    }
-    __syncthreads();
-
-    if (lane == 0) {
-        float best_values[kMaxTopK];
-        std::uint32_t best_indices[
-            kMaxTopK];
-
-        for (std::uint32_t slot = 0;
-             slot < top_k;
-             ++slot) {
-            best_values[slot] =
-                -INFINITY;
-            best_indices[slot] =
-                expert_count;
-        }
-
-        for (std::uint32_t expert = 0;
-             expert < expert_count;
-             ++expert) {
-            const float probability =
-                logits[expert];
-
-            for (std::uint32_t slot = 0;
-                 slot < top_k;
-                 ++slot) {
-                if (!better(
-                        probability,
-                        expert,
-                        best_values[slot],
-                        best_indices[slot])) {
-                    continue;
-                }
-
-                for (std::uint32_t move =
-                         top_k - 1U;
-                     move > slot;
-                     --move) {
-                    best_values[move] =
-                        best_values[
-                            move - 1U];
-                    best_indices[move] =
-                        best_indices[
-                            move - 1U];
-                }
-                best_values[slot] =
-                    probability;
-                best_indices[slot] =
-                    expert;
-                break;
-            }
-        }
-
-        float selected_sum = 0.0F;
-        for (std::uint32_t slot = 0;
-             slot < top_k;
-             ++slot) {
-            selected_sum +=
-                best_values[slot];
-        }
-        if (!normalize_selected) {
-            selected_sum = 1.0F;
-        }
-
-        const auto output_base =
-            static_cast<std::uint64_t>(
-                row) *
-            top_k;
-        for (std::uint32_t slot = 0;
-             slot < top_k;
-             ++slot) {
-            selected_indices[
-                output_base + slot] =
-                best_indices[slot];
-            selected_weights[
-                output_base + slot] =
-                best_values[slot] /
-                selected_sum;
-        }
-    }
+    moe_core::route_softmax_insert<InsertRoutePolicy>(logits, scratch, row, lane,
+        expert_count, top_k, normalize_selected, selected_indices, selected_weights);
 }
 
 constexpr std::uint32_t kRouterExpertsPerBlock = 8;
@@ -587,151 +476,8 @@ __device__ __forceinline__ void parallel_moe_route_select_row(
         logits[expert] = workspace[static_cast<std::uint64_t>(row) * expert_count + expert];
     __syncthreads();
 
-    float local_max =
-        -INFINITY;
-    for (std::uint32_t expert = lane;
-         expert < expert_count;
-         expert += blockDim.x) {
-        local_max =
-            fmaxf(
-                local_max,
-                logits[expert]);
-    }
-    scratch[lane] = local_max;
-    __syncthreads();
-
-    for (std::uint32_t stride =
-             blockDim.x / 2U;
-         stride > 0;
-         stride >>= 1U) {
-        if (lane < stride) {
-            scratch[lane] =
-                fmaxf(
-                    scratch[lane],
-                    scratch[
-                        lane + stride]);
-        }
-        __syncthreads();
-    }
-    const float maximum =
-        scratch[0];
-    // Every wave must retain the maximum before lane zero reuses scratch[0]
-    // for its contribution to the denominator reduction.
-    __syncthreads();
-
-    float local_sum = 0.0F;
-    for (std::uint32_t expert = lane;
-         expert < expert_count;
-         expert += blockDim.x) {
-        const float probability =
-            expf(
-                logits[expert] -
-                maximum);
-        logits[expert] =
-            probability;
-        local_sum += probability;
-    }
-    scratch[lane] = local_sum;
-    __syncthreads();
-
-    for (std::uint32_t stride =
-             blockDim.x / 2U;
-         stride > 0;
-         stride >>= 1U) {
-        if (lane < stride) {
-            scratch[lane] +=
-                scratch[lane + stride];
-        }
-        __syncthreads();
-    }
-    const float denominator =
-        scratch[0];
-
-    for (std::uint32_t expert = lane;
-         expert < expert_count;
-         expert += blockDim.x) {
-        logits[expert] /=
-            denominator;
-    }
-    __syncthreads();
-
-    if (lane == 0) {
-        float best_values[kMaxTopK];
-        std::uint32_t best_indices[
-            kMaxTopK];
-
-        for (std::uint32_t slot = 0;
-             slot < top_k;
-             ++slot) {
-            best_values[slot] =
-                -INFINITY;
-            best_indices[slot] =
-                expert_count;
-        }
-
-        for (std::uint32_t expert = 0;
-             expert < expert_count;
-             ++expert) {
-            const float probability =
-                logits[expert];
-
-            for (std::uint32_t slot = 0;
-                 slot < top_k;
-                 ++slot) {
-                if (!better(
-                        probability,
-                        expert,
-                        best_values[slot],
-                        best_indices[slot])) {
-                    continue;
-                }
-
-                for (std::uint32_t move =
-                         top_k - 1U;
-                     move > slot;
-                     --move) {
-                    best_values[move] =
-                        best_values[
-                            move - 1U];
-                    best_indices[move] =
-                        best_indices[
-                            move - 1U];
-                }
-                best_values[slot] =
-                    probability;
-                best_indices[slot] =
-                    expert;
-                break;
-            }
-        }
-
-        float selected_sum = 0.0F;
-        for (std::uint32_t slot = 0;
-             slot < top_k;
-             ++slot) {
-            selected_sum +=
-                best_values[slot];
-        }
-        if (!normalize_selected) {
-            selected_sum = 1.0F;
-        }
-
-        const auto output_base =
-            static_cast<std::uint64_t>(
-                row) *
-            top_k;
-        for (std::uint32_t slot = 0;
-             slot < top_k;
-             ++slot) {
-            selected_indices[
-                output_base + slot] =
-                best_indices[slot];
-            selected_weights[
-                output_base + slot] =
-                best_values[slot] /
-                selected_sum;
-        }
-    }
+    moe_core::route_softmax_insert<InsertRoutePolicy>(logits, scratch, row, lane,
+        expert_count, top_k, normalize_selected, selected_indices, selected_weights);
 }
 
 __device__ __forceinline__ void ranked_parallel_moe_route_select_row(
@@ -957,31 +703,8 @@ __device__ __forceinline__ void wave_parallel_moe_route_select_row(
             values[i] = expert < expert_count ? logits[expert] : 0.0F;
             if (expert < expert_count && values[i] == values[i]) available |= 1U << i;
         }
-        for (std::uint32_t slot = 0; slot < top_k; ++slot) {
-            bool has = false;
-            float best = -INFINITY;
-            std::uint32_t index = expert_count;
-#pragma unroll
-            for (std::uint32_t i = 0; i < kWaveCandidates; ++i) {
-                if ((available & (1U << i)) != 0) {
-                    const auto expert = lane + kRouterWave * i;
-                    if (!has || better(values[i], expert, best, index)) {
-                        has = true; best = values[i]; index = expert;
-                    }
-                }
-            }
-#pragma unroll
-            for (std::uint32_t mask = kRouterWave / 2U; mask > 0; mask >>= 1U) {
-                const float other = strix::qwen_dpp::xor32(best, static_cast<int>(mask));
-                const auto other_index = strix::qwen_dpp::xor32(index, static_cast<int>(mask));
-                const int other_has = strix::qwen_dpp::xor32(static_cast<int>(has), static_cast<int>(mask));
-                if (other_has != 0 && (!has || better(other, other_index, best, index))) {
-                    has = true; best = other; index = other_index;
-                }
-            }
-            if (lane == 0) { best_values[slot] = has ? best : -INFINITY; best_indices[slot] = has ? index : expert_count; }
-            if (has && index % kRouterWave == lane) available &= ~(1U << (index / kRouterWave));
-        }
+        moe_core::route_wave_topk(values, available, expert_count, top_k, lane,
+            BlockWaveRoutePolicy{{}, lane, expert_count, best_values, best_indices});
     }
     // All eight waves participate; no early return may bypass this barrier.
     __syncthreads();
@@ -1102,31 +825,8 @@ __device__ __forceinline__ void wave_route_select_row(const float* workspace, st
     }
     float mine = -INFINITY;
     std::uint32_t mine_index = expert_count;
-    for (std::uint32_t slot = 0; slot < top_k; ++slot) {
-        bool has = false;
-        float best = -INFINITY;
-        std::uint32_t index = expert_count;
-#pragma unroll
-        for (std::uint32_t i = 0; i < kWaveCandidates; ++i) {
-            if ((available & (1U << i)) != 0) {
-                const auto expert = lane + kRouterWave * i;
-                if (!has || better(values[i], expert, best, index)) {
-                    has = true; best = values[i]; index = expert;
-                }
-            }
-        }
-#pragma unroll
-        for (std::uint32_t mask = kRouterWave / 2U; mask > 0; mask >>= 1U) {
-            const float other = strix::qwen_dpp::xor32(best, static_cast<int>(mask));
-            const auto other_index = strix::qwen_dpp::xor32(index, static_cast<int>(mask));
-            const int other_has = strix::qwen_dpp::xor32(static_cast<int>(has), static_cast<int>(mask));
-            if (other_has != 0 && (!has || better(other, other_index, best, index))) {
-                has = true; best = other; index = other_index;
-            }
-        }
-        if (lane == slot) { mine = has ? best : -INFINITY; mine_index = has ? index : expert_count; }
-        if (has && index % kRouterWave == lane) available &= ~(1U << (index / kRouterWave));
-    }
+    moe_core::route_wave_topk(values, available, expert_count, top_k, lane,
+        LaneWaveRoutePolicy{{}, lane, expert_count, mine, mine_index});
     float selected_sum = 0.0F;
     for (std::uint32_t slot = 0; slot < top_k; ++slot) selected_sum += __shfl(mine, static_cast<int>(slot), kRouterWave);
     if (!normalize_selected) selected_sum = 1.0F;

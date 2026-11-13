@@ -48,17 +48,20 @@ template <unsigned Rows> __device__ __forceinline__ QsaRowsScoreViews<Rows> qsa2
     }
     return v;
 }
-template <unsigned Rows> __device__ __forceinline__ QsaRowsAttentionViews<Rows> qsa2_attention_views(
+// The rows of one session, read in place from the kernel arguments. A local copy of the views indexed by the
+// row of the wave lands in scratch memory (304 bytes per thread in the score kernels); these pointers do not.
+template <unsigned Rows> struct Qsa2AttentionRows {
+    const float* const* q_gate;
+    const std::uint32_t* const* selected;
+    float* const* scores;
+    float* const* output;
+    const std::uint32_t* count;
+    bool compact_output;
+};
+template <unsigned Rows> __device__ __forceinline__ Qsa2AttentionRows<Rows> qsa2_attention_views(
     const Qsa2AttentionArgs& args, const Qsa2AttentionSession& s) {
-    QsaRowsAttentionViews<Rows> v{};
-    v.compact_output = s.compact;
-#pragma unroll
-    for (unsigned r = 0; r < Rows; ++r) {
-        const auto i = s.first + r;
-        v.q_gate[r] = args.views.q_gate[i]; v.selected[r] = args.views.selected[i];
-        v.scores[r] = args.views.scores[i]; v.output[r] = args.views.output[i]; v.count[r] = args.views.count[i];
-    }
-    return v;
+    return {args.views.q_gate + s.first, args.views.selected + s.first, args.views.scores + s.first,
+        args.views.output + s.first, args.views.count + s.first, s.compact};
 }
 template <class Body> __device__ __forceinline__ void qsa2_dispatch(unsigned rows, Body body) {
     if (rows == 2U) body(std::integral_constant<unsigned, 2U>{});
@@ -214,7 +217,7 @@ __device__ __forceinline__ void qsa2_block_pool_body(const std::uint16_t* raw_ke
 
 // Exact body of attention_score_rows_wave_kernel; only blockIdx is virtualized.
 template <unsigned Rows, unsigned PerWave = 1U, bool Int8 = false>
-__device__ __forceinline__ void qsa2_attention_wave_body(QsaRowsAttentionViews<Rows> views,
+__device__ __forceinline__ void qsa2_attention_wave_body(Qsa2AttentionRows<Rows> views,
     const std::uint16_t* kv_state, std::uint32_t maximum_selected, std::uint32_t attention_heads, std::uint32_t kv_heads,
     std::uint32_t head_dim, std::uint32_t slots, uint3 cohort_block) {
 #pragma clang fp contract(off)
@@ -264,7 +267,7 @@ __device__ __forceinline__ void qsa2_attention_wave_body(QsaRowsAttentionViews<R
 
 // Exact body of attention_score_rows_group_kernel; only blockIdx is virtualized.
 template <unsigned Rows, unsigned G, unsigned Slots, bool Scatter, bool Int8 = false>
-__device__ __forceinline__ void qsa2_attention_group_body(QsaRowsAttentionViews<Rows> views,
+__device__ __forceinline__ void qsa2_attention_group_body(Qsa2AttentionRows<Rows> views,
     const std::uint16_t* kv_state, std::uint32_t maximum_selected, std::uint32_t attention_heads, std::uint32_t kv_heads,
     std::uint32_t head_dim, std::uint32_t slots, uint3 cohort_block) {
 #pragma clang fp contract(off)
@@ -328,7 +331,7 @@ __device__ __forceinline__ void qsa2_attention_group_body(QsaRowsAttentionViews<
 
 // Exact body of attention_score_rows_group256_kernel; only blockIdx is virtualized.
 template <unsigned Rows, unsigned G, unsigned Slots, bool Int8 = false>
-__device__ __forceinline__ void qsa2_attention_group256_body(QsaRowsAttentionViews<Rows> views,
+__device__ __forceinline__ void qsa2_attention_group256_body(Qsa2AttentionRows<Rows> views,
     const std::uint16_t* kv_state, std::uint32_t maximum_selected, std::uint32_t attention_heads, std::uint32_t kv_heads,
     std::uint32_t head_dim, std::uint32_t slots, uint3 cohort_block) {
 #pragma clang fp contract(off)
@@ -454,9 +457,9 @@ __global__ __launch_bounds__(256) void qsa2_index_pooled_kernel(Qsa2IndexArgs ar
     if (!s.pooled || blockIdx.x >= s.grid) return;
     qsa2_dispatch(s.rows, [&](auto width) {
         constexpr auto Rows = decltype(width)::value, R = Wanted < Rows ? Wanted : Rows;
-        const auto views = qsa2_score_views<Rows>(s);
-        if (!s.keys && s.packed) block_score_pooled_rows_body<Rows, R, std::uint16_t, false>(views, s.packed, s.blocks, dim, nullptr);
-        else block_score_pooled_rows_body<Rows, R, float, false>(views, s.keys, s.blocks, dim, nullptr);
+        // The session's views are read in place (entries 0..Rows-1 of its 8-entry table).
+        if (!s.keys && s.packed) block_score_pooled_rows_body<Rows, R, std::uint16_t, false, QsaRowsScoreViews<8U>>(s.score, s.packed, s.blocks, dim, nullptr);
+        else block_score_pooled_rows_body<Rows, R, float, false, QsaRowsScoreViews<8U>>(s.score, s.keys, s.blocks, dim, nullptr);
     });
 }
 __global__ __launch_bounds__(kSelectThreads) void qsa2_select_kernel(Qsa2SelectArgs args) {

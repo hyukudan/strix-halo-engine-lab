@@ -13,10 +13,12 @@ struct IntegerPlan {
 };
 // Partial: a partial last chunk loads only its blocks. Without it every chunk loads
 // whole rows, so the launcher must keep the width a multiple of 32 groups.
-template<unsigned Waves = 8, bool Partial = true> struct GroupedIntegerPlan : IntegerPlan {
+// SplitStage: the two activation items of a thread are loaded into separately zeroed registers (all four loads in flight
+// before the LDS stores); without it item 0 is awaited first. A schedule choice per instantiation, the same values.
+template<unsigned Waves = 8, bool Partial = true, bool SplitStage = false> struct GroupedIntegerPlan : IntegerPlan {
     static constexpr IntegerStructure structure = IntegerStructure::grouped_chunk;
     static constexpr unsigned waves_per_eu = Waves;
-    static constexpr bool weight_lds = true, partial_blocks = Partial;
+    static constexpr bool weight_lds = true, partial_blocks = Partial, split_stage_registers = SplitStage;
     static constexpr bool float_half_sums = true, lds_only_barriers = true;
     static constexpr bool half_exchange = true, opaque_magic = true;
 };

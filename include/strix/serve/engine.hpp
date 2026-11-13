@@ -77,6 +77,12 @@ struct ConstraintVerdict {
     // (transforms, argmax, scores) and, on MTP windows, the whole row (readback + mask + select).
     std::uint64_t profile_rows = 0, profile_window_rows = 0, profile_known_rows = 0;
     double profile_mask_ms = 0, profile_select_ms = 0, profile_window_row_ms = 0;
+    // Mask-ahead: rows whose mask came from the host worker (mask_ms then holds only the wait), and every
+    // mask the worker walked with its own time (off the selection thread; includes masks no row needed).
+    std::uint64_t profile_ahead_rows = 0, profile_ahead_masks = 0;
+    // Rows decided by ranked membership (maximum refused, a next-best logit admitted): no mask walk.
+    std::uint64_t profile_ranked_rows = 0;
+    double profile_ahead_ms = 0;
 };
 
 // Armed instrumentation: one process-wide word, unarmed until a GET /metrics or GET /api/status?detail=1 arms it
@@ -151,6 +157,15 @@ private:
     std::vector<Delta> deltas_;
 };
 
+// The rest of a prompt that is still being tokenized (GenerationJob::prompt_tail). `prompt` must hold exactly the
+// first prompt.size() ids; take() appends every further id that is final and returns true once the prompt is complete.
+// wait: block until at least one more id is final or the prompt is complete. Ids never change once appended.
+class PromptTail {
+public:
+    virtual ~PromptTail() = default;
+    virtual bool take(std::vector<std::uint32_t>& prompt, bool wait) = 0;
+};
+
 struct GenerationJob {
     std::function<void()> on_admitted; // optional: session preflight passed, before execution
     std::function<void(GenerationProgress)> on_progress; // optional, host-only completed prefill units
@@ -158,6 +173,11 @@ struct GenerationJob {
     CacheRetention cache_retention = CacheRetention::server_policy;
     std::string session_id;
     std::vector<std::uint32_t> prompt;
+    // Optional early admission: the prompt is still being tokenized. `prompt` holds the ids final so far (the first
+    // chunk at least) and the session runtime appends the rest from here; it runs prefill only on ids it holds and
+    // never treats the prompt as complete before the stream is. Queue selection sees the current size. Null: the
+    // prompt is complete (every existing caller).
+    std::shared_ptr<PromptTail> prompt_tail;
     // chat requests: the prompt's first tokens that render the system prompt and the tools (a prefix every turn of the
     // conversation, and often other conversations, repeat: a prefix cache may snapshot there); 0: none known
     std::uint32_t stable_prefix = 0;

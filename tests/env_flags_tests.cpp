@@ -100,6 +100,17 @@ int main() {
     check(strix::envcfg::integer(key, 7) == 0);
     if (put("12") != 0) return 2;
     check(strix::envcfg::integer(key, 7) == 12);
+    // Strict recorded number: the value, its range and the registry entry; a bad value throws and records nothing new.
+    check(strix::envcfg::number<unsigned>(key, 3U, 0U, 64U) == 12U);
+    check(rejects([&] { return strix::envcfg::number<unsigned>(key, 3U, 0U, 8U); }));
+    if (put("12x") != 0) return 2;
+    check(rejects([&] { return strix::envcfg::number<unsigned>(key, 3U, 0U, 64U); }));
+    {
+        bool found = false;
+        for (const auto& entry : strix::envcfg::registered()) if (entry.name == key) found = entry.value == "12" && entry.set;
+        check(found);
+    }
+    if (put("12") != 0) return 2;
     check(strix::envcfg::flag(key, false) == true);  // first-character '1'
     check(std::string(strix::envcfg::text(key)) == "12");
     {

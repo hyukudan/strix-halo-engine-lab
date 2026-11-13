@@ -1555,6 +1555,127 @@ struct Bench {
         }
         if (ex_d != nullptr) hip_ok(hipFree(ex_d), "free");
     }
+    // Group-wide call (enqueue_prefill_moe_group) == one enqueue_prefill_moe_device call per chunk, bitwise.
+    struct GroupFix {
+        unsigned T = 0, S = 0, seg = 0;
+        Prefill q{};
+        opt::ExpertSlices* ex_d = nullptr;
+        std::uint32_t* routes_d[opt::kPrefillMoeSegments] = {};
+        float *out_ref = nullptr, *out_grp = nullptr;
+        void *ws_chunk = nullptr, *ws_group = nullptr;
+        std::size_t chunk_bytes = 0, group_bytes = 0;
+        unsigned rows(unsigned c) const { return std::min(seg, T - c * seg); }
+    };
+    GroupFix make_group(unsigned seg, unsigned S, unsigned last, bool real_routes) {
+        GroupFix f;
+        f.seg = seg;
+        f.S = S;
+        f.T = (S - 1U) * seg + last;
+        f.q = make_prefill(f.T);
+        if (real_routes && !o.routes.empty()) {
+            if (route_file.empty()) {
+                std::ifstream in(o.routes, std::ios::binary);
+                if (!in) throw std::runtime_error("cannot open --routes " + o.routes);
+                route_file.assign(std::istreambuf_iterator<char>(in), {});
+            }
+            const std::size_t have = route_file.size() / 4;
+            std::vector<std::uint32_t> ids(std::size_t{f.T} * 4);
+            for (std::size_t i = 0; i < ids.size(); ++i) ids[i] = route_file[i % (have * 4)];
+            set_ids(f.q, ids);
+        }
+        f.ex_d = dalloc<opt::ExpertSlices>(opt::kExperts);
+        hip_ok(hipMemcpy(f.ex_d, f.q.ex.data(), opt::kExperts * sizeof(opt::ExpertSlices), hipMemcpyHostToDevice), "experts");
+        for (unsigned c = 0; c < S; ++c) {
+            const unsigned n = f.rows(c);
+            std::vector<std::uint32_t> routes(std::size_t{n} * 8);
+            for (unsigned t = 0; t < n; ++t)
+                for (unsigned k = 0; k < 4; ++k) {
+                    const std::size_t g = std::size_t{c} * seg + t;
+                    const unsigned src = (k + t) % 4U;  // rotated slots
+                    routes[std::size_t{t} * 4 + k] = f.q.ids[g * 4 + src];
+                    std::memcpy(&routes[std::size_t{n} * 4 + std::size_t{t} * 4 + k], &f.q.w4[g * 4 + src], 4);
+                }
+            f.routes_d[c] = dalloc<std::uint32_t>(routes.size());
+            hip_ok(hipMemcpy(f.routes_d[c], routes.data(), routes.size() * 4, hipMemcpyHostToDevice), "routes");
+        }
+        f.out_ref = dalloc<float>(std::size_t{f.T} * H);
+        f.out_grp = dalloc<float>(std::size_t{f.T} * H);
+        f.chunk_bytes = opt::prefill_moe_workspace_bound(seg);
+        f.group_bytes = opt::prefill_moe_group_workspace_bound(f.T);
+        hip_ok(hipMalloc(&f.ws_chunk, f.chunk_bytes), "chunk ws");
+        hip_ok(hipMalloc(&f.ws_group, f.group_bytes), "group ws");
+        return f;
+    }
+    void free_group(GroupFix& f) {
+        for (unsigned c = 0; c < f.S; ++c) hip_ok(hipFree(f.routes_d[c]), "free");
+        hip_ok(hipFree(f.ex_d), "free");
+        hip_ok(hipFree(f.out_ref), "free");
+        hip_ok(hipFree(f.out_grp), "free");
+        hip_ok(hipFree(f.ws_chunk), "free");
+        hip_ok(hipFree(f.ws_group), "free");
+        free_prefill(f.q);
+    }
+    void group_chunks(const GroupFix& f) {
+        for (unsigned c = 0; c < f.S; ++c) {
+            opt::PrefillMoeDeviceView dv;
+            dv.rows = f.rows(c);
+            dv.y = f.q.yy + std::size_t{c} * f.seg * H;
+            dv.routes = f.routes_d[c];
+            dv.experts = f.ex_d;
+            dv.shared = L.shared;
+            dv.out = f.out_ref + std::size_t{c} * f.seg * H;
+            opt::enqueue_prefill_moe_device(dv, f.ws_chunk, f.chunk_bytes, nullptr);
+        }
+    }
+    void group_call(const GroupFix& f) {
+        opt::PrefillMoeGroupView gv;
+        gv.rows = f.T;
+        gv.segments = f.S;
+        gv.seg_rows = f.seg;
+        for (unsigned c = 0; c < f.S; ++c) {
+            gv.y[c] = f.q.yy + std::size_t{c} * f.seg * H;
+            gv.routes[c] = f.routes_d[c];
+            gv.out[c] = f.out_grp + std::size_t{c} * f.seg * H;
+        }
+        gv.experts = f.ex_d;
+        gv.shared = L.shared;
+        opt::enqueue_prefill_moe_group(gv, f.ws_group, f.group_bytes, nullptr);
+    }
+    void test_prefill_group() {
+        struct Case { unsigned seg, S, last; bool real; };
+        const Case cases[] = {{512, 8, 300, false}, {1024, 4, 1024, false}, {1024, 3, 97, false}, {256, 2, 113, false},
+                              {4096, 2, 4096, true}, {2048, 4, 1500, true}, {4096, 1, 4096, true}};
+        for (const Case& k : cases) {
+            GroupFix f = make_group(k.seg, k.S, k.last, k.real);
+            group_chunks(f);
+            hip_ok(hipMemsetAsync(f.out_grp, 0xff, std::size_t{f.T} * H * 4, nullptr), "poison");
+            group_call(f);
+            hip_ok(hipDeviceSynchronize(), "group");
+            opt::prefill_moe_device_check();
+            std::size_t at = 0;
+            const auto a = d2h(f.out_ref, std::size_t{f.T} * H), b = d2h(f.out_grp, std::size_t{f.T} * H);
+            const bool same = same_bits(a, b, &at);
+            check(same, "prefill group " + std::to_string(k.seg) + "x" + std::to_string(k.S) + " differs at " + std::to_string(at));
+            std::printf("prefill group test seg=%u chunks=%u last=%u %s: %s (ws %.1f MB vs chunk %.1f MB)\n", k.seg, k.S, k.last,
+                        k.real ? "routes" : "router", same ? "bitwise" : "DIFF", static_cast<double>(f.group_bytes) / 1e6,
+                        static_cast<double>(f.chunk_bytes) / 1e6);
+            std::fflush(stdout);
+            free_group(f);
+        }
+    }
+    // Whole calls, interleaved: A = one device-planned call per chunk, B = the group-wide call (same bits).
+    void bench_prefill_group() {
+        for (unsigned S : {2U, 4U}) {
+            const std::string cell = "pfgd S" + std::to_string(S);
+            if (!wanted(cell)) continue;
+            GroupFix f = make_group(4096, S, 4096, true);
+            const int saved = o.iters;
+            o.iters = std::max(2, o.iters / 8);
+            aba(cell + " chunks/group", 0, [&](int) { group_chunks(f); }, [&](int) { group_call(f); });
+            o.iters = saved;
+            free_group(f);
+        }
+    }
     void bench_prefill() {
         for (unsigned T : {256U, 1024U}) {
             const std::string cell = "prefill_moe T" + std::to_string(T);
@@ -3119,6 +3240,7 @@ int main(int argc, char** argv) {
             if (!o.no_moe) test_section("test_router_rows", [&] { b.test_router_rows(); });
             if (!o.no_moe) test_section("test_prefill", [&] { b.test_prefill(); });
             if (!o.no_moe) test_section("test_prefill_device", [&] { b.test_prefill_device(); });
+            if (!o.no_moe) test_section("test_prefill_group", [&] { b.test_prefill_group(); });
             if (!o.no_moe) test_section("test_prefill_mtfit", [&] { b.test_prefill_mtfit(); });
             if (!o.no_moe) test_section("test_prefill_core8", [&] { b.test_prefill_core8(); });
             if (!o.no_moe && o.tests == "test_prefill_pipe") test_section("test_prefill_pipe", [&] { b.test_prefill_pipe(); });
@@ -3138,6 +3260,7 @@ int main(int argc, char** argv) {
             if (!o.no_moe) section("bench_prefill_gufuse", [&] { b.bench_prefill_gufuse(); });
             if (!o.no_moe) section("bench_pair_abba", [&] { b.bench_pair_abba(); });
             if (!o.no_moe) section("bench_prefill_gather", [&] { b.bench_prefill_gather(); });
+            if (!o.no_moe) section("bench_prefill_group", [&] { b.bench_prefill_group(); });
             section("bench_prefill_dense", [&] { b.bench_prefill_dense(); });
             section("bench_dense_prefill", [&] { b.bench_dense_prefill(); });
             section("bench_dense", [&] { b.bench_dense(); });

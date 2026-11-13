@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <functional>
+#include <future>
 #include <memory>
 #include <span>
 #include <stdexcept>
@@ -79,6 +80,9 @@ private:
     std::unique_ptr<Impl> impl_;
 };
 void atomic_write(const std::filesystem::path&, std::span<const std::byte>, Options = {});
+// The same publication as a background job of the process-wide host lane. Every publication and read in this file
+// draws the bytes it moves from the process-wide byte budget, which is capped while a session decodes.
+std::future<void> atomic_write_background(std::filesystem::path, std::shared_ptr<const std::vector<std::byte>>, Options = {});
 // Allocate only after the open file's length passes admission. The returned span must
 // have exactly that length. Read/growth failures never return a partially valid record.
 void read(const std::filesystem::path&, std::uint64_t minimum, std::uint64_t maximum,

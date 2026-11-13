@@ -21,7 +21,7 @@
 //   --batch PROMPT.u32:STEPS:N1,N2,...               batched decode (rows = prefixes of the prompt), checked vs alone
 //   --verify-trace NAME:PROMPT.u32:REPS:R1,R2,...    verify-shaped steps (one slot, R rows) timed by R (xfer on/off
 //                                                     ABA) + per-phase GPU trace and distinct routed experts per layer
-//   --ab FLAG:PROMPT.u32:BLOCK                       ABA x3 of a runtime flag (staging | shared | attn | linears | xfer | attnpf | index | idxdec | idxattn | idxconc | xbwait | xbinplace | xbboth | xbprep | xbpub | xbwarm | xbwarmo | moegrid | moepipe | xbilp | xbset | pfx | pfil | pfxip | pfattn4 | pfmsa | pfmsarework | mtfit | core8 | pfpipe | pfpair | pftails | pftab | pfgufuse | pfrouter | pfrouterrows | core8v2 | pfidxconc | pfkvtile | pftiled | pfidx | pftxuc | pfall | pfi4): TTFT and decode blocks
+//   --ab FLAG:PROMPT.u32:BLOCK                       ABA x3 of a runtime flag (staging | shared | attn | linears | xfer | attnpf | index | idxdec | idxattn | idxconc | xbwait | xbinplace | xbboth | xbprep | xbfold | xbpub | xbwarm | xbwarmo | moegrid | moepipe | xbilp | xbset | pfx | pfil | pfxip | pfattn4 | pfmsa | pfmsarework | mtfit | core8 | pfpipe | pfpair | pftails | pftab | pfgufuse | pfrouter | pfrouterrows | core8v2 | pfidxconc | pfkvtile | pftiled | pfidx | pftxuc | pfall | pfi4): TTFT and decode blocks
 //                                                    (pfidxconc: 0 vs STRIX_MM_AB_IDXCONC=1|2, default 2; 7 hashed prefills)
 //                                                    (pfkvtile: off vs STRIX_MM_AB_KVTILE=auto|<index>, default auto; 7 hashed prefills)
 //                                                    (pftxuc: PFX copy-to-host-coherent vs producer-to-uncached TX; 7 hashed prefills)
@@ -986,6 +986,7 @@ std::uint64_t ab_flag(mm::Engine& eng, const std::string& flag, const std::vecto
         else if (flag == "xbinplace") { eng.set_xb_inplace(on); eng.set_xb_wait(false); }
         else if (flag == "xbboth") { eng.set_xb_wait(on); eng.set_xb_inplace(on); }
         else if (flag == "xbprep") eng.set_xb_prep(on);
+        else if (flag == "xbfold") eng.set_xb_fold(on);  // needs the process STRIX_MMX_FOLD=rows (fold slots)
         else if (flag == "xbpub") eng.set_xb_publish(on);  // on top of the process XB_INPLACE (env)
         else if (flag == "xbilp") eng.set_xb_postilp(on);
         else if (flag == "xbset") {  // a whole flag set: STRIX_MM_AB_XBSET letters w i p u m l (B) vs all six off (A)
@@ -1089,7 +1090,7 @@ std::uint64_t ab_flag(mm::Engine& eng, const std::string& flag, const std::vecto
                          : flag == "idxdec" ? eng.index_decode() : flag == "idxattn" ? eng.index_attn()
                          : flag == "idxconc" ? eng.index_concurrent()
                          : flag == "xbwait" ? eng.xb_wait() : flag == "xbinplace" ? eng.xb_inplace()
-                         : flag == "xbboth" ? eng.xb_wait() : flag == "xbprep" ? eng.xb_prep() : flag == "xbpub" ? eng.xb_publish() : flag == "xbwarm" ? eng.xb_warm() != 0 : flag == "xbwarmo" ? eng.xb_warm_o() != 0 : flag == "moegrid" ? true : flag == "moepipe" ? false : flag == "xbilp" ? eng.xb_postilp() : flag == "xbset" ? eng.xb_wait()
+                         : flag == "xbboth" ? eng.xb_wait() : flag == "xbprep" ? eng.xb_prep() : flag == "xbfold" ? eng.xb_fold() : flag == "xbpub" ? eng.xb_publish() : flag == "xbwarm" ? eng.xb_warm() != 0 : flag == "xbwarmo" ? eng.xb_warm_o() != 0 : flag == "moegrid" ? true : flag == "moepipe" ? false : flag == "xbilp" ? eng.xb_postilp() : flag == "xbset" ? eng.xb_wait()
                          : flag == "pfx" ? eng.prefill_xchg() : flag == "pfil" ? eng.prefill_interleave()
                          : flag == "pfidx" ? eng.prefill_index_tile()
                          : flag == "pftxuc" ? eng.prefill_tx_uncached()
@@ -1102,7 +1103,7 @@ std::uint64_t ab_flag(mm::Engine& eng, const std::string& flag, const std::vecto
     const bool pfx0 = eng.prefill_xchg(), pfxip0 = eng.prefill_inplace();
     const bool msa0 = eng.prefill_msa_batch(), att0 = eng.prefill_attend4(), rtr0 = eng.prefill_router_batch();  // pfall restores these
     const unsigned router_rows0 = eng.prefill_router_rows();  // pfrouterrows restores it
-    const bool xb = flag == "xbwait" || flag == "xbinplace" || flag == "xbboth" || flag == "xbprep" || flag == "xbpub" || flag == "xbwarm" || flag == "xbwarmo" || flag == "moegrid" || flag == "moepipe" || flag == "xbilp" || flag == "xbset";
+    const bool xb = flag == "xbwait" || flag == "xbinplace" || flag == "xbboth" || flag == "xbprep" || flag == "xbfold" || flag == "xbpub" || flag == "xbwarm" || flag == "xbwarmo" || flag == "moegrid" || flag == "moepipe" || flag == "xbilp" || flag == "xbset";
     const bool xb_w0 = eng.xb_wait(), xb_i0 = eng.xb_inplace(), xb_p0 = eng.xb_prep(), xb_u0 = eng.xb_publish();
     const unsigned xb_m0 = eng.xb_warm(), xb_o0 = eng.xb_warm_o();
     const auto xb_oc0 = eng.xb_warm_o_count();
@@ -1117,7 +1118,7 @@ std::uint64_t ab_flag(mm::Engine& eng, const std::string& flag, const std::vecto
     std::vector<std::uint64_t> states, outs;  // per arm: K/V/IK state FNV, final-rows FNV (this rank only; never in the cross-rank hash)
     const bool hash_state = ((flag == "pfattn4" || flag == "pfmsa" || flag == "pfmsarework" || flag == "mtfit" || flag == "core8" || flag == "pftab" || flag == "pfgufuse" || flag == "pftails" || flag == "pfpair" || flag == "pfidx" || flag == "pftxuc" || flag == "pfpipe" || flag == "pfrouter" || flag == "pfrouterrows" || flag == "core8v2" || flag == "pfidxconc" || flag == "pfkvtile" || flag == "pftiled" || flag == "pfall")) || (state_fnv_on() && (flag == "pfx" || flag == "pfil" || flag == "pfxip" || std::getenv("STRIX_MM_AB_STATE") != nullptr));
     // pfattn4 / pfmsa / pfmsarework / mtfit / core8 / pftab / pfgufuse / pfidx / pftxuc / pfrouter / pfidxconc / pfkvtile / pftiled: A B A B A B A (every B bracketed by two A prefills); the other prefill flags: A B A B A B
-    const int prefills = flag == "attn" || flag == "linears" || flag == "xfer" || flag == "idxdec" || flag == "idxconc" || flag == "xbwait" || flag == "xbinplace" || flag == "xbboth" || flag == "xbprep" || flag == "xbpub" || flag == "xbwarm" || flag == "xbwarmo" || flag == "moegrid" || flag == "moepipe" || flag == "xbilp" || flag == "xbset" ? 1 : (flag == "pfattn4" || flag == "pfmsa" || flag == "pfmsarework" || flag == "mtfit" || flag == "core8" || flag == "pftab" || flag == "pfgufuse" || flag == "pftails" || flag == "pfpair" || flag == "pfidx" || flag == "pftxuc" || flag == "pfpipe" || flag == "pfrouter" || flag == "pfrouterrows" || flag == "core8v2" || flag == "pfidxconc" || flag == "pfkvtile" || flag == "pftiled" || flag == "pfall" || flag == "pfi4") ? 7 : 6;  // idxattn: both  // decode-only flags: one prefill, no TTFT cells
+    const int prefills = flag == "attn" || flag == "linears" || flag == "xfer" || flag == "idxdec" || flag == "idxconc" || flag == "xbfold" || flag == "xbwait" || flag == "xbinplace" || flag == "xbboth" || flag == "xbprep" || flag == "xbpub" || flag == "xbwarm" || flag == "xbwarmo" || flag == "moegrid" || flag == "moepipe" || flag == "xbilp" || flag == "xbset" ? 1 : (flag == "pfattn4" || flag == "pfmsa" || flag == "pfmsarework" || flag == "mtfit" || flag == "core8" || flag == "pftab" || flag == "pfgufuse" || flag == "pftails" || flag == "pfpair" || flag == "pfidx" || flag == "pftxuc" || flag == "pfpipe" || flag == "pfrouter" || flag == "pfrouterrows" || flag == "core8v2" || flag == "pfidxconc" || flag == "pfkvtile" || flag == "pftiled" || flag == "pfall" || flag == "pfi4") ? 7 : 6;  // idxattn: both  // decode-only flags: one prefill, no TTFT cells
     first.resize(static_cast<std::size_t>(prefills));
     for (int r = 0; r < prefills; ++r) {
         set(r % 2 == 1);

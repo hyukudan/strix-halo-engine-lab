@@ -3,16 +3,22 @@
 // tests/hip_glm_prefill_tests.hip (prefill == decode row by row, bitwise). Build with -ffp-contract=off -fno-fast-math
 // -fno-gpu-flush-denormals-to-zero.
 #include "glm/prefill/glm_prefill.hpp"
+#include "attn_core/select.hpp"
 #include "glm/prefill/glm_pf_variants.hpp"
 #include "glm/prefill/glm_pf_workspace.hpp"
 #include "glm/prefill/glm_pf_aux.hpp"
 #include "glm/prefill/glm_pf_attn_wmma.hpp"
 #include "attn_core/sparse_flash_wmma.hpp"
+#include "attn_core/index_score_band.hpp"
 #include "attn_core/index_score_wmma.hpp"
+#include "core/fma_rows.hpp"
 
 #include <cstdlib>
 #include <cstdio>
+#include <cmath>
+#include <mutex>
 #include <stdexcept>
+#include <unordered_map>
 #include <string>
 #include <type_traits>
 #include <vector>
@@ -643,6 +649,166 @@ template <aidx::Operand O> struct IdxWmmaPolicy {
 };
 static_assert(aidx::kQueries % kIdxHeads == 0);
 
+// ---- STRIX_IDX_WMMA=exact: FP16 WMMA scores, then the pools at the selection cut-off are rescored with v3's
+// arithmetic, so the selected pools are the ones of the exact kernels (attn_core/index_score_band.hpp).
+//
+// idx_key_bound_kernel: max over the launch's pools of |k|_2^2, as a bit pattern in bound[0] (non-negative floats
+// order like their bits; a NaN sorts above +inf, so a non-finite key makes the refine kernel rescore everything).
+__global__ __launch_bounds__(256) void idx_key_bound_kernel(const float* pooled, unsigned pools, std::uint32_t* bound) {
+    const unsigned p = blockIdx.x * 256U + threadIdx.x;
+    float s2 = 0.0F;
+    if (p < pools) {
+        const auto* k = reinterpret_cast<const float4*>(pooled + static_cast<std::size_t>(p) * kIdxDim);
+#pragma unroll 8
+        for (unsigned i = 0; i < kIdxDim / 4; ++i) {
+            const float4 v = k[i];
+            s2 = __builtin_fmaf(v.x, v.x, s2);
+            s2 = __builtin_fmaf(v.y, v.y, s2);
+            s2 = __builtin_fmaf(v.z, v.z, s2);
+            s2 = __builtin_fmaf(v.w, v.w, s2);
+        }
+    }
+    unsigned u = __builtin_bit_cast(unsigned, s2);
+#pragma unroll
+    for (unsigned d = 16; d >= 1; d >>= 1U) {
+        const unsigned o = static_cast<unsigned>(__shfl_xor(static_cast<int>(u), static_cast<int>(d), 32));
+        u = o > u ? o : u;
+    }
+    if (threadIdx.x % 32U == 0) atomicMax(bound, u);
+}
+
+// idx_refine_rows_kernel, one work-group per row (blockIdx.x = row). Candidates are the retained keys of the earlier
+// pool windows (`old` of them, stored in front of the window keys, their pool ids in `ids`) and the WMMA keys of the
+// window. Three histogram passes over key bits 31..8 bracket the kIdxPools-th largest candidate key t in
+// [t_lo, t_hi]; the WMMA score error of the row is bounded by
+//   delta = kInvSqrt128 * sum_h |w_h| * f16_dot_error(|q_h|_2, max_p |k_p|_2)
+// and every candidate in [t_lo - 2 delta, t_hi + 2 delta] is rewritten with the dot and head chains of v3 (same keys
+// as idx_score_rows_v3_kernel): a superset of the band of index_score_band.hpp, so the selection that follows is the
+// exact one, in every window (a retained candidate keeps a value within delta of its exact score).
+// ids == nullptr: the pools of the earlier windows are not addressable any more (pool windows staged per call). Then
+// a row that sees a later window rescores every window pool at or above t_lo - 2 delta, so the keys it retains are
+// exact values, and retained candidates are left alone.
+// A row whose bound is not finite (operand outside the FP16 range, non-finite input) rescores all of its pools.
+// stats (diagnostic, may be null): [0] += rescored candidates, [1] += scored pools.
+constexpr unsigned kIrThreads = 256, kIrPer = (kIndexerKeyStride + kIrThreads - 1) / kIrThreads, kIrHeadLanes = kIrThreads / kIdxHeads;
+static_assert(kIrHeadLanes == 8 && kIdxDim % kIrHeadLanes == 0 && kIndexerKeyStride <= 65536U);
+__device__ __forceinline__ float idx_key_value(std::uint32_t key) {  // inverse of ordered_key
+    return __builtin_bit_cast(float, (key & 0x80000000U) != 0 ? (key & 0x7fffffffU) : ~key);
+}
+__global__ __launch_bounds__(kIrThreads) void idx_refine_rows_kernel(const float* pooled, unsigned t0, const float* qI, const float* wh,
+                                                                    std::uint32_t* keys_all, unsigned cap, unsigned old,
+                                                                    const std::uint32_t* ids_all, unsigned pool_begin, unsigned pool_end,
+                                                                    unsigned pool_base, const std::uint32_t* bound, std::uint32_t* stats) {
+    __shared__ unsigned hist[256];
+    __shared__ float slots_f[kIrThreads / 32];
+    __shared__ std::uint16_t list[kIndexerKeyStride];
+    __shared__ unsigned sh_n, sh_prefix, sh_rem;
+    const unsigned l = threadIdx.x, row = blockIdx.x;
+    const unsigned P = (t0 + row + 1) / kKpool;
+    if (P <= kIdxPools || P <= pool_begin) return;  // uniform: nothing scored for this row in this window
+    const unsigned added = (P < pool_end ? P : pool_end) - pool_begin, count = old + added;
+    if (count <= kIdxPools) return;                 // uniform: every candidate is selected
+    std::uint32_t* win = keys_all + static_cast<std::size_t>(row) * cap;
+    unsigned kv[kIrPer];
+#pragma unroll
+    for (unsigned j = 0; j < kIrPer; ++j) {
+        const unsigned c = l + j * kIrThreads;
+        kv[j] = c < count ? (c < old ? *(win - old + c) : win[c - old]) : 0U;
+    }
+    if (l == 0) {
+        sh_n = 0;
+        sh_prefix = 0;
+        sh_rem = kIdxPools;
+    }
+    // [t_lo, t_hi]: the 24 leading bits of the kIdxPools-th largest key, one byte per pass.
+#pragma unroll 1
+    for (unsigned shift = 24; shift >= 8; shift -= 8) {
+        hist[l] = 0;
+        __syncthreads();
+        const unsigned prefix = sh_prefix;
+#pragma unroll
+        for (unsigned j = 0; j < kIrPer; ++j)
+            if (l + j * kIrThreads < count && (shift == 24 || (kv[j] >> (shift + 8U)) == prefix))
+                atomicAdd(&hist[(kv[j] >> shift) & 255U], 1U);
+        __syncthreads();
+        if (l == 0) {
+            unsigned rem = sh_rem, d = 255;
+            for (; d > 0 && hist[d] < rem; --d) rem -= hist[d];
+            sh_rem = rem;
+            sh_prefix = (prefix << 8U) | d;
+        }
+        __syncthreads();
+    }
+    const unsigned top24 = sh_prefix;
+    // delta: kIrHeadLanes lanes per index head share its 128 query elements.
+    const unsigned head = l / kIrHeadLanes;
+    float q2 = 0.0F;
+#pragma unroll
+    for (unsigned j = 0; j < kIdxDim / kIrHeadLanes; ++j) {
+        const float x = qI[(static_cast<std::size_t>(row) * kIdxHeads + head) * kIdxDim + l % kIrHeadLanes + kIrHeadLanes * j];
+        q2 = __builtin_fmaf(x, x, q2);
+    }
+#pragma unroll
+    for (unsigned d = kIrHeadLanes / 2; d >= 1; d >>= 1U) q2 += __shfl_xor(q2, static_cast<int>(d), 32);
+    const float k2 = __builtin_bit_cast(float, bound[0]);
+    constexpr float kSafe2 = aidx::kF16Safe * aidx::kF16Safe;
+    float term = __builtin_fabsf(wh[static_cast<std::size_t>(row) * kIdxHeads + head]) *
+                 aidx::f16_dot_error(__builtin_sqrtf(q2), __builtin_sqrtf(k2));
+    if (!(q2 < kSafe2) || !(k2 < kSafe2)) term = __builtin_inff();
+    const float delta = aidx::group_reduce(l % kIrHeadLanes == 0 ? term : 0.0F, slots_f, [](float x, float y) { return x + y; }) *
+                        (kInvSqrt128 * 1.01F);
+    const bool all = !(delta < __builtin_inff()), band = P <= pool_end || ids_all != nullptr;
+    const float lo = idx_key_value(top24 << 8U) - 2.0F * delta, hi = idx_key_value((top24 << 8U) | 255U) + 2.0F * delta;
+    const std::uint32_t* ids = ids_all + static_cast<std::size_t>(row) * kMaxTokens;
+#pragma unroll
+    for (unsigned j = 0; j < kIrPer; ++j) {
+        const unsigned c = l + j * kIrThreads;
+        const float a = idx_key_value(kv[j]);
+        // negated comparisons: a bound that is not a number rescores the candidate
+        if (c < count && (c >= old || ids_all != nullptr) && (all || (!(a < lo) && !(band && a > hi))))
+            list[atomicAdd(&sh_n, 1U)] = static_cast<std::uint16_t>(c);
+    }
+    __syncthreads();
+    const unsigned n = sh_n;
+    if (stats != nullptr && l == 0) {
+        atomicAdd(&stats[0], n);
+        atomicAdd(&stats[1], added);
+    }
+    const auto* qr = (ConstF*)(qI + static_cast<std::size_t>(row) * kIdxHeads * kIdxDim);  // NOLINT: address-space cast
+    const auto* wr = (ConstF*)(wh + static_cast<std::size_t>(row) * kIdxHeads);            // NOLINT: address-space cast
+    for (unsigned i = l; i < n; i += kIrThreads) {
+        const unsigned c = list[i], pool = c < old ? ids[c] : pool_begin + c - old;
+        const float* kp = pooled + static_cast<std::size_t>(pool - pool_base) * kIdxDim;
+        float acc[kIdxHeads];
+#pragma unroll
+        for (unsigned h = 0; h < kIdxHeads; ++h) acc[h] = 0.0F;
+        for (unsigned i0 = 0; i0 < kIdxDim; i0 += kIs3L) {
+            float kk[kIs3L];
+#pragma unroll
+            for (unsigned x = 0; x < kIs3L; x += 4) {
+                const float4 t4 = *reinterpret_cast<const float4*>(kp + i0 + x);
+                kk[x] = t4.x;
+                kk[x + 1] = t4.y;
+                kk[x + 2] = t4.z;
+                kk[x + 3] = t4.w;
+            }
+#pragma unroll
+            for (unsigned h = 0; h < kIdxHeads; ++h) {
+                const SVec16 q = *reinterpret_cast<ConstV16*>(qr + static_cast<std::size_t>(h) * kIdxDim + i0);
+#pragma unroll
+                for (unsigned x = 0; x < kIs3L; ++x) acc[h] = __builtin_fmaf(q[x], kk[x], acc[h]);
+            }
+        }
+        float a2 = 0.0F;
+#pragma unroll
+        for (unsigned h = 0; h < kIdxHeads; ++h) {
+            const float sc = acc[h] * kInvSqrt128;
+            a2 = __builtin_fmaf(wr[h], sc > 0.0F ? sc : 0.0F, a2);
+        }
+        *(win - old + c) = ordered_key(a2);
+    }
+}
+
 // idx_select_kernel per row (blockIdx.x = row, t = t0 + row). P <= 512: every pool is selected, the list is 0 .. t.
 __global__ __launch_bounds__(1024) void idx_select_rows_kernel(const std::uint32_t* keys_all, unsigned cap, unsigned t0,
                                                                std::uint32_t* tokens_all, std::uint32_t* n_all) {
@@ -653,80 +819,14 @@ __global__ __launch_bounds__(1024) void idx_select_rows_kernel(const std::uint32
     const unsigned P = (t + 1) / kKpool;
     std::uint32_t* tokens = tokens_all + static_cast<std::size_t>(row) * kMaxTokens;
     if (P <= kIdxPools) {
-        for (unsigned pos = l; pos <= t; pos += 1024) tokens[pos] = pos;
-        if (l == 0) n_all[row] = t + 1;
+        strix::attn_core::select::all_tokens<1024>(l, t, tokens, n_all + row);
         return;
     }
     const std::uint32_t* keys = keys_all + static_cast<std::size_t>(row) * cap;
     const unsigned k = kIdxPools;
-    if (l == 0) {
-        sh_prefix = 0;
-        sh_mask = 0;
-        sh_remaining = k;
-        sh_carry_eq = 0;
-        sh_carry_out = 0;
-    }
-    __syncthreads();
-    for (int shift = 24; shift >= 0; shift -= 8) {
-        for (unsigned d = l; d < 256; d += 1024) hist[d] = 0;
-        __syncthreads();
-        const unsigned prefix = sh_prefix, mask = sh_mask;
-        for (unsigned p = l; p < P; p += 1024)
-            if ((keys[p] & mask) == prefix) atomicAdd(&hist[(keys[p] >> shift) & 255U], 1U);
-        __syncthreads();
-        if (l == 0) {
-            unsigned rem = sh_remaining;
-            for (int d = 255; d >= 0; --d) {
-                if (hist[d] >= rem) {
-                    sh_prefix = prefix | (static_cast<unsigned>(d) << shift);
-                    break;
-                }
-                rem -= hist[d];
-            }
-            sh_remaining = rem;
-            sh_mask = mask | (255U << shift);
-        }
-        __syncthreads();
-    }
-    const unsigned kstar = sh_prefix, take_eq = sh_remaining;
-    for (unsigned base = 0; base < P; base += 1024) {
-        const unsigned p = base + l;
-        const unsigned key = p < P ? keys[p] : 0U;
-        const unsigned eq = (p < P && key == kstar) ? 1U : 0U;
-        scan_eq[l] = eq;
-        __syncthreads();
-        for (unsigned off = 1; off < 1024; off <<= 1U) {
-            const unsigned v = l >= off ? scan_eq[l - off] : 0U;
-            __syncthreads();
-            scan_eq[l] += v;
-            __syncthreads();
-        }
-        const unsigned eq_rank = sh_carry_eq + scan_eq[l] - eq;
-        const unsigned sel = (p < P && (key > kstar || (eq && eq_rank < take_eq))) ? 1U : 0U;
-        scan_sel[l] = sel;
-        __syncthreads();
-        for (unsigned off = 1; off < 1024; off <<= 1U) {
-            const unsigned v = l >= off ? scan_sel[l - off] : 0U;
-            __syncthreads();
-            scan_sel[l] += v;
-            __syncthreads();
-        }
-        if (sel) {
-            const unsigned at = sh_carry_out + scan_sel[l] - 1;
-            for (unsigned j = 0; j < kKpool; ++j) tokens[at * kKpool + j] = p * kKpool + j;
-        }
-        __syncthreads();
-        if (l == 1023) {
-            sh_carry_eq += scan_eq[1023];
-            sh_carry_out += scan_sel[1023];
-        }
-        __syncthreads();
-    }
-    if (l == 0) {
-        unsigned n = sh_carry_out * kKpool;
-        for (unsigned pos = P * kKpool; pos <= t; ++pos) tokens[n++] = pos;
-        n_all[row] = n;
-    }
+    strix::attn_core::select::select_row<strix::attn_core::select::ChunkPolicy<kKpool, false>>(
+        keys, P, t, k, l, tokens, n_all + row,
+        strix::attn_core::select::ChunkStorage{hist, sh_prefix, sh_mask, sh_remaining, sh_carry_eq, sh_carry_out, scan_eq, scan_sel});
 }
 
 // Stable top-k of the retained prefix and the next score window.
@@ -839,28 +939,6 @@ __global__ __launch_bounds__(1024) void idx_merge_window_kernel(std::uint32_t* k
 // consecutive pools per thread, exclusive counts from a wave scan plus the per-wave totals (4 barriers per round
 // instead of 40).
 constexpr unsigned kSel2Threads = 256, kSel2Waves = kSel2Threads / 32;
-// Exclusive prefix of v over the CTA in thread order; `total` = the CTA sum. ws: kSel2Waves words of LDS.
-__device__ __forceinline__ unsigned sel2_excl_scan(unsigned v, unsigned* ws, unsigned& total) {
-    const unsigned lane = threadIdx.x % 32, w = threadIdx.x / 32;
-    unsigned x = v;
-#pragma unroll
-    for (unsigned off = 1; off < 32; off <<= 1U) {
-        const unsigned y = __shfl_up(x, off, 32);
-        if (lane >= off) x += y;
-    }
-    if (lane == 31) ws[w] = x;
-    __syncthreads();
-    unsigned before = 0, tot = 0;
-#pragma unroll
-    for (unsigned i = 0; i < kSel2Waves; ++i) {
-        const unsigned s = ws[i];
-        tot += s;
-        before += i < w ? s : 0U;
-    }
-    __syncthreads();  // ws is reused by the next scan
-    total = tot;
-    return before + x - v;
-}
 __global__ __launch_bounds__(kSel2Threads) void idx_select_rows_v2_kernel(const std::uint32_t* keys_all, unsigned cap, unsigned t0,
                                                                          std::uint32_t* tokens_all, std::uint32_t* n_all) {
     __shared__ unsigned hist[256];
@@ -870,74 +948,13 @@ __global__ __launch_bounds__(kSel2Threads) void idx_select_rows_v2_kernel(const 
     const unsigned P = (t + 1) / kKpool;
     std::uint32_t* tokens = tokens_all + static_cast<std::size_t>(row) * kMaxTokens;
     if (P <= kIdxPools) {
-        for (unsigned pos = l; pos <= t; pos += kSel2Threads) tokens[pos] = pos;
-        if (l == 0) n_all[row] = t + 1;
+        strix::attn_core::select::all_tokens<kSel2Threads>(l, t, tokens, n_all + row);
         return;
     }
     const std::uint32_t* keys = keys_all + static_cast<std::size_t>(row) * cap;
-    unsigned prefix = 0, mask = 0, rem = kIdxPools;
-    for (int shift = 24; shift >= 0; shift -= 8) {
-        hist[l] = 0;
-        __syncthreads();
-        for (unsigned p = l; p < P; p += kSel2Threads) {
-            const unsigned key = keys[p];
-            if ((key & mask) == prefix) atomicAdd(&hist[(key >> shift) & 255U], 1U);
-        }
-        __syncthreads();
-        // thread l holds digit d = 255 - l; cum = count of matching keys with digit >= d. The chosen digit is the one
-        // where cum first reaches rem (= the descending walk of the v1 kernel); rem becomes rem - (cum - h).
-        const unsigned h = hist[255 - l];
-        unsigned tot;
-        const unsigned above = sel2_excl_scan(h, ws, tot);
-        if (above < rem && above + h >= rem) {
-            sh_digit = 255 - l;
-            sh_rem = rem - above;
-        }
-        __syncthreads();
-        prefix |= sh_digit << shift;
-        mask |= 255U << shift;
-        rem = sh_rem;
-        __syncthreads();  // sh_* and hist are rewritten by the next pass
-    }
-    const unsigned kstar = prefix, take_eq = rem;
-    unsigned carry_eq = 0, carry_out = 0;
-    for (unsigned base = 0; base < P; base += 4 * kSel2Threads) {
-        unsigned key[4], eq_n = 0;
-#pragma unroll
-        for (unsigned i = 0; i < 4; ++i) {
-            const unsigned p = base + 4 * l + i;
-            key[i] = p < P ? keys[p] : 0U;
-            eq_n += (p < P && key[i] == kstar) ? 1U : 0U;
-        }
-        unsigned eq_tot;
-        unsigned eq_rank = carry_eq + sel2_excl_scan(eq_n, ws, eq_tot);
-        bool sel[4];
-        unsigned sel_n = 0;
-#pragma unroll
-        for (unsigned i = 0; i < 4; ++i) {
-            const unsigned p = base + 4 * l + i;
-            const bool eq = p < P && key[i] == kstar;
-            sel[i] = p < P && (key[i] > kstar || (eq && eq_rank < take_eq));
-            eq_rank += eq ? 1U : 0U;
-            sel_n += sel[i] ? 1U : 0U;
-        }
-        unsigned sel_tot;
-        unsigned at = carry_out + sel2_excl_scan(sel_n, ws, sel_tot);
-#pragma unroll
-        for (unsigned i = 0; i < 4; ++i)
-            if (sel[i]) {
-                const unsigned p = base + 4 * l + i;
-                for (unsigned j = 0; j < kKpool; ++j) tokens[at * kKpool + j] = p * kKpool + j;
-                ++at;
-            }
-        carry_eq += eq_tot;
-        carry_out += sel_tot;
-    }
-    if (l == 0) {
-        unsigned n = carry_out * kKpool;
-        for (unsigned pos = P * kKpool; pos <= t; ++pos) tokens[n++] = pos;
-        n_all[row] = n;
-    }
+    strix::attn_core::select::select_row<strix::attn_core::select::QuadPolicy<kKpool, kSel2Threads, kSel2Waves>>(
+        keys, P, t, kIdxPools, l, tokens, n_all + row,
+        strix::attn_core::select::QuadStorage{hist, ws, sh_digit, sh_rem});
 }
 
 // ---------------------------------------------------------------- MLA (R13), split in four row-parallel stages
@@ -2872,23 +2889,63 @@ void indexer_select_rows(const DsaSlot& slot, unsigned t0, const float* qI, floa
 
 
 namespace {
-// FAST WMMA index scores for pools [pool_begin, pool_end) (keys at p - pool_begin); STRIX_IDX_WMMA_AUDIT=1 also
-// rescores with v3 into scratch and compares each row's top-512 pool set (diagnostic, synchronous).
+// STRIX_IDX_WMMA for GLM: unset -> exact (WMMA scores + exact rescoring of the cut-off: the lists of the v3 path).
+static_assert(kIndexerWmmaUnsetMode == aidx::kModeExact);
+unsigned idx_wmma_mode() { return aidx::wmma_mode(kIndexerWmmaUnsetMode); }
+
+// Four words of device scratch per stream for the exact mode (key bound, statistics). Work on one stream is ordered,
+// so a launch's bound is read by its own refine kernel. Allocated once per stream and kept for the process.
+std::uint32_t* idx_bound_scratch(hipStream_t s) {
+    static std::mutex m;
+    static std::unordered_map<hipStream_t, std::uint32_t*> map;
+    const std::lock_guard<std::mutex> lock(m);
+    std::uint32_t*& b = map[s];
+    if (b == nullptr) ok(hipMalloc(&b, 4 * sizeof(std::uint32_t)), "glm idx bound scratch");
+    return b;
+}
+
+// WMMA index scores for pools [pool_begin, pool_end) (keys at p - pool_begin; `old` retained keys of the earlier
+// windows sit in front of each row's window keys, their pool ids in `ids`, null when those pools are not in `pooled`).
+// Mode exact: FP16 scores, then idx_refine_rows_kernel.
+// STRIX_IDX_WMMA_AUDIT=1 also rescores with v3 into scratch and compares each row's top-512 pool set (diagnostic,
+// synchronous; in mode exact only for launches that hold every pool of their rows) and prints the rescored share.
 void idx_score_wmma(unsigned mode, const float* pooled, unsigned t0, unsigned C, const float* qI, const float* wh,
-                    std::uint32_t* keys, unsigned cap, unsigned pool_begin, unsigned pool_end, unsigned pool_base, hipStream_t s) {
+                    std::uint32_t* keys, unsigned cap, unsigned old, const std::uint32_t* ids, unsigned pool_begin, unsigned pool_end,
+                    unsigned pool_base, hipStream_t s) {
     using P16 = IdxWmmaPolicy<aidx::Operand::f16>;
     using PB = IdxWmmaPolicy<aidx::Operand::bf16>;
     const IdxWmmaArgs a{pooled, qI, wh, keys, t0, C, cap, pool_begin, pool_end, pool_base};
     const unsigned tiles = (pool_end - pool_begin + aidx::kKeys - 1) / aidx::kKeys, groups = (C + PB::kRows - 1) / PB::kRows;
     if (groups > 65535U) throw std::invalid_argument("glm pf idx wmma: too many rows");
-    if (mode > aidx::kModeF16) throw std::invalid_argument("STRIX_IDX_WMMA: GLM takes bf16 or f16 (bf16x2 and exact need BF16 keys)");
-    if (mode == static_cast<unsigned>(aidx::Operand::f16)) aidx::launch<P16>(a, aidx::wmma_split(tiles), groups, s);
+    if (mode == aidx::kModeBf16x2) throw std::invalid_argument("STRIX_IDX_WMMA: GLM takes bf16, f16 or exact (bf16x2 needs BF16 keys)");
+    const bool rescore = mode == aidx::kModeExact, audit_on = aidx::audit_enabled();
+    const unsigned pools = pool_end - pool_begin;
+    if (mode == static_cast<unsigned>(aidx::Operand::f16) || rescore) aidx::launch<P16>(a, aidx::wmma_split(tiles), groups, s);
     else aidx::launch<PB>(a, aidx::wmma_split(tiles), groups, s);
     ok(hipGetLastError(), "glm pf idx wmma");
-    if (!aidx::audit_enabled()) return;
+    if (rescore) {
+        std::uint32_t* b = idx_bound_scratch(s);
+        ok(hipMemsetAsync(b, 0, 4 * sizeof(std::uint32_t), s), "glm idx bound clear");
+        idx_key_bound_kernel<<<(pools + 255) / 256, 256, 0, s>>>(pooled + static_cast<std::size_t>(pool_begin - pool_base) * kIdxDim, pools, b);
+        idx_refine_rows_kernel<<<C, kIrThreads, 0, s>>>(pooled, t0, qI, wh, keys, cap, old, ids, pool_begin, pool_end, pool_base, b,
+                                                        audit_on ? b + 2 : nullptr);
+        ok(hipGetLastError(), "glm pf idx refine");
+    }
+    if (!audit_on) return;
     static aidx::Audit audit;
     static unsigned calls = 0;
-    const unsigned pools = pool_end - pool_begin;
+    if (rescore) {
+        static double rescored = 0, scored = 0;
+        std::uint32_t st[4]{};
+        ok(hipStreamSynchronize(s), "glm idx refine sync");
+        ok(hipMemcpy(st, idx_bound_scratch(s), sizeof st, hipMemcpyDeviceToHost), "glm idx refine stats");
+        rescored += st[2];
+        scored += st[3];
+        std::fprintf(stderr, "glm idx-wmma exact: rescored %.0f of %.0f scores (%.3f %%), this launch %u of %u, key norm bound %.4g\n",
+                     rescored, scored, scored > 0 ? 100.0 * rescored / scored : 0.0, st[2], st[3],
+                     static_cast<double>(std::sqrt(__builtin_bit_cast(float, st[0]))));
+        if (pool_begin != 0 || pool_end < (t0 + C) / kKpool) return;  // a window: its own top-512 is not the selection
+    }
     const std::size_t n = std::size_t{C - 1} * cap + pools;  // the keys of the last row end at its pool count
     std::uint32_t* exact = nullptr;
     ok(hipMalloc(&exact, n * sizeof(std::uint32_t)), "glm idx audit alloc");
@@ -2941,8 +2998,9 @@ void indexer_select_rows_bounded(const DsaSlot& slot, unsigned t0, const float* 
             const float* pooled = pool_window ? pool_window(begin, pools) : slot.pooled;
             const unsigned base = pool_window ? begin : 0U;
             auto* out = keys + kIdxPools;
-            if (const unsigned wm = aidx::wmma_mode(); wm != 0)
-                idx_score_wmma(wm, pooled, t0, C, qI, wh, out, kIndexerKeyStride, begin, begin + pools, base, s);
+            if (const unsigned wm = idx_wmma_mode(); wm != 0)
+                idx_score_wmma(wm, pooled, t0, C, qI, wh, out, kIndexerKeyStride, std::min(begin, kIdxPools), pool_window ? nullptr : tokens, begin, begin + pools,
+                               base, s);
             else if (score_v == 1)
                 idx_score_rows_kernel<<<dim3((pools + 127) / 128, (C + kScoreRows - 1) / kScoreRows), 128, 0, s>>>(
                     pooled, t0, C, qI, wh, out, kIndexerKeyStride, begin, base);
@@ -2973,8 +3031,8 @@ void indexer_select_rows_versions(const DsaSlot& slot, unsigned t0, const float*
     if (Pmax > kIdxPools) {
         scale_kernel<<<(C * kIdxHeads + 255) / 256, 256, 0, s>>>(wh, C * kIdxHeads, kInvSqrt32);
         ok(hipGetLastError(), "glm pf scale");
-        if (const unsigned wm = aidx::wmma_mode(); wm != 0)
-            idx_score_wmma(wm, slot.pooled, t0, C, qI, wh, keys, kpool_cap, 0, Pmax, 0, s);
+        if (const unsigned wm = idx_wmma_mode(); wm != 0)
+            idx_score_wmma(wm, slot.pooled, t0, C, qI, wh, keys, kpool_cap, 0, tokens, 0, Pmax, 0, s);
         else if (score_v == 1)
             idx_score_rows_kernel<<<dim3((Pmax + 127) / 128, (C + kScoreRows - 1) / kScoreRows), 128, 0, s>>>(
                 slot.pooled, t0, C, qI, wh, keys, kpool_cap, 0);
@@ -2998,11 +3056,39 @@ void dense_rows(const float* x, const void* w, dev::WType wt, unsigned in, unsig
     dense_rows_versioned(x, w, wt, in, o0, n, y, rows, s, dense_rows_version());
 }
 
+// Version 4: the same chains on the shared load-pipelined core (src/core/fma_rows.hpp); the core picks the physical form
+// per shape (rows, chain length, group size). STRIX_GLM_PF_DENSE_FORM=1..7 forces one form where the shape admits it
+// (0 / unset = automatic). Shapes outside the v2 / v3 range (in > 4096) keep the version 3 route.
+static ::strix::core::fma_rows::Form dense_form() {
+    static const auto f = [] {
+        const char* e = std::getenv("STRIX_GLM_PF_DENSE_FORM");
+        if (e == nullptr || *e == 0) return ::strix::core::fma_rows::Form::Auto;
+        const std::string v(e);
+        if (v.size() != 1 || v[0] < '0' || v[0] > '7') throw std::invalid_argument("STRIX_GLM_PF_DENSE_FORM must be 0..7");
+        return static_cast<::strix::core::fma_rows::Form>(static_cast<unsigned>(v[0] - '0'));
+    }();
+    return f;
+}
+static ::strix::core::fma_rows::Weight fma_weight(dev::WType wt) {
+    return wt == dev::WType::F16 ? ::strix::core::fma_rows::Weight::F16
+         : wt == dev::WType::BF16 ? ::strix::core::fma_rows::Weight::BF16 : ::strix::core::fma_rows::Weight::F32;
+}
+
 void dense_rows_versioned(const float* x, const void* w, dev::WType wt, unsigned in, unsigned o0, unsigned n, float* y,
                           unsigned rows, hipStream_t s, unsigned version) {
-    if (version < 1 || version > 3) throw std::invalid_argument("glm pf dense_rows version must be 1, 2 or 3");
+    if (version < 1 || version > 4) throw std::invalid_argument("glm pf dense_rows version must be 1, 2, 3 or 4");
     if (rows == 0 || n == 0) return;
     if (in == 0 || in % kGK) throw std::runtime_error("glm pf dense_rows: in must be a positive multiple of 32");
+    if (version == 4) {
+        if (in <= 4096) {
+            ::strix::core::fma_rows::Group g{};
+            g.count = 1; g.w[0] = w; g.y[0] = y; g.o0[0] = o0; g.n[0] = n;
+            ::strix::core::fma_rows::launch_auto(x, fma_weight(wt), in, rows, g, s, dense_form());
+            ok(hipGetLastError(), "glm pf dense_rows v4");
+            return;
+        }
+        version = 3;
+    }
     // Version 3 only changes grouped calls (dense_rows_group): a single projection measured at parity with v2 (router,
     // KDA f_b), so single calls keep the v2 tile under version 3.
     if (version == 3) version = 2;
@@ -3045,10 +3131,25 @@ void dense_rows_group(const float* x, dev::WType wt, unsigned in, const DensePro
 
 void dense_rows_group_versioned(const float* x, dev::WType wt, unsigned in, const DenseProj* p, unsigned count, unsigned rows,
                                 hipStream_t s, unsigned version, unsigned rt, unsigned c) {
-    if (version < 1 || version > 3) throw std::invalid_argument("glm pf dense_rows version must be 1, 2 or 3");
+    if (version < 1 || version > 4) throw std::invalid_argument("glm pf dense_rows version must be 1, 2, 3 or 4");
     if (count == 0 || count > kDenseGroupMax) throw std::invalid_argument("glm pf dense_rows_group: 1..kDenseGroupMax projections");
     if ((rt != 0 && rt != 32 && rt != 64 && rt != 128) || (c != 0 && c != 32 && c != 64) || ((rt == 0) != (c == 0)))
         throw std::invalid_argument("glm pf dense_rows_group: tile rt 32/64/128 with c 32/64, or both 0 (auto)");
+    if (version == 4) {
+        if (in != 0 && in <= 4096 && in % kGK == 0 && rows != 0) {
+            ::strix::core::fma_rows::Group g{};
+            for (unsigned i = 0; i < count; ++i) {
+                if (p[i].n == 0) continue;
+                g.w[g.count] = p[i].w; g.y[g.count] = p[i].y; g.o0[g.count] = p[i].o0; g.n[g.count] = p[i].n;
+                ++g.count;
+            }
+            if (g.count == 0) return;
+            ::strix::core::fma_rows::launch_auto(x, fma_weight(wt), in, rows, g, s, dense_form());
+            ok(hipGetLastError(), "glm pf dense_rows v4");
+            return;
+        }
+        version = 3;
+    }
     if (version != 3 || in > 4096) {
         for (unsigned i = 0; i < count; ++i) dense_rows_versioned(x, p[i].w, wt, in, p[i].o0, p[i].n, p[i].y, rows, s, version);
         return;

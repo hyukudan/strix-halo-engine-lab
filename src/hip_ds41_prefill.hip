@@ -706,15 +706,43 @@ bool fast_i4() {
     const char* e = std::getenv("STRIX_DS41_FAST_I4");
     return fast_i4_mode < 0 ? (e && std::strcmp(e, "1") == 0) : fast_i4_mode != 0;
 }
-// STRIX_DS41_PF_CORE=1 (default off) or set_pf_core(1 / 0; -1 = the environment): routed and shared expert prefill and the
-// dense Q8_0 x A8 prefill on the shared tiled core. Same bits as the default kernels; slower today, so opt-in. FAST_I4
-// runs only on the shared core and implies it for the expert products.
-int pf_core_mode = -1;
-void set_pf_core(int mode) { pf_core_mode = mode; }
-bool pf_core() {
-    static const bool env = [] { const char* e = std::getenv("STRIX_DS41_PF_CORE"); return e != nullptr && std::strcmp(e, "1") == 0; }();
-    return pf_core_mode < 0 ? env : pf_core_mode != 0;
+// STRIX_DS41_PF_CORE (resolved once per run, at the first product) or set_pf_core (harness override, may change between
+// calls): which prefill products run on the shared tiled core (src/core) instead of the kernels of this file. 0 = none,
+// moe = the routed and shared expert gate/up and down, dense = the dense Q8_0 x A8 products, 1 = both; a named product
+// takes every format the core has (and rejects a width it cannot take). Unset: per form, the shared core where it is
+// measured at least as fast as the kernel here (pf_core_for's argument at the call sites), the kernels of this file for
+// everything else. Any other value, the empty one included, is rejected: a typo must not select a route silently. The
+// same bits either way. FAST_I4 runs only on the shared core and implies it for the expert products.
+enum : int { pf_core_auto = -1, pf_core_none = 0, pf_core_all = 1, pf_core_moe = 2, pf_core_dense_only = 3 };
+int pf_core_policy_of(const char* raw) {
+    static constexpr const char* names[] = {"0", "1", "moe", "dense"};
+    for (int i = 0; i < 4; ++i)
+        if (std::strcmp(raw, names[i]) == 0) return i;
+    throw std::invalid_argument(std::string("STRIX_DS41_PF_CORE: expected 0, 1, moe or dense, got '") + raw + "'");
 }
+int pf_core_env() {
+    static const int policy = [] {
+        const char* raw = strix::envcfg::text("STRIX_DS41_PF_CORE");
+        return raw ? pf_core_policy_of(raw) : int(pf_core_auto);
+    }();
+    return policy;
+}
+constexpr int pf_core_unset = -2;
+int pf_core_override = pf_core_unset;
+void set_pf_core(int mode) { pf_core_override = mode < 0 ? pf_core_unset : mode != 0 ? int(pf_core_all) : int(pf_core_none); }
+void set_pf_core(const char* policy) { pf_core_override = policy ? pf_core_policy_of(policy) : int(pf_core_auto); }
+// 1 = named on, 0 = named off, -1 = not named (decided per form)
+int pf_core_request(bool dense) {
+    const int p = pf_core_override != pf_core_unset ? pf_core_override : pf_core_env();
+    if (p == pf_core_auto) return -1;
+    return p == pf_core_all || p == (dense ? pf_core_dense_only : pf_core_moe) ? 1 : 0;
+}
+bool pf_core_for(bool faster_form) {
+    const int r = pf_core_request(false);
+    return r > 0 || (r < 0 && faster_form);
+}
+bool pf_core() { return pf_core_request(false) > 0; }
+bool pf_core_dense() { return pf_core_request(true) > 0; }
 void enqueue_prefill_gate_up(WeightFormat format, const PrefillGateUpView& view, void* stream) {
     require_routes(view.routes);
     const auto elements = block_elements(format);
@@ -725,7 +753,13 @@ void enqueue_prefill_gate_up(WeightFormat format, const PrefillGateUpView& view,
         reinterpret_cast<std::uintptr_t>(view.codes) % 16U != 0U)
         throw std::invalid_argument("ds41 prefill gate/up view is inconsistent");
     const auto queue = static_cast<hipStream_t>(stream);
-    if (pf_core() || fast_i4()) {
+    // Rank fixture at 2048 and 4096 rows in 16-row batches, shared core against the kernels below (same bits): Q8_0 (the
+    // shared expert) -0.6..-2.2 % -> default; IQ2_XXS +0.3 % at 4096 rows (five cells, -0.0..+0.4 %; one kernel in two
+    // arms differs by up to 0.2 % there and 0.9 % at 2048 rows) -> stays on the kernels below until it is equal.
+    // STRIX_DS41_PREFILL_STAGE=1 asks for the stage kernels of this file: only a named PF_CORE product overrides it.
+    const bool faster_form = format == WeightFormat::q8_0 && view.routes.batch_rows == 16U && !fast_moe() && !stage_forced() &&
+                             view.hidden <= 5120U;
+    if (pf_core_for(faster_form) || fast_i4()) {
         if (view.hidden > 5120U) throw std::invalid_argument("ds41 prefill gate/up view: shared core width");
         if (format == WeightFormat::iq2_xxs) launch_gate_up_core<WeightFormat::iq2_xxs>(view, queue);
         else if (format == WeightFormat::q8_0) launch_gate_up_core<WeightFormat::q8_0>(view, queue);
@@ -790,7 +824,11 @@ void enqueue_prefill_down(WeightFormat format, const PrefillDownView& view, void
         reinterpret_cast<std::uintptr_t>(view.codes) % 16U != 0U)
         throw std::invalid_argument("ds41 prefill down view is inconsistent");
     const auto queue = static_cast<hipStream_t>(stream);
-    if (pf_core() || fast_i4()) {
+    // Rank fixture as in gate/up: Q8_0 (the shared expert) -6.0..-7.2 % -> default; Q2_K -0.1..+2.4 % (eleven of twelve
+    // cells slower) -> stays on the kernels below. STRIX_DS41_PREFILL_STAGE=1 as in gate/up.
+    const bool faster_form = format == WeightFormat::q8_0 && view.routes.batch_rows == 16U && !fast_moe() && !stage_forced() &&
+                             view.width <= 5120U;
+    if (pf_core_for(faster_form) || fast_i4()) {
         if (view.width > 5120U) throw std::invalid_argument("ds41 prefill down view: shared core width");
         if (format == WeightFormat::q2_k) launch_down_core<WeightFormat::q2_k>(view, queue);
         else if (format == WeightFormat::q8_0) launch_down_core<WeightFormat::q8_0>(view, queue);

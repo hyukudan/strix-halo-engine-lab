@@ -40,4 +40,28 @@ inline unsigned width_from_env(const char* value, const char* name) {
 // a given exchange depth admits.
 inline unsigned width_for_depth(unsigned width, unsigned depth) { return std::max(kMin, std::min(width, depth)); }
 
+// MoE sub-group: how many chunks of the group one group-wide MoE call covers (an expert's weights are then decoded
+// once for those chunks' rows). A group-wide call produces all its chunks' partials at once, so their exchanges start
+// together; the pipeline stays free of idle time only while another sub-group's compute covers those transfers.
+// Measured (MiniMax M3.1 FAST_I4 policy default, TP2 USB4, identical state / rows / result hashes in every arm):
+//   8K, 2 chunks, one call for both:        12.28 / 12.96 -> 15.14 / 14.60 s (+13..23 %: the wire is serialised)
+//   32K, group 4, calls of 2 chunks:        49.35 / 49.28 -> 49.36 / 49.15 s (neutral)
+//   32K, group 8, calls of 4 chunks vs the default group 4 per chunk, both orders: 49.20 -> 48.99, 49.25 -> 48.75 s
+// The automatic width is therefore half the chunks of a unit of at least kMoeAutoChunks chunks (two calls of four
+// chunks in a 32K group of 8) and one call per chunk below that. 0 = automatic, 1 = one call per chunk, 2..8 = explicit.
+inline constexpr unsigned kMoeAuto = 0;
+inline constexpr unsigned kMoeAutoChunks = 8;
+inline unsigned moe_width_from_env(const char* value, const char* name) {
+    if (value == nullptr || *value == '\0') return kMoeAuto;
+    const unsigned long w = std::strtoul(value, nullptr, 10);
+    if (w > kMax) throw std::invalid_argument(std::string(name) + " must be 0.." + std::to_string(kMax));
+    return static_cast<unsigned>(w);
+}
+// Sub-group width for a unit of `chunks` chunks.
+inline unsigned moe_width(unsigned requested, unsigned chunks) {
+    if (chunks == 0) return 1;
+    const unsigned w = requested == kMoeAuto ? (chunks >= kMoeAutoChunks ? chunks / 2 : 1U) : std::min(requested, chunks);
+    return std::max(1U, w);
+}
+
 }  // namespace strix::pair::prefill_group

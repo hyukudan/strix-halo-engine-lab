@@ -7,6 +7,7 @@
 #include "strix/qwen_prefill_balance.hpp"
 #include "strix/dist/communicator.hpp"
 #include "strix/startup_markers.hpp"
+#include "strix/power/sampler.hpp"
 #include "strix/device_profile.hpp"
 #include "strix/mtp_cost_table_session.hpp"
 #include "http_slot_capacity.hpp"
@@ -1201,6 +1202,14 @@ static int run_decode_entry(
     // excluded or undeclared one and prints the "device:" receipt line. Without a declaration the single integrated
     // GPU of a node keeps working (declared=implicit). A retry re-enters here with the flags already removed.
     strix::device::bind_hip_main(argc, argv);
+    // Host wait policy of this engine (shared home: strix/device/hip_gate.hpp; STRIX_HOST_WAIT overrides): blocking.
+    // The runtime's own schedule busy-waits (one host core at 100 % for the whole prefill) for no measured speed.
+    try {
+        (void)strix::device::set_host_wait(strix::device::HostWait::blocking);
+    } catch (const std::exception& e) {
+        std::fprintf(stderr, "%s\n", e.what());
+        return 2;
+    }
     if (strix::print_device_profile_if_requested(argc, argv)) return 0;
     if (argc == 2 && std::string_view(argv[1]) == "--help") {
         std::cout << "Usage: strix-hip-decode-token MODEL.gguf TOKEN_ID ... [options]\n"
@@ -6558,6 +6567,8 @@ static int run_decode_entry(
                 << "  \"known_prefix_source_projection_launches_saved_per_window\":" << (known_prefill_plan ? 0U : known_prefix_plan->projection_launches_saved) << ",\n"
                 << "  \"known_prefix_source_logical_weight_bytes_avoided_per_window\":" << (known_prefill_plan ? 0U : known_prefix_plan->logical_projection_weight_bytes_avoided) << ",\n";
         }
+        if (generation_request_timing_enabled)  // shared power receipt of the timed request (strix/power/sampler.hpp)
+            std::cout << "  \"power\":" << strix::power::block_json(strix::power::request_block(generation_request_start, generation_request_stop, options.tokens.size(), result.generated_tokens.size())) << ",\n";
         if (generation_request_timing_enabled)
             std::cout << "  \"generation_request_elapsed_ms\":" << generation_request_elapsed_ms << ",\n"
                       << "  \"generation_request_output_tokens\":" << result.generated_tokens.size() << ",\n"

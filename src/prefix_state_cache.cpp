@@ -1235,28 +1235,87 @@ std::shared_ptr<const PrefixCacheSegment> PrefixStateCache::find_segment(const M
     return found == segments_.end() ? nullptr : found->second.lock();
 }
 
+namespace {
+// Bumps the disk epoch when a function that publishes or removes checkpoint files starts and when it ends,
+// so a lookup ticket whose disk probes overlap such a change is never trusted.
+struct DiskChange {
+    std::atomic<std::uint64_t>& epoch;
+    explicit DiskChange(std::atomic<std::uint64_t>& e) : epoch(e) { epoch.fetch_add(1, std::memory_order_acq_rel); }
+    ~DiskChange() { epoch.fetch_add(1, std::memory_order_acq_rel); }
+};
+}  // namespace
+
+PrefixLookupTicket PrefixStateCache::prepare_ticket(const ModelContentIdentity& identity, std::span<const std::uint32_t> tokens,
+    std::uint32_t block_rows, std::uint64_t limit, bool probe_disk) const {
+    require(block_rows != 0, "prefix cache lookup needs a block size");
+    PrefixLookupTicket ticket;
+    ticket.identity = identity;
+    ticket.block_rows = block_rows;
+    ticket.tokens = tokens;
+    ticket.lookup_tokens = std::min<std::uint64_t>(limit, tokens.size());
+    ticket.digests = prefix_cache_block_digests(identity, tokens, block_rows, ticket.lookup_tokens / block_rows);
+    if (!probe_disk || policy_.disk_directory.empty()) return ticket;
+    // The epoch is read first: a publication or removal that overlaps the probes changes it.
+    ticket.disk_epoch = disk_epoch_.load(std::memory_order_acquire);
+    ticket.disk.assign(ticket.digests.size(), PrefixLookupTicket::disk_absent);
+    for (std::size_t k = 0; k < ticket.digests.size(); ++k) {
+        const auto path = checkpoint_path(policy_.disk_directory, ticket.digests[k]);
+        std::error_code error;
+        if (!std::filesystem::exists(path, error)) continue;
+        try {
+            File probe(path, "rb");
+            CheckpointHeader candidate;
+            if (!probe.open()) continue;
+            probe.read(&candidate, sizeof(candidate));
+            if (candidate.reserved <= 1U)
+                ticket.disk[k] = candidate.reserved ? PrefixLookupTicket::disk_certified : PrefixLookupTicket::disk_legacy;
+        } catch (const std::exception&) {
+            ticket.disk[k] = PrefixLookupTicket::disk_unknown; // the lookup probes it itself and accounts the failure
+        }
+    }
+    return ticket;
+}
+
+PrefixLookupTicket PrefixStateCache::prepare_lookup(const ModelContentIdentity& identity, std::span<const std::uint32_t> tokens,
+    std::uint32_t block_rows, std::uint64_t limit) const {
+    auto owned = std::make_shared<const std::vector<std::uint32_t>>(tokens.begin(), tokens.end());
+    auto ticket = prepare_ticket(identity, *owned, block_rows, limit, true);
+    ticket.owned = std::move(owned);
+    return ticket;
+}
+
 std::shared_ptr<const PrefixCacheCheckpoint> PrefixStateCache::find_longest(const ModelContentIdentity& identity,
     std::span<const std::uint32_t> tokens, std::uint32_t block_rows, std::uint64_t limit, bool promote, std::string_view conversation,
     const std::function<bool(const PrefixCacheCheckpoint&)>& eligible) {
-    require(block_rows != 0, "prefix cache lookup needs a block size");
-    const auto max_blocks = std::min<std::uint64_t>(limit, tokens.size()) / block_rows;
-    const auto digests = prefix_cache_block_digests(identity, tokens, block_rows, max_blocks);
+    // Not prepared ahead: the disk tier is probed during the walk, only for the blocks above the hit.
+    return find_longest(prepare_ticket(identity, tokens, block_rows, limit, false), promote, conversation, eligible);
+}
+
+std::shared_ptr<const PrefixCacheCheckpoint> PrefixStateCache::find_longest(const PrefixLookupTicket& ticket, bool promote,
+    std::string_view conversation, const std::function<bool(const PrefixCacheCheckpoint&)>& eligible) {
+    require(ticket.block_rows != 0 && ticket.digests.size() == ticket.lookup_tokens / ticket.block_rows &&
+            ticket.lookup_tokens <= ticket.tokens.size(), "prefix cache lookup ticket is not prepared");
+    const auto& identity = ticket.identity;
+    const auto block_rows = ticket.block_rows;
+    const auto tokens = ticket.tokens;
+    const auto& digests = ticket.digests;
+    // One acquisition for the bookkeeping and the host-tier probe of every block of the prompt.
+    std::vector<std::shared_ptr<const PrefixCacheCheckpoint>> host(digests.size());
     {
         std::lock_guard lock(mutex_);
         for (auto it=receipts_.begin(); it!=receipts_.end();)
             if (it->second.expired()) it=receipts_.erase(it); else ++it;
         ++stats_.lookups;
-        stats_.lookup_tokens += std::min<std::uint64_t>(limit,tokens.size());
+        stats_.lookup_tokens += ticket.lookup_tokens;
+        for (std::size_t k = 0; k < digests.size(); ++k)
+            if (const auto it = entries_.find(digests[k]); it != entries_.end()) host[k] = it->second.checkpoint;
     }
+    // Prepared disk metadata is used only if no checkpoint file was published or removed since it was read.
+    const bool prepared_disk = ticket.disk.size() == digests.size() &&
+        ticket.disk_epoch == disk_epoch_.load(std::memory_order_acquire);
     for (auto k = digests.size(); k > 0; --k) {
         const auto& digest = digests[k - 1];
-        std::shared_ptr<const PrefixCacheCheckpoint> found;
-        {
-            std::lock_guard lock(mutex_);
-            if (const auto it = entries_.find(digest); it != entries_.end()) {
-                found = it->second.checkpoint;
-            }
-        }
+        const std::shared_ptr<const PrefixCacheCheckpoint> found = std::move(host[k - 1]);
         if (found) {
             if (eligible && !eligible(*found)) {
                 std::lock_guard lock(mutex_); ++stats_.plan_misses; continue;
@@ -1279,14 +1338,19 @@ std::shared_ptr<const PrefixCacheCheckpoint> PrefixStateCache::find_longest(cons
         }
         if (policy_.disk_directory.empty() || (eligible && (!policy_.certified_disk || policy_.legacy))) continue;
         std::error_code error;
-        if (!std::filesystem::exists(checkpoint_path(policy_.disk_directory, digest), error)) continue;
+        const std::uint8_t known = prepared_disk ? ticket.disk[k - 1] : std::uint8_t{PrefixLookupTicket::disk_unknown};
+        if (known == PrefixLookupTicket::disk_absent) continue;
+        if (known == PrefixLookupTicket::disk_unknown &&
+            !std::filesystem::exists(checkpoint_path(policy_.disk_directory, digest), error)) continue;
         try {
             // Certified and legacy lookups never cross. Check before payload allocation.
-            File probe(checkpoint_path(policy_.disk_directory, digest), "rb");
-            CheckpointHeader candidate;
-            if (!probe.open()) continue;
-            probe.read(&candidate, sizeof(candidate));
-            if (candidate.reserved != (eligible ? 1U : 0U)) continue;
+            if (known == PrefixLookupTicket::disk_unknown) {
+                File probe(checkpoint_path(policy_.disk_directory, digest), "rb");
+                CheckpointHeader candidate;
+                if (!probe.open()) continue;
+                probe.read(&candidate, sizeof(candidate));
+                if (candidate.reserved != (eligible ? 1U : 0U)) continue;
+            } else if ((known == PrefixLookupTicket::disk_certified) != static_cast<bool>(eligible)) continue;
             if (auto loaded = load_from_disk(identity, digest, tokens.first(static_cast<std::size_t>(k * block_rows)), block_rows)) {
                 if (eligible && (loaded->producer_certificate.empty() || !eligible(*loaded))) {
                     std::lock_guard lock(mutex_); ++stats_.plan_misses; continue;
@@ -1439,6 +1503,7 @@ std::shared_ptr<const PrefixCacheCheckpoint> PrefixStateCache::load_from_disk(co
 }
 
 void PrefixStateCache::write_to_disk(const PrefixCacheCheckpoint& checkpoint) {
+    const DiskChange disk_change(disk_epoch_);
     const auto start = std::chrono::steady_clock::now();
     const auto& dir = policy_.disk_directory;
     std::uint64_t written = 0;
@@ -1513,6 +1578,7 @@ void PrefixStateCache::update_disk_gauge() {
 
 void PrefixStateCache::enforce_disk_budget() {
     if (!policy_.disk_byte_budget) return;
+    const DiskChange disk_change(disk_epoch_);
     namespace fs = std::filesystem;
     struct Item { fs::path path; fs::file_time_type time; std::uint64_t bytes; };
     std::vector<Item> checkpoints;
@@ -1561,6 +1627,7 @@ void PrefixStateCache::enforce_disk_budget() {
 }
 
 void PrefixStateCache::sweep_disk(std::chrono::seconds min_age) {
+    const DiskChange disk_change(disk_epoch_);
     namespace fs = std::filesystem;
     std::error_code error;
     const auto now = fs::file_time_type::clock::now();

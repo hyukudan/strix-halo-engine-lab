@@ -187,6 +187,12 @@ void* Exchanger::tx() {
     return tx_dev_ + (tx_slot(s) - tx_host_);
 }
 
+void* Exchanger::tx(unsigned ahead) {
+    const std::uint64_t s = next_ + 1 + ahead;
+    if (s > retired_ + options_.depth) throw std::logic_error("mmpfx: tx() of a sequence whose slot is still in use (retire() of s - depth missing)");
+    return tx_dev_ + (tx_slot(s) - tx_host_);
+}
+
 void Exchanger::send(std::size_t bytes, const Tag& tag) {
     check();
     if (bytes == 0 || bytes > options_.capacity) throw std::invalid_argument("mmpfx: message size outside 1..capacity");

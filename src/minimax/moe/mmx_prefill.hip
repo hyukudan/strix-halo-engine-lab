@@ -5,6 +5,7 @@
 #include "minimax/moe/mmx_prefill_core.hpp"
 #include "minimax/moe/mmx_trellis_device.hpp"
 #include "core/activation_quant.hpp"
+#include "core/trellis_device.hpp"
 #ifndef STRIX_MMX_IU4_LIB
 #define STRIX_MMX_IU4_LIB 0
 #endif
@@ -44,38 +45,7 @@ constexpr unsigned kHB = kHidden / 128, kIB = kInter / 128;  // 48, 12
 
 
 // ---------------------------------------------------------------- library WMMA core pieces (gemm.hip, trellis_device.hpp)
-__device__ __forceinline__ float codebook_mul1(std::uint32_t state) {
-    const std::uint32_t product = state * 0x83dcd12dU;
-    const unsigned sum = __builtin_amdgcn_udot4(product, 0x01010101U, 0, false);
-    return __half2float(__float2half_rn(fmaf(static_cast<float>(1024 + sum), __half2float(__ushort_as_half(0x1eee)),
-                                             __half2float(__ushort_as_half(0xc931)))));
-}
-template <int Bits> struct WaveTile {
-    std::uint32_t lo, hi;
-    static constexpr int words = Bits * 8;
-    __device__ explicit WaveTile(const std::uint32_t* data) {
-        const int lane = static_cast<int>(threadIdx.x & 31U);
-        lo = lane < words ? data[lane] : 0;
-        if constexpr (words > 32) hi = lane + 32 < words ? data[lane + 32] : 0;
-        else hi = 0;
-    }
-    __device__ __forceinline__ std::uint32_t word(int index) const {
-        const std::uint32_t first = __shfl(lo, index & 31, 32);
-        if constexpr (words > 32) {
-            const std::uint32_t second = __shfl(hi, index & 31, 32);
-            return index < 32 ? first : second;
-        }
-        return first;
-    }
-    __device__ __forceinline__ std::uint32_t state(int position) const {
-        const int end = (position + 1) * Bits + 256 * Bits;
-        const int start = end - 16;
-        const std::uint32_t earlier = word((start / 32) % words);
-        const std::uint32_t later = word(((end - 1) / 32) % words);
-        const std::uint64_t pair = (static_cast<std::uint64_t>(earlier) << 32) | later;
-        return static_cast<std::uint32_t>(pair >> ((32 - (end & 31)) & 31)) & 65535U;
-    }
-};
+using strix::core::WaveTile;
 using Half16 = _Float16 __attribute__((ext_vector_type(16)));
 using Float8 = float __attribute__((ext_vector_type(8)));
 
@@ -111,7 +81,7 @@ __device__ void wmma_item(const WItem& it, unsigned bx, unsigned by, unsigned bz
             for (int j = 0; j < 8; ++j) {
                 const int r = 2 * (lane % 4) + (j % 2) + 8 * ((j / 2) % 2);
                 const int c = lane / 4 + 8 * (j / 4);
-                q[wave * 256 + r * 16 + c] = static_cast<_Float16>(codebook_mul1(tile.state(8 * lane + j)));
+                q[wave * 256 + r * 16 + c] = static_cast<_Float16>(strix::core::codebook_value(tile.state(8 * lane + j), 2));
             }
         }
         __syncthreads();
@@ -185,7 +155,21 @@ struct Tables {
     unsigned pairs, rows, shared_group;
     unsigned tpairs;  // padded rows of the tile-major layout (v4); xt = [2][tpairs][6144], at = [tpairs][1536]
     unsigned fakeq;   // STRIX_MMX_FAKEQ_A4 (quality study): v4 transformed rows fake-quantised to A4 g64 before the FP16 store
+    // Group-wide call: row r lives in chunk r / seg_rows (seg_rows = 0: one buffer, the kernels' y / out arguments).
+    unsigned seg_rows;
+    const float* seg_y[kPrefillMoeSegments];
+    float* seg_out[kPrefillMoeSegments];
 };
+__device__ __forceinline__ const float* moe_row_in(const float* y, const Tables& t, unsigned r) {
+    if (t.seg_rows == 0) return y + static_cast<std::size_t>(r) * kHidden;
+    const unsigned s = r / t.seg_rows;
+    return t.seg_y[s] + static_cast<std::size_t>(r - s * t.seg_rows) * kHidden;
+}
+__device__ __forceinline__ float* moe_row_out(float* out, const Tables& t, unsigned r) {
+    if (t.seg_rows == 0) return out + static_cast<std::size_t>(r) * kHidden;
+    const unsigned s = r / t.seg_rows;
+    return t.seg_out[s] + static_cast<std::size_t>(r - s * t.seg_rows) * kHidden;
+}
 
 // FAST_I4 fake-quant (quality study): FP16-exact values -> q * s of the A4 g64 quantiser (core/activation_quant.hpp).
 __device__ __forceinline__ void fakeq128(float (&v)[4]) {
@@ -207,7 +191,7 @@ __global__ __launch_bounds__(256) void gather_transform_tiled_kernel(const float
     const unsigned p = q / (2 * kHB), rem = q % (2 * kHB), m = rem / kHB, b = rem % kHB;
     const PGroup& g = t.groups[t.pair_group[p]];
     const std::uint16_t* suh = m == 0 ? g.w.gate.suh : g.w.up.suh;
-    const float* x = y + static_cast<std::size_t>(t.pair_row[p]) * kHidden;
+    const float* x = moe_row_in(y, t, t.pair_row[p]);
     float v[4];
 #pragma unroll
     for (int j = 0; j < 4; ++j) {
@@ -230,7 +214,7 @@ __global__ __launch_bounds__(256) void gather_transform_token_kernel(const float
     const unsigned q = blockIdx.x * 8U + wave;
     if (q >= t.rows * kHB) return;
     const unsigned tok = q / kHB, b = q % kHB;
-    const float* x = y + static_cast<std::size_t>(tok) * kHidden;
+    const float* x = moe_row_in(y, t, tok);
     float xv[4];
 #pragma unroll
     for (int j = 0; j < 4; ++j) xv[j] = x[b * 128U + lane + 32U * static_cast<unsigned>(j)];
@@ -399,9 +383,9 @@ __global__ __launch_bounds__(256) void down_combine_kernel(Tables t, float* out)
     const PGroup& sg = t.groups[t.shared_group];
     float v[4];
     finish_block(t.part + sg.part_dn, sg.s_dn, sg.n, tok, kHidden, b, sg.w.down.svh, lane, v);
+    float* const o = moe_row_out(out, t, tok);
 #pragma unroll
-    for (int j = 0; j < 4; ++j)
-        out[static_cast<std::size_t>(tok) * kHidden + b * 128 + lane + 32U * static_cast<unsigned>(j)] = Epilogue::shared_add(acc[j], v[j]);
+    for (int j = 0; j < 4; ++j) o[b * 128 + lane + 32U * static_cast<unsigned>(j)] = Epilogue::shared_add(acc[j], v[j]);
 }
 
 // Dense prefill linears on the v4 core (enqueue_prefill_dense): the library input transform, row-major x -> tile-major
@@ -1001,9 +985,32 @@ void fill_items(Plan& p, unsigned char* ws) {
 // token, group-member and item contents are those of the host plan, so every CTA does the host CTA's work.
 namespace dp = ::strix::moe_core::device_plan;
 using Queue = dp::ItemQueue<pfk::Item>;
-constexpr unsigned kDevGroups = kExperts + 1;
-constexpr unsigned kGuSlot = 2 * kDevGroups, kDnSlot = kDevGroups;  // items per class: gate+up per group / down
-constexpr unsigned kDevItems = 8 * kGuSlot + 8 * kDnSlot;
+// Group-wide plan (enqueue_prefill_moe_group): one call over the chunks of a prefill group. A row's bits depend on the
+// K split count of its item, and the adopted policy picks the splits from the rows an expert holds in the row's own
+// chunk. The group-wide plan therefore merges, per expert, the chunks' rows by split class: every (chunk, expert) row
+// set joins the group (expert, class of its chunk-local count), which runs with that class's splits. Rows keep their
+// per-chunk arithmetic (same splits, same K ranges, row-independent fragments) while an expert's weights are decoded
+// once for the group's rows of a class instead of once per chunk.
+constexpr unsigned kGwClasses = 5;
+constexpr unsigned kGwSplitGu[kGwClasses] = {1, 2, 4, 8, 16}, kGwSplitDn[kGwClasses] = {1, 1, 1, 2, 4};
+constexpr unsigned gw_class(unsigned n) { return n >= 97 ? 0U : n >= 49 ? 1U : n >= 17 ? 2U : n >= 9 ? 3U : 4U; }
+constexpr bool gw_classes_match_policy() {
+    for (unsigned n = 1; n <= 300; ++n)
+        for (const unsigned bits : {3U, 4U, 5U, 6U, 8U})
+            if (route::gemm_splits(kHidden, kInter, bits, n) != kGwSplitGu[gw_class(n)] ||
+                route::gemm_splits(kInter, kHidden, bits, n) != kGwSplitDn[gw_class(n)])
+                return false;
+    return true;
+}
+static_assert(gw_classes_match_policy(), "group-wide split classes must follow route::gemm_splits");
+// C = split classes per expert: 1 = the per-chunk plan (129 groups), kGwClasses = the group-wide plan (641 groups).
+template <unsigned C> struct DevDims {
+    static constexpr unsigned kVirtual = C * kExperts, kGroups = kVirtual + 1;
+    static constexpr unsigned kGuSlot = 2 * kGroups, kDnSlot = kGroups;  // items per class: gate+up per group / down
+    static constexpr unsigned kItems = 8 * kGuSlot + 8 * kDnSlot;
+};
+constexpr unsigned kDevGroups = DevDims<1>::kGroups;
+constexpr unsigned kGuSlot = DevDims<1>::kGuSlot, kDnSlot = DevDims<1>::kDnSlot;
 struct DevMeta {  // [0..7] gate/up classes, [8..15] down classes
     unsigned count[16], total[16];
 };
@@ -1023,19 +1030,37 @@ struct DevOut {
     unsigned tpairs;
     bool i4=false;
     unsigned grid[16];  // the launch grid of every (stage, class): a bound of its CTAs (class_grids)
+    // Group-wide plan only: the chunks' router tables ([n][4] ids, then [n][4] weights, n = the chunk's rows) and the
+    // per-chunk expert counts [segments][128] of seg_count_kernel.
+    const std::uint32_t* seg_routes[kPrefillMoeSegments];
+    unsigned* seg_count;
+    unsigned seg_rows, segments;
 };
-struct DevPolicy {
-    static constexpr unsigned kExperts = ::strix::minimax::moe::opt::kExperts, kTopK = kTopE, kRows = 256;
+template <unsigned C> struct DevPolicyT {
+    static constexpr unsigned kReal = ::strix::minimax::moe::opt::kExperts;
+    static constexpr unsigned kExperts = DevDims<C>::kVirtual, kGroups = DevDims<C>::kGroups, kTopK = kTopE, kRows = 256;
+    static constexpr unsigned kGuSlot = DevDims<C>::kGuSlot, kDnSlot = DevDims<C>::kDnSlot;
     static constexpr bool kDropInvalid = false;  // keep 5T pairs: an invalid row plans experts 0..3 with weight 0
     using Out = DevOut;
-    using A = dp::Args<DevPolicy>;
+    using A = dp::Args<DevPolicyT>;
     // The token order of make_plan: the row's 4 (id, weight) in ascending id (a sorting network; the ids of a valid row
-    // are distinct, so the order is that of the insertion sort).
-    __device__ static bool load(const A& p, unsigned r, unsigned (&e)[kTopE], float (&w)[kTopE]) {
+    // are distinct, so the order is that of the insertion sort). `seg` = the row's chunk (0 for the per-chunk plan).
+    __device__ static bool load_real(const A& p, unsigned r, unsigned (&e)[kTopE], float (&w)[kTopE], unsigned& seg) {
+        const std::uint32_t* ids = p.ids;
+        const float* weights = p.weights;
+        unsigned local = r;
+        seg = 0;
+        if constexpr (C > 1) {
+            seg = r / p.out.seg_rows;
+            local = r - seg * p.out.seg_rows;
+            const unsigned n = seg + 1U == p.out.segments ? p.rows - seg * p.out.seg_rows : p.out.seg_rows;
+            ids = p.out.seg_routes[seg];
+            weights = reinterpret_cast<const float*>(ids + std::size_t{n} * kTopE);
+        }
 #pragma unroll
         for (unsigned k = 0; k < kTopE; ++k) {
-            e[k] = p.ids[std::size_t{r} * kTopE + k];
-            w[k] = p.weights[std::size_t{r} * kTopE + k];
+            e[k] = ids[std::size_t{local} * kTopE + k];
+            w[k] = weights[std::size_t{local} * kTopE + k];
         }
         auto cs = [&](unsigned i, unsigned j) {
             if (e[i] > e[j]) {
@@ -1052,11 +1077,31 @@ struct DevPolicy {
         cs(0, 2);
         cs(1, 3);
         cs(1, 2);
-        return e[3] >= kExperts || e[0] == e[1] || e[1] == e[2] || e[2] == e[3];
+        return e[3] >= kReal || e[0] == e[1] || e[1] == e[2] || e[2] == e[3];
+    }
+    // Planner ids. Group-wide: expert e of a chunk plans as (class of the chunk's count of e) x 128 + e, in the row's
+    // real-id slot order (the combine order of the per-chunk plan). The fallback ids are mapped here as well, so
+    // fallback() below has nothing left to do.
+    __device__ static bool load(const A& p, unsigned r, unsigned (&e)[kTopE], float (&w)[kTopE]) {
+        unsigned seg = 0;
+        const bool bad = load_real(p, r, e, w, seg);
+        if constexpr (C > 1) {
+#pragma unroll
+            for (unsigned k = 0; k < kTopE; ++k) {
+                if (bad) e[k] = k, w[k] = 0.0F;
+                e[k] += gw_class(p.out.seg_count[seg * kReal + e[k]]) * kReal;
+            }
+        }
+        return bad;
     }
     __device__ static void fallback(unsigned (&e)[kTopE], float (&w)[kTopE]) {
+        if constexpr (C == 1) {
 #pragma unroll
-        for (unsigned k = 0; k < kTopE; ++k) e[k] = k, w[k] = 0.0F;
+            for (unsigned k = 0; k < kTopE; ++k) e[k] = k, w[k] = 0.0F;
+        } else {
+            (void)e;
+            (void)w;
+        }
     }
     // The groups of make_plan and the v4 + mtfit items of fill_items_v2 (gufuse off), in their order: thread x sizes
     // group x, exclusive scans over the groups (row tiles, partial floats, per-class item counts and CTAs), then
@@ -1064,9 +1109,9 @@ struct DevPolicy {
     __device__ static void finish(const A& p, const unsigned* count, const unsigned* start) {
         if(p.out.i4) {
             const unsigned e=threadIdx.x;
-            if(e<kDevGroups) {
+            if(e<kGroups) {
                 PGroup g{}; g.expert=e; g.n=count[e]; g.pair_begin=start[e];
-                g.w=e<kExperts ? p.out.experts[e] : p.out.shared;
+                g.w=e<kExperts ? p.out.experts[e % kReal] : p.out.shared;
                 p.out.groups[e]=g;
                 // Reuse the item arena for the library's device group list.
                 auto* tab=reinterpret_cast<unsigned*>(p.out.items);
@@ -1074,49 +1119,68 @@ struct DevPolicy {
             }
             return;
         }
-        __shared__ unsigned ncls[kDevGroups + 1][16], ncta[kDevGroups + 1][16], tile_rows[kDevGroups + 1];
-        __shared__ std::size_t floats[kDevGroups + 1];
+        // Per group and stage (0 gate/up, 1 down): [stage] = its MT8 items, [2 + stage] = its tail items. In: the CTAs
+        // of the stage's items of that kind; after the scans: their CTA prefix (cta) and item prefix (slot) inside
+        // their class queue. A group's MT8 and tail items share class 7 when its remainder is 113..127 rows.
+        __shared__ unsigned cta[4][kGroups], slot[4][kGroups], tile_rows[kGroups + 1];
+        __shared__ unsigned char tail_cls[kGroups], has_main[kGroups];
+        __shared__ std::size_t floats[kGroups + 1];
         const unsigned x = threadIdx.x;
-        const bool mine = x < kDevGroups;
+        const bool mine = x < kGroups;
         const unsigned n = mine ? count[x] : 0U;
         ExpertSlices w{};
         unsigned s_gu = 0, s_dn = 0;
         route::MtFit fit{};
         if (mine) {
-            w = x < kExperts ? p.out.experts[x] : p.out.shared;
-            s_gu = n ? route::gemm_splits(kHidden, kInter, w.gate.bits, n) : 0U;
-            s_dn = n ? route::gemm_splits(kInter, kHidden, w.down.bits, n) : 0U;
+            w = x < kExperts ? p.out.experts[x % kReal] : p.out.shared;
+            if (C > 1 && x < kExperts) {
+                s_gu = n ? kGwSplitGu[x / kReal] : 0U;
+                s_dn = n ? kGwSplitDn[x / kReal] : 0U;
+            } else {
+                s_gu = n ? route::gemm_splits(kHidden, kInter, w.gate.bits, n) : 0U;
+                s_dn = n ? route::gemm_splits(kInter, kHidden, w.down.bits, n) : 0U;
+            }
             fit = route::mtfit(n);
-            for (unsigned q = 0; q < 16; ++q) ncls[x][q] = ncta[x][q] = 0;
             tile_rows[x] = (n + 15U) / 16U * 16U;
             floats[x] = 2 * static_cast<std::size_t>(s_gu) * n * kInter + static_cast<std::size_t>(s_dn) * n * kHidden;
             // gate/up: 2 items per used class (gate, up); down: 1. gx = 12 / 48.
-            if (fit.main != 0) {
-                ncls[x][7] = 2, ncta[x][7] = 2 * (kInter / 128) * fit.main * s_gu;
-                ncls[x][15] = 1, ncta[x][15] = (kHidden / 128) * fit.main * s_dn;
-            }
-            if (fit.remainder != 0) {
-                ncls[x][fit.tail_class] += 2, ncta[x][fit.tail_class] += 2 * (kInter / 128) * s_gu;
-                ncls[x][8 + fit.tail_class] += 1, ncta[x][8 + fit.tail_class] += (kHidden / 128) * s_dn;
-            }
+            has_main[x] = fit.main != 0 ? 1 : 0;
+            tail_cls[x] = static_cast<unsigned char>(fit.remainder != 0 ? fit.tail_class : 255U);
+            cta[0][x] = 2 * (kInter / 128) * fit.main * s_gu;
+            cta[1][x] = (kHidden / 128) * fit.main * s_dn;
+            cta[2][x] = 2 * (kInter / 128) * s_gu;
+            cta[3][x] = (kHidden / 128) * s_dn;
         }
         __syncthreads();
-        // Exclusive scans down the group columns (row kDevGroups = the totals).
+        // Exclusive scans down the groups: thread q = class queue q (stage q / 8, class q % 8).
         if (x < 16) {
+            const unsigned st = x >> 3U, cls = x & 7U, per = st ? 1U : 2U;
             unsigned c = 0, t = 0;
-            for (unsigned g = 0; g <= kDevGroups; ++g) {
-                const unsigned dc = g < kDevGroups ? ncls[g][x] : 0U, dt = g < kDevGroups ? ncta[g][x] : 0U;
-                ncls[g][x] = c;
-                ncta[g][x] = t;
-                c += dc;
-                t += dt;
+            for (unsigned g = 0; g < kGroups; ++g) {
+                if (cls == 7U && has_main[g] != 0) {
+                    const unsigned d = cta[st][g];
+                    cta[st][g] = t;
+                    slot[st][g] = c;
+                    c += per;
+                    t += d;
+                }
+                if (tail_cls[g] == cls) {
+                    const unsigned d = cta[2U + st][g];
+                    cta[2U + st][g] = t;
+                    slot[2U + st][g] = c;
+                    c += per;
+                    t += d;
+                }
             }
+            p.out.meta->count[x] = c;
+            p.out.meta->total[x] = t;
+            if (t > p.out.grid[x]) atomicOr(p.flag, 2U);  // above the launch grid (bug)
         } else if (x == 16) {
             unsigned t = 0;
-            for (unsigned g = 0; g <= kDevGroups; ++g) { const unsigned d = g < kDevGroups ? tile_rows[g] : 0U; tile_rows[g] = t; t += d; }
+            for (unsigned g = 0; g <= kGroups; ++g) { const unsigned d = g < kGroups ? tile_rows[g] : 0U; tile_rows[g] = t; t += d; }
         } else if (x == 17) {
             std::size_t t = 0;
-            for (unsigned g = 0; g <= kDevGroups; ++g) { const std::size_t d = g < kDevGroups ? floats[g] : 0U; floats[g] = t; t += d; }
+            for (unsigned g = 0; g <= kGroups; ++g) { const std::size_t d = g < kGroups ? floats[g] : 0U; floats[g] = t; t += d; }
         }
         __syncthreads();
         if (mine) {
@@ -1131,19 +1195,26 @@ struct DevPolicy {
             g.part_dn = floats[x] + 2 * static_cast<std::size_t>(s_gu) * n * kInter;
             p.out.groups[x] = g;
             if (n != 0) {
-                unsigned at[16], cta[16];  // this group's next item slot and CTA offset per class
-                for (unsigned q = 0; q < 16; ++q) at[q] = ncls[x][q], cta[q] = ncta[x][q];
-                auto append = [&](pfk::Item it, unsigned stage) {
-                    auto emit = [&](unsigned c, unsigned row0, unsigned gy) {
-                        const unsigned q = stage * 8U + c;
+                // Matrix m of a stage; a queue holds a group's items as gate main, gate tail, up main, up tail.
+                const bool both = fit.main != 0 && fit.remainder != 0 && fit.tail_class == 7U;
+                auto append = [&](pfk::Item it, unsigned stage, unsigned m) {
+                    const unsigned main_ctas = it.gx * fit.main * it.splits, tail_ctas = it.gx * it.splits;
+                    auto emit = [&](unsigned c, unsigned row0, unsigned gy, unsigned at, unsigned cta_begin) {
                         it.row0 = row0;
                         it.gy = gy;
-                        it.cta_begin = cta[q];
-                        cta[q] += it.gx * gy * it.splits;
-                        p.out.items[(stage ? 8U * kGuSlot + c * kDnSlot : c * kGuSlot) + at[q]++] = it;
+                        it.cta_begin = cta_begin;
+                        p.out.items[(stage ? 8U * kGuSlot + c * kDnSlot : c * kGuSlot) + at] = it;
                     };
-                    if (fit.main != 0) emit(7, 0, fit.main);
-                    if (fit.remainder != 0) emit(fit.tail_class, fit.main * 128, 1);
+                    if (fit.main != 0)
+                        emit(7, 0, fit.main, slot[stage][x] + m * (both ? 2U : 1U),
+                             cta[stage][x] + m * (main_ctas + (both ? tail_ctas : 0U)));
+                    if (fit.remainder != 0) {
+                        if (both)
+                            emit(7, fit.main * 128, 1, slot[stage][x] + 1U + 2U * m,
+                                 cta[stage][x] + main_ctas + m * (main_ctas + tail_ctas));
+                        else
+                            emit(fit.tail_class, fit.main * 128, 1, slot[2U + stage][x] + m, cta[2U + stage][x] + m * tail_ctas);
+                    }
                 };
                 for (unsigned m = 0; m < 2U; ++m) {
                     const Exl3& mw = m == 0 ? w.gate : w.up;
@@ -1157,7 +1228,7 @@ struct DevPolicy {
                     it.rows = n;
                     it.splits = s_gu;
                     it.gx = kInter / 128;
-                    append(it, 0);
+                    append(it, 0, m);
                 }
                 pfk::Item it{};
                 it.trellis = w.down.trellis;
@@ -1169,13 +1240,8 @@ struct DevPolicy {
                 it.rows = n;
                 it.splits = s_dn;
                 it.gx = kHidden / 128;
-                append(it, 1);
+                append(it, 1, 0);
             }
-        }
-        if (x < 16) {
-            p.out.meta->count[x] = ncls[kDevGroups][x];
-            p.out.meta->total[x] = ncta[kDevGroups][x];
-            if (ncta[kDevGroups][x] > p.out.grid[x]) atomicOr(p.flag, 2U);  // above the launch grid (bug)
         }
     }
     __device__ static void routed(const A& p, unsigned r, unsigned k, unsigned e, float w, unsigned pos) {
@@ -1189,20 +1255,34 @@ struct DevPolicy {
         p.out.pair_group[pos] = kExperts;
     }
 };
+static_assert(DevDims<1>::kItems == 24U * DevDims<1>::kGroups && DevDims<kGwClasses>::kItems == 24U * DevDims<kGwClasses>::kGroups);
+using DevPolicy = DevPolicyT<1>;
+using GwPolicy = DevPolicyT<kGwClasses>;
+
+// Per-chunk expert counts of the group-wide plan: [segments][128], zeroed by the caller. One thread per row.
+__global__ __launch_bounds__(256) void seg_count_kernel(dp::Args<GwPolicy> p) {
+    const unsigned r = blockIdx.x * 256U + threadIdx.x;
+    if (r >= p.rows) return;
+    unsigned e[kTopE], seg = 0;
+    float w[kTopE];
+    const bool bad = GwPolicy::load_real(p, r, e, w, seg);
+#pragma unroll
+    for (unsigned k = 0; k < kTopE; ++k) atomicAdd(&p.out.seg_count[seg * GwPolicy::kReal + (bad ? k : e[k])], 1U);
+}
 
 // Device-plan workspace of a T-row call (a function of T only).
 struct DevLayout {
     unsigned tpairs = 0;
     std::size_t groups = 0, pair_row = 0, pair_group = 0, tok_pair = 0, tok_w = 0, items = 0, meta = 0, scratch = 0, xt = 0,
-                at = 0, part = 0, bytes = 0;
+                at = 0, part = 0, bytes = 0, seg_count = 0;
 };
 // Partial floats of any routes of T rows: the sum over the 129 groups of 2 s_gu(n) n 1536 + s_dn(n) n 6144 is at most
 // 5T c + 129 max_n (f(n) - c n), c = 2 x 1536 + 6144 (the splits are 1 for large n). Bits do not enter the policy at
 // these shapes; the bound still takes the maximum over them.
-std::size_t dev_part_floats(unsigned T) {
-    static unsigned cached_t = 0;
+std::size_t dev_part_floats(unsigned T, unsigned groups = kDevGroups) {
+    static unsigned cached_t = 0, cached_groups = 0;
     static std::size_t cached = 0;
-    if (cached_t == T) return cached;
+    if (cached_t == T && cached_groups == groups) return cached;
     constexpr std::size_t c = 2ULL * kInter + kHidden;
     std::size_t extra = 0;
     for (unsigned n = 1; n <= T; ++n)
@@ -1211,27 +1291,31 @@ std::size_t dev_part_floats(unsigned T) {
                                   std::size_t{route::gemm_splits(kInter, kHidden, bits, n)} * n * kHidden;
             if (f > c * n) extra = std::max(extra, f - c * n);
         }
-    cached = 5ULL * T * c + std::size_t{kDevGroups} * extra;
+    cached = 5ULL * T * c + std::size_t{groups} * extra;
     cached_t = T;
+    cached_groups = groups;
     return cached;
 }
-DevLayout dev_layout(unsigned T,bool i4=false) {
+// classes = 1: the per-chunk plan; kGwClasses: the group-wide plan (641 groups, their item queues and seg_count).
+DevLayout dev_layout(unsigned T,bool i4=false,unsigned classes=1) {
     DevLayout l;
-    l.tpairs = (5U * T + 15U * kDevGroups + 15U) / 16U * 16U;
+    const unsigned groups = classes * kExperts + 1U;
+    l.tpairs = (5U * T + 15U * groups + 15U) / 16U * 16U;
     std::size_t off = 0;
     auto take = [&](std::size_t bytes) {
         const std::size_t at = off;
         off += align256(bytes);
         return at;
     };
-    l.groups = take(kDevGroups * sizeof(PGroup));
+    l.groups = take(groups * sizeof(PGroup));
     l.pair_row = take(5ULL * T * 4);
     l.pair_group = take(5ULL * T * 4);
     l.tok_pair = take(4ULL * T * 4);
     l.tok_w = take(4ULL * T * 4);
-    l.items = take(kDevItems * sizeof(pfk::Item));
+    l.items = take(std::size_t{24U * groups} * sizeof(pfk::Item));
     l.meta = take(sizeof(DevMeta));
-    l.scratch = take(dp::scratch_bytes<DevPolicy>(T));
+    l.scratch = take(classes == 1 ? dp::scratch_bytes<DevPolicy>(T) : dp::scratch_bytes<GwPolicy>(T));
+    if (classes != 1) l.seg_count = take(std::size_t{kPrefillMoeSegments} * kExperts * sizeof(unsigned));
     if(i4) {
         l.xt=off;
         // Largest tile list (BM32), count word, the global down operand (A4 + FP32 scales) and the
@@ -1246,7 +1330,7 @@ DevLayout dev_layout(unsigned T,bool i4=false) {
     }
     l.xt = take(2ULL * l.tpairs * kHidden * 2);
     l.at = take(std::size_t{l.tpairs} * kInter * 2);
-    l.part = take(dev_part_floats(T) * 4);
+    l.part = take(dev_part_floats(T, groups) * 4);
     l.bytes = off;
     return l;
 }
@@ -1338,32 +1422,103 @@ void launch_dq_class(const Queue& q, unsigned cls, unsigned grid, hipStream_t st
 // splits 1 (n >= 113); floor(n / 128) + [n % 128 >= 113] <= n / 113 and the groups hold 5T rows, so these items have at
 // most gx x matrices x floor(5T / 113) CTAs. Tail items of class c: at most one per matrix and group, so 129 groups x
 // gx x matrices x the largest split count of a group size whose remainder falls in class c.
-std::array<unsigned, 16> class_grids(unsigned T) {
-    static unsigned cached_t = 0;
+// Group-wide plan (classes > 1, `segs` chunks): a group (expert, class k) holds at most segs x (the class's largest
+// chunk count) rows and runs with the class's splits; class 0 and the shared expert keep the bound above.
+std::array<unsigned, 16> class_grids(unsigned T, unsigned classes = 1, unsigned segs = 1) {
+    static unsigned cached_t = 0, cached_classes = 0, cached_segs = 0;
     static std::array<unsigned, 16> cached{};
-    if (cached_t == T) return cached;
+    if (cached_t == T && cached_classes == classes && cached_segs == segs) return cached;
     std::array<unsigned, 16> g{};
-    for (unsigned n = 1; n <= T; ++n) {
-        const auto fit = route::mtfit(n);
-        if (fit.remainder == 0) continue;
-        for (const unsigned bits : {3U, 4U, 5U, 6U, 8U}) {
-            g[fit.tail_class] = std::max(g[fit.tail_class], 2U * (kInter / 128) * route::gemm_splits(kHidden, kInter, bits, n));
-            g[8 + fit.tail_class] = std::max(g[8 + fit.tail_class], (kHidden / 128) * route::gemm_splits(kInter, kHidden, bits, n));
+    const unsigned tiles = std::max(1U, 5U * T / 113U);
+    if (classes == 1) {
+        for (unsigned n = 1; n <= T; ++n) {
+            const auto fit = route::mtfit(n);
+            if (fit.remainder == 0) continue;
+            for (const unsigned bits : {3U, 4U, 5U, 6U, 8U}) {
+                g[fit.tail_class] = std::max(g[fit.tail_class], 2U * (kInter / 128) * route::gemm_splits(kHidden, kInter, bits, n));
+                g[8 + fit.tail_class] = std::max(g[8 + fit.tail_class], (kHidden / 128) * route::gemm_splits(kInter, kHidden, bits, n));
+            }
+        }
+        for (unsigned c = 0; c < 16; ++c) g[c] *= kDevGroups;
+        g[7] += 2U * (kInter / 128) * tiles;
+        g[15] += (kHidden / 128) * tiles;
+    } else {
+        constexpr unsigned kChunkMax[kGwClasses] = {0, 96, 48, 16, 8};  // largest chunk count of a class (0: unbounded)
+        for (unsigned k = 0; k < kGwClasses; ++k) {
+            const unsigned nmax = k == 0 ? T : std::min(T, segs * kChunkMax[k]);
+            bool tail[8] = {};
+            for (unsigned n = 1; n <= nmax; ++n) {
+                const auto fit = route::mtfit(n);
+                if (fit.remainder != 0) tail[fit.tail_class] = true;
+            }
+            const unsigned groups = kExperts + (k == 0 ? 1U : 0U);  // class 0 also bounds the shared expert's tail
+            for (unsigned c = 0; c < 8; ++c) {
+                if (!tail[c]) continue;
+                g[c] += groups * 2U * (kInter / 128) * kGwSplitGu[k];
+                g[8 + c] += groups * (kHidden / 128) * kGwSplitDn[k];
+            }
+            const unsigned main = k == 0 ? tiles : std::min(tiles, kExperts * (nmax / 128U));
+            g[7] += 2U * (kInter / 128) * main * kGwSplitGu[k];
+            g[15] += (kHidden / 128) * main * kGwSplitDn[k];
         }
     }
-    for (unsigned c = 0; c < 16; ++c) g[c] *= kDevGroups;
-    const unsigned tiles = std::max(1U, 5U * T / 113U);
-    g[7] += 2U * (kInter / 128) * tiles;
-    g[15] += (kHidden / 128) * tiles;
     for (auto& v : g) v = std::max(v, 1U);
     cached = g;
     cached_t = T;
+    cached_classes = classes;
+    cached_segs = segs;
     return cached;
 }
 
 #if STRIX_MMX_IU4_LIB
 void launch_i4_chain(const Tables&,const I4Layer&,const float*,float*,const strix::core::IU4Group*,unsigned char*,std::size_t,hipStream_t,bool);
 #endif
+// The launches of a device-planned call over its tables: gather, gate/up classes, finish, down classes, combine.
+// The class queues hold gu_slot / dn_slot items (DevDims of the plan).
+void launch_device_planned(const Tables& t, const float* y, float* out, pfk::Item* items, DevMeta* meta,
+                           const std::array<unsigned, 16>& grids, unsigned gu_slot, unsigned dn_slot, bool token_gather,
+                           hipStream_t stream) {
+    const unsigned T = t.rows;
+    if (token_gather) hipLaunchKernelGGL(gather_transform_token_kernel, dim3((T * kHB + 7) / 8), dim3(256), 0, stream, y, t);
+    else hipLaunchKernelGGL(gather_transform_tiled_kernel, dim3((t.pairs * 2 * kHB + 7) / 8), dim3(256), 0, stream, y, t);
+    launched("gather transform");
+    mark("gather", stream);
+    const bool pair = prefill_pipe_pair(T), side = prefill_tail_stream();
+        auto queue = [&](unsigned stage, unsigned c) {
+        const unsigned qi = stage * 8U + c;
+        return Queue{items + (stage ? 8U * gu_slot + c * dn_slot : c * gu_slot), &meta->count[qi], &meta->total[qi]};
+    };
+    // As the stage() of enqueue_prefill_moe: tails (MT 1..7) on the side stream beside MT8, joined before the consumer.
+    auto stage = [&](unsigned s, const char* const* labels) {
+        if (side) tail_fork(stream);
+        try {
+            for (unsigned c = 0; c < 7; ++c) {
+                launch_dq_class(queue(s, c), c, grids[s * 8U + c], side ? g_tail_side : stream, pair);
+                if (!side) mark(labels[c], stream);
+            }
+            launch_dq_class(queue(s, 7), 7, grids[s * 8U + 7], stream, pair);
+            mark(labels[7], stream);
+        } catch (...) {
+            if (side) tail_join(stream);
+            throw;
+        }
+        if (side) {
+            tail_join(stream);
+            mark(labels[6], stream);
+        }
+    };
+    stage(0, kGuLabel);
+    launched("gate/up device plan");
+    hipLaunchKernelGGL(gate_up_finish_tiled_kernel, dim3((t.pairs * kIB + 7) / 8), dim3(256), 0, stream, t, false, g_gufuse_intermediates);
+    launched("gate/up finish");
+    mark("finish", stream);
+    stage(1, kDnLabel);
+    launched("down device plan");
+    hipLaunchKernelGGL(down_combine_kernel, dim3((T * kHB + 7) / 8), dim3(256), 0, stream, t, out);
+    launched("down combine");
+    mark("combine", stream);
+}
+
 void enqueue_device_moe(const PrefillMoeDeviceView& v, void* workspace, std::size_t workspace_bytes, hipStream_t stream) {
     const unsigned T = v.rows;
     if (T == 0 || v.y == nullptr || v.routes == nullptr || v.experts == nullptr || v.out == nullptr)
@@ -1419,45 +1574,67 @@ void enqueue_device_moe(const PrefillMoeDeviceView& v, void* workspace, std::siz
         return;
     }
 #endif
-    if (v.fakeq_a4 == PrefillFakeq::on || prefill_gather_tok()) hipLaunchKernelGGL(gather_transform_token_kernel, dim3((T * kHB + 7) / 8), dim3(256), 0, stream, v.y, t);
-    else hipLaunchKernelGGL(gather_transform_tiled_kernel, dim3((t.pairs * 2 * kHB + 7) / 8), dim3(256), 0, stream, v.y, t);
-    launched("gather transform");
-    mark("gather", stream);
-    const bool pair = prefill_pipe_pair(T), side = prefill_tail_stream();
-    DevMeta* meta = a.out.meta;
-    auto queue = [&](unsigned stage, unsigned c) {
-        const unsigned qi = stage * 8U + c;
-        return Queue{a.out.items + (stage ? 8U * kGuSlot + c * kDnSlot : c * kGuSlot), &meta->count[qi], &meta->total[qi]};
-    };
-    // As the stage() of enqueue_prefill_moe: tails (MT 1..7) on the side stream beside MT8, joined before the consumer.
-    auto stage = [&](unsigned s, const char* const* labels) {
-        if (side) tail_fork(stream);
-        try {
-            for (unsigned c = 0; c < 7; ++c) {
-                launch_dq_class(queue(s, c), c, grids[s * 8U + c], side ? g_tail_side : stream, pair);
-                if (!side) mark(labels[c], stream);
-            }
-            launch_dq_class(queue(s, 7), 7, grids[s * 8U + 7], stream, pair);
-            mark(labels[7], stream);
-        } catch (...) {
-            if (side) tail_join(stream);
-            throw;
-        }
-        if (side) {
-            tail_join(stream);
-            mark(labels[6], stream);
-        }
-    };
-    stage(0, kGuLabel);
-    launched("gate/up device plan");
-    hipLaunchKernelGGL(gate_up_finish_tiled_kernel, dim3((t.pairs * kIB + 7) / 8), dim3(256), 0, stream, t, false, g_gufuse_intermediates);
-    launched("gate/up finish");
-    mark("finish", stream);
-    stage(1, kDnLabel);
-    launched("down device plan");
-    hipLaunchKernelGGL(down_combine_kernel, dim3((T * kHB + 7) / 8), dim3(256), 0, stream, t, v.out);
-    launched("down combine");
-    mark("combine", stream);
+    launch_device_planned(t, v.y, v.out, a.out.items, a.out.meta, grids, kGuSlot, kDnSlot,
+                          v.fakeq_a4 == PrefillFakeq::on || prefill_gather_tok(), stream);
+}
+
+// Group-wide call: seg_count -> the planner over all rows with the split-class policy -> the same launches.
+void enqueue_group_moe(const PrefillMoeGroupView& v, void* workspace, std::size_t workspace_bytes, hipStream_t stream) {
+    const unsigned T = v.rows, S = v.segments;
+    if (S == 0 || S > kPrefillMoeSegments || v.seg_rows == 0 || T <= (S - 1U) * v.seg_rows || T > S * v.seg_rows ||
+        T - (S - 1U) * v.seg_rows < prefill_moe_group_min_rows() || v.experts == nullptr)
+        throw std::invalid_argument("minimax prefill moe: invalid group view");
+    for (unsigned c = 0; c < S; ++c)
+        if (v.y[c] == nullptr || v.routes[c] == nullptr || v.out[c] == nullptr)
+            throw std::invalid_argument("minimax prefill moe: invalid group view");
+    const DevLayout l = dev_layout(T, false, kGwClasses);
+    if (workspace == nullptr || workspace_bytes < l.bytes) throw std::invalid_argument("minimax prefill moe: workspace too small");
+    auto* ws = static_cast<unsigned char*>(workspace);
+    dp::Args<GwPolicy> a{};
+    a.rows = T;
+    dp::bind_scratch(a, ws + l.scratch, T);
+    a.flag = dev_flag();
+    a.out.groups = reinterpret_cast<PGroup*>(ws + l.groups);
+    a.out.pair_row = reinterpret_cast<std::uint32_t*>(ws + l.pair_row);
+    a.out.pair_group = reinterpret_cast<std::uint32_t*>(ws + l.pair_group);
+    a.out.tok_pair = reinterpret_cast<std::uint32_t*>(ws + l.tok_pair);
+    a.out.tok_w = reinterpret_cast<float*>(ws + l.tok_w);
+    a.out.items = reinterpret_cast<pfk::Item*>(ws + l.items);
+    a.out.meta = reinterpret_cast<DevMeta*>(ws + l.meta);
+    a.out.experts = v.experts;
+    a.out.shared = v.shared;
+    a.out.xt = reinterpret_cast<_Float16*>(ws + l.xt);
+    a.out.at = reinterpret_cast<_Float16*>(ws + l.at);
+    a.out.part = reinterpret_cast<float*>(ws + l.part);
+    a.out.tpairs = l.tpairs;
+    a.out.seg_count = reinterpret_cast<unsigned*>(ws + l.seg_count);
+    a.out.seg_rows = v.seg_rows;
+    a.out.segments = S;
+    for (unsigned c = 0; c < S; ++c) a.out.seg_routes[c] = v.routes[c];
+    const auto grids = class_grids(T, kGwClasses, S);
+    for (unsigned c = 0; c < 16; ++c) a.out.grid[c] = grids[c];
+    mark("start", stream);
+    ok(hipMemsetAsync(a.out.seg_count, 0, std::size_t{kPrefillMoeSegments} * kExperts * sizeof(unsigned), stream), "group counts");
+    hipLaunchKernelGGL(seg_count_kernel, dim3((T + 255U) / 256U), dim3(256), 0, stream, a);
+    launched("group counts");
+    ok(dp::enqueue(a, stream), "device plan");
+    Tables t{};
+    t.groups = a.out.groups;
+    t.pair_row = a.out.pair_row;
+    t.pair_group = a.out.pair_group;
+    t.tok_pair = a.out.tok_pair;
+    t.tok_w = a.out.tok_w;
+    t.xt = a.out.xt;
+    t.at = a.out.at;
+    t.part = a.out.part;
+    t.pairs = 5U * T;
+    t.rows = T;
+    t.shared_group = GwPolicy::kExperts;
+    t.tpairs = l.tpairs;
+    t.seg_rows = v.seg_rows;
+    for (unsigned c = 0; c < S; ++c) t.seg_y[c] = v.y[c], t.seg_out[c] = v.out[c];
+    launch_device_planned(t, nullptr, nullptr, a.out.items, a.out.meta, grids, GwPolicy::kGuSlot, GwPolicy::kDnSlot,
+                          prefill_gather_tok(), stream);
 }
 
 }  // namespace
@@ -1598,6 +1775,13 @@ void enqueue_prefill_moe_device(const PrefillMoeDeviceView& v, void* workspace, 
                                 hipStream_t stream) {
     if (!prefill_moe_device_plan(v.rows)) throw std::invalid_argument("minimax prefill moe: device plan not selected for this call");
     enqueue_device_moe(v, workspace, workspace_bytes, stream);
+}
+
+unsigned prefill_moe_group_min_rows() { return 97; }  // every chunk's shared expert (and class 0) at splits 1
+std::size_t prefill_moe_group_workspace_bound(std::uint32_t rows) { return dev_layout(rows, false, kGwClasses).bytes; }
+void enqueue_prefill_moe_group(const PrefillMoeGroupView& v, void* workspace, std::size_t workspace_bytes, hipStream_t stream) {
+    if (!prefill_moe_device_plan(v.rows)) throw std::invalid_argument("minimax prefill moe: device plan not selected for this call");
+    enqueue_group_moe(v, workspace, workspace_bytes, stream);
 }
 
 void prefill_moe_device_check() {

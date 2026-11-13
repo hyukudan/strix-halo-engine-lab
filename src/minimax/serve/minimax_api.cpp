@@ -217,6 +217,7 @@ MinimaxApi::MinimaxApi(ApiTokenizer tokenizer, sv::GenerationQueue& queue, Minim
     // notes retain the requested filter/seed data without changing planner input.
     config.prepare_job=[](const sv::HttpRequest&,const sv::Json&,sv::GenerationJob& job) { job.sampling={}; };
     config.output_parser=[](const std::string& text,bool,const sv::Json&) { return parse_output(text); };
+    config.tools_off_marker="]<]minimax[>[<tool_call>"; // tool_choice "none": a call block is withheld, not sent as text
     config.terminal_data=[shared_options](const sv::GenerationTicket& ticket) {
         const auto extra=shared_options->take_extra ? shared_options->take_extra(ticket) : std::nullopt;
         sv::ApiTerminalData data;

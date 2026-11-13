@@ -133,6 +133,9 @@ public:
                      "<parameter=days>\n2\n</parameter>\n</function>\n</tool_call><|im_end|>";
         if (prompt.find("LONG") != std::string::npos) { script.clear(); for (int i = 0; i < 400; ++i) script += "word "; }
         if (prompt.find("<think>\n\n</think>") != std::string::npos) script = "Plain answer.<|im_end|>";
+        if (prompt.find("IMITATE") != std::string::npos)  // a history with an earlier call: the model repeats it
+            script = "Need weather.\n</think>\n\nChecking.\n\n<tool_call>\n<function=get_weather>\n<parameter=city>\nOslo\n</parameter>\n"
+                     "</function>\n</tool_call><|im_end|>";
         const auto ids = tokenizer_->encode(script, true);
         GenerationStats stats;
         stats.prompt_tokens = job.prompt.size();
@@ -2279,6 +2282,74 @@ int main() try {
         const auto content = stream_text(r.body, &reasoning, &finish, &usage, nullptr);
         check(content == "Hello there, friend." && reasoning == "Let me think.", "chat stream deltas [" + content + "] [" + reasoning + "]");
         check(finish == "stop" && usage && r.body.ends_with("data: [DONE]\n\n"), "chat stream finish, usage and [DONE]");
+    }
+    {
+        // tool_choice "none" after a history with tool calls (Chat, Responses, Messages; streamed or not): the scripted
+        // model imitates the earlier call, the reply carries no call and no frame text, and the prompt closes with the
+        // instruction. The same history without tool_choice "none" keeps its prompt and its call.
+        const std::string held = "Checking.\n\n[tool call to get_weather withheld: tool_choice is \"none\"]";
+        const std::string history = R"("messages":[{"role":"user","content":"IMITATE please"},
+            {"role":"assistant","content":"","tool_calls":[{"id":"call_1","type":"function","function":{"name":"get_weather","arguments":"{\"city\":\"Oslo\"}"}}]},
+            {"role":"tool","tool_call_id":"call_1","content":"sunny"}],
+            "tools":[{"type":"function","function":{"name":"get_weather","parameters":{"type":"object","properties":{"city":{"type":"string"},"days":{"type":"integer"}}}}}])";
+        const auto plain = parse_json("{" + history + "}"), automatic = parse_json("{" + history + R"(,"tool_choice":"auto"})"),
+            none = parse_json("{" + history + R"(,"tool_choice":"none"})");
+        check(api.chat_prompt(plain) == api.chat_prompt(automatic), "tool_choice auto renders the default prompt");
+        const auto off = tokenizer->decode(api.chat_prompt(none));
+        check(off.find(no_tools_hint) != std::string::npos && off.find("sunny") < off.find(no_tools_hint) && off.find("\"parameters\"") == std::string::npos,
+            "tool_choice none prompt: history, instruction, no definitions");
+        const auto kept = first_choice(parse_json(http(port, "POST", "/v1/chat/completions", plain.dump(), auth).body));
+        check(at(kept, "finish_reason").as_string() == "tool_calls" && at(kept, "message").find("tool_calls"), "history without tool_choice none still calls");
+        const auto j = parse_json(http(port, "POST", "/v1/chat/completions", none.dump(), auth).body);
+        const auto& choice = first_choice(j);
+        check(at(choice, "finish_reason").as_string() == "stop" && !at(choice, "message").find("tool_calls") &&
+                  at(at(choice, "message"), "content").as_string() == held, "chat tool_choice none withholds the call " + j.dump());
+        auto streamed = none; streamed.set("stream", Json(true));
+        std::string text, finish; bool called = false;
+        for (const auto& event : sse_data(http(port, "POST", "/v1/chat/completions", streamed.dump(), auth).body)) {
+            const auto* choices = event.find("choices");
+            if (!choices || choices->size() == 0U) continue;
+            const auto& c = choices->as_array()[0];
+            if (const auto* f = c.find("finish_reason"); f && f->is_string()) finish = f->as_string();
+            const auto* delta = c.find("delta");
+            if (!delta) continue;
+            if (delta->find("tool_calls")) called = true;
+            if (const auto* content = delta->find("content"); content && content->is_string()) text += content->as_string();
+        }
+        check(text == held && finish == "stop" && !called, "chat stream tool_choice none withholds the call [" + text + "] " + finish);
+
+        const std::string input = R"("input":[{"role":"user","content":"IMITATE please"},
+            {"type":"function_call","call_id":"call_1","name":"get_weather","arguments":"{\"city\":\"Oslo\"}"},
+            {"type":"function_call_output","call_id":"call_1","output":"sunny"}],
+            "tools":[{"type":"function","name":"get_weather","parameters":{"type":"object","properties":{"city":{"type":"string"}}}}],"tool_choice":"none")";
+        for (const bool stream : {false, true}) {
+            auto request = parse_json("{" + input + "}"); request.set("stream", Json(stream));
+            const auto r = http(port, "POST", "/v1/responses", request.dump(), auth);
+            const Json response = stream ? at(sse_data(r.body).back(), "response") : parse_json(r.body);
+            bool call = false; std::string message;
+            for (const auto& item : at(response, "output").as_array()) {
+                if (at(item, "type").as_string() == "function_call") call = true;
+                if (at(item, "type").as_string() == "message") message = at(at(item, "content").as_array().at(0), "text").as_string();
+            }
+            check(!call && message == held && at(response, "status").as_string() == "completed",
+                std::string("responses tool_choice none withholds the call") + (stream ? " (stream) " : " ") + response.dump());
+            if (stream) check(r.body.find("function_call_arguments") == std::string::npos && r.body.find("withheld") != std::string::npos, "responses stream sends the notice, no call events");
+        }
+
+        const std::string turns = R"("max_tokens":1000,"messages":[{"role":"user","content":"IMITATE please"},
+            {"role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"get_weather","input":{"city":"Oslo"}}]},
+            {"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_1","content":"sunny"}]}],
+            "tools":[{"name":"get_weather","input_schema":{"type":"object","properties":{"city":{"type":"string"}}}}],"tool_choice":{"type":"none"})";
+        const auto m = parse_json(http(port, "POST", "/v1/messages", "{" + turns + "}", "x-api-key: secret\r\n").body);
+        bool used = false; std::string said;
+        for (const auto& block : at(m, "content").as_array()) {
+            if (at(block, "type").as_string() == "tool_use") used = true;
+            if (at(block, "type").as_string() == "text") said = at(block, "text").as_string();
+        }
+        check(!used && said == held && at(m, "stop_reason").as_string() == "end_turn", "messages tool_choice none withholds the call " + m.dump());
+        const auto events = http(port, "POST", "/v1/messages", "{" + turns + R"(,"stream":true})", "x-api-key: secret\r\n").body;
+        check(events.find("tool_use") == std::string::npos && events.find("input_json_delta") == std::string::npos &&
+                  events.find("withheld: tool_choice") != std::string::npos && events.find("\"end_turn\"") != std::string::npos, "messages stream tool_choice none withholds the call");
     }
     {
         const std::string body = R"({"messages":[{"role":"user","content":"TOOL please"}],"tools":[{"type":"function","function":{"name":"get_weather",

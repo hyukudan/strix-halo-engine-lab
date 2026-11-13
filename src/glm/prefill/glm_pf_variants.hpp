@@ -27,7 +27,7 @@ inline constexpr PfVariant kPfVariants[] = {
     {"STRIX_GLM_PF_MLA_GEMM", "3|2|1", 3U},
     {"STRIX_GLM_PF_SCORES", "7|6|5|4|3|2", 7U},
     {"STRIX_GLM_PF_KDA_SCAN", "5|3|1", 5U},
-    {"STRIX_GLM_PF_DENSE_ROWS", "3|2|1", 3U},
+    {"STRIX_GLM_PF_DENSE_ROWS", "3|4|2|1", 3U},
 };
 
 inline const PfVariant* pf_variant_find(std::string_view env) {

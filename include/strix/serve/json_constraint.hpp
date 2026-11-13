@@ -2,7 +2,9 @@
 
 #include "strix/serve/json.hpp"
 #include "strix/serve/bpe_tokenizer.hpp"
+#include <atomic>
 #include <memory>
+#include <optional>
 #include <span>
 #include <stdexcept>
 #include <vector>
@@ -105,6 +107,10 @@ struct AllowedTokens {
 };
 AllowedTokens allowed(const ConstraintProgram&, const ConstraintCursor&, const TokenByteTrie&,
                       std::span<const std::uint32_t> eos_ids = {});
+// The same walk, abandoned (nullopt, nothing cached) once `stop` is set: for a walk whose result may no
+// longer be wanted. A completed walk returns exactly allowed().
+std::optional<AllowedTokens> allowed_until(const ConstraintProgram&, const ConstraintCursor&, const TokenByteTrie&,
+                                           std::span<const std::uint32_t> eos_ids, const std::atomic<bool>& stop);
 std::uint32_t constrained_greedy(std::span<const float> logits, const AllowedTokens&);
 }  // namespace strix::serve
 

@@ -373,9 +373,12 @@ std::vector<std::vector<float>> HipKnownPromptBackend::execute_group(HipKnownPro
             if (self.failed) throw std::logic_error("known prompt adapter cannot be reused after an exception");
             self.started = true;
             self.guard->require_original();
-            const auto rows = self.window->logical_rows();
+            // A partial member runs the first tokens.size() rows of its tiled owner, as execute_rows_partial does alone.
+            const auto rows = member.partial ? static_cast<std::uint32_t>(member.tokens.size()) : self.window->logical_rows();
             const auto policy = self.window->output_policy();
             validate_known_window_output_policy(policy);
+            if (member.partial && (rows < 16U || rows % 8U || rows > self.window->logical_rows()))
+                throw std::invalid_argument("known prompt group partial block needs 16..T rows in multiples of 8");
             if (!self.window->supports_tiled_prefill() || self.all_rows_sink || policy == KnownWindowOutputPolicy::all_rows ||
                 (member.logits && policy == KnownWindowOutputPolicy::state_only))
                 throw std::invalid_argument("known prompt group members are terminal-row or state-only tiled blocks");

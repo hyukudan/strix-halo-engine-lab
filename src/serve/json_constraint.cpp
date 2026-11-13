@@ -1359,7 +1359,20 @@ struct ConstraintAccess {
     static auto identity(const TokenByteTrie& t) { return t.identity_; }
     static const auto& state(const ConstraintCursor& c) { return *c.state_; }
 };
+namespace {
+std::optional<AllowedTokens> walk_allowed(const ConstraintProgram& program, const ConstraintCursor& cursor, const TokenByteTrie& trie,
+                                          std::span<const std::uint32_t> eos_ids, const std::atomic<bool>* stop);
+}
 AllowedTokens allowed(const ConstraintProgram& program, const ConstraintCursor& cursor, const TokenByteTrie& trie, std::span<const std::uint32_t> eos_ids) {
+    return std::move(*walk_allowed(program, cursor, trie, eos_ids, nullptr));
+}
+std::optional<AllowedTokens> allowed_until(const ConstraintProgram& program, const ConstraintCursor& cursor, const TokenByteTrie& trie,
+                                           std::span<const std::uint32_t> eos_ids, const std::atomic<bool>& stop) {
+    return walk_allowed(program, cursor, trie, eos_ids, &stop);
+}
+namespace {
+std::optional<AllowedTokens> walk_allowed(const ConstraintProgram& program, const ConstraintCursor& cursor, const TokenByteTrie& trie,
+                                          std::span<const std::uint32_t> eos_ids, const std::atomic<bool>* stop) {
     if (!ConstraintAccess::same(program, cursor)) throw ConstraintError("cursor belongs to a different program");
     AllowedTokens mask{trie.vocab_size(), std::vector<std::uint64_t>((trie.vocab_size() + 63) / 64)};
     const auto cache = ConstraintAccess::cache(program);
@@ -1371,7 +1384,8 @@ AllowedTokens allowed(const ConstraintProgram& program, const ConstraintCursor& 
     }
     // Iterative DFS: token length never consumes the native call stack.
     std::vector<std::pair<std::size_t, ConstraintCursor>> pending; pending.emplace_back(0, cursor);
-    while (!pending.empty()) {
+    for (std::size_t visited = 0; !pending.empty(); ++visited) {
+        if (stop && (visited & 255U) == 0 && stop->load(std::memory_order_relaxed)) return std::nullopt;
         auto [at, state] = std::move(pending.back()); pending.pop_back();
         for (auto id : trie.nodes()[at].ids) mask.set(id);
         for (auto [b, next] : trie.nodes()[at].edges) { auto copy = state; if (copy.advance(b)) pending.emplace_back(next, std::move(copy)); }
@@ -1380,6 +1394,7 @@ AllowedTokens allowed(const ConstraintProgram& program, const ConstraintCursor& 
     for (auto id : eos_ids) mask.set(id, cursor.complete());
     return mask;
 }
+}  // namespace
 std::uint32_t constrained_greedy(std::span<const float> logits, const AllowedTokens& mask) {
     if (logits.size() != mask.vocab_size) throw ConstraintError("logit vocabulary mismatch");
     std::uint32_t best = UINT32_MAX; float score = -std::numeric_limits<float>::infinity();

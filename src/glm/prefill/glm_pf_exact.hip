@@ -156,22 +156,23 @@ __global__ __launch_bounds__(256) void x3_kernel(Mat m, const _Float16* t, float
 }
 // FAST glm-pf-wmma-x (STRIX_GLM_PF_WMMA=1): 64-row blocks on the WMMA core.
 template<int B, unsigned Rows = 64, unsigned CP = 1, bool FusedInput = false>
-__global__ __launch_bounds__(256) __attribute__((amdgpu_waves_per_eu(6))) void w_kernel(Mat m, const _Float16* t, float* y, std::size_t ys, unsigned rows, const float* raw = nullptr, std::size_t xs = 0) {
+__global__ __launch_bounds__(256) __attribute__((amdgpu_waves_per_eu(6))) void w_kernel(Mat m, const _Float16* t, float* y, std::size_t ys, unsigned rows, const float* raw = nullptr, std::size_t xs = 0, unsigned all_frag = 0U) {
     __shared__ wmma_x::StorageR<Rows, FusedInput ? 68U : 36U> lds;
     const unsigned row0 = blockIdx.y * Rows;
     const unsigned nr = rows - row0 < Rows ? rows - row0 : Rows;
     auto at = [&](unsigned r, unsigned) { return XRows{t, y, ys, m.input, row0 + r}; };
-    if constexpr (FusedInput) wmma_x::span<B, CP>(m, at, nr, lds, aux::Store{}, aux::H128Input{raw, xs, row0});
-    else wmma_x::span<B, CP>(m, at, nr, lds);
+    if constexpr (FusedInput) wmma_x::span<B, CP>(m, at, nr, lds, aux::Store{}, aux::H128Input{raw, xs, row0}, all_frag != 0U);
+    else wmma_x::span<B, CP>(m, at, nr, lds, aux::Store{}, aux::StagedInput{}, all_frag != 0U);
 }
 template<int B, bool Fused>
 void launch_w(Mat m, const _Float16* t, float* y, std::size_t ys, unsigned rows, hipStream_t s,
               const float* raw, std::size_t xs) {
+    const unsigned af = wmma_x::all_fragments();
     if (wmma_x::tile_rows() == 128U && wmma_x::cols_per_wave() == 2U)
-        w_kernel<B, 128, 2, Fused><<<dim3(m.output / 128U, (rows - 1U) / 128U + 1U), 256, 0, s>>>(m, t, y, ys, rows, raw, xs);
+        w_kernel<B, 128, 2, Fused><<<dim3(m.output / 128U, (rows - 1U) / 128U + 1U), 256, 0, s>>>(m, t, y, ys, rows, raw, xs, af);
     else if (wmma_x::tile_rows() == 128U)
-        w_kernel<B, 128, 1, Fused><<<dim3(m.output / 128U, (rows - 1U) / 128U + 1U), 256, 0, s>>>(m, t, y, ys, rows, raw, xs);
-    else w_kernel<B, 64, 1, Fused><<<dim3(m.output / 128U, (rows - 1U) / 64U + 1U), 256, 0, s>>>(m, t, y, ys, rows, raw, xs);
+        w_kernel<B, 128, 1, Fused><<<dim3(m.output / 128U, (rows - 1U) / 128U + 1U), 256, 0, s>>>(m, t, y, ys, rows, raw, xs, af);
+    else w_kernel<B, 64, 1, Fused><<<dim3(m.output / 128U, (rows - 1U) / 64U + 1U), 256, 0, s>>>(m, t, y, ys, rows, raw, xs, af);
 }
 template<int B, unsigned TM>
 void launch(Mat m, const _Float16* t, float* y, std::size_t ys, unsigned rows, hipStream_t s, std::size_t* scratch) {

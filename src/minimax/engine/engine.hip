@@ -506,6 +506,7 @@ struct Engine::Impl {
     std::vector<hipEvent_t> xb_attn_ev;  // per layer: q/k/v and index projections done (the warm's gate), re-recorded each step
     std::uint64_t xb_warm_o_count = 0;
     bool xb_prep = false;      // STRIX_MM_XB_PREP=1: the FFN post_exchange writes the next layer's q/k/v input transform (no prepare launch)
+    bool xb_fold = true;       // exchange row fold when the module has fold slots (STRIX_MMX_FOLD=rows)
     bool xb_prepped = false;   // the next q/k/v call's inputs were transformed by the post_exchange just enqueued
     unsigned xb_layers = 0;    // layers of the current layers_forward call (the fold needs a next layer)
     bool index_attn = true;  // STRIX_MM_INDEX_PROJ (runtime; default attn = index_proj, decode and prefill)
@@ -524,6 +525,11 @@ struct Engine::Impl {
     bool pf_dense_qkv = true;  // STRIX_MM_PF_DENSE_QKV (default ON): prefill q/k/v in one v4-core call from 1024 rows (same bits as strix_gemm); =0 library
     unsigned pf_idx_rows = 32;
     unsigned pf_msa_rework = 10;  // STRIX_MM_PF_MSA_REWORK: prefill only, default 10 (in-block chunk loop, LDS-staged block list/partials, no global partials); =8 (= 7 with the 16-key tile max as an exact ds_swizzle lane tree) / =7 / =6 / =5 / =3 previous defaults, =0 original, =9 DPP diagnostic
+    // STRIX_MM_PF_MSA_FLASH (FAST, lossy, opt-in; 1 | 2): prefill MSA attention of windows > 8 rows on the shared BF16 WMMA key-split
+    // flash core instead of the exact in-block kernel; selection, block lists and K/V caches unchanged.
+    unsigned pf_msa_flash = 0;
+    static constexpr const char* kMsaFlashLayers = "40-59";  // measured on the EXL3 format: passes the 8K FAST gate with either operand form; 20-59 does not
+    strix::core::LayerSet pf_msa_flash_layers;  // STRIX_MM_PF_MSA_FLASH_LAYERS: layers that use it (unset: kMsaFlashLayers)
     bool pf_msa_batch = true;  // STRIX_MM_PF_MSA_BATCH (default ON, exact measurement): independent scratch per prefill window
     unsigned pf_msa_windows = 0;
     float *pf_scores = nullptr, *pf_partial = nullptr;
@@ -569,6 +575,13 @@ struct Engine::Impl {
     unsigned pf_group = strix::pair::prefill_group::kDefault;  // STRIX_MM_PF_GROUP: chunks interleaved together (2..8;
                                                // clamped to the prompt's chunk count, and to the exchange depth)
     std::vector<float*> grp_h, grp_hn;         // residual / normed rows of group members 1.. (member 0 uses h / hn)
+    // STRIX_MM_PF_MOE_GROUP: chunks of the group per group-wide EXL3 MoE call (strix/pair/prefill_group.hpp moe_width;
+    // 0 = automatic, 1 = one call per chunk). Same bits at every width.
+    unsigned pf_moe_group = strix::pair::prefill_group::kMoeAuto;
+    unsigned pf_moe_cap = 1;                   // widest sub-group the start-up buffers admit
+    std::vector<std::uint32_t*> grp_route;     // router tables of group members 1.. (member 0 uses route_d)
+    void* pf_gws = nullptr;                    // group-wide MoE workspace (pf_moe_cap chunks)
+    std::size_t pf_gws_bytes = 0;
     std::vector<float*> grp_part, grp_remote;  // communicator backend: each member's local / peer partials (member 0: part / remote)
     bool pf_comm_interleave = true;            // the communicator backend is available (start/finish; used when the module is off)
     // DSpark taps: residual after layers 3, 17, 31, 45, 59 of the current call's rows, [rows][5][6144]
@@ -778,6 +791,7 @@ struct Engine::Impl {
         // width is clamped to the prompt's chunk count at run time; an explicit value is honoured as given.
         pf_group_explicit = std::getenv("STRIX_MM_PF_GROUP") != nullptr && *std::getenv("STRIX_MM_PF_GROUP") != '\0';
         pf_group = strix::pair::prefill_group::width_from_env(std::getenv("STRIX_MM_PF_GROUP"), "STRIX_MM_PF_GROUP");
+        pf_moe_group = strix::pair::prefill_group::moe_width_from_env(std::getenv("STRIX_MM_PF_MOE_GROUP"), "STRIX_MM_PF_MOE_GROUP");
         const char* pid = std::getenv("STRIX_MM_PREFILL_IDENTITY");
         fp32_prefill = route::fp32_profile(pid);
         if (fp32_prefill && (!linears_loaded || !moe_opt)) throw std::invalid_argument("STRIX_MM_PREFILL_IDENTITY=fp32 needs STRIX_MM_LINEARS and STRIX_MM_MOE on");
@@ -789,6 +803,21 @@ struct Engine::Impl {
             else if (m != "exl3") throw std::invalid_argument("STRIX_MMX_MODEL_FORMAT must be exl3 or fast_i4");
         }
         i4_shadow = env_flag("STRIX_MMX_FAST_I4_SHADOW", false);
+        // FAST identity (lossy): 1 = one-term BF16 operands, 2 = two-term (hi + lo) queries and probabilities, 0 = the
+        // exact in-block kernel (default: opt-in, also with the FAST_I4 format, whose INT4 layers amplify the change
+        // past the gate). The layer set defaults to the deepest layers (kMsaFlashLayers): the quality gate fails
+        // when shallower layers use it, because every later block selection sees the changed activations.
+        if (const char* fl = std::getenv("STRIX_MM_PF_MSA_FLASH")) {
+            const std::string mode = fl;
+            if (mode != "0" && mode != "1" && mode != "2") throw std::invalid_argument("STRIX_MM_PF_MSA_FLASH must be 0, 1 or 2");
+            pf_msa_flash = static_cast<unsigned>(mode[0] - '0');
+        }
+        {
+            const char* fl = std::getenv("STRIX_MM_PF_MSA_FLASH_LAYERS");
+            pf_msa_flash_layers = strix::core::parse_layer_set(fl == nullptr || fl[0] == 0 ? kMsaFlashLayers : fl, 0, kLayers, "STRIX_MM_PF_MSA_FLASH_LAYERS");
+        }
+        if (pf_msa_flash != 0)
+            std::fprintf(stderr, "prefill identity mm-pf-msa-flash FAST (bf16 WMMA key-split MSA attend, %u-term operands, %u layers)\n", pf_msa_flash, pf_msa_flash_layers.count());
         if (i4_shadow && !model_fast_i4)
             throw std::invalid_argument("STRIX_MMX_FAST_I4_SHADOW needs STRIX_MMX_MODEL_FORMAT=fast_i4");
         if (model_fast_i4) {
@@ -1181,7 +1210,15 @@ struct Engine::Impl {
             std::fprintf(stderr, "mm rank %u: prefill group width %u (STRIX_MM_PFX_DEPTH)\n", static_cast<unsigned>(opt.rank), pf_group);
         }
         if (pf != nullptr || pf_comm_interleave) {  // at start-up: no multi-GB allocation inside a prefill (KFD queue eviction)
+            pf_moe_cap = moe_opt ? strix::pair::prefill_group::moe_width(pf_moe_group, pf_group) : 1U;
+            if (pf_moe_cap > 1) {
+                pf_gws_bytes = mmoe::prefill_moe_group_workspace_bound(static_cast<std::uint32_t>(pf_moe_cap * T));
+                hip_ok(hipMalloc(&pf_gws, pf_gws_bytes), "prefill group moe workspace");
+                std::fprintf(stderr, "mm rank %u: prefill MoE sub-group width up to %u (workspace %.2f GiB)\n",
+                             static_cast<unsigned>(opt.rank), pf_moe_cap, static_cast<double>(pf_gws_bytes) / 1073741824.0);
+            }
             for (unsigned g = 1; g < pf_group; ++g) {
+                if (pf_moe_cap > 1) grp_route.push_back(dalloc<std::uint32_t>(2 * T * kTopE));
                 grp_h.push_back(dalloc<float>(T * kHidden));
                 grp_hn.push_back(dalloc<float>(T * kHidden));
                 if (pf_comm_interleave) {
@@ -1442,6 +1479,9 @@ struct Engine::Impl {
             xb_tx = nullptr;
             xb_pt = {};
             xb_published = false;
+            // STRIX_MMX_FOLD=N (xport row fold): for at most N rows the pair sum p0 + p1 is computed by the exchange
+            // progress thread before the RX flag; post_exchange reads one folded slot (x = h + folded, same bits).
+            if (xb_fold && xf->can_fold(bytes)) xf->fold_next(strix::xport::RowFold::sum_f32);
             const auto xticket = inplace
                 ? backend.post_publish(tag, bytes, self_pub ? mx::Publish::producer : mx::Publish::kernel)
                 : backend.post_copy(tag, local, bytes);
@@ -1464,6 +1504,10 @@ struct Engine::Impl {
             wts4_d = reinterpret_cast<float*>(route_d + n * kTopE);
             pv.part0 = opt.rank == 0 ? local : peer;
             pv.part1 = opt.rank == 0 ? peer : local;
+            if (const void* folded = xf->last_folded()) {
+                pv.part0 = static_cast<const float*>(folded);
+                pv.part1 = nullptr;
+            }
             pv.weights = wts4_d;
             xb_prepped = false;
             if (xb_prep && which == 1 && layer + 1 < xb_layers && linears_opt) {  // fold the next layer's q/k/v prepare
@@ -1803,7 +1847,7 @@ struct Engine::Impl {
                         dv.idx_count = pf_cnt;
                         dv.partial = pf_partial;
                         dv.ticket = pf_ticket;
-                        mfused::enqueue_prefill({dv, static_cast<std::uint32_t>(n), pos0, pf_msa_windows, 0, pf_idx_tile && n > 8, pf_idx_rows, n > 8 ? pf_msa_rework : 0U}, nullptr, tl ? PrefillTimeline::msa_mark : nullptr, tl);
+                        mfused::enqueue_prefill({dv, static_cast<std::uint32_t>(n), pos0, pf_msa_windows, 0, pf_idx_tile && n > 8, pf_idx_rows, n > 8 ? (pf_msa_flash != 0 && pf_msa_rework != 0 && pf_msa_flash_layers.test(L) ? 10U + pf_msa_flash : pf_msa_rework) : 0U}, nullptr, tl ? PrefillTimeline::msa_mark : nullptr, tl);
                         break;
                     }
                     mfused::enqueue_decode(dv, nullptr);
@@ -1927,6 +1971,27 @@ struct Engine::Impl {
         hip_ok(hipStreamSynchronize(nullptr), "i4 shadow sums");
         if (!task.shadow) throw std::logic_error("i4 shadow: no active prefill task");
         task.shadow->add(L, n, sums);
+    }
+
+    // Chunks per group-wide MoE call for layer L of a unit of m chunks (1 = one stage_ffn per chunk). The conditions are
+    // those of stage_ffn_impl's device-plan branch for an EXL3 layer; identical on both ranks.
+    std::size_t pf_moe_width(unsigned L, bool i4_layer, std::size_t m) const {
+        if (pf_gws == nullptr || i4_layer || !layers[L].moe || !moe_opt || gemv || fp32_prefill || pf_table_stats || profiling ||
+            !mmoe::prefill_moe_device_plan(opt.max_rows))
+            return 1;
+        return std::min<std::size_t>(pf_moe_cap, strix::pair::prefill_group::moe_width(pf_moe_group, static_cast<unsigned>(m)));
+    }
+    // One group-wide MoE call (gv: the chunks' normed rows, router tables and outputs).
+    void stage_ffn_group(unsigned L, mmoe::PrefillMoeGroupView& gv) {
+        const Layer& y = layers[L];
+        gv.experts = y.experts_raw_d;
+        gv.shared = y.shared_raw;
+        struct TimelineMoe {
+            bool on;
+            ~TimelineMoe() { if (on) mmoe::set_prefill_marker(nullptr, nullptr); }
+        } timeline_moe{tl != nullptr};
+        if (tl) mmoe::set_prefill_marker(PrefillTimeline::moe_mark, tl);
+        mmoe::enqueue_prefill_moe_group(gv, pf_gws, pf_gws_bytes, nullptr);
     }
 
     void stage_ffn_impl(unsigned L, std::size_t n, float* out, const mmoe::I4Layer* prefill_i4,
@@ -2409,7 +2474,9 @@ struct Engine::Impl {
         float* const h0 = h;
         float* const hn0 = hn;
         std::array<float*, kPfGroupMax> H{}, HN{}, P{}, R{};
+        std::array<std::uint32_t*, kPfGroupMax> RT{};  // router tables (per member when group-wide MoE calls are on)
         std::array<std::size_t, kPfGroupMax> N{};
+        std::uint32_t* const route0 = route_d;
         auto& fences = pf_fences[child_bank ? 1U : 0U];
         const double pipeline_reuse_before = comm.stats().pipeline_reuse_wait;
         const double host_reuse_before = comm.stats().host_reuse_wait;
@@ -2417,6 +2484,7 @@ struct Engine::Impl {
         for (std::size_t c = 0; c < m; ++c) {
             H[c] = c == 0 ? h0 : grp_h[c - 1];
             HN[c] = c == 0 ? hn0 : grp_hn[c - 1];
+            RT[c] = c == 0 || grp_route.empty() ? route0 : grp_route[c - 1];
             P[c] = !via_comm ? part : c == 0 ? part : grp_part[c - 1];  // the module copies `part` into its TX slot at once
             R[c] = !via_comm ? nullptr : c == 0 ? remote : grp_remote[c - 1];
             N[c] = std::min<std::size_t>(opt.max_rows, toks.size() - c * opt.max_rows);
@@ -2435,18 +2503,21 @@ struct Engine::Impl {
         const auto use = [&](std::size_t c) {
             h = H[c];
             hn = HN[c];
+            route_d = ids_d = RT[c];
             pf_idx_member = c;
             if (tl) tl->context(task.c + c, tl->layer);
         };
         struct Restore {
             Impl& e;
             float *saved_h, *saved_hn;
+            std::uint32_t* saved_route;
             ~Restore() {
                 e.h = saved_h;
                 e.hn = saved_hn;
+                e.route_d = e.ids_d = saved_route;
                 e.pf_idx_member = 0;
             }
-        } restore{*this, h0, hn0};
+        } restore{*this, h0, hn0, route0};
         // Communicator backend: one exchange in flight (its start() / finish() contract). Sends are finished in FIFO
         // order; a receive finishes its exchange if it is the one in flight (the CPU waits while the GPU computes the
         // other chunk's stage, enqueued before).
@@ -2549,16 +2620,57 @@ struct Engine::Impl {
                 send(c, 0, L, o);
             }
             const auto* i4 = i4_on && i4_jit_layer(L) ? jit_acquire(L, L1) : nullptr;
-            for (std::size_t c = 0; c < m; ++c) {
+            const auto post_router = [&](std::size_t c) {
                 use(c);
                 const auto view = recv(c);
                 if (tl) tl->mark("attention-post-router", true);
                 post_view(N[c], view, y.w_post, y.wr, y.wb);
                 last_read(c);
                 if (tl) tl->mark("attention-post-router", false);
-                float* o = out_of(c);
-                stage_ffn(L, N[c], o, i4);
-                send(c, 1, L, o);
+            };
+            const std::size_t moe_w = pf_moe_width(L, i4 != nullptr, m);
+            for (std::size_t c0 = 0; c0 < m;) {
+                // A sub-group runs as one group-wide MoE call when every member writes its own output buffer (the
+                // module's TX slots in place, or the communicator's per-member partials) and has the rows the
+                // group-wide plan needs; any other span keeps one call per chunk.
+                const std::size_t span = std::min<std::size_t>(moe_w, m - c0);
+                bool grouped = span >= 2;
+                for (std::size_t c = c0; grouped && c < c0 + span; ++c)
+                    grouped = N[c] >= mmoe::prefill_moe_group_min_rows() && (c + 1 == c0 + span || N[c] == opt.max_rows) &&
+                              (via_comm || pf_inplace || (pf_tx_uncached && N[c] > kMaxStepRows));
+                if (!grouped) {
+                    for (std::size_t c = c0; c < c0 + span; ++c) {
+                        post_router(c);
+                        float* o = out_of(c);
+                        stage_ffn(L, N[c], o, i4);
+                        send(c, 1, L, o);
+                    }
+                    c0 += span;
+                    continue;
+                }
+                mmoe::PrefillMoeGroupView gv;
+                gv.segments = static_cast<std::uint32_t>(span);
+                gv.seg_rows = static_cast<std::uint32_t>(opt.max_rows);
+                std::array<float*, kPfGroupMax> O{};
+                for (std::size_t sm = 0; sm < span; ++sm) {
+                    const std::size_t c = c0 + sm;
+                    post_router(c);
+                    gv.rows += static_cast<std::uint32_t>(N[c]);
+                    gv.y[sm] = HN[c];
+                    gv.routes[sm] = RT[c];
+                }
+                for (std::size_t sm = 0; sm < span; ++sm) {
+                    wait_source(c0 + sm);
+                    O[sm] = via_comm ? P[c0 + sm] : static_cast<float*>(pf->tx(static_cast<unsigned>(sm)));
+                    gv.out[sm] = O[sm];
+                }
+                use(c0);
+                stage_ffn_group(L, gv);
+                for (std::size_t sm = 0; sm < span; ++sm) {
+                    use(c0 + sm);
+                    send(c0 + sm, 1, L, O[sm]);
+                }
+                c0 += span;
             }
             if (i4 != nullptr) jit_release(L);
         }
@@ -3283,6 +3395,8 @@ void Engine::set_xb_inplace(bool on) { impl_->xb_inplace = on; }
 bool Engine::xb_inplace() const { return impl_->xb_inplace; }
 std::pair<std::uint64_t, std::uint64_t> Engine::xb_counts() const { return {impl_->xb_count[0], impl_->xb_count[1]}; }
 void Engine::set_xb_prep(bool on) { impl_->xb_prep = on; }
+void Engine::set_xb_fold(bool on) { impl_->xb_fold = on; }
+bool Engine::xb_fold() const { return impl_->xb_fold; }
 bool Engine::xb_prep() const { return impl_->xb_prep; }
 std::uint64_t Engine::xb_prep_count() const { return impl_->xb_count[2]; }
 void Engine::set_xb_publish(bool on) {

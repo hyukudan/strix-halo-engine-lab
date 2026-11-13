@@ -1,5 +1,6 @@
 #include "strix/session/checkpoint_io.hpp"
 #include "strix/unbuffered_file.hpp"
+#include "../core/host_lane.hpp"
 #include <algorithm>
 #include <atomic>
 #include <cerrno>
@@ -27,6 +28,9 @@
 
 namespace strix::session::checkpoint_io {
 namespace {
+// Checkpoint bytes share the memory bus with the decode weight stream: every chunk moved here is drawn from the
+// process-wide byte budget (unlimited unless a session is decoding).
+void governed(std::uint64_t bytes) { ::strix::core::shared_byte_budget().acquire(bytes); }
 thread_local std::uint64_t observed_activity = 0;
 void inject(Operation op) {
     if (faults().fail == op) {
@@ -229,6 +233,7 @@ void Publication::write(std::span<const std::byte> bytes) {
         if (faults().max_write) n = std::min(n, faults().max_write);
         n = std::min(n, faults().fail_write_at - p.offset);
         check(n <= UINT64_MAX - p.offset, Operation::write, "checkpoint write overflow");
+        governed(n);
         std::uint64_t done = 0;
         if (p.direct) { p.direct->write(bytes.data(), n); done = n; }
         else {
@@ -277,6 +282,12 @@ void Publication::commit(const std::function<void()>& flushed) {
     p.committed = true; // A following directory-sync error is an uncertain durable commit.
     sync_directory(parent(p.target), p.options.durable && p.options.sync_parent);
 }
+std::future<void> atomic_write_background(std::filesystem::path path, std::shared_ptr<const std::vector<std::byte>> bytes,
+                                          Options options) {
+    if (!bytes) throw std::invalid_argument("checkpoint background publication needs its bytes");
+    return ::strix::core::shared_host_lane().submit(::strix::core::HostPriority::background,
+        [path = std::move(path), bytes = std::move(bytes), options] { atomic_write(path, std::span<const std::byte>(*bytes), options); });
+}
 void atomic_write(const std::filesystem::path& p, std::span<const std::byte> bytes, Options options) {
     Publication out(p, options); out.write(bytes); out.commit();
 }
@@ -295,6 +306,7 @@ void read(const std::filesystem::path& p, std::uint64_t minimum, std::uint64_t m
         auto bytes = admitted(in.size());
         for (std::size_t at = 0; at < bytes.size();) {
             inject(Operation::read); const auto n = std::min({bytes.size() - at, state_file_io::chunk_bytes, chunk_bytes});
+            governed(n);
             in.read(bytes.data() + at, n);
             if (observe) observe(bytes.subspan(at,n),at);
             at += n;
@@ -307,6 +319,7 @@ void read(const std::filesystem::path& p, std::uint64_t minimum, std::uint64_t m
     auto bytes = admitted(static_cast<std::uint64_t>(end)); in.seekg(0);
     for (std::size_t at = 0; at < bytes.size();) {
         inject(Operation::read); const auto n = std::min({bytes.size() - at, chunk_bytes, std::size_t{1} << 26});
+        governed(n);
         in.read(reinterpret_cast<char*>(bytes.data() + at), static_cast<std::streamsize>(n));
         check(bool(in), Operation::read, "checkpoint truncated during read");
         if (observe) observe(bytes.subspan(at,n),at);
@@ -358,6 +371,7 @@ void read(const std::filesystem::path& path, std::vector<std::uint8_t>& out,
     while (at < size) {
         inject(Operation::read);
         const auto want = std::min(chunk, (size-at+alignment-1)/alignment*alignment);
+        governed(want);
         ssize_t got;
         do { got = ::pread(file.fd, dst+at, want, static_cast<off_t>(at)); } while (got < 0 && errno == EINTR);
         if (got < 0 && is_direct && at == 0) {

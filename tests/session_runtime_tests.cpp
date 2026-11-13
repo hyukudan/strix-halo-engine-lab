@@ -38,6 +38,79 @@ sv::SessionHooks mixed_hooks() {
 int main() {
     try {
         {
+            // Open prompt (GenerationJob::prompt_tail): prefill starts on the ids that are final, the runtime never
+            // treats the prompt as complete before its tail is, and chunks and output equal the complete prompt's.
+            struct ScriptedTail final : sv::PromptTail {
+                std::vector<std::uint32_t> all;
+                std::size_t released = 0, step = 0;
+                int waits = 0, polls = 0;
+                bool take(std::vector<std::uint32_t>& prompt, bool wait) override {
+                    if (wait) { ++waits; released = std::min(all.size(), released + step); } else ++polls;
+                    if (prompt.size() > released) throw std::logic_error("prompt ahead of its tail");
+                    prompt.insert(prompt.end(), all.begin() + static_cast<std::ptrdiff_t>(prompt.size()),
+                                  all.begin() + static_cast<std::ptrdiff_t>(released));
+                    return released == all.size();
+                }
+            };
+            const std::vector<std::uint32_t> prompt{10, 11, 12, 13, 14, 15, 16};
+            const auto sliced = [](FakeEngine& e) {
+                auto h = runtime_hooks(e);
+                h.schedule = [](std::span<const sv::SessionView> views) {
+                    std::vector<sv::SessionWork> out;
+                    for (std::size_t i = 0; i < views.size(); ++i) {
+                        const std::size_t left = views[i].job.prompt.size() - views[i].prompt_offset;
+                        if (left) out.push_back({sv::SessionPhase::prefill, {i}, {std::min<std::size_t>(2, left)}});
+                        else out.push_back({sv::SessionPhase::decode, {i}, {}});
+                    }
+                    return out;
+                };
+                return h;
+            };
+            ss::Policy off; off.enabled = false;
+            FakeEngine whole; sv::GenerationQueue whole_q;
+            sv::SessionRuntime whole_r(whole_q, whole, whole.store, off, sliced(whole));
+            const auto reference = execute(whole_r, whole_q, job(prompt));
+            CHECK(reference.error.empty() && whole.suffixes.size() == 4 && whole.suffixes.back() == std::vector<std::uint32_t>({16}));
+            for (const std::size_t head : {std::size_t{0}, std::size_t{1}, std::size_t{3}, std::size_t{6}})
+                for (const std::size_t step : {std::size_t{1}, std::size_t{3}, std::size_t{7}}) {
+                    FakeEngine e; sv::GenerationQueue q;
+                    sv::SessionRuntime r(q, e, e.store, off, sliced(e));
+                    auto tail = std::make_shared<ScriptedTail>();
+                    tail->all = prompt; tail->released = head; tail->step = step;
+                    auto j = job(std::vector<std::uint32_t>(prompt.begin(), prompt.begin() + static_cast<std::ptrdiff_t>(head)));
+                    j.prompt_tail = tail;
+                    const auto open = execute(r, q, std::move(j));
+                    CHECK(open.error.empty() && open.ids == reference.ids && open.stats.finish == reference.stats.finish);
+                    CHECK(e.suffixes == whole.suffixes && open.stats.prompt_tokens == prompt.size());
+                    CHECK(tail->released == prompt.size() && tail->waits > 0);
+                }
+            // With a cache the lookup decides on the whole prompt: the tail is settled at admission.
+            FakeEngine cached; sv::GenerationQueue cached_q;
+            sv::SessionRuntime cached_r(cached_q, cached, cached.store, {}, runtime_hooks(cached));
+            const auto cold = execute(cached_r, cached_q, job(prompt));
+            auto tail = std::make_shared<ScriptedTail>();
+            tail->all = prompt; tail->released = 2; tail->step = 2;
+            auto j = job({10, 11});
+            j.prompt_tail = tail;
+            const auto warm = execute(cached_r, cached_q, std::move(j));
+            CHECK(cold.error.empty() && warm.error.empty() && warm.ids == cold.ids && tail->polls == 0);
+            CHECK(warm.stats.prompt_tokens == prompt.size() && warm.stats.cached_tokens > 2);
+            // A failing tail fails only its request.
+            struct FailingTail final : sv::PromptTail {
+                bool take(std::vector<std::uint32_t>&, bool wait) override {
+                    if (wait) throw std::runtime_error("tokenizer failed");
+                    return false;
+                }
+            };
+            FakeEngine f; sv::GenerationQueue fq;
+            sv::SessionRuntime fr(fq, f, f.store, off, sliced(f));
+            auto bad = job({10, 11, 12});
+            bad.prompt_tail = std::make_shared<FailingTail>();
+            const auto failed = execute(fr, fq, std::move(bad));
+            CHECK(failed.error.find("tokenizer failed") != std::string::npos);
+            CHECK(execute(fr, fq, job(prompt)).ids == reference.ids);
+        }
+        {
             FakeEngine e; sv::GenerationQueue q;
             sv::SessionRuntime r(q, e, e.store, {}, runtime_hooks(e));
             auto cold = execute(r, q, job());

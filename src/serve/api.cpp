@@ -2,6 +2,7 @@
 
 #include "strix/serve/chat_template.hpp"
 #include "strix/serve/cycle_receipt.hpp"
+#include "strix/power/sampler.hpp"
 #include "strix/serve/json_constraint.hpp"
 #include "strix/serve/request_fields.hpp"
 #include "strix/serve/session_api.hpp"
@@ -289,6 +290,7 @@ struct RecentRequest {
     std::optional<double> first_token_ms;
     std::uint64_t imported = 0;
     std::string response_id;
+    std::string power;  // strix-power-receipt-v1 of the request (empty: no readable power source)
 };
 
 std::vector<std::string> stop_strings(const Json* stop) {
@@ -406,6 +408,8 @@ struct ApiService::Impl {
     std::string state = "idle";
     std::uint64_t requests_total = 0, requests_failed = 0;
     std::chrono::steady_clock::time_point started = std::chrono::steady_clock::now();
+    // The shared power sampler runs from server start (a device bind has usually started it already).
+    const bool power_started = (power::start_process_sampler(), true);
     const std::string instance = random_id("").substr(0, 16);  // this process's engine instance, chosen once (status, metrics)
     const std::int64_t start_unix = unix_now();
     std::int64_t armed_unix = 0;  // when this service armed the instrumentation's current period (0: armed elsewhere)
@@ -682,7 +686,21 @@ struct ApiService::Impl {
 
     // ---- chat ----
     using ChatPrompt = ApiChatPrompt;
+    // tool_choice "none": the history stays renderable, a closing instruction replaces the removed definitions when
+    // the history holds tool activity, and a call the model still emits is withheld (parsed_output). Requests
+    // without tool_choice "none" take render_chat_prompt unchanged.
     ChatPrompt chat_prompt(const Json& body) const {
+        if (!tool_choice_is_none(body)) return render_chat_prompt(body);
+        const auto* messages = body.find("messages");
+        auto hinted = messages ? messages_with_no_tools_hint(*messages, config.no_tools_hint ? std::string_view(*config.no_tools_hint) : std::string_view(no_tools_hint))
+                               : std::optional<Json>{};
+        ChatPrompt out;
+        if (hinted) { Json copy = body; copy.set("messages", std::move(*hinted)); out = render_chat_prompt(copy); }
+        else out = render_chat_prompt(body);
+        out.tools_off = true;
+        return out;
+    }
+    ChatPrompt render_chat_prompt(const Json& body) const {
         if (!tokenizer) throw ApiError(503, "server_error", "tokenizer is unavailable");
         if (config.prepare_chat) return family_call([&] { return config.prepare_chat(body); });
         const auto* messages = body.find("messages");
@@ -697,8 +715,7 @@ struct ApiService::Impl {
             normalized.push(std::move(copy));
         }
         input.messages = normalized;
-        const auto* tool_choice = body.find("tool_choice");
-        const bool tools_off = tool_choice && tool_choice->is_string() && tool_choice->as_string() == "none";
+        const bool tools_off = tool_choice_is_none(body);
         if (const auto* tools = body.find("tools"); tools && tools->is_array() && !tools_off) input.tools = *tools;
         const auto* kwargs = body.find("chat_template_kwargs");
         const auto kwarg = [&](std::string_view key) -> const Json* {
@@ -987,6 +1004,9 @@ struct ApiService::Impl {
         profile.set("rows", Json(verdict.profile_rows)); profile.set("mask_ms", Json(verdict.profile_mask_ms));
         profile.set("select_ms", Json(verdict.profile_select_ms)); profile.set("window_rows", Json(verdict.profile_window_rows));
         profile.set("window_row_ms", Json(verdict.profile_window_row_ms)); profile.set("known_rows", Json(verdict.profile_known_rows));
+        profile.set("ranked_rows", Json(verdict.profile_ranked_rows));
+        profile.set("ahead_rows", Json(verdict.profile_ahead_rows)); profile.set("ahead_masks", Json(verdict.profile_ahead_masks));
+        profile.set("ahead_ms", Json(verdict.profile_ahead_ms));
         out.set("host_profile", std::move(profile)); return out;
     }
     ConstraintVerdict initial_verdict(const ConstraintSpec& spec) const {
@@ -1240,13 +1260,21 @@ struct ApiService::Impl {
         if (!config.compact_chat_envelope || config.timed_completion_envelope) usage.set("prompt_tokens_details", std::move(details));
         return usage;
     }
-    Json timing_data(const std::string& note) const {
+    // Shared power receipt of a finished request: its decode and prefill windows, counted back from now.
+    static std::string power_receipt(const Outcome& o) {
+        if (!power::process_sampler()) return {};
+        const auto computed = o.stats.prompt_tokens - std::min(o.stats.prompt_tokens, o.stats.cached_tokens + o.stats.imported_tokens);
+        return power::block_json(power::request_block(power::Sampler::now_ns(), power::Phase{o.stats.prefill_ms, computed},
+                                                      power::Phase{o.stats.decode_ms, o.output_tokens}));
+    }
+    Json timing_data(const std::string& note, const Outcome* o = nullptr) const {
         auto data = api_request_scope ? api_request_scope->observation.terminal.timings : Json::object();
         if (!note.empty()) data.set("sampling_note", Json(note));
+        if (o && data.is_object()) if (const auto text = power_receipt(*o); !text.empty()) data.set("power", parse_json(text));
         return data;
     }
     void completion_data(Json& out, const Outcome& o, const Json& body, const std::string& note, bool timings = true) const {
-        if (timings) out.set("timings", timing_data(note));
+        if (timings) out.set("timings", timing_data(note, &o));
         if (bool_or(body, "return_token_ids", false)) {
             Json ids = Json::array();
             for (auto id : o.token_ids) ids.push(Json(static_cast<std::uint64_t>(id)));
@@ -1345,6 +1373,16 @@ struct ApiService::Impl {
     }
 
     AssistantOutput parsed_output(const Outcome& o, const ChatPrompt& prompt) const {
+        if (o.constraint && (o.constraint->program || o.constraint->thinking)) return parsed_turn(o, prompt);
+        auto parsed = parsed_turn(o, prompt);
+        if (prompt.tools_off) withhold_tool_calls(parsed, withheld_marker(prompt));
+        return parsed;
+    }
+    // The marker the stream splitter holds the text from: with tool_choice "none" the family's withhold marker.
+    const std::string& withheld_marker(const ChatPrompt& prompt) const {
+        return prompt.tools_off && !config.tools_off_marker.empty() ? config.tools_off_marker : config.tool_call_marker;
+    }
+    AssistantOutput parsed_turn(const Outcome& o, const ChatPrompt& prompt) const {
         if (o.family) {
             auto parsed = o.family->parsed;
             parsed.content = o.text; parsed.reasoning = o.reasoning;
@@ -1487,12 +1525,13 @@ struct ApiService::Impl {
             return chunk(std::move(first), Json());
         };
         if (!config.compact_chat_envelope) start_stream();  // existing default event after headers
-        ChatSplitter splitter(prompt.thinking, config.tool_call_marker);
+        ChatSplitter splitter(prompt.thinking, withheld_marker(prompt));
         std::int64_t streamed_tool_index=0;
         const auto send_deltas = [&](const std::vector<ChatSplitter::Delta>& deltas) {
             if (!config.compact_chat_envelope && !start_stream()) return false;
             for (const auto& d : deltas) {
                 Json delta = Json::object();
+                if (d.tool_calls.size() && prompt.tools_off) continue;
                 if (d.tool_calls.size()) {
                     auto calls=tool_calls_json(d.tool_calls);
                     for(auto& call:calls.as_array())call.set("index",Json(streamed_tool_index++));
@@ -1503,7 +1542,7 @@ struct ApiService::Impl {
             return true;
         };
         auto outcome = drive(ticket, stops, [&](const std::string& text) {
-                if (!config.timed_completion_envelope) return send_deltas(splitter.push(text));
+                if (!config.timed_completion_envelope || prompt.tools_off) return send_deltas(splitter.push(text));
                 std::vector<ChatSplitter::Delta> one;
                 one.push_back(ChatSplitter::Delta{false,text});
                 return send_deltas(one); },
@@ -1516,7 +1555,8 @@ struct ApiService::Impl {
             finish_entry(entry, outcome);
             return;
         }
-        if (!config.timed_completion_envelope && !outcome.family && (!spec || (!spec->program && !spec->thinking))) send_deltas(splitter.finish());
+        if ((!config.timed_completion_envelope || prompt.tools_off) && !outcome.family && (!spec || (!spec->program && !spec->thinking))) send_deltas(splitter.finish());
+        if (prompt.tools_off && outcome.error.empty()) if (const auto held = parsed_output(outcome, prompt).withheld; !held.empty()) send_deltas({{false, held}});
         std::string finish = public_finish(outcome);
         if (!outcome.error.empty()) {
             Json error = Json::object();
@@ -1759,7 +1799,7 @@ struct ApiService::Impl {
             usage.set("input_tokens_details", std::move(details)); usage.set("output_tokens", Json(o.output_tokens));
             usage.set("output_tokens_details", Json::object()); usage.set("total_tokens", Json(o.stats.prompt_tokens + o.output_tokens));
             out.set("usage", std::move(usage)); out.set("strix", config.stream_receipts || spec ? receipt(run, note, chat, limit, params, spec) : engine_json(o, note, chat));
-            if (run && config.timed_completion_envelope) out.set("timings", timing_data(note));
+            if (run && config.timed_completion_envelope) out.set("timings", timing_data(note, &o));
             return out;
         };
         // a call whose frame did not close (cut by the budget, a stop string or EOS) is not marked completed
@@ -1845,7 +1885,7 @@ struct ApiService::Impl {
             auto p = fields(); p.set("part", part(reasoning, "")); event("response.content_part.added", std::move(p));
         };
         start_stream();  // the first event right after the headers, as before; keepalive comments follow it
-        ChatSplitter splitter(prompt.thinking, config.tool_call_marker);
+        ChatSplitter splitter(prompt.thinking, withheld_marker(prompt));
         const auto deltas = [&](const std::vector<ChatSplitter::Delta>& values) {
             if (!start_stream()) return false;
             for (const auto& d : values) {
@@ -1867,6 +1907,7 @@ struct ApiService::Impl {
         const std::string status = spec ? response_status(o) : !o.error.empty() ? "failed" : o.finish == "length" || cut_call(parsed) ? "incomplete" : "completed";
         // items end completed or incomplete; a failure is the response's status
         const std::string item_status = status == "completed" ? "completed" : "incomplete";
+        if (!parsed.withheld.empty() && o.error.empty()) deltas({{false, parsed.withheld}});
         if (pending_scores.size()) deltas({{false, ""}});
         close(item_status);
         if (!saw_message && o.error.empty()) { add(false); close(item_status); }
@@ -2146,7 +2187,7 @@ struct ApiService::Impl {
             out.set("stop_sequence", outcome.matched.empty() ? Json() : Json(outcome.matched));
             out.set("usage", usage(outcome));
             out.set("strix", (config.stream_receipts ? receipt(&outcome, note, body, limit, sampling_params) : engine_json(outcome, note, body)));
-            if (config.timed_completion_envelope) out.set("timings", timing_data(note));
+            if (config.timed_completion_envelope) out.set("timings", timing_data(note, &outcome));
             response.send(200, "application/json", out.dump());
             finish_entry(entry, outcome);
             return;
@@ -2188,7 +2229,7 @@ struct ApiService::Impl {
             event("content_block_start", start);
         };
         start_stream();  // the first event right after the headers, as before; keepalive comments follow it
-        ChatSplitter splitter(prompt.thinking, config.tool_call_marker);
+        ChatSplitter splitter(prompt.thinking, withheld_marker(prompt));
         const auto send_deltas = [&](const std::vector<ChatSplitter::Delta>& deltas) {
             if (!start_stream()) return false;
             for (const auto& d : deltas) {
@@ -2218,6 +2259,7 @@ struct ApiService::Impl {
             return;
         }
         if (!outcome.family && (!spec || (!spec->program && !spec->thinking))) send_deltas(splitter.finish());
+        if (prompt.tools_off && outcome.error.empty()) if (const auto held = parsed_output(outcome, prompt).withheld; !held.empty()) send_deltas({{false, held}});
         bool tools = false;
         if (splitter.saw_tools() || (outcome.family && outcome.family->parsed.tool_calls.size())) {
             const auto parsed = parsed_output(outcome, prompt);
@@ -2254,6 +2296,7 @@ struct ApiService::Impl {
         entry.queue_ms = o.stats.queue_ms; entry.prefill_ms = o.stats.prefill_ms; entry.decode_ms = o.stats.decode_ms;
         entry.imported = o.stats.imported_tokens;  // every record (its prefill rate); reported as a field only when observed
         if (o.observed) { entry.armed = true; entry.first_token_ms = o.stats.first_token_ms; }
+        if (o.error.empty()) entry.power = power_receipt(o);
         record(entry);
     }
 
@@ -2303,6 +2346,7 @@ struct ApiService::Impl {
                 e.set("first_token_ms", r.first_token_ms ? Json(*r.first_token_ms) : Json());
                 if (!r.response_id.empty()) e.set("response_id", Json(r.response_id));
             }
+            if (!r.power.empty()) e.set("power", parse_json(r.power));
             list.push(std::move(e));
         }
         out.set("requests", std::move(list));
@@ -2442,6 +2486,8 @@ void ApiService::handle(const HttpRequest& request, HttpResponseWriter& raw_resp
             if (impl.config.status_data) deployment_status(data, impl.config.deployment, impl.queue, impl.config.status_slots.value_or(impl.config.http_slots));
             // STRIX_SERVE_RECEIPT=1: the engine's cycle ledger (tools/serve_bench.py finds it by its schema value).
             if (cycle_receipt_enabled() && data.is_object() && cycle_ledger().totals().cycles) data.set("cycle_ledger", parse_json(cycle_ledger().json()));
+            // Shared power view (sources, latest reading, totals since start); absent with STRIX_POWER_SAMPLER=0.
+            if (data.is_object() && power::sampler_enabled()) data.set("power", parse_json(power::status_json()));
             response.send(200, "application/json", data.dump());
             return;
         }

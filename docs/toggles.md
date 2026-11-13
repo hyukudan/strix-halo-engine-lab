@@ -143,13 +143,14 @@ the shared tiled core (`src/core`) landed, with the same bits.
 
 | Switch | Engine | Default | What it does |
 |---|---|---|---|
-| `STRIX_DS41_PF_CORE=1` | deepseek | off | Expert prefill (gate/up, down) and the dense Q8_0 x A8 prefill on the shared tiled core. Same bits as the default kernels. Off because it is still slower: 8K TTFT 8.50 s vs 8.39 s (+0.11 s, quiet ABAB on the pair, four cells each). |
+| `STRIX_DS41_PF_CORE=0\|moe\|dense\|1` | deepseek | per form | Which prefill products run on the shared tiled core instead of the DeepSeek kernels: `moe` = expert gate/up and down, `dense` = the dense Q8_0 x A8 products, `1` = both, `0` = none. Same bits either way. Unset: the shared core where the rank fixture measures it faster, the Q8_0 gate/up (-0.6..-2.2 %) and down (-6.0..-7.2 %) of the shared expert (-2.8..-3.9 % for both), and only in 16-row batches with `STRIX_DS41_FAST_MOE` off and `STRIX_DS41_PREFILL_STAGE` not `1`; the routed IQ2_XXS gate/up (-0.0..+0.4 % at 4096 rows, +0.0..+1.2 % at 2048) and Q2_K down (-0.1..+2.4 %, slower in 11 of 12 cells) and the dense products stay on the DeepSeek kernels. With `moe` the routed products are +0.2..+1.2 % and the shared expert -2.9..-4.6 %. Resolved once per run; any other value, the empty one included, is rejected. |
 | `STRIX_DS41_FAST_I4=1` | deepseek | off | Draft lossy prefill: GGUF expert weights decoded in the kernel to INT4, A8 input requantized to A4. Runs on the shared core. `STRIX_DS41_FAST_I4_SCOPE=all\|gu` picks gate/up/down (default) or gate/up only. Not quality-qualified. |
 | `STRIX_GLM_MODEL_FORMAT=fast_i4` | glm | `exl3` | Lossy format: the routed gate/up experts of the late MoE layers are stored as INT4 (W4A4 prefill, W4A16 decode), their EXL3 copy is released. Refuses the exact identities. Against FAST on the pair: prefill logits KL 0.0145, top-1 95.4 %, NLL -0.002 (gate 0.02 / 93 % / +0.01); teacher-forced decode tokens KL 0.0098, top-1 94.8 %; prefill 8K -2.0 %, 32K -3.2 %; plain and MTP decode speed unchanged. |
 | `STRIX_GLM_FAST_I4_EXL3_LAYERS=<list>` | glm | `0-14` | With `fast_i4`: MoE layers (ordinals, ranges `a-b`, or `none`) that keep the EXL3 routed experts. An early INT4 layer costs a saturating quality step, late layers are cheap; INT4 on every layer does not pass the quality gate. |
 | `STRIX_GLM_FAST_I4_SCOPE=gate_up\|all` | glm | `gate_up` | With `fast_i4`: which routed matrices are INT4. `all` adds the down projection (8K warm prefill -3.6 % against FAST; thinner quality margin). |
 | `STRIX_GLM_FAST_I4_SCALE=fast_full\|legacy` | glm | `fast_full` | With `fast_i4`: weight scale rule of the load-time conversion. `fast_full` uses the full nibble range [-8, 7] at 0.9 of the non-clipping scale (weight error 0.0095 against 0.0115 for `legacy`, same conversion time). |
 | `STRIX_GLM_FAST_I4_PAIRED=0` | glm | on | With `fast_i4` and scope `gate_up`: turns off the paired gate/up kernel (one kernel reads the gate and up INT4 weights and its SwiGLU epilogue writes the down input) and runs the separate gate, up and activation calls. Same output bits either way. |
+| `STRIX_GLM_I4_CHAIN_GSAVE=1` | glm | off | With `fast_i4`, scope `all` and `STRIX_MOE_I4_CHAIN=1`: the paired gate/up GEMM keeps its first-pass gate values in the call's gate/up rows instead of registers, so gate/up and down share one tile plan and one tile list. Same output bits. Off by default: on this model's shapes the register form (gate/up on 64-row tiles, down on 128-row tiles) measured 3-7 % faster per call. `STRIX_MOE_I4_CHAIN_GSAVE=0` forces the register form in every engine. |
 | `STRIX_GLM_PF_SCORE_SEQ=1`, `STRIX_GLM_PF_SCORE_BLOCK=<1..8>` | glm | off, `1` | Quality harness (`STRIX_GLM_PF_SCORE_LAST`): one score file per prefill call, and rows per head call. Measurement only. |
 | `STRIX_GLM_PF_STREAMS=1` | glm | off | Single compute stream for the seqpar TP2 prefill schedule. Same bits; not faster in the first samples. |
 | `STRIX_MMX_MODEL_FORMAT=fast_i4` | minimax | `exl3` | Draft lossy prefill: each MoE layer is converted to INT4 during prefill in two reusable buffers (+3.6 GiB); decode stays on EXL3. See [MiniMax grouped prefill](minimax-grouped-prefill.md#draft-fast_i4). |
@@ -205,6 +206,8 @@ Follow the link for the gain, preconditions and off switch. Defaults are shorten
 | `STRIX_PREFIX_FAIR_RECLAIM_IDLE` | qwen | ON on the qualified single tiled-MTP ... | [prefix-retention-policy](engine/serving/prefix-state-cache.md#prefix-retention-policy) |
 | `STRIX_QRTX_PREFIX_CACHE` | qwen-rtx | ON | [qwen-rtx-prefix-cache](optimizations.md#qwen-rtx-prefix-cache) |
 | `STRIX_QSA_CACHE_ONLY` | qwen | 1 | [qwen-qsa-cache-only](optimizations.md#qwen-qsa-cache-only) |
+| `STRIX_PREFILL_FINAL_CONE` | qwen | 1 | [qwen-prefill-final-cone](optimizations.md#qwen-prefill-final-cone) |
+| `STRIX_HOST_WAIT` | qwen | block | [host-wait-policy](optimizations.md#host-wait-policy) |
 | `STRIX_SESSION_CACHE` | minimax | on (two-node serve route) | [mm-sessions](optimizations.md#mm-sessions) |
 
 ### Prefill (97)
@@ -226,6 +229,7 @@ Follow the link for the gain, preconditions and off switch. Defaults are shorten
 | `STRIX_DS41_PREFILL_ROUTER_V2` | deepseek | on | [ds-router-v2](optimizations.md#ds-router-v2) |
 | `STRIX_GLM_PF_ATTN_QWIN` | glm | auto | [glm-pf-attn-qwin](optimizations.md#glm-pf-attn-qwin) |
 | `STRIX_GLM_PF_AUX_COMBINE` | glm | 1 | [glm-pf-aux-combine](optimizations.md#glm-pf-aux-combine) |
+| `STRIX_GLM_PF_DENSE_FORM` | glm | automatic (0) | [glm-pf-dense-rows-v4](optimizations.md#glm-pf-dense-rows-v4) |
 | `STRIX_GLM_PF_DENSE_ROWS` | glm | 3 | [glm-pf-dense-rows-v3](optimizations.md#glm-pf-dense-rows-v3) |
 | `STRIX_GLM_PF_HC_EXPAND_ROWS` | glm | 2 | [glm-pf-hc-expand-rows](optimizations.md#glm-pf-hc-expand-rows) |
 | `STRIX_GLM_PF_HC_FUSE` | glm | 1 | [glm-pf-hc-fuse](optimizations.md#glm-pf-hc-fuse) |
@@ -246,6 +250,7 @@ Follow the link for the gain, preconditions and off switch. Defaults are shorten
 | `STRIX_GLM_PF_STAGED` | glm | 1 | [glm-pf-staged](optimizations.md#glm-pf-staged) |
 | `STRIX_GLM_PF_SUMEXP` | glm | 1, 1 | [glm-pf-sumexp](optimizations.md#glm-pf-sumexp) |
 | `STRIX_GLM_PF_WMMA` | glm | off (opt-in FAST identity) | [glm-pf-wmma-x](optimizations.md#glm-pf-wmma-x) |
+| `STRIX_GLM_PF_WMMA_LIVE_FRAG` | glm | 1 | [glm-pf-wmma-live-fragments](optimizations.md#glm-pf-wmma-live-fragments) |
 | `STRIX_INTPREFILL_DENSE_ROWS` | qwen | 512 | [qwen-intprefill-dense-rows](optimizations.md#qwen-intprefill-dense-rows) |
 | `STRIX_MMX_PREFILL_GATHER_TOK` | minimax | 1 | [mm-pf-gather-tok](optimizations.md#mm-pf-gather-tok) |
 | `STRIX_MMX_PREFILL_MTFIT` | minimax | 1 | [mm-pf-mtfit](optimizations.md#mm-pf-mtfit) |
@@ -300,6 +305,7 @@ Follow the link for the gain, preconditions and off switch. Defaults are shorten
 | `STRIX_QPF2K_MOE_MC` | qwen | 1 (mode 1; mode 2 needs an explicit v... | [qwen-moe-merge-commit](optimizations.md#qwen-moe-merge-commit) |
 | `STRIX_QPF2K_MOE_ROUTE` | qwen | 14 | [qwen-moe](optimizations.md#qwen-moe) |
 | `STRIX_QPF2K_MOE_XOR64` | qwen | 1 | [qwen-moe-xor-rows](optimizations.md#qwen-moe-xor-rows) |
+| `STRIX_QPF2K_MOE_DA16_ISSUE` | qwen | auto | [qwen-moe-da16-issue](optimizations.md#qwen-moe-da16-issue) |
 | `STRIX_QPF2K_QSA` | qwen | 1 | [qwen-qsa](optimizations.md#qwen-qsa) |
 | `STRIX_QPF2K_QSA_MASK` | qwen | 0x2257 | [qwen-qsa](optimizations.md#qwen-qsa) |
 | `STRIX_QPF2K_SCHED` | qwen | 14 | [qwen-schedule](optimizations.md#qwen-schedule) |
@@ -506,9 +512,10 @@ Follow the link for the gain, preconditions and off switch. Defaults are shorten
 | `STRIX_SERVE_HEALTH_RECORD` | qwen | ON | [operations/service-health.md](operations/service-health.md) |
 | `STRIX_SERVE_OBSERVE_EXPIRY_S` | deepseek | 60 seconds | [ds-observation](optimizations.md#ds-observation) |
 
-### Debug only (2)
+### Debug only (3)
 
 | Toggle | Engine | Default | Details |
 |---|---|---|---|
+| `STRIX_POWER_SAMPLER` | platform | ON | [platform-power-receipt](optimizations.md#platform-power-receipt) |
 | `STRIX_DS41_OB_READY_EPILOGUE` | deepseek | auto | [ds-ready](optimizations.md#ds-ready) |
 | `STRIX_SERVE_BACKEND_PROBE` | qwen | ON | [operations/service-health.md](operations/service-health.md) |
