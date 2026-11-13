@@ -1,14 +1,14 @@
 # Step planner
 
 The batched Qwen serving loop decides, once per step, which prompt runs and whether its unit runs before
-the decode round. By default this is the loop's own policy. With `STRIX_SERVE_STEP_PLANNER=1` the same
-decision comes from the shared planner in `include/strix/serve/step_planner.hpp`.
+the decode round. The decision comes from the shared planner in `include/strix/serve/step_planner.hpp`;
+`STRIX_SERVE_STEP_PLANNER=0` (or the baseline mode) restores the loop's own inline policy.
 
 ## Switch
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `STRIX_SERVE_STEP_PLANNER` | off (only the exact value `1` turns it on) | The shared planner picks the prompt unit and whether it runs before the decode round. Off: the code path is unchanged. |
+| `STRIX_SERVE_STEP_PLANNER` | on (`0` turns it off) | The shared planner picks the prompt unit and whether it runs before the decode round. Off: the inline policy. |
 | `STRIX_SERVE_DECODE_GAP_MS` | `0` | Planner on only. The longest a prompt unit may hold up the decoding requests. `0` means no bound. When set, the unit is a tail-size unit (the largest certified tail) if the observed cost of a full block would exceed the bound. |
 
 Both are printed as `serve lever` lines at the first decode round (`step_planner`, `decode_gap_ms`).

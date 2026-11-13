@@ -2242,9 +2242,10 @@ private:
     // STRIX_SERVE_STEP_PLANNER=1: the shared planner owns the debt ledger; per-step times feed its account().
     serve::StepPlanner step_planner_;
     double step_decode_ms_ = 0.0, step_prompt_ms_ = 0.0, step_suspended_ms_ = 0.0;
-    static bool step_planner_enabled() {
-        static const bool on = [] {const char* v = std::getenv("STRIX_SERVE_STEP_PLANNER");return v && std::string(v) == "1";}();
-        return on;
+    // The shared step planner: on unless STRIX_SERVE_STEP_PLANNER=0 or the baseline mode.
+    bool step_planner_enabled() const {
+        static const bool off = [] {const char* v = std::getenv("STRIX_SERVE_STEP_PLANNER");return v && v[0] == '0' && v[1] == 0;}();
+        return !off && !options_.baseline;
     }
     // STRIX_SERVE_DECODE_GAP_MS: with the planner on, the longest a prompt unit may hold up the decoders (0 = no bound).
     double step_decode_gap_ms_ = [] {
