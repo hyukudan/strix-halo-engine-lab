@@ -39,6 +39,7 @@
 #include "strix/mtp_forward_golden_file.hpp"
 #include "strix/hip_mtp_greedy_runtime.hpp"
 #include "strix/serve/cycle_receipt.hpp"
+#include "strix/serve/step_planner.hpp"
 #include "strix/serve/prompt_join.hpp"
 #include "strix/mtp_batch_window_controller.hpp"
 #include "hip_session_store.hpp"
@@ -467,6 +468,14 @@ public:
     };
     // Units of the largest tail size instead of whole T blocks from now on (on) or again T blocks (off).
     void set_small_blocks(bool on) noexcept {small_=on;}
+    // Certified unit sizes for the step planner: the largest tail unit (what small blocks run) and the full block.
+    // Zero when the prompt has no tail unit.
+    [[nodiscard]] std::uint32_t small_unit_rows() const noexcept {
+        std::uint32_t rows=0;
+        for(const auto& tail:tiled_.tails) rows=std::max<std::uint32_t>(rows,tail.rows);
+        return rows;
+    }
+    [[nodiscard]] std::uint32_t block_unit_rows() const noexcept {return static_cast<std::uint32_t>(tiled_.rows);}
     void force_ladder() noexcept {forced_ladder_=true;}
     [[nodiscard]] BatchNestedRecipe nested_recipe(std::uint64_t limit,bool qualified) const {
         if(tiled_.blocks->output_policy()==KnownWindowOutputPolicy::all_rows) return BatchNestedRecipe{{},0,"route"};
@@ -1165,6 +1174,7 @@ public:
         Slot* waits_for=nullptr;
         QwenPrefixJoinWait join_wait;
         std::uint64_t order = 0; // admission order: prompts advance oldest first
+        unsigned overtakes = 0;  // STRIX_SERVE_STEP_PLANNER=1: times a younger prompt ran first
         std::chrono::steady_clock::time_point prompt_start;
         MtpBatchRequest request;
         MtpServeResult result;
@@ -1432,6 +1442,7 @@ private:
         static_cast<void>(m);
         ++stats_.admitted;
         s.order = stats_.admitted;
+        s.overtakes = 0;
         s.prefill->set_request_order(s.order);
         s.active = true;
         s.prefilling = true;
@@ -1487,18 +1498,66 @@ public:
             const bool sa=short_rows && a.prefill->remaining()<=short_rows,sb=short_rows && b.prefill->remaining()<=short_rows;
             return sa!=sb?sa:a.order<b.order;
         };
-        for (auto& s : slots_) {
-            if (s->prefilling && !s->waits_for && (!prompt || ahead(*s, *prompt))) prompt = s.get();
-            if (s->active && !s->prefilling) decoding = true;
+        step_decode_ms_ = 0.0;step_prompt_ms_ = 0.0;step_suspended_ms_ = 0.0;
+        const bool planner_on = step_planner_enabled();
+        std::uint32_t plan_rows = 0, plan_small_unit = 0, plan_block_unit = 0;
+        bool plan_gap = false;
+        if (planner_on) {
+            // STRIX_SERVE_STEP_PLANNER=1: the shared planner picks the prompt unit and whether it runs before the
+            // decode round (same policy as the inline one at default limits; see docs/engine/serving/step-planner.md).
+            std::vector<serve::StepLane> lanes;
+            lanes.reserve(slots_.size());
+            for (std::size_t i = 0; i < slots_.size(); ++i) {
+                const auto& s = *slots_[i];
+                serve::StepLane lane;
+                lane.lane = static_cast<std::uint32_t>(i);
+                if (s.prefilling && !s.waits_for) {
+                    lane.prompt = true;
+                    lane.prompt_remaining = s.prefill->remaining();
+                    lane.order = s.order;
+                    lane.overtakes = s.overtakes;
+                    if (!plan_block_unit && s.prefill->small_unit_rows() && s.prefill->block_unit_rows()) {
+                        plan_small_unit = s.prefill->small_unit_rows();
+                        plan_block_unit = s.prefill->block_unit_rows();
+                    }
+                } else if (s.active && !s.prefilling) {
+                    decoding = true;
+                } else {
+                    continue;
+                }
+                lanes.push_back(lane);
+            }
+            const std::uint32_t units[2] = {plan_small_unit, plan_block_unit};
+            serve::StepLimits limits;
+            limits.co_forward = false;
+            limits.prompt_share = prompt_share_;
+            limits.short_first_rows = short_rows;
+            limits.max_decode_gap_ms = step_decode_gap_ms_;
+            limits.prompt_row_ms = 1.9;
+            if (plan_block_unit > plan_small_unit) limits.prompt_units = std::span<const std::uint32_t>(units, 2);
+            const serve::StepPlan plan = step_planner_.plan(lanes, limits);
+            plan_gap = step_decode_gap_ms_ > 0.0 && decoding;
+            if (plan.prompt_before_decode && !plan.prompt.empty()) {
+                prompt = slots_[plan.prompt[0].lane].get();
+                plan_rows = plan.prompt[0].rows;
+                for (const auto lane : plan.overtaken) ++slots_[lane]->overtakes;
+            }
+        } else {
+            for (auto& s : slots_) {
+                if (s->prefilling && !s->waits_for && (!prompt || ahead(*s, *prompt))) prompt = s.get();
+                if (s->active && !s->prefilling) decoding = true;
+            }
+            if (!prompt) prompt_debt_ms_ = 0.0;
         }
-        if (!prompt) prompt_debt_ms_ = 0.0;
-        if (prompt && (!decoding || prompt_debt_ms_ <= 0.0)) {
+        if (prompt && (planner_on || !decoding || prompt_debt_ms_ <= 0.0)) {
             ++stats_.prompt_steps;
             step_prompt_ran_ = true;
             // STRIX_BATCH_PROMPT_SMALL=1: T blocks only while nobody decodes; tail-size units in between decode cycles
             // (exact either way: the prompt's rows and bits do not depend on the block sizes)
             const bool small=batch_prompt_small(options_);
             if (small) for (auto& s : slots_) if (s->prefilling) s->prefill->set_small_blocks(decoding);
+            // With a decode-gap bound the plan's unit size decides: a unit below the full block is a tail-size unit.
+            if (planner_on && plan_gap) prompt->prefill->set_small_blocks(plan_rows > 0 && plan_rows < plan_block_unit);
             const auto t0 = clock::now();const auto suspended_before=stats_.service_ms_suspended;
             try {
                 if(cancel_requested(*prompt)) cancel_prefill(*prompt,false);
@@ -1510,7 +1569,10 @@ public:
             } catch(const KnownPrefillCancelled&) {cancel_prefill(*prompt,true);}
             catch(const serve::ConstraintError& e) {constraint_failed(*prompt,e);}
 
-            prompt_debt_ms_ += prompt_share_ * std::max(0.0,std::chrono::duration<double, std::milli>(clock::now() - t0).count()-(stats_.service_ms_suspended-suspended_before));
+            const double prompt_ms = std::chrono::duration<double, std::milli>(clock::now() - t0).count();
+            step_suspended_ms_ = stats_.service_ms_suspended - suspended_before;
+            if (planner_on) step_prompt_ms_ = prompt_ms;
+            else prompt_debt_ms_ += prompt_share_ * std::max(0.0, prompt_ms - step_suspended_ms_);
         }
         for(auto& owner:slots_) {
             auto& s=*owner;
@@ -1530,11 +1592,21 @@ public:
             } catch(const serve::ConstraintError& e) {constraint_failed(s,e);}
             // Serial work pays prompt debt too, including when no ordinary slot
             // remains to run the cohort timing scope below.
-            prompt_debt_ms_-=std::chrono::duration<double,std::milli>(clock::now()-serial_start).count();
+            const double serial_ms=std::chrono::duration<double,std::milli>(clock::now()-serial_start).count();
+            prompt_debt_ms_-=serial_ms;step_decode_ms_+=serial_ms;
             if constexpr (track_completion) serial_completed |= s.result.cycles != previous_cycles;
         }
-        if constexpr (track_completion) return run_decode_round() || serial_completed;
-        else (void)run_decode_round();
+        const auto account_step=[&] {
+            if (planner_on) step_planner_.account(step_prompt_ms_, step_decode_ms_, step_suspended_ms_, step_prompt_ms_ > 0.0 ? plan_rows : 0);
+        };
+        if constexpr (track_completion) {
+            const bool round = run_decode_round();
+            account_step();
+            return round || serial_completed;
+        } else {
+            (void)run_decode_round();
+            account_step();
+        }
     }
 private:
     bool run_decode_round() {
@@ -1563,8 +1635,8 @@ private:
                     ? std::span<const HipMtpGreedyRuntime* const>(peers) : std::span<const HipMtpGreedyRuntime* const>{});
         }
         const auto cycle_start = clock::now();
-        struct Debt {double& debt; clock::time_point t0;
-            ~Debt(){debt -= std::chrono::duration<double, std::milli>(clock::now() - t0).count();}} debt{prompt_debt_ms_, cycle_start};
+        struct Debt {double& debt; double& step_ms; clock::time_point t0;
+            ~Debt(){const double ms = std::chrono::duration<double, std::milli>(clock::now() - t0).count();debt -= ms;step_ms += ms;}} debt{prompt_debt_ms_, step_decode_ms_, cycle_start};
         const auto& m = options_.mtp;
         const auto budget = [](const Slot& s) {
             return static_cast<std::uint32_t>(std::min<std::uint64_t>(s.request.max_tokens - s.result.generated_tokens, UINT32_MAX));
@@ -1637,7 +1709,9 @@ private:
             members.push_back({s->greedy.get(), &s->pending, depth(*s), budget(*s), s->request.stop_tokens,
                 static_cast<std::uint32_t>(slot),transactions.back().get()});
         }
-        static const bool joint=strix::envcfg::flag("STRIX_MTP_BATCH_JOINT", false);
+        // The row budget (on unless STRIX_SERVE_ROW_BUDGET=0 or the baseline mode) runs the joint cycle: its
+        // controller then plans with the budget rule.
+        const bool joint=strix::envcfg::flag("STRIX_MTP_BATCH_JOINT", false) || (mtp_serve_row_budget_enabled() && !options_.baseline);
         auto results = hip_mtp_greedy_cohort_cycle(members, &stats_.cohort,joint?&joint_:nullptr,joint?&policy_joint_:nullptr);
         runtime_done(results);
         for (std::size_t k = 0; k < live.size(); ++k) live[k]->result.shared_execution.add(results[k].shared);
@@ -2305,6 +2379,20 @@ private:
     std::uint32_t serial_rows_per_step_ = 16;
     // Interleaved admission: decode time owed to the requests past their prompt for the prompt units run.
     double prompt_debt_ms_ = 0.0;
+    // STRIX_SERVE_STEP_PLANNER=1: the shared planner owns the debt ledger; per-step times feed its account().
+    serve::StepPlanner step_planner_;
+    double step_decode_ms_ = 0.0, step_prompt_ms_ = 0.0, step_suspended_ms_ = 0.0;
+    // The shared step planner: on unless STRIX_SERVE_STEP_PLANNER=0 or the baseline mode.
+    bool step_planner_enabled() const {
+        static const bool off = [] {const char* v = std::getenv("STRIX_SERVE_STEP_PLANNER");return v && v[0] == '0' && v[1] == 0;}();
+        return !off && !options_.baseline;
+    }
+    // STRIX_SERVE_DECODE_GAP_MS: with the planner on, the longest a prompt unit may hold up the decoders (0 = no bound).
+    double step_decode_gap_ms_ = [] {
+        const char* v = std::getenv("STRIX_SERVE_DECODE_GAP_MS");
+        const double x = v ? std::atof(v) : 0.0;
+        return x > 0.0 ? x : 0.0;
+    }();
     // STRIX_SERVE_RECEIPT=1: a prompt unit ran in the current step; receipt line numbering.
     bool step_prompt_ran_ = false;
     std::uint64_t receipt_sequence_ = 0;
@@ -2324,6 +2412,8 @@ private:
         line("prompt_small", "STRIX_BATCH_PROMPT_SMALL", batch_prompt_small(options_), batch_prompt_small(options_) ? "1" : "0");
         line("prompt_share", "STRIX_BATCH_PROMPT_SHARE", prompt_share_ > 0.0, std::to_string(prompt_share_));
         line("service_ms", "STRIX_BATCH_SERVICE_MS", service_ms_ > 0.0, std::to_string(service_ms_));
+        line("step_planner", "STRIX_SERVE_STEP_PLANNER", step_planner_enabled(), step_planner_enabled() ? "1" : "0");
+        line("decode_gap_ms", "STRIX_SERVE_DECODE_GAP_MS", step_planner_enabled() && step_decode_gap_ms_ > 0.0, std::to_string(step_decode_gap_ms_));
         const auto short_first = raw("STRIX_BATCH_SHORT_FIRST_ROWS");
         line("short_first_rows", "STRIX_BATCH_SHORT_FIRST_ROWS", short_first != "0", short_first == "unset" ? "2048" : short_first);
     }
