@@ -1,6 +1,7 @@
 #include "strix/mtp_window_controller.hpp"
 #include "strix/mtp_batch_window_controller.hpp"
 #include "strix/serve/row_budget.hpp"
+#include "strix/env_flags.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -188,7 +189,7 @@ MtpBatchWindowController::Rule MtpBatchWindowController::rule_from_env(bool base
     return v?parse_rule(v):parse_rule(baseline?"production":"calibrated-c3");
 }
 bool mtp_serve_row_budget_enabled() noexcept {
-    static const bool on=[]{const char* v=std::getenv("STRIX_SERVE_ROW_BUDGET");return !v || !(v[0]=='0' && v[1]==0);}();
+    static const bool on=envcfg::flag("STRIX_SERVE_ROW_BUDGET",true,EnvFlagMatch::exact);
     return on;
 }
 MtpBatchWindowController::Rule MtpBatchWindowController::parse_rule(std::string_view text) {
@@ -281,7 +282,7 @@ std::vector<std::uint32_t> MtpBatchWindowController::search(std::span<const Requ
 }
 MtpBatchWindowController::BudgetCost MtpBatchWindowController::budget_cost() const {
     static const BudgetCost pinned=[]{
-        BudgetCost c;const char* v=std::getenv("STRIX_SERVE_ROW_COST");
+        BudgetCost c;const char* v=envcfg::text("STRIX_SERVE_ROW_COST");
         if(v) {char* end=nullptr;const double f=std::strtod(v,&end);
             if(end && *end==',') {char* next=nullptr;const double r=std::strtod(end+1,&next);
                 const double l=next && *next==','?std::strtod(next+1,nullptr):0.0;
