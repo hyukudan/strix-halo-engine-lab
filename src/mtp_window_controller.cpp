@@ -185,13 +185,22 @@ std::array<std::uint32_t,3> batch_key(std::span<const std::uint32_t> rows) {
 }
 MtpBatchWindowController::Rule MtpBatchWindowController::rule_from_env(bool baseline) {
     const char* v=std::getenv("STRIX_MTP_JOINT_PLAN");
-    if(!v && !baseline && mtp_serve_row_budget_enabled()) return parse_rule("budget");
+    if(!v && !baseline && mtp_serve_row_budget_enabled()) return parse_rule(mtp_serve_cycle_policy_enabled()?"budget-cycle":"budget");
     return v?parse_rule(v):parse_rule(baseline?"production":"calibrated-c3");
 }
 std::uint32_t mtp_serve_row_budget_max_lanes() noexcept {
     static const std::uint32_t lanes=[]{
         try {return envcfg::number<std::uint32_t>("STRIX_SERVE_ROW_BUDGET_MAX_LANES",6U,0U,8U);} catch(...) {return 6U;}}();
     return lanes;
+}
+bool mtp_serve_cycle_policy_enabled() noexcept {
+    static const bool on=envcfg::flag("STRIX_SERVE_CYCLE_POLICY",false,EnvFlagMatch::exact);
+    return on;
+}
+double mtp_serve_pad_row_share() noexcept {
+    static const double share=[]{
+        try {return envcfg::number<double>("STRIX_SERVE_PAD_ROW_SHARE",0.5,0.0,1.0);} catch(...) {return 0.5;}}();
+    return share;
 }
 bool mtp_serve_row_budget_enabled() noexcept {
     static const bool on=envcfg::flag("STRIX_SERVE_ROW_BUDGET",true,EnvFlagMatch::exact);
@@ -205,6 +214,7 @@ MtpBatchWindowController::Rule MtpBatchWindowController::parse_rule(std::string_
     if(text.find("cap4")!=std::string_view::npos) rule.cap=4;
     if(text.find("cap2")!=std::string_view::npos) rule.cap=2;
     if(text.find("budget")!=std::string_view::npos) rule.budget=true;
+    if(text.find("budget-cycle")!=std::string_view::npos) rule.cycle=true;
     return rule;
 }
 std::size_t MtpBatchWindowController::calibration_bin(double p) {
@@ -329,6 +339,16 @@ std::vector<std::uint32_t> MtpBatchWindowController::budget_rows(std::span<const
     // request (the cost of a deeper row exceeds its yield there), so the budget plans only up to the bound.
     if(q.size()>mtp_serve_row_budget_max_lanes()) {
         std::vector<std::uint32_t> fixed(q.size(),2U);
+        if(prior && rule_.cycle) {
+            // Cycle policy: the fixed table's one draft per lane is bought per lane. Not drafting saves the draft
+            // step and the part of the second target row that padding does not pay.
+            const auto all=estimate(q,fixed,true);
+            const double added=(draft_.samples()?draft_.value():1.2)+mtp_serve_pad_row_share()*budget_cost().row_ms;
+            for(std::size_t k=0;k<q.size();++k) {
+                const auto& h=history_.at(q[k].slot);
+                if(!serve::row_pays((h.hits[0]+4.0*0.8)/(h.seen[0]+4.0),added,all.expected,all.ms)) fixed[k]=0U;
+            }
+        }
         if(info) *info=estimate(q,fixed,prior);
         return fixed;
     }
@@ -394,7 +414,8 @@ std::vector<std::uint32_t> MtpBatchWindowController::budget_rows(std::span<const
         // Two physical rows are the minimum either way; the one draft that fills the second row is bought only
         // when its chance beats its cost at the plan's rate.
         const double rate=plan.expected_ms>0.0?plan.expected_tokens/plan.expected_ms:0.0;
-        for(std::size_t k=0;k<q.size();++k) if(out[k]==2U && static_cast<double>(accept[k][1])<=draft_ms*rate) out[k]=0U;
+        const double added=draft_ms+(rule_.cycle?mtp_serve_pad_row_share()*model.row_ms:0.0);
+        for(std::size_t k=0;k<q.size();++k) if(out[k]==2U && static_cast<double>(accept[k][1])<=added*rate) out[k]=0U;
     }
     if(info) *info=estimate(q,out,prior);
     return out;
@@ -409,7 +430,12 @@ std::vector<std::uint32_t> MtpBatchWindowController::plan(std::span<const Reques
     plan_members_=q.size();
     auto out=rule_.budget?budget_rows(q,budget,true,&last_):search(q,budget,true,&last_);
     probe_.clear();
-    if(rule_.budget && q.size()>mtp_serve_row_budget_max_lanes()) return out;
+    if(rule_.budget && q.size()>mtp_serve_row_budget_max_lanes()) {
+        // Above the bound there is no depth exploration; the cycle policy still drafts for every lane on every
+        // 16th plan, or a lane it stopped drafting for would never be measured again.
+        if(rule_.cycle && plans_.at(q.size())++%16U==0U) {std::fill(out.begin(),out.end(),2U);last_=estimate(q,out,true);}
+        return out;
+    }
     auto& plans=plans_.at(q.size());
     // Bounded exploration samples deeper windows even after a low-acceptance
     // region. It does not borrow another request's acceptance history.

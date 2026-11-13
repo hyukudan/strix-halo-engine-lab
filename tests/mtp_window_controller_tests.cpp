@@ -342,6 +342,30 @@ int main() {
         expect(growing.plan(q,16)==eager.plan(q,16),"growth preserves shared planning state");
     }
     {
+        {
+            // Cycle policy above the lane bound: every lane keeps the fixed table's two rows, the draft of a lane
+            // whose drafts keep failing is not bought, and every 16th plan drafts for all.
+            using Controller=strix::MtpBatchWindowController;
+            const auto rule=Controller::parse_rule("budget-cycle");
+            expect(rule.budget && rule.cycle && !Controller::parse_rule("budget").cycle,"budget-cycle rule name parses");
+            Controller cycle(8,rule),table(8,Controller::parse_rule("budget"));
+            const std::vector<float> p(1,0.9F);
+            std::vector<Controller::Request> q;
+            for(std::uint32_t k=0;k<8U;++k) q.push_back({k,2,p});
+            const std::vector<std::uint32_t> two(8,2U);
+            std::vector<std::uint32_t> accepted(8,1U);accepted[0]=0U;
+            expect(cycle.plan(q,32)==two,"the first cycle-policy plan drafts for every lane");
+            for(int n=0;n<40;++n) {cycle.observe(q,two,accepted,9.6,130.0,8);table.observe(q,two,accepted,9.6,130.0,8);}
+            std::uint32_t off=0,probes=0;
+            for(int n=0;n<32;++n) {
+                const auto plan=cycle.plan(q,32);
+                if(plan==two) ++probes;
+                else {++off;expect(plan[0]==0U && std::count(plan.begin(),plan.end(),2U)==7,"only the failing lane loses its draft");}
+                expect(cycle.choose(q,32)==two,"every lane still verifies on its two-row owner");
+                expect(table.plan(q,32)==two,"without the cycle policy the fixed table drafts for all");
+            }
+            expect(probes==2U && off==30U,"every 16th plan above the bound drafts for all");
+        }
         // Budget rule: rows come from the shared row budget. Rows per lane shrink as lanes grow, every plan is
         // made of admitted owners, small totals are 4 or 8, and limits hold.
         using Controller=strix::MtpBatchWindowController;

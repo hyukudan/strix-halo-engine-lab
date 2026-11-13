@@ -1360,6 +1360,7 @@ std::vector<HipMtpServeLever> hip_mtp_serve_levers() {
     const bool joint=strix::envcfg::flag("STRIX_MTP_BATCH_JOINT", false);
     return {
         {"cohort_rows","STRIX_COHORT_ROWS",cohort_budget_rows()!=0U,std::to_string(cohort_budget_rows())},
+        {"cycle_policy","STRIX_SERVE_CYCLE_POLICY",mtp_serve_cycle_policy_enabled(),mtp_serve_cycle_policy_enabled()?"1":"0"},
         {"cohort_max_rows","STRIX_COHORT_MAX_ROWS",cohort_max_rows_override()!=0U,std::to_string(cohort_max_rows_override())},
         {"cohort_step_rows","STRIX_COHORT_STEP_ROWS",std::getenv("STRIX_COHORT_STEP_ROWS")!=nullptr,raw("STRIX_COHORT_STEP_ROWS")},
         {"draft_interleave","STRIX_COHORT_DRAFT_INTERLEAVE",interleave,interleave?"1":"0"},

@@ -20,13 +20,26 @@ namespace strix {
 // of a cycle grow. The serving default (STRIX_SERVE_ROW_BUDGET=0 turns it off); also the rule name "budget".
 // Scheduling only, as every other rule.
 struct MtpBatchPlanRule {bool pooled=false; bool calibrated=false; std::uint32_t cap=8; std::size_t calibrated_min_members=0;
-    bool budget=false;};
+    bool budget=false;
+    // cycle (with budget): the draft of a lane's second row is priced against the complete cycle at every request
+    // count, also above the lane bound; see mtp_serve_cycle_policy_enabled.
+    bool cycle=false;};
 // The batched decode runs its joint cycle with the budget rule. On by default; STRIX_SERVE_ROW_BUDGET=0 (or the
 // baseline mode) restores the fixed rows-per-request table.
 [[nodiscard]] bool mtp_serve_row_budget_enabled() noexcept;
 // Most decoding requests the budget plans for (STRIX_SERVE_ROW_BUDGET_MAX_LANES, default 6, 0..8). Above it every
 // request gets the fixed table's two rows: measured, the budget wins at 2 to 6 requests and loses at 8.
 [[nodiscard]] std::uint32_t mtp_serve_row_budget_max_lanes() noexcept;
+// Cycle policy (STRIX_SERVE_CYCLE_POLICY, default off; also the rule name "budget-cycle"). Two parts, both
+// scheduling only (every emitted token still comes from its request's target row):
+// 1. a lane that verifies no draft keeps one live row: its padding row leaves the routed expert union of a wide
+//    step (HipKnownPrefixCohortMember::live_rows);
+// 2. before drafting, each lane's draft is bought only when serve::row_pays says so for the complete cycle (draft
+//    step plus the part of a target row that padding does not pay), at any request count; every 16th plan above
+//    the lane bound drafts for all so that a lane's acceptance history keeps being measured.
+[[nodiscard]] bool mtp_serve_cycle_policy_enabled() noexcept;
+// Part of a target row's time that a padding row does not pay (STRIX_SERVE_PAD_ROW_SHARE, 0..1, default 0.5).
+[[nodiscard]] double mtp_serve_pad_row_share() noexcept;
 // Joint scheduling only: all selections still come from each request's target.
 // A non-drafting request normally uses R2, commits one row and discards padding.
 class MtpBatchWindowController {

@@ -1831,6 +1831,8 @@ struct HipKnownPrefixWindow::Impl {
         KnownWindowExecutionHooks hooks;
         std::unique_ptr<KnownWindowRun> run;
         bool begun = false, launched = false;
+        std::uint32_t live = 0; // rows in a wide routed expert union; 0 = every row
+        [[nodiscard]] std::uint32_t union_rows() const { return live ? live : run->rows(); }
     };
     static bool cohort_shared_mode(KnownWindowStepMode mode) noexcept {
         return mode == KnownWindowStepMode::routed_expert_union || mode == KnownWindowStepMode::hyper_mix_rows ||
@@ -2020,7 +2022,8 @@ struct HipKnownPrefixWindow::Impl {
         }
         case KnownWindowStepMode::routed_expert_union: {
             std::vector<ExecutionDispatchContext> all;
-            for (const auto& m : members) { const auto rows = m.run->step_rows(i); all.insert(all.end(), rows.begin(), rows.end()); }
+            // Padding rows stay outside the union: their experts would be discarded work.
+            for (const auto& m : members) { const auto rows = m.run->step_rows(i).first(m.union_rows()); all.insert(all.end(), rows.begin(), rows.end()); }
             auto& lead = *members[0].impl;
             moe_experts_known_window_rows_launch(all, lead.routed_config, lead.cohort_union(static_cast<std::uint32_t>(all.size())), 0U);
             break;
@@ -2272,7 +2275,7 @@ struct HipKnownPrefixWindow::Impl {
                     }
                     if (lead.window.mode[i] == KnownWindowStepMode::routed_expert_union) {
                         wide_union_rows = 0;
-                        for (const auto& m : members) wide_union_rows += m.run->rows();
+                        for (const auto& m : members) wide_union_rows += m.union_rows();
                     }
                     for (auto& m : members) {m.run->record_external_step(i);observe(m,i);}
                     continue;
@@ -2847,6 +2850,9 @@ std::vector<HipMtpTargetWindowExecution> HipKnownPrefixWindow::execute_mtp_cohor
         owned[m].session = members[m].session;
         owned[m].tokens = members[m].tokens;
         owned[m].capture = members[m].capture;
+        if (members[m].live_rows > members[m].tokens.size())
+            throw std::invalid_argument("known-window cohort member has more live rows than tokens");
+        owned[m].live = members[m].live_rows;
     }
     std::vector<Impl*> impls;
     for (auto* p : primaries) impls.push_back(p ? p->impl_.get() : nullptr);

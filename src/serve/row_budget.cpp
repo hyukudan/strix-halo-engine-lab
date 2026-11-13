@@ -167,4 +167,10 @@ RowPlan plan_rows(std::span<const LaneDemand> demands, const CycleCost& cost, co
     return plan;
 }
 
+bool row_pays(double accept, double added_ms, double cycle_tokens, double cycle_ms) noexcept {
+    if (!(accept > 0.0)) return false;
+    if (!(added_ms > 0.0) || !(cycle_tokens > 0.0) || !(cycle_ms > 0.0)) return true;
+    return std::min(accept, 1.0) * cycle_ms > added_ms * cycle_tokens;
+}
+
 }  // namespace strix::serve

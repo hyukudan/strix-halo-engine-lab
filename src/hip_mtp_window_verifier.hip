@@ -1,6 +1,7 @@
 #include "strix/env_flags.hpp"
 #include "strix/host_phase_timing.hpp"
 #include "strix/hip_mtp_window_verifier.hpp"
+#include "strix/mtp_batch_window_controller.hpp"
 #include "strix/mtp_payload_geometry.hpp"
 #include "strix/mtp_target_window_policy.hpp"
 #include "strix/mtp_window_controller.hpp"
@@ -668,7 +669,11 @@ std::vector<HipMtpVerifiedTargetRows> HipMtpWindowVerifier::verify_cohort(std::s
         p.inputs.reserve(q.rows);p.inputs.push_back(pending);
         for(std::uint32_t r=1;r<q.rows;++r) p.inputs.push_back(q.candidates.empty()?pending:
             q.candidates[std::min<std::size_t>(r-1U,q.candidates.size()-1U)]);
-        members[a]={owner->window.get(),q.session,p.inputs,p.capture};
+        // Cycle policy, greedy first-max lanes: rows after the last candidate repeat an input and are never
+        // decided, so they stay out of a wide step's routed expert union.
+        const auto live=mtp_serve_cycle_policy_enabled() && !q.transaction && !sampler?
+            static_cast<std::uint32_t>(std::min<std::size_t>(q.rows,q.candidates.size()+1U)):0U;
+        members[a]={owner->window.get(),q.session,p.inputs,p.capture,live==q.rows?0U:live};
         if(q.transaction) {
             require(!sampler && q.verifier->policy_selection_admitted(),"MTP cohort policy route is not serial equivalent");
             q.transaction->reset();q.transaction->expect(q.candidates);
