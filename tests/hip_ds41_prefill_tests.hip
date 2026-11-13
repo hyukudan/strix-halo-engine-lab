@@ -511,6 +511,24 @@ void test_synthetic() {
         }
         strix::ds41::set_pf_core(-1);
     }
+    {
+        // IQ2_XXS gate/up width that is not a multiple of 1024 (the shared core loads whole chunks): the per-form default
+        // keeps the engine kernels; default and PF_CORE=0, partial route batches included, against the decode windows
+        const auto e = synthetic_experts(WeightFormat::iq2_xxs, WeightFormat::q2_k, 8, 1280, 512, 75);
+        const DeviceExperts x(e);
+        for (const char* policy : {static_cast<const char*>(nullptr), "0"}) {
+            strix::ds41::set_pf_core(policy);
+            const std::string name = std::string("synthetic IQ2_XXS/Q2_K h1280 i512 PF_CORE=") + (policy ? policy : "unset");
+            expect(!strix::ds41::prefill_gate_up_on_core(WeightFormat::iq2_xxs, 1280U, 16U), name + ": gate/up routed to the shared core");
+            check_case(x, 37, 6, 4, 16, 0.3, 71, name);
+            check_case(x, 9, 6, 4, 16, 0.0, 72, name);
+        }
+        strix::ds41::set_pf_core(nullptr);
+        expect(strix::ds41::prefill_gate_up_on_core(WeightFormat::iq2_xxs, 1024U, 16U) ==
+                   strix::ds41::prefill_down_on_core(WeightFormat::q2_k, 512U, 16U),
+               "IQ2_XXS h1024 gate/up and Q2_K down: per-form default routes differ");
+        strix::ds41::set_pf_core(-1);
+    }
     check_narrow_gate_up();
     check_q8_nan_payloads();
 }
@@ -935,6 +953,8 @@ void bench_router(const RouterWeights& rw, const std::string& label) {
 
 // Rank-shaped expert calls of the pair prefill (one piece of T rows routed top-k over all experts; this rank owns experts
 // [0, owned)), split kernels only (batches of 16). Arms (STRIX_DS41_BENCH_ARMS = "name:VAR=V,VAR=-;name2:..."; '-' unsets)
+// (default: the engine kernels, PF_CORE=0, against the per-form default route; the v1 / v2 split kernels are explicit
+// arms, "v1:STRIX_DS41_PF_CORE=0,STRIX_DS41_PREFILL_MOE_V2=0;v2:STRIX_DS41_PF_CORE=0,STRIX_DS41_PREFILL_MOE_V2=-")
 // alternate within each repetition, every arm's outputs (A8 codes, deltas, sums, raw down vectors) compared bitwise with
 // the first arm's. STRIX_DS41_BENCH_T (comma list), STRIX_DS41_BENCH_REPS, STRIX_DS41_BENCH_SKEW.
 std::vector<std::string> split_on(const std::string& s, char c) {
@@ -960,7 +980,8 @@ void bench_rank(const DeviceExperts& x, std::uint32_t top_k, std::uint32_t owned
     const auto& e = x.e;
     std::vector<Arm> arms;
     const char* arms_env = std::getenv("STRIX_DS41_BENCH_ARMS");
-    for (const auto& spec : split_on(arms_env && *arms_env ? arms_env : "v1:STRIX_DS41_PREFILL_MOE_V2=0;v2:STRIX_DS41_PREFILL_MOE_V2=-", ';')) {
+    const bool default_arms = !(arms_env && *arms_env);
+    for (const auto& spec : split_on(arms_env && *arms_env ? arms_env : "family:STRIX_DS41_PF_CORE=0;core:STRIX_DS41_PF_CORE=-", ';')) {
         Arm a;
         const auto colon = spec.find(':');
         a.name = spec.substr(0, colon);
@@ -1011,12 +1032,25 @@ void bench_rank(const DeviceExperts& x, std::uint32_t top_k, std::uint32_t owned
         std::vector<std::int8_t> ref_codes;
         std::vector<float> ref_deltas, ref_raw;
         std::vector<std::int32_t> ref_sums;
+        bool ref_gu_core = false, ref_dn_core = false;
         for (unsigned rep = 0; rep < reps + 1U; ++rep)
             for (std::size_t a = 0; a < arms.size(); ++a) {
                 apply_arm(arms[(a + rep) % arms.size()]);
                 const std::size_t arm = (a + rep) % arms.size();
                 const char* r2 = std::getenv("STRIX_DS41_PREFILL_MOE_R2"); // 32-row routes for the R2 arms
                 if (rep == 0U) { run.raw.fill_pattern(); run.act_codes.fill_pattern(); }
+                if (rep == 0U) {
+                    // the route each arm really takes: the default arms are the engine kernels against the shared core
+                    const bool gu_core = prefill_gate_up_on_core(e.gate_up, e.hidden, r2 && std::strcmp(r2, "1") == 0 ? 32U : batch_rows);
+                    const bool dn_core = prefill_down_on_core(e.down, e.inter, r2 && std::strcmp(r2, "1") == 0 ? 32U : batch_rows);
+                    if (a == 0U) { ref_gu_core = gu_core; ref_dn_core = dn_core; }
+                    if (default_arms) expect(a == 0U ? !gu_core && !dn_core : gu_core || dn_core,
+                        label + " T=" + std::to_string(rows) + " arm " + arms[arm].name + ": the default arms do not compare two routes");
+                    std::cout << "RANK-ROUTE " << label << " T=" << rows << " arm " << arms[arm].name << ": gate/up "
+                              << (gu_core ? "shared core" : "engine kernels") << ", down " << (dn_core ? "shared core" : "engine kernels")
+                              << (a != 0U && gu_core == ref_gu_core && dn_core == ref_dn_core ? " (SAME ROUTE as arm " + arms[0].name + ")" : "") << '
+';
+                }
                 hipLaunchKernelGGL(flush_kernel, dim3(1024), dim3(256), 0, nullptr, flush.data, flush.count, sink.data);
                 enqueue_prefill(x, in, r2 && std::strcmp(r2, "1") == 0 ? view32 : view, run, false, ev);
                 check(hipEventSynchronize(ev[2]), "sync");

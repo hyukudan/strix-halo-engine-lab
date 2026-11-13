@@ -17,7 +17,9 @@ struct IntegerPlan {
 // before the LDS stores); without it item 0 is awaited first. A schedule choice per instantiation, the same values.
 // WeightLds = false: no LDS weight tile; each lane reads its own weight row from memory one group ahead (the direct
 // form of the Q8_0 operands, for any codec, with that codec's lean decoder). The workgroup then needs about half the
-// LDS, so two workgroups share a WGP instead of one. The same values.
+// LDS; on the measured target (gfx1151, the DS41 routed operands) two workgroups then shared a WGP instead of one. That
+// occupancy is an observation there, not a guarantee of the plan: it depends on the device and the instantiation. The
+// same values.
 template<unsigned Waves = 8, bool Partial = true, bool SplitStage = false, bool WeightLds = true>
 struct GroupedIntegerPlan : IntegerPlan {
     static constexpr IntegerStructure structure = IntegerStructure::grouped_chunk;
