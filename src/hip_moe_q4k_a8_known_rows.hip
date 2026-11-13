@@ -6,6 +6,7 @@
 #include "strix/hip_arch_caps.hpp"
 #include "moe_core/grouped_policy.hpp"
 #include "moe_core/device_plan.hpp"
+#include "moe_core/route_prune.hpp"
 #include "strix/moe_route_bf16.hpp"
 #include "strix/hip_moe_q4k_a8_known_rows.hpp"
 #include "strix/moe_a8_down_contract.hpp"
@@ -671,6 +672,8 @@ struct PrefillCsrPolicy {
     __device__ __forceinline__ static const unsigned* routes(const View& v,unsigned r){return at(v.routes,r);}
     __device__ __forceinline__ static unsigned expert(const View& v,unsigned r,unsigned s){return at(v.routes,r)[s];}
     __device__ __forceinline__ static unsigned status(const View& v,unsigned r){return *at(v.status,r);}
+    // RoutePrune: a pruned assignment carries weight 0 (moe_core/route_prune.hpp).
+    __device__ __forceinline__ static bool kept(const View& v,unsigned r,unsigned s){return at(v.route_weights,r)[s]!=0.0F;}
     template<bool Certificate>
     __device__ __forceinline__ static bool invalid(const View& v,unsigned r,unsigned s,unsigned e,unsigned experts,bool& unsafe) {
         if constexpr(Certificate) {
@@ -2134,8 +2137,16 @@ void enqueue_prefill(const Request& request,const PrefillRows& rows,unsigned cou
     if(form==2&&count>2048U)throw std::invalid_argument("A8 prefill serial CSR builder admits at most 2048 rows");
     const unsigned blocks=PrefillCsrPlan::blocks_for(count,request.shape.top_k);
     if(blocks==0U||blocks>csr_mw_blocks_max())throw std::invalid_argument("qpf2k CSR multi-CTA block count out of range");
-    hip_check(PrefillCsrPlan::enqueue(rows,count,request.shape.experts,request.shape.top_k,cap,csr_mw_scratch(),stream,certificate),
-        "A8 prefill CSR");
+    // RoutePrune (FAST, default off): zero the negligible route weights, then plan the kept assignments only.
+    const auto prune=prefill_route_prune_state();
+    if(prune.active()) {
+        static const bool witness=[]{std::fprintf(stderr,"qpf2k-moe route prune active\n");return true;}();
+        (void)witness;
+        hip_check(::strix::moe_core::enqueue_route_prune(const_cast<float*>(rows.route_weights.base),rows.route_weights.stride,count,
+            request.shape.top_k,prune,stream),"MoE route prune");
+    }
+    hip_check(PrefillCsrPlan::enqueue(rows,count,request.shape.experts,request.shape.top_k,cap,csr_mw_scratch(),stream,certificate,
+        prune.active()),"A8 prefill CSR");
     prefill_stage_reached(1U,stream);
     // STRIX_PREFILL_MOE_CSR_DUMP=1 (diagnostic, synchronizes): rows-per-expert histogram of each call.
     static const bool csr_dump=strix::envcfg::flag("STRIX_PREFILL_MOE_CSR_DUMP", false);
@@ -2613,6 +2624,7 @@ void enqueue_prefill(const Request& request,const PrefillRows& rows,unsigned cou
 }
 void set_prefill_core2(int core){prefill_core2_override()=core;}
 void set_prefill_route(int bits){prefill_route_override()=bits;}
+void set_prefill_route_prune(moe_core::RoutePrune prune){prefill_route_prune_slot()=prune;}
 void set_prefill_da16(int on){prefill_da16_override()=on;}
 void set_prefill_tile64(int on){prefill_tile64_override()=on;}
 void set_prefill_test_events(hipEvent_t* events){prefill_test_events()=events;}
