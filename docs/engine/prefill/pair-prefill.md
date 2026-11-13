@@ -30,6 +30,49 @@ bytes. Final-state wire v2 uses two pinned 16 MiB slots, a separate copy stream,
 CRC32C per piece and one completion ACK after all H2D installs. Both ranks must
 use this wire version. Memory overhead is 32 MiB pinned host per active handoff.
 
+## One-way seam pieces on the device route
+
+With `usb4gpu`, a seam piece above 64 KiB is eligible for a one-way transfer only when
+the communicator admits a pure device route and the device backend supports it
+(`dist::Communicator::transfer`). The sending rank posts no receive and the receiving rank
+no transmit. An existing early receive is retired once through a symmetric scratch exchange;
+subsequent one-way pieces do not prepost another receive. The receiving GPU checks the
+in-band identity and word checksum of the frame as for a symmetric exchange, and the
+sender's operation completes only against the receive its peer posted.
+
+The seam CRC-32C of such a piece is computed on the device at both ends
+(`xport::DeviceCrc32c`: one digest per 64 KiB span, folded on the host), so the piece is
+neither copied to the host by staging on the sender nor read back by staging on the receiver.
+This does not exclude host copies inside the transport's fallback. The value is the
+host CRC-32C of the same bytes, bit for bit; the control stream (piece CRC, whole-frame CRC,
+consumption ACK) is unchanged; native logit equality remains pending. Pieces of 64 KiB or less and the
+host-only transport keep the host path.
+
+Host or mixed communicator routes decline `transfer()` and use the symmetric fallback,
+including reverse scratch traffic. With host streams available, the default route table
+selects a mixed route above 1 MiB: a full 16 MiB seam piece uses that fallback, with host
+staging for the mixed share. Selecting `usb4gpu` alone does not establish a copy-free or
+one-way transfer; inspect the route table and actual one-way/byte counters.
+
+`STRIX_PAIR_LINK_ONE_WAY=0` restores the symmetric exchange (a full-size scratch payload in
+the unused direction); both ranks must set it the same way. `STRIX_PAIR_LINK_DEVICE_CRC=0`
+restores the host CRC with its copies on the rank that sets it (the wire does not change, so
+the ranks may differ). The run prints one `qwen-pair link:` line with the pieces and
+the device bytes sent and received by the rank.
+
+The link is shared (`pair::DeviceLink`, `src/xport/pair_device_link.hpp`). The Gemma 4 pair
+uses it too: its default transport stays `usb4auto` (host path, unchanged), and
+`--transport usb4gpu` uses the same admission, fallback and device CRC rules
+(its receipt line is `g4-pair link:`).
+
+Both switches default ON in the implementation; native execution qualification is pending.
+Host fold arithmetic and vector-backed staging tests do not execute `DeviceCrc32c`,
+`Communicator::transfer` or GPU queues. Qualification requires native CRC comparisons,
+both directions, multi-chunk transfers, slot reuse, preposted-to-one-way transitions,
+host/mixed fallback, independent CRC OFF settings and failure teardown, with actual
+route/byte counters and complete token, logit and state equality for the workload.
+Kernel compilation alone does not establish these gates.
+
 ## Stage balance, seam copies and the pair timeline
 
 `STRIX_PAIR_TIMING=1` prints one `pair-timing` line per chunk and rank and a per-rank sum

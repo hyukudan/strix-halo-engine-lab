@@ -93,6 +93,10 @@ inline constexpr std::array yarn_environment_rules{
     // guard separately bounds explicit MTP and refuses caching and HTTP.
     YarnEnvironmentRule{"STRIX_PREFIX_BATCH_CERT", YarnEnvironmentClass::nonrotary, ""},
     YarnEnvironmentRule{"STRIX_SERVE_PREFILL", YarnEnvironmentClass::nonrotary, ""},
+    YarnEnvironmentRule{"STRIX_SERVE_ROUTE", YarnEnvironmentClass::nonrotary, ""},
+    YarnEnvironmentRule{"STRIX_SERVE_PREFILL_ORG", YarnEnvironmentClass::nonrotary, ""},
+    YarnEnvironmentRule{"STRIX_SERVE_T16K", YarnEnvironmentClass::nonrotary, ""},
+    YarnEnvironmentRule{"STRIX_SERVE_FP16_MTP", YarnEnvironmentClass::nonrotary, ""},
     YarnEnvironmentRule{"STRIX_BATCH_PROMPT_SMALL", YarnEnvironmentClass::nonrotary, ""},
     YarnEnvironmentRule{"STRIX_PREFIX_CACHE_INFLIGHT", YarnEnvironmentClass::nonrotary, ""},
     YarnEnvironmentRule{"STRIX_PREFIX_CACHE_DISK", YarnEnvironmentClass::nonrotary, ""},

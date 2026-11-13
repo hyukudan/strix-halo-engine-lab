@@ -5754,8 +5754,11 @@ static int run_decode_entry(
                 [&](std::span<const std::byte> data) { pair_link->send(data); },
                 [&](std::span<std::byte> data) { pair_link->receive(data); },
                 [&] { pair_link->abort("pair prefill stopped"); }, pair_prediction.stage(),
-                [&] { return strix::qwen_pp::make_hip_pipe_staging(
-                    static_cast<std::size_t>(known_prefill_plan->logical_rows) * strix::qwen_pp::Seam::row_bytes); },
+                [&] {
+                    auto staging = strix::qwen_pp::make_hip_pipe_staging(
+                        static_cast<std::size_t>(known_prefill_plan->logical_rows) * strix::qwen_pp::Seam::row_bytes);
+                    staging->route_device([link = pair_link.get()](std::size_t bytes) { return link->device_checked(bytes); });
+                    return staging; },
                 [](std::span<const std::byte> data) { return strix::dist::crc32c(data); },
                 [&](bool sending, strix::qwen_pp::PipeStaging& staging, std::size_t offset, std::size_t bytes) {
                     return pair_link->piece(sending, staging, offset, bytes);

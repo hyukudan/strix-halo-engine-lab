@@ -230,7 +230,7 @@ Follow the link for the gain, preconditions and off switch. Defaults are shorten
 | `STRIX_GLM_PF_ATTN_QWIN` | glm | auto | [glm-pf-attn-qwin](optimizations.md#glm-pf-attn-qwin) |
 | `STRIX_GLM_PF_AUX_COMBINE` | glm | 1 | [glm-pf-aux-combine](optimizations.md#glm-pf-aux-combine) |
 | `STRIX_GLM_PF_DENSE_FORM` | glm | automatic (0) | [glm-pf-dense-rows-v4](optimizations.md#glm-pf-dense-rows-v4) |
-| `STRIX_GLM_PF_DENSE_ROWS` | glm | 3 | [glm-pf-dense-rows-v3](optimizations.md#glm-pf-dense-rows-v3) |
+| `STRIX_GLM_PF_DENSE_ROWS` | glm | 4 | [glm-pf-dense-rows-v4](optimizations.md#glm-pf-dense-rows-v4) |
 | `STRIX_GLM_PF_HC_EXPAND_ROWS` | glm | 2 | [glm-pf-hc-expand-rows](optimizations.md#glm-pf-hc-expand-rows) |
 | `STRIX_GLM_PF_HC_FUSE` | glm | 1 | [glm-pf-hc-fuse](optimizations.md#glm-pf-hc-fuse) |
 | `STRIX_GLM_PF_HC_HOIST` | glm | 1, 1 | [glm-pf-sumexp](optimizations.md#glm-pf-sumexp) |
@@ -258,6 +258,7 @@ Follow the link for the gain, preconditions and off switch. Defaults are shorten
 | `STRIX_MMX_PREFILL_TAIL_STREAM` | minimax | 1 | [mm-pf-tail-stream](optimizations.md#mm-pf-tail-stream) |
 | `STRIX_MM_PFX` | minimax | on | [mm-rank-pfx](optimizations.md#mm-rank-pfx) |
 | `STRIX_MM_PFX_CHUNK` | minimax | 4194304 | [mm-pfx-chunk](optimizations.md#mm-pfx-chunk) |
+| `STRIX_MM_PFX_JOINED` | minimax | 1 | [mm-pfx-joined](optimizations.md#mm-pfx-joined) |
 | `STRIX_MM_PF_ASYNC_START` | minimax | ON | [minimax-grouped-prefill.md](minimax-grouped-prefill.md) |
 | `STRIX_MM_PF_ATTEND4` | minimax | 1 | [mm-pf-attend4](optimizations.md#mm-pf-attend4) |
 | `STRIX_MM_PF_DENSE_O` | minimax | 1 | [mm-pf-dense-o](optimizations.md#mm-pf-dense-o) |
@@ -296,7 +297,7 @@ Follow the link for the gain, preconditions and off switch. Defaults are shorten
 | `STRIX_QPF2K_HC_MASK` | qwen | 14 | [qwen-hc](optimizations.md#qwen-hc) |
 | `STRIX_QPF2K_HC_OUTPUT3` | qwen | 1 | [qwen-hc](optimizations.md#qwen-hc) |
 | `STRIX_QPF2K_HC_OUTPUT3_BAND` | qwen | 16 | [qwen-hc](optimizations.md#qwen-hc) |
-| `STRIX_QPF2K_HC_RECOMPUTE_NORM` | qwen | OFF pending native equality and not-s... | [hc-normalized-recompute-candidate](optimizations.md#hc-normalized-recompute-candidate) |
+| `STRIX_QPF2K_HC_RECOMPUTE_NORM` | qwen | ON with the WMMA HC output (auto); =1 ... | [hc-normalized-recompute](optimizations.md#hc-normalized-recompute) |
 | `STRIX_QPF2K_HC_UPCOPY` | qwen | auto with HC output v3 | [qwen-hc](optimizations.md#qwen-hc) |
 | `STRIX_QPF2K_INDEX_BATCH` | qwen | ON | [exact-indexer-projection-batching](optimizations.md#exact-indexer-projection-batching) |
 | `STRIX_QPF2K_MOE_DA16` | qwen | 1 | [qwen-moe](optimizations.md#qwen-moe) |
@@ -305,6 +306,7 @@ Follow the link for the gain, preconditions and off switch. Defaults are shorten
 | `STRIX_QPF2K_MOE_MC` | qwen | 1 (mode 1; mode 2 needs an explicit v... | [qwen-moe-merge-commit](optimizations.md#qwen-moe-merge-commit) |
 | `STRIX_QPF2K_MOE_ROUTE` | qwen | 14 | [qwen-moe](optimizations.md#qwen-moe) |
 | `STRIX_QPF2K_MOE_XOR64` | qwen | 1 | [qwen-moe-xor-rows](optimizations.md#qwen-moe-xor-rows) |
+| `STRIX_QPF2K_MOE_DA16_ISSUE` | qwen | auto | [qwen-moe-da16-issue](optimizations.md#qwen-moe-da16-issue) |
 | `STRIX_QPF2K_QSA` | qwen | 1 | [qwen-qsa](optimizations.md#qwen-qsa) |
 | `STRIX_QPF2K_QSA_MASK` | qwen | 0x2257 | [qwen-qsa](optimizations.md#qwen-qsa) |
 | `STRIX_QPF2K_SCHED` | qwen | 14 | [qwen-schedule](optimizations.md#qwen-schedule) |
@@ -313,6 +315,10 @@ Follow the link for the gain, preconditions and off switch. Defaults are shorten
 | `STRIX_QPF2K_T16K` | qwen | ON from 32768 prompt tokens | [automatic-t16384-prefill](optimizations.md#automatic-t16384-prefill) |
 | `STRIX_QPF2K_WMMA_PIN` | qwen | 1 | [qwen-dense](optimizations.md#qwen-dense) |
 | `STRIX_SERVE_PREFILL` | qwen | ON: admitted T8192; configured prefix... | [default-prompt-prefill](engine/serving/serving.md#default-prompt-prefill) |
+| `STRIX_SERVE_ROUTE` | qwen | ON: server tile and prefill arithmetic from the single-request route rule; `0` restores T8192 with the resolved arithmetic | [default-prompt-prefill](engine/serving/serving.md#default-prompt-prefill) |
+| `STRIX_SERVE_PREFILL_ORG` | qwen | ON: an admitted server owner takes the prefill organization of the single-request route (row-loop, attention stage, table and expert header/merge batching); `0` keeps the startup items only | [default-prompt-prefill](engine/serving/serving.md#default-prompt-prefill) |
+| `STRIX_SERVE_T16K` | qwen | ON: T16384 owner when the context admits a 32,768-token request and every resident slot fits; `0` keeps T8192 | [default-prompt-prefill](engine/serving/serving.md#default-prompt-prefill) |
+| `STRIX_SERVE_FP16_MTP` | qwen | ON: explicit-sidecar MTP servers keep the automatic FP16 prefill arithmetic with the unqualified fast options off; `0` declines it | [default-prompt-prefill](engine/serving/serving.md#default-prompt-prefill) |
 
 ### Decode, MTP and DSpark (22)
 

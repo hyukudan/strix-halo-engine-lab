@@ -264,17 +264,20 @@ template<bool Pair,class Binding> hipError_t launch(int plan,const Binding& b,co
         default:return hipErrorInvalidValue;
     }
 }
-// The chain's plan for a call (moe_i4_chain_plan.hpp) under STRIX_MOE_I4_CHAIN_GSAVE. scratch_floats: FP32 values
-// of gate scratch the caller can lend for the paired launch; pair_slots: pair indices the binding can return.
-template<class Binding> ChainPlan chain_plan(int requested,std::size_t scratch_floats,std::size_t pair_slots) {
-    return chain_plan(requested,gsave_enabled(),scratch_floats,chain_gsave_floats(pair_slots,Binding::I));
+// The chain's plan for a call (moe_i4_chain_plan.hpp). gsave_on: the caller's resolved STRIX_MOE_I4_CHAIN_GSAVE
+// (gsave_enabled(), read once by the caller; nothing here reads the environment). scratch_floats: FP32 values of
+// gate scratch the caller can lend for the paired launch; pair_slots: pair indices the binding can return.
+template<class Binding> ChainPlan chain_plan(int requested,bool gsave_on,std::size_t scratch_floats,std::size_t pair_slots) {
+    return chain_plan(requested,gsave_on,scratch_floats,chain_gsave_floats(pair_slots,Binding::I));
 }
 // Tile list capacity every launch of the plan fits in, the register-save fallback (plan 1 at most) included.
 inline unsigned chain_max_tiles(const ChainPlan& p,std::size_t map_rows,int experts) {
     const auto pt=iu4_grouped_max_tiles(map_rows,experts,p.paired<1 ? p.paired : 1), dt=iu4_grouped_max_tiles(map_rows,experts,p.down);
     return unsigned(pt>dt ? pt : dt);
 }
-struct ChainStatus { hipError_t status; const char* stage; };
+// ran: the plan the launches were enqueued on (the request, or the register-save form after a rejected scratch
+// form), so a caller or fixture can tell a fallback from the requested route. Meaningful when status is success.
+struct ChainStatus { hipError_t status; const char* stage; ChainPlan ran{}; };
 // Paired gate/up then routed down on one plan decision: one tile build when the plan is shared (GSave admitted or
 // plan <= 1), else the register-save paired launch on plan 1 and a second tile build for the down. gsave: the
 // admitted scratch (used only when p.gsave). A scratch-form kernel the device does not admit (spill or residency,
@@ -283,27 +286,29 @@ struct ChainStatus { hipError_t status; const char* stage; };
 template<class Binding,class Between> ChainStatus launch_chain(const ChainPlan& p,const Binding& b,const Weights& w,
     const IU4Group* groups,int experts,IU4GroupTile* tiles,uint32_t* ntiles,std::size_t map_rows,const uint8_t* gq,const float* gs,
     uint8_t* aq,float* as,float* gsave,hipStream_t stream,Between between) {
-    if (p.gsave && !gsave) return {hipErrorInvalidValue,"chain gate scratch"};
+    if (p.gsave && !gsave) return {hipErrorInvalidValue,"chain gate scratch",{}};
     int paired=p.paired;
+    bool gsaved=p.gsave;
     auto pt=unsigned(iu4_grouped_max_tiles(map_rows,experts,paired));
     const auto dt=unsigned(iu4_grouped_max_tiles(map_rows,experts,p.down));
     auto status=build_iu4_grouped_tiles(groups,experts,paired,tiles,ntiles,pt,stream);
-    if (status!=hipSuccess) return {status,"chain tiles"};
+    if (status!=hipSuccess) return {status,"chain tiles",{}};
     status=launch<true>(paired,b,w,tiles,ntiles,pt,gq,gs,aq,as,stream,p.gsave ? gsave : nullptr);
     if (status==hipErrorNotSupported && p.gsave && paired>1) {
         paired=1; pt=unsigned(iu4_grouped_max_tiles(map_rows,experts,paired));
         status=build_iu4_grouped_tiles(groups,experts,paired,tiles,ntiles,pt,stream);
-        if (status!=hipSuccess) return {status,"chain tiles"};
+        if (status!=hipSuccess) return {status,"chain tiles",{}};
         status=launch<true>(paired,b,w,tiles,ntiles,pt,gq,gs,aq,as,stream);
+        gsaved=false;
     }
-    if (status!=hipSuccess) return {status,"chain paired gate/up"};
+    if (status!=hipSuccess) return {status,"chain paired gate/up",{}};
     between();
     if (paired!=p.down) {
         status=build_iu4_grouped_tiles(groups,experts,p.down,tiles,ntiles,dt,stream);
-        if (status!=hipSuccess) return {status,"chain down tiles"};
+        if (status!=hipSuccess) return {status,"chain down tiles",{}};
     }
     status=launch<false>(p.down,b,w,tiles,ntiles,dt,nullptr,nullptr,aq,as,stream);
-    return {status,"chain down"};
+    return {status,"chain down",ChainPlan{paired,p.down,gsaved}};
 }
 template<class Binding> ChainStatus launch_chain(const ChainPlan& p,const Binding& b,const Weights& w,
     const IU4Group* groups,int experts,IU4GroupTile* tiles,uint32_t* ntiles,std::size_t map_rows,const uint8_t* gq,const float* gs,

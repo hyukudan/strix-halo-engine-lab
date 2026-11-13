@@ -89,7 +89,7 @@ void launch_i4_chain(const Tables& t,const I4Layer& q,const float* x,float* out,
     // call runs at most plan 1 on its own tile list. GSave keeps the pass-0 gate in a global FP32
     // scratch (exact, L2-resident, same thread reads it back) so both calls share the selected plan.
     const bool gsv=st::moe_i4::gsave_enabled();
-    const auto cp=st::moe_i4::chain_plan<I4Binding>(iu4_plan(t.pairs,strix::core::moe_i4::kPlan2Rows),gsv ? std::size_t(t.pairs)*kInter : 0,t.pairs);
+    const auto cp=st::moe_i4::chain_plan<I4Binding>(iu4_plan(t.pairs,strix::core::moe_i4::kPlan2Rows),gsv,gsv ? std::size_t(t.pairs)*kInter : 0,t.pairs);
     const unsigned max_tiles=st::moe_i4::chain_max_tiles(cp,t.pairs,kI4Experts);
     const std::size_t tile_bytes=align256(max_tiles*sizeof(st::IU4GroupTile));
     const std::size_t qbytes=align256(std::size_t(t.pairs)*(kInter/2));

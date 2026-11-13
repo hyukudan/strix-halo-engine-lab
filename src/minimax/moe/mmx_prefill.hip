@@ -5,7 +5,7 @@
 #include "minimax/moe/mmx_prefill_core.hpp"
 #include "minimax/moe/mmx_trellis_device.hpp"
 #include "core/activation_quant.hpp"
-#include "core/trellis_device.hpp"
+#include "core/trellis_codec.hpp"
 #ifndef STRIX_MMX_IU4_LIB
 #define STRIX_MMX_IU4_LIB 0
 #endif
@@ -45,7 +45,7 @@ constexpr unsigned kHB = kHidden / 128, kIB = kInter / 128;  // 48, 12
 
 
 // ---------------------------------------------------------------- library WMMA core pieces (gemm.hip, trellis_device.hpp)
-using strix::core::WaveTile;
+template <int Bits> using WaveTile = strix::core::trellis::WaveTile<Bits>;
 using Half16 = _Float16 __attribute__((ext_vector_type(16)));
 using Float8 = float __attribute__((ext_vector_type(8)));
 
@@ -81,7 +81,7 @@ __device__ void wmma_item(const WItem& it, unsigned bx, unsigned by, unsigned bz
             for (int j = 0; j < 8; ++j) {
                 const int r = 2 * (lane % 4) + (j % 2) + 8 * ((j / 2) % 2);
                 const int c = lane / 4 + 8 * (j / 4);
-                q[wave * 256 + r * 16 + c] = static_cast<_Float16>(strix::core::codebook_value(tile.state(8 * lane + j), 2));
+                q[wave * 256 + r * 16 + c] = static_cast<_Float16>(strix::core::trellis::codebook_value(tile.state(8 * lane + j), 2));
             }
         }
         __syncthreads();

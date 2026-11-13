@@ -55,7 +55,7 @@ bit a bit) está activado de forma predeterminada (sin definir o `1`); `=0` rest
 interruptores solo aceptan `0` o `1`.
 
 Los selectores de variante de kernel del prefill (`STRIX_GLM_PF_HC`, `_MLA`, `_IDX`, `_SELECT`, `_OBAR`,
-`_MLA_GEMM`, `_SCORES`, `_KDA_SCAN`, `_DENSE_ROWS`) comparten una tabla que usan el motor y
+`_MLA_GEMM`, `_SCORES`, `_KDA_SCAN`, `_DENSE_ROWS`, `_DENSE_FORM`) comparten una tabla que usan el motor y
 `--print-effective-config`. Sin definir se elige el predeterminado; cualquier valor definido, incluido el vacío,
 debe ser una variante de la lista o el arranque se rechaza con
 `ENV='v' is not a known variant (allowed: ...; unset = D)`. La línea de configuración efectiva indica la variante
@@ -71,7 +71,8 @@ que se ejecuta.
 | `STRIX_GLM_PF_MLA_GEMM` | 3, 2, 1 |
 | `STRIX_GLM_PF_SCORES` | 7, 6, 5, 4, 3, 2 |
 | `STRIX_GLM_PF_KDA_SCAN` | 5, 3, 1 |
-| `STRIX_GLM_PF_DENSE_ROWS` | 3, 2, 1 |
+| `STRIX_GLM_PF_DENSE_ROWS` | 4, 3, 2, 1 |
+| `STRIX_GLM_PF_DENSE_FORM` | 0, 1, 2, 3, 4, 5, 6, 7 (forma física de la versión 4; 0 = automática según la forma de la llamada) |
 
 Con `STRIX_XPORT_TRACE=1`, el intercambio del prefill imprime
 `xport prefill bytes=... copied=... messages=... reuse_dependencies=...` al cerrarse. `reuse_dependencies`

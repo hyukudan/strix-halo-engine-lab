@@ -47,9 +47,9 @@ target_link_libraries(qwen_decode_bench PRIVATE strix_qwen_cuda)
 # Serving front end of the node (OpenAI/Anthropic API, SSE, GGUF BPE tokenizer, Qwen chat template) for the RTX engine.
 add_library(strix_serve_win STATIC
     src/serve/json_constraint.cpp src/serve/constraint_selection.cpp src/serve/bpe_tokenizer.cpp
-    src/serve/chat_template.cpp src/serve/deepseek_chat.cpp src/serve/engine.cpp src/serve/api.cpp src/serve/request_fields.cpp src/serve/health.cpp src/serve/http_server.cpp)
+    src/serve/chat_template.cpp src/serve/deepseek_chat.cpp src/serve/engine.cpp src/serve/api.cpp src/serve/media.cpp src/serve/request_fields.cpp src/serve/health.cpp src/serve/http_server.cpp)
 target_include_directories(strix_serve_win PUBLIC include PRIVATE src/serve)
-target_link_libraries(strix_serve_win PUBLIC strix_qwen_handoff)
+target_link_libraries(strix_serve_win PUBLIC strix_qwen_handoff strix_session)  # api.cpp builds the per-request EmbedTable
 add_executable(strix-cuda-qwen-serve apps/cuda_qwen_serve_main.cu)
 target_link_libraries(strix-cuda-qwen-serve PRIVATE strix_qwen_cuda strix_serve_win)
 if(MSVC)

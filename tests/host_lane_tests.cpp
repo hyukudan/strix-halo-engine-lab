@@ -5,6 +5,7 @@
 #include <csignal>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <future>
 #include <iostream>
 #include <stdexcept>
@@ -186,6 +187,118 @@ void lane_runs_jobs_and_reports() {
     require(sum.load() == 200 * 201 / 2, "queued jobs were dropped at shutdown");
 }
 
+// Latency class: independent jobs overlap up to the worker count, a chain keeps its order, the class narrows
+// while a decode is active, and with no latency workers the jobs use the critical class.
+void latency_class_runs_independent_jobs_in_parallel() {
+    HostLaneConfig config;
+    config.latency_threads = 3;
+    config.latency_decode_threads = 1;
+    config.byte_cap_gbytes_ps = 1.0;
+    {
+        HostLane lane(config);
+        require(lane.config().latency_threads == 3 && lane.config().latency_decode_threads == 1, "latency config");
+        // Three jobs that only finish once all three are running: they must be on three threads at once.
+        std::atomic<int> running{0};
+        std::vector<std::future<bool>> met;
+        for (int i = 0; i < 3; ++i)
+            met.push_back(lane.submit(HostPriority::latency, [&running] {
+                ++running;
+                const auto deadline = Clock::now() + std::chrono::seconds(20);
+                while (running.load() < 3 && Clock::now() < deadline) std::this_thread::yield();
+                return running.load() == 3;
+            }));
+        for (auto& f : met) require(f.get(), "independent latency jobs did not overlap");
+        require(lane.stats().latency_peak_running == 3, "latency peak");
+
+        // Chains: finish protected work before queuing the successor. That work stays ordered;
+        // return/cleanup may overlap the successor, while different chains interleave.
+        constexpr int chains = 8, links = 200;
+        struct Chain {
+            std::vector<int> seen;
+            std::atomic<int> inside{0};
+            std::atomic<bool> overlap{false};
+            std::promise<void> done;
+        };
+        std::vector<Chain> state(chains);
+        std::function<void(int, int)> link = [&](int chain, int index) {
+            (void)lane.submit(HostPriority::latency, [&, chain, index] {
+                Chain& c = state[static_cast<std::size_t>(chain)];
+                if (c.inside.fetch_add(1) != 0) c.overlap = true;
+                c.seen.push_back(index);
+                c.inside.fetch_sub(1);
+                if (index + 1 == links) c.done.set_value();
+                else link(chain, index + 1);
+            });
+        };
+        for (int chain = 0; chain < chains; ++chain) link(chain, 0);
+        for (auto& c : state) {
+            c.done.get_future().get();
+            require(!c.overlap.load() && static_cast<int>(c.seen.size()) == links, "chain overlapped or lost a link");
+            for (int i = 0; i < links; ++i) require(c.seen[static_cast<std::size_t>(i)] == i, "chain order");
+        }
+
+        // While a decode is active only latency_decode_threads jobs run at once; everything still completes.
+        std::atomic<int> now{0}, peak{0};
+        std::vector<std::future<void>> capped;
+        {
+            ByteBudget::DecodeScope decode(lane.budget());
+            for (int i = 0; i < 12; ++i)
+                capped.push_back(lane.submit(HostPriority::latency, [&now, &peak] {
+                    const int mine = ++now;
+                    for (int seen = peak.load(); mine > seen && !peak.compare_exchange_weak(seen, mine);) {}
+                    std::this_thread::sleep_for(milliseconds(2));
+                    --now;
+                }));
+            for (auto& f : capped) f.get();
+        }
+        require(peak.load() == 1, "latency class did not narrow during decode");
+        const auto stats = lane.stats();
+        require(stats.latency_jobs == 3U + chains * links + 12U && stats.critical_jobs == 0, "latency job counts");
+        require(stats.latency_wait_max_ns <= stats.latency_wait_ns && stats.latency_busy_ns > 0, "latency wait stats");
+        require(lane.receipt_json().find("\"host_lane_latency_jobs\":") != std::string::npos, "latency receipt field");
+        // A critical job does not wait behind latency work that fills every latency worker.
+        std::promise<void> gate;
+        const std::shared_future<void> opened = gate.get_future().share();
+        std::vector<std::future<void>> blocked;
+        for (int i = 0; i < 6; ++i) blocked.push_back(lane.submit(HostPriority::latency, [opened] { opened.wait(); }));
+        auto urgent = lane.submit(HostPriority::critical, [] { return 7; });
+        require(urgent.wait_for(std::chrono::seconds(20)) == std::future_status::ready && urgent.get() == 7,
+                "critical job waited behind latency work");
+        gate.set_value();
+        for (auto& f : blocked) f.get();
+    }
+    {
+        // No latency workers: the previous arrangement, latency jobs on the critical thread.
+        HostLaneConfig previous;
+        previous.latency_threads = 0;
+        HostLane lane(previous);
+        const auto caller = std::this_thread::get_id();
+        require(lane.submit(HostPriority::latency, [] { return std::this_thread::get_id(); }).get() != caller, "latency fallback thread");
+        const auto stats = lane.stats();
+        require(stats.critical_jobs == 1 && stats.latency_jobs == 0 && stats.inline_jobs == 0, "latency fallback counts");
+    }
+    {
+        HostLaneConfig automatic, wide, off;
+        wide.latency_threads = 99;
+        wide.latency_decode_threads = 99;
+        off.enabled = false;
+        HostLane a(automatic), w(wide), o(off);
+        require(a.config().latency_threads >= 2 && a.config().latency_threads <= 4, "automatic latency worker count");
+        require(w.config().latency_threads == 8 && w.config().latency_decode_threads == 8, "latency clamps");
+        const auto caller = std::this_thread::get_id();
+        require(o.submit(HostPriority::latency, [] { return std::this_thread::get_id(); }).get() == caller, "inline latency");
+    }
+    // Jobs still queued at destruction complete, also past the worker count.
+    std::atomic<int> sum{0};
+    {
+        HostLaneConfig small;
+        small.latency_threads = 2;
+        HostLane lane(small);
+        for (int i = 1; i <= 300; ++i) (void)lane.submit(HostPriority::latency, [&sum, i] { sum += i; });
+    }
+    require(sum.load() == 300 * 301 / 2, "queued latency jobs were dropped at shutdown");
+}
+
 void lane_disabled_runs_inline() {
     HostLaneConfig config;
     config.enabled = false;
@@ -272,6 +385,35 @@ int load(double seconds, unsigned threads, double cap_gbps, std::size_t buffer_m
 }
 } // namespace
 
+// No submission or job completion may be needed to wake the workers after linger expires.
+void latency_resumes_after_decode_linger() {
+    HostLaneConfig config;
+    config.latency_threads = 4;
+    config.latency_decode_threads = 1;
+    std::promise<void> started, release;
+    auto released = release.get_future().share();
+    HostLane lane(config);
+    lane.budget().decode_begin();
+    auto long_job = lane.submit(HostPriority::latency, [&] {
+        started.set_value();
+        (void)released.wait_for(std::chrono::seconds(5));
+    });
+    started.get_future().wait();
+    std::vector<std::future<void>> short_jobs;
+    for (int i = 0; i < 3; ++i) short_jobs.push_back(lane.submit(HostPriority::latency, [] {}));
+    const bool held = short_jobs.front().wait_for(milliseconds(100)) == std::future_status::timeout;
+    lane.budget().decode_end();
+    const auto deadline = Clock::now() + std::chrono::seconds(2);
+    bool resumed = true;
+    for (auto& job : short_jobs) resumed &= job.wait_until(deadline) == std::future_status::ready;
+    const bool still_blocked = long_job.wait_for(milliseconds(0)) == std::future_status::timeout;
+    release.set_value(); // also let a failing implementation shut down without hanging
+    long_job.get();
+    for (auto& job : short_jobs) job.get();
+    require(held, "latency jobs escaped the active decode cap");
+    require(resumed && still_blocked, "queued latency jobs did not resume after decode linger");
+}
+
 int main(int argc, char** argv) {
     try {
         if (argc >= 5 && std::string(argv[1]) == "--load")
@@ -283,6 +425,8 @@ int main(int argc, char** argv) {
         budget_wait_ends_with_the_decode();
         core_lists();
         lane_runs_jobs_and_reports();
+        latency_class_runs_independent_jobs_in_parallel();
+        latency_resumes_after_decode_linger();
         lane_disabled_runs_inline();
         lane_pins_to_declared_cores();
     } catch (const std::exception& error) {

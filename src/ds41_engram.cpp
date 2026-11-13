@@ -196,13 +196,15 @@ EngramHasher::EngramHasher(const deepseek41::EngramContract& c) : contract_(c) {
 void EngramHasher::push(std::uint32_t token, std::span<std::uint64_t> rows) {
     const auto& c = contract_;
     const std::size_t layers = c.layer_ids.size(), cols = c.rows_per_token(), n = c.max_ngram_size;
+    const bool dead = (token & kEngramDeadBit) != 0U;
+    token &= ~kEngramDeadBit;
     require(token < c.token_map.size() && rows.size() == layers * cols, "Engram hash request");
-    history_.push_back(c.token_map[token]);
+    history_.push_back(dead ? kDead : c.token_map[token]);
     const std::size_t t = history_.size() - 1;
     std::vector<std::uint64_t> ids(n);
     bool blocked = false;
     for (std::size_t s = 0; s < n; ++s) {
-        blocked = blocked || t < s;  // text only: no dead (image) positions
+        blocked = blocked || t < s || history_[t - s] == kDead;  // nothing reads through a dead (image) position
         ids[s] = blocked ? pad_ : history_[t - s];
     }
     for (std::size_t e = 0; e < layers; ++e) {

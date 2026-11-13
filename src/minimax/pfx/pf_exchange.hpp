@@ -23,6 +23,7 @@
 
 #include "minimax/pfx/pf_crc.hpp"
 #include "minimax/pfx/pf_wire.hpp"
+#include "xport/framed_exchange.hpp"
 #include "strix/dist/communicator.hpp"
 
 #include <hip/hip_runtime.h>
@@ -49,6 +50,10 @@ struct Options {
     std::size_t chunk = std::size_t{1} << 22;  // 4 MiB: TTFT -1.5 % at 4K, -1.9 % at 1K vs 1 MiB, bytes identical
     hipStream_t stream = nullptr;
     bool crc = true;
+    // Joined framing (xport/framed_exchange.hpp): the identity rides behind the last chunk, and with CRC and two or
+    // more chunks so does the CRC list; offered in a one-time hello and used when the peer offers it too.
+    // STRIX_MM_PFX_JOINED=0 (both ranks): the original header / chunks / CRC-list rendezvous, no hello.
+    bool joined = true;
     bool tx_uncached = false;
     int progress_cpu = -1, crc_tx_cpu = -1, crc_rx_cpu = -1;
     unsigned idle_spin_us = 3000;
@@ -157,6 +162,9 @@ private:
     xport::HostWaitMetric peer_wait_{"minimax-prefill", "peer"}; // progress thread only
     mutable std::mutex stats_mutex_;
     Lane tx_lane_, rx_lane_;
+    xport::FramedExchange<Header> frame_;
+    std::uint32_t forms_ = xport::frame_rendezvous; // progress thread: the agreed forms (after the hello)
+    bool negotiated_ = false;
     std::thread thread_;
 };
 

@@ -3060,13 +3060,8 @@ void dense_rows(const float* x, const void* w, dev::WType wt, unsigned in, unsig
 // per shape (rows, chain length, group size). STRIX_GLM_PF_DENSE_FORM=1..7 forces one form where the shape admits it
 // (0 / unset = automatic). Shapes outside the v2 / v3 range (in > 4096) keep the version 3 route.
 static ::strix::core::fma_rows::Form dense_form() {
-    static const auto f = [] {
-        const char* e = std::getenv("STRIX_GLM_PF_DENSE_FORM");
-        if (e == nullptr || *e == 0) return ::strix::core::fma_rows::Form::Auto;
-        const std::string v(e);
-        if (v.size() != 1 || v[0] < '0' || v[0] > '7') throw std::invalid_argument("STRIX_GLM_PF_DENSE_FORM must be 0..7");
-        return static_cast<::strix::core::fma_rows::Form>(static_cast<unsigned>(v[0] - '0'));
-    }();
+    // The governed selector table (glm_pf_variants.hpp): the same parser the rank resolver validates at startup.
+    static const auto f = static_cast<::strix::core::fma_rows::Form>(pf_variant_from_env(*pf_variant_find("STRIX_GLM_PF_DENSE_FORM")));
     return f;
 }
 static ::strix::core::fma_rows::Weight fma_weight(dev::WType wt) {

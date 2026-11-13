@@ -23,6 +23,7 @@ if(STRIX_CUDA_QWEN_ONLY)
     include(CTest)
     include(cmake/StrixSession.cmake)
     include(cmake/QwenCuda.cmake)
+    include(cmake/StrixLevers.cmake)
     return()
 endif()
 
@@ -695,6 +696,8 @@ if(BUILD_TESTING)
 endif()
 # Device declaration (strix-devices-v1) and the start gate every GPU binary calls before its first allocation.
 include(cmake/StrixDevice.cmake)
+# Typed lever declaration and the census of environment switches (host tests).
+include(cmake/StrixLevers.cmake)
 # Every HIP app calls the start gate first; the core library carries it to all of them.
 target_link_libraries(strix_core PUBLIC strix_device_hip)
 # Effective-config headers are consumed by the core CLI and its host tests.
@@ -885,6 +888,14 @@ if(BUILD_TESTING)
     strix_target_warnings(strix-host-lane-tests)
     add_test(NAME strix-host-lane-tests COMMAND strix-host-lane-tests)
     set_tests_properties(strix-host-lane-tests PROPERTIES LABELS "cpu" TIMEOUT 120)
+    # Shared weight-load queue: overlapped reads, per-ticket staging inside a resident budget, one publication wait.
+    add_executable(strix-weight-load-queue-tests tests/weight_load_queue_tests.cpp)
+    target_include_directories(strix-weight-load-queue-tests PRIVATE src)
+    target_link_libraries(strix-weight-load-queue-tests PRIVATE Threads::Threads)
+    target_compile_features(strix-weight-load-queue-tests PRIVATE cxx_std_20)
+    strix_target_warnings(strix-weight-load-queue-tests)
+    add_test(NAME strix-weight-load-queue-tests COMMAND strix-weight-load-queue-tests)
+    set_tests_properties(strix-weight-load-queue-tests PROPERTIES LABELS "cpu" TIMEOUT 120)
     # Checkpoint publication and reads under the process-wide byte budget (the test sets its own small cap).
     add_executable(strix-governed-checkpoint-io-tests tests/governed_checkpoint_io_tests.cpp)
     target_include_directories(strix-governed-checkpoint-io-tests PRIVATE src)
@@ -1083,6 +1094,12 @@ if(BUILD_TESTING)
     target_link_libraries(strix-prefix-state-cache-tests PRIVATE strix_core strix_serve)
     strix_target_warnings(strix-prefix-state-cache-tests)
     add_test(NAME strix-prefix-state-cache-tests COMMAND strix-prefix-state-cache-tests)
+    # Prepared lookups (prepare_lookup + find_longest(ticket)) against recorded one-step lookups.
+    add_executable(strix-prefix-lookup-ticket-tests tests/prefix_lookup_ticket_tests.cpp)
+    target_link_libraries(strix-prefix-lookup-ticket-tests PRIVATE strix_core strix_serve)
+    strix_target_warnings(strix-prefix-lookup-ticket-tests)
+    add_test(NAME strix-prefix-lookup-ticket-tests COMMAND strix-prefix-lookup-ticket-tests)
+    set_tests_properties(strix-prefix-lookup-ticket-tests PROPERTIES LABELS "cpu" TIMEOUT 120)
     add_test(NAME strix-prefill-option-cache-write COMMAND strix-prefix-state-cache-tests
         --write-option-checkpoint "${CMAKE_CURRENT_BINARY_DIR}/prefill-option-cache")
     add_test(NAME strix-prefill-option-cache-read COMMAND strix-prefix-state-cache-tests
@@ -2369,6 +2386,20 @@ if(STRIX_ENABLE_HIP_RUNTIME)
             -Wsign-conversion -Wshadow -Werror -Wrange-loop-construct -ffp-contract=off -fno-fast-math)
         add_test(NAME strix-moe-mul1-pair-decode-tests COMMAND strix-moe-mul1-pair-decode-tests)
         set_tests_properties(strix-moe-mul1-pair-decode-tests PROPERTIES LABELS "cpu;moe;exactness")
+        # Shared trellis codec (src/core/trellis_codec.hpp): CPU reference/geometry gate and the device gate/bench.
+        add_executable(strix-trellis-codec-tests tests/trellis_codec_tests.hip)
+        target_include_directories(strix-trellis-codec-tests PRIVATE src)
+        set_target_properties(strix-trellis-codec-tests PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON)
+        target_compile_options(strix-trellis-codec-tests PRIVATE
+            -Wsign-conversion -Wshadow -Werror -Wrange-loop-construct -ffp-contract=off -fno-fast-math)
+        add_test(NAME strix-trellis-codec-tests COMMAND strix-trellis-codec-tests)
+        set_tests_properties(strix-trellis-codec-tests PROPERTIES LABELS "cpu;core;exactness")
+        add_executable(strix-hip-trellis-codec-tests tests/hip_trellis_codec_tests.hip)
+        target_include_directories(strix-hip-trellis-codec-tests PRIVATE src)
+        set_target_properties(strix-hip-trellis-codec-tests PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON)
+        target_compile_options(strix-hip-trellis-codec-tests PRIVATE -O3 -mno-wavefrontsize64 -ffp-contract=off -fno-fast-math)
+        add_test(NAME strix-hip-trellis-codec-tests COMMAND strix-hip-trellis-codec-tests)
+        set_tests_properties(strix-hip-trellis-codec-tests PROPERTIES LABELS "gpu;core;exactness")
         # Some HIP SDKs reject RDNA wave64 at preprocessing time. Test that
         # fallback only when the installed SDK supports building it.
         include(CMakePushCheckState)
@@ -2852,6 +2883,9 @@ int main() { return 0; }"
         add_test(NAME strix-hip-hc-recompute-norm-tests COMMAND strix-hip-hc-wide-rows-tests --recompute-norm)
         set_tests_properties(strix-hip-hc-recompute-norm-tests PROPERTIES
             ENVIRONMENT "STRIX_QPF2K_HC_CHECK=0;STRIX_QPF2K_HC_UPCOPY=0;STRIX_HC_WIDE2_OUTPUT_ROWS=32")
+        add_test(NAME strix-hip-hc-recompute-mirror-tests COMMAND strix-hip-hc-wide-rows-tests --recompute-norm)
+        set_tests_properties(strix-hip-hc-recompute-mirror-tests PROPERTIES
+            ENVIRONMENT "STRIX_QPF2K_HC_CHECK=0;STRIX_QPF2K_HC_UPCOPY=0;STRIX_HC_WIDE2_OUTPUT_ROWS=32;STRIX_HC_RECOMPUTE_STREAM_STRIDE=20480")
         add_test(NAME strix-hip-hc-out16-tests COMMAND strix-hip-hc-wide-rows-tests)
         set_tests_properties(strix-hip-hc-out16-tests PROPERTIES ENVIRONMENT "STRIX_PREFILL_EXACT_FP16=0;STRIX_PREFILL_HC_OUTPUT_WMMA=1;STRIX_HCW_OUTPUT=1;STRIX_HC_OUT16_FIXTURES_ONLY=1;STRIX_QPF2K_HC=1;STRIX_QPF2K_HC_LOWBAND=3")
         add_executable(strix-hip-parallel-hyper-projection-tests tests/hip_parallel_hyper_projection_tests.hip)
@@ -3067,6 +3101,9 @@ int main() { return 0; }"
             -mno-wavefrontsize64 -fno-fast-math -ffp-contract=off -fdenormal-fp-math=ieee)
         strix_target_warnings(strix-hip-q8-rows-projection-tests)
         add_test(NAME strix-hip-q8-rows-projection-tests COMMAND strix-hip-q8-rows-projection-tests)
+        # The same byte gate with the stepped LDS windows forced for every window they can hold.
+        add_test(NAME strix-hip-q8-rows-projection-stepped-tests COMMAND strix-hip-q8-rows-projection-tests)
+        set_tests_properties(strix-hip-q8-rows-projection-stepped-tests PROPERTIES ENVIRONMENT "STRIX_Q8_ROWS_STEPPED=1")
 
         # External fixtures pin compressed bits and identify the materialized
         # reference separately. Never register a GPU invocation with CTest.
@@ -3625,8 +3662,10 @@ endif()
 if(STRIX_ENABLE_HIP_RUNTIME)
     # Two-rank distributed runtime: transports and the device-buffer communicator.
     add_library(strix_dist STATIC src/dist_communicator.cpp src/dist_gpu_direct.cpp src/dist_gpu_direct_setup.cpp
-        src/dist_gpu_direct_copy.hip src/dist_host_copy.hip src/dist_staged_ready.hip src/linux_gpu_queue.cpp)
+        src/dist_gpu_direct_copy.hip src/dist_host_copy.hip src/dist_staged_ready.hip src/linux_gpu_queue.cpp
+        src/xport/device_crc32c.hip)
     target_include_directories(strix_dist PUBLIC include)
+    target_include_directories(strix_dist PRIVATE src)
     target_include_directories(strix_dist SYSTEM PUBLIC "${STRIX_HIP_INCLUDE_DIR}")
     target_compile_features(strix_dist PUBLIC cxx_std_20)
     target_compile_definitions(strix_dist PUBLIC $<$<COMPILE_LANGUAGE:CXX>:__HIP_PLATFORM_AMD__=1>)
@@ -5459,7 +5498,7 @@ if(BUILD_TESTING)
     strix_target_warnings(strix-pair-regime-tests)
     add_test(NAME strix-pair-regime-tests COMMAND strix-pair-regime-tests)
     add_executable(strix-qwen-prefill-pair-tests tests/qwen_prefill_pair_tests.cpp)
-    target_include_directories(strix-qwen-prefill-pair-tests PRIVATE include)
+    target_include_directories(strix-qwen-prefill-pair-tests PRIVATE include src)
     target_compile_features(strix-qwen-prefill-pair-tests PRIVATE cxx_std_20)
     target_link_libraries(strix-qwen-prefill-pair-tests PRIVATE Threads::Threads strix_serve_json)
     if(MSVC)
@@ -5469,7 +5508,7 @@ if(BUILD_TESTING)
     endif()
     add_test(NAME qwen-prefill-pair COMMAND strix-qwen-prefill-pair-tests)
     add_executable(strix-qwen-prefill-staging-crc-tests tests/qwen_prefill_staging_crc_tests.cpp)
-    target_include_directories(strix-qwen-prefill-staging-crc-tests PRIVATE tests/qwen_prefill_staging_shim include)
+    target_include_directories(strix-qwen-prefill-staging-crc-tests PRIVATE tests/qwen_prefill_staging_shim include src)
     target_compile_features(strix-qwen-prefill-staging-crc-tests PRIVATE cxx_std_20)
     target_link_libraries(strix-qwen-prefill-staging-crc-tests PRIVATE Threads::Threads)
     if(MSVC)

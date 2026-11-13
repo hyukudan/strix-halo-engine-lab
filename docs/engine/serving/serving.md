@@ -79,12 +79,55 @@ when it stops.
 
 ## Default prompt prefill
 
-On the qualified native Qwen checkpoint and target, HTTP serving now resolves a known-prefix
-T8192 owner before requests arrive. Keep the required MTP calibration prompt, golden, sidecar,
-pins and window budgets; tiled-prefill organization flags and budgets can be omitted. Unlike
-single-request auto prefill, the server cannot choose T from an incoming prompt at startup.
-It preserves the resolved decode/prefill numerical profiles and explicit context capacity;
-this does not enable automatic FP16 arithmetic. Request prompts must still fit that capacity.
+On the qualified native Qwen checkpoint and target, HTTP serving resolves its known-prefix
+owner before requests arrive. Keep the required MTP calibration prompt, golden, sidecar,
+pins and window budgets; tiled-prefill organization flags and budgets can be omitted.
+
+The server and the single-request command take the route from one rule (`resolve_prompt_route`
+in `apps/qwen_effective_config.hpp`). The single-request command passes its prompt; the server
+cannot see a prompt at startup, so it passes the largest request its context admits, plus its
+own constraints. The server therefore resolves:
+
+- **the primary tile**: T8192, or T16384 when the context admits a request of at least 32,768
+  tokens (the single-request threshold; `STRIX_QPF2K_T16K=1` asks for it from 16,384, any other
+  value disables it) and the T16384 owner fits in memory beside every requested slot
+  (`--http-batch`: each slot's bridge cost plus the retained decode stack of every slot after the
+  first, the equation the runtime slot capacity uses) with the file-backed table still resident. Otherwise it falls back to T8192
+  and then to smaller tiles. `STRIX_QPF2K_T16K=1` keeps the plain memory bound;
+- **the prefill arithmetic**: the automatic FP16 prefill profile of the single-request route
+  whenever the decode profile is the dense-A8 profile and no prefill profile is explicit
+  (`STRIX_PREFILL_F16=0` declines it). A server whose MTP owner is an explicit sidecar keeps this
+  arithmetic with `hc_output_wmma`, `index_proj_wmma`, `index_score_wmma` and `gdn_fp16_chunk` off, the
+  exclusion verified bundles already take (`STRIX_SERVE_FP16_MTP=0` declines the arithmetic instead);
+- **the decode profile**: a server that sets no `--numerical-profile` and no low-level
+  organization flag takes the single-request decode profile and organization. An explicit
+  profile or organization is preserved as before.
+
+The `Qwen serve-prefill:` line printed at load names the tile and the arithmetic, and gives the
+reason whenever T16384 or the automatic arithmetic is declined. `STRIX_SERVE_T16K=0` keeps the
+T8192 owner. `STRIX_SERVE_ROUTE=0` restores the earlier server rule (T8192, resolved arithmetic
+unchanged). Explicit context capacity is preserved; request prompts must still fit it.
+
+An admitted server owner also takes the prefill organization of the single-request route: one
+policy value, applied by both after route admission. It covers row-loop steps as registered
+batches and one strided tap copy (`STRIX_PREFILL_PIPE` bits 16 and 2), attention stage batching
+(`STRIX_QSA_NORM_GROUP`, `STRIX_QSA_ATTEND_BATCH`, `STRIX_QSA_INDEX_ROWS`, `STRIX_QSA_SCORE_PARK`,
+`STRIX_QPF2K_SCORE_ROWS`), table batching (`STRIX_PREFILL_PLE_BATCH`) and the expert header and
+merge policies (`STRIX_QPF2K_MOE_HDR`, `STRIX_QPF2K_MOE_XOR64`, `STRIX_QPF2K_MOE_MC`,
+`STRIX_QPF2K_SHARED_PRE`). These change launches, copies and scheduling, not arithmetic. The
+server does not take the reclamation or decoding items of the single-request route. The load
+line reports how many items were applied and the row-pipeline mask. `STRIX_SERVE_PREFILL_ORG=0`
+keeps the startup items only; each item keeps its own `0` switch, and `STRIX_QPF2K_DEFAULTS=0`
+disables all of them.
+
+Measured on one Strix Halo node (same binary, `STRIX_SERVE_ROUTE=0` as the earlier rule, context
+33,280, four slots, explicit-sidecar MTP, interleaved runs): time to first token through the
+resident server 6.74-7.35 s versus 9.72-10.10 s for an 8,192-token prompt and 27.4-29.6 s versus
+39.5-41.2 s for a 32,768-token prompt. The served token IDs equal the single-request command's
+for both prompts; with the earlier rule the 32,768-token prompt did not. On that node the
+T16384 owner is declined (it would cost one of four slots), and the load line says so. Decode
+cost per MTP cycle is unchanged; short prompts can produce a different greedy continuation than
+the earlier server arithmetic did, because the prompt arithmetic now is the single-request one.
 
 Automatic candidates that would create an extra `STRIX_PROMPT_BATCH_ROWS` owner decline
 with an actionable notice before allocation in both startup and inspection. Unset that
@@ -610,6 +653,23 @@ profile reports these rows as `ranked_rows`.
 Both settings are read through the shared environment registry: unset or empty means the default, a
 `STRIX_CONSTRAINT_RANKED` value that is not a whole decimal number in range stops the server at startup
 with an error naming the variable, and the resolved values are recorded with the other switches of the run.
+
+Schema programs are shared between requests (`ConstraintProgramCache`, default on;
+`STRIX_CONSTRAINT_PROGRAM_CACHE=0` compiles per request as before). A compiled program is immutable and
+does not depend on the request, so requests with the same schema and limits use one program: the schema is
+compiled once, and concurrent requests for a schema that is being compiled wait for that one compilation.
+The key is the semantics version, every limit and the schema text (`Json::dump()`), compared in full; the
+cache holds at most 16 entries and 4 MiB of keys, including pending compilations. Ready entries leave
+least recently used first; when pending entries fill either bound, new keys compile without retention.
+A failed compilation is not kept. These bounds cover cache retention, not programs still held by requests.
+Each shared program carries a mask memo (`STRIX_CONSTRAINT_MASK_MEMO_BYTES`, 8 MiB by default, `0` off)
+keyed by the exact serialized cursor state and the identity of the token trie, so a request that reaches a
+state another request with the same tokenizer already walked takes the stored mask instead of walking the
+trie again. The cursor, the output budget and the EOS overlay stay per request, and the masks are the ones
+a per-request compilation produces (`strix-serve-json-constraint-tests`; `--bench-program-cache` measures
+compile, first mask and first string-state mask for repeated identical-schema requests). Both cache
+settings resolve once on first use and enter the environment registry then; startup inspection before
+that point does not report them.
 
 Masks one step ahead (default on; `STRIX_CONSTRAINT_MASK_AHEAD=0` turns it off) covers the requests that
 still walk one mask per answer row: scores (`logprobs`), logit transforms, and `--http-selection-fast

@@ -109,7 +109,7 @@ const std::map<std::string, std::string> kFormer = {
     {"STRIX_MM_PF_MSA_REWORK", "0"},       {"STRIX_MMX_PREFILL_PIPE", "0"},    {"STRIX_MM_PF_KV_TILE", "off"},
     {"STRIX_MM_PF_ASYNC_START", "0"}, {"STRIX_MM_PF_LATE_SRC_FENCE", "0"},
     {"STRIX_MM_PF_TX_UNCACHED", "0"},      {"STRIX_DIST_CRC_PARALLEL", "0"},   {"STRIX_DIST_HOST_CRC_OVERLAP", "0"},
-    {"STRIX_DIST_HOST_CHUNK_BYTES", "0"},  {"STRIX_MM_PF_IDX_TILE", "0"},
+    {"STRIX_DIST_HOST_CHUNK_BYTES", "0"},  {"STRIX_MM_PFX_JOINED", "0"},       {"STRIX_MM_PF_IDX_TILE", "0"},
     {"STRIX_MM_PF_IDX_ROWS", "32"},        {"STRIX_MMX_MOE_GU_INTERLEAVE", "0"}, {"STRIX_MMX_MOE_SINGLE", "0"},
     {"STRIX_MMX_MOE_DOWN_SPLIT", "0"},    {"STRIX_MM_ATTEND_DIET", "0"},
     {"STRIX_MM_ATTEND4_DECODE", "0"},      {"STRIX_MM_SELECT_ONCE", "0"},

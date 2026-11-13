@@ -104,6 +104,20 @@ struct PrefixCacheCheckpoint {
 // digests[k-1] names the first k blocks; at most max_blocks digests.
 [[nodiscard]] std::vector<ModelContentIdentity> prefix_cache_block_digests(const ModelContentIdentity& identity,
     std::span<const std::uint32_t> tokens, std::uint32_t block_rows, std::uint64_t max_blocks);
+// The part of a longest-prefix lookup that depends only on the prompt (PrefixStateCache::prepare_lookup).
+// It holds no cache state and no lease: a hit is decided, verified against the stored tokens and accounted
+// by find_longest(ticket). Copies share the token storage.
+struct PrefixLookupTicket {
+    enum Disk : std::uint8_t { disk_unknown = 0, disk_absent = 1, disk_legacy = 2, disk_certified = 3 };
+    ModelContentIdentity identity;
+    std::uint32_t block_rows = 0;
+    std::uint64_t lookup_tokens = 0;                         // min(limit, prompt tokens)
+    std::shared_ptr<const std::vector<std::uint32_t>> owned; // the prompt, when the ticket outlives the caller's span
+    std::span<const std::uint32_t> tokens;                   // the prompt the digests were computed from
+    std::vector<ModelContentIdentity> digests;               // digests[k-1] names the first k blocks
+    std::vector<std::uint8_t> disk;                          // Disk class per block; empty: not probed
+    std::uint64_t disk_epoch = 0;
+};
 // Cheap 64-bit payload checksum used by the disk tier (not a security digest).
 [[nodiscard]] std::uint64_t prefix_cache_checksum(std::span<const std::byte> bytes) noexcept;
 
@@ -354,6 +368,18 @@ public:
     [[nodiscard]] std::shared_ptr<const PrefixCacheCheckpoint> find_longest(const ModelContentIdentity& identity,
         std::span<const std::uint32_t> tokens, std::uint32_t block_rows, std::uint64_t limit, bool promote = true, std::string_view conversation = {},
         const std::function<bool(const PrefixCacheCheckpoint&)>& eligible = {});
+    // The same lookup in two steps. prepare_lookup() does the work that depends only on the prompt: it copies
+    // the tokens, hashes every block and, with a disk tier, reads which blocks have a checkpoint file and of
+    // which class. It takes no cache lock and changes nothing, so it can run on any thread before the request
+    // is admitted. find_longest(ticket) then decides under the cache state of that moment and returns what
+    // the one-step lookup returns: it probes the host tier of every block in one lock acquisition, verifies
+    // the stored tokens exactly, and loads a disk checkpoint (payload read, budget credits, certificate
+    // check) itself. Prepared disk metadata is used only while this cache has not published or removed a
+    // checkpoint file since it was read; otherwise the lookup probes the files as the one-step form does.
+    [[nodiscard]] PrefixLookupTicket prepare_lookup(const ModelContentIdentity& identity, std::span<const std::uint32_t> tokens,
+        std::uint32_t block_rows, std::uint64_t limit) const;
+    [[nodiscard]] std::shared_ptr<const PrefixCacheCheckpoint> find_longest(const PrefixLookupTicket& ticket, bool promote = true,
+        std::string_view conversation = {}, const std::function<bool(const PrefixCacheCheckpoint&)>& eligible = {});
     [[nodiscard]] bool contains(const ModelContentIdentity& digest);
     // A retained segment with this digest (host tier only), or null.
     [[nodiscard]] std::shared_ptr<const PrefixCacheSegment> find_segment(const ModelContentIdentity& digest);
@@ -510,6 +536,11 @@ private:
     PrefixCacheAllocator allocate_;
     std::shared_ptr<PrefixPayloadPool> payload_pool_;
     std::uint64_t metadata_allowance_=0;
+    // A ticket over caller-owned tokens; probe_disk=false leaves the disk tier to the lookup.
+    [[nodiscard]] PrefixLookupTicket prepare_ticket(const ModelContentIdentity& identity, std::span<const std::uint32_t> tokens,
+        std::uint32_t block_rows, std::uint64_t limit, bool probe_disk) const;
+    // Changes whenever this cache publishes or removes checkpoint files (start and end of the change).
+    std::atomic<std::uint64_t> disk_epoch_{0};
     mutable std::mutex mutex_;
     std::map<ModelContentIdentity, Entry, DigestLess> entries_;
     std::list<ModelContentIdentity> lru_;  // front: least recently used

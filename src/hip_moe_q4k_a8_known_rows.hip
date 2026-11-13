@@ -1562,41 +1562,11 @@ template<unsigned Tune,unsigned Core> struct F16TileX {
 };
 template<bool Wide> struct f16_qv { using type=uint4; };
 template<> struct f16_qv<false> { using type=uint2; };
-__device__ __forceinline__ uint2 f16_load8(const void* p) {
-    typedef unsigned f16_u32x2 __attribute__((ext_vector_type(2)));
-    const f16_u32x2 v=*reinterpret_cast<const __attribute__((address_space(1))) f16_u32x2*>(reinterpret_cast<std::uintptr_t>(p));
-    return uint2{v.x,v.y};
-}
-// The K loop shared by both projections: two register stages (or one with bit 0), LDS-only barriers.
+__device__ __forceinline__ uint2 f16_load8(const void* p){return strix::moe_core::GroupedF16Issue::load8<uint2>(p);}
+// The K loop shared by both projections (moe_core/grouped_f16.hpp): two register stages (or one with bit 0).
 template<unsigned Tune,class Regs,class Fetch,class Stage,class Step>
 __device__ __forceinline__ void f16_pipeline(unsigned steps,const Fetch& fetch,const Stage& stage,const Step& step_fn) {
-    if constexpr(Tune&1U) {
-        Regs r;
-        fetch(0U,r);
-        for(unsigned step=0;step<steps;++step) {
-            if(step)f16_barrier();
-            stage(step,r,0U);
-            f16_barrier();
-            if(step+1U<steps)fetch(step+1U,r);
-            step_fn(0U);
-        }
-    } else {
-        Regs r0,r1;
-        fetch(0U,r0);fetch(1U,r1); // steps is even
-#pragma unroll 1
-        for(unsigned step=0;step<steps;step+=2U) {
-            if(step)f16_barrier();
-            stage(step,r0,0U);
-            f16_barrier();
-            if(step+2U<steps)fetch(step+2U,r0);
-            step_fn(0U);
-            f16_barrier();
-            stage(step+1U,r1,0U);
-            f16_barrier();
-            if(step+3U<steps)fetch(step+3U,r1);
-            step_fn(0U);
-        }
-    }
+    strix::moe_core::GroupedF16Issue::pipeline<(Tune&1U)!=0U,Regs>(steps,fetch,stage,step_fn);
 }
 template<bool Q5K,unsigned Tune,unsigned Core=0U>
 __global__ __launch_bounds__((F16TileX<Tune,Core>::Threads),prefill_core2_min_waves(Tune,Core)) void project_prefill_f16x(const unsigned char* gate,const unsigned char* up,PrefillRows view,
@@ -1759,8 +1729,8 @@ bool overlap(DeviceBytes a,DeviceBytes b){return a.address<b.address+b.bytes&&b.
 template<bool Q51,unsigned Tune> void prefill_route_i8_resources() {
     static const bool admitted=[]{
         constexpr unsigned Threads=F16Tile<Tune>::Threads;
-        const auto base=down_prefill_f16x_da16_certificate_bf16<Q51,Tune>;
-        const auto compact=down_prefill_f16x_da16_certificate_i8<Q51,Tune>;
+        const auto base=STRIX_DA16_ISSUE_KERNEL(down_prefill_f16x_da16_certificate_bf16,Q51,Tune);
+        const auto compact=STRIX_DA16_ISSUE_KERNEL(down_prefill_f16x_da16_certificate_i8,Q51,Tune);
         hipFuncAttributes a{},b{};int old_blocks=0,new_blocks=0;
         hip_check(hipFuncGetAttributes(&a,reinterpret_cast<const void*>(base)),"route BF16 resource attributes");
         hip_check(hipFuncGetAttributes(&b,reinterpret_cast<const void*>(compact)),"route I8 resource attributes");
@@ -2463,19 +2433,19 @@ void enqueue_prefill(const Request& request,const PrefillRows& rows,unsigned cou
                             return;
                         }
                         if(rows.route_i8) {
-                            if(down_type==7U)hipLaunchKernelGGL(HIP_KERNEL_NAME(down_prefill_f16x_da16_certificate_i8<true,Tune>),down_grid,dim3(Threads),0,
+                            if(down_type==7U)hipLaunchKernelGGL(STRIX_DA16_ISSUE_KERNEL(down_prefill_f16x_da16_certificate_i8,true,Tune),down_grid,dim3(Threads),0,
                                 stream,down_weights,rows,request.shape.hidden,request.shape.rows,image,request.shape.top_k);
-                            else hipLaunchKernelGGL(HIP_KERNEL_NAME(down_prefill_f16x_da16_certificate_i8<false,Tune>),down_grid,dim3(Threads),0,
+                            else hipLaunchKernelGGL(STRIX_DA16_ISSUE_KERNEL(down_prefill_f16x_da16_certificate_i8,false,Tune),down_grid,dim3(Threads),0,
                                 stream,down_weights,rows,request.shape.hidden,request.shape.rows,image,request.shape.top_k);
                         } else if(rows.route_bf16) {
-                            if(down_type==7U)hipLaunchKernelGGL(HIP_KERNEL_NAME(down_prefill_f16x_da16_certificate_bf16<true,Tune>),down_grid,dim3(Threads),0,
+                            if(down_type==7U)hipLaunchKernelGGL(STRIX_DA16_ISSUE_KERNEL(down_prefill_f16x_da16_certificate_bf16,true,Tune),down_grid,dim3(Threads),0,
                                 stream,down_weights,rows,request.shape.hidden,request.shape.rows,image);
-                            else hipLaunchKernelGGL(HIP_KERNEL_NAME(down_prefill_f16x_da16_certificate_bf16<false,Tune>),down_grid,dim3(Threads),0,
+                            else hipLaunchKernelGGL(STRIX_DA16_ISSUE_KERNEL(down_prefill_f16x_da16_certificate_bf16,false,Tune),down_grid,dim3(Threads),0,
                                 stream,down_weights,rows,request.shape.hidden,request.shape.rows,image);
                         } else {
-                            if(down_type==7U)hipLaunchKernelGGL(HIP_KERNEL_NAME(down_prefill_f16x_da16_certificate<true,Tune>),down_grid,dim3(Threads),0,
+                            if(down_type==7U)hipLaunchKernelGGL(STRIX_DA16_ISSUE_KERNEL(down_prefill_f16x_da16_certificate,true,Tune),down_grid,dim3(Threads),0,
                                 stream,down_weights,rows,request.shape.hidden,request.shape.rows,image);
-                            else hipLaunchKernelGGL(HIP_KERNEL_NAME(down_prefill_f16x_da16_certificate<false,Tune>),down_grid,dim3(Threads),0,
+                            else hipLaunchKernelGGL(STRIX_DA16_ISSUE_KERNEL(down_prefill_f16x_da16_certificate,false,Tune),down_grid,dim3(Threads),0,
                                 stream,down_weights,rows,request.shape.hidden,request.shape.rows,image);
                         }
                         hip_check(hipGetLastError(),"FP16 prefill WMMA down (DA16 certificate)");
@@ -2488,9 +2458,9 @@ void enqueue_prefill(const Request& request,const PrefillRows& rows,unsigned cou
                         prefill_da16_mark(2U,stream);
                         return;
                     }
-                    if(down_type==7U)hipLaunchKernelGGL(HIP_KERNEL_NAME(down_prefill_f16x_da16<true,Tune>),down_grid,dim3(Threads),0,
+                    if(down_type==7U)hipLaunchKernelGGL(STRIX_DA16_ISSUE_KERNEL(down_prefill_f16x_da16,true,Tune),down_grid,dim3(Threads),0,
                         stream,down_weights,rows,request.shape.hidden,request.shape.rows,image);
-                    else hipLaunchKernelGGL(HIP_KERNEL_NAME(down_prefill_f16x_da16<false,Tune>),down_grid,dim3(Threads),0,
+                    else hipLaunchKernelGGL(STRIX_DA16_ISSUE_KERNEL(down_prefill_f16x_da16,false,Tune),down_grid,dim3(Threads),0,
                         stream,down_weights,rows,request.shape.hidden,request.shape.rows,image);
                     hip_check(hipGetLastError(),"FP16 prefill WMMA down (DA16)");
                     prefill_da16_mark(2U,stream);
@@ -2626,6 +2596,7 @@ void set_prefill_core2(int core){prefill_core2_override()=core;}
 void set_prefill_route(int bits){prefill_route_override()=bits;}
 void set_prefill_route_prune(moe_core::RoutePrune prune){prefill_route_prune_slot()=prune;}
 void set_prefill_da16(int on){prefill_da16_override()=on;}
+void set_prefill_da16_issue(int on){prefill_da16_issue_override()=on;}
 void set_prefill_tile64(int on){prefill_tile64_override()=on;}
 void set_prefill_test_events(hipEvent_t* events){prefill_test_events()=events;}
 void set_prefill_hdr(int on){prefill_hdr_override()=on;}

@@ -130,6 +130,8 @@ void set_prefill_core2(int core);
 void set_prefill_route(int bits);
 // qpf2k/moe-mi test hook: overrides STRIX_QPF2K_MOE_DA16 (1 = FP16 down operand image written by the last gate/up tile; -1 = environment).
 void set_prefill_da16(int on);
+// Test hook: overrides STRIX_QPF2K_MOE_DA16_ISSUE (1 = uniform DA16 activation issue, 0 = masked issue; -1 = environment, automatic when unset).
+void set_prefill_da16_issue(int on);
 // MoE header reuse test hook: overrides STRIX_QPF2K_MOE_HDR (1 = gate/up header reuse kernel; -1 = environment).
 void set_prefill_hdr(int on);
 // Test hooks: STRIX_QPF2K_MOE_TIERS / STRIX_QPF2K_MOE_DOWN_LDS_EPI, default OFF;

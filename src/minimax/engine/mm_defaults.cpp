@@ -133,6 +133,8 @@ constexpr Item kItems[] = {
     {"dist_crc_parallel", "STRIX_DIST_CRC_PARALLEL", "1", "0", "Host transport measurement: ABA x3 TTFT 1K -12.8 %, decode -1 %, bits unchanged"},
     {"dist_host_crc_overlap", "STRIX_DIST_HOST_CRC_OVERLAP", "1", "0", "Host transport measurement: ABA x3 TTFT 1K -12.8 %, decode -1 %, bits unchanged"},
     {"dist_host_chunk", "STRIX_DIST_HOST_CHUNK_BYTES", "1048576", "0", "Host transport measurement: ABA x3 TTFT 1K -12.8 %, decode -1 %, bits unchanged"},
+    {"pfx_joined", "STRIX_MM_PFX_JOINED", "1", "0",
+     "Prefill exchange wire form: identity and CRC list ride with the last chunk (two rendezvous fewer per message); payload bytes unchanged"},
 };
 
 // Route switches whose code default is the production route; printed as set or "default".

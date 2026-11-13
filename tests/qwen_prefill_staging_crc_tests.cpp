@@ -3,9 +3,39 @@ namespace strix { inline hipStream_t hip_execution_stream() { return nullptr; } 
 #include "../src/hip_qwen_prefill_pair_staging.hpp"
 #include <iostream>
 
+// Allocation probe only: these tests never run a device CRC kernel.
+namespace strix::xport {
+unsigned crc_allocations = 0;
+unsigned crc_executions = 0;
+DeviceCrc32c::~DeviceCrc32c() { delete[] tables_; }
+void DeviceCrc32c::allocate(std::size_t) { tables_ = new std::uint32_t[1]; ++crc_allocations; }
+void DeviceCrc32c::enqueue(hipStream_t, const void*, std::size_t, std::size_t) {
+    ++crc_executions;
+}
+std::uint32_t DeviceCrc32c::value(std::size_t, std::size_t, std::span<const std::byte>) const {
+    ++crc_executions; return 0;
+}
+}
+
 namespace {
 void require(bool condition) {
     if (!condition) throw std::runtime_error("PP seam publication assertion failed");
+}
+void crc_allocation_checks() {
+    using namespace strix::qwen_pp;
+    const auto before = strix::xport::crc_allocations;
+    for (const auto capacity : {std::size_t{65536}, seam_piece_bytes}) {
+        auto staging = make_hip_pipe_staging(capacity);
+        staging->route_device({});
+        // Host-only and CRC OFF adapters install a nonempty but always-false rule.
+        staging->route_device([](std::size_t) { return false; });
+        require(strix::xport::crc_allocations == before);
+        staging->route_device([](std::size_t bytes) { return bytes > 65536U; });
+        const auto expected = before + (capacity > 65536U ? 1U : 0U);
+        require(strix::xport::crc_allocations == expected);
+        staging->route_device([](std::size_t bytes) { return bytes > 65536U; });
+        require(strix::xport::crc_allocations == expected);
+    }
 }
 std::size_t stress(bool device_only) {
     using namespace strix::qwen_pp;
@@ -93,6 +123,7 @@ void strided_rows() {
 }
 int main() {
     try {
+        crc_allocation_checks();
         const auto before = stress(true);
         const auto after = stress(false);
         require(before > 0U && after == 0U);
@@ -107,6 +138,7 @@ int main() {
             require(std::all_of(host.begin(), host.end(), [](auto byte) { return byte == std::byte{0x37}; }));
         }
         strided_rows();
+        require(strix::xport::crc_executions == 0U);
         std::cout << "PASS: 24 seeded sizes x 2 slots; shuffled copy/fence order, source reuse and partial tails; device-only mismatches="
             << before << ", system-release mismatches=" << after << " (host model, not device qualification)\n";
         return 0;

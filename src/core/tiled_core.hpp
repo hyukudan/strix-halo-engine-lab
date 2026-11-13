@@ -7,8 +7,7 @@
 //   Adapter:  NoAdapter = library operands; otherwise the model plug-in (row gather, tile
 //             loop, post-H128 epilogue), see NoAdapter below.
 #include "wmma_tiled.hpp"
-#include "trellis_device.hpp"
-#include "packed_decoder.hpp"
+#include "trellis_codec.hpp"
 #include "hadamard.hpp"
 #include <type_traits>
 #include "integer_operand.hpp"
@@ -28,43 +27,32 @@ using U4 = uint32_t __attribute__((ext_vector_type(4)));
 using U2 = uint32_t __attribute__((ext_vector_type(2)));
 
 // The three ring words of one lane, loaded early and combined at decode time,
-// so the loads stay in flight across a stage of WMMA. Same bit addressing as
-// packed_decode::SaddrLane / optimized::AlignedLane<Bits,true>.
-template<int Bits> struct RawLane {
-    uint32_t a = 0, b = 0, c = 0;
+// so the loads stay in flight across a stage of WMMA: the shared codec's Lane
+// reader (trellis_codec.hpp LaneWords / TileStates) behind the names used here.
+template<int Bits> struct RawLane : trellis::LaneWords<Bits> {
+    __device__ __forceinline__ RawLane() : trellis::LaneWords<Bits>(0, 0, 0) {}
     __device__ __forceinline__ void load(const uint32_t* data) {
-        constexpr int count = Bits * 8;
-        const int start = ((int(threadIdx.x & 31U)) * 8 + 1) * Bits + 256 * Bits - 16;
-        const int index = start / 32 - count;
-        a = data[index < 0 ? index + count : index];
-        b = data[index + 1 >= count ? index + 1 - count : index + 1];
-        c = data[index + 2 >= count ? index + 2 - count : index + 2];
+        static_cast<trellis::LaneWords<Bits>&>(*this) =
+            trellis::LaneWords<Bits>::issue_at(data, trellis::LaneGeom<Bits>(threadIdx.x & 31U));
     }
 };
-template<int Bits> struct Stream {
-    uint32_t high, low, tail;
-    __device__ __forceinline__ explicit Stream(const RawLane<Bits>& r) {
-        const int shift = ((((int(threadIdx.x & 31U)) * 8 + 1) * Bits + 256 * Bits - 16) & 31);
-        high = (r.a << shift) | (r.b >> (32 - shift));
-        low = (r.b << shift) | (r.c >> (32 - shift));
-        tail = r.c << shift;
-    }
-    template<int J> __device__ __forceinline__ uint32_t state() const {
-        constexpr int offset = J * Bits;
-        if constexpr (offset <= 16) return (high >> (16 - offset)) & 65535u;
-        else if constexpr (offset < 32) return ((high << (offset - 16)) | (low >> (48 - offset))) & 65535u;
-        else if constexpr (offset <= 48) return (low >> (48 - offset)) & 65535u;
-        else return ((low << (offset - 48)) | (tail >> (80 - offset))) & 65535u;
-    }
+template<int Bits> struct Stream : trellis::TileStates<Bits> {
+    __device__ __forceinline__ explicit Stream(const RawLane<Bits>& r)
+        : trellis::TileStates<Bits>(trellis::align_words<Bits>(r, trellis::LaneGeom<Bits>(threadIdx.x & 31U).align)) {}
 };
 // Two consecutive K values of one column; low half = first state.
 template<int CB> __device__ __forceinline__ uint32_t decode_pair(uint32_t first, uint32_t second) {
     if constexpr (CB == 2) {
-        return __builtin_bit_cast(uint32_t, packed_decode::mul1_half2(first, second));
+        return __builtin_bit_cast(uint32_t, trellis::Mul1::pair(first, second));
     } else {
-        _Float16 x = _Float16(codebook_value(first, CB)), y = _Float16(codebook_value(second, CB));
+        _Float16 x = _Float16(trellis::codebook_value(first, CB)), y = _Float16(trellis::codebook_value(second, CB));
         return uint32_t(__builtin_bit_cast(uint16_t, x)) | (uint32_t(__builtin_bit_cast(uint16_t, y)) << 16);
     }
+}
+// The same pair from states as the lane reader extracted them: mul1 reads only the low 16 bits, so no mask.
+template<int CB> __device__ __forceinline__ uint32_t decode_pair(trellis::State16 first, trellis::State16 second) {
+    if constexpr (CB == 2) return __builtin_bit_cast(uint32_t, trellis::mul1_pair(first, second));
+    else return decode_pair<CB>(uint32_t(first), uint32_t(second));
 }
 
 template<int BM, int BN, int WM, int WN, class Operand = PackedF16> struct Geometry {

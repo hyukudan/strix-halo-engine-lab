@@ -1,4 +1,5 @@
 #include "strix/device/hip_gate.hpp"
+#include "strix/env_flags.hpp"
 #include "glm/prefill/glm_pf_aux.hpp"
 #include "glm_deploy_owners.hpp"
 #include "glm/load/glm_rank_plan.hpp"
@@ -1217,7 +1218,7 @@ int main(int argc, char** argv) {
                 // STRIX_GLM_ABA_XBPUB=1: the same series over the decode producer publication instead (A off, B on).
                 static const bool xbpub = std::getenv("STRIX_GLM_ABA_XBPUB") != nullptr && std::string(std::getenv("STRIX_GLM_ABA_XBPUB")) == "1";
                 // STRIX_GLM_ABA_FOLD=1: the same series over the exchange row fold (A off, B on; needs STRIX_GLMX_FOLD=rows).
-                static const bool xfold = std::getenv("STRIX_GLM_ABA_FOLD") != nullptr && std::string(std::getenv("STRIX_GLM_ABA_FOLD")) == "1";
+                static const bool xfold = strix::envcfg::flag("STRIX_GLM_ABA_FOLD", false, strix::EnvFlagMatch::exact);
                 if (xbpub) {
                     ge::set_decode_producer_publish(b ? 1 : 0);
                 } else if (xfold) {

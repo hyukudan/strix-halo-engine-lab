@@ -1026,5 +1026,20 @@ void release(Scratch& s) {
         if (p) (void)hipFree(p);
     s = Scratch{};
 }
+void set_chain_policy_for_test(const ChainPolicy* policy) {
+#if STRIX_GLM_PF_IU4_LIB
+    i4_chain_test_policy.store(policy ? (policy->shared_gsave ? 1 : 0) | (policy->lend ? 2 : 0) : -1, std::memory_order_relaxed);
+#else
+    (void)policy;
+#endif
+}
+ChainRun last_chain_run() {
+#if STRIX_GLM_PF_IU4_LIB
+    const std::uint32_t v = i4_chain_last.load(std::memory_order_relaxed);
+    return {(v >> 31) != 0, static_cast<int>(v & 15U), static_cast<int>((v >> 4) & 15U), (v & 0x100U) != 0};
+#else
+    return {};
+#endif
+}
 }  // namespace iu4
 } // namespace strix::glm::pf::exact_moe

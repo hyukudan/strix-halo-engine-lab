@@ -7,6 +7,8 @@
 #include "strix/serve/json.hpp"
 #include "strix/serve/health.hpp"
 #include "strix/serve/deployment.hpp"
+#include "strix/serve/media.hpp"
+#include "strix/session/embed_rows.hpp"
 
 #include <functional>
 #include <memory>
@@ -22,12 +24,72 @@ struct ApiRouteError : std::runtime_error {
     int status;
 };
 
+// ---- media input (images today; other kinds register the same way) ----
+// One media item as the language model sees it.
+struct ApiMediaSpan {
+    session::EmbedLease lease;         // the interned rows; the request's EmbedTable holds it
+    std::vector<std::uint32_t> layout; // ids in prompt order: lease.ids() plus real special token ids
+    std::uint32_t grid_h = 0, grid_w = 0;
+    double preprocess_ms = 0.0, encode_ms = 0.0;
+    bool cache_hit = false;
+};
+// Produces the embedding rows of one media kind. The service loads one per kind it accepts; the API layer never
+// names a model family, a tower or a file format beyond what this interface states.
+//
+// Contract of a set of adapters:
+//  - Handles: an EmbedTable is keyed by handle, so every adapter of one service interns in the SAME
+//    session::EmbedInterner (one handle space per process). A request whose items come back with one handle
+//    for two digests is refused (500) instead of resolving rows of the wrong item.
+//  - Threads: one ApiService calls encode() of its adapters one at a time. An adapter shared by two services
+//    (or called by anything else) must synchronise itself.
+class ApiMediaAdapter {
+public:
+    virtual ~ApiMediaAdapter() = default;
+    // The canonical part type this adapter consumes: {"type":<kind>,"media":k} (serve::media). "image" today.
+    [[nodiscard]] virtual std::string kind() const { return "image"; }
+    // Weights digest + arithmetic id: part of /v1/models and of the capabilities hash.
+    [[nodiscard]] virtual std::string identity() const = 0;
+    // Text that tokenizes to exactly one id; that id marks where the rows of one item go.
+    [[nodiscard]] virtual std::string placeholder() const = 0;
+    // What the renderer receives for the ordinal-th item of the request (0-based, per kind); it must hold the
+    // placeholder exactly once. Default: the placeholder alone.
+    [[nodiscard]] virtual std::string part_text(std::size_t ordinal) const { static_cast<void>(ordinal); return placeholder(); }
+    // Upper bound of the virtual rows of one item.
+    [[nodiscard]] virtual std::uint32_t max_rows() const = 0;
+    // Preprocess, encode (or hit a cache) and intern one item. row_budget is what the request may still spend
+    // (min(max_rows, remaining context)). Throws media::MediaError for content the client must fix.
+    [[nodiscard]] virtual ApiMediaSpan encode(const media::MediaItem& item, std::uint32_t row_budget) = 0;
+    // The interner epoch (session::EmbedInterner::epoch). When it moves, cached state holding virtual ids of an
+    // earlier epoch must be withdrawn before another media request runs (ApiVisionConfig::on_epoch).
+    [[nodiscard]] virtual std::uint64_t epoch() const { return 0; }
+    // Capability and receipt names of the kind: <input_capability> : true, strix.<receipt_name>.
+    [[nodiscard]] virtual std::string input_capability() const { return kind() + "_input"; }
+    [[nodiscard]] virtual std::string receipt_name() const { return kind() == "image" ? "vision" : kind(); }
+};
+struct ApiVisionConfig {
+    // Limits and fetch policy of serve::media. Remote fetch is OFF unless the service sets it
+    // (media::fetch_policy_from_env()); no fetcher is built in.
+    media::Options media;
+    // Row cap of one request over all items; 0: only the context bounds it.
+    std::uint32_t max_request_rows = 0;
+    // Loaded adapters, at most one per kind. Empty: media parts keep the engine's own 400.
+    // Adapters belong to one service unless they synchronize shared encode/epoch state themselves.
+    // All kinds must share one handle namespace (interner); independent handles cannot be combined.
+    std::vector<std::shared_ptr<ApiMediaAdapter>> adapters;
+    // Called once per epoch change before the next media request is admitted; the service withdraws cached
+    // prefixes that hold virtual ids. Unset: media requests answer 503 after a wrap (text is unaffected).
+    // The callback must synchronize with the cache owner and finish withdrawal before returning;
+    // the service media mutex does not protect runtime caches.
+    std::function<void(std::uint64_t epoch)> on_epoch;
+};
 struct ApiChatPrompt {
     std::vector<std::uint32_t> tokens;
     bool thinking = false;
     Json tools;
     std::uint32_t stable_prefix = 0;
     std::shared_ptr<GenerationContext> context = {};
+    // Resolves the virtual ids of tokens; null for a prompt without media rows.
+    std::shared_ptr<const session::EmbedTable> embeds = {};
     bool tools_off = false;  // tool_choice "none" (set by the shared layer): a call the model still emits is withheld
 };
 
@@ -135,6 +197,8 @@ struct ApiConfig {
     std::function<std::string(const QueueSnapshot&)> metrics_data = {};
     // Authenticated extension returning domain JSON through shared framing.
     std::function<std::optional<Json>(const HttpRequest&)> route_data = {};
+    // Media input: see ApiVisionConfig. Default: no adapter, nothing changes.
+    ApiVisionConfig vision = {};
 
 };
 
@@ -150,7 +214,11 @@ public:
     ~ApiService();
     void handle(const HttpRequest& request, HttpResponseWriter& response);
     // Prompt tokens of a chat request body exactly as the chat route builds them (for tests and tools).
+    // A body with media parts is refused here (std::invalid_argument): its virtual ids mean nothing without
+    // the table that prepare_chat_prompt returns with them.
     [[nodiscard]] std::vector<std::uint32_t> chat_prompt(const Json& body) const;
+    // The same prompt with what owns it: tokens, stable prefix and, for media, the EmbedTable of its virtual ids.
+    [[nodiscard]] ApiChatPrompt prepare_chat_prompt(const Json& body) const;
     void set_state(std::string state);
 private:
     struct Impl;
