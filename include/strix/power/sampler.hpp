@@ -2,12 +2,12 @@
 //
 // A Sampler owns a list of Sources and one worker thread that reads them at a fixed period into a fixed ring of
 // Samples. Nothing here needs elevated rights or changes a system setting: a source reads what the machine already
-// exposes, and a source that is missing or unreadable reports "unavailable" with the reason and is skipped. A run never
+// exposes. Missing sources report why; discovered package counters retry unreadable members. A run never
 // fails because of this file.
 //
 // Domains: every energy counter and power reading belongs to one Domain (package, accelerator, system). Energy of a
-// window is computed per domain (the counter when it covers at least as much of the window as the power readings of the
-// same domain, otherwise the trapezoid integral of the power readings) and the disjoint domains are added. A receipt
+// window is computed per physical coverage group (counter when it covers at least as much as that group's power
+// readings, otherwise the power integral). Disjoint groups are added, including those in the same domain. A receipt
 // names what it covers ("package:counter+accelerator:power-integral"): it is the energy of those domains, not of the
 // whole machine, unless the coverage says "system".
 //
@@ -15,7 +15,7 @@
 // hold a valid reading of it and they are at most Options::max_gap_ms apart (linear interpolation inside it). Anything
 // else is not covered: a failed read (the stretches on both sides of it), a window older than the ring, a window that
 // ends after the last sample. A domain a source owns is expected in every receipt, also when its reads only fail. A
-// receipt carries complete and covered_ms (the time every expected domain covers at once); an incomplete receipt
+// receipt carries complete and covered_ms (the time every expected hardware group covers at once); an incomplete receipt
 // reports the energy of the covered parts only and no tok_per_j.
 //
 // Threads: the sources are read by one thread at a time (the worker, or a caller of sample_now/sample_at). Readers of
@@ -41,6 +41,7 @@
 #include <functional>
 #include <limits>
 #include <memory>
+#include <map>
 #include <mutex>
 #include <string>
 #include <string_view>
@@ -60,6 +61,8 @@ inline constexpr std::size_t kDomains = 3;
 
 // One reading of every channel. A channel nobody filled stays NaN.
 struct Sample {
+    struct Reading { double energy_j = kAbsent, power_w = kAbsent; bool expected = false; };
+    std::vector<Reading> hardware;  // sampler-owned physical coverage groups, independent of domain totals
     std::int64_t t_ns = 0;  // steady clock
     std::array<double, kDomains> energy_j{kAbsent, kAbsent, kAbsent};  // cumulative since the source's first read
     std::array<double, kDomains> power_w{kAbsent, kAbsent, kAbsent};   // instantaneous
@@ -69,10 +72,10 @@ struct Sample {
     double gpu_busy_pct = kAbsent;
     std::uint8_t energy_bad = 0, power_bad = 0;  // domains a source failed to read in this sample (bit = domain)
 
-    // Sources of one domain add up. A negative or non-finite value is a failed read.
+    // Readings within one source and domain add up. A negative or non-finite value is a failed read.
     void add_power(Domain domain, double watts) noexcept;
     void add_energy(Domain domain, double joules) noexcept;
-    // A source that owns part of a domain and could not read it: the domain is absent from this sample, never partial.
+    // A source that could not read part of its hardware group: that channel is absent, never a partial total.
     void fail_power(Domain domain) noexcept { power_bad = static_cast<std::uint8_t>(power_bad | (1U << static_cast<unsigned>(domain))); }
     void fail_energy(Domain domain) noexcept { energy_bad = static_cast<std::uint8_t>(energy_bad | (1U << static_cast<unsigned>(domain))); }
     // Sum of the power domains read (system alone when present); NaN when none.
@@ -98,6 +101,10 @@ public:
     virtual ~Source() = default;
     virtual SourceStatus probe() = 0;
     virtual void read(Sample& sample) noexcept = 0;
+    // Empty: this source owns disjoint hardware. Equal nonempty IDs in one domain mean the exact same hardware
+    // (including every member of an aggregate), so counter and power are alternatives. Use one source per channel
+    // in a named group. Stable after probe().
+    virtual std::string_view coverage_id(Domain) const noexcept { return {}; }
 };
 
 // root is the filesystem prefix of the system tree: empty means the real machine ("/"); a test passes a directory
@@ -116,7 +123,7 @@ struct Receipt {
     double gpu_clock_mhz_median = 0.0, temp_c_max = 0.0, cpu_mhz_median = 0.0, gpu_busy_pct_mean = 0.0;
     std::size_t samples = 0;       // samples inside the window
     std::string energy_source;     // "counter" | "power-integral" | "mixed"
-    // complete: every domain the sampler measures covers the whole window. Otherwise energy_j is the energy of the
+    // complete: every hardware group the sampler measures covers the whole window. Otherwise energy_j is the energy of the
     // covered parts only, avg_w its mean power, and covered_ms the time all of those domains cover at once (the
     // intersection of their covered stretches; 0 when one of them has no reading).
     bool complete = false;
@@ -170,11 +177,11 @@ public:
         return std::chrono::duration_cast<std::chrono::nanoseconds>(t.time_since_epoch()).count();
     }
 
-    // One channel of one domain: joules and nanoseconds over its covered stretches and the steepest reading.
+    // One channel of one hardware group: joules and nanoseconds over its covered stretches and the steepest reading.
     struct Cover { double joules = 0.0; std::int64_t ns = 0; double peak = 0.0; };
-    using Covers = std::array<std::array<Cover, kDomains>, 2>;  // [0] counter, [1] power
-    // Nanoseconds per set of channels covering a stretch at once (bit = channel * kDomains + domain).
-    using Joint = std::array<std::int64_t, 1U << (2 * kDomains)>;
+    using Covers = std::vector<std::array<Cover, 2>>;  // per hardware group: counter, power
+    // Only observed combinations are stored; each group has counter bit 1 and power bit 2.
+    using Joint = std::map<std::vector<unsigned char>, std::int64_t>;
 
 private:
     void run();
@@ -184,6 +191,8 @@ private:
     std::vector<std::unique_ptr<Source>> sources_;
     std::vector<SourceStatus> status_;
     std::vector<Source*> live_;
+    std::vector<std::array<std::size_t, kDomains>> groups_;
+    std::vector<Domain> domains_;
     Options options_;
     bool usable_ = false;
     mutable std::mutex mutex_;       // ring, lifetime
@@ -194,7 +203,7 @@ private:
     Joint life_joint_{};
     std::int64_t first_ns_ = 0, last_ns_ = 0;
     std::uint8_t seen_energy_ = 0, seen_power_ = 0;  // domains that delivered a reading
-    std::uint8_t expected_ = 0;                      // domains a source read or failed to read
+    std::vector<unsigned char> expected_;  // hardware groups a source read or failed to read
     std::thread thread_;
     std::mutex wake_mutex_;
     std::condition_variable wake_, sampled_;

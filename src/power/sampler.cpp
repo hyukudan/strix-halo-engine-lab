@@ -126,6 +126,9 @@ void set_if_absent(double& slot, double value) noexcept { if (!finite(slot)) slo
 class AmdgpuHwmon final : public Source {
 public:
     explicit AmdgpuHwmon(std::string root) : root_(std::move(root)) {}
+    std::string_view coverage_id(Domain domain) const noexcept override {
+        return domain == Domain::package ? "host-packages" : "";
+    }
     SourceStatus probe() override {
         SourceStatus status{"amdgpu-hwmon", false, {}};
         const fs::path base = fs::path(root_) / "sys" / "class" / "hwmon";
@@ -176,10 +179,12 @@ private:
 class Rapl final : public Source {
 public:
     explicit Rapl(std::string root) : root_(std::move(root)) {}
+    std::string_view coverage_id(Domain domain) const noexcept override {
+        return domain == Domain::package ? "host-packages" : "";
+    }
     SourceStatus probe() override {
         SourceStatus status{"rapl", false, {}};
         const fs::path base = fs::path(root_) / "sys" / "class" / "powercap";
-        std::string problem;
         for (const auto& dir : children(base)) {
             const auto zone = dir.filename().string();
             // Top-level zones only ("intel-rapl:0"); "intel-rapl:0:0" is a sub-zone already inside its package.
@@ -187,15 +192,18 @@ public:
             if (read_word(dir / "name").rfind("package", 0) != 0) continue;
             Zone z;
             std::string why;
-            if (!z.energy.open((dir / "energy_uj").string(), why)) { if (problem.empty()) problem = why; continue; }
+            z.path = (dir / "energy_uj").string();
+            const bool opened = z.energy.open(z.path, why);
+            const std::string failure = why;
             ValueFile range;
             if (range.open((dir / "max_energy_range_uj").string(), why)) range.read(z.range_uj);
-            z.energy.read(z.last_uj);
+            z.baseline = opened && z.energy.read(z.last_uj) && (z.range_uj <= 0.0 || z.last_uj <= z.range_uj);
             status.detail += (status.detail.empty() ? "" : "; ") + zone + ": energy_uj";
+            if (!z.baseline) status.detail += " (probe failed: " + (failure.empty() ? "invalid baseline" : failure) + ")";
             zones_.push_back(std::move(z));
         }
         status.available = !zones_.empty();
-        if (!status.available) status.detail = problem.empty() ? "no package zone under " + base.generic_string() : problem;
+        if (!status.available) status.detail = "no package zone under " + base.generic_string();
         return status;
     }
     void read(Sample& sample) noexcept override {
@@ -206,7 +214,12 @@ public:
         bool all = true;
         for (auto& z : zones_) {
             double now = 0.0;
+            if (!z.energy.is_open()) {
+                std::string why;
+                if (!z.energy.open(z.path, why)) { all = false; continue; }
+            }
             if (!z.energy.read(now) || (z.range_uj > 0.0 && now > z.range_uj)) { all = false; continue; }
+            if (!z.baseline) { z.last_uj = now; z.baseline = true; continue; }
             // The counter wraps at max_energy_range_uj. A drop with no known range is a reset: nothing is added.
             const double delta = now >= z.last_uj ? now - z.last_uj : (z.range_uj > 0.0 ? now + z.range_uj - z.last_uj : 0.0);
             z.last_uj = now;
@@ -216,7 +229,7 @@ public:
     }
 
 private:
-    struct Zone { ValueFile energy; double range_uj = 0.0, last_uj = 0.0; };
+    struct Zone { ValueFile energy; std::string path; double range_uj = 0.0, last_uj = 0.0; bool baseline = false; };
     std::string root_;
     std::vector<Zone> zones_;
     double total_j_ = 0.0;
@@ -296,51 +309,52 @@ bool stretch(Cover& c, bool counter, std::int64_t ta, double va, std::int64_t tb
     c.ns += hi - lo;
     return true;
 }
-// The stretch between two consecutive samples. A channel covers it only when both samples hold a valid reading: a
-// failed or absent reading ends the stretch before it and starts none after it, so nothing is interpolated across a
-// failed read. `joint` adds the clipped length under the set of channels that cover it (bit = channel * kDomains +
-// domain), which is what the time covered by several domains at once is read from.
-void span(Covers& covers, Joint& joint, const Sample& a, const Sample& b, std::int64_t t0, std::int64_t t1, std::int64_t gap_ns) noexcept {
+// Keep physical coverage groups separate through integration and channel selection. A failed endpoint or an
+// excessive gap excludes the stretch; joint records only observed sets of simultaneously covered channels.
+void span(Covers& covers, Joint& joint, const Sample& a, const Sample& b, std::int64_t t0, std::int64_t t1, std::int64_t gap_ns) {
     const auto lo = std::max(a.t_ns, t0), hi = std::min(b.t_ns, t1);
     if (hi <= lo) return;
-    unsigned mask = 0;
-    for (std::size_t d = 0; d < kDomains; ++d) {
-        if (finite(a.energy_j[d]) && finite(b.energy_j[d]) && stretch(covers[0][d], true, a.t_ns, a.energy_j[d], b.t_ns, b.energy_j[d], t0, t1, gap_ns))
-            mask |= 1U << d;
-        if (finite(a.power_w[d]) && finite(b.power_w[d]) && stretch(covers[1][d], false, a.t_ns, a.power_w[d], b.t_ns, b.power_w[d], t0, t1, gap_ns))
-            mask |= 1U << (kDomains + d);
+    std::vector<unsigned char> mask(covers.size());
+    for (std::size_t g = 0; g < covers.size(); ++g) {
+        const auto& x = a.hardware[g];
+        const auto& y = b.hardware[g];
+        if (finite(x.energy_j) && finite(y.energy_j) && stretch(covers[g][0], true, a.t_ns, x.energy_j, b.t_ns, y.energy_j, t0, t1, gap_ns))
+            mask[g] |= 1;
+        if (finite(x.power_w) && finite(y.power_w) && stretch(covers[g][1], false, a.t_ns, x.power_w, b.t_ns, y.power_w, t0, t1, gap_ns))
+            mask[g] |= 2;
     }
     joint[mask] += hi - lo;
 }
 
-// Energy of a window of window_ns from the per-domain covers. `expected` is the set of domains the sampler measures (a
-// bit per domain, a domain whose reads only fail included): each of them must cover the window for the receipt to be
-// complete. covered_ms is the time all of them cover at once. False: nothing covers any of it.
-bool combine(const Covers& covers, const Joint& joint, unsigned expected, std::int64_t window_ns, Receipt& r) {
-    const unsigned whole = 1U << static_cast<unsigned>(Domain::system);
-    const unsigned used = expected & whole ? whole : expected;
+bool combine(const Covers& covers, const Joint& joint, const std::vector<unsigned char>& expected,
+             const std::vector<Domain>& domains, std::int64_t window_ns, Receipt& r) {
+    bool whole = false;
+    for (std::size_t g = 0; g < covers.size(); ++g) if (expected[g] && domains[g] == Domain::system) whole = true;
     bool any = false, all = true, by_counter = false, by_power = false;
-    unsigned need = 0;
-    for (std::size_t d = 0; d < kDomains; ++d) {
-        if (!(used & (1U << d))) continue;
-        const Cover& c = covers[0][d];
-        const Cover& p = covers[1][d];
-        // The counter unless the power readings of the same domain cover more of the window.
+    std::vector<unsigned char> need(covers.size());
+    for (std::size_t g = 0; g < covers.size(); ++g) {
+        if (!expected[g] || (whole && domains[g] != Domain::system)) continue;
+        const Cover& c = covers[g][0];
+        const Cover& p = covers[g][1];
         const bool counter = c.ns > 0 && c.ns >= p.ns;
         const Cover& u = counter ? c : p;
-        r.coverage += (r.coverage.empty() ? "" : "+") + std::string(domain_name(static_cast<Domain>(d))) + ":" +
+        r.coverage += (r.coverage.empty() ? "" : "+") + std::string(domain_name(domains[g])) + ":" +
             (u.ns <= 0 ? "none" : counter ? "counter" : "power-integral");
         if (u.ns <= 0) { all = false; continue; }
-        need |= 1U << ((counter ? 0 : kDomains) + d);
+        need[g] = counter ? 1 : 2;
         any = true;
         (counter ? by_counter : by_power) = true;
         r.energy_j += u.joules;
         r.avg_w += u.joules / (static_cast<double>(u.ns) * 1e-9);
-        r.peak_w += p.ns > 0 ? p.peak : c.peak;  // sum of the domains' peaks (an upper bound with several domains)
+        r.peak_w += p.ns > 0 ? p.peak : c.peak;  // sum of hardware peaks, an upper bound
     }
     if (!any) return false;
-    std::int64_t covered = 0;  // the stretches every chosen channel covers: the intersection, not the shortest one
-    if (all) for (unsigned mask = 0; mask < joint.size(); ++mask) if ((mask & need) == need) covered += joint[mask];
+    std::int64_t covered = 0;
+    if (all) for (const auto& [mask, ns] : joint) {
+        bool common = true;
+        for (std::size_t g = 0; g < need.size(); ++g) if ((mask[g] & need[g]) != need[g]) common = false;
+        if (common) covered += ns;
+    }
     r.available = true;
     r.complete = covered == window_ns;
     r.covered_ms = static_cast<double>(covered) * 1e-6;
@@ -348,6 +362,7 @@ bool combine(const Covers& covers, const Joint& joint, unsigned expected, std::i
     r.peak_w = std::max(r.peak_w, r.avg_w);
     return true;
 }
+
 double median(std::vector<double>& values) noexcept {
     if (values.empty()) return 0.0;
     std::sort(values.begin(), values.end());
@@ -514,6 +529,22 @@ Sampler::Sampler(std::vector<std::unique_ptr<Source>> sources, Options options) 
         if (status.available) live_.push_back(source.get());
         status_.push_back(std::move(status));
     }
+    groups_.resize(live_.size());
+    // Domain-major order keeps receipt labels stable; an unnamed source gets its own identity in each domain.
+    for (std::size_t d = 0; d < kDomains; ++d) {
+        std::map<std::string, std::size_t> named;
+        for (std::size_t i = 0; i < live_.size(); ++i) {
+            const auto domain = static_cast<Domain>(d);
+            const std::string id(live_[i]->coverage_id(domain));
+            const auto found = named.find(id);
+            if (!id.empty() && found != named.end()) { groups_[i][d] = found->second; continue; }
+            groups_[i][d] = domains_.size();
+            if (!id.empty()) named.emplace(id, domains_.size());
+            domains_.push_back(domain);
+        }
+    }
+    life_.resize(domains_.size());
+    expected_.resize(domains_.size());
     usable_ = !live_.empty();
     if (usable_) ring_.resize(options_.capacity);
 }
@@ -594,19 +625,41 @@ void Sampler::sample_locked(std::int64_t t_ns) {
     }
     Sample sample;
     sample.t_ns = t_ns;
-    for (auto* source : live_) source->read(sample);
+    sample.hardware.resize(domains_.size());
+    std::vector<unsigned char> bad(domains_.size());
+    for (std::size_t i = 0; i < live_.size(); ++i) {
+        Sample part;
+        part.t_ns = t_ns;
+        live_[i]->read(part);
+        for (std::size_t d = 0; d < kDomains; ++d) {
+            const auto domain = static_cast<Domain>(d);
+            auto& h = sample.hardware[groups_[i][d]];
+            if (finite(part.energy_j[d])) { sample.add_energy(domain, part.energy_j[d]); h.energy_j = finite(h.energy_j) ? h.energy_j + part.energy_j[d] : part.energy_j[d]; h.expected = true; }
+            if (finite(part.power_w[d])) { sample.add_power(domain, part.power_w[d]); h.power_w = finite(h.power_w) ? h.power_w + part.power_w[d] : part.power_w[d]; h.expected = true; }
+            if (part.energy_bad & (1U << d)) { bad[groups_[i][d]] |= 1; h.expected = true; sample.fail_energy(domain); }
+            if (part.power_bad & (1U << d)) { bad[groups_[i][d]] |= 2; h.expected = true; sample.fail_power(domain); }
+        }
+        if (finite(part.gpu_clock_mhz)) set_if_absent(sample.gpu_clock_mhz, part.gpu_clock_mhz);
+        if (finite(part.temp_c)) set_max(sample.temp_c, part.temp_c);
+        if (finite(part.cpu_mhz)) set_if_absent(sample.cpu_mhz, part.cpu_mhz);
+        if (finite(part.gpu_busy_pct)) set_if_absent(sample.gpu_busy_pct, part.gpu_busy_pct);
+    }
+    for (std::size_t g = 0; g < bad.size(); ++g) {
+        if (bad[g] & 1) sample.hardware[g].energy_j = kAbsent;
+        if (bad[g] & 2) sample.hardware[g].power_w = kAbsent;
+    }
     for (std::size_t d = 0; d < kDomains; ++d) {
         if (sample.energy_bad & (1U << d)) sample.energy_j[d] = kAbsent;
         if (sample.power_bad & (1U << d)) sample.power_w[d] = kAbsent;
     }
     const std::lock_guard<std::mutex> lock(mutex_);
-    for (std::size_t d = 0; d < kDomains; ++d) {
-        if (finite(sample.energy_j[d])) seen_energy_ = static_cast<std::uint8_t>(seen_energy_ | (1U << d));
-        if (finite(sample.power_w[d])) seen_power_ = static_cast<std::uint8_t>(seen_power_ | (1U << d));
+    for (std::size_t g = 0; g < expected_.size(); ++g) {
+        const auto bit = 1U << static_cast<unsigned>(domains_[g]);
+        if (finite(sample.hardware[g].energy_j)) seen_energy_ = static_cast<std::uint8_t>(seen_energy_ | bit);
+        if (finite(sample.hardware[g].power_w)) seen_power_ = static_cast<std::uint8_t>(seen_power_ | bit);
+        // Failed groups remain expected even when another device in the same domain succeeds.
+        if (sample.hardware[g].expected) expected_[g] = 1;
     }
-    // A domain a source owns is expected from its first read on, failed or not: one that only ever fails stays in
-    // every receipt as "none" instead of dropping out of it.
-    expected_ = static_cast<std::uint8_t>(expected_ | seen_energy_ | seen_power_ | sample.energy_bad | sample.power_bad);
     if (size_)
         span(life_, life_joint_, ring_[(head_ + ring_.size() - 1) % ring_.size()], sample, kNoLo, kNoHi,
              static_cast<std::int64_t>(options_.max_gap_ms) * 1'000'000LL);
@@ -631,7 +684,7 @@ Receipt Sampler::lifetime_receipt() const {
     if (!usable_) return unavailable("no readable source");
     Covers covers;
     Joint joint;
-    unsigned expected = 0;
+    std::vector<unsigned char> expected;
     std::int64_t total = 0;
     {
         const std::lock_guard<std::mutex> lock(mutex_);
@@ -640,10 +693,10 @@ Receipt Sampler::lifetime_receipt() const {
         expected = expected_;
         total = last_ns_ - first_ns_;
     }
-    if (!expected) return unavailable("no power or energy channel");
+    if (std::none_of(expected.begin(), expected.end(), [](auto e) { return e != 0; })) return unavailable("no power or energy channel");
     if (total <= 0) return unavailable("no samples");
     Receipt r;
-    if (!combine(covers, joint, expected, total, r)) return unavailable("no covered stretch since the sampler started");
+    if (!combine(covers, joint, expected, domains_, total, r)) return unavailable("no covered stretch since the sampler started");
     r.duration_ms = static_cast<double>(total) * 1e-6;
     r.energy_source += "-lifetime";
     return r;
@@ -681,21 +734,21 @@ Receipt Sampler::summarize(std::int64_t t0_ns, std::int64_t t1_ns, std::uint64_t
     if (t1_ns <= t0_ns) return unavailable("empty window");
     std::size_t inside = 0;
     bool lead = false;
-    unsigned expected = 0;
+    std::vector<unsigned char> expected;
     std::vector<Sample> points;
     {
         const std::lock_guard<std::mutex> lock(mutex_);
         points = window_locked(t0_ns, t1_ns, inside, lead);
         expected = expected_;
     }
-    if (!expected) return unavailable("no power or energy channel");
+    if (std::none_of(expected.begin(), expected.end(), [](auto e) { return e != 0; })) return unavailable("no power or energy channel");
     if (points.empty()) return unavailable("no samples");
-    Covers covers;
+    Covers covers(domains_.size());
     Joint joint{};
     const auto gap_ns = static_cast<std::int64_t>(options_.max_gap_ms) * 1'000'000LL;
     for (std::size_t i = 1; i < points.size(); ++i) span(covers, joint, points[i - 1], points[i], t0_ns, t1_ns, gap_ns);
     Receipt r;
-    if (!combine(covers, joint, expected, t1_ns - t0_ns, r)) return unavailable("window not covered by the stored samples");
+    if (!combine(covers, joint, expected, domains_, t1_ns - t0_ns, r)) return unavailable("window not covered by the stored samples");
     r.samples = inside;
     r.tokens = tokens;
     r.duration_ms = static_cast<double>(t1_ns - t0_ns) * 1e-6;

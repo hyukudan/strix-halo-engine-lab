@@ -208,14 +208,14 @@ void permission_denied_and_partial() {
     Sampler sampler(make_sources(tree.path()));
     if (!root) {
         const auto rapl = status_of(sampler, "rapl");
-        require(!rapl.available && rapl.detail.find("permission denied") != std::string::npos, "rapl permission reason: " + rapl.detail);
+        require(rapl.available && rapl.detail.find("permission denied") != std::string::npos, "rapl permission reason: " + rapl.detail);
     }
     require(status_of(sampler, "amdgpu-hwmon").available, "partial amdgpu still available");
     sampler.sample_at(kSecond);
     sampler.sample_at(2 * kSecond);
     const auto r = sampler.summarize(kSecond, 2 * kSecond, 0);
     if (!root) {
-        require(!r.available && r.reason == "no power or energy channel", "no energy without a power file");
+        require(!r.available && r.reason.find("not covered") != std::string::npos, "unreadable package remains expected");
     }
     require(near(sampler.latest().gpu_clock_mhz, 2400.0) && near(sampler.latest().temp_c, 70.0), "clock and temperature");
     // Garbage in a value file: not a number, source unavailable.
@@ -348,6 +348,77 @@ std::unique_ptr<Sampler> scripted(Scripted*& source, std::function<void(Sample&)
     return std::make_unique<Sampler>(std::move(sources), options);
 }
 double seconds_of(const Sample& s) { return static_cast<double>(s.t_ns) * 1e-9; }
+
+// Disjoint cards in one domain must both survive counter/power selection, including lifetime ring eviction.
+void disjoint_hardware_channels() {
+    std::vector<std::unique_ptr<Source>> sources;
+    auto counter = std::make_unique<Scripted>();
+    counter->fn = [](Sample& s) { s.add_energy(Domain::accelerator, 50.0 * seconds_of(s)); };
+    auto power = std::make_unique<Scripted>();
+    power->fn = [](Sample& s) {
+        if (seconds_of(s) == 3.0) s.fail_power(Domain::accelerator);
+        else s.add_power(Domain::accelerator, 300.0);
+    };
+    sources.push_back(std::move(counter));
+    sources.push_back(std::move(power));
+    Options options;
+    options.capacity = 4;
+    Sampler sampler(std::move(sources), options);
+    sampler.sample_at(0);
+    sampler.sample_at(kSecond);
+    const auto r = sampler.summarize(0, kSecond, 700);
+    require(r.available && r.complete && near(r.energy_j, 350.0) && near(r.tok_per_j, 2.0), "both cards contribute");
+    require(r.energy_source == "mixed", "counter and power remain distinct");
+    for (int i = 2; i <= 6; ++i) sampler.sample_at(i * kSecond);
+    const auto total = sampler.lifetime_receipt();
+    require(total.available && !total.complete && near(total.energy_j, 1500.0) && near(total.covered_ms, 4000.0), "lifetime retains both cards and their coverage");
+    const auto failed = sampler.summarize(3 * kSecond, 4 * kSecond, 100);
+    require(failed.available && !failed.complete && near(failed.energy_j, 50.0) && failed.tok_per_j == 0.0, "failed card stays expected");
+}
+
+void rapl_probe_recovery() {
+#ifndef _WIN32
+    // An empty member and a missing file both recover; the latter must reopen its descriptor.
+    for (const bool missing : {false, true}) {
+        Tree tree("probe-recovery");
+        tree.rapl(0);
+        const std::string zone = "sys/class/powercap/intel-rapl:1/";
+        tree.put(zone + "name", "package-1");
+        tree.put(zone + "max_energy_range_uj", "1000000");
+        if (!missing) tree.put(zone + "energy_uj", "");
+        Sampler sampler(make_sources(tree.path()));
+        require(status_of(sampler, "rapl").detail.find("probe failed") != std::string::npos, "failed member reported alongside readable member");
+        sampler.sample_at(0);
+        tree.rapl(100000);
+        sampler.sample_at(kSecond);
+        const auto partial = sampler.summarize(0, kSecond, 10);
+        require(!partial.complete && partial.tok_per_j == 0.0 && !partial.available, "probe failure cannot certify partial package");
+        tree.put(zone + "energy_uj", "100000");
+        sampler.sample_at(2 * kSecond);  // establish the recovered member's first baseline
+        tree.rapl(300000);
+        tree.put(zone + "energy_uj", "400000");
+        sampler.sample_at(3 * kSecond);
+        const auto recovered = sampler.summarize(2 * kSecond, 3 * kSecond, 10);
+        require(recovered.complete && near(recovered.energy_j, 0.5), "recovered package includes both zones");
+        require(!sampler.lifetime_receipt().complete, "recovery does not cover the earlier failure");
+    }
+#endif
+}
+
+void rapl_invalid_probe_baseline() {
+    Tree tree("invalid-baseline");
+    if (!tree.rapl(2500000, 1000000)) return;
+    Sampler sampler(make_sources(tree.path()));
+    require(status_of(sampler, "rapl").detail.find("invalid baseline") != std::string::npos, "invalid probe baseline reported");
+    sampler.sample_at(0);
+    tree.rapl(100000, 1000000);
+    sampler.sample_at(kSecond);
+    require(near(sampler.latest().energy_j[0], 0.0), "first valid baseline adds no delta");
+    tree.rapl(200000, 1000000);
+    sampler.sample_at(2 * kSecond);
+    const auto r = sampler.summarize(kSecond, 2 * kSecond, 1);
+    require(r.complete && near(r.energy_j, 0.1), "invalid predecessor cannot poison recovery");
+}
 
 // Finding 2: sample_at() from other threads while the worker runs never enters a source twice at once, and a
 // timestamp that will not be stored does not advance a stateful source.
@@ -740,6 +811,9 @@ int main() {
         execution_window_is_immutable();
         expired_history();
         disjoint_domains();
+        disjoint_hardware_channels();
+        rapl_probe_recovery();
+        rapl_invalid_probe_baseline();
         partial_counter_failure();
         missing_power_interval();
         failing_domain_stays_expected();

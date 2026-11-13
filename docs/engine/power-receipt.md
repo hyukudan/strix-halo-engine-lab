@@ -49,8 +49,11 @@ The hwmon source tells the two apart by what the driver exposes: `in1_input` exi
 a fan (`fan1_input`, `pwm1`) on a card only. With neither marker the device is taken as `package` and the source
 detail says `domain=package(assumed)`, so a package counter is never added to it a second time.
 
-Energy is computed per domain: the counter when it covers at least as much of the window as the power readings of
-the same domain, otherwise the trapezoid integral of the power readings. Disjoint domains are added. `coverage`
+Energy is computed per physical coverage group: the counter when it covers at least as much of the window as
+power readings of the same hardware, otherwise the power integral. Disjoint groups are added even within one
+domain. Sources default to independent groups; `Source::coverage_id(domain)` can identify the exact same hardware
+across counter and power sources. The built-in package sources retain their shared host-package assumption.
+`coverage` may repeat a domain when it contains several groups;
 names what the number describes, for example `package:counter+accelerator:power-integral`; a domain the sampler
 measures but that has no reading in the window appears as `accelerator:none` and the receipt is not complete;
 that holds from the first read of the domain on, also when every read of it fails.
@@ -58,7 +61,9 @@ The energy is the energy of the listed domains. It is the whole machine only whe
 memory, storage, fans and conversion losses outside the listed domains are not in it.
 
 A counter made of several zones is published only for a sample in which every zone was read; a sample in which
-one failed carries no counter, and the zone keeps its own baseline, so its energy is not moved into the stretch in
+one failed carries no counter, including failures during probing (reported in source detail and retried). A zone
+with an invalid or unreadable initial value establishes its baseline on its first valid read without adding energy;
+a previously valid zone keeps its own baseline, so its energy is not moved into the stretch in
 which it recovers. A value file must hold one complete non-negative decimal number (a temperature may be
 negative): a numeric prefix followed by other bytes, a negative power or a counter past its range is a failed read.
 
@@ -91,7 +96,7 @@ Each of `request`, `prefill` and `decode` is either `{"available":false,"reason"
 |---|---|
 | `duration_ms` | length of the window |
 | `energy_j` | energy in the window |
-| `avg_w`, `peak_w` | mean power over the covered part and the highest power reading (with several domains: the sum of their peaks) |
+| `avg_w`, `peak_w` | mean power over the covered part and the highest power reading (with several hardware groups: the sum of their peaks, an upper bound rather than a simultaneous machine peak) |
 | `tokens`, `tok_per_j` | tokens of the phase and tokens per joule (prefill: prompt tokens computed; decode: tokens emitted); `tok_per_j` is 0 unless the receipt is complete |
 | `gpu_clock_mhz_median` | median GPU clock over the samples of the window |
 | `temp_c_max` | highest temperature sample |
