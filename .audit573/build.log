@@ -1,0 +1,8 @@
+Versión de MSBuild 17.14.60+43b635718 para .NET Framework
+
+  1>Checking Build System
+  Generating step_digest.hpp
+  Building Custom Rule D:/tmp/fix-pr573/tests/ds41_step_digest_host/CMakeLists.txt
+  step_digest_tests.cpp
+  ds41_step_digest_tests.vcxproj -> D:\tmp\fix-pr573\.audit573\build\Release\ds41_step_digest_tests.exe
+  Building Custom Rule D:/tmp/fix-pr573/tests/ds41_step_digest_host/CMakeLists.txt

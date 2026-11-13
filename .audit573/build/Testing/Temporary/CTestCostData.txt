@@ -1,0 +1,3 @@
+ds41_step_digest_source_contract 1 0.0496818
+ds41_step_digest_emulated_pair 1 0.0521981
+---

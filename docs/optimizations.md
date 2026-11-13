@@ -1624,10 +1624,10 @@ Group shared-expert SwiGLU pairs.
 
 Splits expert work across the pair, retains expert slots, builds integer routes faster, pairs eligible F16 projections and batches attention segments.
 
-- **Preconditions:** Two ranks and supported expert geometry; TP down width 1152; segment batching does not combine with BATCH_ROWS16=1.
-- **Automatic selection:** Each is on unless disabled; BATCH_SEGMENTS also covers STRIX_DS41_BATCH_ROWS16=1 (two launches per kernel for 9 to 16 requests). Shape guards keep supported older paths.
+- **Preconditions:** Two ranks and supported expert geometry; TP down width 1152.
+- **Automatic selection:** Each is on unless disabled; BATCH_SEGMENTS also covers STRIX_DS41_BATCH_ROWS16=1 (two launches per kernel for 9 to 16 request segments). Shape guards keep supported older paths.
 - **Fallback notice:** Routine operator eligibility has no general decline log. Invalid expert-TP geometry fails validation; do not treat a transport change as the same numerical identity.
-- **Exactness evidence:** The published two-node gates compare both ranks with the reference: prefill logits, decode token IDs, verify rows and batch rows. Keep the same Q2 experts, dense overlay and trellis packs in both arms.
+- **Exactness evidence:** The published two-node gates compare both ranks with the reference: prefill logits, decode token IDs, verify rows and batch rows. Keep the same Q2 experts, dense overlay and trellis packs in both arms. The newly enabled BATCH_ROWS16 segment path still needs server-level qualification of actual 9–16-row steps with mixed segment lengths and complete token/logit/state comparisons against BATCH_SEGMENTS=0; launch-splitting kernel coverage does not establish this gate. Per-rank token-stream checksums are diagnostic only and omit row/slot identity and step boundaries; equality is not proof of identical outputs.
 - **Off switch:** Set one of STRIX_DS41_EXPERT_TP, STRIX_DS41_EXPERT_SLOTS, STRIX_DS41_ROUTES_FAST, STRIX_DS41_F16_PAIR, STRIX_DS41_TP_DOWN or STRIX_DS41_BATCH_SEGMENTS to 0 per comparison.
 - **Measured gain:** Batch segments N8 +9%; TP down R6 -3%, N8 +1.6%
 - **Public evidence:** [Two-node defaults](models/deepseek-v4.1/production-defaults.md)
