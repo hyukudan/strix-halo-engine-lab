@@ -283,10 +283,17 @@ void snap_tests() {
     plan = plan_rows(lone, CycleCost{}, slow);
     check(plan.rows == std::vector<std::uint32_t>{4}, "lone lane pads to the smallest total past the guard");
 }
+void row_price_tests() {
+    // A cycle of 16 tokens in 160 ms runs at 0.1 tokens per ms: a row that adds 4 ms must yield more than 0.4.
+    check(row_pays(0.41, 4, 16, 160) && !row_pays(0.40, 4, 16, 160) && !row_pays(0.39, 4, 16, 160), "a row pays above the cycle's rate only");
+    check(row_pays(0.01, 0, 16, 160) && !row_pays(0, 0, 16, 160), "a free row pays unless it cannot yield");
+    check(row_pays(0.5, 4, 0, 0), "an empty cycle takes any row that can yield");
+    check(row_pays(7, 9, 16, 160) && !row_pays(7, 11, 16, 160), "acceptance is clamped to one");
+}
 }  // namespace
 
 int main() {
-    cost_model_tests(); monotone_tests(); limit_tests(); table_tests(); starvation_tests(); snap_tests();
+    row_price_tests(); cost_model_tests(); monotone_tests(); limit_tests(); table_tests(); starvation_tests(); snap_tests();
     std::cout << "row budget failures: " << failures << '\n';
     return failures ? 1 : 0;
 }

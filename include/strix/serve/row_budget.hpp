@@ -62,4 +62,10 @@ struct RowPlan {
 RowPlan plan_rows(std::span<const LaneDemand> demands, const CycleCost& cost, const RowLimits& limits,
                   double accept_prior = 0.8);
 
+// Price of one more row in a complete cycle: the row pays when its chance of yielding a token is worth more
+// than the time it adds at the rate the rest of the cycle already runs at (cycle_tokens / cycle_ms). added_ms is
+// everything the row brings with it: its draft step, its target row, and for a lane that would otherwise run
+// one live row plus padding only the part of the row that padding does not pay anyway.
+[[nodiscard]] bool row_pays(double accept, double added_ms, double cycle_tokens, double cycle_ms) noexcept;
+
 }  // namespace strix::serve

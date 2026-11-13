@@ -26,6 +26,9 @@ struct HipKnownPrefixCohortMember {
     SerialSessionContext* session = nullptr;
     std::span<const std::uint32_t> tokens;
     std::shared_ptr<HipMtpTargetWindowCapture> capture;
+    // Leading rows that can commit a token; 0 = every row. Later rows are padding: a wide cohort step leaves them
+    // out of the routed expert union (as active_rows does for one window), every other step still runs them.
+    std::uint32_t live_rows = 0;
 };
 struct HipKnownPrefixUnionObservation {
     std::uint64_t first_position = 0;
