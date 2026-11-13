@@ -1,8 +1,8 @@
 # Prefix fork: follow-up reuse of a retained batch slot
 
-`STRIX_SERVE_PREFIX_FORK=1` lets the batched Qwen MTP HTTP server answer a follow-up
-turn without prefilling the part of the prompt that a finished request already consumed.
-Unset (or any other value) keeps the ordinary admission path unchanged.
+The batched Qwen MTP HTTP server answers a follow-up turn without prefilling the part of
+the prompt that a finished request already consumed. `STRIX_SERVE_PREFIX_FORK=0` (or the
+baseline mode) keeps every admission cold.
 
 ## What it does
 

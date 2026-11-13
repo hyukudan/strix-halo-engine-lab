@@ -1425,7 +1425,7 @@ private:
         } else make_prefill(false);
         if(fork_on_) {
             if(fork.hit) {++stats_.prefix_fork_hits;stats_.prefix_fork_restored_tokens+=s.prefill->restored();}
-            std::fprintf(stderr,"prefix fork slot=%zu restored=%llu prompt=%zu hit=%d reason=%s\n",static_cast<std::size_t>(free-slots_.begin()),
+            if(serve::cycle_receipt_enabled()) std::fprintf(stderr,"prefix fork slot=%zu restored=%llu prompt=%zu hit=%d reason=%s\n",static_cast<std::size_t>(free-slots_.begin()),
                 static_cast<unsigned long long>(fork.hit?s.prefill->restored():0ULL),s.request.prompt.size(),fork.hit?1:0,fork.reason);
         }
         static_cast<void>(m);
@@ -2319,7 +2319,8 @@ private:
     unsigned lookahead_=[] {const char* v=std::getenv("STRIX_BATCH_SERVICE_LOOKAHEAD");return v?static_cast<unsigned>(std::clamp(std::atol(v),0L,64L)):2U;}();
     bool cancel_points_=strix::envcfg::flag("STRIX_BATCH_CANCEL_POINTS", true);
     bool engine_call_=false;
-    bool fork_on_=serve::prefix_fork_enabled_from_env();
+    // Follow-up reuse of a retained slot: on unless STRIX_SERVE_PREFIX_FORK=0 or the baseline mode.
+    bool fork_on_=[this]{const char* v=std::getenv("STRIX_SERVE_PREFIX_FORK");return !(v && v[0]=='0' && v[1]==0) && !options_.baseline;}();
     serve::PrefixDirectory fork_dir_;
     serve::PrefixKey fork_key_{1,1,1}; // constant per server: one model, template and format
     std::uint64_t fork_clock_=0;
