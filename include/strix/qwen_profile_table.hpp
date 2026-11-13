@@ -20,7 +20,7 @@ inline constexpr Lever table[] = {
      .value = {"", "", ""}, .builtin = "off",
      .kind = Kind::bit_changing, .ready = {true, false, true}, .runnable = {false, true, false},
      .target = "rel<f>[n] | topp<f>[n] | cap<k>[n]", .off = "off",
-     .source = "RoutePrune: negligible route assignments leave the prefill MoE plan; optional, in no profile; changes logits"},
+     .source = "RoutePrune: the lowest-weight route assignments leave the prefill MoE plan; optional toggle, in no profile; changes logits"},
     {.name = "gdn_fp16_chunk", .env = "STRIX_QPF2K_GDN_FP16_CHUNK", .option = "--gdn-fp16-chunk",
      .value = {"", "1", ""}, .builtin = "0",
      .kind = Kind::bit_changing, .ready = {true, false, true}, .runnable = {false, true, false},

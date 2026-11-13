@@ -38,7 +38,7 @@ struct HipMoeExpertsLauncherConfig {
     // WMMA (known_rows::enqueue_prefill form 3). Serial and window rows are unaffected.
     bool prefill_f16wmma = false;
     bool prefill_moe_route_bf16 = false;
-    // RoutePrune (FAST, default off): negligible route assignments leave the prefill route plan (moe_route_prune.hpp).
+    // RoutePrune (FAST, default off): the lowest-weight route assignments leave the prefill route plan (moe_route_prune.hpp).
     moe_core::RoutePrune prefill_moe_route_prune{};
 };
 

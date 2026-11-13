@@ -9,7 +9,7 @@
 // src/prompt_terminal_diagnostics.cpp; include/strix/session/checkpoint_io.hpp;
 // src/session/checkpoint_io.cpp. The recursive session scope detects the last
 // two additions; extending the audit's other exact scopes is separate work.
-{"CMakeLists.txt", 0x75782745e431b365ULL},
+{"CMakeLists.txt", 0x349bbac51234f2abULL},
 {"apps/minimax_rank_main.cpp", 0x38254f78be4c8facULL},
 {"apps/minimax_serve_main.cpp", 0x901f15e2f283f377ULL},
 {"cmake/StrixSession.cmake", 0x013e65a3501ef1d9ULL},
@@ -155,7 +155,7 @@
 {"src/minimax_msa.cpp", 0x7bd7c5829c4e50e4ULL},
 {"src/moe_core/decode.hpp", 0x5cf3af66ebb9eeb3ULL},
 {"src/moe_core/decode_schedule.hpp", 0x11d945bbc7e75567ULL},
-{"src/moe_core/device_plan.hpp", 0x2d54a065e6c9a0e8ULL},
+{"src/moe_core/device_plan.hpp", 0x2c643a544759fc8bULL},
 {"src/moe_core/device_plan_index.hpp", 0x123ba19e0be85987ULL},
 {"src/moe_core/exl3_trellis.hpp", 0x26e02004b39a5b6bULL},
 {"src/moe_core/grouped_core.hpp", 0x5d1db0eeac22398dULL},
@@ -208,3 +208,4 @@
 {"src/xport/transport_backend.hpp", 0xe55fde715548edf1ULL},
 {"src/xport/wire.hpp", 0x7f1782a0671f1afdULL},
 {"src/moe_core/route.hpp", 0x3acb79710ef6b1a8ULL},
+{"src/moe_core/route_prune.hpp", 0xc984e04250ded524ULL},
