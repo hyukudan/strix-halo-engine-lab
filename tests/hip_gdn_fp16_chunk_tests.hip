@@ -68,11 +68,12 @@ __device__ __forceinline__ float gdn_window_key_sum(const float (&p)[4]) {
     return __int_as_float(__builtin_amdgcn_readfirstlane(__float_as_int(sum)));
 }
 
+#include "../src/core/wave_uniform.hpp"
 #include "../src/hip_gdn_fp16_chunk.inc"
 
 // Gated RMSNorm row epilogue with the production expression, FP32 output to rows.core.
-struct TestNorm {
-    static constexpr bool kRows = true;
+template <bool Wave> struct TestNormT {
+    static constexpr bool kRows = true, kWaveRows = Wave;
     GdnPrefillRows rows;
     const float* norm;
     float epsilon;
@@ -85,10 +86,15 @@ struct TestNorm {
         float square[4];
         for (unsigned p = 0; p < 4U; ++p) square[p] = value[p] * value[p];
         const float inv = rsqrtf(gdn_window_key_sum(square) / 128.0F + epsilon);
-        for (unsigned p = 0; p < 4U; ++p)
-            rows.core[row * rows.stride + head * 128U + p * 32U + lane] = value[p] * inv * w[p] * (1.0F / (1.0F + expf(-z[p])));
+        for (unsigned p = 0; p < 4U; ++p) {
+            const float result = value[p] * inv * w[p] * (1.0F / (1.0F + expf(-z[p])));
+            if constexpr (Wave) strix::core::wave_row(rows.core, row * rows.stride + head * 128U + p * 32U)[lane] = result;
+            else rows.core[row * rows.stride + head * 128U + p * 32U + lane] = result;
+        }
     }
 };
+// The production row policy (scalar wave rows); TestNormT<false> keeps per-lane rows for the --time comparison.
+using TestNorm = TestNormT<true>;
 
 namespace {
 constexpr std::uint32_t kD = 128U;
@@ -292,11 +298,19 @@ struct Device {
         ck(hipDeviceSynchronize(), "run");
     }
     struct Out { std::vector<float> rows, state; std::vector<std::uint16_t> history; };
+    // FNV-1a over every byte a case reads back (rows, state, history), in case order: one line to compare two builds.
+    static inline std::uint64_t digest = 0xcbf29ce484222325ULL;
+    static void fold(const void* data, std::size_t bytes) {
+        const auto* b = static_cast<const unsigned char*>(data);
+        for (std::size_t i = 0; i < bytes; ++i) digest = (digest ^ b[i]) * 0x100000001b3ULL;
+    }
     Out read(const Problem& p) const {
         Out o{std::vector<float>(p.rows.size()), std::vector<float>(p.state.size()), std::vector<std::uint16_t>(p.history.size())};
         ck(hipMemcpy(o.rows.data(), rows, o.rows.size() * 4U, hipMemcpyDeviceToHost), "down rows");
         ck(hipMemcpy(o.state.data(), state, o.state.size() * 4U, hipMemcpyDeviceToHost), "down state");
         ck(hipMemcpy(o.history.data(), history, o.history.size() * 2U, hipMemcpyDeviceToHost), "down history");
+        fold(o.rows.data(), o.rows.size() * 4U); fold(o.state.data(), o.state.size() * 4U);
+        fold(o.history.data(), o.history.size() * 2U);
         return o;
     }
 };
@@ -468,6 +482,14 @@ int time_main() {
     const float scan16 = median([&] {
         enqueue_gdn_fp16_chunk_scan<GdnRecurrentStorage::value_key>(scratch, d.view, p.count, d.state, conv16, 16U, 48U, nullptr, norm);
     });
+    const TestNormT<false> lane_norm{d.view, d.norm, kNormEps};
+    const float lane16 = median([&] {
+        enqueue_gdn_fp16_chunk_scan<GdnRecurrentStorage::value_key>(scratch, d.view, p.count, d.state, conv16, 16U, 48U, nullptr, lane_norm);
+    });
+    const float lane = median([&] {
+        enqueue_gdn_fp16_chunk_scan<GdnRecurrentStorage::value_key>(scratch, d.view, p.count, d.state, conv, 16U, 48U, nullptr, lane_norm);
+    });
+    std::printf("time per-lane rows policy: scan+norm %.3f ms | BF16 rows scan+norm %.3f\n", lane, lane16);
     std::printf("time T8192 48/16 (median of 20): prep %.3f ms | scan+norm %.3f ms | scan raw %.3f ms | total %.3f ms | "
         "BF16 rows: prep %.3f scan+norm %.3f\n", prep, scan, raw, total, prep16, scan16);
     // Payload hash (every row's columns up to the tight width, and the state): equal for every stride.
@@ -552,6 +574,7 @@ int main(int argc, char** argv) {
     }
     std::printf("screen maxima: output relL2 %.6e max %.6e | state relL2 %.6e max %.6e | head relL2 %.6e max %.6e\n",
         worst_out.rel_l2, worst_out.maxrel, worst_state.rel_l2, worst_state.maxrel, worst_head.rel_l2, worst_head.maxrel);
+    std::printf("readback digest %016llx\n", static_cast<unsigned long long>(Device::digest));
     std::printf(failures ? "FAILED %d\n" : "all passed\n", failures);
     return failures ? 1 : 0;
 }
