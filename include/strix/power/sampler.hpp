@@ -181,7 +181,16 @@ public:
     struct Cover { double joules = 0.0; std::int64_t ns = 0; double peak = 0.0; };
     using Covers = std::vector<std::array<Cover, 2>>;  // per hardware group: counter, power
     // Only observed combinations are stored; each group has counter bit 1 and power bit 2.
-    using Joint = std::map<std::vector<unsigned char>, std::int64_t>;
+    // Ordered by length, then bytewise over that explicit length. The default vector ordering lowers to a memcmp whose
+    // bound comes from a pointer difference, which GCC 13 at -O3 cannot bound (-Wstringop-overread).
+    struct MaskLess {
+        bool operator()(const std::vector<unsigned char>& a, const std::vector<unsigned char>& b) const noexcept {
+            if (a.size() != b.size()) return a.size() < b.size();
+            for (std::size_t i = 0; i < a.size(); ++i) if (a[i] != b[i]) return a[i] < b[i];
+            return false;
+        }
+    };
+    using Joint = std::map<std::vector<unsigned char>, std::int64_t, MaskLess>;
 
 private:
     void run();
