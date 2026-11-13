@@ -2264,14 +2264,12 @@ private:
     double step_decode_ms_ = 0.0, step_prompt_ms_ = 0.0, step_suspended_ms_ = 0.0;
     // The shared step planner: on unless STRIX_SERVE_STEP_PLANNER=0 or the baseline mode.
     bool step_planner_enabled() const {
-        static const bool off = [] {const char* v = std::getenv("STRIX_SERVE_STEP_PLANNER");return v && v[0] == '0' && v[1] == 0;}();
+        static const bool off = !strix::envcfg::flag("STRIX_SERVE_STEP_PLANNER", true, strix::EnvFlagMatch::exact);
         return !off && !options_.baseline;
     }
     // STRIX_SERVE_DECODE_GAP_MS: with the planner on, the longest a prompt unit may hold up the decoders (0 = no bound).
     double step_decode_gap_ms_ = [] {
-        const char* v = std::getenv("STRIX_SERVE_DECODE_GAP_MS");
-        const double x = v ? std::atof(v) : 0.0;
-        return x > 0.0 ? x : 0.0;
+        return strix::envcfg::number<double>("STRIX_SERVE_DECODE_GAP_MS", 0.0, 0.0, 3600000.0);
     }();
     // STRIX_SERVE_RECEIPT=1: a prompt unit ran in the current step; receipt line numbering.
     bool step_prompt_ran_ = false;
