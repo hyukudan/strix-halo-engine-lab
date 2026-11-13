@@ -109,11 +109,18 @@ void set_fast_moe(int mode);
 // Overrides are for test harnesses.
 void set_fast_i4(int mode); // 1 on, 0 off, -1 environment
 [[nodiscard]] bool fast_i4();
-// STRIX_DS41_PF_CORE=1 (default off): the expert prefill (gate/up, down) and the dense Q8_0 x A8 prefill run on the
-// shared tiled core (src/core, policy interface v1) instead of the kernels described above. The same bits; opt-in
-// until it is at least as fast. Test override: 1 on, 0 off, -1 environment.
+// STRIX_DS41_PF_CORE: which prefill products run on the shared tiled core (src/core, policy interface v1) instead of
+// the kernels described above: 0 none, moe (expert gate/up and down), dense (dense Q8_0 x A8), 1 both. Unset: per form,
+// the shared core where it is measured faster (today the Q8_0 gate/up and down of the shared expert in 16-row batches,
+// FAST_MOE off, STRIX_DS41_PREFILL_STAGE not 1). The same bits. Resolved once per run; any other value (the empty one
+// included) throws std::invalid_argument at the first product.
+// Harness override, may change between calls: set_pf_core(1 every product / 0 none / -1 back to the environment), or
+// by policy name: "0", "1", "moe", "dense", nullptr = the per-form default (as if unset). pf_core / pf_core_dense: the
+// product is named on.
 void set_pf_core(int mode);
-[[nodiscard]] bool pf_core();
+void set_pf_core(const char* policy);
+[[nodiscard]] bool pf_core();       // expert products (gate/up, down)
+[[nodiscard]] bool pf_core_dense(); // dense Q8_0 x A8 products
 
 // Down of every entry: A8 activation of slot entry_slots[i] (codes[slot * width], deltas) times the
 // batch expert's rows; out[slot * outputs + o] is the unweighted raw slot vector. Formats Q2_K,

@@ -27,6 +27,7 @@
 
 #include "hip_ds41_prepared_load.hpp"
 
+#include "core/hip_range_weight_loader.hpp"
 #include <hip/hip_runtime.h>
 
 #include <algorithm>
@@ -265,44 +266,13 @@ double seconds_since(std::chrono::steady_clock::time_point t) {
     return std::chrono::duration<double>(std::chrono::steady_clock::now() - t).count();
 }
 
-// Byte ranges of the model file into device memory through a pinned staging buffer, read with O_DIRECT so the
-// weights never enter the page cache (resident weights + a cached copy would not fit next to each other).
-class DirectLoader {
-public:
-    static constexpr std::uint64_t align = 4096, chunk = 256ULL << 20U;
-    explicit DirectLoader(const std::filesystem::path& path) {
-        fd_ = ::open(path.c_str(), O_RDONLY | O_CLOEXEC | O_DIRECT);
-        if (fd_ < 0) fd_ = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
-        if (fd_ < 0) throw std::runtime_error("deepseek41 device forward: cannot open " + path.string());
-        strix::LoaderCapture::record(path, fd_);
-        check(hipHostMalloc(reinterpret_cast<void**>(&buffer_), chunk + 2U * align, hipHostMallocDefault), "staging buffer");
+// Byte ranges of the model file into device memory through the shared weight-load queue (core/weight_load_queue.hpp):
+// O_DIRECT reads on bounded workers, per-ticket pinned staging retired by upload events, an own non-blocking copy
+// stream. load() only queues; ready() is the one wait, at the end of the load or before the first consumer.
+struct DirectLoader : strix::core::HipRangeWeightLoader {
+    explicit DirectLoader(const std::filesystem::path& path) : HipRangeWeightLoader(path.string()) {
+        strix::LoaderCapture::record(path, fd());
     }
-    ~DirectLoader() {
-        if (buffer_ != nullptr) (void)hipHostFree(buffer_);
-        if (fd_ >= 0) ::close(fd_);
-    }
-    DirectLoader(const DirectLoader&) = delete;
-    DirectLoader& operator=(const DirectLoader&) = delete;
-    void load(std::uint64_t offset, std::uint64_t bytes, std::uint8_t* device) {
-        std::uint64_t done = 0;
-        while (done < bytes) {
-            const std::uint64_t at = offset + done, base = at & ~(align - 1U), lead = at - base;
-            const std::uint64_t take = std::min(bytes - done, chunk - lead);
-            const std::uint64_t want = (lead + take + align - 1U) & ~(align - 1U);
-            std::uint64_t got = 0;
-            while (got < lead + take) {
-                const auto n = ::pread(fd_, buffer_ + got, want - got, static_cast<off_t>(base + got));
-                if (n <= 0) throw std::runtime_error("deepseek41 device forward: short read of the weights");
-                got += static_cast<std::uint64_t>(n);
-            }
-            check(hipMemcpy(device + done, buffer_ + lead, take, hipMemcpyHostToDevice), "weight upload");
-            done += take;
-        }
-    }
-
-private:
-    int fd_ = -1;
-    std::uint8_t* buffer_ = nullptr;
 };
 
 // FNV of the live window of a ring (slot = position % capacity): positions max(0, T - window) .. T - 1 in order (older
@@ -626,6 +596,7 @@ DeviceForward::DeviceForward(const std::filesystem::path& gguf, const DeviceForw
     DirectLoader loader(gguf);
     std::unique_ptr<DirectLoader> overlay_loader;
     if (m.overlay) overlay_loader = std::make_unique<DirectLoader>(m.overlay->path());
+    const std::function<void()> loaded = [&] { loader.ready(); if (overlay_loader) overlay_loader->ready(); };
     ds41::prepared::HipLoader prepared(gguf, m.overlay ? m.overlay->path() : std::filesystem::path{}, m.model, options.rank, options.world, m.expert_tp, &options.trellis, &options.trellis_sites);
     std::unique_ptr<ds41::SafetensorsCheckpoint> checkpoint;
     std::vector<std::string> fp8_classes;
@@ -671,7 +642,7 @@ DeviceForward::DeviceForward(const std::filesystem::path& gguf, const DeviceForw
             Dev<std::uint8_t> d(ds41::expert_tp::part_bytes(bytes, cfg.n_routed_experts, down, cfg.hidden_size));
             auto& from = over != nullptr ? *overlay_loader : loader;
             ds41::expert_tp::load_part([&](std::uint64_t o, std::uint64_t b, std::uint8_t* dst) { from.load(o, b, dst); }, offset, bytes,
-                                       cfg.n_routed_experts, down, cfg.hidden_size, options.rank, d.p, m.stream);
+                                       cfg.n_routed_experts, down, cfg.hidden_size, options.rank, d.p, m.stream, loaded);
             m.weights.emplace(n, std::move(d));
             continue;
         }
@@ -742,6 +713,7 @@ DeviceForward::DeviceForward(const std::filesystem::path& gguf, const DeviceForw
         (over != nullptr ? *overlay_loader : loader).load(offset, bytes, d.p);
         m.weights.emplace(n, std::move(d));
     }
+    loaded();  // end-of-load publication: the one wait for every tensor queued above
     prepared.report();
     ds41::prepared::device_hashes(m.weights, options.rank, m.stream);
     // The declared identities of the steps on native FP8 weights (the shared expert only with all three tensors).

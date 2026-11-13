@@ -27,6 +27,7 @@ struct Args {
     const float* x;
     unsigned in, rows, tile0, count;
     Segment seg[kDenseGroupMax];
+    unsigned skip_idle;  // row waves without a live row skip their WMMAs (core::f16_dense_tall::tail_policy)
 };
 struct Columns {
     const Args& a;
@@ -43,8 +44,8 @@ struct Columns {
 };
 
 template <unsigned TC> __global__ __launch_bounds__(256) void dense_kernel(Args a) {
-    __shared__ core::f16_dense_tall::Storage lds;
-    core::f16_dense_tall::core<TC>(a.x, a.in, a.rows, Columns{a}, lds);
+    __shared__ core::f16_dense_tall::Storage<TC> lds;
+    core::f16_dense_tall::core<TC>(a.x, a.in, a.rows, Columns{a}, lds, core::f16_dense_tall::RawStore{}, a.skip_idle != 0U);
 }
 
 // True if the shapes fit the core (FP16 weights, in % 128 == 0, every n a positive multiple of 16).
@@ -57,20 +58,25 @@ inline bool supported(dev::WType wt, unsigned in, const DenseProj* p, unsigned c
 }
 
 // y_i[r][o] for every projection i; the caller checked supported(). 16-tile CTA columns first, the remainder in
-// 4-tile columns.
+// the column width core::f16_dense_tall::plan picks.
 inline void dense_group(const float* x, unsigned in, const DenseProj* p, unsigned count, unsigned rows, hipStream_t s) {
-    Args a{x, in, rows, 0U, count, {}};
+    const bool tail = core::f16_dense_tall::tail_policy();
+    Args a{x, in, rows, 0U, count, {}, tail ? 1U : 0U};
     unsigned tiles = 0;
     for (unsigned i = 0; i < count; ++i) {
         a.seg[i] = {static_cast<const _Float16*>(p[i].w) + static_cast<std::size_t>(p[i].o0) * in, p[i].y, p[i].n};
         tiles += p[i].n / 16U;
     }
     const unsigned gx = (rows + core::f16_dense_tall::kRows - 1U) / core::f16_dense_tall::kRows;
-    const unsigned full = tiles / 16U, rest = tiles % 16U;
-    if (full) dense_kernel<16><<<dim3(gx, full), 256, 0, s>>>(a);
-    if (rest) {
-        a.tile0 = full * 16U;
-        dense_kernel<4><<<dim3(gx, (rest + 3U) / 4U), 256, 0, s>>>(a);
+    const core::f16_dense_tall::Plan pl = core::f16_dense_tall::plan(tiles, rows, tail);
+    if (pl.full) dense_kernel<16><<<dim3(gx, pl.full), 256, 0, s>>>(a);
+    a.tile0 = pl.full * 16U;
+    const dim3 grid(gx, pl.gy);
+    switch (pl.tc) {
+    case 4: dense_kernel<4><<<grid, 256, 0, s>>>(a); break;
+    case 2: dense_kernel<2><<<grid, 256, 0, s>>>(a); break;
+    case 1: dense_kernel<1><<<grid, 256, 0, s>>>(a); break;
+    default: break;
     }
     const hipError_t e = hipGetLastError();
     if (e != hipSuccess) throw std::runtime_error(std::string("glm pf kda wmma dense: ") + hipGetErrorString(e));

@@ -48,7 +48,8 @@ environment variable, the shipped value, the value that restores the previous pa
 | glm-pair | pf-kda-scan-v5 | `STRIX_GLM_PF_KDA_SCAN` | 5 | 1 | Measurement: KDA scan v5 (quad-DPP tree, batch fill off the serial path) bitwise == v3 / v1 and decode, 1.84-1.86 -> 1.18-1.20 us/row per KDA layer at t0 0..28672 (v3 1.23-1.25; =3 restores v3) |
 | glm-pair | pf-indexer-v3 | `STRIX_GLM_PF_IDX` | 3 | 1 | Measurement: indexer scores v3 same keys as v2, 5.3 vs 9.6 us/row per DSA layer at t0 28672 (=2 restores v2) |
 | glm-pair | pf-select-v2 | `STRIX_GLM_PF_SELECT` | 2 | 1 | Measurement: indexer select v2 same token lists as v1, 0.38 vs 0.99 us/row at t0 28672, 0.08 vs 0.50 at t0 4096 |
-| glm-pair | pf-dense-rows-v3 | `STRIX_GLM_PF_DENSE_ROWS` | 3 | 1 | Measurement: prefill dense rows v3 groups the projections of one input (KDA f_a / g_a / b, DSA wk / gate / weights_proj) in one 128 x 64 launch, same ascending fmaf chain, bitwise == v2; grouped calls 6.77 vs 9.33 ms (KDA) and 6.62 vs 8.98 ms (DSA) at 8192 rows; TTFT 14.34 -> 14.29 s at 8,192 tokens (=2 restores v2, =1 v1) |
+| glm-pair | pf-dense-rows-v4 | `STRIX_GLM_PF_DENSE_ROWS` | 4 | 1 | Measurement: prefill dense rows v4 runs the exact projections on the shared FMA-rows core, same ascending fmaf chain, bitwise == v3; exact two-node prefill 12.68 / 12.69 s vs 12.81 s at 8,192 tokens, logits / state / token hashes equal (=3 restores v3). Dense rows v3 groups the projections of one input (KDA f_a / g_a / b, DSA wk / gate / weights_proj) in one 128 x 64 launch, same ascending fmaf chain, bitwise == v2; grouped calls 6.77 vs 9.33 ms (KDA) and 6.62 vs 8.98 ms (DSA) at 8192 rows; TTFT 14.34 -> 14.29 s at 8,192 tokens (=2 restores v2, =1 v1) |
+| glm-pair | pf-dense-form-auto | `STRIX_GLM_PF_DENSE_FORM` | 0 | 0 | Guard: physical form of dense rows v4 (shared FMA-rows core), read only with STRIX_GLM_PF_DENSE_ROWS=4: 0 selects the form per shape, 1..7 force one form where the shape admits it (diagnostic; every form gives the same bytes) |
 | glm-pair | max-rows-auto | `STRIX_GLM_MAX_ROWS_AUTO` | 1 | 0 | Measurement: exact 8192 vs 4096 rows, 8K TTFT -4 %, 32K 116.3 -> 109.9 s (-5.5 %); +7.3 GiB per rank |
 | glm-pair | pf-staged | `STRIX_GLM_PF_STAGED` | 1 | 0 | Measurement: pipelined prefill exchanges through the coherent staging views; pair ABBA -0.8 % 1K / -0.9 % 8K TTFT, logits bitwise |
 | glm-pair | pf-hc-fuse | `STRIX_GLM_PF_HC_FUSE` | 1 | 0 | Measurement: mHC expand + next-site norm fused (F not materialised), logits bitwise; pair ABBA x2 -1.1 % 1K / -1.3 % 8K TTFT |
@@ -108,6 +109,7 @@ environment variable, the shipped value, the value that restores the previous pa
 | minimax-pair | dist_crc_parallel | `STRIX_DIST_CRC_PARALLEL` | 1 | 0 | Host transport measurement: ABA x3 TTFT 1K -12.8 %, decode -1 %, bits unchanged |
 | minimax-pair | dist_host_crc_overlap | `STRIX_DIST_HOST_CRC_OVERLAP` | 1 | 0 | Host transport measurement: ABA x3 TTFT 1K -12.8 %, decode -1 %, bits unchanged |
 | minimax-pair | dist_host_chunk | `STRIX_DIST_HOST_CHUNK_BYTES` | 1048576 | 0 | Host transport measurement: ABA x3 TTFT 1K -12.8 %, decode -1 %, bits unchanged |
+| minimax-pair | pfx_joined | `STRIX_MM_PFX_JOINED` | 1 | 0 | Prefill exchange wire form: identity and CRC list ride with the last chunk (two rendezvous fewer per message); payload bytes unchanged |
 | qwen | STRIX_QPF2K_SCHED | `STRIX_QPF2K_SCHED` | 14 | 0 | STRIX_QPF2K_SCHED |
 | qwen | STRIX_QPF2K_DENSE | `STRIX_QPF2K_DENSE` | 1 | 0 | STRIX_QPF2K_DENSE |
 | qwen | STRIX_QPF2K_GDN | `STRIX_QPF2K_GDN` | 1 | 0 | STRIX_QPF2K_GDN |

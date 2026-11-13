@@ -1,9 +1,11 @@
 #include "vision_adapter.hpp"
 
+#include <algorithm>
 #include <bit>
 #include <cmath>
 #include <cstddef>
 #include <cstdio>
+#include <limits>
 #include <stdexcept>
 #include <utility>
 #include <vector>
@@ -12,6 +14,11 @@ namespace strix::deepseek41 {
 namespace {
 
 [[noreturn]] void bad(const std::string& what) { throw std::invalid_argument("deepseek41 vision: " + what); }
+
+std::int64_t checked_size(double value) {
+    if (!std::isfinite(value) || value < 0.0 || value >= 0x1p63) bad("resize size is out of range");
+    return static_cast<std::int64_t>(value);
+}
 
 const char* filter_name(vision::Filter f) {
     switch (f) {
@@ -42,12 +49,14 @@ void copy_row(const vision::Tensor& row, std::uint16_t* dst, std::size_t width) 
 std::string VisionRecipe::id() const {
     // Exact float bits: two recipes that differ in the last place normalise pixels differently, so they are two keys.
     const auto bits = [](float v) { return std::bit_cast<std::uint32_t>(v); };
-    char text[192];
-    std::snprintf(text, sizeof text, "m%08x,%08x,%08x-s%08x,%08x,%08x-%s%s-g%d-p%d-a%d-u%d-n%d", bits(mean[0]), bits(mean[1]),
+    // "r2": the resize rule (patch-multiple canvas, contain + grey margin, partial 3x3 cells completed with zeros).
+    char text[224];
+    std::snprintf(text, sizeof text, "m%08x,%08x,%08x-s%08x,%08x,%08x-%s%s-g%d-p%d-a%d-u%d-n%d-r2-f%d-b%d", bits(mean[0]), bits(mean[1]),
                   bits(mean[2]), bits(stddev[0]), bits(stddev[1]), bits(stddev[2]), filter_name(resampler.filter),
                   resampler.antialias ? "-aa" : "", swiglu_gate_first ? 1 : 0,
                   rope_pairing == vision::EncoderConfig::RopePairing::half ? 0 : 1, static_cast<int>(aligner_activation),
-                  unshuffle_row_major ? 1 : 0, newline_after_last_row ? 1 : 0);
+                  unshuffle_row_major ? 1 : 0, newline_after_last_row ? 1 : 0, static_cast<int>(pad_fill),
+                  pixels_bf16 ? 1 : 0);
     return text;
 }
 
@@ -59,6 +68,8 @@ VisionAdapter::VisionAdapter(VisionConfig config, std::string weights_sha256_hex
         bad("incomplete configuration");
     // The file states no rule for a bounded aspect ratio; refuse one instead of guessing it.
     if (config_.max_wh_ratio != 0) bad("a bounded width/height ratio is not supported");
+    // The resize planner reserves a final newline even for recipes that omit it.
+    if (config_.max_image_tokens < 4) bad("image token budget must fit at least four span rows");
     for (const float m : recipe_.mean)
         if (!std::isfinite(m)) bad("recipe mean");
     for (const float s : recipe_.stddev)
@@ -99,9 +110,14 @@ unsigned VisionAdapter::span_rows(unsigned grid_h, unsigned grid_w) const noexce
     return grid_h * grid_w + newlines + 2U;
 }
 
-// A one-column grid has as many row ends as image rows.
-unsigned VisionAdapter::max_span_rows() const noexcept {
-    return 2U * config_.max_image_tokens + (recipe_.newline_after_last_row ? 2U : 1U);
+// The limit of the checkpoint counts the whole span: image rows, row ends, start and end.
+unsigned VisionAdapter::max_span_rows() const noexcept { return config_.max_image_tokens; }
+
+vision::MergedGrid VisionAdapter::checked_grid(const vision::PatchGrid& grid) const {
+    const auto merged = vision::checked_merged_grid(grid, config_.downsample_ratio, max_span_rows(), true);
+    const auto newlines = merged.grid_h - (recipe_.newline_after_last_row ? 0U : 1U);
+    if (std::uint64_t{merged.tokens} + newlines + 2U > max_span_rows()) bad("the image span exceeds the row limit");
+    return merged;
 }
 
 std::uint64_t VisionAdapter::projector_weight_elements() const noexcept {
@@ -111,7 +127,7 @@ std::uint64_t VisionAdapter::projector_weight_elements() const noexcept {
 
 vision::ResizeRule VisionAdapter::resize() const {
     vision::ResizeRule r;
-    r.multiple = config_.cell();
+    r.multiple = config_.patch_size;
     r.min_pixels = config_.min_pixels;
     r.max_pixels = std::uint64_t{config_.max_image_tokens} * config_.cell() * config_.cell();
     r.max_rows = max_span_rows();
@@ -119,25 +135,46 @@ vision::ResizeRule VisionAdapter::resize() const {
     return r;
 }
 
-vision::ResizePolicy VisionAdapter::resize_policy() const {
-    const vision::ResizeRule rule = resize();
-    vision::ResizePolicy p;
-    p.kind = vision::ResizePolicy::Kind::smart;
-    p.factor = static_cast<int>(rule.multiple);
-    p.min_pixels = static_cast<double>(rule.min_pixels);
-    p.max_pixels = static_cast<double>(rule.max_pixels);
-    p.resampler = recipe_.resampler;
-    return p;
-}
-
 vision::Size VisionAdapter::target(int width, int height) const {
-    const vision::Size t = resize_policy().target(width, height);
-    const auto cell = static_cast<std::int64_t>(config_.cell());
-    const std::int64_t tokens = (t.width / cell) * (t.height / cell);
-    // Both bounds cannot hold for a very elongated image (one cell high and still over the token limit).
-    if (t.width <= 0 || t.height <= 0 || t.width % cell != 0 || t.height % cell != 0 || tokens > config_.max_image_tokens)
-        bad("the image aspect ratio does not fit " + std::to_string(config_.max_image_tokens) + " image rows");
-    return t;
+    if (width <= 0 || height <= 0) bad("empty image");
+    // The reference processor computes this plan in Python: integers where it has integers, IEEE doubles (true
+    // division, pow(x, 0.5), sqrt, floor) where it has floats. The same operations in the same order here.
+    const std::int64_t patch = config_.patch_size, cell = config_.cell(), limit = config_.max_image_tokens;
+    const std::int64_t down = config_.downsample_ratio;
+    std::int64_t w = width, h = height;
+    if (static_cast<std::uint64_t>(w * h) < config_.min_pixels) {
+        const double ratio = std::pow(static_cast<double>(config_.min_pixels) / static_cast<double>(w * h), 0.5);
+        w = checked_size(static_cast<double>(w) * ratio);  // int(): truncation
+        h = checked_size(static_cast<double>(h) * ratio);
+    }
+    const auto span = [&](std::int64_t canvas_h, std::int64_t canvas_w) {
+        const std::int64_t mh = (canvas_h / patch + down - 1) / down, mw = (canvas_w / patch + down - 1) / down;
+        return mh * (mw + 1) + 2;
+    };
+    std::int64_t best_w = (w + patch - 1) / patch * patch, best_h = (h + patch - 1) / patch * patch;
+    if (span(best_h, best_w) > limit) {
+        const double r = static_cast<double>(h) / static_cast<double>(w);
+        const double max_w = std::sqrt(static_cast<double>(limit - 2) / r + 0.25) - 0.5;
+        const double max_h = max_w * r;
+        if (!std::isfinite(max_w) || !std::isfinite(max_h)) bad("resize size is out of range");
+        if (max_w < 1.0) {  // very tall: one column
+            best_h = (limit - 2) / 2 * cell;
+            best_w = cell;
+        } else if (max_h < 1.0) {  // very wide: one row
+            best_h = cell;
+            best_w = (limit - 3) * cell;
+        } else {
+            const double beta = std::min(std::floor(max_w) * static_cast<double>(cell) / static_cast<double>(w),
+                                         std::floor(max_h) * static_cast<double>(cell) / static_cast<double>(h));
+            const double scaled_h = static_cast<double>(h) * beta, scaled_w = static_cast<double>(w) * beta;
+            best_h = checked_size(std::floor(scaled_h / static_cast<double>(patch))) * patch;
+            best_w = checked_size(std::floor(scaled_w / static_cast<double>(patch))) * patch;
+        }
+    }
+    if (best_w <= 0 || best_h <= 0 || best_w > std::numeric_limits<int>::max() ||
+        best_h > std::numeric_limits<int>::max() || span(best_h, best_w) > limit)
+        bad("the image does not fit " + std::to_string(config_.max_image_tokens) + " span rows");
+    return {static_cast<int>(best_w), static_cast<int>(best_h)};
 }
 
 vision::PatchGrid VisionAdapter::patches(const vision::Image& image) const {
@@ -146,10 +183,11 @@ vision::PatchGrid VisionAdapter::patches(const vision::Image& image) const {
     // Before any resample or allocation: the grid must fit the 16-bit patch coordinates of the shared representation.
     vision::check_grid_axes(static_cast<std::uint64_t>(t.height) / config_.patch_size,
                             static_cast<std::uint64_t>(t.width) / config_.patch_size);
-    const vision::Image resized = image.width == t.width && image.height == t.height
-                                      ? image
-                                      : vision::resize(image, t.width, t.height, recipe_.resampler);
-    const std::vector<float> pixels = vision::normalize(resized, recipe_.mean, recipe_.stddev);
+    // The image keeps its aspect ratio: fitted inside the canvas, centred, the margin filled with grey.
+    const vision::Image canvas = vision::resize_contain_pad(
+        image, t.width, t.height, {recipe_.pad_fill, recipe_.pad_fill, recipe_.pad_fill}, recipe_.resampler);
+    const std::vector<float> pixels =
+        vision::normalize_div255(canvas, recipe_.mean, recipe_.stddev, recipe_.pixels_bf16);
     const float* frame = pixels.data();
     vision::PatchSpec spec;
     spec.patch = static_cast<int>(config_.patch_size);
@@ -169,7 +207,7 @@ vision::PatchGrid VisionAdapter::patches(const vision::Image& image) const {
         g.y[r] = static_cast<std::uint16_t>(r / g.grid_w);
         g.x[r] = static_cast<std::uint16_t>(r % g.grid_w);
     }
-    (void)vision::checked_merged_grid(g, config_.downsample_ratio, config_.max_image_tokens);
+    (void)checked_grid(g);
     return g;
 }
 
@@ -209,19 +247,21 @@ void VisionAdapter::project(vision::EncoderOutput& hidden, const vision::PatchGr
                             vision::ProjectedRows& out) {
     if (!aligner_w1_) bad("project() before bind()");
     const unsigned R = config_.downsample_ratio, W = config_.hidden_size, P = config_.projection_size;
-    const vision::MergedGrid merged_grid = vision::checked_merged_grid(grid, R, config_.max_image_tokens);
+    const vision::MergedGrid merged_grid = checked_grid(grid);
     if (hidden.width != W || hidden.rows != grid.rows || hidden.hidden.size() != std::size_t{hidden.rows} * W)
         bad("the encoder output does not match the patch grid");
     const unsigned mh = merged_grid.grid_h, mw = merged_grid.grid_w, tokens = merged_grid.tokens;
     const std::size_t in = std::size_t{W} * R * R;
 
-    // Pixel unshuffle on the raster grid: merged row (my, mx), feature c * R * R + (dy, dx).
+    // Pixel unshuffle on the raster grid: merged row (my, mx), feature c * R * R + (dy, dx). A grid that is not a
+    // multiple of R is completed with zero rows on the right and at the bottom (the vector starts as zeros).
     std::vector<float> merged(std::size_t{tokens} * in);
     for (unsigned my = 0; my < mh; ++my)
         for (unsigned mx = 0; mx < mw; ++mx) {
             float* dst = &merged[(std::size_t{my} * mw + mx) * in];
             for (unsigned dy = 0; dy < R; ++dy)
                 for (unsigned dx = 0; dx < R; ++dx) {
+                    if (my * R + dy >= grid.grid_h || mx * R + dx >= grid.grid_w) continue;
                     const float* src = &hidden.hidden[(std::size_t{my * R + dy} * grid.grid_w + mx * R + dx) * W];
                     const unsigned slot = recipe_.unshuffle_row_major ? dy * R + dx : dx * R + dy;
                     for (unsigned c = 0; c < W; ++c) dst[std::size_t{c} * R * R + slot] = src[c];
@@ -264,8 +304,7 @@ vision::EncoderOptions VisionAdapter::device_options() const {
 }
 
 vision::SpanLayout VisionAdapter::layout(const vision::PatchGrid& grid) const {
-    const unsigned R = config_.downsample_ratio;
-    const vision::MergedGrid merged = vision::checked_merged_grid(grid, R, config_.max_image_tokens);
+    const vision::MergedGrid merged = checked_grid(grid);
     using Role = vision::SpanLayout::Role;
     vision::SpanLayout s;
     s.grid_h = merged.grid_h;

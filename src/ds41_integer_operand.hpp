@@ -46,7 +46,9 @@ struct Ds41PrefillTraits {
 template<WeightFormat F, bool Fast = false, bool Relaxed = false, bool Down = false>
 using Contract = strix::core::IntegerContract<strix::core::IntegerOperand<Ds41PrefillTraits, F, Fast,
     std::conditional_t<!Fast && !Relaxed && F != WeightFormat::mxfp4,
-        strix::core::GroupedIntegerPlan<Down ? STRIX_DS41_SPLIT_DOWN_WAVES : STRIX_DS41_SPLIT_WAVES, Down>,
+        // split stage for down only (rank fixture: Q2_K down from +2..+6 % to +1 %, Q8_0 down -5 -> -7 % against the DeepSeek
+        // kernels; gate/up loses ~1 % with it)
+        strix::core::GroupedIntegerPlan<Down ? STRIX_DS41_SPLIT_DOWN_WAVES : STRIX_DS41_SPLIT_WAVES, Down, Down>,
         strix::core::IntegerPlan>>, Relaxed>;
 // Header instantiation only: no separate archive or library device link is needed.
 template<class C, int BN, class Adapter>

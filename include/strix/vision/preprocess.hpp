@@ -63,6 +63,15 @@ struct ResizePolicy {
 
 // Centre the image on a width x height canvas filled with `fill` (canvas must not be smaller than the image).
 [[nodiscard]] Image pad_center(const Image& image, int width, int height, std::array<std::uint8_t, 3> fill);
+// Largest size of the image's aspect ratio inside the canvas (PIL `ImageOps.contain`): one side is the canvas side,
+// the other is rounded half to even and is 0 when an extreme aspect ratio leaves less than half a pixel.
+// Requires FE_TONEAREST (the default floating-point rounding mode) for half-even sizing.
+[[nodiscard]] Size contain_size(int width, int height, int canvas_width, int canvas_height);
+// PIL `ImageOps.pad(image, (canvas_width, canvas_height), method, color=fill)`: contain-resize, then centre on the
+// canvas; the margin offset is rounded half to even (pad_center rounds it down). Bit-equal to PIL with antialias.
+// An image whose contained size has a zero side leaves the canvas all `fill`, as PIL does.
+[[nodiscard]] Image resize_contain_pad(const Image& image, int canvas_width, int canvas_height,
+                                       std::array<std::uint8_t, 3> fill, Resampler resampler = {});
 // Raster-order tiles of tile_width x tile_height (the image size must be a multiple of the tile size).
 [[nodiscard]] std::vector<Image> tile(const Image& image, int tile_width, int tile_height);
 
@@ -70,6 +79,11 @@ struct ResizePolicy {
 
 // [h][w][3] fp32: (v / 255 - mean[c]) / std[c].
 [[nodiscard]] std::vector<float> normalize(const Image& image, std::array<float, 3> mean, std::array<float, 3> std);
+// [h][w][3] fp32: (v / 255 - mean[c]) / std[c] with a true FP32 division by 255 (the order of a PyTorch
+// `x / 255` processor; `normalize` multiplies by the reciprocal, which differs in the last place for some levels),
+// then each value rounded to the nearest BF16 value (ties to even) when round_bf16 is set.
+[[nodiscard]] std::vector<float> normalize_div255(const Image& image, std::array<float, 3> mean, std::array<float, 3> std,
+                                                  bool round_bf16);
 // In place on [n][3] fp32 samples: (v - mean[c]) / std[c].
 void normalize_inplace(std::span<float> rgb, std::array<float, 3> mean, std::array<float, 3> std);
 

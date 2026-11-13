@@ -36,7 +36,19 @@ bool iu4_fuse_quant() {
 // STRIX_GLM_I4_CHAIN_GSAVE=1 (default off): the full INT4 chain lends its gate/up rows as the paired GEMM's pass-0
 // gate scratch, so gate/up and down share one plan and one tile list (STRIX_MOE_I4_CHAIN_GSAVE=0 still forces the
 // register save). Same integers and bits in both forms.
-bool iu4_chain_gsave() { return strix::envcfg::flag("STRIX_GLM_I4_CHAIN_GSAVE", false); }
+// Both switches are resolved once per process (the registered flag reader does not cache); every MoE call reads the
+// resolved policy. Fixtures replace it with an explicit policy (iu4::set_chain_policy_for_test) instead of changing
+// the environment between calls.
+iu4::ChainPolicy i4_chain_policy_env() {
+    return {strix::core::moe_i4::gsave_enabled(), strix::envcfg::flag("STRIX_GLM_I4_CHAIN_GSAVE", false)};
+}
+std::atomic<int> i4_chain_test_policy{-1};  // -1: process policy; else bit 0 shared_gsave, bit 1 lend
+iu4::ChainPolicy i4_chain_policy() {
+    static const iu4::ChainPolicy process = i4_chain_policy_env();
+    const int t = i4_chain_test_policy.load(std::memory_order_relaxed);
+    return t < 0 ? process : iu4::ChainPolicy{(t & 1) != 0, (t & 2) != 0};
+}
+std::atomic<std::uint32_t> i4_chain_last{0};  // bit 31 valid, bit 8 gsave, bits 4..7 down, bits 0..3 paired
 void launch_i4_chain(Args a,unsigned grid_tiles,const moe::ExpertSlices& shared,const iu4::Layer& q,
     const iu4::Scratch& s,hipStream_t stream) {
     namespace st=strix::core;
@@ -46,9 +58,10 @@ void launch_i4_chain(Args a,unsigned grid_tiles,const moe::ExpertSlices& shared,
     // overwrites its rows before anything reads them (one stream, as in the gate/up-only call). With the scratch the
     // paired GEMM takes the down's plan and tile list. On this geometry (K 4096, N 1024) that form measured slower than
     // the register save (paired BM64, down BM128) at 64..192 rows per expert and on skewed routing, so the scratch is
-    // lent only on request (iu4_chain_gsave()); the default keeps the register save.
+    // lent only on request (i4_chain_policy().lend); the default keeps the register save.
     const size_t slots=size_t(a.rows)*P;
-    const auto cp=st::moe_i4::chain_plan<I4Binding>(iu4_plan(a.rows*8U,strix::core::moe_i4::kPlan2Rows),iu4_chain_gsave() ? slots*2*I : 0,slots);
+    const iu4::ChainPolicy pol=i4_chain_policy();
+    const auto cp=st::moe_i4::chain_plan<I4Binding>(iu4_plan(a.rows*8U,strix::core::moe_i4::kPlan2Rows),pol.shared_gsave,pol.lend ? slots*2*I : 0,slots);
     if(a.rows>s.max_rows || st::moe_i4::chain_max_tiles(cp,size_t(a.rows)*8,E)>s.max_tiles) throw std::logic_error("glm chain scratch too small");
     auto* tiles=static_cast<st::IU4GroupTile*>(s.tiles);
     st::moe_i4::Weights w{};
@@ -65,6 +78,7 @@ void launch_i4_chain(Args a,unsigned grid_tiles,const moe::ExpertSlices& shared,
     ok(hipGetLastError(),"chain gate/up input transform + quantiser");
     const auto run=st::moe_i4::launch_chain(cp,b,w,groups,E,tiles,s.ntiles,size_t(a.rows)*8,s.aq_gu,s.as_gu,s.aq_down,s.as_down,a.gu,stream);
     iu4_ok(run.status,run.stage);
+    i4_chain_last.store(0x80000000U | (run.ran.gsave ? 0x100U : 0U) | (unsigned(run.ran.down)<<4) | unsigned(run.ran.paired),std::memory_order_relaxed);
     // Shared expert retains its existing exact FP16 operand and WMMA-X arithmetic; the combine is the
     // control's ordered one (shared-down aux epilogue, or R16), not atomics.
     a.aux_act=false; a.aux_combine=aux::enabled_default_on("STRIX_GLM_PF_AUX_COMBINE");
@@ -90,7 +104,7 @@ void launch_i4_gate_up(Args a,unsigned grid_tiles,const moe::ExpertSlices& share
     wmma_x::iu4_moe_calls.fetch_add(1,std::memory_order_relaxed);
     a.aux_act=false; a.aux_combine=aux::enabled_default_on("STRIX_GLM_PF_AUX_COMBINE");
     const unsigned pairs=a.rows*P;
-    const auto cp=st::moe_i4::chain_plan<I4Binding>(iu4_plan(pairs),size_t(pairs)*2*I,pairs);
+    const auto cp=st::moe_i4::chain_plan<I4Binding>(iu4_plan(pairs),i4_chain_policy().shared_gsave,size_t(pairs)*2*I,pairs);
     const bool gsave=cp.gsave;
     const int plan=cp.paired;
     const auto max_tiles=unsigned(st::iu4_grouped_max_tiles(size_t(a.rows)*8,E,plan));

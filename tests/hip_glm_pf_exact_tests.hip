@@ -367,7 +367,10 @@ void exceptional(Ctx& cx) {
     }
     sok(strix_weights_destroy(l.w), "exception destroy");
 }
+// --shard I/N: run every N-th test_shape call (each shape seeds itself), so the gate fits several short runs.
+unsigned shard_index = 0, shard_count = 1, shape_seq = 0;
 void test_shape(Ctx& cx, const std::string& dir, const Shape& sh, bool synthetic, bool timing) {
+    if (shape_seq++ % shard_count != shard_index) return;
     const Lin l = prepare(cx, dir, sh, synthetic);
     const Linear prepared = engine_linear(l, false), raw = engine_linear(l, true);
     // 4096 only for representative real expert/MLA/KDA and one H128-partition shape.
@@ -557,8 +560,10 @@ int main(int argc, char** argv) {
     bool timing = true;
     for (int i = 1; i < argc; ++i) {
         if (std::string(argv[i]) == "--no-timing") timing = false;
+        else if (std::string(argv[i]) == "--shard" && i + 1 < argc &&
+                 std::sscanf(argv[++i], "%u/%u", &shard_index, &shard_count) == 2 && shard_index < shard_count) {}
         else if (dir.empty()) dir = argv[i];
-        else { std::fprintf(stderr, "usage: %s [TRELLIS_REAL_DIR] [--no-timing]\n", argv[0]); return 2; }
+        else { std::fprintf(stderr, "usage: %s [TRELLIS_REAL_DIR] [--no-timing] [--shard I/N]\n", argv[0]); return 2; }
     }
     if (dir.empty()) if (const char* p = std::getenv("TRELLIS_REAL_DIR")) dir = p;
     try {

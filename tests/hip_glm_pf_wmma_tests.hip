@@ -120,6 +120,7 @@ void arm_env(unsigned arm) {
     env("STRIX_GLM_PF_WMMA_LIVE_FRAG", arm == 6 ? "0" : "1");
     env("STRIX_GLM_PF_EXACTMOE_TM", nullptr);
     env("STRIX_GLM_PF_EXACTMOE_PLAN", nullptr);
+    env("STRIX_GLM_PF_AUX_COMBINE", "1");  // pinned: the shared pair slot is only meaningful with the separate combine
 }
 bool same_bits(const std::vector<float>& a, const std::vector<float>& b, const std::string& name) {
     const bool same = a.size() == b.size() && std::memcmp(a.data(), b.data(), a.size() * 4) == 0;
@@ -324,6 +325,34 @@ void moe(std::mt19937& rng, hipStream_t s, unsigned reps, bool classes_only) {
         };
         gate(drift(routed(res[0][2]), routed(res[1][2])), name + " pair-output", kF16L2, kF16Max);
         gate(drift(res[0][0], res[1][0]), name + " R16", kF16L2, kF16Max);
+        // The pinned fused combine really ran in both routes: the shared slot still holds the poison.
+        const auto shared_slot_unwritten = [&](const std::vector<float>& v) {
+            for (unsigned r = 0; r < R; ++r)
+                for (unsigned c = 0; c < H; ++c) {
+                    std::uint32_t bits;
+                    std::memcpy(&bits, &v[(std::size_t{r} * 9 + 8) * H + c], 4);
+                    if (bits != 0xffffffffU) return false;
+                }
+            return true;
+        };
+        check(shared_slot_unwritten(res[0][2]) && shared_slot_unwritten(res[1][2]), name + " fused combine leaves the shared pair slot unwritten");
+        // Separate combine (STRIX_GLM_PF_AUX_COMBINE=0): the shared expert writes its pair-output row, so all nine
+        // slots of every row are gated, shared slot included, and the final output again.
+        {
+            std::vector<float> po[2], o16[2];
+            for (unsigned arm = 0; arm < 2; ++arm) {
+                arm_env(arm);
+                env("STRIX_GLM_PF_AUX_COMBINE", "0");
+                ok(hipMemsetAsync(ws, 0xff, wsb, s), "poison"); ok(hipMemsetAsync(out, 0xff, std::size_t{MaxR + 1} * H * 4, s), "poison");
+                X::enqueue(v, plan, ws, wsb, s, 16); ok(hipStreamSynchronize(s), "run unfused");
+                o16[arm].resize(std::size_t{R} * H); ok(hipMemcpy(o16[arm].data(), out, o16[arm].size() * 4, hipMemcpyDeviceToHost), "o");
+                po[arm].resize(std::size_t{R} * 9 * H); ok(hipMemcpy(po[arm].data(), X::pair_output(ws, MaxR, 0), po[arm].size() * 4, hipMemcpyDeviceToHost), "po");
+            }
+            env("STRIX_GLM_PF_AUX_COMBINE", "1");
+            check(!shared_slot_unwritten(po[0]) && !shared_slot_unwritten(po[1]), name + " separate combine writes the shared pair slot");
+            gate(drift(po[0], po[1]), name + " pair-output separate combine (9 slots)", kF16L2, kF16Max);
+            gate(drift(o16[0], o16[1]), name + " R16 separate combine", kF16L2, kF16Max);
+        }
         for (unsigned arm = 0; arm < kArms; ++arm)
             if (!res_dev[arm].empty()) same_bits(res[arm][0], res_dev[arm], name + " arm " + std::to_string(arm) + " device plan");
         for (unsigned arm = 2; arm < kArms; ++arm)

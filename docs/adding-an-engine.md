@@ -112,6 +112,44 @@ and the receiver rewrites the ids with `remap_embed_ids`.
 A prompt without virtual ids takes the same path as before, with or without a bound
 table: ids, state and results are unchanged.
 
+#### Serving media through the API
+
+The API layer needs one object per media kind, `ApiMediaAdapter`
+(`include/strix/serve/api.hpp`), registered in `ApiConfig::vision.adapters`:
+
+| Member | Meaning |
+|---|---|
+| `kind()` | the canonical part type it consumes (`"image"`) |
+| `identity()` | weights digest and arithmetic id; shown in `/v1/models` and part of the capabilities hash |
+| `placeholder()` | text that tokenizes to exactly one id; marks where the rows of one item go |
+| `part_text(n)` | what the renderer receives for the n-th item (default: the placeholder alone) |
+| `max_rows()` | upper bound of the rows of one item |
+| `encode(item, row_budget)` | preprocess, encode or hit a cache, intern; returns the lease and the id layout |
+| `epoch()` | the interner epoch; when it moves, `ApiConfig::vision.on_epoch` withdraws cached prefixes |
+
+With an adapter loaded, the three front doors (`/v1/chat/completions`, `/v1/messages`,
+`/v1/responses`) pass the body through `serve::media::normalize`, hand the renderer
+`part_text` in place of each media part, replace each placeholder token by the ids of
+its item and submit the job with `GenerationJob::embeds`. `SessionRuntime` checks the
+ids against the table before a lane exists and calls `bind_embeds`. `usage` counts the
+rows, the `strix` receipt gains a member per kind (`vision`), and `/tokenize` returns
+real ids plus an `images` array. The capability `image_input` is true only then.
+
+Without an adapter nothing above runs: media parts get the refusal they always got,
+and text requests are unchanged with or without one. Remote image URLs are off unless
+the service sets a fetch policy and a fetcher.
+
+The service that loads an adapter also folds its identity into the prefix format id
+(`embed_format_id`), so a change of tower or weights invalidates image-bearing
+prefixes through the key. Adapters shared across services must synchronize their own
+encoding and epoch state; kinds in one request must use a shared handle namespace.
+The epoch callback synchronizes with the cache owner and completes withdrawal before
+returning. The API mutex alone does not protect runtime caches.
+
+Fake-encoder and skeleton tests qualify request plumbing only. They do not establish
+real embedding consumption, decoder safety, model fidelity, epoch-cache invalidation
+on a production runtime, or GPU qualification.
+
 ### Backend operations
 
 A family asks a `session::Backend` (`include/strix/session/backend.hpp`) for:
@@ -194,6 +232,62 @@ boundary:
 
 The CPU backend is a correctness reference for the contracts and for host tests. It
 is not a production inference path.
+
+## Levers and switches
+
+A lever is an implementation choice with an off switch. Declare it as one row of a
+`strix::lever::Decl` table (`include/strix/lever.hpp`): its `STRIX_*` switch, its
+exactness class (`bitwise`: on by default; `bit_changing`: off until the engine's
+gate opens), its default, and, when it wins only in some regimes, the crossover on
+one axis (rows, context tokens or concurrent streams). `lever::select` is the
+decision rule (explicit switch, then gate, then regime, then default) and records
+the result for `--print-effective-config`; `lever::require_consistent` refuses two
+levers that the table declares incompatible. `static_assert(lever::valid(table))`
+checks the table at compile time.
+
+The environment-reading overload is for startup configuration: it allocates and
+records under the shared registry mutex. Capture an owned switch value at startup
+and use the explicit-value overload for per-request or per-launch decisions.
+Existing `profile::Lever` and `profile::DefaultItem` rows in `engine_profile.hpp`
+remain authoritative for profile values, defaults and qualification. Before an
+engine adopts `lever::Decl`, provide a shared adapter deriving the overlapping
+fields from those rows; do not maintain a second set of names or metadata.
+
+Read any other switch through `include/strix/env_flags.hpp`. The
+`strix-env-switch-census` test (`tools/env_switch_census.py --check`) fails when a
+new switch is read with a raw `getenv`, or when one boolean switch is read with two
+different defaults. `tools/env_switch_baseline.txt` lists the switches that are
+still read raw; after introduction it only shrinks (`--update` removes migrated names).
+`tools/env_switch_census.py --report` prints the current counts.
+`--seed` creates a baseline only when the destination does not exist. The census
+tracks literal names, including adjacent ordinary string literals; runtime-built
+names and wrapper reads are outside its scope. Escapes in raw literal names are
+rejected because this scanner does not decode C++ escapes. Existing baseline names may gain
+raw read sites, so a passing census is not proof that all configuration is governed.
+
+### grandfathered at introduction — 2026-11-13
+
+These switches reached main before the census ratchet landed. The explicit
+`python tools/env_switch_census.py --grandfather NAME... --root .` route adds only
+the named switches and refuses any name not currently read raw, without writing
+on refusal. CMake continues to call `--check`, never `--grandfather`.
+
+| Switch | File | Owner area | Status |
+|---|---|---|---|
+| `STRIX_BATCH_NEST_RATIO` | `apps/hip_mtp_decode_bridge.hpp` | Qwen HTTP scheduling | to be governed |
+| `STRIX_GLM_PF_DENSE_FORM` | `src/glm/prefill/glm_prefill.hip` | GLM prefill | to be governed |
+| `STRIX_HOST_WAIT` | `src/device/hip_gate.cpp`, `src/device/hip_gate_none.cpp` | Shared device host-wait policy | to be governed |
+| `STRIX_MM_PF_MSA_FLASH` | `src/minimax/engine/engine.hip` | MiniMax prefill | to be governed |
+| `STRIX_MM_PF_MSA_FLASH_LAYERS` | `src/minimax/engine/engine.hip` | MiniMax prefill | to be governed |
+| `STRIX_MSA_TEST_FLASH` | `src/minimax/attn/msa_fused_tests.hip` | MiniMax attention qualification | to be governed |
+| `STRIX_PREFILL_FINAL_CONE` | `src/known_prefix_prefill_runtime.cpp` | Shared known-prefix prefill | to be governed |
+| `STRIX_PREFILL_FINAL_CONE_ROWS` | `src/known_prefix_prefill_runtime.cpp` | Shared known-prefix prefill | to be governed |
+| `STRIX_PROMPT_BATCH_LOG` | `apps/hip_mtp_decode_bridge.hpp` | Qwen HTTP scheduling | to be governed |
+
+`STRIX_GLM_ABA_FOLD` in `apps/glm_rank_main.cpp` instead uses `envcfg::flag`
+with exact matching: only `"1"` enables it, as before. `--update` removed
+`STRIX_CONSTRAINT_MASK_AHEAD`, `STRIX_CONSTRAINT_RANKED` and `STRIX_DS41_PF_CORE`
+because they are no longer read raw.
 
 ## Checklist
 

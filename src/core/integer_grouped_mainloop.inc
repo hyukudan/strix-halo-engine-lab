@@ -80,7 +80,8 @@ auto* tile = lds + StageBytes;
 const auto* own_row = ad.weight_row(at, first_col + int(pair * 32) + lane);
 Raw ahead{};
 TileRegs tile_next{};
-if constexpr (Direct) ahead = Operand::load_raw(own_row, q);
+// A wave whose first group is past a narrow row (inputs < 256) has no group at all: it must not read past the row.
+if constexpr (Direct) { if (q < groups) ahead = Operand::load_raw(own_row, q); }
 else tile_next = load_tile(0);
 V8 magic{Ops::dot_magic, Ops::dot_magic, Ops::dot_magic, Ops::dot_magic,
          Ops::dot_magic, Ops::dot_magic, Ops::dot_magic, Ops::dot_magic};
@@ -90,13 +91,25 @@ float leaf[4][2][8] = {};
 for (unsigned chunk = 0; chunk < chunks; ++chunk) {
     sync();
     // Both global activation reads issue before either LDS store.
-    V4 av[2] = {};
-    float dv[2] = {};
+    // Stage registers. Plan::split_stage_registers: each one is zeroed on its own, so both items' loads are issued
+    // before any result is consumed. Otherwise one initialiser per array: the two deltas then share a 64-bit register
+    // pair and item 0's loads are awaited before item 1 is addressed (one more load-counter wait per chunk), but the
+    // gate/up instantiations get the denser instruction schedule with it. Same values either way.
+    V4 av[2];
+    float dv[2];
+    if constexpr (!Plan::split_stage_registers) {
+        __builtin_memset(av, 0, sizeof(av));
+        __builtin_memset(dv, 0, sizeof(dv));
+    }
     #pragma unroll
     for (unsigned i = 0; i < 2; ++i) {
         const auto item = integer_stage_item(unsigned(thread), i);
         const unsigned r = item.row, kh = item.half, gg = item.group;
         const unsigned g = chunk * 32 + gg;
+        if constexpr (Plan::split_stage_registers) {
+            av[i] = V4{0, 0, 0, 0};
+            dv[i] = 0.0f;
+        }
         if (g < groups && r < unsigned(rows)) {
             const unsigned src = sources[r];
             av[i] = *reinterpret_cast<const V4*>(ad.code_row_of(src) + g * 32 + kh * 16);

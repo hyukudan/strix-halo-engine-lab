@@ -114,7 +114,7 @@ void test_plain_equals_receipt() {
 }
 
 void test_apply_env_default() {
-    CHECK(rd::env_items().size() == 41);  // one item per environment selector
+    CHECK(rd::env_items().size() == 42);  // one item per environment selector
     const auto normal = resolve({}, {});
     const auto baseline = resolve({"--baseline"}, {});
     for (const auto& [key, off] : Env{{"STRIX_GLM_PF_SEQPAR", "0"}, {"STRIX_GLM_PF_AUX_COMBINE", "0"},
@@ -133,8 +133,24 @@ void test_apply_env_default() {
     CHECK(rd::print(routed).find("capacity-layout=replicated/routed/qwin=2048") != std::string::npos);
     CHECK(rd::print(routed).find("capacity_layout_reason=first-admitted-query-window") != std::string::npos);
     CHECK(rd::print(routed).find("admission and rank vote pending") != std::string::npos);
-    CHECK(resolve({}, {}).env.at("STRIX_GLM_PF_DENSE_ROWS").value == "3");
+    CHECK(resolve({}, {}).env.at("STRIX_GLM_PF_DENSE_ROWS").value == "4");
     CHECK(resolve({"--baseline"}, {}).env.at("STRIX_GLM_PF_DENSE_ROWS").value == "1");
+    // Dense rows v4 form selector: governed like the version selectors (default 0 = automatic, 0..7 accepted,
+    // anything else refused by the resolver, before any device work).
+    CHECK(resolve({}, {}).env.at("STRIX_GLM_PF_DENSE_FORM").value == "0");
+    CHECK(resolve({"--baseline"}, {}).env.at("STRIX_GLM_PF_DENSE_FORM").value == "0");
+    for (const char* v : {"0", "1", "4", "7"}) {
+        const auto e = resolve({}, {{"STRIX_GLM_PF_DENSE_ROWS", "4"}, {"STRIX_GLM_PF_DENSE_FORM", v}});
+        CHECK(e.env.at("STRIX_GLM_PF_DENSE_FORM").value == v && e.env.at("STRIX_GLM_PF_DENSE_FORM").source == "explicit");
+        CHECK(rd::print(e).find(std::string("effective env STRIX_GLM_PF_DENSE_FORM=") + v + " (explicit, item pf-dense-form-auto; resolved form " + v) != std::string::npos);
+    }
+    for (const char* v : {"8", "-1", "07", "auto", "1 "}) {
+        bool refused = false;
+        try { (void)resolve({}, {{"STRIX_GLM_PF_DENSE_ROWS", "4"}, {"STRIX_GLM_PF_DENSE_FORM", v}}); }
+        catch (const std::invalid_argument&) { refused = true; }
+        CHECK(refused);
+    }
+    CHECK(rd::print(resolve({}, {})).find("effective env STRIX_GLM_PF_DENSE_FORM=0 (default, item pf-dense-form-auto; resolved form 0 (automatic per shape))\n") != std::string::npos);
     for (const char* v : {"1", "2", "3"})
         CHECK(resolve({}, {{"STRIX_GLM_PF_DENSE_ROWS", v}}).env.at("STRIX_GLM_PF_DENSE_ROWS").source == "explicit");
     CHECK(resolve({}, {}).env.at("STRIX_GLM_PF_MIXNORM").value == "1");
@@ -376,7 +392,7 @@ void test_scan_and_print() {
     CHECK(s.find("effective prefill=gemv (requested auto, default)\n") != std::string::npos);
     CHECK(s.find("effective identity=r1b (default)\n") != std::string::npos);
     CHECK(s.find("effective env STRIX_DIST_CRC_PARALLEL=1 (default, item hp-crc-parallel)\n") != std::string::npos);
-    CHECK(s.find("effective env STRIX_GLM_PF_DENSE_ROWS=3 (default, item pf-dense-rows-v3; resolved v3)\n") != std::string::npos);
+    CHECK(s.find("effective env STRIX_GLM_PF_DENSE_ROWS=4 (default, item pf-dense-rows-v4; resolved v4)\n") != std::string::npos);
     CHECK(s.find("effective env STRIX_GLM_PF_MIXNORM=1 (default, item pf-mixnorm)\n") != std::string::npos);
     CHECK(s.find("effective env STRIX_GLM_PF_MLA_GEMM=3 (default, item pf-mla-gemm-v3; resolved v3)\n") != std::string::npos);
     CHECK(s.find("effective env STRIX_GLM_PF_SUMEXP=1 (default, item pf-sumexp)\n") != std::string::npos);

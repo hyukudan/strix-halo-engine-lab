@@ -24,6 +24,8 @@ struct VisionRecipe {
     Activation aligner_activation = Activation::gelu;  // between aligner.w1 and aligner.w2
     bool unshuffle_row_major = true;                   // aligner input index = c * r * r + dy * r + dx (else dx * r + dy)
     bool newline_after_last_row = true;                // the row-end embedding also closes the last grid row
+    std::uint8_t pad_fill = 127;                       // grey of the canvas around an image that does not fill it
+    bool pixels_bf16 = true;                           // normalised pixels are rounded to BF16 before the patch embedding
     [[nodiscard]] std::string id() const;
 };
 
@@ -44,9 +46,10 @@ public:
     // blocks, and which rows those are flips under single-FP16 operand rounding (measured on the real file).
     vision::EncoderOptions device_options() const override;
 
-    // The same resize contract as resize(), in the form the shared preprocessing takes.
-    [[nodiscard]] vision::ResizePolicy resize_policy() const;
-    // Size the image is resampled to. Throws std::invalid_argument when its aspect cannot fit max_image_tokens.
+    // Canvas of the image, the rule of the checkpoint's reference processor: an image under min_pixels is scaled up,
+    // each side is rounded up to a multiple of the patch (not of the 3x3 cell), and a canvas whose whole span would
+    // exceed max_image_tokens rows is shrunk to the largest one that fits. The image keeps its aspect ratio inside the
+    // canvas (patches()); the margin is grey. Throws std::invalid_argument for an empty image.
     [[nodiscard]] vision::Size target(int width, int height) const;
     // Rows of the span for a merged grid: the grid, one row end per grid row, start and end.
     [[nodiscard]] unsigned span_rows(unsigned grid_h, unsigned grid_w) const noexcept;
@@ -57,6 +60,7 @@ public:
     [[nodiscard]] const VisionRecipe& recipe() const noexcept { return recipe_; }
 
 private:
+    [[nodiscard]] vision::MergedGrid checked_grid(const vision::PatchGrid& grid) const;
     VisionConfig config_;
     std::string sha_;
     VisionRecipe recipe_;

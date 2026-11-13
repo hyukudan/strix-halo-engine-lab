@@ -1,6 +1,74 @@
 #pragma once
+#include <cstdint>
 // Device-only fragments. Types supplies the engine's existing vector types.
 namespace strix::moe_core {
+// Global-address issue and the K pipeline shared by the grouped F16 bodies (projection and down). An engine supplies
+// its own vector types and adopts the scheduler through GroupedF16ActivationIssue; it keeps no private copy.
+struct GroupedF16Issue {
+    // LDS-only barrier: the staged tiles are complete (lgkmcnt) while the next step's global loads stay in flight.
+    static __device__ __forceinline__ void barrier(){__asm__ volatile("s_waitcnt lgkmcnt(0)\n\ts_barrier" ::: "memory");}
+    // 16-byte global (not flat) load: flat loads also count in lgkmcnt and would end at barrier().
+    template<class Word4> static __device__ __forceinline__ Word4 load16(const void* p) {
+        typedef unsigned U32x4 __attribute__((ext_vector_type(4)));
+        const U32x4 v=*reinterpret_cast<const __attribute__((address_space(1))) U32x4*>(reinterpret_cast<std::uintptr_t>(p));
+        return Word4{v.x,v.y,v.z,v.w};
+    }
+    template<class Word2> static __device__ __forceinline__ Word2 load8(const void* p) {
+        typedef unsigned U32x2 __attribute__((ext_vector_type(2)));
+        const U32x2 v=*reinterpret_cast<const __attribute__((address_space(1))) U32x2*>(reinterpret_cast<std::uintptr_t>(p));
+        return Word2{v.x,v.y};
+    }
+    // The K loop: two register stages (or one with OneStage), LDS-only barriers. fetch(step, regs) issues the global
+    // loads of a step, stage(step, regs, buffer) converts and writes the LDS tiles, step_fn(buffer) consumes them.
+    template<bool OneStage,class Regs,class Fetch,class Stage,class Step>
+    static __device__ __forceinline__ void pipeline(unsigned steps,const Fetch& fetch,const Stage& stage,const Step& step_fn) {
+        if constexpr(OneStage) {
+            Regs r;
+            fetch(0U,r);
+            for(unsigned step=0;step<steps;++step) {
+                if(step)barrier();
+                stage(step,r,0U);
+                barrier();
+                if(step+1U<steps)fetch(step+1U,r);
+                step_fn(0U);
+            }
+        } else {
+            Regs r0,r1;
+            fetch(0U,r0);fetch(1U,r1); // steps is even
+#pragma unroll 1
+            for(unsigned step=0;step<steps;step+=2U) {
+                if(step)barrier();
+                stage(step,r0,0U);
+                barrier();
+                if(step+2U<steps)fetch(step+2U,r0);
+                step_fn(0U);
+                barrier();
+                stage(step+1U,r1,0U);
+                barrier();
+                if(step+3U<steps)fetch(step+3U,r1);
+                step_fn(0U);
+            }
+        }
+    }
+};
+// Activation issue policy of a register stage. Uniform: every lane issues the loads of every part; the fetch is one
+// straight block without exec-mask regions or skip branches, and the register stage needs no zero initialisation.
+// Contract: `src` of a part outside the batch must already point at readable memory (the bodies clamp it to the first
+// row of the batch) and whatever is staged for such a part must stay unobservable (no store, no certificate reads it).
+// Masked: a part outside the batch issues nothing and keeps `dst` (the zero-initialised stage).
+template<bool Uniform> struct GroupedF16ActivationIssue {
+    static constexpr bool uniform=Uniform;
+    template<class Word4,unsigned N> static __device__ __forceinline__ void issue(bool live,const Word4* src,Word4 (&dst)[N]) {
+        if constexpr(Uniform) {
+            (void)live;
+#pragma unroll
+            for(unsigned q=0;q<N;++q)dst[q]=GroupedF16Issue::load16<Word4>(src+q);
+        } else if(live) {
+#pragma unroll
+            for(unsigned q=0;q<N;++q)dst[q]=GroupedF16Issue::load16<Word4>(src+q);
+        }
+    }
+};
 template<class Types> struct GroupedF16Fragments {
     using FragmentWord8=typename Types::Word8;
     using FragmentHalf16=typename Types::Half16;

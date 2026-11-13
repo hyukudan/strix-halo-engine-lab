@@ -180,6 +180,38 @@ inline constexpr unsigned exact_prefill_items = bit(Item::score_rows) | bit(Item
 // launchers (including serving/MTP priming); defer them too, preserving fixture defaults.
 // HC_LOWBAND also waits for decoder admission; its route guard retains unsupported layouts.
 inline constexpr unsigned startup_items = historical_items | bit(Item::ple_reclaim);
+// The admitted prefill organisation is ONE policy value: the exact launch/layout items a tiled prompt owner takes
+// after its route is admitted (row-loop and tap-copy batching, attention stage batching, table batching, expert
+// header/merge policies). Same arithmetic per element; only launches, copies and scheduling change. The
+// single-request owner and the resident server both apply it through apply_organization, so one cannot drift.
+inline constexpr unsigned prefill_organization_items = bit(Item::pipe) | bit(Item::attend_batch) |
+    bit(Item::score_park) | bit(Item::norm_group) | bit(Item::index_rows) | bit(Item::score_rows) |
+    bit(Item::ple_batch) | bit(Item::shared_pre) | bit(Item::moe_mc) | bit(Item::moe_hdr) | bit(Item::moe_xor64);
+// Row-loop steps as registered batches (16) and one strided tap copy (2): the row-pipeline bits measured on the
+// resident owner. The remaining bits (tap double buffering, headless-block skips, worker enqueue, persistent views)
+// stay with the single-request cursor until they pass the serving gate.
+inline constexpr unsigned serving_pipe_mask = 2U | 16U;
+enum class PrefillOwner : unsigned { single_request, resident_server };
+struct Organization {
+    unsigned items = 0U;      // defaults this owner may take
+    unsigned pipe_mask = ~0U; // bits of the default row-pipeline mask this owner takes
+};
+// The single-request owner also takes its reclamation and decoding items; a resident server keeps its own
+// (historical items at startup, decode organisation from its own admission) and adds only the organisation.
+constexpr Organization admitted_organization(PrefillOwner owner) noexcept {
+    return owner == PrefillOwner::single_request ? Organization{~0U, ~0U}
+        : Organization{prefill_organization_items, serving_pipe_mask};
+}
+// Applies one admitted organisation. Explicit values (including every "0" off control), the baseline and
+// STRIX_QPF2K_DEFAULTS=0 keep their meaning: initialize never overrides them.
+template<class Get, class Put>
+unsigned apply_organization(const Organization& policy, Get get, Put put) {
+    return initialize(get, [&](const char* name, const char* value) {
+        if (std::string_view(name) != "STRIX_PREFILL_PIPE" || policy.pipe_mask == ~0U) return put(name, value);
+        const auto mask = static_cast<unsigned>(std::strtoul(value, nullptr, 0)) & policy.pipe_mask;
+        return mask != 0U && put(name, std::to_string(mask).c_str());
+    }, policy.items);
+}
 // Startup injection writes into the real environment, so a process that re-executes itself before
 // undo_pre_injected (eager code loading restarts the image) hands its injected values to the new image, which
 // would find them set and treat them as user values. This marker carries the injected set (items, plus

@@ -318,21 +318,29 @@ void test_tables() {
     std::string why;
     CHECK(vision::hip_supported(c, &why));
     const vision::ResizeRule r = a.resize();
-    CHECK(r.multiple == 42 && r.min_pixels == 295936 && r.max_pixels == 1806336 && r.max_rows == 2050 && r.max_aspect == 0.0F);
-    CHECK(a.span_rows(13, 13) == 184 && a.span_rows(32, 32) == 1058 && a.span_rows(1024, 1) == 2050 && a.max_span_rows() == 2050);
+    CHECK(r.multiple == 14 && r.min_pixels == 295936 && r.max_pixels == 1806336 && r.max_rows == 1024 && r.max_aspect == 0.0F);
+    CHECK(a.span_rows(13, 13) == 184 && a.span_rows(31, 31) == 994 && a.span_rows(511, 1) == 1024 && a.max_span_rows() == 1024);
     CHECK(a.projector_weight_elements() == 5120ULL * 9216ULL + 5120ULL * 5120ULL);
     CHECK(a.device_options().split_activations);
     struct Row {
         int w, h, tw, th;
     };
-    for (const Row t : {Row{546, 546, 546, 546}, Row{16, 16, 546, 546}, Row{1, 1, 546, 546}, Row{1600, 200, 1596, 210},
-                        Row{200, 1600, 210, 1596}, Row{517, 389, 630, 504}, Row{1008, 756, 1008, 756},
-                        Row{1344, 1344, 1344, 1344}, Row{4000, 3000, 1512, 1134}, Row{5000, 60, 4998, 84}}) {
+    // Canvas sizes printed by the reference processor of the checkpoint (its resize plan) for these image sizes:
+    // sides are multiples of the patch, small images grow to the minimum area, the whole span stays within 1024 rows,
+    // and an extreme aspect ratio collapses to one column or one row of 3 x 3 cells.
+    for (const Row t : {Row{546, 546, 546, 546}, Row{16, 16, 546, 546}, Row{1, 1, 546, 546}, Row{1600, 200, 1610, 210},
+                        Row{200, 1600, 210, 1610}, Row{517, 389, 630, 476}, Row{1008, 756, 1008, 756},
+                        Row{1344, 1344, 1302, 1302}, Row{4000, 3000, 1512, 1134}, Row{5000, 60, 5012, 70},
+                        Row{10, 100000, 42, 21462}, Row{100000, 10, 42882, 42}, Row{544, 544, 546, 546},
+                        Row{1343, 1345, 1288, 1302}, Row{300, 301, 546, 546}, Row{1302, 1302, 1302, 1302},
+                        Row{1303, 1303, 1302, 1302}, Row{3, 4000, 14, 19866}, Row{1, 65000, 42, 21462},
+                        Row{65000, 1, 42882, 42}}) {
         const vision::Size s = a.target(t.w, t.h);
         CHECK(s.width == t.tw && s.height == t.th);
-        CHECK((s.width / 42) * (s.height / 42) <= 1024 && s.width % 42 == 0 && s.height % 42 == 0);
+        const unsigned mh = (static_cast<unsigned>(s.height) / 14U + 2U) / 3U, mw = (static_cast<unsigned>(s.width) / 14U + 2U) / 3U;
+        CHECK(s.width % 14 == 0 && s.height % 14 == 0 && a.span_rows(mh, mw) <= a.max_span_rows());
     }
-    CHECK(throws([&] { (void)a.target(10, 100000); }, "aspect ratio"));  // one cell wide and still 1296 rows
+    CHECK(throws([&] { (void)a.target(0, 5); }, "empty image"));
 
     // Identity: the file digest and every recipe field are in it.
     ds::VisionRecipe other;
@@ -343,6 +351,12 @@ void test_tables() {
     CHECK(a.identity() != ds::VisionAdapter(real_config(), std::string(64, 'b')).identity());
     CHECK(a.identity() != ds::VisionAdapter(real_config(), kSha, other).identity());
     CHECK(a.identity() != ds::VisionAdapter(real_config(), kSha, mean).identity());
+    ds::VisionRecipe fill, exact_pixels;
+    fill.pad_fill = 128;
+    exact_pixels.pixels_bf16 = false;
+    CHECK(a.identity() != ds::VisionAdapter(real_config(), kSha, fill).identity());
+    CHECK(a.identity() != ds::VisionAdapter(real_config(), kSha, exact_pixels).identity());
+    CHECK(a.identity().find("-r2-f127-b1") != std::string::npos);
     CHECK(a.identity().find(kSha) != std::string::npos && a.identity().find("deepseek41-vision/v4.1-flash/") == 0);
     CHECK(throws([] { ds::VisionAdapter bad(real_config(), "abc"); }, "digest"));
     ds::VisionConfig ratio = real_config();
@@ -370,8 +384,15 @@ void test_tables() {
     open.newline_after_last_row = false;
     const vision::SpanLayout t = ds::VisionAdapter(real_config(), kSha, open).layout(g);
     CHECK(t.rows() == 183 && t.role[181] == Role::image && t.role[182] == Role::end);
-    g.grid_w = 40;
-    CHECK(throws([&] { (void)a.layout(g); }, "merge factor"));
+    // A grid that is not a multiple of 3 has partial cells at the right and at the bottom: the merged grid rounds up.
+    vision::PatchGrid odd;
+    odd.grid_h = 38;
+    odd.grid_w = 40;
+    odd.rows = 38U * 40U;
+    const vision::SpanLayout u = a.layout(odd);
+    CHECK(u.grid_h == 13 && u.grid_w == 14 && u.rows() == 13U * 15U + 2U && u.role[14] == Role::image && u.role[15] == Role::newline);
+    odd.rows = 39U * 40U;
+    CHECK(throws([&] { (void)a.layout(odd); }, "rows differ"));
 }
 
 void test_patches_and_projector() {
@@ -400,7 +421,8 @@ void test_patches_and_projector() {
             for (unsigned py = 0; py < 2; ++py)
                 for (unsigned px = 0; px < 2; ++px) {  // feature (channel, y, x): the layout of the patch weight
                     const std::uint8_t v = im.rgb[((g.y[r] * 2U + py) * 18U + g.x[r] * 2U + px) * 3U + c];
-                    const float want = (static_cast<float>(v) * (1.0F / 255.0F) - 0.5F) / 0.5F;
+                    // the reference order (a true division by 255), then the nearest BF16 value
+                    const float want = vision::from_bf16(vision::to_bf16((static_cast<float>(v) / 255.0F - 0.5F) / 0.5F));
                     order = order && g.data[r * 12U + c * 4U + py * 2U + px] == want;
                 }
     }
@@ -411,6 +433,66 @@ void test_patches_and_projector() {
     tiny.rgb.assign(48, 200);
     const vision::PatchGrid up = adapter.patches(tiny);
     CHECK(up.grid_h == 6 && up.grid_w == 6 && up.rows == 36);
+    // 16 x 9 pixels: the canvas is 16 x 10 (sides rounded up to the patch, not to the 3 x 3 cell); the image keeps
+    // its size and sits on a grey canvas, half of the one-pixel margin rounded to even (0.5 -> 0: the top row is
+    // image, the bottom row is grey). The 5 x 8 grid has partial cells: 2 x 3 merged rows.
+    vision::Image wide;
+    wide.width = 16;
+    wide.height = 9;
+    wide.rgb.resize(16 * 9 * 3);
+    for (std::size_t i = 0; i < wide.rgb.size(); ++i) wide.rgb[i] = static_cast<std::uint8_t>((i * 29U + 3U) % 251U);
+    CHECK(adapter.target(16, 9) == (vision::Size{16, 10}));
+    const vision::PatchGrid pg = adapter.patches(wide);
+    CHECK(pg.grid_h == 5 && pg.grid_w == 8 && pg.rows == 40);
+    const float grey = vision::from_bf16(vision::to_bf16((127.0F / 255.0F - 0.5F) / 0.5F));
+    bool canvas = pg.data.size() == 40U * 12U;
+    for (unsigned r = 0; canvas && r < pg.rows; ++r)
+        for (unsigned c = 0; c < 3; ++c)
+            for (unsigned py = 0; py < 2; ++py)
+                for (unsigned px = 0; px < 2; ++px) {
+                    const unsigned y = (r / 8U) * 2U + py, x = (r % 8U) * 2U + px;
+                    const float want = y < 9U ? vision::from_bf16(vision::to_bf16(
+                                                    (static_cast<float>(wide.rgb[(y * 16U + x) * 3U + c]) / 255.0F - 0.5F) / 0.5F))
+                                              : grey;
+                    canvas = canvas && pg.data[r * 12U + c * 4U + py * 2U + px] == want;
+                }
+    CHECK(canvas);
+    {
+        // Partial cells are completed with zero rows before the first aligner linear: direct computation.
+        vision::ReferenceEncoder tower(cfg, weights);
+        const vision::EncoderOutput hidden = tower.encode(pg, adapter.positions(cfg, weights, pg));
+        vision::ProjectedRows rows;
+        vision::EncoderOutput copy = hidden;
+        adapter.project(copy, pg, tower, rows);
+        const vision::SpanLayout layout = adapter.layout(pg);
+        CHECK(rows.rows == 10 && layout.rows() == 10 && layout.grid_h == 2 && layout.grid_w == 3);
+        const vision::Tensor w1 = source.tensor("aligner.w1.weight"), b1 = source.tensor("aligner.w1.bias");
+        const vision::Tensor w2 = source.tensor("aligner.w2.weight"), b2 = source.tensor("aligner.w2.bias");
+        double worst = 0.0;
+        for (unsigned my = 0; my < 2; ++my)
+            for (unsigned mx = 0; mx < 3; ++mx) {
+                std::vector<double> in(288, 0.0), mid(40);
+                for (unsigned c = 0; c < 32; ++c)
+                    for (unsigned dy = 0; dy < 3; ++dy)
+                        for (unsigned dx = 0; dx < 3; ++dx)
+                            if (my * 3U + dy < 5U && mx * 3U + dx < 8U)
+                                in[c * 9U + dy * 3U + dx] =
+                                    static_cast<double>(hidden.hidden[((my * 3U + dy) * 8U + mx * 3U + dx) * 32U + c]);
+                for (unsigned o = 0; o < 40; ++o) {
+                    double acc = static_cast<double>(b1.at(o));
+                    for (unsigned k = 0; k < 288; ++k) acc += in[k] * static_cast<double>(w1.at(o * 288U + k));
+                    const double x = static_cast<double>(static_cast<float>(acc));
+                    mid[o] = static_cast<double>(static_cast<float>(0.5 * x * (1.0 + std::erf(x * 0.70710678118654752440))));
+                }
+                for (unsigned o = 0; o < 40; ++o) {
+                    double acc = static_cast<double>(b2.at(o));
+                    for (unsigned k = 0; k < 40; ++k) acc += mid[k] * static_cast<double>(w2.at(o * 40U + k));
+                    const double got = static_cast<double>(vision::from_bf16(rows.bf16[(1U + my * 4U + mx) * 40U + o]));
+                    worst = std::max(worst, std::fabs(got - acc) / (std::fabs(acc) + 1.0));
+                }
+            }
+        CHECK(worst < 1.0e-2);  // BF16 rows; a missing or misplaced zero row is an error of order one
+    }
 
     vision::ReferenceEncoder backend(cfg, weights);
     const vision::Digest digest{};
@@ -485,6 +567,50 @@ void test_patches_and_projector() {
 
 // Malformed inputs an external audit found accepted (each of these failed before its fix).
 void test_refusals() {
+    // Minimum complete span must be rejected before resize floating-point arithmetic.
+    for (unsigned budget = 1; budget < 4; ++budget) {
+        auto small = real_config();
+        small.max_image_tokens = budget;
+        small.min_pixels = 1764;
+        CHECK(throws([&] { ds::VisionAdapter bad(small, kSha); }, "four span rows"));
+    }
+    auto minimum = real_config();
+    minimum.max_image_tokens = 4;
+    minimum.min_pixels = 1764;
+    CHECK(ds::VisionAdapter(minimum, kSha).target(42, 42) == (vision::Size{42, 42}));
+
+    // Image rows alone fit 1024; the complete span does not, including partial merge cells.
+    const File grid_file = small_file();
+    auto grid_config = ds::validate_vision(grid_file.info()).config;
+    grid_config.max_image_tokens = 1024;
+    ds::VisionAdapter grid_adapter(grid_config, kSha);
+    auto grid_weights = grid_file.weights();
+    vision::EncoderWeights encoder_weights;
+    grid_adapter.bind(grid_weights, encoder_weights);
+    vision::ReferenceEncoder grid_dense(grid_adapter.config(), encoder_weights);
+    for (unsigned side : {95U, 96U}) {
+        vision::PatchGrid grid;
+        grid.grid_h = grid.grid_w = side;
+        grid.rows = side * side;
+        vision::EncoderOutput hidden;
+        hidden.width = grid_config.hidden_size;
+        hidden.rows = grid.rows;
+        hidden.hidden.assign(std::size_t{hidden.rows} * hidden.width, 0.0F);
+        vision::ProjectedRows out;
+        for (bool coordinates : {false, true}) {
+            if (coordinates) {
+                grid.y.resize(grid.rows);
+                grid.x.resize(grid.rows);
+                for (unsigned row = 0; row < grid.rows; ++row) {
+                    grid.y[row] = static_cast<std::uint16_t>(row / side);
+                    grid.x[row] = static_cast<std::uint16_t>(row % side);
+                }
+            }
+            CHECK(throws([&] { (void)grid_adapter.layout(grid); }, "span exceeds"));
+            CHECK(throws([&] { grid_adapter.project(hidden, grid, grid_dense, out); }, "span exceeds"));
+            CHECK(out.bf16.empty());
+        }
+    }
     // Recipe identity: neighbouring representable floats are different recipes, non-finite values are refused.
     ds::VisionRecipe base, near_mean, near_std;
     near_mean.mean[0] = std::nextafter(base.mean[0], 1.0F);

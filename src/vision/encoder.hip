@@ -83,11 +83,24 @@ inline constexpr unsigned kNonfinite = 1U, kOperandRange = 8U;  // failure bits 
 
 // ---- kernels ---------------------------------------------------------------------------------------------------
 
+// Store modes of the GEMM (GemmArgs::flags). Without kAffine the sums go to y; with it the store is the epilogue of
+// the linear and the separate affine kernel is not launched.
+inline constexpr unsigned kSum = 1U;        // sum = y[r][c] + sum first (y holds the high-part pass of a split operand)
+inline constexpr unsigned kAffine = 2U;     // dst[r][c] = sum * scale + bias[c] for c < n
+inline constexpr unsigned kResidual = 4U;   // ... + dst[r][c]
+inline constexpr unsigned kPadRaw = 8U;     // dst is y: padding columns c >= n keep the raw sum, as the two-kernel form left them
+inline constexpr unsigned kSkipIdle = 16U;  // row waves without a live row skip their WMMAs
+
 struct GemmArgs {
     const float* x;      // [rows][in]
     const _Float16* w;   // [tiles * 16][in]
     float* y;            // [rows][stride]
     unsigned in, rows, stride, tiles, tile0;
+    float* dst;          // kAffine: [rows][dstride]
+    const float* bias;   // kAffine: [tiles * 16]
+    unsigned* failure;   // kAffine: kNonfinite is reported here
+    unsigned dstride, n, flags;
+    float scale;
 };
 struct GemmCols {
     const GemmArgs& a;
@@ -98,9 +111,70 @@ struct GemmCols {
         return {a.w + static_cast<std::size_t>(u) * 16U * a.in, a.y + u * 16U, a.stride, live};
     }
 };
+// Same arithmetic, in the same order, as sum_kernel followed by affine_kernel: (high + low) * scale + bias, + residual.
+template <unsigned M> struct GemmModeStore {  // M = the store-mode bits of GemmArgs::flags, fixed at compile time
+    const GemmArgs& a;
+    unsigned bad = 0U;
+    struct Tile {
+        float* y;
+        float* dst;
+        float bias;
+        unsigned c;
+        bool inside;
+    };
+    __device__ __forceinline__ Tile open(unsigned i, const tall::ColumnTile& ct, unsigned c) const {
+        const unsigned col = (a.tile0 + i) * 16U + c;
+        Tile t{tall::detail::uniform(ct.y), nullptr, 0.0F, c, false};
+        if (M & kAffine) {
+            t.dst = a.dst + col;
+            t.bias = a.bias[col];
+            t.inside = col < a.n;
+        }
+        return t;
+    }
+    __device__ __forceinline__ void put(const Tile& t, unsigned r, float v) {
+        float* const raw = t.y + static_cast<std::size_t>(r) * a.stride + t.c;
+        if (M & kSum) v = *raw + v;
+        if (!(M & kAffine)) {
+            *raw = v;
+        } else if (t.inside) {
+            float* const d = t.dst + static_cast<std::size_t>(r) * a.dstride;
+            v = v * a.scale + t.bias;
+            if (M & kResidual) v += *d;
+            if (!__builtin_isfinite(v)) bad = 1U;
+            *d = v;
+        } else if (M & kPadRaw) {
+            *raw = v;
+        }
+    }
+    __device__ __forceinline__ void close() const {
+        if (bad) atomicOr(a.failure, kNonfinite);
+    }
+};
+struct GemmStore {
+    const GemmArgs& a;
+    template <unsigned M, class F> __device__ __forceinline__ void mode(F& f) const {
+        GemmModeStore<M> s{a};
+        f(s);
+    }
+    template <class F> __device__ __forceinline__ void run(F&& f) const {
+        switch (tall::detail::uni(a.flags) & (kSum | kAffine | kResidual | kPadRaw)) {
+        case 0U: mode<0U>(f); break;
+        case kSum: mode<kSum>(f); break;
+        case kAffine: mode<kAffine>(f); break;
+        case kAffine | kSum: mode<kAffine | kSum>(f); break;
+        case kAffine | kResidual: mode<kAffine | kResidual>(f); break;
+        case kAffine | kResidual | kSum: mode<kAffine | kResidual | kSum>(f); break;
+        case kAffine | kPadRaw: mode<kAffine | kPadRaw>(f); break;
+        case kAffine | kPadRaw | kSum: mode<kAffine | kPadRaw | kSum>(f); break;
+        case kAffine | kPadRaw | kResidual: mode<kAffine | kPadRaw | kResidual>(f); break;
+        default: mode<kAffine | kPadRaw | kResidual | kSum>(f); break;
+        }
+    }
+};
 template <unsigned TC> __global__ __launch_bounds__(256) void gemm_kernel(GemmArgs a) {
-    __shared__ tall::Storage lds;
-    tall::core<TC>(a.x, a.in, a.rows, GemmCols{a}, lds);
+    __shared__ tall::Storage<TC> lds;
+    tall::core<TC>(a.x, a.in, a.rows, GemmCols{a}, lds, GemmStore{a}, (a.flags & kSkipIdle) != 0U);
 }
 
 // dst[r][c] = (add ? dst[r][c] : 0) + src[r][c] * scale + bias[c]
@@ -372,6 +446,10 @@ struct Encoder::Impl {
 
     // y[rows][p.n16] = raw sums of x[rows][p.inp] (scale and bias are the caller's epilogue). With `lo`/`ylo`
     // (split activations) the FP16 rounding residue of x goes through a second GEMM and is added.
+    static bool fused() {
+        static const bool on = envcfg::flag("STRIX_VISION_GEMM_EPILOGUE", true);
+        return on;
+    }
     void gemm(const Panel& p, const float* x, unsigned rows, float* y, float* lo, float* ylo) const {
         const unsigned cap = std::max(128U, static_cast<unsigned>(0xFFFFFFFFULL / (4ULL * p.inp)) / 128U * 128U);
         for (unsigned r0 = 0; r0 < rows; r0 += cap) {
@@ -382,18 +460,58 @@ struct Encoder::Impl {
             if (lo) {
                 const std::size_t count = static_cast<std::size_t>(nr) * p.inp, sums = static_cast<std::size_t>(nr) * p.n16;
                 hipLaunchKernelGGL(split_lo_kernel, dim3(blocks_of(count)), dim3(256), 0, stream, xs, lo, count);
+                if (fused()) {  // the low pass adds the high sums in its store
+                    launch(p, lo, nr, ys, kSum);
+                    continue;
+                }
                 launch(p, lo, nr, ylo);
                 hipLaunchKernelGGL(sum_kernel, dim3(blocks_of(sums)), dim3(256), 0, stream, ys, static_cast<const float*>(ylo), sums);
             }
         }
     }
-    void launch(const Panel& p, const float* x, unsigned rows, float* y) const {
-        GemmArgs a{x, p.w.as<const _Float16>(), y, p.inp, rows, p.n16, p.n16 / 16U, 0U};
-        const unsigned gx = (rows + tall::kRows - 1U) / tall::kRows, full = a.tiles / 16U, rest = a.tiles % 16U;
-        if (full) hipLaunchKernelGGL(gemm_kernel<16>, dim3(gx, full), dim3(256), 0, stream, a);
-        if (rest) {
-            a.tile0 = full * 16U;
-            hipLaunchKernelGGL(gemm_kernel<4>, dim3(gx, (rest + 3U) / 4U), dim3(256), 0, stream, a);
+    void launch(const Panel& p, const float* x, unsigned rows, float* y, unsigned flags = 0U, float* dst = nullptr,
+                unsigned dstride = 0U) const {
+        const bool tail = tall::tail_policy();
+        GemmArgs a{x, p.w.as<const _Float16>(), y, p.inp, rows, p.n16, p.n16 / 16U, 0U, dst, p.b.as<const float>(), failure.as<unsigned>(),
+                   dstride, p.n, flags | (tail ? kSkipIdle : 0U), p.inv};
+        const unsigned gx = (rows + tall::kRows - 1U) / tall::kRows;
+        const tall::Plan pl = tall::plan(a.tiles, rows, tail);
+        if (pl.full) hipLaunchKernelGGL(gemm_kernel<16>, dim3(gx, pl.full), dim3(256), 0, stream, a);
+        a.tile0 = pl.full * 16U;
+        const dim3 grid(gx, pl.gy);
+        switch (pl.tc) {
+        case 4: hipLaunchKernelGGL(gemm_kernel<4>, grid, dim3(256), 0, stream, a); break;
+        case 2: hipLaunchKernelGGL(gemm_kernel<2>, grid, dim3(256), 0, stream, a); break;
+        case 1: hipLaunchKernelGGL(gemm_kernel<1>, grid, dim3(256), 0, stream, a); break;
+        default: break;
+        }
+    }
+    // dst[rows][dstride] (columns < p.n) = (add ? dst : 0) + sums * scale + bias: the whole linear. `raw` is the
+    // [rows][p.n16] scratch of the two-kernel form (it may be dst when dstride == p.n16). Fused form (default): the GEMM
+    // stores the final value; with split activations the low pass reads the high sums from `raw` and finishes there.
+    // STRIX_VISION_GEMM_EPILOGUE=0 restores GEMM + affine kernel (bit-identical results).
+    void linear(const Panel& p, const float* x, unsigned rows, float* raw, float* dst, unsigned dstride, bool add, float* lo,
+                float* ylo) const {
+        if (!fused() || (dst == raw && dstride != p.n16)) {
+            gemm(p, x, rows, raw, lo, ylo);
+            affine(dst, dstride, raw, p, rows, add);
+            return;
+        }
+        const unsigned mode = kAffine | (add ? kResidual : 0U) | (dst == raw ? kPadRaw : 0U);
+        const unsigned cap = std::max(128U, static_cast<unsigned>(0xFFFFFFFFULL / (4ULL * p.inp)) / 128U * 128U);
+        for (unsigned r0 = 0; r0 < rows; r0 += cap) {
+            const unsigned nr = std::min(cap, rows - r0);
+            const float* xs = x + static_cast<std::size_t>(r0) * p.inp;
+            float* ys = raw + static_cast<std::size_t>(r0) * p.n16;
+            float* ds = dst + static_cast<std::size_t>(r0) * dstride;
+            if (!lo) {
+                launch(p, xs, nr, ys, mode, ds, dstride);
+                continue;
+            }
+            const std::size_t count = static_cast<std::size_t>(nr) * p.inp;
+            launch(p, xs, nr, ys);
+            hipLaunchKernelGGL(split_lo_kernel, dim3(blocks_of(count)), dim3(256), 0, stream, xs, lo, count);
+            launch(p, lo, nr, ys, mode | kSum, ds, dstride);
         }
     }
     void affine(float* dst, unsigned dstride, const float* src, const Panel& p, unsigned rows, bool add) const {
@@ -568,8 +686,7 @@ EncoderOutput Encoder::encode(const PatchGrid& grid, const PositionInputs& pos, 
         }
     }
 
-    im.gemm(im.patch, dpatch, N, o, lo, ylo);
-    im.affine(x, g.wp, o, im.patch, N, false);
+    im.linear(im.patch, dpatch, N, o, x, g.wp, false, lo, ylo);
     if (!pos.addend.empty())
         hipLaunchKernelGGL(add_rows_kernel, dim3(blocks_of(static_cast<std::size_t>(N) * g.w)), dim3(256), 0, stream, x, g.wp,
                            static_cast<const float*>(dpos), g.w, N);
@@ -585,8 +702,7 @@ EncoderOutput Encoder::encode(const PatchGrid& grid, const PositionInputs& pos, 
         const auto& B = im.blocks[l];
         // attention
         im.norm(x, nrm, g.wp, N, B.n1w, B.n1b);
-        im.gemm(B.qkv, nrm, N, qkv, lo, ylo);
-        im.affine(qkv, g.q16, qkv, B.qkv, N, false);
+        im.linear(B.qkv, nrm, N, qkv, qkv, g.q16, false, lo, ylo);
         unsigned row0 = 0, slot0 = 0;
         for (const unsigned end : tiles) {
             const unsigned n = end - row0, cap = layout::key_slots(n);
@@ -604,8 +720,7 @@ EncoderOutput Encoder::encode(const PatchGrid& grid, const PositionInputs& pos, 
                                static_cast<const float*>(ao), cmp, g.wp, g.heads, g.d, g.dp, N);
             attn = cmp;
         }
-        im.gemm(B.out, attn, N, o, lo, ylo);
-        im.affine(x, g.wp, o, B.out, N, true);
+        im.linear(B.out, attn, N, o, x, g.wp, true, lo, ylo);
         // MLP, in row chunks so the wide middle stays under the workspace cap
         im.norm(x, nrm, g.wp, N, B.n2w, B.n2b);
         for (unsigned r0 = 0; r0 < N; r0 += g.chunk) {
@@ -614,8 +729,7 @@ EncoderOutput Encoder::encode(const PatchGrid& grid, const PositionInputs& pos, 
             const ActArgs a{mid, act, B.mlp1.b.as<const float>(), im.failure.as<unsigned>(), B.mlp1.inv, c.swiglu_limit, g.m116, g.mp, g.m, nr,
                             mode, c.swiglu_gate_first ? 1U : 0U};
             hipLaunchKernelGGL(act_kernel, dim3(blocks_of(static_cast<std::size_t>(nr) * g.m)), dim3(256), 0, stream, a);
-            im.gemm(B.mlp2, act, nr, o2, mlo, mylo);
-            im.affine(x + static_cast<std::size_t>(r0) * g.wp, g.wp, o2, B.mlp2, nr, true);
+            im.linear(B.mlp2, act, nr, o2, x + static_cast<std::size_t>(r0) * g.wp, g.wp, true, mlo, mylo);
         }
         if (tap < c.deepstack_taps.size() && c.deepstack_taps[tap] == l) {
             out.taps.push_back(im.download(x, g.wp, N, g.w));
@@ -655,8 +769,7 @@ void Encoder::linear(const Tensor& w, const Tensor& bias, const float* x, std::s
     ck(hipMemsetAsync(im.failure.p, 0, 4U, im.stream), "failure clear");
     ck(hipStreamSynchronize(im.stream), "linear");
     ck(hipMemcpy(dx.p, padded.data(), dx.n, hipMemcpyHostToDevice), "linear upload");
-    im.gemm(p, dx.as<const float>(), nr, dy.as<float>(), lo.as<float>(), ylo.as<float>());
-    im.affine(dy.as<float>(), p.n16, dy.as<const float>(), p, nr, false);
+    im.linear(p, dx.as<const float>(), nr, dy.as<float>(), dy.as<float>(), p.n16, false, lo.as<float>(), ylo.as<float>());
     const std::vector<float> got = im.download(dy.as<const float>(), p.n16, nr, p.n);
     im.check_failure();
     std::memcpy(y, got.data(), got.size() * 4U);

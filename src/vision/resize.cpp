@@ -255,6 +255,46 @@ Image pad_center(const Image& im, int width, int height, std::array<std::uint8_t
     return out;
 }
 
+Size contain_size(int width, int height, int canvas_width, int canvas_height) {
+    if (width <= 0 || height <= 0 || canvas_width <= 0 || canvas_height <= 0) bad("contain needs positive sizes");
+    const double image_ratio = double(width) / double(height), canvas_ratio = double(canvas_width) / double(canvas_height);
+    Size s{canvas_width, canvas_height};
+    // nearbyint in the default rounding mode = round half to even, the rule of Python's round()
+    if (image_ratio > canvas_ratio)
+        s.height = int(std::nearbyint(double(height) / double(width) * double(canvas_width)));
+    else if (image_ratio < canvas_ratio)
+        s.width = int(std::nearbyint(double(width) / double(height) * double(canvas_height)));
+    return s;
+}
+
+Image resize_contain_pad(const Image& im, int canvas_width, int canvas_height, std::array<std::uint8_t, 3> fill,
+                         Resampler resampler) {
+    check(im);
+    const Size s = contain_size(im.width, im.height, canvas_width, canvas_height);
+    const bool empty = s.width <= 0 || s.height <= 0;
+    Image fitted;
+    if (!empty) fitted = s.width == im.width && s.height == im.height ? im : resize(im, s.width, s.height, resampler);
+    if (s.width == canvas_width && s.height == canvas_height) return fitted;
+    Image out;
+    out.width = canvas_width;
+    out.height = canvas_height;
+    out.rgb.resize(std::size_t(canvas_width) * std::size_t(canvas_height) * 3);
+    for (std::size_t i = 0; i < out.rgb.size(); i += 3) {
+        out.rgb[i] = fill[0];
+        out.rgb[i + 1] = fill[1];
+        out.rgb[i + 2] = fill[2];
+    }
+    // Only one axis has a margin (the width when both could: the order of the PIL function); half of it, to even.
+    const auto half_even = [](int d) { return std::size_t(d / 2 + ((d & 1) != 0 && ((d / 2) & 1) != 0 ? 1 : 0)); };
+    const bool margin_x = s.width != canvas_width;
+    const std::size_t x0 = margin_x ? half_even(canvas_width - s.width) : 0;
+    const std::size_t y0 = margin_x ? 0 : half_even(canvas_height - s.height);
+    for (std::size_t y = 0; !empty && y < std::size_t(s.height); ++y)
+        std::copy_n(fitted.rgb.data() + y * std::size_t(s.width) * 3, std::size_t(s.width) * 3,
+                    out.rgb.data() + ((y0 + y) * std::size_t(canvas_width) + x0) * 3);
+    return out;
+}
+
 std::vector<Image> tile(const Image& im, int tw, int th) {
     check(im);
     if (tw <= 0 || th <= 0 || im.width % tw != 0 || im.height % th != 0) bad("tile size does not divide the image");

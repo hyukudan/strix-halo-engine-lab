@@ -38,17 +38,21 @@ inline void check_grid_axes(std::uint64_t grid_h, std::uint64_t grid_w) {
         throw std::invalid_argument("vision patch grid: an axis of more than " + std::to_string(kMaxGridAxis) + " patches");
 }
 // The whole grid: positive axes inside the coordinate width, both multiples of `merge`, rows == grid_h * grid_w,
-// coordinate vectors absent or one per row, and at most `max_tokens` merged image rows.
-inline MergedGrid checked_merged_grid(const PatchGrid& grid, unsigned merge, std::uint64_t max_tokens) {
+// coordinate vectors absent or one per row, and at most `max_tokens` merged image rows. With partial_cells an axis
+// need not be a multiple of `merge`: the last cell of a row or column is partial and the merged grid rounds up (the
+// adapter completes such a cell itself, e.g. with zero rows).
+inline MergedGrid checked_merged_grid(const PatchGrid& grid, unsigned merge, std::uint64_t max_tokens,
+                                      bool partial_cells = false) {
     if (merge == 0) throw std::invalid_argument("vision patch grid: a zero merge factor");
     check_grid_axes(grid.grid_h, grid.grid_w);
-    if (grid.grid_h % merge != 0 || grid.grid_w % merge != 0)
+    if (!partial_cells && (grid.grid_h % merge != 0 || grid.grid_w % merge != 0))
         throw std::invalid_argument("vision patch grid: an axis is not a multiple of the merge factor");
     if (std::uint64_t{grid.grid_h} * grid.grid_w != grid.rows)
         throw std::invalid_argument("vision patch grid: rows differ from grid_h * grid_w");
     if (grid.y.size() != grid.x.size() || (!grid.y.empty() && grid.y.size() != grid.rows))
         throw std::invalid_argument("vision patch grid: coordinates differ from the row count");
-    const std::uint64_t mh = grid.grid_h / merge, mw = grid.grid_w / merge;
+    const std::uint64_t mh = (std::uint64_t{grid.grid_h} + merge - 1U) / merge;
+    const std::uint64_t mw = (std::uint64_t{grid.grid_w} + merge - 1U) / merge;
     if (mh * mw > max_tokens)
         throw std::invalid_argument("vision patch grid: " + std::to_string(mh * mw) + " image rows, the limit is " +
                                     std::to_string(max_tokens));

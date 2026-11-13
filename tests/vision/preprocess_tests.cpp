@@ -4,7 +4,9 @@
 
 #include "strix/vision/preprocess.hpp"
 
+#include <array>
 #include <atomic>
+#include <bit>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -233,6 +235,59 @@ void resize_tests() {
     const Image padded = pad_center(pattern(1, 4, 2), 8, 6, {1, 2, 3});
     check(padded.width == 8 && padded.height == 6 && padded.rgb[0] == 1 && padded.rgb[1] == 2 && padded.rgb[2] == 3 &&
               padded.rgb[(std::size_t(2) * 8 + 2) * 3] == std::uint8_t(sample(1, 0, 0, 0, 4, 2)), "pad_center");
+    // contain + pad: sizes and margin origins as PIL `ImageOps.contain` / `ImageOps.pad` give them (the free side and
+    // half of the margin are rounded half to even: 2.5 -> 2, 1.5 -> 2, 3.5 -> 4, 4.5 -> 4, 0.5 -> 0).
+    check(contain_size(4, 2, 8, 6) == Size{8, 4} && contain_size(2, 1, 14, 14) == Size{14, 7} &&
+              contain_size(1, 2, 6, 6) == Size{3, 6} && contain_size(1, 2, 5, 5) == Size{2, 5} &&
+              contain_size(4, 3, 2, 2) == Size{2, 2} && contain_size(4, 1, 2, 2) == Size{2, 0} &&
+              contain_size(517, 389, 630, 476) == Size{630, 474} && contain_size(1600, 200, 1610, 210) == Size{1610, 201} &&
+              contain_size(5, 3, 5, 3) == Size{5, 3}, "contain_size");
+    {
+        struct Case {
+            int w, h, cw, ch, x0, y0;
+        };
+        bool placed = true;
+        for (const Case c : {Case{4, 2, 8, 6, 0, 1}, Case{2, 1, 6, 6, 0, 2}, Case{2, 1, 14, 14, 0, 4}, Case{1, 2, 6, 6, 2, 0},
+                             Case{1, 2, 5, 5, 2, 0}, Case{16, 2, 161, 21, 0, 0}, Case{5, 3, 5, 3, 0, 0}}) {
+            const Image source = pattern(3, c.w, c.h);
+            const Size s = contain_size(c.w, c.h, c.cw, c.ch);
+            const Image fitted = s.width == c.w && s.height == c.h ? source : resize(source, s.width, s.height);
+            const Image out = resize_contain_pad(source, c.cw, c.ch, {127, 126, 125});
+            placed = placed && out.width == c.cw && out.height == c.ch && out.rgb.size() == std::size_t(c.cw) * std::size_t(c.ch) * 3;
+            for (int y = 0; placed && y < c.ch; ++y)
+                for (int x = 0; placed && x < c.cw; ++x) {
+                    const bool inside = x >= c.x0 && x < c.x0 + s.width && y >= c.y0 && y < c.y0 + s.height;
+                    for (int ch = 0; ch < 3; ++ch) {
+                        const std::uint8_t got = out.rgb[(std::size_t(y) * std::size_t(c.cw) + std::size_t(x)) * 3 + std::size_t(ch)];
+                        const std::uint8_t want = inside ? fitted.rgb[(std::size_t(y - c.y0) * std::size_t(s.width) + std::size_t(x - c.x0)) * 3 + std::size_t(ch)]
+                                                         : std::uint8_t(127 - ch);
+                        placed = placed && got == want;
+                    }
+                }
+        }
+        check(placed, "resize_contain_pad places the fitted image");
+        const Image gone = resize_contain_pad(pattern(3, 4, 1), 2, 2, {9, 8, 7});  // less than half a pixel high
+        check(gone.width == 2 && gone.height == 2 && gone.rgb == std::vector<std::uint8_t>{9, 8, 7, 9, 8, 7, 9, 8, 7, 9, 8, 7},
+              "resize_contain_pad: a vanished image leaves the fill");
+    }
+    {
+        // (v / 255 - 0.5) / 0.5 with a true division, FP32 bits from the PyTorch expression; BF16 rounding to even.
+        // Level 127 is where the reciprocal form of normalize() lands on another BF16 value.
+        Image levels;
+        levels.width = 6;
+        levels.height = 1;
+        levels.rgb = {0, 0, 0, 1, 1, 1, 127, 127, 127, 128, 128, 128, 200, 200, 200, 255, 255, 255};
+        const std::array<float, 3> half{0.5F, 0.5F, 0.5F};
+        const std::vector<float> exact = normalize_div255(levels, half, half, false);
+        const std::vector<float> rounded = normalize_div255(levels, half, half, true);
+        const std::uint32_t want_exact[6] = {0xbf800000U, 0xbf7dfdfeU, 0xbb808080U, 0x3b808100U, 0x3f119192U, 0x3f800000U};
+        const std::uint32_t want_rounded[6] = {0xbf800000U, 0xbf7e0000U, 0xbb810000U, 0x3b810000U, 0x3f120000U, 0x3f800000U};
+        bool bits = exact.size() == 18 && rounded.size() == 18;
+        for (std::size_t i = 0; bits && i < 18; ++i)
+            bits = std::bit_cast<std::uint32_t>(exact[i]) == want_exact[i / 3] &&
+                   std::bit_cast<std::uint32_t>(rounded[i]) == want_rounded[i / 3];
+        check(bits, "normalize_div255 bits");
+    }
     const Image grid = pattern(1, 12, 8);
     const auto tiles = tile(grid, 4, 4);
     check(tiles.size() == 6 && tiles[4].rgb[0] == grid.rgb[(std::size_t(4) * 12 + 4) * 3] &&

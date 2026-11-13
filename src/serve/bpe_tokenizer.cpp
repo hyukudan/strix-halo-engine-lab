@@ -3,10 +3,13 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cstring>
 #include <fstream>
+#include <functional>
 #include <iterator>
 #include <limits>
+#include <memory>
 #include <mutex>
 #include <stdexcept>
 #include <unordered_map>
@@ -350,17 +353,65 @@ struct BpeTokenizer::Impl {
     // tokenizer.json `ignore_merges`: a pre-token piece that is itself a vocabulary entry is emitted as that ID
     bool ignore_merges = false;
     std::uint32_t eos = UINT32_MAX;
-    mutable std::mutex cache_mutex;
-    mutable std::unordered_map<std::string, std::vector<std::uint32_t>> cache;
-
-    void bpe(std::string_view piece, std::vector<std::uint32_t>& out) const {
-        {
-            const std::lock_guard lock(cache_mutex);
-            if (const auto hit = cache.find(std::string(piece)); hit != cache.end()) {
-                out.insert(out.end(), hit->second.begin(), hit->second.end());
-                return;
+    // Piece cache: memoises bpe(), which is a pure function of the piece. Encoders on different threads read
+    // it at the same time, so a hit takes no lock and writes no shared memory: the table is insert-only with
+    // immutable entries published by compare-and-swap. When it reaches its entry limit a new table replaces
+    // it; readers retain ownership, and a segment refreshes its handle on a full-table miss.
+    // The limit is per table (concurrent inserts may overshoot); retired tables live until readers leave.
+    struct PieceTable {
+        struct Entry {
+            std::size_t hash;
+            std::string piece;
+            std::vector<std::uint32_t> ids;
+        };
+        static constexpr std::size_t slots = std::size_t{1} << 19U, limit = 200000U; // about 38 % at the threshold
+        std::unique_ptr<std::atomic<Entry*>[]> table{new std::atomic<Entry*>[slots]()};
+        std::atomic<std::size_t> size{0};
+        PieceTable() = default;
+        PieceTable(const PieceTable&) = delete;
+        PieceTable& operator=(const PieceTable&) = delete;
+        ~PieceTable() {
+            for (std::size_t i = 0; i < slots; ++i) delete table[i].load(std::memory_order_relaxed);
+        }
+        const Entry* find(std::size_t hash, std::string_view piece) const {
+            for (std::size_t i = hash & (slots - 1U);; i = (i + 1U) & (slots - 1U)) {
+                const Entry* entry = table[i].load(std::memory_order_acquire);
+                if (!entry) return nullptr;
+                if (entry->hash == hash && entry->piece == piece) return entry;
             }
         }
+        // False when the table is full: the caller replaces it.
+        bool insert(std::size_t hash, std::string_view piece, const std::vector<std::uint32_t>& ids) {
+            if (size.load(std::memory_order_relaxed) >= limit) return false;
+            auto entry = std::make_unique<Entry>(Entry{hash, std::string(piece), ids});
+            for (std::size_t i = hash & (slots - 1U);; i = (i + 1U) & (slots - 1U)) {
+                Entry* seen = table[i].load(std::memory_order_acquire);
+                if (!seen && table[i].compare_exchange_strong(seen, entry.get(), std::memory_order_release,
+                                                              std::memory_order_acquire)) {
+                    (void)entry.release();
+                    size.fetch_add(1, std::memory_order_relaxed);
+                    return true;
+                }
+                if (seen->hash == hash && seen->piece == piece) return true; // another encoder published it first
+            }
+        }
+    };
+    mutable std::mutex cache_mutex; // guards the pointer at segment start and rollover
+    mutable std::shared_ptr<PieceTable> cache = std::make_shared<PieceTable>();
+
+    std::shared_ptr<PieceTable> piece_table() const {
+        const std::lock_guard lock(cache_mutex);
+        return cache;
+    }
+    void bpe(std::string_view piece, std::vector<std::uint32_t>& out, std::shared_ptr<PieceTable>& pieces) const {
+        const std::size_t hash = std::hash<std::string_view>{}(piece);
+        if (const auto* hit = pieces->find(hash, piece)) {
+            out.insert(out.end(), hit->ids.begin(), hit->ids.end());
+            return;
+        }
+#ifdef STRIX_BPE_CACHE_TEST_MISS
+        STRIX_BPE_CACHE_TEST_MISS(pieces); // standalone host regression observer; absent in production
+#endif
         std::vector<std::string> symbols;
         symbols.reserve(piece.size());
         for (const char ch : piece) symbols.push_back(byte_unicode[static_cast<unsigned char>(ch)]);
@@ -400,18 +451,19 @@ struct BpeTokenizer::Impl {
             if (id != ids.end()) { result.push_back(id->second); continue; }
             throw std::runtime_error("tokenizer: BPE symbol is not in the vocabulary");
         }
-        {
+        while (!pieces->insert(hash, piece, result)) {
             const std::lock_guard lock(cache_mutex);
-            if (cache.size() > 200000U) cache.clear();
-            cache.emplace(std::string(piece), result);
+            if (cache == pieces) cache = std::make_shared<PieceTable>();
+            pieces = cache; // another segment may already have replaced it; retry the computed result
         }
         out.insert(out.end(), result.begin(), result.end());
     }
     void encode_plain(std::string_view text, std::vector<std::uint32_t>& out) const {
         const auto points = decode_utf8(text);
+        std::shared_ptr<PieceTable> pieces = piece_table();
         for (const auto& [begin, end] : pre_kind == PreTokenizer::deepseek ? pre_split_deepseek(points)
                                                                            : pre_split(points, pre_kind == PreTokenizer::glm4))
-            bpe(text.substr(begin, end - begin), out);
+            bpe(text.substr(begin, end - begin), out, pieces);
     }
 };
 

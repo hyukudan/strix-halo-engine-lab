@@ -17,7 +17,7 @@ function(strix_add_standalone_serve serve_target handoff_target)
     add_library(${serve_target} STATIC
         ${_root}/src/serve/json_constraint.cpp ${_root}/src/serve/constraint_selection.cpp ${_root}/src/serve/bpe_tokenizer.cpp
         ${_root}/src/serve/chat_template.cpp ${_root}/src/serve/deepseek_chat.cpp ${_root}/src/serve/engine.cpp
-        ${_root}/src/serve/api.cpp ${_root}/src/serve/request_fields.cpp ${_root}/src/serve/health.cpp
+        ${_root}/src/serve/api.cpp ${_root}/src/serve/media.cpp ${_root}/src/serve/request_fields.cpp ${_root}/src/serve/health.cpp
         ${_root}/src/serve/http_server.cpp
         # Called by src/serve/api.cpp (deployment routes, preflight view of the status).
         ${_root}/src/serve/deployment.cpp ${_root}/src/preflight.cpp ${_root}/src/linux_uma_observation.cpp
@@ -26,7 +26,7 @@ function(strix_add_standalone_serve serve_target handoff_target)
     target_include_directories(${serve_target} PUBLIC ${_root}/include PRIVATE ${_root}/src/serve "${CMAKE_BINARY_DIR}/generated")
     target_compile_features(${serve_target} PUBLIC cxx_std_20)
     # src/serve/api.cpp calls the shared power sampler: linked by name, this graph has no HIP gate to carry it.
-    target_link_libraries(${serve_target} PUBLIC ${handoff_target} strix_power)
+    target_link_libraries(${serve_target} PUBLIC ${handoff_target} strix_power strix_session)  # api.cpp builds the per-request EmbedTable
     if(MSVC)
         target_compile_definitions(${serve_target} PRIVATE _CRT_SECURE_NO_WARNINGS)
         target_compile_definitions(${handoff_target} PRIVATE _CRT_SECURE_NO_WARNINGS)

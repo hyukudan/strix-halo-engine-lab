@@ -52,7 +52,7 @@ mismatch. `0` restores the legacy path. Restart both ranks after a change.
 `0` or `1`.
 
 Prefill kernel variant selectors (`STRIX_GLM_PF_HC`, `_MLA`, `_IDX`, `_SELECT`, `_OBAR`, `_MLA_GEMM`, `_SCORES`,
-`_KDA_SCAN`, `_DENSE_ROWS`) share one table used by the engine and by `--print-effective-config`. Unset selects
+`_KDA_SCAN`, `_DENSE_ROWS`, `_DENSE_FORM`) share one table used by the engine and by `--print-effective-config`. Unset selects
 the default; any set value, empty included, must be a listed variant or startup is refused with
 `ENV='v' is not a known variant (allowed: ...; unset = D)`. The effective-config line reports the variant that
 runs.
@@ -67,7 +67,8 @@ runs.
 | `STRIX_GLM_PF_MLA_GEMM` | 3, 2, 1 |
 | `STRIX_GLM_PF_SCORES` | 7, 6, 5, 4, 3, 2 |
 | `STRIX_GLM_PF_KDA_SCAN` | 5, 3, 1 |
-| `STRIX_GLM_PF_DENSE_ROWS` | 3, 2, 1 |
+| `STRIX_GLM_PF_DENSE_ROWS` | 4, 3, 2, 1 |
+| `STRIX_GLM_PF_DENSE_FORM` | 0, 1, 2, 3, 4, 5, 6, 7 (physical form of version 4; 0 = automatic per shape) |
 
 With `STRIX_XPORT_TRACE=1`, the prefill exchange prints
 `xport prefill bytes=... copied=... messages=... reuse_dependencies=...` when it closes. `reuse_dependencies`

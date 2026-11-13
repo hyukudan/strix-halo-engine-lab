@@ -144,7 +144,7 @@ llegar el núcleo en mosaico compartido (`src/core`), con los mismos bits.
 
 | Interruptor | Motor | Por defecto | Qué hace |
 |---|---|---|---|
-| `STRIX_DS41_PF_CORE=1` | deepseek | off | Prefill de expertos (gate/up, down) y el prefill denso Q8_0 x A8 en el núcleo compartido. Mismos bits que los kernels por defecto. Apagado porque aún es más lento: TTFT 8K 8,50 s frente a 8,39 s (+0,11 s, ABAB en silencio en el par, cuatro celdas cada uno). |
+| `STRIX_DS41_PF_CORE=0\|moe\|dense\|1` | deepseek | por forma | Qué productos del prefill corren en el núcleo compartido en lugar de los kernels de DeepSeek: `moe` = gate/up y down de expertos, `dense` = los productos densos Q8_0 x A8, `1` = ambos, `0` = ninguno. Mismos bits en todos los casos. Sin definir: el núcleo compartido donde el fixture de rango lo mide más rápido, el gate/up (-0,6..-2,2 %) y el down (-6,0..-7,2 %) Q8_0 del experto compartido (-2,8..-3,9 % en conjunto), y solo en lotes de 16 filas con `STRIX_DS41_FAST_MOE` desactivado y `STRIX_DS41_PREFILL_STAGE` distinto de `1`; el gate/up IQ2_XXS (-0,0..+0,4 % con 4096 filas, +0,0..+1,2 % con 2048) y el down Q2_K (-0,1..+2,4 %, más lento en 11 de 12 celdas) enrutados y los productos densos siguen en los kernels de DeepSeek. Con `moe` los productos enrutados quedan en +0,2..+1,2 % y el experto compartido en -2,9..-4,6 %. Se resuelve una vez por ejecución; cualquier otro valor, incluido el vacío, se rechaza. |
 | `STRIX_DS41_FAST_I4=1` | deepseek | off | Prefill borrador con pérdida: los pesos GGUF de los expertos se decodifican a INT4 en el kernel y la entrada A8 se recuantiza a A4. Corre en el núcleo compartido. `STRIX_DS41_FAST_I4_SCOPE=all\|gu` elige gate/up/down (por defecto) o solo gate/up. Sin cualificar en calidad. |
 | `STRIX_GLM_MODEL_FORMAT=fast_i4` | glm | `exl3` | Formato con pérdida: los expertos enrutados gate/up de las capas MoE tardías se guardan en INT4 (prefill W4A4, decode W4A16) y se libera su copia EXL3. Rechaza las identidades exactas. Frente a FAST en el par: KL de los logits de prefill 0,0145, top-1 95,4 %, NLL -0,002 (umbral 0,02 / 93 % / +0,01); tokens de decode con teacher forcing KL 0,0098, top-1 94,8 %; prefill 8K -2,0 %, 32K -3,2 %; velocidad de decode normal y MTP sin cambios. |
 | `STRIX_GLM_FAST_I4_EXL3_LAYERS=<lista>` | glm | `0-14` | Con `fast_i4`: capas MoE (ordinales, rangos `a-b` o `none`) que conservan los expertos enrutados EXL3. Una capa INT4 temprana cuesta un escalón de calidad que satura, las tardías son baratas; INT4 en todas las capas no pasa el umbral de calidad. |
@@ -231,7 +231,7 @@ Sigue el enlace para ver la ganancia, las precondiciones y el interruptor de apa
 | `STRIX_GLM_PF_ATTN_QWIN` | glm | auto | [glm-pf-attn-qwin](optimizations.md#glm-pf-attn-qwin) |
 | `STRIX_GLM_PF_AUX_COMBINE` | glm | 1 | [glm-pf-aux-combine](optimizations.md#glm-pf-aux-combine) |
 | `STRIX_GLM_PF_DENSE_FORM` | glm | automático (0) | [glm-pf-dense-rows-v4](optimizations.md#glm-pf-dense-rows-v4) |
-| `STRIX_GLM_PF_DENSE_ROWS` | glm | 3 | [glm-pf-dense-rows-v3](optimizations.md#glm-pf-dense-rows-v3) |
+| `STRIX_GLM_PF_DENSE_ROWS` | glm | 4 | [glm-pf-dense-rows-v4](optimizations.md#glm-pf-dense-rows-v4) |
 | `STRIX_GLM_PF_HC_EXPAND_ROWS` | glm | 2 | [glm-pf-hc-expand-rows](optimizations.md#glm-pf-hc-expand-rows) |
 | `STRIX_GLM_PF_HC_FUSE` | glm | 1 | [glm-pf-hc-fuse](optimizations.md#glm-pf-hc-fuse) |
 | `STRIX_GLM_PF_HC_HOIST` | glm | 1, 1 | [glm-pf-sumexp](optimizations.md#glm-pf-sumexp) |
@@ -259,6 +259,7 @@ Sigue el enlace para ver la ganancia, las precondiciones y el interruptor de apa
 | `STRIX_MMX_PREFILL_TAIL_STREAM` | minimax | 1 | [mm-pf-tail-stream](optimizations.md#mm-pf-tail-stream) |
 | `STRIX_MM_PFX` | minimax | on | [mm-rank-pfx](optimizations.md#mm-rank-pfx) |
 | `STRIX_MM_PFX_CHUNK` | minimax | 4194304 | [mm-pfx-chunk](optimizations.md#mm-pfx-chunk) |
+| `STRIX_MM_PFX_JOINED` | minimax | 1 | [mm-pfx-joined](optimizations.md#mm-pfx-joined) |
 | `STRIX_MM_PF_ASYNC_START` | minimax | ON | [minimax-grouped-prefill.md](minimax-grouped-prefill.md) |
 | `STRIX_MM_PF_ATTEND4` | minimax | 1 | [mm-pf-attend4](optimizations.md#mm-pf-attend4) |
 | `STRIX_MM_PF_DENSE_O` | minimax | 1 | [mm-pf-dense-o](optimizations.md#mm-pf-dense-o) |
@@ -297,7 +298,7 @@ Sigue el enlace para ver la ganancia, las precondiciones y el interruptor de apa
 | `STRIX_QPF2K_HC_MASK` | qwen | 14 | [qwen-hc](optimizations.md#qwen-hc) |
 | `STRIX_QPF2K_HC_OUTPUT3` | qwen | 1 | [qwen-hc](optimizations.md#qwen-hc) |
 | `STRIX_QPF2K_HC_OUTPUT3_BAND` | qwen | 16 | [qwen-hc](optimizations.md#qwen-hc) |
-| `STRIX_QPF2K_HC_RECOMPUTE_NORM` | qwen | OFF pending native equality and not-s... | [hc-normalized-recompute-candidate](optimizations.md#hc-normalized-recompute-candidate) |
+| `STRIX_QPF2K_HC_RECOMPUTE_NORM` | qwen | ON with the WMMA HC output (auto); =1 ... | [hc-normalized-recompute](optimizations.md#hc-normalized-recompute) |
 | `STRIX_QPF2K_HC_UPCOPY` | qwen | auto with HC output v3 | [qwen-hc](optimizations.md#qwen-hc) |
 | `STRIX_QPF2K_INDEX_BATCH` | qwen | ON | [exact-indexer-projection-batching](optimizations.md#exact-indexer-projection-batching) |
 | `STRIX_QPF2K_MOE_DA16` | qwen | 1 | [qwen-moe](optimizations.md#qwen-moe) |
@@ -306,6 +307,7 @@ Sigue el enlace para ver la ganancia, las precondiciones y el interruptor de apa
 | `STRIX_QPF2K_MOE_MC` | qwen | 1 (mode 1; mode 2 needs an explicit v... | [qwen-moe-merge-commit](optimizations.md#qwen-moe-merge-commit) |
 | `STRIX_QPF2K_MOE_ROUTE` | qwen | 14 | [qwen-moe](optimizations.md#qwen-moe) |
 | `STRIX_QPF2K_MOE_XOR64` | qwen | 1 | [qwen-moe-xor-rows](optimizations.md#qwen-moe-xor-rows) |
+| `STRIX_QPF2K_MOE_DA16_ISSUE` | qwen | auto | [qwen-moe-da16-issue](optimizations.md#qwen-moe-da16-issue) |
 | `STRIX_QPF2K_QSA` | qwen | 1 | [qwen-qsa](optimizations.md#qwen-qsa) |
 | `STRIX_QPF2K_QSA_MASK` | qwen | 0x2257 | [qwen-qsa](optimizations.md#qwen-qsa) |
 | `STRIX_QPF2K_SCHED` | qwen | 14 | [qwen-schedule](optimizations.md#qwen-schedule) |
@@ -314,6 +316,10 @@ Sigue el enlace para ver la ganancia, las precondiciones y el interruptor de apa
 | `STRIX_QPF2K_T16K` | qwen | ON from 32768 prompt tokens | [automatic-t16384-prefill](optimizations.md#automatic-t16384-prefill) |
 | `STRIX_QPF2K_WMMA_PIN` | qwen | 1 | [qwen-dense](optimizations.md#qwen-dense) |
 | `STRIX_SERVE_PREFILL` | qwen | ON: admitted T8192; configured prefix... | [default-prompt-prefill](engine/serving/serving.md#default-prompt-prefill) |
+| `STRIX_SERVE_ROUTE` | qwen | ON: server tile and prefill arithmetic from the single-request route rule; `0` restores T8192 with the resolved arithmetic | [default-prompt-prefill](engine/serving/serving.md#default-prompt-prefill) |
+| `STRIX_SERVE_PREFILL_ORG` | qwen | ON: an admitted server owner takes the prefill organization of the single-request route (row-loop, attention stage, table and expert header/merge batching); `0` keeps the startup items only | [default-prompt-prefill](engine/serving/serving.md#default-prompt-prefill) |
+| `STRIX_SERVE_T16K` | qwen | ON: T16384 owner when the context admits a 32,768-token request and every resident slot fits; `0` keeps T8192 | [default-prompt-prefill](engine/serving/serving.md#default-prompt-prefill) |
+| `STRIX_SERVE_FP16_MTP` | qwen | ON: explicit-sidecar MTP servers keep the automatic FP16 prefill arithmetic with the unqualified fast options off; `0` declines it | [default-prompt-prefill](engine/serving/serving.md#default-prompt-prefill) |
 
 ### Decode, MTP y DSpark (22)
 

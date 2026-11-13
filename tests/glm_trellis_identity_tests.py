@@ -6,9 +6,11 @@ byte-identical to moe_core before extraction (LF-normalized, no token rewriting)
 This establishes source construction identity, not compiled/device qualification.
 Shared primitives that later gained a host emulation are compared through their device
 view: `__host__ ` dropped and only the `__HIP_DEVICE_COMPILE__` branch kept.
-Four entries are pinned as forwards to the single core implementation instead of the
-original body: materialize and hadamard128 (core/hadamard.hpp), hash16 and mul1_pair
-(core/packed_decoder.hpp). vector_splits is the shared policy (same body as GLM's).
+Two entries are pinned as forwards to the single core implementation instead of the
+original body: materialize and hadamard128 (core/hadamard.hpp). The codec primitives
+(hash16, mul1_pair, LaneGeom, the address helpers, TileStates) are the original bodies,
+moved into src/core/trellis_codec.hpp (the codec shared by every engine) and fingerprinted
+there. vector_splits is the shared policy (same body as GLM's).
 """
 from hashlib import sha256
 from pathlib import Path
@@ -30,9 +32,9 @@ EXPECTED = {'Half2': ('using Half2 =', 'b6555aa71356cdb36d3994f7842cbe84710742e3
  'transform_block_values': ('__device__ __forceinline__ void transform_block_values(',
                             '9d05fdb97c360160fc2c8c0e98fc4a01987b1695418105a95a26a006b12a3df3'),
  'hash16': ('template <std::uint32_t Multiplier> __device__ __forceinline__ std::uint32_t hash16(',
-            '8ba64955d16c0d7f7e520fd2d0ff4c29958e5c2b7a0b397e893a82c45dfcf1cc'),
+            'd7d2186bbf360419b55b3641173e4f7f3ac2bde1bb3ad5d3b09b9f91cc8f539c'),
  'mul1_pair': ('__device__ __forceinline__ Half2 mul1_pair(',
-               'cf030fbbaaadd7c20b0649de6718bd3783fc341b766d44fd409c3c3fdcb901c4'),
+               'bab89ad1a2099b6e9ac8d5cda86ec31f71542b00023b3304c7fad1077fc1fbab'),
  'LaneGeom': ('template <int Bits> struct LaneGeom',
               'a09fa525682d8ce3bc2d6445f64e4337d053decda5d0f6adac692cbf48f8ce50'),
  'GlobalU32': ('using GlobalU32 =', '732234177a16c9da5fe7baa7eb767daf261bf72946839196da7828adb63342cf'),
@@ -42,7 +44,9 @@ EXPECTED = {'Half2': ('using Half2 =', 'b6555aa71356cdb36d3994f7842cbe84710742e3
  'load_u32': ('__device__ __forceinline__ std::uint32_t load_u32(',
               '4e0f0a28553caff0cb72c7af1d334ef2c5d86db61fe9818c74d2f8593cfc0174'),
  'TileStates': ('template <int Bits> struct TileStates',
-                '798aa9c356d1e7288aa37fbe191906a705d5375287c124ffb21c26b881458607'),
+                # state<J>() returns the extracted State16 (integer conversion = the original mask); original
+                # GLM declaration: 798aa9c356d1e7288aa37fbe191906a705d5375287c124ffb21c26b881458607.
+                '0e06b2816fc08eea101a6184e861161bd664193efabf71154d5f0ba16f276cb9'),
  'reduce4': ('__device__ __forceinline__ float reduce4(',
              '4ad51702f5a02a032a7c3729ec84949e8640c0366e58d31324ffb7cf861fd6d5'),
  'Slot': ('template <int Bits, int R> struct Slot',
@@ -53,6 +57,13 @@ EXPECTED = {'Half2': ('using Half2 =', 'b6555aa71356cdb36d3994f7842cbe84710742e3
                       '3bd06fa97279278867af1dee16c0283614519949ecd456df0713acd950f4bba7'),
  'vector_splits': ('__host__ __device__ constexpr unsigned vector_splits(',
                    'b1df182d0fd0a443356251c8705c9b4e99a00906a4a2c631aa6017286848dcb2')}
+
+# Codec dependencies of the pinned declarations that the adapter does not import by name: TileStates::state<J>()
+# returns State16, whose integer conversion is the 16-bit mask, and the pair overload passes the states unmasked.
+DEPENDENCIES = {
+ 'State16': ('struct State16', 'e858841c39378d3d13aebc682092e116bc4806706e4abd7a3c6db25ff64393f9'),
+ 'mul1_pair(State16)': ('Half2 mul1_pair(State16 first, State16 second)',
+                        'd6a3ac5a1cffb1b9d23aa45d974c35644f8fbbe4e4f8068541ac0076f22fd93c')}
 
 
 def declaration(source, marker):
@@ -83,12 +94,17 @@ def device_view(source):
 
 def main():
     adapter = (ROOT / "src/glm/moe/glm_trellis_device.hpp").read_text()
-    shared = device_view((ROOT / "src/moe_core/exl3_trellis.hpp").read_text())
+    # The codec primitives (hash16 .. TileStates) live in the shared codec header; moe_core re-exports them.
+    shared = device_view((ROOT / "src/moe_core/exl3_trellis.hpp").read_text() +
+                         (ROOT / "src/core/trellis_codec.hpp").read_text())
     imports = re.findall(r"^using strix::moe_core::(\w+);$", adapter, re.MULTILINE)
     assert sorted(imports) == sorted(EXPECTED), imports
     for name, (marker, expected) in EXPECTED.items():
         actual = sha256(declaration(shared, marker).encode()).hexdigest()
         assert actual == expected, name + " original GLM declaration changed"
+    for name, (marker, expected) in DEPENDENCIES.items():
+        actual = sha256(declaration(shared, marker).encode()).hexdigest()
+        assert actual == expected, name + " codec dependency changed"
     # Permit only imports in the adapter (the split policy is the shared one too).
     remainder = re.sub(r"//[^\n]*", "", adapter)
     remainder = re.sub(r"^using strix::moe_core::\w+;$", "", remainder, flags=re.MULTILINE)
@@ -97,6 +113,7 @@ def main():
     remainder = remainder.replace("namespace strix::glm::moe::dev {", "").replace("}", "")
     assert not remainder.strip(), "adapter must not acquire primitive bodies"
     print("PASS: %d imported primitive declarations match their pinned fingerprints" % len(EXPECTED))
+    print("PASS: %d codec dependency declarations match their pinned fingerprints" % len(DEPENDENCIES))
     print("PASS: thin-adapter contract (imports only)")
 
 

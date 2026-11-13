@@ -418,6 +418,51 @@ void check_chunked(const DeviceExperts& x, std::uint32_t rows, std::uint32_t top
                    const std::string& label);
 void check_q8_nan_payloads();
 
+// Rows narrower than the 8 group classes of a wave pair (hidden 32 = one group, inter 64 = two): some waves own no group.
+// Gate/up alone (a down of 32 outputs is not a valid view), per-form default and every product on the shared core against
+// the kernels of the engine, bit for bit; the policy names and the rejection of an unknown one.
+void check_narrow_gate_up() {
+    using namespace strix::ds41;
+    const auto e = synthetic_experts(WeightFormat::q8_0, WeightFormat::q8_0, 1, 32, 64, 45);
+    const DeviceExperts x(e);
+    const std::uint32_t rows = 37, top_k = 1, batch_rows = 16;
+    const auto ids = routing(rows, top_k, e.experts, 0.0, 12);
+    RouteBuffers rb(rows, top_k, e.experts, batch_rows);
+    rb.ids.upload(ids);
+    enqueue_build_prefill_routes(rb.ids.data, rows, top_k, e.experts, 1, batch_rows, rb.b, nullptr);
+    const auto view = prefill_routes_view(rb.b, rows, top_k, e.experts, batch_rows);
+    Inputs in(rows, top_k, e.hidden, 23);
+    struct Got { std::vector<float> gate, up, deltas; std::vector<std::int8_t> codes; std::vector<std::int32_t> sums; };
+    const auto run_arm = [&](const char* policy) {
+        set_pf_core(policy);
+        PrefillRun run(rows, rows, 128, e.inter, true);
+        run.gate.fill_pattern(); run.up.fill_pattern(); run.act_codes.fill_pattern(); run.act_deltas.fill_pattern(); run.act_sums.fill_pattern();
+        PrefillGateUpView gu;
+        gu.gate = x.gate.data; gu.up = x.up.data; gu.expert_stride_bytes = e.gate_row() * e.inter; gu.row_bytes = e.gate_row();
+        gu.hidden = e.hidden; gu.inter = e.inter; gu.routes = view; gu.codes = in.codes.data; gu.deltas = in.deltas.data;
+        gu.gate_out = run.gate.data; gu.up_out = run.up.data;
+        gu.act_codes = run.act_codes.data; gu.act_deltas = run.act_deltas.data; gu.act_sums = run.act_sums.data;
+        enqueue_prefill_gate_up(e.gate_up, gu, nullptr);
+        check(hipDeviceSynchronize(), "narrow gate/up");
+        return Got{run.gate.download(), run.up.download(), run.act_deltas.download(), run.act_codes.download(), run.act_sums.download()};
+    };
+    const auto priv = run_arm("0");
+    std::size_t bad = 0;
+    for (const char* policy : {static_cast<const char*>(nullptr), "moe", "1"}) {
+        const auto got = run_arm(policy);
+        bad += bit_mismatches(got.gate, priv.gate) + bit_mismatches(got.up, priv.up) + bit_mismatches(got.codes, priv.codes) +
+               bit_mismatches(got.deltas, priv.deltas) + bit_mismatches(got.sums, priv.sums);
+    }
+    bool rejected = false;
+    try { set_pf_core("mo"); } catch (const std::invalid_argument&) { rejected = true; }
+    try { set_pf_core(""); rejected = false; } catch (const std::invalid_argument&) {}
+    set_pf_core(-1);
+    expect(bad == 0U && rejected, "narrow Q8_0 gate/up h32 i64: " + std::to_string(bad) + " differ, unknown policy " +
+        (rejected ? "rejected" : "ACCEPTED"));
+    std::cout << "synthetic Q8_0 narrow gate/up h32 i64: default / moe / 1 against the engine kernels "
+              << (bad == 0U ? "bit-exact" : "MISMATCH") << ", unknown and empty policy " << (rejected ? "rejected" : "ACCEPTED") << "\n";
+}
+
 void test_synthetic() {
     {
         const auto e = synthetic_experts(WeightFormat::iq2_xxs, WeightFormat::q2_k, 16, 1024, 512, 5);
@@ -453,6 +498,20 @@ void test_synthetic() {
         check_case(x, 45, 1, 1, 32, 0.0, 7, "synthetic Q8_0 shared h5120");
         check_case(x, 37, 1, 1, 16, 0.0, 8, "synthetic Q8_0 shared h5120");
     }
+    {
+        // narrow rows: gate/up of 4 groups, down of 2 (width 64, 128 outputs); per-form default (the shared core for
+        // these Q8_0 forms), the engine kernels and every product on the shared core, each against the decode windows
+        const auto e = synthetic_experts(WeightFormat::q8_0, WeightFormat::q8_0, 1, 128, 64, 55);
+        const DeviceExperts x(e);
+        for (const char* policy : {static_cast<const char*>(nullptr), "0", "1"}) {
+            strix::ds41::set_pf_core(policy);
+            const std::string name = std::string("synthetic Q8_0 narrow h128 i64 PF_CORE=") + (policy ? policy : "unset");
+            check_case(x, 37, 1, 1, 16, 0.0, 13, name);
+            check_case(x, 45, 1, 1, 32, 0.0, 14, name);
+        }
+        strix::ds41::set_pf_core(-1);
+    }
+    check_narrow_gate_up();
     check_q8_nan_payloads();
 }
 
@@ -890,7 +949,9 @@ std::vector<std::string> split_on(const std::string& s, char c) {
 struct Arm { std::string name; std::vector<std::pair<std::string, std::string>> env; };
 void apply_arm(const Arm& a) {
     for (const auto& [k, v] : a.env) {
-        if (v == "-") unsetenv(k.c_str());
+        // resolved once per run in the library: the arms go through the harness override
+        if (k == "STRIX_DS41_PF_CORE") strix::ds41::set_pf_core(v == "-" ? nullptr : v.c_str());
+        else if (v == "-") unsetenv(k.c_str());
         else setenv(k.c_str(), v.c_str(), 1);
     }
 }
@@ -972,8 +1033,16 @@ void bench_rank(const DeviceExperts& x, std::uint32_t top_k, std::uint32_t owned
                     const auto bad = bit_mismatches(codes, ref_codes) + bit_mismatches(deltas, ref_deltas) + bit_mismatches(sums, ref_sums) +
                         bit_mismatches(raw, ref_raw);
                     expect(bad == 0U, label + " T=" + std::to_string(rows) + " arm " + arms[arm].name + ": outputs differ from arm " + arms[0].name);
+                    const auto fnv = [](const auto& v) {
+                        std::uint64_t h = 1469598103934665603ULL;
+                        const auto* p = reinterpret_cast<const unsigned char*>(v.data());
+                        for (std::size_t i = 0; i < v.size() * sizeof(v[0]); ++i) h = (h ^ p[i]) * 1099511628211ULL;
+                        return h;
+                    };
                     std::cout << "RANK-CHECK " << label << " T=" << rows << " arm " << arms[arm].name << " vs " << arms[0].name << ": "
-                              << (bad == 0U ? "bit-identical" : "MISMATCH " + std::to_string(bad)) << " (A8 codes/deltas/sums, raw)\n";
+                              << (bad == 0U ? "bit-identical" : "MISMATCH " + std::to_string(bad)) << " (A8 codes/deltas/sums, raw)" << std::hex
+                              << " fnv codes " << fnv(codes) << " group sums " << fnv(sums) << " deltas " << fnv(deltas) << " raw " << fnv(raw)
+                              << std::dec << '\n';
                 }
             }
         const double ops_gu = 2.0 * static_cast<double>(entries) * 2.0 * e.inter * e.hidden;
