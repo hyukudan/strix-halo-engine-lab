@@ -1201,6 +1201,14 @@ static int run_decode_entry(
     // excluded or undeclared one and prints the "device:" receipt line. Without a declaration the single integrated
     // GPU of a node keeps working (declared=implicit). A retry re-enters here with the flags already removed.
     strix::device::bind_hip_main(argc, argv);
+    // Host wait policy of this engine (shared home: strix/device/hip_gate.hpp; STRIX_HOST_WAIT overrides): blocking.
+    // The runtime's own schedule busy-waits (one host core at 100 % for the whole prefill) for no measured speed.
+    try {
+        (void)strix::device::set_host_wait(strix::device::HostWait::blocking);
+    } catch (const std::exception& e) {
+        std::fprintf(stderr, "%s\n", e.what());
+        return 2;
+    }
     if (strix::print_device_profile_if_requested(argc, argv)) return 0;
     if (argc == 2 && std::string_view(argv[1]) == "--help") {
         std::cout << "Usage: strix-hip-decode-token MODEL.gguf TOKEN_ID ... [options]\n"

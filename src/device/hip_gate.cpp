@@ -55,6 +55,20 @@ void bind_hip_main(int& argc, char** argv, std::FILE* receipt) {
     }
 }
 
+HostWait set_host_wait(HostWait engine_choice, std::FILE* receipt) {
+    const char* text = std::getenv("STRIX_HOST_WAIT");
+    const auto policy = resolve_host_wait(engine_choice, text);
+    if (policy != HostWait::runtime) {
+        const unsigned flag = policy == HostWait::spin ? hipDeviceScheduleSpin : policy == HostWait::yield ? hipDeviceScheduleYield : hipDeviceScheduleBlockingSync;
+        if (const auto status = hipSetDeviceFlags(flag); status != hipSuccess) fail(std::string("host wait: hipSetDeviceFlags failed: ") + hipGetErrorString(status));
+    }
+    if (receipt) {
+        std::fprintf(receipt, "host wait: %s (%s)\n", host_wait_name(policy), text && *text ? "STRIX_HOST_WAIT" : "engine");
+        std::fflush(receipt);
+    }
+    return policy;
+}
+
 const Bound* hip_bound() noexcept {
     auto& state = process();
     const std::lock_guard<std::mutex> lock(state.mutex);

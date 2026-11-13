@@ -3,6 +3,7 @@
 #include "strix/device/gate.hpp"
 
 #include <cstdio>
+#include <initializer_list>
 #include <string>
 
 // HIP side of the start gate, without HIP headers: any main can include this. bind_hip_main() is the one call a HIP
@@ -28,5 +29,37 @@ void bind_hip_main(int& argc, char** argv, std::FILE* receipt = stderr);
 
 // The binding made by this process, or null before the first bind (and always null without the HIP runtime).
 [[nodiscard]] const Bound* hip_bound() noexcept;
+
+// Host wait policy: how a host thread waits for the device (stream / event / device synchronize). ONE policy home for
+// every HIP binary: an engine names its choice once after the bind, and STRIX_HOST_WAIT=runtime|spin|yield|block
+// overrides whatever the engine named.
+//   runtime  : the HIP runtime's own schedule (no device flag is set)
+//   spin     : busy-wait; lowest wake latency, one host core at 100 % while the device works
+//   yield    : busy-wait that yields the core between polls
+//   blocking : sleep in the driver until the device signals; the core idles while the device works
+enum class HostWait { runtime, spin, yield, blocking };
+
+[[nodiscard]] constexpr const char* host_wait_name(HostWait policy) noexcept {
+    switch (policy) {
+        case HostWait::spin: return "spin";
+        case HostWait::yield: return "yield";
+        case HostWait::blocking: return "block";
+        default: return "runtime";
+    }
+}
+
+// The policy in force for an engine choice and the STRIX_HOST_WAIT text (null or empty: the engine choice). Throws
+// Refusal on any other text.
+[[nodiscard]] inline HostWait resolve_host_wait(HostWait engine_choice, const char* override_text) {
+    if (!override_text || !*override_text) return engine_choice;
+    const std::string text(override_text);
+    for (const auto policy : {HostWait::runtime, HostWait::spin, HostWait::yield, HostWait::blocking})
+        if (text == host_wait_name(policy)) return policy;
+    throw Refusal("host wait: STRIX_HOST_WAIT=" + text + " is not one of runtime|spin|yield|block");
+}
+
+// Applies the resolved policy to the calling thread's current device (call after bind_hip) and prints one receipt
+// line (null = silent). Returns the policy in force. Without the HIP runtime it only resolves.
+HostWait set_host_wait(HostWait engine_choice, std::FILE* receipt = stderr);
 
 } // namespace strix::device

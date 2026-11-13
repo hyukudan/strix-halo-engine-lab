@@ -245,6 +245,41 @@ KnownWindowResult execute_known_prefix_prefill_eager(const CompiledKnownPrefixPr
     }
     result.omitted_lm_heads=rows-static_cast<std::uint32_t>(result.logit_row_indices.size());
     result.logical_row_steps=static_cast<std::uint32_t>(rows*steps)-result.omitted_lm_heads;
+    // Final-block cone (default on; STRIX_PREFILL_FINAL_CONE=0, the baseline, STRIX_QPF2K_DEFAULTS=0 or a GSQ model run every row): on a block that keeps its head, the
+    // trailing steps that touch no session state and that no step observer reads feed only the head, and the head
+    // runs only on the logit rows. Those steps run on the trailing rows only (same entries,
+    // same per-row arithmetic). The MTP tap (last MLP injection) is observed on every row, so the default cones the
+    // final mix only (the one step the product route can cone).
+    const bool final_cone=strix::qpf2k::long_context_item_enabled("STRIX_PREFILL_FINAL_CONE");
+    // "2" (opt-in): every trailing stateless unobserved step, not only the final mix.
+    static const bool cone_tail=[]{const char* v=std::getenv("STRIX_PREFILL_FINAL_CONE");return v&&v[0]=='2'&&!v[1];}();
+    std::size_t cone_from=steps;std::uint32_t cone_first=0;
+    if(final_cone&&!headless&&!result.logit_row_indices.empty()&&steps>=2U&&!hooks.preflight_only&&!current_execution_telemetry()) {
+        // The coned steps keep their full-T entry (its arithmetic can differ from the 8-row tile's) on the last
+        // STRIX_PREFILL_FINAL_CONE_ROWS rows (default 128, whole tiles), or from the first logit row's tile if earlier.
+        static const std::uint32_t cone_rows=[]{const char* v=std::getenv("STRIX_PREFILL_FINAL_CONE_ROWS");
+            const auto n=v?std::strtoul(v,nullptr,10):128UL;return static_cast<std::uint32_t>(n<8UL?8UL:(n>65536UL?65536UL:(n+7UL)/8UL*8UL));}();
+        cone_first=rows%8U==0U&&rows>cone_rows?
+            std::min(*std::min_element(result.logit_row_indices.begin(),result.logit_row_indices.end())/8U*8U,rows-cone_rows):0U;
+        if(cone_first) {
+            std::size_t s=steps-1U;
+            while(s) {
+                const auto& t=serial.execution.steps[s-1U];
+                if(t.writes_state!=PersistentState::none||t.reads_state!=PersistentState::none||t.op==SerialOp::lm_head||
+                    (hooks.after_step&&(!hooks.after_step_observes||hooks.after_step_observes(s-1U)))||
+                    ((hooks.prefill_step||!cone_tail)&&t.op!=SerialOp::final_hyper_mix)) break;
+                --s;
+            }
+            cone_from=s;
+            const auto coned=static_cast<std::uint32_t>(steps-1U-cone_from);
+            result.logical_row_steps-=coned*cone_first;
+            if(coned) {
+                result.final_cone_first_row=cone_first;result.final_cone_steps=coned;
+                for(std::size_t c=cone_from;c+1U<steps;++c) if(known_window_rows_mode(plan.tile8.mode[c])) result.final_cone_skipped_tiles+=cone_first/8U;
+            }
+            if(timing&&coned) std::fprintf(stderr,"prefill final cone: steps [%zu,%zu) rows [%u,%u)\n",cone_from,steps-1U,cone_first,rows);
+        }
+    }
     result.execution.completion_order.reserve(rows*steps);
     for(const auto row:result.logit_row_indices) {
         const auto c=context(steps-1U,row);require(c.writes.size()==1U,"known prefill head needs one output");
@@ -435,22 +470,25 @@ KnownWindowResult execute_known_prefix_prefill_eager(const CompiledKnownPrefixPr
             } launch_lap{timing,launch_begin,launch_ms[static_cast<std::size_t>(mode)%launch_ms.size()],launch_steps[static_cast<std::size_t>(mode)%launch_steps.size()]};
             const bool rows_entry=known_window_rows_mode(mode);
             if(headless&&step>=headless_from) break;
+            const bool coned=step>=cone_from&&step+1U!=steps;
             if(rows_entry&&full_by_id[id]&&rows%8U==0U) {
-                std::vector<ExecutionDispatchContext> all(rows);for(std::uint32_t r=0;r<rows;++r) all[r]=context(step,r);
+                // A coned step runs the same entry on rows [cone_first,rows).
+                const std::uint32_t run_first=coned?cone_first:0U,run_rows=rows-run_first;
+                std::vector<ExecutionDispatchContext> all(run_rows);for(std::uint32_t r=0;r<run_rows;++r) all[r]=context(step,run_first+r);
                 auto correlation=current_execution_correlation();correlation.execution_identity=plan.prefill_execution_identity;
                 correlation.position=all[0].position;correlation.step_id=source.id;correlation.op=source.op;correlation.layer=source.layer.value_or(UINT32_MAX);
-                correlation.rows=rows;correlation.row=UINT32_MAX;correlation.phase=ExecutionPhase::operator_step;
+                correlation.rows=run_rows;correlation.row=UINT32_MAX;correlation.phase=ExecutionPhase::operator_step;
                 ExecutionCorrelationScope observed(correlation);
                 // STRIX_QPF2K_HC: the owner may enqueue this step folded with the full-T steps after it.
                 // A step the after_step observer reads is never folded (nor folded into an earlier step's fold).
                 const auto step_observed=[&](std::size_t s) {return hooks.after_step&&(!hooks.after_step_observes||hooks.after_step_observes(s));};
                 const auto full_entry=[&](std::size_t s) {
-                    if(s>=steps||(headless&&s>=headless_from)||step_observed(s)) return false;
+                    if(s>=steps||(headless&&s>=headless_from)||(s>=cone_from&&s+1U!=steps)!=coned||step_observed(s)) return false;
                     const auto m=plan.tile8.mode[s];const auto i=static_cast<std::uint32_t>(plan.tile8.r2_variant[s]);
                     return known_window_rows_mode(m)&&full_by_id[i]!=nullptr&&rows%8U==0U;
                 };
                 const auto contexts_of=[&](std::size_t s) {
-                    std::vector<ExecutionDispatchContext> v(rows);for(std::uint32_t r=0;r<rows;++r) v[r]=context(s,r);return v;
+                    std::vector<ExecutionDispatchContext> v(run_rows);for(std::uint32_t r=0;r<run_rows;++r) v[r]=context(s,run_first+r);return v;
                 };
                 const strix::qsa_cache_only::Scope cache_only(step==cache_only_step);
                 // STRIX_QPF2K_SCHED first: its hook enqueues only the detached shared expert itself and records the
@@ -459,7 +497,7 @@ KnownWindowResult execute_known_prefix_prefill_eager(const CompiledKnownPrefixPr
                     &&!(hooks.prefill_before_step&&!step_observed(step)&&hooks.prefill_before_step(step,all,full_entry,contexts_of)))
                     full_by_id[id]->launch(all,full_by_id[id]->config);
                 // Counted per 8-row tile, like the tile path, so receipts compare across both.
-                const auto tiles=rows/8U;
+                const auto tiles=run_rows/8U;
                 if(mode==KnownWindowStepMode::shared_rows) result.shared_rows_dispatches+=tiles;
                 else if(mode==KnownWindowStepMode::gdn_rows) result.gdn_rows_dispatches+=tiles;
                 else if(mode==KnownWindowStepMode::hyper_mix_rows) result.hyper_mix_rows_dispatches+=tiles;
@@ -467,7 +505,7 @@ KnownWindowResult execute_known_prefix_prefill_eager(const CompiledKnownPrefixPr
                 result.r2_variant_dispatches[id]+=tiles;
                 if(launch.steps[step].runtime_step) ++result.execution.runtime_steps;else ++result.execution.kernel_steps;
                 ++result.execution.completed_steps;result.execution.completion_order.push_back(source.id);
-                for(std::uint32_t r=0;r<rows;++r) result.execution.state.publish_write(source.writes_state);
+                for(std::uint32_t r=0;r<run_rows;++r) result.execution.state.publish_write(source.writes_state);
                 observe(step);
                 continue;
             }
@@ -477,7 +515,7 @@ KnownWindowResult execute_known_prefix_prefill_eager(const CompiledKnownPrefixPr
             // Any other step: the schedule hook only orders it after work it detached (never enqueues it).
             if(hooks.prefill_step&&hooks.prefill_step(step,{})) throw std::logic_error("known prefill schedule hook took a row step");
             static const bool rows_loops=[]{const char* v=std::getenv("STRIX_PREFILL_PIPE");return v&&(std::strtoul(v,nullptr,0)&16UL)!=0UL;}();
-            if(rows_loops&&!strix::qpf2k::suppressed(strix::qpf2k::Item::pipe)&&mode==KnownWindowStepMode::r1_row_loop&&rows>1U&&step+1U!=steps&&!launch.steps[step].runtime_step&&
+            if(rows_loops&&!coned&&!strix::qpf2k::suppressed(strix::qpf2k::Item::pipe)&&mode==KnownWindowStepMode::r1_row_loop&&rows>1U&&step+1U!=steps&&!launch.steps[step].runtime_step&&
                 !reads_position(source.reads_state)&&source.op!=SerialOp::ple&&!current_execution_telemetry())
                 if(const auto batched=rows_launch_for(launch.steps[step].function)) {
                     std::vector<ExecutionDispatchContext> all(rows);for(std::uint32_t r=0;r<rows;++r) all[r]=context(step,r);
@@ -491,7 +529,7 @@ KnownWindowResult execute_known_prefix_prefill_eager(const CompiledKnownPrefixPr
             const auto width=mode==KnownWindowStepMode::r1_row_loop?1U:(rows_entry?8U:2U);
             // All tiles of this source step run before advancing to its next
             // consumer/layer. Recurrent/conv/PLE/QSA rows remain increasing.
-            for(std::uint32_t first=0;first<rows;) {
+            for(std::uint32_t first=coned?cone_first:0U;first<rows;) {
                 const auto count=rows-first>=width?width:1U;
                 std::array<ExecutionDispatchContext,8> pack{};for(std::uint32_t r=0;r<count;++r) pack[r]=context(step,first+r);
                 auto correlation=current_execution_correlation();correlation.execution_identity=plan.prefill_execution_identity;

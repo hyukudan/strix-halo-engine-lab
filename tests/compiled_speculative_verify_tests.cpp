@@ -669,7 +669,11 @@ void known_prefix_prefill_tests(const strix::ModelContract& model) {
         expect(f.session.next_position==rows&&f.session.committed_tokens==rows&&f.session.state.generations==expected_generations,
             "T prefill commits real T inputs and exactly serial state generations once");
         expect(f.state_words==expected_state,"T step-major prefill preserves all seven logical host state payloads");
-        expect(result.shared_rows_dispatches==48U*(rows/8U)&&
+        // The final-block cone runs the trailing stateless steps (here: the last layer's shared step) from the tile
+        // of the terminal row only.
+        expect(policy!=P::terminal_row||rows<=8U||(rows%8U!=0U||(result.final_cone_first_row==rows-8U&&result.final_cone_steps>0U)),
+            "a terminal-row T block cones its trailing stateless steps to the terminal tile");
+        expect(result.shared_rows_dispatches==48U*(rows/8U)-result.final_cone_skipped_tiles&&
             (mixed?result.gdn_rows_dispatches==36U*(rows/8U):result.r2_dispatches==36U*(rows/2U)),
             "T prefill uses real closed tiles at every source step and explicit row tails");
         expect(f.trace.head_admissions.size()==(prefill.terminal_logits_arena?prefill.logit_row_indices.size():rows),
@@ -2399,6 +2403,15 @@ void known_window_mixed_format_tests(const strix::ModelContract& model) {
 }  // namespace
 
 int main() {
+    // The final-block cone keeps 128 trailing rows by default; the fixtures here are smaller, so cone to one tile, and cone
+    // every trailing stateless step (the fixture has no step observer).
+#ifdef _WIN32
+    _putenv_s("STRIX_PREFILL_FINAL_CONE_ROWS", "8");
+    _putenv_s("STRIX_PREFILL_FINAL_CONE", "2");
+#else
+    setenv("STRIX_PREFILL_FINAL_CONE_ROWS", "8", 1);
+    setenv("STRIX_PREFILL_FINAL_CONE", "2", 1);
+#endif
     const auto model =
         strix::ModelContract::qwen38_flash_next();
 

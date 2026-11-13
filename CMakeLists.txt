@@ -4312,7 +4312,7 @@ endif()
 if(STRIX_ENABLE_HIP_RUNTIME)
     # the HIP backend (routed experts resident on a gfx1151 node) and the server with relay over USB4
     add_library(strix_ds41_xs_hip STATIC src/hip_ds41_expert_backend.hip)
-    target_link_libraries(strix_ds41_xs_hip PUBLIC strix_ds41_xs strix_ds41_hip "${STRIX_HIP_RUNTIME_LIBRARY}")
+    target_link_libraries(strix_ds41_xs_hip PUBLIC strix_ds41_xs strix_ds41_hip strix_device_hip "${STRIX_HIP_RUNTIME_LIBRARY}")
     target_include_directories(strix_ds41_xs_hip PUBLIC include "${STRIX_HIP_INCLUDE_DIR}")
     set_target_properties(strix_ds41_xs_hip PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHS}")
     target_compile_options(strix_ds41_xs_hip PRIVATE -mno-wavefrontsize64 -fno-fast-math -ffp-contract=off

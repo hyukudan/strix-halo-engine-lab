@@ -206,6 +206,8 @@ Sigue el enlace para ver la ganancia, las precondiciones y el interruptor de apa
 | `STRIX_PREFIX_FAIR_RECLAIM_IDLE` | qwen | ON on the qualified single tiled-MTP ... | [prefix-retention-policy](engine/serving/prefix-state-cache.md#prefix-retention-policy) |
 | `STRIX_QRTX_PREFIX_CACHE` | qwen-rtx | ON | [qwen-rtx-prefix-cache](optimizations.md#qwen-rtx-prefix-cache) |
 | `STRIX_QSA_CACHE_ONLY` | qwen | 1 | [qwen-qsa-cache-only](optimizations.md#qwen-qsa-cache-only) |
+| `STRIX_PREFILL_FINAL_CONE` | qwen | 1 | [qwen-prefill-final-cone](optimizations.md#qwen-prefill-final-cone) |
+| `STRIX_HOST_WAIT` | qwen | block | [host-wait-policy](optimizations.md#host-wait-policy) |
 | `STRIX_SESSION_CACHE` | minimax | on (two-node serve route) | [mm-sessions](optimizations.md#mm-sessions) |
 
 ### Prefill (97)

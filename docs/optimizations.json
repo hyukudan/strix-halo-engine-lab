@@ -864,6 +864,28 @@
   },
   {
     "engine": "qwen",
+    "name": "Final-block cone: final hyper mix on the trailing rows only",
+    "flag_or_env": "STRIX_PREFILL_FINAL_CONE",
+    "default": "1",
+    "exact": "Exact: plain default command, same binary on/off: prefill logits byte-identical with the token at 8K (five arms) and, at 32K, the full logits of the prefill and of 48 MTP decode steps byte-identical with the tokens. A first form that ran the final mix through the 8-row tile entry was rejected: its prefill logits differed (up to 0.0044) because the full-T entry uses the FP16-output route.",
+    "gain": "8K single node, three alternating off/on pairs: 4,764.0 / 4,752.7 / 4,727.8 ms off vs 4,707.7 / 4,717.4 / 4,677.9 ms on (means 4,748.2 vs 4,701.0 ms, -1.0 %; adjacent pairs -56 / -35 / -50 ms); 32K with 48 decode steps, one pair: 21.11 s off vs 21.00 s on (within run noise)",
+    "preconditions": "A tiled prefill block that keeps its head (the final block), whole 8-row tiles and more than STRIX_PREFILL_FINAL_CONE_ROWS rows (default 128; the HIP hyper-mix entry needs at least 16). The MTP predictor reads the tap (last MLP injection) of every prompt row, so the last layer's MoE and injection still run on all rows; only the final mix, read by the head alone, is coned. =2 (opt-in, host-test evidence only) also cones every other trailing step that touches no session state and has no step observer.",
+    "off_switch": "STRIX_PREFILL_FINAL_CONE=0",
+    "doc_anchor": "docs/optimizations.md#qwen-prefill-final-cone"
+  },
+  {
+    "engine": "qwen",
+    "name": "Blocking host wait (shared host wait policy)",
+    "flag_or_env": "STRIX_HOST_WAIT",
+    "default": "block (Qwen decode app); other engines keep the runtime schedule unless they select one",
+    "exact": "Exact: the policy only changes how the host thread waits for the device. Prefill logits and tokens byte-identical between spin, block and the runtime schedule at 8K and between spin and block at 32K.",
+    "gain": "Host CPU time, not speed. 8K: host user CPU 2.3 s (block) vs 5.8-6.1 s (spin / runtime schedule), busiest thread 61-68 % vs 97-98 %; request 1,730 / 1,762 / 1,729 tok/s block vs 1,723 / 1,738 / 1,770 spin (three pairs, no ordered difference). 32K, two pairs: 18.90 / 18.84 s block vs 19.00 / 18.89 s spin, host user CPU 11.5 / 10.7 s vs 19.4 / 18.9 s. Power: the device power sensor (0.5 s samples) does not separate the arms (32K 135 / 137 W block vs 138 / 136 W spin; 8K 113-122 W both), so no watt saving is claimed.",
+    "preconditions": "Any HIP binary that calls the shared policy after the device bind (strix::device::set_host_wait). The HIP runtime's own schedule busy-waits on device completion, which keeps one host core at 100 % for the whole prefill.",
+    "off_switch": "STRIX_HOST_WAIT=runtime (or spin)",
+    "doc_anchor": "docs/optimizations.md#host-wait-policy"
+  },
+  {
+    "engine": "qwen",
     "name": "QSA scorer R64 above 65,536 blocks",
     "flag_or_env": "STRIX_QSA_SCORE_ROWS64",
     "default": "1 (from 65,536 blocks; per-group 64-row scoring follows the policy)",

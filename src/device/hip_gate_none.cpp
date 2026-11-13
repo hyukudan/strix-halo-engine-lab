@@ -20,6 +20,8 @@ void bind_hip_main(int& argc, char** argv, std::FILE*) {
     }
 }
 
+HostWait set_host_wait(HostWait engine_choice, std::FILE*) { return resolve_host_wait(engine_choice, std::getenv("STRIX_HOST_WAIT")); }
+
 const Bound* hip_bound() noexcept { return nullptr; }
 
 } // namespace strix::device

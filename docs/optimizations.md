@@ -1176,6 +1176,38 @@ A headless tiled block already stops after its last state-writing step, the last
 - **Measured gain:** 262K YaRN serial prefill, 2 runs per arm alternating: 191.04 / 193.21 s on vs 194.76 / 200.17 s off (means 192.1 vs 197.5 s; adjacent pairs -1.6 to -7.0 s); 32K: neutral on the current T16384 route (one headless block; +0.04 / +0.07 s mean in two runs per order), -0.41 s on the earlier T8192 route (three headless blocks)
 - **Implementation / evidence:** [QSA launcher](../src/hip_indexed_attention_launcher.hip), [prefill runtime](../src/known_prefix_prefill_runtime.cpp)
 
+<a id="qwen-prefill-final-cone"></a>
+
+### Final-block cone: final hyper mix on the trailing rows only
+
+**Engine:** `qwen`. **Control:** `STRIX_PREFILL_FINAL_CONE`. **Default:** 1.
+
+The final block of a prompt keeps its head, and the head runs only on the logit rows (the last row). The final hyper mix before it feeds nothing else, so it now runs on the trailing rows only, through the same full-T entry and therefore with the same per-row arithmetic. The last layer's MoE and MLP injection are not coned: the MTP predictor builds one cache row from the tap of every prompt row.
+
+- **Preconditions:** A tiled prefill block that keeps its head (the final block), whole 8-row tiles and more than STRIX_PREFILL_FINAL_CONE_ROWS rows (default 128; the HIP hyper-mix entry needs at least 16). The MTP predictor reads the tap (last MLP injection) of every prompt row, so the last layer's MoE and injection still run on all rows; only the final mix, read by the head alone, is coned. =2 (opt-in, host-test evidence only) also cones every other trailing step that touches no session state and has no step observer.
+- **Automatic selection:** On when unset; `=0`, `--baseline`, `STRIX_QPF2K_DEFAULTS=0` and the GSQ profile run every row; `--print-effective-config` reports it under `long_context_items`. Persistent state is unchanged, so the value stays out of the prefix/session cache namespace.
+- **Fallback notice:** Headless blocks, blocks of at most `STRIX_PREFILL_FINAL_CONE_ROWS` rows, blocks with a row tail and telemetry runs execute every row. `STRIX_PREFILL_TIMING=1` prints the coned steps and rows.
+- **Exactness evidence:** Exact: plain default command, same binary on/off: prefill logits byte-identical with the token at 8K (five arms) and, at 32K, the full logits of the prefill and of 48 MTP decode steps byte-identical with the tokens. A first form that ran the final mix through the 8-row tile entry was rejected: its prefill logits differed (up to 0.0044) because the full-T entry uses the FP16-output route.
+- **Off switch:** STRIX_PREFILL_FINAL_CONE=0
+- **Measured gain:** 8K single node, three alternating off/on pairs: 4,764.0 / 4,752.7 / 4,727.8 ms off vs 4,707.7 / 4,717.4 / 4,677.9 ms on (means 4,748.2 vs 4,701.0 ms, -1.0 %; adjacent pairs -56 / -35 / -50 ms); 32K with 48 decode steps, one pair: 21.11 s off vs 21.00 s on (within run noise)
+- **Implementation / evidence:** [prefill runtime](../src/known_prefix_prefill_runtime.cpp)
+
+<a id="host-wait-policy"></a>
+
+### Blocking host wait (shared host wait policy)
+
+**Engine:** `qwen`. **Control:** `STRIX_HOST_WAIT`. **Default:** block (Qwen decode app); other engines keep the runtime schedule unless they select one.
+
+How a host thread waits for the device is one shared policy: `runtime` (no device flag), `spin`, `yield` or `block`. An engine names its choice once after the device bind and `STRIX_HOST_WAIT` overrides it. The Qwen decode app selects `block`; the DeepSeek expert server's `--busy-poll` selects `spin` through the same call.
+
+- **Preconditions:** Any HIP binary that calls the shared policy after the device bind (strix::device::set_host_wait). The HIP runtime's own schedule busy-waits on device completion, which keeps one host core at 100 % for the whole prefill.
+- **Automatic selection:** Each engine's choice; `STRIX_HOST_WAIT=runtime|spin|yield|block` overrides it and any other text is refused at start. The value stays out of the prefix/session cache namespace. The receipt line `host wait: <policy> (engine|STRIX_HOST_WAIT)` is printed at start.
+- **Fallback notice:** Engines that do not call the policy keep the runtime schedule.
+- **Exactness evidence:** Exact: the policy only changes how the host thread waits for the device. Prefill logits and tokens byte-identical between spin, block and the runtime schedule at 8K and between spin and block at 32K.
+- **Off switch:** STRIX_HOST_WAIT=runtime (or spin)
+- **Measured gain:** Host CPU time, not speed. 8K: host user CPU 2.3 s (block) vs 5.8-6.1 s (spin / runtime schedule), busiest thread 61-68 % vs 97-98 %; request 1,730 / 1,762 / 1,729 tok/s block vs 1,723 / 1,738 / 1,770 spin (three pairs, no ordered difference). 32K, two pairs: 18.90 / 18.84 s block vs 19.00 / 18.89 s spin, host user CPU 11.5 / 10.7 s vs 19.4 / 18.9 s. Power: the device power sensor (0.5 s samples) does not separate the arms (32K 135 / 137 W block vs 138 / 136 W spin; 8K 113-122 W both), so no watt saving is claimed.
+- **Implementation / evidence:** [device gate](../include/strix/device/hip_gate.hpp), [HIP side](../src/device/hip_gate.cpp)
+
 <a id="qwen-qsa-score-rows64"></a>
 
 ### QSA scorer R64 above 65,536 blocks
