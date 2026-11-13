@@ -79,6 +79,26 @@ int main() {
         try { (void)fi::min_rows(bad); } catch (const std::invalid_argument&) { refused = true; }
         require(refused);
     }
+    {   // Nested child: the engine parks the parent task (move), the child begins its own task, the parent resumes
+        // (move back). The row gate travels with the task, so a short child cannot turn the long parent's INT4 off.
+        struct Task { bool open = false; fi::RowGate i4; };
+        Task task, parked;
+        const auto begin = [&](std::size_t rows) { task = Task{}; task.i4.begin(rows, fi::kMinRows); task.open = true; };
+        begin(26000);
+        require(task.i4.on);
+        parked = std::move(task);
+        task = Task{};
+        begin(512);
+        require(!task.i4.on && parked.i4.on);
+        task = std::move(parked);
+        parked = Task{};
+        require(task.open && task.i4.on);
+        begin(4095);
+        require(!task.i4.on);
+        fi::RowGate zero;
+        zero.begin(1, 0);
+        require(zero.on);
+    }
     {   // Shared per-layer policy set (core/layer_set.hpp): the keep-EXL3 / W4A8 layer lists of the FAST_I4 engines.
         namespace sc = strix::core;
         auto set = [](const char* v) { return sc::parse_layer_set(v, 3, 60, "TEST"); };
