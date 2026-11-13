@@ -6,6 +6,7 @@
 #include "core/layer_set.hpp"
 #include "minimax/engine/mm_fast_i4.hpp"
 #include "glm/prefill/glm_pf_exact.hpp"
+#include "glm/prefill/glm_pf_dense_policy.hpp"
 #include "glm/prefill/glm_pf_wmma.hpp"
 #include "apps/glm_route_levers.hpp"
 #include <optional>
@@ -125,13 +126,20 @@ void glm_equivalent() {
     const auto defaults = glm_fingerprint();
     env("STRIX_GLM_PF_KDA_WMMA", "1");
     rr::require_same_route(defaults, glm_fingerprint(1));
+    // FAST WMMA selected: the auto floor is 32 rows; the exact route's is 64 (glm_pf_dense_policy.hpp).
+    env("STRIX_GLM_PF_EXACT_X_MIN_ROWS", "32");
+    rr::require_same_route(defaults, glm_fingerprint(1));
+    env("STRIX_GLM_PF_EXACT_X_MIN_ROWS", "032");
+    rr::require_same_route(defaults, glm_fingerprint(1));
     env("STRIX_GLM_PF_EXACT_X_MIN_ROWS", "2048");
-    rr::require_same_route(defaults, glm_fingerprint(1));
-    env("STRIX_GLM_PF_EXACT_X_MIN_ROWS", "02048");
-    rr::require_same_route(defaults, glm_fingerprint(1));
-    env("STRIX_GLM_PF_EXACT_X_MIN_ROWS", "4096");
     different(defaults, glm_fingerprint());
-    env("STRIX_GLM_PF_EXACT_X_MIN_ROWS", "2048");
+    env("STRIX_GLM_PF_EXACT_X_MIN_ROWS", nullptr);
+    env("STRIX_GLM_PF_WMMA", nullptr);
+    const auto exact_defaults = glm_fingerprint();
+    env("STRIX_GLM_PF_EXACT_X_MIN_ROWS", "64");
+    rr::require_same_route(exact_defaults, glm_fingerprint(1));
+    env("STRIX_GLM_PF_WMMA", "1");
+    env("STRIX_GLM_PF_EXACT_X_MIN_ROWS", "32");
     env("STRIX_GLM_PF_KDA_WMMA", "0");
     different(defaults, glm_fingerprint());
     env("STRIX_GLM_PF_EXACT_X", nullptr);
@@ -167,6 +175,67 @@ void qwen() {
     different(exact, fast);
     options.prefill_fast_components = strix::kFastPrefillAll & ~strix::kFastPrefillHc;
     different(fast, qwen_fingerprint(options, p));
+}
+// One resolver for the serving prefill chunk: the server (entry http) and the rank CLI resolve the same value, the same
+// dense route for the chunk's calls and the same route fingerprint from the same environment and arguments.
+void glm_serve_chunk() {
+    namespace dp = strix::glm::pf::dense_policy;
+    namespace exact = strix::glm::pf::exact;
+    const auto same = [](const dp::Chunk& a, const dp::Chunk& b) {
+        return a.tokens == b.tokens && a.rows == b.rows && a.route == b.route && a.wmma == b.wmma && a.declined == b.declined &&
+               a.reason == b.reason;
+    };
+    for (const char* fast : {static_cast<const char*>(nullptr), "1"}) {
+        env("STRIX_GLM_PF_WMMA", fast);
+        env("STRIX_GLM_PF_EXACT_X", "auto");
+        env("STRIX_GLM_PF_EXACT_X_MIN_ROWS", nullptr);
+        env("STRIX_GLM_PF_SEQPAR", nullptr);
+        env("STRIX_GLM_PF_PIPELINE", "2");
+        rr::reset();
+        const auto cli_fp = strix::glm::record_route_levers("cli", 0, "auto", "gemv", "r1b", 4096);
+        const auto cli = strix::glm::record_prefill_chunk("cli", false, 0, 2, 4096);
+        rr::reset();
+        const auto http_fp = strix::glm::record_route_levers("http", 0, "auto", "gemv", "r1b", 4096);
+        const auto http = strix::glm::record_prefill_chunk("http", false, 0, 2, 4096);
+        rr::require_same_route(cli_fp, http_fp);
+        require(same(cli, http), "server and CLI resolve the same serving chunk");
+        // Default chunk: 512 tokens are two 256-row calls on the pair, and they keep the large-call core.
+        require(http.tokens == 512 && http.rows == 256 && !http.declined && http.route == dp::kX3r8, "default chunk keeps the X3 route");
+        require(http.wmma == (fast != nullptr), "default chunk keeps the FAST WMMA core when it is selected");
+        require(static_cast<unsigned>(exact::route(http.rows)) == http.route, "the launcher selects the resolved route");
+        // What the launcher does with one such call is what the resolver said.
+        rr::reset();
+        rr::set_enabled(true);
+        exact::dispatch_receipt(http.rows);
+        const auto t = rr::snapshot();
+        const auto dense = static_cast<unsigned>(rr::Product::dense);
+        require(t.product[dense][static_cast<unsigned>(fast ? rr::Family::f16_wmma : rr::Family::exact)].launches == 1,
+                "chunk call family");
+        // One node: one 512-row call.
+        require(strix::glm::record_prefill_chunk("http", false, 0, 1, 4096).rows == 512, "one node chunk rows");
+        // The former threshold: the default chunk cannot reach it below the stall ceiling, so the decline is said.
+        env("STRIX_GLM_PF_EXACT_X_MIN_ROWS", "2048");
+        const auto old = strix::glm::record_prefill_chunk("http", false, 0, 2, 4096);
+        require(old.tokens == 512 && old.declined && old.route == dp::kTm && old.reason.find("short_call") != std::string::npos,
+                "declined route carries its reason");
+        require(dp::chunk_line(old).find("declined (short_call)") != std::string::npos, "reason line");
+        // A threshold the default can reach by growing: 512 -> 1024 tokens (two 512-row calls).
+        env("STRIX_GLM_PF_EXACT_X_MIN_ROWS", "512");
+        const auto grown = strix::glm::record_prefill_chunk("http", false, 0, 2, 4096);
+        require(grown.tokens == 1024 && grown.rows == 512 && !grown.declined, "default chunk grows to keep the route");
+        // An explicit chunk is never changed; a short one says what it loses.
+        const auto small = strix::glm::record_prefill_chunk("http", true, 256, 2, 4096);
+        require(small.tokens == 256 && small.rows == 128 && small.declined, "explicit chunk is kept and reported");
+        env("STRIX_GLM_PF_EXACT_X_MIN_ROWS", nullptr);
+        const auto off = strix::glm::record_prefill_chunk("http", true, 0, 2, 4096);
+        require(off.tokens == 0 && !off.declined && off.route == dp::kX3r8, "chunking off");
+        env("STRIX_GLM_PF_EXACT_X", "0");
+        const auto forced = strix::glm::record_prefill_chunk("http", false, 0, 2, 4096);
+        require(forced.route == dp::kTm && forced.declined == (fast != nullptr), "forced TM16 declines only the FAST core");
+        env("STRIX_GLM_PF_EXACT_X", "auto");
+    }
+    env("STRIX_GLM_PF_PIPELINE", nullptr);
+    env("STRIX_GLM_PF_WMMA", "1");
 }
 void glm_bypass() {
     namespace exact = strix::glm::pf::exact;
@@ -215,6 +284,7 @@ int main(int argc, char** argv) {
         else if (name == "glm_equivalent") glm_equivalent();
         else if (name == "qwen") qwen();
         else if (name == "glm_bypass") glm_bypass();
+        else if (name == "glm_serve_chunk") glm_serve_chunk();
         else throw std::runtime_error("unknown test case");
     } catch (const std::exception& error) {
         std::fprintf(stderr, "%s\n", error.what());

@@ -96,7 +96,7 @@ inline const std::vector<EnvItem>& env_items() {
         {"pf-exact-moe-plan", "STRIX_GLM_PF_EXACTMOE_PLAN", "device", "host",
          "Measurement: exact MoE device plan (pairs/tiles/groups built on the GPU, byte-equal to the host plan; no route download or host sync per MoE call)", false, true},
         {"pf-exact-x", "STRIX_GLM_PF_EXACT_X", "auto", "0",
-         "Measurement: exact X3 prefill linear core (scalar activations, eight rows per wave) for calls >= 2048 rows (TM16 below), bitwise; 8K TTFT -14.3 % vs X2", true, true},
+         "Measurement: exact X3 prefill linear core (scalar activations, eight rows per wave) for calls >= 64 rows (TM16 below; the former floor was 2048: X3 is 0.44-0.62 of TM16 at 256-1024 rows), bitwise; 8K TTFT -14.3 % vs X2", true, true},
         {"pf-obar-v10", "STRIX_GLM_PF_OBAR", "10", "2",
          "Measurement: MLA o-bar v10 (v7 staging 2 k per batch, 18 KB LDS: 4 CTAs per WGP) bitwise == v7 / v5, 7.1 / 8.5 / 8.5 / 9.5 vs v7 7.9 / 9.3 / 9.3 / 10.3 us/row per DSA layer at t0 0 / 4096 / 12288 / 28672 (=7 restores v7, =5 v5)", false, true},
         {"pf-scores-v7", "STRIX_GLM_PF_SCORES", "7", "2",

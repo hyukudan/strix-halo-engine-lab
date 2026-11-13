@@ -268,6 +268,10 @@ int main(int argc, char** argv) {
         }
         if (print_config) {  // dry run: no environment change, no GPU, no peer
             std::fputs(rd::print(eff).c_str(), stdout);
+            // Serving-only lever, named here too: the server resolves it with this same function.
+            std::fputs(strix::glm::pf::dense_policy::chunk_line(strix::glm::pending_prefill_chunk(
+                false, 0, opt.world, static_cast<unsigned>(std::stoul(eff.max_rows.value)),
+                [&](const std::function<void(const char*, const char*)>& set) { rd::apply_env(eff, set); })).c_str(), stdout);
             return 0;
         }
         rd::apply_env(eff, [](const char* k, const char* v) { (void)::setenv(k, v, 0); });
@@ -400,6 +404,8 @@ int main(int argc, char** argv) {
         // Shared route receipt: the same lever keys as the server (apps/glm_route_levers.hpp).
         (void)strix::glm::record_route_levers("cli", opt.rank, prefill_requested, prefill_mode, ge::identity_mode_name(eng.identity_mode()),
                                               opt.max_rows);
+        // The same resolver as the server: what a served prompt would be chunked to while another request decodes.
+        (void)strix::glm::record_prefill_chunk("cli", false, 0, opt.world, opt.max_rows);
         // STRIX_GLM_MODEL_FORMAT=fast_i4 (glm-fast-i4, lossy): the routed EXL3 weights are replaced, so the exact /
         // reference identities (decode-row reference prefill, reference gates, identity checks) are refused.
         // --tf scoring (no prompt prefill, verify rows only, no --tf-check) stays available for the quality comparison.

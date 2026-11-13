@@ -57,7 +57,7 @@ The engine picks a kernel family by the number of rows in flight, not by model.
   Past a row threshold the matrix-core and integer paths win. The thresholds are toggles:
   `STRIX_INTPREFILL_DENSE_ROWS` (qwen, 512), `STRIX_QPF2K_DENSE_MIN_ROWS` (qwen, 1024 or 512 by site),
   `STRIX_GLM_PF_WMMA_ROWS` (glm, 64), `STRIX_MM_PF_ASYNC_MIN_ROWS` (minimax, 2048),
-  `STRIX_GLM_PF_EXACT_X_MIN_ROWS` (glm, 2048).
+  `STRIX_GLM_PF_EXACT_X_MIN_ROWS` (glm, 64; 32 with FAST WMMA).
 - **Prefill** is bound by compute. It uses the integer and matrix-core paths, and the FAST profile adds the bit-changing ones.
 
 The crossover depends on the ratio of compute to bandwidth. On gfx1151 that ratio is fixed, so the thresholds are fixed.
