@@ -522,5 +522,6 @@ Follow the link for the gain, preconditions and off switch. Defaults are shorten
 | Toggle | Engine | Default | Details |
 |---|---|---|---|
 | `STRIX_POWER_SAMPLER` | platform | ON | [platform-power-receipt](optimizations.md#platform-power-receipt) |
+| `STRIX_ROUTE_RECEIPT` | platform | ON | [platform-route-receipt](optimizations.md#platform-route-receipt) |
 | `STRIX_DS41_OB_READY_EPILOGUE` | deepseek | auto | [ds-ready](optimizations.md#ds-ready) |
 | `STRIX_SERVE_BACKEND_PROBE` | qwen | ON | [operations/service-health.md](operations/service-health.md) |

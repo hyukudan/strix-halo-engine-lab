@@ -4788,6 +4788,24 @@ measured (`complete`, `covered_ms`); nothing is extended over a failed read or p
 - **Measured:** Measurement, not a speed lever. Qwen 8K real-text prefill, one node, default exact route, sampler on/off interleaved (ABAB): 1,755.9 / 1,744.5 tok/s on vs 1,752.9 / 1,733.5 off (no slowdown), logits and tokens identical. First receipts: prefill 577-588 J, 123.5-125.4 W mean, 150-152 W peak, 13.9-14.2 tok/J, median GPU clock 2,512-2,524 MHz, 84-92 C; serial greedy decode 128 tokens: 544 J, 95.7 W mean, 0.235 tok/J, 2,873 MHz.
 - **Off switch:** `STRIX_POWER_SAMPLER=0`.
 
+<a id="platform-route-receipt"></a>
+
+### Shared route receipt
+
+**Engine:** platform. **Control:** `STRIX_ROUTE_RECEIPT`. **Default:** ON.
+
+One shared block, `strix-route-receipt-v1`, says which kernel family actually ran each product (launches and rows),
+which levers were requested and which took effect, and the reason code of every decline or bypass. The two ranks of
+a pair compare a fingerprint of the numerical levers at start-up and refuse to run on different routes. See
+[engine/route-receipt.md](engine/route-receipt.md).
+
+- **Preconditions:** None. Family lines exist where an engine has launch-site hooks (MiniMax MoE prefill per layer, GLM dense prefill); every engine reports its levers and the explicitly set switches.
+- **Automatic selection:** Armed by the device gate; the server adds the request window and the status view.
+- **Fallback notice:** A bypass line (product, wanted family, reason, calls, rows) in the block; a fingerprint that differs between the ranks is a start-up error.
+- **Exactness evidence:** Host-only counters: no device call, no arithmetic. Qwen 8K prefill, receipt on vs off: logits file and generated tokens byte-identical in all four runs.
+- **Measured:** Observability, not a speed lever. Qwen 8K real-text prefill, one node, default exact route, receipt on/off interleaved (ABAB): 1,768.7 / 1,772.0 tok/s on vs 1,771.1 / 1,769.2 off. Qwen has no launch-site hooks, so this workload does not qualify counter overhead on instrumented MiniMax or GLM paths; that native measurement remains open.
+- **Off switch:** `STRIX_ROUTE_RECEIPT=0` (counters and printed block; the rank comparison stays).
+
 <a id="qwen-moe-route-bf16"></a>
 
 ### MoE route output BF16 storage candidate

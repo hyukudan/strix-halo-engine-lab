@@ -15,6 +15,7 @@
 #endif
 #include "moe_core/device_plan.hpp"
 #include "strix/env_flags.hpp"
+#include "strix/route_receipt.hpp"
 
 
 #include <algorithm>
@@ -1775,6 +1776,7 @@ void enqueue_prefill_moe_device(const PrefillMoeDeviceView& v, void* workspace, 
                                 hipStream_t stream) {
     if (!prefill_moe_device_plan(v.rows)) throw std::invalid_argument("minimax prefill moe: device plan not selected for this call");
     enqueue_device_moe(v, workspace, workspace_bytes, stream);
+    strix::route::launched(strix::route::Product::moe, v.i4 != nullptr ? strix::route::Family::iu4 : strix::route::Family::exact, v.rows);
 }
 
 unsigned prefill_moe_group_min_rows() { return 97; }  // every chunk's shared expert (and class 0) at splits 1
@@ -1782,6 +1784,7 @@ std::size_t prefill_moe_group_workspace_bound(std::uint32_t rows) { return dev_l
 void enqueue_prefill_moe_group(const PrefillMoeGroupView& v, void* workspace, std::size_t workspace_bytes, hipStream_t stream) {
     if (!prefill_moe_device_plan(v.rows)) throw std::invalid_argument("minimax prefill moe: device plan not selected for this call");
     enqueue_group_moe(v, workspace, workspace_bytes, stream);
+    strix::route::launched(strix::route::Product::moe, strix::route::Family::exact, v.rows);  // group-wide calls are EXL3 only
 }
 
 void prefill_moe_device_check() {
@@ -1881,9 +1884,16 @@ void enqueue_prefill_moe(const PrefillMoeView& v, void* workspace, std::size_t w
     if (i4) {
         mark("start", stream);
         launch_iu4(p, t, v, ws, workspace_bytes, stream);
+        // Shared route receipt: scope gate_up keeps the EXL3 down projection.
+        if (v.i4_all) strix::route::launched(strix::route::Product::moe, strix::route::Family::iu4, v.rows);
+        else {
+            strix::route::launched(strix::route::Product::moe_gate_up, strix::route::Family::iu4, v.rows);
+            strix::route::launched(strix::route::Product::moe_down, strix::route::Family::exact, v.rows);
+        }
         return;
     }
 #endif
+    strix::route::launched(strix::route::Product::moe, strix::route::Family::exact, v.rows);  // host-planned EXL3 call
     mark("start", stream);
     // The token gather implements A4 fake quant; force it for the shadow call
     // even when the ordinary path selected the tiled gather.

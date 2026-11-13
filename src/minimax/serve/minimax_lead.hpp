@@ -6,6 +6,7 @@
 #include "minimax_api.hpp"
 #include "minimax_session.hpp"
 #include "session_engine.hpp"
+#include "strix/env_flags.hpp"
 #include "strix/serve/session_runtime.hpp"
 #include "minimax/dspark/minimax_dspark.hpp"
 #include "minimax/dspark/minimax_auto.hpp"
@@ -32,9 +33,14 @@ namespace mm = strix::minimax::engine;
 namespace sv = strix::serve;
 namespace ms = strix::minimax::serve;
 namespace ds = strix::minimax::dspark;
-inline bool prefix_cache_requested() noexcept {
-    const char* value = std::getenv("STRIX_MM_SERVE_PREFIX");
-    return value && std::string_view(value) == "1";
+// Resident-slot reuse of a prefill prefix (opt-in, exactly "1"; both ranks must vote).
+inline bool prefix_cache_requested() {
+    return strix::envcfg::flag("STRIX_MM_SERVE_PREFIX", false, strix::EnvFlagMatch::exact);
+}
+// Conversation mode on top of it (opt-in, exactly "1"; both ranks must vote): a finished reply keeps its slot's rows
+// and the follow-up turn restarts prefill at that frontier. Not bitwise equal to a cold full prefill.
+inline bool conversation_cache_requested() {
+    return strix::envcfg::flag("STRIX_MM_SERVE_CONVERSATION", false, strix::EnvFlagMatch::exact);
 }
 using Clock = std::chrono::steady_clock;
 using ms::Command;
@@ -89,7 +95,9 @@ struct Shared {
     std::uint64_t active_id = 0, parked_id = 0;
     bool nest_taps = false;
     bool prefix_reuse = false; // negotiated once, both ranks and alignment
+    bool conversation = false; // negotiated once, both ranks, needs prefix_reuse
     strix::session::Identity prefix_identity;
+    std::function<bool(std::uint64_t)> prefill_int4_regime;
     std::uint32_t dspark_live = 0, dspark_contexts = 0;
     std::unordered_map<const sv::GenerationTicket*, Extra> extras;
 };
@@ -196,7 +204,8 @@ public:
             if constexpr (requires { eng_.prefill_reuse_rows(); }) reuse_rows_ = eng_.prefill_reuse_rows();
             if (!reuse_rows_ || !sh_.prefix_identity.known() || sh_.prefix_identity.ranks != 2)
                 throw std::invalid_argument("MiniMax resident identity/alignment unavailable");
-        }
+            conversation_ = sh_.conversation;
+        } else if (sh_.conversation) throw std::invalid_argument("MiniMax conversation mode needs prefix reuse");
         prompt_bytes_ = std::move(prompt_bytes);
         lock_ = strix::pair::Lockstep(static_cast<std::uint32_t>(eng_.rank()), run.control_round);
         const char* v = std::getenv("STRIX_MM_SERVE_TIMELINE");
@@ -217,6 +226,12 @@ private:
     sv::SessionHooks owner_hooks() {
         sv::SessionHooks h;
         h.identity = sh_.prefix_identity;
+        h.resident_identity = [this](const sv::GenerationJob& job) {
+            auto id = sh_.prefix_identity;
+            if (sh_.prefill_int4_regime)
+                id.profile += sh_.prefill_int4_regime(job.prompt.size()) ? ":int4" : ":native";
+            return id;
+        };
         h.control_turn = [this](sv::SessionRuntime&) { control_turn(); };
         h.closing = [this] { close_native(); };
         h.failed = [this] { eng_.abort("control channel: protocol failure"); };
@@ -439,8 +454,15 @@ private:
         const auto state = r->state;
         const auto resident = reuse_rows_ ? (r->prefilling ? r->reused : r->stats.prompt_tokens) : 0;
         const auto safe = reuse_rows_ ? resident - resident % reuse_rows_ : 0;
+        // Conversation mode: a reply that ended on its own (stop / length) in a plain, non-nested lane without a drafter
+        // context keeps its consumed rows (prompt + reply up to the last committed token; the final emitted token is
+        // the pending anchor and stays in the next turn's suffix). Everything else keeps the aligned prompt record.
+        const bool keep_reply = conversation_ && !r->prefilling && !r->context && !r->x.nested && (why == "stop" || why == "length");
+        const auto consumed = keep_reply ? store_.consumed(state) : 0;
+        const auto prompt_rows = r->stats.prompt_tokens;
         r.reset();
-        runtime_.complete(state, {}, safe);
+        if (keep_reply && consumed >= prompt_rows) runtime_.complete(state, {}, sv::ResidentClaim{consumed, consumed - prompt_rows});
+        else runtime_.complete(state, {}, safe);
     }
 
     // Emits `ids` of request r in order until a stop token, a cancellation or its token limit; returns false when r ended.
@@ -643,7 +665,7 @@ private:
                                       std::to_string(capacity_) + ")");
             return true;
         }
-        auto lease = runtime_.activate(!nested ? reuse_rows_ : 0);
+        auto lease = runtime_.activate(!nested ? (conversation_ ? 1 : reuse_rows_) : 0);
         auto* t = &lease.taken;
         auto& prompt = t->job.prompt;
         free_slot = lease.state.slot; // shared cache selects the longest FREE resident slot
@@ -696,8 +718,13 @@ private:
         r.x.dspark_mode = ds::mode_name(pol_.dspark_mode);
         r.x.dspark_reason = pol_.dspark_mode == ds::Mode::on ? (r.context ? "legacy" : "plain:legacy_ineligible") : r.automatic.reason;
         r.reused = lease.stats.cached_tokens;
+        if (reuse_rows_) {  // reported only when resident reuse is on, so the default response is unchanged
+            r.x.resident_reported = true;
+            r.x.reply_extended = lease.resident_reply;
+        }
         if (r.context && r.reused) { runtime_.abandon_resident(lease.state); r.reused = 0; }
         r.x.context = r.context;
+        r.x.prefill_computed = prompt.size() - r.reused;
         r.x.sched = pol_.sched == Sched::off ? "off" : "interleave";
         r.x.service_ms = pol_.service_ms;
         r.x.short_first = pending_short_first_;
@@ -1316,6 +1343,7 @@ private:
     strix::session::KvStore store_;
     sv::SessionRuntime runtime_;
     std::uint64_t reuse_rows_ = 0;
+    bool conversation_ = false;
 };
 
 } // namespace strix::minimax::serve::lead

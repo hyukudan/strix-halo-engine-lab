@@ -60,6 +60,7 @@
 
 #include "strix/dist/communicator.hpp"
 #include "strix/dist/gpu_direct.hpp"
+#include "glm_route_levers.hpp"
 #include "strix/glm/engine.hpp"
 
 #include "glm/attn/glm_attn_fast.hpp"
@@ -396,6 +397,9 @@ int main(int argc, char** argv) {
             std::printf("rank %u prefill identity glm-idx-wmma FAST (STRIX_IDX_WMMA=%s, DSA indexer scores on WMMA)\n", opt.rank,
                         strix::attn_core::idx::wmma_mode_name(idx_wmma));
         ge::Engine eng(opt, comm.get());
+        // Shared route receipt: the same lever keys as the server (apps/glm_route_levers.hpp).
+        (void)strix::glm::record_route_levers("cli", opt.rank, prefill_requested, prefill_mode, ge::identity_mode_name(eng.identity_mode()),
+                                              opt.max_rows);
         // STRIX_GLM_MODEL_FORMAT=fast_i4 (glm-fast-i4, lossy): the routed EXL3 weights are replaced, so the exact /
         // reference identities (decode-row reference prefill, reference gates, identity checks) are refused.
         // --tf scoring (no prompt prefill, verify rows only, no --tf-check) stays available for the quality comparison.

@@ -38,6 +38,7 @@ struct SessionLease {
     TakenJob& taken;
     GenerationStats& stats;
     session::KvHandle state;
+    bool resident_reply = false;  // the resident hit reused consumed reply rows (reply-extended record)
 };
 // Taken request held by this owner without a logical lease or physical slot.
 // Generations are never reused within an owner. Copies convey no ownership.
@@ -49,6 +50,19 @@ struct PendingSession {
 struct SessionCacheStats {
     std::uint64_t entries = 0, bytes = 0, hits = 0, misses = 0;
     std::uint64_t turn_admitted = 0, turn_refused = 0, turn_failed = 0, restore_failed = 0;
+    // Resident-slot reuse (activate with a resident alignment). Every lookup is a hit or a miss; hit_rows sums the
+    // rows a hit skipped; reply_hits counts hits whose reused rows reach into consumed reply rows. kept/reply_kept
+    // count records certified at completion, claim_refused the reply claims the runtime declined to certify.
+    std::uint64_t resident_hits = 0, resident_misses = 0, resident_hit_rows = 0, resident_reply_hits = 0;
+    std::uint64_t resident_kept = 0, resident_reply_kept = 0, resident_claim_refused = 0;
+};
+// A family's explicit claim that a lane ended on a committed frontier whose first `rows` rows are canonical model
+// state for tokens prompt + reply: rows == prompt.size() + reply_tokens == the store's consumed frontier. Only the
+// family knows whether decode-produced rows may serve a later prefill; without a claim the shared default (prefill
+// rows only, decode rows throw) is unchanged.
+struct ResidentClaim {
+    std::uint64_t rows = 0;
+    std::uint64_t reply_tokens = 0;
 };
 struct SessionTurnCache {
     session::TurnMetadata metadata;
@@ -60,6 +74,8 @@ struct SessionTurnCache {
 struct SessionHooks {
     // Required stable model/profile/physical-format/rank identity for caching.
     session::Identity identity;
+    // Certifies the arithmetic selected by the original full prompt, including reply retention.
+    std::function<session::Identity(const GenerationJob&)> resident_identity;
     // Additional family admission checks, always before acquire/restore/prefill.
     std::function<void(const GenerationJob&)> validate;
     // Typed family context must be checked by validate. opened binds a freshly
@@ -215,6 +231,10 @@ public:
     void notify_admitted(session::KvHandle);
     void publish_progress(session::KvHandle, GenerationProgress);
     void complete(session::KvHandle, std::string error = {}, std::uint64_t safe_prefill_rows = 0);
+    // Reply-extended resident record. Retained only when the lane is not cancelled/failed, the store sits exactly at
+    // claim.rows with the lane's prompt as the head of its tokens; otherwise nothing is retained (never throws for
+    // an uncertifiable claim). Costs no memory beyond the free slot's own KV and is dropped when the slot is taken.
+    void complete(session::KvHandle, std::string error, const ResidentClaim& claim);
     // Native protocol already formed its complete terminal receipt. Replace,
     // never merge/add its output accounting; completion still owns the lease.
     void complete_native(session::KvHandle, GenerationStats, std::string error = {});

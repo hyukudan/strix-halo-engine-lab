@@ -11,6 +11,7 @@
 // Exactness: Engine::step is batch invariant per row and prefill is per slot, so each request's tokens equal its run
 // alone; the self-test checks it.
 #include "glm/serve/glm_serve_control.hpp"
+#include "strix/serve/conversation_keep.hpp"
 #include "glm/spec/glm_spec_host.hpp"
 #include "glm/serve/glm_serve_import.hpp"
 #include "strix/serve/engine.hpp"
@@ -83,6 +84,13 @@ struct LeadConfig {
     std::uint32_t slots = 8;
     std::uint64_t capacity = 8192;
     std::uint64_t prefix_cache_bytes = 0, prefix_identity = 0;
+    // Reply-end store (opt-in, default off): a finished reply (stop / length) snapshots its slot at the committed row
+    // frontier so the next conversation turn restores there. A decode-produced state is not proven bitwise equal to a
+    // prefill-produced one, so with this off every wire byte and every decision is the prompt-end behaviour.
+    bool prefix_reply_store = false;
+    // MemAvailable probe for the pressure rule (kept entries go before a request is starved); empty: /proc/meminfo.
+    std::function<std::optional<std::uint64_t>()> host_available;
+    std::uint64_t host_floor = kPrefixMemoryFloor;
     bool batch = true;               // false: serial admission (one request at a time)
     bool short_first = true;         // admit the shortest waiting prompt first (bounded overtakes); false: FIFO
     double heartbeat_seconds = 1.0;  // idle: one heartbeat round per interval keeps rank 1 and the link alive
@@ -142,6 +150,8 @@ struct TraceEvent {
 struct LeadStats {
     std::uint64_t steps = 0, rows = 0, prefills = 0, prefill_tokens = 0, prefill_chunks = 0, gap_steps = 0, rounds = 0, heartbeats = 0;
     std::uint64_t prefix_hits = 0, prefix_misses = 0, prefix_stores = 0, prefix_evictions = 0, prefix_bytes = 0;
+    std::uint64_t prefix_pressure_evictions = 0, prefix_refused = 0, prefix_hit_tokens_prompt = 0, prefix_hit_tokens_reply = 0;
+    std::uint64_t prefix_hits_reply = 0, prefix_stores_reply = 0, prefix_reply_skipped = 0;
     std::uint64_t finished = 0, active = 0;
     std::uint64_t rows_hist[kMaxRows + 1]{};  // steps by row count
     double step_seconds = 0, prefill_seconds = 0;
@@ -230,6 +240,8 @@ public:
     // Batched self-speculation on/off (LeadConfig::g2; any thread; takes effect at the next cycle).
     void set_g2(bool on) { g2_on_.store(on && cfg_.g2 && cfg_.mtp); }
     // Selftest driver: clear on the engine thread before admitting its next request.
+    // Lowers (never raises above the hello budget) the kept-prefix ceiling; applied by the lead loop.
+    void lower_prefix_budget(std::uint64_t bytes) { prefix_budget_request_.store(bytes); }
     void clear_prefix_cache() {
         prefix_clear_.store(true);
         while (prefix_clear_.load() && !stop_.load()) std::this_thread::sleep_for(std::chrono::milliseconds(1));
@@ -269,6 +281,8 @@ private:
         Clock::time_point t_admit, t_first;
         double prefill_ms = 0, restore_ms = 0;
         std::uint64_t hit_tokens = 0;
+        strix::serve::KeepKind hit_kind = strix::serve::KeepKind::prompt_end;
+        std::vector<std::uint32_t> emitted;  // reply tokens (only with prefix_reply_store)
         std::optional<double> first_token_ms;
         bool mtp_ok = false;  // prefilled with the MTP bootstrap
         std::uint64_t imported = 0;  // prompt tokens restored from the RTX state (GenerationStats::imported_tokens)
@@ -294,6 +308,12 @@ private:
             (void)control_round(c);
             std::lock_guard<std::mutex> l(m_);
             stats_.prefix_bytes = 0;
+        }
+        // a lowered kept-prefix budget (memory pressure): both ranks drop LRU entries until the ledger fits again
+        if (const auto b = prefix_budget_request_.exchange(kNoBudget); b != kNoBudget && cfg_.prefix_cache_bytes) {
+            prefix_cache_->set_budget(std::min<std::uint64_t>(b, cfg_.prefix_cache_bytes));
+            for (const auto id : prefix_cache_->shrink_plan()) evict_kept(id, true);
+            sync_prefix_stats();
         }
         // cancellations between steps
         for (std::uint32_t s = 0; s < cfg_.slots; ++s)
@@ -410,23 +430,34 @@ private:
         // Preserve the optional FAST import route's identity selection; native snapshots never replace an eligible import.
         const bool import_route = cfg_.rtx_prefill && route_on_.load() && !imp_ && n >= 2 && n >= cfg_.import_min_tokens;
         if (cfg_.prefix_cache_bytes) {
-            if (const auto* e = import_route ? nullptr : prefix_cache_->find(request(p.a).prompt, p.a.mtp_ok, cfg_.prefix_identity)) {
+            const auto* e = import_route ? nullptr : prefix_cache_->lookup(request(p.a).prompt, p.a.mtp_ok, cfg_.prefix_identity);
+            const std::uint64_t held = e ? e->id : 0;
+            if (held) (void)prefix_cache_->acquire(held);  // the entry being restored cannot be a pressure victim
+            relieve_pressure();
+            if (e) {
+                const std::uint64_t frontier = e->frontier;
+                const auto kind = e->kind;
                 // Close C1 before restoring any device state; restored requests bootstrap fresh host control.
                 Control c;
                 c.cmd = static_cast<std::uint32_t>(Cmd::prefix_restore);
                 c.pslot = p.slot;
-                c.ppos = e->frontier;
-                c.prefix_id = e->id;
+                c.ppos = frontier;
+                c.prefix_id = held;
                 c.prefix_identity = cfg_.prefix_identity;
                 c.pflags = p.a.mtp_ok ? kPrefillMtp : 0U;
                 // pf_ already binds this ticket if paired restore fails.
                 if (mtp_slot_ >= 0) leave();
                 const auto t0 = Clock::now();
-                (void)engine_round(c);
+                try { (void)engine_round(c); } catch (...) { prefix_cache_->release(held); throw; }
+                prefix_cache_->release(held);
                 pf_->done = c.ppos;
                 pf_->a.hit_tokens = c.ppos;
+                pf_->a.hit_kind = kind;
                 pf_->a.restore_ms = std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
-                { std::lock_guard<std::mutex> l(m_); ++stats_.prefix_hits; }
+                { std::lock_guard<std::mutex> l(m_);
+                  ++stats_.prefix_hits;
+                  if (kind == strix::serve::KeepKind::reply_end) { ++stats_.prefix_hits_reply; stats_.prefix_hit_tokens_reply += frontier; }
+                  else stats_.prefix_hit_tokens_prompt += frontier; }
                 return;
             }
             std::lock_guard<std::mutex> l(m_);
@@ -533,39 +564,96 @@ private:
         if (mtp_ok) seed_slot_ = static_cast<int>(slot);
     }
 
-    void store_prefix(Prefilling& p, std::uint32_t y0) {
+    void sync_prefix_stats() {
+        const auto k = prefix_cache_->stats();
+        std::lock_guard<std::mutex> l(m_);
+        stats_.prefix_stores = k.stores;
+        stats_.prefix_evictions = k.evictions;
+        stats_.prefix_pressure_evictions = k.pressure_evictions;
+        stats_.prefix_refused = k.refused;
+        stats_.prefix_stores_reply = k.stores_by_kind[1];
+        stats_.prefix_bytes = k.bytes;
+    }
+
+    // Both ranks erase `id` (rank 0 chose it; rank 1 replays).
+    void evict_kept(std::uint64_t id, bool pressure) {
+        Control ev;
+        ev.cmd = static_cast<std::uint32_t>(Cmd::prefix_evict);
+        ev.prefix_id = id;
+        ev.pflags = pressure ? kPrefixPressure : 0U;
+        (void)control_round(ev);
+    }
+
+    // Live requests win over kept prefixes: when this rank's MemAvailable is below the floor the store rule needs,
+    // kept entries go (LRU, never a leased one) instead of the request or its snapshot being refused.
+    void relieve_pressure() {
+        if (!prefix_cache_ || prefix_cache_->size() == 0) return;
+        std::uint64_t shortfall = 0;
+        if (cfg_.host_available) {
+            const auto avail = cfg_.host_available();
+            if (avail && *avail < cfg_.host_floor) shortfall = cfg_.host_floor - *avail;
+        } else if constexpr (requires { eng_.prefix_store_allowed(); }) {
+            if (!eng_.prefix_store_allowed()) shortfall = 1;
+        } else if (const auto avail = prefix_memory_bytes(); avail && *avail < cfg_.host_floor) {
+            shortfall = cfg_.host_floor - *avail;
+        }
+        if (!shortfall) return;
+        for (const auto id : prefix_cache_->reclaim_plan(shortfall)) evict_kept(id, true);
+        sync_prefix_stats();
+    }
+
+    // Two-phase paired store (prompt-end at the end of prefill, reply-end at the end of a reply). `key` has `rows`
+    // restore rows (+ the MTP pending token). Returns true when both ranks admitted it.
+    bool store_snapshot(std::uint32_t slot, bool mtp, std::uint64_t rows, bool reply, std::vector<std::uint32_t>& key) {
         Control c;
         c.cmd = static_cast<std::uint32_t>(Cmd::prefix_prepare);
-        c.pslot = p.slot;
-        c.ppos = request(p.a).prompt.size();
+        c.pslot = slot;
+        c.ppos = rows;
         c.prefix_id = next_prefix_id_++;
         c.prefix_identity = cfg_.prefix_identity;
-        c.pflags = p.a.mtp_ok ? kPrefillMtp : 0U;
-        auto key = request(p.a).prompt;
-        if (p.a.mtp_ok) key.push_back(y0);  // key length differs from the restore frontier
+        c.pflags = (mtp ? kPrefillMtp : 0U) | (reply ? kPrefixReply : 0U);
         c.plen = static_cast<std::uint32_t>(key.size());
         const auto vote = control_round(c, &key);
-        if (vote.at(0)) {
-            while (const auto id = prefix_cache_->replacement_id()) {
-                Control ev;
-                ev.cmd = static_cast<std::uint32_t>(Cmd::prefix_evict);
-                ev.prefix_id = id;
-                (void)control_round(ev);  // replace an equal key only after both new snapshots succeeded
-            }
-            while (prefix_cache_->bytes() > prefix_cache_->budget() - prefix_cache_->pending_bytes()) {
-                Control ev;
-                ev.cmd = static_cast<std::uint32_t>(Cmd::prefix_evict);
-                ev.prefix_id = prefix_cache_->oldest();
-                (void)control_round(ev);  // rank 0 chooses each victim; rank 1 only replays it
-            }
+        bool ok = vote.at(0) != 0;
+        if (ok) {
+            std::vector<std::uint64_t> victims;
+            ok = prefix_cache_->victims(victims);
+            if (ok)
+                for (const auto id : victims) evict_kept(id, false);  // equal key first, then LRU; rank 1 replays
         }
         c.cmd = static_cast<std::uint32_t>(Cmd::prefix_commit);
-        c.prefix_ok = vote.at(0);
+        c.prefix_ok = ok ? 1U : 0U;
         (void)control_round(c);  // both prepared, or both discard; never invalidate the final prefill seed
-        std::lock_guard<std::mutex> l(m_);
-        stats_.prefix_stores = prefix_cache_->stores;
-        stats_.prefix_evictions = prefix_cache_->evictions;
-        stats_.prefix_bytes = prefix_cache_->bytes();
+        sync_prefix_stats();
+        return ok;
+    }
+
+    void store_prefix(Prefilling& p, std::uint32_t y0) {
+        auto key = request(p.a).prompt;
+        if (p.a.mtp_ok) key.push_back(y0);  // key length differs from the restore frontier
+        (void)store_snapshot(p.slot, p.a.mtp_ok, request(p.a).prompt.size(), false, key);
+    }
+
+    // Reply-end store (opt-in). The slot holds rows [0, pos): the prompt, then every emitted token except the last
+    // one (it is pending: produced by the final step but not yet fed back). A stop token is that pending token too.
+    // The store is refused unless the lead can prove the slot is exactly at that committed row frontier: plain
+    // (non-MTP) decode only (MTP verify windows / the C1 decoder can leave the engine ahead of the emitted tokens and
+    // hold deferred KDA rows), a normal finish, and pos == prompt + emitted - 1. A refused store is counted, never
+    // an error; the existing prompt-end entry stays.
+    void store_reply(std::uint32_t slot, const char* why) {
+        const Active& a = *active_[slot];
+        const std::string w = why;
+        if (w != "stop" && w != "length") return;  // cancelled / context / failed: not a committed reply
+        const auto& prompt = request(a).prompt;
+        const bool exact = !a.mtp_ok && a.generated >= 2 && a.emitted.size() == a.generated &&
+                           a.pos == prompt.size() + a.emitted.size() - 1 && a.pos < cfg_.capacity;
+        if (!exact) {
+            if (a.generated >= 2) { std::lock_guard<std::mutex> l(m_); ++stats_.prefix_reply_skipped; }
+            return;
+        }
+        auto key = prompt;
+        key.insert(key.end(), a.emitted.begin(), a.emitted.end() - 1);
+        (void)store_snapshot(slot, false, a.pos, true, key);
     }
 
     // Import gate: both ranks digest the slot's state at frontier n (no engine change: seeds stay valid); the decode
@@ -623,6 +711,7 @@ private:
         Active& a = *active_[s];
         a.last = t;
         ++a.generated;
+        if (cfg_.prefix_reply_store && cfg_.prefix_cache_bytes) a.emitted.push_back(t);
         if (a.generated == 1 && request(a).observed)
             a.first_token_ms = std::chrono::duration<double, std::milli>(Clock::now() - runtime().inspect(a.state).submitted).count();
         trace(ticket_key(a), TraceEvent::token);
@@ -639,6 +728,7 @@ private:
             else leave();
         }
         Active& a = *active_[s];
+        if (cfg_.prefix_reply_store && cfg_.prefix_cache_bytes && error.empty() && !failing_) store_reply(s, why);
         trace(ticket_key(a), TraceEvent::finish);
         strix::serve::GenerationStats st;
         st.finish = why;
@@ -651,7 +741,8 @@ private:
         if (cfg_.prefix_cache_bytes) {
             st.engine_extra.emplace_back("prefix_cache", "{\"hit_tokens\":" + std::to_string(a.hit_tokens) +
                 ",\"prefill_tokens\":" + std::to_string(st.prompt_tokens - a.imported - a.hit_tokens) +
-                ",\"restore_ms\":" + std::to_string(a.restore_ms) + "}");
+                ",\"restore_ms\":" + std::to_string(a.restore_ms) +
+                (cfg_.prefix_reply_store ? std::string(",\"kind\":\"") + (a.hit_tokens == 0 ? "none" : a.hit_kind == strix::serve::KeepKind::reply_end ? "reply_end" : "prompt_end") + "\"" : std::string()) + "}");
         }
         if (!a.route.empty()) st.engine_extra.emplace_back("prefill_route", a.route);
         runtime().complete_native(a.state, std::move(st), error);
@@ -1104,6 +1195,8 @@ private:
     std::optional<PrefixCache> prefix_cache_;
     std::uint64_t next_prefix_id_ = 1;
     std::atomic<bool> prefix_clear_{false};
+    static constexpr std::uint64_t kNoBudget = ~0ULL;
+    std::atomic<std::uint64_t> prefix_budget_request_{kNoBudget};
     Clock::time_point last_round_ = Clock::now();
     bool drained_ = false;
     std::string failure_;

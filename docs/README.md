@@ -115,6 +115,7 @@ work as it stood on their date; documents marked **Superseded** name their repla
 ## Engine: prefill
 
 - [Known input windows](engine/prefill/known-input-windows.md): Known-input windows: layer-major traversal of 2/4/8 known inputs (--known-prefix-window).
+- [Row layout policy](engine/prefill/row-layout.md): physical row stride off page multiples, shared by every row buffer
 - [Explicit known-prefix prefill](engine/prefill/known-prefix-prefill.md): Early source-only note on --known-prefix-prefill-rows T (16..2048) step-major prefill.
 - [Prefill numerical profile](engine/prefill/prefill-numerical-profile.md): --prefill-numerical-profile: separate prefill arithmetic from decode numerical profile; admitted pairs.
 - [Prompt groups: several requests' prompt blocks in one prefill run](engine/prefill/prompt-batch.md): STRIX_PROMPT_BATCH: several requests' tiled prompt blocks in one prefill run.

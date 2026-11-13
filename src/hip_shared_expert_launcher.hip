@@ -1,4 +1,5 @@
 #include "strix/env_flags.hpp"
+#include "core/row_layout.hpp"
 #include "strix/hip_qwen_dpp_reduce.hpp"
 #include "strix/moe_q4k_a8_contract.hpp"
 #include "strix/hip_mtp_fast_draft.hpp"
@@ -1855,13 +1856,7 @@ void known_shared_range(KnownSharedSpan view) {
 }
 std::uint64_t known_shared_stride(const ExecutionBufferAddress& first,
                                   const ExecutionBufferAddress& second) {
-    if (first.bytes != second.bytes || first.bytes > UINT64_MAX - 255U || second.address <= first.address)
-        throw std::invalid_argument("known-window shared R2 row extent/order differs");
-    const auto expected = (first.bytes + 255U) / 256U * 256U;
-    const auto stride = static_cast<std::uint64_t>(second.address - first.address);
-    if (stride != expected)
-        throw std::invalid_argument("known-window shared R2 row stride differs from serial allocation");
-    return stride;
+    return core::retained_row_stride(first.address, first.bytes, second.address, second.bytes);
 }
 const ExecutionMemoryBinding& known_shared_memory(const ExecutionDispatchContext& row) {
     if (!row.resources || !row.resources->scratch || !row.arena)
@@ -2391,7 +2386,7 @@ void shared_expert_known_prefill_rows_launch_detached(std::span<const ExecutionD
     static_cast<void>(known_shared_rows_stream());
     // Compact rows: one row's workspace view rounded up to 256 bytes (the arena's row stride spans the whole row view).
     const auto row_bytes = resolve_dispatch_temporary(rows[0], 0).bytes;
-    const auto stride = (row_bytes + 255U) / 256U * 256U;
+    const auto stride = core::physical_row_stride((row_bytes + 255U) / 256U * 256U, rows.size(), 256U);
     if (!stream || !workspace || workspace % 256U || !row_bytes || row_bytes > views.shape.workspace_stride_bytes ||
         stride > UINT64_MAX / rows.size() || workspace_bytes < stride * rows.size() || workspace_bytes > UINTPTR_MAX - workspace)
         throw std::invalid_argument("detached known shared prefill workspace is invalid");

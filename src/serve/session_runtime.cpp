@@ -105,6 +105,8 @@ struct SessionRuntime::Impl {
         std::stop_source cancel;
         bool done = false, receipt_done = false, cache_cleanup = false;
         std::string publication_error;
+        session::Identity resident_identity;
+        bool resident_reply_hit = false;  // the resident hit reused consumed reply rows
         std::optional<SessionTurnCache> turn;
         SessionView view() const { return {taken.job, handle, stats, offset, rng, phase_remaining}; }
     };
@@ -127,6 +129,8 @@ struct SessionRuntime::Impl {
     bool control_wait = false;
     SessionRuntime* owner = nullptr;
     std::uint64_t hits = 0, misses = 0;
+    std::uint64_t resident_hits = 0, resident_misses = 0, resident_hit_rows = 0, resident_reply_hits = 0;
+    std::uint64_t resident_kept = 0, resident_reply_kept = 0, resident_claim_refused = 0;
     bool stop_notified = false;
     std::uint64_t turn_admitted = 0, turn_refused = 0, turn_failed = 0, restore_failed = 0;
     void close() {
@@ -231,21 +235,41 @@ struct SessionRuntime::Impl {
             catch (...) { if (error.empty()) error = "session receipt callback failed"; }
         }
     }
-    void finish(Lane& l, std::string error = {}, std::uint64_t resident_rows = 0) {
+    // Rows a reply claim may certify, 0 = refuse. The lane must have ended cleanly on the exact committed frontier
+    // with its own prompt as the head of the store's token history.
+    std::uint64_t claim_rows(const Lane& l, const ResidentClaim& k, const std::string& error) const {
+        const auto prompt = l.taken.job.prompt.size();
+        if (!error.empty() || cancelled(l) || !k.rows || k.rows != prompt + k.reply_tokens ||
+            k.rows != store.consumed(l.handle)) return 0;
+        const auto history = store.tokens(l.handle);
+        if (history.size() < k.rows || !std::equal(l.taken.job.prompt.begin(), l.taken.job.prompt.end(), history.begin())) return 0;
+        return k.rows;
+    }
+    void finish(Lane& l, std::string error = {}, std::uint64_t resident_rows = 0, const ResidentClaim* claim = nullptr) {
         if (l.done) return;
         if (error.empty()) error = l.publication_error;
         receipt(l, error);
         if (l.handle.valid()) {
             try {
+                std::uint64_t reply_rows = 0;
+                if (claim) {
+                    resident_rows = claim_rows(l, *claim, error);
+                    reply_rows = resident_rows ? claim->reply_tokens : 0;
+                    if (!resident_rows) ++resident_claim_refused;
+                }
                 const bool retain = resident_rows && error.empty() && policy.store && hooks.identity.known() &&
                     l.taken.job.cache_retention != CacheRetention::no_store;
                 if (cache) cache->invalidate_resident(l.handle);
                 if (!retain) store.release(l.handle);
                 else {
-                    if (resident_rows > l.taken.job.prompt.size())
+                    if (resident_rows > l.taken.job.prompt.size() + reply_rows)
                         throw std::logic_error("decode rows cannot certify a resident prefill prefix");
                     const auto certificate = store.release_resident(l.handle, resident_rows);
-                    try { (void)cache->admit_resident(store, l.handle, certificate->tokens(), hooks.identity); }
+                    try {
+                        if (cache->admit_resident(store, l.handle, certificate->tokens(), l.resident_identity, reply_rows)) {
+                            ++resident_kept; if (reply_rows) ++resident_reply_kept;
+                        }
+                    }
                     catch (...) { /* Optional index allocation cannot fail a delivered reply. */ }
                 }
             }
@@ -762,17 +786,22 @@ SessionLease SessionRuntime::activate(std::uint64_t resident_alignment, bool pre
     if (impl_->hooks.native_validate) embed_admission(impl_->reserved->job, impl_->caps); // admission() ran it otherwise
     const auto started = impl_->hooks.now ? impl_->hooks.now() : std::chrono::steady_clock::now();
     if (resident_alignment && !impl_->cache) throw std::invalid_argument("native retention disabled");
+    l->resident_identity = impl_->hooks.resident_identity ?
+        impl_->hooks.resident_identity(impl_->reserved->job) : impl_->hooks.identity;
     const auto hit = resident_alignment ? impl_->cache->lookup_resident(impl_->store,
-        impl_->reserved->job.prompt, impl_->hooks.identity, resident_alignment) : session::ResidentHit{};
+        impl_->reserved->job.prompt, l->resident_identity, resident_alignment) : session::ResidentHit{};
     if (hit.entry) {
         // Remove the descriptor BEFORE a new lease or native mutation exists.
         impl_->cache->invalidate_resident(hit.entry->source);
         l->handle = impl_->store.acquire_resident(hit.entry->source, hit.entry->tokens().first(static_cast<std::size_t>(hit.rows)));
         l->stats.cached_tokens = hit.rows; ++impl_->hits;
+        ++impl_->resident_hits; impl_->resident_hit_rows += hit.rows;
+        l->resident_reply_hit = hit.rows > hit.entry->tokens().size() - hit.entry->reply_rows;
+        if (l->resident_reply_hit) ++impl_->resident_reply_hits;
     } else {
         l->handle = impl_->store.acquire();
         if (impl_->cache) impl_->cache->invalidate_resident(l->handle);
-        if (resident_alignment) ++impl_->misses;
+        if (resident_alignment) { ++impl_->misses; ++impl_->resident_misses; }
     }
     // The reservation stays whole until the lane is certain: a refused table gives the lease back and the
     // caller still owns a reservation it can refuse().
@@ -783,7 +812,7 @@ SessionLease SessionRuntime::activate(std::uint64_t resident_alignment, bool pre
     l->taken = std::move(*impl_->reserved); impl_->reserved.reset();
     if (!preserve_take_time) l->taken.started = started;
     l->stats.prompt_tokens = l->taken.job.prompt.size();
-    SessionLease result{l->taken, l->stats, l->handle};
+    SessionLease result{l->taken, l->stats, l->handle, l->resident_reply_hit};
     impl_->lanes.push_back(std::move(l));
     return result;
 }
@@ -896,11 +925,20 @@ void SessionRuntime::publish_progress(session::KvHandle h, GenerationProgress pr
 }
 void SessionRuntime::abandon_resident(session::KvHandle h) {
     for (auto& l : impl_->lanes) if (!l->done && l->handle == h) {
-        impl_->store.reset(h); l->stats.cached_tokens = 0;
+        impl_->store.reset(h);
         if (impl_->hits) { --impl_->hits; ++impl_->misses; }
+        if (impl_->resident_hits) {
+            --impl_->resident_hits; ++impl_->resident_misses; impl_->resident_hit_rows -= l->stats.cached_tokens;
+            if (l->resident_reply_hit) --impl_->resident_reply_hits;
+        }
+        l->stats.cached_tokens = 0; l->resident_reply_hit = false;
         return;
     }
     throw std::invalid_argument("stale resident abandonment");
+}
+void SessionRuntime::complete(session::KvHandle h, std::string error, const ResidentClaim& claim) {
+    for (auto& l : impl_->lanes) if (!l->done && l->handle == h) { impl_->finish(*l, std::move(error), 0, &claim); return; }
+    throw std::invalid_argument("stale session completion");
 }
 void SessionRuntime::complete(session::KvHandle h, std::string error, std::uint64_t rows) {
     for (auto& l : impl_->lanes) if (!l->done && l->handle == h) { impl_->finish(*l, std::move(error), rows); return; }
@@ -924,7 +962,9 @@ void SessionRuntime::wait_for(std::chrono::milliseconds duration, bool generatio
 const std::shared_ptr<PrefixStateCache>& SessionRuntime::cache_owner() const noexcept { static const std::shared_ptr<PrefixStateCache> none; return impl_->cache ? impl_->cache->owner() : none; }
 std::size_t SessionRuntime::cache_entries() const noexcept { return impl_->cache ? impl_->cache->size() : 0; }
 SessionCacheStats SessionRuntime::cache_stats() const noexcept { return {impl_->cache ? impl_->cache->size() : 0,impl_->cache ? impl_->cache->bytes() : 0,impl_->hits,impl_->misses,
-    impl_->turn_admitted,impl_->turn_refused,impl_->turn_failed,impl_->restore_failed}; }
+    impl_->turn_admitted,impl_->turn_refused,impl_->turn_failed,impl_->restore_failed,
+    impl_->resident_hits,impl_->resident_misses,impl_->resident_hit_rows,impl_->resident_reply_hits,
+    impl_->resident_kept,impl_->resident_reply_kept,impl_->resident_claim_refused}; }
 bool SessionRuntime::unpin_turn_cache(const std::string& keep) { return impl_->cache && impl_->cache->unpin(keep); }
 session::Capabilities SessionRuntime::capabilities() const { return impl_->caps; }
 void SessionRuntime::configure_api(ApiConfig& c) const {

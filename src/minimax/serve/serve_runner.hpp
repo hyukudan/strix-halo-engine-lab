@@ -27,6 +27,7 @@ struct Runner {
     std::uint32_t v0 = 0, vn = 0;     // this rank's vocabulary half (drafter Markov steps)
 
     bool prefix_reuse = false;
+    bool conversation = false;  // both ranks voted: resident prefills may restart mid-chunk at a reply-end frontier
     // Validation counters only; the sole token/LCP/eviction index is PrefixCache.
     struct ResidentFrontier { std::uint64_t rows = 0, generation = 0, total = 0; };
     std::vector<ResidentFrontier> resident_frontiers;
@@ -92,7 +93,7 @@ struct Runner {
             if (resident_frontiers.empty()) resident_frontiers.resize(eng.slots());
             auto& f = resident_frontiers.at(slot);
             if (resident && ((dd && context) || parent || state_endpoint || !generation || generation <= f.generation ||
-                resident > f.rows || resident % eng.prefill_reuse_rows()))
+                resident > f.rows || (!conversation && resident % eng.prefill_reuse_rows())))
                 throw std::runtime_error("MiniMax stale/unqualified resident frontier");
             f.rows = resident; f.generation = generation; f.total = resident + prompt.size();
         } else if (resident) throw std::runtime_error("MiniMax resident vote OFF");
@@ -126,7 +127,7 @@ struct Runner {
         const bool done = eng.prefill_resume(ms::resume_layers(layers), &last_next);
         if (done && prefix_reuse) {
             auto& f = resident_frontiers.at(slot);
-            f.rows = f.total - f.total % eng.prefill_reuse_rows();
+            f.rows = conversation ? f.total : f.total - f.total % eng.prefill_reuse_rows();
         }
         if (done && next) *next = last_next;
         if (done && state_endpoint) state_endpoint->selected(eng.prefill_progress().slot,last_next);
@@ -170,6 +171,10 @@ struct Runner {
         }
         if ((append & ~contexts) != 0) throw std::runtime_error("step: retired drafter context");
         auto g = eng.step(rows);
+        if (conversation && prefix_reuse && !resident_frontiers.empty())
+            for (const auto& row : rows)  // upper bound of the rows decode wrote; the lead's store holds the exact frontier
+                if (row.slot < resident_frontiers.size() && resident_frontiers[row.slot].rows)
+                    resident_frontiers[row.slot].rows = std::max<std::uint64_t>(resident_frontiers[row.slot].rows, row.pos + 1);
         if (dd != nullptr && append != 0) {
             const float* taps = eng.last_taps();
             for (std::size_t i0 = 0; i0 < rows.size();) {

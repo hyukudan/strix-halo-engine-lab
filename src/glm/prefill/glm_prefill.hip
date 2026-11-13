@@ -12,6 +12,7 @@
 #include "attn_core/index_score_band.hpp"
 #include "attn_core/index_score_wmma.hpp"
 #include "core/fma_rows.hpp"
+#include "strix/route_receipt.hpp"
 
 #include <cstdlib>
 #include <cstdio>
@@ -3080,10 +3081,13 @@ void dense_rows_versioned(const float* x, const void* w, dev::WType wt, unsigned
             g.count = 1; g.w[0] = w; g.y[0] = y; g.o0[0] = o0; g.n[0] = n;
             ::strix::core::fma_rows::launch_auto(x, fma_weight(wt), in, rows, g, s, dense_form());
             ok(hipGetLastError(), "glm pf dense_rows v4");
+            ::strix::route::launched(::strix::route::Product::dense, ::strix::route::Family::fma_rows, rows);
             return;
         }
+        ::strix::route::bypass(::strix::route::Product::dense, ::strix::route::Family::fma_rows, ::strix::route::Reason::shape, rows);  // in > 4096: older tiles
         version = 3;
     }
+    ::strix::route::launched(::strix::route::Product::dense, ::strix::route::Family::exact, rows);
     // Version 3 only changes grouped calls (dense_rows_group): a single projection measured at parity with v2 (router,
     // KDA f_b), so single calls keep the v2 tile under version 3.
     if (version == 3) version = 2;
@@ -3141,6 +3145,7 @@ void dense_rows_group_versioned(const float* x, dev::WType wt, unsigned in, cons
             if (g.count == 0) return;
             ::strix::core::fma_rows::launch_auto(x, fma_weight(wt), in, rows, g, s, dense_form());
             ok(hipGetLastError(), "glm pf dense_rows v4");
+            ::strix::route::launched(::strix::route::Product::dense, ::strix::route::Family::fma_rows, rows);  // one fused launch for the group
             return;
         }
         version = 3;
@@ -3150,6 +3155,7 @@ void dense_rows_group_versioned(const float* x, dev::WType wt, unsigned in, cons
         return;
     }
     if (rows == 0) return;
+    ::strix::route::launched(::strix::route::Product::dense, ::strix::route::Family::exact, rows);  // grouped v3 tile
     if (in == 0 || in % kGK) throw std::runtime_error("glm pf dense_rows: in must be a positive multiple of 32");
     DenseGroupArgs g{};
     unsigned ns[kDenseGroupMax];

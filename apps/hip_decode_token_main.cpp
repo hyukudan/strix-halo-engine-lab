@@ -8,6 +8,7 @@
 #include "strix/dist/communicator.hpp"
 #include "strix/startup_markers.hpp"
 #include "strix/power/sampler.hpp"
+#include "strix/route_receipt.hpp"
 #include "strix/device_profile.hpp"
 #include "strix/mtp_cost_table_session.hpp"
 #include "http_slot_capacity.hpp"
@@ -1715,6 +1716,43 @@ static int run_decode_entry(
         {options, requested_environment, !target_input_export}, model, info, manifest,
         admitted_content, prompt_capabilities, prompt_memory);
     options = effective.options;
+    {
+        // Shared route receipt: the prefill route this entry point resolved (the CLI and the HTTP server resolve
+        // differently from the same switches), requested vs effective, with the selector's own reason text.
+        namespace rr = strix::route;
+        rr::set_engine("qwen");
+        // Bind the resolved arithmetic, including governed options and numerical policy values.
+        const auto pair = strix::decode_cli::numerical_profile_pair(options);
+        const auto budget = options.resolved_qsa_prefill_budget.value_or(0U);
+        const auto union_cap = strix::qsa_union_cap_active();
+        rr::lever("qwen.prefill_identity", "resolved",
+                  strix::prefill_identity_name(effective.prefill_option_mask, budget, union_cap) + ":hash=" +
+                  rr::detail::hex(strix::prefill_identity_hash(effective.prefill_option_mask, budget, union_cap)));
+        rr::lever("qwen.numerical_profile_pair", "resolved",
+                  std::to_string(strix::numerical_profile_pair_identity(pair)));
+        rr::lever("qwen.gsq_owner", "resolved", effective.gsq_owner ? "1" : "0");
+        const bool automatic = options.automatic_prefill;
+        const std::string_view why = effective.reason;
+        const auto code = automatic ? rr::Reason::selected :
+            why == "explicit-route" || why == "baseline" || why == "explicit-diagnostic-or-execution-control" ? rr::Reason::wrong_route :
+            why == "feature-disabled" || why == "not-requested" ? rr::Reason::disabled :
+            why == "prompt-not-eligible" ? rr::Reason::short_call :
+            why == "a8-runtime-not-built" ? rr::Reason::build :
+            why.find("memory") != std::string_view::npos ? rr::Reason::memory :
+            why.find("qualified") != std::string_view::npos ? rr::Reason::qualification : rr::Reason::no_match;
+        rr::lever("qwen.entry", options.http_serve ? "http" : "cli", options.http_serve ? "http" : "cli", rr::Reason::selected, false);
+        rr::lever("qwen.prefill_auto", "auto", automatic ? "tiled-f16:rows=" + std::to_string(options.known_prefix_prefill_rows) : "declined", code, true,
+                  effective.reason);
+        // The tile the prompt actually runs on: the server admits its own (resolve_serve_prefill), so the same switches
+        // do not give the HTTP route the CLI's arithmetic.
+        rr::lever("qwen.prefill_tile_rows", options.http_serve ? "serve-auto" : "auto",
+                  options.known_prefix_prefill_rows ? "tiled:rows=" + std::to_string(options.known_prefix_prefill_rows) : "untiled",
+                  options.known_prefix_prefill_rows ? rr::Reason::selected : rr::Reason::disabled, true, effective.serve_prefill_notice);
+        if (!effective.arithmetic_fallback.empty())
+            rr::lever("qwen.prefill_arithmetic", "auto", "fallback", rr::Reason::no_match, true, effective.arithmetic_fallback);
+        if (!effective.tile_fallback.empty())
+            rr::lever("qwen.prefill_tile", "auto", "fallback", rr::Reason::no_match, true, effective.tile_fallback);
+    }
     // Export only after the resolved route has admitted the profile proposals.
     strix::qwen::profile::withdraw_declined(options.product_profile);
     strix::qwen::profile::apply(options.product_profile);

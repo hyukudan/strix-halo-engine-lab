@@ -31,6 +31,8 @@
 #include "minimax/rtxpf/fp32_identity.hpp"
 #include "minimax/engine/mm_defaults.hpp"
 #include "strix/deploy/device.hpp"
+#include "strix/env_flags.hpp"
+#include "strix/route_receipt.hpp"
 
 #include <strix_trellis.h>
 
@@ -713,6 +715,7 @@ struct Engine::Impl {
     };
     std::array<PfFences, 2> pf_fences{};
     bool pf_comm_inflight = false;
+    bool unaligned_resume = false;             // conversation mode: a resident prefill may restart mid-chunk
     bool pf_group_explicit = false;            // STRIX_MM_PF_GROUP given (then a narrower exchange depth is an error)
     unsigned pf_group = strix::pair::prefill_group::kDefault;  // STRIX_MM_PF_GROUP: chunks interleaved together (2..8;
                                                // clamped to the prompt's chunk count, and to the exchange depth)
@@ -1136,6 +1139,7 @@ struct Engine::Impl {
         lib.release_staging();
         alloc();
         if (model_fast_i4) setup_fast_i4();
+        route_levers();  // shared route receipt: requested vs effective, part of the rank fingerprint
         LoadReport r;
         r.seconds = secs(t0, Clock::now());
         r.gib_read = pack.gib_read();
@@ -1181,6 +1185,40 @@ struct Engine::Impl {
         std::fflush(stdout);
     }
     bool i4_jit_layer(unsigned L) const { return model_fast_i4 && L >= kFirstMoe && L < kLayers && !i4_exl3_layers.test(L); }
+    // Shared route receipt (strix/route_receipt.hpp): why a MoE layer's prefill runs IU4 or keeps the EXL3 operator.
+    strix::route::Reason route_i4_reason(unsigned L, bool i4) const {
+        using R = strix::route::Reason;
+        return i4 ? R::selected : !model_fast_i4 || !mmoe::prefill_iu4() ? R::disabled : !pf_i4_rows ? R::short_call :
+               i4_exl3_layers.test(L) ? R::layer_mask : R::no_match;
+    }
+    void route_levers() const {
+        namespace rr = strix::route;
+        rr::set_engine("minimax");
+        rr::set_rank(static_cast<int>(opt.rank));
+        const char* asked = strix::envcfg::text("STRIX_MMX_MODEL_FORMAT");
+        // Use the same resolved policies as the dispatch sites (including the IU4 override).
+        const bool iu4 = model_fast_i4 && mmoe::prefill_iu4();
+        const auto mask = [](const auto& layers, unsigned first) {
+            std::string value;
+            for (unsigned L = first; L < kLayers; ++L) value += layers.test(L) ? '1' : '0';
+            return value;
+        };
+        std::string effective = "exl3";
+        if (iu4) {
+            effective = std::string("iu4:") + (i4_scope == fast_i4::Scope::all ? "all" : "gate_up") + ":min_rows=" + std::to_string(i4_min_rows) +
+                        ":a8=" + std::to_string(i4_a8) + ":exl3_layers=" + mask(i4_exl3_layers, kFirstMoe);
+            if (i4_a8) effective += ":a8_layers=" + mask(i4_a8_layers, kFirstMoe);
+        }
+        rr::lever("minimax.moe_prefill_format", asked != nullptr && *asked != 0 ? asked : "default", effective,
+                  iu4 ? rr::Reason::selected : rr::Reason::disabled);
+        const unsigned flash = pf_msa_rework != 0 ? pf_msa_flash : 0U;
+        const char* flash_asked = strix::envcfg::text("STRIX_MM_PF_MSA_FLASH");
+        rr::lever("minimax.msa_flash", flash_asked != nullptr ? flash_asked : "default",
+                  std::to_string(flash) + (flash ? ":layers=" + mask(pf_msa_flash_layers, 0) : ""),
+                  flash ? rr::Reason::selected : rr::Reason::disabled);
+        rr::lever("minimax.prefill_identity", fp32_prefill ? "fp32" : "default", fp32_prefill ? "fp32" : "default");
+        rr::lever("minimax.moe_kernels", moe_opt ? "1" : "0", moe_opt ? "1" : "0");
+    }
     // Timing collection is nonblocking. At prompt completion the existing prefill fence makes
     // every sample available; no host fence is introduced for conversion or prefetch.
     void jit_collect(bool report = false) {
@@ -1826,6 +1864,7 @@ struct Engine::Impl {
                                       hipMemcpyDeviceToDevice, nullptr), "trace ids");
             out = send_buffer(n);
             const auto* i4 = i4_on && i4_jit_layer(L) ? jit_acquire(L, L1) : nullptr;
+            const strix::route::LayerScope route_layer(gemv || L < kFirstMoe ? ~0U : L, route_i4_reason(L, i4 != nullptr));
             stage_ffn(L, n, out, i4);
             if (i4 != nullptr) jit_release(L);
             exchange_post(n, L, 1, out, y.w_next, nullptr, nullptr);
@@ -2394,7 +2433,8 @@ struct Engine::Impl {
         task.toks.assign(toks.begin(), toks.end());
         task.pos0 = pos0;
         pf_i4_chain = mmoe::prefill_i4_chain(toks.size());
-        pf_i4_rows = toks.size() >= i4_min_rows;
+        // The kernel route is a property of the whole prompt, not of the suffix a resident restart leaves to compute.
+        pf_i4_rows = pos0 + toks.size() >= i4_min_rows;
         task.chunks = (toks.size() + opt.max_rows - 1) / opt.max_rows;
         const bool module = pf != nullptr && pf_on && !pf_force_comm;
         task.grouped = pf_interleave && (module || pf_comm_interleave) && !profiling && !(taps_on && tap_sink) && task.chunks >= 2;
@@ -2763,6 +2803,7 @@ struct Engine::Impl {
                 send(c, 0, L, o);
             }
             const auto* i4 = i4_on && i4_jit_layer(L) ? jit_acquire(L, L1) : nullptr;
+            const strix::route::LayerScope route_layer(gemv || L < kFirstMoe ? ~0U : L, route_i4_reason(L, i4 != nullptr));
             const auto post_router = [&](std::size_t c) {
                 use(c);
                 const auto view = recv(c);
@@ -3371,7 +3412,7 @@ void Engine::prefill_begin_task(PfTaskId id, PfTaskId parent, std::uint64_t gene
     auto& m = *impl_;
     if (id == 0 || m.task.open) throw std::logic_error("prefill begin: task identity");
     if (resident > m.opt.capacity || tokens.size() > m.opt.capacity - resident ||
-        (resident != 0 && resident % prefill_reuse_rows() != 0))
+        (resident != 0 && !m.unaligned_resume && resident % prefill_reuse_rows() != 0))
         throw std::invalid_argument("prefill begin: prefix range / alignment");
     if (parent != 0) {
         if (!m.parked.open || m.parked.id != parent || id == parent || slot == m.parked.slot ||
@@ -3407,11 +3448,16 @@ LoaderSnapshot Engine::draft_loader_snapshot() const {
 unsigned Engine::prefill_layer() const { return impl_->task.layer; }
 std::uint64_t Engine::prefill_unit_rows() const { return impl_->task.open ? impl_->task.rows : 0; }
 std::uint64_t Engine::prefill_reuse_rows() const {
-    // A whole group boundary is also a chunk boundary when taps/profiling disable grouping. The alignment stays at
-    // the width the default used to have (2 chunks): a wider group changes the schedule, not the chunk bits
-    // (group 2 and 4 give identical state hashes), and a resumed prefill's first group is already narrower.
+    // One chunk: a restart at a multiple of max_rows tiles exactly like the cold prefill. A wider group changes the
+    // schedule, not the chunk bits (group 2 and 4 give identical state hashes), and a resumed prefill's first group
+    // is already narrower, so the group width does not enter the alignment (kReuseChunks bounds it at one chunk).
     return std::uint64_t{impl_->opt.max_rows} * std::min(impl_->pf_group, strix::pair::prefill_group::kReuseChunks);
 }
+bool Engine::prefill_int4_regime(std::uint64_t prompt_rows) const {
+    return impl_->model_fast_i4 && prompt_rows >= impl_->i4_min_rows && mmoe::prefill_iu4();
+}
+void Engine::set_unaligned_resume(bool on) { impl_->unaligned_resume = on; }
+bool Engine::unaligned_resume() const { return impl_->unaligned_resume; }
 std::uint64_t Engine::prefill_rows_left() const { return impl_->task.open ? impl_->task.toks.size() - impl_->task.c0 : 0; }
 const std::uint16_t* Engine::embed_row(std::uint32_t token) const {
     if (token >= kVocab) throw std::out_of_range("embed_row");

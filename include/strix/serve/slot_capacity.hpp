@@ -138,6 +138,7 @@ struct CapacityPool {
     std::optional<std::uint64_t> available_bytes;  // observed; unknown stays unknown
     std::uint64_t headroom_bytes = 0;              // fixed reserve plus shared one-time costs
     SlotCost cost;
+    std::uint64_t keep_bytes = 0;                  // kept-prefix budget charged before slots are counted (see keep_budget_grant)
 };
 struct CapacityTerm {
     std::string name;
@@ -145,12 +146,36 @@ struct CapacityTerm {
     std::uint64_t headroom_bytes = 0;
     SlotCost cost;
     std::uint32_t slots = 0;  // what this pool alone allows, before the cap
+    std::uint64_t keep_bytes = 0;  // kept-prefix budget charged to this pool (0: none; the report omits it)
 };
 struct CapacityReport {
     std::uint32_t slots = 0;
     std::string limiting = "missing memory observations";
     std::vector<CapacityTerm> terms;
 };
+// Kept-prefix (conversation cache) budget for a pool. Live slots win: the grant is what is left after headroom and
+// `min_slots` slots (the first pays its active peak, each further one retained + active peak), capped by the
+// request. An unobserved pool or a missing slot cost grants nothing. Store the grant in CapacityPool::keep_bytes
+// (with_keep_budget does) so report_slot_capacity charges it before slots are counted: a smaller grant shrinks the
+// cache, never the slots.
+inline std::uint64_t keep_budget_grant(const CapacityPool& pool, std::uint64_t requested, std::uint32_t min_slots = 1) {
+    if (!requested || !pool.available_bytes || !pool.cost.retained_bytes) return 0;
+    const auto& c = pool.cost;
+    if (c.active_peak_bytes > UINT64_MAX - c.retained_bytes) return 0;
+    const auto per_extra = c.retained_bytes + c.active_peak_bytes;
+    const std::uint64_t extra = min_slots > 1 ? static_cast<std::uint64_t>(min_slots - 1U) : 0U;
+    if (extra && per_extra > UINT64_MAX / extra) return 0;
+    const auto live = extra * per_extra;
+    if (c.active_peak_bytes > UINT64_MAX - live) return 0;
+    const auto reserved = c.active_peak_bytes + live;
+    if (pool.headroom_bytes > UINT64_MAX - reserved) return 0;
+    const auto floor = pool.headroom_bytes + reserved;
+    return *pool.available_bytes > floor ? std::min(requested, *pool.available_bytes - floor) : 0;
+}
+inline CapacityPool with_keep_budget(CapacityPool pool, std::uint64_t requested, std::uint32_t min_slots = 1) {
+    pool.keep_bytes = keep_budget_grant(pool, requested, min_slots);
+    return pool;
+}
 // Minimum over the pools; ties name the first pool. A pool without an observation, or with no retained cost, gives
 // zero slots: capacity is never raised on an estimate.
 inline CapacityReport report_slot_capacity(const std::vector<CapacityPool>& pools, std::uint32_t cap = 0) {
@@ -159,13 +184,15 @@ inline CapacityReport report_slot_capacity(const std::vector<CapacityPool>& pool
     std::uint64_t best = UINT32_MAX;
     std::string limiting;
     for (const auto& pool : pools) {
-        CapacityTerm term{pool.name, pool.available_bytes, pool.headroom_bytes, pool.cost, 0U};
+        CapacityTerm term{pool.name, pool.available_bytes, pool.headroom_bytes, pool.cost, 0U, pool.keep_bytes};
+        const auto headroom = pool.keep_bytes > UINT64_MAX - pool.headroom_bytes ? UINT64_MAX
+                                                                                  : pool.headroom_bytes + pool.keep_bytes;
         std::string why = pool.name + " budget";
         if (!pool.available_bytes) why = "missing memory observations: " + pool.name;
         else if (!pool.cost.retained_bytes) why = "missing slot cost: " + pool.name;
         else if (pool.cost.active_peak_bytes > UINT64_MAX - pool.cost.retained_bytes) why = "cost overflow: " + pool.name;
         else term.slots = static_cast<std::uint32_t>(slots_in_pool(pool.cost.retained_bytes,
-            pool.cost.active_peak_bytes, *pool.available_bytes, pool.headroom_bytes));
+            pool.cost.active_peak_bytes, *pool.available_bytes, headroom));
         if (limiting.empty() || term.slots < best) { best = term.slots; limiting = std::move(why); }
         report.terms.push_back(std::move(term));
     }
@@ -206,7 +233,8 @@ inline std::string format_capacity_report(const CapacityReport& report) {
     for (const auto& t : report.terms)
         out += " " + t.name + "{available=" + detail::bytes_or_na(t.available_bytes) +
             " headroom=" + std::to_string(t.headroom_bytes) + " retained=" + std::to_string(t.cost.retained_bytes) +
-            " active_peak=" + std::to_string(t.cost.active_peak_bytes) + " slots=" + std::to_string(t.slots) + "}";
+            " active_peak=" + std::to_string(t.cost.active_peak_bytes) + " slots=" + std::to_string(t.slots) +
+            (t.keep_bytes ? " keep=" + std::to_string(t.keep_bytes) : std::string()) + "}";
     return out;
 }
 // JSON object for a status route. Names are engine-chosen identifiers; quotes and backslashes are escaped.
@@ -227,7 +255,8 @@ inline std::string capacity_report_json(const CapacityReport& report) {
             ",\"headroom_bytes\":" + std::to_string(t.headroom_bytes) +
             ",\"retained_bytes\":" + std::to_string(t.cost.retained_bytes) +
             ",\"active_peak_bytes\":" + std::to_string(t.cost.active_peak_bytes) +
-            ",\"slots\":" + std::to_string(t.slots) + "}";
+            ",\"slots\":" + std::to_string(t.slots) +
+            (t.keep_bytes ? ",\"keep_bytes\":" + std::to_string(t.keep_bytes) : std::string()) + "}";
     }
     return out + "]}";
 }

@@ -3063,6 +3063,17 @@
     "doc_anchor": "docs/optimizations.md#platform-power-receipt"
   },
   {
+    "engine": "platform",
+    "name": "Shared route receipt",
+    "flag_or_env": "STRIX_ROUTE_RECEIPT",
+    "default": "ON (counters are a few host integer increments per launch); every binary that binds a device prints the block strix-route-receipt-v1 at exit, the server returns it per request and in the status view",
+    "exact": "Host-only counters: no device call, no arithmetic. Qwen 8K prefill, receipt on vs off: logits file and generated tokens byte-identical in all four runs.",
+    "gain": "Observability, not a speed lever. Qwen 8K real-text prefill, one node, default exact route, receipt on/off interleaved (ABAB): 1,768.7 / 1,772.0 tok/s on vs 1,771.1 / 1,769.2 off (no slowdown).",
+    "preconditions": "None. Family lines exist where an engine has launch-site hooks (MiniMax MoE prefill per layer, GLM dense prefill); every engine reports its levers and the explicitly set switches.",
+    "off_switch": "STRIX_ROUTE_RECEIPT=0",
+    "doc_anchor": "docs/optimizations.md#platform-route-receipt"
+  },
+  {
     "engine": "minimax",
     "name": "Nested short-prompt admission",
     "flag_or_env": "STRIX_MM_SERVE_NEST; /admin/sched nest",
