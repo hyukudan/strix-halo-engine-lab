@@ -24,6 +24,9 @@ struct MtpBatchPlanRule {bool pooled=false; bool calibrated=false; std::uint32_t
 // The batched decode runs its joint cycle with the budget rule. On by default; STRIX_SERVE_ROW_BUDGET=0 (or the
 // baseline mode) restores the fixed rows-per-request table.
 [[nodiscard]] bool mtp_serve_row_budget_enabled() noexcept;
+// Most decoding requests the budget plans for (STRIX_SERVE_ROW_BUDGET_MAX_LANES, default 6, 0..8). Above it every
+// request gets the fixed table's two rows: measured, the budget wins at 2 to 6 requests and loses at 8.
+[[nodiscard]] std::uint32_t mtp_serve_row_budget_max_lanes() noexcept;
 // Joint scheduling only: all selections still come from each request's target.
 // A non-drafting request normally uses R2, commits one row and discards padding.
 class MtpBatchWindowController {

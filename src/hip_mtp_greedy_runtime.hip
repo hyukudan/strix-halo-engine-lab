@@ -1366,6 +1366,7 @@ std::vector<HipMtpServeLever> hip_mtp_serve_levers() {
         {"draft_batch","STRIX_MTP_DRAFT_BATCH",draft_batch_enabled(),draft_batch_enabled()?"1":"0"},
         {"joint_window","STRIX_MTP_BATCH_JOINT",joint || mtp_serve_row_budget_enabled(),joint || mtp_serve_row_budget_enabled()?"1":"0"},
         {"row_budget","STRIX_SERVE_ROW_BUDGET",mtp_serve_row_budget_enabled(),mtp_serve_row_budget_enabled()?"1":"0"},
+        {"row_budget_max_lanes","STRIX_SERVE_ROW_BUDGET_MAX_LANES",mtp_serve_row_budget_enabled(),std::to_string(mtp_serve_row_budget_max_lanes())},
     };
 }
 } // namespace strix

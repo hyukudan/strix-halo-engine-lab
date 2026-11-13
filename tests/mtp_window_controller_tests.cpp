@@ -362,7 +362,8 @@ int main() {
             expect(total>8U || total==4U || total==8U,"small budget totals are four or eight rows");
             expect(widest<=previous,"rows per lane do not grow with the lanes of a cycle");
             previous=widest;
-            if(lanes==8U) expect(total==32U && widest==4U,"eight confident lanes share the 32-row budget");
+            if(lanes==6U) expect(total>12U,"six confident lanes get more than the fixed table");
+            if(lanes>6U) expect(total==2U*lanes && widest==2U,"above the lane bound every request gets the fixed two rows");
         }
         const std::vector<Controller::Request> one{{0,8,sure}},eight{{0,8,sure},{1,8,sure},{2,8,sure},{3,8,sure},{4,8,sure},
             {5,8,sure},{6,8,sure},{7,8,sure}};

@@ -188,6 +188,11 @@ MtpBatchWindowController::Rule MtpBatchWindowController::rule_from_env(bool base
     if(!v && !baseline && mtp_serve_row_budget_enabled()) return parse_rule("budget");
     return v?parse_rule(v):parse_rule(baseline?"production":"calibrated-c3");
 }
+std::uint32_t mtp_serve_row_budget_max_lanes() noexcept {
+    static const std::uint32_t lanes=[]{
+        try {return envcfg::number<std::uint32_t>("STRIX_SERVE_ROW_BUDGET_MAX_LANES",6U,0U,8U);} catch(...) {return 6U;}}();
+    return lanes;
+}
 bool mtp_serve_row_budget_enabled() noexcept {
     static const bool on=envcfg::flag("STRIX_SERVE_ROW_BUDGET",true,EnvFlagMatch::exact);
     return on;
@@ -320,6 +325,13 @@ std::vector<std::uint32_t> MtpBatchWindowController::budget_rows(std::span<const
         throw std::invalid_argument("joint MTP windows require 1..8 requests and two physical rows each");
     for(const auto& r:q) if(r.limit!=2U && r.limit!=4U && r.limit!=8U)
         throw std::invalid_argument("joint MTP window limit must be an admitted owner");
+    // Regime selection: above the lane bound the measured cycle is faster with the fixed table's two rows per
+    // request (the cost of a deeper row exceeds its yield there), so the budget plans only up to the bound.
+    if(q.size()>mtp_serve_row_budget_max_lanes()) {
+        std::vector<std::uint32_t> fixed(q.size(),2U);
+        if(info) *info=estimate(q,fixed,prior);
+        return fixed;
+    }
     // accept[0] is the committed target row; row d + 2 is useful when draft d is accepted. Before drafting the
     // draft's chance is the 0.8 prior, afterwards its own probability, both blended with the slot's history
     // (the production rule's blend).
@@ -397,6 +409,7 @@ std::vector<std::uint32_t> MtpBatchWindowController::plan(std::span<const Reques
     plan_members_=q.size();
     auto out=rule_.budget?budget_rows(q,budget,true,&last_):search(q,budget,true,&last_);
     probe_.clear();
+    if(rule_.budget && q.size()>mtp_serve_row_budget_max_lanes()) return out;
     auto& plans=plans_.at(q.size());
     // Bounded exploration samples deeper windows even after a low-acceptance
     // region. It does not borrow another request's acceptance history.

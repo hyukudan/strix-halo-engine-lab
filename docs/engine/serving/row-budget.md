@@ -26,6 +26,10 @@ The priors are 28 ms fixed, 6 ms per row and 6 ms per request (one request: 34 +
 cycles cover topologies in which rows and requests moved independently, their least-squares fit replaces the
 priors. `STRIX_SERVE_ROW_COST=fixed,row[,lane]` pins the model.
 
+The budget plans cycles of up to `STRIX_SERVE_ROW_BUDGET_MAX_LANES` decoding requests (default 6, range 0 to 8).
+Above the bound every request gets the fixed table's two rows. The bound is measured: the budget is faster at
+two to six requests and slower at eight, where its deeper rows cost more than they yield.
+
 ## Exactness
 
 Scheduling only. Every emitted token comes from the request's own target rows, so token ids equal those of a
