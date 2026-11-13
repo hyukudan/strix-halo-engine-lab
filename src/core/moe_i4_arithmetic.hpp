@@ -9,6 +9,19 @@
 #include <type_traits>
 #include <utility>
 namespace strix::core::moe_i4 {
+// Optional segmented row policy. Bindings without hooks keep the contiguous address expression.
+template<class B,class=void> struct has_input_row : std::false_type {};
+template<class B> struct has_input_row<B,std::void_t<decltype(std::declval<const B&>().input_row(0U))>> : std::true_type {};
+template<class B> STRIX_I4_INLINE const float* input_row(const B& b,unsigned token) {
+    if constexpr (has_input_row<B>::value) return b.input_row(token);
+    else return b.x+static_cast<unsigned long long>(token)*B::H;
+}
+template<class B,class=void> struct has_output_row : std::false_type {};
+template<class B> struct has_output_row<B,std::void_t<decltype(std::declval<const B&>().output_row(0U))>> : std::true_type {};
+template<class B> STRIX_I4_INLINE float* output_row(const B& b,unsigned token) {
+    if constexpr (has_output_row<B>::value) return b.output_row(token);
+    else return b.out+static_cast<unsigned long long>(token)*B::H;
+}
 // Optional binding hook: suh_row(expert,m) resolves the expert's input-scale row once (a callable c -> float with the
 // values of suh(expert,m,c)), so a lane does not repeat the group lookup and pointer load per channel. Same values.
 template<class B,class=void> struct has_suh_row : std::false_type {};
@@ -28,7 +41,7 @@ STRIX_I4_INLINE void input_values(const Binding& b,unsigned expert,unsigned pair
     for(unsigned j=0;j<N;++j) s[j]=suh(col+Ops::channel(j));
     for(unsigned j=0;j<N;++j) {
         const unsigned c=col+Ops::channel(j);
-        const float x=cached ? cached[j] : b.x[static_cast<unsigned long long>(b.token(pair))*Binding::H+c];
+        const float x=cached ? cached[j] : input_row(b,b.token(pair))[c];
         v[j]=Ops::round16(Ops::materialize(x*s[j]));
     }
     Ops::transform(v);

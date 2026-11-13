@@ -660,6 +660,7 @@ struct Engine::Impl {
     fast_i4::Schedule jit_schedule;
     hipStream_t jit_stream = nullptr;
     bool jit_prefetch = false;    // STRIX_MMX_FAST_I4_PREFETCH (default 0)
+    unsigned i4_group = 0;        // STRIX_MMX_FAST_I4_GROUP: opt-in group-wide planner
     bool jit_stats = false;
     struct JitTiming {
         hipEvent_t convert0 = nullptr, convert1 = nullptr, moe0 = nullptr, moe1 = nullptr;
@@ -848,6 +849,7 @@ struct Engine::Impl {
             }
             i4_min_rows = fast_i4::min_rows(std::getenv("STRIX_MMX_FAST_I4_MIN_ROWS"));
             jit_prefetch = env_flag("STRIX_MMX_FAST_I4_PREFETCH", false);
+            i4_group = fast_i4::group_limit(std::getenv("STRIX_MMX_FAST_I4_GROUP"));
             jit_stats = env_flag("STRIX_MMX_FAST_I4_STATS", false);
         }
     }
@@ -1028,11 +1030,11 @@ struct Engine::Impl {
         if (jit_prefetch) hip_ok(hipStreamCreateWithFlags(&jit_stream, hipStreamNonBlocking), "fast_i4 prefetch stream");
         std::printf("mm rank %u: fast_i4 (identity minimax-fast-i4, lossy): %zu reusable IU4 layer slots, "
                     "%.3f GiB (%zu bytes) including slot tables; source tables %.3f MiB; prefill workspace %.3f GiB; "
-                    "scope %s, prefetch %u, EXL3 layers %u, min rows %zu; context %zu x %zu slots unchanged; decode EXL3\n", opt.rank,
+                    "scope %s, prefetch %u, group %u, EXL3 layers %u, min rows %zu; context %zu x %zu slots unchanged; decode EXL3\n", opt.rank,
                     jit.size(), static_cast<double>(jit.size() * pk) / 1073741824.0, jit.size() * pk,
                     static_cast<double>((kLayers - kFirstMoe) * mmoe::i4_source_bytes()) / 1048576.0,
                     static_cast<double>(pf_ws_bytes) / 1073741824.0,
-                    i4_scope == fast_i4::Scope::all ? "all" : "gate_up", jit_prefetch ? 1U : 0U, i4_exl3_layers.count(), i4_min_rows,
+                    i4_scope == fast_i4::Scope::all ? "all" : "gate_up", jit_prefetch ? 1U : 0U, i4_group, i4_exl3_layers.count(), i4_min_rows,
                     static_cast<std::size_t>(opt.capacity), static_cast<std::size_t>(opt.slots));
         std::fflush(stdout);
     }
@@ -1237,6 +1239,8 @@ struct Engine::Impl {
             pf_moe_cap = moe_opt ? strix::pair::prefill_group::moe_width(pf_moe_group, pf_group) : 1U;
             if (pf_moe_cap > 1) {
                 pf_gws_bytes = mmoe::prefill_moe_group_workspace_bound(static_cast<std::uint32_t>(pf_moe_cap * T));
+                if (model_fast_i4 && i4_group > 1 && i4_scope == fast_i4::Scope::all)
+                    pf_gws_bytes = std::max(pf_gws_bytes, mmoe::prefill_i4_group_workspace_bound(static_cast<std::uint32_t>(pf_moe_cap * T)));
                 hip_ok(hipMalloc(&pf_gws, pf_gws_bytes), "prefill group moe workspace");
                 std::fprintf(stderr, "mm rank %u: prefill MoE sub-group width up to %u (workspace %.2f GiB)\n",
                              static_cast<unsigned>(opt.rank), pf_moe_cap, static_cast<double>(pf_gws_bytes) / 1073741824.0);
@@ -2002,10 +2006,12 @@ struct Engine::Impl {
     // Chunks per group-wide MoE call for layer L of a unit of m chunks (1 = one stage_ffn per chunk). The conditions are
     // those of stage_ffn_impl's device-plan branch for an EXL3 layer; identical on both ranks.
     std::size_t pf_moe_width(unsigned L, bool i4_layer, std::size_t m) const {
-        if (pf_gws == nullptr || i4_layer || !layers[L].moe || !moe_opt || gemv || fp32_prefill || pf_table_stats || profiling ||
+        if (pf_gws == nullptr || !layers[L].moe || !moe_opt || gemv || fp32_prefill || pf_table_stats || profiling ||
             !mmoe::prefill_moe_device_plan(opt.max_rows))
             return 1;
-        return std::min<std::size_t>(pf_moe_cap, strix::pair::prefill_group::moe_width(pf_moe_group, static_cast<unsigned>(m)));
+        const unsigned width = std::min(pf_moe_cap, strix::pair::prefill_group::moe_width(pf_moe_group, static_cast<unsigned>(m)));
+        return i4_layer ? fast_i4::group_width(i4_group, width, i4_scope == fast_i4::Scope::all && pf_i4_chain &&
+            !(i4_a8 != 0U && i4_a8_layers.test(L))) : width;
     }
     // One group-wide MoE call (gv: the chunks' normed rows, router tables and outputs).
     void stage_ffn_group(unsigned L, mmoe::PrefillMoeGroupView& gv) {
@@ -2694,8 +2700,9 @@ struct Engine::Impl {
                     gv.out[sm] = O[sm];
                 }
                 use(c0);
+                gv.i4 = i4;
                 stage_ffn_group(L, gv);
-                jit_count(L, false);
+                jit_count(L, i4 != nullptr);
                 for (std::size_t sm = 0; sm < span; ++sm) {
                     use(c0 + sm);
                     send(c0 + sm, 1, L, O[sm]);

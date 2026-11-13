@@ -4,9 +4,23 @@
 #include <cstddef>
 #include <stdexcept>
 #include <string_view>
+#include <limits>
 
 namespace strix::minimax::engine::fast_i4 {
 enum class Scope { all, gate_up };
+inline unsigned group_limit(const char* value) {
+    const std::string_view s = value == nullptr ? "" : value;
+    unsigned v = 0;
+    for (const char c : s) {
+        if (c < '0' || c > '9' || v > (std::numeric_limits<unsigned>::max() - unsigned(c - '0')) / 10U)
+            throw std::invalid_argument("STRIX_MMX_FAST_I4_GROUP must be an unsigned chunk count");
+        v = v * 10U + unsigned(c - '0');
+    }
+    return v;
+}
+constexpr unsigned group_width(unsigned limit, unsigned exl3_width, bool chain_all_a4) {
+    return !chain_all_a4 || limit < 2 ? 1U : (limit < exl3_width ? limit : exl3_width);
+}
 inline Scope scope(const char* value) {
     const std::string_view s = value == nullptr ? "" : value;
     if (s.empty() || s == "all") return Scope::all;

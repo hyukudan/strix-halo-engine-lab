@@ -66,6 +66,18 @@ void range(fi::Schedule& schedule, Queues& q, unsigned first, unsigned end, unsi
     require(q.conversions - before == end - first);
 }
 int main() {
+    require(fi::group_limit(nullptr) == 0 && fi::group_limit("") == 0 && fi::group_limit("0") == 0);
+    require(fi::group_limit("2") == 2 && fi::group_limit("4294967295") == 4294967295U);
+    for (const char* bad : {"-1", " 2", "2x", "4294967296"}) {
+        bool refused = false;
+        try { (void)fi::group_limit(bad); } catch (const std::invalid_argument&) { refused = true; }
+        require(refused);
+    }
+    for (unsigned width : {1U, 2U, 4U, 8U}) {
+        require(fi::group_width(0, width, true) == 1 && fi::group_width(1, width, true) == 1);
+        require(fi::group_width(8, width, false) == 1 && fi::group_width(8, width, true) == width);
+        require(fi::group_width(2, width, true) == (width < 2 ? width : 2));
+    }
     require(fi::scope(nullptr) == fi::Scope::all && fi::scope("") == fi::Scope::all);
     require(fi::scope("all") == fi::Scope::all && fi::scope("gate_up") == fi::Scope::gate_up);
     for (const char* bad : {"ALL", "gate", "all ", "0"}) {

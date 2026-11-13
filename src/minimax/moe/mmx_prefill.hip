@@ -1115,7 +1115,7 @@ template <unsigned C> struct DevPolicyT {
                 p.out.groups[e]=g;
                 // Reuse the item arena for the library's device group list.
                 auto* tab=reinterpret_cast<unsigned*>(p.out.items);
-                tab[3*e]=e; tab[3*e+1]=start[e]; tab[3*e+2]=count[e];
+                tab[3*e]=e<kExperts ? e%kReal : kReal; tab[3*e+1]=start[e]; tab[3*e+2]=count[e];
             }
             return;
         }
@@ -1321,7 +1321,7 @@ DevLayout dev_layout(unsigned T,bool i4=false,unsigned classes=1) {
         // Largest tile list (BM32), count word, the global down operand (A4 + FP32 scales) and the
         // FP32 down rows of the ordered (deterministic) combine, then the gate/up A4 image
         // (row 2*pair+m, quantised once by the pre-pass) with its FP32 scales.
-        take(align256(((5ULL*T+31)/32+kDevGroups)*12)+256+
+        take(align256(((5ULL*T+31)/32+groups)*12)+256+
              align256(5ULL*T*(kInter/2))+align256(5ULL*T*(kInter/64)*4)+align256(5ULL*T*kHidden*4)+
              align256(2ULL*5ULL*T*(kHidden/2))+align256(2ULL*5ULL*T*(kHidden/64)*4)+
              (strix::core::moe_i4::gsave_enabled() ? align256(5ULL*T*kInter*4) : 0));  // GSave: FP32 pass-0 gate of the paired chain GEMM
@@ -1472,6 +1472,7 @@ std::array<unsigned, 16> class_grids(unsigned T, unsigned classes = 1, unsigned 
 
 #if STRIX_MMX_IU4_LIB
 void launch_i4_chain(const Tables&,const I4Layer&,const float*,float*,const strix::core::IU4Group*,unsigned char*,std::size_t,hipStream_t,bool);
+void launch_i4_chain_group(const Tables&,const I4Layer&,const strix::core::IU4Group*,unsigned char*,std::size_t,hipStream_t);
 #endif
 // The launches of a device-planned call over its tables: gather, gate/up classes, finish, down classes, combine.
 // The class queues hold gu_slot / dn_slot items (DevDims of the plan).
@@ -1587,7 +1588,7 @@ void enqueue_group_moe(const PrefillMoeGroupView& v, void* workspace, std::size_
     for (unsigned c = 0; c < S; ++c)
         if (v.y[c] == nullptr || v.routes[c] == nullptr || v.out[c] == nullptr)
             throw std::invalid_argument("minimax prefill moe: invalid group view");
-    const DevLayout l = dev_layout(T, false, kGwClasses);
+    const DevLayout l = dev_layout(T, v.i4 != nullptr, kGwClasses);
     if (workspace == nullptr || workspace_bytes < l.bytes) throw std::invalid_argument("minimax prefill moe: workspace too small");
     auto* ws = static_cast<unsigned char*>(workspace);
     dp::Args<GwPolicy> a{};
@@ -1608,6 +1609,7 @@ void enqueue_group_moe(const PrefillMoeGroupView& v, void* workspace, std::size_
     a.out.part = reinterpret_cast<float*>(ws + l.part);
     a.out.tpairs = l.tpairs;
     a.out.seg_count = reinterpret_cast<unsigned*>(ws + l.seg_count);
+    a.out.i4 = v.i4 != nullptr;
     a.out.seg_rows = v.seg_rows;
     a.out.segments = S;
     for (unsigned c = 0; c < S; ++c) a.out.seg_routes[c] = v.routes[c];
@@ -1633,6 +1635,15 @@ void enqueue_group_moe(const PrefillMoeGroupView& v, void* workspace, std::size_
     t.tpairs = l.tpairs;
     t.seg_rows = v.seg_rows;
     for (unsigned c = 0; c < S; ++c) t.seg_y[c] = v.y[c], t.seg_out[c] = v.out[c];
+#if STRIX_MMX_IU4_LIB
+    if (v.i4) {
+        launch_i4_chain_group(t,*v.i4,reinterpret_cast<const strix::core::IU4Group*>(a.out.items),
+            ws+l.xt,workspace_bytes-l.xt,stream);
+        return;
+    }
+#else
+    if (v.i4) throw std::invalid_argument("group i4 needs the IU4 library");
+#endif
     launch_device_planned(t, nullptr, nullptr, a.out.items, a.out.meta, grids, GwPolicy::kGuSlot, GwPolicy::kDnSlot,
                           prefill_gather_tok(), stream);
 }
@@ -1779,6 +1790,7 @@ void enqueue_prefill_moe_device(const PrefillMoeDeviceView& v, void* workspace, 
 
 unsigned prefill_moe_group_min_rows() { return 97; }  // every chunk's shared expert (and class 0) at splits 1
 std::size_t prefill_moe_group_workspace_bound(std::uint32_t rows) { return dev_layout(rows, false, kGwClasses).bytes; }
+std::size_t prefill_i4_group_workspace_bound(std::uint32_t rows) { return dev_layout(rows, true, kGwClasses).bytes; }
 void enqueue_prefill_moe_group(const PrefillMoeGroupView& v, void* workspace, std::size_t workspace_bytes, hipStream_t stream) {
     if (!prefill_moe_device_plan(v.rows)) throw std::invalid_argument("minimax prefill moe: device plan not selected for this call");
     enqueue_group_moe(v, workspace, workspace_bytes, stream);

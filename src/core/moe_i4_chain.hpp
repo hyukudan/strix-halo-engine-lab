@@ -97,7 +97,7 @@ template<class Schedule> __global__ __launch_bounds__(256) void reference_input_
         const unsigned token=s.token(),col=s.col();
         float cached[4];
         #pragma unroll
-        for(int j=0;j<4;++j) cached[j]=s.b.x[size_t(token)*Schedule::Binding::H+col+(threadIdx.x&31U)+32U*static_cast<unsigned>(j)];
+        for(int j=0;j<4;++j) cached[j]=input_row(s.b,token)[col+(threadIdx.x&31U)+32U*static_cast<unsigned>(j)];
         const auto rows=s.prepare();
         for(unsigned i=0;i<Schedule::kInputRows;++i) {
             if(!s.admit(rows,i)) continue;
@@ -116,7 +116,7 @@ template<class Schedule> __global__ __launch_bounds__(256) void reference_input_
         if(!s.input(0,r)) return;
         const unsigned token=s.b.token(s.source_pair(r.pair));
         #pragma unroll
-        for(unsigned j=0;j<4;++j) cached[j]=s.b.x[size_t(token)*Schedule::Binding::H+r.col+(threadIdx.x&31U)+32*j];
+        for(unsigned j=0;j<4;++j) cached[j]=input_row(s.b,token)[r.col+(threadIdx.x&31U)+32*j];
     }
     for(unsigned i=0;s.input(i,r);++i) {
         float v[4]; InputPolicy<typename Schedule::Binding>{s.b}.load(r.expert,s.source_pair(r.pair),r.m,r.col,v,Schedule::kCachedInput ? cached : nullptr);
@@ -146,7 +146,7 @@ template<class Binding> __global__ __launch_bounds__(256) void reference_combine
     }
     const unsigned shared=b.slot(tok,topk);
     #pragma unroll
-    for(unsigned j=0;j<4;++j) b.out[size_t(tok)*Binding::H+col+lane+32*j]=acc[j]+dn[size_t(shared)*Binding::H+col+lane+32*j];
+    for(unsigned j=0;j<4;++j) output_row(b,tok)[col+lane+32*j]=acc[j]+dn[size_t(shared)*Binding::H+col+lane+32*j];
 }
 // Existing FP16 shared experts can use the same policy arithmetic without entering A4.
 template<class Binding> __global__ void fp16_input_rows(Binding b,_Float16* input,unsigned rows,unsigned expert,unsigned stride,unsigned slot) {

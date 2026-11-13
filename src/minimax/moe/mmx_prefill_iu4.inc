@@ -30,7 +30,7 @@ static_assert(std::size_t{kHidden} * (kInter / 64U) == kI4S && kI4ExpertBytes ==
 void iu4_ok(hipError_t e, const char* what) { ok(e, what); }
 
 
-struct I4Binding {
+template<bool Segmented=false> struct I4BindingT {
     static constexpr unsigned H=kHidden, I=kInter;
     const float* x; float* out; Tables t; bool dense_groups=true; bool reference_group_ids=false; float* dn=nullptr;
     __device__ __forceinline__ float* contribution(unsigned p) const { return dn+size_t(p)*H; }
@@ -48,7 +48,8 @@ struct I4Binding {
     }
     __device__ __forceinline__ const std::uint16_t* suh_ptr(unsigned e,unsigned m) const {
         unsigned gi=e;
-        if(!dense_groups && !reference_group_ids) { gi=0; while(t.groups[gi].expert!=e) ++gi; }
+        if constexpr (Segmented) gi=e==kExperts ? t.shared_group : e;
+        else if(!dense_groups && !reference_group_ids) { gi=0; while(t.groups[gi].expert!=e) ++gi; }
         const auto& w=t.groups[gi].w;
         return m==0 ? w.gate.suh : m==1 ? w.up.suh : w.down.suh;
     }
@@ -61,8 +62,13 @@ struct I4Binding {
     __device__ __forceinline__ SuhRow suh_row(unsigned e,unsigned m) const { return {suh_ptr(e,m)}; }
     __device__ __forceinline__ float activation(float g,float u) const { return Epilogue::swiglu(g,u); }
 };
-struct I4ReferenceSchedule {
-    using Binding=I4Binding;
+using I4Binding=I4BindingT<>;
+struct I4SegmentBinding : I4BindingT<true> {
+    __device__ __forceinline__ const float* input_row(unsigned tok) const { return moe_row_in(nullptr,t,tok); }
+    __device__ __forceinline__ float* output_row(unsigned tok) const { return moe_row_out(nullptr,t,tok); }
+};
+template<class B=I4Binding> struct I4ReferenceScheduleT {
+    using Binding=B;
     static constexpr bool kCachedInput=true;
     Binding b; uint8_t* aq; float* as; const float* gu=nullptr;
     uint8_t* aq2=nullptr; float* as2=nullptr;   // remainder plane (FAST_I4 A8 policy), null = W4A4
@@ -72,7 +78,9 @@ struct I4ReferenceSchedule {
         if(q>=b.t.rows*kHB || i>=2*(kTopE+1)) return false;
         const unsigned tok=q/kHB,k=i/2,m=i%2;
         const unsigned p=k<kTopE ? b.t.tok_pair[tok*kTopE+k] : b.t.groups[b.t.shared_group].pair_begin+tok;
-        r={b.t.pair_group[p],2*p+m,m,(q%kHB)*128,kHidden,nullptr,aq,as,nullptr,aq2,as2};return true;
+        unsigned e=b.t.pair_group[p];
+        if constexpr (std::is_same_v<B,I4SegmentBinding>) e=e==b.t.shared_group ? kExperts : e%kExperts;
+        r={e,2*p+m,m,(q%kHB)*128,kHidden,nullptr,aq,as,nullptr,aq2,as2};return true;
     }
     __device__ __forceinline__ bool activation(unsigned i,strix::core::moe_i4::ReferenceRow& r) const {
         const unsigned q=blockIdx.x*8+threadIdx.x/32;
@@ -81,16 +89,17 @@ struct I4ReferenceSchedule {
         r={b.t.pair_group[p],p,2,(q%kIB)*128,kInter,gu,aq,as,b.t.at,aq2,as2};return true;
     }
 };
+using I4ReferenceSchedule=I4ReferenceScheduleT<>;
 
-void launch_i4_chain(const Tables& t,const I4Layer& q,const float* x,float* out,
-    const strix::core::IU4Group* groups,unsigned char* ws,std::size_t bytes,hipStream_t stream,bool dense_groups=true) {
+template<class Binding> void launch_i4_chain_impl(const Tables& t,const I4Layer& q,const float* x,float* out,
+    const strix::core::IU4Group* groups,unsigned char* ws,std::size_t bytes,hipStream_t stream,bool dense_groups,unsigned group_count) {
     namespace st=strix::core;
     // With the gate kept in registers, plan 2 (BM128) paired gate/up spills on gfx1151 and the paired
     // call runs at most plan 1 on its own tile list. GSave keeps the pass-0 gate in a global FP32
     // scratch (exact, L2-resident, same thread reads it back) so both calls share the selected plan.
     const bool gsv=st::moe_i4::gsave_enabled();
-    const auto cp=st::moe_i4::chain_plan<I4Binding>(iu4_plan(t.pairs,strix::core::moe_i4::kPlan2Rows),gsv ? std::size_t(t.pairs)*kInter : 0,t.pairs);
-    const unsigned max_tiles=st::moe_i4::chain_max_tiles(cp,t.pairs,kI4Experts);
+    const auto cp=st::moe_i4::chain_plan<Binding>(iu4_plan(t.pairs,strix::core::moe_i4::kPlan2Rows),gsv ? std::size_t(t.pairs)*kInter : 0,t.pairs);
+    const unsigned max_tiles=st::moe_i4::chain_max_tiles(cp,t.pairs,group_count);
     const std::size_t tile_bytes=align256(max_tiles*sizeof(st::IU4GroupTile));
     const std::size_t qbytes=align256(std::size_t(t.pairs)*(kInter/2));
     const std::size_t sbytes=align256(std::size_t(t.pairs)*(kInter/64)*4);
@@ -113,20 +122,30 @@ void launch_i4_chain(const Tables& t,const I4Layer& q,const float* x,float* out,
         w.q[m]=q.wq[m]; w.s[m]=q.ws[m]; w.svh[m]=q.svh[m];
         w.q_stride[m]=kI4ExpertBytes; w.s_stride[m]=kI4ExpertBytes/2;
     }
-    I4Binding b{x,out,t,dense_groups,false,dn};
+    Binding b{};
+    b.x=x; b.out=out; b.t=t; b.dense_groups=dense_groups; b.dn=dn;
+    Binding gather=b; gather.dense_groups=false; gather.reference_group_ids=true; gather.dn=nullptr;
     // Same schedule and binding flags as the control pre-pass: bitwise-identical A4 bytes/scales.
-    hipLaunchKernelGGL((st::moe_i4::reference_input_kernel<I4ReferenceSchedule>),dim3((t.rows*kHB+7)/8),dim3(256),0,stream,
-        (I4ReferenceSchedule{{x,out,t,false,true},gq,gs}));
+    hipLaunchKernelGGL((st::moe_i4::reference_input_kernel<I4ReferenceScheduleT<Binding>>),dim3((t.rows*kHB+7)/8),dim3(256),0,stream,
+        (I4ReferenceScheduleT<Binding>{gather,gq,gs}));
     iu4_ok(hipGetLastError(),"chain gather + quantiser");
     mark("gather",stream);
-    const auto run=st::moe_i4::launch_chain(cp,b,w,groups,kI4Experts,tiles,ntiles,t.pairs,gq,gs,aq,as,gv,stream,
+    const auto run=st::moe_i4::launch_chain(cp,b,w,groups,group_count,tiles,ntiles,t.pairs,gq,gs,aq,as,gv,stream,
         [&] { mark("gate_up",stream); });
     iu4_ok(run.status,run.stage);
     mark("down",stream);
     // Ordered combine of the control: ascending top-k FMA, shared expert last. Deterministic.
-    hipLaunchKernelGGL((st::moe_i4::reference_combine_kernel<I4Binding>),dim3((t.rows*kHB+7)/8),dim3(256),0,stream,b,dn,t.rows,kTopE);
+    hipLaunchKernelGGL((st::moe_i4::reference_combine_kernel<Binding>),dim3((t.rows*kHB+7)/8),dim3(256),0,stream,b,dn,t.rows,kTopE);
     iu4_ok(hipGetLastError(),"chain combine");
     mark("combine",stream);
+}
+void launch_i4_chain(const Tables& t,const I4Layer& q,const float* x,float* out,
+    const strix::core::IU4Group* groups,unsigned char* ws,std::size_t bytes,hipStream_t stream,bool dense_groups=true) {
+    launch_i4_chain_impl<I4Binding>(t,q,x,out,groups,ws,bytes,stream,dense_groups,kI4Experts);
+}
+void launch_i4_chain_group(const Tables& t,const I4Layer& q,const strix::core::IU4Group* groups,
+    unsigned char* ws,std::size_t bytes,hipStream_t stream) {
+    launch_i4_chain_impl<I4SegmentBinding>(t,q,nullptr,nullptr,groups,ws,bytes,stream,true,t.shared_group+1U);
 }
 
 // W4A8 policy scratch (remainder-plane A4 image, its scales and its GEMM output); grown on demand, never on the
