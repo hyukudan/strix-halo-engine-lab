@@ -1646,7 +1646,10 @@ struct HipKnownPrefixWindow::Impl {
             const auto assignments=prefill_rows_done*u32(model.num_experts_per_token);
             std::uint64_t experts=0,batches=0;
             for(std::uint32_t i=0;i<8U;++i){experts+=s.rows_per_expert_histogram[i];batches+=s.batch_size_histogram[i];}
-            if(s.status || s.version!=1U || s.logical_rows!=prefill_rows_done || s.assignments!=assignments ||
+            // RoutePrune plans the kept assignments only: at least the best one of every row, at most all of them.
+            const bool pruned=moe_core::route_prune_active().active();
+            const bool planned=pruned ? s.assignments>=prefill_rows_done && s.assignments<=assignments : s.assignments==assignments;
+            if(s.status || s.version!=1U || s.logical_rows!=prefill_rows_done || !planned ||
                 !s.touched || s.touched>assignments || s.touched>model.num_experts ||
                 s.batches<s.touched || s.batches>assignments || !s.maximum_assignments ||
                 s.maximum_assignments>assignments || s.duplicate_assignments>assignments ||

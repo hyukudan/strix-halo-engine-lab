@@ -41,9 +41,11 @@ __device__ __forceinline__ unsigned route_prune_keep(const float* w, unsigned k,
 }
 
 // One thread per row over strided weight rows (row r at base + r * stride bytes, k floats).
-__global__ __launch_bounds__(256) inline void route_prune_kernel(float* base, unsigned long long stride, unsigned rows, unsigned k,
-                                                                 RoutePrune p) {
-    const unsigned r = blockIdx.x * 256U + threadIdx.x;
+// (A template so the header can be included by several translation units.)
+template <unsigned Threads = 256U>
+__global__ __launch_bounds__(Threads) void route_prune_kernel(float* base, unsigned long long stride, unsigned rows, unsigned k,
+                                                               RoutePrune p) {
+    const unsigned r = blockIdx.x * Threads + threadIdx.x;
     if (r >= rows) return;
     float* const w = reinterpret_cast<float*>(reinterpret_cast<char*>(base) + r * stride);
     float sum, kept;
@@ -58,7 +60,7 @@ __global__ __launch_bounds__(256) inline void route_prune_kernel(float* base, un
 // rows > 0, k <= 32, p.active(). Ordered on `stream` after the router and before the route plan.
 inline hipError_t enqueue_route_prune(float* base, unsigned long long stride, unsigned rows, unsigned k, RoutePrune p,
                                       hipStream_t stream) {
-    route_prune_kernel<<<(rows + 255U) / 256U, 256, 0, stream>>>(base, stride, rows, k, p);
+    route_prune_kernel<256U><<<(rows + 255U) / 256U, 256, 0, stream>>>(base, stride, rows, k, p);
     return hipGetLastError();
 }
 
