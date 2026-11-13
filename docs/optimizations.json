@@ -1045,7 +1045,7 @@
     "default": "ON",
     "exact": "The published two-node gates compare both ranks with the reference: prefill logits, decode token IDs, verify rows and batch rows. Keep the same Q2 experts, dense overlay and trellis packs in both arms.",
     "gain": "Batch segments N8 +9%; TP down R6 -3%, N8 +1.6%",
-    "preconditions": "Two ranks and supported expert geometry; TP down width 1152; segment batching does not combine with BATCH_ROWS16=1.",
+    "preconditions": "Two ranks and supported expert geometry; TP down width 1152.",
     "off_switch": "Set one of STRIX_DS41_EXPERT_TP, STRIX_DS41_EXPERT_SLOTS, STRIX_DS41_ROUTES_FAST, STRIX_DS41_F16_PAIR, STRIX_DS41_TP_DOWN or STRIX_DS41_BATCH_SEGMENTS to 0 per comparison.",
     "doc_anchor": "docs/optimizations.md#ds-core"
   },

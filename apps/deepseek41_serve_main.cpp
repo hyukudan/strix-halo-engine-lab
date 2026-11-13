@@ -1132,6 +1132,20 @@ void warm_up(const Args& a, BatchForward& fwd, SlotPrefill* prefill, const strix
 }
 
 // Plans created after READY (misses of the warm-up; all of them when it is off).
+// Digest of every decode step's token ids as THIS rank computed them (FNV-1a over the ids, step order). Both ranks
+// print it when they stop: equal values = identical token ids on the two ranks, without a token log.
+struct StepTokenDigest {
+    std::uint64_t hash = 0xcbf29ce484222325ULL, tokens = 0;
+    template <typename Tokens>
+    void add(const Tokens& step) {
+        for (const std::uint32_t id : step) {
+            for (unsigned b = 0; b < 32U; b += 8U) hash = (hash ^ ((id >> b) & 0xFFU)) * 0x100000001b3ULL;
+            ++tokens;
+        }
+    }
+};
+StepTokenDigest g_step_tokens;
+
 std::string plans_since_ready() {
     const auto now = strix::ds41::trellis_plan_stats();
     char b[96];
@@ -1488,6 +1502,7 @@ void follow(const Args& initial, BatchForward& fwd, Watchdog& dog, const Prefill
         const auto rows = std::span<const BatchRow>(step_rows.data(), c.rows);
         if (spec) spec->follow_lookup_windows(c.pend);  // for follow_stage of these rows (after this step)
         const auto& tokens = stage ? stage->step(rows) : fwd.step(rows);
+        g_step_tokens.add(tokens);
         last_rows.assign(rows.begin(), rows.end());
         spec_rows = last_rows;
         last_tokens = tokens;
@@ -2735,6 +2750,7 @@ void lead(const Args& initial, BatchForward& fwd, strix::dist::Communicator& com
         prof.control += std::chrono::duration<double>(t0 - t_planned).count();
         if (stage && !pre) stage->submit(plan.rows);
         const auto& tokens = stage ? stage->step(plan.rows) : fwd.step(plan.rows);
+        g_step_tokens.add(tokens);
         dog.progress();
         last_round = Clock::now();
         hetero_step_seconds = std::chrono::duration<double>(last_round - t0).count();
@@ -3481,6 +3497,8 @@ void run_rank(Args a, std::uint32_t rank, std::unique_ptr<strix::dist::Transport
     else follow(a, fwd, dog, make_prefill, stage.get());
     if (stage) stage->close();
     std::fprintf(stderr, "rank %u: %s\n", rank, plans_since_ready().c_str());
+    std::fprintf(stderr, "rank %u: step tokens %llu digest %016llx\n", rank, static_cast<unsigned long long>(g_step_tokens.tokens),
+                 static_cast<unsigned long long>(g_step_tokens.hash));
     serve::Json stopped = serve::Json::object();
     stopped.set("event", serve::Json("STOPPED"));
     stopped.set("rank", serve::Json(static_cast<std::uint64_t>(rank)));

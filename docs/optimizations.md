@@ -1625,7 +1625,7 @@ Group shared-expert SwiGLU pairs.
 Splits expert work across the pair, retains expert slots, builds integer routes faster, pairs eligible F16 projections and batches attention segments.
 
 - **Preconditions:** Two ranks and supported expert geometry; TP down width 1152; segment batching does not combine with BATCH_ROWS16=1.
-- **Automatic selection:** Each is on unless disabled; BATCH_SEGMENTS declines itself when STRIX_DS41_BATCH_ROWS16=1. Shape guards keep supported older paths.
+- **Automatic selection:** Each is on unless disabled; BATCH_SEGMENTS also covers STRIX_DS41_BATCH_ROWS16=1 (two launches per kernel for 9 to 16 requests). Shape guards keep supported older paths.
 - **Fallback notice:** Routine operator eligibility has no general decline log. Invalid expert-TP geometry fails validation; do not treat a transport change as the same numerical identity.
 - **Exactness evidence:** The published two-node gates compare both ranks with the reference: prefill logits, decode token IDs, verify rows and batch rows. Keep the same Q2 experts, dense overlay and trellis packs in both arms.
 - **Off switch:** Set one of STRIX_DS41_EXPERT_TP, STRIX_DS41_EXPERT_SLOTS, STRIX_DS41_ROUTES_FAST, STRIX_DS41_F16_PAIR, STRIX_DS41_TP_DOWN or STRIX_DS41_BATCH_SEGMENTS to 0 per comparison.
