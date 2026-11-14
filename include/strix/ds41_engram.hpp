@@ -23,6 +23,10 @@
 #include <thread>
 #include <vector>
 
+namespace strix::core {
+class DirectRowFetcher;
+}
+
 namespace strix::ds41 {
 
 // Marks a token id of a sequence history (EngramHasher::push, AttentionState::tokens) as a dead n-gram position.
@@ -101,6 +105,9 @@ private:
     std::uint64_t file_bytes_ = 0;
     std::vector<EngramTable> tables_;
     std::vector<std::thread> threads_;
+    // direct I/O on Linux: the batch's rows through one deep read queue (core/direct_row_fetch.hpp) instead of one
+    // positional read per row on the worker threads; the same bytes. STRIX_DS41_ENGRAM_URING=0: the worker threads.
+    std::unique_ptr<core::DirectRowFetcher> fetcher_;
     std::unique_ptr<PayloadCache> cache_;
     mutable std::mutex read_mutex_;  // serializes callers and statistics, including async reader clients
     std::mutex mutex_;
