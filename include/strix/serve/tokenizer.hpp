@@ -24,6 +24,15 @@ public:
 class ApiTokenizer {
 public:
     using TokenType = BpeTokenizer::TokenType;
+    ApiTokenizer() = default;
+    ApiTokenizer(const ApiTokenizer&) {} // a copy starts a new memo lifetime
+    ApiTokenizer& operator=(const ApiTokenizer&) {
+        memo_identity_ = std::make_shared<const char>();
+        return *this;
+    }
+    // Encodings/configuration must remain immutable within a memo lifetime. Entries retain this
+    // token, so destroying/replacing the tokenizer cannot recycle its identity while entries live.
+    [[nodiscard]] std::shared_ptr<const void> memo_identity() const { return memo_identity_; }
     virtual ~ApiTokenizer() = default;
     virtual std::vector<std::uint32_t> encode(std::string_view, bool parse_special = true) const = 0;
     virtual std::string decode(std::span<const std::uint32_t>, bool skip_control = false) const = 0;
@@ -67,6 +76,8 @@ public:
     virtual std::uint32_t eos_token() const {
         throw std::invalid_argument("tokenizer does not expose an EOS token");
     }
+private:
+    std::shared_ptr<const void> memo_identity_ = std::make_shared<const char>();
 };
 
 // An explicit binding keeps the legacy ApiService(config, {}, ...) constructor

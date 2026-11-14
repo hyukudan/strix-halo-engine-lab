@@ -5018,6 +5018,8 @@ if(STRIX_FAMILY_MINIMAX)
         strix_target_warnings(strix-minimax-tool-choice-none-tests)
         add_test(NAME strix-minimax-tool-choice-none-tests COMMAND strix-minimax-tool-choice-none-tests)
         add_executable(strix-minimax-tokenizer-tests tests/minimax_tokenizer_tests.cpp)
+        target_compile_definitions(strix-minimax-tokenizer-tests PRIVATE
+            STRIX_MINIMAX_MEMO_FIXTURE="${CMAKE_CURRENT_SOURCE_DIR}/tests/minimax_tokenizer_memo.json")
         target_link_libraries(strix-minimax-tokenizer-tests PRIVATE strix_minimax_serve)
         strix_target_warnings(strix-minimax-tokenizer-tests)
         set(STRIX_MINIMAX_TOKENIZER_JSON "" CACHE FILEPATH "MiniMax tokenizer.json (optional; enables encode/decode checks)")

@@ -17,6 +17,7 @@
 #include <cstdlib>
 #include <functional>
 #include <iostream>
+#include <optional>
 #include <random>
 #include <stdexcept>
 #include <string>
@@ -44,7 +45,7 @@ std::string utf8(std::uint32_t cp) {
 
 // A small byte-level vocabulary with merges, the chat controls of the three templates and added tokens that nest
 // ("<a>" inside "<a>b", "<|im" inside "<|im_start|>"): a restart point is only valid with its lookahead window.
-std::shared_ptr<const BpeTokenizer> make_tokenizer(const std::string& pre) {
+std::shared_ptr<const BpeTokenizer> make_tokenizer(const std::string& pre, bool swap_ids = false) {
     std::array<std::string, 256> alphabet{};
     std::uint32_t extra = 0;
     for (std::uint32_t b = 0; b < 256U; ++b) {
@@ -81,6 +82,7 @@ std::shared_ptr<const BpeTokenizer> make_tokenizer(const std::string& pre) {
         tokens.emplace_back(added);
         types.push_back(4);
     }
+    if (swap_ids) std::swap(tokens[97], tokens[98]);
     return BpeTokenizer::from_parts(std::move(tokens), std::move(types), merges, pre);
 }
 
@@ -355,6 +357,60 @@ void identity_bounds_threads(Rng& rng) {
     require(shared.stats().entries <= 6U, "concurrent sessions: entry bound");
 }
 
+void tokenizer_lifetime() {
+    const auto first = make_tokenizer("qwen35"), second = make_tokenizer("qwen35", true);
+    require(first->vocab_size() == second->vocab_size() && first->encode("a") != second->encode("a"), "replacement fixture");
+    std::optional<BpeApiTokenizer> tokenizer(std::in_place, first);
+    const auto* storage = &*tokenizer;
+    TokenMemo whole, partial;
+    const std::string prefix = "a<a>" + std::string(128, 'a');
+    (void)whole.encode(*tokenizer, "a", true);
+    (void)partial.encode(*tokenizer, prefix + "x", true);
+    tokenizer.reset();
+    tokenizer.emplace(second);
+    require(&*tokenizer == storage, "replacement must reuse storage");
+    require(whole.encode(*tokenizer, "a", true) == second->encode("a"), "replacement whole IDs");
+    require(partial.encode(*tokenizer, prefix + "y", true) == second->encode(prefix + "y"), "replacement partial IDs");
+    require(whole.stats().whole == 0U && partial.stats().partial == 0U, "replacement cannot reuse old lifetime");
+    *tokenizer = BpeApiTokenizer(first);
+    require(whole.encode(*tokenizer, "a", true) == first->encode("a"), "assignment must renew lifetime");
+    require(whole.stats().whole == 0U, "assignment cannot reuse old lifetime");
+}
+
+void retained_capacity() {
+    const std::string text(300000, 'a');
+    std::size_t allocated = 0;
+    const TokenMemo::Encode heavy = [&](std::string_view, std::vector<EncodeMark>& marks) {
+        std::vector<std::uint32_t> ids;
+        ids.reserve(100004);
+        ids.resize(30000, 7U);
+        marks.reserve(30000);
+        for (std::size_t i = 1; i <= 30000U; ++i) marks.push_back({i * 10U, i});
+        allocated = text.size() + 1U + ids.capacity() * sizeof(std::uint32_t) + marks.capacity() * sizeof(EncodeMark);
+        return ids;
+    };
+    TokenMemo roomy(TokenMemo::Limits{std::size_t{8} << 20, 8});
+    require(roomy.encode(1, 0, text, heavy).size() == 30000U, "capacity-heavy result");
+    const auto charge = roomy.stats().bytes;
+    require(charge > allocated, "resident charge must include retained capacity and entry overhead");
+    TokenMemo small(TokenMemo::Limits{std::size_t{1} << 20, 8});
+    require(small.encode(1, 0, text, heavy).size() == 30000U, "oversize result remains valid");
+    require(small.stats().entries == 0U && small.stats().bytes == 0U, "capacity-heavy entry exceeds budget");
+    TokenMemo evict(TokenMemo::Limits{charge * 2U - 1U, 8});
+    (void)evict.encode(1, 0, text, heavy);
+    (void)evict.encode(2, 0, text, heavy);
+    require(evict.stats().entries == 1U && evict.stats().evictions == 1U && evict.stats().bytes == charge,
+            "eviction must subtract the retained-capacity charge");
+    (void)small.encode(3, 0, "a", [](std::string_view, std::vector<EncodeMark>& marks) {
+        marks.reserve(100000);
+        marks.push_back({1, 1});
+        return std::vector<std::uint32_t>{7U};
+    });
+    require(small.stats().entries == 0U, "spare mark capacity exceeds budget");
+    evict.clear();
+    require(evict.stats().entries == 0U && evict.stats().bytes == 0U, "clear releases the resident charge");
+}
+
 // ---- benchmark: host time of one chat turn's render + encode ------------------------------------------------------
 
 double ms_since(std::chrono::steady_clock::time_point t0) {
@@ -372,6 +428,12 @@ std::string prose(Rng& rng, std::size_t words) {
     return out;
 }
 
+double median(std::vector<double> samples) {
+    std::sort(samples.begin(), samples.end());
+    const auto mid = samples.size() / 2U;
+    return samples.size() % 2U ? samples[mid] : (samples[mid - 1U] + samples[mid]) / 2.0;
+}
+
 int bench(const std::string& path, const std::string& family, int rounds) {
     const bool gguf = path.size() > 5U && path.substr(path.size() - 5U) == ".gguf";
     const BpeApiTokenizer tokenizer(gguf ? BpeTokenizer::load_gguf(path) : BpeTokenizer::load_hf_json(path));
@@ -379,7 +441,7 @@ int bench(const std::string& path, const std::string& family, int rounds) {
     for (const auto& [name, r] : renderers()) if (family == name) renderer = &r;
     if (!renderer) throw std::invalid_argument("bench: family is qwen, deepseek or glm");
     std::cout << "tokmemo bench family=" << family << " vocab=" << tokenizer.vocab_size() << " lookahead=" << tokenizer.mark_lookahead()
-              << " rounds=" << rounds << "\ntokens  bytes  msgs  render_ms  encode_full_ms  encode_memo_ms  memo_first_ms  tail_tokens  exact\n";
+              << " rounds=" << rounds << "\ntokens  bytes  msgs  render_median_ms  encode_full_median_ms  encode_memo_median_ms  memo_first_ms  tail_tokens  exact\n";
     for (const std::size_t target : {std::size_t{8000}, std::size_t{32000}, std::size_t{115000}}) {
         Rng rng(42);
         Chat chat;
@@ -425,28 +487,37 @@ int bench(const std::string& path, const std::string& family, int rounds) {
         auto t0 = std::chrono::steady_clock::now();
         (void)memo.encode(tokenizer, before, true);
         const double first_ms = ms_since(t0);
-        double render_ms = 1e30, full_ms = 1e30, memo_ms = 1e30;
+        std::vector<double> render_ms, full_ms, memo_ms;
+        turn();
+        const std::string ask = prose(rng, 50);
         std::size_t tail_tokens = 0, bytes = 0, total = 0;
         bool exact = true;
         for (int round = 0; round < rounds; ++round) {
-            turn();
-            const std::string ask = prose(rng, 50);
+            memo.clear();
+            (void)memo.encode(tokenizer, before, true);
             t0 = std::chrono::steady_clock::now();
             const std::string text = render(*renderer, chat, ask);
-            render_ms = std::min(render_ms, ms_since(t0));
-            t0 = std::chrono::steady_clock::now();
-            const auto want = tokenizer.encode(text, true);
-            full_ms = std::min(full_ms, ms_since(t0));
+            render_ms.push_back(ms_since(t0));
             const auto encoded_before = memo.stats().encoded_bytes;
-            t0 = std::chrono::steady_clock::now();
-            const auto got = memo.encode(tokenizer, text, true);
-            memo_ms = std::min(memo_ms, ms_since(t0));
+            std::vector<std::uint32_t> want, got;
+            const auto full_sample = [&] {
+                t0 = std::chrono::steady_clock::now();
+                want = tokenizer.encode(text, true);
+                full_ms.push_back(ms_since(t0));
+            };
+            const auto memo_sample = [&] {
+                t0 = std::chrono::steady_clock::now();
+                got = memo.encode(tokenizer, text, true);
+                memo_ms.push_back(ms_since(t0));
+            };
+            if (round % 2 == 0) { full_sample(); memo_sample(); }
+            else { memo_sample(); full_sample(); }
             exact = exact && got == want;
             bytes = text.size();
             total = want.size();
             tail_tokens = (memo.stats().encoded_bytes - encoded_before) * want.size() / text.size();
         }
-        std::cout << total << "  " << bytes << "  " << chat.messages.size() << "  " << render_ms << "  " << full_ms << "  " << memo_ms
+        std::cout << total << "  " << bytes << "  " << chat.messages.size() << "  " << median(render_ms) << "  " << median(full_ms) << "  " << median(memo_ms)
                   << "  " << first_ms << "  ~" << tail_tokens << "  " << (exact ? "yes" : "NO") << '\n';
         if (!exact) return 1;
     }
@@ -462,10 +533,14 @@ int main(int argc, char** argv) {
     _CrtSetReportFile(_CRT_ASSERT, _CRTDBG_FILE_STDERR);
 #endif
     try {
+        if (argc == 2 && std::string(argv[1]) == "--lifetime-regression") { tokenizer_lifetime(); return 0; }
+        if (argc == 2 && std::string(argv[1]) == "--capacity-regression") { retained_capacity(); return 0; }
         if (argc >= 3 && std::string(argv[1]) == "--bench")
             return bench(argv[2], argc >= 4 ? argv[3] : "qwen", argc >= 5 ? std::max(1, std::atoi(argv[4])) : 5);
         const std::uint64_t seed = argc >= 3 && std::string(argv[1]) == "--seed" ? std::stoull(argv[2]) : 20261114ULL;
         Rng rng(seed);
+        tokenizer_lifetime();
+        retained_capacity();
         for (const char* pre : {"qwen35", "deepseek-v3", "glm4"}) {
             const auto bpe = make_tokenizer(pre);
             const BpeApiTokenizer tokenizer(bpe);

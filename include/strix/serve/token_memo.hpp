@@ -44,25 +44,37 @@ public:
     [[nodiscard]] static bool enabled_by_default();
     [[nodiscard]] static Limits default_limits();
 
+    // The callback caller supplies a unique identity for immutable vocabulary/configuration.
     [[nodiscard]] std::vector<std::uint32_t> encode(std::uint64_t identity, std::size_t lookahead, std::string_view text,
                                                     const Encode& encode);
-    // encode() of an ApiTokenizer; the identity is the tokenizer object, its vocabulary size, the flag and the salt.
+    // Keyed by retained tokenizer lifetime, parsing flag and salt, with field-by-field equality.
     [[nodiscard]] std::vector<std::uint32_t> encode(const ApiTokenizer& tokenizer, std::string_view text, bool parse_special,
                                                     std::uint64_t salt = 0);
     [[nodiscard]] Stats stats() const;
     void clear();
 
 private:
-    struct Entry {
+    struct Key {
         std::uint64_t identity = 0;
+        std::shared_ptr<const void> tokenizer;
+        bool parse_special = false;
+        bool operator==(const Key&) const = default;
+    };
+    struct Entry {
+        Key key;
         std::string text;
         std::vector<std::uint32_t> ids;
         std::vector<EncodeMark> marks;
         [[nodiscard]] std::size_t bytes() const noexcept {
-            return text.size() + ids.size() * sizeof(std::uint32_t) + marks.size() * sizeof(EncodeMark);
+            // Include spare capacity, the string terminator, entry and list node, and an allowance
+            // for shared ownership (entry + lifetime token). Allocator metadata is not portable.
+            return sizeof(Entry) + sizeof(std::shared_ptr<const Entry>) + 8U * sizeof(void*) +
+                   text.capacity() + 1U + ids.capacity() * sizeof(std::uint32_t) + marks.capacity() * sizeof(EncodeMark);
         }
     };
     using EntryPtr = std::shared_ptr<const Entry>;
+    [[nodiscard]] std::vector<std::uint32_t> encode(Key key, std::size_t lookahead, std::string_view text,
+                                                    const Encode& encode);
 
     Limits limits_;
     mutable std::mutex mutex_;

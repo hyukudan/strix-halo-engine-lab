@@ -26,9 +26,14 @@ whole-text hits only.
 - Shared: `strix::serve::TokenMemo` (`include/strix/serve/token_memo.hpp`). The API service uses it for the
   rendered chat prompt and for the stable system/tools prefix; the MiniMax API uses it through its tokenizer
   callback. `BpeTokenizer` (Qwen, DeepSeek, GLM) and `MinimaxTokenizer` report restart points.
-- Key: tokenizer object, vocabulary size, special-token parsing and a caller salt. One service owns one memo.
+- Key: retained tokenizer lifetime token, special-token parsing and caller salt, compared field by field.
+  Construction, copying and assignment start a fresh lifetime; configuration must otherwise stay immutable.
+  The callback overload requires the caller to supply a unique immutable vocabulary/configuration identity.
 - Memory: 64 MiB and 32 entries by default, least recently used entry evicted first. A prompt that continues a
   kept one replaces it, so a conversation holds one entry; conversations that share a prefix keep their own.
+  The resident-entry charge includes string/vector capacities, the string terminator, entry storage and a
+  bookkeeping allowance for list nodes and shared ownership. It is not a process-memory cap: allocator-specific
+  metadata, in-progress encodes, returned ID copies and pinned evicted entries consume memory outside this budget.
 - Thread-safe; encoding runs outside the lock.
 
 | Variable | Default | Meaning |
@@ -43,5 +48,8 @@ whole-text hits only.
 templates (turns appended, edits in the middle, tools reordered or changed, system prompt changed, sessions
 forked from a shared prefix, eviction under a small bound), on raw texts cut at any byte (inside UTF-8
 sequences and inside special tokens), without special parsing, across tokenizers and from eight threads.
-`--bench TOKENIZER FAMILY` prints the host time of render and encode per turn with and without the memo.
-`strix-minimax-tokenizer-tests` runs the same comparison on the MiniMax tokenizer.
+`--bench TOKENIZER FAMILY` prints host medians for the same before/after history, alternating full/memo
+measurement order and resetting the memo to the same predecessor before each pair. These host samples do
+not qualify concurrent contention or served time to first token.
+`strix-minimax-tokenizer-tests` runs memo checks on a small byte-vocabulary fixture when the optional model
+tokenizer is absent; model-specific golden-ID checks still require that asset.

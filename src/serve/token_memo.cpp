@@ -21,11 +21,6 @@ std::size_t common_prefix(std::string_view a, std::string_view b) noexcept {
     return i;
 }
 
-std::uint64_t mix(std::uint64_t h, std::uint64_t v) noexcept {
-    h ^= v + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
-    return h;
-}
-
 } // namespace
 
 bool TokenMemo::enabled_by_default() {
@@ -45,10 +40,7 @@ TokenMemo::Limits TokenMemo::default_limits() {
 
 std::vector<std::uint32_t> TokenMemo::encode(const ApiTokenizer& tokenizer, std::string_view text, bool parse_special,
                                              std::uint64_t salt) {
-    std::uint64_t identity = mix(salt, static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(&tokenizer)));
-    identity = mix(identity, tokenizer.vocab_size());
-    identity = mix(identity, parse_special ? 1U : 2U);
-    return encode(identity, tokenizer.mark_lookahead(), text,
+    return encode(Key{salt, tokenizer.memo_identity(), parse_special}, tokenizer.mark_lookahead(), text,
                   [&](std::string_view tail, std::vector<EncodeMark>& marks) {
                       return tokenizer.encode_marked(tail, parse_special, marks);
                   });
@@ -56,7 +48,13 @@ std::vector<std::uint32_t> TokenMemo::encode(const ApiTokenizer& tokenizer, std:
 
 std::vector<std::uint32_t> TokenMemo::encode(std::uint64_t identity, std::size_t lookahead, std::string_view text,
                                              const Encode& encode) {
+    return this->encode(Key{identity, {}, false}, lookahead, text, encode);
+}
+
+std::vector<std::uint32_t> TokenMemo::encode(Key key, std::size_t lookahead, std::string_view text,
+                                             const Encode& encode) {
     EntryPtr base;
+    EntryPtr whole;
     std::size_t base_marks = 0; // restart points of `base` that are reused
     std::size_t base_common = 0;
     {
@@ -64,13 +62,14 @@ std::vector<std::uint32_t> TokenMemo::encode(std::uint64_t identity, std::size_t
         ++stats_.calls;
         for (auto it = entries_.begin(); it != entries_.end(); ++it) {
             const Entry& entry = **it;
-            if (entry.identity != identity) continue;
+            if (entry.key != key) continue;
             const std::size_t common = common_prefix(entry.text, text);
             if (common == text.size() && common == entry.text.size()) {
                 ++stats_.whole;
                 stats_.reused_bytes += text.size();
                 entries_.splice(entries_.begin(), entries_, it);
-                return entries_.front()->ids;
+                whole = entries_.front();
+                break;
             }
             if (common < lookahead) continue;
             // restart points whose lookahead window lies inside the shared bytes
@@ -86,8 +85,9 @@ std::vector<std::uint32_t> TokenMemo::encode(std::uint64_t identity, std::size_t
         }
     }
 
+    if (whole) return whole->ids; // pin under the lock; copy outside it
     auto made = std::make_shared<Entry>();
-    made->identity = identity;
+    made->key = std::move(key);
     std::size_t reused = 0;
     if (base) {
         const EncodeMark at = base->marks[base_marks - 1U];
@@ -113,7 +113,7 @@ std::vector<std::uint32_t> TokenMemo::encode(std::uint64_t identity, std::size_t
     for (auto it = entries_.begin(); it != entries_.end();) {
         const Entry& entry = **it;
         // another request stored this text meanwhile, or this text continues the entry it was built from
-        const bool same = entry.identity == identity && entry.text == made->text;
+        const bool same = entry.key == made->key && entry.text == made->text;
         const bool continued = *it == base && base_common + continuation_slack >= entry.text.size() &&
                                made->text.size() >= entry.text.size();
         if (same || continued) {
