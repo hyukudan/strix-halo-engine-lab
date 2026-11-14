@@ -46,6 +46,9 @@ FAST cambia la numérica. Úsalo cuando el rendimiento importe más que una sali
 | `STRIX_QPF2K_GDN_FP16_CHUNK=1`, `--gdn-fp16-chunk` | qwen | off (on en `fast`) | Chunk GDN en FP16 durante el prefill. |
 | `--prefill-exact-fp16` | qwen | off | Fuerza la ruta de prefill FP16 exacta. |
 | `STRIX_DS41_FAST_MOE=1` | deepseek | off (`fast`) | Epílogo MoE relajado. |
+| `STRIX_DS41_FAST_PREFILL=1` | deepseek | off | Perfil `ds41-fast-pf-v1` (un solo resolvedor, `include/strix/ds41_fast_profile.hpp`): `STRIX_DS41_FAST_ATTN=2` + `STRIX_DS41_FAST_MOE=1` + `STRIX_DS41_FAST_DENSE=1`; una variable de palanca fijada manda. Cambia los logits. Puerta del par frente a exacto (1,280 filas teacher-forced, 20 prompts, etiquetas reales del siguiente token, ambos ranks iguales): KL agregada 0.0108, top-1 97.7 %, dNLL +0.0049: pasa KL <= 0.02, top-1 >= 93 % y el límite de dNLL relativo al suelo +0.0155 (media + 2 sd de tres brazos nulos de un ulp en la capa 0 con el mismo binario, `strix-gate --dnll-rule floor`; ver [tools/strix-gate](../tools/strix-gate/README.md)). Prefill del par en caliente, motor, proceso nuevo: 2,952 / 8,192 / 11,594 / 32,768 tokens 893 -> 1,037, 1,165 -> 1,377, 1,203 -> 1,425, 1,285 -> 1,546 tok/s; ciclos de GPU por token a 8K 2.17 M -> 1.89 M. |
+| `STRIX_DS41_FAST_ATTN=2` | deepseek | off | Atención dispersa BF16 de una pasada sobre el núcleo flash compartido (`ds41-attn-bf16flash-v1`; `1` = la forma f16 WMMA anterior, más lenta que exacto). Puerta sola (1,280 filas): KL 0.0108, top-1 97.2 %, dNLL +0.0120: pasa el límite relativo al suelo +0.0155, falla el límite fijo de dNLL 0.01. |
+| `STRIX_DS41_FAST_DENSE=1` | deepseek | off | Productos densos Q8_0 x A8 (q_b, o_a, o_b; llamadas de al menos `STRIX_DS41_FAST_DENSE_MIN_ROWS`, por defecto 128) en una cadena FP16 WMMA sobre el núcleo denso compartido, política `dense-q8a8-f16-v1`. Puerta sola (1,280 filas): KL 0.0100, top-1 98.1 %, dNLL +0.0146: pasa el límite relativo al suelo +0.0155, falla el límite fijo de dNLL 0.01. |
 | `STRIX_GLM_PF_WMMA=1` | glm | off (on con `--profile fast` en rank) | Prefill WMMA. Identidad FAST opcional; `=0` la desactiva incluso en `fast`. |
 
 ## La regla de régimen
@@ -199,6 +202,7 @@ Sigue el enlace para ver la ganancia, las precondiciones y el interruptor de apa
 | `STRIX_DS41_ENGRAM_PAYLOAD_CACHE` | deepseek | auto | [ds-prefill](optimizations.md#ds-prefill) |
 | `STRIX_DS41_PREFIX_DIAGNOSTICS` | deepseek | ON: 512 MiB/rank, block 256, reserve ... | [deepseek-pair-agent-prefix-cache](engine/serving/prefix-state-cache.md#deepseek-pair-agent-prefix-cache) |
 | `STRIX_PREFIX_CACHE` | qwen | ON on the qualified single tiled-MTP ... | [certified-mtp-subset](engine/serving/prefix-state-cache.md#certified-mtp-subset) |
+| `STRIX_PREFIX_QUEUE_PROTECT` | qwen | off | Una petición en espera retiene una referencia al estado de prefijo compatible más largo del nivel host; el desalojo lo salta hasta que la petición se admite, se cancela o se rechaza (con tope de bytes). |
 | `STRIX_PREFIX_CACHE_DISK` | qwen | ON: joining wherever the prefix cache... | [certified-restart-and-in-flight-joining](engine/serving/prefix-state-cache.md#certified-restart-and-in-flight-joining) |
 | `STRIX_PREFIX_CACHE_DURABLE` | qwen | ON: joining wherever the prefix cache... | [certified-restart-and-in-flight-joining](engine/serving/prefix-state-cache.md#certified-restart-and-in-flight-joining) |
 | `STRIX_PREFIX_CACHE_INFLIGHT` | qwen | ON: joining wherever the prefix cache... | [certified-restart-and-in-flight-joining](engine/serving/prefix-state-cache.md#certified-restart-and-in-flight-joining) |
@@ -270,6 +274,7 @@ Sigue el enlace para ver la ganancia, las precondiciones y el interruptor de apa
 | `STRIX_MM_PF_KV_TILE` | minimax | auto | [mm-pf-kv-tile](optimizations.md#mm-pf-kv-tile) |
 | `STRIX_MM_PF_LATE_SRC_FENCE` | minimax | ON | [minimax-grouped-prefill.md](minimax-grouped-prefill.md) |
 | `STRIX_MM_PF_MSA_BATCH` | minimax | 1 | [mm-pf-msa-batch](optimizations.md#mm-pf-msa-batch) |
+| `STRIX_MM_FAST_PREFILL=1` | minimax | off | Perfil `mm-fast-pf-v1` (filas gobernadas `src/minimax/engine/mm_profile_table.hpp`, reglas de paquete compartidas `include/strix/fast_profile.hpp`): `STRIX_MM_PF_MSA_FLASH=1` en las capas 40-59 = `msa-flash-bf16-l40-v1`, solo base MoE EXL3 (no se selecciona con `STRIX_MMX_MODEL_FORMAT=fast_i4`); un miembro fijado manda, `0` gana al paquete. Ambos ranks deben coincidir; las políticas activas entran en la identidad de la caché de sesión. Cambia los logits. Aún no calificado en el dispositivo: no se publica ninguna cifra de puerta ni de velocidad. |
 | `STRIX_MM_PF_MSA_REWORK` | minimax | 5 | [mm-pf-msa-rework](optimizations.md#mm-pf-msa-rework) |
 | `STRIX_MM_PF_MSA_SCRATCH_MB` | minimax | 1152 | [mm-pf-msa-scratch](optimizations.md#mm-pf-msa-scratch) |
 | `STRIX_MM_PF_ROUTER_BATCH` | minimax | 1 | [mm-pf-router-batch](optimizations.md#mm-pf-router-batch) |

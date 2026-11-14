@@ -75,6 +75,9 @@ permanecer en un cable directo o en una red privada.
 
 - [Servicio por HTTP](engine/serving/serving.md): contratos de petición, decode por batch, prefill de prompt
   predeterminado, salida restringida, políticas de planificación medidas.
+- [Memo de tokens del prompt](engine/serving/token-memo.md): un turno que reenvía su historial solo codifica la cola nueva.
+- Protección de prefijos en cola (servidor Qwen, `STRIX_PREFIX_QUEUE_PROTECT=1`, desactivada por defecto): una petición
+  en espera retiene el estado de prefijo compatible más largo de la caché para que el desalojo no lo descarte antes de admitirla.
 - [Caché de estado de prefijo](engine/serving/prefix-state-cache.md) y
   [composición del prefill de servicio con la caché de prefijo](engine/serving/serving-prefill-prefix-cache.md).
 - [Cualificación de la caché de prefijo de DeepSeek](engine/serving/ds41-prefix-cache-qualification.md),
