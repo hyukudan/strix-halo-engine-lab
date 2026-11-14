@@ -1,0 +1,16 @@
+{
+ "schema": "strix-serve-cli-parity-v1",
+ "comment": "Every resolved value that the server of an engine may have different from the CLI of the same engine for one request, with the reason serving requires it. tools/serve_cli_parity.py config fails on any difference that is not listed here. A row may pin cli / serve values: it then stops applying when either side changes.",
+ "engines": {
+  "*": [
+   {"key": "app", "reason": "names the entry point itself"},
+   {"key": "route", "reason": "names the entry point itself (cli / http-single / http-batch)"},
+   {"key": "*.entry", "reason": "names the entry point itself"}
+  ],
+  "qwen": [],
+  "glm": [],
+  "minimax": [],
+  "ds41": [],
+  "gemma": []
+ }
+}
