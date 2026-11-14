@@ -19,6 +19,7 @@
 #include "glm/engine/glm_fast_attn.hpp"
 #include "glm/engine/glm_fast_moe.hpp"
 #include "glm/engine/glm_fast_i4_pack.hpp"
+#include "core/host_free_memory.hpp"
 #include "core/iu4.hpp"
 #include "moe_core/int4_layer_policy.hpp"
 #include "glm/prefill/glm_pf_exact_moe.hpp"
@@ -1499,6 +1500,15 @@ struct Engine::Impl {
             LoadReport rep;
             rep.seconds = std::chrono::duration<double>(Clock::now() - t0).count();
             return rep;
+        }
+        // Free the RAM the load takes before the first device allocation (shared step, core/host_free_memory.hpp): a node
+        // whose page cache holds that memory would otherwise reclaim and migrate pages under the load and the first
+        // forward, and the driver suspends this process's queues at every migrated locked page (the "slow rank" of a pair).
+        // Opt-in (STRIX_HOST_FREE_PREPARE=1). The request is what a load was measured to take from MemFree: the physical
+        // plan plus a fifth.
+        {
+            const auto prep = strix::core::prepare_free_memory(phys + phys / 5);
+            std::fprintf(stderr, "mem: rank %u %s\n", opt.rank, strix::core::describe(prep).c_str());
         }
         lib.reserve_staging();
         base = probe.read();
