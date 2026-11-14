@@ -1448,10 +1448,13 @@ template <class Site, unsigned TM, unsigned TN>
 __global__ __launch_bounds__(128) void project_rows_dense_a8_wmma_kernel(Site site, const std::int8_t* codes, const float* deltas) {
 #pragma clang fp contract(off)
     constexpr unsigned Rows = Site::rows;
-    static_assert(Rows % (16U * TM) == 0U && Rows <= kDenseA8WideRows);
+    // Partial tile (2..15 rows, TM = 1): the tile's unused A rows repeat the last real row and are never stored,
+    // so a real row's products, chain and bits are those of the full tile.
+    constexpr bool Partial = Rows < 16U;
+    static_assert((Partial ? Rows >= 2U && TM == 1U : Rows % (16U * TM) == 0U) && Rows <= kDenseA8WideRows);
     constexpr std::uint32_t pitch = dense_a8_pitch<Rows>();
     const unsigned lane = threadIdx.x & 31U, wave = threadIdx.x / 32U, i = lane & 15U, h = lane >> 4U;
-    constexpr std::uint32_t row_tiles = Rows / (16U * TM);
+    constexpr std::uint32_t row_tiles = Partial ? 1U : Rows / (16U * TM);
     const std::uint32_t width = site.width, outputs = site.outputs, pairs = width / 64U;
     const std::uint32_t m0 = blockIdx.x % row_tiles * 16U * TM, n0 = (blockIdx.x / row_tiles * 4U + wave) * 16U * TN;
     if (n0 >= outputs) return;
@@ -1465,7 +1468,10 @@ __global__ __launch_bounds__(128) void project_rows_dense_a8_wmma_kernel(Site si
     // is row 8 h + e: a lane's eight epilogue rows (and their deltas) are consecutive.
     const std::int8_t* a[TM];
 #pragma unroll
-    for (unsigned t = 0; t < TM; ++t) a[t] = codes + static_cast<std::uint64_t>(m0 + 16U * t + 8U * (i & 1U) + (i >> 1U)) * width;
+    for (unsigned t = 0; t < TM; ++t) {
+        const std::uint32_t row = m0 + 16U * t + 8U * (i & 1U) + (i >> 1U);
+        a[t] = codes + static_cast<std::uint64_t>(Partial ? min(row, Rows - 1U) : row) * width;
+    }
     const std::uint32_t erow = m0 + 8U * h;
     float acc[TM][TN][8];
 #pragma unroll
@@ -1568,7 +1574,8 @@ __global__ __launch_bounds__(128) void project_rows_dense_a8_wmma_kernel(Site si
             const std::uint32_t n = n0 + 16U * u + i;
             if (n < outputs)
 #pragma unroll
-                for (unsigned e = 0; e < 8U; ++e) site.store(n, m0 + 16U * t + 8U * h + e, dense_a8_canonical(acc[t][u][e]));
+                for (unsigned e = 0; e < 8U; ++e)
+                    if (!Partial || 8U * h + e < Rows) site.store(n, m0 + 16U * t + 8U * h + e, dense_a8_canonical(acc[t][u][e]));
         }
 }
 
@@ -1785,15 +1792,15 @@ inline unsigned dense_a8_stage_mode() {
 constexpr std::uint64_t kDenseA8StageBytes = 24U * 1024U;
 // The WMMA projection of 16..256 rows from a quantized slot (barrier-ordered).
 template <class Site> void launch_dense_a8_projection(const Site& site, const DenseA8Slot& slot, hipStream_t stream) {
-    static_assert(Site::rows % 16U == 0U && Site::rows <= kDenseA8WideRows);
+    static_assert((Site::rows >= 2U && Site::rows < 16U) || (Site::rows % 16U == 0U && Site::rows <= kDenseA8WideRows));
     // Tiles measured in prefill on gfx1151 (T = 1032, 64- and 256-row launches): 4 x 1 is the
     // fastest for every site (GDN/QSA in and out, shared gate/up and down).
     const auto tiled = [&]<unsigned TM, unsigned TN>() {
-        constexpr unsigned row_tiles = Site::rows / (16U * TM);
+        constexpr unsigned row_tiles = Site::rows < 16U ? 1U : Site::rows / (16U * TM);
         hipLaunchKernelGGL(HIP_KERNEL_NAME(project_rows_dense_a8_wmma_kernel<Site, TM, TN>), dim3(row_tiles * ((site.outputs + 64U * TN - 1U) / (64U * TN))),
             dim3(128U), 0, stream, site, slot.codes, slot.deltas);
     };
-    constexpr unsigned TM = Site::rows >= 64U ? 4U : Site::rows / 16U;
+    constexpr unsigned TM = Site::rows >= 64U ? 4U : Site::rows < 16U ? 1U : Site::rows / 16U;
     // STRIX_DENSE_A8_TILE=11/12/21/22/41/42 (TM TN) forces one tile shape for every site (tuning).
     static const unsigned forced = strix::env_number<unsigned>("STRIX_DENSE_A8_TILE", 0U);
     // Launches of 64k rows take the LDS-staged 4 x 2 form when it still has at least 40 blocks of 8
@@ -1820,7 +1827,8 @@ template <class Site> void launch_dense_a8_projection(const Site& site, const De
         }
     }
     const auto pick = [&]<unsigned M, unsigned N>() {
-        if constexpr (Site::rows % (16U * M) == 0U) { tiled.template operator()<M, N>(); return true; } else return false;
+        if constexpr (Site::rows % (16U * M) == 0U || (Site::rows < 16U && M == 1U)) { tiled.template operator()<M, N>(); return true; }
+        else return false;
     };
     if (forced == 11U && pick.template operator()<1U, 1U>()) return;
     if (forced == 12U && pick.template operator()<1U, 2U>()) return;
@@ -1966,7 +1974,8 @@ template <class Site> void launch_dense_a8(const Site& site, hipStream_t stream,
     Site q6 = site;
     const bool use_q6 = Site::rows <= 8U && q6_site(site, q6);
     if constexpr (Site::rows >= 2U && Site::rows <= 8U) {
-        if (dense_a8_small_enabled()) {
+        const bool small = dense_a8_small_enabled();
+        if (small || dense_a8_row_tile(Site::rows)) {
             const auto slot = dense_a8_slot(a8_family_of<Site>());
             const auto items = Site::rows * (site.width / 8U);
             // Match the existing direct path: the dependent projection is ordered.
@@ -1975,7 +1984,8 @@ template <class Site> void launch_dense_a8(const Site& site, hipStream_t stream,
                     dim3(kThreads), 0, stream, nullptr, nullptr, hipExtAnyOrderLaunch, site, slot.codes, slot.deltas);
             else hipLaunchKernelGGL(dense_a8_quantize_kernel<Site>, dim3((items + kThreads - 1U) / kThreads),
                 dim3(kThreads), 0, stream, site, slot.codes, slot.deltas);
-            launch_dense_a8_small(site, slot, stream);
+            if (small) launch_dense_a8_small(site, slot, stream);
+            else { dense_a8_row_tile_note_active(Site::rows); launch_dense_a8_projection(site, slot, stream); }
             return;
         }
     }
@@ -2035,6 +2045,11 @@ template <class Site> void launch_dense_a8_quantized(const Site& site, const Den
     }
     if constexpr (Site::rows >= 2U && Site::rows <= 8U) {
         if (dense_a8_small_enabled()) { launch_dense_a8_small(site, slot, stream); return; }
+        if (dense_a8_row_tile(Site::rows)) {
+            dense_a8_row_tile_note_active(Site::rows);
+            launch_dense_a8_projection(site, slot, stream);
+            return;
+        }
     }
     if constexpr (Site::rows > 8U) { launch_dense_a8_projection(site, slot, stream); return; } else {
     constexpr unsigned Outs = dense_a8_outs_of<Site>();

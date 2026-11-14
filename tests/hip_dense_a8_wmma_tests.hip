@@ -701,12 +701,35 @@ void engine_bench(hipStream_t stream) {
             case 2: return baseline_shape_us<2U>(shape, weights, stream);
             case 4: return baseline_shape_us<4U>(shape, weights, stream);
             case 8: return baseline_shape_us<8U>(shape, weights, stream);
-            default: return baseline_shape_us<64U>(shape, weights, stream);
+            case 64: return baseline_shape_us<64U>(shape, weights, stream);
+            default: return 0.0F;
             }
         };
-        for (const unsigned rows : {1U, 2U, 4U, 8U, 64U}) {
+        for (const unsigned rows : {1U, 2U, 3U, 4U, 5U, 6U, 7U, 8U, 64U}) {
             const float dense = median_us([&] { launch_engine_any(rows, a, 0U, weights, shape.outputs, out, stream); }, stream);
             std::cout << "    T=" << rows << "  " << exact(rows) << "  " << dense << "  (" << mb * 1e3 / dense << " GB/s)\n";
+        }
+        // The multi-request decode step: 9..16 rows in one pass over the weights (the engine's 16-row
+        // launch) against the same rows as two launches of at most 8 rows, each a pass over the weights.
+        const auto quantize16 = [&](auto site) {
+            for (unsigned r = 0; r < 16U; ++r)
+                site.input[r] = a.input.as<unsigned char>() + static_cast<std::uint64_t>(r) * shape.width * (shape.bf16 ? 2U : 4U);
+            site.width = shape.width;
+            const auto slot = q8_rows::dense_a8_slot(q8_rows::a8_family_of<decltype(site)>());
+            hipLaunchKernelGGL(q8_rows::dense_a8_quantize_kernel<decltype(site)>, dim3((16U * (shape.width / 8U) + 255U) / 256U), dim3(256), 0,
+                stream, site, slot.codes, slot.deltas);
+        };
+        std::cout << "    16-row quantizer launch alone: " << median_us([&] {
+            if (shape.bf16) quantize16(EngineSite<std::uint16_t, 16U>{}); else quantize16(EngineSite<float, 16U>{});
+        }, stream) << " us\n";
+        std::cout << "    rows  one pass  two launches  us/row (one pass)\n";
+        for (const unsigned rows : {9U, 12U, 16U}) {
+            const float one = median_us([&] { launch_engine_any(16U, a, 0U, weights, shape.outputs, out, stream); }, stream);
+            const float two = median_us([&] {
+                launch_engine_any(8U, a, 0U, weights, shape.outputs, out, stream);
+                launch_engine_any(rows - 8U, a, 8U, weights, shape.outputs, out, stream);
+            }, stream);
+            std::cout << "    R=" << rows << "  " << one << "  " << two << "  " << one / static_cast<float>(rows) << "\n";
         }
     }
 }
