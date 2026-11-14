@@ -578,6 +578,40 @@ void test_apply() {
 
 }  // namespace
 
+// ONE RESOLVER: the same request through both entry points. Every host-path default is one row of one table; the
+// server may end with another value only where the row names the reason, and effective_config() prints both.
+void test_entry_points_host_defaults() {
+    const EnvMap none;
+    md::Cli rank, serve; rank.app = "rank"; serve.app = "serve";
+    const auto rank_lines = lines(md::effective_config(rank, lookup(none)));
+    const auto serve_lines = lines(md::effective_config(serve, lookup(none)));
+    check(!md::host_defaults().empty(), "host defaults table is not empty");
+    std::size_t differing = 0;
+    for (const md::HostDefault& row : md::host_defaults()) {
+        const char* a = md::host_default_value(row, "rank", lookup(none));
+        const char* b = md::host_default_value(row, "serve", lookup(none));
+        const std::string av = a ? a : "unset", bv = b ? b : "unset", key = std::string("host.") + row.name;
+        check(rank_lines.count(key + "=" + av) == 1, key + " printed by the CLI");
+        check(serve_lines.count(key + "=" + bv) == 1, key + " printed by the server");
+        if (av != bv) {
+            ++differing;
+            check(row.serving_reason != nullptr && std::string(row.serving_reason).size() > 20, key + " differs with a named reason");
+            check(serve_lines.count(key + ".serving_reason=" + row.serving_reason) == 1, key + " reason printed by the server");
+        } else {
+            check(row.serving_reason == nullptr, key + " equal on both entry points carries no reason");
+        }
+        // An explicit value wins on both entry points and removes the difference (and the reason line).
+        const EnvMap set = {{row.name, "7"}};
+        check(std::string(md::host_default_value(row, "rank", lookup(set))) == "7" &&
+              std::string(md::host_default_value(row, "serve", lookup(set))) == "7", key + " explicit value wins");
+        check(lines(md::effective_config(serve, lookup(set))).count(key + "=7") == 1, key + " explicit value printed");
+    }
+    check(differing == 3, "exactly the two transport timeouts and the prefill table ring differ between the entry points");
+    const EnvMap base = {{"STRIX_MM_BASELINE", "1"}};
+    for (const md::HostDefault& row : md::host_defaults())
+        if (row.optimization) check(md::host_default_value(row, "rank", lookup(base)) == nullptr, std::string(row.name) + " off under the baseline");
+}
+
 int main(int argc, char** argv) {
     if (argc < 2) {
         std::cerr << "usage: " << argv[0] << " minimax_production_receipt.txt\n";
@@ -597,6 +631,7 @@ int main(int argc, char** argv) {
         test_session_defaults();
         test_session_startup();
         test_apply();
+        test_entry_points_host_defaults();
     } catch (const std::exception& e) {
         std::cerr << "FAIL: " << e.what() << "\n";
         return 1;

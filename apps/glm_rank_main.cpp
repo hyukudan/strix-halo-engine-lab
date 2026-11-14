@@ -56,6 +56,7 @@
 #include "glm/prefill/glm_pf_load_admission.hpp"
 #include "strix/device_profile.hpp"
 #include "glm_rank_startup.hpp"
+#include "glm_auto_rows.hpp"
 #include "glm_rank_transport.hpp"
 
 #include "strix/dist/communicator.hpp"
@@ -455,62 +456,22 @@ int main(int argc, char** argv) {
             admitted_mem_available = admission.snapshot.mem_available;
             if (rd::max_rows_auto(eff)) prefill_margin = std::max(prefill_margin, rd::kMaxRowsSafetyBytes);
             if (rd::max_rows_auto(eff)) {
-                auto b = pf::prefill_budget(64 / opt.world, 64 / opt.world, opt.capacity, rd::kAutoMaxRows, opt.mtp, pf_tier, admission.kv_shard);
-                const auto comm_bytes = opt.world > 1 && !admission.recheck
-                    ? std::uint64_t{rd::kAutoMaxRows} * (3 * 4096 * 4 + 16) + 16384 : 0;
-                rd::select_max_rows(eff, [&] {
-                    if (prefill_mode == "ref") {
-                        auto terms = admission.terms;
-                        terms.push_back({"communication growth and chunk staging", 3 * comm_bytes, 0});
-                        return mem::fits(terms, admission.snapshot, admission.margins, admission.device_free);
-                    }
-                    // Preserve the preferred chunk size if ANY scratch candidate
-                    // admits locally. The engine later votes the SAME layout on
-                    // both ranks before installation, including at fallback rows.
-                    const auto saved = pf::capacity_layout();
-                    std::exception_ptr install_error;
-                    std::uint32_t fits = 0;
-                    try {
-                        for (const auto layout : pf::capacity_candidates(pf::capacity_policy(), admission.kv_shard)) {
-                            try {
-                                pf::capacity_layout() = layout;
-                                b = pf::prefill_budget(64 / opt.world, 64 / opt.world, opt.capacity,
-                                                       rd::kAutoMaxRows, opt.mtp, pf_tier, admission.kv_shard);
-                                pf::capacity_layout() = saved;
-                                pf::admit_prefill_load(admission, b.path, b.workspace, prefill_margin, 3 * comm_bytes);
-                                fits = 1;
-                                break;
-                            } catch (const std::runtime_error&) {
-                                // A local refusal is only a row-size probe here.
-                            }
-                        }
-                    } catch (...) {
-                        install_error = std::current_exception();
-                        fits = 2;
-                    }
-                    pf::capacity_layout() = saved;
-                    // One vote per probe, even if ranks admit different candidates.
+                const rd::AutoRowsPlan plan{opt.rank, opt.world, opt.capacity, opt.mtp, prefill_mode == "ref", pf_tier};
+                opt.max_rows = rd::admit_auto_rows(eff, admission, plan, prefill_margin, [&](std::uint32_t fits) {
                     std::uint32_t peer_fits = fits;
-                    if (comm) {
+                    if (comm)
                         comm->exchange_host(std::as_bytes(std::span{&fits, 1}), std::as_writable_bytes(std::span{&peer_fits, 1}),
                             {static_cast<std::uint32_t>(strix::dist::TagKind::raw_slots), 0xFFFFFFFBU, admission.recheck ? 1U : 0U});
-                        if (peer_fits > 2U) throw std::runtime_error("glm capacity: invalid row probe vote");
+                    return peer_fits;
+                }, [&](unsigned rows) {
+                    opt.max_rows = rows;
+                    if (!admission.recheck) {
+                        startup_agree();
+                        return opt.max_rows;
                     }
-                    if (install_error) std::rethrow_exception(install_error);
-                    if (peer_fits == 2U) throw std::runtime_error("peer install failed");
-                    return fits == 1U;
-                });
-                opt.max_rows = static_cast<unsigned>(std::stoul(eff.max_rows.value));
-                std::fprintf(stderr, "rank %u max-rows admission: %s; candidate %u, path %.2f GiB, workspace %.2f GiB, install %.2f GiB\n",
-                             opt.rank, mem::describe(admission.snapshot).c_str(), opt.max_rows,
-                             mem::gib(b.path), mem::gib(b.workspace), mem::gib(admission.prefill_install));
-                if (!admission.recheck) startup_agree();
-                else {
-                    const auto rows = rd::recheck_rows(opt.max_rows, comm != nullptr,
+                    return rd::recheck_rows(rows, comm != nullptr,
                         [&](auto* proposal, unsigned n, auto& ctl) { eng.exchange()->merge(proposal, n, ctl, nullptr); });
-                    rd::agree_max_rows(eff, rows);
-                    opt.max_rows = static_cast<unsigned>(std::stoul(eff.max_rows.value));
-                }
+                });
                 if (comm) comm->resize_bytes(std::size_t{opt.max_rows} * 4096 * sizeof(float) + 4096);
             }
             std::fprintf(stderr, "rank %u max-rows=%u (%s)\n", opt.rank, opt.max_rows, eff.max_rows.source.c_str());

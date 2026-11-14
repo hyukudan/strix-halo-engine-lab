@@ -365,6 +365,39 @@ SessionConfig session_config(const Cli& cli, const Lookup& env, std::uint64_t av
     return c;
 }
 
+namespace {
+constexpr const char* kPeerGone =
+    "a request must fail within a minute when the peer is gone; the CLI waits out an uneven two-rank load";
+constexpr HostDefault kHostDefaults[] = {
+    // The CRC organisation and the 1 MiB host chunks are items of the table above (apply() exports them for both
+    // entry points), so they are not repeated here.
+    // The ranks load at different speeds (44 s vs 166 s under page-cache pressure): the first collective after the
+    // load must not hit the dist layer's 120 s default.
+    {"STRIX_DIST_USB4_TIMEOUT_MS", "600000", "60000", kPeerGone, false},
+    {"STRIX_DIST_WAIT_TIMEOUT_MS", "600000", "60000", kPeerGone, false},
+    // Prefill MoE table ring: exact, 1K -0.5 %, 8K not slower; qualified with one engine owner only.
+    {"STRIX_MM_PF_TABLE_RING", "1", nullptr,
+     "qualified with a single engine owner; not qualified with several sessions sharing the engine", true},
+};
+}  // namespace
+
+std::span<const HostDefault> host_defaults() { return kHostDefaults; }
+
+const char* host_default_value(const HostDefault& row, const std::string& app, const Lookup& env) {
+    if (const char* set = env(row.name)) return set;
+    if (row.optimization) {
+        const char* base = env(kBaselineEnv);
+        if (base != nullptr && std::string(base) == "1") return nullptr;
+    }
+    return app == "serve" ? row.serve : row.rank;
+}
+
+void apply_host_defaults(const std::string& app) {
+    const Lookup lookup = [](const char* key) { return process_env(key); };
+    for (const auto& row : kHostDefaults)
+        if (const char* value = host_default_value(row, app, lookup)) (void)export_env(row.name, value, 0);
+}
+
 std::string effective_config(const Cli& cli, const Lookup& env) {
     std::ostringstream o;
     o << "app=" << cli.app << "\n"
@@ -405,6 +438,12 @@ std::string effective_config(const Cli& cli, const Lookup& env) {
     o << "session_requested=" << (requested ? requested : "auto") << "\n"
       << "session_cache=" << (session.enabled ? "pending" : "off") << "\n"
       << "session_reason=" << (session.enabled ? "runtime admission required" : session.reason) << "\n";
+    for (const auto& row : kHostDefaults) {
+        const char* value = host_default_value(row, cli.app, env);
+        o << "host." << row.name << "=" << (value ? value : "unset") << "\n";
+        if (cli.app == "serve" && row.serving_reason != nullptr && env(row.name) == nullptr)
+            o << "host." << row.name << ".serving_reason=" << row.serving_reason << "\n";
+    }
     return o.str();
 }
 
