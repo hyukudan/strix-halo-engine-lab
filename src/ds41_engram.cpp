@@ -3,6 +3,7 @@
 
 #include "strix/ds41_formats.hpp"
 #include "core/direct_row_fetch.hpp"
+#include "strix/env_flags.hpp"
 
 #include <chrono>
 #include <algorithm>
@@ -237,6 +238,9 @@ EngramRowReader::EngramRowReader(const std::filesystem::path& file, std::vector<
                                  bool direct_io, std::uint64_t payload_cache_bytes)
     : tables_(std::move(tables)) {
     require(threads >= 1 && threads <= 256 && !tables_.empty(), "Engram reader configuration");
+    // Resolve before opening the descriptor: invalid governed settings must not leak it.
+    const bool ring = envcfg::flag("STRIX_DS41_ENGRAM_URING", true, EnvFlagMatch::exact);
+    const unsigned depth = envcfg::number<unsigned>("STRIX_DS41_ENGRAM_URING_DEPTH", 256U, 0U, 4096U);
     if (payload_cache_bytes != 0U) {
         try { cache_ = std::make_unique<PayloadCache>(payload_cache_bytes); }
         catch (const std::bad_alloc&) { cache_.reset(); }  // an optional cache never prevents loading
@@ -272,11 +276,7 @@ EngramRowReader::EngramRowReader(const std::filesystem::path& file, std::vector<
     if (direct_) {
         // reads in flight on the ring (STRIX_DS41_ENGRAM_URING_DEPTH, default 256: the measured best of 64..512 on the
         // NVMe drives of both nodes; one ring against 96 threads: +15-25 % rows per second and one busy core, not 96 threads)
-        const char* off = std::getenv("STRIX_DS41_ENGRAM_URING");
-        const char* d = std::getenv("STRIX_DS41_ENGRAM_URING_DEPTH");
-        const unsigned long depth = d && *d ? std::strtoul(d, nullptr, 10) : 256UL;
-        if (!(off && std::strcmp(off, "0") == 0) && depth >= 1UL && depth <= 4096UL)
-            fetcher_ = core::DirectRowFetcher::make(fd_, static_cast<unsigned>(depth));
+        if (ring && depth != 0U) fetcher_ = core::DirectRowFetcher::make(fd_, depth);
     }
     for (unsigned i = 0; i < threads; ++i) threads_.emplace_back([this] { worker(); });
 }
@@ -299,6 +299,11 @@ EngramRowReader::~EngramRowReader() {
                      static_cast<unsigned long long>(s.cache_storage_bytes), static_cast<unsigned long long>(s.cache_evictions));
     }
     if (fd_ >= 0) close_fd(fd_);
+}
+
+bool EngramRowReader::ring_io() const {
+    std::lock_guard<std::mutex> lock(read_mutex_);
+    return fetcher_ && fetcher_->usable();
 }
 
 void EngramRowReader::read_one(const EngramRowRequest& r, std::uint8_t* out, std::uint8_t* page) {

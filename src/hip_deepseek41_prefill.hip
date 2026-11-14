@@ -1923,8 +1923,8 @@ PrefillResult DevicePrefill::run_from(std::span<const std::uint32_t> tokens, std
                 // the same shared read-ahead loop to independently ready layers.
                 const std::size_t layer_requests = std::size_t{Tn} * engram_cols;
                 std::vector<std::size_t> offsets{0};
-                const char* piece_env = std::getenv("STRIX_DS41_ENGRAM_PIECE_READ");
-                if (engram_split_read && !engram_layer_blocks && Tn > 0U && !(piece_env && std::strcmp(piece_env, "0") == 0)) {
+                static const bool piece_read = strix::envcfg::flag("STRIX_DS41_ENGRAM_PIECE_READ", true, strix::EnvFlagMatch::exact);
+                if (engram_split_read && !engram_layer_blocks && Tn > 0U && piece_read) {
                     engram_piece_rows = m.task != nullptr && m.task->opt.engram_rows != 0U ? std::min(m.task->opt.engram_rows, C) : C;
                     engram_piece_blocks = (Tn + engram_piece_rows - 1U) / engram_piece_rows;
                     offsets.clear();

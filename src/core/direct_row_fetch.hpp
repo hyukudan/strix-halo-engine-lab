@@ -10,11 +10,13 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <exception>
 #include <memory>
 #include <numeric>
 #include <span>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <vector>
 
 #if defined(__linux__) && __has_include(<linux/io_uring.h>)
@@ -61,10 +63,12 @@ public:
     [[nodiscard]] bool usable() const noexcept { return ring_ready(); }
 
     // sink(i, p): row i's bytes at p (valid during the call only). One caller at a time. Throws on a read error, after
-    // every read in flight has completed (the ring is reusable).
+    // every read in flight has completed (the ring is reusable, including after a sink exception).
+    // A fatal ring-entry error drains consumed submissions and disables the ring.
     template <class Sink> void fetch(std::span<const RowFetch> rows, Sink&& sink, RowFetchStats* stats = nullptr) {
 #ifdef STRIX_DIRECT_ROW_FETCH_URING
         if (rows.empty()) return;
+        if (!usable()) throw std::runtime_error("row fetch: ring unavailable");
         order_.resize(rows.size());
         std::iota(order_.begin(), order_.end(), std::uint32_t{0});
         std::sort(order_.begin(), order_.end(), [&](std::uint32_t a, std::uint32_t b) { return rows[a].offset < rows[b].offset; });
@@ -73,6 +77,7 @@ public:
             if (r.bytes == 0U || r.bytes > slot_bytes - page) throw std::invalid_argument("row fetch: row size");
         std::size_t next = 0, in_flight = 0;
         bool failed = false;
+        std::exception_ptr delivery_error;
         RowFetchStats s;
         const auto deliver = [&](const Group& g, const std::uint8_t* data) {
             for (std::size_t k = g.begin; k < g.end; ++k) {
@@ -119,14 +124,22 @@ public:
             sq_tail_->store(tail_, std::memory_order_release);
             const long rc = ::syscall(SYS_io_uring_enter, ring_, pending, 1U, IORING_ENTER_GETEVENTS, nullptr, 0);
             if (rc < 0 && errno != EINTR && errno != EAGAIN && errno != EBUSY) {
-                // the ring itself failed: nothing more can be reaped and it is not reusable. Reads in flight may still
-                // write their slots, so the slots are left allocated.
-                const std::string why = std::strerror(errno);
-                buffers_ = nullptr;
+                // No SQPOLL: only enter consumes submissions. The SQ head also accounts for partial consumption
+                // on an error. CQ publication needs no further enter; retain slots until every consumed read ends.
+                const int error = errno;
+                in_flight -= tail_ - sq_head_->load(std::memory_order_acquire);
+                while (in_flight != 0U) {
+                    const unsigned head = cq_head_->load(std::memory_order_relaxed);
+                    const unsigned end = cq_tail_->load(std::memory_order_acquire);
+                    in_flight -= end - head;
+                    cq_head_->store(end, std::memory_order_release);
+                    if (in_flight != 0U) std::this_thread::yield();
+                }
                 close_ring();
-                throw std::runtime_error("row fetch: io_uring_enter: " + why);
+                if (delivery_error) std::rethrow_exception(delivery_error);
+                throw std::runtime_error("row fetch: io_uring_enter: " + std::string(std::strerror(error)));
             }
-            if (rc > 0) pending -= std::min(pending, static_cast<unsigned>(rc));  // the rest stay queued for the next enter
+            pending = tail_ - sq_head_->load(std::memory_order_acquire);
             unsigned head = cq_head_->load(std::memory_order_relaxed);
             const unsigned ctail = cq_tail_->load(std::memory_order_acquire);
             for (; head != ctail; ++head) {
@@ -146,13 +159,27 @@ public:
                     }
                     ok = got == g.length;
                 }
-                if (ok && !failed) deliver(g, data);
+                if (ok && !failed) {
+                    try { deliver(g, data); }
+                    catch (...) { delivery_error = std::current_exception(); failed = true; }
+                }
                 else failed = true;
                 free_.push_back(slot);
             }
             cq_head_->store(head, std::memory_order_release);
+            if (failed) {
+                // Withdraw queued but unconsumed entries; no new I/O after a delivery/read failure.
+                while (pending != 0U) {
+                    --tail_;
+                    free_.push_back(static_cast<unsigned>(sqes_[tail_ & sq_mask_].user_data));
+                    --pending;
+                    --in_flight;
+                }
+                sq_tail_->store(tail_, std::memory_order_release);
+            }
         }
         s.rows = rows.size();
+        if (delivery_error) std::rethrow_exception(delivery_error);
         if (failed) throw std::runtime_error("row fetch: direct read failed");
         if (stats) *stats = s;
 #else
@@ -190,6 +217,7 @@ private:
             close_ring();
             return false;
         }
+        sq_head_ = reinterpret_cast<std::atomic<unsigned>*>(sq_ + p.sq_off.head);
         sq_tail_ = reinterpret_cast<std::atomic<unsigned>*>(sq_ + p.sq_off.tail);
         sq_mask_ = *reinterpret_cast<unsigned*>(sq_ + p.sq_off.ring_mask);
         sq_array_ = reinterpret_cast<unsigned*>(sq_ + p.sq_off.array);
@@ -223,7 +251,7 @@ private:
     io_uring_sqe* sqes_ = nullptr;
     io_uring_cqe* cqes_ = nullptr;
     std::size_t sq_bytes_ = 0, cq_bytes_ = 0, sqe_bytes_ = 0;
-    std::atomic<unsigned>*sq_tail_ = nullptr, *cq_head_ = nullptr, *cq_tail_ = nullptr;
+    std::atomic<unsigned>*sq_head_ = nullptr, *sq_tail_ = nullptr, *cq_head_ = nullptr, *cq_tail_ = nullptr;
     unsigned* sq_array_ = nullptr;
     unsigned sq_mask_ = 0, cq_mask_ = 0, tail_ = 0;
     std::vector<Group> groups_;
