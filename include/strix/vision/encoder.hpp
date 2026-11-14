@@ -160,18 +160,30 @@ public:
     virtual const char* arithmetic() const = 0;  // part of the adapter identity
 };
 
+// Diagnostic rounding model of a device arithmetic inside the host reference (default: none = the FP32 oracle,
+// bit for bit). It places the FP16 operand roundings of vision-f16-v1 one site at a time, so a gate failure can be
+// attributed to a rounding site (precision) or to none of them (a defect). Never an adapter arithmetic.
+struct ReferenceRounding {
+    bool linear_inputs_f16 = false;  // every linear input rounded to FP16 (the single-operand device policy)
+    bool attention_f16 = false;      // Q, K, V and the probabilities rounded to FP16 (the flash core's operands)
+    bool any() const { return linear_inputs_f16 || attention_f16; }
+};
+float round_to_f16(float);  // nearest-even FP16 value as a float (subnormals kept, overflow -> infinity)
+
 class ReferenceEncoder final : public EncoderBackend {
 public:
-    ReferenceEncoder(EncoderConfig, const EncoderWeights&);  // the weights outlive the encoder
+    ReferenceEncoder(EncoderConfig, const EncoderWeights&, ReferenceRounding = {});  // the weights outlive the encoder
     EncoderOutput encode(const PatchGrid&, const PositionInputs&) override;
     void linear(const Tensor& w, const Tensor& bias, const float* x, std::size_t rows, float* y) override;
-    const char* arithmetic() const override { return "vision-ref-f32"; }
+    const char* arithmetic() const override { return rounding_.any() ? "vision-ref-f32-rounded" : "vision-ref-f32"; }
 
 private:
     EncoderConfig cfg_;
     const EncoderWeights* weights_;
+    ReferenceRounding rounding_;
 };
-EncoderOutput reference_encode(const EncoderConfig&, const EncoderWeights&, const PatchGrid&, const PositionInputs&);
+EncoderOutput reference_encode(const EncoderConfig&, const EncoderWeights&, const PatchGrid&, const PositionInputs&,
+                               const ReferenceRounding& = {});
 
 // Host copy of rows into an embedding buffer: dst[dst_row[i]][0 .. width) = fp32(src row src_row[i]).
 void splice_rows_host(float* dst, std::size_t dst_stride, const ProjectedRows& src, const std::uint32_t* dst_row,

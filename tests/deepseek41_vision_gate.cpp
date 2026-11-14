@@ -3,6 +3,11 @@
 //
 //   strix-deepseek41-vision-gate --model FILE.gguf --ref DIR [--backend host|hip] [--only a,b]
 //                                [--host-max-patches N] [--split | --no-split] [--unpinned] [--diagnose a,b]
+//                                [--dump DIR] [--rounding none|linear|attention|both]
+//
+// --dump writes this backend's rows (BF16 values as FP32) and tower output beside the reference names, so two
+// backends can be compared row by row. --rounding (host only, diagnostic) runs the FP32 reference with the device's
+// FP16 operand roundings at the named sites (ReferenceRounding): it attributes a device miss to a rounding site.
 //
 // Per case of DIR/cases.txt:
 //   preprocess  PNG -> adapter.patches() against the reference patches (max |diff| <= 1e-6, which implies equal
@@ -234,7 +239,7 @@ int bench(const std::string& png_path, unsigned reps, int prepare, ds::VisionAda
 }
 
 int run(int argc, char** argv) {
-    std::string model, ref, backend_name = "host", only, diagnose_names, bench_png;
+    std::string model, ref, backend_name = "host", only, diagnose_names, bench_png, dump_dir, rounding = "none";
     unsigned host_max_patches = 200, bench_reps = 3;
     int bench_prepare = -1;  // -1 none, 0 prepare_backend, 1 prepare_backend + warm-up
     bool split = false, no_split = false, unpinned = false;
@@ -257,6 +262,8 @@ int run(int argc, char** argv) {
         else if (a == "--reps") bench_reps = static_cast<unsigned>(std::stoul(next()));
         else if (a == "--prepare") bench_prepare = 0;
         else if (a == "--warm") bench_prepare = 1;
+        else if (a == "--dump") dump_dir = next();
+        else if (a == "--rounding") rounding = next();
         else throw std::invalid_argument("unknown option " + a);
     }
     if (model.empty() || (ref.empty() && bench_png.empty()))
@@ -315,7 +322,14 @@ int run(int argc, char** argv) {
     (void)no_split;
     if (device) throw std::runtime_error("this build has no device backend");
 #endif
-    if (!backend) backend = std::make_unique<vision::ReferenceEncoder>(cfg, weights);
+    // --rounding (host backend, diagnostic): the device's FP16 operand roundings placed one site at a time.
+    vision::ReferenceRounding model_rounding;
+    model_rounding.linear_inputs_f16 = rounding == "linear" || rounding == "both";
+    model_rounding.attention_f16 = rounding == "attention" || rounding == "both";
+    if (rounding != "none" && !model_rounding.any()) throw std::invalid_argument("--rounding none|linear|attention|both");
+    if (device && model_rounding.any()) throw std::invalid_argument("--rounding models the device on the host backend");
+    if (model_rounding.any()) std::printf("rounding model %s (diagnostic, not a gate result)\n", rounding.c_str());
+    if (!backend) backend = std::make_unique<vision::ReferenceEncoder>(cfg, weights, model_rounding);
     std::printf("backend %s\n", backend->arithmetic());
     if (!bench_png.empty()) return bench(bench_png, bench_reps, bench_prepare, adapter, weights, *backend);
 
@@ -401,6 +415,15 @@ int run(int argc, char** argv) {
                 }
             }
             m = compare(got.data(), want.data(), rows.width, image_rows);
+            if (!dump_dir.empty()) {  // this backend's rows and tower output, same layout as the reference dumps
+                const auto write = [&](const std::string& file, const std::vector<float>& v) {
+                    std::ofstream f(std::filesystem::path(dump_dir) / (c.name + file), std::ios::binary);
+                    f.write(reinterpret_cast<const char*>(v.data()), static_cast<std::streamsize>(v.size() * sizeof(float)));
+                    if (!f) throw std::runtime_error("cannot write the dump of " + c.name);
+                };
+                write(".rows.f32", got);
+                write(".hidden.f32", hidden_copy);
+            }
             const std::filesystem::path hidden_path = dir / (c.name + ".hidden.f32");
             if (std::filesystem::exists(hidden_path)) {
                 const std::vector<float> want_hidden = read_raw<float>(hidden_path);
