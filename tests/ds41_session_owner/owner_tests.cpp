@@ -13,6 +13,7 @@
 #include "strix/serve/api.hpp"
 #include "strix/serve/cycle_receipt.hpp"
 #include "strix/serve/deepseek_chat.hpp"
+#include "strix/serve/prefill_group.hpp"
 #include "strix/serve/session_api.hpp"
 #include "strix/serve/session_runtime.hpp"
 #if __has_include("deepseek41/http_session_owner.hpp")
@@ -179,6 +180,12 @@ constexpr std::uint32_t kMinRows=9;
 // Explicit double of the native prefill ABI. No physical resource is adopted.
 class SlotPrefill {
 public:
+    struct GroupMember {
+        std::uint32_t slot = 0;
+        const std::vector<std::uint32_t>* prompt = nullptr;
+    };
+    serve::PrefillGroupCapacity group_capacity()const{return {};}
+    std::uint32_t route_class(std::uint32_t)const{return 0;}
     class Task {
     public:
         Task(unsigned s,std::vector<unsigned> p):slot(s),prompt(std::move(p)),ends{static_cast<unsigned>(prompt.size())}{}
@@ -199,6 +206,12 @@ public:
     bool admit(unsigned,bool=true){return false;}
     std::unique_ptr<Task> begin(unsigned s,const std::vector<unsigned>& p,const strix::deepseek41::PrefixLookup&,bool,unsigned){witness::record("prefill begin "+std::to_string(s));return std::make_unique<Task>(s,p);}
     PrefillOutcome run(unsigned s,const std::vector<unsigned>& p,const strix::deepseek41::PrefixLookup&,bool,unsigned){Task t(s,p);return t.finish();}
+    std::vector<PrefillOutcome> run_group(const std::vector<GroupMember>& members,const std::vector<bool>& insert){
+        witness::check(members.size()>=2 && insert.size()==members.size(),"prefill group members and insert flags");
+        std::vector<PrefillOutcome> outcomes;
+        for(const auto& member:members){Task t(member.slot,*member.prompt);outcomes.push_back(t.finish());}
+        return outcomes;
+    }
     void on_prefill(unsigned,const std::vector<unsigned>&){}
     void on_reset(unsigned){}
     unsigned on_step(const std::vector<BatchRow>&,const std::vector<unsigned>&){return 0;}
@@ -230,6 +243,10 @@ void actual_lead(Args a,const Prepare& prepare) {
     struct StepTokenDigest { void add(std::span<const std::uint32_t>) {} } step_tokens;
     struct StepProfile { void add(const strix::deepseek41::BatchStepStats&) {} } step_profile;
     const auto sched=strix::deepseek41::sched::options_from_env(a.device_prefill);
+    const auto group_policy=serve::PrefillGroupPolicy::from_env([](const char* k){
+        const char* v=strix::envcfg::text(k);return v?std::string(v):std::string();
+    },serve::PrefillGroupPolicy::Mode::automatic,sched.min_rows);
+    const auto group_capacity=prefill?prefill->group_capacity():serve::PrefillGroupCapacity{0U};
     serve::GenerationQueue queue(a.max_queue);
     witness::queue=&queue;
     witness::peer=[](auto out,auto in){if(out.size()!=512)return;Control c;std::memcpy(&c,out.data(),offsetof(Control,extra_rows));

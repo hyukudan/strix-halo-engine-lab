@@ -125,6 +125,9 @@ una superposición de 6.5 bits con pesos de atención, expertos compartidos y ca
 | Prefill en dispositivo | 2 nodos | prompt de benchmark de 8K, tipo no especificado | 1 | TTFT **9.757 s** | mediana de 3; logits idénticos bit a bit en ambos ranks | `6a5604bf` |
 | Prefill en dispositivo | 2 nodos | 16K | 1 | TTFT **20.40 s** (803 tok/s) | | `f9332f3e` |
 | Prefill en dispositivo | 2 nodos | 32K | 1 | TTFT **39.6 s** (828 tok/s), 2 ejecuciones | | `43086d05` + valores predeterminados de prefill |
+| Prefill en dispositivo, exacto | 2 nodos | prompts reales de 2,952 / 8,192 / 11,594 / 32,768 tokens, motor, proceso nuevo, en caliente | 1 | **893 / 1,165 / 1,203 / 1,285 tok/s** | 8K 7.02-7.05 s (3 ejecuciones), 32K 25.41-25.58 s (2 ejecuciones); hashes iguales a builds exactos anteriores, ambos ranks iguales | #584 |
+| Prefill en dispositivo, perfil FAST `STRIX_DS41_FAST_PREFILL=1` (opcional) | 2 nodos | mismos prompts | 1 | **1,037 / 1,377 / 1,425 / 1,546 tok/s** | 8K 5.95 s, 32K 21.15-21.25 s; ciclos de GPU por token a 8K 1.89 M frente a 2.17 M en exacto; pasa la puerta relativa al suelo descrita abajo | #584 |
+| Servicio, ejecución completa | 2 nodos | 8 prompts cortos (17-46 tokens), 256 tokens cada uno, greedy | 8 | **97.7-101.3 tok/s** | régimen estable con la cohorte completa 104.3-108.0 tok/s; la diferencia es la admisión de los 8 prompts, 1.28-1.38 s; texto de cada petición igual en todas las ejecuciones | #587 |
 | Servidor, un cliente, chat | 2 nodos | prompt de chat | 1 | **66.9 tok/s** (código) | 34.9 tok/s (prosa) | versión publicada |
 | Servidor, 8 chats × 128 tokens | 2 nodos | prompts de chat | 1 / 2 / 4 / 8 | **41.4 / 54.0 / 59.7 / 67.9 tok/s** agregados | | versión publicada |
 | Servidor, conjunto corto de 8 categorías | 2 nodos | prompts de 36-303 tokens | 1 / 2 / 4 / 8 | | **39.88 / 61.66 / 66.53 / 74.25 tok/s** agregados | `cab238d6` |
@@ -209,6 +212,14 @@ tokens, mismo binario, una carga por brazo; 25.03 frente a 24.44 s con 32,499 en
 Con ambos, TTFT del servidor, un cliente, caché desactivada: **7.94 / 27.73 / 38.61 s** (1,057 / 1,172 / 1,158 tok/s)
 en `default` y 7.05 / 24.32 / 32.95 s (1,192 / 1,336 / 1,357 tok/s) con `--profile fast` en la misma ejecución
 (−11.3 / −12.3 / −14.7 %).
+
+**Puerta de calidad del prefill FAST.** La puerta compara el perfil FAST con exacto en 1,280 filas teacher-forced (20 prompts
+x 64 filas, etiquetas reales del siguiente token, ambos ranks iguales). Un límite fijo de dNLL de 0.01 no lo cumple nada con KL ~0.01 en
+este motor: tres brazos nulos que solo mueven cada valor del flujo un ulp tras la capa 0 dan KL 0.0094-0.0105, top-1
+96.9-98.1 % y dNLL +0.011 a +0.014, y fallan igual que los brazos FAST. Con etiquetas que siguen a una referencia calibrada, el
+dNLL esperado es igual a la KL, así que el límite de dNLL se fija respecto a este suelo nulo: media + 2 sd de los tres nulos con el
+mismo binario (+0.0155), con `strix-gate --dnll-rule floor` ([tools/strix-gate](../../../tools/strix-gate/README.md)).
+El perfil completo da KL 0.0108, top-1 97.7 %, dNLL +0.0049 y pasa; sus tres miembros por separado también pasan la regla del suelo.
 
 <a id="deepseek-rtx-pipeline"></a>
 

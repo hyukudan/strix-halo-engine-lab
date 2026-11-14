@@ -17,6 +17,7 @@
 #include "hip_q8_rows_gemv.hpp"
 #include "hip_dense_f16_tiled.hpp"
 #include "core/wave_uniform.hpp"
+#include "core/f16_dense_tall.hpp"
 #include "strix/hip_gdn_islands.hpp"
 #include "strix/hip_model_residency.hpp"
 #include "strix/hip_setup_quiescence.hpp"
@@ -1146,6 +1147,7 @@ struct GdnInputTiledSite {
         static_cast<void>(q8_rows::segment_row(segments, out, width, m, row));
         reinterpret_cast<float*>(output0[m] + r * output_stride)[row] = round_bf16(value);
     }
+    static constexpr unsigned dense_vector_store = 1U;  // STRIX_QPF2K_DENSE_VEC_SITES bit 1 (default on)
     bool vector_store_supported() const {
         if (output_stride % 16U || outputs % 4U) return false;
         for (unsigned m = 0; m < segments.count; ++m)
@@ -1176,6 +1178,19 @@ struct GdnInputTiled16Site {
         static_cast<void>(q8_rows::segment_row(segments, out, width, m, row));
         output[r * output_stride + (m ? z_offset + row : row)] = float_to_bf16(value);
     }
+    // Vector epilogue (STRIX_QPF2K_DENSE_VEC_SITES bit 64): the four BF16 words of 4 outputs of one segment in one 8-byte store.
+    static constexpr unsigned dense_vector_store = 64U;
+    bool vector_store_supported() const {
+        if (reinterpret_cast<std::uintptr_t>(output) % 8U || output_stride % 4U || outputs % 4U || z_offset % 4U) return false;
+        for (unsigned m = 0; m < segments.count; ++m) if (segments.first[m] % 4U) return false;
+        return true;
+    }
+    __device__ void store4(std::uint32_t out, std::uint32_t r, q8_rows::tiled::f4 value) const {
+        unsigned m; std::uint32_t row;
+        static_cast<void>(q8_rows::segment_row(segments, out, width, m, row));
+        q8_rows::tiled::store4_u16(output + r * output_stride + (m ? z_offset + row : row),
+            float_to_bf16(value.x), float_to_bf16(value.y), float_to_bf16(value.z), float_to_bf16(value.w));
+    }
 };
 struct GdnOutputTiledSite {
     using Input = float;
@@ -1187,6 +1202,14 @@ struct GdnOutputTiledSite {
     std::uint64_t output_stride;
     __device__ void store(std::uint32_t out, std::uint32_t r, float value) const {
         reinterpret_cast<std::uint16_t*>(output0 + r * output_stride)[out] = float_to_bf16(value);
+    }
+    // Vector epilogue (STRIX_QPF2K_DENSE_VEC_SITES bit 2); the launcher takes it only with the pinned lean form (the
+    // unpinned FP16-scratch form spills with it).
+    static constexpr unsigned dense_vector_store = 2U;
+    bool vector_store_supported() const { return q8_rows::tiled::bf16_store4_ok(output0, output_stride, outputs); }
+    __device__ void store4(std::uint32_t out, std::uint32_t r, q8_rows::tiled::f4 value) const {
+        q8_rows::tiled::store4_u16(reinterpret_cast<std::uint16_t*>(output0 + r * output_stride) + out,
+            float_to_bf16(value.x), float_to_bf16(value.y), float_to_bf16(value.z), float_to_bf16(value.w));
     }
 };
 
@@ -5308,7 +5331,21 @@ void enqueue_gdn_prefill_core_rows(const std::vector<std::array<GdnKnownWindowRo
     // STRIX_QPF2K_GDN_GATES_BATCH=1: the same kernel with Sched bit 4 (dt/a preloaded, transforms across lanes).
     static const bool gates_batch_env = strix::envcfg::flag("STRIX_QPF2K_GDN_GATES_BATCH", false);
     const bool gates_batch = gates_batch_env && !qpf2k::suppressed(qpf2k::Item::gdn_gates_batch);
-    if (qpf2k_gates && gates_batch)
+    // FAST gdn_gates_f16 (STRIX_PREFILL_GDN_GATES_F16=1, default OFF): only inside the FAST gdn_fp16_chunk route; the gates
+    // product on the shared dense FP16 core with the incumbent epilogue (qpf2k_gdn::gates_f16). Changes logits (gatef16).
+    static const bool gates_f16_on = strix::prefill_option_enabled(strix::PrefillOption::gdn_gates_f16);
+    const bool gates_f16 = gates_f16_on && fp16_chunk &&
+        qpf2k_gdn::gates_f16::supported(first.hidden, first.value_heads, count, input_stride, reinterpret_cast<const void*>(first.input.address));
+    if (gates_f16)
+        qpf2k_gdn::gates_f16::launch(
+            {reinterpret_cast<const std::uint16_t*>(first.input.address), input_stride,
+             reinterpret_cast<const float*>(first.tensors.beta.runtime->address),
+             reinterpret_cast<const float*>(first.tensors.alpha.runtime->address), first.hidden, first.value_heads, 0U, 0U},
+            {strided, reinterpret_cast<const void*>(first.tensors.dt.runtime->address), small_weight_kind(first.tensors.dt.manifest->ggml_type),
+             reinterpret_cast<const void*>(first.tensors.a.runtime->address), small_weight_kind(first.tensors.a.manifest->ggml_type),
+             first.value_heads, 0U},
+            count, stream);
+    else if (qpf2k_gates && gates_batch)
         hipLaunchKernelGGL(HIP_KERNEL_NAME(qpf2k_gdn::gdn_qpf2k_gates_kernel<QGatesO, QGatesW, QGatesRC, QGatesRB, 2560U, 4U>),
             dim3(first.value_heads * 2U / (QGatesO * QGatesW), count / QGatesRB), dim3(QGatesW * 32U), 0, stream,
             reinterpret_cast<const std::uint16_t*>(first.input.address), input_stride,
@@ -5326,7 +5363,8 @@ void enqueue_gdn_prefill_core_rows(const std::vector<std::array<GdnKnownWindowRo
             reinterpret_cast<const void*>(first.tensors.dt.runtime->address), small_weight_kind(first.tensors.dt.manifest->ggml_type),
             reinterpret_cast<const void*>(first.tensors.a.runtime->address), small_weight_kind(first.tensors.a.manifest->ggml_type),
             first.value_heads);
-    if (qpf2k_gates) qpf2k_gdn_witness(gates_batch ? "gates gdn_qpf2k_gates_kernel<1,8,4,64,batch>" : "gates gdn_qpf2k_gates_kernel<1,8,4,64>", count);
+    if (gates_f16) qpf2k_gdn_witness("gates f16_dense_tall (FAST gdn_gates_f16)", count);
+    else if (qpf2k_gates) qpf2k_gdn_witness(gates_batch ? "gates gdn_qpf2k_gates_kernel<1,8,4,64,batch>" : "gates gdn_qpf2k_gates_kernel<1,8,4,64>", count);
     else if (rows_fit)
         hipLaunchKernelGGL(HIP_KERNEL_NAME(gdn_gates::gdn_gates_rows_kernel<GatesRB, GatesO, GatesS, GatesC>),
             dim3(first.value_heads * 2U / (GatesO * GatesS), count / GatesRB), dim3(GatesS * 256U), 0, stream,

@@ -16,12 +16,12 @@ off switches are in [performance](docs/performance.md) and [measured gains](docs
 
 | Model | Hardware | Decode | Prompt reading |
 |---|---|---|---|
-| Qwen3.8-Flash-Next | 1 node | 62.44 tok/s (MTP, 1K code) | 1,695 tok/s at 4K (exact) |
+| Qwen3.8-Flash-Next | 1 node | 62.44 tok/s (MTP, 1K code) | 1,885 tok/s at 8K, 1,845-1,856 at 32K, 1,755-1,762 at 128K (exact); 2,008 at 8K (`fast`, opt-in; quality qualification in progress) |
 | Qwen3.8-Flash-Next | 2 nodes (two replicas, server) | 158.1 tok/s total with 8 streams (68.2 with 1) | - |
-| Qwen3.8-Flash-Next | 2 nodes (pipelined prefill, opt-in) | - | ~2,660 tok/s at 32K, ~2,800 at 128K (exact) |
-| DeepSeek V4.1 Flash | pair | 70.6 tok/s (DSpark, code) | 1,057 tok/s at 8.4K, 1,172 at 32.5K (exact) |
-| MiniMax M3.1 Flash | pair | 23.10 tok/s (1K) | 596 tok/s at 8K, 529 at 32K (exact) |
-| GLM-5.3 Flash | pair | 44.5 tok/s (MTP, code) | 541 tok/s at 8K, 529 at 32K (exact) |
+| Qwen3.8-Flash-Next | 2 nodes (pipelined prefill, opt-in) | - | 2,968 tok/s at 32K (exact), 3,191 (`fast`, opt-in; quality qualification in progress); below 28,672 prompt rows the pair runs the prompt on one node |
+| DeepSeek V4.1 Flash | pair | 70.6 tok/s (DSpark, code) | 1,165 tok/s at 8K, 1,285 at 32K (exact); 1,377 / 1,546 with the FAST prefill profile (opt-in; [floor-relative quality gate passed](docs/models/deepseek-v4.1/README.md#fast-prefill-quality-gate)) |
+| MiniMax M3.1 Flash | pair | 23.10 tok/s (1K) | 669 tok/s at 8K, 529 at 32K (exact) |
+| GLM-5.3 Flash | pair | 44.5 tok/s (MTP, code) | 541 tok/s at 8K, 529 at 32K (exact); 918 at 8K (`fast`, opt-in; quality qualification in progress) |
 | Nemotron 3.5 Bolt E4B | 1 node | 91.9 tok/s (C1) | 2,780 tok/s at 8K, 2,336 at 32K (`fast`) |
 | Nemotron 3.5 Bolt E4B | 2 nodes (pipelined prefill, opt-in) | - | 4,804 tok/s at 8K, 3,965 at 32K (`fast`, same bytes as 1 node) |
 | MiniMax H3 | pair | 5 s 1344x768 clip with audio in 405.5 s | - |
@@ -80,15 +80,17 @@ Every engine's build and launch command: [getting started](docs/getting-started/
 
 `default` is exact. `fast` adds qualified bit-changing options. `quality` uses a higher-precision pack where one exists.
 
-| Model | Single / pair | Exact / FAST | Memory |
-|---|---|---|---|
-| Qwen3.8-Flash-Next (UD-Q4_K_XL) | single (2 replicas behind a router) | exact default; `fast` | 111 GB weights on a 128 GB node |
-| DeepSeek V4.1 Flash (2-bit experts, 6.5-bit trellis dense) | pair over USB4 | exact default; `fast` | 2 x 128 GB |
-| MiniMax M3.1 Flash (EXL3 3.06 bpw) | pair TP2 | exact | 2 x 128 GB |
-| GLM-5.3 Flash (EXL3 4.05 bpw) | pair TP2 | exact; opt-in WMMA prefill | 2 x 128 GB |
-| Nemotron 3.5 Bolt E4B (Q4_K_M; EXL3 for `quality`) | single, opt-in build; opt-in pair prompt prefill (`STRIX_G4_PAIR=1`, same bytes) | exact default; `fast`; `quality` | 128 GB node |
-| MiniMax H3 (audio + video) | single or pair, opt-in build | dense reference; FAST levers each with its own flag | 128 GB per node |
-| MiniMax-H3-Image (int8 or W4A8) | single or pair (`strix-h3-image`), opt-in build | GPU VAE; `--parallel sequence` for one image, `request` for several | 128 GB per node |
+| Model | Single / pair | Exact / FAST | Memory | Weights |
+|---|---|---|---|---|
+| Qwen3.8-Flash-Next (UD-Q4_K_XL) | single (2 replicas behind a router) | exact default; `fast` | 111 GB weights on a 128 GB node | [UD-Q4_K_XL GGUF](https://huggingface.co/hyukudan/Qwen3.8-Flash-Next-GGUF-mirror) (mirror of `unsloth`, read as published); Q8_0 MTP draft head distilled locally, not published |
+| DeepSeek V4.1 Flash (2-bit experts, 6.5-bit trellis dense) | pair over USB4 | exact default; `fast` | 2 x 128 GB | [expert GGUF](https://huggingface.co/hyukudan/deepseek-v4.1-flash-gguf-mirror), [dense overlay](https://huggingface.co/hyukudan/DeepSeek-V4.1-Flash-1017-strix-dense-U6), [trellis packs](https://huggingface.co/hyukudan/DeepSeek-V4.1-Flash-1017-strix-trellis-EXL3) |
+| MiniMax M3.1 Flash (EXL3 3.06 bpw) | pair TP2 | exact | 2 x 128 GB | [EXL3 3.06 bpw](https://huggingface.co/hyukudan/MiniMax-M3.1-Flash-EXL3-EAQ-v1-3.06-bpw-mirror) (mirror of `Mia-AiLab`, with our EXL3 draft); [draft source](https://huggingface.co/hyukudan/MiniMax-M3.1-Flash-DFlash2-mirror) |
+| GLM-5.3 Flash (EXL3 4.05 bpw) | pair TP2 | exact; opt-in WMMA prefill | 2 x 128 GB | [EXL3 4.05 bpw](https://huggingface.co/hyukudan/GLM-5.3-Flash-exl3-mirror) (mirror of `turboderp`) |
+| Nemotron 3.5 Bolt E4B (Q4_K_M; EXL3 for `quality`) | single, opt-in build; opt-in pair prompt prefill (`STRIX_G4_PAIR=1`, same bytes) | exact default; `fast`; `quality` | 128 GB node | official Q4_K_M GGUF (not mirrored by us); [EXL3 pack](https://huggingface.co/hyukudan/Nemotron-3.5-Bolt-E4B-EXL3); [MTP drafter](https://huggingface.co/hyukudan/Nemotron-3.5-Bolt-E4B-MTP-Drafter) |
+| MiniMax H3 (audio + video) | single or pair, opt-in build | dense reference; FAST levers each with its own flag | 128 GB per node | not published by us ([files](docs/models/minimax-h3/README.md#install-and-run)) |
+| MiniMax-H3-Image (int8 or W4A8) | single or pair (`strix-h3-image`), opt-in build | GPU VAE; `--parallel sequence` for one image, `request` for several | 128 GB per node | not published by us |
+
+Our weights on Hugging Face: [huggingface.co/hyukudan](https://huggingface.co/hyukudan). Mirrors keep the upstream files; revisions, file names and licenses: [models and provenance](docs/reproduce.md#models-and-provenance).
 
 <a id="discrete-gpu"></a>
 

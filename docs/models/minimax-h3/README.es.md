@@ -45,6 +45,9 @@ un nodo.
 
 ## Instalación y ejecución
 
+**Pesos:** no los publicamos. El motor carga los ficheros del paso 2; el pack del codificador de texto se construye en
+local con `tools/h3/te/te_pack.py`.
+
 1. **Compilar** en cada nodo (ROCm, gfx1151):
 
    ```sh
