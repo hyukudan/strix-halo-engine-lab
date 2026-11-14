@@ -6,17 +6,12 @@ are deliberately outside this host fixture's coverage.
 from pathlib import Path
 import re
 import sys
-import subprocess
 
 root, out = map(Path, sys.argv[1:3])
-before = sys.argv[3] == "ON"
 def read(path):
-    if before:
-        return subprocess.check_output(["git", "show", f"HEAD:{path}"], cwd=root, text=True)
     return (root / path).read_text()
 source = read("src/hip_deepseek41_prefill.hip")
-if before:
-    (out / "before_cache.cpp").write_text(read("src/deepseek41_prefix_cache.cpp"))
+
 
 
 def function(marker):
@@ -48,3 +43,8 @@ assert source.index("entries_exchange->finish(st)") < start
 assert source.index("exchange_rows(m.pack_send.p, own_words") < start
 assert end < source.index('hipEventRecord(m.chunk_ready, st)', end)
 (out / "unpack.inc").write_text(unpack)
+
+source = read("src/core/f16_dense_q8a8.hpp")
+(out / "parts.inc").write_text(function("inline void enqueue_parts("))
+source = read("src/hip_ds41_layer.hip")
+(out / "dense.inc").write_text(function("static bool enqueue_fast_dense("))

@@ -137,7 +137,7 @@ void precision_test() {
     require(threw && !failed.impl_->ring16.p, "task guard must precede allocation");
 }
 void cancellation_test() {
-    // Documents the still-open arithmetic defect; this is not a GPU qualification gate.
+    // Cancellation witness retained alongside the production part-orchestration test.
     volatile float large = 16777216.0F, one = 1.0F;
     volatile float fused_first = large + one;
     const float fused = fused_first - large;

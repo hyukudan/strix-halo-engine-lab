@@ -1,4 +1,6 @@
 #include "strix/env_flags.hpp"
+#include "strix/ds41_fast_profile.hpp"
+#include <map>
 #include "strix/deepseek41_pair_defaults.hpp"
 #include "strix/deepseek41_pair_profile_table.hpp"
 #include "strix/deepseek41_serve_cache_policy.hpp"
@@ -249,12 +251,32 @@ Resolved resolve(App app, const std::vector<std::string>& in, const Getenv& raw_
     }
     // Product profile first: its switches are environment for everything below (an explicit one wins).
     strix::profile::Inputs profile_inputs;
-    profile_inputs.env = raw_env;
+    // Resolve the bundle before admission, reporting and rank agreement. An explicit
+    // component OFF wins. Canonical strings are also exported for execution/cache readers.
+    std::map<std::string, std::string> fast_env;
+    const auto enabled = [](const char* v) { return v && std::string_view(v) == "1"; };
+    const bool bundle = enabled(raw_env("STRIX_DS41_FAST_PREFILL"));
+    fast_env.emplace("STRIX_DS41_FAST_PREFILL", bundle ? "1" : "0");
+    fast_env.emplace("STRIX_DS41_FAST_DENSE_MIN_ROWS", std::to_string(
+        strix::ds41::fast_profile::dense_min_rows_value(raw_env("STRIX_DS41_FAST_DENSE_MIN_ROWS"))));
+    for (const char* key : {"STRIX_DS41_FAST_ATTN", "STRIX_DS41_FAST_MOE", "STRIX_DS41_FAST_DENSE"}) {
+        const char* value = raw_env(key);
+        const bool attention = std::string_view(key) == "STRIX_DS41_FAST_ATTN";
+        if (value && *value)
+            fast_env.emplace(key, attention && std::string_view(value) == "2" ? "2" : enabled(value) ? "1" : "0");
+        else if (bundle) fast_env.emplace(key, attention ? "2" : "1");
+    }
+    profile_inputs.env = [&](const char* key) -> const char* {
+        const auto it = fast_env.find(key);
+        if (it != fast_env.end()) return it->second.c_str();
+        const char* value = raw_env(key);
+        return value && *value ? value : nullptr;
+    };
     strix::profile::take_options(profile_engine(), user, profile_inputs);
     r.profile = strix::profile::resolve(profile_engine(), profile_inputs);
     std::vector<std::pair<std::string, std::string>> profile_env;
     for (const auto& e : r.profile->entries)
-        if (!e.lever->env.empty() && strix::profile::applied(e.status))
+        if (!e.lever->env.empty())
             profile_env.emplace_back(std::string(e.lever->env), e.value);
     r.set_env = profile_env;
     if (auto extra = strix::profile::profile_args(*r.profile); !extra.empty())
@@ -463,7 +485,9 @@ Effective::Effective(App app, int& argc, char**& argv, const Build& build) {
 #ifdef _WIN32
         _putenv_s(k.c_str(), v.c_str());
 #else
-        ::setenv(k.c_str(), v.c_str(), 0);
+        const bool governed = std::any_of(profile_table.begin(), profile_table.end(),
+            [&](const auto& row) { return row.env == k; });
+        ::setenv(k.c_str(), v.c_str(), governed ? 1 : 0);
 #endif
     }
     for (const auto& k : r.unset_env) {

@@ -19,8 +19,12 @@ inline bool attention_on() { const char* v = attention(); return (v[0] == '1' ||
 inline bool attention_flash() { const char* v = attention(); return v[0] == '2' && v[1] == 0; }
 inline bool moe_on() { const char* v = lever("STRIX_DS41_FAST_MOE", "1"); return v[0] == '1' && v[1] == 0; }
 inline bool dense_on() { const char* v = lever("STRIX_DS41_FAST_DENSE", "1"); return v[0] == '1' && v[1] == 0; }
-// Preserve dispatch's unsigned interpretation, including explicit zero and negative values.
+// Preserve decimal-prefix parsing and unsigned wrap, including zero and negative values.
+// Also accepts the canonical unsigned value exported by the pair resolver.
+inline unsigned dense_min_rows_value(const char* raw) {
+    return raw ? static_cast<unsigned>(std::strtoull(raw, nullptr, 10)) : 128U;
+}
 inline unsigned dense_min_rows() {
-    return static_cast<unsigned>(strix::envcfg::integer("STRIX_DS41_FAST_DENSE_MIN_ROWS", 128));
+    return dense_min_rows_value(strix::envcfg::text("STRIX_DS41_FAST_DENSE_MIN_ROWS"));
 }
 }  // namespace strix::ds41::fast_profile

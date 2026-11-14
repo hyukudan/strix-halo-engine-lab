@@ -139,4 +139,16 @@ inline void enqueue(const View& v, hipStream_t stream, unsigned waves = 0U) {
     if (waves_for(v.rows, v.in, waves) == 16U) launch<16>(v, stream);
     else launch<8>(v, stream);
 }
+// Independent FP32 chains per K part, added in unfused order by Store.
+// Caller validates each equal-width part; the stream orders the output additions.
+inline void enqueue_parts(View v, unsigned parts, hipStream_t stream) {
+    for (unsigned part = 0; part < parts; ++part) {
+        enqueue(v, stream);
+        if (part + 1U == parts) break;
+        v.k_bytes += v.in / 32U * 34U;
+        v.codes += v.in;
+        v.deltas += v.in / 32U;
+        v.accumulate = 1U;
+    }
+}
 }  // namespace strix::core::f16_dense_tall::q8a8
