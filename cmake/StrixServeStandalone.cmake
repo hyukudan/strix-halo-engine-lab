@@ -18,7 +18,7 @@ function(strix_add_standalone_serve serve_target handoff_target)
         ${_root}/src/serve/json_constraint.cpp ${_root}/src/serve/constraint_selection.cpp ${_root}/src/serve/bpe_tokenizer.cpp
         ${_root}/src/serve/chat_template.cpp ${_root}/src/serve/deepseek_chat.cpp ${_root}/src/serve/engine.cpp
         ${_root}/src/serve/api.cpp ${_root}/src/serve/media.cpp ${_root}/src/serve/request_fields.cpp ${_root}/src/serve/health.cpp
-        ${_root}/src/serve/http_server.cpp
+        ${_root}/src/serve/http_server.cpp ${_root}/src/serve/token_memo.cpp
         # Called by src/serve/api.cpp (deployment routes, preflight view of the status).
         ${_root}/src/serve/deployment.cpp ${_root}/src/preflight.cpp ${_root}/src/linux_uma_observation.cpp
         ${_root}/src/uma_owner_inventory.cpp)
