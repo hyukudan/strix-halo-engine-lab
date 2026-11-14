@@ -211,7 +211,7 @@ int diagnose(const std::string& names, const std::filesystem::path& dir, const d
 // encode, project), reps times on the loaded backend. --prepare: prepare_backend first (projector panels, workspace;
 // --warm adds the grey warm-up image), as the server does at start. Rep 1 carries what is still first-use.
 int bench(const std::string& png_path, unsigned reps, int prepare, ds::VisionAdapter& adapter, const vision::EncoderWeights& weights,
-          vision::EncoderBackend& backend) {
+          vision::EncoderBackend& backend, const std::string& dump_dir) {
     const std::vector<std::uint8_t> png = read_raw<std::uint8_t>(png_path);
     if (prepare >= 0) {
         const auto t0 = Clock::now();
@@ -231,6 +231,11 @@ int bench(const std::string& png_path, unsigned reps, int prepare, ds::VisionAda
         std::uint64_t h = 1469598103934665603ULL;
         for (const auto v : enc.rows->bf16) h = (h ^ v) * 1099511628211ULL;
         if (rep == 0) first_fnv = h;
+        if (rep == 0 && !dump_dir.empty()) {  // --dump with --bench: the image's rows (BF16 as uint16) for a row-by-row comparison
+            std::ofstream f(std::filesystem::path(dump_dir) / "bench.rows.bf16", std::ios::binary);
+            f.write(reinterpret_cast<const char*>(enc.rows->bf16.data()), static_cast<std::streamsize>(enc.rows->bf16.size() * 2U));
+            if (!f) throw std::runtime_error("cannot write the bench dump");
+        }
         std::printf("bench rep %u: patches %u grid %ux%u rows %u | preprocess %.2f ms encode_cached %.2f ms | rows fnv %016llx %s\n",
                     rep + 1U, g.rows, g.grid_h, g.grid_w, enc.rows->rows, pre_ms, enc_ms, static_cast<unsigned long long>(h),
                     h == first_fnv ? "same" : "DIFFERS");
@@ -349,7 +354,7 @@ int run(int argc, char** argv) {
     if (model_rounding.any()) std::printf("rounding model %s (diagnostic, not a gate result)\n", rounding.c_str());
     if (!backend) backend = std::make_unique<vision::ReferenceEncoder>(cfg, weights, model_rounding);
     std::printf("backend %s\n", backend->arithmetic());
-    if (!bench_png.empty()) return bench(bench_png, bench_reps, bench_prepare, adapter, weights, *backend);
+    if (!bench_png.empty()) return bench(bench_png, bench_reps, bench_prepare, adapter, weights, *backend, dump_dir);
 
     const double cos_mean_gate = device ? 0.9995 : 0.99999, cos_min_gate = device ? 0.998 : 0.99999;
     const double rel_gate = device ? 0.02 : 0.01;
