@@ -3736,7 +3736,9 @@ std::uint32_t auto_prefill_rows(const Args& a, BatchForward& fwd, strix::dist::C
         room.mem_available = mem_available_mb() << 20U;
         auto o = slot_prefill_options(a, fwd, comm, rank);
         o.max_rows = std::min(sc::kAutoPrefillRows[0], a.context);
-        room.own_weights = strix::deepseek41::DevicePrefill::owned_weight_bytes(a.model, o);
+        // + the group pass's member states (0 unless STRIX_SERVE_PREFILL_GROUP groups): allocated at construction like
+        // the own weights, outside prefill_piece_bytes (one-sequence buffers only)
+        room.own_weights = strix::deepseek41::DevicePrefill::owned_weight_bytes(a.model, o) + strix::deepseek41::DevicePrefill::group_state_bytes(o);
         // the drafter is already loaded (its host copy freed): device free and MemAvailable include it, no reservation
         room.wide_pieces = sc::auto_wide_pieces(a.context, [](const char* k) {
             const char* v = std::getenv(k);
