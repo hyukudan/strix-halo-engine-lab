@@ -212,6 +212,16 @@ struct EncodeStats {
     double total_ms = 0.0;
     std::vector<double> layer_ms;
 };
+// Wall time of the last load() by step (a receipt: the steps run in this order per panel, so they add up).
+struct EncoderLoadStats {
+    double scan_ms = 0.0;          // per-row magnitude pass over the source weights
+    double host_alloc_ms = 0.0;    // zeroed host panel buffer
+    double convert_ms = 0.0;       // source -> scaled FP16 panel
+    double device_alloc_ms = 0.0;  // device buffers of panel + bias
+    double upload_ms = 0.0;        // host -> device copies of panel + bias
+    double vectors_ms = 0.0;       // norm vectors (allocation + upload)
+    double total_ms = 0.0;
+};
 
 // Defined in the HIP library only (src/vision/encoder.hip).
 class Encoder final : public EncoderBackend {
@@ -226,6 +236,7 @@ public:
     void unload();                     // drops panels and workspace
     bool loaded() const;
     std::size_t device_bytes() const;  // panels + workspace currently held
+    const EncoderLoadStats& load_stats() const;
 
     EncoderOutput encode(const PatchGrid&, const PositionInputs&) override;
     EncoderOutput encode(const PatchGrid&, const PositionInputs&, EncodeStats&);

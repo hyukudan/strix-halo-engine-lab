@@ -314,6 +314,9 @@ int run(int argc, char** argv) {
         t0 = Clock::now();
         enc->load(weights);
         std::printf("device load %.0f ms, %.1f MiB\n", ms_since(t0), static_cast<double>(enc->device_bytes()) / 1048576.0);
+        const vision::EncoderLoadStats& ls = enc->load_stats();
+        std::printf("load receipt: scan %.0f | host alloc %.0f | convert %.0f | device alloc %.0f | upload %.0f | vectors %.0f | total %.0f ms\n",
+                    ls.scan_ms, ls.host_alloc_ms, ls.convert_ms, ls.device_alloc_ms, ls.upload_ms, ls.vectors_ms, ls.total_ms);
         gpu = enc.get();
         backend = std::move(enc);
     }
