@@ -2742,7 +2742,7 @@ struct HipPleKnownWindow::Impl {
         // (q8_rows::tiled, one launch per projection): BF16 rows rounded to FP16 while staging, fp16(d * q) weights, FP32
         // accumulation over ascending K16 tiles, the same FP32 store as PleRowsSite. Changes logits (identity tag plef16).
         if (prefill_option_enabled(PrefillOption::ple_rows_f16)) {
-            const std::uint32_t rows = groups * kPleWideRows;
+            const std::uint32_t tiled_rows = groups * kPleWideRows;
             const auto tiled = [&](const PleRowsSite<kPleWideRows>& s) {
                 PleTiledSite t{};
                 t.input0 = reinterpret_cast<const unsigned char*>(s.base);
@@ -2752,11 +2752,11 @@ struct HipPleKnownWindow::Impl {
                 return t;
             };
             const auto tk = tiled(key), tv = tiled(value);
-            if (q8_rows::tiled::supported(tk, rows) && q8_rows::tiled::supported(tv, rows)) {
+            if (q8_rows::tiled::supported(tk, tiled_rows) && q8_rows::tiled::supported(tv, tiled_rows)) {
                 static const bool witness = [] { std::fprintf(stderr, "qpf2k ple rows f16 tiled active (FAST ple_rows_f16)\n"); return true; }();
                 (void)witness;
-                q8_rows::tiled::launch(tk, rows, hip_execution_stream());
-                q8_rows::tiled::launch(tv, rows, hip_execution_stream());
+                q8_rows::tiled::launch(tk, tiled_rows, hip_execution_stream());
+                q8_rows::tiled::launch(tv, tiled_rows, hip_execution_stream());
                 check_hip(hipGetLastError(), "prefill PLE tiled f16 projection launch");
                 return true;
             }
