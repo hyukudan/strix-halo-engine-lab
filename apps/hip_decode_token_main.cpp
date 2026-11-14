@@ -4299,6 +4299,7 @@ static int run_decode_entry(
             std::shared_ptr<strix::HipKnownPrefixWindow> block_owner;
             std::unique_ptr<strix::HipKnownPromptBackend> blocks;
             std::vector<std::shared_ptr<strix::HipKnownPrefixWindow>> tail_owners;
+            std::vector<std::shared_ptr<strix::HipKnownPrefixWindow>> wide_owners;  // split profile: decode-profile wide owners
             std::vector<std::unique_ptr<strix::HipKnownPromptBackend>> tails;
             std::unique_ptr<strix::decode_cli::HipPrefixStateCacheSession> cache;
             // Split prefill profile: the sibling prefill execution's view of this slot's serial scratch and
@@ -4391,6 +4392,13 @@ static int run_decode_entry(
                     known_tail_memories[t]->scratch, model.vocab_size, original_work_device));
                 hand_off(*stack.tails.back());
             }
+            // --mtp-copy-wide-rows under a split prefill profile: the slot's decode-profile wide owners (as the CLI's
+            // known_wide_owners; their scratch is shared like the tails': the server runs a wide cycle only while one
+            // request is active)
+            for (std::size_t w = 0; w < known_wide_plans.size() && w < known_wide_memories.size(); ++w)
+                stack.wide_owners.push_back(std::make_shared<strix::HipKnownPrefixWindow>(*known_wide_plans[w], compiled, model,
+                    catalog_config, stack.parents->resources, known_wide_memories[w]->scratch, known_wide_memories[w]->scope,
+                    std::static_pointer_cast<const void>(known_wide_memories[w]), workspace(known_wide_memories[w])));
             if (prefix_store)
                 stack.cache = std::make_unique<strix::decode_cli::HipPrefixStateCacheSession>(prefix_store, prefix_cache_identity,
                     prefix_cache_unit(options), prefix_cache_every, model, state_layout, stack.memory->state());
@@ -4402,6 +4410,8 @@ static int run_decode_entry(
             tiled.blocks = stack.blocks.get(); tiled.block_owner = stack.block_owner;
             for (std::size_t t = 0; t < stack.tails.size(); ++t)
                 tiled.tails.push_back({stack.tails[t].get(), stack.tail_owners[t], options.known_prefix_tail_rows[t]});
+            for (std::size_t w = 0; w < stack.wide_owners.size(); ++w)
+                tiled.wide.push_back({nullptr, stack.wide_owners[w], options.mtp.copy_wide_rows[w]});
             tiled.rows = options.known_prefix_prefill_rows;
             tiled.numerical_plan.block.execution=known_prefill_plan->prefill_execution_identity;
             tiled.numerical_plan.block.kernel=known_prefill_plan->prefill_kernel_plan_identity;

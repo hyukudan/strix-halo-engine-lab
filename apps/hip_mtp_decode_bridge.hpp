@@ -2919,13 +2919,14 @@ inline void run_mtp_decode_bridge(const Options& options,const ModelContract& mo
                     if(!runner.wide_rows.empty()) {
                         // Startup check of the owners the wide cycle needs (same lookup the cycle builds from), so a
                         // configuration that cannot run it fails here and not on a request.
-                        if(parents->tiled.prefill_execution_identity)
-                            throw std::invalid_argument("--mtp-copy-wide-rows with --http-batch requires one prefill numerical profile "
-                                "(a split profile needs decode-profile wide owners the server does not build)");
+                        // split prefill profile: the decode-profile wide owners (tiled.wide), else the all-rows tail owners
+                        const bool split=static_cast<bool>(parents->tiled.prefill_execution_identity);
+                        const auto& owners=split?parents->tiled.wide:parents->tiled.tails;
                         for(const auto rows:runner.wide_rows) {
-                            const auto t=std::find_if(parents->tiled.tails.begin(),parents->tiled.tails.end(),[&](const auto& x){return x.rows==rows && x.owner;});
-                            if(t==parents->tiled.tails.end() || t->owner->output_policy()!=KnownWindowOutputPolicy::all_rows)
-                                throw std::invalid_argument("--mtp-copy-wide-rows requires an all-rows tiled tail block of each listed size on the server");
+                            const auto t=std::find_if(owners.begin(),owners.end(),[&](const auto& x){return x.rows==rows && x.owner;});
+                            if(t==owners.end() || (!split && t->owner->output_policy()!=KnownWindowOutputPolicy::all_rows))
+                                throw std::invalid_argument(split ? "--mtp-copy-wide-rows: no decode-profile wide owner of a listed size on the server"
+                                                                  : "--mtp-copy-wide-rows requires an all-rows tiled tail block of each listed size on the server");
                         }
                         runner.enable_wide=[&enable_ngram](HipMtpGreedyRuntime& greedy,std::span<const std::uint32_t> prompt){enable_ngram(greedy,prompt);};
                     }
