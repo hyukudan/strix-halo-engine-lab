@@ -13,6 +13,8 @@
 #include "core/hip_range_weight_loader.hpp"
 #include "core/hip_host_ready.hpp"
 #include "core/layer_read_ahead.hpp"
+#include "core/balanced_read.hpp"
+#include "xport/read_balance.hpp"
 #include <optional>
 #include "strix/ds41_engram.hpp"
 #include "strix/session/embed_splice_hip.hpp"
@@ -591,6 +593,11 @@ struct DevicePrefill::Impl {
     Dev<float> odeltas, oldeltas;
     Dev<std::int32_t> osums, olsums;
     Dev<std::uint8_t> erows;
+    // Engram balanced read (pair): the peer's rows this rank read for it, and the device buffers of the two exchanges
+    // (send half, receive half), grown to the largest share shipped.
+    std::vector<std::uint8_t> engram_help;
+    Dev<std::uint8_t> engram_ship;
+    Dev<std::uint64_t> engram_sync;
     Dev<float> emb, ekv;
     // shared expert activations (every row)
     Dev<std::int8_t> sh_codes;
@@ -1814,7 +1821,27 @@ PrefillResult DevicePrefill::run_from(std::span<const std::uint32_t> tokens, std
     std::unique_ptr<core::HipHostReady> engram_ready;
     std::vector<std::promise<void>> engram_signals;
     std::vector<std::shared_future<void>> engram_futures;
+    // Balanced read (row_split pair, piece blocks; core/balanced_read.hpp): when an Engram layer is about to run, the
+    // ranks exchange their read progress and the one that would finish later gives the last chunks of that layer to
+    // the other, which reads them from its own model file and ships the rows over the link (xport/read_balance.hpp)
+    // while its own kernels run. The split comes from the rates measured on this run; rows in the cache give nothing.
+    // Same file bytes on both ranks: bitwise identical. Opt-in (STRIX_DS41_ENGRAM_BALANCE=1; _LOG=1 prints every split):
+    // on the measured pair it halves the slower rank's wait for its rows and the cold run does not get shorter.
+    bool engram_balance_on = false;
+    std::vector<ds41::EngramRowRequest> engram_peer_requests;  // [layer][peer row][column]
+    // read blocks of a layer: every chunk in parts of about 4096 requests (the split is as fine as a part)
+    struct EngramParts {
+        std::vector<std::uint32_t> units, piece;  // requests of a part, the chunk it belongs to
+        std::vector<std::size_t> start;           // first request of a part within the layer
+    } engram_own_parts, engram_peer_parts;
+    std::optional<core::BalancedReadQueue> engram_balance;
     std::future<double> engram_job;  // destroyed (joined) before gates, promises and requests
+    struct EngramBalanceClose {  // any exit: the reader stops waiting for the next layer's split
+        std::optional<core::BalancedReadQueue>& queue;
+        ~EngramBalanceClose() {
+            if (queue) queue->close();
+        }
+    } engram_balance_close{engram_balance};
     bool engram_split_read = true, engram_layer_blocks = false;
     // Engram rows read in pieces (one read-ahead block per Engram chunk of every layer, in the order the layer runs them):
     // a chunk's kernels wait only for their own rows, so the first Engram layer runs while the rest of its rows still
@@ -1861,6 +1888,27 @@ PrefillResult DevicePrefill::run_from(std::span<const std::uint32_t> tokens, std
                 for (std::uint32_t k = 0; k < engram_cols; ++k)
                     requests.push_back({li, ids[std::size_t{global_row[t]} * per_token + li * engram_cols + k]});
         }
+        {
+            static const bool balance = strix::envcfg::flag("STRIX_DS41_ENGRAM_BALANCE", false);
+            static const bool pieces = strix::envcfg::flag("STRIX_DS41_ENGRAM_PIECE_READ", true) &&
+                                       strix::envcfg::flag("STRIX_DS41_ENGRAM_SPLIT_READ", true);
+            // both ranks decide from the same facts; short runs (decode, small extends) keep the plain read
+            engram_balance_on = balance && pieces && split && m.overlap && m.task == nullptr && Tn != 0U && Tp != 0U &&
+                                !structure_enabled("STRIX_DS41_ENGRAM_DEVICE_READY") &&
+                                !engram_layers.empty() && std::size_t{T} * engram_cols >= 8192U;
+            if (!engram_balance_on && strix::envcfg::flag("STRIX_DS41_ENGRAM_BALANCE_LOG", false))
+                std::fprintf(stderr, "engram balance: off (switch %d pieces %d split %d overlap %d task %d rows %u/%u wire %d ready %d layers %zu)\n",
+                             int(balance), int(pieces), int(split), int(m.overlap), int(m.task != nullptr), Tn, Tp, int(prefill_wire.active()),
+                             int(structure_enabled("STRIX_DS41_ENGRAM_DEVICE_READY")), engram_layers.size());
+            if (engram_balance_on) {
+                const auto peer_row = rank_global_rows(split, T, W, peer);
+                if (peer_row.size() != Tp) throw std::logic_error("deepseek41 prefill: Engram balance row map");
+                for (const auto li : engram_layers)
+                    for (std::uint32_t t = 0; t < Tp; ++t)
+                        for (std::uint32_t k = 0; k < engram_cols; ++k)
+                            engram_peer_requests.push_back({li, ids[std::size_t{peer_row[t]} * per_token + li * engram_cols + k]});
+            }
+        }
         // lookahead: this rank's Engram rows of the next run (its history continues this run's), read after this run's own
         m.engram_ahead_requests.clear();
         if (!engram_next.empty() && !requests.empty() && m.engram_reader->payload_cache()) {  // without a cache nothing is reused
@@ -1884,10 +1932,13 @@ PrefillResult DevicePrefill::run_from(std::span<const std::uint32_t> tokens, std
         const auto start_ahead = [&m, P0, T, own_stats] {  // after this run's own read (the reader serves one caller at a time)
             if (ahead_log) {
                 const auto s = m.engram_reader->stats();
-                std::fprintf(stderr, "engram lookahead: run at %u, %u rows: own read %llu requests, %llu cache hits, %llu misses, %.3f s busy; next run %zu requests\n",
+                std::fprintf(stderr, "engram lookahead: run at %u, %u rows: own read %llu requests, %llu cache hits, %llu misses, %.3f s busy, %llu disk reads of %llu bytes for %llu row bytes; next run %zu requests\n",
                              P0, T, static_cast<unsigned long long>(s.requests - own_stats.requests),
                              static_cast<unsigned long long>(s.payload_hits - own_stats.payload_hits),
                              static_cast<unsigned long long>(s.payload_misses - own_stats.payload_misses), s.busy_seconds - own_stats.busy_seconds,
+                             static_cast<unsigned long long>(s.direct_reads - own_stats.direct_reads),
+                             static_cast<unsigned long long>(s.page_bytes - own_stats.page_bytes),
+                             static_cast<unsigned long long>((s.payload_misses - own_stats.payload_misses) * 264U),
                              m.engram_ahead_requests.size());
             }
             if (m.engram_ahead_requests.empty()) return;
@@ -1941,6 +1992,55 @@ PrefillResult DevicePrefill::run_from(std::span<const std::uint32_t> tokens, std
                 for (auto& signal : engram_signals) engram_futures.push_back(signal.get_future().share());
                 if (engram_layer_blocks)
                     engram_ready = std::make_unique<core::HipHostReady>(blocks, st);
+                if (engram_balance_on) {
+                    if (engram_piece_blocks == 0U) throw std::logic_error("deepseek41 prefill: Engram balance without piece blocks");
+                    const auto parts_of = [&](std::uint32_t rows) {
+                        EngramParts parts;
+                        const std::uint32_t part_rows = std::max<std::uint32_t>(1U, 4096U / engram_cols);
+                        for (std::uint32_t r0 = 0, piece = 0; r0 < rows; r0 += engram_piece_rows, ++piece)
+                            for (std::uint32_t q0 = r0; q0 < std::min(rows, r0 + engram_piece_rows); q0 += part_rows) {
+                                parts.units.push_back((std::min(std::min(rows, r0 + engram_piece_rows), q0 + part_rows) - q0) * engram_cols);
+                                parts.piece.push_back(piece);
+                                parts.start.push_back(std::size_t{q0} * engram_cols);
+                            }
+                        return parts;
+                    };
+                    engram_own_parts = parts_of(Tn);
+                    engram_peer_parts = parts_of(Tp);
+                    engram_balance.emplace(std::vector<std::vector<std::uint32_t>>(engram_layers.size(), engram_own_parts.units));
+                    engram_job = std::async(std::launch::async, [&m, &requests, &engram_signals, &engram_balance, &engram_peer_requests,
+                                                               &own = engram_own_parts, &peer_parts = engram_peer_parts,
+                                                               layer_requests, piece_blocks = engram_piece_blocks,
+                                                               peer_layer = std::size_t{Tp} * engram_cols, start_ahead]() {
+                        double busy = 0.0;  // inside the reader (own and the peer's rows), not the waits between layers
+                        const std::span<const ds41::EngramRowRequest> all(requests), other(engram_peer_requests);
+                        const auto at = [&](std::size_t group, std::size_t block) { return group * layer_requests + own.start[block]; };
+                        engram_balance->run(
+                            [&](std::size_t group, std::size_t block) {
+                                const auto t1 = std::chrono::steady_clock::now();
+                                const std::size_t n = engram_balance->units(group)[block];
+                                m.engram_reader->read(all.subspan(at(group, block), n),
+                                                      std::span<std::uint8_t>(m.engram_pinned + at(group, block) * 264U, n * 264U));
+                                busy += seconds_since(t1);
+                            },
+                            [&](std::size_t group, std::size_t block) {  // a chunk is readable with its last part
+                                if (block + 1U == own.piece.size() || own.piece[block + 1U] != own.piece[block])
+                                    engram_signals[group * piece_blocks + own.piece[block]].set_value();
+                            },
+                            [&](std::size_t group, std::size_t block) {
+                                std::memset(m.engram_pinned + at(group, block) * 264U, 0, std::size_t{engram_balance->units(group)[block]} * 264U);
+                            },
+                            [&](std::size_t group, std::size_t first) {
+                                const auto t1 = std::chrono::steady_clock::now();
+                                const std::size_t from = group * peer_layer + peer_parts.start[first], n = (group + 1U) * peer_layer - from;
+                                m.engram_help.resize(n * 264U);
+                                m.engram_reader->read(other.subspan(from, n), m.engram_help);
+                                busy += seconds_since(t1);
+                            });
+                        start_ahead();
+                        return busy;
+                    });
+                } else
                 engram_job = std::async(std::launch::async, [&m, &requests, &engram_signals, &engram_ready,
                                                            blocks, offsets = std::move(offsets), start_ahead]() {
                     const auto t1 = std::chrono::steady_clock::now();
@@ -1986,6 +2086,75 @@ PrefillResult DevicePrefill::run_from(std::span<const std::uint32_t> tokens, std
             result.engram_seconds += engram_job.get(); // propagates I/O failure before publishing run state
         }
         result.engram_wait_seconds += seconds_since(t0); // host submission/wait only, not a device timing
+    };
+    // balanced read: the split of one Engram layer (both ranks, same place of the exchange order), then the shipment of
+    // the given chunks when the layer reaches the first of them
+    constexpr std::size_t engram_no_ship = ~std::size_t{0};
+    std::size_t engram_ship_block = engram_no_ship, engram_ship_group = 0;
+    std::uint64_t engram_ship_units = 0;
+    bool engram_ship_take = false;
+    static const bool engram_balance_log = strix::envcfg::flag("STRIX_DS41_ENGRAM_BALANCE_LOG", false);
+    const auto engram_balance_sync = [&](std::uint32_t layer) {
+        if (!engram_balance) return;
+        const auto t0 = std::chrono::steady_clock::now();
+        const auto& ids = m.model.engram.layer_ids;
+        const auto li = static_cast<std::uint32_t>(std::find(ids.begin(), ids.end(), layer) - ids.begin());
+        const auto at = static_cast<std::size_t>(std::find(engram_layers.begin(), engram_layers.end(), li) - engram_layers.begin());
+        hipStream_t gs = m.async_gather ? m.comm_stream : st;
+        if (m.engram_sync.p == nullptr) m.engram_sync = Dev<std::uint64_t>(2U * xport::read_balance_words);
+        const core::ReadProgress mine = engram_balance->freeze(at);
+        const auto share = xport::read_balance_sync(mine, engram_balance->units(at), engram_peer_parts.units, 10000U,
+            [&](const xport::ReadBalanceMessage& send, xport::ReadBalanceMessage& got) {
+                check(hipMemcpyAsync(m.engram_sync.p, send.data(), sizeof send, hipMemcpyHostToDevice, gs), "engram balance");
+                exchange_rows(m.engram_sync.p, 1U, m.engram_sync.p + xport::read_balance_words, 1U, sizeof send, 1200U + static_cast<std::uint32_t>(at));
+                check(hipMemcpyAsync(got.data(), m.engram_sync.p + xport::read_balance_words, sizeof got, hipMemcpyDeviceToHost, gs), "engram balance");
+                check(hipStreamSynchronize(gs), "engram balance");
+            });
+        engram_balance->resolve(at, share.give_from);
+        const bool take = share.take_from < engram_peer_parts.units.size(), give = share.give_from < engram_balance->units(at).size();
+        if (take) engram_balance->help(at, share.take_from);
+        if (take || give) {
+            engram_ship_block = take ? share.take_from : share.give_from;
+            engram_ship_group = at;
+            engram_ship_units = share.units;
+            engram_ship_take = take;
+        }
+        if (!take && at + 1U == engram_layers.size()) engram_balance->close();
+        if (engram_balance_log)
+            std::fprintf(stderr, "engram balance: layer %u open %llu free %llu rate %llu/s, peer open %llu free %llu rate %llu/s: %s %llu rows from part %zu, sync %.2f ms\n",
+                         layer, static_cast<unsigned long long>(mine.open), static_cast<unsigned long long>(mine.free),
+                         static_cast<unsigned long long>(mine.rate), static_cast<unsigned long long>(share.peer.open),
+                         static_cast<unsigned long long>(share.peer.free), static_cast<unsigned long long>(share.peer.rate),
+                         take ? "reads for the peer" : give ? "peer reads" : "no split", static_cast<unsigned long long>(share.units),
+                         take || give ? engram_ship_block : std::size_t{0}, seconds_since(t0) * 1e3);
+    };
+    const auto engram_ship = [&] {
+        const auto t0 = std::chrono::steady_clock::now();
+        hipStream_t gs = m.async_gather ? m.comm_stream : st;
+        const std::size_t bytes = engram_ship_units * 264U;
+        if (m.engram_ship.n < 2U * bytes) m.engram_ship = Dev<std::uint8_t>(2U * bytes);
+        std::uint8_t* const send = m.engram_ship.p;
+        std::uint8_t* const receive = m.engram_ship.p + m.engram_ship.n / 2U;
+        if (engram_ship_take) {
+            engram_balance->wait_help();
+            check(hipMemcpyAsync(send, m.engram_help.data(), bytes, hipMemcpyHostToDevice, gs), "engram ship");
+        }
+        exchange_rows(send, static_cast<std::uint32_t>(engram_ship_units), receive, static_cast<std::uint32_t>(engram_ship_units), 264U,
+                      1300U + static_cast<std::uint32_t>(engram_ship_group));
+        if (!engram_ship_take) {
+            const std::size_t first = engram_ship_group * std::size_t{Tn} * engram_cols + engram_own_parts.start[engram_ship_block];
+            check(hipMemcpyAsync(m.engram_pinned + first * 264U, receive, bytes, hipMemcpyDeviceToHost, gs), "engram ship");
+            check(hipStreamSynchronize(gs), "engram ship");
+            engram_balance->wait_own(engram_ship_group);  // the kept parts of the first chunk given
+            for (std::size_t b = engram_own_parts.piece[engram_ship_block]; b < engram_piece_blocks; ++b)
+                engram_signals[engram_ship_group * engram_piece_blocks + b].set_value();
+        } else if (engram_ship_group + 1U == engram_layers.size()) {
+            engram_balance->close();
+        }
+        if (engram_balance_log)
+            std::fprintf(stderr, "engram balance: %zu bytes %s in %.2f ms (with the wait for the rows)\n", bytes,
+                         engram_ship_take ? "shipped" : "received", seconds_since(t0) * 1e3);
+        engram_ship_block = engram_no_ship;
     };
     const auto engram_slice = [&](std::uint32_t layer) -> const std::uint8_t* {  // [token][column] x 264 B of an Engram layer
         const auto& ids = m.model.engram.layer_ids;
@@ -2162,10 +2331,14 @@ PrefillResult DevicePrefill::run_from(std::span<const std::uint32_t> tokens, std
             const std::uint32_t E = m.task != nullptr && m.task->opt.engram_rows != 0U ? std::min(m.task->opt.engram_rows, C) : C;
             std::uint32_t engram_cut = 0;
             const std::uint32_t engram_most = (std::max(Tn, Tp) + E - 1U) / E;
+            engram_balance_sync(layer);
             for (std::uint32_t r0 = 0; r0 < Tn; r0 += E) {
                 const std::uint32_t n = std::min(E, Tn - r0);
                 cut(PrefillUnitLevel::finest, s.layer, "engram");
                 ++engram_cut;
+                if (engram_ship_block != engram_no_ship &&
+                    (engram_ship_take ? engram_peer_parts : engram_own_parts).piece[engram_ship_block] == r0 / E)
+                    engram_ship();  // balanced read: the chunks from here on come from the peer
                 join_engram(layer, r0);  // piece blocks: this chunk's rows only (else joined above)
                 check(hipMemcpyAsync(m.erows.p, erow + std::size_t{r0} * engram_cols * 264U, std::size_t{n} * engram_cols * 264U,
                                      hipMemcpyHostToDevice, st), "engram rows");
@@ -2183,6 +2356,7 @@ PrefillResult DevicePrefill::run_from(std::span<const std::uint32_t> tokens, std
                 ds41::enqueue_engram_inject(stream_now() + std::size_t{r0} * stream_row, m.ekv.p, m.devf(p + "engram_q_norm.weight"),
                                             m.devf(p + "engram_k_norm.weight"), n, H, 1e-20F, st);
             }
+            if (engram_ship_block != engram_no_ship) engram_ship();  // this rank has fewer chunks than the peer gave away
             for (; engram_cut < engram_most; ++engram_cut) cut(PrefillUnitLevel::finest, s.layer, "engram.pad");
             if (!m.overlap) check(hipStreamSynchronize(st), "engram");  // overlap: pinned rows, alive until the run's end
             break;

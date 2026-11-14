@@ -68,6 +68,7 @@ struct EngramRowRequest {
 };
 struct EngramReaderStats {
     std::uint64_t requests = 0, page_reads = 0, page_bytes = 0, batches = 0;
+    std::uint64_t direct_reads = 0;  // reads of the deep queue (each serves the rows of one page run)
     // Unique offsets served by the payload cache / disk, and repeated offsets within a batch.
     std::uint64_t payload_hits = 0, payload_misses = 0, batch_duplicates = 0;
     std::uint64_t payload_hit_bytes = 0, duplicate_bytes = 0, output_bytes = 0;
@@ -123,7 +124,7 @@ private:
     bool stop_ = false, failed_ = false;
     std::string error_;
     EngramReaderStats stats_;
-    std::atomic<std::uint64_t> page_reads_{0}, page_bytes_{0};
+    std::atomic<std::uint64_t> page_reads_{0}, page_bytes_{0}, direct_reads_{0};
 };
 
 // Worker threads of the decode runners' Engram reader: STRIX_DS41_ENGRAM_THREADS=N (1..256), else `fallback`.

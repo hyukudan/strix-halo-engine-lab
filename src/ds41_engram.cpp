@@ -421,6 +421,7 @@ void EngramRowReader::read(std::span<const EngramRowRequest> requests, std::span
         }
         page_reads_.fetch_add(fs.rows, std::memory_order_relaxed);  // rows read from the file (a coalesced read serves several)
         page_bytes_.fetch_add(fs.read_bytes, std::memory_order_relaxed);
+        direct_reads_.fetch_add(fs.reads, std::memory_order_relaxed);
         fetched = true;
     }
     std::unique_lock<std::mutex> lock(mutex_);
@@ -462,6 +463,7 @@ EngramReaderStats EngramRowReader::stats() const {
     std::lock_guard<std::mutex> caller(read_mutex_);
     auto s = stats_;
     s.page_reads = page_reads_.load();
+    s.direct_reads = direct_reads_.load();
     s.page_bytes = page_bytes_.load();
     s.payload_hit_bytes = s.payload_hits * engram_row_bytes;
     s.duplicate_bytes = s.batch_duplicates * engram_row_bytes;
