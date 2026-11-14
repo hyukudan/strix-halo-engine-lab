@@ -6164,6 +6164,13 @@ QsaLaunchStats* qsa_launch_stats() {
 void count_qsa_launch(std::atomic<std::uint64_t> QsaLaunchStats::* kind) {
     if (auto* stats = qsa_launch_stats()) (stats->*kind).fetch_add(1U, std::memory_order_relaxed);
 }
+// STRIX_QSA_ATTEND_SHARED_SOFTMAX=1: the occ attend (mask bit 13) with one softmax per wave pair
+// (attn_core::selected_flash_step ShareSoftmax): the fh == 0 wave hands the FP16 probabilities, alpha and l to its
+// partner through its exchange slots (one more barrier per chunk, no LDS added). Same values: bitwise.
+bool qsa_attend_shared_softmax_enabled() {
+    static const bool enabled = strix::envcfg::flag("STRIX_QSA_ATTEND_SHARED_SOFTMAX", false);
+    return enabled;
+}
 // Draft organization only: do not trade resident query-head capacity for fewer KV requests.
 bool qsa_fast_kv_pair_enabled() {
     static const bool enabled = strix::envcfg::flag("STRIX_QSA_FAST_KV_PAIR", false);
@@ -6289,10 +6296,15 @@ void qsa_fast_batch_flush(hipStream_t stream) {
                 dim3(512), 0, stream, slot.views, b.kv, b.kv_heads, b.heads, b.union_at, ys);
         } else if (qpf2k_qsa_mask() & 0x2000U) {
             // Bit 13: the same grid and body with an eight-waves-per-SIMD register budget (qsa_fast::attend_order_occ_kernel).
-            hipLaunchKernelGGL(HIP_KERNEL_NAME(qsa_fast::attend_order_occ_kernel<64U, TR, G>), dim3(n * (64U / TR) * ys),
-                dim3((2U * G + 4U) * 32U), 0, stream, slot.views, b.kv, b.kv_heads, b.heads, b.union_at, ys);
-            static const bool witnessed = [] {
-                std::fprintf(stderr, "qpf2k qsa attend occ active mask 0x2000 waves_per_eu 8\n");
+            const bool share = qsa_attend_shared_softmax_enabled();
+            if (share)
+                hipLaunchKernelGGL(HIP_KERNEL_NAME(qsa_fast::attend_order_occ_kernel<64U, TR, G, 3U, true>), dim3(n * (64U / TR) * ys),
+                    dim3((2U * G + 4U) * 32U), 0, stream, slot.views, b.kv, b.kv_heads, b.heads, b.union_at, ys);
+            else
+                hipLaunchKernelGGL(HIP_KERNEL_NAME(qsa_fast::attend_order_occ_kernel<64U, TR, G>), dim3(n * (64U / TR) * ys),
+                    dim3((2U * G + 4U) * 32U), 0, stream, slot.views, b.kv, b.kv_heads, b.heads, b.union_at, ys);
+            static const bool witnessed = [share] {
+                std::fprintf(stderr, "qpf2k qsa attend occ active mask 0x2000 waves_per_eu 8%s\n", share ? " shared softmax" : "");
                 return true;
             }();
             (void)witnessed;
