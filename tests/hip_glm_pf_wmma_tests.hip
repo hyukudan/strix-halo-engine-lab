@@ -5,6 +5,7 @@
 #include "glm/prefill/glm_pf_exact.hpp"
 #include "glm/prefill/glm_pf_exact_moe.hpp"
 #include "glm/moe/glm_trellis_device.hpp"
+#include "strix/env_flags.hpp"
 #include <hip/hip_runtime.h>
 #include <algorithm>
 #include <chrono>
@@ -232,6 +233,52 @@ void dense(std::mt19937& rng, hipStream_t s, unsigned reps) {
     }
 }
 
+// --dense-rows: whole-call timing by rows per call (the chunked serving route issues 64..2048-row calls): the TM16
+// exact core (the short-call route), the exact X3 core and the WMMA core, interleaved ABC CBA, minimum of the medians.
+// Timing completion only: this mode does not compare outputs or qualify exactness/fidelity.
+void dense_rows(std::mt19937& rng, hipStream_t s, unsigned reps) {
+    struct BaselineTile {
+        const char* inherited = strix::envcfg::text("STRIX_GLM_PF_EXACT_TM");
+        const bool present = inherited != nullptr;
+        const std::string saved = present ? inherited : "";
+        BaselineTile() { env("STRIX_GLM_PF_EXACT_TM", "16"); }
+        ~BaselineTile() { env("STRIX_GLM_PF_EXACT_TM", present ? saved.c_str() : nullptr); }
+    } baseline_tile;
+    struct Shape { unsigned K, N, bits; };
+    for (const Shape sh : {Shape{4096, 1024, 4}, Shape{1024, 4096, 5}, Shape{4096, 6144, 6}, Shape{2048, 4096, 3}}) {
+        const M::Exl3 w = make_matrix(rng, sh.K, sh.N, sh.bits);
+        strix::glm::engine::Linear l;
+        l.raw.trellis = w.trellis; l.raw.suh = w.suh; l.raw.svh = w.svh;
+        l.raw.input = sh.K; l.raw.output = sh.N; l.raw.bits = sh.bits; l.raw.codebook = 2;
+        constexpr unsigned Rmax = 4096;
+        float* x = alloc<float>(std::size_t{Rmax} * sh.K);
+        float* y = alloc<float>(std::size_t{Rmax + 1} * sh.N);
+        const std::size_t wsb = DX::workspace_bytes(Rmax, sh.K);
+        void* ws = alloc<unsigned char>(wsb);
+        std::vector<float> hx(std::size_t{Rmax} * sh.K);
+        std::normal_distribution<float> n01(0, 1);
+        for (auto& v : hx) v = n01(rng);
+        ok(hipMemcpy(x, hx.data(), hx.size() * 4, hipMemcpyHostToDevice), "x");
+        for (unsigned rows : {32U, 64U, 128U, 256U, 512U, 1024U, 2048U, 4096U}) {
+            double t[3][2];
+            for (unsigned rep = 0; rep < 2; ++rep) for (unsigned o = 0; o < 3; ++o) {
+                const unsigned arm = rep ? 2U - o : o;
+                arm_env(arm == 2 ? 2U : 0U);
+                env("STRIX_GLM_PF_EXACT_X", arm == 0 ? "0" : "4");
+                if (arm == 0 && (DX::route(rows) != DX::Route::tm || DX::tile_rows() != 16))
+                    throw std::runtime_error("dense-rows baseline must resolve to TM16");
+                DX::linear_rows(l, x, sh.K, y, sh.N, rows, ws, wsb, s);
+                t[arm][rep] = median_ms([&] { DX::linear_rows(l, x, sh.K, y, sh.N, rows, ws, wsb, s); }, s, reps);
+            }
+            const double a = std::min(t[0][0], t[0][1]), b = std::min(t[1][0], t[1][1]), c = std::min(t[2][0], t[2][1]);
+            std::printf("ROWS dense K%u N%u b%u rows=%u tm%u %.3f ms exact-X3 %.3f ms (x%.3f) wmma %.3f ms (x%.3f of tm16, x%.3f of X3)\n",
+                        sh.K, sh.N, sh.bits, rows, DX::tile_rows(), a, b, b / a, c, c / a, c / b);
+        }
+        arm_env(0);
+        env("STRIX_GLM_PF_EXACT_X", nullptr);
+    }
+}
+
 void moe(std::mt19937& rng, hipStream_t s, unsigned reps, bool classes_only) {
     constexpr unsigned MaxR = 4096;
     std::vector<M::ExpertSlices> experts(E);
@@ -382,16 +429,18 @@ void moe(std::mt19937& rng, hipStream_t s, unsigned reps, bool classes_only) {
 int main(int argc, char** argv) {
     try {
         unsigned reps = 7;
-        bool do_dense = true, do_moe = true, classes = false;
+        bool do_dense = true, do_moe = true, classes = false, rows_only = false;
         for (int i = 1; i < argc; ++i) {
             if (std::strcmp(argv[i], "--no-timing") == 0) reps = 0;
             else if (std::strcmp(argv[i], "--dense") == 0) do_moe = false;
             else if (std::strcmp(argv[i], "--moe") == 0) do_dense = false;
             else if (std::strcmp(argv[i], "--moe-classes") == 0) { do_dense = false; classes = true; }
-            else throw std::invalid_argument("usage: strix-hip-glm5-pf-wmma-tests [--no-timing] [--dense | --moe | --moe-classes]");
+            else if (std::strcmp(argv[i], "--dense-rows") == 0) { do_dense = false; do_moe = false; rows_only = true; }
+            else throw std::invalid_argument("usage: strix-hip-glm5-pf-wmma-tests [--no-timing] [--dense | --moe | --moe-classes | --dense-rows]");
         }
         std::mt19937 rng(0x77a11ee5U);
         hipStream_t s; ok(hipStreamCreate(&s), "stream");
+        if (rows_only) dense_rows(rng, s, reps ? reps : 7U);
         if (do_dense) dense(rng, s, reps);
         if (do_moe) moe(rng, s, reps, classes);
         ok(hipStreamDestroy(s), "stream");

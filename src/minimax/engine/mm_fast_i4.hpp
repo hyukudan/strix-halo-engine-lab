@@ -2,6 +2,7 @@
 // Host-only model scheduling glue. All conversion and arithmetic stay in the library.
 #include <array>
 #include <cstddef>
+#include <cstdint>
 #include <stdexcept>
 #include <string_view>
 
@@ -34,6 +35,30 @@ inline std::size_t min_rows(const char* value) {
     }
     return v;
 }
+// The row gate of ONE prefill task. It is task state: a nested child begins its own task (short, so OFF) while the
+// parent is parked, and the resumed parent must keep the decision it began with (arithmetic and speed).
+struct RowGate {
+    bool on = true;
+    void begin(std::size_t rows, std::size_t minimum) { on = rows >= minimum; }
+};
+
+// STATS of ONE prefill task and layer. Task state like the row gate: launches and timing samples are charged to the
+// task that issued them, so a nested child's report neither prints nor clears the parked parent's. Timing is kept per
+// arithmetic (the route of the sampled group), not per layer; launch counts do not depend on a timing sample.
+struct LayerStats {
+    std::uint64_t i4_calls = 0, exl3_calls = 0;                    // MoE launches (one per chunk or group)
+    std::uint64_t i4_samples = 0, exl3_samples = 0, converts = 0;  // timed groups / conversions
+    double i4_ms = 0, exl3_ms = 0, convert_ms = 0;
+    void count(bool i4, std::size_t calls) { (i4 ? i4_calls : exl3_calls) += calls; }
+    void sample(bool i4, double ms) { (i4 ? i4_ms : exl3_ms) += ms; ++(i4 ? i4_samples : exl3_samples); }
+    void converted(double ms) { convert_ms += ms; ++converts; }
+    bool any() const { return (i4_calls | exl3_calls | i4_samples | exl3_samples | converts) != 0; }
+    static double mean(double ms, std::uint64_t n) { return n != 0 ? ms / static_cast<double>(n) : 0.0; }
+};
+template<std::size_t Layers>
+struct TaskStats {
+    std::array<LayerStats, Layers> layer{};
+};
 
 // One acquire/release surrounds ALL chunks of a layer. A new group/range must
 // begin afresh; a pack is never treated as a resident layer across groups.

@@ -133,6 +133,10 @@ only the next layer within the current range on a side stream, ordered by slot-f
 events, without adding a host synchronization. Retain it only if 8K TTFT improves by at least
 0.4 s over serial. `STRIX_MMX_FAST_I4_STATS=1` reports event-based converter and whole-group MoE
 times per layer at the existing prompt completion fence; the latter includes inter-chunk gaps.
+The report belongs to the prefill task that completes (a nested child neither prints nor clears
+its parked parent's), gives IU4 and EXL3 launch counts for every MoE layer that launched (also
+for a prompt under the row gate, which has no IU4 launch), and charges sampled time to the
+arithmetic of the sampled group.
 Kernel-chain timing should also use the prefill timeline markers.
 
 With scope `all`, the INT4 chain is the default (`STRIX_MOE_I4_CHAIN=0` selects the unfused calls,

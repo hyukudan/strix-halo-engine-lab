@@ -1625,10 +1625,10 @@ Group shared-expert SwiGLU pairs.
 
 Splits expert work across the pair, retains expert slots, builds integer routes faster, pairs eligible F16 projections and batches attention segments.
 
-- **Preconditions:** Two ranks and supported expert geometry; TP down width 1152; segment batching does not combine with BATCH_ROWS16=1.
-- **Automatic selection:** Each is on unless disabled; BATCH_SEGMENTS also covers STRIX_DS41_BATCH_ROWS16=1 (two launches per kernel for 9 to 16 requests). Shape guards keep supported older paths.
+- **Preconditions:** Two ranks and supported expert geometry; TP down width 1152.
+- **Automatic selection:** Each is on unless disabled; BATCH_SEGMENTS also covers STRIX_DS41_BATCH_ROWS16=1 (two launches per kernel for 9 to 16 request segments). Shape guards keep supported older paths.
 - **Fallback notice:** Routine operator eligibility has no general decline log. Invalid expert-TP geometry fails validation; do not treat a transport change as the same numerical identity.
-- **Exactness evidence:** The published two-node gates compare both ranks with the reference: prefill logits, decode token IDs, verify rows and batch rows. Keep the same Q2 experts, dense overlay and trellis packs in both arms.
+- **Exactness evidence:** The published two-node gates compare both ranks with the reference: prefill logits, decode token IDs, verify rows and batch rows. Keep the same Q2 experts, dense overlay and trellis packs in both arms. The newly enabled BATCH_ROWS16 segment path still needs server-level qualification of actual 9–16-row steps with mixed segment lengths and complete token/logit/state comparisons against BATCH_SEGMENTS=0; launch-splitting kernel coverage does not establish this gate. Per-rank step checksums include row/slot identity and step boundaries but remain diagnostic only; equality is not proof of identical outputs.
 - **Off switch:** Set one of STRIX_DS41_EXPERT_TP, STRIX_DS41_EXPERT_SLOTS, STRIX_DS41_ROUTES_FAST, STRIX_DS41_F16_PAIR, STRIX_DS41_TP_DOWN or STRIX_DS41_BATCH_SEGMENTS to 0 per comparison.
 - **Measured gain:** Batch segments N8 +9%; TP down R6 -3%, N8 +1.6%
 - **Public evidence:** [Two-node defaults](models/deepseek-v4.1/production-defaults.md)
@@ -3986,12 +3986,12 @@ Grouped expert work in exact chunked prefill; calls of 128 rows or more run rout
 
 Register-blocked exact prefill linear: LDS-decoded weights reused over 64 rows, activations read with scalar loads, four outputs x eight rows per lane (X3; X2 = LDS activations over 32 rows with next-stage register prefetch).
 
-- **Preconditions:** Exact chunked prefill linears; auto takes the X3 core with eight rows per wave for calls of at least 2048 rows (STRIX_GLM_PF_EXACT_X_MIN_ROWS) and the TM16 path below. 1, 2, 3 or 4 force X, X2, X3 (four rows per wave) or X3 (eight) for every call.
+- **Preconditions:** Exact chunked prefill linears; auto takes the X3 core with eight rows per wave for calls of at least 64 rows (32 when the FAST WMMA identity is selected; STRIX_GLM_PF_EXACT_X_MIN_ROWS overrides, 2048 restores the former floor) and the TM16 path below. The floor is one host-only policy (glm_pf_dense_policy.hpp) shared by the launcher, the rank CLI and the server; the server resolves its decode-first prefill chunk (--prefill-chunk, default 512 tokens = two 256-row calls on the pair) with it, grows the default chunk up to 1024 tokens when that keeps the large-call core, and prints effective serve-prefill-chunk=... with the reason whenever chunked calls decline it. 1, 2, 3 or 4 force X, X2, X3 (four rows per wave) or X3 (eight) for every call.
 - **Automatic selection:** Unset resolves to auto; the app sets it; the resolver reports it in `--print-effective-config`. Explicit values win; `--baseline` sets 0.
 - **Fallback notice:** Below the row threshold the TM16 path runs; invalid values fail. No silent numerical-identity substitution.
 - **Exactness evidence:** Bitwise: X/X2/X3 keep the TM path's DOT2 chains, fold and split order (X3 reads the wave-uniform activation pairs with scalar loads; LDS holds only decoded weights); dense outputs byte-equal TM for row tails 1..32, 2047/2048/2049 and 4096-row calls, signed zero, FP16 subnormals, +-Inf and NaN payloads; on the real pair decode anchors, speculative oracle and 1K/8K/32K prefill logits equal the X=0 path.
 - **Off switch:** STRIX_GLM_PF_EXACT_X=2 (previous X2 core) or 0
-- **Measured gain:** X3: 8K TTFT 21.42 -> 18.37 s (-14.3 %) vs STRIX_GLM_PF_EXACT_X=2 in the same run (two pairs, MoE v10 in both arms); X2 earlier: 8K 29.59 -> 27.93 s (-5.6 %) vs X=0; logits bitwise on both ranks
+- **Measured gain:** X3: 8K TTFT 21.42 -> 18.37 s (-14.3 %) vs STRIX_GLM_PF_EXACT_X=2 in the same run (two pairs, MoE v10 in both arms); X2 earlier: 8K 29.59 -> 27.93 s (-5.6 %) vs X=0; logits bitwise on both ranks. Row floor 2048 -> 64 (32 with FAST WMMA), pair, fresh process per arm: 1,024-token prompt exact 2.429 -> 2.055 s (-15.4 %), logits, state and tokens identical on both ranks; served 8,192-token prompt admitted while another request decodes, FAST profile: time to first token about 22.6 -> 18.56 s (362 -> 441 tok/s), every chunk call on the WMMA core (6,496 launches, none bypassed) and the same 16 tokens as the request served alone (before, the first token differed); background stream 2.03 -> 2.71 tok/s during the prefill, longest stall 1.64 -> 1.23 s. The 8K whole-prompt route is unchanged (8.93 s, same logits)
 - **Implementation / evidence:** [resolver](../apps/glm_rank_defaults.hpp), [X core](../src/glm/prefill/glm_pf_exact_x.hpp), [tests](../tests/hip_glm_pf_exact_tests.hip)
 
 <a id="glm-pf-obar-v5"></a>

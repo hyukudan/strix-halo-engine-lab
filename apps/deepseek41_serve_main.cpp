@@ -1131,7 +1131,6 @@ void warm_up(const Args& a, BatchForward& fwd, SlotPrefill* prefill, const strix
     plans_at_ready = strix::ds41::trellis_plan_stats();
 }
 
-// Plans created after READY (misses of the warm-up; all of them when it is off).
 // Diagnostic FNV-1a digest of this rank's decode steps, framed by row count and slot ownership.
 // Equal hashes are not proof of token equality (collisions), logits or state equality.
 struct StepTokenDigest {
@@ -1150,7 +1149,6 @@ struct StepTokenDigest {
         }
     }
 };
-StepTokenDigest g_step_tokens;
 
 // Per-rank step profile by rows of the step, printed when the rank stops: where a step's wall time goes on each rank
 // (inside the exchanges with the peer, Engram row reads and the wait for them) and the routed-expert work it did
@@ -1305,7 +1303,8 @@ std::optional<SessionCheckpoint> session_operation(const Args &a, BatchForward &
 using PrefillFactory = std::function<std::unique_ptr<SlotPrefill>(std::uint32_t& rows)>;
 
 // ---- rank 1: no API; runs what rank 0 sends ----
-void follow(const Args& initial, BatchForward& fwd, Watchdog& dog, const PrefillFactory& make_prefill, strix::ds41::hetero::Stage* stage) {
+void follow(const Args& initial, BatchForward& fwd, Watchdog& dog, const PrefillFactory& make_prefill, strix::ds41::hetero::Stage* stage,
+            StepTokenDigest& step_tokens) {
     control_round = 0;
     Args a = initial;
     const auto mine = hello(a);
@@ -1545,7 +1544,7 @@ void follow(const Args& initial, BatchForward& fwd, Watchdog& dog, const Prefill
         const auto rows = std::span<const BatchRow>(step_rows.data(), c.rows);
         if (spec) spec->follow_lookup_windows(c.pend);  // for follow_stage of these rows (after this step)
         const auto& tokens = stage ? stage->step(rows) : fwd.step(rows);
-        g_step_tokens.add(rows, tokens);
+        step_tokens.add(rows, tokens);
         g_step_profile.add(fwd.last_stats());
         last_rows.assign(rows.begin(), rows.end());
         spec_rows = last_rows;
@@ -1843,7 +1842,8 @@ void frames_import_session(const Args& a, ServeState& state, ImportBox& box, str
     s.reply(0, std::span<const std::uint8_t>(reinterpret_cast<const std::uint8_t*>(body.data()), body.size()));
 }
 
-void lead(const Args& initial, BatchForward& fwd, strix::dist::Communicator& comm, Watchdog& dog, const PrefillFactory& make_prefill, strix::ds41::hetero::Stage* stage) {
+void lead(const Args& initial, BatchForward& fwd, strix::dist::Communicator& comm, Watchdog& dog, const PrefillFactory& make_prefill, strix::ds41::hetero::Stage* stage,
+          StepTokenDigest& step_tokens) {
     control_round = 0;
     Args a = initial;
     const auto mine = hello(a);
@@ -2794,7 +2794,7 @@ void lead(const Args& initial, BatchForward& fwd, strix::dist::Communicator& com
         prof.control += std::chrono::duration<double>(t0 - t_planned).count();
         if (stage && !pre) stage->submit(plan.rows);
         const auto& tokens = stage ? stage->step(plan.rows) : fwd.step(plan.rows);
-        g_step_tokens.add(plan.rows, tokens);
+        step_tokens.add(plan.rows, tokens);
         g_step_profile.add(fwd.last_stats());
         dog.progress();
         last_round = Clock::now();
@@ -3538,12 +3538,13 @@ void run_rank(Args a, std::uint32_t rank, std::unique_ptr<strix::dist::Transport
                                         std::to_string(a.context));
         dog.pause(false);
     }
-    if (rank == 0U) lead(a, fwd, comm, dog, make_prefill, stage.get());
-    else follow(a, fwd, dog, make_prefill, stage.get());
+    StepTokenDigest step_tokens;
+    if (rank == 0U) lead(a, fwd, comm, dog, make_prefill, stage.get(), step_tokens);
+    else follow(a, fwd, dog, make_prefill, stage.get(), step_tokens);
     if (stage) stage->close();
     std::fprintf(stderr, "rank %u: %s\n", rank, plans_since_ready().c_str());
-    std::fprintf(stderr, "rank %u: step tokens %llu digest %016llx\n", rank, static_cast<unsigned long long>(g_step_tokens.tokens),
-                 static_cast<unsigned long long>(g_step_tokens.hash));
+    std::fprintf(stderr, "rank %u: step tokens %llu digest %016llx\n", rank, static_cast<unsigned long long>(step_tokens.tokens),
+                 static_cast<unsigned long long>(step_tokens.hash));
     g_step_profile.print(rank);
     serve::Json stopped = serve::Json::object();
     stopped.set("event", serve::Json("STOPPED"));

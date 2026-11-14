@@ -10,6 +10,9 @@ set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
     "${CMAKE_CURRENT_LIST_DIR}/../route_policy_host_tests.cpp.in"
     "${STRIX_SOURCE_ROOT}/src/glm/prefill/glm_pf_exact.hip"
     "${STRIX_SOURCE_ROOT}/src/glm/prefill/glm_pf_exact.hpp"
+    "${STRIX_SOURCE_ROOT}/src/glm/prefill/glm_pf_dense_policy.hpp"
+    "${STRIX_SOURCE_ROOT}/src/glm/engine/engine.hip"
+    "${STRIX_SOURCE_ROOT}/tests/hip_glm_pf_wmma_tests.hip"
     "${STRIX_SOURCE_ROOT}/src/minimax/engine/engine.hip"
     "${STRIX_SOURCE_ROOT}/src/minimax/moe/mmx_prefill_iu4.inc"
     "${STRIX_SOURCE_ROOT}/apps/hip_decode_token_main.cpp"
@@ -32,7 +35,7 @@ foreach(target route-policy-host route-receipt-host)
         target_compile_options(${target} PRIVATE -Wall -Wextra -Wpedantic -Werror)
     endif()
 endforeach()
-foreach(case minimax glm_equivalent qwen glm_bypass)
+foreach(case minimax glm_equivalent qwen glm_bypass glm_serve_chunk glm_schedule glm_reference glm_dense_baseline)
     add_test(NAME route-policy-${case} COMMAND route-policy-host ${case})
 endforeach()
 add_test(NAME route-receipt-host COMMAND route-receipt-host)

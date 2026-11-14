@@ -58,7 +58,7 @@ El motor elige una familia de kernels por el número de filas en vuelo, no por m
   Pasado un umbral de filas ganan las rutas de matrix cores y enteras. Los umbrales son toggles:
   `STRIX_INTPREFILL_DENSE_ROWS` (qwen, 512), `STRIX_QPF2K_DENSE_MIN_ROWS` (qwen, 1024 o 512 según el sitio),
   `STRIX_GLM_PF_WMMA_ROWS` (glm, 64), `STRIX_MM_PF_ASYNC_MIN_ROWS` (minimax, 2048),
-  `STRIX_GLM_PF_EXACT_X_MIN_ROWS` (glm, 2048).
+  `STRIX_GLM_PF_EXACT_X_MIN_ROWS` (glm, 64; 32 with FAST WMMA).
 - **Prefill** está limitado por cómputo. Usa las rutas enteras y de matrix cores, y el perfil FAST añade las que cambian bits.
 
 El punto de cruce depende de la relación entre cómputo y ancho de banda. En gfx1151 esa relación es fija, así que los umbrales son fijos.

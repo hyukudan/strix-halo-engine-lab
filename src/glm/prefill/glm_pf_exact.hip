@@ -1,4 +1,5 @@
 #include "glm/prefill/glm_pf_exact.hpp"
+#include "glm/prefill/glm_pf_dense_policy.hpp"
 #include "glm/moe/glm_trellis_device.hpp"
 #include "glm/prefill/glm_pf_exact_x.hpp"
 #include "glm/prefill/glm_pf_wmma_x.hpp"
@@ -247,13 +248,8 @@ void dispatch_tm(unsigned tm, Mat m, const _Float16* t, float* y, std::size_t ys
 }
 }  // namespace
 unsigned x_auto_rows() {
-    // STRIX_GLM_PF_EXACT_X_MIN_ROWS overrides the auto threshold (rows per linear call).
-    const char* p = envcfg::text("STRIX_GLM_PF_EXACT_X_MIN_ROWS");
-    if (!p) return 2048;
-    char* end = nullptr;
-    const unsigned long v = std::strtoul(p, &end, 10);
-    if (!*p || *end || v == 0 || v > 65536) throw std::invalid_argument("STRIX_GLM_PF_EXACT_X_MIN_ROWS must be 1..65536");
-    return static_cast<unsigned>(v);
+    // glm_pf_dense_policy.hpp: STRIX_GLM_PF_EXACT_X_MIN_ROWS, else 64 rows (32 with the FAST WMMA identity).
+    return dense_policy::auto_min_rows(envcfg::text);
 }
 struct RouteSelection {
     Route route;
@@ -261,15 +257,12 @@ struct RouteSelection {
 };
 static RouteSelection select_route(unsigned rows) {
     using R = ::strix::route::Reason;
-    const char* p = envcfg::text("STRIX_GLM_PF_EXACT_X");
-    if (!p || std::strcmp(p, "0") == 0) return {Route::tm, R::wrong_route};
-    if (std::strcmp(p, "1") == 0) return {Route::x, R::wrong_route};
-    if (std::strcmp(p, "2") == 0) return {Route::x2, R::wrong_route};
-    if (std::strcmp(p, "3") == 0) return {Route::x3, R::wrong_route};
-    if (std::strcmp(p, "4") == 0) return {Route::x3r8, R::shape};
-    if (std::strcmp(p, "auto") == 0) return rows >= x_auto_rows() ?
-        RouteSelection{Route::x3r8, R::shape} : RouteSelection{Route::tm, R::short_call};
-    throw std::invalid_argument("STRIX_GLM_PF_EXACT_X must be 0, 1, 2, 3, 4 or auto");
+    static_assert(static_cast<unsigned>(Route::tm) == dense_policy::kTm && static_cast<unsigned>(Route::x) == dense_policy::kX &&
+                  static_cast<unsigned>(Route::x2) == dense_policy::kX2 && static_cast<unsigned>(Route::x3) == dense_policy::kX3 &&
+                  static_cast<unsigned>(Route::x3r8) == dense_policy::kX3r8);
+    const auto pick = dense_policy::choose(rows, envcfg::text);
+    return {static_cast<Route>(pick.route),
+            pick.route == dense_policy::kX3r8 ? R::shape : pick.automatic ? R::short_call : R::wrong_route};
 }
 Route route(unsigned rows) { return select_route(rows).route; }
 unsigned vector_splits(unsigned input, unsigned output, unsigned bits) {
