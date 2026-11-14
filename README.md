@@ -97,6 +97,26 @@ GLM on one card (draft). See [using a discrete GPU](docs/discrete-gpu.md).
 
 Every switch, its default and when other hardware wants a different value: [toggles](docs/toggles.md).
 
+## Image input
+
+DeepSeek V4.1 on the two-node pair accepts images in OpenAI-style chat completions. Add an `image_url` part to a user
+message. It is off by default: start the server with `--vision <vision GGUF>` on rank 0, together with
+`--prefill-path device`.
+
+```bash
+curl http://localhost:8080/v1/chat/completions -H 'Content-Type: application/json' -d '{
+  "messages": [{"role": "user", "content": [
+    {"type": "text", "text": "Describe this image."},
+    {"type": "image_url", "image_url": {"url": "data:image/png;base64,..."}}]}]}'
+```
+
+Measured on the two-node pair, DeepSeek V4.1 Q2, one 37x23 PNG upscaled to 1550 patches (200 image rows + 21 text
+tokens): first request 1.46-1.87 s to first token (image encode 0.93-1.07 s, 2.0 MB frame to rank 1 in 4-5 ms, LM
+prefill about 0.46 s); the same image again 0.53-0.61 s (embed cache hit); decode 39-41 tok/s.
+
+Limits: PNG and JPEG only; images over the row budget, video, and image requests with `session_id` are refused. Other
+models do not take images yet. Details: [image input](docs/engine/vision.md).
+
 ## How it works
 
 - One shared kernel core: GGUF and EXL3 readers, quantized matrix kernels, attention, the memory planner and the

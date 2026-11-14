@@ -98,6 +98,14 @@ de fichero (tarjeta completa: DSpark 105-108 tok/s); con 48+32 y dos unidades DS
 tok/s), así que `auto` lo ejecuta sin drafter, y 32+32 con dos unidades (sin medir en ese caso) también se ejecuta sin él.
 `--drafter on` / `off` lo fuerzan.
 
+<a id="deepseek-image-input"></a>
+
+## Entrada de imágenes
+
+El par acepta imágenes en chat completions al estilo OpenAI (parte `image_url`). Arranque el servidor con
+`--vision <GGUF de visión>` en el rank 0 y `--prefill-path device`; sin la bandera no se carga nada. Cifras medidas,
+límites y ruta de datos: [entrada de imágenes](../../engine/vision.es.md).
+
 <a id="how-fast"></a>
 
 ## Resultados medidos: el par

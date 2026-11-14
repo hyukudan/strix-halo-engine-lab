@@ -97,6 +97,9 @@ Las tablas listan los flags seleccionados. La lista completa de variables de ent
 | `--prefill auto` | glm | `auto` | Elige la ruta de prefill. | - |
 | `--prefill-chunk N` | glm | 512 | Tamaño de chunk de prefill en filas. | Mayor con más cómputo; menor con menos memoria. |
 | `--prefill-path device` | deepseek serve | `device` | Prefill en la GPU. | - |
+| `--vision FILE` | deepseek serve (rank 0) | desactivado | Entrada de imágenes: carga el GGUF de visión y acepta partes `image_url`. Requiere `--prefill-path device`. [Entrada de imágenes](engine/vision.es.md). | - |
+| `STRIX_VISION_RESIDENT` | deepseek serve | 1 | `1`: la torre de imagen se sube al arrancar; `0`: con la primera imagen. | `0` para dejar la memoria libre hasta que llegue una imagen. |
+| `STRIX_VISION_CACHE_MIB` | deepseek serve | 256 | Tamaño en MiB de la caché de embeddings de imagen; `0` desactiva el almacenamiento. | Mayor si las mismas imágenes se repiten. |
 
 ### Decode, MTP y DSpark
 

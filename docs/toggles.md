@@ -99,6 +99,9 @@ The tables below list the curated flags. The full list of environment variables 
 | `--prefill auto` | glm | `auto` | Picks the prefill path. | - |
 | `--prefill-chunk N` | glm | 512 | Prefill chunk size in rows. | Larger with more compute; smaller with less memory. |
 | `--prefill-path device` | deepseek serve | `device` | Prefill on the GPU. | - |
+| `--vision FILE` | deepseek serve (rank 0) | off | Image input: loads the vision GGUF and accepts `image_url` parts. Needs `--prefill-path device`. [Image input](engine/vision.md). | - |
+| `STRIX_VISION_RESIDENT` | deepseek serve | 1 | `1`: the image tower is uploaded at start; `0`: on the first image. | `0` to keep the memory free until an image arrives. |
+| `STRIX_VISION_CACHE_MIB` | deepseek serve | 256 | Size of the image embed cache in MiB; `0` disables storing. | Larger when the same images repeat. |
 
 ### Decode, MTP and DSpark
 

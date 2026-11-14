@@ -96,6 +96,27 @@ servicio de Qwen y GLM en una tarjeta (borrador). Vea [uso de una GPU discreta](
 
 Cada interruptor, su valor por defecto y cuándo otro hardware quiere otro valor: [toggles](docs/toggles.es.md).
 
+## Entrada de imágenes
+
+DeepSeek V4.1 en el par de dos nodos acepta imágenes en chat completions al estilo OpenAI. Añada una parte `image_url`
+a un mensaje de usuario. Está desactivada por defecto: arranque el servidor con `--vision <GGUF de visión>` en el rank 0,
+junto con `--prefill-path device`.
+
+```bash
+curl http://localhost:8080/v1/chat/completions -H 'Content-Type: application/json' -d '{
+  "messages": [{"role": "user", "content": [
+    {"type": "text", "text": "Describe this image."},
+    {"type": "image_url", "image_url": {"url": "data:image/png;base64,..."}}]}]}'
+```
+
+Medido en el par de dos nodos, DeepSeek V4.1 Q2, un PNG de 37x23 ampliado a 1550 parches (200 filas de imagen + 21
+tokens de texto): primera petición 1,46-1,87 s hasta el primer token (codificación de la imagen 0,93-1,07 s, trama de
+2,0 MB al rank 1 en 4-5 ms, prefill del LM unos 0,46 s); la misma imagen otra vez 0,53-0,61 s (acierto de la caché de
+embeddings); decode 39-41 tok/s.
+
+Límites: solo PNG y JPEG; se rechazan las imágenes que superan el presupuesto de filas, el vídeo y las peticiones con
+imagen y `session_id`. Los demás modelos aún no admiten imágenes. Detalles: [entrada de imágenes](docs/engine/vision.es.md).
+
 ## Cómo funciona
 
 - Un núcleo de kernels compartido: lectores GGUF y EXL3, kernels de matrices cuantizadas, atención, el planificador de

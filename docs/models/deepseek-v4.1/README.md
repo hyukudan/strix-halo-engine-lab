@@ -96,6 +96,14 @@ expert stripes on two drives DSpark wins at 24+32 (9.3 vs 7.8) and `auto` keeps 
 tok/s), so `auto` runs it without the drafter, and 32+32 on two drives (not measured there) also runs without it.
 `--drafter on` / `off` force it.
 
+<a id="deepseek-image-input"></a>
+
+## Image input
+
+The pair accepts images in OpenAI-style chat completions (`image_url` part). Start the server with
+`--vision <vision GGUF>` on rank 0 and `--prefill-path device`; without the flag nothing is loaded. Measured numbers,
+limits and the data path: [image input](../../engine/vision.md).
+
 <a id="how-fast"></a>
 
 ## Measured results: the pair
