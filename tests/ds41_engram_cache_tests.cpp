@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <cstdlib>
 #include <fstream>
 #include <random>
 #include <stdexcept>
@@ -71,9 +72,16 @@ void run(const Fixture& fixture, bool direct, unsigned threads, std::uint64_t bu
 
 int main() try {
     const Fixture fixture;
-    for (const bool direct : {false, true})
-        for (const unsigned threads : {1U, 8U, 64U})
-            for (const std::uint64_t budget : {600ULL, 4096ULL, 1ULL << 20U}) run(fixture, direct, threads, budget);
+    // direct reads: once through the shared deep read queue (where the system has one), once on the worker threads
+    for (const char* ring : {"1", "0"}) {
+        ::setenv("STRIX_DS41_ENGRAM_URING", ring, 1);
+        for (const bool direct : {false, true}) {
+            if (!direct && ring[0] == '0') continue;
+            for (const unsigned threads : {1U, 8U, 64U})
+                for (const std::uint64_t budget : {600ULL, 4096ULL, 1ULL << 20U}) run(fixture, direct, threads, budget);
+        }
+    }
+    ::unsetenv("STRIX_DS41_ENGRAM_URING");
     // Independent readers of two files must never share an offset's payload.
     EngramRowReader first(fixture.path, {{4000, 1}}, 2, false, 4096);
     std::vector<std::uint8_t> a(264), b(264);
