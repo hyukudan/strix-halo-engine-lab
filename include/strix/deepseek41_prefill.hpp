@@ -2,6 +2,7 @@
 
 #include "strix/deepseek41_attention_state.hpp"
 #include "strix/session/embed_splice.hpp"
+#include "strix/serve/prefill_group.hpp"
 
 #include <cstdint>
 #include <filesystem>
@@ -331,6 +332,11 @@ public:
     // the bits (kernel / split / joint selection) evaluated on these rows. Prompts group only within one class (serve::
     // plan_prefill_group, R1), and run_group forces that class instead of re-selecting it from the summed rows.
     [[nodiscard]] std::uint32_t route_class(std::uint32_t rows) const noexcept;
+    [[nodiscard]] serve::PrefillGroupCapacity group_capacity() const noexcept;
+    [[nodiscard]] static bool group_options_supported(const PrefillOptions& o) noexcept {
+        return !(o.fp16_dense || o.bf16_attention || o.fast_attention || o.fast_moe || o.trace || o.stream_hashes ||
+                 o.routing_loads || o.quality_head_rows > 1U || o.null_ulp_layer >= 0 || o.verify_embed_extras);
+    }
     // Members / rows per member the group states hold (PrefillOptions::group_members / group_rows); 0 = no group pass.
     [[nodiscard]] std::uint32_t group_members() const noexcept;
     [[nodiscard]] std::uint32_t group_rows() const noexcept;

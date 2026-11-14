@@ -1,0 +1,10 @@
+^D:\TMP\FIX-PR591\TESTS\PR587_HOST\CMAKELISTS.TXT
+setlocal
+C:\Users\Usuario\AppData\Local\Programs\Python\Python310\Lib\site-packages\cmake\data\bin\cmake.exe -SD:/tmp/fix-pr591/tests/pr587_host -BD:/tmp/fix-pr591/.host-pr591 --check-stamp-file D:/tmp/fix-pr591/.host-pr591/CMakeFiles/generate.stamp
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal & call :cmErrorLevel %errorlevel% & goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd

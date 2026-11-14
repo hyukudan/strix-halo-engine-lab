@@ -579,18 +579,20 @@ std::uint64_t fnv_state_bytes(const strix::deepseek41::AttentionState& state) {
     return h;
 }
 
-// Group prefill policy (serving-only: the CLI runs one prompt): STRIX_SERVE_PREFILL_GROUP=auto|0, _MEMBERS, _ROWS.
-// The DS41 family default is auto: the group pass is bitwise per prompt (logits, exported state, tokens equal to the solo
-// runs) and measured on the pair (C8 whole-run 100.5 -> 104.0 tok/s); a lone prompt keeps the solo path.
-// short_rows = the scheduler's direct-prefill limit. Read through envcfg (recorded in the effective config).
-// Deterministic: every call returns the same policy.
-serve::PrefillGroupPolicy prefill_group_policy(const Args& a) {
-    return serve::PrefillGroupPolicy::from_env(
-        [](const char* k) -> std::string {
+// Resolve once before Effective's inspection exit. These serving-only controls are
+// not changed by the production profile; all reads use the governed registry.
+const serve::PrefillGroupPolicy& prefill_group_policy() {
+    static const auto policy = [] {
+        const auto env = [](const char* k) -> std::string {
             const char* v = strix::envcfg::text(k);
             return v ? std::string(v) : std::string();
-        },
-        serve::PrefillGroupPolicy::Mode::automatic, strix::deepseek41::sched::options_from_env(a.device_prefill).min_rows);
+        };
+        const auto limit = env("STRIX_DS41_SERVE_SCHED_MIN_ROWS");
+        const auto short_rows = limit.empty() ? strix::deepseek41::sched::Options{}.min_rows :
+            static_cast<std::uint32_t>(std::stoul(limit));
+        return serve::PrefillGroupPolicy::from_env(env, serve::PrefillGroupPolicy::Mode::automatic, short_rows);
+    }();
+    return policy;
 }
 
 // The row-split prefill of two ranks gives each 8-row window to one rank alternately: a run needs more than 8 rows so
@@ -610,9 +612,9 @@ strix::deepseek41::PrefillOptions slot_prefill_options(const Args& a, BatchForwa
     o.shared_weights = fwd.file_form_weights();
     o.expert_tp = strix::ds41::expert_tp::enabled_from_env();  // the batch forward's expert TP (dup layout)
     if (!a.dspark.empty()) o.draft_rows = a.dspark_seed_rows;  // the drafter's seed (both ranks hold it)
-    if (const auto gp = prefill_group_policy(a); gp.groups()) {  // group states (memory only when enabled)
+    if (const auto gp = prefill_group_policy(); gp.storage_rows(a.context) >= kMinRows) {
         o.group_members = gp.max_members;
-        o.group_rows = gp.short_rows;
+        o.group_rows = gp.storage_rows(a.context);
     }
     return o;
 }
@@ -1018,7 +1020,7 @@ public:
         std::uint32_t slot = 0;
         const std::vector<std::uint32_t>* prompt = nullptr;
     };
-    [[nodiscard]] bool group_available() const noexcept { return prefill_->group_members() >= 2U; }
+    [[nodiscard]] serve::PrefillGroupCapacity group_capacity() const noexcept { return prefill_->group_capacity(); }
     [[nodiscard]] std::uint32_t route_class(std::uint32_t rows) const noexcept { return prefill_->route_class(rows); }
     // ONE DevicePrefill::run_group over fresh prompts (no prefix-cache resume: members are misses by construction).
     // Per member the same steps as Task::finish: export, record, cache insert (same condition), import into its slot.
@@ -2003,9 +2005,7 @@ void lead(const Args& initial, BatchForward& fwd, strix::dist::Communicator& com
     agree_session_startup(a, fwd, sessions);
     dog.pause(false);
     const auto sched = strix::deepseek41::sched::options_from_env(a.device_prefill);  // STRIX_DS41_SERVE_SCHED (device: interleave unless =off)
-    const auto group_policy = prefill_group_policy(a);  // STRIX_SERVE_PREFILL_GROUP (serving-only, family default auto), resolved once
-    std::fprintf(stderr, "prefill_group: %s (members %u, rows %u, short below %u rows; serving-only: the CLI runs one prompt)\n", group_policy.name(),
-                 group_policy.max_members, group_policy.max_rows, group_policy.short_rows);
+    const auto group_policy = prefill_group_policy();  // STRIX_SERVE_PREFILL_GROUP (serving-only, family default auto), resolved once
     if (sched.mode != strix::deepseek41::sched::Mode::off) {
         if (!a.device_prefill) throw std::invalid_argument("STRIX_DS41_SERVE_SCHED needs --prefill-path device");
         std::fprintf(stderr, "sched: %s (starvation %.1f s, T_dev = %.3f + %.5f P s, unit %u rows, budget %u units / %.0f ms, MoE chunk %u, tasks from %u rows)\n", strix::deepseek41::sched::mode_name(sched.mode),
@@ -2046,6 +2046,13 @@ void lead(const Args& initial, BatchForward& fwd, strix::dist::Communicator& com
     }
     const auto prefill_owner = make_prefill(a.prefill_rows);  // after the drafter (follow() does the same)
     SlotPrefill* const prefill = prefill_owner.get();
+    const auto group_capacity = prefill ? prefill->group_capacity() : serve::PrefillGroupCapacity{0U};
+    const char* const group_mode = group_policy.groups() && group_capacity.members >= 2U ? "auto" : "off";
+    const char* const group_reason = !group_policy.groups() ? "policy-solo" :
+        prefill ? group_capacity.reason : "no-device-prefill";
+    std::fprintf(stderr, "prefill_group: %s (requested %s; %s; rows %llu, windows %llu, local rows %llu)\n",
+                 group_mode, group_policy.name(), group_reason, static_cast<unsigned long long>(group_capacity.rows),
+                 static_cast<unsigned long long>(group_capacity.windows), static_cast<unsigned long long>(group_capacity.local_rows));
     if (prefill) prefill->reconcile(fwd, 0U);
     warm_up(a, fwd, prefill, stage, dog, 0U);
     serve::ApiConfig config;
@@ -2061,7 +2068,7 @@ void lead(const Args& initial, BatchForward& fwd, strix::dist::Communicator& com
     config.sessions_enabled = a.session_ram_bytes != 0;
     config.engine_description = "deepseek41 engine group (2 ranks, EP experts" + std::string(a.tp ? " + TP attention" : "") + "), " +
                                 std::to_string(a.slots) + " slots, greedy, exact per request";
-    config.capabilities_extra = [sched, group_policy](serve::Json& out) {
+    config.capabilities_extra = [sched, group_policy, group_capacity, group_mode, group_reason](serve::Json& out) {
         serve::Json policy = serve::Json::object();
         policy.set("effective", serve::Json(strix::deepseek41::sched::mode_name(sched.mode)));
         policy.set("service_target_ms", serve::Json(sched.service_ms));
@@ -2075,10 +2082,15 @@ void lead(const Args& initial, BatchForward& fwd, strix::dist::Communicator& com
         policy.set("direct_prefill_below_rows", serve::Json(static_cast<std::uint64_t>(sched.min_rows)));
         {
             serve::Json g = serve::Json::object();
-            g.set("mode", serve::Json(group_policy.name()));
+            g.set("requested", serve::Json(group_policy.name()));
+            g.set("mode", serve::Json(group_mode));
             g.set("members", serve::Json(static_cast<std::uint64_t>(group_policy.max_members)));
             g.set("rows", serve::Json(static_cast<std::uint64_t>(group_policy.max_rows)));
-            g.set("reason", serve::Json("serving-only: the CLI runs one prompt"));
+            g.set("reason", serve::Json(group_reason));
+            g.set("device_rows", serve::Json(group_capacity.rows));
+            g.set("member_rows", serve::Json(group_capacity.member_rows));
+            g.set("windows", serve::Json(group_capacity.windows));
+            g.set("local_rows", serve::Json(group_capacity.local_rows));
             policy.set("prefill_group", std::move(g));
         }
         policy.set("qualification", serve::Json("pending-both-rank-gates"));
@@ -2174,10 +2186,15 @@ void lead(const Args& initial, BatchForward& fwd, strix::dist::Communicator& com
         pf.set("direct_prefill_below_rows", serve::Json(static_cast<std::uint64_t>(sched.min_rows)));
         {
             serve::Json g = serve::Json::object();
-            g.set("mode", serve::Json(group_policy.name()));
+            g.set("requested", serve::Json(group_policy.name()));
+            g.set("mode", serve::Json(group_mode));
             g.set("members", serve::Json(static_cast<std::uint64_t>(group_policy.max_members)));
             g.set("rows", serve::Json(static_cast<std::uint64_t>(group_policy.max_rows)));
-            g.set("reason", serve::Json("serving-only: the CLI runs one prompt"));
+            g.set("reason", serve::Json(group_reason));
+            g.set("device_rows", serve::Json(group_capacity.rows));
+            g.set("member_rows", serve::Json(group_capacity.member_rows));
+            g.set("windows", serve::Json(group_capacity.windows));
+            g.set("local_rows", serve::Json(group_capacity.local_rows));
             pf.set("prefill_group", std::move(g));
         }
         pf.set("fallback_reason", serve::Json(sched.mode != strix::deepseek41::sched::Mode::interleave ? "scheduler-not-interleave" :
@@ -3590,30 +3607,26 @@ void lead(const Args& initial, BatchForward& fwd, strix::dist::Communicator& com
                         // PFFIX (a): the waiting short prompts that need the same direct device prefill now (no resume possible: shorter
                         // than one cache block; not mid-prefill: `active` is empty; not a task: below min_rows)
                         std::vector<Running*> group;
-                        if (group_policy.groups() && prefill->group_available() && r.seq.prompt.size() < sched.min_rows) {
-                            std::vector<Running*> offered;
+                        if (group_policy.groups() && group_capacity.members >= 2U && r.seq.prompt.size() < sched.min_rows) {
                             std::vector<serve::GroupCandidate> cands;
-                            const auto offer = [&](Running* q) {
-                                if (q->seq.prompt.empty() || q->seq.prompt.size() >= sched.min_rows || runtime.ticket_cancelled(q->owner)) return;
-                                if (prefill->has_cache() && q->seq.prompt.size() >= a.prefix_block) return;
-                                serve::GroupCandidate g;
-                                g.id = offered.size();
-                                g.rows = static_cast<std::uint32_t>(q->seq.prompt.size());
-                                g.arrival_seq = offered.size();  // the picked request first, then the others by submission order
-                                g.route_class = prefill->route_class(g.rows);
-                                cands.push_back(g);
-                                offered.push_back(q);
-                            };
-                            offer(&r);
-                            for (auto* q : waiting)
-                                if (q != &r) offer(q);
+                            // The selected head may have overtaken older requests. Only later
+                            // arrivals may accompany it; retain indices in the original queue.
+                            for (std::size_t i = pick; i < waiting.size(); ++i) {
+                                const auto* q = waiting[i];
+                                if (q->seq.prompt.empty() || q->seq.prompt.size() >= sched.min_rows || runtime.ticket_cancelled(q->owner)) continue;
+                                if (prefill->has_cache() && q->seq.prompt.size() >= a.prefix_block) continue;
+                                const auto rows = static_cast<std::uint32_t>(q->seq.prompt.size());
+                                cands.push_back({i, rows, i, prefill->route_class(rows)});
+                            }
                             const bool decoding = std::any_of(running.begin(), running.end(), [](const auto& q) { return !q->device_prefill; });
                             const double gap_ms = std::chrono::duration<double, std::milli>(Clock::now() - decode_gap_from).count();
                             const double budget = decoding ? sched.admit_first.max_decode_gap_ms - gap_ms : std::numeric_limits<double>::infinity();
-                            if (cands.size() >= 2U && !offered.empty() && offered.front() == &r) {
-                                const auto ids = serve::plan_prefill_group(cands, group_policy, serve::PrefillGroupCost{sched.tdev_a * 1e3, sched.tdev_b * 1e3}, budget);
+                            if (cands.size() >= 2U && cands.front().id == pick) {
+                                auto ids = serve::plan_prefill_group(cands, group_policy, serve::PrefillGroupCost{sched.tdev_a * 1e3, sched.tdev_b * 1e3}, budget, group_capacity);
+                                serve::limit_prefill_overtakes(ids, waiting,
+                                    [](auto* q) -> std::uint32_t& { return q->prefill_overtakes; });
                                 if (ids.size() >= 2U)
-                                    for (const auto id : ids) group.push_back(offered.at(static_cast<std::size_t>(id)));
+                                    for (const auto id : ids) group.push_back(waiting.at(static_cast<std::size_t>(id)));
                             }
                         }
                         if (group.size() >= 2U) device_prefill_group(group);
@@ -3941,6 +3954,12 @@ int main(int argc, char** argv) try {
     bool session_explicit = std::getenv("STRIX_SESSION_CACHE") && std::string_view(std::getenv("STRIX_SESSION_CACHE")) != "0";
     for (int i = 1; i < argc; ++i)
         if (std::string_view(argv[i]).starts_with("--session-")) session_explicit = true;
+    const auto& resolved_group_policy = prefill_group_policy();
+    for (int i = 1; i < argc; ++i)
+        if (std::string_view(argv[i]) == "--print-effective-config") {
+            std::cout << resolved_group_policy.describe();
+            break;
+        }
     const strix::deepseek41::pair_defaults::Effective production_defaults(strix::deepseek41::pair_defaults::App::serve, argc, argv, strix::deepseek41::pair_defaults::this_build());  // before any option or env read
     // The dist layer's own deadlines below the serve watchdog (120 s): a rare stall ends in the communicator's state
     // report (collective in flight, phase, per-stream bytes) instead of a bare POISONED. An explicit value wins.
@@ -4086,7 +4105,7 @@ int main(int argc, char** argv) try {
     if (a.prefix_block == 0U || a.prefix_block % 8U != 0U) throw std::invalid_argument("--prefix-block must be a positive multiple of 8");
     if (a.prefix_cache_mb != 0U && !a.device_prefill) throw std::invalid_argument("--prefix-cache-mb needs --prefill-path device");
     (void)strix::deepseek41::sched::options_from_env(a.device_prefill);  // STRIX_DS41_SERVE_SCHED: checked before connect / load
-    (void)prefill_group_policy(a);  // STRIX_SERVE_PREFILL_GROUP*: checked before connect / load
+    (void)prefill_group_policy();  // STRIX_SERVE_PREFILL_GROUP*: checked before connect / load
     if (a.prefix_inrun && a.prefix_cache_mb == 0U) throw std::invalid_argument("--prefix-inrun-snapshots needs --prefix-cache-mb (or --cache-profile agent)");
     if (a.prefix_session && !a.dspark.empty())
         throw std::invalid_argument("--prefix-session-snapshots is not exact with --dspark (verify-window rows leave another state than the prefill)");

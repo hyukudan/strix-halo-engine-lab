@@ -3824,6 +3824,23 @@ std::uint32_t DevicePrefill::route_class(std::uint32_t rows) const noexcept {
 std::uint32_t DevicePrefill::group_members() const noexcept { return static_cast<std::uint32_t>(impl_->group.size()); }
 std::uint32_t DevicePrefill::group_rows() const noexcept { return impl_->group.empty() ? 0U : impl_->options.group_rows; }
 
+serve::PrefillGroupCapacity DevicePrefill::group_capacity() const noexcept {
+    const auto& m = *impl_;
+    const auto& o = m.options;
+    serve::PrefillGroupCapacity cap;
+    cap.members = group_options_supported(o) ? m.group.size() : 0U;
+    cap.rows = std::min(o.chunk_rows, o.max_rows != 0U ? o.max_rows : o.max_positions);
+    cap.member_rows = group_rows();
+    cap.window_rows = o.window_rows;
+    if (m.cand_window_bytes != 0U) cap.windows = m.candidates.n / m.cand_window_bytes;
+    cap.local_rows = m.streams[0].n / (std::size_t{m.model.config.hc_mult} * m.model.config.hidden_size);
+    cap.split_class_mask = 1U;
+    cap.rejected_class_mask = 4U;
+    cap.reason = !group_options_supported(o) ? "unsupported-options" :
+                 cap.members < 2U ? "no-group-storage" : "eligible-routes-only; dense-kernel-rows-solo";
+    return cap;
+}
+
 DevicePrefill::DraftSeed DevicePrefill::draft_seed(std::size_t segment) const noexcept {
     const auto& m = *impl_;
     if (segment >= m.group_used) return DraftSeed{};
@@ -3858,8 +3875,7 @@ std::vector<PrefillResult> DevicePrefill::run_group(std::span<const PrefillSegme
     const auto n = static_cast<std::uint32_t>(segments.size());
     if (n < 2U || n > m.group.size()) throw std::invalid_argument("deepseek41 prefill: run_group takes 2..group_members sequences");
     const auto& o = m.options;
-    if (o.fp16_dense || o.bf16_attention || o.fast_attention || o.fast_moe || o.trace || o.stream_hashes || o.routing_loads ||
-        o.quality_head_rows > 1U || o.null_ulp_layer >= 0 || o.verify_embed_extras)
+    if (!group_options_supported(o))
         throw std::logic_error("deepseek41 prefill: run_group supports the exact path only (no fp16 / bf16 / fast / trace / stream hashes / routing loads / quality head)");
     if (!m.embed_next.empty()) throw std::invalid_argument("deepseek41 prefill: run_group refuses an embedding splice");
     if (!m.snap_next.empty()) throw std::invalid_argument("deepseek41 prefill: run_group refuses snapshot points");

@@ -1,0 +1,17 @@
+cycle_receipt_tests 1 0.0794453
+run_receipt_stop 1 0.0752812
+run_receipt_stop_wiring 1 0.0503446
+run_receipt_restored 1 0.0106325
+run_receipt_restored_wiring 1 0.0450715
+run_receipt_rows 1 0.010353
+run_receipt_rows_wiring 1 0.0437919
+run_receipt_prefill 1 0.0119111
+run_receipt_prefill_wiring 1 0.0455785
+prefill_group_tests 1 0.0743082
+prefill_group_regression_tests 1 0.0726015
+prefill_group_capacity_wiring 1 0.0480085
+prefill_group_routes_wiring 1 0.0455582
+prefill_group_storage_wiring 1 0.0444754
+prefill_group_fairness_wiring 1 0.0452241
+prefill_group_inspection_wiring 1 0.0464276
+---
