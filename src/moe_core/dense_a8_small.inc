@@ -16,6 +16,24 @@ inline void dense_a8_small_note_active(unsigned rows) {
     static_cast<void>(once);
 }
 
+// Small-row plan of the 16-row tile form (project_rows_dense_a8_wmma_kernel with 2..15 real rows):
+// one quantizer launch into the family slot, then one pass over the weights with every row in the
+// tile. Per row the bits of the 1..8-row dot4 form (same codes, deltas and ascending block chain).
+// STRIX_DENSE_A8_ROW_TILE: 0 = never, N >= 2 = windows of at least N rows, unset = dense_a8_row_tile_default.
+// In-process A/B: STRIX_COHORT_AB_OFF=densetile.
+constexpr int dense_a8_row_tile_default = 0;
+inline bool dense_a8_row_tile(unsigned rows) {
+    static const int from = strix::envcfg::integer("STRIX_DENSE_A8_ROW_TILE", dense_a8_row_tile_default);
+    return from >= 2 && rows >= static_cast<unsigned>(from) && !known_window_cohort_feature_off("densetile");
+}
+inline void dense_a8_row_tile_note_active(unsigned rows) {
+    static const bool once = [rows] {
+        std::fprintf(stderr, "lever active: STRIX_DENSE_A8_ROW_TILE (first launch: %u rows)\n", rows);
+        return true;
+    }();
+    static_cast<void>(once);
+}
+
 template <class Site>
 __global__ __launch_bounds__(128) void project_rows_dense_a8_small_kernel(
     Site site, const std::int8_t* codes, const float* deltas) {
