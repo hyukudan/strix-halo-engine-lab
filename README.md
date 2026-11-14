@@ -16,12 +16,12 @@ off switches are in [performance](docs/performance.md) and [measured gains](docs
 
 | Model | Hardware | Decode | Prompt reading |
 |---|---|---|---|
-| Qwen3.8-Flash-Next | 1 node | 62.44 tok/s (MTP, 1K code) | 1,885 tok/s at 8K, 1,845-1,856 at 32K, 1,755-1,762 at 128K (exact); 2,008 at 8K (`fast`, opt-in) |
+| Qwen3.8-Flash-Next | 1 node | 62.44 tok/s (MTP, 1K code) | 1,885 tok/s at 8K, 1,845-1,856 at 32K, 1,755-1,762 at 128K (exact); 2,008 at 8K (`fast`, opt-in; quality qualification in progress) |
 | Qwen3.8-Flash-Next | 2 nodes (two replicas, server) | 158.1 tok/s total with 8 streams (68.2 with 1) | - |
-| Qwen3.8-Flash-Next | 2 nodes (pipelined prefill, opt-in) | - | 2,968 tok/s at 32K (exact), 3,191 (`fast`, opt-in); below 28,672 prompt rows the pair runs the prompt on one node |
-| DeepSeek V4.1 Flash | pair | 70.6 tok/s (DSpark, code) | 1,165 tok/s at 8K, 1,285 at 32K (exact); 1,377 / 1,546 with the opt-in FAST prefill profile |
+| Qwen3.8-Flash-Next | 2 nodes (pipelined prefill, opt-in) | - | 2,968 tok/s at 32K (exact), 3,191 (`fast`, opt-in; quality qualification in progress); below 28,672 prompt rows the pair runs the prompt on one node |
+| DeepSeek V4.1 Flash | pair | 70.6 tok/s (DSpark, code) | 1,165 tok/s at 8K, 1,285 at 32K (exact); 1,377 / 1,546 with the FAST prefill profile (opt-in; [floor-relative quality gate passed](docs/models/deepseek-v4.1/README.md#fast-prefill-quality-gate)) |
 | MiniMax M3.1 Flash | pair | 23.10 tok/s (1K) | 669 tok/s at 8K, 529 at 32K (exact) |
-| GLM-5.3 Flash | pair | 44.5 tok/s (MTP, code) | 541 tok/s at 8K, 529 at 32K (exact); 918 at 8K (`fast`, opt-in) |
+| GLM-5.3 Flash | pair | 44.5 tok/s (MTP, code) | 541 tok/s at 8K, 529 at 32K (exact); 918 at 8K (`fast`, opt-in; quality qualification in progress) |
 | Nemotron 3.5 Bolt E4B | 1 node | 91.9 tok/s (C1) | 2,780 tok/s at 8K, 2,336 at 32K (`fast`) |
 | Nemotron 3.5 Bolt E4B | 2 nodes (pipelined prefill, opt-in) | - | 4,804 tok/s at 8K, 3,965 at 32K (`fast`, same bytes as 1 node) |
 | MiniMax H3 | pair | 5 s 1344x768 clip with audio in 405.5 s | - |
