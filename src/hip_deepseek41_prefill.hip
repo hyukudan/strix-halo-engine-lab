@@ -329,14 +329,15 @@ bool prefill_o_b_one() {
     return !(v && v[0] == '0');
 }
 // Routed-MoE and window schedule (bitwise; read per call, defaults from the shared resolver deepseek41_pair_defaults):
-// STRIX_DS41_PREFILL_MOE_PASS_WINDOW (=1 on): one MoE window per pass (ds41::moe_window_rows) up to
-// STRIX_DS41_PREFILL_MOE_WINDOW_CAP rows (default 8192), instead of moe_chunk_rows windows.
+// STRIX_DS41_PREFILL_MOE_PASS_WINDOW (default 1; 0 off): one MoE window per pass (ds41::moe_window_rows) up to
+// STRIX_DS41_PREFILL_MOE_WINDOW_CAP rows (default 8192), instead of moe_chunk_rows windows (rows are independent in the
+// MoE: the same bits; fewer expert reads per pass above 4,096 rows).
 // STRIX_DS41_PREFILL_JOINT_LAYER (=1 on): the joint expert pass when the LAYER's rows are at most
 // STRIX_DS41_PREFILL_JOINT_LAYER_ROWS (default 1024; ds41::moe_joint_layer), besides the prompt rule T <= joint_max_rows.
 // STRIX_DS41_PREFILL_WINDOW_DRAIN (default 1; 0 off; bit 1 = drain the main stream and the lanes before a chunk's windows,
 // bit 2 = after them): host synchronisation at the points --timing synchronises at. Bit 1 alone holds the whole gain: with
 // the main stream drained, the lanes' wait on chunk_ready is already satisfied when their window launches are queued.
-bool prefill_moe_pass_window() { return strix::envcfg::flag("STRIX_DS41_PREFILL_MOE_PASS_WINDOW", false, strix::EnvFlagMatch::exact); }
+bool prefill_moe_pass_window() { return strix::envcfg::flag("STRIX_DS41_PREFILL_MOE_PASS_WINDOW", true, strix::EnvFlagMatch::exact); }
 std::uint32_t prefill_moe_window_cap() { return strix::envcfg::number<std::uint32_t>("STRIX_DS41_PREFILL_MOE_WINDOW_CAP", 8192U, 1U, 65536U); }
 bool prefill_joint_layer() { return strix::envcfg::flag("STRIX_DS41_PREFILL_JOINT_LAYER", false, strix::EnvFlagMatch::exact); }
 std::uint32_t prefill_joint_layer_rows() { return strix::envcfg::number<std::uint32_t>("STRIX_DS41_PREFILL_JOINT_LAYER_ROWS", 1024U, 0U, 65536U); }

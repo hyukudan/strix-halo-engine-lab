@@ -229,6 +229,8 @@ std::span<const strix::profile::DefaultItem> default_items() {
         {"dspark_calib", "STRIX_DS41_DSPARK_CALIB", "", "0", ""},
         // 2026-11-14 DS41 prefill schedule (bitwise): window drain arm 1 (ABAB -239 ms at 11,594, -85 at 2,952)
         {"window_drain", "STRIX_DS41_PREFILL_WINDOW_DRAIN", "", "0", ""},
+        // 2026-11-14 DS41 prefill schedule (bitwise): one MoE window per pass, cap 8192 (ABAB -218 ms at 11,594, hashes equal)
+        {"moe_pass_window", "STRIX_DS41_PREFILL_MOE_PASS_WINDOW", "", "0", ""},
     };
     return items;
 }
