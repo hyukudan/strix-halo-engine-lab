@@ -35,6 +35,7 @@ void enqueue_attention_flash_mirror(Mirror v, int stream) {
 }
 }
 int allocations = 0, fail_after = -1;
+namespace ds41 { namespace attn = ::attn; }
 template<class T> struct Dev {
     std::unique_ptr<T[]> owner;
     T* p = nullptr;
