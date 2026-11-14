@@ -1,0 +1,126 @@
+#include <algorithm>
+#include <array>
+#include <cstdint>
+#include <cstdio>
+#include <span>
+#include <stdexcept>
+#include <string>
+#include <vector>
+
+void check(bool ok, const char* why) { if (!ok) throw std::runtime_error(why); }
+struct Stage { float* data; };
+struct Communicator {
+    std::size_t staged_ready_bytes_ = 262144, max_bytes_ = 1048576;
+    bool trace_ = false, direct_ = true, nonmonotonic = true, prepared = false;
+    unsigned rank = 0, prepares = 0, exchanges = 0;
+    std::vector<float> tx;
+    struct Route { bool direct; };
+    Route route(std::size_t bytes) const { return {nonmonotonic && (bytes <= 160000 || bytes > 400000)}; }
+    @CAPACITY@
+    Stage prepare_staged_ready(int, std::size_t bytes) {
+        if (!staged_ready_bytes_ || !bytes || bytes > max_bytes_ || bytes > staged_ready_bytes_ || trace_ ||
+            (direct_ && route(bytes).direct)) return {nullptr};
+        check(!prepared, "previous ready stage still prepared");
+        prepared = true; ++prepares;
+        tx.resize(bytes / sizeof(float));
+        return {tx.data()};
+    }
+};
+namespace ds41 {
+struct F16RowsView {
+    const float* x;
+    float* out;
+    std::uint32_t rows, x_stride, out_stride, first, count;
+};
+void enqueue_f16_rows(const F16RowsView& v, int) {
+    for (std::uint32_t r = 0; r < v.rows; ++r)
+        for (std::uint32_t j = 0; j < v.count; ++j) {
+            auto& out = v.out[std::size_t{r} * v.out_stride + j];
+            check(out == -1.0F, "row projected twice");
+            out = v.x[std::size_t{r} * v.x_stride] + static_cast<float>(v.first + j);
+        }
+}
+}
+namespace dist {
+enum class TagKind : std::uint32_t { raw_slots = 1 };
+struct Tag { std::uint32_t kind, layer, index; };
+}
+namespace ready_detail {
+void gather_publish(const float* base, std::uint32_t rows, std::uint32_t stride, std::uint32_t half,
+                    std::uint32_t first, Stage stage, int) {
+    for (std::uint32_t r = 0; r < rows; ++r)
+        std::copy_n(base + std::size_t{r} * stride + first, half, stage.data + std::size_t{r} * half);
+}
+void scatter(Stage peer, float* base, std::uint32_t rows, std::uint32_t stride, std::uint32_t half, std::uint32_t first, int) {
+    for (std::uint32_t r = 0; r < rows; ++r)
+        std::copy_n(peer.data + std::size_t{r} * half, half, base + std::size_t{r} * stride + first);
+}
+}
+namespace xport {
+template<bool, class Product, class Consumer>
+void ds41_exchange_raw_slots_staged(Communicator& c, int, float*, std::size_t bytes, dist::Tag tag, Product product, Consumer consumer) {
+    check(c.prepared && bytes / sizeof(float) == c.tx.size(), "exchange without matching view");
+    check(tag.index == c.exchanges && tag.layer == (0x10000U | 3U), "chunk tag/order mismatch");
+    ++c.exchanges;
+    product();
+    auto peer = c.tx;
+    for (auto& value : peer) value += c.rank == 0 ? 12800.0F : -12800.0F;
+    consumer(Stage{peer.data()});
+    c.prepared = false;
+}
+}
+
+void run_rows(std::uint32_t R, unsigned rank, bool nonmonotonic, bool trace = false, std::size_t capacity = 262144) {
+    constexpr std::uint32_t half = 12800, n = 2 * half;
+    const int st = 0, layer = 3;
+    const bool engram_views = true;
+    Communicator communicator;
+    communicator.nonmonotonic = nonmonotonic;
+    communicator.trace_ = trace;
+    communicator.staged_ready_bytes_ = capacity;
+    communicator.rank = rank;
+    std::vector<float> input(R), output(std::size_t{R} * n, -1.0F);
+    for (std::uint32_t r = 0; r < R; ++r) input[r] = static_cast<float>(r * 32768U);
+    struct Options { unsigned rank; Communicator* communicator; };
+    struct Buffer { float* p; };
+    struct Model { Options options; Buffer ekv; } m{{rank, &communicator}, {output.data()}};
+    ds41::F16RowsView v{input.data(), output.data() + rank * half, R, 1, n, rank * half, half};
+    @BRANCH@
+    const bool fallback = nonmonotonic || trace || capacity < std::size_t{half} * sizeof(float);
+    if (fallback) check(!exchanged && communicator.prepares == 0 && communicator.exchanges == 0, "fallback must precede every view/exchange");
+    else check(exchanged && communicator.exchanges > 0, "host route did not use ready exchange");
+    for (std::uint32_t r = 0; r < R; ++r)
+        for (std::uint32_t j = 0; j < n; ++j) {
+            const bool produced = exchanged || j / half == rank;
+            const float expected = produced ? input[r] + static_cast<float>(j) : -1.0F;
+            check(output[std::size_t{r} * n + j] == expected, "chunk projection/copy offsets or row coverage changed");
+        }
+}
+
+@DIGEST@
+struct Row { std::uint32_t slot; };
+void add(StepTokenDigest& d, const std::vector<Row>& rows, const std::vector<std::uint32_t>& tokens) { @ADD@ }
+int main(int argc, char** argv) try {
+    check(argc == 2, "one case required");
+    const std::string mode = argv[1];
+    if (mode == "tail-route") {
+        for (unsigned rank = 0; rank < 2; ++rank) run_rows(7, rank, true);
+    } else if (mode == "row-coverage") {
+        for (unsigned rank = 0; rank < 2; ++rank)
+            for (std::uint32_t rows = 1; rows <= 16; ++rows) {
+                run_rows(rows, rank, false);
+                run_rows(rows, rank, false, true);
+                run_rows(rows, rank, false, false, 4096);
+            }
+    } else {
+        StepTokenDigest a, b, identical;
+        add(a, {{4}, {4}}, {12, 34});
+        add(identical, {{4}, {4}}, {12, 34});
+        check(a.hash == identical.hash && a.tokens == 2, "digest not deterministic");
+        if (mode == "digest-boundary") { add(b, {{4}}, {12}); add(b, {{4}}, {34}); }
+        else if (mode == "digest-slot") add(b, {{4}, {5}}, {12, 34});
+        else throw std::runtime_error("unknown case");
+        check(a.hash != b.hash && a.tokens == b.tokens, "digest omitted framing/ownership");
+    }
+    return 0;
+} catch (const std::exception& error) { std::fprintf(stderr, "%s\n", error.what()); return 1; }

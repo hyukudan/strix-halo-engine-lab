@@ -99,7 +99,11 @@ private:
     // One batched submission of every missing row's page read (Linux native AIO on the O_DIRECT descriptor), instead of
     // waking the worker threads for a few hundred 4 KiB reads per step. 0: not available, the workers read.
     bool read_batched(std::span<const EngramRowRequest> batch, std::span<const std::size_t> destinations, std::uint8_t* out);
-    unsigned long aio_ = 0;
+    struct AioContext {
+        unsigned long value = 0;
+        ~AioContext() { reset(); }
+        void reset() noexcept;
+    } aio_;
     std::uint8_t* aio_pages_ = nullptr;
     std::size_t aio_capacity_ = 0;
     int fd_ = -1;

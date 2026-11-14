@@ -1,0 +1,189 @@
+#include <algorithm>
+#include <array>
+#include <atomic>
+#include <cerrno>
+#include <condition_variable>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <filesystem>
+#include <memory>
+#include <mutex>
+#include <span>
+#include <stdexcept>
+#include <string>
+#include <utility>
+#include <vector>
+
+void check(bool ok, const char* why) { if (!ok) throw std::runtime_error(why); }
+void require(bool ok, const char* why) { if (!ok) throw std::invalid_argument(why); }
+constexpr std::size_t page_size = 4096, aio_window = 256, engram_row_bytes = 264;
+constexpr int O_RDONLY = 0, O_DIRECT = 1, O_CLOEXEC = 2;
+constexpr int SYS_io_setup = 1, SYS_io_destroy = 2, SYS_io_submit = 3, SYS_io_getevents = 4;
+constexpr unsigned IOCB_CMD_PREAD = 0;
+using aio_context_t = unsigned long;
+struct iocb {
+    std::uint64_t aio_data, aio_buf, aio_nbytes;
+    std::int64_t aio_offset;
+    std::uint32_t aio_fildes, aio_lio_opcode;
+};
+struct io_event { std::uint64_t data; std::int64_t res; };
+struct FakeStat { std::int64_t st_size = 1048576; };
+std::string scenario;
+std::vector<std::uint8_t> fixture(1048576);
+std::vector<iocb> pending;
+int setups = 0, destroys = 0, submits = 0, waits = 0, contexts = 0, closes = 0, positional = 0, created_threads = 0, joined_threads = 0;
+int fake_open(const std::filesystem::path::value_type*, int) { return 9; }
+int fake_fstat(int, FakeStat*) { return 0; }
+void close_fd(int) { ++closes; }
+std::uint8_t* alloc_pages(std::size_t n) { return static_cast<std::uint8_t*>(std::malloc(n)); }
+void free_pages(std::uint8_t* p) { std::free(p); }
+long read_at(int, std::uint8_t* out, std::size_t n, std::uint64_t offset) {
+    ++positional;
+    check(pending.empty(), "positional fallback ran with AIO still outstanding");
+    check(offset + n <= fixture.size(), "read outside fixture");
+    std::memcpy(out, fixture.data() + offset, n);
+    return static_cast<long>(n);
+}
+void finish(const iocb& b) {
+    check(b.aio_offset >= 0 && static_cast<std::uint64_t>(b.aio_offset) + b.aio_nbytes <= fixture.size(), "AIO outside fixture");
+    std::memcpy(reinterpret_cast<void*>(b.aio_buf), fixture.data() + b.aio_offset, static_cast<std::size_t>(b.aio_nbytes));
+}
+long syscall(int op, long, aio_context_t* context) {
+    check(op == SYS_io_setup, "setup opcode");
+    ++setups; ++contexts; *context = 42; return 0;
+}
+long syscall(int op, aio_context_t) {
+    check(op == SYS_io_destroy, "destroy opcode");
+    ++destroys; --contexts;
+    for (const auto& b : pending) finish(b);  // destroy must finish writes before returning
+    pending.clear();
+    errno = EINVAL;  // cleanup must not replace the original exception's errno text
+    return 0;
+}
+long syscall(int op, unsigned long, long count, iocb** blocks) {
+    check(op == SYS_io_submit, "submit opcode");
+    ++submits;
+    check(submits <= 100, "unbounded submit retry");
+    if (scenario == "pressure-empty" ||
+        ((scenario == "pressure-partial" || scenario == "pressure-drained") && submits > 1)) { errno = EAGAIN; return -1; }
+    if (scenario == "zero-submit") return 0;
+    if (scenario == "interrupted") { errno = EINTR; return -1; }
+    if (scenario == "partial-submit" && submits > 1) { errno = ENOMEM; return -1; }
+    long accepted = count;
+    if (scenario == "partial-submit" || scenario == "pressure-partial") accepted = std::min(3L, count);
+    if (scenario == "pressure-drained") accepted = 1;
+    for (long i = 0; i < accepted; ++i) pending.push_back(*blocks[i]);
+    return accepted;
+}
+long syscall(int op, unsigned long, long, long count, io_event* events, std::nullptr_t) {
+    check(op == SYS_io_getevents, "wait opcode");
+    ++waits;
+    if (scenario == "wait-error") { errno = EIO; return -1; }
+    const long n = std::min(count, (scenario == "multi-window" ? 19L : 1L));
+    for (long i = 0; i < n; ++i) {
+        check(!pending.empty(), "wait with no outstanding reads");
+        const auto b = pending.back(); pending.pop_back();  // deliberately out of order
+        finish(b);
+        events[i] = {b.aio_data, scenario == "short-read" && waits == 1 ? -5 : static_cast<std::int64_t>(b.aio_nbytes)};
+    }
+    return n;
+}
+namespace strix {
+struct LoaderCapture { static void record(const std::filesystem::path&, int) {} };
+namespace envcfg { bool flag(const char*, bool fallback) { return fallback; } }
+}
+struct FakeThread {
+    template<class F> explicit FakeThread(F&&) {
+        if (scenario == "thread-failure" && ++created_threads == 2) throw std::runtime_error("thread creation failed");
+    }
+    void join() { ++joined_threads; }
+};
+struct EngramTable { std::uint64_t file_offset, rows; };
+struct EngramRowRequest { std::uint32_t table; std::uint64_t row; };
+class EngramRowReader {
+public:
+    EngramRowReader(const std::filesystem::path&, std::vector<EngramTable>, unsigned, bool, std::uint64_t);
+    ~EngramRowReader() {
+        if (@AIO_VALUE@) { syscall(SYS_io_destroy, @AIO_VALUE@); @AIO_VALUE@ = 0; }
+        free_pages(aio_pages_);
+    }
+    void worker() {}
+    void read_one(const EngramRowRequest&, std::uint8_t*, std::uint8_t*);
+    bool read_batched(std::span<const EngramRowRequest>, std::span<const std::size_t>, std::uint8_t*);
+    @AIO_MEMBER@
+    std::uint8_t* aio_pages_ = nullptr;
+    std::size_t aio_capacity_ = 0;
+    int fd_ = -1;
+    bool direct_ = false;
+    std::uint64_t file_bytes_ = 0;
+    std::vector<EngramTable> tables_;
+    std::vector<FakeThread> threads_;
+    struct PayloadCache { explicit PayloadCache(std::uint64_t) {} std::vector<int> entries; };
+    std::unique_ptr<PayloadCache> cache_;
+    std::mutex mutex_;
+    std::condition_variable wake_;
+    bool stop_ = false;
+    std::atomic<std::uint64_t> page_reads_{0}, page_bytes_{0};
+};
+@CTOR@
+@ONE@
+@BATCH@
+
+int main(int argc, char** argv) try {
+    check(argc == 2, "one case required");
+    scenario = argv[1];
+    for (std::size_t i = 0; i < fixture.size(); ++i) fixture[i] = static_cast<std::uint8_t>((i * 17 + i / 257) & 255U);
+    if (scenario == "invalid-zero" || scenario == "invalid-range" || scenario == "thread-failure") {
+        bool rejected = false;
+        try {
+            const EngramTable table = scenario == "invalid-zero" ? EngramTable{0, 0} :
+                scenario == "invalid-range" ? EngramTable{fixture.size() - 8, 1} : EngramTable{4016, 1000};
+            EngramRowReader reader("fixture", {table}, 2, true, 0);
+        } catch (const std::exception&) { rejected = true; }
+        check(rejected, "constructor must reject");
+        check(contexts == 0 && closes == 1, "failed constructor leaked resources");
+        if (scenario == "thread-failure") check(setups == 1 && destroys == 1 && joined_threads == 1, "constructor unwind did not join/retire");
+        else check(setups == 0, "invalid metadata allocated an AIO context");
+        return 0;
+    }
+    EngramRowReader reader("fixture", {{4016, 1000}}, 1, true, 0);
+    const std::size_t count = scenario == "multi-window" ? 600 : 8;
+    std::vector<EngramRowRequest> requests;
+    std::vector<std::size_t> destinations;
+    for (std::size_t i = 0; i < count; ++i) { requests.push_back({0, i}); destinations.push_back(count - 1 - i); }
+    std::vector<std::uint8_t> output(count * engram_row_bytes);
+    bool fallback = false;
+    if (scenario == "partial-submit" || scenario == "wait-error") {
+        bool caught = false;
+        try { (void)reader.read_batched(requests, destinations, output.data()); }
+        catch (const std::runtime_error& error) {
+            const int expected = scenario == "partial-submit" ? ENOMEM : EIO;
+            caught = std::string(error.what()).find(std::strerror(expected)) != std::string::npos;
+        }
+        check(caught, "original read error was not preserved");
+        check(pending.empty() && contexts == 0 && destroys == 1, "exception retained pending AIO");
+        fallback = !reader.read_batched(requests, destinations, output.data());
+        check(fallback, "failed context reused by next read");
+    } else {
+        fallback = !reader.read_batched(requests, destinations, output.data());
+        if (scenario == "multi-window" || scenario == "short-read") {
+            check(!fallback && setups == 1 && waits > 0, "test silently fell back instead of exercising AIO");
+            if (scenario == "multi-window") check(submits >= 3 && positional == 0, "did not cross AIO windows");
+            else check(positional == 1, "short completion did not use positional read");
+        } else {
+            check(fallback && pending.empty() && contexts == 0 && destroys == 1, "pressure must retire AIO and use fallback");
+            check(submits <= 3, "pressure retry not bounded");
+        }
+    }
+    if (fallback) {
+        std::array<std::uint8_t, page_size * 2> page{};
+        for (std::size_t i = 0; i < count; ++i) reader.read_one(requests[i], output.data() + destinations[i] * engram_row_bytes, page.data());
+    }
+    check(pending.empty(), "outstanding writes at return");
+    for (std::size_t i = 0; i < count; ++i)
+        check(std::memcmp(output.data() + destinations[i] * engram_row_bytes, fixture.data() + 4016 + i * engram_row_bytes, engram_row_bytes) == 0,
+              "row bytes or destination order changed");
+    return 0;
+} catch (const std::exception& error) { std::fprintf(stderr, "%s\n", error.what()); return 1; }

@@ -286,6 +286,20 @@ public:
     [[nodiscard]] ProducerStage prepare_staged_ready(hipStream_t stream, std::size_t bytes);
     // The largest payload one ready view takes (0: no ready views); callers split larger exchanges into chunks.
     [[nodiscard]] std::size_t staged_ready_capacity() const noexcept { return staged_ready_bytes_ < max_bytes_ ? staged_ready_bytes_ : max_bytes_; }
+    // Plan equal row chunks without preparing a view. Admission is size-dependent: check both
+    // the full chunk and its tail before any producer work or exchange; zero means ordinary exchange.
+    [[nodiscard]] std::uint32_t staged_ready_chunk_rows(std::uint32_t rows, std::size_t row_bytes) const {
+        if (!rows || !row_bytes || trace_) return 0;
+        const auto capacity = staged_ready_capacity() / row_bytes;
+        if (!capacity) return 0;
+        const auto limit = capacity < rows ? static_cast<std::uint32_t>(capacity) : rows;
+        const auto chunks = 1U + (rows - 1U) / limit;
+        const auto chunk = 1U + (rows - 1U) / chunks;
+        const auto tail = rows % chunk;
+        if (direct_ && (route(std::size_t{chunk} * row_bytes).direct ||
+                       (tail && route(std::size_t{tail} * row_bytes).direct))) return 0;
+        return chunk;
+    }
     void start_staged_ready(hipStream_t stream, std::size_t bytes, const Tag& tag);
     [[nodiscard]] ConsumerStage finish_staged_ready();
     void release_staged_ready(hipStream_t stream);

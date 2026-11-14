@@ -2159,11 +2159,9 @@ const std::vector<std::uint32_t>& BatchForward::run_step(std::span<const BatchRo
                 // fit one view. Each chunk's product runs while the chunk before it is on the wire; no device copies or events.
                 // Same per-row products, plain copies: the same bits.
                 static const bool engram_views = strix::envcfg::flag("STRIX_DS41_ENGRAM_READY", true);
-                const std::size_t ready_cap = engram_views ? m.options.communicator->staged_ready_capacity() : 0U;
+                const std::uint32_t ready_chunk = engram_views ? m.options.communicator->staged_ready_chunk_rows(R, std::size_t{half} * 4U) : 0U;
                 bool exchanged = false;
-                if (std::uint32_t chunk = static_cast<std::uint32_t>(std::min<std::size_t>(R, ready_cap / (std::size_t{half} * 4U))); chunk != 0U) {
-                    const std::uint32_t chunks = (R + chunk - 1U) / chunk;
-                    chunk = (R + chunks - 1U) / chunks;  // even chunks
+                if (const std::uint32_t chunk = ready_chunk; chunk != 0U) {
                     const std::uint32_t other = (1U - m.options.rank) * half;
                     const auto product = [&](std::uint32_t r0, std::uint32_t rn) {
                         ds41::F16RowsView part = v;
@@ -2178,7 +2176,7 @@ const std::vector<std::uint32_t>& BatchForward::run_step(std::span<const BatchRo
                         const std::uint32_t rn = std::min(chunk, R - r0);
                         const std::size_t bytes = std::size_t{rn} * half * 4U;
                         const auto stage = m.options.communicator->prepare_staged_ready(st, bytes);
-                        if (!stage.data) {  // views refused (trace / direct route): the same answer for every chunk
+                        if (!stage.data) {  // size admission was checked for the full chunk AND tail before starting
                             if (r0 != 0U) throw std::logic_error("deepseek41 batch forward: engram ready view refused mid exchange");
                             exchanged = false;
                             if (R > chunk) product(chunk, R - chunk);  // the exchange below takes all the rows

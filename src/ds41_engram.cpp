@@ -271,18 +271,36 @@ EngramRowReader::EngramRowReader(const std::filesystem::path& file, std::vector<
     if (::fstat(fd_, &st) != 0) { close_fd(fd_); throw std::runtime_error("Engram reader cannot stat the model file"); }
 #endif
     file_bytes_ = static_cast<std::uint64_t>(st.st_size);
-#if defined(__linux__)
-    if (direct_ && strix::envcfg::flag("STRIX_DS41_ENGRAM_AIO", true)) {
-        aio_context_t context = 0;
-        if (::syscall(SYS_io_setup, static_cast<long>(aio_window), &context) == 0) aio_ = static_cast<unsigned long>(context);
-    }
-#endif
     for (const auto& t : tables_)
         if (t.rows == 0 || t.file_offset > file_bytes_ || t.rows > (file_bytes_ - t.file_offset) / engram_row_bytes) {
             close_fd(fd_);
             throw std::invalid_argument("Engram table lies outside the model file");
         }
-    for (unsigned i = 0; i < threads; ++i) threads_.emplace_back([this] { worker(); });
+#if defined(__linux__)
+    if (direct_ && strix::envcfg::flag("STRIX_DS41_ENGRAM_AIO", true)) {
+        aio_context_t context = 0;
+        if (::syscall(SYS_io_setup, static_cast<long>(aio_window), &context) == 0) aio_.value = static_cast<unsigned long>(context);
+    }
+#endif
+    try {
+        for (unsigned i = 0; i < threads; ++i) threads_.emplace_back([this] { worker(); });
+    } catch (...) {
+        { std::lock_guard<std::mutex> lock(mutex_); stop_ = true; }
+        wake_.notify_all();
+        for (auto& t : threads_) t.join();
+        close_fd(fd_);
+        throw;  // the context member retires even when construction fails
+    }
+}
+
+void EngramRowReader::AioContext::reset() noexcept {
+#if defined(__linux__)
+    // io_destroy cancels or waits for every accepted read before its buffers can be reused.
+    if (value != 0) {
+        while (::syscall(SYS_io_destroy, static_cast<aio_context_t>(value)) < 0 && errno == EINTR) {}
+        value = 0;
+    }
+#endif
 }
 
 EngramRowReader::~EngramRowReader() {
@@ -302,9 +320,7 @@ EngramRowReader::~EngramRowReader() {
                      static_cast<unsigned long long>(s.cache_capacity), static_cast<unsigned long long>(s.cache_entries),
                      static_cast<unsigned long long>(s.cache_storage_bytes), static_cast<unsigned long long>(s.cache_evictions));
     }
-#if defined(__linux__)
-    if (aio_ != 0) ::syscall(SYS_io_destroy, static_cast<aio_context_t>(aio_));
-#endif
+    aio_.reset();
     if (aio_pages_) free_pages(aio_pages_);
     if (fd_ >= 0) close_fd(fd_);
 }
@@ -340,8 +356,8 @@ void EngramRowReader::read_one(const EngramRowRequest& r, std::uint8_t* out, std
 
 #if defined(__linux__)
 // STRIX_DS41_ENGRAM_AIO (default on, =0 off): the same pages, the same bytes; only how the reads are issued.
-bool EngramRowReader::read_batched(std::span<const EngramRowRequest> batch, std::span<const std::size_t> destinations, std::uint8_t* out) {
-    if (aio_ == 0 || !direct_) return false;
+bool EngramRowReader::read_batched(std::span<const EngramRowRequest> batch, std::span<const std::size_t> destinations, std::uint8_t* out) try {
+    if (aio_.value == 0 || !direct_) return false;
     const std::size_t slot = 2 * page_size;
     if (aio_capacity_ < std::min(batch.size(), aio_window)) {
         if (aio_pages_) free_pages(aio_pages_);
@@ -371,25 +387,31 @@ bool EngramRowReader::read_batched(std::span<const EngramRowRequest> batch, std:
             list[i] = &b;
         }
         std::size_t submitted = 0, completed = 0;
+        unsigned interrupted = 0;
         std::array<bool, aio_window> ok{};
         while (completed < n) {
             if (submitted < n) {
-                const long got = ::syscall(SYS_io_submit, aio_, static_cast<long>(n - submitted), list.data() + submitted);
+                const long got = ::syscall(SYS_io_submit, aio_.value, static_cast<long>(n - submitted), list.data() + submitted);
                 if (got > 0) submitted += static_cast<std::size_t>(got);
+                else if (got == 0 || errno == EAGAIN || (errno == EINTR && ++interrupted >= 3U)) {
+                    aio_.reset();  // resource pressure: retire accepted reads, then let the workers read the batch
+                    return false;
+                }
                 else if (got < 0 && errno != EAGAIN && errno != EINTR) {
-                    if (submitted == 0 && base == 0) return false;  // not supported here: the workers read this batch
+                    if (submitted == 0 && base == 0) { aio_.reset(); return false; }
                     throw std::runtime_error("Engram batched read: submit failed: " + std::string(std::strerror(errno)));
                 }
             }
             if (submitted == completed) continue;
-            const long got = ::syscall(SYS_io_getevents, aio_, 1L, static_cast<long>(submitted - completed), events.data(), nullptr);
+            const long got = ::syscall(SYS_io_getevents, aio_.value, 1L, static_cast<long>(submitted - completed), events.data(), nullptr);
             if (got < 0) {
                 if (errno == EINTR) continue;
                 throw std::runtime_error("Engram batched read: wait failed: " + std::string(std::strerror(errno)));
             }
             for (long e = 0; e < got; ++e) {
                 const std::size_t i = static_cast<std::size_t>(events[static_cast<std::size_t>(e)].data);
-                ok[i] = i < n && events[static_cast<std::size_t>(e)].res == static_cast<std::int64_t>(blocks[i].aio_nbytes);
+                if (i >= n) throw std::runtime_error("Engram batched read: invalid completion index");
+                ok[i] = events[static_cast<std::size_t>(e)].res == static_cast<std::int64_t>(blocks[i].aio_nbytes);
             }
             completed += static_cast<std::size_t>(got);
         }
@@ -407,6 +429,9 @@ bool EngramRowReader::read_batched(std::span<const EngramRowRequest> batch, std:
         }
     }
     return true;
+} catch (...) {
+    aio_.reset();  // preserve the original exception; no old completion or write may reach the next read
+    throw;
 }
 #else
 bool EngramRowReader::read_batched(std::span<const EngramRowRequest>, std::span<const std::size_t>, std::uint8_t*) { return false; }

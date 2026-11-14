@@ -1132,14 +1132,20 @@ void warm_up(const Args& a, BatchForward& fwd, SlotPrefill* prefill, const strix
 }
 
 // Plans created after READY (misses of the warm-up; all of them when it is off).
-// Digest of every decode step's token ids as THIS rank computed them (FNV-1a over the ids, step order). Both ranks
-// print it when they stop: equal values = identical token ids on the two ranks, without a token log.
+// Diagnostic FNV-1a digest of this rank's decode steps, framed by row count and slot ownership.
+// Equal hashes are not proof of token equality (collisions), logits or state equality.
 struct StepTokenDigest {
     std::uint64_t hash = 0xcbf29ce484222325ULL, tokens = 0;
-    template <typename Tokens>
-    void add(const Tokens& step) {
-        for (const std::uint32_t id : step) {
-            for (unsigned b = 0; b < 32U; b += 8U) hash = (hash ^ ((id >> b) & 0xFFU)) * 0x100000001b3ULL;
+    template <typename Rows, typename Tokens>
+    void add(const Rows& rows, const Tokens& step) {
+        if (rows.size() != step.size()) throw std::logic_error("step token digest: row count mismatch");
+        const auto word = [&](std::uint64_t value) {
+            for (unsigned b = 0; b < 64U; b += 8U) hash = (hash ^ ((value >> b) & 0xFFU)) * 0x100000001b3ULL;
+        };
+        word(step.size());
+        for (std::size_t i = 0; i < step.size(); ++i) {
+            word(rows[i].slot);
+            word(step[i]);
             ++tokens;
         }
     }
@@ -1539,7 +1545,7 @@ void follow(const Args& initial, BatchForward& fwd, Watchdog& dog, const Prefill
         const auto rows = std::span<const BatchRow>(step_rows.data(), c.rows);
         if (spec) spec->follow_lookup_windows(c.pend);  // for follow_stage of these rows (after this step)
         const auto& tokens = stage ? stage->step(rows) : fwd.step(rows);
-        g_step_tokens.add(tokens);
+        g_step_tokens.add(rows, tokens);
         g_step_profile.add(fwd.last_stats());
         last_rows.assign(rows.begin(), rows.end());
         spec_rows = last_rows;
@@ -2788,7 +2794,7 @@ void lead(const Args& initial, BatchForward& fwd, strix::dist::Communicator& com
         prof.control += std::chrono::duration<double>(t0 - t_planned).count();
         if (stage && !pre) stage->submit(plan.rows);
         const auto& tokens = stage ? stage->step(plan.rows) : fwd.step(plan.rows);
-        g_step_tokens.add(tokens);
+        g_step_tokens.add(plan.rows, tokens);
         g_step_profile.add(fwd.last_stats());
         dog.progress();
         last_round = Clock::now();
