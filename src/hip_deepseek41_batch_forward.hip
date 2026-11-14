@@ -622,7 +622,7 @@ struct BatchForward::Impl {
     // STRIX_DS41_ENGRAM_FROM_LEAD (default on, =0 off): on the pair only rank 0 reads the Engram rows from storage and
     // sends each layer's rows to rank 1 in an exchange as soon as it has them (one read of the same file instead of two;
     // rank 1 no longer waits for its own storage). The other direction of the exchange carries nothing that is used.
-    // (it is sent from / received into half_other, which is free between two layers' combines and larger than a layer's rows).
+    // half_other is free between combines; startup agreement checks the complete payload fits on both ranks.
     bool engram_from_lead = false;
     Dev<float> half_own, half_other;  // [R x H half sum][R x H/2 split shared down rows]
     Dev<std::uint8_t> shx_own, shx_other;  // split shared expert: A8 activation halves [codes R x I/2][deltas]
@@ -1204,14 +1204,11 @@ BatchForward::BatchForward(const std::filesystem::path& gguf, const BatchForward
         }
     }
     // also STRIX_DS41_BATCH_ENGRAM_ASYNC=1 (ds41/batch-perf cd5e640, the same per-layer reads on a host thread)
-    m.engram_async = [] {
-        const char* v = std::getenv("STRIX_DS41_ENGRAM_ASYNC");
-        const char* b = std::getenv("STRIX_DS41_BATCH_ENGRAM_ASYNC");
-        return !((v && *v == '0') || (b && *b == '0'));
-    }();
+    const bool engram_async = strix::envcfg::flag("STRIX_DS41_ENGRAM_ASYNC", true);
+    const bool batch_engram_async = strix::envcfg::flag("STRIX_DS41_BATCH_ENGRAM_ASYNC", true);
+    m.engram_async = engram_async && batch_engram_async;
     // P13 defaults (after P12): HC_SITE, QA_KV, ENGRAM_ASYNC and COMPRESS_RING on, =0 turns each off.
     m.compress_ring = strix::envcfg::flag("STRIX_DS41_COMPRESS_RING", true);
-    m.engram_from_lead = options.world == 2U && options.communicator != nullptr && strix::envcfg::flag("STRIX_DS41_ENGRAM_FROM_LEAD", true);
     m.never = Dev<std::uint32_t>(1);
     {
         const std::size_t n = W * K + 1U;
@@ -1248,6 +1245,15 @@ BatchForward::BatchForward(const std::filesystem::path& gguf, const BatchForward
         m.trellis_device != trellis_bytes_for(m.model, m.plan, options).total())
         throw std::logic_error("deepseek41 batch forward: footprint() disagrees with the allocations");
     m.control = Dev<std::uint8_t>(2U * control_bytes);
+    if (m.distributed()) {
+        const bool requested = strix::envcfg::flag("STRIX_DS41_ENGRAM_FROM_LEAD", true);
+        // Use the maximum admitted step, independent of projection TP admission.
+        // No new workspace: if either scratch/transport is too small, both read locally.
+        m.engram_from_lead = options.communicator->agree_exchange(
+            requested && m.engram_async && m.engram_reader != nullptr,
+            W * m.model.engram.rows_per_token() * 264U, m.half_other.bytes(),
+            dist::Tag{static_cast<std::uint32_t>(dist::TagKind::control), 0x6567726dU, 0U});
+    }
     load_seconds_ = seconds_since(t_load);
 }
 
@@ -2172,11 +2178,9 @@ const std::vector<std::uint32_t>& BatchForward::run_step(std::span<const BatchRo
                 // fit one view. Each chunk's product runs while the chunk before it is on the wire; no device copies or events.
                 // Same per-row products, plain copies: the same bits.
                 static const bool engram_views = strix::envcfg::flag("STRIX_DS41_ENGRAM_READY", true);
-                const std::size_t ready_cap = engram_views ? m.options.communicator->staged_ready_capacity() : 0U;
+                const std::uint32_t chunk = engram_views ? m.options.communicator->staged_ready_chunk_rows(R, std::size_t{half} * 4U) : 0U;
                 bool exchanged = false;
-                if (std::uint32_t chunk = static_cast<std::uint32_t>(std::min<std::size_t>(R, ready_cap / (std::size_t{half} * 4U))); chunk != 0U) {
-                    const std::uint32_t chunks = (R + chunk - 1U) / chunk;
-                    chunk = (R + chunks - 1U) / chunks;  // even chunks
+                if (chunk != 0U) {
                     const std::uint32_t other = (1U - m.options.rank) * half;
                     const auto product = [&](std::uint32_t r0, std::uint32_t rn) {
                         ds41::F16RowsView part = v;
@@ -2191,10 +2195,9 @@ const std::vector<std::uint32_t>& BatchForward::run_step(std::span<const BatchRo
                         const std::uint32_t rn = std::min(chunk, R - r0);
                         const std::size_t bytes = std::size_t{rn} * half * 4U;
                         const auto stage = m.options.communicator->prepare_staged_ready(st, bytes);
-                        if (!stage.data) {  // views refused (trace / direct route): the same answer for every chunk
-                            if (r0 != 0U) throw std::logic_error("deepseek41 batch forward: engram ready view refused mid exchange");
+                        if (!stage.data) {  // retain the full-payload fallback even after a completed chunk
                             exchanged = false;
-                            if (R > chunk) product(chunk, R - chunk);  // the exchange below takes all the rows
+                            if (r0 + rn < R) product(r0 + rn, R - r0 - rn);
                             break;
                         }
                         ready_detail::gather_publish(m.ekv.p + std::size_t{r0} * n, rn, n, half, v.first, stage, st);

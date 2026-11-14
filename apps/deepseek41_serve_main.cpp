@@ -1180,7 +1180,6 @@ struct StepProfile {
         }
     }
 };
-StepProfile g_step_profile;
 
 // Plans created after READY (misses of the warm-up; all of them when it is off).
 std::string plans_since_ready() {
@@ -1300,7 +1299,7 @@ using PrefillFactory = std::function<std::unique_ptr<SlotPrefill>(std::uint32_t&
 
 // ---- rank 1: no API; runs what rank 0 sends ----
 void follow(const Args& initial, BatchForward& fwd, Watchdog& dog, const PrefillFactory& make_prefill, strix::ds41::hetero::Stage* stage,
-            StepTokenDigest& step_tokens) {
+            StepTokenDigest& step_tokens, StepProfile& step_profile) {
     control_round = 0;
     Args a = initial;
     const auto mine = hello(a);
@@ -1541,7 +1540,7 @@ void follow(const Args& initial, BatchForward& fwd, Watchdog& dog, const Prefill
         if (spec) spec->follow_lookup_windows(c.pend);  // for follow_stage of these rows (after this step)
         const auto& tokens = stage ? stage->step(rows) : fwd.step(rows);
         step_tokens.add(tokens);
-        g_step_profile.add(fwd.last_stats());
+        step_profile.add(fwd.last_stats());
         last_rows.assign(rows.begin(), rows.end());
         spec_rows = last_rows;
         last_tokens = tokens;
@@ -1839,7 +1838,7 @@ void frames_import_session(const Args& a, ServeState& state, ImportBox& box, str
 }
 
 void lead(const Args& initial, BatchForward& fwd, strix::dist::Communicator& comm, Watchdog& dog, const PrefillFactory& make_prefill, strix::ds41::hetero::Stage* stage,
-          StepTokenDigest& step_tokens) {
+          StepTokenDigest& step_tokens, StepProfile& step_profile) {
     control_round = 0;
     Args a = initial;
     const auto mine = hello(a);
@@ -2791,7 +2790,7 @@ void lead(const Args& initial, BatchForward& fwd, strix::dist::Communicator& com
         if (stage && !pre) stage->submit(plan.rows);
         const auto& tokens = stage ? stage->step(plan.rows) : fwd.step(plan.rows);
         step_tokens.add(tokens);
-        g_step_profile.add(fwd.last_stats());
+        step_profile.add(fwd.last_stats());
         dog.progress();
         last_round = Clock::now();
         hetero_step_seconds = std::chrono::duration<double>(last_round - t0).count();
@@ -3535,13 +3534,14 @@ void run_rank(Args a, std::uint32_t rank, std::unique_ptr<strix::dist::Transport
         dog.pause(false);
     }
     StepTokenDigest step_tokens;
-    if (rank == 0U) lead(a, fwd, comm, dog, make_prefill, stage.get(), step_tokens);
-    else follow(a, fwd, dog, make_prefill, stage.get(), step_tokens);
+    StepProfile step_profile;
+    if (rank == 0U) lead(a, fwd, comm, dog, make_prefill, stage.get(), step_tokens, step_profile);
+    else follow(a, fwd, dog, make_prefill, stage.get(), step_tokens, step_profile);
     if (stage) stage->close();
     std::fprintf(stderr, "rank %u: %s\n", rank, plans_since_ready().c_str());
     std::fprintf(stderr, "rank %u: step tokens %llu digest %016llx\n", rank, static_cast<unsigned long long>(step_tokens.tokens),
                  static_cast<unsigned long long>(step_tokens.hash));
-    g_step_profile.print(rank);
+    step_profile.print(rank);
     serve::Json stopped = serve::Json::object();
     stopped.set("event", serve::Json("STOPPED"));
     stopped.set("rank", serve::Json(static_cast<std::uint64_t>(rank)));

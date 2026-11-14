@@ -227,6 +227,7 @@ void actual_lead(Args a,const Prepare& prepare) {
     double hetero_step_seconds=0;
     // Rank checksum reporting is outside this host control fixture.
     struct StepTokenDigest { void add(std::span<const std::uint32_t>) {} } step_tokens;
+    struct StepProfile { void add(const strix::deepseek41::BatchStepStats&) {} } step_profile;
     const auto sched=strix::deepseek41::sched::options_from_env(a.device_prefill);
     serve::GenerationQueue queue(a.max_queue);
     witness::queue=&queue;
