@@ -188,10 +188,27 @@ inline constexpr unsigned prefill_organization_items = bit(Item::pipe) | bit(Ite
     bit(Item::score_park) | bit(Item::norm_group) | bit(Item::index_rows) | bit(Item::score_rows) |
     bit(Item::ple_batch) | bit(Item::shared_pre) | bit(Item::moe_mc) | bit(Item::moe_hdr) | bit(Item::moe_xor64) |
     bit(Item::dense_rows) | bit(Item::hc_lowband);
-// The resident owner takes the complete row-pipeline value of the single-request cursor. With bits 2|16 only, the
+// The resident owner takes the current row-pipeline bits of the single-request cursor. With bits 2|16 only, the
 // per-block binding/scope validation (bit 8) and the per-row view lookups (bit 128) ran on the host inside the block
 // and the device waited for them: 0.4 s of an 8,192-row block, measured on both entry points with the same mask.
-inline constexpr unsigned serving_pipe_mask = ~0U;
+// Future bits require serving lifecycle/cancellation/capacity/concurrency qualification.
+inline constexpr unsigned serving_pipe_mask = 0xffU;
+
+enum class PrefillConstruction { startup, on_demand };
+
+// Only pre-listen construction may eagerly admit the full tile. Lazy slots keep
+// request-time admission, including partial/tail geometry. Admission may poison
+// its owner on failure: propagate before the caller publishes the slot.
+template<class Owner, class Session, class Handoff>
+bool prepare_first_block_admission(bool early_setup, PrefillConstruction construction,
+    Owner& owner, const Session& live, Handoff&& hand_off) {
+    if (!early_setup || construction == PrefillConstruction::on_demand || live.next_position != 0)
+        return false;
+    auto setup_session = live;
+    hand_off(setup_session);
+    owner.prepare_prefill_geometry(setup_session);
+    return true;
+}
 enum class PrefillOwner : unsigned { single_request, resident_server };
 struct Organization {
     unsigned items = 0U;      // defaults this owner may take

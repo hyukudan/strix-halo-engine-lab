@@ -1131,15 +1131,6 @@ std::uint32_t prefix_cache_unit(const O& options) {
 // Whether the route owning a prefix-state namespace can execute STRIX_QPF2K_SCHED bit 2. The MTP bridge (CLI --mtp,
 // HTTP, cohorts) never defers; the CLI cursor drops a defaulted bit 2 under a prefix-state cache, but a session/RTX
 // registry without one defers, so a registry keeps the conservative answer (a miss, never a shared key).
-// Immutable first-block admission of a tiled prompt owner (plan and launcher preflight on a copy of the session;
-// no prompt is read and no kernel is launched). The single-request route and every resident slot run it at startup,
-// so neither pays it inside a request.
-template<class Session, class Handoff>
-static void prepare_first_block_admission(strix::HipKnownPrefixWindow& owner, const Session& live, Handoff&& hand_off) {
-    auto setup_session = live;
-    hand_off(setup_session);
-    owner.prepare_prefill_geometry(setup_session);
-}
 static bool prefix_namespace_sched_defers(const strix::decode_cli::Options& options, bool rtx_state_registry) {
     if (options.mtp.enabled || options.http_serve) return false;
     return strix::qpf2k::cli_sched_defers(!rtx_state_registry);
@@ -4351,7 +4342,7 @@ static int run_decode_entry(
         // prefill arenas (one prompt runs at a time), backends bound to its session, its own cache view. Under
         // a split prefill profile the owners run the sibling prefill execution with the prefill launcher
         // configuration over this slot's resources, and each backend hands this slot's session to it and back.
-        const auto add_tiled = [&](CohortStack& stack) {
+        const auto add_tiled = [&](CohortStack& stack, strix::qpf2k::PrefillConstruction construction) {
             if (!known_prefill_plan || !known_prefix_memory)
                 throw std::logic_error("batched MTP requests need the tiled prefill");
             const auto workspace = [&](const std::shared_ptr<KnownPromptMemory>& arena) {
@@ -4376,22 +4367,20 @@ static int run_decode_entry(
             stack.blocks = std::make_unique<strix::HipKnownPromptBackend>(stack.block_owner, stack.session,
                 known_prefix_memory->scratch, model.vocab_size, original_work_device);
             hand_off(*stack.blocks);
-            // The same startup admission as the single-request route (same resolved switch): a resident slot's first
-            // T block finds its plan and launcher preflight done. A refusal leaves the work to the first request.
-            if (options.early_setup && stack.session.next_position == 0) {
+            // A failed admission poisons the owner: unwind before publishing this slot.
+            // On-demand slots retain execution-time admission of the geometry actually used.
+            {
                 const auto setup_start = std::chrono::steady_clock::now();
-                try {
-                    prepare_first_block_admission(*stack.block_owner, stack.session, [&](auto& setup_session) {
+                if (strix::qpf2k::prepare_first_block_admission(options.early_setup, construction,
+                    *stack.block_owner, stack.session, [&](auto& setup_session) {
                         if (compiled_prefill)
                             strix::hand_off_serial_session(setup_session, {&compiled, &stack.parents->resources},
                                 {&*compiled_prefill, &stack.prefill_resources});
-                    });
+                    })) {
                     static const bool setup_timing = strix::envcfg::flag("STRIX_PREFILL_TIMING", false);
                     if (setup_timing)
                         std::fprintf(stderr, "prefill startup static-setup %.2f ms (resident slot, outside any request)\n",
                             std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - setup_start).count());
-                } catch (const std::exception& error) {
-                    std::fprintf(stderr, "resident slot startup admission left to the first request: %s\n", error.what());
                 }
             }
             for (std::size_t t = 0; t < known_tail_plans.size(); ++t) {
@@ -4538,7 +4527,7 @@ static int run_decode_entry(
             if (single_route) capacity.slots=1;
             if (capacity.slots >= 2U) {
                 auto probe = make_stack();
-                add_tiled(*probe);
+                add_tiled(*probe, strix::qpf2k::PrefillConstruction::startup);
                 check_hip(hipDeviceSynchronize(), "HTTP slot measurement fence");
                 const auto after = observe();
                 const auto delta = [](std::optional<std::uint64_t> a, std::optional<std::uint64_t> b) {
@@ -4808,12 +4797,12 @@ static int run_decode_entry(
         }
         if (batch_slots) {
             batch_stream = std::make_shared<const SharedWindowStream>();
-            const auto build_slot = [&, batch_stream]() -> strix::decode_cli::MtpBatchSlotSetup {
+            const auto build_slot = [&, batch_stream](strix::qpf2k::PrefillConstruction construction) -> strix::decode_cli::MtpBatchSlotSetup {
                 const auto slot = batch_stacks.size() + 1U;
                 const auto built = std::chrono::steady_clock::now();
                 auto stack = make_stack();
                 const auto stacked = std::chrono::steady_clock::now();
-                add_tiled(*stack);
+                add_tiled(*stack, construction);
                 batch_stacks.push_back(std::move(stack));
                 // STRIX_HTTP_SLOT_TIMING=1: setup time of every extra slot (stack, tiled owners).
                 static const bool timing = strix::envcfg::flag("STRIX_HTTP_SLOT_TIMING", false);
@@ -4827,10 +4816,13 @@ static int run_decode_entry(
             for (const auto& stack : batch_stacks)
                 parents->batch_slots.push_back({stack->parents, &stack->session, &*stack->dispatcher,
                     window_factory_for(stack->parents, batch_stream)});
-            while (batch_stacks.size() + 1U < eager_slots) parents->batch_slots.push_back(build_slot());
+            while (batch_stacks.size() + 1U < eager_slots)
+                parents->batch_slots.push_back(build_slot(strix::qpf2k::PrefillConstruction::startup));
             parents->batch_capacity = batch_slots;
             parents->batch_memory_ok = batch_memory_ok;
-            parents->grow_batch_slot = build_slot;
+            parents->grow_batch_slot = [build_slot] {
+                return build_slot(strix::qpf2k::PrefillConstruction::on_demand);
+            };
             parents->serve_batch = options.http_serve
                 ? strix::decode_cli::make_http_batch_serve(options, "native MTP batched decode (" + std::to_string(batch_slots) +
                     " slots), profile " + std::string(optimization_profile.selected) + ", context " + std::to_string(options.context_tokens),
@@ -6073,7 +6065,8 @@ static int run_decode_entry(
             const auto setup_start=std::chrono::steady_clock::now();
             // Use the existing sibling handoff on a copy; the live decode session and
             // persistent state stay at their original frontier until the real block.
-            prepare_first_block_admission(*known_prefix_owner,session,[&](auto& setup_session) {
+            strix::qpf2k::prepare_first_block_admission(true, strix::qpf2k::PrefillConstruction::startup,
+                *known_prefix_owner,session,[&](auto& setup_session) {
                 if(compiled_prefill)
                     strix::hand_off_serial_session(setup_session,{&compiled,&resources},{&*compiled_prefill,&prefill_resources});
             });
