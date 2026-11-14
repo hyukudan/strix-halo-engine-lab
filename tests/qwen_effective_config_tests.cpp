@@ -3259,10 +3259,10 @@ void prefill_identity_plumbing_tests() {
         (bundled.options.prefill_disabled & prefill_option_bit(PrefillOption::hc_output_wmma)),
         "automatic YaRN MTP bundle retains its qualified prefill arithmetic");
     for (const char* name : {"STRIX_PREFILL_PLE_ROWS_F16", "STRIX_PREFILL_GDN_GATES_F16"}) {
-        for (const bool disabled : {false, true}) {
+        for (const bool chunk_off : {false, true}) {
             auto requested = plain_options;
-            Environment env{{name, "1"}, {"STRIX_QPF2K_GDN_FP16_CHUNK", disabled ? "3" : "0"}};
-            if (disabled) requested.prefill_disabled = prefill_option_bit(PrefillOption::gdn_fp16_chunk);
+            Environment env{{name, "1"}, {"STRIX_QPF2K_GDN_FP16_CHUNK", chunk_off ? "3" : "0"}};
+            if (chunk_off) requested.prefill_disabled = prefill_option_bit(PrefillOption::gdn_fp16_chunk);
             const auto inspected = resolved(requested, env);
             expect(!(inspected.prefill_option_mask & (prefill_option_bit(PrefillOption::gdn_fp16_chunk) |
                 prefill_option_bit(PrefillOption::gdn_gates_f16) | kPrefillGdnChunkRev3)),
