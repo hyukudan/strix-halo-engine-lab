@@ -1558,6 +1558,10 @@ void DevicePrefill::set_precision_for_new_sequence(bool dense,bool attention) {
     impl_->options.fp16_dense=dense;impl_->options.bf16_attention=attention;impl_->broken=true;
 }
 
+void DevicePrefill::set_cone(bool on) {
+    if (impl_->task) throw std::logic_error("cannot change the cone during a prefill task");
+    impl_->options.cone = on;
+}
 void DevicePrefill::set_dense_select(bool on) {
     if (impl_->task) throw std::logic_error("cannot change the dense selector during a prefill task");
     auto& m = *impl_;
@@ -3589,7 +3593,7 @@ PrefillResult DevicePrefill::run_from(std::span<const std::uint32_t> tokens, std
                 }
                 break;
             }
-            if(m.options.quality_head_rows>1) {
+            if(m.options.quality_head_rows>1 && !m.options.cone) {
                 unsigned nr=std::min(m.options.quality_head_rows,Tn),first=Tn-nr;
                 ds41::enqueue_hc_collapse(stream_now()+std::size_t(first)*stream_row,m.identity_pre?nullptr:m.mix_ffn.p+first,nr,H,m.quality_h.p,st);
                 ds41::enqueue_rms_norm(m.quality_h.p,m.devf("output_norm.weight"),nr,H,H,1e-20F,m.quality_h.p,st);

@@ -237,7 +237,9 @@ int main(int argc,char** argv) try {
                 const auto t0=std::chrono::steady_clock::now();
                 std::uint32_t next=0;
                 auto pass=[&]{
+                    prefill.set_cone(true);  // the prefill as served (exact suffix replay, or the arm's bounded plan)
                     auto a=prefill.run(all.first(P));
+                    prefill.set_cone(false);  // the 64 teacher rows: every row of every layer
                     auto b=prefill.extend(all.subspan(P,64));
                     const std::size_t V=a.logits.size();
                     if(b.teacher_logits.size()!=64*V || b.logits.size()!=V)throw std::runtime_error("gate mode: teacher logit shape");
