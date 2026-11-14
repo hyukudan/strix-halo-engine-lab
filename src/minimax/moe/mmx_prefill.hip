@@ -699,15 +699,16 @@ unsigned prefill_dense_band() {
 }
 
 // STRIX_MMX_PREFILL_PIPE_TAIL (v4 + mtfit items; lever pf_moe_pipe_tail): 0 (default) = tail classes on item_core_v3;
-// 1 = every class on the pipelined loop (classes MT 1..7, and the MT8 remainders under PIPE); an even mask = bit MT
-// (2..256) per class. Same items, grids, K splits and bits (test_prefill_pipe_tail). The unguarded A loads need the
+// 1 = the tail classes MT 1..7 on the pipelined loop (= mask 254); an even mask = bit MT (2..256) per class. Bit 256
+// (the MT8 remainders on item_pipe<8, 4, false> under PIPE) fails the ISA gate (256 VGPR, spills, scratch): diagnosis
+// only, never part of 1. Same items, grids, K splits and bits (test_prefill_pipe_tail). The unguarded A loads need the
 // mtfit items (one block of ceil(rows / 16) tiles per tail), so a plan without mtfit keeps the old kernels.
 unsigned prefill_pipe_tail_mask() {  // bit c = class c (MT c + 1)
     static const unsigned mask = [] {
         const unsigned v = strix::envcfg::number<unsigned>("STRIX_MMX_PREFILL_PIPE_TAIL", 0U, 0U, 511U);
         if (v > 1U && (v & 1U) != 0U)
             throw std::invalid_argument("STRIX_MMX_PREFILL_PIPE_TAIL must be 0, 1 or an even class mask (bit MT, 2..510)");
-        return v == 1U ? 0xFFU : v >> 1U;
+        return v == 1U ? 0x7FU : v >> 1U;
     }();
     return mask;
 }
