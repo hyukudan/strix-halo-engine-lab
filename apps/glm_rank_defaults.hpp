@@ -294,13 +294,14 @@ inline Effective resolve(const Request& r, const EnvGet& env, const ModelFacts& 
     else if (const char* v = env("STRIX_GLM_PREFILL")) e.prefill_requested = {v, "explicit"};
     else e.prefill_requested = {e.baseline ? "ref" : "auto", src_b};
     // Prefill units (serving-only): a long MTP prompt admitted beside decoding requests pauses at layer boundaries of
-    // its max_rows pieces instead of being cut into token chunks. Default off until measured (governed switch).
+    // its max_rows pieces instead of being cut into token chunks. Default on (exact: the idle run's pieces and kernels;
+    // FAST 8K beside one stream TTFT 15.20 -> 10.83 s, 3 runs per arm); 0 restores the token chunks.
     if (const char* v = env("STRIX_GLM_SERVE_PREFILL_UNITS")) {
         const std::string s = v;
         if (s != "0" && s != "1") throw std::invalid_argument("STRIX_GLM_SERVE_PREFILL_UNITS must be 0 or 1");
         e.prefill_units = {s, "explicit"};
     } else {
-        e.prefill_units = {"0", "default"};
+        e.prefill_units = {"1", "default"};
     }
     // decode Xfer exchange: STRIX_GLM_DECODE_XCH overrides --decode-xch (engine rule)
     if (const char* v = env("STRIX_GLM_DECODE_XCH")) e.decode_xch = {v, "explicit"};
