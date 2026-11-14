@@ -24,6 +24,9 @@ inline PrefillOptions arm_precision(const std::string& label) {
     if (label == "fattn2") { o.fast_attention = true; o.fast_attention_flash = true; return o; }  // ds41-attn-bf16flash-v1
     if (label == "fmoe") { o.fast_moe = true; return o; }
     if (label == "fast") { o.fast_attention = true; o.fast_moe = true; return o; }
+    if (label == "fdense") { o.fast_dense = true; return o; }  // ds41-dense-f16-v1
+    if (label == "fast3") { o.fast_attention = true; o.fast_attention_flash = true; o.fast_moe = true; o.fast_dense = true; return o; }
+    if (label == "fast2") { o.fast_attention = true; o.fast_attention_flash = true; o.fast_moe = true; return o; }
     std::vector<std::string> tok;
     std::stringstream ss(label);
     for (std::string t; std::getline(ss, t, '_');) tok.push_back(t);

@@ -1,8 +1,10 @@
 #include "strix/hip_check.hpp"
+#include "core/f16_dense_q8a8.hpp"  // FAST lever ds41-dense-f16-v1 (shared policy dense-q8a8-f16-v1)
 #include "ds41_dense_adapter.hpp"  // shared tiled core route (STRIX_DS41_PF_CORE=1)
 #include "strix/env_flags.hpp"
 #include "strix/hip_argmax_core.hpp"
 #include "strix/ds41_prefill_tuning.hpp"
+#include "strix/ds41_fast_profile.hpp"
 #include "strix/hip_ds41_layer.hpp"
 #include "strix/hip_ds41_prefill.hpp"
 #include "strix/ds41_exact_flags.hpp"
@@ -3219,6 +3221,32 @@ __global__ __launch_bounds__(32 * post_waves) void q8_0_a8_post_kernel(Q8A8Dense
         }
 }
 
+// FAST lever ds41-dense-f16-v1: the dense Q8_0 x A8 products as ONE FP16 WMMA chain on the shared FP16 dense core
+// (policy core::f16_dense_tall::q8a8, "dense-q8a8-f16-v1": weights decoded once per CTA stage, 128- or 256-row CTAs).
+// STRIX_DS41_FAST_DENSE=1 (default off; also set by the profile STRIX_DS41_FAST_PREFILL=1) or set_fast_dense(1 / 0; -1 = the environment). Calls under
+// STRIX_DS41_FAST_DENSE_MIN_ROWS rows (default 128) and shapes the policy does not take keep the exact kernels.
+// The outputs' A8 is not written here (the caller quantizes, as after any form that returns false).
+int fast_dense_mode = -1;
+void set_fast_dense(int mode) { fast_dense_mode = mode; }
+static bool fast_dense_on() {
+    static const bool env = fast_profile::dense_on();  // the lever or STRIX_DS41_FAST_PREFILL
+    return fast_dense_mode >= 0 ? fast_dense_mode != 0 : env;
+}
+static bool enqueue_fast_dense(const Q8A8DensePrefillView& v, void* stream) {
+    static const unsigned min_rows = static_cast<unsigned>(strix::envcfg::integer("STRIX_DS41_FAST_DENSE_MIN_ROWS", 128));
+    namespace q8a8 = strix::core::f16_dense_tall::q8a8;
+    q8a8::View f{};
+    f.weight = v.weight, f.codes = v.codes, f.deltas = v.deltas, f.out = v.out;
+    f.row_bytes = (v.row_width ? v.row_width : v.width) / 32U * 34U;
+    f.k_bytes = v.k_offset / 32U * 34U;
+    f.in = v.width * v.k_parts, f.count = v.count, f.rows = v.rows, f.x_stride = v.x_stride, f.out_stride = v.out_stride;
+    f.accumulate = v.accumulate ? 1U : 0U;
+    if (v.rows < min_rows || !q8a8::supported(f)) return false;
+    q8a8::enqueue(f, as_stream(stream));
+    hip_check(hipGetLastError(), "Q8_0 x A8 FP16 dense launch");
+    return true;
+}
+
 bool enqueue_q8_0_a8_dense_prefill(const Q8A8DensePrefillView& v, void* stream) {
     require(v.weight && v.codes && v.deltas && v.out && v.count && v.rows && v.width && v.width % 32U == 0 && v.x_stride >= v.width &&
                 v.x_stride % 16U == 0 && v.out_stride >= v.count && reinterpret_cast<std::uintptr_t>(v.codes) % 16U == 0 &&
@@ -3229,6 +3257,7 @@ bool enqueue_q8_0_a8_dense_prefill(const Q8A8DensePrefillView& v, void* stream) 
                                      std::uint64_t{v.k_offset} + 2ULL * v.width <= v.row_width &&
                                      std::uint64_t{v.x_stride} >= 2ULL * v.width)),
             "Q8_0 x A8 dense prefill view");
+    if (fast_dense_on() && enqueue_fast_dense(v, stream)) return false;
     if (pf_core_dense()) return enqueue_q8_0_a8_dense_prefill_core(v, stream);
     if (v.k_parts == 2U) {
         // one launch for both parts in form 822 from 896 rows (gfx1151 bench: -2 % at 896, -5..-7 % at 1024 rows; fewer rows

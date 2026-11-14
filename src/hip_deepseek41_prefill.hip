@@ -23,6 +23,7 @@
 #include "strix/ds41_weight_overlay.hpp"
 #include "strix/hip_ds41_attention.hpp"
 #include "strix/hip_ds41_formats.hpp"
+#include "strix/ds41_fast_profile.hpp"
 #include "strix/hip_ds41_layer.hpp"
 #include "strix/hip_ds41_prefill.hpp"
 #include "strix/hip_ds41_rn_table.hpp"
@@ -665,7 +666,7 @@ DevicePrefill::DevicePrefill(const std::filesystem::path& gguf, const PrefillOpt
     }
     if(const char* e=std::getenv("STRIX_DS41_PREFILL_FP16_DENSE");e && std::string(e)=="1")options.fp16_dense=true;
     if(const char* e=std::getenv("STRIX_DS41_PREFILL_BF16_ATTN");e && std::string(e)=="1")options.bf16_attention=true;
-    if (const char* e = std::getenv("STRIX_DS41_FAST_ATTN"); e != nullptr && (std::string(e) == "1" || std::string(e) == "2")) {
+    if (const char* e = ds41::fast_profile::attention(); ds41::fast_profile::attention_on()) {  // the lever or STRIX_DS41_FAST_PREFILL
         options.fast_attention = true;
         if (e[0] == '2') options.fast_attention_flash = true;  // ds41-attn-bf16flash-v1
     }
@@ -1438,6 +1439,8 @@ void DevicePrefill::set_precision_for_new_sequence(const PrefillOptions& p) {
     o.fast_attention = p.fast_attention;
     o.fast_attention_flash = p.fast_attention_flash;
     o.fast_moe = p.fast_moe;
+    o.fast_dense = p.fast_dense;
+    ds41::set_fast_dense(p.fast_dense ? 1 : 0);
     ds41::set_fast_moe(p.fast_moe ? 1 : 0);   // process-wide switch of the batch MoE dispatch (one sequence at a time here)
 }
 

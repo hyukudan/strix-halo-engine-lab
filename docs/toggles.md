@@ -45,6 +45,9 @@ FAST changes the numerics. Use it when throughput matters more than bit-identica
 | `STRIX_QPF2K_GDN_FP16_CHUNK=1`, `--gdn-fp16-chunk` | qwen | off (on in `fast`) | FP16 GDN chunk in prefill. |
 | `--prefill-exact-fp16` | qwen | off | Forces the exact FP16 prefill path. |
 | `STRIX_DS41_FAST_MOE=1` | deepseek | off (`fast`) | Relaxed MoE epilogue. |
+| `STRIX_DS41_FAST_PREFILL=1` | deepseek | off | Profile `ds41-fast-pf-v1` (one resolver, `include/strix/ds41_fast_profile.hpp`): `STRIX_DS41_FAST_ATTN=2` + `STRIX_DS41_FAST_MOE=1` + `STRIX_DS41_FAST_DENSE=1`; a lever variable that is set wins. Changes logits. Pair gate against exact (1,280 teacher-forced rows, 20 prompts, both ranks equal): pooled KL 0.0090, top-1 97.9 %, dNLL +0.0112: KL and top-1 pass, **dNLL fails the 0.01 limit**; a one-ulp null arm scores KL 0.0097 / 98.3 % / +0.0170 on the same gate, so the profile is at the engine's perturbation floor and stays unqualified. Warm pair prefill 8K 1,169 -> 1,381 tok/s, 11.6K 1,206 -> 1,439 tok/s. |
+| `STRIX_DS41_FAST_ATTN=2` | deepseek | off | BF16 one-pass sparse attention on the shared flash core (`ds41-attn-bf16flash-v1`; `1` = the older f16 WMMA form, slower than exact). Gate alone: KL 0.0100, top-1 97.5 %, dNLL +0.0131 (fails dNLL). |
+| `STRIX_DS41_FAST_DENSE=1` | deepseek | off | Dense Q8_0 x A8 products (q_b, o_a, o_b; calls of at least `STRIX_DS41_FAST_DENSE_MIN_ROWS`, default 128) in one FP16 WMMA chain on the shared dense core, policy `dense-q8a8-f16-v1` (`src/core/f16_dense_q8a8.hpp`; `STRIX_F16_Q8A8_WAVES=8\|16` forces the CTA height, same bits). Gate alone (1,024 rows): KL 0.0099, top-1 98.1 %, dNLL +0.0144 (fails dNLL). |
 | `STRIX_GLM_PF_WMMA=1` | glm | off (on in rank `--profile fast`) | WMMA prefill. Opt-in FAST identity; `=0` disables even in `fast`. |
 
 ## The regime rule
