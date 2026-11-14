@@ -450,6 +450,13 @@ void test_plan() {
     split.split_activations = true;
     CHECK(plan(c, 1521, 1, split).workspace_bytes() > small.workspace_bytes());
     CHECK(plan(c, 1521, 4).fixed_bytes >= small.fixed_bytes);
+    {  // two-term attention (the default) holds the lo terms of K and V^T: 2 x slots x heads x dp x 2 B more
+        EncoderOptions one, two;
+        one.attention_terms = 1U;
+        two.attention_terms = 2U;
+        const std::size_t kv = strix::vision::layout::aligned(std::size_t{3072} * 16U * 64U * 2U);  // plan's slot bound: (2 x 1521 + 15 + 15) & ~15
+        CHECK(plan(c, 1521, 1, two).fixed_bytes == plan(c, 1521, 1, one).fixed_bytes + 2U * kv);
+    }
     CHECK(throws([&] { (void)plan(c, 0, 1); }));
     c.width = 1152;  // head dim 72 runs padded to 80
     c.mlp_width = 4304;
@@ -469,6 +476,43 @@ void test_plan() {
     odd.width = 576;  // 8 x 72: heads * 80 == round_up(576, 128), still compacted
     odd.heads = 8;
     CHECK(geometry(odd, 16, 32, {}).compact);
+}
+
+// The device-rounding model of the attention operands (ReferenceRounding attn_*): one FP16 term carries a relative
+// operand error up to 2^-11, hi + lo up to about 2^-22; on a tower whose scores are large (ill-conditioned softmax),
+// the two-term form tracks FP32 far closer than the one-term form (the device's default vs its faster switch).
+void test_attention_terms() {
+    for (const float x : {1.0F, 0.1F, -3.14159F, 1e-3F, 6.1e-5F, 1234.567F, 0.33333334F}) {
+        CHECK(round_f16_terms(x, 0U) == x);
+        CHECK(round_f16_terms(x, 1U) == round_to_f16(x));
+        CHECK(std::fabs(round_to_f16(x) - x) <= std::fabs(x) * 0x1p-11F);
+        // hi + lo: 2^-21 relative while lo is a normal FP16 (|x| >= 2^-3); below, lo is subnormal: 2^-25 absolute
+        CHECK(std::fabs(round_f16_terms(x, 2U) - x) <= std::max(std::fabs(x) * 0x1p-21F, 0x1p-25F));
+    }
+    EncoderConfig c = base_config();
+    c.layers = 1;
+    Tower t = make_tower(c, 31);
+    for (std::size_t i = 0; i < 2U * c.width * c.width; ++i) mut(t.w.blocks[0].qkv_w)[i] *= 6.0F;  // sharp softmax
+    const PatchGrid g = make_grid(c, 4, 4, 32, 1);
+    const PositionInputs p = default_positions(c, t.w, g);
+    const EncoderOutput exact = reference_encode(c, t.w, g, p);
+    ReferenceRounding one, two, qk;
+    one.attention(1U);
+    two.attention(2U);
+    qk.attn_q = qk.attn_k = 1U;  // one term on QK only
+    const auto rel = [&](const ReferenceRounding& m) {
+        const EncoderOutput o = reference_encode(c, t.w, g, p, m);
+        double num = 0.0, den = 0.0;
+        for (std::size_t i = 0; i < o.hidden.size(); ++i) {
+            num += (static_cast<double>(o.hidden[i]) - exact.hidden[i]) * (static_cast<double>(o.hidden[i]) - exact.hidden[i]);
+            den += static_cast<double>(exact.hidden[i]) * exact.hidden[i];
+        }
+        return std::sqrt(num / den);
+    };
+    const double e1 = rel(one), e2 = rel(two), eqk = rel(qk);
+    std::printf("attention terms model: relL2 one %.3g two %.3g qk-only %.3g\n", e1, e2, eqk);
+    CHECK(e1 > 0.0 && eqk > 0.0 && e2 < e1 / 64.0);
+    CHECK(ReferenceEncoder(c, t.w, two).arithmetic() == std::string("vision-ref-f32-rounded"));
 }
 
 ProjectedRows rows_of(unsigned rows, unsigned width, std::uint16_t fill) {
@@ -726,6 +770,7 @@ int main() {
         test_tiles();
         test_taps_and_types();
         test_plan();
+        test_attention_terms();
         test_cache();
         test_encode_cached();
         test_merge_project();

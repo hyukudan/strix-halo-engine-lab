@@ -103,12 +103,9 @@ __global__ __launch_bounds__((KeySplit<P::kHeads, P::kDim>::kThreads)) void flas
         float x[4];
         P::query(a, row, head, lane, x);
         *reinterpret_cast<U2*>(lds + (head * D + lane * 4U) * 2U) = U2{tile::pack2<O>(x[0], x[1]), tile::pack2<O>(x[2], x[3])};
-        if constexpr (Split) {
-#pragma unroll
-            for (unsigned d = 0; d < 4; ++d) x[d] -= tile::operand_value<O>(tile::to_operand<O>(x[d]));
+        if constexpr (Split)
             *reinterpret_cast<U2*>(lds + G::kQlo + (head * D + lane * 4U) * 2U) =
-                U2{tile::pack2<O>(x[0], x[1]), tile::pack2<O>(x[2], x[3])};
-        }
+                U2{tile::pack2_lo<O>(x[0], x[1]), tile::pack2_lo<O>(x[2], x[3])};
     }
     __syncthreads();
     Frag qf[G::kKs];

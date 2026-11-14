@@ -3,6 +3,7 @@
 #include "strix/vision/encoder.hpp"
 
 #include "encoder_layout.hpp"
+#include "strix/env_flags.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -305,6 +306,11 @@ EncoderPlan plan(const EncoderConfig& c, unsigned rows, unsigned tiles, const En
     return p;
 }
 
+unsigned attention_terms_from_env() {
+    static const unsigned terms = envcfg::number<unsigned>("STRIX_VISION_ATTN_TERMS", 2U, 1U, 2U);
+    return terms;
+}
+
 bool resident_from_env() {
     const char* v = std::getenv("STRIX_VISION_RESIDENT");
     return !v || !*v || std::strcmp(v, "0") != 0;
@@ -322,6 +328,13 @@ float round_to_f16(float f) {
     (void)std::frexp(a, &e);              // a = m * 2^e, m in [0.5, 1)
     const int q = std::max(e, -13) - 11;  // FP16 quantum: 11 significant bits, normal floor 2^-14
     return std::copysign(std::ldexp(std::nearbyint(std::ldexp(a, -q)), q), f);  // ldexp exact, nearbyint nearest-even
+}
+
+float round_f16_terms(float f, unsigned terms) {
+    if (terms == 0U) return f;
+    const float hi = round_to_f16(f);
+    if (terms == 1U || !std::isfinite(hi)) return hi;
+    return hi + round_to_f16(f - hi);  // f - hi is exact in FP32 (Sterbenz); the sum is exact unless lo rounds
 }
 
 ReferenceEncoder::ReferenceEncoder(EncoderConfig c, const EncoderWeights& w, ReferenceRounding r)
@@ -361,8 +374,12 @@ EncoderOutput reference_encode(const EncoderConfig& c, const EncoderWeights& w, 
                     rotate(c, &qkv[r * 3U * W + h * D], &p.angles[r * (D / 2U)]);
                     rotate(c, &qkv[r * 3U * W + W + h * D], &p.angles[r * (D / 2U)]);
                 }
-        if (m.attention_f16)  // the flash core's Q, K, V operands (qkv is read by the attention only)
-            for (float& v : qkv) v = round_to_f16(v);
+        if (m.any_attention())  // the flash core's Q, K, V operands (qkv is read by the attention only)
+            for (std::size_t r = 0; r < N; ++r)
+                for (std::size_t i = 0; i < 3U * W; ++i) {
+                    float& v = qkv[r * 3U * W + i];
+                    v = round_f16_terms(v, i < W ? m.attn_q : i < 2U * W ? m.attn_k : m.attn_v);
+                }
         std::size_t begin = 0;
         for (const unsigned end : tiles) {
             const std::size_t nk = end - begin;
@@ -383,7 +400,7 @@ EncoderOutput reference_encode(const EncoderConfig& c, const EncoderWeights& w, 
                         std::fill(acc.begin(), acc.end(), 0.0);
                         for (std::size_t j = 0; j < nk; ++j) {
                             const double e = std::exp(s[j] - top);  // in (0, 1]: the core rounds p to FP16 operands
-                            const double pj = m.attention_f16 ? static_cast<double>(round_to_f16(static_cast<float>(e))) : e;
+                            const double pj = m.attn_p ? static_cast<double>(round_f16_terms(static_cast<float>(e), m.attn_p)) : e;
                             sum += pj;
                             const float* v = &qkv[(begin + j) * 3U * W + 2U * W + h * D];
                             for (std::size_t d = 0; d < D; ++d) acc[d] += pj * static_cast<double>(v[d]);

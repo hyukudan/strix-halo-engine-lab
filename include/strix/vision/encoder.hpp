@@ -4,7 +4,7 @@
 //
 // Two backends run the same graph from the same EncoderWeights:
 //   ReferenceEncoder  host FP32, slow, the fixture oracle (src/vision/reference.cpp);
-//   Encoder           HIP, arithmetic identity "vision-f16-v1" (src/vision/encoder.hip): weights -> FP16 panels with a
+//   Encoder           HIP, arithmetic identity "vision-f16-attn2-v1" / "vision-f16-v1" (src/vision/encoder.hip): weights -> FP16 panels with a
 //                     power-of-two tensor scale, FP16 operands, FP32 accumulation and residual, FP32
 //                     norm/activation/softmax; optional hi+lo split activations. Class FAST, judged on its gates.
 // A family supplies an adapter (adapter.hpp): tensor names, resize rule, patch order, projector and span layout.
@@ -165,10 +165,16 @@ public:
 // attributed to a rounding site (precision) or to none of them (a defect). Never an adapter arithmetic.
 struct ReferenceRounding {
     bool linear_inputs_f16 = false;  // every linear input rounded to FP16 (the single-operand device policy)
-    bool attention_f16 = false;      // Q, K, V and the probabilities rounded to FP16 (the flash core's operands)
-    bool any() const { return linear_inputs_f16 || attention_f16; }
+    // The flash core's operands Q, K, V and the probabilities P, as FP16 terms per operand: 0 = FP32 (no rounding),
+    // 1 = one FP16 term (the one-term attention), 2 = hi + lo (the two-term attention: lo = FP16 of the remainder).
+    // The device's two-term products drop lo x lo (about 2^-22 relative); the model keeps it.
+    unsigned char attn_q = 0, attn_k = 0, attn_v = 0, attn_p = 0;
+    void attention(unsigned terms) { attn_q = attn_k = attn_v = attn_p = static_cast<unsigned char>(terms); }
+    bool any_attention() const { return attn_q || attn_k || attn_v || attn_p; }
+    bool any() const { return linear_inputs_f16 || any_attention(); }
 };
 float round_to_f16(float);  // nearest-even FP16 value as a float (subnormals kept, overflow -> infinity)
+float round_f16_terms(float, unsigned terms);  // 0: the value; 1: round_to_f16; 2: hi + round_to_f16(value - hi)
 
 class ReferenceEncoder final : public EncoderBackend {
 public:
@@ -191,8 +197,13 @@ void splice_rows_host(float* dst, std::size_t dst_stride, const ProjectedRows& s
 
 // ---- HIP runner ------------------------------------------------------------------------------------------------
 
+// FP16 terms of the tower attention operands Q, K, V, P: 2 = hi + lo (default: precise, 3x the attention WMMA),
+// 1 = one term (faster, lower precision: the "vision-f16-v1" rows). STRIX_VISION_ATTN_TERMS=1|2, strict; the one
+// resolver of the default (every EncoderOptions starts from it: server, CLI, gate, memory plan).
+unsigned attention_terms_from_env();
 struct EncoderOptions {
     bool split_activations = false;                   // hi + lo FP16 operands for every linear input (two GEMMs)
+    unsigned attention_terms = attention_terms_from_env();  // 2 = hi + lo attention operands, 1 = one term
     std::size_t mlp_workspace_bytes = 160U << 20U;    // cap of the chunked MLP buffers (2304 rows split, 4352 single)
     void* stream = nullptr;                           // hipStream_t; null = default stream
 };
@@ -226,7 +237,8 @@ struct EncoderLoadStats {
 // Defined in the HIP library only (src/vision/encoder.hip).
 class Encoder final : public EncoderBackend {
 public:
-    static constexpr const char* kArithmetic = "vision-f16-v1";
+    static constexpr const char* kArithmetic = "vision-f16-v1";            // one-term attention (attention_terms 1)
+    static constexpr const char* kArithmeticAttn2 = "vision-f16-attn2-v1";  // two-term attention (the default)
     explicit Encoder(EncoderConfig, EncoderOptions = {});
     ~Encoder() override;
     Encoder(const Encoder&) = delete;
@@ -251,7 +263,7 @@ public:
     // Device chain: unshuffle kernel, linear1, activation kernel (FP64, the host formula), linear2, one download.
     // STRIX_VISION_PROJECT_DEVICE=0: the host graph of DenseOps (A/B and bitwise check).
     void merge_project(const EncoderOutput& hidden, unsigned grid_h, unsigned grid_w, const MergeProjector&, float* rows) override;
-    const char* arithmetic() const override { return kArithmetic; }
+    const char* arithmetic() const override;  // kArithmeticAttn2 or kArithmetic, by EncoderOptions::attention_terms
 
 private:
     struct Impl;

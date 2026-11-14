@@ -2,8 +2,8 @@
 // the dumps of tools/vision/ds41_ref.py).
 //
 //   strix-deepseek41-vision-gate --model FILE.gguf --ref DIR [--backend host|hip] [--only a,b]
-//                                [--host-max-patches N] [--split | --no-split] [--unpinned] [--diagnose a,b]
-//                                [--dump DIR] [--rounding none|linear|attention|both]
+//                                [--host-max-patches N] [--split | --no-split] [--attn-terms 1|2] [--unpinned] [--diagnose a,b]
+//                                [--dump DIR] [--rounding none|linear|attention|both|attention2|both2|attention:QKVP]
 //
 // --dump writes this backend's rows (BF16 values as FP32) and tower output beside the reference names, so two
 // backends can be compared row by row. --rounding (host only, diagnostic) runs the FP32 reference with the device's
@@ -243,6 +243,7 @@ int run(int argc, char** argv) {
     unsigned host_max_patches = 200, bench_reps = 3;
     int bench_prepare = -1;  // -1 none, 0 prepare_backend, 1 prepare_backend + warm-up
     bool split = false, no_split = false, unpinned = false;
+    unsigned attn_terms = 0;  // --attn-terms 1|2: force the tower attention form (0 = the resolved default)
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         const auto next = [&]() -> std::string {
@@ -256,6 +257,7 @@ int run(int argc, char** argv) {
         else if (a == "--host-max-patches") host_max_patches = static_cast<unsigned>(std::stoul(next()));
         else if (a == "--split") split = true;
         else if (a == "--no-split") no_split = true;
+        else if (a == "--attn-terms") attn_terms = static_cast<unsigned>(std::stoul(next()));
         else if (a == "--unpinned") unpinned = true;
         else if (a == "--diagnose") diagnose_names = next();
         else if (a == "--bench") bench_png = next();
@@ -309,7 +311,8 @@ int run(int argc, char** argv) {
         vision::EncoderOptions opt = adapter.device_options();  // the family's policy unless an arm is forced
         if (split) opt.split_activations = true;
         if (no_split) opt.split_activations = false;
-        std::printf("split activations %d\n", opt.split_activations ? 1 : 0);
+        if (attn_terms) opt.attention_terms = attn_terms;
+        std::printf("split activations %d attention terms %u\n", opt.split_activations ? 1 : 0, opt.attention_terms);
         auto enc = std::make_unique<vision::Encoder>(cfg, opt);
         t0 = Clock::now();
         enc->load(weights);
@@ -323,13 +326,25 @@ int run(int argc, char** argv) {
 #else
     (void)split;
     (void)no_split;
+    (void)attn_terms;
     if (device) throw std::runtime_error("this build has no device backend");
 #endif
     // --rounding (host backend, diagnostic): the device's FP16 operand roundings placed one site at a time.
     vision::ReferenceRounding model_rounding;
     model_rounding.linear_inputs_f16 = rounding == "linear" || rounding == "both";
-    model_rounding.attention_f16 = rounding == "attention" || rounding == "both";
-    if (rounding != "none" && !model_rounding.any()) throw std::invalid_argument("--rounding none|linear|attention|both");
+    if (rounding == "attention" || rounding == "both") model_rounding.attention(1U);
+    if (rounding == "attention2" || rounding == "both2") model_rounding.attention(2U);
+    model_rounding.linear_inputs_f16 = model_rounding.linear_inputs_f16 || rounding == "both2";
+    if (rounding.rfind("attention:", 0) == 0 && rounding.size() == 14U) {  // attention:QKVP, FP16 terms per operand (0, 1, 2)
+        unsigned char* t[4] = {&model_rounding.attn_q, &model_rounding.attn_k, &model_rounding.attn_v, &model_rounding.attn_p};
+        for (unsigned i = 0; i < 4U; ++i) {
+            const char c = rounding[10U + i];
+            if (c < '0' || c > '2') throw std::invalid_argument("--rounding attention:QKVP takes digits 0, 1, 2");
+            *t[i] = static_cast<unsigned char>(c - '0');
+        }
+    }
+    if (rounding != "none" && !model_rounding.any())
+        throw std::invalid_argument("--rounding none|linear|attention|both|attention2|both2|attention:QKVP");
     if (device && model_rounding.any()) throw std::invalid_argument("--rounding models the device on the host backend");
     if (model_rounding.any()) std::printf("rounding model %s (diagnostic, not a gate result)\n", rounding.c_str());
     if (!backend) backend = std::make_unique<vision::ReferenceEncoder>(cfg, weights, model_rounding);
