@@ -58,12 +58,12 @@ inline constexpr PrefillLever kPrefillLevers[] = {
     {"STRIX_DS41_ATTN_A8", PrefillLeverClass::reload},
     {"STRIX_DS41_ATTN_LDS_SWIZZLE", PrefillLeverClass::cached},
     {"STRIX_DS41_ATTN_LEAN", PrefillLeverClass::cached},
-    {"STRIX_DS41_ATTN_LIVE_CHUNKS", PrefillLeverClass::cached},
+    {"STRIX_DS41_ATTN_LIVE_CHUNKS", PrefillLeverClass::reload},  // startup pair resolver (deepseek41_pair_defaults) reads/exports it once
     {"STRIX_DS41_ATTN_MIN_BLOCKS", PrefillLeverClass::cached},
     {"STRIX_DS41_ATTN_SEG_HPW", PrefillLeverClass::cached},
-    {"STRIX_DS41_ATTN_TILE_F16", PrefillLeverClass::cached},
+    {"STRIX_DS41_ATTN_TILE_F16", PrefillLeverClass::reload},  // startup pair resolver (deepseek41_pair_defaults) reads/exports it once
     {"STRIX_DS41_ATTN_WAVE_CAP", PrefillLeverClass::cached},
-    {"STRIX_DS41_ATTN_WINDOW_FOLD", PrefillLeverClass::cached},
+    {"STRIX_DS41_ATTN_WINDOW_FOLD", PrefillLeverClass::reload},  // startup pair resolver (deepseek41_pair_defaults) reads/exports it once
     {"STRIX_DS41_BASELINE", PrefillLeverClass::reload},
     {"STRIX_DS41_BATCH_ENGRAM_ASYNC", PrefillLeverClass::reload},
     {"STRIX_DS41_BATCH_PACKED", PrefillLeverClass::reload},
@@ -80,7 +80,7 @@ inline constexpr PrefillLever kPrefillLevers[] = {
     {"STRIX_DS41_DECODE_PREFETCH", PrefillLeverClass::reload},
     {"STRIX_DS41_DEFER_DECODER", PrefillLeverClass::cached},
     {"STRIX_DS41_DENSE_FORM", PrefillLeverClass::cached},
-    {"STRIX_DS41_DENSE_SELECT", PrefillLeverClass::construct},
+    {"STRIX_DS41_DENSE_SELECT", PrefillLeverClass::reload},  // startup pair resolver (deepseek41_pair_defaults) reads/exports it once
     {"STRIX_DS41_DENSE_STATS", PrefillLeverClass::cached},
     {"STRIX_DS41_DENSE_TALL", PrefillLeverClass::cached},
     {"STRIX_DS41_DENSE_TALL_ROTATE", PrefillLeverClass::cached},
@@ -118,15 +118,15 @@ inline constexpr PrefillLever kPrefillLevers[] = {
     {"STRIX_DS41_F16_TILE", PrefillLeverClass::reload},
     {"STRIX_DS41_F16_TILED", PrefillLeverClass::reload},
     {"STRIX_DS41_F16_WIDE", PrefillLeverClass::reload},
-    {"STRIX_DS41_FAST_ATTN", PrefillLeverClass::construct},  // via the fast profile, read in DevicePrefill::apply_levers
-    {"STRIX_DS41_FAST_DENSE", PrefillLeverClass::cached},  // set_fast_dense still overrides; set_precision_for_new_sequence(options) pins it
-    {"STRIX_DS41_FAST_DENSE_MIN_ROWS", PrefillLeverClass::cached},
+    {"STRIX_DS41_FAST_ATTN", PrefillLeverClass::reload},  // startup pair resolver (deepseek41_pair_defaults) reads/exports it once
+    {"STRIX_DS41_FAST_DENSE", PrefillLeverClass::reload},  // startup pair resolver (deepseek41_pair_defaults) reads/exports it once
+    {"STRIX_DS41_FAST_DENSE_MIN_ROWS", PrefillLeverClass::reload},  // startup pair resolver (deepseek41_pair_defaults) reads/exports it once
     {"STRIX_DS41_FAST_I4", PrefillLeverClass::runtime},
     {"STRIX_DS41_FAST_I4_SCOPE", PrefillLeverClass::reload},
-    {"STRIX_DS41_FAST_MOE", PrefillLeverClass::cached},  // fast_moe() lever_cache (also follows STRIX_DS41_FAST_PREFILL)
+    {"STRIX_DS41_FAST_MOE", PrefillLeverClass::reload},  // startup pair resolver (deepseek41_pair_defaults) reads/exports it once
     {"STRIX_DS41_FAST_MOE_DOWN_ROWS", PrefillLeverClass::runtime},  // getenv on every call
     {"STRIX_DS41_FAST_MOE_ORDER", PrefillLeverClass::runtime},  // getenv on every call
-    {"STRIX_DS41_FAST_PREFILL", PrefillLeverClass::construct},  // via the fast profile, read in DevicePrefill::apply_levers
+    {"STRIX_DS41_FAST_PREFILL", PrefillLeverClass::reload},  // startup pair resolver (deepseek41_pair_defaults) reads/exports it once
     {"STRIX_DS41_FP16_CACHE", PrefillLeverClass::reload},
     {"STRIX_DS41_FP16_CACHE_READONLY", PrefillLeverClass::reload},
     {"STRIX_DS41_FP16_TUNE", PrefillLeverClass::reload},

@@ -75,6 +75,17 @@ void table_covers_sources() {
     const rp::LeverTable t = dr::lever_table();
     check(t.size() == table.size(), "runner table has every row");
     check(rp::lever_class(t, "STRIX_DS41_NOT_A_LEVER") == rp::LeverClass::reload, "undeclared lever is reload");
+    // The startup pair resolver reads its inputs once and exports derived levers into the environment (some with
+    // overwrite), so a later change of any name it touches would not reach the engine the way a fresh process sees it
+    // (device-measured 11-14: an arm STRIX_DS41_FAST_PREFILL=0 kept the FAST logits). Every such name is reload.
+    for (const char* rel : {"src/deepseek41_pair_defaults.cpp", "include/strix/deepseek41_pair_defaults.hpp"}) {
+        const std::string text = read_file(root / rel);
+        for (std::sregex_iterator it(text.begin(), text.end(), literal), end; it != end; ++it) {
+            const std::string name = (*it)[1].str();
+            check(rp::lever_class(t, name) == rp::LeverClass::reload,
+                  name + " is read or exported by the startup pair resolver (" + rel + "): must be reload");
+        }
+    }
 }
 
 // ---- fake engine -------------------------------------------------------------------------------------------
