@@ -135,6 +135,7 @@
 #include "strix/serve/api.hpp"
 #include "strix/serve/bpe_tokenizer.hpp"
 #include "strix/serve/cycle_receipt.hpp"
+#include "strix/env_flags.hpp"
 #include "strix/serve/deepseek_chat.hpp"
 #include "strix/serve/engine.hpp"
 #include "strix/serve/http_server.hpp"
@@ -579,15 +580,17 @@ std::uint64_t fnv_state_bytes(const strix::deepseek41::AttentionState& state) {
 }
 
 // Group prefill policy (serving-only: the CLI runs one prompt): STRIX_SERVE_PREFILL_GROUP=auto|0, _MEMBERS, _ROWS.
-// The DS41 family default is OFF until the grouped pass is measured; short_rows = the scheduler's direct-prefill limit.
-// Same environment functor as sched::options_from_env. Deterministic: every call returns the same policy.
+// The DS41 family default is auto: the group pass is bitwise per prompt (logits, exported state, tokens equal to the solo
+// runs) and measured on the pair (C8 whole-run 100.5 -> 104.0 tok/s); a lone prompt keeps the solo path.
+// short_rows = the scheduler's direct-prefill limit. Read through envcfg (recorded in the effective config).
+// Deterministic: every call returns the same policy.
 serve::PrefillGroupPolicy prefill_group_policy(const Args& a) {
     return serve::PrefillGroupPolicy::from_env(
         [](const char* k) -> std::string {
-            const char* v = std::getenv(k);
+            const char* v = strix::envcfg::text(k);
             return v ? std::string(v) : std::string();
         },
-        serve::PrefillGroupPolicy::Mode::off, strix::deepseek41::sched::options_from_env(a.device_prefill).min_rows);
+        serve::PrefillGroupPolicy::Mode::automatic, strix::deepseek41::sched::options_from_env(a.device_prefill).min_rows);
 }
 
 // The row-split prefill of two ranks gives each 8-row window to one rank alternately: a run needs more than 8 rows so
@@ -2000,7 +2003,7 @@ void lead(const Args& initial, BatchForward& fwd, strix::dist::Communicator& com
     agree_session_startup(a, fwd, sessions);
     dog.pause(false);
     const auto sched = strix::deepseek41::sched::options_from_env(a.device_prefill);  // STRIX_DS41_SERVE_SCHED (device: interleave unless =off)
-    const auto group_policy = prefill_group_policy(a);  // STRIX_SERVE_PREFILL_GROUP (serving-only, family default off), resolved once
+    const auto group_policy = prefill_group_policy(a);  // STRIX_SERVE_PREFILL_GROUP (serving-only, family default auto), resolved once
     std::fprintf(stderr, "prefill_group: %s (members %u, rows %u, short below %u rows; serving-only: the CLI runs one prompt)\n", group_policy.name(),
                  group_policy.max_members, group_policy.max_rows, group_policy.short_rows);
     if (sched.mode != strix::deepseek41::sched::Mode::off) {
