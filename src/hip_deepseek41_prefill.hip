@@ -544,12 +544,12 @@ struct DevicePrefill::Impl {
         if (ring16.p != nullptr) return;
         std::uint32_t ratio = 0;
         for (const auto& role : roles) if (role.ratio != 0U && (ratio == 0U || role.ratio < ratio)) ratio = role.ratio;
-        const std::size_t rows = std::size_t{prefill_capacity} - options.window_rows - attn::kWindow;
-        Dev<std::uint16_t> ring(std::size_t{prefill_capacity} * attn::kHeadDim);
-        Dev<std::uint16_t> kv(ratio != 0U ? (rows / ratio + 1U) * attn::kHeadDim : 0U);
+        const std::size_t rows = std::size_t{prefill_capacity} - options.window_rows - ds41::attn::kWindow;
+        Dev<std::uint16_t> ring(std::size_t{prefill_capacity} * ds41::attn::kHeadDim);
+        Dev<std::uint16_t> compressed_mirror(ratio != 0U ? (rows / ratio + 1U) * ds41::attn::kHeadDim : 0U);
         ring.zero(stream);
         ring16 = std::move(ring);
-        kv16 = std::move(kv);
+        kv16 = std::move(compressed_mirror);
     }
     // in-run snapshots (set_snapshot_points): the points of the next run, those of the last run and their rings
     // (point-major, one ring_capacity ring per layer)
