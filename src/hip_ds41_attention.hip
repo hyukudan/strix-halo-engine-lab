@@ -2026,11 +2026,8 @@ void set_fast_attn_tuning(unsigned chunks_per_block, unsigned ablate, unsigned h
 template <unsigned Cpb, unsigned H>
 static void launch_f16wmma(const AttentionView& v, hipStream_t stream) {
     const dim3 grid((attention_chunks(v) + Cpb - 1U) / Cpb, v.heads / H, v.rows);
-    if (v.key_floor != 0U) {  // policy ds41-decoder-replay-bounded-v1: the floored instantiations
-        hipLaunchKernelGGL(HIP_KERNEL_NAME(attention_f16wmma_floor_kernel<Cpb, H>), grid, dim3(256), 0, stream, v);
-        if (v.tickets == nullptr) hipLaunchKernelGGL(HIP_KERNEL_NAME(attention_f16wmma_floor_combine_kernel<Cpb>), dim3(v.heads, v.rows), dim3(32), 0, stream, v);
-        return;
-    }
+    // policy ds41-decoder-replay-bounded-v1 never binds this form (256 VGPR with spills): flash or exact only
+    if (v.key_floor != 0U) throw std::invalid_argument("ds41 f16wmma prefill attention: no window key floor form");
     hipLaunchKernelGGL(HIP_KERNEL_NAME(attention_f16wmma_kernel<Cpb, H>), grid, dim3(256), 0, stream, v);
     if (v.tickets == nullptr) hipLaunchKernelGGL(HIP_KERNEL_NAME(attention_f16wmma_combine_kernel<Cpb>), dim3(v.heads, v.rows), dim3(32), 0, stream, v);
 }

@@ -96,6 +96,9 @@ struct PrefillOptions {
     // the last row's logits depend on (ds41_prefill.hpp plan_suffix_replay); every result and the live attention state
     // equal those of a full prefill.
     bool cone = true;
+    // FAST policy ds41-decoder-replay-bounded-v1: the bound R (rows, a multiple of 128) of the next runs from position 0;
+    // 0: STRIX_DS41_DECODER_REPLAY (default 0, off). set_precision_for_new_sequence applies it (quality arms).
+    std::uint32_t decoder_replay_rows = 0;
     // rows of the drafter's seed (0: none): the last draft_rows rows of a run; the cone also covers them, and the run
     // keeps their inputs of the last three layers (both ranks hold every seed row; draft_seed())
     std::uint32_t draft_rows = 0;

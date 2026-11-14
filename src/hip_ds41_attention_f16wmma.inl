@@ -196,18 +196,3 @@ __global__ __launch_bounds__(32) void attention_f16wmma_combine_kernel(Attention
     const unsigned n = visible_keys(v, blockIdx.y, nw), chunks = (n + kChunk - 1) / kChunk;
     attention_combine_head(v, blockIdx.y, blockIdx.x, threadIdx.x, (chunks + Cpb - 1) / Cpb);
 }
-// policy ds41-decoder-replay-bounded-v1: the window keys from the layer's key_floor, as separate kernels
-struct FastAttentionFloorPolicy : FastAttentionPolicy {
-    __device__ static __forceinline__ unsigned visible(const Args& v, unsigned r, unsigned& nw) { return visible_keys<true>(v, r, nw); }
-};
-template <unsigned Cpb, unsigned H>
-__global__ __launch_bounds__(256) void attention_f16wmma_floor_kernel(AttentionView v) {
-    DS41_TIMED(5U);
-    strix::attn_core::banded_flash_prefill<FastAttentionFloorPolicy, Cpb, H>(v);
-}
-template <unsigned Cpb>
-__global__ __launch_bounds__(32) void attention_f16wmma_floor_combine_kernel(AttentionView v) {
-    unsigned nw;
-    const unsigned n = visible_keys<true>(v, blockIdx.y, nw), chunks = (n + kChunk - 1) / kChunk;
-    attention_combine_head(v, blockIdx.y, blockIdx.x, threadIdx.x, (chunks + Cpb - 1) / Cpb);
-}

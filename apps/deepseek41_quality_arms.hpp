@@ -27,6 +27,13 @@ inline PrefillOptions arm_precision(const std::string& label) {
     if (label == "fdense") { o.fast_dense = true; return o; }  // ds41-dense-f16-v1
     if (label == "fast3") { o.fast_attention = true; o.fast_attention_flash = true; o.fast_moe = true; o.fast_dense = true; return o; }
     if (label == "fast2") { o.fast_attention = true; o.fast_attention_flash = true; o.fast_moe = true; return o; }
+    // fast3b<R>: fast3 + FAST policy ds41-decoder-replay-bounded-v1 with the bound R (rows, a multiple of 128)
+    if (label.rfind("fast3b", 0) == 0 && label.size() > 6 && label.find_first_not_of("0123456789", 6) == std::string::npos) {
+        o.fast_attention = true; o.fast_attention_flash = true; o.fast_moe = true; o.fast_dense = true;
+        o.decoder_replay_rows = static_cast<std::uint32_t>(std::stoul(label.substr(6)));
+        if (o.decoder_replay_rows == 0U || o.decoder_replay_rows % 128U != 0U) throw std::runtime_error("arm bound " + label);
+        return o;
+    }
     std::vector<std::string> tok;
     std::stringstream ss(label);
     for (std::string t; std::getline(ss, t, '_');) tok.push_back(t);
@@ -61,6 +68,18 @@ inline PrefillOptions arm_precision(const std::string& label) {
     if (proj) o.fp16_projections = proj;
     if (kind == "n" && o.null_ulp_layer < 0) throw std::runtime_error("null arm needs l<L>");
     return o;
+}
+
+// Profile of an arm for the gate's execution witness: "exact" (incumbent arithmetic; the null controls perturb it),
+// "fast-prefill" (the FAST prefill levers fast3 / fast3b<R>), else "diagnostic" (no floor-rule role).
+inline std::string arm_profile(const PrefillOptions& o) {
+    const bool fast3 = o.fast_attention && o.fast_attention_flash && o.fast_moe && o.fast_dense;
+    const bool other = o.fp16_dense || o.bf16_attention || o.fp16_fast || o.fp16_keep_a8 || o.fp16_wsplit ||
+                       o.fp16_projections != 31U || o.approx_layer_first != 0U || o.approx_layer_end != 1000U || o.fp16_min_rows != 0U;
+    if (other) return "diagnostic";
+    if (fast3 && o.null_ulp_layer < 0) return "fast-prefill";
+    if (!o.fast_attention && !o.fast_attention_flash && !o.fast_moe && !o.fast_dense && o.decoder_replay_rows == 0U) return "exact";
+    return "diagnostic";
 }
 
 }  // namespace strix::deepseek41::quality
