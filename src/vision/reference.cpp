@@ -321,13 +321,22 @@ void layout::parallel_ranges(std::size_t n, std::size_t work_per_item, const std
 }
 
 float round_to_f16(float f) {
-    if (!std::isfinite(f) || f == 0.0F) return f;
-    const float a = std::fabs(f);
-    if (a >= 65520.0F) return std::copysign(std::numeric_limits<float>::infinity(), f);  // half-way to 2^16 and above
-    int e = 0;
-    (void)std::frexp(a, &e);              // a = m * 2^e, m in [0.5, 1)
-    const int q = std::max(e, -13) - 11;  // FP16 quantum: 11 significant bits, normal floor 2^-14
-    return std::copysign(std::ldexp(std::nearbyint(std::ldexp(a, -q)), q), f);  // ldexp exact, nearbyint nearest-even
+    std::uint32_t bits;
+    std::memcpy(&bits, &f, sizeof(bits));
+    const auto sign = static_cast<std::uint16_t>((bits >> 16U) & 0x8000U);
+    const std::uint32_t a = bits & 0x7FFFFFFFU;
+    if (a >= 0x7F800000U) return f;  // preserve infinities and NaNs
+    if (a >= 0x477FF000U) return half_to_float(static_cast<std::uint16_t>(sign | 0x7C00U));
+    if (a < 0x33000000U) return half_to_float(sign);  // below half the least FP16 subnormal
+    const unsigned exponent = a >> 23U;
+    const unsigned shift = exponent < 113U ? 126U - exponent : 13U;
+    const std::uint32_t mantissa = (a & 0x7FFFFFU) | 0x800000U;
+    const std::uint32_t remainder = mantissa & ((1U << shift) - 1U);
+    const std::uint32_t halfway = 1U << (shift - 1U);
+    std::uint32_t rounded = mantissa >> shift;
+    rounded += remainder > halfway || (remainder == halfway && (rounded & 1U));
+    if (exponent >= 113U) rounded += (exponent - 113U) << 10U;
+    return half_to_float(static_cast<std::uint16_t>(sign | rounded));
 }
 
 float round_f16_terms(float f, unsigned terms) {
@@ -398,12 +407,26 @@ EncoderOutput reference_encode(const EncoderConfig& c, const EncoderWeights& w, 
                         }
                         double sum = 0.0;
                         std::fill(acc.begin(), acc.end(), 0.0);
-                        for (std::size_t j = 0; j < nk; ++j) {
-                            const double e = std::exp(s[j] - top);  // in (0, 1]: the core rounds p to FP16 operands
-                            const double pj = m.attn_p ? static_cast<double>(round_f16_terms(static_cast<float>(e), m.attn_p)) : e;
-                            sum += pj;
-                            const float* v = &qkv[(begin + j) * 3U * W + 2U * W + h * D];
-                            for (std::size_t d = 0; d < D; ++d) acc[d] += pj * static_cast<double>(v[d]);
+                        const std::size_t step = m.attn_p ? 16U : nk;
+                        if (m.attn_p) top = -std::numeric_limits<double>::infinity();
+                        for (std::size_t j0 = 0; j0 < nk; j0 += step) {
+                            const std::size_t j1 = std::min(j0 + step, nk);
+                            if (m.attn_p) {
+                                double next = top;
+                                for (std::size_t j = j0; j < j1; ++j) next = std::max(next, s[j]);
+                                const double alpha = std::exp(top - next);
+                                sum *= alpha;
+                                for (double& v : acc) v *= alpha;
+                                top = next;
+                            }
+                            for (std::size_t j = j0; j < j1; ++j) {
+                                // Round at this online step's maximum; earlier contributions are only rescaled.
+                                const double e = std::exp(s[j] - top);
+                                const double pj = m.attn_p ? static_cast<double>(round_f16_terms(static_cast<float>(e), m.attn_p)) : e;
+                                sum += pj;
+                                const float* v = &qkv[(begin + j) * 3U * W + 2U * W + h * D];
+                                for (std::size_t d = 0; d < D; ++d) acc[d] += pj * static_cast<double>(v[d]);
+                            }
                         }
                         for (std::size_t d = 0; d < D; ++d) att[r * W + h * D + d] = static_cast<float>(acc[d] / sum);
                     }

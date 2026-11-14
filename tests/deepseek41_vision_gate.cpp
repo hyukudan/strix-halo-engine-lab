@@ -6,8 +6,8 @@
 //                                [--dump DIR] [--rounding none|linear|attention|both|attention2|both2|attention:QKVP]
 //
 // --dump writes this backend's rows (BF16 values as FP32) and tower output beside the reference names, so two
-// backends can be compared row by row. --rounding (host only, diagnostic) runs the FP32 reference with the device's
-// FP16 operand roundings at the named sites (ReferenceRounding): it attributes a device miss to a rounding site.
+// backends can be compared row by row; references, aliases and existing dumps cannot be overwritten.
+// --rounding (host only, diagnostic) studies FP16 operand sensitivity (ReferenceRounding), not bitwise device equality.
 //
 // Per case of DIR/cases.txt:
 //   preprocess  PNG -> adapter.patches() against the reference patches (max |diff| <= 1e-6, which implies equal
@@ -17,6 +17,7 @@
 // Thresholds: host FP32 backend cosine >= 0.99999 (graph); device backend mean >= 0.9995, min >= 0.998, relative
 // L2 <= 2 % (arithmetic class FAST). The device backend also prints the per-layer time receipt.
 #include "../src/deepseek41/vision_adapter.hpp"
+#include "vision_gate_dump.hpp"
 #include "vision_gate_options.hpp"
 
 #include "strix/deepseek41_model.hpp"
@@ -352,7 +353,11 @@ int run(int argc, char** argv) {
     bool ok = true;
     unsigned ran = 0;
     const std::filesystem::path dir(ref);
-    for (const Case& c : read_cases(dir)) {
+    const auto cases = read_cases(dir);
+    if (!dump_dir.empty())
+        for (const Case& c : cases)
+            if (listed(only, c.name)) vision_gate::check_dump_paths(dir, dump_dir, c.name);
+    for (const Case& c : cases) {
         if (!listed(only, c.name)) continue;
         const std::vector<float> ref_patches = read_raw<float>(dir / (c.name + ".patches.f32"));
         const unsigned patches = c.grid_h * c.grid_w;
@@ -431,9 +436,7 @@ int run(int argc, char** argv) {
             m = compare(got.data(), want.data(), rows.width, image_rows);
             if (!dump_dir.empty()) {  // this backend's rows and tower output, same layout as the reference dumps
                 const auto write = [&](const std::string& file, const std::vector<float>& v) {
-                    std::ofstream f(std::filesystem::path(dump_dir) / (c.name + file), std::ios::binary);
-                    f.write(reinterpret_cast<const char*>(v.data()), static_cast<std::streamsize>(v.size() * sizeof(float)));
-                    if (!f) throw std::runtime_error("cannot write the dump of " + c.name);
+                    vision_gate::write_dump(std::filesystem::path(dump_dir) / (c.name + file), v);
                 };
                 write(".rows.f32", got);
                 write(".hidden.f32", hidden_copy);

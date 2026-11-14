@@ -738,8 +738,10 @@ void Encoder::load(const EncoderWeights& w) {
         im.blocks.push_back(std::move(d));
     }
     if (im.cfg.final_norm) {
+        const auto tv = LoadClock::now();
         im.fnw = make_vector(w.final_norm_w, im.cfg.width);
         im.fnb = make_vector(w.final_norm_b, im.cfg.width);
+        ls.vectors_ms += ms_from(tv);
     }
     im.loaded = true;
     ls.total_ms = std::chrono::duration<double, std::milli>(LoadClock::now() - t0).count();
