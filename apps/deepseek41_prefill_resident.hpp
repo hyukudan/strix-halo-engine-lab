@@ -51,14 +51,16 @@ inline constexpr const char* kEngineName = "deepseek41-prefill";
 }
 
 // The prompt format of --prompt: comma-separated decimal ids (the app's read_prompt).
-[[nodiscard]] inline std::vector<std::uint32_t> read_csv_prompt(const std::string& path) {
-    std::ifstream in(path);
-    if (!in) throw std::invalid_argument("cannot read " + path);
-    std::string text((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+[[nodiscard]] inline std::vector<std::uint32_t> read_csv_prompt(const std::string& path, std::uint64_t rows = 0) {
+    const std::string text = rp::read_text_file(path, rp::kMaxPromptBytes);
     std::vector<std::uint32_t> ids;
     std::stringstream ss(text);
     for (std::string t; std::getline(ss, t, ',');)
         if (!t.empty()) ids.push_back(static_cast<std::uint32_t>(std::stoul(t)));
+    if (rows != 0) {
+        if (rows > ids.size()) throw std::invalid_argument("prompt shorter than --rows");
+        ids.resize(static_cast<std::size_t>(rows));
+    }
     return ids;
 }
 
@@ -123,7 +125,30 @@ template<class Prefill>
     h.world = w.world;
     h.capacity = w.capacity;
     h.prompt_max = w.prompt_max;
-    h.read_prompt = [](const std::string& path) { return read_csv_prompt(path); };
+    h.read_prompt = [rows = w.prompt_max](const std::string& path) { return read_csv_prompt(path, rows); };
+    h.validate_arm = [](const rp::Arm& arm) {
+        if (arm.steps != 1) throw rp::PlanError("deepseek41-prefill requires steps:1");
+        // Check the throwing construct resolvers before any environment/object mutation.
+        for (const auto& [key, value] : arm.env) {
+            if (value.empty()) continue;
+            if (key == "STRIX_DS41_PREFILL_FP16_PROJ") {
+                std::stringstream ss(value);
+                for (std::string t; std::getline(ss, t, ',');)
+                    if (t != "q_a" && t != "kv" && t != "q_b" && t != "o_a" && t != "o_b")
+                        throw rp::PlanError(key + ": " + t);
+            } else if (key == "STRIX_DS41_PREFILL_APPROX_LAYERS") {
+                char* end = nullptr;
+                (void)std::strtoul(value.c_str(), &end, 10);
+                if (end == nullptr || *end != '-') throw rp::PlanError(key + ": first-end");
+            } else if (key == "STRIX_DS41_PREFILL_DENSE_MIN_ROWS") {
+                (void)std::stoul(value);
+            }
+        }
+    };
+    h.validate_batch = [](const rp::BatchSpec& spec) {
+        for (const auto& request : spec.requests)
+            if (request.max_tokens != 1) throw rp::PlanError("deepseek41-prefill requires batch max_tokens:1");
+    };
     if (w.world > 1) {
         if (!w.exchange || !w.barrier) throw std::invalid_argument("resident: world 2 needs the peer exchange and barrier");
         auto ex = w.exchange;

@@ -193,7 +193,7 @@ inline constexpr PrefillLever kPrefillLevers[] = {
     {"STRIX_DS41_PREFILL_ROUTER_WIDE", PrefillLeverClass::cached},
     {"STRIX_DS41_PREFILL_SELECT", PrefillLeverClass::reload},
     {"STRIX_DS41_PREFILL_SLABS", PrefillLeverClass::reload},  // picks the window at load
-    {"STRIX_DS41_PREFILL_SPLIT_MIN_ROWS", PrefillLeverClass::construct},
+    {"STRIX_DS41_PREFILL_SPLIT_MIN_ROWS", PrefillLeverClass::reload},  // sizes residual streams and half sums
     {"STRIX_DS41_PREFILL_STAGE", PrefillLeverClass::cached},
     {"STRIX_DS41_PREFILL_STAGED_GATHER", PrefillLeverClass::construct},  // needs staged_half (reload) as well
     {"STRIX_DS41_PREFILL_STAGED_HALF", PrefillLeverClass::reload},  // sizes the communicator staging buffers at load

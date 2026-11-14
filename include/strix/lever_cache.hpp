@@ -59,15 +59,20 @@ public:
         const std::uint64_t want = lever_generation() + 1U;  // seen_ == 0: never resolved
         if constexpr (kLockFree) {
             if (seen_.load(std::memory_order_acquire) != want) {
-                value_.store(resolve_(), std::memory_order_relaxed);
-                seen_.store(want, std::memory_order_release);
+                std::lock_guard<std::mutex> lock(mutex_);
+                const auto current = lever_generation() + 1U;
+                if (seen_.load(std::memory_order_relaxed) != current) {
+                    value_.store(resolve_(), std::memory_order_relaxed);
+                    seen_.store(current, std::memory_order_release);
+                }
             }
             return value_.load(std::memory_order_relaxed);
         } else {
             std::lock_guard<std::mutex> lock(mutex_);
-            if (seen_.load(std::memory_order_relaxed) != want) {
+            const auto current = lever_generation() + 1U;
+            if (seen_.load(std::memory_order_relaxed) != current) {
                 value_ = resolve_();
-                seen_.store(want, std::memory_order_relaxed);
+                seen_.store(current, std::memory_order_relaxed);
             }
             return value_;
         }
@@ -76,12 +81,12 @@ public:
 
     // Pins `v` until the next lever_environment_changed().
     void set(T v) {
+        std::lock_guard<std::mutex> lock(mutex_);
         const std::uint64_t want = lever_generation() + 1U;
         if constexpr (kLockFree) {
             value_.store(v, std::memory_order_relaxed);
             seen_.store(want, std::memory_order_release);
         } else {
-            std::lock_guard<std::mutex> lock(mutex_);
             value_ = std::move(v);
             seen_.store(want, std::memory_order_relaxed);
         }
@@ -89,12 +94,11 @@ public:
 
 private:
     static constexpr bool kLockFree = detail::lever_lock_free<T>::value;
-    struct Empty {};
 
     Resolve resolve_;
     std::atomic<std::uint64_t> seen_{0};
     std::conditional_t<kLockFree, std::atomic<T>, T> value_{};
-    std::conditional_t<kLockFree, Empty, std::mutex> mutex_;
+    std::mutex mutex_;
 };
 
 }  // namespace strix

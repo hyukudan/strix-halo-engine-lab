@@ -8,6 +8,7 @@
 #include "deepseek41_prefill_resident.hpp"
 
 #include "strix/lever_cache.hpp"
+#include "strix/env_flags.hpp"
 
 #include <algorithm>
 #include <cstdio>
@@ -20,6 +21,12 @@
 #include <span>
 #include <string>
 #include <vector>
+#if defined(_WIN32)
+#include <process.h>
+#else
+#include <sys/wait.h>
+#include <unistd.h>
+#endif
 
 namespace fs = std::filesystem;
 namespace dr = strix::deepseek41::resident;
@@ -28,6 +35,7 @@ namespace rp = strix::serve::resident;
 namespace {
 
 int failures = 0;
+std::string executable;
 void check(bool ok, const std::string& what) {
     if (!ok) {
         std::fprintf(stderr, "FAIL: %s\n", what.c_str());
@@ -75,6 +83,8 @@ void table_covers_sources() {
     const rp::LeverTable t = dr::lever_table();
     check(t.size() == table.size(), "runner table has every row");
     check(rp::lever_class(t, "STRIX_DS41_NOT_A_LEVER") == rp::LeverClass::reload, "undeclared lever is reload");
+    check(rp::lever_class(t, "STRIX_DS41_PREFILL_SPLIT_MIN_ROWS") == rp::LeverClass::reload,
+          "allocation-dependent split threshold requires reload");
     // The startup pair resolver reads its inputs once and exports derived levers into the environment (some with
     // overwrite), so a later change of any name it touches would not reach the engine the way a fresh process sees it
     // (device-measured 11-14: an arm STRIX_DS41_FAST_PREFILL=0 kept the FAST logits). Every such name is reload.
@@ -92,7 +102,7 @@ void table_covers_sources() {
 
 // A converted lever (was a static const): which kernel form the fake uses.
 strix::lever_cache<int> g_form{[] {
-    const char* v = std::getenv("STRIX_DS41_HC_SITE_FAST");
+    const char* v = strix::envcfg::text("STRIX_DS41_HC_SITE_FAST");
     return v != nullptr && v[0] == '0' ? 0 : 1;
 }};
 
@@ -106,7 +116,7 @@ struct FakePrefill {
     int construct_value = 0;  // a per-object switch, re-resolved by apply_levers (as DevicePrefill)
     int applies = 0;
     static int resolve_construct() {
-        const char* v = std::getenv("FAKE_CONSTRUCT");
+        const char* v = strix::envcfg::text("FAKE_CONSTRUCT");
         return v != nullptr ? std::atoi(v) : 0;
     }
     FakePrefill() : construct_value(resolve_construct()) {}
@@ -156,6 +166,27 @@ std::string plan_text(const fs::path& prompt, const std::string& arms) {
            prompt.generic_string() + R"("}],"arms":[)" + arms + "]}";
 }
 
+std::string fresh_digest(const fs::path& prompt, const fs::path& output, const char* form, const char* construct) {
+    const auto p = prompt.string(), o = output.string();
+#if defined(_WIN32)
+    const char* args[] = {executable.c_str(), "--fresh", form, construct, p.c_str(), o.c_str(), nullptr};
+    const auto status = _spawnv(_P_WAIT, executable.c_str(), args);
+#else
+    const auto pid = fork();
+    if (pid == 0) {
+        execl(executable.c_str(), executable.c_str(), "--fresh", form, construct, p.c_str(), o.c_str(),
+              static_cast<char*>(nullptr));
+        _exit(127);
+    }
+    int status = -1;
+    if (pid > 0 && waitpid(pid, &status, 0) != pid) status = -1;
+#endif
+    check(status == 0, "fresh subprocess exited successfully");
+    const auto digest = read_file(output);
+    check(!digest.empty(), "fresh subprocess wrote logits digest");
+    return digest;
+}
+
 void fake_plan_matches_fresh() {
     const fs::path dir = fs::temp_directory_path() / ("strix-ds41-resident-test-" + std::to_string(std::rand()));
     fs::create_directories(dir);
@@ -170,26 +201,27 @@ void fake_plan_matches_fresh() {
     const std::string arm_a = R"({"name":"A","env":{"STRIX_DS41_HC_SITE_FAST":"0"},"prompts":["p","q"]})";
     const std::string arm_b = R"({"name":"B","env":{"STRIX_DS41_HC_SITE_FAST":"1"},"prompts":["p","q"]})";
     const auto run = [&](const std::string& arms, const std::string& tag) {
-        const fs::path planf = dir / (tag + ".json");
-        {
-            std::ofstream f(planf);
-            f << plan_text(prompt, arms);
-        }
         FakePrefill pre;
         dr::Wiring w;
         w.capacity = 64;
         w.print = false;
-        const auto oc = dr::run_plan_file(pre, w, planf.string(), (dir / tag).string(), 0.0);
-        if (tag != "construct") check(pre.applies > 0, tag + ": apply_levers called on arm switch");
-        (void)oc;
+        auto h = dr::make_hooks(pre, w);
+        h.levers.push_back({"FAKE_CONSTRUCT", rp::LeverClass::construct});
+        const auto oc = rp::run_plan(rp::parse_plan(plan_text(prompt, arms)), dir / tag, 0.0, h);
+        if (tag.rfind("reload", 0) != 0) {
+            check(pre.applies > 0, tag + ": apply_levers called on arm switch");
+            check(oc.errors == 0 && oc.runs == oc.slots && oc.skipped == 0, tag + ": every intended run executed");
+        } else {
+            check(oc.errors == oc.slots && pre.applies == 0, "reload arms never execute");
+        }
         return receipts(dir / tag);
     };
-    // fresh processes of each arm alone (the cache's first read after the arm's environment: the fresh value)
-    const auto fa = run(arm_a, "fresh-a");
-    const auto fb = run(arm_b, "fresh-b");
+    // Independent controls: environment set before construction, no resident apply hook in the child.
+    const auto fa = fresh_digest(prompt, dir / "fresh-a", "0", "0");
+    const auto fb = fresh_digest(prompt, dir / "fresh-b", "1", "0");
     const auto res = run(arm_a + "," + arm_b, "resident");
-    check(fa.size() == 6 && fb.size() == 6 && res.size() == 12, "run counts (6, 6, 12)");
-    std::map<std::string, std::string> fresh = {{"A", fa.empty() ? "" : fa[0].logits_fnv}, {"B", fb.empty() ? "" : fb[0].logits_fnv}};
+    check(res.size() == 12, "all 12 resident runtime runs executed");
+    std::map<std::string, std::string> fresh = {{"A", fa}, {"B", fb}};
     check(!fresh["A"].empty() && fresh["A"] != fresh["B"], "the lever changes the result");
     std::size_t cold = 0;
     for (const auto& r : res) {
@@ -203,19 +235,81 @@ void fake_plan_matches_fresh() {
     // construct lever via apply_levers
     const auto con = run(R"({"name":"C0","env":{"FAKE_CONSTRUCT":"0"},"prompts":["p"]},{"name":"C5","env":{"FAKE_CONSTRUCT":"5"},"prompts":["p"]})",
                          "construct");
-    // FAKE_CONSTRUCT is not in the table -> reload: refused, never measured with a stale value
-    bool refused = !con.empty();
-    for (const auto& r : con) refused = refused && (r.arm == "C0" || r.error.find("reload") != std::string::npos);
-    check(refused, "an undeclared lever is refused as reload");
+    const auto c0 = fresh_digest(prompt, dir / "fresh-c0", "1", "0");
+    const auto c5 = fresh_digest(prompt, dir / "fresh-c5", "1", "5");
+    check(c0 != c5 && con.size() == 6, "construct lever changes logits and executes six runs");
+    for (const auto& r : con) {
+        check(r.error.empty(), "construct arm executed");
+        check(r.logits_fnv == (r.arm == "C0" ? c0 : c5), "construct logits match fresh construction");
+    }
+    const auto reload = run(R"({"name":"R","env":{"FAKE_UNDECLARED":"1"}})", "reload-unknown");
+    for (const auto& r : reload) check(r.error.find("reload") != std::string::npos, "undeclared lever refused");
+    const auto split = run(R"({"name":"R","env":{"STRIX_DS41_PREFILL_SPLIT_MIN_ROWS":"32769"}})", "reload-split");
+    for (const auto& r : split) check(r.error.find("reload") != std::string::npos, "split threshold refused");
     check(std::getenv("STRIX_DS41_HC_SITE_FAST") == nullptr || std::getenv("STRIX_DS41_HC_SITE_FAST")[0] == 0,
           "the runner restores the launch environment");
     std::error_code ec;
     fs::remove_all(dir, ec);
 }
 
+void adapter_validation() {
+    const auto dir = fs::temp_directory_path() / "strix-613-adapter-validation";
+    fs::create_directories(dir);
+    const auto prompt = dir / "p.csv";
+    { std::ofstream out(prompt); out << "1,2,3,4,5"; }
+    FakePrefill pre;
+    dr::Wiring w;
+    w.capacity = 8193;
+    w.prompt_max = 5;
+    auto h = dr::make_hooks(pre, w);
+    auto p = rp::parse_plan(plan_text(prompt, R"({"name":"A"})"));
+    p.repeats = 1;
+    const auto refused = [&](const rp::Plan& plan, const char* label) {
+        bool rejected = false;
+        try { (void)rp::run_plan(plan, dir / label, 0, h); }
+        catch (const rp::PlanError&) { rejected = true; }
+        check(rejected && pre.applies == 0, std::string(label) + " rejected before scheduling/mutation");
+        check(!fs::exists(dir / label), "validation creates no receipts");
+    };
+    p.arms[0].steps = 2;
+    refused(p, "steps-two");
+    p.arms[0].steps = 1;
+    p.concurrency = 1;
+    p.steps = 2; // implicit batch request length, independent of arm.steps
+    refused(p, "batch-two");
+    p.steps = 1;
+    p.concurrency.reset();
+    p.arms[0].env = {{"STRIX_DS41_PREFILL_FP16_PROJ", "bogus"}, {"STRIX_DS41_PREFILL_PACK", "0"}};
+    refused(p, "invalid-projection");
+    check(strix::envcfg::text("STRIX_DS41_PREFILL_FP16_PROJ") == nullptr, "invalid arm leaves environment unchanged");
+    p.arms[0].env.clear();
+    check(h.read_prompt(prompt.string()).size() == 5, "exact --rows accepted");
+    { std::ofstream out(prompt); out << "1,2,3,4,5,6"; }
+    check(h.read_prompt(prompt.string()).size() == 5, "longer prompt truncated exactly");
+    { std::ofstream out(prompt); out << "1,2,3,4"; }
+    const auto oc = rp::run_plan(p, dir / "short", 0, h);
+    check(oc.errors == oc.slots && pre.applies == 0, "short --rows input never executes");
+    p.concurrency = 1;
+    const auto batch = rp::run_plan(p, dir / "short-batch", 0, h);
+    check(batch.errors == batch.slots && pre.applies == 0, "short batch input never executes");
+    std::error_code ec;
+    fs::remove_all(dir, ec);
+}
+
 }  // namespace
 
-int main() try {
+int main(int argc, char** argv) try {
+    if (argc == 6 && std::string(argv[1]) == "--fresh") {
+        if (rp::detail::set_env("STRIX_DS41_HC_SITE_FAST", argv[2]) != 0 ||
+            rp::detail::set_env("FAKE_CONSTRUCT", argv[3]) != 0) return 2;
+        FakePrefill pre;
+        const auto result = pre.run(dr::read_csv_prompt(argv[4]));
+        std::ofstream out(argv[5]);
+        out << rp::hex64(dr::logits_fnv(result.logits));
+        return out ? 0 : 3;
+    }
+    executable = fs::absolute(argv[0]).string();
+    adapter_validation();
     table_covers_sources();
     fake_plan_matches_fresh();
     if (failures == 0) std::printf("deepseek41_prefill_resident_cpu_tests: ok\n");

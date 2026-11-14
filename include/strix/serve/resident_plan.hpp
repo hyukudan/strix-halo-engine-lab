@@ -70,9 +70,10 @@ inline constexpr std::uint32_t kFnv32Prime = 0x01000193U;
 [[nodiscard]] inline std::string hex32(std::uint32_t value) { return hex_digits(value, 8); }
 
 // FNV-1a 64 over the little-endian bytes of the generated token ids.
-[[nodiscard]] inline std::uint64_t token_digest(const std::vector<std::int32_t>& tokens) noexcept {
+template<class Token>
+[[nodiscard]] inline std::uint64_t token_digest(const std::vector<Token>& tokens) noexcept {
     std::uint64_t h = kFnv64Offset;
-    for (const std::int32_t t : tokens) {
+    for (const Token t : tokens) {
         const auto u = static_cast<std::uint32_t>(t);
         for (unsigned shift = 0; shift < 32U; shift += 8U) {
             h ^= (u >> shift) & 0xffU;
@@ -374,7 +375,11 @@ inline Json normalized_json(const Plan& plan) {
 // Parses and validates a plan (plain JSON; duplicate keys and unknown keys are rejected so a typo never
 // falls back to a default). The hash covers the normalized plan, so key order, whitespace and spelled-out
 // defaults do not change it.
+inline constexpr std::size_t kMaxPlanBytes = 1024U * 1024U;
+inline constexpr std::size_t kMaxPromptBytes = 64U * 1024U * 1024U;
+
 [[nodiscard]] inline Plan parse_plan(std::string_view text) {
+    if (text.size() > kMaxPlanBytes) throw PlanError("resident plan: input exceeds 1 MiB");
     Json root;
     try {
         root = parse_json_unique(text);
@@ -638,7 +643,23 @@ struct RunSlot {
 // previous occurrence or the group has just been loaded. With early stop, the runner skips the remaining
 // passes of a group once decide_early_stop() says so; the schedule itself is static.
 [[nodiscard]] inline std::vector<RunSlot> schedule(const Plan& plan, const std::vector<ArmGroup>& groups) {
+    // Conservative bound includes warmups at every occurrence, even for sequential order.
+    // Check before allocating: neither a time budget nor early stop bounds host memory.
+    constexpr std::size_t max_slots = 65536;
+    std::size_t bound = 0;
+    const auto add = [&](const Arm& a, std::size_t repeats) {
+        if (a.prompts.size() > max_slots || plan.warmup > max_slots - a.prompts.size())
+            throw PlanError("resident plan: schedule exceeds 65536 slots");
+        const auto per = a.prompts.size() + plan.warmup;
+        if (per != 0 && repeats > (max_slots - bound) / per)
+            throw PlanError("resident plan: schedule exceeds 65536 slots");
+        bound += per * repeats;
+    };
+    for (const auto& g : groups)
+        for (const auto a : g.arms) add(plan.arms.at(a), plan.repeats);
+    if (plan.cold_control && !plan.arms.empty()) add(plan.arms.front(), 1);
     std::vector<RunSlot> out;
+    out.reserve(bound);
     std::uint64_t seq = 0;
     const auto emit_occurrence = [&](std::size_t g, std::size_t arm, std::uint32_t pass, std::size_t position,
                                      bool switched, bool cold) {
@@ -691,6 +712,7 @@ struct RunResult {
     std::string logits_sha256;         // sha256 of the same raw f32 row
     std::string error;                 // non-empty: the run failed and is excluded from statistics
     bool cold_run = false;             // first run after the load or an arm switch (warm-ups included)
+    Json prompt_inputs = Json::array(); // ordered effective input counts and content digests
 };
 
 [[nodiscard]] inline double metric_value(const RunResult& r, std::string_view metric) noexcept {
@@ -731,25 +753,29 @@ struct Comparison {
     double sd_rel = kNoValue;
     double half_rel = kNoValue;  // critical value * sd / sqrt(n)
     std::string verdict;         // insufficient | separated | equivalent | open
+    bool cold_run = false;
 };
 
 // Pairs `arm` with `baseline` on (pass, prompt); warmups, cold-control runs, errors and non-positive or
 // missing baseline values are excluded.
 [[nodiscard]] inline Comparison compare_pair(const Plan& plan, const std::vector<ArmGroup>& groups,
                                              std::size_t baseline, std::size_t arm,
-                                             const std::vector<RunRecord>& records) {
+                                             const std::vector<RunRecord>& records, bool cold_run = false) {
     Comparison c;
     c.baseline = baseline;
     c.arm = arm;
     c.metric = plan.early_stop.metric;
+    c.cold_run = cold_run;
     c.cross_reload = group_of(groups, baseline) != group_of(groups, arm);
     std::vector<double> d;
     for (const RunRecord& a : records) {
-        if (a.slot.arm != baseline || a.slot.warmup || a.slot.cold || !a.result.error.empty()) continue;
+        if (a.slot.arm != baseline || a.slot.warmup || a.slot.cold || !a.result.error.empty() ||
+            a.result.cold_run != cold_run) continue;
         const double av = metric_value(a.result, c.metric);
         if (!std::isfinite(av) || av <= 0.0) continue;
         for (const RunRecord& b : records) {
-            if (b.slot.arm != arm || b.slot.warmup || b.slot.cold || !b.result.error.empty()) continue;
+            if (b.slot.arm != arm || b.slot.warmup || b.slot.cold || !b.result.error.empty() ||
+                b.result.cold_run != cold_run) continue;
             if (b.slot.pass != a.slot.pass || b.slot.prompt != a.slot.prompt) continue;
             const double bv = metric_value(b.result, c.metric);
             if (std::isfinite(bv)) d.push_back((bv - av) / av);
@@ -786,9 +812,9 @@ struct Comparison {
 
 // Plan arm 0 against every other arm.
 [[nodiscard]] inline std::vector<Comparison> compare_all(const Plan& plan, const std::vector<ArmGroup>& groups,
-                                                         const std::vector<RunRecord>& records) {
+                                                         const std::vector<RunRecord>& records, bool cold_run = false) {
     std::vector<Comparison> out;
-    for (std::size_t i = 1; i < plan.arms.size(); ++i) out.push_back(compare_pair(plan, groups, 0, i, records));
+    for (std::size_t i = 1; i < plan.arms.size(); ++i) out.push_back(compare_pair(plan, groups, 0, i, records, cold_run));
     return out;
 }
 
@@ -803,6 +829,7 @@ struct StopDecision {
     if (!plan.early_stop.enabled || comparisons.empty()) return out;
     bool separated = false, equivalent = false;
     for (const Comparison& c : comparisons) {
+        if (c.cold_run) return out;  // only warm evidence can stop a plan
         if (c.verdict == "separated") separated = true;
         else if (c.verdict == "equivalent") equivalent = true;
         else return out;
@@ -845,6 +872,7 @@ inline Json number_or_null(double v) { return std::isfinite(v) ? Json(v) : Json(
     out.set("cold_control", Json(s.cold));
     out.set("cold_run", Json(r.cold_run));
     out.set("steps", Json(static_cast<std::uint64_t>(arm.steps)));
+    out.set("prompt_inputs", r.prompt_inputs);
     for (const std::string_view m : kMetricNames) out.set(std::string(m), detail::number_or_null(metric_value(r, m)));
     out.set("n_tokens", Json(static_cast<std::uint64_t>(r.tokens.size())));
     out.set("tokens_fnv", Json(hex64(token_digest(r.tokens))));
@@ -883,10 +911,11 @@ inline Stats stats(const std::vector<double>& v) {
     return s;
 }
 inline std::vector<double> resident_values(const std::vector<RunRecord>& records, std::size_t arm,
-                                           std::string_view metric, bool cold) {
+                                           std::string_view metric, bool cold, bool cold_run = false) {
     std::vector<double> v;
     for (const RunRecord& r : records) {
         if (r.slot.arm != arm || r.slot.warmup || r.slot.cold != cold || !r.result.error.empty()) continue;
+        if (!cold && r.result.cold_run != cold_run) continue;
         const double x = metric_value(r.result, metric);
         if (std::isfinite(x)) v.push_back(x);
     }
@@ -904,6 +933,7 @@ inline std::vector<double> resident_values(const std::vector<RunRecord>& records
     out.set("engine", Json(plan.engine));
     out.set("order", Json(std::string(order_name(plan.order))));
     out.set("metric", Json(plan.early_stop.metric));
+    out.set("early_stop_population", Json("warm"));
     out.set("groups", Json(static_cast<std::uint64_t>(groups.size())));
     std::size_t errors = 0;
     for (const RunRecord& r : records) errors += r.result.error.empty() ? 0U : 1U;
@@ -925,16 +955,28 @@ inline std::vector<double> resident_values(const std::vector<RunRecord>& records
         }
         a.set("n_runs", Json(static_cast<std::uint64_t>(n)));
         a.set("mean", std::move(means));
+        Json cold_means = Json::object();
+        std::size_t cold_n = 0;
+        for (const std::string_view m : kMetricNames) {
+            const auto s = detail::stats(detail::resident_values(records, i, m, false, true));
+            cold_n = std::max(cold_n, s.n);
+            cold_means.set(std::string(m), detail::number_or_null(s.mean));
+        }
+        a.set("population", Json("warm"));
+        a.set("cold_n_runs", Json(static_cast<std::uint64_t>(cold_n)));
+        a.set("cold_mean", std::move(cold_means));
         arms.push(std::move(a));
     }
     out.set("arms", std::move(arms));
 
-    Json cmp = Json::array();
-    for (const Comparison& c : comparisons) {
+    const auto comparison_json = [&](const std::vector<Comparison>& values) {
+      Json cmp = Json::array();
+      for (const Comparison& c : values) {
         Json item = Json::object();
         item.set("baseline", Json(plan.arms.at(c.baseline).name));
         item.set("arm", Json(plan.arms.at(c.arm).name));
         item.set("metric", Json(c.metric));
+        item.set("population", Json(c.cold_run ? "cold" : "warm"));
         item.set("cross_reload", Json(c.cross_reload));
         item.set("n_pairs", Json(static_cast<std::uint64_t>(c.n_pairs)));
         item.set("mean_rel", detail::number_or_null(c.mean_rel));
@@ -943,8 +985,11 @@ inline std::vector<double> resident_values(const std::vector<RunRecord>& records
         item.set("ci_hi", detail::number_or_null(c.mean_rel + c.half_rel));
         item.set("verdict", Json(c.verdict));
         cmp.push(std::move(item));
-    }
-    out.set("comparisons", std::move(cmp));
+      }
+      return cmp;
+    };
+    out.set("comparisons", comparison_json(comparisons));
+    out.set("cold_comparisons", comparison_json(compare_all(plan, groups, records, true)));
     out.set("stopped_early", Json(stop.stop));
     out.set("stop_reason", Json(stop.reason));
 

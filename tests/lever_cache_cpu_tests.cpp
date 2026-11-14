@@ -9,6 +9,9 @@
 #include <stdexcept>
 #include <string>
 #include <vector>
+#include <thread>
+#include <future>
+#include <chrono>
 
 namespace {
 
@@ -31,6 +34,42 @@ std::vector<bool> resolve_table() {
     std::vector<bool> t(4, false);
     t[static_cast<std::size_t>(g_source & 3)] = true;
     return t;
+}
+
+std::atomic<int> entered{0};
+std::atomic<bool> release_resolver{false};
+int slow_resolve() {
+    ++entered;
+    while (!release_resolver.load()) std::this_thread::yield();
+    return 7;
+}
+
+void concurrent_miss_and_pin() {
+    using namespace std::chrono_literals;
+    {
+        strix::lever_cache<int> c{slow_resolve};
+        std::vector<std::future<int>> reads;
+        for (int i = 0; i < 8; ++i) reads.push_back(std::async(std::launch::async, [&] { return c.get(); }));
+        while (entered.load() == 0) std::this_thread::yield();
+        std::this_thread::sleep_for(50ms);
+        release_resolver = true;
+        for (auto& r : reads) check(r.get() == 7, "concurrent first read value");
+        check(entered == 1, "concurrent first reads resolve exactly once");
+    }
+    entered = 0;
+    release_resolver = false;
+    strix::lever_cache<int> c{slow_resolve};
+    auto read = std::async(std::launch::async, [&] { return c.get(); });
+    while (entered.load() == 0) std::this_thread::yield();
+    std::promise<void> started;
+    auto pin = std::async(std::launch::async, [&] { started.set_value(); c.set(42); });
+    started.get_future().wait();
+    const bool serialized = pin.wait_for(50ms) == std::future_status::timeout;
+    release_resolver = true;
+    (void)read.get();
+    pin.get();
+    check(serialized, "pin publication waits for in-flight resolution");
+    check(c.get() == 42 && entered == 1, "resolution cannot overwrite a completed pin");
 }
 
 }  // namespace
@@ -82,6 +121,7 @@ int main() {
         check(raised, "a throwing resolver propagates");
         check(bad() == 5, "a throwing resolver is retried on the next read (like a static initialiser)");
     }
+    concurrent_miss_and_pin();
     if (failures == 0) std::printf("lever_cache: all checks passed\n");
     return failures == 0 ? 0 : 1;
 }

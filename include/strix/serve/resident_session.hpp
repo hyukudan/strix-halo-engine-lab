@@ -1,5 +1,7 @@
 #pragma once
 
+#include <exception>
+
 // Resident test server: the engine-neutral runner on top of resident_plan.hpp. An engine app loads its model
 // once, fills a Hooks struct (lever table, rank agreement, arm switch, reset, one timed run) and then either
 //   run_plan()    runs one plan (--resident-plan FILE), or
@@ -267,6 +269,7 @@ struct Hooks {
     std::function<bool(const std::array<std::uint32_t, 8>&)> agree;
     // Optional check of every arm before the plan starts (throw PlanError for a value the engine cannot apply).
     std::function<void(const Arm&)> validate_arm;
+    std::function<void(const BatchSpec&)> validate_batch;
     // After the env of an arm (or the baseline) is set: re-resolve construct/cached levers from the environment.
     std::function<void()> apply_levers;
     // Reset per-request state (KV, positions, draft state, RNG).
@@ -288,6 +291,7 @@ inline constexpr std::uint32_t kTagCtl = 0x5243544cU;   // "RCTL": rank 0 contin
 inline constexpr std::uint32_t kTagSlot = 0x52534c54U;  // "RSLT": arm switch + prompt per slot
 inline constexpr std::uint32_t kTagJob = 0x524a4f42U;   // "RJOB": session job
 inline constexpr std::uint32_t kTagBatch = 0x52424154U; // "RBAT": N, mode, MTP and total token agreement
+inline constexpr std::uint32_t kTagInput = 0x52494e50U; // "RINP": effective input digest, count and request index
 
 [[nodiscard]] inline std::array<std::uint32_t, 8> agreement_fields(std::uint32_t tag, std::uint64_t hash,
                                                                    std::uint32_t a, std::uint32_t b, std::uint32_t c,
@@ -307,7 +311,8 @@ inline constexpr std::uint32_t kTagBatch = 0x52424154U; // "RBAT": N, mode, MTP 
     std::ifstream in(path, std::ios::binary | std::ios::ate);
     if (!in) throw std::runtime_error("cannot open prompt " + path);
     const std::streamoff n = in.tellg();
-    if (n <= 0 || n % 4 != 0) throw std::runtime_error("prompt " + path + " is empty or not u32 LE");
+    if (n <= 0 || n % 4 != 0 || static_cast<std::uint64_t>(n) > kMaxPromptBytes)
+        throw std::runtime_error("prompt " + path + " is empty, oversized or not u32 LE");
     std::vector<std::uint32_t> out(static_cast<std::size_t>(n / 4));
     in.seekg(0);
     in.read(reinterpret_cast<char*>(out.data()), n);
@@ -315,12 +320,19 @@ inline constexpr std::uint32_t kTagBatch = 0x52424154U; // "RBAT": N, mode, MTP 
     return out;
 }
 
-[[nodiscard]] inline std::string read_text_file(const std::filesystem::path& path) {
+[[nodiscard]] inline std::string read_text_file(const std::filesystem::path& path, std::size_t limit = kMaxPlanBytes) {
     std::ifstream in(path, std::ios::binary);
     if (!in) throw std::runtime_error("cannot open " + path.string());
-    std::ostringstream ss;
-    ss << in.rdbuf();
-    return ss.str();
+    std::string text;
+    char buf[4096];
+    while (in) {
+        in.read(buf, sizeof(buf));
+        const auto n = static_cast<std::size_t>(in.gcount());
+        if (n > limit - text.size()) throw PlanError("resident input exceeds byte limit: " + path.string());
+        text.append(buf, n);
+    }
+    if (!in.eof()) throw std::runtime_error("cannot read " + path.string());
+    return text;
 }
 
 // Writes via a temporary name and a rename, so a reader never sees a partial file.
@@ -543,7 +555,10 @@ inline constexpr double kMaxBudgetS = 300.0;
 
 // Runs every slot of `plan` on the loaded engine and writes receipts, logits files and (rank 0) summary.json into
 // `out`. budget_s > 0: rank 0 stops the plan before a slot that would end past the budget (estimate: the longest
-// slot so far). Throws PlanError / std::invalid_argument only before the first slot (deterministic on every rank).
+// slot so far). PlanError means pre-execution validation failed; execution failures are fatal runtime errors.
+// Reload groups only diagnose/refuse incompatible arms: no reload or fresh cold control is performed.
+// An "ok" outcome may contain refused/missing-input slots. Automation must inspect errors (summary: errors;
+// session status: run_errors), not just state or the CLI exit code.
 [[nodiscard]] inline PlanOutcome run_plan(const Plan& plan, const std::filesystem::path& out, double budget_s,
                                           Hooks& h) {
     using detail::Clock;
@@ -555,8 +570,16 @@ inline constexpr double kMaxBudgetS = 300.0;
     if (std::find(h.engine_names.begin(), h.engine_names.end(), plan.engine) == h.engine_names.end())
         throw PlanError("resident plan: engine \"" + plan.engine + "\" is not served by this session");
     if (!h.run) throw std::invalid_argument("resident: engine adapter has no run hook");
-    if (h.validate_arm)
-        for (const Arm& arm : plan.arms) h.validate_arm(arm);
+    const BatchSpec spec = batch_spec(plan);
+    try {
+        if (h.validate_arm)
+            for (const Arm& arm : plan.arms) h.validate_arm(arm);
+        if (plan.concurrency && h.validate_batch) h.validate_batch(spec);
+    } catch (const std::invalid_argument& e) {
+        throw PlanError(e.what());
+    } catch (const std::out_of_range& e) {
+        throw PlanError(e.what());
+    }
     const auto groups = group_arms(plan, h.levers);
     // Each batch is one occurrence, regardless of the arm's serial prompt list.
     const auto slots = [&] {
@@ -565,7 +588,6 @@ inline constexpr double kMaxBudgetS = 300.0;
         for (auto& arm : scheduled_plan.arms) arm.prompts.resize(1);
         return schedule(scheduled_plan, groups);
     }();
-    const BatchSpec spec = batch_spec(plan);
     oc.slots = slots.size();
     const Baseline base = capture_baseline(plan, [](const char* k) { return std::getenv(k); });
     std::vector<std::string> mismatch(plan.arms.size());
@@ -590,6 +612,13 @@ inline constexpr double kMaxBudgetS = 300.0;
         strix::lever_environment_changed();  // every strix::lever_cache resolves again from the arm's environment
         if (h.apply_levers) h.apply_levers();
     };
+    bool env_dirty = false;
+    const auto restore = [&] {
+        if (!env_dirty) return;
+        apply_env(application(Arm{}, h.levers, base));
+        env_dirty = false;
+    };
+    try {
     std::vector<RunRecord> records;
     StopDecision stop;
     double longest = 0.0;
@@ -655,7 +684,27 @@ inline constexpr double kMaxBudgetS = 300.0;
         if (!all_ok) {
             rec.result.error = local_error.empty() ? std::string("a peer rank could not run this slot") : local_error;
         } else {
+            const auto agree_input = [&](const std::vector<std::uint32_t>& prompt, std::size_t request) {
+                const auto count = static_cast<std::uint64_t>(prompt.size());
+                const auto digest = token_digest(prompt);
+                const auto fields = agreement_fields(kTagInput, digest, static_cast<std::uint32_t>(count),
+                    static_cast<std::uint32_t>(count >> 32U), static_cast<std::uint32_t>(request),
+                    static_cast<std::uint32_t>(slot.seq));
+                if (!agree_all(h, fields)) throw std::runtime_error("resident: prompt input agreement refused");
+                Json input = Json::object();
+                input.set("request", Json(static_cast<std::uint64_t>(request)));
+                input.set("n_tokens", Json(count));
+                input.set("tokens_fnv", Json(hex64(digest)));
+                rec.result.prompt_inputs.push(std::move(input));
+            };
+            if (plan.concurrency) {
+                for (std::size_t i = 0; i < spec.requests.size(); ++i)
+                    agree_input(batch_prompts[spec.requests[i].prompt], i);
+            } else {
+                agree_input(toks, 0);
+            }
             if (applied_arm != slot.arm) {
+                env_dirty = true;  // even a partially applied arm must roll back on failure
                 apply_env(application(arm, h.levers, base));
                 applied_arm = slot.arm;
                 after_switch = true;
@@ -777,7 +826,7 @@ inline constexpr double kMaxBudgetS = 300.0;
         const auto comps = compare_all(plan, groups, records);
         write_text_atomic(out / "summary.json", summary_json(plan, groups, records, comps, stop).dump());
     }
-    if (applied_arm != plan.arms.size()) apply_env(application(Arm{}, h.levers, base));
+    restore();
     if (h.reset) h.reset();
     if (stop.stop) oc.state = "stopped-early";
     else if (budget_hit) oc.state = "over-budget";  // rank 0 only; see above for the other ranks
@@ -786,6 +835,14 @@ inline constexpr double kMaxBudgetS = 300.0;
                 oc.state.c_str(), stop.stop ? " " : "", stop.stop ? stop.reason.c_str() : "", oc.wall_s);
     std::fflush(stdout);
     return oc;
+    } catch (...) {
+        try {
+            restore();  // restore both environment and partially resolved object members
+        } catch (...) {
+            std::throw_with_nested(std::runtime_error("resident: baseline restoration failed; session must end"));
+        }
+        std::throw_with_nested(std::runtime_error("resident: execution failed; session must end"));
+    }
 }
 
 // ---------------------------------------------------------------------------------------------------
@@ -799,6 +856,7 @@ struct Job {
 };
 
 [[nodiscard]] inline Job parse_job(std::string_view text) {
+    if (text.size() > kMaxPlanBytes) throw PlanError("resident job: input exceeds 1 MiB");
     Json root;
     try {
         root = parse_json_unique(text);
@@ -879,9 +937,6 @@ inline std::size_t run_session(const std::filesystem::path& dir, Hooks& h, const
             const Plan plan = parse_plan(job.plan_text);
             oc = run_plan(plan, job.out, job.budget_s, h);
         } catch (const PlanError& e) {
-            oc.state = "error";
-            oc.error = e.what();
-        } catch (const std::invalid_argument& e) {
             oc.state = "error";
             oc.error = e.what();
         }

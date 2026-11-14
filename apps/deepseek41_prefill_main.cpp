@@ -145,18 +145,7 @@ std::uint64_t fnv(const std::vector<float>& v) {
 }
 
 std::vector<std::uint32_t> read_prompt(const std::string& path, std::uint32_t rows) {
-    std::ifstream in(path);
-    if (!in) throw std::invalid_argument("cannot read " + path);
-    std::string text((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
-    std::vector<std::uint32_t> ids;
-    std::stringstream ss(text);
-    for (std::string t; std::getline(ss, t, ',');)
-        if (!t.empty()) ids.push_back(static_cast<std::uint32_t>(std::stoul(t)));
-    if (rows != 0U) {
-        if (rows > ids.size()) throw std::invalid_argument("prompt shorter than --rows");
-        ids.resize(rows);
-    }
-    return ids;
+    return strix::deepseek41::resident::read_csv_prompt(path, rows);
 }
 
 void print_result(const char* who, const strix::deepseek41::PrefillResult& r, std::size_t rows, bool timing, const std::string& loads_out = {}) {

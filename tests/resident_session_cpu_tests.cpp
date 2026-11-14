@@ -2,6 +2,7 @@
 // single-node engine: arm switching through the real process environment, reload-only arms, receipts with logits
 // digests, plan budget, and failure isolation between jobs of one session. No GPU, no model.
 #include "strix/serve/resident_session.hpp"
+#include "strix/env_flags.hpp"
 
 #include <chrono>
 #include <cstdio>
@@ -432,6 +433,11 @@ void test_serial_receipt_unchanged(const fs::path& root) {
     r.logits_fnv = rp::hex64(rp::fnv1a64_bytes(row.data(), row.size() * sizeof(float)));
     r.logits_sha256 = rp::sha256_hex(row.data(), row.size() * sizeof(float));
     const std::string got = rp::read_text_file(out / (rp::receipt_name(plan, slots[0]) + rp::rank_suffix(0)));
+    Json input = Json::object();
+    input.set("request", Json(std::uint64_t{0}));
+    input.set("n_tokens", Json(std::uint64_t{3}));
+    input.set("tokens_fnv", Json(rp::hex64(rp::token_digest(std::vector<std::uint32_t>{7, 8, 9}))));
+    r.prompt_inputs.push(std::move(input));
     // write_text_atomic terminates every file with '\n'.
     CHECK(got == rp::receipt_json(plan, expected).dump() + "\n");
     CHECK(!run_receipts(out)[0].find("batch"));
@@ -448,6 +454,125 @@ void test_idle_end(const fs::path& root) {
     CHECK(rp::run_session(dir, h, so) == 0);
 }
 
+void test_input_agreement(const fs::path& root) {
+    for (const bool batch : {false, true}) {
+        auto p = rp::parse_plan(R"({"engine":"fake","steps":1,"warmup":0,"repeats":1,
+            "prompts":[{"name":"p","path":"p"},{"name":"q","path":"q"}],"arms":[{"name":"A","prompts":["p"]}]})");
+        if (batch) { p.concurrency = 2; p.solo_control = false; }
+        FakeEngine eng;
+        auto h = eng.hooks();
+        h.world = 2;
+        h.prompt_max = 2;
+        h.read_prompt = [](const std::string&) { return std::vector<std::uint32_t>{1, 2, 3}; };
+        h.run_batch = fake_batch;
+        std::vector<std::array<std::uint32_t, 8>> transcript;
+        h.agree = [&](const auto& fields) { transcript.push_back(fields); return true; };
+        const auto out = root / (batch ? "input-batch" : "input-serial");
+        CHECK(rp::run_plan(p, out, 0, h).errors == 0);
+        const auto receipt = run_receipts(out).front();
+        const auto* inputs = receipt.find("prompt_inputs");
+        CHECK(inputs && inputs->size() == (batch ? 2U : 1U));
+        if (inputs && inputs->size() > 0) {
+            CHECK(inputs->as_array()[0].find("n_tokens")->as_int() == 2);
+            CHECK(inputs->as_array()[0].find("tokens_fnv")->as_string() ==
+                  rp::hex64(rp::token_digest(std::vector<std::uint32_t>{1, 2})));
+        }
+        for (int variant = 0; variant < 3; ++variant) {
+            std::size_t index = 0;
+            h.agree = [&](const auto& fields) {
+                if (index >= transcript.size() || fields != transcript[index++])
+                    throw std::runtime_error("peer inputs differ");
+                return true;
+            };
+            h.read_prompt = [=](const std::string& path) {
+                if (batch && path == "p") return std::vector<std::uint32_t>{1, 2, 3};
+                if (variant == 0) return std::vector<std::uint32_t>{1, 9, 3}; // same count, stale content
+                if (variant == 1) return std::vector<std::uint32_t>{1}; // different count
+                return std::vector<std::uint32_t>{1, 2, 9}; // only discarded tail differs
+            };
+            int device_calls = 0;
+            h.apply_levers = [&] { ++device_calls; };
+            h.reset = [&] { ++device_calls; };
+            h.barrier = [&](std::uint64_t) { ++device_calls; };
+            bool failed = false;
+            try { (void)rp::run_plan(p, out / std::to_string(variant), 0, h); }
+            catch (const std::runtime_error&) { failed = true; }
+            CHECK(failed == (variant != 2));
+            if (variant != 2) CHECK(device_calls == 0);
+        }
+    }
+}
+
+void test_transaction_and_fatal_errors(const fs::path& root) {
+    rp::detail::unset_env("FAKE_RT");
+    auto p = rp::parse_plan(R"({"engine":"fake","steps":1,"warmup":0,"repeats":1,
+        "prompts":[{"name":"p","path":"unused"}],"arms":[{"name":"A","env":{"FAKE_RT":"bad"}}]})");
+    FakeEngine eng;
+    auto h = eng.hooks();
+    h.read_prompt = [](const std::string&) { return std::vector<std::uint32_t>{1}; };
+    std::string object = "baseline";
+    h.apply_levers = [&] {
+        const char* v = strix::envcfg::text("FAKE_RT");
+        object = v ? v : "baseline"; // deliberately partially mutate before failure
+        if (object == "bad") throw std::invalid_argument("resolver failed");
+    };
+    bool fatal = false;
+    try { (void)rp::run_plan(p, root / "apply-failed", 0, h); }
+    catch (const rp::PlanError&) { CHECK(false); }
+    catch (const std::runtime_error&) { fatal = true; }
+    CHECK(fatal && object == "baseline" && strix::envcfg::text("FAKE_RT") == nullptr);
+
+    h.validate_arm = [](const rp::Arm& a) {
+        if (!a.env.empty()) throw std::invalid_argument("invalid arm before mutation");
+    };
+    const auto dir = root / "recover-validation";
+    fs::create_directories(dir);
+    const auto bad = R"({"engine":"fake","steps":1,"warmup":0,"repeats":1,
+        "prompts":[{"name":"p","path":"unused"}],"arms":[{"name":"A","env":{"FAKE_RT":"bad"}}]})";
+    const auto good = R"({"engine":"fake","steps":1,"warmup":0,"repeats":1,
+        "prompts":[{"name":"p","path":"unused"}],"arms":[{"name":"A"}]})";
+    write_file(dir / "job-1.json", job_json("bad", bad, dir / "bad", 0));
+    write_file(dir / "job-2.json", job_json("good", good, dir / "good", 0));
+    write_file(dir / "stop-3", "");
+    CHECK(rp::run_session(dir, h, {}) == 2);
+    CHECK(read_json(dir / "done-1.r0").find("state")->as_string() == "error");
+    CHECK(read_json(dir / "done-2.r0").find("state")->as_string() == "ok");
+    CHECK(eng.seen.size() == 1 && eng.seen.front() == "-");
+
+    h.validate_arm = {};
+    for (const bool plan_error : {false, true}) {
+        const auto fatal_dir = root / (plan_error ? "fatal-plan-error" : "fatal-invalid-argument");
+        fs::create_directories(fatal_dir);
+        write_file(fatal_dir / "job-1.json", job_json("run", good, fatal_dir / "out", 0));
+        write_file(fatal_dir / "job-2.json", job_json("must-not-run", good, fatal_dir / "next", 0));
+        write_file(fatal_dir / "stop-3", "");
+        int calls = 0;
+        h.run = [&](const auto&, unsigned, const rp::LogitsSink*, bool) -> rp::RunIo {
+            ++calls;
+            if (plan_error) throw rp::PlanError("engine PlanError is also fatal");
+            throw std::invalid_argument("engine failure");
+        };
+        fatal = false;
+        try { (void)rp::run_session(fatal_dir, h, {}); }
+        catch (const std::runtime_error&) { fatal = true; }
+        CHECK(fatal && calls == 1 && !fs::exists(fatal_dir / "done-1.r0"));
+        CHECK(object == "baseline" && strix::envcfg::text("FAKE_RT") == nullptr);
+    }
+}
+
+void test_input_limits(const fs::path& root) {
+    const auto path = root / "large-input";
+    write_file(path, std::string(rp::kMaxPlanBytes + 1, ' '));
+    bool refused = false;
+    try { (void)rp::read_text_file(path); } catch (const rp::PlanError&) { refused = true; }
+    CHECK(refused);
+    // Sparse file: exercise the u32 limit without allocating a large test buffer.
+    fs::resize_file(path, rp::kMaxPromptBytes + 4);
+    refused = false;
+    try { (void)rp::read_u32_file(path.string()); } catch (const std::runtime_error&) { refused = true; }
+    CHECK(refused);
+}
+
 }  // namespace
 
 int main() {
@@ -455,6 +580,9 @@ int main() {
     std::error_code ec;
     fs::remove_all(root, ec);
     fs::create_directories(root);
+    test_input_agreement(root);
+    test_transaction_and_fatal_errors(root);
+    test_input_limits(root);
     test_sha256();
     test_parse_job();
     write_u32(root / "batch-p.u32", {7, 8, 9});

@@ -381,9 +381,59 @@ void test_summary() {
     }
 }
 
+void test_schedule_bound() {
+    auto p = parse_plan(plan_text("abab", 10000, 20, false, false));
+    p.warmup = 1000;
+    bool refused = false;
+    try { (void)schedule(p, group_arms(p, kRuntimeX)); }
+    catch (const PlanError&) { refused = true; }
+    CHECK(refused);
+    p.repeats = std::numeric_limits<std::uint32_t>::max();
+    refused = false;
+    try { (void)schedule(p, group_arms(p, kRuntimeX)); }
+    catch (const PlanError&) { refused = true; }
+    CHECK(refused);
+    CHECK(rejects(std::string(kMaxPlanBytes + 1, ' ')));
+}
+
+void test_cold_warm_statistics() {
+    auto p = parse_plan(plan_text("sequential", 3, 2, false, true));
+    p.warmup = 0;
+    p.early_stop.metric = "ttft_ms";
+    const auto groups = group_arms(p, kRuntimeX);
+    std::vector<RunRecord> records;
+    for (const auto& s : schedule(p, groups)) {
+        RunRecord r{s, {}};
+        r.result.cold_run = s.pass == 0;
+        r.result.ttft_ms = s.pass == 0 ? (s.arm == 0 ? 10.0 : 100.0) : 1.0;
+        records.push_back(r);
+    }
+    const auto warm = compare_all(p, groups, records);
+    const auto cold = compare_all(p, groups, records, true);
+    CHECK(warm[0].n_pairs == 2 && warm[0].mean_rel == 0);
+    CHECK(cold[0].n_pairs == 1 && cold[0].mean_rel == 9);
+    CHECK(!decide_early_stop(p, warm).stop); // two warm pairs, min_pairs is three
+    p.early_stop.min_pairs = 2;
+    CHECK(decide_early_stop(p, compare_all(p, groups, records)).stop);
+    auto cold_decided = cold;
+    cold_decided[0].verdict = "separated";
+    CHECK(!decide_early_stop(p, cold_decided).stop);
+    const auto summary = summary_json(p, groups, records, warm, {});
+    const auto& a = summary.find("arms")->as_array()[0];
+    CHECK(a.find("n_runs")->as_int() == 2);
+    CHECK(a.find("mean")->find("ttft_ms")->as_double() == 1);
+    CHECK(a.find("cold_n_runs")->as_int() == 1);
+    CHECK(a.find("cold_mean")->find("ttft_ms")->as_double() == 10);
+    CHECK(summary.find("cold_comparisons")->as_array()[0].find("n_pairs")->as_int() == 1);
+    records.back().result.cold_run = true; // never pair a warm baseline with a cold arm
+    CHECK(compare_all(p, groups, records)[0].n_pairs == 1);
+}
+
 }  // namespace
 
 int main() {
+    test_schedule_bound();
+    test_cold_warm_statistics();
     test_parse();
     test_batch_plan();
     test_hash();
