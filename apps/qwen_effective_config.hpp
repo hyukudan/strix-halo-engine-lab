@@ -179,7 +179,7 @@ inline Environment requested_prefill_environment(Get get) {
             "STRIX_QSA_DECODE_FUSED_MAXIMA", "STRIX_QSA_DECODE_ATTN_V2", "STRIX_QSA_DECODE_VALUE_V2", "STRIX_MOE_R1_GLUE_FUSE", "STRIX_QWEN_DECODE_FUSE",
             "STRIX_QPF2K_COMPACT_IMAGES", "STRIX_QPF2K_INDEX_BATCH", "STRIX_EAGER_CODE_LOAD", "HIP_ENABLE_DEFERRED_LOADING", "STRIX_QPF2K_EARLY_SETUP", "STRIX_CTX_EXACT_MEMORY", "STRIX_QSA_SCORE_RING", "STRIX_QSA_SCORE_RING_ROWS", "STRIX_TERMINAL_LOGITS_ARENA",
             "STRIX_SESSION_CACHE", "STRIX_SESSION_DISK", "XDG_CACHE_HOME", "HOME",
-            "STRIX_PREFIX_BATCH_CERT", "STRIX_QWEN_YARN_MTP", "STRIX_QWEN_YARN_HOST_RESERVE", "STRIX_PLE_ROLLING_CAP_BYTES", "STRIX_PLE_ROLLING", "STRIX_PLE_ROLLING_POSITIONS", "STRIX_PREFIX_CACHE", "STRIX_PREFIX_CACHE_RETENTION",
+            "STRIX_PREFIX_BATCH_CERT", "STRIX_BATCH_CACHE_SOLO", "STRIX_QWEN_YARN_MTP", "STRIX_QWEN_YARN_HOST_RESERVE", "STRIX_PLE_ROLLING_CAP_BYTES", "STRIX_PLE_ROLLING", "STRIX_PLE_ROLLING_POSITIONS", "STRIX_PREFIX_CACHE", "STRIX_PREFIX_CACHE_RETENTION",
             "STRIX_PREFIX_CACHE_INFLIGHT", "STRIX_PREFIX_CACHE_DISK", "STRIX_PREFIX_CACHE_DURABLE", "STRIX_PREFIX_FAIR_RECLAIM_IDLE",
             "STRIX_SERVE_PREFILL", "STRIX_SERVE_ROUTE", "STRIX_SERVE_PREFILL_ORG", "STRIX_SERVE_T16K", "STRIX_SERVE_FP16_MTP", "STRIX_PLE_WARM", "STRIX_PLE_SERVE_RESERVE", "STRIX_PLE_REWARM", "STRIX_BATCH_PROMPT_SMALL", "STRIX_QPF2K_MOE_ROUTE_BF16",
             "STRIX_QPF2K_HC_RECOMPUTE_NORM", "STRIX_INTPREFILL_MOE_TUNE", "STRIX_QPF2K_MOE", "STRIX_QPF2K_MOE_SMALL", "STRIX_QPF2K_QSA_BUDGET", "STRIX_QPF2K_MOE_DIRECT_B"})
@@ -1534,8 +1534,14 @@ inline void resolve_http_session_ram(EffectiveConfig& result, const PrefillMemor
 // prompt groups, no prompt-window cohorts (scheduling only; each prompt's units and per-row arithmetic are unchanged).
 // STRIX_BATCH_CACHE_SOLO=0 keeps the incumbent scheduler; its restores decline batch-suffix-not-solo.
 // AUTO stays declined until a batch row is qualified (qwen_cache_admission.hpp).
-inline void resolve_batch_cache_scheduler(Options& o, const Environment& env) {
+// Startup supplies the admitted route (zero for the single runner) before constructing runners or cache identities.
+inline void resolve_batch_cache_scheduler(Options& o, const Environment& env,
+    std::optional<std::uint32_t> admitted_slots=std::nullopt) {
+    if(admitted_slots) o.http_batch=*admitted_slots;
     o.batch_cache_solo=false;
+    if(!admitted_slots && o.http_serve && o.mtp.enabled && !o.http_batch_explicit && o.http_batch==1) {
+        o.batch_cache_solo_reason="capacity-pending";return;
+    }
     if(!o.http_serve || !o.mtp.enabled || o.http_batch<=1) {o.batch_cache_solo_reason="not-batch";return;}
     if(o.baseline || !cache_defaults_suppression(o,env).empty()) {o.batch_cache_solo_reason="suppressed";return;}
     auto& a=*o.cache_activation;

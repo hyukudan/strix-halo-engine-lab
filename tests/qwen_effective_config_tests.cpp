@@ -344,7 +344,10 @@ void serve_prefill_admission_tests(const ModelContract& model, const ModelManife
         const auto solo=resolve({parse(l0),base},memory).options;
         expect(solo.batch_cache_solo && solo.prefix_batch_cert==1 && solo.batch_cache_solo_reason=="l0-restore" &&
             prefix_batch_cert_execution_mode(solo)==1,"qcq: explicit batch budget + L0 resolves the solo scheduler");
-        auto kept_env=base; kept_env["STRIX_BATCH_CACHE_SOLO"]="0";
+        auto kept_env=requested_prefill_environment([](const char* name) -> const char* {
+            return std::string_view(name)=="STRIX_BATCH_CACHE_SOLO" || std::string_view(name)=="STRIX_BATCH_PROMPT_SMALL"
+                ? "0" : nullptr;
+        });
         const auto kept=resolve({parse(l0),kept_env},memory).options;
         expect(!kept.batch_cache_solo && kept.prefix_batch_cert==1 && kept.batch_cache_solo_reason=="STRIX_BATCH_CACHE_SOLO=0",
             "qcq: STRIX_BATCH_CACHE_SOLO=0 keeps the incumbent scheduler");

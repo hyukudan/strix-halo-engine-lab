@@ -4595,7 +4595,7 @@ static int run_decode_entry(
                 ? capacity.slots : 0U;
             const bool pool_fallback = !single_route && !batch_slots &&
                 qsa_mtp_pool_single_fallback_pending(options, strix::qpf2k::has_gsq_gate(manifest));
-            options.http_batch = static_cast<std::uint32_t>(batch_slots);
+            resolve_batch_cache_scheduler(options, requested_environment, static_cast<std::uint32_t>(batch_slots));
             if (pool_fallback) {
                 // Batch sizing excluded the pool; the single runner keeps it only if its one slot still fits with it.
                 const auto single = resolve_http_bridge_capacity(retained, prompt_memory.serving(options),
