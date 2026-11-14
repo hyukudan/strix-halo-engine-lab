@@ -9,12 +9,13 @@ class HttpSessionOwner {
 public:
     HttpSessionOwner(serve::GenerationQueue&, std::uint64_t context, std::uint32_t slots,
                      std::function<void(serve::SessionRuntime&)>, std::function<bool()> drained,
-                     std::function<void()> failed, std::function<void()> stopped);
+                     std::function<void()> failed, std::function<void()> stopped,
+                     bool embed_rows = false);  // true: the native turns resolve image rows (--vision)
     serve::SessionRuntime& runtime() noexcept { return runtime_; }
 private:
     class ControlEngine final : public session::Engine {
     public:
-        ControlEngine(std::uint64_t, std::uint32_t);
+        ControlEngine(std::uint64_t, std::uint32_t, bool embed_rows);
         void prefill(std::span<const std::uint32_t>, session::KvHandle&) override;
         session::StepResult decode(session::KvHandle&, const session::SamplerState&) override;
         session::Capabilities caps() const override { return caps_; }

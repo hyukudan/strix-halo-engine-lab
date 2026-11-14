@@ -2344,7 +2344,8 @@ void lead(const Args& initial, BatchForward& fwd, strix::dist::Communicator& com
     strix::deepseek41::HttpSessionOwner request_owner(queue, a.context, a.slots,
         [&](serve::SessionRuntime& r) { native_turn(r); }, [&] { return native_drained; },
         [&] { if (native_failed) native_failed(); },
-        [&] { if (state.failed.load() && native_stop_http) native_stop_http(); });
+        [&] { if (state.failed.load() && native_stop_http) native_stop_http(); },
+        vision_stack != nullptr);  // image rows reach the native turns only with --vision
     auto& runtime = request_owner.runtime();
     const auto request = [&](const Running& r) -> const serve::TakenJob& {
         return r.owner.valid() ? runtime.inspect(r.owner) : runtime.inspect(r.pending);
