@@ -30,7 +30,8 @@ inline constexpr std::array<strix::profile::Lever, 6> profile_table{{
     {"dense_min_rows", "STRIX_DS41_FAST_DENSE_MIN_ROWS", "", {"", "", ""}, "128", strix::profile::Kind::bit_changing,
      {true, false, true}, {true, true, true}, "", "", "FAST dense dispatch threshold", false, {}, true},
     // Prefill only: FAST policy ds41-decoder-replay-bounded-v1 (value R rows, a multiple of 128): every decoder layer runs
-    // its last R rows, window keys floored at the cut (not bit-equal to the full decode). Explicit only, OFF in every
+    // its last R rows, window keys floored at the cut, its dense products in the exact form (bounded run == full run
+    // with the floor, bit for bit; not bit-equal to the full decode). Explicit only, OFF in every
     // profile; set, it enters the profile fingerprint (rank agreement, prefix-cache identity).
     {"decoder_replay_bounded", "STRIX_DS41_DECODER_REPLAY", "", {"", "", ""}, "0", strix::profile::Kind::bit_changing,
      {true, false, true}, {true, true, true}, "", "0", "explicit FAST policy ds41-decoder-replay-bounded-v1; quality gate (DS41 FAST user rule) required", false, {}, true},
