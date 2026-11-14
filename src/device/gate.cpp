@@ -349,7 +349,6 @@ CommandLine take_command_line(int& argc, char** argv) {
         if (std::strcmp(argv[i], "--devices") == 0) target = &out.devices_path;
         else if (std::strcmp(argv[i], "--device-id") == 0) target = &out.select;
         if (!target) {
-            if (std::strcmp(argv[i], "--deploy-check") == 0) out.inspect_only = true;
             argv[kept++] = argv[i];
             continue;
         }
