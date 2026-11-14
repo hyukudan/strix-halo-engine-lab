@@ -137,10 +137,13 @@ template<class Prefill>
     }
     h.apply_levers = [&pre] { pre.apply_levers(); };
     h.run = [&pre](const std::vector<std::uint32_t>& prompt, unsigned, const rp::LogitsSink* sink, bool) {
-        const Telemetry before = read_telemetry();
+        // nothing between the barrier and the clock start (as --ttft-timing); node state is read after the run, and the
+        // wall-clock window lets a 40 ms clock/busy sampler of the ticket give the window means
         const auto t0 = std::chrono::steady_clock::now();
+        const auto e0 = std::chrono::system_clock::now();
         auto r = pre.run(std::span<const std::uint32_t>(prompt));
         const double wall = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+        const double epoch0 = std::chrono::duration<double>(e0.time_since_epoch()).count();
         const Telemetry after = read_telemetry();
         if (sink != nullptr && *sink) (*sink)(r.logits.data(), r.logits.size());
         rp::RunIo io;
@@ -148,11 +151,11 @@ template<class Prefill>
         io.prefill_s = wall;
         char note[320];
         std::snprintf(note, sizeof(note),
-                      "run %.3f ms, engram read %.3f ms, head %.3f ms, next token %u, logits_fnv %016llx, sclk %d->%d MHz, "
-                      "busy %d->%d %%, MemAvailable %.2f GiB",
+                      "run %.3f ms, engram read %.3f ms, head %.3f ms, next token %u, logits_fnv %016llx, window %.3f+%.3f s, "
+                      "after: sclk %d MHz, busy %d %%, MemAvailable %.2f GiB",
                       r.seconds * 1e3, r.engram_seconds * 1e3, r.head_seconds * 1e3, r.next_token,
-                      static_cast<unsigned long long>(logits_fnv(r.logits)), before.sclk_mhz, after.sclk_mhz,
-                      before.busy_pct, after.busy_pct, after.mem_available_gib);
+                      static_cast<unsigned long long>(logits_fnv(r.logits)), epoch0, wall, after.sclk_mhz, after.busy_pct,
+                      after.mem_available_gib);
         io.note = note;
         return io;
     };
