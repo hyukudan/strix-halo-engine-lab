@@ -161,11 +161,12 @@ public:
 };
 
 // Diagnostic rounding model of a device arithmetic inside the host reference (default: none = the FP32 oracle,
-// bit for bit). It places the FP16 operand roundings of vision-f16-v1 one site at a time, so a gate failure can be
-// attributed to a rounding site (precision) or to none of them (a defect). Never an adapter arithmetic.
+// bit for bit). It places the FP16 operand roundings of vision-f16-v1 one site at a time to study sensitivity.
+// Accumulation and transcendental evaluation remain FP64: this is not a bitwise device oracle or proof of a defect.
+// Never an adapter arithmetic; the shared rounded identity is diagnostic only, not a cache/qualification identity.
 struct ReferenceRounding {
     bool linear_inputs_f16 = false;  // every linear input rounded to FP16 (the single-operand device policy)
-    bool attention_f16 = false;      // Q, K, V and the probabilities rounded to FP16 (the flash core's operands)
+    bool attention_f16 = false;      // Q/K/V and probabilities at each 16-key online maximum rounded to FP16
     bool any() const { return linear_inputs_f16 || attention_f16; }
 };
 float round_to_f16(float);  // nearest-even FP16 value as a float (subnormals kept, overflow -> infinity)
@@ -212,7 +213,7 @@ struct EncodeStats {
     double total_ms = 0.0;
     std::vector<double> layer_ms;
 };
-// Wall time of the last load() by step (a receipt: the steps run in this order per panel, so they add up).
+// Wall time of the last load() by step (approximate receipt; total also includes uninstrumented overhead).
 struct EncoderLoadStats {
     double scan_ms = 0.0;          // per-row magnitude pass over the source weights
     double host_alloc_ms = 0.0;    // zeroed host panel buffer
