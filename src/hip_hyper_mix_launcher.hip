@@ -5364,15 +5364,19 @@ void launch_wide_hyper_kernels_impl(const HyperWideRows& wide_in, const void* do
             low_mode = (low_band == UINT32_MAX ? qpf2k_hc_lowband() : low_band) & 3U;
         if (wide.low_t_pitch <= kQpf2kLowBandRows) low_mode &= ~1U;
         if (low_mode & 1U) { wide.low_t_band = true; wide.low_t_pitch = kQpf2kLowBandRows; }
+        // LowMode bit 2 (STRIX_QPF2K_HC_LOW32=0, default): the out16 call reads low16 only and returns before every FP32 low
+        // reader, so its projection skips the FP32 tail. Not with low_t, the check mode or the normalized16 / inverse forms.
+        if (out16 && output_kernel != kSkipKernel && !wide.low_t && qpf2k_projection_route && qpf2k_hc_low32_skip()) low_mode = 4U;
         // Output-only test seams (projection skipped) read the low values an earlier call left in the shared scratch: refused when
         // that call wrote another layout (bit 0: low_t banded) or skipped low16 (bit 1). Every projection records what it wrote.
         static std::atomic<unsigned> low_state{0U};
         if (projection_kernel == kSkipKernel) {
             if (output_kernel != kSkipKernel && (((low_state.load() & 1U) && output_kernel == 1U && !out16 && wide.low_t) ||
-                                                 ((low_state.load() & 2U) && (output_kernel == 2U || out16))))
+                                                 ((low_state.load() & 2U) && (output_kernel == 2U || out16)) ||
+                                                 ((low_state.load() & 4U) && output_kernel != 2U && !out16)))
                 throw std::invalid_argument("HC wide rows test: the last projection left the low values in another layout");
         } else if (projection_kernel == 2U) {
-            low_state.store(((wide.low_t ? low_mode : low_state.load()) & 1U) | (low_mode & 2U));
+            low_state.store(((wide.low_t ? low_mode : low_state.load()) & 1U) | (low_mode & 6U));
         } else if (wide.low_t) {
             low_state.fetch_and(~1U);
         }
@@ -5424,6 +5428,7 @@ void launch_wide_hyper_kernels_impl(const HyperWideRows& wide_in, const void* do
                         case 1U: shaped.template operator()<1U>(); break;
                         case 2U: shaped.template operator()<2U>(); break;
                         case 3U: shaped.template operator()<3U>(); break;
+                        case 4U: shaped.template operator()<4U>(); break;
                         default: shaped.template operator()<0U>();
                         }
                     } else if (qpf2k_projection_form == 3U)
@@ -5438,11 +5443,18 @@ void launch_wide_hyper_kernels_impl(const HyperWideRows& wide_in, const void* do
                         case 1U: launch.template operator()<1U>(); break;
                         case 2U: launch.template operator()<2U>(); break;
                         case 3U: launch.template operator()<3U>(); break;
+                        case 4U: launch.template operator()<4U>(); break;
                         default: launch.template operator()<0U>();
                         }
                     }
                 };
-                if (!qpf2k_hc_check() || qpf2k_projection) qpf2k();
+                if (!qpf2k_hc_check() || qpf2k_projection) {
+                    qpf2k();
+                    // Census seam (STRIX_QPF2K_HC_LOW32_POISON=1): NaN over the FP32 tail of an out16 call; the final hash proves no reader.
+                    if (out16 && qpf2k_hc_low32_poison())
+                        check_hip(hipMemset2DAsync(wide.normalized + 10240U, wide.normalized_stride, 0xff, 320U * 4U, wide.count, stream),
+                            "qpf2k HC low32 poison");
+                }
                 else {
                     hipLaunchKernelGGL(HIP_KERNEL_NAME(hcw_projection_kernel<false>), grid, dim3(256U), 0, stream, wide, scratch.down,
                         static_cast<const float*>(inject), config.hc_count, scratch.low16);

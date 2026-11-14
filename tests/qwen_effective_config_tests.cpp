@@ -2181,7 +2181,7 @@ void yarn_admission_tests(const gguf::FileInfo& info, const ModelManifest& manif
                     !rule.values.empty()), "YaRN refused rows carry a reason; OFF and diagnostic rows bound their values");
         }
         for (const char* name : {"STRIX_QSA_UNION_MERGE", "STRIX_QSA_SCORE_ROWS64", "STRIX_PREFILL_MOE_MERGE_VEC",
-                "STRIX_QPF2K_WMMA_PIN", "STRIX_QPF2K_HC_UPCOPY", "STRIX_PREFILL_ROUTER_SELECT", "STRIX_ROUTER_STAGE_ACT",
+                "STRIX_QPF2K_WMMA_PIN", "STRIX_QPF2K_HC_UPCOPY", "STRIX_QPF2K_HC_LOW32", "STRIX_PREFILL_ROUTER_SELECT", "STRIX_ROUTER_STAGE_ACT",
                 "STRIX_QSA_WINDOW_ATTN_V2", "STRIX_PREFIX_CACHE", "STRIX_QPF2K_GDN_CHUNK16",
                 "STRIX_PREFILL_PLE_ROWS_F16", "STRIX_PREFILL_GDN_GATES_F16"}) {
             auto off = request; off.environment[name] = "0";

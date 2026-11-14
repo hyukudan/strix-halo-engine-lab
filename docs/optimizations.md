@@ -4872,6 +4872,9 @@ Three parts make the route faster than the image:
 - **Full-width projection** (`STRIX_QPF2K_HC_PROJ_TILE`, default 64 rows per block; 32 and 16 selectable, 0 selects
   the five-column-block form). One block owns 64 rows and all 320 low outputs, so each normalized value is formed
   once instead of once per column block.
+- **No unread FP32 low tail** (`STRIX_QPF2K_HC_LOW32`, default 0). The out16 output reads the FP16 low image only, so
+  the projection no longer writes the 1,280-byte FP32 low values of each row (1.02 GB per 8192-row block over 97 HC
+  sites). The check mode and every FP32 output still write them. `STRIX_QPF2K_HC_LOW32=1` restores the store.
 - **Output epilogue.** The stream loads of a block are issued before the first pinned multiply. Interleaved with
   the pinned multiplies, each load was waited for alone.
 - **Stream mirror.** Stream rows whose pitch is a multiple of 4096 bytes alias when a block reads many rows at the
