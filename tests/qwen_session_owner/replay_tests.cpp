@@ -71,6 +71,8 @@ struct MtpBatchRunner {
     std::size_t slots_capacity=3;
     std::mutex mutex;
     std::mutex* session_mutex=&mutex;
+    // No prefix store in the replay: the queue protection binding is empty (owner protection inert).
+    strix::serve::QueuedPrefixProtection::Binding queue_protection_binding() { return {}; }
     bool session_run=true, memory_refusal=false, check_mutex=false, completed=true, empty_error=false, unknown_error=false;
     bool stop_when_empty=true;
     int fault=0;

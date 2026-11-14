@@ -443,6 +443,10 @@ public:
     // would spin. Returns has_queued_work() at return.
     bool wait_work_until(std::chrono::steady_clock::time_point deadline) const;
     [[nodiscard]] bool has_waiting(const std::function<bool(const GenerationJob&, std::chrono::steady_clock::time_point)>& eligible) const;
+    // At most `max` waiting (not cancelled) entries in queue order, under the queue lock. The visitor must
+    // be cheap (no cache lock, no hashing) and must not re-enter the queue; it returns false to stop.
+    void visit_waiting(std::size_t max,
+        const std::function<bool(const GenerationJob&, const std::shared_ptr<GenerationTicket>&)>& visit) const;
     // The end of a taken job: fills queue_ms, updates the totals and finishes its ticket.
     // Engines may call it inside their own timed regions (a batching runner that times a prompt unit and completes a
     // request in it). The observation it adds reads and writes only the queue's own counters, never an engine's

@@ -1637,9 +1637,11 @@ inline serve::Json cache_family_identity_json(const CacheFamilyIdentity& id) {
     return out;
 }
 // Called only on the automatic path after the actual runner/identity is bound.
-inline bool apply_automatic_cache_fit(Options& o, const CacheLateFit& fit) {
+inline bool apply_automatic_cache_fit(Options& o, const CacheLateFit& observed) {
     auto& a=*o.cache_activation;
     if(!automatic_cache_work(o)) return false;
+    // The one budget-rule resolution for CLI and server (default: the incumbent legacy rule).
+    auto fit=observed; fit.budget_policy=serve::cache_budget_policy_from_env();
     const auto result=fit.cgroup_ancestry_unproven ? CacheFitResult{0,"cgroup-ancestry-unproven"} : fit_cache_late(fit);
     a.S=fit.S; a.H=std::max(UINT64_C(4)<<30,fit.headroom); a.F=fit.F;
     if(fit.E && *fit.E<=UINT64_MAX-(UINT64_C(256)<<20)) a.E=*fit.E+(UINT64_C(256)<<20);

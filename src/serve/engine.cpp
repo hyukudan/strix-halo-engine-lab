@@ -531,6 +531,16 @@ bool GenerationQueue::has_waiting(const std::function<bool(const GenerationJob&,
         return !e.ticket->cancelled() && eligible(e.job, e.submitted);
     });
 }
+void GenerationQueue::visit_waiting(std::size_t max,
+    const std::function<bool(const GenerationJob&, const std::shared_ptr<GenerationTicket>&)>& visit) const {
+    std::lock_guard lock(mutex_);
+    for (const auto& e : entries_) {
+        if (!max) return;
+        if (e.ticket->cancelled()) continue;
+        --max;
+        if (!visit(e.job, e.ticket)) return;
+    }
+}
 
 bool GenerationQueue::has_queued_work() const {
     std::lock_guard lock(mutex_);
