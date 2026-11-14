@@ -16,6 +16,7 @@
 #include "strix/deepseek41_model.hpp"
 #include "strix/model_content_hash.hpp"
 #include "strix/vision/compare.hpp"
+#include "strix/vision/embed_cache.hpp"
 #include "strix/vision/encoder.hpp"
 #include "strix/vision/gguf_weights.hpp"
 #include "strix/vision/image.hpp"
@@ -201,51 +202,33 @@ int diagnose(const std::string& names, const std::filesystem::path& dir, const d
 }
 #endif
 
-// --bench FILE.png: the serve path of one image without a cache (decode + patches, positions, encode, project), reps
-// times on the loaded backend: rep 1 carries every first-use cost the load leaves (workspace, projector panels, first
-// kernel launches); later reps are the steady encode. The last extra rep synchronises per block (layer table).
-int bench(const std::string& png_path, unsigned reps, ds::VisionAdapter& adapter, const vision::EncoderConfig& cfg,
-          const vision::EncoderWeights& weights, vision::EncoderBackend& backend) {
+// --bench FILE.png: the serve path of one image without a cache (decode + patches, then encode_cached: positions,
+// encode, project), reps times on the loaded backend. --prepare: prepare_backend first (projector panels, workspace;
+// --warm adds the grey warm-up image), as the server does at start. Rep 1 carries what is still first-use.
+int bench(const std::string& png_path, unsigned reps, int prepare, ds::VisionAdapter& adapter, const vision::EncoderWeights& weights,
+          vision::EncoderBackend& backend) {
     const std::vector<std::uint8_t> png = read_raw<std::uint8_t>(png_path);
+    if (prepare >= 0) {
+        const auto t0 = Clock::now();
+        const vision::PrepareReport r = vision::prepare_backend(adapter, backend, weights, prepare > 0);
+        std::printf("bench prepare %.2f ms (linears %zu, reserved rows %u, prepare %.2f ms, warm-up rows %u %.2f ms)\n", ms_since(t0),
+                    r.linears, r.reserved_rows, r.prepare_ms, r.warmup_rows, r.warmup_ms);
+    }
     std::uint64_t first_fnv = 0;
-    for (unsigned rep = 0; rep < reps + 1U; ++rep) {
-        const bool layers = rep == reps;
+    for (unsigned rep = 0; rep < reps; ++rep) {
         auto t0 = Clock::now();
         const vision::Image image = vision::decode(png);
         const vision::PatchGrid g = adapter.patches(image);
         const double pre_ms = ms_since(t0);
         t0 = Clock::now();
-        const vision::PositionInputs pos = adapter.positions(cfg, weights, g);
-        const double pos_ms = ms_since(t0);
-        t0 = Clock::now();
-        vision::EncodeStats stats;
-        stats.per_layer = layers;
-        vision::EncoderOutput hidden;
-#ifdef STRIX_DS41_VISION_GATE_HIP
-        if (auto* gpu = dynamic_cast<vision::Encoder*>(&backend)) hidden = gpu->encode(g, pos, stats);
-        else hidden = backend.encode(g, pos);
-#else
-        hidden = backend.encode(g, pos);
-#endif
+        const auto enc = vision::encode_cached(adapter, backend, weights, nullptr, vision::Digest{}, g);
         const double enc_ms = ms_since(t0);
-        t0 = Clock::now();
-        vision::ProjectedRows rows;
-        adapter.project(hidden, g, backend, rows);
-        const double proj_ms = ms_since(t0);
         std::uint64_t h = 1469598103934665603ULL;
-        for (const auto v : rows.bf16) h = (h ^ v) * 1099511628211ULL;
+        for (const auto v : enc.rows->bf16) h = (h ^ v) * 1099511628211ULL;
         if (rep == 0) first_fnv = h;
-        std::printf("bench rep %u%s: patches %u grid %ux%u rows %u | preprocess %.2f ms positions %.2f ms encode %.2f ms "
-                    "(tower %.2f) project %.2f ms total %.2f ms | rows fnv %016llx %s\n",
-                    rep + 1U, layers ? " (per-block sync)" : "", g.rows, g.grid_h, g.grid_w, rows.rows, pre_ms, pos_ms, enc_ms,
-                    stats.total_ms, proj_ms, pre_ms + pos_ms + enc_ms + proj_ms, static_cast<unsigned long long>(h),
+        std::printf("bench rep %u: patches %u grid %ux%u rows %u | preprocess %.2f ms encode_cached %.2f ms | rows fnv %016llx %s\n",
+                    rep + 1U, g.rows, g.grid_h, g.grid_w, enc.rows->rows, pre_ms, enc_ms, static_cast<unsigned long long>(h),
                     h == first_fnv ? "same" : "DIFFERS");
-        if (layers && !stats.layer_ms.empty()) {
-            double sum = 0.0, lo = stats.layer_ms.front(), hi = lo;
-            for (const double v : stats.layer_ms) { sum += v; lo = std::min(lo, v); hi = std::max(hi, v); }
-            std::printf("bench blocks %zu: sum %.2f ms, min %.3f, max %.3f, first %.3f, last %.3f\n", stats.layer_ms.size(), sum, lo,
-                        hi, stats.layer_ms.front(), stats.layer_ms.back());
-        }
     }
     return 0;
 }
@@ -253,6 +236,7 @@ int bench(const std::string& png_path, unsigned reps, ds::VisionAdapter& adapter
 int run(int argc, char** argv) {
     std::string model, ref, backend_name = "host", only, diagnose_names, bench_png;
     unsigned host_max_patches = 200, bench_reps = 3;
+    int bench_prepare = -1;  // -1 none, 0 prepare_backend, 1 prepare_backend + warm-up
     bool split = false, no_split = false, unpinned = false;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
@@ -271,6 +255,8 @@ int run(int argc, char** argv) {
         else if (a == "--diagnose") diagnose_names = next();
         else if (a == "--bench") bench_png = next();
         else if (a == "--reps") bench_reps = static_cast<unsigned>(std::stoul(next()));
+        else if (a == "--prepare") bench_prepare = 0;
+        else if (a == "--warm") bench_prepare = 1;
         else throw std::invalid_argument("unknown option " + a);
     }
     if (model.empty() || (ref.empty() && bench_png.empty()))
@@ -331,7 +317,7 @@ int run(int argc, char** argv) {
 #endif
     if (!backend) backend = std::make_unique<vision::ReferenceEncoder>(cfg, weights);
     std::printf("backend %s\n", backend->arithmetic());
-    if (!bench_png.empty()) return bench(bench_png, bench_reps, adapter, cfg, weights, *backend);
+    if (!bench_png.empty()) return bench(bench_png, bench_reps, bench_prepare, adapter, weights, *backend);
 
     const double cos_mean_gate = device ? 0.9995 : 0.99999, cos_min_gate = device ? 0.998 : 0.99999;
     const double rel_gate = device ? 0.02 : 0.01;
