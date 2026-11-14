@@ -12,6 +12,7 @@
 #include <cstring>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 
 namespace strix::glm::pf::dense_policy {
 inline constexpr unsigned kExactMinRows = 64, kWmmaMinRows = 32;
@@ -50,10 +51,22 @@ template<class Env> Choice choose(unsigned rows, Env&& env) {
     throw std::invalid_argument("STRIX_GLM_PF_EXACT_X must be 0, 1, 2, 3, 4 or auto");
 }
 
-// Rows of one dense linear call when the engine prefills `tokens` rows in one chunk: the TP2 sequence-parallel
-// pipeline 2 issues two half-chunk calls (xfer::seqpar_tiles), everything else one call of the whole chunk.
-inline unsigned call_rows(unsigned tokens, unsigned world, bool seqpar, unsigned pipeline) {
-    return world == 2 && seqpar && pipeline == 2 && tokens >= 4 && tokens % 4 == 0 ? tokens / 2U : tokens;
+// Extrema over all nonempty dense calls in a full serving chunk, including the engine's max_rows remainder.
+// Pipeline 2 splits even SP rows into R/2 column calls (also with one SP tile); the legacy/TP1 path splits
+// ceil/floor halves. Thus the same bounds apply for every world/seqpar policy. Route selection is monotone.
+struct CallRows { unsigned min, max; };
+inline CallRows call_rows(unsigned tokens, unsigned max_rows, unsigned pipeline) {
+    const unsigned capacity = std::max(1U, max_rows);
+    const auto bounds = [pipeline](unsigned rows) -> CallRows {
+        return pipeline == 2 ? CallRows{std::max(1U, rows / 2U), rows / 2U + rows % 2U} : CallRows{rows, rows};
+    };
+    auto calls = bounds(std::min(tokens, capacity));
+    if (tokens > capacity && tokens % capacity != 0) {
+        const auto tail = bounds(tokens % capacity);
+        calls.min = std::min(calls.min, tail.min);
+        calls.max = std::max(calls.max, tail.max);
+    }
+    return calls;
 }
 
 // The serving prefill interleave chunk: tokens of a new prompt per decode step while another request decodes (the
@@ -63,59 +76,67 @@ struct Chunk {
     bool explicit_request = false;
     unsigned requested = 0;   // the value of the flag when explicit
     unsigned tokens = 0;      // effective chunk
-    unsigned rows = 0;        // rows per dense call of one chunk (0: whole prompt)
-    unsigned route = kTm;     // dense core of those calls
+    unsigned rows = 0;        // minimum rows per dense call of one full chunk (0: unknown/inapplicable)
+    unsigned max_call_rows = 0;
+    unsigned route = kTm;     // core of the smallest calls; mixed says larger calls select another core
+    bool mixed = false;
+    bool applicable = true;
     bool wmma = false;        // FAST WMMA identity selected for those calls (a matrix still needs input % 64 == 0)
     bool declined = false;    // chunked calls do not take the large-call core
     std::string reason;
 };
-template<class Env> Chunk resolve_chunk(bool explicit_request, unsigned requested, unsigned world, unsigned max_rows, Env&& env) {
+template<class Env> Chunk resolve_chunk(bool explicit_request, unsigned requested, unsigned /*world*/, unsigned max_rows,
+                                       std::string_view prefill, Env&& env) {
     Chunk c;
     c.explicit_request = explicit_request;
     c.requested = requested;
     c.tokens = explicit_request ? requested : kServeChunk;
-    if (c.tokens == 0) {
-        c.route = choose(max_rows, env).route;
-        c.wmma = c.route == kX3r8 && wmma_selected(env);
-        c.reason = "chunking off: every prompt is prefilled whole, as in the CLI";
+    if (prefill != "gemv") {
+        c.applicable = false;
+        c.reason = "dense X3 route inapplicable to " + std::string(prefill) + " prefill; chunk unchanged";
         return c;
     }
-    const char* sp = env("STRIX_GLM_PF_SEQPAR");
+    if (c.tokens == 0) {
+        c.reason = "chunking off: every prompt is prefilled whole, as in the CLI; dense route depends on prompt length";
+        return c;
+    }
     const char* pl = env("STRIX_GLM_PF_PIPELINE");
-    const bool seqpar = sp == nullptr || std::strcmp(sp, "0") != 0;
     const unsigned pipeline = pl != nullptr && std::strcmp(pl, "2") == 0 ? 2U : 1U;
     const auto rows_of = [&](unsigned tokens) {
-        return call_rows(max_rows ? std::min(tokens, max_rows) : tokens, world, seqpar, pipeline);
+        return call_rows(tokens, max_rows, pipeline);
     };
-    c.rows = rows_of(c.tokens);
+    c.rows = rows_of(c.tokens).min;
     Choice pick = choose(c.rows, env);
     if (pick.automatic && pick.route == kTm && !explicit_request) {
         // Default chunk: grow it until its calls reach the auto threshold, within the decode-stall ceiling.
-        for (unsigned t = c.tokens * 2U; t <= kServeChunkCeiling && (max_rows == 0 || t <= max_rows); t *= 2U)
-            if (choose(rows_of(t), env).route != kTm) {
+        for (unsigned t = c.tokens * 2U; t <= kServeChunkCeiling; t *= 2U)
+            if (choose(rows_of(t).min, env).route != kTm) {
                 c.tokens = t;
-                c.rows = rows_of(t);
+                c.rows = rows_of(t).min;
                 pick = choose(c.rows, env);
                 break;
             }
     }
     c.route = pick.route;
+    c.max_call_rows = rows_of(c.tokens).max;
+    c.mixed = choose(c.max_call_rows, env).route != c.route;
     const bool fast = wmma_selected(env);
     c.wmma = pick.route == kX3r8 && fast;
-    const std::string rows = std::to_string(c.rows) + "-row dense calls";
+    const std::string rows = std::to_string(c.rows) + ".." + std::to_string(c.max_call_rows) + "-row dense calls";
     if (!pick.automatic) {
         c.declined = pick.route != kX3r8 && fast;
         c.reason = rows + ", route forced by STRIX_GLM_PF_EXACT_X" + (c.declined ? " (FAST WMMA core declined: wrong_route)" : "");
     } else if (pick.route == kTm) {
         c.declined = true;
-        c.reason = rows + " below the auto threshold of " + std::to_string(pick.min_rows) + " rows: large-call core" +
-                   (fast ? " and FAST WMMA identity" : "") + " declined (short_call), TM16 core; " +
+        c.reason = rows + ", minimum below the auto threshold of " + std::to_string(pick.min_rows) + " rows: large-call core" +
+                   (fast ? " and FAST WMMA identity" : "") + " declined (short_call), " +
+                   (c.mixed ? "mixed TM/X3 cores; " : "TM core; ") +
                    (explicit_request ? std::string("raise --prefill-chunk")
                                      : "the default chunk is not grown past " + std::to_string(kServeChunkCeiling) + " tokens") +
                    " or lower STRIX_GLM_PF_EXACT_X_MIN_ROWS";
     } else {
         c.reason = rows + " at or above the auto threshold of " + std::to_string(pick.min_rows) + " rows: " +
-                   (c.wmma ? "X3 route with the FAST WMMA core" : "exact X3 core") + ", as whole-prompt calls" +
+                   (c.wmma ? "X3 route with the FAST WMMA core" : "exact X3 core") +
                    (!explicit_request && c.tokens != kServeChunk ? " (default chunk grown from " + std::to_string(kServeChunk) + ")"
                                                                  : std::string());
     }
@@ -123,6 +144,7 @@ template<class Env> Chunk resolve_chunk(bool explicit_request, unsigned requeste
 }
 inline std::string chunk_line(const Chunk& c) {
     return "effective serve-prefill-chunk=" + std::to_string(c.tokens) + " (" + (c.explicit_request ? "explicit" : "default") +
-           "; serving only: one chunk of a new prompt per decode step while another request decodes; " + c.reason + ")\n";
+           "; serving only: one full chunk of a new prompt per decode step while another request decodes; " + c.reason +
+           "; prediction only: prompt tails and whole-prompt execution may select other routes)\n";
 }
 }  // namespace strix::glm::pf::dense_policy

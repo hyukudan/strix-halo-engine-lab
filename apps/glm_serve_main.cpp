@@ -899,7 +899,7 @@ int main(int argc, char** argv) {
             std::fputs(rd::print(eff).c_str(), stdout);
             {   // Dry run: the shared chunk resolver over the resolved (not yet applied) environment.
                 const auto chunk = strix::glm::pending_prefill_chunk(
-                    prefill_chunk_explicit, prefill_chunk, opt.world, static_cast<unsigned>(std::stoul(eff.max_rows.value)),
+                    prefill_chunk_explicit, prefill_chunk, opt.world, static_cast<unsigned>(std::stoul(eff.max_rows.value)), eff.prefill,
                     [&](const std::function<void(const char*, const char*)>& set) { rd::apply_env(eff, set); });
                 std::fputs(strix::glm::pf::dense_policy::chunk_line(chunk).c_str(), stdout);
                 prefill_chunk = chunk.tokens;
@@ -997,7 +997,7 @@ int main(int argc, char** argv) {
                                                                      ge::identity_mode_name(eng.identity_mode()), opt.max_rows);
             // One resolver for the interleave chunk: both ranks print the value and what its dense calls take, and a
             // declined route says why here instead of disappearing under load.
-            const auto chunk = strix::glm::record_prefill_chunk("http", prefill_chunk_explicit, prefill_chunk, opt.world, opt.max_rows);
+            const auto chunk = strix::glm::record_prefill_chunk("http", prefill_chunk_explicit, prefill_chunk, opt.world, opt.max_rows, prefill_mode);
             prefill_chunk = chunk.tokens;
             std::printf("rank %u %s", opt.rank, strix::glm::pf::dense_policy::chunk_line(chunk).c_str());
             hello.route_fingerprint = static_cast<std::uint32_t>(fp ^ (fp >> 32));

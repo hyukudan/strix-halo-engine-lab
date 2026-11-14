@@ -51,14 +51,16 @@ inline std::uint64_t record_route_levers(std::string_view entry, unsigned rank, 
 // reports it (it has no concurrent decode, so it always prefills whole prompts). Informative lever, outside the
 // fingerprint: the chunk changes which rows share a call, never the arithmetic a selected route computes.
 inline pf::dense_policy::Chunk record_prefill_chunk(std::string_view entry, bool explicit_request, unsigned requested,
-                                                    unsigned world, unsigned max_rows) {
+                                                    unsigned world, unsigned max_rows, std::string_view prefill) {
     namespace rr = strix::route;
     namespace dp = pf::dense_policy;
-    const dp::Chunk c = dp::resolve_chunk(explicit_request, requested, world, max_rows, strix::envcfg::text);
-    const std::string core = c.route == dp::kX3r8 ? (c.wmma ? "x3r8+f16_wmma" : "x3r8") : c.route == dp::kTm ? "tm16" :
+    const dp::Chunk c = dp::resolve_chunk(explicit_request, requested, world, max_rows, prefill, strix::envcfg::text);
+    const std::string core = !c.applicable ? "inapplicable" : c.tokens == 0 ? "prompt-dependent" : c.mixed ? "mixed" :
+        c.route == dp::kX3r8 ? (c.wmma ? "x3r8+f16_wmma" : "x3r8") : c.route == dp::kTm ? "tm" :
         "x" + std::to_string(c.route);
     rr::lever("glm.prefill_chunk", explicit_request ? std::to_string(requested) : std::string("default"),
               std::to_string(c.tokens) + ":rows=" + std::to_string(c.rows) + ":dense=" + core,
+              !c.applicable ? rr::Reason::wrong_route : c.tokens == 0 ? rr::Reason::no_match :
               !c.declined ? rr::Reason::selected : c.route == dp::kTm && c.reason.find("short_call") != std::string::npos ?
                   rr::Reason::short_call : rr::Reason::wrong_route,
               false, std::string(entry == "cli" ? "serving-only lever (the CLI prefills whole prompts); " : "") + c.reason);
@@ -70,10 +72,10 @@ inline pf::dense_policy::Chunk record_prefill_chunk(std::string_view entry, bool
 // but not applied. `apply_pending(set)` calls set(name, value) for every value the app would set if unset.
 template<class ApplyPending>
 inline pf::dense_policy::Chunk pending_prefill_chunk(bool explicit_request, unsigned requested, unsigned world, unsigned max_rows,
-                                                     ApplyPending&& apply_pending) {
+                                                     std::string_view prefill, ApplyPending&& apply_pending) {
     std::map<std::string, std::string> pending;
     apply_pending([&](const char* name, const char* value) { if (std::getenv(name) == nullptr) pending[name] = value; });
-    return pf::dense_policy::resolve_chunk(explicit_request, requested, world, max_rows, [&](const char* name) {
+    return pf::dense_policy::resolve_chunk(explicit_request, requested, world, max_rows, prefill, [&](const char* name) {
         const auto it = pending.find(name);
         return it != pending.end() ? it->second.c_str() : static_cast<const char*>(std::getenv(name));
     });

@@ -5,6 +5,7 @@
 #include "glm/prefill/glm_pf_exact.hpp"
 #include "glm/prefill/glm_pf_exact_moe.hpp"
 #include "glm/moe/glm_trellis_device.hpp"
+#include "strix/env_flags.hpp"
 #include <hip/hip_runtime.h>
 #include <algorithm>
 #include <chrono>
@@ -234,7 +235,15 @@ void dense(std::mt19937& rng, hipStream_t s, unsigned reps) {
 
 // --dense-rows: whole-call timing by rows per call (the chunked serving route issues 64..2048-row calls): the TM16
 // exact core (the short-call route), the exact X3 core and the WMMA core, interleaved ABC CBA, minimum of the medians.
+// Timing completion only: this mode does not compare outputs or qualify exactness/fidelity.
 void dense_rows(std::mt19937& rng, hipStream_t s, unsigned reps) {
+    struct BaselineTile {
+        const char* inherited = strix::envcfg::text("STRIX_GLM_PF_EXACT_TM");
+        const bool present = inherited != nullptr;
+        const std::string saved = present ? inherited : "";
+        BaselineTile() { env("STRIX_GLM_PF_EXACT_TM", "16"); }
+        ~BaselineTile() { env("STRIX_GLM_PF_EXACT_TM", present ? saved.c_str() : nullptr); }
+    } baseline_tile;
     struct Shape { unsigned K, N, bits; };
     for (const Shape sh : {Shape{4096, 1024, 4}, Shape{1024, 4096, 5}, Shape{4096, 6144, 6}, Shape{2048, 4096, 3}}) {
         const M::Exl3 w = make_matrix(rng, sh.K, sh.N, sh.bits);
@@ -256,12 +265,14 @@ void dense_rows(std::mt19937& rng, hipStream_t s, unsigned reps) {
                 const unsigned arm = rep ? 2U - o : o;
                 arm_env(arm == 2 ? 2U : 0U);
                 env("STRIX_GLM_PF_EXACT_X", arm == 0 ? "0" : "4");
+                if (arm == 0 && (DX::route(rows) != DX::Route::tm || DX::tile_rows() != 16))
+                    throw std::runtime_error("dense-rows baseline must resolve to TM16");
                 DX::linear_rows(l, x, sh.K, y, sh.N, rows, ws, wsb, s);
                 t[arm][rep] = median_ms([&] { DX::linear_rows(l, x, sh.K, y, sh.N, rows, ws, wsb, s); }, s, reps);
             }
             const double a = std::min(t[0][0], t[0][1]), b = std::min(t[1][0], t[1][1]), c = std::min(t[2][0], t[2][1]);
-            std::printf("ROWS dense K%u N%u b%u rows=%u tm16 %.3f ms exact-X3 %.3f ms (x%.3f) wmma %.3f ms (x%.3f of tm16, x%.3f of X3)\n",
-                        sh.K, sh.N, sh.bits, rows, a, b, b / a, c, c / a, c / b);
+            std::printf("ROWS dense K%u N%u b%u rows=%u tm%u %.3f ms exact-X3 %.3f ms (x%.3f) wmma %.3f ms (x%.3f of tm16, x%.3f of X3)\n",
+                        sh.K, sh.N, sh.bits, rows, DX::tile_rows(), a, b, b / a, c, c / a, c / b);
         }
         arm_env(0);
         env("STRIX_GLM_PF_EXACT_X", nullptr);
