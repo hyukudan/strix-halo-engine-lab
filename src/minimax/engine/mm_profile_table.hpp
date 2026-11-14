@@ -11,6 +11,7 @@
 #include "strix/fast_profile.hpp"
 
 #include <array>
+#include <string_view>
 
 namespace strix::minimax::defaults {
 
@@ -25,6 +26,25 @@ inline constexpr strix::fast_profile::Member kFastMembers[] = {
 inline constexpr strix::fast_profile::Bundle kFastBundle{"STRIX_MM_FAST_PREFILL", "mm-fast-pf-v1", kFastMembers};
 inline constexpr const char* kMsaFlashLayers = "40-59";  // passes the 8K FAST gate on EXL3; 20-59 does not
 inline constexpr unsigned kMsaLayers = 60;
+
+// Named one-term policies (canonical layer ranges -> policy id): each passed the unchanged FAST gate (KL <= 0.02,
+// top-1 >= 93 %, dNLL <= 0.01) on EXL3 at 8K and 32K. Any other mask / the two-term mode is reported by its ranges.
+struct MsaFlashPolicy {
+    const char* layers;
+    const char* policy;
+};
+inline constexpr MsaFlashPolicy kMsaFlashPolicies[] = {
+    {"40-59", "msa-flash-bf16-l40-v1"},
+    {"30-59", "msa-flash-bf16-l30-v1"},
+};
+inline constexpr const char* msa_flash_policy(std::string_view layers) {
+    for (const auto& p : kMsaFlashPolicies)
+        if (layers == p.layers) return p.policy;
+    return nullptr;
+}
+static_assert(msa_flash_policy(kMsaFlashLayers) != nullptr &&
+                  std::string_view(msa_flash_policy(kMsaFlashLayers)) == std::string_view(kFastMembers[0].policy),
+              "the bundle member's policy id names the bundle's layer set");
 
 // Bundle selection is requested provenance; only effective members enter agreement.
 inline constexpr std::array<strix::profile::Lever, 2> profile_table{{
