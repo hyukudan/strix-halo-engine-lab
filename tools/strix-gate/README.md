@@ -150,6 +150,33 @@ is pooled KL <= 0.02, top-1 >= 0.93, dNLL <= 0.01 (`--max-kl`, `--min-top1`, `--
 `--expect-identical` is the control for two runs of one identity: any logit or selection
 difference fails. Exit 0 = pass, 1 = fail, 2 = identity or input defect (no verdict).
 
+### Floor-relative dNLL (DeepSeek V4.1 FAST prefill only)
+
+```sh
+python tools/strix-gate/fast_logit_gate.py compare EXACT CAND --ranks 0 1 --tokens ... \
+    --dnll-rule floor --engine ds41 --profile fast-prefill --null-arm NULL_S1 --null-arm NULL_S2 --null-arm NULL_S3
+```
+
+Labels are the true next tokens, so a change that carries no information about the text costs
+E[dNLL] = KL in expectation: on DS41 every layer-0 change (a one-ulp null included) re-routes MoE
+rows and lands at KL ~0.01, dNLL +0.011..+0.014, above the absolute 0.01. For that profile the dNLL
+limit is relative to this floor: `--dnll-rule floor` makes it mean + 2 sd (n - 1) of the pooled dNLL
+of at least three layer-0 null-control arms (`--null-arm DIR`, sealed runs) measured against the
+same reference, on the same prompts and the same binary as the candidate. KL <= 0.02 and
+top-1 >= 0.93 are unchanged. Example (DS41 20 prompts x 64 rows): nulls +0.01408 / +0.01140 /
++0.01111 give mean +0.01220, sd 0.00164, limit +0.01547; arms +0.01203 and +0.01458 pass, +0.01600 fails.
+
+Refused with exit 2 (no verdict): fewer than three nulls, a null whose binary differs from the
+candidate's, whose prompts or token files differ, or whose run id repeats the reference, the
+candidate or another null; `--null-arm` without `--dnll-rule floor`; floor with
+`--expect-identical`; and any `--engine` / `--profile` pair that `DNLL_POLICY` in the script does not
+grant the floor rule. Today the table holds one entry, `ds41` / `fast-prefill`; every other engine and
+profile keeps the absolute dNLL <= 0.01 (the default, unchanged). Widening the table is a policy
+decision. Under the floor rule the report prints and records (`pooled.dnll_rule` in `--json`) the
+rule, engine, profile, each null (run id, arm, env, rows, KL, top-1, dNLL), mean, sd, the limit and
+the absolute 0.01 verdict as a reference column; with the default rule `pooled.dnll_rule` records
+`abs` and the limit.
+
 When both arms carry selection dumps (`PREFIX-<prompt>-sel-r<rank>.u32`; MiniMax writes them
 with `STRIX_MM_QUALITY_SELECT=1` next to `STRIX_MM_QUALITY_OUT`), `compare` also reports, per
 layer, the (row, head) slots whose selected block set differs and the first layer and position

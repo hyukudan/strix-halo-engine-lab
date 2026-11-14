@@ -118,6 +118,101 @@ class Case(unittest.TestCase):
         e, rc = self.arm("E", "r9", bad)
         self.assertEqual(rc, [2, 0])
 
+    # ---- floor-relative dNLL rule (DS41 FAST prefill only)
+    def noisy(self, scale, seed):
+        rng = np.random.default_rng(seed)
+        return self.logits + rng.normal(scale=scale, size=self.logits.shape).astype("<f4")
+
+    def floor_args(self, nulls, engine="ds41", profile="fast-prefill"):
+        out = ["--dnll-rule", "floor", "--engine", engine, "--profile", profile]
+        for n in nulls:
+            out += ["--null-arm", str(n)]
+        return out
+
+    def test_dsq3_numbers(self):
+        nulls = [0.01408, 0.01140, 0.01111]
+        mean, sd, limit = g.floor_limit(nulls)
+        self.assertAlmostEqual(mean, 0.01220, places=5)
+        self.assertAlmostEqual(sd, 0.00164, places=5)
+        self.assertAlmostEqual(limit, 0.01547, places=5)
+        for dnll, ok, abs_ok in ((0.01203, True, False), (0.01458, True, False), (0.01600, False, False), (0.00485, True, True)):
+            v = g.dnll_verdict(dnll, "floor", 0.01, nulls)
+            self.assertEqual((v["pass"], v["abs_pass"], v["n_nulls"], v["sigmas"]), (ok, abs_ok, 3, 2.0), dnll)
+        v = g.dnll_verdict(0.01203, "abs", 0.01)
+        self.assertEqual((v["pass"], v["limit"]), (False, 0.01))
+        with self.assertRaises(g.GateError):
+            g.floor_limit([0.014, 0.011])
+        with self.assertRaises(g.GateError):
+            g.floor_limit([0.014, 0.011, float("nan")])
+
+    def test_policy_table(self):
+        self.assertEqual(g.allowed_dnll_rules("ds41", "fast-prefill"), ("abs", "floor"))
+        for e, p in (("ds41", "exact"), ("qwen", "fast-prefill"), ("minimax", "fast"), ("glm", "fast-prefill")):
+            self.assertEqual(g.allowed_dnll_rules(e, p), ("abs",))
+            with self.assertRaises(g.GateError):
+                g.check_dnll_policy("floor", e, p, 3)
+        with self.assertRaises(g.GateError):
+            g.check_dnll_policy("floor", "ds41", "fast-prefill", 2)
+        with self.assertRaises(g.GateError):
+            g.check_dnll_policy("floor", None, None, 3)
+        with self.assertRaises(g.GateError):
+            g.check_dnll_policy("abs", None, None, 1)
+        g.check_dnll_policy("floor", "ds41", "fast-prefill", 3)
+
+    def test_floor_end_to_end(self):
+        import json
+        a, _ = self.arm("A", "r1")
+        nulls = [self.arm(f"N{i}", f"n{i}", self.noisy(0.3, 10 + i), mode=3)[0] for i in range(3)]
+        cand, _ = self.arm("C", "c1", self.noisy(0.3, 20), mode=3)
+        out = self.root / "f.json"
+        rc = self.cmp(a, cand, *self.floor_args(nulls), "--json", str(out))
+        p = json.loads(out.read_text())["pooled"]
+        d = p["dnll_rule"]
+        vals = [n["dnll"] for n in d["nulls"]]
+        self.assertEqual([n["run_id"] for n in d["nulls"]], ["n0", "n1", "n2"])
+        self.assertAlmostEqual(d["mean"], float(np.mean(vals)), places=12)
+        self.assertAlmostEqual(d["sd"], float(np.std(vals, ddof=1)), places=12)
+        self.assertAlmostEqual(d["limit"], d["mean"] + 2 * d["sd"], places=12)
+        self.assertEqual((d["rule"], d["engine"], d["profile"], d["abs_limit"]), ("floor", "ds41", "fast-prefill", 0.01))
+        self.assertEqual(d["abs_pass"], p["dnll"] <= 0.01)
+        want = p["kl"] <= 0.02 and p["top1"] >= 0.93 and p["dnll"] <= d["limit"]
+        self.assertEqual((rc, p["pass"]), (0 if want else 1, want))
+        self.assertIn("floor ds41/fast-prefill", p["rule"])
+
+    def test_floor_refusals_have_no_verdict(self):
+        a, _ = self.arm("A", "r1")
+        nulls = [self.arm(f"N{i}", f"n{i}", self.noisy(1e-3, 10 + i), mode=3)[0] for i in range(3)]
+        cand, _ = self.arm("C", "c1", self.noisy(1e-3, 20), mode=3)
+        self.assertEqual(self.cmp(a, cand, *self.floor_args(nulls[:2])), 2)  # two nulls
+        self.assertEqual(self.cmp(a, cand, *self.floor_args([])), 2)  # no nulls
+        self.assertEqual(self.cmp(a, cand, *self.floor_args(nulls, "qwen")), 2)  # engine not in the policy table
+        self.assertEqual(self.cmp(a, cand, *self.floor_args(nulls, "ds41", "exact")), 2)  # profile not in the table
+        self.assertEqual(self.cmp(a, cand, "--dnll-rule", "floor", *sum((["--null-arm", str(n)] for n in nulls), [])), 2)
+        self.assertEqual(self.cmp(a, cand, "--null-arm", str(nulls[0])), 2)  # nulls without the floor rule
+        self.assertEqual(self.cmp(a, cand, *self.floor_args(nulls), "--expect-identical"), 2)
+        self.assertEqual(self.cmp(a, cand, *self.floor_args([nulls[0], nulls[1], nulls[0]])), 2)  # one null twice
+        self.assertEqual(self.cmp(a, cand, *self.floor_args([nulls[0], nulls[1], cand])), 2)  # candidate as a null
+        other = self.root / "engine2"
+        other.write_bytes(b"other binary")
+        self.binary, keep = other, self.binary
+        foreign, _ = self.arm("NB", "nb", self.noisy(1e-3, 30), mode=3)
+        self.binary = keep
+        self.assertEqual(self.cmp(a, cand, *self.floor_args([nulls[0], nulls[1], foreign])), 2)  # null on another binary
+        self.assertIn(self.cmp(a, cand, *self.floor_args(nulls)), (0, 1))  # the valid call reaches a verdict
+
+    def test_default_rule_unchanged(self):
+        import json
+        a, _ = self.arm("A", "r1")
+        for i, scale in enumerate((1e-3, 0.3, 1.0)):
+            cand, _ = self.arm(f"C{i}", f"c{i}", self.noisy(scale, 40 + i), mode=3)
+            out = self.root / f"d{i}.json"
+            rc = self.cmp(a, cand, "--json", str(out))
+            p = json.loads(out.read_text())["pooled"]
+            want = p["kl"] <= 0.02 and p["top1"] >= 0.93 and p["dnll"] <= 0.01
+            self.assertEqual((rc, p["pass"]), (0 if want else 1, want))
+            self.assertEqual(p["rule"], "KL <= 0.02, top-1 >= 0.93, dNLL <= 0.01")
+            self.assertEqual((p["dnll_rule"]["rule"], p["dnll_rule"]["limit"], p["dnll_rule"]["nulls"]), ("abs", 0.01, []))
+
 
 if __name__ == "__main__":
     unittest.main()

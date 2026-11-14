@@ -14,7 +14,9 @@ Two subcommands (Python 3.9+, numpy):
            an arm; prompts, rows and vocabulary widths must agree. Reports per prompt and pooled KL(ref || cand),
            top-1 agreement and the NLL change on the real next tokens, and, when both arms carry block-selection
            dumps, the selected ids that differ per layer and position. Exit 0 = gate passed, 1 = gate failed,
-           2 = identity or input error (no verdict).
+           2 = identity or input error (no verdict). The dNLL limit is absolute (--max-dnll) unless
+           --dnll-rule floor is given: then it is mean + 2 sd (n - 1) of >= 3 --null-arm runs, allowed only for
+           the engine / profile pairs in DNLL_POLICY (DS41 FAST prefill); the absolute verdict stays a reference.
 
 Dump layout inside a run directory (PREFIX is the --prefix value, default "q"):
   PREFIX-<prompt>-tf-r<rank>.f32   [rows][width] little-endian FP32: the head logits of the last `rows` prompt
@@ -39,6 +41,61 @@ SEL_MAGIC = 0x444C4553
 
 class GateError(Exception):
     """Identity or input defect: the comparison has no verdict."""
+
+
+# dNLL rules per engine / profile. "abs" (every engine, the default): pooled dNLL <= --max-dnll. "floor": pooled dNLL <=
+# mean + FLOOR_SIGMAS * sd (n - 1) of at least FLOOR_MIN_NULLS layer-0 null-control arms measured on the same prompts and
+# binary as the candidate; KL and top-1 limits are unchanged. Only the DeepSeek V4.1 FAST prefill profile may use "floor":
+# its layer-0 chaos floor (any one-ulp change at layer 0 re-routes MoE rows) already costs dNLL ~0.012 > 0.01. Adding an
+# entry here is a policy decision, not a tuning knob.
+DNLL_POLICY = {
+    ("ds41", "fast-prefill"): ("abs", "floor"),
+}
+FLOOR_MIN_NULLS = 3
+FLOOR_SIGMAS = 2.0
+
+
+def allowed_dnll_rules(engine, profile):
+    return DNLL_POLICY.get((engine, profile), ("abs",))
+
+
+def check_dnll_policy(rule, engine, profile, n_nulls):
+    """Refuses a rule the policy table does not grant, or a floor without enough nulls (GateError = no verdict)."""
+    if rule == "abs":
+        if n_nulls:
+            raise GateError("--null-arm is only used by --dnll-rule floor")
+        return
+    if not engine or not profile:
+        raise GateError("--dnll-rule floor needs --engine and --profile (checked against DNLL_POLICY)")
+    if rule not in allowed_dnll_rules(engine, profile):
+        granted = ", ".join(f"{e}/{p}" for (e, p), rules in sorted(DNLL_POLICY.items()) if rule in rules)
+        raise GateError(f"--dnll-rule {rule} is not allowed for engine {engine} profile {profile} (DNLL_POLICY grants it to: "
+                        f"{granted}); use the absolute rule")
+    if n_nulls < FLOOR_MIN_NULLS:
+        raise GateError(f"--dnll-rule floor needs at least {FLOOR_MIN_NULLS} --null-arm layer-0 null controls, got {n_nulls}")
+
+
+def floor_limit(null_dnll):
+    """(mean, sd with n - 1, limit = mean + FLOOR_SIGMAS * sd) of the null-control pooled dNLL values."""
+    v = np.asarray(null_dnll, dtype=np.float64)
+    if v.ndim != 1 or v.size < FLOOR_MIN_NULLS:
+        raise GateError(f"floor rule needs at least {FLOOR_MIN_NULLS} null dNLL values, got {v.size}")
+    if not np.all(np.isfinite(v)):
+        raise GateError("floor rule: a null dNLL is not finite")
+    mean, sd = float(v.mean()), float(v.std(ddof=1))
+    return mean, sd, mean + FLOOR_SIGMAS * sd
+
+
+def dnll_verdict(dnll, rule, max_dnll, null_dnll=()):
+    """The dNLL part of the gate: {rule, limit, pass, abs_limit, abs_pass[, mean, sd, sigmas, n_nulls]}."""
+    out = {"rule": rule, "abs_limit": max_dnll, "abs_pass": bool(dnll <= max_dnll)}
+    if rule == "floor":
+        mean, sd, limit = floor_limit(null_dnll)
+        out.update(mean=mean, sd=sd, sigmas=FLOOR_SIGMAS, n_nulls=len(null_dnll), limit=limit)
+    else:
+        out["limit"] = max_dnll
+    out["pass"] = bool(dnll <= out["limit"])
+    return out
 
 
 def sha256_file(path):
@@ -259,6 +316,10 @@ def compare_selection(da, a, db, b, name):
 
 def compare(a):
     ranks = sorted(set(a.ranks))
+    null_dirs = a.null_arm or []
+    if a.expect_identical and (a.dnll_rule != "abs" or null_dirs):
+        raise GateError("--expect-identical has no dNLL limit: drop --dnll-rule / --null-arm")
+    check_dnll_policy(a.dnll_rule, a.engine, a.profile, len(null_dirs))
     da, ma = load_arm(a.ref, ranks)
     db, mb = load_arm(a.cand, ranks)
     if ma[0]["run_id"] == mb[0]["run_id"]:
@@ -267,6 +328,17 @@ def compare(a):
     names = sorted(ma[0]["prompts"])
     if names != sorted(mb[0]["prompts"]) or names != sorted(tokens):
         raise GateError("arms and --tokens disagree on the prompt set")
+    nulls, seen_ids = [], {ma[0]["run_id"], mb[0]["run_id"]}
+    for nd in null_dirs:  # floor rule: every null is a sealed run on the candidate's binary and prompts
+        dn, mn = load_arm(nd, ranks)
+        if mn[0]["run_id"] in seen_ids:
+            raise GateError(f"{nd}: null arm run id {mn[0]['run_id']} repeats the reference, the candidate or another null")
+        seen_ids.add(mn[0]["run_id"])
+        if [m["binary"]["sha256"] for m in mn] != [m["binary"]["sha256"] for m in mb]:
+            raise GateError(f"{nd}: null arm ran another binary than the candidate (the floor must be measured on the same binary)")
+        if sorted(mn[0]["prompts"]) != names:
+            raise GateError(f"{nd}: null arm prompt set differs from the reference / candidate")
+        nulls.append((dn, mn))
     report = {"ref": {k: ma[0][k] for k in ("run_id", "arm", "env", "attest")}, "cand": {k: mb[0][k] for k in ("run_id", "arm", "env", "attest")},
               "ref_binary": [m["binary"]["sha256"] for m in ma], "cand_binary": [m["binary"]["sha256"] for m in mb], "prompts": {}}
     print(f"ref  run {ma[0]['run_id']} arm {ma[0]['arm']} env {ma[0]['env']} binary {report['ref_binary'][0][:12]}")
@@ -275,7 +347,7 @@ def compare(a):
     identical, sel_slots, sel_slot_diff, sel_id_diff, sel_seen = True, 0, 0, 0, False
     for name in names:
         tok_sha = sha256_file(tokens[name])
-        for m in ma + mb:
+        for m in ma + mb + [m for _, mn in nulls for m in mn]:
             if m["prompts"][name]["tokens_sha256"] != tok_sha:
                 raise GateError(f"{name}: a sealed run used a different token file than --tokens")
         tok = np.fromfile(tokens[name], "<u4").astype(np.int64)
@@ -307,15 +379,37 @@ def compare(a):
     kl = float(np.concatenate(pooled["kl"]).mean())
     top1 = float(np.concatenate(pooled["agree"]).mean())
     dnll = float(np.concatenate(pooled["nll_cand"]).mean() - np.concatenate(pooled["nll_ref"]).mean())
+    null_rows = []
+    for dn, mn in nulls:  # pooled exactly like the candidate: same reference, same prompts, same labels
+        acc = {"kl": [], "agree": [], "nll_ref": [], "nll_cand": []}
+        for name in names:
+            r = compare_logits(da, ma, dn, mn, name, np.fromfile(tokens[name], "<u4").astype(np.int64))
+            for k in acc:
+                acc[k].append(r[k])
+        nd_ = float(np.concatenate(acc["nll_cand"]).mean() - np.concatenate(acc["nll_ref"]).mean())
+        null_rows.append({"dir": str(dn), "run_id": mn[0]["run_id"], "arm": mn[0]["arm"], "env": mn[0]["env"],
+                          "rows": int(sum(len(k) for k in acc["kl"])), "kl": float(np.concatenate(acc["kl"]).mean()),
+                          "top1": float(np.concatenate(acc["agree"]).mean()), "dnll": nd_})
+        print(f"null {mn[0]['arm']} run {mn[0]['run_id']} env {mn[0]['env']}: KL {null_rows[-1]['kl']:.5f}, "
+              f"top-1 {null_rows[-1]['top1']:.4f}, dNLL {nd_:+.5f}")
+    dv = None
     if a.expect_identical:
         ok = identical and sel_slot_diff == 0
         rule = "identical logits and selections"
     else:
-        ok = kl <= a.max_kl and top1 >= a.min_top1 and dnll <= a.max_dnll
-        rule = f"KL <= {a.max_kl}, top-1 >= {a.min_top1}, dNLL <= {a.max_dnll}"
+        dv = dnll_verdict(dnll, a.dnll_rule, a.max_dnll, [x["dnll"] for x in null_rows])
+        dv.update(engine=a.engine, profile=a.profile, nulls=null_rows)
+        ok = kl <= a.max_kl and top1 >= a.min_top1 and dv["pass"]
+        if a.dnll_rule == "floor":
+            rule = (f"KL <= {a.max_kl}, top-1 >= {a.min_top1}, dNLL <= {dv['limit']:+.5f} (floor {a.engine}/{a.profile}: "
+                    f"{dv['n_nulls']} nulls mean {dv['mean']:+.5f} + {FLOOR_SIGMAS:g} sd {dv['sd']:.5f})")
+        else:
+            rule = f"KL <= {a.max_kl}, top-1 >= {a.min_top1}, dNLL <= {a.max_dnll}"
     report["pooled"] = {"rows": int(sum(len(k) for k in pooled["kl"])), "kl": kl, "top1": top1, "dnll": dnll, "identical": identical,
                         "selection": {"slots": sel_slots, "slot_diff": sel_slot_diff, "id_diff": sel_id_diff} if sel_seen else None,
-                        "rule": rule, "pass": ok}
+                        "rule": rule, "dnll_rule": dv, "pass": ok}
+    if dv is not None and a.dnll_rule == "floor":
+        print(f"REFERENCE absolute dNLL <= {a.max_dnll}: {'PASS' if dv['abs_pass'] else 'FAIL'} (not the verdict under the floor rule)")
     sel = f"; selection {sel_slot_diff}/{sel_slots} slots differ, {sel_id_diff} ids" if sel_seen else ""
     print(f"POOLED rows {report['pooled']['rows']}: KL {kl:.5f}, top-1 {top1:.4f}, dNLL {dnll:+.5f}, logits identical {identical}{sel} "
           f"[{rule}] -> {'PASS' if ok else 'FAIL'}")
@@ -348,6 +442,13 @@ def main(argv=None):
     c.add_argument("--max-kl", type=float, default=0.02)
     c.add_argument("--min-top1", type=float, default=0.93)
     c.add_argument("--max-dnll", type=float, default=0.01)
+    c.add_argument("--dnll-rule", choices=("abs", "floor"), default="abs",
+                   help="abs: dNLL <= --max-dnll (default, every engine); floor: dNLL <= mean + 2 sd of the --null-arm runs "
+                        "(only engine/profile pairs in DNLL_POLICY, today ds41/fast-prefill)")
+    c.add_argument("--null-arm", action="append", metavar="DIR",
+                   help="sealed layer-0 null-control run on the candidate's binary and prompts (repeat, >= 3 for floor)")
+    c.add_argument("--engine", help="engine of the candidate (floor rule policy check), e.g. ds41")
+    c.add_argument("--profile", help="profile of the candidate (floor rule policy check), e.g. fast-prefill")
     c.add_argument("--expect-identical", action="store_true", help="repeat of one identity: any difference fails")
     c.add_argument("--json")
     a = ap.parse_args(argv)
