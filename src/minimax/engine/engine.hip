@@ -792,11 +792,11 @@ struct Engine::Impl {
     float* i4_shadow_sums = nullptr;     // two pairs of {squared error, exact energy}
     fast_i4::Scope i4_scope = fast_i4::Scope::all;
     strix::core::LayerSet i4_exl3_layers;  // STRIX_MMX_FAST_I4_EXL3_LAYERS: MoE layers that keep the EXL3 operator
+    unsigned i4_bits = 4;                  // STRIX_MMX_FAST_I4_BITS: operand bits of the INT4 chain (4 = W4A4, 8 = W8A8)
     unsigned i4_a8 = 0;                    // STRIX_MMX_FAST_I4_A8: bit 0 gate/up input, bit 1 down input as two A4 planes
     strix::core::LayerSet i4_a8_layers;    // STRIX_MMX_FAST_I4_A8_LAYERS: the layers it applies to (unset: all MoE layers)
     bool pf_i4_chain = mmoe::prefill_i4_chain(); // per prompt: prefill_begin sets it from the prompt rows
     std::size_t i4_min_rows = fast_i4::kMinRows;  // STRIX_MMX_FAST_I4_MIN_ROWS: shorter prompts prefill on EXL3
-    bool pf_i4_rows = true;                       // per prompt: prefill_begin, prompt rows >= i4_min_rows
     struct JitSlot {
         std::uint8_t* pack = nullptr;
         mmoe::I4Layer weights{};   // fixed wq/ws and reusable device svh tables
@@ -810,7 +810,7 @@ struct Engine::Impl {
     struct JitTiming {
         hipEvent_t convert0 = nullptr, convert1 = nullptr, moe0 = nullptr, moe1 = nullptr;
         bool convert_pending = false, moe_pending = false, moe_started = false;
-        std::uint64_t converts = 0, moes = 0;
+        std::uint64_t converts = 0, moes = 0, i4_calls = 0, exl3_calls = 0;  // calls: MoE launches (one per chunk or group)
         double convert_ms = 0, moe_ms = 0;
     };
     std::array<JitTiming, kLayers> jit_timing{};
@@ -991,6 +991,15 @@ struct Engine::Impl {
                 const char* al = std::getenv("STRIX_MMX_FAST_I4_A8_LAYERS");
                 i4_a8_layers = strix::core::parse_layer_set(al == nullptr || al[0] == 0 ? "!" : al, kFirstMoe, kLayers,
                                                             "STRIX_MMX_FAST_I4_A8_LAYERS");
+            }
+            {   // FAST policy i8: W8A8 on the same chain (signed-byte packs and activation images, 2x pack bytes).
+                const char* bits = std::getenv("STRIX_MMX_FAST_I4_BITS");
+                const std::string_view s = bits == nullptr ? "" : bits;
+                if (!s.empty() && s != "4" && s != "8") throw std::invalid_argument("STRIX_MMX_FAST_I4_BITS must be 4 or 8");
+                i4_bits = s == "8" ? 8U : 4U;
+                if (i4_bits == 8U && (i4_scope != fast_i4::Scope::all || i4_a8 != 0U || !mmoe::prefill_i4_chain(0)))
+                    throw std::invalid_argument("STRIX_MMX_FAST_I4_BITS=8 needs scope all on the INT4 chain, without the A8 planes");
+                mmoe::set_prefill_i4_wide(i4_bits == 8U);
             }
             i4_min_rows = fast_i4::min_rows(std::getenv("STRIX_MMX_FAST_I4_MIN_ROWS"));
             jit_prefetch = env_flag("STRIX_MMX_FAST_I4_PREFETCH", false);
@@ -1176,19 +1185,19 @@ struct Engine::Impl {
         if (jit_prefetch) hip_ok(hipStreamCreateWithFlags(&jit_stream, hipStreamNonBlocking), "fast_i4 prefetch stream");
         std::printf("mm rank %u: fast_i4 (identity minimax-fast-i4, lossy): %zu reusable IU4 layer slots, "
                     "%.3f GiB (%zu bytes) including slot tables; source tables %.3f MiB; prefill workspace %.3f GiB; "
-                    "scope %s, prefetch %u, EXL3 layers %u, min rows %zu; context %zu x %zu slots unchanged; decode EXL3\n", opt.rank,
+                    "scope %s, bits %u, prefetch %u, EXL3 layers %u, min rows %zu; context %zu x %zu slots unchanged; decode EXL3\n", opt.rank,
                     jit.size(), static_cast<double>(jit.size() * pk) / 1073741824.0, jit.size() * pk,
                     static_cast<double>((kLayers - kFirstMoe) * mmoe::i4_source_bytes()) / 1048576.0,
                     static_cast<double>(pf_ws_bytes) / 1073741824.0,
-                    i4_scope == fast_i4::Scope::all ? "all" : "gate_up", jit_prefetch ? 1U : 0U, i4_exl3_layers.count(), i4_min_rows,
+                    i4_scope == fast_i4::Scope::all ? "all" : "gate_up", i4_bits, jit_prefetch ? 1U : 0U, i4_exl3_layers.count(), i4_min_rows,
                     static_cast<std::size_t>(opt.capacity), static_cast<std::size_t>(opt.slots));
         std::fflush(stdout);
     }
     bool i4_jit_layer(unsigned L) const { return model_fast_i4 && L >= kFirstMoe && L < kLayers && !i4_exl3_layers.test(L); }
     // Shared route receipt (strix/route_receipt.hpp): why a MoE layer's prefill runs IU4 or keeps the EXL3 operator.
-    strix::route::Reason route_i4_reason(unsigned L, bool i4) const {
+    strix::route::Reason route_i4_reason(unsigned L, bool i4, bool rows_on) const {
         using R = strix::route::Reason;
-        return i4 ? R::selected : !model_fast_i4 || !mmoe::prefill_iu4() ? R::disabled : !pf_i4_rows ? R::short_call :
+        return i4 ? R::selected : !model_fast_i4 || !mmoe::prefill_iu4() ? R::disabled : !rows_on ? R::short_call :
                i4_exl3_layers.test(L) ? R::layer_mask : R::no_match;
     }
     void route_levers() const {
@@ -1223,6 +1232,7 @@ struct Engine::Impl {
     // every sample available; no host fence is introduced for conversion or prefetch.
     void jit_collect(bool report = false) {
         if (!jit_stats) return;
+        double sum_i4 = 0, sum_exl3 = 0, sum_convert = 0;
         for (unsigned L = kFirstMoe; L < kLayers; ++L) {
             auto& t = jit_timing[L];
             auto collect = [&](bool& pending, hipEvent_t a, hipEvent_t b, double& total, std::uint64_t& count) {
@@ -1238,11 +1248,23 @@ struct Engine::Impl {
             };
             collect(t.convert_pending, t.convert0, t.convert1, t.convert_ms, t.converts);
             collect(t.moe_pending, t.moe0, t.moe1, t.moe_ms, t.moes);
-            if (report && t.converts != 0 && t.moes != 0)
-                std::printf("rank %u fast_i4 L%u: converter %.3f ms/layer (%llu), IU4 group %.3f ms/layer (%llu)\n",
-                            opt.rank, L, t.convert_ms / static_cast<double>(t.converts), static_cast<unsigned long long>(t.converts),
-                            t.moe_ms / static_cast<double>(t.moes), static_cast<unsigned long long>(t.moes));
+            if (!report) continue;
+            if (t.moes != 0) {
+                const bool i4 = t.i4_calls != 0;
+                std::printf("rank %u fast_i4 L%u: %s, converter %.3f ms/layer (%llu), MoE group %.3f ms/layer (%llu), launches IU4 %llu EXL3 %llu\n",
+                            opt.rank, L, i4 ? "IU4" : "EXL3", t.converts != 0 ? t.convert_ms / static_cast<double>(t.converts) : 0.0,
+                            static_cast<unsigned long long>(t.converts), t.moe_ms / static_cast<double>(t.moes),
+                            static_cast<unsigned long long>(t.moes), static_cast<unsigned long long>(t.i4_calls),
+                            static_cast<unsigned long long>(t.exl3_calls));
+                (i4 ? sum_i4 : sum_exl3) += t.moe_ms;
+                sum_convert += t.convert_ms;
+            }
+            t.converts = t.moes = t.i4_calls = t.exl3_calls = 0;  // one prompt per report
+            t.convert_ms = t.moe_ms = 0;
         }
+        if (report)
+            std::printf("rank %u fast_i4 prompt: sampled MoE group time IU4 %.1f ms, EXL3 %.1f ms, converter %.1f ms\n", opt.rank,
+                        sum_i4, sum_exl3, sum_convert);
     }
     void jit_begin() { jit_collect(); jit_schedule.begin(); }
     const mmoe::I4Layer* jit_acquire(unsigned L, unsigned end) {
@@ -1262,16 +1284,28 @@ struct Engine::Impl {
                 if (side) hip_ok(hipEventRecord(j.ready, stream), "fast_i4 prefetch ready");
             },
             [&](unsigned slot) { hip_ok(hipStreamWaitEvent(nullptr, jit[slot].ready, 0), "fast_i4 wait ready"); });
-        auto& t = jit_timing[L];
-        t.moe_started = jit_stats && !t.moe_pending;
-        if (t.moe_started) hip_ok(hipEventRecord(t.moe0, nullptr), "fast_i4 MoE begin");
+        jit_moe_begin(L);
         return &jit[s].weights;
     }
-    void jit_release(unsigned L) {
+    // STATS: the same group timer and launch counts for the layers kept on EXL3, so one run gives both sides.
+    void jit_moe_begin(unsigned L) {
+        auto& t = jit_timing[L];
+        t.moe_started = jit_stats && t.moe0 != nullptr && !t.moe_pending;
+        if (t.moe_started) hip_ok(hipEventRecord(t.moe0, nullptr), "fast_i4 MoE begin");
+    }
+    void jit_moe_end(unsigned L) {
         if (jit_timing[L].moe_started) {
             hip_ok(hipEventRecord(jit_timing[L].moe1, nullptr), "fast_i4 MoE end");
             jit_timing[L].moe_pending = true;
+            jit_timing[L].moe_started = false;
         }
+    }
+    void jit_count(unsigned L, bool i4, std::size_t calls = 1) {
+        if (!jit_stats) return;
+        (i4 ? jit_timing[L].i4_calls : jit_timing[L].exl3_calls) += calls;
+    }
+    void jit_release(unsigned L) {
+        jit_moe_end(L);
         hip_ok(hipEventRecord(jit[L & 1U].free, nullptr), "fast_i4 slot free");
     }
 
@@ -1850,7 +1884,7 @@ struct Engine::Impl {
         }
         xb_layers = L1;
         xb_prepped = false;
-        const bool i4_on = !gemv && model_fast_i4 && pf_i4_rows && mmoe::prefill_iu4();
+        const bool i4_on = !gemv && model_fast_i4 && task.i4.on && mmoe::prefill_iu4();
         if (i4_on) jit_begin();
         for (unsigned L = L0; L < L1; ++L) {
             const Layer& y = layers[L];
@@ -1864,9 +1898,11 @@ struct Engine::Impl {
                                       hipMemcpyDeviceToDevice, nullptr), "trace ids");
             out = send_buffer(n);
             const auto* i4 = i4_on && i4_jit_layer(L) ? jit_acquire(L, L1) : nullptr;
-            const strix::route::LayerScope route_layer(gemv || L < kFirstMoe ? ~0U : L, route_i4_reason(L, i4 != nullptr));
+            const strix::route::LayerScope route_layer(gemv || L < kFirstMoe ? ~0U : L, route_i4_reason(L, i4 != nullptr, task.i4.on));
+            if (i4 == nullptr && i4_on && y.moe) jit_moe_begin(L);
             stage_ffn(L, n, out, i4);
-            if (i4 != nullptr) jit_release(L);
+            if (y.moe) jit_count(L, i4 != nullptr);
+            if (i4 != nullptr) jit_release(L); else jit_moe_end(L);
             exchange_post(n, L, 1, out, y.w_next, nullptr, nullptr);
             tmark(tmark_at(L, 5));
             if (taps_on) capture_tap(L, n);
@@ -2405,6 +2441,7 @@ struct Engine::Impl {
         Engine::PfTaskId id = 0, parent = 0;
         std::uint64_t generation = 0;
         std::unique_ptr<strix::core::i4_shadow::Accumulator<kLayers>> shadow;
+        fast_i4::RowGate i4;  // per task: a nested child's begin must not change the parked parent's INT4 decision
     } task, parked;
     struct ActivationBank { float *h = nullptr, *hn = nullptr, *taps = nullptr; } base_bank, nest_bank;
     bool child_bank = false;
@@ -2434,7 +2471,7 @@ struct Engine::Impl {
         task.pos0 = pos0;
         pf_i4_chain = mmoe::prefill_i4_chain(toks.size());
         // The kernel route is a property of the whole prompt, not of the suffix a resident restart leaves to compute.
-        pf_i4_rows = pos0 + toks.size() >= i4_min_rows;
+        task.i4.begin(pos0 + toks.size(), i4_min_rows);
         task.chunks = (toks.size() + opt.max_rows - 1) / opt.max_rows;
         const bool module = pf != nullptr && pf_on && !pf_force_comm;
         task.grouped = pf_interleave && (module || pf_comm_interleave) && !profiling && !(taps_on && tap_sink) && task.chunks >= 2;
@@ -2784,7 +2821,7 @@ struct Engine::Impl {
             embed_rows(toks.data() + c * opt.max_rows, N[c]);
             hipLaunchKernelGGL(rmsnorm_gemma_kernel, dim3(static_cast<unsigned>(N[c])), dim3(256), 0, nullptr, h, w_in0, hn, kHidden);
         }
-        const bool i4_on = model_fast_i4 && pf_i4_rows && mmoe::prefill_iu4();
+        const bool i4_on = model_fast_i4 && task.i4.on && mmoe::prefill_iu4();
         if (i4_on) jit_begin();
         for (unsigned L = L0; L < L1; ++L) {
             const Layer& y = layers[L];
@@ -2803,7 +2840,7 @@ struct Engine::Impl {
                 send(c, 0, L, o);
             }
             const auto* i4 = i4_on && i4_jit_layer(L) ? jit_acquire(L, L1) : nullptr;
-            const strix::route::LayerScope route_layer(gemv || L < kFirstMoe ? ~0U : L, route_i4_reason(L, i4 != nullptr));
+            const strix::route::LayerScope route_layer(gemv || L < kFirstMoe ? ~0U : L, route_i4_reason(L, i4 != nullptr, task.i4.on));
             const auto post_router = [&](std::size_t c) {
                 use(c);
                 const auto view = recv(c);
@@ -2813,6 +2850,7 @@ struct Engine::Impl {
                 if (tl) tl->mark("attention-post-router", false);
             };
             const std::size_t moe_w = pf_moe_width(L, i4 != nullptr, m);
+            if (i4 == nullptr && i4_on && y.moe) jit_moe_begin(L);
             for (std::size_t c0 = 0; c0 < m;) {
                 // A sub-group runs as one group-wide MoE call when every member writes its own output buffer (the
                 // module's TX slots in place, or the communicator's per-member partials) and has the rows the
@@ -2827,6 +2865,7 @@ struct Engine::Impl {
                         post_router(c);
                         float* o = out_of(c);
                         stage_ffn(L, N[c], o, i4);
+                        if (y.moe) jit_count(L, i4 != nullptr);
                         send(c, 1, L, o);
                     }
                     c0 += span;
@@ -2850,13 +2889,14 @@ struct Engine::Impl {
                 }
                 use(c0);
                 stage_ffn_group(L, gv);
+                jit_count(L, false);
                 for (std::size_t sm = 0; sm < span; ++sm) {
                     use(c0 + sm);
                     send(c0 + sm, 1, L, O[sm]);
                 }
                 c0 += span;
             }
-            if (i4 != nullptr) jit_release(L);
+            if (i4 != nullptr) jit_release(L); else jit_moe_end(L);
         }
         for (std::size_t c = 0; c < m; ++c) {
             use(c);

@@ -123,6 +123,7 @@ template<int Bits> struct WmmaXContract {
 //          activation, combine... Fused epilogue only.
 // kPassRow: global-A row offset added per chain pass (paired gate/up reads an interleaved
 // pre-quantised image, row = map*a_mul + a_add + pass*kPassRow). NoChain: 0 (unchanged).
+// kWide (optional chain member): the packed operands hold signed bytes instead of signed nibbles (see chain_wide).
 struct NoChain {
     static constexpr bool kActive = false;
     static constexpr int kPasses = 1;
@@ -135,6 +136,12 @@ struct NoAdapter {
 };
 // Probe (benchmark builds only, timing decomposition, wrong outputs):
 // 1 = no Q decode/LDS store, 2 = no WMMA, 3 = WMMA + fragment reads only.
+// Wide packed operands (W8A8 on the IU4 staging): a K-wide signed-byte row is staged as a 2K-wide nibble row
+// (inputs = 2K, one scale group = 128 nibble columns = 64 K), so chunks, swizzle, LDS layout and scale staging are
+// the IU4 ones unchanged; the K loop joins two consecutive 8-byte fragments into one IU8 WMMA operand, so the
+// WMMA count per K is that of IU4. I32 group sums stay exact (64 * 127 * 127 < 2^24).
+template<class C, class = void> struct chain_wide : std::false_type {};
+template<class C> struct chain_wide<C, std::void_t<decltype(C::kWide)>> : std::bool_constant<C::kWide> {};
 template<class Contract> constexpr unsigned core_waves_per_eu() {
     if constexpr (is_integer_operand<typename Contract::Operand>::value) return Contract::Operand::Plan::waves_per_eu;
     else return 0;
@@ -181,7 +188,8 @@ __attribute__((amdgpu_waves_per_eu(core_waves_per_eu<Contract>()))) void tiled_c
     constexpr bool AD = Adapter::kActive;
     static_assert(!AD || (Integer || (!IU4 && !DenseF16 && Probe == 0 && (!Fused || BN % 128 == 0))), "adapters: trellis F16 operands");
     static_assert(Fold == 0 || (!IU4 && !DenseF16));
-    static_assert(!Chain::kActive || (IU4Grouped && Fused && IU4Group == 64 && !AD));
+    constexpr bool Wide = chain_wide<Chain>::value;
+    static_assert(!Chain::kActive || (IU4Grouped && Fused && IU4Group == (Wide ? 128 : 64) && !AD));
     // Gate values stay in each lane's registers across the paired gate/up mainloops.
     constexpr int chain_groups = (G::waves_m * 16 * (BN / 128) + G::waves - 1) / G::waves;
     float chain_saved[Chain::kSaveRegs ? MT * chain_groups * 4 : 1];
@@ -519,6 +527,34 @@ __attribute__((amdgpu_waves_per_eu(core_waves_per_eu<Contract>()))) void tiled_c
             for (int seg = 0; seg < SLOTS; ++seg) {
                 const int t0 = k0 + seg * SEG;          // first K16 tile of the segment
                 if (t0 >= tiles_k) break;               // K tail (uniform)
+                if constexpr (Wide) {
+                    using Bytes = int32_t __attribute__((ext_vector_type(4)));
+                    static_assert(SEG % 2 == 0);
+                    #pragma unroll
+                    for (int j = 0; j < SEG; j += 2) {
+                        const int b0 = ((seg * SEG + j) * 8) ^ swz, b1 = ((seg * SEG + j + 1) * 8) ^ swz;
+                        Bytes left[MT], right[NT];
+                        #pragma unroll
+                        for (int mt = 0; mt < MT; ++mt) {
+                            const auto* f = a_frag + mt * 16 * G::row_bytes;
+                            const Nibbles lo = *reinterpret_cast<const Nibbles*>(f + b0), hi = *reinterpret_cast<const Nibbles*>(f + b1);
+                            left[mt] = Bytes{lo[0], lo[1], hi[0], hi[1]};
+                        }
+                        #pragma unroll
+                        for (int nt = 0; nt < NT; ++nt) {
+                            const auto* f = b_frag + nt * 16 * G::row_bytes;
+                            const Nibbles lo = *reinterpret_cast<const Nibbles*>(f + b0), hi = *reinterpret_cast<const Nibbles*>(f + b1);
+                            right[nt] = Bytes{lo[0], lo[1], hi[0], hi[1]};
+                        }
+                        #pragma unroll
+                        for (int mt = 0; mt < MT; ++mt) {
+                            if (!mt_live(mt)) continue;
+                            #pragma unroll
+                            for (int nt = 0; nt < NT; ++nt)
+                                sum[mt][nt] = integer_wmma<8>(left[mt], right[nt], sum[mt][nt]);
+                        }
+                    }
+                } else
                 #pragma unroll
                 for (int j = 0; j < SEG; ++j) {
                     const int byte = ((seg * SEG + j) * 8) ^ swz;

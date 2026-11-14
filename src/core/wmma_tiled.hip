@@ -232,7 +232,7 @@ template<int Tile, bool Transform> hipError_t launch_grouped(const IU4GroupedOpe
 template<int Bits>
 __global__ __launch_bounds__(256) void exl3_iu4_convert_kernel(const uint32_t* const* trellis, int inputs, int outputs,
     uint8_t* wq, _Float16* ws, size_t wq_expert, size_t ws_expert, int scale_rule) {
-    const bool full = scale_rule == iu4_scale_rule_fast_full;
+    const bool full = scale_rule == iu4_scale_rule_fast_full, wide = scale_rule == iu4_scale_rule_wide8;
     const int lane = int(threadIdx.x & 31U), item = int(blockIdx.x) * 8 + int(threadIdx.x >> 5U), ntiles = outputs / 16;
     const int expert = int(blockIdx.y);
     const uint32_t* src = trellis[expert];
@@ -268,7 +268,7 @@ __global__ __launch_bounds__(256) void exl3_iu4_convert_kernel(const uint32_t* c
             for (int j = 0; j < 4; ++j) amax = fmaxf(amax, fabsf(v[u][4 * half + j]));
         amax = fmaxf(amax, __shfl_xor(amax, 1));
         amax = fmaxf(amax, __shfl_xor(amax, 2));
-        _Float16 s = _Float16(amax == 0.0f ? 1.0f : fmaxf(amax / 7.0f, 0x1p-24f));
+        _Float16 s = _Float16(amax == 0.0f ? 1.0f : fmaxf(amax / (wide ? 127.0f : 7.0f), 0x1p-24f));
         if (full) {  // fast full range: the group's positive and negative extremes (the quad's four lanes hold its 64 values)
             float pos = 0.0f, neg = 0.0f;
             #pragma unroll
@@ -295,6 +295,11 @@ __global__ __launch_bounds__(256) void exl3_iu4_convert_kernel(const uint32_t* c
                 const int lo = full ? iu4_requant_full(w0, inv) : iu4_requant(w0, inv),
                           hi = full ? iu4_requant_full(w1, inv) : iu4_requant(w1, inv);
                 const int k = (g * 4 + u) * 16 + 8 * pp + 2 * q;
+                if (wide) {  // one signed byte per weight at the nibble-pair position of column 2k of a 2K-wide matrix
+                    base[iu4_weight_byte(2 * k, n, outputs)] = uint8_t(iu8_requant(w0, inv));
+                    base[iu4_weight_byte(2 * k + 2, n, outputs)] = uint8_t(iu8_requant(w1, inv));
+                    continue;
+                }
                 base[iu4_weight_byte(k, n, outputs)] = uint8_t((uint32_t(lo) & 15U) | ((uint32_t(hi) & 15U) << 4U));
             }
     }

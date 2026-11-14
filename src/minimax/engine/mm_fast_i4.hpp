@@ -34,6 +34,12 @@ inline std::size_t min_rows(const char* value) {
     }
     return v;
 }
+// The row gate of ONE prefill task. It is task state: a nested child begins its own task (short, so OFF) while the
+// parent is parked, and the resumed parent must keep the decision it began with (arithmetic and speed).
+struct RowGate {
+    bool on = true;
+    void begin(std::size_t rows, std::size_t minimum) { on = rows >= minimum; }
+};
 
 // One acquire/release surrounds ALL chunks of a layer. A new group/range must
 // begin afresh; a pack is never treated as a resident layer across groups.

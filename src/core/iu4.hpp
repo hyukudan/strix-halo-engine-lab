@@ -41,7 +41,24 @@ inline int iu4_requant(float w, float inv) {
 // 0.0116, fast full range 0.0096.
 inline constexpr int iu4_scale_rule_legacy = 0;
 inline constexpr int iu4_scale_rule_fast_full = 2001;
-inline constexpr bool iu4_scale_rule_valid(int rule) { return rule == iu4_scale_rule_legacy || rule == iu4_scale_rule_fast_full; }
+// Wide pack (W8, FAST policy "i8"): signed bytes in [-127, 127], s = max|w| / 127 per output column and K64 group,
+// stored as the nibble layout of a 2K-wide matrix ([K/8][N/16][column][8 bytes], byte k % 8), twice the IU4 bytes.
+// The tiled core stages it as IU4 rows and multiplies with the IU8 WMMA (tiled_core.hpp, chain_wide).
+inline constexpr int iu4_scale_rule_wide8 = 8001;
+inline constexpr bool iu4_scale_rule_valid(int rule) {
+    return rule == iu4_scale_rule_legacy || rule == iu4_scale_rule_fast_full || rule == iu4_scale_rule_wide8;
+}
+#if defined(__HIPCC__)
+__host__ __device__
+#endif
+inline int iu8_requant(float w, float inv) {
+#if defined(__HIP_DEVICE_COMPILE__)
+    const int q = static_cast<int>(__builtin_rintf(w * inv));
+#else
+    const int q = static_cast<int>(std::nearbyint(w * inv));
+#endif
+    return q < -127 ? -127 : (q > 127 ? 127 : q);
+}
 #if defined(__HIPCC__)
 __host__ __device__
 #endif

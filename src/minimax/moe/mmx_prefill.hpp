@@ -63,6 +63,10 @@ void i4_convert(const I4Source& src, const I4Layer& out, hipStream_t stream, boo
 // Prefill MoE of an I4 layer: -1 = STRIX_MMX_PF_IU4 (default 1 = on whenever the view carries a layer), 0 = off (the
 // exact EXL3 path, only while the EXL3 tiles are resident), 1 = on. STRIX_MMX_IU4_PLAN = library plan 0 | 1 | 2.
 void set_prefill_iu4(int on);
+// FAST policy i8 (STRIX_MMX_FAST_I4_BITS=8): W8A8 packs and activation images on the same INT4 chain (scope all only);
+// set before any pack, slot or workspace is sized. Pack and slot bytes double (the scales do not).
+void set_prefill_i4_wide(bool on);
+bool prefill_i4_wide();
 bool prefill_iu4();
 // STRIX_MMX_FAKEQ_A4=1 (quality study only, default off): the exact v4 path with the gate/up and down inputs
 // fake-quantised to A4 g64 after their input transforms (iu4_fake128); EXL3 weights unchanged.
