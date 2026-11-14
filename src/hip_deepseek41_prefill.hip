@@ -333,13 +333,14 @@ bool prefill_o_b_one() {
 // STRIX_DS41_PREFILL_MOE_WINDOW_CAP rows (default 8192), instead of moe_chunk_rows windows.
 // STRIX_DS41_PREFILL_JOINT_LAYER (=1 on): the joint expert pass when the LAYER's rows are at most
 // STRIX_DS41_PREFILL_JOINT_LAYER_ROWS (default 1024; ds41::moe_joint_layer), besides the prompt rule T <= joint_max_rows.
-// STRIX_DS41_PREFILL_WINDOW_DRAIN (0 off; bit 1 = drain the main stream and the lanes before a chunk's windows, bit 2 =
-// after them): host synchronisation at the points --timing synchronises at.
+// STRIX_DS41_PREFILL_WINDOW_DRAIN (default 1; 0 off; bit 1 = drain the main stream and the lanes before a chunk's windows,
+// bit 2 = after them): host synchronisation at the points --timing synchronises at. Bit 1 alone holds the whole gain: with
+// the main stream drained, the lanes' wait on chunk_ready is already satisfied when their window launches are queued.
 bool prefill_moe_pass_window() { return strix::envcfg::flag("STRIX_DS41_PREFILL_MOE_PASS_WINDOW", false, strix::EnvFlagMatch::exact); }
 std::uint32_t prefill_moe_window_cap() { return strix::envcfg::number<std::uint32_t>("STRIX_DS41_PREFILL_MOE_WINDOW_CAP", 8192U, 1U, 65536U); }
 bool prefill_joint_layer() { return strix::envcfg::flag("STRIX_DS41_PREFILL_JOINT_LAYER", false, strix::EnvFlagMatch::exact); }
 std::uint32_t prefill_joint_layer_rows() { return strix::envcfg::number<std::uint32_t>("STRIX_DS41_PREFILL_JOINT_LAYER_ROWS", 1024U, 0U, 65536U); }
-unsigned prefill_window_drain() { return strix::envcfg::number<unsigned>("STRIX_DS41_PREFILL_WINDOW_DRAIN", 0U, 0U, 3U); }
+unsigned prefill_window_drain() { return strix::envcfg::number<unsigned>("STRIX_DS41_PREFILL_WINDOW_DRAIN", 1U, 0U, 3U); }
 bool prefill_o_low_a8_fused() {
     const char* v = std::getenv("STRIX_DS41_PREFILL_O_LOW_A8_FUSED");
     return !(v && v[0] == '0');
