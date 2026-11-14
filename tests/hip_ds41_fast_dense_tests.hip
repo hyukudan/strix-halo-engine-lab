@@ -90,15 +90,23 @@ bool run(const Case& c, unsigned reps) {
     const double tf = c.acc ? (call(1, fast.p), 0.0) : timed([&] { call(1, fast.p); }, r);
     ck(hipDeviceSynchronize(), "sync");
     const auto he = exact.down(), hf = fast.down();
-    // the policy at both CTA heights (timing only; the rule's pick is what the lever ran above)
+    // Gate both CTA heights even in --no-timing mode; timing alone cannot establish identity.
     namespace q8a8 = strix::core::f16_dense_tall::q8a8;
     double tw[2] = {0.0, 0.0};
-    if (!c.acc && reps > 1U) {
+    bool geometry_equal = true;
+    if (!c.acc) {
         Dev<float> scratch(std::size_t{c.rows} * c.count);
         q8a8::View f{};
         f.weight = dw.p, f.codes = da.p, f.deltas = dd.p, f.out = scratch.p;
         f.row_bytes = row_bytes, f.in = c.in, f.count = c.count, f.rows = c.rows, f.x_stride = c.in, f.out_stride = c.count;
-        for (unsigned i = 0; i < 2U; ++i) tw[i] = timed([&] { q8a8::enqueue(f, nullptr, i ? 16U : 8U); }, r);
+        std::vector<float> wave8;
+        for (unsigned i = 0; i < 2U; ++i) {
+            tw[i] = timed([&] { q8a8::enqueue(f, nullptr, i ? 16U : 8U); }, r);
+            ck(hipDeviceSynchronize(), "geometry sync");
+            const auto result = scratch.down();
+            if (i == 0U) wave8 = result;
+            else geometry_equal = std::memcmp(wave8.data(), result.data(), result.size() * sizeof(float)) == 0;
+        }
     }
     double num = 0.0, den = 0.0;
     unsigned bad = 0;
@@ -109,7 +117,7 @@ bool run(const Case& c, unsigned reps) {
     }
     const double rel = std::sqrt(num / std::max(den, 1e-30));
     const bool lever = c.rows >= 128U;  // below: the exact kernels (rel must be 0)
-    const bool ok = bad == 0U && (lever ? rel > 0.0 && rel < 3e-3 : rel == 0.0);
+    const bool ok = geometry_equal && bad == 0U && (lever ? rel > 0.0 && rel < 3e-3 : rel == 0.0);
     std::printf("fd %5u %5u %5u parts %u acc %d | exact %8.4f | fast %8.4f | w8 %8.4f w16 %8.4f | rule %2u | rel_l2 %.3e %s\n", c.rows,
                 c.in, c.count, c.parts, int(c.acc), te, tf, tw[0], tw[1], q8a8::waves_for(c.rows, c.in), rel, ok ? "ok" : "FAIL");
     return ok;

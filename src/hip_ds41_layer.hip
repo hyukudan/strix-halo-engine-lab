@@ -3233,7 +3233,7 @@ static bool fast_dense_on() {
     return fast_dense_mode >= 0 ? fast_dense_mode != 0 : env;
 }
 static bool enqueue_fast_dense(const Q8A8DensePrefillView& v, void* stream) {
-    static const unsigned min_rows = static_cast<unsigned>(strix::envcfg::integer("STRIX_DS41_FAST_DENSE_MIN_ROWS", 128));
+    static const unsigned min_rows = fast_profile::dense_min_rows();
     namespace q8a8 = strix::core::f16_dense_tall::q8a8;
     q8a8::View f{};
     f.weight = v.weight, f.codes = v.codes, f.deltas = v.deltas, f.out = v.out;

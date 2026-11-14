@@ -534,8 +534,23 @@ struct DevicePrefill::Impl {
     // ds41-attn-bf16flash-v1: BF16 mirrors of the ring (per entry, as written) and of the layer's compressed cache
     Dev<std::uint16_t> ring16, kv16;
     bool flash_run = false;   // this run starts a new prompt (every ring entry it reads is written, and mirrored, by it)
-    bool flash_attn_at(std::uint32_t layer) const { return flash_run && options.fast_attention_flash && fast_attn_at(layer) && ring16.p != nullptr; }
+    bool flash_attn_at(std::uint32_t layer) const {
+        if (!flash_run || !options.fast_attention_flash || !fast_attn_at(layer)) return false;
+        if (ring16.p == nullptr) throw std::logic_error("ds41-attn-bf16flash-v1: missing ring mirror");
+        return true;
+    }
     std::uint32_t prefill_capacity = 0;
+    void prepare_flash_mirrors() {
+        if (ring16.p != nullptr) return;
+        std::uint32_t ratio = 0;
+        for (const auto& role : roles) if (role.ratio != 0U && (ratio == 0U || role.ratio < ratio)) ratio = role.ratio;
+        const std::size_t rows = std::size_t{prefill_capacity} - options.window_rows - attn::kWindow;
+        Dev<std::uint16_t> ring(std::size_t{prefill_capacity} * attn::kHeadDim);
+        Dev<std::uint16_t> kv(ratio != 0U ? (rows / ratio + 1U) * attn::kHeadDim : 0U);
+        ring.zero(stream);
+        ring16 = std::move(ring);
+        kv16 = std::move(kv);
+    }
     // in-run snapshots (set_snapshot_points): the points of the next run, those of the last run and their rings
     // (point-major, one ring_capacity ring per layer)
     std::vector<std::uint32_t> snap_next, snap_points;
@@ -901,16 +916,7 @@ DevicePrefill::DevicePrefill(const std::filesystem::path& gguf, const PrefillOpt
     m.prefill_capacity = static_cast<std::uint32_t>(T + W + attn::kWindow);
     m.prefill_ring = Dev<std::uint8_t>(std::size_t{m.prefill_capacity} * attn::kWindowEntryBytes);
     m.prefill_ring.zero(m.stream);
-    if (m.options.fast_attention && m.options.fast_attention_flash) {
-        std::uint32_t ratio = 0;   // the densest compressed cache: (rows) / ratio entries
-        for (const auto& role : m.roles) if (role.ratio != 0U && (ratio == 0U || role.ratio < ratio)) ratio = role.ratio;
-        m.ring16 = Dev<std::uint16_t>(std::size_t{m.prefill_capacity} * attn::kHeadDim);
-        m.ring16.zero(m.stream);
-        m.kv16 = Dev<std::uint16_t>(ratio != 0U ? (std::size_t{T} / ratio + 1U) * attn::kHeadDim : 0U);
-    } else {
-        m.ring16 = Dev<std::uint16_t>();
-        m.kv16 = Dev<std::uint16_t>();
-    }
+    if (m.options.fast_attention && m.options.fast_attention_flash) m.prepare_flash_mirrors();
     check(hipEventCreateWithFlags(&m.chunk_ready, hipEventDisableTiming), "event");
     check(hipStreamCreateWithFlags(&m.comm_stream, hipStreamNonBlocking), "comm stream");
     for (auto& e : m.half_ready) check(hipEventCreateWithFlags(&e, hipEventDisableTiming), "event");
@@ -1424,6 +1430,8 @@ void DevicePrefill::set_dense_select(bool on) {
 }
 
 void DevicePrefill::set_precision_for_new_sequence(const PrefillOptions& p) {
+    if (impl_->task) throw std::logic_error("cannot change precision during a prefill task");
+    if (p.fast_attention && p.fast_attention_flash) impl_->prepare_flash_mirrors();
     set_precision_for_new_sequence(p.fp16_dense, p.bf16_attention);
     auto& o = impl_->options;
     o.fp16_projections = p.fp16_projections;
@@ -1512,6 +1520,7 @@ PrefillResult DevicePrefill::run_from(std::span<const std::uint32_t> tokens, std
     const std::uint32_t T = static_cast<std::uint32_t>(tokens.size());  // rows of this run, at positions [P0, P0 + T)
     const std::uint32_t P0 = start;
     m.flash_run = P0 == 0U;
+    bool flash_reported = false;
     const std::uint32_t max_rows = m.options.max_rows != 0U ? m.options.max_rows : m.options.max_positions;
     if (T == 0U || T > max_rows || std::uint64_t{P0} + T > m.options.max_positions)
         throw std::invalid_argument("deepseek41 prefill: rows outside 1..max_rows or positions beyond max_positions");
@@ -2529,6 +2538,10 @@ PrefillResult DevicePrefill::run_from(std::span<const std::uint32_t> tokens, std
                     if (peer_ring + peer_comp) {
                         final_entries_kernel<false><<<peer_ring + peer_comp, 128, 0, st>>>(fe);
                         check(hipGetLastError(), "final entries unpack");
+                        // Both exchange paths join here. Publish received keys to the mirror on st before chunk_ready.
+                        if (peer_ring && m.flash_attn_at(layer))
+                            attn::hip::enqueue_attention_flash_mirror(
+                                {m.prefill_ring.p, m.ring16.p, fe.ring_pos, peer_ring, m.prefill_capacity, true}, st);
                     }
                     if (carry_words && !last_local) {
                         const std::size_t peer_carry = std::size_t{peer_words} - carry_words;
@@ -2698,10 +2711,15 @@ PrefillResult DevicePrefill::run_from(std::span<const std::uint32_t> tokens, std
                             v.sums = m.osums.p + std::size_t{w0 - r0} * QL / 32U;
                         }
                         if(m.bf16_at(layer)) attn::hip::enqueue_attention_bf16_prefill(v,ls);
-                        else if (m.flash_attn_at(layer) && heads % 32U == 0U) {
+                        else if (m.flash_attn_at(layer)) {
+                            if (heads % 32U != 0U) throw std::invalid_argument("ds41-attn-bf16flash-v1: requires a multiple of 32 heads");
                             v.ring16 = m.ring16.p;
                             v.kv16 = m.kv16.p;
                             attn::hip::enqueue_attention_flash_prefill(v, ls);
+                            if (!flash_reported) {
+                                std::fprintf(stderr, "deepseek41 prefill effective attention: ds41-attn-bf16flash-v1\n");
+                                flash_reported = true;
+                            }
                         } else if (m.fast_attn_at(layer)) attn::hip::enqueue_attention_f16wmma_prefill(v, ls);
                         else attn::hip::enqueue_attention(v, ls);
                     }
