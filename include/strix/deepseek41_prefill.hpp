@@ -115,6 +115,16 @@ struct PrefillOptions {
     // owned; the others are loaded as usual. Serving keeps one copy of the weights per node this way. The owner must
     // outlive the prefill.
     std::map<std::string, std::pair<const void*, std::uint64_t>> shared_weights;
+    // Group pass (run_group): sequence states for up to group_members fresh short sequences of at most group_rows rows
+    // each, beside the full-size one of run / extend. 0 = none (run_group throws; no memory). Serving sets them from its
+    // prefill group policy (serve::PrefillGroupPolicy max_members / short_rows); the CLI never groups (one prompt).
+    std::uint32_t group_members = 0;
+    std::uint32_t group_rows = 64;
+};
+
+// One member of a group pass: a fresh sequence from position 0 (no resume, no snapshot points, no splice).
+struct PrefillSegment {
+    std::span<const std::uint32_t> tokens;
 };
 
 // timing (diagnostic: the stream is synchronized around each part, which removes overlap across parts). attention
@@ -315,6 +325,33 @@ public:
     // export_state / export_state_at / state_hashes refuse and draft_seed is empty. STRIX_DS41_DEFER_DECODER=0: never admitted.
     void set_decoder_deferral(std::uint32_t next_rows);
     [[nodiscard]] AttentionState export_state_at(std::uint32_t position) const;
+
+    // ---- group pass (PFFIX spec (a): several short prompts admitted together = ONE pass over the layers) ----
+    // The route class a fresh sequence of `rows` rows takes ALONE: every row-count threshold of the run that can change
+    // the bits (kernel / split / joint selection) evaluated on these rows. Prompts group only within one class (serve::
+    // plan_prefill_group, R1), and run_group forces that class instead of re-selecting it from the summed rows.
+    [[nodiscard]] std::uint32_t route_class(std::uint32_t rows) const noexcept;
+    // Members / rows per member the group states hold (PrefillOptions::group_members / group_rows); 0 = no group pass.
+    [[nodiscard]] std::uint32_t group_members() const noexcept;
+    [[nodiscard]] std::uint32_t group_rows() const noexcept;
+    // Run 2..group_members() fresh sequences (each 1..group_rows() rows, all of one route_class) as ONE pass: rows
+    // concatenated, every member's first row on an attention-window boundary; stateless work (hyper-connections, norms,
+    // projections, router, shared expert, MoE) once over all rows, stateful work (rings, caches, compressor carry, index
+    // count, Engram hashing, attention) per member on its own state; one exchange per layer per kind for the whole group;
+    // the head over the members' last rows in one launch. Result i equals run(segments[i].tokens) of a fresh sequence:
+    // logits, next_token and (export_state(i)) the attention state, bitwise. Levers that plan for one sequence (cone,
+    // decoder deferral, draft seed, snapshot points) are per member or off in a group pass (exact levers: same bits).
+    // World 2: both ranks call it with the same segments. Not during a task; afterwards the live sequence of run /
+    // extend is discarded (the next single-sequence operation must be run() or import_state()).
+    std::vector<PrefillResult> run_group(std::span<const PrefillSegment> segments);
+    // Member `segment` of the last run_group, as export_state() of its solo run (position = its rows).
+    [[nodiscard]] AttentionState export_state(std::size_t segment) const;
+    // Member `segment` of the last run_group: its draft seed (PrefillOptions::draft_rows), as draft_seed() of its solo run
+    // (its last min(draft_rows, rows) rows; first = rows - seed rows), valid until the next run. Empty for a missing member.
+    [[nodiscard]] DraftSeed draft_seed(std::size_t segment) const noexcept;
+    // Device bytes the group states and the group scratch of these options hold (0 when group_members is 0): memory admission
+    // adds them to the prefill's scratch estimate (serve::sched::prefill_piece_bytes covers the one-sequence buffers only).
+    [[nodiscard]] static std::uint64_t group_state_bytes(const PrefillOptions& options);
     [[nodiscard]] std::uint64_t weight_bytes() const noexcept;         // loaded (owned) by this prefill
     [[nodiscard]] std::uint64_t shared_weight_bytes() const noexcept;  // read in place from shared_weights
     // The bytes of weights a prefill with these options would load itself (not found in options.shared_weights; streamed
