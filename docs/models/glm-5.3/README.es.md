@@ -14,6 +14,9 @@ en sí: [dos nodos por USB4](../../pair.es.md).
 
 ## Ejecución: el par
 
+**Pesos:** [hyukudan/GLM-5.3-Flash-exl3-mirror](https://huggingface.co/hyukudan/GLM-5.3-Flash-exl3-mirror) (réplica de `turboderp/GLM-5.3-Flash-exl3`, 4.05 bpw, usada tal
+cual se publica). Ficheros y revisiones: [reproducir](../../reproduce.md#models-and-provenance).
+
 La división de GLM por tokens es un perfil FAST de memoria calificado. Está desactivada por defecto;
 `STRIX_GLM_KV_SHARD=auto` (con `STRIX_GLM_PF_PIPELINE=1`) selecciona la división solo después de que todos los candidatos replicados
 de scratch/ventana permitidos fallen la admisión de inicio en alguno de los ranks; `=1` fuerza la división y `=0` fuerza la replicación. Exige una solicitud,
@@ -183,6 +186,8 @@ en GiB de los términos de ruta, espacio de trabajo, instalación/staging, segur
 
 | Modo | Prompt / contexto | Medido | Build / exactitud |
 |---|---|---:|---|
+| Prefill, perfil `fast` (opcional; calificación de calidad en curso) | 8K, motor, proceso nuevo, más de 110 GiB de memoria libre en ambos nodos | **8.92 s = 918 tok/s**; con la memoria de un nodo llena de caché de páginas al arrancar, la misma ejecución tardó 9.5-10.1 s (el driver pausa las colas de la GPU mientras se recuperan páginas durante la carga): liberar memoria en ambos nodos antes de medir el par | main `ae06f9466`; hashes de logits y estado iguales entre ejecuciones |
+| Prefill servido bajo carga, `fast` (opcional; calificación de calidad en curso) | prompt de 8K admitido mientras un flujo decodifica, ABAB x3 | TTFT **15.03-15.06 s** con chunks agrupados según la cohorte en decode (por defecto) frente a 18.50-18.55 s con `STRIX_SERVE_PREFILL_INTERLEAVE=0`; flujo en decode 2.32 frente a 1.89 tok/s durante el prefill, mayor pausa 1.80 frente a 1.20 s | #590; tokens de la petición de 8K iguales a la petición sola |
 | Decode greedy, R1 | prompt de chat de 31 tokens + 64 tokens generados | **45.29 ms/token = 22.1 tok/s**; **51 %** del suelo calculado de 23.2 ms | `1836c99c`; tokens iguales a la referencia |
 | Decode por batch, R1 | Ocho filas independientes, contexto del benchmark no especificado | **122.0 ms/step = 65.5 tok/s agregados** | `1836c99c`; tokens iguales a la referencia anterior del par real |
 | Prefill por fragmentos exacto | prompts de benchmark de 1K / 8K / 32K, tipo no especificado | TTFT **4.268 / 34.70 / 144.75 s** (240 / 236 / 226 tok/s) | `875ca821`, integrado en `41d8cfdc`; los logits de ambos ranks son iguales bit a bit al prefill exacto anterior |

@@ -576,6 +576,135 @@ void test_apply() {
     }
 }
 
+// FAST prefill profile (mm_profile_table.hpp): bundle expansion, explicit-OFF precedence, FAST_I4 exclusion, legacy
+// field omission with every row OFF, rank agreement.
+void test_fast_prefill_profile() {
+    const EnvMap off;
+    const auto none_fp = strix::profile::resolve(strix::profile::Engine{"minimax-pair", "", {}, false}, {}).fingerprint();
+    const auto fp = [](const EnvMap& m) { return md::profile_resolution(lookup(m)).fingerprint(); };
+    {
+        const auto p = md::prefill_policy(lookup(off));
+        check(p.msa_flash == 0 && p.msa_flash_asked == "default" && p.policies.empty() && p.note.empty() && p.canonical.empty(),
+              "fast profile: plain invocation runs nothing");
+        check(md::prefill_identity(lookup(off)).empty(), "fast profile: plain cache identity unchanged (no field)");
+        check(fp(off) == none_fp, "fast profile: rows at builtin leave the legacy fingerprint unchanged");
+        for (const auto& e : md::profile_resolution(lookup(off)).entries)
+            check(e.status == strix::profile::Status::builtin && e.value == e.lever->builtin, "fast profile: builtin row " + std::string(e.lever->name));
+        const EnvMap unused{{"STRIX_MM_PF_MSA_FLASH_LAYERS", "10-59"}, {"STRIX_MM_FAST_PREFILL", "01"}};
+        check(fp(unused) == none_fp && md::prefill_policy(lookup(unused)).msa_flash == 0,
+              "fast profile: an unused layer set and a non-'1' switch keep the legacy fingerprint");
+        const EnvMap zero{{"STRIX_MM_PF_MSA_FLASH", "0"}};
+        check(md::prefill_identity(lookup(zero)).empty() && fp(zero) == none_fp, "fast profile: explicit OFF alone is the legacy identity");
+    }
+    const EnvMap bundle{{"STRIX_MM_FAST_PREFILL", "1"}};
+    for (const auto& guard : {std::pair{"STRIX_MM_PF_MSA_REWORK", "0"},
+                              std::pair{"STRIX_MM_PF_MSA_FLASH_LAYERS", "none"},
+                              std::pair{"STRIX_MM_PF_MSA_FLASH_LAYERS", "!0-59"},
+                              std::pair{"STRIX_MM_ATTN_PREFILL", "off"},
+                              std::pair{"STRIX_MM_BASELINE", "1"}}) {
+        EnvMap declined = bundle;
+        declined[guard.first] = guard.second;
+        const auto p = md::prefill_policy(lookup(declined));
+        check(p.msa_flash == 0 && p.msa_flash_requested == 1 && p.policies.empty() && !p.note.empty() && p.msa_flash_asked == "fast_prefill",
+              "fast admission: static guard declines flash and preserves request: " + std::string(guard.first));
+        check(md::prefill_identity(lookup(declined)).empty() && fp(declined) == none_fp,
+              "fast admission: declined policy leaves no FAST cache field or agreement input");
+        const auto cfg = md::effective_config(md::parse_cli("rank", {}), lookup(declined));
+        check(cfg.find("\nSTRIX_MM_PF_MSA_FLASH=0\n") != std::string::npos &&
+              cfg.find("\nprefill.fast_policies=none\n") != std::string::npos &&
+              cfg.find("\nprefill.fast_profile=off\n") != std::string::npos &&
+              cfg.find("\nprefill.fast_profile_requested=mm-fast-pf-v1\n") != std::string::npos &&
+              cfg.find("\nprefill.msa_flash_requested=1\n") != std::string::npos &&
+              cfg.find("\nprefill.msa_flash_layers_requested=" + p.msa_flash_layers_requested + "\n") != std::string::npos &&
+              cfg.find("\nprefill.identity=default\n") != std::string::npos,
+              "fast admission: effective receipt matches disabled execution route");
+    }
+    check(md::msa_flash_decline_reason(false, true, 20) != nullptr &&
+          md::msa_flash_decline_reason(true, false, 20) != nullptr &&
+          md::msa_flash_decline_reason(true, true, 0) != nullptr &&
+          md::msa_flash_decline_reason(true, true, 20) == nullptr,
+          "fast admission: live engine receipt guards match static admission");
+    {
+        const auto p = md::prefill_policy(lookup(bundle));
+        check(p.msa_flash == 1 && p.msa_flash_layers == "40-59" && p.msa_flash_asked == "fast_prefill" &&
+              p.policies == "msa-flash-bf16-l40-v1", "fast profile: bundle selects msa-flash-bf16-l40-v1");
+        check(md::prefill_identity(lookup(bundle)) == "prefill_msa=msa-flash-bf16-l40-v1", "fast profile: cache identity names the policy");
+        check(fp(bundle) != none_fp, "fast profile: bundle changes the profile fingerprint");
+        const auto r = md::profile_resolution(lookup(bundle));
+        check(r.find("msa_flash") != nullptr && r.find("msa_flash")->value == "1", "fast profile: governed row carries the member");
+        const auto cfg = md::effective_config(md::parse_cli("rank", {}), lookup(bundle));
+        check(cfg.find("\nSTRIX_MM_PF_MSA_FLASH=1\n") != std::string::npos &&
+              cfg.find("\nprefill.fast_policies=msa-flash-bf16-l40-v1\n") != std::string::npos &&
+              cfg.find("\nprefill.fast_profile=mm-fast-pf-v1\n") != std::string::npos, "fast profile: effective config prints the rows");
+    }
+    {   // An explicit member wins: OFF beats the bundle, 2 replaces its value.
+        const EnvMap explicit_off{{"STRIX_MM_FAST_PREFILL", "1"}, {"STRIX_MM_PF_MSA_FLASH", "0"}};
+        const auto p = md::prefill_policy(lookup(explicit_off));
+        check(p.msa_flash == 0 && p.policies.empty() && md::prefill_identity(lookup(explicit_off)).empty(), "fast profile: explicit OFF beats the bundle");
+        const auto r = md::profile_resolution(lookup(explicit_off));
+        const auto* row = r.find("msa_flash");
+        check(row != nullptr && row->status == strix::profile::Status::off, "fast profile: explicit OFF recorded as off");
+        const EnvMap two_env{{"STRIX_MM_FAST_PREFILL", "1"}, {"STRIX_MM_PF_MSA_FLASH", "2"}};
+        const auto two = md::prefill_policy(lookup(two_env));
+        check(two.msa_flash == 2 && two.msa_flash_asked == "2" && two.policies == "msa-flash-bf16-2term-l40-59", "fast profile: explicit 2 wins");
+        const EnvMap legacy_env{{"STRIX_MM_PF_MSA_FLASH", "1"}, {"STRIX_MM_PF_MSA_FLASH_LAYERS", "50-59"}};
+        const auto legacy = md::prefill_policy(lookup(legacy_env));
+        check(legacy.msa_flash == 1 && legacy.policies == "msa-flash-bf16-l50-59", "fast profile: the legacy opt-in still runs, named by its layers");
+    }
+    {   // EXL3 base only: the bundle does not select it on FAST_I4; an explicit value still does.
+        const EnvMap i4{{"STRIX_MM_FAST_PREFILL", "1"}, {"STRIX_MMX_MODEL_FORMAT", "fast_i4"}};
+        const auto p = md::prefill_policy(lookup(i4));
+        check(p.msa_flash == 0 && !p.note.empty(), "fast profile: bundle excludes the flash member on fast_i4");
+        check(md::prefill_identity(lookup(i4)) == "moe_prefill_format=fast_i4", "fast profile: fast_i4 is part of the cache identity");
+        EnvMap i4_explicit = i4;
+        i4_explicit["STRIX_MM_PF_MSA_FLASH"] = "1";
+        check(md::prefill_policy(lookup(i4_explicit)).msa_flash == 1, "fast profile: explicit flash on fast_i4 wins");
+    }
+    {
+        bool threw = false;
+        const EnvMap bad_mode{{"STRIX_MM_PF_MSA_FLASH", "3"}}, bad_layers{{"STRIX_MM_PF_MSA_FLASH_LAYERS", "70"}};
+        try { (void)md::prefill_policy(lookup(bad_mode)); } catch (const std::invalid_argument&) { threw = true; }
+        check(threw, "fast profile: invalid flash mode rejected");
+        threw = false;
+        try { (void)md::prefill_policy(lookup(bad_layers)); } catch (const std::invalid_argument&) { threw = true; }
+        check(threw, "fast profile: invalid layer set rejected");
+    }
+    {   // Rank agreement over the control channel: same resolution passes, asymmetric ranks are rejected.
+        const auto hello = [](const strix::profile::Resolution& r) {
+            std::vector<unsigned char> bytes;
+            md::check_peer(r, [&](const void* o, void* i, std::size_t n) {
+                bytes.assign(static_cast<const unsigned char*>(o), static_cast<const unsigned char*>(o) + n);
+                std::memcpy(i, o, n);
+            });
+            return bytes;
+        };
+        const auto agree = [&](const EnvMap& mine, const EnvMap& peer) {
+            const auto peer_bytes = hello(md::profile_resolution(lookup(peer)));
+            try {
+                md::check_peer(md::profile_resolution(lookup(mine)), [&](const void*, void* i, std::size_t n) {
+                    std::memcpy(i, peer_bytes.data(), n < peer_bytes.size() ? n : peer_bytes.size());
+                });
+            } catch (const std::runtime_error&) { return false; }
+            return true;
+        };
+        const EnvMap one{{"STRIX_MM_PF_MSA_FLASH", "1"}}, two{{"STRIX_MM_PF_MSA_FLASH", "2"}};
+        const EnvMap same{{"STRIX_MM_FAST_PREFILL", "1"}, {"STRIX_MM_PF_MSA_FLASH", "1"}};
+        check(agree(off, off) && agree(bundle, bundle), "fast profile: symmetric ranks agree");
+        check(!agree(bundle, off) && !agree(off, bundle), "fast profile: bundle on one rank only is rejected");
+        check(!agree(two, one), "fast profile: member value mismatch rejected");
+        check(agree(same, bundle), "fast profile: an explicit value equal to the bundle's is the same run");
+        check(agree(one, bundle) && agree(bundle, one), "fast agreement: bundle-only and explicit-only agree");
+        for (const char* layers : {"40-49,50-59", "!0-39", "50-59,40-55", "040-059"}) {
+            const EnvMap equivalent{{"STRIX_MM_PF_MSA_FLASH", "1"}, {"STRIX_MM_PF_MSA_FLASH_LAYERS", layers}};
+            check(agree(one, equivalent) && agree(equivalent, one), "fast agreement: equivalent parsed layer masks agree");
+            check(md::prefill_identity(lookup(equivalent)) == md::prefill_identity(lookup(one)),
+                  "fast agreement: equivalent masks name the same cache policy");
+        }
+        const EnvMap different{{"STRIX_MM_PF_MSA_FLASH", "1"}, {"STRIX_MM_PF_MSA_FLASH_LAYERS", "41-59"}};
+        check(!agree(one, different), "fast agreement: different masks remain rejected");
+    }
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -597,6 +726,7 @@ int main(int argc, char** argv) {
         test_session_defaults();
         test_session_startup();
         test_apply();
+        test_fast_prefill_profile();
     } catch (const std::exception& e) {
         std::cerr << "FAIL: " << e.what() << "\n";
         return 1;

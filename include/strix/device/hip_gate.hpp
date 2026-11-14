@@ -25,6 +25,7 @@ const Bound& bind_hip(Request request = {}, const std::string& devices_path = {}
 
 // For a main(): takes --devices FILE / --device-id ID out of the argument vector and binds. On a refusal it prints the
 // one-line reason and exits with status 2.
+// Engine flags (including --deploy-check) cannot bypass admission before the engine parser validates their meaning.
 void bind_hip_main(int& argc, char** argv, std::FILE* receipt = stderr);
 
 // The binding made by this process, or null before the first bind (and always null without the HIP runtime).

@@ -43,6 +43,9 @@ inline constexpr std::array yarn_environment_rules{
     YarnEnvironmentRule{"HIP_ENABLE_DEFERRED_LOADING", YarnEnvironmentClass::nonrotary, ""},
     YarnEnvironmentRule{"STRIX_PREFILL_INDEX_PROJ_WMMA", YarnEnvironmentClass::nonrotary, ""},
     YarnEnvironmentRule{"STRIX_PREFILL_INDEX_SCORE_WMMA", YarnEnvironmentClass::nonrotary, ""},
+    // Candidate ON paths have not been audited for YaRN; OFF preserves existing arithmetic.
+    YarnEnvironmentRule{"STRIX_PREFILL_PLE_ROWS_F16", YarnEnvironmentClass::off_switch, "0"},
+    YarnEnvironmentRule{"STRIX_PREFILL_GDN_GATES_F16", YarnEnvironmentClass::off_switch, "0"},
     // STRIX_QWEN_ALLON (include/strix/qwen_allon.hpp) only fills the per-lever variables that are still unset, before
     // main; it has no execution effect of its own. Each variable it exports is classified by its own row, so a lever
     // this table refuses is named in the refusal instead of the profile switch.
@@ -69,6 +72,9 @@ inline constexpr std::array yarn_environment_rules{
     // (src/hip_qsa_fast_prefill_kv_pair.inc, src/hip_indexed_attention_launcher.hip:6087). It reads keys and queries that the table-bound norm/RoPE
     // launches already rotated (the rotary sites of the QSA group are listed in yarn_environment_path); the attend files carry no rotary token.
     YarnEnvironmentRule{"STRIX_QSA_FAST_KV_PAIR", YarnEnvironmentClass::nonrotary, "0|1"},
+    // One softmax per wave pair in the occ attend (STRIX_QSA_ATTEND_SHARED_SOFTMAX, src/attn_core/selected_flash_prefill.hpp): it reads the same
+    // rotated keys and queries as the default attend and changes no value (bitwise); no rotary token.
+    YarnEnvironmentRule{"STRIX_QSA_ATTEND_SHARED_SOFTMAX", YarnEnvironmentClass::nonrotary, "0|1"},
     // MoE 64x64 register tile (STRIX_QPF2K_MOE_TILE64, its own arm: declined while the tier split is active, src/hip_moe_prefill_tile64.inc:332);
     // routed experts hold no rotary work.
     YarnEnvironmentRule{"STRIX_QPF2K_MOE_TILE64", YarnEnvironmentClass::nonrotary, "0|1"},

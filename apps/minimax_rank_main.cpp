@@ -1824,6 +1824,9 @@ int main(int argc, char** argv) {
             const auto route_fp = strix::route::compare_ranks([&](const void* o, void* i, std::size_t n) { eng.exchange_bytes(o, i, n); });
             std::printf("rank %u: route fingerprint %016llx agreed with the peer\n", opt.rank, static_cast<unsigned long long>(route_fp));
         } catch (...) { eng.abort("route receipt: numerical-route fingerprint mismatch"); throw; }
+        try {  // FAST prefill profile rows (STRIX_MM_FAST_PREFILL and members): both ranks must resolve the same
+            strix::minimax::defaults::check_peer([&](const void* o, void* i, std::size_t n) { eng.exchange_bytes(o, i, n); });
+        } catch (...) { eng.abort("product profile: MiniMax FAST prefill profile differs between the ranks"); throw; }
         std::printf("rank %u: load %.1f s, %.1f GiB read (%s), device used %.1f GiB\n", opt.rank, lr.seconds, lr.gib_read,
                     lr.direct_io ? "O_DIRECT" : "buffered", lr.device_gib);
         std::fflush(stdout);

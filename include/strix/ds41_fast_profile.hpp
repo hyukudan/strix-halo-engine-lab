@@ -6,19 +6,23 @@
 //     MoE        STRIX_DS41_FAST_MOE=1    ds41-moe-relaxed-v1
 //     dense      STRIX_DS41_FAST_DENSE=1  ds41-dense-f16-v1 (shared policy dense-q8a8-f16-v1)
 // A lever variable that is set (any value, "0" = off) wins over the profile. Changes logits; see docs/toggles.md.
-#include "strix/env_flags.hpp"
+// Bundle rules (explicit member wins, explicit OFF beats the bundle) are the shared ones: strix/fast_profile.hpp.
+#include "strix/fast_profile.hpp"
+
+#include <cstdlib>
 
 namespace strix::ds41::fast_profile {
-inline const char* lever(const char* name, const char* profile_value) {
-    if (const char* e = strix::envcfg::text(name); e != nullptr && *e != 0) return e;
-    const char* p = strix::envcfg::text("STRIX_DS41_FAST_PREFILL");
-    return p != nullptr && p[0] == '1' && p[1] == 0 ? profile_value : "";
-}
-inline const char* attention() { return lever("STRIX_DS41_FAST_ATTN", "2"); }  // "1" f16wmma-v1, "2" bf16flash-v1
+inline constexpr strix::fast_profile::Member kMembers[] = {
+    {"STRIX_DS41_FAST_ATTN", "2", "ds41-attn-bf16flash-v1", "1 2"},
+    {"STRIX_DS41_FAST_MOE", "1", "ds41-moe-relaxed-v1"},
+    {"STRIX_DS41_FAST_DENSE", "1", "ds41-dense-f16-v1"},
+};
+inline constexpr strix::fast_profile::Bundle kBundle{"STRIX_DS41_FAST_PREFILL", "ds41-fast-pf-v1", kMembers};
+inline const char* attention() { return strix::fast_profile::lever(kBundle, kMembers[0]); }  // "1" f16wmma-v1, "2" bf16flash-v1
 inline bool attention_on() { const char* v = attention(); return (v[0] == '1' || v[0] == '2') && v[1] == 0; }
 inline bool attention_flash() { const char* v = attention(); return v[0] == '2' && v[1] == 0; }
-inline bool moe_on() { const char* v = lever("STRIX_DS41_FAST_MOE", "1"); return v[0] == '1' && v[1] == 0; }
-inline bool dense_on() { const char* v = lever("STRIX_DS41_FAST_DENSE", "1"); return v[0] == '1' && v[1] == 0; }
+inline bool moe_on() { const char* v = strix::fast_profile::lever(kBundle, kMembers[1]); return v[0] == '1' && v[1] == 0; }
+inline bool dense_on() { const char* v = strix::fast_profile::lever(kBundle, kMembers[2]); return v[0] == '1' && v[1] == 0; }
 // Preserve decimal-prefix parsing and unsigned wrap, including zero and negative values.
 // Also accepts the canonical unsigned value exported by the pair resolver.
 inline unsigned dense_min_rows_value(const char* raw) {

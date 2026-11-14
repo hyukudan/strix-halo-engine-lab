@@ -4,7 +4,9 @@
 // MiniMax M3.1 defaults-on resolver: the table of default-ON items, the baseline master switch and the canonical
 // effective configuration (see mm_defaults.hpp).
 #include "minimax/engine/mm_defaults.hpp"
+#include "minimax/engine/mm_profile_table.hpp"
 #include "minimax/engine/route_identity.hpp"
+#include "core/layer_set.hpp"
 #include "minimax/serve/minimax_sched.hpp"
 #include "minimax/dspark/minimax_auto.hpp"
 #include "strix/session/speculation_default.hpp"
@@ -183,6 +185,95 @@ std::vector<Resolved> resolve(const Lookup& env) {
         auto value = profile::resolve_default(it, base, env);
         out.push_back({&it, std::move(value.value), value.source});
     }
+    return out;
+}
+
+namespace {
+bool fast_i4_format(const Lookup& env) {
+    const char* f = env("STRIX_MMX_MODEL_FORMAT");
+    return f != nullptr && std::strcmp(f, "fast_i4") == 0;
+}
+}  // namespace
+
+const char* msa_flash_decline_reason(bool rework, bool fused, unsigned layers) {
+    if (!rework) return "STRIX_MM_PF_MSA_REWORK=0";
+    if (!fused) return "STRIX_MM_ATTN_PREFILL=off";
+    if (layers == 0) return "STRIX_MM_PF_MSA_FLASH_LAYERS selects no layers";
+    return nullptr;
+}
+
+PrefillPolicy prefill_policy(const Lookup& env) {
+    namespace fp = strix::fast_profile;
+    const fp::Member& flash = kFastMembers[0];
+    const char* raw = env(flash.env);
+    if (fp::set(raw) && std::strcmp(raw, "0") != 0 && !fp::accepted(flash, raw))
+        throw std::invalid_argument("STRIX_MM_PF_MSA_FLASH must be 0, 1 or 2");
+    PrefillPolicy p;
+    // The MSA flash member runs on the exact EXL3 MoE base only (its gate fails on FAST_I4); an explicit value still wins.
+    const bool i4 = fast_i4_format(env);
+    p.canonical = fp::expand(kFastBundle, env, [&](const fp::Member&) { return !i4; });
+    const auto it = p.canonical.find(flash.env);
+    const std::string mode = it != p.canonical.end() ? it->second : "0";
+    p.msa_flash = mode == "0" ? 0U : static_cast<unsigned>(mode[0] - '0');
+    p.msa_flash_requested = p.msa_flash;
+    p.msa_flash_asked = fp::set(raw) ? raw : it != p.canonical.end() ? "fast_prefill" : "default";
+    const char* layers = env("STRIX_MM_PF_MSA_FLASH_LAYERS");
+    p.msa_flash_layers_requested = fp::set(layers) ? layers : kMsaFlashLayers;
+    const auto mask = strix::core::parse_layer_set(p.msa_flash_layers_requested.c_str(), 0, kMsaLayers, "STRIX_MM_PF_MSA_FLASH_LAYERS");
+    p.msa_flash_layers = fp::layer_ranges(kMsaLayers, [&](unsigned l) { return mask.test(l); });
+    if (p.msa_flash != 0) {
+        bool rework = true;
+        for (const auto& r : resolve(env))
+            if (std::strcmp(r.item->env, "STRIX_MM_PF_MSA_REWORK") == 0) rework = r.value != "0";
+        const char* fused = env("STRIX_MM_ATTN_PREFILL");
+        if (const char* reason = msa_flash_decline_reason(rework, fused == nullptr || std::strcmp(fused, "off") != 0, mask.count())) {
+            p.msa_flash = 0;
+            p.note = reason;
+        }
+    }
+    if (p.msa_flash != 0)
+        p.policies = p.msa_flash == 1 && p.msa_flash_layers == kMsaFlashLayers
+                         ? std::string(flash.policy)
+                         : std::string("msa-flash-bf16") + (p.msa_flash == 2 ? "-2term" : "") + "-l" + p.msa_flash_layers;
+    if (i4 && fp::switch_on(env(kFastBundle.env)) && !fp::set(raw))
+        p.note = std::string(flash.policy) + " not selected by " + kFastBundle.env + " on STRIX_MMX_MODEL_FORMAT=fast_i4";
+    return p;
+}
+
+const profile::Engine& profile_engine() {
+    static const profile::Engine engine{"minimax-pair", "", profile_table, false};
+    return engine;
+}
+
+profile::Resolution profile_resolution(const Lookup& env) {
+    const auto p = prefill_policy(env);
+    const auto base = strix::fast_profile::lookup(p.canonical, env);
+    const std::string effective_mode = std::to_string(p.msa_flash);
+    profile::Inputs in;
+    in.env = [&](const char* key) -> const char* {
+        // The layer set is read only while the flash attention runs: an unused setting is not part of the identity.
+        if (std::strcmp(key, "STRIX_MM_PF_MSA_FLASH") == 0)
+            return p.msa_flash == 0 && p.msa_flash_asked == "default" ? nullptr : effective_mode.c_str();
+        if (std::strcmp(key, "STRIX_MM_PF_MSA_FLASH_LAYERS") == 0)
+            return p.msa_flash == 0 ? nullptr : p.msa_flash_layers.c_str();
+        return base(key);
+    };
+    return profile::resolve(profile_engine(), in);
+}
+
+void check_peer(const profile::Resolution& mine, const std::function<void(const void*, void*, std::size_t)>& exchange) {
+    profile::check_peer(mine, [&](std::span<const std::byte> out, std::span<std::byte> in) {
+        exchange(out.data(), in.data(), out.size());
+    });
+}
+void check_peer(const std::function<void(const void*, void*, std::size_t)>& exchange) {
+    check_peer(profile_resolution(process_env), exchange);
+}
+
+std::string prefill_identity(const Lookup& env) {
+    const auto p = prefill_policy(env);
+    std::string out = p.policies.empty() ? std::string() : "prefill_msa=" + p.policies;
+    if (fast_i4_format(env)) out += std::string(out.empty() ? "" : ";") + "moe_prefill_format=fast_i4";
     return out;
 }
 
@@ -378,6 +469,22 @@ std::string effective_config(const Cli& cli, const Lookup& env) {
     }
     o << "build.gu4_scalar=" << (STRIX_MM_GU4_SCALAR ? "on" : "off") << "\n";
     for (const Resolved& r : resolve(env)) o << r.item->env << "=" << r.value << "\n";
+    {   // FAST prefill profile rows (default OFF): the same resolution the engine, the cache identity and the ranks use.
+        const auto pf = prefill_policy(env);
+        const auto pr = profile_resolution(env);
+        for (const auto& e : pr.entries) o << e.lever->env << "=" << e.value << "\n";
+        const auto id = prefill_identity(env);
+        const bool bundle_requested = strix::fast_profile::switch_on(env(kFastBundle.env));
+        o << "prefill.fast_profile=" << (bundle_requested && !pf.policies.empty() ? kFastBundle.profile : "off") << "\n"
+          << "prefill.fast_profile_requested=" << (bundle_requested ? kFastBundle.profile : "off") << "\n"
+          << "prefill.msa_flash_requested=" << pf.msa_flash_requested << "\n"
+          << "prefill.msa_flash_source=" << pf.msa_flash_asked << "\n"
+          << "prefill.msa_flash_layers_requested=" << pf.msa_flash_layers_requested << "\n"
+          << "prefill.fast_policies=" << (pf.policies.empty() ? "none" : pf.policies) << "\n"
+          << "prefill.fast_note=" << (pf.note.empty() ? "none" : pf.note) << "\n"
+          << "prefill.identity=" << (id.empty() ? "default" : id) << "\n"
+          << "profile_fingerprint=" << profile::hex_identity(pr.fingerprint()) << "\n";
+    }
     o << "STRIX_MM_PF_ASYNC_MIN_ROWS=" << pf_async_min_rows(env("STRIX_MM_PF_ASYNC_MIN_ROWS")) << "\n";
     const auto prior = dspark::parse_prior(cli.dspark_prior.empty() ? env("STRIX_MM_DSPARK_PRIOR") : cli.dspark_prior.c_str());
     o << "dspark.prior=" << dspark::prior_name(prior) << "\n";
