@@ -176,7 +176,7 @@ struct Tag {
     std::uint32_t layer = 0;
     std::uint64_t request = 0;
 };
-enum class TagKind : std::uint32_t { half_sum = 1, raw_slots = 2, argmax = 3, control = 4 };
+enum class TagKind : std::uint32_t { half_sum = 1, raw_slots = 2, argmax = 3, control = 4, engram_rows = 5 };
 
 struct CommunicatorStats {
     std::uint64_t exchanges = 0;
@@ -284,6 +284,8 @@ public:
     // views in place and call publish_staged_block. No HIP calls in start/finish/
     // release on this path. prepare returns {} for routes/sizes not admitted.
     [[nodiscard]] ProducerStage prepare_staged_ready(hipStream_t stream, std::size_t bytes);
+    // The largest payload one ready view takes (0: no ready views); callers split larger exchanges into chunks.
+    [[nodiscard]] std::size_t staged_ready_capacity() const noexcept { return staged_ready_bytes_ < max_bytes_ ? staged_ready_bytes_ : max_bytes_; }
     void start_staged_ready(hipStream_t stream, std::size_t bytes, const Tag& tag);
     [[nodiscard]] ConsumerStage finish_staged_ready();
     void release_staged_ready(hipStream_t stream);

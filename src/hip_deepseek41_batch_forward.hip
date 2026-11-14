@@ -368,7 +368,7 @@ std::uint64_t workspace_bytes_for(const TargetModel& model, const BatchForwardOp
     n += (W * partial_blocks + 5U * W) * sizeof(ds41::ArgmaxCandidate);                     // argmax
     n += 2U * (W * H + W * H / 2U) * 4U;                                                   // half sums (+ split shared down rows)
     n += 2U * (W * I / 2U + W * I / 64U * 4U);                                             // split shared activation halves
-    n += 6U * (W * K + 1U) * 4U + 2U * 4U;                                                 // built routes
+    n += 6U * (W * K + 1U) * 4U + 2U * std::max<std::uint64_t>(options.layers, 1U) * 4U;                                                // built routes
     if (!ds41::trellis_env_spec().empty()) {
         n += 3U * W * I * 4U;  // trellis gate up act
         if (const char* t = std::getenv("STRIX_DS41_SHEXP_TP"); t != nullptr && *t == '1') n += W * H * 4U;  // shexp-tp rank 1 partial
@@ -619,6 +619,11 @@ struct BatchForward::Impl {
     // STRIX_DS41_COMPRESS_RING=1: commit restores every ratio-2 carry in one kernel and does not synchronise (the carries
     // are only read by the stream's later work; host reads of them download, which synchronises).
     bool engram_async = false, compress_ring = false;
+    // STRIX_DS41_ENGRAM_FROM_LEAD (default on, =0 off): on the pair only rank 0 reads the Engram rows from storage and
+    // sends each layer's rows to rank 1 in an exchange as soon as it has them (one read of the same file instead of two;
+    // rank 1 no longer waits for its own storage). The other direction of the exchange carries nothing that is used.
+    // (it is sent from / received into half_other, which is free between two layers' combines and larger than a layer's rows).
+    bool engram_from_lead = false;
     Dev<float> half_own, half_other;  // [R x H half sum][R x H/2 split shared down rows]
     Dev<std::uint8_t> shx_own, shx_other;  // split shared expert: A8 activation halves [codes R x I/2][deltas]
     // world 2, the shared expert (same kernels and bits in every form): 0 before the routed experts (default), 1 between
@@ -1206,6 +1211,7 @@ BatchForward::BatchForward(const std::filesystem::path& gguf, const BatchForward
     }();
     // P13 defaults (after P12): HC_SITE, QA_KV, ENGRAM_ASYNC and COMPRESS_RING on, =0 turns each off.
     m.compress_ring = strix::envcfg::flag("STRIX_DS41_COMPRESS_RING", true);
+    m.engram_from_lead = options.world == 2U && options.communicator != nullptr && strix::envcfg::flag("STRIX_DS41_ENGRAM_FROM_LEAD", true);
     m.never = Dev<std::uint32_t>(1);
     {
         const std::size_t n = W * K + 1U;
@@ -1215,7 +1221,7 @@ BatchForward::BatchForward(const std::filesystem::path& gguf, const BatchForward
         m.built.slots = m.track<std::uint32_t>(n);
         m.built.order = m.track<std::uint32_t>(n);
         m.built.low_counts = m.track<std::uint32_t>(n);
-        m.built.counts = m.track<std::uint32_t>(2);
+        m.built.counts = m.track<std::uint32_t>(2U * std::max<std::uint32_t>(options.layers, 1U));  // [layer][2], one download per step
     }
     m.counts_pinned = Pinned<std::uint32_t>(2U * std::max<std::uint32_t>(options.layers, 1U));
     for (std::uint32_t r = 1; r <= W; ++r) {  // the shared expert as expert 0 of a one-expert window of r rows
@@ -1720,6 +1726,8 @@ const std::vector<std::uint32_t>& BatchForward::run_step(std::span<const BatchRo
     std::vector<std::future<void>> engram_wait;
     double engram_read_seconds = 0.0;
     std::future<void> engram_io;
+    const bool engram_peer_rows = engram_async && m.engram_from_lead;
+    const bool rows_from_lead = engram_peer_rows && m.options.rank != 0U;  // this rank takes rank 0's rows
     if (engram_async) {
         for (std::uint32_t li = 0; li < engram_in_range; ++li) {
             engram_wait.push_back(engram_ready[li].get_future());
@@ -1731,7 +1739,7 @@ const std::vector<std::uint32_t>& BatchForward::run_step(std::span<const BatchRo
                 for (std::uint32_t k = 0; k < cols; ++k)
                     layer_requests[li].push_back({li, engram_rows[(std::size_t{r} * engram_layers + li) * cols + k]});
         }
-        engram_io = std::async(std::launch::async, [&] {
+        if (!rows_from_lead) engram_io = std::async(std::launch::async, [&] {
             const auto t0 = std::chrono::steady_clock::now();
             std::uint32_t li = engram_first;
             try {
@@ -1963,6 +1971,7 @@ const std::vector<std::uint32_t>& BatchForward::run_step(std::span<const BatchRo
     static const bool qnorm_a8 = strix::envcfg::flag("STRIX_DS41_R1FUSE_QNORM_A8", false);
     const bool router_routes = ds41::r1fuse_routes();  // STRIX_DS41_R1FUSE_ROUTES: default on, =0 off
     bool q_a8 = false, routes_ready = false;
+    std::uint32_t* layer_counts = m.built.counts.p;  // this layer's pair of the per-step counts
     const auto route_view = [&] {
         ds41::BuildRoutesView bv;
         bv.ids = m.ids.p;
@@ -1977,7 +1986,7 @@ const std::vector<std::uint32_t>& BatchForward::run_step(std::span<const BatchRo
         bv.slots = m.built.slots.p;
         bv.order = m.built.order.p;
         bv.low_counts = m.built.low_counts.p;
-        bv.counts = m.built.counts.p;
+        bv.counts = layer_counts;
         return bv;
     };
     bool x_a8 = false;  // codes/deltas/sums hold the A8 of the current x
@@ -2113,6 +2122,7 @@ const std::vector<std::uint32_t>& BatchForward::run_step(std::span<const BatchRo
         if (front_cut != 0U && step_index != 0U && (s.layer < 0 || static_cast<std::uint32_t>(s.layer) >= front_cut)) break;
         const double trace_comm = tr ? m.comm_seconds() : 0.0;
         const auto layer = static_cast<std::uint32_t>(std::max(s.layer, 0));
+        layer_counts = m.built.counts.p + 2U * std::min(layer, m.options.layers - 1U);
         const std::string p = "blk." + std::to_string(layer) + ".";
         if (m.options.layer_timing && s.layer >= 0 && s.layer != timed_layer) {
             timed_layer = s.layer;
@@ -2127,10 +2137,17 @@ const std::vector<std::uint32_t>& BatchForward::run_step(std::span<const BatchRo
             flush_post();  // the injection updates the expanded stream
             const std::size_t li = static_cast<std::size_t>(std::find(e.layer_ids.begin(), e.layer_ids.end(), layer) - e.layer_ids.begin());
             if (engram_async) {  // this layer's rows only: the later Engram layers' reads overlap the layers before them
-                engram_wait.at(li).get();
-                const std::size_t at = li * R * cols * 264U;
-                check(hipMemcpyAsync(m.erows.p + at, m.erows_pinned.p + at, std::size_t{R} * cols * 264U, hipMemcpyHostToDevice, st),
-                      "engram rows");
+                const auto t_rows = std::chrono::steady_clock::now();
+                const std::size_t at = li * R * cols * 264U, row_bytes_all = std::size_t{R} * cols * 264U;
+                const dist::Tag rows_tag{static_cast<std::uint32_t>(dist::TagKind::engram_rows), layer, 0U};
+                if (rows_from_lead) {
+                    m.options.communicator->exchange(st, m.half_other.p, m.erows.p + at, row_bytes_all, rows_tag);
+                } else {
+                    engram_wait.at(li).get();
+                    check(hipMemcpyAsync(m.erows.p + at, m.erows_pinned.p + at, row_bytes_all, hipMemcpyHostToDevice, st), "engram rows");
+                    if (engram_peer_rows) m.options.communicator->exchange(st, m.erows.p + at, m.half_other.p, row_bytes_all, rows_tag);
+                }
+                stats_.engram_wait_seconds += seconds_since(t_rows);
             }
             ds41::enqueue_engram_rows_bf16(m.erows.p + li * R * cols * 264U, R * cols, m.emb.p, st);
             ds41::F16RowsView v;
@@ -2151,7 +2168,52 @@ const std::vector<std::uint32_t>& BatchForward::run_step(std::span<const BatchRo
                 v.count = half;
                 v.out = m.ekv.p + v.first;
                 v.out_stride = n;
-                ds41::enqueue_f16_rows(v, st);
+                // STRIX_DS41_ENGRAM_READY (default on, =0 off): the halves through the ready views, in chunks of token rows that
+                // fit one view. Each chunk's product runs while the chunk before it is on the wire; no device copies or events.
+                // Same per-row products, plain copies: the same bits.
+                static const bool engram_views = strix::envcfg::flag("STRIX_DS41_ENGRAM_READY", true);
+                const std::size_t ready_cap = engram_views ? m.options.communicator->staged_ready_capacity() : 0U;
+                bool exchanged = false;
+                if (std::uint32_t chunk = static_cast<std::uint32_t>(std::min<std::size_t>(R, ready_cap / (std::size_t{half} * 4U))); chunk != 0U) {
+                    const std::uint32_t chunks = (R + chunk - 1U) / chunk;
+                    chunk = (R + chunks - 1U) / chunks;  // even chunks
+                    const std::uint32_t other = (1U - m.options.rank) * half;
+                    const auto product = [&](std::uint32_t r0, std::uint32_t rn) {
+                        ds41::F16RowsView part = v;
+                        part.x = v.x + std::size_t{r0} * v.x_stride;
+                        part.out = v.out + std::size_t{r0} * n;
+                        part.rows = rn;
+                        ds41::enqueue_f16_rows(part, st);
+                    };
+                    product(0U, chunk);
+                    exchanged = true;
+                    for (std::uint32_t r0 = 0, ci = 0; r0 < R; r0 += chunk, ++ci) {
+                        const std::uint32_t rn = std::min(chunk, R - r0);
+                        const std::size_t bytes = std::size_t{rn} * half * 4U;
+                        const auto stage = m.options.communicator->prepare_staged_ready(st, bytes);
+                        if (!stage.data) {  // views refused (trace / direct route): the same answer for every chunk
+                            if (r0 != 0U) throw std::logic_error("deepseek41 batch forward: engram ready view refused mid exchange");
+                            exchanged = false;
+                            if (R > chunk) product(chunk, R - chunk);  // the exchange below takes all the rows
+                            break;
+                        }
+                        ready_detail::gather_publish(m.ekv.p + std::size_t{r0} * n, rn, n, half, v.first, stage, st);
+                        xport::ds41_exchange_raw_slots_staged<true>(
+                            *m.options.communicator, st, stage.data, bytes,
+                            dist::Tag{static_cast<std::uint32_t>(dist::TagKind::raw_slots), 0x10000U | static_cast<std::uint32_t>(layer), ci},
+                            [&] {
+                                if (r0 + chunk < R) product(r0 + chunk, std::min(chunk, R - r0 - chunk));
+                            },
+                            [&](const auto& peer_view) { ready_detail::scatter(peer_view, m.ekv.p + std::size_t{r0} * n, rn, n, half, other, st); });
+                    }
+                } else {
+                    ds41::enqueue_f16_rows(v, st);
+                }
+                if (exchanged) {
+                    ds41::enqueue_engram_inject(stream_now(), m.ekv.p, m.devf(p + "engram_q_norm.weight"), m.devf(p + "engram_k_norm.weight"), R, H,
+                                                1e-20F, st);
+                    break;
+                }
                 const std::uint32_t total = R * half, blocks = (total + 255U) / 256U;
                 engram_pack<<<blocks, 256, 0, st>>>(m.ekv.p, m.ekv_tx.p, R, n, half, v.first);
                 check(hipGetLastError(), "engram_pack");
@@ -2811,9 +2873,8 @@ const std::vector<std::uint32_t>& BatchForward::run_step(std::span<const BatchRo
             // selection, each expert once, its rows in row order
             const auto bv = route_view();
             if (!routes_ready) ds41::enqueue_build_routes(bv, st);
-            check(hipMemcpyAsync(m.counts_pinned.p + 2U * layer, m.built.counts.p, 8U, hipMemcpyDeviceToHost, st), "union counts");
-            const ds41::RoutesView gate_routes{m.built.experts.p, m.built.begins.p, m.built.rows.p, m.built.slots.p, R * K, R, m.built.counts.p};
-            const ds41::RoutesView down_routes{m.built.experts.p, m.built.begins.p, m.built.slots.p, m.built.slots.p, R * K, R, m.built.counts.p};
+            const ds41::RoutesView gate_routes{m.built.experts.p, m.built.begins.p, m.built.rows.p, m.built.slots.p, R * K, R, layer_counts};
+            const ds41::RoutesView down_routes{m.built.experts.p, m.built.begins.p, m.built.slots.p, m.built.slots.p, R * K, R, layer_counts};
             // expert TP: this rank's 1152 intermediate rows of every expert and its 5-block down rows (ds41_expert_tp.hpp)
             const std::uint32_t EI = m.expert_tp ? ds41::expert_tp::half : I;
             const auto gate_row = row_bytes(ds41::WeightFormat::iq2_xxs, H);
@@ -3070,7 +3131,7 @@ const std::vector<std::uint32_t>& BatchForward::run_step(std::span<const BatchRo
         namespace pipe = ds41::pipe;
         flush_post();  // the last layer's expansion is still pending with the fused hc sites
         if (engram_async) {
-            engram_io.get();
+            if (engram_io.valid()) engram_io.get();
             stats_.engram_seconds = engram_read_seconds;
         }
         const auto fcut = pipe::plan_boundary(m.model.layers, front_cut);
@@ -3136,9 +3197,11 @@ const std::vector<std::uint32_t>& BatchForward::run_step(std::span<const BatchRo
         return tokens_;
     }
     if (engram_async) {
-        engram_io.get();
+        if (engram_io.valid()) engram_io.get();
         stats_.engram_seconds = engram_read_seconds;
     }
+    // the union counts of every layer in one download (they were one 8-byte copy command per layer)
+    check(hipMemcpyAsync(m.counts_pinned.p, m.built.counts.p, std::size_t{8U} * m.options.layers, hipMemcpyDeviceToHost, st), "union counts");
     check(hipStreamSynchronize(st), "step");
     tokens_.resize(R);
     for (std::uint32_t r = 0; r < R; ++r) {

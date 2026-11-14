@@ -1568,7 +1568,7 @@ Discover a DSpark-MXFP4 GGUF and auto vocabulary beside the model/packs.
 
 ### Engram projection split across ranks
 
-**Engine:** `deepseek`. **Control:** `STRIX_DS41_ENGRAM_TP`. **Default:** on for steps of up to 8 rows.
+**Engine:** `deepseek`. **Control:** `STRIX_DS41_ENGRAM_TP; STRIX_DS41_ENGRAM_READY; STRIX_DS41_ENGRAM_FROM_LEAD`. **Default:** on for steps of up to 8 rows.
 
 The two ranks each compute half of the Engram projection's output rows (same per-row arithmetic) and exchange the
 halves, instead of both reading the whole ~160 MB weight.
@@ -1577,7 +1577,8 @@ halves, instead of both reading the whole ~160 MB weight.
 - **Automatic selection:** On for every DeviceForward / BatchForward step of up to 8 rows (decode or prompt); `=r1` restores the previous single-row-only default.
 - **Fallback notice:** Without two ranks or the F8 Engram KV, the full projection runs on each rank.
 - **Exactness evidence:** Bitwise: R1-R8 verify windows with rejects equal the archived full-projection digests on both ranks; batch N1/N2/N4/N8 in-process A/B (fed, argmax, gathered logits per row and final attention states) identical, also on the communicator fallbacks.
-- **Off switch:** STRIX_DS41_ENGRAM_TP=0 (off), =r1 (single-row steps only)
+- **Off switch:** STRIX_DS41_ENGRAM_TP=0 (off), =r1 (single-row steps only); STRIX_DS41_ENGRAM_READY=0 (batch steps: halves by device copies instead of the ready views); STRIX_DS41_ENGRAM_FROM_LEAD=0 (pair batch steps: each rank reads its own Engram rows from storage)
+- **Batch steps:** the halves go through the ready views in chunks of token rows that fit one view, each chunk's product running while the chunk before it is exchanged (same products, plain copies). On the pair only the first rank reads the Engram rows from storage and sends each layer's rows to the second in an exchange (one read of the same file instead of two; same bytes): the second rank's wait for its rows per step of eight requests goes from 1.15 to 0.37 ms. Eight requests at once: same token ids on both ranks, tok/s equal to before within run-to-run spread.
 - **Measured gain:** R1 decode -0.61 ms/step (-2.1 %); verify windows (rank app, in-process ABA x4, every arm bitwise on both ranks, steps of up to 8 rows vs off): R1 -2.1 %, R2 -1.5 %, R4 -1.0 %, R6 -1.0 % (95 % intervals below zero), R8 -0.6 % (3/3 pairs faster)
 - **Implementation / evidence:** [production defaults](models/deepseek-v4.1/production-defaults.md)
 
