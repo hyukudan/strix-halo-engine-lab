@@ -79,15 +79,17 @@ La compilación y el lanzamiento de cada motor: [primeros pasos](docs/getting-st
 `default` es exacto. `fast` añade opciones cualificadas que cambian bits. `quality` usa un pack de mayor precisión
 donde existe.
 
-| Modelo | Uno / par | Exacto / FAST | Memoria |
-|---|---|---|---|
-| Qwen3.8-Flash-Next (UD-Q4_K_XL) | uno (2 réplicas detrás de un router) | exacto por defecto; `fast` | 111 GB de pesos en un nodo de 128 GB |
-| DeepSeek V4.1 Flash (expertos de 2 bits, denso trellis de 6.5 bits) | par por USB4 | exacto por defecto; `fast` | 2 x 128 GB |
-| MiniMax M3.1 Flash (EXL3 3.06 bpw) | par TP2 | exacto | 2 x 128 GB |
-| GLM-5.3 Flash (EXL3 4.05 bpw) | par TP2 | exacto; prefill WMMA opcional | 2 x 128 GB |
-| Nemotron 3.5 Bolt E4B (Q4_K_M; EXL3 para `quality`) | uno, compilación opcional; prefill del prompt en pareja opcional (`STRIX_G4_PAIR=1`, mismos bytes) | exacto por defecto; `fast`; `quality` | nodo de 128 GB |
-| MiniMax H3 (audio + vídeo) | uno o par, compilación opcional | referencia densa; palancas FAST, cada una con su flag | 128 GB por nodo |
-| MiniMax-H3-Image (int8 o W4A8) | uno o par (`strix-h3-image`), compilación opcional | VAE en GPU; `--parallel sequence` para una imagen, `request` para varias | 128 GB por nodo |
+| Modelo | Uno / par | Exacto / FAST | Memoria | Pesos |
+|---|---|---|---|---|
+| Qwen3.8-Flash-Next (UD-Q4_K_XL) | uno (2 réplicas detrás de un router) | exacto por defecto; `fast` | 111 GB de pesos en un nodo de 128 GB | [GGUF UD-Q4_K_XL](https://huggingface.co/hyukudan/Qwen3.8-Flash-Next-GGUF-mirror) (réplica de `unsloth`, leído tal cual se publica); cabeza de draft MTP Q8_0 destilada en local, no publicada |
+| DeepSeek V4.1 Flash (expertos de 2 bits, denso trellis de 6.5 bits) | par por USB4 | exacto por defecto; `fast` | 2 x 128 GB | [GGUF de expertos](https://huggingface.co/hyukudan/deepseek-v4.1-flash-gguf-mirror), [capa densa](https://huggingface.co/hyukudan/DeepSeek-V4.1-Flash-1017-strix-dense-U6), [packs trellis](https://huggingface.co/hyukudan/DeepSeek-V4.1-Flash-1017-strix-trellis-EXL3) |
+| MiniMax M3.1 Flash (EXL3 3.06 bpw) | par TP2 | exacto | 2 x 128 GB | [EXL3 3.06 bpw](https://huggingface.co/hyukudan/MiniMax-M3.1-Flash-EXL3-EAQ-v1-3.06-bpw-mirror) (réplica de `Mia-AiLab`, con nuestro draft EXL3); [origen del draft](https://huggingface.co/hyukudan/MiniMax-M3.1-Flash-DFlash2-mirror) |
+| GLM-5.3 Flash (EXL3 4.05 bpw) | par TP2 | exacto; prefill WMMA opcional | 2 x 128 GB | [EXL3 4.05 bpw](https://huggingface.co/hyukudan/GLM-5.3-Flash-exl3-mirror) (réplica de `turboderp`) |
+| Nemotron 3.5 Bolt E4B (Q4_K_M; EXL3 para `quality`) | uno, compilación opcional; prefill del prompt en pareja opcional (`STRIX_G4_PAIR=1`, mismos bytes) | exacto por defecto; `fast`; `quality` | nodo de 128 GB | GGUF Q4_K_M oficial (no lo replicamos); [pack EXL3](https://huggingface.co/hyukudan/Nemotron-3.5-Bolt-E4B-EXL3); [drafter MTP](https://huggingface.co/hyukudan/Nemotron-3.5-Bolt-E4B-MTP-Drafter) |
+| MiniMax H3 (audio + vídeo) | uno o par, compilación opcional | referencia densa; palancas FAST, cada una con su flag | 128 GB por nodo | no publicado por nosotros ([ficheros](docs/models/minimax-h3/README.es.md#instalación-y-ejecución)) |
+| MiniMax-H3-Image (int8 o W4A8) | uno o par (`strix-h3-image`), compilación opcional | VAE en GPU; `--parallel sequence` para una imagen, `request` para varias | 128 GB por nodo | no publicado por nosotros |
+
+Nuestros pesos en Hugging Face: [huggingface.co/hyukudan](https://huggingface.co/hyukudan). Las réplicas conservan los ficheros de origen; revisiones, nombres de fichero y licencias: [modelos y procedencia](docs/reproduce.md#models-and-provenance).
 
 <a id="discrete-gpu"></a>
 

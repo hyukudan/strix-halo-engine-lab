@@ -27,6 +27,11 @@ los ranks coinciden. [Contrato de implementación](../../minimax-grouped-prefill
 
 ## Ejecución
 
+**Pesos:** [hyukudan/MiniMax-M3.1-Flash-EXL3-EAQ-v1-3.06-bpw-mirror](https://huggingface.co/hyukudan/MiniMax-M3.1-Flash-EXL3-EAQ-v1-3.06-bpw-mirror) (réplica de
+`Mia-AiLab/MiniMax-M3.1-Flash-EXL3-EAQ-v1-3.06-bpw`, usada tal cual se publica; nuestros packs de draft EXL3 de 4 bits en
+`minimax-drafts/`) y [hyukudan/MiniMax-M3.1-Flash-DFlash2-mirror](https://huggingface.co/hyukudan/MiniMax-M3.1-Flash-DFlash2-mirror) (origen del draft). Ficheros y revisiones:
+[reproducir](../../reproduce.md#models-and-provenance).
+
 Ejecute una vez por nodo con `R` establecido en 0 o 1 y assets EXL3 coincidentes:
 
 ```sh

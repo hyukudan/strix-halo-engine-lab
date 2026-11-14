@@ -46,6 +46,9 @@ encoder 10 s) and ~8 min on the pair (52-55 s per step, video VAE 40.6 s), the p
 
 ## Install and run
 
+**Weights:** not published by us. The engine loads the model files listed in step 2; the text-encoder pack is built
+locally with `tools/h3/te/te_pack.py`.
+
 1. **Build** on each node (ROCm, gfx1151):
 
    ```sh

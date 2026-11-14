@@ -14,6 +14,9 @@ en sí: [dos nodos por USB4](../../pair.es.md).
 
 ## Ejecución: el par
 
+**Pesos:** [hyukudan/GLM-5.3-Flash-exl3-mirror](https://huggingface.co/hyukudan/GLM-5.3-Flash-exl3-mirror) (réplica de `turboderp/GLM-5.3-Flash-exl3`, 4.05 bpw, usada tal
+cual se publica). Ficheros y revisiones: [reproducir](../../reproduce.md#models-and-provenance).
+
 La división de GLM por tokens es un perfil FAST de memoria calificado. Está desactivada por defecto;
 `STRIX_GLM_KV_SHARD=auto` (con `STRIX_GLM_PF_PIPELINE=1`) selecciona la división solo después de que todos los candidatos replicados
 de scratch/ventana permitidos fallen la admisión de inicio en alguno de los ranks; `=1` fuerza la división y `=0` fuerza la replicación. Exige una solicitud,

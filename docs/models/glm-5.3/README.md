@@ -13,6 +13,9 @@ read and what "exact" covers: [methodology](../../methodology.md). Build instruc
 
 ## Run: the pair
 
+**Weights:** [hyukudan/GLM-5.3-Flash-exl3-mirror](https://huggingface.co/hyukudan/GLM-5.3-Flash-exl3-mirror) (mirror of `turboderp/GLM-5.3-Flash-exl3`, 4.05 bpw, used as
+published). Files and revisions: [reproduce](../../reproduce.md#models-and-provenance).
+
 Optional GLM token sharding is a qualified FAST memory profile. It is off by default; `STRIX_GLM_KV_SHARD=auto`
 (with `STRIX_GLM_PF_PIPELINE=1`) selects sharding only after all permitted replicated scratch/window candidates
 fail startup admission on either rank;
