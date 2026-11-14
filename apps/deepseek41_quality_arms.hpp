@@ -21,6 +21,7 @@ inline PrefillOptions arm_precision(const std::string& label) {
     if (label == "attention") { o.bf16_attention = true; return o; }
     // the FAST levers: f16 WMMA attention, relaxed-order MoE, both (the composed DS FAST prefill)
     if (label == "fattn") { o.fast_attention = true; return o; }
+    if (label == "fattn2") { o.fast_attention = true; o.fast_attention_flash = true; return o; }  // ds41-attn-bf16flash-v1
     if (label == "fmoe") { o.fast_moe = true; return o; }
     if (label == "fast") { o.fast_attention = true; o.fast_moe = true; return o; }
     std::vector<std::string> tok;

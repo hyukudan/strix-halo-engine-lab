@@ -6,6 +6,7 @@
 #include "strix/hip_ds41_attention.hpp"
 #include "hip_ds41_attention_qk.inc"
 #include "attn_core/banded_flash_prefill.hpp"
+#include "attn_core/sparse_flash_wmma.hpp"
 
 #include <cstdlib>
 #include <stdexcept>
@@ -1665,6 +1666,7 @@ __global__ __launch_bounds__(256) void attention_bf16_chunk2(AttentionView v) {
 }
 
 #include "hip_ds41_attention_f16wmma.inl"  // FAST lever ds41-attn-f16wmma-v1 (not exact; prefill only)
+#include "hip_ds41_attention_flash.inl"    // FAST lever ds41-attn-bf16flash-v1 (not exact; prefill only)
 
 // ---- kernels: one call (the block's own coordinates), or several segments of one kind in one launch ----
 // A segment launch carries up to kMaxSegments views by value; segment k owns the linear blocks [first[k], first[k+1])
@@ -2007,6 +2009,22 @@ static void launch_f16wmma_cpb(const AttentionView& v, hipStream_t stream) {
     case 10U: launch_f16wmma<10, H>(v, stream); break;
     default: launch_f16wmma<2, H>(v, stream); break;
     }
+}
+void enqueue_attention_flash_mirror(const KeyMirrorView& v, hipStream_t stream) {
+    if (v.count == 0U) return;
+    if (v.src == nullptr || v.dst == nullptr || (v.window && (v.pos == nullptr || v.capacity == 0U))) throw std::invalid_argument("ds41 flash mirror view");
+    hipLaunchKernelGGL(flash_mirror_kernel, dim3(v.count), dim3(32), 0, stream, v);
+    hip_check(hipGetLastError(), "ds41 flash mirror");
+}
+void enqueue_attention_flash_prefill(const AttentionView& v, hipStream_t stream) {
+    (void)attention_hpw(v);  // the incumbent view checks
+    if (v.heads % 32U != 0U) throw std::invalid_argument("ds41 flash attention: heads must be a multiple of 32");
+    if (v.kv != nullptr || v.ring_out != nullptr) throw std::invalid_argument("ds41 flash attention: no window fold");
+    if (v.ring16 == nullptr || (v.idx_count != nullptr && v.kv16 == nullptr)) throw std::invalid_argument("ds41 flash attention: key mirrors");
+    using strix::attn_core::sparse::flash_rows_kernel;
+    hipLaunchKernelGGL(HIP_KERNEL_NAME(flash_rows_kernel<FlashAttentionPolicy, 32U>), dim3(v.rows * (v.heads / 32U)), dim3(256), 0, stream, v);
+    hipLaunchKernelGGL(attention_flash_combine_kernel, dim3(v.heads, v.rows), dim3(32), 0, stream, v);
+    hip_check(hipGetLastError(), "ds41 flash attention");
 }
 void enqueue_attention_f16wmma_prefill(const AttentionView& v, hipStream_t stream) {
     (void)attention_hpw(v);  // the incumbent view checks

@@ -124,6 +124,10 @@ struct AttentionView {
     // STRIX_DS41_ATTN_LIVE_CHUNKS: the caller's upper bound on any row's visible keys (window + selected), or 0 (unknown):
     // the grid and the heads-per-wave choice then count only the chunks it can hold. A row above it traps.
     std::uint32_t max_visible = 0;
+    // FAST lever ds41-attn-bf16flash-v1 only: BF16 mirrors of the ring (capacity x 512) and of kv_cache (entry x 512),
+    // written by enqueue_attention_flash_mirror
+    const std::uint16_t* ring16 = nullptr;
+    const std::uint16_t* kv16 = nullptr;
 };
 inline constexpr unsigned kAttnGroupCount = 8;   // at most 8 head groups per row (8 heads per block)
 // variant 0: STRIX_DS41_BF16_ATTN_VARIANT (default 1, the first kernel); 2: QK split over the waves, 16-byte key stores
@@ -132,6 +136,19 @@ void enqueue_attention_bf16_prefill(const AttentionView&, hipStream_t stream, in
 // softmax statistics with the ordered rescale, today's FP32 chunk combine. Same view contract as enqueue_attention (no
 // window fold; heads a multiple of 16). Selected by the prefill with STRIX_DS41_FAST_ATTN=1 (default off).
 void enqueue_attention_f16wmma_prefill(const AttentionView& v, hipStream_t stream);
+// FAST lever ds41-attn-bf16flash-v1 (prefill only, NOT bit-exact; calls of a multiple of 32 heads): the shared sparse
+// flash core (attn_core/sparse_flash_wmma.hpp) on BF16 WMMA in ONE pass per product: one work-group per (row, 32
+// heads), keys read from BF16 mirrors (the stored FP8 values are exact in BF16), queries and probabilities rounded
+// once to BF16, FP32 online softmax; the unchanged combine (sink, 1 / L, inverse RoPE, A8 of o) finishes the row.
+struct KeyMirrorView {
+    const std::uint8_t* src;      // window: the ring (capacity x 528); else kv_cache (entries x 288)
+    std::uint16_t* dst;           // entry x 512 BF16
+    const std::uint64_t* pos;     // window: `count` positions (entry pos % capacity); else unused
+    std::uint32_t count, capacity;
+    bool window;                  // false: entries [0, count)
+};
+void enqueue_attention_flash_mirror(const KeyMirrorView& v, hipStream_t stream);
+void enqueue_attention_flash_prefill(const AttentionView& v, hipStream_t stream);
 // Benchmarks only: chunks per block (1, 2 = default, 5, 10), an ablation mask (0 = none; see the kernel; non-zero = wrong
 // results) and heads per block (16 = default, 32 where the call's heads allow it: measured slower, kept for benchmarks).
 void set_fast_attn_tuning(unsigned chunks_per_block, unsigned ablate, unsigned heads_per_block = 16U);

@@ -33,6 +33,10 @@ struct PrefillOptions {
     // FAST lever ds41-attn-f16wmma-v1 (STRIX_DS41_FAST_ATTN=1): non-exact f16 WMMA attention, prefill only, layers
     // [approx_layer_first, approx_layer_end); bf16_attention wins where both are set
     bool fast_attention = false;
+    // with fast_attention: FAST lever ds41-attn-bf16flash-v1 (STRIX_DS41_FAST_ATTN=2) instead of ds41-attn-f16wmma-v1:
+    // the shared sparse flash core on BF16 WMMA, one pass per product, keys from BF16 mirrors. Runs of a new prompt
+    // (start 0) whose calls hold a multiple of 32 heads; other runs keep ds41-attn-f16wmma-v1.
+    bool fast_attention_flash = false;
     // FAST lever ds41-moe-relaxed-v1 (STRIX_DS41_FAST_MOE=1): routed experts in relaxed order. Read from the environment by
     // the MoE dispatch; set_precision_for_new_sequence applies an explicit value (quality arms).
     bool fast_moe = false;

@@ -131,6 +131,32 @@ void run_case(const char* name, std::uint64_t last, unsigned rows, unsigned head
     g::enqueue_attention_f16wmma_prefill(v, nullptr);
     check(hipDeviceSynchronize());
     const auto again = dout.get();
+    // FAST lever ds41-attn-bf16flash-v1 (calls of a multiple of 32 heads): BF16 mirrors of every ring slot and cache entry
+    float flash_ms = 0.0F;
+    Err ef{};
+    if (heads % 32U == 0U) {
+        std::vector<std::uint64_t> slots(cap);
+        for (std::uint32_t i = 0; i < cap; ++i) slots[i] = i;
+        Dev<std::uint64_t> dslots(slots);
+        Dev<std::uint16_t> dring16(std::size_t{cap} * 512), dkv16(std::size_t{ncache} * 512 + 512);
+        g::enqueue_attention_flash_mirror({dring.p, dring16.p, dslots.p, cap, cap, true}, nullptr);
+        g::enqueue_attention_flash_mirror({dkv.p, dkv16.p, nullptr, ncache, 0U, false}, nullptr);
+        g::AttentionView vf = v;
+        vf.ring16 = dring16.p; vf.kv16 = dkv16.p;
+        check(hipMemset(dout.p, 0, dout.n * sizeof(float)));
+        flash_ms = timing([&] { g::enqueue_attention_flash_prefill(vf, nullptr); });
+        const auto gf = dout.get();
+        ef = compare(ref, gf);
+        std::printf("%-22s flash_ms=%.4f speedup=%.2f rel_l2=%.3g max_abs=%.3g nonfinite=%zu\n", name, flash_ms, flash_ms > 0.0F ? exact_ms / flash_ms : 0.0F,
+                    ef.rel_l2, ef.max_abs, ef.nonfinite);
+        // Declared limit of the BF16 operands (8 significant bits): the score error is about 2^-9 of the score's size, so
+        // inputs with scores of hundreds (window scales above 134, |q| of 1e5) are reported, not bounded. The real
+        // inputs are bounded by the FAST logit gate, not by this test.
+        if (checked && !case_nan && smax <= 134U && qmax <= 2.0F) {
+            expect(ef.nonfinite == 0, std::string(name) + " flash finite");
+            expect(ef.rel_l2 < 2e-2, std::string(name) + " flash relative L2 < 2e-2");
+        }
+    }
     if (checked) {
         expect(std::memcmp(got.data(), again.data(), got.size() * sizeof(float)) == 0, std::string(name) + " repeat bits");
         if (case_nan) {
