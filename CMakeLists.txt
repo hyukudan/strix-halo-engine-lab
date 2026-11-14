@@ -766,6 +766,7 @@ add_library(strix_serve STATIC
     src/serve/constraint_selection.cpp
     src/serve/bpe_tokenizer.cpp
     src/serve/prompt_stream.cpp
+    src/serve/token_memo.cpp
     src/serve/chat_template.cpp
     src/serve/deepseek_chat.cpp
     src/serve/glm_chat.cpp
@@ -961,6 +962,12 @@ if(BUILD_TESTING)
     strix_target_warnings(strix-incremental-tokenizer-tests)
     add_test(NAME strix-incremental-tokenizer-tests COMMAND strix-incremental-tokenizer-tests)
     set_tests_properties(strix-incremental-tokenizer-tests PROPERTIES LABELS "cpu" TIMEOUT 300)
+    # Token memo: memoised prompt ids equal a full encode for random chats, edits, shared prefixes and split points.
+    add_executable(strix-token-memo-tests tests/token_memo_tests.cpp)
+    target_link_libraries(strix-token-memo-tests PRIVATE strix_serve)
+    strix_target_warnings(strix-token-memo-tests)
+    add_test(NAME strix-token-memo-tests COMMAND strix-token-memo-tests)
+    set_tests_properties(strix-token-memo-tests PROPERTIES LABELS "cpu" TIMEOUT 300)
     add_executable(strix-glm-tokenizer-tests tests/glm_tokenizer_tests.cpp)
     target_link_libraries(strix-glm-tokenizer-tests PRIVATE strix_serve)
     strix_target_warnings(strix-glm-tokenizer-tests)

@@ -8,6 +8,7 @@
 #include "strix/serve/media.hpp"
 #include "strix/serve/request_fields.hpp"
 #include "strix/serve/session_api.hpp"
+#include "strix/serve/token_memo.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -425,6 +426,12 @@ template<class F> decltype(auto) family_call(F&& f, bool legacy_errors = false) 
 struct ApiService::Impl {
     ApiConfig config;
     std::shared_ptr<const ApiTokenizer> tokenizer;
+    // Prompt ids of recent chat turns: a turn that resends its history encodes only the new tail (exactly the
+    // tokenizer's ids; STRIX_SERVE_TOKEN_MEMO=0 encodes every prompt in full).
+    mutable TokenMemo token_memo;
+    std::vector<std::uint32_t> encode_prompt(std::string_view text) const {
+        return TokenMemo::enabled_by_default() ? token_memo.encode(*tokenizer, text, true) : tokenizer->encode(text, true);
+    }
     GenerationQueue& queue;
     std::uint64_t context_tokens;
     bool engine_samples;
@@ -978,7 +985,7 @@ struct ApiService::Impl {
         try { text = config.chat_renderer ? config.chat_renderer(input) : render_chat_template(input); }
         catch (const ChatTemplateError& error) { throw ApiError(400, "invalid_request_error", error.what(), "messages"); }
         ChatPrompt out;
-        out.tokens = tokenizer->encode(text, true);
+        out.tokens = encode_prompt(text);
         out.thinking = !input.enable_thinking || *input.enable_thinking;
         out.tools = input.tools;
         // the stable prefix: the leading system messages and the tools rendered alone, when their tokens begin the prompt
@@ -995,7 +1002,7 @@ struct ApiService::Impl {
             head.messages = system;
             head.add_generation_prompt = false;
             try {
-                const auto ids = tokenizer->encode(config.chat_renderer ? config.chat_renderer(head) : render_chat_template(head), true);
+                const auto ids = encode_prompt(config.chat_renderer ? config.chat_renderer(head) : render_chat_template(head));
                 if (ids.size() < out.tokens.size() && std::equal(ids.begin(), ids.end(), out.tokens.begin()))
                     out.stable_prefix = static_cast<std::uint32_t>(ids.size());
             } catch (const ChatTemplateError&) {}

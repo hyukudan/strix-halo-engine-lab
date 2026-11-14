@@ -2,6 +2,7 @@
 #include "minimax/serve/minimax_chat.hpp"
 #include "minimax/serve/minimax_tokenizer.hpp"
 #include "strix/serve/request_fields.hpp"
+#include "strix/serve/token_memo.hpp"
 
 #include <algorithm>
 #include <cstdio>
@@ -114,7 +115,12 @@ ApiTokenizer api_tokenizer(std::shared_ptr<const MinimaxTokenizer> tokenizer) {
     if (!tokenizer) throw std::invalid_argument("API tokenizer is required");
     ApiTokenizer t;
     t.eos_id=tokenizer->eos_id();
-    t.encode=[tokenizer](std::string_view text) { return tokenizer->encode(text,true); };
+    // Chat turns resend their history: the memo encodes only the new tail, with the ids of a full encode.
+    t.encode=[tokenizer,memo=std::make_shared<sv::TokenMemo>(),lookahead=tokenizer->mark_lookahead()](std::string_view text) {
+        if (!sv::TokenMemo::enabled_by_default()) return tokenizer->encode(text,true);
+        return memo->encode(1U,lookahead,text,[&](std::string_view tail,std::vector<sv::EncodeMark>& marks) {
+            return tokenizer->encode_marked(tail,true,marks); });
+    };
     t.decode=[tokenizer](std::span<const std::uint32_t> ids) { return tokenizer->decode(ids,true); };
     t.stream_bytes=[tokenizer](std::uint32_t id) { return tokenizer->is_special(id) ? std::string() : tokenizer->token_bytes(id); };
     t.delegated=std::make_shared<DelegatedTokenizer>(std::move(tokenizer));

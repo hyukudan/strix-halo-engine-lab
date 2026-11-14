@@ -574,6 +574,22 @@ std::shared_ptr<const BpeTokenizer> BpeTokenizer::load_gguf(const std::string& p
 }
 
 std::vector<std::uint32_t> BpeTokenizer::encode(std::string_view text, bool parse_special) const {
+    return encode_marks(text, parse_special, nullptr);
+}
+
+std::vector<std::uint32_t> BpeTokenizer::encode_marked(std::string_view text, bool parse_special,
+                                                       std::vector<EncodeMark>& marks) const {
+    return encode_marks(text, parse_special, &marks);
+}
+
+std::size_t BpeTokenizer::mark_lookahead() const noexcept {
+    std::size_t longest = 0;
+    for (const auto id : impl_->specials) longest = std::max(longest, impl_->tokens[id].size());
+    return longest;
+}
+
+std::vector<std::uint32_t> BpeTokenizer::encode_marks(std::string_view text, bool parse_special,
+                                                      std::vector<EncodeMark>* marks) const {
     std::vector<std::uint32_t> out;
     // glm4 follows `tokenizers`: with special parsing off, the non-special added tokens (<think>, <tool_call>, ...) still match
     const bool glm = impl_->pre_kind == PreTokenizer::glm4;
@@ -590,6 +606,7 @@ std::vector<std::uint32_t> BpeTokenizer::encode(std::string_view text, bool pars
                     out.push_back(id);
                     i += s.size();
                     start = i;
+                    if (marks) marks->push_back({i, out.size()});
                     matched = true;
                     break;
                 }

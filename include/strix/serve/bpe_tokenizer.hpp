@@ -9,6 +9,15 @@
 
 namespace strix::serve {
 
+// A restart point of an encoding of a text T: byte offset `bytes` (the end of a special token) and the number of
+// ids emitted before it. For every text U that equals T on the first `bytes + mark_lookahead()` bytes,
+// encode(U) == encode(T)[0, ids) ++ encode(U.substr(bytes)): the scan carries no state across a special token,
+// and no special token that starts before `bytes` reads past that window.
+struct EncodeMark {
+    std::size_t bytes = 0;
+    std::size_t ids = 0;
+};
+
 // Byte-level BPE tokenizer read from a GGUF file's tokenizer metadata (`tokenizer.ggml.tokens`,
 // `token_type`, `merges`, `pre`). Encoding splits the text on control and user-defined tokens
 // (when special parsing is on), pre-tokenizes every other piece with the model's pattern, maps its
@@ -29,6 +38,11 @@ public:
 
     // parse_special: control and user-defined token texts in `text` become their IDs.
     [[nodiscard]] std::vector<std::uint32_t> encode(std::string_view text, bool parse_special = true) const;
+    // encode() that also appends its restart points (see EncodeMark), in increasing byte order.
+    [[nodiscard]] std::vector<std::uint32_t> encode_marked(std::string_view text, bool parse_special,
+                                                           std::vector<EncodeMark>& marks) const;
+    // Bytes of the longest control / user-defined token text: the window an EncodeMark needs after its offset.
+    [[nodiscard]] std::size_t mark_lookahead() const noexcept;
     // Incremental form of encode(). The caller keeps `text` unchanged and a cursor that starts at zero; each call
     // encodes about `slice_bytes` more text and appends the ids, which are final: the ids appended over all calls are
     // exactly encode(text, parse_special). Returns false (and appends nothing) once the text is fully encoded.
@@ -59,6 +73,7 @@ private:
     BpeTokenizer();
     struct Impl;
     std::unique_ptr<Impl> impl_;
+    std::vector<std::uint32_t> encode_marks(std::string_view text, bool parse_special, std::vector<EncodeMark>* marks) const;
 };
 
 // Incremental decoder: feeds token bytes and returns only complete UTF-8 characters; a sequence

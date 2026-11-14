@@ -4,8 +4,10 @@
 // Without tokenizer.json (or when the file does not exist) only the NFC and chat-text checks run.
 #include "minimax/serve/minimax_chat.hpp"
 #include "minimax/serve/minimax_tokenizer.hpp"
+#include "strix/serve/token_memo.hpp"
 #include "strix/serve/json.hpp"
 
+#include <random>
 #include <chrono>
 #include <cstdint>
 #include <fstream>
@@ -101,6 +103,38 @@ int main(int argc, char** argv) try {
         const auto& text = c.find("text")->as_string();
         const auto got = mm::MinimaxTokenizer::nfc(text);
         check("nfc", got == c.find("nfc")->as_string(), escape(text) + " -> " + escape(got) + " want " + escape(c.find("nfc")->as_string()));
+    }
+    // Restart points and the prompt memo: random texts with added tokens, pieces of them, combining marks and split
+    // UTF-8, cut at any byte and continued differently, always give the ids of a full encode.
+    if (tok) {
+        static const std::vector<std::string> parts = {"<mm:think>", "</mm:think>", "<mm:", "<", ">", "]<]minimax[>[", "]<]",
+            "e\xCC\x81", "\xCC\x81", "caf\xC3\xA9", "\xC3", "\xE6\x97\xA5", "\xF0\x9F",
+            " the", " and", "\n\n", " ", "12", "{\"a\":1}", "x"};
+        std::mt19937_64 rng(20261114ULL);
+        strix::serve::TokenMemo memo(strix::serve::TokenMemo::Limits{std::size_t{1} << 20, 6});
+        const std::size_t lookahead = tok->mark_lookahead();
+        std::vector<std::string> kept;
+        bool split = true, same = true;
+        for (int round = 0; round < 3000; ++round) {
+            std::string text = kept.empty() || rng() % 5U == 0U ? std::string() : kept[rng() % kept.size()];
+            text.resize(rng() % (text.size() + 1U));
+            for (std::size_t n = rng() % 40U; n > 0U; --n) text += parts[rng() % parts.size()];
+            std::vector<strix::serve::EncodeMark> marks;
+            const auto ids = tok->encode_marked(text, true, marks);
+            same = same && ids == tok->encode(text, true);
+            for (const auto& mark : marks) {
+                auto joined = tok->encode(std::string_view(text).substr(0, mark.bytes), true);
+                const auto tail = tok->encode(std::string_view(text).substr(mark.bytes), true);
+                joined.insert(joined.end(), tail.begin(), tail.end());
+                split = split && joined == ids;
+            }
+            same = same && ids == memo.encode(1U, lookahead, text, [&](std::string_view rest, std::vector<strix::serve::EncodeMark>& out) {
+                return tok->encode_marked(rest, true, out); });
+            if (kept.size() < 16U) kept.push_back(text); else kept[rng() % kept.size()] = text;
+        }
+        check("memo", split, "a restart point does not split the encoding");
+        check("memo", same, "memo ids differ from a full encode");
+        check("memo", memo.stats().partial > 300U, "the memo reused too few prefixes");
     }
     // Invalid UTF-8 survives encode/decode unchanged.
     if (tok) {
