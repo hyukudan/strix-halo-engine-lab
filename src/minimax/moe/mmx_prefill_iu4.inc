@@ -26,12 +26,20 @@ constexpr std::size_t kI4Tab = (kI4Experts * sizeof(void*) + 255U) & ~std::size_
 static_assert(std::size_t{kHidden} * (kInter / 64U) == kI4S && kI4ExpertBytes == kI4W + 2U * kI4S && kI4ExpertBytes % 256U == 0U,
               "gate/up and down share one per-expert block: nibbles, then FP16 scales");
 
+// FAST policy i8 (W8A8, set_prefill_i4_wide): signed-byte packs and activation images on the same chain. The pack
+// block of an expert matrix is then 2 * kI4W weight bytes followed by the same FP16 scales.
+bool g_i4_wide = false;
+std::size_t i4_w_bytes() { return g_i4_wide ? 2U * kI4W : kI4W; }
+std::size_t i4_expert_bytes() { return i4_w_bytes() + 2U * kI4S; }
+std::size_t i4_layer_bytes() { return 3U * kI4Experts * i4_expert_bytes(); }
+
 #if STRIX_MMX_IU4_LIB
 void iu4_ok(hipError_t e, const char* what) { ok(e, what); }
 
 
-struct I4Binding {
+template<bool Wide> struct I4BindingT {
     static constexpr unsigned H=kHidden, I=kInter;
+    static constexpr bool kWide=Wide;   // moe_i4::binding_wide: signed-byte operands
     const float* x; float* out; Tables t; bool dense_groups=true; bool reference_group_ids=false; float* dn=nullptr;
     __device__ __forceinline__ float* contribution(unsigned p) const { return dn+size_t(p)*H; }
     __device__ __forceinline__ unsigned slot(unsigned tok,unsigned k) const {
@@ -61,8 +69,9 @@ struct I4Binding {
     __device__ __forceinline__ SuhRow suh_row(unsigned e,unsigned m) const { return {suh_ptr(e,m)}; }
     __device__ __forceinline__ float activation(float g,float u) const { return Epilogue::swiglu(g,u); }
 };
-struct I4ReferenceSchedule {
-    using Binding=I4Binding;
+using I4Binding=I4BindingT<false>;
+template<bool Wide> struct I4ReferenceScheduleT {
+    using Binding=I4BindingT<Wide>;
     static constexpr bool kCachedInput=true;
     Binding b; uint8_t* aq; float* as; const float* gu=nullptr;
     uint8_t* aq2=nullptr; float* as2=nullptr;   // remainder plane (FAST_I4 A8 policy), null = W4A4
@@ -82,21 +91,26 @@ struct I4ReferenceSchedule {
     }
 };
 
-void launch_i4_chain(const Tables& t,const I4Layer& q,const float* x,float* out,
-    const strix::core::IU4Group* groups,unsigned char* ws,std::size_t bytes,hipStream_t stream,bool dense_groups=true) {
+using I4ReferenceSchedule=I4ReferenceScheduleT<false>;
+
+template<bool Wide> void launch_i4_chain_t(const Tables& t,const I4Layer& q,const float* x,float* out,
+    const strix::core::IU4Group* groups,unsigned char* ws,std::size_t bytes,hipStream_t stream,bool dense_groups) {
     namespace st=strix::core;
+    using Bind=I4BindingT<Wide>;
+    using Sched=I4ReferenceScheduleT<Wide>;
+    constexpr std::size_t kAB=Wide ? 1U : 2U;   // activation image: K / kAB bytes per row
     // With the gate kept in registers, plan 2 (BM128) paired gate/up spills on gfx1151 and the paired
     // call runs at most plan 1 on its own tile list. GSave keeps the pass-0 gate in a global FP32
     // scratch (exact, L2-resident, same thread reads it back) so both calls share the selected plan.
     const bool gsv=st::moe_i4::gsave_enabled();
-    const auto cp=st::moe_i4::chain_plan<I4Binding>(iu4_plan(t.pairs,strix::core::moe_i4::kPlan2Rows),gsv,gsv ? std::size_t(t.pairs)*kInter : 0,t.pairs);
+    const auto cp=st::moe_i4::chain_plan<Bind>(iu4_plan(t.pairs,strix::core::moe_i4::kPlan2Rows),gsv,gsv ? std::size_t(t.pairs)*kInter : 0,t.pairs);
     const unsigned max_tiles=st::moe_i4::chain_max_tiles(cp,t.pairs,kI4Experts);
     const std::size_t tile_bytes=align256(max_tiles*sizeof(st::IU4GroupTile));
-    const std::size_t qbytes=align256(std::size_t(t.pairs)*(kInter/2));
+    const std::size_t qbytes=align256(std::size_t(t.pairs)*(kInter/kAB));
     const std::size_t sbytes=align256(std::size_t(t.pairs)*(kInter/64)*4);
     const std::size_t dbytes=align256(std::size_t(t.pairs)*kHidden*4);
     // Gate/up A4 image of the control (row 2*pair+m): quantised once, not once per N tile.
-    const std::size_t gqbytes=align256(2*std::size_t(t.pairs)*(kHidden/2));
+    const std::size_t gqbytes=align256(2*std::size_t(t.pairs)*(kHidden/kAB));
     const std::size_t gsbytes=align256(2*std::size_t(t.pairs)*(kHidden/64)*4);
     const std::size_t gvbytes=gsv ? align256(std::size_t(t.pairs)*kInter*4) : 0;
     if(bytes<tile_bytes+256+qbytes+sbytes+dbytes+gqbytes+gsbytes+gvbytes) throw std::logic_error("minimax fused i4 scratch too small");
@@ -111,12 +125,12 @@ void launch_i4_chain(const Tables& t,const I4Layer& q,const float* x,float* out,
     st::moe_i4::Weights w{};
     for(unsigned m=0;m<3;++m) {
         w.q[m]=q.wq[m]; w.s[m]=q.ws[m]; w.svh[m]=q.svh[m];
-        w.q_stride[m]=kI4ExpertBytes; w.s_stride[m]=kI4ExpertBytes/2;
+        w.q_stride[m]=i4_expert_bytes(); w.s_stride[m]=i4_expert_bytes()/2;
     }
-    I4Binding b{x,out,t,dense_groups,false,dn};
+    Bind b{x,out,t,dense_groups,false,dn};
     // Same schedule and binding flags as the control pre-pass: bitwise-identical A4 bytes/scales.
-    hipLaunchKernelGGL((st::moe_i4::reference_input_kernel<I4ReferenceSchedule>),dim3((t.rows*kHB+7)/8),dim3(256),0,stream,
-        (I4ReferenceSchedule{{x,out,t,false,true},gq,gs}));
+    hipLaunchKernelGGL((st::moe_i4::reference_input_kernel<Sched>),dim3((t.rows*kHB+7)/8),dim3(256),0,stream,
+        (Sched{{x,out,t,false,true},gq,gs}));
     iu4_ok(hipGetLastError(),"chain gather + quantiser");
     mark("gather",stream);
     const auto run=st::moe_i4::launch_chain(cp,b,w,groups,kI4Experts,tiles,ntiles,t.pairs,gq,gs,aq,as,gv,stream,
@@ -124,9 +138,14 @@ void launch_i4_chain(const Tables& t,const I4Layer& q,const float* x,float* out,
     iu4_ok(run.status,run.stage);
     mark("down",stream);
     // Ordered combine of the control: ascending top-k FMA, shared expert last. Deterministic.
-    hipLaunchKernelGGL((st::moe_i4::reference_combine_kernel<I4Binding>),dim3((t.rows*kHB+7)/8),dim3(256),0,stream,b,dn,t.rows,kTopE);
+    hipLaunchKernelGGL((st::moe_i4::reference_combine_kernel<Bind>),dim3((t.rows*kHB+7)/8),dim3(256),0,stream,b,dn,t.rows,kTopE);
     iu4_ok(hipGetLastError(),"chain combine");
     mark("combine",stream);
+}
+void launch_i4_chain(const Tables& t,const I4Layer& q,const float* x,float* out,
+    const strix::core::IU4Group* groups,unsigned char* ws,std::size_t bytes,hipStream_t stream,bool dense_groups=true) {
+    if (g_i4_wide) launch_i4_chain_t<true>(t,q,x,out,groups,ws,bytes,stream,dense_groups);
+    else launch_i4_chain_t<false>(t,q,x,out,groups,ws,bytes,stream,dense_groups);
 }
 
 // W4A8 policy scratch (remainder-plane A4 image, its scales and its GEMM output); grown on demand, never on the
@@ -149,6 +168,7 @@ unsigned char* i4_a8_scratch(std::size_t bytes) {
     return base;
 }
 void launch_iu4(const Plan& p, const Tables& t, const PrefillMoeView& v, unsigned char* ws, std::size_t ws_bytes, hipStream_t stream) {
+    if (g_i4_wide) throw std::logic_error("minimax fast_i4 bits 8 runs on the INT4 chain only (scope all)");
     namespace st = strix::core;
     const I4Layer& q = *v.i4;
     if(v.i4_all && v.i4_chain && v.i4_a8 == 0U) {
@@ -188,7 +208,7 @@ void launch_iu4(const Plan& p, const Tables& t, const PrefillMoeView& v, unsigne
     for (unsigned m = 0; m < 2U; ++m) {
         st::IU4GroupedOperands o;
         o.a_q = aq_gu; o.a_scale = as_gu; o.w_q = q.wq[m]; o.w_scale = q.ws[m];
-        o.w_expert_bytes = kI4ExpertBytes; o.w_scale_expert = kI4ExpertBytes / 2U;
+        o.w_expert_bytes = i4_expert_bytes(); o.w_scale_expert = i4_expert_bytes() / 2U;
         o.col_scale = q.svh[m]; o.map = nullptr; o.a_mul = 2U; o.a_add = m; o.o_mul = 2U; o.o_add = m;
         iu4_ok(st::launch_wmma_tiled_iu4_grouped(o, tiles, ntiles, max_tiles, gu, static_cast<int>(kHidden), static_cast<int>(kInter), stream, plan),
                "iu4 gate/up");
@@ -198,7 +218,7 @@ void launch_iu4(const Plan& p, const Tables& t, const PrefillMoeView& v, unsigne
         for (unsigned m = 0; m < 2U; ++m) {
             st::IU4GroupedOperands o;
             o.a_q = x2; o.a_scale = reinterpret_cast<float*>(x2 + gu_q); o.w_q = q.wq[m]; o.w_scale = q.ws[m];
-            o.w_expert_bytes = kI4ExpertBytes; o.w_scale_expert = kI4ExpertBytes / 2U;
+            o.w_expert_bytes = i4_expert_bytes(); o.w_scale_expert = i4_expert_bytes() / 2U;
             o.col_scale = q.svh[m]; o.map = nullptr; o.a_mul = 2U; o.a_add = m; o.o_mul = 2U; o.o_add = m;
             iu4_ok(st::launch_wmma_tiled_iu4_grouped(o, tiles, ntiles, max_tiles, gu2, static_cast<int>(kHidden), static_cast<int>(kInter), stream, plan),
                    "iu4 gate/up remainder plane");
@@ -231,7 +251,7 @@ void launch_iu4(const Plan& p, const Tables& t, const PrefillMoeView& v, unsigne
     }
     st::IU4GroupedOperands o;
     o.a_q = aq_dn; o.a_scale = as_dn; o.w_q = q.wq[2]; o.w_scale = q.ws[2];
-    o.w_expert_bytes = kI4ExpertBytes; o.w_scale_expert = kI4ExpertBytes / 2U;
+    o.w_expert_bytes = i4_expert_bytes(); o.w_scale_expert = i4_expert_bytes() / 2U;
     o.col_scale = q.svh[2]; o.map = nullptr;
     iu4_ok(st::launch_wmma_tiled_iu4_grouped(o, tiles, ntiles, max_tiles, dn, static_cast<int>(kInter), static_cast<int>(kHidden), stream, plan),
            "iu4 down");
@@ -253,13 +273,13 @@ void launch_iu4(const Plan& p, const Tables& t, const PrefillMoeView& v, unsigne
 }  // namespace
 
 bool iu4_built() { return STRIX_MMX_IU4_LIB != 0; }
-std::size_t i4_pack_bytes() { return kI4PackBytes; }
+std::size_t i4_pack_bytes() { return i4_layer_bytes(); }
 std::size_t i4_source_bytes() { return 3U * 10U * kI4Tab; }
-std::size_t i4_slot_bytes() { return kI4PackBytes + 3U * kI4Tab; }
+std::size_t i4_slot_bytes() { return i4_layer_bytes() + 3U * kI4Tab; }
 I4Layer i4_slot_view(std::uint8_t* base) {
     I4Layer out = i4_layer_view(base, {});
     for (unsigned m = 0; m < 3; ++m)
-        out.svh[m] = reinterpret_cast<const std::uint16_t* const*>(base + kI4PackBytes + m * kI4Tab);
+        out.svh[m] = reinterpret_cast<const std::uint16_t* const*>(base + i4_layer_bytes() + m * kI4Tab);
     return out;
 }
 I4Source i4_source_build(const ExpertSlices* experts, const ExpertSlices& shared, void* base) {
@@ -298,8 +318,8 @@ I4Source i4_source_build(const ExpertSlices* experts, const ExpertSlices& shared
 I4Layer i4_layer_view(std::uint8_t* pack, const I4Source& src) {
     I4Layer out;
     for (unsigned m = 0; m < 3; ++m) {
-        out.wq[m] = pack + std::size_t{m} * kI4Experts * kI4ExpertBytes;
-        out.ws[m] = reinterpret_cast<_Float16*>(out.wq[m] + kI4W);
+        out.wq[m] = pack + std::size_t{m} * kI4Experts * i4_expert_bytes();
+        out.ws[m] = reinterpret_cast<_Float16*>(out.wq[m] + i4_w_bytes());
         out.svh[m] = src.svh[m];
     }
     return out;
@@ -315,7 +335,8 @@ void i4_convert(const I4Source& src, const I4Layer& out, hipStream_t stream, boo
             const auto* td = src.trellis[m][bits];
             if (td == nullptr) continue;
             iu4_ok(strix::core::convert_exl3_iu4(td, static_cast<int>(bits), static_cast<int>(kI4Experts), static_cast<int>(K),
-                                                   static_cast<int>(N), out.wq[m], out.ws[m], kI4ExpertBytes, kI4ExpertBytes / 2U, stream),
+                                                   static_cast<int>(N), out.wq[m], out.ws[m], i4_expert_bytes(), i4_expert_bytes() / 2U, stream,
+                                                   g_i4_wide ? strix::core::iu4_scale_rule_wide8 : strix::core::iu4_scale_rule_legacy),
                    "fast_i4 convert");
         }
     }
@@ -325,6 +346,11 @@ void i4_convert(const I4Source& src, const I4Layer& out, hipStream_t stream, boo
 #endif
 }
 void set_prefill_iu4(int on) { g_iu4_override = on; }
+void set_prefill_i4_wide(bool on) {
+    if (on && !STRIX_MMX_IU4_LIB) throw std::invalid_argument("fast_i4 bits 8 needs the grouped IU4 core");
+    g_i4_wide = on;
+}
+bool prefill_i4_wide() { return g_i4_wide; }
 bool prefill_iu4() {
     if (g_iu4_override >= 0) return g_iu4_override != 0;
     const char* p = std::getenv("STRIX_MMX_PF_IU4");

@@ -6,6 +6,7 @@
 #include "core/iu4.hpp"
 #include "moe_core/device_plan_index.hpp"
 #include "minimax/engine/route_identity.hpp"
+#include <algorithm>
 #include <array>
 #include <bit>
 #include <cassert>
@@ -13,6 +14,7 @@
 #include <cstring>
 #include <iostream>
 #include <random>
+#include <vector>
 using namespace strix;
 // A binary16 RN-even round trip for finite small-shape test inputs.
 float half(float x) {
@@ -159,8 +161,48 @@ void chain_plans() {
         }
     }
 }
+// FAST policy i8 (wide operands): pack layout, requantiser and the precision the policy exists for.
+static void wide_pack() {
+    using namespace strix::core;
+    constexpr int K=128,N=32;
+    std::vector<int> seen(std::size_t(K)*N,0);
+    for(int k=0;k<K;++k) for(int n=0;n<N;++n) {
+        const std::size_t at=iu4_weight_byte(2*k,n,N);   // the byte of weight (k, n): nibble column 2k of a 2K-wide matrix
+        assert(at==((std::size_t(k/8)*(N/16)+std::size_t(n/16))*16U+std::size_t(n%16))*8U+std::size_t(k%8));
+        assert(at<seen.size() && seen[at]++==0);
+    }
+    assert(iu4_scale_rule_valid(iu4_scale_rule_wide8) && iu8_requant(1e9f,1.f)==127 && iu8_requant(-1e9f,1.f)==-127);
+    assert(iu8_requant(0.5f,1.f)==0 && iu8_requant(1.5f,1.f)==2 && iu8_requant(-2.5f,1.f)==-2);
+    // Group product float(sum) * (sa * sw) per K64 group, levels 7 (W4A4) and 127 (W8A8), on Gaussian operands.
+    std::mt19937 rng(7); std::normal_distribution<float> nd(0.f,1.f);
+    double err[2]={0,0},energy=0;
+    for(int trial=0;trial<64;++trial) {
+        float w[K],x[K]; for(int k=0;k<K;++k) { w[k]=nd(rng); x[k]=nd(rng); }
+        double exact=0; for(int k=0;k<K;++k) exact+=double(w[k])*x[k];
+        energy+=double(K);   // E[(w.x)^2] of unit Gaussians
+        for(int mode=0;mode<2;++mode) {
+            const float levels=mode ? 127.f : 7.f; float y=0;
+            for(int g=0;g<K/64;++g) {
+                float mw=0,mx=0; for(int j=0;j<64;++j) { mw=std::max(mw,std::fabs(w[g*64+j])); mx=std::max(mx,std::fabs(x[g*64+j])); }
+                const float sw=mw/levels,sx=mx/levels; int sum=0;
+                for(int j=0;j<64;++j) {
+                    const int qw=mode ? iu8_requant(w[g*64+j],1.f/sw) : iu4_requant(w[g*64+j],1.f/sw);
+                    const int qx=mode ? iu8_requant(x[g*64+j],1.f/sx) : iu4_requant(x[g*64+j],1.f/sx);
+                    sum+=qw*qx;
+                }
+                assert(std::abs(sum)<(1<<24));   // exact in FP32
+                y+=float(sum)*(sx*sw);
+            }
+            err[mode]+=(double(y)-exact)*(double(y)-exact);
+        }
+    }
+    const double r4=err[0]/energy,r8=err[1]/energy;   // noise energy / product energy
+    assert(r4>0.01 && r4<0.05 && r8<r4/150.0);
+    std::cout<<"wide pack: W4A4 noise "<<r4<<", W8A8 noise "<<r8<<" of the product energy"<<std::endl;
+}
 int main() {
     arithmetic();
+    wide_pack();
     chain_plans();
     for(unsigned R:{0U,1U,31U,32U,33U,255U,256U,257U,8192U})
         for(bool skew:{false,true}) { planner(R,128,4,skew);planner(R,288,8,skew); }

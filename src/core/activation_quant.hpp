@@ -53,6 +53,28 @@ __device__ __forceinline__ void iu4_quant128(const float (&v)[4], std::uint8_t* 
     iu4_quant128_store(v, begin, lane, IU4RowStore{q, s});
 }
 
+// Wide (A8) twin for the W8A8 policy: same wave max per K64 group, s = max / 127 (1 when 0), q = clamp(RNE(x / s),
+// -127, 127), one signed byte per channel, row-major (row_q holds K bytes, row_s the same two FP32 scales).
+__device__ __forceinline__ void iu8_quant128(const float (&v)[4], std::uint8_t* q, float* s, unsigned begin, unsigned lane) {
+#pragma unroll
+    for (unsigned g = 0; g < 2U; ++g) {
+        float amax = fmaxf(fabsf(v[2U * g]), fabsf(v[2U * g + 1U]));
+#pragma unroll
+        for (int delta = 16; delta > 0; delta /= 2) amax = fmaxf(amax, __shfl_xor(amax, delta));
+        const float scale = amax == 0.0F ? 1.0F : amax / 127.0F;
+#pragma unroll
+        for (unsigned jj = 0; jj < 2U; ++jj) {
+            const unsigned j = 2U * g + jj;
+            const int qv = max(-127, min(127, static_cast<int>(nearbyintf(v[j] / scale))));
+            // Four lanes share a dword: one store per quad.
+            const unsigned b = static_cast<unsigned>(qv) & 255U;
+            const unsigned p2 = b | (static_cast<unsigned>(__shfl_xor(static_cast<int>(b), 1)) << 8U);
+            const unsigned p4 = p2 | (static_cast<unsigned>(__shfl_xor(static_cast<int>(p2), 2)) << 16U);
+            if (!(lane & 3U)) *reinterpret_cast<std::uint32_t*>(q + begin + lane + 32U * j) = p4;
+        }
+        if (lane == 0U) s[begin / 64U + g] = scale;
+    }
+}
 // Two-plane ("A8") twin of iu4_quant128: plane 1 is exactly iu4_quant128 (q, s); plane 2 holds the remainder
 // r = v - q s (|r| <= s / 2) as q2 = clamp(RNE(r / s2), -7, 7) with s2 = s / 14, so v ~ q s + q2 s2 with a step of
 // s / 14 (about 7.7 bits). Two IU4 GEMMs over the two planes add up to the W4A8 product; plane 1 alone is W4A4.

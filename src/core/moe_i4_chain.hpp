@@ -33,6 +33,11 @@ inline bool gsave_enabled(bool def = true) {
     if (std::strcmp(p, "1") == 0) return true;
     throw std::invalid_argument("STRIX_MOE_I4_CHAIN_GSAVE must be 0 or 1");
 }
+// Wide operands (FAST policy W8A8): a binding with `static constexpr bool kWide = true` runs the same chain on signed
+// bytes: weight packs of the iu4_scale_rule_wide8 converter (K * N bytes), activation images of iu8_quant128 (K bytes
+// per row), same scale arrays. Every other binding keeps the nibble forms and their bits.
+template<class B,class=void> struct binding_wide : std::false_type {};
+template<class B> struct binding_wide<B,std::void_t<decltype(B::kWide)>> : std::bool_constant<B::kWide> {};
 struct Weights {
     const uint8_t* q[3];
     const _Float16* s[3];
@@ -73,8 +78,9 @@ struct ReferenceRow {
     uint8_t* aq=nullptr; float* as=nullptr; _Float16* fp16=nullptr;
     uint8_t* aq2=nullptr; float* as2=nullptr;   // optional remainder plane (iu4_quant128_planes, W4A8 as two IU4 GEMMs)
 };
-__device__ __forceinline__ void reference_store(const ReferenceRow& r,const float (&v)[4]) {
-    if(r.aq && r.aq2) iu4_quant128_planes(v,r.aq+size_t(r.pair)*(r.width/2),r.as+size_t(r.pair)*(r.width/64),
+__device__ __forceinline__ void reference_store(const ReferenceRow& r,const float (&v)[4],bool wide=false) {
+    if(wide && r.aq) iu8_quant128(v,r.aq+size_t(r.pair)*r.width,r.as+size_t(r.pair)*(r.width/64),r.col,threadIdx.x&31U);
+    else if(r.aq && r.aq2) iu4_quant128_planes(v,r.aq+size_t(r.pair)*(r.width/2),r.as+size_t(r.pair)*(r.width/64),
         r.aq2+size_t(r.pair)*(r.width/2),r.as2+size_t(r.pair)*(r.width/64),r.col,threadIdx.x&31U);
     else if(r.aq) iu4_quant128(v,r.aq+size_t(r.pair)*(r.width/2),r.as+size_t(r.pair)*(r.width/64),r.col,threadIdx.x&31U);
     else {
@@ -106,7 +112,7 @@ template<class Schedule> __global__ __launch_bounds__(256) void reference_input_
                 ReferenceRow r{};
                 s.input(rows,i,m,r);
                 float v[4]; InputPolicy<typename Schedule::Binding>{s.b}.load(r.expert,s.source_pair(r.pair),r.m,r.col,v,cached);
-                reference_store(r,v);
+                reference_store(r,v,binding_wide<typename Schedule::Binding>::value);
             }
         }
     } else {
@@ -120,7 +126,7 @@ template<class Schedule> __global__ __launch_bounds__(256) void reference_input_
     }
     for(unsigned i=0;s.input(i,r);++i) {
         float v[4]; InputPolicy<typename Schedule::Binding>{s.b}.load(r.expert,s.source_pair(r.pair),r.m,r.col,v,Schedule::kCachedInput ? cached : nullptr);
-        reference_store(r,v);
+        reference_store(r,v,binding_wide<typename Schedule::Binding>::value);
     }
     }
 }
@@ -131,7 +137,7 @@ template<class Schedule> __global__ __launch_bounds__(256) void reference_activa
         #pragma unroll
         for(unsigned j=0;j<4;++j) { const unsigned c=r.col+(threadIdx.x&31U)+32*j;g[j]=r.gu[size_t(r.pair)*2*r.width+c];u[j]=r.gu[(size_t(r.pair)*2+1)*r.width+c]; }
         EpiloguePolicy<typename Schedule::Binding>{s.b}.activation(r.expert,r.col,g,u,v);
-        reference_store(r,v);
+        reference_store(r,v,binding_wide<typename Schedule::Binding>::value);
     }
 }
 template<class Binding> __global__ __launch_bounds__(256) void reference_combine_kernel(Binding b,const float* dn,unsigned rows,unsigned topk) {
@@ -188,6 +194,7 @@ template<class Binding,bool Pair,bool GSave=false,bool Fp16=false> struct Chain 
     static constexpr int kPasses = Pair ? 2 : 1;
     static constexpr uint32_t kPassRow = Pair ? 1 : 0;
     static constexpr bool kSaveRegs = Pair && !GSave;
+    static constexpr bool kWide = binding_wide<Binding>::value;
     Binding b; Weights w;
     uint8_t* aq; float* as;
     float* gsave = nullptr;
@@ -218,7 +225,8 @@ template<class Binding,bool Pair,bool GSave=false,bool Fp16=false> struct Chain 
                     _Float16* row=at16+size_t(pair)*Binding::I+col+(threadIdx.x&31U);
                     #pragma unroll
                     for (unsigned j=0;j<4;++j) row[32*j]=_Float16(a[j]);
-                } else iu4_quant128(a,aq+size_t(pair)*(Binding::I/2),as+size_t(pair)*(Binding::I/64),col,threadIdx.x&31U);
+                } else if constexpr (kWide) iu8_quant128(a,aq+size_t(pair)*Binding::I,as+size_t(pair)*(Binding::I/64),col,threadIdx.x&31U);
+                else iu4_quant128(a,aq+size_t(pair)*(Binding::I/2),as+size_t(pair)*(Binding::I/64),col,threadIdx.x&31U);
             }
         } else EpiloguePolicy<Binding>{b}.contribution(pair,col,v);
     }
@@ -234,8 +242,10 @@ template<int Plan,bool Pair,bool GSave,class Binding,bool Fp16=false> hipError_t
     // Paired: A is the pre-quantised gate/up image gq/gs, row 2*pair+pass (pass offset via kPassRow).
     // Down: A is the down image aq/as written by the paired epilogue, row = pair.
     gp.a_mul=Pair ? 2U : 1U;
-    const unsigned K=Pair ? Binding::H : Binding::I, N=Pair ? Binding::I : Binding::H;
-    const auto kernel=wmma_tiled::tiled_core<TiledContract<PackedIU4>,c.bm,c.bn,c.wm,c.wn,true,0,false,false,64,true,wmma_tiled::NoAdapter,C>;
+    // Wide: the core sees a 2K-wide nibble matrix with 128-column scale groups (tiled_core.hpp, chain_wide).
+    constexpr bool W=binding_wide<Binding>::value;
+    const unsigned K=(Pair ? Binding::H : Binding::I)*(W ? 2U : 1U), N=Pair ? Binding::I : Binding::H;
+    const auto kernel=wmma_tiled::tiled_core<TiledContract<PackedIU4>,c.bm,c.bn,c.wm,c.wn,true,0,false,false,W ? 128 : 64,true,wmma_tiled::NoAdapter,C>;
     // Reject spills/insufficient residency before launching. No token/route readback.
     hipFuncAttributes attr{}; auto status=hipFuncGetAttributes(&attr,reinterpret_cast<const void*>(kernel));
     if (status!=hipSuccess) return status;

@@ -128,6 +128,13 @@ completion; the live result stays INT4. `STRIX_MMX_FAST_I4_A8=gate_up|down|all` 
 the exact operator and is not part of the policy. The layer-list grammar, the shadow reducer and the two-plane
 quantiser are shared (`src/core/layer_set.hpp`, `src/core/i4_shadow.hpp`, `src/core/activation_quant.hpp`).
 
+`STRIX_MMX_FAST_I4_BITS=8` (FAST policy i8, opt-in) runs the same chain on signed bytes: weights
+`s = max|w| / 127` per output column and K64 group, activations `max / 127` per row and K64 group. A byte row is
+staged as a 2K-wide nibble row, so the tuned IU4 staging is reused unchanged and the K loop issues one IU8 WMMA
+where IU4 issues two IU4 ones over the same bytes; pack and slot bytes double. It needs scope `all` on the chain.
+The 4-bit forms carry about 1.2 % noise energy per operand (uniform over rows, see the quality table); 8 bits
+remove it by more than two orders of magnitude.
+
 Serial conversion on the engine stream is the default. `STRIX_MMX_FAST_I4_PREFETCH=1` converts
 only the next layer within the current range on a side stream, ordered by slot-free and ready
 events, without adding a host synchronization. Retain it only if 8K TTFT improves by at least

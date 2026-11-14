@@ -792,6 +792,7 @@ struct Engine::Impl {
     float* i4_shadow_sums = nullptr;     // two pairs of {squared error, exact energy}
     fast_i4::Scope i4_scope = fast_i4::Scope::all;
     strix::core::LayerSet i4_exl3_layers;  // STRIX_MMX_FAST_I4_EXL3_LAYERS: MoE layers that keep the EXL3 operator
+    unsigned i4_bits = 4;                  // STRIX_MMX_FAST_I4_BITS: operand bits of the INT4 chain (4 = W4A4, 8 = W8A8)
     unsigned i4_a8 = 0;                    // STRIX_MMX_FAST_I4_A8: bit 0 gate/up input, bit 1 down input as two A4 planes
     strix::core::LayerSet i4_a8_layers;    // STRIX_MMX_FAST_I4_A8_LAYERS: the layers it applies to (unset: all MoE layers)
     bool pf_i4_chain = mmoe::prefill_i4_chain(); // per prompt: prefill_begin sets it from the prompt rows
@@ -991,6 +992,15 @@ struct Engine::Impl {
                 i4_a8_layers = strix::core::parse_layer_set(al == nullptr || al[0] == 0 ? "!" : al, kFirstMoe, kLayers,
                                                             "STRIX_MMX_FAST_I4_A8_LAYERS");
             }
+            {   // FAST policy i8: W8A8 on the same chain (signed-byte packs and activation images, 2x pack bytes).
+                const char* bits = std::getenv("STRIX_MMX_FAST_I4_BITS");
+                const std::string_view s = bits == nullptr ? "" : bits;
+                if (!s.empty() && s != "4" && s != "8") throw std::invalid_argument("STRIX_MMX_FAST_I4_BITS must be 4 or 8");
+                i4_bits = s == "8" ? 8U : 4U;
+                if (i4_bits == 8U && (i4_scope != fast_i4::Scope::all || i4_a8 != 0U || !mmoe::prefill_i4_chain(0)))
+                    throw std::invalid_argument("STRIX_MMX_FAST_I4_BITS=8 needs scope all on the INT4 chain, without the A8 planes");
+                mmoe::set_prefill_i4_wide(i4_bits == 8U);
+            }
             i4_min_rows = fast_i4::min_rows(std::getenv("STRIX_MMX_FAST_I4_MIN_ROWS"));
             jit_prefetch = env_flag("STRIX_MMX_FAST_I4_PREFETCH", false);
             jit_stats = env_flag("STRIX_MMX_FAST_I4_STATS", false);
@@ -1175,11 +1185,11 @@ struct Engine::Impl {
         if (jit_prefetch) hip_ok(hipStreamCreateWithFlags(&jit_stream, hipStreamNonBlocking), "fast_i4 prefetch stream");
         std::printf("mm rank %u: fast_i4 (identity minimax-fast-i4, lossy): %zu reusable IU4 layer slots, "
                     "%.3f GiB (%zu bytes) including slot tables; source tables %.3f MiB; prefill workspace %.3f GiB; "
-                    "scope %s, prefetch %u, EXL3 layers %u, min rows %zu; context %zu x %zu slots unchanged; decode EXL3\n", opt.rank,
+                    "scope %s, bits %u, prefetch %u, EXL3 layers %u, min rows %zu; context %zu x %zu slots unchanged; decode EXL3\n", opt.rank,
                     jit.size(), static_cast<double>(jit.size() * pk) / 1073741824.0, jit.size() * pk,
                     static_cast<double>((kLayers - kFirstMoe) * mmoe::i4_source_bytes()) / 1048576.0,
                     static_cast<double>(pf_ws_bytes) / 1073741824.0,
-                    i4_scope == fast_i4::Scope::all ? "all" : "gate_up", jit_prefetch ? 1U : 0U, i4_exl3_layers.count(), i4_min_rows,
+                    i4_scope == fast_i4::Scope::all ? "all" : "gate_up", i4_bits, jit_prefetch ? 1U : 0U, i4_exl3_layers.count(), i4_min_rows,
                     static_cast<std::size_t>(opt.capacity), static_cast<std::size_t>(opt.slots));
         std::fflush(stdout);
     }
