@@ -2753,16 +2753,14 @@ struct HipPleKnownWindow::Impl {
             };
             const auto tk = tiled(key), tv = tiled(value);
             if (q8_rows::tiled::supported(tk, rows) && q8_rows::tiled::supported(tv, rows)) {
-                static const bool witness = [] { std::fprintf(stderr, "qpf2k ple rows f16 tiled active (FAST ple_rows_f16)
-"); return true; }();
+                static const bool witness = [] { std::fprintf(stderr, "qpf2k ple rows f16 tiled active (FAST ple_rows_f16)\n"); return true; }();
                 (void)witness;
                 q8_rows::tiled::launch(tk, rows, hip_execution_stream());
                 q8_rows::tiled::launch(tv, rows, hip_execution_stream());
                 check_hip(hipGetLastError(), "prefill PLE tiled f16 projection launch");
                 return true;
             }
-            static const bool declined = [] { std::fprintf(stderr, "qpf2k ple rows f16 declined: shape unsupported by q8_rows::tiled
-"); return true; }();
+            static const bool declined = [] { std::fprintf(stderr, "qpf2k ple rows f16 declined: shape unsupported by q8_rows::tiled\n"); return true; }();
             (void)declined;
         }
         if (!ple_batch_admits(key, groups) || !ple_batch_admits(value, groups)) return false;
