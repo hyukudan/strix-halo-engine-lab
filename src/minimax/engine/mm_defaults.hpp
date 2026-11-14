@@ -95,6 +95,21 @@ Cli parse_cli(const std::string& app, const std::vector<std::string>& args);  //
 // Serve configuration validates scheduler and DSpark policy, independently of process environment export.
 std::string effective_config(const Cli& cli, const Lookup& env);
 inline constexpr const char* kPrintFlag = "--print-effective-config";
+// Defaults of both entry points that are not items (transport timeouts, prefill table ring): ONE table.
+// `serve == rank` unless serving needs another value, and then `serving_reason` says why; effective_config() prints
+// every row (host.NAME=...) and the reason, so the server/CLI parity gate sees the same list on both sides.
+struct HostDefault {
+    const char* name;
+    const char* rank;            // nullptr = left unset
+    const char* serve;           // nullptr = left unset
+    const char* serving_reason;  // nullptr when rank == serve
+    bool optimization;           // true: not applied under STRIX_MM_BASELINE=1
+};
+std::span<const HostDefault> host_defaults();
+// The value `app` ends with for one row: the explicit environment value, else the row default, else nullptr.
+const char* host_default_value(const HostDefault& row, const std::string& app, const Lookup& env);
+// setenv-if-unset of every row for `app` (rank | serve). An explicit value always wins.
+void apply_host_defaults(const std::string& app);
 // App entry: when argv holds kPrintFlag, apply() and print effective_config() of the invocation (no model, no GPU)
 // and return true (the app exits 0); otherwise apply() and return false. Serve policy is validated
 // on both paths before any transport/device/model work; rank invocations do not validate serve policy.
