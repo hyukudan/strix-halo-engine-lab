@@ -117,9 +117,12 @@ struct Environment {
 
 // Removes `--devices FILE` and `--device-id ID` from an argument vector (in place) and returns them, so every binary
 // accepts the two flags without touching its own parser. Throws std::invalid_argument for a flag without a value.
+// `inspect_only` reports a kept `--deploy-check`: the deployment inspection prints its plan from measured facts and
+// exits before any device work, so a main does not bind (or open) a device for it.
 struct CommandLine {
     std::string devices_path;
     std::string select;
+    bool inspect_only = false;
 };
 [[nodiscard]] CommandLine take_command_line(int& argc, char** argv);
 

@@ -59,7 +59,8 @@ enum class HostWait { runtime, spin, yield, blocking };
 }
 
 // Applies the resolved policy to the calling thread's current device (call after bind_hip) and prints one receipt
-// line (null = silent). Returns the policy in force. Without the HIP runtime it only resolves.
+// line (null = silent). Returns the policy in force. Without the HIP runtime, or after bind_hip_main saw
+// --deploy-check (no device bound), it only resolves.
 HostWait set_host_wait(HostWait engine_choice, std::FILE* receipt = stderr);
 
 } // namespace strix::device

@@ -14,6 +14,7 @@ namespace {
 struct Process {
     std::mutex mutex;
     std::optional<Bound> bound;
+    bool inspection = false;  // bind_hip_main saw --deploy-check: no device call in this process
 };
 Process& process() {
     static Process state;
@@ -49,6 +50,11 @@ const Bound& bind_hip(Request request, const std::string& devices_path, std::FIL
 void bind_hip_main(int& argc, char** argv, std::FILE* receipt) {
     try {
         const auto cli = take_command_line(argc, argv);
+        if (cli.inspect_only) {  // --deploy-check: inspection without a device (docs/deployment.md)
+            { const std::lock_guard<std::mutex> lock(process().mutex); process().inspection = true; }
+            if (receipt) { std::fprintf(receipt, "device gate: not bound (--deploy-check opens no device)\n"); std::fflush(receipt); }
+            return;
+        }
         Request request;
         request.select = cli.select;
         (void)bind_hip(std::move(request), cli.devices_path, receipt);
@@ -62,6 +68,7 @@ void bind_hip_main(int& argc, char** argv, std::FILE* receipt) {
 HostWait set_host_wait(HostWait engine_choice, std::FILE* receipt) {
     const char* text = std::getenv("STRIX_HOST_WAIT");
     const auto policy = resolve_host_wait(engine_choice, text);
+    if (const std::lock_guard<std::mutex> lock(process().mutex); process().inspection) return policy;  // no device
     if (policy != HostWait::runtime) {
         const unsigned flag = policy == HostWait::spin ? hipDeviceScheduleSpin : policy == HostWait::yield ? hipDeviceScheduleYield : hipDeviceScheduleBlockingSync;
         if (const auto status = hipSetDeviceFlags(flag); status != hipSuccess) fail(std::string("host wait: hipSetDeviceFlags failed: ") + hipGetErrorString(status));
