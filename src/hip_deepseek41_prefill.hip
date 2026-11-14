@@ -1737,14 +1737,14 @@ PrefillResult DevicePrefill::run_from(std::span<const std::uint32_t> tokens, std
         g.draft_rows = m.options.draft_rows;
         const auto plan = bounded != 0U && !bounded_oracle ? ds41::plan_bounded_replay(g, 0U, T, bounded) : ds41::plan_suffix_replay(g, 0U, T);
         const auto down = [&](std::uint64_t v) { return static_cast<std::uint32_t>(v / W * W); };
-        const std::uint32_t cut = bounded != 0U && T > bounded ? down(T - bounded) : 0U;  // the decoder layers' key floor
+        const std::uint32_t key_cut = bounded != 0U && T > bounded ? down(T - bounded) : 0U;  // the decoder layers' key floor
         for (const auto& pl : plan.layers) {
             if (pl.layer >= m.options.layers) continue;
             auto& r = rows[pl.layer];
             r.o0 = down(pl.out_begin);
             r.k0 = down(pl.kv_begin);
             r.x0 = m.roles[pl.layer].owns_kv ? 0U : r.k0;
-            if (pl.layer >= first_decoder) r.kf = cut;  // bounded: == k0; oracle: the exact cone's rows, the same floor
+            if (pl.layer >= first_decoder) r.kf = key_cut;  // bounded: == k0; oracle: the exact cone's rows, the same floor
         }
         // in-run snapshot points: also the cone of the state at p (one contiguous suffix per layer: the union)
         for (const auto p : m.snap_points) {
@@ -2983,7 +2983,7 @@ PrefillResult DevicePrefill::run_from(std::span<const std::uint32_t> tokens, std
                         }
                         v.partial = ln.attn_partial.p;
                         v.tickets = ln.attn_tickets.p;
-                        v.key_floor = R0.kf != 0U ? P0 + R0.kf : 0U;  // bounded decoder replay: no window key below the cut
+                        v.key_floor = R0.kf != 0U ? static_cast<std::uint32_t>(P0 + R0.kf) : 0U;  // bounded decoder replay: no window key below the cut
                         v.o = m.o.p + std::size_t{w0 - r0} * QL;
                         if (o_a8_fused) {
                             v.codes = m.ocodes.p + std::size_t{w0 - r0} * QL;
