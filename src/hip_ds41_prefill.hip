@@ -3,6 +3,7 @@
 #include "strix/hip_check.hpp"
 #pragma clang fp contract(off)
 #include "strix/ds41_fast_profile.hpp"
+#include "strix/ds41_prefill_precision.hpp"
 #include "strix/hip_ds41_prefill.hpp"
 
 #include <hip/hip_fp16.h>
@@ -699,7 +700,8 @@ static bool fast_moe_order() {
 }
 bool fast_moe() {
     static const bool env = fast_profile::moe_on();  // the lever or STRIX_DS41_FAST_PREFILL
-    return fast_moe_mode < 0 ? env : fast_moe_mode != 0;
+    // a running DevicePrefill's own precision first (strix/ds41_prefill_precision.hpp), else the override or env
+    return effective_fast(&PrefillPrecision::fast_moe, fast_moe_mode, env);
 }
 int fast_i4_mode = -1;
 void set_fast_i4(int mode) { fast_i4_mode = mode; }

@@ -10,8 +10,9 @@
 using PrefillOptions = strix::deepseek41::PrefillOptions;
 void require(bool ok, const char* message) { if (!ok) throw std::runtime_error(message); }
 namespace ds41 {
-void set_fast_dense(int) {}
-void set_fast_moe(int) {}
+int process_wide_writes = 0;  // DAYAUDIT 2: a precision change of one object must not write the process-wide modes
+void set_fast_dense(int) { ++process_wide_writes; }
+void set_fast_moe(int) { ++process_wide_writes; }
 }
 namespace attn {
 constexpr unsigned kWindow = 128, kHeadDim = 512;
@@ -136,6 +137,11 @@ void precision_test() {
     pre.set_precision_for_new_sequence(PrefillOptions{});
     pre.set_precision_for_new_sequence(p);
     require(allocations == allocated && m.flash_attn_at(0), "mirror reuse between arms");
+    PrefillOptions fast = p;
+    fast.fast_dense = fast.fast_moe = true;
+    pre.set_precision_for_new_sequence(fast);
+    require(ds41::process_wide_writes == 0 && m.options.fast_dense && m.options.fast_moe,
+            "precision is the object's own (no process-wide FAST dense / MoE write)");
     DevicePrefill failed;
     fail_after = allocations + 1; // second allocation fails: do not commit either buffer or precision
     bool threw = false;

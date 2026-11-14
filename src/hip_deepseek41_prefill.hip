@@ -4,6 +4,7 @@
 #include "strix/ds41_prefill_tuning.hpp"
 #include "strix/hip_ds41_dense_fp16.hpp"
 #include "strix/deepseek41_prefill.hpp"
+#include "strix/ds41_prefill_precision.hpp"
 
 #include "strix/deepseek41_attention_host.hpp"
 #include "strix/deepseek41_plan.hpp"
@@ -1556,8 +1557,8 @@ void DevicePrefill::set_precision_for_new_sequence(const PrefillOptions& p) {
     o.fast_attention_flash = p.fast_attention_flash;
     o.fast_moe = p.fast_moe;
     o.fast_dense = p.fast_dense;
-    ds41::set_fast_dense(p.fast_dense ? 1 : 0);
-    ds41::set_fast_moe(p.fast_moe ? 1 : 0);   // process-wide switch of the batch MoE dispatch (one sequence at a time here)
+    // no process-wide switch: run_from installs these options as the precision of its own execution (another
+    // DevicePrefill of the process keeps its own; strix/ds41_prefill_precision.hpp)
 }
 
 PrefillResult DevicePrefill::run(std::span<const std::uint32_t> tokens) {
@@ -1577,6 +1578,8 @@ std::uint32_t DevicePrefill::positions() const noexcept { return impl_->rows_don
 
 PrefillResult DevicePrefill::run_from(std::span<const std::uint32_t> tokens, std::uint32_t start) {
     auto& m = *impl_;
+    // this object's FAST dense / MoE precision for every dispatch of the run (thread of the run: caller or task worker)
+    const ds41::PrefillPrecisionScope precision_scope(ds41::PrefillPrecision{m.options.fast_dense, m.options.fast_moe});
     // provided embedding rows of this run (none: text, nothing below changes)
     const strix::session::EmbedSplice embeds = std::exchange(m.embed_run, {});
     const ds41::RnWideOff own_kernels;  // the prefill keeps its own Q8_0 x A8 kernels (P12: the multi-row form is -1 %)

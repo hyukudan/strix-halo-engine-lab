@@ -29,6 +29,10 @@ methods = function("bool flash_attn_at(") + "\n"
 if "void prepare_flash_mirrors()" in source:
     methods += function("void prepare_flash_mirrors()")
 (out / "methods.inc").write_text(methods)
+# DAYAUDIT 2: every run installs its own FAST dense / MoE precision before any dispatch
+run_from = function("PrefillResult DevicePrefill::run_from(")
+head = run_from[:run_from.index("const strix::session::EmbedSplice embeds")]
+assert "PrefillPrecisionScope" in head and "m.options.fast_dense, m.options.fast_moe" in head, "run_from must install its own precision first"
 (out / "setter.inc").write_text(
     function("void DevicePrefill::set_precision_for_new_sequence(bool") + "\n" +
     function("void DevicePrefill::set_precision_for_new_sequence(const PrefillOptions&"))
@@ -48,3 +52,6 @@ source = read("src/core/f16_dense_q8a8.hpp")
 (out / "parts.inc").write_text(function("inline void enqueue_parts("))
 source = read("src/hip_ds41_layer.hip")
 (out / "dense.inc").write_text(function("static bool enqueue_fast_dense("))
+(out / "fast_dense_on.inc").write_text(function("static bool fast_dense_on()"))
+source = read("src/hip_ds41_prefill.hip")
+(out / "fast_moe.inc").write_text(function("bool fast_moe() {"))
