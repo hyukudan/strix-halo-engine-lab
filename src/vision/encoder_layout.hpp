@@ -10,6 +10,13 @@
 
 namespace strix::vision::layout {
 
+struct ProjectorGeometry {
+    unsigned rows = 0, mh = 0, mw = 0, tokens = 0, in = 0;
+};
+ProjectorGeometry merge_geometry(unsigned grid_h, unsigned grid_w, unsigned ratio);
+ProjectorGeometry projector_geometry(const EncoderOutput&, unsigned grid_h, unsigned grid_w, const MergeProjector&,
+                                     const float* rows, bool resident = false);
+
 inline constexpr unsigned kGemmIn = 128;  // f16_dense_tall: in % 128 == 0
 inline constexpr unsigned kGemmOut = 16;  // 16 outputs per column tile
 inline constexpr std::size_t kAlign = 256;

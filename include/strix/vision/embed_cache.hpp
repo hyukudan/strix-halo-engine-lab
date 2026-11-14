@@ -61,6 +61,8 @@ CachedEncode encode_cached(VisionAdapter&, EncoderBackend&, const EncoderWeights
 // Start-time preparation of a loaded backend, so the first image pays only its own encode: the adapter's projector
 // linears are built now (prepare_linear), the workspace is sized for the largest admitted input (reserve) and, with
 // warm_up, one grey image goes through adapter.patches -> encode -> project (kernel first use; nothing is cached).
+// This reserves tower workspace only. Pinned staging and projector scratch grow with demand; other geometries
+// can still clear the workspace. Warm-up does not establish allocation-free or first-use-free largest requests.
 struct PrepareReport {
     std::size_t linears = 0;
     unsigned reserved_rows = 0, warmup_rows = 0;

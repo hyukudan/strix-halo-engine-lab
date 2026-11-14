@@ -351,6 +351,18 @@ inline bool applied(Status status) {
     return status == Status::set || status == Status::unqualified || status == Status::provisional;
 }
 
+// Variables an adapter exports after resolution: every applied profile column, plus every row whose value the
+// resolver canonicalized (`canonical`: e.g. a FAST bundle's expanded members, strix/fast_profile.hpp), so the
+// execution readers see the same values as the receipt, the rank agreement and the cache identity.
+template <class Keys>
+inline std::vector<std::pair<std::string, std::string>> exports(const Resolution& resolution, const Keys& canonical) {
+    std::vector<std::pair<std::string, std::string>> out;
+    for (const auto& e : resolution.entries)
+        if (!e.lever->env.empty() && (applied(e.status) || canonical.contains(std::string(e.lever->env))))
+            out.emplace_back(std::string(e.lever->env), e.value);
+    return out;
+}
+
 using Export = std::function<bool(const char*, const char*)>;
 inline bool export_environment(const char* key, const char* value) {
 #ifdef _WIN32

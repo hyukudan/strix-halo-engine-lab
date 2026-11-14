@@ -1123,6 +1123,13 @@ if(BUILD_TESTING)
     strix_target_warnings(strix-prefix-lookup-ticket-tests)
     add_test(NAME strix-prefix-lookup-ticket-tests COMMAND strix-prefix-lookup-ticket-tests)
     set_tests_properties(strix-prefix-lookup-ticket-tests PROPERTIES LABELS "cpu" TIMEOUT 120)
+    # Queue protection of prefix states, the governed automatic budget rule and the pending cache rows.
+    add_executable(strix-prefix-queue-protection-tests tests/prefix_queue_protection_tests.cpp)
+    target_include_directories(strix-prefix-queue-protection-tests PRIVATE apps)
+    target_link_libraries(strix-prefix-queue-protection-tests PRIVATE strix_core strix_serve)
+    strix_target_warnings(strix-prefix-queue-protection-tests)
+    add_test(NAME strix-prefix-queue-protection-tests COMMAND strix-prefix-queue-protection-tests)
+    set_tests_properties(strix-prefix-queue-protection-tests PROPERTIES LABELS "cpu" TIMEOUT 120)
     add_test(NAME strix-prefill-option-cache-write COMMAND strix-prefix-state-cache-tests
         --write-option-checkpoint "${CMAKE_CURRENT_BINARY_DIR}/prefill-option-cache")
     add_test(NAME strix-prefill-option-cache-read COMMAND strix-prefix-state-cache-tests
