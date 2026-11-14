@@ -1200,7 +1200,6 @@ inline void validate_release_manifest(const Options& o) {
 // Resolve compatibility before route-dependent validation. A cap never enables missing prerequisites.
 inline std::string http_batch_incompatibility(const Options& o) {
     if (o.rtx_state_import) return "single-only state import";
-    if (!o.mtp.copy_wide_rows.empty()) return "single-only copy-wide";
     if (!o.mtp.window_prefix || !o.mtp.draft_chain ||
         o.mtp.window_rows_set != std::vector<std::uint32_t>{2U, 4U, 8U})
         return "missing prefix windows, draft chain or rows 2,4,8";
@@ -1551,6 +1550,14 @@ inline void validate_resolved_gdn_islands(const Options& options) {
         throw std::invalid_argument("GDN islands require resolved D1 and virtual/prefetch input with virtual output");
 }
 
+// The single resolver of the wide copy cycle (--mtp-copy-wide-rows). The CLI runs it for its one request; the
+// --http-batch server runs it only while exactly one request is live, and STRIX_MTP_SERVE_WIDE=0 (serve_switch=false)
+// forces it off there. Returns the configured sizes (descending) or empty. Both routes call this, never the raw option.
+[[nodiscard]] inline std::vector<std::uint32_t> mtp_wide_copy_rows_effective(const Options& o,bool serve_switch=true) {
+    if(!o.mtp.enabled || !o.mtp.ngram_copy_edit || o.mtp.copy_wide_rows.empty()) return {};
+    if(o.http_serve && !serve_switch) return {};
+    return o.mtp.copy_wide_rows;
+}
 inline void validate_mtp_cli(const Options& o,bool resolved=false) {
     const auto& m=o.mtp;
     // HTTP can supply its tiled owner after host memory admission. Validate the
@@ -1617,9 +1624,12 @@ inline void validate_mtp_cli(const Options& o,bool resolved=false) {
     if(m.ngram_draft && (!m.draft_chain || !m.window_rows || !m.window_prefix || m.sample_options || m.metadata_only || !m.cohort.empty()))
         throw std::invalid_argument("--mtp-ngram-draft requires --mtp-draft-chain, prefix target windows, greedy selection and one request");
     if(!m.copy_wide_rows.empty()) {
-        if(!m.ngram_copy_edit || !tiled || o.http_batch || m.metadata_only || !m.golden_dump.empty())
+        if(!m.ngram_copy_edit || !tiled || m.metadata_only || !m.golden_dump.empty())
             throw std::invalid_argument("--mtp-copy-wide-rows requires --mtp-ngram-draft=copy or =wide on the tiled MTP prompt, "
                 "one request and no golden dump");
+        // The HTTP route resolves its tiled prefill (and with it the tail sizes) after admission: the resolved
+        // validation (validate_resolved_mtp_cli) checks the sizes then.
+        if(resolved || !http_prefill_pending(o))
         for(const auto wide:m.copy_wide_rows)
             if(std::find(o.known_prefix_tail_rows.begin(),o.known_prefix_tail_rows.end(),wide)==o.known_prefix_tail_rows.end())
                 throw std::invalid_argument("--mtp-copy-wide-rows requires a tiled tail block of each listed size "
