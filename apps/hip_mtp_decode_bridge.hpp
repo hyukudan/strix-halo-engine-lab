@@ -2920,12 +2920,12 @@ inline void run_mtp_decode_bridge(const Options& options,const ModelContract& mo
                         // Startup check of the owners the wide cycle needs (same lookup the cycle builds from), so a
                         // configuration that cannot run it fails here and not on a request.
                         // split prefill profile: the decode-profile wide owners (tiled.wide), else the all-rows tail owners
-                        const bool split=static_cast<bool>(parents->tiled.prefill_execution_identity);
-                        const auto& owners=split?parents->tiled.wide:parents->tiled.tails;
+                        const bool split_profile=static_cast<bool>(parents->tiled.prefill_execution_identity);
+                        const auto& owners=split_profile?parents->tiled.wide:parents->tiled.tails;
                         for(const auto rows:runner.wide_rows) {
                             const auto t=std::find_if(owners.begin(),owners.end(),[&](const auto& x){return x.rows==rows && x.owner;});
-                            if(t==owners.end() || (!split && t->owner->output_policy()!=KnownWindowOutputPolicy::all_rows))
-                                throw std::invalid_argument(split ? "--mtp-copy-wide-rows: no decode-profile wide owner of a listed size on the server"
+                            if(t==owners.end() || (!split_profile && t->owner->output_policy()!=KnownWindowOutputPolicy::all_rows))
+                                throw std::invalid_argument(split_profile ? "--mtp-copy-wide-rows: no decode-profile wide owner of a listed size on the server"
                                                                   : "--mtp-copy-wide-rows requires an all-rows tiled tail block of each listed size on the server");
                         }
                         runner.enable_wide=[&enable_ngram](HipMtpGreedyRuntime& greedy,std::span<const std::uint32_t> prompt){enable_ngram(greedy,prompt);};
