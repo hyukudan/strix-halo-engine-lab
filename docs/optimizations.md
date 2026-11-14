@@ -3474,6 +3474,18 @@ Interleave up to 8 forward chunks (`--max-rows` 4096 each) of one prompt as one 
 - **Off switch:** STRIX_MM_PF_GROUP=2 (previous default)
 - **Measured gain:** MiniMax M3.1 FAST_I4 32K TTFT, TP2 USB4, ABAB both orders: group 4 vs 2: 55.0 / 54.5 s -> 52.2 / 51.7 s (-5.1 %); group 8 vs 2: 55.5 / 55.2 s -> 52.5 / 51.4 s (-6.1 %, not distinguishable from 4, hence the default 4); 8K unchanged by construction; decode unchanged (46.1-46.5 ms/token at 32K ctx in all arms).
 
+<a id="mm-pf-moe-split"></a>
+### Prefill group-wide EXL3 MoE call, split form
+
+**Engine:** `minimax`. **Control:** `STRIX_MM_PF_MOE_SPLIT` (0 = off, 1 = on). **Default:** off (shared policy `include/strix/pair/prefill_group.hpp`, `moe_split`).
+
+Run gate/up and its finish once for all chunks of a group-wide MoE call, then the down product and its combine per chunk on the plan of that chunk, so the partial of a chunk leaves while the down of the next chunk computes. With the switch on, a unit of 2 to 7 chunks at the automatic width runs as one split call.
+
+- **Preconditions:** Those of the group-wide call, plus the per-chunk device workspace.
+- **Exactness evidence:** 8K pair runs: state, final-rows and result hashes equal to one call per chunk, ranks agree, in every run.
+- **Off switch:** STRIX_MM_PF_MOE_SPLIT=0
+- **Measured gain:** None at 8K: slower than one call per chunk (numbers in the pull request). The wait on the wire is 1.50 s against 2.40 s for the unsplit group-wide call and 0.07 s for one call per chunk; the attention exchange of the last chunk is not covered by compute. Not measured at 32K.
+
 <a id="mm-pf-moe-group"></a>
 ### Prefill group-wide EXL3 MoE call
 

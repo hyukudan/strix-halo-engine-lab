@@ -65,4 +65,24 @@ inline unsigned moe_width(unsigned requested, unsigned chunks) {
     return std::max(1U, w);
 }
 
+// Split form of a group-wide MoE call: gate/up (two thirds of the weights of an expert, no exchange behind it) runs once
+// for the sub-group, the down product and its combine run per chunk, so the partial of each chunk leaves while the down
+// of the next chunk computes. Same bits. Measured (MiniMax M3.1 exact, TP2 USB4, 8K = 2 chunks, warm, traced): the wait
+// on the wire falls from 2.40 s (one call for both chunks) to 1.50 s, against 0.07 s with one call per chunk: gate/up
+// needs the rows of every chunk, so the attention exchange of the last chunk has no compute to hide behind
+// (about 22 ms per layer), and that costs more than the shared weight passes save. So it is opt-in:
+// 0 (default) = never, 1 = every group-wide call, and a unit below kMoeAutoChunks chunks at the automatic width then
+// runs as one split call.
+inline constexpr unsigned kMoeSplitOff = 0;
+inline unsigned moe_split_from_env(const char* value, const char* name) {
+    if (value == nullptr || *value == 0 || std::string(value) == "0") return kMoeSplitOff;
+    if (std::string(value) == "1") return 1;
+    throw std::invalid_argument(std::string(name) + " must be 0 or 1");
+}
+inline bool moe_split(unsigned mode) { return mode == 1; }
+inline unsigned moe_width(unsigned requested, unsigned chunks, unsigned split_mode) {
+    if (moe_split(split_mode) && requested == kMoeAuto && chunks >= 2 && chunks < kMoeAutoChunks) return chunks;
+    return moe_width(requested, chunks);
+}
+
 }  // namespace strix::pair::prefill_group
