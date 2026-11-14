@@ -1284,15 +1284,19 @@ pays a cost per prefill call on top of the cost per token, so many small chunks 
 ones; a chunk also stalls every decoding request while it runs. `serve::PrefillInterleave`
 (`include/strix/serve/prefill_interleave.hpp`, engine neutral, pure arithmetic) sizes the chunk by the cohort: the
 first chunk of a prompt stays at the server's base chunk and measures the cost per token; later chunks group up to
-four base chunks while at most two requests decode, half as many for every doubling of the cohort, never more than a
-3 s decode stall at the measured cost and never more than the engine takes in one call. A chunk of k base chunks is
-followed by k decode rounds, so the decoding requests keep the same rounds per prompt token. Chunk boundaries of a
-prompt already depend on the load (the whole prompt when nothing decodes), so the grouping stays inside the exactness
-class of the server's chunked prefill. The GLM-5.3 server uses it by default (see its model page for the measured
+four base chunks while at most two requests decode, half as many for every doubling of the cohort. Grouping admission
+uses a 3 s stall estimate from the latest call, not a latency ceiling; the base is never reduced and costs can rise.
+The cap constrains grouping only: engines must safely split or validate base, unchunked and no-cohort calls that exceed it.
+A chunk of k base chunks is followed by k decode rounds, including across prompt completion before a queued successor
+prefills; debt is cleared when no decoder remains. GLM supplies a startup-captured dense-route guard: grouping must
+preserve the routes of the base calls and their tails, otherwise the group shrinks. Whole-prompt execution and separate
+tails retain their shape-dependent routes. This does not establish native numerical equality or timing qualification.
+The GLM-5.3 server uses it by default (see its model page for the measured
 gain); `STRIX_SERVE_PREFILL_INTERLEAVE=0` restores one base chunk per decode round,
 `STRIX_SERVE_PREFILL_INTERLEAVE_SCALE`, `_STALL_MS`, `_SMALL_COHORT` and `_ROUNDS=1` (one decode round per chunk)
 move the rule. `STRIX_SERVE_PREFILL_TIMELINE=1` prints one `prefill-timeline` line per chunked prompt: per chunk its
-tokens, the decoding requests, the call time, and the decode rounds and time before it.
+tokens, the decoding requests, the call time, and the decode rounds and time before it. This optional diagnostic
+allocates and writes synchronously on the scheduler thread; a slow stderr consumer can perturb the measured workload.
 The ordinary piece endpoints and cache snapshots stay unchanged. Arrivals, status
 and cancellation are inspected between resumes. One indivisible unit, decode sweep,
 state import or allocation can exceed the target; it is not a latency guarantee.

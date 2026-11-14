@@ -110,7 +110,8 @@ struct LeadConfig {
     unsigned prefill_chunk = 512;
     // Grouping of those chunks by the decode cohort (shared policy, strix/serve/prefill_interleave.hpp): after a first
     // chunk of `prefill_chunk` tokens, larger chunks while few requests decode, each followed by as many decode rounds
-    // as base chunks it holds. `prefill_chunk_cap`: the largest chunk the engine takes in one call (0 = no bound).
+    // as base chunks it holds, including across prompt completion. `prefill_chunk_cap`: grouping cap (0 = no bound);
+    // base/whole-prompt calls can exceed it and the engine must split them internally.
     strix::serve::PrefillInterleave interleave;
     unsigned prefill_chunk_cap = 0;
     // 1: one `prefill-timeline` line per chunked prompt on stderr.
@@ -306,10 +307,10 @@ private:
         std::uint32_t import_id = 0;
         Clock::time_point import_t0, import_t_req;
         bool import_requested = false;  // the RTX was asked to send
-        // decode-cohort interleave: cost of this prompt's chunks so far, decode rounds owed before its next chunk,
+        // decode-cohort interleave: cost of this prompt's latest chunk,
         // decode rounds / time since its last chunk, and the timeline receipt
         double ms_per_token = 0, decode_ms = 0;
-        unsigned decode_owed = 0, decode_rounds = 0;
+        unsigned decode_rounds = 0;
         strix::serve::PrefillTimeline timeline;
     };
 
@@ -350,6 +351,7 @@ private:
             }
         }
         const unsigned decoding = decoding_count();
+        if (decoding == 0) decode_debt_.clear();
         if (decoding == 0 && !pf_ && !imp_) {
             if (table_.live() != 0) return;
             if (queue_.has_queued_work()) return;
@@ -375,14 +377,16 @@ private:
         // decode first: the running requests' round, then the import poll of a prompt waiting for its RTX state
         // (the C1 MTP path stays open meanwhile), then one chunk of the prompt in prefill
         const bool importing = imp_ && imp_->import_id != 0;
-        if (decoding > 0 && !(decoding == 1 && !pf_ && mtp_round())) {
+        if (decoding > 0) {
             const auto d0 = Clock::now();
-            if (g2_ready()) g2_cycle();
-            else step_all();
+            if (!(decoding == 1 && !pf_ && mtp_round())) {
+                if (g2_ready()) g2_cycle();
+                else step_all();
+            }
+            decode_debt_.decoded();
             if (pf_) {
                 pf_->decode_ms += std::chrono::duration<double, std::milli>(Clock::now() - d0).count();
                 ++pf_->decode_rounds;
-                if (pf_->decode_owed > 0) --pf_->decode_owed;
             }
         }
         if (importing && decoding == 0 && !pf_) {  // nothing else runs: a heartbeat keeps the follower's status coming
@@ -393,7 +397,8 @@ private:
         }
         if (importing) poll_import();
         // A grouped chunk is followed by its decode rounds (PrefillInterleave); with nothing decoding none is owed.
-        if (pf_ && (pf_->decode_owed == 0 || decoding_count() == 0)) prefill_chunk();
+        if (decoding_count() == 0) decode_debt_.clear();
+        if (pf_ && decode_debt_.ready()) prefill_chunk();
         last_round_ = Clock::now();
     }
 
@@ -528,7 +533,7 @@ private:
         const unsigned lanes = decoding_count();
         const auto plan = cfg_.interleave.plan(p.chunk, n - p.done, lanes, cfg_.prefill_chunk_cap, p.ms_per_token);
         const std::size_t m = plan.tokens;
-        p.decode_owed = plan.decode_rounds;
+        decode_debt_.charge(plan);
         const bool last = p.done + m == n;
         Control c;
         c.cmd = static_cast<std::uint32_t>(Cmd::prefill);
@@ -1216,6 +1221,7 @@ private:
     SlotTable table_;
     std::vector<std::optional<Active>> active_;
     std::optional<Prefilling> pf_;
+    strix::serve::PrefillDecodeDebt decode_debt_;
     std::optional<Prefilling> imp_;  // the prompt waiting for its RTX state (its slot allocated), off the prefill place
     std::uint32_t next_import_id_ = 1, peer_import_id_ = 0, peer_import_status_ = 0, peer_import_token_ = 0;
     std::atomic<bool> mtp_on_;

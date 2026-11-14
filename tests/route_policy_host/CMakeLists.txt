@@ -12,6 +12,7 @@ set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
     "${STRIX_SOURCE_ROOT}/src/glm/prefill/glm_pf_exact.hpp"
     "${STRIX_SOURCE_ROOT}/src/glm/prefill/glm_pf_dense_policy.hpp"
     "${STRIX_SOURCE_ROOT}/src/glm/engine/engine.hip"
+    "${STRIX_SOURCE_ROOT}/apps/glm_serve_main.cpp"
     "${STRIX_SOURCE_ROOT}/tests/hip_glm_pf_wmma_tests.hip"
     "${STRIX_SOURCE_ROOT}/src/minimax/engine/engine.hip"
     "${STRIX_SOURCE_ROOT}/src/minimax/moe/mmx_prefill_iu4.inc"

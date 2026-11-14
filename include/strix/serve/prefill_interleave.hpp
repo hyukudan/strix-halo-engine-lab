@@ -5,6 +5,8 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <functional>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -16,16 +18,16 @@ namespace strix::serve {
 //
 // A prefill call has a cost per call (plan, launches of short row counts, one exchange per layer on a pair) on top of
 // its cost per token, so many small chunks cost more per token than few large ones. A chunk also stalls every decoding
-// request for its whole duration, so its size is bounded by the stall the decode cohort may see, and that bound is
-// paid once per stalled request: a small cohort affords a large chunk, a large cohort a small one.
+// request for its whole duration, so grouping is admitted by an estimate of the stall the decode cohort may see.
+// Each stalled request pays that cost: a small cohort affords a large chunk, a large cohort a small one.
 //
 // plan() keeps the scheduler's base ratio (one decode round per `base` prompt tokens) and changes only the grouping:
 // a chunk of k x base tokens is followed by k decode rounds, so the decoding requests receive the same rounds per
 // prompt token and the prompt reaches its first token sooner. The first chunk of a prompt stays at `base`: it measures
-// the cost per token on this machine, which bounds the later chunks by `max_stall_ms`.
+// the cost per token on this machine, used to estimate later chunks against `max_stall_ms` (not a latency ceiling).
 //
-// It only groups work. The chunk boundaries of a prompt already depend on the load (whole prompt when nothing
-// decodes), so an engine adopts this under the same exactness class as its chunked prefill.
+// Engines with shape-dependent arithmetic must supply route_identity to preserve the base calls' routes, including
+// tails. Route preservation alone does not qualify native numerical equality for a new grouping.
 struct PrefillInterleave {
     enum class Select { automatic, off };
     static constexpr unsigned kDefaultScale = 4;
@@ -34,9 +36,12 @@ struct PrefillInterleave {
 
     Select select = Select::automatic;
     unsigned max_scale = kDefaultScale;                 // largest chunk, in base chunks (power of two)
-    double max_stall_ms = kDefaultMaxStallMs;           // longest decode stall one grown chunk may cause
+    double max_stall_ms = kDefaultMaxStallMs;           // grouping admission estimate from the latest call
     std::size_t small_cohort = kDefaultSmallCohort;     // decoding requests that still take max_scale
     bool decode_ratio = true;                           // false: one decode round per chunk, whatever its size
+    // Stable identity for a uniform call; nullopt for mixed/unknown routes (decline grouping).
+    // Capture engine policy at startup, never read environment/configuration in this callback.
+    std::function<std::optional<unsigned>(std::size_t)> route_identity;
 
     struct Plan {
         std::size_t tokens = 0;      // tokens of the next prefill call
@@ -54,7 +59,8 @@ struct PrefillInterleave {
     //   base          the scheduler's chunk (tokens per decode round); 0 = no chunking
     //   remaining     prompt tokens not yet prefilled
     //   decoding      requests a decode round would advance now
-    //   cap           largest call the engine accepts in one chunk (0 = no bound)
+    //   cap           grouping cap (0 = no bound); base, unchunked and no-cohort calls may exceed it.
+    //                 The engine must split those calls safely or validate their sizes separately.
     //   ms_per_token  measured cost of this prompt's earlier chunks (0 = none yet: the call stays at base)
     [[nodiscard]] constexpr Plan plan(std::size_t base, std::size_t remaining, std::size_t decoding, std::size_t cap,
                                       double ms_per_token) const noexcept {
@@ -67,7 +73,8 @@ struct PrefillInterleave {
         unsigned s = 1;
         if (select == Select::automatic && ms_per_token == ms_per_token && ms_per_token > 0.0) {
             s = cohort_scale(decoding);
-            while (s > 1U && (static_cast<double>(s * base) * ms_per_token > max_stall_ms || (cap != 0 && s * base > cap))) s /= 2U;
+            while (s > 1U && (static_cast<double>(s * base) * ms_per_token > max_stall_ms || (cap != 0 && s * base > cap) ||
+                             !keeps_routes(base, std::min<std::size_t>(remaining, s * base)))) s /= 2U;
         }
         p.tokens = std::min<std::size_t>(remaining, s * base);
         p.scale = static_cast<unsigned>((p.tokens + base - 1U) / base);
@@ -81,8 +88,10 @@ struct PrefillInterleave {
         std::snprintf(stall, sizeof(stall), "%.0f", max_stall_ms);
         return "prefill-interleave=auto (serving only, the CLI has no decode cohort: after a first chunk of " + std::to_string(base) +
                " tokens, chunks of up to " + std::to_string(max_scale) + " x " + std::to_string(base) + " tokens while at most " +
-               std::to_string(small_cohort) + " requests decode, halved per doubling of the cohort, bounded by a decode stall of " +
-               stall + " ms; " + (decode_ratio ? "one decode round per " + std::to_string(base) + " prompt tokens is kept"
+               std::to_string(small_cohort) + " requests decode, halved per doubling of the cohort, grouping admission estimate " +
+               stall + " ms from the latest call (not a latency ceiling); " +
+               (route_identity ? "grouping preserves base and tail arithmetic routes; " : "") +
+               (decode_ratio ? "one decode round per " + std::to_string(base) + " prompt tokens is kept across prompt completion"
                                                : std::string("one decode round per chunk")) +
                "; STRIX_SERVE_PREFILL_INTERLEAVE=0 restores one base chunk per round)";
     }
@@ -123,8 +132,24 @@ struct PrefillInterleave {
     }
 
 private:
+    [[nodiscard]] bool keeps_routes(std::size_t base, std::size_t tokens) const {
+        if (!route_identity || tokens <= base) return true;
+        const auto grouped = route_identity(tokens);
+        if (!grouped || grouped != route_identity(base)) return false;
+        const auto tail = tokens % base;
+        return tail == 0 || grouped == route_identity(tail);
+    }
     static std::string text(const char* v) { return v ? std::string(v) : std::string(); }
     static std::string text(std::string v) { return v; }
+};
+
+// Scheduler-owned: completion/cancellation of a prompt must not erase service owed to existing decoders.
+struct PrefillDecodeDebt {
+    unsigned rounds = 0;
+    void charge(const PrefillInterleave::Plan& plan) noexcept { rounds = plan.decode_rounds; }
+    void decoded() noexcept { if (rounds != 0) --rounds; }
+    void clear() noexcept { rounds = 0; }
+    [[nodiscard]] bool ready() const noexcept { return rounds == 0; }
 };
 
 // Timeline of one prompt prefilled in chunks between decode rounds: where its admission-to-first-token window went.
