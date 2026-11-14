@@ -23,3 +23,12 @@ strix_servespec_host_test(NAME pair-embed-frame
 if(TARGET pair-embed-frame)
     set_tests_properties(pair-embed-frame PROPERTIES LABELS "cpu;session")
 endif()
+
+# --vision FILE of the DeepSeek V4.1 pair server: the bridge, the family adapter, the weight reader and the device tower.
+if(TARGET strix-deepseek41-serve)
+    foreach(strix_vise2e_lib strix_vision_api_media strix_deepseek41_vision strix_vision_gguf strix_vision_encoder_hip)
+        if(TARGET ${strix_vise2e_lib})
+            target_link_libraries(strix-deepseek41-serve PRIVATE ${strix_vise2e_lib})
+        endif()
+    endforeach()
+endif()
