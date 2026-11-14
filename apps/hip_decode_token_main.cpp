@@ -3487,11 +3487,18 @@ static int run_decode_entry(
             pair_prediction.half = pair_cut.half;
         }
         const auto pair_legacy_rows = options.known_prefix_prefill_rows;
-        const auto choice = strix::qwen_pp::choose_chunk(std::getenv("STRIX_QWEN_PF_PIPE_CHUNK"),
-            pair_legacy_rows, options.tokens.size(), pair_cost_bucket ? &*pair_cost_bucket : nullptr, pair_prediction);
-        options.known_prefix_prefill_rows = choice.rows;
-        pair_prompt_route = strix::qwen_pp::choose_prompt_route(options.tokens.size(), choice.rows,
-            pair_cost_bucket ? &*pair_cost_bucket : nullptr, pair_prediction);
+        const strix::lever::Inputs pair_regime_inputs{0U, options.tokens.size(), 0U};
+        const auto pair_route = strix::qwen_pp::resolve_pair_route(options.tokens.size(), pair_legacy_rows,
+            std::getenv("STRIX_QWEN_PF_PIPE_CHUNK"), pair_cost_bucket ? &*pair_cost_bucket : nullptr, pair_prediction,
+            strix::lever::select(strix::qwen_pp::chunk_policy_lever, pair_regime_inputs).on,
+            strix::lever::select(strix::qwen_pp::single_tiles_lever, pair_regime_inputs).on);
+        const auto& choice = pair_route.chunk;
+        options.known_prefix_prefill_rows = pair_route.tile_rows;
+        pair_prompt_route = pair_route.route;
+        std::fprintf(stderr, "qwen-pair regime policy=%s mode=%s chunk=%u chunks=%llu predicted-pipeline-ms=%.0f "
+            "predicted-single-ms=%.0f tile-rows=%u\n", pair_route.policy, pair_prompt_route.prefix ? "pipeline" : "single",
+            choice.rows, static_cast<unsigned long long>(pair_route.model.chunks), pair_route.model.pipeline_ms,
+            pair_route.model.single_ms, pair_route.tile_rows);
         std::fprintf(stderr, "qwen-handoff route=%s prefix=%llu suffix=%llu\n", pair_prompt_route.reason,
             static_cast<unsigned long long>(pair_prompt_route.prefix),
             static_cast<unsigned long long>(options.tokens.size() - pair_prompt_route.prefix));
