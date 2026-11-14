@@ -2,6 +2,7 @@
 #include "strix/ds41_prefill_tuning.hpp"
 #include "strix/hip_check.hpp"
 #pragma clang fp contract(off)
+#include "strix/ds41_fast_profile.hpp"
 #include "strix/hip_ds41_prefill.hpp"
 
 #include <hip/hip_fp16.h>
@@ -697,7 +698,7 @@ static bool fast_moe_order() {
     return !(e && e[0] == '0');
 }
 bool fast_moe() {
-    static const bool env = [] { const char* e = std::getenv("STRIX_DS41_FAST_MOE"); return e != nullptr && std::strcmp(e, "1") == 0; }();
+    static const bool env = fast_profile::moe_on();  // the lever or STRIX_DS41_FAST_PREFILL
     return fast_moe_mode < 0 ? env : fast_moe_mode != 0;
 }
 int fast_i4_mode = -1;

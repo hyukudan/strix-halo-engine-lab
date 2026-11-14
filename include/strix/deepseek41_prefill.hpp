@@ -34,9 +34,14 @@ struct PrefillOptions {
     // FAST lever ds41-attn-f16wmma-v1 (STRIX_DS41_FAST_ATTN=1): non-exact f16 WMMA attention, prefill only, layers
     // [approx_layer_first, approx_layer_end); bf16_attention wins where both are set
     bool fast_attention = false;
+    // with fast_attention: FAST lever ds41-attn-bf16flash-v1 (STRIX_DS41_FAST_ATTN=2) instead of ds41-attn-f16wmma-v1:
+    // the shared sparse flash core on BF16 WMMA, one pass per product, keys from BF16 mirrors. Runs of a new prompt
+    // (start 0) require a multiple of 32 heads; extensions keep ds41-attn-f16wmma-v1.
+    bool fast_attention_flash = false;
     // FAST lever ds41-moe-relaxed-v1 (STRIX_DS41_FAST_MOE=1): routed experts in relaxed order. Read from the environment by
     // the MoE dispatch; set_precision_for_new_sequence applies an explicit value (quality arms).
     bool fast_moe = false;
+    bool fast_dense = false;  // FAST lever ds41-dense-f16-v1 (STRIX_DS41_FAST_DENSE=1): dense Q8_0 x A8 products in one FP16 WMMA chain
     // Diagnostics/selection for the non-exact paths (no effect while both switches above are off, except null_ulp_layer):
     // projection bits 1 q_a, 2 kv, 4 q_b, 8 o_a, 16 o_b; layers [approx_layer_first, approx_layer_end); FP16 only at
     // calls of at least fp16_min_rows rows; fp16_keep_a8: FP16 operands from the A8 codes (the exact path's activations)
@@ -252,6 +257,8 @@ public:
     // must use separate precision identities. Intended for controlled quality comparisons.
     void set_precision_for_new_sequence(bool fp16_dense, bool bf16_attention);
     // The same, with every diagnostic/selection field of PrefillOptions (fp16_*, approx_*, null_ulp_layer, trace).
+    // Enabling flash prepares its mirrors before changing precision; allocation failure propagates.
+    // FAST dense/MoE overrides are process-wide: serialize this call with execution in all engine instances.
     void set_precision_for_new_sequence(const PrefillOptions& precision);
     // The exact dense selector for the next sequences (same bits either way; in-process A/B of its speed): on = every
     // exact dense call with the per-site form of STRIX_DS41_DENSE_TALL=auto and q_b / o_a on the dense kernel; off =
@@ -334,7 +341,7 @@ public:
     [[nodiscard]] std::uint32_t route_class(std::uint32_t rows) const noexcept;
     [[nodiscard]] serve::PrefillGroupCapacity group_capacity() const noexcept;
     [[nodiscard]] static bool group_options_supported(const PrefillOptions& o) noexcept {
-        return !(o.fp16_dense || o.bf16_attention || o.fast_attention || o.fast_moe || o.trace || o.stream_hashes ||
+        return !(o.fp16_dense || o.bf16_attention || o.fast_attention || o.fast_attention_flash || o.fast_dense || o.fast_moe || o.trace || o.stream_hashes ||
                  o.routing_loads || o.quality_head_rows > 1U || o.null_ulp_layer >= 0 || o.verify_embed_extras);
     }
     // Members / rows per member the group states hold (PrefillOptions::group_members / group_rows); 0 = no group pass.

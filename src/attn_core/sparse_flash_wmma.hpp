@@ -35,6 +35,14 @@
 //   static __device__ const std::uint16_t* value_row(const Args&, unsigned row, unsigned pos)  [D], 16-B aligned
 //   static __device__ const float* query(const Args&, unsigned row)                 FP32 [H][D]
 //   static __device__ float* out(const Args&, unsigned row)                         FP32 [H][D]
+// Optional (a policy without them compiles to the code above):
+//   static __device__ void query16(const Args&, unsigned row, unsigned head, unsigned chunk, float (&x)[16])
+//                                 replaces query(): dims 16 chunk .. + 15 of a head, computed by the policy (e.g. RoPE)
+//   static __device__ void emit_state(const Args&, unsigned row, unsigned head, float m, float l)
+//   static __device__ void emit(const Args&, unsigned row, unsigned head, unsigned dim, float o)
+//                                 replace out(): the raw online state (m in log2 units of the scaled score, l, and
+//                                 the accumulator relative to m) for an engine epilogue (sink term, inverse RoPE);
+//                                 a row without keys then writes nothing
 // Launch: flash_rows_kernel<P, T><<<rows, Geometry<P::kHeads, P::kDim, T>::kThreads, 0, stream>>>(args).
 #include "attn_core/flash_tile.hpp"
 
@@ -62,6 +70,11 @@ template <unsigned H, unsigned D, unsigned T> struct Geometry {
     static_assert(kGPass >= 1 && kGPass * kDg * 8 == D, "gather covers the value width");
 };
 
+template <class P>
+concept PolicyQuery16 = requires(const typename P::Args& a, float (&x)[16]) { P::query16(a, 0U, 0U, 0U, x); };
+template <class P>
+concept PolicyRawState = requires(const typename P::Args& a) { P::emit_state(a, 0U, 0U, 0.0F, 0.0F); P::emit(a, 0U, 0U, 0U, 0.0F); };
+
 template <class P, unsigned T>
 __global__ __launch_bounds__((Geometry<P::kHeads, P::kDim, T>::kThreads)) void flash_rows_kernel(typename P::Args a) {
     using G = Geometry<P::kHeads, P::kDim, T>;
@@ -75,13 +88,25 @@ __global__ __launch_bounds__((Geometry<P::kHeads, P::kDim, T>::kThreads)) void f
     const unsigned r = blockIdx.x, tid = threadIdx.x, w = tid >> 5U, lane = tid & 31U, ln = lane & 15U, hf = lane >> 4U;
     const unsigned mt = w % G::kMt, qd = w / G::kMt;
     const unsigned n = P::count(a, r);
-    float* const out = P::out(a, r);
-    if (n == 0) {  // uniform: nothing attended (not produced by the engines; defined as zeros)
-        for (unsigned x = tid; x < H * D; x += G::kThreads) out[x] = 0.0F;
-        return;
+    float* out = nullptr;
+    if constexpr (PolicyRawState<P>) {
+        if (n == 0) return;
+    } else {
+        out = P::out(a, r);
+        if (n == 0) {  // uniform: nothing attended (not produced by the engines; defined as zeros)
+            for (unsigned x = tid; x < H * D; x += G::kThreads) out[x] = 0.0F;
+            return;
+        }
     }
     Frag qf[G::kKs];
-    {
+    if constexpr (PolicyQuery16<P>) {
+#pragma unroll
+        for (unsigned k = 0; k < G::kKs; ++k) {
+            float x[16];
+            P::query16(a, r, mt * 16U + ln, (qd * G::kQd) / 16U + k, x);
+            qf[k] = tile::frag_from_f32<O>(x);
+        }
+    } else {
         const float* qr = P::query(a, r) + static_cast<std::size_t>(mt * 16U + ln) * D + qd * G::kQd;
 #pragma unroll
         for (unsigned k = 0; k < G::kKs; ++k) qf[k] = tile::frag_from_f32<O>(qr + 16U * k);
@@ -157,6 +182,14 @@ __global__ __launch_bounds__((Geometry<P::kHeads, P::kDim, T>::kThreads)) void f
             }
         }
         __syncthreads();
+    }
+    if constexpr (PolicyRawState<P>) {
+        if (sg == 0) P::emit_state(a, r, sh, st.m, st.l);
+#pragma unroll
+        for (unsigned c = 0; c < G::kDt; ++c)
+#pragma unroll
+            for (unsigned e = 0; e < 8; ++e) P::emit(a, r, mt * 16U + 2U * e + hf, qd * G::kQd + 16U * c + ln, o[c][e]);
+        return;
     }
     if (sg == 0) al[tile::row_slot(sh)] = tile::finalize_scale(st);
     __syncthreads();

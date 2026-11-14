@@ -254,6 +254,9 @@ struct Q8A8DensePrefillView {
     // Lean 4 form, auto, row_width 8192 / width 4096, from 896 rows; else the two launches). No A8 output.
     std::uint32_t k_parts = 1;
 };
+// FAST lever ds41-dense-f16-v1 (STRIX_DS41_FAST_DENSE): 1 on, 0 off, -1 = the environment (default). Process-wide.
+// Callers must serialize changes against execution in every engine instance, not only the current prefill task.
+void set_fast_dense(int mode);
 // Returns true when the outputs' A8 (a8_codes) was written.
 bool enqueue_q8_0_a8_dense_prefill(const Q8A8DensePrefillView& view, void* stream);
 // F16 projection (weight [count rows of width]): out[r * out_stride + o] = f16_row_dot(row first + o, x_r),

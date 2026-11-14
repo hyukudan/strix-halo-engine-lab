@@ -28,6 +28,7 @@
 
 #include <hip/hip_runtime.h>
 
+#include <concepts>
 #include <cstddef>
 #include <cstdint>
 
@@ -73,6 +74,18 @@ __device__ __forceinline__ Half16 staged_fragment(const std::uint32_t* p) {
     return __builtin_bit_cast(Half16, v);
 }
 }  // namespace detail
+
+// Optional Cols hooks (a policy without them compiles to the code it had):
+//   stage(tile, col, unit, nb): the stager's 64 FP16 weights of column `col` of column tile `tile` for the k units
+//     [unit, unit + 4) into nb[8], instead of raw FP16 loads from tile(i).w: weights of another stored form are decoded
+//     once per (CTA, stage) and every row wave reads the decoded FP16 from LDS.
+//   fragment(row, unit) -> Half16: the lane's A fragment of `row` at k unit `unit`, instead of 16 FP32 loads of x.
+//   kWaves: row waves per CTA (default 8 = 128 rows per weight read); launch with 32 * kWaves threads and
+//     grid.x = ceil(rows / (16 * kWaves)). Stagers stay the first 16 * TC threads.
+template <class C> concept ColsStage = requires(const C& c, U4* nb) { c.stage(0U, 0U, 0U, nb); };
+template <class C> concept ColsFragment = requires(const C& c) { { c.fragment(0U, 0U) } -> std::same_as<Half16>; };
+template <class C> inline constexpr unsigned kCtaWaves = 8U;
+template <class C> requires requires { C::kWaves; } inline constexpr unsigned kCtaWaves<C> = C::kWaves;
 
 // Pitch 36 dwords per column: b128 accesses stay aligned and columns rotate banks. 2,304 bytes per column tile.
 template <unsigned TC> struct alignas(16) Storage {
@@ -127,24 +140,33 @@ __device__ __forceinline__ void core(const float* x, unsigned in, unsigned nr, C
     // No 8-tile width: its WMMAs sink below the fragment reads of the whole stage and the kernel spills (124+ VGPRs).
     static_assert(TC == 1 || TC == 2 || TC == 4 || TC == 16);
     const unsigned tid = threadIdx.x, lane = tid & 31U, wave = tid >> 5U, c = lane & 15U;
-    const unsigned row0 = blockIdx.x * kRows + wave * 16U;
+    const unsigned row0 = blockIdx.x * (16U * kCtaWaves<Cols>) + wave * 16U;
     const unsigned units = detail::uni(in) / 16U;
     const auto* xb = reinterpret_cast<const unsigned char*>(detail::uniform(x));
     // Rows past nr read row 0 (their sums are never stored).
-    const std::uint32_t xo = (row0 + c < nr ? row0 + c : 0U) * in * 4U;
+    const std::uint32_t xr = row0 + c < nr ? row0 + c : 0U, xo = xr * in * 4U;
+    const auto frag = [&](unsigned unit) __attribute__((always_inline)) {
+        if constexpr (ColsFragment<Cols>) return cols.fragment(xr, unit);
+        else return detail::row_fragment(xb, xo + unit * 64U);
+    };
     // Stager role: thread tid owns column tid of the CTA's column block.
     const bool stager = tid < 16U * TC;
-    const auto* wp = reinterpret_cast<const unsigned char*>(cols.tile(blockIdx.y * TC + (stager ? tid / 16U : 0U)).w) +
-                     static_cast<std::size_t>(tid & 15U) * in * 2U;
+    const unsigned stile = blockIdx.y * TC + (stager ? tid / 16U : 0U);
+    const auto* wp = ColsStage<Cols> ? nullptr : reinterpret_cast<const unsigned char*>(cols.tile(stile).w) +
+                                                     static_cast<std::size_t>(tid & 15U) * in * 2U;
     U4 nb[8];
-    const auto fetch = [&](unsigned unit) {
+    const auto fetch = [&](unsigned unit) __attribute__((always_inline)) {
+        if constexpr (ColsStage<Cols>) {
+            cols.stage(stile, tid & 15U, unit, nb);
+        } else {
 #pragma unroll
-        for (unsigned i = 0; i < 8U; ++i) nb[i] = *(detail::GlobalU4*)(wp + std::size_t{unit} * 32U + 16U * i);
+            for (unsigned i = 0; i < 8U; ++i) nb[i] = *(detail::GlobalU4*)(wp + std::size_t{unit} * 32U + 16U * i);
+        }
     };
     // A wave with no live row keeps its staging and barrier duties and skips its row loads and WMMAs.
     const bool idle = detail::uni(skip_dead_waves && row0 >= nr ? 1U : 0U) != 0U;
     Float8 acc[TC] = {};
-    Half16 an = detail::row_fragment(xb, xo);
+    Half16 an = frag(0U);
     if (stager) fetch(0U);
     for (unsigned base = 0; base < units; base += 8U) {
 #pragma unroll
@@ -162,7 +184,7 @@ __device__ __forceinline__ void core(const float* x, unsigned in, unsigned nr, C
 #pragma unroll
             for (unsigned kk = 0; kk < 4U; ++kk) {
                 const Half16 a = an;
-                if (kk + 1U < 4U || s == 0U || u0 + 4U < units) an = detail::row_fragment(xb, xo + (u0 + kk + 1U) * 64U);
+                if (kk + 1U < 4U || s == 0U || u0 + 4U < units) an = frag(u0 + kk + 1U);
 #pragma unroll
                 for (unsigned t = 0; t < TC; ++t)
                     acc[t] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a, detail::staged_fragment(&lds.w[16U * t + c][kk * 8U]), acc[t]);

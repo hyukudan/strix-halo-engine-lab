@@ -527,6 +527,8 @@ PairRun run_pair(unsigned n, std::uint32_t slots, bool batch, std::uint32_t toke
     lc.mtp = mtp;
     lc.mtp_cycles = 2;
     lc.prefill_chunk = chunk;
+    // These levels assert the base interleave (one chunk per decode round); the grouped form has its own case below.
+    lc.interleave.select = sv::PrefillInterleave::Select::off;
     lc.g2 = g2;
     if (import_min != 0) {  // route on: the fake ranks stage at import_expect, the 'RTX' always accepts
         lc.rtx_prefill = [](std::span<const std::uint32_t>, std::uint32_t) { return true; };
@@ -585,9 +587,64 @@ PairRun run_pair(unsigned n, std::uint32_t slots, bool batch, std::uint32_t toke
     return out;
 }
 
+void queued_successor_interleave() {
+    // Final grouped chunks must pay their debt before a queued successor prefills (also when slots are reused).
+    for (const bool grouped : {false, true}) {
+        FakeEng e(4);
+        e.stops = false;
+        gs::Channel ch({}, 0);
+        ch.hello(hello_for(4, 4096, 1));
+        sv::GenerationQueue queue(8);
+        gs::LeadConfig lc;
+        lc.slots = 4;
+        lc.capacity = 4096;
+        lc.prefill_chunk = 512;
+        lc.prefill_chunk_cap = 4096;
+        lc.interleave.select = grouped ? sv::PrefillInterleave::Select::automatic : sv::PrefillInterleave::Select::off;
+        lc.interleave.max_stall_ms = 1e9;
+        std::atomic<bool> stop{false};
+        gs::Lead<FakeEng> lead(e, ch, queue, lc, stop);
+        std::vector<std::shared_ptr<sv::GenerationTicket>> tickets;
+        // Queue everything before running, so prompt completion cannot race successor submission.
+        for (unsigned i = 0; i < 4; ++i) {
+            sv::GenerationJob j;
+            j.prompt.assign(i == 0 ? 8U : 2560U, 5U);
+            j.max_tokens = i == 0 ? 100U : 1U;
+            tickets.push_back(queue.submit(std::move(j)));
+        }
+        std::thread runner([&] { lead.loop(); });
+        for (const auto& ticket : tickets) {
+            bool done = false;
+            while (!done) (void)ticket->wait(std::chrono::milliseconds(100), done);
+        }
+        stop.store(true);
+        runner.join();
+        unsigned chunks = 0, steps = 0, owed = 0, violations = 0, successors = 0;
+        for (const auto& line : e.log) {
+            if (line.rfind("step", 0) == 0) ++steps;
+            if (line.rfind("prefill 1 ", 0) != 0) continue;
+            if (chunks != 0) {
+                if (steps != owed) ++violations;
+                if (line.find(" @0 ") != std::string::npos) ++successors;
+            }
+            owed = grouped && line.find(" +2048") != std::string::npos ? 4U : 1U;
+            steps = 0;
+            ++chunks;
+        }
+        CHECK(chunks == (grouped ? 6U : 15U) && successors == 2 && violations == 0);
+        std::printf("queued-successor interleave (%s): %u chunks, %u successors, %u debt violations\n",
+                    grouped ? "grouped" : "single", chunks, successors, violations);
+    }
+
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
+    if (argc == 2 && std::string(argv[1]) == "--interleave-only") {
+        queued_successor_interleave();
+        return failures == 0 ? 0 : 1;
+    }
     const bool prefix_only = argc == 2 && std::string(argv[1]) == "--prefix-only";
     // ---- admission order: LeadConfig::short_first feeds SessionRuntime::reserve_fifo(wait, short_first), which takes
     // from the shared queue with this selection; off keeps FIFO
@@ -1014,13 +1071,13 @@ int main(int argc, char** argv) {
         }
         // a peer with the previous (v5) block layout is refused at the version check, before any later field is read
         {
-            gs::Control c;
-            c.cmd = static_cast<std::uint32_t>(gs::Cmd::heartbeat);
-            auto blk = gs::encode(c);
+            gs::Control old_peer;
+            old_peer.cmd = static_cast<std::uint32_t>(gs::Cmd::heartbeat);
+            auto blk = gs::encode(old_peer);
             const std::uint32_t v5 = 5;
             std::memcpy(blk.data() + offsetof(gs::Control, version), &v5, sizeof v5);
             CHECK(throws_with([&] { (void)gs::decode(blk); }, "protocol version 5 from the peer, expected 7"));
-            CHECK(gs::decode(gs::encode(c)).version == gs::kControlVersion);
+            CHECK(gs::decode(gs::encode(old_peer)).version == gs::kControlVersion);
             std::printf("v5-layout peer block: refused at the version check\n");
         }
         std::vector<gs::WireRow> rows = {{0, 1, 3}, {1, 1, 3}, {2, 1, 9}};
@@ -1381,8 +1438,12 @@ int main(int argc, char** argv) {
         const auto r = run_pair(3, 4, true, 40, 0, hello_for(8, 4096, 2), false, 100, 3);
         CHECK(r.lead_error.empty() && r.follow_error.empty() && r.driver_error.empty() && r.result.exact && r.log0 == r.log1);
     }
+    queued_successor_interleave();
+
     // ---- decode-first: a running stream gets one decode round between consecutive prefill chunks of a new prompt
-    {
+    // (interleave off), or the same rounds per prompt token around grouped chunks (the shared PrefillInterleave policy:
+    // 64, then 4 x 64 while one request decodes)
+    for (const bool grouped : {false, true}) {
         FakeEng e(4);
         e.stops = false;
         gs::Channel ch({}, 0);
@@ -1393,6 +1454,9 @@ int main(int argc, char** argv) {
         lc.capacity = 4096;
         lc.heartbeat_seconds = 0.01;
         lc.prefill_chunk = 64;
+        lc.interleave.select = grouped ? sv::PrefillInterleave::Select::automatic : sv::PrefillInterleave::Select::off;
+        lc.interleave.max_stall_ms = 1e9;
+        lc.prefill_timeline = grouped ? 1 : 0;
         std::atomic<bool> stop{false};
         gs::Lead<FakeEng> lead(e, ch, queue, lc, stop);
         std::thread runner([&] { lead.loop(); });
@@ -1416,21 +1480,24 @@ int main(int argc, char** argv) {
         while (!done) (void)ta->wait(std::chrono::milliseconds(100), done);
         stop.store(true);
         runner.join();
-        // between two chunk calls of the big prompt there is exactly one step
-        int last_chunk = -1, violations = 0, chunks = 0;
+        // between two chunk calls of the big prompt there is exactly one step; grouped: 64 + 256 + 256 + 64 tokens with
+        // 1, 4 and 4 steps after the first three chunks (the same 9 steps the 10 single chunks get)
+        int last_chunk = -1, violations = 0, chunks = 0, steps_between = 0;
+        const int want_grouped[3] = {1, 4, 4};
         for (std::size_t i = 0; i < e.log.size(); ++i) {
             if (e.log[i].rfind("prefill 1 ", 0) == 0) {
                 if (last_chunk >= 0) {
                     int st = 0;
                     for (std::size_t j = static_cast<std::size_t>(last_chunk) + 1; j < i; ++j) st += e.log[j].rfind("step", 0) == 0 ? 1 : 0;
-                    if (st != 1) ++violations;
+                    if (st != (grouped ? want_grouped[std::min(chunks - 1, 2)] : 1)) ++violations;
+                    steps_between += st;
                 }
                 last_chunk = static_cast<int>(i);
                 ++chunks;
             }
         }
-        CHECK(chunks == 10 && violations == 0);
-        std::printf("decode-first interleave: %d chunks of the 640-token prompt, one step between consecutive chunks: %s\n", chunks,
+        CHECK(chunks == (grouped ? 4 : 10) && violations == 0 && steps_between == 9);
+        std::printf("decode-first interleave (%s, %d steps between chunks): %d chunks of the 640-token prompt, expected step pattern: %s\n", grouped ? "grouped" : "single", steps_between, chunks,
                     violations == 0 ? "yes" : "NO");
     }
     // ---- per-request route receipts: an imported prompt reports imported_tokens + route rtx; a refused one, its fallback

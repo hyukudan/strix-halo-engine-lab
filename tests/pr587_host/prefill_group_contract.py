@@ -15,6 +15,9 @@ def check(serve, hip, case):
         assert "group_options_supported(o)" in capacity
         assert "cap.rejected_class_mask = 4U" in capacity
         assert "if (!group_options_supported(o))" in hip
+        assert "options.fast_dense = options.fast_dense || ds41::fast_profile::dense_on()" in hip
+        assert "options.fast_moe = options.fast_moe || ds41::fast_profile::moe_on()" in hip
+        assert "ds41::fast_profile::attention_on()" in hip
         assert 'g.set("reason", serve::Json(group_reason))' in serve
     elif case == "storage":
         assert "o.group_rows = gp.storage_rows(a.context)" in serve

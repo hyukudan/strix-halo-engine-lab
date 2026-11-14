@@ -559,10 +559,21 @@
     "name": "Batched MTP predictor priming",
     "flag_or_env": "STRIX_MTP_PRIME_ROWS",
     "default": "ON (STRIX_MTP_PRIME_ROWS=0 disables)",
-    "exact": "Same binary at 262,144 tokens: end-of-prompt state digest (target state, predictor rows, held row), terminal FP32 logits digest, tokens and MTP acceptance counters equal on and off.",
-    "gain": "MTP-route prompt at 262,144 tokens (YaRN f2, T8192): 210.9-213.2 -> 202.8-203.8 s, -8.1 to -10.0 s in three pairs; decode unchanged.",
+    "exact": "Original eight-row route only: same binary at 262,144 tokens: end-of-prompt state digest (target state, predictor rows, held row), terminal FP32 logits digest, tokens and MTP acceptance counters equal on and off.",
+    "gain": "Original eight-row route only: MTP-route prompt at 262,144 tokens (YaRN f2, T8192): 210.9-213.2 -> 202.8-203.8 s, -8.1 to -10.0 s in three pairs; decode unchanged.",
     "preconditions": "MTP route with a tiled prompt and the production draft chain; other configurations keep the one-row loop.",
     "off_switch": "STRIX_MTP_PRIME_ROWS=0 (restart)",
+    "doc_anchor": "docs/optimizations.md#qwen-mtp-prime-rows"
+  },
+  {
+    "engine": "qwen",
+    "name": "MTP priming batch capacity",
+    "flag_or_env": "STRIX_MTP_PRIME_BATCH",
+    "default": "64 rows, clamped to 8..128 (restart)",
+    "exact": "Shared per-row bodies and original eight-row HC/cache-projection tiles; compiler and native bitwise validation of wider batches are pending.",
+    "gain": "No wider-batch timing claim.",
+    "preconditions": "Same admission as STRIX_MTP_PRIME_ROWS. Allocation retries eight slots, then uses one-row priming; final row stays on the one-row path.",
+    "off_switch": "STRIX_MTP_PRIME_BATCH=8 restores original batches; STRIX_MTP_PRIME_ROWS=0 disables batching (restart)",
     "doc_anchor": "docs/optimizations.md#qwen-mtp-prime-rows"
   },
   {

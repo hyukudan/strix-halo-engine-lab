@@ -59,6 +59,7 @@
 #include "strix/serve/api.hpp"
 #include "strix/serve/bpe_tokenizer.hpp"
 #include "strix/serve/glm_chat.hpp"
+#include "strix/serve/prefill_interleave.hpp"
 #include "strix/session/speculation_default.hpp"
 #include "strix/serve/http_server.hpp"
 
@@ -96,6 +97,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <vector>
 
@@ -108,6 +110,21 @@ namespace rd = strix::glm::rank_defaults;
 namespace sp = strix::glm::spec;
 namespace gi = strix::glm::import;
 #include "glm_deploy.inc"
+
+strix::serve::PrefillInterleave serve_prefill_interleave(std::string_view mode, unsigned max_rows, unsigned pipeline) {
+    auto policy = strix::serve::PrefillInterleave::from_env(strix::envcfg::text);
+    if (mode == "gemv") {
+        namespace dp = strix::glm::pf::dense_policy;
+        const auto choice = dp::choose(0, strix::envcfg::text);
+        policy.route_identity = [choice, max_rows, pipeline](std::size_t tokens) -> std::optional<unsigned> {
+            const auto rows = dp::call_rows(static_cast<unsigned>(tokens), max_rows, pipeline);
+            if (!choice.automatic) return choice.route;
+            if (rows.min < choice.min_rows && rows.max >= choice.min_rows) return std::nullopt;
+            return rows.min >= choice.min_rows ? dp::kX3r8 : dp::kTm;
+        };
+    }
+    return policy;
+}
 
 std::atomic<bool> g_stop{false};
 std::atomic<int> g_signal{0};
@@ -875,17 +892,8 @@ int main(int argc, char** argv) {
         // bootstrap when the model has a complete MTP head; STRIX_GLM_SERVE_MTP=0 resolves as --mtp-spec 0). No decode
         // handshake here (both ranks resolve on their own and hello compares the result), so automatic max-rows takes its
         // fixed fallback.
-        rank_args.push_back("--decode");
-        rank_args.push_back("1");
-        if (!serve_mtp) {
-            rank_args.push_back("--mtp-spec");
-            rank_args.push_back("0");
-        }
-        const auto request = rd::scan(rank_args);
-        auto eff = rd::resolve(request, rd::process_env(), rd::probe_model_mtp(argv[1]));
-        rd::fallback_without_handshake(eff, request, rd::process_env());
+        auto eff = rd::resolve_serve(rank_args, serve_mtp, rd::process_env(), rd::probe_model_mtp(argv[1]));
         const bool mtp_on = eff.mtp_spec.value == "1" && (eff.prefill == "gemv" || eff.prefill == "ref");
-        if (rd::max_rows_auto(eff)) eff.max_rows = {std::to_string(rd::kFallbackMaxRows), "auto-4096-serve"};
         if (!deployment.file.empty() || deployment.check) {
             opt.mtp = mtp_on; opt.spec = mtp_on;
             std::string refusal;
@@ -903,6 +911,7 @@ int main(int argc, char** argv) {
                     [&](const std::function<void(const char*, const char*)>& set) { rd::apply_env(eff, set); });
                 std::fputs(strix::glm::pf::dense_policy::chunk_line(chunk).c_str(), stdout);
                 prefill_chunk = chunk.tokens;
+                std::fputs(("effective serve-" + strix::serve::PrefillInterleave::from_env(strix::envcfg::text).describe(prefill_chunk) + "\n").c_str(), stdout);
             }
             std::printf("serve slots=%u capacity=%llu batch=%s short-first=%s prefill-chunk=%u (mtp %d) c1-mtp=%s kmax=%u adaptive=%d cycles/round=%u\n",
                         opt.slots, static_cast<unsigned long long>(opt.capacity), serial ? "serial" : "on", short_first ? "on" : "off", prefill_chunk,
@@ -1000,6 +1009,9 @@ int main(int argc, char** argv) {
             const auto chunk = strix::glm::record_prefill_chunk("http", prefill_chunk_explicit, prefill_chunk, opt.world, opt.max_rows, prefill_mode);
             prefill_chunk = chunk.tokens;
             std::printf("rank %u %s", opt.rank, strix::glm::pf::dense_policy::chunk_line(chunk).c_str());
+            if (opt.rank == 0)
+                std::printf("rank 0 effective serve-%s\n",
+                            serve_prefill_interleave(prefill_mode, opt.max_rows, eng.prefill_pipeline()).describe(prefill_chunk).c_str());
             hello.route_fingerprint = static_cast<std::uint32_t>(fp ^ (fp >> 32));
             std::printf("rank %u: route fingerprint %016llx\n", opt.rank, static_cast<unsigned long long>(fp));
         }
@@ -1139,6 +1151,9 @@ int main(int argc, char** argv) {
         lc.prefix_reply_store = strix::envcfg::flag("STRIX_GLM_SERVE_REPLY_KEEP", false, strix::EnvFlagMatch::exact);
         lc.prefix_identity = gs::fnv1a64(&hello.model_hash, sizeof(hello.model_hash), hello.identity_hash);
         lc.prefill_chunk = prefill_chunk;
+        lc.interleave = serve_prefill_interleave(prefill_mode, opt.max_rows, eng.prefill_pipeline());
+        lc.prefill_chunk_cap = opt.max_rows;
+        lc.prefill_timeline = static_cast<unsigned>(std::max(0, strix::envcfg::integer("STRIX_SERVE_PREFILL_TIMELINE", 0)));
         lc.prefill_chunk_mtp = prefill_chunk_mtp;
         lc.mtp = mtp_on;
         lc.mtp_cycles = mtp_cycles;

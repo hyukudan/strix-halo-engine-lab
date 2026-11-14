@@ -59,6 +59,14 @@ int main() {
     check(!DevicePrefill::group_options_supported(options), "BF16 group declined");
     options = {}; options.fp16_dense = true;
     check(!DevicePrefill::group_options_supported(options), "FP16 group declined");
+    options = {}; options.fast_dense = true;
+    check(!DevicePrefill::group_options_supported(options), "FAST dense group declined");
+    options = {}; options.fast_attention_flash = true;
+    check(!DevicePrefill::group_options_supported(options), "flash group declined");
+    options = {}; options.fast_attention = true;
+    check(!DevicePrefill::group_options_supported(options), "FAST attention group declined");
+    options = {}; options.fast_moe = true;
+    check(!DevicePrefill::group_options_supported(options), "FAST MoE group declined");
     options = {}; options.trace = true;
     check(!DevicePrefill::group_options_supported(options), "trace group declined");
     options = {}; options.quality_head_rows = 2U;

@@ -1,3 +1,5 @@
+#include "strix/hip_mtp_prime_rows.hpp"
+#include <type_traits>
 #include "strix/env_flags.hpp"
 #include "strix/hip_qwen_dpp_reduce.hpp"
 #include "strix/hip_check.hpp"
@@ -9925,11 +9927,27 @@ namespace {
 // buffers, position, counts, caches and status word); bodies are the one-token kernels' bodies.
 constexpr unsigned kMtpBatchRows = 8U;
 struct MtpBatchLinearRows { const std::uint16_t* input[kMtpBatchRows]; float* output[kMtpBatchRows]; };
+struct MtpPrimeLinearRows {HipMtpPrimeStride input,output;std::uint32_t count;};
+static_assert(sizeof(MtpPrimeLinearRows)==40U);
+__device__ __forceinline__ const std::uint16_t* mtp_linear_input(const MtpBatchLinearRows& rows,unsigned t) {return rows.input[t];}
+__device__ __forceinline__ float* mtp_linear_output(const MtpBatchLinearRows& rows,unsigned t) {return rows.output[t];}
+__device__ __forceinline__ unsigned mtp_linear_prime_row(const MtpPrimeLinearRows& rows,unsigned t) {
+    const auto r=blockIdx.y*kMtpBatchRows+t;
+    // Pad a partial tile with its last row. Thread 0 repeats identical stores, in order, within the same block.
+    return r<rows.count?r:rows.count-1U;
+}
+__device__ __forceinline__ const std::uint16_t* mtp_linear_input(const MtpPrimeLinearRows& rows,unsigned t) {
+    return reinterpret_cast<const std::uint16_t*>(rows.input[mtp_linear_prime_row(rows,t)]);
+}
+__device__ __forceinline__ float* mtp_linear_output(const MtpPrimeLinearRows& rows,unsigned t) {
+    return reinterpret_cast<float*>(rows.output[mtp_linear_prime_row(rows,t)]);
+}
+
 // linear_to_float_kernel over Count tokens: each thread loads its weight once per feature and runs every
 // token's unchanged chain (same feature stride, same product/accumulate expression, same 256-leaf LDS tree
 // and BF16 epilogue).
-template <WeightKind Kind, unsigned Count>
-__global__ void linear_to_float_rows_kernel(MtpBatchLinearRows rows, const void* weights, std::uint32_t input_width,
+template <WeightKind Kind, unsigned Count,class Rows=MtpBatchLinearRows>
+__global__ void linear_to_float_rows_kernel(Rows rows, const void* weights, std::uint32_t input_width,
     std::uint32_t output_width) {
     const auto out = static_cast<std::uint32_t>(blockIdx.x);
     if (out >= output_width) return;
@@ -9940,7 +9958,7 @@ __global__ void linear_to_float_rows_kernel(MtpBatchLinearRows rows, const void*
     for (std::uint32_t feature = static_cast<std::uint32_t>(threadIdx.x); feature < input_width; feature += kThreads) {
         const float weight = load_weight<Kind>(weights, input_width, out, feature);
 #pragma unroll
-        for (unsigned t = 0; t < Count; ++t) sum[t] += load_activation(&rows.input[t][feature]) * weight;
+        for (unsigned t = 0; t < Count; ++t) sum[t] += load_activation(&mtp_linear_input(rows,t)[feature]) * weight;
     }
 #pragma unroll
     for (unsigned t = 0; t < Count; ++t) scratch[t][threadIdx.x] = sum[t];
@@ -9954,7 +9972,7 @@ __global__ void linear_to_float_rows_kernel(MtpBatchLinearRows rows, const void*
     }
     if (threadIdx.x == 0) {
 #pragma unroll
-        for (unsigned t = 0; t < Count; ++t) rows.output[t][out] = round_bf16(scratch[t][0]);
+        for (unsigned t = 0; t < Count; ++t) mtp_linear_output(rows,t)[out] = round_bf16(scratch[t][0]);
     }
 }
 struct MtpBatchNormRopeRows { float* values[kMtpBatchRows]; std::uint64_t position[kMtpBatchRows]; };
@@ -9963,6 +9981,14 @@ __global__ void norm_rope_rows_kernel(MtpBatchNormRopeRows rows, std::uint32_t h
     std::uint32_t head_stride, const void* norm_weights, float epsilon, std::uint32_t rotary_dim, float theta, Source... rotary_source) {
     norm_rope_body<Kind, Source...>(rows.values[blockIdx.y], head_count, head_dim, head_stride, norm_weights, epsilon, rotary_dim,
         theta, rows.position[blockIdx.y], GraphPositionKernelArguments{}, rotary_source...);
+}
+struct MtpPrimeNormRopeRows {HipMtpPrimeStride values;std::uint64_t position;};
+static_assert(sizeof(MtpPrimeNormRopeRows)==24U);
+template <SmallWeightKind Kind,class... Source>
+__global__ void norm_rope_prime_rows_kernel(MtpPrimeNormRopeRows rows,std::uint32_t head_count,std::uint32_t head_dim,
+    std::uint32_t head_stride,const void* norm_weights,float epsilon,std::uint32_t rotary_dim,float theta,Source... rotary_source) {
+    norm_rope_body<Kind,Source...>(reinterpret_cast<float*>(rows.values[blockIdx.y]),head_count,head_dim,head_stride,
+        norm_weights,epsilon,rotary_dim,theta,rows.position+blockIdx.y,GraphPositionKernelArguments{},rotary_source...);
 }
 struct MtpBatchFiniteRows { const float* values[kMtpBatchRows]; std::uint32_t* status[kMtpBatchRows]; };
 __global__ void validate_indexed_graph_values_rows(MtpBatchFiniteRows rows, std::uint32_t count) {
@@ -9991,6 +10017,21 @@ __global__ __launch_bounds__(kThreads) void mtp_cache_publish_ordered_rows_kerne
     for (std::uint32_t r = 0; r < count; ++r) {
         mtp_cache_publish_body(rows.index[r], index_dim, rows.key[r], rows.value[r], kv_width, rows.raw_state[r], rows.kv_state[r],
             rows.position[r], rows.capacity[r], rows.status[r]);
+        __syncthreads();
+    }
+}
+struct MtpPrimePublishRows {
+    HipMtpCachePrimeRows views;
+    std::uint16_t* raw_state;std::uint16_t* kv_state;
+    std::uint64_t position,capacity;std::uint32_t* status;
+};
+static_assert(sizeof(MtpPrimePublishRows)==104U);
+__global__ __launch_bounds__(kThreads) void mtp_cache_publish_ordered_prime_rows_kernel(MtpPrimePublishRows rows,
+    std::uint32_t count,std::uint32_t index_dim,std::uint32_t kv_width) {
+    for(std::uint32_t r=0;r<count;++r) {
+        mtp_cache_publish_body(reinterpret_cast<const float*>(rows.views.index_key[r]),index_dim,
+            reinterpret_cast<const float*>(rows.views.key[r]),reinterpret_cast<const float*>(rows.views.value[r]),kv_width,
+            rows.raw_state,rows.kv_state,rows.position+r,rows.capacity,rows.status);
         __syncthreads();
     }
 }
@@ -10087,11 +10128,14 @@ void mtp_batch_finite(const std::vector<MtpAttentionPrepared>& rows, const std::
     hipLaunchKernelGGL(validate_indexed_graph_values_rows, dim3(static_cast<unsigned>(members.size())), dim3(kThreads), 0, stream, f, count);
     check_hip(hipGetLastError(), "MTP batch finite validation enqueue");
 }
-template <WeightKind Kind>
-void enqueue_linear_rows(const MtpBatchLinearRows& l, std::size_t count, const void* weights, std::uint32_t width,
+template <WeightKind Kind,class Rows=MtpBatchLinearRows>
+void enqueue_linear_rows(const Rows& l, std::size_t count, const void* weights, std::uint32_t width,
     std::uint32_t outputs, hipStream_t stream) {
     const dim3 grid(outputs);
-    switch (count) {
+    if constexpr (std::is_same_v<Rows,MtpPrimeLinearRows>) {
+        hipLaunchKernelGGL(HIP_KERNEL_NAME(linear_to_float_rows_kernel<Kind,kMtpBatchRows,Rows>),
+            dim3(outputs,(static_cast<unsigned>(count)+kMtpBatchRows-1U)/kMtpBatchRows),dim3(kThreads),0,stream,l,weights,width,outputs);
+    } else switch (count) {
     case 1: hipLaunchKernelGGL(HIP_KERNEL_NAME(linear_to_float_rows_kernel<Kind, 1U>), grid, dim3(kThreads), 0, stream, l, weights, width, outputs); break;
     case 2: hipLaunchKernelGGL(HIP_KERNEL_NAME(linear_to_float_rows_kernel<Kind, 2U>), grid, dim3(kThreads), 0, stream, l, weights, width, outputs); break;
     case 3: hipLaunchKernelGGL(HIP_KERNEL_NAME(linear_to_float_rows_kernel<Kind, 3U>), grid, dim3(kThreads), 0, stream, l, weights, width, outputs); break;
@@ -10184,9 +10228,14 @@ bool hip_mtp_attention_draft_rows_supported() {
 // norm_rope_rows_kernel the same body at the row's position, and one block publishes the rows in order, each validated
 // then stored (on success the bytes of validate_mtp_cache_casts + the two store kernels; a failing row stops the later ones). Pool leases are taken row by row
 // as the one-row form does; the last one stays held over the enqueues.
-void launch_hip_mtp_cache_rows_batch(const MtpNativeContext& first, const HipMtpCacheRowsBatch& rows, std::uint32_t count,
+namespace {
+template<class Rows> void launch_mtp_cache_rows_batch(const MtpNativeContext& first,const Rows& rows,std::uint32_t count,
     void* raw_stream) {
-    if (!count || count > kMtpBatchRows) throw std::invalid_argument("MTP cache-row batch size is invalid");
+    constexpr bool prime=std::is_same_v<Rows,HipMtpCachePrimeRows>;
+    if (!count || count > (prime?hip_mtp_prime_rows_max:kMtpBatchRows)) throw std::invalid_argument("MTP cache-row batch size is invalid");
+    if constexpr (prime)
+        if(!rows.input.stride || !rows.index_key.stride || !rows.key.stride || !rows.value.stride)
+            throw std::invalid_argument("MTP cache-row prime scratch stride is invalid");
     const auto p = prepare_mtp_attention(first);require_mtp_attention_stream(first, raw_stream);
     MtpNativeContext last = first;last.position = first.position + count - 1U;
     (void)prepare_mtp_attention(last);
@@ -10199,8 +10248,11 @@ void launch_hip_mtp_cache_rows_batch(const MtpNativeContext& first, const HipMtp
         MtpNativeContext row = first;row.position = first.position + r;
         pool_access.reset();pool_access = mtp_pool_access(row, p, stream, true);
     }
-    MtpBatchLinearRows index{}, key{}, value{};
-    for (std::uint32_t r = 0; r < count; ++r) {
+    using LinearRows=std::conditional_t<prime,MtpPrimeLinearRows,MtpBatchLinearRows>;
+    LinearRows index{},key{},value{};
+    if constexpr (prime) {
+        index={rows.input,rows.index_key,count};key={rows.input,rows.key,count};value={rows.input,rows.value,count};
+    } else for (std::uint32_t r = 0; r < count; ++r) {
         index.input[r] = key.input[r] = value.input[r] = rows.input[r];
         index.output[r] = rows.index_key[r];key.output[r] = rows.key[r];value.output[r] = rows.value[r];
     }
@@ -10210,25 +10262,49 @@ void launch_hip_mtp_cache_rows_batch(const MtpNativeContext& first, const HipMtp
         p.kv_width, stream);
     enqueue_linear_rows<WeightKind::q8_0>(value, count, reinterpret_cast<const void*>(p.tensors.v.runtime->address), p.hidden,
         p.kv_width, stream);
-    MtpBatchNormRopeRows rope{};
-    for (std::uint32_t r = 0; r < count; ++r) {rope.values[r] = rows.key[r];rope.position[r] = first.position + r;}
+    using RopeRows=std::conditional_t<prime,MtpPrimeNormRopeRows,MtpBatchNormRopeRows>;
+    RopeRows rope{};
+    if constexpr (prime) rope={rows.key,first.position};
+    else for (std::uint32_t r = 0; r < count; ++r) {rope.values[r] = rows.key[r];rope.position[r] = first.position + r;}
     with_qwen_rotary(m, stream, [&](auto... rotary_source) {
-        hipLaunchKernelGGL(HIP_KERNEL_NAME(norm_rope_rows_kernel<SmallWeightKind::f32, decltype(rotary_source)...>), dim3(p.kv_heads, count),
-            dim3(p.dim), 2ULL * p.dim * sizeof(float), stream, rope, p.kv_heads, p.dim, p.dim,
-            reinterpret_cast<const void*>(p.tensors.k_norm.runtime->address), m.rms_norm_epsilon, checked_u32(m.rotary_dim(), "rotary_dim"),
-            m.rope_theta, rotary_source...);
+        if constexpr (prime) {
+            hipLaunchKernelGGL(HIP_KERNEL_NAME(norm_rope_prime_rows_kernel<SmallWeightKind::f32, decltype(rotary_source)...>), dim3(p.kv_heads, count),
+                dim3(p.dim), 2ULL * p.dim * sizeof(float), stream, rope, p.kv_heads, p.dim, p.dim,
+                reinterpret_cast<const void*>(p.tensors.k_norm.runtime->address), m.rms_norm_epsilon, checked_u32(m.rotary_dim(), "rotary_dim"),
+                m.rope_theta, rotary_source...);
+        } else {
+            hipLaunchKernelGGL(HIP_KERNEL_NAME(norm_rope_rows_kernel<SmallWeightKind::f32, decltype(rotary_source)...>), dim3(p.kv_heads, count),
+                dim3(p.dim), 2ULL * p.dim * sizeof(float), stream, rope, p.kv_heads, p.dim, p.dim,
+                reinterpret_cast<const void*>(p.tensors.k_norm.runtime->address), m.rms_norm_epsilon, checked_u32(m.rotary_dim(), "rotary_dim"),
+                m.rope_theta, rotary_source...);
+        }
     });
     check_hip(hipGetLastError(), "MTP cache-row batch norm/RoPE enqueue");
-    MtpBatchPublishRows publish{};
-    for (std::uint32_t r = 0; r < count; ++r) {
-        publish.index[r] = rows.index_key[r];publish.key[r] = rows.key[r];publish.value[r] = rows.value[r];
-        publish.raw_state[r] = reinterpret_cast<std::uint16_t*>(p.index.address);publish.kv_state[r] = reinterpret_cast<std::uint16_t*>(p.kv.address);
-        publish.position[r] = first.position + r;publish.capacity[r] = first.resources->context_capacity();
-        publish.status[r] = reinterpret_cast<std::uint32_t*>(p.status.address);
+    if constexpr (prime) {
+        const MtpPrimePublishRows publish{rows,reinterpret_cast<std::uint16_t*>(p.index.address),
+            reinterpret_cast<std::uint16_t*>(p.kv.address),first.position,first.resources->context_capacity(),
+            reinterpret_cast<std::uint32_t*>(p.status.address)};
+        hipLaunchKernelGGL(mtp_cache_publish_ordered_prime_rows_kernel,dim3(1),dim3(kThreads),0,stream,publish,count,p.index_dim,p.kv_width);
+    } else {
+        MtpBatchPublishRows publish{};
+        for (std::uint32_t r = 0; r < count; ++r) {
+            publish.index[r] = rows.index_key[r];publish.key[r] = rows.key[r];publish.value[r] = rows.value[r];
+            publish.raw_state[r] = reinterpret_cast<std::uint16_t*>(p.index.address);publish.kv_state[r] = reinterpret_cast<std::uint16_t*>(p.kv.address);
+            publish.position[r] = first.position + r;publish.capacity[r] = first.resources->context_capacity();
+            publish.status[r] = reinterpret_cast<std::uint32_t*>(p.status.address);
+        }
+        hipLaunchKernelGGL(mtp_cache_publish_ordered_rows_kernel, dim3(1), dim3(kThreads), 0, stream, publish, count, p.index_dim, p.kv_width);
     }
-    hipLaunchKernelGGL(mtp_cache_publish_ordered_rows_kernel, dim3(1), dim3(kThreads), 0, stream, publish, count, p.index_dim, p.kv_width);
     check_hip(hipGetLastError(), "MTP cache-row batch publish enqueue");
 }
+}
+void launch_hip_mtp_cache_rows_batch(const MtpNativeContext& first,const HipMtpCacheRowsBatch& rows,std::uint32_t count,void* stream) {
+    launch_mtp_cache_rows_batch(first,rows,count,stream);
+}
+void launch_hip_mtp_cache_prime_rows(const MtpNativeContext& first,const HipMtpCachePrimeRows& rows,std::uint32_t count,void* stream) {
+    launch_mtp_cache_rows_batch(first,rows,count,stream);
+}
+
 void launch_hip_mtp_indexer_rows(std::span<const MtpNativeContext> contexts, void* raw_stream) {
     const auto rows = mtp_batch_prepare(contexts);
     if (!raw_stream) throw std::invalid_argument("MTP indexer batch needs a stream");
