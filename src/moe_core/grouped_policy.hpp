@@ -12,9 +12,13 @@ namespace strix::moe_core {
 
 template <class Types> struct GroupedF16Fragments;
 
-template <bool Xor64 = false>
+// PipeTail: partial row blocks of the pipelined MT8 item run on item_pipe with a row guard on the store instead of
+// the scalar core (same fragments, K-ascending chains, split ranges and stores: bitwise). The decode form stays the
+// engine's Traits::Decode<Bits>::kPacked. Needs inputs padded to the item's MT x 16 rows (unguarded A loads).
+template <bool Xor64 = false, bool PipeTail = false>
 struct GroupedPrefillPolicy {
     static constexpr bool xor64 = Xor64;
+    static constexpr bool kPipeTail = PipeTail;
 };
 
 template <class Policy = GroupedPrefillPolicy<>, unsigned PaddedPitch = 72U>
