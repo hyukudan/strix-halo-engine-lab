@@ -90,8 +90,8 @@ __device__ __forceinline__ void flash_body(typename P::Args a, float* ws, unsign
     static_assert(S::lds_bytes + (Two ? 16 * KP * 2 + D * 16 * 2 : 0) <= 65536, "LDS budget (two-term)");
     __shared__ __attribute__((aligned(16))) std::uint16_t ks[16 * KP];
     __shared__ __attribute__((aligned(16))) std::uint16_t vs[D * 16];
-    __shared__ __attribute__((aligned(16))) std::uint16_t ks_lo[Two ? 16 * KP : 8];
-    __shared__ __attribute__((aligned(16))) std::uint16_t vs_lo[Two ? D * 16 : 8];
+    [[maybe_unused]] __shared__ __attribute__((aligned(16))) std::uint16_t ks_lo[Two ? 16 * KP : 8];
+    [[maybe_unused]] __shared__ __attribute__((aligned(16))) std::uint16_t vs_lo[Two ? D * 16 : 8];
     __shared__ __attribute__((aligned(16))) float part[S::waves * 16 * SP];
     const unsigned tid = threadIdx.x, lane = tid & 31U, wave = tid >> 5, rr = lane & 15U, hw = lane >> 4;
     const unsigned tile = wave / S::split, piece = wave % S::split;
@@ -116,7 +116,8 @@ __device__ __forceinline__ void flash_body(typename P::Args a, float* ws, unsign
     const bool live = wave_live && sub + rr < block_rows;
     const unsigned d0 = piece * S::slice;
     bool bad_half = false;
-    Frag qf[F], qf_lo[Two ? F : 1];
+    Frag qf[F];
+    [[maybe_unused]] Frag qf_lo[Two ? F : 1];
     {
         const float* q = live ? P::query(a, my_row, head) + d0 : nullptr;
         constexpr unsigned short exponent = O == tile::Operand::f16 ? 0x7c00U : 0x7f80U;
@@ -129,7 +130,7 @@ __device__ __forceinline__ void flash_body(typename P::Args a, float* ws, unsign
         }
     }
     U4 kreg[S::per_thread], vreg[S::per_thread];
-    U4 klreg[Two ? S::per_thread : 1], vlreg[Two ? S::per_thread : 1];
+    [[maybe_unused]] U4 klreg[Two ? S::per_thread : 1], vlreg[Two ? S::per_thread : 1];
     const auto fetch = [&](unsigned kt) {
 #pragma unroll
         for (unsigned i = 0; i < S::per_thread; ++i) {
@@ -232,7 +233,8 @@ __device__ __forceinline__ void flash_body(typename P::Args a, float* ws, unsign
             const bool present = mine || __shfl_xor(int(mine), 16, 32) != 0;
             // The online update is spelled out, not routed through online_step (flash_core.hpp): identical
             // math through the shared step adds 4-24 B of scratch per kernel on gfx1151 (remarks, R1-7).
-            Frag pa, pl;
+            Frag pa;
+            [[maybe_unused]] Frag pl;
             const float alpha = present ? __builtin_amdgcn_exp2f(maximum - m) : 1.0F;
             {
                 float own[8];
