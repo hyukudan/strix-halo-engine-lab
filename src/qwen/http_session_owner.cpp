@@ -171,6 +171,8 @@ void HttpSessionOwner::pump(const Submit& prepare, const std::function<bool()>& 
     }
 }
 void HttpSessionOwner::turn() {
+    // Protect/release waiting states even when native nested admission is disabled.
+    protection_.scan(queue_);
     // One candidate per common-owner turn. Preserve the two native growth
     // points across these bounded turns; yielding never adds native calls.
     if (turn_ == Turn::growth) {
@@ -181,6 +183,7 @@ void HttpSessionOwner::turn() {
         if (native_.has_free_slot() && !(runtime_.reservation() && native_.active())) {
             if (!runtime_.reserve_fifo() && !native_.active() && !queue_.stopping()) {
                 runtime_.wait_for(std::chrono::seconds(1), true);
+                protection_.scan(queue_);
                 (void)runtime_.reserve_fifo();
             }
             if (runtime_.reservation() && (runtime_.reservation()->job.session_id.empty() || !native_.active())) {

@@ -26,7 +26,7 @@ enum class CacheBudgetRule { legacy, share };
 struct CacheBudgetPolicy {
     CacheBudgetRule rule = CacheBudgetRule::legacy;
     std::uint32_t share_pct = 50;  // 1..100 of (A - R)
-    std::uint64_t cap_bytes = 0;   // 0: no ceiling beyond A - R
+    std::uint64_t cap_bytes = 0;   // caps the share component, not the legacy floor; 0: no cap
     bool operator==(const CacheBudgetPolicy&) const = default;
 };
 [[nodiscard]] constexpr const char* cache_budget_rule_name(CacheBudgetRule rule) {

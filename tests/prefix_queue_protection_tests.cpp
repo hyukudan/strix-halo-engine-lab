@@ -9,6 +9,7 @@
 #include "strix/serve/queued_prefix_protection.hpp"
 
 #include <cstring>
+#include <filesystem>
 #include <iostream>
 #include <span>
 #include <stdexcept>
@@ -206,6 +207,8 @@ void budget_rule() {
     require(share.budget == 12 * gib, "share rule at a 12 GiB cap");
     require(16 * 597 * mib <= share.budget, "16 x 597 MiB fit at 12 GiB");
     require(share.budget <= *fit.A - reserve && *fit.L + reserve + share.budget <= *fit.U, "reserves respected");
+    fit.budget_policy.cap_bytes = gib;
+    require(strix::decode_cli::fit_cache_late(fit).budget == 4 * gib, "share cap is subordinate to the legacy floor");
     // Without a cap the share is half of A - R; at 100 % exactly A - R; never below the legacy minimum.
     fit.budget_policy.cap_bytes = 0;
     const auto half = strix::decode_cli::fit_cache_late(fit).budget;
@@ -220,6 +223,81 @@ void budget_rule() {
     require(tight.budget != 0 && tight.budget <= *fit.A - reserve, "tight: bounded by A - R");
     fit.A = reserve - 1;
     require(strix::decode_cli::fit_cache_late(fit).budget == 0, "below the reserve: declined as before");
+}
+
+void legacy_protected_budget(bool promotion_only = false) {
+    const auto id = identity_of("legacy-protected-budget");
+    const auto directory = std::filesystem::current_path() / "legacy-protected-budget";
+    std::filesystem::create_directories(directory);
+    strix::PrefixStateCachePolicy policy{(blocks * segment_bytes + 24) * 2 + 1024, directory, 0};
+    policy.legacy = true;
+    policy.retention = strix::PrefixCacheRetention::lru;
+    const auto a = history(801), b = history(802), c = history(803);
+    {
+        strix::PrefixStateCache writer(policy, heap);
+        require(writer.insert(state(writer, id, c)), "seed disk checkpoint");
+        writer.flush();
+        require(writer.stats().disk_writes != 0, "disk checkpoint written");
+    }
+    {
+        strix::PrefixStateCache cache(policy, heap);
+        require(cache.insert(state(cache, id, a)) && cache.insert(state(cache, id, b)), "fill legacy LRU");
+        auto ha = cache.protect_longest(cache.prepare_lookup(id, a, rows, a.size()));
+        auto hb = cache.protect_longest(cache.prepare_lookup(id, b, rows, b.size()));
+        require(ha && hb, "protect all legacy victims");
+        const auto retained = cache.stats().host_bytes;
+        if (!promotion_only) require(!cache.insert(state(cache, id, c)), "protected legacy capture refused");
+        require(cache.stats().host_bytes == retained && retained <= policy.host_byte_budget, "legacy capture stays within budget");
+        const auto loaded = cache.find_longest(id, c, rows, c.size());
+        require(loaded && cache.stats().disk_hits == 1, "legacy disk hit still returned");
+        require(cache.stats().host_checkpoints == 2 && cache.stats().host_bytes == retained, "disk promotion cannot exceed budget");
+    }
+    std::filesystem::remove_all(directory);
+}
+
+void queue_prepare_host_only() {
+    const auto id = identity_of("host-only-preparation");
+    const auto directory = std::filesystem::current_path() / "queue-prepare-host-only";
+    auto cache = std::make_shared<strix::PrefixStateCache>(strix::PrefixStateCachePolicy{1U << 20, directory, 0}, heap);
+    auto tokens = history(901);
+    const auto expected = tokens;
+    require(cache->insert(state(*cache, id, tokens)), "host checkpoint with disk tier");
+    cache->flush();
+    // A probing preparation always populates disk, even for absent files.
+    const auto probed = cache->prepare_lookup(id, tokens, rows, tokens.size());
+    require(!probed.disk.empty(), "control probes the configured disk tier");
+    auto binding = strix::serve::prefix_cache_queue_binding(cache, [id] { return id; }, rows, 0,
+        [](std::uint64_t n) { return n; });
+    auto prepared = binding.prepare(tokens);
+    const auto ticket = std::static_pointer_cast<const strix::PrefixLookupTicket>(prepared);
+    require(ticket && ticket->disk.empty() && ticket->disk_epoch == 0, "queue preparation performs no disk probes");
+    tokens.clear();
+    require(ticket->owned && *ticket->owned == expected, "host-only ticket owns its prompt");
+    require(static_cast<bool>(binding.protect(prepared)), "host-only ticket protects host checkpoint");
+    cache.reset();
+    std::filesystem::remove_all(directory);
+}
+
+void retry_past_head_misses() {
+    const auto id = identity_of("retry-fairness");
+    auto cache = std::make_shared<strix::PrefixStateCache>(strix::PrefixStateCachePolicy{1U << 20, {}, 0}, heap);
+    require(cache->insert(state(*cache, id, history(16))), "cache only the seventeenth history");
+    strix::serve::GenerationQueue queue;
+    for (std::uint32_t i = 0; i < 17; ++i) {
+        strix::serve::GenerationJob job;
+        job.prompt = followup(history(i));
+        require(static_cast<bool>(queue.submit(std::move(job))), "enqueue fairness job");
+    }
+    strix::serve::QueuedPrefixProtectionPolicy policy;
+    policy.enabled = true;
+    strix::serve::QueuedPrefixProtection protection(policy,
+        strix::serve::prefix_cache_queue_binding(cache, [id] { return id; }, rows));
+    for (unsigned scan = 0; scan < 8; ++scan) {
+        const auto before = protection.stats().attempts;
+        protection.scan(queue);
+        require(protection.stats().attempts - before <= policy.max_protect, "retry scan remains bounded");
+    }
+    require(protection.stats().prepared == 17 && protection.stats().held == 1, "later hit is not starved by persistent head misses");
 }
 
 void qualification_rows() {
@@ -256,10 +334,22 @@ void qualification_rows() {
 }
 } // namespace
 
-int main() {
+int main(int argc, char** argv) {
     try {
+        if (argc == 2) {
+            const std::string test = argv[1];
+            if (test == "legacy-capture") legacy_protected_budget();
+            else if (test == "legacy-promotion") legacy_protected_budget(true);
+            else if (test == "host-only") queue_prepare_host_only();
+            else if (test == "fair-retry") retry_past_head_misses();
+            else throw std::runtime_error("unknown test case");
+            return 0;
+        }
         queue_protection();
         cache_edges();
+        legacy_protected_budget();
+        queue_prepare_host_only();
+        retry_past_head_misses();
         budget_rule();
         qualification_rows();
     } catch (const std::exception& e) {

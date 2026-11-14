@@ -380,8 +380,9 @@ public:
     // the stored tokens exactly, and loads a disk checkpoint (payload read, budget credits, certificate
     // check) itself. Prepared disk metadata is used only while this cache has not published or removed a
     // checkpoint file since it was read; otherwise the lookup probes the files as the one-step form does.
+    // probe_disk=false is owned, host-only preparation: hashes/copies only, with no filesystem work.
     [[nodiscard]] PrefixLookupTicket prepare_lookup(const ModelContentIdentity& identity, std::span<const std::uint32_t> tokens,
-        std::uint32_t block_rows, std::uint64_t limit) const;
+        std::uint32_t block_rows, std::uint64_t limit, bool probe_disk = true) const;
     [[nodiscard]] std::shared_ptr<const PrefixCacheCheckpoint> find_longest(const PrefixLookupTicket& ticket, bool promote = true,
         std::string_view conversation = {}, const std::function<bool(const PrefixCacheCheckpoint&)>& eligible = {});
     // Queue protection. A request still WAITING for a slot takes a reference on the longest host-tier

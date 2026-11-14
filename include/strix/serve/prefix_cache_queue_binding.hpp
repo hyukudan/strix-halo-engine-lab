@@ -1,5 +1,5 @@
 #pragma once
-// Binds QueuedPrefixProtection to a PrefixStateCache: preparation = prepare_lookup (prompt-only block
+// Binds QueuedPrefixProtection to a PrefixStateCache: preparation = host-only prepare_lookup (prompt-only block
 // digests, the same limit the restore lookup uses), protection = protect_longest under a byte cap.
 // The store is held weakly: a released store makes preparation and protection no-ops, and live handles
 // then release nothing. `identity` must stay callable while the protector lives.
@@ -23,7 +23,7 @@ namespace strix::serve {
         if (!cache || !block_rows || prompt.size() < 2 || !identity) return {};
         const auto rows = limit ? limit(prompt.size()) : prompt.size() - 1;
         if (rows < block_rows) return {};
-        return std::make_shared<const PrefixLookupTicket>(cache->prepare_lookup(identity(), prompt, block_rows, rows));
+        return std::make_shared<const PrefixLookupTicket>(cache->prepare_lookup(identity(), prompt, block_rows, rows, false));
     };
     b.protect = [store = std::move(store), max_bytes](const QueuedPrefixProtection::Prepared& prepared) -> QueuedPrefixProtection::Handle {
         const auto cache = store.lock();

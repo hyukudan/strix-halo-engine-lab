@@ -1560,6 +1560,12 @@ inline serve::Json cache_activation_json(const Options& o) {
     out.set("runner",serve::Json(std::string(a.runner==CacheRunner::pending?"pending-runner":a.runner==CacheRunner::cli?"cli-target-tiled":a.runner==CacheRunner::batch_mtp?"http-mtp-batch":a.runner==CacheRunner::single_mtp?"http-mtp-fixed":"http-target")));
     out.set("family",serve::Json(a.family)); out.set("evidence_id",serve::Json(a.evidence_id));
     out.set("automatic_qualified",serve::Json(a.automatic_qualified));
+    if(a.budget_policy) {
+        out.set("budget_rule",serve::Json(serve::cache_budget_rule_name(a.budget_policy->rule)));
+        out.set("budget_share_pct",serve::Json(static_cast<std::uint64_t>(a.budget_policy->share_pct)));
+        out.set("budget_share_cap_bytes",serve::Json(a.budget_policy->cap_bytes));
+        out.set("budget_share_cap_scope",serve::Json("share-component-before-legacy-floor"));
+    }
     out.set("phase",serve::Json(a.automatic_path && !a.decision_phase.empty()?a.decision_phase:(a.finalized?"post-residency":"inspection")));
     for (const auto& [name,value]: {std::pair{"B",a.B},{"S",a.S},{"H",a.H},{"F",a.F},{"E",a.E},
             {"context_off",a.context_off},{"slots_off",a.slots_off},
@@ -1642,6 +1648,7 @@ inline bool apply_automatic_cache_fit(Options& o, const CacheLateFit& observed) 
     if(!automatic_cache_work(o)) return false;
     // The one budget-rule resolution for CLI and server (default: the incumbent legacy rule).
     auto fit=observed; fit.budget_policy=serve::cache_budget_policy_from_env();
+    a.budget_policy=fit.budget_policy;
     const auto result=fit.cgroup_ancestry_unproven ? CacheFitResult{0,"cgroup-ancestry-unproven"} : fit_cache_late(fit);
     a.S=fit.S; a.H=std::max(UINT64_C(4)<<30,fit.headroom); a.F=fit.F;
     if(fit.E && *fit.E<=UINT64_MAX-(UINT64_C(256)<<20)) a.E=*fit.E+(UINT64_C(256)<<20);
@@ -1902,6 +1909,7 @@ inline void intersect_cache_cgroup_limits(PrefillMemory& result, const std::stri
 // visibility is unknown capacity and declines; HIP is never initialized here.
 inline PrefillMemory observe_prefill_memory(PrefillCapabilities& capabilities, bool cache_limits=false) {
     PrefillMemory result;
+    (void)capabilities; // used only by the Linux sysfs observation below
     (void)cache_limits;
     const auto observed = observe_linux_uma_memory();
     if (observed.memory.observation_identity) {

@@ -165,6 +165,7 @@ struct CachePolicyActivation {
     std::optional<std::uint64_t> U,L,A,reserve,observation_age_ns;
     double pool_setup_ms=0;
     bool limits_consistent=false;
+    std::optional<serve::CacheBudgetPolicy> budget_policy; // populated when the automatic fit resolves it
     std::optional<std::uint64_t> B,S,H,F,E, context_off, slots_off, context_admitted, slots_admitted;
 };
 // One process-wide decline also reaches runtime Options copies. Numerical

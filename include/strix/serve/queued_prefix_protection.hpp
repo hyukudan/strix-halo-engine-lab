@@ -32,7 +32,7 @@ struct QueuedPrefixProtectionPolicy {
     bool enabled = false;
     std::size_t max_waiting = 64;  // waiting jobs examined per scan, in queue order
     std::size_t max_prepare = 4;   // new prompts prepared (copied + hashed) per scan
-    std::size_t max_protect = 16;  // protection attempts per scan (misses are retried, head first)
+    std::size_t max_protect = 16;  // protection attempts per scan (round-robin retries)
 };
 // One resolution for every server owner: STRIX_PREFIX_QUEUE_PROTECT ("1" on; unset = default OFF).
 [[nodiscard]] inline QueuedPrefixProtectionPolicy queued_prefix_protection_policy_from_env() {
@@ -94,8 +94,11 @@ public:
             it = jobs_.erase(it);  // left the queue without admission: cancel, timeout, failure, refusal
         }
         auto attempts = policy_.max_protect;
-        for (const auto& v : visits) {  // queue order: the head restores first
-            if (!attempts) break;
+        const auto start = visits.empty() ? 0 : next_attempt_ % visits.size();
+        for (std::size_t i = 0; i < visits.size() && attempts; ++i) {
+            const auto index = (start + i) % visits.size();
+            const auto& v = visits[index];
+            next_attempt_ = index + 1;
             auto& job = jobs_.at(v.key);
             if (job.handle || !job.prepared) continue;
             --attempts; ++stats_.attempts;
@@ -130,6 +133,7 @@ private:
     Binding binding_{};
     std::map<const GenerationTicket*, Job> jobs_;
     std::uint64_t epoch_ = 0;
+    std::size_t next_attempt_ = 0;
     Stats stats_{};
 };
 

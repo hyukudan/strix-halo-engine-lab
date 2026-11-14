@@ -1281,13 +1281,11 @@ bool PrefixStateCache::insert(std::shared_ptr<const PrefixCacheCheckpoint> check
             ++stats_.rejected_over_budget; ++stats_.budget_skips;
             return false;
         }
-        if (!policy_.legacy) {
-            evict_to_budget_locked(need, policy_.retention == PrefixCacheRetention::fair ? checkpoint.get() : nullptr);
-            if ((policy_.retention == PrefixCacheRetention::fair && entries_.size() >= 256) ||
-                retained_bytes_locked() > policy_.host_byte_budget - need) {
-                ++stats_.budget_skips; ++stats_.rejected_over_budget; return false;
-            }
-        } else evict_to_budget_locked(need);
+        evict_to_budget_locked(need, !policy_.legacy && policy_.retention == PrefixCacheRetention::fair ? checkpoint.get() : nullptr);
+        if ((!policy_.legacy && policy_.retention == PrefixCacheRetention::fair && entries_.size() >= 256) ||
+            retained_bytes_locked() > policy_.host_byte_budget - need) {
+            ++stats_.budget_skips; ++stats_.rejected_over_budget; return false;
+        }
         add_locked(checkpoint);
         ++stats_.inserted;
     }
@@ -1359,9 +1357,9 @@ PrefixLookupTicket PrefixStateCache::prepare_ticket(const ModelContentIdentity& 
 }
 
 PrefixLookupTicket PrefixStateCache::prepare_lookup(const ModelContentIdentity& identity, std::span<const std::uint32_t> tokens,
-    std::uint32_t block_rows, std::uint64_t limit) const {
+    std::uint32_t block_rows, std::uint64_t limit, bool probe_disk) const {
     auto owned = std::make_shared<const std::vector<std::uint32_t>>(tokens.begin(), tokens.end());
-    auto ticket = prepare_ticket(identity, *owned, block_rows, limit, true);
+    auto ticket = prepare_ticket(identity, *owned, block_rows, limit, probe_disk);
     ticket.owned = std::move(owned);
     return ticket;
 }
@@ -1456,7 +1454,7 @@ std::shared_ptr<const PrefixCacheCheckpoint> PrefixStateCache::find_longest(cons
                         if (conversation.size()<=128) promoted->conversation=conversation;
                         evict_to_budget_locked(need, policy_.retention == PrefixCacheRetention::fair ? promoted.get() : nullptr);
                         if ((policy_.retention != PrefixCacheRetention::fair || entries_.size()<256) &&
-                            (policy_.legacy || retained_bytes_locked() <= policy_.host_byte_budget - need)) {
+                            retained_bytes_locked() <= policy_.host_byte_budget - need) {
                             add_locked(promoted);
                             auto& entry = entries_.at(promoted->digest);
                             entry.reuse=1;
