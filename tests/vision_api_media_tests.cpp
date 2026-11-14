@@ -7,6 +7,7 @@
 #include <cstdio>
 #include <fstream>
 #include <iterator>
+#include <new>
 #include <string>
 
 namespace {
@@ -133,6 +134,28 @@ int main(int argc, char** argv) {
     }
     CHECK(webp_status == 400);
     CHECK(bridge.stats().refused == 2U);
+
+    // A failed lazy upload releases partial panels and retries before any backend encode.
+    unsigned attempts = 0, rollbacks = 0, panels = 0;
+    o.on_first_encode = [&] {
+        ++attempts;
+        CHECK(panels == 0U);
+        panels = 1U;
+        if (attempts == 1U) throw std::bad_alloc();
+    };
+    o.on_first_encode_failure = [&] { ++rollbacks; panels = 0U; };
+    session::EmbedInterner retry_interner;
+    ApiMediaBridge retry(adapter, backend, tower.w, nullptr, retry_interner, o);
+    const auto projections = adapter.projections();
+    bool allocation_failed = false;
+    try { (void)retry.encode(item_of(png, 5), 64); }
+    catch (const std::bad_alloc&) { allocation_failed = true; }
+    CHECK(allocation_failed && attempts == 1U && rollbacks == 1U && panels == 0U);
+    CHECK(adapter.projections() == projections && retry.stats().encodes == 0U);
+    const auto recovered = retry.encode(item_of(png, 5), 64);
+    CHECK(recovered.lease && attempts == 2U && rollbacks == 1U && panels == 1U);
+    const auto fresh = retry.encode(item_of(png, 6), 64);
+    CHECK(fresh.lease && attempts == 2U && retry.stats().encodes == 2U);
 
     if (failures) { std::fprintf(stderr, "%d failure(s)\n", failures); return 1; }
     std::puts("vision-api-media: ok");

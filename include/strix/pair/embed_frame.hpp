@@ -253,6 +253,8 @@ private:
     std::map<session::EmbedDigest, session::EmbedLease> held_;
 };
 
+// Experimental policy only: serving executes rank0 and does not call this selector.
+// Peer/split have no execution path; measured rows alone do not qualify them for serving.
 // Where a pair encodes a request's images (spec 2e). rank0: the encoder on rank 0, rows framed to rank 1 (default).
 // peer: rank 1 encodes while rank 0 prefills the text before the first image. split: images alternate between ranks.
 enum class EmbedEncodeMode : std::uint8_t { rank0 = 0, peer = 1, split = 2 };

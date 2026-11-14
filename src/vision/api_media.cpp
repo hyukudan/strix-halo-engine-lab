@@ -92,8 +92,13 @@ serve::ApiMediaSpan ApiMediaBridge::encode(const serve::media::MediaItem& item, 
         if (k.layout.role.size() > budget) over_budget(k.layout.role.size());
         span.preprocess_ms = ms_since(t0);
         if (!started_) {
+            try {
+                if (options_.on_first_encode) options_.on_first_encode();
+            } catch (...) {
+                if (options_.on_first_encode_failure) options_.on_first_encode_failure();
+                throw;
+            }
             started_ = true;
-            if (options_.on_first_encode) options_.on_first_encode();
         }
         const auto t1 = Clock::now();
         auto encoded = encode_cached(adapter_, backend_, weights_, cache_, digest, grid);

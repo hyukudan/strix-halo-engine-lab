@@ -32,8 +32,10 @@ struct ApiMediaOptions {
     std::uint32_t lm_width = 0;   // LM hidden width; rows of another width are refused at construction time of a span
     unsigned axes = 0;            // position axes the family reads (span_embed_rows)
     DecodeLimits limits;          // encoded bytes / decoded pixels per image
-    // Called before the first encode (lazy weight upload, e.g. Encoder::load); may be empty.
+    // Called before the first encode (lazy weight upload, e.g. Encoder::load); retried after failure.
     std::function<void()> on_first_encode;
+    // Roll back partial initialization if on_first_encode throws. Must not throw; may be empty.
+    std::function<void()> on_first_encode_failure;
 };
 
 class ApiMediaBridge final : public serve::ApiMediaAdapter {

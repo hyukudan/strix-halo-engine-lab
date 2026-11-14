@@ -636,6 +636,7 @@ std::unique_ptr<VisionStack> make_vision_stack(const Args& a, const strix::deeps
         auto* const enc = st->encoder.get();
         const auto* const w = &st->weights;
         o.on_first_encode = [enc, w] { enc->load(*w); };
+        o.on_first_encode_failure = [enc] { enc->unload(); };
     }
     st->bridge = std::make_shared<vis::ApiMediaBridge>(*st->adapter, *st->encoder, st->weights, st->cache.get(), st->interner, std::move(o));
     return st;
@@ -644,6 +645,15 @@ std::unique_ptr<VisionStack> make_vision_stack(const Args& a, const strix::deeps
 // The prompt with every virtual id replaced by its vocabulary id (what DSpark, the logs and the history look up).
 std::vector<std::uint32_t> real_prompt(const std::vector<std::uint32_t>& prompt, const std::shared_ptr<const strix::session::EmbedTable>& table, std::uint32_t hidden) {
     return strix::session::resolve_embed_run(prompt, table, {hidden}).tokens;
+}
+
+// Engram history keeps image positions dead, using vocabulary ids rather than local handles.
+std::vector<std::uint32_t> engram_prompt(std::span<const std::uint32_t> prompt,
+                                       const std::shared_ptr<const strix::session::EmbedTable>& table, std::uint32_t hidden) {
+    auto tokens = strix::session::resolve_embed_run(prompt, table, {hidden}).tokens;
+    for (std::size_t i = 0; i < tokens.size(); ++i)
+        if (strix::session::is_embed_id(prompt[i])) tokens[i] = strix::ds41::engram_dead_token(tokens[i]);
+    return tokens;
 }
 
 class SlotPrefill {
@@ -914,10 +924,8 @@ public:
                     if (!embeds_) {
                         sp_.prefill_->set_engram_lookahead(std::span<const std::uint32_t>(prompt_.data() + end, next - end));
                     } else {  // image rows are dead n-gram positions of the Engram (real token id with the dead bit)
-                        auto ahead = strix::session::resolve_embed_run(std::span<const std::uint32_t>(prompt_.data() + end, next - end), embeds_,
-                                                                      {sp_.fwd_.model().config.hidden_size}).tokens;
-                        for (std::size_t i = 0; i < ahead.size(); ++i)
-                            if (strix::session::is_embed_id(prompt_[end + i])) ahead[i] = strix::ds41::engram_dead_token(ahead[i]);
+                        auto ahead = engram_prompt(std::span<const std::uint32_t>(prompt_.data() + end, next - end), embeds_,
+                                                   sp_.fwd_.model().config.hidden_size);
                         sp_.prefill_->set_engram_lookahead(ahead);
                     }
                 }
@@ -1012,7 +1020,7 @@ public:
             double final_insert = 0.0;
             if (state_.layers.empty()) {
                 state_ = sp_.prefill_->export_state();
-                state_.tokens = prompt_;
+                state_.tokens = embeds_ ? engram_prompt(prompt_, embeds_, sp_.fwd_.model().config.hidden_size) : prompt_;
                 state_.next_token = r_.next_token;
                 sp_.record_export(state_, 2);
                 if (sp_.cache_ && insert_ && total() % sp_.a_.prefix_block == 0U) {
