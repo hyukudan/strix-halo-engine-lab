@@ -660,7 +660,7 @@ measured by this adapter. Without `drafter-mtp/` the drafter arm is skipped and 
   Kit token exactness and reference candidates remain unavailable for MTP. Prompt lists are accepted.
 - The GLM pair HTTP server (`strix-glm5-serve`, see the [GLM page](models/glm-5.3/README.md#glm-serve)) is not driven
   by the kit yet; GLM RTX exposes a file queue, not this HTTP interface.
-- Default Qwen distill-g is published ([hyukudan/Qwen3.8-Flash-Next-MTP-distillG-Q8_0](https://huggingface.co/hyukudan/Qwen3.8-Flash-Next-MTP-distillG-Q8_0)) but not downloaded by the fetcher; some project assets still need separate publication/supply.
+- Default Qwen distill-g is published ([hyukudan/Qwen3.8-Flash-Next-MTP-distillG-Q8_0](https://huggingface.co/hyukudan/Qwen3.8-Flash-Next-MTP-distillG-Q8_0)) and the Qwen fetch recipe downloads it; some other project assets still need separate publication/supply.
   Full-profile prerequisites remain required for prefill-only/plain-only runs.
 - List/all presence checks are not profile-aware for GSQ. Check does not establish native
   execution or fidelity; skip verification cannot establish model content.
