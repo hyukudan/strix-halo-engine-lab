@@ -656,23 +656,23 @@ struct DevicePrefill::Impl {
     // The per-object switches that change no allocation and no weight layout, resolved from the CURRENT environment and the
     // requested options: the constructor and DevicePrefill::apply_levers both call this (one resolver, one set of defaults).
     // Not here (they size buffers or select what is loaded; reload): EXPERT_TP, WINDOW, SLABS, OVERLAY, STAGED_HALF, MEM_GUARD.
-    void resolve_levers(PrefillOptions& options, const PrefillOptions& req) {
-        options.fp16_dense = req.fp16_dense;
-        options.bf16_attention = req.bf16_attention;
-        options.fast_attention = req.fast_attention;
-        options.fast_attention_flash = req.fast_attention_flash;
-        options.fp16_projections = req.fp16_projections;
-        options.fp16_min_rows = req.fp16_min_rows;
-        options.approx_layer_first = req.approx_layer_first;
-        options.approx_layer_end = req.approx_layer_end;
-        options.fp16_keep_a8 = req.fp16_keep_a8;
-        options.fp16_fast = req.fp16_fast;
-        options.fp16_wsplit = req.fp16_wsplit;
-        if(const char* e=std::getenv("STRIX_DS41_PREFILL_FP16_DENSE");e && std::string(e)=="1")options.fp16_dense=true;
-        if(const char* e=std::getenv("STRIX_DS41_PREFILL_BF16_ATTN");e && std::string(e)=="1")options.bf16_attention=true;
+    void resolve_levers(PrefillOptions& opts, const PrefillOptions& req) {
+        opts.fp16_dense = req.fp16_dense;
+        opts.bf16_attention = req.bf16_attention;
+        opts.fast_attention = req.fast_attention;
+        opts.fast_attention_flash = req.fast_attention_flash;
+        opts.fp16_projections = req.fp16_projections;
+        opts.fp16_min_rows = req.fp16_min_rows;
+        opts.approx_layer_first = req.approx_layer_first;
+        opts.approx_layer_end = req.approx_layer_end;
+        opts.fp16_keep_a8 = req.fp16_keep_a8;
+        opts.fp16_fast = req.fp16_fast;
+        opts.fp16_wsplit = req.fp16_wsplit;
+        if(const char* e=std::getenv("STRIX_DS41_PREFILL_FP16_DENSE");e && std::string(e)=="1")opts.fp16_dense=true;
+        if(const char* e=std::getenv("STRIX_DS41_PREFILL_BF16_ATTN");e && std::string(e)=="1")opts.bf16_attention=true;
         if (const char* e = ds41::fast_profile::attention(); ds41::fast_profile::attention_on()) {  // the lever or STRIX_DS41_FAST_PREFILL
-            options.fast_attention = true;
-            if (e[0] == '2') options.fast_attention_flash = true;  // ds41-attn-bf16flash-v1
+            opts.fast_attention = true;
+            if (e[0] == '2') opts.fast_attention_flash = true;  // ds41-attn-bf16flash-v1
         }
         // Per-shape selector of the FP16 backend: STRIX_DS41_PREFILL_FP16_PROJ (comma list of q_a, kv, q_b, o_a, o_b),
         // STRIX_DS41_PREFILL_FP16_MIN_ROWS (calls of at least that many rows), STRIX_DS41_PREFILL_APPROX_LAYERS=first-end,
@@ -688,19 +688,19 @@ struct DevicePrefill::Impl {
                 else if (t == "o_b") mask |= 16U;
                 else throw std::invalid_argument("STRIX_DS41_PREFILL_FP16_PROJ: " + t);
             }
-            options.fp16_projections = mask;
+            opts.fp16_projections = mask;
         }
         if (const char* e = std::getenv("STRIX_DS41_PREFILL_FP16_MIN_ROWS"); e != nullptr && *e != 0)
-            options.fp16_min_rows = static_cast<std::uint32_t>(std::strtoul(e, nullptr, 10));
+            opts.fp16_min_rows = static_cast<std::uint32_t>(std::strtoul(e, nullptr, 10));
         if (const char* e = std::getenv("STRIX_DS41_PREFILL_APPROX_LAYERS"); e != nullptr && *e != 0) {
             char* end = nullptr;
-            options.approx_layer_first = static_cast<std::uint32_t>(std::strtoul(e, &end, 10));
+            opts.approx_layer_first = static_cast<std::uint32_t>(std::strtoul(e, &end, 10));
             if (end == nullptr || *end != '-') throw std::invalid_argument("STRIX_DS41_PREFILL_APPROX_LAYERS: first-end");
-            options.approx_layer_end = static_cast<std::uint32_t>(std::strtoul(end + 1, nullptr, 10));
+            opts.approx_layer_end = static_cast<std::uint32_t>(std::strtoul(end + 1, nullptr, 10));
         }
-        if (const char* e = std::getenv("STRIX_DS41_PREFILL_FP16_A8"); e != nullptr && std::string(e) == "1") options.fp16_keep_a8 = true;
-        if (const char* e = std::getenv("STRIX_DS41_PREFILL_FP16_FAST"); e != nullptr && std::string(e) == "1") options.fp16_fast = true;
-        if (const char* e = std::getenv("STRIX_DS41_PREFILL_FP16_WSPLIT"); e != nullptr && std::string(e) == "1") options.fp16_wsplit = true;
+        if (const char* e = std::getenv("STRIX_DS41_PREFILL_FP16_A8"); e != nullptr && std::string(e) == "1") opts.fp16_keep_a8 = true;
+        if (const char* e = std::getenv("STRIX_DS41_PREFILL_FP16_FAST"); e != nullptr && std::string(e) == "1") opts.fp16_fast = true;
+        if (const char* e = std::getenv("STRIX_DS41_PREFILL_FP16_WSPLIT"); e != nullptr && std::string(e) == "1") opts.fp16_wsplit = true;
         const char* v = std::getenv("STRIX_DS41_PREFILL_MOE_PERSIST");
         moe_persist = !(v != nullptr && v[0] == '0');
         v = std::getenv("STRIX_DS41_PREFILL_ASYNC_GATHER");
@@ -742,7 +742,7 @@ struct DevicePrefill::Impl {
         staged_gather_allowed = !(v != nullptr && v[0] == '0');
         staged_gather = staged_half && staged_gather_allowed;
         v = std::getenv("STRIX_DS41_PREFILL_EARLY_QB");
-        early_q_b = !(options.row_split && v != nullptr && v[0] == '0');
+        early_q_b = !(opts.row_split && v != nullptr && v[0] == '0');
     }
     [[nodiscard]] bool distributed() const noexcept { return options.world == 2U; }
     std::unique_ptr<ds41::WeightOverlay> overlay;  // weights_overlay (Q8_0 form)
@@ -1972,7 +1972,7 @@ PrefillResult DevicePrefill::run_from(std::span<const std::uint32_t> tokens, std
             }
             if (m.engram_ahead_requests.empty()) return;
             try {  // no thread: the next run reads its rows itself
-                m.engram_ahead = std::thread([&m] {
+                m.engram_ahead = std::thread([&m, ahead_log] {
                     const auto t0 = std::chrono::steady_clock::now();
                     try {
                         m.engram_ahead_out.resize(m.engram_ahead_requests.size() * 264U);

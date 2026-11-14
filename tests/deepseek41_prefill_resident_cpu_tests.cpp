@@ -36,10 +36,8 @@ void check(bool ok, const std::string& what) {
 }
 
 #ifdef _WIN32
-void set_env(const char* k, const char* v) { _putenv_s(k, v); }
 void unset_env(const char* k) { _putenv_s(k, ""); }
 #else
-void set_env(const char* k, const char* v) { setenv(k, v, 1); }
 void unset_env(const char* k) { unsetenv(k); }
 #endif
 
