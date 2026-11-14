@@ -12,8 +12,8 @@ def check(serve, hip, case):
             assert bound in capacity, bound
     elif case == "routes":
         capacity = hip.split("DevicePrefill::group_capacity() const noexcept", 1)[1].split("DevicePrefill::DraftSeed", 1)[0]
-        assert "group_options_supported(o)" in capacity
-        assert "cap.rejected_class_mask = 4U" in capacity
+        assert "group_decline_reason(o)" in capacity
+        assert "cap.rejected_class_mask = kSoloRouteClass" in capacity
         assert "if (!group_options_supported(o))" in hip
         assert "options.fast_dense = options.fast_dense || ds41::fast_profile::dense_on()" in hip
         assert "options.fast_moe = options.fast_moe || ds41::fast_profile::moe_on()" in hip
