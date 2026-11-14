@@ -11,6 +11,8 @@
 #include <cstdlib>
 #include <stdexcept>
 
+#include "strix/lever_cache.hpp"
+
 namespace strix::ds41::attn::hip {
 #if defined(STRIX_DS41_ATTN_TIMING)
 // Timing build only: thread 0 of every block records wall clock and shader cycles at entry and exit.
@@ -1810,10 +1812,10 @@ static void check_compress(const CompressView& v) {
 }
 // 2 fast, 1 ahead, 0 the default kernel
 static int compress_form() {
-    static const bool ahead_env = strix::envcfg::flag("STRIX_DS41_COMPRESS_AHEAD", false);
-    static const bool fast_env = strix::envcfg::flag("STRIX_DS41_COMPRESS_FAST", true);  // default on
-    if (compress_fast_mode < 0 ? fast_env : compress_fast_mode != 0) return 2;
-    if (compress_ahead_mode < 0 ? ahead_env : compress_ahead_mode != 0) return 1;
+    static strix::lever_cache<bool> ahead_env{[] { return strix::envcfg::flag("STRIX_DS41_COMPRESS_AHEAD", false); }};
+    static strix::lever_cache<bool> fast_env{[] { return strix::envcfg::flag("STRIX_DS41_COMPRESS_FAST", true); }};  // default on
+    if (compress_fast_mode < 0 ? fast_env.get() : compress_fast_mode != 0) return 2;
+    if (compress_ahead_mode < 0 ? ahead_env.get() : compress_ahead_mode != 0) return 1;
     return 0;
 }
 void enqueue_compress(const CompressView& v, hipStream_t stream) {
@@ -1849,8 +1851,8 @@ static unsigned select_slices(const SelectView& v) {
 }
 static dim3 select_merge_grid(const SelectView& v) { return dim3(v.pool == Pool::candidate_source ? 2U : 1U, v.rows); }
 bool select_v1() {
-    static const bool on = [] { const char* e = std::getenv("STRIX_DS41_SELECT_V1"); return e != nullptr && e[0] == '1'; }();
-    return on;
+    static strix::lever_cache<bool> on{[] { const char* e = std::getenv("STRIX_DS41_SELECT_V1"); return e != nullptr && e[0] == '1'; }};
+    return on.get();
 }
 template <bool Legacy>
 void launch_select(const SelectView& v, hipStream_t stream) {
@@ -1873,24 +1875,24 @@ unsigned attention_min_blocks_value = 0;
 }  // namespace
 void set_index_candidate_filter(int mode) { index_candidate_filter_mode = mode; }
 bool index_candidate_filter() {
-    static const bool env = strix::env_flag_default_on("STRIX_DS41_IDX_CAND_FILTER");
-    return index_candidate_filter_mode < 0 ? env : index_candidate_filter_mode != 0;
+    static strix::lever_cache<bool> env{[] { return strix::env_flag_default_on("STRIX_DS41_IDX_CAND_FILTER"); }};
+    return index_candidate_filter_mode < 0 ? env.get() : index_candidate_filter_mode != 0;
 }
 void set_index_direct(int mode) { index_direct_mode = mode; }
 bool index_direct() {
-    static const bool env = strix::env_flag_default_on("STRIX_DS41_IDX_DIRECT");
-    return index_direct_mode < 0 ? env : index_direct_mode != 0;
+    static strix::lever_cache<bool> env{[] { return strix::env_flag_default_on("STRIX_DS41_IDX_DIRECT"); }};
+    return index_direct_mode < 0 ? env.get() : index_direct_mode != 0;
 }
 void set_attention_segment_hpw(int mode) { attention_segment_hpw_mode = mode; }
 void set_attention_min_blocks(unsigned blocks) { attention_min_blocks_value = blocks; }
 // the grid size below which a call takes fewer heads per wave (STRIX_DS41_ATTN_MIN_BLOCKS, default 40: one per two CUs)
 static unsigned attention_min_blocks() {
-    static const unsigned env = [] { const char* e = std::getenv("STRIX_DS41_ATTN_MIN_BLOCKS"); return e != nullptr && e[0] != 0 ? static_cast<unsigned>(std::strtoul(e, nullptr, 10)) : 40U; }();
-    return attention_min_blocks_value != 0U ? attention_min_blocks_value : env;
+    static strix::lever_cache<unsigned> env{[] { const char* e = std::getenv("STRIX_DS41_ATTN_MIN_BLOCKS"); return e != nullptr && e[0] != 0 ? static_cast<unsigned>(std::strtoul(e, nullptr, 10)) : 40U; }};
+    return attention_min_blocks_value != 0U ? attention_min_blocks_value : env.get();
 }
 static bool attention_segment_hpw() {
-    static const bool env = strix::env_flag_default_on("STRIX_DS41_ATTN_SEG_HPW");
-    return attention_segment_hpw_mode < 0 ? env : attention_segment_hpw_mode != 0;
+    static strix::lever_cache<bool> env{[] { return strix::env_flag_default_on("STRIX_DS41_ATTN_SEG_HPW"); }};
+    return attention_segment_hpw_mode < 0 ? env.get() : attention_segment_hpw_mode != 0;
 }
 static void check_select_direct(const SelectView& v) {
     check_rows(v.rows);
@@ -1923,40 +1925,40 @@ static unsigned attention_hpw(const AttentionView& v) {
 int attention_lds_swizzle_mode = -1;
 void set_attention_lds_swizzle(int mode) { attention_lds_swizzle_mode = mode; }
 static bool attention_lds_swizzle() {
-    static const bool env = strix::envcfg::flag("STRIX_DS41_ATTN_LDS_SWIZZLE", true, strix::EnvFlagMatch::exact);  // default on, =0 off
-    return attention_lds_swizzle_mode < 0 ? env : attention_lds_swizzle_mode != 0;
+    static strix::lever_cache<bool> env{[] { return strix::envcfg::flag("STRIX_DS41_ATTN_LDS_SWIZZLE", true, strix::EnvFlagMatch::exact); }};  // default on, =0 off
+    return attention_lds_swizzle_mode < 0 ? env.get() : attention_lds_swizzle_mode != 0;
 }
 int attention_live_chunks_mode = -1;
 void set_attention_live_chunks(int mode) { attention_live_chunks_mode = mode; }
 bool attention_live_chunks() {
-    static const bool env = strix::envcfg::flag("STRIX_DS41_ATTN_LIVE_CHUNKS", true, strix::EnvFlagMatch::exact);  // default on, =0 off
-    return attention_live_chunks_mode < 0 ? env : attention_live_chunks_mode != 0;
+    static strix::lever_cache<bool> env{[] { return strix::envcfg::flag("STRIX_DS41_ATTN_LIVE_CHUNKS", true, strix::EnvFlagMatch::exact); }};  // default on, =0 off
+    return attention_live_chunks_mode < 0 ? env.get() : attention_live_chunks_mode != 0;
 }
 int attention_window_fold_mode = -1;
 void set_attention_window_fold(int mode) { attention_window_fold_mode = mode; }
 bool attention_window_fold() {
-    static const bool env = strix::envcfg::flag("STRIX_DS41_ATTN_WINDOW_FOLD", true, strix::EnvFlagMatch::exact);  // default on, =0 off
-    return attention_window_fold_mode < 0 ? env : attention_window_fold_mode != 0;
+    static strix::lever_cache<bool> env{[] { return strix::envcfg::flag("STRIX_DS41_ATTN_WINDOW_FOLD", true, strix::EnvFlagMatch::exact); }};  // default on, =0 off
+    return attention_window_fold_mode < 0 ? env.get() : attention_window_fold_mode != 0;
 }
 int attention_tile_f16_mode = -1;
 void set_attention_tile_f16(int mode) { attention_tile_f16_mode = mode; }
 static bool attention_tile_f16() {
-    static const bool env = strix::envcfg::flag("STRIX_DS41_ATTN_TILE_F16", true, strix::EnvFlagMatch::exact);  // default on, =0 off
-    return attention_tile_f16_mode < 0 ? env : attention_tile_f16_mode != 0;
+    static strix::lever_cache<bool> env{[] { return strix::envcfg::flag("STRIX_DS41_ATTN_TILE_F16", true, strix::EnvFlagMatch::exact); }};  // default on, =0 off
+    return attention_tile_f16_mode < 0 ? env.get() : attention_tile_f16_mode != 0;
 }
 int attention_wave_cap_mode = -1;
 void set_attention_wave_cap(int mode) { attention_wave_cap_mode = mode; }
 // the 6-wave form for a call: lean 3 at 4 heads per wave with compressed keys or 64 heads (default on, =0 off)
 static bool attention_wave_cap(const AttentionView& v) {
-    static const bool env = strix::envcfg::flag("STRIX_DS41_ATTN_WAVE_CAP", true, strix::EnvFlagMatch::exact);
-    return (attention_wave_cap_mode < 0 ? env : attention_wave_cap_mode != 0) && (v.idx_count != nullptr || v.heads >= 64U);
+    static strix::lever_cache<bool> env{[] { return strix::envcfg::flag("STRIX_DS41_ATTN_WAVE_CAP", true, strix::EnvFlagMatch::exact); }};
+    return (attention_wave_cap_mode < 0 ? env.get() : attention_wave_cap_mode != 0) && (v.idx_count != nullptr || v.heads >= 64U);
 }
 int attention_lean_mode = -1;
 void set_attention_lean(int mode) { attention_lean_mode = mode; }
 int attention_lean() {
     // default 3 (2 + permuted-key / dual-issue QK, PV addressing, rescale skip, spread exp), 2 softmax/PV + dequant, 1 softmax/PV only, 0 off
-    static const int env = [] { const char* e = std::getenv("STRIX_DS41_ATTN_LEAN"); return e == nullptr || e[0] == 0 ? 3 : e[0] >= '0' && e[0] <= '3' ? e[0] - '0' : 3; }();
-    const int m = attention_lean_mode < 0 ? env : attention_lean_mode;
+    static strix::lever_cache<int> env{[] { const char* e = std::getenv("STRIX_DS41_ATTN_LEAN"); return e == nullptr || e[0] == 0 ? 3 : e[0] >= '0' && e[0] <= '3' ? e[0] - '0' : 3; }};
+    const int m = attention_lean_mode < 0 ? env.get() : attention_lean_mode;
     return m > 3 ? 3 : m;
 }
 static void check_fold(const AttentionView& v) {
@@ -1977,8 +1979,8 @@ static void launch_attention(const AttentionView& v, hipStream_t stream) {
     hip_check(hipGetLastError(), "ds41 attention");
 }
 void enqueue_attention_bf16_prefill(const AttentionView& v, hipStream_t stream, int variant) {
-    static const int env_variant = [] { const char* e = std::getenv("STRIX_DS41_BF16_ATTN_VARIANT"); return e && e[0] == '2' ? 2 : 1; }();
-    if (variant == 0) variant = env_variant;
+    static strix::lever_cache<int> env_variant{[] { const char* e = std::getenv("STRIX_DS41_BF16_ATTN_VARIANT"); return e && e[0] == '2' ? 2 : 1; }};
+    if (variant == 0) variant = env_variant.get();
     (void)attention_hpw(v); // retain the incumbent view validation
     if(v.heads%16U)throw std::invalid_argument("BF16 prefill requires a multiple of 16 heads");
     if (variant == 2) hipLaunchKernelGGL(attention_bf16_chunk2, dim3(kMaxChunks,v.heads/16,v.rows),dim3(256),0,stream,v);
