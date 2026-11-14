@@ -28,6 +28,7 @@ enum class PrefillOption : unsigned {
     index_proj_wmma,    // Candidate BF16 indexer projections; explicit opt-in until qualified
     gdn_fp16_chunk,     // Candidate chunked GDN prefill on FP16 WMMA (qwen-gdn-fp16-chunk rev 2/3); explicit opt-in until qualified
     index_score_wmma,   // Candidate FAST BF16 index scores; explicit opt-in until qualified
+    ple_rows_f16,       // Candidate FAST PLE key/value rows on the shared FP16 dense core (q8_rows::tiled); explicit opt-in until qualified
     count
 };
 
@@ -42,6 +43,7 @@ inline constexpr std::array<PrefillOptionInfo, static_cast<unsigned>(PrefillOpti
     {"index_proj_wmma", "STRIX_PREFILL_INDEX_PROJ_WMMA", "idxproj16"},
     {"gdn_fp16_chunk", "STRIX_QPF2K_GDN_FP16_CHUNK", "gdnchunk16"},
     {"index_score_wmma", "STRIX_PREFILL_INDEX_SCORE_WMMA", "idxscore16"},
+    {"ple_rows_f16", "STRIX_PREFILL_PLE_ROWS_F16", "plef16"},
 }};
 
 // Options whose implementation is built in and enabled by default. An option joins this mask only when it is READY;
@@ -53,7 +55,8 @@ inline constexpr unsigned kPrefillGdnChunkRev3 = 1U << static_cast<unsigned>(Pre
 // Implemented candidates may be exercised explicitly without promotion to READY.
 inline constexpr unsigned kPrefillOptionsCandidates = (1U << static_cast<unsigned>(PrefillOption::index_proj_wmma)) |
     (1U << static_cast<unsigned>(PrefillOption::gdn_fp16_chunk)) |
-    (1U << static_cast<unsigned>(PrefillOption::index_score_wmma));
+    (1U << static_cast<unsigned>(PrefillOption::index_score_wmma)) |
+    (1U << static_cast<unsigned>(PrefillOption::ple_rows_f16));
 
 // Candidate index arithmetic is not qualified for MTP or nested scheduling.
 inline constexpr bool index_wmma_unqualified_route(unsigned mask, unsigned fast_components) {
