@@ -11,7 +11,10 @@ One shared vision runtime serves every family; a model only supplies an adapter
 
 ## Use
 
-Start the server with `--vision <vision GGUF>` on rank 0 and `--prefill-path device`. The flag is off by default; without
+Start the server with `--vision <vision GGUF>` on rank 0, `--prefill-path device` and an explicitly sized
+`--prefill-rows N`. Vision with `--deploy`, `--deploy-check` or `--prefill-rows auto` is refused until the admission
+estimates include retained source bytes, device peaks, cached/frame rows and transient copies. Manual sizing must
+leave room for these allocations on both ranks. The flag is off by default; without
 it no vision code runs and rank 1 holds nothing of it. Send an OpenAI-style chat completion with an `image_url` part
 (`data:` URL):
 
@@ -71,3 +74,6 @@ See [toggles](../toggles.md).
 - Video is refused.
 - One image adapter so far (DeepSeek V4.1); other models do not take images yet.
 - Needs the device prefill path.
+- Encoding is serialized with media preprocessing; peer/split scheduling and overlap with text-prefix prefill remain future work.
+- Image positions have zero Engram gates. Synthetic gate tests do not qualify complete served-image fidelity;
+  qualification evidence must name the tested revision and cover that arithmetic in the complete image workload.

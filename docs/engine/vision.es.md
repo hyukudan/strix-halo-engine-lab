@@ -11,7 +11,10 @@ en el par de dos nodos. Un runtime de visión compartido sirve a todas las famil
 
 ## Uso
 
-Arranque el servidor con `--vision <GGUF de visión>` en el rank 0 y `--prefill-path device`. La bandera está desactivada
+Arranque el servidor con `--vision <GGUF de visión>` en el rank 0, `--prefill-path device` y un tamaño explícito
+`--prefill-rows N`. Se rechaza visión con `--deploy`, `--deploy-check` o `--prefill-rows auto` hasta incluir en la admisión
+los bytes fuente retenidos, los picos de dispositivo, las filas de caché/trama y las copias temporales. El tamaño manual
+debe dejar espacio para estas asignaciones en ambos ranks. La bandera está desactivada
 por defecto; sin ella no se ejecuta código de visión y el rank 1 no guarda nada de él. Envíe un chat completion al estilo
 OpenAI con una parte `image_url` (URL `data:`):
 
@@ -75,3 +78,6 @@ Véase [toggles](../toggles.es.md).
 - Se rechaza el vídeo.
 - Hasta ahora un solo adaptador de imagen (DeepSeek V4.1); los demás modelos aún no admiten imágenes.
 - Requiere la ruta de prefill en dispositivo.
+- La codificación se serializa con el preprocesamiento; la planificación peer/split y el solapamiento con el prefill del prefijo de texto quedan pendientes.
+- Las posiciones de imagen tienen puertas Engram a cero. Las pruebas sintéticas no cualifican la fidelidad de imágenes servidas;
+  la evidencia debe identificar la revisión probada y cubrir esa aritmética en la carga completa de imagen.

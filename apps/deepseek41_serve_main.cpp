@@ -1147,19 +1147,8 @@ void transfer_frame(BatchForward& fwd, std::span<const std::byte> out, std::vect
         if (peer[0] == 0U || peer[0] > (std::uint64_t{1} << 32U)) throw std::runtime_error("embed frame: implausible length from rank 0");
         in->resize(static_cast<std::size_t>(peer[0]));
     }
-    const std::size_t n = in ? in->size() : out.size();
-    std::vector<std::byte> zeros, back;
-    for (std::size_t at = 0; at < n; at += kImportChunk) {
-        const std::size_t take = std::min(kImportChunk, n - at);
-        back.resize(take);
-        if (in) {
-            zeros.assign(take, std::byte{0});
-            fwd.exchange_host(zeros, back);
-            std::memcpy(in->data() + at, back.data(), take);
-        } else {
-            fwd.exchange_host(out.subspan(at, take), back);
-        }
-    }
+    strix::pair::transfer_embed_frame_bytes(out, in ? std::span<std::byte>(*in) : std::span<std::byte>{},
+        kImportChunk, [&](auto sent, auto received) { fwd.exchange_host(sent, received); });
 }
 
 // The trellis plans (site, buffers, row count; o_a group plans; head rows) are created by the first step that submits
@@ -3985,6 +3974,12 @@ int main(int argc, char** argv) try {
     if (a.model.empty()) throw std::invalid_argument("usage: strix-deepseek41-serve MODEL.gguf --rank R --transport T | --group-manifest FILE | --describe-json | --deploy FILE|auto [--deploy-check]");
     if (!a.manifest.empty()) apply_manifest(a);
     if (a.deploy_check && a.deploy.empty()) a.deploy = "auto";
+    // Vision's retained host data and lazy device peaks are not in either admission estimate yet.
+    // Refuse before deployment preparation and before rank 1 clears its --vision flag.
+    if (!a.vision.empty() && !a.deploy.empty())
+        throw std::invalid_argument("--vision is not supported with --deploy/--deploy-check: vision peak footprint not implemented");
+    if (!a.vision.empty() && a.prefill_rows_auto)
+        throw std::invalid_argument("--vision is not supported with --prefill-rows auto: vision peak footprint not implemented; use an explicitly sized --prefill-rows N");
     if (!a.deploy.empty()) prepare_deployment(a);
     if (a.session_ram_bytes && a.session_ram_bytes < (16ULL << 20U) + std::uint64_t{a.context} * 2048ULL) {
         a.session_ram_bytes = 0; a.session_dir.clear();
