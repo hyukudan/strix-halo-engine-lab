@@ -105,7 +105,7 @@ and read the tokenizer from `MODEL_DIR/tokenizer.json`:
 
 Defaults: 8 request slots (`--slots`, at most 8), 8192 positions per slot (`--capacity`), exact MTP self-speculation
 with one request in flight, batched MTP verify with more (`STRIX_GLM_SERVE_G2=0` = batched plain steps), decode-first
-chunked prefill of 512 tokens while others decode (`--prefill-chunk 0` = whole prompts). `--serial` admits one
+chunked prefill of 512 tokens while others decode (`--prefill-chunk 0` = whole prompts). The chunk is resolved by the same route policy as the CLI: both ranks print `effective serve-prefill-chunk=...` with the dense core its calls take, and the reason whenever a chunk declines the large-call core. `--serial` admits one
 request at a time; `--api-key-file F` requires a bearer key. `--selftest N` on rank 0 (no HTTP) runs N built-in
 prompts together and each alone and reports EXACT/FAIL with tok/s per concurrency level.
 
