@@ -18,11 +18,13 @@ namespace {
 using namespace detail;
 namespace M = strix::glm::moe;
 
-M::Exl3 view(const Linear& l) {
-    if (l.raw.trellis == nullptr) throw std::logic_error("fast MoE: expert not loaded raw");
+// i4: a fast_i4 routed expert (trellis freed; the W4A16 kernels read only its suh / svh).
+M::Exl3 view(const Linear& l, bool i4 = false) {
+    if (l.raw.trellis == nullptr && !(i4 && l.raw.suh != nullptr && l.raw.svh != nullptr))
+        throw std::logic_error("fast MoE: expert not loaded raw");
     return M::Exl3{l.raw.trellis, l.raw.suh, l.raw.svh, l.raw.input, l.raw.output, l.raw.bits};
 }
-M::ExpertSlices slices(const Mlp& m) { return M::ExpertSlices{view(m.gate), view(m.up), view(m.down)}; }
+M::ExpertSlices slices(const Mlp& m, bool i4 = false) { return M::ExpertSlices{view(m.gate, i4), view(m.up, i4), view(m.down, i4)}; }
 
 class FastMoe final : public MoePath {
 public:
@@ -33,6 +35,7 @@ public:
         (void)hipFree(ws_.base);
         for (auto& [k, p] : experts_) (void)hipFree(p);
     }
+    bool publishes() const override { return true; }
     void forward(const MoeLayerWeights& w, const CallCtx& c, const float* x, const std::uint32_t* ids, const float* wts,
                  float* y) override {
         const auto R = static_cast<unsigned>(c.rows.size());
@@ -46,6 +49,15 @@ public:
         v.shared = slices(w.shared);
         v.out = y;
         v.ws = ws_;
+        v.publish = c.publish;
+        if (w.i4.on()) {  // stored routed INT4: W4A16 for every row regime
+            for (unsigned m = 0; m < 3; ++m) {
+                v.i4.wq[m] = w.i4.wq[m];
+                v.i4.ws[m] = w.i4.ws[m];
+            }
+            M::enqueue_experts(v, c.stream);
+            return;
+        }
         if (c.decode && M::pipe_enabled()) M::enqueue_experts_pipe(v, c.stream);
         else M::enqueue_experts(v, c.stream);
     }
@@ -64,7 +76,7 @@ private:
         if (w.experts.size() != M::kExperts) throw std::logic_error("fast MoE: 288 experts expected");
         std::vector<M::ExpertSlices> h;
         h.reserve(M::kExperts);
-        for (const Mlp& e : w.experts) h.push_back(slices(e));
+        for (const Mlp& e : w.experts) h.push_back(slices(e, w.i4.on()));
         auto* d = dalloc<M::ExpertSlices>(h.size());
         try {
             hip_ok(hipMemcpy(d, h.data(), h.size() * sizeof(M::ExpertSlices), hipMemcpyHostToDevice), "expert slices");

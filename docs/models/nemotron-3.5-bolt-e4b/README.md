@@ -285,6 +285,35 @@ process per run, both orders, prefill tok/s (prompt time):
 Decode after the prompt (128 tokens) is unchanged: 2K / 8K / 32K 47.3 / 42.1 / 29.5 tok/s after `a8`, 47.3 / 42.1 /
 29.4 after v1.
 
+### Two nodes: pipeline prompt prefill (opt-in)
+
+`STRIX_G4_PAIR=1` runs the prompt prefill of one request on two nodes as a two-stage layer pipeline; the default
+stays single-node. Rank 0 runs layers 0-20 of each 512-row prompt chunk while rank 1 runs layers 21-41 of the
+previous chunk. The seam (87 MB per chunk over the USB4 link, about 17 ms) carries the residual rows, the next
+layer's input norm, the taps and rank 0's K/V rows, so rank 1 ends the prompt holding the complete KV cache and
+decodes alone; rank 0 exits. Per-layer arithmetic is unchanged: the KV state digest and a digest of the raw logits
+of every decoded token (`STRIX_G4_LOGITS_DIGEST=1`) equal the single-node `fast` route byte for byte (2K, 8K and 32K,
+cuts 19, 21, 23 and 24). A prompt of one chunk runs on rank 1 alone.
+
+```bash
+# Same binary, model and prompt on both nodes; rank 1 prints the answer.
+STRIX_G4_PAIR=1 strix-gemma4-decode --model MODEL.gguf --profile fast ... --rank 0   # node A
+STRIX_G4_PAIR=1 strix-gemma4-decode --model MODEL.gguf --profile fast ... --rank 1   # node B
+```
+
+`--transport tcp --peer HOST` replaces the default USB4 link; `STRIX_G4_PAIR_CUT` (default 21, the fastest of
+19 / 21 / 23 at 8K and of 21 / 24 at 32K) moves the split. Q4_K_M, `fast`, `--draft off`, fresh process per run, same binary, single node and
+pair alternated (ABAB), main 51b42906e with WMMA prefill attention; prefill tok/s (prompt time):
+
+| Prompt | One node | **Two nodes** | Speedup |
+|---|---:|---:|---:|
+| 2K | 2,866 (0.71 s) | **4,132 (0.50 s)** | 1.44x |
+| 8K | 2,761 (2.97 s) | **4,804 (1.71 s)** | 1.74x |
+| 32K | 2,322 (14.11 s) | **3,965 (8.27 s; runs 7.78 and 8.76 s)** | 1.71x |
+
+The ceiling with 512-row chunks is 2C/(C+1) for C chunks (2K 1.60x, 8K 1.88x, 32K 1.97x). Decode after the prompt
+is the single-node decode on rank 1, same speed within noise (measured on main 3de139c0c: MTP drafter, 128 tokens, 2K / 8K / 32K: one node 69.7 / 62.3 / 38.0 tok/s, after the pair prefill 69.8 / 62.7 / 37.9; same KV state bytes, so the drafter receives the same taps).
+
 `a8` prompt prefill (`fast` on non-Q4_K_M packs; `STRIX_G4_PREFILL_IDENTITY=a8`, valid only with the `g4-a8-v1` decode; with another decode
 identity exact prefill runs and one stderr line says so). The prompt runs in 512-row chunks on the same `g4-a8-v1`
 linears as decode (IU8 WMMA for long chunks, the decode kernels for up to 8 rows), canonical attention: every prompt

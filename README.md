@@ -5,7 +5,7 @@
 This is a C++/HIP inference engine for AMD Strix Halo: Ryzen AI Max+ 395, Radeon 8060S (`gfx1151`), 128 GB of unified
 memory, Linux and ROCm. It runs on one node, or on two nodes linked by USB4. An RTX PRO 6000 adds optional routes.
 It runs Qwen3.8-Flash-Next, DeepSeek V4.1 Flash, MiniMax M3.1 Flash and GLM-5.3 Flash in production.
-Nemotron 3.5 Bolt E4B and MiniMax H3 (audio + video) are opt-in builds.
+Nemotron 3.5 Bolt E4B, MiniMax H3 (audio + video) and MiniMax-H3-Image (text to image) are opt-in builds.
 The default path is exact: its tokens are identical to the declared reference path.
 How we measure and what "exact" covers: [methodology](docs/methodology.md).
 
@@ -23,7 +23,10 @@ off switches are in [performance](docs/performance.md) and [measured gains](docs
 | MiniMax M3.1 Flash | pair | 23.10 tok/s (1K) | 596 tok/s at 8K, 529 at 32K (exact) |
 | GLM-5.3 Flash | pair | 44.5 tok/s (MTP, code) | 541 tok/s at 8K, 529 at 32K (exact) |
 | Nemotron 3.5 Bolt E4B | 1 node | 91.9 tok/s (C1) | 2,780 tok/s at 8K, 2,336 at 32K (`fast`) |
+| Nemotron 3.5 Bolt E4B | 2 nodes (pipelined prefill, opt-in) | - | 4,804 tok/s at 8K, 3,965 at 32K (`fast`, same bytes as 1 node) |
 | MiniMax H3 | pair | 5 s 1344x768 clip with audio in 405.5 s | - |
+| MiniMax-H3-Image (int8, 6 steps) | 1 node | 1024x1024 image in 33.6 s, 2048x2048 in 52 s | - |
+| MiniMax-H3-Image (int8, 6 steps) | pair | 1024x1024 image in 22.4 s, 2048x2048 in 44.6 s | - |
 
 <a id="hardware"></a>
 
@@ -54,7 +57,9 @@ ninja -C build strix-hip-decode-token
 ```
 
 The run prints a JSON receipt with token IDs and timing. Add `--print-effective-config` to see the resolved
-configuration before any device work.
+configuration before any device work. With the [drafter bundle](docs/engine/speculative/mtp-native-cli.md#default-mtp-drafter-bundle)
+beside the model this command decodes with exact MTP speculation (the MTP figure above); without it, or with
+`--no-mtp` / `STRIX_MTP=0`, it decodes the same tokens one at a time.
 
 Pair (DeepSeek). Two nodes with 128 GB each and two USB4 cables. Run on both nodes, with `--rank 1` and the other
 address on the second one:
@@ -81,8 +86,9 @@ Every engine's build and launch command: [getting started](docs/getting-started/
 | DeepSeek V4.1 Flash (2-bit experts, 6.5-bit trellis dense) | pair over USB4 | exact default; `fast` | 2 x 128 GB |
 | MiniMax M3.1 Flash (EXL3 3.06 bpw) | pair TP2 | exact | 2 x 128 GB |
 | GLM-5.3 Flash (EXL3 4.05 bpw) | pair TP2 | exact; opt-in WMMA prefill | 2 x 128 GB |
-| Nemotron 3.5 Bolt E4B (Q4_K_M; EXL3 for `quality`) | single, opt-in build | exact default; `fast`; `quality` | 128 GB node |
+| Nemotron 3.5 Bolt E4B (Q4_K_M; EXL3 for `quality`) | single, opt-in build; opt-in pair prompt prefill (`STRIX_G4_PAIR=1`, same bytes) | exact default; `fast`; `quality` | 128 GB node |
 | MiniMax H3 (audio + video) | single or pair, opt-in build | dense reference; FAST levers each with its own flag | 128 GB per node |
+| MiniMax-H3-Image (int8 or W4A8) | single or pair (`strix-h3-image`), opt-in build | GPU VAE; `--parallel sequence` for one image, `request` for several | 128 GB per node |
 
 <a id="discrete-gpu"></a>
 

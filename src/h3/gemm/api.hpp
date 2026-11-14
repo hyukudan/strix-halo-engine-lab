@@ -33,6 +33,8 @@
 #include <hip/hip_runtime.h>
 
 #include <cstdint>
+#include <cstdlib>
+#include <initializer_list>
 #include <map>
 #include <mutex>
 #include <stdexcept>
@@ -41,6 +43,7 @@
 #include <vector>
 
 #include "h3/gemm/kernels.hpp"
+#include "strix/env_flags.hpp"
 
 namespace strix::h3::gemm {
 
@@ -48,7 +51,21 @@ struct Weights {
     const std::int8_t* codes = nullptr;  // device, [n][k] row-major (16-byte aligned)
     const float* scales = nullptr;       // device, [n]
     std::uint32_t n = 0, k = 0;
+    Operand operand = Operand::int8_convrot;
+    const std::uint8_t* group_fp8 = nullptr;
+    const float* group_f32 = nullptr;
+    const float* codebook = nullptr;
+    std::uint32_t group_size = 16;
+    const std::uint8_t* scale_ids = nullptr;
+    const std::uint16_t* pair_lut = nullptr;
+    unsigned group_shift = 0;
 };
+
+inline void set_operand(dev::GemmArgs& a, const Weights& w) {
+    a.operand=w.operand; a.group_fp8=w.group_fp8; a.group_f32=w.group_f32;
+    a.codebook=w.codebook; a.group_size=w.group_size;
+    a.scale_ids=w.scale_ids; a.pair_lut=w.pair_lut; a.group_shift=w.group_shift;
+}
 
 namespace detail {
 inline void hip_check(hipError_t e, const char* what) {
@@ -157,6 +174,9 @@ inline void check(const std::uint16_t* x, std::uint64_t x_ld, std::uint32_t rows
     else if (!w.k || w.k % 256U || w.k > 16384U) bad = "k must be a positive multiple of 256, at most 16384";
     else if (!w.n || w.n % (swiglu ? 512U : 256U)) bad = swiglu ? "n must be a positive multiple of 512" : "n must be a positive multiple of 256";
     else if (!w.codes || !w.scales || !aligned16(w.codes)) bad = "weights missing or not 16-byte aligned";
+    else if (w.operand==Operand::w4a8 && ((w.pair_lut ? (!w.scale_ids || w.group_shift>=32U ||
+             (1U<<w.group_shift)!=w.group_size) : (!w.group_fp8==!w.group_f32)) || w.group_size<4 ||
+             (16%w.group_size && w.group_size%16) || w.k%w.group_size)) bad="invalid packed operand scales";
     else if (static_cast<std::uint64_t>(rows) * w.k > 0xffffffffULL || static_cast<std::uint64_t>(w.n) * w.k > 0xffffffffULL)
         bad = "rows * k and n * k must stay below 2^32 (split the rows)";
     else if (!ws.codes() || rows > ws.max_rows() || w.k > ws.max_k()) bad = "workspace too small";
@@ -165,8 +185,25 @@ inline void check(const std::uint16_t* x, std::uint64_t x_ld, std::uint32_t rows
     if (bad) throw std::invalid_argument(std::string("h3 gemm: ") + bad);
 }
 inline void launched(const char* what) { hip_check(hipGetLastError(), what); }
-// Tile width: measured fastest per shape on gfx1151; identical bits either way.
-inline bool wide_tiles(std::uint32_t rows, const Weights& w) { return w.n >= 16384U && rows >= 32768U; }
+// Narrow-tile row limit (see plain_width).
+constexpr std::uint32_t kNarrowRowsMax = 8192U;
+// Tile width: measured fastest per shape on gfx1151; identical bits either way (int32 accumulation over the full K,
+// per-element epilogue). Narrow 64-column tiles for the n <= 8192 projections (attention out, fc2) at image-scale
+// rows: 1280 rows x 5376 give only 210 128-column tiles, a ragged last wave on 40 CUs; 64-column tiles measured
+// 7-8 % faster there (gfx1151 kernel trace: out 2259 -> 2096 us, fc2 4648 -> 4257 us per call).
+// int8_convrot only: the W4A8 B-fetch kernel measured 1.9 % slower per image step with 64-column tiles.
+// STRIX_H3_GEMM_BN=64/128/256 forces one plain width where it divides n (benchmarks).
+inline unsigned plain_width(std::uint32_t rows, const Weights& w) {
+    static const int forced = [] {
+        constexpr int widths[] = {64, 128, 256};
+        const std::size_t i = strix::env_choice("STRIX_H3_GEMM_BN", 3, {"64", "128", "256"});  // 3 = unset: no forced width
+        return i < 3U ? widths[i] : 0;
+    }();
+    if (forced && w.n % static_cast<unsigned>(forced) == 0U) return static_cast<unsigned>(forced);
+    if (w.n >= 16384U && rows >= 32768U) return 256U;
+    if (w.operand == Operand::int8_convrot && w.n <= 8192U && rows <= kNarrowRowsMax) return 64U;
+    return 128U;
+}
 }  // namespace detail
 
 inline void linear(const std::uint16_t* x, std::uint64_t x_ld, std::uint32_t rows, const Weights& w, Workspace& ws, std::uint16_t* y,
@@ -178,8 +215,12 @@ inline void linear(const std::uint16_t* x, std::uint64_t x_ld, std::uint32_t row
     dev::GemmArgs a;
     a.a = ws.codes(); a.b = w.codes; a.row_scale = ws.row_scale(); a.ch_scale = w.scales; a.m = rows; a.n = w.n; a.k = w.k;
     a.out.ptr[0] = y; a.out.ld = y_ld; a.out.seg_cols = w.n;
-    if (detail::wide_tiles(rows, w)) launch_gemm<256U, dev::Epi::plain>(a, stream);
-    else launch_gemm<128U, dev::Epi::plain>(a, stream);
+    set_operand(a, w);
+    switch (detail::plain_width(rows, w)) {
+        case 256U: launch_gemm<256U, dev::Epi::plain>(a, stream); break;
+        case 64U: launch_gemm<64U, dev::Epi::plain>(a, stream); break;
+        default: launch_gemm<128U, dev::Epi::plain>(a, stream); break;
+    }
     detail::launched("gemm launch");
 }
 
@@ -193,6 +234,7 @@ inline void linear_fc1_swiglu(const std::uint16_t* x, std::uint64_t x_ld, std::u
     dev::GemmArgs a;
     a.a = ws.codes(); a.b = permuted.codes; a.row_scale = ws.row_scale(); a.ch_scale = permuted.scales; a.silu = table;
     a.m = rows; a.n = permuted.n; a.k = permuted.k;
+    set_operand(a, permuted);
     a.out.ptr[0] = h; a.out.ld = h_ld; a.out.seg_cols = permuted.n / 2U;
     launch_gemm<256U, dev::Epi::swiglu>(a, stream);
     detail::launched("gemm launch");

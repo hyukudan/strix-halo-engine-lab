@@ -12,6 +12,8 @@
 //   - x_embedder runs on a contiguous row view: one rounding (fp16(x W^T + b));
 //   - output: per block, norm_out + proj_out + unpatchify of its tokens, the first 3 frames of every block dropped
 //     (4 T - 3 ceil(T / 5) frames); no tiling, no temporal blending.
+// Image --fast-vae-fp16 uses vae::GpuDecoder(image=true) and the shared kernels;
+// this class retains the distilled video's windowed and temporal policy.
 
 #include <string>
 #include <vector>

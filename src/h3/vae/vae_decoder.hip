@@ -1,4 +1,7 @@
+#include "strix/env_flags.hpp"
 #include "h3/vae/vae_decoder.hpp"
+#include "h3/vae/precision.hpp"
+#include "h3/vae/latent_stats.hpp"
 
 #include <hip/hip_runtime.h>
 
@@ -58,21 +61,43 @@ struct GpuDecoder::Dev {
     }
     _Float16* upload(const H16& v) {
         _Float16* p = alloc(v.size());
-        ck(hipMemcpy(p, v.data(), v.size() * 2, hipMemcpyHostToDevice), "upload");
+        // on the decoder's own stream, not the legacy default stream: a decoder loaded while another stream computes
+        // (the image DiT sampling) neither waits for nor stalls that stream
+        ck(hipMemcpyAsync(p, v.data(), v.size() * 2, hipMemcpyHostToDevice, st), "upload");
+        ck(hipStreamSynchronize(st), "upload");
         return p;
     }
     DevLinear upload(const LinearH& l) { return {upload(l.w), upload(l.b), l.in, l.out}; }
 };
 
-GpuDecoder::GpuDecoder(const std::string& weights, int layers, bool fused_swiglu) : layers_(layers), fused_(fused_swiglu) {
+GpuDecoder::GpuDecoder(const std::string& weights, int layers, bool fused_swiglu, bool image) : layers_(layers), fused_(fused_swiglu), image_(image) {
     SafeTensors stf(weights);
     head_ = load_head(stf);
+    const int kDim = head_.x_embed.out, kQkv = 3 * kDim, kFf = 4 * kDim, kFf2 = 2 * kFf;
+    if ((!image_ && kDim != vae::kDim) || (image_ && kDim != 1024 && kDim != vae::kDim))
+        throw std::invalid_argument("h3 vae decoder: unsupported width");
+    if (image_ && (layers != 24 || head_.proj.out != 768 || head_.proj.in != kDim))
+        throw std::invalid_argument("image VAE FAST: expected 24 layers and single-frame projection");
+    if (head_.x_embed.in != kLatentC || head_.registers.size() != std::size_t(kRegisters * kDim) ||
+        head_.norm_out_w.size() != std::size_t(kDim) || head_.norm_out_b.size() != std::size_t(kDim))
+        throw std::invalid_argument("h3 vae decoder: unsupported head geometry");
+    if (image_ && head_.latents_mean.empty() && head_.latents_std.empty()) {
+        for (int c = 0; c < kLatentC; ++c) {
+            head_.latents_mean.push_back(f2h(kLatentsMean[c]));
+            head_.latents_std.push_back(f2h(kLatentsStd[c]));
+        }
+    }
     auto dev = std::make_unique<Dev>();  // released on any exception below
     Dev& d = *dev;
     ck(hipStreamCreate(&d.st), "stream");
     for (auto& e : d.ev) ck(hipEventCreate(&e), "event");
     for (int l = 0; l < layers; ++l) {
         const LayerH w = load_layer(stf, l);
+        if (w.norm1.size() != std::size_t(kDim) || w.norm2.size() != std::size_t(kDim) ||
+            w.scale1.size() != std::size_t(kDim) || w.scale2.size() != std::size_t(kDim) ||
+            w.qkv.in != kDim || w.qkv.out != kQkv || w.out.in != kDim || w.out.out != kDim ||
+            w.w1.in != kDim || w.w1.out != kFf2 || w.w2.in != kFf || w.w2.out != kDim)
+            throw std::invalid_argument("h3 vae decoder: unsupported block geometry");
         LinearH w1 = w.w1;
         if (fused_) {  // rows (and bias) in the fused epilogue's gate / up order
             LinearH p = w1;
@@ -94,7 +119,7 @@ GpuDecoder::GpuDecoder(const std::string& weights, int layers, bool fused_swiglu
     d.ln_b = d.upload(head_.norm_out_b);
     const std::size_t L = Dev::kMaxL, Lp = Dev::kMaxLp;
     d.x = d.alloc(L * kDim); d.a = d.alloc(L * kDim); d.qkv = d.alloc(L * kQkv);
-    d.q = d.alloc(32 * Lp * 64); d.k = d.alloc(32 * Lp * 64); d.v = d.alloc(32 * Lp * 64);
+    d.q = d.alloc(std::size_t(kDim) * Lp); d.k = d.alloc(std::size_t(kDim) * Lp); d.v = d.alloc(std::size_t(kDim) * Lp);
     d.o = d.alloc(L * kDim); d.hb = d.alloc(L * kFf2); d.g = d.alloc(L * kFf);
     d.proj_out = d.alloc(std::size_t(Dev::kMaxP) * kProj); d.zin = d.alloc(std::size_t(kLatentC) * Dev::kMaxP);
     d.rc = d.alloc(L * kRotPairs); d.rs = d.alloc(L * kRotPairs);
@@ -106,17 +131,20 @@ GpuDecoder::~GpuDecoder() { delete d_; }
 
 H16 GpuDecoder::decode_call(const H16& dec_in, int nt, int ny, int nx, CallTiming* timing, H16* h_out, int stop_after,
                             const H16* h_in_override, H16* rows_out) {
+    const int kDim = head_.x_embed.out, kQkv = 3 * kDim, kFf = 4 * kDim, kFf2 = 2 * kFf;
+    const unsigned heads = unsigned(kDim / kHeadDim), pairs = kDim == 1024 ? 16U : 24U;
     const unsigned P = unsigned(nt * ny * nx), L = P + kSuffix, Lp = (L + 63U) / 64U * 64U;
+    if (image_ && nt != 1) throw std::invalid_argument("image VAE FAST: one latent frame required");
     if (nt < 1 || ny < 1 || nx < 1 || P > Dev::kMaxP) throw std::invalid_argument("h3 vae decoder: call box must be 1..7 x 1..16 x 1..16 (P <= 1792)");
     if (h_in_override) {
-        if (h_in_override->size() != std::size_t(L) * kDim) throw std::invalid_argument("h3 vae decoder: residual input length != L x 2048");
+        if (h_in_override->size() != std::size_t(L) * kDim) throw std::invalid_argument("h3 vae decoder: residual input length != L x width");
     } else if (dec_in.size() != std::size_t(kLatentC) * P) {
         throw std::invalid_argument("h3 vae decoder: call input length != 24 x nt x ny x nx");
     }
     if (stop_after > layers_) throw std::invalid_argument("h3 vae decoder: stop_after beyond the loaded layers");
     auto& rope = d_->rope_cache[{nt, ny, nx}];
     if (rope.first.empty()) {
-        const RopeTable r = rope_table(nt, ny, nx);
+        const RopeTable r = image_ ? image_rope_table(ny, nx, false, int(pairs / 8U)) : rope_table(nt, ny, nx);
         rope.first.resize(r.c.size()); rope.second.resize(r.s.size());
         for (std::size_t i = 0; i < r.c.size(); ++i) { rope.first[i] = f2h(r.c[i]); rope.second[i] = f2h(r.s[i]); }
     }
@@ -129,12 +157,12 @@ H16 GpuDecoder::decode_call(const H16& dec_in, int nt, int ny, int nx, CallTimin
         ck(hipMemcpyAsync(d_->x, h_in_override->data(), std::size_t(L) * kDim * 2, hipMemcpyHostToDevice, st), "h_in");
     } else {
         ck(hipMemcpyAsync(d_->zin, dec_in.data(), std::size_t(kLatentC) * P * 2, hipMemcpyHostToDevice, st), "zin");
-        gpu::embed(d_->zin, d_->x_embed.w, d_->x_embed.b, d_->registers, d_->x, P, st);
+        gpu::embed(d_->zin, d_->x_embed.w, d_->x_embed.b, d_->registers, d_->x, P, st, unsigned(kDim));
     }
     ck(hipEventRecord(d_->ev[1], st), "ev");
     const int nl = stop_after < 0 ? layers_ : stop_after;
     // STRIX_H3_VAE_PROFILE=1: events around every op of every layer (timing only; same launches)
-    static const bool profile = [] { const char* v = std::getenv("STRIX_H3_VAE_PROFILE"); return v && v[0] == '1'; }();
+    static const bool profile = strix::envcfg::flag("STRIX_H3_VAE_PROFILE", false);
     std::vector<hipEvent_t> pev;
     const auto mark = [&] {
         if (!profile) return;
@@ -146,17 +174,17 @@ H16 GpuDecoder::decode_call(const H16& dec_in, int nt, int ny, int nx, CallTimin
     mark();
     for (int li = 0; li < nl; ++li) {
         const auto& w = d_->layers[std::size_t(li)];
-        gpu::rms_norm(d_->x, w.norm1, d_->a, L, st); mark();
+        gpu::rms_norm(d_->x, w.norm1, d_->a, L, st, unsigned(kDim)); mark();
         gpu::gemm(d_->a, kDim, w.qkv.w, w.qkv.b, d_->qkv, kQkv, L, kQkv, kDim, st); mark();
-        gpu::rms_rope(d_->qkv, d_->rc, d_->rs, d_->q, d_->k, d_->v, L, Lp, st); mark();
-        gpu::attention(d_->q, d_->k, d_->v, d_->o, L, Lp, st); mark();
+        gpu::rms_rope(d_->qkv, d_->rc, d_->rs, d_->q, d_->k, d_->v, L, Lp, st, heads, pairs); mark();
+        gpu::attention(d_->q, d_->k, d_->v, d_->o, L, Lp, st, unsigned(kDim)); mark();
         gpu::gemm_residual(d_->o, kDim, w.out.w, w.out.b, w.scale1, d_->x, kDim, L, kDim, kDim, st); mark();
-        gpu::rms_norm(d_->x, w.norm2, d_->a, L, st); mark();
+        gpu::rms_norm(d_->x, w.norm2, d_->a, L, st, unsigned(kDim)); mark();
         if (fused_) {
             gpu::gemm_swiglu(d_->a, kDim, w.w1.w, w.w1.b, d_->g, kFf, L, kFf2, kDim, st); mark(); mark();
         } else {
             gpu::gemm(d_->a, kDim, w.w1.w, w.w1.b, d_->hb, kFf2, L, kFf2, kDim, st); mark();
-            gpu::swiglu(d_->hb, d_->g, L, st); mark();
+            gpu::swiglu(d_->hb, d_->g, L, st, unsigned(kFf)); mark();
         }
         gpu::gemm_residual(d_->g, kFf, w.w2.w, w.w2.b, w.scale2, d_->x, kDim, L, kDim, kFf, st); mark();
     }
@@ -179,15 +207,16 @@ H16 GpuDecoder::decode_call(const H16& dec_in, int nt, int ny, int nx, CallTimin
         h_out->resize(std::size_t(L) * kDim);
         ck(hipMemcpyAsync(h_out->data(), d_->x, h_out->size() * 2, hipMemcpyDeviceToHost, st), "h_out");
     }
-    gpu::layer_norm(d_->x, d_->ln_w, d_->ln_b, d_->a, P, st);
-    gpu::gemm(d_->a, kDim, d_->proj.w, d_->proj.b, d_->proj_out, kProj, P, kProj, kDim, st);
+    gpu::layer_norm(d_->x, d_->ln_w, d_->ln_b, d_->a, P, st, unsigned(kDim));
+    const unsigned projection = image_ ? 768U : kProj;
+    gpu::gemm(d_->a, kDim, d_->proj.w, d_->proj.b, d_->proj_out, projection, P, projection, kDim, st);
     ck(hipEventRecord(d_->ev[3], st), "ev");
-    H16 rows(std::size_t(P) * kProj);
+    H16 rows(std::size_t(P) * projection);
     ck(hipMemcpyAsync(rows.data(), d_->proj_out, rows.size() * 2, hipMemcpyDeviceToHost, st), "proj rows");
     ck(hipStreamSynchronize(st), "sync");
     H16 out;
     if (rows_out) *rows_out = std::move(rows);  // caller unpatchifies (off the GPU's critical path)
-    else out = unpatchify(rows, nt, ny, nx);
+    else out = image_ ? precision::unpatchify<half_bits>(rows, nt, ny, nx, 1) : unpatchify(rows, nt, ny, nx);
     if (timing) {
         float a = 0, b = 0;
         ck(hipEventElapsedTime(&a, d_->ev[0], d_->ev[1]), "elapsed");

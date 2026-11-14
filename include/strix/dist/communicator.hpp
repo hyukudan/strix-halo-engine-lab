@@ -1,4 +1,5 @@
 #pragma once
+#include "strix/dist/exchange_direction.hpp"
 #include "strix/dist/staged_ready.hpp"
 #include "strix/dist/transport_caps.hpp"
 #include "strix/dist/host_wait.hpp"
@@ -175,7 +176,7 @@ struct Tag {
     std::uint32_t layer = 0;
     std::uint64_t request = 0;
 };
-enum class TagKind : std::uint32_t { half_sum = 1, raw_slots = 2, argmax = 3, control = 4 };
+enum class TagKind : std::uint32_t { half_sum = 1, raw_slots = 2, argmax = 3, control = 4, engram_rows = 5 };
 
 struct CommunicatorStats {
     std::uint64_t exchanges = 0;
@@ -235,6 +236,13 @@ public:
     // STRIX_DIST_HOST_CRC_OVERLAP=1 additionally prepares TX CRCs and validates RX
     // chunks on persistent workers while the progress thread moves other chunks.
     void exchange(hipStream_t stream, const void* local, void* remote, std::size_t bytes, const Tag& tag);
+    // One-way device transfer of `bytes` (GPU-direct routes only): the sending rank passes sending = true and its
+    // device buffer, the receiving rank sending = false and the buffer to fill; both at the same point with the same
+    // size and tag. Nothing travels in the unused direction and no early receive is posted. The receiver's GPU checks
+    // the in-band identity and checksum as for exchange(); check_exchanges() reports a refusal. Returns false, with
+    // nothing sent, when this size has no pure device route (host or mixed route, or an engine without a one-way
+    // form): the caller then uses its host path. Both ranks get the same answer (same route table).
+    [[nodiscard]] bool transfer(hipStream_t stream, bool sending, void* device, std::size_t bytes, const Tag& tag);
     // The same exchange in two halves, so that work enqueued in between overlaps the transfer. start()
     // enqueues the copy of `local` on `stream` and returns; the progress thread waits on the CPU for that
     // copy, then sends and receives. finish() waits for the peer's message, checks it, and enqueues its
@@ -247,8 +255,20 @@ public:
     // same as exchange()'s, so a peer may use either call for the same collective. The calling thread does the transfer;
     // not between start() and finish().
     void exchange_host(std::span<const std::byte> local, std::span<std::byte> remote, const Tag& tag);
+    // Agree before an optional collective changes the pair's protocol. Both ranks
+    // call this even when locally disabled; either refusal selects the old path.
+    [[nodiscard]] bool agree_exchange(bool requested, std::size_t bytes, std::size_t scratch_bytes, const Tag& tag) {
+        const std::byte local{static_cast<unsigned char>(requested && bytes != 0U && bytes <= scratch_bytes && bytes <= max_bytes())};
+        std::byte peer{};
+        exchange_host({&local, 1U}, {&peer, 1U}, tag);
+        return local == std::byte{1} && peer == std::byte{1};
+    }
     // Per-communicator opt-in, without changing other engines/process environment.
     void enable_async_start() { async_start_ = true; }
+    // Enable before the first collective. Per-communicator scheduling policy for messages above GPU ring capacity:
+    // start the first chunk before caller work; finish drains it and the tail.
+    // Same bytes, chunk identities, route table and buffer lifetime as before.
+    void enable_direct_chunk_overlap() { direct_chunk_overlap_ = true; }
     // Fatal teardown: stop and join host submission before caller events/buffers
     // can be retired. The communicator remains poisoned; caller must drain GPU work.
     void cancel_pending(const std::string& reason) noexcept;
@@ -272,6 +292,23 @@ public:
     // views in place and call publish_staged_block. No HIP calls in start/finish/
     // release on this path. prepare returns {} for routes/sizes not admitted.
     [[nodiscard]] ProducerStage prepare_staged_ready(hipStream_t stream, std::size_t bytes);
+    // The largest payload one ready view takes (0: no ready views); callers split larger exchanges into chunks.
+    [[nodiscard]] std::size_t staged_ready_capacity() const noexcept { return staged_ready_bytes_ < max_bytes_ ? staged_ready_bytes_ : max_bytes_; }
+    // Preflight all distinct sizes before preparing a view (prepare reserves it).
+    // Capacity alone does not admit a size: trace and direct routes refuse views.
+    // Keep these route guards consistent with prepare_staged_ready.
+    [[nodiscard]] std::uint32_t staged_ready_chunk_rows(std::uint32_t rows, std::size_t row_bytes) const {
+        if (!rows || !row_bytes || trace_) return 0U;
+        const auto limit = staged_ready_capacity() / row_bytes;
+        if (!limit) return 0U;
+        auto chunk = limit < rows ? static_cast<std::uint32_t>(limit) : rows;
+        const auto chunks = 1U + (rows - 1U) / chunk;
+        chunk = 1U + (rows - 1U) / chunks;
+        const auto tail = rows % chunk;
+        if (direct_ && (route(std::size_t{chunk} * row_bytes).direct ||
+                       (tail && route(std::size_t{tail} * row_bytes).direct))) return 0U;
+        return chunk;
+    }
     void start_staged_ready(hipStream_t stream, std::size_t bytes, const Tag& tag);
     [[nodiscard]] ConsumerStage finish_staged_ready();
     void release_staged_ready(hipStream_t stream);
@@ -400,6 +437,7 @@ private:
     void finish_pipeline(hipStream_t stream, void* remote);
     std::unique_ptr<DeviceExchange> direct_;
     bool direct_started_ = false;
+    bool direct_chunk_overlap_ = false;
     std::vector<Route> routes_;
     void configure_routes();
     [[nodiscard]] const Route& route(std::size_t bytes) const;
@@ -412,6 +450,10 @@ private:
     // host path), and the mixed route's rings.
     std::size_t direct_bytes_ = 0, direct_offset_ = 0;
     unsigned mix_rings_ = 0;
+    // The exchange in flight is a one-way transfer(): its direction, else both.
+    ExchangeDirection direction_ = ExchangeDirection::both;
+    void direct_hint(std::size_t bytes, unsigned rings);
+    bool one_way_probed_ = false, one_way_ = false;
     CommunicatorStats stats_;
 };
 

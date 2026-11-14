@@ -17,6 +17,34 @@ petición, las opciones y las puertas están en [docs/engine/serving/serving.md]
 
 ## Exposición de los servidores
 
+DeepSeek V4.1 usa chat sin razonamiento cuando la petición omite la elección.
+`--default-thinking on|off` cambia ese valor del servidor (por defecto `off`).
+La petición tiene prioridad mediante `enable_thinking` (también en
+`chat_template_kwargs`) o `thinking.type` en Messages; `reasoning_effort: "none"`
+desactiva el razonamiento. `GET /v1/capabilities` informa de `default_thinking`.
+
+En DeepSeek, `--prefix-cache-disk-mb` fija el límite del nivel de disco. La cuota
+del directorio compartido es el mayor de ese límite y 4096 MiB; con valor 0 el
+nivel y la cuota no tienen límite. Se mantienen el mínimo libre de 16384 MiB y
+el máximo de 128 MiB de payloads pendientes. Un nivel lleno expulsa sus estados
+menos usados y termina sus borrados antes de reservar otra escritura; no expulsa
+otros espacios de nombres. Véase el [contrato de caché](engine/serving/prefix-state-cache.md).
+
+La admisión de captura de prefijos de DeepSeek usa el plan compartido del modelo:
+solo las capas fuente de KV aportan KV e índices comprimidos, según su ratio
+(890 bytes por token en V4.1), más 4 bytes por ID de token. Los anillos y las
+copias transitorias mantienen sus márgenes conservadores. Un desbordamiento de
+la predicción satura el tamaño y no permite admitir con un cálculo reducido.
+
+MiniMax permite reutilizar prefijos residentes para peticiones sin sesión mediante
+`STRIX_MM_SERVE_PREFIX=1` en ambos rangos; sigue desactivado por defecto y en baseline.
+Solo reutiliza bloques alineados a 2 chunks de prefill (`--max-rows` x 2,
+8192 tokens por defecto), nunca filas producidas por decode. Ambos rangos deben usar
+la misma configuración. Las peticiones anidadas y los contextos DSpark hacen prefill
+completo; las operaciones de sesión invalidan el registro. Se informa de los tokens
+reutilizados y de `capabilities.prefix_cache` en `/api/status`. Es una opción experimental:
+quedan pendientes las puertas de dispositivo de tokens completos, logits y estado.
+
 Qwen y DeepSeek publican las funciones ejecutadas en `GET /v1/capabilities`; el objeto `strix` de cada respuesta
 indica la política de muestreo solicitada frente a la efectiva. En todos los servidores (Qwen, DeepSeek, MiniMax) los
 campos de generación no admitidos devuelven 400 indicando el campo. MiniMax decodifica de forma greedy: una temperatura

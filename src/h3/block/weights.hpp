@@ -14,6 +14,7 @@
 
 #include "h3/block/safetensors.hpp"
 #include "h3/gemm/ref.hpp"
+#include "h3/gemm/operand.hpp"
 
 namespace strix::h3::block {
 
@@ -32,6 +33,11 @@ inline constexpr float kNormEps = 1e-5F;
 
 struct LoadPolicy {
     bool round_params_bf16 = true;
+    // Explicit image checkpoint policy. Video defaults retain their original arithmetic.
+    bool audio_enabled = true;
+    bool dense_bf16 = false;
+    bool direct_timestep = false;
+    bool image_operands = false; // admit packed formats only through image policy
 };
 
 // int8 tensorwise + convrot (group 256) linear: w[n][k] int8 codes, ws[n] fp32 per-channel scales, no bias.
@@ -39,6 +45,9 @@ struct QLinear {
     std::uint32_t n = 0, k = 0;
     std::vector<std::int8_t> w;
     std::vector<float> ws;
+    std::vector<std::uint16_t> bf16;  // optional dense policy; never activation-quantized
+    gemm::Operand operand = gemm::Operand::int8_convrot;
+    gemm::PackedW4A8 packed;
 };
 
 // bf16 linear (refiner, condition_proj): w[n][k] bf16 bits, optional bias bf16 bits.
@@ -66,6 +75,11 @@ struct BlockWeights {
 };
 
 struct GlobalWeights {
+    bool pdd_fused = false;  // full per-step heads, unlike the video offset bank
+    bool audio_enabled = true;
+    bool direct_timestep = false;
+    F32Linear time_in, time_out;
+    std::vector<float> discrete_times;  // admitted finite image schedule; no interpolation
     std::uint32_t basis = 0;       // curve basis width (time_embed_dim of the curve form)
     std::uint32_t curve_grid = 0;  // adaln_t_table rows (1025)
     std::uint32_t pdd_steps = 1;   // stacked output heads
@@ -181,24 +195,76 @@ inline QLinear read_qlinear(const SafeTensors& st, const std::string& prefix, st
     q.ws = st.read_vec<float>(prefix + ".weight_scale", StDtype::f32);
     return q;
 }
+inline QLinear read_image_linear(const SafeTensors& st, const std::string& prefix, std::uint32_t n, std::uint32_t k) {
+    const auto& t=st.at(prefix+".weight");
+    if (t.dtype==StDtype::bf16 || t.dtype==StDtype::f16 || t.dtype==StDtype::f32) {
+        expect_shape(st,prefix+".weight",{n,k});
+        QLinear q; q.n=n; q.k=k; q.bf16=read_bf16(st,prefix+".weight"); return q;
+    }
+    // Layer metadata is authoritative; a filename never selects arithmetic.
+    const auto& ct=st.at(prefix+".comfy_quant");
+    if (ct.dtype!=StDtype::u8 || ct.nbytes()>65536) throw std::invalid_argument("weights: invalid layer metadata");
+    std::string raw(std::size_t(ct.nbytes()),'\0'); st.read_raw(ct,raw.data());
+    const auto conf=fixture::JsonParser(raw).parse();
+    const auto& fmt=conf.at("format").str();
+    if (fmt=="int8_tensorwise") return read_qlinear(st,prefix,n,k);
+    if (fmt!="asym_w4a8_int8") throw std::invalid_argument("weights: unsupported image operand "+fmt);
+    auto setting=[&](const char* key, double fallback) {
+        const auto* v=conf.find(key); const auto* params=conf.find("params");
+        if (!v && params && params->is_object()) v=params->find(key);
+        return v?v->num():fallback;
+    };
+    const double gs=setting("group_size",16);
+    if (gs<4 || gs>k || gs!=std::floor(gs) || setting("convrot_groupsize",256)!=256)
+        throw std::invalid_argument("weights: unsupported packed grouping");
+    if (st.find(prefix+".weight_correction") || st.find(prefix+".bias"))
+        throw std::invalid_argument("weights: packed correction/bias requires a different arithmetic policy");
+    QLinear q; q.n=n; q.k=k; q.operand=gemm::Operand::w4a8; q.packed.group_size=std::uint32_t(gs);
+    expect_shape(st,prefix+".weight",{n,k/2});
+    q.w=st.read_vec<std::int8_t>(prefix+".weight",StDtype::i8);
+    expect_shape(st,prefix+".weight_s_rel",{n,k/q.packed.group_size});
+    const auto& sr=st.at(prefix+".weight_s_rel");
+    if (sr.dtype==StDtype::f32) q.packed.scales_f32=st.read_vec<float>(sr.name,StDtype::f32);
+    else if ((sr.dtype_name=="F8_E4M3" || sr.dtype_name=="F8_E4M3FN" || sr.dtype==StDtype::u8) && sr.nbytes()==sr.numel()) {
+        q.packed.scales_fp8.resize(std::size_t(sr.nbytes()));st.read_raw(sr,q.packed.scales_fp8.data());
+    } else throw std::invalid_argument("weights: expected E4M3FN or F32 group scales");
+    expect_shape(st,prefix+".weight_s_channel",{n});
+    q.ws=st.read_vec<float>(prefix+".weight_s_channel",StDtype::f32);
+    for (auto s:q.ws) if (!std::isfinite(s) || s<=0) throw std::invalid_argument("weights: channel scale");
+    if (st.find(prefix+".weight_codebook")) {
+        expect_shape(st,prefix+".weight_codebook",{16});
+        q.packed.codebook=read_as_f32(st,prefix+".weight_codebook",false);
+    }
+    q.packed.validate(n,k,q.w.size()); return q;
+}
 }  // namespace detail
 
 inline GlobalWeights load_global(const SafeTensors& st, const LoadPolicy& pol = {}) {
     using namespace detail;
     GlobalWeights g;
+    g.audio_enabled = pol.audio_enabled;
+    g.direct_timestep = pol.direct_timestep;
     const StTensor* tab = st.find("adaln_t_table");
+    if (pol.direct_timestep) {
+        g.time_in = read_f32_linear(st, "time_embedder.proj_in", false);
+        g.time_out = read_f32_linear(st, "time_embedder.proj_out", false);
+        if (g.time_in.k != 256 || g.time_in.n != kHidden || g.time_out.k != kHidden || g.time_out.n != 2688)
+            throw std::runtime_error("weights: image timestep shapes");
+        g.basis = g.time_out.n;
+    } else {
     if (!tab) throw std::runtime_error("weights: not a curve-form checkpoint (no adaln_t_table)");
     if (tab->shape.size() != 2 || tab->dtype != StDtype::f32) throw std::runtime_error("weights: bad adaln_t_table");
     g.curve_grid = static_cast<std::uint32_t>(tab->shape[0]);
     g.basis = static_cast<std::uint32_t>(tab->shape[1]);
     g.adaln_t_table = st.read_vec<float>("adaln_t_table", StDtype::f32);
+    }
     expect_shape(st, "rope.inv_freq", {kRopeFreqs});
     g.inv_freq = st.read_vec<float>("rope.inv_freq", StDtype::f32);
     const bool r = pol.round_params_bf16;
     g.video_patch_proj = read_f32_linear(st, "video_patch_proj", r);
-    g.audio_patch_proj = read_f32_linear(st, "audio_patch_proj", r);
-    if (g.video_patch_proj.n != kHidden || g.video_patch_proj.k != kVideoPatch || g.audio_patch_proj.n != kHidden ||
-        g.audio_patch_proj.k != kAudioDim)
+    if (g.audio_enabled) g.audio_patch_proj = read_f32_linear(st, "audio_patch_proj", r);
+    if (g.video_patch_proj.n != kHidden || g.video_patch_proj.k != kVideoPatch || (g.audio_enabled &&
+        (g.audio_patch_proj.n != kHidden || g.audio_patch_proj.k != kAudioDim)))
         throw std::runtime_error("weights: bad patch projection shapes");
     g.condition_proj = read_bf16_linear(st, "condition_proj", true);
     if (g.condition_proj.n != kHidden || g.condition_proj.k != kTextDim) throw std::runtime_error("weights: condition_proj");
@@ -226,11 +292,12 @@ inline GlobalWeights load_global(const SafeTensors& st, const LoadPolicy& pol = 
     g.final_adaln = read_f32_linear(st, "final_layer.adaln_proj.linear", r);
     if (g.final_adaln.n != 2 * kHidden || g.final_adaln.k != g.basis) throw std::runtime_error("weights: final adaln");
     g.video_out = read_f32_linear(st, "final_layer.video_out", r);
-    g.audio_out = read_f32_linear(st, "final_layer.audio_out", r);
-    if (g.video_out.k != kHidden || g.video_out.n % kVideoPatch || g.audio_out.k != kHidden || g.audio_out.n % kAudioDim)
+    if (g.audio_enabled) g.audio_out = read_f32_linear(st, "final_layer.audio_out", r);
+    if (g.video_out.k != kHidden || !g.video_out.n || g.video_out.n % kVideoPatch || (g.audio_enabled &&
+        (g.audio_out.k != kHidden || g.audio_out.n % kAudioDim)))
         throw std::runtime_error("weights: head shapes");
     g.pdd_steps = g.video_out.n / kVideoPatch;
-    if (g.audio_out.n / kAudioDim != g.pdd_steps) throw std::runtime_error("weights: video/audio head banks differ");
+    if (g.audio_enabled && g.audio_out.n / kAudioDim != g.pdd_steps) throw std::runtime_error("weights: video/audio head banks differ");
     return g;
 }
 
@@ -254,6 +321,29 @@ inline BlockWeights load_block(const SafeTensors& st, std::uint32_t i, std::uint
     if (b.adaln.n != 6U * kHidden * 3U || b.adaln.k != basis) throw std::runtime_error("weights: adaln shape of " + p);
     if (st.find(p + ".attn.to_gate_compress.weight")) {
         // VSA gate: unused by the dense forward (ignored)
+    }
+    if (pol.image_operands) {
+        b.qkv=read_image_linear(st,p+".attn.qkv_proj",3*kInner,kHidden);
+        b.out=read_image_linear(st,p+".attn.out_proj",kHidden,kInner);
+        b.fc1=read_image_linear(st,p+".mlp.fc1",2*kFfn,kHidden);
+        b.fc2=read_image_linear(st,p+".mlp.fc2",kHidden,kFfn);
+        const bool dense=!b.qkv.bf16.empty();
+        if (dense!=!b.out.bf16.empty() || dense!=!b.fc1.bf16.empty() || dense!=!b.fc2.bf16.empty())
+            throw std::invalid_argument("weights: mixed dense and quantized block projections");
+        return b;
+    }
+    if (pol.dense_bf16) {
+        auto dense = [&](const std::string& name, std::uint32_t n, std::uint32_t k) {
+            expect_shape(st, name + ".weight", {n, k});
+            QLinear q; q.n = n; q.k = k;
+            q.bf16 = read_bf16(st, name + ".weight");
+            return q;
+        };
+        b.qkv = dense(p + ".attn.qkv_proj", 3 * kInner, kHidden);
+        b.out = dense(p + ".attn.out_proj", kHidden, kInner);
+        b.fc1 = dense(p + ".mlp.fc1", 2 * kFfn, kHidden);
+        b.fc2 = dense(p + ".mlp.fc2", kHidden, kFfn);
+        return b;
     }
     b.qkv = read_qlinear(st, p + ".attn.qkv_proj", 3 * kInner, kHidden);
     b.out = read_qlinear(st, p + ".attn.out_proj", kHidden, kInner);

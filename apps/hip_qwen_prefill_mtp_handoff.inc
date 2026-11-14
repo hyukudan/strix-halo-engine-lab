@@ -22,6 +22,7 @@ inline HipMtpTargetHiddenTicket run_pair_tiled_mtp_prompt(std::span<const std::u
             std::any_of(compiled.execution.steps.begin(),compiled.execution.steps.end(),
                 [&](const auto& step){return step.layer==layer && step.op==SerialOp::attn_inject;});
     }
+    const auto legal_half=qwen_pp::legal_cuts(compiled.execution.steps,SerialOp::mlp_hyper_mix,SerialOp::mlp_inject,false);
     const char* cut_env=std::getenv("STRIX_QWEN_PF_PIPE_CUT");
     const char* costs_env=std::getenv("STRIX_QWEN_PF_PIPE_COSTS");
     qwen_pp::CutPrediction prediction;
@@ -29,8 +30,14 @@ inline HipMtpTargetHiddenTicket run_pair_tiled_mtp_prompt(std::span<const std::u
     if(costs_env) {
         const auto costs=qwen_pp::load_costs(costs_env,tokens.size());
         route_costs=costs;
-        prediction=cut_env?qwen_pp::predict_cut(costs,qwen_pp::parse_cut(cut_env,legal)):qwen_pp::choose_cut(costs,legal);
-    } else prediction.cut=qwen_pp::parse_cut(cut_env,legal);
+        prediction=cut_env?qwen_pp::predict_cut(costs,qwen_pp::parse_stage_cut(cut_env,legal,legal_half)):
+            qwen_pp::choose_cut(costs,legal,legal_half);
+    } else {
+        const auto cut=qwen_pp::parse_stage_cut(cut_env,legal,legal_half);
+        prediction.cut=cut.layer;prediction.half=cut.half;
+    }
+    // A half-layer cut leaves the attention state of the cut layer with stage A.
+    const auto state_begin=prediction.stage().state_begin();
     // Respect the ordinary MTP owner's tail ladder, rather than inventing a
     // partial-T numerical route for rows that single-node MTP runs serially.
     auto route_plan=tiled.numerical_plan;
@@ -66,7 +73,8 @@ inline HipMtpTargetHiddenTicket run_pair_tiled_mtp_prompt(std::span<const std::u
             qualified,activated,resources,dispatcher,held,receipt);
     }
     tokens=tokens.first(static_cast<std::size_t>(route.prefix));
-    const auto range=rank==0U?"0:"+std::to_string(prediction.cut):std::to_string(prediction.cut)+":48";
+    const auto cut_text=prediction.stage().text();
+    const auto range=rank==0U?"0:"+cut_text:cut_text+":48";
     // Window verification after handoff must never inherit the stage-only range.
     struct RestoreRange {
         std::string previous;
@@ -90,25 +98,18 @@ inline HipMtpTargetHiddenTicket run_pair_tiled_mtp_prompt(std::span<const std::u
     if(::setenv("STRIX_QWEN_PF_LAYER_RANGE",range.c_str(),1)!=0)
 #endif
         throw std::runtime_error("pair handoff MTP layer range update failed");
-    const char* transport_env=std::getenv("STRIX_QWEN_PF_PIPE_TRANSPORT");
-    const std::string_view transport=transport_env?transport_env:"usb4auto";
-    std::unique_ptr<dist::Transport> link;
-    if(transport=="usb4auto" || transport=="usb4-auto") {
-        dist::Usb4AutoOptions usb;usb.rank=rank;link=dist::usb4_host_auto(usb);
-    } else if(transport=="tcp") {
-        const char* peer=std::getenv("STRIX_QWEN_PF_PIPE_PEER");
-        if(rank==1U && !peer) throw std::invalid_argument("pair handoff MTP TCP rank 1 requires --peer HOST");
-        const auto timeout=std::chrono::milliseconds(120000);
-        link=rank==0U?dist::tcp_listen(29872,timeout):dist::tcp_connect(peer,29872,timeout);
-    } else throw std::invalid_argument("pair handoff MTP transport must be usb4auto or tcp");
+    auto link=std::make_unique<qwen_pp::PairTransport>(rank);
     qwen_pp::Pipe pipe(rank,(tokens.size()+tiled.rows-1U)/tiled.rows,
         [&](std::span<const std::byte> data){link->send(data);},
-        [&](std::span<std::byte> data){link->receive(data);},[&]{link->abort("pair handoff MTP stopped");},prediction.cut,
+        [&](std::span<std::byte> data){link->receive(data);},[&]{link->abort("pair handoff MTP stopped");},prediction.stage(),
         [&]{return qwen_pp::make_hip_pipe_staging(static_cast<std::size_t>(tiled.rows)*qwen_pp::Seam::row_bytes);},
-        [](std::span<const std::byte> data){return dist::crc32c(data);});
+        [](std::span<const std::byte> data){return dist::crc32c(data);},
+        [&](bool sending, qwen_pp::PipeStaging& staging, std::size_t offset, std::size_t bytes) {
+            return link->piece(sending, staging, offset, bytes);
+        });
     auto& context=qwen_pp::pipe_context;
     context={&pipe,rank,0U,compiled.execution_identity^tiled.numerical_plan.block.execution^
-        tiled.numerical_plan.block.kernel,prediction.cut};
+        tiled.numerical_plan.block.kernel,prediction.cut,nullptr,prediction.half};
     const auto bind_content=[&](const ModelContentIdentity& content) {
         for(const char byte:model_content_identity_hex(content))
             context.identity=(context.identity^static_cast<unsigned char>(byte))*1099511628211ULL;
@@ -126,6 +127,7 @@ inline HipMtpTargetHiddenTicket run_pair_tiled_mtp_prompt(std::span<const std::u
         ++context.sequence;
     }
     pipe.finish(context.sequence); // join the seam worker before one-shot state transfer
+    link->finish();
     HipMtpTargetHiddenTicket pending;
     if(rank==1U) pending=prompt.finish(receipt); // drains all tap/predictor work
     const auto check_copy=[](hipError_t status) {
@@ -159,7 +161,7 @@ inline HipMtpTargetHiddenTicket run_pair_tiled_mtp_prompt(std::span<const std::u
     const auto append=[&](qwen_pp::StatePart part,std::uintptr_t address) {
         parts.push_back(part);addresses.push_back(address);
     };
-    for(std::uint32_t layer=prediction.cut;layer<48U;++layer) {
+    for(std::uint32_t layer=state_begin;layer<48U;++layer) {
         const bool attention=(layer+1U)%model.full_attention_interval==0U;
         for(const auto component:{SessionStateComponent::attention_kv,SessionStateComponent::recurrent_matrix,
             SessionStateComponent::gdn_convolution,SessionStateComponent::sparse_index}) {
@@ -178,7 +180,7 @@ inline HipMtpTargetHiddenTicket run_pair_tiled_mtp_prompt(std::span<const std::u
     auto state_staging=qwen_pp::make_hip_state_staging();
     const auto bytes=qwen_pp::handoff_overlap(rank==1U,parts,
         qwen_pp::mtp_state_identity(context.identity^session.state_layout_identity,descriptor),
-        session.next_position,prediction.cut,*state_staging,
+        session.next_position,state_begin,*state_staging,
         [&](std::span<const std::byte> data){link->send(data);},
         [&](std::span<std::byte> data){link->receive(data);},
         [&](bool save,std::size_t index,std::uint64_t offset,std::span<std::byte> data) {
@@ -205,8 +207,8 @@ inline HipMtpTargetHiddenTicket run_pair_tiled_mtp_prompt(std::span<const std::u
         pending=target.adopt_prefill_row(session,tokens.back(),terminal,logits,model.rotary_identity());
         receipt="\"pair_mtp_handoff\":true,\"predictor_rows\":"+std::to_string(descriptor[2]);
     }
-    std::fprintf(stderr,"qwen-handoff-mtp rank=%u cut=%u handoff-bytes=%llu handoff-seconds=%.6f prefill-handoff-seconds=%.6f\n",
-        rank,prediction.cut,static_cast<unsigned long long>(bytes),
+    std::fprintf(stderr,"qwen-handoff-mtp rank=%u cut=%s handoff-bytes=%llu handoff-seconds=%.6f prefill-handoff-seconds=%.6f\n",
+        rank,cut_text.c_str(),static_cast<unsigned long long>(bytes),
         std::chrono::duration<double>(std::chrono::steady_clock::now()-handoff_start).count(),
         std::chrono::duration<double>(std::chrono::steady_clock::now()-start).count());
     restore.reset();

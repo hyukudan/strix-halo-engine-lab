@@ -1,3 +1,4 @@
+#include "strix/device/hip_gate.hpp"
 #include "strix/deepseek41_prefill.hpp"
 #include "strix/dist/communicator.hpp"
 #include "deepseek41_quality_arms.hpp"
@@ -41,8 +42,10 @@ std::string trace_json(const PrefillResult& ref, const PrefillResult& got, std::
         unsigned router = 0, router_ids = 0, index = 0, rows = 0, router_tail = 0, index_tail = 0;
         const std::size_t nr = a.row_hashes.size(), K = nr ? a.router_ids.size() / nr : 0;
         for (std::size_t r = 0; K && r < nr && a.router_ids.size() == b.router_ids.size(); ++r) {
-            std::vector<std::uint32_t> x(a.router_ids.begin() + r * K, a.router_ids.begin() + (r + 1) * K);
-            std::vector<std::uint32_t> y(b.router_ids.begin() + r * K, b.router_ids.begin() + (r + 1) * K);
+            // sized first, then copied: gcc 14 -O3 reports a false -Wfree-nonheap-object on the iterator-range form
+            std::vector<std::uint32_t> x(K), y(K);
+            std::copy_n(a.router_ids.data() + r * K, K, x.begin());
+            std::copy_n(b.router_ids.data() + r * K, K, y.begin());
             std::sort(x.begin(), x.end());
             std::sort(y.begin(), y.end());
             if (x != y) {
@@ -89,6 +92,10 @@ std::string trace_json(const PrefillResult& ref, const PrefillResult& got, std::
 }  // namespace
 
 int main(int argc,char** argv) try {
+    // Start gate: resolves the declared device (--devices FILE, --device-id ID, STRIX_DEVICES, STRIX_DEVICE), refuses an
+    // excluded or undeclared one and prints the "device:" receipt line. Without a declaration the single integrated
+    // GPU of a node keeps working (declared=implicit).
+    strix::device::bind_hip_main(argc, argv);
     const auto start=std::chrono::steady_clock::now();
     if(argc!=5 && argc!=6)throw std::runtime_error("MODEL manifest.tsv outdir rank [budget_seconds]");
     const double budget=argc==6?std::stod(argv[5]):0;

@@ -61,26 +61,28 @@ strix::xport::ChannelOptions<GlmSeqparTraits> seqpar_options(unsigned rank, unsi
 }
 }
 
-SeqparExchange::SeqparExchange(dist::Transport& transport, unsigned rank, unsigned max_rows, hipStream_t stream)
-    : side_(max_rows), rank_(rank), max_rows_(max_rows), stream_(stream),
+SeqparExchange::SeqparExchange(dist::Transport& transport, unsigned rank, unsigned max_rows, hipStream_t stream,
+                             unsigned compute_streams)
+    : side_(max_rows, compute_streams), rank_(rank), max_rows_(max_rows), stream_(stream),
       channel_(transport, seqpar_options(rank, max_rows, side_.stream)) {}
 
 SeqparExchange::~SeqparExchange() {
     // Retire device users BEFORE Channel frees its RX slots, including after
     // an enqueue failure. A progress failure releases all flag wait packets.
     try { channel_.drain(); } catch (...) {}
-    for (auto s : side_.compute) (void)hipStreamSynchronize(s);
+    for (auto s : side_.compute) if (s) (void)hipStreamSynchronize(s);
     (void)hipStreamSynchronize(side_.stream);
     (void)hipStreamSynchronize(stream_);
 }
 
-SeqparExchange::Side::Side(unsigned max_rows) {
+SeqparExchange::Side::Side(unsigned max_rows, unsigned compute_streams) : streams(compute_streams) {
+    if (streams != 1 && streams != 2) throw std::invalid_argument("glm seqpar: compute streams must be 1 or 2");
     try {
         int least = 0, greatest = 0;
         ok(hipDeviceGetStreamPriorityRange(&least, &greatest), "seqpar priority range");
         ok(hipStreamCreateWithPriority(&stream, hipStreamNonBlocking, least), "seqpar transfer queue");
         for (unsigned i = 0; i < ready.size(); ++i) {
-            ok(hipStreamCreateWithFlags(&compute[i], hipStreamNonBlocking), "seqpar compute queue");
+            if (i < streams) ok(hipStreamCreateWithFlags(&compute[i], hipStreamNonBlocking), "seqpar compute queue");
             ok(hipEventCreateWithFlags(&ready[i], hipEventDisableTiming), "seqpar ready event");
             ok(hipEventCreateWithFlags(&done[i], hipEventDisableTiming), "seqpar done event");
         }
@@ -168,10 +170,7 @@ void SeqparExchange::release_reduce_scatter(unsigned lane, hipStream_t consumer)
 
 std::size_t SeqparExchange::workspace_bytes(unsigned max_rows) {
     const auto o = seqpar_options(0, max_rows, nullptr);
-    if (o.depth < 2 || o.depth > 64) throw std::invalid_argument("glm seqpar: channel depth must be 2..64");
-    const auto stride = (o.capacity + sizeof(Trailer) + 4095U) & ~std::size_t{4095};
-    // Includes the direct coherent consumer buffer (128 MiB at 8192 rows).
-    return 2U * o.depth * stride + GlmSchedule::row_bytes(max_rows) + (8U << 20U);
+    return seqpar_workspace_bytes(max_rows, o.depth, o.capacity);
 }
 
 void SeqparExchange::start_reduce_scatter(float* partial, SeqparRows tile, unsigned lane, hipStream_t producer) {
@@ -291,13 +290,30 @@ bool XferExchange::fused_boundary_rows(const float* part, const float* X, const 
     return true;
 }
 
+XferExchange::ProducerSlot XferExchange::producer_slot(unsigned rows, hipStream_t s) {
+    if (rows == 0 || rows > max_rows_) return {};
+    Exchanger& x = ensure(s);
+    const auto t = x.producer_target();
+    auto* data = static_cast<float*>(x.tx());
+    produced_ = data;
+    return {data, {t.flag, t.counter, t.sequence}};
+}
+
 void XferExchange::boundary_rows(const float* part, const float* X, const float* mix, float* Xout, unsigned* flag,
                                   unsigned rows, unsigned flag_stride, hipStream_t s) {
     if (rows == 0 || rows > max_rows_) throw std::invalid_argument("glm xfer exchange: rows");
     Exchanger& x = ensure(s);
     const std::size_t bytes = GlmSchedule::row_bytes(rows);
     strix::xport::TransportBackend<Exchanger> backend(x);
-    const auto ticket = backend.post_copy(Tag{layer_ % 2 == 0 ? Kind::attn_sum : Kind::ffn_sum, static_cast<std::uint32_t>(layer_ / 2), step_}, part, bytes);
+    const Tag tag{layer_ % 2 == 0 ? Kind::attn_sum : Kind::ffn_sum, static_cast<std::uint32_t>(layer_ / 2), step_};
+    // A partial produced in the slot of producer_slot() is already written and published by its last kernel.
+    const bool produced = produced_ != nullptr && part == produced_;
+    if (produced_ != nullptr && !produced) throw std::logic_error("glm xfer exchange: producer slot taken but not used by the next boundary");
+    produced_ = nullptr;
+    // STRIX_GLMX_FOLD=N (xport row fold): boundaries of at most N rows have their pair sum (R17, rank 0's partial
+    // first) computed by the exchange progress thread; post_expand then reads one folded slot. Same bits.
+    if (fold_enabled_.load(std::memory_order_relaxed) && x.can_fold(bytes)) x.fold_next(strix::xport::RowFold::sum_f32);
+    const auto ticket = produced ? backend.post_publish(tag, bytes, Publish::producer) : backend.post_copy(tag, part, bytes);
     ++layer_;
     if (use_bracket_) {
         if (bracket_ == nullptr) ok(hipMalloc(reinterpret_cast<void**>(&bracket_), GlmSchedule::row_bytes(max_rows_) * kHc), "bracket");
@@ -305,13 +321,23 @@ void XferExchange::boundary_rows(const float* part, const float* X, const float*
     }
     const RxView none{};
     if (kwait_) {
-        const RxView v = backend.wait_view(ticket, s);
-        if (use_bracket_) post_expand_bracket(bracket_, mix, part, nullptr, v, rank_, Xout, flag, rows, s, flag_stride);
-        else post_expand(X, mix, part, nullptr, v, rank_, Xout, flag, rows, s, flag_stride);
+        RxView v = backend.wait_view(ticket, s);
+        const float* local = part;
+        if (const void* folded = x.last_folded()) {  // the kernel reads the folded slot after its wait (local == nullptr)
+            v.payload = folded;
+            local = nullptr;
+        }
+        if (use_bracket_) post_expand_bracket(bracket_, mix, local, nullptr, v, rank_, Xout, flag, rows, s, flag_stride);
+        else post_expand(X, mix, local, nullptr, v, rank_, Xout, flag, rows, s, flag_stride);
     } else {
         const auto* peer = static_cast<const float*>(backend.wait(ticket, s).remote);
-        if (use_bracket_) post_expand_bracket(bracket_, mix, part, peer, none, rank_, Xout, flag, rows, s, flag_stride);
-        else post_expand(X, mix, part, peer, none, rank_, Xout, flag, rows, s, flag_stride);
+        const float* local = part;
+        if (const void* folded = x.last_folded()) {
+            peer = static_cast<const float*>(folded);
+            local = nullptr;
+        }
+        if (use_bracket_) post_expand_bracket(bracket_, mix, local, peer, none, rank_, Xout, flag, rows, s, flag_stride);
+        else post_expand(X, mix, local, peer, none, rank_, Xout, flag, rows, s, flag_stride);
     }
     backend.release(ticket, s);
 }

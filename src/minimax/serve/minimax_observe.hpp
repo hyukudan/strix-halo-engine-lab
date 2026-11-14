@@ -101,6 +101,7 @@ struct ObserverInfo {
     std::uint64_t device_used_bytes = 0;
     std::string instance_id;      // new_instance_id() when empty
     bool draft = false;           // a drafter is loaded (capabilities.draft)
+    bool prefix_cache = false;    // automatic prefix KV reuse is on (capabilities.prefix_cache)
     std::vector<LegacyMetric> legacy;  // HELP/TYPE of the legacy lines; empty = legacy_metrics()
     std::int64_t start_time = 0;  // unix seconds; now when 0
 };

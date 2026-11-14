@@ -3,7 +3,7 @@
 # H3_AUDIO_VAE_WEIGHTS; plain tests report SKIPPED without them, the "qualification" label tests fail.
 add_library(strix_h3_vae_host STATIC src/h3/vae/vae_io.cpp src/h3/vae/vae_plan.cpp src/h3/vae/vae_ref.cpp
     src/h3/vae/vae_host_decode.cpp src/h3/vae/vae_shard.cpp src/h3/vae/audio_ref.cpp
-    src/h3/vae/enc_ref.cpp)
+    src/h3/vae/enc_ref.cpp src/h3/vae/image.cpp)
 target_link_libraries(strix_h3_vae_host PUBLIC strix_h3_common Threads::Threads)
 if(MSVC)
     target_compile_definitions(strix_h3_vae_host PUBLIC _CRT_SECURE_NO_WARNINGS)

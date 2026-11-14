@@ -35,6 +35,10 @@ The command-line tools take token IDs; the HTTP servers carry the models' own to
 
 ## Build
 
+Single-config generators (such as Ninja) default to `Release` when `CMAKE_BUILD_TYPE`
+is empty or omitted, including the standalone CUDA build. An explicit build type is
+preserved. Multi-config generators keep their configuration selection (`--config Release`).
+
 ```sh
 export PATH=/opt/rocm/core-10.1/bin:$PATH
 cmake -S . -B build -G Ninja \

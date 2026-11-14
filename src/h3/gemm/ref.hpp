@@ -99,7 +99,7 @@ inline bool rotate_group256(const std::uint16_t* in, std::uint16_t* out) {
 constexpr int kFixShift = 47;
 H3_HD inline int msb64(std::uint64_t a) {  // a != 0
 #if defined(__HIP_DEVICE_COMPILE__)
-    return 63 - __clzll(static_cast<long long>(a));
+    return 63 - __builtin_clzll(a);  // clang builtin: valid without hip_runtime.h (strix-h3-image HIP TU)
 #else
     return 63 - std::countl_zero(a);
 #endif

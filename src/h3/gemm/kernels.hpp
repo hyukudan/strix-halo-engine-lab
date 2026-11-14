@@ -6,7 +6,7 @@
 //     the team (lane xor 1, 2, 3 / 4, 8, 12), in 64-bit fixed point relative to the group's max exponent; rounded once
 //     to bf16 (ref fixed_to_bf16); row absmax over the block; s = amax / 127 (IEEE), divisor bf16(s); codes
 //     clamp(rint(bf16(x / sb))). Rows independent: batch invariant.
-//   gemm_kernel: block tile 256 rows x BN outputs (BN 128: 8 waves, BN 256: 16 waves; each wave 64 x 64 = 4 x 4 WMMA
+//   gemm_kernel: block tile 256 rows x BN outputs (BN 64: 4 waves, BN 128: 8 waves, BN 256: 16 waves; each wave 64 x 64 = 4 x 4 WMMA
 //     tiles), 64 K bytes per stage, two LDS stages (64-byte rows, 16-byte chunks XOR-swizzled by (row / 2) % 4), int32
 //     accumulators over the full K (exact, order-free). Epilogue per element: bf16(fp32(acc) * (row_scale * ch_scale)).
 //     Epilogue SwiGLU (fc1 with swiglu_permute()d weights): each wave's 16-column tiles alternate gate / up of the same
@@ -22,15 +22,20 @@
 #include <stdexcept>
 
 #include "h3/gemm/ref.hpp"
+#include "h3/gemm/operand.hpp"
 
 namespace strix::h3::gemm::dev {
 
 typedef int v4i __attribute__((ext_vector_type(4)));
 typedef int v8i __attribute__((ext_vector_type(8)));
 typedef unsigned u32x4 __attribute__((ext_vector_type(4)));
+typedef unsigned u32x2 __attribute__((ext_vector_type(2)));
 
 __device__ __forceinline__ u32x4 g16(const void* p) {
     return *reinterpret_cast<const __attribute__((address_space(1))) u32x4*>(reinterpret_cast<std::uintptr_t>(p));
+}
+__device__ __forceinline__ u32x2 g8(const void* p) {
+    return *reinterpret_cast<const __attribute__((address_space(1))) u32x2*>(reinterpret_cast<std::uintptr_t>(p));
 }
 
 // ---------------------------------------------------------------------------------------------------------------- quantizer
@@ -208,16 +213,56 @@ struct GemmArgs {
     OutSegs out;                      // plain: n columns; swiglu: n / 2 columns
     std::int32_t* acc_out = nullptr;  // raw
     std::uint32_t m = 0, n = 0, k = 0, raster_m = 8;
+    Operand operand = Operand::int8_convrot;
+    const std::uint8_t* group_fp8 = nullptr;
+    const float* group_f32 = nullptr;
+    const float* codebook = nullptr;
+    std::uint32_t group_size = 16;
+    const std::uint8_t* scale_ids = nullptr;
+    const std::uint16_t* pair_lut = nullptr;
+    unsigned group_shift = 0;
+};
+
+// Only the B fetch changes. INT8 keeps the original vector load; packed W4A8
+// expands a 16-code chunk in registers before the same LDS/WMMA organization.
+template <Operand O> struct BOperand {
+    __device__ static __forceinline__ u32x4 load(const GemmArgs& g, std::uint32_t offset) {
+        if constexpr (O == Operand::int8_convrot) return g16(g.b + offset);
+        else {
+            u32x4 out{};
+            if (g.pair_lut) {
+                // Eight packed bytes, loaded once. Each lookup returns two exact
+                // signed codes. Groups >=16 share one table across this chunk.
+                const auto packed = g8(g.b + offset / 2U);
+                const unsigned table = unsigned(g.scale_ids[offset >> g.group_shift]) * 256U;
+#pragma unroll
+                for (unsigned j = 0; j < 8U; ++j) {
+                    const unsigned u = (packed[j / 4U] >> (8U * (j % 4U))) & 255U;
+                    const unsigned base = g.group_size >= 16U ? table :
+                        unsigned(g.scale_ids[(offset + 2U * j) >> g.group_shift]) * 256U;
+                    out[j / 2U] |= unsigned(g.pair_lut[base + u]) << (16U * (j % 2U));
+                }
+                return out;
+            }
+            for (unsigned i=0;i<16;++i) {
+                const auto at=offset+i, group=at/g.group_size;
+                const float scale=g.group_fp8?e4m3fn(g.group_fp8[group]):g.group_f32[group];
+                const auto code=w4a8_code(static_cast<std::uint8_t>(g.b[at/2]),at%2,scale,g.codebook);
+                out[i/4] |= std::uint32_t(static_cast<std::uint8_t>(code)) << (8U*(i%4));
+            }
+            return out;
+        }
+    }
 };
 
 constexpr unsigned kBM = 256U, kWM = 64U, kWN = 64U, kStageK = 64U;
 __device__ __forceinline__ unsigned lds_at(unsigned row, unsigned chunk) { return row * 64U + ((chunk ^ ((row / 2U) % 4U)) * 16U); }
 __device__ __forceinline__ void lds_barrier() { __asm__ volatile("s_waitcnt lgkmcnt(0)\n\ts_barrier" ::: "memory"); }
 
-template <unsigned BN, Epi E>
-__global__ __launch_bounds__(BN == 256U ? 512U : 256U) void gemm_kernel(GemmArgs g) {
+template <unsigned BN, Epi E, Operand O = Operand::int8_convrot>
+__global__ __launch_bounds__(2U * BN) void gemm_kernel(GemmArgs g) {
 #pragma clang fp contract(off)
-    constexpr unsigned Threads = BN == 256U ? 512U : 256U, WavesN = BN / kWN, MT = kWM / 16U, NT = kWN / 16U;
+    constexpr unsigned Threads = 2U * BN, WavesN = BN / kWN, MT = kWM / 16U, NT = kWN / 16U;
     constexpr unsigned StageBytes = (kBM + BN) * 64U;
     constexpr unsigned AChunks = kBM * 4U / Threads, BChunks = BN * 4U / Threads;  // 16-byte chunks per thread
     __shared__ __align__(16) unsigned char lds[2U * StageBytes];
@@ -248,7 +293,7 @@ __global__ __launch_bounds__(BN == 256U ? 512U : 256U) void gemm_kernel(GemmArgs
 #pragma unroll
         for (unsigned i = 0; i < AChunks; ++i) areg[i] = g16(g.a + kStageK * s + aoff[i]);
 #pragma unroll
-        for (unsigned i = 0; i < BChunks; ++i) breg[i] = g16(g.b + kStageK * s + boff[i]);
+        for (unsigned i = 0; i < BChunks; ++i) breg[i] = BOperand<O>::load(g, kStageK * s + boff[i]);
     };
     const auto store = [&](unsigned buffer) {
         unsigned char* as = lds + buffer * StageBytes;
@@ -402,7 +447,15 @@ template <unsigned BN, dev::Epi E> inline void launch_gemm(const dev::GemmArgs& 
     }
     if (!ok) throw std::invalid_argument("h3 gemm: invalid GEMM arguments");
     const std::uint32_t tiles = (args.m + dev::kBM - 1U) / dev::kBM * (args.n / BN);
-    hipLaunchKernelGGL(HIP_KERNEL_NAME(dev::gemm_kernel<BN, E>), dim3(tiles), dim3(BN == 256U ? 512U : 256U), 0, stream, args);
+    if (g.operand == Operand::w4a8) {
+        if ((g.pair_lut ? (!g.scale_ids || g.group_shift >= 32U ||
+                          (1U << g.group_shift) != g.group_size) : (!g.group_fp8 == !g.group_f32)) || g.group_size < 4 ||
+            (16 % g.group_size && g.group_size % 16) || g.k % g.group_size)
+            throw std::invalid_argument("h3 gemm: invalid packed operand scales");
+        hipLaunchKernelGGL(HIP_KERNEL_NAME(dev::gemm_kernel<BN, E, Operand::w4a8>), dim3(tiles), dim3(2U * BN), 0, stream, args);
+        return;
+    }
+    hipLaunchKernelGGL(HIP_KERNEL_NAME(dev::gemm_kernel<BN, E>), dim3(tiles), dim3(2U * BN), 0, stream, args);
 }
 
 }  // namespace strix::h3::gemm

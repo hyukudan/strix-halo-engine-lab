@@ -27,6 +27,7 @@ namespace {
 
 using strix::ds41::WeightFormat;
 int failures = 0;
+bool i4_diagnostic = false;
 void expect(bool condition, const std::string& message) {
     if (!condition) {
         ++failures;
@@ -299,7 +300,8 @@ void run_case(const DeviceExperts& x, std::uint32_t rows, std::uint32_t top_k, d
     for (auto& v : ev) check(hipEventCreate(&v), "event");
     struct Result { std::vector<float> raw, deltas; std::vector<std::int8_t> codes; float gu = 0, dn = 0; };
     const auto run_mode = [&](int mode) {
-        set_fast_moe(mode);
+        set_fast_moe(i4_diagnostic ? 0 : mode);
+        set_fast_i4(i4_diagnostic ? mode : 0);
         PrefillRun run(slots, rows, e.hidden, e.inter, false);
         check(hipMemset(run.raw.data, 0, run.raw.count * sizeof(float)), "clear");
         enqueue_prefill(x, in, view, run, false);
@@ -325,6 +327,7 @@ void run_case(const DeviceExperts& x, std::uint32_t rows, std::uint32_t top_k, d
     const Result exact = run_mode(0), fast = run_mode(1);
     const Result again = run_mode(1);
     set_fast_moe(-1);
+    set_fast_i4(-1);
     std::size_t nonfinite = 0;
     const double err = rel_l2(exact.raw, fast.raw, nonfinite);
     std::size_t code_diff = 0, code_far = 0;
@@ -333,8 +336,8 @@ void run_case(const DeviceExperts& x, std::uint32_t rows, std::uint32_t top_k, d
         code_far += std::abs(int(exact.codes[i]) - int(fast.codes[i])) > 1;
     }
     expect(nonfinite == 0U, label + ": finite raw vectors");
-    expect(err < 1e-3, label + ": raw relative L2 < 1e-3");
-    expect(code_far == 0U, label + ": A8 codes within 1");
+    if (!i4_diagnostic) expect(err < 1e-3, label + ": raw relative L2 < 1e-3");
+    if (!i4_diagnostic) expect(code_far == 0U, label + ": A8 codes within 1");
     expect(bit_mismatches(fast.raw, again.raw) == 0U && bit_mismatches(fast.codes, again.codes) == 0U, label + ": repeat bits");
     std::cout << "MOE " << label << " T=" << rows << " experts=" << e.experts << " skew=" << skew << " exact_gu_ms=" << exact.gu
               << " fast_gu_ms=" << fast.gu << " exact_dn_ms=" << exact.dn << " fast_dn_ms=" << fast.dn << " speedup="
@@ -374,7 +377,8 @@ void custom_batches_case(const DeviceExperts& x, std::uint32_t rows, std::uint32
     Inputs in(rows, top_k, e.hidden, 444U + rows);
     const std::size_t slots = static_cast<std::size_t>(rows) * top_k;
     const auto run_mode = [&](int mode) {
-        set_fast_moe(mode);
+        set_fast_moe(i4_diagnostic ? 0 : mode);
+        set_fast_i4(i4_diagnostic ? mode : 0);
         PrefillRun run(slots, rows, e.hidden, e.inter, false);
         check(hipMemset(run.raw.data, 0xff, run.raw.count * sizeof(float)), "poison");   // NaN: an unwritten entry shows
         enqueue_prefill(x, in, view, run, false);
@@ -383,19 +387,22 @@ void custom_batches_case(const DeviceExperts& x, std::uint32_t rows, std::uint32
     };
     const auto exact = run_mode(0), fast = run_mode(1);
     set_fast_moe(-1);
+    set_fast_i4(-1);
     std::size_t nonfinite = 0;
     const double err = rel_l2(exact, fast, nonfinite);
     expect(split > 0U, "custom batches: some batches split");
-    expect(nonfinite == 0U && err < 1e-3, "custom batches: every entry written once, raw rel L2 < 1e-3");
+    expect(nonfinite == 0U && (i4_diagnostic || err < 1e-3), "custom batches: every entry written once, raw rel L2 < 1e-3");
     std::cout << "MOE custom-batches T=" << rows << " split=" << split << " raw_rel_l2=" << err << " nonfinite=" << nonfinite << std::endl;
 }
 }  // namespace
 
 int main(int argc, char** argv) try {
     for (int i = 1; i < argc; ++i) {
-        if (std::string(argv[i]) == "--no-timing") timing_on = false;
+        if (std::string(argv[i]) == "--fast-i4") i4_diagnostic = true;
+        else if (std::string(argv[i]) == "--no-timing") timing_on = false;
         else if (std::string(argv[i]) == "--reps" && i + 1 < argc) reps = static_cast<unsigned>(std::stoul(argv[++i]));
     }
+    if (i4_diagnostic) std::cout << "FAST_I4 diagnostic: finite/coverage/repeat gates only; model fidelity NOT QUALIFIED\n";
     {
         // 48 synthetic experts: T 1024 x top-6 = ~128 rows per expert (an 8K pair prefill), T 4096 = ~512 (32K)
         const auto s = synthetic_experts(WeightFormat::iq2_xxs, WeightFormat::q2_k, 48U, 5120U, 2304U, 11U);

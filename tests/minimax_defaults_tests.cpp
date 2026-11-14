@@ -1,10 +1,11 @@
 #ifdef _MSC_VER
 #define _CRT_SECURE_NO_WARNINGS
 #endif
-// MiniMax M3.1 defaults-on resolver, CPU only: the plain invocation resolves to exactly the measured production
-// receipt (argv + env, tests/fixtures/minimax_production_receipt.txt), every off switch restores its item's former
+// MiniMax M3.1 defaults-on resolver, CPU only: the host invocation matches the measured production
+// receipt (argv + env, tests/fixtures/minimax_production_receipt.txt), serve's routed default is checked separately, every off switch restores its item's former
 // value, STRIX_MM_BASELINE=1 restores all of them, and apply() exports what --print-effective-config prints.
 #include "minimax/engine/mm_defaults.hpp"
+#include "strix/dist/transport_spec.hpp"
 #include "strix/minimax/session_startup.hpp"
 
 #include <cstdlib>
@@ -100,7 +101,7 @@ const std::map<std::string, std::string> kFormer = {
     {"STRIX_MMX_MOE_WIDE", "0"},           {"STRIX_MM_INDEX_CONC", "0"},       {"STRIX_MMX_CRC", "1"},
     {"STRIX_MM_XB_WAIT", "0"},             {"STRIX_MM_XB_INPLACE", "0"},       {"STRIX_MM_XB_PUBLISH", "0"},
     {"STRIX_MM_XB_POSTILP", "0"},          {"STRIX_MM_XB_WARM", "0"},          {"STRIX_MM_DSPARK_ATTN", "0"},
-    {"STRIX_MM_DRAFT_LIN", "lib"},         {"STRIX_MMX_PREFILL_CORE", "lib"},  {"STRIX_MM_PF_MSA_BATCH", "0"},
+    {"STRIX_MM_DRAFT_LIN", "lib"},         {"STRIX_MM_PF_MSA_BATCH", "0"},
     {"STRIX_MMX_LINEAR_V11", "0"},
     {"STRIX_MM_MARKOV", "full"},           {"STRIX_MM_MARKOV_C", "1024"},      {"STRIX_MM_MARKOV_H", "2048"},
     {"STRIX_MM_MARKOV_TOPC", "v1"},
@@ -108,7 +109,7 @@ const std::map<std::string, std::string> kFormer = {
     {"STRIX_MM_PF_MSA_REWORK", "0"},       {"STRIX_MMX_PREFILL_PIPE", "0"},    {"STRIX_MM_PF_KV_TILE", "off"},
     {"STRIX_MM_PF_ASYNC_START", "0"}, {"STRIX_MM_PF_LATE_SRC_FENCE", "0"},
     {"STRIX_MM_PF_TX_UNCACHED", "0"},      {"STRIX_DIST_CRC_PARALLEL", "0"},   {"STRIX_DIST_HOST_CRC_OVERLAP", "0"},
-    {"STRIX_DIST_HOST_CHUNK_BYTES", "0"},  {"STRIX_MM_PF_IDX_TILE", "0"},
+    {"STRIX_DIST_HOST_CHUNK_BYTES", "0"},  {"STRIX_MM_PFX_JOINED", "0"},       {"STRIX_MM_PF_IDX_TILE", "0"},
     {"STRIX_MM_PF_IDX_ROWS", "32"},        {"STRIX_MMX_MOE_GU_INTERLEAVE", "0"}, {"STRIX_MMX_MOE_SINGLE", "0"},
     {"STRIX_MMX_MOE_DOWN_SPLIT", "0"},    {"STRIX_MM_ATTEND_DIET", "0"},
     {"STRIX_MM_ATTEND4_DECODE", "0"},      {"STRIX_MM_SELECT_ONCE", "0"},
@@ -141,13 +142,18 @@ void test_receipts(const char* path) {
     const EnvMap none;
     for (const Receipt& r : receipts) {
         const std::string want = md::effective_config(md::parse_cli(r.app, r.argv), lookup(r.env));
-        const std::string got = md::effective_config(md::parse_cli(r.app, r.plain), lookup(none));
+        auto plain = r.plain;
+        // Preserve the measured host receipt verbatim. The new serve default
+        // is a transport policy, with native qualification still pending;
+        // compare its explicit host restoration to the historical receipt.
+        if (r.app == "serve") { plain.push_back("--transport"); plain.push_back("usb4-auto"); }
+        const std::string got = md::effective_config(md::parse_cli(r.app, plain), lookup(none));
         auto numerical = [](const std::string& text) {
             std::istringstream input(text); std::string result, line;
             while (std::getline(input,line)) if (!line.starts_with("session_")) result += line + "\n";
             return result;
         };
-        check(numerical(got) == numerical(want), r.app + ": plain invocation == receipt\n--- receipt\n" + want + "--- plain\n" + got);
+        check(numerical(got) == numerical(want), r.app + ": host configuration == receipt\n--- receipt\n" + want + "--- host\n" + got);
         // Every receipt env value is one of the resolved items (no receipt switch is left unmanaged).
         for (const auto& [k, v] : r.env) {
             bool found = false;
@@ -304,6 +310,29 @@ void test_session_inspection() {
     }
 }
 void test_session_defaults() {
+    // Exercise the same shared negotiated-name helper as the serving app.
+    for (const bool direct_live : {false, true}) {
+        auto negotiated = md::parse_cli("serve", {});
+        check(negotiated.transport == "usb4gpu", "serve requests GPU transport by default");
+        negotiated.transport = strix::dist::negotiated_transport(negotiated.transport,
+            direct_live, md::kRouteHost, md::kRouteGpu);
+        for (const EnvMap& request : {EnvMap{}, EnvMap{{"STRIX_SESSION_CACHE", "1"}}}) {
+            for (const bool explicit_cli : {false, true}) {
+                const auto policy = md::session_policy(negotiated, lookup(request), explicit_cli);
+                check(policy.route == (direct_live ? "serve/usb4gpu/fixed-width-one-session-v1"
+                                                  : "serve/usb4-auto/fixed-width-one-session-v1"),
+                      "session route follows negotiated transport");
+                check(policy.enabled == !direct_live, "only negotiated host serving is cache eligible");
+                check(policy.reason == (direct_live ? "route not yet GPU-qualified: " + policy.route : ""),
+                      "unqualified direct route supplies one clear OFF reason");
+                if (!explicit_cli) {
+                    const auto runtime = md::session_config(negotiated, lookup(request), 100ULL << 30);
+                    check(runtime.enabled == !direct_live && runtime.route == policy.route,
+                          "runtime admission retains negotiated eligibility");
+                }
+            }
+        }
+    }
     md::Cli cli; cli.app = "serve";
     for (const EnvMap& off : {EnvMap{{"STRIX_SESSION_CACHE", "0"}},
                              EnvMap{{"STRIX_SESSION_CACHE", "off"}}, EnvMap{{"STRIX_MM_BASELINE", "1"}},
@@ -429,7 +458,8 @@ void test_cli() {
     check(lines(md::effective_config(override_cli, lookup(bad_mode))).count("serve.dspark_mode=on") == 1,
           "CLI overrides env and baseline before validation");
     const auto d = md::parse_cli("serve", {"M"});
-    check(d.transport == "usb4-auto" && d.slots == 8, "serve cli defaults = receipt");
+    check(d.transport == "usb4gpu" && d.slots == 8, "serve routed transport default");
+    check(md::parse_cli("serve", {"M", "--transport", "usb4-auto"}).transport == "usb4-auto", "serve host override");
     const EnvMap none;
     for (const char* session : {"named:prompt.u32:16", "./prompt.u32", "fast", "default"}) {
         // Defaults inspection never interprets --profile, including strings

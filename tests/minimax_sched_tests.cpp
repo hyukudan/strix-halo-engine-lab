@@ -29,10 +29,10 @@ struct Trace {
     void cancel_all() { if (open) prefill_cancel(active); if (parked) prefill_cancel(parked); }
     void retire_contexts(unsigned mask) { calls.push_back(1300 + mask); }
     void set_taps(bool on) { calls.push_back(on ? 81 : 80); }
-    void prefill_begin(unsigned slot, std::span<const unsigned> prompt, bool context, std::uint64_t id, std::uint64_t p, std::uint64_t g) {
+    void prefill_begin(unsigned slot, std::span<const unsigned> prompt, bool context, std::uint64_t id, std::uint64_t p, std::uint64_t g, std::uint64_t resident = 0) {
         if (open || (p != 0 && (parked != p || id == p))) throw std::runtime_error("wrong begin");
         active = id; parent = p; generation = g;
-        calls.push_back(200 + slot + static_cast<unsigned>(prompt.size()) + (context ? 10 : 0)); open = true;
+        calls.push_back(200 + slot + static_cast<unsigned>(resident + prompt.size()) + (context ? 10 : 0)); open = true;
     }
     bool prefill_unit(unsigned layers, unsigned*) { calls.push_back(layers); return false; }
     void prefill_cancel(std::uint64_t id = 0) {
@@ -45,7 +45,7 @@ struct Trace {
     void step(std::span<const unsigned> rows, unsigned append) { calls.push_back(300 + static_cast<unsigned>(rows.size()) + append); }
 };
 struct Control {
-    unsigned command = 0, bank = 0, plen = 0, pslot = 0, pflags = 0, layers = 0, rows = 0, append = 0, dslots = 0;
+    unsigned command = 0, bank = 0, plen = 0, pslot = 0, pstart = 0, pflags = 0, layers = 0, rows = 0, append = 0, dslots = 0;
     unsigned row[8]{}, dslot[8]{}, danchor[8]{};
     std::uint64_t dpos[8]{}, task_id = 0, parent_task_id = 0, slot_generation = 0;
 };
@@ -55,6 +55,8 @@ namespace ms = strix::minimax::serve;
 struct WireTrace : Trace {
     int socket = -1;
     unsigned delay_ms = 0;
+    unsigned pair_rank = 0;
+    unsigned rank() const { return pair_rank; }
     strix::minimax::engine::PfProgress prefill_progress(bool frozen = false) const {
         strix::minimax::engine::PfProgress p;
         p.id = frozen ? parked : active;
@@ -366,7 +368,7 @@ int main() {
             if (::socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) != 0) throw std::runtime_error("socketpair");
             const auto rank = [&](unsigned r) {
                 WireTrace engine;
-                engine.socket = sockets[r]; engine.active = 42; engine.parent = 41;
+                engine.socket = sockets[r]; engine.pair_rank = r; engine.active = 42; engine.parent = 41;
                 engine.open = opcode != 11 && opcode != 12; engine.parked = 41;
                 ms::Control out;
                 if (r == 0) { out.command = opcode; out.task_id = id; out.layers = 1; out.parent_task_id = opcode == 10 ? 999U : 0U; out.bank = opcode == 10 || opcode == 5 ? 1U : 0U; }
@@ -388,7 +390,7 @@ int main() {
         int sockets[2]{};
         if (::socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) != 0) throw std::runtime_error("socketpair");
         WireTrace lead, follower;
-        lead.socket = sockets[0]; follower.socket = sockets[1]; follower.delay_ms = 100;
+        lead.socket = sockets[0]; follower.socket = sockets[1]; follower.pair_rank = 1; follower.delay_ms = 100;
         ms::Control completion;
         completion.command = static_cast<unsigned>(ms::Command::check); completion.task_id = 42;
         auto peer = std::async(std::launch::async, [&] { return ms::exchange(follower, ms::Control{}); });

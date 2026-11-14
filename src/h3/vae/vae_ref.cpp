@@ -1,4 +1,5 @@
 #include "h3/vae/vae_ref.hpp"
+#include "h3/vae/precision.hpp"
 #include "h3/vae/vae_threads.hpp"
 
 #include <algorithm>
@@ -115,86 +116,17 @@ RopeTable rope_table(int nt, int ny, int nx) {
     return r;
 }
 
-H16 linear(const H16& x, int rows, const LinearH& w, bool round_before_bias) {
-    H16 y(std::size_t(rows) * w.out);
-    std::vector<float> wf(w.w.size());
-    for (std::size_t i = 0; i < wf.size(); ++i) wf[i] = h2f(w.w[i]);
-    parallel_rows(rows, [&](int r) {
-        std::vector<float> xr(static_cast<std::size_t>(w.in));
-        for (int k = 0; k < w.in; ++k) xr[std::size_t(k)] = h2f(x[std::size_t(r) * w.in + k]);
-        for (int n = 0; n < w.out; ++n) {
-            const float* wr = wf.data() + std::size_t(n) * w.in;
-            float acc[8] = {};
-            int k = 0;
-            for (; k + 8 <= w.in; k += 8)
-                for (int u = 0; u < 8; ++u) acc[u] += xr[std::size_t(k + u)] * wr[k + u];
-            float s = ((acc[0] + acc[1]) + (acc[2] + acc[3])) + ((acc[4] + acc[5]) + (acc[6] + acc[7]));
-            for (; k < w.in; ++k) s += xr[std::size_t(k)] * wr[k];
-            y[std::size_t(r) * w.out + n] = round_before_bias ? f2h(rh(s) + h2f(w.b[std::size_t(n)])) : f2h(s + h2f(w.b[std::size_t(n)]));
-        }
-    });
-    return y;
-}
+H16 linear(const H16& x, int rows, const LinearH& w, bool round_before_bias) { return precision::linear<half_bits>(x,rows,w,round_before_bias); }
 
-void linear_residual(H16& x, const H16& in, int rows, const LinearH& w, const H16& scale) {
-    const H16 y = linear(in, rows, w);
-    for (int r = 0; r < rows; ++r)
-        for (int n = 0; n < w.out; ++n) {
-            const std::size_t i = std::size_t(r) * w.out + n;
-            x[i] = f2h(h2f(x[i]) + h2f(y[i]) * h2f(scale[std::size_t(n)]));
-        }
-}
+void linear_residual(H16& x, const H16& in, int rows, const LinearH& w, const H16& scale) { precision::linear_residual<half_bits>(x,in,rows,w,scale); }
 
-H16 rms_norm(const H16& x, int rows, int width, const H16* weight, float eps) {
-    H16 y(x.size());
-    for (int r = 0; r < rows; ++r) {
-        const half_bits* xr = x.data() + std::size_t(r) * width;
-        double ss = 0;
-        for (int k = 0; k < width; ++k) { const float v = h2f(xr[k]); ss += double(v) * v; }
-        const float inv = 1.0F / std::sqrt(float(ss / width) + eps);
-        for (int k = 0; k < width; ++k) {
-            float v = h2f(xr[k]) * inv;
-            if (weight) v *= h2f((*weight)[std::size_t(k)]);
-            y[std::size_t(r) * width + k] = f2h(v);
-        }
-    }
-    return y;
-}
+H16 rms_norm(const H16& x, int rows, int width, const H16* weight, float eps) { return precision::rms_norm<half_bits>(x,rows,width,weight,eps); }
 
-H16 layer_norm(const H16& x, int rows, int width, const H16& w, const H16& b, float eps) {
-    H16 y(x.size());
-    for (int r = 0; r < rows; ++r) {
-        const half_bits* xr = x.data() + std::size_t(r) * width;
-        double mu = 0;
-        for (int k = 0; k < width; ++k) mu += h2f(xr[k]);
-        mu /= width;
-        double var = 0;
-        for (int k = 0; k < width; ++k) { const double d = h2f(xr[k]) - mu; var += d * d; }
-        var /= width;
-        const float inv = float(1.0 / std::sqrt(var + eps));
-        for (int k = 0; k < width; ++k)
-            y[std::size_t(r) * width + k] = f2h(float(h2f(xr[k]) - mu) * inv * h2f(w[std::size_t(k)]) + h2f(b[std::size_t(k)]));
-    }
-    return y;
-}
+H16 layer_norm(const H16& x, int rows, int width, const H16& w, const H16& b, float eps) { return precision::layer_norm<half_bits>(x,rows,width,w,b,eps); }
 
 namespace {
 // Per-head RMSNorm (unit weight) + split-half rope on [0, 48): FP16 rounding after each product and add.
-void rms_rope_head(const half_bits* src, half_bits* dst, const float* c, const float* s) {
-    double ss = 0;
-    for (int d = 0; d < kHeadDim; ++d) { const float v = h2f(src[d]); ss += double(v) * v; }
-    const float inv = 1.0F / std::sqrt(float(ss / kHeadDim) + 1e-5F);
-    float n[kHeadDim];
-    for (int d = 0; d < kHeadDim; ++d) n[d] = rh(h2f(src[d]) * inv);  // unit weight: x * inv * 1
-    for (int i = 0; i < kRotPairs; ++i) {
-        const float x0 = n[i], x1 = n[i + kRotPairs];
-        const float o0 = rh(rh(x0 * c[i]) + x1 * -s[i]);
-        const float o1 = rh(rh(x1 * c[i]) + x0 * s[i]);
-        dst[i] = f2h(o0);
-        dst[i + kRotPairs] = f2h(o1);
-    }
-    for (int d = kRotDim; d < kHeadDim; ++d) dst[d] = f2h(n[d]);
-}
+
 }  // namespace
 
 // FP16 sanitization after attention (reference): NaN -> 0, +-Inf -> +-65504.
@@ -204,114 +136,17 @@ half_bits nan_to_num16(half_bits b) {
     return half_bits((b & 0x8000U) | 0x7bffU);
 }
 
-H16 attention(const H16& qkv, int L, const RopeTable& rope, H16* q_out, H16* k_out) {
-    H16 q(std::size_t(L) * kDim), k(std::size_t(L) * kDim), v(std::size_t(L) * kDim);
-    for (int r = 0; r < L; ++r)
-        for (int h = 0; h < kHeads; ++h) {
-            const half_bits* row = qkv.data() + std::size_t(r) * kQkv + h * 3 * kHeadDim;
-            const float* c = rope.c.data() + std::size_t(r) * kRotPairs;
-            const float* s = rope.s.data() + std::size_t(r) * kRotPairs;
-            rms_rope_head(row, q.data() + std::size_t(r) * kDim + h * kHeadDim, c, s);
-            rms_rope_head(row + kHeadDim, k.data() + std::size_t(r) * kDim + h * kHeadDim, c, s);
-            std::memcpy(v.data() + std::size_t(r) * kDim + h * kHeadDim, row + 2 * kHeadDim, kHeadDim * 2);
-        }
-    if (q_out) *q_out = q;
-    if (k_out) *k_out = k;
-    H16 o(std::size_t(L) * kDim);
-    std::vector<float> kf(k.size()), vf(v.size());
-    for (std::size_t i = 0; i < k.size(); ++i) { kf[i] = h2f(k[i]); vf[i] = h2f(v[i]); }
-    parallel_rows(L * kHeads, [&](int job) {
-        const int r = job / kHeads, h = job % kHeads;
-        float qr[kHeadDim];
-        for (int d = 0; d < kHeadDim; ++d) qr[d] = h2f(q[std::size_t(r) * kDim + h * kHeadDim + d]);
-        std::vector<double> sc(static_cast<std::size_t>(L));
-        double mx = -1e300;
-        for (int j = 0; j < L; ++j) {
-            const float* kr = kf.data() + std::size_t(j) * kDim + h * kHeadDim;
-            double dot = 0;
-            for (int d = 0; d < kHeadDim; ++d) dot += double(qr[d]) * kr[d];
-            sc[std::size_t(j)] = dot * 0.125;
-            mx = std::max(mx, sc[std::size_t(j)]);
-        }
-        double sum = 0;
-        for (int j = 0; j < L; ++j) { sc[std::size_t(j)] = std::exp(sc[std::size_t(j)] - mx); sum += sc[std::size_t(j)]; }
-        double acc[kHeadDim] = {};
-        for (int j = 0; j < L; ++j) {
-            const float* vr = vf.data() + std::size_t(j) * kDim + h * kHeadDim;
-            for (int d = 0; d < kHeadDim; ++d) acc[d] += sc[std::size_t(j)] * vr[d];
-        }
-        for (int d = 0; d < kHeadDim; ++d) o[std::size_t(r) * kDim + h * kHeadDim + d] = nan_to_num16(f2h(float(acc[d] / sum)));
-    });
-    return o;
-}
+H16 attention(const H16& qkv, int L, const RopeTable& rope, H16* q_out, H16* k_out) { return precision::attention<half_bits>(qkv,L,rope,q_out,k_out); }
 
-void layer_forward(const LayerH& w, H16& x, int L, const RopeTable& rope) {
-    const H16 a = rms_norm(x, L, kDim, &w.norm1, 1e-5F);
-    const H16 qkv = linear(a, L, w.qkv);
-    const H16 o = attention(qkv, L, rope);
-    linear_residual(x, o, L, w.out, w.scale1);
-    const H16 a2 = rms_norm(x, L, kDim, &w.norm2, 1e-5F);
-    const H16 h = linear(a2, L, w.w1);
-    H16 g(std::size_t(L) * kFf);
-    for (int r = 0; r < L; ++r)
-        for (int n = 0; n < kFf; ++n) {
-            const float gate = h2f(h[std::size_t(r) * kFf2 + n]);
-            const float up = h2f(h[std::size_t(r) * kFf2 + kFf + n]);
-            const float si = rh(gate / (1.0F + std::exp(-gate)));
-            g[std::size_t(r) * kFf + n] = f2h(si * up);
-        }
-    linear_residual(x, g, L, w.w2, w.scale2);
-}
+void layer_forward(const LayerH& w, H16& x, int L, const RopeTable& rope) { precision::layer_forward<half_bits>(w,x,L,rope); }
 
-H16 post_quant(const HeadH& h, const H16& z, int voxels) {
-    H16 out(z.size());
-    for (int co = 0; co < kLatentC; ++co)
-        for (int p = 0; p < voxels; ++p) {
-            float s = 0;
-            for (int ci = 0; ci < kLatentC; ++ci) s += h2f(h.post_quant.w[std::size_t(co) * kLatentC + ci]) * h2f(z[std::size_t(ci) * voxels + p]);
-            out[std::size_t(co) * voxels + p] = f2h(s + h2f(h.post_quant.b[std::size_t(co)]));
-        }
-    return out;
-}
+H16 post_quant(const HeadH& h, const H16& z, int voxels) { return precision::post_quant<half_bits>(h,z,voxels); }
 
-H16 embed(const HeadH& h, const H16& dec_in, int nt, int ny, int nx) {
-    const int P = nt * ny * nx, L = P + kSuffix;
-    H16 rows(std::size_t(P) * kLatentC);
-    for (int p = 0; p < P; ++p)
-        for (int c = 0; c < kLatentC; ++c) rows[std::size_t(p) * kLatentC + c] = dec_in[std::size_t(c) * P + p];
-    // the reference feeds a transposed (non-contiguous) 3-D view: matmul rounds to FP16, then the bias add rounds again
-    const H16 e = linear(rows, P, h.x_embed, true);
-    H16 x(std::size_t(L) * kDim, 0);
-    std::memcpy(x.data(), e.data(), e.size() * 2);
-    std::memcpy(x.data() + std::size_t(P) * kDim, h.registers.data(), std::size_t(kRegisters) * kDim * 2);
-    return x;  // last row: zeros
-}
+H16 embed(const HeadH& h, const H16& dec_in, int nt, int ny, int nx) { return precision::embed<half_bits>(h,dec_in,nt,ny,nx); }
 
-H16 unpatchify(const H16& pr, int nt, int ny, int nx) {
-    const int F = 4 * nt, Hh = 16 * ny, Ww = 16 * nx;
-    H16 out(std::size_t(3) * F * Hh * Ww);
-    for (int t = 0; t < nt; ++t)
-        for (int y = 0; y < ny; ++y)
-            for (int x = 0; x < nx; ++x) {
-                const half_bits* row = pr.data() + std::size_t((t * ny + y) * nx + x) * kProj;
-                for (int c = 0; c < 3; ++c)
-                    for (int pt = 0; pt < 4; ++pt)
-                        for (int py = 0; py < 16; ++py)
-                            for (int px = 0; px < 16; ++px)
-                                out[((std::size_t(c) * F + t * 4 + pt) * Hh + y * 16 + py) * Ww + x * 16 + px] =
-                                    row[((c * 4 + pt) * 16 + py) * 16 + px];
-            }
-    return out;
-}
+H16 unpatchify(const H16& pr, int nt, int ny, int nx) { return precision::unpatchify<half_bits>(pr,nt,ny,nx); }
 
-H16 head_out(const HeadH& h, const H16& x, int nt, int ny, int nx, H16* proj_rows) {
-    const int P = nt * ny * nx;
-    const H16 xs(x.begin(), x.begin() + std::ptrdiff_t(std::size_t(P) * kDim));
-    const H16 n = layer_norm(xs, P, kDim, h.norm_out_w, h.norm_out_b, 1e-5F);
-    const H16 pr = linear(n, P, h.proj);
-    if (proj_rows) *proj_rows = pr;
-    return unpatchify(pr, nt, ny, nx);
-}
+H16 head_out(const HeadH& h, const H16& x, int nt, int ny, int nx, H16* proj_rows) { return precision::head_out<half_bits>(h,x,nt,ny,nx,proj_rows); }
 
 // Invalid comparisons (different lengths, empty, any non-finite value on either side) score -inf PSNR and +inf
 // error, so every threshold fails on them.

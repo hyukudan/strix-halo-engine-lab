@@ -303,6 +303,36 @@ por ejecución, los dos órdenes, tok/s de prefill (tiempo del prompt):
 El decode tras el prompt (128 tokens) no cambia: 2K / 8K / 32K 47.3 / 42.1 / 29.5 tok/s tras `a8`, 47.3 / 42.1 / 29.4
 tras v1.
 
+### Dos nodos: prefill del prompt en pipeline (opcional)
+
+`STRIX_G4_PAIR=1` ejecuta el prefill del prompt de una petición en dos nodos como un pipeline de capas de dos
+etapas; por defecto todo sigue en un nodo. El rango 0 ejecuta las capas 0-20 de cada fragmento de 512 filas del
+prompt mientras el rango 1 ejecuta las capas 21-41 del fragmento anterior. La costura (87 MB por fragmento por el
+enlace USB4, unos 17 ms) lleva las filas residuales, la norma de entrada de la capa siguiente, los taps y las filas
+K/V del rango 0, así que el rango 1 termina el prompt con la caché KV completa y decodifica solo; el rango 0 termina.
+La aritmética de cada capa no cambia: el digest del estado KV y un digest de los logits sin procesar de cada token
+decodificado (`STRIX_G4_LOGITS_DIGEST=1`) son iguales byte a byte a la ruta `fast` de un nodo (2K, 8K y 32K, cortes
+19, 21, 23 y 24). Un prompt de un solo fragmento se ejecuta solo en el rango 1.
+
+```bash
+# Mismo binario, modelo y prompt en los dos nodos; el rango 1 imprime la respuesta.
+STRIX_G4_PAIR=1 strix-gemma4-decode --model MODEL.gguf --profile fast ... --rank 0   # nodo A
+STRIX_G4_PAIR=1 strix-gemma4-decode --model MODEL.gguf --profile fast ... --rank 1   # nodo B
+```
+
+`--transport tcp --peer HOST` sustituye el enlace USB4 por defecto; `STRIX_G4_PAIR_CUT` (por defecto 21, el más
+rápido de 19 / 21 / 23 a 8K y de 21 / 24 a 32K) mueve el corte. Q4_K_M, `fast`, `--draft off`, un proceso nuevo por ejecución, el mismo
+binario, un nodo y pareja alternados (ABAB), main 51b42906e con la atención WMMA del prefill; tok/s de prefill (tiempo del prompt):
+
+| Prompt | Un nodo | **Dos nodos** | Aceleración |
+|---|---:|---:|---:|
+| 2K | 2,866 (0.71 s) | **4,132 (0.50 s)** | 1.44x |
+| 8K | 2,761 (2.97 s) | **4,804 (1.71 s)** | 1.74x |
+| 32K | 2,322 (14.11 s) | **3,965 (8.27 s; runs 7.78 and 8.76 s)** | 1.71x |
+
+El techo con fragmentos de 512 filas es 2C/(C+1) para C fragmentos (2K 1.60x, 8K 1.88x, 32K 1.97x). El decode tras
+el prompt es el decode de un nodo en el rango 1, la misma velocidad dentro del ruido (medido sobre main 3de139c0c: drafter MTP, 128 tokens, 2K / 8K / 32K: un nodo 69.7 / 62.3 / 38.0 tok/s, tras el prefill en pareja 69.8 / 62.7 / 37.9; mismos bytes del estado KV, así que el drafter recibe los mismos taps).
+
 Prefill de prompts `a8` (`fast` en paquetes que no son Q4_K_M; `STRIX_G4_PREFILL_IDENTITY=a8`, válido solo con el decode `g4-a8-v1`; con otra
 identidad de decode se ejecuta el prefill exacto y una línea en stderr lo indica). El prompt se procesa en bloques de
 512 filas con los mismos lineales `g4-a8-v1` que el decode (IU8 WMMA en bloques largos, los kernels del decode hasta 8

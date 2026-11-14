@@ -109,8 +109,12 @@ public:
     [[nodiscard]] unsigned nested_rows() const;
     [[nodiscard]] const char* nested_reason() const;
     [[nodiscard]] PfProgress prefill_progress(bool parked = false) const;
+    // `resident` positions of `slot`'s cache are a reused prefix that precedes `tokens`; prefill opens at that
+    // position (0 = the whole prompt). Reuse must preserve completed prefill unit boundaries;
+    // decode-produced rows are not a prefill identity.
     void prefill_begin_task(PfTaskId id, PfTaskId parent, std::uint64_t generation,
-                            std::uint32_t slot, std::span<const std::uint32_t> tokens, PrefillTapSink sink);
+                            std::uint32_t slot, std::span<const std::uint32_t> tokens, std::uint64_t resident,
+                            PrefillTapSink sink);
     void prefill_park(PfTaskId id);
     void prefill_resume_parked(PfTaskId id);
     void prefill_cancel(PfTaskId id);
@@ -120,6 +124,12 @@ public:
     [[nodiscard]] const char* prefill_unlimited_reason() const;  // empty, profiling or fp32_prefill
     [[nodiscard]] unsigned prefill_layer() const;           // next layer of the open chunk / group (0: at a chunk boundary)
     [[nodiscard]] std::uint64_t prefill_unit_rows() const;  // rows of the open chunk / group (0: none open)
+    [[nodiscard]] std::uint64_t prefill_reuse_rows() const;  // finest exact resume alignment: one prefill chunk
+    // Conversation mode only (both ranks voted): a resident prefill may restart at any row, not only a chunk
+    // boundary. The suffix then tiles from that row, so it is NOT the cold chunking. Default off.
+    [[nodiscard]] bool prefill_int4_regime(std::uint64_t prompt_rows) const;
+    void set_unaligned_resume(bool on);
+    [[nodiscard]] bool unaligned_resume() const;
     [[nodiscard]] std::uint64_t prefill_rows_left() const;  // rows from the open chunk / group to the end (0: none open)
     // Teacher-forced gate: the first `layers` layers over `tokens` (positions 0.., slot 0) in ONE call with the G4
     // harness's kernels and call order; returns the residual [T x 6144] after layer `layers - 1`.
@@ -252,6 +262,10 @@ public:
     // linears skip their prepare launch (same bits); xb_prep_count = layers that took it.
     void set_xb_prep(bool on);
     [[nodiscard]] bool xb_prep() const;
+    // Exchange row fold (xport/row_fold.hpp, STRIX_MMX_FOLD=rows on the exchange module): when on (default) and the
+    // module has fold slots for the message, the pair sum is computed by its progress thread. Same bits.
+    void set_xb_fold(bool on);
+    [[nodiscard]] bool xb_fold() const;
     [[nodiscard]] std::uint64_t xb_prep_count() const;
     // STRIX_MM_XB_PUBLISH=1 (with XB_INPLACE): the in-place producers (o_proj v4 core, MoE down4, dense down) publish
     // their exchange message themselves (lean form), no publish launch; xb_publish_count = exchanges that took it.
@@ -312,6 +326,12 @@ public:
     [[nodiscard]] std::uint64_t state_fnv(std::uint32_t slot, std::uint64_t positions);
     // FNV-1a of the last prefill's final normed rows of its last chunk (the head's input), 0 before any prefill.
     [[nodiscard]] std::uint64_t prefill_out_fnv();
+    // The same rows as values (quality comparisons, e.g. FAST STRIX_XPORT_HALF vs FP32 payloads); empty before any prefill.
+    [[nodiscard]] std::vector<float> prefill_out_rows();
+    // This rank's vocabulary slice of the head logits for the last `rows` of those rows, [rows][slice] (teacher-forced
+    // per-token quality: KL / NLL / top-1 against a reference arm); empty before any prefill.
+    [[nodiscard]] std::vector<float> prefill_out_logits(std::size_t rows);
+
 
     [[nodiscard]] const dist::CommunicatorStats& comm_stats() const;
     [[nodiscard]] const Profile& profile() const;

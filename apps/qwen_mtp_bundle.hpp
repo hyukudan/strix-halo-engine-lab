@@ -50,7 +50,7 @@ private:
     bool previous_;
 };
 inline int retry_mtp_bundle_serial(const std::exception& error,const std::function<int()>& run) {
-    std::cerr << "YaRN MTP bundle setup unavailable; using serial decode: " << error.what() << '\n';
+    std::cerr << "MTP bundle setup unavailable; using serial decode: " << error.what() << '\n';
     YarnBundleSerialRetry retry;
     return run();
 }
@@ -64,7 +64,7 @@ public:
 #if defined(__linux__)
         for (auto entry=::environ; entry && *entry; ++entry) {
 #elif defined(_WIN32)
-        for (auto entry=::_environ; entry && *entry; ++entry) {
+        for (auto entry=_environ; entry && *entry; ++entry) {
 #endif
 #if defined(__linux__) || defined(_WIN32)
             const std::string text=*entry;
@@ -81,7 +81,7 @@ public:
 #if defined(__linux__)
         for(auto entry=::environ;entry && *entry;++entry) {
 #elif defined(_WIN32)
-        for(auto entry=::_environ;entry && *entry;++entry) {
+        for(auto entry=_environ;entry && *entry;++entry) {
 #endif
 #if defined(__linux__) || defined(_WIN32)
             const std::string text=*entry;
@@ -248,7 +248,7 @@ inline std::filesystem::path ensure_mtp_bundle_golden(const std::filesystem::pat
         std::filesystem::remove(temp,ignored);
         throw;
     }
-    std::cerr << "YaRN MTP calibration cached: " << final.string() << '\n';
+    std::cerr << "MTP calibration cached: " << final.string() << '\n';
     return final;
 }
 } // namespace strix::decode_cli

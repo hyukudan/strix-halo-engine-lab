@@ -21,23 +21,15 @@
 
 namespace strix::h3::vae::enc {
 
-struct Conv2 {  // causal conv: w = 2-D view [cout][cin][kh][kw] (last temporal tap, T == 1 path); w3 = all kt taps
-    int cin = 0, cout = 0, k = 0, kt = 1;
-    H16 w, b, w3;  // w3 [cout][cin][kt][kh][kw]
-};
-struct Norm { H16 w, b; };
-struct Res { Norm n1, n2; Conv2 c1, c2, nin; bool has_nin = false; };
-struct Weights {
-    Conv2 conv_in, conv_out, quant;
-    Res blocks[6][2];
-    Conv2 down[4];
-    Norm norm_out;
-    H16 latents_mean, latents_std;
-};
+using Conv2 = Conv2T<half_bits>;
+using Norm = NormT<half_bits>;
+using Res = ResT<half_bits>;
+using Weights = WeightsT<half_bits>;
+
 Weights load(const SafeTensors& st);
 
 // Host ops on FP16 [C][H][W] maps.
-struct Map { int C = 0, H = 0, W = 0; H16 v; };
+using Map = MapT<half_bits>;
 
 // Supported shapes: H, W multiples of 16 and >= 32. Every 3x3 conv reflect-pads by 1, which needs >= 2 pixels at every
 // level; four stride-2 downsamples take 32 px to 2 px (16 px would reach 1 px, where the reflection is undefined and the

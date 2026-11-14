@@ -1,3 +1,5 @@
+#include "strix/device/hip_gate.hpp"
+#include "strix/dist/open_transport.hpp"
 #include "strix/ds41_dspark_vocab.hpp"
 #include "strix/model_content_hash.hpp"
 #include "strix/deepseek41_describe.hpp"
@@ -204,54 +206,6 @@ struct OpSums {
         }
     }
 };
-
-// usb4gpu: the device exchange (GPU-direct streams) built next to the host-path control transport.
-std::unique_ptr<strix::dist::DeviceExchange> gpu_direct;
-
-std::unique_ptr<strix::dist::Transport> open_transport(const std::string& spec, std::uint32_t rank, unsigned timeout) {
-    const std::chrono::seconds limit(timeout);
-    const auto colon = spec.find(':');
-    const std::string kind = spec.substr(0, colon), rest = colon == std::string::npos ? "" : spec.substr(colon + 1);
-    if (kind == "tcp-listen") return strix::dist::tcp_listen(static_cast<std::uint16_t>(std::stoul(rest)), limit);
-    if (kind == "tcp-connect") {
-        const auto c2 = rest.rfind(':');
-        return strix::dist::tcp_connect(rest.substr(0, c2), static_cast<std::uint16_t>(std::stoul(rest.substr(c2 + 1))), limit);
-    }
-    if (kind == "usb4auto") {  // every live stream of every cable, paired by handshake (the communicator's discovery)
-        strix::dist::Usb4AutoOptions o;
-        o.rank = rank;
-        o.timeout = limit;
-        strix::dist::Usb4Topology topology;
-        auto t = strix::dist::usb4_host_auto(o, &topology);
-        std::printf("usb4 topology: %s\n", topology.receipt().c_str());
-        return t;
-    }
-    if (kind == "usb4gpu") {  // GPU-direct exchanges over the gpu_direct streams, control over the host-path ones
-        strix::dist::Usb4AutoOptions o;
-        o.rank = rank;
-        o.timeout = limit;
-        strix::dist::Usb4Topology topology;
-        auto t = strix::dist::usb4_host_auto(o, &topology);
-        std::printf("usb4 topology: %s\n", topology.receipt().c_str());
-        std::string receipt;
-        std::string why_direct;
-        if (strix::dist::usb4_gpu_direct_streams(o, *t, &why_direct) == 0U) {  // both ranks agree: host path only
-            std::printf("gpu-direct unavailable (%s): host path only\n", why_direct.c_str());
-            return t;
-        }
-        gpu_direct = strix::dist::usb4_gpu_direct(o, topology, *t, {}, &receipt);
-        std::printf("usb4 %s\n", receipt.c_str());
-        return t;
-    }
-    if (kind == "usb4") {
-        std::vector<std::string> devices;
-        std::stringstream ss(rest);
-        for (std::string d; std::getline(ss, d, ',');) devices.push_back(d);
-        return strix::dist::usb4_host(devices);
-    }
-    (void)rank;
-    throw std::invalid_argument("unknown or unavailable transport " + spec);
-}
 
 // ---- pipeline TAIL ----
 namespace pipe = strix::ds41::pipe;
@@ -1644,16 +1598,16 @@ void run_session(const Args &a, strix::deepseek41::DeviceForward &fwd, std::uint
         ds::save_attention_state(a.export_state, state);
 }
 
-void run_rank(const Args& a, std::uint32_t rank, std::unique_ptr<strix::dist::Transport> transport, bool print) {
+void run_rank(const Args& a, std::uint32_t rank, std::unique_ptr<strix::dist::Transport> transport, bool print,
+              std::unique_ptr<strix::dist::DeviceExchange> direct = nullptr) {
     const auto t0 = std::chrono::steady_clock::now();
     // no transport: one node alone (world 1; with --stream-experts the experts are read from the file per layer)
     const bool single = transport == nullptr;
     std::unique_ptr<strix::dist::Communicator> comm_owner;
     // max message 1 MB: a verify window's STEP frame or its rows' logits slices (<= 1 MB control chunks) in one exchange
-    if (!single && gpu_direct)
+    if (!single)
         comm_owner = std::make_unique<strix::dist::Communicator>(strix::dist::Group{rank, 2U, 1U, 0x64733431ULL}, std::move(transport),
-                                                                 std::move(gpu_direct), std::size_t{1} << 20U);
-    else if (!single) comm_owner = std::make_unique<strix::dist::Communicator>(strix::dist::Group{rank, 2U, 1U, 0x64733431ULL}, std::move(transport), std::size_t{1} << 20U);
+                                                                 std::move(direct), std::size_t{1} << 20U);
     if (comm_owner) {  // both ranks must run the same product profile
         auto& comm = *comm_owner;
         strix::profile::check_peer(strix::deepseek41::pair_defaults::profile_resolution(), [&](std::span<const std::byte> profile_out, std::span<std::byte> profile_in) {
@@ -2110,6 +2064,10 @@ std::string describe(const Args& a) {
 }  // namespace
 
 int main(int argc, char** argv) try {
+    // Start gate: resolves the declared device (--devices FILE, --device-id ID, STRIX_DEVICES, STRIX_DEVICE), refuses an
+    // excluded or undeclared one and prints the "device:" receipt line. Without a declaration the single integrated
+    // GPU of a node keeps working (declared=implicit).
+    strix::device::bind_hip_main(argc, argv);
     const strix::deepseek41::pair_defaults::Effective production_defaults(strix::deepseek41::pair_defaults::App::rank, argc, argv, strix::deepseek41::pair_defaults::this_build());  // before any option or env read
     Args a;
     for (int i = 1; i < argc; ++i) {
@@ -2315,11 +2273,12 @@ int main(int argc, char** argv) try {
     // A blocked open() of a stream on a dead link would hold this node (and the peer) indefinitely: the alarm's
     // default action ends the process if the transport is not open within the timeout.
     ::alarm(a.connect_timeout);
-    auto transport = open_transport(a.transport, a.rank, a.connect_timeout);
+    auto opened = strix::dist::open_pair(a.transport, a.rank, {std::chrono::seconds(a.connect_timeout), strix::dist::all_transport_capabilities, true});
+    auto transport = std::move(opened.host);
     ::alarm(0);
     std::printf("connected (%s)\n", transport->name().c_str());
     std::fflush(stdout);
-    run_rank(a, a.rank, std::move(transport), true);
+    run_rank(a, a.rank, std::move(transport), true, std::move(opened.direct));
     return 0;
 } catch (const std::exception& e) {
     std::cerr << "error: " << e.what() << '\n';

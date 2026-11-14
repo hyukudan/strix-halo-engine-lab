@@ -5,6 +5,8 @@
 // FP16 rounding points follow the reference module (see vae_ref.hpp): one FP32 computation and one FP16
 // rounding per tensor op; linears accumulate K16 tiles in ascending order into one FP32 accumulator.
 
+#include "strix/env_flags.hpp"
+#include "strix/hip_check.hpp"
 #include "h3/vae/vae_kernels.hpp"
 
 #include <hip/hip_runtime.h>
@@ -23,7 +25,7 @@ typedef float f8 __attribute__((ext_vector_type(8)));
 typedef unsigned u32x4 __attribute__((ext_vector_type(4)));
 
 void check(hipError_t e, const char* what) {
-    if (e != hipSuccess) throw std::runtime_error(std::string("h3 vae hip: ") + what + ": " + hipGetErrorString(e));
+    ::strix::hip_check_prefixed("h3 vae hip: ", e, what);
 }
 void launched(const char* what) { check(hipGetLastError(), what); }
 
@@ -64,11 +66,12 @@ template <unsigned Threads> __device__ float block_sum(float v, float* red) {
 }
 
 // ---------------------------------------------------------------------------------------------------------
-// RMSNorm over 2048 (weighted) and LayerNorm over 2048 (weight + bias): one 256-thread block per row,
-// each thread owns 8 consecutive features.
-__global__ __launch_bounds__(256) void rms_norm_kernel(const _Float16* __restrict__ x, const _Float16* __restrict__ w,
+// RMSNorm (weighted) and LayerNorm (weight + bias): one width/8-thread block per row.
+// Eight consecutive features per thread; width 2048 retains its original reduction tree.
+template <unsigned Width>
+__global__ __launch_bounds__(Width / 8U) void rms_norm_kernel(const _Float16* __restrict__ x, const _Float16* __restrict__ w,
                                                        _Float16* __restrict__ y, unsigned width, float eps) {
-    __shared__ float red[8];
+    __shared__ float red[Width / 256U];
     const std::size_t row = blockIdx.x;
     const unsigned c0 = threadIdx.x * 8U;
     float v[8];
@@ -76,7 +79,7 @@ __global__ __launch_bounds__(256) void rms_norm_kernel(const _Float16* __restric
     const h8 xv = *reinterpret_cast<const h8*>(x + row * width + c0);
 #pragma unroll
     for (unsigned k = 0; k < 8U; ++k) { v[k] = h(xv[k]); ss += v[k] * v[k]; }
-    const float total = block_sum<256>(ss, red);
+    const float total = block_sum<Width / 8U>(ss, red);
     const float inv = 1.0F / sqrtf(total / float(width) + eps);
     const h8 wv = *reinterpret_cast<const h8*>(w + c0);
     h8 out;
@@ -85,10 +88,11 @@ __global__ __launch_bounds__(256) void rms_norm_kernel(const _Float16* __restric
     *reinterpret_cast<h8*>(y + row * width + c0) = out;
 }
 
-__global__ __launch_bounds__(256) void layer_norm_kernel(const _Float16* __restrict__ x, const _Float16* __restrict__ w,
+template <unsigned Width>
+__global__ __launch_bounds__(Width / 8U) void layer_norm_kernel(const _Float16* __restrict__ x, const _Float16* __restrict__ w,
                                                          const _Float16* __restrict__ b, _Float16* __restrict__ y,
                                                          unsigned width, float eps) {
-    __shared__ float red[8];
+    __shared__ float red[Width / 256U];
     const std::size_t row = blockIdx.x;
     const unsigned c0 = threadIdx.x * 8U;
     float v[8];
@@ -96,11 +100,11 @@ __global__ __launch_bounds__(256) void layer_norm_kernel(const _Float16* __restr
     const h8 xv = *reinterpret_cast<const h8*>(x + row * width + c0);
 #pragma unroll
     for (unsigned k = 0; k < 8U; ++k) { v[k] = h(xv[k]); s += v[k]; }
-    const float mu = block_sum<256>(s, red) / float(width);
+    const float mu = block_sum<Width / 8U>(s, red) / float(width);
     float q = 0.0F;
 #pragma unroll
     for (unsigned k = 0; k < 8U; ++k) { const float d = v[k] - mu; q += d * d; }
-    const float var = block_sum<256>(q, red) / float(width);
+    const float var = block_sum<Width / 8U>(q, red) / float(width);
     const float inv = 1.0F / sqrtf(var + eps);
     const h8 wv = *reinterpret_cast<const h8*>(w + c0), bv = *reinterpret_cast<const h8*>(b + c0);
     h8 out;
@@ -349,7 +353,7 @@ __global__ __launch_bounds__((BM / 64U) * (BN / 64U) * 32U) void gemm_tiled_kern
 // STRIX_H3_VAE_GEMM=0: the simple 128 x 128 kernel (same bits, slower).
 int tiled_override = -1;
 bool use_tiled() {
-    static const bool on = [] { const char* v = std::getenv("STRIX_H3_VAE_GEMM"); return !v || v[0] != '0'; }();
+    static const bool on = strix::envcfg::flag("STRIX_H3_VAE_GEMM", true);
     return tiled_override < 0 ? on : tiled_override != 0;
 }
 // Block tile choice (routing only: every tile gives the same bits, each output's K16 order is fixed).
@@ -360,7 +364,7 @@ int tile_override = -1;
 // 128 x 128 30.1 TF; w2 (K 8192) 256 x 256 21.2 TF; out (2048 x 2048) and the rest 128 x 256.
 unsigned tile_for(unsigned M, unsigned N, unsigned K, unsigned mode) {
     if (tile_override >= 0) return unsigned(tile_override);
-    static const int env = [] { const char* v = std::getenv("STRIX_H3_VAE_TILE"); return v ? std::atoi(v) : -1; }();
+    static const int env = strix::envcfg::integer("STRIX_H3_VAE_TILE", -1);
     if (env >= 0 && env <= 3) return unsigned(env);
     (void)M;
     if (mode == 3U) return 3U;
@@ -386,32 +390,34 @@ template <unsigned Mode> void launch_tiled(const _Float16* A, unsigned lda, cons
 
 // ---------------------------------------------------------------------------------------------------------
 // gated SiLU: g[r][n] = fp16(fp16(silu(h[r][n])) * h[r][8192 + n])
+template <unsigned Ff>
 __global__ __launch_bounds__(256) void swiglu_kernel(const _Float16* __restrict__ hbuf, _Float16* __restrict__ g, unsigned rows) {
     const std::size_t i = std::size_t(blockIdx.x) * 256U + threadIdx.x;
-    if (i >= std::size_t(rows) * 8192U) return;
-    const std::size_t r = i / 8192U, n = i % 8192U;
-    const float gate = h(hbuf[r * 16384U + n]), up = h(hbuf[r * 16384U + 8192U + n]);
+    if (i >= std::size_t(rows) * Ff) return;
+    const std::size_t r = i / Ff, n = i % Ff;
+    const float gate = h(hbuf[r * (2U * Ff) + n]), up = h(hbuf[r * (2U * Ff) + Ff + n]);
     const float si = h(r16(gate / (1.0F + expf(-gate))));
     g[i] = r16(si * up);
 }
 
 // ---------------------------------------------------------------------------------------------------------
-// Per-head RMSNorm (unit weight, eps 1e-5) + split-half rope on dims [0, 48) of q and k; v copied.
-// qkv [L][6144] (head h: q at 192 h, k at 192 h + 64, v at 192 h + 128) -> Q, K, V [32][Lp][64].
-// rope: [L][24] FP16 cos, [L][24] FP16 sin. One thread per (token, head, q|k|v).
+// Per-head RMSNorm (unit weight, eps 1e-5) + split-half RoPE on [0, 2*Pairs); v copied.
+// qkv [L][Heads*192] (head h: q/k/v at 192h + 0/64/128) -> Q/K/V [Heads][Lp][64].
+// RoPE [L][Pairs] FP16 cos/sin. One thread per (token, head, q|k|v).
+template <unsigned Heads, unsigned Pairs>
 __global__ __launch_bounds__(256) void rms_rope_kernel(const _Float16* __restrict__ qkv, const _Float16* __restrict__ rc,
                                                        const _Float16* __restrict__ rs, _Float16* __restrict__ Q,
                                                        _Float16* __restrict__ Kh, _Float16* __restrict__ V, unsigned L, unsigned Lp) {
     const unsigned item = blockIdx.x * 256U + threadIdx.x;
-    if (item >= Lp * 32U * 3U) return;
-    const unsigned which = item % 3U, hd = (item / 3U) % 32U, tok = item / 96U;
+    if (item >= Lp * Heads * 3U) return;
+    const unsigned which = item % 3U, hd = (item / 3U) % Heads, tok = item / (Heads * 3U);
     _Float16* dst = (which == 0U ? Q : which == 1U ? Kh : V) + (std::size_t(hd) * Lp + tok) * 64U;
     if (tok >= L) {  // padding rows [L, Lp): zeroed on every call (no stale values from an earlier, larger call)
 #pragma unroll
         for (unsigned d = 0; d < 64U; d += 8U) *reinterpret_cast<h8*>(dst + d) = h8{};
         return;
     }
-    const _Float16* src = qkv + std::size_t(tok) * 6144U + hd * 192U + which * 64U;
+    const _Float16* src = qkv + std::size_t(tok) * (Heads * 192U) + hd * 192U + which * 64U;
     if (which == 2U) {
 #pragma unroll
         for (unsigned d = 0; d < 64U; d += 8U) *reinterpret_cast<h8*>(dst + d) = *reinterpret_cast<const h8*>(src + d);
@@ -425,14 +431,14 @@ __global__ __launch_bounds__(256) void rms_rope_kernel(const _Float16* __restric
 #pragma unroll
     for (unsigned d = 0; d < 64U; ++d) n[d] = h(r16(n[d] * inv));
 #pragma unroll
-    for (unsigned i = 0; i < 24U; ++i) {
-        const float c = h(rc[tok * 24U + i]), s = h(rs[tok * 24U + i]);
-        const float x0 = n[i], x1 = n[i + 24U];
+    for (unsigned i = 0; i < Pairs; ++i) {
+        const float c = h(rc[tok * Pairs + i]), s = h(rs[tok * Pairs + i]);
+        const float x0 = n[i], x1 = n[i + Pairs];
         dst[i] = r16(h(r16(x0 * c)) + x1 * -s);
-        dst[i + 24U] = r16(h(r16(x1 * c)) + x0 * s);
+        dst[i + Pairs] = r16(h(r16(x1 * c)) + x0 * s);
     }
 #pragma unroll
-    for (unsigned d = 48U; d < 64U; ++d) dst[d] = r16(n[d]);
+    for (unsigned d = (2U * Pairs); d < 64U; ++d) dst[d] = r16(n[d]);
 }
 
 // ---------------------------------------------------------------------------------------------------------
@@ -442,6 +448,7 @@ __global__ __launch_bounds__(256) void rms_rope_kernel(const _Float16* __restric
 // FP32 (exp2 of scaled scores), P rounded to FP16 for O^T += V^T P^T. Key order is ascending and fixed.
 // Q, K, V: [32][Lp][64] (rows L..Lp zero); O: [L][2048], column 64 h + d.
 constexpr unsigned kAQ = 128U, kAK = 64U, kAPitch = 72U;
+template <unsigned Width>
 __global__ __launch_bounds__(256) void attention_kernel(const _Float16* __restrict__ Q, const _Float16* __restrict__ Kh,
                                                         const _Float16* __restrict__ V, _Float16* __restrict__ O,
                                                         unsigned L, unsigned Lp) {
@@ -538,21 +545,22 @@ __global__ __launch_bounds__(256) void attention_kernel(const _Float16* __restri
 #pragma unroll
         for (unsigned e = 0; e < 8U; ++e) {
             const unsigned d = 16U * dt + 2U * e + (upper ? 1U : 0U);
-            O[std::size_t(q) * 2048U + hd * 64U + d] = nan_to_num16(r16(o[dt][e] * inv));
+            O[std::size_t(q) * Width + hd * 64U + d] = nan_to_num16(r16(o[dt][e] * inv));
         }
 }
 
 // ---------------------------------------------------------------------------------------------------------
 // x_embedder (24 -> 2048) on the decoder input [24][P] (channel-major), the reference's two roundings
 // (matmul to FP16, then + bias); rows P..P+3 = register tokens, row P+4 = zeros.
+template <unsigned Width>
 __global__ __launch_bounds__(256) void embed_kernel(const _Float16* __restrict__ zin, const _Float16* __restrict__ w,
                                                     const _Float16* __restrict__ b, const _Float16* __restrict__ reg,
                                                     _Float16* __restrict__ x, unsigned P) {
     const std::size_t i = std::size_t(blockIdx.x) * 256U + threadIdx.x;
-    if (i >= std::size_t(P + 5U) * 2048U) return;
-    const unsigned r = unsigned(i / 2048U), n = unsigned(i % 2048U);
+    if (i >= std::size_t(P + 5U) * Width) return;
+    const unsigned r = unsigned(i / Width), n = unsigned(i % Width);
     if (r >= P) {
-        x[i] = r < P + 4U ? reg[(r - P) * 2048U + n] : r16(0.0F);
+        x[i] = r < P + 4U ? reg[(r - P) * Width + n] : r16(0.0F);
         return;
     }
     float acc[8] = {};
@@ -565,12 +573,16 @@ __global__ __launch_bounds__(256) void embed_kernel(const _Float16* __restrict__
 
 void set_gemm_tiled(int on) { tiled_override = on; }
 void set_gemm_tile(int tile) { tile_override = tile; }
-void rms_norm(const _Float16* x, const _Float16* w, _Float16* y, unsigned rows, hipStream_t st) {
-    rms_norm_kernel<<<rows, 256, 0, st>>>(x, w, y, 2048U, 1e-5F);
+void rms_norm(const _Float16* x, const _Float16* w, _Float16* y, unsigned rows, hipStream_t st, unsigned width) {
+    if (width == 2048U) rms_norm_kernel<2048U><<<rows, 256, 0, st>>>(x, w, y, width, 1e-5F);
+    else if (width == 1024U) rms_norm_kernel<1024U><<<rows, 128, 0, st>>>(x, w, y, width, 1e-5F);
+    else throw std::invalid_argument("h3 vae norm: unsupported width");
     launched("rms_norm");
 }
-void layer_norm(const _Float16* x, const _Float16* w, const _Float16* b, _Float16* y, unsigned rows, hipStream_t st) {
-    layer_norm_kernel<<<rows, 256, 0, st>>>(x, w, b, y, 2048U, 1e-5F);
+void layer_norm(const _Float16* x, const _Float16* w, const _Float16* b, _Float16* y, unsigned rows, hipStream_t st, unsigned width) {
+    if (width == 2048U) layer_norm_kernel<2048U><<<rows, 256, 0, st>>>(x, w, b, y, width, 1e-5F);
+    else if (width == 1024U) layer_norm_kernel<1024U><<<rows, 128, 0, st>>>(x, w, b, y, width, 1e-5F);
+    else throw std::invalid_argument("h3 vae norm: unsupported width");
     launched("layer_norm");
 }
 void gemm(const _Float16* A, unsigned lda, const _Float16* W, const _Float16* bias, _Float16* C, unsigned ldc,
@@ -613,22 +625,33 @@ void conv_gemm(const _Float16* x, const ConvGeom& geo, const _Float16* W, const 
     }
     launched("conv_gemm");
 }
-void swiglu(const _Float16* hbuf, _Float16* g, unsigned rows, hipStream_t st) {
-    swiglu_kernel<<<unsigned((std::size_t(rows) * 8192U + 255U) / 256U), 256, 0, st>>>(hbuf, g, rows);
+void swiglu(const _Float16* hbuf, _Float16* g, unsigned rows, hipStream_t st, unsigned ff) {
+    const unsigned blocks = unsigned((std::size_t(rows) * ff + 255U) / 256U);
+    if (ff == 8192U) swiglu_kernel<8192U><<<blocks, 256, 0, st>>>(hbuf, g, rows);
+    else if (ff == 4096U) swiglu_kernel<4096U><<<blocks, 256, 0, st>>>(hbuf, g, rows);
+    else throw std::invalid_argument("h3 vae swiglu: unsupported width");
     launched("swiglu");
 }
 void rms_rope(const _Float16* qkv, const _Float16* rc, const _Float16* rs, _Float16* Q, _Float16* K, _Float16* V,
-              unsigned L, unsigned Lp, hipStream_t st) {
-    rms_rope_kernel<<<(Lp * 96U + 255U) / 256U, 256, 0, st>>>(qkv, rc, rs, Q, K, V, L, Lp);
+              unsigned L, unsigned Lp, hipStream_t st, unsigned heads, unsigned pairs) {
+    const unsigned blocks = (Lp * heads * 3U + 255U) / 256U;
+    if (heads == 32U && pairs == 24U) rms_rope_kernel<32U, 24U><<<blocks, 256, 0, st>>>(qkv, rc, rs, Q, K, V, L, Lp);
+    else if (heads == 16U && pairs == 16U) rms_rope_kernel<16U, 16U><<<blocks, 256, 0, st>>>(qkv, rc, rs, Q, K, V, L, Lp);
+    else throw std::invalid_argument("h3 vae rope: unsupported head/pair geometry");
     launched("rms_rope");
 }
-void attention(const _Float16* Q, const _Float16* K, const _Float16* V, _Float16* O, unsigned L, unsigned Lp, hipStream_t st) {
+void attention(const _Float16* Q, const _Float16* K, const _Float16* V, _Float16* O, unsigned L, unsigned Lp, hipStream_t st, unsigned width) {
     if (Lp % kAK) throw std::invalid_argument("h3 vae attention: Lp % 64");
-    attention_kernel<<<dim3((L + kAQ - 1U) / kAQ, 32U), 256, 0, st>>>(Q, K, V, O, L, Lp);
+    if (width == 2048U) attention_kernel<2048U><<<dim3((L + kAQ - 1U) / kAQ, 32U), 256, 0, st>>>(Q, K, V, O, L, Lp);
+    else if (width == 1024U) attention_kernel<1024U><<<dim3((L + kAQ - 1U) / kAQ, 16U), 256, 0, st>>>(Q, K, V, O, L, Lp);
+    else throw std::invalid_argument("h3 vae attention: unsupported width");
     launched("attention");
 }
-void embed(const _Float16* zin, const _Float16* w, const _Float16* b, const _Float16* reg, _Float16* x, unsigned P, hipStream_t st) {
-    embed_kernel<<<unsigned((std::size_t(P + 5U) * 2048U + 255U) / 256U), 256, 0, st>>>(zin, w, b, reg, x, P);
+void embed(const _Float16* zin, const _Float16* w, const _Float16* b, const _Float16* reg, _Float16* x, unsigned P, hipStream_t st, unsigned width) {
+    const unsigned blocks = unsigned((std::size_t(P + 5U) * width + 255U) / 256U);
+    if (width == 2048U) embed_kernel<2048U><<<blocks, 256, 0, st>>>(zin, w, b, reg, x, P);
+    else if (width == 1024U) embed_kernel<1024U><<<blocks, 256, 0, st>>>(zin, w, b, reg, x, P);
+    else throw std::invalid_argument("h3 vae embed: unsupported width");
     launched("embed");
 }
 

@@ -40,6 +40,27 @@ class Communicator;
 }
 
 namespace strix::deepseek41 {
+// The shared arena's position units map to compressed KV + index entries in
+// every KV-source layer. Both startup sizing and the scheduler use this rule.
+template<class Roles>
+std::uint64_t batch_pool_storage_bytes(std::uint64_t units, const Roles& roles, unsigned layers,
+                                      std::uint64_t entry_bytes) {
+    std::uint64_t bytes = 0;
+    for (unsigned l = 0; l < layers; ++l)
+        if (roles[l].owns_kv) bytes += units / roles[l].ratio * entry_bytes;
+    return bytes;
+}
+template<class Ranges, class Roles>
+std::uint64_t batch_pool_free_bytes(const Ranges& ranges, const Roles& roles, unsigned layers,
+                                   std::uint64_t entry_bytes) {
+    std::uint64_t bytes = 0;
+    for (const auto& [begin, units] : ranges) {
+        (void)begin;
+        bytes += batch_pool_storage_bytes(units, roles, layers, entry_bytes);
+    }
+    return bytes;
+}
+
 
 struct BatchForwardOptions {
     std::uint32_t layers = 40;
@@ -73,6 +94,7 @@ struct BatchStepStats {
     std::uint32_t rows = 0, segments = 0;
     double seconds = 0.0;           // wall time of the step, inputs to tokens on the host
     double engram_seconds = 0.0;    // Engram row reads
+    double engram_wait_seconds = 0.0;  // the step blocked on its Engram rows (asynchronous reads not there yet)
     double exchange_seconds = 0.0;  // inside the communicator (world 2)
     // per layer: the routed experts of this rank used by the step's rows (the union), and the most rows one of them
     // served; filled every step (copied asynchronously, read after the step)
@@ -114,6 +136,7 @@ public:
     bool reserve(std::uint32_t slot, std::uint32_t positions);
     void release(std::uint32_t slot);                                 // KV pool: the slot's room back (no-op without one)
     [[nodiscard]] std::uint32_t capacity(std::uint32_t slot) const;  // positions the slot may hold now
+    [[nodiscard]] std::uint64_t pool_free_bytes() const;              // sum of unassigned arena ranges (not largest contiguous fit)
     [[nodiscard]] std::uint64_t pool_free_positions() const;          // KV pool: the largest reservation that fits now
     // `to` continues exactly as `from` would (its state copied): measurement runs reuse one filled context.
     void copy_slot(std::uint32_t from, std::uint32_t to);

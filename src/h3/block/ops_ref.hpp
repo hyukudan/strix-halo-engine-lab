@@ -205,6 +205,7 @@ inline double qk_score_bound(const std::vector<std::uint16_t>& qw, const std::ve
     return (mq * std::sqrt(128.0) * grow) * (mk * std::sqrt(128.0) * grow) * (1.4426950408889634 / std::sqrt(128.0));
 }
 inline constexpr double kAttnScoreLimit = 16384.0;  // 2^14
+inline constexpr double kAttnScoreLimitExtended = 32768.0;  // 2^15: explicit opt-in (DeviceForward::set_attn_score_limit)
 // scaled score bound of one head from the max squared norms of its q and k rows
 inline double attn_score_from_sumsq(float q_ss, float k_ss) {
     return std::sqrt(static_cast<double>(q_ss)) * std::sqrt(static_cast<double>(k_ss)) * (1.4426950408889634 / std::sqrt(128.0)) *
@@ -264,6 +265,32 @@ inline float lerp_f32(float a, float b, float w) {
 }
 // Curve rows for the given timesteps (fp32 values): [n][basis].
 inline std::vector<float> curve_t_emb(const GlobalWeights& g, const std::vector<float>& t_vals) {
+    if (!g.discrete_times.empty()) {
+        std::vector<float> out(t_vals.size() * g.basis, 0.0F);
+        for (std::size_t r = 0; r < t_vals.size(); ++r) {
+            const auto it = std::find(g.discrete_times.begin(), g.discrete_times.end(), t_vals[r]);
+            if (it == g.discrete_times.end()) throw std::invalid_argument("image: timestep outside prepared schedule");
+            out[r * g.basis + static_cast<std::size_t>(it - g.discrete_times.begin())] = 1.0F;
+        }
+        return out;
+    }
+    if (g.direct_timestep) {
+        std::vector<float> emb(t_vals.size() * g.time_in.k);
+        const auto half = g.time_in.k / 2;
+        for (std::size_t r = 0; r < t_vals.size(); ++r)
+            for (std::uint32_t i = 0; i < half; ++i) {
+                const float freq = std::exp(-std::log(10000.0F) * static_cast<float>(i) / static_cast<float>(half));
+                const float a = t_vals[r] * freq;
+                emb[r * g.time_in.k + i] = std::cos(a);
+                emb[r * g.time_in.k + half + i] = std::sin(a);
+            }
+        auto h = f32_linear(g.time_in, emb.data(), static_cast<std::uint32_t>(t_vals.size()));
+        for (auto& v : h) v = v / (1.0F + std::exp(-v));
+        auto out = f32_linear(g.time_out, h.data(), static_cast<std::uint32_t>(t_vals.size()));
+        // All raw adaLN projections apply SiLU to this same embedding.
+        for (auto& v : out) v = v / (1.0F + std::exp(-v));
+        return out;
+    }
     std::vector<float> e(t_vals.size() * g.basis);
     const float last = static_cast<float>(g.curve_grid - 1);
     for (std::size_t i = 0; i < t_vals.size(); ++i) {

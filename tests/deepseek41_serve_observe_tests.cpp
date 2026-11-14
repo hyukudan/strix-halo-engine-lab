@@ -357,7 +357,7 @@ int main() {
             seqs[i].prompt.assign(1, 1U);
             seqs[i].fed = 1;
             seqs[i].generated.reserve(kSteps * 3U + 1U);
-            seqs[i].generated = {5U};
+            seqs[i].generated.assign(1, 5U);  // not = {5U}: gcc 14 -O3 reports a false -Warray-bounds on the one-element list
             ptrs.push_back(&seqs[i]);
             owner.insert(owner.end(), 4, static_cast<std::uint32_t>(i));
         }

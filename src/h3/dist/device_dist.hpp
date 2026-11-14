@@ -65,6 +65,17 @@ struct DeviceRunOptions {
     enum class Inject { none, throw_in_flight, nan_q, v_big, bound_rows };
     Inject inject = Inject::none;
     std::int32_t inject_block = -1;
+    // Attention admission bound (admission.hpp): kScoreBound 2^14 (default) or kScoreBoundExtended 2^15 (explicit
+    // opt-in, e.g. strix-h3-image --attn-score-2p15). Both ranks must use the same value (the image CLI handshakes it).
+    double score_bound = kScoreBound;
+    // World 2, dense blocks (no FAST accelerators, hashes or test hooks): each block's K/V goes out as two messages,
+    // head rows [0, a) and tail rows [a, max_rows), a = round_down_64(max_rows (100 - pct) / 100). The out
+    // projection + MLP of block i and the norm + QKV of block i + 1 run per row part, so the head message of block
+    // i + 1 flies while the tail rows compute and the tail message while the local partial runs. Same kernels on row
+    // ranges (row-wise ops, per-row int8 quantization, integer GEMM accumulation), the same key blocks and merge
+    // order: the bits do not change. V travels row-major and is transposed by the receiver. 0 = one message per
+    // block (the reference schedule). Both ranks must use the same value (the image CLI handshakes it).
+    std::uint32_t pair_split_tail_pct = 0;
 };
 
 // Thrown only by the throw_in_flight test hook.
@@ -100,7 +111,8 @@ struct DeviceRunResult {
     std::string comm_stats;
 };
 
-// One rank of the schedule. `comm` is required for world 2 (built without a device exchange: host path only).
+// One rank of the schedule. `comm` is required for world 2; it owns the shared
+// negotiated host/GPU-direct route. The schedule uses the same device buffer API on either.
 class DeviceDistRank {
 public:
     DeviceDistRank(const DeviceModel& model, const Split& sp, const Role& role, strix::dist::Communicator* comm);
@@ -124,7 +136,7 @@ public:
     // accel: FAST-class accelerators (accel.hpp; nullptr = the dense path, bit for bit unchanged). Both ranks must pass
     // equivalent accelerators (same assets, threshold, forced decisions); one DistAccel per rank object.
     ForwardResult forward(const block::PackedLayout& L, const block::ForwardPlan& p, const block::StreamInputs& in, const ForwardTables& t,
-        std::uint32_t nblocks, const DeviceRunOptions& opt, DistAccel* accel = nullptr);
+        std::uint32_t nblocks, const DeviceRunOptions& opt, DistAccel* accel = nullptr, const block::PddContext* pdd = nullptr);
 
     // Real-shape attention bench on random Q/K/V (no weights): attention alone, local partial alone, local partial
     // with a concurrent exchange of the full message, exchange alone. Both ranks call it together (world 2).
@@ -145,7 +157,7 @@ private:
     DeviceRunResult run_blocks(const ForwardTables& t, std::uint32_t basis, std::uint32_t nblocks, const DeviceRunOptions& opt, bool download_x);
     AttnBench bench_attention_impl(unsigned reps);
     ForwardResult forward_impl(const block::PackedLayout& L, const block::ForwardPlan& p, const block::StreamInputs& in, const ForwardTables& t,
-        std::uint32_t nblocks, const DeviceRunOptions& opt);
+        std::uint32_t nblocks, const DeviceRunOptions& opt, const block::PddContext* pdd);
     std::unique_ptr<Impl> impl_;
 };
 

@@ -104,10 +104,13 @@ struct HostFallbackAttention final : DeviceAttentionOp {
 // The gemm package's device linear (int8 weights resident, fc1 permuted for the fused SwiGLU epilogue).
 class GemmDeviceLinear final : public DeviceLinearOp {
 public:
-    // fused: fc1 permuted for the SwiGLU epilogue (default); false: fc1 in checkpoint order, [rows][28672] output, the
-    // driver runs K5 (needed by the Turbo fc1 branch, which acts on the plain fc1 output)
+    // fused: fc1 returns SwiGLU(fc1) [rows][14336] (default): int8_convrot fc1 permuted for the SwiGLU epilogue, other
+    // operands (W4A8, dense BF16) in checkpoint order + K5 inside run(); same bits either way. false: fc1 in checkpoint
+    // order, [rows][28672] output, the driver runs K5 (needed by the Turbo fc1 branch, which acts on the plain fc1 output)
+    // max_rows 0: weights only (prepare before the row count is known); set_max_rows before the first run.
     GemmDeviceLinear(std::uint32_t max_rows, bool fused = true);
     ~GemmDeviceLinear() override;
+    void set_max_rows(std::uint32_t max_rows);  // (re)allocates the activation workspace; the resident weights stay
     void prepare(const std::shared_ptr<const BlockWeights>& b) override;
     bool prepared(std::uint32_t block) const override;
     void run(std::uint32_t block, LinearKind kind, const std::uint16_t* d_x, std::uint32_t m, std::uint16_t* d_y, void* stream) override;
@@ -119,6 +122,19 @@ public:
     struct Impl;
 
 private:
+    std::unique_ptr<Impl> impl_;
+};
+
+class Bf16DeviceLinear final : public DeviceLinearOp {
+public:
+    Bf16DeviceLinear();
+    ~Bf16DeviceLinear() override;
+    void prepare(const std::shared_ptr<const BlockWeights>& b) override;
+    bool prepared(std::uint32_t block) const override;
+    void run(std::uint32_t block, LinearKind kind, const std::uint16_t* x, std::uint32_t m,
+             std::uint16_t* y, void* stream) override;
+private:
+    struct Impl;
     std::unique_ptr<Impl> impl_;
 };
 
@@ -169,6 +185,10 @@ public:
     StreamOutputs run(BlockSource& blocks, const PackedLayout& L, const ForwardPlan& p, const StreamInputs& in,
         DeviceLinearOp& lin, DeviceAttentionOp& att, DeviceForwardTaps* taps = nullptr, const PddContext* pdd = nullptr);
 
+    // Optional eager residency, without a model evaluation or sampler/RNG mutation.
+    // Reuses the same preparation as run(); repeated calls are no-ops.
+    void prepare(BlockSource& blocks, DeviceLinearOp& lin);
+
     // condition_proj + token refiner on the device (bf16 linears resident after the first call); text [L][5120] bf16
     // -> [L][5376] bf16 (bitwise == text_refine_host with the same attention arithmetic).
     std::vector<std::uint16_t> refine_text(const std::uint16_t* text, std::uint32_t L, DeviceAttentionOp& att);
@@ -178,6 +198,10 @@ public:
     // strict: throw when a forward flushed rotation groups (the gemm package's exact-rotation window);
     // default false: the count is returned in DeviceForwardTaps::flushed_groups.
     void set_strict_flush(bool strict);
+    // Attention admission limit on the measured max||q|| max||k|| log2(e)/sqrt(128): kAttnScoreLimit (2^14, the
+    // qualified domain, default) or kAttnScoreLimitExtended (2^15, explicit opt-in: every |score c| stays below 2^15,
+    // the kernel's bound_rows telemetry line, exp2 arguments stay <= 0 and mc rounds within 2^-10). Other values throw.
+    void set_attn_score_limit(double limit);
 
     // Accelerated forms (turbo_accel.hpp); default: none (the dense forward). Turbo needs a non-fused DeviceLinearOp
     // whose blocks come from a MergedFc2Source; it also applies to refine_text. reset_accel_run(): start of a sampling

@@ -24,11 +24,20 @@ Solo necesitas esta página para inspeccionar una ruta, depurar o llevar el moto
 
 | Perfil | Qué hace |
 |---|---|
-| `--profile default` | Ruta exacta. Los mismos bits que la ruta de referencia. Es el valor por defecto. |
+| `--profile default` | Ruta de producción actual; no exporta cambios de perfil. Es el valor por defecto. |
 | `--profile fast` | Añade solo opciones cualificadas que cambian bits. Las filas aún no cualificadas siguen apagadas (ver `--allow-pending`). |
 | `--profile quality` | Un pack de mayor precisión donde existe (Nemotron EXL3). Si no, igual que `default`. |
 
-Las filas FAST por motor están en [optimizations.md](optimizations.md#product-profiles-pair).
+Existen perfiles con nombre para Qwen, el par DeepSeek, Gemma4/Nemotron y `strix-glm5-rank`.
+MiniMax no tiene perfiles de producto con nombre: `--profile NAME:PROMPT.u32:STEPS` ejecuta una sesión con tiempos.
+GLM rank acepta `--profile default|fast|quality` (también `--profile=NAME`); `--profile` sin valor sigue activando
+los tiempos de kernels y se puede combinar con un perfil con nombre. En GLM, `fast` solo activa `STRIX_GLM_PF_WMMA=1`;
+un valor explícito del entorno prevalece y `--baseline` / `STRIX_GLM_BASELINE=1` veta la adición del perfil.
+`quality` usa los ajustes por defecto y lo avisa. Ambos ranks deben acordar el valor efectivo de WMMA;
+siguen vigentes las guardas de arranque existentes.
+
+Véanse los [perfiles Qwen](optimizations.md#qwen-product-profiles),
+[perfiles del par DeepSeek](optimizations.md#product-profiles-pair) y la [fila FAST de GLM](optimizations.md#glm-pf-wmma-x).
 FAST cambia la numérica. Úsalo cuando el rendimiento importe más que una salida idéntica bit a bit.
 
 | Interruptor | Motor | Por defecto | Qué hace |
@@ -37,7 +46,7 @@ FAST cambia la numérica. Úsalo cuando el rendimiento importe más que una sali
 | `STRIX_QPF2K_GDN_FP16_CHUNK=1`, `--gdn-fp16-chunk` | qwen | off (on en `fast`) | Chunk GDN en FP16 durante el prefill. |
 | `--prefill-exact-fp16` | qwen | off | Fuerza la ruta de prefill FP16 exacta. |
 | `STRIX_DS41_FAST_MOE=1` | deepseek | off (`fast`) | Epílogo MoE relajado. |
-| `STRIX_GLM_PF_WMMA=1` | glm | off | Prefill WMMA. Identidad FAST opcional. |
+| `STRIX_GLM_PF_WMMA=1` | glm | off (on con `--profile fast` en rank) | Prefill WMMA. Identidad FAST opcional; `=0` la desactiva incluso en `fast`. |
 
 ## La regla de régimen
 
@@ -49,7 +58,7 @@ El motor elige una familia de kernels por el número de filas en vuelo, no por m
   Pasado un umbral de filas ganan las rutas de matrix cores y enteras. Los umbrales son toggles:
   `STRIX_INTPREFILL_DENSE_ROWS` (qwen, 512), `STRIX_QPF2K_DENSE_MIN_ROWS` (qwen, 1024 o 512 según el sitio),
   `STRIX_GLM_PF_WMMA_ROWS` (glm, 64), `STRIX_MM_PF_ASYNC_MIN_ROWS` (minimax, 2048),
-  `STRIX_GLM_PF_EXACT_X_MIN_ROWS` (glm, 2048).
+  `STRIX_GLM_PF_EXACT_X_MIN_ROWS` (glm, 64; 32 with FAST WMMA).
 - **Prefill** está limitado por cómputo. Usa las rutas enteras y de matrix cores, y el perfil FAST añade las que cambian bits.
 
 El punto de cruce depende de la relación entre cómputo y ancho de banda. En gfx1151 esa relación es fija, así que los umbrales son fijos.
@@ -107,6 +116,8 @@ Las tablas listan los flags seleccionados. La lista completa de variables de ent
 |---|---|---|---|---|
 | `--transport usb4auto\|usb4gpu` (prefill: `usb4-auto`\|`usb4-gpu`) | deepseek pair | `usb4auto` | Transporte USB4. `usb4gpu` usa streams GPU-direct cuando el driver los ofrece; si no, la ruta por host. | Otras interconexiones necesitan su propio transporte. |
 | `--peer-timeout` | deepseek serve | 120 | Segundos de espera al peer. | Más alto en enlaces lentos. |
+| `--transport usb4gpu\|usb4auto\|usb4-auto\|tcp`, `STRIX_QWEN_PF_PIPE_TRANSPORT` | qwen pair prefill | `usb4gpu` | Los payloads grandes del seam usan el router del communicator; control/CRC/ACK siguen por host. `usb4auto` o `usb4-auto` fuerza host. Ambos ranks deben coincidir. Gates nativos bit a bit/TTFT pendientes. | [Evidencia de rutas](coord/transport-routing.md). |
+| `--transport usb4gpu\|usb4-auto` | minimax serve | `usb4gpu` | GPU-direct con router para mensajes grandes; host para ≤64 KiB y fallback sin streams directos. Mantiene XFER de decode; PFX solo en rank. `usb4-auto` fuerza host y conserva la ruta cualificada de caché de sesiones. | [Regímenes y límites](coord/transport-routing.md). |
 | `--tp-attention`, `--no-tp-attention` | deepseek | on | Reparte la atención entre los dos ranks. | Off cuando el enlace es lento frente al cómputo. |
 | `--engram-direct`, `--engram-mapped` | deepseek | `direct` | Acceso a la tabla engram. | `mapped` cuando falta memoria. |
 | `--decode-xch xfer\|comm`, `STRIX_GLM_DECODE_XCH` | glm | `xfer` (`comm` en baseline) | Modo de intercambio en decode. | Compara ambos en otra interconexión. |
@@ -119,10 +130,32 @@ Montaje del par: [pair-setup.es.md](pair-setup.es.md).
 
 | Flag | Motor | Por defecto | Qué hace |
 |---|---|---|---|
-| `--profile default\|fast\|quality` | todos | `default` | Ver [Perfiles](#perfiles-exacto-frente-a-fast). |
+| `--profile default\|fast\|quality` | qwen, par deepseek, gemma4/nemotron, glm rank | `default` | Ver [Perfiles](#perfiles-exacto-frente-a-fast). |
+| `--profile` (sin valor) | glm rank | off | Tiempos de kernels; se conserva junto a los perfiles con nombre. |
+| `--profile NAME:PROMPT.u32:STEPS` | minimax rank | off | Sesión con tiempos, no un perfil de producto. |
 | `--allow-pending` | apps de par | off | Deja que `fast` aplique filas aún no cualificadas. |
 | `--print-effective-config` | todos | off | Imprime la configuración resuelta y sale antes de tocar el dispositivo. |
 | `STRIX_DS41_BASELINE=1` | deepseek | off | Apaga todos los defaults de producción. Ejecuta el comando simple como antes. |
+
+### Núcleo compartido e INT4 (opt-in)
+
+Todos están apagados por defecto. Apagados, cada motor ejecuta los mismos kernels y lanzamientos que antes de
+llegar el núcleo en mosaico compartido (`src/core`), con los mismos bits.
+
+| Interruptor | Motor | Por defecto | Qué hace |
+|---|---|---|---|
+| `STRIX_DS41_PF_CORE=0\|moe\|dense\|1` | deepseek | por forma | Qué productos del prefill corren en el núcleo compartido en lugar de los kernels de DeepSeek: `moe` = gate/up y down de expertos, `dense` = los productos densos Q8_0 x A8, `1` = ambos, `0` = ninguno. Mismos bits en todos los casos. Sin definir: el núcleo compartido donde el fixture de rango lo mide más rápido, el gate/up (-0,6..-2,2 %) y el down (-6,0..-7,2 %) Q8_0 del experto compartido (-2,8..-3,9 % en conjunto), y solo en lotes de 16 filas con `STRIX_DS41_FAST_MOE` desactivado y `STRIX_DS41_PREFILL_STAGE` distinto de `1`, y el gate/up IQ2_XXS (-7,1..-8,2 % con 2048 / 4096 / 8192 filas) y el down Q2_K (-2,4..-3,4 %) enrutados, que corren ahí sin el tile de pesos en LDS para que dos workgroups compartan un WGP; los productos densos siguen en los kernels de DeepSeek. Se resuelve una vez por ejecución; cualquier otro valor, incluido el vacío, se rechaza. |
+| `STRIX_DS41_FAST_I4=1` | deepseek | off | Prefill borrador con pérdida: los pesos GGUF de los expertos se decodifican a INT4 en el kernel y la entrada A8 se recuantiza a A4. Corre en el núcleo compartido. `STRIX_DS41_FAST_I4_SCOPE=all\|gu` elige gate/up/down (por defecto) o solo gate/up. Sin cualificar en calidad. |
+| `STRIX_GLM_MODEL_FORMAT=fast_i4` | glm | `exl3` | Formato con pérdida: los expertos enrutados gate/up de las capas MoE tardías se guardan en INT4 (prefill W4A4, decode W4A16) y se libera su copia EXL3. Rechaza las identidades exactas. Frente a FAST en el par: KL de los logits de prefill 0,0145, top-1 95,4 %, NLL -0,002 (umbral 0,02 / 93 % / +0,01); tokens de decode con teacher forcing KL 0,0098, top-1 94,8 %; prefill 8K -2,0 %, 32K -3,2 %; velocidad de decode normal y MTP sin cambios. |
+| `STRIX_GLM_FAST_I4_EXL3_LAYERS=<lista>` | glm | `0-14` | Con `fast_i4`: capas MoE (ordinales, rangos `a-b` o `none`) que conservan los expertos enrutados EXL3. Una capa INT4 temprana cuesta un escalón de calidad que satura, las tardías son baratas; INT4 en todas las capas no pasa el umbral de calidad. |
+| `STRIX_GLM_FAST_I4_SCOPE=gate_up\|all` | glm | `gate_up` | Con `fast_i4`: qué matrices enrutadas van en INT4. `all` añade la proyección down (prefill 8K en caliente -3,6 % frente a FAST; menos margen de calidad). |
+| `STRIX_GLM_FAST_I4_SCALE=fast_full\|legacy` | glm | `fast_full` | Con `fast_i4`: regla de escala de los pesos en la conversión de carga. `fast_full` usa todo el rango del nibble [-8, 7] a 0,9 de la escala sin recorte (error de pesos 0,0095 frente a 0,0115 con `legacy`, mismo tiempo de conversión). |
+| `STRIX_GLM_FAST_I4_PAIRED=0` | glm | activado | Con `fast_i4` y ámbito `gate_up`: desactiva el kernel emparejado gate/up (un kernel lee los pesos INT4 de gate y up y su epílogo SwiGLU escribe la entrada de down) y ejecuta las llamadas separadas de gate, up y activación. Mismos bits de salida en ambos casos. |
+| `STRIX_GLM_I4_CHAIN_GSAVE=1` | glm | desactivado | Con `fast_i4`, ámbito `all` y `STRIX_MOE_I4_CHAIN=1`: el GEMM emparejado gate/up guarda los valores de gate de la primera pasada en las filas gate/up de la llamada en lugar de en registros, de modo que gate/up y down comparten un plan de teselas y una lista de teselas. Mismos bits de salida. Desactivado por defecto: con las formas de este modelo, la variante con registros (gate/up en teselas de 64 filas, down en teselas de 128) midió un 3-7 % menos de tiempo por llamada. `STRIX_MOE_I4_CHAIN_GSAVE=0` fuerza la variante con registros en todos los motores. |
+| `STRIX_GLM_PF_SCORE_SEQ=1`, `STRIX_GLM_PF_SCORE_BLOCK=<1..8>` | glm | off, `1` | Arnés de calidad (`STRIX_GLM_PF_SCORE_LAST`): un fichero de puntuación por llamada de prefill y filas por llamada de la cabeza. Solo medición. |
+| `STRIX_GLM_PF_STREAMS=1` | glm | off | Un solo stream de cómputo para el prefill seqpar TP2. Mismos bits; no fue más rápido en las primeras muestras. |
+| `STRIX_MMX_MODEL_FORMAT=fast_i4` | minimax | `exl3` | Prefill borrador con pérdida: cada capa MoE se convierte a INT4 durante el prefill en dos buffers reutilizables (+3,6 GiB); el decode sigue en EXL3. Ver [prefill agrupado de MiniMax](minimax-grouped-prefill.md#draft-fast_i4). |
+| `STRIX_DS41_PREFILL_LEASE=1`, `STRIX_DS41_ENGRAM_DEVICE_READY=1`, `STRIX_DS41_SEED_EARLY=1` | deepseek | off | Opciones de estructura del prefill (intercambio con lease, Engram listo por capa, semilla temprana del draft). Mismos bits; sin ganancia medida todavía. |
 
 ### Solo depuración
 
@@ -174,6 +207,8 @@ Sigue el enlace para ver la ganancia, las precondiciones y el interruptor de apa
 | `STRIX_PREFIX_FAIR_RECLAIM_IDLE` | qwen | ON on the qualified single tiled-MTP ... | [prefix-retention-policy](engine/serving/prefix-state-cache.md#prefix-retention-policy) |
 | `STRIX_QRTX_PREFIX_CACHE` | qwen-rtx | ON | [qwen-rtx-prefix-cache](optimizations.md#qwen-rtx-prefix-cache) |
 | `STRIX_QSA_CACHE_ONLY` | qwen | 1 | [qwen-qsa-cache-only](optimizations.md#qwen-qsa-cache-only) |
+| `STRIX_PREFILL_FINAL_CONE` | qwen | 1 | [qwen-prefill-final-cone](optimizations.md#qwen-prefill-final-cone) |
+| `STRIX_HOST_WAIT` | qwen | block | [host-wait-policy](optimizations.md#host-wait-policy) |
 | `STRIX_SESSION_CACHE` | minimax | on (two-node serve route) | [mm-sessions](optimizations.md#mm-sessions) |
 
 ### Prefill (97)
@@ -195,12 +230,15 @@ Sigue el enlace para ver la ganancia, las precondiciones y el interruptor de apa
 | `STRIX_DS41_PREFILL_ROUTER_V2` | deepseek | on | [ds-router-v2](optimizations.md#ds-router-v2) |
 | `STRIX_GLM_PF_ATTN_QWIN` | glm | auto | [glm-pf-attn-qwin](optimizations.md#glm-pf-attn-qwin) |
 | `STRIX_GLM_PF_AUX_COMBINE` | glm | 1 | [glm-pf-aux-combine](optimizations.md#glm-pf-aux-combine) |
-| `STRIX_GLM_PF_DENSE_ROWS` | glm | 3 | [glm-pf-dense-rows-v3](optimizations.md#glm-pf-dense-rows-v3) |
+| `STRIX_GLM_PF_DENSE_FORM` | glm | automático (0) | [glm-pf-dense-rows-v4](optimizations.md#glm-pf-dense-rows-v4) |
+| `STRIX_GLM_PF_DENSE_ROWS` | glm | 4 | [glm-pf-dense-rows-v4](optimizations.md#glm-pf-dense-rows-v4) |
 | `STRIX_GLM_PF_HC_EXPAND_ROWS` | glm | 2 | [glm-pf-hc-expand-rows](optimizations.md#glm-pf-hc-expand-rows) |
 | `STRIX_GLM_PF_HC_FUSE` | glm | 1 | [glm-pf-hc-fuse](optimizations.md#glm-pf-hc-fuse) |
 | `STRIX_GLM_PF_HC_HOIST` | glm | 1, 1 | [glm-pf-sumexp](optimizations.md#glm-pf-sumexp) |
 | `STRIX_GLM_PF_IDX` | glm | 3 / 2 | [glm-pf-indexer-v2](optimizations.md#glm-pf-indexer-v2) |
+| `STRIX_GLM_PF_IN_TOKEN` | glm | 1 | [glm-pf-in-token](optimizations.md#glm-pf-in-token) |
 | `STRIX_GLM_PF_KDA_PACK` | glm | 0 | [glm-pf-kda-pack](optimizations.md#glm-pf-kda-pack) |
+| `STRIX_GLM_PF_KDA_WMMA` | glm | on in FAST prefill (STRIX_GLM_PF_WMMA=1); off in exact mode | [glm-pf-kda-wmma](optimizations.md#glm-pf-kda-wmma) |
 | `STRIX_GLM_PF_KDA_SCAN` | glm | 5 | [glm-pf-kda-scan-v5](optimizations.md#glm-pf-kda-scan-v5) |
 | `STRIX_GLM_PF_MIXNORM` | glm | 1 | [glm-pf-mixnorm](optimizations.md#glm-pf-mixnorm) |
 | `STRIX_GLM_PF_MLA_GEMM` | glm | 3 (v3); 2 selects v2 | [glm-pf-mla-gemm-v2](optimizations.md#glm-pf-mla-gemm-v2) |
@@ -213,14 +251,15 @@ Sigue el enlace para ver la ganancia, las precondiciones y el interruptor de apa
 | `STRIX_GLM_PF_STAGED` | glm | 1 | [glm-pf-staged](optimizations.md#glm-pf-staged) |
 | `STRIX_GLM_PF_SUMEXP` | glm | 1, 1 | [glm-pf-sumexp](optimizations.md#glm-pf-sumexp) |
 | `STRIX_GLM_PF_WMMA` | glm | off (opt-in FAST identity) | [glm-pf-wmma-x](optimizations.md#glm-pf-wmma-x) |
+| `STRIX_GLM_PF_WMMA_LIVE_FRAG` | glm | 1 | [glm-pf-wmma-live-fragments](optimizations.md#glm-pf-wmma-live-fragments) |
 | `STRIX_INTPREFILL_DENSE_ROWS` | qwen | 512 | [qwen-intprefill-dense-rows](optimizations.md#qwen-intprefill-dense-rows) |
-| `STRIX_MMX_PREFILL_CORE` | minimax | v4 | [mm-pf-core-v4](optimizations.md#mm-pf-core-v4) |
 | `STRIX_MMX_PREFILL_GATHER_TOK` | minimax | 1 | [mm-pf-gather-tok](optimizations.md#mm-pf-gather-tok) |
 | `STRIX_MMX_PREFILL_MTFIT` | minimax | 1 | [mm-pf-mtfit](optimizations.md#mm-pf-mtfit) |
 | `STRIX_MMX_PREFILL_PIPE` | minimax | 1 | [mm-pf-moe-pipe](optimizations.md#mm-pf-moe-pipe) |
 | `STRIX_MMX_PREFILL_TAIL_STREAM` | minimax | 1 | [mm-pf-tail-stream](optimizations.md#mm-pf-tail-stream) |
 | `STRIX_MM_PFX` | minimax | on | [mm-rank-pfx](optimizations.md#mm-rank-pfx) |
 | `STRIX_MM_PFX_CHUNK` | minimax | 4194304 | [mm-pfx-chunk](optimizations.md#mm-pfx-chunk) |
+| `STRIX_MM_PFX_JOINED` | minimax | 1 | [mm-pfx-joined](optimizations.md#mm-pfx-joined) |
 | `STRIX_MM_PF_ASYNC_START` | minimax | ON | [minimax-grouped-prefill.md](minimax-grouped-prefill.md) |
 | `STRIX_MM_PF_ATTEND4` | minimax | 1 | [mm-pf-attend4](optimizations.md#mm-pf-attend4) |
 | `STRIX_MM_PF_DENSE_O` | minimax | 1 | [mm-pf-dense-o](optimizations.md#mm-pf-dense-o) |
@@ -252,7 +291,6 @@ Sigue el enlace para ver la ganancia, las precondiciones y el interruptor de apa
 | `STRIX_QPF2K_GDN` | qwen | 1 | [qwen-gdn](optimizations.md#qwen-gdn) |
 | `STRIX_QPF2K_GDN_CHUNK16` | qwen | auto | [qwen-gdn-chunk16](optimizations.md#qwen-gdn-chunk16) |
 | `STRIX_QPF2K_GDN_COOP_LAUNCH` | qwen | 0 | [qwen-gdn](optimizations.md#qwen-gdn) |
-| `STRIX_QPF2K_GDN_CORE16` | qwen | 1 | [qwen-gdn](optimizations.md#qwen-gdn) |
 | `STRIX_QPF2K_GDN_GATES_BATCH` | qwen | 1 | [qwen-gdn](optimizations.md#qwen-gdn) |
 | `STRIX_QPF2K_GDN_PARTS` | qwen | opt-in (bit 128 off; normal mask 55) | [qwen-gdn-witness](optimizations.md#qwen-gdn-witness) |
 | `STRIX_QPF2K_HC` | qwen | 1 | [qwen-hc](optimizations.md#qwen-hc) |
@@ -260,7 +298,7 @@ Sigue el enlace para ver la ganancia, las precondiciones y el interruptor de apa
 | `STRIX_QPF2K_HC_MASK` | qwen | 14 | [qwen-hc](optimizations.md#qwen-hc) |
 | `STRIX_QPF2K_HC_OUTPUT3` | qwen | 1 | [qwen-hc](optimizations.md#qwen-hc) |
 | `STRIX_QPF2K_HC_OUTPUT3_BAND` | qwen | 16 | [qwen-hc](optimizations.md#qwen-hc) |
-| `STRIX_QPF2K_HC_RECOMPUTE_NORM` | qwen | OFF pending native equality and not-s... | [hc-normalized-recompute-candidate](optimizations.md#hc-normalized-recompute-candidate) |
+| `STRIX_QPF2K_HC_RECOMPUTE_NORM` | qwen | ON with the WMMA HC output (auto); =1 ... | [hc-normalized-recompute](optimizations.md#hc-normalized-recompute) |
 | `STRIX_QPF2K_HC_UPCOPY` | qwen | auto with HC output v3 | [qwen-hc](optimizations.md#qwen-hc) |
 | `STRIX_QPF2K_INDEX_BATCH` | qwen | ON | [exact-indexer-projection-batching](optimizations.md#exact-indexer-projection-batching) |
 | `STRIX_QPF2K_MOE_DA16` | qwen | 1 | [qwen-moe](optimizations.md#qwen-moe) |
@@ -269,6 +307,7 @@ Sigue el enlace para ver la ganancia, las precondiciones y el interruptor de apa
 | `STRIX_QPF2K_MOE_MC` | qwen | 1 (mode 1; mode 2 needs an explicit v... | [qwen-moe-merge-commit](optimizations.md#qwen-moe-merge-commit) |
 | `STRIX_QPF2K_MOE_ROUTE` | qwen | 14 | [qwen-moe](optimizations.md#qwen-moe) |
 | `STRIX_QPF2K_MOE_XOR64` | qwen | 1 | [qwen-moe-xor-rows](optimizations.md#qwen-moe-xor-rows) |
+| `STRIX_QPF2K_MOE_DA16_ISSUE` | qwen | auto | [qwen-moe-da16-issue](optimizations.md#qwen-moe-da16-issue) |
 | `STRIX_QPF2K_QSA` | qwen | 1 | [qwen-qsa](optimizations.md#qwen-qsa) |
 | `STRIX_QPF2K_QSA_MASK` | qwen | 0x2257 | [qwen-qsa](optimizations.md#qwen-qsa) |
 | `STRIX_QPF2K_SCHED` | qwen | 14 | [qwen-schedule](optimizations.md#qwen-schedule) |
@@ -277,6 +316,10 @@ Sigue el enlace para ver la ganancia, las precondiciones y el interruptor de apa
 | `STRIX_QPF2K_T16K` | qwen | ON from 32768 prompt tokens | [automatic-t16384-prefill](optimizations.md#automatic-t16384-prefill) |
 | `STRIX_QPF2K_WMMA_PIN` | qwen | 1 | [qwen-dense](optimizations.md#qwen-dense) |
 | `STRIX_SERVE_PREFILL` | qwen | ON: admitted T8192; configured prefix... | [default-prompt-prefill](engine/serving/serving.md#default-prompt-prefill) |
+| `STRIX_SERVE_ROUTE` | qwen | ON: server tile and prefill arithmetic from the single-request route rule; `0` restores T8192 with the resolved arithmetic | [default-prompt-prefill](engine/serving/serving.md#default-prompt-prefill) |
+| `STRIX_SERVE_PREFILL_ORG` | qwen | ON: an admitted server owner takes the prefill organization of the single-request route (row-loop, attention stage, table and expert header/merge batching); `0` keeps the startup items only | [default-prompt-prefill](engine/serving/serving.md#default-prompt-prefill) |
+| `STRIX_SERVE_T16K` | qwen | ON: T16384 owner when the context admits a 32,768-token request and every resident slot fits; `0` keeps T8192 | [default-prompt-prefill](engine/serving/serving.md#default-prompt-prefill) |
+| `STRIX_SERVE_FP16_MTP` | qwen | ON: explicit-sidecar MTP servers keep the automatic FP16 prefill arithmetic with the unqualified fast options off; `0` declines it | [default-prompt-prefill](engine/serving/serving.md#default-prompt-prefill) |
 
 ### Decode, MTP y DSpark (22)
 
@@ -332,7 +375,8 @@ Sigue el enlace para ver la ganancia, las precondiciones y el interruptor de apa
 | `STRIX_MM_XFER` | minimax | XFER on, PFX loaded, interleave on | [mm-routes](optimizations.md#mm-routes) |
 | `STRIX_MTP_JOINT_PLAN` | qwen | calibrated-c3 when STRIX_MTP_BATCH_JO... | [joint-plan-rule](engine/scheduling/joint-serving-windows.md#joint-plan-rule) |
 | `STRIX_MTP_JOINT_RULE_FILE` | qwen | calibrated-c3 when STRIX_MTP_BATCH_JO... | [joint-plan-rule](engine/scheduling/joint-serving-windows.md#joint-plan-rule) |
-| `STRIX_MTP_PRIME_ROWS` | qwen | OFF (opt-in: STRIX_MTP_PRIME_ROWS=1) | [qwen-mtp-prime-rows](optimizations.md#qwen-mtp-prime-rows) |
+| `STRIX_MTP_PRIME_BATCH` | qwen | 64 filas (limitado a 8..128; 8 restaura los lotes originales) | [qwen-mtp-prime-rows](optimizations.md#qwen-mtp-prime-rows) |
+| `STRIX_MTP_PRIME_ROWS` | qwen | ON (STRIX_MTP_PRIME_ROWS=0: desactivar) | [qwen-mtp-prime-rows](optimizations.md#qwen-mtp-prime-rows) |
 | `STRIX_QSA_MTP_POOL` | qwen | 1 (eligible native MTP CLI, the singl... | [qwen-qsa-mtp-pool](optimizations.md#qwen-qsa-mtp-pool) |
 
 ### Exacto frente a FAST (9)

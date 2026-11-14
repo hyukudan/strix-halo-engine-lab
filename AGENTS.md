@@ -19,6 +19,26 @@ repository history as part of ordinary documentation editing. Numerical proposal
 drafts until their compiler, native execution, model fidelity and complete-workload gates
 pass; theoretical throughput and external results do not establish local qualification.
 
+# Shared code first (all engines)
+
+Every improvement that can apply to more than one engine is implemented once, in shared code, and
+each engine only adapts it. This is the default for new work, not a later refactor.
+
+- Shared homes: `src/core` (linear/integer/IU4 kernels and plans), `src/moe_core` (MoE routing,
+  grouped GEMM, activation quantisation policies), `src/attn_core` (attention kernels),
+  `include/strix/session` and `include/strix/serve` (engine contract, KV/prefix/conversation
+  caches, scheduling, batching, fanout, receipts), `include/strix/pair` and `include/strix/dist`
+  (two-node pipelines, transports, exchange overlap).
+- Engine code holds only what is truly model-specific: tensor layouts and names, numerics the model
+  requires, its family adapter (hooks the shared layer calls) and `models/<model>.toml` settings.
+- A variant is a policy or trait on the existing shared kernel, never a parallel copy. If a shared
+  path is slower for one engine, fix it inside the shared code until it matches, then make it that
+  engine's default and delete the engine-local copy, its switches and dead tests.
+- Prototyping inside one engine is allowed only as a step: the same change set (or its PR description)
+  states what moves to shared code and which engines adopt it next.
+- Reviews reject new engine-local copies of logic that already exists, or obviously belongs, in a
+  shared home.
+
 # Production defaults for humans and coding agents
 
 The fast path is the default for all five public engines. Start with the plain command; let the
@@ -27,7 +47,7 @@ are already defaults: they can force an explicit route and decline the automatic
 
 | Engine | Recommended command / contract | Inspect | Baseline |
 |---|---|---|---|
-| Qwen | `strix-hip-decode-token MODEL.gguf $(cat prompt.ids) --generate 256`; [auto route](docs/getting-started/engine-reference.md#command-line) | `--print-effective-config` | `--baseline` / `STRIX_BASELINE=1` |
+| Qwen | `strix-hip-decode-token MODEL.gguf $(cat prompt.ids) --generate 256`; [auto route](docs/getting-started/engine-reference.md#command-line); exact MTP decode is on when the [drafter bundle](docs/engine/speculative/mtp-native-cli.md#default-mtp-drafter-bundle) is beside the model (`--no-mtp` / `STRIX_MTP=0` = plain decode, same tokens) | `--print-effective-config` | `--baseline` / `STRIX_BASELINE=1` |
 | DeepSeek pair | `strix-deepseek41-serve MODEL.gguf --rank R --transport usb4auto`, one rank per node; [production defaults](docs/models/deepseek-v4.1/production-defaults.md) | `--print-effective-config` | `STRIX_DS41_BASELINE=1` |
 | DeepSeek RTX | Use the [standalone command and required receipt/state/reference assets](docs/models/deepseek-v4.1/rtx-standalone.md#run-and-persistent-worker) | `--print-config` | `--baseline` / `STRIX_DS41_RTX_BASELINE=1` |
 | MiniMax | `strix-minimax-rank MODEL_DIR R usb4-auto OUTPUT_DIR`, one rank per node; [resolver](src/minimax/engine/mm_defaults.cpp) | `--print-effective-config` | `STRIX_MM_BASELINE=1` |
@@ -38,8 +58,9 @@ Qwen startup prints one `strix-build-info` and one `strix-startup-event` JSON li
 runs; `STRIX_RELEASE_EVENTS=0` switches both off). Advisories in that record are not failures.
 Inspection exits before device work; preserve the engine's required assets and two-rank launch contract
 for execution. Check [all item guards, fallback notices and off switches](docs/optimizations.md) or
-the [JSON catalog](docs/optimizations.json). Qwen automatic FP16 prefill excludes MTP and HTTP serving;
-HTTP resolves T8192 with its existing arithmetic ([defaults](docs/engine/serving/serving.md#default-prompt-prefill)).
+the [JSON catalog](docs/optimizations.json). Qwen automatic FP16 prefill excludes explicit `--mtp` single-request commands (the default drafter bundle keeps it);
+HTTP serving resolves its tile and prefill arithmetic through the same rule as the single-request route
+(`resolve_prompt_route`; [defaults](docs/engine/serving/serving.md#default-prompt-prefill)).
 HTTP servers (Qwen, DeepSeek) describe what they execute at `GET /v1/capabilities`; the `strix` object of each response
 states the applied policy (requested vs effective sampling). Generation fields the server does not execute are refused
 with a 400 naming the field ([list](docs/engine/serving/serving.md#chat-requests)). Qwen executes JSON-constrained

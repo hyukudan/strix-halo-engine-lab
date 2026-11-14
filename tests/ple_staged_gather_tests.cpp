@@ -164,7 +164,7 @@ int main() {
         }
         for(std::size_t i=0;i<ids.size();++i) {
             auto wrong=ids;++wrong[i];
-            deferred=consumed?tail:all;
+            if(consumed) deferred=tail; else deferred=all;  // not a conditional: gcc 14 -O3 reports a false -Wstringop-overflow
             const auto original=deferred;
             expect(accept_serve_staged_gather(source,source,hashes,heads,wrong,consumed,deferred)==0 && deferred==original,
                 "serve staging compares every row id, including consumed row zero");

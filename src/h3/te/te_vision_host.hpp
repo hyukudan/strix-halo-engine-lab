@@ -14,6 +14,7 @@ namespace strix::h3::te {
 struct Frames {          // [t][h][w][3] in [0, 1], t = 1 (image) or 2 (video block)
     int t = 1, h = 0, w = 0;
     std::vector<float> rgb;
+    int min_pixels = 3136, max_pixels = 12845056;
 };
 
 struct Patches {         // [grid_h * grid_w][3 * 2 * 16 * 16], rows in 2x2 merge order
@@ -23,7 +24,7 @@ struct Patches {         // [grid_h * grid_w][3 * 2 * 16 * 16], rows in 2x2 merg
 };
 
 // Target size of the reference resize (factor 32, min 3136, max 12845056 pixels).
-void smart_resize(int h, int w, int& h_bar, int& w_bar);
+void smart_resize(int h, int w, int& h_bar, int& w_bar, double min_pixels = 3136, double max_pixels = 12845056);
 // Bilinear resize of one [h][w][3] frame (reference semantics, fp32).
 std::vector<float> resize_bilinear(const float* rgb, int h, int w, int oh, int ow);
 // Image (t = 1, the frame fills both temporal slots) or video pair (t = 2).

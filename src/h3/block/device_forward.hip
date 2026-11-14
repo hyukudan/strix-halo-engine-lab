@@ -11,7 +11,9 @@
 
 #include "h3/attn/attn.hpp"
 #include "h3/block/glue.hpp"
+#include "h3/block/weights_device.hpp"
 #include "h3/gemm/api.hpp"
+#include "h3/gemm/dense.hpp"
 #include "h3/gemm/ref.hpp"
 #include "h3/levers/fbc/fbc.hpp"
 #include "h3/levers/lora/turbo.hpp"
@@ -127,18 +129,48 @@ void HostFallbackAttention::run(const std::uint16_t* d_q, const std::uint16_t* d
 }
 
 // ------------------------------------------------------------------------------------------------- gemm linear
+struct Bf16DeviceLinear::Impl {
+    struct Matrix { DevBuf w; std::uint32_t n=0, k=0; };
+    std::map<std::uint32_t, std::vector<Matrix>> blocks;
+};
+Bf16DeviceLinear::Bf16DeviceLinear() : impl_(std::make_unique<Impl>()) {}
+Bf16DeviceLinear::~Bf16DeviceLinear() = default;
+bool Bf16DeviceLinear::prepared(std::uint32_t i) const { return impl_->blocks.count(i) != 0; }
+void Bf16DeviceLinear::prepare(const std::shared_ptr<const BlockWeights>& b) {
+    if (prepared(b->index)) return;
+    std::vector<Impl::Matrix> mats;
+    for (const auto* q : {&b->qkv, &b->out, &b->fc1, &b->fc2}) {
+        if (q->bf16.size() != static_cast<std::size_t>(q->n)*q->k)
+            throw std::invalid_argument("dense BF16: missing matrix payload");
+        Impl::Matrix m; m.n=q->n; m.k=q->k; m.w=upload(q->bf16, nullptr);
+        mats.push_back(std::move(m));
+    }
+    impl_->blocks.emplace(b->index, std::move(mats));
+}
+void Bf16DeviceLinear::run(std::uint32_t i, LinearKind kind, const std::uint16_t* x,
+                          std::uint32_t m, std::uint16_t* y, void* stream) {
+    const auto& w=impl_->blocks.at(i).at(static_cast<std::size_t>(kind));
+    gemm::dense_bf16(x,w.w.as<std::uint16_t>(),m,w.n,w.k,y,stream);
+}
+
 struct GemmDeviceLinear::Impl {
     struct DevW {
         DevBuf codes, scales;
+        std::array<DevBuf,3> packed;
         gemm::Weights w;
+        bool dense = false;
     };
     struct BlockW {
         DevW qkv, out, fc1, fc2;
+        bool fc1_fused = false;  // fc1 permuted for the SwiGLU epilogue (int8_convrot); else checkpoint order + K5
     };
     gemm::Workspace ws;
     std::map<std::uint32_t, BlockW> blocks;
     std::uint64_t bytes = 0;
-    explicit Impl(std::uint32_t max_rows) : ws(max_rows, kFfn) {}
+    std::uint32_t max_rows = 0;
+    DevBuf f1;      // [max_rows][2 * kFfn] bf16: plain fc1 output of blocks the epilogue cannot fuse (allocated on first use)
+    DevBuf silu;    // K5 table for those blocks
+    explicit Impl(std::uint32_t rows) : max_rows(rows) { if (rows) ws = gemm::Workspace(rows, kFfn); }
     void up(DevW& d, const std::int8_t* codes, const float* scales, std::uint32_t n, std::uint32_t k) {
         d.codes.alloc(static_cast<std::size_t>(n) * k);
         d.scales.alloc(static_cast<std::size_t>(n) * 4U);
@@ -147,34 +179,71 @@ struct GemmDeviceLinear::Impl {
         d.w = gemm::Weights{d.codes.as<std::int8_t>(), d.scales.as<float>(), n, k};
         bytes += static_cast<std::uint64_t>(n) * k + static_cast<std::uint64_t>(n) * 4U;
     }
+    void up(DevW& d, const QLinear& q) {
+        if (!q.bf16.empty()) {
+            d.codes=upload(q.bf16,nullptr);d.dense=true;
+            d.w.n=q.n;d.w.k=q.k;bytes+=2ULL*q.bf16.size();return;
+        }
+        if (q.operand==gemm::Operand::int8_convrot) { up(d,q.w.data(),q.ws.data(),q.n,q.k); return; }
+        d.codes=upload(q.w,nullptr); d.scales=upload(q.ws,nullptr);
+        d.w={d.codes.as<std::int8_t>(),d.scales.as<float>(),q.n,q.k};
+        const auto metadata=upload_operand(q,d.w,d.packed,[](const auto& v) { return upload(v,nullptr); });
+        bytes+=q.w.size()+4ULL*q.ws.size()+metadata;
+    }
 };
 GemmDeviceLinear::GemmDeviceLinear(std::uint32_t max_rows, bool fused) : fused_(fused), impl_(std::make_unique<Impl>(max_rows)) {}
 GemmDeviceLinear::~GemmDeviceLinear() = default;
 void GemmDeviceLinear::prepare(const std::shared_ptr<const BlockWeights>& b) {
     if (prepared(b->index)) return;
     Impl::BlockW& d = impl_->blocks[b->index];
-    impl_->up(d.qkv, b->qkv.w.data(), b->qkv.ws.data(), b->qkv.n, b->qkv.k);
-    impl_->up(d.out, b->out.w.data(), b->out.ws.data(), b->out.n, b->out.k);
-    if (fused_) {
+    impl_->up(d.qkv, b->qkv);
+    impl_->up(d.out, b->out);
+    // Fused policy per block: the epilogue needs int8_convrot fc1 rows in swiglu order. Packed (W4A8) and dense BF16
+    // fc1 keep checkpoint order and run fc1 + K5 here, so run() still returns SwiGLU(fc1) (same bits either way).
+    if (fused_ && b->fc1.operand==gemm::Operand::int8_convrot && b->fc1.bf16.empty()) {
         const gemm::SwiGLUWeights p = gemm::permute_fc1_for_swiglu(b->fc1.w.data(), b->fc1.ws.data(), b->fc1.n, b->fc1.k);
         impl_->up(d.fc1, p.codes.data(), p.scales.data(), b->fc1.n, b->fc1.k);
+        d.fc1_fused = true;
     } else {
-        impl_->up(d.fc1, b->fc1.w.data(), b->fc1.ws.data(), b->fc1.n, b->fc1.k);
+        impl_->up(d.fc1, b->fc1);
     }
-    impl_->up(d.fc2, b->fc2.w.data(), b->fc2.ws.data(), b->fc2.n, b->fc2.k);
+    impl_->up(d.fc2, b->fc2);
 }
 bool GemmDeviceLinear::prepared(std::uint32_t block) const { return impl_->blocks.count(block) != 0; }
+void GemmDeviceLinear::set_max_rows(std::uint32_t max_rows) {
+    if (!max_rows) throw std::invalid_argument("device linear: empty workspace");
+    if (max_rows == impl_->max_rows && impl_->ws.max_rows()) return;
+    impl_->ws = gemm::Workspace(max_rows, kFfn);
+    impl_->max_rows = max_rows;
+    impl_->f1 = DevBuf{};  // sized by max_rows on first use
+}
 void GemmDeviceLinear::run(std::uint32_t block, LinearKind kind, const std::uint16_t* d_x, std::uint32_t m, std::uint16_t* d_y, void* stream) {
     const Impl::BlockW& d = impl_->blocks.at(block);
     hipStream_t s = static_cast<hipStream_t>(stream);
+    auto project=[&](const Impl::DevW& w, unsigned pitch) {
+        if (w.dense) gemm::dense_bf16(d_x,w.codes.as<std::uint16_t>(),m,w.w.n,w.w.k,d_y,stream);
+        else gemm::linear(d_x,pitch,m,w.w,impl_->ws,d_y,w.w.n,s);
+    };
     switch (kind) {
-        case LinearKind::qkv: gemm::linear(d_x, kHidden, m, d.qkv.w, impl_->ws, d_y, d.qkv.w.n, s); break;
-        case LinearKind::out: gemm::linear(d_x, kInner, m, d.out.w, impl_->ws, d_y, d.out.w.n, s); break;
+        case LinearKind::qkv: project(d.qkv,kHidden); break;
+        case LinearKind::out: project(d.out,kInner); break;
         case LinearKind::fc1:
-            if (fused_) gemm::linear_fc1_swiglu(d_x, kHidden, m, d.fc1.w, impl_->ws, d_y, kFfn, s);
-            else gemm::linear(d_x, kHidden, m, d.fc1.w, impl_->ws, d_y, d.fc1.w.n, s);
+            if (d.fc1_fused) gemm::linear_fc1_swiglu(d_x, kHidden, m, d.fc1.w, impl_->ws, d_y, kFfn, s);
+            else if (!fused_) project(d.fc1,kHidden);
+            else {
+                if (m > impl_->max_rows) throw std::invalid_argument("device linear: rows above the workspace");
+                if (!impl_->f1.as<void>()) {
+                    impl_->f1.alloc(static_cast<std::size_t>(impl_->max_rows) * 2U * kFfn * 2U);
+                    const auto& st = gemm::silu_table();
+                    impl_->silu = upload(std::vector<std::uint16_t>(st.begin(), st.end()), s);
+                }
+                std::uint16_t* const y = d_y;
+                d_y = impl_->f1.as<std::uint16_t>();
+                project(d.fc1,kHidden);
+                gpu::launch_swiglu(impl_->f1.as<std::uint16_t>(), m, kFfn, impl_->silu.as<std::uint16_t>(), y, stream);
+            }
             break;
-        case LinearKind::fc2: gemm::linear(d_x, kFfn, m, d.fc2.w, impl_->ws, d_y, d.fc2.w.n, s); break;
+        case LinearKind::fc2: project(d.fc2,kFfn); break;
     }
 }
 std::uint64_t GemmDeviceLinear::flush_count(void* stream) { return impl_->ws.flush_count(static_cast<hipStream_t>(stream)); }
@@ -234,6 +303,7 @@ struct DeviceForward::Impl {
     std::map<std::uint32_t, BlockDev> blocks;
     bool refiner_ready = false;
     bool strict_flush = false;
+    double attn_score_limit = kAttnScoreLimit;
     // per-forward work buffers (grown on demand, reused across forwards)
     DevBuf w_x, w_h, w_o, w_qkv, w_q, w_k, w_vt, w_ao, w_sw, w_f1, w_ada, w_mod[6], w_vrows, w_arows, w_vdst, w_adst, w_temb, w_mrow;
     std::uint64_t vt_bytes_zeroed = 0;
@@ -302,7 +372,24 @@ struct DeviceForward::Impl {
 
 DeviceForward::DeviceForward(const GlobalWeights& g) : impl_(std::make_unique<Impl>(g)) {}
 DeviceForward::~DeviceForward() = default;
+void DeviceForward::prepare(BlockSource& blocks, DeviceLinearOp& lin) {
+    // Block i + 1 is read and folded on a worker while block i is permuted and uploaded (the same bytes as a serial loop).
+    std::vector<std::uint32_t> todo;
+    for (std::uint32_t i=0;i<blocks.num_blocks();++i)
+        if (!lin.prepared(i) || impl_->blocks.count(i)==0) todo.push_back(i);
+    BlockReadAhead ahead(blocks, std::move(todo));
+    while (const auto b=ahead.next()) {
+        lin.prepare(b);
+        impl_->block_dev(*b);
+    }
+    hip_check(hipStreamSynchronize(impl_->stream), "prepare blocks");
+}
 void DeviceForward::set_strict_flush(bool strict) { impl_->strict_flush = strict; }
+void DeviceForward::set_attn_score_limit(double limit) {
+    if (limit != kAttnScoreLimit && limit != kAttnScoreLimitExtended)
+        throw std::invalid_argument("device forward: attention score limit must be 2^14 or 2^15");
+    impl_->attn_score_limit = limit;
+}
 void DeviceForward::set_accel(const AccelOptions& o) {
     if (o.fbc && !(o.fbc_threshold >= 0.0)) throw std::invalid_argument("device forward: FBC threshold");
     impl_->acc = o;
@@ -345,7 +432,7 @@ StreamOutputs DeviceForward::run(BlockSource& blocks, const PackedLayout& L, con
     const auto tproj = std::chrono::steady_clock::now();
     gpu::launch_patch_proj(d_vrows.as<float>(), static_cast<std::uint32_t>(vdst.size()), kVideoPatch, I.vproj_w.as<float>(),
         I.vproj_b.as<float>(), d_vdst.as<std::int32_t>(), d_x.as<std::uint16_t>(), sv);
-    gpu::launch_patch_proj(d_arows.as<float>(), static_cast<std::uint32_t>(adst.size()), kAudioDim, I.aproj_w.as<float>(),
+    if (g.audio_enabled) gpu::launch_patch_proj(d_arows.as<float>(), static_cast<std::uint32_t>(adst.size()), kAudioDim, I.aproj_w.as<float>(),
         I.aproj_b.as<float>(), d_adst.as<std::int32_t>(), d_x.as<std::uint16_t>(), sv);
     for (const auto& seg : L.segments)
         if (seg.kind == SegKind::text) {
@@ -530,9 +617,9 @@ StreamOutputs DeviceForward::run(BlockSource& blocks, const PackedLayout& L, con
             taps->attn_score_max = worst;
             taps->attn_score_block = wb;
         }
-        if (!(worst <= kAttnScoreLimit))
+        if (!(worst <= I.attn_score_limit))
             throw std::runtime_error("device forward: attention input contract violated in block " + std::to_string(wb) +
-                                     ": max||q|| max||k|| log2(e)/sqrt(128) = " + std::to_string(worst) + " > 2^14");
+                                     ": max||q|| max||k|| log2(e)/sqrt(128) = " + std::to_string(worst) + " > limit " + std::to_string(I.attn_score_limit));
         const std::uint64_t br = datt.bound_rows(sv);
         if (taps) taps->attn_bound_rows = br;
         if (br != 0) throw std::runtime_error("device forward: attention bound_rows telemetry " + std::to_string(br) + " (must be 0)");
@@ -564,7 +651,7 @@ StreamOutputs DeviceForward::run(BlockSource& blocks, const PackedLayout& L, con
         out = download<float>(d_rows.as<void>(), static_cast<std::size_t>(m) * nout, s);
     };
     head(SegKind::video, p.video_t_row, bank ? d_vbw : I.vout_w, bank ? d_vbb : I.vout_b, kVideoPatch, fr.video);
-    head(SegKind::audio, p.audio_t_row, bank ? d_abw : I.aout_w, bank ? d_abb : I.aout_b, kAudioDim, fr.audio);
+    if (g.audio_enabled) head(SegKind::audio, p.audio_t_row, bank ? d_abw : I.aout_w, bank ? d_abb : I.aout_b, kAudioDim, fr.audio);
     StreamOutputs so;
     const std::vector<float> v = unpatchify_video(fr.video.data(), L.latent_t, L.latent_h, L.latent_w);
     const std::vector<float> a = unpack_audio(fr.audio.data(), L.audio_t);

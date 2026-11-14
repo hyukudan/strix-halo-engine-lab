@@ -19,6 +19,11 @@ environment variable, the shipped value, the value that restores the previous pa
 | glm-pair | hp-crc-overlap | `STRIX_DIST_HOST_CRC_OVERLAP` | 1 | 0 | Measurement: hp host path, exact TTFT 1K -8.5 %, 8K -3.1 %, logits fnv matches reference 16/16 |
 | glm-pair | hp-chunk-bytes | `STRIX_DIST_HOST_CHUNK_BYTES` | 1048576 | 0 | Measurement: hp host path, exact TTFT 1K -8.5 %, 8K -3.1 %, logits fnv matches reference 16/16 |
 | glm-pair | pf-pipeline-2 | `STRIX_GLM_PF_PIPELINE` | 2 | 1 | Measurement: N=2 whole-layer prefill pipeline + async start, prefill gate bitwise, 8K -4.0 % (needs dist-async-start) |
+| glm-pair | pf-seqpar | `STRIX_GLM_PF_SEQPAR` | auto | 0 | Guard: ordinary TP2 ownership, pipeline-capable prefill and at least two rows; auto declines to legacy |
+| glm-pair | pf-aux-combine | `STRIX_GLM_PF_AUX_COMBINE` | 1 | 0 | Guard: exact MoE epilogue; off restores the separate auxiliary combine |
+| glm-pair | pf-in-token | `STRIX_GLM_PF_IN_TOKEN` | 1 | 0 | Measurement: token-ordered MoE gate/up input transform (device plan; each x row read once, not 18x), logits and state bitwise on both ranks at 8K / 32K exact and FAST; 8K FAST TTFT 10.55 -> 10.21 s (median of 4 pairs) (=0 restores the tile-ordered transform) |
+| glm-pair | pf-scratch | `STRIX_GLM_PF_SCRATCH` | auto | full | Guard: joint capacity admission; auto tries routed scratch after the original full layout |
+| glm-pair | pf-attn-qwin | `STRIX_GLM_PF_ATTN_QWIN` | auto | 0 | Guard: joint capacity admission; auto tries a 2048-row query window after full-chunk candidates |
 | glm-pair | dist-async-start | `STRIX_DIST_ASYNC_START` | 1 | 0 | Measurement: async exchange start (full-host chunked path; only the pipeline uses it) |
 | glm-pair | hsa-no-fragment-allocator | `HSA_DISABLE_FRAGMENT_ALLOCATOR` | 1 | 0 | Measurement: production decode and prefill configuration; allocator granules fit GTT |
 | glm-pair | r1b-dense-auto | `STRIX_GLM_R1B_DENSE` | 7 | 2 | Measurement: R1b-fast kernels -7.8 % R1 / -5.4 % R8, same tokens |
@@ -36,14 +41,15 @@ environment variable, the shipped value, the value that restores the previous pa
 | glm-pair | moe-fast | `STRIX_GLM_MOE` | fast | ref | Measurement: FastMoe matches DefaultMoe bitwise (real TP2 slices); raw-only experts (fits GTT) |
 | glm-pair | pf-exact-moe-auto | `STRIX_GLM_PF_EXACTMOE_V` | auto | 1 | Measurement: exact MoE auto (v14 through the X3 core with row-bucketed tiles and folded remainders for calls >= 128 rows, v3 with row buckets below), outputs bitwise; 8K TTFT -19.5 % and 1K -15 % vs the X2 core; MoE call -3..-6 % vs v11 |
 | glm-pair | pf-exact-moe-plan | `STRIX_GLM_PF_EXACTMOE_PLAN` | device | host | Measurement: exact MoE device plan (pairs/tiles/groups built on the GPU, byte-equal to the host plan; no route download or host sync per MoE call) |
-| glm-pair | pf-exact-x | `STRIX_GLM_PF_EXACT_X` | auto | 0 | Measurement: exact X3 prefill linear core (scalar activations, eight rows per wave) for calls >= 2048 rows (TM16 below), bitwise; 8K TTFT -14.3 % vs X2 |
+| glm-pair | pf-exact-x | `STRIX_GLM_PF_EXACT_X` | auto | 0 | Measurement: exact X3 prefill linear core (scalar activations, eight rows per wave) for calls >= 64 rows (TM16 below; the former floor was 2048: X3 is 0.44-0.62 of TM16 at 256-1024 rows), bitwise; 8K TTFT -14.3 % vs X2 |
 | glm-pair | pf-obar-v10 | `STRIX_GLM_PF_OBAR` | 10 | 2 | Measurement: MLA o-bar v10 (v7 staging 2 k per batch, 18 KB LDS: 4 CTAs per WGP) bitwise == v7 / v5, 7.1 / 8.5 / 8.5 / 9.5 vs v7 7.9 / 9.3 / 9.3 / 10.3 us/row per DSA layer at t0 0 / 4096 / 12288 / 28672 (=7 restores v7, =5 v5) |
 | glm-pair | pf-scores-v7 | `STRIX_GLM_PF_SCORES` | 7 | 2 | Measurement: MLA scores v7 (v6 in 256-row grid groups) bitwise == v6 / v5, 4.90 / 6.08 / 7.87 / 9.89 vs v6 4.96 / 8.42 / 9.41 / 10.46 us/row per DSA layer at t0 0 / 4096 / 12288 / 28672 (=6 restores v6) |
 | glm-pair | pf-mla-gemm-v3 | `STRIX_GLM_PF_MLA_GEMM` | 3 | 2 | Measurement: MLA absorb / out GEMM v3 (128x128 VALU tiles, same ascending-k FMA chains) bitwise == v2 on the pair at 8K / 32K, MLA GEMM 0.715 -> 0.425 s (8K) and 2.853 -> 1.628 s (32K) per rank (=2 restores v2, =1 legacy) |
 | glm-pair | pf-kda-scan-v5 | `STRIX_GLM_PF_KDA_SCAN` | 5 | 1 | Measurement: KDA scan v5 (quad-DPP tree, batch fill off the serial path) bitwise == v3 / v1 and decode, 1.84-1.86 -> 1.18-1.20 us/row per KDA layer at t0 0..28672 (v3 1.23-1.25; =3 restores v3) |
 | glm-pair | pf-indexer-v3 | `STRIX_GLM_PF_IDX` | 3 | 1 | Measurement: indexer scores v3 same keys as v2, 5.3 vs 9.6 us/row per DSA layer at t0 28672 (=2 restores v2) |
 | glm-pair | pf-select-v2 | `STRIX_GLM_PF_SELECT` | 2 | 1 | Measurement: indexer select v2 same token lists as v1, 0.38 vs 0.99 us/row at t0 28672, 0.08 vs 0.50 at t0 4096 |
-| glm-pair | pf-dense-rows-v3 | `STRIX_GLM_PF_DENSE_ROWS` | 3 | 1 | Measurement: prefill dense rows v3 groups the projections of one input (KDA f_a / g_a / b, DSA wk / gate / weights_proj) in one 128 x 64 launch, same ascending fmaf chain, bitwise == v2; grouped calls 6.77 vs 9.33 ms (KDA) and 6.62 vs 8.98 ms (DSA) at 8192 rows; TTFT 14.34 -> 14.29 s at 8,192 tokens (=2 restores v2, =1 v1) |
+| glm-pair | pf-dense-rows-v4 | `STRIX_GLM_PF_DENSE_ROWS` | 4 | 1 | Measurement: prefill dense rows v4 runs the exact projections on the shared FMA-rows core, same ascending fmaf chain, bitwise == v3; exact two-node prefill 12.68 / 12.69 s vs 12.81 s at 8,192 tokens, logits / state / token hashes equal (=3 restores v3). Dense rows v3 groups the projections of one input (KDA f_a / g_a / b, DSA wk / gate / weights_proj) in one 128 x 64 launch, same ascending fmaf chain, bitwise == v2; grouped calls 6.77 vs 9.33 ms (KDA) and 6.62 vs 8.98 ms (DSA) at 8192 rows; TTFT 14.34 -> 14.29 s at 8,192 tokens (=2 restores v2, =1 v1) |
+| glm-pair | pf-dense-form-auto | `STRIX_GLM_PF_DENSE_FORM` | 0 | 0 | Guard: physical form of dense rows v4 (shared FMA-rows core), read only with STRIX_GLM_PF_DENSE_ROWS=4: 0 selects the form per shape, 1..7 force one form where the shape admits it (diagnostic; every form gives the same bytes) |
 | glm-pair | max-rows-auto | `STRIX_GLM_MAX_ROWS_AUTO` | 1 | 0 | Measurement: exact 8192 vs 4096 rows, 8K TTFT -4 %, 32K 116.3 -> 109.9 s (-5.5 %); +7.3 GiB per rank |
 | glm-pair | pf-staged | `STRIX_GLM_PF_STAGED` | 1 | 0 | Measurement: pipelined prefill exchanges through the coherent staging views; pair ABBA -0.8 % 1K / -0.9 % 8K TTFT, logits bitwise |
 | glm-pair | pf-hc-fuse | `STRIX_GLM_PF_HC_FUSE` | 1 | 0 | Measurement: mHC expand + next-site norm fused (F not materialised), logits bitwise; pair ABBA x2 -1.1 % 1K / -1.3 % 8K TTFT |
@@ -81,7 +87,6 @@ environment variable, the shipped value, the value that restores the previous pa
 | minimax-pair | markov_cand_c | `STRIX_MM_MARKOV_C` | 4096 | 1024 | Markov measurement: C 4096 (offline approx1-K3: C4096/H8192 0 acceptance changes on 1857 anchors) |
 | minimax-pair | markov_cand_h | `STRIX_MM_MARKOV_H` | 8192 | 2048 | Markov measurement: \|H\| 8192 (offline approx1-K3: C4096/H8192 0 acceptance changes on 1857 anchors) |
 | minimax-pair | markov_topc_v2 | `STRIX_MM_MARKOV_TOPC` | v2 | v1 | Markov measurement: top-C v2 = v1 canonical set / scores / picks (payload gates v1/v2 vs CPU) |
-| minimax-pair | pf_core_v4 | `STRIX_MMX_PREFILL_CORE` | v4 | lib | Prefill core measurement: bitwise everywhere, whole call 0.34-0.58x lib |
 | minimax-pair | pf_msa_batch | `STRIX_MM_PF_MSA_BATCH` | 1 | 0 | Prefill measurement: exact, pfall TTFT 1K -17 %, 8K -20 % |
 | minimax-pair | pf_attend4 | `STRIX_MM_PF_ATTEND4` | 1 | 0 | Prefill measurement: exact, pfall TTFT 1K -17 %, 8K -20 % |
 | minimax-pair | pf_router_batch | `STRIX_MM_PF_ROUTER_BATCH` | 1 | 0 | Prefill measurement: exact, pfall TTFT 1K -17 %, 8K -20 % |
@@ -104,11 +109,11 @@ environment variable, the shipped value, the value that restores the previous pa
 | minimax-pair | dist_crc_parallel | `STRIX_DIST_CRC_PARALLEL` | 1 | 0 | Host transport measurement: ABA x3 TTFT 1K -12.8 %, decode -1 %, bits unchanged |
 | minimax-pair | dist_host_crc_overlap | `STRIX_DIST_HOST_CRC_OVERLAP` | 1 | 0 | Host transport measurement: ABA x3 TTFT 1K -12.8 %, decode -1 %, bits unchanged |
 | minimax-pair | dist_host_chunk | `STRIX_DIST_HOST_CHUNK_BYTES` | 1048576 | 0 | Host transport measurement: ABA x3 TTFT 1K -12.8 %, decode -1 %, bits unchanged |
+| minimax-pair | pfx_joined | `STRIX_MM_PFX_JOINED` | 1 | 0 | Prefill exchange wire form: identity and CRC list ride with the last chunk (two rendezvous fewer per message); payload bytes unchanged |
 | qwen | STRIX_QPF2K_SCHED | `STRIX_QPF2K_SCHED` | 14 | 0 | STRIX_QPF2K_SCHED |
 | qwen | STRIX_QPF2K_DENSE | `STRIX_QPF2K_DENSE` | 1 | 0 | STRIX_QPF2K_DENSE |
 | qwen | STRIX_QPF2K_GDN | `STRIX_QPF2K_GDN` | 1 | 0 | STRIX_QPF2K_GDN |
 | qwen | STRIX_QPF2K_GDN_GATES_BATCH | `STRIX_QPF2K_GDN_GATES_BATCH` | 1 | 0 | STRIX_QPF2K_GDN_GATES_BATCH |
-| qwen | STRIX_QPF2K_GDN_CORE16 | `STRIX_QPF2K_GDN_CORE16` | 1 | 0 | STRIX_QPF2K_GDN_CORE16 |
 | qwen | STRIX_QPF2K_QSA | `STRIX_QPF2K_QSA` | 1 | 0 | STRIX_QPF2K_QSA |
 | qwen | STRIX_QPF2K_QSA_MASK | `STRIX_QPF2K_QSA_MASK` | 0x2257 | 0 | STRIX_QPF2K_QSA_MASK |
 | qwen | STRIX_QPF2K_HC | `STRIX_QPF2K_HC` | 1 | 0 | STRIX_QPF2K_HC |
@@ -151,7 +156,6 @@ this section for Qwen, `STRIX_QWEN_ALLON=fast` also the FAST rows. An explicit p
 | qwen | moe_down_lds_epilogue | `STRIX_QPF2K_MOE_DOWN_LDS_EPI` | 1 | exact | down LDS-backed vector stores; byte gate and timing pending |
 | qwen | moe_direct_b | `STRIX_QPF2K_MOE_DIRECT_B` | 1 | exact | Q4_K gate/up direct-B fragments (plain CLI prefill only); native gate pending |
 | qwen | qsa_kv_pair | `STRIX_QSA_FAST_KV_PAIR` | 1 | exact | single-image paired QSA attend loader; fixture byte-equal, native pending |
-| qwen | mtp_prime_rows | `STRIX_MTP_PRIME_ROWS` | 1 | exact | 262,144-token MTP prompt 210.9-213.2 -> 202.8-203.8 s, digests equal |
 | qwen | mtp_device_handoff | `STRIX_MTP_DEVICE_HANDOFF` | 1 | exact | MTP cycle without a host fence; same launches and stream order |
 | qwen | decode_fuse | `STRIX_QWEN_DECODE_FUSE` | 1 | exact | single-row GDN preparation fusion; host and fixture checks |
 | qwen | router_bf16 | `STRIX_QWEN_ROUTER_BF16` | 1 | exact | exact BF16 router weight copy (120 MiB); device gate pending |

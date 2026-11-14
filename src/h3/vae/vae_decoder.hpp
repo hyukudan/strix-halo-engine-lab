@@ -21,16 +21,17 @@ struct ChunkRange { int first = 0, last = 0; };  // temporal chunks [first, last
 
 class GpuDecoder {
 public:
-    // weights: the video VAE FP16 safetensors (decoder.* + post_quant_conv + latents stats)
+    // weights: VAE safetensors (decoder.* + post_quant_conv + latents stats).
+    // image=true: 24-layer, single-frame, width 1024/16 heads/2 axes or 2048/32 heads/3 axes.
     // fused_swiglu: w1 + gated SiLU in one GEMM epilogue (same bits as the two-step form; needs the tiled GEMM)
-    explicit GpuDecoder(const std::string& weights, int layers = kLayers36, bool fused_swiglu = true);
+    explicit GpuDecoder(const std::string& weights, int layers = kLayers36, bool fused_swiglu = true, bool image = false);
     ~GpuDecoder();
     GpuDecoder(const GpuDecoder&) = delete;
     GpuDecoder& operator=(const GpuDecoder&) = delete;
 
     const HeadH& head() const { return head_; }
     // dec_in: post_quant_conv output FP16 [24][nt][ny][nx]; returns FP16 [3][4 nt][16 ny][16 nx].
-    // h_out (optional): the residual stream after `stop_after` layers (all layers when < 0), [L][2048].
+    // h_out (optional): residual stream after `stop_after` layers (all when < 0), [L][weight width].
     // rows_out (optional): receives the projection rows [P][3072] instead (the return value is then empty).
     H16 decode_call(const H16& dec_in, int nt, int ny, int nx, CallTiming* timing = nullptr, H16* h_out = nullptr,
                     int stop_after = -1, const H16* h_in_override = nullptr, H16* rows_out = nullptr);
@@ -54,6 +55,7 @@ private:
     HeadH head_;
     int layers_ = 0;
     bool fused_ = true;
+    bool image_ = false;
 };
 
 // Latent box of a call from the denormalized, padded latent [24][Tp][H][W], then post_quant_conv (host).

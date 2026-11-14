@@ -4,6 +4,12 @@
 
 #include "glm/common/glm_math.hpp"
 #include "glm/moe/glm_trellis_device.hpp"
+#ifndef STRIX_GLM_FAST_I4_CORE
+#define STRIX_GLM_FAST_I4_CORE 0
+#endif
+#if STRIX_GLM_FAST_I4_CORE
+#include "core/w4a16.hpp"  // strix-trellis fast/i4-w4a16 src/core (shared stored INT4 core)
+#endif
 
 #include <cstdlib>
 #include <stdexcept>
@@ -54,6 +60,8 @@ struct Args {
     float* out;
     unsigned char* ws;
     float* dbg_gu;  // MoeView::debug_gate_up
+    I4Experts i4;   // MoeView::i4 (fast_i4: routed slots on the W4A16 core; read only by the I4 kernel instantiations)
+    strix::pair::ProducerPublish pub;  // MoeView::publish (down_kernel; the core path publishes with one more launch)
     __device__ _Float16* at(unsigned pair) const {
         return reinterpret_cast<_Float16*>(ws + kOffAt) + static_cast<std::size_t>(pair) * kInter;
     }
@@ -458,7 +466,7 @@ using DecodeCore = strix::moe_core::Decode<DecodeTraits>;
 // ---------------------------------------------------------------- gate + up (+ R15 + down input transform)
 // CTA = 4 waves x 4 columns (2 output blocks) of matrix m over SG library splits starting at split sg * SG.
 template <int MaxR, unsigned SG, bool Pipe> constexpr std::size_t kGuSmem = std::size_t{MaxR} * SG * kSplitCh * 2 + 4 * kRowbufStride<Pipe> * 16;
-template <int MaxR, unsigned SG, bool Pipe>
+template <int MaxR, unsigned SG, bool Pipe, bool I4 = false>
 __device__ __forceinline__ void gate_up_body(const Args& a, const SlotInfo& si, unsigned slot, unsigned cg, unsigned sg, unsigned m,
                              unsigned char* smem) {
     auto* xs = reinterpret_cast<_Float16*>(smem);
@@ -474,8 +482,25 @@ __device__ __forceinline__ void gate_up_body(const Args& a, const SlotInfo& si, 
     __syncthreads();
     const unsigned col0 = static_cast<unsigned>(__builtin_amdgcn_readfirstlane(static_cast<int>(cg * 16U + wave * 4U)));
     const unsigned k0 = sg * SG * kGateKps;
-    wide_rows<MaxR, kGateKps, true, Pipe>(w, kInter, k0, k0 + SG * kGateKps, col0, xs, SG * kSplitCh, nrows, wave, lane, rowbuf,
-                                    a.part(first, m, sg * SG), std::size_t{2} * kGateSplits * kInter, nullptr, 0, 0);
+    bool routed_i4 = false;
+#if STRIX_GLM_FAST_I4_CORE
+    if constexpr (I4) {
+        if (slot >= 1) {  // fast_i4: W4A16 routed gate/up into the same raw split partials (part layout)
+            routed_i4 = true;
+            float* const part0 = a.part(first, m, sg * SG);
+            constexpr std::size_t row_stride = std::size_t{2} * kGateSplits * kInter;
+            strix::core::w4a16::wave_rows<MaxR, kGateKps, SG * 2U>(
+                a.i4.wq[m] + std::size_t{si.expert} * (std::size_t{kHidden} * kInter / 2U),
+                a.i4.ws[m] + std::size_t{si.expert} * kInter * (kHidden / 64U), kInter, kHidden, k0, k0 + SG * kGateKps, col0, xs,
+                SG * kSplitCh, lane, nrows, [&](unsigned split, unsigned r, unsigned col, float v) {
+                    if (r < nrows) part0[std::size_t{split} * kInter + r * row_stride + col] = v;
+                });
+        }
+    }
+#endif
+    if (!routed_i4)
+        wide_rows<MaxR, kGateKps, true, Pipe>(w, kInter, k0, k0 + SG * kGateKps, col0, xs, SG * kSplitCh, nrows, wave, lane, rowbuf,
+                                        a.part(first, m, sg * SG), std::size_t{2} * kGateSplits * kInter, nullptr, 0, 0);
     auto finish = [&](unsigned block) {
         const std::uint16_t* gsvh = slot_matrix(a, si, slot, 0).svh;
         const std::uint16_t* usvh = slot_matrix(a, si, slot, 1).svh;
@@ -520,7 +545,7 @@ __device__ __forceinline__ void gate_up_body(const Args& a, const SlotInfo& si, 
 }
 
 // grid (kGuGroups x 32 / SG, slots, 2 matrices); FirstSlot 0 (shared included) or 1 (routed only).
-template <int MaxR, unsigned SG, unsigned FirstSlot, bool Pipe>
+template <int MaxR, unsigned SG, unsigned FirstSlot, bool Pipe, bool I4 = false>
 __global__ __launch_bounds__(128) void gate_up_kernel(Args a) {
     __shared__ alignas(16) unsigned char smem[kGuSmem<MaxR, SG, Pipe>];
     __shared__ SlotInfo si;
@@ -528,7 +553,7 @@ __global__ __launch_bounds__(128) void gate_up_kernel(Args a) {
     const unsigned slot = blockIdx.y + FirstSlot;
     slot_info(a, slot, true, si, ids, mask);
     if (!si.active) return;
-    gate_up_body<MaxR, SG, Pipe>(a, si, slot, blockIdx.x % kGuGroups, blockIdx.x / kGuGroups, blockIdx.z, smem);
+    gate_up_body<MaxR, SG, Pipe, I4>(a, si, slot, blockIdx.x % kGuGroups, blockIdx.x / kGuGroups, blockIdx.z, smem);
 }
 
 // ---------------------------------------------------------------- router (R1 logits, R14 / R5) + shared gate/up
@@ -688,7 +713,7 @@ __global__ __launch_bounds__(128) void router_shared_kernel(Args a) {
 // grid (kDnGroups, slots incl. shared). CTA = 4 waves x 4 columns (256 outputs) over the whole K: the 4 library splits
 // accumulate in ascending order in the CTA's fin rows; H32 + svh per 128-output block into yslot; the last CTA of the
 // 256-output group (over all active slots) runs R16 for every row.
-template <int MaxR, bool Pipe>
+template <int MaxR, bool Pipe, bool I4 = false>
 __global__ __launch_bounds__(128) void down_kernel(Args a) {
     __shared__ _Float16 xs[MaxR * kInter];
     __shared__ WideV4 rowbuf[4 * kRowbufStride<Pipe>];
@@ -707,8 +732,25 @@ __global__ __launch_bounds__(128) void down_kernel(Args a) {
     }
     __syncthreads();
     const unsigned col0 = static_cast<unsigned>(__builtin_amdgcn_readfirstlane(static_cast<int>(cg * 16U + wave * 4U)));
-    wide_rows<MaxR, kDownKps, false, Pipe>(w, kHidden, 0, kDownKt, col0, xs, kInter, nrows, wave, lane, rowbuf, nullptr, 0, fin, 256,
-                                     wave * 4U);
+    bool routed_i4 = false;
+#if STRIX_GLM_FAST_I4_CORE
+    if constexpr (I4) {
+        if (slot >= 1 && a.i4.wq[2] != nullptr) {  // fast_i4 scope all: W4A16 routed down; fin = the 4 splits accumulated in ascending order (as below)
+            routed_i4 = true;
+            strix::core::w4a16::wave_rows<MaxR, kDownKps, kDownKt / 4U>(
+                a.i4.wq[2] + std::size_t{si.expert} * (std::size_t{kInter} * kHidden / 2U),
+                a.i4.ws[2] + std::size_t{si.expert} * kHidden * (kInter / 64U), kHidden, kInter, 0, kDownKt, col0, xs, kInter, lane, nrows,
+                [&](unsigned split, unsigned r, unsigned col, float v) {
+                    if (r >= nrows) return;
+                    float* pf = fin + r * 256U + (col - cg * 256U);
+                    *pf = split == 0 ? 0.0F + v : *pf + v;
+                });
+        }
+    }
+#endif
+    if (!routed_i4)
+        wide_rows<MaxR, kDownKps, false, Pipe>(w, kHidden, 0, kDownKt, col0, xs, kInter, nrows, wave, lane, rowbuf, nullptr, 0, fin, 256,
+                                         wave * 4U);
     __syncthreads();
     for (unsigned job = wave; job < nrows * 2; job += 4) {  // output transform per (row, 128-output block)
         const unsigned lr = job / 2, b = job % 2;
@@ -745,6 +787,16 @@ __global__ __launch_bounds__(128) void down_kernel(Args a) {
                 acc = __builtin_fmaf(a.weights[r * kTopE + k], load_agent(a.yslot(pairs[r * kTopE + k]) + o), acc);
             a.out[static_cast<std::size_t>(r) * kHidden + o] = acc + load_agent(a.yslot(r) + o);
         }
+    }
+    // One R16 workgroup per 256-output group stores the partial: the last of the kDnGroups publishes it.
+    if (a.pub.on()) strix::pair::producer_publish(a.pub, kDnGroups);
+}
+
+// The core down path does not publish in-kernel: one thread raises the flag after it (same message, one more launch).
+__global__ void publish_after_kernel(strix::pair::ProducerPublish t) {
+    if (threadIdx.x == 0) {
+        __builtin_amdgcn_fence(__ATOMIC_RELEASE, "");
+        __hip_atomic_store(t.flag, t.sequence, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
     }
 }
 
@@ -794,7 +846,7 @@ Args make_args(const MoeView& v, bool router) {
         throw std::invalid_argument("glm moe: shared expert must be 4096 -> 1024 -> 4096 at K4 or K6");
     auto* ws = static_cast<unsigned char*>(v.ws.base);
     float* logits = v.logits != nullptr ? v.logits : reinterpret_cast<float*>(ws + kOffLogits);
-    return {v.rows, v.y, v.router_w, v.bias, v.ids, v.weights, logits, v.experts, v.shared, v.out, ws, v.debug_gate_up};
+    return {v.rows, v.y, v.router_w, v.bias, v.ids, v.weights, logits, v.experts, v.shared, v.out, ws, v.debug_gate_up, v.i4, v.publish};
 }
 
 // SG (library splits per gate_up CTA; bitwise at every value). Default = the measurement (node 0, cold synthetic
@@ -838,6 +890,10 @@ void launch_rows_sg(const Args& a, bool router, hipStream_t stream, hipEvent_t* 
             if (marks != nullptr) (void)hipEventRecord(marks[router ? 1 : 0], stream);
             core_down_kernel<MaxR, Pipe><<<dim3(kDnGroups, routed + 1), 128, 0, stream>>>(a);
             check_launch("core_down");
+            if (a.pub.on()) {
+                publish_after_kernel<<<1, 32, 0, stream>>>(a.pub);
+                check_launch("core_down publish");
+            }
             return;
         }
     }
@@ -854,7 +910,34 @@ void launch_rows_sg(const Args& a, bool router, hipStream_t stream, hipEvent_t* 
     down_kernel<MaxR, Pipe><<<dim3(kDnGroups, routed + 1), 128, 0, stream>>>(a);
     check_launch("down");
 }
+// fast_i4 (MoeView::i4): the same three launches with the routed slots on the W4A16 core (no core / pipe variants).
+template <int MaxR, unsigned SG>
+void launch_rows_i4(const Args& a, bool router, hipStream_t stream, hipEvent_t* marks) {
+#if STRIX_GLM_FAST_I4_CORE
+    const unsigned routed = routed_slots(a.rows);
+    if (router) {
+        router_shared_kernel<MaxR, SG, false><<<kRouterCtas + kGuGroups * (kGateSplits / SG) * 2, 128, 0, stream>>>(a);
+        check_launch("router_shared");
+        if (marks != nullptr) (void)hipEventRecord(marks[0], stream);
+        gate_up_kernel<MaxR, SG, 1, false, true><<<dim3(kGuGroups * (kGateSplits / SG), routed, 2), 128, 0, stream>>>(a);
+    } else {
+        gate_up_kernel<MaxR, SG, 0, false, true><<<dim3(kGuGroups * (kGateSplits / SG), routed + 1, 2), 128, 0, stream>>>(a);
+    }
+    check_launch("i4 gate_up");
+    if (marks != nullptr) (void)hipEventRecord(marks[router ? 1 : 0], stream);
+    down_kernel<MaxR, false, true><<<dim3(kDnGroups, routed + 1), 128, 0, stream>>>(a);
+    check_launch("i4 down");
+#else
+    (void)a, (void)router, (void)stream, (void)marks;
+    throw std::invalid_argument("glm moe: fast_i4 W4A16 core not built (shared stored INT4 core)");
+#endif
+}
 template <int MaxR, bool Pipe> void launch_rows(const Args& a, bool router, hipStream_t stream, hipEvent_t* marks) {
+    if (a.i4.on()) {
+        if (split_group(static_cast<unsigned>(MaxR)) == 1) launch_rows_i4<MaxR, 1>(a, router, stream, marks);
+        else launch_rows_i4<MaxR, 2>(a, router, stream, marks);
+        return;
+    }
     switch (split_group(static_cast<unsigned>(MaxR))) {
     case 1: launch_rows_sg<MaxR, 1, Pipe>(a, router, stream, marks); break;
     case 2: launch_rows_sg<MaxR, 2, Pipe>(a, router, stream, marks); break;
@@ -874,6 +957,7 @@ void launch(const MoeView& v, bool router, hipStream_t stream, hipEvent_t* marks
 }  // namespace
 
 std::size_t moe_workspace_bytes() { return kMoeBytes; }
+bool fast_i4_built() { return STRIX_GLM_FAST_I4_CORE != 0; }
 const float* moe_pair_gate_partials(const MoeWorkspace& ws, unsigned pair) {
     return reinterpret_cast<const float*>(static_cast<const unsigned char*>(ws.base) + kOffPart) +
            static_cast<std::size_t>(pair) * 2 * kGateSplits * kInter;

@@ -68,6 +68,33 @@ int main() try {
     expect(!ds::prefix_memory_admitted(8192, 8192, 1), "reserve is after predicted allocations");
     expect(ds::prefix_memory_admitted(8193, 8192, 1), "round predicted bytes upward");
     expect(!ds::prefix_memory_admitted(1, UINT64_MAX, UINT64_MAX), "admission arithmetic cannot wrap");
+    // The service-directory quota is never smaller than the tier it holds: 4096 MiB at least, the tier's ceiling
+    // above that, unlimited for an unlimited tier (0); the filesystem free-space floor still applies.
+    expect(ds::prefix_disk_quota_bytes(1024) == 4096ULL << 20U, "small tier keeps the 4096 MiB directory quota");
+    expect(ds::prefix_disk_quota_bytes(4096) == 4096ULL << 20U, "default tier: 4096 MiB quota");
+    expect(ds::prefix_disk_quota_bytes(262144) == 262144ULL << 20U, "256 GiB tier: 256 GiB quota");
+    expect(ds::prefix_disk_quota_bytes(0) == UINT64_MAX, "unlimited tier: no directory quota");
+    expect(ds::prefix_disk_quota_bytes(UINT64_MAX >> 20U) == (UINT64_MAX >> 20U) << 20U, "largest accepted tier does not wrap");
+    expect(ds::prefix_disk_quota_bytes(UINT64_MAX) == UINT64_MAX, "a larger value never wraps to a zero quota");
+    {
+        // V4.1 on the pair: 890 B of compressed KV + index keys per position (+ 4 B token id), 40 layers of rings,
+        // 1 GiB host cache, 3 GiB reserve, ~8.1 GiB MemAvailable per node (weights, drafter and KV pool resident).
+        const std::uint64_t rings = 40U * (136U * 528U + 4096U + 4096U), per_token = 890U + 4U;
+        const auto p = [&](std::uint64_t tokens, std::uint64_t bpt) { return ds::prefix_capture_predicted_bytes(tokens, bpt, rings, 1024); };
+        expect(ds::prefix_capture_predicted_bytes(UINT64_MAX, 2, 0, 0) == UINT64_MAX, "token bytes saturate");
+        expect(ds::prefix_capture_predicted_bytes(0, 0, UINT64_MAX, 0) == UINT64_MAX, "ring copies saturate");
+        expect(ds::prefix_capture_predicted_bytes(0, 0, 0, UINT64_MAX) == UINT64_MAX, "host budget saturates");
+        expect(ds::prefix_capture_predicted_bytes(1, 1, 0, 0, UINT64_MAX) == UINT64_MAX, "slot copies saturate");
+        expect(!ds::prefix_memory_admitted(8100, 3072, ds::prefix_capture_predicted_bytes(UINT64_MAX, 2, 0, 0)),
+               "overflow cannot admit a capture");
+        expect(p(0, per_token) == (1024ULL << 20U) + 3U * rings + 8U * rings, "empty capture: budget + state rings x3 + snapshot rings x8");
+        expect(p(180000, per_token) - p(0, per_token) == 3ULL * 180000U * per_token, "three copies of the per-position state");
+        expect(ds::prefix_capture_predicted_bytes(1000, per_token, rings, 0, 2) == 2U * (3U * (1000U * per_token + rings) + 8U * rings),
+               "per-slot terms scale with slots");
+        expect(ds::prefix_memory_admitted(8100, 3072, p(180000, per_token)), "a 180K-token agent prompt is captured");
+        expect(ds::prefix_memory_admitted(8100, 3072, p(1048576, per_token)), "a 1M-token prompt is captured");
+        expect(!ds::prefix_memory_admitted(8100, 3072, p(180000, 40U * 356U + 4U)), "the every-layer ratio-1 estimate refused it");
+    }
 #if defined(__unix__)
     const auto root = std::filesystem::temp_directory_path() / ("ds41-host-lease-test-" + std::to_string(::getpid()));
     {

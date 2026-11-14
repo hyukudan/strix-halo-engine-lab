@@ -17,6 +17,7 @@
 #include <vector>
 
 #include "h3/vae/vae_half.hpp"
+#include "h3/vae/precision_types.hpp"
 #include "h3/vae/vae_io.hpp"
 
 namespace strix::h3::vae {
@@ -26,18 +27,9 @@ constexpr int kRotPairs = 24, kRotDim = 48, kRegisters = 4, kSuffix = 5, kLatent
 
 using H16 = std::vector<half_bits>;
 
-struct LinearH {  // FP16 weights [out][in], bias [out]
-    int in = 0, out = 0;
-    H16 w, b;
-};
-struct LayerH {
-    H16 norm1, norm2, scale1, scale2;
-    LinearH qkv, out, w1, w2;
-};
-struct HeadH {  // everything outside the 36 blocks
-    LinearH post_quant, x_embed, proj;  // post_quant: [24][24] (1x1x1 conv), x_embed [2048][24], proj [3072][2048]
-    H16 registers, norm_out_w, norm_out_b, latents_mean, latents_std;
-};
+using LinearH = LinearT<half_bits>;
+using LayerH = LayerT<half_bits>;
+using HeadH = HeadT<half_bits>;
 
 LinearH load_linear(const SafeTensors& st, const std::string& prefix);  // prefix.weight / prefix.bias (F16)
 LayerH load_layer(const SafeTensors& st, int layer, const std::string& block_prefix = "decoder.transformer_blocks.");
@@ -47,9 +39,12 @@ HeadH load_head(const SafeTensors& st, const std::string& dec_prefix = "decoder.
 // entries [c, -s, s, c]). Suffix tokens have id 0 (c = 1, s = 0).
 struct RopeTable {
     int L = 0;
-    std::vector<float> c, s;  // [L][24], FP16 values
+    std::vector<float> c, s;  // [L][pairs], FP16 values
+    int pairs = kRotPairs;    // rotated pairs per head (split-half over the first 2*pairs dims)
 };
 RopeTable rope_table(int nt, int ny, int nx);
+// axes 3: p-h3-image (time, y, x; 24 pairs). axes 2: MiniMax-H3-Image (y, x; 16 pairs = half the head).
+RopeTable image_rope_table(int ny, int nx, bool fp32 = true, int axes = 3);
 
 // Host ops (FP16 tensors as bits, row-major). Multithreaded over rows.
 H16 linear(const H16& x, int rows, const LinearH& w, bool round_before_bias = false);  // fp16(x W^T + b) or fp16(fp16(x W^T) + b)

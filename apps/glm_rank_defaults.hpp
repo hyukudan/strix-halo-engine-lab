@@ -14,6 +14,8 @@
 #include "glm/prefill/glm_pf_variants.hpp"
 #include "glm/prefill/glm_pf_capacity_policy.hpp"
 #include "strix/engine_profile.hpp"
+#include "strix/glm_pair_profile_table.hpp"
+#include "strix/session/speculation_default.hpp"
 
 #include <cstdint>
 #include <cstdlib>
@@ -52,6 +54,8 @@ inline const std::vector<EnvItem>& env_items() {
          "Guard: ordinary TP2 ownership, pipeline-capable prefill and at least two rows; auto declines to legacy", false, true},
         {"pf-aux-combine", "STRIX_GLM_PF_AUX_COMBINE", "1", "0",
          "Guard: exact MoE epilogue; off restores the separate auxiliary combine", false, true},
+        {"pf-in-token", "STRIX_GLM_PF_IN_TOKEN", "1", "0",
+         "Measurement: token-ordered MoE gate/up input transform (device plan; each x row read once, not 18x), logits and state bitwise on both ranks at 8K / 32K exact and FAST; 8K FAST TTFT 10.55 -> 10.21 s (median of 4 pairs) (=0 restores the tile-ordered transform)", false, true},
         {"pf-scratch", "STRIX_GLM_PF_SCRATCH", "auto", "full",
          "Guard: joint capacity admission; auto tries routed scratch after the original full layout", false, true},
         {"pf-attn-qwin", "STRIX_GLM_PF_ATTN_QWIN", "auto", "0",
@@ -92,7 +96,7 @@ inline const std::vector<EnvItem>& env_items() {
         {"pf-exact-moe-plan", "STRIX_GLM_PF_EXACTMOE_PLAN", "device", "host",
          "Measurement: exact MoE device plan (pairs/tiles/groups built on the GPU, byte-equal to the host plan; no route download or host sync per MoE call)", false, true},
         {"pf-exact-x", "STRIX_GLM_PF_EXACT_X", "auto", "0",
-         "Measurement: exact X3 prefill linear core (scalar activations, eight rows per wave) for calls >= 2048 rows (TM16 below), bitwise; 8K TTFT -14.3 % vs X2", true, true},
+         "Measurement: exact X3 prefill linear core (scalar activations, eight rows per wave) for calls >= 64 rows (TM16 below; the former floor was 2048: X3 is 0.44-0.62 of TM16 at 256-1024 rows), bitwise; 8K TTFT -14.3 % vs X2", true, true},
         {"pf-obar-v10", "STRIX_GLM_PF_OBAR", "10", "2",
          "Measurement: MLA o-bar v10 (v7 staging 2 k per batch, 18 KB LDS: 4 CTAs per WGP) bitwise == v7 / v5, 7.1 / 8.5 / 8.5 / 9.5 vs v7 7.9 / 9.3 / 9.3 / 10.3 us/row per DSA layer at t0 0 / 4096 / 12288 / 28672 (=7 restores v7, =5 v5)", false, true},
         {"pf-scores-v7", "STRIX_GLM_PF_SCORES", "7", "2",
@@ -105,8 +109,10 @@ inline const std::vector<EnvItem>& env_items() {
          "Measurement: indexer scores v3 same keys as v2, 5.3 vs 9.6 us/row per DSA layer at t0 28672 (=2 restores v2)", false, true},
         {"pf-select-v2", "STRIX_GLM_PF_SELECT", "2", "1",
          "Measurement: indexer select v2 same token lists as v1, 0.38 vs 0.99 us/row at t0 28672, 0.08 vs 0.50 at t0 4096", false, true},
-        {"pf-dense-rows-v3", "STRIX_GLM_PF_DENSE_ROWS", "3", "1",
-         "Measurement: prefill dense rows v3 groups the projections of one input (KDA f_a / g_a / b, DSA wk / gate / weights_proj) in one 128 x 64 launch, same ascending fmaf chain, bitwise == v2; grouped calls 6.77 vs 9.33 ms (KDA) and 6.62 vs 8.98 ms (DSA) at 8192 rows; TTFT 14.34 -> 14.29 s at 8,192 tokens (=2 restores v2, =1 v1)", false, true},
+        {"pf-dense-rows-v4", "STRIX_GLM_PF_DENSE_ROWS", "4", "1",
+         "Measurement: prefill dense rows v4 runs the exact projections on the shared FMA-rows core, same ascending fmaf chain, bitwise == v3; exact two-node prefill 12.68 / 12.69 s vs 12.81 s at 8,192 tokens, logits / state / token hashes equal (=3 restores v3). Dense rows v3 groups the projections of one input (KDA f_a / g_a / b, DSA wk / gate / weights_proj) in one 128 x 64 launch, same ascending fmaf chain, bitwise == v2; grouped calls 6.77 vs 9.33 ms (KDA) and 6.62 vs 8.98 ms (DSA) at 8192 rows; TTFT 14.34 -> 14.29 s at 8,192 tokens (=2 restores v2, =1 v1)", false, true},
+        {"pf-dense-form-auto", "STRIX_GLM_PF_DENSE_FORM", "0", "0",
+         "Guard: physical form of dense rows v4 (shared FMA-rows core), read only with STRIX_GLM_PF_DENSE_ROWS=4: 0 selects the form per shape, 1..7 force one form where the shape admits it (diagnostic; every form gives the same bytes)", false, true},
         {"max-rows-auto", "STRIX_GLM_MAX_ROWS_AUTO", "1", "0",
          "Measurement: exact 8192 vs 4096 rows, 8K TTFT -4 %, 32K 116.3 -> 109.9 s (-5.5 %); +7.3 GiB per rank", false, true},
         {"pf-staged", "STRIX_GLM_PF_STAGED", "1", "0",
@@ -128,7 +134,8 @@ inline const std::vector<EnvItem>& env_items() {
 // Options with no value (everything else the rank app accepts takes exactly one value).
 inline bool is_value_free(const std::string& a) {
     return a == "--g3-sweep" || a == "--pf-install-before-load" || a == "--pf-swap-moe" || a == "--mem-plan" ||
-           a == "--profile" || a == "--tf-check" || a == "--baseline" || a == "--print-effective-config";
+           a == "--profile" || a == "--tf-check" || a == "--baseline" || a == "--print-effective-config" ||
+           strix::session::speculation_opt_out_argument(a);
 }
 
 // Gate / measurement modes that install their own prefill path (prefill auto -> ref under them).
@@ -140,6 +147,7 @@ inline bool is_reference_gate(const std::string& a) {
 
 // The part of the command line the defaults depend on (args = argv[2..], i.e. without program and MODEL_DIR).
 struct Request {
+    strix::profile::Inputs product;
     std::uint32_t world = 2;
     std::optional<std::string> identity, prefill, decode_xch;
     std::optional<bool> mtp, mtp_spec;
@@ -150,11 +158,12 @@ struct Request {
     bool spec = false, g3 = false, decode_or_batch = false, mem_plan = false, reference_gate = false;
     unsigned idcheck = 0;
     std::string xch = "comm";
-    bool baseline_flag = false, print = false;
+    bool baseline_flag = false, print = false, no_mtp = false;  // no_mtp: shared speculation opt-out
 };
 
-inline Request scan(const std::vector<std::string>& args) {
+inline Request scan(std::vector<std::string> args) {
     Request r;
+    strix::profile::take_options(product_profile_engine, args, r.product);
     for (std::size_t i = 0; i < args.size(); ++i) {
         const std::string& a = args[i];
         if (is_reference_gate(a)) r.reference_gate = true;
@@ -163,6 +172,7 @@ inline Request scan(const std::vector<std::string>& args) {
             if (a == "--mem-plan") r.mem_plan = true;
             else if (a == "--baseline") r.baseline_flag = true;
             else if (a == "--print-effective-config") r.print = true;
+            else if (strix::session::speculation_opt_out_argument(a)) r.no_mtp = true;
             continue;
         }
         if (i + 1 >= args.size()) break;  // the app's own parser reports the missing value
@@ -221,6 +231,7 @@ struct Value {
 };
 
 struct Effective {
+    std::optional<strix::profile::Resolution> product;
     bool baseline = false;
     std::uint32_t world = 2;
     bool kv_shard = false, kv_shard_auto = false;
@@ -237,6 +248,19 @@ struct Effective {
 inline Effective resolve(const Request& r, const EnvGet& env, const ModelFacts& facts = {}) {
     Effective e;
     e.baseline = baseline_requested(r, env);
+    if (r.product.profile || r.product.allow_pending) {
+        auto inputs = r.product;
+        inputs.env = env;
+        e.product = strix::profile::resolve(product_profile_engine, inputs);
+        // Baseline vetoes profile additions; explicit environment values still win.
+        if (e.baseline) for (auto& entry : e.product->entries) {
+            if (strix::profile::applied(entry.status)) {
+                entry.value = std::string(entry.lever->off);
+                entry.status = strix::profile::Status::off;
+                entry.reason = "baseline";
+            }
+        }
+    }
     const char* src_b = e.baseline ? "baseline" : "default";
     // identity: STRIX_GLM_IDENTITY overrides --identity (engine rule)
     if (const char* v = env("STRIX_GLM_IDENTITY")) e.identity = {v, "explicit"};
@@ -250,6 +274,9 @@ inline Effective resolve(const Request& r, const EnvGet& env, const ModelFacts& 
         if (std::string(v) != "0" && std::string(v) != "1") throw std::invalid_argument("STRIX_GLM_MTP_SPEC=0|1");
         requested = std::string(v) == "1";
     }
+    // shared opt-out: plain decode unless an engine switch was given
+    if (!requested && (r.no_mtp || strix::session::speculation_environment_off(env(strix::session::speculation_environment))))
+        requested = false;
     const bool normal_decode = r.decode && !r.reference_gate && !r.mem_plan && r.idcheck == 0;
     const std::string requested_prefill = r.prefill.value_or(env("STRIX_GLM_PREFILL") ? env("STRIX_GLM_PREFILL") : "auto");
     const bool eligible = !env_is(env, "STRIX_GLM_SMOKE_HEAD", "1") && e.identity.value != "r1b-all" &&
@@ -319,6 +346,29 @@ inline bool max_rows_auto(const Effective& e) {
     return e.max_rows.source == "auto-8192" || e.max_rows.source == "auto-4096-memory";
 }
 
+// The serve entry point (strix-glm5-serve) resolves the SAME request as the CLI through scan / resolve above. These two
+// functions are everything serving changes, so the parity gate (tests/serve_cli_parity_tests.cpp) sees exactly what the
+// server runs: the speculation opt-out is forwarded as "--mtp-spec 0", and an automatic exchange-row choice starts at the
+// fallback (the server has no startup handshake that could size the larger one).
+inline std::vector<std::string> serve_request_args(std::vector<std::string> rank_args, bool serve_mtp) {
+    rank_args.insert(rank_args.end(), {"--decode", "1"});
+    if (!serve_mtp) {
+        rank_args.push_back("--mtp-spec");
+        rank_args.push_back("0");
+    }
+    return rank_args;
+}
+inline void serve_adjust(Effective& e) {
+    if (max_rows_auto(e)) e.max_rows = {std::to_string(kFallbackMaxRows), "auto-4096-serve"};
+}
+inline Effective resolve_serve(const std::vector<std::string>& rank_args, bool serve_mtp,
+                               const EnvGet& env, const ModelFacts& facts = {}) {
+    auto e = resolve(scan(serve_request_args(rank_args, serve_mtp)), env, facts);
+    // Serving always resolves a normal decode; its fixed row fallback replaces startup admission.
+    serve_adjust(e);
+    return e;
+}
+
 // The predicate dry-runs the load and prefill admissions, including their current margins.
 template<class Fits>
 inline void select_max_rows(Effective& e, Fits&& fits) {
@@ -338,6 +388,10 @@ inline void apply_env(const Effective& e, const std::function<void(const char*, 
         if (v.source == "explicit") continue;
         if (v.source == "baseline" || it.app_sets) setenv_if_unset(it.env, v.value.c_str());
     }
+    if (e.product) strix::profile::apply(*e.product, [&](const char* key, const char* value) {
+        setenv_if_unset(key, value);
+        return true;
+    });
 }
 
 inline std::string print(const Effective& e) {
@@ -345,6 +399,12 @@ inline std::string print(const Effective& e) {
     auto line = [&](const std::string& k, const Value& v) { s += "effective " + k + "=" + v.value + " (" + v.source + ")\n"; };
     s += std::string("effective baseline=") + (e.baseline ? "1" : "0") + "\n";
     line("identity", e.identity);
+    {  // STRIX_GLM_MODEL_FORMAT (the load converts / refuses; inspection only reports it)
+        const char* f = std::getenv("STRIX_GLM_MODEL_FORMAT");
+        const bool i4 = f != nullptr && std::string(f) == "fast_i4";
+        s += std::string("effective model-format=") + (i4 ? "fast_i4 (identity glm-fast-i4: routed INT4 g64 W4A4 prefill / W4A16 decode, lossy; exact identities refused)"
+                                                         : "exl3 (default)") + "\n";
+    }
     if (e.kv_shard_auto) s += "effective kv-shard-policy=auto (pending calibrated load + unified prefill admission and rank vote)\n";
     if (e.kv_shard) s += std::string("effective kv-shard=") + kvshard::numerical_identity + " (draft; owned pools; bounded temporary prefill)\n";
     line("mtp", e.mtp);
@@ -377,12 +437,15 @@ inline std::string print(const Effective& e) {
         std::string resolved;
         if (const auto* p = strix::glm::pf::pf_variant_find(it.env)) {
             const unsigned ver = strix::glm::pf::pf_variant_parse(*p, v.value.c_str());
-            resolved = "; resolved v" + std::to_string(ver);
+            const bool form = std::string_view(it.env) == "STRIX_GLM_PF_DENSE_FORM";
+            resolved = (form ? "; resolved form " : "; resolved v") + std::to_string(ver);
+            if (form && ver == 0U) resolved += " (automatic per shape)";
             if (std::string_view(it.env) == "STRIX_GLM_PF_OBAR" && (ver == 5U || ver == 7U || ver == 10U))
                 resolved += ", heads 64 runs v2";
         }
         s += std::string("effective env ") + it.env + "=" + v.value + " (" + v.source + ", item " + it.name + resolved + ")\n";
     }
+    if (e.product) s += e.product->describe();
     return s;
 }
 

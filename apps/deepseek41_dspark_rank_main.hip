@@ -1,3 +1,5 @@
+#include "strix/device/hip_gate.hpp"
+#include "strix/dist/open_transport.hpp"
 // One rank of the two-node deepseek41 decode with DSpark speculative drafting and verify windows, or both ranks in
 // one process over the in-memory transport (--transport emulate, trimmed models).
 //   strix-deepseek41-dspark-rank MODEL.gguf DRAFT.gguf --rank R --transport usb4:DEV,DEV,... | usb4auto | usb4gpu | tcp-listen:PORT |
@@ -15,6 +17,7 @@
 // Draft placement: split = both ranks draft, the drafter's head split by vocabulary (8-byte candidate exchange per
 // Markov step, the rest replicated); rank0 = rank 0 drafts alone and sends the window (k and the drafts) to rank 1.
 #include "strix/deepseek41_device_forward.hpp"
+#include "strix/hip_check.hpp"
 #include "strix/dist/communicator.hpp"
 #include "strix/dist/gpu_direct.hpp"
 #include "strix/ds41_dspark_driver.hpp"
@@ -47,7 +50,7 @@ using clock_type = std::chrono::steady_clock;
 double since(clock_type::time_point t) { return std::chrono::duration<double>(clock_type::now() - t).count(); }
 
 void check(hipError_t e, const char* what) {
-    if (e != hipSuccess) throw std::runtime_error(std::string("dspark rank: ") + what + ": " + hipGetErrorString(e));
+    ::strix::hip_check_prefixed("dspark rank: ", e, what);
 }
 
 struct Args {
@@ -67,46 +70,6 @@ std::vector<std::uint32_t> parse_list(const std::string& s) {
     return out;
 }
 
-// usb4gpu: the device exchange (GPU-direct streams) built next to the host-path control transport (null: host path).
-std::unique_ptr<strix::dist::DeviceExchange> gpu_direct;
-
-std::unique_ptr<strix::dist::Transport> open_transport(const std::string& spec, std::uint32_t rank, unsigned timeout) {
-    const std::chrono::seconds limit(timeout);
-    const auto colon = spec.find(':');
-    const std::string kind = spec.substr(0, colon), rest = colon == std::string::npos ? "" : spec.substr(colon + 1);
-    if (kind == "tcp-listen") return strix::dist::tcp_listen(static_cast<std::uint16_t>(std::stoul(rest)), limit);
-    if (kind == "tcp-connect") {
-        const auto c2 = rest.rfind(':');
-        return strix::dist::tcp_connect(rest.substr(0, c2), static_cast<std::uint16_t>(std::stoul(rest.substr(c2 + 1))), limit);
-    }
-    if (kind == "usb4") {
-        std::vector<std::string> devices;
-        std::stringstream ss(rest);
-        for (std::string d; std::getline(ss, d, ',');) devices.push_back(d);
-        return strix::dist::usb4_host(devices);
-    }
-    if (kind == "usb4auto" || kind == "usb4gpu") {  // usb4gpu: GPU-direct exchanges over the gpu_direct streams
-        strix::dist::Usb4AutoOptions o;
-        o.rank = rank;
-        o.timeout = limit;
-        strix::dist::Usb4Topology topology;
-        auto t = strix::dist::usb4_host_auto(o, &topology);
-        std::printf("usb4 topology: %s\n", topology.receipt().c_str());
-        if (kind == "usb4auto") return t;
-        std::string why;
-        if (strix::dist::usb4_gpu_direct_streams(o, *t, &why) == 0U) {  // both ranks agree from the same exchanged counts
-            std::printf("gpu-direct unavailable (%s): host path only\n", why.c_str());
-            return t;
-        }
-        std::string receipt;
-        gpu_direct = strix::dist::usb4_gpu_direct(o, topology, *t, {}, &receipt);
-        std::printf("usb4 %s\n", receipt.c_str());
-        return t;
-    }
-    throw std::invalid_argument("unknown or unavailable transport " + spec);
-}
-
-// Device scratch for the drafter's input rows and the window packet.
 struct Scratch {
     float* main_hidden = nullptr;  // [128][15360]
     std::uint32_t* packet = nullptr;  // [2][16]: own, peer
@@ -253,9 +216,10 @@ void run_dump(const Args& a, strix::deepseek41::DeviceForward& fwd, bool write) 
     (void)hipFree(rows_dev);
 }
 
-void run_rank(const Args& a, std::uint32_t rank, std::unique_ptr<strix::dist::Transport> transport, bool print) {
+void run_rank(const Args& a, std::uint32_t rank, std::unique_ptr<strix::dist::Transport> transport, bool print,
+              std::unique_ptr<strix::dist::DeviceExchange> direct = nullptr) {
     const auto t_start = clock_type::now();
-    strix::dist::Communicator comm(strix::dist::Group{rank, 2U, 1U, 0x64733432ULL}, std::move(transport), std::move(gpu_direct), 512U << 10U);
+    strix::dist::Communicator comm(strix::dist::Group{rank, 2U, 1U, 0x64733432ULL}, std::move(transport), std::move(direct), 512U << 10U);
     const bool spec = a.mode == "spec", oracle = a.mode == "oracle";
     const auto reference = a.reference.empty() ? std::vector<std::uint32_t>{} : parse_list(a.reference);
     const auto oracle_rows = parse_list(a.oracle_rows);
@@ -778,6 +742,10 @@ void run_single(const Args& a) {
 }  // namespace
 
 int main(int argc, char** argv) try {
+    // Start gate: resolves the declared device (--devices FILE, --device-id ID, STRIX_DEVICES, STRIX_DEVICE), refuses an
+    // excluded or undeclared one and prints the "device:" receipt line. Without a declaration the single integrated
+    // GPU of a node keeps working (declared=implicit).
+    strix::device::bind_hip_main(argc, argv);
     Args a;
     for (int i = 1; i < argc; ++i) {
         const std::string s = argv[i];
@@ -844,11 +812,12 @@ int main(int argc, char** argv) try {
     }
     // A blocked open() of a stream on a dead link would hold this node (and the peer) indefinitely.
     ::alarm(a.connect_timeout);
-    auto transport = open_transport(a.transport, a.rank, a.connect_timeout);
+    auto opened = strix::dist::open_pair(a.transport, a.rank, {std::chrono::seconds(a.connect_timeout), strix::dist::all_transport_capabilities, true});
+    auto transport = std::move(opened.host);
     ::alarm(0);
     std::printf("connected (%s)\n", transport->name().c_str());
     std::fflush(stdout);
-    run_rank(a, a.rank, std::move(transport), true);
+    run_rank(a, a.rank, std::move(transport), true, std::move(opened.direct));
     return 0;
 } catch (const std::exception& e) {
     std::cerr << "error: " << e.what() << '\n';

@@ -14,7 +14,8 @@ template<class StreamType> struct Ds41ExchangeRuntime {
     using Stream = StreamType;
     using Event = std::nullptr_t;
     Stream stream;
-    // No lease fences: the producer, exchange and consumer share the old stream.
+    // Legacy ordering belongs to Communicator. Prefill ChannelCommunicator
+    // supplies its own device readiness and physical-slot lease fences.
     void record_source(Event, Stream, bool) {}
     void record_remote(Event, Stream) {}
 };

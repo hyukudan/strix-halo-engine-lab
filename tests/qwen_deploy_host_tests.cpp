@@ -10,6 +10,33 @@ static dp::DeviceFacts device(unsigned gib) {
 }
 int main() {
     try {
+        constexpr std::uint64_t gib = 1ULL<<30;
+        auto node = device(128); node.mem_total_bytes = node.mem_free_bytes = 1172*gib/10;
+        dp::Spec automatic; automatic.context = 8192;
+        dp::Footprint http; http.weights=80*gib; http.kv_total=gib; http.workspace=9*gib;
+        http.elastic_extra.emplace_back("session_ram",8*gib);
+        strix::qwen::deployment::Provider batch(http,8192,4,"single","default",{},2*gib,gib,gib);
+        const auto four=dp::resolve(automatic,{node},batch);
+        check(!four.refused && four.chosen.slots==4,"KV-first admits native HTTP stacks before session RAM");
+        check(four.ranks[0].kv_bytes==4*gib,"only persistent state is classified as KV; scratch and metadata stay separate");
+        check(four.ranks[0].footprint.extra.back().first=="session_ram" &&
+              four.ranks[0].required_bytes<=four.ranks[0].budget_bytes,"elastic session preserves safety margin");
+        auto tight=node; tight.mem_free_bytes=100*gib;
+        const auto fewer=dp::resolve(automatic,{tight},batch);
+        check(!fewer.refused && fewer.chosen.slots==1 && fewer.ranks[0].footprint.extra.back().second==gib,
+              "session shrinks after slot search, never hides KV overcommit");
+        automatic.slots=4;
+        check(dp::resolve(automatic,{tight},batch).refused,"pinned slots never shrink");
+        automatic.slots=0;
+        dp::Footprint cli; cli.weights=103*gib; cli.kv_total=gib; cli.workspace=gib;
+        cli.elastic_extra.emplace_back("session_ram",8*gib);
+        strix::qwen::deployment::Provider cli_auto(cli,8192,1,"single","default");
+        const auto cli_fit=dp::resolve(automatic,{node},cli_auto);
+        check(!cli_fit.refused && cli_fit.ranks[0].footprint.extra.back().second==node.mem_free_bytes-113*gib,
+              "default CLI session budget fits remaining measured bytes");
+        cli.elastic_extra.clear(); cli.extra.emplace_back("session_ram",8*gib);
+        strix::qwen::deployment::Provider cli_pin(cli,8192,1,"single","default");
+        check(dp::resolve(automatic,{node},cli_pin).refused,"explicit session budget never shrinks");
         dp::Footprint f; f.weights=20ULL<<30; f.kv_total=2ULL<<30; f.workspace=1ULL<<30;
         strix::qwen::deployment::Provider single(f,8192,1,"single","default");
         dp::Spec s; s.context=8192; s.slots=1;

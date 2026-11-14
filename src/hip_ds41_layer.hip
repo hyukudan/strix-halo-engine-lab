@@ -1,5 +1,12 @@
+#include "strix/hip_check.hpp"
+#include "core/f16_dense_q8a8.hpp"  // FAST lever ds41-dense-f16-v1 (shared policy dense-q8a8-f16-v1)
+#include "ds41_dense_adapter.hpp"  // shared tiled core route (STRIX_DS41_PF_CORE=1)
+#include "strix/env_flags.hpp"
+#include "strix/hip_argmax_core.hpp"
 #include "strix/ds41_prefill_tuning.hpp"
+#include "strix/ds41_fast_profile.hpp"
 #include "strix/hip_ds41_layer.hpp"
+#include "strix/hip_ds41_prefill.hpp"
 #include "strix/ds41_exact_flags.hpp"
 #include "strix/dist/staged_ready.hpp"
 #include "strix/hip_ds41_f16_rows.hpp"
@@ -16,6 +23,7 @@
 #include <type_traits>
 #include <atomic>
 #include <cstdint>
+#include <cstring>
 #include <cstdio>
 #include <cstdlib>
 #include <map>
@@ -32,9 +40,7 @@
 namespace strix::ds41 {
 namespace {
 
-void check(hipError_t e, const char* what) {
-    if (e != hipSuccess) throw std::runtime_error(std::string(what) + ": " + hipGetErrorString(e));
-}
+using strix::hip_check;
 void require(bool ok, const char* message) {
     if (!ok) throw std::invalid_argument(message);
 }
@@ -1745,10 +1751,7 @@ __global__ __launch_bounds__(wave * f16_waves) void f16_rows_wide_kernel(F16Rows
         }
 }
 
-bool f16_rows_wide_enabled = [] {
-    const char* e = std::getenv("STRIX_DS41_F16_WIDE");
-    return !(e && e[0] == '0');
-}();
+bool f16_rows_wide_enabled = strix::envcfg::flag("STRIX_DS41_F16_WIDE", true);
 // Many rows: lanes stay the lane classes of the declared lane dot (lane l: elements l, l + 32, ... in
 // ascending order, then the butterfly), and each wave keeps the class sums of 16 rows x 6 outputs, so a
 // weight value is used by 16 rows and an activation value by 6 outputs; a block's 8 waves take 48
@@ -2061,7 +2064,8 @@ constexpr unsigned argmax_threads = 256, argmax_span = 4096;
 
 __device__ inline ArgmaxCandidate better(const ArgmaxCandidate& a, const ArgmaxCandidate& b) {
     // Both usable: larger value, then lower index. Unusable entries (index ~0U, value -inf) never win.
-    ArgmaxCandidate o = (b.value > a.value || (b.value == a.value && b.index < a.index)) ? b : a;
+    // Shared first-max order (R2-07); identical to the float compare for finite/-inf values.
+    ArgmaxCandidate o = strix::argmax::better(b.value, b.index, a.value, a.index) ? b : a;
     o.finite = a.finite & b.finite;
     return o;
 }
@@ -2080,12 +2084,8 @@ __global__ __launch_bounds__(argmax_threads) void argmax_partial_kernel(const fl
         if (!__builtin_isfinite(v)) { best.finite = 0; continue; }
         best = better(best, ArgmaxCandidate{v, first_index + i, 1});
     }
-    s[threadIdx.x] = best;
-    __syncthreads();
-    for (unsigned d = argmax_threads / 2; d; d >>= 1) {
-        if (threadIdx.x < d) s[threadIdx.x] = better(s[threadIdx.x], s[threadIdx.x + d]);
-        __syncthreads();
-    }
+    strix::argmax::block_reduce<argmax_threads>(
+        s, threadIdx.x, best, [](const ArgmaxCandidate& a, const ArgmaxCandidate& b) { return better(a, b); });
     if (threadIdx.x == 0) partial[static_cast<std::size_t>(r) * blocks + b] = s[0];
 }
 
@@ -2099,12 +2099,8 @@ __global__ __launch_bounds__(argmax_threads) void argmax_final_kernel(const Argm
         const ArgmaxCandidate* q = partial + static_cast<std::size_t>(r) * blocks + i;
         best = better(best, ArgmaxCandidate{q->value, q->index, q->finite});  // field loads: no private copy
     }
-    s[threadIdx.x] = best;
-    __syncthreads();
-    for (unsigned d = argmax_threads / 2; d; d >>= 1) {
-        if (threadIdx.x < d) s[threadIdx.x] = better(s[threadIdx.x], s[threadIdx.x + d]);
-        __syncthreads();
-    }
+    strix::argmax::block_reduce<argmax_threads>(
+        s, threadIdx.x, best, [](const ArgmaxCandidate& a, const ArgmaxCandidate& b) { return better(a, b); });
     if (threadIdx.x == 0) out[r] = s[0];
 }
 
@@ -2182,7 +2178,7 @@ void enqueue_hc_mixes(const HcMixView& v, void* stream) {
                        as_stream(stream), v.stream, v.fn, v.hidden, v.rows, chunks, v.partial);
     hipLaunchKernelGGL(hc_mix_final_kernel, dim3(v.rows), dim3(wave), 0, as_stream(stream), v.partial, v.base, v.scale, n, chunks,
                        v.iters, v.hc_eps, v.norm_eps, v.out);
-    check(hipGetLastError(), "hc mixes launch");
+    hip_check(hipGetLastError(), "hc mixes launch");
 }
 
 void enqueue_hc_collapse(const float* hc_stream, const HcMix* mixes, std::uint32_t rows, std::uint32_t hidden, float* out,
@@ -2190,7 +2186,7 @@ void enqueue_hc_collapse(const float* hc_stream, const HcMix* mixes, std::uint32
     const auto total = static_cast<unsigned long long>(rows) * hidden;
     hipLaunchKernelGGL(hc_collapse_kernel, dim3(blocks_for(total, 256)), dim3(256), 0, as_stream(stream), hc_stream, mixes,
                        hidden, total, out);
-    check(hipGetLastError(), "hc collapse launch");
+    hip_check(hipGetLastError(), "hc collapse launch");
 }
 
 void enqueue_hc_expand(const float* sub, const float* residual, const HcMix* mixes, std::uint32_t rows, std::uint32_t hidden,
@@ -2200,7 +2196,7 @@ void enqueue_hc_expand(const float* sub, const float* residual, const HcMix* mix
     const auto total = static_cast<unsigned long long>(rows) * hc_copies * hidden;
     hipLaunchKernelGGL(hc_expand_kernel, dim3(blocks_for(total, 256)), dim3(256), 0, as_stream(stream), sub, residual, mixes,
                        hidden, total, out);
-    check(hipGetLastError(), "hc expand launch");
+    hip_check(hipGetLastError(), "hc expand launch");
 }
 
 std::size_t hc_site_counter_count(std::uint32_t rows) { return rows; }
@@ -2222,7 +2218,7 @@ void enqueue_hc_site(const HcSiteView& v, void* stream) {
                                      !overlap(v.sub, stream_bytes / hc_copies, v.collapse_out, stream_bytes / hc_copies))),
             "hc site view");
     // STRIX_DS41_HC_SITE_FAST=0: the previous site kernel (and its one-launch row limit); same bits either way.
-    static const bool fast_env = [] { const char* e = std::getenv("STRIX_DS41_HC_SITE_FAST"); return !(e && e[0] == '0'); }();
+    static const bool fast_env = strix::envcfg::flag("STRIX_DS41_HC_SITE_FAST", true);
     const bool fast = v.form == 2 || (v.form == 0 && fast_env);
     const bool one = v.launches == 1 ||
                      (v.launches == 0 && v.rows <= (fast ? hc_site_fast_one_launch_rows : hc_site_one_launch_rows));
@@ -2259,7 +2255,7 @@ void enqueue_hc_site(const HcSiteView& v, void* stream) {
             const unsigned gc = g < 4U ? g : 4U, ctiles = (v.rows + gc - 1U) / gc;
             const auto kernel = gc == 1 ? hc_site_collapse_kernel<1> : gc == 2 ? hc_site_collapse_kernel<2> : hc_site_collapse_kernel<4>;
             hipLaunchKernelGGL(kernel, dim3(mix_chunks / hc_copies * ctiles), dim3(site_threads), 0, as_stream(stream), v, mix_chunks);
-            check(hipGetLastError(), "hc site collapse launch");
+            hip_check(hipGetLastError(), "hc site collapse launch");
             return;
         }
         const unsigned partial_blocks = v.fn || v.sub ? mix_chunks * tiles : 0U;
@@ -2272,7 +2268,7 @@ void enqueue_hc_site(const HcSiteView& v, void* stream) {
         hipLaunchKernelGGL(kernel, dim3(partial_blocks + norm_blocks), dim3(site_threads), 0, as_stream(stream), v, mix_chunks,
                            partial_blocks, norm_chunks, part);
     }
-    check(hipGetLastError(), "hc site launch");
+    hip_check(hipGetLastError(), "hc site launch");
 }
 
 void enqueue_norm(const NormView& v, void* stream) {
@@ -2295,7 +2291,7 @@ void enqueue_norm(const NormView& v, void* stream) {
         hipLaunchKernelGGL(norm_ilp_kernel, dim3(v.rows), dim3(wave * chunks), 0, as_stream(stream), v);
     else
         hipLaunchKernelGGL(norm_kernel, dim3(v.rows), dim3(wave * chunks), 0, as_stream(stream), v);
-    check(hipGetLastError(), "norm launch");
+    hip_check(hipGetLastError(), "norm launch");
 }
 
 void enqueue_rms_norm(const float* x, const float* weight, std::uint32_t rows, std::uint32_t n, std::uint32_t stride, float eps,
@@ -2310,14 +2306,14 @@ void enqueue_inverse_rope_a8(const InverseRopeA8View& v, void* stream) {
     require(v.o && v.rows && n % 32U == 0 && v.head_dim >= 2U * v.pairs && v.rope_cos && v.rope_sin && v.positions && v.codes &&
                 v.deltas && v.sums, "inverse RoPE + A8 view");
     hipLaunchKernelGGL(inverse_rope_a8_kernel, dim3((n / 32U + 7U) / 8U, v.rows), dim3(256), 0, as_stream(stream), v);
-    check(hipGetLastError(), "inverse RoPE + A8 launch");
+    hip_check(hipGetLastError(), "inverse RoPE + A8 launch");
 }
 
 void enqueue_rope(const RopeView& v, void* stream) {
     require(v.x && v.cos && v.sin && v.positions && v.rows && v.vectors && v.pairs, "RoPE view");
     require(v.offset % 2U == 0 && v.row_stride % 2U == 0 && v.vector_stride % 2U == 0, "RoPE view alignment");
     hipLaunchKernelGGL(rope_kernel, dim3((v.vectors * v.pairs + 255U) / 256U, v.rows), dim3(256), 0, as_stream(stream), v);
-    check(hipGetLastError(), "RoPE launch");
+    hip_check(hipGetLastError(), "RoPE launch");
 }
 
 template <unsigned MaxRows, unsigned W>
@@ -2352,7 +2348,7 @@ void enqueue_fp8_a8(const Q8A8View& view, hipStream_t q) {
     require(view.scales && !view.planar && view.rows <= 16U, "native FP8 x A8 site: scales, interleaved rows, 1..16 rows");
     if (view.rows > max_rows) {
         launch_fp8_a8<16, 1>(view, q);
-        check(hipGetLastError(), "native FP8 x A8 sixteen-row launch");
+        hip_check(hipGetLastError(), "native FP8 x A8 sixteen-row launch");
         return;
     }
     // Outputs per wave (1, 2 or 4; same bits): STRIX_DS41_FP8_W, default 1 at 1-2 rows (one contiguous row stream per
@@ -2365,7 +2361,7 @@ void enqueue_fp8_a8(const Q8A8View& view, hipStream_t q) {
     else if (view.rows == 2) { if (w4) launch_fp8_a8<2, 4>(view, q); else if (w2) launch_fp8_a8<2, 2>(view, q); else launch_fp8_a8<2, 1>(view, q); }
     else if (view.rows <= 4) { if (w4) launch_fp8_a8<4, 4>(view, q); else if (w2) launch_fp8_a8<4, 2>(view, q); else launch_fp8_a8<4, 1>(view, q); }
     else { if (w2) launch_fp8_a8<8, 2>(view, q); else launch_fp8_a8<8, 1>(view, q); }
-    check(hipGetLastError(), "native FP8 x A8 launch");
+    hip_check(hipGetLastError(), "native FP8 x A8 launch");
 }
 }  // namespace
 
@@ -2376,7 +2372,7 @@ void enqueue_swiglu_a8(const float* gate, const float* up, std::uint32_t rows, s
     require(gate && up && codes && deltas && sums && rows && width && width % 32U == 0, "SwiGLU + A8 view");
     const unsigned groups = rows * (width / 32U);
     hipLaunchKernelGGL(swiglu_a8_kernel, dim3((groups + 7U) / 8U), dim3(256), 0, as_stream(stream), gate, up, groups, limit, codes, deltas, sums);
-    check(hipGetLastError(), "SwiGLU + A8 launch");
+    hip_check(hipGetLastError(), "SwiGLU + A8 launch");
 }
 
 static Q8A8View checked_q8_0_a8(const Q8A8View& v) {
@@ -2421,7 +2417,7 @@ void enqueue_q8_0_a8(const Q8A8View& v, void* stream) {
         Q8A8View plain = view;
         plain.a8_codes = nullptr;
         launch_q8_0_a8<16, 1>(plain, as_stream(stream));
-        check(hipGetLastError(), "Q8_0 x A8 sixteen-row launch");
+        hip_check(hipGetLastError(), "Q8_0 x A8 sixteen-row launch");
         if (v.a8_codes) enqueue_quantize_a8(v.out, v.count, v.rows, v.a8_codes, v.a8_deltas, v.a8_sums, stream);
         return;
     }
@@ -2471,7 +2467,7 @@ void enqueue_q8_0_a8(const Q8A8View& v, void* stream) {
         else hipLaunchKernelGGL(HIP_KERNEL_NAME(q8_0_a8_staged_kernel<0>), grid, block, 0, q, view);
     }
     else launch_q8_0_a8<8, 1>(view, q);
-    check(hipGetLastError(), "Q8_0 x A8 launch");
+    hip_check(hipGetLastError(), "Q8_0 x A8 launch");
 }
 
 namespace {
@@ -2526,7 +2522,7 @@ bool enqueue_q8_0_a8_ready(const Q8A8View& v, dist::ProducerStage stage, void* s
     else if (view.packed == 4U) launch_q8_ready_rows<4>(view, stage, q);
     else if (view.packed == 5U) launch_q8_ready_rows<5>(view, stage, q);
     else launch_q8_ready_rows<6>(view, stage, q);
-    check(hipGetLastError(), "Q8 x A8 ready epilogue launch");
+    hip_check(hipGetLastError(), "Q8 x A8 ready epilogue launch");
     return true;
 }
 
@@ -2552,7 +2548,7 @@ void enqueue_q8_0_a8_pair(const Q8A8View& a, const Q8A8View& b, void* stream) {
     if (x.rows == 1) { if (w4) launch_q8_0_a8_pair<1, 4>(x, y, q); else if (w2) launch_q8_0_a8_pair<1, 2>(x, y, q); else launch_q8_0_a8_pair<1, 1>(x, y, q); }
     else if (x.rows == 2) { if (w4) launch_q8_0_a8_pair<2, 4>(x, y, q); else if (w2) launch_q8_0_a8_pair<2, 2>(x, y, q); else launch_q8_0_a8_pair<2, 1>(x, y, q); }
     else { if (w2) launch_q8_0_a8_pair<4, 2>(x, y, q); else launch_q8_0_a8_pair<4, 1>(x, y, q); }
-    check(hipGetLastError(), "Q8_0 x A8 pair launch");
+    hip_check(hipGetLastError(), "Q8_0 x A8 pair launch");
 }
 
 void enqueue_f16_rows(const F16RowsView& v, void* stream) {
@@ -2570,7 +2566,7 @@ void enqueue_f16_rows(const F16RowsView& v, void* stream) {
     }
     if (v.rows <= max_rows) {  // decode rows: lanes kernel, else the wide or the plain site kernel (same bits)
         // Same bits, 16-byte loads (hip_ds41_f16_rows.hip); STRIX_DS41_F16_LANES=0 keeps this kernel.
-        static const bool lanes = [] { const char* e = std::getenv("STRIX_DS41_F16_LANES"); return !(e && e[0] == '0'); }();
+        static const bool lanes = strix::envcfg::flag("STRIX_DS41_F16_LANES", true);
         if (lanes && f16_rows_lanes_supported(v)) { enqueue_f16_rows_lanes(v, stream); return; }
         // DSpark's wide-load kernel (same bits; superseded by the lanes kernel) when the lanes are switched off
         if (f16_rows_wide_enabled && v.width % f16_chunk == 0U && v.x_stride % 4U == 0U) {  // same bits, more bandwidth
@@ -2580,11 +2576,11 @@ void enqueue_f16_rows(const F16RowsView& v, void* stream) {
             else
                 hipLaunchKernelGGL(f16_rows_wide_kernel<1>, dim3((v.count + f16_waves - 1U) / f16_waves), dim3(wave * f16_waves), 0,
                                    as_stream(stream), v);
-            check(hipGetLastError(), "F16 rows launch");
+            hip_check(hipGetLastError(), "F16 rows launch");
             return;
         }
         hipLaunchKernelGGL(f16_rows_kernel, dim3((v.count + 7U) / 8U), dim3(256), 0, as_stream(stream), v);
-        check(hipGetLastError(), "F16 rows launch");
+        hip_check(hipGetLastError(), "F16 rows launch");
         return;
     }
     // prefill rows: the LDS-tiled kernel, else the many-rows kernel (same lane classes, same bits)
@@ -2607,7 +2603,7 @@ void enqueue_f16_rows(const F16RowsView& v, void* stream) {
     } else
         hipLaunchKernelGGL(f16_many_kernel, dim3((v.count + f16_block_outputs - 1U) / f16_block_outputs, (v.rows + f16_tile_rows - 1U) / f16_tile_rows),
                            dim3(256), 0, as_stream(stream), v);
-    check(hipGetLastError(), "F16 rows launch");
+    hip_check(hipGetLastError(), "F16 rows launch");
 }
 
 // One flag word per (device, stream), allocated on first use and kept. The caller holds the entry's mutex from the reset
@@ -2628,10 +2624,10 @@ static EngramWideFlags& engram_wide_flags() {
 static EngramWideFlag& engram_wide_flag(void* stream) {
     EngramWideFlags& all = engram_wide_flags();
     int device = 0;
-    check(hipGetDevice(&device), "Engram flag device");
+    hip_check(hipGetDevice(&device), "Engram flag device");
     const std::lock_guard<std::mutex> lock(all.mu);
     EngramWideFlag& f = all.flags[{device, stream}];
-    if (!f.p) check(hipMalloc(reinterpret_cast<void**>(&f.p), sizeof(unsigned)), "Engram flag alloc");
+    if (!f.p) hip_check(hipMalloc(reinterpret_cast<void**>(&f.p), sizeof(unsigned)), "Engram flag alloc");
     return f;
 }
 
@@ -2656,7 +2652,7 @@ void enqueue_engram_f16_pf(const F16RowsView& v, void* stream) {
     bool fma = !(f && f[0] == '0') && as_stream(stream) != hipStreamPerThread;
     if (fma) {
         hipStreamCaptureStatus capture = hipStreamCaptureStatusNone;
-        check(hipStreamIsCapturing(as_stream(stream), &capture), "Engram capture status");
+        hip_check(hipStreamIsCapturing(as_stream(stream), &capture), "Engram capture status");
         fma = capture == hipStreamCaptureStatusNone;
     }
     // Tile unset = auto: 48 x 64 whenever the fused form can run (measured up to 3.8 % faster than 48 x 32 at 1056 and 2048
@@ -2670,7 +2666,7 @@ void enqueue_engram_f16_pf(const F16RowsView& v, void* stream) {
         EngramWideFlag& w = engram_wide_flag(stream);
         submit = std::unique_lock<std::mutex>(w.submit);
         flag = w.p;
-        check(hipMemsetAsync(flag, 0, sizeof(unsigned), as_stream(stream)), "Engram x scan reset");
+        hip_check(hipMemsetAsync(flag, 0, sizeof(unsigned), as_stream(stream)), "Engram x scan reset");
         hipLaunchKernelGGL(engram_x_exact_scan, dim3(256), dim3(256), 0, as_stream(stream), v, flag);
     }
     const auto launch = [&](auto fused) {
@@ -2695,7 +2691,7 @@ void enqueue_engram_f16_pf(const F16RowsView& v, void* stream) {
     };
     if (fma) launch(std::true_type{});
     launch(std::false_type{});
-    check(hipGetLastError(), "Engram F16 prefetch tile launch");
+    hip_check(hipGetLastError(), "Engram F16 prefetch tile launch");
 }
 
 #if STRIX_DS41_ENGRAM_DIAG
@@ -2703,7 +2699,7 @@ void enqueue_engram_f16_pf(const F16RowsView& v, void* stream) {
 bool engram_f16_pf_x_exact(const F16RowsView& v) {
     require(engram_f16_pf_supported(v), "Engram F16 prefetch tile view");
     unsigned* flag = nullptr;
-    check(hipMalloc(reinterpret_cast<void**>(&flag), sizeof(unsigned)), "Engram scan flag");
+    hip_check(hipMalloc(reinterpret_cast<void**>(&flag), sizeof(unsigned)), "Engram scan flag");
     unsigned h = 1U;
     hipError_t e = hipMemset(flag, 0, sizeof(unsigned));
     if (e == hipSuccess) {
@@ -2712,7 +2708,7 @@ bool engram_f16_pf_x_exact(const F16RowsView& v) {
     }
     if (e == hipSuccess) e = hipMemcpy(&h, flag, sizeof(unsigned), hipMemcpyDeviceToHost);
     (void)hipFree(flag);
-    check(e, "Engram scan");
+    hip_check(e, "Engram scan");
     return h == 0U;
 }
 
@@ -2721,13 +2717,13 @@ void enqueue_engram_f16_pf_fused_unchecked(const F16RowsView& v, void* stream) {
     const unsigned row_tiles = (v.rows + 47U) / 48U, output_tiles = (v.count + 63U) / 64U;
     hipLaunchKernelGGL((f16_tiled_pf_kernel<48, 64, 8, 6, true>), dim3(row_tiles * output_tiles), dim3(48U / 6U * (64U / 16U) * 32U),
                        0, as_stream(stream), v, row_tiles, output_tiles, static_cast<const unsigned*>(nullptr));
-    check(hipGetLastError(), "Engram F16 fused launch");
+    hip_check(hipGetLastError(), "Engram F16 fused launch");
 }
 
 int engram_f16_pf_stream_flag(void* stream) {
     EngramWideFlags& all = engram_wide_flags();
     int device = 0;
-    check(hipGetDevice(&device), "Engram flag device");
+    hip_check(hipGetDevice(&device), "Engram flag device");
     unsigned* p = nullptr;
     {
         const std::lock_guard<std::mutex> lock(all.mu);
@@ -2735,9 +2731,9 @@ int engram_f16_pf_stream_flag(void* stream) {
         if (it == all.flags.end()) return -1;
         p = it->second.p;
     }
-    check(hipStreamSynchronize(as_stream(stream)), "Engram flag sync");
+    hip_check(hipStreamSynchronize(as_stream(stream)), "Engram flag sync");
     unsigned h = 0U;
-    check(hipMemcpy(&h, p, sizeof(unsigned), hipMemcpyDeviceToHost), "Engram flag read");
+    hip_check(hipMemcpy(&h, p, sizeof(unsigned), hipMemcpyDeviceToHost), "Engram flag read");
     return static_cast<int>(h);
 }
 #endif
@@ -2757,8 +2753,8 @@ void enqueue_engram_f16_rows(const F16RowsView& v, void* stream) {
 
 void enqueue_f16_rows_pair(const F16RowsView& a, const F16RowsView& b, void* stream) {
     // STRIX_DS41_F16_PAIR (on by default since P16, =0 off): one launch when both views take the lanes kernels (hip_ds41_f16_rows.hip)
-    static const bool pair = [] { const char* e = std::getenv("STRIX_DS41_F16_PAIR"); return !(e && e[0] == '0'); }();
-    static const bool lanes = [] { const char* e = std::getenv("STRIX_DS41_F16_LANES"); return !(e && e[0] == '0'); }();
+    static const bool pair = strix::envcfg::flag("STRIX_DS41_F16_PAIR", true);
+    static const bool lanes = strix::envcfg::flag("STRIX_DS41_F16_LANES", true);
     if (pair && lanes && a.rows <= max_rows && f16_rows_pair_supported(a, b)) {
         enqueue_f16_rows_lanes_pair(a, b, stream);
         return;
@@ -2774,7 +2770,7 @@ void enqueue_embedding(const std::uint16_t* table, const std::uint32_t* tokens, 
     const auto total = static_cast<unsigned long long>(rows) * hc_copies * hidden;
     hipLaunchKernelGGL(embedding_kernel, dim3(blocks_for(total, 256)), dim3(256), 0, as_stream(stream), table, tokens, hidden,
                        total, stream_out);
-    check(hipGetLastError(), "embedding launch");
+    hip_check(hipGetLastError(), "embedding launch");
 }
 
 std::uint32_t argmax_partial_blocks(std::uint32_t count) { return (count + argmax_span - 1U) / argmax_span; }
@@ -2786,20 +2782,20 @@ void enqueue_argmax(const float* logits, std::uint32_t rows, std::uint32_t count
     hipLaunchKernelGGL(argmax_partial_kernel, dim3(blocks, rows), dim3(argmax_threads), 0, as_stream(stream), logits, count,
                        stride, first_index, blocks, partial);
     hipLaunchKernelGGL(argmax_final_kernel, dim3(rows), dim3(argmax_threads), 0, as_stream(stream), partial, blocks, out);
-    check(hipGetLastError(), "argmax launch");
+    hip_check(hipGetLastError(), "argmax launch");
 }
 
 void enqueue_combine_argmax(const ArgmaxCandidate* a, const ArgmaxCandidate* b, std::uint32_t rows, ArgmaxCandidate* out,
                             void* stream) {
     hipLaunchKernelGGL(combine_argmax_kernel, dim3((rows + 63U) / 64U), dim3(64), 0, as_stream(stream), a, b, rows, out);
-    check(hipGetLastError(), "argmax combine launch");
+    hip_check(hipGetLastError(), "argmax combine launch");
 }
 
 void enqueue_engram_rows_bf16(const std::uint8_t* rows, std::uint32_t row_count, float* out, void* stream) {
     enqueue_decode_engram_rows(rows, row_count, out, stream);
     const auto total = static_cast<unsigned long long>(row_count) * engram_row_elements;
     hipLaunchKernelGGL(round_bf16_kernel, dim3(blocks_for(total, 256)), dim3(256), 0, as_stream(stream), out, total);
-    check(hipGetLastError(), "Engram bf16 launch");
+    hip_check(hipGetLastError(), "Engram bf16 launch");
 }
 
 PrefillRoutes prefill_site_routes(std::uint32_t rows, std::uint32_t groups, std::uint32_t batch_rows) {
@@ -2824,6 +2820,207 @@ void enqueue_q8_0_a8_prefill(const Q8A8PrefillView& v, void* stream) {
     d.deltas = v.deltas;
     d.out = v.out;
     enqueue_prefill_down(WeightFormat::q8_0, d, stream);
+}
+
+// STRIX_DS41_PF_CORE=1 (opt-in, see hip_ds41_prefill.hpp): the dense Q8_0 x A8 prefill on the shared tiled core. The
+// same forms (tall selector, two-part fusion, fused A8) as policy values; the same bits as the kernels below.
+static bool enqueue_q8_0_a8_dense_prefill_core(const Q8A8DensePrefillView& v, void* stream) {
+    static const bool tall_rotate = strix::envcfg::flag("STRIX_DS41_DENSE_TALL_ROTATE", false);
+    static const bool dense_stats = strix::envcfg::flag("STRIX_DS41_DENSE_STATS", false);
+    static const bool staged = strix::envcfg::flag("STRIX_DS41_DENSE_FORM", true);
+    const bool lean_ok = std::uint64_t(v.rows) * v.x_stride < 0x7fffffffULL &&
+        std::uint64_t(v.count) * ((v.row_width ? v.row_width : v.width) / 32U * 34U) < 0x7fffffffULL;
+    if (v.k_parts == 2U) {
+        if (strix::core::integer_dense_fuse_parts(v.tall, v.rows, v.row_width, v.width, v.count, lean_ok,
+            tall_rotate || dense_stats, staged)) {
+            integer_core::launch_dense<2, 2, 4, false, 2>(v, as_stream(stream));
+            hip_check(hipGetLastError(), "Q8_0 x A8 two-part shared core");
+            return false;
+        }
+        auto part = v;
+        part.k_parts = 1U;
+        enqueue_q8_0_a8_dense_prefill_core(part, stream);
+        part.k_offset += v.width;
+        part.codes += v.width;
+        part.deltas += v.width / 32U;
+        part.accumulate = true;
+        enqueue_q8_0_a8_dense_prefill_core(part, stream);
+        return false;
+    }
+    static const unsigned tall_env = [] {
+        const char* e = std::getenv("STRIX_DS41_DENSE_TALL");
+        return e && std::strcmp(e, "auto") == 0 ? 1U : e ? unsigned(std::strtoul(e, nullptr, 10)) : 0U;
+    }();
+    unsigned tall = v.tall ? v.tall : tall_env;
+    if (tall == 1U) {
+        tall = strix::core::integer_dense_form(v.rows, v.width, v.count, v.row_width, lean_ok);
+        if (tall_rotate) {
+            static std::atomic<unsigned> turn{0};
+            tall = std::array<unsigned, 3>{814, 914, 822}[turn.fetch_add(1, std::memory_order_relaxed) % 3];
+            if (!lean_ok) tall = tall == 914 ? 114 : tall == 822 ? 22 : 14;
+        }
+    }
+    // STRIX_DS41_DENSE_STATS=1 (diagnostics): calls and rows per (form, width, count, row_width), printed at exit
+    static const bool stats = [] {
+        const char* e = std::getenv("STRIX_DS41_DENSE_STATS");
+        return e != nullptr && e[0] == '1';
+    }();
+    if (stats) {
+        struct Count { unsigned long long calls = 0, rows = 0; };
+        static std::mutex lock;
+        static std::map<std::array<unsigned, 4>, Count> counts;
+        static const bool printer = [] {
+            std::atexit([] {
+                std::lock_guard<std::mutex> g(lock);
+                for (const auto& [k, c] : counts)
+                    std::fprintf(stderr, "dense stats: form %u width %u count %u row_width %u calls %llu rows %llu\n", k[0], k[1], k[2], k[3], c.calls, c.rows);
+            });
+            return true;
+        }();
+        (void)printer;
+        std::lock_guard<std::mutex> g(lock);
+        auto& c = counts[{staged ? tall : 0U, v.width, v.count, v.row_width}];
+        ++c.calls;
+        c.rows += v.rows;
+    }
+    bool a8 = false;
+    if (staged) {
+        switch (tall) {
+        case 22:
+            integer_core::launch_dense<2, 2, 0, false>(v, as_stream(stream));
+            a8 = true; break;
+        case 41:
+            integer_core::launch_dense<4, 1, 0, false>(v, as_stream(stream));
+            a8 = false; break;
+        case 14:
+            integer_core::launch_dense<1, 4, 0, false>(v, as_stream(stream));
+            a8 = true; break;
+        case 114:
+            integer_core::launch_dense<1, 4, 0, true>(v, as_stream(stream));
+            a8 = true; break;
+        case 112:
+            integer_core::launch_dense<1, 2, 0, true>(v, as_stream(stream));
+            a8 = true; break;
+        case 214:
+            integer_core::launch_dense<1, 4, 1, false>(v, as_stream(stream));
+            a8 = true; break;
+        case 212:
+            integer_core::launch_dense<1, 2, 1, false>(v, as_stream(stream));
+            a8 = true; break;
+        case 314:
+            integer_core::launch_dense<1, 4, 1, true>(v, as_stream(stream));
+            a8 = true; break;
+        case 312:
+            integer_core::launch_dense<1, 2, 1, true>(v, as_stream(stream));
+            a8 = true; break;
+        case 414:
+            require(lean_ok, "Q8_0 x A8 dense buffer form beyond 2 GiB");
+            integer_core::launch_dense<1, 4, 2, false>(v, as_stream(stream));
+            a8 = true; break;
+        case 412:
+            require(lean_ok, "Q8_0 x A8 dense buffer form beyond 2 GiB");
+            integer_core::launch_dense<1, 2, 2, false>(v, as_stream(stream));
+            a8 = true; break;
+        case 514:
+            require(lean_ok, "Q8_0 x A8 dense buffer form beyond 2 GiB");
+            integer_core::launch_dense<1, 4, 2, true>(v, as_stream(stream));
+            a8 = true; break;
+        case 614:
+            require(lean_ok, "Q8_0 x A8 dense buffer form beyond 2 GiB");
+            integer_core::launch_dense<1, 4, 3, false>(v, as_stream(stream));
+            a8 = true; break;
+        case 612:
+            require(lean_ok, "Q8_0 x A8 dense buffer form beyond 2 GiB");
+            integer_core::launch_dense<1, 2, 3, false>(v, as_stream(stream));
+            a8 = true; break;
+        case 714:
+            require(lean_ok, "Q8_0 x A8 dense buffer form beyond 2 GiB");
+            integer_core::launch_dense<1, 4, 3, true>(v, as_stream(stream));
+            a8 = true; break;
+        case 814:
+            require(lean_ok, "Q8_0 x A8 dense buffer form beyond 2 GiB");
+            integer_core::launch_dense<1, 4, 4, false>(v, as_stream(stream));
+            a8 = true; break;
+        case 812:
+            require(lean_ok, "Q8_0 x A8 dense buffer form beyond 2 GiB");
+            integer_core::launch_dense<1, 2, 4, false>(v, as_stream(stream));
+            a8 = true; break;
+        case 914:
+            require(lean_ok, "Q8_0 x A8 dense buffer form beyond 2 GiB");
+            integer_core::launch_dense<1, 4, 4, true>(v, as_stream(stream));
+            a8 = true; break;
+        case 422:
+            require(lean_ok, "Q8_0 x A8 dense buffer form beyond 2 GiB");
+            integer_core::launch_dense<2, 2, 2, false>(v, as_stream(stream));
+            a8 = true; break;
+        case 822:
+            require(lean_ok, "Q8_0 x A8 dense buffer form beyond 2 GiB");
+            integer_core::launch_dense<2, 2, 4, false>(v, as_stream(stream));
+            a8 = true; break;
+        case 21:
+            integer_core::launch_dense<2, 1, 0, false>(v, as_stream(stream));
+            a8 = false; break;
+        case 12:
+            integer_core::launch_dense<1, 2, 0, false>(v, as_stream(stream));
+            a8 = true; break;
+        case 1514:
+            require(lean_ok, "Q8_0 x A8 dense buffer form beyond 2 GiB");
+            integer_core::launch_dense<1, 4, 5, false>(v, as_stream(stream));
+            a8 = true; break;
+        case 1522:
+            require(lean_ok, "Q8_0 x A8 dense buffer form beyond 2 GiB");
+            integer_core::launch_dense<2, 2, 5, false>(v, as_stream(stream));
+            a8 = true; break;
+        case 1614:
+            require(lean_ok, "Q8_0 x A8 dense buffer form beyond 2 GiB");
+            integer_core::launch_dense<1, 4, 5, true>(v, as_stream(stream));
+            a8 = true; break;
+        case 1714:
+            require(lean_ok, "Q8_0 x A8 dense buffer form beyond 2 GiB");
+            integer_core::launch_dense<1, 4, 6, false>(v, as_stream(stream));
+            a8 = true; break;
+        case 1722:
+            require(lean_ok, "Q8_0 x A8 dense buffer form beyond 2 GiB");
+            integer_core::launch_dense<2, 2, 6, false>(v, as_stream(stream));
+            a8 = true; break;
+        case 1814:
+            require(lean_ok, "Q8_0 x A8 dense buffer form beyond 2 GiB");
+            integer_core::launch_dense<1, 4, 6, true>(v, as_stream(stream));
+            a8 = true; break;
+        case 1914:
+            require(lean_ok, "Q8_0 x A8 dense buffer form beyond 2 GiB");
+            integer_core::launch_dense<1, 4, 7, false>(v, as_stream(stream));
+            a8 = true; break;
+        case 1922:
+            require(lean_ok, "Q8_0 x A8 dense buffer form beyond 2 GiB");
+            integer_core::launch_dense<2, 2, 7, false>(v, as_stream(stream));
+            a8 = true; break;
+        case 2014:
+            require(lean_ok, "Q8_0 x A8 dense buffer form beyond 2 GiB");
+            integer_core::launch_dense<1, 4, 7, true>(v, as_stream(stream));
+            a8 = true; break;
+        case 2114:
+            require(lean_ok, "Q8_0 x A8 dense buffer form beyond 2 GiB");
+            integer_core::launch_dense<1, 4, 8, false>(v, as_stream(stream));
+            a8 = true; break;
+        case 2122:
+            require(lean_ok, "Q8_0 x A8 dense buffer form beyond 2 GiB");
+            integer_core::launch_dense<2, 2, 8, false>(v, as_stream(stream));
+            a8 = true; break;
+        case 2214:
+            require(lean_ok, "Q8_0 x A8 dense buffer form beyond 2 GiB");
+            integer_core::launch_dense<1, 4, 8, true>(v, as_stream(stream));
+            a8 = true; break;
+        default:
+            if (v.count <= 16U) integer_core::launch_dense<1, 1, 0, false, 1, true>(v, as_stream(stream));
+            else integer_core::launch_dense<1, 2, 0, false, 1, true>(v, as_stream(stream));
+        }
+    } else {
+        if (v.count <= 16U) integer_core::launch_dense<1, 1, 0, false, 1, true, false>(v, as_stream(stream));
+        else integer_core::launch_dense<1, 2, 0, false, 1, true, false>(v, as_stream(stream));
+    }
+    hip_check(hipGetLastError(), "Q8_0 x A8 dense shared core");
+    return v.a8_codes != nullptr && staged && a8;
 }
 
 // Post-order form (tall = 96..99, opt-in): the same group terms, class sums and tree as the staged wide form, bit for
@@ -3024,6 +3221,32 @@ __global__ __launch_bounds__(32 * post_waves) void q8_0_a8_post_kernel(Q8A8Dense
         }
 }
 
+// FAST lever ds41-dense-f16-v1: the dense Q8_0 x A8 products as ONE FP16 WMMA chain on the shared FP16 dense core
+// (policy core::f16_dense_tall::q8a8, "dense-q8a8-f16-v1": weights decoded once per CTA stage, 128- or 256-row CTAs).
+// STRIX_DS41_FAST_DENSE=1 (default off; also set by the profile STRIX_DS41_FAST_PREFILL=1) or set_fast_dense(1 / 0; -1 = the environment). Calls under
+// STRIX_DS41_FAST_DENSE_MIN_ROWS rows (default 128) and shapes the policy does not take keep the exact kernels.
+// The outputs' A8 is not written here (the caller quantizes, as after any form that returns false).
+int fast_dense_mode = -1;
+void set_fast_dense(int mode) { fast_dense_mode = mode; }
+static bool fast_dense_on() {
+    static const bool env = fast_profile::dense_on();  // the lever or STRIX_DS41_FAST_PREFILL
+    return fast_dense_mode >= 0 ? fast_dense_mode != 0 : env;
+}
+static bool enqueue_fast_dense(const Q8A8DensePrefillView& v, void* stream) {
+    static const unsigned min_rows = fast_profile::dense_min_rows();
+    namespace q8a8 = strix::core::f16_dense_tall::q8a8;
+    q8a8::View f{};
+    f.weight = v.weight, f.codes = v.codes, f.deltas = v.deltas, f.out = v.out;
+    f.row_bytes = (v.row_width ? v.row_width : v.width) / 32U * 34U;
+    f.k_bytes = v.k_offset / 32U * 34U;
+    f.in = v.width, f.count = v.count, f.rows = v.rows, f.x_stride = v.x_stride, f.out_stride = v.out_stride;
+    f.accumulate = v.accumulate ? 1U : 0U;
+    if (v.rows < min_rows || !q8a8::supported(f)) return false;
+    q8a8::enqueue_parts(f, v.k_parts, as_stream(stream));
+    hip_check(hipGetLastError(), "Q8_0 x A8 FP16 dense launch");
+    return true;
+}
+
 bool enqueue_q8_0_a8_dense_prefill(const Q8A8DensePrefillView& v, void* stream) {
     require(v.weight && v.codes && v.deltas && v.out && v.count && v.rows && v.width && v.width % 32U == 0 && v.x_stride >= v.width &&
                 v.x_stride % 16U == 0 && v.out_stride >= v.count && reinterpret_cast<std::uintptr_t>(v.codes) % 16U == 0 &&
@@ -3034,20 +3257,22 @@ bool enqueue_q8_0_a8_dense_prefill(const Q8A8DensePrefillView& v, void* stream) 
                                      std::uint64_t{v.k_offset} + 2ULL * v.width <= v.row_width &&
                                      std::uint64_t{v.x_stride} >= 2ULL * v.width)),
             "Q8_0 x A8 dense prefill view");
+    if (fast_dense_on() && enqueue_fast_dense(v, stream)) return false;
+    if (pf_core_dense()) return enqueue_q8_0_a8_dense_prefill_core(v, stream);
     if (v.k_parts == 2U) {
         // one launch for both parts in form 822 from 896 rows (gfx1151 bench: -2 % at 896, -5..-7 % at 1024 rows; fewer rows
         // lose to the two launches); else the two launches (the second accumulated)
         // (the auto rule's 822 pick: o_a's count 1024 takes 914 first; the rotation gate and the statistics see two calls)
-        const auto env_on = [](const char* name) { const char* e = std::getenv(name); return e != nullptr && e[0] == '1'; };
         const bool one = v.tall == 1U && v.rows >= 896U && v.row_width == 8192U && v.width == 4096U && v.count != 1024U &&
-                         !env_on("STRIX_DS41_DENSE_TALL_ROTATE") && !env_on("STRIX_DS41_DENSE_STATS") &&
+                         !strix::env_flag_default_off("STRIX_DS41_DENSE_TALL_ROTATE", strix::EnvFlagMatch::first_character) &&
+                         !strix::env_flag_default_off("STRIX_DS41_DENSE_STATS", strix::EnvFlagMatch::first_character) &&
                          static_cast<std::size_t>(v.rows) * v.x_stride < 0x7fffffffULL &&
                          static_cast<std::size_t>(v.count) * (v.row_width / 32U * 34U) < 0x7fffffffULL &&
-                         [] { const char* e = std::getenv("STRIX_DS41_DENSE_FORM"); return !(e && e[0] == '0'); }();
+                         strix::envcfg::flag("STRIX_DS41_DENSE_FORM", true);
         if (one) {
             const dim3 g((v.rows + 31U) / 32U, (v.count + 31U) / 32U);
             hipLaunchKernelGGL((q8_0_a8_tall_kernel<2, 2, false, 4U, 2U>), g, dim3(32 * tall_waves), 0, as_stream(stream), v);
-            check(hipGetLastError(), "Q8_0 x A8 dense prefill launch");
+            hip_check(hipGetLastError(), "Q8_0 x A8 dense prefill launch");
             return false;
         }
         auto p0 = v;
@@ -3063,10 +3288,7 @@ bool enqueue_q8_0_a8_dense_prefill(const Q8A8DensePrefillView& v, void* stream) 
     }
     unsigned outputs = 32U;
     const dim3 grid((v.rows + 15U) / 16U, (v.count + outputs - 1U) / outputs);
-    static const bool staged = [] {
-        const char* e = std::getenv("STRIX_DS41_DENSE_FORM");
-        return !(e && e[0] == '0');
-    }();
+    static const bool staged = strix::envcfg::flag("STRIX_DS41_DENSE_FORM", true);
     // STRIX_DS41_DENSE_TALL=22 / 41 / 14 / 21 / 12: RT OT of the tall form for every call (staged only); auto: by shape,
     // from the gfx1151 smoke (prefill measurements): >= 3072 rows, or 2048 rows and >= 1024 outputs: 1 x 4 (q_a / kv);
     // >= 256 rows with >= 4096 outputs and width >= 4096: 1 x 2 (wo_b halves); else the wide form. Every form: the same bits.
@@ -3194,7 +3416,7 @@ bool enqueue_q8_0_a8_dense_prefill(const Q8A8DensePrefillView& v, void* stream) 
         if (staged) hipLaunchKernelGGL(HIP_KERNEL_NAME(q8_0_a8_wide_kernel<true, 2>), grid, dim3(32 * wide_waves), 0, as_stream(stream), v);
         else hipLaunchKernelGGL(HIP_KERNEL_NAME(q8_0_a8_wide_kernel<false, 2>), grid, dim3(32 * wide_waves), 0, as_stream(stream), v);
     }
-    check(hipGetLastError(), "Q8_0 x A8 dense prefill launch");
+    hip_check(hipGetLastError(), "Q8_0 x A8 dense prefill launch");
     // the tall forms with an even OT wrote the outputs' A8 (the others ignore a8_codes)
     static constexpr unsigned a8_forms[] = {22U,  14U,   114U,  112U,  214U,  212U,  314U,  312U,  414U,  412U,  514U,  614U,
                                             612U, 714U,  814U,  812U,  914U,  422U,  822U,  1514U, 1522U, 1614U, 1714U, 1722U,
@@ -3212,7 +3434,7 @@ void enqueue_engram_inject(float* hc_stream, const float* kv, const float* q_nor
     require(chunks * hc_copies <= 32U, "Engram injection hidden size");
     hipLaunchKernelGGL(engram_inject_kernel, dim3(rows), dim3(wave * hc_copies * chunks), 0, as_stream(stream), hc_stream, kv, q_norm,
                        k_norm, hidden, eps, inv);
-    check(hipGetLastError(), "Engram injection launch");
+    hip_check(hipGetLastError(), "Engram injection launch");
 }
 
 // ---- launch accesses ---------------------------------------------------------------------------

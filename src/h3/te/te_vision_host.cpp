@@ -2,6 +2,8 @@
 
 #include "h3/te/te_tokenizer.hpp"
 
+#include "strix/vision/preprocess.hpp"
+
 #include <algorithm>
 #include <cmath>
 #include <stdexcept>
@@ -10,90 +12,38 @@ namespace strix::h3::te {
 namespace {
 
 constexpr int kPatch = 16, kMerge = 2, kTemporal = 2, kFactor = kPatch * kMerge;
-constexpr double kMinPixels = 3136, kMaxPixels = 12845056;
-
-struct Taps { std::vector<int> i0, i1; std::vector<float> w0, w1; };
-
-// Source indices/weights of one axis: half-pixel centers, clamped at 0, scale = in / out (fp32).
-Taps taps(int in, int out) {
-    Taps t;
-    const float scale = float(in) / float(out);
-    for (int o = 0; o < out; ++o) {
-        float src = scale * (float(o) + 0.5F) - 0.5F;
-        if (src < 0.0F) src = 0.0F;
-        const int i0 = static_cast<int>(src);
-        const float l1 = std::min(std::max(src - float(i0), 0.0F), 1.0F);
-        t.i0.push_back(i0);
-        t.i1.push_back(i0 < in - 1 ? i0 + 1 : i0);
-        t.w0.push_back(1.0F - l1);
-        t.w1.push_back(l1);
-    }
-    return t;
-}
 
 }  // namespace
 
-void smart_resize(int h, int w, int& h_bar, int& w_bar) {
-    // Python round(): half to even on the double quotient
-    h_bar = int(std::nearbyint(double(h) / kFactor)) * kFactor;
-    w_bar = int(std::nearbyint(double(w) / kFactor)) * kFactor;
-    if (double(h_bar) * w_bar > kMaxPixels) {
-        const double beta = std::sqrt(double(h) * w / kMaxPixels);
-        h_bar = std::max(kFactor, int(std::floor(h / beta / kFactor)) * kFactor);
-        w_bar = std::max(kFactor, int(std::floor(w / beta / kFactor)) * kFactor);
-    } else if (double(h_bar) * w_bar < kMinPixels) {
-        const double beta = std::sqrt(kMinPixels / (double(h) * w));
-        h_bar = int(std::ceil(h * beta / kFactor)) * kFactor;
-        w_bar = int(std::ceil(w * beta / kFactor)) * kFactor;
-    }
+// The preprocessing lives in the shared vision library; these keep the H3 signatures.
+void smart_resize(int h, int w, int& h_bar, int& w_bar, double min_pixels, double max_pixels) {
+    const vision::Size s = vision::smart_resize(h, w, kFactor, min_pixels, max_pixels);
+    h_bar = s.height;
+    w_bar = s.width;
 }
 
 std::vector<float> resize_bilinear(const float* rgb, int h, int w, int oh, int ow) {
-    const auto th = taps(h, oh), tw = taps(w, ow);
-    std::vector<float> out(std::size_t(oh) * ow * 3);
-    for (int y = 0; y < oh; ++y)
-        for (int x = 0; x < ow; ++x)
-            for (int c = 0; c < 3; ++c) {
-                const auto at = [&](int yy, int xx) { return rgb[(std::size_t(yy) * w + xx) * 3 + c]; };
-                const float r0 = at(th.i0[y], tw.i0[x]) * tw.w0[x] + at(th.i0[y], tw.i1[x]) * tw.w1[x];
-                const float r1 = at(th.i1[y], tw.i0[x]) * tw.w0[x] + at(th.i1[y], tw.i1[x]) * tw.w1[x];
-                out[(std::size_t(y) * ow + x) * 3 + c] = r0 * th.w0[y] + r1 * th.w1[y];
-            }
-    return out;
+    return vision::resize_bilinear_f32(rgb, h, w, oh, ow);
 }
 
 Patches make_patches(const Frames& f) {
     if ((f.t != 1 && f.t != 2) || f.h <= 0 || f.w <= 0 || f.rgb.size() != std::size_t(f.t) * f.h * f.w * 3)
         throw std::invalid_argument("make_patches: frames");
     int hb = 0, wb = 0;
-    smart_resize(f.h, f.w, hb, wb);
+    smart_resize(f.h, f.w, hb, wb, f.min_pixels, f.max_pixels);
     std::vector<std::vector<float>> frames;
+    std::vector<const float*> views;
     for (int t = 0; t < f.t; ++t) {
-        auto r = resize_bilinear(f.rgb.data() + std::size_t(t) * f.h * f.w * 3, f.h, f.w, hb, wb);
-        for (auto& v : r) v = (v - 0.5F) / 0.5F;
+        auto r = vision::resize_bilinear_f32(f.rgb.data() + std::size_t(t) * f.h * f.w * 3, f.h, f.w, hb, wb);
+        vision::normalize_inplace(r, {0.5F, 0.5F, 0.5F}, {0.5F, 0.5F, 0.5F});
         frames.push_back(std::move(r));
     }
+    for (const auto& fr : frames) views.push_back(fr.data());
+    auto shared = vision::patchify(views, hb, wb, vision::PatchSpec{kPatch, kTemporal, kMerge});
     Patches p;
-    p.grid_h = hb / kPatch;
-    p.grid_w = wb / kPatch;
-    constexpr int feat = 3 * kTemporal * kPatch * kPatch;
-    p.data.resize(std::size_t(p.grid_h) * p.grid_w * feat);
-    std::size_t row = 0;
-    for (int bh = 0; bh < p.grid_h / kMerge; ++bh)
-        for (int bw = 0; bw < p.grid_w / kMerge; ++bw)
-            for (int mh = 0; mh < kMerge; ++mh)
-                for (int mw = 0; mw < kMerge; ++mw, ++row) {
-                    float* dst = p.data.data() + row * feat;
-                    for (int c = 0; c < 3; ++c)
-                        for (int t = 0; t < kTemporal; ++t) {
-                            const auto& fr = frames[f.t == 1 ? 0 : t];
-                            for (int py = 0; py < kPatch; ++py)
-                                for (int px = 0; px < kPatch; ++px) {
-                                    const int y = (bh * kMerge + mh) * kPatch + py, x = (bw * kMerge + mw) * kPatch + px;
-                                    *dst++ = fr[(std::size_t(y) * wb + x) * 3 + c];
-                                }
-                        }
-                }
+    p.grid_h = shared.grid_h;
+    p.grid_w = shared.grid_w;
+    p.data = std::move(shared.data);
     return p;
 }
 

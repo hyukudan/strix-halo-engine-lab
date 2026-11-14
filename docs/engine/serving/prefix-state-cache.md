@@ -63,12 +63,19 @@ preallocated. Explicit larger host ceilings are accepted but effective retention
 1024 MiB; a failed lease disables new retention on both ranks. The host accounting includes
 per-layer vector descriptors and allocator allowances; it is not an allocator/RSS hard limit.
 The conservative transient prediction includes retained copies, whole-prefix exports, serialization
-and snapshot rings. Unsupported host locking fails closed.
+and snapshot rings. Its per-token attention term comes from the shared decode plan:
+only KV-source layers contribute compressed KV and index keys, amortized by their
+compression ratio (890 bytes/token for V4.1), plus 4 bytes/token for token IDs.
+Fixed rings remain conservatively bounded; arithmetic overflow saturates the
+prediction instead of allowing an undersized admission. Unsupported host locking fails closed.
 
 An explicit directory gets a 4096 MiB tier ceiling unless overridden. Its namespaces and service
-processes share a 4096 MiB directory quota, a 128 MiB outstanding-payload limit and a 16384 MiB
-filesystem free-space floor. Queue reservations precede serialization; payloads remain charged
-through the active write. Files pending deletion and temporary files count physically until gone.
+processes share a directory quota of 4096 MiB or the tier ceiling, whichever is larger (none for an
+unlimited tier, `--prefix-cache-disk-mb 0`), a 128 MiB outstanding-payload limit and a 16384 MiB
+filesystem free-space floor. A full tier evicts its least recently used states before the quota is
+checked, and those deletions finish first, so it keeps persisting new states. Queue reservations
+precede serialization; payloads remain charged through the active write. Files pending deletion and
+temporary files count physically until gone.
 Quota/space/peer refusal keeps RAM when possible. Each namespace/rank directory has one exclusive
 service owner; a second writer is refused, and no sibling namespace is evicted. Inactive writer
 reservations are ignored after a crash. Disk reads retain all-or-nothing peer restore and do not
@@ -169,6 +176,29 @@ identity and one exact token prefix; the stored tokens are compared as well. Why
   no two configurations whose outputs could differ ever share an entry;
 - context size and layout fix the state geometry; the executable digest keeps a disk tier from
   serving a state that another build produced.
+
+### Prepared lookups
+
+A longest-prefix lookup has a part that depends only on the prompt and a part that depends on the cache.
+`PrefixStateCache::prepare_lookup()` does the first part and returns a `PrefixLookupTicket`: a copy of the
+tokens, the digest of every block and, with a disk tier, which blocks have a checkpoint file and of which
+class (legacy or certified). It takes no cache lock and changes nothing, so a caller can run it on any
+thread before the request is admitted. `find_longest(ticket)` then decides under the cache state of that
+moment and returns what the one-step `find_longest()` returns:
+
+- the host tier of every block is probed in one lock acquisition (the one-step form used one per block);
+- a host hit is still verified against the stored tokens, token by token, and an entry that does not
+  match is still removed; a hash never stands in for the comparison;
+- a disk checkpoint is still loaded by the lookup itself, where its payload buffers, budget credits and
+  certificate check belong: the ticket holds no payload, no lease and no reservation;
+- prepared disk metadata is used only while this cache has not published or removed a checkpoint file
+  since it was read. Otherwise the lookup probes the files as the one-step form does. A file published by
+  another cache object on the same directory after the ticket was prepared is seen by the next ticket.
+
+The one-step form is the same code with a ticket built on the spot and the disk tier probed during the
+walk. `strix-prefix-lookup-ticket-tests` runs a recorded sequence of lookups one-step against one cache
+and prepared against an identically filled cache and compares every hit and every counter; `--bench`
+prints the cost of both forms for 8K, 32K and 128K token prompts.
 
 ## Storage
 

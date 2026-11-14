@@ -13,6 +13,7 @@
 #include "../apps/qwen_yarn_registered_admission.hpp"
 #include "../apps/qwen_mtp_owner_plan.hpp"
 #include "../apps/known_prefill_reservation.hpp"
+#include "../apps/qwen_deploy_provider.hpp"
 #include "../apps/ple_resident_fallback.hpp"
 #include "qwen_serial_contract.hpp"
 #include "qwen_historical_resolver.hpp"
@@ -30,6 +31,14 @@
 #include <filesystem>
 #include <chrono>
 
+// POSIX test controls, backed by the MSVC process environment on host builds.
+#ifdef _WIN32
+inline int setenv(const char* name, const char* value, int overwrite) {
+    if (!overwrite && std::getenv(name)) return 0;
+    return _putenv_s(name,value);
+}
+inline int unsetenv(const char* name) { return _putenv_s(name,""); }
+#endif
 using namespace strix;
 using namespace strix::decode_cli;
 namespace {
@@ -454,6 +463,73 @@ void serve_prefill_admission_tests(const ModelContract& model, const ModelManife
             expect(resolve(production,tighter).options.known_prefix_prefill_rows==4096,
                 "registered target also consumes GTT and still falls back under GTT pressure");
         }
+        // Measured D9 native ledger. A mapping lease is not a physical pin:
+        // the shared rule credits only its clean, unregistered file pages.
+        constexpr std::uint64_t mapped=111334658048ULL, live_bytes=112090202777ULL;
+        constexpr std::uint64_t growth=15815011044ULL, temporary=16338988ULL;
+        const auto backing=read_only_registered_mapping_accounting(mapped,registered);
+        expect(backing.retained_bytes==registered && backing.reclaimable_bytes==mapped-registered,
+            "native mapping rule fully charges registered pages and credits only their complement");
+        expect(!read_only_registered_mapping_accounting(mapped,mapped).reclaimable_bytes,
+            "fully pinned model mapping receives no reclaimable credit");
+        bool bad_backing=false;
+        try { (void)read_only_registered_mapping_accounting(mapped,mapped+1U); }
+        catch (const std::invalid_argument&) { bad_backing=true; }
+        expect(bad_backing,"mapping rule rejects registered backing larger than the mapping");
+        UmaOwnerInventory live;
+        live.reservation_upper_bound_bytes=live_bytes;
+        live.known_file_mapping_bytes=mapped;
+        for (const auto available : {126701535232ULL,127565436108ULL}) { // 118 and 118.8 GiB
+            observed.available=available;
+            const auto admitted=resolve(production,observed);
+            validate_effective_startup(admitted);
+            expect(admitted.options.known_prefix_prefill_rows==8192 &&
+                admitted.host_compilation.at("target_reclaimable_mapping_bytes")==backing.reclaimable_bytes,
+                "admission and native ledger use the same T8192 reclaimable mapping rule near 118 GiB");
+            for (const bool ram_off : {false,true}) {
+                auto o=admitted.options;
+                if (ram_off) { o.session_ram_bytes=0; o.supplied_options.insert("--session-ram-bytes"); }
+                unsigned warms=0;
+                const auto reservation=admit_http_prefill_before_warm(o,live,growth,temporary,
+                    backing.reclaimable_bytes,true,[&] { ++warms; });
+                expect(warms==1 && reservation.retained_reserved_bytes==99094056317ULL &&
+                    reservation.setup_peak_reserved_bytes==99110395305ULL &&
+                    reservation.reclaimable_file_mapping_credit_bytes==backing.reclaimable_bytes,
+                    "measured D9 ledger admits before warming with default or zero session RAM");
+            }
+            // With no reclaimability proof, the original D9 ledger must refuse.
+            // A real growth overflow still refuses even with the full valid credit.
+            for (const bool reclaimable : {false,true}) {
+                auto o=admitted.options;
+                unsigned warms=0;
+                bool refused=false;
+                const auto required_growth=reclaimable ? growth+32*gib_bytes : growth;
+                try { (void)admit_http_prefill_before_warm(o,live,required_growth,temporary,
+                    reclaimable?backing.reclaimable_bytes:0U,true,[&] { ++warms; }); }
+                catch (const std::invalid_argument& e) {
+                    const std::string message=e.what();
+                    refused=message.find("[known-prefill live_bytes=112090202777")!=std::string::npos &&
+                        message.find("growth_bytes="+std::to_string(required_growth))!=std::string::npos &&
+                        message.find("retained_limit_bytes="+std::to_string(available))!=std::string::npos;
+                }
+                expect(refused && !warms,"unfit native ledger refuses with diagnostics before any warm-up");
+            }
+            auto explicit_ram=admitted.options;
+            explicit_ram.session_ram_bytes=32*gib_bytes;
+            explicit_ram.supplied_options.insert("--session-ram-bytes");
+            unsigned warms=0;
+            bool refused=false;
+            try { (void)admit_http_prefill_before_warm(explicit_ram,live,growth,temporary,
+                backing.reclaimable_bytes,true,[&] { ++warms; }); }
+            catch (const std::invalid_argument& e) {
+                const std::string message=e.what();
+                refused=message.starts_with("explicit --session-ram-bytes") &&
+                    message.find("[known-prefill live_bytes=112090202777")!=std::string::npos &&
+                    message.find("verified_credit_bytes="+std::to_string(backing.reclaimable_bytes))!=std::string::npos;
+            }
+            expect(refused && !warms && explicit_ram.session_ram_bytes==32*gib_bytes,
+                "explicit oversize session RAM is preserved and refuses before warm-up");
+        }
     }
     // Synthetic verified-asset/owner evidence, deliberately far below ceilings.
     memory.serving=[](const Options&) { return HttpServingMemory{gib_bytes,gib_bytes,gib_bytes,gib_bytes}; };
@@ -465,8 +541,35 @@ void serve_prefill_admission_tests(const ModelContract& model, const ModelManife
         startup.options.known_prefix_expert_union && startup.options.known_window_router_rows &&
         startup.options.known_prefix_tail_rows==std::vector<std::uint32_t>({1024,256,64,16}) &&
         startup.options.prefix_cache_block_rows==0 &&
-        numerical_profile_pair(startup.options).prefill==dense_a8_profile,
-        "serve_prefill_production_mtp_ceilings: preserve explicit route organizations, tails, cache and arithmetic");
+        numerical_profile_pair(startup.options).decode==dense_a8_profile,
+        "serve_prefill_production_mtp_ceilings: preserve explicit route organizations, tails, cache and decode arithmetic");
+    {
+        // Explicit-sidecar MTP: the single-request FP16 prefill arithmetic without the options its gates have not passed.
+        const auto governed_excluded = prefill_option_bit(PrefillOption::hc_output_wmma) |
+            prefill_option_bit(PrefillOption::index_proj_wmma) | prefill_option_bit(PrefillOption::gdn_fp16_chunk) |
+            prefill_option_bit(PrefillOption::index_score_wmma);
+        expect(startup.options.prefill_profile_automatic &&
+            startup.options.prefill_numerical_profile==DecodeNumericalProfile::fast_prefill_f16wmma_v1 &&
+            startup.options.resolved_prefill_option_mask && !(*startup.options.resolved_prefill_option_mask & governed_excluded) &&
+            startup.prefill_option_mask==*startup.options.resolved_prefill_option_mask &&
+            startup.serve_prefill_notice.find("governed MTP")!=std::string::npos,
+            "serve_prefill_production_mtp_ceilings: sidecar MTP takes automatic fp16 with the governed exclusions");
+        // STRIX_SERVE_FP16_MTP=0 keeps the resolved arithmetic whatever the option mask already excludes.
+        for (const bool already_excluded : {false,true}) {
+            auto off=request; off.environment["STRIX_SERVE_FP16_MTP"]="0";
+            if (already_excluded) off.environment["STRIX_PREFILL_HC_OUTPUT_WMMA"]="0";
+            const auto kept=resolve(off,memory);
+            expect(kept.options.known_prefix_prefill_rows==8192 && !kept.options.prefill_profile_automatic &&
+                !kept.options.prefill_numerical_profile &&
+                numerical_profile_pair(kept.options).prefill==dense_a8_profile &&
+                kept.serve_prefill_notice.find("automatic fp16 declined: STRIX_SERVE_FP16_MTP=0")!=std::string::npos,
+                already_excluded ? "serve_prefill_production_mtp_ceilings: FP16 MTP off switch wins with hc_output_wmma already excluded"
+                                 : "serve_prefill_production_mtp_ceilings: FP16 MTP off switch keeps the resolved arithmetic");
+            auto on=off; on.environment.erase("STRIX_SERVE_FP16_MTP");
+            expect(resolve(on,memory).options.prefill_profile_automatic,
+                "serve_prefill_production_mtp_ceilings: sidecar MTP keeps automatic fp16 under either option mask");
+        }
+    }
     auto inspect_args=args; inspect_args.emplace_back("--print-effective-config");
     RequestedOptions inspection{parse(inspect_args),request.environment};
     const auto dry=resolve(inspection,memory);
@@ -493,6 +596,141 @@ void serve_prefill_admission_tests(const ModelContract& model, const ModelManife
     rejected=memory; rejected.available=1;
     expect(resolve(request,rejected).serve_prefill_notice.find("host-available needs")!=std::string::npos,
         "serve_prefill_rejection_details: name failed memory bound and byte counts");
+    {
+        auto low_args=args; low_args.emplace_back("--deploy-check");
+        const auto low=resolve({parse(low_args),request.environment},rejected);
+        expect(low.options.deploy_check && low.options.print_effective_config && low.options.deployment_spec &&
+            !low.options.known_prefix_prefill_rows,"low-memory deploy-check fixture declines every T");
+        const auto reason=deployment_startup_refusal(low);
+        expect(reason.find("host-available needs")!=std::string::npos &&
+            reason.find("--http-serve requires the tiled MTP route")==std::string::npos,
+            "deploy inspection keeps the memory refusal instead of the generic route exception");
+        qwen::deployment::Provider provider({},static_cast<std::uint32_t>(low.options.context_tokens),1,
+            "single","default",reason);
+        deploy::DeviceFacts d; d.mem_total_bytes=1172*gib_bytes/10; d.mem_free_bytes=1;
+        const auto plan=deploy::resolve(*low.options.deployment_spec,{d},provider);
+        const auto json=serve::parse_json(plan.to_json());
+        expect(plan.refused && json.find("refused")->as_bool() &&
+            plan.to_json().find("host-available needs")!=std::string::npos,
+            "low-memory deploy inspection emits parseable structured refusal JSON");
+    }
+    {
+        auto observed=memory;
+        observed.available=1172*gib_bytes/10;
+        observed.estimate=[](const Options& o) {
+            return PrefillRequirements{92*gib_bytes,gib_bytes,gib_bytes,
+                o.known_prefix_prefill_rows*(gib_bytes/1024),gib_bytes/2,gib_bytes/8,gib_bytes,2*gib_bytes};
+        };
+        const auto plain=resolve(request,observed);
+        validate_effective_startup(plain);
+        const auto committed=plain.host_compilation.at("serve_committed_host_peak_bytes");
+        expect(plain.options.known_prefix_prefill_rows==8192 && plain.options.session_ram_bytes>0 &&
+            plain.options.session_ram_bytes<8*gib_bytes &&
+            plain.options.session_ram_bytes==*observed.available-committed,
+            "117.2 GiB plain HTTP fits default RAM after retained owners and margin");
+        expect(plain.options.supplied_options==request.options.supplied_options &&
+            plain.options.known_prefill_host_headroom==4*gib_bytes &&
+            plain.options.known_prefill_uma_budget==*observed.available &&
+            plain.options.http_batch_cap==request.options.http_batch_cap &&
+            plain.options.cache_activation->automatic_path==startup.options.cache_activation->automatic_path,
+            "elastic session sizing preserves margin, UMA limit, slot policy and cache provenance");
+        auto cached=request; cached.options.prefix_cache_host_bytes=gib_bytes;
+        const auto with_cache=resolve(cached,observed);
+        expect(with_cache.options.session_ram_bytes==*observed.available-
+            with_cache.host_compilation.at("serve_committed_host_peak_bytes") &&
+            plain.options.session_ram_bytes-with_cache.options.session_ram_bytes==gib_bytes,
+            "explicit prefix payload is charged exactly once before elastic session RAM");
+        auto exact=observed; exact.available=committed;
+        const auto zero=resolve(request,exact);
+        validate_effective_startup(zero);
+        expect(zero.options.known_prefix_prefill_rows==8192 && !zero.options.session_ram_bytes,
+            "default session cap may become zero without refusing or changing T");
+        auto generous=observed; generous.available=200*gib_bytes;
+        expect(resolve(request,generous).options.session_ram_bytes==8*gib_bytes,
+            "default remains capped at 8 GiB when mandatory owners leave room");
+        auto pinned=request;
+        pinned.options.supplied_options.insert("--session-ram-bytes");
+        pinned.options.session_ram_bytes=8*gib_bytes;
+        const auto oversized=resolve(pinned,observed);
+        expect(oversized.options.session_ram_bytes==8*gib_bytes &&
+            oversized.error.find("explicit --session-ram-bytes")!=std::string::npos &&
+            oversized.error.find("after retained reservation and margin")!=std::string::npos,
+            "explicit oversize RAM stays fixed and gives a named refusal");
+        bool oversized_refused=false;
+        try { validate_effective_startup(oversized); }
+        catch (const std::invalid_argument& e) {
+            oversized_refused=std::string_view(e.what()).find("explicit --session-ram-bytes")!=std::string_view::npos;
+        }
+        expect(oversized_refused,"plain HTTP startup refuses explicit oversize session RAM");
+        pinned.options.session_ram_bytes=0;
+        const auto off=resolve(pinned,observed);
+        validate_effective_startup(off);
+        expect(!off.options.session_ram_bytes && off.options.known_prefix_prefill_rows==plain.options.known_prefix_prefill_rows &&
+            numerical_profile_pair(off.options)==numerical_profile_pair(plain.options),
+            "explicit RAM OFF preserves HTTP tile and arithmetic");
+        auto native=plain.options;
+        UmaOwnerInventory live; live.reservation_upper_bound_bytes=112*gib_bytes;
+        const auto actual=plan_known_prefill_reservation(live,4*gib_bytes,0,{},0,0);
+        fit_http_session_ram(native,actual.setup_peak_reserved_bytes,*observed.available);
+        expect(native.session_ram_bytes==*observed.available-actual.setup_peak_reserved_bytes &&
+            native.session_ram_bytes<plain.options.session_ram_bytes,
+            "native retained ledger refits the default without changing its UMA limit");
+        fit_http_session_ram(native,*observed.available,*observed.available);
+        expect(!native.session_ram_bytes,"native reservation can consume the remaining default session cap");
+        // Exercise the actual post-registration throw boundary, rather than
+        // fitting an estimator-only commitment. Session RAM is not an input to
+        // this ledger: changing its cap cannot cure a mandatory-owner overflow.
+        auto node_args=args;
+        for (const auto* flag : {"--http-batch","--prefix-cache-block-rows"}) {
+            const auto at=std::find(node_args.begin(),node_args.end(),flag);
+            if (at!=node_args.end()) node_args.erase(at,at+2);
+        }
+        const RequestedOptions node_request{parse(node_args),request.environment};
+        node_args.insert(node_args.end(),{"--session-ram-bytes","0"});
+        const RequestedOptions off_request{parse(node_args),request.environment};
+        for (const auto available : {1172*gib_bytes/10,1188*gib_bytes/10}) {
+            auto node=observed; node.available=available;
+            auto admitted=resolve(node_request,node);
+            const auto ram_off=resolve(off_request,node);
+            validate_effective_startup(admitted);
+            validate_effective_startup(ram_off);
+            expect(admitted.options.cache_activation->automatic_path &&
+                !ram_off.options.cache_activation->automatic_path &&
+                admitted.options.known_prefill_uma_budget==ram_off.options.known_prefill_uma_budget &&
+                admitted.options.known_prefix_prefill_rows==ram_off.options.known_prefix_prefill_rows &&
+                admitted.host_compilation==ram_off.host_compilation,
+                "parsed default/RAM-OFF changes cache provenance but not the prefill commitment or UMA limit");
+            auto native_options=admitted.options;
+            UmaOwnerInventory owners;
+            owners.reservation_upper_bound_bytes=112*gib_bytes;
+            const UmaReservationLimits limits{native_options.known_prefill_uma_budget,
+                native_options.known_prefill_uma_budget};
+            const auto mandatory=plan_known_prefill_reservation(owners,4*gib_bytes,0,{},0,0);
+            fit_http_session_ram(native_options,mandatory.setup_peak_reserved_bytes,*limits.retained_bytes);
+            const auto checked=plan_known_prefill_reservation(owners,4*gib_bytes,0,limits,0,0);
+            expect(native_options.session_ram_bytes>0 &&
+                native_options.session_ram_bytes==deploy::fit_elastic_extra(admitted.options.session_ram_bytes,
+                    mandatory.setup_peak_reserved_bytes,*limits.retained_bytes) &&
+                checked.retained_reserved_bytes==mandatory.retained_reserved_bytes,
+                "117 GiB native retained check admits after fitting default RAM with the shared rule");
+            for (const bool disable_ram : {false,true}) {
+                auto arm=native_options;
+                if (disable_ram) { arm.session_ram_bytes=0; arm.supplied_options.insert("--session-ram-bytes"); }
+                const auto over=plan_known_prefill_reservation(owners,8*gib_bytes,0,{},0,0);
+                fit_http_session_ram(arm,over.setup_peak_reserved_bytes,*limits.retained_bytes);
+                bool native_refused=false;
+                try { (void)plan_known_prefill_reservation(owners,8*gib_bytes,0,limits,0,0); }
+                catch (const std::invalid_argument& e) {
+                    const std::string message=e.what();
+                    native_refused=message.starts_with("UMA retained reservation exceeds explicit budget") &&
+                        message.find("[known-prefill live_bytes="+std::to_string(owners.reservation_upper_bound_bytes))!=std::string::npos &&
+                        message.find("growth_bytes="+std::to_string(8*gib_bytes))!=std::string::npos &&
+                        message.find("retained_limit_bytes="+std::to_string(*limits.retained_bytes))!=std::string::npos;
+                }
+                expect(native_refused,"mandatory native UMA overflow refuses with ledger details in default and RAM-OFF arms");
+            }
+        }
+    }
     for (const char* name : {"STRIX_SERVE_PREFILL","STRIX_KNOWN_PREFIX_WINDOW","STRIX_KNOWN_PREFIX_FULL_ROWS",
             "STRIX_KNOWN_PREFIX_EXPERT_UNION","STRIX_KNOWN_WINDOW_ROUTER_ROWS","STRIX_KNOWN_PREFIX_PREFILL_ROWS"}) {
         auto off=request; off.environment[name]="0";
@@ -515,9 +753,11 @@ void serve_prefill_admission_tests(const ModelContract& model, const ModelManife
         explicit_config.options.known_prefill_metadata_budget==startup.options.known_prefill_metadata_budget &&
         explicit_config.options.known_prefill_uma_budget==startup.options.known_prefill_uma_budget &&
         explicit_config.options.known_prefill_host_headroom==startup.options.known_prefill_host_headroom &&
-        explicit_config.options.known_prefix_tail_rows==startup.options.known_prefix_tail_rows &&
-        numerical_profile_pair(explicit_config.options)==numerical_profile_pair(startup.options),
-        "serve_prefill_production_guards: explicit T/budgets win and automatic organizations preserve arithmetic");
+        explicit_config.options.known_prefix_tail_rows==startup.options.known_prefix_tail_rows,
+        "serve_prefill_production_guards: explicit T/budgets win");
+    expect(numerical_profile_pair(explicit_config.options).decode==numerical_profile_pair(startup.options).decode &&
+        numerical_profile_pair(explicit_config.options).prefill==dense_a8_profile && !explicit_config.options.prefill_profile_automatic,
+        "serve_prefill_production_guards: an explicit tiled configuration keeps its resolved arithmetic");
     // Prefill alone fits at every tile; adding the verified first slot forces
     // a retry under either host-only or GTT-only pressure, including batch 0.
     for (const bool inspect : {false,true}) for (const bool single : {false,true}) {
@@ -1630,7 +1870,7 @@ void yarn_admission_tests(const gguf::FileInfo& info, const ModelManifest& manif
     }, qpf2k::startup_items);
     const Environment recorded_startup{
         {"STRIX_PLE_RECLAIMABLE","auto"}, {"STRIX_QPF2K_DENSE","1"},
-        {"STRIX_QPF2K_GDN","1"}, {"STRIX_QPF2K_GDN_CORE16","1"},
+        {"STRIX_QPF2K_GDN","1"},
         {"STRIX_QPF2K_GDN_GATES_BATCH","1"}, {"STRIX_QPF2K_HC","1"},
         {"STRIX_QPF2K_HC_MASK","14"}, {"STRIX_QPF2K_HC_OUTPUT3","1"},
         {"STRIX_QPF2K_HC_OUTPUT3_BAND","16"}, {"STRIX_QPF2K_MOE_DA16","1"},
@@ -3160,14 +3400,13 @@ int main(int argc, char** arguments) {
                     "fast profile applies provisional storage through native resolver without permission");
                 expect(moe_prefill_storage_name(got.options.prefill_moe_route_bf16) ==
                     std::string_view(enabled ? "fp16-v1+moeroute16" : "fp16-v1") &&
-                    got.options.product_profile.qualification() == (enabled ? (allow ?
-                        "qualification in progress: qsa_budget,moe_route_bf16; unqualified: gdn_fp16_chunk" :
-                        "qualification in progress: qsa_budget,moe_route_bf16")
+                    got.options.product_profile.qualification() == (enabled ?
+                        "qualification in progress: qsa_budget,moe_route_bf16,gdn_fp16_chunk"
                         : "qualified"),
                     "product receipt and actual storage identity agree");
                 const auto pair = numerical_profile_pair(got.options);
-                // fast with --allow-pending also runs the runnable GDN chunk candidate.
-                const unsigned gdn = enabled && allow ? prefill_option_bit(PrefillOption::gdn_fp16_chunk) : 0U;
+                // fast also runs the provisional GDN chunk candidate.
+                const unsigned gdn = enabled ? prefill_option_bit(PrefillOption::gdn_fp16_chunk) : 0U;
                 expect(got.prefill_option_mask == (kPrefillOptionsReady | gdn),
                     "every product profile retains the governed HC default");
                 const auto composed = prefill_arithmetic_identity(pair, got.prefill_option_mask, false);
@@ -3308,6 +3547,11 @@ int main(int argc, char** arguments) {
                 args.insert(args.end(), {"--http-batch", batch});
             args.insert(args.end(), {"--profile", "fast", "--print-effective-config"});
             auto selected = RequestedOptions{parse(args), {}};
+            auto deploy_args=args; deploy_args.insert(deploy_args.end(),{"--deploy","auto"});
+            const auto deploy_options=parse(deploy_args);
+            expect(deploy_options.http_batch_explicit==selected.options.http_batch_explicit &&
+                deploy_options.http_batch_cap==selected.options.http_batch_cap &&
+                !deploy_options.deployment_spec->slots,"deployment preserves plain HTTP routing and automatic slots");
             const auto got = resolve(selected, memory);
             expect(got.error.empty() && !got.options.prefill_moe_route_bf16,
                 "fast HTTP and MTP inspection softly decline candidate storage");
@@ -3315,7 +3559,7 @@ int main(int argc, char** arguments) {
             const auto reason = got.options.prefill_moe_route_bf16_reason;
             expect(row && row->status == qwen::profile::Status::pending && row->value == "0" &&
                 row->reason == reason && !reason.empty() && reason != "off" &&
-                got.options.product_profile.qualification() == "qualification in progress: qsa_budget",
+                got.options.product_profile.qualification() == "qualification in progress: qsa_budget,gdn_fp16_chunk",
                 "declined row reports builtin, pending and the storage decline reason");
             Environment exported;
             qwen::profile::apply(got.options.product_profile, [&](const char* key, const char* value) {
@@ -3385,12 +3629,209 @@ int main(int argc, char** arguments) {
         http.options.context_tokens=32768; http.options.context_explicit=true; http.options.unqualified_context=true;
         http.options.tokens.clear();
         const auto fast=resolve(http,memory);
-        expect(fast.options.known_prefix_prefill_rows==8192 && fast.options.automatic_prefill,
-            "HTTP allocates automatic T8192 before prompts arrive");
-        expect(fast.options.context_tokens==32768 && !fast.options.prefill_numerical_profile &&
-            fast.options.numerical_profile==resolve_prefill_effective_config(http,model,info,manifest,
-                validated_model_content_identity,capabilities,memory).options.numerical_profile,
-            "HTTP preserves context and numerical identity");
+        // This fixture's resolver pins STRIX_QPF2K_T16K=0 (the historical ladder), so the owner stays T8192.
+        expect(fast.options.known_prefix_prefill_rows==8192 && fast.options.automatic_prefill && !fast.t16k_policy_source &&
+            fast.serve_prefill_notice.find("T16384:STRIX_QPF2K_T16K-disabled")!=std::string::npos,
+            "HTTP allocates automatic T8192 before prompts arrive and prints why T16384 is declined");
+        expect(fast.options.context_tokens==32768 && fast.options.numerical_profile==dense_a8_profile &&
+            fast.options.prefill_profile_automatic,
+            "HTTP preserves context and resolves the single-request arithmetic");
+        {
+            // One route rule: for the same request shape the server resolves the single-request route.
+            const auto same_identity=[](const Options& a,const Options& b) {
+                return a.prefill_numerical_profile==b.prefill_numerical_profile &&
+                    a.prefill_profile_automatic==b.prefill_profile_automatic &&
+                    a.known_prefix_window==b.known_prefix_window && a.known_prefix_full_rows==b.known_prefix_full_rows &&
+                    a.known_prefix_expert_union==b.known_prefix_expert_union &&
+                    a.known_window_router_rows==b.known_window_router_rows &&
+                    a.known_prefix_output_policy==b.known_prefix_output_policy &&
+                    a.q51_slot_parallel_down==b.q51_slot_parallel_down && a.batched_moe_activation==b.batched_moe_activation &&
+                    a.wave8_q8_gdn_input==b.wave8_q8_gdn_input && a.wave8_q8_gdn_output==b.wave8_q8_gdn_output &&
+                    a.prefetch_q8_lm_head==b.prefetch_q8_lm_head && a.wave8_q8_lm_head==b.wave8_q8_lm_head &&
+                    a.wave8_q8_qsa_output==b.wave8_q8_qsa_output;
+            };
+            for (const std::size_t rows : {std::size_t{8192},std::size_t{32768}}) {
+                auto cli=request; cli.options.tokens.assign(rows,request.options.tokens.front());
+                if (rows==32768) cli.environment["STRIX_QPF2K_T16K"]="1";
+                const auto single=resolve(cli,memory);
+                auto shaped=http; shaped.options.context_tokens=single.options.context_tokens;
+                shaped.environment=cli.environment;
+                const auto server=resolve(shaped,memory);
+                expect(single.admitted && single.options.known_prefix_prefill_rows==(rows==8192?8192U:16384U),
+                    "single-request route admits the pinned request shape");
+                expect(server.options.known_prefix_prefill_rows==single.options.known_prefix_prefill_rows,
+                    "server primary tile equals the single-request tile for the same request shape");
+                expect(same_identity(server.options,single.options) && server.options.prefill_profile_automatic &&
+                    server.options.prefill_numerical_profile==DecodeNumericalProfile::fast_prefill_f16wmma_v1,
+                    "server prefill arithmetic and organization equal the single-request route");
+                expect(server.t16k_policy_source==single.t16k_policy_source,"server T16384 policy equals the single-request policy");
+                expect(server.serve_prefill_notice.find("arithmetic fp16")!=std::string::npos,"server route line names the arithmetic");
+                Options a=http.options;
+                const PromptRouteShape shape{rows};
+                const auto ra=resolve_prompt_route(a,cli.environment,capabilities,shape);
+                expect(ra.primary_rows==single.options.known_prefix_prefill_rows,"shared rule yields the admitted single-request tile");
+                // The automatic threshold is the same pure rule for a prompt and for a server's largest request.
+                Options prompt=http.options,owner=http.options;
+                PromptRouteShape serving{rows,true};
+                const auto automatic_prompt=resolve_prompt_route(prompt,Environment{},capabilities,shape);
+                const auto automatic_owner=resolve_prompt_route(owner,Environment{},capabilities,serving);
+                expect(automatic_prompt.primary_rows==(rows>=t16k_prompt_threshold?16384U:8192U) &&
+                    automatic_owner.primary_rows==automatic_prompt.primary_rows &&
+                    automatic_owner.t16k_policy_source==automatic_prompt.t16k_policy_source,
+                    "automatic T16384 threshold is one rule for both callers");
+            }
+            auto wide=http; wide.options.context_tokens=40960; wide.environment["STRIX_QPF2K_T16K"]="1";
+            auto pinned=wide; pinned.environment["STRIX_SERVE_T16K"]="0";
+            const auto t8=resolve(pinned,memory);
+            expect(t8.options.known_prefix_prefill_rows==8192 && t8.serve_prefill_notice.find("T16384:STRIX_SERVE_T16K=0")!=std::string::npos,
+                "server T16384 off switch keeps T8192 and prints the reason");
+            pinned=wide; pinned.environment["STRIX_SERVE_ROUTE"]="0";
+            const auto legacy=resolve(pinned,memory);
+            expect(legacy.options.known_prefix_prefill_rows==8192 && !legacy.options.prefill_profile_automatic &&
+                legacy.serve_prefill_notice.find("arithmetic preserved")!=std::string::npos,
+                "server route off switch keeps the earlier owner and arithmetic");
+            {
+                // One prefill organisation value: the admitted server owner takes the items the single-request route takes.
+                const auto policy=qpf2k::admitted_organization(qpf2k::PrefillOwner::resident_server);
+                const auto single_policy=qpf2k::admitted_organization(qpf2k::PrefillOwner::single_request);
+                expect(policy.items==qpf2k::prefill_organization_items && (single_policy.items&policy.items)==policy.items &&
+                    !(policy.items&(qpf2k::bit(qpf2k::Item::ple_reclaim)|qpf2k::bit(qpf2k::Item::cohort_lean)|
+                        qpf2k::bit(qpf2k::Item::rows_lean)|qpf2k::bit(qpf2k::Item::dispatch_fuse))),
+                    "server organisation is a subset of the single-request one without reclamation or decoding items");
+                const auto organised=[&](const EffectiveConfig& c,bool want,const char* skip=nullptr) {
+                    for(const auto& entry:qpf2k::defaults) {
+                        if(skip && std::string_view(skip)==entry.name) continue;
+                        const bool has=c.environment.contains(entry.name);
+                        if(policy.items&qpf2k::bit(entry.item)) {
+                            if(has!=want) return false;
+                            if(want && c.sources.at(entry.name)!=OptionSource::automatic) return false;
+                            if(want && c.environment.at(entry.name)!=std::string(entry.on)) return false;
+                        } else if(!(qpf2k::historical_items&qpf2k::bit(entry.item)) && has) return false;
+                    }
+                    return true;
+                };
+                const auto shared=resolve(http,memory);
+                expect(shared.options.known_prefix_prefill_rows && organised(shared,true) &&
+                    shared.serve_prefill_notice.find("prefill organization shared with the single-request route (13 items automatic, row pipeline 255)")!=std::string::npos,
+                    "admitted server owner takes the shared prefill organisation and prints it");
+                for(const auto& entry:qpf2k::defaults)
+                    if(qpf2k::historical_items&qpf2k::bit(entry.item))
+                        expect(!shared.environment.contains(entry.name) || shared.sources.at(entry.name)==OptionSource::automatic,
+                            "startup items keep their automatic provenance after the organisation is applied");
+                // ONE RESOLVER: the same request through the single-request entry and the resident entry ends with
+                // the same value of every default, or the difference is named with its reason in the server notice.
+                const auto single=resolve(request,memory);
+                expect(single.options.known_prefix_prefill_rows && single.environment.contains("STRIX_PREFILL_PIPE") &&
+                    single.environment.at("STRIX_PREFILL_PIPE")==shared.environment.at("STRIX_PREFILL_PIPE"),
+                    "both entry points resolve the same row-pipeline value");
+                for(const auto& entry:qpf2k::defaults) {
+                    const auto a=single.environment.find(entry.name),b=shared.environment.find(entry.name);
+                    const bool same=(a==single.environment.end())==(b==shared.environment.end()) &&
+                        (a==single.environment.end() || a->second==b->second);
+                    if(same) continue;
+                    const char* reason=qpf2k::serving_exclusion_reason(entry.item);
+                    expect(reason && shared.serve_prefill_notice.find(std::string(entry.name)+" ("+reason+")")!=std::string::npos,
+                        (std::string("unexplained difference between the entry points: ")+entry.name).c_str());
+                }
+                expect(shared.serve_prefill_notice.find("UNEXPLAINED")==std::string::npos,
+                    "every single-request default the server does not take carries a reason");
+                auto off=http; off.environment["STRIX_SERVE_PREFILL_ORG"]="0";
+                const auto startup_only=resolve(off,memory);
+                expect(organised(startup_only,false) &&
+                    startup_only.serve_prefill_notice.find("prefill organization startup items only")!=std::string::npos,
+                    "server organisation off switch keeps the startup items only");
+                expect(organised(legacy,false),"earlier server rule takes no organisation item");
+                off=http; off.environment["STRIX_QSA_NORM_GROUP"]="0"; off.environment["STRIX_PREFILL_PIPE"]="2";
+                const auto item_off=resolve(off,memory);
+                expect(item_off.environment.at("STRIX_QSA_NORM_GROUP")=="0" && item_off.environment.at("STRIX_PREFILL_PIPE")=="2" &&
+                    item_off.sources.at("STRIX_QSA_NORM_GROUP")==OptionSource::explicit_value &&
+                    item_off.sources.at("STRIX_PREFILL_PIPE")==OptionSource::explicit_value &&
+                    item_off.environment.at("STRIX_QSA_ATTEND_BATCH")=="1" &&
+                    item_off.serve_prefill_notice.find("(11 items automatic, row pipeline 2)")!=std::string::npos,
+                    "explicit item values survive the shared organisation");
+                off=http; off.environment["STRIX_QPF2K_DEFAULTS"]="0";
+                expect(organised(resolve(off,memory),false),"defaults off switch also suppresses the server organisation");
+            }
+            pinned=http; pinned.environment["STRIX_PREFILL_F16"]="0";
+            const auto no_f16=resolve(pinned,memory);
+            expect(!no_f16.options.prefill_numerical_profile &&
+                no_f16.serve_prefill_notice.find("automatic fp16 declined: STRIX_PREFILL_F16=0")!=std::string::npos,
+                "server prints why the automatic arithmetic is declined");
+            auto slots=memory;
+            slots.estimate=[&](const Options& o) {
+                auto r=memory.estimate(o); if(o.known_prefix_prefill_rows==16384) r.workspace=128*gib_bytes; return r;
+            };
+            const auto fallback=resolve(wide,slots);
+            expect(fallback.options.known_prefix_prefill_rows==8192 && fallback.options.prefill_profile_automatic &&
+                fallback.serve_prefill_notice.find("T16384:memory")!=std::string::npos,
+                "server falls back to T8192 with the shared arithmetic when T16384 does not fit, and says why");
+        }
+        {
+            // T16384 admission charges the retained stack of every additional slot (the runtime capacity equation):
+            // a margin of two retained stacks beside four slots must fall back to T8192; three admit T16384.
+            auto wide=http; wide.options.context_tokens=40960; wide.environment["STRIX_QPF2K_T16K"]="1";
+            wide.options.http_batch=4;
+            const std::uint64_t stack=256ULL*1024ULL*1024ULL;
+            auto stacked=memory;
+            stacked.estimate=[&](const Options& o) { auto r=memory.estimate(o); r.http_slot_retained=stack; return r; };
+            const auto bare=resolve(wide,memory);
+            expect(bare.options.known_prefix_prefill_rows==16384,"four-slot server admits T16384 when slots retain nothing");
+            const auto bridge_total=bare.host_compilation.at("serve_committed_host_peak_bytes");
+            stacked.available=bridge_total+2U*stack;
+            const auto short_by_one=resolve(wide,stacked);
+            expect(short_by_one.options.known_prefix_prefill_rows==8192 &&
+                short_by_one.serve_prefill_notice.find("T16384:memory:host-available")!=std::string::npos,
+                "T16384 admission falls back to T8192 when the retained stacks of the additional slots do not fit");
+            stacked.available=bridge_total+3U*stack;
+            const auto exact=resolve(wide,stacked);
+            expect(exact.options.known_prefix_prefill_rows==16384 &&
+                exact.host_compilation.at("serve_committed_host_peak_bytes")==bridge_total+3U*stack,
+                "T16384 admission charges exactly (slots - 1) retained stacks");
+            auto one=wide; one.options.http_batch=1;
+            stacked.available=bridge_total;
+            expect(resolve(one,stacked).options.known_prefix_prefill_rows==16384,"a one-slot T16384 server charges no additional stack");
+        }
+        {
+            // Default decode adoption on a valid explicit-sidecar MTP server: the governed exclusions are applied
+            // before the combined decode/prefill candidate is validated, so the adoption is not discarded.
+            auto sidecar_argv=mtp_fixture(); sidecar_argv.insert(sidecar_argv.begin()+5,13,"1");
+            sidecar_argv.insert(sidecar_argv.end(),{"--http-serve","--http-batch","0",
+                "--mtp-window-expert-union","--mtp-window-prefix","--mtp-window-hyper-mix","--mtp-window-qsa-rows"});
+            const auto set_value=[&](const char* flag,const char* value) {
+                const auto it=std::find(sidecar_argv.begin(),sidecar_argv.end(),flag);
+                if(it==sidecar_argv.end()) sidecar_argv.insert(sidecar_argv.end(),{flag,value}); else *(it+1)=value;
+            };
+            for(const auto& [flag,value] : std::vector<std::pair<const char*,const char*>>{
+                {"--mtp-normalized-rounding","bf16-rne"},{"--mtp-sidecar-retained-bytes","3221225472"},
+                {"--mtp-sidecar-setup-bytes","4294967296"},{"--mtp-golden-max-bytes","6442450944"},
+                {"--mtp-replay-host-bytes","6442450944"},{"--mtp-runtime-bytes","134217728"},
+                {"--mtp-target-capture-bytes","268435456"},{"--mtp-candidate-depth","7"},
+                {"--mtp-target-window-rows","8"},{"--mtp-window-arena-bytes","2147483648"},
+                {"--mtp-window-capture-bytes","67108864"},{"--mtp-window-checkpoint-bytes","8589934592"},
+                {"--mtp-window-total-bytes","17179869184"},{"--mtp-window-history-intervals","8192"},
+                {"--mtp-window-expert-union-bytes","65536"},{"--mtp-target-window-rows-set","2,4,8"}}) set_value(flag,value);
+            auto sidecar=RequestedOptions{parse(sidecar_argv),{}};
+            const auto governed_excluded = prefill_option_bit(PrefillOption::hc_output_wmma) |
+                prefill_option_bit(PrefillOption::index_proj_wmma) | prefill_option_bit(PrefillOption::gdn_fp16_chunk) |
+                prefill_option_bit(PrefillOption::index_score_wmma);
+            expect(sidecar.options.mtp.enabled && !sidecar.options.mtp_native_bundle &&
+                !sidecar.options.numerical_profile_explicit && sidecar.options.numerical_profile!=dense_a8_profile,
+                "sidecar adoption fixture is an explicit-sidecar MTP server without a decode profile");
+            const auto adopted=resolve(sidecar,memory);
+            expect(adopted.options.numerical_profile==dense_a8_profile && adopted.options.prefill_profile_automatic &&
+                adopted.options.prefill_numerical_profile==DecodeNumericalProfile::fast_prefill_f16wmma_v1 &&
+                adopted.options.resolved_prefill_option_mask && (adopted.options.prefill_disabled & governed_excluded)==governed_excluded &&
+                !(*adopted.options.resolved_prefill_option_mask & governed_excluded) &&
+                adopted.prefill_option_mask==*adopted.options.resolved_prefill_option_mask &&
+                adopted.serve_prefill_notice.find("decode profile dense-a8 automatic")!=std::string::npos &&
+                adopted.serve_prefill_notice.find("governed MTP")!=std::string::npos,
+                "sidecar MTP server adopts dense-A8 decode with automatic fp16 and the governed exclusion mask");
+            sidecar.environment["STRIX_SERVE_FP16_MTP"]="0";
+            const auto kept=resolve(sidecar,memory);
+            expect(kept.options.numerical_profile==sidecar.options.numerical_profile && !kept.options.prefill_profile_automatic &&
+                !kept.options.prefill_numerical_profile,
+                "sidecar MTP server with the FP16 off switch keeps its previous decode and prefill arithmetic");
+        }
         expect(fast.options.known_prefix_tail_rows==std::vector<std::uint32_t>({1024,256,64,16}),
             "HTTP keeps all tail owners for future requests");
         auto context=http; context.options.context_tokens=4096;

@@ -9,7 +9,7 @@ inline YarnEnvironmentPath yarn_environment_path(qpf2k::Item item) {
         // hip_indexed_attention_launcher.hip:5768-5825,5885-5890,5993-6020;
         // hip_qsa_prefill_batch.inc:193-220 (batched table/norm/pool).
         return YarnEnvironmentPath::b3_rotary;
-    case sched: case dense: case gdn: case gdn_gates_batch: case gdn_core16:
+    case sched: case dense: case gdn: case gdn_gates_batch:
     case hc: case hc_mask: case hc_output3: case hc_output3_band: case hc_lowband:
     case moe_da16: case moe_route: case ple_reclaim: case dense_rows: case pipe:
     case attend_batch: case score_park: case index_rows: case cohort_lean:
@@ -93,6 +93,10 @@ inline constexpr std::array yarn_environment_rules{
     // guard separately bounds explicit MTP and refuses caching and HTTP.
     YarnEnvironmentRule{"STRIX_PREFIX_BATCH_CERT", YarnEnvironmentClass::nonrotary, ""},
     YarnEnvironmentRule{"STRIX_SERVE_PREFILL", YarnEnvironmentClass::nonrotary, ""},
+    YarnEnvironmentRule{"STRIX_SERVE_ROUTE", YarnEnvironmentClass::nonrotary, ""},
+    YarnEnvironmentRule{"STRIX_SERVE_PREFILL_ORG", YarnEnvironmentClass::nonrotary, ""},
+    YarnEnvironmentRule{"STRIX_SERVE_T16K", YarnEnvironmentClass::nonrotary, ""},
+    YarnEnvironmentRule{"STRIX_SERVE_FP16_MTP", YarnEnvironmentClass::nonrotary, ""},
     YarnEnvironmentRule{"STRIX_BATCH_PROMPT_SMALL", YarnEnvironmentClass::nonrotary, ""},
     YarnEnvironmentRule{"STRIX_PREFIX_CACHE_INFLIGHT", YarnEnvironmentClass::nonrotary, ""},
     YarnEnvironmentRule{"STRIX_PREFIX_CACHE_DISK", YarnEnvironmentClass::nonrotary, ""},
@@ -105,8 +109,8 @@ inline constexpr std::array yarn_environment_rules{
     YarnEnvironmentRule{"STRIX_QPF2K_MOE_DEFAULTED", YarnEnvironmentClass::nonrotary, ""},
     YarnEnvironmentRule{"STRIX_QPF2K_DEFAULTS", YarnEnvironmentClass::nonrotary, ""},
     YarnEnvironmentRule{"STRIX_PREFILL_F16", YarnEnvironmentClass::nonrotary, ""},
-    // No rotary: DA16 certificate down (src/hip_moe_prefill_da16.inc:140;
-    // src/hip_moe_da16_down_body.inc:103-104) only rounds route-dot storage;
+    // No rotary: DA16 certificate down (src/moe_core/hip_moe_prefill_da16.inc:140;
+    // src/moe_core/hip_moe_da16_down_body.inc:103-104) only rounds route-dot storage;
     // scalar/vector merge/commit (src/hip_moe_experts_launcher.hip:2768,2773;
     // src/hip_moe_prefill_commit.inc:18,71,115-117) only widens it before FMA.
     // Match the candidate parser: empty or any 0-prefix is OFF, all other

@@ -67,6 +67,17 @@ float dot_f32_fast(const float* a, const float* b, std::uint32_t k) {
 }  // namespace
 
 void HostLinear::run(const QLinear& w, const std::uint16_t* x, std::uint32_t m, std::uint16_t* y) {
+    if (!w.bf16.empty()) {
+        parallel_for(m, [&](std::uint64_t r) {
+            for (std::uint32_t c = 0; c < w.n; ++c) {
+                float s = 0;
+                for (std::uint32_t j = 0; j < w.k; ++j)
+                    s = s + bf(x[r * w.k + j]) * bf(w.bf16[static_cast<std::size_t>(c) * w.k + j]);
+                y[r * w.n + c] = tob(s);
+            }
+        });
+        return;
+    }
     const std::uint32_t k = w.k, n = w.n;
     std::vector<std::int8_t> q(static_cast<std::size_t>(m) * k);
     std::vector<float> rs(m);
@@ -79,7 +90,13 @@ void HostLinear::run(const QLinear& w, const std::uint16_t* x, std::uint32_t m, 
     parallel_for((n + kCB - 1) / kCB, [&](std::uint64_t cb) {
         const std::uint32_t c0 = static_cast<std::uint32_t>(cb) * kCB, c1 = std::min(n, c0 + kCB);
         for (std::uint32_t c = c0; c < c1; ++c) {
-            const std::int8_t* wr = w.w.data() + static_cast<std::size_t>(c) * k;
+            std::vector<std::int8_t> decoded;
+            const std::int8_t* wr;
+            if (w.operand==gemm::Operand::w4a8) {
+                decoded.resize(k);
+                for (std::uint32_t j=0;j<k;++j) decoded[j]=w.packed.at(w.w.data(),std::size_t(c)*k+j);
+                wr=decoded.data();
+            } else wr=w.w.data() + static_cast<std::size_t>(c) * k;
             for (std::uint32_t r = 0; r < m; ++r)
                 y[static_cast<std::size_t>(r) * n + c] = gemm::epilogue(dot_i8_fast(q.data() + static_cast<std::size_t>(r) * k, wr, k), rs[r], w.ws[c]);
         }
@@ -436,6 +453,15 @@ bool select_heads(const GlobalWeights& g, const ForwardPlan& p, const PddContext
             i = j;
         }
     const float sn = ss[std::min(i + 1, ss.size() - 1)];
+    if (g.pdd_fused) {
+        if (ss.size() != n + 1 || i >= n) throw std::runtime_error("final layer: fused head schedule mismatch");
+        const auto& src = g.video_out;
+        vh.n = src.n / n; vh.k = src.k;
+        const auto off = static_cast<std::size_t>(i) * vh.n;
+        vh.w.assign(src.w.begin() + off * vh.k, src.w.begin() + (off + vh.n) * vh.k);
+        vh.b.assign(src.b.begin() + off, src.b.begin() + off + vh.n);
+        return true;
+    }
     auto idx = [&](float s) {
         const float base = time_shift_sigma_f32(s, pdd->shift_video, 1.0F);
         return static_cast<std::int64_t>(round_half_even(static_cast<double>(1.0F - base) * n));
@@ -444,7 +470,7 @@ bool select_heads(const GlobalWeights& g, const ForwardPlan& p, const PddContext
     start = std::min<std::int64_t>(start, n - 1);
     stop = std::max<std::int64_t>(stop, start + 1);
     vh = pdd_head(g.video_out, n, static_cast<std::uint32_t>(start), static_cast<std::uint32_t>(stop), pdd->shift_video);
-    ah = pdd_head(g.audio_out, n, static_cast<std::uint32_t>(start), static_cast<std::uint32_t>(stop), pdd->shift_audio);
+    if (g.audio_enabled) ah = pdd_head(g.audio_out, n, static_cast<std::uint32_t>(start), static_cast<std::uint32_t>(stop), pdd->shift_audio);
     return true;
 }
 
@@ -479,7 +505,7 @@ FinalRows final_layer_host(const GlobalWeights& g, const std::vector<std::uint16
         });
     };
     run(L.find(SegKind::video), p.video_t_row, *vh, fr.video);
-    run(L.find(SegKind::audio), p.audio_t_row, *ah, fr.audio);
+    if (g.audio_enabled) run(L.find(SegKind::audio), p.audio_t_row, *ah, fr.audio);
     return fr;
 }
 

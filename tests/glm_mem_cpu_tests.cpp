@@ -20,6 +20,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <limits>
 #include <string>
 #include <thread>
 #include <vector>
@@ -268,11 +269,39 @@ void test_e1_plan() {
     CHECK(!threw);
 }
 
+// ---------------------------------------------------------------- watchdog thresholds: caller-budgeted host memory
+void test_watchdog_budget() {
+    const char* previous = std::getenv("STRIX_GLM_WD_RSS_GIB");
+    const bool had_previous = previous != nullptr;
+    const std::string saved = previous ? previous : "";
+    ::unsetenv("STRIX_GLM_WD_RSS_GIB");
+    const std::uint64_t base = mem::Watchdog{}.max_rss;
+    CHECK(mem::Watchdog::from_env().max_rss == base);
+    // A budgeted prefix cache is not a leak: the default limit moves with it (16 GiB of snapshots alone pass 8 GiB).
+    CHECK(mem::Watchdog::from_env(16 * mem::kGiB).max_rss == base + 16 * mem::kGiB);
+    CHECK(mem::Watchdog::from_env(std::numeric_limits<std::uint64_t>::max()).max_rss == std::numeric_limits<std::uint64_t>::max());
+    // An explicit limit is taken as given, 0 (off) included.
+    ::setenv("STRIX_GLM_WD_RSS_GIB", "12", 1);
+    CHECK(mem::Watchdog::from_env(16 * mem::kGiB).max_rss == 12 * mem::kGiB);
+    ::setenv("STRIX_GLM_WD_RSS_GIB", "0", 1);
+    CHECK(mem::Watchdog::from_env(16 * mem::kGiB).max_rss == 0);
+    ::unsetenv("STRIX_GLM_WD_RSS_GIB");
+    // The other thresholds do not move.
+    const auto d = mem::Watchdog::from_env(), w = mem::Watchdog::from_env(16 * mem::kGiB);
+    CHECK(w.min_ram_headroom == d.min_ram_headroom && w.max_swap_growth == d.max_swap_growth && w.max_gtt_used == d.max_gtt_used);
+    if (had_previous) ::setenv("STRIX_GLM_WD_RSS_GIB", saved.c_str(), 1);
+    else ::unsetenv("STRIX_GLM_WD_RSS_GIB");
+}
+
 // ---------------------------------------------------------------- monitor: trace + watchdog
 void test_monitor(const fs::path& tmp) {
     const fs::path d = tmp / "mon";
     fs::create_directories(d);
     const std::string mi = (d / "meminfo").string(), trace = (d / "trace.tsv").string();
+    // The zone layout is synthetic too (no CMA): the host's /proc/zoneinfo would subtract its own CMA area from the
+    // synthetic MemAvailable, and the headroom below would depend on the machine running the test.
+    const std::string zi = (d / "zoneinfo").string();
+    write_file(zi, "Node 0, zone   Normal\n  pages free     1000000\n");
     write_file(mi, meminfo(40 * 1048576ULL, 0, 8388604));
     std::atomic<int> aborted{0};
     std::string reason;
@@ -282,7 +311,7 @@ void test_monitor(const fs::path& tmp) {
         wd.min_ram_headroom = 4 * mem::kGiB;
         wd.max_swap_growth = 1 * mem::kGiB;
         wd.max_rss = 0;
-        mem::Monitor m(mem::Probe({mi, "/proc/self/status", "/nonexistent"}), trace, wd,
+        mem::Monitor m(mem::Probe({mi, "/proc/self/status", "/nonexistent", zi}), trace, wd,
                        [&](const std::string& why) {
                            std::lock_guard<std::mutex> g(mu);
                            reason = why;
@@ -315,7 +344,7 @@ void test_monitor(const fs::path& tmp) {
         mem::Watchdog wd;
         wd.max_rss = 0;
         wd.max_swap_growth = 1 * mem::kGiB;
-        mem::Monitor m(mem::Probe({mi, "/proc/self/status", "/nonexistent"}), "", wd, [&](const std::string& why) {
+        mem::Monitor m(mem::Probe({mi, "/proc/self/status", "/nonexistent", zi}), "", wd, [&](const std::string& why) {
             std::lock_guard<std::mutex> g(mu);
             reason = why;
             aborted.fetch_add(1);
@@ -333,7 +362,7 @@ void test_monitor(const fs::path& tmp) {
         wd.min_ram_headroom = 0;
         wd.max_swap_growth = 0;
         wd.max_rss = 1 * mem::kMiB;
-        mem::Monitor m(mem::Probe({mi, "/proc/self/status", "/nonexistent"}), "", wd, [&](const std::string&) { aborted.fetch_add(1); },
+        mem::Monitor m(mem::Probe({mi, "/proc/self/status", "/nonexistent", zi}), "", wd, [&](const std::string&) { aborted.fetch_add(1); },
                        20, 100);
         for (int i = 0; i < 50 && aborted.load() == 0; ++i) std::this_thread::sleep_for(std::chrono::milliseconds(10));
         CHECK(aborted.load() == 1);
@@ -367,7 +396,7 @@ void test_monitor(const fs::path& tmp) {
         wd.max_rss = 0;
         const std::string mi2 = (d / "meminfo2").string();
         write_file(mi2, meminfo(40 * 1048576ULL, 0, 8388604));
-        mem::Monitor m(mem::Probe({mi2, "/proc/self/status", "/nonexistent"}), "", wd, [&](const std::string& why) {
+        mem::Monitor m(mem::Probe({mi2, "/proc/self/status", "/nonexistent", zi}), "", wd, [&](const std::string& why) {
             std::lock_guard<std::mutex> g(mu);
             reason = why;
             aborted.fetch_add(1);
@@ -396,7 +425,7 @@ void test_monitor(const fs::path& tmp) {
         const auto t0 = std::chrono::steady_clock::now();
         double fired = -1;
         {
-            mem::Monitor m(mem::Probe({mi, "/proc/self/status", "/nonexistent"}), sink, wd, [&](const std::string&) {
+            mem::Monitor m(mem::Probe({mi, "/proc/self/status", "/nonexistent", zi}), sink, wd, [&](const std::string&) {
                 fired = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
                 aborted.fetch_add(1);
             }, 20, 20, 300);
@@ -416,7 +445,7 @@ void test_monitor(const fs::path& tmp) {
         mem::Watchdog wd;
         wd.enabled = false;
         wd.max_rss = 1;
-        mem::Monitor m(mem::Probe({mi, "/proc/self/status", "/nonexistent"}), "", wd, [&](const std::string&) { aborted.fetch_add(1); },
+        mem::Monitor m(mem::Probe({mi, "/proc/self/status", "/nonexistent", zi}), "", wd, [&](const std::string&) { aborted.fetch_add(1); },
                        20, 100);
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
@@ -656,6 +685,7 @@ int main(int argc, char** argv) {
     test_admit();
     test_cost_model();
     test_e1_plan();
+    test_watchdog_budget();
     test_monitor(tmp);
     test_pack(tmp);
     fs::remove_all(tmp);

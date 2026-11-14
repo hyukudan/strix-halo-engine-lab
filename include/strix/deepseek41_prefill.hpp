@@ -1,6 +1,7 @@
 #pragma once
 
 #include "strix/deepseek41_attention_state.hpp"
+#include "strix/session/embed_splice.hpp"
 
 #include <cstdint>
 #include <filesystem>
@@ -32,9 +33,14 @@ struct PrefillOptions {
     // FAST lever ds41-attn-f16wmma-v1 (STRIX_DS41_FAST_ATTN=1): non-exact f16 WMMA attention, prefill only, layers
     // [approx_layer_first, approx_layer_end); bf16_attention wins where both are set
     bool fast_attention = false;
+    // with fast_attention: FAST lever ds41-attn-bf16flash-v1 (STRIX_DS41_FAST_ATTN=2) instead of ds41-attn-f16wmma-v1:
+    // the shared sparse flash core on BF16 WMMA, one pass per product, keys from BF16 mirrors. Runs of a new prompt
+    // (start 0) require a multiple of 32 heads; extensions keep ds41-attn-f16wmma-v1.
+    bool fast_attention_flash = false;
     // FAST lever ds41-moe-relaxed-v1 (STRIX_DS41_FAST_MOE=1): routed experts in relaxed order. Read from the environment by
     // the MoE dispatch; set_precision_for_new_sequence applies an explicit value (quality arms).
     bool fast_moe = false;
+    bool fast_dense = false;  // FAST lever ds41-dense-f16-v1 (STRIX_DS41_FAST_DENSE=1): dense Q8_0 x A8 products in one FP16 WMMA chain
     // Diagnostics/selection for the non-exact paths (no effect while both switches above are off, except null_ulp_layer):
     // projection bits 1 q_a, 2 kv, 4 q_b, 8 o_a, 16 o_b; layers [approx_layer_first, approx_layer_end); FP16 only at
     // calls of at least fp16_min_rows rows; fp16_keep_a8: FP16 operands from the A8 codes (the exact path's activations)
@@ -82,6 +88,7 @@ struct PrefillOptions {
     bool expert_tp = false;
     bool engram_direct_io = true;        // Engram rows from the NVMe with O_DIRECT (else the file mapping)
     bool stream_hashes = false;          // FNV of the last row's residual stream after each layer (gate against decode)
+    bool verify_embed_extras = false;    // identity gate only: independent dead-hash and device image-router probes
     bool gather_logits = true;           // world 2: exchange the vocabulary slices so both ranks hold every logit
     bool timing = false;                 // per-layer wall times (synchronises at every layer end)
     // Exact suffix replay (the full 40 layers only): decoder layers compute only the cone of rows the final state and
@@ -137,6 +144,7 @@ struct PrefillResult {
     std::uint32_t next_token = 0;
     bool decoder_deferred = false;     // set_decoder_deferral admitted: no logits / next token / seed, decode state completed by the next run
     std::vector<std::uint64_t> stream_hashes;  // last row, after each layer (stream_hashes)
+    bool embed_dead_hash_checked = false, embed_image_router_checked = false; // verify_embed_extras evidence
     double seconds = 0.0, engram_seconds = 0.0, head_seconds = 0.0;
     double engram_wait_seconds = 0.0;  // overlapped Engram read: the part the run waited for (before the Engram layers)
     std::vector<PrefillLayerTiming> layers;
@@ -238,6 +246,8 @@ public:
     // must use separate precision identities. Intended for controlled quality comparisons.
     void set_precision_for_new_sequence(bool fp16_dense, bool bf16_attention);
     // The same, with every diagnostic/selection field of PrefillOptions (fp16_*, approx_*, null_ulp_layer, trace).
+    // Enabling flash prepares its mirrors before changing precision; allocation failure propagates.
+    // FAST dense/MoE overrides are process-wide: serialize this call with execution in all engine instances.
     void set_precision_for_new_sequence(const PrefillOptions& precision);
     // The exact dense selector for the next sequences (same bits either way; in-process A/B of its speed): on = every
     // exact dense call with the per-site form of STRIX_DS41_DENSE_TALL=auto and q_b / o_a on the dense kernel; off =
@@ -260,6 +270,7 @@ public:
     struct DraftSeed {
         std::array<const float*, 3> streams{};
         std::uint32_t rows = 0, first = 0;
+        std::uint32_t row_elements = 0; // hc * hidden; permits byte-exact seed inspection
     };
     [[nodiscard]] DraftSeed draft_seed() const noexcept;
     // FNV of every layer's attention state after the last run (the ring's live window, the used compressed KV and
@@ -286,6 +297,21 @@ public:
     // cache, so the next run's read is served from host memory (the same bytes; nothing else changes). A next run with
     // other tokens or boundaries reads what the cache misses as before. STRIX_DS41_ENGRAM_LOOKAHEAD=0: ignored.
     void set_engram_lookahead(std::span<const std::uint32_t> next);
+    // Provided embedding rows of the next run (run / extend / begin_run / begin_extend; one run only): the run's rows
+    // named by the splice take their layer-0 input from it instead of the embedding table (every residual stream
+    // copy; width = hidden size; checked before the run computes anything, std::invalid_argument). The run's `tokens`
+    // hold a vocabulary id for those rows too (session::resolve_embed_run gives both). Rows of a segment with
+    // `extras` are image rows: the routers use their image bias and the Engram treats them as dead n-gram
+    // positions; a segment without it is handled exactly as the token rows it replaces. Positions are the prompt
+    // index, as for text. A caller that keeps a token history for import_state / the decode engines marks image
+    // rows with ds41::engram_dead_token. With two ranks both must be given the same splice. Not during a task.
+    void set_embed_rows(session::EmbedSplice splice);
+    // The embedding table's rows of `tokens`, [tokens][hidden] IEEE binary16 bits (identity gates of the splice).
+    [[nodiscard]] std::vector<std::uint16_t> embedding_rows(std::span<const std::uint32_t> tokens) const;
+    // Device bytes the splice staging can reach for runs with at most `rows` provided rows.
+    [[nodiscard]] static constexpr std::uint64_t embed_staging_bytes(std::uint64_t rows, std::uint64_t hidden) noexcept {
+        return session::embed_splice_staging_bytes(rows, hidden) + 256U;
+    }
     // The next run (run / extend / begin) is followed by `next_rows` more rows of the same sequence and nobody reads its
     // decode state, logits or seed: its decoder layers then skip their cone (only the first decoder layer's compressed-KV /
     // index-key entries of every row, which the later runs read, are computed). Admitted only for the full layer set with

@@ -351,6 +351,7 @@ void test_port_extensions() {
     mo::observe_reset_for_tests();
     auto i = info();
     i.draft = true;
+    i.prefix_cache = true;
     i.legacy = {{"mm_queued", "gauge", "Queued."}, {"mm_steps", "counter", "Decode steps."}};
     mo::Observer obs(i);
     auto r = record("chatcmpl-1", 10, 5);
@@ -360,6 +361,7 @@ void test_port_extensions() {
     obs.record(r2);
     const auto s = strix::serve::parse_json(obs.status(snapshot(), false, false).dump());
     check(at(at(s, "capabilities"), "draft").as_bool(), "capabilities.draft from the configuration");
+    check(at(at(s, "capabilities"), "prefix_cache").as_bool(), "capabilities.prefix_cache from the configuration");
     const auto& list = at(s, "requests").as_array();
     check(at(list[1], "max_gap_ms").as_double() == 61.5 && at(list[0], "max_gap_ms").is_null(), "max_gap_ms number or null");
     // a build with more legacy lines passes its own text and table; unknown names are untyped

@@ -1,6 +1,10 @@
+#include "strix/env_flags.hpp"
+#include "strix/ds41_fast_profile.hpp"
+#include <map>
 #include "strix/deepseek41_pair_defaults.hpp"
 #include "strix/deepseek41_pair_profile_table.hpp"
 #include "strix/deepseek41_serve_cache_policy.hpp"
+#include "strix/session/speculation_default.hpp"
 
 #include <algorithm>
 #include <array>
@@ -105,7 +109,7 @@ void resolve_sessions(App app, Resolved& r, const Getenv& env, const Probe& prob
     c.disk_bytes = disk_budget.empty() ? 0 : number(disk_budget);
     std::string effective_draft;
     for (std::size_t i = 0; i < r.args.size(); ++i) {
-        if (r.args[i] == "--no-dspark") effective_draft.clear();
+        if (r.args[i] == "--no-dspark" || strix::session::speculation_opt_out_argument(r.args[i])) effective_draft.clear();
         else if (r.args[i] == "--dspark" && i + 1 < r.args.size()) effective_draft = r.args[++i];
     }
     const std::string route = !effective_draft.empty() ? "tp2-http-batch-dspark" : "tp2-http-target";
@@ -247,12 +251,36 @@ Resolved resolve(App app, const std::vector<std::string>& in, const Getenv& raw_
     }
     // Product profile first: its switches are environment for everything below (an explicit one wins).
     strix::profile::Inputs profile_inputs;
-    profile_inputs.env = raw_env;
+    // Resolve the bundle before admission, reporting and rank agreement. An explicit
+    // component OFF wins. Canonical strings are also exported for execution/cache readers.
+    std::map<std::string, std::string> fast_env;
+    const auto enabled = [](const char* v) { return v && std::string_view(v) == "1"; };
+    const bool bundle = enabled(raw_env("STRIX_DS41_FAST_PREFILL"));
+    if (const char* value = raw_env("STRIX_DS41_FAST_PREFILL"); value && *value)
+        fast_env.emplace("STRIX_DS41_FAST_PREFILL", bundle ? "1" : "0");
+    if (const char* value = raw_env("STRIX_DS41_FAST_DENSE_MIN_ROWS");
+        (value && *value) || bundle || enabled(raw_env("STRIX_DS41_FAST_DENSE")))
+        fast_env.emplace("STRIX_DS41_FAST_DENSE_MIN_ROWS", std::to_string(
+            strix::ds41::fast_profile::dense_min_rows_value(value)));
+    for (const char* key : {"STRIX_DS41_FAST_ATTN", "STRIX_DS41_FAST_MOE", "STRIX_DS41_FAST_DENSE"}) {
+        const char* value = raw_env(key);
+        const bool attention = std::string_view(key) == "STRIX_DS41_FAST_ATTN";
+        if (value && *value)
+            fast_env.emplace(key, attention && std::string_view(value) == "2" ? "2" : enabled(value) ? "1" : "0");
+        else if (bundle) fast_env.emplace(key, attention ? "2" : "1");
+    }
+    profile_inputs.env = [&](const char* key) -> const char* {
+        const auto it = fast_env.find(key);
+        if (it != fast_env.end()) return it->second.c_str();
+        const char* value = raw_env(key);
+        return value && *value ? value : nullptr;
+    };
     strix::profile::take_options(profile_engine(), user, profile_inputs);
     r.profile = strix::profile::resolve(profile_engine(), profile_inputs);
     std::vector<std::pair<std::string, std::string>> profile_env;
     for (const auto& e : r.profile->entries)
-        if (!e.lever->env.empty() && strix::profile::applied(e.status))
+        if (!e.lever->env.empty() &&
+            (strix::profile::applied(e.status) || fast_env.contains(std::string(e.lever->env))))
             profile_env.emplace_back(std::string(e.lever->env), e.value);
     r.set_env = profile_env;
     if (auto extra = strix::profile::profile_args(*r.profile); !extra.empty())
@@ -340,7 +368,10 @@ Resolved resolve(App app, const std::vector<std::string>& in, const Getenv& raw_
     if (app == App::serve) {
         def.insert(def.end(), {"--peer-timeout", "120", "--prefill-path", "device", "--slots", "8", "--prefill-rows", "auto"});
         const char* rows16 = env("STRIX_DS41_BATCH_ROWS16");
-        if (has(user, "--no-dspark") || has(user, "--dspark") || model.empty()) {
+        if (has(user, "--no-dspark") || has(user, strix::session::speculation_opt_out_flag.data()) || has(user, "--dspark") ||
+            model.empty()) {
+        } else if (strix::session::speculation_environment_off(env(strix::session::speculation_environment))) {
+            notice("serve DSpark off (STRIX_MTP=0)");
         } else if (rows16 != nullptr && rows16[0] == '1') {
             notice("serve DSpark off (not qualified with STRIX_DS41_BATCH_ROWS16=1)");
         } else if ([&] {
@@ -458,7 +489,9 @@ Effective::Effective(App app, int& argc, char**& argv, const Build& build) {
 #ifdef _WIN32
         _putenv_s(k.c_str(), v.c_str());
 #else
-        ::setenv(k.c_str(), v.c_str(), 0);
+        const bool governed = std::any_of(profile_table.begin(), profile_table.end(),
+            [&](const auto& row) { return row.env == k; });
+        ::setenv(k.c_str(), v.c_str(), governed ? 1 : 0);
 #endif
     }
     for (const auto& k : r.unset_env) {
@@ -471,7 +504,7 @@ Effective::Effective(App app, int& argc, char**& argv, const Build& build) {
     profile_json_storage() = r.profile ? r.profile->json() : std::string();
     profile_storage() = r.profile;
     if (r.print_only) {
-        std::cout << describe(app, r);
+        std::cout << describe(app, r) << ::strix::envcfg::describe();
         std::cout.flush();
         std::exit(0);
     }

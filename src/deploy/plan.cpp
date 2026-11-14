@@ -165,6 +165,13 @@ Plan resolve(const Spec& input, const std::vector<DeviceFacts>& devices, const F
                             b.after_workspace_bytes = needed <= b.budget_bytes ? b.budget_bytes - needed : 0;
                             needed = checked_add(checked_add(needed, f.weights), f.staging);
                             for (const auto& extra : f.extra) needed = checked_add(needed, extra.second);
+                            // KV/slots and every mandatory owner win over optional cache RAM.
+                            for (const auto& [name, cap] : f.elastic_extra) {
+                                const auto bytes = fit_elastic_extra(cap, needed, b.budget_bytes);
+                                b.footprint.extra.emplace_back(name, bytes);
+                                needed = checked_add(needed, bytes);
+                            }
+                            b.footprint.elastic_extra.clear();
                             b.required_bytes = needed;
                             b.fits = b.free_bytes >= margin && needed <= b.budget_bytes;
                             if (!b.fits && b.reason.empty()) b.reason = "weights/staging/extras exceed remaining budget";

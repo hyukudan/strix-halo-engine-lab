@@ -9,11 +9,14 @@
 #include <stdexcept>
 #include <string>
 #include <vector>
+#include <filesystem>
+#include <memory>
 #if !defined(_WIN32)
 #include <sys/types.h>
 #endif
 
 #include "h3/common/fixture.hpp"  // JsonParser
+#include "h3/block/checkpoint_names.hpp"
 
 namespace strix::h3::block {
 
@@ -55,9 +58,24 @@ struct StTensor {
 
 class SafeTensors {
 public:
-    explicit SafeTensors(const std::string& path) : path_(path) {
+    explicit SafeTensors(const std::string& path, CheckpointNames names = CheckpointNames::unchanged) : path_(path) {
+        if (std::filesystem::is_directory(path)) {
+            // Tensor names must be unique across checkpoint shards. No payload is read here.
+            for (const auto& e : std::filesystem::directory_iterator(path)) {
+                if (e.path().extension() != ".safetensors") continue;
+                auto child = std::make_unique<SafeTensors>(e.path().string(), names);
+                for (const auto& [name, t] : child->tensors()) {
+                    if (!tensors_.emplace(name, t).second) throw std::runtime_error("safetensors: duplicate sharded tensor " + name);
+                    owners_[name] = child.get();
+                }
+                shards_.push_back(std::move(child));
+            }
+            if (shards_.empty()) throw std::runtime_error("safetensors: no completed checkpoint shards");
+            return;
+        }
         f_ = std::fopen(path.c_str(), "rb");
         if (!f_) throw std::runtime_error("safetensors: cannot open " + path);
+        const auto file_bytes = std::filesystem::file_size(path);
         unsigned char lenb[8];
         if (std::fread(lenb, 1, 8, f_) != 8) throw std::runtime_error("safetensors: short header");
         std::uint64_t hl = 0;
@@ -75,16 +93,20 @@ public:
                 continue;
             }
             StTensor t;
-            t.name = name;
+            t.name = checkpoint_name(name, names);
             t.dtype_name = e.at("dtype").str();
             t.dtype = parse_st_dtype(t.dtype_name);
             for (const auto& s : e.at("shape").arr()) t.shape.push_back(static_cast<std::int64_t>(s.num()));
             const auto& off = e.at("data_offsets").arr();
             t.begin = data_base_ + static_cast<std::uint64_t>(off.at(0).num());
             t.end = data_base_ + static_cast<std::uint64_t>(off.at(1).num());
+            if (t.end < t.begin || t.end > file_bytes)
+                throw std::runtime_error("safetensors: tensor outside completed file " + name);
             if (st_dtype_size(t.dtype) && t.nbytes() != t.numel() * st_dtype_size(t.dtype))
                 throw std::runtime_error("safetensors: size mismatch for " + name);
-            tensors_.emplace(name, std::move(t));
+            const auto canonical=t.name;
+            if (!tensors_.emplace(canonical, std::move(t)).second)
+                throw std::runtime_error("safetensors: duplicate canonical tensor " + canonical);
         }
     }
     ~SafeTensors() {
@@ -106,6 +128,7 @@ public:
     }
     // Raw bytes of a tensor into dst (nbytes of the tensor).
     void read_raw(const StTensor& t, void* dst) const {
+        if (!shards_.empty()) { owners_.at(t.name)->read_raw(t, dst); return; }
         std::lock_guard<std::mutex> lk(mu_);
 #if defined(_WIN32)
         if (_fseeki64(f_, static_cast<long long>(t.begin), SEEK_SET) != 0)
@@ -126,6 +149,8 @@ public:
     const std::string& path() const { return path_; }
 
 private:
+    std::vector<std::unique_ptr<SafeTensors>> shards_;
+    std::map<std::string, SafeTensors*> owners_;
     std::string path_;
     std::FILE* f_ = nullptr;
     std::uint64_t data_base_ = 0;

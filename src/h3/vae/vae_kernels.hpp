@@ -17,8 +17,8 @@ struct ConvGeom { int T = 0, H = 0, W = 0, C = 0, Ho = 1, Wo = 1, k = 1, ts = 1,
 // Same operands in the same K16 order as im2col + gemm / gemm_add: the same bits.
 void conv_gemm(const _Float16* x, const ConvGeom& geo, const _Float16* W, const _Float16* bias, const _Float16* R, _Float16* C,
                unsigned ldc, unsigned M, unsigned N, unsigned Kp, hipStream_t st);
-void rms_norm(const _Float16* x, const _Float16* w, _Float16* y, unsigned rows, hipStream_t st);              // width 2048
-void layer_norm(const _Float16* x, const _Float16* w, const _Float16* b, _Float16* y, unsigned rows, hipStream_t st);
+void rms_norm(const _Float16* x, const _Float16* w, _Float16* y, unsigned rows, hipStream_t st, unsigned width = 2048);
+void layer_norm(const _Float16* x, const _Float16* w, const _Float16* b, _Float16* y, unsigned rows, hipStream_t st, unsigned width = 2048);
 // C[M][N] = fp16(A W^T + b); N % 128 == 0, K % 32 == 0
 void gemm(const _Float16* A, unsigned lda, const _Float16* W, const _Float16* bias, _Float16* C, unsigned ldc,
           unsigned M, unsigned N, unsigned K, hipStream_t st);
@@ -37,11 +37,11 @@ inline unsigned swiglu_source_row(unsigned p, unsigned n) {
     const unsigned tile = p / 256U, within = p % 256U, wn = within / 64U, u = (within % 64U) / 16U, c = within % 16U;
     return (u % 2U ? n / 2U : 0U) + tile * 128U + wn * 32U + (u / 2U) * 16U + c;
 }
-void swiglu(const _Float16* h, _Float16* g, unsigned rows, hipStream_t st);  // [rows][16384] -> [rows][8192]
+void swiglu(const _Float16* h, _Float16* g, unsigned rows, hipStream_t st, unsigned ff = 8192);
 void rms_rope(const _Float16* qkv, const _Float16* rope_c, const _Float16* rope_s, _Float16* Q, _Float16* K, _Float16* V,
-              unsigned L, unsigned Lp, hipStream_t st);
-void attention(const _Float16* Q, const _Float16* K, const _Float16* V, _Float16* O, unsigned L, unsigned Lp, hipStream_t st);
+              unsigned L, unsigned Lp, hipStream_t st, unsigned heads = 32, unsigned pairs = 24);
+void attention(const _Float16* Q, const _Float16* K, const _Float16* V, _Float16* O, unsigned L, unsigned Lp, hipStream_t st, unsigned width = 2048);
 void embed(const _Float16* zin, const _Float16* w, const _Float16* b, const _Float16* registers, _Float16* x, unsigned P,
-           hipStream_t st);
+           hipStream_t st, unsigned width = 2048);
 
 }  // namespace strix::h3::vae::gpu

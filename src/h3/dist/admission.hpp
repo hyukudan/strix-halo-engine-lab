@@ -25,6 +25,7 @@ public:
 
 inline constexpr std::uint32_t kAdmitPerBlock = 3;      // [q norm bits, k norm bits, |V| max bf16 bits]
 inline constexpr double kScoreBound = 16384.0;          // 2^14
+inline constexpr double kScoreBoundExtended = 32768.0;  // 2^15: explicit opt-in (DeviceRunOptions::score_bound)
 inline constexpr std::uint16_t kVMaxBits = 0x7180;      // bf16 2^100
 inline constexpr std::uint16_t kBf16InfBits = 0x7f80;
 
@@ -38,7 +39,9 @@ struct AdmissionResult {
 // Throws ContractViolation (first violation in block order: non-finite / out-of-domain operands, then bound rows,
 // then the score bound).
 inline AdmissionResult admit(const std::vector<const std::vector<unsigned>*>& ops, const std::vector<std::uint64_t>& bound_rows,
-    std::uint32_t nblocks) {
+    std::uint32_t nblocks, double score_bound = kScoreBound) {
+    if (score_bound != kScoreBound && score_bound != kScoreBoundExtended)
+        throw std::invalid_argument("h3 dist admission: score bound must be 2^14 or 2^15");
     auto f32 = [](unsigned b) {
         float v;
         std::memcpy(&v, &b, 4);
@@ -78,9 +81,9 @@ inline AdmissionResult admit(const std::vector<const std::vector<unsigned>*>& op
     std::uint64_t rows = 0;
     for (auto b : bound_rows) rows += b;
     if (rows != 0) throw ContractViolation("h3 dist: attention contract telemetry: " + std::to_string(rows) + " bound rows (must be 0)");
-    if (!(res.worst <= kScoreBound))
+    if (!(res.worst <= score_bound))
         throw ContractViolation("h3 dist: attention operands outside the contract: block " + std::to_string(res.worst_block) +
-            " ||q|| ||k|| log2(e)/sqrt(128) = " + std::to_string(res.worst) + " > 2^14");
+            " ||q|| ||k|| log2(e)/sqrt(128) = " + std::to_string(res.worst) + (score_bound == kScoreBound ? " > 2^14" : " > 2^15"));
     return res;
 }
 

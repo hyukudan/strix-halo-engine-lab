@@ -16,6 +16,11 @@ inline strix::profile::NumericalIdentity numerical_identity(const Effective& e) 
                                    "R2 lane-strided fmaf partials with pairwise halving tree";
     identity.reduction_plan = e.identity.value;
     identity.prefill_lineage = e.prefill;
+    if (const char* f = std::getenv("STRIX_GLM_MODEL_FORMAT"); f != nullptr && std::string(f) == "fast_i4") {
+        identity.reduction_plan += ";model-format=fast_i4;stored-int4-g64-v1;all-routed;exl3-routed=absent";
+        identity.arithmetic_contract += "; glm-fast-i4: routed experts IU4 g64 (EXL3 mul1 decode -> per-column K64 FP16 absmax/7 scale, RNE "
+                                        "nibbles), prefill W4A4 grouped IU4 (activations per row K64), decode W4A16 (F32 dot2 per group, fmaf scale)";
+    }
     if (e.kv_shard) {
         identity.state_format = "glm-dsa-owned-blocks-v1;layout=474c4d4b56533033;block=4;pool-parity;rank/capacity/frontier-bound";
         identity.reduction_plan += std::string(";") + kvshard::numerical_identity;

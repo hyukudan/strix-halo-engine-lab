@@ -24,7 +24,7 @@ if(BUILD_TESTING)
 endif()
 if(STRIX_ENABLE_HIP_RUNTIME AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/h3/block/glue.hip")
     add_library(strix_h3_block_hip STATIC src/h3/block/glue.hip src/h3/block/device_forward.hip src/h3/block/turbo_accel.hip src/h3/block/sparse_accel.hip
-        src/h3/block/lora_host.cpp)
+        src/h3/block/lora_host.cpp src/h3/gemm/dense.hip)
     # the levers sparse K1 variant (defined in h3_50_levers.cmake, after this file: resolved at generate time)
     target_link_libraries(strix_h3_block_hip PUBLIC strix_h3_levers_sparse_attn)
     target_link_libraries(strix_h3_block_hip PUBLIC strix_h3_attn)

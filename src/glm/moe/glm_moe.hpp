@@ -36,6 +36,8 @@
 
 #include <hip/hip_runtime.h>
 
+#include "strix/pair/producer_publish.hpp"
+
 namespace strix::glm::moe {
 
 inline constexpr unsigned kHidden = 4096, kInter = 1024 /* per rank */, kExperts = 288, kTopE = 8, kMaxRows = 8;
@@ -53,6 +55,15 @@ struct Exl3 {
 struct ExpertSlices {  // gate, up: 4096 -> 1024; down: 1024 -> 4096
     Exl3 gate, up, down;
 };
+// STRIX_GLM_MODEL_FORMAT=fast_i4 (lossy): the routed experts as the IU4 g64 pack (strix-trellis core/iu4.hpp layout,
+// had128-rotated basis; the EXL3 suh / svh stay in ExpertSlices, the routed trellis pointers are null). Per matrix m
+// (0 gate, 1 up, 2 down) over the 288 experts: wq [288][K/16][N/16][16][8] nibbles, ws FP16 [288][N][K/64].
+struct I4Experts {
+    const std::uint8_t* wq[3] = {};
+    const std::uint16_t* ws[3] = {};  // wq[2] / ws[2] null: scope gate_up (routed down stays EXL3)
+    bool on() const { return wq[0] != nullptr; }
+};
+bool fast_i4_built();  // the W4A16 routed core is compiled in (STRIX_GLM_PF_IU4_TRELLIS_DIR build)
 
 // One device allocation of moe_workspace_bytes(), zeroed once before first use (its arrival counters reset themselves
 // at the end of every call). Calls sharing a workspace must be ordered (one stream, or explicit events): concurrent
@@ -83,6 +94,12 @@ struct MoeView {
     // Tests only: when set, the gate/up finish also writes the two linear outputs (strix_gemv bits of gate and up, after
     // svh, before R15) per pair: [pair][0 gate / 1 up][1024]. nullptr in production (no extra stores).
     float* debug_gate_up = nullptr;
+    // fast_i4: routed gate/up/down on the W4A16 core (int4 weights, FP16 activations, F32 accumulation, per-group
+    // scale); the shared expert, router, transforms, R15 and R16 stay as above. Not bitwise to the EXL3 identity.
+    I4Experts i4{};
+    // Producer publication (pair decode): `out` is the channel's TX slot and the down kernel raises the TX flag after its
+    // last R16 store (strix/pair/producer_publish.hpp). Off (default): nothing is published.
+    strix::pair::ProducerPublish publish{};
 };
 // Both throw std::invalid_argument on unsupported shapes (shared other than K4/K6 at the GLM shapes, rows outside
 // 1..8, null pointers). Routed expert slices must be K4 at the GLM shapes (device array, not checked on the host).

@@ -35,6 +35,11 @@ Las herramientas de línea de comandos reciben IDs de token; los servidores HTTP
 
 ## Compilación
 
+Los generadores de una sola configuración (como Ninja) usan `Release` si
+`CMAKE_BUILD_TYPE` está vacío o no se indica, también en la compilación CUDA independiente.
+Se conserva cualquier tipo explícito. Los generadores multiconfiguración mantienen
+su selección de configuración (`--config Release`).
+
 ```sh
 export PATH=/opt/rocm/core-10.1/bin:$PATH
 cmake -S . -B build -G Ninja \

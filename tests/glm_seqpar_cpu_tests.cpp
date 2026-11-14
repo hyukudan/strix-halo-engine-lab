@@ -153,7 +153,87 @@ void bandwidth_bound() {
     require(exchange < compute);
 }
 }
+// Exercise the production scheduler over consecutive layers. Lane state models
+// publications/consumers, independently of how quickly the DMA queue progresses.
+void single_stream_schedule(unsigned tiles) {
+    using S = SeqparStep;
+    struct Lane { unsigned gather = 0, reduce = 0, attention = 0, post = 0; };
+    std::array<Lane, 2> lanes{};
+    unsigned grouped = 0;
+    for (unsigned layer = 0; layer < 3; ++layer) {
+        unsigned attention_done = 0;
+        seqpar_single_layer(tiles, [&](S step, unsigned i) {
+            require(i < tiles);
+            auto& lane = lanes[i];
+            switch (step) {
+            case S::pre_attn:
+                require(lane.gather == 0 && lane.reduce == 0 && lane.post == 2 * layer);
+                lane.gather = 1;
+                break;
+            case S::attn:
+                require(lane.gather == 1 && i == attention_done++);
+                lane.gather = 0;
+                lane.attention = 1;
+                break;
+            case S::reduce_attn:
+                require(lane.attention == 1 && lane.reduce == 0);
+                lane.reduce = 1;
+                break;
+            case S::post_attn:
+                require(lane.reduce == 1);
+                lane.reduce = 0;
+                ++lane.post;
+                break;
+            case S::pre_ffn:
+                require(lane.post == 2 * layer + 1 && lane.gather == 0);
+                lane.gather = 2;
+                break;
+            case S::ffn:
+                require(attention_done == tiles && grouped++ == layer);
+                for (unsigned j = 0; j < tiles; ++j) {
+                    require(lanes[j].gather == 2 && lanes[j].reduce == 0);
+                    lanes[j].gather = 0;
+                }
+                break;
+            case S::reduce_ffn:
+                require(grouped == layer + 1 && lane.reduce == 0);
+                lane.reduce = 2;
+                break;
+            case S::post_ffn:
+                require(lane.reduce == 2);
+                lane.reduce = lane.attention = 0;
+                ++lane.post;
+                break;
+            }
+        });
+    }
+    require(grouped == 3);
+    for (unsigned i = 0; i < tiles; ++i)
+        require(lanes[i].post == 6 && lanes[i].gather == 0 && lanes[i].reduce == 0);
+}
+void moe_pieces(unsigned rows) {
+    unsigned calls = 0, first = 0;
+    while (first < rows) {
+        const auto piece = seqpar_moe_piece(rows, first);
+        require(piece.first == first && piece.count > 0 && piece.count <= 8192);
+        first += piece.count;
+        ++calls;
+    }
+    require(first == rows && calls == (rows + 8191U) / 8192U);
+}
 int main() {
+    static_assert(seqpar_compute_streams() == 2);
+    static_assert(seqpar_compute_streams("1") == 1);
+    static_assert(seqpar_compute_streams("2") == 2);
+    for (const char* value : {"", "0", "3", "auto", "01", "1 "})
+        rejects([=] { (void)seqpar_compute_streams(value); });
+    rejects([] { (void)seqpar_moe_piece(0, 0); });
+    rejects([] { (void)seqpar_moe_piece(8192, 8192); });
+    rejects([] { seqpar_single_layer(0, [](SeqparStep, unsigned) {}); });
+    rejects([] { seqpar_single_layer(3, [](SeqparStep, unsigned) {}); });
+    single_stream_schedule(1);
+    single_stream_schedule(2);
+    for (unsigned rows : {2U, 6U, 4096U, 8192U, 8194U, 16384U, 32768U, 65536U}) moe_pieces(rows);
     static_assert(GlmSeqparTraits::kPlan != GlmTraits::kPlan);
     static_assert(seqpar_rows(8192, 1).first == 4096);
     static_assert(seqpar_rows(8192, 0).bytes() == 64U * 1024U * 1024U);
@@ -174,5 +254,5 @@ int main() {
     for (unsigned rows : {1024U, 8192U, 65536U}) tiled_plan(rows, 2);
     direct_wire();
     bandwidth_bound();
-    std::puts("glm seqpar host ownership/tile/payload/bitwise roundtrip/direct-wire/bandwidth tests: PASS");
+    std::puts("glm seqpar host ownership/tile/payload/bitwise roundtrip/direct-wire/bandwidth/single-stream tests: PASS");
 }

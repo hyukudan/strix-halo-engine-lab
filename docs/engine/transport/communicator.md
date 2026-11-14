@@ -6,6 +6,15 @@ Status: first layer of the distributed runtime. `include/strix/dist/communicator
 
 ## Pieces
 
+Production app transport setup is shared in
+[`dist/open_transport.hpp`](../../../include/strix/dist/open_transport.hpp), with
+an explicit per-app spelling policy and a host-only parser test. It always opens
+host control first; `usb4gpu` adds a device exchange for the existing size router,
+with negotiated host-only fallback. Qwen pair seam payloads and MiniMax serve now
+default to this routed setup; small control stays on host. MiniMax rank keeps its
+measured XFER/PFX host modules between complete communicator exchanges. See the
+[routing decision and pending native gates](../../coord/transport-routing.md).
+
 - **`Transport`**: moves whole messages between the two ranks, in order. Backends:
   - `memory_pair()`: both ranks in one process (the emulated two-node setup: two host threads, one GPU, one
     stream per rank);

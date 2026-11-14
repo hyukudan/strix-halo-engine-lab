@@ -275,7 +275,7 @@ std::vector<std::byte> pattern(std::size_t n, unsigned seed) {
 }
 
 // Both ranks run the same exchanges (sizes in the same order) through a Communicator each.
-void test_exchanges() {
+void test_exchanges(bool chunk_overlap) {
     std::vector<std::unique_ptr<FakeWire>> wires;
     Rank r0, r1;
     auto [d0, d1] = make_pair(wires, r0, r1, 4, std::chrono::milliseconds(20000));
@@ -283,6 +283,10 @@ void test_exchanges() {
     std::cout << "pair ready: capacity " << cap << " B" << std::endl;
     auto [t0, t1] = strix::dist::memory_pair();
     strix::dist::Communicator c0({0, 2, 1, 1}, std::move(t0), std::move(d0), 3U * cap), c1({1, 2, 1, 1}, std::move(t1), std::move(d1), 3U * cap);
+    if (chunk_overlap) {
+        c0.enable_direct_chunk_overlap();
+        c1.enable_direct_chunk_overlap();
+    }
     // Sizes that are not whole 4-byte words included: the last word travels padded and nothing past `n` is written.
     std::vector<std::size_t> sizes{1, 3, 12, 13, 64, 4096, 4097, 20480, 20481, 20544, 122880, 131072 + 12, cap / 2U, cap - 1U, cap,
                                    2U * cap + 4096U, 2U * cap + 4099U};
@@ -468,6 +472,8 @@ void test_router() {
         return;
     }
     expect(c0->route_text() == c1->route_text(), "both ranks apply rank 0's route table (" + c0->route_text() + " / " + c1->route_text() + ")");
+    c0->enable_direct_chunk_overlap();
+    c1->enable_direct_chunk_overlap();
     std::atomic<std::size_t> bad{0};
     const std::vector<std::size_t> sizes{3, 64, 1000, 4096, 20480, 65537, 163840, 600000, 3000000};
     const auto run = [&](strix::dist::Communicator& c, unsigned rank) {
@@ -519,6 +525,8 @@ void test_router() {
         const std::string table = "65536:host,262144:gpu:2,inf:mix:2:30";
         a.set_routes(table);
         b.set_routes(table);
+        a.enable_direct_chunk_overlap();
+        b.enable_direct_chunk_overlap();
         expect(a.route_text() == table, "mixed route table round trip (" + a.route_text() + ")");
         bad = 0;
         std::exception_ptr e3;
@@ -728,7 +736,8 @@ int main(int argc, char** argv) try {
     if (argc > 1 && std::string(argv[1]) == "--router") { test_router(); return failures == 0 ? 0 : 1; }
     test_failures(argv[0]); // before this process touches the GPU (the children fork from here)
     test_flag_wait();
-    test_exchanges();
+    test_exchanges(false);
+    test_exchanges(true);
     test_bootstrap();
     test_router();
     test_stall_bound();

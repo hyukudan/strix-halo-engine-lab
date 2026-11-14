@@ -8,8 +8,11 @@
 #include "glm/prefill/glm_pf_moe.hpp"
 #include "glm/prefill/glm_pf_exact.hpp"
 #include "glm/prefill/glm_pf_exact_moe.hpp"
+#include "glm/prefill/glm_pf_kda_wmma.hpp"
+#include "glm/prefill/glm_pf_wmma.hpp"
 #include "glm/prefill/glm_prefill.hpp"
 #include "glm/engine/glm_kvshard.hpp"
+#include "glm/xfer/glm_xfer_exchange.hpp"
 
 #include <strix_trellis.h>
 
@@ -104,6 +107,11 @@ __global__ void scatter_rows_kernel(const float* y, const std::uint32_t* dst, fl
     eo[static_cast<std::size_t>(dst[r]) * kHidden + i] = y[static_cast<std::size_t>(r) * kHidden + i];
 }
 
+bool stored_i4_format() {
+    const char* f = std::getenv("STRIX_GLM_MODEL_FORMAT");
+    return f != nullptr && std::string(f) == "fast_i4";
+}
+
 class GlmPfPath final : public PrefillPath {
 public:
     GlmPfPath(unsigned kda_heads, unsigned mla_heads, std::uint64_t cap, unsigned max_rows, TierB tb)
@@ -159,6 +167,7 @@ public:
         if (kp && std::string(kp) != "0" && std::string(kp) != "1")
             throw std::invalid_argument("STRIX_GLM_PF_KDA_PACK must be 0 or 1");
         kda_pack_ = kp && std::string(kp) == "1";  // 1 = contiguous KDA projections + pack_qkv (the pre-strided form)
+        kda_wmma_ = kda_wmma::enabled();  // FAST identity glm-pf-kda-wmma-v1 (f_a / g_a / b / f_b / g_b on WMMA): default with STRIX_GLM_PF_WMMA=1
         (void)exact::tile_rows();
         route_ids_.resize(R * kTopE);
         route_weights_.resize(R * kTopE);
@@ -166,6 +175,7 @@ public:
             xmoe_wsb_ = exact_moe::workspace_bytes(Rmax_);
             xmoe_ws_ = own_.alloc<unsigned char>(xmoe_wsb_);
         }
+        if (stored_i4_format()) iu4_scratch_ = exact_moe::iu4::make_scratch(Rmax_);
         // gemv-mode per-row MoE scratch (DefaultMoe's)
         eo_ = own_.alloc<float>(static_cast<std::size_t>(kTopE) * kHidden);
         ge_ = own_.alloc<float>(kExpertI);
@@ -187,7 +197,7 @@ public:
         // Validate the immutable legacy route at install, not at every MoE enqueue.
         if (moe_route_.legacy_arena != (moe_ws_ != nullptr))
             throw std::logic_error("glm pf path: grouped WMMA MoE was not admitted");
-        if (own_.bytes != path_bytes_ || own_.ptrs.size() > kPrefillAllocationBound)
+        if (own_.bytes + iu4_scratch_.bytes != path_bytes_ || own_.ptrs.size() > kPrefillAllocationBound)
             throw std::logic_error("glm pf path: allocation tally differs from prefill_budget (update both)");
     }
     // Exact bytes the constructor allocates, also used by both admission checks.
@@ -206,6 +216,7 @@ public:
         // two matrix-specific H-wide FP16 input transforms and plan/table.
         // 792849408 bytes at R=2048; 1585660416 bytes at R=4096 (64-bit ABI).
         if (route.exact) b += exact_moe::workspace_bytes(Rmax);
+        if (stored_i4_format()) b += exact_moe::iu4::scratch_bytes(Rmax);
         b += (std::uint64_t{kTopE} * kHidden + 3 * kExpertI + kHidden) * 4;
         b += 3 * R * std::max<std::uint64_t>(std::uint64_t{kDenseI} * Hk / kKdaHeads, I) * 4;
         if (I != kMoeInter) b += R * kTopE * (3 * kHidden * 4 + 2 * 4);
@@ -238,7 +249,8 @@ public:
     std::uint64_t admission_margin() const override { return margin_; }
     std::uint64_t margin_ = std::uint64_t{8} << 30;  // set by make_prefill_path (STRIX_GLM_PF_MARGIN_GIB)
 
-    ~GlmPfPath() override {  // own_ frees every device buffer
+    ~GlmPfPath() override {  // own_ frees every device buffer (the IU4 copies are separate allocations)
+        exact_moe::iu4::release(iu4_scratch_);
         for (auto& t : pinned_tables_) (void)hipHostFree(t.second);
     }
 
@@ -262,10 +274,19 @@ public:
         }
         {  // the three projections of x share one launch under dense v3 (v1 / v2 run them one by one); same bits
             const DenseProj px[3] = {{w.f_a, 0, kKdaDim, ta_}, {w.g_a, 0, kKdaDim, tb128_}, {w.b, 0, H, b_}};
-            dense_rows_group(x, D::WType::F16, kHidden, px, 3, R, c.stream);
+            const DenseProj pf{w.f_b, 0, C, f_}, pg{w.g_b, 0, C, g_};
+            if (kda_wmma_ && kda_wmma::supported(D::WType::F16, kHidden, px, 3, R) &&
+                kda_wmma::supported(D::WType::F16, kKdaDim, &pf, 1, R) && kda_wmma::supported(D::WType::F16, kKdaDim, &pg, 1, R)) {
+                // FAST (default with the FAST route): the same five projections on the shared dense FP16 WMMA core.
+                kda_wmma::dense_group(x, kHidden, px, 3, R, c.stream);
+                kda_wmma::dense_group(ta_, kKdaDim, &pf, 1, R, c.stream);
+                kda_wmma::dense_group(tb128_, kKdaDim, &pg, 1, R, c.stream);
+            } else {
+                dense_rows_group(x, D::WType::F16, kHidden, px, 3, R, c.stream);
+                dense_rows(ta_, w.f_b, D::WType::F16, kKdaDim, 0, C, f_, R, c.stream);
+                dense_rows(tb128_, w.g_b, D::WType::F16, kKdaDim, 0, C, g_, R, c.stream);
+            }
         }
-        dense_rows(ta_, w.f_b, D::WType::F16, kKdaDim, 0, C, f_, R, c.stream);
-        dense_rows(tb128_, w.g_b, D::WType::F16, kKdaDim, 0, C, g_, R, c.stream);
         const D::KdaDev kd{H, w.conv, w.A_log, w.dt_bias, w.o_norm};
         float* S = st.S + static_cast<std::size_t>(slot) * H * kKdaDim * kKdaDim;
         float* cv = st.conv + static_cast<std::size_t>(slot) * 3 * C * 3;
@@ -316,7 +337,7 @@ public:
             // Device plan: no route download, host grouping or plan upload. The layer's expert table is kept in
             // pinned host memory and copied in stream order into the workspace table slot.
             if (w.experts.size() != moe::kExperts) throw std::invalid_argument("glm pf exact moe: expected 288 experts");
-            for (unsigned e = 0; e < moe::kExperts; ++e) exact_table_[e] = exact_slices(w.experts[e], false);
+            for (unsigned e = 0; e < moe::kExperts; ++e) exact_table_[e] = exact_slices(w.experts[e], false, w.i4.on());
             const moe::ExpertSlices shared = exact_slices(w.shared, true);
             constexpr std::size_t kTableBytes = (moe::kExperts + 1) * sizeof(moe::ExpertSlices);
             auto& pinned = pinned_tables_[&w];
@@ -339,6 +360,25 @@ public:
             v.ids = ids;
             v.weights = wts;
             v.out = y;
+            if (w.i4.on()) {  // fast_i4 resident layer: the engine-owned pack
+                if (!wmma_x::enabled())
+                    throw std::invalid_argument("STRIX_GLM_MODEL_FORMAT=fast_i4: the exact prefill identity is refused (STRIX_GLM_PF_WMMA=1)");
+                if (iu4_scratch_.max_rows == 0) throw std::logic_error("stored INT4 scratch was not planned at startup");
+                auto it = i4_views_.find(&w);
+                if (it == i4_views_.end()) {
+                    exact_moe::iu4::Layer q;
+                    for (unsigned m = 0; m < 3; ++m) {
+                        q.wq[m] = w.i4.wq[m];
+                        q.ws[m] = w.i4.ws[m];
+                        q.svh[m] = w.i4.svh[m];
+                    }
+                    q.bytes = w.i4.bytes;
+                    q.replace = true;
+                    it = i4_views_.emplace(&w, q).first;
+                }
+                v.iu4 = &it->second;
+                v.iu4_scratch = &iu4_scratch_;
+            }
             exact_moe::enqueue_device(v, xmoe_plan_, xmoe_ws_, xmoe_wsb_, c.stream, c.flag);
             return;
         }
@@ -522,9 +562,10 @@ private:
         return experts_.emplace(&w, std::move(v)).first->second;
     }
 
-    static moe::Exl3 exact_part(const Linear& l, unsigned N, unsigned K, bool shared) {
+    // i4: a fast_i4 routed expert (trellis freed; the IU4 path reads only suh / svh).
+    static moe::Exl3 exact_part(const Linear& l, unsigned N, unsigned K, bool shared, bool i4 = false) {
         const unsigned bits = l.raw.bits;
-        if (l.raw.trellis != nullptr) {
+        if (l.raw.trellis != nullptr || (i4 && l.raw.suh != nullptr)) {
             if (!l.raw.suh || !l.raw.svh || l.raw.output != N || l.raw.input != K ||
                 (bits != 4 && !(shared && bits == 6)))
                 throw std::invalid_argument("glm pf exact moe: invalid raw expert");
@@ -536,9 +577,9 @@ private:
         const auto p = moe_exl3_from_weights(static_cast<strix_weights>(l.prepared), N, K, bits);
         return {p.trellis, p.suh, p.svh, K, N, bits};
     }
-    static moe::ExpertSlices exact_slices(const Mlp& m, bool shared) {
-        return {exact_part(m.gate, kMoeInter, kHidden, shared), exact_part(m.up, kMoeInter, kHidden, shared),
-                exact_part(m.down, kHidden, kMoeInter, shared)};
+    static moe::ExpertSlices exact_slices(const Mlp& m, bool shared, bool i4 = false) {
+        return {exact_part(m.gate, kMoeInter, kHidden, shared, i4), exact_part(m.up, kMoeInter, kHidden, shared, i4),
+                exact_part(m.down, kHidden, kMoeInter, shared, i4)};
     }
 
     DeviceOwner own_;       // first member: owns every buffer below
@@ -555,6 +596,8 @@ private:
     std::size_t xmoe_wsb_ = 0;
     std::array<moe::ExpertSlices, moe::kExperts> exact_table_{};
     std::map<const MoeLayerWeights*, moe::ExpertSlices*> pinned_tables_;  // host-pinned [289] per MoE layer
+    std::map<const MoeLayerWeights*, exact_moe::iu4::Layer> i4_views_;  // fast_i4: views of MoeLayerWeights::i4 (not owned)
+    exact_moe::iu4::Scratch iu4_scratch_{};
     std::vector<std::uint32_t> route_ids_;
     std::vector<float> route_weights_;
     float *tq_, *tk_, *tv_, *qkv_, *f_, *g_, *b_, *ta_, *tb128_, *scr_, *beta_, *o_, *y1_;
@@ -564,6 +607,7 @@ private:
     std::size_t exact_wsb_ = 0;
     bool exact_on_ = false;
     bool kda_pack_ = false;
+    bool kda_wmma_ = false;
     void* moe_ws_ = nullptr;
     std::size_t moe_wsb_ = 0;
     float *eo_, *ge_, *ue_, *ae_, *sh1_;
@@ -603,6 +647,10 @@ PrefillBudget prefill_budget(unsigned kda_heads, unsigned mla_heads, std::uint64
     b.path = GlmPfPath::device_bytes(kda_heads, mla_heads, capacity, max_rows, b.moe_route, b.attention_rows);
     b.workspace = tierb == TierB::wmma ? GlmPfPath::workspace_bytes(kda_heads, mla_heads, max_rows) : 0;
     if (kv_shard) b.workspace += kKvShardPrefillTemporaryBytes;
+    // Covers both explicit/default pipeline 2, including seqpar auto admission.
+    // Native install_prefill separately admits this owner before constructing it.
+    if (kda_heads == 32 && mla_heads == 32 && tierb == TierB::gemv && !kv_shard && max_rows >= 2)
+        b.pipeline = xfer::SeqparExchange::workspace_bytes(max_rows);
     const std::uint64_t RC = std::max(8U, max_rows);
     b.engine_rows = RC * ((3ULL * kHc * kHidden + 2ULL * kHcMix + (5ULL + (mtp ? 9ULL : 0ULL)) * kHidden + kExperts + kTopE) * 4 + (kTopE + 2) * 4 + 8);
     return b;

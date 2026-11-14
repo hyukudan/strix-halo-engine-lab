@@ -198,7 +198,10 @@ struct Watchdog {
     std::uint64_t max_rss = 8 * kGiB;           // STRIX_GLM_WD_RSS_GIB
     std::uint64_t max_gtt_used = 0;             // STRIX_GLM_WD_GTT_GIB (absolute, device = GTT + VRAM); else the engine's load limit
     double max_psi_full10 = 25;                  // STRIX_GLM_WD_PSI_FULL (percent; 0 = off)
-    static Watchdog from_env();
+    // host_budget: host bytes the caller keeps in this process beyond the engine's own (the server's prefix snapshots
+    // are plain heap, so a full cache is that much RSS). It raises the default RSS limit; an explicit
+    // STRIX_GLM_WD_RSS_GIB is taken as given (0 = off).
+    static Watchdog from_env(std::uint64_t host_budget = 0);
 };
 
 // Two threads. The sampler takes a snapshot + watchdog check every `sample_ms` and queues one trace line every

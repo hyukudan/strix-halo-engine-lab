@@ -1,4 +1,5 @@
 #include "h3/vae/enc_ref.hpp"
+#include "h3/vae/precision.hpp"
 #include "h3/vae/vae_threads.hpp"
 
 #include <algorithm>
@@ -11,7 +12,13 @@ namespace strix::h3::vae::enc {
 
 namespace {
 H16 rd(const SafeTensors& st, const std::string& n) {
-    if (st.info(n).dtype != "f16") throw std::runtime_error("encoder: " + n + " is not f16");
+    if (st.info(n).dtype == "f32") {
+        const auto raw = st.read(n);
+        H16 v(raw.size()/4);
+        for (std::size_t i=0;i<v.size();++i) { float f; std::memcpy(&f,raw.data()+4*i,4); v[i]=f2h(f); }
+        return v;
+    }
+    if (st.info(n).dtype != "f16") throw std::runtime_error("encoder: unsupported parameter dtype");
     const auto raw = st.read(n);
     H16 v(raw.size() / 2);
     std::memcpy(v.data(), raw.data(), raw.size());
@@ -83,98 +90,17 @@ Weights load(const SafeTensors& st) {
     return w;
 }
 
-Map conv(const Conv2& c, const Map& x, int stride, const Map* res) {
-    Map y;
-    y.C = c.cout;
-    const int pad = stride == 1 ? c.k / 2 : 0;  // downsample: no left/top pad, reflect 1 on the right/bottom
-    const int Hp = stride == 1 ? x.H + 2 * pad : x.H + 1, Wp = stride == 1 ? x.W + 2 * pad : x.W + 1;
-    y.H = (Hp - c.k) / stride + 1;
-    y.W = (Wp - c.k) / stride + 1;
-    y.v.resize(std::size_t(y.C) * y.H * y.W);
-    std::vector<float> xf(x.v.size()), wf(c.w.size());
-    for (std::size_t i = 0; i < xf.size(); ++i) xf[i] = h2f(x.v[i]);
-    for (std::size_t i = 0; i < wf.size(); ++i) wf[i] = h2f(c.w[i]);
-    parallel(c.cout, [&](int co) {
-        std::vector<double> acc(std::size_t(y.H) * y.W, 0.0);
-        for (int ci = 0; ci < c.cin; ++ci)
-            for (int ky = 0; ky < c.k; ++ky)
-                for (int kx = 0; kx < c.k; ++kx) {
-                    const double wv = wf[((std::size_t(co) * c.cin + ci) * c.k + ky) * c.k + kx];
-                    for (int oy = 0; oy < y.H; ++oy) {
-                        const int iy = reflect(oy * stride + ky - pad, x.H);
-                        const float* xr = xf.data() + (std::size_t(ci) * x.H + iy) * x.W;
-                        double* ar = acc.data() + std::size_t(oy) * y.W;
-                        for (int ox = 0; ox < y.W; ++ox) ar[ox] += wv * xr[reflect(ox * stride + kx - pad, x.W)];
-                    }
-                }
-        const float b = h2f(c.b[std::size_t(co)]);
-        for (std::size_t q = 0; q < acc.size(); ++q) {
-            float v = rh(float(acc[q]) + b);
-            if (res) v = rh(v + h2f(res->v[std::size_t(co) * acc.size() + q]));
-            y.v[std::size_t(co) * acc.size() + q] = f2h(v);
-        }
-    });
-    return y;
-}
+Map conv(const Conv2& c, const Map& x, int stride, const Map* res) { return precision::conv<half_bits>(c,x,stride,res); }
 
-Map gn_silu(const Norm& n, const Map& x) {
-    Map y = x;
-    const int G = 32, cg = x.C / G;
-    const std::size_t plane = std::size_t(x.H) * x.W;
-    for (int g = 0; g < G; ++g) {
-        double s = 0, q = 0;
-        const std::size_t cnt = std::size_t(cg) * plane;
-        for (std::size_t i = 0; i < cnt; ++i) s += h2f(x.v[std::size_t(g) * cnt + i]);
-        const double mu = s / double(cnt);
-        for (std::size_t i = 0; i < cnt; ++i) { const double d = h2f(x.v[std::size_t(g) * cnt + i]) - mu; q += d * d; }
-        const float inv = float(1.0 / std::sqrt(q / double(cnt) + 1e-6));
-        for (int c = g * cg; c < (g + 1) * cg; ++c) {
-            const float w = h2f(n.w[std::size_t(c)]), b = h2f(n.b[std::size_t(c)]);
-            for (std::size_t p = 0; p < plane; ++p) {
-                const std::size_t i = std::size_t(c) * plane + p;
-                const float nv = rh(float(h2f(x.v[i]) - mu) * inv * w + b);
-                y.v[i] = f2h(nv / (1.0F + std::exp(-nv)));
-            }
-        }
-    }
-    return y;
-}
+Map gn_silu(const Norm& n, const Map& x) { return precision::gn_silu<half_bits>(n,x); }
 
-Map resblock(const Res& r, const Map& x) {
-    const Map h = conv(r.c1, gn_silu(r.n1, x), 1);
-    const Map s = r.has_nin ? conv(r.nin, x, 1) : x;
-    return conv(r.c2, gn_silu(r.n2, h), 1, &s);
-}
+Map resblock(const Res& r, const Map& x) { return precision::resblock<half_bits>(r,x); }
 
-Map normalize_pixels(const std::vector<float>& x, int H, int W) {
-    const float mean[3] = {rh(0.485F), rh(0.456F), rh(0.406F)}, sd[3] = {rh(0.229F), rh(0.224F), rh(0.225F)};
-    Map m;
-    m.C = 3; m.H = H; m.W = W;
-    m.v.resize(x.size());
-    for (int c = 0; c < 3; ++c)
-        for (std::size_t p = 0; p < std::size_t(H) * W; ++p) {
-            const std::size_t i = std::size_t(c) * H * W + p;
-            float v = rh(x[i]);
-            v = rh(v + 1.0F);
-            v = rh(v * 0.5F);
-            v = rh(v - mean[c]);
-            m.v[i] = f2h(v / sd[c]);
-        }
-    return m;
-}
+Map normalize_pixels(const std::vector<float>& x, int H, int W) { return precision::normalize_pixels<half_bits>(x,H,W); }
 
-Map quant(const Weights& w, const Map& x) { return conv(w.quant, x, 1); }
+Map quant(const Weights& w, const Map& x) { return precision::quant<half_bits>(w,x); }
 
-Map encode_tile(const Weights& w, const Map& pixels) {
-    check_tile(pixels);
-    Map x = conv(w.conv_in, pixels, 1);
-    for (int l = 0; l < 6; ++l) {
-        x = resblock(w.blocks[l][0], x);
-        x = resblock(w.blocks[l][1], x);
-        if (l < 4) x = conv(w.down[l], x, 2);
-    }
-    return quant(w, conv(w.conv_out, gn_silu(w.norm_out, x), 1));
-}
+Map encode_tile(const Weights& w, const Map& pixels) { return precision::encode_tile<half_bits>(w,pixels); }
 
 namespace {
 Pix16 as_pix(const Map& m) { Pix16 p; p.C = m.C; p.F = 1; p.Hh = m.H; p.Ww = m.W; p.v = m.v; return p; }

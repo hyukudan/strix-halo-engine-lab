@@ -5,6 +5,7 @@
 #include "gemma4/kernels/rows_linear.hpp"
 #include "gemma4/kernels/capture_guard.hpp"
 #include "gemma4/exl3/device.hpp"
+#include "pair.hpp"
 #include <hip/hip_runtime.h>
 #include <cstdlib>
 #include <string_view>
@@ -597,9 +598,20 @@ std::vector<ChunkResult> DevicePrefill::pass(std::span<const PrefillSegment> seg
     // KV_QUEUE: the commit publishes this pass's rows on the queue that wrote them.
     for (const auto& p : parts) if (p.tx->stream->writer_queue) p.tx->stream->queue = b.queue;
     ChunkResult result; result.rows = n; result.vocab = c.vocab; result.tap_width = 5 * c.hidden;
+    // PAIR (prefill/pair.hpp): stage A runs layers [0, cut) and ships the seam; stage B receives it and runs
+    // [cut, layers). Off (no pipe): every layer, no seam work.
+    auto& ps = pair_stage;
+    const bool stage_a = ps.pipe && ps.rank == 0, stage_b = ps.pipe && ps.rank == 1;
+    if ((stage_a || stage_b) && (parts.size() != 1 || all_logits || (stage_a && logits) || ps.cut == 0 || ps.cut >= c.layers))
+        throw std::invalid_argument("pair prefill runs one stream per pass, stage A without logits, 0 < cut < layers");
+    const unsigned first_layer = stage_b ? ps.cut : 0, end_layer = stage_a ? ps.cut : c.layers;
+    static const bool pair_breakdown = [] { const auto* v = std::getenv("STRIX_G4_PAIR_BREAKDOWN"); return v && std::string_view(v) == "1"; }();
+    if ((stage_a || stage_b) && pair_breakdown && !impl_->profile) set_profile(true);
+    const double waited_before = ps.wait_ms;
     // PINNED_TAPS: unconsumed taps are never copied; consumed taps and hidden
     // rows land in pinned memory through asynchronous copies. Off: as before.
-    const bool pinned = views && lever_enabled(lever_pinned_taps), want_taps = taps || !pinned;
+    // Stage A always produces its tap columns: stage B's consumer may want them.
+    const bool pinned = views && lever_enabled(lever_pinned_taps), want_taps = taps || !pinned || stage_a;
     unsigned last_tap = 0;
     for (const auto t : tap_layers) last_tap = std::max(last_tap, unsigned(t));
     bool taps_issued = false;
@@ -677,7 +689,8 @@ std::vector<ChunkResult> DevicePrefill::pass(std::span<const PrefillSegment> seg
         // writes the residual; producer layers' K/V run beside q and its head.
         // The PLE projection queues behind layer 0's K/V, so attention does not
         // wait for it.
-        const bool side = !b.profile && lever_enabled(lever_side_stream);
+        // Stage B overwrites the embedded rows with the seam right after its PLE projection: one queue.
+        const bool side = !b.profile && !stage_b && lever_enabled(lever_side_stream);
         if (side) { b.reserve_exl3(n); b.side_ready(); result.levers |= lever_side_stream; }
         const auto pn = n * c.layers * c.ple_dim;
         const auto ple_stage = [&] {
@@ -715,7 +728,41 @@ std::vector<ChunkResult> DevicePrefill::pass(std::span<const PrefillSegment> seg
         // reads its producer's KV (layers >= 24) reuses that producer's pack.
         unsigned packed_producer[2] = {~0U, ~0U};
         bool x_ready = false; // FUSE_EPILOGUE: x already holds this layer's input norm
-        for (unsigned l = 0; l < c.layers; ++l) {
+        // The seam's pieces in order: residual, x, taps, then K and V of each producer layer below the cut.
+        const auto seam = [&](strix::pair::PipeFrame& frame, bool save) {
+            std::size_t offset = 0;
+            const auto piece = [&](void* device, std::size_t bytes, bool wanted = true) {
+                if (wanted) frame.staging->copy(save, offset, device, bytes);
+                offset += bytes;
+            };
+            const auto rows_bytes = std::size_t(n) * c.hidden * sizeof(float);
+            piece(b.residual.data(), rows_bytes); piece(b.x.data(), rows_bytes);
+            piece(b.taps.data(), 5 * rows_bytes, save || want_taps);
+            auto* tx = parts.front().tx;
+            for (unsigned l = 0; l < ps.cut; ++l) if (c.layer[l].producer == l) {
+                const auto kv_bytes = std::size_t(n) * tx->stream->cache[l].width * sizeof(float);
+                piece(tx->overlay[l].k.data(), kv_bytes); piece(tx->overlay[l].v.data(), kv_bytes);
+            }
+            return offset;
+        };
+        const auto chunk_hash = [&] {
+            std::uint64_t hash = 14695981039346656037ULL;
+            for (const auto t : input) { hash ^= t; hash *= 1099511628211ULL; }
+            return hash;
+        };
+        if (stage_b) {
+            ps.queue = b.queue;
+            const auto waited = Clock::now();
+            auto& frame = ps.pipe->acquire(ps.sequence);
+            ps.wait_ms += std::chrono::duration<double, std::milli>(Clock::now() - waited).count();
+            const auto& h = frame.header;
+            if (h[PairWord::start] != parts.front().tx->start || h[PairWord::rows] != n || h[PairWord::tokens] != chunk_hash() ||
+                h[PairWord::bytes] != pair_seam_bytes(c, ps.cut, n))
+                throw std::runtime_error("pair prefill seam chunk does not match this stage's chunk (position, rows, tokens)");
+            (void)seam(frame, false);
+            x_ready = h[PairWord::x_ready] != 0;
+        }
+        for (unsigned l = first_layer; l < end_layer; ++l) {
             const auto& y = w.layer[l]; const auto& a = c.layer[l]; const auto d = a.head_dim;
             auto* layer_reads = b.reads.as<gpu::KvRead>() + std::size_t(l) * n;
             const bool global = a.attention == AttentionKind::global;
@@ -850,9 +897,28 @@ std::vector<ChunkResult> DevicePrefill::pass(std::span<const PrefillSegment> seg
             // The copy queue drains the taps while the remaining layers run.
             if (pinned && want_taps && l == last_tap) { b.drain_taps(n, result.tap_width); taps_issued = true; }
         }
-        if (want_taps && device_finite && !taps_checked) { b.finite(b.taps, std::size_t(n) * result.tap_width); taps_checked = true; }
-        if (pinned && want_taps && !taps_issued) { b.drain_taps(n, result.tap_width); taps_issued = true; }
-        if (!x_ready) b.norm(b.residual, w.final_norm, b.x, n, c.hidden);
+        if (want_taps && device_finite && !taps_checked && !stage_a) { b.finite(b.taps, std::size_t(n) * result.tap_width); taps_checked = true; }
+        if (pinned && want_taps && !taps_issued && !stage_a) { b.drain_taps(n, result.tap_width); taps_issued = true; }
+        if (stage_a) {
+            // Snapshot the seam on this queue (the next chunk may reuse every buffer after seal), then hand
+            // the frame to the pipe's wire thread; this stage's next chunk overlaps stage B's work on this one.
+            ps.queue = b.queue;
+            const auto sealing = Clock::now();
+            auto& frame = ps.pipe->acquire(ps.sequence);
+            if (!frame.staging) throw std::logic_error("pair prefill stage A requires device staging");
+            frame.header = {};
+            auto& h = frame.header;
+            h[PairWord::magic] = pair_seam_magic; h[1] = ps.sequence; h[PairWord::start] = parts.front().tx->start;
+            h[PairWord::rows] = n; h[PairWord::cut] = ps.cut; h[PairWord::identity] = ps.identity;
+            h[PairWord::tokens] = chunk_hash(); h[PairWord::x_ready] = x_ready ? 1U : 0U;
+            h[PairWord::bytes] = pair_seam_bytes(c, ps.cut, n); h[41] = ps.pipe->count();
+            frame.resize(std::size_t(h[PairWord::bytes]));
+            if (seam(frame, true) != h[PairWord::bytes]) throw std::logic_error("pair prefill seam layout");
+            frame.staging->seal(std::size_t(h[PairWord::bytes]));
+            ps.pipe->release(ps.sequence);
+            ps.seal_ms += std::chrono::duration<double, std::milli>(Clock::now() - sealing).count();
+        }
+        if (!x_ready && !stage_a) b.norm(b.residual, w.final_norm, b.x, n, c.hidden);
         // Last-row-only head uses the same WMMA tile and K order. Qualification
         // can request every row without changing any already computed state.
         const unsigned head_rows = all_logits ? n : 1;
@@ -862,7 +928,7 @@ std::vector<ChunkResult> DevicePrefill::pass(std::span<const PrefillSegment> seg
             else b.logits.resize(std::size_t(head_rows) * c.vocab * sizeof(float));
             b.dot("head", w.head.data ? w.head : w.embedding, b.x.as<float>() + (all_logits ? 0 : std::size_t(n - 1) * c.hidden), b.logits.as<float>(), head_rows);
             gpu::cap_logits(b.logits.as<float>(), head_rows * c.vocab, b.queue); b.finite(b.logits, std::size_t(head_rows) * c.vocab);
-        } else {
+        } else if (!stage_a) {
             checked(hipMemcpyAsync(b.last_row.data(), b.x.as<float>() + std::size_t(n - 1) * c.hidden, std::size_t(c.hidden) * sizeof(float),
                                    hipMemcpyDeviceToDevice, b.queue));
         }
@@ -870,6 +936,13 @@ std::vector<ChunkResult> DevicePrefill::pass(std::span<const PrefillSegment> seg
             checked(hipMemcpyAsync(b.pinned_hidden, b.x.data(), std::size_t(n) * c.hidden * sizeof(float), hipMemcpyDeviceToHost, b.queue));
         gpu::synchronize(b.queue);
         if (taps_issued) checked(hipEventSynchronize(b.copied));
+        // Stage B consumed the seam frame (its copies finished above): the slot may take the next chunk.
+        if (stage_b) ps.pipe->release(ps.sequence);
+        if (stage_a || stage_b) {
+            ++ps.sequence;
+            ps.chunk_ms.push_back(std::chrono::duration<double, std::milli>(Clock::now() - entered).count() - (ps.wait_ms - waited_before));
+            ps.linear_ms = b.stats.linear_ms; ps.attention_ms = b.stats.attention_ms; ps.other_ms = b.stats.other_ms;
+        }
         synced_at = Clock::now();
         unsigned failure = 0; b.get(&failure, b.failure, sizeof(failure));
         std::vector<unsigned> maxima(b.ranges.size()); b.get(maxima.data(), b.maximum, maxima.size() * sizeof(unsigned));

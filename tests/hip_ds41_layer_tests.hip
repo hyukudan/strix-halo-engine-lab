@@ -742,6 +742,7 @@ void synthetic(std::mt19937& rng) {
                     bool nan_group = false;
                     for (const float x : rd) nan_group = nan_group || x != x;
                     if (overflow) expect(nan_group, "overflow rows give all-NaN groups (NaN deltas)");
+                    // The wide fallback (forms 0/41) writes the A8 output separately.
                     const bool expect_written = form != 41U && form != 0U;
                     expect(ok && written == expect_written, "dense prefill + output A8 bitwise, form " + std::to_string(form) + " count=" + std::to_string(count) + " rows=" +
                                                                 std::to_string(many) + (overflow ? " overflow" : "") +

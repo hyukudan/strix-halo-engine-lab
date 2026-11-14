@@ -1,6 +1,11 @@
+#include "strix/device/hip_gate.hpp"
 #include "gemma4/engine/runtime.hpp"
 #include "gemma4/ref/npz.hpp"
 #include "gemma4_prefill_ab.hpp"
+#ifdef STRIX_GEMMA4_DEVICE_BACKEND
+#include "gemma4/engine/pair.hpp"
+#include "strix/pair/link.hpp"
+#endif
 
 #include <iostream>
 #include <sstream>
@@ -24,8 +29,17 @@ void emit(const e::Options& options, const e::Runtime& runtime, std::span<const 
 }
 }
 int main(int argc, char** argv) {
+    // Start gate: resolves the declared device (--devices FILE, --device-id ID, STRIX_DEVICES, STRIX_DEVICE), refuses an
+    // excluded or undeclared one and prints the "device:" receipt line. Without a declaration the single integrated
+    // GPU of a node keeps working (declared=implicit).
+    strix::device::bind_hip_main(argc, argv);
     for (int i = 1; i < argc; ++i) if (std::string_view(argv[i]) == "--ab-switch") return prefill_ab::run(argc, argv);
     try {
+#ifdef STRIX_GEMMA4_DEVICE_BACKEND
+        // STRIX_G4_PAIR=1: --rank/--peer/--transport belong to the two-node route, not the option parser.
+        std::vector<char*> pair_arguments;
+        if (e::pair_enabled()) pair_arguments = strix::pair::strip_flags(argc,argv,"STRIX_G4_PAIR");
+#endif
         const auto options = e::parse_options(argc,argv);
         if (options.help) {
             std::cout << "strix-gemma4-decode MODEL --rope-tables TABLE_DIR [--ids IDS.txt | --prompt TEXT | --chat REQUEST.json | --fixture FIXTURE.npz] [--tokenizer tokenizer.json]\n"
@@ -78,6 +92,14 @@ int main(int argc, char** argv) {
             else throw std::invalid_argument("provide --ids, --prompt with tokenizer, --chat or --fixture");
             prompts.push_back(std::move(prompt));
         }
+#ifdef STRIX_GEMMA4_DEVICE_BACKEND
+        if (e::pair_enabled()) {
+            if (prompts.size() != 1 || !expected.empty()) throw std::invalid_argument("pair route runs one --ids/--prompt request");
+            return e::run_pair(options,runtime,prompts.front(),[&](std::span<const std::uint32_t> ids, Json receipt) {
+                emit(options,runtime,ids,std::move(receipt));
+            });
+        }
+#endif
         bool matched = true, failed = false;
         for (std::size_t p = 0; p < prompts.size(); ++p) {
             e::Coordinator coordinator(*runtime.backend,runtime.drafts);

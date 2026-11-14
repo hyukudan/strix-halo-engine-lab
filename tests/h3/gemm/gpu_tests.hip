@@ -90,6 +90,59 @@ struct DeviceRun {
     std::vector<std::uint16_t> y;
     unsigned flushed = 0;
 };
+
+template <unsigned BN> void test_packed_operand() {
+    constexpr unsigned m = 17, n = 512, k = 256;
+    const auto x = activations(m, k, 712);
+    const auto cs = channel_scales(n, 713);
+    Dev<std::uint16_t> dx(x), dy(std::size_t(m) * n);
+    Dev<float> ds(m), dcs(cs);
+    Dev<std::int8_t> da(std::size_t(m) * k);
+    Dev<std::int32_t> acc(std::size_t(m) * n);
+    launch_quantize(dx.p, k, m, k, da.p, ds.p, nullptr, nullptr);
+    unsigned cases = 0;
+    for (unsigned group : {4U, 8U, 16U, 32U, 64U, 256U})
+        for (unsigned kind = 0; kind < 3; ++kind)
+            for (bool codebook : {false, true}) {
+                PackedW4A8 p; p.group_size = group;
+                const float scales[] = {0, 0.5F, 1.5F, 2.5F, 16, 448, 1.0F / 512, 1};
+                const std::uint8_t fp8[] = {0, 0x30, 0x3c, 0x42, 0x58, 0x7e, 1, 0x38};
+                for (unsigned i = 0; i < n * k / group; ++i) {
+                    if (kind == 0) p.scales_f32.push_back(scales[i % 8]);
+                    else p.scales_fp8.push_back(fp8[i % 8]); // E4M3 and raw U8 storage
+                }
+                if (codebook) for (unsigned i = 0; i < 16; ++i) p.codebook.push_back((float(i) - 7.5F) / 2);
+                std::vector<std::int8_t> packed(n * k / 2), unpacked(n * k);
+                for (unsigned i = 0; i < packed.size(); ++i) packed[i] = std::int8_t(std::uint8_t(i));
+                p.validate(n, k, packed.size());
+                for (unsigned i = 0; i < unpacked.size(); ++i) unpacked[i] = p.at(packed.data(), i);
+                const auto lut = prepare_w4a8(p);
+                Dev<std::int8_t> dp(packed), du(unpacked);
+                Dev<float> df(p.scales_f32), db(p.codebook);
+                Dev<std::uint8_t> df8(p.scales_fp8), ids(lut.scale_ids);
+                Dev<std::uint16_t> pairs(lut.pairs);
+                dev::GemmArgs a;
+                a.a=da.p; a.row_scale=ds.p; a.ch_scale=dcs.p; a.m=m; a.n=n; a.k=k;
+                a.out.ptr[0]=dy.p; a.out.ld=n; a.out.seg_cols=n; a.acc_out=acc.p;
+                a.b=du.p;
+                launch_gemm<BN, dev::Epi::plain>(a, nullptr);
+                const auto ref=dy.get();
+                launch_gemm<BN, dev::Epi::raw>(a, nullptr);
+                const auto ref_acc=acc.get();
+                a.b=dp.p; a.operand=Operand::w4a8; a.group_size=group;
+                a.group_fp8=kind ? df8.p : nullptr; a.group_f32=kind ? nullptr : df.p;
+                a.codebook=codebook ? db.p : nullptr;
+                for (bool prepared : {false, true}) {
+                    if (prepared) { a.pair_lut=pairs.p; a.scale_ids=ids.p; a.group_shift=lut.group_shift; }
+                    launch_gemm<BN, dev::Epi::plain>(a, nullptr);
+                    CHECK(ndiff(dy.get(), ref)==0, "W4A8 BN%u group%u kind%u cb%d prepared%d output", BN, group, kind, codebook, prepared);
+                    launch_gemm<BN, dev::Epi::raw>(a, nullptr);
+                    CHECK(ndiff(acc.get(), ref_acc)==0, "W4A8 BN%u group%u kind%u cb%d prepared%d accumulator", BN, group, kind, codebook, prepared);
+                }
+                ++cases;
+            }
+    std::printf("W4A8 BN%u: %u cases, general/prepared/unpacked INT8 outputs and accumulators compared\n", BN, cases);
+}
 template <unsigned BN>
 DeviceRun run_device(const std::vector<std::uint16_t>& x, std::uint32_t m, std::uint32_t k, const std::vector<std::int8_t>& w,
     const std::vector<float>& ws, std::uint32_t n, bool with_acc) {
@@ -637,6 +690,8 @@ int main(int argc, char** argv) {
     const char* qs = std::getenv("STRIX_H3_QUANT_SET");
     const char* ckpt = std::getenv("H3_CKPT");
     const auto t0 = std::chrono::steady_clock::now();
+    test_packed_operand<128U>();
+    test_packed_operand<256U>();
     test_projection<128U>(333U, 5376U, 384U, 11U);
     test_projection<256U>(333U, 5376U, 512U, 12U);
     test_projection<128U>(70U, 14336U, 128U, 13U);
@@ -645,6 +700,9 @@ int main(int argc, char** argv) {
     test_projection<128U>(1U, 5376U, 128U, 16U);      // M = 1
     test_projection<256U>(1U, 14336U, 256U, 17U);
     test_projection<128U>(2400U, 512U, 256U, 18U);    // 10 row tiles: grouped raster crosses its 8-tile groups
+    test_projection<64U>(333U, 7168U, 448U, 23U);     // BN 64 (narrow image-scale tiles), 7 output tiles
+    test_projection<64U>(600U, 14336U, 128U, 24U);    // BN 64 at K 14336, 3 row tiles
+    test_packed_operand<64U>();
     test_projection<256U>(2305U, 256U, 512U, 19U);    // 10 row tiles, 2 output tiles, tail of 1 row
     test_swiglu_and_segments<128U>(259U, 21U);
     test_swiglu_and_segments<256U>(259U, 22U);

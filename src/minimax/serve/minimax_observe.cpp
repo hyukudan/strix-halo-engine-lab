@@ -190,7 +190,7 @@ sv::Json Observer::status(const sv::QueueSnapshot& q, bool stopping, bool detail
     out.set("instance", std::move(instance));
     out.set("armed", sv::Json(observe_armed()));
     sv::Json caps = sv::Json::object();
-    caps.set("prefix_cache", sv::Json(false));
+    caps.set("prefix_cache", sv::Json(info_.prefix_cache));
     caps.set("state_import", sv::Json(false));
     caps.set("draft", sv::Json(info_.draft));
     caps.set("return_token_ids", sv::Json(true));
@@ -349,7 +349,9 @@ std::string Observer::metrics(const sv::QueueSnapshot& q, std::string_view legac
     scalar(m, "strix_requests_failed_total", "counter", "Generations that failed.", format_u64(q.failed));
     scalar(m, "strix_requests_cancelled_total", "counter", "Generations cancelled (client gone).", format_u64(q.cancelled));
     scalar(m, "strix_prompt_tokens_total", "counter", "Prompt tokens of finished generations.", format_u64(q.prompt_tokens));
-    scalar(m, "strix_prompt_tokens_cached_total", "counter", "Prompt tokens restored from a prefix cache (this engine has none).",
+    scalar(m, "strix_prompt_tokens_cached_total", "counter",
+           info_.prefix_cache ? "Prompt tokens reused from a slot's resident prefix KV instead of being prefilled."
+                              : "Prompt tokens reused from a slot's resident prefix KV (off; STRIX_MM_SERVE_PREFIX=1 on both ranks).",
            format_u64(q.cached_tokens));
     scalar(m, "strix_generated_tokens_total", "counter", "Generated tokens.", format_u64(q.generated_tokens));
     scalar(m, "strix_engine_busy_seconds_total", "counter", "Seconds the engine spent on generations.", format_double(q.busy_seconds));

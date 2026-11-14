@@ -86,7 +86,9 @@ public:
             return {nullptr, nullptr, nullptr, tr_bytes, suh.bytes, n * 2, n, suh.shape[0], tr.shape[2] / 16};
         }
         std::uint8_t* t = stage(tr_bytes + suh.bytes + n * 2);
-        if (o0 == 0 && n == svh.shape[0]) {
+        if (i4_mode_ == 2) {
+            // fast_i4 pack hit: no trellis bytes are read (copy_raw leaves raw.trellis null)
+        } else if (o0 == 0 && n == svh.shape[0]) {
             pack_.read(tr, 0, tr.bytes, t);
         } else {
             if (whole_.size() < tr.bytes) whole_.resize(tr.bytes);
@@ -109,7 +111,7 @@ public:
             return {nullptr, nullptr, nullptr, tr_bytes, n * 2, svh.bytes, svh.shape[0], n, tr.shape[2] / 16};
         }
         std::uint8_t* t = stage(tr_bytes + n * 2 + svh.bytes);
-        pack_.read(tr, (i0 / 16) * row_bytes, tr_bytes, t);
+        if (i4_mode_ != 2) pack_.read(tr, (i0 / 16) * row_bytes, tr_bytes, t);
         pack_.read(suh, i0 * 2, n * 2, t + tr_bytes);
         pack_.read(svh, 0, svh.bytes, t + tr_bytes + n * 2);
         return {t, t + tr_bytes, t + tr_bytes + n * 2, tr_bytes, n * 2, svh.bytes, svh.shape[0], n, tr.shape[2] / 16};
@@ -184,6 +186,7 @@ public:
     void set_plan(mem::LoadPlan* p) {
         plan_ = p;
         plan_arena_left_ = 0;
+        plan_i4_temp_ = false;
         if (p) p->bounce = PackReader::bounce_bytes();
     }
     bool planning() const { return plan_ != nullptr; }
@@ -418,6 +421,64 @@ public:
         return r;
     }
     double device_gib() const { return static_cast<double>(device_bytes_) / 1073741824.0; }
+    // One exact device allocation (planned as such; freed with the arenas). fast_i4 INT4 layer packs.
+    void* dedicated(std::uint64_t bytes, const char* what) {
+        bytes = (bytes + 255) & ~std::uint64_t{255};
+        if (plan_) {
+            plan_->add(bytes);
+            return nullptr;
+        }
+        void* p = nullptr;
+        hip_ok(hipMalloc(&p, bytes), what);
+        alloc_log(p, bytes, what);
+        allocated_ += bytes;
+        recorded_.push_back(bytes);
+        arenas_.push_back(p);
+        device_bytes_ += bytes;
+        return p;
+    }
+    // fast_i4 load (STRIX_GLM_MODEL_FORMAT=fast_i4): between i4_routed_begin / _end the raw slices put their trellis
+    // into ONE reusable layer buffer (planned once, freed by i4_temp_release after the load), suh / svh in the arena as
+    // usual. skip_trellis: the layer's INT4 pack is read from STRIX_GLM_FAST_I4_PACK, the trellis is not read at all
+    // (raw.trellis = nullptr). The allocations are the same either way (plan parity).
+    void i4_routed_begin(std::uint64_t layer_trellis_bytes, bool skip_trellis) {
+        const bool have = plan_ ? plan_i4_temp_ : i4_temp_ != nullptr;
+        if (!have) {
+            void* p = dedicated(layer_trellis_bytes, "fast_i4 routed EXL3 layer buffer");
+            if (plan_) plan_i4_temp_ = true;
+            else i4_temp_ = static_cast<std::uint8_t*>(p);
+            i4_temp_bytes_ = (layer_trellis_bytes + 255) & ~std::uint64_t{255};
+        }
+        i4_cursor_ = 0;
+        i4_mode_ = skip_trellis ? 2 : 1;
+    }
+    void i4_routed_end() { i4_mode_ = 0; }
+    // Scope gate_up: the routed down of a converted layer is an ordinary resident raw slice.
+    void i4_suspend(bool on) {
+        if (on) {
+            i4_saved_ = i4_mode_;
+            i4_mode_ = 0;
+        } else {
+            i4_mode_ = i4_saved_;
+        }
+    }
+    // After the load: returns the layer buffer's bytes to the device (the plan counted it as resident: conservative).
+    std::uint64_t i4_temp_release() {
+        if (!i4_temp_) return 0;
+        hip_ok(hipDeviceSynchronize(), "fast_i4 layer buffer sync");
+        for (auto it = arenas_.begin(); it != arenas_.end(); ++it)
+            if (*it == i4_temp_) {
+                arenas_.erase(it);
+                break;
+            }
+        hip_ok(hipFree(i4_temp_), "fast_i4 layer buffer free");
+        i4_temp_ = nullptr;
+        device_bytes_ -= i4_temp_bytes_;
+        return i4_temp_bytes_;
+    }
+    bool i4_skip_trellis() const { return i4_mode_ == 2; }
+    PackReader& pack() { return pack_; }
+    std::uint8_t* staging(std::uint64_t bytes) { return stage(bytes); }
 
 private:
     static constexpr std::size_t kStage = std::size_t{1} << 30;  // > the largest slice (full lm_head on one node, ~476 MB)
@@ -486,6 +547,22 @@ private:
         return l;
     }
     void copy_raw(Linear& l, const Staged& g) {
+        if (i4_mode_ != 0) {  // fast_i4 routed expert: trellis -> the layer buffer (or nothing), suh / svh -> arena
+            auto* d_suh = static_cast<std::uint8_t*>(arena(g.suh_bytes + 256 + g.svh_bytes));
+            const std::uint64_t tr = (g.tr_bytes + 255) & ~std::uint64_t{255};
+            if (i4_cursor_ + tr > i4_temp_bytes_) throw std::logic_error("fast_i4: routed layer larger than its EXL3 buffer");
+            std::uint8_t* d = i4_mode_ == 1 && !plan_ ? i4_temp_ + i4_cursor_ : nullptr;
+            i4_cursor_ += tr;
+            if (plan_) return;
+            std::uint8_t* d_svh = d_suh + ((g.suh_bytes + 255) & ~std::uint64_t{255});
+            if (d) hip_ok(hipMemcpy(d, g.tr, g.tr_bytes, hipMemcpyHostToDevice), "raw trellis (fast_i4 layer buffer)");
+            hip_ok(hipMemcpy(d_suh, g.suh, g.suh_bytes, hipMemcpyHostToDevice), "raw suh");
+            hip_ok(hipMemcpy(d_svh, g.svh, g.svh_bytes, hipMemcpyHostToDevice), "raw svh");
+            l.raw.trellis = reinterpret_cast<const std::uint32_t*>(d);
+            l.raw.suh = reinterpret_cast<const std::uint16_t*>(d_suh);
+            l.raw.svh = reinterpret_cast<const std::uint16_t*>(d_svh);
+            return;
+        }
         auto* d = static_cast<std::uint8_t*>(arena(g.tr_bytes + 256 + g.suh_bytes + 256 + g.svh_bytes));
         if (plan_) return;  // dry run (glm_mem): the arena bytes are planned, nothing is copied
         std::uint8_t* d_suh = d + ((g.tr_bytes + 255) & ~std::uint64_t{255});
@@ -528,6 +605,11 @@ private:
     std::vector<void*> arenas_;
     std::uint8_t* arena_next_ = nullptr;
     std::uint64_t arena_left_ = 0, device_bytes_ = 0;
+    std::uint8_t* i4_temp_ = nullptr;  // fast_i4 routed EXL3 layer buffer (load only)
+    std::uint64_t i4_temp_bytes_ = 0, i4_cursor_ = 0;
+    int i4_saved_ = 0;
+    int i4_mode_ = 0;  // 0 off, 1 trellis into i4_temp_, 2 skip the trellis (pack hit)
+    bool plan_i4_temp_ = false;
 };
 
 

@@ -1,4 +1,5 @@
 #include "../apps/glm_deploy_owners.hpp"
+#include "glm/xfer/glm_seqpar.hpp"
 #include <iostream>
 #include <map>
 #include <stdexcept>
@@ -13,6 +14,23 @@ static dp::DeviceFacts device(unsigned gib, bool unified = true) {
 }
 int main() {
     try {
+        namespace gx = strix::glm::xfer;
+        check(gx::prefill_pipeline(2,nullptr)==gx::prefill_pipeline(1,"2"), "default and explicit pipeline 2 resolve identically");
+        check(gx::prefill_pipeline(2,"1")==1,"pipeline 1 off switch");
+        bool bad_pipeline=false;
+        try { (void)gx::prefill_pipeline(1,"3"); } catch(const std::invalid_argument&) { bad_pipeline=true; }
+        check(bad_pipeline,"invalid explicit pipeline refuses before device work");
+        const unsigned rows=8192, depth=4;
+        const auto capacity=gx::GlmSchedule::row_bytes((rows+1U)/2U);
+        const auto stride=(capacity+sizeof(gx::Trailer)+4095U)&~std::size_t{4095};
+        const auto pipeline_bytes=gx::seqpar_workspace_bytes(rows,depth,capacity);
+        check(pipeline_bytes==2*depth*stride+gx::GlmSchedule::row_bytes(rows)+(8U<<20U),
+              "pipeline bounds both rings and full normalized buffer once");
+        check(gx::seqpar_workspace_bytes(rows,8,capacity)>pipeline_bytes,"channel depth changes pipeline bound");
+        bool bad_depth=false, big_stride=false;
+        try { (void)gx::seqpar_workspace_bytes(rows,1,capacity); } catch(const std::invalid_argument&) { bad_depth=true; }
+        try { (void)gx::seqpar_workspace_bytes(rows,4,SIZE_MAX); } catch(const std::overflow_error&) { big_stride=true; }
+        check(bad_depth && big_stride,"pipeline bound rejects invalid depth and overflow");
         gd::Options o; o.slots = 4;
         const std::array<gd::Owners, 2> weights{{{70ULL<<30, 1ULL<<30}, {71ULL<<30, 1ULL<<30}}};
         const auto workspace = [](std::uint32_t, bool shard) { return (shard ? 3ULL : 2ULL)<<30; };

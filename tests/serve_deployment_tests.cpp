@@ -1,5 +1,8 @@
 // Host-only deployment tests using the serving harness's recording writer and real ApiService.
 #include "strix/serve/api.hpp"
+#include "strix/deepseek41_batch_forward.hpp"
+#include <map>
+#include <array>
 #include <iostream>
 using namespace strix::serve;
 namespace {
@@ -26,6 +29,29 @@ Writer get(ApiService& api, const char* path = "/health", const char* token = nu
     HttpRequest request; request.method = "GET"; request.path = path;
     if (token) request.headers.emplace_back("authorization", std::string("Bearer ") + token);
     Writer out; api.handle(request, out); return out;
+}
+void kv_pool_tests() {
+    using namespace strix::deepseek41;
+    struct Role { bool owns_kv; unsigned ratio; };
+    const std::array<Role,3> roles{{{true,1},{true,2},{false,0}}};
+    std::map<std::uint64_t,std::uint64_t> free{{0,32},{64,16}};
+    constexpr std::uint64_t entry=352; // fixture KV + index row, independent of model assets
+    const auto total=batch_pool_storage_bytes(80,roles,3,entry);
+    const auto fragmented=batch_pool_free_bytes(free,roles,3,entry);
+    check(fragmented==72*entry && fragmented<total,"free bytes sum all arena holes across KV-source layers");
+    free.erase(0);
+    check(batch_pool_free_bytes(free,roles,3,entry)==24*entry,"reserve subtracts actual compressed ownership");
+    free.clear();
+    check(batch_pool_free_bytes(free,roles,3,entry)==0,"exhausted pool is zero rather than null");
+    free.emplace(0,80);
+    check(batch_pool_free_bytes(free,roles,3,entry)==total,"release/coalescing restores complete arena bytes");
+    GenerationQueue queue;
+    ApiConfig config;
+    config.deployment.capacity_provider=[&] { return ServeCapacity{4,0,batch_pool_free_bytes(free,roles,3,entry),0}; };
+    ApiService api(config,{},queue,8192,false);
+    check(at(at(parse_json(get(api,"/api/status").body),"capacity"),"kv_bytes_free").as_int()==static_cast<std::int64_t>(total),
+          "allocator byte snapshot reaches HTTP capacity");
+    queue.shutdown();
 }
 void deployment_tests() {
     GenerationQueue queue;
@@ -97,7 +123,7 @@ void deployment_tests() {
 
 } // namespace
 int main() try {
-    deployment_tests();
+    kv_pool_tests(); deployment_tests();
     std::cout << "deployment failures: " << failures << '\n';
     return failures ? 1 : 0;
 } catch (const std::exception& error) {

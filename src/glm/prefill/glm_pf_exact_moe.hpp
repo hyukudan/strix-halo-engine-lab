@@ -1,6 +1,7 @@
 #pragma once
 // Grouped chunk MoE preserving moe::enqueue_experts R=1 arithmetic.
 #include "glm/moe/glm_moe.hpp"
+#include <cstdint>
 #include <vector>
 
 namespace strix::glm::pf::exact_moe {
@@ -42,6 +43,50 @@ bool v3_row_buckets();  // STRIX_GLM_PF_EXACTMOE_V3_RCAP (default 1): v3 tiles u
 unsigned selected_variant(unsigned rows);  // what enqueue runs for a call of `rows` rows (1, 2, 3, 6..11 or 14)
 void enqueue(const View& v, Plan& plan, void* workspace, std::size_t bytes,
              hipStream_t stream, unsigned tm = 0);
+// FAST_I4 stored routed experts. Load-time pack builder and shared IU4 execution glue.
+namespace iu4 {
+bool built();            // the library core is linked
+struct Layer {           // device: per routed matrix m (0 gate, 1 up, 2 down) x 288 experts
+    std::uint8_t* wq[3] = {};
+    std::uint16_t* ws[3] = {};             // FP16 bits [288][N][K/64]
+    const std::uint16_t* const* svh[3] = {};  // device [288] svh pointers (output column scales)
+    std::size_t bytes = 0;
+    double seconds = 0;
+    // fast_i4 (STRIX_GLM_MODEL_FORMAT): the routed EXL3 trellis is freed, so every call of this layer takes the IU4
+    // path whatever the selected variant (a view of the engine-owned pack; release() is never called on it).
+    bool replace = false;
+};
+struct Scratch {          // device, per call: quantised activations and the tile list
+    std::uint8_t* aq_gu = nullptr;
+    float* as_gu = nullptr;
+    std::uint8_t* aq_down = nullptr;
+    float* as_down = nullptr;
+    void* tiles = nullptr;
+    std::uint32_t* ntiles = nullptr;
+    unsigned max_rows = 0;
+    std::uint32_t max_tiles = 0;
+    std::size_t bytes = 0;
+};
+// host_table: [288] routed experts (device trellis/suh/svh pointers). Synchronous (returns after the stream drains).
+// The same conversion into caller-owned buffers: q.wq / q.ws sized as convert() allocates them, q.svh device [288]
+// tables (filled here from host_table's svh). Synchronous. Returns the device seconds.
+double convert_into(const moe::ExpertSlices* host_table, Layer& q, hipStream_t stream, int scale_rule = 0);
+constexpr std::size_t weight_bytes() { return std::size_t{288} * 4096U * 1024U / 2U; }  // per matrix (all three equal)
+constexpr std::size_t scale_bytes(unsigned m) { return std::size_t{288} * (m == 2U ? 4096U * (1024U / 64U) : 1024U * (4096U / 64U)) * 2U; }
+std::size_t scratch_bytes(unsigned max_rows);
+Scratch make_scratch(unsigned max_rows);
+void release(Scratch& scratch);
+// Full INT4 chain (STRIX_MOE_I4_CHAIN=1), gate-scratch policy. The process policy is resolved once from
+// STRIX_MOE_I4_CHAIN_GSAVE (shared switch, default on) and STRIX_GLM_I4_CHAIN_GSAVE (lend the call's gate/up rows,
+// default off). Qualification fixtures pass an explicit policy instead of changing the environment between calls
+// (nullptr restores the process policy).
+struct ChainPolicy { bool shared_gsave = true, lend = false; };
+void set_chain_policy_for_test(const ChainPolicy* policy);
+// Plan the last full-chain call was enqueued on (0 BM32, 1 BM64, 2 BM128) and whether the paired GEMM kept its gate
+// in the lent scratch; valid is false before the first chain call. A resource fallback shows here, not in the bits.
+struct ChainRun { bool valid = false; int paired = 0, down = 0; bool gsave = false; };
+ChainRun last_chain_run();
+}  // namespace iu4
 // Device plan: the same pairs/tiles/groups bytes as enqueue() built on the GPU from device ids, without the route
 // download, host grouping or plan upload (no host synchronization). table: device [289] (entry 288 = shared expert).
 // Invalid ids (not strictly ascending or >= 288) set *flag and that row gets no routed pairs.
@@ -53,6 +98,8 @@ struct DeviceView {
     const std::uint32_t* ids = nullptr;        // device [rows][8]
     const float* weights = nullptr;            // device [rows][8]
     float* out = nullptr;
+    const iu4::Layer* iu4 = nullptr;           // stored routed experts (null: EXL3)
+    const iu4::Scratch* iu4_scratch = nullptr;
 };
 unsigned tm_env();  // STRIX_GLM_PF_EXACTMOE_TM (16 default, 32)
 moe::ExpertSlices* workspace_table(void* workspace);  // the workspace's [289] device table slot

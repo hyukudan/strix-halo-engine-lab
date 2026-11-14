@@ -1,5 +1,6 @@
 #include "strix/hip_ds41_attention.hpp"
 #include "strix/hip_ds41_layer.hpp"
+#include "strix/hip_ds41_prefill.hpp"
 #include "strix/hip_ds41_dense_fp16.hpp"
 #include <algorithm>
 #include <cmath>
@@ -142,6 +143,9 @@ void tall_smoke(unsigned rows,unsigned width,unsigned count,unsigned row_width=0
     for(unsigned form:forms){
         v.tall=form;clear();d::enqueue_q8_0_a8_dense_prefill(v,nullptr);auto got=out.get();
         expect(same(ref,got),"tall form "+std::to_string(form)+" bitwise");
+        // the shared tiled core route (STRIX_DS41_PF_CORE=1) must give the same bits for every form
+        d::set_pf_core(1);clear();d::enqueue_q8_0_a8_dense_prefill(v,nullptr);const auto core=out.get();d::set_pf_core(-1);
+        expect(same(ref,core),"shared core form "+std::to_string(form)+" bitwise");
         float ms=timing([&]{d::enqueue_q8_0_a8_dense_prefill(v,nullptr);});
         std::printf(" t%u_ms=%.6f%s",form,ms,same(ref,got)?"":"(DIFF)");
     }
