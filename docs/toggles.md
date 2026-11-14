@@ -272,6 +272,8 @@ Follow the link for the gain, preconditions and off switch. Defaults are shorten
 | `STRIX_MM_PF_KV_TILE` | minimax | auto | [mm-pf-kv-tile](optimizations.md#mm-pf-kv-tile) |
 | `STRIX_MM_PF_LATE_SRC_FENCE` | minimax | ON | [minimax-grouped-prefill.md](minimax-grouped-prefill.md) |
 | `STRIX_MM_PF_MSA_BATCH` | minimax | 1 | [mm-pf-msa-batch](optimizations.md#mm-pf-msa-batch) |
+| `STRIX_MM_FAST_PREFILL=1` | minimax | off | Profile `mm-fast-pf-v1` (governed rows `src/minimax/engine/mm_profile_table.hpp`, shared bundle rules `include/strix/fast_profile.hpp`): `STRIX_MM_PF_MSA_FLASH=1` on layers 40-59 = `msa-flash-bf16-l40-v1`, EXL3 MoE base only (not selected with `STRIX_MMX_MODEL_FORMAT=fast_i4`); a set member wins, `0` beats the bundle. Both ranks must agree; active policies enter the session-cache identity. Changes logits. |
+| `STRIX_MM_PF_MSA_FLASH` | minimax | 0 | FAST MSA flash attention (1 one-term, 2 two-term BF16), governed row of the FAST prefill profile; [mm-pf-msa-flash](optimizations.md) |
 | `STRIX_MM_PF_MSA_REWORK` | minimax | 5 | [mm-pf-msa-rework](optimizations.md#mm-pf-msa-rework) |
 | `STRIX_MM_PF_MSA_SCRATCH_MB` | minimax | 1152 | [mm-pf-msa-scratch](optimizations.md#mm-pf-msa-scratch) |
 | `STRIX_MM_PF_ROUTER_BATCH` | minimax | 1 | [mm-pf-router-batch](optimizations.md#mm-pf-router-batch) |
