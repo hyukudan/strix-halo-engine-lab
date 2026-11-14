@@ -256,9 +256,12 @@ Resolved resolve(App app, const std::vector<std::string>& in, const Getenv& raw_
     std::map<std::string, std::string> fast_env;
     const auto enabled = [](const char* v) { return v && std::string_view(v) == "1"; };
     const bool bundle = enabled(raw_env("STRIX_DS41_FAST_PREFILL"));
-    fast_env.emplace("STRIX_DS41_FAST_PREFILL", bundle ? "1" : "0");
-    fast_env.emplace("STRIX_DS41_FAST_DENSE_MIN_ROWS", std::to_string(
-        strix::ds41::fast_profile::dense_min_rows_value(raw_env("STRIX_DS41_FAST_DENSE_MIN_ROWS"))));
+    if (const char* value = raw_env("STRIX_DS41_FAST_PREFILL"); value && *value)
+        fast_env.emplace("STRIX_DS41_FAST_PREFILL", bundle ? "1" : "0");
+    if (const char* value = raw_env("STRIX_DS41_FAST_DENSE_MIN_ROWS");
+        (value && *value) || bundle || enabled(raw_env("STRIX_DS41_FAST_DENSE")))
+        fast_env.emplace("STRIX_DS41_FAST_DENSE_MIN_ROWS", std::to_string(
+            strix::ds41::fast_profile::dense_min_rows_value(value)));
     for (const char* key : {"STRIX_DS41_FAST_ATTN", "STRIX_DS41_FAST_MOE", "STRIX_DS41_FAST_DENSE"}) {
         const char* value = raw_env(key);
         const bool attention = std::string_view(key) == "STRIX_DS41_FAST_ATTN";
@@ -276,7 +279,8 @@ Resolved resolve(App app, const std::vector<std::string>& in, const Getenv& raw_
     r.profile = strix::profile::resolve(profile_engine(), profile_inputs);
     std::vector<std::pair<std::string, std::string>> profile_env;
     for (const auto& e : r.profile->entries)
-        if (!e.lever->env.empty())
+        if (!e.lever->env.empty() &&
+            (strix::profile::applied(e.status) || fast_env.contains(std::string(e.lever->env))))
             profile_env.emplace_back(std::string(e.lever->env), e.value);
     r.set_env = profile_env;
     if (auto extra = strix::profile::profile_args(*r.profile); !extra.empty())

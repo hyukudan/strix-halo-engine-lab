@@ -432,6 +432,18 @@ void test_profile() {
         const auto head = std::string("app ") + pd::app_name(app) + "\nprofile default\nprofile qualification qualified\n";
         check(d.rfind(head, 0) == 0, "describe: profile lines right after the app line");
         check(base.profile && base.profile->json().find("\"pending\":[]") != std::string::npos, "default: nothing pending");
+        // The added explicit-only rows must not invalidate existing OFF pair identities.
+        auto legacy = *base.profile;
+        legacy.entries.resize(2);
+        check(base.profile->fingerprint() == legacy.fingerprint(), "default: legacy OFF fingerprint");
+        auto off_world = w;
+        off_world.env["STRIX_DS41_FAST_ATTN"] = "0";
+        off_world.env["STRIX_DS41_FAST_MOE"] = "0";
+        off_world.env["STRIX_DS41_FAST_DENSE"] = "0";
+        off_world.env["STRIX_DS41_FAST_PREFILL"] = "0";
+        const auto explicit_off = off_world.run(app, plain_args);
+        check(explicit_off.profile->fingerprint() == legacy.fingerprint(), "explicit OFF: legacy fingerprint");
+
 
         auto fast_args = plain_args;
         fast_args.insert(fast_args.end(), {"--profile", "fast"});
@@ -446,7 +458,7 @@ void test_profile() {
               "fast: provisional moe_relaxed still runs");
         std::size_t pending = 0;
         for (const auto& e : f.profile->entries) pending += e.status == pr::Status::pending;
-        check(pending == pd::profile_table.size() - 1U && f.notices.size() == base.notices.size() + pending + 1U,
+        check(pending == 1U && f.profile->find("attention_f16wmma")->status == pr::Status::pending && f.notices.size() == base.notices.size() + pending + 1U,
               "fast: one notice per pending row and one for the provisional row");
         check(std::count(f.notices.begin(), f.notices.end(),
                          "deepseek41-pair profile fast: moe_relaxed=1 is bit-changing; qualification in progress") == 1,

@@ -49,6 +49,7 @@ struct Lever {
     std::string_view source;                // qualification receipt, or what a pending column waits for
     bool native_option = false;            // an adapter's native CLI parser owns validation/export
     std::array<bool, 3> provisional{};      // selected ahead of qualification; still requires `runnable`; wins over `ready` until the row is flipped
+    bool omit_builtin_fingerprint = false;  // additive governed rows preserve the legacy identity at builtin
 };
 
 // One engine: its receipt tag, the allow-pending variable and the table.
@@ -223,7 +224,11 @@ struct Resolution {
         };
         mix(name(profile));
         mix(qualification());
-        for (const auto& entry : entries) { mix(entry.lever->name); mix(entry.value); }
+        for (const auto& entry : entries) {
+            if (entry.lever->omit_builtin_fingerprint && entry.value == entry.lever->builtin) continue;
+            mix(entry.lever->name);
+            mix(entry.value);
+        }
         return h;
     }
 };

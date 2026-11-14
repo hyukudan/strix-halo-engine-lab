@@ -24,11 +24,11 @@ inline constexpr std::array<strix::profile::Lever, 5> profile_table{{
      "selected for fast ahead of its qualification receipt (ds41-moe-relaxed-v1, in progress); changes logits",
      false, {false, true, false}},
     {"dense_f16", "STRIX_DS41_FAST_DENSE", "", {"", "", ""}, "0", strix::profile::Kind::bit_changing,
-     {true, false, true}, {true, true, true}, "", "0", "explicit FAST dense; native qualification required"},
+     {true, false, true}, {true, true, true}, "", "0", "explicit FAST dense; native qualification required", false, {}, true},
     {"fast_prefill", "STRIX_DS41_FAST_PREFILL", "", {"", "", ""}, "0", strix::profile::Kind::bit_changing,
-     {true, false, true}, {true, true, true}, "", "0", "explicit FAST bundle; native qualification required"},
+     {true, false, true}, {true, true, true}, "", "0", "explicit FAST bundle; native qualification required", false, {}, true},
     {"dense_min_rows", "STRIX_DS41_FAST_DENSE_MIN_ROWS", "", {"", "", ""}, "128", strix::profile::Kind::bit_changing,
-     {true, false, true}, {true, true, true}, "", "", "FAST dense dispatch threshold"},
+     {true, false, true}, {true, true, true}, "", "", "FAST dense dispatch threshold", false, {}, true},
 }};
 
 }  // namespace strix::deepseek41::pair_defaults
