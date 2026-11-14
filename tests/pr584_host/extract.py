@@ -32,8 +32,8 @@ if "void prepare_flash_mirrors()" in source:
 (out / "setter.inc").write_text(
     function("void DevicePrefill::set_precision_for_new_sequence(bool") + "\n" +
     function("void DevicePrefill::set_precision_for_new_sequence(const PrefillOptions&"))
-start = source.index("                    fe.ring_pos = m.ppos64.p + pk0;")
-end = source.index("                    if (carry_words && !last_local)", start)
+start = source.index("                    for (std::uint32_t sg = 0; sg < nseg; ++sg) {", source.index("recv_words = static_cast<const std::uint32_t*>(entries_exchange->finish(st))"))
+end = source.index("                    for (std::uint32_t sg = 0; sg < nseg; ++sg) {", start + 1)
 unpack = source[start:end]
 unpack = re.sub(r"final_entries_kernel<false><<<[^\n]+>>>\(fe\);", "unpack_entries(fe);", unpack)
 if "<<<" in unpack:

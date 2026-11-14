@@ -95,6 +95,10 @@ struct EncoderOutput {
     // Non-zero: the hidden rows stayed on the device of the backend whose encode_for_projection() returned this
     // output (`hidden` is then empty); only that backend's merge_project() of the same encode reads them.
     std::uint64_t device_epoch = 0;
+    std::shared_ptr<const void> device_owner{};  // keeps the owner token unique even after backend destruction
+    bool resident_for(const std::shared_ptr<const void>& owner, std::uint64_t epoch) const {
+        return device_owner && device_owner == owner && device_epoch != 0 && device_epoch == epoch;
+    }
 };
 // Projected rows of one image as the cache and the splice store them.
 struct ProjectedRows {
@@ -127,7 +131,7 @@ struct MergeProjector {
     bool row_major = true;
     Activation act = Activation::gelu;
     Tensor w1, b1, w2, b2;
-    unsigned tokens(unsigned grid_h, unsigned grid_w) const;  // merged rows; throws on a zero ratio
+    unsigned tokens(unsigned grid_h, unsigned grid_w) const;  // throws on empty or unrepresentable geometry
 };
 
 // y[r][o] = sum_k x[r][k] * w[o][k] + bias[o] for row-major x [rows][w.cols], y [rows][w.rows]. Adapters run their
@@ -137,8 +141,8 @@ public:
     virtual ~DenseOps() = default;
     virtual void linear(const Tensor& w, const Tensor& bias, const float* x, std::size_t rows, float* y) = 0;
     // The whole projector. Default (host): unshuffle, linear(), activate(), linear(), reading hidden.hidden; a device
-    // backend chains the four steps on the device (same values: the linears are its linear(), the activation the same
-    // FP64 formula). rows: [tokens][w2.rows] host floats.
+    // backend chains the four steps on the device. The same FP64 activation formula does not guarantee identical
+    // host/device transcendental rounding. rows: [tokens][w2.rows] host floats.
     virtual void merge_project(const EncoderOutput& hidden, unsigned grid_h, unsigned grid_w, const MergeProjector&, float* rows);
     // Start-time hook: build now what the first linear(w, bias) would build (a device panel). Host: nothing to do.
     virtual void prepare_linear(const Tensor& w, const Tensor& bias) {
@@ -236,7 +240,10 @@ public:
     void load(const EncoderWeights&);  // FP16 panels to the device; lazy callers call it on the first image
     void unload();                     // drops panels and workspace
     bool loaded() const;
-    std::size_t device_bytes() const;  // panels + workspace currently held
+    std::size_t device_bytes() const;  // panels + workspace + projector scratch currently held
+    std::size_t pinned_host_bytes() const;  // retained input staging, separate from device_bytes()
+    static bool project_device();  // governed, process-cached, default on (STRIX_VISION_PROJECT_DEVICE=0 = host graph); also available in host-only builds
+    static const char* effective_arithmetic();
     const EncoderLoadStats& load_stats() const;
 
     EncoderOutput encode(const PatchGrid&, const PositionInputs&) override;
@@ -248,11 +255,12 @@ public:
     // Workspace for `rows` rows in `tiles` tiles allocated now (encode() still grows it for a larger input).
     void reserve(unsigned rows, unsigned tiles) override;
     // Hidden rows stay in the workspace when STRIX_VISION_PROJECT_DEVICE (default 1) is on.
+    // This numerical candidate has a separate arithmetic identity; node qualification: rows bitwise equal to the host projector; --projector-gate covers the remaining arms.
     EncoderOutput encode_for_projection(const PatchGrid&, const PositionInputs&) override;
     // Device chain: unshuffle kernel, linear1, activation kernel (FP64, the host formula), linear2, one download.
     // STRIX_VISION_PROJECT_DEVICE=0: the host graph of DenseOps (A/B and bitwise check).
     void merge_project(const EncoderOutput& hidden, unsigned grid_h, unsigned grid_w, const MergeProjector&, float* rows) override;
-    const char* arithmetic() const override { return kArithmetic; }
+    const char* arithmetic() const override { return effective_arithmetic(); }
 
 private:
     struct Impl;

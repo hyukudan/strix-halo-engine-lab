@@ -10,6 +10,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <numeric>
 #include <stdexcept>
 #include <string>
@@ -643,6 +644,52 @@ void test_merge_project() {
     }));
 }
 
+void test_merge_project_overflow() {
+    MergeProjector m;
+    // A failing old implementation stops here, before exercising its unsafe loops.
+    const bool rejects_wrap = throws([&] { (void)m.tokens(65536U, 65537U); });
+    CHECK(rejects_wrap);
+    if (!rejects_wrap) return;
+    EncoderOutput h;
+    h.rows = 65536U;
+    h.width = 1;
+    h.hidden.resize(h.rows);
+    float weight = 1.0F, output = 17.0F;
+    m.w1 = m.w2 = Tensor{&weight, Tensor::Type::f32, 1, 1};
+    CountingDense dense;
+    CHECK(throws([&] { dense.merge_project(h, 65536U, 65537U, m, &output); }));
+    // The resident HIP path calls the same validator without requiring host hidden storage.
+    CHECK(throws([&] { (void)layout::projector_geometry(h, 65536U, 65537U, m, &output, true); }));
+    CHECK(dense.linears == 0 && output == 17.0F);
+    constexpr unsigned max = std::numeric_limits<unsigned>::max();
+    m.ratio = 3;
+    CHECK(m.tokens(max - 1U, 1U) == max / 3U);  // ceil addition used to wrap
+    m.ratio = 2;
+    CHECK(throws([&] { (void)m.tokens(max, 1U); }));  // padded coordinate would wrap
+    m.ratio = max;
+    CHECK(throws([&] { (void)m.tokens(1U, 1U); }));  // ratio squared would wrap
+    m.ratio = 1;
+    CHECK(throws([&] { (void)m.tokens(0U, 1U); }));
+    h.rows = 1;
+    h.width = max;
+    m.ratio = 65535U;
+    CHECK(throws([&] { (void)layout::projector_geometry(h, 1U, 1U, m, &output, true); }));
+}
+
+void test_resident_owner() {
+    const std::shared_ptr<const void> a = std::make_shared<const char>(char{0}), b = std::make_shared<const char>(char{0});
+    EncoderOutput h;
+    h.device_epoch = 1;
+    h.device_owner = a;
+    CHECK(h.resident_for(a, 1));
+    CHECK(!h.resident_for(b, 1));
+    CHECK(!h.resident_for(a, 2));
+    h.device_epoch = 0;
+    CHECK(!h.resident_for(a, 0));
+    h.device_owner.reset();
+    CHECK(!h.resident_for({}, 0));
+}
+
 // prepare_backend: the projector linears and the workspace go through the backend hooks; without warm-up nothing is
 // encoded, with it the adapter's image path runs once (on the path encode_cached picks) and nothing is cached.
 struct RecordingBackend final : EncoderBackend {
@@ -709,13 +756,19 @@ void test_prepare_backend() {
 
 }  // namespace
 
-int main() {
+int main(int argc, char** argv) {
 #ifdef _MSC_VER
     _set_abort_behavior(0, _WRITE_ABORT_MSG | _CALL_REPORTFAULT);
     _CrtSetReportMode(_CRT_ASSERT, _CRTDBG_MODE_FILE);
     _CrtSetReportFile(_CRT_ASSERT, _CRTDBG_FILE_STDERR);
 #endif
     try {
+        if (argc == 3 && std::strcmp(argv[1], "--project-device") == 0) {
+            const bool device = std::strcmp(argv[2], "on") == 0;
+            CHECK(Encoder::project_device() == device);
+            CHECK(std::strcmp(Encoder::effective_arithmetic(), device ? "vision-f16-v1-project-device-f64-v1" : "vision-f16-v1") == 0);
+            return failures ? 1 : 0;
+        }
         test_bf16();
         test_validate();
         test_positions();
@@ -729,6 +782,8 @@ int main() {
         test_cache();
         test_encode_cached();
         test_merge_project();
+        test_merge_project_overflow();
+        test_resident_owner();
         test_prepare_backend();
     } catch (const std::exception& e) {
         std::fprintf(stderr, "FAIL exception: %s\n", e.what());

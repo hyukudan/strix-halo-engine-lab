@@ -15,7 +15,10 @@
 #include "strix/iq4_nl.hpp"
 #include "strix/ple_workspace.hpp"
 #include "strix/graph_ple.hpp"
+#include "strix/qpf2k_defaults.hpp"
+#include "strix/prefill_identity.hpp"
 #include "hip_q8_rows_gemv.hpp"
+#include "hip_dense_f16_tiled.hpp"
 
 #include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
@@ -2491,6 +2494,17 @@ register_for_compiled_execution(
 }
 
 #include "hip_ple_rows_site.inc"
+// FAST ple_rows_f16: the same rows and FP32 stores for q8_rows::tiled (row r at input0 + r * input_stride).
+struct PleTiledSite {
+    using Input = std::uint16_t;
+    const unsigned char* input0;
+    std::uint64_t input_stride;
+    q8_rows::Segments segments;
+    std::uint32_t width, outputs;
+    float* out;
+    std::uint32_t out_stride;
+    __device__ void store(std::uint32_t o, std::uint32_t r, float value) const { out[static_cast<std::uint64_t>(r) * out_stride + o] = value; }
+};
 
 void testing::invalidate_ple_projection_weights() { q8_rows::invalidate_lane_weights(); }
 
@@ -2724,6 +2738,31 @@ struct HipPleKnownWindow::Impl {
         const auto key = site(reinterpret_cast<const void*>(p.tensors.key.runtime->address), expanded, projections);
         const auto value = site(reinterpret_cast<const void*>(p.tensors.value.runtime->address), hidden,
             projections + static_cast<std::uint64_t>(max_rows) * expanded);
+        // FAST ple_rows_f16 (STRIX_PREFILL_PLE_ROWS_F16=1, default OFF): every row of the call through the shared FP16 dense core
+        // (q8_rows::tiled, one launch per projection): BF16 rows rounded to FP16 while staging, fp16(d * q) weights, FP32
+        // accumulation over ascending K16 tiles, the same FP32 store as PleRowsSite. Changes logits (identity tag plef16).
+        if (prefill_option_enabled(PrefillOption::ple_rows_f16)) {
+            const std::uint32_t tiled_rows = groups * kPleWideRows;
+            const auto tiled = [&](const PleRowsSite<kPleWideRows>& s) {
+                PleTiledSite t{};
+                t.input0 = reinterpret_cast<const unsigned char*>(s.base);
+                t.input_stride = static_cast<std::uint64_t>(s.in_stride) * sizeof(std::uint16_t);
+                t.segments = s.segments; t.width = s.width; t.outputs = s.outputs;
+                t.out = s.out; t.out_stride = s.out_stride;
+                return t;
+            };
+            const auto tk = tiled(key), tv = tiled(value);
+            if (q8_rows::tiled::supported(tk, tiled_rows) && q8_rows::tiled::supported(tv, tiled_rows)) {
+                static const bool witness = [] { std::fprintf(stderr, "qpf2k ple rows f16 tiled active (FAST ple_rows_f16)\n"); return true; }();
+                (void)witness;
+                q8_rows::tiled::launch(tk, tiled_rows, hip_execution_stream());
+                q8_rows::tiled::launch(tv, tiled_rows, hip_execution_stream());
+                check_hip(hipGetLastError(), "prefill PLE tiled f16 projection launch");
+                return true;
+            }
+            static const bool declined = [] { std::fprintf(stderr, "qpf2k ple rows f16 declined: shape unsupported by q8_rows::tiled\n"); return true; }();
+            (void)declined;
+        }
         if (!ple_batch_admits(key, groups) || !ple_batch_admits(value, groups)) return false;
         if (!ple_batch_reserve(batch_rows, static_cast<std::uint64_t>(groups) * kPleWideRows * width * sizeof(float))) return false;
         auto* packed = static_cast<float*>(batch_rows.base);
@@ -3263,6 +3302,15 @@ void HipPleKnownWindow::launch(std::span<const ExecutionDispatchContext> rows) {
         const auto total = static_cast<std::uint32_t>(rows.size());
         std::uint32_t first = 0;
         static const bool batch = strix::envcfg::flag("STRIX_PREFILL_PLE_BATCH", false, strix::EnvFlagMatch::exact);
+        // The draft FP16 arithmetic exists only on the batch route. Refuse controls
+        // that would silently execute or restore FP32 projections under plef16.
+        if (prefill_option_enabled(PrefillOption::ple_rows_f16)) {
+            if (!wide || !batch || qpf2k::suppressed(qpf2k::Item::ple_batch))
+                throw std::invalid_argument("ple_rows_f16 requires STRIX_PREFILL_PLE_WIDE=1 and "
+                    "STRIX_PREFILL_PLE_BATCH=1 with PLE batching unsuppressed");
+            if (check)
+                throw std::invalid_argument("ple_rows_f16 is incompatible with STRIX_PREFILL_PLE_WIDE_CHECK=1");
+        }
         if (wide && batch && !qpf2k::suppressed(qpf2k::Item::ple_batch) &&
             total >= kPleWideRows && w.project_rows_batch(prepared[0], at(0), total / kPleWideRows)) {
             static const bool witness = [] { std::fprintf(stderr, "qpf2k ple row batch active\n"); return true; }();

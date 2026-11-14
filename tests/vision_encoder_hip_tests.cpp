@@ -202,10 +202,67 @@ void bench(std::istream* reference, std::ostream* save) {
     }
 }
 
+// Explicit qualification gate, separate from the reference-quality test. Run --projector-gate in fresh processes
+// with STRIX_VISION_PROJECT_DEVICE=0 and =1; an equality pass alone does not qualify the candidate as a default.
+// The oracle is the host activation graph using the same device linears; compare final stored BF16 bytes.
+void projector_gate() {
+    using C = EncoderConfig;
+    auto cfg = tower(128, 2, 352, C::Norm::rmsnorm, C::Mlp::swiglu, C::Pos::rope2d, 1);
+    Tower t = make_tower(cfg, 603);
+    constexpr unsigned ratio = 2, p = 15, out = 17;
+    std::vector<float> w1(std::size_t{p} * cfg.width * ratio * ratio), w2(std::size_t{out} * p);
+    std::vector<float> bias{-16.0F, -10.0F, -8.0F, -6.0F, -5.0F, -4.0F, -3.0F, -1.0F,
+                            -0.0F, 0.0F, 1.0F, 3.0F, 5.0F, 8.0F, 16.0F};
+    vision_toy::Rng rng{604};
+    for (float& v : w1) v = rng.next() * 0.03125F;
+    for (float& v : w2) v = rng.next();
+    MergeProjector m;
+    m.ratio = ratio;
+    m.w1 = Tensor{w1.data(), Tensor::Type::f32, p, std::size_t{cfg.width} * ratio * ratio};
+    m.b1 = Tensor{bias.data(), Tensor::Type::f32, p, 1};
+    m.w2 = Tensor{w2.data(), Tensor::Type::f32, out, p};
+    for (bool split : {false, true}) {
+        EncoderOptions opt;
+        opt.split_activations = split;
+        Encoder enc(cfg, opt);
+        enc.load(t.w);
+        for (unsigned gh : {3U, 4U}) {
+            const auto grid = make_grid(cfg, gh, 5U, 605);
+            const auto pos = default_positions(cfg, t.w, grid);
+            const auto host = enc.encode(grid, pos);
+            const auto resident = enc.encode_for_projection(grid, pos);
+            dense_fixture::require(enc.pinned_host_bytes() > 0, "pinned staging accounting");
+            dense_fixture::require((resident.device_epoch != 0) == Encoder::project_device(), "projector residency policy");
+            for (bool row_major : {false, true})
+                for (Activation act : {Activation::gelu, Activation::gelu_tanh, Activation::silu}) {
+                    m.row_major = row_major;
+                    m.act = act;
+                    std::vector<float> want(std::size_t{m.tokens(gh, 5U)} * out), got(want.size());
+                    enc.DenseOps::merge_project(host, gh, 5U, m, want.data());
+                    const auto bytes = to_bf16_rows(want.data(), want.size());
+                    enc.merge_project(host, gh, 5U, m, got.data());
+                    dense_fixture::require(to_bf16_rows(got.data(), got.size()) == bytes, "host-input projector BF16 mismatch");
+                    enc.merge_project(resident, gh, 5U, m, got.data());
+                    dense_fixture::require(to_bf16_rows(got.data(), got.size()) == bytes, "resident projector BF16 mismatch");
+                }
+        }
+    }
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
     using C = EncoderConfig;
+    if (argc == 2 && std::strcmp(argv[1], "--projector-gate") == 0) {
+        try {
+            projector_gate();
+            std::puts("vision-projector-gate: PASS");
+            return 0;
+        } catch (const std::exception& e) {
+            std::fprintf(stderr, "vision-projector-gate: FAIL %s\n", e.what());
+            return 1;
+        }
+    }
     const bool with_bench = argc > 1 && std::strcmp(argv[1], "--bench") == 0;
     const bool save_bench = argc > 1 && std::strcmp(argv[1], "--bench-save-reference") == 0;
     if (argc != 1 && (!(with_bench || save_bench) || argc != 3)) {

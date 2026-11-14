@@ -2118,10 +2118,12 @@ __global__ __launch_bounds__(256) void round_bf16_kernel(float* __restrict__ val
 
 // One block per row: wave (copy cc, chunk c) computes the chunk sums of h*h, key*key and (h*(q*k))*key;
 // the copy's totals are the ascending chunk sums; then every thread applies the gates (in place through
-// hc_stream only).
+// hc_stream only). gate_off (may be null): a row whose flag is nonzero gets gate 0 on every copy, so the add is h + 0 * value,
+// as the upstream model's gate.masked_fill(~token_mask, 0) at image positions.
 __global__ __launch_bounds__(1024) void engram_inject_kernel(float* __restrict__ hc_stream, const float* __restrict__ kv,
                                                              const float* __restrict__ qn, const float* __restrict__ kn, unsigned hidden,
-                                                             float eps, float inv_sqrt_hidden) {
+                                                             float eps, float inv_sqrt_hidden,
+                                                             const std::uint8_t* __restrict__ gate_off) {
     __shared__ float part[3][hc_copies][32];
     __shared__ float gates[hc_copies];
     const unsigned chunks = (hidden + chunk - 1U) / chunk;
@@ -2152,7 +2154,8 @@ __global__ __launch_bounds__(1024) void engram_inject_kernel(float* __restrict__
         for (unsigned j = 0; j < chunks; ++j) { hh = hh + part[0][cp][j]; kk = kk + part[1][cp][j]; dk = dk + part[2][cp][j]; }
         const float rh = declared_rsqrt(hh / static_cast<float>(hidden) + eps);
         const float rk = declared_rsqrt(kk / static_cast<float>(hidden) + eps);
-        gates[cp] = engram_gate_of((dk * (rh * rk)) * inv_sqrt_hidden);
+        const float gate = engram_gate_of((dk * (rh * rk)) * inv_sqrt_hidden);
+        gates[cp] = gate_off != nullptr && gate_off[blockIdx.x] != 0U ? 0.0F : gate;
     }
     __syncthreads();
     const float* value = row_kv + hc_copies * hidden;
@@ -3427,13 +3430,13 @@ bool enqueue_q8_0_a8_dense_prefill(const Q8A8DensePrefillView& v, void* stream) 
 }
 
 void enqueue_engram_inject(float* hc_stream, const float* kv, const float* q_norm, const float* k_norm, std::uint32_t rows,
-                           std::uint32_t hidden, float eps, void* stream) {
+                           std::uint32_t hidden, float eps, void* stream, const std::uint8_t* gate_off) {
     require(hc_stream && kv && q_norm && k_norm && rows && hidden, "Engram injection view");
     const float inv = static_cast<float>(1.0 / __builtin_sqrt(static_cast<double>(hidden)));
     const unsigned chunks = (hidden + chunk - 1U) / chunk;
     require(chunks * hc_copies <= 32U, "Engram injection hidden size");
     hipLaunchKernelGGL(engram_inject_kernel, dim3(rows), dim3(wave * hc_copies * chunks), 0, as_stream(stream), hc_stream, kv, q_norm,
-                       k_norm, hidden, eps, inv);
+                       k_norm, hidden, eps, inv, gate_off);
     hip_check(hipGetLastError(), "Engram injection launch");
 }
 

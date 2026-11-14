@@ -14,7 +14,9 @@ Two subcommands (Python 3.9+, numpy):
            an arm; prompts, rows and vocabulary widths must agree. Reports per prompt and pooled KL(ref || cand),
            top-1 agreement and the NLL change on the real next tokens, and, when both arms carry block-selection
            dumps, the selected ids that differ per layer and position. Exit 0 = gate passed, 1 = gate failed,
-           2 = identity or input error (no verdict).
+           2 = identity or input error (no verdict). The dNLL limit is absolute (--max-dnll) unless
+           --dnll-rule floor is given: then it is mean + 2 sd (n - 1) of >= 3 --null-arm runs, allowed only for
+           the engine / profile pairs in DNLL_POLICY (DS41 FAST prefill); the absolute verdict stays a reference.
 
 Dump layout inside a run directory (PREFIX is the --prefix value, default "q"):
   PREFIX-<prompt>-tf-r<rank>.f32   [rows][width] little-endian FP32: the head logits of the last `rows` prompt
@@ -39,6 +41,101 @@ SEL_MAGIC = 0x444C4553
 
 class GateError(Exception):
     """Identity or input defect: the comparison has no verdict."""
+
+
+# dNLL rules per engine / profile. "abs" (every engine, the default): pooled dNLL <= --max-dnll. "floor": pooled dNLL <=
+# mean + FLOOR_SIGMAS * sd (n - 1) of at least FLOOR_MIN_NULLS layer-0 null-control arms measured on the same prompts and
+# binary as the candidate; KL and top-1 limits are unchanged. Only the DeepSeek V4.1 FAST prefill profile may use "floor":
+# its layer-0 chaos floor (any one-ulp change at layer 0 re-routes MoE rows) already costs dNLL ~0.012 > 0.01. Adding an
+# entry here is a policy decision, not a tuning knob.
+DNLL_POLICY = {
+    ("ds41", "fast-prefill"): ("abs", "floor"),
+}
+FLOOR_MIN_NULLS = 3
+FLOOR_SIGMAS = 2.0
+WITNESS_SCHEMA = "strix-fast-execution/v1"
+DS41_NULL_CONTROL = {"kind": "layer0-null", "layer": 0, "magnitude": 1, "unit": "ulp"}
+
+
+def execution_witness(doc):
+    """Validate producer evidence and its binding to this rank's sealed inputs/outputs."""
+    w = doc.get("execution")
+    if not isinstance(w, dict) or w.get("schema") != WITNESS_SCHEMA:
+        raise GateError("missing or invalid execution witness")
+    for key, expected in (("run_id", doc["run_id"]), ("rank", doc["rank"]),
+                          ("binary_sha256", doc["binary"]["sha256"]), ("prompts", doc["prompts"])):
+        if w.get(key) != expected:
+            raise GateError(f"execution witness differs from sealed {key}")
+    for key in ("model_sha256", "numerical_config_sha256"):
+        value = w.get(key)
+        if not isinstance(value, str) or len(value) != 64 or any(c not in "0123456789abcdef" for c in value):
+            raise GateError(f"execution witness: invalid {key}")
+    if any(not isinstance(w.get(k), str) or not w[k] for k in ("engine", "profile")):
+        raise GateError("execution witness: missing engine/profile")
+    if "control" not in w or (w["control"] is not None and not isinstance(w["control"], dict)):
+        raise GateError("execution witness: missing or invalid control identity")
+    return w
+
+
+def check_floor_execution(ref, cand, nulls, engine, profile):
+    for i, (mr, mc) in enumerate(zip(ref, cand)):
+        wr, wc = execution_witness(mr), execution_witness(mc)
+        if (wc["engine"], wc["profile"]) != (engine, profile) or wc["control"] is not None:
+            raise GateError("candidate execution witness disagrees with floor engine/profile or is a control")
+        if (wr["engine"], wr["profile"], wr["control"]) != (engine, "exact", None):
+            raise GateError("floor reference must witness the exact baseline without a control")
+        if wr["model_sha256"] != wc["model_sha256"]:
+            raise GateError("floor reference/candidate model identity differs")
+        for _, mn in nulls:
+            wn = execution_witness(mn[i])
+            if any(wn[k] != wr[k] for k in ("engine", "profile", "model_sha256", "numerical_config_sha256")):
+                raise GateError("null execution witness differs from the reference model/baseline numerical configuration")
+            # JSON comparison also refuses booleans in place of integer layer/magnitude.
+            if json.dumps(wn["control"], sort_keys=True) != json.dumps(DS41_NULL_CONTROL, sort_keys=True):
+                raise GateError("null execution witness must attest the DS41 one-ulp layer-0 control")
+
+
+def allowed_dnll_rules(engine, profile):
+    return DNLL_POLICY.get((engine, profile), ("abs",))
+
+
+def check_dnll_policy(rule, engine, profile, n_nulls):
+    """Refuses a rule the policy table does not grant, or a floor without enough nulls (GateError = no verdict)."""
+    if rule == "abs":
+        if n_nulls:
+            raise GateError("--null-arm is only used by --dnll-rule floor")
+        return
+    if not engine or not profile:
+        raise GateError("--dnll-rule floor needs --engine and --profile (checked against DNLL_POLICY)")
+    if rule not in allowed_dnll_rules(engine, profile):
+        granted = ", ".join(f"{e}/{p}" for (e, p), rules in sorted(DNLL_POLICY.items()) if rule in rules)
+        raise GateError(f"--dnll-rule {rule} is not allowed for engine {engine} profile {profile} (DNLL_POLICY grants it to: "
+                        f"{granted}); use the absolute rule")
+    if n_nulls < FLOOR_MIN_NULLS:
+        raise GateError(f"--dnll-rule floor needs at least {FLOOR_MIN_NULLS} --null-arm layer-0 null controls, got {n_nulls}")
+
+
+def floor_limit(null_dnll):
+    """(mean, sd with n - 1, limit = mean + FLOOR_SIGMAS * sd) of the null-control pooled dNLL values."""
+    v = np.asarray(null_dnll, dtype=np.float64)
+    if v.ndim != 1 or v.size < FLOOR_MIN_NULLS:
+        raise GateError(f"floor rule needs at least {FLOOR_MIN_NULLS} null dNLL values, got {v.size}")
+    if not np.all(np.isfinite(v)):
+        raise GateError("floor rule: a null dNLL is not finite")
+    mean, sd = float(v.mean()), float(v.std(ddof=1))
+    return mean, sd, mean + FLOOR_SIGMAS * sd
+
+
+def dnll_verdict(dnll, rule, max_dnll, null_dnll=()):
+    """The dNLL part of the gate: {rule, limit, pass, abs_limit, abs_pass[, mean, sd, sigmas, n_nulls]}."""
+    out = {"rule": rule, "abs_limit": max_dnll, "abs_pass": bool(dnll <= max_dnll)}
+    if rule == "floor":
+        mean, sd, limit = floor_limit(null_dnll)
+        out.update(mean=mean, sd=sd, sigmas=FLOOR_SIGMAS, n_nulls=len(null_dnll), limit=limit)
+    else:
+        out["limit"] = max_dnll
+    out["pass"] = bool(dnll <= out["limit"])
+    return out
 
 
 def sha256_file(path):
@@ -134,6 +231,12 @@ def seal(a):
     doc = {"schema": SCHEMA, "run_id": a.run_id, "arm": a.arm, "rank": a.rank, "prefix": a.prefix,
            "binary": {"name": binary.name, "sha256": sha256_file(binary)}, "env": env, "attest": attest,
            "sealed_unix": int(time.time()), "prompts": prompts}
+    if a.execution_witness:
+        try:
+            doc["execution"] = json.loads(pathlib.Path(a.execution_witness).read_text(encoding="utf-8"))
+        except (OSError, ValueError) as e:
+            raise GateError(f"cannot read execution witness: {e}") from e
+        execution_witness(doc)
     tmp = manifest.with_suffix(".tmp")
     tmp.write_text(json.dumps(doc, indent=1, sort_keys=True) + "\n", encoding="utf-8", newline="\n")
     os.replace(tmp, manifest)
@@ -161,6 +264,12 @@ def load_arm(d, ranks):
                 raise GateError(f"{d}: ranks disagree on {key}")
         if sorted(doc["prompts"]) != sorted(first["prompts"]):
             raise GateError(f"{d}: ranks disagree on the prompt set")
+    if any("execution" in doc for doc in docs):
+        witnesses = [execution_witness(doc) for doc in docs]
+        for w in witnesses[1:]:
+            for key in ("engine", "profile", "model_sha256", "numerical_config_sha256", "control"):
+                if w[key] != witnesses[0][key]:
+                    raise GateError(f"{d}: ranks disagree on execution {key}")
     return d, docs
 
 
@@ -259,6 +368,10 @@ def compare_selection(da, a, db, b, name):
 
 def compare(a):
     ranks = sorted(set(a.ranks))
+    null_dirs = a.null_arm or []
+    if a.expect_identical and (a.dnll_rule != "abs" or null_dirs):
+        raise GateError("--expect-identical has no dNLL limit: drop --dnll-rule / --null-arm")
+    check_dnll_policy(a.dnll_rule, a.engine, a.profile, len(null_dirs))
     da, ma = load_arm(a.ref, ranks)
     db, mb = load_arm(a.cand, ranks)
     if ma[0]["run_id"] == mb[0]["run_id"]:
@@ -267,15 +380,31 @@ def compare(a):
     names = sorted(ma[0]["prompts"])
     if names != sorted(mb[0]["prompts"]) or names != sorted(tokens):
         raise GateError("arms and --tokens disagree on the prompt set")
+    nulls, seen_ids = [], {ma[0]["run_id"], mb[0]["run_id"]}
+    for nd in null_dirs:  # floor rule: every null is a sealed run on the candidate's binary and prompts
+        dn, mn = load_arm(nd, ranks)
+        if mn[0]["run_id"] in seen_ids:
+            raise GateError(f"{nd}: null arm run id {mn[0]['run_id']} repeats the reference, the candidate or another null")
+        seen_ids.add(mn[0]["run_id"])
+        if [m["binary"]["sha256"] for m in mn] != [m["binary"]["sha256"] for m in mb]:
+            raise GateError(f"{nd}: null arm ran another binary than the candidate (the floor must be measured on the same binary)")
+        if sorted(mn[0]["prompts"]) != names:
+            raise GateError(f"{nd}: null arm prompt set differs from the reference / candidate")
+        nulls.append((dn, mn))
+    if a.dnll_rule == "floor":
+        check_floor_execution(ma, mb, nulls, a.engine, a.profile)
     report = {"ref": {k: ma[0][k] for k in ("run_id", "arm", "env", "attest")}, "cand": {k: mb[0][k] for k in ("run_id", "arm", "env", "attest")},
               "ref_binary": [m["binary"]["sha256"] for m in ma], "cand_binary": [m["binary"]["sha256"] for m in mb], "prompts": {}}
+    if a.dnll_rule == "floor":
+        report["ref"]["execution"] = ma[0]["execution"]
+        report["cand"]["execution"] = mb[0]["execution"]
     print(f"ref  run {ma[0]['run_id']} arm {ma[0]['arm']} env {ma[0]['env']} binary {report['ref_binary'][0][:12]}")
     print(f"cand run {mb[0]['run_id']} arm {mb[0]['arm']} env {mb[0]['env']} binary {report['cand_binary'][0][:12]}")
     pooled = {"kl": [], "agree": [], "nll_ref": [], "nll_cand": []}
     identical, sel_slots, sel_slot_diff, sel_id_diff, sel_seen = True, 0, 0, 0, False
     for name in names:
         tok_sha = sha256_file(tokens[name])
-        for m in ma + mb:
+        for m in ma + mb + [m for _, mn in nulls for m in mn]:
             if m["prompts"][name]["tokens_sha256"] != tok_sha:
                 raise GateError(f"{name}: a sealed run used a different token file than --tokens")
         tok = np.fromfile(tokens[name], "<u4").astype(np.int64)
@@ -307,15 +436,38 @@ def compare(a):
     kl = float(np.concatenate(pooled["kl"]).mean())
     top1 = float(np.concatenate(pooled["agree"]).mean())
     dnll = float(np.concatenate(pooled["nll_cand"]).mean() - np.concatenate(pooled["nll_ref"]).mean())
+    null_rows = []
+    for dn, mn in nulls:  # pooled exactly like the candidate: same reference, same prompts, same labels
+        acc = {"kl": [], "agree": [], "nll_ref": [], "nll_cand": []}
+        for name in names:
+            r = compare_logits(da, ma, dn, mn, name, np.fromfile(tokens[name], "<u4").astype(np.int64))
+            for k in acc:
+                acc[k].append(r[k])
+        nd_ = float(np.concatenate(acc["nll_cand"]).mean() - np.concatenate(acc["nll_ref"]).mean())
+        null_rows.append({"dir": str(dn), "run_id": mn[0]["run_id"], "arm": mn[0]["arm"], "env": mn[0]["env"],
+                          "execution": mn[0]["execution"],
+                          "rows": int(sum(len(k) for k in acc["kl"])), "kl": float(np.concatenate(acc["kl"]).mean()),
+                          "top1": float(np.concatenate(acc["agree"]).mean()), "dnll": nd_})
+        print(f"null {mn[0]['arm']} run {mn[0]['run_id']} env {mn[0]['env']}: KL {null_rows[-1]['kl']:.5f}, "
+              f"top-1 {null_rows[-1]['top1']:.4f}, dNLL {nd_:+.5f}")
+    dv = None
     if a.expect_identical:
         ok = identical and sel_slot_diff == 0
         rule = "identical logits and selections"
     else:
-        ok = kl <= a.max_kl and top1 >= a.min_top1 and dnll <= a.max_dnll
-        rule = f"KL <= {a.max_kl}, top-1 >= {a.min_top1}, dNLL <= {a.max_dnll}"
+        dv = dnll_verdict(dnll, a.dnll_rule, a.max_dnll, [x["dnll"] for x in null_rows])
+        dv.update(engine=a.engine, profile=a.profile, nulls=null_rows)
+        ok = kl <= a.max_kl and top1 >= a.min_top1 and dv["pass"]
+        if a.dnll_rule == "floor":
+            rule = (f"KL <= {a.max_kl}, top-1 >= {a.min_top1}, dNLL <= {dv['limit']:+.5f} (floor {a.engine}/{a.profile}: "
+                    f"{dv['n_nulls']} nulls mean {dv['mean']:+.5f} + {FLOOR_SIGMAS:g} sd {dv['sd']:.5f})")
+        else:
+            rule = f"KL <= {a.max_kl}, top-1 >= {a.min_top1}, dNLL <= {a.max_dnll}"
     report["pooled"] = {"rows": int(sum(len(k) for k in pooled["kl"])), "kl": kl, "top1": top1, "dnll": dnll, "identical": identical,
                         "selection": {"slots": sel_slots, "slot_diff": sel_slot_diff, "id_diff": sel_id_diff} if sel_seen else None,
-                        "rule": rule, "pass": ok}
+                        "rule": rule, "dnll_rule": dv, "pass": ok}
+    if dv is not None and a.dnll_rule == "floor":
+        print(f"REFERENCE absolute dNLL <= {a.max_dnll}: {'PASS' if dv['abs_pass'] else 'FAIL'} (not the verdict under the floor rule)")
     sel = f"; selection {sel_slot_diff}/{sel_slots} slots differ, {sel_id_diff} ids" if sel_seen else ""
     print(f"POOLED rows {report['pooled']['rows']}: KL {kl:.5f}, top-1 {top1:.4f}, dNLL {dnll:+.5f}, logits identical {identical}{sel} "
           f"[{rule}] -> {'PASS' if ok else 'FAIL'}")
@@ -338,6 +490,7 @@ def main(argv=None):
     s.add_argument("--prompt", action="append", metavar="NAME=TOKENS.u32")
     s.add_argument("--env", action="append", metavar="NAME=VALUE", help="environment the arm was launched with")
     s.add_argument("--attest", action="append", metavar="KEY=VALUE", help="sel_mode=N must equal the selection dump's mode")
+    s.add_argument("--execution-witness", metavar="JSON", help="launcher/engine execution evidence; required on every floor arm")
     s.add_argument("--select", action="store_true", help="selection dumps are required")
     s.add_argument("--not-before", type=float, help="unix time the run started: older dumps are stale")
     c = sub.add_parser("compare")
@@ -348,6 +501,13 @@ def main(argv=None):
     c.add_argument("--max-kl", type=float, default=0.02)
     c.add_argument("--min-top1", type=float, default=0.93)
     c.add_argument("--max-dnll", type=float, default=0.01)
+    c.add_argument("--dnll-rule", choices=("abs", "floor"), default="abs",
+                   help="abs: dNLL <= --max-dnll (default, every engine); floor: dNLL <= mean + 2 sd of the --null-arm runs "
+                        "(only engine/profile pairs in DNLL_POLICY, today ds41/fast-prefill)")
+    c.add_argument("--null-arm", action="append", metavar="DIR",
+                   help="sealed layer-0 null-control run on the candidate's binary and prompts (repeat, >= 3 for floor)")
+    c.add_argument("--engine", help="engine of the candidate (floor rule policy check), e.g. ds41")
+    c.add_argument("--profile", help="profile of the candidate (floor rule policy check), e.g. fast-prefill")
     c.add_argument("--expect-identical", action="store_true", help="repeat of one identity: any difference fails")
     c.add_argument("--json")
     a = ap.parse_args(argv)
