@@ -17,6 +17,7 @@
 #include "hip_q8_rows_gemv.hpp"
 #include "hip_dense_f16_tiled.hpp"
 #include "core/wave_uniform.hpp"
+#include "core/f16_dense_tall.hpp"
 #include "strix/hip_gdn_islands.hpp"
 #include "strix/hip_model_residency.hpp"
 #include "strix/hip_setup_quiescence.hpp"
@@ -5330,7 +5331,21 @@ void enqueue_gdn_prefill_core_rows(const std::vector<std::array<GdnKnownWindowRo
     // STRIX_QPF2K_GDN_GATES_BATCH=1: the same kernel with Sched bit 4 (dt/a preloaded, transforms across lanes).
     static const bool gates_batch_env = strix::envcfg::flag("STRIX_QPF2K_GDN_GATES_BATCH", false);
     const bool gates_batch = gates_batch_env && !qpf2k::suppressed(qpf2k::Item::gdn_gates_batch);
-    if (qpf2k_gates && gates_batch)
+    // FAST gdn_gates_f16 (STRIX_PREFILL_GDN_GATES_F16=1, default OFF): only inside the FAST gdn_fp16_chunk route; the gates
+    // product on the shared dense FP16 core with the incumbent epilogue (qpf2k_gdn::gates_f16). Changes logits (gatef16).
+    static const bool gates_f16_on = strix::prefill_option_enabled(strix::PrefillOption::gdn_gates_f16);
+    const bool gates_f16 = gates_f16_on && fp16_chunk &&
+        qpf2k_gdn::gates_f16::supported(first.hidden, first.value_heads, count, input_stride, reinterpret_cast<const void*>(first.input.address));
+    if (gates_f16)
+        qpf2k_gdn::gates_f16::launch(
+            {reinterpret_cast<const std::uint16_t*>(first.input.address), input_stride,
+             reinterpret_cast<const float*>(first.tensors.beta.runtime->address),
+             reinterpret_cast<const float*>(first.tensors.alpha.runtime->address), first.hidden, first.value_heads, 0U, 0U},
+            {strided, reinterpret_cast<const void*>(first.tensors.dt.runtime->address), small_weight_kind(first.tensors.dt.manifest->ggml_type),
+             reinterpret_cast<const void*>(first.tensors.a.runtime->address), small_weight_kind(first.tensors.a.manifest->ggml_type),
+             first.value_heads, 0U},
+            count, stream);
+    else if (qpf2k_gates && gates_batch)
         hipLaunchKernelGGL(HIP_KERNEL_NAME(qpf2k_gdn::gdn_qpf2k_gates_kernel<QGatesO, QGatesW, QGatesRC, QGatesRB, 2560U, 4U>),
             dim3(first.value_heads * 2U / (QGatesO * QGatesW), count / QGatesRB), dim3(QGatesW * 32U), 0, stream,
             reinterpret_cast<const std::uint16_t*>(first.input.address), input_stride,
@@ -5348,7 +5363,8 @@ void enqueue_gdn_prefill_core_rows(const std::vector<std::array<GdnKnownWindowRo
             reinterpret_cast<const void*>(first.tensors.dt.runtime->address), small_weight_kind(first.tensors.dt.manifest->ggml_type),
             reinterpret_cast<const void*>(first.tensors.a.runtime->address), small_weight_kind(first.tensors.a.manifest->ggml_type),
             first.value_heads);
-    if (qpf2k_gates) qpf2k_gdn_witness(gates_batch ? "gates gdn_qpf2k_gates_kernel<1,8,4,64,batch>" : "gates gdn_qpf2k_gates_kernel<1,8,4,64>", count);
+    if (gates_f16) qpf2k_gdn_witness("gates f16_dense_tall (FAST gdn_gates_f16)", count);
+    else if (qpf2k_gates) qpf2k_gdn_witness(gates_batch ? "gates gdn_qpf2k_gates_kernel<1,8,4,64,batch>" : "gates gdn_qpf2k_gates_kernel<1,8,4,64>", count);
     else if (rows_fit)
         hipLaunchKernelGGL(HIP_KERNEL_NAME(gdn_gates::gdn_gates_rows_kernel<GatesRB, GatesO, GatesS, GatesC>),
             dim3(first.value_heads * 2U / (GatesO * GatesS), count / GatesRB), dim3(GatesS * 256U), 0, stream,
