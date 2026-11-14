@@ -116,6 +116,7 @@
 #include "strix/hip_ds41_dspark.hpp"
 #include "strix/deepseek41_prefill.hpp"
 #include "strix/deepseek41_prefix_cache.hpp"
+#include "strix/serve/prefill_group.hpp"
 #include "strix/deepseek41_plan.hpp"
 #include "strix/deepseek41_serve_cache_policy.hpp"
 #include "strix/deepseek41_cache_lease.hpp"
@@ -299,7 +300,8 @@ strix::deepseek41::BatchForwardOptions forward_options(const Args& a, strix::dis
 
 // ---- the control channel: one fixed-size block per round, rank 0 -> rank 1 (rank 1 answers with its own) ----
 enum class Command : std::uint32_t { hello = 1, step = 2, heartbeat = 3, shutdown = 4, prefill = 5, import_state = 6, prefill_unit = 7, quiesce = 8,
-    session = 9
+    session = 9,
+    prefill_group = 10  // several short prompts as ONE group pass (STRIX_SERVE_PREFILL_GROUP): see device_prefill_group
 };
 struct Control {
     std::uint32_t magic = 0x43425344U;  // "DSBC"
@@ -344,6 +346,11 @@ struct Control {
 constexpr std::uint32_t kPrefillTask = 4U, kPrefillAbort = 8U, kPrefillDone = 16U;
 // prefill command, pflags bits 8..31: the request's stable prefix (system prompt + tools) in cache blocks
 constexpr std::uint32_t kPrefillHintShift = 8U;
+// prefill_group command: pslot = member count n (2..kMaxGroupMembers), pflags bit 0 = insert (as in prefill). The control
+// block is followed by one exchange_host message of 2 x n u32 (slot, prompt length per member, in group order), then
+// each member's prompt via send_prompt in the same order. Pool operations, resets, snapshots and commits ride in the
+// block exactly as in a prefill command.
+constexpr std::uint32_t kMaxGroupMembers = 64U;
 constexpr std::uint32_t kTokensPerMessage = 16384U;  // 64 KiB per exchange_host
 constexpr std::uint32_t kPoolRelease = 1U, kPoolReserve = 2U;
 constexpr std::size_t kImportChunk = std::size_t{64} << 10U;  // BatchForward::exchange_host's message limit
@@ -552,7 +559,36 @@ struct PrefillOutcome {
     std::uint64_t logits = 0;
     double state_seconds = 0.0, prefill_seconds = 0.0, handoff_seconds = 0.0, seconds = 0.0;
     double insert_seconds = 0.0;  // part of prefill_seconds: the state exports and cache inserts at piece ends
+    std::uint64_t state_fnv = 0;  // STRIX_DS41_SERVE_PREFILL_LOG=1 only: FNV-1a of the exported state's serialized bytes
+    std::uint32_t group_k = 0, group_n = 0;  // member k (1-based) of a group pass of n members; 0/0 = a solo prefill
 };
+
+// STRIX_DS41_SERVE_PREFILL_LOG=1 (both ranks): the prefill lines carry state_fnv and the group position.
+bool prefill_log_enabled() {
+    static const bool on = [] {
+        const char* v = std::getenv("STRIX_DS41_SERVE_PREFILL_LOG");
+        return v != nullptr && std::string(v) == "1";
+    }();
+    return on;
+}
+std::uint64_t fnv_state_bytes(const strix::deepseek41::AttentionState& state) {
+    const auto bytes = strix::deepseek41::serialize_attention_state(state);
+    std::uint64_t h = 14695981039346656037ULL;
+    for (const std::uint8_t b : bytes) h = (h ^ b) * 1099511628211ULL;
+    return h;
+}
+
+// Group prefill policy (serving-only: the CLI runs one prompt): STRIX_SERVE_PREFILL_GROUP=auto|0, _MEMBERS, _ROWS.
+// The DS41 family default is OFF until the grouped pass is measured; short_rows = the scheduler's direct-prefill limit.
+// Same environment functor as sched::options_from_env. Deterministic: every call returns the same policy.
+serve::PrefillGroupPolicy prefill_group_policy(const Args& a) {
+    return serve::PrefillGroupPolicy::from_env(
+        [](const char* k) -> std::string {
+            const char* v = std::getenv(k);
+            return v ? std::string(v) : std::string();
+        },
+        serve::PrefillGroupPolicy::Mode::off, strix::deepseek41::sched::options_from_env(a.device_prefill).min_rows);
+}
 
 // The row-split prefill of two ranks gives each 8-row window to one rank alternately: a run needs more than 8 rows so
 // that each rank has a row. Shorter prompts take the rows path; pieces and resume points leave at least this many rows.
@@ -571,6 +607,10 @@ strix::deepseek41::PrefillOptions slot_prefill_options(const Args& a, BatchForwa
     o.shared_weights = fwd.file_form_weights();
     o.expert_tp = strix::ds41::expert_tp::enabled_from_env();  // the batch forward's expert TP (dup layout)
     if (!a.dspark.empty()) o.draft_rows = a.dspark_seed_rows;  // the drafter's seed (both ranks hold it)
+    if (const auto gp = prefill_group_policy(a); gp.groups()) {  // group states (memory only when enabled)
+        o.group_members = gp.max_members;
+        o.group_rows = gp.short_rows;
+    }
     return o;
 }
 
@@ -929,6 +969,7 @@ public:
                     out_.prefill_seconds += final_insert;
                 }
             }
+            if (prefill_log_enabled()) out_.state_fnv = fnv_state_bytes(state_);
             sp_.fwd_.import_state(slot_, state_);
             out_.handoff_seconds = std::chrono::duration<double>(Clock::now() - t2).count() - final_insert;
             out_.seconds = std::chrono::duration<double>(Clock::now() - t0_).count();
@@ -970,6 +1011,58 @@ public:
         while (!t->done()) (void)t->step(strix::deepseek41::sched::next_unit_end(t->rows(), t->default_ends(), 0U, kMinRows), 0U);
         return t->finish();
     }
+    struct GroupMember {
+        std::uint32_t slot = 0;
+        const std::vector<std::uint32_t>* prompt = nullptr;
+    };
+    [[nodiscard]] bool group_available() const noexcept { return prefill_->group_members() >= 2U; }
+    [[nodiscard]] std::uint32_t route_class(std::uint32_t rows) const noexcept { return prefill_->route_class(rows); }
+    // ONE DevicePrefill::run_group over fresh prompts (no prefix-cache resume: members are misses by construction).
+    // Per member the same steps as Task::finish: export, record, cache insert (same condition), import into its slot.
+    // Timing: the pass is shared, so each member reports the whole group's wall time as prefill_seconds / seconds
+    // (a member's TTFT really includes the whole pass); handoff_seconds is the member's own export/insert/import.
+    // The shared counters (state.prefill_seconds) therefore count the pass once per member: the log says
+    // "group k/n" so readers can divide. insert[i] is the caller's per-member capture decision (as in the solo path).
+    std::vector<PrefillOutcome> run_group(const std::vector<GroupMember>& members, const std::vector<bool>& insert) {
+        if (members.size() < 2U || insert.size() != members.size()) throw std::invalid_argument("run_group: members and insert flags");
+        const auto t0 = Clock::now();
+        std::vector<strix::deepseek41::PrefillSegment> segments;
+        segments.reserve(members.size());
+        for (const auto& m : members) segments.push_back({std::span<const std::uint32_t>(*m.prompt)});
+        const auto results = prefill_->run_group(segments);
+        if (results.size() != members.size()) throw std::runtime_error("run_group: result count differs from the members");
+        const double pass = std::chrono::duration<double>(Clock::now() - t0).count();
+        std::vector<PrefillOutcome> outs(members.size());
+        for (std::size_t i = 0; i < members.size(); ++i) {
+            const auto t2 = Clock::now();
+            const auto& prompt = *members[i].prompt;
+            auto& o = outs[i];
+            o.next_token = results[i].next_token;
+            o.logits = fnv_floats(results[i].logits);
+            o.pieces = 1U;
+            o.prefill_seconds = pass;
+            o.seed = prefill_->draft_seed(i);  // the drafter's seed of member i (as the solo path's draft_seed())
+            auto state = prefill_->export_state(i);
+            state.tokens = prompt;
+            state.next_token = results[i].next_token;
+            record_export(state, 2);
+            double ins = 0.0;
+            if (cache_ && insert[i] && prompt.size() % a_.prefix_block == 0U) {
+                const auto ti = Clock::now();
+                o.inserted += cache_->insert(state, o.logits) ? 1U : 0U;
+                ins = std::chrono::duration<double>(Clock::now() - ti).count();
+                o.insert_seconds = ins;
+                o.prefill_seconds += ins;
+            }
+            if (prefill_log_enabled()) o.state_fnv = fnv_state_bytes(state);
+            fwd_.import_state(members[i].slot, state);
+            o.handoff_seconds = std::chrono::duration<double>(Clock::now() - t2).count() - ins;
+            o.group_k = static_cast<std::uint32_t>(i + 1U);
+            o.group_n = static_cast<std::uint32_t>(members.size());
+            o.seconds = std::chrono::duration<double>(Clock::now() - t0).count();
+        }
+        return outs;
+    }
 
 private:
     const Args& a_;
@@ -1001,6 +1094,15 @@ void send_prompt(BatchForward& fwd, std::span<const std::uint32_t> prompt, std::
         fwd.exchange_host(o, i);
         if (received) std::memcpy(received->data() + at, i.data(), take * 4U);
     }
+}
+
+// The members of a prefill_group command: slot and prompt length of each, in group order (2 u32 per member), rank 0 ->
+// rank 1 in one exchange_host message (rank 1: `info` is filled).
+void send_group_info(BatchForward& fwd, std::vector<std::uint32_t>& info, bool lead) {
+    std::vector<std::byte> o(info.size() * 4U), i(o.size());
+    if (lead) std::memcpy(o.data(), info.data(), o.size());
+    fwd.exchange_host(o, i);
+    if (!lead) std::memcpy(info.data(), i.data(), i.size());
 }
 
 std::atomic<bool>& stop_requested() {
@@ -1348,11 +1450,13 @@ void follow(const Args& initial, BatchForward& fwd, Watchdog& dog, const Prefill
     std::uint64_t spec_step = 0;
     std::vector<std::pair<std::uint32_t, std::uint32_t>> round_commits;  // commits that came in draft rounds
     std::unique_ptr<SlotPrefill::Task> task;  // STRIX_DS41_SERVE_SCHED=interleave: the prefill rank 0 runs in units
-    const bool log_prefill = std::getenv("STRIX_DS41_SERVE_PREFILL_LOG") != nullptr && std::string(std::getenv("STRIX_DS41_SERVE_PREFILL_LOG")) == "1";
     const auto log_outcome = [&](std::uint32_t slot, std::uint32_t tokens, const PrefillOutcome& o) {
-        if (log_prefill)
-            std::fprintf(stderr, "rank 1 prefill slot %u: %u tokens, resume %u, %u pieces; token %u logits_fnv %016llx; %.3f s\n", slot, tokens, o.resume,
-                         o.pieces, o.next_token, static_cast<unsigned long long>(o.logits), o.seconds);
+        if (prefill_log_enabled()) {
+            std::fprintf(stderr, "rank 1 prefill slot %u: %u tokens, resume %u, %u pieces; token %u logits_fnv %016llx state_fnv %016llx; %.3f s", slot, tokens,
+                         o.resume, o.pieces, o.next_token, static_cast<unsigned long long>(o.logits), static_cast<unsigned long long>(o.state_fnv), o.seconds);
+            if (o.group_n != 0U) std::fprintf(stderr, " group %u/%u", o.group_k, o.group_n);
+            std::fprintf(stderr, "\n");
+        }
     };
     for (;;) {
         reply.round = control_round;
@@ -1477,8 +1581,10 @@ void follow(const Args& initial, BatchForward& fwd, Watchdog& dog, const Prefill
             }
             continue;
         }
+        const bool is_group = c.command == static_cast<std::uint32_t>(Command::prefill_group);
         const bool is_prefill = c.command == static_cast<std::uint32_t>(Command::prefill);
-        if (is_prefill ? (prefill == nullptr || c.plen == 0U || c.plen >= a.context || c.pslot >= a.slots)
+        if (is_group ? (prefill == nullptr || c.pslot < 2U || c.pslot > kMaxGroupMembers || c.pslot > a.slots)
+          : is_prefill ? (prefill == nullptr || c.plen == 0U || c.plen >= a.context || c.pslot >= a.slots)
                        : (c.command != static_cast<std::uint32_t>(Command::step) || c.rows == 0U || c.rows > fwd.row_limit()))
             throw std::runtime_error("control channel: unexpected command");
         if (c.ops > std::size(c.op)) throw std::runtime_error("control channel: too many pool operations");
@@ -1493,6 +1599,39 @@ void follow(const Args& initial, BatchForward& fwd, Watchdog& dog, const Prefill
                 if (prefill) prefill->on_reset(s);
                 if (spec) spec->release(s);
             }
+        if (is_group) {  // n prompts (slots and lengths first), then the same ONE group pass as rank 0
+            std::vector<std::uint32_t> info(std::size_t{c.pslot} * 2U);
+            send_group_info(fwd, info, false);
+            std::vector<std::vector<std::uint32_t>> prompts(c.pslot);
+            std::vector<SlotPrefill::GroupMember> members(c.pslot);
+            std::uint32_t used = 0;
+            for (std::uint32_t m = 0; m < c.pslot; ++m) {
+                const std::uint32_t slot = info[std::size_t{m} * 2U], len = info[std::size_t{m} * 2U + 1U];
+                if (slot >= a.slots || ((used >> slot) & 1U) != 0U || len == 0U || len >= a.context)
+                    throw std::runtime_error("control channel: bad prefill group member");
+                used |= 1U << slot;
+                prompts[m].resize(len);
+                send_prompt(fwd, {}, &prompts[m]);
+                members[m] = {slot, &prompts[m]};
+            }
+            std::vector<bool> insert_flags(c.pslot, false);
+            dog.pause(true);
+            for (std::uint32_t m = 0; m < c.pslot; ++m) {  // a miss by construction on both ranks (lookup keeps the counters in step)
+                const auto hit = prefill->lookup(prompts[m]);
+                if (hit.resume != 0U) throw std::runtime_error("prefill group: rank 1 holds a prefix for a member (resume " + std::to_string(hit.resume) + ")");
+                const auto plen = static_cast<std::uint32_t>(prompts[m].size());
+                const bool capture = prefill->has_cache() && plen >= a.prefix_block;
+                insert_flags[m] = capture && prefill->admit(plen, (c.pflags & 1U) != 0U);
+            }
+            const auto outs = prefill->run_group(members, insert_flags);
+            for (std::uint32_t m = 0; m < c.pslot; ++m) {
+                prefill->on_prefill(members[m].slot, prompts[m]);
+                if (spec) spec->imported(members[m].slot, prompts[m], static_cast<std::uint32_t>(prompts[m].size()), outs[m].next_token, outs[m].seed.streams, outs[m].seed.rows, fwd.stream());
+                log_outcome(members[m].slot, static_cast<std::uint32_t>(prompts[m].size()), outs[m]);
+            }
+            dog.pause(false);
+            continue;
+        }
         if (is_prefill) {  // the prompt, then the same prefill as rank 0 (the cache must give rank 0's hit)
             std::vector<std::uint32_t> prompt(c.plen);
             send_prompt(fwd, {}, &prompt);
@@ -1853,6 +1992,9 @@ void lead(const Args& initial, BatchForward& fwd, strix::dist::Communicator& com
     agree_session_startup(a, fwd, sessions);
     dog.pause(false);
     const auto sched = strix::deepseek41::sched::options_from_env(a.device_prefill);  // STRIX_DS41_SERVE_SCHED (device: interleave unless =off)
+    const auto group_policy = prefill_group_policy(a);  // STRIX_SERVE_PREFILL_GROUP (serving-only, family default off), resolved once
+    std::fprintf(stderr, "prefill_group: %s (members %u, rows %u, short below %u rows; serving-only: the CLI runs one prompt)\n", group_policy.name(),
+                 group_policy.max_members, group_policy.max_rows, group_policy.short_rows);
     if (sched.mode != strix::deepseek41::sched::Mode::off) {
         if (!a.device_prefill) throw std::invalid_argument("STRIX_DS41_SERVE_SCHED needs --prefill-path device");
         std::fprintf(stderr, "sched: %s (starvation %.1f s, T_dev = %.3f + %.5f P s, unit %u rows, budget %u units / %.0f ms, MoE chunk %u, tasks from %u rows)\n", strix::deepseek41::sched::mode_name(sched.mode),
@@ -1908,7 +2050,7 @@ void lead(const Args& initial, BatchForward& fwd, strix::dist::Communicator& com
     config.sessions_enabled = a.session_ram_bytes != 0;
     config.engine_description = "deepseek41 engine group (2 ranks, EP experts" + std::string(a.tp ? " + TP attention" : "") + "), " +
                                 std::to_string(a.slots) + " slots, greedy, exact per request";
-    config.capabilities_extra = [sched](serve::Json& out) {
+    config.capabilities_extra = [sched, group_policy](serve::Json& out) {
         serve::Json policy = serve::Json::object();
         policy.set("effective", serve::Json(strix::deepseek41::sched::mode_name(sched.mode)));
         policy.set("service_target_ms", serve::Json(sched.service_ms));
@@ -1920,6 +2062,14 @@ void lead(const Args& initial, BatchForward& fwd, strix::dist::Communicator& com
         policy.set("short_first", serve::Json(sched.short_first));
         policy.set("nested_prefill", serve::Json(false));
         policy.set("direct_prefill_below_rows", serve::Json(static_cast<std::uint64_t>(sched.min_rows)));
+        {
+            serve::Json g = serve::Json::object();
+            g.set("mode", serve::Json(group_policy.name()));
+            g.set("members", serve::Json(static_cast<std::uint64_t>(group_policy.max_members)));
+            g.set("rows", serve::Json(static_cast<std::uint64_t>(group_policy.max_rows)));
+            g.set("reason", serve::Json("serving-only: the CLI runs one prompt"));
+            policy.set("prefill_group", std::move(g));
+        }
         policy.set("qualification", serve::Json("pending-both-rank-gates"));
         out.set("scheduler", std::move(policy));
         if (const auto& profile = strix::deepseek41::pair_defaults::profile_json(); !profile.empty())
@@ -2011,6 +2161,14 @@ void lead(const Args& initial, BatchForward& fwd, strix::dist::Communicator& com
         pf.set("max_unit_ms", serve::Json(st.scheduler_max_unit_ms));
         pf.set("cancellations", serve::Json(st.prefill_cancellations));
         pf.set("direct_prefill_below_rows", serve::Json(static_cast<std::uint64_t>(sched.min_rows)));
+        {
+            serve::Json g = serve::Json::object();
+            g.set("mode", serve::Json(group_policy.name()));
+            g.set("members", serve::Json(static_cast<std::uint64_t>(group_policy.max_members)));
+            g.set("rows", serve::Json(static_cast<std::uint64_t>(group_policy.max_rows)));
+            g.set("reason", serve::Json("serving-only: the CLI runs one prompt"));
+            pf.set("prefill_group", std::move(g));
+        }
         pf.set("fallback_reason", serve::Json(sched.mode != strix::deepseek41::sched::Mode::interleave ? "scheduler-not-interleave" :
             sched.legacy_units ? "explicit-legacy-budget" : sched.service_ms == 0.0 ? "service-disabled" : ""));
         pf.set("path", serve::Json(a.device_prefill ? "device" : "rows"));
@@ -2563,6 +2721,8 @@ void lead(const Args& initial, BatchForward& fwd, strix::dist::Communicator& com
             std::fprintf(stderr, " disk read %.1f MB in %.3f s (%.2f GB/s)", static_cast<double>(prefill->disk_bytes()) / 1e6, prefill->disk_seconds(),
                          prefill->disk_seconds() > 0.0 ? static_cast<double>(prefill->disk_bytes()) / prefill->disk_seconds() / 1e9 : 0.0);
         if (disk_failed) std::fprintf(stderr, " DISK READ FAILED on a rank: path forgotten, ran as a miss");
+        if (prefill_log_enabled()) std::fprintf(stderr, " state_fnv %016llx", static_cast<unsigned long long>(o.state_fnv));
+        if (o.group_n != 0U) std::fprintf(stderr, " group %u/%u", o.group_k, o.group_n);
         std::fprintf(stderr, "\n");
         const std::lock_guard lock(state.mutex);
         ++state.prefills;
@@ -2658,6 +2818,60 @@ void lead(const Args& initial, BatchForward& fwd, strix::dist::Communicator& com
         dog.pause(false);
         last_round = Clock::now();
         prefill_done(r, o, hit, disk_failed, t0);
+    };
+    // PFFIX (a): several short waiting prompts = ONE group pass on both ranks (members chosen by serve::plan_prefill_group).
+    // One control exchange announces the group (pslot = n), one message carries slot + length of each member, then each
+    // prompt; rank 1 runs the same SlotPrefill::run_group. Members are cache misses by construction (the caller only
+    // offers prompts shorter than one cache block), so no prepare / disk acknowledgement is needed. A throw propagates
+    // exactly like a solo device_prefill failure (native_failed ends every running request).
+    const auto device_prefill_group = [&](const std::vector<Running*>& members) {
+        const auto t0 = Clock::now();
+        const auto n = static_cast<std::uint32_t>(members.size());
+        bool insert = prefill->has_cache();
+        Control c;
+        c.command = static_cast<std::uint32_t>(Command::prefill_group);
+        c.resets = pending_resets;
+        if (pool_ops.size() > std::size(c.op)) throw std::runtime_error("too many KV pool operations in one round");
+        c.ops = static_cast<std::uint32_t>(pool_ops.size());
+        std::copy(pool_ops.begin(), pool_ops.end(), c.op);
+        pool_ops.clear();
+        c.pslot = n;
+        c.pflags = insert ? 1U : 0U;
+        c.snaps = pending_snaps;
+        pending_snaps = 0;
+        take_commits(c);
+        (void)exchange(fwd, c);
+        for (std::uint32_t s = 0; s < a.slots; ++s)
+            if ((pending_resets >> s) & 1U) {
+                fwd.reset(s);
+                if (stage) stage->reset(s);
+                prefill->on_reset(s);
+            }
+        pending_resets = 0;
+        std::vector<std::uint32_t> info(std::size_t{n} * 2U);
+        std::vector<SlotPrefill::GroupMember> gm(n);
+        for (std::uint32_t m = 0; m < n; ++m) {
+            info[std::size_t{m} * 2U] = members[m]->seq.slot;
+            info[std::size_t{m} * 2U + 1U] = static_cast<std::uint32_t>(members[m]->seq.prompt.size());
+            gm[m] = {members[m]->seq.slot, &members[m]->seq.prompt};
+        }
+        send_group_info(fwd, info, true);
+        for (const auto* m : members) send_prompt(fwd, m->seq.prompt, nullptr);
+        dog.pause(true);
+        std::vector<bool> insert_flags(n, false);
+        std::vector<strix::deepseek41::PrefixLookup> hits(n);
+        for (std::uint32_t m = 0; m < n; ++m) {
+            hits[m] = prefill->lookup(members[m]->seq.prompt);  // a miss by construction; same call on rank 1
+            if (hits[m].resume != 0U) throw std::runtime_error("prefill group: a member has a cache resume");
+            const auto plen = static_cast<std::uint32_t>(members[m]->seq.prompt.size());
+            const bool capture = prefill->has_cache() && plen >= a.prefix_block;
+            insert_flags[m] = capture && prefill->admit(plen, insert);
+        }
+        const auto outs = prefill->run_group(gm, insert_flags);
+        for (std::uint32_t m = 0; m < n; ++m) prefill->on_prefill(gm[m].slot, members[m]->seq.prompt);
+        dog.pause(false);
+        last_round = Clock::now();
+        for (std::uint32_t m = 0; m < n; ++m) prefill_done(*members[m], outs[m], hits[m], false, t0);
     };
     // interleave: the active task's next unit on both ranks (budget_rows 0: up to its next default piece end)
     // A resumable task stopped inside a piece continues that piece, including while idle.
@@ -3358,8 +3572,40 @@ void lead(const Args& initial, BatchForward& fwd, strix::dist::Communicator& com
                             [](auto* r) -> std::uint32_t& { return r->prefill_overtakes; });
                         auto& r = *waiting[pick];
                         const auto t_pf = (run_on || step_trace) ? Clock::now() : Clock::time_point{};
-                        device_prefill(r, r.seq.prompt.size() >= sched.min_rows);
+                        // PFFIX (a): the waiting short prompts that need the same direct device prefill now (no resume possible: shorter
+                        // than one cache block; not mid-prefill: `active` is empty; not a task: below min_rows)
+                        std::vector<Running*> group;
+                        if (group_policy.groups() && prefill->group_available() && r.seq.prompt.size() < sched.min_rows) {
+                            std::vector<Running*> offered;
+                            std::vector<serve::GroupCandidate> cands;
+                            const auto offer = [&](Running* q) {
+                                if (q->seq.prompt.empty() || q->seq.prompt.size() >= sched.min_rows || runtime.ticket_cancelled(q->owner)) return;
+                                if (prefill->has_cache() && q->seq.prompt.size() >= a.prefix_block) return;
+                                serve::GroupCandidate g;
+                                g.id = offered.size();
+                                g.rows = static_cast<std::uint32_t>(q->seq.prompt.size());
+                                g.arrival_seq = offered.size();  // the picked request first, then the others by submission order
+                                g.route_class = prefill->route_class(g.rows);
+                                cands.push_back(g);
+                                offered.push_back(q);
+                            };
+                            offer(&r);
+                            for (auto* q : waiting)
+                                if (q != &r) offer(q);
+                            const bool decoding = std::any_of(running.begin(), running.end(), [](const auto& q) { return !q->device_prefill; });
+                            const double gap_ms = std::chrono::duration<double, std::milli>(Clock::now() - decode_gap_from).count();
+                            const double budget = decoding ? sched.admit_first.max_decode_gap_ms - gap_ms : std::numeric_limits<double>::infinity();
+                            if (cands.size() >= 2U && !offered.empty() && offered.front() == &r) {
+                                const auto ids = serve::plan_prefill_group(cands, group_policy, serve::PrefillGroupCost{sched.tdev_a * 1e3, sched.tdev_b * 1e3}, budget);
+                                if (ids.size() >= 2U)
+                                    for (const auto id : ids) group.push_back(offered.at(static_cast<std::size_t>(id)));
+                            }
+                        }
+                        if (group.size() >= 2U) device_prefill_group(group);
+                        else device_prefill(r, r.seq.prompt.size() >= sched.min_rows);
                         if (run_on) run_window.admission(run_ns(t_pf), run_ns(Clock::now()), active ? 0U : r.seq.prompt.size(), run_commit(r));
+                        if (step_trace && group.size() >= 2U)
+                            std::fprintf(stderr, "steptrace prefill_group t %.1f members %zu end %.1f\n", trace_ms(t_pf), group.size(), trace_ms(Clock::now()));
                         if (step_trace)
                             std::fprintf(stderr, "steptrace prefill t %.1f slot %u tokens %zu end %.1f task %d\n", trace_ms(t_pf), r.seq.slot,
                                          r.seq.prompt.size(), trace_ms(Clock::now()), active ? 1 : 0);
@@ -3811,6 +4057,7 @@ int main(int argc, char** argv) try {
     if (a.prefix_block == 0U || a.prefix_block % 8U != 0U) throw std::invalid_argument("--prefix-block must be a positive multiple of 8");
     if (a.prefix_cache_mb != 0U && !a.device_prefill) throw std::invalid_argument("--prefix-cache-mb needs --prefill-path device");
     (void)strix::deepseek41::sched::options_from_env(a.device_prefill);  // STRIX_DS41_SERVE_SCHED: checked before connect / load
+    (void)prefill_group_policy(a);  // STRIX_SERVE_PREFILL_GROUP*: checked before connect / load
     if (a.prefix_inrun && a.prefix_cache_mb == 0U) throw std::invalid_argument("--prefix-inrun-snapshots needs --prefix-cache-mb (or --cache-profile agent)");
     if (a.prefix_session && !a.dspark.empty())
         throw std::invalid_argument("--prefix-session-snapshots is not exact with --dspark (verify-window rows leave another state than the prefill)");

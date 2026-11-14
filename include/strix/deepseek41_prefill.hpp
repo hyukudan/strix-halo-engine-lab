@@ -346,6 +346,12 @@ public:
     std::vector<PrefillResult> run_group(std::span<const PrefillSegment> segments);
     // Member `segment` of the last run_group, as export_state() of its solo run (position = its rows).
     [[nodiscard]] AttentionState export_state(std::size_t segment) const;
+    // Member `segment` of the last run_group: its draft seed (PrefillOptions::draft_rows), as draft_seed() of its solo run
+    // (its last min(draft_rows, rows) rows; first = rows - seed rows), valid until the next run. Empty for a missing member.
+    [[nodiscard]] DraftSeed draft_seed(std::size_t segment) const noexcept;
+    // Device bytes the group states and the group scratch of these options hold (0 when group_members is 0): memory admission
+    // adds them to the prefill's scratch estimate (serve::sched::prefill_piece_bytes covers the one-sequence buffers only).
+    [[nodiscard]] static std::uint64_t group_state_bytes(const PrefillOptions& options);
     [[nodiscard]] std::uint64_t weight_bytes() const noexcept;         // loaded (owned) by this prefill
     [[nodiscard]] std::uint64_t shared_weight_bytes() const noexcept;  // read in place from shared_weights
     // The bytes of weights a prefill with these options would load itself (not found in options.shared_weights; streamed
