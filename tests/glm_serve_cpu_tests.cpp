@@ -1,6 +1,7 @@
 // strix-glm5-serve host-only tests: control block encode/decode, hello / row checks, finish decisions, the slot table,
 // and the lead + follower protocol over an in-process loopback with a deterministic fake engine (batched streams must
 // equal their alone runs; serial mode; world 1; context limit; a cross-rank token mismatch aborts both ranks).
+#include "strix/session/prefill_session.hpp"
 #include "glm/serve/glm_serve_control.hpp"
 #include "glm/serve/glm_serve_lead.hpp"
 #include "glm/serve/glm_serve_import.hpp"
@@ -223,6 +224,7 @@ struct FakeEng {
     }
     std::uint32_t prefill(std::uint32_t s, std::span<const std::uint32_t> t, std::uint64_t pos0) {
         plain_call();
+        if (units_open) throw std::runtime_error("fake prefill: another prompt's prefill units session is open");
         if (!ready.at(s) || pos0 != frontier[s]) throw std::runtime_error("fake prefill: not at the slot frontier / without reset");
         for (const auto x : t) h[s] = fold(h[s], x);
         frontier[s] = pos0 + t.size();
@@ -379,6 +381,43 @@ struct FakeEng {
             seed_spec(s);
         }
         return y0;
+    }
+    // Prefill units (the engine's prefill_mtp session): the whole-prompt call runs when the last unit arrives, so the
+    // tokens equal the idle run by construction; while a session is open no other prompt may prefill (the engine's
+    // row buffers hold the paused piece).
+    std::uint32_t unit_rows = 0, unit_layers = 0;
+    std::vector<std::uint32_t> units_tokens, unit_calls;
+    std::uint32_t units_slot = 0;
+    std::uint64_t units_pos = 0, units_done = 0, units_total = 0;
+    bool units_open = false;
+    unsigned units_cancelled = 0, units_delay_us = 0;
+    std::uint32_t prefill_units(std::uint32_t s, std::span<const std::uint32_t> t, std::uint64_t pos0, bool start, std::uint32_t n) {
+        if (n == 0) {
+            if (!units_open) throw std::runtime_error("fake units: cancel without a session");
+            units_open = false;
+            ++units_cancelled;
+            log.push_back("units cancel " + std::to_string(s));
+            return gs::kPrefillPending;
+        }
+        if (start) {
+            if (units_open) throw std::runtime_error("fake units: a session is already open");
+            units_open = true;
+            units_tokens.assign(t.begin(), t.end());
+            units_slot = s;
+            units_pos = pos0;
+            units_done = 0;
+            units_total = strix::session::LayerUnits{t.size(), unit_rows, unit_layers}.total();
+            if (units_total == 0) throw std::runtime_error("fake units: no unit geometry");
+        } else if (!units_open || s != units_slot || pos0 != units_pos) {
+            throw std::runtime_error("fake units: resume without its session");
+        }
+        unit_calls.push_back(n);
+        log.push_back("units " + std::to_string(s) + " +" + std::to_string(n));
+        if (units_delay_us) std::this_thread::sleep_for(std::chrono::microseconds(units_delay_us));
+        units_done = std::min<std::uint64_t>(units_done + n, units_total);
+        if (units_done < units_total) return gs::kPrefillPending;
+        units_open = false;
+        return prefill_mtp(units_slot, units_tokens, units_pos, true);
     }
     void mtp_enter(std::uint32_t r, const gs::WireRow& w, bool from_seed) {
         if (from_seed) {
@@ -1076,7 +1115,7 @@ int main(int argc, char** argv) {
             auto blk = gs::encode(old_peer);
             const std::uint32_t v5 = 5;
             std::memcpy(blk.data() + offsetof(gs::Control, version), &v5, sizeof v5);
-            CHECK(throws_with([&] { (void)gs::decode(blk); }, "protocol version 5 from the peer, expected 7"));
+            CHECK(throws_with([&] { (void)gs::decode(blk); }, "protocol version 5 from the peer, expected 8"));
             CHECK(gs::decode(gs::encode(old_peer)).version == gs::kControlVersion);
             std::printf("v5-layout peer block: refused at the version check\n");
         }
@@ -1730,6 +1769,109 @@ int main(int argc, char** argv) {
         std::printf("arrival during MTP: A %zu tokens, B %zu tokens, mtp rounds %llu enters %llu leaves %llu, steps %llu\n", a.size(),
                     b.size(), static_cast<unsigned long long>(st.mtp_rounds), static_cast<unsigned long long>(st.mtp_enters),
                     static_cast<unsigned long long>(st.mtp_leaves), static_cast<unsigned long long>(st.steps));
+    }
+    // ---- prefill units (a long MTP prompt beside a decoding request, cut by LAYERS): one engine session paused at layer
+    // boundaries of its 256-row pieces; every call carries the 64-token base chunk's work in layer units of the current
+    // piece (LayerUnits::base_units; grouping capped at one base-equivalent), a decode round separates the calls, the
+    // tokens equal the idle run; a cancelled request closes the session on the engine and the next prompt prefills
+    {
+        namespace ss = strix::session;
+        static_assert(ss::LayerUnits{640, 256, 45}.total() == 135 && ss::LayerUnits{640, 256, 45}.pieces() == 3);
+        static_assert(ss::LayerUnits{640, 256, 45}.piece_rows_at(89) == 256 && ss::LayerUnits{640, 256, 45}.piece_rows_at(90) == 128);
+        static_assert(ss::LayerUnits{640, 256, 45}.base_units(64, 0) == 12);    // 64 x 45 / 256 = 11.25, rounded up
+        static_assert(ss::LayerUnits{640, 256, 45}.base_units(64, 96) == 23);   // the 128-row piece: 22.5
+        static_assert(ss::LayerUnits{640, 256, 45}.base_units(64, 130) == 5);   // the units left
+        static_assert(ss::LayerUnits{640, 256, 45}.base_units(0, 3) == 132 && ss::LayerUnits{640, 256, 45}.base_units(64, 135) == 0);
+        static_assert(ss::LayerUnits{0, 256, 45}.total() == 0 && ss::LayerUnits{1, 4096, 45}.base_units(512, 0) == 45);
+        for (const bool cancel : {false, true}) {
+            FakeEng e(4);
+            e.stops = false;
+            e.unit_rows = 256;
+            e.unit_layers = 45;
+            if (cancel) e.units_delay_us = 20000;
+            gs::Channel ch({}, 0);
+            ch.hello(hello_for(4, 4096, 1));
+            sv::GenerationQueue queue(8);
+            gs::LeadConfig lc;
+            lc.slots = 4;
+            lc.capacity = 4096;
+            lc.heartbeat_seconds = 0.01;
+            lc.mtp = true;
+            lc.prefill_chunk = 64;
+            lc.prefill_units_rows = 256;
+            lc.prefill_units_layers = 45;
+            lc.prefill_timeline = 1;
+            std::atomic<bool> stop{false};
+            gs::Lead<FakeEng> lead(e, ch, queue, lc, stop);
+            std::thread runner([&] { lead.loop(); });
+            auto job = [&](std::vector<std::uint32_t> p, std::uint32_t max) {
+                sv::GenerationJob j;
+                j.prompt = std::move(p);
+                j.max_tokens = max;
+                return queue.submit(std::move(j));
+            };
+            const auto pa = prompts(3)[0], pd = prompts(3)[2];
+            auto ta = job(pa, 400);
+            std::vector<std::uint32_t> a, b, d;
+            bool done = false;
+            while (a.size() < 5 && !done) {
+                auto g = ta->wait(std::chrono::milliseconds(100), done);
+                a.insert(a.end(), g.begin(), g.end());
+            }
+            std::vector<std::uint32_t> big(640);
+            for (std::size_t i = 0; i < big.size(); ++i) big[i] = static_cast<std::uint32_t>(3 + i % 97);
+            auto tb = job(big, 6);
+            bool done_b = false;
+            if (cancel) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(70));
+                tb->cancel();
+            }
+            while (!done_b) {
+                auto g = tb->wait(std::chrono::milliseconds(100), done_b);
+                b.insert(b.end(), g.begin(), g.end());
+            }
+            auto td = job(pd, 8);
+            bool done_d = false;
+            while (!done_d) {
+                auto g = td->wait(std::chrono::milliseconds(100), done_d);
+                d.insert(d.end(), g.begin(), g.end());
+            }
+            while (!done) {
+                auto g = ta->wait(std::chrono::milliseconds(100), done);
+                a.insert(a.end(), g.begin(), g.end());
+            }
+            stop.store(true);
+            runner.join();
+            auto plain = [](const std::vector<std::uint32_t>& p, std::size_t n) {
+                FakeEng f(1);
+                f.stops = false;
+                f.reset(0);
+                std::vector<std::uint32_t> t{f.prefill(0, p, 0)};
+                while (t.size() < n) {
+                    const gs::WireRow r{0, t.back(), f.frontier[0]};
+                    t.push_back(f.step({&r, 1})[0]);
+                }
+                return t;
+            };
+            CHECK(a == plain(pa, 400));
+            CHECK(d == plain(pd, 8));
+            int back_to_back = 0;
+            for (std::size_t i = 1; i < e.log.size(); ++i)
+                if (e.log[i].rfind("units 1 +", 0) == 0 && e.log[i - 1].rfind("units 1 +", 0) == 0) ++back_to_back;
+            if (!cancel) {
+                const std::vector<std::uint32_t> want{12, 12, 12, 12, 12, 12, 12, 12, 23, 16};
+                CHECK(b == plain(big, 6));
+                CHECK(e.unit_calls == want);
+                CHECK(back_to_back == 0 && e.units_cancelled == 0);
+            } else {
+                CHECK(e.units_cancelled == 1 && !e.units_open && e.unit_calls.size() < 10);
+            }
+            std::string calls;
+            for (const auto u : e.unit_calls) calls += (calls.empty() ? "" : " ") + std::to_string(u);
+            std::printf("prefill units%s: %zu calls (%s), decode between every call: %s, tokens == idle run: %s\n",
+                        cancel ? " (cancelled)" : "", e.unit_calls.size(), calls.c_str(),
+                        back_to_back == 0 ? "yes" : "NO", a == plain(pa, 400) && d == plain(pd, 8) ? "yes" : "NO");
+        }
     }
     // ---- world 1, context limit, rejected prompt, max_tokens
     {
