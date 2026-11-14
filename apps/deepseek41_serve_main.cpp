@@ -1556,6 +1556,7 @@ struct Running {
     serve::PendingSession pending; // only while this candidate awaits native admission
     BatchSequence seq;
     std::size_t published = 0;
+    serve::RunTokenCursor run_tokens;
     Clock::time_point start, first_token;
     bool has_first = false;
     std::uint32_t prefill_overtakes = 0;
@@ -2290,9 +2291,9 @@ void lead(const Args& initial, BatchForward& fwd, strix::dist::Communicator& com
     const auto run_ns = [](Clock::time_point t) {
         return static_cast<std::int64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(t.time_since_epoch()).count());
     };
-    const std::string run_identity = "engine=deepseek41-pair draft=" + std::string(a.dspark.empty() ? "off" : "on") + " draft_max_inflight=" +
+    const std::string run_identity = run_on ? "engine=deepseek41-pair draft=" + std::string(a.dspark.empty() ? "off" : "on") + " draft_max_inflight=" +
         std::to_string(a.dspark_max_inflight) + " context=" + std::to_string(a.context) + " slots=" + std::to_string(a.slots) +
-        " prefill=" + (a.device_prefill ? "device" : "rows");
+        " prefill=" + (a.device_prefill ? "device" : "rows") : std::string{};
     std::vector<std::unique_ptr<Running>> running;
     std::vector<std::uint32_t> free_slots;
     for (std::uint32_t s = a.slots; s-- > 0U;) free_slots.push_back(s);
@@ -2412,6 +2413,10 @@ void lead(const Args& initial, BatchForward& fwd, strix::dist::Communicator& com
         const std::lock_guard lock(state.mutex);
         state.busy = static_cast<std::uint32_t>(running.size());
     };
+    const auto run_commit = [&](Running& r) {
+        const auto& job = request(r).job;
+        return r.run_tokens.commit(run_window, r.seq.slot, r.seq.generated, r.published, job.max_tokens, job.stop_tokens);
+    };
     // publish the new tokens, then end the requests that are done
     const auto publish = [&] {
         for (std::size_t i = running.size(); i-- > 0U;) {
@@ -2420,13 +2425,7 @@ void lead(const Args& initial, BatchForward& fwd, strix::dist::Communicator& com
             {  // a window emits several tokens: the ones after a stop token or past max_tokens are dropped
                 auto& g = r.seq.generated;
                 const auto& stops = request(r).job.stop_tokens;
-                std::size_t end = std::min<std::size_t>(g.size(), std::max<std::size_t>(request(r).job.max_tokens, r.published + 1U));
-                for (std::size_t k = r.published; k < end; ++k)
-                    if (std::find(stops.begin(), stops.end(), g[k]) != stops.end()) {
-                        end = k + 1U;
-                        break;
-                    }
-                g.resize(end);
+                g.resize(serve::retained_output_end(g, r.published, request(r).job.max_tokens, stops));
             }
             if (!r.has_first) {
                 r.has_first = true;
@@ -2730,6 +2729,7 @@ void lead(const Args& initial, BatchForward& fwd, strix::dist::Communicator& com
         r.device_prefill = false;
         r.account.continued(p.position);  // usage.prompt_tokens_details.cached_tokens reports them (none read again)
         if (r.seq.prompt.size() == p.position) r.seq.generated.assign(1U, p.next_token);
+        if (run_on) run_window.restored(run_ns(Clock::now()), run_commit(r));
         std::fprintf(stderr, "import: request of %zu prompt tokens waiting for its prefill continues the state in slot %u (position %u)\n",
                      r.seq.prompt.size(), p.slot, p.position);
     };
@@ -2770,9 +2770,6 @@ void lead(const Args& initial, BatchForward& fwd, strix::dist::Communicator& com
         const bool armed = serve::observe_armed();  // one load per step: the draft tally and the published snapshot
         const auto t_loop = Clock::now();
         if (prof.steps != 0U) prof.between += std::chrono::duration<double>(t_loop - prof.last_end).count();
-        std::array<std::uint32_t, 64> run_before{};  // tokens of each lane before the step (whole-run receipt)
-        if (run_on)
-            for (std::size_t i = 0; i < seqs.size() && i < run_before.size(); ++i) run_before[i] = static_cast<std::uint32_t>(seqs[i]->generated.size());
         strix::deepseek41::PlannedStep planned;
         if (pre) {
             planned = *pre;
@@ -2781,6 +2778,8 @@ void lead(const Args& initial, BatchForward& fwd, strix::dist::Communicator& com
             planned = plan_seqs(seqs);
         }
         const auto& plan = planned;
+        const auto run_work = run_on ? serve::run_step_work(plan.owner, [&](std::uint32_t i) { return seqs[i]->reading_prompt(); })
+                                    : serve::RunStepWork{};
         const auto t_planned = Clock::now();
         prof.plan += std::chrono::duration<double>(t_planned - t_loop).count();
         Control c;
@@ -2878,9 +2877,10 @@ void lead(const Args& initial, BatchForward& fwd, strix::dist::Communicator& com
         prof.last_end = Clock::now();
         if (run_on) {  // the step interval is the forward; planning, control and the commit work are host control
             std::uint64_t emitted = 0;
-            for (std::size_t i = 0; i < seqs.size() && i < run_before.size(); ++i)
-                for (std::size_t k = run_before[i]; k < seqs[i]->generated.size(); ++k, ++emitted) run_window.token(seqs[i]->slot, seqs[i]->generated[k]);
-            run_window.step(run_ns(t0), run_ns(last_round), static_cast<std::uint32_t>(seqs.size()), static_cast<std::uint32_t>(plan.rows.size()), emitted);
+            for (const auto* seq : seqs)
+                for (auto& r : running)
+                    if (&r->seq == seq) { emitted += run_commit(*r); break; }
+            run_window.planned_step(run_ns(t0), run_ns(last_round), run_work, emitted);
             run_window.host_control(run_ns(t0) - run_ns(t_loop) + run_ns(prof.last_end) - run_ns(last_round));
         }
         if (++prof.steps % 100U == 0U) prof.print(spec.get());
@@ -3259,7 +3259,11 @@ void lead(const Args& initial, BatchForward& fwd, strix::dist::Communicator& com
                                  p.position);
                     if (!request(*r).job.session_id.empty()) runtime.notify_admitted(r->owner);
                     running.push_back(std::move(r));
-                    if (run_on) run_window.request(run_ns(Clock::now()));
+                    if (run_on) {
+                        const auto now = run_ns(Clock::now());
+                        run_window.request(now);
+                        run_window.restored(now, run_commit(*running.back()));
+                    }
                     worked = true;
                     const std::lock_guard lock(state.mutex);
                     state.busy = static_cast<std::uint32_t>(running.size());
@@ -3353,9 +3357,9 @@ void lead(const Args& initial, BatchForward& fwd, strix::dist::Communicator& com
                             [](const auto* r) { return r->seq.prompt.size(); },
                             [](auto* r) -> std::uint32_t& { return r->prefill_overtakes; });
                         auto& r = *waiting[pick];
-                        const auto t_pf = Clock::now();
+                        const auto t_pf = (run_on || step_trace) ? Clock::now() : Clock::time_point{};
                         device_prefill(r, r.seq.prompt.size() >= sched.min_rows);
-                        if (run_on) run_window.admission(run_ns(t_pf), run_ns(Clock::now()), active ? 0U : r.seq.prompt.size(), active ? 0U : r.seq.generated.size());
+                        if (run_on) run_window.admission(run_ns(t_pf), run_ns(Clock::now()), active ? 0U : r.seq.prompt.size(), run_commit(r));
                         if (step_trace)
                             std::fprintf(stderr, "steptrace prefill t %.1f slot %u tokens %zu end %.1f task %d\n", trace_ms(t_pf), r.seq.slot,
                                          r.seq.prompt.size(), trace_ms(Clock::now()), active ? 1 : 0);
@@ -3375,7 +3379,7 @@ void lead(const Args& initial, BatchForward& fwd, strix::dist::Communicator& com
                 const bool hold = sched.admit_first.prompt_before_decode(running.size() + queued, waiting_prefill + (prefilled_now && queued != 0U ? 1U : 0U),
                     seqs.size(), std::chrono::duration<double, std::milli>(Clock::now() - decode_gap_from).count());
                 if (hold) {
-                    run_window.hold();
+                    if (run_on) run_window.hold();
                     if (step_trace) std::fprintf(stderr, "steptrace hold t %.1f seqs %zu waiting %zu queued %zu\n", trace_ms(Clock::now()), seqs.size(), waiting_prefill, queued);
                 } else if (!seqs.empty()) {
                     decode_step(seqs);
@@ -3385,10 +3389,10 @@ void lead(const Args& initial, BatchForward& fwd, strix::dist::Communicator& com
                 if (active) {
                     // phase B (resumable): the default pieces, a few units per tick; else pieces of unit_rows rows
                     Running* const unit_of = active->r;
-                    const auto t_unit = Clock::now();
+                    const auto t_unit = run_on ? Clock::now() : Clock::time_point{};
                     run_unit(strix::deepseek41::sched::row_budget(sched, seqs.empty()), !seqs.empty());
                     if (run_on)  // a piece of a resumable prefill; the last piece carries the prompt and its first token
-                        run_window.admission(run_ns(t_unit), run_ns(Clock::now()), active ? 0U : unit_of->seq.prompt.size(), active ? 0U : unit_of->seq.generated.size());
+                        run_window.admission(run_ns(t_unit), run_ns(Clock::now()), active ? 0U : unit_of->seq.prompt.size(), run_commit(*unit_of));
                     if (!active) publish();  // its first token
                     return;
                 }
@@ -3398,9 +3402,9 @@ void lead(const Args& initial, BatchForward& fwd, strix::dist::Communicator& com
                 bool prefilled = false;
                 for (auto& r : running)
                     if (r->device_prefill) {
-                        const auto t_pf = Clock::now();
+                        const auto t_pf = run_on ? Clock::now() : Clock::time_point{};
                         device_prefill(*r, false);
-                        if (run_on) run_window.admission(run_ns(t_pf), run_ns(Clock::now()), r->seq.prompt.size(), r->seq.generated.size());
+                        if (run_on) run_window.admission(run_ns(t_pf), run_ns(Clock::now()), r->seq.prompt.size(), run_commit(*r));
                         prefilled = true;
                     }
                 if (prefilled) {

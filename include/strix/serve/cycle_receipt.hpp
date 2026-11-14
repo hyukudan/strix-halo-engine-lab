@@ -23,6 +23,7 @@
 #include <limits>
 #include <mutex>
 #include <sstream>
+#include <span>
 #include <string>
 #include <vector>
 
@@ -303,12 +304,14 @@ inline void dump_cycle_ledger(std::FILE* out) {
 }
 
 // Whole-run receipt: one busy window of a scheduler (first admission to the last lane leaving), split so that
-// the whole-run rate (outputs / wall) and the steady rate (outputs of full-cohort steps / their wall) come from
-// the same clock. The intervals are a partition of the window; `other_ns()` is what no call claimed.
+// whole_tok_s includes the entire wall time. steady_tok_s is FORWARD-ONLY for full-cohort decode steps;
+// it excludes planning/drafting, control, commit and publication, and is not serving throughput.
+// The intervals are a partition of the window; `other_ns()` is what no call claimed.
 //   admission     prompt units (prefill) of the window, with the outputs they emitted (a prompt's first token)
 //   ramp          decode steps before the largest cohort of the window stepped together
 //   full          decode steps of that largest cohort: the steady state. Never inferred from a smaller step.
 //   partial       smaller steps after the cohort was reached (a lane left, was cancelled, or was admitted late)
+//   mixed         steps with both prompt and decode rows; never qualify a steady cohort
 //   host_control  planning, the control exchange and the work between two steps that the scheduler timed
 //   hold          decode steps skipped while prompts were served first (a count: their time is admission)
 // A step with zero emitted tokens (every proposal held or rolled back) still counts its time in its class.
@@ -326,13 +329,13 @@ struct RunReceipt {
     std::uint32_t requests = 0, cancelled = 0, peak_lanes = 0;
     std::uint64_t prompt_units = 0, prompt_tokens = 0, admission_outputs = 0, holds = 0;
     std::int64_t admission_ns = 0, host_control_ns = 0;
-    Class ramp, full, partial;
+    Class ramp, full, partial, mixed;
     std::uint64_t digest = 1469598103934665603ULL;  // FNV-1a of (lane, token) in commit order
 
-    [[nodiscard]] std::uint64_t outputs() const noexcept { return admission_outputs + ramp.outputs + full.outputs + partial.outputs; }
+    [[nodiscard]] std::uint64_t outputs() const noexcept { return admission_outputs + ramp.outputs + full.outputs + partial.outputs + mixed.outputs; }
     [[nodiscard]] std::int64_t wall_ns() const noexcept { return end_ns - begin_ns; }
     [[nodiscard]] std::int64_t other_ns() const noexcept {
-        return wall_ns() - admission_ns - host_control_ns - ramp.ns - full.ns - partial.ns;
+        return wall_ns() - admission_ns - host_control_ns - ramp.ns - full.ns - partial.ns - mixed.ns;
     }
     // Time after the last full-cohort step (tail steps, their control and the drain).
     [[nodiscard]] std::int64_t tail_ns() const noexcept { return full.steps ? end_ns - last_full_ns : 0; }
@@ -344,9 +347,36 @@ struct RunReceipt {
     }
     [[nodiscard]] bool consistent() const noexcept {
         return end_ns >= begin_ns && admission_ns >= 0 && host_control_ns >= 0 && ramp.ns >= 0 && full.ns >= 0 &&
-            partial.ns >= 0 && other_ns() >= 0;
+            partial.ns >= 0 && mixed.ns >= 0 && other_ns() >= 0;
     }
 };
+
+// Publication and accounting use the same bounds, including the stop token itself.
+[[nodiscard]] inline std::size_t retained_output_end(std::span<const std::uint32_t> tokens, std::size_t published,
+                                                    std::size_t max_tokens, std::span<const std::uint32_t> stops) {
+    std::size_t end = std::min(tokens.size(), std::max(max_tokens, published + 1U));
+    for (std::size_t k = published; k < end; ++k)
+        if (std::find(stops.begin(), stops.end(), tokens[k]) != stops.end()) return k + 1U;
+    return end;
+}
+
+struct RunStepWork {
+    std::uint32_t rows = 0, prompt_rows = 0, decode_lanes = 0;
+};
+
+// Capture BEFORE executing a plan: owners index the input sequences, not the running cohort.
+// Multiple speculative rows belonging to one decoding request count as one lane.
+template <typename IsPrompt>
+[[nodiscard]] RunStepWork run_step_work(std::span<const std::uint32_t> owners, IsPrompt is_prompt) {
+    RunStepWork work;
+    std::array<bool, kCycleLaneBuckets> seen{};
+    for (const auto owner : owners) {
+        ++work.rows;
+        if (is_prompt(owner)) ++work.prompt_rows;
+        else if (!seen.at(owner)) ++work.decode_lanes, seen.at(owner) = true;
+    }
+    return work;
+}
 
 class RunWindow {
 public:
@@ -373,6 +403,23 @@ public:
     }
     void host_control(std::int64_t ns) noexcept {
         if (open_ && ns > 0) r_.host_control_ns += ns;
+    }
+    // A restored pending token has no local prefill work or prompt tokens.
+    void restored(std::int64_t now_ns, std::uint64_t emitted) noexcept {
+        if (!open_) return;
+        r_.admission_outputs += emitted;
+        output(now_ns, emitted);
+    }
+    void planned_step(std::int64_t begin_ns, std::int64_t end_ns, const RunStepWork& work, std::uint64_t emitted) noexcept {
+        if (!open_ || end_ns < begin_ns) return;
+        if (work.prompt_rows == 0) step(begin_ns, end_ns, work.decode_lanes, work.rows, emitted);
+        else if (work.decode_lanes == 0) admission(begin_ns, end_ns, work.prompt_rows, emitted);
+        else {
+            ++r_.prompt_units;
+            r_.prompt_tokens += work.prompt_rows;
+            r_.mixed.add({1, emitted, work.rows, end_ns - begin_ns});
+            output(end_ns, emitted);
+        }
     }
     // One decode step of `lanes` requests over `rows` physical rows; `emitted` tokens were committed (0 is valid).
     void step(std::int64_t begin_ns, std::int64_t end_ns, std::uint32_t lanes, std::uint32_t rows, std::uint64_t emitted) noexcept {
@@ -410,6 +457,21 @@ private:
     bool open_ = false;
 };
 
+// One cursor per request, shared by restored, prefill and decode commits. Digest order is scheduler
+// completion order, then input sequence order within a step, then token order within each sequence.
+// Commit before publication can erase the request/close the window. This never mutates generated tokens.
+struct RunTokenCursor {
+    std::size_t accounted = 0;
+    std::uint64_t commit(RunWindow& window, std::uint32_t lane, std::span<const std::uint32_t> tokens,
+                         std::size_t published, std::size_t max_tokens, std::span<const std::uint32_t> stops) {
+        if (!window.open()) return 0;
+        const auto end = retained_output_end(tokens, published, max_tokens, stops);
+        std::uint64_t emitted = 0;
+        for (; accounted < end; ++accounted, ++emitted) window.token(lane, tokens[accounted]);
+        return emitted;
+    }
+};
+
 // One log line per window ("serve run key=value ..."); times in ms, stamps relative to the window's begin.
 [[nodiscard]] inline std::string format_run_receipt(const RunReceipt& r, const std::string& identity = {}) {
     const auto ms = [](std::int64_t ns) { return static_cast<double>(ns) / 1e6; };
@@ -423,7 +485,8 @@ private:
       << r.peak_lanes << " outputs=" << r.outputs() << " wall_ms=" << ms(r.wall_ns()) << " whole_tok_s=" << r.whole_rate()
       << " steady_tok_s=" << r.steady_rate() << " prompt_units=" << r.prompt_units << " prompt_tokens=" << r.prompt_tokens
       << " admission_outputs=" << r.admission_outputs << " admission_ms=" << ms(r.admission_ns) << " holds=" << r.holds;
-    cls("ramp", r.ramp), cls("full", r.full), cls("partial", r.partial);
+    cls("ramp", r.ramp), cls("full", r.full), cls("partial", r.partial), cls("mixed", r.mixed);
+    o << " steady_basis=forward_only";
     o << " host_control_ms=" << ms(r.host_control_ns) << " other_ms=" << ms(r.other_ns()) << " tail_ms=" << ms(r.tail_ns())
       << " first_output_at=" << at(r.first_output_ns) << " cohort_at=" << at(r.cohort_ns) << " last_full_at=" << at(r.last_full_ns)
       << " last_output_at=" << at(r.last_output_ns) << " digest=" << std::hex << r.digest << std::dec;
