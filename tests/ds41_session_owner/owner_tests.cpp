@@ -58,6 +58,7 @@ struct BatchForward::Impl {};
 BatchForward::BatchForward(const std::filesystem::path&, const BatchForwardOptions&) : impl_(std::make_unique<Impl>()) {}
 BatchForward::~BatchForward() = default;
 std::uint32_t BatchForward::row_limit() const noexcept {return max_rows;}
+const TargetModel& BatchForward::model() const noexcept {static const TargetModel m{};return m;}  // text fixture: only config.hidden_size is read
 void BatchForward::reset(std::uint32_t s) { witness::record("reset physical="+std::to_string(101+s*17)); witness::positions[s]=0; }
 bool BatchForward::reserve(std::uint32_t s,std::uint32_t n) {
     witness::record("reserve physical="+std::to_string(101+s*17)+" rows="+std::to_string(n));
