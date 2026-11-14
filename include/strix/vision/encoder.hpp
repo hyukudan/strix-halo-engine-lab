@@ -193,7 +193,7 @@ void splice_rows_host(float* dst, std::size_t dst_stride, const ProjectedRows& s
 
 struct EncoderOptions {
     bool split_activations = false;                   // hi + lo FP16 operands for every linear input (two GEMMs)
-    std::size_t mlp_workspace_bytes = 96U << 20U;     // cap of the chunked MLP buffers
+    std::size_t mlp_workspace_bytes = 160U << 20U;    // cap of the chunked MLP buffers (2304 rows split, 4352 single)
     void* stream = nullptr;                           // hipStream_t; null = default stream
 };
 // Device bytes of one tower, exact for the runner: what a family reports to its memory budget before admission.
