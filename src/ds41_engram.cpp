@@ -26,6 +26,11 @@
 #include <sys/stat.h>
 #include <unistd.h>
 #endif
+#if defined(__linux__)
+#include <linux/aio_abi.h>
+#include <sys/syscall.h>
+#include "strix/env_flags.hpp"
+#endif
 
 namespace strix::ds41 {
 namespace {
@@ -35,6 +40,9 @@ void require(bool ok, const char* message) {
 }
 
 constexpr std::uint64_t page_size = 4096;
+#if defined(__linux__)
+constexpr std::size_t aio_window = 256;  // batched reads in flight per submission window
+#endif
 
 // Positional read (pread; thread-safe on a shared descriptor) and page-aligned buffers.
 #if defined(_WIN32)
@@ -263,6 +271,12 @@ EngramRowReader::EngramRowReader(const std::filesystem::path& file, std::vector<
     if (::fstat(fd_, &st) != 0) { close_fd(fd_); throw std::runtime_error("Engram reader cannot stat the model file"); }
 #endif
     file_bytes_ = static_cast<std::uint64_t>(st.st_size);
+#if defined(__linux__)
+    if (direct_ && strix::envcfg::flag("STRIX_DS41_ENGRAM_AIO", true)) {
+        aio_context_t context = 0;
+        if (::syscall(SYS_io_setup, static_cast<long>(aio_window), &context) == 0) aio_ = static_cast<unsigned long>(context);
+    }
+#endif
     for (const auto& t : tables_)
         if (t.rows == 0 || t.file_offset > file_bytes_ || t.rows > (file_bytes_ - t.file_offset) / engram_row_bytes) {
             close_fd(fd_);
@@ -288,6 +302,10 @@ EngramRowReader::~EngramRowReader() {
                      static_cast<unsigned long long>(s.cache_capacity), static_cast<unsigned long long>(s.cache_entries),
                      static_cast<unsigned long long>(s.cache_storage_bytes), static_cast<unsigned long long>(s.cache_evictions));
     }
+#if defined(__linux__)
+    if (aio_ != 0) ::syscall(SYS_io_destroy, static_cast<aio_context_t>(aio_));
+#endif
+    if (aio_pages_) free_pages(aio_pages_);
     if (fd_ >= 0) close_fd(fd_);
 }
 
@@ -319,6 +337,80 @@ void EngramRowReader::read_one(const EngramRowRequest& r, std::uint8_t* out, std
     page_reads_.fetch_add(1, std::memory_order_relaxed);
     page_bytes_.fetch_add(length, std::memory_order_relaxed);
 }
+
+#if defined(__linux__)
+// STRIX_DS41_ENGRAM_AIO (default on, =0 off): the same pages, the same bytes; only how the reads are issued.
+bool EngramRowReader::read_batched(std::span<const EngramRowRequest> batch, std::span<const std::size_t> destinations, std::uint8_t* out) {
+    if (aio_ == 0 || !direct_) return false;
+    const std::size_t slot = 2 * page_size;
+    if (aio_capacity_ < std::min(batch.size(), aio_window)) {
+        if (aio_pages_) free_pages(aio_pages_);
+        aio_capacity_ = aio_window;
+        aio_pages_ = alloc_pages(aio_capacity_ * slot);
+        if (aio_pages_ == nullptr) { aio_capacity_ = 0; return false; }
+    }
+    std::array<iocb, aio_window> blocks;
+    std::array<iocb*, aio_window> list;
+    std::array<io_event, aio_window> events;
+    for (std::size_t base = 0; base < batch.size(); base += aio_window) {
+        const std::size_t n = std::min(aio_window, batch.size() - base);
+        for (std::size_t i = 0; i < n; ++i) {
+            const auto& r = batch[base + i];
+            if (r.table >= tables_.size() || r.row >= tables_[r.table].rows) throw std::out_of_range("Engram row out of range");
+            const std::uint64_t offset = tables_[r.table].file_offset + r.row * engram_row_bytes;
+            const std::uint64_t first = offset & ~(page_size - 1);
+            const std::uint64_t last = (offset + engram_row_bytes + page_size - 1) & ~(page_size - 1);
+            auto& b = blocks[i];
+            std::memset(&b, 0, sizeof(b));
+            b.aio_data = i;
+            b.aio_lio_opcode = IOCB_CMD_PREAD;
+            b.aio_fildes = static_cast<std::uint32_t>(fd_);
+            b.aio_buf = reinterpret_cast<std::uint64_t>(aio_pages_ + i * slot);
+            b.aio_nbytes = last - first;  // one or two pages
+            b.aio_offset = static_cast<std::int64_t>(first);
+            list[i] = &b;
+        }
+        std::size_t submitted = 0, completed = 0;
+        std::array<bool, aio_window> ok{};
+        while (completed < n) {
+            if (submitted < n) {
+                const long got = ::syscall(SYS_io_submit, aio_, static_cast<long>(n - submitted), list.data() + submitted);
+                if (got > 0) submitted += static_cast<std::size_t>(got);
+                else if (got < 0 && errno != EAGAIN && errno != EINTR) {
+                    if (submitted == 0 && base == 0) return false;  // not supported here: the workers read this batch
+                    throw std::runtime_error("Engram batched read: submit failed: " + std::string(std::strerror(errno)));
+                }
+            }
+            if (submitted == completed) continue;
+            const long got = ::syscall(SYS_io_getevents, aio_, 1L, static_cast<long>(submitted - completed), events.data(), nullptr);
+            if (got < 0) {
+                if (errno == EINTR) continue;
+                throw std::runtime_error("Engram batched read: wait failed: " + std::string(std::strerror(errno)));
+            }
+            for (long e = 0; e < got; ++e) {
+                const std::size_t i = static_cast<std::size_t>(events[static_cast<std::size_t>(e)].data);
+                ok[i] = i < n && events[static_cast<std::size_t>(e)].res == static_cast<std::int64_t>(blocks[i].aio_nbytes);
+            }
+            completed += static_cast<std::size_t>(got);
+        }
+        for (std::size_t i = 0; i < n; ++i) {
+            const auto& r = batch[base + i];
+            const std::size_t dest = destinations.empty() ? base + i : destinations[base + i];
+            if (!ok[i]) {  // a short or failed page read: the positional read of the same pages decides
+                read_one(r, out + dest * engram_row_bytes, aio_pages_ + i * slot);
+                continue;
+            }
+            const std::uint64_t offset = tables_[r.table].file_offset + r.row * engram_row_bytes;
+            std::memcpy(out + dest * engram_row_bytes, aio_pages_ + i * slot + (offset & (page_size - 1)), engram_row_bytes);
+            page_reads_.fetch_add(1, std::memory_order_relaxed);
+            page_bytes_.fetch_add(blocks[i].aio_nbytes, std::memory_order_relaxed);
+        }
+    }
+    return true;
+}
+#else
+bool EngramRowReader::read_batched(std::span<const EngramRowRequest>, std::span<const std::size_t>, std::uint8_t*) { return false; }
+#endif
 
 void EngramRowReader::worker() {
     auto* page = alloc_pages(2 * page_size);
@@ -387,6 +479,7 @@ void EngramRowReader::read(std::span<const EngramRowRequest> requests, std::span
             else { misses.push_back(r); destinations.push_back(i); }
         }
     }
+    if (!read_batched(cache_ ? std::span<const EngramRowRequest>(misses) : requests, destinations, out.data())) {
     std::unique_lock<std::mutex> lock(mutex_);
     batch_ = cache_ ? std::span<const EngramRowRequest>(misses) : requests;
     destinations_ = destinations;
@@ -402,6 +495,7 @@ void EngramRowReader::read(std::span<const EngramRowRequest> requests, std::span
     destinations_ = {};
     out_ = nullptr;
     if (failed_) throw std::runtime_error("Engram batch read failed: " + error_);
+    }
     if (cache_) {
         for (std::size_t j = 0; j < misses.size(); ++j) {
             const auto& r = misses[j];

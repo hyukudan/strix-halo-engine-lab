@@ -361,6 +361,8 @@ Follow the link for the gain, preconditions and off switch. Defaults are shorten
 | `STRIX_DIST_USB4_EAGER` | deepseek | auto | [ds-transport](optimizations.md#ds-transport) |
 | `STRIX_DS41_CE_PACING` | deepseek-rtx | ON | [rtx-ce-pacing](optimizations.md#rtx-ce-pacing) |
 | `STRIX_DS41_ENGRAM_TP` | deepseek | on for steps of up to 8 rows | [ds-engram-tp](optimizations.md#ds-engram-tp) |
+| `STRIX_DS41_ENGRAM_READY` | deepseek | on | [ds-engram-tp](optimizations.md#ds-engram-tp) |
+| `STRIX_DS41_ENGRAM_AIO` | deepseek | on | [ds-engram-tp](optimizations.md#ds-engram-tp) |
 | `STRIX_DS41_EXPERT_TP` | deepseek | ON | [ds-core](optimizations.md#ds-core) |
 | `STRIX_DS41_F16_PAIR` | deepseek | ON | [ds-core](optimizations.md#ds-core) |
 | `STRIX_DS41_TP_DOWN` | deepseek | ON | [ds-core](optimizations.md#ds-core) |

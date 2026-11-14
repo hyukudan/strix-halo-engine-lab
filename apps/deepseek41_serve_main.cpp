@@ -1146,6 +1146,43 @@ struct StepTokenDigest {
 };
 StepTokenDigest g_step_tokens;
 
+// Per-rank step profile by rows of the step, printed when the rank stops: where a step's wall time goes on each rank
+// (inside the exchanges with the peer, Engram row reads and the wait for them) and the routed-expert work it did
+// (experts touched per layer, weight bytes read), so the two ranks can be compared without a profiler.
+struct StepProfile {
+    struct Bin {
+        std::uint64_t steps = 0, unions = 0, layers = 0, expert_bytes = 0;
+        double seconds = 0.0, exchange = 0.0, engram_read = 0.0, engram_wait = 0.0;
+    };
+    std::array<Bin, BatchForward::extended_max_rows + 1U> bins{};
+    void add(const strix::deepseek41::BatchStepStats& s) {
+        if (s.rows >= bins.size()) return;
+        auto& b = bins[s.rows];
+        ++b.steps;
+        b.seconds += s.seconds;
+        b.exchange += s.exchange_seconds;
+        b.engram_read += s.engram_seconds;
+        b.engram_wait += s.engram_wait_seconds;
+        for (const auto u : s.union_experts) b.unions += u;
+        b.layers += s.union_experts.size();
+        b.expert_bytes += s.expert_bytes;
+    }
+    void print(std::uint32_t rank) const {
+        for (std::size_t r = 1; r < bins.size(); ++r) {
+            const auto& b = bins[r];
+            if (b.steps < 16U) continue;
+            const double n = static_cast<double>(b.steps);
+            std::fprintf(stderr,
+                         "rank %u: step profile rows %zu steps %llu step_ms %.2f exchange_ms %.2f engram_read_ms %.2f engram_wait_ms %.2f "
+                         "experts_per_layer %.2f expert_mb_per_step %.1f expert_mb_per_row %.1f\n",
+                         rank, r, static_cast<unsigned long long>(b.steps), 1e3 * b.seconds / n, 1e3 * b.exchange / n, 1e3 * b.engram_read / n,
+                         1e3 * b.engram_wait / n, b.layers ? static_cast<double>(b.unions) / static_cast<double>(b.layers) : 0.0,
+                         static_cast<double>(b.expert_bytes) / n / 1e6, static_cast<double>(b.expert_bytes) / n / 1e6 / static_cast<double>(r));
+        }
+    }
+};
+StepProfile g_step_profile;
+
 std::string plans_since_ready() {
     const auto now = strix::ds41::trellis_plan_stats();
     char b[96];
@@ -1503,6 +1540,7 @@ void follow(const Args& initial, BatchForward& fwd, Watchdog& dog, const Prefill
         if (spec) spec->follow_lookup_windows(c.pend);  // for follow_stage of these rows (after this step)
         const auto& tokens = stage ? stage->step(rows) : fwd.step(rows);
         g_step_tokens.add(tokens);
+        g_step_profile.add(fwd.last_stats());
         last_rows.assign(rows.begin(), rows.end());
         spec_rows = last_rows;
         last_tokens = tokens;
@@ -2751,6 +2789,7 @@ void lead(const Args& initial, BatchForward& fwd, strix::dist::Communicator& com
         if (stage && !pre) stage->submit(plan.rows);
         const auto& tokens = stage ? stage->step(plan.rows) : fwd.step(plan.rows);
         g_step_tokens.add(tokens);
+        g_step_profile.add(fwd.last_stats());
         dog.progress();
         last_round = Clock::now();
         hetero_step_seconds = std::chrono::duration<double>(last_round - t0).count();
@@ -3499,6 +3538,7 @@ void run_rank(Args a, std::uint32_t rank, std::unique_ptr<strix::dist::Transport
     std::fprintf(stderr, "rank %u: %s\n", rank, plans_since_ready().c_str());
     std::fprintf(stderr, "rank %u: step tokens %llu digest %016llx\n", rank, static_cast<unsigned long long>(g_step_tokens.tokens),
                  static_cast<unsigned long long>(g_step_tokens.hash));
+    g_step_profile.print(rank);
     serve::Json stopped = serve::Json::object();
     stopped.set("event", serve::Json("STOPPED"));
     stopped.set("rank", serve::Json(static_cast<std::uint64_t>(rank)));

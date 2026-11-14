@@ -96,6 +96,12 @@ private:
     struct PayloadCache;
     void worker();
     void read_one(const EngramRowRequest& request, std::uint8_t* out, std::uint8_t* page);
+    // One batched submission of every missing row's page read (Linux native AIO on the O_DIRECT descriptor), instead of
+    // waking the worker threads for a few hundred 4 KiB reads per step. 0: not available, the workers read.
+    bool read_batched(std::span<const EngramRowRequest> batch, std::span<const std::size_t> destinations, std::uint8_t* out);
+    unsigned long aio_ = 0;
+    std::uint8_t* aio_pages_ = nullptr;
+    std::size_t aio_capacity_ = 0;
     int fd_ = -1;
     bool direct_ = false;
     std::uint64_t file_bytes_ = 0;

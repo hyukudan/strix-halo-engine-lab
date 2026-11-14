@@ -284,6 +284,8 @@ public:
     // views in place and call publish_staged_block. No HIP calls in start/finish/
     // release on this path. prepare returns {} for routes/sizes not admitted.
     [[nodiscard]] ProducerStage prepare_staged_ready(hipStream_t stream, std::size_t bytes);
+    // The largest payload one ready view takes (0: no ready views); callers split larger exchanges into chunks.
+    [[nodiscard]] std::size_t staged_ready_capacity() const noexcept { return staged_ready_bytes_ < max_bytes_ ? staged_ready_bytes_ : max_bytes_; }
     void start_staged_ready(hipStream_t stream, std::size_t bytes, const Tag& tag);
     [[nodiscard]] ConsumerStage finish_staged_ready();
     void release_staged_ready(hipStream_t stream);

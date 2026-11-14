@@ -94,6 +94,7 @@ struct BatchStepStats {
     std::uint32_t rows = 0, segments = 0;
     double seconds = 0.0;           // wall time of the step, inputs to tokens on the host
     double engram_seconds = 0.0;    // Engram row reads
+    double engram_wait_seconds = 0.0;  // the step blocked on its Engram rows (asynchronous reads not there yet)
     double exchange_seconds = 0.0;  // inside the communicator (world 2)
     // per layer: the routed experts of this rank used by the step's rows (the union), and the most rows one of them
     // served; filled every step (copied asynchronously, read after the step)
