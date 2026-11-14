@@ -695,16 +695,16 @@ Apply the measured 255 bitmask for overlap, row loops, headless work and persist
 
 ### Batched MTP predictor priming
 
-**Engine:** `qwen`. **Control:** `STRIX_MTP_PRIME_ROWS`. **Default:** ON (`STRIX_MTP_PRIME_ROWS=0` disables).
+**Engine:** `qwen`. **Control:** `STRIX_MTP_PRIME_ROWS`. **Default:** ON (`STRIX_MTP_PRIME_ROWS=0` disables). **Batch size:** `STRIX_MTP_PRIME_BATCH=64`, clamped to 8..128; `8` restores the original batch sizes. Both controls are cached; restart the process.
 
-The tiled MTP prompt primes the predictor cache for each finished block in batches of up to 8 rows per launch instead of one row at a time: token embedding, draft input fusion, draft attention HC mix, index-key/K/V projections, key norm/RoPE and the validated cache publish. Every row keeps the one-row kernels' arithmetic; rows read the target hidden in place and the last row of each call keeps the one-row path.
+The tiled MTP prompt primes the predictor cache for each finished block in batches of up to the selected batch size per launch instead of one row at a time: token embedding, draft input fusion, draft attention HC mix, index-key/K/V projections, key norm/RoPE and the validated cache publish. The wider route reuses the original per-row bodies and eight-row HC/cache-projection tiles; its compiler/native bitwise validation is pending. Each row retains the same operation order; rows read the target hidden in place and the last row of each call keeps the one-row path.
 
 - **Preconditions:** MTP route with a tiled prompt and the production draft chain (non-exact draft, Q4 input-projection copy, HC rows kernels on and persistent HC off, 16-byte aligned HC workspace). Other configurations keep the one-row loop.
-- **Automatic selection:** Enabled when unset or exactly `1`; `0` disables (other explicit values retain the one-row path). If the 8-row scratch cannot be allocated, the one-row loop runs.
+- **Automatic selection:** Enabled when unset or exactly `1`; `0` disables (other explicit values retain the one-row path). Scratch uses P times the aligned per-row layout. If allocation fails, retry eight slots, then use the one-row loop. Decode/draft batch structs remain capped at eight.
 - **Fallback notice:** None; the one-row loop is the fallback.
-- **Exactness evidence:** Same binary, 262,144-token prompt: end-of-prompt state digest (target state, predictor KV/index rows, held row), terminal FP32 logits digest, generation lineage digest, generated tokens and MTP acceptance counters equal with the switch on and off. Rows are published in order, so a failing row stops the later ones as before.
+- **Exactness evidence (original eight-row route only):** Same binary, 262,144-token prompt: end-of-prompt state digest (target state, predictor KV/index rows, held row), terminal FP32 logits digest, generation lineage digest, generated tokens and MTP acceptance counters equal with the switch on and off. Rows are published in order, so a failing row stops the later ones as before.
 - **Off switch:** STRIX_MTP_PRIME_ROWS=0 (restart the process)
-- **Measured gain:** MTP-route prompt at 262,144 tokens (YaRN f2, T8192, one node): 210.9–213.2 → 202.8–203.8 s, −8.1 to −10.0 s in three pairs; decode unchanged.
+- **Measured gain (original eight-row route only; no wider-batch timing claim):** MTP-route prompt at 262,144 tokens (YaRN f2, T8192, one node): 210.9–213.2 → 202.8–203.8 s, −8.1 to −10.0 s in three pairs; decode unchanged.
 
 <a id="qwen-qsa-attend-batch"></a>
 

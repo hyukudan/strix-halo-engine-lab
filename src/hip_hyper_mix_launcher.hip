@@ -1,3 +1,4 @@
+#include "strix/hip_mtp_prime_rows.hpp"
 #include "strix/env_flags.hpp"
 #include "strix/hip_qwen_dpp_reduce.hpp"
 #include "strix/hip_mtp_fast_draft.hpp"
@@ -1739,15 +1740,29 @@ template<typename Pointer> __device__ __forceinline__ Pointer tiled(Pointer poin
 struct HyperTileRows : HyperRows {
     std::uint32_t tiles; // tiles per block of the kernels that loop over tiles (grid z = all tiles / tiles)
 };
+// Priming tiles retain the incumbent eight-row bodies; only the last tile may be partial.
+struct HyperPrimeTileRows : HyperRows {std::uint32_t count;};
+static_assert(sizeof(HyperPrimeTileRows)==360U);
+template<class Rows> __device__ __forceinline__ unsigned hyper_tile_count(const Rows& rows,unsigned count) {
+    if constexpr (std::is_same_v<Rows,HyperPrimeTileRows>) {
+        const auto remaining=rows.count-blockIdx.z*kWindowRows;
+        return remaining<kWindowRows?remaining:kWindowRows;
+    } else return count;
+}
+
 template <typename Pointer> __device__ __forceinline__ Pointer tiled(Pointer pointer, std::uint64_t, const HyperRows&,
     std::uint32_t = 0U) {
     return pointer;
 }
-template <typename Pointer> __device__ __forceinline__ Pointer tiled(Pointer pointer, std::uint64_t stride, const HyperTileRows&,
-    std::uint32_t tile = blockIdx.z) {
+template <typename Pointer> __device__ __forceinline__ Pointer hyper_tiled_pointer(Pointer pointer,std::uint64_t stride,
+    std::uint32_t tile) {
     const auto offset = static_cast<std::uint64_t>(tile) * stride;
     return pointer ? reinterpret_cast<Pointer>(reinterpret_cast<std::uintptr_t>(pointer) + offset) : pointer;
 }
+template <typename Pointer> __device__ __forceinline__ Pointer tiled(Pointer pointer, std::uint64_t stride, const HyperTileRows&,
+    std::uint32_t tile = blockIdx.z) {return hyper_tiled_pointer(pointer,stride,tile);}
+template <typename Pointer> __device__ __forceinline__ Pointer tiled(Pointer pointer,std::uint64_t stride,const HyperPrimeTileRows&,
+    std::uint32_t tile = blockIdx.z) {return hyper_tiled_pointer(pointer,stride,tile);}
 template <class Rows> __device__ __forceinline__ std::uint32_t looped_tiles(const Rows& rows) {
     if constexpr (std::is_same_v<Rows, HyperTileRows>) return rows.tiles; else return 1U;
 }
@@ -1755,6 +1770,8 @@ template <class Rows> __device__ __forceinline__ std::uint32_t looped_tiles(cons
 template <typename Storage, class Rows = HyperRows, bool Recompute = false>
 __global__ void rows_prepare_hyper_norm_kernel(Rows rows, const void* norm, std::uint32_t norm_type,
     std::uint32_t hidden, float epsilon, float* recompute_inverse) {
+    if constexpr (std::is_same_v<Rows,HyperPrimeTileRows>)
+        if(blockIdx.z*kWindowRows+blockIdx.y>=rows.count)return;
     const auto stream = blockIdx.x;
     const auto* input = static_cast<const Storage*>(tiled(rows.input[blockIdx.y], rows.tile_input, rows));
     auto* normalized = tiled(rows.normalized[blockIdx.y], rows.tile_normalized, rows);
@@ -2024,6 +2041,7 @@ __device__ __forceinline__ void rows_splitk_hyper_lane_dots(const Rows& rows, un
 template <unsigned R, class Rows = HyperRows, bool Q6 = false>
 __global__ __launch_bounds__(512) void rows_splitk_hyper_projection_kernel(Rows rows, unsigned count,
     const void* __restrict__ down, unsigned streams, unsigned rank, const void* __restrict__ inject, unsigned low_blocks) {
+    count=hyper_tile_count(rows,count);
     __shared__ float red[hyper_row_capacity<Rows>][16][R];
     const unsigned lane=threadIdx.x%32U,tile=threadIdx.x/32U;
     const bool is_inject=blockIdx.x>=low_blocks;
@@ -2202,6 +2220,7 @@ __device__ __forceinline__ std::uint64_t lane_chain_codes(const unsigned char* r
 template <typename Storage, std::uint32_t Count = 0U, class Rows = HyperRows, bool Q6 = false>
 __global__ void rows_lane_chain_hyper_output_kernel(Rows rows, std::uint32_t count, const void* up,
     std::uint32_t hidden, std::uint32_t streams, std::uint32_t rank) {
+    count=hyper_tile_count(rows,count);
     extern __shared__ __align__(16) unsigned char staging[];
     const auto lane=threadIdx.x&31U,stream=threadIdx.x/32U;
     const std::uint64_t first=static_cast<std::uint64_t>(blockIdx.x)*32U;
@@ -6944,9 +6963,31 @@ bool hip_mtp_hyper_mix_draft_rows_supported() {
     static const bool persistent=strix::envcfg::flag("STRIX_MTP_HC_PERSISTENT", false);
     return rows_kernels && !persistent;
 }
-void enqueue_hip_mtp_hyper_mix_q8_rows(const HipMtpHyperDraftRows& views,std::uint32_t count,const float* norm,const void* down,
+namespace {
+template<class Rows> void enqueue_mtp_hyper_rows(const Rows& rows,std::uint32_t count,const float* norm,const void* down,
     const float* inject,const void* up,float epsilon,void* raw_stream) {
     constexpr unsigned h=2560U,streams=4U,rank=320U;
+    const auto stream=static_cast<hipStream_t>(raw_stream);
+    const auto per_tile=std::min(count,kWindowRows);
+    const auto tiles=(count+kWindowRows-1U)/kWindowRows;
+    check_hip(hipPeekAtLastError(),"MTP draft HC batch prior HIP error");
+    hipLaunchKernelGGL(HIP_KERNEL_NAME(rows_prepare_hyper_norm_kernel<std::uint16_t,Rows>),dim3(streams,per_tile,tiles),dim3(kThreads),0,stream,
+        rows,static_cast<const void*>(norm),0U,h,epsilon, nullptr);
+    check_hip(hipGetLastError(),"MTP draft HC batch normalization");
+    constexpr unsigned outputs=2U,blocks=(rank+outputs-1U)/outputs;
+    hipLaunchKernelGGL(HIP_KERNEL_NAME(rows_splitk_hyper_projection_kernel<outputs,Rows>),
+        dim3(blocks+(inject?(streams+outputs-1U)/outputs:0U),1U,tiles),dim3(512U),0,stream,rows,count,down,streams,rank,
+        static_cast<const void*>(inject),blocks);
+    check_hip(hipGetLastError(),"MTP draft HC batch split-K projection");
+    const auto lds=lane_chain_hyper_output_lds(streams,rank)+static_cast<std::uint64_t>(per_tile-1U)*streams*32U*sizeof(float);
+    hipLaunchKernelGGL(HIP_KERNEL_NAME(rows_lane_chain_hyper_output_kernel<std::uint16_t,0U,Rows>),dim3(h/32U,1U,tiles),dim3(32U*streams),
+        static_cast<std::size_t>(lds),stream,rows,count,up,h,streams,rank);
+    check_hip(hipGetLastError(),"MTP draft HC batch lane-chain output");
+}
+}
+void enqueue_hip_mtp_hyper_mix_q8_rows(const HipMtpHyperDraftRows& views,std::uint32_t count,const float* norm,const void* down,
+    const float* inject,const void* up,float epsilon,void* raw_stream) {
+    constexpr unsigned h=2560U,streams=4U;
     if(!count || count>kWindowRows || !raw_stream || !norm || !down || !up || !hip_mtp_hyper_mix_draft_rows_supported() ||
        (inject && reinterpret_cast<std::uintptr_t>(inject)%16U))
         throw std::invalid_argument("MTP draft HC batch views, size, stream or configuration are invalid");
@@ -6958,20 +6999,26 @@ void enqueue_hip_mtp_hyper_mix_q8_rows(const HipMtpHyperDraftRows& views,std::ui
         rows.input[t]=views.input[t];rows.output[t]=views.output[t];
         rows.normalized[t]=views.workspace[t];rows.low[t]=views.workspace[t]+h*streams;rows.injection[t]=views.injection[t];
     }
-    const auto stream=static_cast<hipStream_t>(raw_stream);
-    check_hip(hipPeekAtLastError(),"MTP draft HC batch prior HIP error");
-    hipLaunchKernelGGL(HIP_KERNEL_NAME(rows_prepare_hyper_norm_kernel<std::uint16_t,HyperRows>),dim3(streams,count),dim3(kThreads),0,stream,
-        rows,static_cast<const void*>(norm),0U,h,epsilon, nullptr);
-    check_hip(hipGetLastError(),"MTP draft HC batch normalization");
-    constexpr unsigned outputs=2U,blocks=(rank+outputs-1U)/outputs;
-    hipLaunchKernelGGL(HIP_KERNEL_NAME(rows_splitk_hyper_projection_kernel<outputs,HyperRows>),
-        dim3(blocks+(inject?(streams+outputs-1U)/outputs:0U)),dim3(512U),0,stream,rows,count,down,streams,rank,
-        static_cast<const void*>(inject),blocks);
-    check_hip(hipGetLastError(),"MTP draft HC batch split-K projection");
-    const auto lds=lane_chain_hyper_output_lds(streams,rank)+static_cast<std::uint64_t>(count-1U)*streams*32U*sizeof(float);
-    hipLaunchKernelGGL(HIP_KERNEL_NAME(rows_lane_chain_hyper_output_kernel<std::uint16_t,0U,HyperRows>),dim3(h/32U),dim3(32U*streams),
-        static_cast<std::size_t>(lds),stream,rows,count,up,h,streams,rank);
-    check_hip(hipGetLastError(),"MTP draft HC batch lane-chain output");
+    enqueue_mtp_hyper_rows(rows,count,norm,down,inject,up,epsilon,raw_stream);
+}
+void enqueue_hip_mtp_hyper_mix_q8_prime_rows(const HipMtpHyperPrimeRows& views,std::uint32_t count,const float* norm,
+    const void* down,const float* inject,const void* up,float epsilon,void* raw_stream) {
+    constexpr unsigned h=2560U,streams=4U;
+    if(!count || count>hip_mtp_prime_rows_max || !raw_stream || !norm || !down || !up ||
+       !hip_mtp_hyper_mix_draft_rows_supported() || (inject && reinterpret_cast<std::uintptr_t>(inject)%16U) ||
+       !views.input.base || !views.output.base || !views.workspace.base || views.workspace.base%16U ||
+       views.workspace.stride%16U || !views.input.stride || !views.output.stride || !views.workspace.stride ||
+       (inject && !views.injection.stride) || (inject==nullptr)!=(views.injection.base==0U))
+        throw std::invalid_argument("MTP draft HC prime batch views are invalid");
+    HyperPrimeTileRows rows{};rows.count=count;
+    for(std::uint32_t t=0;t<std::min(count,kWindowRows);++t) {
+        rows.input[t]=reinterpret_cast<const void*>(views.input[t]);rows.output[t]=reinterpret_cast<void*>(views.output[t]);
+        rows.normalized[t]=reinterpret_cast<float*>(views.workspace[t]);rows.low[t]=rows.normalized[t]+h*streams;
+        rows.injection[t]=inject?reinterpret_cast<float*>(views.injection[t]):nullptr;
+    }
+    rows.tile_input=kWindowRows*views.input.stride;rows.tile_output=kWindowRows*views.output.stride;
+    rows.tile_normalized=kWindowRows*views.workspace.stride;rows.tile_injection=kWindowRows*views.injection.stride;
+    enqueue_mtp_hyper_rows(rows,count,norm,down,inject,up,epsilon,raw_stream);
 }
 void launch_hip_mtp_hyper_mix_draft_rows(std::span<const MtpNativeContext> contexts,MtpHyperRole role,const float* inject_f32,
     void* raw_stream) {
