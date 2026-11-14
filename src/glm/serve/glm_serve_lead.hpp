@@ -120,6 +120,8 @@ struct LeadConfig {
     // engine's max_rows), `prefill_units_layers` units per piece (strix/session/prefill_session.hpp LayerUnits).
     std::uint32_t prefill_units_rows = 0;
     std::uint32_t prefill_units_layers = 45;
+    // Engine admission for all pieces of the remaining prompt; absent means token chunks.
+    std::function<bool(std::uint64_t)> prefill_units_admit;
     // 1: one `prefill-timeline` line per chunked prompt on stderr.
     unsigned prefill_timeline = 0;
     bool prefill_chunk_mtp = true;   // false: MTP-bootstrap prompts are prefilled whole (only plain prompts chunk)
@@ -564,7 +566,8 @@ private:
         // Each call runs the base chunk's work in layer units of the current piece (LayerUnits::base_units) through
         // the same pacer; grouping is capped at one base-equivalent: a layer unit has no per-call pass to amortize.
         // A prompt that fits one base chunk keeps the token call (one call either way).
-        if (p.units || (cfg_.prefill_units_rows != 0 && p.a.mtp_ok && p.chunk != 0 && lanes != 0 && n - p.done > p.chunk)) {
+        if (p.units || (cfg_.prefill_units_rows != 0 && p.a.mtp_ok && p.chunk != 0 && lanes != 0 && n - p.done > p.chunk &&
+                        cfg_.prefill_units_admit && cfg_.prefill_units_admit(n - p.done))) {
             const bool start = !p.units;
             if (start) {
                 const strix::session::LayerUnits lu{n - p.done, cfg_.prefill_units_rows, cfg_.prefill_units_layers};
@@ -913,6 +916,9 @@ private:
             return import_fallback(false, mine == failed ? "rank0_staging_failed" : peer == failed ? "rank1_staging_failed"
                                           : rtx_down    ? "rtx_unavailable"
                                                         : "timeout");
+        // Keep receiving/reporting while another prompt owns the engine session, even between pieces.
+        // The import's suffix starts a new prefill session; only the lead may order that on both ranks.
+        if (pf_ && pf_->units) return;
         commit_import(waited);
     }
 

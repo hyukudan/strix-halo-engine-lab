@@ -1,0 +1,7 @@
+cmake_minimum_required(VERSION 3.24)
+project(strix_pr601_host LANGUAGES CXX)
+include(CTest)
+add_subdirectory(../pr590_host pr590)
+add_test(NAME pr601-unit-geometry COMMAND glm_owner_existing_cpu_tests --audit601-geometry)
+add_test(NAME pr601-import-deferral COMMAND glm_owner_existing_cpu_tests --audit601-import)
+set_tests_properties(pr601-unit-geometry pr601-import-deferral PROPERTIES TIMEOUT 60)

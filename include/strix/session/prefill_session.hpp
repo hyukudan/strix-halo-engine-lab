@@ -43,6 +43,15 @@ struct LayerUnits {
         return valid() ? (rows + piece_rows - 1U) / piece_rows : 0U;
     }
     [[nodiscard]] constexpr std::uint64_t total() const noexcept { return pieces() * layers; }
+    // Admission must cover every piece, including the short tail, before a session starts.
+    // Full pieces share one geometry; checking it and the tail is sufficient.
+    template<class Pausable>
+    [[nodiscard]] constexpr bool all_pieces_pausable(Pausable pausable) const {
+        if (!valid()) return false;
+        if (!pausable(static_cast<std::uint32_t>(std::min<std::uint64_t>(rows, piece_rows)))) return false;
+        const auto tail = static_cast<std::uint32_t>(rows % piece_rows);
+        return rows <= piece_rows || tail == 0 || pausable(tail);
+    }
     // Rows of the piece unit `u` belongs to (the last piece may be short).
     [[nodiscard]] constexpr std::uint64_t piece_rows_at(std::uint64_t u) const noexcept {
         if (!valid() || u >= total()) return 0;

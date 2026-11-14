@@ -2548,6 +2548,10 @@ struct Engine::Impl {
         if (pf_seqpar && xfer::seqpar_admits(R)) return true;
         return opt.pf_pipeline != 2 && !kv_shard;
     }
+    bool prefill_units_admit(std::uint64_t rows) const {
+        const strix::session::LayerUnits lu{rows, static_cast<std::uint32_t>(std::max<std::size_t>(1, opt.max_rows)), opt.layers};
+        return opt.prefill_units && lu.all_pieces_pausable([this](std::uint32_t r) { return unit_pausable(r); });
+    }
     RowSet row_set() const { return {X, X2, F, hz, hrr, mix, xc, xn, part, hfin, hidden, rlog, wts, ids, tok_d, slot_d, pos_d}; }
     void set_rows(const RowSet& s) {
         X = s.X, X2 = s.X2, F = s.F, hz = s.hz, hrr = s.hrr, mix = s.mix, xc = s.xc, xn = s.xn, part = s.part;
@@ -2606,6 +2610,8 @@ struct Engine::Impl {
         if (n == 0) throw std::invalid_argument("prefill_mtp_advance: zero units");
         if (n < units.total - units.done && !opt.prefill_units)
             throw std::logic_error("prefill units need Options::prefill_units (the reserved decode row window)");
+        if (n < units.total - units.done && !prefill_units_admit(units.tokens.size()))
+            throw std::logic_error("prefill units need pausable geometry for every piece");
         unit_resume();
         try {
             const std::span<const std::uint32_t> tokens(units.tokens);
@@ -3090,6 +3096,7 @@ bool Engine::prefill_mtp_advance(std::uint32_t units, Exchange::MergeCtl& ctl, M
 }
 void Engine::prefill_mtp_cancel() { impl_->prefill_mtp_cancel(); }
 std::uint32_t Engine::prefill_units_done() const { return impl_->units.done; }
+bool Engine::prefill_units_admit(std::uint64_t rows) const { return impl_->prefill_units_admit(rows); }
 std::uint32_t Engine::prefill_units_total() const { return impl_->units.total; }
 bool Engine::prefill_units_active() const { return impl_->units.active; }
 std::vector<std::uint32_t> Engine::step(std::span<const Row> rows) { return impl_->step(rows); }

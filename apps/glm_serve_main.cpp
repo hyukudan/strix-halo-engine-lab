@@ -1222,6 +1222,7 @@ int main(int argc, char** argv) {
         lc.prefill_chunk_mtp = prefill_chunk_mtp;
         lc.prefill_units_rows = opt.prefill_units && prefill_chunk_mtp ? opt.max_rows : 0U;  // max_rows after admission
         lc.prefill_units_layers = opt.layers;
+        lc.prefill_units_admit = [&eng](std::uint64_t rows) { return eng.prefill_units_admit(rows); };
         lc.mtp = mtp_on;
         lc.mtp_cycles = mtp_cycles;
         lc.g2 = g2_on;

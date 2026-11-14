@@ -473,9 +473,12 @@ public:
     // the call that completes the prompt runs the head and the drafter seed (`ctl` is used only then) and returns true
     // with `out` as prefill_mtp's. Pausing inside a piece needs Options::prefill_units: while paused, calls of other
     // slots (<= 8 rows) run in the reserved decode window. prefill_mtp == begin + advance(~0U): same bits.
+    // Partial advances require prefill_units_admit(tokens.size()); otherwise use whole calls/token chunks.
     void prefill_mtp_begin(std::uint32_t slot, std::span<const std::uint32_t> tokens, std::uint64_t pos0);
     bool prefill_mtp_advance(std::uint32_t units, Exchange::MergeCtl& ctl, MtpPrefillOut& out);
     void prefill_mtp_cancel();
+    // True only when every piece can honor an exact layer-unit budget.
+    [[nodiscard]] bool prefill_units_admit(std::uint64_t rows) const;
     [[nodiscard]] std::uint32_t prefill_units_done() const;
     [[nodiscard]] std::uint32_t prefill_units_total() const;
     [[nodiscard]] bool prefill_units_active() const;

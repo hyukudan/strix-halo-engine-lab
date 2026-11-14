@@ -348,6 +348,7 @@ struct FakeEng {
                 frontier[s] = t.size();
             },
             [&]() -> std::uint32_t {
+                if (mtp && units_open) throw std::runtime_error("fake import suffix: prefill session still open");
                 if (pipe) {  // the engine's argmax over both ranks: a rank alone here would wait for its peer forever
                     const std::uint32_t mine = tok(h[s]);
                     std::uint32_t peer = 0;
@@ -374,6 +375,7 @@ struct FakeEng {
         if (expected_id == id) expected_status = static_cast<std::uint32_t>(gs::ImportStatus::failed);
     }
     std::uint32_t prefill_mtp(std::uint32_t s, std::span<const std::uint32_t> t, std::uint64_t pos0, bool last) {
+        if (units_open) throw std::runtime_error("fake prefill: prefill session still open");
         const auto y0 = prefill(s, t, pos0);
         log.back() += last ? " mtp last" : " mtp";
         if (last) {
@@ -391,6 +393,7 @@ struct FakeEng {
     std::uint64_t units_pos = 0, units_done = 0, units_total = 0;
     bool units_open = false;
     unsigned units_cancelled = 0, units_delay_us = 0;
+    std::function<void()> units_advanced;
     std::uint32_t prefill_units(std::uint32_t s, std::span<const std::uint32_t> t, std::uint64_t pos0, bool start, std::uint32_t n) {
         if (n == 0) {
             if (!units_open) throw std::runtime_error("fake units: cancel without a session");
@@ -415,6 +418,7 @@ struct FakeEng {
         log.push_back("units " + std::to_string(s) + " +" + std::to_string(n));
         if (units_delay_us) std::this_thread::sleep_for(std::chrono::microseconds(units_delay_us));
         units_done = std::min<std::uint64_t>(units_done + n, units_total);
+        if (units_advanced) units_advanced();
         if (units_done < units_total) return gs::kPrefillPending;
         units_open = false;
         return prefill_mtp(units_slot, units_tokens, units_pos, true);
@@ -679,7 +683,125 @@ void queued_successor_interleave() {
 
 }  // namespace
 
+// Host protocol regressions: geometry decline and imports ready inside/between pieces.
+// These checks cover ordering/accounting, not native residual/logit/state equality.
+void audit601_regressions(bool imports) {
+    const unsigned cases = imports ? 2U : 4U;
+    for (unsigned variant = 0; variant < cases; ++variant) {
+        Loopback lb;
+        FakeEng e(4), e1(4);
+        e.stops = e1.stops = false;
+        e.delay_us = e1.delay_us = 500;
+        e.unit_rows = e1.unit_rows = imports ? 256U : 8192U;
+        e.unit_layers = e1.unit_layers = imports ? 4U : 45U;
+        std::atomic<bool> hold{true};
+        std::atomic<unsigned> ready_ranks{0};
+        if (imports) {
+            e.hold = e1.hold = &hold;
+            const auto hook = [&](FakeEng& f) {
+                // One unit: inside a piece; four units: exactly between pieces, still active.
+                if (f.unit_calls.size() == (variant == 0 ? 1U : 4U) && ready_ranks.fetch_add(1) == 1)
+                    hold.store(false);
+            };
+            // Callbacks outlive this block: retain the hook by value.
+            e.units_advanced = [&, hook] { hook(e); };
+            e1.units_advanced = [&, hook] { hook(e1); };
+        }
+        gs::Channel ch(lb.side(0), 0), c1(lb.side(1), 1);
+        std::thread follower([&] { gs::follow(e1, c1, hello_for(4, 32768, 2), 4, 32768); });
+        ch.hello(hello_for(4, 32768, 2));
+        sv::GenerationQueue queue(8);
+        gs::LeadConfig lc;
+        lc.slots = 4;
+        lc.capacity = 32768;
+        lc.mtp = true;
+        lc.short_first = false;
+        lc.prefill_chunk = imports ? 64U : 512U;
+        lc.prefill_units_rows = e.unit_rows;
+        lc.prefill_units_layers = e.unit_layers;
+        lc.prefill_units_admit = [&](std::uint64_t rows) {
+            const strix::session::LayerUnits lu{rows, e.unit_rows, e.unit_layers};
+            // Pipeline 2: seqpar pauses only even pieces; disabled seqpar cannot pause any.
+            return lu.all_pieces_pausable([&](std::uint32_t r) { return imports || (variant != 2 && r >= 2 && r % 2 == 0); });
+        };
+        if (imports) {
+            lc.rtx_prefill = [](std::span<const std::uint32_t>, std::uint32_t) { return true; };
+            lc.import_min_tokens = 100;
+            lc.import_listen_grace_s = 0;
+        }
+        std::atomic<bool> stop{false};
+        gs::Lead<FakeEng> lead(e, ch, queue, lc, stop);
+        std::thread runner([&] { lead.loop(); });
+        auto submit = [&](std::size_t rows, std::uint32_t token, std::uint32_t count) {
+            sv::GenerationJob j;
+            j.prompt.assign(rows, token);
+            j.max_tokens = count;
+            return queue.submit(std::move(j));
+        };
+        auto a = submit(16, 3, 400);
+        bool done_a = false;
+        auto tokens_a = a->wait(std::chrono::milliseconds(100), done_a);
+        while (tokens_a.empty() && !done_a) tokens_a = a->wait(std::chrono::milliseconds(100), done_a);
+        auto b = imports ? submit(300, 7, 6) : nullptr;
+        // Odd single piece; odd multi-piece tail; seqpar disabled on even rows; supported control.
+        const std::size_t rows = imports ? 640U : variant == 0 ? 8191U : variant == 1 ? 16383U : 8192U;
+        auto c = submit(rows, 9, 6);
+        auto drain = [](const auto& ticket) {
+            std::vector<std::uint32_t> tokens;
+            bool done = false;
+            while (!done) {
+                auto next = ticket->wait(std::chrono::milliseconds(100), done);
+                tokens.insert(tokens.end(), next.begin(), next.end());
+            }
+            return tokens;
+        };
+        const auto tokens_c = drain(c);
+        const auto tokens_b = b ? drain(b) : std::vector<std::uint32_t>{};
+        const auto rest_a = drain(a);
+        tokens_a.insert(tokens_a.end(), rest_a.begin(), rest_a.end());
+        stop.store(true);
+        runner.join();
+        follower.join();
+        auto plain = [](std::size_t n, std::uint32_t token, std::size_t count) {
+            FakeEng f(1);
+            f.stops = false;
+            f.reset(0);
+            const std::vector<std::uint32_t> prompt(n, token);
+            std::vector<std::uint32_t> out{f.prefill(0, prompt, 0)};
+            while (out.size() < count) {
+                const gs::WireRow row{0, out.back(), f.frontier[0]};
+                out.push_back(f.step({&row, 1})[0]);
+            }
+            return out;
+        };
+        CHECK(tokens_a == plain(16, 3, 400));
+        CHECK(tokens_c == plain(rows, 9, 6));
+        CHECK(e.log == e1.log && !e.units_open && !e1.units_open);
+        if (imports) {
+            CHECK(ready_ranks.load() == 2 && !hold.load());
+            CHECK(tokens_b == plain(300, 7, 6));
+            CHECK(b->stats().imported_tokens == 299 && lead.stats().imports == 1);
+            CHECK(!e.unit_calls.empty() && e.dropped.empty() && e1.dropped.empty());
+            std::size_t last_unit = 0, imported = 0;
+            unsigned decode_between = 0;
+            for (std::size_t i = 0; i < e.log.size(); ++i) {
+                if (e.log[i].rfind("units ", 0) == 0) last_unit = i;
+                if (e.log[i].rfind("import ", 0) == 0) imported = i;
+                if (last_unit != 0 && imported == 0 && e.log[i].rfind("step", 0) == 0) ++decode_between;
+            }
+            CHECK(imported > last_unit && decode_between > 0);
+        } else {
+            CHECK(e.unit_calls.empty() == (variant != 3));
+        }
+        std::printf("audit601 %s variant %u: completed both ranks\n", imports ? "import deferral" : "geometry admission", variant);
+    }
+}
+
 int main(int argc, char** argv) {
+    if (argc == 2 && (std::string(argv[1]) == "--audit601-geometry" || std::string(argv[1]) == "--audit601-import")) {
+        audit601_regressions(std::string(argv[1]) == "--audit601-import");
+        return failures == 0 ? 0 : 1;
+    }
     if (argc == 2 && std::string(argv[1]) == "--interleave-only") {
         queued_successor_interleave();
         return failures == 0 ? 0 : 1;
@@ -1800,6 +1922,7 @@ int main(int argc, char** argv) {
             lc.prefill_chunk = 64;
             lc.prefill_units_rows = 256;
             lc.prefill_units_layers = 45;
+            lc.prefill_units_admit = [](std::uint64_t) { return true; };
             lc.prefill_timeline = 1;
             std::atomic<bool> stop{false};
             gs::Lead<FakeEng> lead(e, ch, queue, lc, stop);
