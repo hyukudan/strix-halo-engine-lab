@@ -2212,7 +2212,8 @@ PrefillResult DevicePrefill::run_from(std::span<const std::uint32_t> tokens, std
                 v.out = m.ekv.p;
                 ds41::enqueue_engram_f16_rows(v, st);
                 ds41::enqueue_engram_inject(stream_now() + std::size_t{r0} * stream_row, m.ekv.p, m.devf(p + "engram_q_norm.weight"),
-                                            m.devf(p + "engram_k_norm.weight"), n, H, 1e-20F, st);
+                                            m.devf(p + "engram_k_norm.weight"), n, H, 1e-20F, st,
+                                            m.image_rows_set ? m.image_rows.p + r0 : nullptr);  // image rows: gate 0 (upstream)
             }
             for (; engram_cut < engram_most; ++engram_cut) cut(PrefillUnitLevel::finest, s.layer, "engram.pad");
             if (!m.overlap) check(hipStreamSynchronize(st), "engram");  // overlap: pinned rows, alive until the run's end
