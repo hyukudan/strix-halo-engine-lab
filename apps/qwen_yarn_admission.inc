@@ -43,6 +43,9 @@ inline constexpr std::array yarn_environment_rules{
     YarnEnvironmentRule{"HIP_ENABLE_DEFERRED_LOADING", YarnEnvironmentClass::nonrotary, ""},
     YarnEnvironmentRule{"STRIX_PREFILL_INDEX_PROJ_WMMA", YarnEnvironmentClass::nonrotary, ""},
     YarnEnvironmentRule{"STRIX_PREFILL_INDEX_SCORE_WMMA", YarnEnvironmentClass::nonrotary, ""},
+    // Candidate ON paths have not been audited for YaRN; OFF preserves existing arithmetic.
+    YarnEnvironmentRule{"STRIX_PREFILL_PLE_ROWS_F16", YarnEnvironmentClass::off_switch, "0"},
+    YarnEnvironmentRule{"STRIX_PREFILL_GDN_GATES_F16", YarnEnvironmentClass::off_switch, "0"},
     // STRIX_QWEN_ALLON (include/strix/qwen_allon.hpp) only fills the per-lever variables that are still unset, before
     // main; it has no execution effect of its own. Each variable it exports is classified by its own row, so a lever
     // this table refuses is named in the refusal instead of the profile switch.

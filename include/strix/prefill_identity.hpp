@@ -82,6 +82,13 @@ inline PrefillIdentityOverride& prefill_identity_override() {
 
 inline unsigned prefill_option_bit(PrefillOption option) { return 1U << static_cast<unsigned>(option); }
 
+// Apply after resolving controls or removing route options, before publishing an identity.
+inline unsigned normalize_prefill_options(unsigned mask) {
+    if (!(mask & prefill_option_bit(PrefillOption::gdn_fp16_chunk)))
+        mask &= ~(kPrefillGdnChunkRev3 | prefill_option_bit(PrefillOption::gdn_gates_f16));
+    return mask & (kPrefillOptionsReady | kPrefillOptionsCandidates | kPrefillGdnChunkRev3);
+}
+
 // Command line: --prefill-exact-fp16 and --prefill-disable a,b. Call before the first prefill (the mask is read per call).
 inline void set_prefill_identity_override(bool exact, unsigned disabled) {
     auto& o = detail::prefill_identity_override();
@@ -121,7 +128,7 @@ inline unsigned resolve_prefill_options(Get get, bool exact = false, unsigned di
         }
         if (value && value[0] == '0') mask &= ~bit;
     }
-    return mask;
+    return normalize_prefill_options(mask);
 }
 
 // The active set: environment, then the command line override.
@@ -129,9 +136,7 @@ inline unsigned prefill_options_active() {
     unsigned mask = resolve_prefill_options([](const char* name) { return std::getenv(name); });
     const auto& o = detail::prefill_identity_override();
     if (o.set) mask = o.exact ? 0U : mask & ~o.disabled;
-    // gdn_gates_f16 runs only inside the gdn_fp16_chunk route: without it the identity does not name it.
-    if (!(mask & prefill_option_bit(PrefillOption::gdn_fp16_chunk))) mask &= ~(kPrefillGdnChunkRev3 | prefill_option_bit(PrefillOption::gdn_gates_f16));
-    return mask & (kPrefillOptionsReady | kPrefillOptionsCandidates | kPrefillGdnChunkRev3);
+    return normalize_prefill_options(mask);
 }
 inline bool prefill_option_enabled(PrefillOption option) { return (prefill_options_active() & prefill_option_bit(option)) != 0U; }
 
