@@ -44,7 +44,9 @@
 //   const uint16_t* value_t_lo(const Args&, kv_head, d) lo terms of value_t(), same layout
 // Q, K, V and P are carried as hi + lo and every product runs as hi.hi + hi.lo + lo.hi into the same FP32 chain
 // (lo.lo, about 2^-22 relative, is dropped): 3x the QK and PV WMMA, operand error 2^-11 -> about 2^-17 (f16).
-// The denominator sums hi + lo of p. LDS adds 16 x (D + 8) x 2 + D x 32 B; Q lo stays in registers.
+// The denominator sums hi + lo of p. LDS adds 16 x (D + 8) x 2 + D x 32 B (K, V^T lo) + waves x 16 x (D + 8) x 2 B:
+// the Q lo terms sit in LDS (wave-private rows, read per key tile) so the 192-VGPR cap holds the hi state without
+// spilling (in registers: 32 VGPRs spilled at D 64).
 // rows() is __host__ __device__. Launch: launch<P>(args, heads, stream, workspace, splits) - grid (row blocks, heads / Group, splits), longest
 // blocks first; workspace_floats(rows, heads, D, splits) FP32 when splits > 1.
 #include <hip/hip_runtime.h>
@@ -87,11 +89,12 @@ __device__ __forceinline__ void flash_body(typename P::Args a, float* ws, unsign
     constexpr auto O = P::kOp;
     constexpr bool Two = terms_of<P>::value == 2U;
     static_assert(terms_of<P>::value == 1U || Two, "kTerms is 1 or 2");
-    static_assert(S::lds_bytes + (Two ? 16 * KP * 2 + D * 16 * 2 : 0) <= 65536, "LDS budget (two-term)");
+    static_assert(S::lds_bytes + (Two ? 16 * KP * 2 + D * 16 * 2 + S::waves * 16 * KP * 2 : 0) <= 65536, "LDS budget (two-term)");
     __shared__ __attribute__((aligned(16))) std::uint16_t ks[16 * KP];
     __shared__ __attribute__((aligned(16))) std::uint16_t vs[D * 16];
     [[maybe_unused]] __shared__ __attribute__((aligned(16))) std::uint16_t ks_lo[Two ? 16 * KP : 8];
     [[maybe_unused]] __shared__ __attribute__((aligned(16))) std::uint16_t vs_lo[Two ? D * 16 : 8];
+    [[maybe_unused]] __shared__ __attribute__((aligned(16))) std::uint16_t qs_lo[Two ? S::waves * 16 * KP : 8];  // [wave][row][D]
     __shared__ __attribute__((aligned(16))) float part[S::waves * 16 * SP];
     const unsigned tid = threadIdx.x, lane = tid & 31U, wave = tid >> 5, rr = lane & 15U, hw = lane >> 4;
     const unsigned tile = wave / S::split, piece = wave % S::split;
@@ -117,14 +120,17 @@ __device__ __forceinline__ void flash_body(typename P::Args a, float* ws, unsign
     const unsigned d0 = piece * S::slice;
     bool bad_half = false;
     Frag qf[F];
-    [[maybe_unused]] Frag qf_lo[Two ? F : 1];
+    [[maybe_unused]] std::uint16_t* const q_lo = &qs_lo[Two ? (wave * 16U + rr) * KP + d0 : 0U];  // this lane's row
     {
         const float* q = live ? P::query(a, my_row, head) + d0 : nullptr;
         constexpr unsigned short exponent = O == tile::Operand::f16 ? 0x7c00U : 0x7f80U;
 #pragma unroll
         for (unsigned f = 0; f < F; ++f) {
             qf[f] = live ? tile::frag_from_f32<O>(q + 16U * f) : Frag{};
-            if constexpr (Two) qf_lo[f] = live ? tile::frag_lo_from_f32<O>(q + 16U * f) : Frag{};
+            if constexpr (Two) {  // both half-waves hold the row; one stores it (read after the first barrier)
+                const Frag lo = live ? tile::frag_lo_from_f32<O>(q + 16U * f) : Frag{};
+                if (hw == 0U) __builtin_memcpy(q_lo + 16U * f, &lo, 32U);
+            }
 #pragma unroll
             for (unsigned i = 0; i < 16; ++i) bad_half |= (qf[f][i] & exponent) == exponent;
         }
@@ -183,12 +189,12 @@ __device__ __forceinline__ void flash_body(typename P::Args a, float* ws, unsign
                     const unsigned at = rr * KP + d0 + 16U * f;
                     const Frag kh = tile::frag32(&ks[at]);
                     s = tile::mma<O>(qf[f], tile::frag32(&ks_lo[at]), s);
-                    s = tile::mma<O>(qf_lo[f], kh, s);
+                    s = tile::mma<O>(tile::frag32(q_lo + 16U * f), kh, s);
                     s = tile::mma<O>(qf[f], kh, s);
                     if (f + 1 < F) {
                         const Frag kh1 = tile::frag32(&ks[at + 16U]);
                         s1 = tile::mma<O>(qf[f + 1], tile::frag32(&ks_lo[at + 16U]), s1);
-                        s1 = tile::mma<O>(qf_lo[f + 1], kh1, s1);
+                        s1 = tile::mma<O>(tile::frag32(q_lo + 16U * f + 16U), kh1, s1);
                         s1 = tile::mma<O>(qf[f + 1], kh1, s1);
                     }
                 } else {
