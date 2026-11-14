@@ -877,15 +877,11 @@ int main(int argc, char** argv) {
         // fixed fallback.
         rank_args.push_back("--decode");
         rank_args.push_back("1");
-        if (!serve_mtp) {
-            rank_args.push_back("--mtp-spec");
-            rank_args.push_back("0");
-        }
-        const auto request = rd::scan(rank_args);
+        const auto request = rd::scan(rd::serve_request_args(rank_args, serve_mtp));
         auto eff = rd::resolve(request, rd::process_env(), rd::probe_model_mtp(argv[1]));
         rd::fallback_without_handshake(eff, request, rd::process_env());
         const bool mtp_on = eff.mtp_spec.value == "1" && (eff.prefill == "gemv" || eff.prefill == "ref");
-        if (rd::max_rows_auto(eff)) eff.max_rows = {std::to_string(rd::kFallbackMaxRows), "auto-4096-serve"};
+        rd::serve_adjust(eff);
         if (!deployment.file.empty() || deployment.check) {
             opt.mtp = mtp_on; opt.spec = mtp_on;
             std::string refusal;

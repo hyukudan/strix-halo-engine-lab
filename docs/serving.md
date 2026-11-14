@@ -42,6 +42,23 @@ router or its control channel; the two-node DeepSeek ranks exchange tensors over
 (pipeline stage TCP port) and the expert servers talk plain TCP: none of these carry authentication, so they must
 stay on a direct cable or a private network.
 
+## Server and CLI resolve the same configuration
+
+A server with one request must run what the engine's CLI runs. Each family has one resolver that both entry points
+call; `strix-serve-cli-parity-tests` (host, no GPU) resolves the same plain request through both and fails on any
+difference that is not listed in `tests/serve_cli_parity_tests.cpp` with the reason serving requires it, and on any
+listed difference that no longer exists. `strix-serve-cli-parity-tests --print` prints both resolved configurations
+side by side. The Qwen pair of entry points is covered by `strix-qwen-effective-config-tests`.
+
+To measure the result, run the server and the CLI on the same build and prompt and report the ratio (exit 1 below
+`--min-ratio`, default 0.99, or when the produced tokens differ):
+
+```
+python3 tools/serve_cli_ratio.py server --url http://127.0.0.1:PORT --prompt-ids IDS.txt --out server.json
+python3 tools/serve_cli_ratio.py cli --family qwen --out cli.json cli-run1.log cli-run2.log cli-run3.log
+python3 tools/serve_cli_ratio.py report server.json cli.json
+```
+
 ## Further reading
 
 - [Serving over HTTP](engine/serving/serving.md): request contracts, batched decoding, default prompt prefill,
