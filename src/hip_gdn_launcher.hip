@@ -1146,6 +1146,7 @@ struct GdnInputTiledSite {
         static_cast<void>(q8_rows::segment_row(segments, out, width, m, row));
         reinterpret_cast<float*>(output0[m] + r * output_stride)[row] = round_bf16(value);
     }
+    static constexpr unsigned dense_vector_store = 1U;  // STRIX_QPF2K_DENSE_VEC_SITES bit 1 (default on)
     bool vector_store_supported() const {
         if (output_stride % 16U || outputs % 4U) return false;
         for (unsigned m = 0; m < segments.count; ++m)
@@ -1176,6 +1177,19 @@ struct GdnInputTiled16Site {
         static_cast<void>(q8_rows::segment_row(segments, out, width, m, row));
         output[r * output_stride + (m ? z_offset + row : row)] = float_to_bf16(value);
     }
+    // Vector epilogue (STRIX_QPF2K_DENSE_VEC_SITES bit 64): the four BF16 words of 4 outputs of one segment in one 8-byte store.
+    static constexpr unsigned dense_vector_store = 64U;
+    bool vector_store_supported() const {
+        if (reinterpret_cast<std::uintptr_t>(output) % 8U || output_stride % 4U || outputs % 4U || z_offset % 4U) return false;
+        for (unsigned m = 0; m < segments.count; ++m) if (segments.first[m] % 4U) return false;
+        return true;
+    }
+    __device__ void store4(std::uint32_t out, std::uint32_t r, q8_rows::tiled::f4 value) const {
+        unsigned m; std::uint32_t row;
+        static_cast<void>(q8_rows::segment_row(segments, out, width, m, row));
+        q8_rows::tiled::store4_u16(output + r * output_stride + (m ? z_offset + row : row),
+            float_to_bf16(value.x), float_to_bf16(value.y), float_to_bf16(value.z), float_to_bf16(value.w));
+    }
 };
 struct GdnOutputTiledSite {
     using Input = float;
@@ -1187,6 +1201,14 @@ struct GdnOutputTiledSite {
     std::uint64_t output_stride;
     __device__ void store(std::uint32_t out, std::uint32_t r, float value) const {
         reinterpret_cast<std::uint16_t*>(output0 + r * output_stride)[out] = float_to_bf16(value);
+    }
+    // Vector epilogue (STRIX_QPF2K_DENSE_VEC_SITES bit 2); the launcher takes it only with the pinned lean form (the
+    // unpinned FP16-scratch form spills with it).
+    static constexpr unsigned dense_vector_store = 2U;
+    bool vector_store_supported() const { return q8_rows::tiled::bf16_store4_ok(output0, output_stride, outputs); }
+    __device__ void store4(std::uint32_t out, std::uint32_t r, q8_rows::tiled::f4 value) const {
+        q8_rows::tiled::store4_u16(reinterpret_cast<std::uint16_t*>(output0 + r * output_stride) + out,
+            float_to_bf16(value.x), float_to_bf16(value.y), float_to_bf16(value.z), float_to_bf16(value.w));
     }
 };
 

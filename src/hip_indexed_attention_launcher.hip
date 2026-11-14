@@ -4149,9 +4149,25 @@ struct QsaInputTiledSite {
         static_cast<void>(q8_rows::segment_row(segments, out, width, m, row));
         reinterpret_cast<float*>(output0[m] + r * output_stride)[row] = round_bf16(value);
     }
+    // Vector epilogue (STRIX_QPF2K_DENSE_VEC_SITES bit 4): 4 outputs of one segment, BF16-rounded FP32, one 16-byte store.
+    static constexpr unsigned dense_vector_store = 4U;
+    bool vector_store_supported() const {
+        if (output_stride % 16U || outputs % 4U) return false;
+        for (unsigned m = 0; m < segments.count; ++m)
+            if (reinterpret_cast<std::uintptr_t>(output0[m]) % 16U || segments.first[m] % 4U) return false;
+        return true;
+    }
+    __device__ void store4(std::uint32_t out, std::uint32_t r, q8_rows::tiled::f4 value) const {
+        unsigned m; std::uint32_t row;
+        static_cast<void>(q8_rows::segment_row(segments, out, width, m, row));
+        const q8_rows::tiled::f4 rounded{round_bf16(value.x), round_bf16(value.y), round_bf16(value.z), round_bf16(value.w)};
+        *reinterpret_cast<q8_rows::tiled::f4*>(output0[m] + r * output_stride + 4ULL * row) = rounded;
+    }
 };
 template <class InputType = float> struct QsaOutputTiledSite {
     using Input = InputType;
+    // STRIX_QPF2K_DENSE_VEC_SITES bit 8 / STRIX_QPF2K_DENSE_LEAN_SITES bit 8 (lean pinned form 4; BF16 input rows only).
+    static constexpr unsigned dense_vector_store = 8U, dense_lean_site = 8U;
     const unsigned char* input0;
     std::uint64_t input_stride;
     q8_rows::Segments segments;
@@ -4160,6 +4176,11 @@ template <class InputType = float> struct QsaOutputTiledSite {
     std::uint64_t output_stride;
     __device__ void store(std::uint32_t out, std::uint32_t r, float value) const {
         reinterpret_cast<std::uint16_t*>(output0 + r * output_stride)[out] = float_to_bf16(value);
+    }
+    bool vector_store_supported() const { return q8_rows::tiled::bf16_store4_ok(output0, output_stride, outputs); }
+    __device__ void store4(std::uint32_t out, std::uint32_t r, q8_rows::tiled::f4 value) const {
+        q8_rows::tiled::store4_u16(reinterpret_cast<std::uint16_t*>(output0 + r * output_stride) + out,
+            float_to_bf16(value.x), float_to_bf16(value.y), float_to_bf16(value.z), float_to_bf16(value.w));
     }
 };
 

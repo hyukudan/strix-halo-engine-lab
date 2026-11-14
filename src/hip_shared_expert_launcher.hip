@@ -1655,6 +1655,7 @@ struct SharedGateUpTiledSite {
 };
 struct SharedDownTiledSite {
     using Input = float;
+    static constexpr unsigned dense_lean_site = 32U;  // STRIX_QPF2K_DENSE_LEAN_SITES bit 32: FP16-scratch A form 4 (DENSE_FORM=4: -20 %)
     const unsigned char* input0;  // the workspace rows: activation [intermediate] then the shared gate
     std::uint64_t input_stride;
     q8_rows::Segments segments;
