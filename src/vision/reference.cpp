@@ -2,6 +2,7 @@
 // reference tower (the fixture oracle; slow by design: double accumulation, no approximation anywhere).
 #include "strix/vision/encoder.hpp"
 
+#include "../attn_core/two_term_model.hpp"
 #include "encoder_layout.hpp"
 #include "strix/env_flags.hpp"
 
@@ -374,12 +375,16 @@ EncoderOutput reference_encode(const EncoderConfig& c, const EncoderWeights& w, 
                     rotate(c, &qkv[r * 3U * W + h * D], &p.angles[r * (D / 2U)]);
                     rotate(c, &qkv[r * 3U * W + W + h * D], &p.angles[r * (D / 2U)]);
                 }
-        if (m.any_attention())  // the flash core's Q, K, V operands (qkv is read by the attention only)
+        if (m.any_attention() && !m.attn_order)  // the flash core's Q, K, V operands (qkv is read by the attention only)
             for (std::size_t r = 0; r < N; ++r)
                 for (std::size_t i = 0; i < 3U * W; ++i) {
                     float& v = qkv[r * 3U * W + i];
                     v = round_f16_terms(v, i < W ? m.attn_q : i < 2U * W ? m.attn_k : m.attn_v);
                 }
+        // The core's constant: FP32 1/sqrt(D) times FP32 log2(e), rounded once more (the policy's kScaleLog2).
+        const float scale_log2 = static_cast<float>(1.0 / std::sqrt(static_cast<double>(D))) * 1.44269504088896341F;
+        std::vector<attn_core::model::Terms> qkv_terms(m.attn_order ? qkv.size() : 0U);
+        for (std::size_t i = 0; i < qkv_terms.size(); ++i) qkv_terms[i] = attn_core::model::split(qkv[i], attn_core::model::Format::f16, m.attn_q);
         std::size_t begin = 0;
         for (const unsigned end : tiles) {
             const std::size_t nk = end - begin;
@@ -388,6 +393,13 @@ EncoderOutput reference_encode(const EncoderConfig& c, const EncoderWeights& w, 
                 for (std::size_t r = begin + r0; r < begin + r1; ++r)
                     for (std::size_t h = 0; h < H; ++h) {
                         const float* q = &qkv[r * 3U * W + h * D];
+                        if (m.attn_order) {  // the dense core's three products and their order (two_term_model.hpp)
+                            const auto at = [&](std::size_t j, std::size_t part) { return &qkv_terms[(begin + j) * 3U * W + part * W + h * D]; };
+                            attn_core::model::dense_row(
+                                &qkv_terms[r * 3U * W + h * D], static_cast<unsigned>(nk), [&](unsigned j) { return at(j, 1U); }, [&](unsigned j) { return at(j, 2U); },
+                                static_cast<unsigned>(D), scale_log2, m.attn_q, attn_core::model::Format::f16, &att[r * W + h * D]);
+                            continue;
+                        }
                         double top = -std::numeric_limits<double>::infinity();
                         for (std::size_t j = 0; j < nk; ++j) {
                             const float* k = &qkv[(begin + j) * 3U * W + W + h * D];

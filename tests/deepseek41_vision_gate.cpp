@@ -3,7 +3,7 @@
 //
 //   strix-deepseek41-vision-gate --model FILE.gguf --ref DIR [--backend host|hip] [--only a,b]
 //                                [--host-max-patches N] [--split | --no-split] [--attn-terms 1|2] [--unpinned] [--diagnose a,b]
-//                                [--dump DIR] [--rounding none|linear|attention|both|attention2|both2|attention:QKVP]
+//                                [--dump DIR] [--rounding none|linear|attention|both|attention2|both2|attention:QKVP|order1|order2]
 //
 // --dump writes this backend's rows (BF16 values as FP32) and tower output beside the reference names, so two
 // backends can be compared row by row. --rounding (host only, diagnostic) runs the FP32 reference with the device's
@@ -340,6 +340,8 @@ int run(int argc, char** argv) {
     if (rounding == "attention" || rounding == "both") model_rounding.attention(1U);
     if (rounding == "attention2" || rounding == "both2") model_rounding.attention(2U);
     model_rounding.linear_inputs_f16 = model_rounding.linear_inputs_f16 || rounding == "both2";
+    // order1 / order2: the dense core's real products and their order (ReferenceRounding::attn_order).
+    if (rounding == "order1" || rounding == "order2") model_rounding.attention_order(rounding == "order2" ? 2U : 1U);
     if (rounding.rfind("attention:", 0) == 0 && rounding.size() == 14U) {  // attention:QKVP, FP16 terms per operand (0, 1, 2)
         unsigned char* t[4] = {&model_rounding.attn_q, &model_rounding.attn_k, &model_rounding.attn_v, &model_rounding.attn_p};
         for (unsigned i = 0; i < 4U; ++i) {
@@ -349,7 +351,7 @@ int run(int argc, char** argv) {
         }
     }
     if (rounding != "none" && !model_rounding.any())
-        throw std::invalid_argument("--rounding none|linear|attention|both|attention2|both2|attention:QKVP");
+        throw std::invalid_argument("--rounding none|linear|attention|both|attention2|both2|attention:QKVP|order1|order2");
     if (device && model_rounding.any()) throw std::invalid_argument("--rounding models the device on the host backend");
     if (model_rounding.any()) std::printf("rounding model %s (diagnostic, not a gate result)\n", rounding.c_str());
     if (!backend) backend = std::make_unique<vision::ReferenceEncoder>(cfg, weights, model_rounding);

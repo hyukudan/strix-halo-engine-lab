@@ -30,7 +30,8 @@ template <Operand O> __device__ __forceinline__ float operand_value(std::uint16_
     else return static_cast<float>(__builtin_bit_cast(_Float16, b));
 }
 // Two-term operand: hi = to_operand(x), lo = to_operand(x - hi) (the remainder is exact in FP32); the value is
-// hi + lo, an operand rounding error of about 2^-17 (f16) / 2^-15 (bf16) relative instead of 2^-11 / 2^-8.
+// hi + lo. Error <= max(u^2 |x|, h) instead of max(u |x|, h) (u = 2^-11 f16, 2^-8 bf16; h = half the smallest
+// subnormal step, f16 2^-25): relative only while x - hi is a normal number of the format (two_term_model.hpp).
 // The one mechanism of the two-term paths: online_step_split, sparse_flash_keysplit (Split), dense core (kTerms 2).
 struct Terms2 {
     std::uint16_t hi, lo;

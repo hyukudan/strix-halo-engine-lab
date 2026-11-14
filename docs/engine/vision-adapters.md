@@ -162,8 +162,13 @@ V alone 0.99996, P alone 0.999998. The rounding of the outlier's query, amplifie
 
 The tower attention therefore carries Q, K, V and P as two FP16 terms by default (hi + lo, lo = the FP16 rounding of
 the remainder; the shared mechanism `tile::to_operand2` that the key-split sparse core already uses). Every product
-runs as hi.hi + hi.lo + lo.hi, so the operand error drops from about 2^-11 to about 2^-17 at three times the attention
-WMMA. Host model with two terms: row 40 at 0.999998; device: 0.999800, and all seven images pass at the unchanged
+runs as hi.hi + hi.lo + lo.hi, at three times the attention WMMA. The gain is conditioned on format and range, not a
+fixed figure: per FP16 operand the error goes from max(2^-11 |x|, 2^-25) to max(2^-22 |x|, 2^-25), so per product
+from about 2^-10 |ab| to about 3 x 2^-22 |ab| while the remainders are normal FP16 (|x| above about 2^-3); smaller
+values keep the 2^-25 absolute floor and below 2^-14 two terms equal one. The FP32 WMMA chain adds about 2^-24 per
+step relative to the sum of |a_i b_i|, so a score with cancellation keeps a large relative error in both forms.
+`src/attn_core/two_term_model.hpp` holds the bounds and a host model of the three products in the core's order
+(gate `--rounding order1|order2`); the operand-only model (`--rounding attention:QKVP`) stays as the diagnostic. Host model with two terms: row 40 at 0.999998; device: 0.999800, and all seven images pass at the unchanged
 threshold.
 
 | Switch | Value | Rows | Cost on the minimum image (1,550 patches, steady) |

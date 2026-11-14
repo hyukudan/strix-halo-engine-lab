@@ -43,7 +43,10 @@
 //   const uint16_t* key_lo(const Args&, pos, kv_head)   lo terms of key(), same layout (tile::to_operand2)
 //   const uint16_t* value_t_lo(const Args&, kv_head, d) lo terms of value_t(), same layout
 // Q, K, V and P are carried as hi + lo and every product runs as hi.hi + hi.lo + lo.hi into the same FP32 chain
-// (lo.lo, about 2^-22 relative, is dropped): 3x the QK and PV WMMA, operand error 2^-11 -> about 2^-17 (f16).
+// (lo.lo dropped): 3x the QK and PV WMMA. Per product, about 2u |ab| -> 3u^2 |ab| (f16 u = 2^-11: 2^-10 -> 2^-20.4)
+// while the remainders are normal f16; below that a 2^-25 absolute floor, and no gain for |x| < 2^-14. The FP32
+// chain adds about 2^-24 x sum |a_i b_i| per WMMA step, so cancellation is not covered. Bounds and a host model of
+// these products in this order: two_term_model.hpp.
 // The denominator sums hi + lo of p. LDS adds 16 x (D + 8) x 2 + D x 32 B; Q lo stays in registers.
 // rows() is __host__ __device__. Launch: launch<P>(args, heads, stream, workspace, splits) - grid (row blocks, heads / Group, splits), longest
 // blocks first; workspace_floats(rows, heads, D, splits) FP32 when splits > 1.

@@ -8,8 +8,9 @@
 // Keys/values are used as stored (bf16 caches).
 // Split = true (two-term operands): queries and probabilities are carried as hi + lo, each rounded to the operand
 // type (lo = the rounding remainder of hi), and both products run once per term (32 WMMA per tile instead of 16).
-// The operand rounding error drops from 2^-9 to about 2^-17 relative; the result is still not the exact kernel's
-// bytes (summation order, exp2).
+// bf16 operand error max(2^-8 |x|, h) -> max(2^-16 |x|, h) (bf16 keeps FP32's range, so h is negligible): about
+// 2^-7 -> 3 x 2^-16 |ab| per product (two_term_model.hpp); the result is still not the exact kernel's bytes
+// (summation order, exp2), and cancellation in a score is not covered by either form.
 //
 // Shape: one work-group = one query row (16 query heads) = 4 waves. The row's key list is cut into 16-key tiles and
 // wave w owns tiles w, w + 4, ...: a complete flash step per tile inside the wave, no barrier in the key loop.

@@ -7,7 +7,8 @@
 // (attn_core/dense_flash_prefill.hpp) under a non-causal policy: mask::bidir_* gives every row a window of n logical
 // keys and the policy backs logical key p with physical key p % n, so the causal core computes full bidirectional
 // attention unchanged. The attention operands Q, K, V, P are hi + lo FP16 terms by default (the core's kTerms 2:
-// hi.hi + hi.lo + lo.hi per product, operand error ~2^-17 instead of 2^-11; 3x the attention WMMA); attention_terms
+// hi.hi + hi.lo + lo.hi per product, ~3 x 2^-22 |ab| instead of ~2^-10 |ab| for normal f16 remainders, 2^-25
+// absolute below; bounds in attn_core/two_term_model.hpp; 3x the attention WMMA); attention_terms
 // 1 is the one-term form. Norms, activations, rotary rotation, residual and the softmax stay FP32.
 // Buffers: encoder_layout.hpp (the same numbers plan() reports). Input pads of the GEMM (in % 128) are zero columns.
 #include "strix/vision/encoder.hpp"

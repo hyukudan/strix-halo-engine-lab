@@ -2,6 +2,7 @@
 // invariants), default positions, the device plan, the embed cache and the row splice. No GPU, no checkpoint.
 #include "strix/vision/embed_cache.hpp"
 
+#include "../src/attn_core/two_term_model.hpp"
 #include "../src/vision/encoder_layout.hpp"
 #include "vision_encoder_toy.hpp"
 
@@ -478,16 +479,61 @@ void test_plan() {
     CHECK(geometry(odd, 16, 32, {}).compact);
 }
 
-// The device-rounding model of the attention operands (ReferenceRounding attn_*): one FP16 term carries a relative
-// operand error up to 2^-11, hi + lo up to about 2^-22; on a tower whose scores are large (ill-conditioned softmax),
-// the two-term form tracks FP32 far closer than the one-term form (the device's default vs its faster switch).
+// The shared two-term model (src/attn_core/two_term_model.hpp): its RNE agrees with the reference's own FP16
+// rounding; split errors and product errors stay inside the format- and range-conditioned bounds (f16 and bf16,
+// normal remainders, subnormal remainders, subnormal values, near overflow); below 2^-14 two terms gain nothing.
+void test_two_term_model() {
+    namespace tm = strix::attn_core::model;
+    std::uint64_t s = 0x9E3779B97F4A7C15ULL;
+    const auto next = [&s] {
+        s ^= s << 13U;
+        s ^= s >> 7U;
+        s ^= s << 17U;
+        return s;
+    };
+    std::vector<float> xs = {0.0F, 1.0F, -1.0F, 0.1F, 1e-3F, 6.1e-5F, 0x1p-14F, 0x1.8p-15F, 3e-8F, 65504.0F, 65519.0F, 0.33333334F};
+    for (int i = 0; i < 4000; ++i) {  // log-uniform magnitudes 2^-30 .. 2^15, both signs
+        const double e = static_cast<double>(next() % 45000U) / 1000.0 - 30.0;
+        const double m = 1.0 + static_cast<double>(next() % 1000000U) / 1e6;
+        xs.push_back(static_cast<float>((next() & 1U ? -m : m) * std::exp2(e)));
+    }
+    unsigned gain_lost = 0;
+    for (const float x : xs) {
+        CHECK(tm::round_operand(x, tm::Format::f16) == round_to_f16(x));
+        CHECK(round_f16_terms(x, 2U) == tm::split(x, tm::Format::f16, 2U).hi + tm::split(x, tm::Format::f16, 2U).lo);
+        for (const tm::Format f : {tm::Format::f16, tm::Format::bf16}) {
+            for (unsigned terms = 1; terms <= 2U; ++terms) {
+                const tm::Terms t = tm::split(x, f, terms);
+                const double err = std::fabs(static_cast<double>(x) - t.hi - t.lo);
+                CHECK(err <= tm::operand_bound(x, f, terms));
+                const float y = xs[next() % xs.size()];
+                const tm::Terms u = tm::split(y, f, terms);
+                if (std::isfinite(t.hi) && std::isfinite(u.hi))
+                    CHECK(std::fabs(static_cast<double>(x) * y - tm::device_product(t, u)) <= tm::product_bound(x, y, f, terms));
+            }
+        }
+        if (std::fabs(x) < 0x1p-14F) {  // hi subnormal: lo is 0, two terms are one term
+            CHECK(tm::split(x, tm::Format::f16, 2U).lo == 0.0F);
+            ++gain_lost;
+        }
+    }
+    CHECK(gain_lost > 100U);
+    CHECK(std::isinf(tm::split(65520.0F, tm::Format::f16, 2U).hi) && std::isinf(tm::operand_bound(65520.0, tm::Format::f16, 2U)));
+    // The relative two-term figure depends on the format: f16 3 u^2 ~ 2^-20.4, bf16 3 u^2 ~ 2^-14.4 per product.
+    CHECK(tm::product_bound(1.0, 1.0, tm::Format::f16, 2U) < 0x1p-20 && tm::product_bound(1.0, 1.0, tm::Format::bf16, 2U) > 0x1p-15);
+    CHECK(tm::dot_roundings(64U, 1U) == 3U && tm::dot_roundings(64U, 2U) == 7U && tm::dot_roundings(80U, 2U) == 10U);
+}
+
+// The device-rounding models of the attention operands: one FP16 term carries a relative operand error up to 2^-11,
+// hi + lo up to max(2^-22 |x|, 2^-25) (two_term_model.hpp); on a tower whose scores are large (ill-conditioned
+// softmax), the two-term form tracks FP32 far closer than the one-term form (the device's default vs its faster
+// switch), both in the operand model (attn_*) and in the model of the core's real products and order (attn_order).
 void test_attention_terms() {
     for (const float x : {1.0F, 0.1F, -3.14159F, 1e-3F, 6.1e-5F, 1234.567F, 0.33333334F}) {
         CHECK(round_f16_terms(x, 0U) == x);
         CHECK(round_f16_terms(x, 1U) == round_to_f16(x));
         CHECK(std::fabs(round_to_f16(x) - x) <= std::fabs(x) * 0x1p-11F);
-        // hi + lo: 2^-21 relative while lo is a normal FP16 (|x| >= 2^-3); below, lo is subnormal: 2^-25 absolute
-        CHECK(std::fabs(round_f16_terms(x, 2U) - x) <= std::max(std::fabs(x) * 0x1p-21F, 0x1p-25F));
+        CHECK(std::fabs(round_f16_terms(x, 2U) - x) <= std::max(std::fabs(x) * 0x1p-22F, 0x1p-25F));
     }
     EncoderConfig c = base_config();
     c.layers = 1;
@@ -509,9 +555,13 @@ void test_attention_terms() {
         }
         return std::sqrt(num / den);
     };
-    const double e1 = rel(one), e2 = rel(two), eqk = rel(qk);
-    std::printf("attention terms model: relL2 one %.3g two %.3g qk-only %.3g\n", e1, e2, eqk);
+    ReferenceRounding order1, order2;
+    order1.attention_order(1U);
+    order2.attention_order(2U);
+    const double e1 = rel(one), e2 = rel(two), eqk = rel(qk), o1 = rel(order1), o2 = rel(order2);
+    std::printf("attention terms model: relL2 one %.3g two %.3g qk-only %.3g | order model one %.3g two %.3g\n", e1, e2, eqk, o1, o2);
     CHECK(e1 > 0.0 && eqk > 0.0 && e2 < e1 / 64.0);
+    CHECK(o1 > e1 / 4.0 && o1 < e1 * 4.0 && o2 > 0.0 && o2 < o1 / 64.0);
     CHECK(ReferenceEncoder(c, t.w, two).arithmetic() == std::string("vision-ref-f32-rounded"));
 }
 
@@ -770,6 +820,7 @@ int main() {
         test_tiles();
         test_taps_and_types();
         test_plan();
+        test_two_term_model();
         test_attention_terms();
         test_cache();
         test_encode_cached();

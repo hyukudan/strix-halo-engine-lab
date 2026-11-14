@@ -167,9 +167,18 @@ struct ReferenceRounding {
     bool linear_inputs_f16 = false;  // every linear input rounded to FP16 (the single-operand device policy)
     // The flash core's operands Q, K, V and the probabilities P, as FP16 terms per operand: 0 = FP32 (no rounding),
     // 1 = one FP16 term (the one-term attention), 2 = hi + lo (the two-term attention: lo = FP16 of the remainder).
-    // The device's two-term products drop lo x lo (about 2^-22 relative); the model keeps it.
+    // This operand model rounds the operands only: it keeps lo x lo (the device drops it) and multiplies and sums in
+    // FP64 (error bounds by format and range: src/attn_core/two_term_model.hpp).
     unsigned char attn_q = 0, attn_k = 0, attn_v = 0, attn_p = 0;
+    // attn_order: the dense core's real products and order instead (attn_core::model::dense_row: hi.hi + hi.lo +
+    // lo.hi, FP32 chains in the core's step order, online exp2 softmax per 16-key tile), attn_q terms on all four
+    // operands; keys in tile order (the device's cyclic slots and split-K merges are not modelled).
+    bool attn_order = false;
     void attention(unsigned terms) { attn_q = attn_k = attn_v = attn_p = static_cast<unsigned char>(terms); }
+    void attention_order(unsigned terms) {
+        attention(terms);
+        attn_order = true;
+    }
     bool any_attention() const { return attn_q || attn_k || attn_v || attn_p; }
     bool any() const { return linear_inputs_f16 || any_attention(); }
 };
