@@ -140,6 +140,12 @@ struct PrefillMoeGroupView {
 unsigned prefill_moe_group_min_rows();
 std::size_t prefill_moe_group_workspace_bound(std::uint32_t rows);
 void enqueue_prefill_moe_group(const PrefillMoeGroupView& v, void* workspace, std::size_t workspace_bytes, hipStream_t stream);
+// Split form of the group-wide call (same bits): gate/up + finish once for all chunks (out may be null), then one down +
+// combine per chunk on the plan of that chunk in chunk_workspace (the per-chunk device workspace), so the output of a
+// chunk is complete, and its exchange can start, while the down of the next chunk runs.
+void enqueue_prefill_moe_group_gate_up(const PrefillMoeGroupView& v, void* workspace, std::size_t workspace_bytes, hipStream_t stream);
+void enqueue_prefill_moe_group_down(const PrefillMoeGroupView& v, std::uint32_t segment, void* group_workspace,
+                                    void* chunk_workspace, std::size_t chunk_workspace_bytes, hipStream_t stream);
 // The fused FAST_I4 candidate chain for a prompt of total_rows rows (0: capability/opt-in checks). Default on at
 // every length (8K -1.7 %, 32K -0.9 % with the global gate save). STRIX_MOE_I4_CHAIN=0/1 overrides. Same bits.
 bool prefill_i4_chain(std::size_t total_rows = 0);

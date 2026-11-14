@@ -1476,14 +1476,42 @@ void launch_i4_chain(const Tables&,const I4Layer&,const float*,float*,const stri
 #endif
 // The launches of a device-planned call over its tables: gather, gate/up classes, finish, down classes, combine.
 // The class queues hold gu_slot / dn_slot items (DevDims of the plan).
+// Split group call (strix/pair/prefill_group.hpp moe_split): the group-wide plan runs gather + gate/up + finish for all
+// chunks (kPhaseGateUp); each chunk's down + combine then runs on that chunk's own plan (kPhaseDown), reading its down
+// input rows from the group-wide plan's order. A pair is (row, k-th expert of the row in ascending id, or the shared
+// expert), the same in both plans, and both store the down input tile-major by the group's tiled row.
+constexpr unsigned kPhaseGateUp = 1U, kPhaseDown = 2U, kPhaseAll = 3U;
+struct GroupSource {
+    Tables group;   // the group-wide plan's tables (groups, tok_pair, pair_group, at)
+    unsigned row0;  // the chunk's first row in the group
+};
+__global__ __launch_bounds__(256) void group_at_remap_kernel(Tables tc, Tables tg, unsigned row0) {
+    const unsigned wave = threadIdx.x >> 5U, lane = threadIdx.x & 31U;
+    const unsigned q = blockIdx.x * 8U + wave;
+    if (q >= tc.rows * 5U * kIB) return;
+    const unsigned slot = q / kIB, b = q % kIB, tok = slot / 5U, k = slot % 5U, gtok = row0 + tok;
+    const unsigned pc = k < kTopE ? tc.tok_pair[tok * kTopE + k] : tc.groups[tc.shared_group].pair_begin + tok;
+    const unsigned pg = k < kTopE ? tg.tok_pair[gtok * kTopE + k] : tg.groups[tg.shared_group].pair_begin + gtok;
+    const PGroup& gc = tc.groups[tc.pair_group[pc]];
+    const PGroup& gg = tg.groups[tg.pair_group[pg]];
+    const unsigned rc = gc.tbegin + (pc - gc.pair_begin), rg = gg.tbegin + (pg - gg.pair_begin);
+#pragma unroll
+    for (unsigned j = 0; j < 4; ++j) {
+        const unsigned col = b * 128U + lane + 32U * j;
+        tc.at[tiled_at(rc, col, kInter)] = tg.at[tiled_at(rg, col, kInter)];
+    }
+}
 void launch_device_planned(const Tables& t, const float* y, float* out, pfk::Item* items, DevMeta* meta,
                            const std::array<unsigned, 16>& grids, unsigned gu_slot, unsigned dn_slot, bool token_gather,
-                           hipStream_t stream) {
+                           hipStream_t stream, unsigned phases = kPhaseAll) {
     const unsigned T = t.rows;
-    if (token_gather) hipLaunchKernelGGL(gather_transform_token_kernel, dim3((T * kHB + 7) / 8), dim3(256), 0, stream, y, t);
+    if ((phases & kPhaseGateUp) == 0) {
+    } else if (token_gather) hipLaunchKernelGGL(gather_transform_token_kernel, dim3((T * kHB + 7) / 8), dim3(256), 0, stream, y, t);
     else hipLaunchKernelGGL(gather_transform_tiled_kernel, dim3((t.pairs * 2 * kHB + 7) / 8), dim3(256), 0, stream, y, t);
-    launched("gather transform");
-    mark("gather", stream);
+    if ((phases & kPhaseGateUp) != 0) {
+        launched("gather transform");
+        mark("gather", stream);
+    }
     const bool pair = prefill_pipe_pair(T), side = prefill_tail_stream();
         auto queue = [&](unsigned stage, unsigned c) {
         const unsigned qi = stage * 8U + c;
@@ -1508,11 +1536,14 @@ void launch_device_planned(const Tables& t, const float* y, float* out, pfk::Ite
             mark(labels[6], stream);
         }
     };
-    stage(0, kGuLabel);
-    launched("gate/up device plan");
-    hipLaunchKernelGGL(gate_up_finish_tiled_kernel, dim3((t.pairs * kIB + 7) / 8), dim3(256), 0, stream, t, false, g_gufuse_intermediates);
-    launched("gate/up finish");
-    mark("finish", stream);
+    if ((phases & kPhaseGateUp) != 0) {
+        stage(0, kGuLabel);
+        launched("gate/up device plan");
+        hipLaunchKernelGGL(gate_up_finish_tiled_kernel, dim3((t.pairs * kIB + 7) / 8), dim3(256), 0, stream, t, false, g_gufuse_intermediates);
+        launched("gate/up finish");
+        mark("finish", stream);
+    }
+    if ((phases & kPhaseDown) == 0) return;
     stage(1, kDnLabel);
     launched("down device plan");
     hipLaunchKernelGGL(down_combine_kernel, dim3((T * kHB + 7) / 8), dim3(256), 0, stream, t, out);
@@ -1520,9 +1551,11 @@ void launch_device_planned(const Tables& t, const float* y, float* out, pfk::Ite
     mark("combine", stream);
 }
 
-void enqueue_device_moe(const PrefillMoeDeviceView& v, void* workspace, std::size_t workspace_bytes, hipStream_t stream) {
+void enqueue_device_moe(const PrefillMoeDeviceView& v, void* workspace, std::size_t workspace_bytes, hipStream_t stream,
+                        const GroupSource* source = nullptr) {
     const unsigned T = v.rows;
-    if (T == 0 || v.y == nullptr || v.routes == nullptr || v.experts == nullptr || v.out == nullptr)
+    if (source != nullptr && v.i4 != nullptr) throw std::invalid_argument("minimax prefill moe: split group call is EXL3 only");
+    if (T == 0 || (v.y == nullptr && source == nullptr) || v.routes == nullptr || v.experts == nullptr || v.out == nullptr)
         throw std::invalid_argument("minimax prefill moe: invalid device view");
     const DevLayout l = dev_layout(T,v.i4!=nullptr);
     if (workspace == nullptr || workspace_bytes < l.bytes) throw std::invalid_argument("minimax prefill moe: workspace too small");
@@ -1575,18 +1608,25 @@ void enqueue_device_moe(const PrefillMoeDeviceView& v, void* workspace, std::siz
         return;
     }
 #endif
+    if (source != nullptr) {
+        hipLaunchKernelGGL(group_at_remap_kernel, dim3((T * 5U * kIB + 7) / 8), dim3(256), 0, stream, t, source->group, source->row0);
+        launched("group down input");
+        launch_device_planned(t, nullptr, v.out, a.out.items, a.out.meta, grids, kGuSlot, kDnSlot, false, stream, kPhaseDown);
+        return;
+    }
     launch_device_planned(t, v.y, v.out, a.out.items, a.out.meta, grids, kGuSlot, kDnSlot,
                           v.fakeq_a4 == PrefillFakeq::on || prefill_gather_tok(), stream);
 }
 
 // Group-wide call: seg_count -> the planner over all rows with the split-class policy -> the same launches.
-void enqueue_group_moe(const PrefillMoeGroupView& v, void* workspace, std::size_t workspace_bytes, hipStream_t stream) {
+void enqueue_group_moe(const PrefillMoeGroupView& v, void* workspace, std::size_t workspace_bytes, hipStream_t stream,
+                       bool gate_up_only = false) {
     const unsigned T = v.rows, S = v.segments;
     if (S == 0 || S > kPrefillMoeSegments || v.seg_rows == 0 || T <= (S - 1U) * v.seg_rows || T > S * v.seg_rows ||
         T - (S - 1U) * v.seg_rows < prefill_moe_group_min_rows() || v.experts == nullptr)
         throw std::invalid_argument("minimax prefill moe: invalid group view");
     for (unsigned c = 0; c < S; ++c)
-        if (v.y[c] == nullptr || v.routes[c] == nullptr || v.out[c] == nullptr)
+        if (v.y[c] == nullptr || v.routes[c] == nullptr || (v.out[c] == nullptr && !gate_up_only))
             throw std::invalid_argument("minimax prefill moe: invalid group view");
     const DevLayout l = dev_layout(T, false, kGwClasses);
     if (workspace == nullptr || workspace_bytes < l.bytes) throw std::invalid_argument("minimax prefill moe: workspace too small");
@@ -1635,7 +1675,7 @@ void enqueue_group_moe(const PrefillMoeGroupView& v, void* workspace, std::size_
     t.seg_rows = v.seg_rows;
     for (unsigned c = 0; c < S; ++c) t.seg_y[c] = v.y[c], t.seg_out[c] = v.out[c];
     launch_device_planned(t, nullptr, nullptr, a.out.items, a.out.meta, grids, GwPolicy::kGuSlot, GwPolicy::kDnSlot,
-                          prefill_gather_tok(), stream);
+                          prefill_gather_tok(), stream, gate_up_only ? kPhaseGateUp : kPhaseAll);
 }
 
 }  // namespace
@@ -1785,6 +1825,37 @@ void enqueue_prefill_moe_group(const PrefillMoeGroupView& v, void* workspace, st
     if (!prefill_moe_device_plan(v.rows)) throw std::invalid_argument("minimax prefill moe: device plan not selected for this call");
     enqueue_group_moe(v, workspace, workspace_bytes, stream);
     strix::route::launched(strix::route::Product::moe, strix::route::Family::exact, v.rows);  // group-wide calls are EXL3 only
+}
+
+void enqueue_prefill_moe_group_gate_up(const PrefillMoeGroupView& v, void* workspace, std::size_t workspace_bytes, hipStream_t stream) {
+    if (!prefill_moe_device_plan(v.rows)) throw std::invalid_argument("minimax prefill moe: device plan not selected for this call");
+    enqueue_group_moe(v, workspace, workspace_bytes, stream, true);
+}
+
+void enqueue_prefill_moe_group_down(const PrefillMoeGroupView& v, std::uint32_t segment, void* group_workspace,
+                                    void* chunk_workspace, std::size_t chunk_workspace_bytes, hipStream_t stream) {
+    const unsigned T = v.rows, S = v.segments;
+    if (segment >= S || group_workspace == nullptr || v.out[segment] == nullptr)
+        throw std::invalid_argument("minimax prefill moe: invalid group down view");
+    const DevLayout l = dev_layout(T, false, kGwClasses);
+    auto* ws = static_cast<unsigned char*>(group_workspace);
+    GroupSource source{};
+    source.group.groups = reinterpret_cast<PGroup*>(ws + l.groups);
+    source.group.pair_group = reinterpret_cast<std::uint32_t*>(ws + l.pair_group);
+    source.group.tok_pair = reinterpret_cast<std::uint32_t*>(ws + l.tok_pair);
+    source.group.at = reinterpret_cast<_Float16*>(ws + l.at);
+    source.group.rows = T;
+    source.group.shared_group = GwPolicy::kExperts;
+    source.row0 = segment * v.seg_rows;
+    PrefillMoeDeviceView d{};
+    d.rows = segment + 1U == S ? T - (S - 1U) * v.seg_rows : v.seg_rows;
+    d.routes = v.routes[segment];
+    d.experts = v.experts;
+    d.shared = v.shared;
+    d.out = v.out[segment];
+    if (!prefill_moe_device_plan(d.rows)) throw std::invalid_argument("minimax prefill moe: device plan not selected for this call");
+    enqueue_device_moe(d, chunk_workspace, chunk_workspace_bytes, stream, &source);
+    strix::route::launched(strix::route::Product::moe, strix::route::Family::exact, d.rows);
 }
 
 void prefill_moe_device_check() {

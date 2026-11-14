@@ -723,6 +723,8 @@ struct Engine::Impl {
     // STRIX_MM_PF_MOE_GROUP: chunks of the group per group-wide EXL3 MoE call (strix/pair/prefill_group.hpp moe_width;
     // 0 = automatic, 1 = one call per chunk). Same bits at every width.
     unsigned pf_moe_group = strix::pair::prefill_group::kMoeAuto;
+    // STRIX_MM_PF_MOE_SPLIT=1: split form of a group-wide call (strix/pair/prefill_group.hpp moe_split). Same bits.
+    unsigned pf_moe_split = strix::pair::prefill_group::kMoeSplitOff;
     unsigned pf_moe_cap = 1;                   // widest sub-group the start-up buffers admit
     std::vector<std::uint32_t*> grp_route;     // router tables of group members 1.. (member 0 uses route_d)
     void* pf_gws = nullptr;                    // group-wide MoE workspace (pf_moe_cap chunks)
@@ -935,6 +937,7 @@ struct Engine::Impl {
         pf_group_explicit = std::getenv("STRIX_MM_PF_GROUP") != nullptr && *std::getenv("STRIX_MM_PF_GROUP") != '\0';
         pf_group = strix::pair::prefill_group::width_from_env(std::getenv("STRIX_MM_PF_GROUP"), "STRIX_MM_PF_GROUP");
         pf_moe_group = strix::pair::prefill_group::moe_width_from_env(std::getenv("STRIX_MM_PF_MOE_GROUP"), "STRIX_MM_PF_MOE_GROUP");
+        pf_moe_split = strix::pair::prefill_group::moe_split_from_env(strix::envcfg::text("STRIX_MM_PF_MOE_SPLIT"), "STRIX_MM_PF_MOE_SPLIT");
         const char* pid = std::getenv("STRIX_MM_PREFILL_IDENTITY");
         fp32_prefill = route::fp32_profile(pid);
         if (fp32_prefill && (!linears_loaded || !moe_opt)) throw std::invalid_argument("STRIX_MM_PREFILL_IDENTITY=fp32 needs STRIX_MM_LINEARS and STRIX_MM_MOE on");
@@ -1427,7 +1430,7 @@ struct Engine::Impl {
             std::fprintf(stderr, "mm rank %u: prefill group width %u (STRIX_MM_PFX_DEPTH)\n", static_cast<unsigned>(opt.rank), pf_group);
         }
         if (pf != nullptr || pf_comm_interleave) {  // at start-up: no multi-GB allocation inside a prefill (KFD queue eviction)
-            pf_moe_cap = moe_opt ? strix::pair::prefill_group::moe_width(pf_moe_group, pf_group) : 1U;
+            pf_moe_cap = moe_opt ? strix::pair::prefill_group::moe_width(pf_moe_group, pf_group, pf_moe_split) : 1U;
             if (pf_moe_cap > 1) {
                 pf_gws_bytes = mmoe::prefill_moe_group_workspace_bound(static_cast<std::uint32_t>(pf_moe_cap * T));
                 hip_ok(hipMalloc(&pf_gws, pf_gws_bytes), "prefill group moe workspace");
@@ -2201,10 +2204,19 @@ struct Engine::Impl {
         if (pf_gws == nullptr || i4_layer || !layers[L].moe || !moe_opt || gemv || fp32_prefill || pf_table_stats || profiling ||
             !mmoe::prefill_moe_device_plan(opt.max_rows))
             return 1;
-        return std::min<std::size_t>(pf_moe_cap, strix::pair::prefill_group::moe_width(pf_moe_group, static_cast<unsigned>(m)));
+        return std::min<std::size_t>(pf_moe_cap, strix::pair::prefill_group::moe_width(pf_moe_group, static_cast<unsigned>(m), pf_moe_split));
     }
     // One group-wide MoE call (gv: the chunks' normed rows, router tables and outputs).
-    void stage_ffn_group(unsigned L, mmoe::PrefillMoeGroupView& gv) {
+    // Split form: down + combine of chunk sm on its own plan (pf_ws), after the gate/up of the group.
+    void stage_ffn_group_down(const mmoe::PrefillMoeGroupView& gv, std::uint32_t sm) {
+        struct TimelineMoe {
+            bool on;
+            ~TimelineMoe() { if (on) mmoe::set_prefill_marker(nullptr, nullptr); }
+        } timeline_moe{tl != nullptr};
+        if (tl) mmoe::set_prefill_marker(PrefillTimeline::moe_mark, tl);
+        mmoe::enqueue_prefill_moe_group_down(gv, sm, pf_gws, pf_ws, pf_ws_bytes, nullptr);
+    }
+    void stage_ffn_group(unsigned L, mmoe::PrefillMoeGroupView& gv, bool split = false) {
         const Layer& y = layers[L];
         gv.experts = y.experts_raw_d;
         gv.shared = y.shared_raw;
@@ -2213,7 +2225,8 @@ struct Engine::Impl {
             ~TimelineMoe() { if (on) mmoe::set_prefill_marker(nullptr, nullptr); }
         } timeline_moe{tl != nullptr};
         if (tl) mmoe::set_prefill_marker(PrefillTimeline::moe_mark, tl);
-        mmoe::enqueue_prefill_moe_group(gv, pf_gws, pf_gws_bytes, nullptr);
+        if (split) mmoe::enqueue_prefill_moe_group_gate_up(gv, pf_gws, pf_gws_bytes, nullptr);
+        else mmoe::enqueue_prefill_moe_group(gv, pf_gws, pf_gws_bytes, nullptr);
     }
 
     void stage_ffn_impl(unsigned L, std::size_t n, float* out, const mmoe::I4Layer* prefill_i4,
@@ -2898,10 +2911,12 @@ struct Engine::Impl {
                     gv.out[sm] = O[sm];
                 }
                 use(c0);
-                stage_ffn_group(L, gv);
+                const bool split = pf_ws != nullptr && strix::pair::prefill_group::moe_split(pf_moe_split);
+                stage_ffn_group(L, gv, split);
                 jit_count(L, false);
                 for (std::size_t sm = 0; sm < span; ++sm) {
                     use(c0 + sm);
+                    if (split) stage_ffn_group_down(gv, static_cast<std::uint32_t>(sm));
                     send(c0 + sm, 1, L, O[sm]);
                 }
                 c0 += span;
