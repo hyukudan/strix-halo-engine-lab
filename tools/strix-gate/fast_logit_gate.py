@@ -53,6 +53,46 @@ DNLL_POLICY = {
 }
 FLOOR_MIN_NULLS = 3
 FLOOR_SIGMAS = 2.0
+WITNESS_SCHEMA = "strix-fast-execution/v1"
+DS41_NULL_CONTROL = {"kind": "layer0-null", "layer": 0, "magnitude": 1, "unit": "ulp"}
+
+
+def execution_witness(doc):
+    """Validate producer evidence and its binding to this rank's sealed inputs/outputs."""
+    w = doc.get("execution")
+    if not isinstance(w, dict) or w.get("schema") != WITNESS_SCHEMA:
+        raise GateError("missing or invalid execution witness")
+    for key, expected in (("run_id", doc["run_id"]), ("rank", doc["rank"]),
+                          ("binary_sha256", doc["binary"]["sha256"]), ("prompts", doc["prompts"])):
+        if w.get(key) != expected:
+            raise GateError(f"execution witness differs from sealed {key}")
+    for key in ("model_sha256", "numerical_config_sha256"):
+        value = w.get(key)
+        if not isinstance(value, str) or len(value) != 64 or any(c not in "0123456789abcdef" for c in value):
+            raise GateError(f"execution witness: invalid {key}")
+    if any(not isinstance(w.get(k), str) or not w[k] for k in ("engine", "profile")):
+        raise GateError("execution witness: missing engine/profile")
+    if "control" not in w or (w["control"] is not None and not isinstance(w["control"], dict)):
+        raise GateError("execution witness: missing or invalid control identity")
+    return w
+
+
+def check_floor_execution(ref, cand, nulls, engine, profile):
+    for i, (mr, mc) in enumerate(zip(ref, cand)):
+        wr, wc = execution_witness(mr), execution_witness(mc)
+        if (wc["engine"], wc["profile"]) != (engine, profile) or wc["control"] is not None:
+            raise GateError("candidate execution witness disagrees with floor engine/profile or is a control")
+        if (wr["engine"], wr["profile"], wr["control"]) != (engine, "exact", None):
+            raise GateError("floor reference must witness the exact baseline without a control")
+        if wr["model_sha256"] != wc["model_sha256"]:
+            raise GateError("floor reference/candidate model identity differs")
+        for _, mn in nulls:
+            wn = execution_witness(mn[i])
+            if any(wn[k] != wr[k] for k in ("engine", "profile", "model_sha256", "numerical_config_sha256")):
+                raise GateError("null execution witness differs from the reference model/baseline numerical configuration")
+            # JSON comparison also refuses booleans in place of integer layer/magnitude.
+            if json.dumps(wn["control"], sort_keys=True) != json.dumps(DS41_NULL_CONTROL, sort_keys=True):
+                raise GateError("null execution witness must attest the DS41 one-ulp layer-0 control")
 
 
 def allowed_dnll_rules(engine, profile):
@@ -191,6 +231,12 @@ def seal(a):
     doc = {"schema": SCHEMA, "run_id": a.run_id, "arm": a.arm, "rank": a.rank, "prefix": a.prefix,
            "binary": {"name": binary.name, "sha256": sha256_file(binary)}, "env": env, "attest": attest,
            "sealed_unix": int(time.time()), "prompts": prompts}
+    if a.execution_witness:
+        try:
+            doc["execution"] = json.loads(pathlib.Path(a.execution_witness).read_text(encoding="utf-8"))
+        except (OSError, ValueError) as e:
+            raise GateError(f"cannot read execution witness: {e}") from e
+        execution_witness(doc)
     tmp = manifest.with_suffix(".tmp")
     tmp.write_text(json.dumps(doc, indent=1, sort_keys=True) + "\n", encoding="utf-8", newline="\n")
     os.replace(tmp, manifest)
@@ -218,6 +264,12 @@ def load_arm(d, ranks):
                 raise GateError(f"{d}: ranks disagree on {key}")
         if sorted(doc["prompts"]) != sorted(first["prompts"]):
             raise GateError(f"{d}: ranks disagree on the prompt set")
+    if any("execution" in doc for doc in docs):
+        witnesses = [execution_witness(doc) for doc in docs]
+        for w in witnesses[1:]:
+            for key in ("engine", "profile", "model_sha256", "numerical_config_sha256", "control"):
+                if w[key] != witnesses[0][key]:
+                    raise GateError(f"{d}: ranks disagree on execution {key}")
     return d, docs
 
 
@@ -339,8 +391,13 @@ def compare(a):
         if sorted(mn[0]["prompts"]) != names:
             raise GateError(f"{nd}: null arm prompt set differs from the reference / candidate")
         nulls.append((dn, mn))
+    if a.dnll_rule == "floor":
+        check_floor_execution(ma, mb, nulls, a.engine, a.profile)
     report = {"ref": {k: ma[0][k] for k in ("run_id", "arm", "env", "attest")}, "cand": {k: mb[0][k] for k in ("run_id", "arm", "env", "attest")},
               "ref_binary": [m["binary"]["sha256"] for m in ma], "cand_binary": [m["binary"]["sha256"] for m in mb], "prompts": {}}
+    if a.dnll_rule == "floor":
+        report["ref"]["execution"] = ma[0]["execution"]
+        report["cand"]["execution"] = mb[0]["execution"]
     print(f"ref  run {ma[0]['run_id']} arm {ma[0]['arm']} env {ma[0]['env']} binary {report['ref_binary'][0][:12]}")
     print(f"cand run {mb[0]['run_id']} arm {mb[0]['arm']} env {mb[0]['env']} binary {report['cand_binary'][0][:12]}")
     pooled = {"kl": [], "agree": [], "nll_ref": [], "nll_cand": []}
@@ -388,6 +445,7 @@ def compare(a):
                 acc[k].append(r[k])
         nd_ = float(np.concatenate(acc["nll_cand"]).mean() - np.concatenate(acc["nll_ref"]).mean())
         null_rows.append({"dir": str(dn), "run_id": mn[0]["run_id"], "arm": mn[0]["arm"], "env": mn[0]["env"],
+                          "execution": mn[0]["execution"],
                           "rows": int(sum(len(k) for k in acc["kl"])), "kl": float(np.concatenate(acc["kl"]).mean()),
                           "top1": float(np.concatenate(acc["agree"]).mean()), "dnll": nd_})
         print(f"null {mn[0]['arm']} run {mn[0]['run_id']} env {mn[0]['env']}: KL {null_rows[-1]['kl']:.5f}, "
@@ -432,6 +490,7 @@ def main(argv=None):
     s.add_argument("--prompt", action="append", metavar="NAME=TOKENS.u32")
     s.add_argument("--env", action="append", metavar="NAME=VALUE", help="environment the arm was launched with")
     s.add_argument("--attest", action="append", metavar="KEY=VALUE", help="sel_mode=N must equal the selection dump's mode")
+    s.add_argument("--execution-witness", metavar="JSON", help="launcher/engine execution evidence; required on every floor arm")
     s.add_argument("--select", action="store_true", help="selection dumps are required")
     s.add_argument("--not-before", type=float, help="unix time the run started: older dumps are stale")
     c = sub.add_parser("compare")

@@ -177,6 +177,51 @@ rule, engine, profile, each null (run id, arm, env, rows, KL, top-1, dNLL), mean
 the absolute 0.01 verdict as a reference column; with the default rule `pooled.dnll_rule` records
 `abs` and the limit.
 
+Floor comparisons also require `seal --execution-witness execution-rR.json` on
+the reference, candidate and every null, on every rank. Missing or incompatible
+evidence is exit 2, with no verdict. Arm names, `--env` and `--attest sel_mode`
+do not establish control eligibility. The launcher/engine must emit this JSON
+from the executed configuration and the completed dumps; sealing preserves it
+as `execution` and checks its binding to the run:
+
+```json
+{
+  "schema": "strix-fast-execution/v1",
+  "run_id": "unique-run-id", "rank": 0,
+  "binary_sha256": "<64 lowercase hex digits>",
+  "engine": "ds41", "profile": "exact",
+  "model_sha256": "<64 lowercase hex digits>",
+  "numerical_config_sha256": "<64 lowercase hex digits>",
+  "control": {"kind": "layer0-null", "layer": 0, "magnitude": 1, "unit": "ulp"},
+  "prompts": {"<prompt-name>": "<same structured entry as the sealed prompts map>"}
+}
+```
+
+`prompts` must contain the full token counts/hashes, row counts and dump
+names/sizes/hashes/widths (plus selection records/mode when present) described
+above, computed by the producer. The placeholders are not usable evidence.
+`model_sha256` identifies the complete ordered model asset bundle;
+`numerical_config_sha256` hashes the canonical resolved numerical configuration,
+including effective switches, arithmetic, tensor layouts and selection policy,
+excluding only the separately recorded control perturbation and its random seed.
+Producers must use the same canonical encoding across arms and ranks.
+The exact reference and nulls must match both identities and use profile `exact`;
+the candidate must match the model and witness `ds41` / `fast-prefill`.
+Reference and candidate use `"control": null`. Only the one-ULP layer-0 identity
+above is admitted as a control. Rank identities must agree; each rank binds its
+own binary and dumps. Reports include the first rank's execution evidence.
+
+Trust boundary: these are trusted launcher/engine statements, not signatures or
+proof derived from logits. The gate cannot detect a producer that misreports
+execution or a deliberately rewritten manifest. CLI engine/profile labels are
+checked against the sealed witness. This change defines the consumer contract;
+it does not add a native witness producer. Runs without producer evidence cannot
+use the floor rule; do not create evidence by relabelling existing runs.
+Mean plus two sample standard deviations from three controls is an empirical
+policy threshold, not a confidence bound or model-fidelity result. Synthetic
+host tests establish validation and arithmetic only; compiler, native execution,
+model fidelity and complete-workload qualification remain separate gates.
+
 When both arms carry selection dumps (`PREFIX-<prompt>-sel-r<rank>.u32`; MiniMax writes them
 with `STRIX_MM_QUALITY_SELECT=1` next to `STRIX_MM_QUALITY_OUT`), `compare` also reports, per
 layer, the (row, head) slots whose selected block set differs and the first layer and position

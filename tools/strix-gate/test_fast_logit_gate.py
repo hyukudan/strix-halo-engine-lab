@@ -1,6 +1,7 @@
 """Synthetic CPU tests of fast_logit_gate.py (numpy only; no engine)."""
 import contextlib
 import io
+import json
 import os
 import pathlib
 import sys
@@ -22,7 +23,7 @@ def run(argv):
 
 class Case(unittest.TestCase):
     def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory()
+        self.tmp = tempfile.TemporaryDirectory(dir=pathlib.Path(__file__).resolve().parents[2])
         self.root = pathlib.Path(self.tmp.name)
         self.rng = np.random.default_rng(7)
         self.tok = self.root / "p.u32"
@@ -44,7 +45,7 @@ class Case(unittest.TestCase):
             words += [g.SEL_MAGIC, 1, mode, 16, 0, ROWS, 2, 4] + [3] * (ROWS * 2) + ids.ravel().tolist()
         np.array(words, "<u4").tofile(path)
 
-    def arm(self, name, run_id, logits=None, mode=4, swap=False, seal=True, select=True):
+    def arm(self, name, run_id, logits=None, mode=4, swap=False, seal=True, select=True, witness=None):
         d = self.root / name
         d.mkdir()
         z = self.logits if logits is None else logits
@@ -54,9 +55,25 @@ class Case(unittest.TestCase):
             if select:
                 self.selection(d / f"q-p-sel-r{rank}.u32", mode, swap and rank == 1)
             if seal:
+                evidence = []
+                if witness:
+                    files = {}
+                    for kind, ext in [("tf", "f32")] + ([("sel", "u32")] if select else []):
+                        f = d / f"q-p-{kind}-r{rank}.{ext}"
+                        files[kind] = {"name": f.name, "bytes": f.stat().st_size, "sha256": g.sha256_file(f)}
+                        files[kind].update({"width": hi - lo} if kind == "tf" else {"records": 2, "mode": mode})
+                    w = {"schema": "strix-fast-execution/v1", "run_id": run_id, "rank": rank,
+                         "binary_sha256": g.sha256_file(self.binary), "engine": "ds41",
+                         "profile": "fast-prefill" if witness == "candidate" else "exact",
+                         "model_sha256": "a" * 64, "numerical_config_sha256": ("c" if witness == "candidate" else "b") * 64,
+                         "control": {"kind": "layer0-null", "layer": 0, "magnitude": 1, "unit": "ulp"} if witness == "null" else None,
+                         "prompts": {"p": {"tokens": TOKENS, "tokens_sha256": g.sha256_file(self.tok), "rows": ROWS, "files": files}}}
+                    wp = d / f"execution-r{rank}.json"
+                    wp.write_text(json.dumps(w), encoding="utf-8")
+                    evidence = ["--execution-witness", str(wp)]
                 rc.append(run(["seal", "--dir", str(d), "--rank", str(rank), "--arm", name, "--run-id", run_id, "--binary",
                                str(self.binary), "--rows", str(ROWS), "--prompt", f"p={self.tok}", "--env", "MODE=x",
-                               "--attest", f"sel_mode={mode}"] + (["--select"] if select else [])))
+                               "--attest", f"sel_mode={mode}"] + (["--select"] if select else []) + evidence))
         return d, rc
 
     def cmp(self, a, b, *extra):
@@ -161,15 +178,16 @@ class Case(unittest.TestCase):
 
     def test_floor_end_to_end(self):
         import json
-        a, _ = self.arm("A", "r1")
-        nulls = [self.arm(f"N{i}", f"n{i}", self.noisy(0.3, 10 + i), mode=3)[0] for i in range(3)]
-        cand, _ = self.arm("C", "c1", self.noisy(0.3, 20), mode=3)
+        a, _ = self.arm("A", "r1", witness="baseline")
+        nulls = [self.arm(f"N{i}", f"n{i}", self.noisy(0.3, 10 + i), mode=3, witness="null")[0] for i in range(3)]
+        cand, _ = self.arm("C", "c1", self.noisy(0.3, 20), mode=3, witness="candidate")
         out = self.root / "f.json"
         rc = self.cmp(a, cand, *self.floor_args(nulls), "--json", str(out))
         p = json.loads(out.read_text())["pooled"]
         d = p["dnll_rule"]
         vals = [n["dnll"] for n in d["nulls"]]
         self.assertEqual([n["run_id"] for n in d["nulls"]], ["n0", "n1", "n2"])
+        self.assertEqual(d["nulls"][0]["execution"]["control"], g.DS41_NULL_CONTROL)
         self.assertAlmostEqual(d["mean"], float(np.mean(vals)), places=12)
         self.assertAlmostEqual(d["sd"], float(np.std(vals, ddof=1)), places=12)
         self.assertAlmostEqual(d["limit"], d["mean"] + 2 * d["sd"], places=12)
@@ -180,9 +198,9 @@ class Case(unittest.TestCase):
         self.assertIn("floor ds41/fast-prefill", p["rule"])
 
     def test_floor_refusals_have_no_verdict(self):
-        a, _ = self.arm("A", "r1")
-        nulls = [self.arm(f"N{i}", f"n{i}", self.noisy(1e-3, 10 + i), mode=3)[0] for i in range(3)]
-        cand, _ = self.arm("C", "c1", self.noisy(1e-3, 20), mode=3)
+        a, _ = self.arm("A", "r1", witness="baseline")
+        nulls = [self.arm(f"N{i}", f"n{i}", self.noisy(1e-3, 10 + i), mode=3, witness="null")[0] for i in range(3)]
+        cand, _ = self.arm("C", "c1", self.noisy(1e-3, 20), mode=3, witness="candidate")
         self.assertEqual(self.cmp(a, cand, *self.floor_args(nulls[:2])), 2)  # two nulls
         self.assertEqual(self.cmp(a, cand, *self.floor_args([])), 2)  # no nulls
         self.assertEqual(self.cmp(a, cand, *self.floor_args(nulls, "qwen")), 2)  # engine not in the policy table
@@ -195,10 +213,95 @@ class Case(unittest.TestCase):
         other = self.root / "engine2"
         other.write_bytes(b"other binary")
         self.binary, keep = other, self.binary
-        foreign, _ = self.arm("NB", "nb", self.noisy(1e-3, 30), mode=3)
+        foreign, _ = self.arm("NB", "nb", self.noisy(1e-3, 30), mode=3, witness="null")
         self.binary = keep
         self.assertEqual(self.cmp(a, cand, *self.floor_args([nulls[0], nulls[1], foreign])), 2)  # null on another binary
         self.assertIn(self.cmp(a, cand, *self.floor_args(nulls)), (0, 1))  # the valid call reaches a verdict
+
+    def floor_fixture(self, witness="null"):
+        # Depress only the next-token logit; the winning alternative stays unchanged.
+        ref = np.zeros_like(self.logits)
+        labels = np.concatenate((np.fromfile(self.tok, "<u4")[-ROWS + 1:], [0]))
+        ref[np.arange(ROWS), (labels + 1) % ref.shape[1]] = 1
+
+        def shifted(dnll):
+            z = ref.copy()
+            mass = np.exp(1) + z.shape[1] - 1
+            z[np.arange(ROWS), labels] = -np.log((mass * np.exp(dnll) - 1) / (mass - 1))
+            return z
+
+        a, rc = self.arm("A", "ref", ref, witness="baseline", select=False)
+        self.assertEqual(rc, [0, 0])
+        cand, rc = self.arm("C", "cand", shifted(0.016), witness="candidate", select=False)
+        self.assertEqual(rc, [0, 0])
+        nulls = []
+        for i, dnll in enumerate((0.04, 0.05, 0.06)):
+            d, rc = self.arm(f"layer0-null-{i}", f"null-{i}", shifted(dnll), witness=witness, select=False)
+            self.assertEqual(rc, [0, 0])
+            nulls.append(d)
+        return a, cand, nulls
+
+    def test_floor_rejects_inflated_non_controls_despite_names(self):
+        a, cand, nulls = self.floor_fixture(witness="baseline")
+        out = self.root / "refused.json"
+        self.assertEqual(self.cmp(a, cand, *self.floor_args(nulls), "--json", str(out)), 2)
+        self.assertFalse(out.exists())
+
+    def test_floor_rejects_missing_control_witness(self):
+        a, cand, nulls = self.floor_fixture(witness=None)
+        self.assertEqual(self.cmp(a, cand, *self.floor_args(nulls)), 2)
+
+    def test_floor_witness_incompatibilities(self):
+        a, cand, nulls = self.floor_fixture()
+        for target, key, value in ((nulls[0], "control", None),
+                                   (nulls[0], "control", {**g.DS41_NULL_CONTROL, "layer": 1}),
+                                   (nulls[0], "control", {**g.DS41_NULL_CONTROL, "magnitude": 2}),
+                                   (nulls[0], "model_sha256", "d" * 64),
+                                   (nulls[0], "numerical_config_sha256", "d" * 64),
+                                   (cand, "engine", "qwen"), (cand, "profile", "exact"),
+                                   (a, "control", g.DS41_NULL_CONTROL)):
+            with self.subTest(key=key, value=value):
+                paths = [target / f"manifest-r{r}.json" for r in range(2)]
+                originals = [p.read_text(encoding="utf-8") for p in paths]
+                for p, original in zip(paths, originals):
+                    doc = json.loads(original)
+                    doc["execution"][key] = value
+                    p.write_text(json.dumps(doc), encoding="utf-8")
+                self.assertEqual(self.cmp(a, cand, *self.floor_args(nulls)), 2)
+                for p, original in zip(paths, originals):
+                    p.write_text(original, encoding="utf-8")
+
+    def test_floor_rejects_rank_witness_disagreement(self):
+        a, cand, nulls = self.floor_fixture()
+        p = nulls[0] / "manifest-r1.json"
+        original = json.loads(p.read_text(encoding="utf-8"))
+        for value in (None, {**original["execution"], "numerical_config_sha256": "d" * 64}):
+            doc = dict(original)
+            if value is None:
+                del doc["execution"]
+            else:
+                doc["execution"] = value
+            p.write_text(json.dumps(doc), encoding="utf-8")
+            self.assertEqual(self.cmp(a, cand, *self.floor_args(nulls)), 2)
+
+    def test_seal_binds_execution_witness(self):
+        d, rc = self.arm("A", "r1", witness="null", select=False)
+        self.assertEqual(rc, [0, 0])
+        p = d / "execution-r0.json"
+        original = json.loads(p.read_text(encoding="utf-8"))
+        (d / "manifest-r0.json").unlink()
+        base = ["seal", "--dir", str(d), "--rank", "0", "--arm", "A", "--run-id", "r1", "--binary", str(self.binary),
+                "--rows", str(ROWS), "--prompt", f"p={self.tok}", "--execution-witness", str(p)]
+        for key, value in (("run_id", "other"), ("rank", 1), ("binary_sha256", "d" * 64),
+                           ("prompts", {}), ("model_sha256", ""), ("control", "layer0-null")):
+            with self.subTest(key=key):
+                p.write_text(json.dumps({**original, key: value}), encoding="utf-8")
+                self.assertEqual(run(base), 2)
+                self.assertFalse((d / "manifest-r0.json").exists())
+        p.write_text("{", encoding="utf-8")
+        self.assertEqual(run(base), 2)
+        p.write_text(json.dumps(original), encoding="utf-8")
+        self.assertEqual(run(base), 0)
 
     def test_default_rule_unchanged(self):
         import json
