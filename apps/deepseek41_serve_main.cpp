@@ -683,8 +683,9 @@ std::unique_ptr<VisionStack> make_vision_stack(const Args& a, const strix::deeps
         const bool warm_up = strix::envcfg::flag("STRIX_VISION_WARMUP", true);
         const vis::PrepareReport r = vis::prepare_backend(*st->adapter, *st->encoder, st->weights, warm_up);
         const std::string warm = warm_up ? std::to_string(r.warmup_rows) + " rows " + std::to_string(static_cast<long>(r.warmup_ms)) + " ms" : "off";
-        std::fprintf(stderr, "vision: resident tower + %zu projector panels, workspace for %u rows, %.1f MiB on the device (%.0f ms); warm-up %s\n",
-                     r.linears, r.reserved_rows, static_cast<double>(st->encoder->device_bytes()) / 1048576.0, r.prepare_ms, warm.c_str());
+        std::fprintf(stderr, "vision: resident tower + %zu projector panels, workspace for %u rows, %.1f MiB on the device, %.1f MiB pinned staging (%.0f ms); warm-up %s\n",
+                     r.linears, r.reserved_rows, static_cast<double>(st->encoder->device_bytes()) / 1048576.0,
+                     static_cast<double>(st->encoder->pinned_host_bytes()) / 1048576.0, r.prepare_ms, warm.c_str());
     } else {
         auto* const enc = st->encoder.get();
         const auto* const w = &st->weights;
