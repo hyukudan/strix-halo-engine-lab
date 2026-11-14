@@ -427,7 +427,12 @@ void rapl_invalid_probe_baseline() {
 // request asks cover() for one) does not grow the heap before the ring wraps. glibc's statistics only; a sanitizer's
 // allocator replaces them.
 void ring_memory_fixed_at_construction() {
-#if defined(__GLIBC__) && !defined(__SANITIZE_ADDRESS__) && !defined(__SANITIZE_THREAD__)
+#if defined(__has_feature)
+#if __has_feature(address_sanitizer) || __has_feature(thread_sanitizer)
+#define STRIX_POWER_TEST_SANITIZED 1
+#endif
+#endif
+#if defined(__GLIBC__) && !defined(__SANITIZE_ADDRESS__) && !defined(__SANITIZE_THREAD__) && !defined(STRIX_POWER_TEST_SANITIZED)
     Tree tree("ringmem");
     tree.gpu(30.0, 2900.0, 50.0);
     Sampler sampler(make_sources(tree.path()));  // the default ring (65536 samples), as the process sampler's
@@ -441,7 +446,10 @@ void ring_memory_fixed_at_construction() {
     const auto growth = heap() - before;
     std::printf("heap over %d stored samples: %+lld bytes\n", kSamples, growth);
     require(growth < 1024, "ring memory grows with the stored samples: " + std::to_string(growth) + " bytes");
+#else
+    std::puts("SKIP ring_memory_fixed_at_construction: requires glibc without ASan/TSan");
 #endif
+#undef STRIX_POWER_TEST_SANITIZED
 }
 
 // Finding 2: sample_at() from other threads while the worker runs never enters a source twice at once, and a
