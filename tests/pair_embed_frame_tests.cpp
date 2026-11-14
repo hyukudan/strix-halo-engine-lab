@@ -1,6 +1,7 @@
 // pair::EmbedFrame: round trip, once-per-digest ledger, corruption, regime rule.
 #include "strix/pair/embed_frame.hpp"
 
+#include <array>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -52,6 +53,34 @@ bool throws(F&& f) {
 }  // namespace
 
 int main() {
+    // Transfer boundaries: the pair gate's 22 MiB cap, including a partial final message.
+    constexpr std::size_t cap = std::size_t{22} << 20U;
+    for (const auto n : {std::size_t{0}, std::size_t{1}, cap - 1U, cap, cap + 1U}) {
+        std::vector<std::byte> source(n), received(n);
+        for (std::size_t i = 0; i < n; ++i) source[i] = static_cast<std::byte>(i % 251U);
+        std::size_t sent = 0, calls = 0;
+        pair::transfer_embed_frame_bytes(source, {}, cap, [&](auto out, auto in) {
+            CHECK(!out.empty() && out.size() <= cap && out.size() == in.size());
+            CHECK(std::equal(out.begin(), out.end(), source.begin() + static_cast<std::ptrdiff_t>(sent)));
+            sent += out.size();
+            ++calls;
+            std::fill(in.begin(), in.end(), std::byte{0xff});
+        });
+        CHECK(sent == n && calls == (n + cap - 1U) / cap);
+        std::size_t at = 0;
+        pair::transfer_embed_frame_bytes({}, received, cap, [&](auto out, auto in) {
+            CHECK(!out.empty() && out.size() <= cap && out.size() == in.size());
+            CHECK(std::all_of(out.begin(), out.end(), [](auto b) { return b == std::byte{0}; }));
+            std::copy_n(source.begin() + static_cast<std::ptrdiff_t>(at), in.size(), in.begin());
+            at += in.size();
+        });
+        CHECK(at == n && received == source);
+    }
+    std::array<std::byte, 1> byte{};
+    const auto no_exchange = [&](auto, auto) { CHECK(false); };
+    CHECK(throws([&] { pair::transfer_embed_frame_bytes(byte, {}, 0U, no_exchange); }));
+    CHECK(throws([&] { pair::transfer_embed_frame_bytes(byte, byte, cap, no_exchange); }));
+
     session::EmbedInterner sender;
     // the sender burns a few handles first, so its handles differ from the receiver's
     auto warm = sender.intern(span(9, 2, 4));
@@ -108,8 +137,9 @@ int main() {
     CHECK(throws([&] { (void)rx2.receive(bad, prompt, crc); }));
     auto bad2 = f1;
     bad2[pair::kEmbedFrameHeaderBytes + 4U] = std::byte{7};
-    CHECK(throws([&] { (void)rx2.receive(bad2, prompt, crc); }));
-    CHECK(throws([&] { (void)rx2.receive(std::span<const std::byte>(f1.data(), f1.size() - 1U), prompt, crc); }));
+    pair::EmbedFrameReceiver rx_manifest(2), rx_short(2);  // frame errors are terminal; never retry rx2
+    CHECK(throws([&] { (void)rx_manifest.receive(bad2, prompt, crc); }));
+    CHECK(throws([&] { (void)rx_short.receive(std::span<const std::byte>(f1.data(), f1.size() - 1U), prompt, crc); }));
     pair::EmbedFrameReceiver rx3(2);
     CHECK(throws([&] { (void)rx3.receive(f2, prompt, crc); }));  // manifest only, nothing held
     // deep rows are refused by version 1

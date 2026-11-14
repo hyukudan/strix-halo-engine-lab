@@ -670,10 +670,11 @@ struct Engine::Impl {
     unsigned pf_idx_rows = 32;
     unsigned pf_msa_rework = 10;  // STRIX_MM_PF_MSA_REWORK: prefill only, default 10 (in-block chunk loop, LDS-staged block list/partials, no global partials); =8 (= 7 with the 16-key tile max as an exact ds_swizzle lane tree) / =7 / =6 / =5 / =3 previous defaults, =0 original, =9 DPP diagnostic
     // STRIX_MM_PF_MSA_FLASH (FAST, lossy, opt-in; 1 | 2): prefill MSA attention of windows > 8 rows on the shared BF16 WMMA key-split
-    // flash core instead of the exact in-block kernel; selection, block lists and K/V caches unchanged.
+    // flash core instead of the exact in-block kernel; selection, block lists and K/V caches unchanged. Governed rows of the
+    // MiniMax FAST prefill profile (mm_profile_table.hpp; STRIX_MM_FAST_PREFILL=1 selects msa-flash-bf16-l40-v1).
     unsigned pf_msa_flash = 0;
-    static constexpr const char* kMsaFlashLayers = "40-59";  // measured on the EXL3 format: passes the 8K FAST gate with either operand form; 20-59 does not
-    strix::core::LayerSet pf_msa_flash_layers;  // STRIX_MM_PF_MSA_FLASH_LAYERS: layers that use it (unset: kMsaFlashLayers)
+    std::string pf_msa_flash_asked = "default";  // receipt: "default", the explicit value or "fast_prefill"
+    strix::core::LayerSet pf_msa_flash_layers;  // STRIX_MM_PF_MSA_FLASH_LAYERS: layers that use it (unset: defaults::kMsaFlashLayers)
     bool pf_msa_batch = true;  // STRIX_MM_PF_MSA_BATCH (default ON, exact measurement): independent scratch per prefill window
     unsigned pf_msa_windows = 0;
     float *pf_scores = nullptr, *pf_partial = nullptr;
@@ -950,16 +951,18 @@ struct Engine::Impl {
         // exact in-block kernel (default: opt-in, also with the FAST_I4 format, whose INT4 layers amplify the change
         // past the gate). The layer set defaults to the deepest layers (kMsaFlashLayers): the quality gate fails
         // when shallower layers use it, because every later block selection sees the changed activations.
-        if (const char* fl = std::getenv("STRIX_MM_PF_MSA_FLASH")) {
-            const std::string mode = fl;
-            if (mode != "0" && mode != "1" && mode != "2") throw std::invalid_argument("STRIX_MM_PF_MSA_FLASH must be 0, 1 or 2");
-            pf_msa_flash = static_cast<unsigned>(mode[0] - '0');
-        }
+        // One resolver (mm_defaults.cpp prefill_policy): the same values as the effective config, the session-cache
+        // identity and the rank agreement; STRIX_MM_FAST_PREFILL=1 selects mode 1 unless the format is fast_i4.
         {
-            const char* fl = std::getenv("STRIX_MM_PF_MSA_FLASH_LAYERS");
-            pf_msa_flash_layers = strix::core::parse_layer_set(fl == nullptr || fl[0] == 0 ? kMsaFlashLayers : fl, 0, kLayers, "STRIX_MM_PF_MSA_FLASH_LAYERS");
+            const auto policy = defaults::prefill_policy(strix::envcfg::text);
+            // Keep the selection for runtime rework controls; dispatch applies the same guards.
+            pf_msa_flash = policy.msa_flash_requested;
+            pf_msa_flash_asked = policy.msa_flash_asked;
+            pf_msa_flash_layers = strix::core::parse_layer_set(policy.msa_flash_layers.c_str(), 0, kLayers, "STRIX_MM_PF_MSA_FLASH_LAYERS");
+            if (!policy.note.empty()) std::fprintf(stderr, "minimax fast prefill: %s\n", policy.note.c_str());
         }
-        if (pf_msa_flash != 0)
+        if (pf_msa_flash != 0 && defaults::msa_flash_decline_reason(pf_msa_rework != 0, attn_prefill_fused,
+                                                                  pf_msa_flash_layers.count()) == nullptr)
             std::fprintf(stderr, "prefill identity mm-pf-msa-flash FAST (bf16 WMMA key-split MSA attend, %u-term operands, %u layers)\n", pf_msa_flash, pf_msa_flash_layers.count());
         if (i4_shadow && !model_fast_i4)
             throw std::invalid_argument("STRIX_MMX_FAST_I4_SHADOW needs STRIX_MMX_MODEL_FORMAT=fast_i4");
@@ -1209,9 +1212,9 @@ struct Engine::Impl {
         }
         rr::lever("minimax.moe_prefill_format", asked != nullptr && *asked != 0 ? asked : "default", effective,
                   iu4 ? rr::Reason::selected : rr::Reason::disabled);
-        const unsigned flash = pf_msa_rework != 0 ? pf_msa_flash : 0U;
-        const char* flash_asked = strix::envcfg::text("STRIX_MM_PF_MSA_FLASH");
-        rr::lever("minimax.msa_flash", flash_asked != nullptr ? flash_asked : "default",
+        const unsigned flash = defaults::msa_flash_decline_reason(pf_msa_rework != 0, attn_prefill_fused,
+                                                                 pf_msa_flash_layers.count()) == nullptr ? pf_msa_flash : 0U;
+        rr::lever("minimax.msa_flash", pf_msa_flash_asked,
                   std::to_string(flash) + (flash ? ":layers=" + mask(pf_msa_flash_layers, 0) : ""),
                   flash ? rr::Reason::selected : rr::Reason::disabled);
         rr::lever("minimax.prefill_identity", fp32_prefill ? "fp32" : "default", fp32_prefill ? "fp32" : "default");

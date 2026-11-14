@@ -576,9 +576,10 @@ std::vector<std::uint16_t> framed_embed_rows(strix::dist::Communicator& comm, st
     std::uint64_t mine = frame.size(), theirs = 0;
     comm.exchange_host(std::as_bytes(std::span<const std::uint64_t>(&mine, 1U)), std::as_writable_bytes(std::span<std::uint64_t>(&theirs, 1U)), tag);
     const std::uint64_t bytes = rank == 0U ? mine : theirs;
-    std::vector<std::byte> in(bytes);
-    if (rank != 0U) frame.assign(bytes, std::byte{0});
-    comm.exchange_host(frame, in, strix::dist::Tag{tag.kind, tag.layer, 1U});
+    std::vector<std::byte> in(rank == 0U ? 0U : bytes);
+    strix::pair::transfer_embed_frame_bytes(frame, in, comm.max_bytes(), [&](auto out, auto received) {
+        comm.exchange_host(out, received, strix::dist::Tag{tag.kind, tag.layer, 1U});
+    });
     if (rank == 0U) {
         std::printf("embed-identity frame: %llu bytes, %u rows x %u to rank 1\n", static_cast<unsigned long long>(bytes), count, width);
         return rows;

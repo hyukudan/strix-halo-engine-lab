@@ -933,6 +933,23 @@ void synthetic(std::mt19937& rng) {
     Device<float> dkv(kv), dqn(qn), dkn(kn), dst(s);
     enqueue_engram_inject(dst.p, dkv.p, dqn.p, dkn.p, rows, hidden, 1e-20F, nullptr);
     expect(same_bits(dst.down(), hs), "Engram injection (chunked) bitwise");
+    {
+        // image rows (every third row flagged): gate 0 there, the other rows as without flags
+        std::vector<std::uint8_t> off(rows, 0);
+        for (std::uint32_t r = 1; r < rows; r += 3) off[r] = 1;
+        auto hi = s;
+        for (std::uint32_t r = 0; r < rows; ++r)
+            engram_inject(std::span<float>(hi.data() + r * n, n), std::span<const float>(kv.data() + std::size_t{r} * hidden * 5, hidden * 5), qn, kn,
+                          1e-20F, off[r] != 0);
+        Device<std::uint8_t> doff(off);
+        Device<float> dimg(s);
+        enqueue_engram_inject(dimg.p, dkv.p, dqn.p, dkn.p, rows, hidden, 1e-20F, nullptr, doff.p);
+        const auto got = dimg.down();
+        bool untouched = true;
+        for (std::uint32_t r = 1; r < rows; r += 3)
+            untouched = untouched && std::equal(got.begin() + r * n, got.begin() + (r + 1) * n, s.begin() + r * n);
+        expect(same_bits(got, hi) && untouched, "Engram injection gate-off rows bitwise (image rows untouched)");
+    }
     std::cout << "synthetic layer-site kernels checked\n";
 }
 

@@ -290,6 +290,12 @@ void entry_points() {
     char* bad_argv[] = {b0, b1, nullptr};
     int bad_argc = 2;
     rejects([&] { (void)take_command_line(bad_argc, bad_argv); }, "needs a value", "flag without a value");
+    char c0[] = "app", c1[] = "--deploy", c2[] = "auto", c3[] = "--deploy-check", c4[] = "--device-id", c5[] = "main";
+    char* check_argv[] = {c0, c1, c2, c3, c4, c5, nullptr};
+    int check_argc = 6;
+    const auto check = take_command_line(check_argc, check_argv);
+    require(check.select == "main" && check_argc == 4 && std::string(check_argv[3]) == "--deploy-check",
+            "--deploy-check is kept for the engine parser to interpret");
 }
 
 // NPU and CPU units: declared explicitly, never matched against the GPU listing, shown in the start line.

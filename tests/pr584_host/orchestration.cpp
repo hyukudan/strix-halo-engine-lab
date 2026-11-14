@@ -97,12 +97,22 @@ void ring_test() {
             if ((pos / 2U) % 2U == rank) m.prefill_ring.p[pos % 8U] = m.ring16.p[pos % 8U] = value;
             else { m.ppos64.p[j] = pos; ordinary[j] = staging[j] = value; ++j; }
         }
-        Entries fe;
-        fe.ring = m.prefill_ring.p;
-        fe.capacity = m.prefill_capacity;
-        const unsigned pk0 = 0, px0 = 0;
+        using FinalEntries = Entries;
+        const unsigned nseg = 1;
+        struct Section { unsigned off; };
+        const Section sec_pe[]{{0}};
+        const auto seq_ring = [&](unsigned) -> auto& { return m.prefill_ring; };
+        const auto seq_capacity = [&](unsigned) { return m.prefill_capacity; };
+        const auto entries_of = [&](unsigned, Section, const std::uint64_t* pos, std::uint32_t* packed) {
+            Entries fe;
+            fe.ring = m.prefill_ring.p;
+            fe.capacity = m.prefill_capacity;
+            fe.ring_pos = pos;
+            fe.ring_rows = 4;
+            fe.packed = packed;
+            return fe;
+        };
         [[maybe_unused]] const unsigned layer = 0;
-        unsigned peer_ring = 4, peer_comp = 0;
         const int st = 7;
         const auto* recv_words = staged ? staging : ordinary;
 #include "unpack.inc"

@@ -1264,6 +1264,28 @@ public:
         return true;
     }
     [[nodiscard]] std::size_t slots() const noexcept { return slots_.size(); }
+    // Queue protection over the prefix store every slot shares (slot 0's session supplies the lookup identity
+    // and block rows). Resolved at each call: the automatic cache attaches only after the late fit, and a
+    // declined or absent cache makes both calls no-ops. The HTTP owner binds it; default OFF (envcfg lever).
+    [[nodiscard]] serve::QueuedPrefixProtection::Binding queue_protection_binding() {
+        const auto current = [this]() -> HipPrefixStateCacheSession* {
+            return slots_.empty() || !slots_.front()->parents ? nullptr : slots_.front()->parents->tiled.cache;
+        };
+        serve::QueuedPrefixProtection::Binding b;
+        b.prepare = [current](std::span<const std::uint32_t> prompt) -> serve::QueuedPrefixProtection::Prepared {
+            auto* cache = current();
+            if (!cache) return {};
+            const auto inner = cache->queue_protection_binding();
+            return inner ? inner.prepare(prompt) : nullptr;
+        };
+        b.protect = [current](const serve::QueuedPrefixProtection::Prepared& prepared) -> serve::QueuedPrefixProtection::Handle {
+            auto* cache = current();
+            if (!cache) return {};
+            const auto inner = cache->queue_protection_binding();
+            return inner ? inner.protect(prepared) : nullptr;
+        };
+        return b;
+    }
     [[nodiscard]] std::size_t active() const noexcept {
         return static_cast<std::size_t>(std::count_if(slots_.begin(), slots_.end(), [](const auto& s) { return s->active; }));
     }
