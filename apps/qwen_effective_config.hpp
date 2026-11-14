@@ -1528,6 +1528,22 @@ inline void resolve_http_session_ram(EffectiveConfig& result, const PrefillMemor
             std::min(*memory.available,o.known_prefill_uma_budget));
     } catch (const std::exception& e) { result.error=e.what(); }
 }
+// HTTP batch route restore. Capture and restore on this route need strict L0 (HipPrefixStateCacheSession::set_plan):
+// an explicit host budget without --prefix-batch-cert l0 stores nothing (unchanged explicit semantics). L0 admits only
+// the solo suffix class (qwen_suffix_solo_class), so the batch scheduler then runs every prompt alone: no nested prompts, no
+// prompt groups, no prompt-window cohorts (scheduling only; each prompt's units and per-row arithmetic are unchanged).
+// STRIX_BATCH_CACHE_SOLO=0 keeps the incumbent scheduler; its restores decline batch-suffix-not-solo.
+// AUTO stays declined until a batch row is qualified (qwen_cache_admission.hpp).
+inline void resolve_batch_cache_scheduler(Options& o, const Environment& env) {
+    o.batch_cache_solo=false;
+    if(!o.http_serve || !o.mtp.enabled || o.http_batch<=1) {o.batch_cache_solo_reason="not-batch";return;}
+    if(o.baseline || !cache_defaults_suppression(o,env).empty()) {o.batch_cache_solo_reason="suppressed";return;}
+    auto& a=*o.cache_activation;
+    if(a.automatic_path) {o.batch_cache_solo_reason="automatic-unqualified";return;}
+    if(!o.prefix_cache || !o.prefix_cache_host_bytes || o.prefix_batch_cert!=1) {o.batch_cache_solo_reason="no-l0-restore";return;}
+    if(env_is(env,"STRIX_BATCH_CACHE_SOLO","0")) {o.batch_cache_solo_reason="STRIX_BATCH_CACHE_SOLO=0";return;}
+    o.batch_cache_solo=true; o.batch_cache_solo_reason="l0-restore";
+}
 inline void resolve_prefix_defaults(Options& o, const ModelContract& model,
     const Environment& env, std::optional<std::uint64_t> available,
     std::span<const SessionRouteQualification> qualifications=prefix_auto_route_qualifications) {
@@ -1546,11 +1562,14 @@ inline void resolve_prefix_defaults(Options& o, const ModelContract& model,
         a.reason=o.http_serve?"pending-post-residency":o.prefix_cache_then_prompts.empty()?"no-reuse-route":"serial-capture-cost-unqualified";
         a.cert_reason="pending-post-residency";
     }
+    resolve_batch_cache_scheduler(o,env);
 }
 inline serve::Json cache_activation_json(const Options& o) {
     const auto& a=*o.cache_activation;
     auto out=serve::Json::object();
     out.set("requested",serve::Json(a.prefix_requested));
+    out.set("batch_cache_solo",serve::Json(o.batch_cache_solo));
+    out.set("batch_cache_solo_reason",serve::Json(o.batch_cache_solo_reason));
     out.set("effective",a.finalized?serve::Json(a.prefix):serve::Json());
     out.set("session_requested",serve::Json(a.session_requested));
     out.set("session_effective",a.finalized?serve::Json(a.session):serve::Json());

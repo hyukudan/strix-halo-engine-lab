@@ -439,6 +439,10 @@ struct Options {
     // Automatic single-route admission, invoked with all ordinary owners resident.
     std::function<void()> cache_attach_ready, cache_attach_rollback;
     unsigned prefix_batch_cert = 0; // 0 off, 1 strict L0, 2 capture-only, 3 unqualified L1 (capture only)
+    // Batch restore admits only the solo suffix class (qwen_suffix_solo_class): no nested prompts, no prompt groups,
+    // no prompt-window cohorts. Resolved once by resolve_batch_cache_scheduler (shared by CLI and server).
+    bool batch_cache_solo = false;
+    std::string batch_cache_solo_reason = "not-batch";
     bool prefix_cache = true;
     bool prefix_cache_inflight = true, prefix_cache_disk = true, prefix_cache_durable = true;
     bool prefix_fair_reclaim_idle = true; // Retention policy only; excluded from execution records.

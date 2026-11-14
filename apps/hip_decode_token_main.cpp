@@ -1185,6 +1185,7 @@ static strix::decode_cli::CacheFamilyIdentity resolved_cache_family(
     c.cohort=strix::decode_cli::MtpBatchRunner::prompt_window_cohort(); c.small=number("STRIX_BATCH_PROMPT_SMALL",0)!=0;
     c.windows=number("STRIX_PROMPT_WINDOW",1)!=0;
     c.nest_rows=number("STRIX_BATCH_NEST_ROWS",2048); c.short_rows=number("STRIX_BATCH_SHORT_FIRST_ROWS",2048);
+    if(options.batch_cache_solo && runner==strix::decode_cli::CacheRunner::batch_mtp) {c.groups=false;c.cohort=false;c.nest_rows=0;}
     c.lookahead=number("STRIX_BATCH_SERVICE_LOOKAHEAD",2); c.cancel=number("STRIX_BATCH_CANCEL_POINTS",1)!=0;
     c.interleave=number("STRIX_BATCH_INTERLEAVE",options.http_serve?1:0);
     const char* service=std::getenv("STRIX_BATCH_SERVICE_MS"); c.service_ms=service?std::max(0.0,std::atof(service)):250;

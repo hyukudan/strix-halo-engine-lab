@@ -1219,6 +1219,7 @@ public:
         : options_(options), model_(model), compiled_(compiled), qualified_(qualified), activated_(activated),
           enable_draft_(std::move(enable_draft)), slots_(std::move(slots)), interleave_(interleave),
           serial_rows_per_step_(serial_rows_per_step ? serial_rows_per_step : 1U),joint_(slots_.size(),MtpBatchWindowController::rule_from_env(options.baseline)),policy_joint_(slots_.size(),MtpBatchWindowController::rule_from_env(options.baseline)) {
+        if(options_.batch_cache_solo) nest_rows_=0; // resolved solo suffix class (resolve_batch_cache_scheduler)
         stats_.nest_rows_limit=nest_rows_;
         if (slots_.empty()) throw std::invalid_argument("batched MTP decoding needs a slot");
         if(service_ms_>0.0 || cancel_points_ || nest_rows_) {
@@ -1294,6 +1295,9 @@ public:
     [[nodiscard]] static bool prompt_batching() noexcept { return prompt_batch_enabled(); }
     [[nodiscard]] static std::uint32_t prompt_group_rows() { return prompt_batch_rows(); }
     [[nodiscard]] static bool prompt_window_cohort() { return prompt_window_cohort_enabled(); }
+    // The executed scheduler: the environment toggles, minus groups/cohorts under the resolved solo suffix class.
+    [[nodiscard]] bool prompt_groups_on() const { return prompt_batch_enabled() && !options_.batch_cache_solo; }
+    [[nodiscard]] bool prompt_cohort_on() const { return prompt_window_cohort_enabled() && !options_.batch_cache_solo; }
     [[nodiscard]] std::size_t prefilling() const noexcept {
         return static_cast<std::size_t>(std::count_if(slots_.begin(), slots_.end(), [](const auto& s) { return s->prefilling; }));
     }
@@ -1327,11 +1331,11 @@ private:
         if(!result.enabled) return result;
         result.allow_restore=prefix_batch_cert_execution_mode(options_)==1 && !service_mode_;
         auto& c=result.config;
-        c.groups=prompt_batch_enabled();c.group_rows=prompt_batch_rows();
+        c.groups=prompt_groups_on();c.group_rows=prompt_batch_rows();
         c.group_owner=bool(slots_.front()->parents->tiled.group);
         c.small=batch_prompt_small(options_);
         const char* windows=std::getenv("STRIX_PROMPT_WINDOW");c.windows=(!windows || windows[0]!='0') && bool(s.window);
-        c.cohort=prompt_window_cohort_enabled();c.service=service_ms_>0;c.cancel=cancel_points_;c.nest_rows=nest_rows_;
+        c.cohort=prompt_cohort_on();c.service=service_ms_>0;c.cancel=cancel_points_;c.nest_rows=nest_rows_;
         c.service_ms=service_ms_;c.lookahead=lookahead_;c.prompt_share=prompt_share_;c.interleave=interleave_;
         const char* short_rows=std::getenv("STRIX_BATCH_SHORT_FIRST_ROWS");
         c.short_rows=short_rows?std::strtoull(short_rows,nullptr,10):2048ULL;
@@ -1941,7 +1945,7 @@ private:
             if (why) std::cerr << "prompt group none: " << reason << " prefilling " << prefilling() << " a " << a << " b " << b << std::endl;
             return false;
         };
-        if (!prompt_batch_enabled() || prefilling() < 2U) return none("single");
+        if (!prompt_groups_on() || prefilling() < 2U) return none("single");
         const auto& lead = slots_.front()->parents->tiled;
         auto& group = lead.group ? *lead.group : *lead.blocks;
         const auto budget = std::min(lead.group ? lead.group_owner->logical_rows() : lead.rows, prompt_batch_rows());
@@ -2014,7 +2018,7 @@ private:
         return on;
     }
     bool run_prompt_windows(Slot& oldest) {
-        if (!prompt_window_cohort_enabled()) return false;
+        if (!prompt_cohort_on()) return false;
         const auto first = oldest.prefill->window_unit();
         if (!first) return false;
         std::vector<Slot*> members{&oldest};
@@ -2255,7 +2259,7 @@ private:
     std::uint32_t nest_ratio_=[] {const char* v=std::getenv("STRIX_BATCH_NEST_RATIO");return v?static_cast<std::uint32_t>(std::clamp(std::atol(v),0L,1L<<20)):4U;}();
     [[nodiscard]] bool joins_group(const Slot& s) const {
         return paused_owner_ && serve::prompt_join(paused_owner_->logical_rows(),s.prefill->remaining(),
-            serve::PromptJoinLimits{prompt_batch_enabled(),nest_ratio_})==serve::PromptJoin::group;
+            serve::PromptJoinLimits{prompt_groups_on(),nest_ratio_})==serve::PromptJoin::group;
     }
     bool service_mode_=false;
     Slot* leaf_=nullptr;

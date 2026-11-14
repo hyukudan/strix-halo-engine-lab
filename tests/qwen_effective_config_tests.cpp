@@ -335,6 +335,35 @@ void serve_prefill_admission_tests(const ModelContract& model, const ModelManife
         return resolve_effective_config(r,model,{},manifest,validated_model_content_identity,{true,true,true},m);
     };
     {
+        // qcq: an explicit host budget + strict L0 on the HTTP batch route resolves the solo suffix class (the
+        // scheduler the L0 gate below pins by env). No mode, capture, STRIX_BATCH_CACHE_SOLO=0, AUTO and the fixed
+        // route keep the incumbent scheduler. One resolver: the same options reach the bridge and the identity.
+        const Environment base{{"STRIX_BATCH_PROMPT_SMALL","0"}};
+        auto budget=args; budget.insert(budget.end(),{"--prefix-cache-host-bytes","4294967296"});
+        auto l0=budget; l0.insert(l0.end(),{"--prefix-batch-cert","l0"});
+        const auto solo=resolve({parse(l0),base},memory).options;
+        expect(solo.batch_cache_solo && solo.prefix_batch_cert==1 && solo.batch_cache_solo_reason=="l0-restore" &&
+            prefix_batch_cert_execution_mode(solo)==1,"qcq: explicit batch budget + L0 resolves the solo scheduler");
+        auto kept_env=base; kept_env["STRIX_BATCH_CACHE_SOLO"]="0";
+        const auto kept=resolve({parse(l0),kept_env},memory).options;
+        expect(!kept.batch_cache_solo && kept.prefix_batch_cert==1 && kept.batch_cache_solo_reason=="STRIX_BATCH_CACHE_SOLO=0",
+            "qcq: STRIX_BATCH_CACHE_SOLO=0 keeps the incumbent scheduler");
+        auto capture=budget; capture.insert(capture.end(),{"--prefix-batch-cert","capture"});
+        const auto cap=resolve({parse(capture),base},memory).options;
+        expect(!cap.batch_cache_solo && cap.prefix_batch_cert==2 && cap.batch_cache_solo_reason=="no-l0-restore",
+            "qcq: capture-only mode keeps the incumbent scheduler");
+        const auto none=resolve({parse(budget),base},memory).options;
+        expect(!none.batch_cache_solo && none.prefix_batch_cert==0 && none.batch_cache_solo_reason=="no-l0-restore",
+            "qcq: explicit budget without a mode is unchanged");
+        const auto automatic=resolve(request,memory).options;
+        expect(!automatic.batch_cache_solo && automatic.batch_cache_solo_reason=="automatic-unqualified",
+            "qcq: AUTO batch stays declined (no qualified batch row)");
+        auto fixed=budget; *(std::find(fixed.begin(),fixed.end(),"--http-batch")+1)="1";
+        const auto single=resolve({parse(fixed),base},memory).options;
+        expect(!single.batch_cache_solo && single.batch_cache_solo_reason=="not-batch",
+            "qcq: the fixed route is unchanged");
+    }
+    {
         // Native joining gate shape: pinned MTP server args (C24576, T8192 serving prefill),
         // explicit 4 GiB host budget, --http-batch 3 --prefix-batch-cert l0, gate env.
         // The HTTP 1024-row checkpoint default applies; joining must still be armed.
