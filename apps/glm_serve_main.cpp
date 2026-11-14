@@ -59,6 +59,7 @@
 #include "strix/serve/api.hpp"
 #include "strix/serve/bpe_tokenizer.hpp"
 #include "strix/serve/glm_chat.hpp"
+#include "strix/serve/prefill_interleave.hpp"
 #include "strix/session/speculation_default.hpp"
 #include "strix/serve/http_server.hpp"
 
@@ -903,6 +904,7 @@ int main(int argc, char** argv) {
                     [&](const std::function<void(const char*, const char*)>& set) { rd::apply_env(eff, set); });
                 std::fputs(strix::glm::pf::dense_policy::chunk_line(chunk).c_str(), stdout);
                 prefill_chunk = chunk.tokens;
+                std::fputs(("effective serve-" + strix::serve::PrefillInterleave::from_env(strix::envcfg::text).describe(prefill_chunk) + "\n").c_str(), stdout);
             }
             std::printf("serve slots=%u capacity=%llu batch=%s short-first=%s prefill-chunk=%u (mtp %d) c1-mtp=%s kmax=%u adaptive=%d cycles/round=%u\n",
                         opt.slots, static_cast<unsigned long long>(opt.capacity), serial ? "serial" : "on", short_first ? "on" : "off", prefill_chunk,
@@ -1000,6 +1002,8 @@ int main(int argc, char** argv) {
             const auto chunk = strix::glm::record_prefill_chunk("http", prefill_chunk_explicit, prefill_chunk, opt.world, opt.max_rows, prefill_mode);
             prefill_chunk = chunk.tokens;
             std::printf("rank %u %s", opt.rank, strix::glm::pf::dense_policy::chunk_line(chunk).c_str());
+            if (opt.rank == 0)
+                std::printf("rank 0 effective serve-%s\n", strix::serve::PrefillInterleave::from_env(strix::envcfg::text).describe(prefill_chunk).c_str());
             hello.route_fingerprint = static_cast<std::uint32_t>(fp ^ (fp >> 32));
             std::printf("rank %u: route fingerprint %016llx\n", opt.rank, static_cast<unsigned long long>(fp));
         }
@@ -1139,6 +1143,9 @@ int main(int argc, char** argv) {
         lc.prefix_reply_store = strix::envcfg::flag("STRIX_GLM_SERVE_REPLY_KEEP", false, strix::EnvFlagMatch::exact);
         lc.prefix_identity = gs::fnv1a64(&hello.model_hash, sizeof(hello.model_hash), hello.identity_hash);
         lc.prefill_chunk = prefill_chunk;
+        lc.interleave = strix::serve::PrefillInterleave::from_env(strix::envcfg::text);
+        lc.prefill_chunk_cap = opt.max_rows;
+        lc.prefill_timeline = static_cast<unsigned>(std::max(0, strix::envcfg::integer("STRIX_SERVE_PREFILL_TIMELINE", 0)));
         lc.prefill_chunk_mtp = prefill_chunk_mtp;
         lc.mtp = mtp_on;
         lc.mtp_cycles = mtp_cycles;

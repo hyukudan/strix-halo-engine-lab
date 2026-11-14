@@ -1278,6 +1278,21 @@ token 1.6 s against 1.8 s; one to four concurrent requests run the same order (n
 `STRIX_SERVE_ADMIT_FIRST_MIN_LIVE` moves the crossover and `STRIX_SERVE_ADMIT_FIRST_GAP_MS` the wait bound.
 `STRIX_DS41_SERVE_STEP_TRACE=1` prints one line per decode step, device prefill and held step. The rule is
 `serve::AdmitFirst` in `include/strix/serve/prompt_service.hpp`, engine neutral.
+
+**Prefill chunks grouped by the decode cohort.** A server that prefills a new prompt in chunks between decode rounds
+pays a cost per prefill call on top of the cost per token, so many small chunks cost more per token than a few large
+ones; a chunk also stalls every decoding request while it runs. `serve::PrefillInterleave`
+(`include/strix/serve/prefill_interleave.hpp`, engine neutral, pure arithmetic) sizes the chunk by the cohort: the
+first chunk of a prompt stays at the server's base chunk and measures the cost per token; later chunks group up to
+four base chunks while at most two requests decode, half as many for every doubling of the cohort, never more than a
+3 s decode stall at the measured cost and never more than the engine takes in one call. A chunk of k base chunks is
+followed by k decode rounds, so the decoding requests keep the same rounds per prompt token. Chunk boundaries of a
+prompt already depend on the load (the whole prompt when nothing decodes), so the grouping stays inside the exactness
+class of the server's chunked prefill. The GLM-5.3 server uses it by default (see its model page for the measured
+gain); `STRIX_SERVE_PREFILL_INTERLEAVE=0` restores one base chunk per decode round,
+`STRIX_SERVE_PREFILL_INTERLEAVE_SCALE`, `_STALL_MS`, `_SMALL_COHORT` and `_ROUNDS=1` (one decode round per chunk)
+move the rule. `STRIX_SERVE_PREFILL_TIMELINE=1` prints one `prefill-timeline` line per chunked prompt: per chunk its
+tokens, the decoding requests, the call time, and the decode rounds and time before it.
 The ordinary piece endpoints and cache snapshots stay unchanged. Arrivals, status
 and cancellation are inspected between resumes. One indivisible unit, decode sweep,
 state import or allocation can exceed the target; it is not a latency guarantee.

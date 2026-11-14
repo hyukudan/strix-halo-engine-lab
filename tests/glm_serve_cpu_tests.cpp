@@ -527,6 +527,8 @@ PairRun run_pair(unsigned n, std::uint32_t slots, bool batch, std::uint32_t toke
     lc.mtp = mtp;
     lc.mtp_cycles = 2;
     lc.prefill_chunk = chunk;
+    // These levels assert the base interleave (one chunk per decode round); the grouped form has its own case below.
+    lc.interleave.select = sv::PrefillInterleave::Select::off;
     lc.g2 = g2;
     if (import_min != 0) {  // route on: the fake ranks stage at import_expect, the 'RTX' always accepts
         lc.rtx_prefill = [](std::span<const std::uint32_t>, std::uint32_t) { return true; };
@@ -1382,7 +1384,9 @@ int main(int argc, char** argv) {
         CHECK(r.lead_error.empty() && r.follow_error.empty() && r.driver_error.empty() && r.result.exact && r.log0 == r.log1);
     }
     // ---- decode-first: a running stream gets one decode round between consecutive prefill chunks of a new prompt
-    {
+    // (interleave off), or the same rounds per prompt token around grouped chunks (the shared PrefillInterleave policy:
+    // 64, then 4 x 64 while one request decodes)
+    for (const bool grouped : {false, true}) {
         FakeEng e(4);
         e.stops = false;
         gs::Channel ch({}, 0);
@@ -1393,6 +1397,9 @@ int main(int argc, char** argv) {
         lc.capacity = 4096;
         lc.heartbeat_seconds = 0.01;
         lc.prefill_chunk = 64;
+        lc.interleave.select = grouped ? sv::PrefillInterleave::Select::automatic : sv::PrefillInterleave::Select::off;
+        lc.interleave.max_stall_ms = 1e9;
+        lc.prefill_timeline = grouped ? 1 : 0;
         std::atomic<bool> stop{false};
         gs::Lead<FakeEng> lead(e, ch, queue, lc, stop);
         std::thread runner([&] { lead.loop(); });
@@ -1416,21 +1423,24 @@ int main(int argc, char** argv) {
         while (!done) (void)ta->wait(std::chrono::milliseconds(100), done);
         stop.store(true);
         runner.join();
-        // between two chunk calls of the big prompt there is exactly one step
-        int last_chunk = -1, violations = 0, chunks = 0;
+        // between two chunk calls of the big prompt there is exactly one step; grouped: 64 + 256 + 256 + 64 tokens with
+        // 1, 4 and 4 steps after the first three chunks (the same 9 steps the 10 single chunks get)
+        int last_chunk = -1, violations = 0, chunks = 0, steps_between = 0;
+        const int want_grouped[3] = {1, 4, 4};
         for (std::size_t i = 0; i < e.log.size(); ++i) {
             if (e.log[i].rfind("prefill 1 ", 0) == 0) {
                 if (last_chunk >= 0) {
                     int st = 0;
                     for (std::size_t j = static_cast<std::size_t>(last_chunk) + 1; j < i; ++j) st += e.log[j].rfind("step", 0) == 0 ? 1 : 0;
-                    if (st != 1) ++violations;
+                    if (st != (grouped ? want_grouped[std::min(chunks - 1, 2)] : 1)) ++violations;
+                    steps_between += st;
                 }
                 last_chunk = static_cast<int>(i);
                 ++chunks;
             }
         }
-        CHECK(chunks == 10 && violations == 0);
-        std::printf("decode-first interleave: %d chunks of the 640-token prompt, one step between consecutive chunks: %s\n", chunks,
+        CHECK(chunks == (grouped ? 4 : 10) && violations == 0 && steps_between == 9);
+        std::printf("decode-first interleave (%s, %d steps between chunks): %d chunks of the 640-token prompt, expected step pattern: %s\n", grouped ? "grouped" : "single", steps_between, chunks,
                     violations == 0 ? "yes" : "NO");
     }
     // ---- per-request route receipts: an imported prompt reports imported_tokens + route rtx; a refused one, its fallback
