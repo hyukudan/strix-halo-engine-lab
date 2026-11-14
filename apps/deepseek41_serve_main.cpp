@@ -635,7 +635,7 @@ std::unique_ptr<VisionStack> make_vision_stack(const Args& a, const strix::deeps
         st->encoder->load(st->weights);
         // Every first-use cost of the first image moves here: projector panels, the workspace of the largest admitted
         // image, and (STRIX_VISION_WARMUP, default 1) one grey image through the whole encode path.
-        const bool warm_up = envcfg::flag("STRIX_VISION_WARMUP", true);
+        const bool warm_up = strix::envcfg::flag("STRIX_VISION_WARMUP", true);
         const vis::PrepareReport r = vis::prepare_backend(*st->adapter, *st->encoder, st->weights, warm_up);
         const std::string warm = warm_up ? std::to_string(r.warmup_rows) + " rows " + std::to_string(static_cast<long>(r.warmup_ms)) + " ms" : "off";
         std::fprintf(stderr, "vision: resident tower + %zu projector panels, workspace for %u rows, %.1f MiB on the device (%.0f ms); warm-up %s\n",
