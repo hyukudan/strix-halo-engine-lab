@@ -302,6 +302,12 @@ serial route, `--profile default` vs `--profile fast`, two interleaved pairs) pr
 (−2.9 %, 1,371 → 1,412 tok/s)**, every fast run faster than every default run; decode is unchanged. See the
 [catalog](../../optimizations.md#qwen-moe-route-bf16).
 
+**MoE route pruning — optional toggle, default OFF, in no profile.** `STRIX_QPF2K_MOE_ROUTE_PRUNE=cap9` (or
+`--prefill-moe-route-prune cap9`) drops the lowest-weight expert of every prefill row before the route plan is built:
+about 2 % less prefill time at 8,192 and 32,768 tokens, inside the composite FAST gate at both lengths. `cap8` gives
+4-5 % and leaves the gate at 32,768 tokens. It changes logits and adds `+rp<spec>` to the prefill identity; unset it and
+restart to roll back. Numbers and grammar: [moe-route-prune](../../engine/kernels/moe-route-prune.md).
+
 **Chunked GDN prefill on FP16 WMMA — opt-in candidate, pending qualification.** `STRIX_QPF2K_GDN_FP16_CHUNK=1`
 (or `--gdn-fp16-chunk 1`) runs the GDN layers' conv, recurrence and gated norm as 32-row chunks on FP16 WMMA with FP32
 accumulation and FP32 state (identity `qwen-gdn-fp16-chunk rev 2`; the input projection then writes its BF16-rounded

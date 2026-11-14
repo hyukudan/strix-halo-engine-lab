@@ -4342,7 +4342,7 @@ static int run_decode_entry(
         // prefill arenas (one prompt runs at a time), backends bound to its session, its own cache view. Under
         // a split prefill profile the owners run the sibling prefill execution with the prefill launcher
         // configuration over this slot's resources, and each backend hands this slot's session to it and back.
-        const auto add_tiled = [&](CohortStack& stack) {
+        const auto add_tiled = [&](CohortStack& stack, strix::qpf2k::PrefillConstruction construction) {
             if (!known_prefill_plan || !known_prefix_memory)
                 throw std::logic_error("batched MTP requests need the tiled prefill");
             const auto workspace = [&](const std::shared_ptr<KnownPromptMemory>& arena) {
@@ -4367,6 +4367,22 @@ static int run_decode_entry(
             stack.blocks = std::make_unique<strix::HipKnownPromptBackend>(stack.block_owner, stack.session,
                 known_prefix_memory->scratch, model.vocab_size, original_work_device);
             hand_off(*stack.blocks);
+            // A failed admission poisons the owner: unwind before publishing this slot.
+            // On-demand slots retain execution-time admission of the geometry actually used.
+            {
+                const auto setup_start = std::chrono::steady_clock::now();
+                if (strix::qpf2k::prepare_first_block_admission(options.early_setup, construction,
+                    *stack.block_owner, stack.session, [&](auto& setup_session) {
+                        if (compiled_prefill)
+                            strix::hand_off_serial_session(setup_session, {&compiled, &stack.parents->resources},
+                                {&*compiled_prefill, &stack.prefill_resources});
+                    })) {
+                    static const bool setup_timing = strix::envcfg::flag("STRIX_PREFILL_TIMING", false);
+                    if (setup_timing)
+                        std::fprintf(stderr, "prefill startup static-setup %.2f ms (resident slot, outside any request)\n",
+                            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - setup_start).count());
+                }
+            }
             for (std::size_t t = 0; t < known_tail_plans.size(); ++t) {
                 stack.tail_owners.push_back(std::make_shared<strix::HipKnownPrefixWindow>(*known_tail_plans[t], owner_compiled, model,
                     owner_catalog, owner_resources, known_tail_memories[t]->scratch, known_tail_memories[t]->scope,
@@ -4511,7 +4527,7 @@ static int run_decode_entry(
             if (single_route) capacity.slots=1;
             if (capacity.slots >= 2U) {
                 auto probe = make_stack();
-                add_tiled(*probe);
+                add_tiled(*probe, strix::qpf2k::PrefillConstruction::startup);
                 check_hip(hipDeviceSynchronize(), "HTTP slot measurement fence");
                 const auto after = observe();
                 const auto delta = [](std::optional<std::uint64_t> a, std::optional<std::uint64_t> b) {
@@ -4781,12 +4797,12 @@ static int run_decode_entry(
         }
         if (batch_slots) {
             batch_stream = std::make_shared<const SharedWindowStream>();
-            const auto build_slot = [&, batch_stream]() -> strix::decode_cli::MtpBatchSlotSetup {
+            const auto build_slot = [&, batch_stream](strix::qpf2k::PrefillConstruction construction) -> strix::decode_cli::MtpBatchSlotSetup {
                 const auto slot = batch_stacks.size() + 1U;
                 const auto built = std::chrono::steady_clock::now();
                 auto stack = make_stack();
                 const auto stacked = std::chrono::steady_clock::now();
-                add_tiled(*stack);
+                add_tiled(*stack, construction);
                 batch_stacks.push_back(std::move(stack));
                 // STRIX_HTTP_SLOT_TIMING=1: setup time of every extra slot (stack, tiled owners).
                 static const bool timing = strix::envcfg::flag("STRIX_HTTP_SLOT_TIMING", false);
@@ -4800,10 +4816,13 @@ static int run_decode_entry(
             for (const auto& stack : batch_stacks)
                 parents->batch_slots.push_back({stack->parents, &stack->session, &*stack->dispatcher,
                     window_factory_for(stack->parents, batch_stream)});
-            while (batch_stacks.size() + 1U < eager_slots) parents->batch_slots.push_back(build_slot());
+            while (batch_stacks.size() + 1U < eager_slots)
+                parents->batch_slots.push_back(build_slot(strix::qpf2k::PrefillConstruction::startup));
             parents->batch_capacity = batch_slots;
             parents->batch_memory_ok = batch_memory_ok;
-            parents->grow_batch_slot = build_slot;
+            parents->grow_batch_slot = [build_slot] {
+                return build_slot(strix::qpf2k::PrefillConstruction::on_demand);
+            };
             parents->serve_batch = options.http_serve
                 ? strix::decode_cli::make_http_batch_serve(options, "native MTP batched decode (" + std::to_string(batch_slots) +
                     " slots), profile " + std::string(optimization_profile.selected) + ", context " + std::to_string(options.context_tokens),
@@ -6046,10 +6065,11 @@ static int run_decode_entry(
             const auto setup_start=std::chrono::steady_clock::now();
             // Use the existing sibling handoff on a copy; the live decode session and
             // persistent state stay at their original frontier until the real block.
-            auto setup_session=session;
-            if(compiled_prefill)
-                strix::hand_off_serial_session(setup_session,{&compiled,&resources},{&*compiled_prefill,&prefill_resources});
-            known_prefix_owner->prepare_prefill_geometry(setup_session);
+            strix::qpf2k::prepare_first_block_admission(true, strix::qpf2k::PrefillConstruction::startup,
+                *known_prefix_owner,session,[&](auto& setup_session) {
+                if(compiled_prefill)
+                    strix::hand_off_serial_session(setup_session,{&compiled,&resources},{&*compiled_prefill,&prefill_resources});
+            });
             const char* timing=std::getenv("STRIX_PREFILL_TIMING");
             if(timing && timing[0]=='1')
                 std::fprintf(stderr,"prefill startup static-setup %.2f ms (outside generation request)\n",
@@ -6608,8 +6628,10 @@ static int run_decode_entry(
                 << "  \"known_prefix_source_projection_launches_saved_per_window\":" << (known_prefill_plan ? 0U : known_prefix_plan->projection_launches_saved) << ",\n"
                 << "  \"known_prefix_source_logical_weight_bytes_avoided_per_window\":" << (known_prefill_plan ? 0U : known_prefix_plan->logical_projection_weight_bytes_avoided) << ",\n";
         }
-        if (generation_request_timing_enabled)  // shared power receipt of the timed request (strix/power/sampler.hpp)
-            std::cout << "  \"power\":" << strix::power::block_json(strix::power::request_block(generation_request_start, generation_request_stop, options.tokens.size(), result.generated_tokens.size())) << ",\n";
+        // Shared power receipt of the timed request (strix/power/sampler.hpp); no member with STRIX_POWER_SAMPLER=0.
+        if (generation_request_timing_enabled && strix::power::sampler_enabled())
+            if (const auto member = strix::power::block_member(strix::power::request_block(generation_request_start, generation_request_stop, options.tokens.size(), result.generated_tokens.size())); !member.empty())
+                std::cout << "  " << member << ",\n";
         if (generation_request_timing_enabled)
             std::cout << "  \"generation_request_elapsed_ms\":" << generation_request_elapsed_ms << ",\n"
                       << "  \"generation_request_output_tokens\":" << result.generated_tokens.size() << ",\n"

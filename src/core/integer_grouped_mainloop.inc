@@ -16,10 +16,11 @@ constexpr unsigned CodeBytes = 16384, DeltaBytes = 2048;
 constexpr unsigned StageBytes = Operand::activation_bytes + Operand::sum_bytes;
 constexpr unsigned RowWords = Operand::chunk_row_bytes / 4;
 constexpr unsigned RunWords = 32 * RowWords, Loads = (RunWords + 511) / 512;
-__shared__ unsigned long long grid[!Q2 && !Direct ? 256 : 1];
+// The IQ2_XXS grid is staged for every codec that decodes through it, also without the LDS weight tile.
+__shared__ unsigned long long grid[!Q2 && !Operand::direct_weights ? 256 : 1];
 __shared__ unsigned sources[16], slots[Adapter::kFinish ? 16 : 1];
 __shared__ float values[Adapter::kFinish ? BM * BN : 1];
-if constexpr (!Q2 && !Direct)
+if constexpr (!Q2 && !Operand::direct_weights)
     for (unsigned i = unsigned(thread); i < 256; i += G::threads) grid[i] = ad.grid()[i];
 if (thread < rows) {
     sources[thread] = ad.source(at, thread);
@@ -157,7 +158,7 @@ for (unsigned chunk = 0; chunk < chunks; ++chunk) {
             if (next < groups) ahead = Operand::load_raw(own_row, next);
         } else raw = Operand::load_raw(tile + (pair * 32 + unsigned(lane)) * Operand::chunk_row_bytes, gg);
         const auto own = [&] {
-            if constexpr (Direct) return Ops::decode(raw, grid);
+            if constexpr (Operand::direct_weights) return Ops::decode(raw, grid);
             else return Ops::decode_lean(raw, grid);
         }();
         const V4 x0 = other4(own.b0), x1 = other4(own.b1);

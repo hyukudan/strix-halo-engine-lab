@@ -756,7 +756,10 @@ int main(int argc, char** argv) {
         opt.model_dir = argv[1];
         opt.slots = 8;
         std::string transport_spec, host = "127.0.0.1", model_id = "glm-5.3-flash", api_key_file;
-        unsigned port = 8080, selftest = 0, selftest_tokens = 128, heartbeat_ms = 1000, mtp_cycles = 1, prefill_chunk = 512;
+        unsigned port = 8080, selftest = 0, selftest_tokens = 128, heartbeat_ms = 1000, mtp_cycles = 1;
+        // --prefill-chunk: resolved after the engine options (strix::glm::record_prefill_chunk, the shared resolver).
+        unsigned prefill_chunk = strix::glm::pf::dense_policy::kServeChunk;
+        bool prefill_chunk_explicit = false;
         std::uint64_t prefix_cache_bytes = 4ULL << 30;  // default 4 GiB per rank; --prefix-cache-gib 0 = off
         bool prefix_cache_pinned = false;                // named by the operator: a deployment plan must hold it
         bool selftest_prefix = false;
@@ -812,7 +815,7 @@ int main(int argc, char** argv) {
                 short_first_flag = v == "on" ? 1 : 0;
             }
             else if (a == "--mtp-cycles") mtp_cycles = static_cast<unsigned>(std::stoul(next()));
-            else if (a == "--prefill-chunk") prefill_chunk = static_cast<unsigned>(std::stoul(next()));
+            else if (a == "--prefill-chunk") { prefill_chunk = static_cast<unsigned>(std::stoul(next())); prefill_chunk_explicit = true; }
             else if (a == "--prefill-chunk-mtp") prefill_chunk_mtp = std::stoul(next()) != 0;
             else if (a == "--prefix-cache-gib") {
                 prefix_cache_bytes = gs::prefix_budget_bytes(next());
@@ -894,6 +897,13 @@ int main(int argc, char** argv) {
         }
         if (print_config) {
             std::fputs(rd::print(eff).c_str(), stdout);
+            {   // Dry run: the shared chunk resolver over the resolved (not yet applied) environment.
+                const auto chunk = strix::glm::pending_prefill_chunk(
+                    prefill_chunk_explicit, prefill_chunk, opt.world, static_cast<unsigned>(std::stoul(eff.max_rows.value)), eff.prefill,
+                    [&](const std::function<void(const char*, const char*)>& set) { rd::apply_env(eff, set); });
+                std::fputs(strix::glm::pf::dense_policy::chunk_line(chunk).c_str(), stdout);
+                prefill_chunk = chunk.tokens;
+            }
             std::printf("serve slots=%u capacity=%llu batch=%s short-first=%s prefill-chunk=%u (mtp %d) c1-mtp=%s kmax=%u adaptive=%d cycles/round=%u\n",
                         opt.slots, static_cast<unsigned long long>(opt.capacity), serial ? "serial" : "on", short_first ? "on" : "off", prefill_chunk,
                         prefill_chunk_mtp ? 1 : 0,
@@ -985,6 +995,11 @@ int main(int argc, char** argv) {
             // ranks on different numerical routes refuse to pair.
             const std::uint64_t fp = strix::glm::record_route_levers("http", opt.rank, eff.prefill, prefill_mode,
                                                                      ge::identity_mode_name(eng.identity_mode()), opt.max_rows);
+            // One resolver for the interleave chunk: both ranks print the value and what its dense calls take, and a
+            // declined route says why here instead of disappearing under load.
+            const auto chunk = strix::glm::record_prefill_chunk("http", prefill_chunk_explicit, prefill_chunk, opt.world, opt.max_rows, prefill_mode);
+            prefill_chunk = chunk.tokens;
+            std::printf("rank %u %s", opt.rank, strix::glm::pf::dense_policy::chunk_line(chunk).c_str());
             hello.route_fingerprint = static_cast<std::uint32_t>(fp ^ (fp >> 32));
             std::printf("rank %u: route fingerprint %016llx\n", opt.rank, static_cast<unsigned long long>(fp));
         }

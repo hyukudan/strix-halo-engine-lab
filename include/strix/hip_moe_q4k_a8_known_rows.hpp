@@ -1,6 +1,7 @@
 #pragma once
 #include "strix/hip_moe_q4k_a8_probe.hpp"
 #include "strix/q51_known_rows.hpp"
+#include "strix/moe_route_prune.hpp"
 #include <array>
 #include <span>
 #include <stdexcept>
@@ -186,6 +187,9 @@ bool prefill_da16_ran();
 bool prefill_clear_skipped();
 // True only after all three certificate producer specializations were enqueued for this call.
 bool prefill_certificate_produced();
+// RoutePrune of this thread's next enqueue_prefill calls (off by default): the route weights of pruned assignments become 0
+// and the CSR plans the kept ones only; the caller's merge must skip zero-weight slots.
+void set_prefill_route_prune(moe_core::RoutePrune prune);
 // Reserve once before any prefill submission; largest compiled T first, on its device.
 void reserve_prefill_pools(unsigned rows);
 std::array<std::uint64_t, 2> prefill_test_image_generations();

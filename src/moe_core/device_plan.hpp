@@ -177,6 +177,7 @@ template <class P> inline hipError_t enqueue(const Args<P>& a, hipStream_t strea
 //   kHistogramBins: capped unique-row and batch-size histogram bins; kInvalid: whole-plan failure bit.
 //   View; tables(View): offsets, touched, experts, begins, rows, slots pointers (only live words are written).
 //   routes(View,row), expert(View,row,slot), status(View,row), invalid<Certificate>(View,row,slot,expert,experts,bool& unsafe).
+//   kept(View,row,slot): only for enqueue(..., prune=true) (moe_core/route_prune.hpp): false = the assignment is not planned.
 //   certificate(View): mark an unsafe wave; failure(View,tid,bits,count,rows) and summary(View,tid,status,
 //   touched,batches,count,duplicates,maximum,rows,hist): engine summary adapters, including all reserved words.
 // Histograms count unique rows per touched expert and assignments per batch, with the last bin saturated.
@@ -194,10 +195,10 @@ template<class P> struct PackedPlan {
     }
     // Scratch is reserved once for capacity; enqueue never allocates. rows/top_k must fit that capacity.
     static hipError_t enqueue(typename P::View v,unsigned rows,unsigned experts,unsigned top_k,unsigned cap,
-                              unsigned* scratch,hipStream_t stream,bool certificate=false);
+                              unsigned* scratch,hipStream_t stream,bool certificate=false,bool prune=false);
 };
 
-template<class P,bool Certificate=false>
+template<class P,bool Certificate=false,bool Prune=false>
 __global__ __launch_bounds__(P::kThreads) void csr_count_kernel(typename P::View v,unsigned rows,unsigned experts,unsigned top_k,unsigned* scratch) {
     const unsigned t=threadIdx.x,count=rows*top_k,k=blockIdx.x,first=k*PackedPlan<P>::kSpan,last=min(count,first+PackedPlan<P>::kSpan);
     __shared__ unsigned n_of[P::kExperts],failure,status;
@@ -209,9 +210,12 @@ __global__ __launch_bounds__(P::kThreads) void csr_count_kernel(typename P::View
         const unsigned r=a/top_k,s=a%top_k,e=P::expert(v,r,s);
         if(P::template invalid<Certificate>(v,r,s,e,experts,unsafe))atomicOr(&failure,P::kInvalid);
         else {
+            if constexpr(Prune)if(!P::kept(v,r,s))continue;
             atomicAdd(&n_of[e],1U);
             const unsigned* const route=P::routes(v,r);
             bool repeat=false;
+            if constexpr(Prune){for(unsigned q=0;q<s;++q)repeat|=route[q]==e&&P::kept(v,r,q);}
+            else
             for(unsigned q=0;q<s;++q)repeat|=route[q]==e;
             if(repeat)atomicAdd(scratch+2U+e,1U);
         }
@@ -226,7 +230,7 @@ __global__ __launch_bounds__(P::kThreads) void csr_count_kernel(typename P::View
     if(t==0U){if(failure)atomicOr(scratch,failure);if(status)atomicOr(scratch+1U,status);}
     if(t<P::kExperts)scratch[PackedPlan<P>::kHead+k*P::kExperts+t]=n_of[t];
 }
-template<class P>
+template<class P,bool Prune=false>
 __global__ __launch_bounds__(P::kThreads) void csr_scan_kernel(typename P::View v,unsigned rows,unsigned experts,unsigned top_k,unsigned cap,unsigned blocks,unsigned* scratch) {
     const auto& csr=P::tables(v);
     const unsigned t=threadIdx.x,count=rows*top_k;
@@ -265,10 +269,12 @@ __global__ __launch_bounds__(P::kThreads) void csr_scan_kernel(typename P::View 
         }
     }
     __syncthreads();
-    if(t==0U)csr.begins[scan[2][P::kExperts-1U]]=count;
-    P::summary(v,t,status,scan[1][P::kExperts-1U],scan[2][P::kExperts-1U],count,duplicates,maximum,rows,hist);
+    // Prune: the plan holds the kept assignments only (the prefix scans above count kept ones).
+    const unsigned planned=Prune?scan[0][P::kExperts-1U]:count;
+    if(t==0U)csr.begins[scan[2][P::kExperts-1U]]=planned;
+    P::summary(v,t,status,scan[1][P::kExperts-1U],scan[2][P::kExperts-1U],planned,duplicates,maximum,rows,hist);
 }
-template<class P>
+template<class P,bool Prune=false>
 __global__ __launch_bounds__(P::kThreads) void csr_scatter_kernel(typename P::View v,unsigned rows,unsigned top_k,const unsigned* scratch) {
     constexpr unsigned Waves=P::kThreads/32U;
     const auto& csr=P::tables(v);
@@ -279,7 +285,8 @@ __global__ __launch_bounds__(P::kThreads) void csr_scatter_kernel(typename P::Vi
     for(unsigned x=t;x<Waves*(P::kExperts/2U);x+=P::kThreads)position[x/(P::kExperts/2U)][x%(P::kExperts/2U)]=0U;
     __syncthreads();
     const auto expert_at=[&](unsigned a){return P::expert(v,a/top_k,a%top_k);};
-    for(unsigned a=first+lane;a<last;a+=32U)atomicAdd(&position[wave][expert_at(a)/2U],1U<<(16U*(expert_at(a)&1U)));
+    const auto planned=[&](unsigned a){if constexpr(Prune)return P::kept(v,a/top_k,a%top_k);else{(void)a;return true;}};
+    for(unsigned a=first+lane;a<last;a+=32U)if(planned(a))atomicAdd(&position[wave][expert_at(a)/2U],1U<<(16U*(expert_at(a)&1U)));
     __syncthreads();
     if(t<(P::kExperts/2U)) {
         unsigned lo=0U,hi=0U;
@@ -289,7 +296,7 @@ __global__ __launch_bounds__(P::kThreads) void csr_scatter_kernel(typename P::Vi
     const unsigned* const base=scratch+PackedPlan<P>::kHead+k*P::kExperts;
     for(unsigned step=first;step<last;step+=32U) {
         const unsigned a=step+lane;
-        const bool valid=a<last;
+        const bool valid=a<last&&planned(a);
         const unsigned e=valid?expert_at(a):0U;
         unsigned active=static_cast<unsigned>(__ballot(valid)),peers=0U;
         while(active) {
@@ -309,10 +316,22 @@ __global__ __launch_bounds__(P::kThreads) void csr_scatter_kernel(typename P::Vi
 
 template<class P>
 inline hipError_t PackedPlan<P>::enqueue(typename P::View v,unsigned rows,unsigned experts,unsigned top_k,unsigned cap,
-                                        unsigned* scratch,hipStream_t stream,bool certificate) {
+                                        unsigned* scratch,hipStream_t stream,bool certificate,bool prune) {
     const unsigned blocks=blocks_for(rows,top_k);
     hipError_t e=hipMemsetAsync(scratch,0,kHead*sizeof(unsigned),stream);
     if(e!=hipSuccess)return e;
+    if(prune) {
+        if constexpr(requires { P::kept(v,0U,0U); }) {
+            // Pruned plan (P::kept): the same three launches over the kept assignments; the default instantiations are untouched.
+            if(certificate)csr_count_kernel<P,true,true><<<blocks,P::kThreads,0,stream>>>(v,rows,experts,top_k,scratch);
+            else csr_count_kernel<P,false,true><<<blocks,P::kThreads,0,stream>>>(v,rows,experts,top_k,scratch);
+            csr_scan_kernel<P,true><<<1,P::kThreads,0,stream>>>(v,rows,experts,top_k,cap,blocks,scratch);
+            csr_scatter_kernel<P,true><<<blocks,P::kThreads,0,stream>>>(v,rows,top_k,scratch);
+            return hipGetLastError();
+        } else {
+            return hipErrorInvalidValue;  // Optional policy hook: ordinary plans need not provide it.
+        }
+    }
     if(certificate)csr_count_kernel<P,true><<<blocks,P::kThreads,0,stream>>>(v,rows,experts,top_k,scratch);
     else csr_count_kernel<P><<<blocks,P::kThreads,0,stream>>>(v,rows,experts,top_k,scratch);
     csr_scan_kernel<P><<<1,P::kThreads,0,stream>>>(v,rows,experts,top_k,cap,blocks,scratch);

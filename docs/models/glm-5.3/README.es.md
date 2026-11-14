@@ -111,7 +111,7 @@ Interruptores MLA del prefill: `STRIX_GLM_PF_SCORES=6` y `STRIX_GLM_PF_OBAR=7` (
 Valores predeterminados: 8 slots de petición (`--slots`, 8 como máximo), 8192 posiciones por slot (`--capacity`),
 autoespeculación MTP exacta con una sola petición en curso, verificación MTP por lotes con varias
 (`STRIX_GLM_SERVE_G2=0` = pasos simples por lotes) y prefill por chunks de 512 tokens con prioridad al decode mientras
-otras peticiones decodifican (`--prefill-chunk 0` = prompts enteros). `--serial` admite una petición cada vez;
+otras peticiones decodifican (`--prefill-chunk 0` = prompts enteros). El chunk lo resuelve la misma regla de rutas que la CLI: ambos rangos imprimen `effective serve-prefill-chunk=...` con el núcleo denso que toman sus llamadas y el motivo cuando un chunk no alcanza el núcleo de llamadas grandes. `--serial` admite una petición cada vez;
 `--api-key-file F` exige una clave bearer. `--selftest N` en el rank 0 (sin HTTP) ejecuta N prompts integrados juntos
 y cada uno por separado e informa EXACT/FAIL con tok/s por nivel de concurrencia.
 

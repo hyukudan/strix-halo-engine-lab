@@ -2,6 +2,7 @@
 // HTTP API contract tests with a scripted engine (no GPU): OpenAI chat/completions (plain and
 // SSE), tool calls, stop strings, Anthropic messages (plain and events), errors and API keys,
 // two concurrent clients through the FIFO queue, and cancellation when a client disconnects.
+#include "strix/power/sampler.hpp"
 #include "strix/serve/api.hpp"
 #include "strix/serve/constraint_selection.hpp"
 
@@ -859,7 +860,13 @@ void test_scoring_transforms(const std::shared_ptr<const BpeTokenizer>& tokenize
     check(run(t, {}, logits) == std::vector<std::uint32_t>{'a','a','a'}, "composition tie resolves to the lowest id");
 }
 
+struct AuthorizationPowerSource final : strix::power::Source {
+    strix::power::SourceStatus probe() override { return {"authorization-test", true, "deterministic power"}; }
+    void read(strix::power::Sample& sample) noexcept override { sample.add_power(strix::power::Domain::accelerator, 100.0); }
+};
+
 int main() try {
+    strix::power::register_source("authorization-test", [](const std::string&) { return std::make_unique<AuthorizationPowerSource>(); });
     [[maybe_unused]] SocketRuntime sockets;
     {
         // Large objects: repeated keys keep their first position and the last value (serving parser) or fail (unique
@@ -1902,6 +1909,24 @@ int main() try {
         check(at(incomplete, "status").as_string() == "incomplete" && at(at(incomplete, "incomplete_details"), "reason").as_string() == "max_output_tokens", "responses non-stream incomplete");
         const auto status = parse_json(http(port, "GET", "/api/status", "").body);
         check(at(at(status, "requests").as_array()[0], "route").as_string() == "responses", "responses recent request route");
+        // Host power telemetry is not part of the open status: with an API key configured it needs the key.
+        check(!status.find("power"), "power telemetry served without the API key");
+        for (const auto& recent : at(status, "requests").as_array()) check(!recent.find("power"), "request power receipt served without the API key");
+        check(strix::power::sampler_enabled(), "authorization fixture needs the sampler enabled");
+        const auto keyed = parse_json(http(port, "GET", "/api/status", "", auth).body);
+        check(keyed.find("power") && at(*keyed.find("power"), "schema").as_string() == "strix-power-status-v1", "power view with the API key");
+        const auto& keyed_recent = at(keyed, "requests").as_array();
+        check(!keyed_recent.empty() && keyed_recent[0].find("power"), "keyed recent request must carry an actual power receipt");
+        const auto wrong = parse_json(http(port, "GET", "/api/status", "", "Authorization: Bearer wrong\r\n").body);
+        check(!wrong.find("power"), "power telemetry with a wrong key");
+        for (const auto* view : {&status, &wrong}) {
+            const auto& recent = at(*view, "requests").as_array();
+            check(recent.size() == keyed_recent.size(), "authorization views cover the same requests");
+            for (std::size_t i = 0; i < recent.size(); ++i) {
+                check(at(recent[i], "id").dump() == at(keyed_recent[i], "id").dump(), "same request in authorization views");
+                check(!recent[i].find("power"), "request power receipt requires the correct key");
+            }
+        }
         for (const char* input : {"Hi", "TOOL", "ENGINE_ERROR", "length"}) {
             Json request = Json::object(); request.set("input", Json(input)); request.set("stream", Json(true));
             if (std::string(input) == "TOOL") request.set("tools", parse_json(R"([{"type":"function","name":"get_weather","parameters":{"type":"object","properties":{"days":{"type":"integer"}}}}])"));

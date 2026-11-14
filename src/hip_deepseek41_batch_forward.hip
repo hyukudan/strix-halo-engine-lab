@@ -1918,13 +1918,9 @@ const std::vector<std::uint32_t>& BatchForward::run_step(std::span<const BatchRo
     static const bool attn_a8 = strix::envcfg::flag("STRIX_DS41_ATTN_A8", false);
     // STRIX_DS41_BATCH_SEGMENTS (default on since P17.2, =0 off): the stateful attention kernels of every request segment
     // in one launch per kernel (enqueue_*_segments), each segment's blocks unchanged, same bits. The segment views below
-    // are sized for max_rows requests: unset, it is off with STRIX_DS41_BATCH_ROWS16=1 (16 rows); =1 with ROWS16 is refused.
-    static const char* const segments_env = std::getenv("STRIX_DS41_BATCH_SEGMENTS");
-    static const bool batch_segments = segments_env != nullptr && segments_env[0] != '\0'
-                                           ? segments_env[0] == '1'
-                                           : BatchForward::configured_row_limit() <= BatchForward::max_rows;
-    if (batch_segments && BatchForward::configured_row_limit() > BatchForward::max_rows)
-        throw std::invalid_argument("deepseek41 batch forward: STRIX_DS41_BATCH_SEGMENTS=1 is not qualified with STRIX_DS41_BATCH_ROWS16=1");
+    // hold one view per request of the configured step limit (8, or 16 with STRIX_DS41_BATCH_ROWS16=1); the device side
+    // flushes a launch every attn::hip::kMaxSegments views, so 16 requests are two launches per kernel instead of 16.
+    static const bool batch_segments = strix::envcfg::flag("STRIX_DS41_BATCH_SEGMENTS", true);
     struct PendingPost { bool on = false; const float* sub = nullptr; const float* residual = nullptr; const ds41::HcMix* mixes = nullptr; };
     PendingPost post;  // an expansion not yet enqueued; stream_now() is already its output
     // capture_main_hidden (as DeviceForward): the input of layers [layers - 3, layers) once the expansion is stored
@@ -2508,7 +2504,7 @@ const std::vector<std::uint32_t>& BatchForward::run_step(std::span<const BatchRo
         case Op::window_write: {
             if (attn::hip::attention_window_fold()) break;   // STRIX_DS41_ATTN_WINDOW_FOLD: the attention kernel inserts the rows
             const auto& r = m.roles[layer];
-            std::array<attn::hip::WindowView, max_rows> views{};
+            std::array<attn::hip::WindowView, extended_max_rows> views{};
             std::size_t nv = 0;
             for (const auto& g : segments) {
                 attn::hip::WindowView v{};
@@ -2544,7 +2540,7 @@ const std::vector<std::uint32_t>& BatchForward::run_step(std::span<const BatchRo
                 ds41::enqueue_f16_rows_pair(f16_proj(p + "attn_compressor_kv.weight", m.ckv[layer].p),
                                             f16_proj(p + "attn_compressor_gate.weight", m.cscore[layer].p), st);
             else ds41::enqueue_f16_rows(f16_proj(p + "attn_compressor_kv.weight", m.ckv[layer].p), st);
-            std::array<attn::hip::CompressView, max_rows> views{};
+            std::array<attn::hip::CompressView, extended_max_rows> views{};
             std::size_t nv = 0;
             for (const auto& g : segments) {
                 auto& L = m.slots[g.slot].layers[layer];
@@ -2603,8 +2599,8 @@ const std::vector<std::uint32_t>& BatchForward::run_step(std::span<const BatchRo
                 wv.out = m.iw.p;
                 ds41::enqueue_f16_rows_pair(qv, wv, st);  // one launch with STRIX_DS41_F16_PAIR=1 (F16 q_b)
             }
-            std::array<attn::hip::IndexView, max_rows> ivs{};
-            std::array<attn::hip::SelectView, max_rows> svs{}, dvs{};
+            std::array<attn::hip::IndexView, extended_max_rows> ivs{};
+            std::array<attn::hip::SelectView, extended_max_rows> svs{}, dvs{};
             std::size_t nv = 0, nd = 0;
             for (const auto& g : segments) {
                 const std::uint32_t count = (g.position + g.count) / ratio;  // of the segment's last row
@@ -2666,7 +2662,7 @@ const std::vector<std::uint32_t>& BatchForward::run_step(std::span<const BatchRo
         }
         case Op::attention: {
             const auto& r = m.roles[layer];
-            std::array<attn::hip::AttentionView, max_rows> views{};
+            std::array<attn::hip::AttentionView, extended_max_rows> views{};
             std::size_t nv = 0;
             for (const auto& g : segments) {
                 const auto& S = m.slots[g.slot];

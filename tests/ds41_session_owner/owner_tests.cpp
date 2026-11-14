@@ -225,6 +225,8 @@ void actual_lead(Args a,const Prepare& prepare) {
     strix::ds41::hetero::Stage native_stage(fwd);
     strix::ds41::hetero::Stage* stage=witness::scenario.starts_with("hetero")?&native_stage:nullptr;
     double hetero_step_seconds=0;
+    // Rank checksum reporting is outside this host control fixture.
+    struct StepTokenDigest { void add(std::span<const std::uint32_t>) {} } step_tokens;
     const auto sched=strix::deepseek41::sched::options_from_env(a.device_prefill);
     serve::GenerationQueue queue(a.max_queue);
     witness::queue=&queue;

@@ -237,6 +237,9 @@ struct GenerationStats {
     std::string sampling = "greedy";
     // Engine receipts added to the response's "strix" object: (member name, JSON value text). Empty: none.
     std::vector<std::pair<std::string, std::string>> engine_extra;
+    // Steady-clock nanoseconds of the job's execution span, stamped by the queue when the job finishes (0: not
+    // stamped). The power receipt of a request is taken over this span, not over the time its response is rendered.
+    std::int64_t exec_begin_ns = 0, exec_end_ns = 0;
 };
 
 // A request-local failure preserves its terminal receipt without poisoning the engine.

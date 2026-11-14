@@ -14,6 +14,7 @@
 #include "hip_prefill_pool.hpp"
 #include "strix/dispatch_fuse.hpp"
 #include "strix/qpf2k_defaults.hpp"
+#include "strix/prefill_identity.hpp"
 #include "strix/hip_mtp_target_window.hpp"
 #include "strix/hip_ple_launcher.hpp"
 #if defined(STRIX_HAS_EXPERIMENTAL_Q4K_A8_RUNTIME)
@@ -1340,6 +1341,7 @@ struct HipKnownPrefixWindow::Impl {
         // fast-prefill-f16wmma-v1 moe component: T-row prefill blocks run the routed MoE in FP16 WMMA.
         routed_config.prefill_f16wmma=(config.fast_prefill_components & kFastPrefillMoe) != 0U;
         routed_config.prefill_moe_route_bf16=(config.fast_prefill_components & kFastPrefillMoeRouteBF16) != 0U;
+        routed_config.prefill_moe_route_prune=prefill_route_prune_active();
         routed_config.q4k_a8_stats=config.q4k_a8_stats;
         routed_config.q4k_a8_quiescence=std::make_shared<HipSetupQuiescenceGuard>();
         for(std::size_t i=0;i<window.mode.size();++i)
@@ -1646,7 +1648,10 @@ struct HipKnownPrefixWindow::Impl {
             const auto assignments=prefill_rows_done*u32(model.num_experts_per_token);
             std::uint64_t experts=0,batches=0;
             for(std::uint32_t i=0;i<8U;++i){experts+=s.rows_per_expert_histogram[i];batches+=s.batch_size_histogram[i];}
-            if(s.status || s.version!=1U || s.logical_rows!=prefill_rows_done || s.assignments!=assignments ||
+            // RoutePrune plans the kept assignments only: at least the best one of every row, at most all of them.
+            const bool pruned=prefill_route_prune_active().active();
+            const bool planned=pruned ? s.assignments>=prefill_rows_done && s.assignments<=assignments : s.assignments==assignments;
+            if(s.status || s.version!=1U || s.logical_rows!=prefill_rows_done || !planned ||
                 !s.touched || s.touched>assignments || s.touched>model.num_experts ||
                 s.batches<s.touched || s.batches>assignments || !s.maximum_assignments ||
                 s.maximum_assignments>assignments || s.duplicate_assignments>assignments ||

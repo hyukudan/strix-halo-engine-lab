@@ -21,6 +21,8 @@
 inline bool& prefill_certificate_flag(){static thread_local bool v=false;return v;}
 inline bool& prefill_clear_skipped_flag(){static thread_local bool v=false;return v;}
 inline int& prefill_route_override(){static int v=-1;return v;}
+inline ::strix::moe_core::RoutePrune& prefill_route_prune_slot(){static thread_local ::strix::moe_core::RoutePrune v{};return v;}
+inline ::strix::moe_core::RoutePrune prefill_route_prune_state(){return prefill_route_prune_slot();}
 // Per-call (this thread): bit 1 DA16, bit 2 ROUTE defaulted ON but off for this GSQ call (see enqueue_prefill).
 inline unsigned& prefill_moe_gsq_off(){static thread_local unsigned v=0U;return v;}
 inline unsigned prefill_route() {

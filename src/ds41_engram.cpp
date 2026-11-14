@@ -2,6 +2,8 @@
 #include "strix/ds41_engram.hpp"
 
 #include "strix/ds41_formats.hpp"
+#include "core/direct_row_fetch.hpp"
+#include "strix/env_flags.hpp"
 
 #include <chrono>
 #include <algorithm>
@@ -236,6 +238,9 @@ EngramRowReader::EngramRowReader(const std::filesystem::path& file, std::vector<
                                  bool direct_io, std::uint64_t payload_cache_bytes)
     : tables_(std::move(tables)) {
     require(threads >= 1 && threads <= 256 && !tables_.empty(), "Engram reader configuration");
+    // Resolve before opening the descriptor: invalid governed settings must not leak it.
+    const bool ring = envcfg::flag("STRIX_DS41_ENGRAM_URING", true, EnvFlagMatch::exact);
+    const unsigned depth = envcfg::number<unsigned>("STRIX_DS41_ENGRAM_URING_DEPTH", 256U, 0U, 4096U);
     if (payload_cache_bytes != 0U) {
         try { cache_ = std::make_unique<PayloadCache>(payload_cache_bytes); }
         catch (const std::bad_alloc&) { cache_.reset(); }  // an optional cache never prevents loading
@@ -268,6 +273,11 @@ EngramRowReader::EngramRowReader(const std::filesystem::path& file, std::vector<
             close_fd(fd_);
             throw std::invalid_argument("Engram table lies outside the model file");
         }
+    if (direct_) {
+        // reads in flight on the ring (STRIX_DS41_ENGRAM_URING_DEPTH, default 256: the measured best of 64..512 on the
+        // NVMe drives of both nodes; one ring against 96 threads: +15-25 % rows per second and one busy core, not 96 threads)
+        if (ring && depth != 0U) fetcher_ = core::DirectRowFetcher::make(fd_, depth);
+    }
     for (unsigned i = 0; i < threads; ++i) threads_.emplace_back([this] { worker(); });
 }
 
@@ -289,6 +299,11 @@ EngramRowReader::~EngramRowReader() {
                      static_cast<unsigned long long>(s.cache_storage_bytes), static_cast<unsigned long long>(s.cache_evictions));
     }
     if (fd_ >= 0) close_fd(fd_);
+}
+
+bool EngramRowReader::ring_io() const {
+    std::lock_guard<std::mutex> lock(read_mutex_);
+    return fetcher_ && fetcher_->usable();
 }
 
 void EngramRowReader::read_one(const EngramRowRequest& r, std::uint8_t* out, std::uint8_t* page) {
@@ -387,8 +402,29 @@ void EngramRowReader::read(std::span<const EngramRowRequest> requests, std::span
             else { misses.push_back(r); destinations.push_back(i); }
         }
     }
+    const std::span<const EngramRowRequest> todo = cache_ ? std::span<const EngramRowRequest>(misses) : requests;
+    bool fetched = false;
+    if (fetcher_ && fetcher_->usable() && !todo.empty()) {
+        std::vector<core::RowFetch> rows(todo.size());
+        for (std::size_t i = 0; i < todo.size(); ++i) {
+            const auto& r = todo[i];
+            if (r.table >= tables_.size() || r.row >= tables_[r.table].rows) throw std::out_of_range("Engram row out of range");
+            rows[i] = {tables_[r.table].file_offset + r.row * engram_row_bytes, static_cast<std::uint32_t>(engram_row_bytes)};
+        }
+        core::RowFetchStats fs;
+        try {
+            fetcher_->fetch(rows, [&](std::uint32_t i, const std::uint8_t* p) {
+                std::memcpy(out.data() + (destinations.empty() ? i : destinations[i]) * engram_row_bytes, p, engram_row_bytes);
+            }, &fs);
+        } catch (const std::runtime_error& e) {
+            throw std::runtime_error(std::string("Engram batch read failed: ") + e.what());
+        }
+        page_reads_.fetch_add(fs.rows, std::memory_order_relaxed);  // rows read from the file (a coalesced read serves several)
+        page_bytes_.fetch_add(fs.read_bytes, std::memory_order_relaxed);
+        fetched = true;
+    }
     std::unique_lock<std::mutex> lock(mutex_);
-    batch_ = cache_ ? std::span<const EngramRowRequest>(misses) : requests;
+    batch_ = fetched ? std::span<const EngramRowRequest>() : todo;
     destinations_ = destinations;
     out_ = out.data();
     finished_ = 0;

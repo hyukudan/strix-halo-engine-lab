@@ -741,6 +741,17 @@ bool pf_core_for(bool faster_form) {
     const int r = pf_core_request(false);
     return r > 0 || (r < 0 && faster_form);
 }
+// The gate/up core loads whole 1024-element chunks of IQ2_XXS (no partial-chunk path): other widths keep the kernels below.
+bool prefill_gate_up_on_core(WeightFormat format, std::uint32_t hidden, std::uint32_t batch_rows) {
+    const bool faster_form = (format == WeightFormat::q8_0 || (format == WeightFormat::iq2_xxs && hidden % 1024U == 0U)) &&
+                             batch_rows == 16U && !fast_moe() && !stage_forced() && hidden <= 5120U;
+    return pf_core_for(faster_form) || fast_i4();
+}
+bool prefill_down_on_core(WeightFormat format, std::uint32_t width, std::uint32_t batch_rows) {
+    const bool faster_form = (format == WeightFormat::q8_0 || format == WeightFormat::q2_k) && batch_rows == 16U &&
+                             !fast_moe() && !stage_forced() && width <= 5120U;
+    return pf_core_for(faster_form) || fast_i4();
+}
 bool pf_core() { return pf_core_request(false) > 0; }
 bool pf_core_dense() { return pf_core_request(true) > 0; }
 void enqueue_prefill_gate_up(WeightFormat format, const PrefillGateUpView& view, void* stream) {
@@ -754,12 +765,10 @@ void enqueue_prefill_gate_up(WeightFormat format, const PrefillGateUpView& view,
         throw std::invalid_argument("ds41 prefill gate/up view is inconsistent");
     const auto queue = static_cast<hipStream_t>(stream);
     // Rank fixture at 2048 and 4096 rows in 16-row batches, shared core against the kernels below (same bits): Q8_0 (the
-    // shared expert) -0.6..-2.2 % -> default; IQ2_XXS +0.3 % at 4096 rows (five cells, -0.0..+0.4 %; one kernel in two
-    // arms differs by up to 0.2 % there and 0.9 % at 2048 rows) -> stays on the kernels below until it is equal.
+    // shared expert) -0.6..-2.2 % -> default; IQ2_XXS without the LDS weight tile (two workgroups per WGP) -7.1..-8.2 %
+    // at 2048 / 4096 / 8192 rows -> default.
     // STRIX_DS41_PREFILL_STAGE=1 asks for the stage kernels of this file: only a named PF_CORE product overrides it.
-    const bool faster_form = format == WeightFormat::q8_0 && view.routes.batch_rows == 16U && !fast_moe() && !stage_forced() &&
-                             view.hidden <= 5120U;
-    if (pf_core_for(faster_form) || fast_i4()) {
+    if (prefill_gate_up_on_core(format, view.hidden, view.routes.batch_rows)) {
         if (view.hidden > 5120U) throw std::invalid_argument("ds41 prefill gate/up view: shared core width");
         if (format == WeightFormat::iq2_xxs) launch_gate_up_core<WeightFormat::iq2_xxs>(view, queue);
         else if (format == WeightFormat::q8_0) launch_gate_up_core<WeightFormat::q8_0>(view, queue);
@@ -824,11 +833,9 @@ void enqueue_prefill_down(WeightFormat format, const PrefillDownView& view, void
         reinterpret_cast<std::uintptr_t>(view.codes) % 16U != 0U)
         throw std::invalid_argument("ds41 prefill down view is inconsistent");
     const auto queue = static_cast<hipStream_t>(stream);
-    // Rank fixture as in gate/up: Q8_0 (the shared expert) -6.0..-7.2 % -> default; Q2_K -0.1..+2.4 % (eleven of twelve
-    // cells slower) -> stays on the kernels below. STRIX_DS41_PREFILL_STAGE=1 as in gate/up.
-    const bool faster_form = format == WeightFormat::q8_0 && view.routes.batch_rows == 16U && !fast_moe() && !stage_forced() &&
-                             view.width <= 5120U;
-    if (pf_core_for(faster_form) || fast_i4()) {
+    // Rank fixture as in gate/up: Q8_0 (the shared expert) -6.0..-7.2 % -> default; Q2_K without the LDS weight tile
+    // -2.4..-3.4 % at 2048 / 4096 / 8192 rows -> default. STRIX_DS41_PREFILL_STAGE=1 as in gate/up.
+    if (prefill_down_on_core(format, view.width, view.routes.batch_rows)) {
         if (view.width > 5120U) throw std::invalid_argument("ds41 prefill down view: shared core width");
         if (format == WeightFormat::q2_k) launch_down_core<WeightFormat::q2_k>(view, queue);
         else if (format == WeightFormat::q8_0) launch_down_core<WeightFormat::q8_0>(view, queue);

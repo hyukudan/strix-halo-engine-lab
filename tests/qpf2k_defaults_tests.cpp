@@ -53,7 +53,7 @@ void policy_tests() {
         if (qpf2k::exact_prefill_items & qpf2k::bit(entry.item))
             expect(!startup.contains(entry.name), "non-decoder clients retain exact prefill opt-ins");
     {
-        // One organisation value per owner: the server takes the organisation items with its row-pipeline bits.
+        // One organisation value per owner: the server takes the organisation items with the current row-pipeline bits.
         const auto server = qpf2k::admitted_organization(qpf2k::PrefillOwner::resident_server);
         const auto get = [](Environment& e) { return [&e](const char* name) -> const char* {
             const auto it = e.find(name); return it == e.end() ? nullptr : it->second.c_str(); }; };
@@ -61,7 +61,7 @@ void policy_tests() {
             e.emplace(name, value); return true; }; };
         Environment served;
         expect(qpf2k::apply_organization(server, get(served), put(served)) == qpf2k::prefill_organization_items &&
-            served.at("STRIX_PREFILL_PIPE") == "18" && served.at("STRIX_PREFILL_PLE_BATCH") == "1" &&
+            served.at("STRIX_PREFILL_PIPE") == "255" && qpf2k::serving_pipe_mask == 0xffU && served.at("STRIX_PREFILL_PLE_BATCH") == "1" &&
             !served.contains("STRIX_PLE_RECLAIMABLE") && !served.contains("STRIX_DISPATCH_FUSE") &&
             !served.contains("STRIX_QPF2K_SCHED"), "server organisation carries no reclamation, decoding or startup item");
         Environment single;

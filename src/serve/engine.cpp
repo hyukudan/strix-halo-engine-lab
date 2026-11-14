@@ -233,7 +233,10 @@ void GenerationQueue::run(GenerationEngine& engine, const std::function<void(con
             stats.constraint->reason = "cancelled";
         }
         stats.queue_ms = std::chrono::duration<double, std::milli>(started - entry.submitted).count();
-        const auto busy = std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
+        const auto ended = std::chrono::steady_clock::now();
+        stats.exec_begin_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(started.time_since_epoch()).count();
+        stats.exec_end_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(ended.time_since_epoch()).count();
+        const auto busy = std::chrono::duration<double>(ended - started).count();
         const bool observed = still_observed(*ticket);
         ObserveDelta delta;
         if (observed) {  // computed before the lock, which only adds it
@@ -395,7 +398,10 @@ void GenerationQueue::finish(TakenJob& job, GenerationStats stats, std::string e
     }
     stats.queue_ms = std::chrono::duration<double, std::milli>(job.started - job.submitted).count();
     // Batched jobs overlap: busy time adds each job's own service time.
-    const auto busy = std::chrono::duration<double>(std::chrono::steady_clock::now() - job.started).count();
+    const auto ended = std::chrono::steady_clock::now();
+    stats.exec_begin_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(job.started.time_since_epoch()).count();
+    stats.exec_end_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(ended.time_since_epoch()).count();
+    const auto busy = std::chrono::duration<double>(ended - job.started).count();
     const bool observed = still_observed(*job.ticket);
     ObserveDelta delta;
     if (observed) {
