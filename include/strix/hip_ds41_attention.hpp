@@ -128,6 +128,11 @@ struct AttentionView {
     // written by enqueue_attention_flash_mirror
     const std::uint16_t* ring16 = nullptr;
     const std::uint16_t* kv16 = nullptr;
+    // FAST policy ds41-decoder-replay-bounded-v1 only: the absolute position of the layer's first window key (its kv_begin);
+    // a row at pos reads the window keys max(key_floor, pos - 127) .. pos (ring slots by the real pos). 0 = every window key
+    // from position 0 (today). Non-zero binds the floored instantiations of the flash and f16wmma kernels (a compile-time
+    // policy: the incumbent instantiations are untouched); the other attention forms refuse it.
+    std::uint64_t key_floor = 0;
 };
 inline constexpr unsigned kAttnGroupCount = 8;   // at most 8 head groups per row (8 heads per block)
 // variant 0: STRIX_DS41_BF16_ATTN_VARIANT (default 1, the first kernel); 2: QK split over the waves, 16-byte key stores

@@ -78,6 +78,25 @@ struct FlashAttentionPolicy {
     __device__ static __forceinline__ void emit(const Args& v, unsigned wg, unsigned head, unsigned dim, float o) { part(v, wg, head)[2U + dim] = o; }
 };
 
+// policy ds41-decoder-replay-bounded-v1: the window keys from the layer's key_floor (visible_keys<true>); the ring slots of
+// the real positions. Its own instantiation of the flash core: FlashAttentionPolicy's code is untouched.
+struct FlashAttentionFloorPolicy : FlashAttentionPolicy {
+    __device__ static __forceinline__ unsigned count(const Args& v, unsigned wg) {
+        unsigned nw;
+        return visible_keys<true>(v, row(v, wg), nw);
+    }
+    __device__ static __forceinline__ unsigned key(const Args& v, unsigned wg, unsigned j) {
+        const unsigned r = row(v, wg);
+        const std::uint64_t p = v.pos[r], span = p + 1U - v.key_floor;
+        const unsigned nw = span < kWindow ? static_cast<unsigned>(span) : kWindow;
+        if (j < nw) {
+            unsigned slot = static_cast<unsigned>((p + 1U - nw) % v.capacity) + j;
+            if (slot >= v.capacity) slot -= v.capacity;
+            return slot;
+        }
+        return v.capacity + v.idx[static_cast<std::size_t>(r) * v.topk + j - nw];
+    }
+};
 // the row's single partial (slot 0) through the unchanged combine
 __global__ __launch_bounds__(32) void attention_flash_combine_kernel(AttentionView v) {
     attention_combine_head(v, blockIdx.y, blockIdx.x, threadIdx.x, 1U);

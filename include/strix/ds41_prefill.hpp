@@ -130,6 +130,17 @@ bool try_grow_moe_scratch(std::unique_ptr<Scratch>& current, std::uint64_t bytes
         return false;
     }
 }
+// ---- Bounded decoder replay (FAST policy ds41-decoder-replay-bounded-v1; NOT bit-equal to a full prefill) ----
+//
+// The encoder layers run every new row as above; every decoder layer runs only its last `bound` rows:
+// out_begin = kv_begin = max(cached, total - bound), and a row s of a decoder layer reads the window keys
+// max(kv_begin, s - window + 1) .. s (the key floor; no window key of that layer before the cut). The first decoder
+// layer still projects every row's compressed KV and index keys (the engine's x0 = 0): those keys stay readable.
+// When the drafter needs more rows than the bound (draft_rows > bound), every decoder layer covers total - draft_rows
+// (a layer's input rows are its predecessor's outputs). `bound` is a positive multiple of the window;
+// the ring after the run then holds rows total - window .. total - 1 of every decoder layer, as a full prefill's.
+[[nodiscard]] SuffixReplayPlan plan_bounded_replay(const SuffixReplayGeometry& geometry, std::uint64_t cached, std::uint64_t total,
+                                                   std::uint32_t bound);
 
 // Routed-MoE schedule of a row-split pair prefill. Bitwise: the MoE's rows are independent, so neither the window size
 // nor the joint / two-pass form changes a row's bits; only the number of expert reads and launches changes.

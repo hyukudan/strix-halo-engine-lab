@@ -341,6 +341,12 @@ bool prefill_moe_pass_window() { return strix::envcfg::flag("STRIX_DS41_PREFILL_
 std::uint32_t prefill_moe_window_cap() { return strix::envcfg::number<std::uint32_t>("STRIX_DS41_PREFILL_MOE_WINDOW_CAP", 8192U, 1U, 65536U); }
 bool prefill_joint_layer() { return strix::envcfg::flag("STRIX_DS41_PREFILL_JOINT_LAYER", false, strix::EnvFlagMatch::exact); }
 std::uint32_t prefill_joint_layer_rows() { return strix::envcfg::number<std::uint32_t>("STRIX_DS41_PREFILL_JOINT_LAYER_ROWS", 1024U, 0U, 65536U); }
+// FAST policy ds41-decoder-replay-bounded-v1 (STRIX_DS41_DECODER_REPLAY = R rows, a multiple of 128; 0/unset off; set by the
+// governed profile table): every decoder layer runs only its last R rows, window keys floored at the cut
+// (ds41::plan_bounded_replay). STRIX_DS41_DECODER_REPLAY_ORACLE=1 (measurement only): the exact cone's rows with the same
+// key floors, whose last-row logits and state must equal the bounded run's bit for bit (fixture b).
+std::uint32_t prefill_decoder_replay_rows() { return strix::envcfg::number<std::uint32_t>("STRIX_DS41_DECODER_REPLAY", 0U, 0U, 65536U); }
+bool prefill_decoder_replay_oracle() { return strix::envcfg::flag("STRIX_DS41_DECODER_REPLAY_ORACLE", false, strix::EnvFlagMatch::exact); }
 unsigned prefill_window_drain() { return strix::envcfg::number<unsigned>("STRIX_DS41_PREFILL_WINDOW_DRAIN", 1U, 0U, 3U); }
 bool prefill_o_low_a8_fused() {
     const char* v = std::getenv("STRIX_DS41_PREFILL_O_LOW_A8_FUSED");
@@ -1687,6 +1693,9 @@ PrefillResult DevicePrefill::run_from(std::span<const std::uint32_t> tokens, std
     // own cone, as this code plans it (rounded down to W, with the draft rows), starts at least one attention window
     // after the continuation's first row in every decoder layer, so it reads no decoder ring entry of this run.
     const std::uint32_t first_decoder = ds41::SuffixReplayGeometry{}.first_decoder;
+    // the bounded decoder replay's bound (0 off) and oracle form, agreed by both ranks with the deferral below
+    const std::uint32_t bounded = prefill_decoder_replay_rows();
+    const bool bounded_oracle = bounded != 0U && prefill_decoder_replay_oracle();
     bool defer = false;
     {
         const std::uint32_t next_rows = std::exchange(m.defer_next, 0U);
@@ -1701,30 +1710,41 @@ PrefillResult DevicePrefill::run_from(std::span<const std::uint32_t> tokens, std
                 if (pl.layer >= first_decoder && pl.out_begin / W * W < attn::kWindow) defer = false;
         }
         if (grp == nullptr && m.distributed() && m.options.cone && m.options.layers == c.num_hidden_layers) {  // both ranks: the same decision
-            const std::array<std::uint32_t, 2> mine{defer ? 1U : 0U, defer ? next_rows : 0U};
-            std::array<std::uint32_t, 2> other{};
+            const std::array<std::uint32_t, 3> mine{defer ? 1U : 0U, defer ? next_rows : 0U, bounded | (bounded_oracle ? 0x80000000U : 0U)};
+            std::array<std::uint32_t, 3> other{};
             m.options.communicator->exchange_host(std::as_bytes(std::span(mine)), std::as_writable_bytes(std::span(other)),
                                                   dist::Tag{static_cast<std::uint32_t>(dist::TagKind::control), 0x64656631U, P0});
             if (other != mine)
-                throw std::runtime_error("deepseek41 prefill: the ranks disagree on the decoder deferral of the run at " + std::to_string(P0));
+                throw std::runtime_error("deepseek41 prefill: the ranks disagree on the decoder deferral or the bounded decoder replay of the run at " + std::to_string(P0));
         }
+    }
+    // bounded decoder replay (FAST policy ds41-decoder-replay-bounded-v1): v1 is a fresh prompt's whole cone only
+    if (bounded != 0U) {
+        if (bounded % attn::kWindow != 0U || bounded % W != 0U)
+            throw std::invalid_argument("ds41-decoder-replay-bounded-v1: the bound must be a multiple of 128 and of window_rows");
+        if (!m.options.cone || m.options.layers != c.num_hidden_layers || P0 != 0U || !m.snap_points.empty() || defer || m.state_incomplete ||
+            grp != nullptr)
+            throw std::invalid_argument("ds41-decoder-replay-bounded-v1 (v1): a fresh prompt's whole-model cone only (no cached prefix, "
+                                        "no in-run snapshot points, no decoder deferral, no group pass)");
     }
     result.decoder_deferred = defer;
     if (defer) result.next_token = 0xFFFFFFFFU;
-    struct Rows { std::uint32_t x0 = 0, k0 = 0, o0 = 0; };
+    struct Rows { std::uint32_t x0 = 0, k0 = 0, o0 = 0, kf = 0; };  // kf: the window key floor (0 none)
     std::vector<Rows> rows(m.options.layers);
     if (m.options.cone && m.options.layers == c.num_hidden_layers && grp == nullptr) {  // a group pass: every row in every layer (exact)
         ds41::SuffixReplayGeometry g;
         g.layers = c.num_hidden_layers;
         g.draft_rows = m.options.draft_rows;
-        const auto plan = ds41::plan_suffix_replay(g, 0U, T);
+        const auto plan = bounded != 0U && !bounded_oracle ? ds41::plan_bounded_replay(g, 0U, T, bounded) : ds41::plan_suffix_replay(g, 0U, T);
         const auto down = [&](std::uint64_t v) { return static_cast<std::uint32_t>(v / W * W); };
+        const std::uint32_t cut = bounded != 0U && T > bounded ? down(T - bounded) : 0U;  // the decoder layers' key floor
         for (const auto& pl : plan.layers) {
             if (pl.layer >= m.options.layers) continue;
             auto& r = rows[pl.layer];
             r.o0 = down(pl.out_begin);
             r.k0 = down(pl.kv_begin);
             r.x0 = m.roles[pl.layer].owns_kv ? 0U : r.k0;
+            if (pl.layer >= first_decoder) r.kf = cut;  // bounded: == k0; oracle: the exact cone's rows, the same floor
         }
         // in-run snapshot points: also the cone of the state at p (one contiguous suffix per layer: the union)
         for (const auto p : m.snap_points) {
@@ -2963,6 +2983,7 @@ PrefillResult DevicePrefill::run_from(std::span<const std::uint32_t> tokens, std
                         }
                         v.partial = ln.attn_partial.p;
                         v.tickets = ln.attn_tickets.p;
+                        v.key_floor = R0.kf != 0U ? P0 + R0.kf : 0U;  // bounded decoder replay: no window key below the cut
                         v.o = m.o.p + std::size_t{w0 - r0} * QL;
                         if (o_a8_fused) {
                             v.codes = m.ocodes.p + std::size_t{w0 - r0} * QL;

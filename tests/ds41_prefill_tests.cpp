@@ -297,11 +297,47 @@ void test_moe_schedule() {
     expect(!moe_joint_layer(606, 605, 1024) && !moe_joint_layer(0, 0, 0), "joint layer: above max_rows, or max_rows 0, never");
 }
 
+void test_bounded_plan() {
+    using strix::ds41::plan_bounded_replay;
+    const strix::ds41::SuffixReplayGeometry g;  // 40 layers, first decoder 20, window 128, draft 128 rows x 3 layers
+    for (const std::uint32_t R : {128U, 256U, 512U, 1024U}) {
+        for (const std::uint64_t T : {2952ULL, 11594ULL, 32768ULL}) {
+            const auto p = plan_bounded_replay(g, 0, T, R);
+            bool ok = p.layers.size() == 40U && p.encoder_output_begin == 0U && p.ring_rows == 0U;
+            for (const auto& l : p.layers) {
+                const std::uint64_t want = l.layer < 20U ? 0U : T - R;
+                ok = ok && l.out_begin == want && l.kv_begin == want;
+            }
+            ok = ok && p.replay_row_layers == T * 20U + std::uint64_t{R} * 20U && p.full_row_layers == T * 40U;
+            expect(ok, "bounded plan: encoder every row, every decoder layer its last R rows (R " + std::to_string(R) + ", T " + std::to_string(T) + ")");
+        }
+    }
+    // a prompt shorter than the bound: every row everywhere (the full prefill's rows, keys floored at 0)
+    const auto shortp = plan_bounded_replay(g, 0, 100, 128);
+    expect(shortp.layers[39].out_begin == 0U && shortp.layers[20].kv_begin == 0U, "bounded plan: a prompt within the bound runs every row");
+    // the drafter needs 512 rows of the last layers' inputs: every decoder layer covers them
+    strix::ds41::SuffixReplayGeometry gd = g;
+    gd.draft_rows = 512;
+    const auto pd = plan_bounded_replay(gd, 0, 8192, 128);
+    expect(pd.layers[20].out_begin == 8192U - 512U && pd.layers[39].out_begin == 8192U - 512U && pd.layers[19].out_begin == 0U,
+           "bounded plan: draft rows beyond the bound widen every decoder layer");
+    // the 8K bounded plan against the exact cone: 2,560 decoder row-layers instead of 24,150
+    const auto p8 = plan_bounded_replay(g, 0, 8192, 128);
+    expect(p8.replay_row_layers - 8192U * 20U == 2'560U, "bounded 8K plan: 2,560 decoder row-layers");
+    std::uint32_t rejected = 0;
+    for (const std::uint32_t R : {0U, 100U, 200U}) {
+        try { (void)plan_bounded_replay(g, 0, 8192, R); } catch (const std::invalid_argument&) { ++rejected; }
+    }
+    try { (void)plan_bounded_replay(g, 8192, 8192, 128); } catch (const std::invalid_argument&) { ++rejected; }
+    expect(rejected == 4U, "bounded plan rejects a bound that is not a positive multiple of the window, and no new row");
+}
+
 int main() {
     test_routes();
     test_plan();
     test_moe_schedule();
     test_moe_growth();
+    test_bounded_plan();
     // Bounded replay must leave complete final rings, all requested head rows,
     // and the encoder/source-cache inputs. Exercise unaligned prompt lengths
     // and call sizes, as well as the 8K/32K qualification shapes.
