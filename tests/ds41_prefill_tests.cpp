@@ -228,9 +228,29 @@ void test_state_transfer_framing() {
     expect(rejected == 5U, "v2 framing rejects truncation, trailing bytes, history mismatch and overflowing lengths");
 }
 
+void test_moe_schedule() {
+    using strix::ds41::moe_joint_layer;
+    using strix::ds41::moe_window_rows;
+    // 11,594 rows split 5,795 / 5,800: one window of 6,144 rows instead of two of 4,096; never below the configured window
+    expect(moe_window_rows(4096, 1024, 5800, 8192) == 6144U, "moe window: the pass rows in whole chunks");
+    expect(moe_window_rows(4096, 1024, 1476, 8192) == 4096U, "moe window: at least the configured window");
+    expect(moe_window_rows(4096, 1024, 0, 8192) == 4096U, "moe window: no rows keeps the configured window");
+    expect(moe_window_rows(4096, 1024, 16384, 8192) == 8192U, "moe window: at most the cap");
+    expect(moe_window_rows(4096, 1024, 16384, 1000) == 4096U, "moe window: a cap below the window keeps the window");
+    expect(moe_window_rows(4096, 1024, 9000, 9500) == 9216U, "moe window: the cap in whole chunks");
+    bool rejected = false;
+    try { (void)moe_window_rows(0, 1024, 10, 8192); } catch (const std::invalid_argument&) { rejected = true; }
+    expect(rejected, "moe window rejects a zero window");
+    // joint by the layer's rows: symmetric in (peer, own), so both ranks take the same form
+    expect(moe_joint_layer(512, 512, 1024) && moe_joint_layer(700, 324, 1024) && moe_joint_layer(324, 700, 1024),
+           "joint layer: at most max_rows rows");
+    expect(!moe_joint_layer(606, 605, 1024) && !moe_joint_layer(0, 0, 0), "joint layer: above max_rows, or max_rows 0, never");
+}
+
 int main() {
     test_routes();
     test_plan();
+    test_moe_schedule();
     // Bounded replay must leave complete final rings, all requested head rows,
     // and the encoder/source-cache inputs. Exercise unaligned prompt lengths
     // and call sizes, as well as the 8K/32K qualification shapes.

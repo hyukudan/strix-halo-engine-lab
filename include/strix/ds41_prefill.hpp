@@ -92,4 +92,14 @@ struct SuffixReplayPlan {
 // computes exactly the needed rows (nothing missing, nothing extra), else a description.
 [[nodiscard]] std::string verify_suffix_replay(const SuffixReplayGeometry& geometry, const SuffixReplayPlan& plan);
 
+// Routed-MoE schedule of a row-split pair prefill. Bitwise: the MoE's rows are independent, so neither the window size
+// nor the joint / two-pass form changes a row's bits; only the number of expert reads and launches changes.
+// moe_window_rows: one MoE window per pass. The pass rows (the larger of a layer's peer and own rows, the same value on
+// both ranks) rounded up to whole `chunk` rows, at least `base` (the configured window) and at most max(cap, base).
+[[nodiscard]] std::uint32_t moe_window_rows(std::uint32_t base, std::uint32_t chunk, std::uint32_t pass_rows, std::uint32_t cap);
+// moe_joint_layer: one expert pass over [peer rows; own rows] when the LAYER's rows (peer + own, the same on both ranks)
+// are at most max_rows (0: never). The two-pass form overlaps the peer rows' half sums with the own rows but reads every
+// expert twice; below max_rows the saved reads outweigh the exposed half-sum wire (rows x hidden x 4 B over the link).
+[[nodiscard]] bool moe_joint_layer(std::uint32_t peer_rows, std::uint32_t own_rows, std::uint32_t max_rows);
+
 } // namespace strix::ds41
