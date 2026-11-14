@@ -185,6 +185,13 @@ void route_checks() {
     const auto with_costs = resolve_pair_route(32768, 16384, nullptr, &costs, cut, true, true);
     require(std::string_view(with_costs.policy) == "fixed" &&
         std::string_view(with_costs.route.reason) == choose_prompt_route(32768, 4096, &costs, cut).reason);
+    // Defaults: the length policy from 8,192 context tokens, single-route tiles always; "0"/"1" override.
+    namespace lv = strix::lever;
+    require(!lv::select(chunk_policy_lever, {0U, 4096U, 0U}, nullptr).on);
+    require(lv::select(chunk_policy_lever, {0U, 8192U, 0U}, nullptr).on);
+    require(lv::select(chunk_policy_lever, {0U, 131072U, 0U}, nullptr).on);
+    require(!lv::select(chunk_policy_lever, {0U, 32768U, 0U}, "0").on && lv::select(chunk_policy_lever, {0U, 4096U, 0U}, "1").on);
+    require(lv::select(single_tiles_lever, {0U, 8192U, 0U}, nullptr).on && !lv::select(single_tiles_lever, {}, "0").on);
     // Shared rule: no legal chunk, or a chunk that covers the prompt, is never a pipeline.
     const std::array<std::uint32_t, 1> whole{8192U};
     require(strix::pair::choose_pipeline(8192, pipeline_cost, whole, [](std::uint32_t) { return true; }).mode ==

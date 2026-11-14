@@ -254,9 +254,13 @@ inline constexpr pair::PipelineCost pipeline_cost{168.0, 0.5474, 35.0, 28.0, 0.0
 inline constexpr std::array<std::uint32_t, 5> pipeline_chunk_candidates{1024U, 2048U, 4096U, 8192U, 16384U};
 // qwen.pair_chunk_policy: ON = length (pair::choose_pipeline picks route and chunk per prompt length),
 // OFF = fixed (4,096-row chunks, pipeline from 28,672 rows without a cost file). Both arms are bitwise.
+// ON from 8,192 context tokens (measured, exact, logits equal to one node): 8K 4 x 2,048 3,302-3,309 ms
+// (2,476-2,481 tok/s) vs fixed 4,358-4,365 ms; 32K identical plan (2,932-2,968 both); 128K 16 x 8,192
+// 41,668 ms (3,146 tok/s) vs 32 x 4,096 42,778 ms. Below 8,192 (4K: 4 x 1,024 predicted) not measured: fixed.
 inline constexpr lever::Decl chunk_policy_lever{
-    "qwen.pair_chunk_policy", "STRIX_QWEN_PAIR_CHUNK_POLICY", lever::Exactness::bitwise, false, {}, {},
-    "pair receipts 14-nov: 8K 2 x 4,096 2,228 tok/s, 4 x 2,048 2,521; 32K 8 x 4,096 2,968"};
+    "qwen.pair_chunk_policy", "STRIX_QWEN_PAIR_CHUNK_POLICY", lever::Exactness::bitwise, false,
+    {lever::Axis::context, 8192U, false, true}, {},
+    "pair receipts 14/15-nov: 8K 2,476-2,481 vs 1,877-1,880 tok/s; 32K equal; 128K 3,146 vs 3,064"};
 // qwen.pair_single_tiles: when the pair declines a prompt (single route), rank 0 keeps the one-node tile
 // instead of the pipeline chunk (8K: 4,096-row tiles 1,752 tok/s vs one node's 8,192-row tiles 1,860).
 inline constexpr lever::Decl single_tiles_lever{
