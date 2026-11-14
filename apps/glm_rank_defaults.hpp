@@ -351,6 +351,7 @@ inline bool max_rows_auto(const Effective& e) {
 // server runs: the speculation opt-out is forwarded as "--mtp-spec 0", and an automatic exchange-row choice starts at the
 // fallback (the server has no startup handshake that could size the larger one).
 inline std::vector<std::string> serve_request_args(std::vector<std::string> rank_args, bool serve_mtp) {
+    rank_args.insert(rank_args.end(), {"--decode", "1"});
     if (!serve_mtp) {
         rank_args.push_back("--mtp-spec");
         rank_args.push_back("0");
@@ -359,6 +360,13 @@ inline std::vector<std::string> serve_request_args(std::vector<std::string> rank
 }
 inline void serve_adjust(Effective& e) {
     if (max_rows_auto(e)) e.max_rows = {std::to_string(kFallbackMaxRows), "auto-4096-serve"};
+}
+inline Effective resolve_serve(const std::vector<std::string>& rank_args, bool serve_mtp,
+                               const EnvGet& env, const ModelFacts& facts = {}) {
+    auto e = resolve(scan(serve_request_args(rank_args, serve_mtp)), env, facts);
+    // Serving always resolves a normal decode; its fixed row fallback replaces startup admission.
+    serve_adjust(e);
+    return e;
 }
 
 // The predicate dry-runs the load and prefill admissions, including their current margins.

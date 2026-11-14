@@ -74,16 +74,11 @@ void helper_tests() {
 
 #if defined(STRIX_PARITY_GLM)
 // GLM: strix-glm5-rank and strix-glm5-serve call rd::scan / rd::resolve; the server forwards its rank options through
-// rd::serve_request_args and applies rd::serve_adjust (apps/glm_serve_main.cpp).
+// rd::resolve_serve, including normal decode and startup adjustment (apps/glm_serve_main.cpp).
 void glm() {
     namespace rd = strix::glm::rank_defaults;
     const rd::EnvGet none = [](const char*) -> const char* { return nullptr; };
     const std::vector<std::string> request{"--world", "2"};
-    auto cli_args = request;
-    cli_args.insert(cli_args.end(), {"--decode", "64"});  // the CLI's serving-shaped request: prompt + N decoded tokens
-    const auto cli = rd::resolve(rd::scan(cli_args), none);
-    auto server = rd::resolve(rd::scan(rd::serve_request_args(request, true)), none);
-    rd::serve_adjust(server);
     static constexpr sp::Allowed allowed[] = {
         // OPEN (not yet removed): the CLI sizes the exchange with its startup admission (8192 rows when both ranks fit),
         // the server starts from the 4096-row fallback. Named here so it cannot grow silently.
@@ -96,7 +91,21 @@ void glm() {
             if (const auto at = v.rfind(" ("); at != std::string::npos && !v.empty() && v.back() == ')') v.erase(at);
         return c;
     };
-    gate("glm", values(sp::from_lines(rd::print(cli))), values(sp::from_lines(rd::print(server))), allowed);
+    for (const bool complete : {false, true}) for (const bool opt_out : {false, true}) {
+        rd::ModelFacts facts;
+        facts.mtp_present = facts.mtp_complete = complete;
+        facts.reason = complete ? "complete" : "missing mtp.safetensors";
+        auto cli_args = request;
+        cli_args.insert(cli_args.end(), {"--decode", "64"});
+        if (opt_out) cli_args.push_back("--no-mtp");
+        const auto cli = rd::resolve(rd::scan(cli_args), none, facts);
+        const auto server = rd::resolve_serve(request, !opt_out, none, facts);
+        const std::string expected = complete && !opt_out ? "1" : "0";
+        check(cli.mtp_spec.value == expected && server.mtp_spec.value == expected &&
+              cli.mtp.value == expected && server.mtp.value == expected && server.prefill == "gemv",
+              "GLM complete/missing assets and opt-out select intended MTP/prefill route");
+        gate("glm", values(sp::from_lines(rd::print(cli))), values(sp::from_lines(rd::print(server))), allowed);
+    }
 }
 #endif
 
@@ -160,14 +169,24 @@ int main(int argc, char** argv) {
     try {
         helper_tests();
 #if defined(STRIX_PARITY_GLM)
+        std::cout << "included: glm (complete/missing MTP assets, default/opt-out)\n";
         glm();
+#else
+        std::cout << "skipped: glm (resolver not linked)\n";
 #endif
 #if defined(STRIX_PARITY_MINIMAX)
+        std::cout << "included: minimax\n";
         minimax();
+#else
+        std::cout << "skipped: minimax (resolver not linked)\n";
 #endif
 #if defined(STRIX_PARITY_DS41)
+        std::cout << "included: ds41\n";
         ds41();
+#else
+        std::cout << "skipped: ds41 (resolver not linked)\n";
 #endif
+        std::cout << "skipped: qwen (separate strix-qwen-effective-config-tests), gemma (no configuration parity fixture)\n";
     } catch (const std::exception& e) {
         std::cerr << "FAIL: exception: " << e.what() << "\n";
         return 1;

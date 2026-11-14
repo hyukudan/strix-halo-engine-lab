@@ -48,16 +48,31 @@ A server with one request must run what the engine's CLI runs. Each family has o
 call; `strix-serve-cli-parity-tests` (host, no GPU) resolves the same plain request through both and fails on any
 difference that is not listed in `tests/serve_cli_parity_tests.cpp` with the reason serving requires it, and on any
 listed difference that no longer exists. `strix-serve-cli-parity-tests --print` prints both resolved configurations
-side by side. The Qwen pair of entry points is covered by `strix-qwen-effective-config-tests`.
+side by side. Its ordinary output lists included and skipped families; GLM covers complete/missing MTP assets
+and explicit opt-out. The Qwen pair of entry points is covered separately by `strix-qwen-effective-config-tests`.
+Gemma configuration parity is not yet covered by this gate; its benchmark request contract is tested by
+`gemma4-session-shared-api` using the same request fixture as the Python tool.
 
 To measure the result, run the server and the CLI on the same build and prompt and report the ratio (exit 1 below
-`--min-ratio`, default 0.99, or when the produced tokens differ):
+`--min-ratio`, default 0.99, when complete token sequences differ, or when any measured run lacks evidence).
+Disable prefix/session caching for full-prefill measurements. The tool arms `/api/status?detail=1`, matches
+per-request accounting by response ID, and rejects missing counts or any cached/imported tokens; its prefill
+rate uses computed tokens only. Servers without that accounting cannot qualify full-prefill parity here.
+Use raw prompt IDs on `/v1/completions`; for chat, render once externally and use those same IDs for both
+entry points. The tool does not benchmark chat rendering. Use the actual served model name and select
+`--family gemma` for its supported `strix.generated_ids` receipt (other families request `return_token_ids`).
 
 ```
 python3 tools/serve_cli_ratio.py server --url http://127.0.0.1:PORT --prompt-ids IDS.txt --out server.json
 python3 tools/serve_cli_ratio.py cli --family qwen --out cli.json cli-run1.log cli-run2.log cli-run3.log
 python3 tools/serve_cli_ratio.py report server.json cli.json
 ```
+
+For CLI logs without complete generated IDs, append `--output-ids RUN1.ids RUN2.ids RUN3.ids` to the `cli`
+command, one whitespace/comma-separated generated-ID file per log. Missing IDs fail even when timings pass.
+DeepSeek CLI logs provide decode timing only: explicitly use `report --decode-only`, which makes no prefill
+parity claim. `--skip-decode` gates prefill only. Cache-reuse throughput requires a separate benchmark with
+matched initial state and a defined reuse metric.
 
 ## Further reading
 
