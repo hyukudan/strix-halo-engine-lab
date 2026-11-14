@@ -444,20 +444,20 @@ int main(int argc, char** argv) {
                 std::printf("rank %u mtp-spec: unavailable on at least one rank (head or precondition); using plain decode\n", opt.rank);
         };
         const auto pf_tier = prefill_mode == "gemv" ? strix::glm::pf::TierB::gemv : strix::glm::pf::TierB::wmma;
-        std::uint64_t prefill_margin = 0;
-        std::uint64_t prefill_first_forward = 0;
-        std::uint64_t admitted_prefill_path = 0, admitted_device_free = 0, admitted_mem_available = 0;
-        const auto lr = eng.load([&](const ge::mem::LoadAdmission& admission) {
+        rd::PrefillLoad prefill_load{{opt.rank, opt.world, opt.capacity, opt.mtp, prefill_mode == "ref", pf_tier},
+                                    0, 0, pf_before_load, mem_plan};
+        std::uint64_t admitted_device_free = 0, admitted_mem_available = 0;
+        const auto lr = prefill_load.load(eng, opt, [&](const ge::mem::LoadAdmission& admission) {
             namespace pf = strix::glm::pf;
             namespace mem = strix::glm::engine::mem;
             // Keep the existing 8 GiB OS/peer/runtime headroom, now at both checks.
-            prefill_margin = std::max(pf::admission_margin_bytes(), admission.margins.ram);
+            prefill_load.margin = std::max(pf::admission_margin_bytes(), admission.margins.ram);
             admitted_device_free = admission.device_free;
             admitted_mem_available = admission.snapshot.mem_available;
-            if (rd::max_rows_auto(eff)) prefill_margin = std::max(prefill_margin, rd::kMaxRowsSafetyBytes);
+            if (rd::max_rows_auto(eff)) prefill_load.margin = std::max(prefill_load.margin, rd::kMaxRowsSafetyBytes);
             if (rd::max_rows_auto(eff)) {
                 const rd::AutoRowsPlan plan{opt.rank, opt.world, opt.capacity, opt.mtp, prefill_mode == "ref", pf_tier};
-                opt.max_rows = rd::admit_auto_rows(eff, admission, plan, prefill_margin, [&](std::uint32_t fits) {
+                opt.max_rows = rd::admit_auto_rows(eff, admission, plan, prefill_load.margin, [&](std::uint32_t fits) {
                     std::uint32_t peer_fits = fits;
                     if (comm)
                         comm->exchange_host(std::as_bytes(std::span{&fits, 1}), std::as_writable_bytes(std::span{&peer_fits, 1}),
@@ -476,34 +476,6 @@ int main(int argc, char** argv) {
             }
             std::fprintf(stderr, "rank %u max-rows=%u (%s)\n", opt.rank, opt.max_rows, eff.max_rows.source.c_str());
             return opt.max_rows;
-        }, [&](const ge::mem::LoadAdmission& admission) {
-            namespace pf = strix::glm::pf;
-            namespace mem = strix::glm::engine::mem;
-            prefill_first_forward = admission.first_forward_reserve;
-            // The recheck sees actual communication pools and the replanned row
-            // count; the provisional auto callback still has the 8192-row plan.
-            // Explicit sizes and --mem-plan also admit before the first weight.
-            if (prefill_mode != "ref" && (!opt.auto_rows || admission.recheck)) {
-                const auto b = pf::prefill_budget(64 / opt.world, 64 / opt.world, opt.capacity, opt.max_rows, opt.mtp, pf_tier, admission.kv_shard);
-                admitted_prefill_path = b.path;
-                const auto comm_bytes = opt.world > 1 && !admission.recheck
-                    ? std::uint64_t{opt.max_rows} * (3 * 4096 * 4 + 16) + 16384 : 0;
-                pf::admit_prefill_load(admission, b.path, b.workspace, prefill_margin, 3 * comm_bytes);
-                std::fprintf(stderr, "rank %u prefill admission: path %.3f GiB, workspace %.3f GiB, install/staging %.3f GiB, late safety %.3f GiB, first-forward reserve %.3f GiB, layout %s%s, grouped-moe legacy-wmma=%u exact=%u, attention-scratch-rows=%u\n",
-                             opt.rank, mem::gib(b.path), mem::gib(b.workspace), mem::gib(admission.prefill_install),
-                             mem::gib(prefill_margin), mem::gib(prefill_first_forward),
-                             admission.kv_shard ? "sharded" : "replicated", admission.candidate ? " (candidate)" : "",
-                             unsigned(b.moe_route.legacy_wmma), unsigned(b.moe_route.exact), b.attention_rows);
-            }
-            if (!admission.candidate && pf_before_load && !mem_plan && (!opt.auto_rows || admission.recheck)) {
-                eng.set_prefill(pf::make_prefill_path(64 / opt.world, 64 / opt.world, opt.capacity, opt.max_rows,
-                                                      pf_tier, prefill_margin, admission.kv_shard, prefill_first_forward));
-                std::printf("rank %u prefill %s set before load\n", opt.rank, prefill_mode.c_str());
-            }
-        }, [&](bool sharded) -> std::shared_ptr<ge::PrefillPath> {
-            if (prefill_mode == "ref" || pf_before_load || mem_plan) return {};
-            return strix::glm::pf::make_prefill_path(64 / opt.world, 64 / opt.world, opt.capacity, opt.max_rows,
-                                                    pf_tier, prefill_margin, sharded, prefill_first_forward);
         });
         eff.kv_shard = eng.kv_shard_enabled();
         const auto admitted_layout = strix::glm::pf::capacity_layout();
@@ -516,9 +488,9 @@ int main(int argc, char** argv) {
         if (!eff.kv_shard) {
             const auto kv_bytes = opt.capacity * strix::glm::kvshard::bytes_per_token;
             std::printf("rank %u kv-budget layout=replicated dsa_layer_kv_bytes=%llu pf_path=%llu pf_window_budget=0 device_free=%llu mem_available=%llu margin=%llu\n",
-                opt.rank, static_cast<unsigned long long>(kv_bytes), static_cast<unsigned long long>(admitted_prefill_path),
+                opt.rank, static_cast<unsigned long long>(kv_bytes), static_cast<unsigned long long>(prefill_load.admitted_path),
                 static_cast<unsigned long long>(admitted_device_free), static_cast<unsigned long long>(admitted_mem_available),
-                static_cast<unsigned long long>(prefill_margin));
+                static_cast<unsigned long long>(prefill_load.margin));
         }
         const auto load_identity = eng.identity_mode();
         std::printf("rank %u: load %.1f s, %.1f GiB read, device %.1f GiB (layers %u, mtp %d) model-format %s identity %s decode-xch %s%s%s%s%s",

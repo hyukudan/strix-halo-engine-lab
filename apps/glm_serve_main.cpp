@@ -965,9 +965,9 @@ int main(int argc, char** argv) {
         opt.host_budget = prefix_cache_bytes;  // the prefix snapshots are this process's RSS: not a watchdog breach
         ge::Engine eng(opt, comm.get());
         const auto pf_tier = prefill_mode == "gemv" ? strix::glm::pf::TierB::gemv : strix::glm::pf::TierB::wmma;
-        std::uint64_t prefill_margin = strix::glm::pf::admission_margin_bytes();
+        rd::PrefillLoad prefill_load{{opt.rank, opt.world, opt.capacity, opt.mtp, prefill_mode == "ref", pf_tier}};
         bool rows_mode_checked = false;
-        const auto lr = eng.load([&](const ge::mem::LoadAdmission& admission) {
+        const auto lr = prefill_load.load(eng, opt, [&](const ge::mem::LoadAdmission& admission) {
             // Both ranks must be in the same max-rows mode before the automatic admission's votes (a peer in a fixed mode
             // would never answer them).
             if (!rows_mode_checked && comm) {
@@ -977,11 +977,12 @@ int main(int argc, char** argv) {
                                     {static_cast<std::uint32_t>(strix::dist::TagKind::raw_slots), 0xFFFFFFFAU, 0U});
                 if (peer_mode != mode) throw std::runtime_error("TP2 ranks resolved different max-rows modes (automatic vs fixed)");
             }
+            prefill_load.margin = std::max(strix::glm::pf::admission_margin_bytes(), admission.margins.ram);
             if (!opt.auto_rows) return opt.max_rows;
             // The CLI's margins: the 8 GiB OS/peer/runtime headroom at both checks.
-            prefill_margin = std::max({strix::glm::pf::admission_margin_bytes(), admission.margins.ram, rd::kMaxRowsSafetyBytes});
+            prefill_load.margin = std::max({strix::glm::pf::admission_margin_bytes(), admission.margins.ram, rd::kMaxRowsSafetyBytes});
             const rd::AutoRowsPlan plan{opt.rank, opt.world, opt.capacity, opt.mtp, prefill_mode == "ref", pf_tier};
-            opt.max_rows = rd::admit_auto_rows(eff, admission, plan, prefill_margin, [&](std::uint32_t fits) {
+            opt.max_rows = rd::admit_auto_rows(eff, admission, plan, prefill_load.margin, [&](std::uint32_t fits) {
                 std::uint32_t peer_fits = fits;
                 if (comm)
                     comm->exchange_host(std::as_bytes(std::span{&fits, 1}), std::as_writable_bytes(std::span{&peer_fits, 1}),
@@ -995,11 +996,6 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "rank %u max-rows=%u (%s)\n", opt.rank, opt.max_rows, eff.max_rows.source.c_str());
             return opt.max_rows;
         });
-        if (prefill_mode != "ref") {
-            namespace pf = strix::glm::pf;
-            const unsigned heads = 64 / opt.world;
-            eng.set_prefill(pf::make_prefill_path(heads, heads, opt.capacity, opt.max_rows, pf_tier, prefill_margin));
-        }
         std::printf("rank %u: load %.1f s, %.1f GiB read, device %.1f GiB, identity %s, decode-xch %s, prefill %s pipeline %u\n",
                     opt.rank, lr.seconds, lr.gib_read, lr.device_gib, ge::identity_mode_name(eng.identity_mode()),
                     opt.world == 1 ? "local" : eng.decode_xfer_enabled() ? "xfer" : "comm", prefill_mode.c_str(), eng.prefill_pipeline());

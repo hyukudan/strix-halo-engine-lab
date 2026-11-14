@@ -337,8 +337,9 @@ void serve_prefill_admission_tests(const ModelContract& model, const ModelManife
     };
     {
         // Server / CLI parity (strix/serve_cli_parity.hpp): the same request words through the ONE resolver, once as the
-        // HTTP server (--http-serve --http-batch 2 and its prefix-cache block setting) and once as the CLI. Every
-        // resolved environment value and the route options must be equal unless named below with the serving reason.
+        // HTTP server (--http-serve --http-batch 2 and its prefix-cache block setting) and once as the CLI. Compare the
+        // environment and the route fields projected below, with the listed field/family allowances. This is not
+        // complete effective-configuration or numerical-identity parity.
         namespace sp = strix::parity;
         std::vector<std::string> cli_args;
         for(std::size_t i=0;i<args.size();++i) {
@@ -362,7 +363,7 @@ void serve_prefill_admission_tests(const ModelContract& model, const ModelManife
             // The server has no prompt at startup, so resolve_serve_prefill (apps/qwen_effective_config.hpp) admits the
             // known-prefix tiled prefill and its organisation for the serving context then; the CLI resolves the same
             // route from the prompt it is given (same block plan and kernels at 8K: wave4 SRVPAR receipts). Named here so
-            // that any other serving-only value fails.
+            // that serving-only values outside these fields/families fail.
             {"known_prefix_prefill_rows","serving admits the tiled prefill at startup; the CLI from its prompt"},
             {"env:STRIX_QPF2K_*","organisation of the tiled prefill admitted at serving startup"},
             {"env:STRIX_QSA_*","organisation of the tiled prefill admitted at serving startup"},
@@ -373,7 +374,7 @@ void serve_prefill_admission_tests(const ModelContract& model, const ModelManife
         };
         const auto report=sp::compare(view(cli),view(served),allowed);
         if(!report.ok()) std::cerr<<sp::text("qwen",report);
-        expect(report.ok(),"qwen: server and CLI resolve the same request to the same values (or a named serving reason)");
+        expect(report.ok(),"qwen: projected CLI/server route fields and environment match within the listed allowances");
     }
     {
         // Native joining gate shape: pinned MTP server args (C24576, T8192 serving prefill),

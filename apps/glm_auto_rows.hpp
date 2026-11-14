@@ -13,6 +13,7 @@
 #include <exception>
 #include <stdexcept>
 #include <string>
+#include <utility>
 
 namespace strix::glm::rank_defaults {
 
@@ -22,6 +23,51 @@ struct AutoRowsPlan {
     bool mtp = false;
     bool reference = false;  // prefill_mode == "ref"
     strix::glm::pf::TierB tier = strix::glm::pf::TierB::gemv;
+};
+
+// Row probing deliberately restores the layout. Always give Engine::load both
+// callbacks so it can vote a common candidate and coordinate install retries.
+struct PrefillLoad {
+    AutoRowsPlan plan;
+    std::uint64_t margin = 0, admitted_path = 0;
+    bool before_load = false, plan_only = false;
+
+    template<class Engine, class Options, class SelectRows>
+    auto load(Engine& eng, Options& opt, SelectRows&& select_rows) {
+        namespace pf = strix::glm::pf;
+        namespace mem = strix::glm::engine::mem;
+        std::uint64_t first_forward = 0;
+        const auto make = [&](bool sharded) {
+            return pf::make_prefill_path(64 / plan.world, 64 / plan.world, plan.capacity, opt.max_rows,
+                                         plan.tier, margin, sharded, first_forward);
+        };
+        return eng.load(std::forward<SelectRows>(select_rows), [&](const mem::LoadAdmission& admission) {
+            first_forward = admission.first_forward_reserve;
+            // Provisional auto admission still has the 8192-row plan. Rechecks
+            // see the agreed rows and actual communication pools.
+            if (!plan.reference && (!opt.auto_rows || admission.recheck)) {
+                const auto b = pf::prefill_budget(64 / plan.world, 64 / plan.world, plan.capacity,
+                                                  opt.max_rows, plan.mtp, plan.tier, admission.kv_shard);
+                admitted_path = b.path;
+                const auto comm_bytes = plan.world > 1 && !admission.recheck
+                    ? std::uint64_t{opt.max_rows} * (3 * 4096 * 4 + 16) + 16384 : 0;
+                pf::admit_prefill_load(admission, b.path, b.workspace, margin, 3 * comm_bytes);
+                std::fprintf(stderr, "rank %u prefill admission: path %.3f GiB, workspace %.3f GiB, install/staging %.3f GiB, late safety %.3f GiB, first-forward reserve %.3f GiB, layout %s%s, grouped-moe legacy-wmma=%u exact=%u, attention-scratch-rows=%u\n",
+                             plan.rank, mem::gib(b.path), mem::gib(b.workspace), mem::gib(admission.prefill_install),
+                             mem::gib(margin), mem::gib(first_forward),
+                             admission.kv_shard ? "sharded" : "replicated", admission.candidate ? " (candidate)" : "",
+                             unsigned(b.moe_route.legacy_wmma), unsigned(b.moe_route.exact), b.attention_rows);
+            }
+            if (!admission.candidate && before_load && !plan_only && (!opt.auto_rows || admission.recheck)) {
+                eng.set_prefill(make(admission.kv_shard));
+                std::printf("rank %u prefill %s set before load\n", plan.rank,
+                            plan.tier == pf::TierB::gemv ? "gemv" : "wmma");
+            }
+        }, [&](bool sharded) -> std::shared_ptr<strix::glm::engine::PrefillPath> {
+            if (plan.reference || before_load || plan_only) return {};
+            return make(sharded);
+        });
+    }
 };
 
 // Called from the engine's load-admission callback when max_rows_auto(e). vote(local) exchanges one fit vote with the
