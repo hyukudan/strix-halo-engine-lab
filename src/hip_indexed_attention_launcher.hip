@@ -4149,9 +4149,25 @@ struct QsaInputTiledSite {
         static_cast<void>(q8_rows::segment_row(segments, out, width, m, row));
         reinterpret_cast<float*>(output0[m] + r * output_stride)[row] = round_bf16(value);
     }
+    // Vector epilogue (STRIX_QPF2K_DENSE_VEC_SITES bit 4): 4 outputs of one segment, BF16-rounded FP32, one 16-byte store.
+    static constexpr unsigned dense_vector_store = 4U;
+    bool vector_store_supported() const {
+        if (output_stride % 16U || outputs % 4U) return false;
+        for (unsigned m = 0; m < segments.count; ++m)
+            if (reinterpret_cast<std::uintptr_t>(output0[m]) % 16U || segments.first[m] % 4U) return false;
+        return true;
+    }
+    __device__ void store4(std::uint32_t out, std::uint32_t r, q8_rows::tiled::f4 value) const {
+        unsigned m; std::uint32_t row;
+        static_cast<void>(q8_rows::segment_row(segments, out, width, m, row));
+        const q8_rows::tiled::f4 rounded{round_bf16(value.x), round_bf16(value.y), round_bf16(value.z), round_bf16(value.w)};
+        *reinterpret_cast<q8_rows::tiled::f4*>(output0[m] + r * output_stride + 4ULL * row) = rounded;
+    }
 };
 template <class InputType = float> struct QsaOutputTiledSite {
     using Input = InputType;
+    // STRIX_QPF2K_DENSE_VEC_SITES bit 8 / STRIX_QPF2K_DENSE_LEAN_SITES bit 8 (lean pinned form 4; BF16 input rows only).
+    static constexpr unsigned dense_vector_store = 8U, dense_lean_site = 8U;
     const unsigned char* input0;
     std::uint64_t input_stride;
     q8_rows::Segments segments;
@@ -4160,6 +4176,11 @@ template <class InputType = float> struct QsaOutputTiledSite {
     std::uint64_t output_stride;
     __device__ void store(std::uint32_t out, std::uint32_t r, float value) const {
         reinterpret_cast<std::uint16_t*>(output0 + r * output_stride)[out] = float_to_bf16(value);
+    }
+    bool vector_store_supported() const { return q8_rows::tiled::bf16_store4_ok(output0, output_stride, outputs); }
+    __device__ void store4(std::uint32_t out, std::uint32_t r, q8_rows::tiled::f4 value) const {
+        q8_rows::tiled::store4_u16(reinterpret_cast<std::uint16_t*>(output0 + r * output_stride) + out,
+            float_to_bf16(value.x), float_to_bf16(value.y), float_to_bf16(value.z), float_to_bf16(value.w));
     }
 };
 
@@ -6143,6 +6164,13 @@ QsaLaunchStats* qsa_launch_stats() {
 void count_qsa_launch(std::atomic<std::uint64_t> QsaLaunchStats::* kind) {
     if (auto* stats = qsa_launch_stats()) (stats->*kind).fetch_add(1U, std::memory_order_relaxed);
 }
+// STRIX_QSA_ATTEND_SHARED_SOFTMAX=1: the occ attend (mask bit 13) with one softmax per wave pair
+// (attn_core::selected_flash_step ShareSoftmax): the fh == 0 wave hands the FP16 probabilities, alpha and l to its
+// partner through its exchange slots (one more barrier per chunk, no LDS added). Same values: bitwise.
+bool qsa_attend_shared_softmax_enabled() {
+    static const bool enabled = strix::envcfg::flag("STRIX_QSA_ATTEND_SHARED_SOFTMAX", false);
+    return enabled;
+}
 // Draft organization only: do not trade resident query-head capacity for fewer KV requests.
 bool qsa_fast_kv_pair_enabled() {
     static const bool enabled = strix::envcfg::flag("STRIX_QSA_FAST_KV_PAIR", false);
@@ -6268,10 +6296,15 @@ void qsa_fast_batch_flush(hipStream_t stream) {
                 dim3(512), 0, stream, slot.views, b.kv, b.kv_heads, b.heads, b.union_at, ys);
         } else if (qpf2k_qsa_mask() & 0x2000U) {
             // Bit 13: the same grid and body with an eight-waves-per-SIMD register budget (qsa_fast::attend_order_occ_kernel).
-            hipLaunchKernelGGL(HIP_KERNEL_NAME(qsa_fast::attend_order_occ_kernel<64U, TR, G>), dim3(n * (64U / TR) * ys),
-                dim3((2U * G + 4U) * 32U), 0, stream, slot.views, b.kv, b.kv_heads, b.heads, b.union_at, ys);
-            static const bool witnessed = [] {
-                std::fprintf(stderr, "qpf2k qsa attend occ active mask 0x2000 waves_per_eu 8\n");
+            const bool share = qsa_attend_shared_softmax_enabled();
+            if (share)
+                hipLaunchKernelGGL(HIP_KERNEL_NAME(qsa_fast::attend_order_occ_kernel<64U, TR, G, 3U, true>), dim3(n * (64U / TR) * ys),
+                    dim3((2U * G + 4U) * 32U), 0, stream, slot.views, b.kv, b.kv_heads, b.heads, b.union_at, ys);
+            else
+                hipLaunchKernelGGL(HIP_KERNEL_NAME(qsa_fast::attend_order_occ_kernel<64U, TR, G>), dim3(n * (64U / TR) * ys),
+                    dim3((2U * G + 4U) * 32U), 0, stream, slot.views, b.kv, b.kv_heads, b.heads, b.union_at, ys);
+            static const bool witnessed = [share] {
+                std::fprintf(stderr, "qpf2k qsa attend occ active mask 0x2000 waves_per_eu 8%s\n", share ? " shared softmax" : "");
                 return true;
             }();
             (void)witnessed;

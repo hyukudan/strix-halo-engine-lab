@@ -253,35 +253,17 @@ Resolved resolve(App app, const std::vector<std::string>& in, const Getenv& raw_
     strix::profile::Inputs profile_inputs;
     // Resolve the bundle before admission, reporting and rank agreement. An explicit
     // component OFF wins. Canonical strings are also exported for execution/cache readers.
-    std::map<std::string, std::string> fast_env;
-    const auto enabled = [](const char* v) { return v && std::string_view(v) == "1"; };
-    const bool bundle = enabled(raw_env("STRIX_DS41_FAST_PREFILL"));
-    if (const char* value = raw_env("STRIX_DS41_FAST_PREFILL"); value && *value)
-        fast_env.emplace("STRIX_DS41_FAST_PREFILL", bundle ? "1" : "0");
+    // Shared bundle rules (strix/fast_profile.hpp); the dense row threshold is DS41's own auxiliary row.
+    namespace fp = strix::fast_profile;
+    auto fast_env = fp::expand(strix::ds41::fast_profile::kBundle, raw_env);
     if (const char* value = raw_env("STRIX_DS41_FAST_DENSE_MIN_ROWS");
-        (value && *value) || bundle || enabled(raw_env("STRIX_DS41_FAST_DENSE")))
+        fp::set(value) || fp::switch_on(raw_env("STRIX_DS41_FAST_PREFILL")) || fp::switch_on(raw_env("STRIX_DS41_FAST_DENSE")))
         fast_env.emplace("STRIX_DS41_FAST_DENSE_MIN_ROWS", std::to_string(
             strix::ds41::fast_profile::dense_min_rows_value(value)));
-    for (const char* key : {"STRIX_DS41_FAST_ATTN", "STRIX_DS41_FAST_MOE", "STRIX_DS41_FAST_DENSE"}) {
-        const char* value = raw_env(key);
-        const bool attention = std::string_view(key) == "STRIX_DS41_FAST_ATTN";
-        if (value && *value)
-            fast_env.emplace(key, attention && std::string_view(value) == "2" ? "2" : enabled(value) ? "1" : "0");
-        else if (bundle) fast_env.emplace(key, attention ? "2" : "1");
-    }
-    profile_inputs.env = [&](const char* key) -> const char* {
-        const auto it = fast_env.find(key);
-        if (it != fast_env.end()) return it->second.c_str();
-        const char* value = raw_env(key);
-        return value && *value ? value : nullptr;
-    };
+    profile_inputs.env = fp::lookup(fast_env, raw_env);
     strix::profile::take_options(profile_engine(), user, profile_inputs);
     r.profile = strix::profile::resolve(profile_engine(), profile_inputs);
-    std::vector<std::pair<std::string, std::string>> profile_env;
-    for (const auto& e : r.profile->entries)
-        if (!e.lever->env.empty() &&
-            (strix::profile::applied(e.status) || fast_env.contains(std::string(e.lever->env))))
-            profile_env.emplace_back(std::string(e.lever->env), e.value);
+    const auto profile_env = strix::profile::exports(*r.profile, fast_env);
     r.set_env = profile_env;
     if (auto extra = strix::profile::profile_args(*r.profile); !extra.empty())
         user.insert(user.begin() + (!user.empty() && !user[0].empty() && user[0][0] != '-' ? 1 : 0), extra.begin(), extra.end());

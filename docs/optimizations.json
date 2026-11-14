@@ -218,7 +218,7 @@
     "default": "CLI tool (not in the serving path)",
     "exact": "No engine effect; CPU-only full-file hashing and optional structural audits.",
     "gain": "No throughput claim",
-    "preconditions": "Explicit role closure and root-relative members; trusted published pins where available. Distill-g needs separate supply.",
+    "preconditions": "Explicit role closure and root-relative members; trusted published pins where available. Distill-g is fetched from its published repository.",
     "off_switch": "Omit the explicit CLI command; no startup work is installed.",
     "doc_anchor": "docs/operations/release-assets.md"
   },

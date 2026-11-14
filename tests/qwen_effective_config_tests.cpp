@@ -292,6 +292,34 @@ PrefillMemory ample_memory() {
 }
 // CPU regression: production organizations/window ceilings with synthetic tokens,
 // asset pins and backing requirements. No model, golden, HIP or external files.
+// Exercise the runtime environment/CLI override path independently of inspection.
+void expect_runtime_prefill_identity(const EffectiveConfig& config) {
+    const auto saved_override = detail::prefill_identity_override();
+    std::map<std::string, std::optional<std::string>> saved_environment;
+    const auto install = [&](const std::string& name) {
+        const auto* old = std::getenv(name.c_str());
+        saved_environment[name] = old ? std::optional<std::string>(old) : std::nullopt;
+        const auto it = config.environment.find(name);
+        if (it == config.environment.end()) unsetenv(name.c_str());
+        else setenv(name.c_str(), it->second.c_str(), 1);
+    };
+    install("STRIX_PREFILL_EXACT_FP16");
+    for (const auto& option : kPrefillOptions) install(std::string(option.env));
+    detail::prefill_identity_override() = {};
+    set_prefill_identity_override(config.options.prefill_exact_fp16, config.options.prefill_disabled);
+    const auto runtime = prefill_options_active();
+    expect(config.prefill_option_mask == runtime && config.options.resolved_prefill_option_mask == runtime,
+        "inspection and runtime dependency-filtered masks agree");
+    expect(prefill_identity_name(config.prefill_option_mask) == prefill_identity_name(runtime) &&
+        prefill_identity_hash(config.prefill_option_mask) == prefill_identity_hash(runtime),
+        "inspection and runtime dependency-filtered names and hashes agree");
+    detail::prefill_identity_override() = saved_override;
+    for (const auto& [name, value] : saved_environment) {
+        if (value) setenv(name.c_str(), value->c_str(), 1);
+        else unsetenv(name.c_str());
+    }
+}
+
 void serve_prefill_admission_tests(const ModelContract& model, const ModelManifest& manifest) {
     auto args=mtp_fixture();
     args.insert(args.begin()+5,13,"1");
@@ -554,6 +582,20 @@ void serve_prefill_admission_tests(const ModelContract& model, const ModelManife
             startup.prefill_option_mask==*startup.options.resolved_prefill_option_mask &&
             startup.serve_prefill_notice.find("governed MTP")!=std::string::npos,
             "serve_prefill_production_mtp_ceilings: sidecar MTP takes automatic fp16 with the governed exclusions");
+        for (const char* name : {"STRIX_PREFILL_PLE_ROWS_F16", "STRIX_PREFILL_GDN_GATES_F16"}) {
+            auto fast = request;
+            fast.environment[name] = "1";
+            fast.environment["STRIX_QPF2K_GDN_FP16_CHUNK"] = "3";
+            const auto excluded = resolve(fast, memory);
+            validate_effective_startup(excluded);
+            const auto candidates = prefill_option_bit(PrefillOption::ple_rows_f16) |
+                prefill_option_bit(PrefillOption::gdn_gates_f16);
+            expect(excluded.options.prefill_profile_automatic &&
+                !(excluded.prefill_option_mask & (governed_excluded | candidates | kPrefillGdnChunkRev3)) &&
+                (excluded.options.prefill_disabled & candidates) == candidates,
+                "sidecar MTP excludes both explicitly requested FAST candidates");
+            expect_runtime_prefill_identity(excluded);
+        }
         // STRIX_SERVE_FP16_MTP=0 keeps the resolved arithmetic whatever the option mask already excludes.
         for (const bool already_excluded : {false,true}) {
             auto off=request; off.environment["STRIX_SERVE_FP16_MTP"]="0";
@@ -2140,7 +2182,8 @@ void yarn_admission_tests(const gguf::FileInfo& info, const ModelManifest& manif
         }
         for (const char* name : {"STRIX_QSA_UNION_MERGE", "STRIX_QSA_SCORE_ROWS64", "STRIX_PREFILL_MOE_MERGE_VEC",
                 "STRIX_QPF2K_WMMA_PIN", "STRIX_QPF2K_HC_UPCOPY", "STRIX_PREFILL_ROUTER_SELECT", "STRIX_ROUTER_STAGE_ACT",
-                "STRIX_QSA_WINDOW_ATTN_V2", "STRIX_PREFIX_CACHE", "STRIX_QPF2K_GDN_CHUNK16"}) {
+                "STRIX_QSA_WINDOW_ATTN_V2", "STRIX_PREFIX_CACHE", "STRIX_QPF2K_GDN_CHUNK16",
+                "STRIX_PREFILL_PLE_ROWS_F16", "STRIX_PREFILL_GDN_GATES_F16"}) {
             auto off = request; off.environment[name] = "0";
             const auto admitted = resolve(off, memory);
             expect(yarn_environment_refusal({{name, "0"}}, 2).empty() && admitted.admitted,
@@ -3215,6 +3258,33 @@ void prefill_identity_plumbing_tests() {
     expect(bundled.prefill_option_mask == 0U &&
         (bundled.options.prefill_disabled & prefill_option_bit(PrefillOption::hc_output_wmma)),
         "automatic YaRN MTP bundle retains its qualified prefill arithmetic");
+    for (const char* name : {"STRIX_PREFILL_PLE_ROWS_F16", "STRIX_PREFILL_GDN_GATES_F16"}) {
+        for (const bool chunk_off : {false, true}) {
+            auto requested = plain_options;
+            Environment env{{name, "1"}, {"STRIX_QPF2K_GDN_FP16_CHUNK", chunk_off ? "3" : "0"}};
+            if (chunk_off) requested.prefill_disabled = prefill_option_bit(PrefillOption::gdn_fp16_chunk);
+            const auto inspected = resolved(requested, env);
+            expect(!(inspected.prefill_option_mask & (prefill_option_bit(PrefillOption::gdn_fp16_chunk) |
+                prefill_option_bit(PrefillOption::gdn_gates_f16) | kPrefillGdnChunkRev3)),
+                "chunk OFF removes its dependent gate candidate and revision tag");
+            expect_runtime_prefill_identity(inspected);
+        }
+        for (const bool yarn : {false, true}) {
+            auto requested = bundled_mtp;
+            if (yarn) {
+                requested.mtp_bundle_path.clear();
+                requested.rotary = RotaryDescriptor::yarn(2U);
+            }
+            const auto inspected = initialize_prefill_config({requested,
+                {{name, "1"}, {"STRIX_QPF2K_GDN_FP16_CHUNK", "3"}}});
+            const auto candidates = prefill_option_bit(PrefillOption::ple_rows_f16) |
+                prefill_option_bit(PrefillOption::gdn_gates_f16);
+            expect(inspected.prefill_option_mask == 0U &&
+                (inspected.options.prefill_disabled & candidates) == candidates,
+                "bundle and automatic YaRN MTP exclude both FAST candidates");
+            expect_runtime_prefill_identity(inspected);
+        }
+    }
     auto split = plain_options;
     split.numerical_profile = dense_a8_profile;
     split.numerical_profile_explicit = true;

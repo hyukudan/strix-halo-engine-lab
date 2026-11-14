@@ -45,7 +45,10 @@ model/state assets, profile and rank/transport arguments:
 `--deploy auto` searches the provider's supported choices. `--deploy FILE` constrains
 that search with a TOML file. `--deploy-check` prints the plan and exits before
 weight payload loading, device-owner construction or pair connection; metadata
-must still be readable. Pair inspection therefore needs measured peer inventory.
+must still be readable. The startup device gate still admits and binds a device;
+`--devices` / `--device-id` retain their normal admission checks. Device-free
+inspection requires integration with the validated engine parser's launch mode.
+Pair inspection therefore needs measured peer inventory.
 Inspect `refused`, `refusal`, candidate reasons, `requested`, `chosen` and each
 rank's budget. A refused plan must not be launched. Remove `--deploy-check` to
 execute an admitted configuration, keeping the same launch arguments.
@@ -201,7 +204,10 @@ prefill = "exl3"
 
 Use the transport spelling accepted by the selected engine. Keep one process per
 rank for TP2 and retain the engine's normal peer/transport launch configuration.
-For offline inspection, append one `[[devices]]` table per node. Supply all six
+For measured inspection inventory, add the root key `devices = [{...}, {...}]`
+before the first table header (`[hardware]` in these examples), never after
+`[format]`. Use one inline table per node in rank order (the parser's TOML subset
+has no `[[devices]]` array tables). Supply all six
 fields: `gfx_target` (string), `cu_count` (integer), `mem_total_bytes` and
 `mem_free_bytes` (integers), `unified` (boolean), and `source` (nonempty string
 describing measurement provenance). Copy actual observations; do not duplicate

@@ -48,7 +48,10 @@ modelo/estado, el perfil y los argumentos de rango/transporte obligatorios:
 `--deploy auto` busca entre las opciones del proveedor. `--deploy FILE` restringe
 la búsqueda mediante TOML. `--deploy-check` imprime el plan y termina antes de
 cargar los datos de pesos, construir los recursos del dispositivo o conectar el
-par; los metadatos deben seguir siendo legibles. La inspección del par necesita
+par; los metadatos deben seguir siendo legibles. La puerta de arranque sigue
+admitiendo y ligando un dispositivo; `--devices` / `--device-id` conservan sus
+comprobaciones de admisión. La inspección sin dispositivo requiere integrar el
+modo de ejecución validado por el analizador del motor. La inspección del par necesita
 por tanto un inventario medido del otro nodo. Revise `refused`, `refusal`, los
 motivos de los candidatos, `requested`, `chosen` y los presupuestos por rango.
 No ejecute un plan rechazado. Quite `--deploy-check` para ejecutar una configuración
@@ -213,7 +216,10 @@ prefill = "exl3"
 
 Use la escritura del transporte que acepte el motor seleccionado. Para TP2 mantenga
 un proceso por rango y la configuración habitual de enlace/transporte. Para
-inspeccionar sin conexión, añada una tabla `[[devices]]` por nodo. Incluya los seis
+aportar el inventario medido, añada la clave raíz `devices = [{...}, {...}]`
+antes de la primera cabecera de tabla (`[hardware]` en estos ejemplos), nunca
+después de `[format]`. Use una tabla en línea por nodo en orden de rango
+(el subconjunto TOML del analizador no admite tablas `[[devices]]`). Incluya los seis
 campos: `gfx_target` (cadena), `cu_count` (entero), `mem_total_bytes` y
 `mem_free_bytes` (enteros), `unified` (booleano) y `source` (cadena no vacía que
 describa la procedencia de la medida). Copie observaciones reales; no duplique el

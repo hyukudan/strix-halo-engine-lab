@@ -117,6 +117,7 @@ struct Environment {
 
 // Removes `--devices FILE` and `--device-id ID` from an argument vector (in place) and returns them, so every binary
 // accepts the two flags without touching its own parser. Throws std::invalid_argument for a flag without a value.
+// Does not interpret engine options: a kept token may be another option's value.
 struct CommandLine {
     std::string devices_path;
     std::string select;

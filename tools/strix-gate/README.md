@@ -150,6 +150,78 @@ is pooled KL <= 0.02, top-1 >= 0.93, dNLL <= 0.01 (`--max-kl`, `--min-top1`, `--
 `--expect-identical` is the control for two runs of one identity: any logit or selection
 difference fails. Exit 0 = pass, 1 = fail, 2 = identity or input defect (no verdict).
 
+### Floor-relative dNLL (DeepSeek V4.1 FAST prefill only)
+
+```sh
+python tools/strix-gate/fast_logit_gate.py compare EXACT CAND --ranks 0 1 --tokens ... \
+    --dnll-rule floor --engine ds41 --profile fast-prefill --null-arm NULL_S1 --null-arm NULL_S2 --null-arm NULL_S3
+```
+
+Labels are the true next tokens, so a change that carries no information about the text costs
+E[dNLL] = KL in expectation: on DS41 every layer-0 change (a one-ulp null included) re-routes MoE
+rows and lands at KL ~0.01, dNLL +0.011..+0.014, above the absolute 0.01. For that profile the dNLL
+limit is relative to this floor: `--dnll-rule floor` makes it mean + 2 sd (n - 1) of the pooled dNLL
+of at least three layer-0 null-control arms (`--null-arm DIR`, sealed runs) measured against the
+same reference, on the same prompts and the same binary as the candidate. KL <= 0.02 and
+top-1 >= 0.93 are unchanged. Example (DS41 20 prompts x 64 rows): nulls +0.01408 / +0.01140 /
++0.01111 give mean +0.01220, sd 0.00164, limit +0.01547; arms +0.01203 and +0.01458 pass, +0.01600 fails.
+
+Refused with exit 2 (no verdict): fewer than three nulls, a null whose binary differs from the
+candidate's, whose prompts or token files differ, or whose run id repeats the reference, the
+candidate or another null; `--null-arm` without `--dnll-rule floor`; floor with
+`--expect-identical`; and any `--engine` / `--profile` pair that `DNLL_POLICY` in the script does not
+grant the floor rule. Today the table holds one entry, `ds41` / `fast-prefill`; every other engine and
+profile keeps the absolute dNLL <= 0.01 (the default, unchanged). Widening the table is a policy
+decision. Under the floor rule the report prints and records (`pooled.dnll_rule` in `--json`) the
+rule, engine, profile, each null (run id, arm, env, rows, KL, top-1, dNLL), mean, sd, the limit and
+the absolute 0.01 verdict as a reference column; with the default rule `pooled.dnll_rule` records
+`abs` and the limit.
+
+Floor comparisons also require `seal --execution-witness execution-rR.json` on
+the reference, candidate and every null, on every rank. Missing or incompatible
+evidence is exit 2, with no verdict. Arm names, `--env` and `--attest sel_mode`
+do not establish control eligibility. The launcher/engine must emit this JSON
+from the executed configuration and the completed dumps; sealing preserves it
+as `execution` and checks its binding to the run:
+
+```json
+{
+  "schema": "strix-fast-execution/v1",
+  "run_id": "unique-run-id", "rank": 0,
+  "binary_sha256": "<64 lowercase hex digits>",
+  "engine": "ds41", "profile": "exact",
+  "model_sha256": "<64 lowercase hex digits>",
+  "numerical_config_sha256": "<64 lowercase hex digits>",
+  "control": {"kind": "layer0-null", "layer": 0, "magnitude": 1, "unit": "ulp"},
+  "prompts": {"<prompt-name>": "<same structured entry as the sealed prompts map>"}
+}
+```
+
+`prompts` must contain the full token counts/hashes, row counts and dump
+names/sizes/hashes/widths (plus selection records/mode when present) described
+above, computed by the producer. The placeholders are not usable evidence.
+`model_sha256` identifies the complete ordered model asset bundle;
+`numerical_config_sha256` hashes the canonical resolved numerical configuration,
+including effective switches, arithmetic, tensor layouts and selection policy,
+excluding only the separately recorded control perturbation and its random seed.
+Producers must use the same canonical encoding across arms and ranks.
+The exact reference and nulls must match both identities and use profile `exact`;
+the candidate must match the model and witness `ds41` / `fast-prefill`.
+Reference and candidate use `"control": null`. Only the one-ULP layer-0 identity
+above is admitted as a control. Rank identities must agree; each rank binds its
+own binary and dumps. Reports include the first rank's execution evidence.
+
+Trust boundary: these are trusted launcher/engine statements, not signatures or
+proof derived from logits. The gate cannot detect a producer that misreports
+execution or a deliberately rewritten manifest. CLI engine/profile labels are
+checked against the sealed witness. This change defines the consumer contract;
+it does not add a native witness producer. Runs without producer evidence cannot
+use the floor rule; do not create evidence by relabelling existing runs.
+Mean plus two sample standard deviations from three controls is an empirical
+policy threshold, not a confidence bound or model-fidelity result. Synthetic
+host tests establish validation and arithmetic only; compiler, native execution,
+model fidelity and complete-workload qualification remain separate gates.
+
 When both arms carry selection dumps (`PREFIX-<prompt>-sel-r<rank>.u32`; MiniMax writes them
 with `STRIX_MM_QUALITY_SELECT=1` next to `STRIX_MM_QUALITY_OUT`), `compare` also reports, per
 layer, the (row, head) slots whose selected block set differs and the first layer and position
