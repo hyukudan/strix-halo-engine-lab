@@ -138,7 +138,7 @@ def main():
     if engine == 'qwen':
         if a.profile != 'gsq':
             if a.dry_run: command(['llama-gguf-split','--merge',a.model_dir/'UD-Q4_K_XL/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf',a.model_dir/'Qwen3.8-Flash-Next-UD-Q4_K_XL.gguf'],True)
-        print('Public MTP is the base sidecar; the default distill-g sidecar must be supplied separately. Do not rename base to distill-g.')
+        print('Public MTP is the base sidecar; the default distill-g sidecar must be downloaded separately from https://huggingface.co/hyukudan/Qwen3.8-Flash-Next-MTP-distillG-Q8_0 (SHA-256 5516d3ce407783a424315b6a2a0d8b06341665bb3541b98e5db0fe944add4c3c). Do not rename base to distill-g.')
     if engine == 'deepseek-rtx': print('Supply a valid MODEL.receipt.json and exported STATE.bin separately.')
     return 0
 
