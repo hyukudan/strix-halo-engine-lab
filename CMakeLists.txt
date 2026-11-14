@@ -2550,6 +2550,7 @@ int main() { return 0; }"
         src/hip_moe_experts_launcher.hip
         src/hip_ple_launcher.hip
         src/hip_mtp_resources.hip
+        src/session/cycle_pack.hip
         src/hip_mtp_runtime.hip
         src/hip_mtp_draft_head.hip
         src/hip_mtp_fast_draft.hip

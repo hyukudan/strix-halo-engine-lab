@@ -11,6 +11,7 @@
 #include "strix/mtp_batch_window_controller.hpp"
 #include "strix/hip_mtp_fast_draft.hpp"
 #include "strix/serve/cycle_receipt.hpp"
+#include "strix/session/cycle_pack.hpp"
 #include <hip/hip_runtime.h>
 #include <optional>
 #include <algorithm>
@@ -1367,6 +1368,7 @@ std::vector<HipMtpServeLever> hip_mtp_serve_levers() {
         {"joint_window","STRIX_MTP_BATCH_JOINT",joint || mtp_serve_row_budget_enabled(),joint || mtp_serve_row_budget_enabled()?"1":"0"},
         {"row_budget","STRIX_SERVE_ROW_BUDGET",mtp_serve_row_budget_enabled(),mtp_serve_row_budget_enabled()?"1":"0"},
         {"row_budget_max_lanes","STRIX_SERVE_ROW_BUDGET_MAX_LANES",mtp_serve_row_budget_enabled(),std::to_string(mtp_serve_row_budget_max_lanes())},
+        {"cycle_pack","STRIX_SERVE_CYCLE_PACK",strix::session::serve_cycle_pack_choice(2).on,strix::session::serve_cycle_pack_choice(2).on?"1":"0"},
     };
 }
 } // namespace strix
