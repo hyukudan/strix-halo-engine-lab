@@ -3,14 +3,92 @@
  "comment": "Every resolved value that the server of an engine may have different from the CLI of the same engine for one request, with the reason serving requires it. tools/serve_cli_parity.py config fails on any difference that is not listed here. A row may pin cli / serve values: it then stops applying when either side changes.",
  "engines": {
   "*": [
-   {"key": "app", "reason": "names the entry point itself"},
-   {"key": "route", "reason": "names the entry point itself (cli / http-single / http-batch)"},
-   {"key": "*.entry", "reason": "names the entry point itself"}
+   {
+    "key": "app",
+    "reason": "names the entry point itself"
+   },
+   {
+    "key": "route",
+    "reason": "names the entry point itself (cli / http-single / http-batch)"
+   },
+   {
+    "key": "*.entry",
+    "reason": "names the entry point itself"
+   }
   ],
   "qwen": [],
-  "glm": [],
-  "minimax": [],
-  "ds41": [],
+  "glm": [
+   {
+    "key": "serve.*",
+    "reason": "serving-only state (slots, batch scheduler, import route, wire): no CLI counterpart"
+   },
+   {
+    "key": "serve-prefill-chunk",
+    "reason": "serving-only lever: chunking applies only while another request decodes"
+   }
+  ],
+  "minimax": [
+   {
+    "key": "serve.*",
+    "reason": "serving-only state (scheduler and DSpark policy): no CLI counterpart"
+   },
+   {
+    "key": "slots",
+    "reason": "request slots exist only in the server"
+   },
+   {
+    "key": "host.STRIX_DIST_USB4_TIMEOUT_MS",
+    "cli": "600000",
+    "serve": "60000",
+    "reason": "a request must fail within a minute when the peer is gone; the CLI waits out an uneven two-rank load"
+   },
+   {
+    "key": "host.STRIX_DIST_WAIT_TIMEOUT_MS",
+    "cli": "600000",
+    "serve": "60000",
+    "reason": "a request must fail within a minute when the peer is gone; the CLI waits out an uneven two-rank load"
+   },
+   {
+    "key": "host.STRIX_MM_PF_TABLE_RING",
+    "cli": "1",
+    "serve": "unset",
+    "reason": "qualified with a single engine owner; not qualified with several sessions sharing the engine (open: qualify it for serving)"
+   },
+   {
+    "key": "host.*.serving_reason",
+    "reason": "the server prints why a host default differs from the CLI"
+   },
+   {
+    "key": "session_*",
+    "reason": "the session cache is a serving feature; one-shot CLI runs keep it explicit"
+   }
+  ],
+  "ds41": [
+   {
+    "key": "arg.--slots",
+    "reason": "request slots exist only in the server"
+   },
+   {
+    "key": "arg.--context",
+    "reason": "the server sizes its context once at startup; the CLI sizes it per run"
+   },
+   {
+    "key": "arg.--peer-timeout",
+    "reason": "a resident server must notice a lost peer; one-shot runs end with the process"
+   },
+   {
+    "key": "arg.--dspark*",
+    "reason": "the server loads the draft model by default; the CLI decode tools take it as an argument"
+   },
+   {
+    "key": "notice[[]*",
+    "reason": "notices describe serving-only resolution (draft vocabulary, session cache)"
+   },
+   {
+    "key": "session",
+    "reason": "the session cache is a serving feature; one-shot CLI runs keep it explicit"
+   }
+  ],
   "gemma": []
  }
 }

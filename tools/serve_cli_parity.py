@@ -99,8 +99,8 @@ def parse_config(text):
         line = line.strip()
         if not line or "{" in line and (line.startswith("{") or line.startswith("strix-route-receipt")):
             continue
-        if line.startswith("device:"):
-            continue
+        if line.startswith("device:") or re.match(r"^[A-Za-z][\w -]*: \{", line):
+            continue  # device banner, prefixed receipts (power, route): not configuration
         if line.startswith("effective env "):
             key, _, value = line[14:].partition("=")
             out[f"env.{key}"] = value.split(" (", 1)[0]
