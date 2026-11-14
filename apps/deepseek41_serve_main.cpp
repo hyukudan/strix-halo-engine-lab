@@ -133,6 +133,7 @@
 #include "strix/model_content_hash.hpp"
 #include "strix/serve/api.hpp"
 #include "strix/serve/bpe_tokenizer.hpp"
+#include "strix/serve/cycle_receipt.hpp"
 #include "strix/serve/deepseek_chat.hpp"
 #include "strix/serve/engine.hpp"
 #include "strix/serve/http_server.hpp"
@@ -2282,6 +2283,16 @@ void lead(const Args& initial, BatchForward& fwd, strix::dist::Communicator& com
                          static_cast<unsigned long long>(drafts_allowed), plans_since_ready().c_str());
         }
     } prof;
+    // STRIX_SERVE_RECEIPT=1: one "serve run" line per busy window (shared whole-run receipt; clock reads the loop
+    // already makes, plus one per prompt unit)
+    const bool run_on = serve::cycle_receipt_enabled();
+    serve::RunWindow run_window;
+    const auto run_ns = [](Clock::time_point t) {
+        return static_cast<std::int64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(t.time_since_epoch()).count());
+    };
+    const std::string run_identity = "engine=deepseek41-pair draft=" + std::string(a.dspark.empty() ? "off" : "on") + " draft_max_inflight=" +
+        std::to_string(a.dspark_max_inflight) + " context=" + std::to_string(a.context) + " slots=" + std::to_string(a.slots) +
+        " prefill=" + (a.device_prefill ? "device" : "rows");
     std::vector<std::unique_ptr<Running>> running;
     std::vector<std::uint32_t> free_slots;
     for (std::uint32_t s = a.slots; s-- > 0U;) free_slots.push_back(s);
@@ -2391,6 +2402,13 @@ void lead(const Args& initial, BatchForward& fwd, strix::dist::Communicator& com
         pool_release(r.seq.slot);
         free_slots.push_back(r.seq.slot);
         running.erase(running.begin() + static_cast<std::ptrdiff_t>(i));
+        if (run_on && run_window.open()) {
+            if (reason == "cancelled") run_window.cancel();
+            if (running.empty()) {
+                const auto receipt = run_window.close(run_ns(Clock::now()));
+                std::fprintf(stderr, "%s\n", serve::format_run_receipt(receipt, run_identity).c_str());
+            }
+        }
         const std::lock_guard lock(state.mutex);
         state.busy = static_cast<std::uint32_t>(running.size());
     };
@@ -2752,6 +2770,9 @@ void lead(const Args& initial, BatchForward& fwd, strix::dist::Communicator& com
         const bool armed = serve::observe_armed();  // one load per step: the draft tally and the published snapshot
         const auto t_loop = Clock::now();
         if (prof.steps != 0U) prof.between += std::chrono::duration<double>(t_loop - prof.last_end).count();
+        std::array<std::uint32_t, 64> run_before{};  // tokens of each lane before the step (whole-run receipt)
+        if (run_on)
+            for (std::size_t i = 0; i < seqs.size() && i < run_before.size(); ++i) run_before[i] = static_cast<std::uint32_t>(seqs[i]->generated.size());
         strix::deepseek41::PlannedStep planned;
         if (pre) {
             planned = *pre;
@@ -2855,6 +2876,13 @@ void lead(const Args& initial, BatchForward& fwd, strix::dist::Communicator& com
         prof.step += std::chrono::duration<double>(last_round - t0).count();
         prof.finish += std::chrono::duration<double>(Clock::now() - last_round).count();
         prof.last_end = Clock::now();
+        if (run_on) {  // the step interval is the forward; planning, control and the commit work are host control
+            std::uint64_t emitted = 0;
+            for (std::size_t i = 0; i < seqs.size() && i < run_before.size(); ++i)
+                for (std::size_t k = run_before[i]; k < seqs[i]->generated.size(); ++k, ++emitted) run_window.token(seqs[i]->slot, seqs[i]->generated[k]);
+            run_window.step(run_ns(t0), run_ns(last_round), static_cast<std::uint32_t>(seqs.size()), static_cast<std::uint32_t>(plan.rows.size()), emitted);
+            run_window.host_control(run_ns(t0) - run_ns(t_loop) + run_ns(prof.last_end) - run_ns(last_round));
+        }
         if (++prof.steps % 100U == 0U) prof.print(spec.get());
         const double dt = std::chrono::duration<double>(last_round - t0).count();
         step_ema = step_ema == 0.0 ? dt : 0.8 * step_ema + 0.2 * dt;  // the deferred admission's W
@@ -3231,6 +3259,7 @@ void lead(const Args& initial, BatchForward& fwd, strix::dist::Communicator& com
                                  p.position);
                     if (!request(*r).job.session_id.empty()) runtime.notify_admitted(r->owner);
                     running.push_back(std::move(r));
+                    if (run_on) run_window.request(run_ns(Clock::now()));
                     worked = true;
                     const std::lock_guard lock(state.mutex);
                     state.busy = static_cast<std::uint32_t>(running.size());
@@ -3268,6 +3297,7 @@ void lead(const Args& initial, BatchForward& fwd, strix::dist::Communicator& com
                 pending_resets |= 1U << r->seq.slot;
                 if (!request(*r).job.session_id.empty()) runtime.notify_admitted(r->owner);
                 running.push_back(std::move(r));
+                if (run_on) run_window.request(run_ns(Clock::now()));
                 worked = true;
                 const std::lock_guard lock(state.mutex);
                 state.busy = static_cast<std::uint32_t>(running.size());
@@ -3325,6 +3355,7 @@ void lead(const Args& initial, BatchForward& fwd, strix::dist::Communicator& com
                         auto& r = *waiting[pick];
                         const auto t_pf = Clock::now();
                         device_prefill(r, r.seq.prompt.size() >= sched.min_rows);
+                        if (run_on) run_window.admission(run_ns(t_pf), run_ns(Clock::now()), active ? 0U : r.seq.prompt.size(), active ? 0U : r.seq.generated.size());
                         if (step_trace)
                             std::fprintf(stderr, "steptrace prefill t %.1f slot %u tokens %zu end %.1f task %d\n", trace_ms(t_pf), r.seq.slot,
                                          r.seq.prompt.size(), trace_ms(Clock::now()), active ? 1 : 0);
@@ -3344,6 +3375,7 @@ void lead(const Args& initial, BatchForward& fwd, strix::dist::Communicator& com
                 const bool hold = sched.admit_first.prompt_before_decode(running.size() + queued, waiting_prefill + (prefilled_now && queued != 0U ? 1U : 0U),
                     seqs.size(), std::chrono::duration<double, std::milli>(Clock::now() - decode_gap_from).count());
                 if (hold) {
+                    run_window.hold();
                     if (step_trace) std::fprintf(stderr, "steptrace hold t %.1f seqs %zu waiting %zu queued %zu\n", trace_ms(Clock::now()), seqs.size(), waiting_prefill, queued);
                 } else if (!seqs.empty()) {
                     decode_step(seqs);
@@ -3352,7 +3384,11 @@ void lead(const Args& initial, BatchForward& fwd, strix::dist::Communicator& com
                 }
                 if (active) {
                     // phase B (resumable): the default pieces, a few units per tick; else pieces of unit_rows rows
+                    Running* const unit_of = active->r;
+                    const auto t_unit = Clock::now();
                     run_unit(strix::deepseek41::sched::row_budget(sched, seqs.empty()), !seqs.empty());
+                    if (run_on)  // a piece of a resumable prefill; the last piece carries the prompt and its first token
+                        run_window.admission(run_ns(t_unit), run_ns(Clock::now()), active ? 0U : unit_of->seq.prompt.size(), active ? 0U : unit_of->seq.generated.size());
                     if (!active) publish();  // its first token
                     return;
                 }
@@ -3362,7 +3398,9 @@ void lead(const Args& initial, BatchForward& fwd, strix::dist::Communicator& com
                 bool prefilled = false;
                 for (auto& r : running)
                     if (r->device_prefill) {
+                        const auto t_pf = Clock::now();
                         device_prefill(*r, false);
+                        if (run_on) run_window.admission(run_ns(t_pf), run_ns(Clock::now()), r->seq.prompt.size(), r->seq.generated.size());
                         prefilled = true;
                     }
                 if (prefilled) {

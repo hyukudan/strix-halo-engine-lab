@@ -302,4 +302,133 @@ inline void dump_cycle_ledger(std::FILE* out) {
     std::fprintf(out, "serve ledger %s\n", text.c_str());
 }
 
+// Whole-run receipt: one busy window of a scheduler (first admission to the last lane leaving), split so that
+// the whole-run rate (outputs / wall) and the steady rate (outputs of full-cohort steps / their wall) come from
+// the same clock. The intervals are a partition of the window; `other_ns()` is what no call claimed.
+//   admission     prompt units (prefill) of the window, with the outputs they emitted (a prompt's first token)
+//   ramp          decode steps before the largest cohort of the window stepped together
+//   full          decode steps of that largest cohort: the steady state. Never inferred from a smaller step.
+//   partial       smaller steps after the cohort was reached (a lane left, was cancelled, or was admitted late)
+//   host_control  planning, the control exchange and the work between two steps that the scheduler timed
+//   hold          decode steps skipped while prompts were served first (a count: their time is admission)
+// A step with zero emitted tokens (every proposal held or rolled back) still counts its time in its class.
+struct RunReceipt {
+    struct Class {
+        std::uint64_t steps = 0, outputs = 0, rows = 0;
+        std::int64_t ns = 0;
+        void add(const Class& o) noexcept { steps += o.steps, outputs += o.outputs, rows += o.rows, ns += o.ns; }
+    };
+    std::int64_t begin_ns = 0, end_ns = 0;
+    std::int64_t first_output_ns = 0;   // the first token of the window
+    std::int64_t cohort_ns = 0;         // begin of the first full-cohort step
+    std::int64_t last_full_ns = 0;      // end of the last full-cohort step
+    std::int64_t last_output_ns = 0;    // the last token of the window
+    std::uint32_t requests = 0, cancelled = 0, peak_lanes = 0;
+    std::uint64_t prompt_units = 0, prompt_tokens = 0, admission_outputs = 0, holds = 0;
+    std::int64_t admission_ns = 0, host_control_ns = 0;
+    Class ramp, full, partial;
+    std::uint64_t digest = 1469598103934665603ULL;  // FNV-1a of (lane, token) in commit order
+
+    [[nodiscard]] std::uint64_t outputs() const noexcept { return admission_outputs + ramp.outputs + full.outputs + partial.outputs; }
+    [[nodiscard]] std::int64_t wall_ns() const noexcept { return end_ns - begin_ns; }
+    [[nodiscard]] std::int64_t other_ns() const noexcept {
+        return wall_ns() - admission_ns - host_control_ns - ramp.ns - full.ns - partial.ns;
+    }
+    // Time after the last full-cohort step (tail steps, their control and the drain).
+    [[nodiscard]] std::int64_t tail_ns() const noexcept { return full.steps ? end_ns - last_full_ns : 0; }
+    [[nodiscard]] double whole_rate() const noexcept {
+        return wall_ns() > 0 ? static_cast<double>(outputs()) * 1e9 / static_cast<double>(wall_ns()) : 0.0;
+    }
+    [[nodiscard]] double steady_rate() const noexcept {
+        return full.ns > 0 ? static_cast<double>(full.outputs) * 1e9 / static_cast<double>(full.ns) : 0.0;
+    }
+    [[nodiscard]] bool consistent() const noexcept {
+        return end_ns >= begin_ns && admission_ns >= 0 && host_control_ns >= 0 && ramp.ns >= 0 && full.ns >= 0 &&
+            partial.ns >= 0 && other_ns() >= 0;
+    }
+};
+
+class RunWindow {
+public:
+    [[nodiscard]] bool open() const noexcept { return open_; }
+    // A request entered the scheduler; the first one opens the window.
+    void request(std::int64_t now_ns) noexcept {
+        if (!open_) r_ = RunReceipt{}, r_.begin_ns = now_ns, open_ = true;
+        ++r_.requests;
+    }
+    void cancel() noexcept {
+        if (open_) ++r_.cancelled;
+    }
+    void hold() noexcept {
+        if (open_) ++r_.holds;
+    }
+    // One prompt unit (a prefill or a piece of one); `emitted` tokens became visible with it.
+    void admission(std::int64_t begin_ns, std::int64_t end_ns, std::uint64_t tokens, std::uint64_t emitted) noexcept {
+        if (!open_ || end_ns < begin_ns) return;
+        ++r_.prompt_units;
+        r_.prompt_tokens += tokens;
+        r_.admission_ns += end_ns - begin_ns;
+        r_.admission_outputs += emitted;
+        output(end_ns, emitted);
+    }
+    void host_control(std::int64_t ns) noexcept {
+        if (open_ && ns > 0) r_.host_control_ns += ns;
+    }
+    // One decode step of `lanes` requests over `rows` physical rows; `emitted` tokens were committed (0 is valid).
+    void step(std::int64_t begin_ns, std::int64_t end_ns, std::uint32_t lanes, std::uint32_t rows, std::uint64_t emitted) noexcept {
+        if (!open_ || end_ns < begin_ns || lanes == 0) return;
+        RunReceipt::Class c;
+        c.steps = 1, c.outputs = emitted, c.rows = rows, c.ns = end_ns - begin_ns;
+        if (lanes > r_.peak_lanes) {  // a larger cohort: everything before it was the ramp
+            r_.ramp.add(r_.full), r_.ramp.add(r_.partial);
+            r_.full = r_.partial = RunReceipt::Class{};
+            r_.peak_lanes = lanes;
+            r_.cohort_ns = begin_ns;
+        }
+        if (lanes == r_.peak_lanes) r_.full.add(c), r_.last_full_ns = end_ns;
+        else r_.partial.add(c);
+        output(end_ns, emitted);
+    }
+    void token(std::uint32_t lane, std::uint32_t token) noexcept {
+        for (const std::uint32_t v : {lane, token})
+            for (int i = 0; i < 4; ++i) r_.digest = (r_.digest ^ ((v >> (8 * i)) & 0xFFU)) * 1099511628211ULL;
+    }
+    // The last lane left: the window closes and its receipt is returned.
+    [[nodiscard]] RunReceipt close(std::int64_t now_ns) noexcept {
+        r_.end_ns = now_ns;
+        open_ = false;
+        return r_;
+    }
+
+private:
+    void output(std::int64_t at_ns, std::uint64_t emitted) noexcept {
+        if (emitted == 0) return;
+        if (r_.first_output_ns == 0) r_.first_output_ns = at_ns;
+        r_.last_output_ns = at_ns;
+    }
+    RunReceipt r_{};
+    bool open_ = false;
+};
+
+// One log line per window ("serve run key=value ..."); times in ms, stamps relative to the window's begin.
+[[nodiscard]] inline std::string format_run_receipt(const RunReceipt& r, const std::string& identity = {}) {
+    const auto ms = [](std::int64_t ns) { return static_cast<double>(ns) / 1e6; };
+    const auto at = [&](std::int64_t ns) { return ns ? ms(ns - r.begin_ns) : -1.0; };
+    std::ostringstream o;
+    const auto cls = [&](const char* name, const RunReceipt::Class& c) {
+        o << ' ' << name << "_steps=" << c.steps << ' ' << name << "_outputs=" << c.outputs << ' ' << name << "_rows=" << c.rows << ' '
+          << name << "_ms=" << ms(c.ns);
+    };
+    o << std::fixed << std::setprecision(3) << "serve run requests=" << r.requests << " cancelled=" << r.cancelled << " peak_lanes="
+      << r.peak_lanes << " outputs=" << r.outputs() << " wall_ms=" << ms(r.wall_ns()) << " whole_tok_s=" << r.whole_rate()
+      << " steady_tok_s=" << r.steady_rate() << " prompt_units=" << r.prompt_units << " prompt_tokens=" << r.prompt_tokens
+      << " admission_outputs=" << r.admission_outputs << " admission_ms=" << ms(r.admission_ns) << " holds=" << r.holds;
+    cls("ramp", r.ramp), cls("full", r.full), cls("partial", r.partial);
+    o << " host_control_ms=" << ms(r.host_control_ns) << " other_ms=" << ms(r.other_ns()) << " tail_ms=" << ms(r.tail_ns())
+      << " first_output_at=" << at(r.first_output_ns) << " cohort_at=" << at(r.cohort_ns) << " last_full_at=" << at(r.last_full_ns)
+      << " last_output_at=" << at(r.last_output_ns) << " digest=" << std::hex << r.digest << std::dec;
+    if (!identity.empty()) o << ' ' << identity;
+    return o.str();
+}
+
 } // namespace strix::serve
