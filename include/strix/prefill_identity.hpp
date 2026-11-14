@@ -29,6 +29,7 @@ enum class PrefillOption : unsigned {
     gdn_fp16_chunk,     // Candidate chunked GDN prefill on FP16 WMMA (qwen-gdn-fp16-chunk rev 2/3); explicit opt-in until qualified
     index_score_wmma,   // Candidate FAST BF16 index scores; explicit opt-in until qualified
     ple_rows_f16,       // Candidate FAST PLE key/value rows on the shared FP16 dense core (q8_rows::tiled); explicit opt-in until qualified
+    gdn_gates_f16,      // Candidate FAST GDN beta/alpha gates on the shared FP16 dense core (f16_dense_tall); needs gdn_fp16_chunk
     count
 };
 
@@ -44,6 +45,7 @@ inline constexpr std::array<PrefillOptionInfo, static_cast<unsigned>(PrefillOpti
     {"gdn_fp16_chunk", "STRIX_QPF2K_GDN_FP16_CHUNK", "gdnchunk16"},
     {"index_score_wmma", "STRIX_PREFILL_INDEX_SCORE_WMMA", "idxscore16"},
     {"ple_rows_f16", "STRIX_PREFILL_PLE_ROWS_F16", "plef16"},
+    {"gdn_gates_f16", "STRIX_PREFILL_GDN_GATES_F16", "gatef16"},
 }};
 
 // Options whose implementation is built in and enabled by default. An option joins this mask only when it is READY;
@@ -56,7 +58,8 @@ inline constexpr unsigned kPrefillGdnChunkRev3 = 1U << static_cast<unsigned>(Pre
 inline constexpr unsigned kPrefillOptionsCandidates = (1U << static_cast<unsigned>(PrefillOption::index_proj_wmma)) |
     (1U << static_cast<unsigned>(PrefillOption::gdn_fp16_chunk)) |
     (1U << static_cast<unsigned>(PrefillOption::index_score_wmma)) |
-    (1U << static_cast<unsigned>(PrefillOption::ple_rows_f16));
+    (1U << static_cast<unsigned>(PrefillOption::ple_rows_f16)) |
+    (1U << static_cast<unsigned>(PrefillOption::gdn_gates_f16));
 
 // Candidate index arithmetic is not qualified for MTP or nested scheduling.
 inline constexpr bool index_wmma_unqualified_route(unsigned mask, unsigned fast_components) {
@@ -126,7 +129,8 @@ inline unsigned prefill_options_active() {
     unsigned mask = resolve_prefill_options([](const char* name) { return std::getenv(name); });
     const auto& o = detail::prefill_identity_override();
     if (o.set) mask = o.exact ? 0U : mask & ~o.disabled;
-    if (!(mask & prefill_option_bit(PrefillOption::gdn_fp16_chunk))) mask &= ~kPrefillGdnChunkRev3;
+    // gdn_gates_f16 runs only inside the gdn_fp16_chunk route: without it the identity does not name it.
+    if (!(mask & prefill_option_bit(PrefillOption::gdn_fp16_chunk))) mask &= ~(kPrefillGdnChunkRev3 | prefill_option_bit(PrefillOption::gdn_gates_f16));
     return mask & (kPrefillOptionsReady | kPrefillOptionsCandidates | kPrefillGdnChunkRev3);
 }
 inline bool prefill_option_enabled(PrefillOption option) { return (prefill_options_active() & prefill_option_bit(option)) != 0U; }
