@@ -3405,7 +3405,7 @@ PrefillResult DevicePrefill::run_from(std::span<const std::uint32_t> tokens, std
                     pin.deltas = m.peer_xdeltas.p + std::size_t{p0} * H / 32U;
                     // both ranks send max(np, no) rows (the same message size); staged: in one message
                     const std::uint32_t nmax = std::max(np, no);
-                    // joint expert pass: the prompt rule (T <= joint_max_rows) or, with the joint-layer lever, the LAYER's rows
+                    // joint expert pass: the run rule (joint_sel: T <= joint_max_rows, or the group pass) or, with the joint-layer lever, the LAYER's rows
                     // (np + no, the same on both ranks): the cone layers' second pass reads every expert again for few rows
                     const bool joint = m.moe_joint || joint_sel ||
                                        (prefill_joint_layer() && ds41::moe_joint_layer(np, no, prefill_joint_layer_rows()));
