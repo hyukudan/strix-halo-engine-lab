@@ -3,7 +3,8 @@
 // OFF by default (the defaults-ON items stay in mm_defaults.cpp kItems) and that both ranks must agree on. Resolved by
 // the one MiniMax resolver (mm_defaults.cpp prefill_policy / profile_resolution): engine, session-cache identity,
 // effective config and rank agreement read the same values. A row at its builtin value is left out of the profile
-// fingerprint (omit_builtin_fingerprint), so with every row OFF the identities of older pairs and caches are unchanged.
+// fingerprint (omit_builtin_fingerprint), so with every row OFF these rows add no fingerprint inputs.
+// Complete cache compatibility also depends on the executable and raw environment identity.
 // No row has a 'fast' column yet: MiniMax rank's --profile is the per-phase timing session, so the product profile is
 // selected by the FAST prefill bundle switch only.
 #include "strix/engine_profile.hpp"
@@ -25,10 +26,8 @@ inline constexpr strix::fast_profile::Bundle kFastBundle{"STRIX_MM_FAST_PREFILL"
 inline constexpr const char* kMsaFlashLayers = "40-59";  // passes the 8K FAST gate on EXL3; 20-59 does not
 inline constexpr unsigned kMsaLayers = 60;
 
-inline constexpr std::array<strix::profile::Lever, 3> profile_table{{
-    {"fast_prefill", "STRIX_MM_FAST_PREFILL", "", {"", "", ""}, "0", strix::profile::Kind::bit_changing,
-     {true, false, true}, {true, true, true}, "", "0", "explicit FAST bundle mm-fast-pf-v1; native qualification required",
-     false, {}, true},
+// Bundle selection is requested provenance; only effective members enter agreement.
+inline constexpr std::array<strix::profile::Lever, 2> profile_table{{
     // Prefill only: MSA attention of windows > 8 rows; selection, block lists and K/V caches unchanged.
     {"msa_flash", "STRIX_MM_PF_MSA_FLASH", "", {"", "", ""}, "0", strix::profile::Kind::bit_changing,
      {true, false, true}, {true, true, true}, "", "0",

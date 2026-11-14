@@ -38,6 +38,21 @@ using Overrides = std::map<std::string, std::string>;  // canonical values the r
 inline bool switch_on(const char* v) { return v != nullptr && v[0] == '1' && v[1] == 0; }
 inline bool set(const char* v) { return v != nullptr && *v != 0; }
 
+// Canonical ranges for a parsed policy mask; syntax/provenance must not affect agreement.
+template <class Contains>
+inline std::string layer_ranges(unsigned end, const Contains& contains) {
+    std::string out;
+    for (unsigned l = 0; l < end; ++l) {
+        if (!contains(l)) continue;
+        const unsigned first = l;
+        while (l + 1 < end && contains(l + 1)) ++l;
+        if (!out.empty()) out += ',';
+        out += std::to_string(first);
+        if (l != first) out += '-' + std::to_string(l);
+    }
+    return out.empty() ? "none" : out;
+}
+
 inline bool accepted(const Member& m, std::string_view raw) {
     std::string_view list(m.accept);
     while (!list.empty()) {

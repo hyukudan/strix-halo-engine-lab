@@ -195,6 +195,13 @@ bool fast_i4_format(const Lookup& env) {
 }
 }  // namespace
 
+const char* msa_flash_decline_reason(bool rework, bool fused, unsigned layers) {
+    if (!rework) return "STRIX_MM_PF_MSA_REWORK=0";
+    if (!fused) return "STRIX_MM_ATTN_PREFILL=off";
+    if (layers == 0) return "STRIX_MM_PF_MSA_FLASH_LAYERS selects no layers";
+    return nullptr;
+}
+
 PrefillPolicy prefill_policy(const Lookup& env) {
     namespace fp = strix::fast_profile;
     const fp::Member& flash = kFastMembers[0];
@@ -208,10 +215,22 @@ PrefillPolicy prefill_policy(const Lookup& env) {
     const auto it = p.canonical.find(flash.env);
     const std::string mode = it != p.canonical.end() ? it->second : "0";
     p.msa_flash = mode == "0" ? 0U : static_cast<unsigned>(mode[0] - '0');
+    p.msa_flash_requested = p.msa_flash;
     p.msa_flash_asked = fp::set(raw) ? raw : it != p.canonical.end() ? "fast_prefill" : "default";
     const char* layers = env("STRIX_MM_PF_MSA_FLASH_LAYERS");
-    p.msa_flash_layers = fp::set(layers) ? layers : kMsaFlashLayers;
-    (void)strix::core::parse_layer_set(p.msa_flash_layers.c_str(), 0, kMsaLayers, "STRIX_MM_PF_MSA_FLASH_LAYERS");
+    p.msa_flash_layers_requested = fp::set(layers) ? layers : kMsaFlashLayers;
+    const auto mask = strix::core::parse_layer_set(p.msa_flash_layers_requested.c_str(), 0, kMsaLayers, "STRIX_MM_PF_MSA_FLASH_LAYERS");
+    p.msa_flash_layers = fp::layer_ranges(kMsaLayers, [&](unsigned l) { return mask.test(l); });
+    if (p.msa_flash != 0) {
+        bool rework = true;
+        for (const auto& r : resolve(env))
+            if (std::strcmp(r.item->env, "STRIX_MM_PF_MSA_REWORK") == 0) rework = r.value != "0";
+        const char* fused = env("STRIX_MM_ATTN_PREFILL");
+        if (const char* reason = msa_flash_decline_reason(rework, fused == nullptr || std::strcmp(fused, "off") != 0, mask.count())) {
+            p.msa_flash = 0;
+            p.note = reason;
+        }
+    }
     if (p.msa_flash != 0)
         p.policies = p.msa_flash == 1 && p.msa_flash_layers == kMsaFlashLayers
                          ? std::string(flash.policy)
@@ -229,10 +248,14 @@ const profile::Engine& profile_engine() {
 profile::Resolution profile_resolution(const Lookup& env) {
     const auto p = prefill_policy(env);
     const auto base = strix::fast_profile::lookup(p.canonical, env);
+    const std::string effective_mode = std::to_string(p.msa_flash);
     profile::Inputs in;
     in.env = [&](const char* key) -> const char* {
         // The layer set is read only while the flash attention runs: an unused setting is not part of the identity.
-        if (p.msa_flash == 0 && std::strcmp(key, "STRIX_MM_PF_MSA_FLASH_LAYERS") == 0) return nullptr;
+        if (std::strcmp(key, "STRIX_MM_PF_MSA_FLASH") == 0)
+            return p.msa_flash == 0 && p.msa_flash_asked == "default" ? nullptr : effective_mode.c_str();
+        if (std::strcmp(key, "STRIX_MM_PF_MSA_FLASH_LAYERS") == 0)
+            return p.msa_flash == 0 ? nullptr : p.msa_flash_layers.c_str();
         return base(key);
     };
     return profile::resolve(profile_engine(), in);
@@ -451,7 +474,12 @@ std::string effective_config(const Cli& cli, const Lookup& env) {
         const auto pr = profile_resolution(env);
         for (const auto& e : pr.entries) o << e.lever->env << "=" << e.value << "\n";
         const auto id = prefill_identity(env);
-        o << "prefill.fast_profile=" << (strix::fast_profile::switch_on(env(kFastBundle.env)) ? kFastBundle.profile : "off") << "\n"
+        const bool bundle_requested = strix::fast_profile::switch_on(env(kFastBundle.env));
+        o << "prefill.fast_profile=" << (bundle_requested && !pf.policies.empty() ? kFastBundle.profile : "off") << "\n"
+          << "prefill.fast_profile_requested=" << (bundle_requested ? kFastBundle.profile : "off") << "\n"
+          << "prefill.msa_flash_requested=" << pf.msa_flash_requested << "\n"
+          << "prefill.msa_flash_source=" << pf.msa_flash_asked << "\n"
+          << "prefill.msa_flash_layers_requested=" << pf.msa_flash_layers_requested << "\n"
           << "prefill.fast_policies=" << (pf.policies.empty() ? "none" : pf.policies) << "\n"
           << "prefill.fast_note=" << (pf.note.empty() ? "none" : pf.note) << "\n"
           << "prefill.identity=" << (id.empty() ? "default" : id) << "\n"

@@ -58,7 +58,8 @@ Runtime::Runtime(engine::Engine &e, dspark::DeviceDrafter *d,
       {"producer", "single-row-suffix;fixed-spec-width-1-v1"},
       {"draft", dd_ ? "fixed:1" : "off"}};
   // Active FAST prefill policies (and the FAST_I4 MoE format) change the parked state: a cache written under them
-  // must not restore into another identity. Absent with every governed row at its builtin (older caches stay valid).
+  // must not restore into another identity. Absent with every governed row at its builtin; executable and raw
+  // environment hashing still govern complete cache compatibility, including bundle versus explicit selection.
   if (const auto policy = strix::minimax::defaults::prefill_identity(
           [](const char* key) -> const char* { return std::getenv(key); });
       !policy.empty())

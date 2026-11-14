@@ -955,12 +955,14 @@ struct Engine::Impl {
         // identity and the rank agreement; STRIX_MM_FAST_PREFILL=1 selects mode 1 unless the format is fast_i4.
         {
             const auto policy = defaults::prefill_policy(strix::envcfg::text);
-            pf_msa_flash = policy.msa_flash;
+            // Keep the selection for runtime rework controls; dispatch applies the same guards.
+            pf_msa_flash = policy.msa_flash_requested;
             pf_msa_flash_asked = policy.msa_flash_asked;
             pf_msa_flash_layers = strix::core::parse_layer_set(policy.msa_flash_layers.c_str(), 0, kLayers, "STRIX_MM_PF_MSA_FLASH_LAYERS");
             if (!policy.note.empty()) std::fprintf(stderr, "minimax fast prefill: %s\n", policy.note.c_str());
         }
-        if (pf_msa_flash != 0)
+        if (pf_msa_flash != 0 && defaults::msa_flash_decline_reason(pf_msa_rework != 0, attn_prefill_fused,
+                                                                  pf_msa_flash_layers.count()) == nullptr)
             std::fprintf(stderr, "prefill identity mm-pf-msa-flash FAST (bf16 WMMA key-split MSA attend, %u-term operands, %u layers)\n", pf_msa_flash, pf_msa_flash_layers.count());
         if (i4_shadow && !model_fast_i4)
             throw std::invalid_argument("STRIX_MMX_FAST_I4_SHADOW needs STRIX_MMX_MODEL_FORMAT=fast_i4");
@@ -1210,7 +1212,8 @@ struct Engine::Impl {
         }
         rr::lever("minimax.moe_prefill_format", asked != nullptr && *asked != 0 ? asked : "default", effective,
                   iu4 ? rr::Reason::selected : rr::Reason::disabled);
-        const unsigned flash = pf_msa_rework != 0 ? pf_msa_flash : 0U;
+        const unsigned flash = defaults::msa_flash_decline_reason(pf_msa_rework != 0, attn_prefill_fused,
+                                                                 pf_msa_flash_layers.count()) == nullptr ? pf_msa_flash : 0U;
         rr::lever("minimax.msa_flash", pf_msa_flash_asked,
                   std::to_string(flash) + (flash ? ":layers=" + mask(pf_msa_flash_layers, 0) : ""),
                   flash ? rr::Reason::selected : rr::Reason::disabled);
