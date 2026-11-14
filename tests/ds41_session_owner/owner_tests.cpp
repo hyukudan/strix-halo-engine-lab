@@ -11,6 +11,7 @@
 #include "strix/ds41_attention.hpp"
 #include "strix/deepseek41_attention_host.hpp"
 #include "strix/serve/api.hpp"
+#include "strix/serve/cycle_receipt.hpp"
 #include "strix/serve/deepseek_chat.hpp"
 #include "strix/serve/session_api.hpp"
 #include "strix/serve/session_runtime.hpp"
