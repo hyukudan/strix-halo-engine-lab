@@ -815,7 +815,8 @@ void run_rank(const Args& a, const std::vector<std::uint32_t>& prompt, std::uint
     o.world = 2;
     o.communicator = &comm;
     const bool decode_reference = a.reference && (a.transport != "emulate" || a.decode_reference);
-    o.stream_hashes = decode_reference || out_state != nullptr;
+    o.stream_hashes = decode_reference || out_state != nullptr || a.embed_identity;
+    o.verify_embed_extras = a.embed_identity;
     strix::deepseek41::PrefillResult r;
     std::vector<std::pair<std::string, std::uint64_t>> state;
     if (a.ttft && !decode_reference && out_state == nullptr) {
