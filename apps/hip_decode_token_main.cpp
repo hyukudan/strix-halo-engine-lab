@@ -4127,7 +4127,8 @@ static int run_decode_entry(
             auto& tiled = parents->tiled;
             tiled.blocks = known_prefix_backend.get(); tiled.block_owner = known_prefix_owner;
             for (std::size_t t = 0; t < known_tail_backends.size(); ++t)
-                tiled.tails.push_back({known_tail_backends[t].get(), known_tail_owners[t], options.known_prefix_tail_rows[t]});
+                if (strix::decode_cli::known_prefix_tail_tiles_prompts(options, options.known_prefix_tail_rows[t], compiled_prefill.has_value()))
+                    tiled.tails.push_back({known_tail_backends[t].get(), known_tail_owners[t], options.known_prefix_tail_rows[t]});
             for (std::size_t w = 0; w < known_wide_owners.size(); ++w)
                 tiled.wide.push_back({nullptr, known_wide_owners[w], options.mtp.copy_wide_rows[w]});
             tiled.rows = options.known_prefix_prefill_rows;
@@ -4409,7 +4410,8 @@ static int run_decode_entry(
             auto& tiled = stack.parents->tiled;
             tiled.blocks = stack.blocks.get(); tiled.block_owner = stack.block_owner;
             for (std::size_t t = 0; t < stack.tails.size(); ++t)
-                tiled.tails.push_back({stack.tails[t].get(), stack.tail_owners[t], options.known_prefix_tail_rows[t]});
+                if (strix::decode_cli::known_prefix_tail_tiles_prompts(options, options.known_prefix_tail_rows[t], compiled_prefill.has_value()))
+                    tiled.tails.push_back({stack.tails[t].get(), stack.tail_owners[t], options.known_prefix_tail_rows[t]});
             for (std::size_t w = 0; w < stack.wide_owners.size(); ++w)
                 tiled.wide.push_back({nullptr, stack.wide_owners[w], options.mtp.copy_wide_rows[w]});
             tiled.rows = options.known_prefix_prefill_rows;

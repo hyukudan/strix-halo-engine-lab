@@ -412,6 +412,8 @@ struct Options {
     // Smaller tiled blocks (descending) for the remainder after the last complete T-row block; by default the
     // sizes of default_known_prefill_tail_rows below T (D-056), none with `--known-prefix-tail-rows none`.
     std::vector<std::uint32_t> known_prefix_tail_rows;
+    // tail sizes added only because --mtp-copy-wide-rows verifies on them (not requested or chosen for prompts)
+    std::vector<std::uint32_t> known_prefix_wide_only_tail_rows;
     bool known_prefix_tail_rows_off = false;
     // STRIX_QPF2K_SCHED bit 8: the smallest default tail size before pruning (MTP capture-slot bound; 0 = unused)
     std::uint32_t known_prefix_tail_capture_rows = 0;
@@ -1308,8 +1310,19 @@ inline void apply_default_known_prefill_tails(Options& options, const char* sche
     // --mtp-copy-wide-rows: each wide size runs on a tail owner of exactly that many rows (descending order kept).
     auto& tails = options.known_prefix_tail_rows;
     for (const auto wide : options.mtp.copy_wide_rows)
-        if (wide < options.known_prefix_prefill_rows && std::find(tails.begin(), tails.end(), wide) == tails.end())
+        if (wide < options.known_prefix_prefill_rows && std::find(tails.begin(), tails.end(), wide) == tails.end()) {
             tails.insert(std::upper_bound(tails.begin(), tails.end(), wide, std::greater<std::uint32_t>()), wide);
+            options.known_prefix_wide_only_tail_rows.push_back(wide);
+        }
+}
+
+// Whether a tail owner of `rows` tiles prompts. Under a split prefill profile the wide copy cycle verifies on its own
+// decode-profile owners (tiled.wide), so a tail size added only for it stays out of prompt tiling: the prompt is cut
+// exactly as without --mtp-copy-wide-rows (same blocks, same numerics, same tokens). Without a split profile the wide
+// cycle verifies on these tail owners, which then also tile prompts (as before).
+[[nodiscard]] inline bool known_prefix_tail_tiles_prompts(const Options& options, std::uint32_t rows, bool split_prefill_profile) {
+    const auto& w = options.known_prefix_wide_only_tail_rows;
+    return !split_prefill_profile || std::find(w.begin(), w.end(), rows) == w.end();
 }
 
 inline void validate_known_prefill_options(const Options& options) {

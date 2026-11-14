@@ -357,6 +357,14 @@ void campaign_defaults_contract(){
         require(mtp_wide_copy_rows_effective(serve)==cli_rows,"the serve route resolves the CLI's wide sizes");
         require(mtp_wide_copy_rows_effective(serve,false).empty() && mtp_wide_copy_rows_effective(cli,false)==cli_rows,
             "only STRIX_MTP_SERVE_WIDE=0 differs, and only on the serve route");
+        // tail sizes added only for the wide cycle never tile prompts under a split prefill profile (prompt cut as without the flags)
+        for(const auto rows:cli.known_prefix_wide_only_tail_rows)
+            require(!known_prefix_tail_tiles_prompts(cli,rows,true) && known_prefix_tail_tiles_prompts(cli,rows,false),
+                "a wide-only tail size stays out of split-profile prompt tiling");
+        for(const auto rows:cli.known_prefix_tail_rows)
+            if(std::find(cli.known_prefix_wide_only_tail_rows.begin(),cli.known_prefix_wide_only_tail_rows.end(),rows)==
+               cli.known_prefix_wide_only_tail_rows.end())
+                require(known_prefix_tail_tiles_prompts(cli,rows,true),"a requested tail size still tiles prompts");
         {   // the real command line: --http-serve --http-batch with the wide flags parses (tails resolved with the prefill)
             auto line=cli_args;line.insert(line.end(),{"--mtp-target-window-rows-set","2,4,8","--http-serve","--http-batch","2"});
             const auto served=parse(line);
