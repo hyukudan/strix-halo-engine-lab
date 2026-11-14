@@ -2,7 +2,12 @@
 # device plan and the embed cache; the HIP runner where the HIP runtime is built.
 add_library(strix_vision_encoder STATIC
     "${CMAKE_SOURCE_DIR}/src/vision/reference.cpp"
+    "${CMAKE_SOURCE_DIR}/src/vision/projector.cpp"
     "${CMAKE_SOURCE_DIR}/src/vision/embed_cache.cpp")
+if(NOT MSVC)
+    # Projector activation: no fused multiply-add (rows are cache content; the device kernel keeps the same order).
+    set_source_files_properties("${CMAKE_SOURCE_DIR}/src/vision/projector.cpp" PROPERTIES COMPILE_OPTIONS "-ffp-contract=off;-fno-fast-math")
+endif()
 target_include_directories(strix_vision_encoder PUBLIC "${CMAKE_SOURCE_DIR}/include")
 target_compile_features(strix_vision_encoder PUBLIC cxx_std_20)
 find_package(Threads REQUIRED)

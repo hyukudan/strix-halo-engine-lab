@@ -92,6 +92,9 @@ struct EncoderOutput {
     unsigned rows = 0, width = 0;
     std::vector<float> hidden;             // [rows][width], after the final norm when the config has one
     std::vector<std::vector<float>> taps;  // one [rows][width] per deepstack tap, in tap order
+    // Non-zero: the hidden rows stayed on the device of the backend whose encode_for_projection() returned this
+    // output (`hidden` is then empty); only that backend's merge_project() of the same encode reads them.
+    std::uint64_t device_epoch = 0;
 };
 // Projected rows of one image as the cache and the splice store them.
 struct ProjectedRows {
@@ -111,16 +114,49 @@ std::uint16_t to_bf16(float);  // round to nearest even; NaN stays NaN
 float from_bf16(std::uint16_t);
 std::vector<std::uint16_t> to_bf16_rows(const float* rows, std::size_t count);
 
+// Projector activation: evaluated in FP64 and rounded once to FP32 (the host and the device kernel use this formula).
+enum class Activation : std::uint8_t { gelu, gelu_tanh, silu };
+float activate(Activation, float);
+
+// Pixel-unshuffle + two-linear MLP projector (the DeepSeek aligner; a merger of the same shape in other towers).
+// Merged row (my, mx) of the ratio x ratio cell has feature c * ratio^2 + slot, slot = row_major ? dy * ratio + dx :
+// dx * ratio + dy; cells past the grid edge are zeros. rows[t][w2.rows] = linear2(act(linear1(merged))) for the
+// t = my * ceil(grid_w / ratio) + mx merged rows.
+struct MergeProjector {
+    unsigned ratio = 1;
+    bool row_major = true;
+    Activation act = Activation::gelu;
+    Tensor w1, b1, w2, b2;
+    unsigned tokens(unsigned grid_h, unsigned grid_w) const;  // merged rows; throws on a zero ratio
+};
+
 // y[r][o] = sum_k x[r][k] * w[o][k] + bias[o] for row-major x [rows][w.cols], y [rows][w.rows]. Adapters run their
 // projector linears through this so the reference and the device share one graph.
 class DenseOps {
 public:
     virtual ~DenseOps() = default;
     virtual void linear(const Tensor& w, const Tensor& bias, const float* x, std::size_t rows, float* y) = 0;
+    // The whole projector. Default (host): unshuffle, linear(), activate(), linear(), reading hidden.hidden; a device
+    // backend chains the four steps on the device (same values: the linears are its linear(), the activation the same
+    // FP64 formula). rows: [tokens][w2.rows] host floats.
+    virtual void merge_project(const EncoderOutput& hidden, unsigned grid_h, unsigned grid_w, const MergeProjector&, float* rows);
+    // Start-time hook: build now what the first linear(w, bias) would build (a device panel). Host: nothing to do.
+    virtual void prepare_linear(const Tensor& w, const Tensor& bias) {
+        (void)w;
+        (void)bias;
+    }
 };
 class EncoderBackend : public DenseOps {
 public:
     virtual EncoderOutput encode(const PatchGrid&, const PositionInputs&) = 0;
+    // encode() for a merge_project() of this backend that follows at once: a device backend may keep the hidden rows
+    // on the device (EncoderOutput::device_epoch). Default: encode().
+    virtual EncoderOutput encode_for_projection(const PatchGrid& g, const PositionInputs& p) { return encode(g, p); }
+    // Start-time hook: hold the workspace of `rows` rows in `tiles` attention tiles from now on. Host: nothing.
+    virtual void reserve(unsigned rows, unsigned tiles) {
+        (void)rows;
+        (void)tiles;
+    }
     virtual const char* arithmetic() const = 0;  // part of the adapter identity
 };
 
@@ -181,12 +217,22 @@ public:
 
     EncoderOutput encode(const PatchGrid&, const PositionInputs&) override;
     EncoderOutput encode(const PatchGrid&, const PositionInputs&, EncodeStats&);
-    // Projector linear on the shared GEMM; the panel of w is built on first use and kept until unload().
+    // Projector linear on the shared GEMM; the panel of w is built by prepare_linear() or on first use and kept
+    // until unload(). Device scratch grows only (no allocation per call once the largest shape has been seen).
     void linear(const Tensor& w, const Tensor& bias, const float* x, std::size_t rows, float* y) override;
+    void prepare_linear(const Tensor& w, const Tensor& bias) override;
+    // Workspace for `rows` rows in `tiles` tiles allocated now (encode() still grows it for a larger input).
+    void reserve(unsigned rows, unsigned tiles) override;
+    // Hidden rows stay in the workspace when STRIX_VISION_PROJECT_DEVICE (default 1) is on.
+    EncoderOutput encode_for_projection(const PatchGrid&, const PositionInputs&) override;
+    // Device chain: unshuffle kernel, linear1, activation kernel (FP64, the host formula), linear2, one download.
+    // STRIX_VISION_PROJECT_DEVICE=0: the host graph of DenseOps (A/B and bitwise check).
+    void merge_project(const EncoderOutput& hidden, unsigned grid_h, unsigned grid_w, const MergeProjector&, float* rows) override;
     const char* arithmetic() const override { return kArithmetic; }
 
 private:
     struct Impl;
+    EncoderOutput run(const PatchGrid&, const PositionInputs&, EncodeStats&, bool keep_hidden);
     std::unique_ptr<Impl> impl_;
 };
 
