@@ -1605,14 +1605,22 @@ void follow(const Args& initial, BatchForward& fwd, Watchdog& dog, const Prefill
             std::vector<std::vector<std::uint32_t>> prompts(c.pslot);
             std::vector<SlotPrefill::GroupMember> members(c.pslot);
             std::uint32_t used = 0;
+            std::size_t joined_len = 0;
             for (std::uint32_t m = 0; m < c.pslot; ++m) {
                 const std::uint32_t slot = info[std::size_t{m} * 2U], len = info[std::size_t{m} * 2U + 1U];
                 if (slot >= a.slots || ((used >> slot) & 1U) != 0U || len == 0U || len >= a.context)
                     throw std::runtime_error("control channel: bad prefill group member");
                 used |= 1U << slot;
-                prompts[m].resize(len);
-                send_prompt(fwd, {}, &prompts[m]);
-                members[m] = {slot, &prompts[m]};
+                joined_len += len;
+            }
+            // the members' prompts back to back in one prompt transfer (rank 0 sends them joined)
+            std::vector<std::uint32_t> joined(joined_len);
+            send_prompt(fwd, {}, &joined);
+            for (std::size_t m = 0, at = 0; m < c.pslot; ++m) {
+                const std::uint32_t len = info[m * 2U + 1U];
+                prompts[m].assign(joined.begin() + static_cast<std::ptrdiff_t>(at), joined.begin() + static_cast<std::ptrdiff_t>(at + len));
+                at += len;
+                members[m] = {info[m * 2U], &prompts[m]};
             }
             std::vector<bool> insert_flags(c.pslot, false);
             dog.pause(true);
@@ -2856,7 +2864,11 @@ void lead(const Args& initial, BatchForward& fwd, strix::dist::Communicator& com
             gm[m] = {members[m]->seq.slot, &members[m]->seq.prompt};
         }
         send_group_info(fwd, info, true);
-        for (const auto* m : members) send_prompt(fwd, m->seq.prompt, nullptr);
+        {  // the members' prompts back to back in one prompt transfer (rank 1 splits them by the lengths above)
+            std::vector<std::uint32_t> joined;
+            for (const auto* m : members) joined.insert(joined.end(), m->seq.prompt.begin(), m->seq.prompt.end());
+            send_prompt(fwd, joined, nullptr);
+        }
         dog.pause(true);
         std::vector<bool> insert_flags(n, false);
         std::vector<strix::deepseek41::PrefixLookup> hits(n);
@@ -3603,7 +3615,19 @@ void lead(const Args& initial, BatchForward& fwd, strix::dist::Communicator& com
                         }
                         if (group.size() >= 2U) device_prefill_group(group);
                         else device_prefill(r, r.seq.prompt.size() >= sched.min_rows);
-                        if (run_on) run_window.admission(run_ns(t_pf), run_ns(Clock::now()), active ? 0U : r.seq.prompt.size(), run_commit(r));
+                        if (run_on) {  // a group pass is ONE prompt unit carrying every member's prompt and first token
+                            std::uint64_t unit_tokens = 0, unit_emitted = 0;
+                            if (group.size() >= 2U)
+                                for (auto* q : group) {
+                                    unit_tokens += q->seq.prompt.size();
+                                    unit_emitted += run_commit(*q);
+                                }
+                            else {
+                                unit_tokens = r.seq.prompt.size();
+                                unit_emitted = run_commit(r);
+                            }
+                            run_window.admission(run_ns(t_pf), run_ns(Clock::now()), active ? 0U : unit_tokens, unit_emitted);
+                        }
                         if (step_trace && group.size() >= 2U)
                             std::fprintf(stderr, "steptrace prefill_group t %.1f members %zu end %.1f\n", trace_ms(t_pf), group.size(), trace_ms(Clock::now()));
                         if (step_trace)
