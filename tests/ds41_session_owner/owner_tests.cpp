@@ -8,6 +8,7 @@
 #include "strix/deploy/binding.hpp"
 #include "strix/model_content_hash.hpp"
 #include "strix/pair/lockstep.hpp"
+#include "strix/pair/embed_frame.hpp"
 #include "strix/ds41_attention.hpp"
 #include "strix/deepseek41_attention_host.hpp"
 #include "strix/serve/api.hpp"
@@ -23,6 +24,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <deque>
 #include <fstream>
@@ -153,6 +155,11 @@ public:
     CommunicatorStats stats() const {return {};}
     void* device_exchange() const {return nullptr;}
 };
+// Image frame transfer is outside this text-only fixture (the real header needs HIP); never silently accept it.
+std::uint32_t crc32c(std::span<const std::byte>) noexcept {
+    std::fputs("DS41 owner FAIL: text fixture reached image CRC\n",stderr);
+    std::exit(1);
+}
 }
 namespace strix::ds41::hetero {
 class Stage {
@@ -178,6 +185,11 @@ using Clock=std::chrono::steady_clock;
 #include "outcome.inc"
 constexpr std::uint32_t kMinRows=9;
 // Explicit double of the native prefill ABI. No physical resource is adopted.
+std::vector<std::uint32_t> real_prompt(const std::vector<std::uint32_t>& prompt,
+    const std::shared_ptr<const strix::session::EmbedTable>& embeds, std::uint32_t) {
+    witness::check(!embeds,"text fixture must not resolve image embeddings");
+    return prompt;
+}
 class SlotPrefill {
 public:
     struct GroupMember {
@@ -189,6 +201,8 @@ public:
     class Task {
     public:
         Task(unsigned s,std::vector<unsigned> p):slot(s),prompt(std::move(p)),ends{static_cast<unsigned>(prompt.size())}{}
+        const std::vector<unsigned>& vocab_prompt()const{return prompt;}
+        bool image()const noexcept{return false;}
         bool mid_piece()const{return false;} unsigned piece_end()const{return 0;}
         unsigned rows()const{return at;}const std::vector<unsigned>& default_ends()const{return ends;}
         unsigned units_within(double)const{return 1;}unsigned unit_position()const{return units;}
@@ -204,15 +218,15 @@ public:
     bool prepare(const std::vector<unsigned>&,const strix::deepseek41::PrefixLookup&){return true;}
     void forget(const std::vector<unsigned>&,const strix::deepseek41::PrefixLookup&){}
     bool admit(unsigned,bool=true){return false;}
-    std::unique_ptr<Task> begin(unsigned s,const std::vector<unsigned>& p,const strix::deepseek41::PrefixLookup&,bool,unsigned){witness::record("prefill begin "+std::to_string(s));return std::make_unique<Task>(s,p);}
-    PrefillOutcome run(unsigned s,const std::vector<unsigned>& p,const strix::deepseek41::PrefixLookup&,bool,unsigned){Task t(s,p);return t.finish();}
+    std::unique_ptr<Task> begin(unsigned s,const std::vector<unsigned>& p,const strix::deepseek41::PrefixLookup&,bool,unsigned=0,std::shared_ptr<const strix::session::EmbedTable> embeds={}){witness::check(!embeds,"text fixture prefill begin received image");witness::record("prefill begin "+std::to_string(s));return std::make_unique<Task>(s,p);}
+    PrefillOutcome run(unsigned s,const std::vector<unsigned>& p,const strix::deepseek41::PrefixLookup&,bool,unsigned=0,std::shared_ptr<const strix::session::EmbedTable> embeds={}){witness::check(!embeds,"text fixture prefill run received image");Task t(s,p);return t.finish();}
     std::vector<PrefillOutcome> run_group(const std::vector<GroupMember>& members,const std::vector<bool>& insert){
         witness::check(members.size()>=2 && insert.size()==members.size(),"prefill group members and insert flags");
         std::vector<PrefillOutcome> outcomes;
         for(const auto& member:members){Task t(member.slot,*member.prompt);outcomes.push_back(t.finish());}
         return outcomes;
     }
-    void on_prefill(unsigned,const std::vector<unsigned>&){}
+    void on_prefill(unsigned,const std::vector<unsigned>&,bool image=false){witness::check(!image,"text fixture on_prefill received image");}
     void on_reset(unsigned){}
     unsigned on_step(const std::vector<BatchRow>&,const std::vector<unsigned>&){return 0;}
     void snapshot(unsigned){}
@@ -235,6 +249,7 @@ void actual_lead(Args a,const Prepare& prepare) {
     std::unique_ptr<strix::deepseek41::BatchSpeculator> spec;
     strix::ds41::dspark::DeviceDrafter drafter({});
     if(witness::scenario=="spec" || witness::scenario=="hetero-spec")spec=std::make_unique<strix::deepseek41::BatchSpeculator>(fwd,drafter,a.slots,strix::deepseek41::BatchSpecOptions{});
+    constexpr std::nullptr_t vision_stack = nullptr;  // No vision adapter in this text-only fixture.
     SlotPrefill native_prefill;SlotPrefill* prefill=a.device_prefill?&native_prefill:nullptr;
     strix::ds41::hetero::Stage native_stage(fwd);
     strix::ds41::hetero::Stage* stage=witness::scenario.starts_with("hetero")?&native_stage:nullptr;
