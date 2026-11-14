@@ -1372,18 +1372,23 @@ __device__ __forceinline__ void attention_combine_head(const AttentionView& v, u
         v.sums[g] = sum;
     }
 }
-// Floor (policy ds41-decoder-replay-bounded-v1, separate instantiations): the window keys start at the layer's key_floor
-// (<= pos), so a row reads min(pos + 1 - key_floor, kWindow) window keys; the ring slots keep the real positions.
-template <bool Floor = false>
 __device__ __forceinline__ unsigned visible_keys(const AttentionView& v, unsigned r, unsigned& nw) {
     const std::uint64_t p = v.pos[r];
-    if constexpr (Floor) {
-        const std::uint64_t span = p + 1U - v.key_floor;
-        nw = span < kWindow ? static_cast<unsigned>(span) : kWindow;
-    } else {
-        nw = p + 1U < kWindow ? static_cast<unsigned>(p + 1U) : kWindow;
-    }
+    nw = p + 1U < kWindow ? static_cast<unsigned>(p + 1U) : kWindow;
     return nw + (v.idx_count != nullptr ? v.idx_count[r] : 0U);
+}
+// policy ds41-decoder-replay-bounded-v1 (separate instantiations; visible_keys above stays main's text so the incumbent
+// kernels compile as before): the window keys start at the layer's key_floor (<= pos), so a row reads
+// min(pos + 1 - key_floor, kWindow) window keys; the ring slots keep the real positions.
+__device__ __forceinline__ unsigned visible_keys_floor(const AttentionView& v, unsigned r, unsigned& nw) {
+    const std::uint64_t p = v.pos[r], span = p + 1U - v.key_floor;
+    nw = span < kWindow ? static_cast<unsigned>(span) : kWindow;
+    return nw + (v.idx_count != nullptr ? v.idx_count[r] : 0U);
+}
+template <bool Floor>
+__device__ __forceinline__ unsigned visible_keys_at(const AttentionView& v, unsigned r, unsigned& nw) {
+    if constexpr (Floor) return visible_keys_floor(v, r, nw);
+    else return visible_keys(v, r, nw);
 }
 template <unsigned kAttnHpw, bool Swizzle, bool Half = false, bool Fold = false, unsigned Lean = 0, bool Floor = false>
 __device__ __forceinline__ void attention_chunk_body(const AttentionView& v, const uint3 bid) {
@@ -1395,7 +1400,7 @@ __device__ __forceinline__ void attention_chunk_body(const AttentionView& v, con
     const unsigned c = bid.x, r = bid.z, tid = threadIdx.x, lane = tid & 31U;
     const unsigned hb = (bid.y * (kAttnThreads / 32U) + (tid >> 5U)) * kAttnHpw;
     unsigned nw;
-    const unsigned n = visible_keys<Floor>(v, r, nw), chunks = (n + kChunk - 1) / kChunk;
+    const unsigned n = visible_keys_at<Floor>(v, r, nw), chunks = (n + kChunk - 1) / kChunk;
     if (v.max_visible != 0U && n > v.max_visible) __builtin_trap();   // the grid covers max_visible keys only
     if (c >= chunks) return;
     const unsigned j0 = c * kChunk, end = n - j0 < kChunk ? n : j0 + kChunk;
@@ -1510,7 +1515,7 @@ template <bool Floor = false>
 __device__ __forceinline__ void attention_combine_body(const AttentionView& v, const uint3 bid) {
     DS41_TIMED(6U);
     unsigned nw;
-    const unsigned n = visible_keys<Floor>(v, bid.y, nw);
+    const unsigned n = visible_keys_at<Floor>(v, bid.y, nw);
     attention_combine_head(v, bid.y, bid.x, threadIdx.x, (n + kChunk - 1) / kChunk);
 }
 

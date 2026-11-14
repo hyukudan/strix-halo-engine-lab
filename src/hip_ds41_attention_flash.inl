@@ -78,12 +78,12 @@ struct FlashAttentionPolicy {
     __device__ static __forceinline__ void emit(const Args& v, unsigned wg, unsigned head, unsigned dim, float o) { part(v, wg, head)[2U + dim] = o; }
 };
 
-// policy ds41-decoder-replay-bounded-v1: the window keys from the layer's key_floor (visible_keys<true>); the ring slots of
+// policy ds41-decoder-replay-bounded-v1: the window keys from the layer's key_floor (visible_keys_floor); the ring slots of
 // the real positions. Its own instantiation of the flash core: FlashAttentionPolicy's code is untouched.
 struct FlashAttentionFloorPolicy : FlashAttentionPolicy {
     __device__ static __forceinline__ unsigned count(const Args& v, unsigned wg) {
         unsigned nw;
-        return visible_keys<true>(v, row(v, wg), nw);
+        return visible_keys_floor(v, row(v, wg), nw);
     }
     __device__ static __forceinline__ unsigned key(const Args& v, unsigned wg, unsigned j) {
         const unsigned r = row(v, wg);
