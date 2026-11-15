@@ -289,3 +289,29 @@ where the arms part. This is a cross-run comparison: after the first difference 
 different activations, so later differences include propagation, not only local rounding.
 
 `python -m unittest discover -s tools/strix-gate -p 'test_*.py'` covers it with synthetic dumps.
+
+### TURBO relative bar: `compare --mode turbo`
+
+`--mode fast` (default) is the absolute FAST bar above, unchanged. `--mode turbo` judges T (the candidate) against a
+reference pack R measured on the same E (the exact arm): `compare E T --mode turbo --reference-pack-arm R_DIR ...`.
+Per row, U95(KL_T-KL_R), U95(disagreement_T-disagreement_R) and U95(dNLL_T-dNLL_R) must each be <= 0 (one-sided 95 %,
+paired rows). Optional absolute safety limits: `--turbo-max-kl`, `--turbo-min-top1`, `--turbo-max-dnll`. `--null-arm`
+controls are measured against E and reported (not a verdict input).
+
+Pack identity: `seal --model-sha SHA` records the weights/pack sha (else the execution witness `model_sha256` is used).
+E and T must share it unless `--candidate-sha` declares T's; R may differ from E only with `--reference-sha` equal to R's
+sealed value. An undeclared or mismatching sha is an error (exit 2, both shas named).
+
+`--task-results JSON`: `{"tasks":[{"name":"t1","category":"code|math|retrieval|tools|json|prose","E":{"passed":8,"total":10},"T":{...},"R":{...}}]}`.
+Per category and overall the receipt carries passed/total/rate and a Wilson 95 % interval per arm. Checks per category:
+T's drop vs E must not exceed R's drop unless the T and R Wilson intervals overlap; absolute drop of T vs E <= 5 points
+code/math, 2 retrieval, 1 tools (override `--task-drop-limit CAT=POINTS`); json must pass 100 % for T.
+
+Verdicts and exit codes: PASS 0, FAIL 1 (every failing check is named), error 2, NO-REFERENCE 3 (no `--reference-pack-arm`
+or a task without `R`; never PASS, but a failing check still reports FAIL).
+
+`--receipt OUT.json` writes `strix-turbo-receipt/v1`: `verdict`, `failing`, `commit` (`--commit`), `binary_sha256` {E,T,R},
+`pack` {calibration (`--calibration`), E_sha, T_sha, R_sha}, `run`, `hardware` (`--run-manifest JSON`, free keys such as
+hardware, gpu_clock_mhz), `routes` {effective_config: lines of `--effective-config FILE`, execution_witness from the seals},
+`metrics` (mean + 95 % interval for T and R), `checks`, `tasks`, `controls`, `performance` (`--perf JSON`: tok_s,
+bytes_per_token, ttft_ms, p95_ms; absent keys are null and listed in `missing`).

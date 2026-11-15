@@ -230,6 +230,12 @@ Resolution resolve(Name profile, bool allow_pending, App app, const Inputs& inpu
     out.name = profile;
     out.app = app;
     out.allow_pending = allow_pending;
+    // PROVISIONAL decline: the shared parser accepts 'turbo', but this backend's rows have three columns and its
+    // replica / prefill-service caches do not read the TURBO namespace (strix/turbo.hpp exported_namespace) yet, so a
+    // turbo state would alias the fast one. Lifted when the RTX adapter binds ds41-turbo-v1 (columns + cache key).
+    if (profile == Name::turbo)
+        throw std::invalid_argument("ds41 RTX: --profile turbo is not bound on this backend yet (pending: RTX cache "
+                                    "namespace and turbo column; use the pair engine's ds41-turbo-v1)");
     const auto column = unsigned(profile);
     const char* baseline_env = environment(inputs.env, "STRIX_DS41_RTX_BASELINE");
     const bool env_baseline = baseline_env && std::string_view(baseline_env) == "1";

@@ -18,7 +18,10 @@
 //   --tf ORACLE_DIR [--tf-write]                     full teacher-forced logits of ORACLE_DIR/rows.u32 (G4 form): fnv,
 //                                                     top-1 vs the real next token; --tf-write saves logits_pair.f32
 //   --session NAME:PROMPT.u32:STEPS                  prefill + STEPS greedy decode steps (repeatable)
-//   --profile NAME:PROMPT.u32:STEPS                  the same with synchronised per-phase times (slower)
+//   --timing-profile NAME:PROMPT.u32:STEPS           the same with synchronised per-phase times (slower); the old
+//                                                    spelling --profile NAME:PROMPT.u32:STEPS stays accepted (notice)
+//   --profile default|fast|quality|turbo             product profile (strix-minimax-serve takes the same switch)
+//   --turbo-weights native|onfly|converted           TURBO weight source (+ --turbo-weight-bits, --turbo-weights-pack)
 //   --batch PROMPT.u32:STEPS:N1,N2,...               batched decode (rows = prefixes of the prompt), checked vs alone
 //   --verify-trace NAME:PROMPT.u32:REPS:R1,R2,...    verify-shaped steps (one slot, R rows) timed by R (xfer on/off
 //                                                     ABA) + per-phase GPU trace and distinct routed experts per layer
@@ -1705,7 +1708,9 @@ int main(int argc, char** argv) {
             else if (a == "--offload") offloads.push_back(next());
             else if (a == "--offload-import") offload_imports.push_back(next());
             else if (a == "--offload-listen") offload_listens.push_back(next());
-            else if (a == "--profile") sessions.push_back("@" + next());  // a session with per-phase timing
+            else if (std::string timing; strix::minimax::defaults::product_option(a, next, &timing)) {
+                if (!timing.empty()) sessions.push_back("@" + timing);  // a session with per-phase timing
+            }
             else if (a == "--batch") batches.push_back(next());
             else if (a == "--verify-trace") vtraces.push_back(next());
             else if (a == "--ab") ab_runs.push_back(next());
