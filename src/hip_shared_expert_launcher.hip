@@ -632,6 +632,8 @@ __global__ void __launch_bounds__(kThreads) rows_shared_activation_scalar_site_k
 __device__ __forceinline__ void shared_gate_dot(float* workspace, const std::uint16_t* input, const void* scalar_weights,
     std::uint32_t intermediate_size, std::uint32_t input_width, float* scratch) {
     float sum = 0.0F;
+    // Unrolled for loads in flight (one CTA per row is latency bound); the sum keeps its sequential feature order.
+#pragma unroll 10
     for (std::uint32_t feature = static_cast<std::uint32_t>(threadIdx.x); feature < input_width; feature += kThreads)
         sum += load_activation(&input[feature]) * load_weight<WeightKind::f32>(scalar_weights, input_width, 0, feature);
     scratch[threadIdx.x] = sum;
@@ -2399,21 +2401,29 @@ bool known_shared_prefill_enqueue(std::span<const ExecutionDispatchContext> rows
             else { known_shared_engine_projection<8U>(down, at(r), stream, config, any); r += 8U; }
         }
     };
+    if (paired) {
+        // The shared gate's dot first (it reads only the input): the paired gate|up then writes the FP16 preimage just
+        // before its down reads it, still MALL-resident (a dot between them evicts it: down +6 % measured).
+        hipLaunchKernelGGL(rows_shared_gate_dot_kernel, dim3(1U, pre_rows), dim3(kThreads), 0, stream, views.workspace.address,
+            s.workspace_stride_bytes, views.input.address, s.input_stride_bytes,
+            reinterpret_cast<const void*>(views.weights.shared_gate_f32.address), config.intermediate_size, config.hidden_size);
+        check_hip(hipGetLastError(), "known shared prefill shared gate dot launch");
+    }
     each_width(false);
-    // Diagnostic injection is after the real gate|up transaction and before either activation producer.
-    if (injected_gate_up) check_hip(hipMemcpy2DAsync(reinterpret_cast<void*>(views.workspace.address), s.workspace_stride_bytes,
-        injected_gate_up, 2U * s.intermediate * sizeof(float), 2U * s.intermediate * sizeof(float), rows.size(),
-        hipMemcpyDeviceToDevice, stream), "shared pre diagnostic gate/up injection");
+    // Diagnostic injection is after the real gate|up transaction and before either activation producer. Paired rows
+    // read the injection in their epilogue; only the other rows take the copy (it would overwrite the gate's float).
+    const std::uint64_t injected_from = paired ? pre_rows : 0U;
+    if (injected_gate_up && injected_from < rows.size())
+        check_hip(hipMemcpy2DAsync(reinterpret_cast<void*>(views.workspace.address + injected_from * s.workspace_stride_bytes),
+            s.workspace_stride_bytes, injected_gate_up + injected_from * 2U * s.intermediate, 2U * s.intermediate * sizeof(float),
+            2U * s.intermediate * sizeof(float), rows.size() - injected_from, hipMemcpyDeviceToDevice, stream),
+            "shared pre diagnostic gate/up injection");
     if (pre_image) {
         static std::atomic<bool> witnessed{false};
         if (!witnessed.exchange(true, std::memory_order_relaxed))
             std::fprintf(stderr, "qpf2k shared pre active (rows %u, stream %p, glu pair %d)\n", pre_rows, static_cast<void*>(stream),
                 paired ? 1 : 0);
-        if (paired)
-            hipLaunchKernelGGL(rows_shared_gate_dot_kernel, dim3(1U, pre_rows), dim3(kThreads), 0, stream, views.workspace.address,
-                s.workspace_stride_bytes, views.input.address, s.input_stride_bytes,
-                reinterpret_cast<const void*>(views.weights.shared_gate_f32.address), config.intermediate_size, config.hidden_size);
-        else hipLaunchKernelGGL(rows_shared_activation_scalar_pre_kernel,
+        if (!paired) hipLaunchKernelGGL(rows_shared_activation_scalar_pre_kernel,
             dim3((config.intermediate_size + kThreads - 1U) / kThreads, pre_rows),
             dim3(kThreads), 0, stream, views.workspace.address, s.workspace_stride_bytes, views.input.address,
             s.input_stride_bytes, reinterpret_cast<const void*>(views.weights.shared_gate_f32.address),
