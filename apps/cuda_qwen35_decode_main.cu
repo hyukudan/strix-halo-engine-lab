@@ -18,6 +18,7 @@
 
 #include "strix/cuda_core/attention.hpp"
 #include "strix/cuda_core/dense.hpp"
+#include "strix/cuda_core/nvfp4.hpp"
 #include "strix/cuda_core/gdn.hpp"
 #include "strix/cuda_core/norms.hpp"
 #include "strix/cuda_core/rope.hpp"
@@ -34,6 +35,8 @@ namespace cc = strix::cuda_core;
                                      std::to_string(__LINE__));                                                \
         }                                                                                                      \
     } while (0)
+
+#include "cuda_qwen35_turbo.hpp"
 
 namespace {
 
@@ -91,6 +94,7 @@ struct Weights {
     std::uint64_t total = 0, trunk_bytes = 0;
     std::map<std::string, strix::gguf::TensorInfo> info;
     std::map<std::string, std::uint64_t> off;
+    std::map<std::string, float> fp4_gs;  // TURBO NVFP4 tensors (name -> FP32 global scale)
     [[nodiscard]] const void* ptr(const std::string& n) const { return base + off.at(n); }
     [[nodiscard]] bool has(const std::string& n) const { return off.count(n) != 0; }
     [[nodiscard]] cc::DenseWeight dense(const std::string& n) const {
@@ -99,6 +103,11 @@ struct Weights {
         w.data = ptr(n);
         w.in = static_cast<std::uint32_t>(t.dimensions.at(0));
         w.out = static_cast<std::uint32_t>(t.dimensions.size() > 1 ? t.dimensions[1] : 1);
+        if (const auto g = fp4_gs.find(n); g != fp4_gs.end()) {
+            w.format = cc::WeightFormat::nvfp4;
+            w.gscale = g->second;
+            return w;
+        }
         switch (t.ggml_type) {
             case 30: w.format = cc::WeightFormat::bf16; break;
             case 8: w.format = cc::WeightFormat::q8_0; break;
@@ -113,34 +122,59 @@ struct Weights {
     }
 };
 
-void load_weights(const std::string& path, const strix::gguf::FileInfo& f, Weights& W) {
+void load_weights(const std::string& path, const strix::gguf::FileInfo& f, Weights& W, const q35turbo::Options& T) {
     std::uint64_t total = 0;
     for (const auto& t : f.tensors) {
         if (t.name.rfind("blk.64.", 0) == 0 || t.name.rfind("mtp.", 0) == 0) continue;  // MTP trunk not used in v0
         W.info[t.name] = t;
         W.off[t.name] = total;
-        total += (t.byte_size + 255) & ~255ULL;
-        if (t.name != "token_embd.weight") W.trunk_bytes += t.byte_size;
+        const bool fp4 = T.eligible(t);
+        const std::uint64_t stored = fp4 ? cc::nvfp4_bytes(static_cast<std::uint32_t>(t.dimensions[1]), static_cast<std::uint32_t>(t.dimensions[0])) : t.byte_size;
+        if (fp4) W.fp4_gs[t.name] = 0.0f;
+        total += (stored + 255) & ~255ULL;
+        if (t.name != "token_embd.weight") W.trunk_bytes += stored;
     }
     W.total = total;
     CK(cudaMalloc(reinterpret_cast<void**>(&W.base), total));
-    std::ifstream in(path, std::ios::binary);
-    if (!in) throw std::runtime_error("cannot open " + path);
+    std::ifstream in;
+    if (!T.synthetic) {
+        in.open(path, std::ios::binary);
+        if (!in) throw std::runtime_error("cannot open " + path);
+    }
     constexpr std::size_t kChunk = 128u << 20;
     unsigned char* pin = nullptr;
-    CK(cudaMallocHost(reinterpret_cast<void**>(&pin), kChunk));
+    if (!T.synthetic) CK(cudaMallocHost(reinterpret_cast<void**>(&pin), kChunk));
+    unsigned char* tmp = nullptr;  // BF16 staging for on-the-fly NVFP4 conversion (largest eligible tensor)
+    std::uint64_t tmp_bytes = 0;
+    for (const auto& [name, t] : W.info)
+        if (W.fp4_gs.count(name)) tmp_bytes = std::max<std::uint64_t>(tmp_bytes, t.byte_size);
+    if (tmp_bytes) CK(cudaMalloc(reinterpret_cast<void**>(&tmp), tmp_bytes));
     for (const auto& [name, t] : W.info) {
-        in.seekg(static_cast<std::streamoff>(t.absolute_offset));
-        std::uint64_t done = 0;
-        while (done < t.byte_size) {
-            const std::size_t n = static_cast<std::size_t>(std::min<std::uint64_t>(kChunk, t.byte_size - done));
-            in.read(reinterpret_cast<char*>(pin), static_cast<std::streamsize>(n));
-            if (!in) throw std::runtime_error("short read for " + name);
-            CK(cudaMemcpy(W.base + W.off[name] + done, pin, n, cudaMemcpyHostToDevice));
-            done += n;
+        const bool fp4 = W.fp4_gs.count(name) != 0;
+        unsigned char* dst = fp4 ? tmp : W.base + W.off[name];
+        if (T.synthetic) {
+            q35turbo::synth_fill(t, dst);
+        } else {
+            in.seekg(static_cast<std::streamoff>(t.absolute_offset));
+            std::uint64_t done = 0;
+            while (done < t.byte_size) {
+                const std::size_t n = static_cast<std::size_t>(std::min<std::uint64_t>(kChunk, t.byte_size - done));
+                in.read(reinterpret_cast<char*>(pin), static_cast<std::streamsize>(n));
+                if (!in) throw std::runtime_error("short read for " + name);
+                CK(cudaMemcpy(dst + done, pin, n, cudaMemcpyHostToDevice));
+                done += n;
+            }
+        }
+        if (fp4) {
+            float gs = 0.0f;
+            CK(cc::nvfp4_quantize_bf16(tmp, static_cast<std::uint32_t>(t.dimensions[1]), static_cast<std::uint32_t>(t.dimensions[0]),
+                                       W.base + W.off[name], &gs, nullptr));
+            W.fp4_gs[name] = gs;
         }
     }
-    CK(cudaFreeHost(pin));
+    CK(cudaDeviceSynchronize());
+    if (tmp) CK(cudaFree(tmp));
+    if (pin) CK(cudaFreeHost(pin));
 }
 
 // ---- engine ----
@@ -308,6 +342,7 @@ int main(int argc, char** argv) {
     strix::device::bind_cuda_main(argc, argv);
     try {
         std::string model, dump, ids_arg;
+        q35turbo::Options turbo;
         std::uint32_t n_gen = 32, rows_cap = 16, max_pos = 4096;
         for (int i = 1; i < argc; ++i) {
             const std::string a = argv[i];
@@ -321,8 +356,15 @@ int main(int argc, char** argv) {
             else if (a == "--rows") rows_cap = static_cast<std::uint32_t>(std::stoul(next()));
             else if (a == "--max-pos") max_pos = static_cast<std::uint32_t>(std::stoul(next()));
             else if (a == "--dump-logits") dump = next();
-            else throw std::runtime_error("unknown argument " + a);
+            else if (turbo.parse(a, next)) {
+            } else throw std::runtime_error("unknown argument " + a);
         }
+        turbo.print(stderr);
+        if (turbo.print_cfg) {
+            turbo.print(stdout);
+            return 0;
+        }
+        if (turbo.synthetic && model.empty()) model = "synthetic-27b";
         if (model.empty() || ids_arg.empty() || rows_cap == 0 || rows_cap > 16)
             throw std::runtime_error("usage: --model F.gguf --prompt-ids 1,2,3 [--n-gen N] [--rows 1..16] [--max-pos N] [--dump-logits F]");
         std::vector<std::uint32_t> prompt;
@@ -333,14 +375,22 @@ int main(int argc, char** argv) {
         }
         if (prompt.size() + n_gen > max_pos) max_pos = static_cast<std::uint32_t>(prompt.size() + n_gen);
 
-        const auto info = strix::gguf::read_file(model);
+        strix::gguf::FileInfo info;
         Engine E;
-        E.c = read_cfg(info);
+        if (turbo.synthetic) {  // Qwen3.8-27B shapes, tensors generated on the device
+            E.c.layers = 64; E.c.hidden = 5120; E.c.inter = 17408; E.c.vocab = 248320; E.c.heads = 24; E.c.kv_heads = 4;
+            E.c.head_dim = 256; E.c.rotary = 64; E.c.interval = 4; E.c.key_heads = 16; E.c.key_dim = 128; E.c.value_heads = 48;
+            E.c.value_dim = 128; E.c.conv_k = 4; E.c.eps = 1e-6f; E.c.theta = 1e7;
+            info.tensors = q35turbo::synthetic_tensors(E.c);
+        } else {
+            info = strix::gguf::read_file(model);
+            E.c = read_cfg(info);
+        }
         std::fprintf(stderr, "qwen35: layers %u hidden %u inter %u vocab %u heads %u/%u hd %u gdn %u/%u x %u\n", E.c.layers,
                      E.c.hidden, E.c.inter, E.c.vocab, E.c.heads, E.c.kv_heads, E.c.head_dim, E.c.key_heads, E.c.value_heads,
                      E.c.value_dim);
         const auto t0 = std::chrono::steady_clock::now();
-        load_weights(model, info, E.W);
+        load_weights(model, info, E.W, turbo);
         E.init(max_pos);
         std::fprintf(stderr, "loaded %.2f GB in %.1f s\n", E.W.total / 1e9,
                      std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());

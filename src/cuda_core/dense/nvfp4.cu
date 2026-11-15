@@ -61,23 +61,32 @@ __device__ __forceinline__ void mma16816(float (&c)[4], std::uint32_t a0, std::u
 
 // ---------------------------------------------------------------------------------------------------------------- GEMV
 constexpr int kWarpsPerBlock = 4;
-constexpr std::uint32_t kTargetWarps = 1024;  // split-K target (depends on the shape only, never on rows)
+std::uint32_t g_target_warps = 640;  // split-K target (depends on the shape only, never on rows)
 
 struct LoadRegs {
     uint4 d0, d1, sc;
 };
 
-__device__ __forceinline__ LoadRegs load_record(const unsigned char* rec, int lane) {
-    LoadRegs r;
-    r.d0 = __ldg(reinterpret_cast<const uint4*>(rec) + lane);
-    r.d1 = __ldg(reinterpret_cast<const uint4*>(rec + 512) + lane);
-    r.sc = __ldg(reinterpret_cast<const uint4*>(rec + 1024) + (lane >> 2));
+// Weight stream: read once, keep out of L1 so the activation slab stays resident.
+__device__ __forceinline__ uint4 ld_stream(const void* p) {
+    uint4 r;
+    asm volatile("ld.global.nc.L1::no_allocate.v4.u32 {%0,%1,%2,%3}, [%4];" : "=r"(r.x), "=r"(r.y), "=r"(r.z), "=r"(r.w) : "l"(p));
     return r;
 }
 
+__device__ __forceinline__ LoadRegs load_record(const unsigned char* rec, int lane) {
+    LoadRegs r;
+    r.d0 = ld_stream(rec + lane * 16);
+    r.d1 = ld_stream(rec + 512 + lane * 16);
+    r.sc = ld_stream(rec + 1024 + (lane >> 2) * 16);
+    return r;
+}
+
+constexpr int kSlab = 4;  // K chunks (of 128) of activations staged in shared memory per barrier pair
+
+// xs layout (fragment ready): [chunk in slab][rb][group j][lane] -> uint2 {b0, b1} (f16x2 pairs of that lane).
 template <int RB, int MT>
-__device__ __forceinline__ void compute_chunk(const LoadRegs (&L)[MT], const bool (&on)[MT], const float* xrow[RB],
-                                              const bool (&rv)[RB], std::uint32_t kbase, int t,
+__device__ __forceinline__ void compute_chunk(const LoadRegs (&L)[MT], const bool (&on)[MT], const uint2* xs, int lane,
                                               float (&acc)[MT][RB][4]) {
 #pragma unroll
     for (int jp = 0; jp < 4; ++jp) {  // group pair (2jp, 2jp+1)
@@ -87,7 +96,6 @@ __device__ __forceinline__ void compute_chunk(const LoadRegs (&L)[MT], const boo
             if (!on[mt]) continue;
             const std::uint32_t w0 = jp == 0 ? L[mt].d0.x : jp == 1 ? L[mt].d0.y : jp == 2 ? L[mt].d0.z : L[mt].d0.w;
             const std::uint32_t w1 = jp == 0 ? L[mt].d1.x : jp == 1 ? L[mt].d1.y : jp == 2 ? L[mt].d1.z : L[mt].d1.w;
-            // scales of (h, groups 2jp, 2jp+1): bytes 2jp,2jp+1 of the 8-byte half
             const std::uint32_t s0w = jp < 2 ? L[mt].sc.x : L[mt].sc.y;
             const std::uint32_t s1w = jp < 2 ? L[mt].sc.z : L[mt].sc.w;
             const std::uint32_t sh = (jp & 1) * 16;
@@ -110,38 +118,30 @@ __device__ __forceinline__ void compute_chunk(const LoadRegs (&L)[MT], const boo
         }
 #pragma unroll
         for (int gi = 0; gi < 2; ++gi) {
-            const std::uint32_t k0 = kbase + static_cast<std::uint32_t>(16 * (2 * jp + gi) + 2 * t);
-            std::uint32_t b0[RB], b1[RB];
+            uint2 b[RB];
 #pragma unroll
-            for (int rb = 0; rb < RB; ++rb) {
-                float2 p0 = make_float2(0.f, 0.f), p1 = p0;
-                if (rv[rb]) {
-                    p0 = *reinterpret_cast<const float2*>(xrow[rb] + k0);
-                    p1 = *reinterpret_cast<const float2*>(xrow[rb] + k0 + 8);
-                }
-                b0[rb] = pack_f16x2(p0.x, p0.y);
-                b1[rb] = pack_f16x2(p1.x, p1.y);
-            }
+            for (int rb = 0; rb < RB; ++rb) b[rb] = xs[(rb * 8 + 2 * jp + gi) * 32 + lane];
 #pragma unroll
             for (int mt = 0; mt < MT; ++mt) {
                 if (!on[mt]) continue;
 #pragma unroll
                 for (int rb = 0; rb < RB; ++rb)
-                    mma16816(acc[mt][rb], a[mt][gi][0], a[mt][gi][1], a[mt][gi][2], a[mt][gi][3], b0[rb], b1[rb]);
+                    mma16816(acc[mt][rb], a[mt][gi][0], a[mt][gi][1], a[mt][gi][2], a[mt][gi][3], b[rb].x, b[rb].y);
             }
         }
     }
 }
 
-// grid (ceil(ntiles / MT), ceil(ks / 4), nw): z selects the weight (gate/up). part = [z][ks][rows][out] FP32; when
-// DIRECT (ks == 1, single weight) the epilogue y = acc * gscale (+ resid) is written straight to y.
+// grid (ceil(ntiles / (4 MT)), ks, nw): the 4 warps of a block take 4 MT consecutive output tiles and share the
+// activation slab through shared memory; blockIdx.y selects the K range. part = [z][ks][rows][out] FP32; when DIRECT
+// (ks == 1, single weight) the epilogue y = acc * gscale (+ resid) is written straight to y.
 template <int RB, int MT, bool DIRECT>
 __global__ void __launch_bounds__(kWarpsPerBlock * 32)
     fp4_gemv(const unsigned char* w0, const unsigned char* w1, const float* x, float* part, float* y, const float* resid,
              float gs0, std::uint32_t out, std::uint32_t in, std::uint32_t rows, std::uint32_t ks) {
-    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, t = lane & 3;
-    const std::uint32_t kidx = blockIdx.y * kWarpsPerBlock + warp;
-    if (kidx >= ks) return;
+    extern __shared__ uint2 xs_dyn[];
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const std::uint32_t kidx = blockIdx.y;
     const unsigned char* w = blockIdx.z == 0 ? w0 : w1;
     const std::uint32_t nch = in >> 7, ntiles = out >> 4;
     const std::uint32_t c0 = static_cast<std::uint32_t>(static_cast<std::uint64_t>(kidx) * nch / ks);
@@ -150,17 +150,9 @@ __global__ void __launch_bounds__(kWarpsPerBlock * 32)
     const unsigned char* base[MT];
 #pragma unroll
     for (int mt = 0; mt < MT; ++mt) {
-        const std::uint32_t m = blockIdx.x * MT + mt;
+        const std::uint32_t m = (blockIdx.x * kWarpsPerBlock + warp) * MT + mt;
         on[mt] = m < ntiles;
         base[mt] = w + static_cast<std::size_t>(on[mt] ? m : 0) * nch * kNvfp4RecordBytes;
-    }
-    const float* xrow[RB];
-    bool rv[RB];
-#pragma unroll
-    for (int rb = 0; rb < RB; ++rb) {
-        const std::uint32_t n = static_cast<std::uint32_t>(rb * 8 + g);
-        rv[rb] = n < rows;
-        xrow[rb] = x + static_cast<std::size_t>(rv[rb] ? n : 0) * in;
     }
     float acc[MT][RB][4];
 #pragma unroll
@@ -173,20 +165,39 @@ __global__ void __launch_bounds__(kWarpsPerBlock * 32)
     for (int mt = 0; mt < MT; ++mt)
         if (on[mt] && c0 < c1) cur[mt] = load_record(base[mt] + static_cast<std::size_t>(c0) * kNvfp4RecordBytes, lane);
     for (std::uint32_t c = c0; c < c1; ++c) {
+        const std::uint32_t cs = (c - c0) % kSlab;
+        if (cs == 0) {
+            __syncthreads();
+            const std::uint32_t nc = min(static_cast<std::uint32_t>(kSlab), c1 - c);
+            const std::uint32_t total = nc * RB * 8 * 32;
+            for (std::uint32_t e = threadIdx.x; e < total; e += kWarpsPerBlock * 32) {
+                const std::uint32_t ln = e & 31, j = (e >> 5) & 7, rb = (e >> 8) % RB, cc_ = e / (256 * RB);
+                const std::uint32_t n = rb * 8 + (ln >> 2), k0 = ((c + cc_) << 7) + j * 16 + (ln & 3) * 2;
+                float2 p0 = make_float2(0.f, 0.f), p1 = p0;
+                if (n < rows) {
+                    const float* xr = x + static_cast<std::size_t>(n) * in + k0;
+                    p0 = *reinterpret_cast<const float2*>(xr);
+                    p1 = *reinterpret_cast<const float2*>(xr + 8);
+                }
+                xs_dyn[(cc_ * RB + rb) * 256 + j * 32 + ln] = make_uint2(pack_f16x2(p0.x, p0.y), pack_f16x2(p1.x, p1.y));
+            }
+            __syncthreads();
+        }
         if (c + 1 < c1) {
 #pragma unroll
             for (int mt = 0; mt < MT; ++mt)
                 if (on[mt]) nxt[mt] = load_record(base[mt] + static_cast<std::size_t>(c + 1) * kNvfp4RecordBytes, lane);
         }
-        compute_chunk<RB, MT>(cur, on, xrow, rv, c << 7, t, acc);
+        compute_chunk<RB, MT>(cur, on, xs_dyn + cs * RB * 256, lane, acc);
 #pragma unroll
         for (int mt = 0; mt < MT; ++mt) cur[mt] = nxt[mt];
     }
     // epilogue: C fragment (c0,c1: row g, cols 2t,2t+1; c2,c3: row g+8)
+    const int g = lane >> 2, t = lane & 3;
 #pragma unroll
     for (int mt = 0; mt < MT; ++mt) {
         if (!on[mt]) continue;
-        const std::uint32_t m = blockIdx.x * MT + mt;
+        const std::uint32_t m = (blockIdx.x * kWarpsPerBlock + warp) * MT + mt;
 #pragma unroll
         for (int rb = 0; rb < RB; ++rb)
 #pragma unroll
@@ -230,21 +241,21 @@ std::size_t g_ws_bytes = 0;
 
 template <int RB, int MT, bool DIRECT>
 cudaError_t launch_gemv(const unsigned char* w0, const unsigned char* w1, const float* x, float* part, float* y,
-                        const float* resid, float gs0, std::uint32_t out, std::uint32_t in, std::uint32_t rows,
+                        const float* resid, float gs0, float gs1, std::uint32_t out, std::uint32_t in, std::uint32_t rows,
                         std::uint32_t ks, std::uint32_t nw, cudaStream_t s) {
-    const dim3 grid((out / 16 + MT - 1) / MT, (ks + kWarpsPerBlock - 1) / kWarpsPerBlock, nw);
-    fp4_gemv<RB, MT, DIRECT><<<grid, kWarpsPerBlock * 32, 0, s>>>(w0, w1, x, part, y, resid, gs0, out, in, rows, ks);
+    const dim3 grid((out / 16 + kWarpsPerBlock * MT - 1) / (kWarpsPerBlock * MT), ks, nw);
+    fp4_gemv<RB, MT, DIRECT><<<grid, kWarpsPerBlock * 32, kSlab * RB * 2048, s>>>(w0, w1, x, part, y, resid, gs0, out, in, rows, ks);
     return cudaGetLastError();
 }
 
 template <bool DIRECT>
 cudaError_t by_rb(const unsigned char* w0, const unsigned char* w1, const float* x, float* part, float* y,
-                  const float* resid, float gs0, std::uint32_t out, std::uint32_t in, std::uint32_t rows,
+                  const float* resid, float gs0, float gs1, std::uint32_t out, std::uint32_t in, std::uint32_t rows,
                   std::uint32_t ks, std::uint32_t nw, cudaStream_t s) {
-    if (rows <= 8) return launch_gemv<1, 4, DIRECT>(w0, w1, x, part, y, resid, gs0, out, in, rows, ks, nw, s);
-    if (rows <= 16) return launch_gemv<2, 4, DIRECT>(w0, w1, x, part, y, resid, gs0, out, in, rows, ks, nw, s);
-    if (rows <= 24) return launch_gemv<3, 2, DIRECT>(w0, w1, x, part, y, resid, gs0, out, in, rows, ks, nw, s);
-    return launch_gemv<4, 2, DIRECT>(w0, w1, x, part, y, resid, gs0, out, in, rows, ks, nw, s);
+    if (rows <= 8) return launch_gemv<1, 4, DIRECT>(w0, w1, x, part, y, resid, gs0, gs1, out, in, rows, ks, nw, s);
+    if (rows <= 16) return launch_gemv<2, 4, DIRECT>(w0, w1, x, part, y, resid, gs0, gs1, out, in, rows, ks, nw, s);
+    if (rows <= 24) return launch_gemv<3, 2, DIRECT>(w0, w1, x, part, y, resid, gs0, gs1, out, in, rows, ks, nw, s);
+    return launch_gemv<4, 2, DIRECT>(w0, w1, x, part, y, resid, gs0, gs1, out, in, rows, ks, nw, s);
 }
 
 bool ok(const DenseWeight& w, std::uint32_t rows) {
@@ -363,9 +374,11 @@ cudaError_t quantize(const void* src, std::uint32_t out, std::uint32_t in, void*
 
 }  // namespace
 
+void nvfp4_set_split_target(std::uint32_t warps) { g_target_warps = warps ? warps : 640; }
+
 std::uint32_t nvfp4_split_k(std::uint32_t out, std::uint32_t in) {
-    const std::uint32_t nch = in >> 7, groups = std::max<std::uint32_t>(1, (out / 16 + 3) / 4);
-    return std::clamp<std::uint32_t>((kTargetWarps + groups / 2) / groups, 1, nch);
+    const std::uint32_t nch = in >> 7, groups = std::max<std::uint32_t>(1, (out / 16 + 15) / 16);
+    return std::clamp<std::uint32_t>((g_target_warps + groups / 2) / groups, 1, nch);
 }
 
 cudaError_t nvfp4_quantize_bf16(const void* bf16, std::uint32_t out, std::uint32_t in, void* dst, float* gscale,
@@ -384,11 +397,10 @@ cudaError_t nvfp4_dense_rows(const DenseWeight& w, const float* x, float* y, std
     if (!ok(w, rows)) return cudaErrorInvalidValue;
     const std::uint32_t ks = nvfp4_split_k(w.out, w.in);
     const auto* wd = static_cast<const unsigned char*>(w.data);
-    if (ks == 1) return by_rb<true>(wd, wd, x, nullptr, y, residual, w.gscale, w.out, w.in, rows, 1, 1, s);
-    const std::size_t need = static_cast<std::size_t>(ks) * rows * w.out * 4;
-    cudaError_t e = ensure_ws(need);
+    if (ks == 1) return by_rb<true>(wd, wd, x, nullptr, y, residual, w.gscale, 1.0f, w.out, w.in, rows, 1, 1, s);
+    cudaError_t e = ensure_ws(static_cast<std::size_t>(ks) * rows * w.out * 4);
     if (e != cudaSuccess) return e;
-    e = by_rb<false>(wd, wd, x, g_ws, y, residual, w.gscale, w.out, w.in, rows, ks, 1, s);
+    e = by_rb<false>(wd, wd, x, g_ws, y, residual, w.gscale, 1.0f, w.out, w.in, rows, ks, 1, s);
     if (e != cudaSuccess) return e;
     const std::size_t n = static_cast<std::size_t>(w.out) * rows;
     fp4_reduce<false><<<static_cast<unsigned>((n + 255) / 256), 256, 0, s>>>(g_ws, y, residual, w.gscale, 1.0f, w.out, rows, ks);
@@ -399,11 +411,10 @@ cudaError_t nvfp4_gate_up_silu_rows(const DenseWeight& gate, const DenseWeight& 
                                     std::uint32_t rows, cudaStream_t s) {
     if (!ok(gate, rows) || !ok(up, rows) || gate.out != up.out || gate.in != up.in) return cudaErrorInvalidValue;
     const std::uint32_t ks = nvfp4_split_k(gate.out, gate.in);
-    const std::size_t need = static_cast<std::size_t>(2) * ks * rows * gate.out * 4;
-    cudaError_t e = ensure_ws(need);
+    cudaError_t e = ensure_ws(static_cast<std::size_t>(2) * ks * rows * gate.out * 4);
     if (e != cudaSuccess) return e;
     e = by_rb<false>(static_cast<const unsigned char*>(gate.data), static_cast<const unsigned char*>(up.data), x, g_ws,
-                     nullptr, nullptr, 1.0f, gate.out, gate.in, rows, ks, 2, s);
+                     nullptr, nullptr, gate.gscale, up.gscale, gate.out, gate.in, rows, ks, 2, s);
     if (e != cudaSuccess) return e;
     const std::size_t n = static_cast<std::size_t>(gate.out) * rows;
     fp4_reduce<true><<<static_cast<unsigned>((n + 255) / 256), 256, 0, s>>>(g_ws, y, nullptr, gate.gscale, up.gscale, gate.out, rows, ks);

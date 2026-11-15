@@ -50,6 +50,8 @@ cudaError_t nvfp4_dense_rows(const DenseWeight& w, const float* x, float* y, std
 cudaError_t nvfp4_gate_up_silu_rows(const DenseWeight& gate, const DenseWeight& up, const float* x, float* y,
                                     std::uint32_t rows, cudaStream_t stream);
 cudaError_t nvfp4_reserve_workspace(std::size_t bytes);
+// Tuning/test hook: target number of blocks used to pick the split-K factor (default 640; 0 = default).
+void nvfp4_set_split_target(std::uint32_t warps);
 // Split-K factor used for (out, in) (diagnostics / tests).
 std::uint32_t nvfp4_split_k(std::uint32_t out, std::uint32_t in);
 

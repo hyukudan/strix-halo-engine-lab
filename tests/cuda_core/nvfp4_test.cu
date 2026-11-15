@@ -161,7 +161,42 @@ static void test_shape(std::uint32_t out, std::uint32_t in, std::mt19937& rng) {
     cudaFree(d_w); cudaFree(d_t); cudaFree(d_x); cudaFree(d_y); cudaFree(d_res);
 }
 
+__global__ void read_kernel(const uint4* p, std::size_t n, unsigned* sink) {
+    unsigned a = 0;
+    for (std::size_t i = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x; i < n; i += std::size_t(gridDim.x) * blockDim.x) {
+        uint4 v;
+        asm volatile("ld.global.nc.L1::no_allocate.v4.u32 {%0,%1,%2,%3}, [%4];" : "=r"(v.x), "=r"(v.y), "=r"(v.z), "=r"(v.w) : "l"(p + i));
+        a ^= v.x ^ v.y ^ v.z ^ v.w;
+    }
+    if (a == 0x12345678u) *sink = a;
+}
+
+static void read_peak() {
+    const std::size_t bytes = std::size_t(1) << 30;
+    uint4* p;
+    unsigned* sink;
+    CK(cudaMalloc(&p, bytes));
+    CK(cudaMalloc(&sink, 4));
+    CK(cudaMemset(p, 1, bytes));
+    cudaEvent_t e0, e1;
+    CK(cudaEventCreate(&e0));
+    CK(cudaEventCreate(&e1));
+    for (int bpsm : {2, 4, 8}) {
+        read_kernel<<<188 * bpsm, 256>>>(p, bytes / 16, sink);
+        CK(cudaEventRecord(e0));
+        for (int i = 0; i < 5; ++i) read_kernel<<<188 * bpsm, 256>>>(p, bytes / 16, sink);
+        CK(cudaEventRecord(e1));
+        CK(cudaEventSynchronize(e1));
+        float ms;
+        CK(cudaEventElapsedTime(&ms, e0, e1));
+        std::printf("read-only 1 GiB, %d blocks/SM x 256 thr: %.0f GB/s\n", bpsm, 5.0 * bytes / (ms * 1e-3) / 1e9);
+    }
+    cudaFree(p);
+    cudaFree(sink);
+}
+
 static void bench() {
+    read_peak();
     struct S {
         const char* name;
         std::uint32_t out, in;
@@ -201,8 +236,7 @@ static void bench() {
             CK(cudaMemcpy(buf + o, h.data(), std::min(h.size(), per * sets - o), cudaMemcpyHostToDevice));
         std::printf("%-24s %4u", s.name, cc::nvfp4_split_k(s.out, s.in));
         for (auto r : rows_list) {
-            const int iters = 4 * static_cast<int>(sets);
-            auto run = [&](std::size_t set) {
+            auto run_s = [&](std::size_t set, cudaStream_t st) {
                 cc::DenseWeight W;
                 W.format = cc::WeightFormat::nvfp4;
                 W.out = s.out;
@@ -212,19 +246,35 @@ static void bench() {
                 if (s.fused) {
                     cc::DenseWeight U = W;
                     U.data = buf + set * per + per / 2;
-                    CK(cc::nvfp4_gate_up_silu_rows(W, U, d_x, d_y, r, 0));
+                    CK(cc::nvfp4_gate_up_silu_rows(W, U, d_x, d_y, r, st));
                 } else {
-                    CK(cc::nvfp4_dense_rows(W, d_x, d_y, r, nullptr, 0));
+                    CK(cc::nvfp4_dense_rows(W, d_x, d_y, r, nullptr, st));
                 }
             };
+            auto run = [&](std::size_t set) { run_s(set, 0); };
             for (std::size_t i = 0; i < sets; ++i) run(i);
-            CK(cudaEventRecord(e0, 0));
-            for (int i = 0; i < iters; ++i) run(i % sets);
-            CK(cudaEventRecord(e1, 0));
+            CK(cudaDeviceSynchronize());
+            // graph of `sets` calls (each on its own weight copy) removes host launch gaps: device-side time per call
+            cudaGraph_t gr;
+            cudaGraphExec_t ge;
+            cudaStream_t cs;
+            CK(cudaStreamCreate(&cs));
+            CK(cudaStreamBeginCapture(cs, cudaStreamCaptureModeGlobal));
+            for (std::size_t i = 0; i < sets; ++i) run_s(i, cs);
+            CK(cudaStreamEndCapture(cs, &gr));
+            CK(cudaGraphInstantiate(&ge, gr, 0));
+            CK(cudaGraphLaunch(ge, cs));
+            CK(cudaStreamSynchronize(cs));
+            CK(cudaEventRecord(e0, cs));
+            for (int i = 0; i < 4; ++i) CK(cudaGraphLaunch(ge, cs));
+            CK(cudaEventRecord(e1, cs));
             CK(cudaEventSynchronize(e1));
             float ms = 0;
             CK(cudaEventElapsedTime(&ms, e0, e1));
-            const double us = ms * 1e3 / iters;
+            CK(cudaGraphExecDestroy(ge));
+            CK(cudaGraphDestroy(gr));
+            CK(cudaStreamDestroy(cs));
+            const double us = ms * 1e3 / (4.0 * sets);
             std::printf("  %7.1f %5.0f", us, per / (us * 1e-6) / 1e9);
         }
         std::printf("   [%.1f MB]\n", per / 1e6);
@@ -234,6 +284,7 @@ static void bench() {
 
 int main(int argc, char** argv) {
     const std::string a = argc > 1 ? argv[1] : "";
+    if (argc > 2) cc::nvfp4_set_split_target(static_cast<std::uint32_t>(std::atoi(argv[2])));
     CK(cudaSetDevice(0));
     cudaDeviceProp p;
     CK(cudaGetDeviceProperties(&p, 0));
