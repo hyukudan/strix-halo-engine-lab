@@ -165,6 +165,7 @@ add_library(strix_core STATIC
     src/model_manifest.cpp
     src/model_family_registry.cpp
     src/cost_table_cache.cpp
+    src/logprob_partials.cpp
 )
 else()
 add_library(strix_core STATIC
@@ -173,6 +174,7 @@ add_library(strix_core STATIC
     src/greedy_serving_scheduler.cpp
     src/serving_cohort.cpp
     src/generation_output.cpp
+    src/logprob_partials.cpp
     src/known_prompt_chunks.cpp
     src/known_prefix_prefill.cpp
     src/known_prefix_prefill_runtime.cpp
@@ -1278,6 +1280,10 @@ if(BUILD_TESTING)
     target_link_libraries(strix-generation-output-tests PRIVATE strix_core)
     strix_target_warnings(strix-generation-output-tests)
     add_test(NAME strix-generation-output-tests COMMAND strix-generation-output-tests)
+    add_executable(strix-logprob-partials-tests tests/logprob_partials_tests.cpp)
+    target_link_libraries(strix-logprob-partials-tests PRIVATE strix_core)
+    strix_target_warnings(strix-logprob-partials-tests)
+    add_test(NAME strix-logprob-partials-tests COMMAND strix-logprob-partials-tests)
     add_executable(strix-greedy-serving-scheduler-tests tests/greedy_serving_scheduler_tests.cpp)
     target_link_libraries(strix-greedy-serving-scheduler-tests PRIVATE strix_core)
     strix_target_warnings(strix-greedy-serving-scheduler-tests)
@@ -2604,6 +2610,7 @@ int main() { return 0; }"
         src/hip_integer_projection_runtime.hip
         src/hip_lm_head_launcher.hip
         src/hip_generation_output.hip
+        src/hip_logprob_partials.hip
         src/hip_moe_overlap_dispatcher.hip
         src/hip_shared_expert_launcher.hip
         src/hip_dense_trellis.hip
@@ -2649,6 +2656,9 @@ int main() { return 0; }"
     set_source_files_properties(src/hip_qsa_selection_diagnostic.hip
         PROPERTIES COMPILE_OPTIONS "-mno-wavefrontsize64;-fno-fast-math")
     set_source_files_properties(src/hip_dense_trellis.hip
+        PROPERTIES COMPILE_OPTIONS "-mno-wavefrontsize64;-fno-fast-math;-ffp-contract=off;-fdenormal-fp-math=ieee")
+    # logprob partials: the nonfinite test and the contract's FP32 lane order hold as written
+    set_source_files_properties(src/hip_logprob_partials.hip tests/hip_logprob_partials_tests.hip
         PROPERTIES COMPILE_OPTIONS "-mno-wavefrontsize64;-fno-fast-math;-ffp-contract=off;-fdenormal-fp-math=ieee")
     set_source_files_properties(src/hip_mtp_input_fusion.hip
         PROPERTIES COMPILE_OPTIONS "-mno-wavefrontsize64;-fno-fast-math;-ffp-contract=off;-fhip-fp32-correctly-rounded-divide-sqrt;-fdenormal-fp-math=ieee")
@@ -3634,6 +3644,11 @@ int main() { return 0; }"
         target_link_libraries(strix-hip-generation-output-tests PRIVATE strix_hip_runtime)
         strix_target_warnings(strix-hip-generation-output-tests)
         add_test(NAME strix-hip-generation-output-tests COMMAND strix-hip-generation-output-tests)
+        add_executable(strix-hip-logprob-partials-tests tests/hip_logprob_partials_tests.hip)
+        set_target_properties(strix-hip-logprob-partials-tests PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHS}")
+        target_link_libraries(strix-hip-logprob-partials-tests PRIVATE strix_hip_runtime strix_core)
+        strix_target_warnings(strix-hip-logprob-partials-tests)
+        add_test(NAME strix-hip-logprob-partials-tests COMMAND strix-hip-logprob-partials-tests)
         set_target_properties(strix-hip-gdn-lm-wave8-diagnostic-tests PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHS}")
         target_link_libraries(strix-hip-gdn-lm-wave8-diagnostic-tests PRIVATE strix_hip_runtime)
         strix_target_warnings(strix-hip-gdn-lm-wave8-diagnostic-tests)
