@@ -1,7 +1,7 @@
 // Dense rows 1..32 on tensor cores: BF16 mma.sync m16n8k16 (FP32 accumulate). The FP32 activation is split exactly into three
 // bf16 terms (hi + mid + lo = x, products with bf16 weights exact in FP32), accumulated lo, mid, hi. Fixed order (independent of
 // the row count: rows ride the N dimension, every output element is its own accumulator): the K axis is cut into blocks of 32;
-// warp w (of 8) owns groups of 4 consecutive blocks: blocks 4(8i+w) .. 4(8i+w)+3 for i = 0, 1, ... (blocks ascending); inside a block two k16 steps, each with its terms; the 8 warp partials are summed in
+// warp w (of 8) owns groups of U consecutive blocks (U = 4 bf16, 8 q8_0): blocks U(8i+w) .. U(8i+w)+U-1 for i = 0, 1, ... (blocks ascending); inside a block two k16 steps, each with its terms; the 8 warp partials are summed in
 // ascending warp order. q8_0: int8 values are exact in bf16; each 32-block partial starts from zero and is folded into the
 // running sum as tot = tot + fl(d * part), blocks ascending per warp. Thread-level k permutation: thread q of a quad owns 8
 // consecutive k of the 32-block (same permutation for A and B, so the sum is unchanged).
@@ -65,7 +65,8 @@ struct WLoad {
 };
 
 template <WeightFormat F>
-__device__ __forceinline__ void wload(WLoad<F>& l, const void* base, std::uint32_t in, std::uint32_t o0, int g, int qd, std::uint32_t kb) {
+__device__ __forceinline__ void wload(WLoad<F>& l, const void* base, std::uint32_t in, std::uint32_t o0, int g, int qd, std::uint32_t kb,
+                                      const unsigned char* sbase, int ub) {
     if constexpr (F == WeightFormat::bf16) {
         const uint4* p = reinterpret_cast<const uint4*>(static_cast<const std::uint16_t*>(base) + static_cast<std::size_t>(o0 + g) * in) + kb * 4 + qd;
         l.u[0] = __ldg(p);
@@ -74,10 +75,11 @@ __device__ __forceinline__ void wload(WLoad<F>& l, const void* base, std::uint32
         const std::size_t rb = static_cast<std::size_t>(in >> 5) * 34;
 #pragma unroll
         for (int h = 0; h < 2; ++h) {
-            const std::uint16_t* p = reinterpret_cast<const std::uint16_t*>(static_cast<const unsigned char*>(base) + (o0 + g + 8 * h) * rb + kb * 34);
-            l.d[h] = __half2float(__ushort_as_half(__ldg(p)));
+            const std::uint16_t* p = reinterpret_cast<const std::uint16_t*>(
+                sbase != nullptr ? sbase + (g + 8 * h) * 272 + ub * 34 : static_cast<const unsigned char*>(base) + (o0 + g + 8 * h) * rb + kb * 34);
+            l.d[h] = __half2float(__ushort_as_half(*p));
             const std::uint16_t* q = p + 1 + 4 * qd;
-            const std::uint32_t v0 = __ldg(q), v1 = __ldg(q + 1), v2 = __ldg(q + 2), v3 = __ldg(q + 3);
+            const std::uint32_t v0 = q[0], v1 = q[1], v2 = q[2], v3 = q[3];
             l.q[h][0] = v0 | (v1 << 16);
             l.q[h][1] = v2 | (v3 << 16);
         }
@@ -101,14 +103,33 @@ __device__ __forceinline__ void a_words(const WLoad<F>& l, int h, std::uint32_t 
 
 template <WeightFormat F, int NT, int TERMS, int U>
 __device__ __forceinline__ void mma_dot(const void* base, std::uint32_t in, std::uint32_t o0, const float* x, std::uint32_t rows, int warp,
-                                        int g, int qd, float (&tot)[NT][4]) {
+                                        int g, int qd, float (&tot)[NT][4], uint4* stg, int lane) {
     const std::uint32_t nkb = in >> 5;
+    const bool staged = F == WeightFormat::q8_0 && (in & 255) == 0;  // rows 16 B aligned: stage 16 rows x 8 blocks (272 B each) through smem
     for (std::uint32_t kb0 = warp * U; kb0 < nkb; kb0 += 8 * U) {
+        const unsigned char* sbase = nullptr;
+        if constexpr (F == WeightFormat::q8_0) {
+            if (staged) {
+                const std::size_t rb = static_cast<std::size_t>(nkb) * 34;
+                uint4 v[9];
+#pragma unroll
+                for (int t = 0; t < 9; ++t) {
+                    const int j = lane + 32 * t, r = j / 17, c = j % 17;
+                    if (j < 272) v[t] = __ldg(reinterpret_cast<const uint4*>(static_cast<const unsigned char*>(base) + (o0 + r) * rb + kb0 * 34) + c);
+                }
+                __syncwarp();
+#pragma unroll
+                for (int t = 0; t < 9; ++t)
+                    if (lane + 32 * t < 272) stg[lane + 32 * t] = v[t];
+                __syncwarp();
+                sbase = reinterpret_cast<const unsigned char*>(stg);
+            }
+        }
         WLoad<F> l[U];
 #pragma unroll
         for (int u = 0; u < U; ++u) {
             const std::uint32_t kb = kb0 + u;
-            if (kb < nkb) wload<F>(l[u], base, in, o0, g, qd, kb);
+            if (kb < nkb) wload<F>(l[u], base, in, o0, g, qd, kb, sbase, u);
         }
 #pragma unroll
         for (int u = 0; u < U; ++u) {
@@ -141,11 +162,16 @@ __device__ __forceinline__ void mma_dot(const void* base, std::uint32_t in, std:
     }
 }
 
+__device__ __forceinline__ int warp_id_of(int t) { return t >> 5; }
+
 template <WeightFormat F, int NT, int TERMS, bool FUSED>
 __global__ void __launch_bounds__(256) mma_kernel(MmaArgs ma, const void* w1, const float* x, const float* resid, std::uint32_t in,
                                                   std::uint32_t rows) {
-    constexpr int U = 4;
-    __shared__ float red[FUSED ? 2 : 1][8][NT * 128];
+    constexpr int U = F == WeightFormat::bf16 ? 4 : 8;
+    constexpr std::size_t kRed = (FUSED ? 2 : 1) * 8 * NT * 128 * sizeof(float), kStg = F == WeightFormat::q8_0 ? 8 * 272 * 16 : 0;
+    __shared__ __align__(16) unsigned char smem[kRed > kStg ? kRed : kStg];
+    float(*red)[8][NT * 128] = reinterpret_cast<float(*)[8][NT * 128]>(smem);
+    uint4* stg = reinterpret_cast<uint4*>(smem) + warp_id_of(threadIdx.x) * 272;
     pdl_trigger();
     const std::uint32_t tile = blockIdx.x;
     const void* wsel = ma.w[0];
@@ -168,8 +194,9 @@ __global__ void __launch_bounds__(256) mma_kernel(MmaArgs ma, const void* w1, co
 #pragma unroll
         for (int i = 0; i < 4; ++i) a0[nt][i] = a1[nt][i] = 0.0f;
     pdl_wait();
-    mma_dot<F, NT, TERMS, U>(wsel, in, o0, x, rows, warp, g, qd, a0);
-    if constexpr (FUSED) mma_dot<F, NT, TERMS, U>(w1, in, o0, x, rows, warp, g, qd, a1);
+    mma_dot<F, NT, TERMS, U>(wsel, in, o0, x, rows, warp, g, qd, a0, stg, lane);
+    if constexpr (FUSED) { __syncwarp(); mma_dot<F, NT, TERMS, U>(w1, in, o0, x, rows, warp, g, qd, a1, stg, lane); }
+    __syncthreads();  // the staging area is reused as the reduction area
 #pragma unroll
     for (int nt = 0; nt < NT; ++nt) {
         // element e = nt * 128 + o * 8 + c (o = output row within the tile, c = activation row within the n-tile)

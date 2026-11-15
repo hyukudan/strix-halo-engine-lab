@@ -49,10 +49,10 @@ static float half_val(std::uint16_t b) { __half h; std::memcpy(&h, &b, 2); retur
 static std::mt19937 rng(1234);
 static float rnd(float s) { return std::uniform_real_distribution<float>(-s, s)(rng); }
 
-static int test_dense_arith(cc::DenseArith arith) {
+static int test_dense_arith(cc::DenseArith arith, std::uint32_t in) {
     cc::set_dense_arith(arith);
     const bool mma = arith != cc::DenseArith::fp32;
-    const std::uint32_t in = 1056, out = mma ? 80 : 70, R = 32;
+    const std::uint32_t out = mma ? 80 : 70, R = 32;
     std::vector<std::uint16_t> wb(out * in);
     std::vector<double> wd(out * in);
     for (std::size_t i = 0; i < wb.size(); ++i) { wb[i] = bf16_bits(rnd(0.1f)); wd[i] = bf16_val(wb[i]); }
@@ -114,9 +114,10 @@ static int test_dense_arith(cc::DenseArith arith) {
     return 0;
 }
 int test_dense() {
-    if (int e = test_dense_arith(cc::DenseArith::fp32)) return e;
-    if (int e = test_dense_arith(cc::DenseArith::mma3)) return e;
-    return test_dense_arith(cc::DenseArith::mma1) ;
+    if (int e = test_dense_arith(cc::DenseArith::fp32, 1056)) return e;
+    if (int e = test_dense_arith(cc::DenseArith::mma3, 1056)) return e;
+    if (int e = test_dense_arith(cc::DenseArith::mma3, 1280)) return e;  // q8_0 staged path (in % 256 == 0)
+    return test_dense_arith(cc::DenseArith::mma1, 1280);
 }
 
 int test_norms_rope() {
