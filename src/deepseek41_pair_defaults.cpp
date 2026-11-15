@@ -13,6 +13,7 @@
 #include <stdexcept>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <iostream>
 #include <fstream>
@@ -424,9 +425,10 @@ std::string describe(App app, const Resolved& r) {
 }
 
 DsparkSettings resolve_dspark_settings() {
-    const bool copy_rows8 = ::strix::envcfg::choice("STRIX_DS41_COPY_ROWS", {"6", "8"}, 0) == 1;
-    // Report the row count rather than envcfg::choice's internal choice index.
-    ::strix::envcfg::record("STRIX_DS41_COPY_ROWS", std::getenv("STRIX_DS41_COPY_ROWS"), copy_rows8 ? "8" : "6");
+    const char* raw = ::strix::envcfg::text("STRIX_DS41_COPY_ROWS");
+    const bool copy_rows8 = raw != nullptr && std::strcmp(raw, "8") == 0;  // anything else: six rows
+    // Report the row count rather than the raw text.
+    ::strix::envcfg::record("STRIX_DS41_COPY_ROWS", raw, copy_rows8 ? "8" : "6");
     return {copy_rows8, ::strix::envcfg::flag("STRIX_DS41_SPEC_ARBITER", false)};
 }
 
