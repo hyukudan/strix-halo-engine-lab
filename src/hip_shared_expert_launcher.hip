@@ -665,7 +665,9 @@ __global__ void __launch_bounds__(kThreads) rows_shared_activation_scalar_pre_ke
     if (index < intermediate_size) {
         const float gate = workspace[index];
         const float up = workspace[intermediate_size + index];
-        const float act = (gate / (1.0F + expf(-gate))) * up;
+        // The product as one v_mul_f32: without an FP32 store, LLVM would fold it with the FP16 cast into one
+        // v_fma_mixlo_f16 (a single rounding, 1-ulp different from the FP32 activation's RNE FP16).
+        const float act = core::glu_pair::act(gate, up);
         if (blockIdx.y < pre_rows) {
             a16[blockIdx.y * q8_rows::tiled::scratch_pitch(intermediate_size) + index] = static_cast<_Float16>(act);
             unsigned bad = isfinite(act) && !(fabsf(act) <= 65504.0F);
