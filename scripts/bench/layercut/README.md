@@ -94,9 +94,9 @@ ACT and other layers; gaps, duplicates and incomplete coverage at END are reject
 resident on the GPU, sends ACT as urgent pieces over both producer links (`strix::handoff::Lanes`: KV is handed to a
 Sender only while no ACT of any destination is unreleased) and exports KV fragments into a bounded pinned pool, so
 the GPU never waits for KV. bp-v1 (`--codec bp`), if on, applies to KV only; ACT is always sent uncoded.
-Timeline lines: `lcfix-tl pc` (per block: ring wait, GPU+D2H, ACT queued, ACT/KV released per rank) and
-`lcfix-xport pc` on the producer; `lcfix-tl rR` (ACT stored, relayed, last KV stored, fetch start and wait),
-`lcfix-rank` and `lcfix-act` (XXH64 of the staged ACT, exactness witness) on each rank. ACT is FP32 residual **h**, `[rows][6144]`, 24,576 bytes/row, never normalized hn.
+Timeline lines: `layercut-tl pc` (per block: ring wait, GPU+D2H, ACT queued, ACT/KV released per rank) and
+`layercut-xport pc` on the producer; `layercut-tl rR` (ACT stored, relayed, last KV stored, fetch start and wait),
+`layercut-rank` and `layercut-act` (XXH64 of the staged ACT, exactness witness) on each rank. ACT is FP32 residual **h**, `[rows][6144]`, 24,576 bytes/row, never normalized hn.
 Relay ACT goes only to rank 0 with `handoff::kRelay`; rank 0 submits it to rank 1 before publishing local rows.
 Rank 1's producer session then carries KV only; its separate relay session carries ACT only with the same metadata/session ID.
 Direct ACT goes to both ranks with flags=0. KV is rank-local BF16 K, V, IK in component-major planes

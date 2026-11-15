@@ -264,7 +264,7 @@ std::vector<std::uint32_t> layercut_session(mm::Engine& eng, strix::handoff::Lis
             double fetch_at = -1, fetch_wait = 0;
             for (const auto& f : tl_fetch)
                 if (f.row0 / cfg.block == b) { if (fetch_at < 0) fetch_at = f.at; fetch_wait += f.wait; }
-            std::printf("lcfix-tl r%u req %u block %zu act %.3f relay %.3f kv %.3f fetch %.3f wait %.3f\n", eng.rank(), req, b,
+            std::printf("layercut-tl r%u req %u block %zu act %.3f relay %.3f kv %.3f fetch %.3f wait %.3f\n", eng.rank(), req, b,
                         tl_act[b], tl_relay->at[b], tl_kv[b], fetch_at, fetch_wait);
         }
         const auto rs = session->stats();
@@ -275,8 +275,8 @@ std::vector<std::uint32_t> layercut_session(mm::Engine& eng, strix::handoff::Lis
             x.update(act.data, prompt.size() * mlc::seam_bytes);
             std::snprintf(act_digest, sizeof act_digest, "%016llx", static_cast<unsigned long long>(x.digest()));
         }
-        std::printf("lcfix-act r%u req %u act xxh64 %s rows %zu\n", eng.rank(), req, act_digest, prompt.size());
-        std::printf("lcfix-rank r%u req %u contract v%u prefill %.3f import %.3f agree %.3f reply %.3f recv wait %.3f decode %.3f end %.3f%s\n",
+        std::printf("layercut-act r%u req %u act xxh64 %s rows %zu\n", eng.rank(), req, act_digest, prompt.size());
+        std::printf("layercut-rank r%u req %u contract v%u prefill %.3f import %.3f agree %.3f reply %.3f recv wait %.3f decode %.3f end %.3f%s\n",
                     eng.rank(), req, expected.version, prefill, imported, agree_s, reply_at, rs.wait_seconds, rs.decode_seconds, rs.end,
                     relay_session ? " (ACT on the relay session)" : "");
     }

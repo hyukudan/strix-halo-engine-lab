@@ -353,18 +353,18 @@ void run_layercut(const lc::Resolved& cfg, Store& store, const std::vector<std::
         std::printf("layercut: TTFT %.6f s, rtx compute %.6f s, act last byte %.6f s, kv last byte %.6f s, cut %u block %u; run %u %s token %u%s\n",
             ttft, compute, act_last, kv_last, cut, block, it, it == 0 ? "cold" : "warm", token,
             bp ? " (bp last-byte values are aggregate upper bounds from session open)" : "");
-        // Timeline (PC clock, s after run start; bp-v1 KV 'sent' = encoded). Correlate with the ranks' lcfix-tl lines by block.
+        // Timeline (PC clock, s after run start; bp-v1 KV 'sent' = encoded). Correlate with the ranks' layercut-tl lines by block.
         {
             std::lock_guard<std::mutex> lock(times->mutex);
             for (std::size_t b = 0; b < schedule.size(); ++b) {
                 const auto& t = times->blocks[b];
-                std::printf("lcfix-tl pc run %u block %zu rows %u buf_wait %.3f gpu %.3f act_q %.3f act_sent %.3f %.3f kv_sent %.3f %.3f\n",
+                std::printf("layercut-tl pc run %u block %zu rows %u buf_wait %.3f gpu %.3f act_q %.3f act_sent %.3f %.3f kv_sent %.3f %.3f\n",
                     it, b, schedule[b].rows, t.buf_wait, t.gpu, t.act_q, t.act_sent[0], t.act_sent[1], t.kv_sent[0], t.kv_sent[1]);
             }
         }
         const auto s0 = sender[0]->stats(), s1 = sender[1]->stats();
         const auto ls = lanes ? lanes->stats() : strix::handoff::Lanes::Stats{};
-        std::printf("lcfix-xport pc run %u %s kv_frag %u codec %s wire %.3f/%.3f GB encode %.3f/%.3f s last_byte %.3f/%.3f s bulk_held %.3f s\n",
+        std::printf("layercut-xport pc run %u %s kv_frag %u codec %s wire %.3f/%.3f GB encode %.3f/%.3f s last_byte %.3f/%.3f s bulk_held %.3f s\n",
             it, act_first ? "act-first" : "fifo", act_first ? frag : block, bp ? "bp-v1" : "identity", s0.wire_bytes / 1e9, s1.wire_bytes / 1e9,
             s0.encode_seconds, s1.encode_seconds, s0.last_byte, s1.last_byte, ls.bulk_held_s);
         std::fflush(stdout);
