@@ -17,6 +17,8 @@
 //             (:221-236); v_mul u*q (:238); scalar dot v_dual_fmac_f32 sum = w * x + sum over features tid, tid+256, ...
 //             ascending (:281); LDS tree strides 128..1, v_add_f32 (:301-401); 1/(1 + expf(-s)) (:416-457, IEEE div).
 #include "strix/env_flags.hpp"
+#include "strix/lever.hpp"
+#include "core/imma_tile.cuh"
 #include "strix/cuda/qwen_dense.hpp"
 
 #include <cuda_fp16.h>
@@ -30,6 +32,15 @@ namespace {
 // STRIX_QRTX_DECODE_KERNELS=0: keep the tiled kernels at rows <= 8 too (reference seam for the decode-shaped ones).
 bool decode_rows_enabled() {
     static const bool on = strix::envcfg::flag("STRIX_QRTX_DECODE_KERNELS", true);
+    return on;
+}
+
+// STRIX_QRTX_DENSE_TILE2=0: the first tiled kernel (project_kernel) instead of project_tile2_kernel. Bitwise: same chain per output.
+inline constexpr strix::lever::Decl dense_tile2_lever{
+    .name = "qwen_dense_tile2", .env = "STRIX_QRTX_DENSE_TILE2", .exactness = strix::lever::Exactness::bitwise,
+    .default_on = true, .source = "I-NOTES.md (rtxfast-I): byte equality vs project_kernel in qwen_dense_tests"};
+bool dense_tile2_enabled() {
+    static const bool on = strix::lever::select(dense_tile2_lever, {}, std::getenv("STRIX_QRTX_DENSE_TILE2")).on;
     return on;
 }
 
@@ -250,6 +261,150 @@ __global__ __launch_bounds__(kThreads) void project_kernel(KSite site, std::uint
                         const float dot = __fsub_rn(__int_as_float(d[e]), 12582912.0F);   // exact float(dot_b)
                         const float p = __fmul_rn(dw[nt][e & 1], dl[mt][e >> 1]);         // v_mul_f32 dw * delta
                         acc[mt][nt][e] = __fmaf_rn(p, dot, acc[mt][nt][e]);               // v_fmac_f32
+                    }
+                }
+        }
+        __syncthreads();
+    }
+#pragma unroll
+    for (int mt = 0; mt < 4; ++mt)
+#pragma unroll
+        for (int hh = 0; hh < 2; ++hh) {
+            const std::uint32_t row = m0 + static_cast<std::uint32_t>(wm * 64 + mt * 16 + gid + 8 * hh);
+            if (row >= rows) continue;
+#pragma unroll
+            for (int nt = 0; nt < 4; ++nt)
+#pragma unroll
+                for (int c = 0; c < 2; ++c) {
+                    const std::uint32_t n = n0 + static_cast<std::uint32_t>(wn * 32 + nt * 8 + 2 * tig + c);
+                    if (n < site.outputs) store_value<S>(site, row, n, acc[mt][nt][2 * hh + c]);
+                }
+        }
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// Projection, tile2 (STRIX_QRTX_DENSE_TILE2, bitwise): the same CTA 128 x 128 / warp 64 x 32 / per-(row, output) FP32 chain
+// as project_kernel, with the shared-memory traffic and the occupancy reworked. Stage = 2 K blocks (even + odd, so every
+// raw Q8_0 offset is static), 45 KB double buffer -> two CTAs per SM (128 regs). A fragments by ldmatrix.x4 (core::imma);
+// the 128 + 128 per-stage scales/deltas are staged by the loader in the exact order the warps read them, so a warp reads
+// them as 2 + 2 LDS.128 instead of 16 LDS.32. Requires width / 32 even (checked by the launcher).
+constexpr int kT2Rw = 20;                                  // row pitch in words (80 B): ldmatrix and LDS conflict-free
+constexpr int kT2A = kBM * kT2Rw * 4, kT2B = kBN * kT2Rw * 4, kT2D = 2 * kBM * 4, kT2S = 2 * kBN * 4;
+constexpr int kT2Stage = kT2A + kT2B + kT2D + kT2S;
+constexpr int kT2Smem = 2 * kT2Stage;
+
+template <Store S>
+__global__ __launch_bounds__(kThreads, 2) void project_tile2_kernel(KSite site, std::uint32_t rows, const std::int8_t* codes,
+                                                                    const float* deltas, std::uint32_t pitch) {
+    extern __shared__ __align__(16) unsigned char smem[];
+    const int tid = static_cast<int>(threadIdx.x), lane = tid & 31, warp = tid >> 5, gid = lane >> 2, tig = lane & 3;
+    const int wm = warp & 1, wn = warp >> 1;
+    const std::uint32_t m0 = blockIdx.y * kBM, n0 = blockIdx.x * kBN;
+    const std::uint32_t width = site.width, nblocks = width / 32U, row_bytes = nblocks * 34U;
+    const std::uint32_t stages = nblocks / 2U;
+
+    // Weight rows: every segment begin is a multiple of kBN (launcher check), so the tile lies in one segment and a row is
+    // wbase + row * row_bytes. Raw bytes loader: consecutive lanes take consecutive words of a row (68 B per stage and row,
+    // 17 words), so one warp instruction touches 2-3 rows instead of 16. Scale loader: thread -> output tid & 127, block tid >> 7.
+    const KSeg& tseg = site.seg[find_seg(site, n0)];
+    const unsigned char* wbase = tseg.w + static_cast<std::uint64_t>(n0 - tseg.begin) * row_bytes;
+    const std::uint32_t nrows = n0 < site.outputs ? min(static_cast<std::uint32_t>(kBN), site.outputs - n0) : 0U;
+    const int sn = tid & 127, sj = tid >> 7;
+    const bool svalid = static_cast<std::uint32_t>(sn) < nrows;
+    const unsigned char* srow = wbase + static_cast<std::uint64_t>(sn) * row_bytes;
+    const std::uint32_t sgr = m0 + static_cast<std::uint32_t>(sn);   // delta row of the scale/delta loaders
+    const bool dvalid = sgr < rows;
+    // Destination slots: S[j][wn][tig][nt][c] words, D[j][wm][gid][mt * 2 + h] floats (the reader's order).
+    const int s_off = (((sj * 4 + (sn >> 5)) * 4 + ((sn >> 1) & 3)) * 4 + ((sn >> 3) & 3)) * 2 + (sn & 1);
+    const int d_off = ((sj * 2 + (sn >> 6)) * 8 + (sn & 7)) * 8 + ((sn >> 4) & 3) * 2 + ((sn >> 3) & 1);
+
+    const auto load_stage = [&](std::uint32_t s, int buf) {
+        unsigned char* base = smem + buf * kT2Stage;
+        auto* A = reinterpret_cast<std::uint32_t*>(base);
+        auto* B = reinterpret_cast<std::uint32_t*>(base + kT2A);
+        auto* D = reinterpret_cast<float*>(base + kT2A + kT2B);
+        auto* SC = reinterpret_cast<std::uint32_t*>(base + kT2A + kT2B + kT2D);
+        const std::uint32_t kb0 = s * 2U;
+#pragma unroll
+        for (int k = 0; k < 2; ++k) {
+            const std::uint32_t i = static_cast<std::uint32_t>(tid + k * kThreads), r = i >> 2, c = i & 3U, gr = m0 + r;
+            const bool ok = gr < rows;
+            cp_async16(A + r * kT2Rw + c * 4U, ok ? codes + static_cast<std::uint64_t>(gr) * width + kb0 * 32U + c * 16U : codes, ok);
+        }
+        const unsigned char* wstage = wbase + static_cast<std::uint64_t>(kb0) * 34U;
+        std::uint32_t brow = static_cast<std::uint32_t>(tid) / 17U, bw = static_cast<std::uint32_t>(tid) % 17U;
+#pragma unroll
+        for (int k = 0; k < 9; ++k) {   // 128 rows x 17 words = 2176 = 8.5 x 256
+            if (k < 8 || tid < 128) {
+                const bool ok = brow < nrows;
+                cp_async4(B + brow * kT2Rw + bw, ok ? reinterpret_cast<const std::uint32_t*>(wstage + static_cast<std::uint64_t>(brow) * row_bytes) + bw
+                                                    : reinterpret_cast<const std::uint32_t*>(site.seg[0].w), ok);
+            }
+            bw += 1U; brow += 15U;   // + 256 = 15 rows + 1 word
+            if (bw >= 17U) { bw -= 17U; ++brow; }
+        }
+        // scale of block kb0 + sj: low half of word 0 (even block) or high half of word 8 (odd block) of the stage's raw bytes
+        const auto* ssrc = reinterpret_cast<const std::uint32_t*>(srow + static_cast<std::uint64_t>(kb0) * 34U) + (sj ? 8 : 0);
+        cp_async4(SC + s_off, svalid ? ssrc : reinterpret_cast<const std::uint32_t*>(site.seg[0].w), svalid);
+        cp_async4(D + d_off, dvalid ? deltas + static_cast<std::uint64_t>(kb0 + sj) * pitch + sgr : deltas, dvalid);
+    };
+
+    float acc[4][4][4];
+#pragma unroll
+    for (int a = 0; a < 4; ++a)
+#pragma unroll
+        for (int b = 0; b < 4; ++b)
+#pragma unroll
+            for (int e = 0; e < 4; ++e) acc[a][b][e] = 0.0F;
+
+    load_stage(0U, 0);
+    cp_async_commit();
+    for (std::uint32_t s = 0; s < stages; ++s) {
+#ifndef T2_NOLOAD
+        if (s + 1U < stages) load_stage(s + 1U, static_cast<int>((s + 1U) & 1U));
+#endif
+        cp_async_commit();
+        cp_async_wait1();
+        __syncthreads();
+        const unsigned char* base = smem + (s & 1U) * kT2Stage;
+        const auto* B = reinterpret_cast<const std::uint32_t*>(base + kT2A);
+        const auto* D = reinterpret_cast<const float*>(base + kT2A + kT2B);
+        const auto* SC = reinterpret_cast<const std::uint32_t*>(base + kT2A + kT2B + kT2D);
+#pragma unroll
+        for (int j = 0; j < 2; ++j) {   // blocks ascending: the HIP chain order
+            std::uint32_t a[4][4];
+#pragma unroll
+            for (int mt = 0; mt < 4; ++mt)
+                core::imma::load_a_frag(a[mt], base + (wm * 64 + mt * 16) * (kT2Rw * 4) + j * 32, kT2Rw * 4, lane);
+            const float4 d0 = *reinterpret_cast<const float4*>(D + ((j * 2 + wm) * 8 + gid) * 8);
+            const float4 d1 = *reinterpret_cast<const float4*>(D + ((j * 2 + wm) * 8 + gid) * 8 + 4);
+            const float dl[4][2] = {{d0.x, d0.y}, {d0.z, d0.w}, {d1.x, d1.y}, {d1.z, d1.w}};
+            const uint4 s0 = *reinterpret_cast<const uint4*>(SC + ((j * 4 + wn) * 4 + tig) * 8);
+            const uint4 s1 = *reinterpret_cast<const uint4*>(SC + ((j * 4 + wn) * 4 + tig) * 8 + 4);
+            const std::uint32_t sw[8] = {s0.x, s0.y, s0.z, s0.w, s1.x, s1.y, s1.z, s1.w};
+            std::uint32_t b[4][2];
+            float dw[4][2];
+#pragma unroll
+            for (int nt = 0; nt < 4; ++nt) {
+                const std::uint32_t* W = B + (wn * 32 + nt * 8 + gid) * kT2Rw + tig;
+                if (j == 0) { b[nt][0] = __byte_perm(W[0], W[1], 0x5432); b[nt][1] = __byte_perm(W[4], W[5], 0x5432); }
+                else { b[nt][0] = W[9]; b[nt][1] = W[13]; }
+#pragma unroll
+                for (int c = 0; c < 2; ++c) dw[nt][c] = j == 0 ? core::imma::half_lo(sw[nt * 2 + c]) : core::imma::half_hi(sw[nt * 2 + c]);
+            }
+#pragma unroll
+            for (int mt = 0; mt < 4; ++mt)
+#pragma unroll
+                for (int nt = 0; nt < 4; ++nt) {
+                    int d[4];
+                    core::imma::mma_seeded(d, a[mt], b[nt]);
+#pragma unroll
+                    for (int e = 0; e < 4; ++e) {
+#ifdef T2_NOEPI
+                        acc[mt][nt][e] = __int_as_float(__float_as_int(acc[mt][nt][e]) ^ d[e]);
+#else
+                        acc[mt][nt][e] = core::imma::block_acc(d[e], dw[nt][e & 1], dl[mt][e >> 1], acc[mt][nt][e]);
+#endif
                     }
                 }
         }
@@ -529,16 +684,30 @@ __global__ __launch_bounds__(256) void shared_activation_kernel(float* workspace
         workspace[intermediate] = __fdiv_rn(1.0F, __fadd_rn(1.0F, amdmath::amd_expf(tables, -scratch[0])));
 }
 
+bool segments_tile_aligned(const KSite& k) {
+    for (std::uint32_t m = 0; m < k.nseg; ++m)
+        if (k.seg[m].begin % static_cast<std::uint32_t>(kBN) != 0U) return false;
+    return true;
+}
+
 template <Store S> cudaError_t launch_project(cudaStream_t stream, const KSite& k, std::uint32_t rows, const std::int8_t* codes,
                                               const float* deltas, std::uint32_t pitch) {
     if (rows <= 8U && k.width <= 6144U && decode_rows_enabled())
         return rows_ksplit_enabled() ? launch_rows_ks<S>(stream, k, rows, codes, deltas, pitch)
                                      : launch_rows<S>(stream, k, rows, codes, deltas, pitch);
+    const dim3 grid((k.outputs + kBN - 1U) / kBN, (rows + kBM - 1U) / kBM);
+    if (dense_tile2_enabled() && (k.width / 32U) % 2U == 0U && segments_tile_aligned(k)) {
+        static std::once_flag once2;
+        static cudaError_t attr2 = cudaSuccess;
+        std::call_once(once2, [] { attr2 = cudaFuncSetAttribute(project_tile2_kernel<S>, cudaFuncAttributeMaxDynamicSharedMemorySize, kT2Smem); });
+        if (attr2 != cudaSuccess) return attr2;
+        project_tile2_kernel<S><<<grid, kThreads, kT2Smem, stream>>>(k, rows, codes, deltas, pitch);
+        return cudaGetLastError();
+    }
     static std::once_flag once;
     static cudaError_t attr = cudaSuccess;
     std::call_once(once, [] { attr = cudaFuncSetAttribute(project_kernel<S>, cudaFuncAttributeMaxDynamicSharedMemorySize, kSmem); });
     if (attr != cudaSuccess) return attr;
-    const dim3 grid((k.outputs + kBN - 1U) / kBN, (rows + kBM - 1U) / kBM);
     project_kernel<S><<<grid, kThreads, kSmem, stream>>>(k, rows, codes, deltas, pitch);
     return cudaGetLastError();
 }

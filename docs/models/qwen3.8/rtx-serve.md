@@ -110,3 +110,9 @@ host RAM, LRU-evicted; row segments are shared between checkpoints of the same p
 (multi-session equality and window packing), `qwen_qsa_multi_test`, `qwen_quant_host_test` and
 `qwen_quant_device_test` (GGUF decoders against the host reference), and the `qwen_decode_bench` timing bench. Prefix cache: `qwen_prefix_cache_host_test` (planner, identity,
 store, slab pool, batched capture) and `qwen_prefix_cache_e2e`.
+
+Profiles: `--profile exact|default|fast|quality` and the lever options (`--hc-mma`, `--mtp-mma`, `--qsa-mma`,
+`--prefill-moe-route-bf16`; env `STRIX_QRTX_HC_MMA` / `_MTP_MMA` / `_QSA_MMA`) are parsed by one shared parser
+(`include/strix/cuda/qwen_options.hpp`) and resolved by the shared Qwen profile resolver over the CUDA rows in
+`include/strix/profiles/qwen_cuda.hpp`; `--print-effective-config` prints the result, with the serve-only values named and
+explained. FAST quality gate kit: `scripts/bench/cuda/qwen_fast/README.md` (`qwen_tf_logits`, `gate.sh`); host test `qwen_cuda_profile_host_test`.

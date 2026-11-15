@@ -63,6 +63,10 @@ target_link_libraries(qwen_cohort_e2e PRIVATE strix_qwen_cuda strix_qwen_handoff
 add_executable(qwen_qsa_multi_test tests/cuda/qwen_qsa_multi_test.cu)
 target_link_libraries(qwen_qsa_multi_test PRIVATE strix_qwen_cuda)
 target_compile_options(qwen_qsa_multi_test PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--fmad=false>)
+# QSA FAST attention form (qsa_mma) vs exact attention on random inputs + timing: qwen_qsa_mma_test <tables dir>
+add_executable(qwen_qsa_mma_test tests/cuda/qwen_qsa_mma_test.cu)
+target_link_libraries(qwen_qsa_mma_test PRIVATE strix_qwen_cuda)
+target_compile_options(qwen_qsa_mma_test PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--fmad=false>)
 
 # Prefix storage and compatibility planning are host-only; no CUDA initialization in their tests.
 add_library(strix_qwen_prefix STATIC src/prefix_state_cache.cpp src/cuda/models/qwen/qwen_prefix_identity.cpp)
@@ -124,3 +128,14 @@ if(MSVC)
 endif()
 add_test(NAME qwen_gdn_state16 COMMAND qwen_gdn_state16_test)
 set_tests_properties(qwen_gdn_state16 PROPERTIES ENVIRONMENT "CUDA_VISIBLE_DEVICES=0")
+
+# Profile resolution of the CUDA Qwen apps: one resolver, one engine-option parser, named serve/CLI differences (host-only).
+add_executable(qwen_cuda_profile_host_test tests/cuda/qwen_cuda_profile_host_test.cpp)
+target_link_libraries(qwen_cuda_profile_host_test PRIVATE strix_qwen_prefix)
+add_test(NAME qwen_cuda_profile_host COMMAND qwen_cuda_profile_host_test)
+# Gate kit: teacher-forced logit dump (layout of tools/strix-gate/fast_logit_gate.py); see scripts/bench/cuda/qwen_fast/README.md.
+add_executable(qwen_tf_logits tests/cuda/qwen_tf_logits.cu)
+target_link_libraries(qwen_tf_logits PRIVATE strix_qwen_cuda strix_qwen_handoff)
+if(MSVC)
+    target_compile_options(qwen_tf_logits PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/EHsc,/Zc:preprocessor,/utf-8>)
+endif()

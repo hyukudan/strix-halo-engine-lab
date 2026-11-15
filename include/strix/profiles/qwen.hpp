@@ -25,7 +25,7 @@ using ::strix::profile::status_name;
 #include "strix/qwen_profile_table.hpp"
 inline std::span<const Lever> levers() { return table; }
 inline Name parse(std::string_view value) {
-    if (value == "default") return Name::standard;
+    if (value == "default" || value == "exact") return Name::standard; // "exact" is the default profile under its other name
     if (value == "fast") return Name::fast;
     if (value == "quality") return Name::quality;
     throw std::invalid_argument("profile must be default, fast or quality");
@@ -201,13 +201,14 @@ inline bool metadata_environment(std::string_view key) {
 inline bool policy_option(std::string_view key) {
     return key == "--profile" || key == "--allow-pending";
 }
-inline bool take_option(int argc, char** argv, int& i, std::optional<Name>& profile, Inputs& inputs) {
+inline bool take_option(int argc, char** argv, int& i, std::optional<Name>& profile, Inputs& inputs,
+        std::span<const Lever> rows = levers()) {
     const std::string_view arg = argv[i];
     const auto equal = arg.find('=');
     const auto key = arg.substr(0, equal);
     if (arg == "--allow-pending") { inputs.allow_pending = true; return true; }
     const Lever* lever = nullptr;
-    for (const auto& row : levers()) if (!row.native_option && key == row.option) lever = &row;
+    for (const auto& row : rows) if (!row.native_option && key == row.option) lever = &row;
     if (key != "--profile" && !lever) return false;
     const auto value = equal != std::string_view::npos ? arg.substr(equal + 1U) :
         (i + 1 < argc ? std::string_view(argv[++i]) : std::string_view{});

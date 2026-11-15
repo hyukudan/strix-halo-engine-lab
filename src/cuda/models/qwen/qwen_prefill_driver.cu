@@ -1007,6 +1007,7 @@ void Prefill::Impl::run_block(const Segment* seg, std::uint32_t count, std::uint
         a.normalized = normalized;
         a.injection = injection;
         a.output = hidden;
+        a.mma = cfg.forms.hc_mma && !window;  // FAST form on run()'s prefill blocks only; verify/step windows stay exact
         hc::hc_mix(a, tables, stream);
     };
     const auto inject = [&](const std::uint16_t* value) {
@@ -1226,7 +1227,7 @@ void Prefill::Impl::qsa_core(std::uint32_t l, const Segment& seg) {
     const auto o = qsa_ordinal(l);
     SessionState& ss = *seg.s;
     const qsa::LayerState st{ss.kv[o], ss.raw_index[o], ss.pooled[o], &ss.pooled_valid[o]};
-    qsa::layer_core(rb, seg.rows, seg.p0, qw, st, rope, tables, qws, stream);
+    qsa::layer_core(rb, seg.rows, seg.p0, qw, st, rope, tables, qws, stream, cfg.forms.qsa_mma && !window);
 }
 
 void Prefill::Impl::qsa_layer(std::uint32_t l, const Segment* seg, std::uint32_t count) {
@@ -1435,7 +1436,7 @@ Timing Prefill::run(SessionId session, const std::vector<std::uint32_t>& tokens,
                 ck(cudaMemcpyAsync(m.mtp_next, m.next_host.data(), std::uint64_t{n} * 4, cudaMemcpyHostToDevice, m.stream), "mtp next");
                 const auto mwts = m.mtp_weights();
                 mark_stream(m.stream, "mtp_compute_start", k, {}, p0, n, 0);
-                pm::launch_mtp_cache_rows(mwts, pm::MtpRounding{}, m.tap, m.mtp_next, n, p0, S.mtp_kv, S.mtp_index, m.mtp_ws,
+                pm::launch_mtp_cache_rows(mwts, pm::MtpRounding{.mma = m.cfg.forms.mtp_mma}, m.tap, m.mtp_next, n, p0, S.mtp_kv, S.mtp_index, m.mtp_ws,
                                           m.mtp_status, m.tables, m.stream);
                 mark_stream(m.stream, "mtp_compute_end", k, {}, p0, n, 0);
                 if (m.cfg.export_state) {
@@ -2162,7 +2163,7 @@ std::uint32_t Prefill::Impl::prefill_enqueue(SessionState& S, const std::vector<
             const auto cnt = static_cast<std::uint32_t>(last - p0);
             for (std::uint32_t r = 0; r < cnt; ++r) next_pinned[r] = tokens[p0 + r + 1];
             ck(cudaMemcpyAsync(mtp_next, next_pinned, std::uint64_t{cnt} * 4, cudaMemcpyHostToDevice, stream), "mtp next");
-            pm::launch_mtp_cache_rows(mtp_weights(), pm::MtpRounding{}, tap, mtp_next, cnt, p0, S.mtp_kv, S.mtp_index, mtp_ws,
+            pm::launch_mtp_cache_rows(mtp_weights(), pm::MtpRounding{.mma = cfg.forms.mtp_mma}, tap, mtp_next, cnt, p0, S.mtp_kv, S.mtp_index, mtp_ws,
                                       mtp_status, tables, stream);
         }
     }
