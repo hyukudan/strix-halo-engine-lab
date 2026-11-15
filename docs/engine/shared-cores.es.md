@@ -53,7 +53,12 @@ FP16 para lotes de filas de prefill sobre WMMA. Es de clase FAST: las activacion
 WMMA por mosaico desde +0 con k ascendente. Encima viven políticas con nombre. La política `dense-q8a8-f16-v1`
 ([`f16_dense_q8a8.hpp`](../../src/core/f16_dense_q8a8.hpp), espacio de nombres `strix::core::f16_dense_tall::q8a8`)
 calcula pesos Q8_0 x activaciones A8 como una cadena FP16 por salida en lugar de los productos enteros exactos;
-DeepSeek V4.1 la enlaza (ejemplo abajo).
+DeepSeek V4.1 la enlaza (ejemplo abajo). El rasgo opcional `kColumnFast` pone los bloques de columnas en `grid.x`:
+los CTA de un bloque de filas comparten x en L2 (mismos bits). La proyección de índice FAST de MiniMax
+`minimax-index-proj-wmma-v1` ([`src/minimax/attn/index_proj.hpp`](../../src/minimax/attn/index_proj.hpp)) enlaza el
+núcleo con `stage()` leyendo sus pesos empaquetados y, desde 2.048 filas, x redondeada antes en mosaicos FP16 por
+k. Kit: `STRIX_MMATTN_BENCH=wmma` en `src/minimax/attn/index_proj_tests.hip` (ABAB estricto, series `x16` / `diag` /
+`orders` en `STRIX_MMATTN_WMMA_SERIES`; línea de compilación en la cabecera del archivo).
 
 **Núcleo en mosaico y bucles enteros** ([`src/core/tiled_core.hpp`](../../src/core/tiled_core.hpp)). El núcleo
 WMMA de prefill de la biblioteca, solo cabecera para que los motores lo instancien con sus adaptadores en lugar de

@@ -52,7 +52,12 @@ prefill row batches on WMMA. It is FAST class: activations are rounded to FP16, 
 ascending k. Named policies sit on top of it. The policy `dense-q8a8-f16-v1`
 ([`f16_dense_q8a8.hpp`](../../src/core/f16_dense_q8a8.hpp), namespace `strix::core::f16_dense_tall::q8a8`) runs
 Q8_0 weights x A8 activations as one FP16 chain per output instead of the exact integer products; DeepSeek V4.1
-binds it (worked example below).
+binds it (worked example below). The optional `kColumnFast` trait puts the column blocks on `grid.x`, so the CTAs
+of one row block share x in L2 (same bits). MiniMax's FAST index projection `minimax-index-proj-wmma-v1`
+([`src/minimax/attn/index_proj.hpp`](../../src/minimax/attn/index_proj.hpp)) binds the core with `stage()` reading its
+packed weights and, from 2,048 rows, x pre-rounded into k-tile-major FP16 tiles. Kit:
+`STRIX_MMATTN_BENCH=wmma` on `src/minimax/attn/index_proj_tests.hip` (strict ABAB, series `x16` / `diag` / `orders`
+in `STRIX_MMATTN_WMMA_SERIES`; build line in the file header).
 
 **Tiled core and integer mainloops** ([`src/core/tiled_core.hpp`](../../src/core/tiled_core.hpp)). The library
 WMMA prefill core, header-only so that engines instantiate it with their own adapters instead of keeping private

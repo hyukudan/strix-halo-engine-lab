@@ -499,6 +499,11 @@ void enqueue_index_proj_wmma_x16(const IndexProjView& v, _Float16* xt, hipStream
                        static_cast<const _Float16*>(xt));
     hip_check(hipGetLastError(), "index_proj wmma x16");
 }
+bool index_proj_fast_tiles(unsigned rows) { return rows >= kFastTilesRows; }
+void enqueue_index_proj_fast(const IndexProjView& v, _Float16* xt, hipStream_t stream) {
+    if (index_proj_fast_tiles(v.rows)) enqueue_index_proj_wmma_x16(v, xt, stream);
+    else enqueue_index_proj_wmma(v, stream);
+}
 void enqueue_index_proj_wmma_diag(const IndexProjView& v, int mode, hipStream_t stream) {
     if (v.rows == 0 || static_cast<std::uint64_t>(v.rows) * kProjIn * 4U >= (std::uint64_t{1} << 32U))
         throw std::invalid_argument("index_proj wmma diag: rows must be 1 .. 174762");

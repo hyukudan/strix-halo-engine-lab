@@ -54,6 +54,18 @@ void enqueue_index_proj_wmma(const IndexProjView& v, hipStream_t stream, unsigne
 // read 16 KB contiguous per stage instead of 128 rows 24 KB apart). convert = false reuses xt as already written
 // (bench: the cost a producer that writes the tiles itself would leave).
 void enqueue_index_proj_wmma_x16(const IndexProjView& v, _Float16* xt, hipStream_t stream, bool convert = true);
+// The FAST entry (minimax-index-proj-wmma-v1, both forms the same bits): the x16 tiles form from kFastTilesRows rows,
+// the direct form below (strict ABAB x3, 60 layers' weights rotated, 11-15, gfxclk ~2.4 GHz, us per call:
+//   rows   exact slab   direct   x16 (convert + wmma)   x16 wmma alone
+//   1024        686        203        274                   151
+//   2048       1659        953        634                   307
+//   4096       2758       1716       1234                   529
+//   8192       5072       3058       2449                  1062
+// ; the 1024-row direct figure keeps x (25 MB) in the 32 MB MALL across the bench's calls). xt: rows x 6144 FP16 when
+// index_proj_fast_tiles(rows), else unused (may be null).
+inline constexpr unsigned kFastTilesRows = 2048;
+bool index_proj_fast_tiles(unsigned rows);
+void enqueue_index_proj_fast(const IndexProjView& v, _Float16* xt, hipStream_t stream);
 // Diagnostics of the tc 4 kernel (bench only): 1 = x rows taken modulo 128 (x stays in cache; wrong outputs),
 // 2 = the same kernel capped at 192 VGPRs (2 CTAs per CU; same bits as enqueue_index_proj_wmma), 3 = only the first
 // column block (outputs 0..63: x read exactly once, 1/6 of the products).

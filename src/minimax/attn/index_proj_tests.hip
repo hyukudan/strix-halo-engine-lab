@@ -2,7 +2,10 @@
 // equal to the gate's dense_t (FP32 transposed weights) and to the engine's dense_t16 (both copied below verbatim from
 // src/minimax/engine/mm_kernels.hpp at minimax/engine f2f84f43), decode rows 1..8 x ring 8/16/32 and the tiled
 // prefill kernel at ragged token counts. STRIX_MMATTN_BENCH=1 adds ABA x3 timings with the weights of 60 layers
-// rotated (cold, like the real layer loop).
+// rotated (cold, like the real layer loop). FAST minimax-index-proj-wmma-v1: contract / drift / same-bits checks
+// always; STRIX_MMATTN_BENCH=wmma its strict ABAB bench (STRIX_MMATTN_WMMA_SERIES = x16 | diag | orders).
+// Build (gfx1151): clang++ -x hip --offload-arch=gfx1151 -mno-wavefrontsize64 --rocm-path=<rocm> -O3 -std=c++20
+//   -Isrc -Iinclude --hip-link src/minimax/attn/index_proj.hip src/minimax/attn/index_proj_tests.hip -o index-proj-tests
 #include "index_proj.hpp"
 
 #include <algorithm>
@@ -272,15 +275,16 @@ void wmma_tests(std::mt19937& rng) {
                 std::fprintf(stderr, "FAIL: wmma rows %u tc %u rows_fast %d guard %d finite %d\n", rows, tc, int(rows_fast), int(guard), int(finite));
             }
         }
-        for (int form = 0; form < 2; ++form) {  // the 192-VGPR form and the x16 tiles form: same bits as tc 4
+        for (int form = 0; form < 3; ++form) {  // the 192-VGPR form, the x16 tiles form and the FAST entry: same bits as tc 4
             hip_ok(hipMemset(iq, 0xFF, nq * 4), "memset");
             hip_ok(hipMemset(ik, 0xFF, nk * 4), "memset");
             if (form == 0) ma::enqueue_index_proj_wmma_diag({x, w.packed, iq, ik, rows}, 2, nullptr);
-            else ma::enqueue_index_proj_wmma_x16({x, w.packed, iq, ik, rows}, xt, nullptr);
+            else if (form == 1) ma::enqueue_index_proj_wmma_x16({x, w.packed, iq, ik, rows}, xt, nullptr);
+            else ma::enqueue_index_proj_fast({x, w.packed, iq, ik, rows}, xt, nullptr);
             hip_ok(hipDeviceSynchronize(), "sync");
             if (host(iq, first_q.size()) != first_q || host(ik, first_k.size()) != first_k) {
                 ++g_fail;
-                std::fprintf(stderr, "FAIL: wmma rows %u %s form differs from tc 4\n", rows, form == 0 ? "192-VGPR" : "x16");
+                std::fprintf(stderr, "FAIL: wmma rows %u %s form differs from tc 4\n", rows, form == 0 ? "192-VGPR" : form == 1 ? "x16" : "fast entry");
             }
         }
     }
