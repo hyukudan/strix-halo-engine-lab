@@ -752,6 +752,8 @@ struct CudaPrefill::Impl {
     double dense_gib = 0.0, used_before_experts_gib = 0.0, free_at_plan_gib = 0.0, expert_budget_gib = 0.0;
     std::vector<std::uint32_t> resident_experts;       // [layer] (streamer)
     std::string residency_plan;                        // how the per-expert plan was found (rows / even / even-1slot)
+    std::string host_pin_reason;                       // why the host pin order is what it is (resolve_host_pin_order)
+    double host_pin_layer_file_bytes = -1.0;           // auto: bytes the layer order would stream from the file
     std::vector<ExpertTier> tiers;
     std::unique_ptr<deepseek41::TargetModel> model;
     std::vector<EngramTable> engram_tables;
@@ -1399,8 +1401,15 @@ CudaPrefill::CudaPrefill(const std::filesystem::path& gguf, const CudaPrefillOpt
     auto& o = m.o;
     require(valid_host_pin_policy(o.host_commit_floor_gib, o.host_pin_wait_s), "host floor/wait must be finite and nonnegative");
     require(o.host_pin_order == HostPinOrder::layer || o.host_pin_order == HostPinOrder::deadline || o.host_pin_order == HostPinOrder::early ||
-                o.host_pin_order == HostPinOrder::interleave, "host pin order layer, deadline, early or interleave");
-    require(o.file_ring_mib >= 128U, "file ring of at least 128 MiB (two 64 MiB pages)");
+                o.host_pin_order == HostPinOrder::interleave || o.host_pin_order == HostPinOrder::automatic,
+            "host pin order auto, layer, deadline, early or interleave");
+    if (o.host_pin_order != HostPinOrder::automatic) {  // automatic resolves where the streamed bytes are known
+        const auto pick = resolve_host_pin_order(o.host_pin_order, {}, o.host_expert_gib, -1.0, o.file_ring_mib, o.slots);
+        o.host_expert_gib = pick.host_gib;
+        o.file_ring_mib = pick.ring_mib;
+        m.host_pin_reason = pick.reason;
+    }
+    require(o.file_ring_mib == 0U || o.file_ring_mib >= 128U, "file ring of at least 128 MiB (two 64 MiB pages)");
     if (o.decode_only) o.pass_rows = 0;
     if (o.pass_rows != 0U) {
         require(o.max_positions > 0U && o.max_positions <= 2097152U, "long context capacity 1..2M");
@@ -1694,7 +1703,14 @@ CudaPrefill::CudaPrefill(const std::filesystem::path& gguf, const CudaPrefillOpt
         }
         m.expert_budget_gib = o.device_expert_gib;
     }
+    const auto host_pin_fallback = [&](const char* reason) {  // automatic outside the measured streamer path: layer
+        if (o.host_pin_order != HostPinOrder::automatic) return;
+        o.host_pin_order = HostPinOrder::layer;
+        o.file_ring_mib = kLegacyFileRingMib;
+        m.host_pin_reason = reason;
+    };
     if (!use_streamer) {
+        host_pin_fallback("whole-layer expert provider: layer (not measured)");
         m.tiers = o.tiers.empty() ? default_tiers(o, c.num_hidden_layers, layer_bytes) : o.tiers;
         require(m.tiers.size() >= o.end_layer, "tiers cover the layer range");
         m.experts = std::make_unique<ExpertProvider>(*m.reader, extents, m.tiers, o.first_layer, o.end_layer, o.slots, m.st, o.host_alias_layers,
@@ -1770,6 +1786,21 @@ CudaPrefill::CudaPrefill(const std::filesystem::path& gguf, const CudaPrefillOpt
                 }
             }
             m.residency_plan = plan_note;
+            if (o.host_pin_order == HostPinOrder::automatic) {
+                // before the legacy budget below: the chosen order's budget (interleave: minus its ring) is the one measured
+                std::vector<std::uint64_t> streamed(o.end_layer, 0);
+                for (std::uint32_t l = o.first_layer; l < o.end_layer; ++l)
+                    streamed[l] = static_cast<std::uint64_t>(s[l - o.first_layer]) * static_cast<std::uint64_t>(expert_bytes);
+                const auto room = ds41::host_memory_room();
+                const double pinnable = room.known ? std::max(0.0, double(room.free_physical) - o.host_commit_floor_gib * double(1ULL << 30)) : -1.0;
+                const auto pick = resolve_host_pin_order(o.host_pin_order, streamed, o.host_expert_gib, pinnable, o.file_ring_mib, sp.slots);
+                o.host_pin_order = pick.order;
+                o.host_expert_gib = pick.host_gib;
+                o.file_ring_mib = pick.ring_mib;
+                sp.staging_pages = std::max<std::uint32_t>(2U, o.file_ring_mib / 64U);
+                m.host_pin_reason = pick.reason;
+                m.host_pin_layer_file_bytes = pick.layer_file_bytes;
+            }
             const auto rank = expert_ranking(o.expert_rank, c.num_hidden_layers, E);
             double host_left = o.host_expert_gib * double(1ULL << 30);
             for (std::uint32_t l = o.first_layer; l < o.end_layer; ++l) {
@@ -1809,6 +1840,10 @@ CudaPrefill::CudaPrefill(const std::filesystem::path& gguf, const CudaPrefillOpt
             m.tiers.assign(c.num_hidden_layers, ExpertTier::device);
             for (std::uint32_t l = o.first_layer; l < o.end_layer; ++l)
                 m.tiers[l] = sp.resident[l] == E ? ExpertTier::device : sp.stream_tier[l];
+        }
+        if (o.host_pin_order == HostPinOrder::automatic) {
+            host_pin_fallback("whole-layer streamer: layer (not measured)");
+            sp.staging_pages = std::max<std::uint32_t>(2U, o.file_ring_mib / 64U);
         }
         m.resident_experts = sp.resident;
         m.streamer = std::make_unique<detail::ExpertStreamer>(*m.reader, std::move(sp));
@@ -1937,6 +1972,8 @@ std::string CudaPrefill::weight_io_fields() const {
     return json == "null" ? std::string() : ",\"weight_io\":" + json;
 }
 
+const CudaPrefillOptions& CudaPrefill::effective_options() const { return impl_->o; }
+
 std::string CudaPrefill::describe() const {
     const auto& m = *impl_;
     std::ostringstream s;
@@ -2008,7 +2045,9 @@ std::string CudaPrefill::describe() const {
     const auto room = ds41::host_memory_room();
     s << "],\"host_free_physical_bytes\":" << (room.known ? std::to_string(room.free_physical) : "\"unknown\"")
       << ",\"host_free_commit_bytes\":" << (room.known ? std::to_string(room.free_commit) : "\"unknown\"");
-    s << ",\"host_pin_order\":\"" << host_pin_order_name(m.o.host_pin_order) << "\",\"host_layers\":[";
+    s << ",\"host_pin_order\":\"" << host_pin_order_name(m.o.host_pin_order) << "\",\"host_pin_reason\":\"" << m.host_pin_reason
+      << "\",\"host_pin_layer_file_bytes\":" << m.host_pin_layer_file_bytes << ",\"file_ring_mib\":" << m.o.file_ring_mib
+      << ",\"host_layers\":[";
     bool first_host = true;
     for (std::uint32_t l = m.o.first_layer; l < m.o.end_layer; ++l) {
         if (m.run_tiers[l] != ExpertTier::host) continue;

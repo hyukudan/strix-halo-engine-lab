@@ -110,5 +110,36 @@ int main() {
         check(used <= budget && used >= budget - double(rtx[2]));
         check(file_before_host);
     }
+    {   // the file ring: auto under interleave comes out of the budget (equal pinned RAM); explicit or other orders add
+        const auto a = resolve_file_ring(HostPinOrder::interleave, 68.0, 0, 2);
+        check(a.host_gib == 64.0 && a.ring_mib == kInterleaveFileRingMib);
+        const auto again = resolve_file_ring(HostPinOrder::interleave, a.host_gib, a.ring_mib, 2);  // idempotent
+        check(again.host_gib == 64.0 && again.ring_mib == kInterleaveFileRingMib);
+        const auto off = resolve_file_ring(HostPinOrder::layer, 68.0, 0, 2);
+        check(off.host_gib == 68.0 && off.ring_mib == kLegacyFileRingMib);
+        const auto small = resolve_file_ring(HostPinOrder::interleave, 6.0, 0, 2);
+        check(small.host_gib == 6.0 && small.ring_mib == kLegacyFileRingMib);
+        const auto no_slots = resolve_file_ring(HostPinOrder::interleave, 68.0, 0, 0);
+        check(no_slots.host_gib == 68.0 && no_slots.ring_mib == kLegacyFileRingMib);
+        const auto explicit_ring = resolve_file_ring(HostPinOrder::interleave, 64.0, 4096, 2);
+        check(explicit_ring.host_gib == 64.0 && explicit_ring.ring_mib == 4096);
+    }
+    {   // automatic: the measured decision table (layer-order file tier F = streamed - pinnable, crossover 10 GB)
+        std::vector<std::uint64_t> streamed(40, 0);
+        for (std::size_t l = 0; l < 20; ++l) streamed[l] = 3'690'000'000ULL;  // 73.8 GB streamed
+        const double gib = double(1ULL << 30);
+        const auto big = resolve_host_pin_order(HostPinOrder::automatic, streamed, 68.0, 57.9 * gib, 0, 2);   // F ~11.6 GB
+        check(big.order == HostPinOrder::interleave && big.host_gib == 64.0 && big.ring_mib == kInterleaveFileRingMib);
+        check(big.layer_file_bytes > 10e9);
+        const auto small = resolve_host_pin_order(HostPinOrder::automatic, streamed, 68.0, 80.0 * gib, 0, 2);  // F = 73.8 - 73.0
+        check(small.order == HostPinOrder::layer && small.host_gib == 68.0 && small.ring_mib == kLegacyFileRingMib);
+        const auto unknown = resolve_host_pin_order(HostPinOrder::automatic, streamed, 56.0, -1.0, 0, 2);     // F = 73.8 - 60.1
+        check(unknown.order == HostPinOrder::interleave);
+        const auto forced = resolve_host_pin_order(HostPinOrder::layer, streamed, 56.0, -1.0, 0, 2);
+        check(forced.order == HostPinOrder::layer && forced.ring_mib == kLegacyFileRingMib && forced.layer_file_bytes < 0.0);
+        const auto none = resolve_host_pin_order(HostPinOrder::automatic, streamed, 68.0, 1.0 * gib, 0, 0);
+        check(none.order == HostPinOrder::layer);
+        check(parse_host_pin_order("auto") == HostPinOrder::automatic);
+    }
     std::puts("host pin plan checks pass");
 }
