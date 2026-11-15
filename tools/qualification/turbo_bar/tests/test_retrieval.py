@@ -39,6 +39,12 @@ class RetrievalTests(unittest.TestCase):
         self.assertEqual(len({(x["mode"], x["concurrency"], x["cut"]) for x in items if x["length"] == 2048}), 8)
         self.assertEqual(sum(1 for x in items if x["primary"]), 12)
 
+    def test_single_interior_boundary(self):
+        # length = 2 chunks has exactly one interior boundary (the 8K / 4096 pilot case).
+        items = retrieval.build([(1024, 2)], 512)
+        self.assertTrue(items)
+        self.assertTrue(all(x["length"] == 1024 for x in items))
+
 
 if __name__ == "__main__":
     unittest.main()

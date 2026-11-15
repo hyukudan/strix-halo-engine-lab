@@ -45,7 +45,9 @@ def make_case(seed, length, mode, conc, cut, chunk, cmd=None, cpt=4.0, template_
     base = list(g["parts"])
     base[g["needle_idx"]] = tasks._filler(rng, [n for n, _ in others[:20]] or ["Rune Falk"])
     nb = max(2, length // chunk)
-    k = tasks._seed("retrieval-boundary", seed, length).randint(1, nb - 2)
+    # Interior boundaries are k * chunk for k = 1 .. nb - 1 (8K with 4096-token chunks has exactly one);
+    # the mid-chunk control at boundary + chunk / 2 then stays inside the context.
+    k = tasks._seed("retrieval-boundary", seed, length).randint(1, max(1, nb - 1))
     boundary = k * chunk
     desired = boundary - rec_tokens // 2 if cut == "straddle" else boundary + chunk // 2 - rec_tokens // 2
     desired -= template_offset
