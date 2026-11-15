@@ -1,7 +1,7 @@
 #include "strix/deepseek41_batch_dspark.hpp"
 
 #include "strix/ds41_dspark_vocab.hpp"
-#include "strix/env_flags.hpp"
+#include "strix/deepseek41_pair_defaults.hpp"
 #include "strix/hip_check.hpp"
 
 #include <hip/hip_runtime.h>
@@ -133,8 +133,9 @@ BatchSpeculator::BatchSpeculator(BatchForward& target, ds::DeviceDrafter& drafte
             lookup_capacity_ = static_cast<std::uint32_t>(std::clamp(std::atof(v), 64.0, 4194304.0));
         // spec.copy_rows (6 = today, 8 = one request's maximum segment) and spec.arbiter.ds41 (shared source arbiter at
         // one decoding request); registered for the effective config, the same for every entry point of this speculator
-        copy_drafts_ = ::strix::envcfg::choice("STRIX_DS41_COPY_ROWS", {"6", "8"}, 0) == 1 ? max_copy_drafts : ds::block_size;
-        arbiter_on_ = ::strix::envcfg::flag("STRIX_DS41_SPEC_ARBITER", false);
+        const auto settings = pair_defaults::resolve_dspark_settings();
+        copy_drafts_ = settings.copy_rows8 ? max_copy_drafts : ds::block_size;
+        arbiter_on_ = settings.arbiter;
     }
     S.context.resize(slots);
     check(hipMalloc(reinterpret_cast<void**>(&S.staging), std::size_t{slots} * stage_rows * ds::main_width * sizeof(float)), "staging");

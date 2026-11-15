@@ -423,6 +423,13 @@ std::string describe(App app, const Resolved& r) {
     return o.str();
 }
 
+DsparkSettings resolve_dspark_settings() {
+    const bool copy_rows8 = ::strix::envcfg::choice("STRIX_DS41_COPY_ROWS", {"6", "8"}, 0) == 1;
+    // Report the row count rather than envcfg::choice's internal choice index.
+    ::strix::envcfg::record("STRIX_DS41_COPY_ROWS", std::getenv("STRIX_DS41_COPY_ROWS"), copy_rows8 ? "8" : "6");
+    return {copy_rows8, ::strix::envcfg::flag("STRIX_DS41_SPEC_ARBITER", false)};
+}
+
 Effective::Effective(App app, int& argc, char**& argv, const Build& build) {
     std::vector<std::string> in(argv + 1, argv + argc);
     Probe probe;
@@ -486,6 +493,7 @@ Effective::Effective(App app, int& argc, char**& argv, const Build& build) {
     profile_json_storage() = r.profile ? r.profile->json() : std::string();
     profile_storage() = r.profile;
     if (r.print_only) {
+        (void)resolve_dspark_settings();
         std::cout << describe(app, r) << ::strix::envcfg::describe();
         std::cout.flush();
         std::exit(0);

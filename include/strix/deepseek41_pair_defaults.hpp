@@ -49,6 +49,14 @@ namespace strix::deepseek41::pair_defaults {
 
 enum class App { rank, batch, prefill, serve };
 
+struct DsparkSettings {
+    bool copy_rows8 = false;
+    bool arbiter = false;
+};
+// Device-independent switch registration, also used before inspection exits.
+// Lookup admission still controls whether BatchSpeculator applies these settings.
+DsparkSettings resolve_dspark_settings();
+
 struct Build {
     bool trellis_dense_r1 = false;  // linked against a trellis library with the dense-r1 API (STRIX_DS41_TRELLIS_API)
 };
