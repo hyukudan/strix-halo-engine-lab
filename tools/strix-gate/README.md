@@ -242,13 +242,15 @@ prompts and reference) the candidate must pass all of (`MM_FLOOR` in the script)
 |---|---|
 | `kl`, `top1` | pooled KL <= mean + 2 sd of the nulls; top-1 >= mean - 2 sd |
 | `dnll` | pooled dNLL <= min(mean + 2 sd, 0.03): a wide floor never relaxes the bar past 3 x 0.01 |
-| `kl_q50`, `kl_q90`, `kl_q99` | each per-row KL quantile <= mean + 2 sd of the nulls' same quantile (a diffuse shift cannot hide under heavy null tails) |
+| `kl_q50`, `kl_q90`, `kl_q99` | each per-row KL quantile <= max(mean + 2 sd of the nulls' same quantile, tolerance 1e-3 / 0.02 / 0.02): a diffuse shift cannot hide under heavy null tails, and a one-ulp null's median row (rounding only, KL ~1e-5) does not demand bitwise arithmetic |
 | `sign` | rows with abs(dNLL) >= 1e-3: one-sided binomial P(X >= worse) >= 0.01 against p0 = max(0.5, pooled null worse share); more chaos adds rows, not slack |
 | `copy` | copy rows (the last 8 prompt tokens occurred earlier and were followed by the true token; token-only, the same rows for every arm): next-token misses beyond the reference's <= worst null + max(1, ceil(1 %)) |
 
 The absolute KL / top-1 / dNLL verdict is printed and stored (`pooled.abs_pass`) as a reference.
-The candidate must differ from the reference only in its FAST layer set: its `base_config_sha256`
-(numerical configuration without the MSA flash lever and switches) must equal the reference's.
+The candidate must differ from the reference only in its FAST layer set: every receipt lever other
+than `minimax.msa_flash` must be equal, and so must every switch both runs consulted, except the MSA
+flash switches (a receipt lists only the switches its code path read before it was printed, so a
+flash run lists more than an exact one).
 Mean + 2 sd of three controls is a policy threshold, not a bound: a candidate drawn exactly like
 the nulls fails one such check about 11 % of the time (t with 2 degrees of freedom).
 
@@ -266,7 +268,7 @@ rank's process route receipt (`strix-route-receipt {...}`): engine; profile `exa
 off, EXL3, default prefill identity), `fast-prefill` (MSA flash on, otherwise the same) or
 `other`; `fast` = MSA flash mode (10 + `STRIX_MM_PF_MSA_FLASH`: 11 one-term, 12 two-term) and
 layers; `numerical_config_sha256` over the effective levers and switch set without output-only
-switches; `base_config_sha256` the same without the MSA flash lever and switches. The control
+switches, and `config` = those levers and switches (for the comparison above). The control
 comes only from the engine's own null-control lines (`DIAG attn ulp: layer L seed S ...`, a lab
 diagnostic build): one layer and seed, at least one event per prompt, otherwise refused.
 `model_sha256` is the ordered model bundle without re-reading tensor payloads: every file's path

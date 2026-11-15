@@ -73,15 +73,18 @@ WITNESS_SCHEMA = "strix-fast-execution/v1"
 DS41_NULL_CONTROL = {"kind": "layer0-null", "layer": 0, "magnitude": 1, "unit": "ulp"}
 MM_NULL_KIND = "attn-ulp-null"  # MiniMax null control: {"kind", "layer", "magnitude": 1, "unit": "ulp", "seed"}
 MM_FLOOR = {
-    "policy": "minimax-onset-floor-v1",
+    "policy": "minimax-onset-floor-v1.1",
     "dnll_cap": 0.03,                   # the floor-relative dNLL limit never exceeds 3 x the absolute 0.01
-    "kl_quantiles": (0.5, 0.9, 0.99),   # per-row KL quantiles: mu + 2 sd of the nulls' same quantile
+    "kl_quantiles": (0.5, 0.9, 0.99),   # per-row KL quantiles: max(mu + 2 sd of the nulls' same quantile, tolerance)
+    # v1.1: a quantile limit is never below these (nats). A one-ulp null's median row only carries rounding (KL ~1e-5,
+    # sd ~1e-6), so a purely relative q50 demands bitwise arithmetic; 1e-3 = 1/20 of the absolute mean bar 0.02 still
+    # catches a diffuse defect, and q90 / q99 are never held stricter than the absolute mean bar.
+    "kl_quantile_tol": {"q50": 1e-3, "q90": 0.02, "q99": 0.02},
     "sign_min_abs": 1e-3,               # rows with |dNLL| >= this (nats) enter the sign test
     "sign_alpha": 0.01,                 # one-sided binomial P(X >= worse) vs p0 = max(0.5, pooled null worse share)
     "copy_k": 8,                        # copy row: the last k prompt tokens occurred before, followed by the true token
     "copy_slack_frac": 0.01,            # copy-row extra misses <= worst null + max(1, ceil(1 % of the copy rows))
 }
-HEX64 = re.compile(r"[0-9a-f]{64}")
 
 
 def is_int(v):
@@ -117,10 +120,26 @@ def execution_witness(doc):
     if "control" not in w or (w["control"] is not None and not isinstance(w["control"], dict)):
         raise GateError("execution witness: missing or invalid control identity")
     check_fast_block(w.get("fast"))
-    base = w.get("base_config_sha256")
-    if base is not None and (not isinstance(base, str) or not HEX64.fullmatch(base)):
-        raise GateError("execution witness: invalid base_config_sha256")
+    cfg = w.get("config")
+    if cfg is not None and (not isinstance(cfg, dict) or sorted(cfg) != ["levers", "switches"] or not all(
+            isinstance(cfg[k], dict) and all(isinstance(a, str) and isinstance(b, str) for a, b in cfg[k].items())
+            for k in cfg)):
+        raise GateError("execution witness: invalid config (levers / switches maps of strings)")
     return w
+
+
+def config_difference(ref, cand):
+    """First lever or switch, outside the FAST layer set's own, where two witnessed configurations disagree: levers must
+    match exactly; switches are compared where both runs consulted them (a receipt lists only the switches its code path
+    read before it was printed, so a flash run lists more than an exact one). None = they agree."""
+    lr, lc = ({k: v for k, v in c["levers"].items() if k not in MM_FAST_LEVERS} for c in (ref, cand))
+    if lr != lc:
+        return "lever " + next(k for k in sorted(set(lr) | set(lc)) if lr.get(k) != lc.get(k))
+    sr, sc = ref["switches"], cand["switches"]
+    for k in sorted(set(sr) & set(sc) - MM_FAST_SWITCHES):
+        if sr[k] != sc[k]:
+            return f"switch {k}={sr[k]!r} vs {sc[k]!r}"
+    return None
 
 
 def null_control_ok(engine, control, onset):
@@ -148,9 +167,11 @@ def check_floor_execution(ref, cand, nulls, engine, profile):
         if engine == "minimax":
             if wc.get("fast") is None or wr.get("fast") is not None:
                 raise GateError("minimax floor: the candidate must witness its FAST layer set and the reference none")
-            if wr.get("base_config_sha256") is None or wc.get("base_config_sha256") != wr["base_config_sha256"]:
-                raise GateError("minimax floor: the candidate differs from the reference beyond its FAST layer set "
-                                "(base_config_sha256)")
+            if wr.get("config") is None or wc.get("config") is None:
+                raise GateError("minimax floor: reference and candidate must witness their configuration (config)")
+            diff = config_difference(wr["config"], wc["config"])
+            if diff is not None:
+                raise GateError(f"minimax floor: the candidate differs from the reference beyond its FAST layer set ({diff})")
             onset = wc["fast"]["layers"][0]
         for _, mn in nulls:
             wn = execution_witness(mn[i])
@@ -287,7 +308,9 @@ def minimax_floor_checks(c, nulls, policy=MM_FLOOR):
     add("dnll", c["dnll"], limit, c["dnll"] <= limit, mean=m, sd=s, floor=m + k * s, cap=policy["dnll_cap"])
     for q in c["kl_q"]:
         m, s = mean_sd([n["kl_q"][q] for n in nulls])
-        add(f"kl_{q}", c["kl_q"][q], m + k * s, c["kl_q"][q] <= m + k * s, mean=m, sd=s)
+        tol = policy["kl_quantile_tol"].get(q, 0.0)
+        limit = max(m + k * s, tol)
+        add(f"kl_{q}", c["kl_q"][q], limit, c["kl_q"][q] <= limit, mean=m, sd=s, floor=m + k * s, tol=tol)
     nw, nc = sum(n["worse"] for n in nulls), sum(n["worse"] + n["better"] for n in nulls)
     p0 = max(0.5, nw / nc) if nc else 0.5
     changed = c["worse"] + c["better"]
@@ -421,7 +444,7 @@ RECEIPT_PREFIX = "strix-route-receipt "
 # Switches that only name outputs or the control: excluded from the numerical configuration identity.
 MM_OUTPUT_SWITCHES = frozenset({"STRIX_MM_QUALITY_OUT", "STRIX_MM_QUALITY_ROWS", "STRIX_MM_QUALITY_SELECT", "STRIX_MM_STATE_FNV",
                                 "STRIX_MM_DIAG_ATTN_ULP"})
-# The FAST layer set's own lever and switches: removed for base_config_sha256 (candidate == reference + this layer set).
+# The FAST layer set's own lever and switches: ignored by config_difference (candidate == reference + this layer set).
 MM_FAST_SWITCHES = frozenset({"STRIX_MM_PF_MSA_FLASH", "STRIX_MM_PF_MSA_FLASH_LAYERS", "STRIX_MM_FAST_PREFILL"})
 MM_FAST_LEVERS = frozenset({"minimax.msa_flash"})
 MM_DIAG = re.compile(rb"^DIAG attn ulp: layer (\d+) seed (\d+) rows (\d+) pos0 (\d+) values (\d+)\s*$", re.M)
@@ -507,8 +530,6 @@ def minimax_execution(log, rank, n_prompts):
         fast = {"policy": "msa-flash", "msa_flash_mode": 10 + int(m.group(1)), "layers": layers}
     plain = levers["minimax.moe_prefill_format"] == "exl3" and levers["minimax.prefill_identity"] == "default"
     profile = ("fast-prefill" if fast else "exact") if plain else "other"
-    base = {"engine": "minimax", "levers": {k: v for k, v in levers.items() if k not in MM_FAST_LEVERS},
-            "switches": {k: v for k, v in sw.items() if k not in MM_FAST_SWITCHES}}
     diag = MM_DIAG.findall(log)
     control = None
     if diag:
@@ -520,7 +541,7 @@ def minimax_execution(log, rank, n_prompts):
         control = {"kind": MM_NULL_KIND, "layer": layer_set.pop(), "magnitude": 1, "unit": "ulp", "seed": seed_set.pop()}
     return {"engine": "minimax", "profile": profile, "fast": fast, "control": control,
             "numerical_config_sha256": canonical_sha({"engine": "minimax", "levers": levers, "switches": sw}),
-            "base_config_sha256": canonical_sha(base), "route_fingerprint": rc.get("fingerprint")}
+            "config": {"levers": levers, "switches": sw}, "route_fingerprint": rc.get("fingerprint")}
 
 
 WITNESS_ADAPTERS = {"minimax": minimax_execution}
@@ -574,7 +595,7 @@ def load_arm(d, ranks):
     if any("execution" in doc for doc in docs):
         witnesses = [execution_witness(doc) for doc in docs]
         for w in witnesses[1:]:
-            for key in ("engine", "profile", "model_sha256", "numerical_config_sha256", "control", "fast", "base_config_sha256"):
+            for key in ("engine", "profile", "model_sha256", "numerical_config_sha256", "control", "fast", "config"):
                 if w.get(key) != witnesses[0].get(key):
                     raise GateError(f"{d}: ranks disagree on execution {key}")
     return d, docs

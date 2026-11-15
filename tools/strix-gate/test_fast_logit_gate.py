@@ -354,8 +354,8 @@ class MiniMaxFloor(unittest.TestCase):
                           {"name": "minimax.prefill_identity", "requested": "default", "effective": "default", "reason": "selected"}],
                "switches": {"set": {"STRIX_MM_PF_MSA_FLASH": "0" if fast is None else str(fast[0] - 10), "STRIX_X": extra,
                                     "STRIX_MM_QUALITY_OUT": f"/runs/{rank}-{fast}-{extra}-{self.rng.integers(1 << 30)}/q"}}}
-        if fast is not None:
-            doc["switches"]["set"]["STRIX_MM_PF_MSA_FLASH_LAYERS"] = f"{fast[1]}-59"
+        if fast is not None:  # like the engine: the flash path consults (and lists) more switches than the exact one
+            doc["switches"]["set"].update({"STRIX_MM_PF_MSA_FLASH_LAYERS": f"{fast[1]}-59", "STRIX_MMX_MOE_WIDE": "2"})
         return "strix-route-receipt " + json.dumps(doc)
 
     def mm_arm(self, name, logits, fast=None, control=None, extra="b", log=None):
@@ -431,8 +431,12 @@ class MiniMaxFloor(unittest.TestCase):
         # output paths and the control are not numerical configuration; the FAST layer set is only outside the base
         self.assertEqual(w["e"]["numerical_config_sha256"], w["n"]["numerical_config_sha256"])
         self.assertNotEqual(w["e"]["numerical_config_sha256"], w["c"]["numerical_config_sha256"])
-        self.assertEqual(w["e"]["base_config_sha256"], w["c"]["base_config_sha256"])
-        self.assertNotEqual(w["e"]["base_config_sha256"], w["o"]["base_config_sha256"])
+        self.assertIsNone(g.config_difference(w["e"]["config"], w["c"]["config"]))
+        self.assertEqual(g.config_difference(w["e"]["config"], w["o"]["config"]), "switch STRIX_X='b' vs 'other'")
+        lev = json.loads(json.dumps(w["c"]["config"]))
+        lev["levers"]["minimax.prefill_identity"] = "fp32"
+        self.assertEqual(g.config_difference(w["e"]["config"], lev), "lever minimax.prefill_identity")
+        self.assertNotIn("STRIX_MM_QUALITY_OUT", w["e"]["config"]["switches"])
         self.assertEqual(len({x["model_sha256"] for x in w.values()}), 1)
         r0 = json.loads((c / "manifest-r0.json").read_text(encoding="utf-8"))
         self.assertEqual(r0["execution"]["prompts"], r0["prompts"])
@@ -465,7 +469,9 @@ class MiniMaxFloor(unittest.TestCase):
         d = p["dnll_rule"]
         names = [c["name"] for c in d["checks"]]
         self.assertEqual(names, ["kl", "top1", "dnll", "kl_q50", "kl_q90", "kl_q99", "sign", "copy"])
-        self.assertEqual((d["policy"], d["onset"], d["n_nulls"]), ("minimax-onset-floor-v1", 30, 3))
+        self.assertEqual((d["policy"], d["onset"], d["n_nulls"]), ("minimax-onset-floor-v1.1", 30, 3))
+        for q in d["checks"][3:6]:
+            self.assertEqual(q["limit"], max(q["floor"], q["tol"]))
         kl = [n["stats"]["kl"] for n in d["nulls"]]
         c = d["checks"][0]
         self.assertAlmostEqual(c["limit"], float(np.mean(kl) + 2 * np.std(kl, ddof=1)), places=12)
