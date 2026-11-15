@@ -18,7 +18,7 @@ import sys
 import time
 from pathlib import Path
 
-from tools.qualification.turbo_bar.common import canon_sha, read_json, sha256_file, write_json
+from tools.qualification.turbo_bar.common import canon_sha, read_json, read_jsonl, sha256_file, suite_record, write_json
 
 ARITH = ("exact", "controlled", "turbo")
 ROLES = ("E", "R", "T")
@@ -26,7 +26,7 @@ DEFAULT_PROTOCOL = {
     "checkpoint_sha256": None, "tokenizer_receipt_sha256": None, "chat_template_sha256": None,
     "contexts": [8192, 32768], "retrieval_probe_context": 131072, "seeds": [1234],
     "sampling": {"temperature": 0, "top_k": 1, "top_p": 1, "seed": 1234},
-    "corpus_sha256": None, "tasks_sha256": None,
+    "corpus_sha256": None, "tasks_sha256": None, "suites": {},
     "margins": {"kl": 0.0, "top1_disagreement": 0.0, "dnll": 0.0, "task_success": 0.0, "retrieval_success": 0.0},
     "alpha": 0.05, "bootstrap": {"B": 10000, "seed": 20240601},
 }
@@ -146,7 +146,7 @@ def validate_complete(m):
     return problems
 
 
-def freeze(path, new_version=False, reason=None):
+def freeze(path, new_version=False, reason=None, suites=None):
     m = load(path)
     if new_version:
         if not m["frozen"]:
@@ -167,6 +167,8 @@ def freeze(path, new_version=False, reason=None):
         return m
     if m["frozen"]:
         raise ManifestError("already frozen")
+    for name, items in (suites or {}).items():
+        m["protocol"]["suites"][name] = suite_record(items)
     problems = validate_complete(m)
     if problems:
         raise ManifestError("cannot freeze: " + "; ".join(problems))
@@ -244,9 +246,12 @@ def main(argv=None):
     p.add_argument("--env", action="append", default=[], metavar="K=V")
     p.add_argument("--arithmetic", choices=ARITH, default=None)
     p.add_argument("--produced-from", help="JSON: tool, args, source sha for an R built from our weights")
+    p.add_argument("--effective-route", help="JSON applied HTTP route expected in the server identity receipt")
     p = common(sub.add_parser("freeze"))
     p.add_argument("--new-version", action="store_true")
     p.add_argument("--reason")
+    p.add_argument("--tasks-items", help="JSONL suite to bind into the frozen core")
+    p.add_argument("--retrieval-items", help="JSONL suite to bind into the frozen core")
     p = common(sub.add_parser("check"))
     p.add_argument("rundir")
     common(sub.add_parser("show"))
@@ -268,9 +273,12 @@ def main(argv=None):
                            file_record(a.binary, table, hash_now), a.arg, _kv(a.env),
                            a.arithmetic or {"E": "exact", "R": "controlled", "T": "turbo"}[a.role],
                            json.loads(a.produced_from) if a.produced_from else None)
+            if a.effective_route:
+                arm["effective_route"] = json.loads(a.effective_route)
             add_arm(a.manifest, arm)
         elif a.cmd == "freeze":
-            m = freeze(a.manifest, a.new_version, a.reason)
+            suites = {k: read_jsonl(p) for k, p in (("tasks", a.tasks_items), ("retrieval", a.retrieval_items)) if p}
+            m = freeze(a.manifest, a.new_version, a.reason, suites)
             print("frozen" if m["frozen"] else f"version {m['version']} (draft; edit R, then freeze)")
             if m["frozen"]:
                 print(m["frozen"]["sha256"])

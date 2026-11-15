@@ -11,7 +11,7 @@ Tests: `python -m unittest discover -s tools/qualification/turbo_bar/tests -t .`
 | arm | meaning |
 |---|---|
 | **E** | exact route on our weights; the reference of every comparison |
-| **R** | a reference pack (a smaller pack of the same model), run with controlled/exact arithmetic. Its measured loss vs E is the **limit** TURBO may lose |
+| **R** | a reduced-precision reference pack of the same model, run with controlled/exact arithmetic. Its measured loss vs E is the **limit** TURBO may lose |
 | **T** | TURBO: speed levers on our weights; several named variants `T:<name>` |
 
 TURBO passes only when its loss vs E is bounded **below** R's loss vs E with paired 95 % confidence intervals.
@@ -31,6 +31,9 @@ temperature 0 / top_k 1 / top_p 1, corpus sha, tasks sha, margins delta per endp
   every earlier T is SUPERSEDED, and the analysis refuses to mix versions. R cannot be chosen afterwards.
 * Hashing 100 GB is optional: `--sha-from FILE` takes precomputed `sha256sum` output.
 * `check RUNDIR` compares the identities, binary and weights shas in `RUNDIR/run.json` with the frozen manifest.
+* Freeze task/retrieval inventories with `freeze --tasks-items tasks.jsonl --retrieval-items retrieval.jsonl`.
+  These bind every item, hidden check, split and matrix cell into the core. Old unbound scored files are refused.
+  HTTP arms also declare `add-arm --effective-route JSON`; this is part of the immutable arm specification.
 
 ## Pilot design
 
@@ -42,7 +45,7 @@ temperature 0 / top_k 1 / top_p 1, corpus sha, tasks sha, margins delta per endp
   sha256 order inside the category. The corpus sha goes in the manifest.
 * **Logits**: spread rows come from the engine's teacher-logits spool (`spool.py`, TMLLOG01/02, strict
   validation); the 256 forced continuation steps come from the option-qual runner (`--keep-logits`).
-* **Tasks** (`tasks.py`): code (13 templates, hidden unit tests run by `python -I`, 10 s), math (`ANSWER: n`),
+* **Tasks** (`tasks.py`): code (13 templates; execution currently unavailable), math (`ANSWER: n`),
   needle (key-to-value records, answer only by association), json (tool call, exact types). **32 EXPLORE and
   128 CONFIRM** items per kind, all distinct; the verdict uses CONFIRM only.
 * **Retrieval** (`retrieval.py`): needle matrix at 8192, 32768 (16 cases each) and a 131072 probe (4): prefix
@@ -61,6 +64,12 @@ CI = the wider envelope of the Student t interval and a seeded percentile bootst
 PASS iff CI_hi < limit; FAIL iff CI_lo > limit; otherwise INCONCLUSIVE with
 `n_needed = ceil(n * (halfwidth / |limit - mean|)^2)` and "enlarge sample". Fewer than 3 units is INCONCLUSIVE.
 Where a task or retrieval cell is at a ceiling for all arms, declare a positive margin before freezing.
+Retrieval first averages keys within each haystack, then gives each declared matrix cell equal weight.
+Its conservative interval averages simultaneous cell bounds (Bonferroni levels); bootstrap units within
+each cell are independent haystacks. Fewer than three haystacks in any cell remains INCONCLUSIVE.
+SEARCH parents are reported separately; only CONFIRM parents contribute to logits qualification.
+Intervals are per comparison, not a correction for repeated variant selection. Frontier selection remains
+exploratory; optional sample enlargement or confirmatory selection requires a separately predeclared protocol.
 
 ## Controls and reports
 
@@ -87,12 +96,12 @@ python -m tools.qualification.turbo_bar.corpus --out corpus --salt SALT --tokeni
 python -m tools.qualification.turbo_bar.retrieval --out retrieval.jsonl --chunk 4096 --tokenize-cmd "TOK MODEL encode"
 python -m tools.qualification.turbo_bar.manifest init --manifest M.json --model NAME --set 'corpus_sha256="..."' ...
 python -m tools.qualification.turbo_bar.manifest add-arm --manifest M.json --role E --identity ... --weight W --binary BIN
-python -m tools.qualification.turbo_bar.manifest freeze --manifest M.json
+python -m tools.qualification.turbo_bar.manifest freeze --manifest M.json --tasks-items tasks.jsonl --retrieval-items retrieval.jsonl
 python3 -m tools.qualification.turbo_bar.run_logits spread --corpus corpus --manifest M.json --bin BIN --out OUT
 python3 -m tools.qualification.turbo_bar.run_logits continuation --manifest M.json --out ARMS.json   # then option_qual.run
 python -m tools.qualification.turbo_bar.manifest check --manifest M.json OUT
-python -m tools.qualification.turbo_bar.client run --url URL --items tasks.jsonl --arm E --out res [--concurrency 8]
-python -m tools.qualification.turbo_bar.client score --items tasks.jsonl --results res
+python -m tools.qualification.turbo_bar.client run --manifest M.json --url URL --items tasks.jsonl --arm E --out res [--concurrency 8]
+python -m tools.qualification.turbo_bar.client score --manifest M.json --items tasks.jsonl --results res
 python -m tools.qualification.turbo_bar.losses layout --corpus corpus --spread OUT/spread --continuation CONT \
     --arms E,R,T:x,Erep --manifest M.json --out layout.json
 python -m tools.qualification.turbo_bar.losses analyze --layout layout.json --out losses.json
@@ -100,5 +109,30 @@ python -m tools.qualification.turbo_bar.report --manifest M.json --losses losses
     --retrieval resr --frontier F.json --out report
 ```
 
-`run_logits spread` runs one engine process per (case, arm) (`Erep` is a second E run), skips complete
-outputs, stops before `--soft-seconds` and exits 2 when it must be run again.
+`run_logits spread` currently supports Qwen only; other engines need an adapter. It runs one process
+per (case, arm) (`Erep` is a second E run), verifies weights and complete output receipts before reuse,
+stops before `--soft-seconds` and exits 2 when it must be run again. Incompatible outputs preserve the
+old run record and are refused. Existing outputs without bound receipts must be collected afresh.
+
+Qualification requires both prescribed spread positions and all 256 continuation steps. Continuation
+receipts must carry the same `output_contract` binding, payload hash and effective-route hash as spread
+receipts; the existing option-qual runner does not yet emit this adapter contract. Unbound continuation
+files are refused. Spread-only diagnostic layouts remain INCONCLUSIVE.
+
+HTTP responses must supply `strix.qualification_identity` with `identity`, `binary_sha256`, the ordered
+`weights_sha256` list and the declared `effective_route` object. Missing or mismatched identities cannot
+qualify. Retrieval additionally needs an authoritative `strix.qualification_route`: applied `mode`,
+actual `concurrency`, `cut`, `chunk`, `needle_start`, `needle_end`, and boolean `prefix_restored`.
+These are required adapter contracts, not a claim that current servers emit them. Restored cells require
+successful warm-up as well. Missing evidence is NOT-MEASURED and prevents PASS. Use `--suite retrieval`
+for both retrieval client commands. Failed requests cannot disappear from the frozen item inventory.
+
+Code scoring refuses all execution until a qualified OS sandbox backend and trusted external test
+controller are available. Isolation must exclude network access, host secrets and writable host mounts,
+enforce resource limits, and tear down the whole process tree. The controller must validate completion
+and outcomes of every case; interpreter exit status alone is insufficient. The full task suite therefore
+cannot currently qualify. Non-code diagnostics do not substitute for its missing code measurements.
+
+The K-quant reference pack retains the original block geometry and byte size: reduced precision does
+not imply smaller disk or resident memory. Synthetic round trips are not independent known-byte or
+native loader/kernel fidelity qualification; those gates remain open.

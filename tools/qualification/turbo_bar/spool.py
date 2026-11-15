@@ -35,7 +35,7 @@ def header(path):
             raise SpoolError("bad spool magic")
         version = 1 if magic == MAGIC1 else 2
         vocab, rows, count = struct.unpack("<QQQ", _exact(f, 24, "header"))
-        if not vocab or count < 2:
+        if not vocab or count < 2 or not rows or (version == 1 and rows != count - 1):
             raise SpoolError("inconsistent spool dimensions")
         expected = 32 + 4 * count + (8 * rows if version == 2 else 0) + rows * (ROW_HEAD.size + 4 * vocab) + 16
         if size < expected:
@@ -63,7 +63,8 @@ def header(path):
 
 def complete(path):
     try:
-        header(path)
+        for _ in read(path):
+            pass
         return True
     except (OSError, SpoolError):
         return False
@@ -80,6 +81,8 @@ def read(path):
             token, pos = ROW_HEAD.unpack(_exact(f, ROW_HEAD.size, "row header"))
             if pos >= len(inputs) - 1:
                 raise SpoolError("row position has no next token")
+            if sel is None and pos != r:
+                raise SpoolError("v1 row position differs from row index")
             if sel is not None and pos != int(sel[r]):
                 raise SpoolError("row position differs from selected position")
             if pos <= prev:

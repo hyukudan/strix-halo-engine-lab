@@ -28,6 +28,53 @@ def canon_sha(obj):
     return sha256_bytes(canon(obj).encode("utf-8"))
 
 
+ITEM_FIELDS = ("kind", "split", "group", "primary", "length", "mode", "concurrency", "cut", "meta")
+
+
+def unique_rows(rows):
+    out = {}
+    for r in rows:
+        if r["id"] in out:
+            raise ValueError(f"duplicate item id: {r['id']}")
+        out[r["id"]] = r
+    return out
+
+
+def suite_record(items):
+    by = unique_rows(items)
+    if not by:
+        raise ValueError("empty suite")
+    return {"sha256": canon_sha([by[k] for k in sorted(by)]),
+            "items": {k: dict({f: v[f] for f in ITEM_FIELDS if f in v}, item_sha256=canon_sha(v))
+                      for k, v in sorted(by.items())}}
+
+
+def experiment_binding(m, arm):
+    if not m.get("frozen") or arm not in m["arms"]:
+        raise ValueError("frozen manifest and current arm required")
+    return {"manifest_core_sha256": m["frozen"]["core_sha256"], "manifest_version": m["version"],
+            "arm": arm, "arm_sha256": canon_sha(m["arms"][arm])}
+
+
+def server_identity(m, arm):
+    spec = m["arms"][arm]
+    route = spec.get("effective_route")
+    if not isinstance(route, dict) or not route:
+        raise ValueError(f"{arm}: declare effective_route before collecting HTTP evidence")
+    return {"identity": spec["identity"], "binary_sha256": spec["binary"]["sha256"],
+            "weights_sha256": [w["sha256"] for w in spec["weights"]], "effective_route": route}
+
+
+def http_binding(m, arm, suite):
+    if not m:
+        raise ValueError("frozen manifest required")
+    rec = m["protocol"].get("suites", {}).get(suite)
+    if not rec:
+        raise ValueError(f"missing frozen {suite} suite")
+    return dict(experiment_binding(m, arm), suite=suite, suite_sha256=rec["sha256"],
+                server_identity=server_identity(m, arm))
+
+
 def read_json(path):
     return json.loads(Path(path).read_text(encoding="utf-8"))
 

@@ -18,7 +18,9 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from tools.qualification.turbo_bar import tasks
-from tools.qualification.turbo_bar.common import read_jsonl, safe_name, write_jsonl
+from tools.qualification.turbo_bar import manifest as mf
+from tools.qualification.turbo_bar.common import (ITEM_FIELDS, canon_sha, http_binding, read_jsonl, safe_name,
+                                                  suite_record, unique_rows, write_jsonl)
 
 
 def post(url, messages, max_tokens, seed=1234, model=None, timeout=3600.0):
@@ -34,9 +36,10 @@ def post(url, messages, max_tokens, seed=1234, model=None, timeout=3600.0):
     return data, time.perf_counter() - t0
 
 
-def one(url, arm, item, warmup=False, **kw):
+def one(url, arm, item, warmup=False, binding=None, **kw):
     rec = {"id": item["id"] + ("#warmup" if warmup else ""), "arm": arm, "group": item.get("group"), "warmup": warmup,
-           "reply": None, "usage": None, "latency_s": None, "strix": None, "error": None}
+           "reply": None, "usage": None, "latency_s": None, "strix": None, "error": None,
+           "binding": binding, "item_sha256": canon_sha(item)}
     try:
         msgs = item["warmup"] if warmup else item["messages"]
         data, dt = post(url, msgs, item["max_tokens"], **kw)
@@ -47,8 +50,13 @@ def one(url, arm, item, warmup=False, **kw):
     return rec
 
 
-def run(url, items, arm, out, concurrency=1, seed=1234, model=None, timeout=3600.0):
-    kw = dict(seed=seed, model=model, timeout=timeout)
+def run(url, items, arm, out, concurrency=1, seed=1234, model=None, timeout=3600.0, manifest=None, suite="tasks"):
+    binding = http_binding(manifest, arm, suite)
+    if suite_record(items) != manifest["protocol"]["suites"][suite]:
+        raise ValueError("items/checks differ from frozen suite")
+    if seed not in manifest["protocol"]["seeds"]:
+        raise ValueError("seed is not in frozen protocol")
+    kw = dict(seed=seed, model=model, timeout=timeout, binding=binding)
     results, groups, plain = [], {}, []
     for it in items:
         (groups.setdefault(it["group"], []) if it.get("group") else plain).append(it)
@@ -89,20 +97,65 @@ def prefix_hit(strix):
     return walk(strix) if strix else None
 
 
-def score(items, results_dir, out_dir=None):
-    by_id = {it["id"]: it for it in items}
+def route_measured(item, result, warmups):
+    if item["kind"] != "retrieval":
+        return True
+    meta = item["meta"]
+    route = (result.get("strix") or {}).get("qualification_route") or {}
+    if not meta.get("measured") or not meta.get("cut_ok"):
+        return False
+    expected = {"mode": item["mode"], "concurrency": item["concurrency"], "cut": item["cut"],
+                "chunk": meta["chunk"], "needle_start": meta["needle_start"], "needle_end": meta["needle_end"]}
+    if any(route.get(k) != v for k, v in expected.items()):
+        return False
+    if item["mode"] == "restored":
+        warm = warmups.get(item["group"], [])
+        return bool(warm and all(not w.get("error") and w.get("reply") is not None for w in warm)
+                    and route.get("prefix_restored") is True)
+    return route.get("prefix_restored") is False
+
+
+def score(items, results_dir, out_dir=None, manifest=None, suite="tasks"):
+    by_id = unique_rows(items)
+    if suite_record(items) != (manifest or {}).get("protocol", {}).get("suites", {}).get(suite):
+        raise ValueError("items/checks differ from frozen suite")
+    if any(it["kind"] == "code" for it in items):
+        tasks.require_code_sandbox()
     out_dir = Path(out_dir or results_dir)
     written = {}
     for rp in sorted(Path(results_dir).glob("results.*.jsonl")):
+        raw = read_jsonl(rp)
+        unique_rows(raw)
+        main = [r for r in raw if not r.get("warmup")]
+        if {r["id"] for r in main} != set(by_id):
+            raise ValueError("result coverage differs from frozen suite")
+        arms = {r["arm"] for r in raw}
+        if len(arms) != 1:
+            raise ValueError("mixed arms in results")
+        arm = arms.pop()
+        binding = http_binding(manifest, arm, suite)
+        warmups = {}
+        expected_warm = {it["id"] + "#warmup" for it in items if it.get("warmup")}
+        if {r["id"] for r in raw if r.get("warmup")} != expected_warm:
+            raise ValueError("warm-up coverage differs from frozen suite")
+        for r in raw:
+            key = r["id"].removesuffix("#warmup") if r.get("warmup") else r["id"]
+            if r.get("binding") != binding or r.get("item_sha256") != canon_sha(by_id[key]):
+                raise ValueError("stale result binding or changed item/check")
+            if not r.get("error") and (r.get("strix") or {}).get("qualification_identity") != binding["server_identity"]:
+                raise ValueError("missing or mismatched effective server identity")
+            if r.get("warmup"):
+                warmups.setdefault(by_id[key]["group"], []).append(r)
         rows = []
-        for r in read_jsonl(rp):
-            if r.get("warmup") or r["id"] not in by_id:
-                continue
+        for r in main:
             it = by_id[r["id"]]
             ok = bool(r.get("reply") is not None and not r.get("error") and tasks.score_item(it, r["reply"]))
             row = {"id": it["id"], "kind": it["kind"], "split": it["split"], "arm": r["arm"], "ok": int(ok),
-                   "latency_s": r.get("latency_s"), "prefix_hit": prefix_hit(r.get("strix")), "error": r.get("error")}
-            for k in ("group", "primary", "length", "mode", "concurrency", "cut"):
+                   "latency_s": r.get("latency_s"), "prefix_hit": prefix_hit(r.get("strix")), "error": r.get("error"),
+                   "binding": binding, "item_sha256": canon_sha(it), "server_identity":
+                   (r.get("strix") or {}).get("qualification_identity"),
+                   "measured": route_measured(it, r, warmups)}
+            for k in ITEM_FIELDS:
                 if k in it:
                     row[k] = it[k]
             rows.append(row)
@@ -128,13 +181,16 @@ def main(argv=None):
     s.add_argument("--items", required=True)
     s.add_argument("--results", required=True)
     s.add_argument("--out")
+    for p in (r, s):
+        p.add_argument("--manifest", required=True)
+        p.add_argument("--suite", choices=("tasks", "retrieval"), default="tasks")
     a = ap.parse_args(argv)
     items = read_jsonl(a.items)
     if a.cmd == "run":
-        res = run(a.url, items, a.arm, a.out, a.concurrency, a.seed, a.model, a.timeout)
+        res = run(a.url, items, a.arm, a.out, a.concurrency, a.seed, a.model, a.timeout, mf.load(a.manifest), a.suite)
         print(len(res), "requests;", sum(1 for x in res if x["error"]), "errors")
     else:
-        for p, (ok, n) in score(items, a.results, a.out).items():
+        for p, (ok, n) in score(items, a.results, a.out, mf.load(a.manifest), a.suite).items():
             print(f"{p}: {ok}/{n}")
     return 0
 

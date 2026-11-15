@@ -57,11 +57,11 @@ class LossTests(unittest.TestCase):
         self.assertNotEqual(res["overall"]["T:a"], "PASS")
 
     def test_prompt_ids_must_match(self):
-        z = np.zeros((1, 4), dtype=np.float32)
+        z = np.zeros((1, 8), dtype=np.float32)
         spool.write(self.tmp / "a.bin", INPUTS, [2], z)
-        spool.write(self.tmp / "b.bin", [9] + INPUTS[1:], [2], z)
+        spool.write(self.tmp / "b.bin", [7] + INPUTS[1:], [2], z)
         case = {"case": "c", "format": "spool", "files": {"a": str(self.tmp / "a.bin"), "b": str(self.tmp / "b.bin")}}
-        with self.assertRaises(ValueError):
+        with self.assertRaisesRegex(ValueError, "different prompt ids"):
             losses.case_sums(case, [("a", "b")])
 
 

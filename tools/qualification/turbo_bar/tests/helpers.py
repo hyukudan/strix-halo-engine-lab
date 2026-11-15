@@ -33,7 +33,8 @@ def make_layout(tmp, ts=("T:a",), parents=4, noise_r=0.5, noise_t=0.1, erep="exa
     arms = ["E", "R", "Erep"] + list(ts) + (["C"] if control else [])
     for p in range(parents):
         for source in ("spread", "continuation"):
-            base = rng.normal(size=(len(POSITIONS), V)).astype(np.float32) * 2
+            positions = POSITIONS if source == "spread" else list(range(8191, 8447))
+            base = rng.normal(size=(len(positions), V)).astype(np.float32) * 2
             z = {"E": base, "R": base + rng.normal(size=base.shape).astype(np.float32) * noise_r,
                  "Erep": base.copy() if erep == "exact" else base + np.float32(1e-3)}
             for t in ts:
@@ -47,11 +48,12 @@ def make_layout(tmp, ts=("T:a",), parents=4, noise_r=0.5, noise_t=0.1, erep="exa
                 if source == "spread":
                     spool.write(f, INPUTS, POSITIONS, z[a])
                 else:
-                    records.write_steps(f, [(i, POSITIONS[i], int(np.argmax(z[a][i])), INPUTS[POSITIONS[i] + 1], z[a][i])
-                                            for i in range(len(POSITIONS))])
+                    records.write_steps(f, [(i, pos, int(np.argmax(z[a][i])), INPUTS[i % len(INPUTS)], z[a][i])
+                                            for i, pos in enumerate(positions)])
                 files[a] = str(f)
             cases.append({"case": f"p{p}/{source}", "parent": f"p{p}", "category": ["code", "math"][p % 2], "length": 8192,
-                          "source": source, "format": "spool" if source == "spread" else "steps", "files": files})
+                          "source": source, "format": "spool" if source == "spread" else "steps", "files": files,
+                          "split": "CONFIRM", "expected_positions": list(positions)})
     return {"E": "E", "R": "R", "T": list(ts), "Erep": "Erep", "control": "C" if control else None, "cases": cases,
             "margins": {}, "bootstrap": {"B": 200, "seed": 1}, "manifest": {"version": 1, "core_sha256": None}}
 

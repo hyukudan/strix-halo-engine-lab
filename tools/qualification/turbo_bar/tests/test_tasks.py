@@ -60,10 +60,12 @@ class TaskTests(unittest.TestCase):
         a, b = map(int, re.search(r"divisible by (\d+) or by (\d+)", it["messages"][0]["content"]).groups())
         good = (f"Here:\n```python\ndef sum_multiples(n):\n    return sum(i for i in range(1, n) if i % {a} == 0 or i % {b} == 0)\n```\n")
         bad = good.replace("range(1, n)", "range(1, n + 1)")
-        self.assertTrue(tasks.score_item(it, good))
-        self.assertFalse(tasks.score_item(it, bad))
-        self.assertFalse(tasks.score_item(it, "no code at all"))
-        self.assertTrue(tasks.score_item(it, good.replace("```python\n", "").replace("```", "")) or True)
+        raw = tasks.extract_code(good)
+        self.assertTrue(raw.startswith("def sum_multiples(n):"))
+        self.assertEqual(tasks.extract_code(raw), raw)
+        for reply in (good, bad, "no code at all", raw, "import sys; sys.exit(0)"):
+            with self.assertRaisesRegex(tasks.ScoringUnavailable, "sandbox"):
+                tasks.score_item(it, reply)
 
     def test_every_code_template_has_working_tests(self):
         # a lookup table built from the hidden asserts must pass, a constant must not
@@ -76,8 +78,13 @@ class TaskTests(unittest.TestCase):
             entry = it["check"]["entry"]
             src = f"def {entry}(*a):\n    t = {{{', '.join(f'{k!r}: {v}' for k, v in table.items())}}}\n" \
                   f"    return t[{entry!r} + '(' + ', '.join(map(repr, a)) + ')']\n"
-            self.assertTrue(tasks.score_item(it, "```python\n" + src + "```"), entry)
-            self.assertFalse(tasks.score_item(it, f"```python\ndef {entry}(*a):\n    return None\n```"))
+            # These are trusted test-generated functions, never model replies.
+            ns = {}
+            exec(src, ns)
+            exec(it["check"]["tests"], ns)
+            exec(f"def {entry}(*a):\n    return None\n", ns)
+            with self.assertRaises(AssertionError):
+                exec(it["check"]["tests"], ns)
 
 
 if __name__ == "__main__":

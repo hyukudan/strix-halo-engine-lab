@@ -25,8 +25,9 @@ class SpoolTests(unittest.TestCase):
         for i, (pos, inp, label, z) in enumerate(rows):
             self.assertEqual((inp, label), (INPUTS[pos], INPUTS[pos + 1]))
             np.testing.assert_array_equal(z, self.z[i])
-        p1 = self.write(1, positions=[0, 1, 2, 3], name="s1.bin")
-        self.assertEqual([r[0] for r in spool.read(p1)], [0, 1, 2, 3])
+        p1 = self.write(1, positions=list(range(len(INPUTS) - 1)), name="s1.bin",
+                        z=np.zeros((len(INPUTS) - 1, V), dtype=np.float32))
+        self.assertEqual([r[0] for r in spool.read(p1)], list(range(len(INPUTS) - 1)))
         self.assertTrue(spool.complete(p1))
 
     def test_missing_footer_and_count_mismatch(self):

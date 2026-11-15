@@ -4,7 +4,7 @@ from pathlib import Path
 
 from tools.qualification.turbo_bar import frontier, losses, report
 from tools.qualification.turbo_bar import manifest as mf
-from tools.qualification.turbo_bar.common import read_json, write_json, write_jsonl
+from tools.qualification.turbo_bar.common import canon_sha, http_binding, read_json, suite_record, write_json, write_jsonl
 from tools.qualification.turbo_bar.tests.helpers import frozen_manifest, make_layout
 
 
@@ -25,7 +25,7 @@ class FrontierTests(unittest.TestCase):
         self.assertFalse(by["slow"]["within_noise"])
         self.assertEqual(res["selected"], "near")
         self.assertTrue(by["bad"]["pareto"] and by["fast"]["pareto"] and by["slow"]["pareto"])
-        self.assertFalse(by["near"]["pareto"] and not by["near"]["pareto"])  # computed, not asserted either way
+        self.assertTrue(by["near"]["pareto"])
         self.assertIn("SELECTED", frontier.table(res))
 
     def test_no_pass_selects_nothing(self):
@@ -37,16 +37,29 @@ class ReportTests(unittest.TestCase):
         self.tmp = Path(tempfile.mkdtemp())
         self.mpath = frozen_manifest(self.tmp)
         self.m = mf.load(self.mpath)
+        items = [{"id": f"{kind}-{split}-{i:03d}", "kind": kind, "split": split}
+                 for kind in ("code", "math", "needle", "json") for split in ("explore", "confirm") for i in range(60)]
+        self.m["frozen"] = None
+        self.m["protocol"]["suites"]["tasks"] = suite_record(items)
+        for a in self.m["arms"].values():
+            a["effective_route"] = {"profile": "test"}
+        self.m["arms"]["T:a"] = dict(self.m["arms"]["E"], role="T", name="a")
+        mf.save(self.mpath, self.m)
+        self.m = mf.freeze(self.mpath)
         layout = make_layout(self.tmp, noise_r=1.0, noise_t=0.01, parents=6)
         layout["manifest"] = {"version": 1, "core_sha256": self.m["frozen"]["core_sha256"]}
+        layout["arm_sha256"] = {"T:a": canon_sha(self.m["arms"]["T:a"])}
         layout["bootstrap"] = {"B": 200, "seed": 1}
         self.losses = losses.analyze(layout)
         write_json(self.tmp / "losses.json", self.losses)
         td = self.tmp / "tasks"
         td.mkdir()
         for arm, fails in (("E", 0), ("R", 20), ("T_a", 2)):
-            rows = [{"id": f"math-confirm-{i:03d}", "kind": "math", "split": "confirm", "arm": arm,
-                     "ok": int(i >= fails)} for i in range(60)]
+            name = "T:a" if arm == "T_a" else arm
+            binding = http_binding(self.m, name, "tasks")
+            rows = [dict(rec, id=key, arm=name, ok=int(int(key[-3:]) >= fails), binding=binding,
+                         server_identity=binding["server_identity"], measured=True)
+                    for key, rec in self.m["protocol"]["suites"]["tasks"]["items"].items()]
             write_jsonl(td / f"scored.{arm}.jsonl", rows)
         write_json(self.tmp / "front.json", [{"name": "a", "speed": [1.2, 1.25, 1.22]}])
 
@@ -73,6 +86,22 @@ class ReportTests(unittest.TestCase):
         write_json(self.tmp / "bad.json", bad)
         r = report.build(self.mpath, self.tmp / "bad.json")
         self.assertEqual(r["status"], "INVALID")
+        self.assertTrue(all(v["verdict"] == "INVALID" for v in r["overall"].values()))
+
+    def test_frontier_overwrites_stale_quality(self):
+        write_json(self.tmp / "front.json", [{"name": "a", "speed": [1.2, 1.25, 1.22],
+                                               "quality": {"kl_mean": -999, "dnll_mean": -999}}])
+        r = report.build(self.mpath, self.tmp / "losses.json", frontier_path=self.tmp / "front.json")
+        v = r["frontier"]["variants"][0]
+        self.assertEqual(v["kl_mean"], self.losses["summary"]["T:a"]["kl_mean"])
+        self.assertEqual(v["dnll_mean"], self.losses["summary"]["T:a"]["dnll_mean"])
+
+    def test_unknown_losses_arm_is_invalid(self):
+        changed = dict(self.losses, overall={"T:old": "PASS"})
+        write_json(self.tmp / "old.json", changed)
+        r = report.build(self.mpath, self.tmp / "old.json")
+        self.assertEqual(r["status"], "INVALID")
+        self.assertIn("unknown or superseded", r["invalid_reason"])
         self.assertTrue(all(v["verdict"] == "INVALID" for v in r["overall"].values()))
 
 

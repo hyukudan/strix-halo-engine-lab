@@ -16,7 +16,7 @@ import numpy as np
 
 from tools.qualification.option_qual import metrics, records
 from tools.qualification.turbo_bar import spool, stats
-from tools.qualification.turbo_bar.common import read_json, safe_name, write_json
+from tools.qualification.turbo_bar.common import canon_sha, read_ids, read_json, safe_name, write_json
 
 METRICS = ("kl", "dis", "dnll")
 METRIC_LABEL = {"kl": "KL", "dis": "top-1 disagreement", "dnll": "dNLL"}
@@ -40,6 +40,10 @@ def pair_name(a, b):
     return f"{a}>{b}"
 
 
+def bitwise_equal(a, b):
+    return a.shape == b.shape and np.array_equal(a.view(np.uint32), b.view(np.uint32))
+
+
 def case_sums(case, pairs):
     """Stream the arms of one case in lockstep; returns dict(n, sums{pair:{metric}}, bitwise{pair})."""
     arms = sorted({x for p in pairs for x in p})
@@ -55,6 +59,7 @@ def case_sums(case, pairs):
     sums = {pair_name(*p): dict.fromkeys(METRICS, 0.0) for p in pairs}
     bitwise = {pair_name(*p): True for p in pairs}
     n = 0
+    positions = []
     sentinel = object()
     while True:
         rows = {a: next(it, sentinel) for a, it in its.items()}
@@ -67,6 +72,7 @@ def case_sums(case, pairs):
         lab = {r[1] for r in rows.values()}
         if len(pos) != 1 or len(lab) != 1:
             raise ValueError(f"{case['case']}: arms disagree on position or label at row {n}")
+        positions.append(pos.pop())
         label = lab.pop()
         lp = {a: metrics.log_softmax(r[2]) for a, r in rows.items()}
         top = {a: int(np.argmax(r[2])) for a, r in rows.items()}
@@ -76,10 +82,10 @@ def case_sums(case, pairs):
             s["kl"] += metrics._kl(lp[a], lp[b], np.exp(lp[a]))
             s["dis"] += int(top[a] != top[b])
             s["dnll"] += nll[b] - nll[a]
-            if bitwise[pair_name(a, b)] and not np.array_equal(rows[a][2], rows[b][2]):
+            if bitwise[pair_name(a, b)] and not bitwise_equal(rows[a][2], rows[b][2]):
                 bitwise[pair_name(a, b)] = False
         n += 1
-    return {"n": n, "sums": sums, "bitwise": bitwise}
+    return {"n": n, "sums": sums, "bitwise": bitwise, "positions": positions}
 
 
 ROUTE_FIELDS = ("teacher_forced_tiled_lm_head", "teacher_logits_scope", "teacher_logits_rows")
@@ -140,9 +146,11 @@ def analyze(layout):
     for c in layout["cases"]:
         r = case_sums(c, pairs)
         r.update({k: c[k] for k in ("case", "parent", "category", "length", "source")})
+        r["split"] = c.get("split")
         recs.append(r)
     out = {"manifest": layout.get("manifest"), "status": "VALID", "invalid_reason": None, "groups": {}, "bar": {},
            "overall": {}, "summary": {}, "nulls": {}, "n_cases": len(recs), "margins": margins}
+    out["arm_sha256"] = layout.get("arm_sha256", {})
     # null control (a): E vs E-repeat bitwise identical
     npair = pair_name(E, erep)
     exact = all(r["bitwise"][npair] and all(r["sums"][npair][m] == 0 for m in METRICS) for r in recs)
@@ -162,7 +170,26 @@ def analyze(layout):
             if rf:
                 routes.setdefault(f"{c['source']}/{arm}", rf)
     out["routes"] = routes
-    filters = group_filters(recs)
+    complete = bool(recs)
+    units = {}
+    for c, r in zip(layout["cases"], recs):
+        key = (r["parent"], r["length"])
+        sources = units.setdefault(key, set())
+        if r["source"] in sources:
+            raise ValueError("duplicate parent/length/source")
+        sources.add(r["source"])
+        expected = c.get("expected_positions")
+        complete &= bool(expected) and r["positions"] == expected
+        complete &= r["split"] in ("SEARCH", "CONFIRM")
+        if r["source"] == "continuation":
+            complete &= r["positions"] == list(range(r["length"] - 1, r["length"] + 255))
+    complete &= all(s == {"spread", "continuation"} for s in units.values())
+    for parent in {r["parent"] for r in recs}:
+        if len({r["split"] for r in recs if r["parent"] == parent}) != 1:
+            raise ValueError("parent belongs to multiple splits")
+    out["complete_sources"] = bool(complete)
+    filters = {g: dict(flt, split="CONFIRM") for g, flt in group_filters(recs).items()}
+    filters["search"] = {"split": "SEARCH"}
     for g, flt in filters.items():
         entry = {"n_parents": 0, "pairs": {}}
         for p in pairs:
@@ -200,6 +227,9 @@ def analyze(layout):
         v = combine(vs)
         if inactive[t] and v == "PASS":
             v = "INCONCLUSIVE"  # spread NOT-MEASURED never counts toward a PASS
+        if not complete:
+            v = "INCONCLUSIVE"
+            out["not_measured"][t] = "incomplete prescribed sources, positions or split metadata"
         out["overall"][t] = "INVALID" if out["status"] == "INVALID" else v
         a = out["groups"]["all"]["pairs"][pair_name(E, t)]
         out["summary"][t] = {"kl_mean": a["kl"]["mean"], "dnll_mean": a["dnll"]["mean"],
@@ -210,7 +240,10 @@ def analyze(layout):
 
 def build_layout(corpus_dir, spread_dir, arms, cont_dir=None, margins=None, manifest=None, boot=None, fmt_cont="steps"):
     from pathlib import Path
+    from tools.qualification.turbo_bar.run_logits import output_contract, validate_output
     corpus = read_json(Path(corpus_dir) / "corpus.json")
+    if not manifest or not manifest["frozen"] or canon_sha(corpus) != manifest["protocol"]["corpus_sha256"]:
+        raise ValueError("layout requires the frozen corpus/manifest")
     cases = []
     labels = {a["label"] if isinstance(a, dict) else a: a for a in arms}
     for c in corpus["cases"]:
@@ -224,8 +257,20 @@ def build_layout(corpus_dir, spread_dir, arms, cont_dir=None, margins=None, mani
             missing = [p for p in files.values() if not Path(p).is_file()]
             if missing:
                 raise FileNotFoundError(f"{c['case']} {source}: missing {missing[0]} (+{len(missing) - 1})")
+            expected_positions = (read_ids(Path(corpus_dir) / c["positions"]) if source == "spread"
+                                  else list(range(c["length"] - 1, c["length"] + 255)))
+            if source == "spread" and len(expected_positions) != corpus["n_positions"]:
+                raise ValueError("spread selection count differs from prescribed corpus")
+            if source == "continuation" and len(read_ids(Path(corpus_dir) / c["cont_ids"])) != 256:
+                raise ValueError("qualification requires 256 continuation tokens")
+            for arm, path in files.items():
+                side = read_json(Path(path).with_suffix(".json"))
+                expected = output_contract(manifest, arm, c, corpus_dir, source,
+                                           side.get("contract", {}).get("prefill_rows") if source == "spread" else None)
+                validate_output(path, expected)
             cases.append({"case": f"{c['case']}/{source}", "parent": c["parent"], "category": c["category"],
-                          "length": c["length"], "source": source, "format": fmt, "files": files})
+                          "length": c["length"], "source": source, "format": fmt, "files": files,
+                          "split": c["split"], "expected_positions": expected_positions})
     return cases
 
 
@@ -249,9 +294,10 @@ def main(argv=None):
         m = mf.load(a.manifest)
         names = a.arms.split(",")
         Ts = [n for n in names if n.startswith("T:")]
-        cases = build_layout(a.corpus, a.spread, names, a.continuation)
+        cases = build_layout(a.corpus, a.spread, names, a.continuation, manifest=m)
         proto = m["protocol"]
         write_json(a.out, {"E": "E", "R": "R", "T": Ts, "Erep": "Erep", "control": a.control, "cases": cases,
+                           "arm_sha256": {n: canon_sha(m["arms"][n]) for n in Ts},
                            "margins": proto["margins"], "bootstrap": proto["bootstrap"],
                            "manifest": {"version": m["version"], "core_sha256": (m["frozen"] or {}).get("core_sha256")}})
         return 0

@@ -28,7 +28,7 @@ from pathlib import Path
 
 from tools.qualification.turbo_bar import manifest as mf
 from tools.qualification.turbo_bar import spool
-from tools.qualification.turbo_bar.common import read_ids, read_json, safe_name, sha256_file, write_json
+from tools.qualification.turbo_bar.common import canon_sha, read_ids, read_json, safe_name, sha256_file, write_json
 
 KEEP_ENV = ("PATH", "HOME", "LD_LIBRARY_PATH", "SYSTEMROOT")
 ROUTE_RE = re.compile(r'"?(teacher_forced_tiled_lm_head|teacher_logits_scope|teacher_logits_rows)"?\s*[:=]\s*("[^"]*"|[^\s,}]+)')
@@ -102,6 +102,48 @@ def run_one(argv, env, timeout, stack_kib):
         return None, out.decode("utf-8", "replace"), True
 
 
+def output_contract(m, name, case, corpus, source="spread", prefill_rows=None):
+    spec = arm_spec(m, name)
+    keys = ("prompt_ids", "positions") if source == "spread" else ("prompt_ids", "cont_ids")
+    hashes = {k + "_sha256": sha256_file(Path(corpus) / case[k]) for k in keys}
+    if any(hashes[k + "_sha256"] != case[k + "_sha256"] for k in keys):
+        raise ValueError("corpus prompt/selection/continuation hash mismatch")
+    return {"manifest_core_sha256": m["frozen"]["core_sha256"], "manifest_version": m["version"],
+            "arm": name, "arm_sha256": canon_sha(spec), "case": case["case"], "source": source,
+            "binary_sha256": spec["binary"]["sha256"], "weights_sha256": [w["sha256"] for w in spec["weights"]],
+            "identity": spec["identity"], "prefill_rows": prefill_rows, **hashes}
+
+
+def validate_output(path, expected):
+    path = Path(path)
+    side = read_json(path.with_suffix(".json"))
+    if side.get("contract") != expected or not side.get("complete") or side.get("rc") != 0:
+        raise ValueError(f"{path.name}: output receipt does not match frozen experiment")
+    receipt = side.get("receipt")
+    if (not receipt or side.get("receipt_sha256") != canon_sha(receipt)
+            or side.get("payload_sha256") != sha256_file(path)):
+        raise ValueError(f"{path.name}: missing or changed effective route/payload receipt")
+    if expected["source"] == "spread" and not all(k in receipt for k in
+            ("teacher_forced_tiled_lm_head", "teacher_logits_scope", "teacher_logits_rows")):
+        raise ValueError(f"{path.name}: incomplete effective route receipt")
+    return side
+
+
+def preserve_run(out, record):
+    path = Path(out) / "run.json"
+    if path.exists():
+        old = read_json(path)
+        if any(old.get(k) != v for k, v in record.items() if k != "arms"):
+            raise ValueError("output directory belongs to another experiment; old run.json preserved")
+        for name, arm in old.get("arms", {}).items():
+            if name in record["arms"] and arm != record["arms"][name]:
+                raise ValueError("run arm identity changed; old run.json preserved")
+        record = dict(record, arms=dict(old["arms"], **record["arms"]))
+    elif any((Path(out) / "spread").glob("*.bin")):
+        raise ValueError("outputs without run.json cannot be relabelled")
+    return record
+
+
 def spread(a):
     t0 = time.monotonic()
     m = mf.load(a.manifest)
@@ -109,6 +151,10 @@ def spread(a):
         raise SystemExit("manifest is not frozen")
     corpus = Path(a.corpus)
     doc = read_json(corpus / "corpus.json")
+    if canon_sha(doc) != m["protocol"]["corpus_sha256"]:
+        raise ValueError("corpus differs from frozen manifest")
+    if not m["model"].lower().startswith("qwen"):
+        raise ValueError("spread runner currently supports only the Qwen adapter")
     arms = a.arms.split(",") if a.arms else ["E", "Erep", "R"] + [k for k in m["arms"] if k.startswith("T:")]
     bins = dict(x.split("=", 1) for x in a.bin_for)
     out = Path(a.out)
@@ -126,14 +172,21 @@ def spread(a):
         for w in spec["weights"]:
             if not os.path.exists(w["path"]) or os.path.getsize(w["path"]) != w["bytes"]:
                 raise SystemExit(f"arm {name}: weights {w['path']} missing or size differs from the manifest")
-            models.append({"sha256": sha256_file(w["path"]) if a.verify_weights_sha else w["sha256"],
-                           "bytes": w["bytes"], "sha_verified_now": bool(a.verify_weights_sha)})
-            if a.verify_weights_sha and models[-1]["sha256"] != w["sha256"]:
+            models.append({"sha256": sha256_file(w["path"]), "bytes": w["bytes"], "sha_verified_now": True})
+            if models[-1]["sha256"] != w["sha256"]:
                 raise SystemExit(f"arm {name}: weights sha256 differs from the frozen manifest")
         run_arms[name] = {"identity": spec["identity"], "binary_sha256": bin_sha[b], "weights": models,
                           "args": spec["args"], "env": spec["env"]}
-    write_json(out / "run.json", {"manifest_core_sha256": m["frozen"]["core_sha256"], "manifest_version": m["version"],
-                                  "arms": run_arms})
+    record = preserve_run(out, {"manifest_core_sha256": m["frozen"]["core_sha256"], "manifest_version": m["version"],
+                                "corpus_sha256": canon_sha(doc), "arms": run_arms})
+    reusable = set()
+    for case in doc["cases"]:
+        for name in arms:
+            path = out / "spread" / f"{case['case']}.{safe_name(name)}.bin"
+            if spool.complete(path):
+                validate_output(path, output_contract(m, name, case, corpus, prefill_rows=a.prefill_rows))
+                reusable.add(path)
+    write_json(out / "run.json", record)
     want = set(a.cases.split(",")) if a.cases else None
     summary = {"complete": 0, "skipped": 0, "ran": 0, "failed": 0, "deferred": 0}
     deferred = False
@@ -144,7 +197,7 @@ def spread(a):
         for name in arms:
             spec = arm_spec(m, name)
             path = out / "spread" / f"{case['case']}.{safe_name(name)}.bin"
-            if spool.complete(path):
+            if path in reusable:
                 summary["skipped"] += 1
                 continue
             remaining = a.soft_seconds - (time.monotonic() - t0) - a.reserve_seconds
@@ -167,6 +220,8 @@ def spread(a):
                     "manifest_core_sha256": m["frozen"]["core_sha256"], "prefill_rows": a.prefill_rows,
                     "args": spec["args"], "env": {k: v for k, v in spec["env"].items()}, "receipt": route_fields(text),
                     "log_tail": text[-4000:]}
+            side.update(contract=output_contract(m, name, case, corpus, prefill_rows=a.prefill_rows),
+                        receipt_sha256=canon_sha(side["receipt"]), payload_sha256=sha256_file(path) if ok else None)
             write_json(path.with_suffix(".json"), side)
             if timed_out:
                 deferred = True
@@ -211,7 +266,7 @@ def main(argv=None):
     s.add_argument("--soft-seconds", type=float, default=430.0)
     s.add_argument("--reserve-seconds", type=float, default=20.0)
     s.add_argument("--stack-kib", type=int, default=65536)
-    s.add_argument("--verify-weights-sha", action="store_true", help="stream-hash the weights now (slow for 100 GB)")
+    s.add_argument("--verify-weights-sha", action="store_true", help="compatibility flag; weights are always verified")
     c = sub.add_parser("continuation")
     c.add_argument("--manifest", required=True)
     c.add_argument("--out", required=True)

@@ -10,10 +10,7 @@ import json
 import math
 import random
 import re
-import subprocess
 import sys
-import tempfile
-from pathlib import Path
 
 from tools.qualification.turbo_bar.common import canon, canon_sha, sha256_bytes, write_jsonl
 
@@ -364,16 +361,20 @@ def extract_code(reply):
     return m.group(1) if m else reply
 
 
+class ScoringUnavailable(RuntimeError):
+    pass
+
+
+def require_code_sandbox():
+    # No qualified OS isolation backend ships with this kit. Never fall back to
+    # python -I: it grants filesystem, network and process access to the reply.
+    # A future backend must isolate secrets/mounts/network, bound resources, reap
+    # the process tree, and use a trusted external controller for every test case.
+    raise ScoringUnavailable("code scoring unavailable: qualified OS sandbox and external test controller required")
+
+
 def score_code(reply, check, timeout=10):
-    code = extract_code(reply)
-    with tempfile.TemporaryDirectory(prefix="turbo-code-") as d:
-        Path(d, "solution.py").write_text(code + "\n\n" + check["tests"], encoding="utf-8")
-        try:
-            r = subprocess.run([sys.executable, "-I", "solution.py"], cwd=d, timeout=timeout,
-                               stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        except (subprocess.TimeoutExpired, OSError):
-            return False
-        return r.returncode == 0
+    require_code_sandbox()
 
 
 # ----------------------------------------------------------------------------------------------- needle
