@@ -72,16 +72,29 @@ def score(text, present, absent, k, name):
 
 def main():
     imgdir, files = sys.argv[1], sys.argv[2:]
-    runs = [{r["name"]: r for r in json.load(open(f))} for f in files]
+    runs, manifests, tags = [], [], []
+    for f in files:
+        with open(f + ".manifest.json") as stream:
+            manifest = json.load(stream)  # legacy results without a denominator cannot be certified
+        with open(f) as stream:
+            runs.append({r["name"]: r for r in json.load(stream)})
+        manifests.append(manifest["requested"])
+        tags.append(manifest["terms"])
+    names = sorted({item["name"] for manifest in manifests for item in manifest})
+    failed = 0
     print("image | pixels present / absent | T | colours hit | false | pattern | orient | palette rule | answer")
     tot = {}
-    for name in runs[0]:
+    for name in names:
         present, absent = classes("%s/%s.png" % (imgdir, name))
-        for run in runs:
+        for run, tag in zip(runs, tags):
             r = run.get(name, {})
-            text = r.get("text", "")
+            ok = r.get("status") == 200 and bool(r.get("text")) and not r.get("error")
+            failed += not ok
+            text = r.get("text", "") if ok else ""
+            if not ok:
+                print("ERROR %s T%s: missing/failed answer" % (name, tag))
             hit, false, pat, ori, rule = score(text, present, absent, kind(name), name)
-            T = r.get("terms", "?")
+            T = tag
             s = tot.setdefault(T, [0, 0, 0, 0, 0, 0])
             s[0] += len(hit); s[1] += len(present); s[2] += len(false); s[3] += pat; s[4] += bool(ori); s[5] += 1
             print("%s | %s / %s | T%s | %d/%d %s | %s | %d | %s | %s | %s" % (
@@ -90,6 +103,8 @@ def main():
     for T, s in sorted(tot.items()):
         print("TOTAL T%s: colours %d/%d, false colours %d, pattern %d/%d, orientation %d" % (T, s[0], s[1], s[2], s[3], s[5], s[4]))
 
+    return int(failed > 0)
+
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

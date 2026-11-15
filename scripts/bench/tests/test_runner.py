@@ -87,9 +87,10 @@ class Receipts(unittest.TestCase):
         lines = [(100.0, "qwen cache policy: {\"reason\":\"declined\"}"), (104.0, "qpf2k sched block rows 8192"), (109.0, "exit")]
         make_run(d, lines, [sample(100 + 0.2 * i, ev=(0 if 100 + 0.2 * i < 106 else 9)) for i in range(50)],
                  stdout='{"generation_request_elapsed_ms": 3000, "generated_tokens": [1]}')
-        r = self.summarize(d, "--anchor-regex", "qpf2k.sched.block.rows")
-        self.assertTrue(r["valid"], r["invalid_reasons"])  # eviction after the anchor; cache-policy "declined" is not an error
-        self.assertEqual(r["prefill_ms_warm"], 3000.0)
+        r = self.summarize(d, "--need-prefill")
+        self.assertFalse(r["valid"])
+        self.assertEqual(r["prefill_ms_warm"], 0.0)
+        self.assertEqual(r["metrics"]["request_latency_ms"], 3000.0)
         make_run(d, lines + [(110.0, "terminate called: what(): boom")], [sample(100 + 0.2 * i) for i in range(50)], rc=134)
         r = self.summarize(d)
         self.assertFalse(r["valid"])
@@ -97,9 +98,9 @@ class Receipts(unittest.TestCase):
 
     def test_memory_floor_and_unsampled_host(self):
         d = os.path.join(self.out, "m")
-        make_run(d, [(100.0, "prefill-wall-ms=10")], [sample(100 + 0.2 * i, avail_kb=2 ** 20) for i in range(5)])
+        make_run(d, [(100.0, "prefill-wall-ms=10")], [sample(99.8 + 0.2 * i, avail_kb=2 ** 20) for i in range(5)])
         self.assertFalse(self.summarize(d, "--min-avail-gb", "4")["valid"])
-        make_run(d, [(100.0, "prefill-wall-ms=10")], [sample(100 + 0.2 * i, avail_kb=0) for i in range(5)])
+        make_run(d, [(100.0, "prefill-wall-ms=10")], [sample(99.8 + 0.2 * i, avail_kb=0) for i in range(5)])
         r = self.summarize(d, "--min-avail-gb", "4")
         self.assertTrue(r["valid"], r["invalid_reasons"])
         self.assertTrue(any("not sampled" in w for w in r["warnings"]))
@@ -116,7 +117,7 @@ class Abab(unittest.TestCase):
                         json.dump(dict(arm=arm, round=rnd, valid=True, prefill_ms_warm=ms, prefill_ms_cold=ms + 50,
                                        tok_s_warm=8192 / ms * 1e3, sclk_mhz=2900, busy_pct=90, gpu_clocks_per_token=1,
                                        logits_sha="aa", gen_sha="g", metrics={}), f)
-            r = subprocess.run([sys.executable, "-I", os.path.join(COMMON, "abab.py"), "summary", out],
+            r = subprocess.run([sys.executable, "-I", os.path.join(COMMON, "abab.py"), "summary", out, "--base", "A"],
                                capture_output=True, text=True, check=True).stdout
             self.assertIn("B vs A: prefill_ms_warm per-round -10.00 -10.00 -10.00 median -10.00 % over 3 rounds;", r)
             self.assertIn("bitwise-same logits", r)
@@ -130,14 +131,19 @@ class Served(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             s = os.path.join(d, "server")
             make_run(s, [(100.0, "READY")], [sample(100 + 0.2 * i) for i in range(5)])
+            with open(os.path.join(s, "meta.json")) as f:
+                meta = json.load(f)
+            meta["intentional_shutdown"] = True
+            with open(os.path.join(s, "meta.json"), "w") as f:
+                json.dump(meta, f)
             burst = dict(concurrency=8, client=dict(end_to_end_tok_s=120.5, per_request_tok_s_p50=15.0, ttft_p50_s=0.2,
-                                                     failed=0), steady=dict(aggregate_tok_s=130.0))
+                                                     failed=0, requests=8, output_tokens=16), steady=dict(aggregate_tok_s=130.0))
             with open(os.path.join(d, "json-0.json"), "w") as f:
                 json.dump(dict(bursts=[burst]), f)
             with open(os.devnull, "w") as null:
                 old, sys.stdout = sys.stdout, null
                 try:
-                    serve_receipts.main([d, "--tag", "t", "--arm", "ctl", "--round-base", "2"])
+                    serve_receipts.main([d, "--tag", "t", "--arm", "ctl", "--round-base", "2", "--client-rc", "0", "--expected", "json-0", "--concurrency", "8"])
                 finally:
                     sys.stdout = old
             r = load(os.path.join(d, "json-0"))

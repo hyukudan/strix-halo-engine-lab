@@ -15,4 +15,4 @@ ulimit -s 65536 2>/dev/null || true
 kit_run "$dir" "$cap" "$@"
 read -ra extra <<<"${KIT_RECEIPT_ARGS:-}"
 kit_receipt "$dir" "${KIT_TAG:-$(basename "$dir")}" --arm "${KIT_ARM:-${KIT_TAG:-$(basename "$dir")}}" \
-    --round "${KIT_ROUND:-0}" --tokens "${KIT_TOKENS:-0}" "${extra[@]}"
+    --workload "${KIT_WORKLOAD:-}" --round "${KIT_ROUND:-0}" --tokens "${KIT_TOKENS:-0}" "${extra[@]}"

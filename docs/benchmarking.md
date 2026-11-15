@@ -21,7 +21,7 @@ second node of a pair is the ssh alias in `KIT_PEER`.
 | `serve_receipts.py` | Turns served results into receipts (`agg_C<n>`, `e2e_C<n>`, `req_C<n>`, `ttft_C<n>`). |
 | `prompt_ids.py` | Prompt files for any length (`p<N>.ids`, `.csv` or `.u32`). Each one is the seed text tokenized once, repeated and truncated, with a sha256 per prompt. |
 
-Every run directory holds `cmd.txt`, `stdout`, `stderr`, `stderr.ts` (the arrival time of every line), `samples.tsv`,
+Every run directory holds `cmd.txt`, `stdout`, `stdout.ts`, `stderr`, `stderr.ts` (the arrival time of every line), `samples.tsv`,
 `klog.txt` and `meta.json`, plus `receipt.json` once it has been summarised.
 
 **Validity** (a run that fails any check is listed with its reasons and left out of every median):
@@ -58,7 +58,7 @@ ticket):
 | `ds41/prefill-pair` | DeepSeek V4.1 pair prefill, length × rows × arm, cold and warm in one process (`--ttft-timing --repeat 2`); the logits FNV of both ranks must agree. | `ds41/prefill-pair --bin strix-deepseek41-prefill --model M --ids DIR --sizes 8K,32K --arm 'exact\|\|'` |
 | `ds41/serve-decode` | DeepSeek V4.1 pair served decode, classes prose / edit / json at 1, 4 and 8 chats (server cycle receipts, end-to-end, TTFT). | `ds41/serve-decode --bin-dir DIR --model M --arm 'ctl\|\|' --round 0` (then `abab.py summary OUT --metric e2e_C8`) |
 | `glm/prefill-pair` | GLM pair prefill, exact vs FAST, several prompts in one load (`--pf-ttft`), first prompt cold and last warm; rank agreement on logits and state FNV. | `glm/prefill-pair --bin strix-glm5-rank --model DIR --prompts p8192.u32,p8192.u32` |
-| `minimax/fast-gate` | MiniMax FAST quality gate against the floor: reference, at least 3 null-control arms (5 recommended) and the candidate, then `tools/strix-gate/fast_logit_gate.py` seal and compare (`--dnll-rule floor`). | GPU: `minimax/fast-gate run --bin strix-minimax-rank --model DIR --arm 'cand\|\|STRIX_X=1' --sessions s8k=p.u32`; CPU: `fast-gate.sh seal ...`, `fast-gate.sh compare --ref ref --cand cand --null n1 --null n2 --null n3 --dnll-rule floor` |
+| `minimax/fast-gate` | MiniMax FAST quality gate using the admitted absolute dNLL rule: reference and candidate, both ranks, then `tools/strix-gate/fast_logit_gate.py` seal and compare (`--dnll-rule abs`). | GPU: `minimax/fast-gate run --bin strix-minimax-rank --model DIR --arm 'cand\|\|STRIX_X=1' --sessions s8k=p.u32`; CPU: `fast-gate.sh seal ...`, `fast-gate.sh compare --ref ref --cand cand --dnll-rule abs` |
 | `vision/battery` | Vision content battery: one greedy answer per synthetic image, graded from the pixels (`score.py`): colours present or absent, pattern, orientation, palette rule. | `vision/battery --bin-dir DIR --model M --vision V.gguf --images IMGDIR`, then `python3 scripts/bench/vision/score.py IMGDIR OUT/*/battery.json` |
 | `rtx/ds41-rtx-pair-batch` | DeepSeek V4.1 RTX + pair batched decode C2 / C4 / C8: RTX FRONT on `[0, cut)` with `strix-cuda-ds41-multi-front`, pair TAIL on `strix-deepseek41-batch --hetero-listen`, 2 groups in flight; `--mode both` checks every request against its pair-only run. | node ticket: `rtx/ds41-rtx-pair-batch tail --bin strix-deepseek41-batch --model M --prompts a.csv,...,h.csv --token-file TOK --n 2,4,8 --generate 48`; RTX host: `scripts/bench/rtx/ds41-rtx-pair-batch.sh front --bin strix-cuda-ds41-multi-front --model M --stage NODE:7841 --token-file TOK` |
 | `rtx/serve-route` | Served RTX routes (Qwen whole model on one RTX, or any OpenAI-compatible RTX server), decode classes at 1, 4 and 8 chats. | `scripts/bench/rtx/serve-route.sh --route qwen --bin strix-cuda-qwen-serve --model Q.gguf -- --tables T --rope-table R --mtp-sidecar S --draft-vocab V` |
@@ -74,3 +74,7 @@ magnitude between prose, a code edit and CSV-to-JSON, so served decode is always
 `scripts/bench/tests/run.sh` checks the syntax of every kit, runs shellcheck when it is installed, and runs
 `scripts/bench/tests/test_runner.py`, offline tests of the receipts, validity rules, ABAB summary, served receipts
 and prompt formats.
+
+Vision scores are synthetic-image word-matching heuristics, not a general image-understanding accuracy measure. ABAB comparisons require an explicit `--base ARM` within a comparable workload group.
+
+Served runs share the ticket deadline and require both ranks, telemetry and completed requests to pass. Custom clients must write `KIT_RUN_DIR/client-result.json` with positive `completed` and zero `failed`, and exit successfully. Intentional TERM shutdown is recorded separately from server failure. Missing prefill timings remain unqualified; request latency is a separate metric.

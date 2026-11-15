@@ -21,7 +21,7 @@ se pasan como argumentos, y el segundo nodo de un par es el alias ssh de `KIT_PE
 | `serve_receipts.py` | Convierte los resultados servidos en recibos (`agg_C<n>`, `e2e_C<n>`, `req_C<n>`, `ttft_C<n>`). |
 | `prompt_ids.py` | Ficheros de prompt de cualquier longitud (`p<N>.ids`, `.csv` o `.u32`). Cada uno es el texto semilla tokenizado una vez, repetido y truncado, con un sha256 por prompt. |
 
-Cada directorio de ejecución guarda `cmd.txt`, `stdout`, `stderr`, `stderr.ts` (la hora de llegada de cada línea),
+Cada directorio de ejecución guarda `cmd.txt`, `stdout`, `stdout.ts`, `stderr`, `stderr.ts` (la hora de llegada de cada línea),
 `samples.tsv`, `klog.txt` y `meta.json`, más `receipt.json` una vez resumido.
 
 **Validez** (una ejecución que falla cualquier comprobación se lista con sus motivos y queda fuera de todas las medianas):
@@ -58,7 +58,7 @@ que el ticket):
 | `ds41/prefill-pair` | Prefill del par DeepSeek V4.1, longitud × filas × brazo, frío y caliente en un proceso (`--ttft-timing --repeat 2`); el FNV de los logits de los dos rangos debe coincidir. | `ds41/prefill-pair --bin strix-deepseek41-prefill --model M --ids DIR --sizes 8K,32K --arm 'exact\|\|'` |
 | `ds41/serve-decode` | Decodificación servida del par DeepSeek V4.1, clases prosa / edición / json con 1, 4 y 8 chats (recibos de ciclo del servidor, extremo a extremo, TTFT). | `ds41/serve-decode --bin-dir DIR --model M --arm 'ctl\|\|' --round 0` (luego `abab.py summary OUT --metric e2e_C8`) |
 | `glm/prefill-pair` | Prefill del par GLM, exacto contra FAST, varios prompts en una carga (`--pf-ttft`), el primer prompt en frío y el último en caliente; acuerdo entre rangos en el FNV de logits y de estado. | `glm/prefill-pair --bin strix-glm5-rank --model DIR --prompts p8192.u32,p8192.u32` |
-| `minimax/fast-gate` | Puerta de calidad FAST de MiniMax relativa al suelo: referencia, al menos 3 brazos de control nulo (5 recomendados) y el candidato, luego seal y compare de `tools/strix-gate/fast_logit_gate.py` (`--dnll-rule floor`). | GPU: `minimax/fast-gate run --bin strix-minimax-rank --model DIR --arm 'cand\|\|STRIX_X=1' --sessions s8k=p.u32`; CPU: `fast-gate.sh seal ...`, `fast-gate.sh compare --ref ref --cand cand --null n1 --null n2 --null n3 --dnll-rule floor` |
+| `minimax/fast-gate` | Puerta de calidad FAST de MiniMax con la regla absoluta dNLL admitida: referencia y candidato, ambos rangos, luego seal y compare de `tools/strix-gate/fast_logit_gate.py` (`--dnll-rule abs`). | GPU: `minimax/fast-gate run --bin strix-minimax-rank --model DIR --arm 'cand\|\|STRIX_X=1' --sessions s8k=p.u32`; CPU: `fast-gate.sh seal ...`, `fast-gate.sh compare --ref ref --cand cand --dnll-rule abs` |
 | `vision/battery` | Batería de contenido de visión: una respuesta greedy por imagen sintética, puntuada a partir de los píxeles (`score.py`): colores presentes o ausentes, patrón, orientación, regla de la paleta. | `vision/battery --bin-dir DIR --model M --vision V.gguf --images IMGDIR`, luego `python3 scripts/bench/vision/score.py IMGDIR OUT/*/battery.json` |
 | `rtx/ds41-rtx-pair-batch` | Decodificación por lotes RTX + par de DeepSeek V4.1, C2 / C4 / C8: FRONT en la RTX sobre `[0, cut)` con `strix-cuda-ds41-multi-front`, TAIL en el par con `strix-deepseek41-batch --hetero-listen`, 2 grupos en vuelo; `--mode both` compara cada petición con su ejecución solo en el par. | ticket del nodo: `rtx/ds41-rtx-pair-batch tail --bin strix-deepseek41-batch --model M --prompts a.csv,...,h.csv --token-file TOK --n 2,4,8 --generate 48`; host RTX: `scripts/bench/rtx/ds41-rtx-pair-batch.sh front --bin strix-cuda-ds41-multi-front --model M --stage NODO:7841 --token-file TOK` |
 | `rtx/serve-route` | Rutas RTX servidas (Qwen entero en una RTX, o cualquier servidor RTX compatible con OpenAI), clases de decodificación con 1, 4 y 8 chats. | `scripts/bench/rtx/serve-route.sh --route qwen --bin strix-cuda-qwen-serve --model Q.gguf -- --tables T --rope-table R --mtp-sidecar S --draft-vocab V` |
@@ -75,3 +75,5 @@ informa siempre por clase.
 `scripts/bench/tests/run.sh` comprueba la sintaxis de todos los kits, pasa shellcheck si está instalado y ejecuta
 `scripts/bench/tests/test_runner.py`, pruebas sin conexión de los recibos, las reglas de validez, el resumen ABAB,
 los recibos servidos y los formatos de prompt.
+
+Las puntuaciones de visión son heurísticas de palabras para imágenes sintéticas, no una medida general de comprensión visual. Las comparaciones ABAB requieren `--base ARM` explícito dentro de un grupo de cargas comparables.

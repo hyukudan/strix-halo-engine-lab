@@ -30,22 +30,19 @@ pbin=${pbin:-$bin} pmodel=${pmodel:-$model} pprompts=${pprompts:-$prompts}
 out=${KIT_OUT:-bench-out}
 kit_same_binary "$bin" "$pbin"
 read -ra PE <<<"$pair_env"
-tokens=$(($(stat -c %s "${prompts##*,}") / 4))
+IFS=, read -ra prompt_list <<<"$prompts"
 for ((r = 0; r < rounds; r++)); do
     for a in "${arms[@]}"; do
         IFS='|' read -r name args envs <<<"$a"; read -ra A <<<"$args"; read -ra E <<<"$envs"
         tag=$name-$r
         kit_fits 60 || { echo "== $tag SKIP (left $(kit_left) s)"; continue; }
-        export KIT_TAG=$tag KIT_ARM=$name KIT_ROUND=$r KIT_TOKENS=$tokens
-        export KIT_RECEIPT_ARGS='--need-prefill --prefill-regex ^pf.\S+-ttft:.\d+.tokens.([0-9.]+).s@s'
+        export KIT_TAG=$tag KIT_ARM=$name KIT_ROUND=$r KIT_TOKENS=0 KIT_EXPECTED=${#prompt_list[@]}
+        export KIT_RECEIPT_ARGS='--need-prefill --family glm'
         base=(--world 2 --transport usb4-auto --mtp 0 --slots 1 --capacity "$cap" --max-rows "$rows" --pf-ttft-mode gemv)
         p1=(env "${PE[@]}" "${E[@]}" "$pbin" "$pmodel" --rank 1 "${base[@]}" --pf-ttft "$pprompts" "${A[@]}")
         p0=(env "${PE[@]}" "${E[@]}" "$bin" "$model" --rank 0 "${base[@]}" --pf-ttft "$prompts" "${A[@]}")
         echo "#### $tag args[$args] env[$envs] t+$(($(date +%s) - KIT_T0))s"
         kit_pair_arm "$out/$tag" "$(($(kit_left) - 3))" '^pf |rank 1|what\(\)' p1 p0
-        f0=$(grep -aoE 'logits fnv \w+, state fnv \w+' "$out/$tag-r0/stderr" "$out/$tag-r0/stdout" 2>/dev/null | cut -d: -f2- | md5sum | cut -c1-8)
-        f1=$(kit_peer "cat $(printf %q "${KIT_PEER_OUT:-$out}/$tag-r1/stderr") $(printf %q "${KIT_PEER_OUT:-$out}/$tag-r1/stdout") 2>/dev/null | grep -aoE 'logits fnv \w+, state fnv \w+' | md5sum | cut -c1-8")
-        [[ $f0 == "$f1" ]] && echo "   ranks agree (fnv digest $f0)" || echo "   ! ranks DIFFER (r0 $f0 r1 $f1)"
         sleep "${KIT_SETTLE_S:-2}"
     done
 done

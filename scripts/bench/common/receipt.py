@@ -12,13 +12,13 @@ and the LAST as warm (methodology: never compare a warm figure with a cold one).
 (last match of a regex with one group), e.g. decode tok/s.
 
 Power, clock and GPU busy are integrated over the warm prefill window [anchor - prefill, anchor], anchor = the
-time stamp of the line that carried the figure (stderr.ts). GPU clocks per token = busy x sclk x window / tokens.
+time stamp of the line that carried the figure (stdout.ts or stderr.ts). GPU clocks per token = busy x sclk x window / tokens.
 
 Validity (a receipt with valid=false is excluded by abab.py and its reasons are printed):
   rc != 0; kfd evicted_ms grew inside the timed window (memory pressure moved our buffers while timing; growth
   during model load is a warning, --evict-whole-run makes it fatal); MemAvailable fell below --min-avail-gb;
   kernel log events (amdgpu / kfd / thunderbolt / oom / reset) in the run are a warning (--strict-klog: fatal);
-  --require REGEX lines missing from stderr; --reject REGEX lines present.
+  --require REGEX lines missing from both streams; --reject REGEX lines present.
 """
 import argparse
 import hashlib
@@ -27,9 +27,64 @@ import os
 import re
 import sys
 
-KIT_EVICT_PAD_S = 0.25  # one sampler period after the end line; the first in-window sample is the baseline
+KIT_EVICT_PAD_S = 0.25  # retain the sample preceding the window, including boundary uncertainty
 DEFAULT_PREFILL = [r"prefill-handoff-seconds=([\d.]+)@s", r"prefill-wall-ms=([\d.]+)"]
 DEFAULT_REJECT = [r"what\(\)", r"\btimed out\b", r"^(?!.*cache policy).*\bdeclined\b"]
+# Producer formats; timing, row counts and agreement evidence share the same matched rows.
+FAMILY_PREFILL = {
+    "ds41": r"^ttft run (?P<key>\d+): (?P<tokens>\d+) rows, wall (?P<ms>[\d.]+) ms .*logits_fnv (?P<logits>[0-9a-f]{16})$",
+    "glm": r"^rank (?P<rank>[01]) pf (?P<key>\S+-ttft): (?P<tokens>\d+) tokens (?P<seconds>[\d.]+) s .*logits fnv (?P<logits>[0-9a-f]{16}), state fnv (?P<state>[0-9a-f]{16})$",
+    "minimax": r"^rank (?P<rank>[01]) (?P<key>\S+): prompt (?P<tokens>\d+) tokens, TTFT (?P<seconds>[\d.]+) s, prefill .*$",
+}
+
+
+def family_rows(text, family):
+    return [m.groupdict() for m in re.finditer(FAMILY_PREFILL[family], text, re.M)]
+
+
+def process_reasons(meta):
+    rc = meta.get("rc")
+    if rc == 0 or (meta.get("intentional_shutdown") and rc == 143):
+        return []
+    return ["rc=%s" % rc]
+
+
+def telemetry_reasons(rows, min_avail_gb, evictions, klog=(), sampler_error=""):
+    reasons = []
+    if len(rows) < 2:
+        reasons.append("insufficient samples")
+    if sampler_error:
+        reasons.append("sampler failed: " + sampler_error.strip()[:100])
+    if evictions > 0:
+        reasons.append("kfd evicted_ms +%d in the timed window" % evictions)
+    avail = [r[6] for r in rows]
+    if avail and max(avail) > 0 and min(avail) / 2 ** 20 < min_avail_gb:
+        reasons.append("MemAvailable %.1f GiB < %.1f" % (min(avail) / 2 ** 20, min_avail_gb))
+    if klog:
+        reasons.append("klog %d events" % len(klog))
+    return reasons
+
+
+def pair_receipts(paths, expected=0):
+    """Fail both ranks closed, preserving ordered, full-width evidence and peer validity."""
+    recs = [json.loads(read_text(p) or "{}") for p in paths]
+    reasons = []
+    if not all(r.get("valid") for r in recs):
+        reasons.append("pair rank invalid or missing receipt")
+    if expected:
+        evidence = [r.get("rank_evidence", []) for r in recs]
+        if any(len(e) != expected for e in evidence):
+            reasons.append("rank evidence missing or unexpected count")
+        elif evidence[0] != evidence[1]:
+            reasons.append("rank evidence mismatch")
+    for p, rec in zip(paths, recs):
+        if not rec:
+            rec = dict(tag="missing-rank", arm="missing-rank", round=0)
+        rec["invalid_reasons"] = list(dict.fromkeys(rec.get("invalid_reasons", []) + reasons))
+        rec["valid"] = not rec["invalid_reasons"]
+        with open(p, "w") as stream:
+            json.dump(rec, stream, indent=1)
+    return reasons
 
 
 def read_text(path):
@@ -86,7 +141,7 @@ def stamps(path):
 
 
 def prefill_values(err, patterns):
-    """All prefill figures in ms, in stderr order, from the first pattern that matches at all."""
+    """All prefill figures in ms, in stream order, from the first pattern that matches at all."""
     for pat in patterns:
         scale = 1.0
         if pat.endswith("@s"):
@@ -117,7 +172,8 @@ def integrate(rows, t0, t1):
 
 
 def cmd_meta(args):
-    meta = dict(rc=args.rc, wall_ms=args.wall_ms, mem=args.mem.strip(), host=args.host_tag, bin_sha=args.bin_sha)
+    meta = dict(rc=args.rc, wall_ms=args.wall_ms, mem=args.mem.strip(), host=args.host_tag, bin_sha=args.bin_sha,
+                intentional_shutdown=args.intentional_shutdown)
     with open(os.path.join(args.dir, "meta.json"), "w") as stream:
         json.dump(meta, stream)
 
@@ -126,18 +182,24 @@ def cmd_summarize(args):
     d = args.dir
     meta = json.loads(read_text(os.path.join(d, "meta.json")) or "{}")
     err = read_text(os.path.join(d, "stderr"))
-    out_json = stdout_json(read_text(os.path.join(d, "stdout")))
-    pat, pf = prefill_values(err, args.prefill_regex or DEFAULT_PREFILL)
-    if not pf and out_json.get("generation_request_elapsed_ms"):
-        pf = [float(out_json["generation_request_elapsed_ms"])]
+    out = read_text(os.path.join(d, "stdout"))
+    out_json = stdout_json(out)
+    text = err + "\n" + out
+    timing, stream_name = (out, "stdout") if args.family else (err, "stderr")
+    fr = family_rows(out, args.family) if args.family else []
+    pat, pf = prefill_values(timing, args.prefill_regex or DEFAULT_PREFILL) if not args.family else (
+        FAMILY_PREFILL[args.family], [float(v["ms"]) if "ms" in v else float(v["seconds"]) * 1000 for v in fr])
+    if not pf and not args.family:
+        pat, pf = prefill_values(out, args.prefill_regex or DEFAULT_PREFILL)
+        timing, stream_name = out, "stdout"
     warm = pf[-1] if pf else 0.0
     cold = pf[0] if pf else 0.0
-    tl = stamps(os.path.join(d, "stderr.ts"))
+    tl = stamps(os.path.join(d, stream_name + ".ts"))
     anchor = 0.0
     if pat:
         # stderr.ts holds one stamp per stderr line (same order), so the line index gives the arrival time.
         rx = re.compile(pat)
-        idx = [i for i, line in enumerate(err.splitlines()) if rx.search(line)]
+        idx = [i for i, line in enumerate(timing.splitlines()) if rx.search(line)]
         if idx and idx[-1] < len(tl):
             anchor = tl[idx[-1]][0]
     if args.anchor_regex:
@@ -146,17 +208,20 @@ def cmd_summarize(args):
         idx = [i for i, line in enumerate(err.splitlines()) if rx.search(line)]
         if idx and idx[-1] < len(tl):
             anchor = tl[idx[-1]][0]
-    if not anchor and tl:
-        anchor = tl[-1][0]
     rows = samples(os.path.join(d, "samples.tsv"))
     joules, cyc, busy, span, temp = integrate(rows, anchor - warm / 1e3, anchor)
     sp = span or 1.0
     ev = [r[8] for r in rows]
     t0w = anchor - warm / 1e3
-    evw = [r[8] for r in rows if t0w <= r[0] <= anchor + KIT_EVICT_PAD_S]
+    before = [r for r in rows if r[0] <= t0w]
+    after = [r for r in rows if r[0] >= anchor]
+    window = (before[-1:] + [r for r in rows if t0w < r[0] < anchor] + after[:1]) if pf else rows
+    evw = [r[8] for r in window]
     avail = [r[6] for r in rows]
     klog = [l for l in read_text(os.path.join(d, "klog.txt")).splitlines() if l.strip()]
     metrics = {}
+    if "generation_request_elapsed_ms" in out_json:
+        metrics["request_latency_ms"] = float(out_json["generation_request_elapsed_ms"])
     for item in args.metric or []:
         name, _, rx = item.partition("=")
         found = re.findall(rx, err) or re.findall(rx, read_text(os.path.join(d, "stdout")))
@@ -164,12 +229,15 @@ def cmd_summarize(args):
             last = found[-1]
             metrics[name] = float(last[0] if isinstance(last, tuple) else last)
     gen = out_json.get("generated_tokens")
-    tokens = args.tokens
+    counts = [int(v["tokens"]) for v in fr] or [args.tokens] * len(pf)
+    tokens = counts[-1] if counts else args.tokens
+    cold_tokens = counts[0] if counts else args.tokens
     rec = dict(
         tag=args.tag, arm=args.arm or args.tag, round=args.round, host=meta.get("host"), bin_sha=meta.get("bin_sha"),
         rc=meta.get("rc"), wall_ms=meta.get("wall_ms"), mem_start=meta.get("mem"),
-        prefills=len(pf), prefill_ms_cold=cold, prefill_ms_warm=warm, tokens=tokens,
-        tok_s_cold=(tokens / (cold / 1e3) if tokens and cold else 0.0),
+        workload=args.workload, prefills=len(pf), prefill_ms_cold=cold, prefill_ms_warm=warm, tokens=tokens,
+        prefill_tokens=counts, rank_evidence=[{k: v[k] for k in ("key", "tokens", "logits", "state") if k in v} for v in fr],
+        tok_s_cold=(cold_tokens / (cold / 1e3) if cold_tokens and cold else 0.0),
         tok_s_warm=(tokens / (warm / 1e3) if tokens and warm else 0.0),
         window_s=round(span, 3), joules=round(joules, 1), watts=round(joules / sp, 1),
         sclk_mhz=round(cyc / sp / 1e6, 0), busy_pct=round(busy / sp, 1), temp_max_c=round(temp, 0),
@@ -180,29 +248,25 @@ def cmd_summarize(args):
         evicted_ms_run=(growth(ev) if ev else -1), evicted_ms_window=(growth(evw) if len(evw) > 1 else -1),
         avail_min_gb=(round(min(avail) / 2 ** 20, 1) if avail else -1),
         klog_events=len(klog))
-    reasons = []
-    if rec["rc"] not in (0, None):
-        reasons.append("rc=%s" % rec["rc"])
-    if rec["evicted_ms_window"] > 0 or (args.evict_whole_run and rec["evicted_ms_run"] > 0):
-        reasons.append("kfd evicted_ms +%d in the timed window" % max(rec["evicted_ms_window"], 0))
-    if avail and max(avail) > 0 and rec["avail_min_gb"] < args.min_avail_gb:
-        reasons.append("MemAvailable %.1f GiB < %.1f" % (rec["avail_min_gb"], args.min_avail_gb))
+    reasons = process_reasons(meta) + telemetry_reasons(
+        rows, args.min_avail_gb, rec["evicted_ms_run"] if args.evict_whole_run else rec["evicted_ms_window"],
+        sampler_error=read_text(os.path.join(d, "sampler.error")))
+    if pf and (not anchor or not before or not after):
+        reasons.append("insufficient timed-window coverage")
     warnings = []
     if rec["evicted_ms_run"] > 0 and rec["evicted_ms_window"] <= 0:
         warnings.append("kfd evicted_ms +%d outside the timed window (load)" % rec["evicted_ms_run"])
     if klog:
         (reasons if args.strict_klog else warnings).append("klog %d events: %s" % (len(klog), klog[0][-80:]))
-    if not rows:
-        reasons.append("no samples")
-    elif not any(r[6] for r in rows):
+    if rows and not any(r[6] for r in rows):
         warnings.append("host memory and kfd evictions not sampled on this host")
     if args.need_prefill and not pf:
         reasons.append("no prefill figure")
     for rx in args.require or []:
-        if not re.search(rx, err, re.M):
+        if not re.search(rx, text, re.M):
             reasons.append("missing /%s/" % rx[:40])
     for rx in (args.reject if args.reject is not None else DEFAULT_REJECT):
-        m = re.search(rx, err, re.M)
+        m = re.search(rx, text, re.M)
         if m:
             reasons.append("stderr /%s/" % rx[:30])
     rec["valid"] = not reasons
@@ -230,12 +294,18 @@ def main(argv=None):
     m.add_argument("--mem", default="")
     m.add_argument("--host-tag", default="local")
     m.add_argument("--bin-sha", default="-")
+    m.add_argument("--intentional-shutdown", action="store_true")
+    pair = sub.add_parser("pair")
+    pair.add_argument("paths", nargs=2)
+    pair.add_argument("--expected", type=int, default=0)
     s = sub.add_parser("summarize")
     s.add_argument("dir")
     s.add_argument("--tag", required=True)
     s.add_argument("--arm")
+    s.add_argument("--workload", default="")
     s.add_argument("--round", type=int, default=0, help="ABAB round index (abab.py pairs arms by round)")
     s.add_argument("--tokens", type=int, default=0, help="prompt tokens, for prefill tok/s and clocks per token")
+    s.add_argument("--family", choices=tuple(FAMILY_PREFILL))
     s.add_argument("--prefill-regex", action="append", help="regex with one float group; suffix @s = seconds")
     s.add_argument("--anchor-regex", help="stderr line that ends the timed prefill (default: the figure's own line)")
     s.add_argument("--metric", action="append", help="NAME=REGEX (one float group, last match)")
@@ -246,6 +316,8 @@ def main(argv=None):
     s.add_argument("--evict-whole-run", action="store_true", help="any eviction in the run invalidates (decode kits)")
     s.add_argument("--strict-klog", action="store_true", help="kernel-log events invalidate instead of warning")
     args = p.parse_args(argv)
+    if args.cmd == "pair":
+        return bool(pair_receipts(args.paths, args.expected))
     {"meta": cmd_meta, "summarize": cmd_summarize}[args.cmd](args)
 
 

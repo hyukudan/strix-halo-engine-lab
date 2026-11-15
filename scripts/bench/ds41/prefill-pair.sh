@@ -40,16 +40,13 @@ for ((r = 0; r < rounds; r++)); do
             tag=s$s-$name-$r
             kit_fits "$need" || { echo "== $tag SKIP (left $(kit_left) s < $need)"; continue; }
             export KIT_TAG=$tag KIT_ARM=s$s-$name KIT_ROUND=$r KIT_TOKENS=$n
-            export KIT_RECEIPT_ARGS="--need-prefill --prefill-regex ^ttft.run.[0-9]+:.([0-9.]+).ms"
+            export KIT_EXPECTED=$rep KIT_RECEIPT_ARGS="--need-prefill --family ds41"
             p1=(env "${PE[@]}" "${E[@]}" "$pbin" "$pmodel" --rank 1 --transport usb4-auto --prompt "$pids/p$n.csv" "${RW[@]}"
                 --ttft-timing --ttft-warmup 512 --repeat "$rep" "${A[@]}")
             p0=(env "${PE[@]}" "${E[@]}" "$bin" "$model" --rank 0 --transport usb4-auto --prompt "$ids/p$n.csv" "${RW[@]}"
                 --ttft-timing --ttft-warmup 512 --repeat "$rep" "${A[@]}")
             echo "#### $tag args[$args] env[$envs] t+$(($(date +%s) - KIT_T0))s"
             kit_pair_arm "$out/$tag" "$(($(kit_left) - 3))" '^ttft|rank 1|what\(\)' p1 p0
-            f0=$(grep -aoE 'fnv [0-9a-f]{8}' "$out/$tag-r0/stderr" 2>/dev/null | tail -1)
-            f1=$(kit_peer "grep -aoE 'fnv [0-9a-f]{8}' $(printf %q "${KIT_PEER_OUT:-$out}/$tag-r1/stderr") | tail -1" 2>/dev/null)
-            [[ -n $f0 && $f0 == "$f1" ]] && echo "   ranks agree ($f0)" || echo "   ! ranks DIFFER or no fnv (r0 '$f0' r1 '$f1')"
             sleep "${KIT_SETTLE_S:-2}"
         done
     done

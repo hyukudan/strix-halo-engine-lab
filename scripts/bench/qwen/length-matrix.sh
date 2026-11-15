@@ -69,7 +69,7 @@ for ((r = 0; r < rounds; r++)); do
                 tag=s$s-$m-$name-$r need=$(need_of "$n" "$m")
                 kit_fits "$need" || { echo "== $tag SKIP (left $(kit_left) s < $need)"; continue; }
                 cap=$(($(kit_left) - 3))
-                export KIT_TAG=$tag KIT_ARM=s$s-$m-$name KIT_ROUND=$r KIT_TOKENS=$n KIT_RECEIPT_ARGS='--need-prefill --anchor-regex qpf2k.sched.block.rows|prefill-wall-ms='
+                export KIT_TAG=$tag KIT_ARM=s$s-$m-$name KIT_ROUND=$r KIT_TOKENS=$n KIT_WORKLOAD=s$s-$m KIT_RECEIPT_ARGS='--need-prefill'
                 echo "#### $tag args[${args}] env[${envs}] t+$(($(date +%s) - KIT_T0))s"
                 case $m in
                     full)

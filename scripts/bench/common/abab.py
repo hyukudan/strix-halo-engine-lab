@@ -7,7 +7,7 @@
   abab.py summary OUT [--base ARM] [--metric NAME]
                                         read OUT/**/receipt.json; per arm: valid/total, median warm and cold prefill,
                                         tok/s, clock, GPU clocks per token, identities; per-round deltas vs the base
-                                        arm (default: first arm seen in round order); invalid receipts are listed
+                                        arm (explicit --base within one comparable workload); invalid receipts are listed
                                         with their reasons and excluded.
 A comparison with fewer than 3 valid rounds per arm is printed but marked "UNDER 3 PAIRS".
 """
@@ -50,6 +50,18 @@ def value(rec, metric):
     return (rec.get("metrics") or {}).get(metric, 0.0)
 
 
+def logits_verdict(left, right):
+    """Compare each round once; no set reduction or discarded missing evidence."""
+    if not left or set(left) != set(right):
+        return "missing logits evidence/rounds"
+    pairs = [(left[r].get("logits_sha"), right[r].get("logits_sha")) for r in sorted(left)]
+    if any(a in (None, "", "-") or b in (None, "", "-") for a, b in pairs):
+        return "missing logits evidence"
+    varied = any(len({p[i] for p in pairs}) > 1 for i in (0, 1))
+    verdict = "logits DIFFER" if any(a != b for a, b in pairs) else "bitwise-same logits"
+    return verdict + ("; within-arm nondeterminism (or different workloads)" if varied else "")
+
+
 def cmd_summary(args):
     recs = load(args.out)
     if not recs:
@@ -59,7 +71,7 @@ def cmd_summary(args):
     for rec in sorted(recs, key=lambda r: (r.get("round", 0), r["_dir"])):
         if rec["arm"] not in order:
             order.append(rec["arm"])
-    base = args.base or order[0]
+    base = args.base
     metric = args.metric
     for rec in recs:
         if not rec.get("valid"):
@@ -70,23 +82,31 @@ def cmd_summary(args):
         ok = [r for r in recs if r["arm"] == arm and r.get("valid")]
         allr = [r for r in recs if r["arm"] == arm]
         per[arm] = {r.get("round", 0): r for r in ok}
+        if len(per[arm]) != len(ok):
+            print("! duplicate rounds for %s; comparison disabled" % arm)
+            per[arm] = {}
         print("%s | %d/%d | %.1f | %.1f | %.0f | %.2f | %.0f | %.0f | %.0f | %s | %s" % (
-            arm, len(ok), len(allr), med(r["prefill_ms_warm"] for r in ok), med(r["prefill_ms_cold"] for r in ok),
-            med(r["tok_s_warm"] for r in ok), med(value(r, metric) for r in ok), med(r["sclk_mhz"] for r in ok),
-            med(r["busy_pct"] for r in ok), med(r.get("gpu_clocks_per_token") or 0 for r in ok),
-            ",".join(sorted({r["logits_sha"] for r in ok}))[:40], ",".join(sorted({r["gen_sha"] for r in ok}))[:28]))
-    base_ids = {r["logits_sha"] for r in per[base].values()} - {"-"}
+            arm, len(ok), len(allr), med(r.get("prefill_ms_warm", 0) for r in ok), med(r.get("prefill_ms_cold", 0) for r in ok),
+            med(r.get("tok_s_warm", 0) for r in ok), med(value(r, metric) for r in ok), med(r.get("sclk_mhz", 0) for r in ok),
+            med(r.get("busy_pct", 0) for r in ok), med(r.get("gpu_clocks_per_token") or 0 for r in ok),
+            ",".join(sorted({r.get("logits_sha", "-") for r in ok}))[:40], ",".join(sorted({r.get("gen_sha", "-") for r in ok}))[:28]))
+    if base not in per:
+        print("select an explicit --base ARM for a comparable workload group")
+        return 0
     for arm in order:
         if arm == base:
             continue
         rounds = sorted(set(per[arm]) & set(per[base]))
+        if any((per[arm][r].get("tokens"), per[arm][r].get("prefill_tokens"), per[arm][r].get("workload")) !=
+               (per[base][r].get("tokens"), per[base][r].get("prefill_tokens"), per[base][r].get("workload")) for r in rounds):
+            print("%s vs %s: incompatible workloads; comparison disabled" % (arm, base))
+            continue
         deltas = []
         for r in rounds:
             b, c = value(per[base][r], metric), value(per[arm][r], metric)
             if b:
                 deltas.append(100.0 * (c - b) / b)
-        ids = {r["logits_sha"] for r in per[arm].values()} - {"-"}
-        same = "bitwise-same logits" if ids and ids == base_ids else ("logits DIFFER" if ids and base_ids else "no logits")
+        same = logits_verdict(per[base], per[arm])
         print("%s vs %s: %s per-round %s median %+.2f %% over %d rounds%s; %s" % (
             arm, base, metric, " ".join("%+.2f" % x for x in deltas) or "-", statistics.median(deltas) if deltas else 0.0, len(deltas),
             "" if len(deltas) >= 3 else " UNDER 3 PAIRS", same))

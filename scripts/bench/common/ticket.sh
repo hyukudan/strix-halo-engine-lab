@@ -22,4 +22,3 @@ source "$here/runlib.sh"
     echo "kit rc=$? after $(( $(date +%s) - KIT_T0 )) s"
 } >"$out/ticket.log" 2>&1
 kit_summary_done "$out"
-grep -a '^== \|^ticket \|^kit rc\|SKIP\|ABORT' "$out/ticket.log" | head -40 >>"$out/summary.txt"
