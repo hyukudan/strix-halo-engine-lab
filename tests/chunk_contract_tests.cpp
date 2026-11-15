@@ -134,12 +134,43 @@ int main() {
     // Section 4: the WMMA attention open row (odd call end from an even start) is carried; even ends commit all.
     CHECK(cc::plan_call(0, 15, cc::kWmmaKPairRows, false).commit_end == 14 && cc::plan_call(0, 15, cc::kWmmaKPairRows, false).carry_tokens == 1);
     CHECK(cc::plan_call(0, 1, cc::kWmmaKPairRows, false).commit_end == 0 && cc::plan_call(14, 526, cc::kWmmaKPairRows, false).carry_tokens == 0);
-    CHECK(32 % cc::kWmmaKPairRows == 0 && 16 % cc::kWmmaKPairRows == 0);
+    static_assert(32 % cc::kWmmaKPairRows == 0 && 16 % cc::kWmmaKPairRows == 0);
     CHECK(cc::chunk_contract_tag("gdn-c32-r3", 32, 4) == "gdn-c32-r3+chunkinv-attn-state-v1/b32/s4");
     CHECK(cc::absolute_segment(5, 9, 4, 1).tile_begin == 5 && cc::absolute_segment(5, 9, 4, 1).tile_end == 8);
-    {   // plan predicate: T-multiple blocks + tails; a 16-row tail before the last 32 boundary is not canonical
+    {   // A final tail may not be split into independently closed partial blocks.
         const std::vector<std::uint64_t> ok{4096, 8192, 8256, 8272}, bad{4096, 8192, 8208, 8224, 8229}, tail{8192, 8224, 8240, 8245};
-        CHECK(cc::block_plan_canonical(ok, 0, 32)); CHECK(!cc::block_plan_canonical(bad, 0, 32)); CHECK(cc::block_plan_canonical(tail, 0, 32));
+        CHECK(cc::block_plan_canonical(ok, 0, 32)); CHECK(!cc::block_plan_canonical(bad, 0, 32)); CHECK(!cc::block_plan_canonical(tail, 0, 32));
+        CHECK(!cc::block_plan_canonical(std::vector<std::uint64_t>{1, 2}, 0, 32));
+        CHECK(cc::block_plan_canonical(std::vector<std::uint64_t>{33}, 0, 32));
+        CHECK(!cc::block_plan_canonical(std::vector<std::uint64_t>{32}, 1, 32));
+        CHECK(!cc::block_plan_canonical(std::vector<std::uint64_t>{32, 32}, 0, 32));
+        CHECK(!cc::block_plan_canonical(std::vector<std::uint64_t>{64, 32}, 0, 32));
+        CHECK(!cc::block_plan_canonical(std::vector<std::uint64_t>{1}, 0, 0));
+        CHECK(cc::block_plan_canonical(std::vector<std::uint64_t>{1, 2}, 0, 1));
+        const auto split = recurrence(2, {1, 2}, 32, false), full = recurrence(2, {2}, 32, false);
+        CHECK(bits(split.state) != bits(full.state)); CHECK(split.rows == full.rows); // rows alone miss the state mismatch
+        for (const auto& cuts : {ok, std::vector<std::uint64_t>{33}}) {
+            const auto r = recurrence(cuts.back(), cuts, 32, false);
+            const auto reference = recurrence(cuts.back(), {cuts.back()}, 32, false);
+            CHECK(r.rows == reference.rows); CHECK(bits(r.state) == bits(reference.state));
+        }
+    }
+    // Exhaust every partition of short prompts, including a nonzero aligned start and initial state.
+    for (std::uint64_t begin : {0ULL, 4ULL}) for (unsigned count = 1; count <= 12; ++count) {
+        const auto end = begin + count;
+        std::vector<std::uint32_t> reference(static_cast<std::size_t>(end));
+        const float state = run_rows(0.25F, begin, end, 4, reference);
+        for (unsigned mask = 0; mask < (1U << (count - 1U)); ++mask) {
+            std::vector<std::uint64_t> cuts;
+            for (unsigned i = 1; i < count; ++i) if (mask & (1U << (i - 1U))) cuts.push_back(begin + i);
+            cuts.push_back(end);
+            if (!cc::block_plan_canonical(cuts, begin, 4)) continue;
+            std::vector<std::uint32_t> rows(static_cast<std::size_t>(end));
+            float actual = 0.25F;
+            auto last = begin;
+            for (const auto e : cuts) { actual = run_rows(actual, last, e, 4, rows); last = e; }
+            CHECK(rows == reference); CHECK(bits(actual) == bits(state));
+        }
     }
     std::printf(g_fail ? "chunk_contract_tests: %d failures\n" : "chunk_contract_tests: ok\n", g_fail);
     return g_fail ? 1 : 0;

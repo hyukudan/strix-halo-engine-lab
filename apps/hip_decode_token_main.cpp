@@ -5980,7 +5980,7 @@ static int run_decode_entry(
                 const bool canonical = strix::chunk_contract::block_plan_canonical(ends, paired.start_position, 32U);
                 std::fprintf(stderr, "chunkinv %s: GDN FAST plan T%u start %llu rows %zu units %zu -> %s\n",
                     strix::chunk_contract::kContractName, paired.logical_rows, static_cast<unsigned long long>(paired.start_position),
-                    prompt.size(), ends.size(), canonical ? "canonical" : "NOT canonical (a call ends inside a 32-row block)");
+                    prompt.size(), ends.size(), canonical ? "canonical" : "NOT canonical (unaligned start/interior end or non-increasing ends)");
             }
             if(prefix_state) {
                 strix::decode_cli::QwenTiledPlanConfig plan;

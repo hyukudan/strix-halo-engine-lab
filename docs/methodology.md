@@ -82,6 +82,10 @@ bash scripts/bench/bench.sh run --engine E --only exactness --suite quick --json
 
 Chunk invariance (`chunkinv-attn-state-v1`, `src/core/chunk_contract.hpp`): `scripts/bench/chunkinv/fixtures.sh
 BUILD_DIR OUT_DIR` runs the GDN open-tail, dense flash split and WMMA K-pair fixtures on one GPU.
+Any required fixture failure or timeout makes the runner fail; an unavailable optional `hipcc` probe is an explicit skip.
+Dense attention evidence covers one layer with fixed Q/K/V and fixture-managed carry/replay, not arbitrary
+Gemma4 transactions or prefix reuse. The KDA host fixture checks double-precision algebra, not device execution.
+Neither these fixtures nor token equality alone establish multilayer cached logit/state equality.
 CPU tests and config inspection do not qualify native execution.
 
 <a id="how-it-works"></a>

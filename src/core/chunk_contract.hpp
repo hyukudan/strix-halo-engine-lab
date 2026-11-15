@@ -84,18 +84,15 @@ constexpr CallPlan plan_call(std::uint64_t committed, std::uint64_t call_end, un
 // A prefix-cache entry may be stored at `end` only when it is a committed boundary.
 constexpr bool cacheable_boundary(std::uint64_t end, unsigned block) noexcept { return block <= 1U || end % block == 0U; }
 
-// A block recurrence that closes its partial block per call is chunk-invariant over a call plan when every call that
-// starts before the last absolute block boundary floor(L / block) * block also ends on a block boundary: then the
-// only partial blocks are in the final suffix, whose split is a function of L (and the tail ladder) alone.
-// ends: absolute end of each call in order, last == L.
+// Equivalent to one whole-call block recurrence: the start and every non-final end must be block-aligned.
+// Only the final call may close a partial block. Ends must strictly increase; an empty plan is a no-op.
+// ends: absolute end of each call in order, last == L. A zero block size is invalid.
 template <class Ends>
 constexpr bool block_plan_canonical(const Ends& ends, std::uint64_t begin, unsigned block) noexcept {
-    if (block <= 1U) return true;
-    std::uint64_t last = begin, total = begin;
-    for (const auto e : ends) total = e;
-    const std::uint64_t suffix = total / block * block;
+    if (block == 0U || begin % block != 0U) return false;
+    std::uint64_t last = begin;
     for (const auto e : ends) {
-        if (last < suffix && e % block != 0U) return false;
+        if (e <= last || last % block != 0U) return false;
         last = e;
     }
     return true;

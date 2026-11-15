@@ -526,7 +526,8 @@ void attention_flash(const float* q, const gpu::KvRead* reads, unsigned rows, un
         while (splits > 1 && attn_core::dense::workspace_floats(rows, heads, dim, splits) * sizeof(float) > workspace_bytes) --splits;
     }
     // STRIX_G4_PREFILL_FLASH_ABSSEG=1 (opt-in, identity dense-flash-absseg-v1/s512, bit-changing against the block share):
-    // split boundaries from absolute key tiles (chunk_contract.hpp), so rows get the same bits for any chunk size.
+    // split boundaries from absolute key tiles (chunk_contract.hpp). Arbitrary transaction cuts also require
+    // open-row carry/replay through every layer; the dense fixture's replay does not qualify this engine path.
     // 8 segments of 512 tiles cover max_positions; a call that cannot hold its segments fails closed.
     unsigned seg_tiles = 0;
     static const bool absseg = [] {
