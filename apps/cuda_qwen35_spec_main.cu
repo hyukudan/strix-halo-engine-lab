@@ -14,6 +14,7 @@
 #include <vector>
 
 #include "strix/device/cuda_enumerator.hpp"
+#include "strix/cuda_core/dense.hpp"
 #include "strix/qwen35/cuda_engine.hpp"
 #include "strix/qwen35/cuda_spec.hpp"
 
@@ -69,7 +70,8 @@ int main(int argc, char** argv) {
         std::string model, synth, ids_arg, ids_file, sources = "copy,chain,hybrid", chain_hidden = "post", label = "run";
         std::uint32_t n_gen = 256, prompt_len = 64, layers_override = 0, max_pos = 0, max_block = 32, chain_k = 7;
         double oracle = -1.0;
-        bool cost_table = false, check = true, graphs = true, seed_costs = true;
+        bool cost_table = false, check = true, graphs = true, seed_costs = true, turbo_lm_head = true;
+        q::TurboWeights turbo = q::TurboWeights::off;
         for (int i = 1; i < argc; ++i) {
             const std::string a = argv[i];
             auto next = [&]() -> std::string {
@@ -94,6 +96,20 @@ int main(int argc, char** argv) {
             else if (a == "--chain-hidden") chain_hidden = next();
             else if (a == "--max-pos") max_pos = std::uint32_t(std::stoul(next()));
             else if (a == "--label") label = next();
+            else if (a == "--turbo-weights") {
+                const std::string v = next();
+                if (v != "off" && v != "native" && v != "onfly") throw std::runtime_error("--turbo-weights expects off|native|onfly");
+                turbo = v == "onfly" ? q::TurboWeights::onfly : v == "native" ? q::TurboWeights::native : q::TurboWeights::off;
+            } else if (a == "--turbo-lm-head") {
+                const std::string v = next();
+                if (v != "nvfp4" && v != "bf16") throw std::runtime_error("--turbo-lm-head expects nvfp4|bf16");
+                turbo_lm_head = v == "nvfp4";
+            } else if (a == "--dense-arith") {
+                const std::string v = next();
+                namespace cc = strix::cuda_core;
+                cc::set_dense_arith(v == "fp32" ? cc::DenseArith::fp32 : v == "mma2" ? cc::DenseArith::mma2
+                                    : v == "mma1" ? cc::DenseArith::mma1 : cc::DenseArith::mma3);
+            }
             else throw std::runtime_error("unknown argument " + a);
         }
         if (model.empty() == synth.empty())
@@ -109,6 +125,8 @@ int main(int argc, char** argv) {
         }
         q::EngineOptions opt;
         opt.use_graphs = graphs;
+        opt.turbo_weights = turbo;
+        opt.turbo_lm_head = turbo_lm_head;
         opt.max_positions = std::max<std::uint32_t>(max_pos, std::uint32_t(std::max<std::size_t>(prompt.size(), prompt_len) + n_gen + 128 +
                                                                           (cost_table ? 4096 : 0)));
         std::unique_ptr<q::CudaEngine> E;
@@ -119,6 +137,7 @@ int main(int argc, char** argv) {
             E = q::CudaEngine::synthetic(cfg, synth == "q8_0" ? q::PackFormat::q8_0 : q::PackFormat::bf16, opt, 0x5eedULL);
         }
         const auto& cfg = E->config();
+        std::printf("identity: %s\n", E->identity().c_str());
         if (prompt.empty()) {
             std::uint64_t s = 99;
             for (std::uint32_t i = 0; i < prompt_len; ++i) prompt.push_back(std::uint32_t(mix(s + i) % cfg.vocab));
