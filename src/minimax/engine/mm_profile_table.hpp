@@ -52,13 +52,23 @@ static_assert(msa_flash_policy(kMsaFlashLayers) != nullptr &&
               "the bundle member's policy id names the bundle's layer set");
 
 // Bundle selection is requested provenance; only effective members enter agreement.
-inline constexpr std::array<strix::profile::Lever, 2> profile_table{{
+inline constexpr std::array<strix::profile::Lever, 4> profile_table{{
     // Prefill only: MSA attention of windows > 8 rows; selection, block lists and K/V caches unchanged.
-    {"msa_flash", "STRIX_MM_PF_MSA_FLASH", "", {"", "", ""}, "0", strix::profile::Kind::bit_changing,
-     {true, false, true}, {true, true, true}, "", "0",
-     "msa-flash-bf16-l40-v1 (EXL3 gate PASS 8K KL 0.0012, 32K KL 0.0029); 2 = two-term operands", false, {}, true},
-    {"msa_flash_layers", "STRIX_MM_PF_MSA_FLASH_LAYERS", "", {"", "", ""}, kMsaFlashLayers, strix::profile::Kind::bit_changing,
-     {true, false, true}, {true, true, true}, "", "", "FAST MSA flash layer set (read only while msa_flash is on)", false, {}, true},
+    {"msa_flash", "STRIX_MM_PF_MSA_FLASH", "", {"", "", "", "1"}, "0", strix::profile::Kind::bit_changing,
+     {true, false, true, false}, {true, true, true, true}, "", "0",
+     "msa-flash-bf16-l40-v1 (EXL3 gate PASS 8K KL 0.0012, 32K KL 0.0029); 2 = two-term operands; turbo = 1 (mode 11) on layers 0-59 ahead of qualification",
+     false, {false, false, false, true}, true},
+    {"msa_flash_layers", "STRIX_MM_PF_MSA_FLASH_LAYERS", "", {"", "", "", "0-59"}, kMsaFlashLayers, strix::profile::Kind::bit_changing,
+     {true, false, true, false}, {true, true, true, true}, "", "", "FAST MSA flash layer set (read only while msa_flash is on); turbo = 0-59, per-prompt qualification with the layer-range kit (scripts/bench/mmflash)",
+     false, {false, false, false, true}, true},
+    // PENDING turbo cells: the lever exists only on an open PR / has no per-layer selector yet (reason in `source`).
+    {"moe_invariant", "STRIX_MM_MOE_INVARIANT", "", {"", "", "", "1"}, "0", strix::profile::Kind::bit_changing,
+     {true, false, true, false}, {false, false, false, false}, "", "0",
+     "pending: rows-free MoE order (open PR #662, chunkinv/linear-contract); cell flips with that merge", false, {}, true},
+    {"iu4_layers", "STRIX_MM_IU4_LAYERS", "", {"", "", "", ""}, "", strix::profile::Kind::bit_changing,
+     {true, false, true, false}, {false, false, false, false}, "", "",
+     "pending: transient IU4 per layer (fast_i4 is all-or-nothing today and fails the gate, KL 0.079); no per-layer selector yet; "
+     "never imposed where it slows", false, {}, true},
 }};
 
 }  // namespace strix::minimax::defaults
