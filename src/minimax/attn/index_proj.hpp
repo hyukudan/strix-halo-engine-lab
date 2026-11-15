@@ -50,6 +50,9 @@ void enqueue_index_proj_decode_lds(const IndexProjView& v, hipStream_t stream);
 // every tc gives the same bits. Any rows >= 1; rows * 6144 * 4 < 2^32. CTA order: column blocks fastest (the
 // blocks of one row block share x in L2); rows_fast = true is the measured-slower order, kept for the bench.
 void enqueue_index_proj_wmma(const IndexProjView& v, hipStream_t stream, unsigned tc = 4, bool rows_fast = false);
+// Diagnostics of the tc 4 kernel (bench only): 1 = x rows taken modulo 128 (x stays in cache; wrong outputs),
+// 2 = the same kernel capped at 192 VGPRs (2 CTAs per CU; same bits as enqueue_index_proj_wmma).
+void enqueue_index_proj_wmma_diag(const IndexProjView& v, int mode, hipStream_t stream);
 // Diagnostics (bench only, wrong outputs for modes 1-3): rows 1 (ring 32) or > 1 (row pairs, ring 16); mode 0 = the
 // decode kernel, 1 = no weight loads, 2 = pure FMA chain, 3 = no FMAs (weight + activation streams).
 void enqueue_index_proj_diag(const IndexProjView& v, int mode, hipStream_t stream);

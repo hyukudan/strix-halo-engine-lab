@@ -308,6 +308,22 @@ template <unsigned TC, bool CF> __global__ __launch_bounds__(256) void proj_wmma
     __shared__ tall::Storage<TC> lds;
     tall::core<TC>(v.x, kProjIn, v.rows, IndexColsOrder<CF>{{v.w, v.iq, v.ik}}, lds);
 }
+// Diagnostics (bench only): mode 1 = every row reads x row (row % 128): the x stream stays in cache (wrong
+// outputs); mode 2 = the production kernel with at most 192 VGPRs (8 waves per SIMD: 2 CTAs per CU), same bits.
+struct IndexColsXCached : IndexColsOrder<true> {
+    const unsigned char* xb;
+    __device__ __forceinline__ tall::Half16 fragment(unsigned row, unsigned unit) const {
+        return tall::detail::row_fragment(tall::detail::uniform(xb), (row % 128U) * kProjIn * 4U + unit * 64U);
+    }
+};
+__global__ __launch_bounds__(256) void proj_wmma_xcached_kernel(IndexProjView v) {
+    __shared__ tall::Storage<4> lds;
+    tall::core<4>(v.x, kProjIn, v.rows, IndexColsXCached{{{v.w, v.iq, v.ik}}, reinterpret_cast<const unsigned char*>(v.x)}, lds);
+}
+__global__ __launch_bounds__(256) __attribute__((amdgpu_waves_per_eu(8, 8))) void proj_wmma_cap_kernel(IndexProjView v) {
+    __shared__ tall::Storage<4> lds;
+    tall::core<4>(v.x, kProjIn, v.rows, IndexColsOrder<true>{{v.w, v.iq, v.ik}}, lds);
+}
 
 using strix::hip_check;
 
@@ -443,6 +459,15 @@ void enqueue_index_proj_wmma(const IndexProjView& v, hipStream_t stream, unsigne
     default: throw std::invalid_argument("index_proj wmma: tc must be 4, 2 or 1");
     }
     hip_check(hipGetLastError(), "index_proj wmma");
+}
+void enqueue_index_proj_wmma_diag(const IndexProjView& v, int mode, hipStream_t stream) {
+    if (v.rows == 0 || static_cast<std::uint64_t>(v.rows) * kProjIn * 4U >= (std::uint64_t{1} << 32U))
+        throw std::invalid_argument("index_proj wmma diag: rows must be 1 .. 174762");
+    const dim3 grid(kWmmaTiles / 4U, (v.rows + tall::kRows - 1U) / tall::kRows);
+    if (mode == 1) hipLaunchKernelGGL(proj_wmma_xcached_kernel, grid, dim3(256), 0, stream, v);
+    else if (mode == 2) hipLaunchKernelGGL(proj_wmma_cap_kernel, grid, dim3(256), 0, stream, v);
+    else throw std::invalid_argument("index_proj wmma diag: mode must be 1 or 2");
+    hip_check(hipGetLastError(), "index_proj wmma diag");
 }
 
 void enqueue_index_proj(const IndexProjView& v, hipStream_t stream) {

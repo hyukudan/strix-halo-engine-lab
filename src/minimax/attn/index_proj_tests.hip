@@ -271,6 +271,12 @@ void wmma_tests(std::mt19937& rng) {
                 std::fprintf(stderr, "FAIL: wmma rows %u tc %u rows_fast %d guard %d finite %d\n", rows, tc, int(rows_fast), int(guard), int(finite));
             }
         }
+        ma::enqueue_index_proj_wmma_diag({x, w.packed, iq, ik, rows}, 2, nullptr);  // the 192-VGPR form: same bits
+        hip_ok(hipDeviceSynchronize(), "sync");
+        if (host(iq, first_q.size()) != first_q || host(ik, first_k.size()) != first_k) {
+            ++g_fail;
+            std::fprintf(stderr, "FAIL: wmma rows %u 192-VGPR form differs from tc 4\n", rows);
+        }
     }
     for (void* p : {static_cast<void*>(x), static_cast<void*>(x16), static_cast<void*>(eq), static_cast<void*>(ek), static_cast<void*>(cq),
                     static_cast<void*>(ck), static_cast<void*>(iq), static_cast<void*>(ik)})
@@ -319,6 +325,7 @@ void bench_wmma(std::mt19937& rng) {
     auto launch = [&](int arm, unsigned l, unsigned rows) {
         const ma::IndexProjView v{x, ws[l].packed, iq, ik, rows};
         if (arm == 0) ma::enqueue_index_proj_slab(v, st);
+        else if (arm >= 4) ma::enqueue_index_proj_wmma_diag(v, arm - 3, st);
         else ma::enqueue_index_proj_wmma(v, st, arm == 3 ? 2U : 4U, arm == 2);
     };
     auto timed = [&](int arm, unsigned rows, unsigned layers, bool warm) {
@@ -331,12 +338,17 @@ void bench_wmma(std::mt19937& rng) {
         hip_ok(hipEventElapsedTime(&ms, e0, e1), "elapsed");
         return 1000.0 * ms / layers;
     };
-    for (int arm = 0; arm < 4; ++arm) launch(arm, 0, 8);  // code objects loaded, not timed
+    for (int arm = 0; arm < 6; ++arm) launch(arm, 0, 8);  // code objects loaded, not timed
     hip_ok(hipStreamSynchronize(st), "sync");
     const double cold_a = timed(0, 4096, 1, false), cold_b = timed(1, 4096, 1, false);
     std::printf("wmma bench cold (first 4096-row call, layer 0) us: slab %.0f wmma-tc4 %.0f\n", cold_a, cold_b);
-    const char* names[4] = {"slab", "wmma-tc4", "wmma-tc4-rowsfast", "wmma-tc2"};
-    for (const auto [a, b] : {std::pair{0, 1}, std::pair{2, 1}, std::pair{1, 3}})
+    // Run 2 (18:25 11-15, column-fast): 4096 rows tc4-rowsfast 4426 vs tc4 1715; tc2 1.21-1.74x of tc4 at 1024..8192.
+    const char* names[6] = {"slab", "wmma-tc4", "wmma-tc4-rowsfast", "wmma-tc2", "diag-xcached", "wmma-tc4-vgpr192"};
+    const char* series = std::getenv("STRIX_MMATTN_WMMA_SERIES");  // "diag" (default): slab|tc4, tc4|xcached, tc4|vgpr192
+    const bool orders = series != nullptr && std::strcmp(series, "orders") == 0;  // "orders": slab|tc4, rowsfast|tc4, tc4|tc2
+    const std::vector<std::pair<int, int>> pairs = orders ? std::vector<std::pair<int, int>>{{0, 1}, {2, 1}, {1, 3}}
+                                                          : std::vector<std::pair<int, int>>{{0, 1}, {1, 4}, {1, 5}};
+    for (const auto& [a, b] : pairs)
         for (unsigned rows : {4096U, 1024U, 2048U, 8192U}) {
             const unsigned layers = rows > 2048 ? 12 : 30;
             std::vector<double> ta, tb, ratio;
