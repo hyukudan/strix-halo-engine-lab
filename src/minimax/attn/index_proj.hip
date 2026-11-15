@@ -2,6 +2,7 @@
 #include "minimax/engine/route_identity.hpp"
 // minimax-m3 index projections in one launch, exact dense_t order (src/minimax/attn/index_proj.hpp).
 #include "index_proj.hpp"
+#include "core/f16_dense_tall.hpp"
 
 #include <cstdlib>
 #include <stdexcept>
@@ -276,6 +277,33 @@ template <unsigned R, unsigned XW> __global__ __launch_bounds__(kWaves * 32) voi
         if (tb == t0 || tb + t >= t0) store_out(v, tb + t, o, acc[t]);  // a shifted wave stores only rows >= t0
 }
 
+// FAST minimax-index-proj-wmma-v1 (index_proj.hpp): adapter of the shared dense FP16 WMMA core. Column tile i = 16
+// consecutive outputs: tiles 0..15 are iq (row stride 256), 16..23 ik (row stride 128); 24 tiles, so tc = 4 / 2 / 1
+// cover them with no dead tile. stage() copies the 64 FP16 weights of k units [unit, unit + 4) of one output from
+// the packed layout: chunk c (inputs 8c..8c+7) of output o is 16 bytes at (c * kProjOut + o) * 8, and the 4 units are
+// chunks 2 unit .. 2 unit + 7, so nb[i] = chunk 2 unit + i (16 stagers of a tile read 256 contiguous bytes per chunk).
+namespace tall = strix::core::f16_dense_tall;
+constexpr unsigned kWmmaTiles = kProjOut / 16U;
+static_assert(kProjQ % 16U == 0 && kProjK % 16U == 0 && kProjIn % 128U == 0, "index_proj wmma: core tiling");
+struct IndexCols {
+    const _Float16* w;
+    float* iq;
+    float* ik;
+    __device__ __forceinline__ tall::ColumnTile tile(unsigned i) const {
+        return i < kProjQ / 16U ? tall::ColumnTile{nullptr, iq + 16U * i, kProjQ, true}
+                                : tall::ColumnTile{nullptr, ik + 16U * (i - kProjQ / 16U), kProjK, true};
+    }
+    __device__ __forceinline__ void stage(unsigned tile, unsigned col, unsigned unit, tall::U4* nb) const {
+        const auto* p = reinterpret_cast<const unsigned char*>(w) + (static_cast<std::size_t>(2U * unit) * kProjOut + tile * 16U + col) * 16U;
+#pragma unroll
+        for (unsigned i = 0; i < 8U; ++i) nb[i] = *(tall::detail::GlobalU4*)(p + static_cast<std::size_t>(i) * kProjOut * 16U);
+    }
+};
+template <unsigned TC> __global__ __launch_bounds__(256) void proj_wmma_kernel(IndexProjView v) {
+    __shared__ tall::Storage<TC> lds;
+    tall::core<TC>(v.x, kProjIn, v.rows, IndexCols{v.w, v.iq, v.ik}, lds);
+}
+
 using strix::hip_check;
 
 template <unsigned D> void launch_decode(const IndexProjView& v, unsigned rpw, hipStream_t stream) {
@@ -393,6 +421,19 @@ void enqueue_index_proj_slab(const IndexProjView& v, hipStream_t stream) {
     const dim3 grid(kProjOut / 32, (v.rows + kWaves * kTokPerWave - 1) / (kWaves * kTokPerWave));
     hipLaunchKernelGGL((proj_slab_kernel<kTokPerWave, 8>), grid, dim3(kWaves * 32), 0, stream, v);
     hip_check(hipGetLastError(), "index_proj slab");
+}
+
+void enqueue_index_proj_wmma(const IndexProjView& v, hipStream_t stream, unsigned tc) {
+    if (v.rows == 0 || static_cast<std::uint64_t>(v.rows) * kProjIn * 4U >= (std::uint64_t{1} << 32U))
+        throw std::invalid_argument("index_proj wmma: rows must be 1 .. 174762");
+    const unsigned gx = (v.rows + tall::kRows - 1U) / tall::kRows;
+    switch (tc) {
+    case 4: hipLaunchKernelGGL(proj_wmma_kernel<4>, dim3(gx, kWmmaTiles / 4U), dim3(256), 0, stream, v); break;
+    case 2: hipLaunchKernelGGL(proj_wmma_kernel<2>, dim3(gx, kWmmaTiles / 2U), dim3(256), 0, stream, v); break;
+    case 1: hipLaunchKernelGGL(proj_wmma_kernel<1>, dim3(gx, kWmmaTiles), dim3(256), 0, stream, v); break;
+    default: throw std::invalid_argument("index_proj wmma: tc must be 4, 2 or 1");
+    }
+    hip_check(hipGetLastError(), "index_proj wmma");
 }
 
 void enqueue_index_proj(const IndexProjView& v, hipStream_t stream) {

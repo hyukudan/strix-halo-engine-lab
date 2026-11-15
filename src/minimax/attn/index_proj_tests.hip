@@ -6,12 +6,20 @@
 #include "index_proj.hpp"
 
 #include <algorithm>
+#include <bit>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <random>
 #include <string>
+#include <tuple>
 #include <vector>
+#if defined(__linux__)
+#include <filesystem>
+#include <fstream>
+#include <unistd.h>
+#endif
 
 namespace ma = strix::minimax::attn;
 
@@ -189,6 +197,169 @@ void tests(std::mt19937& rng) {
     free_weights(w);
 }
 
+// FAST minimax-index-proj-wmma-v1 contract: (a) against dense_t on x rounded to FP16 (the same products in an FP32
+// chain: only the accumulation order differs), (b) drift against the exact chains on x (the FP16 rounding of x),
+// (c) tc 4 / 2 / 1 bit for bit equal, (d) finite outputs and rows past `rows` untouched. x carries a few outlier
+// channels (x 24) like a norm output.
+void wmma_tests(std::mt19937& rng) {
+    Weights w = make_weights(rng, true);
+    const unsigned maxT = 1100;
+    std::normal_distribution<float> n(0.0F, 1.0F);
+    std::vector<float> xh(std::size_t(maxT) * kHidden), x16h(xh.size());
+    for (std::size_t i = 0; i < xh.size(); ++i) {
+        xh[i] = n(rng) * (i % kHidden % 997U == 5U ? 24.0F : 1.0F);
+        x16h[i] = static_cast<float>(static_cast<_Float16>(xh[i]));
+    }
+    float *x = dev(xh), *x16 = dev(x16h);
+    const std::size_t nq = std::size_t(maxT) * ma::kProjQ, nk = std::size_t(maxT) * ma::kProjK;
+    float *eq = dev(std::vector<float>(nq)), *ek = dev(std::vector<float>(nk)), *cq = dev(std::vector<float>(nq)),
+          *ck = dev(std::vector<float>(nk)), *iq = dev(std::vector<float>(nq)), *ik = dev(std::vector<float>(nk));
+    auto rel_l2 = [](const std::vector<float>& a, const std::vector<float>& b, double& max_rel) {
+        double num = 0, den = 0, mx = 0;
+        for (std::size_t i = 0; i < a.size(); ++i) {
+            const double d = double(a[i]) - double(b[i]);
+            num += d * d;
+            den += double(b[i]) * double(b[i]);
+            mx = std::max(mx, std::abs(d));
+        }
+        max_rel = mx / std::sqrt(den / double(std::max<std::size_t>(1, b.size())));
+        return std::sqrt(num / std::max(den, 1e-300));
+    };
+    for (unsigned rows : {1U, 15U, 16U, 127U, 128U, 129U, 300U, 1100U}) {
+        for (auto [xin, q, k] : {std::tuple{x, eq, ek}, std::tuple{x16, cq, ck}}) {
+            hipLaunchKernelGGL(dense_t_kernel, dim3(rows, ma::kProjQ / 128), dim3(128), 0, nullptr, xin, w.tq, q, kHidden, ma::kProjQ);
+            hipLaunchKernelGGL(dense_t_kernel, dim3(rows, 1), dim3(128), 0, nullptr, xin, w.tk, k, kHidden, ma::kProjK);
+        }
+        std::vector<float> first_q, first_k;
+        for (unsigned tc : {4U, 2U, 1U}) {
+            hip_ok(hipMemset(iq, 0xFF, nq * 4), "memset");
+            hip_ok(hipMemset(ik, 0xFF, nk * 4), "memset");
+            ma::enqueue_index_proj_wmma({x, w.packed, iq, ik, rows}, nullptr, tc);
+            hip_ok(hipDeviceSynchronize(), "sync");
+            const auto aq = host(iq, std::size_t(rows + (rows < maxT ? 1 : 0)) * ma::kProjQ);
+            const auto ak = host(ik, std::size_t(rows + (rows < maxT ? 1 : 0)) * ma::kProjK);
+            bool guard = true, finite = true;
+            auto scan = [&](const std::vector<float>& a, std::size_t live) {  // [0, live) finite, the rest still 0xFF
+                for (std::size_t i = 0; i < a.size(); ++i) {
+                    if (i < live) finite = finite && std::isfinite(a[i]);
+                    else guard = guard && std::bit_cast<std::uint32_t>(a[i]) == 0xFFFFFFFFU;
+                }
+            };
+            scan(aq, std::size_t(rows) * ma::kProjQ);
+            scan(ak, std::size_t(rows) * ma::kProjK);
+            std::vector<float> lq(aq.begin(), aq.begin() + std::size_t(rows) * ma::kProjQ), lk(ak.begin(), ak.begin() + std::size_t(rows) * ma::kProjK);
+            if (tc == 4) {
+                double mq = 0, mk = 0, dq = 0, dk = 0;
+                const double cq_l2 = rel_l2(lq, host(cq, lq.size()), mq), ck_l2 = rel_l2(lk, host(ck, lk.size()), mk);
+                const double eq_l2 = rel_l2(lq, host(eq, lq.size()), dq), ek_l2 = rel_l2(lk, host(ek, lk.size()), dk);
+                std::printf("wmma rows %u: contract rel-l2 iq %.2e ik %.2e | drift vs exact rel-l2 iq %.2e ik %.2e, max |err|/rms iq %.2e ik %.2e\n",
+                            rows, cq_l2, ck_l2, eq_l2, ek_l2, dq, dk);
+                if (!(cq_l2 < 2e-5 && ck_l2 < 2e-5 && eq_l2 < 2e-3 && ek_l2 < 2e-3)) {
+                    ++g_fail;
+                    std::fprintf(stderr, "FAIL: wmma rows %u contract / drift bound\n", rows);
+                }
+                first_q = std::move(lq);
+                first_k = std::move(lk);
+            } else if (std::memcmp(lq.data(), first_q.data(), lq.size() * 4) != 0 || std::memcmp(lk.data(), first_k.data(), lk.size() * 4) != 0) {
+                ++g_fail;
+                std::fprintf(stderr, "FAIL: wmma rows %u tc %u differs from tc 4\n", rows, tc);
+            }
+            if (!guard || !finite) {
+                ++g_fail;
+                std::fprintf(stderr, "FAIL: wmma rows %u tc %u guard %d finite %d\n", rows, tc, int(guard), int(finite));
+            }
+        }
+    }
+    for (void* p : {static_cast<void*>(x), static_cast<void*>(x16), static_cast<void*>(eq), static_cast<void*>(ek), static_cast<void*>(cq),
+                    static_cast<void*>(ck), static_cast<void*>(iq), static_cast<void*>(ik)})
+        (void)hipFree(p);
+    free_weights(w);
+}
+
+#if defined(__linux__)
+// Sum of evicted_ms over this process's KFD stats entries (0 when absent).
+long kfd_evicted_ms() {
+    long total = 0;
+    std::error_code ec;
+    const std::string dir = "/sys/class/kfd/kfd/proc/" + std::to_string(::getpid());
+    for (const auto& e : std::filesystem::directory_iterator(dir, ec)) {
+        if (e.path().filename().string().rfind("stats_", 0) != 0) continue;
+        std::ifstream f(e.path() / "evicted_ms");
+        long v = 0;
+        if (f >> v) total += v;
+    }
+    return total;
+}
+#else
+long kfd_evicted_ms() { return 0; }
+#endif
+
+// STRIX_MMATTN_BENCH=wmma: strict A B A B A B (3 pairs) per row count, 60 layers' weights rotated. Series 1: A = slab
+// (exact default), B = wmma tc 4; series 2 / 3: A = wmma tc 4, B = tc 2 / tc 1. Cold = the first call of each arm in
+// the process (code object load excluded by one 8-row call of every kernel first), warm = the medians.
+void bench_wmma(std::mt19937& rng) {
+    const unsigned L = 60;
+    std::vector<Weights> ws;
+    for (unsigned l = 0; l < L; ++l) ws.push_back(make_weights(rng, false));
+    const unsigned maxT = 8192;
+    std::normal_distribution<float> n(0.0F, 1.0F);
+    std::vector<float> xh(std::size_t(maxT) * kHidden);
+    for (auto& v : xh) v = n(rng);
+    float* x = dev(xh);
+    float *iq = dev(std::vector<float>(std::size_t(maxT) * ma::kProjQ)), *ik = dev(std::vector<float>(std::size_t(maxT) * ma::kProjK));
+    hipStream_t st;
+    hip_ok(hipStreamCreateWithFlags(&st, hipStreamNonBlocking), "stream");
+    hipEvent_t e0, e1;
+    hip_ok(hipEventCreate(&e0), "event");
+    hip_ok(hipEventCreate(&e1), "event");
+    auto launch = [&](int arm, unsigned l, unsigned rows) {
+        const ma::IndexProjView v{x, ws[l].packed, iq, ik, rows};
+        if (arm == 0) ma::enqueue_index_proj_slab(v, st);
+        else ma::enqueue_index_proj_wmma(v, st, arm == 1 ? 4U : arm == 2 ? 2U : 1U);
+    };
+    auto timed = [&](int arm, unsigned rows, unsigned layers, bool warm) {
+        if (warm) launch(arm, 0, rows);
+        hip_ok(hipEventRecord(e0, st), "rec");
+        for (unsigned l = 0; l < layers; ++l) launch(arm, l, rows);
+        hip_ok(hipEventRecord(e1, st), "rec");
+        hip_ok(hipEventSynchronize(e1), "sync");
+        float ms = 0;
+        hip_ok(hipEventElapsedTime(&ms, e0, e1), "elapsed");
+        return 1000.0 * ms / layers;
+    };
+    for (int arm = 0; arm < 4; ++arm) launch(arm, 0, 8);  // code objects loaded, not timed
+    hip_ok(hipStreamSynchronize(st), "sync");
+    const double cold_a = timed(0, 4096, 1, false), cold_b = timed(1, 4096, 1, false);
+    std::printf("wmma bench cold (first 4096-row call, layer 0) us: slab %.0f wmma-tc4 %.0f\n", cold_a, cold_b);
+    const char* names[4] = {"slab", "wmma-tc4", "wmma-tc2", "wmma-tc1"};
+    for (const auto [a, b] : {std::pair{0, 1}, std::pair{1, 2}, std::pair{1, 3}})
+        for (unsigned rows : {4096U, 1024U, 8192U}) {
+            const unsigned layers = rows > 2048 ? 12 : 30;
+            std::vector<double> ta, tb, ratio;
+            std::string runs;
+            for (int pair = 0; pair < 3; ++pair) {
+                const double x1 = timed(a, rows, layers, true), y1 = timed(b, rows, layers, true);
+                ta.push_back(x1);
+                tb.push_back(y1);
+                ratio.push_back(y1 / x1);
+                char buf[64];
+                std::snprintf(buf, sizeof buf, " [%.0f %.0f]", x1, y1);
+                runs += buf;
+            }
+            std::printf("wmma bench T %u us/call: A %s %.0f B %s %.0f (B/A median %.3f, worst %.3f, last pair %.3f) ABAB:%s\n", rows,
+                        names[a], median(ta), names[b], median(tb), median(ratio), *std::max_element(ratio.begin(), ratio.end()),
+                        ratio.back(), runs.c_str());
+        }
+    std::printf("wmma bench kfd evicted_ms %ld\n", kfd_evicted_ms());
+    (void)hipEventDestroy(e0);
+    (void)hipEventDestroy(e1);
+    (void)hipStreamDestroy(st);
+    for (auto& w : ws) free_weights(w);
+    (void)hipFree(x);
+    (void)hipFree(iq);
+    (void)hipFree(ik);
+}
+
 // slab_only (STRIX_MMATTN_BENCH=slab): only the prefill slab gate.
 void bench(std::mt19937& rng, bool slab_only) {
     const unsigned L = 60;
@@ -340,6 +511,7 @@ int main() {
     std::setvbuf(stdout, nullptr, _IOLBF, 0);
     std::mt19937 rng(20261024);
     tests(rng);
+    wmma_tests(rng);
     if (g_fail != 0) {
         std::fprintf(stderr, "%d failure(s)\n", g_fail);
         return 1;
@@ -347,5 +519,7 @@ int main() {
     std::printf("strix-mmattn-index-proj-tests: all passed\n");
     if (const char* b = std::getenv("STRIX_MMATTN_BENCH"); b != nullptr && (std::strcmp(b, "1") == 0 || std::strcmp(b, "slab") == 0))
         bench(rng, std::strcmp(b, "slab") == 0);
+    else if (b != nullptr && std::strcmp(b, "wmma") == 0)
+        bench_wmma(rng);
     return 0;
 }
