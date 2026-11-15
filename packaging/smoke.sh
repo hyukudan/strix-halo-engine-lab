@@ -20,7 +20,7 @@ while [ $# -gt 0 ]; do
 done
 base="${root%/}${prefix}"
 bindir="$base/bin" datadir="$base/share/strix"
-fails=0 passes=0 nohelp=0
+fails=0 passes=0 nohelp=0 nogpu=0
 pass() { passes=$((passes + 1)); echo "PASS $*"; }
 fail() { fails=$((fails + 1)); echo "FAIL $*"; }
 skip() { echo "SKIP $*"; }
@@ -38,8 +38,12 @@ for exe in "$bindir"/strix-*; do
         fail "$name --help: rc=$rc (timeout or signal)"
     elif [ $rc -eq 0 ] || printf '%s' "$out" | grep -qiE "usage|options"; then
         pass "$name --help (rc=$rc)"
-    elif printf '%s' "$out" | grep -qiE "error while loading shared libraries|symbol lookup error|device gate"; then
+    elif printf '%s' "$out" | grep -qiE "error while loading shared libraries|symbol lookup error"; then
         fail "$name --help: rc=$rc: $(printf '%s' "$out" | head -2 | tr '\n' ' ' | cut -c1-160)"
+    elif printf '%s' "$out" | grep -qiE "device gate: refusing to start: cannot enumerate"; then
+        # Libraries resolved and the start gate ran; with no visible GPU nothing more can run (HIP mains bind first).
+        nogpu=$((nogpu + 1))
+        pass "$name loads (no visible GPU: the device gate refused before --help)"
     elif [ -n "$out" ]; then
         # The program loaded and its own parser answered (it has no --help yet): the package is intact.
         nohelp=$((nohelp + 1))
@@ -91,5 +95,5 @@ if [ -x "$hip" ] && [ -n "$model" ]; then
 elif [ -x "$hip" ]; then
     skip "--print-effective-config: needs --model FILE.gguf"
 fi
-echo "smoke: $passes passed ($nohelp without --help), $fails failed"
+echo "smoke: $passes passed ($nohelp without --help, $nogpu stopped by the device gate without a GPU), $fails failed"
 [ $fails -eq 0 ]
