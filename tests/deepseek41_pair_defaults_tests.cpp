@@ -584,7 +584,9 @@ void test_common_adapter() {
             check(result.set_env == expected, "baseline preserves individual OFF and every other row: " + std::string(row.name));
             for (const char* value : {"", "1"}) {
                 w.env[row.env] = value;
-                check(w.run(rc.app, args).set_env == expected, "baseline preserves explicit empty/ON: " + std::string(row.name));
+                const bool automatic_transport = row.env == strix::ds41::decode_xport_lever.env && *value == '\0';
+                check(w.run(rc.app, args).set_env == (automatic_transport ? pd::baseline_off_items() : expected),
+                      "baseline overrides automatic transport and preserves other explicit empty/ON: " + std::string(row.name));
             }
         }
         const auto result = World{}.run(rc.app, args);
@@ -641,7 +643,7 @@ void test_common_adapter() {
 void test_decode_xport() {
     namespace ds = strix::ds41;
     const std::pair<const char*, const char*> cases[] = {
-        {nullptr, "channel (default)"}, {"communicator", "communicator (explicit)"}, {"channel", "channel (explicit)"},
+        {nullptr, "channel (default)"}, {"", "channel (default)"}, {"communicator", "communicator (explicit)"}, {"channel", "channel (explicit)"},
         {"0", "communicator (explicit)"}, {"1", "channel (explicit)"}};
     for (const auto& [value, expected] : cases) {
         World w;
@@ -672,6 +674,30 @@ void test_decode_xport() {
     base.env["STRIX_DS41_BASELINE"] = "1";
     const auto b = base.run(pd::App::serve, plain(receipts[0]));
     check(env_of(b)["STRIX_DS41_DECODE_XPORT"] == "0" && b.decode_xport == "communicator (baseline)", "decode xport: STRIX_DS41_BASELINE=1 sets the communicator");
+    for (const char* value : {"", "0", "1", "communicator", "channel"}) {
+        for (const auto app : {pd::App::rank, pd::App::batch, pd::App::serve}) {
+            World inherited;
+            inherited.env["STRIX_DS41_BASELINE"] = "1";
+            inherited.env["STRIX_DS41_DECODE_XPORT"] = value;
+            const auto resolved = inherited.run(app, plain(receipts[0]));
+            for (const auto& [key, exported] : resolved.set_env) inherited.env[key] = exported;
+            const auto actual = ds::decode_xport_choice(inherited.env.at("STRIX_DS41_DECODE_XPORT").c_str());
+            const bool expected_channel = std::string_view(value) == "1" || std::string_view(value) == "channel";
+            check(actual.on == expected_channel, "baseline applied exports preserve explicit values and override empty");
+            check(resolved.decode_xport.starts_with(ds::decode_xport_name(actual.on)),
+                  "baseline inspection agrees with engine after applying exports");
+        }
+    }
+    for (const bool selected : {false, true}) {
+        for (const bool actual : {false, true}) {
+            for (const bool logits : {false, true}) {
+                bool rejected = false;
+                try { ds::check_decode_xport_step(selected, actual, logits); }
+                catch (const std::runtime_error&) { rejected = true; }
+                check(rejected == (selected && !actual && logits), "logit qualification refuses Channel fallback");
+            }
+        }
+    }
 }
 
 }  // namespace

@@ -1266,6 +1266,7 @@ BatchForward::BatchForward(const std::filesystem::path& gguf, const BatchForward
         const bool channel = ds41::decode_xport_choice(std::getenv(ds41::decode_xport_lever.env.data())).on;
         m.decode_xport = options.communicator->agree_exchange(channel, 1U, 1U,
             dist::Tag{static_cast<std::uint32_t>(dist::TagKind::control), 0x64787074U, 0U});
+        ds41::check_decode_xport_step(channel, m.decode_xport, options.slice_logits || options.gather_logits);
         if (channel || m.decode_xport)
             std::fprintf(stderr, "ds41 decode xport: requested=%s effective=%s\n", ds41::decode_xport_name(channel),
                          ds41::decode_xport_name(m.decode_xport));
@@ -1695,9 +1696,10 @@ const std::vector<std::uint32_t>& BatchForward::run_step(std::span<const BatchRo
     const std::uint32_t V = c.vocab_size, W = m.row_capacity;
     hipStream_t st = m.stream;
     // STRIX_DS41_DECODE_XPORT=channel: the transport is leased to the Channel for this step (plain TP steps only: the
-    // pipeline FRONT / TAIL halves and the gate's logits gather keep the communicator). A communicator still holding a
+    // pipeline FRONT / TAIL halves keep the communicator). Logit gathers use the same bounded Channel byte exchanges.
+    // A communicator still holding a
     // staged view (none between steps today) declines the step, counted in decode_xport_declined.
-    bool channel_step = m.decode_xport && !tail && front_cut == 0U && !m.options.gather_logits;
+    bool channel_step = m.decode_xport && !tail && front_cut == 0U;
     if (channel_step) {
         try {
             m.options.communicator->release_transport(st);
@@ -1706,6 +1708,7 @@ const std::vector<std::uint32_t>& BatchForward::run_step(std::span<const BatchRo
             ++m.decode_xport_declined;
         }
     }
+    ds41::check_decode_xport_step(m.decode_xport, channel_step, m.options.slice_logits || m.options.gather_logits);
     if (channel_step && !m.decode_channel) {
         prefill_xport::Exchange::Options opt;
         opt.rank = m.options.rank;
@@ -3287,7 +3290,17 @@ const std::vector<std::uint32_t>& BatchForward::run_step(std::span<const BatchRo
     // the union counts of every layer in one download (they were one 8-byte copy command per layer)
     check(hipMemcpyAsync(m.counts_pinned.p, m.built.counts.p, std::size_t{8U} * m.options.layers, hipMemcpyDeviceToHost, st), "union counts");
     check(hipStreamSynchronize(st), "step");
-    if (channel_step) m.decode_wire->drain();  // every exchange complete: the communicator may use the transport again
+    if (channel_step) m.decode_wire->drain_and_account(
+        [&](std::uint64_t exchanges, std::uint64_t bytes, double producer_wait, double wire_seconds, double check_seconds) {
+            m.options.communicator->account_borrowed_transport(exchanges, bytes, producer_wait, wire_seconds, check_seconds);
+        });
+    // Engine and server read the same communicator totals. Channel progress
+    // time overlaps device execution and must not be added to step wall time.
+    if (m.options.slice_logits || m.options.gather_logits)
+        std::fprintf(stderr, "ds41 decode qualification: rank=%u route=%s channel_steps=%llu declined=%llu\n",
+                     m.options.rank, ds41::decode_xport_name(channel_step),
+                     static_cast<unsigned long long>(m.decode_xport_steps),
+                     static_cast<unsigned long long>(m.decode_xport_declined));
     tokens_.resize(R);
     for (std::uint32_t r = 0; r < R; ++r) {
         if (m.best_pinned.p[r].finite == 0U) throw std::runtime_error("deepseek41 batch forward: non-finite logits");

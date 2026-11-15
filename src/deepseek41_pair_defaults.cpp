@@ -272,7 +272,11 @@ Resolved resolve(App app, const std::vector<std::string>& in, const Getenv& raw_
     for (auto& n : r.profile->notices()) r.notices.push_back(std::move(n));
     const Getenv env = [&](const char* name) -> const char* {
         for (const auto& [k, v] : profile_env) if (k == name) return v.c_str();
-        return raw_env(name);
+        const char* value = raw_env(name);
+        // The transport selector treats empty as automatic; baseline must also
+        // export its rollback over an inherited empty value.
+        if (name == strix::ds41::decode_xport_lever.env && !set(value)) return nullptr;
+        return value;
     };
     const auto put = [&](const char* name, std::string value) {
         if (env(name) == nullptr) r.set_env.emplace_back(name, std::move(value));

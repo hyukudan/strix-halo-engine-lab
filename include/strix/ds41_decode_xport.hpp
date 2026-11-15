@@ -4,7 +4,7 @@
 // BatchForward::run_step. `channel` leases the communicator's transport to the shared device-waited xport::Channel for
 // the step: producers publish their TX slot on the GPU, consumers wait on the RX flag with a stream wait packet, and the
 // host keeps enqueuing instead of spinning in finish() for each of the 80 o_b / MoE half-sum exchanges. Same kernels'
-// arithmetic, same canonical order (rank 0's half first): bitwise. Default channel (ABAB receipt in decode_xport_lever);
+// arithmetic, same canonical order (rank 0's half first): intended bitwise contract. Default channel;
 // STRIX_DS41_DECODE_XPORT=communicator (or STRIX_DS41_BASELINE=1) is the rollback.
 //
 // One rule for every entry point: the pair defaults resolver (CLI and serve, --print-effective-config) and the engine
@@ -20,7 +20,7 @@ namespace strix::ds41 {
 
 inline constexpr lever::Decl decode_xport_lever{
     "ds41-decode-xport", "STRIX_DS41_DECODE_XPORT", lever::Exactness::bitwise, true, {}, {},
-    "LNKS1 ABAB 3 pairs, text sha equal: 1 chat 29.75 -> 29.95 tok/s, 8 chats 95.4 -> 96.6, 8K 28.92 -> 29.10, 32K 28.67 -> 28.94"};
+    "Qualification requires both-rank Channel route evidence and complete token, logit and state equality against communicator; host selection tests alone do not qualify execution"};
 
 // The value as written ("communicator" / "channel" / "0" / "1" / unset) -> the lever choice. Throws on anything else.
 [[nodiscard]] inline lever::Choice decode_xport_choice(const char* value) {
@@ -34,5 +34,12 @@ inline constexpr lever::Decl decode_xport_lever{
 }
 
 [[nodiscard]] inline const char* decode_xport_name(bool channel) noexcept { return channel ? "channel" : "communicator"; }
+
+// Logit collection does not change the transport. Qualification must fail if a
+// selected Channel cannot execute the step, instead of checking the fallback.
+inline void check_decode_xport_step(bool selected, bool actual, bool checking_logits) {
+    if (selected && !actual && checking_logits)
+        throw std::runtime_error("deepseek41 logit qualification requires the selected Channel decode route");
+}
 
 } // namespace strix::ds41

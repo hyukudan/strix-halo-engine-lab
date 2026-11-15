@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <stdexcept>
 #include <vector>
+#include "stats.hpp"
 
 namespace strix::xport {
 // Adapt a borrowed Channel to the Communicator byte interface. Framing, wire
@@ -26,8 +27,10 @@ class ChannelCommunicator {
     std::uint64_t held_ = 0;
     bool submitted_ = false;
     bool drained_ = false;
+    Stats accounted_{};
 
     void before_send(Stream producer) {
+        drained_ = false;
         runtime_.order(producer, channel_->options().stream);
         auto& event = consumers_[static_cast<std::size_t>(channel_->sent() % consumers_.size())];
         if (event) runtime_.wait(event, channel_->options().stream);
@@ -56,6 +59,19 @@ public:
     }
     bool active() const { return channel_ != nullptr; }
     void drain() { if (channel_) { channel_->drain(); drained_ = true; } }
+    // Sample only after drain's acquire of progress completion: Channel::stats
+    // is otherwise mutable on the worker. The sink receives cumulative deltas
+    // exactly once, including when drain is repeated between leases.
+    template<class Account>
+    void drain_and_account(Account&& account) {
+        if (!channel_) return;
+        drain();
+        const auto now = channel_->stats();
+        account(now.exchanges - accounted_.exchanges, now.bytes - accounted_.bytes,
+                now.producer_wait - accounted_.producer_wait, now.wire - accounted_.wire,
+                now.check - accounted_.check);
+        accounted_ = now;
+    }
     void* send_staging(std::size_t bytes) {
         if (!channel_) return legacy_->send_staging(bytes);
         if (!bytes || bytes > channel_->options().capacity) return nullptr;
