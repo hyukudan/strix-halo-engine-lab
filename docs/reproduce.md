@@ -603,6 +603,12 @@ SSH cleanup failure reports unverified teardown; the remote timeout still bounds
 The outer timeout includes setup/teardown plus forced-kill grace. Forced termination/network
 failure may prevent final report delivery; inspect retained evidence privately.
 
+### DeepSeek V4.1 CUDA prefill -> pair decode hand-off
+
+[`scripts/bench/hetpf/`](../scripts/bench/hetpf/README.md) runs the same prompt through three routes (CUDA prefill with
+the state handed to the pair, the pair alone, the CUDA device alone), cold and warm, in one detached run with a phase
+breakdown, GPU clocks per token and a host-node link probe (RTT and useful throughput both ways).
+
 ## Long-context retrieval and reasoning checks (Qwen)
 
 `tools/qualification/longctx_fidelity/` builds deterministic prompts whose answers are computed by the
