@@ -167,6 +167,24 @@ std::vector<std::uint32_t> layercut_session(mm::Engine& eng, strix::handoff::Lis
         });
         while (!eng.prefill_resume(~0U, &next)) {}
         prefill = secs(start, Clock::now());
+        // STRIX_MM_QUALITY_OUT=PREFIX (+ STRIX_MM_QUALITY_ROWS=N): the same raw FP32 dumps as a --session prefill, named
+        // PREFIX-cut-<name>-{logits,row,tf}-r<rank>.f32, so the mixed identity is compared row by row with the pair alone.
+        if (const char* qo = strix::envcfg::text("STRIX_MM_QUALITY_OUT"); qo != nullptr && *qo != '\0') {
+            const std::string base = std::string(qo) + "-cut-" + name + "-";
+            const auto put = [&](const std::string& what, const float* p, std::size_t n) {
+                std::ofstream f(base + what + "-r" + std::to_string(eng.rank()) + ".f32", std::ios::binary);
+                f.write(reinterpret_cast<const char*>(p), static_cast<std::streamsize>(n * sizeof(float)));
+                if (!f) throw std::runtime_error("STRIX_MM_QUALITY_OUT: cannot write " + base + what);
+            };
+            const auto lg = eng.last_logits(1);
+            put("logits", lg.data(), lg.size());
+            const auto out_rows = eng.prefill_out_rows();
+            if (out_rows.size() >= mlc::hidden) put("row", out_rows.data() + out_rows.size() - mlc::hidden, mlc::hidden);
+            if (const char* qr = strix::envcfg::text("STRIX_MM_QUALITY_ROWS"); qr != nullptr && *qr != '\0') {
+                const auto tf = eng.prefill_out_logits(std::stoul(qr));
+                put("tf", tf.data(), tf.size());
+            }
+        }
         main_reader.join(); if (act_reader.joinable()) act_reader.join();
         check_error();
         const auto t = Clock::now();
