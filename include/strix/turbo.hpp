@@ -65,15 +65,15 @@ struct WeightCaps {
 };
 
 struct WeightsRequest {  // explicit CLI spellings (take_options fills it)
-    std::optional<std::string> source, bits, pack;
+    std::optional<std::string> source{}, bits{}, pack{};
 };
 
 struct Weights {
     Source requested = Source::native, effective = Source::native;
     unsigned requested_bits = 0, effective_bits = 0;  // 0: the pack's own widths (native)
-    std::string pack, method;
+    std::string pack{}, method{};
     std::string origin = "builtin";                   // builtin | profile | env | cli
-    std::string reason;                               // why requested != effective; empty: honoured
+    std::string reason{};                             // why requested != effective; empty: honoured
 
     [[nodiscard]] bool honoured() const { return reason.empty(); }
     // Named identity per source and width: "native", "onfly-int4-rtn-g32", "converted-int4".
@@ -154,15 +154,15 @@ inline std::string describe_facts(const Facts& facts) {
 // The drafter's caches use the same key with role=drafter, so they never mix with the target's.
 enum class CacheRole : unsigned { target = 0, drafter = 1 };
 struct CacheKey {
-    std::string model;         // model id
-    std::string weights_sha;   // content digest of the weights the run reads (the converted pack's own digest)
-    std::string profile;       // "default" | "fast" | "quality" | the versioned turbo name ("ds41-turbo-v1")
-    std::string levers;        // effective lever values (hex of the profile fingerprint)
-    std::string weights;       // Weights::identity()
-    std::string order;         // reduction order and chunk plan
-    std::string state;         // KV / recurrent state format
-    std::string rotary;        // rotary descriptor
-    std::string backend;       // backend and lineage
+    std::string model{};         // model id
+    std::string weights_sha{};   // content digest of the weights the run reads (the converted pack's own digest)
+    std::string profile{};       // "default" | "fast" | "quality" | the versioned turbo name ("ds41-turbo-v1")
+    std::string levers{};        // effective lever values (hex of the profile fingerprint)
+    std::string weights{};       // Weights::identity()
+    std::string order{};         // reduction order and chunk plan
+    std::string state{};         // KV / recurrent state format
+    std::string rotary{};        // rotary descriptor
+    std::string backend{};       // backend and lineage
     CacheRole role = CacheRole::target;
 
     [[nodiscard]] std::string text() const {

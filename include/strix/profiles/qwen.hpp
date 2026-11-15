@@ -31,7 +31,7 @@ inline constexpr ::strix::profile::turbo::WeightCaps kWeightCaps{};
 struct Resolution {
     Name profile = Name::standard;
     std::vector<Entry> entries;
-    ::strix::profile::turbo::Weights weights;  // weight toggle (native outside turbo)
+    ::strix::profile::turbo::Weights weights{};  // weight toggle (native outside turbo)
     bool is_turbo() const { return profile == Name::turbo; }
     std::string versioned() const { return is_turbo() ? std::string(kTurboVersion) : std::string(name(profile)); }
     // Effective lever values (not how they were set), as in the shared strix::profile::Resolution::fingerprint().
@@ -128,7 +128,7 @@ struct Inputs {
     Pairs cli;
     Lookup env;
     bool allow_pending = false;
-    ::strix::profile::turbo::WeightsRequest weights;  // --turbo-weights / --turbo-weight-bits / --turbo-weights-pack
+    ::strix::profile::turbo::WeightsRequest weights{};  // --turbo-weights / --turbo-weight-bits / --turbo-weights-pack
 };
 using ::strix::profile::environment;
 // Export provenance survives a future re-exec. A changed inherited value

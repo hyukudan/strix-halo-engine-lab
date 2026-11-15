@@ -73,7 +73,7 @@ struct Engine {
     std::string_view allow_env;             // e.g. STRIX_DS41_PROFILE_ALLOW_PENDING
     std::span<const Lever> table;
     bool quality_rows = false;              // false: 'quality' runs default with one notice
-    std::string_view turbo_version;         // versioned TURBO name ("ds41-turbo-v1"); empty: turbo refused
+    std::string_view turbo_version{};       // versioned TURBO name ("ds41-turbo-v1"); empty: turbo refused
     turbo::WeightCaps weight_caps{};        // weight sources / widths this build can load under turbo
 };
 
@@ -152,7 +152,7 @@ struct Entry {
     std::string target;  // pending: the declared target that is not applied
     bool cli_override = false;  // adapter provenance; does not enter the rank fingerprint
     std::string reason;         // adapter admission explanation
-    std::string requested;      // what the profile column or the explicit setting asked for (empty: builtin)
+    std::string requested{};    // what the profile column or the explicit setting asked for (empty: builtin)
 };
 
 struct Resolution {
@@ -160,7 +160,7 @@ struct Resolution {
     Name profile = Name::standard;
     bool allow_pending = false;
     std::vector<Entry> entries;
-    turbo::Weights weights;               // weight toggle (native outside turbo)
+    turbo::Weights weights{};             // weight toggle (native outside turbo)
 
     [[nodiscard]] bool is_turbo() const { return profile == Name::turbo; }
     // Versioned product name: the turbo name under turbo, else the profile name.
@@ -346,7 +346,7 @@ struct Inputs {
     Pairs cli;                    // levers set by their own CLI option: {lever name, value}
     Lookup env;                   // environment lookup; empty: the process environment
     bool allow_pending = false;   // --allow-pending
-    turbo::WeightsRequest weights;  // --turbo-weights / --turbo-weight-bits / --turbo-weights-pack
+    turbo::WeightsRequest weights{};  // --turbo-weights / --turbo-weight-bits / --turbo-weights-pack
 };
 
 inline const char* environment(const Lookup& env, std::string_view key) {
