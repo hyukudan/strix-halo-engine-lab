@@ -51,7 +51,21 @@ struct Config {
 // Reads and validates the qwen35.* metadata; throws std::invalid_argument naming the first bad key.
 [[nodiscard]] Config config_from_gguf(const gguf::FileInfo& info);
 
-// Every tensor name the contract requires for `config` (trunk + MTP), in plan order.
+// One required tensor. dimensions are in GGUF (ggml) order: dimensions[0] is the fastest axis, i.e. the input
+// features of a matrix. Matrices are BF16 or Q8_0 (the packs); everything else (norms, conv, ssm vectors) is F32.
+struct TensorSpec {
+    std::string name;
+    std::vector<std::uint64_t> dimensions;
+    bool matrix = false;
+};
+
+// Every tensor the contract requires for `config` (trunk + MTP blk.<layers>), in plan order.
+[[nodiscard]] std::vector<TensorSpec> expected_tensors(const Config& config);
+
+// Names of expected_tensors, in the same order.
 [[nodiscard]] std::vector<std::string> required_tensor_names(const Config& config);
+
+// Registers the "qwen35" architecture with the model family registry (idempotent).
+void register_family();
 
 }  // namespace strix::qwen35

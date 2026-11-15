@@ -57,6 +57,7 @@ if(STRIX_EXPERIMENTAL_MALL_Q2_DOWN_NT)
     set_property(SOURCE src/hip_ds41_formats.hip APPEND PROPERTY COMPILE_DEFINITIONS STRIX_EXPERIMENTAL_MALL_Q2_DOWN_NT=1)
 endif()
 option(STRIX_FAMILY_DEEPSEEK41 "Build the deepseek41 model family module" ON)
+option(STRIX_FAMILY_QWEN35 "Build the qwen35 (Qwen3.8-27B dense) model family module" ON)
 option(STRIX_FAMILY_MINIMAX "Build the experimental minimax-m3 bring-up modules (MSA host reference)" OFF)
 option(STRIX_ENABLE_CUDA_DS41 "Build the deepseek41 CUDA backend (sm_120 / sm_89 / sm_86) and its tests" OFF)
 option(STRIX_ENABLE_CUDA_TRELLIS "Build experimental compressed-weight CUDA linear kernels and probes" OFF)
@@ -3764,6 +3765,20 @@ if(STRIX_ENABLE_HIP_RUNTIME)
     endif()
 endif()
 endif()  # NOT STRIX_CUDA_DS41_ONLY
+
+# ---- qwen35 model family module (optional; host contract only, backends consume include/strix/qwen35/config.hpp) ----
+if(STRIX_FAMILY_QWEN35)
+add_library(strix_family_qwen35 STATIC src/qwen35/config.cpp src/qwen35/family.cpp)
+target_link_libraries(strix_family_qwen35 PUBLIC strix_core)
+strix_target_warnings(strix_family_qwen35)
+if(BUILD_TESTING)
+    add_executable(strix-qwen35-config-tests tests/qwen35_config_tests.cpp)
+    target_link_libraries(strix-qwen35-config-tests PRIVATE strix_family_qwen35)
+    strix_target_warnings(strix-qwen35-config-tests)
+    add_test(NAME strix-qwen35-config-tests COMMAND strix-qwen35-config-tests)
+    set_tests_properties(strix-qwen35-config-tests PROPERTIES LABELS "cpu;model" TIMEOUT 30)
+endif()
+endif()
 
 # ---- deepseek41 model family module (optional) ----
 if(STRIX_FAMILY_DEEPSEEK41)
