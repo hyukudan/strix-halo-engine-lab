@@ -4,6 +4,7 @@
 // the flags are zero after every call; (c) drift report (top-4 set agreement, max score difference). Timing: exact vs
 // each form, median of reps per row count. Needs a GPU. Exit 0 = PASS.
 #include "strix/hip_minimax_moe.hpp"
+#include "router_wmma_gate_checks.hpp"
 
 #include <hip/hip_runtime.h>
 
@@ -52,11 +53,12 @@ void run_case(std::mt19937& rng, unsigned rows, bool timing) {
     for (auto& v : y) v = ny(rng);
     for (auto& v : rw) v = nw(rng);
     for (auto& v : bias) v = nb(rng);
+    router_wmma_test::prepare_probe(y, H, rw, E, 1.0F);
     std::vector<unsigned> big;  // rows with an FP16 overflow of y (finite FP32): the exact fallback must take them
     for (unsigned r : {3U, rows / 2U + 1U, rows - 1U})
         if (r < rows && std::find(big.begin(), big.end(), r) == big.end()) big.push_back(r);
     const std::vector<float> clean = y;  // timing input: no overflow rows (the fallback is the rare path)
-    for (unsigned r : big) y[std::size_t{r} * H + (r * 37U) % H] = 1.0e5F;
+    for (unsigned r : big) router_wmma_test::inject_overflow(y, H, r);
     float *dy = dev(y), *drw = dev(rw), *db = dev(bias);
     auto* dw16 = dev(std::vector<std::uint16_t>(rw.size()));
     moe::hip::convert_router_f16(drw, dw16, nullptr);
@@ -74,8 +76,23 @@ void run_case(std::mt19937& rng, unsigned rows, bool timing) {
     const Outs ref = collect();
     Outs form[3];
     for (unsigned f = 0; f < 3; ++f) {
+        ok(hipMemset(scratch, 0xff, moe::hip::router_tiled_scratch_floats(rows) * sizeof(float)), "poison scores");
+        ok(hipMemset(dwt, 0xff, std::size_t{rows} * K * sizeof(float)), "poison weights");
+        ok(hipMemset(di, 0xff, std::size_t{rows} * K * sizeof(std::uint32_t)), "poison ids");
         wmma(f);
         form[f] = collect();
+        check(router_wmma_test::complete(form[f].scores) && router_wmma_test::complete(form[f].w),
+              "all scores and weights written and finite form " + std::to_string(f));
+        check(std::all_of(form[f].ids.begin(), form[f].ids.end(), [](std::uint32_t id) { return id < E; }),
+              "all ids written and valid form " + std::to_string(f));
+        if (rows > 1U)
+            for (unsigned e = 0; e < E; ++e)
+                check(router_wmma_test::wmma_probe(form[f].scores[std::size_t{e} * rows], ref.scores[std::size_t{e} * rows],
+                                                  1.0F / (1.0F + std::exp(-1.0F)), 1.0e-6F), "finite WMMA probe (not exact fallback)");
+        for (unsigned r : big)
+            for (unsigned e = 0; e < 2U * E; ++e)
+                check(std::memcmp(&form[f].scores[std::size_t{e} * rows + r], &ref.scores[std::size_t{e} * rows + r], sizeof(float)) == 0,
+                      "injected NaN product replaced by exact fallback form " + std::to_string(f));
         const auto fl = host(flags, rows);
         check(std::all_of(fl.begin(), fl.end(), [](std::uint32_t v) { return v == 0U; }), "flags zero after form " + std::to_string(f));
     }

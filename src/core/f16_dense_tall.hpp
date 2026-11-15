@@ -31,9 +31,21 @@
 #include <concepts>
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <type_traits>
 
 namespace strix::core::f16_dense_tall {
+// Optional ownership for matrix weights / row flags. Constructor unwinding must
+// also drain outstanding conversion or product work before releasing storage.
+struct DeviceStorageDeleter {
+    void operator()(void* p) const noexcept {
+        if (p == nullptr) return;
+        (void)hipDeviceSynchronize();
+        (void)hipFree(p);
+    }
+};
+template <class T> using DeviceStorage = std::unique_ptr<T, DeviceStorageDeleter>;
+
 using Half16 = _Float16 __attribute__((ext_vector_type(16)));
 using Float8 = float __attribute__((ext_vector_type(8)));
 using Float4 = float __attribute__((ext_vector_type(4)));
@@ -229,7 +241,7 @@ template <class Inner> struct Guarded {
         unsigned* flags;
         __device__ __forceinline__ auto open(unsigned i, const ColumnTile& ct, unsigned c) const { return s.open(i, ct, c); }
         template <class T> __device__ __forceinline__ void put(const T& t, unsigned r, float v) const {
-            if (!__builtin_isfinite(v)) flags[r] = 1U;
+            if (!__builtin_isfinite(v)) atomicOr(flags + r, 1U);
             s.put(t, r, v);
         }
         __device__ __forceinline__ void close() const { s.close(); }
