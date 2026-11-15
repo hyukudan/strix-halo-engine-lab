@@ -180,6 +180,12 @@ endforeach()
 
 # ---- serve configuration and service --------------------------------------------------------------------------
 if(WIN32)
+    # The MSVC C++ runtime (msvcp140, vcruntime140*) next to the executables, from the local Visual Studio
+    # redistributable folder: the ZIP then needs only the NVIDIA driver (cudart is linked statically).
+    set(CMAKE_INSTALL_SYSTEM_RUNTIME_DESTINATION "${CMAKE_INSTALL_BINDIR}")
+    set(CMAKE_INSTALL_SYSTEM_RUNTIME_COMPONENT cuda)
+    set(CMAKE_INSTALL_UCRT_LIBRARIES OFF)
+    include(InstallRequiredSystemLibraries)
     install(FILES "${_strix_pkg_dir}/serve.toml" "${_strix_pkg_dir}/windows/serve.args"
         "${_strix_pkg_dir}/windows/devices.example.toml" DESTINATION "${CMAKE_INSTALL_SYSCONFDIR}/strix" COMPONENT cuda)
     install(PROGRAMS "${_strix_pkg_dir}/windows/install.ps1" "${_strix_pkg_dir}/windows/uninstall.ps1"
@@ -270,6 +276,7 @@ else()
     # Stage through DESTDIR so /etc/strix stays absolute in every generator (tar.gz mirrors the root layout).
     set(CPACK_SET_DESTDIR ON)
     set(CPACK_PACKAGING_INSTALL_PREFIX "${CMAKE_INSTALL_PREFIX}")
+    set(CPACK_PROJECT_CONFIG_FILE "${_strix_pkg_dir}/CPackProjectConfig.cmake")
     set(CPACK_STRIP_FILES ON)
     set(CPACK_ARCHIVE_COMPONENT_INSTALL ON)
     foreach(_c IN ITEMS core tools docs hip cuda)
