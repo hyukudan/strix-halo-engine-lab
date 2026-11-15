@@ -264,6 +264,7 @@ Sigue el enlace para ver la ganancia, las precondiciones y el interruptor de apa
 | `STRIX_MMX_PREFILL_MTFIT` | minimax | 1 | [mm-pf-mtfit](optimizations.md#mm-pf-mtfit) |
 | `STRIX_MMX_PREFILL_PIPE` | minimax | 1 | [mm-pf-moe-pipe](optimizations.md#mm-pf-moe-pipe) |
 | `STRIX_MMX_PREFILL_TAIL_STREAM` | minimax | 1 | [mm-pf-tail-stream](optimizations.md#mm-pf-tail-stream) |
+| `STRIX_MMX_PREFILL_PIPE_TAIL` | minimax | 1 | [mm-pf-pipe-tail](optimizations.md#mm-pf-pipe-tail) |
 | `STRIX_MM_PFX` | minimax | on | [mm-rank-pfx](optimizations.md#mm-rank-pfx) |
 | `STRIX_MM_PFX_CHUNK` | minimax | 4194304 | [mm-pfx-chunk](optimizations.md#mm-pfx-chunk) |
 | `STRIX_MM_PFX_JOINED` | minimax | 1 | [mm-pfx-joined](optimizations.md#mm-pfx-joined) |
@@ -277,7 +278,7 @@ Sigue el enlace para ver la ganancia, las precondiciones y el interruptor de apa
 | `STRIX_MM_PF_KV_TILE` | minimax | auto | [mm-pf-kv-tile](optimizations.md#mm-pf-kv-tile) |
 | `STRIX_MM_PF_LATE_SRC_FENCE` | minimax | ON | [minimax-grouped-prefill.md](minimax-grouped-prefill.md) |
 | `STRIX_MM_PF_MSA_BATCH` | minimax | 1 | [mm-pf-msa-batch](optimizations.md#mm-pf-msa-batch) |
-| `STRIX_MM_FAST_PREFILL=1` | minimax | off | Opcional. Perfil `mm-fast-pf-v1` (filas gobernadas `src/minimax/engine/mm_profile_table.hpp`, reglas de paquete compartidas `include/strix/fast_profile.hpp`): `STRIX_MM_PF_MSA_FLASH=1` en las capas 40-59 = `msa-flash-bf16-l40-v1`, solo base MoE EXL3 (no se selecciona con `STRIX_MMX_MODEL_FORMAT=fast_i4`); un miembro fijado manda, `0` gana al paquete. Ambos ranks deben coincidir; las políticas activas entran en la identidad de la caché de sesión. Cambia los logits. Aún no calificado en el dispositivo: no se publica ninguna cifra de puerta ni de velocidad. |
+| `STRIX_MM_FAST_PREFILL=1` | minimax | off | Opcional. Perfil `mm-fast-pf-v1` (filas gobernadas `src/minimax/engine/mm_profile_table.hpp`, reglas de paquete compartidas `include/strix/fast_profile.hpp`): `STRIX_MM_PF_MSA_FLASH=1` en las capas 40-59 = `msa-flash-bf16-l40-v1`, solo base MoE EXL3 (no se selecciona con `STRIX_MMX_MODEL_FORMAT=fast_i4`); un miembro fijado manda, `0` gana al paquete. Ambos ranks deben coincidir; las políticas activas entran en la identidad de la caché de sesión. Cambia los logits. Dispositivo (par EXL3, puerta sin cambios KL <= 0.02, top-1 >= 93 %, dNLL <= 0.01, 256 filas por prompt): 8K PASA (KL 0.0012), 32K PASA (dos prompts, KL 0.0029); TTFT con los valores por defecto 8K 12.47 -> 11.92 s, 32K 50.91 -> 48.06 s. `STRIX_MM_PF_MSA_FLASH_LAYERS=30-59` (`msa-flash-bf16-l30-v1`) pasa a 8K (KL 0.0076, 11.41 s) pero falla a 32K (dNLL +0.012 / +0.016): solo prompts de hasta 8K tokens, el paquete nunca la selecciona. |
 | `STRIX_MM_PF_MSA_REWORK` | minimax | 5 | [mm-pf-msa-rework](optimizations.md#mm-pf-msa-rework) |
 | `STRIX_MM_PF_MSA_SCRATCH_MB` | minimax | 1152 | [mm-pf-msa-scratch](optimizations.md#mm-pf-msa-scratch) |
 | `STRIX_MM_PF_ROUTER_BATCH` | minimax | 1 | [mm-pf-router-batch](optimizations.md#mm-pf-router-batch) |
@@ -307,6 +308,7 @@ Sigue el enlace para ver la ganancia, las precondiciones y el interruptor de apa
 | `STRIX_QPF2K_HC_OUTPUT3` | qwen | 1 | [qwen-hc](optimizations.md#qwen-hc) |
 | `STRIX_QPF2K_HC_OUTPUT3_BAND` | qwen | 16 | [qwen-hc](optimizations.md#qwen-hc) |
 | `STRIX_QPF2K_HC_RECOMPUTE_NORM` | qwen | ON with the WMMA HC output (auto); =1 ... | [hc-normalized-recompute](optimizations.md#hc-normalized-recompute) |
+| `STRIX_QPF2K_HC_LOW32` | qwen | 0 (la proyección out16 no escribe la cola FP32 sin lector); =1 la conserva | [hc-normalized-recompute](optimizations.md#hc-normalized-recompute) |
 | `STRIX_QPF2K_HC_UPCOPY` | qwen | auto with HC output v3 | [qwen-hc](optimizations.md#qwen-hc) |
 | `STRIX_QPF2K_INDEX_BATCH` | qwen | ON | [exact-indexer-projection-batching](optimizations.md#exact-indexer-projection-batching) |
 | `STRIX_QPF2K_MOE_DA16` | qwen | 1 | [qwen-moe](optimizations.md#qwen-moe) |
@@ -326,6 +328,7 @@ Sigue el enlace para ver la ganancia, las precondiciones y el interruptor de apa
 | `STRIX_SERVE_PREFILL` | qwen | ON: admitted T8192; configured prefix... | [default-prompt-prefill](engine/serving/serving.md#default-prompt-prefill) |
 | `STRIX_SERVE_ROUTE` | qwen | ON: server tile and prefill arithmetic from the single-request route rule; `0` restores T8192 with the resolved arithmetic | [default-prompt-prefill](engine/serving/serving.md#default-prompt-prefill) |
 | `STRIX_SERVE_PREFILL_ORG` | qwen | ON: an admitted server owner takes the prefill organization of the single-request route (row-loop, attention stage, table and expert header/merge batching); `0` keeps the startup items only | [default-prompt-prefill](engine/serving/serving.md#default-prompt-prefill) |
+| `STRIX_SERVE_PREFILL_GROUP` | deepseek (par) | auto | varios prompts cortos admitidos a la vez comparten una pasada de prefill en el dispositivo; `0` = una pasada por prompt; `STRIX_SERVE_PREFILL_GROUP_MEMBERS` (2..64) limita un grupo; [página de DeepSeek](models/deepseek-v4.1/README.es.md) |
 | `STRIX_SERVE_T16K` | qwen | ON: T16384 owner when the context admits a 32,768-token request and every resident slot fits; `0` keeps T8192 | [default-prompt-prefill](engine/serving/serving.md#default-prompt-prefill) |
 | `STRIX_SERVE_FP16_MTP` | qwen | ON: explicit-sidecar MTP servers keep the automatic FP16 prefill arithmetic with the unqualified fast options off; `0` declines it | [default-prompt-prefill](engine/serving/serving.md#default-prompt-prefill) |
 
@@ -469,6 +472,7 @@ Sigue el enlace para ver la ganancia, las precondiciones y el interruptor de apa
 | `STRIX_GLM_MOE` | glm | fast | [glm-moe-fast](optimizations.md#glm-moe-fast) |
 | `STRIX_GLM_POST` | glm | fast | [glm-post-exchange-fast](optimizations.md#glm-post-exchange-fast) |
 | `STRIX_GLM_SERVE_G2` | glm | on (with MTP) | [glm-serve-g2](optimizations.md#glm-serve-g2) |
+| `STRIX_GLM_SERVE_PREFILL_UNITS` | glm | 1 | un prompt largo admitido bajo carga se corta en unidades de capa, no en chunks de tokens; `0` = chunks de tokens; [página de GLM](models/glm-5.3/README.es.md) |
 | `STRIX_GLM_STEP_FLAG` | glm | 1 (engine default) | [glm-step-flag](optimizations.md#glm-step-flag) |
 | `STRIX_GLM_TIERB` | glm | fused | [glm-attn-tierb-fused](optimizations.md#glm-attn-tierb-fused) |
 | `STRIX_LM_HEAD_COHORT_LEAN` | qwen | 1 | [qwen-lm-head-cohort-lean](optimizations.md#qwen-lm-head-cohort-lean) |

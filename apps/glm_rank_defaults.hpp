@@ -236,6 +236,7 @@ struct Effective {
     std::uint32_t world = 2;
     bool kv_shard = false, kv_shard_auto = false;
     Value identity, prefill_requested, mtp, mtp_spec, spec, decode_xch, max_rows;
+    Value prefill_units;  // STRIX_GLM_SERVE_PREFILL_UNITS (serving-only)
     ModelFacts head;
     bool mtp_spec_candidate = false;
     unsigned kmax = 3;
@@ -292,6 +293,16 @@ inline Effective resolve(const Request& r, const EnvGet& env, const ModelFacts& 
     if (r.prefill) e.prefill_requested = {*r.prefill, "explicit"};
     else if (const char* v = env("STRIX_GLM_PREFILL")) e.prefill_requested = {v, "explicit"};
     else e.prefill_requested = {e.baseline ? "ref" : "auto", src_b};
+    // Prefill units (serving-only): a long MTP prompt admitted beside decoding requests pauses at layer boundaries of
+    // its max_rows pieces instead of being cut into token chunks. Default on (exact: the idle run's pieces and kernels;
+    // FAST 8K beside one stream TTFT 15.20 -> 10.83 s, 3 runs per arm); 0 restores the token chunks.
+    if (const char* v = env("STRIX_GLM_SERVE_PREFILL_UNITS")) {
+        const std::string s = v;
+        if (s != "0" && s != "1") throw std::invalid_argument("STRIX_GLM_SERVE_PREFILL_UNITS must be 0 or 1");
+        e.prefill_units = {s, "explicit"};
+    } else {
+        e.prefill_units = {"1", "default"};
+    }
     // decode Xfer exchange: STRIX_GLM_DECODE_XCH overrides --decode-xch (engine rule)
     if (const char* v = env("STRIX_GLM_DECODE_XCH")) e.decode_xch = {v, "explicit"};
     else if (r.decode_xch) e.decode_xch = {*r.decode_xch, "explicit"};
@@ -428,6 +439,9 @@ inline std::string print(const Effective& e) {
     s += "effective capacity-layout=" + std::string(layout.sharded ? "sharded" : "replicated") +
         "/" + (layout.routed ? "routed" : "full") + "/qwin=" + std::to_string(layout.query_window) +
         " (initial candidate; admission and rank vote pending; capacity_layout_reason=" + pf::capacity_layout_reason(layout) + ")\n";
+    s += "effective prefill-units=" + e.prefill_units.value + " (" + e.prefill_units.source +
+         "; serving-only: a long prompt beside decoding requests pauses at layer boundaries of its max_rows pieces, "
+         "8 decode rows reserved above max_rows; the CLI has no decode cohort and prefills whole prompts)\n";
     line("decode-xch", e.decode_xch);
     line("max-rows", e.max_rows);
     if (max_rows_auto(e)) s += "effective max-rows-admission=startup-admission-and-rank-min (8192 candidate, 4096 fallback)\n";
