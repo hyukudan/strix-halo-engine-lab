@@ -94,6 +94,13 @@ inline constexpr unsigned kMaxDenseJobs = 4;
 struct PrefillDenseJob {
     Exl3 w{};
     float* out = nullptr;
+    // Optional query image (MSA FAST flash layers; output % 128 == 0, 128-column heads): instead of out, the BF16
+    // image of each head after msa::norm_rope_lane (norm weights image_w [128], RoPE row image_rope[row]) as the flash
+    // core's query_op reads it, and with image_lo its lo terms (mode 12). Same bits as the flash prologue on out.
+    std::uint16_t* image = nullptr;
+    std::uint16_t* image_lo = nullptr;
+    const float* image_w = nullptr;
+    const void* image_rope = nullptr;  // const msa::RopeRow* (strix/minimax_msa.hpp)
 };
 bool prefill_dense_supported(const Exl3& w);
 std::size_t prefill_dense_workspace_bytes(const PrefillDenseJob* jobs, unsigned count, unsigned rows);
