@@ -304,7 +304,13 @@ rango su estado. Ambos rangos preparan la entrega y votan (la vinculación auten
 de ejecutar el último token del prompt; cualquier fallo antes de ese voto vuelve al prefill propio del par en los dos
 rangos, y un fallo dentro de las operaciones colectivas del último token detiene el servidor (fatal). `--import-dsa-once`
 (con `dsa_once` del productor) envía el estado DSA solo al rango 0, que lo retransmite al rango 1 por el enlace del par
-(8K: de 480 a 316 MB en el enlace del productor, con tokens iguales a los de la entrega de la versión 1). Los prompts importados llevan la identidad FAST
+(8K: de 480 a 316 MB en el enlace del productor, con tokens iguales a los de la entrega de la versión 1). `--import-index-tail`
+(en todos los rangos, con `index_tail` del productor; versión 3, o 4 con `--import-dsa-once`) envía la clave y la puerta
+del índice DSA solo del bloque de pool abierto (`P % 4` filas): los bloques cerrados viajan como sus filas de pool FP32,
+que es lo único que leen los kernels de decode, prefill y MTP (`include/strix/block_summary_state.hpp`). 32K: de 806,92 a
+605,62 MB para los dos rangos con DSA una vez; 128K: −805,28 MB. Opcional; `tests/hip_glm_dsa_tests.hip` comprueba la
+continuación bit a bit con las filas omitidas envenenadas, y `scripts/bench/handoff/glm_wire_versions.sh` mide las
+versiones del protocolo sobre un enlace real. Los prompts importados llevan la identidad FAST
 `glm-pf-rtx-native-v1` (no son bit a bit el prefill propio del par; el `prefill_route` de cada respuesta la nombra).
 `--import-gate` falla si algún brazo enrutado no importó de verdad (y una batería sin prompts también falla).
 `--import-model-sha` es una atestación del operador: el receptor la compara con la cabecera de la entrega del
