@@ -9,10 +9,20 @@ process and reports, for one run of it (default: the last, i.e. the warm run of 
   a sweep of the CTAs in flight capped at `--cus`, split into the loop edges and its interior, then again with
   every kernel whose LDS cannot share a CU with a fill CTA (`--cu-lds`) counted as occupying one.
 
-Both CU figures are lower bounds of free CU time (running kernels' CTAs are counted as resident). Use it before any
-scheduling change to a window loop (grouped launches, more lanes, overlap of the loop edges): a lever that only
-removes launches cannot gain more than the loop's idle, and one that only repacks CTAs cannot gain more than the
-free CU time.
+Both CU figures are lower bounds of free CU time under the one-fill-CTA-per-CU assumption
+(running kernels' CTAs are counted as resident). They are not speedup ceilings: CTA repacking
+can recover wave-tail capacity hidden by these counts, even when the reported free time is zero.
+A speedup ceiling needs an independently justified occupancy/work model. Do not use these
+figures alone to reject a scheduling proposal.
+
+A cluster is every nonempty consecutive sequence of matching launches in start-time order;
+a nonmatching launch ends it. Timing uses the union of cluster spans. GPU busy/idle and the
+LDS sweep include all run kernels clipped to that union, including other queues and kernels
+started before a cluster. The fill sweep likewise includes all overlapping fill launches.
+Cluster counts and per-kind inclusive times remain separate launch metrics. Edges are the union
+of each cluster's clipped first/last `--edge-us` intervals; the interior is the complement
+inside the loop union. Overlaps and touching edges count once. Full symbols are used for
+matching, grouping and run splitting; only the displayed kind column is shortened.
 
 ```
 python3 window_census.py r0_kernel_trace.csv [--run N] [--split embedding_kernel] [--kinds a,b,...]
@@ -22,4 +32,7 @@ python3 -m unittest test_window_census.py
 
 `--kinds` defaults to the DS41 window set (index, select, flash or exact attention, combine, empty top-k memset); GLM
 and MiniMax window loops pass their own kernel names. `--cus` and `--cu-lds` come from the device declaration
-(gfx1151: 40 CUs, 64 KiB LDS per CU). No host names or paths: the trace path is the only input.
+(gfx1151: 40 CUs, 64 KiB LDS per CU). The CLI echoes the selected kernel and capacity assumptions;
+these defaults do not detect the traced family or device. Set the overrides explicitly for
+other families/devices. Empty or malformed traces, invalid run indices and invalid capacity/edge
+arguments produce CLI errors. No host names or paths: the trace path is the only input.
