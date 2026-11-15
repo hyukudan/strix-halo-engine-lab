@@ -4,11 +4,53 @@
 #include "strix/pair/chain.hpp"
 #include "strix/handoff.hpp"
 #include <charconv>
+#include <chrono>
+#include <condition_variable>
+#include <functional>
+#include <mutex>
 #include <optional>
+#include <stdexcept>
 #include <string_view>
+#include <thread>
 
 namespace strix::pair::layercut {
 namespace chain = strix::pair::chain;
+// Covers startup, including the first connection and its HELLO. The cancellation
+// callback must be noexcept and wake any pending accept/read; it runs at most once.
+class StartupScope {
+    std::function<void()> cancel_;
+    std::mutex mutex_;
+    std::condition_variable cv_;
+    enum class State { pending, ready, failed };
+    State state_ = State::pending;
+    std::thread timer_;
+    void fail_locked() {
+        if (state_ != State::pending) return;
+        state_ = State::failed;
+        cancel_();
+        cv_.notify_all();
+    }
+public:
+    explicit StartupScope(std::function<void()> cancel,
+                          std::chrono::milliseconds timeout = std::chrono::seconds(120))
+        : cancel_(std::move(cancel)), timer_([this, timeout] {
+            std::unique_lock lock(mutex_);
+            if (!cv_.wait_for(lock, timeout, [this] { return state_ != State::pending; })) fail_locked();
+        }) {}
+    StartupScope(const StartupScope&) = delete;
+    StartupScope& operator=(const StartupScope&) = delete;
+    ~StartupScope() { fail(); timer_.join(); }
+    void fail() {
+        std::lock_guard lock(mutex_);
+        fail_locked();
+    }
+    void complete() {
+        std::lock_guard lock(mutex_);
+        if (state_ == State::failed) throw std::runtime_error("layercut startup cancelled or timed out");
+        state_ = State::ready;
+        cv_.notify_all();
+    }
+};
 inline constexpr std::uint32_t kAct = 0x4C43'4101U, kKv = 0x4C43'4B02U;
 enum class Act { relay, direct };
 inline const char* act_name(Act a) { return a == Act::relay ? "relay" : "direct"; }
