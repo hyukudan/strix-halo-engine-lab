@@ -414,13 +414,19 @@ void convert_router_f16(const float* router_w, std::uint16_t* w16, hipStream_t s
     if (e != hipSuccess) throw std::runtime_error(std::string("minimax router f16: ") + hipGetErrorString(e));
 }
 
-// MiniMax router: 8 column tiles of 6,144-long chains; the product is bound by the reads of y (25 KB per row), so the
-// default is one launch whose two 4-tile column blocks share each y row in L2 (narrow4).
-static tall::MatrixForm router_form(unsigned form) {
+// MiniMax router: 8 column tiles of 6,144-long chains; the product is bound by the reads of y (25 KB per row). Automatic
+// form by piece rows (u2 unit receipts, gfx1151): up to 1,536 rows y stays in the 32 MB MALL and narrow4 (two 4-tile
+// column blocks sharing each y row) wins (1024: 0.183 vs wide16 0.415 ms); above it wide16 reads y once
+// (2048: 0.858 vs narrow4 1.101; 4096: 1.274 vs 1.710 ms). STRIX_F16_MATRIX_FORM overrides.
+constexpr unsigned kRouterWideRows = 1536;
+static tall::MatrixForm router_form(unsigned form, unsigned rows) {
     if (form <= 2U) return static_cast<tall::MatrixForm>(form);
-    return tall::matrix_form(tall::MatrixForm::narrow4);
+    return tall::matrix_form(rows <= kRouterWideRows ? tall::MatrixForm::narrow4 : tall::MatrixForm::wide16);
 }
-const char* router_wmma_form() { return tall::matrix_form_name(router_form(~0U)); }
+const char* router_wmma_form() {
+    const tall::MatrixForm a = router_form(~0U, 0), b = router_form(~0U, ~0U);
+    return a == b ? tall::matrix_form_name(a) : "auto (narrow4 <= 1536 rows < wide16)";
+}
 
 void enqueue_router_wmma(std::uint32_t rows, const float* y, const float* router_w, const std::uint16_t* w16, const float* bias,
                          std::uint32_t* ids, float* weights, float* scratch, std::uint32_t* flags, hipStream_t stream, unsigned form) {
@@ -429,7 +435,7 @@ void enqueue_router_wmma(std::uint32_t rows, const float* y, const float* router
     if (scratch == nullptr || flags == nullptr || w16 == nullptr) throw std::invalid_argument("minimax router wmma: scratch, flags and f16 weights are required");
     if (std::uint64_t{rows} * kHidden * 4U >= (std::uint64_t{1} << 32U)) throw std::invalid_argument("minimax router wmma: too many rows");
     const tall::Guarded<RouterScoreStore> store{{scratch, bias, rows}, flags};
-    tall::launch_matrix(router_form(form), y, rows, reinterpret_cast<const _Float16*>(w16), kHidden, kExperts, scratch, rows, store, stream);
+    tall::launch_matrix(router_form(form, rows), y, rows, reinterpret_cast<const _Float16*>(w16), kHidden, kExperts, scratch, rows, store, stream);
     hipLaunchKernelGGL(router_exact_rows_kernel, dim3((rows + kRouterFallbackSpan - 1U) / kRouterFallbackSpan), dim3(kNormThreads), 0, stream,
                        rows, y, router_w, bias, scratch, flags);
     hipLaunchKernelGGL(router_select_kernel, dim3((rows + 255) / 256), dim3(256), 0, stream, rows, scratch, ids, weights);
