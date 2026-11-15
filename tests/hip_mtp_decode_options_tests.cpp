@@ -358,6 +358,7 @@ void campaign_defaults_contract(){
         require(mtp_wide_copy_rows_effective(serve,false).empty() && mtp_wide_copy_rows_effective(cli,false)==cli_rows,
             "only STRIX_MTP_SERVE_WIDE=0 differs, and only on the serve route");
         // tail sizes added only for the wide cycle never tile prompts under a split prefill profile (prompt cut as without the flags)
+        require(!cli.known_prefix_wide_only_tail_rows.empty(),"wide-only tail exclusion is exercised");
         for(const auto rows:cli.known_prefix_wide_only_tail_rows)
             require(!known_prefix_tail_tiles_prompts(cli,rows,true) && known_prefix_tail_tiles_prompts(cli,rows,false),
                 "a wide-only tail size stays out of split-profile prompt tiling");

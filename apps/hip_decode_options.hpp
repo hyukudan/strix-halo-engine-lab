@@ -1,6 +1,7 @@
 #include "strix/ctx_exact_memory.hpp"
 #include "strix/deploy/binding.hpp"
 #pragma once
+#include "strix/env_flags.hpp"
 #include "strix/rotary_descriptor.hpp"
 #include "strix/qsa_committed_pool.hpp"
 #include <iostream>
@@ -1564,9 +1565,10 @@ inline void validate_resolved_gdn_islands(const Options& options) {
 }
 
 // The single resolver of the wide copy cycle (--mtp-copy-wide-rows). The CLI runs it for its one request; the
-// --http-batch server runs it only while exactly one request is live, and STRIX_MTP_SERVE_WIDE=0 (serve_switch=false)
+// HTTP server runs it only while exactly one request is live, and STRIX_MTP_SERVE_WIDE=0 (serve_switch=false)
 // forces it off there. Returns the configured sizes (descending) or empty. Both routes call this, never the raw option.
-[[nodiscard]] inline std::vector<std::uint32_t> mtp_wide_copy_rows_effective(const Options& o,bool serve_switch=true) {
+[[nodiscard]] inline std::vector<std::uint32_t> mtp_wide_copy_rows_effective(const Options& o,
+    bool serve_switch=strix::envcfg::flag("STRIX_MTP_SERVE_WIDE",true)) {
     if(!o.mtp.enabled || !o.mtp.ngram_copy_edit || o.mtp.copy_wide_rows.empty()) return {};
     if(o.http_serve && !serve_switch) return {};
     return o.mtp.copy_wide_rows;

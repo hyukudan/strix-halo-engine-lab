@@ -4126,19 +4126,20 @@ static int run_decode_entry(
                 throw std::logic_error("tiled MTP prompt lacks its tiled prefill owners");
             auto& tiled = parents->tiled;
             tiled.blocks = known_prefix_backend.get(); tiled.block_owner = known_prefix_owner;
-            for (std::size_t t = 0; t < known_tail_backends.size(); ++t)
-                if (strix::decode_cli::known_prefix_tail_tiles_prompts(options, options.known_prefix_tail_rows[t], compiled_prefill.has_value()))
+            for (std::size_t t = 0; t < known_tail_backends.size(); ++t) {
+                if (strix::decode_cli::known_prefix_tail_tiles_prompts(options, options.known_prefix_tail_rows[t], compiled_prefill.has_value())) {
                     tiled.tails.push_back({known_tail_backends[t].get(), known_tail_owners[t], options.known_prefix_tail_rows[t]});
+                    strix::decode_cli::QwenPlanOwner owner;
+                    owner.execution=known_tail_plans[t]->prefill_execution_identity;
+                    owner.kernel=known_tail_plans[t]->prefill_kernel_plan_identity;
+                    tiled.numerical_plan.tails.push_back(owner);
+                }
+            }
             for (std::size_t w = 0; w < known_wide_owners.size(); ++w)
                 tiled.wide.push_back({nullptr, known_wide_owners[w], options.mtp.copy_wide_rows[w]});
             tiled.rows = options.known_prefix_prefill_rows;
             tiled.numerical_plan.block.execution=known_prefill_plan->prefill_execution_identity;
             tiled.numerical_plan.block.kernel=known_prefill_plan->prefill_kernel_plan_identity;
-            for(const auto& tail:known_tail_plans) {
-                strix::decode_cli::QwenPlanOwner owner;
-                owner.execution=tail->prefill_execution_identity;owner.kernel=tail->prefill_kernel_plan_identity;
-                tiled.numerical_plan.tails.push_back(owner);
-            }
             tiled.numerical_plan.decode_execution=compiled.execution_identity;
             tiled.numerical_plan.decode_kernel=compiled.kernel_plan_identity;
             tiled.numerical_plan.prefill_execution=compiled_prefill?compiled_prefill->execution_identity:compiled.execution_identity;
@@ -4409,19 +4410,20 @@ static int run_decode_entry(
             if(stack.cache) stack.cache->set_staging_cap(options.prefix_cache_staging_bytes);
             auto& tiled = stack.parents->tiled;
             tiled.blocks = stack.blocks.get(); tiled.block_owner = stack.block_owner;
-            for (std::size_t t = 0; t < stack.tails.size(); ++t)
-                if (strix::decode_cli::known_prefix_tail_tiles_prompts(options, options.known_prefix_tail_rows[t], compiled_prefill.has_value()))
+            for (std::size_t t = 0; t < stack.tails.size(); ++t) {
+                if (strix::decode_cli::known_prefix_tail_tiles_prompts(options, options.known_prefix_tail_rows[t], compiled_prefill.has_value())) {
                     tiled.tails.push_back({stack.tails[t].get(), stack.tail_owners[t], options.known_prefix_tail_rows[t]});
+                    strix::decode_cli::QwenPlanOwner owner;
+                    owner.execution=known_tail_plans[t]->prefill_execution_identity;
+                    owner.kernel=known_tail_plans[t]->prefill_kernel_plan_identity;
+                    tiled.numerical_plan.tails.push_back(owner);
+                }
+            }
             for (std::size_t w = 0; w < stack.wide_owners.size(); ++w)
                 tiled.wide.push_back({nullptr, stack.wide_owners[w], options.mtp.copy_wide_rows[w]});
             tiled.rows = options.known_prefix_prefill_rows;
             tiled.numerical_plan.block.execution=known_prefill_plan->prefill_execution_identity;
             tiled.numerical_plan.block.kernel=known_prefill_plan->prefill_kernel_plan_identity;
-            for(const auto& tail:known_tail_plans) {
-                strix::decode_cli::QwenPlanOwner owner;
-                owner.execution=tail->prefill_execution_identity;owner.kernel=tail->prefill_kernel_plan_identity;
-                tiled.numerical_plan.tails.push_back(owner);
-            }
             tiled.numerical_plan.decode_execution=compiled.execution_identity;
             tiled.numerical_plan.decode_kernel=compiled.kernel_plan_identity;
             tiled.numerical_plan.prefill_execution=compiled_prefill?compiled_prefill->execution_identity:compiled.execution_identity;
@@ -4500,7 +4502,12 @@ static int run_decode_entry(
                 if (!observation.gtt_limit || !observation.gtt_used || *observation.gtt_used > *observation.gtt_limit) return {};
                 return *observation.gtt_limit - *observation.gtt_used;
             };
-            const auto serving = prompt_memory.serving(options);
+            auto serving = prompt_memory.serving(options);
+            // The bridge builds a wide workspace for every slot, including slot zero.
+            // The stack probe below does not build these; charge them as future slot commitments.
+            const auto wide_bytes = mtp_wide_copy_retained_bytes(model, state_layout, mtp_wide_copy_rows_effective(options));
+            serving.slot_host = add(serving.slot_host, wide_bytes);
+            serving.slot_device = add(serving.slot_device, wide_bytes);
             // Future commitments exclude the already resident primary stack and tiled arenas.
             auto slot_metadata = known_prefill_plan->host_metadata_payload_bytes;
             for (const auto& tail : known_tail_plans) slot_metadata = add(slot_metadata, tail->host_metadata_payload_bytes);
@@ -4609,7 +4616,10 @@ static int run_decode_entry(
             options.http_batch = static_cast<std::uint32_t>(batch_slots);
             if (pool_fallback) {
                 // Batch sizing excluded the pool; the single runner keeps it only if its one slot still fits with it.
-                const auto single = resolve_http_bridge_capacity(retained, prompt_memory.serving(options),
+                auto single_serving = prompt_memory.serving(options);
+                single_serving.slot_host = add(single_serving.slot_host, wide_bytes);
+                single_serving.slot_device = add(single_serving.slot_device, wide_bytes);
+                const auto single = resolve_http_bridge_capacity(retained, single_serving,
                     fit_host, fit_device, headroom, headroom, 1U);
                 options.qsa_mtp_pool_fallback_unfit = !single.slots;
                 std::cerr << "qsa-mtp-pool single-fallback enabled=" << (single.slots ? 1 : 0) << " reserved_bytes="
