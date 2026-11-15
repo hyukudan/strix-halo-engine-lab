@@ -140,7 +140,7 @@ void dense_contract() {
             for (unsigned r : rows) {
                 const unsigned lib = route::gemm_splits(m.in, m.out, bits, r);
                 adaptive_moves |= lib != whole;
-                // Actual engine admission/fallback is exercised by tests/pr665_host, not inferred from S here.
+                // Actual engine admission/fallback is exercised by tests/minimax_route_host, not inferred from S here.
             }
         }
     require(adaptive_moves, "negative control: adaptive dense split should depend on the rows of a chunk");

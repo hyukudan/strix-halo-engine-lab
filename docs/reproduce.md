@@ -618,7 +618,7 @@ runs every call whose `strix_gemm` split would differ): together the identity `m
 splits. Invariant order applies only to prefill; decode and verification retain their existing routes, including
 `STRIX_MM_LINEARS=load`. Startup rejects `STRIX_MM_LINEARS=off`, `STRIX_MM_MOE=off`, unsupported or missing dense
 weights, and insufficient dense workspace. Mandatory dense dispatch fails explicitly instead of falling back.
-Host engine-route regressions: configure `tests/pr665_host`, build Release, then run `ctest --output-on-failure -C Release`.
+Host engine-route regressions: configure `tests/minimax_route_host`, build Release, then run `ctest --output-on-failure -C Release`.
 Dense device gate: `strix-hip-mmx-moe-bench --test --tests test_prefill_dense` (chunks 256/1024/4096/whole,
 4096 + 1..17 tails, 1..17-row calls, library cross-check, adaptive control). Quality: the FAST logit gate floor rule with
 layer-0 nulls (`tools/strix-gate/README.md`, onset-matched floor). Gates:
