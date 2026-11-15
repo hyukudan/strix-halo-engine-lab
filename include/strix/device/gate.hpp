@@ -124,4 +124,14 @@ struct CommandLine {
 };
 [[nodiscard]] CommandLine take_command_line(int& argc, char** argv);
 
+// True when the command line asks for help (`--help` or `-h`). A help request never opens a device, so an installed
+// program answers it on a machine without a visible GPU (package smoke tests, containers).
+[[nodiscard]] inline bool wants_help(int argc, char** argv) {
+    for (int i = 1; i < argc; ++i) {
+        const std::string_view a = argv[i];
+        if (a == "--help" || a == "-h") return true;
+    }
+    return false;
+}
+
 } // namespace strix::device

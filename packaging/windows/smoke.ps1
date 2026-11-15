@@ -20,7 +20,7 @@ param(
     [int]$HealthSeconds = 600
 )
 $ErrorActionPreference = 'Stop'
-$script:fails = 0; $script:passes = 0
+$script:fails = 0; $script:passes = 0; $script:nohelp = 0
 function Pass($m) { $script:passes++; Write-Host "PASS $m" }
 function Fail($m) { $script:fails++; Write-Host "FAIL $m" }
 function Skip($m) { Write-Host "SKIP $m" }
@@ -50,7 +50,13 @@ foreach ($exe in Get-ChildItem -Path $bin -Filter 'strix-*.exe') {
     if ($r.Code -eq -1073741515) { Fail "$($exe.Name): a required DLL is missing (0xC0000135)" }
     elseif ($r.Code -eq 'timeout') { Fail "$($exe.Name) --help: timeout" }
     elseif ($r.Code -eq 0 -or $r.Text -match '(?i)usage|options') { Pass "$($exe.Name) --help (rc=$($r.Code))" }
-    else { Fail "$($exe.Name) --help: rc=$($r.Code): $($r.Text.Substring(0, [Math]::Min(160, $r.Text.Length)))" }
+    elseif ($r.Text -match '(?i)device gate' -or $r.Text.Trim() -eq '') {
+        Fail "$($exe.Name) --help: rc=$($r.Code): $($r.Text.Substring(0, [Math]::Min(160, $r.Text.Length)))"
+    } else {
+        # The program loaded and its own parser answered (it has no --help yet): the package is intact.
+        $script:nohelp++
+        Pass "$($exe.Name) loads (no --help: $($r.Text.Trim().Split([char]10)[0]))"
+    }
 }
 
 $skel = Join-Path $bin 'strix-skeleton-serve.exe'
@@ -79,6 +85,6 @@ if ($EffectiveConfigArgs.Count -gt 0 -and $server) {
 } else {
     Skip '--print-effective-config: needs -EffectiveConfigArgs with a model'
 }
-Write-Host "smoke: $($script:passes) passed, $($script:fails) failed"
+Write-Host "smoke: $($script:passes) passed ($($script:nohelp) without --help), $($script:fails) failed"
 if ($script:fails -gt 0) { exit 1 }
 exit 0

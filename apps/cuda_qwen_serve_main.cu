@@ -658,9 +658,8 @@ private:
 
 int main(int argc, char** argv) {
     // --help answers before any device or file is touched (post-install smoke: the binary and its DLLs load).
-    for (int i = 1; i < argc; ++i) {
-        const std::string a = argv[i];
-        if (a == "--help" || a == "-h") {
+    {
+        if (strix::device::wants_help(argc, argv)) {
             std::cout << "usage: strix-cuda-qwen-serve --model FIRST_PART.gguf --tables DIR --rope-table FILE\n"
                          "         [--mtp-sidecar FILE] [--draft-vocab FILE] [--bind ADDR] [--port N]\n"
                          "         [--api-key-file FILE] [--prefix-cache on|off] [--devices FILE | --device-id ID]\n"

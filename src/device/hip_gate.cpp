@@ -49,6 +49,7 @@ const Bound& bind_hip(Request request, const std::string& devices_path, std::FIL
 void bind_hip_main(int& argc, char** argv, std::FILE* receipt) {
     try {
         const auto cli = take_command_line(argc, argv);
+        if (wants_help(argc, argv)) return;  // the main's own parser prints its usage; no device is opened
         Request request;
         request.select = cli.select;
         (void)bind_hip(std::move(request), cli.devices_path, receipt);

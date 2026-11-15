@@ -339,9 +339,8 @@ void handle(Service& svc, http::Sock s, std::uint32_t max_positions, const std::
 
 int main(int argc, char** argv) {
     // --help answers before any device or file is touched (post-install smoke: the binary and its DLLs load).
-    for (int i = 1; i < argc; ++i) {
-        const std::string a = argv[i];
-        if (a == "--help" || a == "-h") {
+    {
+        if (strix::device::wants_help(argc, argv)) {
             std::printf("usage: strix-cuda-qwen-prefill-service --model FILE.gguf --tables DIR --rope-table FILE\n"
                         "         [--mtp-sidecar FILE] [--max-positions N] [--bind ADDR] [--port N]\n"
                         "         [--devices FILE | --device-id ID]\n"

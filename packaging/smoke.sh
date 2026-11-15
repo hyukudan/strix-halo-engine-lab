@@ -20,7 +20,7 @@ while [ $# -gt 0 ]; do
 done
 base="${root%/}${prefix}"
 bindir="$base/bin" datadir="$base/share/strix"
-fails=0 passes=0
+fails=0 passes=0 nohelp=0
 pass() { passes=$((passes + 1)); echo "PASS $*"; }
 fail() { fails=$((fails + 1)); echo "FAIL $*"; }
 skip() { echo "SKIP $*"; }
@@ -38,8 +38,14 @@ for exe in "$bindir"/strix-*; do
         fail "$name --help: rc=$rc (timeout or signal)"
     elif [ $rc -eq 0 ] || printf '%s' "$out" | grep -qiE "usage|options"; then
         pass "$name --help (rc=$rc)"
-    else
+    elif printf '%s' "$out" | grep -qiE "error while loading shared libraries|symbol lookup error|device gate"; then
         fail "$name --help: rc=$rc: $(printf '%s' "$out" | head -2 | tr '\n' ' ' | cut -c1-160)"
+    elif [ -n "$out" ]; then
+        # The program loaded and its own parser answered (it has no --help yet): the package is intact.
+        nohelp=$((nohelp + 1))
+        pass "$name loads (no --help: $(printf '%s' "$out" | head -1 | cut -c1-100))"
+    else
+        fail "$name --help: rc=$rc and no output"
     fi
 done
 
@@ -85,5 +91,5 @@ if [ -x "$hip" ] && [ -n "$model" ]; then
 elif [ -x "$hip" ]; then
     skip "--print-effective-config: needs --model FILE.gguf"
 fi
-echo "smoke: $passes passed, $fails failed"
+echo "smoke: $passes passed ($nohelp without --help), $fails failed"
 [ $fails -eq 0 ]
