@@ -464,6 +464,7 @@ int main(int argc, char** argv) {
         cut_input.link_mbps = strix::envcfg::number<double>("STRIX_SPLIT_LINK_MBPS", 0, 0);
         // Same resolver as the pair listener: the declared pair identity names its chunk rows (identity grain).
         cut_input.pair_grain = lc::identity_grain(cut_pair_identity);
+        if (cut_input.pair_grain == mlc::pair_chunk_rows) cut_input.pair_unit_scale = mlc::pair_unit_scale();
         const auto cut_cfg = lc::resolve(cut_cli, cut_input);
         if (print_effective || cut_cfg.split == lc::chain::Split::layer_cut) std::printf("%s", cut_cfg.lines.c_str());
         if (print_effective) return 0;

@@ -55,6 +55,7 @@ CutArguments cut_arguments(int argc, char** argv) {
     }
     lc::Inputs input{mlc::chain_shape()};
     input.pair_grain = lc::identity_grain(cut_pair_identity(args.chunk_rows));
+    if (input.pair_grain == mlc::pair_chunk_rows) input.pair_unit_scale = mlc::pair_unit_scale();
     if (!args.listens.empty()) {
         if (!cli.split) cli.split = "layer-cut";
         input.rows = read_u32(cut_fields(args.listens.front())[1]).size();

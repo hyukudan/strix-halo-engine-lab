@@ -182,6 +182,7 @@ int main() try {
         lc::Inputs listener = g, producer = g;
         listener.pair_grain = lc::identity_grain("default/c" + std::to_string(4096));
         producer.pair_grain = lc::identity_grain(mm::default_pair_identity());
+        listener.pair_unit_scale = producer.pair_unit_scale = mm::pair_unit_scale();
         lc::Cli same; same.split = "layer-cut"; same.cut = "28";
         require(lc::resolve(same, listener, none).lines == lc::resolve(same, producer, none).lines, "listener == producer");
     }
