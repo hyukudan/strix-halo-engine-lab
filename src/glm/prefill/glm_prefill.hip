@@ -13,6 +13,7 @@
 #include "attn_core/index_score_wmma.hpp"
 #include "core/fma_rows.hpp"
 #include "strix/route_receipt.hpp"
+#include "strix/env_flags.hpp"
 
 #include <cstdlib>
 #include <cstdio>
@@ -2497,50 +2498,86 @@ __global__ __launch_bounds__(256) void hc_norm_factor_rows_kernel(const float* X
 // kHoist (STRIX_GLM_PF_HC_HOIST, load placement only; every expression and its order are unchanged):
 //   0: y (or y0 + y1) is loaded inside each of the B steps, behind the previous step's stores (the stores may alias).
 //   1: all B y values are loaded (and summed) into registers before the first step.
-//   2: as 1, and the row pointers are restrict-qualified so the X loads of later steps may also be issued early.
-template <bool kPair, unsigned kHoist = 0>
-__global__ __launch_bounds__(256) void hc_expand_norm_rows_kernel(const float* X, const float* mix, const float* y, const float* y1,
-                                                                  float* Xo, float* rr_out, unsigned* flag) {
+//   2: as 1, and the row pointers are restrict-qualified so the X loads of later steps may also be issued early
+//      (clang attaches noalias to parameters only, so this local qualifier may leave the ISA unchanged).
+//   3: as 2, and the loads are placed explicitly: the row's 20 mix coefficients (m[kHc..2kHc), c[0..16)) once into
+//      registers before the first step, and each step's 4 X values once before its 4 outputs (otherwise every output
+//      reloads them behind the previous store). X, mix and Xo never alias (X / Xo are the two residual buffers).
+// One row's B steps and its fmaf chain; shared by the one-row kernel below and hc_expand_cta_kernel. Returns the
+// chain value a and the row's nonfinite flag; the caller reduces a over the row.
+template <bool kPair, unsigned kHoist>
+__device__ __forceinline__ float hc_expand_row_steps(const float* X, const float* mix, const float* y, const float* y1, float* Xo,
+                                                     std::size_t r, unsigned l, bool& bad_out) {
+    static_assert(kHoist <= 3);
     constexpr unsigned n = kHc * kHidden, B = kHidden / 256;
-    __shared__ float s[256];
-    const unsigned r = blockIdx.x, l = threadIdx.x;
-    const float* m = mix + static_cast<std::size_t>(r) * kHcMix;
+    constexpr bool kRegs = kHoist >= 3;
+    const float* m = mix + r * kHcMix;
     const float* c = m + 2 * kHc;
-    using CP = std::conditional_t<kHoist == 2, const float* __restrict__, const float*>;
-    using OP = std::conditional_t<kHoist == 2, float* __restrict__, float*>;
-    const CP Xr = X + static_cast<std::size_t>(r) * n;
-    const OP Xor = Xo + static_cast<std::size_t>(r) * n;
+    using CP = std::conditional_t<kHoist >= 2, const float* __restrict__, const float*>;
+    using OP = std::conditional_t<kHoist >= 2, float* __restrict__, float*>;
+    const CP Xr = X + r * n;
+    const OP Xor = Xo + r * n;
     float v[kHc - 1][B];  // streams 1 .. 3; stream 0 enters the chain as produced (its terms come first in ascending j)
     float yv[kHoist != 0 ? B : 1];
     if constexpr (kHoist != 0) {
-        const float* __restrict__ yr = y + static_cast<std::size_t>(r) * kHidden;
-        const float* __restrict__ y1r = kPair ? y1 + static_cast<std::size_t>(r) * kHidden : nullptr;
+        const float* __restrict__ yr = y + r * kHidden;
+        const float* __restrict__ y1r = kPair ? y1 + r * kHidden : nullptr;
 #pragma unroll
         for (unsigned b = 0; b < B; ++b) yv[b] = kPair ? yr[b * 256 + l] + y1r[b * 256 + l] : yr[b * 256 + l];
+    }
+    float cm[kRegs ? kHc : 1], cc[kRegs ? kHc * kHc : 1];
+    if constexpr (kRegs) {
+#pragma unroll
+        for (unsigned i = 0; i < kHc; ++i) cm[i] = m[kHc + i];
+#pragma unroll
+        for (unsigned j = 0; j < kHc * kHc; ++j) cc[j] = c[j];
     }
     float a = 0.0F;
     bool bad = false;
 #pragma unroll
     for (unsigned b = 0; b < B; ++b) {
         const unsigned d = b * 256 + l;
-        const std::size_t yi = static_cast<std::size_t>(r) * kHidden + d;
+        const std::size_t yi = r * kHidden + d;
         const float yd = kHoist != 0 ? yv[b] : kPair ? y[yi] + y1[yi] : y[yi];
+        float xs[kRegs ? kHc : 1];
+        if constexpr (kRegs) {
+#pragma unroll
+            for (unsigned j = 0; j < kHc; ++j) xs[j] = Xr[j * kHidden + d];
+        }
 #pragma unroll
         for (unsigned i = 0; i < kHc; ++i) {
-            const float mx = ((c[0 * kHc + i] * Xr[d] + c[1 * kHc + i] * Xr[kHidden + d]) + c[2 * kHc + i] * Xr[2 * kHidden + d]) +
-                             c[3 * kHc + i] * Xr[3 * kHidden + d];
-            const float o = m[kHc + i] * yd + mx;
+            float mx, mi;
+            if constexpr (kRegs) {  // the same expression on the same values, from registers
+                mx = ((cc[0 * kHc + i] * xs[0] + cc[1 * kHc + i] * xs[1]) + cc[2 * kHc + i] * xs[2]) + cc[3 * kHc + i] * xs[3];
+                mi = cm[i];
+            } else {
+                mx = ((c[0 * kHc + i] * Xr[d] + c[1 * kHc + i] * Xr[kHidden + d]) + c[2 * kHc + i] * Xr[2 * kHidden + d]) +
+                     c[3 * kHc + i] * Xr[3 * kHidden + d];
+                mi = m[kHc + i];
+            }
+            const float o = mi * yd + mx;
             bad = bad || !is_finite(o);
             Xor[i * kHidden + d] = o;
             if (i == 0) a = __builtin_fmaf(o, o, a);
             else v[i - 1][b] = o;
         }
     }
-    if (flag && bad) atomicOr(flag, 1U);
 #pragma unroll
     for (unsigned i = 0; i < kHc - 1; ++i)
 #pragma unroll
         for (unsigned b = 0; b < B; ++b) a = __builtin_fmaf(v[i][b], v[i][b], a);
+    bad_out = bad;
+    return a;
+}
+template <bool kPair, unsigned kHoist = 0>
+__global__ __launch_bounds__(256) void hc_expand_norm_rows_kernel(const float* X, const float* mix, const float* y, const float* y1,
+                                                                  float* Xo, float* rr_out, unsigned* flag) {
+    constexpr unsigned n = kHc * kHidden;
+    __shared__ float s[256];
+    const unsigned r = blockIdx.x, l = threadIdx.x;
+    bool bad = false;
+    const float a = hc_expand_row_steps<kPair, kHoist>(X, mix, y, y1, Xo, r, l, bad);
+    if (flag && bad) atomicOr(flag, 1U);
     const float ss = lds_tree256_lane0(s, a);
     if (l == 0) rr_out[r] = inv_sqrt(ss / static_cast<float>(n) + kEps);
 }
@@ -2704,14 +2741,31 @@ void hc_chain_launch(const float* F, const float* fn, float* z, unsigned rows, c
     if (cols8) hc_chain_rows_v2_kernel<Rows, FromX, 8><<<dim3((rows + Rows - 1) / Rows, kHcMix / 8), 2 * Rows, 0, s>>>(F, fn, z, rows, rr);
     else hc_chain_rows_v2_kernel<Rows, FromX><<<(rows + Rows - 1) / Rows, 2 * Rows, 0, s>>>(F, fn, z, rows, rr);
 }
-unsigned hc_rows_tile() {  // STRIX_GLM_PF_HC_TILE = 64 | 32 | 16 (same bits), default 32
+unsigned hc_rows_tile() {  // STRIX_GLM_PF_HC_TILE = 64 | 32 | 16 (same bits), legacy alias of HC_CHAIN_ROWS; 0 = unset
     static const unsigned t = [] {
         const char* e = std::getenv("STRIX_GLM_PF_HC_TILE");
         if (e && std::string(e) == "64") return 64U;
+        if (e && std::string(e) == "32") return 32U;
         if (e && std::string(e) == "16") return 16U;
-        return 32U;
+        return 0U;
     }();
     return t;
+}
+// The v2 chain's rows per CTA (T = 2 x Rows threads, one thread = 4 rows x Cols / 8 outputs). Same bits for every
+// tile: each output's chain is fmaf over k ascending (stages of kHcK, then k) and never crosses rows or CTAs.
+// STRIX_GLM_PF_HC_CHAIN_ROWS = auto (default) | 64 | 32 | 16 | 8; auto picks by the launch's rows (fixture table).
+unsigned hc_chain_rows_auto(unsigned rows) {
+    (void)rows;
+    return 32U;
+}
+template <bool FromX>
+void hc_chain_launch_rows(unsigned t, const float* F, const float* fn, float* z, unsigned rows, const float* rr, bool cols8,
+                          hipStream_t s) {
+    if (t == 64) hc_chain_launch<64, FromX>(F, fn, z, rows, rr, cols8, s);
+    else if (t == 32) hc_chain_launch<32, FromX>(F, fn, z, rows, rr, cols8, s);
+    else if (t == 16) hc_chain_launch<16, FromX>(F, fn, z, rows, rr, cols8, s);
+    else if (t == 8) hc_chain_launch<8, FromX>(F, fn, z, rows, rr, cols8, s);
+    else throw std::invalid_argument("hc chain rows per CTA must be 64, 32, 16 or 8");
 }
 
 // One lane per row executes the shared serial R6; all lanes then share the collapse.
@@ -3188,10 +3242,7 @@ void hc_pre_rows_v2(const float* X, const float* fn, const float* base, const fl
     if (rows == 0) return;
     hc_norm_rows_kernel<<<rows, 256, 0, s>>>(X, F);
     ok(hipGetLastError(), "glm pf hc_norm_rows v2");
-    const unsigned t = hc_rows_tile();
-    if (t == 64) hc_chain_launch<64, false>(F, fn, z, rows, nullptr, hc_cols8(), s);
-    else if (t == 16) hc_chain_launch<16, false>(F, fn, z, rows, nullptr, hc_cols8(), s);
-    else hc_chain_launch<32, false>(F, fn, z, rows, nullptr, hc_cols8(), s);
+    hc_chain_launch_rows<false>(hc_chain_rows(rows), F, fn, z, rows, nullptr, hc_cols8(), s);
     ok(hipGetLastError(), "glm pf hc_chain_rows v2");
     hc_mix_rows_v2_kernel<<<(rows + kHcMixRows - 1) / kHcMixRows, 256, 0, s>>>(X, z, base, scale, mix, xc, rows);
     ok(hipGetLastError(), "glm pf hc_mix_rows v2");
@@ -3233,10 +3284,7 @@ void hc_pre_rows_v2(const float* X, const float* fn, const float* base, const fl
     if (rows == 0) return;
     hc_norm_rows_kernel<<<rows, 256, 0, s>>>(X, F);
     ok(hipGetLastError(), "glm pf hc_norm_rows v2 mixnorm");
-    const unsigned t = hc_rows_tile();
-    if (t == 64) hc_chain_launch<64, false>(F, fn, z, rows, nullptr, hc_cols8(), s);
-    else if (t == 16) hc_chain_launch<16, false>(F, fn, z, rows, nullptr, hc_cols8(), s);
-    else hc_chain_launch<32, false>(F, fn, z, rows, nullptr, hc_cols8(), s);
+    hc_chain_launch_rows<false>(hc_chain_rows(rows), F, fn, z, rows, nullptr, hc_cols8(), s);
     ok(hipGetLastError(), "glm pf hc_chain_rows v2 mixnorm");
     hc_mix_norm_rows(X, z, base, scale, mix, norm, xn, rows, s);
 }
@@ -3270,16 +3318,36 @@ void launch_expand_norm(unsigned hoist, const float* X, const float* mix, const 
     if (hoist == 0) hc_expand_norm_rows_kernel<kPair, 0><<<rows, 256, 0, s>>>(X, mix, y0, y1, Xo, rr, flag);
     else if (hoist == 1) hc_expand_norm_rows_kernel<kPair, 1><<<rows, 256, 0, s>>>(X, mix, y0, y1, Xo, rr, flag);
     else if (hoist == 2) hc_expand_norm_rows_kernel<kPair, 2><<<rows, 256, 0, s>>>(X, mix, y0, y1, Xo, rr, flag);
-    else throw std::invalid_argument("hc expand hoist must be 0, 1 or 2");
+    else if (hoist == 3) hc_expand_norm_rows_kernel<kPair, 3><<<rows, 256, 0, s>>>(X, mix, y0, y1, Xo, rr, flag);
+    else throw std::invalid_argument("hc expand hoist must be 0, 1, 2 or 3");
 }
 }  // namespace
+
+unsigned hc_chain_rows(unsigned rows) {
+    static const unsigned forced = [] {
+        const char* e = strix::envcfg::text("STRIX_GLM_PF_HC_CHAIN_ROWS");  // recorded in the effective config
+        const std::string v = e != nullptr ? e : "";
+        if (v == "64" || v == "32" || v == "16" || v == "8") return static_cast<unsigned>(std::stoul(v));
+        if (!v.empty() && v != "auto") throw std::invalid_argument("STRIX_GLM_PF_HC_CHAIN_ROWS must be auto, 64, 32, 16 or 8");
+        return hc_rows_tile();  // the legacy STRIX_GLM_PF_HC_TILE when set, else 0 = auto by rows
+    }();
+    return forced != 0 ? forced : hc_chain_rows_auto(rows);
+}
+
+void hc_chain_rows_shape(unsigned tile, bool cols8, bool from_x, const float* F, const float* fn, float* z, unsigned rows,
+                         const float* rr, hipStream_t s) {
+    if (rows == 0) return;
+    if (from_x) hc_chain_launch_rows<true>(tile, F, fn, z, rows, rr, cols8, s);
+    else hc_chain_launch_rows<false>(tile, F, fn, z, rows, nullptr, cols8, s);
+    ok(hipGetLastError(), "glm pf hc_chain_rows_shape");
+}
 
 unsigned hc_expand_hoist() {
     static const unsigned h = [] {
         const char* e = std::getenv("STRIX_GLM_PF_HC_HOIST");
         if (e == nullptr || *e == '\0') return 1U;  // default 1; load placement only (exact by construction); 0 = loads inside each step
         const std::string v(e);
-        if (v != "0" && v != "1" && v != "2") throw std::invalid_argument("STRIX_GLM_PF_HC_HOIST must be 0, 1 or 2");
+        if (v != "0" && v != "1" && v != "2" && v != "3") throw std::invalid_argument("STRIX_GLM_PF_HC_HOIST must be 0, 1, 2 or 3");
         return static_cast<unsigned>(v[0] - '0');
     }();
     return h;
@@ -3344,7 +3412,7 @@ void hc_expand_norm_rows_cta(unsigned cta_rows, unsigned hoist, const float* X, 
                              const float* y, const float* y1, float* Xo, float* rr, unsigned* flag,
                              unsigned rows, hipStream_t s) {
     if (cta_rows != 1 && cta_rows != 2) throw std::invalid_argument("hc expand CTA rows must be 1 or 2");
-    if (hoist > 2) throw std::invalid_argument("hc expand hoist must be 0, 1 or 2");
+    if (hoist > 3) throw std::invalid_argument("hc expand hoist must be 0, 1, 2 or 3");
     if (rows == 0) return;
     if (cta_rows == 1 && hoist == 0 && y1 == nullptr) {
         hc_expand_norm_rows_kernel<false, 0><<<rows, 256, 0, s>>>(X, mix, y, nullptr, Xo, rr, flag);
@@ -3375,9 +3443,11 @@ bool hc_expand_cta_resources() {
     HC_EXPAND_RESOURCE(false, 0);
     HC_EXPAND_RESOURCE(false, 1);
     HC_EXPAND_RESOURCE(false, 2);
+    HC_EXPAND_RESOURCE(false, 3);
     HC_EXPAND_RESOURCE(true, 0);
     HC_EXPAND_RESOURCE(true, 1);
     HC_EXPAND_RESOURCE(true, 2);
+    HC_EXPAND_RESOURCE(true, 3);
 #undef HC_EXPAND_RESOURCE
     return pass;
 }
@@ -3386,10 +3456,7 @@ void hc_pre_rows_normed(const float* X, const float* fn, const float* base, cons
                         float* xc, unsigned rows, hipStream_t s) {
     if (rows == 0) return;
     if (hc_version() != 2) throw std::logic_error("glm pf hc_pre_rows_normed: v2 sites only");
-    const unsigned t = hc_rows_tile();
-    if (t == 64) hc_chain_launch<64, true>(X, fn, z, rows, rr, hc_cols8(), s);
-    else if (t == 16) hc_chain_launch<16, true>(X, fn, z, rows, rr, hc_cols8(), s);
-    else hc_chain_launch<32, true>(X, fn, z, rows, rr, hc_cols8(), s);
+    hc_chain_launch_rows<true>(hc_chain_rows(rows), X, fn, z, rows, rr, hc_cols8(), s);
     ok(hipGetLastError(), "glm pf hc_chain_rows normed");
     hc_mix_rows_v2_kernel<<<(rows + kHcMixRows - 1) / kHcMixRows, 256, 0, s>>>(X, z, base, scale, mix, xc, rows);
     ok(hipGetLastError(), "glm pf hc_mix_rows normed");
@@ -3399,10 +3466,7 @@ void hc_pre_rows_normed(const float* X, const float* fn, const float* base, cons
                         const std::uint16_t* norm, float* xn, unsigned rows, hipStream_t s) {
     if (rows == 0) return;
     if (hc_version() != 2) throw std::logic_error("glm pf hc_pre_rows_normed: v2 sites only");
-    const unsigned t = hc_rows_tile();
-    if (t == 64) hc_chain_launch<64, true>(X, fn, z, rows, rr, hc_cols8(), s);
-    else if (t == 16) hc_chain_launch<16, true>(X, fn, z, rows, rr, hc_cols8(), s);
-    else hc_chain_launch<32, true>(X, fn, z, rows, rr, hc_cols8(), s);
+    hc_chain_launch_rows<true>(hc_chain_rows(rows), X, fn, z, rows, rr, hc_cols8(), s);
     ok(hipGetLastError(), "glm pf hc_chain_rows normed mixnorm");
     hc_mix_norm_rows(X, z, base, scale, mix, norm, xn, rows, s);
 }

@@ -1688,10 +1688,10 @@ void test_hc_expand_norm(std::mt19937& g) {
             unsigned *flr = zalloc<unsigned>(1), *fls = zalloc<unsigned>(1);
             P::hc_expand_norm_rows(dX, mix, dS, Xr, fr, flr, R, nullptr);
             P::hc_sum_expand_norm_rows(dX, mix, dY, dQ1, Xs, fs, fls, R, nullptr);
-            // STRIX_GLM_PF_HC_HOIST 0 / 1 / 2 explicitly (load placement only): single and pair forms
-            float *Xh[3][2], *fh[3][2];
-            unsigned* flh[3][2];
-            for (unsigned h = 0; h < 3; ++h) {
+            // STRIX_GLM_PF_HC_HOIST 0 / 1 / 2 / 3 explicitly (load placement only): single and pair forms
+            float *Xh[4][2], *fh[4][2];
+            unsigned* flh[4][2];
+            for (unsigned h = 0; h < 4; ++h) {
                 for (unsigned pr = 0; pr < 2; ++pr) {
                     Xh[h][pr] = poison<float>(nf + guard);
                     fh[h][pr] = poison<float>(R + guard);
@@ -1738,7 +1738,7 @@ void test_hc_expand_norm(std::mt19937& g) {
             compare(Xr, Xs, nf, "sum-on-load X vs sum2 + fused");
             compare(fr, fs, R, "sum-on-load rr vs sum2 + fused");
             const unsigned cr = down(flr, 1)[0], cs = down(fls, 1)[0];
-            for (unsigned h = 0; h < 3; ++h)
+            for (unsigned h = 0; h < 4; ++h)
                 for (unsigned pr = 0; pr < 2; ++pr) {
                     const std::string nm = std::string(pr ? "pair" : "single") + " hoist " + std::to_string(h);
                     compare(Xr, Xh[h][pr], nf, (nm + " X").c_str());
@@ -1800,7 +1800,7 @@ void bench_hc_seam(std::mt19937& g) {
         t_sum2_kernel<<<static_cast<unsigned>((nx + 255) / 256), 256>>>(dY, p1, S, nx);
         P::hc_expand_norm_rows_h(0, dX, mix, S, Xref, rref, fl, R, nullptr);
         const auto Hx = down(Xref, nf), Hr = down(rref, R);
-        for (unsigned h = 0; h < 3; ++h) {
+        for (unsigned h = 0; h < 4; ++h) {
             for (int pr = 0; pr < 2; ++pr) {
                 auto run = [&] {
                     if (pr) P::hc_sum_expand_norm_rows_h(h, dX, mix, dY, p1, Xo, rr, fl, R, nullptr);
@@ -1841,6 +1841,7 @@ void bench_hc_seam(std::mt19937& g) {
     free_all();
 }
 #include "hip_glm_hc_expand_cta_fixture.inc"
+#include "hip_glm_hc_chain_fixture.inc"
 
 int main(int argc, char** argv) {
     if (argc < 2) {
@@ -1855,6 +1856,12 @@ int main(int argc, char** argv) {
             try { std::printf("hc-expand-rows=%u\n", P::hc_expand_cta_rows()); }
             catch (const std::invalid_argument& e) { std::fprintf(stderr, "%s\n", e.what()); return 2; }
             return 0;  // no allocation or device work
+        }
+        if (mode == "hcchain" || mode == "hcchainbench") {
+            test_hc_chain(g, want_timing && mode == "hcchainbench");
+            std::printf("checks: %d failures: %d
+", checks, failures);
+            return failures ? 1 : 0;
         }
         if (mode == "hcexpand" || mode == "hcexpandbench") {
             test_hc_expand_cta(g, false);
@@ -1882,7 +1889,7 @@ int main(int argc, char** argv) {
         return failures ? 1 : 0;
     }
     if (const char* only = std::getenv("STRIX_GLM_PF_TEST_ONLY"); only != nullptr && std::string(only) == "hcbench") {
-        test_hc_expand_norm(g);  // the bitwise gate first (all stress inputs, hoist 0 / 1 / 2)
+        test_hc_expand_norm(g);  // the bitwise gate first (all stress inputs, hoist 0 / 1 / 2 / 3)
         if (failures == 0) bench_hc_seam(g);
         std::printf("checks: %d failures: %d\n", checks, failures);
         return failures ? 1 : 0;

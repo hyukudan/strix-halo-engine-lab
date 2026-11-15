@@ -1,5 +1,5 @@
 // Included inside glm_prefill.hip's anonymous namespace. Expand CTA placement only.
-// Pair addition and hoist 0/1/2 repeat the existing sum-on-load/hoisted expand arithmetic;
+// Pair addition and hoist 0-3 repeat the existing sum-on-load/hoisted expand arithmetic;
 // those levers are controls, not gains attributable to the two-row organization.
 // Compile with the enclosing translation unit's strict FP flags and wave32 contract.
 // LDS = kRows * 256 * sizeof(float): 1/2 KiB for 256/512 threads. Per-thread live
@@ -22,50 +22,17 @@ __global__ __launch_bounds__(kRows * 256) void hc_expand_cta_kernel(
     const float* X, const float* mix, const float* y, const float* y1, float* Xo,
     float* rr_out, unsigned* flag, unsigned rows) {
     static_assert(kRows == 1 || kRows == 2);
-    static_assert(kHoist <= 2);
-    constexpr unsigned n = kHc * kHidden, B = kHidden / 256;
+    static_assert(kHoist <= 3);
+    constexpr unsigned n = kHc * kHidden;
     static_assert(kHc == 4 && kHidden % 256 == 0);
     __shared__ float s[kRows][256];
     const unsigned group = threadIdx.x / 256, l = threadIdx.x % 256;
     const unsigned r = blockIdx.x * kRows + group;
     float a = 0.0F;
     if (kRows == 1 || r < rows) {  // one-row control has no tail branch; no inactive-row memory access
-        const float* m = mix + static_cast<std::size_t>(r) * kHcMix;
-        const float* c = m + 2 * kHc;
-        using CP = std::conditional_t<kHoist == 2, const float* __restrict__, const float*>;
-        using OP = std::conditional_t<kHoist == 2, float* __restrict__, float*>;
-        const CP Xr = X + static_cast<std::size_t>(r) * n;
-        const OP Xor = Xo + static_cast<std::size_t>(r) * n;
-        float v[kHc - 1][B];
-        float yv[kHoist != 0 ? B : 1];
-        if constexpr (kHoist != 0) {
-            const float* __restrict__ yr = y + static_cast<std::size_t>(r) * kHidden;
-            const float* __restrict__ y1r = kPair ? y1 + static_cast<std::size_t>(r) * kHidden : nullptr;
-#pragma unroll
-            for (unsigned b = 0; b < B; ++b) yv[b] = kPair ? yr[b * 256 + l] + y1r[b * 256 + l] : yr[b * 256 + l];
-        }
-        bool bad = false;
-#pragma unroll
-        for (unsigned b = 0; b < B; ++b) {
-            const unsigned d = b * 256 + l;
-            const std::size_t yi = static_cast<std::size_t>(r) * kHidden + d;
-            const float yd = kHoist != 0 ? yv[b] : kPair ? y[yi] + y1[yi] : y[yi];
-#pragma unroll
-            for (unsigned i = 0; i < kHc; ++i) {
-                const float mx = ((c[0 * kHc + i] * Xr[d] + c[1 * kHc + i] * Xr[kHidden + d]) + c[2 * kHc + i] * Xr[2 * kHidden + d]) +
-                                 c[3 * kHc + i] * Xr[3 * kHidden + d];
-                const float o = m[kHc + i] * yd + mx;
-                bad = bad || !is_finite(o);
-                Xor[i * kHidden + d] = o;
-                if (i == 0) a = __builtin_fmaf(o, o, a);
-                else v[i - 1][b] = o;
-            }
-        }
+        bool bad = false;  // the one-row kernel's steps and chain (hc_expand_row_steps), same per-row order
+        a = hc_expand_row_steps<kPair, kHoist>(X, mix, y, y1, Xo, r, l, bad);
         if (flag && bad) atomicOr(flag, 1U);
-#pragma unroll
-        for (unsigned i = 0; i < kHc - 1; ++i)
-#pragma unroll
-            for (unsigned b = 0; b < B; ++b) a = __builtin_fmaf(v[i][b], v[i][b], a);
     }
     // Do not call lds_tree256_lane0: it indexes with the whole CTA's threadIdx.x.
     const float ss = hc_expand_row_tree256_lane0(s[group], a, l);
@@ -78,7 +45,8 @@ void hc_expand_cta_launch(unsigned hoist, const float* X, const float* mix, cons
     const unsigned grid = rows / kRows + (rows % kRows != 0);
     if (hoist == 0) hc_expand_cta_kernel<kPair, 0, kRows><<<grid, kRows * 256, 0, stream>>>(X, mix, y, y1, Xo, rr, flag, rows);
     else if (hoist == 1) hc_expand_cta_kernel<kPair, 1, kRows><<<grid, kRows * 256, 0, stream>>>(X, mix, y, y1, Xo, rr, flag, rows);
-    else hc_expand_cta_kernel<kPair, 2, kRows><<<grid, kRows * 256, 0, stream>>>(X, mix, y, y1, Xo, rr, flag, rows);
+    else if (hoist == 2) hc_expand_cta_kernel<kPair, 2, kRows><<<grid, kRows * 256, 0, stream>>>(X, mix, y, y1, Xo, rr, flag, rows);
+    else hc_expand_cta_kernel<kPair, 3, kRows><<<grid, kRows * 256, 0, stream>>>(X, mix, y, y1, Xo, rr, flag, rows);
 }
 
 template <bool kPair, unsigned kHoist, unsigned kRows>

@@ -12,9 +12,9 @@ void test_hc_expand_cta(std::mt19937& g, bool timing) {
     if (failures) return;
     check(P::hc_expand_cta_resources(), "expand CTA resources: launchable, resident, no reported local bytes");
     if (failures) return;
-    for (unsigned R : {1U, 2U, 3U, 7U, 4096U, 8192U}) {
+    for (unsigned R : {1U, 2U, 3U, 7U, 2048U, 4096U, 8192U}) {
         const std::size_t nf = static_cast<std::size_t>(R) * n, ny = static_cast<std::size_t>(R) * kHidden;
-        const unsigned stresses = !timing && R < 4096 ? 5 : 1;
+        const unsigned stresses = !timing && R < 2048 ? 5 : 1;
         for (unsigned stress = 0; stress < stresses; ++stress) {
             // Bench replays the exact finite case admitted by the complete preceding gate.
             g.seed(20261025U + R * 5U + stress);
@@ -73,7 +73,7 @@ void test_hc_expand_cta(std::mt19937& g, bool timing) {
                     const auto ref_x = down(ref, nf + 2 * guard), ref_r = down(refrr, R + 2 * guard);
                     const unsigned ref_f = down(refflag, 1)[0];
                     check((ref_f & seed) == seed && (stress != 2 || ref_f == (seed | 1U)), "expand CTA reference flag stress");
-                    for (unsigned h = 0; h < 3; ++h) {
+                    for (unsigned h = 0; h < 4; ++h) {
                         const std::string label = "expand CTA R=" + std::to_string(R) + " stress=" + std::to_string(stress) +
                             " pair=" + std::to_string(pair) + " hoist=" + std::to_string(h) + " mapped=" + std::to_string(mem);
                         auto run = [&](unsigned cta_rows, bool seam) {
@@ -139,7 +139,7 @@ void test_hc_expand_cta(std::mt19937& g, bool timing) {
         }
     }
     for (unsigned cta_rows : {1U, 2U})
-        for (unsigned h = 0; h < 3; ++h)
+        for (unsigned h = 0; h < 4; ++h)
             P::hc_expand_norm_rows_cta(cta_rows, h, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, 0, nullptr);
     for (unsigned invalid : {0U, 3U, 512U}) {
         bool rejected = false;
@@ -148,7 +148,7 @@ void test_hc_expand_cta(std::mt19937& g, bool timing) {
         check(rejected, "expand CTA rejects invalid row selector " + std::to_string(invalid));
     }
     bool rejected = false;
-    try { P::hc_expand_norm_rows_cta(2, 3, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, 0, nullptr); }
+    try { P::hc_expand_norm_rows_cta(2, 4, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, 0, nullptr); }
     catch (const std::invalid_argument&) { rejected = true; }
     check(rejected, "expand CTA rejects invalid hoist");
     hok(hipGetLastError(), "expand CTA zero rows");

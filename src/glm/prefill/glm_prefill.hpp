@@ -129,7 +129,7 @@ void hc_expand_norm_rows(const float* X, const float* mix, const float* y, float
 // Two-row expand CTA: strict cached STRIX_GLM_PF_HC_EXPAND_ROWS=1 (kernel default) / 2 (rank default).
 // Default keeps the existing kernel. Explicit gate API bypasses the selector: each row
 // uses 256 threads and its own ordered tree. y1 != nullptr forms rank-ordered y + y1
-// before multiplication; hoist 0/1/2 are the existing load-placement controls.
+// before multiplication; hoist 0/1/2/3 are the load-placement controls.
 // Hoist 2 requires disjoint X/Xo. No resource, payload or performance qualification implied.
 unsigned hc_expand_cta_rows();
 void hc_expand_norm_rows_cta(unsigned cta_rows, unsigned hoist, const float* X, const float* mix,
@@ -146,9 +146,15 @@ void hc_pre_rows_normed(const float* X, const float* fn, const float* base, cons
 bool hc_sum_expand_enabled();
 void hc_sum_expand_norm_rows(const float* X, const float* mix, const float* y0, const float* y1, float* Xo, float* rr, unsigned* flag,
                              unsigned rows, hipStream_t s);
-// STRIX_GLM_PF_HC_HOIST (default 1; 0 = loads inside each step, 2 = 1 plus restrict): where the fused expand issues its loads (1: y / y0 + y1 into registers before the first
+// STRIX_GLM_PF_HC_HOIST (default 1; 0 = loads inside each step, 2 = 1 plus restrict, 3 = 2 plus the row coefficients and each step's X in registers): where the fused expand issues its loads (1: y / y0 + y1 into registers before the first
 // step; 2: also restrict row pointers so later X loads issue early). Same expressions in the same order: same bits.
 unsigned hc_expand_hoist();
+// v2 chain rows per CTA for a launch of `rows` rows (STRIX_GLM_PF_HC_CHAIN_ROWS = auto | 64 | 32 | 16 | 8, same bits).
+unsigned hc_chain_rows(unsigned rows);
+// Test hook: one v2 chain launch with an explicit shape (tile 64 | 32 | 16 | 8, 24 or 8 outputs per CTA); from_x forms
+// F = X * rr on load (the normed sites), else F is read as stored.
+void hc_chain_rows_shape(unsigned tile, bool cols8, bool from_x, const float* F, const float* fn, float* z, unsigned rows,
+                         const float* rr, hipStream_t s);
 void hc_expand_norm_rows_h(unsigned hoist, const float* X, const float* mix, const float* y, float* Xo, float* rr, unsigned* flag,
                            unsigned rows, hipStream_t s);
 void hc_sum_expand_norm_rows_h(unsigned hoist, const float* X, const float* mix, const float* y0, const float* y1, float* Xo, float* rr,
