@@ -2793,16 +2793,14 @@ struct Bench {
                 }
                 if (k.T == 8192) {
                     check(control_differs, "dense negative control: adaptive split should change bits at 256-row segments " + group_name(g));
-                    std::printf("dense chunk invariance %s T=8192 adaptive control: %s
-", group_name(g).c_str(),
+                    std::printf("dense chunk invariance %s T=8192 adaptive control: %s\n", group_name(g).c_str(),
                                 control_differs ? "differs (expected)" : "SAME");
                 }
                 hip_ok(hipFree(in), "free");
                 for (auto* x : whole) hip_ok(hipFree(x), "free");
                 for (auto* x : part) hip_ok(hipFree(x), "free");
             }
-            std::printf("dense chunk invariance %s invariant: %u/%u bitwise; library == invariant v4 %u/%u
-", group_name(g).c_str(),
+            std::printf("dense chunk invariance %s invariant: %u/%u bitwise; library == invariant v4 %u/%u\n", group_name(g).c_str(),
                         pass, cells, lib_same, lib_cells);
             std::fflush(stdout);
             hip_ok(hipFree(ws), "free");
