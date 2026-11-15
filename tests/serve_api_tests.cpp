@@ -1365,12 +1365,12 @@ int main() try {
         for (const auto n : {-1,21}) { auto b = parse_json(base.dump()); b.set("top_logprobs",Json(n)); check(call("/v1/chat/completions",b,false).status == 400,"top logprobs bounds"); }
         {  // prompt-token scores: no engine executes them; the field is refused explicitly on every route, never ignored
             auto b = parse_json(base.dump()); b.set("prompt_logprobs", Json(1));
-            const auto r = call("/v1/chat/completions", b, false);
-            check(r.status == 400 && r.body.find("prompt_logprobs") != std::string::npos, "prompt_logprobs refused explicitly (chat)");
-            auto c = parse_json(R"({"prompt":"Hi","max_tokens":2,"prompt_logprobs":0})");
-            check(call("/v1/completions", c, false).status == 400, "prompt_logprobs refused explicitly (completions)");
-            auto n = parse_json(base.dump()); n.set("prompt_logprobs", Json());
-            check(call("/v1/chat/completions", n, false).status == 200, "prompt_logprobs null is neutral");
+            const auto refused = call("/v1/chat/completions", b, false);
+            check(refused.status == 400 && refused.body.find("prompt_logprobs") != std::string::npos, "prompt_logprobs refused explicitly (chat)");
+            auto legacy = parse_json(R"({"prompt":"Hi","max_tokens":2,"prompt_logprobs":0})");
+            check(call("/v1/completions", legacy, false).status == 400, "prompt_logprobs refused explicitly (completions)");
+            auto neutral = parse_json(base.dump()); neutral.set("prompt_logprobs", Json());
+            check(call("/v1/chat/completions", neutral, false).status == 200, "prompt_logprobs null is neutral");
         }
         for (const auto n : {-1,6}) { auto b = parse_json(completion.dump()); b.set("logprobs",Json(n)); check(call("/v1/completions",b,false).status == 400,"completion logprobs bounds"); }
         for (const auto* field : {"presence_penalty","frequency_penalty","repetition_penalty"}) {
