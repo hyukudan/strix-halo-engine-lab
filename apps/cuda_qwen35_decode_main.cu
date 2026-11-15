@@ -13,6 +13,7 @@
 #include <thread>
 #include <vector>
 
+#include "strix/cuda_core/dense.hpp"
 #include "strix/device/cuda_enumerator.hpp"
 #include "strix/qwen35/cuda_engine.hpp"
 
@@ -115,6 +116,11 @@ int main(int argc, char** argv) {
             else if (a == "--graphs") graphs = next() != "0";
             else if (a == "--bw-probe") bwp = true;
             else if (a == "--pdl") pdl = next() != "0";
+            else if (a == "--dense-arith") {
+                const std::string v = next();
+                strix::cuda_core::set_dense_arith(v == "fp32" ? strix::cuda_core::DenseArith::fp32 : v == "mma2" ? strix::cuda_core::DenseArith::mma2
+                                                  : v == "mma1" ? strix::cuda_core::DenseArith::mma1 : strix::cuda_core::DenseArith::mma3);
+            }
             else if (a == "--multi") multi = next() != "0";
             else if (a == "--dump-logits") dump = next();
             else if (a == "--dump-mtp") dump_mtp = next();
@@ -128,7 +134,7 @@ int main(int argc, char** argv) {
         if ((model.empty() == synth.empty()) || rows_cap == 0 || rows_cap > 32 || decode_rows == 0 || decode_rows > 32)
             throw std::runtime_error(
                 "usage: (--model F.gguf | --synthetic-full bf16|q8_0 [--layers N]) (--prompt-ids 1,2,3 | --prompt-len N) [--ctx-fill N] "
-                "[--n-gen N] [--rows 1..32] [--decode-rows 1..32 (timing of an R-row window, committed fully)] [--max-pos N] "
+                "[--dense-arith mma3|mma2|mma1|fp32] [--n-gen N] [--rows 1..32] [--decode-rows 1..32 (timing of an R-row window, committed fully)] [--max-pos N] "
                 "[--graphs 0|1] [--dump-logits F]");
         std::vector<std::uint32_t> prompt;
         if (!ids_arg.empty()) {

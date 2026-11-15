@@ -49,8 +49,10 @@ static float half_val(std::uint16_t b) { __half h; std::memcpy(&h, &b, 2); retur
 static std::mt19937 rng(1234);
 static float rnd(float s) { return std::uniform_real_distribution<float>(-s, s)(rng); }
 
-int test_dense() {
-    const std::uint32_t in = 1056, out = 70, R = 16;
+static int test_dense_arith(cc::DenseArith arith) {
+    cc::set_dense_arith(arith);
+    const bool mma = arith != cc::DenseArith::fp32;
+    const std::uint32_t in = 1056, out = mma ? 80 : 70, R = 32;
     std::vector<std::uint16_t> wb(out * in);
     std::vector<double> wd(out * in);
     for (std::size_t i = 0; i < wb.size(); ++i) { wb[i] = bf16_bits(rnd(0.1f)); wd[i] = bf16_val(wb[i]); }
@@ -76,13 +78,14 @@ int test_dense() {
     Case cases[3] = {{"bf16", {dwb, cc::WeightFormat::bf16, out, in}, &wd, {}}, {"q8_0", {dwq, cc::WeightFormat::q8_0, out, in}, &wqd, {}},
                      {"f32", {dwf, cc::WeightFormat::f32, out, in}, &wfd, {}}};
     for (auto& cs : cases) {
-        for (std::uint32_t rows : {1u, 2u, 3u, 5u, 8u, 11u, 16u}) {
+        for (std::uint32_t rows : {1u, 2u, 3u, 5u, 8u, 11u, 16u, 17u, 24u, 32u}) {
+            if (!mma && rows > 16) continue;
             CK(cc::dense_rows(cs.w, dx, dy, rows, nullptr, nullptr));
             auto y = get(dy, rows * out);
             std::vector<double> ref(rows * out);
             for (std::uint32_t r = 0; r < rows; ++r)
                 for (std::uint32_t o = 0; o < out; ++o) { double s = 0; for (std::uint32_t k = 0; k < in; ++k) s += (*cs.ref)[o * in + k] * x[r * in + k]; ref[r * out + o] = s; }
-            CHECK(maxrel(y, ref) < 1e-5, "%s rows %u relerr %g", cs.name, rows, maxrel(y, ref));
+            CHECK(maxrel(y, ref) < (arith == cc::DenseArith::mma1 && cs.w.format != cc::WeightFormat::f32 ? 1e-2 : 1e-5), "%s rows %u relerr %g", cs.name, rows, maxrel(y, ref));
             // row invariance: each row alone must equal the batched row, bitwise
             for (std::uint32_t r = 0; r < rows; ++r) {
                 CK(cc::dense_rows(cs.w, dx + r * in, dy1 + r * out, 1, nullptr, nullptr));
@@ -107,7 +110,13 @@ int test_dense() {
     CHECK(maxrel(f, ref) < 1e-5, "fused relerr %g", maxrel(f, ref));
     for (std::uint32_t r = 0; r < 9; ++r) CK(cc::dense_gate_up_silu_rows(cases[0].w, cases[0].w, dx + r * in, dy1 + r * out, 1, nullptr));
     CHECK(bits_equal(f, get(dy1, 9 * out)), "fused rows invariance");
+    cc::set_dense_arith(cc::DenseArith::mma3);
     return 0;
+}
+int test_dense() {
+    if (int e = test_dense_arith(cc::DenseArith::fp32)) return e;
+    if (int e = test_dense_arith(cc::DenseArith::mma3)) return e;
+    return test_dense_arith(cc::DenseArith::mma1) ;
 }
 
 int test_norms_rope() {

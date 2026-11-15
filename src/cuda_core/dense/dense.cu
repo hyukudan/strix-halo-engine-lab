@@ -2,6 +2,7 @@
 #include "strix/cuda_core/dense.hpp"
 
 #include "../common.cuh"
+#include "dense_mma.hpp"
 
 namespace strix::cuda_core {
 namespace {
@@ -335,6 +336,12 @@ __global__ void argmax_stage2(const float* pv, const std::uint32_t* pi, std::uin
 
 void set_programmatic_launch(bool on) { pdl_enabled() = on; }
 
+namespace {
+DenseArith g_arith = DenseArith::mma3;
+}
+void set_dense_arith(DenseArith a) { g_arith = a; }
+DenseArith dense_arith() { return g_arith; }
+
 cudaError_t dense_rows(const DenseWeight& w, const float* x, float* y, std::uint32_t rows, const float* residual,
                        cudaStream_t stream) {
     return dense_rows_multi(&w, &y, 1, x, rows, residual, stream);
@@ -355,6 +362,13 @@ cudaError_t dense_rows_multi(const DenseWeight* ws, float* const* ys, int n, con
         ma.row_end[j] = total;
     }
     for (int j = n; j < kMaxMulti; ++j) ma.row_end[j] = total;
+    if (g_arith != DenseArith::fp32) {
+        MmaCall mc{};
+        mc.n = n; mc.format = ws[0].format; mc.in = ws[0].in; mc.rows = rows; mc.x = x; mc.residual = residual;
+        mc.terms = g_arith == DenseArith::mma3 ? 3 : g_arith == DenseArith::mma2 ? 2 : 1;
+        for (int j = 0; j < n; ++j) { mc.w[j] = ws[j].data; mc.y[j] = ys[j]; mc.out[j] = ws[j].out; }
+        if (dense_mma_supported(mc)) return dense_mma_launch(mc, stream);
+    }
     return dispatch<false>(ma, ws[0], nullptr, x, residual, rows, stream);
 }
 
@@ -368,6 +382,13 @@ cudaError_t dense_gate_up_silu_rows(const DenseWeight& gate, const DenseWeight& 
     ma.y[0] = y;
     ma.out[0] = gate.out;
     for (int j = 0; j < kMaxMulti; ++j) ma.row_end[j] = gate.out;
+    if (g_arith != DenseArith::fp32) {
+        MmaCall mc{};
+        mc.n = 1; mc.format = gate.format; mc.in = gate.in; mc.rows = rows; mc.x = x; mc.w1 = up.data;
+        mc.terms = g_arith == DenseArith::mma3 ? 3 : g_arith == DenseArith::mma2 ? 2 : 1;
+        mc.w[0] = gate.data; mc.y[0] = y; mc.out[0] = gate.out;
+        if (dense_mma_supported(mc)) return dense_mma_launch(mc, stream);
+    }
     return dispatch<true>(ma, gate, up.data, x, nullptr, rows, stream);
 }
 

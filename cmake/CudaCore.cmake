@@ -17,6 +17,7 @@ endif()
 get_filename_component(_cc_root "${CMAKE_CURRENT_LIST_DIR}/.." ABSOLUTE)
 add_library(strix_cuda_core STATIC
     ${_cc_root}/src/cuda_core/dense/dense.cu
+    ${_cc_root}/src/cuda_core/dense/dense_mma.cu
     ${_cc_root}/src/cuda_core/norms/norms.cu
     ${_cc_root}/src/cuda_core/norms/rope.cu
     ${_cc_root}/src/cuda_core/attention/attention.cu
