@@ -2,6 +2,7 @@
 
 #include <cstdio>
 #include <stdexcept>
+#include <string>
 
 using namespace strix::ds41;
 
@@ -71,6 +72,43 @@ int main() {
         }
         check(!host[1] && !host[2] && used <= budget);
         previous = host;
+    }
+    // interleave: the name round-trips; budget, residents and the idle-preload layers are respected for any budget/ring
+    check(parse_host_pin_order("interleave") == HostPinOrder::interleave);
+    check(std::string(host_pin_order_name(HostPinOrder::interleave)) == "interleave");
+    for (unsigned budget = 0; budget <= 100; budget += 5)
+        for (double ring : {1.0, 10.0, 40.0}) {
+            const auto host = interleave_host_layers(bytes, 2, budget, ring, 1.0, 0.25);
+            unsigned used = 0;
+            for (std::size_t l = 0; l < bytes.size(); ++l) {
+                if (!bytes[l]) check(!host[l]);
+                if (host[l]) used += static_cast<unsigned>(bytes[l]);
+            }
+            check(used <= budget);
+            check(host[1] == (budget >= 16U));  // the first preload slot is pinned first when it fits
+            check(ordered_host_layers(HostPinOrder::interleave, bytes, 2, budget, ring) ==
+                  interleave_host_layers(bytes, 2, budget, ring));
+        }
+    {
+        // the measured RTX shape: 20 full layers (3.82 GB), 20 mostly resident ones, 2 preload slots, 61.5 GB of host
+        // budget and a 4 GiB ring. The layer order leaves every file byte after the host block; interleave must put
+        // file layers among the full host layers and still spend the budget (no extra disk bytes).
+        std::vector<std::uint64_t> rtx(40, 0);
+        for (std::size_t l = 0; l < 20; ++l) rtx[l] = 3'822'000'000ULL;
+        for (std::size_t l = 20; l < 40; ++l) rtx[l] = (39 - l) * 30'000'000ULL;
+        const double budget = 61.5e9, ring = 4.0 * double(1ULL << 30);
+        const auto host = interleave_host_layers(rtx, 2, budget, ring);
+        double used = 0.0, streamed = 0.0;
+        bool file_before_host = false, seen_file = false;
+        check(host[0] && host[1]);  // the preload slots come from pinned memory
+        for (std::size_t l = 2; l < 40; ++l) {
+            streamed += double(rtx[l]);
+            if (host[l]) { used += double(rtx[l]); file_before_host = file_before_host || (seen_file && rtx[l] == rtx[2]); }
+            else if (rtx[l]) seen_file = true;
+        }
+        used += double(rtx[0] + rtx[1]);
+        check(used <= budget && used >= budget - double(rtx[2]));
+        check(file_before_host);
     }
     std::puts("host pin plan checks pass");
 }

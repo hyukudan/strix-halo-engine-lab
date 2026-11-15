@@ -1376,8 +1376,7 @@ std::vector<ExpertTier> default_tiers(const CudaPrefillOptions& o, std::uint32_t
         for (std::uint32_t l = o.first_layer; l < o.end_layer; ++l)
             if (t[l] == ExpertTier::file) bytes[l] = layer_bytes;
         const auto budget = o.host_expert_gib * double(1ULL << 30);
-        const auto host = o.host_pin_order == HostPinOrder::early ? early_host_layers(bytes, o.slots, budget)
-                                                                  : deadline_host_layers(bytes, o.slots, budget);
+        const auto host = ordered_host_layers(o.host_pin_order, bytes, o.slots, budget, double(o.file_ring_mib) * double(1ULL << 20));
         for (std::uint32_t l = o.first_layer; l < o.end_layer; ++l)
             if (host[l]) t[l] = ExpertTier::host;
         return t;
@@ -1399,7 +1398,9 @@ CudaPrefill::CudaPrefill(const std::filesystem::path& gguf, const CudaPrefillOpt
     m.gguf_path = gguf;
     auto& o = m.o;
     require(valid_host_pin_policy(o.host_commit_floor_gib, o.host_pin_wait_s), "host floor/wait must be finite and nonnegative");
-    require(o.host_pin_order == HostPinOrder::layer || o.host_pin_order == HostPinOrder::deadline || o.host_pin_order == HostPinOrder::early, "host pin order layer, deadline or early");
+    require(o.host_pin_order == HostPinOrder::layer || o.host_pin_order == HostPinOrder::deadline || o.host_pin_order == HostPinOrder::early ||
+                o.host_pin_order == HostPinOrder::interleave, "host pin order layer, deadline, early or interleave");
+    require(o.file_ring_mib >= 128U, "file ring of at least 128 MiB (two 64 MiB pages)");
     if (o.decode_only) o.pass_rows = 0;
     if (o.pass_rows != 0U) {
         require(o.max_positions > 0U && o.max_positions <= 2097152U, "long context capacity 1..2M");
@@ -1719,6 +1720,7 @@ CudaPrefill::CudaPrefill(const std::filesystem::path& gguf, const CudaPrefillOpt
         sp.slots = o.slots;
         sp.group_experts = o.xfer_group_experts;
         sp.piece_bytes = std::uint64_t{o.xfer_piece_mib} << 20U;
+        sp.staging_pages = std::max<std::uint32_t>(2U, o.file_ring_mib / 64U);
         sp.host_alias = o.host_alias_layers;
         sp.host_commit_floor_gib = o.host_commit_floor_gib;
         sp.host_pin_wait_s = o.host_pin_wait_s;
@@ -1800,8 +1802,7 @@ CudaPrefill::CudaPrefill(const std::filesystem::path& gguf, const CudaPrefillOpt
                 for (std::uint32_t l = o.first_layer; l < o.end_layer; ++l)
                     bytes[l] = std::uint64_t{E - sp.resident[l]} * expert_bytes;
                 const auto budget = o.host_expert_gib * double(1ULL << 30);
-                const auto host = o.host_pin_order == HostPinOrder::early ? early_host_layers(bytes, sp.slots, budget)
-                                                                          : deadline_host_layers(bytes, sp.slots, budget);
+                const auto host = ordered_host_layers(o.host_pin_order, bytes, sp.slots, budget, double(o.file_ring_mib) * double(1ULL << 20));
                 for (std::uint32_t l = o.first_layer; l < o.end_layer; ++l)
                     sp.stream_tier[l] = host[l] ? ExpertTier::host : ExpertTier::file;
             }

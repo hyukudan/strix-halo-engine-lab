@@ -104,6 +104,8 @@ struct CudaPrefillOptions {
     bool reserve_export_capture = false;
     double host_expert_gib = 0.0;                   // budget of pinned host memory for expert layers
     HostPinOrder host_pin_order = HostPinOrder::layer;  // deadline: pin streamed suffix; early: ascending fill; both exclude idle-preload slots
+                                                        // interleave: file-tier layers placed where the disk read hides behind host copies
+    std::uint32_t file_ring_mib = 256;              // pinned file-read ring (64 MiB pages, >= 128): disk read-ahead of the copy stream
     std::uint32_t slots = 2;                        // device slots for non-resident layers (0: none; decode-only objects)
     // TIMING ONLY (not the model's bits): host-tier layers beyond this many share the pinned copies of the first ones
     // (real transfers, wrong weights), to measure a RAM tier larger than the free memory (0: off).

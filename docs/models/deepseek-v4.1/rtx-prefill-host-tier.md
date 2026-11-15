@@ -1,6 +1,12 @@
 # RTX prefill host placement
 
-The prefill service accepts `--host-gib G --host-pin-order layer|deadline|early`.
+The prefill service accepts `--host-gib G --host-pin-order layer|deadline|early|interleave [--file-ring-mib N]`.
+`interleave` (with a ring of about one layer, `--file-ring-mib 4096`) places FILE layers among the HOST ones so the
+disk read of each hides behind earlier host copies (the copy stream and the disk work in parallel instead of one
+after the other), and pins the preload slots first (back-to-back requests leave no idle time for a disk preload).
+Same bytes and resident experts: exact. Measured on one RTX at equal pinned memory (68 GiB, ABAB, 2 pairs): 2K warm
+-11 %, 32K -1 %, 8K mixed (one pair +3 %, one -15 %); opt-in until a third 8K pair. Kit:
+`scripts/bench/cuda/ds41_prefill_matrix.sh` (service matrix, cold/warm, GPU clock) + `ds41_prefill_summary.py`.
 `early` is the legacy ascending fill without the layers the idle preload already holds: the pinned
 layers lead the schedule and later FILE reads overlap their compute.
 `layer` is the default and preserves the ascending host-budget allocation.

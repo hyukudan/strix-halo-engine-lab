@@ -43,6 +43,9 @@ struct StreamerPlan {
     std::uint32_t slots = 2;
     std::uint32_t group_experts = 0;               // experts per transport group (0: one group per layer)
     std::uint64_t piece_bytes = 0;                 // largest single copy (0: a group's tensor piece at once)
+    // pinned 64 MiB pages of the file-read ring (>= 2): how far disk reads may run ahead of the copy stream. 4 (256 MiB)
+    // keeps file reads in step with the copies; a ring of a whole file-tier layer lets its read overlap earlier host copies
+    std::uint32_t staging_pages = 4;
     std::uint32_t host_alias = 0;                  // TIMING ONLY: host layers beyond this many reuse earlier copies
     std::uint32_t host_pin_attempts = 3;           // tries per host layer's pinned buffer (the OS may grow the pagefile)
     std::uint32_t host_pin_retry_ms = 1500;        // wait between tries; a layer that still fails streams from the file

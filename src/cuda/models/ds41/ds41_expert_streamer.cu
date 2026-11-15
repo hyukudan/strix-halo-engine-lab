@@ -22,7 +22,7 @@ namespace {
 double seconds_since(std::chrono::steady_clock::time_point t) {
     return std::chrono::duration<double>(std::chrono::steady_clock::now() - t).count();
 }
-constexpr std::size_t kStaging = 4, kStagingBytes = std::size_t{64} << 20;
+constexpr std::size_t kStagingBytes = std::size_t{64} << 20;  // one file-read ring page (StreamerPlan::staging_pages)
 
 }  // namespace
 
@@ -92,7 +92,7 @@ ExpertStreamer::ExpertStreamer(FileReader& file, StreamerPlan plan) : file_(file
     if (p_.order.size() < p_.end || p_.resident.size() < p_.end || p_.stream_tier.size() < p_.end || p_.extents.size() < p_.end)
         throw std::invalid_argument("ds41 expert streamer: plan does not cover the layers");
     STRIX_CUDA_CHECK(cudaStreamCreateWithFlags(&copy_, cudaStreamNonBlocking));
-    staging_.resize(kStaging);
+    staging_.resize(std::max<std::size_t>(2U, p_.staging_pages));
     for (auto& st : staging_) {
         st.buf = std::make_unique<PinnedBytes>(kStagingBytes + 2U * FileReader::alignment);
         st.done = std::make_unique<Event>();
