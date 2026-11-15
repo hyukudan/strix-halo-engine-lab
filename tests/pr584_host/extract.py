@@ -26,6 +26,8 @@ def function(marker):
 
 
 methods = function("bool flash_attn_at(") + "\n"
+if "std::uint32_t min_ratio() const" in source:
+    methods += function("std::uint32_t min_ratio() const") + "\n"
 if "void prepare_flash_mirrors()" in source:
     methods += function("void prepare_flash_mirrors()")
 (out / "methods.inc").write_text(methods)

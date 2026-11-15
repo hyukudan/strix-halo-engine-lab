@@ -58,6 +58,10 @@ struct DevicePrefill {
         unsigned prefill_capacity = 4096;
         int stream = 7;
         bool fast_attn_at(unsigned) const { return options.fast_attention && !options.bf16_attention; }
+        struct SeqState { unsigned prefill_capacity = 0; Dev<std::uint16_t> ring16, kv16; };
+        std::vector<SeqState> group;  // group-pass members (their own flash mirrors)
+        int dense_rebuilds = 0;
+        void rebuild_dense_classes() { ++dense_rebuilds; }
 #include "methods.inc"
     };
     std::unique_ptr<Impl> impl_ = std::make_unique<Impl>();
@@ -103,6 +107,7 @@ void ring_test() {
         const Section sec_pe[]{{0}};
         const auto seq_ring = [&](unsigned) -> auto& { return m.prefill_ring; };
         const auto seq_capacity = [&](unsigned) { return m.prefill_capacity; };
+        const auto seq_ring16 = [&](unsigned) { return m.ring16.p; };
         const auto entries_of = [&](unsigned, Section, const std::uint64_t* pos, std::uint32_t* packed) {
             Entries fe;
             fe.ring = m.prefill_ring.p;
