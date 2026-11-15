@@ -1716,6 +1716,12 @@ static int run_decode_entry(
         {options, requested_environment, !target_input_export}, model, info, manifest,
         admitted_content, prompt_capabilities, prompt_memory);
     options = effective.options;
+    if (options.mtp.enabled) {
+        const auto& mtp = options.mtp;
+        std::cerr << "MTP runtime budget: requested=" << mtp.runtime_bytes
+            << " effective=" << strix::mtp_payload::runtime_budget(model,options.context_tokens,mtp.runtime_bytes,mtp.runtime_automatic)
+            << " source=" << (mtp.runtime_automatic ? "automatic-bundle" : "explicit") << '\n';
+    }
     {
         // Shared route receipt: the prefill route this entry point resolved (the CLI and the HTTP server resolve
         // differently from the same switches), requested vs effective, with the selector's own reason text.
@@ -3772,7 +3778,7 @@ static int run_decode_entry(
             if (ple_turn) {
                 const auto& m = options.mtp;
                 mtp_growth = strix::decode_cli::mtp_prefill_reservation({m.sidecar_retained_bytes,
-                    strix::mtp_payload::runtime_budget(model, options.context_tokens, m.runtime_bytes),
+                    strix::mtp_payload::runtime_budget(model, options.context_tokens, m.runtime_bytes, m.runtime_automatic),
                     m.target_capture_bytes, m.replay_host_bytes, m.golden_max_bytes, m.window_arena_bytes,
                     m.window_capture_bytes, m.window_checkpoint_bytes, m.window_total_bytes,
                     m.window_rows ? static_cast<std::uint32_t>(m.window_rows_set.empty() ? 1U : m.window_rows_set.size()) : 0U,
@@ -4565,7 +4571,7 @@ static int run_decode_entry(
                 cache_slot_retained=retained;
                 const auto mul=strix::decode_cli::prefill_checked_mul;
                 // Native owner budgets bound the geometry charged in serving.slot_*.
-                cache_slot_native=add(add(strix::mtp_payload::runtime_budget(model,options.context_tokens,options.mtp.runtime_bytes),
+                cache_slot_native=add(add(strix::mtp_payload::runtime_budget(model,options.context_tokens,options.mtp.runtime_bytes,options.mtp.runtime_automatic),
                     options.mtp.window_total_bytes),options.mtp.target_capture_bytes);
                 // Request admission builds taps, draft/greedy heads and scratch.
                 // Keep all of them unpaid even when the lane's native owners exist.
@@ -4690,7 +4696,7 @@ static int run_decode_entry(
                     *cache_slot_retained,*cache_slot_native,cache_prompt_transient,batch_slots,eager_slots,eager_slots);
             } else {
                 auto future=prefill_checked_add(strix::mtp_payload::runtime_budget(model,options.context_tokens,
-                    options.mtp.runtime_bytes),options.mtp.window_total_bytes);
+                    options.mtp.runtime_bytes,options.mtp.runtime_automatic),options.mtp.window_total_bytes);
                 future=prefill_checked_add(future,options.mtp.target_capture_bytes);
                 const auto resident_native=future;
                 const auto width=prefill_checked_mul(prefill_checked_mul(model.hidden_size,model.hc_count),2);
