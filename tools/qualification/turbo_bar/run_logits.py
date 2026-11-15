@@ -35,7 +35,11 @@ ROUTE_RE = re.compile(r'"?(teacher_forced_tiled_lm_head|teacher_logits_scope|tea
 FIXED = ["--teacher-forced-score", "--generate", "1", "--known-prefix-window", "--known-prefix-full-rows",
          # The tiled known-prefix route requires every budget explicitly (same values as scripts/bench/engines/qwen.sh).
          "--known-prefix-workspace-budget-bytes", "8589934592", "--known-prefix-host-metadata-budget-bytes", "1073741824",
-         "--known-prefix-uma-budget-bytes", "137438953472", "--known-prefix-host-headroom-bytes", "4294967296"]
+         "--known-prefix-uma-budget-bytes", "137438953472", "--known-prefix-host-headroom-bytes", "4294967296",
+         # The known-prefix window states the resolved v5 organization (D1 + paired wave8 GDN input/output)
+         # explicitly (apps/hip_decode_options.hpp validate_known_prefill_options); the serial route resolves it.
+         "--deferred-moe-status", "--virtual-q8-gdn-input", "--prefetch-q8-gdn-input", "--virtual-q8-gdn-output",
+         "--wave8-q8-gdn-input", "--wave8-q8-gdn-output"]
 
 
 def clean_env(arm_env):
