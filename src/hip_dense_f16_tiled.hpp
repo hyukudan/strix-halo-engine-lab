@@ -480,6 +480,7 @@ __global__ __attribute__((amdgpu_flat_work_group_size(1, TileShape<BN>::threads)
             }
         return;
     }
+    if constexpr (!requires { Site::glu_pair; }) {  // paired sites store only through store_pair (above)
 #pragma unroll
     for (unsigned t = 0; t < kMT; ++t)
 #pragma unroll
@@ -494,6 +495,7 @@ __global__ __attribute__((amdgpu_flat_work_group_size(1, TileShape<BN>::threads)
                 } else if (r < rows) site.store(out, r, acc[t][u][e]);
             }
         }
+    }
 }
 
 // Form 1/2 (STRIX_QPF2K_DENSE_FORM): the same 256 x 128 block tile, operands, K16 order and stores, run by 16 waves
@@ -817,9 +819,11 @@ void launch_projection(const Site& site, std::uint32_t rows, hipStream_t stream,
             else lean();
         }
     } else {
-        if (form_id == 1U) go(project2_kernel<Site, Mode, 512U, 32U, 2U, Probe>, 512U);
-        else if (form_id == 2U) go(project2_kernel<Site, Mode, 512U, 32U, 1U, Probe>, 512U);
-        else if (form_id == 3U) go(project_kernel<Site, Mode, Probe, 256U>, 512U);
+        if constexpr (!requires { Site::glu_pair; }) {  // paired sites: forms 1/2 were mapped to form 0 above
+            if (form_id == 1U) { go(project2_kernel<Site, Mode, 512U, 32U, 2U, Probe>, 512U); return; }
+            if (form_id == 2U) { go(project2_kernel<Site, Mode, 512U, 32U, 1U, Probe>, 512U); return; }
+        }
+        if (form_id == 3U) go(project_kernel<Site, Mode, Probe, 256U>, 512U);
         else if (form_id == 4U) {
             if constexpr (Mode != kF32) {
                 if (wmma_pin()) go(project_kernel<Site, Mode, Probe, 256U, true, true>, 512U);
