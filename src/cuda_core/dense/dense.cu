@@ -1,5 +1,6 @@
 // Dense rows 1..16: BF16 / Q8_0 / F32 weights, FP32 accumulation in the fixed order documented in dense.hpp.
 #include "strix/cuda_core/dense.hpp"
+#include "strix/cuda_core/nvfp4.hpp"
 
 #include "../common.cuh"
 
@@ -215,12 +216,14 @@ __global__ void argmax_kernel(const float* logits, std::uint32_t vocab, std::uin
 
 cudaError_t dense_rows(const DenseWeight& w, const float* x, float* y, std::uint32_t rows, const float* residual,
                        cudaStream_t stream) {
+    if (w.format == WeightFormat::nvfp4) return nvfp4_dense_rows(w, x, y, rows, residual, stream);
     if (!valid(w, rows)) return cudaErrorInvalidValue;
     return dispatch<false>(w, nullptr, x, y, residual, rows, stream);
 }
 
 cudaError_t dense_gate_up_silu_rows(const DenseWeight& gate, const DenseWeight& up, const float* x, float* y,
                                     std::uint32_t rows, cudaStream_t stream) {
+    if (gate.format == WeightFormat::nvfp4) return nvfp4_gate_up_silu_rows(gate, up, x, y, rows, stream);
     if (!valid(gate, rows) || !valid(up, rows) || gate.format != up.format || gate.in != up.in || gate.out != up.out)
         return cudaErrorInvalidValue;
     return dispatch<true>(gate, &up, x, y, nullptr, rows, stream);

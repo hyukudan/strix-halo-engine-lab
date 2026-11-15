@@ -15,7 +15,16 @@ if(MSVC)
     add_compile_options($<$<COMPILE_LANGUAGE:CXX>:/EHsc> $<$<COMPILE_LANGUAGE:CXX>:/utf-8> $<$<COMPILE_LANGUAGE:CXX>:/Zc:preprocessor>)
 endif()
 get_filename_component(_cc_root "${CMAKE_CURRENT_LIST_DIR}/.." ABSOLUTE)
+# NVFP4 (TURBO weights) needs sm_120a PTX (cvt.e2m1x2): own object library, built for 120a only.
+add_library(strix_cuda_core_fp4 OBJECT ${_cc_root}/src/cuda_core/dense/nvfp4.cu)
+set_target_properties(strix_cuda_core_fp4 PROPERTIES CUDA_ARCHITECTURES "120a-real")
+target_include_directories(strix_cuda_core_fp4 PUBLIC ${_cc_root}/include)
+target_compile_options(strix_cuda_core_fp4 PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--fmad=false;--prec-div=true;--prec-sqrt=true;--ftz=false>)
+if(MSVC)
+    target_compile_options(strix_cuda_core_fp4 PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/EHsc,/Zc:preprocessor,/utf-8>)
+endif()
 add_library(strix_cuda_core STATIC
+    $<TARGET_OBJECTS:strix_cuda_core_fp4>
     ${_cc_root}/src/cuda_core/dense/dense.cu
     ${_cc_root}/src/cuda_core/norms/norms.cu
     ${_cc_root}/src/cuda_core/norms/rope.cu
@@ -42,4 +51,11 @@ target_link_libraries(cuda_core_test PRIVATE strix_cuda_core)
 target_compile_options(cuda_core_test PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--fmad=false;--prec-div=true;--prec-sqrt=true;--ftz=false>)
 if(MSVC)
     target_compile_options(cuda_core_test PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/EHsc,/Zc:preprocessor,/utf-8>)
+endif()
+
+add_executable(cuda_core_nvfp4_test ${_cc_root}/tests/cuda_core/nvfp4_test.cu)
+target_link_libraries(cuda_core_nvfp4_test PRIVATE strix_cuda_core)
+target_compile_options(cuda_core_nvfp4_test PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--fmad=false;--prec-div=true;--prec-sqrt=true;--ftz=false>)
+if(MSVC)
+    target_compile_options(cuda_core_nvfp4_test PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/EHsc,/Zc:preprocessor,/utf-8>)
 endif()
