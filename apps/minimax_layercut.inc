@@ -180,6 +180,13 @@ std::vector<std::uint32_t> layercut_session(mm::Engine& eng, strix::handoff::Lis
         check_error();
         const std::span<const std::uint8_t> token_bytes(reinterpret_cast<const std::uint8_t*>(&next), 4);
         session->reply(0, eng.rank() == 0 ? token_bytes : std::span<const std::uint8_t>{});
+        // After the reply (outside TTFT): the imported + computed state digest, the same hash as the session's
+        // "state fnv" line (N positions) and over N - 1 positions (the full hand-off imports rows [0, N - 1)).
+        // STRIX_MM_STATE_FNV=0 skips it, as for the session prints.
+        if (const char* v = strix::envcfg::text("STRIX_MM_STATE_FNV"); !(v != nullptr && std::string_view(v) == "0"))
+            std::printf("rank %u layercut %s: state fnv %016llx (slot 0, %zu positions, K/V/index key, 60 layers), first %zu positions %016llx\n",
+                        eng.rank(), name.c_str(), static_cast<unsigned long long>(eng.state_fnv(0, prompt.size())), prompt.size(),
+                        prompt.size() - 1, static_cast<unsigned long long>(eng.state_fnv(0, prompt.size() - 1)));
     } catch (...) {
         const auto e = std::current_exception();
         fail(e);
