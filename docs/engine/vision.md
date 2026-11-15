@@ -1,7 +1,7 @@
 # Image input
 
 Image input lets a chat request carry pictures. Today one model takes them: DeepSeek V4.1 on the two-node pair.
-One shared vision runtime serves every family; a model only supplies an adapter
+[One shared vision runtime](shared-cores.md#the-components) serves every family; a model only supplies an adapter
 ([vision-adapters.md](vision-adapters.md) describes the adapter interface).
 
 | Model | Image input |

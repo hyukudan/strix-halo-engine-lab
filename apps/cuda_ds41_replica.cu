@@ -354,15 +354,16 @@ static std::optional<strix::ds41::dspark::WindowController::Table> resolve_prior
 }
 
 int main(int argc, char** argv) {
-    // Start gate: resolves the declared device (--devices FILE, --device-id ID, STRIX_DEVICES, STRIX_DEVICE), refuses an
-    // excluded or undeclared card, restricts the process to the chosen one and prints the "device:" receipt line.
-    strix::device::bind_cuda_main(argc, argv);
-    // lazy module loading + a kernel spinning on a host flag can deadlock the first launch of another kernel
+    // lazy module loading + a kernel spinning on a host flag can deadlock the first launch of another kernel. The driver
+    // reads this once, when the CUDA runtime starts, so it is set before the start gate (which starts the runtime).
 #ifdef _WIN32
     _putenv_s("CUDA_MODULE_LOADING", "EAGER");
 #else
     setenv("CUDA_MODULE_LOADING", "EAGER", 1);
 #endif
+    // Start gate: resolves the declared device (--devices FILE, --device-id ID, STRIX_DEVICES, STRIX_DEVICE), refuses an
+    // excluded or undeclared card, restricts the process to the chosen one and prints the "device:" receipt line.
+    strix::device::bind_cuda_main(argc, argv);
     if (argc < 2) usage("MODEL.gguf [options]");
     const std::string model = argv[1];
     std::string state_file, ref_file, routes, seqmod = "5:0", chats_arg, seqs_file, json_out, timeline_out, phases_arg = "exact0,pressure,exact8,chats8,chats0";
