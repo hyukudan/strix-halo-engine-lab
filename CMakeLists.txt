@@ -696,6 +696,11 @@ if(BUILD_TESTING)
 endif()
 # Device declaration (strix-devices-v1) and the start gate every GPU binary calls before its first allocation.
 include(cmake/StrixDevice.cmake)
+# Intel GPU backend (SYCL / oneAPI, Level Zero): opt-in, host-only unless the C++ compiler is icpx (cmake/StrixIntel.cmake).
+option(STRIX_BACKEND_INTEL "Build the Intel GPU backend scaffold (SYCL when the compiler is oneAPI DPC++)" OFF)
+if(STRIX_BACKEND_INTEL)
+    include(cmake/StrixIntel.cmake)
+endif()
 # Typed lever declaration and the census of environment switches (host tests).
 include(cmake/StrixLevers.cmake)
 # Every HIP app calls the start gate first; the core library carries it to all of them.
