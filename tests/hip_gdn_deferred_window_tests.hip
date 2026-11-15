@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <array>
 #include <bit>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
@@ -13,6 +14,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <vector>
 
 namespace {
@@ -494,9 +496,74 @@ void benchmark_gates() {
     (void)hipEventDestroy(start); (void)hipEventDestroy(stop);
     check(hipFree(flush), "free MALL flush buffer");
 }
+// `bench-state warm|cold`: recurrent-state traffic of the decode recurrences (incumbent storage), for a kernel
+// trace. Cases run in order, 3 + 25 launches each, separated by a 60 ms host gap so a trace splits per case;
+// cold flushes the MALL (96 MiB memset) before every sample. Prints "case <name> <event median us>".
+void benchmark_state(bool cold) {
+    Fixture f(GdnRecurrentStorage::key_value, HipGdnRecurrentLayout::baseline, true, true, 5U);
+    f.reset();
+    void* flush = nullptr;
+    constexpr std::size_t flush_bytes = 96ULL << 20U;
+    check(hipMalloc(&flush, flush_bytes), "allocate MALL flush buffer");
+    hipEvent_t start, stop;
+    check(hipEventCreate(&start), "event"); check(hipEventCreate(&stop), "event");
+    unsigned sample = 0;
+    const auto run_case = [&](const std::string& name, auto&& run) {
+        f.owner.finish();
+        std::this_thread::sleep_for(std::chrono::milliseconds(60));
+        for (unsigned i = 0; i < 3U; ++i) run();
+        std::vector<float> samples;
+        for (unsigned i = 0; i < 25U; ++i) {
+            if (cold) check(hipMemsetAsync(flush, static_cast<int>(++sample & 0xffU), flush_bytes, f.owner.stream), "MALL flush");
+            check(hipEventRecord(start, f.owner.stream), "record"); run(); check(hipEventRecord(stop, f.owner.stream), "record");
+            check(hipEventSynchronize(stop), "sync"); samples.push_back(elapsed(start, stop));
+        }
+        std::sort(samples.begin(), samples.end());
+        std::cout << "case " << name << " " << samples[samples.size() / 2U] * 1000.0F << " us\n";
+    };
+    const auto serial_layer = f.layer(f.serial), window_layer = f.layer(f.window);
+    const auto serial_row = f.rows(f.serial, 0U, 1U)[0];
+    run_case("r1", [&] { gdn_window_serial_row_probe(serial_layer, serial_row, f.config, f.owner.stream); });
+    for (const unsigned t : {1U, 2U, 8U})
+        for (const unsigned pending : {0U, t}) {
+            f.set_control(pending, 0U);
+            const auto views = f.rows(f.window, 0U, t);
+            run_case("w" + std::to_string(t) + "p" + std::to_string(pending),
+                [&] { gdn_window_enqueue(window_layer, views, f.device_control(), f.config, f.owner.stream); });
+        }
+    f.set_control(2U, 0U);
+    run_case("commit2", [&] { gdn_window_commit_enqueue(window_layer, f.device_control(), f.config, f.owner.stream); });
+    // Eight chats of one layer (C8 cohort): own state, conv history, retained rows and control each.
+    std::vector<Side> chats(8);
+    std::vector<Buffer> controls;
+    for (auto& chat : chats) {
+        chat.matrix = f.owner.allocate(state_floats * sizeof(float)); write(chat.matrix, f.state0);
+        chat.conv = f.owner.allocate(f.history0.size() * sizeof(std::uint16_t)); write(chat.conv, f.history0);
+        chat.retained = f.owner.allocate(static_cast<std::size_t>(gdn_window_retained_bytes(f.config.model)));
+        for (unsigned row = 0; row < 2U; ++row) {
+            chat.input.push_back(f.window.input[row]);
+            chat.output.push_back(f.owner.allocate(hidden * sizeof(std::uint16_t)));
+            chat.workspace.push_back(f.owner.allocate(workspace_floats * sizeof(float)));
+        }
+        controls.push_back(f.owner.allocate(sizeof(GdnWindowControl)));
+        check(hipMemset(controls.back().address, 0, sizeof(GdnWindowControl)), "zero cohort control");
+    }
+    for (const unsigned rows : {1U, 2U}) {
+        std::vector<std::vector<GdnWindowRow>> views;
+        for (const auto& chat : chats) views.push_back(f.rows(chat, 0U, rows));
+        std::vector<GdnWindowCohortSegment> segments;
+        for (std::size_t k = 0; k < chats.size(); ++k)
+            segments.push_back({f.layer(chats[k]), views[k], reinterpret_cast<const GdnWindowControl*>(controls[k].address)});
+        run_case("c8r" + std::to_string(rows), [&] { gdn_window_cohort_enqueue(segments, f.config, f.owner.stream); });
+    }
+    f.owner.finish();
+    (void)hipEventDestroy(start); (void)hipEventDestroy(stop);
+    check(hipFree(flush), "free MALL flush buffer");
+}
 } // namespace
 int main(int argc, char** argv) {
     try {
+        if (argc > 2 && std::string_view(argv[1]) == "bench-state") { benchmark_state(std::string_view(argv[2]) == "cold"); return 0; }
         if (argc > 1 && std::string_view(argv[1]) == "bench") { benchmark(); return 0; }
         if (argc > 1 && std::string_view(argv[1]) == "bench-cold") { benchmark_cold(); return 0; }
         if (argc > 1 && std::string_view(argv[1]) == "bench-gates") { benchmark_gates(); return 0; }
