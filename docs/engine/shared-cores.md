@@ -53,6 +53,8 @@ ascending k. Named policies sit on top of it. The policy `dense-q8a8-f16-v1`
 ([`f16_dense_q8a8.hpp`](../../src/core/f16_dense_q8a8.hpp), namespace `strix::core::f16_dense_tall::q8a8`) runs
 Q8_0 weights x A8 activations as one FP16 chain per output instead of the exact integer products; DeepSeek V4.1
 binds it (worked example below).
+Its stagers decode two weights per packed FP16 operation (`kWPacked`, `STRIX_F16_Q8A8_WPACK`, default on, same bits;
+the kit `ds41/dense-forms` times both forms and gates the bits).
 
 **Tiled core and integer mainloops** ([`src/core/tiled_core.hpp`](../../src/core/tiled_core.hpp)). The library
 WMMA prefill core, header-only so that engines instantiate it with their own adapters instead of keeping private
