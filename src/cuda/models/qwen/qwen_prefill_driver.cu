@@ -34,6 +34,7 @@
 #include <nvtx3/nvToolsExt.h>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cstdio>
@@ -345,6 +346,17 @@ struct Prefill::Impl : BlockFields {
     bool graph_table = true;                       // STRIX_QRTX_GRAPH_TABLE=0: graphs bake session pointers (keyed by session)
     bool table_mode = false;                       // run_block / window_prologue emit table-relative launches (capture)
     void qsa_core(std::uint32_t l, const Segment& seg);
+    // ---- QSA inside the step graph (STRIX_QRTX_QSA_GRAPH, default on): the captured cores read their segment maps from a
+    // device table that the replay writes first (one graph per window, no cuts); same kernels and order as qsa_layer.
+    // Maps [0, 12) = the window's QSA layers, [12, 12 + 7) = the draft chain's steps.
+    static constexpr std::uint32_t kQsaMaps = 12U + kMaxStepRows;
+    qsa::SegmentMap* qsa_maps = nullptr;           // device [kQsaMaps]
+    qsa::SegmentMap* qsa_maps_pinned = nullptr;    // host source of the captured copy
+    bool qsa_graph = true;
+    const qsa::MultiShape* qsa_dev_shape = nullptr;  // capture: run_block emits qsa_layer_dev with this shape
+    qsa::LayerWeights qsa_weights(std::uint32_t l) const;
+    void qsa_layer_dev(std::uint32_t l, const Segment* seg, std::uint32_t count);
+    void qsa_replay_maps(const Segment* seg, std::uint32_t count);  // host maps of the 12 layers + pooled-valid counts
     // every segment's QSA core of layer l: one launch per step across the segments (multiseg, >= 2 segments), else per segment
     void qsa_layer(std::uint32_t l, const Segment* seg, std::uint32_t count);
     bool multiseg = true;                          // STRIX_QRTX_MULTISEG=0: GDN/QSA cores launched per session
@@ -373,6 +385,16 @@ struct Prefill::Impl : BlockFields {
     std::uint16_t* draft_wide = nullptr;       // [3][10240]
     std::uint32_t* draft_token = nullptr;      // device word: the token the next draft step embeds
     std::uint32_t* draft_sel = nullptr;        // device [8][2] token, probability
+    // draft chain graphs (STRIX_QRTX_DRAFT_GRAPH, default on): one graph per (session buffers, depth); positions, the pending
+    // token and the QSA maps (qsa_maps[12 + k]) are copied from pinned memory at the start of every replay
+    using DraftKey = std::array<std::uintptr_t, 5>;
+    struct DraftGraph { cudaGraphExec_t exec = nullptr; std::uint64_t used = 0; };
+    std::map<DraftKey, DraftGraph> draft_graphs;
+    std::map<DraftKey, std::uint32_t> draft_warmed;
+    bool draft_graph = true;
+    std::uint64_t* draft_pos = nullptr;         // device [8]
+    std::uint64_t* draft_pos_pinned = nullptr;  // [8] + the pending token word after them
+    std::uint64_t draft_captures = 0, draft_replays = 0;
     // batched draft chains (draft_cohort): row j = the j-th chain by descending depth
     std::uint16_t* bd_wide = nullptr;          // [3][8][10240] attention / mlp / source wide rows
     std::uint16_t* bd_fused = nullptr;         // [8][10240] input-fusion rows
@@ -652,6 +674,9 @@ void Prefill::Impl::upload_draft() {
     draft_wide = dev_alloc<std::uint16_t>(3 * kWide, "draft wide");
     draft_token = dev_alloc<std::uint32_t>(1, "draft token");
     draft_sel = dev_alloc<std::uint32_t>(2 * kMaxStepRows, "draft selections");
+    draft_pos = dev_zero<std::uint64_t>(kMaxStepRows, "draft positions");
+    ck(cudaMallocHost(&draft_pos_pinned, (kMaxStepRows + 1U) * sizeof(std::uint64_t)), "pinned draft positions");
+    std::memset(draft_pos_pinned, 0, (kMaxStepRows + 1U) * sizeof(std::uint64_t));
     bd_wide = dev_alloc<std::uint16_t>(3ULL * kMaxStepRows * kWide, "batched draft wide");
     bd_fused = dev_alloc<std::uint16_t>(std::uint64_t{kMaxStepRows} * kWide, "batched draft fused");
     bd_logits = dev_alloc<float>(std::uint64_t{kMaxStepRows} * ids.size(), "batched draft logits");
@@ -752,6 +777,9 @@ void Prefill::Impl::allocate() {
         seg_table = dev_zero<SegTable>(kMaxStepRows, "graph descriptor table");
         ck(cudaMallocHost(&seg_table_pinned, kMaxStepRows * sizeof(SegTable)), "pinned descriptor table");
         std::memset(seg_table_pinned, 0, kMaxStepRows * sizeof(SegTable));
+        qsa_maps = dev_zero<qsa::SegmentMap>(kQsaMaps, "qsa segment maps");
+        ck(cudaMallocHost(&qsa_maps_pinned, kQsaMaps * sizeof(qsa::SegmentMap)), "pinned qsa segment maps");
+        for (std::uint32_t i = 0; i < kQsaMaps; ++i) qsa_maps_pinned[i] = qsa::SegmentMap{};
         ck(cudaMallocHost(&moe_sticky_pinned, (1 + kMaxWindowRows) * 4), "pinned moe sticky");
         win_rows = dev_zero<float>(std::uint64_t{36} * kMaxWindowRows * gdn_stride, "window gdn rows");
         win_raw = dev_zero<float>(std::uint64_t{36} * kMaxWindowRows * gdn::kConvWidth, "window conv inputs");
@@ -897,6 +925,8 @@ Prefill::Prefill(const Config& config) : impl_(std::make_unique<Impl>()) {
         m.graph_table = !(t && t[0] == '0');
         const char* ms = std::getenv("STRIX_QRTX_MULTISEG");
         m.multiseg = !(ms && ms[0] == '0');
+        m.qsa_graph = strix::envcfg::flag("STRIX_QRTX_QSA_GRAPH", true);
+        m.draft_graph = strix::envcfg::flag("STRIX_QRTX_DRAFT_GRAPH", true);
     }
     char buf[384];
     std::snprintf(buf, sizeof(buf), "{\"weights_gb\":%.2f,\"upload_s\":%.1f,\"block_rows\":%u,\"max_positions\":%u,"
@@ -1083,6 +1113,7 @@ void Prefill::Impl::run_block(const Segment* seg, std::uint32_t count, std::uint
             nv.pop();
             nv.push("qsa");
             if (qsa_cut) qsa_cut(l);
+            else if (qsa_dev_shape) qsa_layer_dev(l, seg, count);
             else qsa_layer(l, seg, count);
             nv.pop();
             nv.push("dense_out");
@@ -1199,6 +1230,33 @@ void Prefill::Impl::qsa_layer(std::uint32_t l, const Segment* seg, std::uint32_t
     }
     if (seg[0].offset != 0) throw std::logic_error("qsa_layer: segments must start at row 0");
     qsa::layer_core_multi(rb, st, count, qw, rope, tables, qws, stream);
+}
+
+qsa::LayerWeights Prefill::Impl::qsa_weights(std::uint32_t l) const {
+    return qsa::LayerWeights{static_cast<const std::uint16_t*>(lw[l].p[k_indexer_q_proj_weight]),
+                             static_cast<const std::uint16_t*>(lw[l].p[k_indexer_k_proj_weight]),
+                             static_cast<const float*>(lw[l].p[k_attn_q_norm_weight]),
+                             static_cast<const float*>(lw[l].p[k_attn_k_norm_weight]),
+                             static_cast<const float*>(lw[l].p[k_indexer_q_norm_weight]),
+                             static_cast<const float*>(lw[l].p[k_indexer_k_norm_weight])};
+}
+
+void Prefill::Impl::qsa_layer_dev(std::uint32_t l, const Segment* seg, std::uint32_t count) {
+    for (std::uint32_t i = 0; i < count; ++i)
+        if (seg[i].offset != (i == 0 ? 0U : seg[i - 1].offset + seg[i - 1].rows)) throw std::logic_error("qsa_layer_dev: segments not contiguous");
+    const qsa::RowBuffers rb{hidden, q_gate, qk, qv, index_q, index_k, attn_out};
+    qsa::layer_core_device(rb, qsa_maps + qsa_ordinal(l), *qsa_dev_shape, qsa_weights(l), rope, tables, qws, stream);
+}
+
+void Prefill::Impl::qsa_replay_maps(const Segment* seg, std::uint32_t count) {
+    for (std::uint32_t o = 0; o < 12U; ++o) {
+        qsa::SegmentState st[kMaxStepRows];
+        for (std::uint32_t i = 0; i < count; ++i) {
+            SessionState& ss = *seg[i].s;
+            st[i] = qsa::SegmentState{seg[i].rows, seg[i].p0, qsa::LayerState{ss.kv[o], ss.raw_index[o], ss.pooled[o], &ss.pooled_valid[o]}};
+        }
+        qsa::prepare_replay(st, count, qws, qsa_maps_pinned[o]);
+    }
 }
 
 Timing Prefill::run(const std::vector<std::uint32_t>& tokens, std::uint64_t position, const Sink& sink, const RunOptions& options) {
@@ -1716,6 +1774,11 @@ std::vector<StepResult> Prefill::verify_cohort(const std::vector<CohortRows>& co
                     m.drop_graph(lru);
                 }
                 Impl::StepGraph g;
+                qsa::MultiShape dev_shape{};
+                std::uint32_t seg_rows[kMaxStepRows] = {};
+                bool own_pools = true;  // every session keeps its pooled keys (else each window re-pools from block 0)
+                for (std::uint32_t i = 0; i < n; ++i) { seg_rows[i] = segs[i].rows; own_pools = own_pools && segs[i].s->pooled[0]; }
+                const bool dev_qsa = m.qsa_graph && own_pools && (m.multiseg || n == 1) && qsa::graph_shape(seg_rows, n, m.qws, dev_shape);
                 const auto close = [&] {
                     cudaGraph_t graph = nullptr;
                     ck(cudaStreamEndCapture(m.stream, &graph), "end capture");
@@ -1726,10 +1789,16 @@ std::vector<StepResult> Prefill::verify_cohort(const std::vector<CohortRows>& co
                     g.seg.push_back(exec);
                 };
                 ck(cudaStreamBeginCapture(m.stream, cudaStreamCaptureModeRelaxed), "begin capture");
-                m.qsa_cut = [&](std::uint32_t) {
-                    close();
-                    ck(cudaStreamBeginCapture(m.stream, cudaStreamCaptureModeRelaxed), "begin capture");
-                };
+                if (dev_qsa) {  // one graph: the QSA cores read the maps the replay copies first
+                    ck(cudaMemcpyAsync(m.qsa_maps, m.qsa_maps_pinned, 12U * sizeof(qsa::SegmentMap), cudaMemcpyHostToDevice, m.stream),
+                       "qsa maps");
+                    m.qsa_dev_shape = &dev_shape;
+                } else {
+                    m.qsa_cut = [&](std::uint32_t) {
+                        close();
+                        ck(cudaStreamBeginCapture(m.stream, cudaStreamCaptureModeRelaxed), "begin capture");
+                    };
+                }
                 try {
                     m.table_mode = table;
                     m.window_prologue(segs.data(), n);
@@ -1740,6 +1809,7 @@ std::vector<StepResult> Prefill::verify_cohort(const std::vector<CohortRows>& co
                 } catch (...) {
                     m.table_mode = false;
                     m.qsa_cut = nullptr;
+                    m.qsa_dev_shape = nullptr;
                     cudaStreamCaptureStatus cs = cudaStreamCaptureStatusNone;
                     if (cudaStreamIsCapturing(m.stream, &cs) == cudaSuccess && cs != cudaStreamCaptureStatusNone) {
                         cudaGraph_t graph = nullptr;
@@ -1750,6 +1820,7 @@ std::vector<StepResult> Prefill::verify_cohort(const std::vector<CohortRows>& co
                     throw;
                 }
                 m.qsa_cut = nullptr;
+                m.qsa_dev_shape = nullptr;
                 for (auto* s : members) { s->ngram[0] = s->ngram_before[0]; s->ngram[1] = s->ngram_before[1]; }
                 m.warmed.erase(key);
                 ++m.graph_captures;
@@ -1765,10 +1836,15 @@ std::vector<StepResult> Prefill::verify_cohort(const std::vector<CohortRows>& co
                 pm::ple_hash_rows(m.ple_contract, sg.tokens, sg.rows, sg.p0, sg.s->ngram,
                                   m.ple_ids_host + std::uint64_t{sg.offset} * pm::kPleHeads);
             const auto& seg = it->second.seg;
-            ck(cudaGraphLaunch(seg[0], m.stream), "graph launch");
-            for (std::uint32_t o = 0; o < 12; ++o) {
-                m.qsa_layer(4 * o + 3, segs.data(), n);
-                ck(cudaGraphLaunch(seg[o + 1], m.stream), "graph launch");
+            if (seg.size() == 1) {  // QSA in the graph: this window's maps, then one launch
+                m.qsa_replay_maps(segs.data(), n);
+                ck(cudaGraphLaunch(seg[0], m.stream), "graph launch");
+            } else {
+                ck(cudaGraphLaunch(seg[0], m.stream), "graph launch");
+                for (std::uint32_t o = 0; o < 12; ++o) {
+                    m.qsa_layer(4 * o + 3, segs.data(), n);
+                    ck(cudaGraphLaunch(seg[o + 1], m.stream), "graph launch");
+                }
             }
             ++m.graph_replays;
         }
@@ -2272,7 +2348,6 @@ Draft Prefill::draft(SessionId session, std::uint32_t pending, std::uint32_t dep
     const auto mwf = [&](const char* n) { return static_cast<const float*>(mw(n)); };
     const auto mwts = m.mtp_weights();
     const auto views = pm::mtp_workspace_views(m.mtp_ws, 1);
-    ck(cudaMemcpyAsync(m.draft_token, &pending, 4, cudaMemcpyHostToDevice, m.stream), "draft pending");
     const std::uint16_t* source = S.held;  // h_{L-1}, then the chain's wide state
     std::uint16_t* wide_attn = m.draft_wide;
     std::uint16_t* wide_mlp = m.draft_wide + kWide;
@@ -2285,11 +2360,52 @@ Draft Prefill::draft(SessionId session, std::uint32_t pending, std::uint32_t dep
         a.normalized = m.normalized; a.injection = m.injection; a.output = m.hidden;
         hc::hc_mix(a, m.tables, m.stream);
     };
-    for (std::uint32_t k = 0; k < depth; ++k) {
+    // The whole chain as one graph replay: the same launches with the QSA cores on device maps and the cache positions read
+    // from device memory (the eager chain runs once per key first; any position, pooled state or token replays it).
+    qsa::MultiShape dshape{};
+    const std::uint32_t one_row = 1;
+    const Impl::DraftKey dkey{reinterpret_cast<std::uintptr_t>(S.held), reinterpret_cast<std::uintptr_t>(S.mtp_kv),
+                              reinterpret_cast<std::uintptr_t>(S.mtp_index), reinterpret_cast<std::uintptr_t>(S.mtp_pooled), depth};
+    cudaGraphExec_t dexec = nullptr;
+    bool capture = false;
+    if (m.use_graphs && m.qsa_graph && m.draft_graph && !per_step_sync && S.mtp_pooled && cudaStreamQuery(m.stream) == cudaSuccess &&
+        qsa::graph_shape(&one_row, 1, m.qws, dshape)) {
+        const auto it = m.draft_graphs.find(dkey);
+        if (it != m.draft_graphs.end()) {
+            dexec = it->second.exec;
+            it->second.used = ++m.graph_clock;
+        } else if (m.draft_warmed.count(dkey)) {
+            capture = true;
+        } else {
+            if (m.draft_warmed.size() > 4096) m.draft_warmed.clear();
+            m.draft_warmed[dkey] = 1;
+        }
+    }
+    const std::uint32_t valid_before = S.mtp_pooled_valid;
+    if (dexec || capture) {  // this chain's inputs (the stream is idle: no copy of an earlier replay is in flight)
+        for (std::uint32_t k = 0; k < depth; ++k) {
+            m.draft_pos_pinned[k] = S.length - 1 + k;
+            const qsa::SegmentState st{1, S.length - 1 + k, qsa::LayerState{S.mtp_kv, S.mtp_index, S.mtp_pooled, &S.mtp_pooled_valid}};
+            qsa::prepare_replay(&st, 1, m.qws, m.qsa_maps_pinned[12U + k]);
+        }
+        std::memcpy(m.draft_pos_pinned + kMaxStepRows, &pending, 4);
+    } else {
+        ck(cudaMemcpyAsync(m.draft_token, &pending, 4, cudaMemcpyHostToDevice, m.stream), "draft pending");
+    }
+    if (capture) {
+        ck(cudaStreamBeginCapture(m.stream, cudaStreamCaptureModeRelaxed), "begin draft capture");
+        ck(cudaMemcpyAsync(m.draft_token, m.draft_pos_pinned + kMaxStepRows, 4, cudaMemcpyHostToDevice, m.stream), "draft pending");
+        ck(cudaMemcpyAsync(m.draft_pos, m.draft_pos_pinned, kMaxStepRows * sizeof(std::uint64_t), cudaMemcpyHostToDevice, m.stream),
+           "draft positions");
+        ck(cudaMemcpyAsync(m.qsa_maps + 12, m.qsa_maps_pinned + 12, depth * sizeof(qsa::SegmentMap), cudaMemcpyHostToDevice, m.stream),
+           "draft qsa maps");
+    }
+    try {
+    for (std::uint32_t k = 0; k < (dexec ? 0U : depth); ++k) {
         const std::uint64_t pos = S.length - 1 + k;
         // input fusion (enorm/hnorm/eh_proj) -> the MTP wide row; also stores a provisional cache row at pos
         pm::launch_mtp_cache_rows(mwts, pm::MtpRounding{}, source, m.draft_token, 1, pos, S.mtp_kv, S.mtp_index, m.mtp_ws,
-            m.mtp_status, m.tables, m.stream);
+            m.mtp_status, m.tables, m.stream, capture ? m.draft_pos + k : nullptr);
         mix(views.fused, mwf("hc_attn_norm.weight"), m.mtp_attn_inject, m.mtp_hc_attn);
         dn::Site in;
         in.store = dn::Store::f32_round_bf16;
@@ -2303,8 +2419,11 @@ Draft Prefill::draft(SessionId session, std::uint32_t pending, std::uint32_t dep
         const qsa::LayerWeights lw{static_cast<const std::uint16_t*>(mw("indexer.q_proj.weight")),
                                    static_cast<const std::uint16_t*>(mw("indexer.k_proj.weight")), mwf("attn_q_norm.weight"),
                                    mwf("attn_k_norm.weight"), mwf("indexer.q_norm.weight"), mwf("indexer.k_norm.weight")};
-        qsa::layer_core(rb, 1, pos, lw, qsa::LayerState{S.mtp_kv, S.mtp_index, S.mtp_pooled, &S.mtp_pooled_valid}, m.rope, m.tables,
-            m.qws, m.stream);
+        if (capture)
+            qsa::layer_core_device(rb, m.qsa_maps + 12U + k, dshape, lw, m.rope, m.tables, m.qws, m.stream);
+        else
+            qsa::layer_core(rb, 1, pos, lw, qsa::LayerState{S.mtp_kv, S.mtp_index, S.mtp_pooled, &S.mtp_pooled_valid}, m.rope,
+                m.tables, m.qws, m.stream);
         dn::Site o;
         o.store = dn::Store::bf16;
         o.width = qsa::kAttnWidth;
@@ -2339,6 +2458,38 @@ Draft Prefill::draft(SessionId session, std::uint32_t pending, std::uint32_t dep
         out.tokens.push_back(sel[0]);
         out.probability.push_back(probability);
         if (probability < min_probability) break;  // the node keeps the low draft and stops after it
+    }
+    if (capture) {
+        cudaGraph_t graph = nullptr;
+        ck(cudaStreamEndCapture(m.stream, &graph), "end draft capture");
+        const auto st = cudaGraphInstantiate(&dexec, graph, 0);
+        cudaGraphDestroy(graph);
+        ck(st, "draft graph instantiate");
+        while (m.draft_graphs.size() >= 64) {
+            auto lru = m.draft_graphs.begin();
+            for (auto g = m.draft_graphs.begin(); g != m.draft_graphs.end(); ++g) if (g->second.used < lru->second.used) lru = g;
+            cudaGraphExecDestroy(lru->second.exec);
+            m.draft_graphs.erase(lru);
+        }
+        m.draft_graphs[dkey] = Impl::DraftGraph{dexec, ++m.graph_clock};
+        m.draft_warmed.erase(dkey);
+        ++m.draft_captures;
+    }
+    if (dexec) {
+        ck(cudaGraphLaunch(dexec, m.stream), "draft graph launch");
+        ++m.draft_replays;
+    }
+    } catch (...) {
+        if (capture) {
+            cudaStreamCaptureStatus cs = cudaStreamCaptureStatusNone;
+            if (cudaStreamIsCapturing(m.stream, &cs) == cudaSuccess && cs != cudaStreamCaptureStatusNone) {
+                cudaGraph_t graph = nullptr;
+                cudaStreamEndCapture(m.stream, &graph);
+                if (graph) cudaGraphDestroy(graph);
+            }
+        }
+        if (dexec || capture) S.mtp_pooled_valid = valid_before;  // nothing of this chain ran
+        throw;
     }
     if (!per_step_sync) {
         // every step was launched back to back; one read, then the same stop rule (later steps are discarded)

@@ -144,6 +144,26 @@ struct SegmentState {
 void layer_core_multi(const RowBuffers& rows_buf, const SegmentState* segments, std::uint32_t count, const LayerWeights& w,
     const RopeTable* cs, const amdmath::Tables& tables, Workspace& ws, cudaStream_t stream);
 
+// ---- graph-capturable QSA core: the launches of layer_core_multi with the per-window values in a device descriptor ----
+// Launch geometry of the multi-segment core. Eager: the exact counts of one window. Graph: fixed per segment-rows layout
+// (the pool and score kernels walk their blocks / waves grid-stride; score runs past a row's selected count return at once),
+// so one captured launch serves every position; values and operation order are those of layer_core.
+struct MultiShape {
+    std::uint32_t rows = 0, pool_grid = 0, score_grid = 0, slot_runs = 0;
+    bool head_all = false;
+};
+// host: validates, fills the map, this window's eager shape and the pooled-valid counts after it (valid_after[count]);
+// false = outside the multi-launch shapes (layer_core per segment). Throws on invalid positions before any state changes.
+bool prepare_multi(const SegmentState* segments, std::uint32_t count, const Workspace& ws, SegmentMap& map, MultiShape& shape,
+    std::uint32_t* valid_after);
+// the fixed graph shape for these segment rows; false = this layout cannot be captured (keep the eager core)
+bool graph_shape(const std::uint32_t* segment_rows, std::uint32_t count, const Workspace& ws, MultiShape& shape);
+// capture: launches that read the map from device_map (copied before each replay). Replay: prepare_replay fills the host
+// map for that copy and advances the pooled-valid counts exactly as layer_core_multi does around its launches.
+void layer_core_device(const RowBuffers& rows_buf, const SegmentMap* device_map, const MultiShape& shape, const LayerWeights& w,
+    const RopeTable* cs, const amdmath::Tables& tables, Workspace& ws, cudaStream_t stream);
+void prepare_replay(const SegmentState* segments, std::uint32_t count, const Workspace& ws, SegmentMap& map);
+
 // ---- the whole QSA core of one layer for rows [first_position, first_position + rows) ----
 // indexer projection, 3 norms, store, pool (blocks needed by the last row), then per chunk of workspace.chunk_rows rows:
 // block scores, selection, attention. Positions < first_position must already be in `state`.
