@@ -55,6 +55,7 @@ void run_case(std::mt19937& rng, unsigned rows, bool timing) {
     std::vector<unsigned> big;  // rows with an FP16 overflow of y (finite FP32): the exact fallback must take them
     for (unsigned r : {3U, rows / 2U + 1U, rows - 1U})
         if (r < rows && std::find(big.begin(), big.end(), r) == big.end()) big.push_back(r);
+    const std::vector<float> clean = y;  // timing input: no overflow rows (the fallback is the rare path)
     for (unsigned r : big) y[std::size_t{r} * H + (r * 37U) % H] = 1.0e5F;
     float *dy = dev(y), *drw = dev(rw), *db = dev(bias);
     auto* dw16 = dev(std::vector<std::uint16_t>(rw.size()));
@@ -114,6 +115,7 @@ void run_case(std::mt19937& rng, unsigned rows, bool timing) {
         check(same_set >= n * 95U / 100U, tag + " top-4 set agreement >= 95 %");
     }
     if (!timing) return;
+    ok(hipMemcpy(dy, clean.data(), clean.size() * sizeof(float), hipMemcpyHostToDevice), "clean y");
     hipEvent_t a, b;
     ok(hipEventCreate(&a), "event");
     ok(hipEventCreate(&b), "event");

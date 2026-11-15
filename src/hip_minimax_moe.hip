@@ -339,6 +339,7 @@ __global__ __launch_bounds__(kNormThreads) void router_exact_rows_kernel(std::ui
         for (unsigned e = wave; e < kExperts; e += kWaves) {
             const float* w = router_w + static_cast<std::size_t>(e) * kHidden;
             float a = 0.0F;
+#pragma unroll 8  // the weight loads issue ahead; the chain order is unchanged
             for (unsigned j = lane; j < kHidden; j += kRouterLanes) a = __builtin_fmaf(ys[j], w[j], a);
             for (unsigned d = 16; d >= 1; d >>= 1U) a = a + __shfl_xor(a, static_cast<int>(d), 32);
             if (lane == 0) {

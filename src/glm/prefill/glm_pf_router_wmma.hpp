@@ -29,6 +29,7 @@ __global__ __launch_bounds__(256) void exact_rows_kernel(const float* x, const s
         for (unsigned e = threadIdx.x; e < kOut; e += 256U) {
             const auto* we = reinterpret_cast<const uint4*>(w + static_cast<std::size_t>(e) * kIn);
             float acc = 0.0F;
+#pragma unroll 4  // the weight loads issue ahead; the chain order is unchanged
             for (unsigned q = 0; q < kIn / 8U; ++q) {
                 const uint4 v = we[q];
                 const auto* h = reinterpret_cast<const std::uint16_t*>(&v);

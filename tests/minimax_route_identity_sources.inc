@@ -43,7 +43,7 @@
 {"include/strix/session/speculation_default.hpp", 0x283f9e8200a42426ULL},
 {"src/bp_codec.cpp", 0x852b966998dc0b58ULL},
 {"src/dspark_common/markov_cand_kernels.hpp", 0xf20c7f91a631cbc1ULL},
-{"src/hip_minimax_moe.hip", 0xd728fbe901205c96ULL},
+{"src/hip_minimax_moe.hip", 0x6ab7009372ba6f95ULL},
 {"src/hip_minimax_msa.hip", 0x033e1129cca207edULL},
 {"src/minimax/attn/index_proj.hip", 0x78459dee817467feULL},
 {"src/minimax/attn/index_proj.hpp", 0x393a96aa17edfaddULL},
