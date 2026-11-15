@@ -2750,10 +2750,11 @@ bool engram_f16_pf_admitted(const F16RowsView& v) noexcept {
 // FAST lever ds41-engram-f16wmma-v1 (STRIX_DS41_FAST_ENGRAM=1 or set_fast_engram(1 / 0; -1 = the environment); default
 // off): the Engram KV projection on the shared dense FP16 WMMA core (core/f16_dense_tall.hpp, 128-row CTAs x 256
 // columns) instead of the exact FP32 FMA chains of f16_tiled_pf (measured 4.2 TFLOPS: 77 ms per 1,024 rows).
-// Contract: x holds BF16 values (8 significant bits); 0 and every 2^-17 <= |x| < 2^16 are exact in FP16, so each
-// product is the exact one and only the FP32 summation order differs (one WMMA chain per row tile and column tile,
-// 16-wide k units ascending). A scan flags any other x; then the WMMA launch exits and the exact separate kernel runs
-// instead (the lever-off bits), without a host sync. Shapes the exact tile path does not admit keep the exact path.
+// Contract (the shared core's): x is rounded to FP16 (RNE); BF16 values of 2^-17 <= |x| < 2^16 convert exactly, smaller
+// ones lose low bits in FP16's subnormal range (absolute error <= 2^-25); the products are then exact in FP32 and the
+// sums run in WMMA order (one chain per row tile and column tile, 16-wide k units ascending). A scan flags |x| >= 2^16,
+// Inf and NaN (FP16 would overflow); then the WMMA launch exits and the exact separate kernel runs instead (the lever-off
+// bits), without a host sync. Shapes the exact tile path does not admit keep the exact path.
 int fast_engram_mode = -1;
 void set_fast_engram(int mode) { fast_engram_mode = mode; }
 static bool fast_engram_on() {
@@ -2761,8 +2762,7 @@ static bool fast_engram_on() {
     return fast_engram_mode >= 0 ? fast_engram_mode != 0 : env;
 }
 namespace {
-// Sets *flag when any x of the view is not a BF16 value that FP16 holds exactly (zero, or biased FP32 exponent
-// 110 .. 142); Inf and NaN (exponent 255) are flagged.
+// Sets *flag when any x of the view would overflow FP16: biased FP32 exponent >= 143 (|x| >= 2^16), Inf and NaN.
 __global__ __launch_bounds__(256) void engram_x_f16_scan(F16RowsView v, unsigned* flag) {
     const std::size_t per_row = v.width / 4U, total = per_row * v.rows;
     bool out = false;
@@ -2773,7 +2773,7 @@ __global__ __launch_bounds__(256) void engram_x_f16_scan(F16RowsView v, unsigned
 #pragma unroll
         for (unsigned k = 0; k < 4; ++k) {
             const unsigned m = words[k] & 0x7FFFFFFFU;
-            out = out || (words[k] & 0xFFFFU) != 0U || (m != 0U && (m < (110U << 23U) || m >= (143U << 23U)));
+            out = out || m >= (143U << 23U);
         }
     }
     if (out) atomicOr(flag, 1U);
