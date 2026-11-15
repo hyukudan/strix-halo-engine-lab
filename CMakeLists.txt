@@ -1224,6 +1224,12 @@ if(BUILD_TESTING)
     strix_target_warnings(strix-qwen-router-bf16-tests)
     add_test(NAME strix-qwen-router-bf16-tests COMMAND strix-qwen-router-bf16-tests)
     set_tests_properties(strix-qwen-router-bf16-tests PROPERTIES LABELS "cpu")
+    add_executable(strix-onfly-i4-tests tests/onfly_i4_tests.cpp)
+    target_link_libraries(strix-onfly-i4-tests PRIVATE strix_core strix_serve)
+    target_include_directories(strix-onfly-i4-tests PRIVATE src)
+    strix_target_warnings(strix-onfly-i4-tests)
+    add_test(NAME strix-onfly-i4-tests COMMAND strix-onfly-i4-tests)
+    set_tests_properties(strix-onfly-i4-tests PROPERTIES LABELS "cpu")
     add_executable(strix-qwen-mtp-bundle-tests tests/qwen_mtp_bundle_tests.cpp)
     target_link_libraries(strix-qwen-mtp-bundle-tests PRIVATE strix_core)
     strix_target_warnings(strix-qwen-mtp-bundle-tests)
@@ -2563,6 +2569,7 @@ int main() { return 0; }"
         src/hip_qwen_moe_prepared.cpp
         src/hip_q6p_pack.cpp
         src/hip_qwen_router_bf16.cpp
+        src/hip_qwen_onfly_i4.cpp
         src/hip_dense_trellis_pack.cpp
         src/hip_runtime_allocator.cpp
         src/hip_sampled_target_logits_reader.cpp
@@ -2646,6 +2653,7 @@ int main() { return 0; }"
         PUBLIC
         strix_core
         "${STRIX_HIP_RUNTIME_LIBRARY}"
+        strix_tiled_core
     )
     if(STRIX_ENABLE_EXPERIMENTAL_Q4K_A8_RUNTIME)
         target_link_libraries(strix_hip_runtime PUBLIC strix_q4k_a8_hip_probe)

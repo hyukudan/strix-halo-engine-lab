@@ -139,4 +139,42 @@ void to_q8_0(const unsigned char* q6, std::uint64_t rows, std::uint64_t cols, un
         }
 }
 
+namespace iu4 {
+namespace {
+struct Registry {
+    std::shared_mutex mutex;
+    std::unordered_map<const void*, Tensor> tensors;
+    std::atomic<std::uint64_t> count{0}, hits{0};
+};
+Registry& registry() {
+    static Registry instance;
+    return instance;
+}
+}  // namespace
+void register_tensor(const void* original_address, const Tensor& tensor) {
+    auto& r = registry();
+    const std::unique_lock lock(r.mutex);
+    r.tensors[original_address] = tensor;
+    r.count.store(r.tensors.size(), std::memory_order_release);
+}
+void unregister_tensor(const void* original_address, const unsigned char* copy_address) noexcept {
+    auto& r = registry();
+    const std::unique_lock lock(r.mutex);
+    const auto it = r.tensors.find(original_address);
+    if (it != r.tensors.end() && it->second.base == copy_address) r.tensors.erase(it);
+    r.count.store(r.tensors.size(), std::memory_order_release);
+}
+const Tensor* find(const void* original_address) noexcept {
+    auto& r = registry();
+    if (!r.count.load(std::memory_order_acquire)) return nullptr;
+    const std::shared_lock lock(r.mutex);
+    const auto it = r.tensors.find(original_address);
+    if (it == r.tensors.end()) return nullptr;
+    r.hits.fetch_add(1U, std::memory_order_relaxed);
+    return &it->second;
+}
+std::uint64_t count() noexcept { return registry().count.load(std::memory_order_acquire); }
+std::uint64_t hits() noexcept { return registry().hits.load(std::memory_order_relaxed); }
+}  // namespace iu4
+
 }  // namespace strix::q6p
