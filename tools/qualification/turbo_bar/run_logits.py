@@ -52,7 +52,10 @@ def clean_env(arm_env):
 
 
 def engine_argv(binary, model, ids, prefill_rows, out_bin, positions, extra):
-    return ([str(binary), str(model)] + [str(i) for i in ids] + FIXED +
+    # The context must hold the whole teacher sequence; 8192 is the qualified context, any other length is
+    # stated as unqualified (as scripts/bench/engines/qwen.sh does).
+    ctx = ["--context", str(len(ids))] + ([] if len(ids) == 8192 else ["--unqualified-context"])
+    return ([str(binary), str(model)] + [str(i) for i in ids] + FIXED + ctx +
             ["--known-prefix-prefill-rows", str(prefill_rows), "--known-prefix-output-policy", "all-rows",
              "--teacher-logits-file", str(out_bin), "--teacher-logits-rows", str(positions)] + list(extra))
 
