@@ -2221,7 +2221,6 @@ void lead(const Args& initial, BatchForward& fwd, strix::dist::Communicator& com
                                     : serve::PrefillGroupAgreement{group_policy_own, serve::PrefillGroupCapacity{0U}};
     const auto& group_policy = group_pair.policy;
     const auto& group_capacity = group_pair.capacity;
-    bool group_image_noted = false;  // the image decline is printed once
     const char* const group_mode = group_policy.groups() && group_capacity.members >= 2U ? "auto" : "off";
     const char* const group_reason = !group_policy.groups() ? "policy-solo" :
         prefill ? group_capacity.reason : "no-device-prefill";
@@ -3849,6 +3848,7 @@ void lead(const Args& initial, BatchForward& fwd, strix::dist::Communicator& com
                                 const auto rows = static_cast<std::uint32_t>(q->seq.prompt.size());
                                 // DAYAUDIT 3: the group message carries no EmbedFrame and GroupMember no embeddings
                                 const bool image = request(*q).job.embeds != nullptr;
+                                static bool group_image_noted = false;  // the image decline is printed once (one serving loop per process)
                                 if (image && !std::exchange(group_image_noted, true))
                                     std::fprintf(stderr, "prefill group: %s (such a prompt runs alone)\n", serve::kGroupImageDecline);
                                 cands.push_back({i, rows, i, prefill->route_class(rows), image});
