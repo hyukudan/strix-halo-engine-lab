@@ -157,6 +157,9 @@ struct PrefillResult {
     bool decoder_deferred = false;     // set_decoder_deferral admitted: no logits / next token / seed, decode state completed by the next run
     std::vector<std::uint64_t> stream_hashes;  // last row, after each layer (stream_hashes)
     bool embed_dead_hash_checked = false, embed_image_router_checked = false; // verify_embed_extras evidence
+    // verify_embed_extras: an image row's residual is bitwise unchanged by every Engram layer (gate shut, as upstream) while
+    // a text row of the same run changes; false when the run has no Engram layer on this rank or no image row
+    bool embed_image_engram_checked = false;
     double seconds = 0.0, engram_seconds = 0.0, head_seconds = 0.0;
     double engram_wait_seconds = 0.0;  // overlapped Engram read: the part the run waited for (before the Engram layers)
     std::vector<PrefillLayerTiming> layers;

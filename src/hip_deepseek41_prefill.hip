@@ -2252,6 +2252,10 @@ PrefillResult DevicePrefill::run_from(std::span<const std::uint32_t> tokens, std
         std::size_t embed_at = 0;  // first row in embed_stage
     };
     std::vector<EmbedPiece> embed_pieces;
+    // verify_embed_extras: this rank's first image row and first text row, whose residual streams the Engram check
+    // compares across every Engram layer (upstream: an image row passes the layer unchanged, a text row does not).
+    std::uint32_t verify_image_row = UINT32_MAX, verify_text_row = UINT32_MAX;
+    bool engram_image_seen = false, engram_image_kept = true, engram_text_moved = false;
     if (!embeds.empty() || m.image_rows_set) {
         const std::size_t embed_width = c.hidden_size;
         std::vector<std::uint8_t> embed_flags(Tn, 0);
@@ -2267,6 +2271,9 @@ PrefillResult DevicePrefill::run_from(std::span<const std::uint32_t> tokens, std
         if (m.options.verify_embed_extras && m.image_rows_set) {
             // Known-effect fixture on an actual uploaded image flag: zero scores, text selects 0, image selects 1.
             const auto at = static_cast<std::size_t>(std::find(embed_flags.begin(), embed_flags.end(), std::uint8_t{1}) - embed_flags.begin());
+            verify_image_row = static_cast<std::uint32_t>(at);
+            if (const auto text = std::find(embed_flags.begin(), embed_flags.end(), std::uint8_t{0}); text != embed_flags.end())
+                verify_text_row = static_cast<std::uint32_t>(text - embed_flags.begin());
             Dev<float> x(256), weight(256 * 256), bias(256), image_bias(256), scores(256), weights(1);
             Dev<std::uint32_t> selected(1);
             x.zero(st);
@@ -2399,6 +2406,10 @@ PrefillResult DevicePrefill::run_from(std::span<const std::uint32_t> tokens, std
             const std::uint32_t E = m.task != nullptr && m.task->opt.engram_rows != 0U ? std::min(m.task->opt.engram_rows, C) : C;
             std::uint32_t engram_cut = 0;
             const std::uint32_t engram_most = (std::max(Tn, Tp) + E - 1U) / E;
+            const auto residual_row = [&](std::uint32_t row) {
+                return row == UINT32_MAX ? std::vector<float>{} : download(stream_now() + std::size_t{row} * stream_row, stream_row, st);
+            };
+            const auto image_before = residual_row(verify_image_row), text_before = residual_row(verify_text_row);
             for (std::uint32_t r0 = 0; r0 < Tn; r0 += E) {
                 const std::uint32_t n = std::min(E, Tn - r0);
                 cut(PrefillUnitLevel::finest, s.layer, "engram");
@@ -2423,6 +2434,15 @@ PrefillResult DevicePrefill::run_from(std::span<const std::uint32_t> tokens, std
             }
             for (; engram_cut < engram_most; ++engram_cut) cut(PrefillUnitLevel::finest, s.layer, "engram.pad");
             if (!m.overlap) check(hipStreamSynchronize(st), "engram");  // overlap: pinned rows, alive until the run's end
+            if (!image_before.empty()) {  // bitwise: a shut gate adds nothing to the image row
+                const auto same_bits = [](const std::vector<float>& a, const std::vector<float>& b) {
+                    return a.size() == b.size() && std::memcmp(a.data(), b.data(), a.size() * sizeof(float)) == 0;
+                };
+                engram_image_seen = true;
+                engram_image_kept = engram_image_kept && same_bits(residual_row(verify_image_row), image_before);
+                engram_text_moved = engram_text_moved || text_before.empty() || !same_bits(residual_row(verify_text_row), text_before);
+                result.embed_image_engram_checked = engram_image_seen && engram_image_kept && engram_text_moved;
+            }
             break;
         }
         case Op::hc_mix: {

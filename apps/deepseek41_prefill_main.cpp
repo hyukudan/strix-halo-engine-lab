@@ -701,6 +701,7 @@ int embed_identity_gate(const Args& a, strix::deepseek41::DevicePrefill& pre, co
     for (const float v : image.r.logits) finite = finite && std::isfinite(v);
     verdict("image-router", image.r.embed_image_router_checked);
     verdict("image-dead", image.r.embed_dead_hash_checked);
+    verdict("image-engram", image.r.embed_image_engram_checked);
     verdict("image", finite && !same(image, ref, ref_state));
     std::printf("embed-identity image    logits %s the plain run\n",
                 fnv(image.r.logits) == fnv(ref.logits) ? "equal to" : "differ from");
