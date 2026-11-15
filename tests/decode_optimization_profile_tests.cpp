@@ -1,5 +1,7 @@
 #include "../apps/hip_decode_options.hpp"
 #include <iostream>
+#include <filesystem>
+#include <fstream>
 #include <array>
 #include <string>
 #include <vector>
@@ -1355,6 +1357,21 @@ int main() {
         "teacher logits file requires a nonempty path");
     rejects([] { (void)parse({"decoder", "m", "1", "2", "--generate", "1", "--teacher-forced-score", "--teacher-logits-file=a", "--teacher-logits-file=b"}); },
         "duplicate teacher logits file option");
+    {
+        const auto rows_path = (std::filesystem::temp_directory_path() / "strix-teacher-rows-test.txt").string();
+        { std::ofstream rows_file(rows_path); rows_file << "0 1 "; }
+        auto rows_teacher = parse({"decoder", "m", "1", "2", "3", "--generate", "1", "--teacher-forced-score",
+            "--teacher-logits-file", "fresh-logits.bin", "--teacher-logits-rows", rows_path.c_str()});
+        expect(rows_teacher.teacher_logits_rows == std::vector<std::uint64_t>{0U, 1U} && !rows_teacher.any_low_level_flag,
+            "teacher logits rows keep the listed positions without selecting a numerical recipe");
+        rejects([&] { (void)parse({"decoder", "m", "1", "2", "--generate", "1", "--teacher-forced-score",
+            "--teacher-logits-rows", rows_path.c_str()}); }, "teacher logits rows require a teacher logits file");
+        { std::ofstream rows_file(rows_path); rows_file << "1 1 "; }
+        rejects([&] { (void)parse({"decoder", "m", "1", "2", "--generate", "1", "--teacher-forced-score",
+            "--teacher-logits-file", "a.bin", "--teacher-logits-rows", rows_path.c_str()}); },
+            "teacher logits rows must be ascending decimal positions");
+        std::filesystem::remove(rows_path);
+    }
     validate_resolved_teacher_forced_score(teacher, 4);
     rejects([&] { validate_resolved_teacher_forced_score(teacher, 3); }, "teacher input exceeds model vocabulary");
     auto short_context = teacher; short_context.context_tokens = 2;
