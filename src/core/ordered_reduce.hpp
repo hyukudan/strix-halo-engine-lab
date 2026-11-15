@@ -1,5 +1,8 @@
 #pragma once
-// Ordered reductions with fewer barriers, bit-identical to the LDS loops they replace.
+// Ordered reductions with fewer barriers, preserving the explicit-add LDS tree below.
+// Broadcast qualification requires raw bit equality, including NaN payloads. Legacy += trees used by lane-0/pair
+// callers have a weaker comparison contract: non-NaN bits and NaN positions match, but NaN payloads may differ
+// because the compiler can select a different operand order for +=. This is not universal bitwise qualification.
 //
 // R2 tree. The engines' exact R2 reduction is the LDS halving tree
 //     s[l] = part(l); sync; for (h = L/2; h; h >>= 1) { if (l < h) s[l] = s[l] + s[l + h]; sync; }
@@ -16,6 +19,7 @@
 // Integer addition mod 2^32 is associative and commutative, so it equals any serial or Hillis-Steele prefix bit for bit.
 //
 // Preconditions: 32-lane waves of consecutive threads; every lane of a participating wave is active.
+// The shuffle fallback does not establish wave64 support, including for CSR callers using scalarized wave_index.
 #include "../../include/strix/hip_qwen_dpp_reduce.hpp"
 
 #include <hip/hip_runtime.h>

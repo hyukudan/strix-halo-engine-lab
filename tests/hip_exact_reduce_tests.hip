@@ -1,5 +1,5 @@
 // Exact-reduction fixture (no model): core/ordered_reduce.hpp and the CSR scan of moe_core/device_plan.hpp against
-// verbatim copies of the LDS loops they replaced, bit for bit.
+// verbatim copies of the LDS loops they replaced: broadcasts/CSR bit for bit; legacy += trees allow NaN payload changes.
 //   trees: L = 64..1024; broadcast (twice on one s: the reuse barrier), lane 0, and the PLE key/query pair, on
 //          cancellation, signed zeros, subnormals, infinities, NaN payloads, overflow and random bit patterns.
 //   CSR:   count -> {old scan, new scan} -> scatter on the same scratch; scratch words, offsets, touched, batch
@@ -7,6 +7,7 @@
 //   time:  ABAB (old, new) of the tree alone and of the scan at 8K/32K/128K rows (`time` argument).
 #include "../src/core/ordered_reduce.hpp"
 #include "../src/moe_core/device_plan.hpp"
+#include "exact_reduce_contract.hpp"
 
 #include <hip/hip_runtime.h>
 
@@ -130,7 +131,7 @@ std::vector<float> tree_inputs(unsigned L, unsigned ctas, std::mt19937& g) {
                 case 3: a = (bits(g) % 7U == 0U) ? bits_float(bits(g) & 0x807fffffU) : ((bits(g) & 1U) ? -0.0F : 0.0F); break;  // subnormals
                 case 4: { const auto r = bits(g) % 9U; if (r == 0U) a = std::numeric_limits<float>::infinity(); if (r == 1U) a = -std::numeric_limits<float>::infinity(); } break;
                 case 5: if (bits(g) % 5U == 0U) a = bits_float(0x7f800001U | (bits(g) & 0x803fffffU) | ((bits(g) & 1U) << 22U)); break;  // NaN payloads
-                case 6: if (l == bits(g) % L) a = bits_float(0xffc00000U | (bits(g) & 0x3fffffU)); break;
+                case 6: a = bits_float(exact_reduce_contract::collision_leaf(l, (c & 1U) != 0U)); break;
                 case 7: a = std::numeric_limits<float>::max() * ((bits(g) & 1U) ? 0.75F : -0.5F) * (1.0F + 0.25F * std::fabs(nd(g))); break;  // overflow
                 case 8: a = bits_float(bits(g) & 0x807fffffU); break;                                                  // all subnormal
                 case 9: a = bits_float(bits(g)); break;                                                                // any bits
@@ -156,28 +157,28 @@ template <unsigned L> void tree_case(std::mt19937& g) {
     tree_kernel<L, true><<<kCtas, L>>>(din, b);
     check(hipDeviceSynchronize(), "tree kernels");
     const auto ha = down(a, n), hb = down(b, n);
-    // payload: both NaN, bits differ. Reported (slot, kind, first words) but not a failure; any other difference fails.
+    // Broadcasts require raw equality. Only r1/pa/pb (legacy +=) permit NaN-to-NaN payload changes.
     unsigned bad = 0U, nan = 0U, payload = 0U, shown = 0U, by_slot[5] = {}, by_kind[11] = {};
     const std::size_t per = 2U * L + 3U;
     for (std::size_t i = 0; i < n; ++i) {
         std::uint32_t ua, ub;
         std::memcpy(&ua, &ha[i], 4);
         std::memcpy(&ub, &hb[i], 4);
+        const std::size_t c = i / per;
+        const unsigned slot = exact_reduce_contract::output_slot(i, L);
         const bool both_nan = std::isnan(ha[i]) && std::isnan(hb[i]);
-        bad += ua != ub && !both_nan;
+        bad += exact_reduce_contract::mismatch(ua, ub, slot);
         nan += std::isnan(ha[i]);
         if (ua == ub || !both_nan) continue;
         ++payload;
-        const std::size_t c = i / per, k = i % per;
-        const unsigned slot = k < L ? 0U : k < 2U * L ? 1U : static_cast<unsigned>(k - 2U * L) + 2U;
         ++by_slot[slot];
         ++by_kind[c % 11U];
         if (shown++ < 3U) std::printf("  L%u payload cta %zu kind %zu slot %u: old %08x new %08x\n", L, c, c % 11U, slot, ua, ub);
     }
     char what[96];
-    std::snprintf(what, sizeof what, "tree L%u bit-identical to the LDS loop (non-NaN bits, NaN positions)", L);
+    std::snprintf(what, sizeof what, "tree L%u: broadcast raw bits; legacy += non-NaN bits and NaN positions", L);
     expect(bad == 0U, what);
-    std::printf("tree L%-4u %u CTAs x 11 kinds: %zu words, %u differ beyond NaN payload, %u NaN-payload-only (slots b1 b2 r1 pa pb %u %u %u %u %u;"
+    std::printf("tree L%-4u %u CTAs x 11 kinds: %zu words, %u contract mismatches, %u NaN-payload-only (slots b1 b2 r1 pa pb %u %u %u %u %u;"
                 " kinds 4/5/6/9 %u %u %u %u), %u NaN results\n", L, kCtas, n, bad, payload, by_slot[0], by_slot[1], by_slot[2], by_slot[3],
                 by_slot[4], by_kind[4], by_kind[5], by_kind[6], by_kind[9], nan);
     check(hipFree(din), "free");
