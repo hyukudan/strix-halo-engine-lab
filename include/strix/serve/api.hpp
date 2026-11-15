@@ -125,6 +125,10 @@ struct ApiConfig {
     std::optional<std::uint32_t> default_top_k;
     bool capabilities = true;
     bool responses = true;
+    // Ollama-compatible routes (/api/chat, /api/generate, /api/tags, /api/show, /api/ps, /api/version) over the same
+    // chat/completions handlers (src/serve/ollama.cpp). Off: ollama_api = false here, or STRIX_SERVE_OLLAMA=0 process-wide.
+    bool ollama_api = true;
+    std::string ollama_api_version = "0.12.0"; // the API level /api/version reports (clients gate features on it)
     bool stream_receipts = true;
     // Resolved engine support: enable only after every constrained selection path executes it.
     bool engine_logprobs = false, engine_logit_transforms = false;

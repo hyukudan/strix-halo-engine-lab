@@ -683,6 +683,14 @@ add_library(strix_model_description STATIC src/model_description.cpp)
 target_include_directories(strix_model_description PUBLIC include)
 target_compile_features(strix_model_description PUBLIC cxx_std_20)
 strix_target_warnings(strix_model_description)
+# Shared --serve-config TOML expander (every serve CLI binds it with its own option table); reads TOML with the
+# model-description reader above.
+add_library(strix_serve_config STATIC src/serve/serve_config.cpp)
+target_include_directories(strix_serve_config PUBLIC include)
+target_compile_features(strix_serve_config PUBLIC cxx_std_20)
+target_link_libraries(strix_serve_config PUBLIC strix_model_description)
+strix_target_warnings(strix_serve_config)
+target_link_libraries(strix_core PUBLIC strix_serve_config)
 
 # Deployment planning is host-only. Its TOML reader is the existing model reader.
 add_library(strix_deploy STATIC src/deploy/device.cpp src/deploy/spec.cpp src/deploy/plan.cpp src/deploy/link.cpp
@@ -791,6 +799,7 @@ add_library(strix_serve STATIC
     src/serve/http_server.cpp
     src/serve/engine.cpp
     src/serve/api.cpp
+    src/serve/ollama.cpp
     src/serve/deployment.cpp
     src/serve/request_fields.cpp
     src/serve/health.cpp
@@ -1179,6 +1188,10 @@ if(BUILD_TESTING)
     foreach(schedule IN ITEMS 2 4 16 20)
         add_test(NAME strix-serial-prompt-plan-sched-${schedule} COMMAND strix-serial-prompt-plan-tests ${schedule})
     endforeach()
+    add_executable(strix-serve-config-tests tests/serve_config_tests.cpp)
+    target_link_libraries(strix-serve-config-tests PRIVATE strix_core)
+    strix_target_warnings(strix-serve-config-tests)
+    add_test(NAME strix-serve-config-tests COMMAND strix-serve-config-tests)
     add_executable(strix-http-slot-capacity-tests tests/http_slot_capacity_tests.cpp)
     target_link_libraries(strix-http-slot-capacity-tests PRIVATE strix_core)
     strix_target_warnings(strix-http-slot-capacity-tests)

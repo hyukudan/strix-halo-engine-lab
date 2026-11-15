@@ -14,6 +14,7 @@
 #include "../apps/hip_session_store.hpp"
 #include "../apps/qwen_effective_config.hpp"
 #include "strix/serve/http_server.hpp"
+#include "strix/serve/ollama.hpp"
 
 #ifdef _WIN32
 #include <winsock2.h>
@@ -864,6 +865,133 @@ struct AuthorizationPowerSource final : strix::power::Source {
     strix::power::SourceStatus probe() override { return {"authorization-test", true, "deterministic power"}; }
     void read(strix::power::Sample& sample) noexcept override { sample.add_power(strix::power::Domain::accelerator, 100.0); }
 };
+
+// Ollama-compatible contract (src/serve/ollama.cpp) against the OpenAI route on the same service: same prompt IDs,
+// same committed text and counts, NDJSON streaming, tools, load probes, named refusals, auth, disconnect, num_ctx.
+std::vector<Json> ndjson(const std::string& body) {
+    std::vector<Json> out;
+    for (std::size_t at = 0; at < body.size();) {
+        auto end = body.find('\n', at);
+        if (end == std::string::npos) end = body.size();
+        if (end > at) out.push_back(parse_json(body.substr(at, end - at)));
+        at = end + 1U;
+    }
+    return out;
+}
+void test_ollama_contract(std::uint16_t port, const std::string& auth, ScriptedEngine& engine) {
+    using strix::serve::ollama::ResponseWriter;
+    using strix::serve::ollama::Route;
+    const auto post = [&](const std::string& path, const std::string& body, const std::string& extra = {}) { return http(port, "POST", path, body, auth + extra); };
+    const auto error_of = [](const Reply& r) { const auto j = parse_json(r.body); return j.find("error") && j.find("error")->is_string() ? j.find("error")->as_string() : std::string(); };
+    // metadata and auth
+    const auto tags = parse_json(http(port, "GET", "/api/tags", "", auth).body);
+    const auto model = at(at(tags, "models").as_array().front(), "name").as_string();
+    check(model == "test-model", "ollama tags name the served model");
+    check(!at(parse_json(http(port, "GET", "/api/version", "", auth).body), "version").as_string().empty(), "ollama version");
+    const auto unauth = http(port, "GET", "/api/tags", "");
+    check(unauth.status == 401 && !error_of(unauth).empty(), "ollama routes take the same API key");
+    const auto ps = parse_json(http(port, "GET", "/api/ps", "", auth).body);
+    check(at(at(ps, "models").as_array().front(), "context_length").as_int() > 0, "ollama ps reports the served context");
+    const auto show = parse_json(post("/api/show", R"({"model":"test-model"})").body);
+    std::set<std::string> caps;
+    for (const auto& c : at(show, "capabilities").as_array()) caps.insert(c.as_string());
+    check(caps.contains("completion") && caps.contains("tools") && !caps.contains("embedding") && !caps.contains("vision"),
+        "ollama show announces only executed capabilities");
+    check(post("/api/show", R"({"model":"other"})").status == 404, "ollama unknown model is 404");
+    check(http(port, "GET", "/api/status", "").status == 200, "strix status route unchanged");
+    // non-streamed chat == OpenAI chat: same prompt IDs, same text, same counts
+    const auto openai = post("/v1/chat/completions", R"({"messages":[{"role":"user","content":"hi"}],"max_tokens":50,"temperature":0,"top_k":5,"seed":7})");
+    const auto oa = parse_json(openai.body);
+    const auto ids_openai = engine.prompts().back().first;
+    const auto sampled_openai = engine.sampling().back();
+    const auto chat = post("/api/chat", R"({"model":"test-model","messages":[{"role":"user","content":"hi"}],"stream":false,"options":{"num_predict":50,"temperature":0,"top_k":5,"seed":7}})");
+    const auto oc = parse_json(chat.body);
+    const auto sampled_ollama = engine.sampling().back();
+    check(chat.status == 200 && engine.prompts().back().first == ids_openai, "ollama chat prompt IDs equal the OpenAI request");
+    check(sampled_ollama.top_k == sampled_openai.top_k && sampled_ollama.seed == sampled_openai.seed && sampled_ollama.seeded == sampled_openai.seeded &&
+        sampled_ollama.temperature == sampled_openai.temperature, "ollama options resolve to the same sampling");
+    const auto& oa_message = at(at(oa, "choices").as_array().front(), "message");
+    check(at(at(oc, "message"), "content").as_string() == at(oa_message, "content").as_string(), "ollama chat text equals OpenAI");
+    check(oa_message.find("reasoning_content") && at(at(oc, "message"), "thinking").as_string() == at(oa_message, "reasoning_content").as_string(), "ollama thinking equals OpenAI reasoning");
+    check(at(oc, "eval_count").as_int() == at(at(oa, "usage"), "completion_tokens").as_int() &&
+        at(oc, "prompt_eval_count").as_int() == at(at(oa, "usage"), "prompt_tokens").as_int() && at(oc, "done").as_bool() &&
+        at(oc, "done_reason").as_string() == "stop", "ollama counts and done_reason");
+    // streamed (the Ollama default): NDJSON lines, same text, a final done line
+    const auto streamed = post("/api/chat", R"({"model":"test-model","messages":[{"role":"user","content":"hi"}],"options":{"num_predict":50}})");
+    check(streamed.headers.find("application/x-ndjson") != std::string::npos, "ollama stream is NDJSON");
+    std::string text;
+    const auto lines = ndjson(streamed.body);
+    for (const auto& l : lines) if (const auto* m = l.find("message")) text += at(*m, "content").as_string();
+    check(!lines.empty() && at(lines.back(), "done").as_bool() && text == at(oa_message, "content").as_string() &&
+        at(lines.back(), "eval_count").as_int() == at(at(oa, "usage"), "completion_tokens").as_int(), "ollama stream text and counts equal OpenAI");
+    // tools: complete calls with object arguments, streamed and not
+    const std::string tools = R"("tools":[{"type":"function","function":{"name":"get_weather","parameters":{"type":"object","properties":{"city":{"type":"string"},"days":{"type":"integer"}}}}}])";
+    const auto tool = parse_json(post("/api/chat", R"({"model":"test-model","stream":false,"messages":[{"role":"user","content":"TOOL"}],)" + tools + "}").body);
+    const auto* calls = at(tool, "message").find("tool_calls");
+    check(calls && calls->size() == 1U && at(at(calls->as_array().front(), "function"), "name").as_string() == "get_weather" &&
+        at(at(at(calls->as_array().front(), "function"), "arguments"), "city").as_string() == "Oslo", "ollama tool call with object arguments");
+    bool streamed_call = false;
+    for (const auto& l : ndjson(post("/api/chat", R"({"model":"test-model","messages":[{"role":"user","content":"TOOL"}],)" + tools + "}").body))
+        if (const auto* m = l.find("message")) if (const auto* c = m->find("tool_calls"); c && c->size()) streamed_call = at(at(c->as_array().front(), "function"), "name").as_string() == "get_weather";
+    check(streamed_call, "ollama streamed tool call");
+    const auto history = post("/api/chat", R"({"model":"test-model","stream":false,"messages":[{"role":"user","content":"TOOL"},{"role":"assistant","content":"","tool_calls":[{"function":{"name":"get_weather","arguments":{"city":"Oslo"}}}]},{"role":"tool","content":"sunny","tool_name":"get_weather"}],)" + tools + "}");
+    check(history.status == 200, "ollama tool history (object arguments, tool_name) accepted");
+    // generate == chat with one user message; raw == completions
+    const auto gen = parse_json(post("/api/generate", R"({"model":"test-model","prompt":"hi","stream":false,"options":{"num_predict":50}})").body);
+    check(engine.prompts().back().first == ids_openai && at(gen, "response").as_string() == at(oa_message, "content").as_string(), "ollama generate equals chat");
+    const auto completion = parse_json(post("/v1/completions", R"({"prompt":"hi","max_tokens":20})").body);
+    const auto ids_completion = engine.prompts().back().first;
+    const auto raw = parse_json(post("/api/generate", R"({"model":"test-model","prompt":"hi","raw":true,"stream":false,"options":{"num_predict":20}})").body);
+    check(engine.prompts().back().first == ids_completion && at(raw, "response").as_string() == at(at(completion, "choices").as_array().front(), "text").as_string(), "ollama raw generate equals completions");
+    // load probe runs nothing
+    const auto before = engine.prompts().size();
+    const auto probe = parse_json(post("/api/generate", R"({"model":"test-model","stream":false})").body);
+    check(at(probe, "done_reason").as_string() == "load" && engine.prompts().size() == before, "ollama load probe runs nothing");
+    // named refusals and reported no-effect options
+    check(post("/api/embed", R"({"model":"test-model","input":"x"})").status == 501, "ollama embed refused (no embedding engine)");
+    check(post("/api/pull", R"({"model":"x"})").status == 501 && http(port, "DELETE", "/api/delete", "{}", auth).status == 501, "ollama management refused");
+    check(post("/api/nope", "{}").status == 404, "ollama unknown route");
+    const auto mirostat = post("/api/chat", R"({"model":"test-model","messages":[{"role":"user","content":"hi"}],"options":{"mirostat":2}})");
+    check(mirostat.status == 400 && error_of(mirostat).find("mirostat") != std::string::npos, "ollama refuses result-changing options it cannot execute");
+    check(post("/api/chat", R"({"model":"test-model","messages":[{"role":"user","content":"hi"}],"options":{"bogus":1}})").status == 400, "ollama unknown option");
+    check(post("/api/chat", R"({"model":"test-model","messages":[{"role":"user","content":"hi"}],"bogus":1})").status == 400, "ollama unknown field");
+    check(post("/api/generate", R"({"model":"test-model","prompt":"hi","suffix":"x"})").status == 400, "ollama suffix refused");
+    check(post("/api/generate", R"({"model":"test-model","prompt":"hi","context":[1,2]})").status == 400, "ollama context refused");
+    const auto image = post("/api/chat", R"({"model":"test-model","messages":[{"role":"user","content":"hi","images":["iVBORw0KGgoAAAA"]}]})");
+    check(image.status == 400 && error_of(image).find("image") != std::string::npos, "ollama images refused without an image adapter");
+    const auto hint = post("/api/chat", R"({"model":"test-model","stream":false,"keep_alive":"5m","messages":[{"role":"user","content":"hi"}],"options":{"num_predict":50,"num_thread":8}})");
+    check(hint.status == 200 && hint.headers.find("X-Strix-Ollama-No-Effect: keep_alive,num_thread") != std::string::npos &&
+        engine.prompts().back().first == ids_openai, "ollama no-effect options are reported, not silent");
+    // num_ctx below the served context bounds prompt + output (never truncates)
+    const auto prompt_tokens = at(at(oa, "usage"), "prompt_tokens").as_int();
+    const auto tight = post("/api/chat", R"({"model":"test-model","messages":[{"role":"user","content":"hi"}],"options":{"num_ctx":2}})");
+    check(tight.status == 400 && error_of(tight).find("num_ctx") != std::string::npos, "ollama num_ctx below the prompt is refused");
+    const auto bounded = parse_json(post("/api/chat", R"({"model":"test-model","stream":false,"messages":[{"role":"user","content":"hi"}],"options":{"num_ctx":)" +
+        std::to_string(prompt_tokens + 3) + "}}").body);
+    check(at(bounded, "eval_count").as_int() == 3 && at(bounded, "done_reason").as_string() == "length", "ollama num_ctx bounds the output");
+    // disconnect cancels the generation (same ticket path as OpenAI)
+    const auto cancelled = engine.cancelled.load();
+    (void)http(port, "POST", "/api/chat", R"({"model":"test-model","messages":[{"role":"user","content":"LONG"}],"options":{"num_predict":400}})", auth, 300);
+    for (int i = 0; i < 200 && engine.cancelled.load() == cancelled; ++i) std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    check(engine.cancelled.load() > cancelled, "ollama client disconnect cancels the generation");
+    // re-encoding cost per streamed token (the HTTP overhead budget): one SSE frame -> one NDJSON line
+    struct Null final : strix::serve::HttpResponseWriter {
+        void send(int, std::string_view, std::string_view, const std::vector<std::pair<std::string, std::string>>&) override {}
+        bool begin_stream(int, std::string_view, const std::vector<std::pair<std::string, std::string>>&) override { return true; }
+        bool write(std::string_view) override { return true; }
+        void end_stream() override {}
+        bool client_gone() const override { return false; }
+    } sink;
+    ResponseWriter writer(sink, Route::chat, "test-model", {});
+    const std::string frame = R"({"id":"chatcmpl-x","object":"chat.completion.chunk","created":1,"model":"test-model","choices":[{"index":0,"delta":{"content":" word"},"finish_reason":null}]})";
+    constexpr int frames = 20000;
+    std::size_t bytes = 0;
+    const auto t0 = std::chrono::steady_clock::now();
+    for (int i = 0; i < frames; ++i) bytes += writer.translate_frame(frame).size();
+    const double us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count() / frames;
+    std::cout << "ollama re-encode: " << us << " us/token frame (" << bytes / frames << " B/line)\n";
+    check(bytes > 0 && us < 200.0, "ollama re-encode cost per token frame");
+}
 
 int main() try {
     strix::power::register_source("authorization-test", [](const std::string&) { return std::make_unique<AuthorizationPowerSource>(); });
@@ -2622,6 +2750,7 @@ int main() try {
               b.headers.find("X-Strix-Queue-Position:") != std::string::npos, "stream submission headers");
         check(b.status == 200 && stream_text(b.body, nullptr, nullptr, nullptr, nullptr) == "Hello there, friend.", "concurrent client B");
     }
+    test_ollama_contract(port, auth, engine);
     {
         const auto before = engine.cancelled.load();
         (void)http(port, "POST", "/v1/chat/completions", R"({"messages":[{"role":"user","content":"LONG"}],"stream":true,"max_tokens":400})", auth, 300);
