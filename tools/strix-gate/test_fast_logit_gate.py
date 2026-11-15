@@ -317,5 +317,323 @@ class Case(unittest.TestCase):
             self.assertEqual((p["dnll_rule"]["rule"], p["dnll_rule"]["limit"], p["dnll_rule"]["nulls"]), ("abs", 0.01, []))
 
 
+MR, MW, MT = 64, (6, 5), 120  # MiniMax fixture: rows, rank vocabulary widths, prompt tokens
+
+
+class MiniMaxFloor(unittest.TestCase):
+    """MiniMax onset-matched floor and the launcher-side witness producer (`witness`)."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory(dir=pathlib.Path(__file__).resolve().parents[2])
+        self.root = pathlib.Path(self.tmp.name)
+        rng = np.random.default_rng(11)
+        head = rng.integers(0, sum(MW), MT - MR, dtype=np.int64)
+        self.tokens = np.resize(head, MT)  # period MT - MR: the scored tail repeats the start (copy rows)
+        self.tok = self.root / "p.u32"
+        self.tokens.astype("<u4").tofile(self.tok)
+        self.binary = self.root / "strix-minimax-rank"
+        self.binary.write_bytes(b"binary")
+        self.model = self.root / "model"
+        self.model.mkdir()
+        (self.model / "config.json").write_text("{}", encoding="utf-8")
+        header = json.dumps({"w": {"dtype": "F16", "shape": [2], "data_offsets": [0, 4]}}).encode()
+        (self.model / "model-00001-of-00001.safetensors").write_bytes(len(header).to_bytes(8, "little") + header + b"\0" * 4)
+        self.labels = np.concatenate((self.tokens[MT - MR + 1:], [0]))
+        self.ref = rng.normal(size=(MR, sum(MW)))
+        self.ref[np.arange(MR), self.labels] += 4.0  # the reference predicts the true token well
+        self.rng = rng
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def receipt(self, rank, fast=None, extra="b"):
+        flash = "0" if fast is None else f"{fast[0] - 10}:layers=" + "".join("1" if fast[1] <= L else "0" for L in range(60))
+        doc = {"schema": "strix-route-receipt-v1", "scope": "process", "engine": "minimax", "rank": rank, "fingerprint": "f",
+               "levers": [{"name": "minimax.moe_prefill_format", "requested": "default", "effective": "exl3", "reason": "disabled"},
+                          {"name": "minimax.msa_flash", "requested": "x", "effective": flash, "reason": "selected"},
+                          {"name": "minimax.prefill_identity", "requested": "default", "effective": "default", "reason": "selected"}],
+               "switches": {"set": {"STRIX_MM_PF_MSA_FLASH": "0" if fast is None else str(fast[0] - 10), "STRIX_X": extra,
+                                    "STRIX_MM_QUALITY_OUT": f"/runs/{rank}-{fast}-{extra}-{self.rng.integers(1 << 30)}/q"}}}
+        if fast is not None:
+            doc["switches"]["set"]["STRIX_MM_PF_MSA_FLASH_LAYERS"] = f"{fast[1]}-59"
+        return "strix-route-receipt " + json.dumps(doc)
+
+    def mm_arm(self, name, logits, fast=None, control=None, extra="b", log=None, prompts=("p",)):
+        """Dumps for two ranks, an engine log per rank, then `witness` and `seal` exactly as a launcher would."""
+        d = self.root / name
+        d.mkdir()
+        rcs = []
+        for rank, (lo, hi) in enumerate(((0, MW[0]), (MW[0], sum(MW)))):
+            for prompt in prompts:
+                logits[:, lo:hi].astype("<f4").tofile(d / f"q-{prompt}-tf-r{rank}.f32")
+            lines = ["mm rank: load", self.receipt(rank, fast, extra)]
+            if control is not None:
+                lines += [f"DIAG attn ulp: layer {control[0]} seed {control[1]} rows {min(64, MT - p)} pos0 {p} values 99"
+                          f" prompt {json.dumps(prompt)}" for prompt in prompts for p in (0, 64)]
+            (d / f"r{rank}.log").write_text("\n".join(log(rank) if log else lines) + "\n", encoding="utf-8")
+            common = ["--dir", str(d), "--rank", str(rank), "--run-id", name, "--binary", str(self.binary), "--rows", str(MR)]
+            for prompt in prompts:
+                common += ["--prompt", f"{prompt}={self.tok}"]
+            rc = run(["witness", *common, "--engine", "minimax", "--engine-log", str(d / f"r{rank}.log"), "--model",
+                      str(self.model), "--out", str(d / f"execution-r{rank}.json")])
+            if rc == 0:
+                rc = run(["seal", *common, "--arm", name, "--execution-witness", str(d / f"execution-r{rank}.json")])
+            rcs.append(rc)
+        return d, rcs
+
+    def noisy(self, scale, seed, rows=None):
+        z = self.ref.copy()
+        r = np.random.default_rng(seed)
+        idx = np.arange(MR) if rows is None else rows
+        z[idx] += r.normal(scale=scale, size=(len(idx), z.shape[1]))
+        return z
+
+    def cmp(self, ref, cand, nulls, *extra, out=None):
+        args = ["compare", str(ref), str(cand), "--ranks", "0", "1", "--tokens", f"p={self.tok}", "--dnll-rule", "floor",
+                "--engine", "minimax", "--profile", "fast-prefill", *sum((["--null-arm", str(n)] for n in nulls), []), *extra]
+        return run(args + (["--json", str(out)] if out else []))
+
+    def fixture(self, onset=30, null_scale=0.3, cand=None, null_layer=None, seeds=(1, 2, 3)):
+        ref, rc = self.mm_arm("ref", self.ref)
+        self.assertEqual(rc, [0, 0])
+        nulls = []
+        for i, s in enumerate(seeds):
+            d, rc = self.mm_arm(f"null{i}", self.noisy(null_scale, 100 + i), control=(onset if null_layer is None else null_layer, s))
+            self.assertEqual(rc, [0, 0])
+            nulls.append(d)
+        c, rc = self.mm_arm("cand", self.noisy(null_scale * 0.7, 200) if cand is None else cand, fast=(12, onset))
+        self.assertEqual(rc, [0, 0])
+        return ref, c, nulls
+
+    def test_copy_rows_and_binomial_tail(self):
+        t = np.array([1, 2, 3, 4, 9, 1, 2, 3, 4, 9, 1, 2, 3, 5])
+        # rows = last 6 positions 8..13; labelled 8..12; k = 3: (2,3,4)->9 at 8 repeats 3 (9), (3,4,9)->1, (4,9,1)->2,
+        # (9,1,2)->3, (1,2,3)->4 but the true next token is 5
+        self.assertEqual(g.copy_rows(t, 6, k=3).tolist(), [True, True, True, True, False])
+        self.assertEqual(g.copy_rows(t, 6, k=6).tolist(), [False, False, True, True, False])
+        self.assertEqual(g.copy_rows(self.tokens, MR).sum(), MR - 1 - 7)
+        self.assertEqual(g.binom_sf(0, 5, 0.5), 1.0)
+        self.assertAlmostEqual(g.binom_sf(3, 3, 0.5), 0.125)
+        self.assertAlmostEqual(g.binom_sf(2, 3, 0.5), 0.5)
+        from math import comb
+        for w in (0, 7, 15, 20):
+            want = sum(comb(20, j) * 0.6 ** j * 0.4 ** (20 - j) for j in range(w, 21))
+            self.assertAlmostEqual(g.binom_sf(w, 20, 0.6), want, places=12)
+
+    def test_witness_producer(self):
+        e, _ = self.mm_arm("e", self.ref)
+        n, _ = self.mm_arm("n", self.noisy(0.1, 1), control=(30, 2))
+        c, _ = self.mm_arm("c", self.noisy(0.1, 2), fast=(12, 30))
+        o, _ = self.mm_arm("o", self.noisy(0.1, 3), fast=(11, 30), extra="other")
+        w = {k: json.loads((d / "execution-r0.json").read_text(encoding="utf-8")) for k, d in (("e", e), ("n", n), ("c", c), ("o", o))}
+        self.assertEqual((w["e"]["profile"], w["e"]["fast"], w["e"]["control"]), ("exact", None, None))
+        self.assertEqual(w["n"]["control"], {"kind": "attn-ulp-null", "layer": 30, "magnitude": 1, "unit": "ulp", "seed": 2})
+        self.assertEqual(w["c"]["profile"], "fast-prefill")
+        self.assertEqual(w["c"]["fast"], {"policy": "msa-flash", "msa_flash_mode": 12, "layers": list(range(30, 60))})
+        self.assertEqual(w["o"]["fast"]["msa_flash_mode"], 11)
+        # output paths and the control are not numerical configuration; the FAST layer set is only outside the base
+        self.assertEqual(w["e"]["numerical_config_sha256"], w["n"]["numerical_config_sha256"])
+        self.assertNotEqual(w["e"]["numerical_config_sha256"], w["c"]["numerical_config_sha256"])
+        self.assertIsNone(g.config_difference(w["e"]["config"], w["c"]["config"]))
+        self.assertEqual(g.config_difference(w["e"]["config"], w["o"]["config"]), "switch STRIX_X='b' vs 'other'")
+        lev = json.loads(json.dumps(w["c"]["config"]))
+        lev["levers"]["minimax.prefill_identity"] = "fp32"
+        self.assertEqual(g.config_difference(w["e"]["config"], lev), "lever minimax.prefill_identity")
+        self.assertNotIn("STRIX_MM_QUALITY_OUT", w["e"]["config"]["switches"])
+        self.assertEqual(len({x["model_sha256"] for x in w.values()}), 1)
+        r0 = json.loads((c / "manifest-r0.json").read_text(encoding="utf-8"))
+        self.assertEqual(r0["execution"]["prompts"], r0["prompts"])
+        bad = {"no receipt": lambda r: ["mm rank: load"],
+               "two receipts": lambda r: [self.receipt(r), self.receipt(r)],
+               "other rank only": lambda r: [self.receipt(1 - r)],
+               "control at two layers": lambda r: [self.receipt(r), 'DIAG attn ulp: layer 3 seed 1 rows 9 pos0 0 values 1 prompt "p"',
+                                                   'DIAG attn ulp: layer 4 seed 1 rows 9 pos0 0 values 1 prompt "p"'],
+               "bad flash value": lambda r: [self.receipt(r).replace('"effective": "0"', '"effective": "1"')]}
+        for i, (why, log) in enumerate(bad.items()):
+            with self.subTest(why=why):
+                d, rc = self.mm_arm(f"bad{i}", self.ref, log=log)
+                self.assertEqual(rc, [2, 2])
+                self.assertFalse((d / "execution-r0.json").exists() or (d / "manifest-r0.json").exists())
+        model = self.model
+        self.model = self.root / "no-such-model"
+        self.assertEqual(self.mm_arm("nomodel", self.ref)[1], [2, 2])
+        self.model = model
+        header = (self.model / "model-00001-of-00001.safetensors").read_bytes()
+        (self.model / "model-00001-of-00001.safetensors").write_bytes(header.replace(b"F16", b"F32"))
+        changed, _ = self.mm_arm("changed", self.ref)
+        self.assertNotEqual(json.loads((changed / "execution-r0.json").read_text(encoding="utf-8"))["model_sha256"],
+                            w["e"]["model_sha256"])
+
+    def test_model_identity_binds_payload(self):
+        weights = self.model / "model-00001-of-00001.safetensors"
+        before = g.model_bundle_sha256(self.model)
+        payload = weights.read_bytes()
+        weights.write_bytes(payload[:-1] + b"\x01")
+        self.assertNotEqual(before, g.model_bundle_sha256(self.model))
+
+    def test_copy_rows_matches_full_history(self):
+        rng = np.random.default_rng(625)
+        for total in (4, 19, 128):
+            tokens = rng.integers(0, 3, size=total)
+            for rows in (1, min(8, total), total):
+                for k in (1, 3, 8):
+                    expected = []
+                    for p in range(total - rows, total - 1):
+                        earlier = [q for q in range(k - 1, p) if p >= k - 1 and
+                                   np.array_equal(tokens[q - k + 1:q + 1], tokens[p - k + 1:p + 1])]
+                        expected.append(bool(earlier) and tokens[earlier[-1] + 1] == tokens[p + 1])
+                    self.assertEqual(g.copy_rows(tokens, rows, k).tolist(), expected)
+
+    def test_model_identity_binds_large_file_middle(self):
+        large = self.model / "weights.bin"
+        with large.open("wb") as f:
+            f.truncate((64 << 20) + 1)
+        before = g.model_bundle_sha256(self.model)
+        with large.open("r+b") as f:
+            f.seek(32 << 20)
+            f.write(b"\x01")
+        self.assertNotEqual(before, g.model_bundle_sha256(self.model))
+
+    def test_floor_refuses_payload_replacement(self):
+        ref, cand, nulls = self.fixture()
+        weights = self.model / "model-00001-of-00001.safetensors"
+        payload = weights.read_bytes()
+        weights.write_bytes(payload[:-1] + b"\x01")
+        other, rc = self.mm_arm("new-weights", self.ref, fast=(12, 30))
+        self.assertEqual(rc, [0, 0])
+        self.assertEqual(self.cmp(ref, other, nulls), 2)
+
+    def test_floor_refuses_one_sided_switches(self):
+        base = {"levers": {}, "switches": {}}
+        override = {"levers": {}, "switches": {"STRIX_MMX_PREFILL_PIPE_TAIL": "0"}}
+        self.assertIsNotNone(g.config_difference(base, override))
+        self.assertIsNotNone(g.config_difference(override, base))
+        self.assertIsNone(g.config_difference(override, override))
+        ref, cand, nulls = self.fixture()
+        for i, value in enumerate(("0", "1")):
+            def log(rank):
+                line = self.receipt(rank, (12, 30))
+                doc = json.loads(line[len(g.RECEIPT_PREFIX):])
+                doc["switches"]["set"]["STRIX_MMX_PREFILL_PIPE_TAIL"] = value
+                return [g.RECEIPT_PREFIX + json.dumps(doc)]
+            other, rc = self.mm_arm(f"override{i}", self.ref, log=log)
+            self.assertEqual(rc, [0, 0])
+            self.assertEqual(self.cmp(ref, other, nulls), 2)
+
+    def test_control_requires_per_prompt_nonzero_events(self):
+        event = "DIAG attn ulp: layer 30 seed 7 rows 64 pos0 0 values 99"
+        bad = {
+            "unbound": [event, event.replace("pos0 0", "pos0 64")],
+            "only-p": [event + ' prompt "p"', event.replace("pos0 0", "pos0 64") + ' prompt "p"'],
+            "zero-values": [event + ' prompt "p"', event.replace("values 99", "values 0") + ' prompt "q"'],
+            "zero-rows": [event + ' prompt "p"', event.replace("rows 64", "rows 0") + ' prompt "q"'],
+            "out-of-range": [event + ' prompt "p"', event.replace("pos0 0", f"pos0 {MT}") + ' prompt "q"'],
+            "unknown": [event + ' prompt "p"', event + ' prompt "unknown"'],
+        }
+        for name, events in bad.items():
+            with self.subTest(name=name):
+                d, rc = self.mm_arm(name, self.ref, prompts=("p", "q"), log=lambda r: [self.receipt(r), *events])
+                self.assertEqual(rc, [2, 2])
+                self.assertFalse((d / "execution-r0.json").exists())
+        self.assertEqual(self.mm_arm("covered", self.ref, prompts=("p", "q"), control=(30, 7))[1], [0, 0])
+
+    def test_floor_end_to_end(self):
+        ref, cand, nulls = self.fixture()
+        out = self.root / "f.json"
+        rc = self.cmp(ref, cand, nulls, out=out)
+        p = json.loads(out.read_text(encoding="utf-8"))["pooled"]
+        d = p["dnll_rule"]
+        names = [c["name"] for c in d["checks"]]
+        self.assertEqual(names, ["kl", "top1", "dnll", "kl_q50", "kl_q90", "kl_q99", "sign", "copy"])
+        self.assertEqual((d["policy"], d["onset"], d["n_nulls"]), ("minimax-onset-floor-v1.2", 30, 3))
+        for q in d["checks"][3:6]:
+            self.assertEqual(q["limit"], max(q["floor"], q["tol"]))
+        kl = [n["stats"]["kl"] for n in d["nulls"]]
+        c = d["checks"][0]
+        self.assertAlmostEqual(c["floor"], float(np.mean(kl) + 2 * np.std(kl, ddof=1)), places=12)
+        self.assertEqual(c["limit"], max(0.02, c["floor"]))  # the floor only relaxes the absolute bar
+        self.assertEqual(d["limit"], min(max(0.01, d["floor_limit"]), 0.03))
+        self.assertEqual([x["name"] for x in d["checks"] if not x["required"]], ["kl_q99"])
+        self.assertEqual(p["pass"], all(x["pass"] for x in d["checks"] if x["required"]))
+        self.assertEqual(rc, 0 if p["pass"] else 1)
+        self.assertTrue(p["pass"], [x for x in d["checks"] if not x["pass"]])  # a candidate drawn like the nulls passes
+        self.assertEqual(p["abs_pass"], p["kl"] <= 0.02 and p["top1"] >= 0.93 and p["dnll"] <= 0.01)
+
+    def test_floor_never_tighter_than_absolute(self):
+        ref, _ = self.mm_arm("ref", self.ref)
+        nulls = []
+        for i, up in enumerate((0.30, 0.32, 0.34)):  # nulls that all improve the true token: floor limit < 0
+            z = self.ref.copy()
+            z[np.arange(MR - 1), self.labels[:-1]] += up
+            nulls.append(self.mm_arm(f"null{i}", z, control=(40, i + 1))[0])
+        z = self.ref.copy()
+        z[np.arange(MR - 1), self.labels[:-1]] -= 0.02  # slightly worse than exact, far inside the absolute 0.01
+        cand, _ = self.mm_arm("cand", z, fast=(11, 40))
+        out = self.root / "tight.json"
+        self.cmp(ref, cand, nulls, out=out)
+        dn = next(c for c in json.loads(out.read_text(encoding="utf-8"))["pooled"]["dnll_rule"]["checks"] if c["name"] == "dnll")
+        self.assertLess(dn["floor"], 0.0)
+        self.assertEqual(dn["limit"], 0.01)
+        self.assertTrue(dn["pass"], dn)
+
+    def test_onset_seed_and_base_refusals(self):
+        ref, cand, nulls = self.fixture()
+        self.assertIn(self.cmp(ref, cand, nulls), (0, 1))
+        for i in range(3):  # layer-0 nulls cannot judge a 30-59 candidate
+            self.mm_arm(f"l0-{i}", self.noisy(0.3, 300 + i), control=(0, i + 1))
+        self.assertEqual(self.cmp(ref, cand, [self.root / f"l0-{i}" for i in range(3)]), 2)
+        for i, s in enumerate((5, 5, 6)):  # repeated seed
+            self.mm_arm(f"rep-{i}", self.noisy(0.3, 400 + i), control=(30, s))
+        self.assertEqual(self.cmp(ref, cand, [self.root / f"rep-{i}" for i in range(3)]), 2)
+        other, _ = self.mm_arm("other", self.noisy(0.3, 500), fast=(12, 30), extra="changed")  # more than the layer set differs
+        self.assertEqual(self.cmp(ref, other, nulls), 2)
+        self.assertEqual(self.cmp(ref, cand, nulls[:2]), 2)
+        self.assertEqual(self.cmp(cand, cand, nulls), 2)
+        self.assertEqual(run(["compare", str(ref), str(cand), "--ranks", "0", "1", "--tokens", f"p={self.tok}", "--dnll-rule",
+                              "floor", "--engine", "minimax", "--profile", "fast", *sum((["--null-arm", str(n)] for n in nulls), [])]), 2)
+
+    def test_dnll_cap_keeps_a_wide_floor_a_bar(self):
+        ref, rc = self.mm_arm("ref", self.ref)
+        nulls = []
+        for i, dn in enumerate((0.0, 0.08, 0.16)):  # nulls lowering the true token by very different amounts: floor ~ +0.24
+            z = self.ref.copy()
+            z[np.arange(MR - 1), self.labels[:-1]] -= dn * 3
+            nulls.append(self.mm_arm(f"null{i}", z, control=(30, i + 1))[0])
+        z = self.ref.copy()
+        z[np.arange(MR - 1), self.labels[:-1]] -= 0.25
+        cand, _ = self.mm_arm("cand", z, fast=(12, 30))
+        out = self.root / "cap.json"
+        self.assertEqual(self.cmp(ref, cand, nulls, out=out), 1)
+        d = json.loads(out.read_text(encoding="utf-8"))["pooled"]["dnll_rule"]
+        dn = next(c for c in d["checks"] if c["name"] == "dnll")
+        self.assertGreater(dn["floor"], 0.03)
+        self.assertEqual(dn["limit"], 0.03)
+        self.assertLess(dn["value"], dn["floor"])
+        self.assertFalse(dn["pass"])
+
+    def test_sign_and_copy_catch_a_defect_inside_a_wide_floor(self):
+        rows = np.arange(MR - 1)
+        copy = np.nonzero(g.copy_rows(self.tokens, MR))[0]
+        base = self.ref.copy()
+        base[np.arange(MR), self.labels] += 4.0  # confident reference: every labelled row hits the true token
+        nulls_z = []
+        for i in range(3):  # chaotic nulls: large symmetric changes on non-copy rows (3 up, 3 down), copy rows untouched
+            z = base.copy()
+            pick = np.random.default_rng(600 + i).choice(np.setdiff1d(rows, copy), 6, replace=False)
+            z[pick, self.labels[pick]] += np.array([-3.0, 3.0] * 3)
+            nulls_z.append(z)
+        cand = base.copy()
+        cand[copy[:12], self.labels[copy[:12]]] -= 12.0  # a retrieval defect: 12 copy rows lose the true token
+        ref, _ = self.mm_arm("ref", base)
+        nulls = [self.mm_arm(f"null{i}", z, control=(30, i + 1))[0] for i, z in enumerate(nulls_z)]
+        c, _ = self.mm_arm("cand", cand, fast=(11, 30))
+        out = self.root / "defect.json"
+        self.assertEqual(self.cmp(ref, c, nulls, out=out), 1)
+        checks = {x["name"]: x for x in json.loads(out.read_text(encoding="utf-8"))["pooled"]["dnll_rule"]["checks"]}
+        self.assertFalse(checks["sign"]["pass"])
+        self.assertFalse(checks["copy"]["pass"])
+        self.assertEqual((checks["copy"]["value"], checks["copy"]["worst_null"]), (12, 0))
+
+
 if __name__ == "__main__":
     unittest.main()
