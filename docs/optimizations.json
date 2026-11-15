@@ -1865,6 +1865,17 @@
   },
   {
     "engine": "minimax",
+    "name": "Prefill MoE tail rows on the pipelined kernel",
+    "flag_or_env": "STRIX_MMX_PREFILL_PIPE_TAIL",
+    "default": "1",
+    "exact": "Same items, operands, k order and split partials; the partial block (MT 1-7) runs item_pipe with a guarded store. Fixture 12,480 cells memcmp vs item_core_v3; pair logits and both-rank state digests identical at 8K and 32K.",
+    "gain": "PAIR TTFT, valid runs without kfd evictions in the window: 8K 12.68 -> 12.47 s, 32K 51.81 -> 50.91 s.",
+    "preconditions": "MT-fit row plans (the default); class MT8 partial stays on the old kernel.",
+    "off_switch": "STRIX_MMX_PREFILL_PIPE_TAIL=0",
+    "doc_anchor": "docs/optimizations.md#mm-pf-pipe-tail"
+  },
+  {
+    "engine": "minimax",
     "name": "Prefill MoE paired MT8 PIPE bands",
     "flag_or_env": "STRIX_MMX_PREFILL_PIPE_PAIR",
     "default": "auto",

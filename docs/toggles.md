@@ -260,6 +260,7 @@ Follow the link for the gain, preconditions and off switch. Defaults are shorten
 | `STRIX_MMX_PREFILL_MTFIT` | minimax | 1 | [mm-pf-mtfit](optimizations.md#mm-pf-mtfit) |
 | `STRIX_MMX_PREFILL_PIPE` | minimax | 1 | [mm-pf-moe-pipe](optimizations.md#mm-pf-moe-pipe) |
 | `STRIX_MMX_PREFILL_TAIL_STREAM` | minimax | 1 | [mm-pf-tail-stream](optimizations.md#mm-pf-tail-stream) |
+| `STRIX_MMX_PREFILL_PIPE_TAIL` | minimax | 1 | [mm-pf-pipe-tail](optimizations.md#mm-pf-pipe-tail) |
 | `STRIX_MM_PFX` | minimax | on | [mm-rank-pfx](optimizations.md#mm-rank-pfx) |
 | `STRIX_MM_PFX_CHUNK` | minimax | 4194304 | [mm-pfx-chunk](optimizations.md#mm-pfx-chunk) |
 | `STRIX_MM_PFX_JOINED` | minimax | 1 | [mm-pfx-joined](optimizations.md#mm-pfx-joined) |
@@ -273,7 +274,7 @@ Follow the link for the gain, preconditions and off switch. Defaults are shorten
 | `STRIX_MM_PF_KV_TILE` | minimax | auto | [mm-pf-kv-tile](optimizations.md#mm-pf-kv-tile) |
 | `STRIX_MM_PF_LATE_SRC_FENCE` | minimax | ON | [minimax-grouped-prefill.md](minimax-grouped-prefill.md) |
 | `STRIX_MM_PF_MSA_BATCH` | minimax | 1 | [mm-pf-msa-batch](optimizations.md#mm-pf-msa-batch) |
-| `STRIX_MM_FAST_PREFILL=1` | minimax | off | Opt-in. Profile `mm-fast-pf-v1` (governed rows `src/minimax/engine/mm_profile_table.hpp`, shared bundle rules `include/strix/fast_profile.hpp`): `STRIX_MM_PF_MSA_FLASH=1` on layers 40-59 = `msa-flash-bf16-l40-v1`, EXL3 MoE base only (not selected with `STRIX_MMX_MODEL_FORMAT=fast_i4`); a set member wins, `0` beats the bundle. Both ranks must agree; active policies enter the session-cache identity. Changes logits. Not yet qualified on device: no gate or speed figure is published. |
+| `STRIX_MM_FAST_PREFILL=1` | minimax | off | Opt-in. Profile `mm-fast-pf-v1` (governed rows `src/minimax/engine/mm_profile_table.hpp`, shared bundle rules `include/strix/fast_profile.hpp`): `STRIX_MM_PF_MSA_FLASH=1` on layers 40-59 = `msa-flash-bf16-l40-v1`, EXL3 MoE base only (not selected with `STRIX_MMX_MODEL_FORMAT=fast_i4`); a set member wins, `0` beats the bundle. Both ranks must agree; active policies enter the session-cache identity. Changes logits. Device (EXL3 pair, unchanged gate KL <= 0.02, top-1 >= 93 %, dNLL <= 0.01, 256 rows per prompt): 8K PASS (KL 0.0012), 32K PASS (two prompts, KL 0.0029); TTFT with the defaults 8K 12.47 -> 11.92 s, 32K 50.91 -> 48.06 s. `STRIX_MM_PF_MSA_FLASH_LAYERS=30-59` (`msa-flash-bf16-l30-v1`) passes at 8K (KL 0.0076, 11.41 s) but fails at 32K (dNLL +0.012 / +0.016): prompts of at most 8K tokens only, never selected by the bundle. |
 | `STRIX_MM_PF_MSA_FLASH` | minimax | 0 | FAST MSA flash attention (1 one-term, 2 two-term BF16), governed row of the FAST prefill profile; [mm-pf-msa-flash](optimizations.md) |
 | `STRIX_MM_PF_MSA_REWORK` | minimax | 5 | [mm-pf-msa-rework](optimizations.md#mm-pf-msa-rework) |
 | `STRIX_MM_PF_MSA_SCRATCH_MB` | minimax | 1152 | [mm-pf-msa-scratch](optimizations.md#mm-pf-msa-scratch) |

@@ -114,7 +114,7 @@ constexpr Item kItems[] = {
     {"pf_moe_tail_stream", "STRIX_MMX_PREFILL_TAIL_STREAM", "1", "0",
      "Prefill MoE measurement: exact (partials/xt/at/output bitwise), tail classes beside MT8: MoE call -1.9 to -3.0 % real routes"},
     {"pf_moe_pipe_tail", "STRIX_MMX_PREFILL_PIPE_TAIL", "1", "0",
-     "Prefill MoE measurement: bitwise (pipe-tail fixture, state fnv both ranks), tail rows (MT 1..7) on the pipelined kernel: 8K TTFT -411..-544 ms (+4.3 %)"},
+     "Prefill MoE measurement: bitwise (pipe-tail fixture 12,480 cells, logits and state fnv of both ranks identical), tail rows (MT 1..7) on the pipelined kernel: PAIR TTFT 8K 12.68 -> 12.47 s, 32K 51.81 -> 50.91 s"},
     {"pf_gather_tok", "STRIX_MMX_PREFILL_GATHER_TOK", "1", "0",
      "Prefill MoE measurement: exact (tiled xt/at, partials, output bitwise), gather 6.35 -> 4.14 ms per 4096-row call"},
     {"pf_router_rows", "STRIX_MM_PF_ROUTER_ROWS", "32", "8",

@@ -2906,6 +2906,22 @@ Run the small row-tile classes (MT 1-7, each with its own launch and register bu
 - **Measured gain:** MoE call, real weights and routes of one layer, 5 interleaved runs: 4096 rows 49.31 -> 47.81 ms (-3.0 %), 2048 rows -1.9 %, 1024 rows -1.9 %. Two Strix Halo nodes over 2x USB4, in-process A B A B A B A: 1K TTFT -0.1 to -1.1 % (every B faster, two runs), 8K mean -1.6 % (5 of 6 arms faster, one +2.3 % within the 8K noise); 32K fresh process per arm (A B A, B A B): TTFT -0.8 % / -0.3 % against the bracketing arms, MoE GPU time 24.46 -> 24.21 s (mean of 3). Merging the tail classes into one launch instead is slower (+1.5 % at 4096 rows): the merged kernel takes the largest class's registers.
 - **Implementation / evidence:** [kernel](../src/minimax/moe/mmx_prefill.hip), [resolver](../src/minimax/engine/mm_defaults.cpp), [bench tests](../tests/hip_mmx_moe_bench.hip)
 
+<a id="mm-pf-pipe-tail"></a>
+
+### Prefill MoE tail rows on the pipelined kernel
+
+**Engine:** `minimax`. **Control:** `STRIX_MMX_PREFILL_PIPE_TAIL`. **Default:** 1.
+
+The partial last block of an expert (row tiles MT 1-7) runs the pipelined grouped kernel (`item_pipe` with `FullRows = false`: the store is guarded, the loads stay unguarded inside the group's 16-row padding) instead of the scalar tail core. Shared policy `GroupedPrefillPolicy<.., PipeTail>::kPipeTail` (`src/moe_core/grouped_policy.hpp`).
+
+- **Preconditions:** MT-fit row plans (`STRIX_MMX_PREFILL_MTFIT=1`, the default); other plans keep the old tail core. Class MT8 partial stays on the old kernel (that form spills).
+- **Automatic selection:** Resolver supplies 1 only when unset; explicit values win; an even mask (bit = MT) selects classes for diagnosis.
+- **Fallback notice:** None needed: =0 is the former tail core.
+- **Exactness evidence:** Device fixture `strix-hip-mmx-moe-bench --pipe-tail-test` (launch-checked): 12,480 cells memcmp vs item_core_v3 with NaN-padded rows. Pair model: logits identical to the S1-off binary on 768 rows at 8K and 256 rows at 32K; state digests of both ranks equal to the reference.
+- **Measured gain:** PAIR, one process per ticket, valid runs (no kfd eviction inside the TTFT window on either rank): 8K 12.68 -> 12.47 s, 32K 51.81 -> 50.91 s.
+- **Off switch:** STRIX_MMX_PREFILL_PIPE_TAIL=0
+- **Implementation / evidence:** [resolver](../src/minimax/engine/mm_defaults.cpp), [kernel](../src/moe_core/grouped_core.hpp)
+
 <a id="mm-pf-pipe-pair"></a>
 
 ### Prefill MoE paired MT8 PIPE bands
