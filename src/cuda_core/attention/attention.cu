@@ -7,7 +7,8 @@ namespace strix::cuda_core {
 namespace {
 
 __global__ void kv_store_kernel(AttentionDims d, const float* k, const float* v, __nv_bfloat16* kc, __nv_bfloat16* vc,
-                                std::uint32_t pos0) {
+                                const std::uint32_t* pos0p) {
+    const std::uint32_t pos0 = *pos0p;
     const std::uint32_t r = blockIdx.y, h = blockIdx.x;
     const std::size_t src = (static_cast<std::size_t>(r) * d.kv_heads + h) * d.head_dim;
     const std::size_t dst = (static_cast<std::size_t>(h) * d.max_positions + pos0 + r) * d.head_dim;
@@ -20,7 +21,8 @@ __global__ void kv_store_kernel(AttentionDims d, const float* k, const float* v,
 template <int D>
 __global__ void __launch_bounds__(D) attn_kernel(AttentionDims dims, const float* q, GroupedView qv, const float* gate,
                                                   GroupedView gv, const __nv_bfloat16* kc, const __nv_bfloat16* vc,
-                                                  std::uint32_t pos0, float* out, float* scratch) {
+                                                  const std::uint32_t* pos0p, float* out, float* scratch) {
+    const std::uint32_t pos0 = *pos0p;
     constexpr int EPL = D / 32;  // dims per lane
     constexpr int NW = D / 32;
     __shared__ float qs[D];
@@ -81,17 +83,16 @@ __global__ void __launch_bounds__(D) attn_kernel(AttentionDims dims, const float
 }  // namespace
 
 cudaError_t kv_store(const AttentionDims& d, const float* k, const float* v, __nv_bfloat16* k_cache, __nv_bfloat16* v_cache,
-                     std::uint32_t pos0, std::uint32_t rows, cudaStream_t stream) {
-    if (pos0 + rows > d.max_positions || rows == 0) return cudaErrorInvalidValue;
+                     const std::uint32_t* pos0, std::uint32_t rows, cudaStream_t stream) {
+    if (rows == 0) return cudaErrorInvalidValue;
     kv_store_kernel<<<dim3(d.kv_heads, rows), 256, 0, stream>>>(d, k, v, k_cache, v_cache, pos0);
     return cudaGetLastError();
 }
 
 cudaError_t attention_decode(const AttentionDims& d, const float* q, const GroupedView& qv, const float* gate,
                              const GroupedView& gv, const __nv_bfloat16* k_cache, const __nv_bfloat16* v_cache,
-                             std::uint32_t pos0, std::uint32_t rows, float* out, float* scratch, cudaStream_t stream) {
-    if (d.head_dim != 256 || rows == 0 || rows > kMaxRows || d.kv_heads == 0 || d.heads % d.kv_heads != 0 ||
-        pos0 + rows > d.max_positions)
+                             const std::uint32_t* pos0, std::uint32_t rows, float* out, float* scratch, cudaStream_t stream) {
+    if (d.head_dim != 256 || rows == 0 || rows > kMaxRows || d.kv_heads == 0 || d.heads % d.kv_heads != 0)
         return cudaErrorInvalidValue;
     attn_kernel<256><<<dim3(d.heads, rows), 256, 0, stream>>>(d, q, qv, gate, gv, k_cache, v_cache, pos0, out, scratch);
     return cudaGetLastError();

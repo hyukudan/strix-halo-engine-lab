@@ -139,7 +139,8 @@ cudaError_t by_rows(const void* w0, const void* w1, const float* x, float* y, co
     if (rows <= 2) return launch<F, 2, FUSED>(w0, w1, x, y, resid, out, in, rows, s);
     if (rows <= 4) return launch<F, 4, FUSED>(w0, w1, x, y, resid, out, in, rows, s);
     if (rows <= 8) return launch<F, 8, FUSED>(w0, w1, x, y, resid, out, in, rows, s);
-    return launch<F, 16, FUSED>(w0, w1, x, y, resid, out, in, rows, s);
+    if (rows <= 16) return launch<F, 16, FUSED>(w0, w1, x, y, resid, out, in, rows, s);
+    return launch<F, 32, FUSED>(w0, w1, x, y, resid, out, in, rows, s);
 }
 
 bool valid(const DenseWeight& w, std::uint32_t rows) {

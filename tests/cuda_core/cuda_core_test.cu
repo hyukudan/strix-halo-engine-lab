@@ -34,6 +34,7 @@ static double maxrel(const std::vector<float>& a, const std::vector<double>& ref
     for (std::size_t i = 0; i < a.size(); ++i) worst = std::max(worst, std::fabs(a[i] - ref[i]) / scale);
     return worst;
 }
+static std::uint32_t* dpos(std::uint32_t v) { std::uint32_t* p = nullptr; cudaMalloc((void**)&p, 4); cudaMemcpy(p, &v, 4, cudaMemcpyHostToDevice); return p; }
 static std::uint16_t bf16_bits(float f) {
     std::uint32_t u; std::memcpy(&u, &f, 4);
     u += 0x7FFF + ((u >> 16) & 1);
@@ -143,7 +144,7 @@ int test_norms_rope() {
     std::vector<float> q(rr * heads * hd); for (auto& e : q) e = rnd(1.0f);
     auto *dq = dev(q), *dc = dev(ct), *ds = dev(st);
     const cc::GroupedView qv{rr, heads, hd, 0, 0};
-    CK(cc::rope_apply(dq, qv, rd, dc, ds, pos0, nullptr));
+    CK(cc::rope_apply(dq, qv, rd, dc, ds, dpos(pos0), nullptr));
     auto qo = get(dq, q.size());
     std::vector<double> qr(q.size());
     for (std::uint32_t r = 0; r < rr; ++r) for (std::uint32_t h = 0; h < heads; ++h) for (std::uint32_t i = 0; i < hd; ++i) {
@@ -168,15 +169,15 @@ int test_attention() {
     auto *dk = dev(kf), *dv = dev(vf);
     auto *kc = devz<__nv_bfloat16>(2 * 64 * 256), *vc = devz<__nv_bfloat16>(2 * 64 * 256);
     // history stored in one call, then window
-    CK(cc::kv_store(d, dk, dv, kc, vc, 0, 16, nullptr));
-    for (std::uint32_t p = 16; p < pos0; p += 16) CK(cc::kv_store(d, dk + p * 512, dv + p * 512, kc, vc, p, std::min(16u, pos0 - p), nullptr));
-    CK(cc::kv_store(d, dk + pos0 * 512, dv + pos0 * 512, kc, vc, pos0, R, nullptr));
+    CK(cc::kv_store(d, dk, dv, kc, vc, dpos(0), 16, nullptr));
+    for (std::uint32_t p = 16; p < pos0; p += 16) CK(cc::kv_store(d, dk + p * 512, dv + p * 512, kc, vc, dpos(p), std::min(16u, pos0 - p), nullptr));
+    CK(cc::kv_store(d, dk + pos0 * 512, dv + pos0 * 512, kc, vc, dpos(pos0), R, nullptr));
     std::vector<float> q(R * 6 * 256), gt(q.size());
     for (auto& e : q) e = rnd(2.0f);
     for (auto& e : gt) e = rnd(2.0f);
     auto *dq = dev(q), *dgt = dev(gt), *dout = devz<float>(q.size()), *dsc = devz<float>(cc::attention_scratch_floats(d, R)), *dout1 = devz<float>(q.size());
     const cc::GroupedView qv{R, 6, 256, 0, 0};
-    CK(cc::attention_decode(d, dq, qv, dgt, qv, kc, vc, pos0, R, dout, dsc, nullptr));
+    CK(cc::attention_decode(d, dq, qv, dgt, qv, kc, vc, dpos(pos0), R, dout, dsc, nullptr));
     auto o = get(dout, q.size());
     // reference with bf16-rounded K/V
     std::vector<double> ref(q.size());
@@ -196,7 +197,7 @@ int test_attention() {
     }
     CHECK(maxrel(o, ref) < 1e-5, "attention relerr %g", maxrel(o, ref));
     for (std::uint32_t r = 0; r < R; ++r)
-        CK(cc::attention_decode(d, dq + r * 1536, cc::GroupedView{1, 6, 256, 0, 0}, dgt + r * 1536, cc::GroupedView{1, 6, 256, 0, 0}, kc, vc, pos0 + r, 1, dout1 + r * 1536, dsc, nullptr));
+        CK(cc::attention_decode(d, dq + r * 1536, cc::GroupedView{1, 6, 256, 0, 0}, dgt + r * 1536, cc::GroupedView{1, 6, 256, 0, 0}, kc, vc, dpos(pos0 + r), 1, dout1 + r * 1536, dsc, nullptr));
     CHECK(bits_equal(o, get(dout1, q.size())), "attention rows invariance");
     return 0;
 }
@@ -220,13 +221,23 @@ int test_gdn() {
     auto *dcw = dev(convw), *da = dev(a), *ddt = dev(dt), *dng = dev(ng), *dz = dev(z), *dar = dev(ar), *dbr = dev(br);
     cc::GdnLayer L{dcw, da, ddt, dng};
     auto run = [&](std::uint32_t chunk, std::vector<float>& outv, std::vector<float>& sout) {
-        auto *dq = dev(qkv), *dout = devz<float>(R * hv * 128), *dst = dev(s0), *dcs = dev(cs0);
+        std::vector<float> two(2 * s0.size(), 0.0f);
+        std::copy(s0.begin(), s0.end(), two.begin());
+        auto *draw = dev(qkv), *dqc = devz<float>(R * C), *dout = devz<float>(R * hv * 128), *dst = dev(two), *dcs = dev(cs0);
+        auto* dpar = devz<std::uint32_t>(1);
         for (std::uint32_t r = 0; r < R; r += chunk) {
             const std::uint32_t n = std::min(chunk, R - r);
-            if (cc::gdn_decode(d, L, {dcs, dst}, dq + r * C, dz + r * hv * 128, dar + r * hv, dbr + r * hv, dout + r * hv * 128, n, 1e-6f, nullptr) != cudaSuccess) std::printf("gdn launch fail\n");
+            cc::GdnWindow w{draw + r * C, dqc + r * C, dar + r * hv, dbr + r * hv};
+            if (cc::gdn_window(d, L, {dcs, dst}, w, dz + r * hv * 128, dout + r * hv * 128, n, 1e-6f, dpar, nullptr) != cudaSuccess) std::printf("gdn launch fail\n");
+            cc::GdnCommitLayer cl{L, {dcs, dst}, w};
+            if (cc::gdn_commit(d, &cl, 1, n, n, dpar, nullptr) != cudaSuccess) std::printf("gdn commit fail\n");
         }
-        outv = get(dout, R * hv * 128); sout = get(dst, s0.size());
-        cudaFree(dq); cudaFree(dout); cudaFree(dst); cudaFree(dcs);
+        std::uint32_t par = 0;
+        cudaMemcpy(&par, dpar, 4, cudaMemcpyDeviceToHost);
+        outv = get(dout, R * hv * 128);
+        auto all = get(dst, two.size());
+        sout.assign(all.begin() + par * s0.size(), all.begin() + (par + 1) * s0.size());
+        cudaFree(draw); cudaFree(dqc); cudaFree(dout); cudaFree(dst); cudaFree(dcs); cudaFree(dpar);
     };
     std::vector<float> o6, s6, o1, s1, o3, s3;
     run(6, o6, s6); run(1, o1, s1); run(3, o3, s3);

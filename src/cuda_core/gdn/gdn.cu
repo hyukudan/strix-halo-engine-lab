@@ -1,4 +1,5 @@
-// Gated DeltaNet decode: causal depthwise conv (k=4) + SiLU, l2norm q/k, delta rule with sequential rows, gated RMSNorm.
+// Gated DeltaNet decode with deferred commit: causal depthwise conv (k=4) + SiLU, l2norm q/k, delta rule with sequential rows
+// into a shadow state side, gated RMSNorm. See gdn.hpp for the contract.
 #include "strix/cuda_core/gdn.hpp"
 
 #include <cmath>
@@ -8,60 +9,94 @@
 namespace strix::cuda_core {
 namespace {
 
-// One thread per channel; rows sequential. tap order oldest first: ((0 + w0 s0) + w1 s1) + w2 s2) + w3 x.
-__global__ void conv_silu_kernel(const float* __restrict__ w, float* conv_state, float* qkv, std::uint32_t channels,
-                                 std::uint32_t rows) {
-    const std::uint32_t c = blockIdx.x * blockDim.x + threadIdx.x;
-    if (c >= channels) return;
+// 128-thread block sum with the documented 256-thread order (warps 4..7 would hold zeros): butterfly per warp, then 0..3.
+__device__ __forceinline__ float block_sum128(float v, float* smem) {
+    v = warp_sum_xor(v);
+    const int w = threadIdx.x >> 5;
+    if ((threadIdx.x & 31) == 0) smem[w] = v;
+    __syncthreads();
+    float s = __fadd_rn(__fadd_rn(__fadd_rn(smem[0], smem[1]), smem[2]), smem[3]);
+    __syncthreads();
+    return s;
+}
+
+// Block = 128 channels. Blocks [0, qk_blocks) are q/k heads (conv + silu + l2norm); the rest are v channels (conv + silu).
+// tap order oldest first: ((0 + w0 s0) + w1 s1) + w2 s2) + w3 x. The conv state is read-only here.
+__global__ void __launch_bounds__(128) conv_pre_kernel(const float* __restrict__ w, const float* __restrict__ conv_state,
+                                                       const float* __restrict__ raw, float* qc, std::uint32_t channels,
+                                                       std::uint32_t rows, std::uint32_t q_blocks, std::uint32_t qk_blocks,
+                                                       float qscale) {
+    __shared__ float red[4];
+    const std::uint32_t c = blockIdx.x * 128 + threadIdx.x;
     const float w0 = w[c * 4], w1 = w[c * 4 + 1], w2 = w[c * 4 + 2], w3 = w[c * 4 + 3];
     float s0 = conv_state[c * 3], s1 = conv_state[c * 3 + 1], s2 = conv_state[c * 3 + 2];
+    const bool qk = blockIdx.x < qk_blocks;
+    const float scale = blockIdx.x < q_blocks ? qscale : 1.0f;
     for (std::uint32_t r = 0; r < rows; ++r) {
-        float* p = qkv + static_cast<std::size_t>(r) * channels + c;
-        const float x = *p;
+        const float x = raw[static_cast<std::size_t>(r) * channels + c];
         float sum = __fmul_rn(w0, s0);
         sum = __fadd_rn(sum, __fmul_rn(w1, s1));
         sum = __fadd_rn(sum, __fmul_rn(w2, s2));
         sum = __fadd_rn(sum, __fmul_rn(w3, x));
-        *p = cc_silu(sum);
+        float y = cc_silu(sum);
         s0 = s1;
         s1 = s2;
         s2 = x;
+        if (qk) {
+            const float ss = block_sum128(__fmul_rn(y, y), red);  // p = 0 + y*y is exact
+            const float inv = __fdiv_rn(1.0f, __fsqrt_rn(__fadd_rn(ss, 1e-6f)));
+            y = __fmul_rn(__fmul_rn(y, inv), scale);
+        }
+        qc[static_cast<std::size_t>(r) * channels + c] = y;
     }
-    conv_state[c * 3] = s0;
-    conv_state[c * 3 + 1] = s1;
-    conv_state[c * 3 + 2] = s2;
 }
 
-// Block = one warp = 32 value columns of one value head; the warp holds S[:, cols] (128 floats per lane) in registers.
-__global__ void __launch_bounds__(32) delta_kernel(float* state, const float* qkv, const float* a_raw, const float* b_raw,
-                                                   const float* ssm_a, const float* dt_bias, float* o, GdnDims d,
-                                                   std::uint32_t rows) {
+struct DeltaArgs {
+    float* base;         // [2][heads][128][128]
+    const float* qkvc;   // [rows][channels]
+    const float* a_raw;  // [rows][heads]
+    const float* b_raw;
+    const float* ssm_a;
+    const float* dt_bias;
+    const float* gain;  // gated norm (window forward only)
+    const float* z;     // [rows][v_width]
+    float* out;         // [rows][v_width]
+    float* conv;        // commit only
+    const float* raw;   // commit only
+};
+struct CommitBatch {
+    DeltaArgs a[kMaxGdnLayers];
+};
+
+template <bool OUT>
+__device__ __forceinline__ void delta_body(const DeltaArgs& a, const GdnDims& d, std::uint32_t rows, std::uint32_t parity,
+                                           std::uint32_t h, float eps) {
     constexpr int K = 128;
     __shared__ float ks[K], qs[K];
-    const std::uint32_t h = blockIdx.y, tile = blockIdx.x, lane = threadIdx.x;
+    __shared__ float red[4];
+    const std::uint32_t t = threadIdx.x;
     const std::uint32_t kh = h % d.key_heads;
-    const std::uint32_t col = tile * 32 + lane;
     const std::uint32_t channels = d.conv_channels();
-    float* sp = state + static_cast<std::size_t>(h) * K * d.value_dim + col;
+    const std::size_t side = static_cast<std::size_t>(d.value_heads) * K * d.value_dim;
+    const float* sp = a.base + parity * side + static_cast<std::size_t>(h) * K * d.value_dim + t;
+    float* dp = a.base + (1 - parity) * side + static_cast<std::size_t>(h) * K * d.value_dim + t;
     float S[K];
 #pragma unroll
     for (int k = 0; k < K; ++k) S[k] = sp[static_cast<std::size_t>(k) * d.value_dim];
+    const float dtb = a.dt_bias[h], sa = a.ssm_a[h];
     for (std::uint32_t r = 0; r < rows; ++r) {
-        const float* row = qkv + static_cast<std::size_t>(r) * channels;
-#pragma unroll
-        for (int i = 0; i < K / 32; ++i) {
-            qs[lane + 32 * i] = row[kh * K + lane + 32 * i];
-            ks[lane + 32 * i] = row[d.qk_width() + kh * K + lane + 32 * i];
-        }
-        __syncwarp();
-        const float braw = b_raw[static_cast<std::size_t>(r) * d.value_heads + h];
-        const float araw = a_raw[static_cast<std::size_t>(r) * d.value_heads + h];
+        const float* row = a.qkvc + static_cast<std::size_t>(r) * channels;
+        ks[t] = row[d.qk_width() + kh * K + t];
+        if constexpr (OUT) qs[t] = row[kh * K + t];
+        const float braw = a.b_raw[static_cast<std::size_t>(r) * d.value_heads + h];
+        const float araw = a.a_raw[static_cast<std::size_t>(r) * d.value_heads + h];
         const float beta = cc_sigmoid(braw);
-        const float xin = __fadd_rn(araw, dt_bias[h]);
+        const float xin = __fadd_rn(araw, dtb);
         const float sp_ = xin > 20.0f ? xin : cc_log1pf(cc_expf(xin));
-        const float g = __fmul_rn(ssm_a[h], sp_);
+        const float g = __fmul_rn(sa, sp_);
         const float decay = cc_expf(g);
-        const float vcol = row[2 * d.qk_width() + h * d.value_dim + col];
+        const float vcol = row[2 * d.qk_width() + h * d.value_dim + t];
+        __syncthreads();
         float kv = 0.0f;
 #pragma unroll
         for (int k = 0; k < K; ++k) {
@@ -70,36 +105,90 @@ __global__ void __launch_bounds__(32) delta_kernel(float* state, const float* qk
         }
         const float dl = __fmul_rn(__fsub_rn(vcol, kv), beta);
         float acc = 0.0f;
+        if constexpr (OUT) {
 #pragma unroll
-        for (int k = 0; k < K; ++k) {
-            S[k] = __fadd_rn(S[k], __fmul_rn(ks[k], dl));
-            acc = __fadd_rn(acc, __fmul_rn(S[k], qs[k]));
+            for (int k = 0; k < K; ++k) {
+                S[k] = __fadd_rn(S[k], __fmul_rn(ks[k], dl));
+                acc = __fadd_rn(acc, __fmul_rn(S[k], qs[k]));
+            }
+            const float ss = block_sum128(__fmul_rn(acc, acc), red);
+            const float inv = __fdiv_rn(1.0f, __fsqrt_rn(__fadd_rn(__fdiv_rn(ss, 128.0f), eps)));
+            float v = __fmul_rn(acc, inv);
+            v = __fmul_rn(v, a.gain[t]);
+            v = __fmul_rn(v, cc_silu(a.z[static_cast<std::size_t>(r) * d.v_width() + h * d.value_dim + t]));
+            a.out[static_cast<std::size_t>(r) * d.v_width() + h * d.value_dim + t] = v;
+        } else {
+#pragma unroll
+            for (int k = 0; k < K; ++k) S[k] = __fadd_rn(S[k], __fmul_rn(ks[k], dl));
         }
-        o[(static_cast<std::size_t>(r) * d.value_heads + h) * d.value_dim + col] = acc;
-        __syncwarp();
+        __syncthreads();
     }
 #pragma unroll
-    for (int k = 0; k < K; ++k) sp[static_cast<std::size_t>(k) * d.value_dim] = S[k];
+    for (int k = 0; k < K; ++k) dp[static_cast<std::size_t>(k) * d.value_dim] = S[k];
 }
+
+__global__ void __launch_bounds__(128) delta_window_kernel(DeltaArgs a, GdnDims d, std::uint32_t rows,
+                                                           const std::uint32_t* parity, float eps) {
+    delta_body<true>(a, d, rows, *parity, blockIdx.x, eps);
+}
+
+__global__ void __launch_bounds__(128) delta_apply_kernel(CommitBatch b, GdnDims d, std::uint32_t rows,
+                                                          const std::uint32_t* parity) {
+    delta_body<false>(b.a[blockIdx.y], d, rows, *parity, blockIdx.x, 0.0f);
+}
+
+// conv state after accepting the first k raw rows: the last three of (s0, s1, s2, raw_0 .. raw_{k-1}).
+__global__ void __launch_bounds__(128) conv_commit_kernel(CommitBatch b, std::uint32_t channels, std::uint32_t k) {
+    const DeltaArgs& a = b.a[blockIdx.y];
+    const std::uint32_t c = blockIdx.x * 128 + threadIdx.x;
+    const float s[3] = {a.conv[c * 3], a.conv[c * 3 + 1], a.conv[c * 3 + 2]};
+    float n[3];
+    for (int i = 0; i < 3; ++i) {
+        const int idx = static_cast<int>(k) - 3 + i;  // index into raw rows; negative = old state
+        n[i] = idx >= 0 ? a.raw[static_cast<std::size_t>(idx) * channels + c] : s[idx + 3];
+    }
+    a.conv[c * 3] = n[0];
+    a.conv[c * 3 + 1] = n[1];
+    a.conv[c * 3 + 2] = n[2];
+}
+
+__global__ void flip_kernel(std::uint32_t* p) { *p ^= 1u; }
 
 }  // namespace
 
-cudaError_t gdn_decode(const GdnDims& d, const GdnLayer& layer, const GdnState& state, float* qkv, const float* z,
-                       const float* a_raw, const float* b_raw, float* out, std::uint32_t rows, float eps,
-                       cudaStream_t stream) {
+cudaError_t gdn_window(const GdnDims& d, const GdnLayer& layer, const GdnState& state, const GdnWindow& win, const float* z,
+                       float* out, std::uint32_t rows, float eps, const std::uint32_t* parity_dev, cudaStream_t stream) {
     if (d.key_dim != 128 || d.value_dim != 128 || d.conv_kernel != 4 || rows == 0 || rows > kMaxRows) return cudaErrorInvalidValue;
     const std::uint32_t C = d.conv_channels();
-    conv_silu_kernel<<<(C + 127) / 128, 128, 0, stream>>>(layer.conv_w, state.conv, qkv, C, rows);
-    if (auto e = cudaGetLastError(); e != cudaSuccess) return e;
-    GroupedView qk{rows, d.key_heads, d.key_dim, C, d.key_dim};
     const float qscale = static_cast<float>(1.0 / std::sqrt(static_cast<double>(d.key_dim)));
-    if (auto e = l2norm(qkv, qk, qkv, qk, 1e-6f, qscale, stream); e != cudaSuccess) return e;
-    if (auto e = l2norm(qkv + d.qk_width(), qk, qkv + d.qk_width(), qk, 1e-6f, 1.0f, stream); e != cudaSuccess) return e;
-    delta_kernel<<<dim3(d.value_dim / 32, d.value_heads), 32, 0, stream>>>(state.delta, qkv, a_raw, b_raw, layer.ssm_a,
-                                                                           layer.dt_bias, out, d, rows);
+    conv_pre_kernel<<<C / 128, 128, 0, stream>>>(layer.conv_w, state.conv, win.raw, win.qkv_c, C, rows, d.key_heads,
+                                                 2 * d.key_heads, qscale);
     if (auto e = cudaGetLastError(); e != cudaSuccess) return e;
-    GroupedView ov{rows, d.value_heads, d.value_dim, 0, 0};
-    return gated_rmsnorm(out, ov, layer.norm_gain, z, ov, GateKind::swish, out, ov, eps, stream);
+    DeltaArgs a{state.delta_base, win.qkv_c, win.a_raw, win.b_raw, layer.ssm_a, layer.dt_bias, layer.norm_gain, z, out,
+                nullptr, nullptr};
+    delta_window_kernel<<<d.value_heads, 128, 0, stream>>>(a, d, rows, parity_dev, eps);
+    return cudaGetLastError();
+}
+
+cudaError_t gdn_commit(const GdnDims& d, const GdnCommitLayer* layers, std::uint32_t n, std::uint32_t window_rows,
+                       std::uint32_t k, std::uint32_t* parity_dev, cudaStream_t stream) {
+    if (n == 0 || n > kMaxGdnLayers || k > window_rows) return cudaErrorInvalidValue;
+    if (k == 0) return cudaSuccess;
+    CommitBatch b{};
+    for (std::uint32_t i = 0; i < n; ++i) {
+        const auto& L = layers[i];
+        b.a[i] = DeltaArgs{L.state.delta_base, L.win.qkv_c, L.win.a_raw, L.win.b_raw, L.layer.ssm_a, L.layer.dt_bias,
+                           nullptr, nullptr, nullptr, L.state.conv, L.win.raw};
+    }
+    const std::uint32_t C = d.conv_channels();
+    if (k < window_rows) {
+        delta_apply_kernel<<<dim3(d.value_heads, n), 128, 0, stream>>>(b, d, k, parity_dev);
+        if (auto e = cudaGetLastError(); e != cudaSuccess) return e;
+    }
+    conv_commit_kernel<<<dim3(C / 128, n), 128, 0, stream>>>(b, C, k);
+    if (auto e = cudaGetLastError(); e != cudaSuccess) return e;
+    flip_kernel<<<1, 1, 0, stream>>>(parity_dev);
+    return cudaGetLastError();
 }
 
 }  // namespace strix::cuda_core

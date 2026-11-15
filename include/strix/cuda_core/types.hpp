@@ -34,6 +34,6 @@ struct GroupedView {
     [[nodiscard]] __host__ __device__ std::uint32_t gs() const noexcept { return group_stride ? group_stride : n; }
 };
 
-constexpr std::uint32_t kMaxRows = 16;  // verify window
+constexpr std::uint32_t kMaxRows = 32;  // verify window
 
 }  // namespace strix::cuda_core
