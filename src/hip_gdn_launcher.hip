@@ -1515,6 +1515,13 @@ void recurrent_step_kernel(
     __shared__ float deltas[kValueTile];
 
     float retained[kValueTile];
+    // 16-bit contracts: the thread's 32 contiguous elements load as packed 16-byte runs (one access per 8).
+    float packed_run[S == RecurrentStateType::f32 ? 1U : kValueTile];
+    if constexpr (S != RecurrentStateType::f32)
+        rstate::load_run<S, kValueTile>(state + (static_cast<std::uint64_t>(value_head) * head_dim + lane) * head_dim + value_base,
+            packed_run);
+    else
+        (void)packed_run;
 #pragma unroll
     for (std::uint32_t column = 0;
          column < kValueTile;
@@ -1529,8 +1536,11 @@ void recurrent_step_kernel(
              lane) *
                 head_dim +
             value_index;
+        float stored;
+        if constexpr (S == RecurrentStateType::f32) stored = state[state_index];
+        else stored = packed_run[column];
         retained[column] =
-            rstate::Codec<S>::load(state[state_index]) *
+            stored *
             expf(
                 gate[value_head]);
         reduction[
@@ -1663,9 +1673,14 @@ void recurrent_step_kernel(
              lane) *
                 head_dim +
             value_index;
-        state[state_index] =
-            rstate::Codec<S>::store(retained[column]);
+        if constexpr (S == RecurrentStateType::f32)
+            state[state_index] = retained[column];
+        else
+            (void)state_index;
     }
+    if constexpr (S != RecurrentStateType::f32)
+        rstate::store_run<S, kValueTile>(state + (static_cast<std::uint64_t>(value_head) * head_dim + lane) * head_dim + value_base,
+            retained);
 }
 
 #ifdef STRIX_BUILD_KNOWN_WINDOW_DIAGNOSTIC
@@ -2528,7 +2543,7 @@ __device__ __forceinline__ void gdn_window_round_state(float (&retained)[4][Colu
         for (std::uint32_t part = 0; part < 4U; ++part)
 #pragma unroll
             for (std::uint32_t column = 0; column < Columns; ++column)
-                retained[part][column] = rstate::Codec<S>::load(rstate::Codec<S>::store(retained[part][column]));
+                retained[part][column] = rstate::round_in_register<S>(retained[part][column]);
     }
 }
 template <unsigned Rows, GdnRecurrentStorage Storage, std::uint32_t Columns = kGdnWindowColumns, bool Scatter = false,
@@ -2576,12 +2591,21 @@ __device__ __forceinline__ void gdn_window_recurrence(const GdnWindowRows<Rows ?
         for (unsigned row = 0; row < Rows; ++row) window[row] = window_inputs(row);
     }
     float retained[4][Columns];
+    // 16-bit key-value runs (Columns contiguous elements per key row) move packed: one access per row run.
+    constexpr bool packed = S != RecurrentStateType::f32 && Storage == GdnRecurrentStorage::key_value;
+    if constexpr (packed) {
+#pragma unroll
+        for (std::uint32_t part = 0; part < 4U; ++part)
+            rstate::load_run<S, Columns>(state + gdn_window_state_index<Storage>(value_head, part * 32U + lane, value_base, head_dim),
+                retained[part]);
+    } else {
 #pragma unroll
     for (std::uint32_t part = 0; part < 4U; ++part)
 #pragma unroll
         for (std::uint32_t column = 0; column < Columns; ++column)
             retained[part][column] = rstate::Codec<S>::load(
                 state[gdn_window_state_index<Storage>(value_head, part * 32U + lane, value_base + column, head_dim)]);
+    }
     const auto pending = gdn_window_pending(control), slot = control->pending_slot & 1U;
     if (pending) {
         auto next = pending_inputs(slot, 0U);
@@ -2591,12 +2615,19 @@ __device__ __forceinline__ void gdn_window_recurrence(const GdnWindowRows<Rows ?
             gdn_window_step<false, Columns, Scatter>(retained, in, nullptr);
             gdn_window_round_state<S, Columns>(retained);
         }
+        if constexpr (packed) {
+#pragma unroll
+            for (std::uint32_t part = 0; part < 4U; ++part)
+                rstate::store_run<S, Columns>(
+                    state + gdn_window_state_index<Storage>(value_head, part * 32U + lane, value_base, head_dim), retained[part]);
+        } else {
 #pragma unroll
         for (std::uint32_t part = 0; part < 4U; ++part)
 #pragma unroll
             for (std::uint32_t column = 0; column < Columns; ++column)
                 state[gdn_window_state_index<Storage>(value_head, part * 32U + lane, value_base + column, head_dim)] =
                     rstate::Codec<S>::store(retained[part][column]);
+        }
     }
     if constexpr (Rows != 0U) {
         if constexpr (Scatter) {

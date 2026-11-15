@@ -123,6 +123,56 @@ template <RecurrentStateType Type> struct View {
 template <RecurrentStateType Type> STRIX_RS_FN View<Type> view(void* base) {
     return View<Type>{static_cast<typename Codec<Type>::Elem*>(base)};
 }
+// Contiguous run access for the 16-bit contracts: N consecutive elements (N = 2, 4 or a multiple of 8, base aligned to
+// 2N bytes, at most 16) move as ONE 4 / 8 / 16-byte access per group instead of N two-byte accesses. Scalar 2-byte
+// stores of lane-strided runs write partial sectors and ran the window commit at ~27 GB/s (hal2 RUN2); the packed form
+// writes whole 16-byte segments like the f32 kernels' dwordx4. Same values and bits as N scalar load / store calls.
+template <unsigned Words> struct alignas(Words * 4U) Pack { std::uint32_t w[Words]; };
+template <RecurrentStateType Type, unsigned N>
+STRIX_RS_FN void load_run(const std::uint16_t* src, float (&out)[N]) {
+    static_assert(Type != RecurrentStateType::f32, "f32 kernels keep their incumbent scalar access");
+    static_assert(N == 2U || N == 4U || N % 8U == 0U, "run of 2, 4 or 8k elements");
+    constexpr unsigned group = N < 8U ? N : 8U, words = group / 2U;
+#pragma unroll
+    for (unsigned g = 0; g < N / group; ++g) {
+        const auto p = reinterpret_cast<const Pack<words>*>(src)[g];
+#pragma unroll
+        for (unsigned i = 0; i < words; ++i) {
+            out[g * group + 2U * i] = Codec<Type>::load(static_cast<std::uint16_t>(p.w[i] & 0xffffU));
+            out[g * group + 2U * i + 1U] = Codec<Type>::load(static_cast<std::uint16_t>(p.w[i] >> 16));
+        }
+    }
+}
+template <RecurrentStateType Type, unsigned N>
+STRIX_RS_FN void store_run(std::uint16_t* dst, const float (&in)[N]) {
+    static_assert(Type != RecurrentStateType::f32, "f32 kernels keep their incumbent scalar access");
+    static_assert(N == 2U || N == 4U || N % 8U == 0U, "run of 2, 4 or 8k elements");
+    constexpr unsigned group = N < 8U ? N : 8U, words = group / 2U;
+#pragma unroll
+    for (unsigned g = 0; g < N / group; ++g) {
+        Pack<words> p;
+#pragma unroll
+        for (unsigned i = 0; i < words; ++i)
+            p.w[i] = static_cast<std::uint32_t>(Codec<Type>::store(in[g * group + 2U * i])) |
+                (static_cast<std::uint32_t>(Codec<Type>::store(in[g * group + 2U * i + 1U])) << 16);
+        reinterpret_cast<Pack<words>*>(dst)[g] = p;
+    }
+}
+// In-register round trip (the value the next row would load after a store), without the NaN canonicalisation:
+// only STORED bits are canonical; a NaN in registers stays a NaN and is canonicalised when it is stored.
+template <RecurrentStateType Type> STRIX_RS_FN float round_in_register(float value) {
+    if constexpr (Type == RecurrentStateType::bf16) return f32_from_bf16(bf16_from_f32(value));
+    else if constexpr (Type == RecurrentStateType::f16) {
+#if defined(__HIP_DEVICE_COMPILE__)
+        return static_cast<float>(static_cast<_Float16>(value));
+#elif defined(__CUDA_ARCH__)
+        return __half2float(__float2half_rn(value));
+#else
+        return f32_from_f16_host(f16_from_f32_host(value));
+#endif
+    } else return value;
+}
+
 // Host round trip (reference arms, quality oracles): the float the state holds after one store.
 STRIX_RS_FN float round_trip(RecurrentStateType type, float value) {
     return type == RecurrentStateType::f16 ? f32_from_f16_host(f16_from_f32_host(value)) :
