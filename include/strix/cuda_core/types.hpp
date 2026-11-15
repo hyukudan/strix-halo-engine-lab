@@ -34,6 +34,9 @@ struct GroupedView {
     [[nodiscard]] __host__ __device__ std::uint32_t gs() const noexcept { return group_stride ? group_stride : n; }
 };
 
+// Programmatic dependent launch between consecutive kernels (default on); takes effect for graphs captured afterwards.
+void set_programmatic_launch(bool on);
+
 constexpr std::uint32_t kMaxRows = 32;  // verify window
 
 }  // namespace strix::cuda_core

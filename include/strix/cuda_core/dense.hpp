@@ -13,6 +13,16 @@ namespace strix::cuda_core {
 cudaError_t dense_rows(const DenseWeight& w, const float* x, float* y, std::uint32_t rows, const float* residual,
                        cudaStream_t stream);
 
+// Up to 4 weights with the same x, format and in served by ONE launch (ys[j] gets weights[j]'s output); bitwise equal to separate
+// dense_rows calls (the per-output-row order does not depend on the launch composition). No residual.
+cudaError_t dense_rows_multi(const DenseWeight* ws, float* const* ys, int n, const float* x, std::uint32_t rows,
+                             const float* residual, cudaStream_t stream);
+
+// Up to 4 weights with the same x, format and in served by ONE launch (ys[j] receives output j); bitwise equal to separate
+// dense_rows calls (the per-output-row order does not depend on the launch composition). No residual.
+cudaError_t dense_rows_multi(const DenseWeight* ws, float* const* ys, int n, const float* x, std::uint32_t rows,
+                             const float* residual, cudaStream_t stream);
+
 // y[r][o] = silu(gate_dot) * up_dot with silu(g) = g / (1 + expf(-g)); bitwise equal to two dense_rows calls followed by the
 // same epilogue. gate and up must share format/in/out.
 cudaError_t dense_gate_up_silu_rows(const DenseWeight& gate, const DenseWeight& up, const float* x, float* y,
@@ -22,8 +32,9 @@ cudaError_t dense_gate_up_silu_rows(const DenseWeight& gate, const DenseWeight& 
 cudaError_t embedding_rows(const DenseWeight& table, const std::uint32_t* ids, float* out, std::uint32_t rows,
                            cudaStream_t stream);
 
-// out[i] = argmax of logits[i] ... lowest index wins ties. One block; v0 helper for greedy.
-cudaError_t argmax_rows(const float* logits, std::uint32_t vocab, std::uint32_t rows, std::uint32_t* out,
+// out[r] = argmax of logits row r (lowest index wins ties). workspace: kArgmaxWorkspaceBytes of device memory.
+constexpr std::size_t kArgmaxWorkspaceBytes = 32 * 128 * 8;
+cudaError_t argmax_rows(const float* logits, std::uint32_t vocab, std::uint32_t rows, std::uint32_t* out, void* workspace,
                         cudaStream_t stream);
 
 }  // namespace strix::cuda_core

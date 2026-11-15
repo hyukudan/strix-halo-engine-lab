@@ -8,6 +8,33 @@
 
 namespace strix::cuda_core {
 
+// Programmatic dependent launch (PDL). A kernel launched with launch_pdl may START before its predecessor in the stream/graph has
+// finished (once every predecessor block has called pdl_trigger or exited); it MUST call pdl_wait() before reading anything the
+// predecessor wrote or writing anything the predecessor reads. Work before pdl_wait may only touch constant data (weights, committed
+// state that nothing in the same graph writes). pdl_wait returns after the predecessor grid completed and its writes are visible.
+__device__ __forceinline__ void pdl_trigger() { asm volatile("griddepcontrol.launch_dependents;" ::: "memory"); }
+__device__ __forceinline__ void pdl_wait() { asm volatile("griddepcontrol.wait;" ::: "memory"); }
+
+inline bool& pdl_enabled() {
+    static bool on = true;
+    return on;
+}
+
+template <class... KArgs, class... Args>
+cudaError_t launch_pdl(void (*kernel)(KArgs...), dim3 grid, dim3 block, cudaStream_t stream, Args... args) {
+    cudaLaunchConfig_t cfg{};
+    cfg.gridDim = grid;
+    cfg.blockDim = block;
+    cfg.dynamicSmemBytes = 0;
+    cfg.stream = stream;
+    cudaLaunchAttribute at[1];
+    at[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+    at[0].val.programmaticStreamSerializationAllowed = 1;
+    cfg.attrs = at;
+    cfg.numAttrs = pdl_enabled() ? 1 : 0;
+    return cudaLaunchKernelEx(&cfg, kernel, static_cast<KArgs>(args)...);
+}
+
 // Single points for transcendentals (a HIP twin swaps these for its own bit-matched versions).
 __device__ __forceinline__ float cc_expf(float x) { return expf(x); }
 __device__ __forceinline__ float cc_log1pf(float x) { return log1pf(x); }

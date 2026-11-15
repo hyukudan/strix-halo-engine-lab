@@ -98,49 +98,92 @@ __device__ __forceinline__ void dot_any(const void* w, std::uint32_t o, const fl
     }
 }
 
+// Up to four weights sharing x (and format/in) are served by ONE launch: warp g of the grid owns global output row g, mapped to
+// (weight j, row o). The per-row arithmetic does not depend on the mapping.
+constexpr int kMaxMulti = 4;
+constexpr int kWarpsPerBlock = 8;  // 128-thread blocks: finer grid -> less wave-quantisation tail on 188 SMs
+struct MultiArgs {
+    const void* w[kMaxMulti];
+    float* y[kMaxMulti];
+    std::uint32_t out[kMaxMulti];
+    std::uint32_t row_end[kMaxMulti];  // cumulative rows
+    int n;
+};
+
+// L2 prefetch of the first 4 KiB of this warp's weight row while the predecessor kernel is still running (weights do not depend on it).
+template <WeightFormat F>
+__device__ __forceinline__ void prefetch_row(const void* w, std::uint32_t o, std::uint32_t in, int lane) {
+    const std::size_t row_bytes = F == WeightFormat::bf16 ? static_cast<std::size_t>(in) * 2
+                                  : F == WeightFormat::f32 ? static_cast<std::size_t>(in) * 4
+                                                           : static_cast<std::size_t>(in >> 5) * 34;
+    const char* p = static_cast<const char*>(w) + static_cast<std::size_t>(o) * row_bytes + static_cast<std::size_t>(lane) * 128;
+    if (static_cast<std::size_t>(lane) * 128 < row_bytes) asm volatile("prefetch.global.L2 [%0];" ::"l"(p));
+}
+
 template <WeightFormat F, int R, bool FUSED>
-__global__ void __launch_bounds__(256) dense_kernel(const void* w0, const void* w1, const float* x, float* y,
-                                                    const float* resid, std::uint32_t out, std::uint32_t in,
-                                                    std::uint32_t rows) {
-    const std::uint32_t o = blockIdx.x * 8 + (threadIdx.x >> 5);
-    if (o >= out) return;
+__global__ void __launch_bounds__(kWarpsPerBlock * 32)
+    dense_kernel(MultiArgs ma, const void* w1, const float* x, const float* resid, std::uint32_t in, std::uint32_t rows) {
+    pdl_trigger();
+    const std::uint32_t g = blockIdx.x * kWarpsPerBlock + (threadIdx.x >> 5);
+    if (g >= ma.row_end[kMaxMulti - 1]) {
+        pdl_wait();
+        return;
+    }  // row_end is padded with the total
+    // compile-time unrolled selection: no dynamic indexing of the kernel parameter array (would force a local-memory copy)
+    const void* wsel = ma.w[0];
+    float* y = ma.y[0];
+    std::uint32_t start = 0, out = ma.out[0];
+#pragma unroll
+    for (int jj = 0; jj < kMaxMulti - 1; ++jj) {
+        if (g >= ma.row_end[jj]) {
+            start = ma.row_end[jj];
+            wsel = ma.w[jj + 1];
+            y = ma.y[jj + 1];
+            out = ma.out[jj + 1];
+        }
+    }
+    const std::uint32_t o = g - start;
+    const int lane0 = threadIdx.x & 31;
+    prefetch_row<F>(wsel, o, in, lane0);
+    if constexpr (FUSED) prefetch_row<F>(w1, o, in, lane0);
+    pdl_wait();
     const int lane = threadIdx.x & 31;
     float a0[R], a1[R];
 #pragma unroll
     for (int r = 0; r < R; ++r) a0[r] = a1[r] = 0.0f;
-    dot_any<F, R>(w0, o, x, in, rows, lane, a0);
+    dot_any<F, R>(wsel, o, x, in, rows, lane, a0);
     if constexpr (FUSED) dot_any<F, R>(w1, o, x, in, rows, lane, a1);
 #pragma unroll
     for (int r = 0; r < R; ++r) {
-        const float g = warp_sum_xor(a0[r]);
-        float v = g;
+        const float gsum = warp_sum_xor(a0[r]);
+        float v = gsum;
         if constexpr (FUSED) {
             const float u = warp_sum_xor(a1[r]);
-            v = __fmul_rn(cc_silu(g), u);
+            v = __fmul_rn(cc_silu(gsum), u);
         } else if (resid != nullptr) {
             const std::size_t idx = static_cast<std::size_t>(r) * out + o;
-            if (static_cast<std::uint32_t>(r) < rows) v = __fadd_rn(resid[idx], g);
+            if (static_cast<std::uint32_t>(r) < rows) v = __fadd_rn(resid[idx], gsum);
         }
         if (lane == 0 && static_cast<std::uint32_t>(r) < rows) y[static_cast<std::size_t>(r) * out + o] = v;
     }
 }
 
 template <WeightFormat F, int R, bool FUSED>
-cudaError_t launch(const void* w0, const void* w1, const float* x, float* y, const float* resid, std::uint32_t out,
-                   std::uint32_t in, std::uint32_t rows, cudaStream_t s) {
-    dense_kernel<F, R, FUSED><<<(out + 7) / 8, 256, 0, s>>>(w0, w1, x, y, resid, out, in, rows);
-    return cudaGetLastError();
+cudaError_t launch(const MultiArgs& ma, const void* w1, const float* x, const float* resid, std::uint32_t in, std::uint32_t rows,
+                   cudaStream_t s) {
+    const std::uint32_t total = ma.row_end[ma.n - 1];
+    return launch_pdl(dense_kernel<F, R, FUSED>, dim3((total + kWarpsPerBlock - 1) / kWarpsPerBlock), dim3(kWarpsPerBlock * 32), s, ma, w1, x, resid, in, rows);
 }
 
 template <WeightFormat F, bool FUSED>
-cudaError_t by_rows(const void* w0, const void* w1, const float* x, float* y, const float* resid, std::uint32_t out,
-                    std::uint32_t in, std::uint32_t rows, cudaStream_t s) {
-    if (rows <= 1) return launch<F, 1, FUSED>(w0, w1, x, y, resid, out, in, rows, s);
-    if (rows <= 2) return launch<F, 2, FUSED>(w0, w1, x, y, resid, out, in, rows, s);
-    if (rows <= 4) return launch<F, 4, FUSED>(w0, w1, x, y, resid, out, in, rows, s);
-    if (rows <= 8) return launch<F, 8, FUSED>(w0, w1, x, y, resid, out, in, rows, s);
-    if (rows <= 16) return launch<F, 16, FUSED>(w0, w1, x, y, resid, out, in, rows, s);
-    return launch<F, 32, FUSED>(w0, w1, x, y, resid, out, in, rows, s);
+cudaError_t by_rows(const MultiArgs& ma, const void* w1, const float* x, const float* resid, std::uint32_t in, std::uint32_t rows,
+                    cudaStream_t s) {
+    if (rows <= 1) return launch<F, 1, FUSED>(ma, w1, x, resid, in, rows, s);
+    if (rows <= 2) return launch<F, 2, FUSED>(ma, w1, x, resid, in, rows, s);
+    if (rows <= 4) return launch<F, 4, FUSED>(ma, w1, x, resid, in, rows, s);
+    if (rows <= 8) return launch<F, 8, FUSED>(ma, w1, x, resid, in, rows, s);
+    if (rows <= 16) return launch<F, 16, FUSED>(ma, w1, x, resid, in, rows, s);
+    return launch<F, 32, FUSED>(ma, w1, x, resid, in, rows, s);
 }
 
 bool valid(const DenseWeight& w, std::uint32_t rows) {
@@ -149,19 +192,20 @@ bool valid(const DenseWeight& w, std::uint32_t rows) {
 }
 
 template <bool FUSED>
-cudaError_t dispatch(const DenseWeight& a, const DenseWeight* b, const float* x, float* y, const float* resid,
+cudaError_t dispatch(const MultiArgs& ma, const DenseWeight& a, const void* w1, const float* x, const float* resid,
                      std::uint32_t rows, cudaStream_t s) {
-    const void* w1 = b ? b->data : nullptr;
     switch (a.format) {
-        case WeightFormat::bf16: return by_rows<WeightFormat::bf16, FUSED>(a.data, w1, x, y, resid, a.out, a.in, rows, s);
-        case WeightFormat::q8_0: return by_rows<WeightFormat::q8_0, FUSED>(a.data, w1, x, y, resid, a.out, a.in, rows, s);
-        case WeightFormat::f32: return by_rows<WeightFormat::f32, FUSED>(a.data, w1, x, y, resid, a.out, a.in, rows, s);
+        case WeightFormat::bf16: return by_rows<WeightFormat::bf16, FUSED>(ma, w1, x, resid, a.in, rows, s);
+        case WeightFormat::q8_0: return by_rows<WeightFormat::q8_0, FUSED>(ma, w1, x, resid, a.in, rows, s);
+        case WeightFormat::f32: return by_rows<WeightFormat::f32, FUSED>(ma, w1, x, resid, a.in, rows, s);
     }
     return cudaErrorInvalidValue;
 }
 
 __global__ void embedding_kernel(const unsigned char* table, WeightFormat fmt, std::uint32_t in, const std::uint32_t* ids,
                                  float* out) {
+    pdl_trigger();
+    pdl_wait();
     const std::size_t id = ids[blockIdx.x];
     float* o = out + static_cast<std::size_t>(blockIdx.x) * in;
     for (std::uint32_t i = threadIdx.x; i < in; i += blockDim.x) {
@@ -179,33 +223,55 @@ __global__ void embedding_kernel(const unsigned char* table, WeightFormat fmt, s
     }
 }
 
-__global__ void argmax_kernel(const float* logits, std::uint32_t vocab, std::uint32_t* out) {
-    const float* l = logits + static_cast<std::size_t>(blockIdx.x) * vocab;
-    float best = __int_as_float(0xff800000);
+// Two-stage argmax, lowest index wins ties. Stage 1: block (c, r) scans a contiguous chunk of row r; stage 2: one block per row.
+constexpr std::uint32_t kArgmaxChunks = 128;
+__device__ __forceinline__ bool better(float v, std::uint32_t i, float bv, std::uint32_t bi) {
+    return bi == 0xFFFFFFFFu || v > bv || (v == bv && i < bi);
+}
+__global__ void argmax_stage1(const float* logits, std::uint32_t vocab, float* pv, std::uint32_t* pi) {
+    pdl_trigger();
+    pdl_wait();
+    const float* l = logits + static_cast<std::size_t>(blockIdx.y) * vocab;
+    const std::uint32_t per = (vocab + kArgmaxChunks - 1) / kArgmaxChunks;
+    const std::uint32_t lo = blockIdx.x * per, hi = min(vocab, lo + per);
+    float best = 0.0f;
     std::uint32_t bi = 0xFFFFFFFFu;
-    for (std::uint32_t i = threadIdx.x; i < vocab; i += blockDim.x) {
+    for (std::uint32_t i = lo + threadIdx.x; i < hi; i += blockDim.x) {
         const float v = l[i];
-        if (v > best || bi == 0xFFFFFFFFu) {
+        if (better(v, i, best, bi)) {
             best = v;
             bi = i;
         }
     }
-    __shared__ float sv[1024];
-    __shared__ std::uint32_t si[1024];
+    __shared__ float sv[256];
+    __shared__ std::uint32_t si[256];
     sv[threadIdx.x] = best;
     si[threadIdx.x] = bi;
     __syncthreads();
     for (unsigned s = blockDim.x / 2; s > 0; s >>= 1) {
-        if (threadIdx.x < s) {
-            const float ov = sv[threadIdx.x + s];
-            const std::uint32_t oi = si[threadIdx.x + s];
-            const float mv = sv[threadIdx.x];
-            const std::uint32_t mi = si[threadIdx.x];
-            const bool take = mi == 0xFFFFFFFFu || (oi != 0xFFFFFFFFu && (ov > mv || (ov == mv && oi < mi)));
-            if (take) {
-                sv[threadIdx.x] = ov;
-                si[threadIdx.x] = oi;
-            }
+        if (threadIdx.x < s && si[threadIdx.x + s] != 0xFFFFFFFFu && better(sv[threadIdx.x + s], si[threadIdx.x + s], sv[threadIdx.x], si[threadIdx.x])) {
+            sv[threadIdx.x] = sv[threadIdx.x + s];
+            si[threadIdx.x] = si[threadIdx.x + s];
+        }
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) {
+        pv[blockIdx.y * kArgmaxChunks + blockIdx.x] = sv[0];
+        pi[blockIdx.y * kArgmaxChunks + blockIdx.x] = si[0];
+    }
+}
+__global__ void argmax_stage2(const float* pv, const std::uint32_t* pi, std::uint32_t* out) {
+    pdl_wait();
+    const std::size_t base = static_cast<std::size_t>(blockIdx.x) * kArgmaxChunks;
+    __shared__ float sv[kArgmaxChunks];
+    __shared__ std::uint32_t si[kArgmaxChunks];
+    sv[threadIdx.x] = pv[base + threadIdx.x];
+    si[threadIdx.x] = pi[base + threadIdx.x];
+    __syncthreads();
+    for (unsigned s = kArgmaxChunks / 2; s > 0; s >>= 1) {
+        if (threadIdx.x < s && si[threadIdx.x + s] != 0xFFFFFFFFu && better(sv[threadIdx.x + s], si[threadIdx.x + s], sv[threadIdx.x], si[threadIdx.x])) {
+            sv[threadIdx.x] = sv[threadIdx.x + s];
+            si[threadIdx.x] = si[threadIdx.x + s];
         }
         __syncthreads();
     }
@@ -214,30 +280,57 @@ __global__ void argmax_kernel(const float* logits, std::uint32_t vocab, std::uin
 
 }  // namespace
 
+void set_programmatic_launch(bool on) { pdl_enabled() = on; }
+
 cudaError_t dense_rows(const DenseWeight& w, const float* x, float* y, std::uint32_t rows, const float* residual,
                        cudaStream_t stream) {
-    if (!valid(w, rows)) return cudaErrorInvalidValue;
-    return dispatch<false>(w, nullptr, x, y, residual, rows, stream);
+    return dense_rows_multi(&w, &y, 1, x, rows, residual, stream);
+}
+
+cudaError_t dense_rows_multi(const DenseWeight* ws, float* const* ys, int n, const float* x, std::uint32_t rows,
+                             const float* residual, cudaStream_t stream) {
+    if (n < 1 || n > kMaxMulti || (residual != nullptr && n != 1)) return cudaErrorInvalidValue;
+    MultiArgs ma{};
+    ma.n = n;
+    std::uint32_t total = 0;
+    for (int j = 0; j < n; ++j) {
+        if (!valid(ws[j], rows) || ws[j].format != ws[0].format || ws[j].in != ws[0].in) return cudaErrorInvalidValue;
+        ma.w[j] = ws[j].data;
+        ma.y[j] = ys[j];
+        ma.out[j] = ws[j].out;
+        total += ws[j].out;
+        ma.row_end[j] = total;
+    }
+    for (int j = n; j < kMaxMulti; ++j) ma.row_end[j] = total;
+    return dispatch<false>(ma, ws[0], nullptr, x, residual, rows, stream);
 }
 
 cudaError_t dense_gate_up_silu_rows(const DenseWeight& gate, const DenseWeight& up, const float* x, float* y,
                                     std::uint32_t rows, cudaStream_t stream) {
     if (!valid(gate, rows) || !valid(up, rows) || gate.format != up.format || gate.in != up.in || gate.out != up.out)
         return cudaErrorInvalidValue;
-    return dispatch<true>(gate, &up, x, y, nullptr, rows, stream);
+    MultiArgs ma{};
+    ma.n = 1;
+    ma.w[0] = gate.data;
+    ma.y[0] = y;
+    ma.out[0] = gate.out;
+    for (int j = 0; j < kMaxMulti; ++j) ma.row_end[j] = gate.out;
+    return dispatch<true>(ma, gate, up.data, x, nullptr, rows, stream);
 }
 
 cudaError_t embedding_rows(const DenseWeight& table, const std::uint32_t* ids, float* out, std::uint32_t rows,
                            cudaStream_t stream) {
     if (table.data == nullptr || rows == 0) return cudaErrorInvalidValue;
-    embedding_kernel<<<rows, 256, 0, stream>>>(static_cast<const unsigned char*>(table.data), table.format, table.in, ids, out);
-    return cudaGetLastError();
+    return launch_pdl(embedding_kernel, dim3(rows), dim3(256), stream, static_cast<const unsigned char*>(table.data), table.format, table.in, ids, out);
 }
 
-cudaError_t argmax_rows(const float* logits, std::uint32_t vocab, std::uint32_t rows, std::uint32_t* out,
+cudaError_t argmax_rows(const float* logits, std::uint32_t vocab, std::uint32_t rows, std::uint32_t* out, void* workspace,
                         cudaStream_t stream) {
-    argmax_kernel<<<rows, 1024, 0, stream>>>(logits, vocab, out);
-    return cudaGetLastError();
+    if (workspace == nullptr || rows == 0 || rows > kMaxRows) return cudaErrorInvalidValue;
+    float* pv = static_cast<float*>(workspace);
+    std::uint32_t* pi = reinterpret_cast<std::uint32_t*>(pv + static_cast<std::size_t>(kMaxRows) * kArgmaxChunks);
+    if (auto e = launch_pdl(argmax_stage1, dim3(kArgmaxChunks, rows), dim3(256), stream, logits, vocab, pv, pi); e != cudaSuccess) return e;
+    return launch_pdl(argmax_stage2, dim3(rows), dim3(kArgmaxChunks), stream, static_cast<const float*>(pv), static_cast<const std::uint32_t*>(pi), out);
 }
 
 }  // namespace strix::cuda_core

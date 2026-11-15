@@ -100,7 +100,7 @@ __device__ __forceinline__ std::uint64_t mix64(std::uint64_t x) {
 }
 __device__ __forceinline__ float urand(std::uint64_t seed, std::uint64_t idx) {
     const std::uint64_t h = mix64(seed ^ mix64(idx));
-    return static_cast<float>(static_cast<double>(h >> 40) * (1.0 / 16777216.0) * 2.0 - 1.0);
+    return static_cast<float>(static_cast<std::int32_t>(h >> 40)) * (1.0f / 8388608.0f) - 1.0f;  // exact in float: 24-bit / 2^23 - 1
 }
 
 __global__ void fill_bf16_kernel(std::uint16_t* p, std::uint64_t n, std::uint64_t seed, float base, float amp) {
@@ -309,6 +309,7 @@ struct CudaEngine::Impl {
           *ao = nullptr, *hid = nullptr, *logits = nullptr, *scratch = nullptr, *cos_t = nullptr, *sin_t = nullptr;
     float *mx = nullptr, *mxn = nullptr, *mcat = nullptr, *mtmp = nullptr, *mlogits = nullptr;
     std::uint32_t *d_ids = nullptr, *d_pos = nullptr, *d_top = nullptr, *d_parity = nullptr;
+    void* d_argws = nullptr;
     std::uint32_t *d_mids = nullptr, *d_mpos = nullptr, *d_mtop = nullptr;
     // per-layer state / window buffers
     std::vector<float*> conv, delta, raw, qkvc, ar, br;
@@ -364,6 +365,7 @@ struct CudaEngine::Impl {
     }
 
     void init() {
+        cc::set_programmatic_launch(opt.pdl);
         gd = {c.gdn_key_heads, c.gdn_key_dim, c.gdn_value_heads, c.gdn_value_dim, c.gdn_conv_kernel};
         ad.heads = c.heads;
         ad.kv_heads = c.kv_heads;
@@ -400,6 +402,7 @@ struct CudaEngine::Impl {
         d_pos = alloc<std::uint32_t>(1);
         d_top = alloc<std::uint32_t>(RM);
         d_parity = alloc<std::uint32_t>(1, true);
+        d_argws = alloc<unsigned char>(cc::kArgmaxWorkspaceBytes);
         if (mtp_ok) {
             mx = alloc<float>(RM * H);
             mxn = alloc<float>(RM * H);
@@ -466,12 +469,25 @@ struct CudaEngine::Impl {
         __nv_bfloat16 *kc, *vc;
     };
 
+    // GEMVs that share x: one launch when format and in agree (bitwise equal either way), else separate launches.
+    void multi(const cc::DenseWeight* ws, float* const* ys, int n, const float* xin, std::uint32_t rows) {
+        bool ok = true;
+        for (int j = 1; j < n; ++j) ok = ok && ws[j].format == ws[0].format && ws[j].in == ws[0].in;
+        if (ok && opt.multi_gemv) {
+            CK(cc::dense_rows_multi(ws, ys, n, xin, rows, nullptr, s));
+        } else {
+            for (int j = 0; j < n; ++j) CK(cc::dense_rows(ws[j], xin, ys[j], rows, nullptr, s));
+        }
+    }
+
     void attn_mixer(const LayerW& w, const Bufs& b, std::uint32_t rows) {
         const std::uint32_t D = c.head_dim;
         const std::uint32_t qgw = c.heads * D * 2;
-        CK(cc::dense_rows(w.q, b.xn, qg, rows, nullptr, s));
-        CK(cc::dense_rows(w.k, b.xn, k, rows, nullptr, s));
-        CK(cc::dense_rows(w.v, b.xn, v, rows, nullptr, s));
+        {
+            const cc::DenseWeight ws[3] = {w.q, w.k, w.v};
+            float* const ys[3] = {qg, k, v};
+            multi(ws, ys, 3, b.xn, rows);
+        }
         const cc::GroupedView qsrc{rows, c.heads, D, qgw, 2 * D}, qdst{rows, c.heads, D, c.heads * D, D};
         const cc::GroupedView kvv{rows, c.kv_heads, D, c.kv_heads * D, D};
         CK(cc::rmsnorm(qg, qsrc, w.qn, q, qdst, c.rms_eps, s));
@@ -499,10 +515,11 @@ struct CudaEngine::Impl {
             const LayerW& w = L[l];
             CK(cc::rmsnorm(x, hv, w.attn_norm, xn, hv, c.rms_eps, s));
             if (!w.attn) {
-                CK(cc::dense_rows(w.qkv, xn, raw[l], rows, nullptr, s));
-                CK(cc::dense_rows(w.gate, xn, z, rows, nullptr, s));
-                CK(cc::dense_rows(w.beta, xn, br[l], rows, nullptr, s));
-                CK(cc::dense_rows(w.alpha, xn, ar[l], rows, nullptr, s));
+                {
+                    const cc::DenseWeight ws[4] = {w.qkv, w.gate, w.beta, w.alpha};
+                    float* const ys[4] = {raw[l], z, br[l], ar[l]};
+                    multi(ws, ys, 4, xn, rows);
+                }
                 const auto& cl = commit_layers[gi++];
                 CK(cc::gdn_window(gd, cl.layer, cl.state, cl.win, z, gout, rows, c.rms_eps, d_parity, s));
                 CK(cc::dense_rows(w.out, gout, x, rows, x, s));
@@ -514,10 +531,10 @@ struct CudaEngine::Impl {
         CK(cc::rmsnorm(x, hv, out_norm, xn, hv, c.rms_eps, s));
         if (want == LogitRows::all) {
             CK(cc::dense_rows(head, xn, logits, rows, nullptr, s));
-            CK(cc::argmax_rows(logits, c.vocab, rows, d_top, s));
+            CK(cc::argmax_rows(logits, c.vocab, rows, d_top, d_argws, s));
         } else if (want == LogitRows::last) {
             CK(cc::dense_rows(head, xn + static_cast<std::size_t>(rows - 1) * H, logits, 1, nullptr, s));
-            CK(cc::argmax_rows(logits, c.vocab, 1, d_top, s));
+            CK(cc::argmax_rows(logits, c.vocab, 1, d_top, d_argws, s));
         }
     }
 
@@ -598,7 +615,7 @@ struct CudaEngine::Impl {
         // mx holds the block output (pre mtp.norm); the hidden export needs it intact, so normalise into mxn.
         CK(cc::rmsnorm(mx, hv, m_shnorm, mxn, hv, c.rms_eps, s));
         CK(cc::dense_rows(head, mxn, mlogits, rows, nullptr, s));
-        CK(cc::argmax_rows(mlogits, c.vocab, rows, d_mtop, s));
+        CK(cc::argmax_rows(mlogits, c.vocab, rows, d_mtop, d_argws, s));
         CudaEngine::MtpOut o;
         o.logits = mlogits;
         o.top = d_mtop;

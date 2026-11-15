@@ -17,17 +17,22 @@ struct AttentionDims {
 cudaError_t kv_store(const AttentionDims& d, const float* k, const float* v, __nv_bfloat16* k_cache,
                      __nv_bfloat16* v_cache, const std::uint32_t* pos0_dev, std::uint32_t rows, cudaStream_t stream);
 
-// Floats of scratch attention_decode needs: rows * heads * max_positions.
+constexpr std::uint32_t kAttnChunk = 256;  // positions per reduction chunk
+[[nodiscard]] __host__ __device__ inline std::uint32_t attn_max_chunks(const AttentionDims& d) { return (d.max_positions + kAttnChunk - 1) / kAttnChunk; }
+
+// Floats of scratch attention_decode needs for `rows`: scores + chunk max + chunk denominators + chunk value partials.
 inline std::size_t attention_scratch_floats(const AttentionDims& d, std::uint32_t rows) {
-    return static_cast<std::size_t>(rows) * d.heads * d.max_positions;
+    const std::size_t rh = static_cast<std::size_t>(rows) * d.heads, mc = attn_max_chunks(d);
+    return rh * d.max_positions + 2 * rh * mc + rh * mc * d.head_dim;
 }
 
 // Row r (position pos0 + r) attends to cache positions 0 .. pos0 + r (causal inside the window; the window's own K/V
 // must have been stored first). q: FP32 view (rows x heads x head_dim). gate (optional, same shape, its own strides):
-// out *= sigmoid(gate). ORDER per (row, head): score_p = fl(dot) * scale with the dot over the dims as 32 lanes x
-// head_dim/32 consecutive dims (sequential per lane, then xor butterfly 16..1); m = max; e_p = expf(s_p - m);
-// denominator = thread t adds e[t + head_dim i] ascending, then the warp-order tree of norms.hpp;
-// out_d = (sum_p e_p * v[p][d], p ascending) / denom. Independent of rows and launch shape. head_dim 256 instantiated.
+// out *= sigmoid(gate). ORDER per (row, head), positions split into 256-position chunks by absolute position:
+// score_p = fl(dot) * scale, dot = lane owns 8 consecutive dims sequentially then xor butterfly 16..1; m = max over all positions
+// (exact); e_p = expf(s_p - m); chunk denominator = block tree (thread t holds position chunk*256 + t, zero past the length) of norms.hpp;
+// chunk value partial_d = sum over the chunk positions ascending of fl(e_p * v[p][d]); denom = chunk denominators added ascending,
+// acc = chunk partials added ascending, out = acc / denom. Independent of rows and launch shape. head_dim 256, group <= 8.
 cudaError_t attention_decode(const AttentionDims& d, const float* q, const GroupedView& qv, const float* gate,
                              const GroupedView& gv, const __nv_bfloat16* k_cache, const __nv_bfloat16* v_cache,
                              const std::uint32_t* pos0_dev, std::uint32_t rows, float* out /*[rows][heads][head_dim]*/,

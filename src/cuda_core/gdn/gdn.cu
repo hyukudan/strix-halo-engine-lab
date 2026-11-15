@@ -27,9 +27,11 @@ __global__ void __launch_bounds__(128) conv_pre_kernel(const float* __restrict__
                                                        std::uint32_t rows, std::uint32_t q_blocks, std::uint32_t qk_blocks,
                                                        float qscale) {
     __shared__ float red[4];
+    pdl_trigger();
     const std::uint32_t c = blockIdx.x * 128 + threadIdx.x;
     const float w0 = w[c * 4], w1 = w[c * 4 + 1], w2 = w[c * 4 + 2], w3 = w[c * 4 + 3];
-    float s0 = conv_state[c * 3], s1 = conv_state[c * 3 + 1], s2 = conv_state[c * 3 + 2];
+    float s0 = conv_state[c * 3], s1 = conv_state[c * 3 + 1], s2 = conv_state[c * 3 + 2];  // committed state: written only outside the graph
+    pdl_wait();
     const bool qk = blockIdx.x < qk_blocks;
     const float scale = blockIdx.x < q_blocks ? qscale : 1.0f;
     for (std::uint32_t r = 0; r < rows; ++r) {
@@ -81,8 +83,10 @@ __device__ __forceinline__ void delta_body(const DeltaArgs& a, const GdnDims& d,
     const float* sp = a.base + parity * side + static_cast<std::size_t>(h) * K * d.value_dim + t;
     float* dp = a.base + (1 - parity) * side + static_cast<std::size_t>(h) * K * d.value_dim + t;
     float S[K];
+    pdl_trigger();
 #pragma unroll
     for (int k = 0; k < K; ++k) S[k] = sp[static_cast<std::size_t>(k) * d.value_dim];
+    pdl_wait();
     const float dtb = a.dt_bias[h], sa = a.ssm_a[h];
     for (std::uint32_t r = 0; r < rows; ++r) {
         const float* row = a.qkvc + static_cast<std::size_t>(r) * channels;
@@ -161,13 +165,13 @@ cudaError_t gdn_window(const GdnDims& d, const GdnLayer& layer, const GdnState& 
     if (d.key_dim != 128 || d.value_dim != 128 || d.conv_kernel != 4 || rows == 0 || rows > kMaxRows) return cudaErrorInvalidValue;
     const std::uint32_t C = d.conv_channels();
     const float qscale = static_cast<float>(1.0 / std::sqrt(static_cast<double>(d.key_dim)));
-    conv_pre_kernel<<<C / 128, 128, 0, stream>>>(layer.conv_w, state.conv, win.raw, win.qkv_c, C, rows, d.key_heads,
-                                                 2 * d.key_heads, qscale);
-    if (auto e = cudaGetLastError(); e != cudaSuccess) return e;
+    if (auto e = launch_pdl(conv_pre_kernel, dim3(C / 128), dim3(128), stream, layer.conv_w, state.conv, win.raw, win.qkv_c, C, rows,
+                            d.key_heads, 2 * d.key_heads, qscale);
+        e != cudaSuccess)
+        return e;
     DeltaArgs a{state.delta_base, win.qkv_c, win.a_raw, win.b_raw, layer.ssm_a, layer.dt_bias, layer.norm_gain, z, out,
                 nullptr, nullptr};
-    delta_window_kernel<<<d.value_heads, 128, 0, stream>>>(a, d, rows, parity_dev, eps);
-    return cudaGetLastError();
+    return launch_pdl(delta_window_kernel, dim3(d.value_heads), dim3(128), stream, a, d, rows, parity_dev, eps);
 }
 
 cudaError_t gdn_commit(const GdnDims& d, const GdnCommitLayer* layers, std::uint32_t n, std::uint32_t window_rows,

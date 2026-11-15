@@ -8,19 +8,27 @@ namespace {
 
 enum class Mode : int { rms = 0, gated_swish = 1, gated_sigmoid = 2, l2 = 3 };
 
-template <Mode M>
+// Same order as before (thread t adds x[t + 256 i] ascending); the NREG values of a thread stay in registers between the sum and the
+// write (one global read per element instead of two). Padding terms are 0 (p + 0*0 == p for p >= 0).
+template <Mode M, int NREG>
 __global__ void __launch_bounds__(256)
     norm_kernel(const float* x, GroupedView xv, const float* gain, const float* z, GroupedView zv, float* y, GroupedView yv,
                 float eps, float scale) {
     __shared__ float red[8];
+    pdl_trigger();
+    pdl_wait();
     const std::uint32_t r = blockIdx.y, g = blockIdx.x, n = xv.n;
     const float* xp = x + static_cast<std::size_t>(r) * xv.rs() + static_cast<std::size_t>(g) * xv.gs();
     float* yp = y + static_cast<std::size_t>(r) * yv.rs() + static_cast<std::size_t>(g) * yv.gs();
+    float xr[NREG];
     float p = 0.0f;
-    for (std::uint32_t i = threadIdx.x; i < n; i += 256) {
-        const float v = xp[i];
-        p = __fadd_rn(p, __fmul_rn(v, v));
+#pragma unroll
+    for (int i = 0; i < NREG; ++i) {
+        const std::uint32_t idx = threadIdx.x + 256u * i;
+        xr[i] = idx < n ? xp[idx] : 0.0f;
     }
+#pragma unroll
+    for (int i = 0; i < NREG; ++i) p = __fadd_rn(p, __fmul_rn(xr[i], xr[i]));
     const float ss = block_sum256(p, red);
     float inv;
     if constexpr (M == Mode::l2) {
@@ -31,16 +39,20 @@ __global__ void __launch_bounds__(256)
     const float* zp = nullptr;
     if constexpr (M == Mode::gated_swish || M == Mode::gated_sigmoid)
         zp = z + static_cast<std::size_t>(r) * zv.rs() + static_cast<std::size_t>(g) * zv.gs();
-    for (std::uint32_t i = threadIdx.x; i < n; i += 256) {
-        float v = __fmul_rn(xp[i], inv);
-        if constexpr (M == Mode::l2) {
-            v = __fmul_rn(v, scale);
-        } else {
-            if (gain != nullptr) v = __fmul_rn(v, gain[i]);
-            if constexpr (M == Mode::gated_swish) v = __fmul_rn(v, cc_silu(zp[i]));
-            if constexpr (M == Mode::gated_sigmoid) v = __fmul_rn(v, cc_sigmoid(zp[i]));
+#pragma unroll
+    for (int i = 0; i < NREG; ++i) {
+        const std::uint32_t idx = threadIdx.x + 256u * i;
+        if (idx < n) {
+            float v = __fmul_rn(xr[i], inv);
+            if constexpr (M == Mode::l2) {
+                v = __fmul_rn(v, scale);
+            } else {
+                if (gain != nullptr) v = __fmul_rn(v, gain[idx]);
+                if constexpr (M == Mode::gated_swish) v = __fmul_rn(v, cc_silu(zp[idx]));
+                if constexpr (M == Mode::gated_sigmoid) v = __fmul_rn(v, cc_sigmoid(zp[idx]));
+            }
+            yp[idx] = v;
         }
-        yp[i] = v;
     }
 }
 
@@ -51,7 +63,16 @@ cudaError_t run(const float* x, const GroupedView& xv, const float* gain, const 
                 const GroupedView& yv, float eps, float scale, cudaStream_t s) {
     if (!same_shape(xv, yv) || xv.n == 0 || xv.rows == 0 || xv.groups == 0) return cudaErrorInvalidValue;
     if (xv.groups > 65535u * 1u && false) return cudaErrorInvalidValue;
-    norm_kernel<M><<<dim3(xv.groups, xv.rows), 256, 0, s>>>(x, xv, gain, z, zv, y, yv, eps, scale);
+    const dim3 grid(xv.groups, xv.rows);
+    const std::uint32_t nreg = (xv.n + 255) / 256;
+    if (nreg <= 1) launch_pdl(norm_kernel<M, 1>, grid, dim3(256), s, x, xv, gain, z, zv, y, yv, eps, scale);
+    else if (nreg <= 2) launch_pdl(norm_kernel<M, 2>, grid, dim3(256), s, x, xv, gain, z, zv, y, yv, eps, scale);
+    else if (nreg <= 4) launch_pdl(norm_kernel<M, 4>, grid, dim3(256), s, x, xv, gain, z, zv, y, yv, eps, scale);
+    else if (nreg <= 8) launch_pdl(norm_kernel<M, 8>, grid, dim3(256), s, x, xv, gain, z, zv, y, yv, eps, scale);
+    else if (nreg <= 16) launch_pdl(norm_kernel<M, 16>, grid, dim3(256), s, x, xv, gain, z, zv, y, yv, eps, scale);
+    else if (nreg <= 24) launch_pdl(norm_kernel<M, 24>, grid, dim3(256), s, x, xv, gain, z, zv, y, yv, eps, scale);
+    else if (nreg <= 32) launch_pdl(norm_kernel<M, 32>, grid, dim3(256), s, x, xv, gain, z, zv, y, yv, eps, scale);
+    else return cudaErrorInvalidValue;  // n <= 8192
     return cudaGetLastError();
 }
 
