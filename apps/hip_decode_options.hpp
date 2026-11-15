@@ -3405,9 +3405,15 @@ inline Options parse_options(
     // up to 512) explicitly, so the same factor rule applies. Every prompt native admits keeps native bits.
     if (!yarn_factor && !options.baseline && !yarn_cli && !yarn_env && !options.context_explicit && !options.tokens.empty() &&
         static_cast<std::uint64_t>(options.tokens.size()) + options.generate_tokens > strix::RotaryDescriptor::original_max) {
+        // The factor covers prompt + generation; the headroom is clamped to that band (as native clamps to 262,144),
+        // so 524,287 + 1 keeps f2 and 1,048,575 + 1 is admitted at f4.
+        const auto exact = static_cast<std::uint64_t>(options.tokens.size()) + options.generate_tokens;
         const auto need = (static_cast<std::uint64_t>(options.tokens.size()) +
             std::max<std::uint64_t>(options.generate_tokens, 512U) + 511U) / 512U * 512U;
-        if (strix::automatic_qwen_rope_yarn(need)) { options.context_tokens = need; options.context_explicit = true; }
+        if (const auto factor = strix::automatic_qwen_rope_yarn(exact)) {
+            options.context_tokens = std::min<std::uint64_t>(need, strix::RotaryDescriptor::original_max * factor);
+            options.context_explicit = true;
+        }
     }
     if (!yarn_factor && !options.baseline && !yarn_cli && !yarn_env && options.context_explicit &&
         (yarn_factor = strix::automatic_qwen_rope_yarn(options.context_tokens)) != 0U) {

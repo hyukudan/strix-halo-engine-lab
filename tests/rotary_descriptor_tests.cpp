@@ -80,6 +80,12 @@ int main() {
         fits.insert(fits.end(), {"--generate", "1"});
         const auto n = parse(std::move(fits));
         require(n.rotary == native && !n.context_explicit && !n.rotary_automatic, "a prompt native admits stays native");
+        // 524,287 + 1: the headroom is clamped to the f2 band instead of moving the request to f4.
+        std::vector<std::string> band{"decoder", "model.gguf"};
+        band.insert(band.end(), 524287U, "1");
+        band.insert(band.end(), {"--generate", "1"});
+        const auto b = parse(std::move(band));
+        require(b.rotary.factor() == 2U && b.context_tokens == 524288U, "headroom clamped to the f2 band");
     }
     require(automatic_qwen_rope_yarn(262144) == 0U && automatic_qwen_rope_yarn(262145) == 2U &&
         automatic_qwen_rope_yarn(524289) == 4U && automatic_qwen_rope_yarn(1048577) == 0U, "automatic factor bands");
