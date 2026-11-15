@@ -7,6 +7,8 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <fstream>
+#include <iterator>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -93,10 +95,12 @@ struct ClockSampler {
 int main(int argc, char** argv) {
     strix::device::bind_cuda_main(argc, argv);
     try {
-        std::string model, dump, ids_arg, synth, dump_mtp;
+        std::string model, dump, ids_arg, synth, dump_mtp, force_file;
         bool mtp_pre = false;
         std::uint32_t n_gen = 32, rows_cap = 16, max_pos = 4096, prompt_len = 0, ctx_fill = 0, layers_override = 0, decode_rows = 1;
-        bool graphs = true, multi = true, bwp = false, pdl = false;
+        bool graphs = true, multi = true, bwp = false, pdl = false, print_cfg = false;
+        q::EngineOptions topt;  // TURBO levers (defaults = exact)
+        std::string arith_name = "mma3";
         for (int i = 1; i < argc; ++i) {
             const std::string a = argv[i];
             auto next = [&]() -> std::string {
@@ -118,14 +122,36 @@ int main(int argc, char** argv) {
             else if (a == "--pdl") pdl = next() != "0";
             else if (a == "--dense-arith") {
                 const std::string v = next();
+                arith_name = v == "fp32" || v == "mma2" || v == "mma1" ? v : "mma3";
                 strix::cuda_core::set_dense_arith(v == "fp32" ? strix::cuda_core::DenseArith::fp32 : v == "mma2" ? strix::cuda_core::DenseArith::mma2
                                                   : v == "mma1" ? strix::cuda_core::DenseArith::mma1 : strix::cuda_core::DenseArith::mma3);
             }
-            else if (a == "--multi") multi = next() != "0";
+            else if (a == "--multi" || a == "--turbo-multi-launch") multi = next() != "0";
+            else if (a == "--turbo-weights") {
+                const std::string v = next();
+                if (v == "native") topt.turbo_weights = q::TurboWeights::native;
+                else if (v == "onfly") topt.turbo_weights = q::TurboWeights::onfly;
+                else if (v == "off") topt.turbo_weights = q::TurboWeights::off;
+                else if (v == "converted") throw std::runtime_error("--turbo-weights converted: not implemented yet (native|onfly)");
+                else throw std::runtime_error("--turbo-weights expects native|onfly");
+            } else if (a == "--turbo-bits") {
+                topt.turbo_bits = static_cast<std::uint32_t>(std::stoul(next()));
+                if (topt.turbo_bits != 4) throw std::runtime_error("--turbo-bits: only 4 is implemented");
+            } else if (a == "--turbo-lm-head") {
+                const std::string v = next();
+                if (v != "nvfp4" && v != "bf16") throw std::runtime_error("--turbo-lm-head expects nvfp4|bf16");
+                topt.turbo_lm_head = v == "nvfp4";
+            } else if (a == "--print-effective-config") print_cfg = true;
             else if (a == "--dump-logits") dump = next();
+            else if (a == "--force-gen-file") force_file = next();  // teacher forcing: decode feeds these tokens (comma list), not its own argmax
             else if (a == "--dump-mtp") dump_mtp = next();
             else if (a == "--mtp-hidden") mtp_pre = next() == "pre";
             else throw std::runtime_error("unknown argument " + a);
+        }
+        if (print_cfg) {
+            topt.multi_gemv = multi;
+            q::print_effective_config(topt, arith_name.c_str(), stdout);
+            return 0;
         }
         if (bwp) {
             std::printf("bw-probe: %.3f TB/s streaming read (4 GiB)\n", bw_probe_tbs());
@@ -142,7 +168,7 @@ int main(int argc, char** argv) {
             std::string t;
             while (std::getline(ss, t, ',')) prompt.push_back(static_cast<std::uint32_t>(std::stoul(t)));
         }
-        q::EngineOptions opt;
+        q::EngineOptions opt = topt;
         opt.use_graphs = graphs;
         opt.multi_gemv = multi;
         opt.pdl = pdl;
@@ -157,6 +183,8 @@ int main(int argc, char** argv) {
             E = q::CudaEngine::synthetic(cfg, synth == "q8_0" ? q::PackFormat::q8_0 : q::PackFormat::bf16, opt, 0x5eedULL);
         }
         const auto& cfg = E->config();
+        q::print_effective_config(E->options(), arith_name.c_str(), stderr);
+        std::fprintf(stderr, "  nvfp4 tensors: %u, weight bytes per pass %.2f GB\n", E->nvfp4_tensors(), static_cast<double>(E->weight_bytes()) / 1e9);
         std::fprintf(stderr, "qwen35: layers %u hidden %u inter %u vocab %u heads %u/%u hd %u gdn %u/%u x %u mtp %d\n", cfg.layers,
                      cfg.hidden, cfg.intermediate, cfg.vocab, cfg.heads, cfg.kv_heads, cfg.head_dim, cfg.gdn_key_heads,
                      cfg.gdn_value_heads, cfg.gdn_value_dim, E->has_mtp() ? 1 : 0);
@@ -172,6 +200,7 @@ int main(int argc, char** argv) {
 
         std::FILE* df = dump.empty() ? nullptr : std::fopen(dump.c_str(), "wb");
         if (!dump.empty() && !df) throw std::runtime_error("cannot open " + dump);
+        std::FILE* df_open = nullptr;
         std::vector<float> host_logits(static_cast<std::size_t>(cfg.vocab));
         std::vector<std::uint32_t> top1;
         std::vector<float> hid_all;
@@ -203,7 +232,7 @@ int main(int argc, char** argv) {
         E->sync();
         const double prefill_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - tp0).count();
         if (df) {
-            std::fclose(df);
+            df_open = df;
             std::printf("prompt top1:");
             for (auto t : top1) std::printf(" %u", t);
             std::printf("\n");
@@ -219,7 +248,16 @@ int main(int argc, char** argv) {
         CK(cudaEventCreate(&e0));
         CK(cudaEventCreate(&e1));
         const std::uint32_t ctx0 = E->committed();
+        std::vector<std::uint32_t> forced;
+        if (!force_file.empty()) {
+            std::ifstream ff(force_file);
+            std::string all((std::istreambuf_iterator<char>(ff)), std::istreambuf_iterator<char>());
+            std::stringstream fs(all);
+            std::string t;
+            while (std::getline(fs, t, ',')) if (!t.empty()) forced.push_back(static_cast<std::uint32_t>(std::stoul(t)));
+        }
         for (std::uint32_t i = 0; i < n_gen; ++i) {
+            if (i < forced.size()) next_tok = forced[i];
             gen.push_back(next_tok);
             if (i + 1 == n_gen) break;
             std::uint32_t toks[32];
@@ -234,12 +272,17 @@ int main(int argc, char** argv) {
             }
             std::uint32_t tp[32];
             E->read_top(o, decode_rows == 1 ? 1 : decode_rows, tp);
+            if (df_open && decode_rows == 1) {  // continuation logits follow the prompt rows in the dump (position prompt+i)
+                E->read_logits(o, 0, host_logits.data());
+                std::fwrite(host_logits.data(), 4, cfg.vocab, df_open);
+            }
             next_tok = tp[decode_rows == 1 ? 0 : decode_rows - 1];
             float ms = 0;
             CK(cudaEventElapsedTime(&ms, e0, e1));
             step_ms.push_back(ms);
         }
         clk.end();
+        if (df_open) std::fclose(df_open);
         if (!dump_mtp.empty()) {
             // MTP row i: position i, token i+1 of (prompt + generated), trunk hidden i (post-final-norm unless --mtp-hidden pre)
             std::vector<std::uint32_t> seq = prompt;

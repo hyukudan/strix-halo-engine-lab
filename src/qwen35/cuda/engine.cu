@@ -15,6 +15,7 @@
 #include "strix/cuda_core/attention.hpp"
 #include "strix/cuda_core/dense.hpp"
 #include "strix/cuda_core/gdn.hpp"
+#include "strix/cuda_core/nvfp4.hpp"
 #include "strix/cuda_core/norms.hpp"
 #include "strix/cuda_core/rope.hpp"
 #include "strix/gguf_reader.hpp"
@@ -77,7 +78,29 @@ struct TensorSpec {
     std::string name;
     int type = 0;  // ggml: 30 bf16, 8 q8_0, 0 f32
     std::uint64_t in = 0, out = 1, bytes = 0, file_off = 0;
+    // TURBO onfly: the source is BF16 (src_bytes) and the stored copy is NVFP4 (bytes); gscale is set at conversion.
+    bool fp4 = false;
+    std::uint64_t src_bytes = 0;
+    float gscale = 1.0f;
 };
+
+// Tensors that take the NVFP4 path: 2-D BF16 weights (every projection, the MTP eh_proj, optional lm_head), never the
+// embedding table (row gather) nor norms / conv / state tensors.
+bool fp4_eligible(const EngineOptions& o, const TensorSpec& t) {
+    if (o.turbo_weights != TurboWeights::onfly || t.type != 30 || t.out <= 1) return false;
+    if (t.name == "token_embd.weight") return false;
+    if (t.name == "output.weight" && !o.turbo_lm_head) return false;
+    if (t.name.size() < 7 || t.name.compare(t.name.size() - 7, 7, ".weight") != 0) return false;
+    return cc::nvfp4_shape_ok(static_cast<std::uint32_t>(t.out), static_cast<std::uint32_t>(t.in));
+}
+void mark_fp4(const EngineOptions& o, std::vector<TensorSpec>& v) {
+    for (auto& t : v) {
+        if (!fp4_eligible(o, t)) continue;
+        t.fp4 = true;
+        t.src_bytes = t.bytes;
+        t.bytes = cc::nvfp4_bytes(static_cast<std::uint32_t>(t.out), static_cast<std::uint32_t>(t.in));
+    }
+}
 
 std::uint64_t bytes_of(int type, std::uint64_t in, std::uint64_t out) {
     if (type == 30) return in * out * 2;
@@ -145,6 +168,11 @@ struct WeightStore {
         w.data = ptr(n);
         w.in = static_cast<std::uint32_t>(t.in);
         w.out = static_cast<std::uint32_t>(t.out);
+        if (t.fp4) {
+            w.format = cc::WeightFormat::nvfp4;
+            w.gscale = t.gscale;
+            return w;
+        }
         switch (t.type) {
             case 30: w.format = cc::WeightFormat::bf16; break;
             case 8: w.format = cc::WeightFormat::q8_0; break;
@@ -373,6 +401,17 @@ struct CudaEngine::Impl {
         ad.scale = static_cast<float>(1.0 / std::sqrt(static_cast<double>(c.head_dim)));
         ad.max_positions = opt.max_positions;
         CK(cudaStreamCreateWithFlags(&s, cudaStreamNonBlocking));
+        {   // NVFP4 split-K workspace: grow-only, must exist before graph capture. Bound = rows 32, all jobs of the largest layer.
+            std::size_t need = 0, layer_sum = 0;
+            for (const auto& [name, t] : W.spec) {
+                if (!t.fp4) continue;
+                const std::size_t ks = cc::nvfp4_split_k(static_cast<std::uint32_t>(t.out), static_cast<std::uint32_t>(t.in));
+                const std::size_t b = 2 * ks * cc::kNvfp4MaxRows * t.out * 4;
+                layer_sum += b;
+                need = std::max(need, b);
+            }
+            if (layer_sum) CK(cc::nvfp4_reserve_workspace(std::min<std::size_t>(layer_sum, std::max<std::size_t>(need * 4, 64u << 20))));
+        }
         for (std::uint32_t l = 0; l < c.layers; ++l) L.push_back(resolve(l, c.kind(l) == LayerKind::full_attention));
         head = W.has("output.weight") ? W.dense("output.weight") : W.dense("token_embd.weight");
         embd = W.dense("token_embd.weight");
@@ -636,24 +675,38 @@ std::unique_ptr<CudaEngine> CudaEngine::from_gguf(const std::string& path, const
     const auto info = gguf::read_file(path);
     P.c = read_cfg(info);
     const auto t0 = std::chrono::steady_clock::now();
-    layout(P.W, specs_from_gguf(info, P.c.layers, opt.load_mtp), P.c.layers);
+    auto specs = specs_from_gguf(info, P.c.layers, opt.load_mtp);
+    mark_fp4(opt, specs);
+    layout(P.W, specs, P.c.layers);
+    std::uint64_t tmp_bytes = 0;
+    for (const auto& t : specs) if (t.fp4) tmp_bytes = std::max(tmp_bytes, t.src_bytes);
+    unsigned char* tmp = nullptr;  // BF16 staging for the on-the-fly conversion (largest eligible tensor)
+    if (tmp_bytes) CK(cudaMalloc(reinterpret_cast<void**>(&tmp), tmp_bytes));
     std::ifstream in(path, std::ios::binary);
     if (!in) throw std::runtime_error("cannot open " + path);
     constexpr std::size_t kChunk = 128u << 20;
     unsigned char* pin = nullptr;
     CK(cudaMallocHost(reinterpret_cast<void**>(&pin), kChunk));
-    for (const auto& [name, t] : P.W.spec) {
+    for (auto& [name, t] : P.W.spec) {
         in.seekg(static_cast<std::streamoff>(t.file_off));
         std::uint64_t done = 0;
-        while (done < t.bytes) {
-            const std::size_t n = static_cast<std::size_t>(std::min<std::uint64_t>(kChunk, t.bytes - done));
+        const std::uint64_t total = t.fp4 ? t.src_bytes : t.bytes;
+        unsigned char* dst = t.fp4 ? tmp : P.W.base + P.W.off[name];
+        while (done < total) {
+            const std::size_t n = static_cast<std::size_t>(std::min<std::uint64_t>(kChunk, total - done));
             in.read(reinterpret_cast<char*>(pin), static_cast<std::streamsize>(n));
             if (!in) throw std::runtime_error("short read for " + name);
-            CK(cudaMemcpy(P.W.base + P.W.off[name] + done, pin, n, cudaMemcpyHostToDevice));
+            CK(cudaMemcpy(dst + done, pin, n, cudaMemcpyHostToDevice));
             done += n;
+        }
+        if (t.fp4) {
+            CK(cc::nvfp4_quantize_bf16(tmp, static_cast<std::uint32_t>(t.out), static_cast<std::uint32_t>(t.in),
+                                       P.W.base + P.W.off[name], &t.gscale, nullptr));
+            CK(cudaDeviceSynchronize());
         }
     }
     CK(cudaFreeHost(pin));
+    if (tmp) CK(cudaFree(tmp));
     P.init();
     if (!opt.quiet)
         std::fprintf(stderr, "qwen35 engine: loaded %.2f GB in %.1f s, mtp %s\n", static_cast<double>(P.W.total) / 1e9,
@@ -667,12 +720,19 @@ std::unique_ptr<CudaEngine> CudaEngine::synthetic(const Config& cfg, PackFormat 
     P.opt = opt;
     P.c = cfg;
     const auto t0 = std::chrono::steady_clock::now();
+    if (opt.turbo_weights == TurboWeights::onfly) pack = PackFormat::bf16;  // onfly source is BF16
     const auto sp = synth_specs(cfg, pack, opt.load_mtp);
     std::vector<TensorSpec> specs;
     for (const auto& [t, f] : sp) specs.push_back(t);
+    mark_fp4(opt, specs);
     layout(P.W, specs, cfg.layers);
-    for (const auto& [t, f] : sp) {
-        unsigned char* dst = P.W.base + P.W.off[t.name];
+    std::uint64_t tmp_bytes = 0;
+    for (const auto& t : specs) if (t.fp4) tmp_bytes = std::max(tmp_bytes, t.src_bytes);
+    unsigned char* tmp = nullptr;
+    if (tmp_bytes) CK(cudaMalloc(reinterpret_cast<void**>(&tmp), tmp_bytes));
+    for (const auto& [t0_, f] : sp) {
+        auto& t = P.W.spec[t0_.name];
+        unsigned char* dst = t.fp4 ? tmp : P.W.base + P.W.off[t.name];
         const std::uint64_t sd = seed ^ fnv(t.name);
         const std::uint64_t n = t.in * t.out;
         if (t.type == 0) {
@@ -683,8 +743,14 @@ std::unique_ptr<CudaEngine> CudaEngine::synthetic(const Config& cfg, PackFormat 
             fill_q8_kernel<<<4096, 256>>>(dst, n / 32, sd, f.amp);
         }
         CK(cudaGetLastError());
+        if (t.fp4) {
+            CK(cc::nvfp4_quantize_bf16(tmp, static_cast<std::uint32_t>(t.out), static_cast<std::uint32_t>(t.in),
+                                       P.W.base + P.W.off[t.name], &t.gscale, nullptr));
+            CK(cudaDeviceSynchronize());
+        }
     }
     CK(cudaDeviceSynchronize());
+    if (tmp) CK(cudaFree(tmp));
     P.init();
     if (!opt.quiet)
         std::fprintf(stderr, "qwen35 engine: synthetic %s %.2f GB generated in %.1f s, mtp %s\n", pack == PackFormat::bf16 ? "bf16" : "q8_0",
@@ -693,7 +759,34 @@ std::unique_ptr<CudaEngine> CudaEngine::synthetic(const Config& cfg, PackFormat 
     return e;
 }
 
+std::string engine_identity(const EngineOptions& o, const char* arith) {
+    const std::string a = arith ? arith : "mma3";
+    if (o.turbo_weights == TurboWeights::off) return "qwen35-cuda-exact-" + a + "-v1";
+    if (o.turbo_weights == TurboWeights::native) return "qwen35-turbo-native-" + a + "-v1";
+    return std::string("qwen35-turbo-nvfp4-onfly-rtn16-v1") + (o.turbo_lm_head ? "" : "-lmhead-bf16");
+}
+
+void print_effective_config(const EngineOptions& o, const char* arith, std::FILE* f) {
+    const std::string id = engine_identity(o, arith);
+    std::fprintf(f, "effective-config:\n  identity: %s\n  prefix-cache-key: %s (never shared across identities)\n", id.c_str(), id.c_str());
+    std::fprintf(f, "  dense-arith: %s\n  turbo-weights: %s\n  turbo-bits: %u\n  turbo-lm-head: %s\n  turbo-multi-launch: %s (bitwise neutral)\n",
+                 arith ? arith : "mma3", o.turbo_weights == TurboWeights::off ? "off (exact pack)" : o.turbo_weights == TurboWeights::native ? "native" : "onfly",
+                 o.turbo_bits, o.turbo_weights == TurboWeights::onfly ? (o.turbo_lm_head ? "nvfp4" : "bf16") : "n/a", o.multi_gemv ? "on" : "off");
+    if (o.turbo_weights == TurboWeights::onfly)
+        std::fprintf(f, "  format: NVFP4 e2m1 + e4m3/16 + FP32 global; RTN; GEMV f16 mma, FP32 accumulate, activations RN f16, rows 1..32 bitwise row-invariant\n");
+}
+
 const Config& CudaEngine::config() const { return p_->c; }
+const EngineOptions& CudaEngine::options() const { return p_->opt; }
+std::string CudaEngine::identity() const {
+    static const char* names[] = {"fp32", "mma3", "mma2", "mma1"};
+    return engine_identity(p_->opt, names[static_cast<int>(cc::dense_arith())]);
+}
+std::uint32_t CudaEngine::nvfp4_tensors() const {
+    std::uint32_t n = 0;
+    for (const auto& [k, t] : p_->W.spec) n += t.fp4 ? 1u : 0u;
+    return n;
+}
 bool CudaEngine::has_mtp() const { return p_->mtp_ok; }
 cudaStream_t CudaEngine::stream() const { return p_->s; }
 std::uint32_t CudaEngine::committed() const { return p_->committed; }

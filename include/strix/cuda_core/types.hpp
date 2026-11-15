@@ -15,6 +15,7 @@ enum class WeightFormat : std::uint8_t {
     bf16,  // 2 bytes per element, row-major [out][in]
     q8_0,  // GGUF Q8_0: per 32 elements {f16 d, int8 q[32]} = 34 bytes, row-major [out][in/32 blocks]
     f32,   // 4 bytes per element (small tensors)
+    nvfp4, // TURBO: e2m1 + e4m3 scale per 16 + FP32 global scale (gscale); tile layout in nvfp4.hpp (rows 1..32)
 };
 
 // A 2-D weight [out][in] in device memory (no ownership).
@@ -23,6 +24,7 @@ struct DenseWeight {
     WeightFormat format = WeightFormat::bf16;
     std::uint32_t out = 0;
     std::uint32_t in = 0;
+    float gscale = 1.0f;  // nvfp4 only: per-tensor FP32 global scale
 };
 
 // Rows x groups x n view of an FP32 tensor: element (r, g, i) at base[r * row_stride + g * group_stride + i].
