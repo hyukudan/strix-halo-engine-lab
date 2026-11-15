@@ -358,8 +358,19 @@ void serve_prefill_admission_tests(const ModelContract& model, const ModelManife
         const auto none=resolve({parse(budget),base},memory).options;
         expect(!none.batch_cache_solo && none.prefix_batch_cert==0 && none.batch_cache_solo_reason=="no-l0-restore",
             "qcq: explicit budget without a mode is unchanged");
-        const auto automatic=resolve(request,memory).options;
-        expect(!automatic.batch_cache_solo && automatic.batch_cache_solo_reason=="automatic-unqualified",
+        const auto explicit_rows=resolve(request,memory).options;
+        expect(!explicit_rows.cache_activation->automatic_path && !explicit_rows.batch_cache_solo &&
+            explicit_rows.batch_cache_solo_reason=="no-l0-restore",
+            "qcq: explicit checkpoint rows without budget or L0 keep the incumbent scheduler");
+        // Even a zero checkpoint-row override selects explicit cache configuration.
+        auto auto_args=args;
+        const auto rows=std::find(auto_args.begin(),auto_args.end(),"--prefix-cache-block-rows");
+        if(rows==auto_args.end()||rows+1==auto_args.end())
+            throw std::runtime_error("qcq: AUTO fixture lost its --prefix-cache-block-rows pair");
+        auto_args.erase(rows,rows+2);
+        const auto automatic=resolve({parse(auto_args),base},memory).options;
+        expect(automatic.cache_activation->automatic_path && !automatic.batch_cache_solo &&
+            automatic.batch_cache_solo_reason=="automatic-unqualified",
             "qcq: AUTO batch stays declined (no qualified batch row)");
         auto fixed=budget; *(std::find(fixed.begin(),fixed.end(),"--http-batch")+1)="1";
         const auto single=resolve({parse(fixed),base},memory).options;
