@@ -213,8 +213,9 @@ struct Fixture {
     }
     // poison: the output and temporary views start from this byte (the rest of the arena from the seed), so a store
     // missing in both routes cannot hide behind a common initial value (compare two poisons, see written_equal).
-    // pair: the paired gate|up override (-1 production, 0 pre-kernel, 1 / 2 paired); admitted pre runs return the preimage.
-    PreResult run_pre(bool pre, const float* injection, hipStream_t stream, bool admitted = true, int poison = -1, int pair = -1) {
+    // Explicit producers ignore inherited form/pair settings: 0 pre-kernel, 1 paired form 4, 2 paired form 0.
+    PreResult run_pre(bool pre, const float* injection, hipStream_t stream, bool admitted = true, int poison = -1, int pair = 1,
+        SharedPreFallback fallback = SharedPreFallback::none) {
         auto start = seed;
         if (poison >= 0)
             for (std::size_t r = 0; r < contexts.size(); ++r)
@@ -224,9 +225,19 @@ struct Fixture {
         write(scratch, start);
         const auto before = shared_expert_shared_pre_fixture_overflow_count();
         auto current = scope(); current.stream = stream;
+        SharedPreFixtureRoute route;
+        const unsigned requested_form = pair == 2 ? 0U : 4U;
         { const HipLaunchScope active(current);
-          require(shared_expert_shared_pre_fixture_launch(contexts, config, pre, injection, pair) == (pre && admitted),
+          require(shared_expert_shared_pre_fixture_launch(contexts, config, pre, injection, pair, requested_form, &route) == (pre && admitted),
               "shared pre fixture did not take the requested admitted route"); }
+        const auto expected_producer = !pre || !admitted ? SharedPreProducer::complete_activation
+            : pair == 0 ? SharedPreProducer::pre_kernel : SharedPreProducer::paired;
+        const auto expected_fallback = !pre ? SharedPreFallback::disabled
+            : !admitted ? fallback : pair == 0 ? SharedPreFallback::pair_disabled : SharedPreFallback::none;
+        require(route.producer == expected_producer, "shared pre producer was not exercised");
+        require(route.fallback == expected_fallback, "shared pre fallback reason changed");
+        require(route.form == (expected_producer == SharedPreProducer::paired ? requested_form : ~0U),
+            "shared pre effective paired form was not exercised");
         check(hipStreamSynchronize(stream), "complete shared pre fixture");
         const auto delta = shared_expert_shared_pre_fixture_overflow_count() - before;
         auto result = read(scratch), masked = result;
@@ -401,7 +412,7 @@ void shared_pre_fixtures(bool bench) {
     {
         Fixture short_rows(16U, false); short_rows.config.dense_f16_prefill = true; short_rows.prepare(0, false);
         const auto a = short_rows.run_pre(false, nullptr, short_rows.owner.stream, false);
-        const auto b = short_rows.run_pre(true, nullptr, short_rows.owner.stream, false);
+        const auto b = short_rows.run_pre(true, nullptr, short_rows.owner.stream, false, -1, 1, SharedPreFallback::short_rows);
         require(a.arena == b.arena && a.overflow == b.overflow, "shared pre changed a short path");
     }
     for (unsigned rows : {32U, 40U, 48U, 56U, 64U, 256U, 288U, 512U, 1000U, 1024U, 8192U}) {
@@ -419,7 +430,7 @@ void shared_pre_fixtures(bool bench) {
                     const auto dead = [&](const std::vector<std::byte>& arena) { return f.mask_dead(arena, pre_rows); };
                     const auto a = f.run_pre(false, device, stream), b = f.run_pre(true, device, stream);
                     require(dead(a.arena) == dead(b.arena), "shared pre BF16 / complete FP32 temporary / guard bytes differ");
-                    // Producers of the preimage: production (paired), the activation pre-kernel, paired on form 0. Same
+                    // Producers of the preimage: paired form 4, the activation pre-kernel, paired form 0. Same
                     // FP16 bytes, gate, outputs and counter.
                     for (const int pair : {0, 2}) {
                         const auto c = f.run_pre(true, device, stream, true, -1, pair);
@@ -498,7 +509,7 @@ void shared_pre_fixtures(bool bench) {
             const bool prior_baseline = qpf2k::baseline; qpf2k::baseline = true;
             try {
                 const auto a = f.run_pre(false, nullptr, f.owner.stream, false);
-                const auto b = f.run_pre(true, nullptr, f.owner.stream, false);
+                const auto b = f.run_pre(true, nullptr, f.owner.stream, false, -1, 1, SharedPreFallback::suppressed);
                 require(a.arena == b.arena && a.overflow == b.overflow, "suppressed shared pre changed fallback");
             } catch (...) { qpf2k::baseline = prior_baseline; throw; }
             qpf2k::baseline = prior_baseline;

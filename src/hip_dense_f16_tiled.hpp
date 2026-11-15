@@ -775,13 +775,15 @@ template <class Site> bool supported(const Site& site, std::uint32_t rows) { ret
 // Launch of one projection kernel (form, A mode) over all rows.
 template <class Site, unsigned Mode, unsigned Probe = 0U>
 void launch_projection(const Site& site, std::uint32_t rows, hipStream_t stream, bool any_order, unsigned form_id, std::uint32_t raster_m,
-    const _Float16* a16) {
+    const _Float16* a16, unsigned* effective_form = nullptr) {
     if constexpr (requires { Site::glu_pair; }) {
         // Paired sites never straddle a segment inside a wave; their store exists in project_kernel only (forms 0/3/4).
         if (form_id == 1U || form_id == 2U) form_id = 0U;
     } else if (form_id >= 3U)  // 256-output tiles: every segment boundary a multiple of 256, else form 0 (same bits)
         for (unsigned m = 1; m < site.segments.count; ++m) if (site.segments.first[m] % 256U) form_id = 0U;
-    if (Mode == kF32 && form_id == 4U) form_id = 3U;  // FP32 A staged inline does not fit 192 VGPRs: form 3 (same bits)
+    if constexpr (Mode == kF32)  // FP32 A staged inline does not fit 192 VGPRs: form 3 (same bits).
+        if (form_id == 4U) form_id = 3U;
+    if (effective_form) *effective_form = form_id;
     if constexpr (Probe == 0U && requires { Site::dense_vector_store; } && !requires { Site::dense_vector_epilogue; }) {
         // Unpinned scratch-A + Q8 + the vector epilogue spills; preserve the
         // original scalar route there. Decide once before wrapping the site.
@@ -839,7 +841,7 @@ void launch_projection(const Site& site, std::uint32_t rows, hipStream_t stream,
 // itself when inline) independent of the kernel queued just before it, as launch_dense_f16's convert.
 template <class Site, unsigned Probe = 0U>
 void launch(const Site& site, std::uint32_t rows, hipStream_t stream, bool any_order = false, unsigned mode = ~0U, unsigned raster_m = 0U,
-    unsigned form_id = ~0U) {
+    unsigned form_id = ~0U, unsigned* effective_form = nullptr) {
     if (mode == ~0U) mode = mode_of(site);
     if (form_id == ~0U) {
         form_id = form<Site>(mode);
@@ -870,11 +872,11 @@ void launch(const Site& site, std::uint32_t rows, hipStream_t stream, bool any_o
             hipExtLaunchKernelGGL(HIP_KERNEL_NAME(convert_kernel<Site>), grid, dim3(256U), 0, stream, nullptr, nullptr, hipExtAnyOrderLaunch,
                 site, rows, a16, dense_f16_overflow_counter());
         else hipLaunchKernelGGL(HIP_KERNEL_NAME(convert_kernel<Site>), grid, dim3(256U), 0, stream, site, rows, a16, dense_f16_overflow_counter());
-        launch_projection<Site, kPre, Probe>(site, rows, stream, false, form_id, raster_m, a16);
+        launch_projection<Site, kPre, Probe>(site, rows, stream, false, form_id, raster_m, a16, effective_form);
         return;
     }
-    if constexpr (sizeof(typename Site::Input) == 4U) launch_projection<Site, kF32, Probe>(site, rows, stream, any_order, form_id, raster_m, nullptr);
-    else launch_projection<Site, kBf16, Probe>(site, rows, stream, any_order, form_id, raster_m, nullptr);
+    if constexpr (sizeof(typename Site::Input) == 4U) launch_projection<Site, kF32, Probe>(site, rows, stream, any_order, form_id, raster_m, nullptr, effective_form);
+    else launch_projection<Site, kBf16, Probe>(site, rows, stream, any_order, form_id, raster_m, nullptr, effective_form);
 }
 
 }  // namespace strix::q8_rows::tiled

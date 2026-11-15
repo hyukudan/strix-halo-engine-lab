@@ -2264,7 +2264,9 @@ std::mutex& shared_pre_mutex() { static std::mutex mutex; return mutex; }
 std::map<hipStream_t, SharedPreSlot>& shared_pre_slots() { static std::map<hipStream_t, SharedPreSlot> slots; return slots; }
 bool known_shared_prefill_enqueue(std::span<const ExecutionDispatchContext> rows, const KnownSharedR2Views& views,
     hipStream_t stream, const HipSharedExpertLauncherConfig& config, bool first_barrier = false,
-    int shared_pre_override = -1, const float* injected_gate_up = nullptr, int glu_pair_override = -1) {
+    int shared_pre_override = -1, const float* injected_gate_up = nullptr, int glu_pair_override = -1,
+    unsigned paired_form = ~0U, SharedPreFixtureRoute* route = nullptr) {
+    if (route) *route = {};
     const auto& s = views.shape;
     const auto at = [&](std::uint64_t r) {
         auto v = views;
@@ -2345,20 +2347,36 @@ bool known_shared_prefill_enqueue(std::span<const ExecutionDispatchContext> rows
         fill_pair(site);
         paired = q8_rows::tiled::supported(site, pre_rows);
     }
+    if (route) {
+        route->producer = paired ? SharedPreProducer::paired : pre_image ? SharedPreProducer::pre_kernel
+            : SharedPreProducer::complete_activation;
+        if (paired) route->fallback = SharedPreFallback::none;
+        else if (pre_image) {
+            if (glu_pair != 1 && glu_pair != 2) route->fallback = SharedPreFallback::pair_disabled;
+            else if (!q8_rows::tiled::site_enabled(16U)) route->fallback = SharedPreFallback::pair_site_disabled;
+            else if (tiled_rows < q8_rows::tiled::min_rows(16U)) route->fallback = SharedPreFallback::pair_short_rows;
+            else route->fallback = SharedPreFallback::pair_unsupported;
+        } else if (!(shared_pre_override < 0 ? shared_pre_env : shared_pre_override != 0))
+            route->fallback = SharedPreFallback::disabled;
+        else if (qpf2k::suppressed(qpf2k::Item::shared_pre) || qpf2k::suppressed(qpf2k::Item::dense))
+            route->fallback = SharedPreFallback::suppressed;
+        else if (!tiled_rows) route->fallback = SharedPreFallback::short_rows;
+        else route->fallback = SharedPreFallback::preimage_unavailable;
+    }
     const auto tiled = [&](bool down) -> std::uint64_t {
         if (!tiled_rows || !q8_rows::tiled::site_enabled(down ? 32U : 16U) || tiled_rows < q8_rows::tiled::min_rows(down ? 32U : 16U)) return 0U;
         const auto n = static_cast<std::uint32_t>(tiled_rows);
         if (!down && paired) {
-            const unsigned form = glu_pair == 2 ? 0U : ~0U;
+            const unsigned form = paired_form != ~0U ? paired_form : glu_pair == 2 ? 0U : ~0U;
             // Same any-order rule as the FP32 gate|up below (it reads only the MoE input).
             if (injected_gate_up) {
                 SharedGluPairTiledSite<true> site{};
                 fill_pair(site);
-                q8_rows::tiled::launch(site, n, stream, strix_any_order_enabled(), ~0U, 0U, form);
+                q8_rows::tiled::launch(site, n, stream, strix_any_order_enabled(), ~0U, 0U, form, route ? &route->form : nullptr);
             } else {
                 SharedGluPairTiledSite<> site{};
                 fill_pair(site);
-                q8_rows::tiled::launch(site, n, stream, strix_any_order_enabled(), ~0U, 0U, form);
+                q8_rows::tiled::launch(site, n, stream, strix_any_order_enabled(), ~0U, 0U, form, route ? &route->form : nullptr);
             }
             check_hip(hipGetLastError(), "known shared prefill paired gate|up launch");
             return tiled_rows;
@@ -2452,11 +2470,13 @@ unsigned shared_expert_shared_pre_fixture_overflow_count() { return q8_rows::den
 
 // Explicit fixture seam, independent of the immutable production environment parser; admission is still mandatory.
 bool shared_expert_shared_pre_fixture_launch(std::span<const ExecutionDispatchContext> rows,
-    const HipSharedExpertLauncherConfig& config, bool shared_pre, const float* injected_gate_up, int glu_pair) {
+    const HipSharedExpertLauncherConfig& config, bool shared_pre, const float* injected_gate_up, int glu_pair,
+    unsigned paired_form, SharedPreFixtureRoute* route) {
     const auto views = known_shared_prefill_views(rows, config);
     const auto stream = known_shared_rows_stream();
     check_hip(hipPeekAtLastError(), "shared pre fixture stale launch error");
-    return known_shared_prefill_enqueue(rows, views, stream, config, false, shared_pre ? 1 : 0, injected_gate_up, glu_pair);
+    return known_shared_prefill_enqueue(rows, views, stream, config, false, shared_pre ? 1 : 0, injected_gate_up, glu_pair,
+        paired_form, route);
 }
 std::vector<std::uint16_t> shared_expert_shared_pre_fixture_a16(void* raw_stream, std::uint32_t rows, std::uint32_t features) {
     const auto stream = static_cast<hipStream_t>(raw_stream);
