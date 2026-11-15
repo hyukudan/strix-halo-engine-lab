@@ -2316,7 +2316,7 @@ struct Bench {
     // Cells "n16abba T": production (A, pairs auto) vs the N16 PIPE on every MT8 call (B), same receipt.
     void bench_pair_abba() {
         bench_moe_abba("pairabba", "pair", {1024U, 2048U, 4096U}, [](int on) { opt::set_prefill_pipe_pair(on); });
-        bench_moe_abba("n16abba", "n16", {1024U, 2048U, 4096U, 8192U}, [](int on) { opt::set_prefill_pipe_n16(on); });
+        bench_moe_abba("n16abba", "n16", {512U, 1024U, 1536U, 2048U, 4096U, 8192U}, [](int on) { opt::set_prefill_pipe_n16(on); });
     }
     template <class Set> void bench_moe_abba(const char* prefix, const char* label, std::initializer_list<unsigned> ts, Set set) {
         struct Restore { ~Restore() { opt::set_prefill_pipe_pair(-1); opt::set_prefill_pipe_n16(-1); opt::set_prefill_mtfit(-1); } } restore;

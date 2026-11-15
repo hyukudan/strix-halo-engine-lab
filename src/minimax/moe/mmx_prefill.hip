@@ -687,14 +687,21 @@ bool prefill_pipe_pair(unsigned rows) {
     const int mode = g_pipe_pair_override < 0 ? prefill_pipe_pair_default() : g_pipe_pair_override;
     return mode == 1 || (mode == 2 && rows >= kPairMinRows);
 }
-// STRIX_MMX_PREFILL_PIPE_N16 (under PIPE): 1 = the MT8 class on 8 waves of one output tile each (item_pipe Tiles 1:
-// 64 instead of 128 accumulator registers per lane, twice the A loads, no LDS) in place of the column pairs and the
-// paired bands; 0 (default) = off. Same items, grids, K splits and bits (test_prefill_pipe_tail, device plan arms).
-bool prefill_pipe_n16_default() {
-    static const bool value = strix::envcfg::flag("STRIX_MMX_PREFILL_PIPE_N16", false);
+// STRIX_MMX_PREFILL_PIPE_N16 (under PIPE): the MT8 class on 8 waves of one output tile each (item_pipe Tiles 1: 64
+// instead of 128 accumulator registers per lane, 166 VGPR / occupancy 9 against 239-247 / 6, twice the A loads, no LDS).
+// 0 (default) = off; 1 = every MT8 call, in place of the column pairs and the paired bands; auto = the calls that do
+// not take the paired bands (below kPairMinRows): whole-call ABBA T1024 -1.6 % (CI -2.3..-0.9) against the column
+// pairs, while against the paired bands it loses (T2048 +3.2, T4096 +6.1, T8192 +7.9 %: the pairs decode each weight
+// tile once per 256 rows, N16 once per 128). Same items, grids, K splits and bits (pipe-tail fixture, device plan arms).
+int prefill_pipe_n16_default() {  // 0 off, 1 on, 2 auto
+    static const int value = static_cast<int>(strix::env_choice("STRIX_MMX_PREFILL_PIPE_N16", 0, {"0", "1", "auto"}));
     return value;
 }
-bool prefill_pipe_n16() { return g_pipe_n16_override < 0 ? prefill_pipe_n16_default() : g_pipe_n16_override != 0; }
+thread_local bool g_pipe_n16_pair = false;  // the paired-band decision of the call being launched (auto mode)
+bool prefill_pipe_n16() {
+    const int mode = g_pipe_n16_override < 0 ? prefill_pipe_n16_default() : g_pipe_n16_override;
+    return mode == 1 || (mode == 2 && !g_pipe_n16_pair);
+}
 // STRIX_MMX_PREFILL_DENSE_BAND (dense linears under PIPE): 0 (default) = MT8 PIPE CTAs, 4 / 8 = tall bands of that many
 // waves over 512 / 1024 rows (one weight decode per band); rows beyond the last full band keep PIPE / the tail. Same bits.
 int prefill_dense_band_default() {
@@ -881,6 +888,7 @@ bool prefill_p1_packed() {
 
 template <bool Packed, bool Tail = false>
 void launch_pipe_class(const pfk::Item* items_d, unsigned n, unsigned ctas, hipStream_t stream, bool pair, bool simplify) {
+    g_pipe_n16_pair = pair;
     if (prefill_pipe_n16() && simplify)
         hipLaunchKernelGGL((pfk::grouped_pipe_n16_kernel<true, false, Tail>), dim3(ctas), dim3(256), 0, stream, items_d, n);
     else if (prefill_pipe_n16())
@@ -921,6 +929,7 @@ void launch_class(const pfk::Item* items_d, unsigned n, unsigned ctas, unsigned 
                   bool tail_pipe = false) {
     if (cls == 7 && prefill_pipe() != 0) {
         // N16 takes the guarded tail on mtfit items (166 VGPR, occupancy 9); its scalar-core fallback form holds 222.
+        g_pipe_n16_pair = pair;
         const bool simplify = prefill_pipe() == 2, tail = tail_pipe && (prefill_pipe_tail(7) || prefill_pipe_n16());
         if (prefill_p1_packed() && tail) launch_pipe_class<true, true>(items_d, n, ctas, stream, pair, simplify);
         else if (prefill_p1_packed()) launch_pipe_class<true>(items_d, n, ctas, stream, pair, simplify);
@@ -1467,6 +1476,7 @@ template <int MT> void launch_dq_pipe_tail(const Queue& q, const dim3& g, hipStr
 }
 template <bool Tail> void launch_dq_pipe(const Queue& q, const dim3& g, hipStream_t stream, bool pair) {
     const bool simplify = prefill_pipe() == 2, packed = prefill_p1_packed();
+    g_pipe_n16_pair = pair;
     // N16: the device plan is always mtfit, so the partial blocks take the guarded tail (166 VGPR instead of 222).
     if (prefill_pipe_n16() && simplify) hipLaunchKernelGGL((dq_pipe_n16_kernel<true, false, true>), g, dim3(256), 0, stream, q);
     else if (prefill_pipe_n16() && packed) hipLaunchKernelGGL((dq_pipe_n16_kernel<false, true, true>), g, dim3(256), 0, stream, q);
@@ -1768,7 +1778,7 @@ void set_prefill_pipe_pair(int value) {
     g_pipe_pair_override = value;
 }
 void set_prefill_pipe_n16(int value) {
-    if (value < -1 || value > 1) throw std::invalid_argument("set_prefill_pipe_n16: value must be -1, 0 or 1");
+    if (value < -1 || value > 2) throw std::invalid_argument("set_prefill_pipe_n16: value must be -1, 0, 1 or 2 (auto)");
     (void)prefill_pipe_n16_default();  // capture once, including at Engine startup
     g_pipe_n16_override = value;
 }

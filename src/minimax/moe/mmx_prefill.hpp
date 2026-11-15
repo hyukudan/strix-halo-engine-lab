@@ -173,7 +173,7 @@ int prefill_pipe_override();
 // 1 = every call, 2 = auto.
 void set_prefill_pipe_pair(int value);
 // Under PIPE: the MT8 class on 8 waves of one output tile each (in place of pairs and paired bands). -1 =
-// STRIX_MMX_PREFILL_PIPE_N16 (default off), 0 = off, 1 = on. Same bits.
+// STRIX_MMX_PREFILL_PIPE_N16 (default off), 0 = off, 1 = on, 2 = auto (the calls without paired bands). Same bits.
 void set_prefill_pipe_n16(int value);
 // Dense linears under PIPE: tall bands. -1 = STRIX_MMX_PREFILL_DENSE_BAND (default 0 = off), 0 = off, 4 / 8 = bands of
 // 4 / 8 waves over 512 / 1024 rows.
