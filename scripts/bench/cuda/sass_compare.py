@@ -40,7 +40,13 @@ def sass(cuobjdump, path):
         return None
     funcs, body, name = {}, [], None
     for line in r.stdout.splitlines():
-        if 'Function :' in line:
+        # A new fatbin ends the preceding function. Image metadata is not SASS and must not be attributed
+        # to that function when a host adapter changes archive extraction order or adds an empty image.
+        if line.strip().startswith('Fatbin '):
+            if name is not None:
+                funcs.setdefault(SYM.sub('S', name), []).append('\n'.join(body))
+            name, body = None, []
+        elif 'Function :' in line:
             if name is not None:
                 funcs.setdefault(SYM.sub('S', name), []).append('\n'.join(body))
             name, body = line.split('Function :', 1)[1].strip(), []

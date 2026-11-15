@@ -53,8 +53,11 @@ capture and replay). Numerical identity is part of the plan (FMA or not, FTZ, di
 type, top-k ties, split-K, rounding): a core selects only between variants of the same identity, by capability and
 shape. Order:
 
-1. **Dense IMMA tile** (`core/dense/`, mirrors `src/core/linear_plan.hpp`, `tiled_core.hpp`, `integer_plan.hpp`):
-   `ds41_core_mma.cu` (tiled Q8_0 x A8) first; the DeepSeek and Qwen CMake lists then name the core library.
+1. **Dense IMMA tile (done)** (`core/dense/q8_a8_imma.cu`): tiled Q8_0 x A8 kernels, repack and tuning dispatch
+   share `include/strix/cuda/core/{types,plan,dense}.hpp`; old DeepSeek signatures remain field-by-field adapters.
+   `include/strix/device/runtime.hpp` binds the existing descriptor to CUDA capability queries; workspace and stream stay caller-owned.
+   The extraction gate compares every built CUDA object's and executable's normalised SASS against the base build;
+   this is an instruction-preserving move, with no new numerical or workload qualification claim.
 2. **Common numerics and norms** (`core/norms/`): `ds41_cuda_common.{cuh,cu}` (device, workspace, stream, event
    helpers become `core/runtime` pieces), `ds41_core_norm.cu`, Qwen `hc` with the AMD-identical math
    (`include/strix/cuda/amd_math.cuh` is already in core), MiniMax Gemma norms; one interface, separate arithmetic

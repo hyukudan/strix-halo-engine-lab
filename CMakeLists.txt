@@ -4600,12 +4600,12 @@ if(STRIX_ENABLE_CUDA_DS41)
     endif()
     enable_language(CUDA)
     find_package(CUDAToolkit REQUIRED)
+    include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/StrixCudaBackend.cmake)
     set(STRIX_DS41_CUDA_SOURCES src/cuda/models/ds41/ds41_cuda_common.cu src/cuda/models/ds41/ds41_core.cu src/cuda/models/ds41/ds41_core_norm.cu
-        src/cuda/models/ds41/ds41_core_moe.cu src/cuda/models/ds41/ds41_core_io.cu src/cuda/models/ds41/ds41_core_mma.cu src/cuda/models/ds41/ds41_router_v2.cu
+        src/cuda/models/ds41/ds41_core_moe.cu src/cuda/models/ds41/ds41_core_io.cu ${STRIX_CUDA_CORE_DENSE_SOURCES} src/cuda/models/ds41/ds41_core_mma.cu src/cuda/models/ds41/ds41_router_v2.cu
         src/cuda/models/ds41/ds41_core_layer.cu)
     # Every deepseek41 CUDA binary resolves its device through the start gate before its first allocation.
     include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/StrixDevice.cmake)
-    include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/StrixCudaBackend.cmake)
     add_library(strix_ds41_cuda STATIC ${STRIX_DS41_CUDA_SOURCES})
     target_link_libraries(strix_ds41_cuda PUBLIC strix_ds41_layer strix_ds41_formats strix_family_deepseek41 strix_device strix_cuda_core CUDA::cudart)
     target_include_directories(strix_ds41_cuda PUBLIC include)
