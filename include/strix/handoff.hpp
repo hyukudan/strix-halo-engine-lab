@@ -31,6 +31,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <exception>
 #include <memory>
 #include <mutex>
 #include <span>
@@ -116,6 +117,9 @@ public:
     Reply finish();
     // Safe from any thread, also while finish() waits on another one (which then throws).
     void abort(std::string_view why) noexcept;
+    // One failure observer; also called immediately for an already failed Sender. Runs outside Sender locks,
+    // must not throw or call this Sender. Captures must outlive the Sender (or use weak ownership).
+    void on_failure(std::function<void(std::exception_ptr)> notify);
     [[nodiscard]] SenderStats stats() const;
     [[nodiscard]] Codec codec() const noexcept;
 

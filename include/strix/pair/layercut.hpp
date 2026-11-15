@@ -3,6 +3,7 @@
 #include "strix/env_flags.hpp"
 #include "strix/pair/chain.hpp"
 #include "strix/handoff.hpp"
+#include <algorithm>
 #include <charconv>
 #include <optional>
 #include <string_view>
@@ -19,6 +20,28 @@ enum class Xport { act_first, fifo };
 inline const char* xport_name(Xport x) { return x == Xport::act_first ? "act-first" : "fifo"; }
 inline const char* act_name(Act a) { return a == Act::relay ? "relay" : a == Act::link ? "link" : "direct"; }
 struct Cli { std::optional<std::string> split, cut, block, act, xport, kv_frag; };
+// Consume shared policy flags before an engine's execution parser sees the remaining arguments.
+// Recognition and value consumption live together, including for flags added to this contract later.
+inline Cli take_cli(int& argc, char** argv, int first) {
+    Cli cli;
+    int out = std::min(first, argc);
+    for (int i = first; i < argc; ++i) {
+        const std::string_view flag = argv[i];
+        std::optional<std::string>* value = nullptr;
+        if (flag == "--split") value = &cli.split;
+        else if (flag == "--cut") value = &cli.cut;
+        else if (flag == "--cut-block") value = &cli.block;
+        else if (flag == "--cut-act") value = &cli.act;
+        else if (flag == "--cut-xport") value = &cli.xport;
+        else if (flag == "--cut-kv-frag") value = &cli.kv_frag;
+        if (!value) { argv[out++] = argv[i]; continue; }
+        if (i + 1 >= argc) throw std::invalid_argument("missing value for " + std::string(flag));
+        *value = argv[++i];
+    }
+    argc = out;
+    argv[out] = nullptr;
+    return cli;
+}
 struct Inputs {
     chain::ModelShape model;
     std::uint64_t rows = 0;

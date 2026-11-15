@@ -94,6 +94,9 @@ ACT and other layers; gaps, duplicates and incomplete coverage at END are reject
 resident on the GPU, sends ACT as urgent pieces over both producer links (`strix::handoff::Lanes`: KV is handed to a
 Sender only while no ACT of any destination is unreleased) and exports KV fragments into a bounded pinned pool, so
 the GPU never waits for KV. bp-v1 (`--codec bp`), if on, applies to KV only; ACT is always sent uncoded.
+Per-rank KV pinned storage is `max(8, floor(32 MiB / fragment_bytes)) * fragment_bytes`, where
+`fragment_bytes = min(cut-kv-frag, cut-block) * 1280`. The 32 MiB value is a sizing target, not a cap:
+block=fragment=8192 uses 80 MiB per rank, in addition to the two ACT slots and other staging allocations.
 Timeline lines: `layercut-tl pc` (per block: ring wait, GPU+D2H, ACT queued, ACT/KV released per rank) and
 `layercut-xport pc` on the producer; `layercut-tl rR` (ACT stored, relayed, last KV stored, fetch start and wait),
 `layercut-rank` and `layercut-act` (XXH64 of the staged ACT, exactness witness) on each rank. ACT is FP32 residual **h**, `[rows][6144]`, 24,576 bytes/row, never normalized hn.

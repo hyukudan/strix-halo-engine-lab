@@ -32,22 +32,16 @@ struct CutArguments {
     std::string relay;
     unsigned relay_port = 0;
 };
-CutArguments cut_arguments(int argc, char** argv) {
+CutArguments cut_arguments(int& argc, char** argv) {
     CutArguments args;
-    lc::Cli cli;
+    auto cli = lc::take_cli(argc, argv, 5);
     for (int i = 5; i < argc; ++i) {
         const std::string flag = argv[i];
         const auto next = [&]() -> std::string {
             if (i + 1 >= argc) throw std::invalid_argument("missing value for " + flag);
             return argv[++i];
         };
-        if (flag == "--split") cli.split = next();
-        else if (flag == "--cut") cli.cut = next();
-        else if (flag == "--cut-block") cli.block = next();
-        else if (flag == "--cut-act") cli.act = next();
-        else if (flag == "--cut-xport") cli.xport = next();
-        else if (flag == "--cut-kv-frag") cli.kv_frag = next();
-        else if (flag == "--layercut-listen") args.listens.push_back(next());
+        if (flag == "--layercut-listen") args.listens.push_back(next());
         else if (flag == "--cut-relay") args.relay = next();
         else if (flag == "--cut-relay-listen") args.relay_port = lc::number(next(), "--cut-relay-listen");
     }

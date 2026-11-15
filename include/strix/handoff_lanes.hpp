@@ -45,6 +45,9 @@ public:
         s_->opt = options;
         s_->queues.resize(s_->senders.size());
         s_->ahead.assign(s_->senders.size(), 0);
+        for (auto* sender : s_->senders) sender->on_failure([weak = std::weak_ptr<State>(s_)](std::exception_ptr e) {
+            if (auto s = weak.lock()) s->cancel(e);
+        });
         feeder_ = std::thread([s = s_] { feed(*s, s); });
     }
     ~Lanes() { abort(); if (feeder_.joinable()) feeder_.join(); }
@@ -54,18 +57,22 @@ public:
     // On the caller's thread (Sender::submit may wait on its own max_pending_plain_bytes).
     void urgent(unsigned dst, const PieceHeader& header, std::span<const bp_codec::Region> regions,
                 std::function<void()> release, bool identity = true) {
+        ReleaseGuard guard{std::move(release)};
         auto& S = *s_;
         S.check_dst(dst);
+        std::function<void()> done = [s = s_, fn = guard.fn]() mutable {
+            if (fn) { try { fn(); } catch (...) {} }
+            { std::lock_guard<std::mutex> g(s->m); --s->urgent_open; }
+            s->cv.notify_all();
+        };
         {
             std::lock_guard<std::mutex> g(S.m);
             if (S.error) std::rethrow_exception(S.error);
+            if (S.stop) throw std::runtime_error("handoff lanes: urgent after abort");
             ++S.urgent_open; ++S.stats.urgent_pieces;
         }
-        S.senders[dst]->submit(header, regions, [s = s_, fn = std::move(release)]() mutable {
-            if (fn) fn();
-            { std::lock_guard<std::mutex> g(s->m); --s->urgent_open; }
-            s->cv.notify_all();
-        }, identity);
+        guard.fn = {};
+        S.senders[dst]->submit(header, regions, std::move(done), identity);
     }
     void bulk(unsigned dst, const PieceHeader& header, std::vector<bp_codec::Region> regions, std::function<void()> release) {
         auto& S = *s_;
@@ -86,24 +93,27 @@ public:
         auto& S = *s_;
         std::unique_lock<std::mutex> g(S.m);
         S.cv.wait(g, [&] { return S.error || S.stop || (S.handing == 0 && S.all_empty()); });
-        if (S.error) std::rethrow_exception(S.error);
+        if (S.error) {
+            const auto error = S.error;
+            g.unlock();
+            // Never join from a Sender callback. Cancel and join here before borrowed storage can be reclaimed.
+            for (auto* sender : S.senders) sender->abort("handoff lanes failed");
+            if (feeder_.joinable()) feeder_.join();
+            std::rethrow_exception(error);
+        }
         if (S.stop) throw std::runtime_error("handoff lanes: aborted");
     }
     // Drops queued bulk (its callbacks run here) and stops the feeder; pieces already handed belong to their Sender.
     void abort() noexcept {
-        auto& S = *s_;
-        std::vector<Bulk> dropped;
-        {
-            std::lock_guard<std::mutex> g(S.m);
-            S.stop = true;
-            for (auto& q : S.queues) { for (auto& b : q) dropped.push_back(std::move(b)); q.clear(); }
-        }
-        S.cv.notify_all();
-        for (auto& b : dropped) if (b.release) { try { b.release(); } catch (...) {} }
+        s_->cancel({});
     }
     [[nodiscard]] Stats stats() const { std::lock_guard<std::mutex> g(s_->m); return s_->stats; }
 
 private:
+    struct ReleaseGuard {
+        std::function<void()> fn;
+        ~ReleaseGuard() { if (fn) { try { fn(); } catch (...) {} } }
+    };
     struct Bulk {
         PieceHeader header;
         std::vector<bp_codec::Region> regions;
@@ -121,6 +131,18 @@ private:
         bool stop = false;
         std::exception_ptr error;
         Stats stats;
+        void cancel(std::exception_ptr e) noexcept {
+            std::vector<std::deque<Bulk>> dropped;
+            {
+                std::lock_guard<std::mutex> g(m);
+                if (!error) error = e;
+                stop = true;
+                dropped.swap(queues);
+            }
+            cv.notify_all();
+            for (auto& q : dropped) for (auto& b : q)
+                if (b.release) { try { b.release(); } catch (...) {} }
+        }
         void check_dst(unsigned dst) const { if (dst >= senders.size()) throw std::out_of_range("handoff lanes: destination"); }
         bool all_empty() const { for (const auto& q : queues) if (!q.empty()) return false; return true; }
         // Round robin over members with queued bulk and room ahead; -1 = none.
@@ -165,8 +187,7 @@ private:
                     s->cv.notify_all();
                 }, false);
             } catch (...) {
-                std::lock_guard<std::mutex> g(S.m);
-                if (!S.error) S.error = std::current_exception();
+                S.cancel(std::current_exception());
             }
             { std::lock_guard<std::mutex> g(S.m); --S.handing; }
             S.cv.notify_all();
