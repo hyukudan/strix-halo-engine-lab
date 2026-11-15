@@ -78,6 +78,10 @@ STRIX_RS_FN float f32_from_f16_host(std::uint16_t half) {
 // ---- device / host dispatch -------------------------------------------------------------------------------
 STRIX_RS_FN std::uint16_t f16_from_f32(float value) {
 #if defined(__HIP_DEVICE_COMPILE__)
+    // The barrier keeps the operand a materialised f32: without it the compiler may fold fptrunc(fmul / fma) into
+    // v_fma_mixlo_f16 (ONE rounding of the exact result to f16) instead of f32 rounding then f16 rounding, so a
+    // fused and an unfused site would store different bits (hal2 RUN3 window != serial).
+    __asm__ volatile("" : "+v"(value));
     if (__builtin_isnan(value)) return static_cast<std::uint16_t>((f32_bits(value) >> 16 & 0x8000U) | 0x7e00U);
     return __builtin_bit_cast(std::uint16_t, static_cast<_Float16>(value));
 #elif defined(__CUDA_ARCH__)
@@ -166,6 +170,7 @@ template <RecurrentStateType Type> STRIX_RS_FN float round_in_register(float val
     if constexpr (Type == RecurrentStateType::bf16) return f32_from_bf16(bf16_from_f32(value));
     else if constexpr (Type == RecurrentStateType::f16) {
 #if defined(__HIP_DEVICE_COMPILE__)
+        __asm__ volatile("" : "+v"(value));  // no fptrunc(fmul / fma) -> v_fma_mixlo fold (see f16_from_f32)
         return static_cast<float>(static_cast<_Float16>(value));
 #elif defined(__CUDA_ARCH__)
         return __half2float(__float2half_rn(value));
