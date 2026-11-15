@@ -469,17 +469,36 @@ class MiniMaxFloor(unittest.TestCase):
         d = p["dnll_rule"]
         names = [c["name"] for c in d["checks"]]
         self.assertEqual(names, ["kl", "top1", "dnll", "kl_q50", "kl_q90", "kl_q99", "sign", "copy"])
-        self.assertEqual((d["policy"], d["onset"], d["n_nulls"]), ("minimax-onset-floor-v1.1", 30, 3))
+        self.assertEqual((d["policy"], d["onset"], d["n_nulls"]), ("minimax-onset-floor-v1.2", 30, 3))
         for q in d["checks"][3:6]:
             self.assertEqual(q["limit"], max(q["floor"], q["tol"]))
         kl = [n["stats"]["kl"] for n in d["nulls"]]
         c = d["checks"][0]
-        self.assertAlmostEqual(c["limit"], float(np.mean(kl) + 2 * np.std(kl, ddof=1)), places=12)
-        self.assertEqual(d["limit"], min(d["floor_limit"], 0.03))
-        self.assertEqual(p["pass"], all(x["pass"] for x in d["checks"]))
+        self.assertAlmostEqual(c["floor"], float(np.mean(kl) + 2 * np.std(kl, ddof=1)), places=12)
+        self.assertEqual(c["limit"], max(0.02, c["floor"]))  # the floor only relaxes the absolute bar
+        self.assertEqual(d["limit"], min(max(0.01, d["floor_limit"]), 0.03))
+        self.assertEqual([x["name"] for x in d["checks"] if not x["required"]], ["kl_q99"])
+        self.assertEqual(p["pass"], all(x["pass"] for x in d["checks"] if x["required"]))
         self.assertEqual(rc, 0 if p["pass"] else 1)
         self.assertTrue(p["pass"], [x for x in d["checks"] if not x["pass"]])  # a candidate drawn like the nulls passes
         self.assertEqual(p["abs_pass"], p["kl"] <= 0.02 and p["top1"] >= 0.93 and p["dnll"] <= 0.01)
+
+    def test_floor_never_tighter_than_absolute(self):
+        ref, _ = self.mm_arm("ref", self.ref)
+        nulls = []
+        for i, up in enumerate((0.30, 0.32, 0.34)):  # nulls that all improve the true token: floor limit < 0
+            z = self.ref.copy()
+            z[np.arange(MR - 1), self.labels[:-1]] += up
+            nulls.append(self.mm_arm(f"null{i}", z, control=(40, i + 1))[0])
+        z = self.ref.copy()
+        z[np.arange(MR - 1), self.labels[:-1]] -= 0.02  # slightly worse than exact, far inside the absolute 0.01
+        cand, _ = self.mm_arm("cand", z, fast=(11, 40))
+        out = self.root / "tight.json"
+        self.cmp(ref, cand, nulls, out=out)
+        dn = next(c for c in json.loads(out.read_text(encoding="utf-8"))["pooled"]["dnll_rule"]["checks"] if c["name"] == "dnll")
+        self.assertLess(dn["floor"], 0.0)
+        self.assertEqual(dn["limit"], 0.01)
+        self.assertTrue(dn["pass"], dn)
 
     def test_onset_seed_and_base_refusals(self):
         ref, cand, nulls = self.fixture()

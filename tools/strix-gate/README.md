@@ -240,9 +240,9 @@ prompts and reference) the candidate must pass all of (`MM_FLOOR` in the script)
 
 | check | rule |
 |---|---|
-| `kl`, `top1` | pooled KL <= mean + 2 sd of the nulls; top-1 >= mean - 2 sd |
-| `dnll` | pooled dNLL <= min(mean + 2 sd, 0.03): a wide floor never relaxes the bar past 3 x 0.01 |
-| `kl_q50`, `kl_q90`, `kl_q99` | each per-row KL quantile <= max(mean + 2 sd of the nulls' same quantile, tolerance 1e-3 / 0.02 / 0.02): a diffuse shift cannot hide under heavy null tails, and a one-ulp null's median row (rounding only, KL ~1e-5) does not demand bitwise arithmetic |
+| `kl`, `top1` | pooled KL <= max(0.02, mean + 2 sd of the nulls); top-1 >= min(0.93, mean - 2 sd): the floor only relaxes the absolute bar |
+| `dnll` | pooled dNLL <= min(max(0.01, mean + 2 sd), 0.03): never tighter than the absolute 0.01, never looser than 3 x 0.01 |
+| `kl_q50`, `kl_q90` | each per-row KL quantile <= max(mean + 2 sd of the nulls' same quantile, tolerance 1e-3 / 0.02): a diffuse shift cannot hide under heavy null tails, and a one-ulp null's median row (rounding only, KL ~1e-5) does not demand bitwise arithmetic; `kl_q99` is reported only (the tail is chaos, and one null site flips fewer near-ties than a FAST layer set) |
 | `sign` | rows with abs(dNLL) >= 1e-3: one-sided binomial P(X >= worse) >= 0.01 against p0 = max(0.5, pooled null worse share); more chaos adds rows, not slack |
 | `copy` | copy rows (the last 8 prompt tokens occurred earlier and were followed by the true token; token-only, the same rows for every arm): next-token misses beyond the reference's <= worst null + max(1, ceil(1 %)) |
 

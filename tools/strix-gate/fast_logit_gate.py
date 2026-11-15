@@ -73,13 +73,16 @@ WITNESS_SCHEMA = "strix-fast-execution/v1"
 DS41_NULL_CONTROL = {"kind": "layer0-null", "layer": 0, "magnitude": 1, "unit": "ulp"}
 MM_NULL_KIND = "attn-ulp-null"  # MiniMax null control: {"kind", "layer", "magnitude": 1, "unit": "ulp", "seed"}
 MM_FLOOR = {
-    "policy": "minimax-onset-floor-v1.1",
+    "policy": "minimax-onset-floor-v1.2",
     "dnll_cap": 0.03,                   # the floor-relative dNLL limit never exceeds 3 x the absolute 0.01
     "kl_quantiles": (0.5, 0.9, 0.99),   # per-row KL quantiles: max(mu + 2 sd of the nulls' same quantile, tolerance)
     # v1.1: a quantile limit is never below these (nats). A one-ulp null's median row only carries rounding (KL ~1e-5,
     # sd ~1e-6), so a purely relative q50 demands bitwise arithmetic; 1e-3 = 1/20 of the absolute mean bar 0.02 still
     # catches a diffuse defect, and q90 / q99 are never held stricter than the absolute mean bar.
     "kl_quantile_tol": {"q50": 1e-3, "q90": 0.02, "q99": 0.02},
+    # v1.2: q99 is reported, not required: the tail is chaos and one null site flips fewer near-ties than a FAST layer set
+    # (measured: the 40-59 control, absolute PASS, sits at q99 0.025-0.029 vs its single-site nulls 0.017-0.022).
+    "required_quantiles": ("q50", "q90"),
     "sign_min_abs": 1e-3,               # rows with |dNLL| >= this (nats) enter the sign test
     "sign_alpha": 0.01,                 # one-sided binomial P(X >= worse) vs p0 = max(0.5, pooled null worse share)
     "copy_k": 8,                        # copy row: the last k prompt tokens occurred before, followed by the true token
@@ -292,25 +295,30 @@ def mean_sd(values):
     return float(v.mean()), float(v.std(ddof=1))
 
 
-def minimax_floor_checks(c, nulls, policy=MM_FLOOR):
-    """The six MiniMax floor checks of candidate stats `c` against the null stats (all must pass)."""
+def minimax_floor_checks(c, nulls, policy=MM_FLOOR, max_kl=0.02, min_top1=0.93, max_dnll=0.01):
+    """The MiniMax floor checks of candidate stats `c` against the null stats; every check with required=True must pass.
+    The floor only relaxes: KL / top-1 / dNLL limits are the looser of the absolute bar and the null spread (mean +- 2 sd),
+    the dNLL limit capped at policy dnll_cap, so a tight or negative null floor never makes a bar stricter than absolute."""
     checks, k = [], FLOOR_SIGMAS
 
-    def add(name, value, limit, ok, **extra):
-        checks.append({"name": name, "value": value, "limit": limit, "pass": bool(ok), **extra})
+    def add(name, value, limit, ok, required=True, **extra):
+        checks.append({"name": name, "value": value, "limit": limit, "pass": bool(ok), "required": required, **extra})
 
     m, s = mean_sd([n["kl"] for n in nulls])
-    add("kl", c["kl"], m + k * s, c["kl"] <= m + k * s, mean=m, sd=s)
+    limit = max(max_kl, m + k * s)
+    add("kl", c["kl"], limit, c["kl"] <= limit, mean=m, sd=s, floor=m + k * s, abs=max_kl)
     m, s = mean_sd([n["top1"] for n in nulls])
-    add("top1", c["top1"], m - k * s, c["top1"] >= m - k * s, mean=m, sd=s)
+    limit = min(min_top1, m - k * s)
+    add("top1", c["top1"], limit, c["top1"] >= limit, mean=m, sd=s, floor=m - k * s, abs=min_top1)
     m, s = mean_sd([n["dnll"] for n in nulls])
-    limit = min(m + k * s, policy["dnll_cap"])
-    add("dnll", c["dnll"], limit, c["dnll"] <= limit, mean=m, sd=s, floor=m + k * s, cap=policy["dnll_cap"])
+    limit = min(max(max_dnll, m + k * s), policy["dnll_cap"])
+    add("dnll", c["dnll"], limit, c["dnll"] <= limit, mean=m, sd=s, floor=m + k * s, abs=max_dnll, cap=policy["dnll_cap"])
     for q in c["kl_q"]:
         m, s = mean_sd([n["kl_q"][q] for n in nulls])
         tol = policy["kl_quantile_tol"].get(q, 0.0)
         limit = max(m + k * s, tol)
-        add(f"kl_{q}", c["kl_q"][q], limit, c["kl_q"][q] <= limit, mean=m, sd=s, floor=m + k * s, tol=tol)
+        add(f"kl_{q}", c["kl_q"][q], limit, c["kl_q"][q] <= limit, required=q in policy["required_quantiles"],
+            mean=m, sd=s, floor=m + k * s, tol=tol)
     nw, nc = sum(n["worse"] for n in nulls), sum(n["worse"] + n["better"] for n in nulls)
     p0 = max(0.5, nw / nc) if nc else 0.5
     changed = c["worse"] + c["better"]
@@ -795,18 +803,19 @@ def compare(a):
         dv.update(engine=a.engine, profile=a.profile, nulls=null_rows)
         ok = kl <= a.max_kl and top1 >= a.min_top1 and dv["pass"]
         if mm_floor:
-            checks = minimax_floor_checks(stats, null_stats)
+            checks = minimax_floor_checks(stats, null_stats, max_kl=a.max_kl, min_top1=a.min_top1, max_dnll=a.max_dnll)
             dnll_check = next(c for c in checks if c["name"] == "dnll")
             dv.update(policy=MM_FLOOR["policy"], onset=onset, checks=checks, floor_limit=dv["limit"],
                       limit=dnll_check["limit"], cap=MM_FLOOR["dnll_cap"], pass_dnll=dnll_check["pass"])
             dv["pass"] = dnll_check["pass"]
-            ok = all(c["pass"] for c in checks)
+            ok = all(c["pass"] for c in checks if c["required"])
             for c in checks:
-                extra = {k: v for k, v in c.items() if k not in ("name", "value", "limit", "pass")}
-                print(f"check {c['name']}: {c['value']:.6g} vs limit {c['limit']:.6g} -> {'PASS' if c['pass'] else 'FAIL'} "
+                extra = {k: v for k, v in c.items() if k not in ("name", "value", "limit", "pass", "required")}
+                print(f"check {c['name']}: {c['value']:.6g} vs limit {c['limit']:.6g} -> {'PASS' if c['pass'] else 'FAIL'}"
+                      f"{'' if c['required'] else ' (reported, not required)'} "
                       f"{json.dumps(extra, sort_keys=True)}")
             rule = (f"floor {a.engine}/{a.profile} {MM_FLOOR['policy']} onset layer {onset}, {dv['n_nulls']} nulls: all of "
-                    f"{', '.join(c['name'] for c in checks)}")
+                    f"{', '.join(c['name'] for c in checks if c['required'])} (floor only relaxes the absolute bar)")
         elif a.dnll_rule == "floor":
             rule = (f"KL <= {a.max_kl}, top-1 >= {a.min_top1}, dNLL <= {dv['limit']:+.5f} (floor {a.engine}/{a.profile}: "
                     f"{dv['n_nulls']} nulls mean {dv['mean']:+.5f} + {FLOOR_SIGMAS:g} sd {dv['sd']:.5f})")
