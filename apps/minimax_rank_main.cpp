@@ -1752,7 +1752,8 @@ int main(int argc, char** argv) {
             if (cut_cfg.split != lc::chain::Split::layer_cut || opt.rank >= 2 || cut_relay_port > 65535)
                 throw std::invalid_argument("--layercut-listen needs layer-cut policy, rank 0/1 and valid relay port");
             // A chunk-dependent pair identity keeps the pair-alone chunk rows (the resolver made the block a multiple of
-            // them) and runs each block as one unit; the row-invariant FP32 identity may shrink its chunks to the block.
+            // them) and caps unit width at a block; group width may cap it further or grouping may be disabled.
+            // Units may cross block boundaries. The row-invariant FP32 identity may shrink its chunks to the block.
             if (cut_cfg.grain != 0) {
                 if (cut_cfg.grain != opt.max_rows || cut_cfg.block % opt.max_rows != 0)
                     throw std::logic_error("layercut: block / pair chunk identity grain mismatch");

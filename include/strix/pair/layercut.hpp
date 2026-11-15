@@ -4,6 +4,7 @@
 #include "strix/pair/chain.hpp"
 #include "strix/handoff.hpp"
 #include <charconv>
+#include <limits>
 #include <optional>
 #include <string_view>
 
@@ -55,6 +56,14 @@ inline std::uint32_t identity_grain(std::string_view pair_identity) {
     if (rows == 0 || rows % 16 != 0) throw std::invalid_argument("layercut pair identity: chunk rows must be a positive multiple of 16");
     return rows;
 }
+// Chunk admission belongs to routes that may cut layers, not ordinary engine sizing.
+// Match resolve's CLI-over-environment precedence, including an explicit device-only override.
+inline std::uint32_t route_identity_grain(const Cli& cli, std::string_view pair_identity,
+    Lookup env = [](const char* k) { return envcfg::text(k); }) {
+    const char* value = cli.split ? cli.split->c_str() : env("STRIX_SPLIT");
+    const std::string_view split = value && *value ? value : "device-only";
+    return split == "layer-cut" || split == "auto" ? identity_grain(pair_identity) : 0;
+}
 inline double link_class(std::string_view s) {
     if (s == "1gbe") return 118;
     if (s == "2.5gbe") return 290;
@@ -89,13 +98,16 @@ inline Resolved resolve(const Cli& cli, const Inputs& input, Lookup env = [](con
     const std::uint32_t grain = input.pair_grain;
     out.grain = grain;
     if (grain != 0 && b.origin == "default") b = {std::to_string(grain), "identity grain"};
-    if (b.text != "auto") {
-        out.block = number(b.text, "STRIX_SPLIT_BLOCK");
-        if (out.block == 0 || out.block % 16 != 0) throw std::invalid_argument("STRIX_SPLIT_BLOCK: expected positive multiple of 16");
-        if (grain != 0 && out.block % grain != 0)
-            throw std::invalid_argument("STRIX_SPLIT_BLOCK=" + std::to_string(out.block) + " splits the pair's " +
+    const auto validate_block = [grain](std::uint32_t block) {
+        if (block == 0 || block % 16 != 0) throw std::invalid_argument("STRIX_SPLIT_BLOCK: expected positive multiple of 16");
+        if (grain != 0 && block % grain != 0)
+            throw std::invalid_argument("STRIX_SPLIT_BLOCK=" + std::to_string(block) + " splits the pair's " +
                 std::to_string(grain) + "-row chunks: the cut layers would not reproduce the pair-alone bits "
                 "(chunk-local MoE split classes); use a multiple of " + std::to_string(grain));
+    };
+    if (b.text != "auto") {
+        out.block = number(b.text, "STRIX_SPLIT_BLOCK");
+        validate_block(out.block);
     }
     const bool plan = s.text == "auto" || b.text == "auto" ||
         (c.text == "auto" && (c.origin != "default" || out.split == chain::Split::layer_cut));
@@ -112,7 +124,12 @@ inline Resolved resolve(const Cli& cli, const Inputs& input, Lookup env = [](con
         req.split = out.split; req.rows = input.rows; req.decoders = {1};
         if (b.text != "auto") req.blocks = {out.block};
         else if (grain == 0) req.blocks = {256, 512, 1024, 2048, 4096};
-        else req.blocks = {grain, 2 * grain, 4 * grain};  // identity-legal candidates only
+        else for (const std::uint64_t multiple : {1ULL, 2ULL, 4ULL}) {
+            const auto candidate = multiple * grain;
+            if (candidate <= std::numeric_limits<std::uint32_t>::max())
+                req.blocks.push_back(static_cast<std::uint32_t>(candidate));
+        }
+        for (const auto block : req.blocks) validate_block(block);
         if (c.text != "auto") req.legal_cut = [cut = out.cut](std::uint32_t k) { return k == cut; };
         if (out.split == chain::Split::layer_cut) req.cuts = {out.cut};
         const auto best = chain::choose(devices, {{mbps * 1000, mbps * 1000, 0}}, input.model, req).best;
@@ -126,6 +143,7 @@ inline Resolved resolve(const Cli& cli, const Inputs& input, Lookup env = [](con
         if (b.text == "auto") { out.block = best.block; b.origin = "planner"; }
         out.reason = best.reason + "; declared rates, qualification pending";
     } else out.reason = "explicit policy; default route unchanged; layer-cut qualification pending";
+    validate_block(out.block);
     if (out.split == chain::Split::layer_cut && (out.cut == 0 || out.cut >= input.model.layers))
         throw std::invalid_argument("STRIX_SPLIT_CUT: layer-cut requires [1,L-1]");
     const auto line = [&](const char* key, const std::string& v, const std::string& origin) {

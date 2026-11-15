@@ -54,12 +54,12 @@ CutArguments cut_arguments(int argc, char** argv) {
         else if (flag == "--max-rows") args.chunk_rows = lc::number(next(), "--max-rows");
     }
     lc::Inputs input{mlc::chain_shape()};
-    input.pair_grain = lc::identity_grain(cut_pair_identity(args.chunk_rows));
-    if (input.pair_grain == mlc::pair_chunk_rows) input.pair_unit_scale = mlc::pair_unit_scale();
     if (!args.listens.empty()) {
         if (!cli.split) cli.split = "layer-cut";
         input.rows = read_u32(cut_fields(args.listens.front())[1]).size();
     }
+    input.pair_grain = lc::route_identity_grain(cli, cut_pair_identity(args.chunk_rows));
+    if (input.pair_grain == mlc::pair_chunk_rows) input.pair_unit_scale = mlc::pair_unit_scale();
     input.rtx_rows_s = strix::envcfg::number<double>("STRIX_SPLIT_RTX_ROWS_S", 0, 0);
     input.pair_rows_s = strix::envcfg::number<double>("STRIX_SPLIT_PAIR_ROWS_S", 0, 0);
     input.link_mbps = strix::envcfg::number<double>("STRIX_SPLIT_LINK_MBPS", 0, 0);

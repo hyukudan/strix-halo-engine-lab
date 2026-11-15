@@ -185,6 +185,15 @@ int main() try {
         listener.pair_unit_scale = producer.pair_unit_scale = mm::pair_unit_scale();
         lc::Cli same; same.split = "layer-cut"; same.cut = "28";
         require(lc::resolve(same, listener, none).lines == lc::resolve(same, producer, none).lines, "listener == producer");
+        // Near UINT32_MAX/4 and /2: overflowing candidates must never wrap to a small block.
+        g.rows = 16; cut.block = "auto";
+        for (const char* id : {"default/c1073741808", "default/c1073741840",
+                               "default/c2147483664", "default/c4294967280"}) {
+            g.pair_grain = lc::identity_grain(id);
+            const auto boundary = lc::resolve(cut, g, none);
+            require(boundary.block == g.pair_grain && boundary.block % g.pair_grain == 0,
+                "auto boundary candidates preserve identity grain");
+        }
     }
     // Measured unit-rows scale: log2-linear, clamped; small blocks cost the pair more per row.
     {
@@ -199,6 +208,17 @@ int main() try {
         u.pair_unit_scale = {{256, 3.0}, {1024, 1.274}, {4096, 1.0}};
         const auto scaled = lc::resolve(cut, u, none);
         require(scaled.block >= flat.block, "a small-unit penalty never shrinks the planned block");
+        // Known two-stage cost, with a 16-row block and an 8-row tail. Scaling changes
+        // only device row costs; stage fixed costs and the link stay unchanged.
+        const lc::chain::ModelShape shape{2, 1, {0, 0}, {0, 0}, {}};
+        std::vector<lc::chain::Device> devices{{"first", {1, 0}}, {"last", {0, 2}}};
+        devices[1].block_fixed_ms = 3;
+        const auto plain = lc::chain::evaluate(devices, {{1, 1, 5}}, shape, 24, 0, 1, {0, 1, 2}, 16);
+        devices[1].unit_scale = {{8, 3}, {16, 2}};
+        const auto weighted = lc::chain::evaluate(devices, {{1, 1, 5}}, shape, 24, 0, 1, {0, 1, 2}, 16);
+        require(plain.valid && weighted.valid && plain.wall_ms == 91 && weighted.wall_ms == 155 &&
+            weighted.stage_block_ms[1] == 67 && weighted.hop_block_ms[0] == 21,
+            "scale affects evaluated full blocks and tails, not fixed or link costs");
     }
     std::puts("PASS: layercut resolver, schedule, metadata, coverage and KV reassembly");
     return 0;
