@@ -18,6 +18,12 @@ project(strix_engine_lab VERSION 0.1.0 LANGUAGES CXX)
 option(STRIX_LEGACY_MAINS "Build legacy Gemma4 and MiniMax serve executables" ON)
 
 # Standalone CUDA Qwen prefill and host-only scheduling/codec checks.
+option(STRIX_CUDA_CORE "Build the shared CUDA core and strix-cuda-qwen35-decode" OFF)
+option(STRIX_CUDA_CORE_ONLY "Build only the shared CUDA core (CUDA language, no HIP tree)" OFF)
+if(STRIX_CUDA_CORE_ONLY)
+    include(cmake/CudaCore.cmake)
+    return()
+endif()
 option(STRIX_CUDA_QWEN_ONLY "Build only the CUDA Qwen prefill service and gates" OFF)
 if(STRIX_CUDA_QWEN_ONLY)
     include(CTest)
@@ -5647,4 +5653,8 @@ include("${CMAKE_CURRENT_LIST_DIR}/cmake/servespec/hook.cmake")
 # CPU backend (opt-in, docs/architecture/backends.md).
 if(STRIX_BACKEND_CPU)
     include("${CMAKE_CURRENT_LIST_DIR}/cmake/StrixBackendCpu.cmake")
+endif()
+# Shared CUDA core (opt-in).
+if(STRIX_CUDA_CORE)
+    include("${CMAKE_CURRENT_LIST_DIR}/cmake/CudaCore.cmake")
 endif()
