@@ -892,6 +892,21 @@ Build the shared expert's FP16 operand once for gate/up and down; the existing t
 - **Measured gain:** ~-1 % TTFT at 32K; combined five-item set -0.71 s (-3.2 %) at 32K vs all five off (interleaved, same build)
 - **Implementation / evidence:** [defaults](../include/strix/qpf2k_defaults.hpp), [engine reference](getting-started/engine-reference.md)
 
+<a id="qwen-glu-pair"></a>
+
+### Paired GLU store for the shared-expert preimage
+
+**Engine:** `qwen` (shared policy `src/core/glu_pair.hpp`). **Control:** `STRIX_QPF2K_GLU_PAIR`. **Default:** 1.
+
+When the shared-expert preimage is admitted, the tiled gate|up interleaves 16-output blocks of gate and up. Each lane then holds both operands of one (row, feature), and the epilogue writes the FP16 activation directly. Neither the FP32 gate|up image nor the activation pass is materialized. The activation pass shrinks to the shared gate's dot, which runs before the gate|up so the preimage stays cache-resident for its down. With the item off, the pre-kernel no longer writes the FP32 activation that has no reader.
+
+- **Preconditions:** `STRIX_QPF2K_SHARED_PRE` admitted (its own preconditions apply), tiled gate|up admitted for the same rows, features a multiple of 16.
+- **Fallback notice:** `=0` keeps the activation pre-kernel; `=2` forces form 0 for the paired kernel (default: form 4). Any failed check keeps the pre-kernel route.
+- **Exactness evidence:** Bitwise: the shared-pre fixture (32..8192 rows, nine gate/up payload kinds including non-finite values, two streams) gives equal FP16 preimage, gate, outputs and overflow count on every route, plus an RNE oracle. Final logits are identical at 8K, 32K and 128K. The product is one `v_mul_f32`; without that, LLVM folds it with the FP16 cast into `v_fma_mixlo_f16` (1 ulp).
+- **Off switch:** STRIX_QPF2K_GLU_PAIR=0
+- **Measured gain:** Shared-expert kernels per 8K request 146.6 -> 128.0 ms (-18.6 ms), at 32K -68 ms (traced, one node). The request-level effect (-0.1 % at 8K, -0.5 % at 32K) is within clock noise.
+- **Implementation / evidence:** [policy](../src/core/glu_pair.hpp), [tiled kernel](../src/hip_dense_f16_tiled.hpp)
+
 <a id="qwen-moe-merge-commit"></a>
 
 ### MoE ordered merge + BF16 commit
