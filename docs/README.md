@@ -55,6 +55,7 @@ work as it stood on their date; documents marked **Superseded** name their repla
 
 - [Measured performance](performance.md): All measured speed numbers with date, config and exactness check, per model and for the USB4 link.
 - [Methodology](methodology.md) ([Español](methodology.es.md)): How the tables are read, exactness per engine, model fidelity, defaults and off switches, design decisions.
+- [Measurement kits](benchmarking.md) ([Español](benchmarking.es.md)): The ABAB kits under `scripts/bench/<area>/` (prefill length matrices, served decode classes, FAST gates, vision battery, RTX routes) with their validity rules and commands.
 - [Measured gains](measured-gains.md) ([Español](measured-gains.es.md)): Changelog of every shipped default with its measured gain, exactness evidence and off switch.
 - [Two nodes over USB4](pair.md) ([Español](pair.es.md)): The pair, what it needs, how DeepSeek, MiniMax and GLM run on it, links to the transport internals.
 - [Serving over HTTP](serving.md) ([Español](serving.es.md)): Which server each engine has, serving features, exposing the servers safely.
