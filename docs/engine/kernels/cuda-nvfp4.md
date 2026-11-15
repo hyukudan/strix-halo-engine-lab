@@ -82,3 +82,14 @@ Keep generated receipts in the build/output directory. Unit tests have a
 110-second timeout and refuse any visible-device setting other than `0`.
 These operator gates do not qualify model fidelity or complete workloads;
 production numerical defaults and model integration remain pending those gates.
+
+## Measured limits (review, graph replay, RTX PRO 6000, device 0)
+
+Both activations and weights are FP4 here (W4A4), so the arithmetic identity is
+tolerance-qualified, not an FP16-activation GEMV: against a double-precision dot
+of the same dequantised weights and FP32 activations the relative RMS error is
+about 9.5e-2 for 5120 and 17408 inputs, versus about 2e-4 for an FP16-activation
+(W4A16) kernel on the same weights. An ABAB comparison with a W4A16 GEMV on the
+Qwen3.8-27B shapes (rows 1 and 8) shows this decode route at 0.4-0.9 TB/s; rows
+above 8 take the GEMM route, which is 4-13x slower than the decode route for
+small M, so M 9..32 needs a decode-shaped route before a model adapter binds it.
