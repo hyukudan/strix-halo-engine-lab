@@ -46,6 +46,17 @@ int main() {
           "Qwen: 192 B/token/layer less (N multiple of 4)");
     check(13 * (st::raw_bytes(qwen, st::RawRows::full, 4) - st::state_bytes(qwen, st::RawRows::open_tail, 4)) / 4 == 2496,
           "Qwen: 2,496 B/token over 13 QSA layers");
+    // Qwen single node, MTP, N multiple of 4 (MINSTATE): today 29,952 N - 2,304 + Fq, minimum 27,456 N - 1,536 + Fq - 737,280
+    // (Fq = 116,400,144; the 737,280 = 36 GDN layers x one of four conv entries). Index part: 13 QSA layers.
+    {
+        const std::uint64_t Fq = 116400144ULL, N = 32768;
+        const std::uint64_t other = 29952ULL * N - 2304 + Fq - 13 * st::raw_bytes(qwen, st::RawRows::full, N);  // KV, MTP, held, fixed
+        const std::uint64_t minimum = other - 737280ULL + 13 * st::state_bytes(qwen, st::RawRows::open_tail, N) + 768;  // +768: the MTP QSA holds N - 1 rows (256 raw + 512 tail vs N rows)
+        check(minimum == 27456ULL * N - 1536 + Fq - 737280ULL, "Qwen 32K minimum = 27,456 N - 1,536 + Fq - 737,280");
+        check(minimum == 1015339536ULL, "Qwen 32K: 1,015.34 MB (MINSTATE table)");
+    }
+    // DS41 window ring (W = 128, capacity 136, 528 B/entry, 40 rings): only the last 127 entries are read again.
+    check(40ULL * st::last_rows(136, 127).rows * 528 == 2682240ULL, "DS41 ring minimum 2,682,240 B (MINSTATE)");
     // A declined form falls back to full with an observable reason; a granted one carries none.
     const auto declined = st::resolve_raw_rows(st::RawRows::open_tail, "raw keys reread by block_score_kernel");
     check(declined.form == st::RawRows::full && !declined.reason.empty(), "decline -> full + reason");
