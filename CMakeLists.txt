@@ -90,6 +90,7 @@ if(STRIX_EXPERIMENTAL_MALL_SHARED_DOWN_NT)
     endif()
     set_property(SOURCE src/hip_shared_expert_launcher.hip APPEND PROPERTY COMPILE_DEFINITIONS STRIX_EXPERIMENTAL_MALL_SHARED_DOWN_NT=1)
 endif()
+option(STRIX_BACKEND_CPU "Build the CPU backend scaffold (src/cpu) and its host tests" OFF)
 option(STRIX_USE_OPENSSL_SHA256 "Use OpenSSL for full-file SHA-256 verification" OFF)
 option(STRIX_CHECK_KERNEL_SCRATCH "Fail the build when a kernel's private scratch/spills exceed tools/kernel_scratch_allowance.txt" OFF)
 # Post-build check of every amdgcn code object linked into target (tools/check_kernel_scratch.py).
@@ -5595,3 +5596,7 @@ endfunction()
 cmake_language(DEFER CALL strix_link_host_cache_adopters)
 # Serving-spec fragments (cmake/servespec/*.cmake): shared serving sources and their host tests.
 include("${CMAKE_CURRENT_LIST_DIR}/cmake/servespec/hook.cmake")
+# CPU backend (opt-in, docs/architecture/backends.md).
+if(STRIX_BACKEND_CPU)
+    include("${CMAKE_CURRENT_LIST_DIR}/cmake/StrixBackendCpu.cmake")
+endif()
