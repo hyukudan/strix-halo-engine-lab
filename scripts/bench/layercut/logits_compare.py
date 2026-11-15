@@ -16,7 +16,15 @@ import numpy as np
 def load(prefix, what, rows):
     parts = [np.fromfile(f"{prefix}-{what}-r{r}.f32", dtype=np.float32) for r in (0, 1)]
     if rows:
-        parts = [p.reshape(rows, -1) for p in parts]
+        for rank, part in enumerate(parts):
+            last = f"{prefix}-logits-r{rank}.f32"
+            width = np.fromfile(last, dtype=np.float32).size
+            if not width or part.size % width:
+                raise ValueError(f"{prefix}: rank {rank}: incomplete vocabulary rows (last-row width {width})")
+            retained = part.size // width
+            if retained != rows:
+                raise ValueError(f"{prefix}: rank {rank}: requested {rows} teacher-forced rows, retained {retained}")
+            parts[rank] = part.reshape(rows, width)
         return np.concatenate(parts, axis=1).astype(np.float64)
     return np.concatenate(parts)[None, :].astype(np.float64)
 

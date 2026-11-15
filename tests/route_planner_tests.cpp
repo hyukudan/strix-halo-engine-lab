@@ -6,6 +6,7 @@
 #include <cmath>
 #include <cstdlib>
 #include <iostream>
+#include <limits>
 #include <stdexcept>
 #include <string>
 
@@ -282,7 +283,7 @@ void ds_tests() {
     require(p.chosen < 0 && p.reason.find("decode is placed on") != std::string::npos, "pinned unselectable option refused");
 }
 
-void one_resolver_tests() {
+void idle_load_tests() {
     const auto model = ds_model();
     const auto costs = parse_stage_costs(kDsCosts);
     const auto cli = inventory(kLink1g);
@@ -290,7 +291,7 @@ void one_resolver_tests() {
     serve.load["rtx"] = {}; serve.load["halo-a"] = {2, 0, false}; // idle prefill, pair decoding two streams
     const auto r = request("ds-like", 32768, {"halo-a", "halo-b"});
     const auto a = plan_route(r, cli, model, costs), b = plan_route(r, serve, model, costs);
-    require(a.hash() == b.hash() && a.to_json() == b.to_json(), "CLI and server resolve the same request identically");
+    require(a.hash() == b.hash() && a.to_json() == b.to_json(), "idle decode load leaves the planner deterministic");
     require(a.to_json().find("\"schema\":\"strix-route-v1\"") == 1 && a.to_json().find("\"route_id\":\"" + a.hash()) != std::string::npos,
             "route JSON schema and id");
     serve.load["rtx"].queued = 1; // the only explained difference: live load
@@ -334,18 +335,220 @@ void qwen_tests() {
     p = plan_route(request("qwen-like", 32768, {"halo-a"}), inventory(measured10g), qwen_model("synthetic-gate"), bare);
     require(option(p, "layers:").reason.find("no per-layer work") == 0, "split without layer work refused");
 }
+// Small independent timing oracle: two one-ms/row stages, with no wire or import costs.
+struct Tiny {
+    Inventory inv = inventory(kLink1g);
+    Model model{"tiny", 2, GiB, 0, 0, 0,
+                {{"layers", "pipe", "split", {"a", "b"}, {10}, "synthetic", 0}}};
+    StageCostTable costs{"tiny", {}};
+    RouteRequest req = request("tiny", 11, {});
+    Tiny() {
+        for (auto& d : inv.declaration.devices) {
+            d.attach = {};
+            d.attach.kind = "integrated";
+            d.roles = {"prefill", "decode"};
+        }
+        for (const auto& [unit, identity] : std::vector<std::pair<std::string, std::string>>{{"rtx", "a"}, {"halo-a", "b"}}) {
+            StageCost e;
+            e.name = identity; e.unit = {unit}; e.identity = identity; e.context = 11; e.chunk = 10;
+            e.total_ms = 22; e.layers = {1, 1}; e.spread = 0;
+            costs.entries.push_back(e);
+        }
+    }
+    RoutePlan plan() const { return plan_route(req, inv, model, costs); }
+};
+
+void request_validation_tests() {
+    Tiny t;
+    t.req.spec.context = 10;
+    require(!t.plan().selected(), "prompt must fit the admitted context");
+    t.req.spec.context = 0; t.req.prompt = 0;
+    require(!t.plan().selected(), "zero context refused before division");
+    t.req.spec.context = 32;
+    for (const double margin : {-1.0, std::numeric_limits<double>::quiet_NaN()}) {
+        t.req.spec.memory.margin_gib = margin;
+        require(!t.plan().selected(), "invalid margin refused before conversion");
+    }
+    t.req.spec.memory.margin_gib = 0; t.req.spec.slots = 2;
+    require(!t.plan().selected(), "provider slot limit enforced");
+    t.req.spec.slots = 1; t.model.protocols_[0].chunks = {0};
+    require(!t.plan().selected(), "zero protocol chunk refused");
+}
+
+void ownership_tests() {
+    rejects([] { return parse_stage_costs("schema = \"strix-stage-costs-v1\"\nmodel = \"m\"\n[costs.x]\n"
+        "unit = [\"g\", \"g\"]\ntopology = \"tp2\"\nidentity = \"i\"\ncontext = 1\ntotal_ms = 1.0\n"); }, "duplicate devices");
+    Tiny t;
+    t.model.protocols_[0].kind = "handoff";
+    t.costs.entries[1].unit = {"rtx", "halo-a"}; t.costs.entries[1].topology = "tp2";
+    require(!t.plan().selected(), "overlapping handoff cannot double spend device memory");
+    t.costs.entries[1].unit = {"halo-a", "halo-a"};
+    require(!t.plan().selected(), "programmatic cost units also reject duplicates");
+}
+
+void dense_path_tests() {
+    LinkGraph g;
+    for (int i = 0; i < 16; ++i) g.nodes.push_back(std::to_string(i));
+    for (std::size_t i = 0; i < g.nodes.size(); ++i)
+        for (std::size_t j = i + 1; j < g.nodes.size(); ++j)
+            g.edges.push_back({"e", g.nodes[i], g.nodes[j], "", "r", 1, 1, 0, RateSource::measured});
+    const auto p = best_path(g, "0", "15");
+    require(p.path && p.path->edges.size() == 1 && p.path->rtt_us == 1, "dense graph chooses direct equal-width path");
+    // A faster prefix is not necessarily the shortest path after a later bottleneck.
+    g = {{"a", "b", "c", "d"}, {
+        {"ab", "a", "b", "", "ab", 10, 100, 0, RateSource::measured},
+        {"ac", "a", "c", "", "ac", 5, 1, 0, RateSource::measured},
+        {"cb", "c", "b", "", "cb", 5, 1, 0, RateSource::measured},
+        {"bd", "b", "d", "", "bd", 5, 1, 0, RateSource::measured}}};
+    const auto q = best_path(g, "a", "d");
+    require(q.path && q.path->rtt_us == 3 && q.path->edges.size() == 3, "RTT optimized after bottleneck is fixed");
+}
+
+void planning_limit_tests() {
+    Tiny t;
+    t.model = Model("tiny", 500, GiB, 0, 0, 0,
+                    {{"layers", "pipe", "split", {"a", "b", "c"}, {10}, "synthetic", 0}});
+    auto third = t.costs.entries.back(); third.unit = {"halo-b"}; third.identity = "c";
+    t.costs.entries.push_back(third);
+    for (auto& e : t.costs.entries) e.layers.assign(500, 1);
+    const auto p = t.plan();
+    require(!p.selected() && p.options.empty() && p.reason.find("work limit") != std::string::npos,
+            "cut search fails closed at its work bound");
+    // Assignment product with no legal complete placement must also terminate.
+    t.model.protocols_[0].stages.assign(12, "a");
+    t.costs.entries.clear();
+    for (int i = 0; i < 12; ++i) {
+        auto e = third; e.unit = {"d" + std::to_string(i)}; e.identity = "a";
+        t.costs.entries.push_back(e);
+    }
+    require(t.plan().reason.find("work limit") != std::string::npos, "assignment search is bounded");
+}
+
+void stage_role_tests() {
+    Tiny t;
+    for (auto& d : t.inv.declaration.devices) d.roles = {"prefill"};
+    require(!t.plan().selected(), "last split stage must be decode eligible");
+    for (auto& d : t.inv.declaration.devices) {
+        d.roles = {"prefill", "decode"};
+        if (d.id == "halo-a") { d.attach.kind = "remote"; d.attach.link = "1gbe"; }
+    }
+    const auto p = t.plan();
+    require(!p.selected() && option(p, "layers:").reason.find("needs a measured rate") != std::string::npos,
+            "decode permission cannot bypass measured prefill permission");
+}
+
+void uneven_tail_tests() {
+    Tiny t;
+    const auto p = t.plan();
+    require(p.selected() && std::abs(p.selected()->predicted_ms - 21) < 1e-9,
+            "11 rows in blocks of 10 finish at 21 ms, including preceding block drain");
+    t.req.prompt = 20;
+    const auto full = t.plan();
+    require(full.selected() && std::abs(full.selected()->predicted_ms - 30) < 1e-9, "two full blocks finish at 30 ms");
+    t.req.prompt = 1;
+    require(std::abs(t.plan().selected()->predicted_ms - 2) < 1e-9, "one short block finishes at 2 ms");
+}
+
+void acknowledgement_tests() {
+    Tiny t;
+    for (auto& d : t.inv.declaration.devices) if (d.id == "rtx") {
+        d.attach.kind = "pcie"; d.attach.h2d_gbytes_ps = 1; d.attach.rtt_us_measured = 10000;
+    }
+    t.model = Model("tiny", 2, GiB, 100, 0, 2000,
+                    {{"layers", "pipe", "split", {"a", "b"}, {10}, "synthetic", 0, 0, 10}});
+    const auto p = t.plan();
+    const auto o = option(p, "layers:");
+    require(o.selectable && o.transfers.size() == 2, "acknowledgement fixture admitted");
+    require(std::abs(o.transfers[0].ms - 1000.001) < 1e-9, "seam full block pays 100 acknowledgements");
+    require(std::abs(o.transfers[1].ms - 1000.001) < 1e-9, "state pays 100 acknowledgements");
+    // With negligible wire time: seam [10,1010],[1010,1110]; stage1 [1010,1020],[1110,1111].
+    require(std::abs(o.predicted_ms - 2111.0021) < 1e-7, "total includes seam dependency and every state acknowledgement");
+}
+
+void shared_port_tests() {
+    Tiny t;
+    t.inv.declaration.links.clear();
+    for (auto& d : t.inv.declaration.devices) {
+        if (d.id == "halo-b") continue;
+        d.attach.kind = "pcie"; d.attach.port = "shared"; d.attach.h2d_gbytes_ps = 1;
+        d.attach.rtt_us_measured = 1000;
+    }
+    t.model = Model("tiny", 2, GiB, 0, 0, 1e9,
+                    {{"handoff", "pipe", "handoff", {"a", "b"}, {}, "synthetic", 0, 0, 10000000}});
+    const auto p = t.plan();
+    const auto o = option(p, "handoff:");
+    require(o.selectable && std::abs(o.transfers[0].ms - 2200) < 1e-9,
+            "one GB uses shared port twice plus 100 two-ms acknowledgements");
+    require(std::abs(o.predicted_ms - 2222) < 1e-9 && std::abs(o.rows_per_s - 5) < 1e-9,
+            "handoff total and throughput include repeated shared-port demand");
+}
+
+void chunk_calibration_tests() {
+    Tiny t;
+    t.req.prompt = 20;
+    t.model.protocols_[0].chunks = {10, 20};
+    for (auto& e : t.costs.entries) { e.context = 20; e.total_ms = 400; }
+    const auto first = t.costs.entries;
+    for (auto e : first) { e.name += "-20"; e.chunk = 20; e.total_ms = 40; t.costs.entries.push_back(e); }
+    const auto p = t.plan();
+    require(p.selected() && p.selected()->chunk == 20 && std::abs(p.selected()->predicted_ms - 40) < 1e-9,
+            "matching block measurements change the winning chunk");
+    require(p.selected()->stages[0].cost == "a-20", "receipt identifies matching chunk calibration");
+    t.model.protocols_[0].chunks = {5};
+    require(option(t.plan(), "layers:").reason.find("no matching chunk calibration") != std::string::npos,
+            "missing chunk calibration is explicitly labelled");
+}
+
+void decoder_admission_tests() {
+    Tiny t;
+    t.req.decode = {"halo-b"};
+    const auto a = t.plan();
+    require(a.selected() && a.selected()->stages.size() == 3, "off-chain decoder retained");
+    const auto& d = a.selected()->stages.back();
+    require(d.unit == t.req.decode && d.identity == "b" && d.topology == "single" && d.ranks.size() == 1 && d.ranks[0].fits,
+            "decoder has identity, topology and full-model rank admission");
+    t.inv.facts["halo-b"].mem_free_bytes -= GiB;
+    const auto b = t.plan();
+    require(b.selected() && a.hash() != b.hash() && a.to_json() != b.to_json(), "decoder budget participates in canonical receipt");
+}
+
+void pinned_cut_tests() {
+    Tiny t;
+    t.model = Model("tiny", 4, GiB, 0, 0, 0,
+                    {{"layers", "pipe", "split", {"a", "b"}, {10}, "synthetic", 0}});
+    t.req.prompt = 20;
+    for (auto& e : t.costs.entries) { e.layers.assign(4, 1); e.context = 20; e.total_ms = 80; }
+    const auto original = t.plan();
+    require(original.selected() && original.selected()->stages[0].end == 2, "original balanced cut is two");
+    t.req.pin = original.selected()->label;
+    t.costs.entries[0].total_ms = 800;
+    const auto pinned = t.plan();
+    require(pinned.selected() && pinned.selected()->label == t.req.pin, "legal pinned cut survives changed calibration");
+    t.req.pin.clear();
+    require(t.plan().selected()->stages[0].end == 1, "new optimum differs from pinned cut");
+}
 } // namespace
 
-int main() try {
+int main(int argc, char** argv) try {
 #ifdef _WIN32
     _set_abort_behavior(0, _WRITE_ABORT_MSG | _CALL_REPORTFAULT);
     _CrtSetReportMode(_CRT_ASSERT, _CRTDBG_MODE_FILE);
     _CrtSetReportFile(_CRT_ASSERT, _CRTDBG_FILE_STDERR);
 #endif
-    declaration_tests();
-    ds_tests();
-    one_resolver_tests();
-    qwen_tests();
+    const std::string test = argc > 1 ? argv[1] : "all";
+    const auto run = [&](const char* name, auto fn) { if (test == "all" || test == name) fn(); };
+    run("existing", [] { declaration_tests(); ds_tests(); idle_load_tests(); qwen_tests(); });
+    run("request_validation", request_validation_tests);
+    run("ownership", ownership_tests);
+    run("dense_path", dense_path_tests);
+    run("planning_limit", planning_limit_tests);
+    run("stage_role", stage_role_tests);
+    run("uneven_tail", uneven_tail_tests);
+    run("acknowledgement", acknowledgement_tests);
+    run("shared_port", shared_port_tests);
+    run("chunk_calibration", chunk_calibration_tests);
+    run("decoder_admission", decoder_admission_tests);
+    run("pinned_cut", pinned_cut_tests);
     std::cout << "route planner tests passed\n";
     return 0;
 } catch (const std::exception& e) {

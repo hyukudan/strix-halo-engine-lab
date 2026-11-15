@@ -8,13 +8,24 @@
 #include "strix/qwen_prefill_chain.hpp"
 #include <cstdio>
 #include <cstdlib>
+#include <charconv>
+#include <cmath>
 #include <string>
+#include <string_view>
 
 namespace {
 double number(const char* text, const char* name) {
     char* end = nullptr;
     const double value = std::strtod(text, &end);
-    if (!end || *end != '\0' || !(value >= 0.0)) throw std::invalid_argument(std::string("bad value for ") + name);
+    if (end == text || *end != '\0' || !std::isfinite(value) || !(value >= 0.0))
+        throw std::invalid_argument(std::string("bad value for ") + name);
+    return value;
+}
+template<class T> T integer(std::string_view text, const char* name) {
+    T value = 0;
+    const auto result = std::from_chars(text.data(), text.data() + text.size(), value);
+    if (text.empty() || result.ec != std::errc{} || result.ptr != text.data() + text.size())
+        throw std::invalid_argument(std::string("bad value for ") + name);
     return value;
 }
 std::vector<std::uint32_t> blocks(std::string text) {
@@ -23,9 +34,9 @@ std::vector<std::uint32_t> blocks(std::string text) {
     while (at <= text.size()) {
         const auto comma = text.find(',', at);
         const auto part = text.substr(at, comma == std::string::npos ? std::string::npos : comma - at);
-        const auto value = number(part.c_str(), "--blocks");
-        if (value < 1.0 || value > 65536.0) throw std::invalid_argument("--blocks entries must be 1..65536");
-        out.push_back(static_cast<std::uint32_t>(value));
+        const auto value = integer<std::uint32_t>(part, "--blocks");
+        if (value < 1U || value > 65536U) throw std::invalid_argument("--blocks entries must be 1..65536");
+        out.push_back(value);
         if (comma == std::string::npos) break;
         at = comma + 1U;
     }
@@ -55,7 +66,7 @@ int main(int argc, char** argv) try {
     for (int i = 1; i + 1 < argc; i += 2) {
         const std::string key = argv[i];
         const char* value = argv[i + 1];
-        if (key == "--rows") rows = static_cast<std::uint64_t>(number(value, "--rows"));
+        if (key == "--rows") rows = integer<std::uint64_t>(value, "--rows");
         else if (key == "--card-rate") card_rate = number(value, "--card-rate");
         else if (key == "--node-rate") node_rate = number(value, "--node-rate");
         else if (key == "--link-mbps") link_mbps = number(value, "--link-mbps");
@@ -67,7 +78,10 @@ int main(int argc, char** argv) try {
         else if (key == "--decoder") decoder = value;
         else if (key == "--costs") costs = value;
         else if (key == "--split") split_text = value;
-        else if (key == "--cuts") cut_text = value;
+        else if (key == "--cuts") {
+            cut_text = value;
+            if (cut_text.empty()) throw std::invalid_argument("bad value for --cuts");
+        }
         else throw std::invalid_argument("unknown option " + key);
     }
     if (argc % 2 == 0) throw std::invalid_argument("options take one value each");
@@ -88,6 +102,7 @@ int main(int argc, char** argv) try {
         devices.push_back(strix::qwen_pp::chain_seed_device("node-b", node_rate, {}, node_fixed));
     }
     const double link = link_mbps * 1000.0, pair = pair_mbps * 1000.0; // MB/s -> bytes/ms
+    if (!std::isfinite(link) || !std::isfinite(pair)) throw std::invalid_argument("link rate out of range");
     const std::vector<chain::Link> links{{link, link, latency}, {pair, pair, 0.05}};
     chain::Request request;
     request.rows = rows;
@@ -102,12 +117,12 @@ int main(int argc, char** argv) try {
     else if (split_text == "handoff-full") request.split = chain::Split::handoff;
     else if (split_text == "layer-cut") request.split = chain::Split::layer_cut;
     else throw std::invalid_argument("--split auto|device-only|handoff-full|layer-cut");
-    if (!cut_text.empty()) {  // "24,0": 0 = auto; same parser as --blocks (0 allowed here)
+    if (!cut_text.empty()) {  // "24,0": 0 = auto
         std::size_t at = 0;
         while (true) {
             const auto comma = cut_text.find(',', at);
             const auto part = cut_text.substr(at, comma == std::string::npos ? std::string::npos : comma - at);
-            request.cuts.push_back(static_cast<std::uint32_t>(number(part.c_str(), "--cuts")));
+            request.cuts.push_back(integer<std::uint32_t>(part, "--cuts"));
             if (comma == std::string::npos) break;
             at = comma + 1U;
         }
