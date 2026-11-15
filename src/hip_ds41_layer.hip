@@ -2752,7 +2752,7 @@ bool engram_f16_pf_admitted(const F16RowsView& v) noexcept {
 // columns) instead of the exact FP32 FMA chains of f16_tiled_pf (measured 4.2 TFLOPS: 77 ms per 1,024 rows).
 // Contract (the shared core's): x is rounded to FP16 (RNE); BF16 values of 2^-17 <= |x| < 2^16 convert exactly, smaller
 // ones lose low bits in FP16's subnormal range (absolute error <= 2^-25); the products are then exact in FP32 and the
-// sums run in WMMA order (one chain per row tile and column tile, 16-wide k units ascending). A scan flags |x| >= 2^16,
+// sums run in WMMA order (one chain per row tile and column tile, 16-wide k units ascending). A scan flags |x| >= 65520 (FP16 RNE overflow),
 // Inf and NaN (FP16 would overflow); then the WMMA launch exits and the exact separate kernel runs instead (the lever-off
 // bits), without a host sync. Shapes the exact tile path does not admit keep the exact path.
 int fast_engram_mode = -1;
@@ -2762,7 +2762,7 @@ static bool fast_engram_on() {
     return fast_engram_mode >= 0 ? fast_engram_mode != 0 : env;
 }
 namespace {
-// Sets *flag when any x of the view would overflow FP16: biased FP32 exponent >= 143 (|x| >= 2^16), Inf and NaN.
+// Sets *flag when any x of the view would overflow FP16 under RNE: |x| >= 65520 (FP32 bits 0x477FF000), Inf and NaN.
 __global__ __launch_bounds__(256) void engram_x_f16_scan(F16RowsView v, unsigned* flag) {
     const std::size_t per_row = v.width / 4U, total = per_row * v.rows;
     bool out = false;
@@ -2773,7 +2773,7 @@ __global__ __launch_bounds__(256) void engram_x_f16_scan(F16RowsView v, unsigned
 #pragma unroll
         for (unsigned k = 0; k < 4; ++k) {
             const unsigned m = words[k] & 0x7FFFFFFFU;
-            out = out || m >= (143U << 23U);
+            out = out || m >= 0x477FF000U;  // 65520: FP16 RNE overflows from here (Inf and NaN included)
         }
     }
     if (out) atomicOr(flag, 1U);
@@ -2824,12 +2824,16 @@ static bool enqueue_engram_f16_wmma(const F16RowsView& v, void* stream) {
     return true;
 }
 
-void enqueue_engram_f16_rows(const F16RowsView& v, void* stream) {
+void enqueue_engram_f16_rows(const F16RowsView& v, void* stream, bool fast_engram) {
     // Read on every call (in-process A/B); =0 restores enqueue_f16_rows with all its controls.
     const char* e = std::getenv("STRIX_DS41_ENGRAM_F16_PF");
-    if (fast_engram_on() && !(e && e[0] == '0') && engram_f16_wmma_supported(v) && enqueue_engram_f16_wmma(v, stream)) return;
+    if (fast_engram && !(e && e[0] == '0') && engram_f16_wmma_supported(v) && enqueue_engram_f16_wmma(v, stream)) return;
     if (!(e && e[0] == '0') && engram_f16_pf_admitted(v)) enqueue_engram_f16_pf(v, stream);
     else enqueue_f16_rows(v, stream);
+}
+
+void enqueue_engram_f16_rows(const F16RowsView& v, void* stream) {
+    enqueue_engram_f16_rows(v, stream, fast_engram_on());
 }
 
 void enqueue_f16_rows_pair(const F16RowsView& a, const F16RowsView& b, void* stream) {

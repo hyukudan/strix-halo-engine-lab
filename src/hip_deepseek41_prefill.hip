@@ -1577,7 +1577,6 @@ void DevicePrefill::set_precision_for_new_sequence(const PrefillOptions& p) {
     o.fast_engram = p.fast_engram;
     ds41::set_fast_dense(p.fast_dense ? 1 : 0);
     ds41::set_fast_moe(p.fast_moe ? 1 : 0);   // process-wide switch of the batch MoE dispatch (one sequence at a time here)
-    ds41::set_fast_engram(p.fast_engram ? 1 : 0);
 }
 
 PrefillResult DevicePrefill::run(std::span<const std::uint32_t> tokens) {
@@ -2428,7 +2427,7 @@ PrefillResult DevicePrefill::run_from(std::span<const std::uint32_t> tokens, std
                 v.x_stride = v.width;
                 v.out_stride = v.count;
                 v.out = m.ekv.p;
-                ds41::enqueue_engram_f16_rows(v, st);
+                ds41::enqueue_engram_f16_rows(v, st, m.options.fast_engram);
                 ds41::enqueue_engram_inject(stream_now() + std::size_t{r0} * stream_row, m.ekv.p, m.devf(p + "engram_q_norm.weight"),
                                             m.devf(p + "engram_k_norm.weight"), n, H, 1e-20F, st,
                                             m.image_rows_set ? m.image_rows.p + r0 : nullptr);  // image rows: gate 0 (upstream)
