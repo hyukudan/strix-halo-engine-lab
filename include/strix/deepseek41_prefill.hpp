@@ -2,8 +2,10 @@
 
 #include "strix/deepseek41_attention_state.hpp"
 #include "strix/session/embed_splice.hpp"
+#include "strix/serve/prefill_group.hpp"
 
 #include <cstdint>
+#include <cstring>
 #include <filesystem>
 #include <map>
 #include <memory>
@@ -66,7 +68,7 @@ struct PrefillOptions {
     std::uint32_t window_rows = 8;       // rows per attention window (1..attn::kMaxCallRows; also the unit of the row split)
     // rows per routed-MoE chunk (a multiple of chunk_rows; the expert weights are read once per chunk); world 2 sends
     // a chunk's half sums in pieces of chunk_rows rows on a communication stream while the next chunk runs
-    std::uint32_t moe_chunk_rows = 4096;
+    std::uint32_t moe_chunk_rows = 0;  // 0: automatic, starting at 4096; nonzero: hard upper bound
     std::uint32_t attention_lanes = 4;   // streams the windows of a chunk are spread over (index, select, attention)
     // world 2: tensor-parallel attention as the two-rank decode forward: rank r runs q_b of heads [32r, 32r + 32), their
     // attention, wo_a of o-groups [4r, 4r + 4) and wo_b's K-half r; the halves of every chunk are exchanged and
@@ -120,6 +122,16 @@ struct PrefillOptions {
     // owned; the others are loaded as usual. Serving keeps one copy of the weights per node this way. The owner must
     // outlive the prefill.
     std::map<std::string, std::pair<const void*, std::uint64_t>> shared_weights;
+    // Group pass (run_group): sequence states for up to group_members fresh short sequences of at most group_rows rows
+    // each, beside the full-size one of run / extend. 0 = none (run_group throws; no memory). Serving sets them from its
+    // prefill group policy (serve::PrefillGroupPolicy max_members / short_rows); the CLI never groups (one prompt).
+    std::uint32_t group_members = 0;
+    std::uint32_t group_rows = 64;
+};
+
+// One member of a group pass: a fresh sequence from position 0 (no resume, no snapshot points, no splice).
+struct PrefillSegment {
+    std::span<const std::uint32_t> tokens;
 };
 
 // timing (diagnostic: the stream is synchronized around each part, which removes overlap across parts). attention
@@ -145,6 +157,28 @@ struct PrefillResult {
     bool decoder_deferred = false;     // set_decoder_deferral admitted: no logits / next token / seed, decode state completed by the next run
     std::vector<std::uint64_t> stream_hashes;  // last row, after each layer (stream_hashes)
     bool embed_dead_hash_checked = false, embed_image_router_checked = false; // verify_embed_extras evidence
+    // Local sampled evidence only: every observed image residual stays bitwise unchanged,
+    // and a text residual in the same run changes in at least one Engram layer.
+    // Missing local rows/layers are inconclusive, never a distributed qualification.
+    bool embed_image_engram_checked = false;
+    bool embed_engram_image_seen = false, embed_engram_text_seen = false;
+    bool embed_engram_image_kept = true, embed_engram_text_moved = false;
+    void observe_embed_engram(std::span<const float> image_before, std::span<const float> image_after,
+                             std::span<const float> text_before, std::span<const float> text_after) {
+        const auto same_bits = [](std::span<const float> a, std::span<const float> b) {
+            return a.size() == b.size() && (a.empty() || std::memcmp(a.data(), b.data(), a.size_bytes()) == 0);
+        };
+        if (!image_before.empty()) {
+            embed_engram_image_seen = true;
+            embed_engram_image_kept = embed_engram_image_kept && same_bits(image_before, image_after);
+        }
+        if (!text_before.empty() && text_before.size() == text_after.size()) {
+            embed_engram_text_seen = true;
+            embed_engram_text_moved = embed_engram_text_moved || !same_bits(text_before, text_after);
+        }
+        embed_image_engram_checked = embed_engram_image_seen && embed_engram_image_kept &&
+                                     embed_engram_text_seen && embed_engram_text_moved;
+    }
     double seconds = 0.0, engram_seconds = 0.0, head_seconds = 0.0;
     double engram_wait_seconds = 0.0;  // overlapped Engram read: the part the run waited for (before the Engram layers)
     std::vector<PrefillLayerTiming> layers;
@@ -322,6 +356,38 @@ public:
     // export_state / export_state_at / state_hashes refuse and draft_seed is empty. STRIX_DS41_DEFER_DECODER=0: never admitted.
     void set_decoder_deferral(std::uint32_t next_rows);
     [[nodiscard]] AttentionState export_state_at(std::uint32_t position) const;
+
+    // ---- group pass (PFFIX spec (a): several short prompts admitted together = ONE pass over the layers) ----
+    // The route class a fresh sequence of `rows` rows takes ALONE: every row-count threshold of the run that can change
+    // the bits (kernel / split / joint selection) evaluated on these rows. Prompts group only within one class (serve::
+    // plan_prefill_group, R1), and run_group forces that class instead of re-selecting it from the summed rows.
+    [[nodiscard]] std::uint32_t route_class(std::uint32_t rows) const noexcept;
+    [[nodiscard]] serve::PrefillGroupCapacity group_capacity() const noexcept;
+    [[nodiscard]] static bool group_options_supported(const PrefillOptions& o) noexcept {
+        return !(o.fp16_dense || o.bf16_attention || o.fast_attention || o.fast_attention_flash || o.fast_dense || o.fast_moe || o.trace || o.stream_hashes ||
+                 o.routing_loads || o.quality_head_rows > 1U || o.null_ulp_layer >= 0 || o.verify_embed_extras);
+    }
+    // Members / rows per member the group states hold (PrefillOptions::group_members / group_rows); 0 = no group pass.
+    [[nodiscard]] std::uint32_t group_members() const noexcept;
+    [[nodiscard]] std::uint32_t group_rows() const noexcept;
+    // Run 2..group_members() fresh sequences (each 1..group_rows() rows, all of one route_class) as ONE pass: rows
+    // concatenated, every member's first row on an attention-window boundary; stateless work (hyper-connections, norms,
+    // projections, router, shared expert, MoE) once over all rows, stateful work (rings, caches, compressor carry, index
+    // count, Engram hashing, attention) per member on its own state; one exchange per layer per kind for the whole group;
+    // the head over the members' last rows in one launch. Result i equals run(segments[i].tokens) of a fresh sequence:
+    // logits, next_token and (export_state(i)) the attention state, bitwise. Levers that plan for one sequence (cone,
+    // decoder deferral, draft seed, snapshot points) are per member or off in a group pass (exact levers: same bits).
+    // World 2: both ranks call it with the same segments. Not during a task; afterwards the live sequence of run /
+    // extend is discarded (the next single-sequence operation must be run() or import_state()).
+    std::vector<PrefillResult> run_group(std::span<const PrefillSegment> segments);
+    // Member `segment` of the last run_group, as export_state() of its solo run (position = its rows).
+    [[nodiscard]] AttentionState export_state(std::size_t segment) const;
+    // Member `segment` of the last run_group: its draft seed (PrefillOptions::draft_rows), as draft_seed() of its solo run
+    // (its last min(draft_rows, rows) rows; first = rows - seed rows), valid until the next run. Empty for a missing member.
+    [[nodiscard]] DraftSeed draft_seed(std::size_t segment) const noexcept;
+    // Device bytes the group states and the group scratch of these options hold (0 when group_members is 0): memory admission
+    // adds them to the prefill's scratch estimate (serve::sched::prefill_piece_bytes covers the one-sequence buffers only).
+    [[nodiscard]] static std::uint64_t group_state_bytes(const PrefillOptions& options);
     [[nodiscard]] std::uint64_t weight_bytes() const noexcept;         // loaded (owned) by this prefill
     [[nodiscard]] std::uint64_t shared_weight_bytes() const noexcept;  // read in place from shared_weights
     // The bytes of weights a prefill with these options would load itself (not found in options.shared_weights; streamed

@@ -14,6 +14,7 @@
 #include "../apps/hip_session_store.hpp"
 #include "../apps/qwen_effective_config.hpp"
 #include "strix/serve/http_server.hpp"
+#include "strix/serve/ollama.hpp"
 
 #ifdef _WIN32
 #include <winsock2.h>
@@ -52,6 +53,15 @@ int socket_option(TestSocket fd,int level,int option,const void* value,socklen_t
 }
 struct SocketRuntime {};
 #endif
+auto socket_send(TestSocket fd, const char* data, std::size_t size, int flags) {
+#ifdef _WIN32
+    if (size > static_cast<std::size_t>(std::numeric_limits<int>::max()))
+        throw std::runtime_error("test socket write exceeds Winsock length range");
+    return ::send(fd, data, static_cast<int>(size), flags);
+#else
+    return ::send(fd, data, size, flags);
+#endif
+}
 void set_receive_timeout(TestSocket fd,unsigned seconds) {
 #ifdef _WIN32
     const DWORD timeout=seconds*1000;
@@ -276,7 +286,7 @@ Reply http(std::uint16_t port, const std::string& method, const std::string& pat
     if (::connect(fd, reinterpret_cast<sockaddr*>(&address), sizeof(address)) != 0) { close_socket(fd); return {}; }
     const auto request = method + " " + path + " HTTP/1.1\r\nHost: x\r\nConnection: close\r\nContent-Type: application/json\r\n" + extra +
         "Content-Length: " + std::to_string(body.size()) + "\r\n\r\n" + body;
-    (void)::send(fd, request.data(), request.size(), MSG_NOSIGNAL);
+    (void)socket_send(fd, request.data(), request.size(), MSG_NOSIGNAL);
     std::string raw;
     char buffer[4096];
     for (;;) {
@@ -744,12 +754,12 @@ void test_constraint_selection(const std::shared_ptr<const BpeTokenizer>& tokeni
     check(selector.verdict("stop", "serial-host").status == "complete", "committed EOS completes constraint");
     check(throws([&] { (void)selector.prepare(); }), "no selection after EOS");
     ConstraintSelection tie(spec, trie, tokenizer);
-    std::fill(row.begin(), row.end(), -100); row[' '] = -0.0F; row['{'] = 0.0F;
+    std::fill(row.begin(), row.end(), -100.0F); row[' '] = -0.0F; row['{'] = 0.0F;
     check(tie.select(row, tie.prepare()).token == ' ', "signed-zero tie chooses lowest ID");
     row[tokenizer->find("<tool_call>")] = std::numeric_limits<float>::quiet_NaN();
     check(throws([&] { (void)tie.select(row, tie.prepare()); }), "nonfinite even in masked entry fails");
     auto empty = tie.prepare(); std::fill(empty.mask.words.begin(), empty.mask.words.end(), 0);
-    std::fill(row.begin(), row.end(), 0);
+    std::fill(row.begin(), row.end(), 0.0F);
     check(throws([&] { (void)tie.select(row, empty); }), "empty mask fails explicitly");
     auto thinking_spec = std::make_shared<ConstraintSpec>(*spec); thinking_spec->starts_in_reasoning = true;
     ConstraintSelection thinking(thinking_spec, trie, tokenizer);
@@ -865,6 +875,178 @@ struct AuthorizationPowerSource final : strix::power::Source {
     void read(strix::power::Sample& sample) noexcept override { sample.add_power(strix::power::Domain::accelerator, 100.0); }
 };
 
+// Ollama-compatible contract (src/serve/ollama.cpp) against the OpenAI route on the same service: same prompt IDs,
+// same committed text and counts, NDJSON streaming, tools, load probes, named refusals, auth, disconnect, num_ctx.
+std::vector<Json> ndjson(const std::string& body) {
+    std::vector<Json> out;
+    for (std::size_t at = 0; at < body.size();) {
+        auto end = body.find('\n', at);
+        if (end == std::string::npos) end = body.size();
+        if (end > at) out.push_back(parse_json(body.substr(at, end - at)));
+        at = end + 1U;
+    }
+    return out;
+}
+void test_ollama_contract(std::uint16_t port, const std::string& auth, ScriptedEngine& engine) {
+    using strix::serve::ollama::ResponseWriter;
+    using strix::serve::ollama::Route;
+    const auto post = [&](const std::string& path, const std::string& body, const std::string& extra = {}) { return http(port, "POST", path, body, auth + extra); };
+    const auto error_of = [](const Reply& r) { const auto j = parse_json(r.body); return j.find("error") && j.find("error")->is_string() ? j.find("error")->as_string() : std::string(); };
+    // metadata and auth
+    const auto tags = parse_json(http(port, "GET", "/api/tags", "", auth).body);
+    const auto model = at(at(tags, "models").as_array().front(), "name").as_string();
+    check(model == "test-model", "ollama tags name the served model");
+    check(!at(parse_json(http(port, "GET", "/api/version", "", auth).body), "version").as_string().empty(), "ollama version");
+    const auto unauth = http(port, "GET", "/api/tags", "");
+    check(unauth.status == 401 && !error_of(unauth).empty(), "ollama routes take the same API key");
+    const auto ps = parse_json(http(port, "GET", "/api/ps", "", auth).body);
+    check(at(at(ps, "models").as_array().front(), "context_length").as_int() > 0, "ollama ps reports the served context");
+    const auto show = parse_json(post("/api/show", R"({"model":"test-model"})").body);
+    std::set<std::string> caps;
+    for (const auto& c : at(show, "capabilities").as_array()) caps.insert(c.as_string());
+    check(caps.contains("completion") && caps.contains("tools") && !caps.contains("embedding") && !caps.contains("vision"),
+        "ollama show announces only executed capabilities");
+    check(post("/api/show", R"({"model":"other"})").status == 404, "ollama unknown model is 404");
+    check(http(port, "GET", "/api/status", "").status == 200, "strix status route unchanged");
+    // non-streamed chat == OpenAI chat: same prompt IDs, same text, same counts
+    const auto openai = post("/v1/chat/completions", R"({"messages":[{"role":"user","content":"hi"}],"max_tokens":50,"temperature":0,"top_k":5,"seed":7})");
+    const auto oa = parse_json(openai.body);
+    const auto ids_openai = engine.prompts().back().first;
+    const auto sampled_openai = engine.sampling().back();
+    const auto chat = post("/api/chat", R"({"model":"test-model","messages":[{"role":"user","content":"hi"}],"stream":false,"options":{"num_predict":50,"temperature":0,"top_k":5,"seed":7}})");
+    const auto oc = parse_json(chat.body);
+    const auto sampled_ollama = engine.sampling().back();
+    check(chat.status == 200 && engine.prompts().back().first == ids_openai, "ollama chat prompt IDs equal the OpenAI request");
+    check(sampled_ollama.top_k == sampled_openai.top_k && sampled_ollama.seed == sampled_openai.seed && sampled_ollama.seeded == sampled_openai.seeded &&
+        sampled_ollama.temperature == sampled_openai.temperature, "ollama options resolve to the same sampling");
+    const auto& oa_message = at(at(oa, "choices").as_array().front(), "message");
+    check(at(at(oc, "message"), "content").as_string() == at(oa_message, "content").as_string(), "ollama chat text equals OpenAI");
+    check(oa_message.find("reasoning_content") && at(at(oc, "message"), "thinking").as_string() == at(oa_message, "reasoning_content").as_string(), "ollama thinking equals OpenAI reasoning");
+    check(at(oc, "eval_count").as_int() == at(at(oa, "usage"), "completion_tokens").as_int() &&
+        at(oc, "prompt_eval_count").as_int() == at(at(oa, "usage"), "prompt_tokens").as_int() && at(oc, "done").as_bool() &&
+        at(oc, "done_reason").as_string() == "stop", "ollama counts and done_reason");
+    // streamed (the Ollama default): NDJSON lines, same text, a final done line
+    const auto streamed = post("/api/chat", R"({"model":"test-model","messages":[{"role":"user","content":"hi"}],"options":{"num_predict":50}})");
+    check(streamed.headers.find("application/x-ndjson") != std::string::npos, "ollama stream is NDJSON");
+    std::string text;
+    const auto lines = ndjson(streamed.body);
+    for (const auto& l : lines) if (const auto* m = l.find("message")) text += at(*m, "content").as_string();
+    check(!lines.empty() && at(lines.back(), "done").as_bool() && text == at(oa_message, "content").as_string() &&
+        at(lines.back(), "eval_count").as_int() == at(at(oa, "usage"), "completion_tokens").as_int(), "ollama stream text and counts equal OpenAI");
+    // tools: complete calls with object arguments, streamed and not
+    const std::string tools = R"("tools":[{"type":"function","function":{"name":"get_weather","parameters":{"type":"object","properties":{"city":{"type":"string"},"days":{"type":"integer"}}}}}])";
+    const auto tool = parse_json(post("/api/chat", R"({"model":"test-model","stream":false,"messages":[{"role":"user","content":"TOOL"}],)" + tools + "}").body);
+    const auto* calls = at(tool, "message").find("tool_calls");
+    check(calls && calls->size() == 1U && at(at(calls->as_array().front(), "function"), "name").as_string() == "get_weather" &&
+        at(at(at(calls->as_array().front(), "function"), "arguments"), "city").as_string() == "Oslo", "ollama tool call with object arguments");
+    bool streamed_call = false;
+    for (const auto& l : ndjson(post("/api/chat", R"({"model":"test-model","messages":[{"role":"user","content":"TOOL"}],)" + tools + "}").body))
+        if (const auto* m = l.find("message")) if (const auto* c = m->find("tool_calls"); c && c->size()) streamed_call = at(at(c->as_array().front(), "function"), "name").as_string() == "get_weather";
+    check(streamed_call, "ollama streamed tool call");
+    const auto history = post("/api/chat", R"({"model":"test-model","stream":false,"messages":[{"role":"user","content":"TOOL"},{"role":"assistant","content":"","tool_calls":[{"function":{"name":"get_weather","arguments":{"city":"Oslo"}}}]},{"role":"tool","content":"sunny","tool_name":"get_weather"}],)" + tools + "}");
+    check(history.status == 200, "ollama tool history (object arguments, tool_name) accepted");
+    const auto history_ids = engine.prompts().back().first;
+    const auto openai_history = post("/v1/chat/completions", R"({"model":"test-model","stream":false,"messages":[{"role":"user","content":"TOOL"},{"role":"assistant","content":"","tool_calls":[{"id":"call_0","type":"function","function":{"name":"get_weather","arguments":"{\"city\":\"Oslo\"}"}}]},{"role":"tool","content":"sunny","name":"get_weather"}],)" + tools + "}");
+    check(openai_history.status == 200 && engine.prompts().back().first == history_ids, "ollama tool history prompt IDs equal OpenAI");
+    // generate == chat with one user message; raw == completions
+    const auto gen = parse_json(post("/api/generate", R"({"model":"test-model","prompt":"hi","stream":false,"options":{"num_predict":50}})").body);
+    check(engine.prompts().back().first == ids_openai && at(gen, "response").as_string() == at(oa_message, "content").as_string(), "ollama generate equals chat");
+    const auto completion = parse_json(post("/v1/completions", R"({"prompt":"hi","max_tokens":20})").body);
+    const auto ids_completion = engine.prompts().back().first;
+    const auto raw = parse_json(post("/api/generate", R"({"model":"test-model","prompt":"hi","raw":true,"stream":false,"options":{"num_predict":20}})").body);
+    check(engine.prompts().back().first == ids_completion && at(raw, "response").as_string() == at(at(completion, "choices").as_array().front(), "text").as_string(), "ollama raw generate equals completions");
+    // load probe runs nothing
+    const auto before = engine.prompts().size();
+    const auto probe = parse_json(post("/api/generate", R"({"model":"test-model","stream":false})").body);
+    check(at(probe, "done_reason").as_string() == "load" && engine.prompts().size() == before, "ollama load probe runs nothing");
+    // named refusals and reported no-effect options
+    check(post("/api/embed", R"({"model":"test-model","input":"x"})").status == 501, "ollama embed refused (no embedding engine)");
+    check(post("/api/pull", R"({"model":"x"})").status == 501 && http(port, "DELETE", "/api/delete", "{}", auth).status == 501, "ollama management refused");
+    check(post("/api/nope", "{}").status == 404, "ollama unknown route");
+    const auto mirostat = post("/api/chat", R"({"model":"test-model","messages":[{"role":"user","content":"hi"}],"options":{"mirostat":2}})");
+    check(mirostat.status == 400 && error_of(mirostat).find("mirostat") != std::string::npos, "ollama refuses result-changing options it cannot execute");
+    check(post("/api/chat", R"({"model":"test-model","messages":[{"role":"user","content":"hi"}],"options":{"bogus":1}})").status == 400, "ollama unknown option");
+    for (const char* key : {"num_predict", "num_ctx"}) {
+        for (const char* invalid : {"1.5", "9223372036854775808", "-9223372036854775809", "1e100", "0", "-3", "true", "\"3\""}) {
+            const auto body = std::string(R"({"model":"test-model","stream":false,"messages":[{"role":"user","content":"hi"}],"options":{")") + key + "\":" + invalid + "}}";
+            const auto response = post("/api/chat", body);
+            check(response.status == 400 && error_of(response).find(key) != std::string::npos, "invalid integer option is a named HTTP 400");
+            bool classified = false;
+            try { (void)strix::serve::ollama::translate(Route::chat, parse_json(body), {"test-model", 4096}); }
+            catch (const strix::serve::ollama::RequestError& e) { classified = e.status() == 400 && e.code() == "invalid_option"; }
+            catch (const JsonError&) {}
+            check(classified, "integer conversion errors have invalid_option classification");
+        }
+    }
+    for (const char* penalty : {"\"repeat_penalty\":2", "\"presence_penalty\":1", "\"frequency_penalty\":1"}) {
+        for (const char* value : {"false", "true"}) {
+            const auto response = post("/api/chat", std::string(R"({"model":"test-model","stream":false,"messages":[{"role":"user","content":"hi\n"}],"options":{)") +
+                penalty + ",\"penalize_newline\":" + value + "}}", "X-Test-Config: constraints-greedy\r\n");
+            check(response.status == 400 && error_of(response).find("penalize_newline") != std::string::npos,
+                "both newline controls refused with active penalties on transform-capable service");
+        }
+    }
+    for (const char* value : {"false", "true"}) {
+        const auto response = post("/api/chat", std::string(R"({"model":"test-model","stream":false,"messages":[{"role":"user","content":"hi\n"}],"options":{"penalize_newline":)") +
+            value + "}}", "X-Test-Config: constraints-greedy\r\n");
+        check(response.status == 200 && response.headers.find("penalize_newline") != std::string::npos,
+            "both newline controls remain no-effect with neutral penalties");
+    }
+    for (const char* value : {"-1", "-2", "1", "3.0", "3e0", "9223372036854775807"}) {
+        const auto response = post("/api/chat", std::string(R"({"model":"test-model","stream":false,"messages":[{"role":"user","content":"hi"}],"options":{"num_predict":)") + value + "}}");
+        check(response.status == 200, "valid num_predict integers retain their domain");
+    }
+    check(post("/api/chat", R"({"model":"test-model","messages":[{"role":"user","content":"hi"}],"bogus":1})").status == 400, "ollama unknown field");
+    check(post("/api/generate", R"({"model":"test-model","prompt":"hi","suffix":"x"})").status == 400, "ollama suffix refused");
+    check(post("/api/generate", R"({"model":"test-model","prompt":"hi","context":[1,2]})").status == 400, "ollama context refused");
+    const auto image = post("/api/chat", R"({"model":"test-model","messages":[{"role":"user","content":"hi","images":["iVBORw0KGgoAAAA"]}]})");
+    check(image.status == 400 && error_of(image).find("image") != std::string::npos, "ollama images refused without an image adapter");
+    const auto hint = post("/api/chat", R"({"model":"test-model","stream":false,"keep_alive":"5m","messages":[{"role":"user","content":"hi"}],"options":{"num_predict":50,"num_thread":8}})");
+    check(hint.status == 200 && hint.headers.find("X-Strix-Ollama-No-Effect: keep_alive,num_thread") != std::string::npos &&
+        engine.prompts().back().first == ids_openai, "ollama no-effect options are reported, not silent");
+    // num_ctx below the served context bounds prompt + output (never truncates)
+    const auto prompt_tokens = at(at(oa, "usage"), "prompt_tokens").as_int();
+    const auto tight = post("/api/chat", R"({"model":"test-model","messages":[{"role":"user","content":"hi"}],"options":{"num_ctx":2}})");
+    check(tight.status == 400 && error_of(tight).find("num_ctx") != std::string::npos, "ollama num_ctx below the prompt is refused");
+    const auto bounded = parse_json(post("/api/chat", R"({"model":"test-model","stream":false,"messages":[{"role":"user","content":"hi"}],"options":{"num_ctx":)" +
+        std::to_string(prompt_tokens + 3) + "}}").body);
+    check(at(bounded, "eval_count").as_int() == 3 && at(bounded, "done_reason").as_string() == "length", "ollama num_ctx bounds the output");
+    for (const char* mode : {"", "strict-context", "exact-context"}) {
+        const auto extra = std::string("X-Test-Config: ") + mode + "\r\n";
+        const auto response = post("/api/chat", R"({"model":"test-model","stream":false,"messages":[{"role":"user","content":"hi"}],"options":{"num_predict":50,"num_ctx":)" +
+            std::to_string(prompt_tokens + 3) + "}}", extra);
+        check(response.status == 200, "num_ctx caps generation in default, strict and exact modes");
+        if (response.status == 200) {
+            const auto result = parse_json(response.body);
+            check(at(result, "eval_count").as_int() == 3 && at(result, "done_reason").as_string() == "length", "num_ctx yields three tokens and length stop");
+        }
+    }
+    check(post("/v1/chat/completions", R"({"model":"test-model","messages":[{"role":"user","content":"hi"}],"max_tokens":999999})",
+        "X-Test-Config: strict-context\r\n").status == 400, "OpenAI strict-context overflow still refused after bounded request");
+    // disconnect cancels the generation (same ticket path as OpenAI)
+    const auto cancelled = engine.cancelled.load();
+    (void)http(port, "POST", "/api/chat", R"({"model":"test-model","messages":[{"role":"user","content":"LONG"}],"options":{"num_predict":400}})", auth, 300);
+    for (int i = 0; i < 200 && engine.cancelled.load() == cancelled; ++i) std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    check(engine.cancelled.load() > cancelled, "ollama client disconnect cancels the generation");
+    // re-encoding cost per streamed token (the HTTP overhead budget): one SSE frame -> one NDJSON line
+    struct Null final : strix::serve::HttpResponseWriter {
+        void send(int, std::string_view, std::string_view, const std::vector<std::pair<std::string, std::string>>&) override {}
+        bool begin_stream(int, std::string_view, const std::vector<std::pair<std::string, std::string>>&) override { return true; }
+        bool write(std::string_view) override { return true; }
+        void end_stream() override {}
+        bool client_gone() const override { return false; }
+    } sink;
+    ResponseWriter writer(sink, Route::chat, "test-model", {});
+    const std::string frame = R"({"id":"chatcmpl-x","object":"chat.completion.chunk","created":1,"model":"test-model","choices":[{"index":0,"delta":{"content":" word"},"finish_reason":null}]})";
+    constexpr int frames = 20000;
+    std::size_t bytes = 0;
+    const auto t0 = std::chrono::steady_clock::now();
+    for (int i = 0; i < frames; ++i) bytes += writer.translate_frame(frame).size();
+    const double us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count() / frames;
+    std::cout << "ollama re-encode: " << us << " us/token frame (" << bytes / frames << " B/line)\n";
+    check(bytes > 0 && us < 200.0, "ollama re-encode cost per token frame");
+}
+
 int main() try {
     strix::power::register_source("authorization-test", [](const std::string&) { return std::make_unique<AuthorizationPowerSource>(); });
     [[maybe_unused]] SocketRuntime sockets;
@@ -948,7 +1130,7 @@ int main() try {
             check(::connect(fd, reinterpret_cast<sockaddr*>(&address), sizeof(address)) == 0, "pipelined client connects");
             set_receive_timeout(fd,20);  // preserve the bounded receive deadline
             const std::string requests = "GET /stream-boom HTTP/1.1\r\nHost: x\r\n\r\nGET /ok HTTP/1.1\r\nHost: x\r\n\r\n";
-            (void)::send(fd, requests.data(), requests.size(), MSG_NOSIGNAL);
+            (void)socket_send(fd, requests.data(), requests.size(), MSG_NOSIGNAL);
             std::string raw;
             char buffer[4096];
             for (;;) {
@@ -1009,7 +1191,7 @@ int main() try {
         {
             const TestSocket fd = connect_local();
             const std::string partial = "GET /ok HTTP/1.1\r\nHo";
-            (void)::send(fd, partial.data(), partial.size(), MSG_NOSIGNAL);
+            (void)socket_send(fd, partial.data(), partial.size(), MSG_NOSIGNAL);
             const auto raw = read_all(fd);
             close_socket(fd);
             check(raw.rfind("HTTP/1.1 408", 0) == 0, "stalled request header answers 408");
@@ -1029,13 +1211,13 @@ int main() try {
                 return raw;
             };
             const std::string request = "GET /ok HTTP/1.1\r\nHost: x\r\n\r\n";
-            (void)::send(fd, request.data(), request.size(), MSG_NOSIGNAL);
+            (void)socket_send(fd, request.data(), request.size(), MSG_NOSIGNAL);
             check(read_response().rfind("HTTP/1.1 200", 0) == 0, "kept-alive first request answered");
             std::this_thread::sleep_for(std::chrono::milliseconds(2500));  // idle longer than the request deadline
-            (void)::send(fd, request.data(), request.size(), MSG_NOSIGNAL);
+            (void)socket_send(fd, request.data(), request.size(), MSG_NOSIGNAL);
             check(read_response().rfind("HTTP/1.1 200", 0) == 0, "request deadline starts at the first byte, not while idle");
             const std::string partial = "GET /ok HTTP/1.1\r\nHo";
-            (void)::send(fd, partial.data(), partial.size(), MSG_NOSIGNAL);
+            (void)socket_send(fd, partial.data(), partial.size(), MSG_NOSIGNAL);
             const auto raw = read_all(fd);
             check(raw.rfind("HTTP/1.1 408", 0) == 0, "a stalled request on a kept-alive connection answers 408");
             close_socket(fd);
@@ -1044,7 +1226,7 @@ int main() try {
             // A body that stops arriving is refused once the request deadline passes.
             const TestSocket fd = connect_local();
             const std::string partial = "POST /ok HTTP/1.1\r\nHost: x\r\nContent-Length: 10\r\n\r\nabc";
-            (void)::send(fd, partial.data(), partial.size(), MSG_NOSIGNAL);
+            (void)socket_send(fd, partial.data(), partial.size(), MSG_NOSIGNAL);
             const auto raw = read_all(fd);
             close_socket(fd);
             check(raw.rfind("HTTP/1.1 408", 0) == 0, "stalled request body answers 408");
@@ -1053,7 +1235,7 @@ int main() try {
             // Framing that cannot be read unambiguously is refused and the connection closed (one response only).
             const auto answer = [&](const std::string& raw_request) {
                 const TestSocket fd = connect_local();
-                (void)::send(fd, raw_request.data(), raw_request.size(), MSG_NOSIGNAL);
+                (void)socket_send(fd, raw_request.data(), raw_request.size(), MSG_NOSIGNAL);
                 const auto raw = read_all(fd);
                 close_socket(fd);
                 std::size_t responses = 0;
@@ -1077,7 +1259,7 @@ int main() try {
                 // The refusal survives unread request bytes (no reset before the client reads it) and is complete JSON.
                 const TestSocket fd = connect_local();
                 const std::string raw_request = "POST /ok HTTP/1.1\r\nContent-Length: x\r\n\r\n" + std::string(200000, 'z');
-                (void)::send(fd, raw_request.data(), raw_request.size(), MSG_NOSIGNAL);
+                (void)socket_send(fd, raw_request.data(), raw_request.size(), MSG_NOSIGNAL);
                 const auto raw = read_all(fd);
                 close_socket(fd);
                 const auto body_at = raw.find("\r\n\r\n");
@@ -1101,7 +1283,7 @@ int main() try {
             set_receive_timeout(fd,20);  // preserve the bounded receive deadline
             check(::connect(fd, reinterpret_cast<sockaddr*>(&address), sizeof(address)) == 0, "header-limit client connects");
             const std::string big = "GET /ok HTTP/1.1\r\nX-Pad: " + std::string(4000, 'a') + "\r\n\r\n";
-            (void)::send(fd, big.data(), big.size(), MSG_NOSIGNAL);
+            (void)socket_send(fd, big.data(), big.size(), MSG_NOSIGNAL);
             const auto raw = read_all(fd);
             close_socket(fd);
             check(raw.rfind("HTTP/1.1 431", 0) == 0, "header over the limit answers 431 whatever the read sizes");
@@ -1114,10 +1296,10 @@ int main() try {
                 set_receive_timeout(c,20);
                 (void)::connect(c, reinterpret_cast<sockaddr*>(&address), sizeof(address));
                 const auto cut = split ? request.size() - 2U : request.size();
-                (void)::send(c, request.data(), cut, MSG_NOSIGNAL);
+                (void)socket_send(c, request.data(), cut, MSG_NOSIGNAL);
                 if (split) {
                     std::this_thread::sleep_for(std::chrono::milliseconds(200));
-                    (void)::send(c, request.data() + cut, request.size() - cut, MSG_NOSIGNAL);
+                    (void)socket_send(c, request.data() + cut, request.size() - cut, MSG_NOSIGNAL);
                 }
                 const auto reply = read_all(c);
                 close_socket(c);
@@ -1133,7 +1315,7 @@ int main() try {
             const int small = 4096;
             socket_option(fd, SOL_SOCKET, SO_RCVBUF, &small, sizeof(small));
             const std::string request = "GET /flood HTTP/1.1\r\nHost: x\r\n\r\n";
-            (void)::send(fd, request.data(), request.size(), MSG_NOSIGNAL);
+            (void)socket_send(fd, request.data(), request.size(), MSG_NOSIGNAL);
             const auto begin = std::chrono::steady_clock::now();
             while (flood_result.load() == 0 && std::chrono::steady_clock::now() - begin < std::chrono::seconds(30))
                 std::this_thread::sleep_for(std::chrono::milliseconds(50));  // never read: the server's send stalls
@@ -1190,6 +1372,10 @@ int main() try {
     mirror->publish(snap);
     config.state_cache_stats=[mirror] { return mirror->read(); };
     ApiService api(config, tokenizer, queue, engine.context_tokens(), false);
+    auto strict_config = config; strict_config.strict_context_limit = true;
+    ApiService strict_api(strict_config, tokenizer, queue, engine.context_tokens(), false);
+    auto exact_config = strict_config; exact_config.exact_max_tokens = true;
+    ApiService exact_api(exact_config, tokenizer, queue, engine.context_tokens(), false);
     auto constrained_config = config;
     constrained_config.engine_logprobs = constrained_config.engine_logit_transforms = true;
     constrained_config.engine_constraints = engine.supports_constraints();
@@ -1249,6 +1435,8 @@ int main() try {
     HttpServer server(http_config, [&](const HttpRequest& r, HttpResponseWriter& w) {
         const auto mode = r.header("x-test-config");
         if (mode == "thinking-off") thinking_off_api.handle(r, w);
+        else if (mode == "strict-context") strict_api.handle(r, w);
+        else if (mode == "exact-context") exact_api.handle(r, w);
         else if (mode == "thinking-on") thinking_on_api.handle(r, w);
         else if (r.header("x-test-sessions") == "1" && mode == "constraints") constrained_session_api.handle(r, w);
         else if (r.header("x-test-sessions") == "1") session_api.handle(r, w);
@@ -2622,6 +2810,7 @@ int main() try {
               b.headers.find("X-Strix-Queue-Position:") != std::string::npos, "stream submission headers");
         check(b.status == 200 && stream_text(b.body, nullptr, nullptr, nullptr, nullptr) == "Hello there, friend.", "concurrent client B");
     }
+    test_ollama_contract(port, auth, engine);
     {
         const auto before = engine.cancelled.load();
         (void)http(port, "POST", "/v1/chat/completions", R"({"messages":[{"role":"user","content":"LONG"}],"stream":true,"max_tokens":400})", auth, 300);
