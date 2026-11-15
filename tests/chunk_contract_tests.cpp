@@ -133,6 +133,10 @@ int main() {
     CHECK(cc::plan_call(32, 40, 32, true).commit_end == 40);
     CHECK(cc::chunk_contract_tag("gdn-c32-r3", 32, 4) == "gdn-c32-r3+chunkinv-attn-state-v1/b32/s4");
     CHECK(cc::absolute_segment(5, 9, 4, 1).tile_begin == 5 && cc::absolute_segment(5, 9, 4, 1).tile_end == 8);
+    {   // plan predicate: T-multiple blocks + tails; a 16-row tail before the last 32 boundary is not canonical
+        const std::vector<std::uint64_t> ok{4096, 8192, 8256, 8272}, bad{4096, 8192, 8208, 8224, 8229}, tail{8192, 8224, 8240, 8245};
+        CHECK(cc::block_plan_canonical(ok, 0, 32)); CHECK(!cc::block_plan_canonical(bad, 0, 32)); CHECK(cc::block_plan_canonical(tail, 0, 32));
+    }
     std::printf(g_fail ? "chunk_contract_tests: %d failures\n" : "chunk_contract_tests: ok\n", g_fail);
     return g_fail ? 1 : 0;
 }
