@@ -27,7 +27,9 @@ inline std::span<const Lever> levers() { return table; }
 inline Name parse(std::string_view value) { return ::strix::profile::parse(value); }  // default|fast|quality|turbo
 inline constexpr std::string_view kTurboVersion = "qwen-turbo-v1";
 // Weight sources this build loads under turbo (onfly / converted flip to runnable with their loaders).
-inline constexpr ::strix::profile::turbo::WeightCaps kWeightCaps{};
+inline constexpr ::strix::profile::turbo::WeightCaps kWeightCaps{
+    {true, true, false}, {false, false, false, false, true, false, false, false, false}, "rtn-g64",
+    "onfly INT4 g64 is built for decode dense projections only (qwen)", "converted low-bit pack loader is not implemented in this build"};
 struct Resolution {
     Name profile = Name::standard;
     std::vector<Entry> entries;

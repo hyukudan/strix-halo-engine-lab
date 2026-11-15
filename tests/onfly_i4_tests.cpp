@@ -107,24 +107,21 @@ int main() {
         expect(pad_zero, "pad columns have scale 0");
     }
 
-    // Resolver: native default, onfly via CLI or environment give the same value; converted is refused; identity.
+    // Sub-switch resolver: native default, onfly (decided by the profile weights) via CLI or environment gives the same value.
     const auto no_env = [](const char*) -> const char* { return nullptr; };
-    expect(!onfly_i4::resolve({}, no_env).active() && onfly_i4::resolve({}, no_env).identity().empty(), "native default has no identity");
-    const auto via_cli = onfly_i4::resolve({"onfly", "4", "gdn_in,qsa_io", "legacy"}, no_env);
+    expect(!onfly_i4::resolve({}, no_env, false).active() && onfly_i4::resolve({}, no_env, false).identity().empty(), "native default has no identity");
+    const auto via_cli = onfly_i4::resolve({"gdn_in,qsa_io", "legacy"}, no_env, true);
     const auto via_env = onfly_i4::resolve({}, [](const char* n) -> const char* {
         const std::string name = n;
-        if (name == "STRIX_TURBO_WEIGHTS") return "onfly";
-        if (name == "STRIX_TURBO_WEIGHT_BITS") return "4";
         if (name == "STRIX_TURBO_ONFLY_GROUPS") return "gdn_in,qsa_io";
         if (name == "STRIX_TURBO_ONFLY_SCALE") return "legacy";
         return nullptr;
-    });
+    }, true);
     expect(via_cli.identity() == via_env.identity() && via_cli.active() && via_cli.groups == 5U, "CLI and environment resolve to the same value");
-    expect(onfly_i4::resolve({"native"}, [](const char*) -> const char* { return "onfly"; }).source == onfly_i4::Source::native, "CLI wins over environment");
-    expect(via_cli.identity() != onfly_i4::resolve({"onfly"}, no_env).identity(), "groups and rule enter the identity");
-    for (const auto& bad : {onfly_i4::Request{"converted"}, onfly_i4::Request{"onfly", "3"}, onfly_i4::Request{"onfly", "", "nope"}, onfly_i4::Request{"fast"}}) {
+    expect(via_cli.identity() != onfly_i4::resolve({}, no_env, true).identity(), "groups and rule enter the identity");
+    for (const auto& bad : {onfly_i4::Request{"nope"}, onfly_i4::Request{"", "fast"}}) {
         bool refused = false;
-        try { (void)onfly_i4::resolve(bad, no_env); } catch (const std::invalid_argument&) { refused = true; }
+        try { (void)onfly_i4::resolve(bad, no_env, true); } catch (const std::invalid_argument&) { refused = true; }
         expect(refused, "unsupported request refused with a reason");
     }
     expect(onfly_i4::classify("blk.3.attn_qkv.weight") == onfly_i4::gdn_in && onfly_i4::classify("blk.3.ssm_out.weight") == onfly_i4::gdn_out &&
@@ -140,8 +137,8 @@ int main() {
         for (auto& a : args) argv.push_back(a.data());
         return decode_cli::parse_options(static_cast<int>(argv.size()), argv.data());
     };
-    const auto cli = decode_cli::initialize_prefill_config({options_for({"--turbo-weights", "onfly", "--turbo-onfly-groups=gdn_in,gdn_out"}), {}});
-    const auto serve = decode_cli::initialize_prefill_config({options_for({}), {{"STRIX_TURBO_WEIGHTS", "onfly"}, {"STRIX_TURBO_ONFLY_GROUPS", "gdn_in,gdn_out"}}});
+    const auto cli = decode_cli::initialize_prefill_config({options_for({"--profile", "turbo", "--turbo-weights", "onfly", "--turbo-onfly-groups=gdn_in,gdn_out"}), {}});
+    const auto serve = decode_cli::initialize_prefill_config({options_for({"--profile", "turbo", "--turbo-weights", "onfly"}), {{"STRIX_TURBO_ONFLY_GROUPS", "gdn_in,gdn_out"}}});
     const auto native = decode_cli::initialize_prefill_config({options_for({}), {}});
     expect(cli.options.turbo.identity() == serve.options.turbo.identity() && cli.options.turbo.active(), "CLI and server resolve the same effective turbo value");
     expect(decode_cli::effective_prefill_argv(cli.options) == decode_cli::effective_prefill_argv(serve.options), "CLI and server give the same cache argv");

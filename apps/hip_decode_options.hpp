@@ -2047,8 +2047,7 @@ inline Options parse_options(
         {
             using Req = strix::onfly_i4::Request;
             bool turbo_flag = false;
-            for (const auto& [flag, field] : {std::pair<std::string_view, std::string Req::*>{"--turbo-weights", &Req::weights},
-                                              {"--turbo-weight-bits", &Req::bits}, {"--turbo-onfly-groups", &Req::groups},
+            for (const auto& [flag, field] : {std::pair<std::string_view, std::string Req::*>{"--turbo-onfly-groups", &Req::groups},
                                               {"--turbo-onfly-scale-rule", &Req::scale_rule}}) {
                 if (argument != flag && !(argument.starts_with(flag) && argument.size() > flag.size() && argument[flag.size()] == '=')) continue;
                 const auto value = argument == flag ? (index + 1 < argc ? std::string_view(argv[++index]) : std::string_view{})

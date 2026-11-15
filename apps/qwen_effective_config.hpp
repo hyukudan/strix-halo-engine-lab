@@ -186,7 +186,7 @@ inline Environment requested_prefill_environment(Get get) {
             "STRIX_QPF2K_HC_RECOMPUTE_NORM", "STRIX_INTPREFILL_MOE_TUNE", "STRIX_QPF2K_MOE", "STRIX_QPF2K_MOE_SMALL", "STRIX_QPF2K_QSA_BUDGET", "STRIX_QPF2K_MOE_DIRECT_B"})
         if (!(qpf2k::pre_injected_moe_marker && std::string_view(name) == "STRIX_QPF2K_MOE_DEFAULTED"))
             if (const char* value = get(name)) env.emplace(name, value);
-    for (const char* name : {"STRIX_TURBO_WEIGHTS", "STRIX_TURBO_WEIGHT_BITS", "STRIX_TURBO_ONFLY_GROUPS", "STRIX_TURBO_ONFLY_SCALE"})
+    for (const char* name : {"STRIX_TURBO_ONFLY_GROUPS", "STRIX_TURBO_ONFLY_SCALE"})
         if (const char* value = get(name)) env.emplace(name, value);
     for (const char* name : {"STRIX_BITCALC_LOGITS_OUT", "STRIX_BITCALC_FORCE_TOKENS"})
         if (get(name)) env.emplace(name, "1");
@@ -540,7 +540,7 @@ inline EffectiveConfig initialize_prefill_config(const RequestedOptions& request
     result.options.turbo = strix::onfly_i4::resolve(request.options.turbo_request, [&](const char* name) -> const char* {
         const auto it = result.environment.find(name);
         return it == result.environment.end() ? nullptr : it->second.c_str();
-    });
+    }, request.options.product_profile.weights.effective == strix::profile::turbo::Source::onfly);
     if (result.options.eager_code_load && !result.environment.contains("HIP_ENABLE_DEFERRED_LOADING"))
         result.environment["HIP_ENABLE_DEFERRED_LOADING"] = "0";
     result.prefill_option_mask = resolve_prefill_options([&](const char* name) -> const char* {

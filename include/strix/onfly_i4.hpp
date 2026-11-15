@@ -3,8 +3,8 @@
 // identity that enters every cache key, and the tensor classifier. One resolver (resolve_onfly_i4) serves the CLI and
 // the HTTP server (same binary, same RequestedOptions); the effective values are printed by --print-effective-config.
 //
-//   --turbo-weights native|onfly|converted   STRIX_TURBO_WEIGHTS         native (default): the packs as they are
-//   --turbo-weight-bits 4                    STRIX_TURBO_WEIGHT_BITS     onfly / converted: 4 only so far
+// The weight source itself (--turbo-weights native|onfly|converted, --turbo-weight-bits) is owned by
+// strix/turbo.hpp and resolved by strix::qwen::profile; this header adds only the Qwen tensor-group sub-switches:
 //   --turbo-onfly-groups LIST                STRIX_TURBO_ONFLY_GROUPS    gdn_in,gdn_out,qsa_io,shared_expert (default: all)
 //   --turbo-onfly-scale-rule legacy|full     STRIX_TURBO_ONFLY_SCALE     default full (core/iu4.hpp fast full range)
 #include <cstdint>
@@ -23,7 +23,7 @@ inline constexpr int kScaleLegacy = 0, kScaleFullRange = 2001;
 enum class Source : unsigned { native = 0, onfly = 1, converted = 2 };
 
 struct Request {  // as typed (empty = not given)
-    std::string weights, bits, groups, scale_rule;
+    std::string groups, scale_rule;
 };
 struct Resolved {
     Source source = Source::native;
@@ -67,23 +67,16 @@ inline std::string groups_text(unsigned mask) {
     return out.empty() ? "none" : out;
 }
 
-// CLI > environment > default; `env(name)` returns nullptr when unset. `converted` is refused (not implemented).
-inline Resolved resolve(const Request& cli, const std::function<const char*(const char*)>& env) {
+// CLI > environment > default; `env(name)` returns nullptr when unset.
+// `onfly`: the profile resolution's effective weight source is onfly at 4 bits (turbo::Weights).
+inline Resolved resolve(const Request& cli, const std::function<const char*(const char*)>& env, bool onfly) {
     const auto pick = [&](const std::string& typed, const char* name) {
         if (!typed.empty()) return typed;
         const char* v = env(name);
         return v ? std::string(v) : std::string{};
     };
     Resolved r;
-    const auto weights = pick(cli.weights, "STRIX_TURBO_WEIGHTS");
-    if (weights.empty() || weights == "native") r.source = Source::native;
-    else if (weights == "onfly") r.source = Source::onfly;
-    else if (weights == "converted")
-        throw std::invalid_argument("--turbo-weights converted: not implemented for Qwen (no pre-converted low-bit pack format yet)");
-    else throw std::invalid_argument("--turbo-weights: expected native, onfly or converted");
-    const auto bits = pick(cli.bits, "STRIX_TURBO_WEIGHT_BITS");
-    if (!bits.empty() && bits != "4")
-        throw std::invalid_argument("--turbo-weight-bits: only 4 is implemented (3 and 2 later)");
+    r.source = onfly ? Source::onfly : Source::native;
     r.groups = parse_groups(pick(cli.groups, "STRIX_TURBO_ONFLY_GROUPS"));
     const auto rule = pick(cli.scale_rule, "STRIX_TURBO_ONFLY_SCALE");
     if (rule.empty() || rule == "full") r.scale_rule = kScaleFullRange;
