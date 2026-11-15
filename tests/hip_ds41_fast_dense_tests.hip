@@ -5,6 +5,7 @@
 // that every form of the policy gives form 0's bits; --forms [reps [rounds [rows]]] times the forms on DS41 chunk shapes.
 #include "core/f16_dense_q8a8.hpp"
 #include "strix/hip_ds41_layer.hpp"
+#include "hip_ds41_fast_dense_args.hpp"
 
 #include <hip/hip_runtime.h>
 
@@ -206,6 +207,11 @@ bool forms(const Shape& c, unsigned reps, unsigned rounds) {
     q8a8::View f{};
     f.weight = dw.p, f.codes = da.p, f.deltas = dd.p, f.row_bytes = row_bytes, f.in = c.in, f.count = c.count, f.rows = c.rows;
     f.x_stride = width, f.out_stride = c.count;
+    f.out = base.p;
+    if (!q8a8::supported(f)) {
+        std::fprintf(stderr, "FAIL unsupported forms shape %s (rows %u)\n", c.name, c.rows);
+        return false;
+    }
     const auto call = [&](unsigned form, float* y) {
         f.out = y;
         q8a8::enqueue_parts(f, c.parts, nullptr, form);
@@ -261,14 +267,19 @@ bool forms(const Shape& c, unsigned reps, unsigned rounds) {
 }  // namespace
 
 int main(int argc, char** argv) {
+    std::printf("dispatch form %u\n", q8a8::form_for());
     // --forms [reps [rounds [rows]]]: the forms bench on the DS41 chunk shapes only
     if (argc > 1 && std::string(argv[1]) == "--forms") {
-        const unsigned reps = argc > 2 ? unsigned(std::atoi(argv[2])) : 10U, rounds = argc > 3 ? unsigned(std::atoi(argv[3])) : 7U;
-        const unsigned rows = argc > 4 ? unsigned(std::atoi(argv[4])) : 1024U;
+        strix::test::DenseFormsArgs args;
+        if (!strix::test::parse_dense_forms_args(argc, argv, args)) {
+            std::fprintf(stderr, "usage: --forms [reps:1..1000 [rounds:2..101 [rows:1..16384]]]\n");
+            return 2;
+        }
+        const auto [reps, rounds, rows] = args;
         const Shape shapes[] = {{"q_b", rows, 1280, 32768, 1, 1}, {"o_a", rows, 4096, 1024, 1, 8}, {"o_b", rows, 4096, 5120, 2, 1},
                                 {"q_a", rows, 5120, 1280, 1, 1},  {"kv", rows, 5120, 512, 1, 1}};
         bool ok = decode_check();
-        for (const auto& s : shapes) ok = forms(s, std::max(reps, 1U), std::max(rounds, 2U)) && ok;
+        for (const auto& s : shapes) ok = forms(s, reps, rounds) && ok;
         for (unsigned k = 0; k < kFormCount; ++k)
             std::printf("census form %u: %8.3f ms per layer-chunk (d %+7.3f) | x113 layer-chunks (11.6K rank 0) %8.1f ms (d %+6.1f)\n",
                         kForms[k], chunk_ms[k], chunk_ms[k] - chunk_ms[0], 113.0 * chunk_ms[k], 113.0 * (chunk_ms[k] - chunk_ms[0]));
