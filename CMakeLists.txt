@@ -711,6 +711,7 @@ if(STRIX_BACKEND_INTEL)
 endif()
 # Typed lever declaration and the census of environment switches (host tests).
 include(cmake/StrixLevers.cmake)
+include(cmake/StrixPairState.cmake)
 # Every HIP app calls the start gate first; the core library carries it to all of them.
 target_link_libraries(strix_core PUBLIC strix_device_hip)
 # strix_core (src/serial_request.cpp) and strix_serve (src/serve/api.cpp) call the shared power sampler themselves

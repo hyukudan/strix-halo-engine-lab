@@ -22,6 +22,7 @@
 //                    listeners, --repeat K times per prompt alternating identity / bp-v1 frames (ABA...): transport,
 //                    codec, import and token reply on the real link, plus its rate
 //   MM_RTX_PROFILE=1 synchronised per-phase times
+#include "strix/pair/state_decls.hpp"
 #include "mm_rtx_kernels.cuh"
 #include "mm_rtx_pack.hpp"
 #include "mm_rtx_weights.hpp"
@@ -334,8 +335,10 @@ struct Sender {
             n -= static_cast<std::size_t>(k);
         }
     }
-    void frame(std::uint32_t layer, std::uint64_t rows, const void* p, std::uint64_t bytes, bool bp = false) {
-        const std::uint32_t h32[2] = {bp ? 0x42524d4dU : 0x58524d4dU, layer};
+    // Magic: 'MMRX' plain / 'MMRB' bp-v1; with index keys once 'MMRI' / 'MMRJ' (rank 0: full K/V/IK block, it relays IK;
+    // rank 1: the K/V head of the block only).
+    void frame(std::uint32_t layer, std::uint64_t rows, const void* p, std::uint64_t bytes, bool bp = false, bool once = false) {
+        const std::uint32_t h32[2] = {once ? (bp ? 0x4A524d4dU : 0x49524d4dU) : (bp ? 0x42524d4dU : 0x58524d4dU), layer};
         const std::uint64_t h64[2] = {rows, bytes};
         all(h32, 8);
         all(h64, 16);
@@ -418,6 +421,8 @@ int main(int argc, char** argv) {
         unsigned n_layers = kLayers, repeat = 1;
         std::string send_to;
         bool codec_bp = false;
+        int ik_once_cli = -1;  // --ik-once 1 / --no-ik-once 0: index keys once, rank 0 relays (strix/pair/state_owners.hpp)
+        bool ik_ab = false;    // --ik-once ab (replay only): alternate per repeat, per-rank copies first
         int resident = -1, pinned_n = -1;
         std::string replay_dir, blob_cache;
         struct Prompt {
@@ -432,12 +437,28 @@ int main(int argc, char** argv) {
             if (a == "--repeat") { repeat = static_cast<unsigned>(std::stoul(argv[++i])); continue; }
             if (a == "--send") { send_to = argv[++i]; continue; }
             if (a == "--codec") { codec_bp = std::string(argv[++i]) == "bp"; continue; }
+            if (a == "--ik-once") {
+                if (i + 1 < argc && std::string(argv[i + 1]) == "ab") { ik_ab = true; ++i; }
+                ik_once_cli = 1;
+                continue;
+            }
+            if (a == "--no-ik-once") { ik_once_cli = 0; continue; }
             if (a == "--replay-state") { replay_dir = argv[++i]; continue; }
             if (a == "--pinned") { pinned_n = std::stoi(argv[++i]); continue; }
             if (a == "--blob-cache") { blob_cache = argv[++i]; continue; }
             const auto c = a.find(':');
             prompts.push_back({a.substr(0, c), read_u32(a.substr(c + 1))});
         }
+        // One resolver for the hand-off owners (shared with the ranks): flag, then STRIX_HANDOFF_SHARED_ONCE, then the
+        // MiniMax default (per-rank copies until its pair receipt). The ranks follow the frame magic.
+        namespace ps = strix::pair::state;
+        const bool ik_once = ps::resolve(ps::decl::minimax, ik_once_cli, -1).shared_once;
+        if (ik_ab && replay_dir.empty()) throw std::runtime_error("--ik-once ab needs --replay-state");
+        if (!send_to.empty())
+            std::printf("mm-rtx-prefill: hand-off owners %s (STRIX_HANDOFF_SHARED_ONCE / --ik-once): %.0f B per row
+",
+                        ik_ab ? "ABAB" : ik_once ? "ik-once" : "per-rank copies",
+                        static_cast<double>(ps::host_bytes(ps::decl::minimax, 1, 0, ik_once && !ik_ab)));
         if (!replay_dir.empty()) {  // transport replay, no GPU
             WSADATA wsa;
             if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) throw std::runtime_error("WSAStartup");
@@ -453,7 +474,7 @@ int main(int argc, char** argv) {
                     f.read(reinterpret_cast<char*>(st[r].data()), static_cast<std::streamsize>(st[r].size()));
                 }
                 for (unsigned it = 0; it < repeat; ++it) {
-                    const bool bp = codec_bp ? (it % 2 == 1) : false;  // --codec bp: identity, bp, identity, ...
+                    const bool bp = codec_bp && !ik_ab ? (it % 2 == 1) : codec_bp;  // --codec bp: identity, bp, identity, ...
                     Sender snd[2];
                     const auto c = send_to.find(',');
                     snd[0].open(send_to.substr(0, c));
@@ -465,16 +486,19 @@ int main(int argc, char** argv) {
                     std::thread th[2];
                     for (unsigned r = 0; r < 2; ++r)
                         th[r] = std::thread([&, r]() {
+                            // --ik-once ab: odd repeats send the index keys once (ABAB in one process, same state files)
+                            const bool once = ik_ab ? (it % 2 == 1) : ik_once;
+                            const std::uint64_t sent = r == 1 && once ? rows * 1024 : bytes;
                             for (unsigned L = 0; L < n_layers; ++L) {
                                 const std::uint8_t* p = st[r].data() + static_cast<std::size_t>(L) * bytes;
                                 if (bp) {
-                                    const strix::bp_codec::Region reg{p, bytes, 2};
+                                    const strix::bp_codec::Region reg{p, sent, 2};
                                     const auto f = strix::bp_codec::encode(std::span<const strix::bp_codec::Region>(&reg, 1), &pool);
-                                    snd[r].frame(L, rows, f.data(), f.size(), true);
+                                    snd[r].frame(L, rows, f.data(), f.size(), true, once);
                                     wire[r] += f.size();
                                 } else {
-                                    snd[r].frame(L, rows, p, bytes);
-                                    wire[r] += bytes;
+                                    snd[r].frame(L, rows, p, sent, false, once);
+                                    wire[r] += sent;
                                 }
                             }
                             snd[r].frame(0xffffffffU, rows, nullptr, 0);
@@ -488,9 +512,9 @@ int main(int argc, char** argv) {
                     snd[0].close();
                     snd[1].close();
                     const double mb = static_cast<double>(wire[0] + wire[1]) / 1e6;
-                    std::printf("mm-rtx-prefill: replay %s #%u %s: sent rank0 %.3f s rank1 %.3f s, wire %.1f MB (%.3f of %.1f MB plain), "
+                    std::printf("mm-rtx-prefill: replay %s #%u %s%s: sent rank0 %.3f s rank1 %.3f s, wire %.1f MB (%.3f of %.1f MB plain), "
                                 "%.1f MB/s plain-equivalent, reply (token %u) at %.3f s\n",
-                                pr.name.c_str(), it, bp ? "bp-v1" : "identity", t_sent[0], t_sent[1], mb,
+                                pr.name.c_str(), it, bp ? "bp-v1" : "identity", (ik_ab ? (it % 2 == 1) : ik_once) ? " ik-once" : "", t_sent[0], t_sent[1], mb,
                                 mb / (2.0 * static_cast<double>(bytes) * n_layers / 1e6), 2.0 * static_cast<double>(bytes) * n_layers / 1e6,
                                 2.0 * static_cast<double>(bytes) * n_layers / 1e6 / std::max(t_sent[0], t_sent[1]), token, ttft);
                     std::fflush(stdout);
@@ -747,23 +771,25 @@ int main(int argc, char** argv) {
                     if (!send_to.empty())
                         for (unsigned r = 0; r < 2; ++r)
                             th[r] = std::thread([&, r]() {
-                                const std::uint64_t rows = seqs[0].rows, bytes = rows * 1280;
+                                // IK once (shared piece): rank 1's frame is the block's K/V head [0, rows * 1024); rank 0 relays IK.
+                                const std::uint64_t rows = seqs[0].rows, block = rows * 1280,
+                                                    bytes = r == 1 && ik_once ? rows * 1024 : block;
                                 for (unsigned L = 0; L < n_layers; ++L) {
                                     {
                                         std::unique_lock<std::mutex> lk(rec_m);
                                         rec_cv.wait(lk, [&] { return recorded > L; });
                                     }
                                     ck(cudaEventSynchronize(layer_done[L]), "layer done");
-                                    const std::uint8_t* p = blobs[r][0] + static_cast<std::size_t>(L) * bytes;
+                                    const std::uint8_t* p = blobs[r][0] + static_cast<std::size_t>(L) * block;
                                     if (codec_bp) {
                                         const auto e0 = Clock::now();
                                         const strix::bp_codec::Region reg{p, bytes, 2};  // BF16 rows
                                         const auto f = strix::bp_codec::encode(std::span<const strix::bp_codec::Region>(&reg, 1), &pool);
                                         t_enc[r] += secs(e0, Clock::now());
-                                        snd[r].frame(L, rows, f.data(), f.size(), true);
+                                        snd[r].frame(L, rows, f.data(), f.size(), true, ik_once);
                                         wire[r] += f.size();
                                     } else {
-                                        snd[r].frame(L, rows, p, bytes);
+                                        snd[r].frame(L, rows, p, bytes, false, ik_once);
                                         wire[r] += bytes;
                                     }
                                 }
