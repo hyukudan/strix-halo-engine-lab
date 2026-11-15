@@ -457,7 +457,7 @@ void acknowledgement_tests() {
     t.model = Model("tiny", 2, GiB, 100, 0, 2000,
                     {{"layers", "pipe", "split", {"a", "b"}, {10}, "synthetic", 0, 0, 10}});
     const auto p = t.plan();
-    const auto& o = option(p, "layers:");
+    const auto o = option(p, "layers:");
     require(o.selectable && o.transfers.size() == 2, "acknowledgement fixture admitted");
     require(std::abs(o.transfers[0].ms - 1000.001) < 1e-9, "seam full block pays 100 acknowledgements");
     require(std::abs(o.transfers[1].ms - 1000.001) < 1e-9, "state pays 100 acknowledgements");
@@ -476,7 +476,7 @@ void shared_port_tests() {
     t.model = Model("tiny", 2, GiB, 0, 0, 1e9,
                     {{"handoff", "pipe", "handoff", {"a", "b"}, {}, "synthetic", 0, 0, 10000000}});
     const auto p = t.plan();
-    const auto& o = option(p, "handoff:");
+    const auto o = option(p, "handoff:");
     require(o.selectable && std::abs(o.transfers[0].ms - 2200) < 1e-9,
             "one GB uses shared port twice plus 100 two-ms acknowledgements");
     require(std::abs(o.predicted_ms - 2222) < 1e-9 && std::abs(o.rows_per_s - 5) < 1e-9,
