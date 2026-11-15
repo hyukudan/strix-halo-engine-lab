@@ -54,7 +54,9 @@ struct Args {
     float* y;
     std::size_t y_row, y_batch;
     unsigned rows, K, N, batches;
-    unsigned order = 0;  // grid: 0 = (column tile, row block, batch); 1 = (column tile, batch, row block)
+    // CTA order. 0 = (column tile, row block, batch); 1 = (column tile, batch, row block); 2 = groups of `group`
+    // batches: (column tile x batch in group, row block, group). Placement only: the bits never depend on it.
+    unsigned order = 0, group = 1;
 };
 
 struct RawStore {
@@ -73,7 +75,7 @@ static_assert(sizeof(Storage) == 20480);
 
 inline bool fits(const Args& p) {
     return p.rows >= 1U && p.K % kBK == 0U && p.N % kBN == 0U && p.batches >= 1U && p.batches <= 65535U &&
-           (p.rows + kBM - 1U) / kBM <= 65535U && p.order <= 1U && p.a_row % 4U == 0U && p.a_batch % 4U == 0U && p.w_ld % 8U == 0U &&
+           (p.rows + kBM - 1U) / kBM <= 65535U && p.order <= 2U && p.group >= 1U && p.batches % p.group == 0U && (p.order != 2U || p.N / kBN * p.group <= 65535U) && p.a_row % 4U == 0U && p.a_batch % 4U == 0U && p.w_ld % 8U == 0U &&
            p.w_batch % 8U == 0U && reinterpret_cast<std::uintptr_t>(p.a) % 16U == 0U &&
            reinterpret_cast<std::uintptr_t>(p.w) % 16U == 0U;
 }
@@ -90,7 +92,10 @@ __device__ __forceinline__ std::uint32_t pack(float lo, float hi) {
 template <Layout L, class Store>
 __device__ __forceinline__ void core(const Args& p, Storage& lds, const Store& store) {
     const unsigned tid = threadIdx.x, lane = tid & 31U, wave = tid >> 5U, wm = wave & 3U, wn = wave >> 2U;
-    const unsigned n0 = blockIdx.x * kBN, r0 = (p.order ? blockIdx.z : blockIdx.y) * kBM, b = p.order ? blockIdx.y : blockIdx.z;
+    const unsigned nt = p.N / kBN;
+    const unsigned n0 = (p.order == 2U ? blockIdx.x % nt : blockIdx.x) * kBN;
+    const unsigned r0 = (p.order == 1U ? blockIdx.z : blockIdx.y) * kBM;
+    const unsigned b = p.order == 0U ? blockIdx.z : p.order == 1U ? blockIdx.y : blockIdx.z * p.group + blockIdx.x / nt;
     const unsigned c = lane & 15U;
     // A stager: row tid / 2, k half (tid % 2) * 16 of the stage. Rows past `rows` read row 0 (never stored).
     const unsigned ar = tid >> 1U, ak = (tid & 1U) * 16U;
@@ -173,7 +178,8 @@ __global__ __launch_bounds__(kThreads) void gemm_kernel(Args p, Store store) {
 
 inline dim3 grid(const Args& p) {
     const unsigned rb = (p.rows + kBM - 1U) / kBM;
-    return p.order ? dim3(p.N / kBN, p.batches, rb) : dim3(p.N / kBN, rb, p.batches);
+    if (p.order == 2U) return dim3(p.N / kBN * p.group, rb, p.batches / p.group);
+    return p.order == 1U ? dim3(p.N / kBN, p.batches, rb) : dim3(p.N / kBN, rb, p.batches);
 }
 
 template <Layout L> inline void gemm(const Args& p, hipStream_t s) {

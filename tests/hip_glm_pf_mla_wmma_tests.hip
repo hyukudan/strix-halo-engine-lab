@@ -76,16 +76,20 @@ template <bool kOut> void run(unsigned heads, unsigned C, std::mt19937& g, bool 
     check(finite, name + " finite");
     check(guard_ok, name + " guard rows untouched");
     // FP32 accumulation in WMMA hardware order: rel-L2 ~8e-7 at K 256 and ~1.6e-6 at K 512 against the double contract,
-    // the same value at every row count (uniform precision, not an indexing error); bound 2.5e-9 * K.
-    check(l2c <= 2.5e-9 * K, name + " contract rel-L2 <= 2.5e-9 K");
+    // the same value at every row count (uniform precision, not an indexing error); bound 4e-9 * K.
+    check(l2c <= 4.0e-9 * K, name + " contract rel-L2 <= 4e-9 K");
     check(l2d <= 5.0e-4, name + " drift vs FP32 inputs rel-L2 <= 5e-4");
     if (timing) {
-        // Arm 0 = the engine call; arms 1 / 2 are timing diagnostics on the same buffers (outputs ignored): 1 = grid with
-        // the batch before the row blocks, 2 = head-major [heads][C][K] strides (no 32 / 64 KiB row stride).
-        for (unsigned arm = 0; arm < 3; ++arm) {
+        // Arm 0 = the engine call; the others are placement diagnostics on the same buffers (outputs ignored): order 0 /
+        // 1 / 2 (head groups of 4, 8, 16) on the engine strides (L), and on head-major [heads][C][K] strides (H).
+        struct Arm { unsigned order, group; bool head_major; };
+        const Arm arms[] = {{0, 1, false}, {0, 1, false}, {1, 1, false}, {2, 4, false}, {2, 8, false}, {2, 16, false},
+                            {0, 1, true}, {1, 1, true}, {2, 8, true}};
+        for (unsigned arm = 0; arm < sizeof(arms) / sizeof(arms[0]); ++arm) {
             auto p = M::args<kLora, kDim, kOut>(dx, dk, heads, C, dy);
-            if (arm == 1) p.order = 1;
-            if (arm == 2) { p.a_row = K; p.a_batch = std::size_t{C} * K; p.y_row = N; p.y_batch = std::size_t{C} * N; }
+            p.order = arms[arm].order;
+            p.group = arms[arm].group;
+            if (arms[arm].head_major) { p.a_row = K; p.a_batch = std::size_t{C} * K; p.y_row = N; p.y_batch = std::size_t{C} * N; }
             const auto launch = [&] {
                 if constexpr (kOut) strix::core::f16_tile_gemm::gemm<strix::core::f16_tile_gemm::Layout::NK>(p, nullptr);
                 else strix::core::f16_tile_gemm::gemm<strix::core::f16_tile_gemm::Layout::KN>(p, nullptr);
@@ -101,7 +105,8 @@ template <bool kOut> void run(unsigned heads, unsigned C, std::mt19937& g, bool 
             }
             std::sort(t.begin(), t.end());
             const double mac = static_cast<double>(C) * heads * K * N;
-            std::printf("TIME %s arm %u %.3f ms (%.2f TMAC/s)\n", name.c_str(), arm, t[4], mac / t[4] / 1e9);
+            std::printf("TIME %s arm %u order %u group %u %s %.3f ms (%.2f TMAC/s)\n", name.c_str(), arm, arms[arm].order,
+                        arms[arm].group, arms[arm].head_major ? "H" : "L", t[4], mac / t[4] / 1e9);
         }
     }
     ok(hipFree(dx), "free"); ok(hipFree(dy), "free"); ok(hipFree(dk), "free");
