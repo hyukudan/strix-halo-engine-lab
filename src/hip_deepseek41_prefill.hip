@@ -1736,6 +1736,9 @@ PrefillResult DevicePrefill::run_from(std::span<const std::uint32_t> tokens, std
     if (bounded != 0U) {
         if (bounded % attn::kWindow != 0U || bounded % W != 0U)
             throw std::invalid_argument("ds41-decoder-replay-bounded-v1: the bound must be a multiple of 128 and of window_rows");
+        if (bounded < ds41::bounded_replay_min_rows)
+            throw std::invalid_argument("ds41-decoder-replay-bounded-v1: bounds below " + std::to_string(ds41::bounded_replay_min_rows) +
+                                        " rows fail the DS41 FAST quality gate (R = 128: dNLL +0.01406 > +0.00991)");
         // its plan replaces the cone (also without options.cone: the quality runner's all-rows form, whose head rows lie
         // inside the bound)
         if (m.options.layers != c.num_hidden_layers || !m.snap_points.empty() || defer || m.state_incomplete || grp != nullptr ||

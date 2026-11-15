@@ -34,7 +34,7 @@ inline constexpr std::array<strix::profile::Lever, 6> profile_table{{
     // with the floor, bit for bit; not bit-equal to the full decode). Explicit only, OFF in every
     // profile; set, it enters the profile fingerprint (rank agreement, prefix-cache identity).
     {"decoder_replay_bounded", "STRIX_DS41_DECODER_REPLAY", "", {"", "", ""}, "0", strix::profile::Kind::bit_changing,
-     {true, false, true}, {true, true, true}, "", "0", "explicit FAST policy ds41-decoder-replay-bounded-v1; quality gate (DS41 FAST user rule) required", false, {}, true},
+     {true, false, true}, {true, true, true}, "", "0", "explicit FAST policy ds41-decoder-replay-bounded-v1; gate-qualified from R = 256 (smaller bounds refused)", false, {}, true},
 }};
 
 }  // namespace strix::deepseek41::pair_defaults

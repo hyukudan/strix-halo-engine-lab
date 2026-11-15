@@ -139,6 +139,10 @@ bool try_grow_moe_scratch(std::unique_ptr<Scratch>& current, std::uint64_t bytes
 // When the drafter needs more rows than the bound (draft_rows > bound), every decoder layer covers total - draft_rows
 // (a layer's input rows are its predecessor's outputs). `bound` is a positive multiple of the window;
 // the ring after the run then holds rows total - window .. total - 1 of every decoder layer, as a full prefill's.
+// The smallest bound the DS41 FAST quality gate qualifies (20 prompts x (the prefill's last row + 64 teacher-forced rows
+// from the bounded state), USER rule KL <= 0.02, top-1 >= 93 %, dNLL <= null mean + 2 sd): R = 256 passes (dNLL +0.00632
+// against +0.00991), R = 128 fails (+0.01406). Engines refuse smaller bounds; the planner itself takes any.
+inline constexpr std::uint32_t bounded_replay_min_rows = 256;
 [[nodiscard]] SuffixReplayPlan plan_bounded_replay(const SuffixReplayGeometry& geometry, std::uint64_t cached, std::uint64_t total,
                                                    std::uint32_t bound);
 
