@@ -3358,14 +3358,14 @@ int main(int argc, char** arguments) {
     {
         EffectiveConfig c;
         const auto reported = [&] { return effective_config_json(c); };
-        expect(reported().find("\"STRIX_QWEN_DECODE_FUSE\":{\"enabled\":false,\"suppression\":\"opt-in-not-requested\"}") != std::string::npos,
-            "R1 decode fusion is an opt-in and reports it off by default");
+        expect(reported().find("\"STRIX_QWEN_DECODE_FUSE\":{\"enabled\":true,\"suppression\":null}") != std::string::npos,
+            "R1 decode fusion is a code default and reports it on");
         c.environment["STRIX_QWEN_DECODE_FUSE"] = "0";
-        expect(reported().find("\"STRIX_QWEN_DECODE_FUSE\":{\"enabled\":false,\"suppression\":\"opt-in-not-requested\"}") != std::string::npos,
-            "R1 decode fusion reports its OFF from the snapshot");
+        expect(reported().find("\"STRIX_QWEN_DECODE_FUSE\":{\"enabled\":false,\"suppression\":\"explicit-off\"}") != std::string::npos,
+            "R1 decode fusion reports its explicit OFF from the snapshot");
         c.environment["STRIX_QWEN_DECODE_FUSE"] = "1";
         expect(reported().find("\"STRIX_QWEN_DECODE_FUSE\":{\"enabled\":true,\"suppression\":null}") != std::string::npos,
-            "R1 decode fusion reports the opt-in ON");
+            "R1 decode fusion reports the explicit ON");
         c.environment["STRIX_QWEN_DECODE_FUSE"] = "1";
         for (const auto* name : {"STRIX_BASELINE", "STRIX_QPF2K_DEFAULTS"}) {
             c.environment[name] = std::string_view(name) == "STRIX_BASELINE" ? "1" : "0";

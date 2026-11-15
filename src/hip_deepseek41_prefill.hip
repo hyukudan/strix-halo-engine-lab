@@ -4,6 +4,7 @@
 #include "strix/ds41_prefill_tuning.hpp"
 #include "strix/hip_ds41_dense_fp16.hpp"
 #include "strix/deepseek41_prefill.hpp"
+#include "strix/ds41_prefill_precision.hpp"
 
 #include "strix/deepseek41_attention_host.hpp"
 #include "strix/deepseek41_plan.hpp"
@@ -591,6 +592,7 @@ struct DevicePrefill::Impl {
     };
     std::vector<SeqState> group;
     std::uint32_t group_used = 0;               // members of the last run_group (0: none)
+    bool solo_discarded = false;                // run_group dropped the single sequence: export_state() refuses until run / import
     const PrefillGroupPlan* grp = nullptr;      // set by run_group around its run_from
     std::vector<PrefillResult> group_results;   // filled by the head of a group pass
     // group scratch: the members' last rows (head), their logits blocks, argmax candidates, seed rows of every member
@@ -1575,8 +1577,8 @@ void DevicePrefill::set_precision_for_new_sequence(const PrefillOptions& p) {
     o.fast_moe = p.fast_moe;
     o.fast_dense = p.fast_dense;
     o.fast_engram = p.fast_engram;
-    ds41::set_fast_dense(p.fast_dense ? 1 : 0);
-    ds41::set_fast_moe(p.fast_moe ? 1 : 0);   // process-wide switch of the batch MoE dispatch (one sequence at a time here)
+    // no process-wide switch: run_from installs these options as the precision of its own execution (another
+    // DevicePrefill of the process keeps its own; strix/ds41_prefill_precision.hpp)
 }
 
 PrefillResult DevicePrefill::run(std::span<const std::uint32_t> tokens) {
@@ -1596,6 +1598,8 @@ std::uint32_t DevicePrefill::positions() const noexcept { return impl_->rows_don
 
 PrefillResult DevicePrefill::run_from(std::span<const std::uint32_t> tokens, std::uint32_t start) {
     auto& m = *impl_;
+    // this object's FAST dense / MoE precision for every dispatch of the run (thread of the run: caller or task worker)
+    const ds41::PrefillPrecisionScope precision_scope(ds41::PrefillPrecision{m.options.fast_dense, m.options.fast_moe});
     // provided embedding rows of this run (none: text, nothing below changes)
     const strix::session::EmbedSplice embeds = std::exchange(m.embed_run, {});
     const ds41::RnWideOff own_kernels;  // the prefill keeps its own Q8_0 x A8 kernels (P12: the multi-row form is -1 %)
@@ -2263,6 +2267,9 @@ PrefillResult DevicePrefill::run_from(std::span<const std::uint32_t> tokens, std
         std::size_t embed_at = 0;  // first row in embed_stage
     };
     std::vector<EmbedPiece> embed_pieces;
+    // verify_embed_extras: this rank's first image row and first text row, whose residual streams the Engram check
+    // compares across every Engram layer (upstream: an image row passes the layer unchanged, a text row does not).
+    std::uint32_t verify_image_row = UINT32_MAX, verify_text_row = UINT32_MAX;
     if (!embeds.empty() || m.image_rows_set) {
         const std::size_t embed_width = c.hidden_size;
         std::vector<std::uint8_t> embed_flags(Tn, 0);
@@ -2278,6 +2285,9 @@ PrefillResult DevicePrefill::run_from(std::span<const std::uint32_t> tokens, std
         if (m.options.verify_embed_extras && m.image_rows_set) {
             // Known-effect fixture on an actual uploaded image flag: zero scores, text selects 0, image selects 1.
             const auto at = static_cast<std::size_t>(std::find(embed_flags.begin(), embed_flags.end(), std::uint8_t{1}) - embed_flags.begin());
+            verify_image_row = static_cast<std::uint32_t>(at);
+            if (const auto text = std::find(embed_flags.begin(), embed_flags.end(), std::uint8_t{0}); text != embed_flags.end())
+                verify_text_row = static_cast<std::uint32_t>(text - embed_flags.begin());
             Dev<float> x(256), weight(256 * 256), bias(256), image_bias(256), scores(256), weights(1);
             Dev<std::uint32_t> selected(1);
             x.zero(st);
@@ -2410,6 +2420,10 @@ PrefillResult DevicePrefill::run_from(std::span<const std::uint32_t> tokens, std
             const std::uint32_t E = m.task != nullptr && m.task->opt.engram_rows != 0U ? std::min(m.task->opt.engram_rows, C) : C;
             std::uint32_t engram_cut = 0;
             const std::uint32_t engram_most = (std::max(Tn, Tp) + E - 1U) / E;
+            const auto residual_row = [&](std::uint32_t row) {
+                return row == UINT32_MAX ? std::vector<float>{} : download(stream_now() + std::size_t{row} * stream_row, stream_row, st);
+            };
+            const auto image_before = residual_row(verify_image_row), text_before = residual_row(verify_text_row);
             for (std::uint32_t r0 = 0; r0 < Tn; r0 += E) {
                 const std::uint32_t n = std::min(E, Tn - r0);
                 cut(PrefillUnitLevel::finest, s.layer, "engram");
@@ -2434,6 +2448,9 @@ PrefillResult DevicePrefill::run_from(std::span<const std::uint32_t> tokens, std
             }
             for (; engram_cut < engram_most; ++engram_cut) cut(PrefillUnitLevel::finest, s.layer, "engram.pad");
             if (!m.overlap) check(hipStreamSynchronize(st), "engram");  // overlap: pinned rows, alive until the run's end
+            if (!image_before.empty() || !text_before.empty())
+                result.observe_embed_engram(image_before, residual_row(verify_image_row),
+                                            text_before, residual_row(verify_text_row));
             break;
         }
         case Op::hc_mix: {
@@ -3698,12 +3715,14 @@ PrefillResult DevicePrefill::run_from(std::span<const std::uint32_t> tokens, std
         m.last_row_local = true;
         m.state_incomplete = false;
         m.seed_rows = 0;
+        m.solo_discarded = true;
     } else {
         m.rows_done = P0 + T;
         m.local_rows_done = Tn;
         m.last_row_local = last_local;
         m.state_incomplete = defer;
         m.group_used = 0;
+        m.solo_discarded = false;
     }
 #ifdef STRIX_DS41_PREFILL_FP16_LT
     if (m.fast_used) {
@@ -3810,6 +3829,7 @@ void DevicePrefill::import_state(const AttentionState& s) {
     m.cancel_broken = false;
     m.state_incomplete = false;  // a complete state replaces a deferred run's (only after the import succeeded)
     m.defer_next = 0;
+    m.solo_discarded = false;    // the single sequence is the imported one again
 }
 
 // The attention state of one sequence: `layers` its per-layer state, T its rows, local_rows the rows this rank computed of
@@ -3817,6 +3837,8 @@ void DevicePrefill::import_state(const AttentionState& s) {
 static AttentionState export_sequence(const DevicePrefill::Impl& m, const std::vector<DevicePrefill::Impl::LayerState>& layers, std::uint32_t T,
                                       std::uint32_t local_rows, bool last_local_row) {
     namespace attn = ds41::attn;
+    // the last row's index count is read at local_rows - 1: a rank holding the last row holds at least that row
+    if (last_local_row && local_rows == 0U) throw std::logic_error("deepseek41 prefill: export of a state without local rows");
     AttentionState s;
     s.position = T;
     s.layers.resize(m.options.layers);
@@ -3895,6 +3917,8 @@ static AttentionState export_sequence(const DevicePrefill::Impl& m, const std::v
 AttentionState DevicePrefill::export_state() const {
     const auto& m = *impl_;
     if (m.state_incomplete) throw std::logic_error("deepseek41 prefill: the last run deferred its decoder (its continuation completes the state)");
+    // after run_group the single sequence was discarded (rows 0): its members export by segment
+    if (m.solo_discarded) throw std::logic_error("deepseek41 prefill: the last pass was a group: export_state(segment)");
     return export_sequence(m, m.attn, m.rows_done, m.local_rows_done, m.last_row_local);
 }
 
