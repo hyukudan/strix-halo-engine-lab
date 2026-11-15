@@ -69,6 +69,8 @@ profile::Resolution profile_resolution(const Lookup& env);
 // Cache / receipt identity of the active prefill policies; empty with every governed row at its builtin and the EXL3
 // MoE format. This field's omission alone does not establish complete cache compatibility.
 std::string prefill_identity(const Lookup& env);
+// Effective STRIX_MMX_PF_ORDER (table default or explicit): "adaptive" or "invariant" (identity mmx-pf-linear-s1-v1).
+std::string linear_order(const Lookup& env);
 // Rank agreement of the profile rows (strix::profile::check_peer over the process environment): both ranks call it at
 // the same startup point with the control-channel byte exchange; a mismatch throws naming both fingerprints.
 void check_peer(const std::function<void(const void*, void*, std::size_t)>& exchange);

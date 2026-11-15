@@ -587,6 +587,11 @@ void test_fast_prefill_profile() {
         check(p.msa_flash == 0 && p.msa_flash_asked == "default" && p.policies.empty() && p.note.empty() && p.canonical.empty(),
               "fast profile: plain invocation runs nothing");
         check(md::prefill_identity(lookup(off)).empty(), "fast profile: plain cache identity unchanged (no field)");
+        EnvMap inv{{"STRIX_MMX_PF_ORDER", "invariant"}}, ada{{"STRIX_MMX_PF_ORDER", "adaptive"}};
+        check(md::prefill_identity(lookup(inv)) == "prefill_order=mmx-pf-linear-s1-v1" && md::linear_order(lookup(inv)) == "invariant",
+              "linear order: invariant names its cache identity");
+        check(md::prefill_identity(lookup(ada)).empty() && md::linear_order(lookup(ada)) == "adaptive",
+              "linear order: adaptive keeps the legacy cache identity");
         check(fp(off) == none_fp, "fast profile: rows at builtin leave the legacy fingerprint unchanged");
         for (const auto& e : md::profile_resolution(lookup(off)).entries)
             check(e.status == strix::profile::Status::builtin && e.value == e.lever->builtin, "fast profile: builtin row " + std::string(e.lever->name));

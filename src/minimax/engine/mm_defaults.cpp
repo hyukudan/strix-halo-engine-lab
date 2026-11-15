@@ -272,10 +272,20 @@ void check_peer(const std::function<void(const void*, void*, std::size_t)>& exch
     check_peer(profile_resolution(process_env), exchange);
 }
 
+std::string linear_order(const Lookup& env) {
+    for (const auto& r : resolve(env))  // a table default counts exactly like an explicit value
+        if (std::strcmp(r.item->env, "STRIX_MMX_PF_ORDER") == 0) return r.value;
+    const char* v = env("STRIX_MMX_PF_ORDER");
+    return v != nullptr && *v != ' ' ? std::string(v) : std::string("adaptive");
+}
+
 std::string prefill_identity(const Lookup& env) {
     const auto p = prefill_policy(env);
     std::string out = p.policies.empty() ? std::string() : "prefill_msa=" + p.policies;
     if (fast_i4_format(env)) out += std::string(out.empty() ? "" : ";") + "moe_prefill_format=fast_i4";
+    // Chunk-invariant linear order (MoE gate/up/down + dense q/k/v/o, fixed S = 1): different bits from the adaptive
+    // order, so a parked state written under one never restores into the other.
+    if (linear_order(env) == "invariant") out += std::string(out.empty() ? "" : ";") + "prefill_order=mmx-pf-linear-s1-v1";
     return out;
 }
 

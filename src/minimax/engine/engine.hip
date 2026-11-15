@@ -1919,8 +1919,22 @@ struct Engine::Impl {
     // Prefill q/k/v on the v4 core: measured faster than three strix_gemm calls from 1024 rows (bench pfdv4 q+k+v
     // T1024 0.78, T4096 0.70; o alone is slower at 1024 rows and stays on the library).
     static constexpr std::size_t kDenseQkvMinRows = 1024;
+    // Invariant order (STRIX_MMX_PF_ORDER=invariant, identity mmx-pf-linear-s1-v1): strix_gemm's split follows the rows
+    // (route::gemm_splits; <= 8 rows a GEMV chain), so a call whose library split differs from the fixed contract runs on
+    // the v4 core with S = kDenseFixedSplits. Where they agree (> 8 rows, S = 1) both give the same bits
+    // (test_prefill_dense: v4 == strix_gemm bitwise at equal S) and the measured route choice stays.
+    template <class W> static bool lib_off_contract(std::size_t n, const W& w) {
+        return n <= 8 || route::gemm_splits(w.input, w.output, w.bits, static_cast<unsigned>(n)) !=
+                             static_cast<unsigned>(mmoe::kDenseFixedSplits);
+    }
+    template <std::size_t N> static bool dense_forced(std::size_t n, const mmoe::PrefillDenseJob (&jobs)[N]) {
+        if (!mmoe::prefill_order_invariant()) return false;
+        for (const auto& j : jobs)
+            if (lib_off_contract(n, j.w)) return true;
+        return false;
+    }
     bool dense_qkv(std::size_t n, const mmoe::PrefillDenseJob (&jobs)[3]) const {
-        if (!pf_dense_qkv || n < kDenseQkvMinRows || pf_ws == nullptr) return false;
+        if (pf_ws == nullptr || (!dense_forced(n, jobs) && (!pf_dense_qkv || n < kDenseQkvMinRows))) return false;
         for (const auto& j : jobs)  // raw weights loaded, same input width, implemented bit width; else the library
             if (j.w.trellis == nullptr || j.w.input != jobs[0].w.input || !mmoe::prefill_dense_supported(j.w)) return false;
         return mmoe::prefill_dense_workspace_bytes(jobs, 3, static_cast<unsigned>(n)) <= pf_ws_bytes;
@@ -1930,7 +1944,7 @@ struct Engine::Impl {
     // larger --max-rows pieces are not qualified).
     static constexpr std::size_t kDenseORows = 4096;
     bool dense_o(std::size_t n, const mmoe::PrefillDenseJob (&job)[1]) const {
-        return pf_dense_o && n == kDenseORows && pf_ws != nullptr && job[0].w.trellis != nullptr &&
+        return (dense_forced(n, job) || (pf_dense_o && n == kDenseORows)) && pf_ws != nullptr && job[0].w.trellis != nullptr &&
                mmoe::prefill_dense_supported(job[0].w) &&
                mmoe::prefill_dense_workspace_bytes(job, 1, static_cast<unsigned>(n)) <= pf_ws_bytes;
     }

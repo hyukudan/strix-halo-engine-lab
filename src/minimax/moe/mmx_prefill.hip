@@ -15,6 +15,7 @@
 #endif
 #include "moe_core/device_plan.hpp"
 #include "moe_core/grouped_policy.hpp"
+#include "core/linear_plan.hpp"  // fixed_linear_contract: rows-free dense K chain (invariant order)
 #include "strix/env_flags.hpp"
 #include "strix/route_receipt.hpp"
 
@@ -55,6 +56,15 @@ const ::strix::moe_core::GroupedSplitContract& prefill_moe_order() {
         throw std::invalid_argument("STRIX_MMX_PF_ORDER must be adaptive or invariant");
     }();
     return c;
+}
+bool prefill_order_invariant() { return prefill_moe_order().invariant(); }
+// Dense v4 split: invariant binds the shared rows-free contract (one ascending K16 chain per output, S = 1 for every
+// MiniMax q/k/v/o matrix: the split the adaptive policy already picks for >= 1024-row pieces); adaptive keeps the
+// library's rows-dependent split (== strix_gemm bitwise).
+unsigned prefill_dense_splits(unsigned input, unsigned output, unsigned bits, unsigned rows) {
+    if (prefill_order_invariant())
+        return static_cast<unsigned>(::strix::core::fixed_linear_contract(static_cast<int>(input), kDenseFixedSplits).splits);
+    return gemm_splits(input, output, bits, rows);
 }
 
 namespace {
@@ -2076,7 +2086,7 @@ DensePlan make_dense_plan(const PrefillDenseJob* jobs, unsigned count, unsigned 
             w.svh == nullptr || jobs[m].out == nullptr)
             throw std::invalid_argument("minimax prefill dense: jobs need one input width and outputs % 128 == 0");
         if (!dense_bits_supported(w.bits)) throw std::invalid_argument("minimax prefill dense: unsupported bit width");
-        p.splits[m] = gemm_splits(w.input, w.output, w.bits, rows);
+        p.splits[m] = prefill_dense_splits(w.input, w.output, w.bits, rows);
         p.off_xt[m] = off;
         off += align256(std::size_t{p.tpad} * p.k * 2);
         p.off_part[m] = off;
