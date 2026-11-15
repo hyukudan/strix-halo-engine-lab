@@ -10,6 +10,7 @@
 #include "strix/deepseek41_plan.hpp"
 #include "strix/dist/communicator.hpp"
 #include "xport/ds41_adapter.hpp"
+#include "xport/ahead_plan.hpp"
 #include "hip_deepseek41_prefill_xport.hpp"
 #include "core/hip_range_weight_loader.hpp"
 #include "core/hip_host_ready.hpp"
@@ -343,6 +344,11 @@ std::uint32_t prefill_moe_window_cap() { return strix::envcfg::number<std::uint3
 bool prefill_joint_layer() { return strix::envcfg::flag("STRIX_DS41_PREFILL_JOINT_LAYER", false, strix::EnvFlagMatch::exact); }
 std::uint32_t prefill_joint_layer_rows() { return strix::envcfg::number<std::uint32_t>("STRIX_DS41_PREFILL_JOINT_LAYER_ROWS", 1024U, 0U, 65536U); }
 unsigned prefill_window_drain() { return strix::envcfg::number<unsigned>("STRIX_DS41_PREFILL_WINDOW_DRAIN", 1U, 0U, 3U); }
+// STRIX_DS41_PREFILL_EARLY_QB=N: the q_b chunks of a row-split layer computed while its final entries cross (0 none,
+// 1 the first chunk only; N > 1 also needs N q banks of chunk_rows x heads x head_dim floats, capped by the chunks of
+// a rank and by STRIX_DS41_PREFILL_EARLY_QB_MIB of extra scratch). Schedule only: the same bits for every N.
+std::uint32_t prefill_early_q_b_chunks() { return strix::envcfg::number<std::uint32_t>("STRIX_DS41_PREFILL_EARLY_QB", 1U, 0U, 64U); }
+std::uint32_t prefill_early_q_b_mib() { return strix::envcfg::number<std::uint32_t>("STRIX_DS41_PREFILL_EARLY_QB_MIB", 1024U, 0U, 65536U); }
 bool prefill_o_low_a8_fused() {
     const char* v = std::getenv("STRIX_DS41_PREFILL_O_LOW_A8_FUSED");
     return !(v && v[0] == '0');
@@ -427,7 +433,10 @@ struct DevicePrefill::Impl {
     // row_split, final entries: the first chunk's q_b runs before the host waits for the peer's entries (it reads only
     // this rank's rows), so the wait no longer leaves the GPU idle. Same kernel, same inputs: bitwise identical. Only
     // when the next unit boundary does not park (m.q is shared). Default on; STRIX_DS41_PREFILL_EARLY_QB=0: after.
+    // early_q_b_chunks > 1: that many chunks (one q bank each, q_banks of them; xport::AheadPlan), still bitwise.
     bool early_q_b = true;
+    std::uint32_t early_q_b_chunks = 1;
+    std::uint32_t q_banks = 1;
     Dev<std::uint32_t> pack_send, pack_recv;
     // sites run on the dense WMMA kernel instead of the batch kernel (STRIX_DS41_PREFILL_DENSE_SITES, comma list of
     // q_a, kv, q_b, o_a; default q_a,kv, faster on the dense kernel at 512 and 2048 rows; "none" = all on the batch
@@ -1064,7 +1073,14 @@ DevicePrefill::DevicePrefill(const std::filesystem::path& gguf, const PrefillOpt
     m.trace_hash = Dev<std::uint64_t>(T);
     m.image_rows = Dev<std::uint8_t>(T);
     m.image_rows.zero(m.stream);
-    m.q = Dev<float>(C * QH);
+    // q banks (xport::AheadPlan): row split only, at most the chunks of one rank's rows, within the scratch allowance
+    if (m.distributed() && options.row_split) {
+        m.early_q_b_chunks = prefill_early_q_b_chunks();
+        const auto rank_chunks = static_cast<std::uint32_t>((split_stream_rows + C - 1U) / C);
+        m.q_banks = xport::ahead_banks(m.early_q_b_chunks, rank_chunks, C * QH * sizeof(float),
+                                       std::size_t{prefill_early_q_b_mib()} << 20U);
+    }
+    m.q = Dev<float>(std::size_t{m.q_banks} * C * QH);
     m.o = Dev<float>(C * QH);
     m.ocodes = Dev<std::int8_t>(C * QH);
     m.odeltas = Dev<float>(C * QH / 32U);
@@ -1098,7 +1114,7 @@ DevicePrefill::DevicePrefill(const std::filesystem::path& gguf, const PrefillOpt
             }
             m.staged_gather = m.staged_half;
             if (const char* v = std::getenv("STRIX_DS41_PREFILL_STAGED_GATHER"); v != nullptr && v[0] == '0') m.staged_gather = false;
-            if (const char* v = std::getenv("STRIX_DS41_PREFILL_EARLY_QB"); v != nullptr && v[0] == '0') m.early_q_b = false;
+            m.early_q_b = m.early_q_b_chunks != 0U;  // STRIX_DS41_PREFILL_EARLY_QB (read with the q banks above)
         }
         m.half_own = Dev<float>(half_rows * H);
         m.half_other = Dev<float>(half_rows * H);
@@ -2657,7 +2673,13 @@ PrefillResult DevicePrefill::run_from(std::span<const std::uint32_t> tokens, std
                     attn::hip::enqueue_compress(v, st);
                     L.carry_cur = 1 - L.carry_cur;
                 };
-                // q = q_b(qr) of this rank's chunk at r0 (n rows) into m.q
+                // q banks (xport::AheadPlan): chunk u of this rank's rows (from o0) owns bank u % banks of m.q; the
+                // staged path below may produce the first q_plan.ahead() chunks while the final entries cross
+                xport::AheadPlan q_plan{split ? m.q_banks : 1U, Tn > o0 ? (Tn - o0 + C - 1U) / C : 0U, 0U};
+                const auto q_bank = [&](std::uint32_t r0) {
+                    return m.q.p + std::size_t{q_plan.bank((r0 - o0) / C)} * C * QL;
+                };
+                // q = q_b(qr) of this rank's chunk at r0 (n rows) into its bank of m.q
                 const auto q_b_chunk = [&](std::uint32_t r0, std::uint32_t n) {
                     const bool fp16_q_b = m.fp16_at(4U, layer, n);
                     if (fp16_q_b && m.options.fp16_fast) {
@@ -2667,7 +2689,7 @@ PrefillResult DevicePrefill::run_from(std::span<const std::uint32_t> tokens, std
                         v.count = QL;
                         v.rows = n;
                         v.x_stride = QA;
-                        v.out = m.q.p;
+                        v.out = q_bank(r0);
                         v.out_stride = QL;
                         m.fast(&v, 1U, n, m.qr16.p + std::size_t{r0} * QA, QA, nullptr, st);
                     } else if (fp16_q_b || (m.dense_q_b && grp == nullptr && n >= m.dense_min_rows)) {  // a group pass: never (its class has no dense rows)
@@ -2679,7 +2701,7 @@ PrefillResult DevicePrefill::run_from(std::span<const std::uint32_t> tokens, std
                         v.deltas = m.qdeltas.p + std::size_t{r0} * QA / 32U;
                         v.rows = n;
                         v.x_stride = QA;
-                        v.out = m.q.p;
+                        v.out = q_bank(r0);
                         v.out_stride = QL;
                         m.dense(v, m.qr.p + std::size_t{r0} * QA, st, fp16_q_b);
                     } else {
@@ -2691,12 +2713,11 @@ PrefillResult DevicePrefill::run_from(std::span<const std::uint32_t> tokens, std
                         v.routes = site_routes(n, 1U);
                         v.codes = m.qcodes.p + std::size_t{r0} * QA;
                         v.deltas = m.qdeltas.p + std::size_t{r0} * QA / 32U;
-                        v.out = m.q.p;
+                        v.out = q_bank(r0);
                         ds41::enqueue_q8_0_a8_prefill(v, st);
                     }
                 };
-                // m.early_q_b: the first chunk's q_b already ran while the final entries crossed (below)
-                bool first_q_b_done = false;
+                // m.early_q_b: the first q_plan.ahead() chunks' q_b already ran while the final entries crossed (below)
                 // Every window K/V of the layer (rows from k0) and every compressed entry (rows from x0: below k0 only a KV
                 // source in the cone, layer 20, whose entries every decoder layer reads) in row order on the main stream;
                 // a row's index scores, selection and attention read only entries of rows up to its own, so the windows
@@ -2785,12 +2806,21 @@ PrefillResult DevicePrefill::run_from(std::span<const std::uint32_t> tokens, std
                         entries_exchange.emplace(prefill_wire, st, staged_send, entry_bytes,
                             dist::Tag{static_cast<std::uint32_t>(dist::TagKind::raw_slots), layer, ++exchange_seq});
                         index_projections();  // while the entries cross
-                        // the first chunk's q_b too, unless the task parks at that chunk's boundary (m.q is shared)
-                        if (m.early_q_b && o0 < Tn && (m.task == nullptr || m.task->runs_through(PrefillUnitLevel::finest, 1U))) {
-                            mark_part(0);  // timing: the q_b into its own part, as in the loop
-                            q_b_chunk(o0, std::min(C, Tn - o0));
-                            mark_part(2);
-                            first_q_b_done = true;
+                        // the first chunks' q_b too (one bank each), never past a chunk boundary where the task may
+                        // park (the banks are shared with the work that runs there)
+                        if (m.early_q_b && o0 < Tn) {
+                            std::uint32_t limit = std::min(m.early_q_b_chunks, q_plan.bank_count());
+                            if (m.task != nullptr)
+                                while (limit != 0U && !m.task->runs_through(PrefillUnitLevel::finest, limit)) --limit;
+                            q_plan.limit = limit;
+                            if (q_plan.ahead() != 0U) {
+                                mark_part(0);  // timing: the q_b into its own part, as in the loop
+                                for (std::uint32_t u = 0; u < q_plan.ahead(); ++u) {
+                                    const std::uint32_t r0 = o0 + u * C;
+                                    q_b_chunk(r0, std::min(C, Tn - r0));
+                                }
+                                mark_part(2);
+                            }
                         }
                         recv_words = static_cast<const std::uint32_t*>(entries_exchange->finish(st));
                     } else {
@@ -2896,7 +2926,7 @@ PrefillResult DevicePrefill::run_from(std::span<const std::uint32_t> tokens, std
                         cut(PrefillUnitLevel::finest, s.layer, "attn.chunk");
                         ++chunks_cut;
                     }
-                    if (!first_q_b_done || r0 != o0) q_b_chunk(r0, n);
+                    if (!q_plan.produced_ahead((r0 - o0) / C)) q_b_chunk(r0, n);
                     mark_part(2);
                     drain_windows(1U);
                     check(hipEventRecord(m.chunk_ready, st), "chunk ready");
@@ -2967,7 +2997,7 @@ PrefillResult DevicePrefill::run_from(std::span<const std::uint32_t> tokens, std
                         v.capacity = seq_capacity(win.seg);
                         v.topk = attn::kTopK;
                         v.heads = heads;
-                        v.q = m.q.p + std::size_t{w0 - r0} * QL;
+                        v.q = q_bank(r0) + std::size_t{w0 - r0} * QL;
                         v.sink = m.devf(p + "attn_sinks.weight") + head0;
                         v.rope = rope;
                         v.pos = pos;
