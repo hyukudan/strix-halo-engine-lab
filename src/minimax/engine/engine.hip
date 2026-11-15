@@ -28,6 +28,7 @@
 #include "minimax/pfx/pf_route.hpp"
 #include "minimax/moe/mmx_moe.hpp"
 #include "minimax/moe/mmx_prefill.hpp"
+#include "moe_core/grouped_policy.hpp"
 #include "minimax/rtxpf/fp32_identity.hpp"
 #include "minimax/engine/mm_defaults.hpp"
 #include "strix/deploy/device.hpp"
@@ -51,6 +52,11 @@
 
 extern "C" void strix_trellis_lab_set_tile_override(int cfg) __attribute__((weak));
 extern "C" int strix_trellis_lab_last_tile() __attribute__((weak));
+
+// Startup initializes the same cached governed order used by MoE dispatch.
+namespace strix::minimax::moe::opt {
+const ::strix::moe_core::GroupedSplitContract& prefill_moe_order();
+}
 
 namespace strix::minimax::engine {
 
@@ -1196,6 +1202,10 @@ struct Engine::Impl {
         namespace rr = strix::route;
         rr::set_engine("minimax");
         rr::set_rank(static_cast<int>(opt.rank));
+        const char* order_asked = strix::envcfg::text("STRIX_MMX_PF_ORDER");
+        const bool invariant = mmoe::prefill_moe_order().invariant();
+        rr::numerical_variant("minimax.moe_prefill_order", order_asked ? order_asked : "default",
+                              invariant ? "invariant" : "adaptive", "adaptive");
         const char* asked = strix::envcfg::text("STRIX_MMX_MODEL_FORMAT");
         // Use the same resolved policies as the dispatch sites (including the IU4 override).
         const bool iu4 = model_fast_i4 && mmoe::prefill_iu4();
