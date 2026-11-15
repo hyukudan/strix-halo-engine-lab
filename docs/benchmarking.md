@@ -69,6 +69,11 @@ The RTX DeepSeek prefill service (`strix-cuda-ds41-prefill-service`) is measured
 The decode-class prompts are in `scripts/bench/prompts/classes/`. Drafting acceptance differs by an order of
 magnitude between prose, a code edit and CSV-to-JSON, so served decode is always reported per class.
 
+TURBO quality bar: `tools/qualification/turbo_bar/` ([README](../tools/qualification/turbo_bar/README.md)) measures
+E (exact route) against R (a smaller pack of the same weights on the same kernels) and T (TURBO): KL, top-1 and
+dNLL on full logits, scored tasks, retrieval, paired 95 % intervals (INCONCLUSIVE when unresolved) and a
+speed/quality frontier. `rpack_kquant.py` produces R; `models.json` declares E/R/T per model.
+
 ## Checks
 
 `scripts/bench/tests/run.sh` checks the syntax of every kit, runs shellcheck when it is installed, and runs
