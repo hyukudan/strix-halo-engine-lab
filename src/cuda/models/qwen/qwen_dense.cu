@@ -18,7 +18,7 @@
 //             ascending (:281); LDS tree strides 128..1, v_add_f32 (:301-401); 1/(1 + expf(-s)) (:416-457, IEEE div).
 #include "strix/env_flags.hpp"
 #include "strix/lever.hpp"
-#include "core/imma_tile.cuh"
+#include "../../core/imma_tile.cuh"
 #include "strix/cuda/qwen_dense.hpp"
 
 #include <cuda_fp16.h>
@@ -38,9 +38,9 @@ bool decode_rows_enabled() {
 // STRIX_QRTX_DENSE_TILE2=0: the first tiled kernel (project_kernel) instead of project_tile2_kernel. Bitwise: same chain per output.
 inline constexpr strix::lever::Decl dense_tile2_lever{
     .name = "qwen_dense_tile2", .env = "STRIX_QRTX_DENSE_TILE2", .exactness = strix::lever::Exactness::bitwise,
-    .default_on = true, .source = "I-NOTES.md (rtxfast-I): byte equality vs project_kernel in qwen_dense_tests"};
+    .default_on = true, .source = "tests/cuda/qwen_dense_tests.cu: byte equality vs project_kernel"};
 bool dense_tile2_enabled() {
-    static const bool on = strix::lever::select(dense_tile2_lever, {}, std::getenv("STRIX_QRTX_DENSE_TILE2")).on;
+    static const bool on = strix::lever::select(dense_tile2_lever, {}).on;
     return on;
 }
 

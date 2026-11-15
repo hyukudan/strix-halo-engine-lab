@@ -21,14 +21,8 @@ namespace {
 
 using ptx::ldsm_x4;
 using ptx::ldsm_x4_trans;
+using ptx::mma_bf16;
 
-// D += A (16x16 bf16, row) x B (16x8 bf16, col), FP32 accumulation in place.
-__device__ __forceinline__ void mma_bf16(float (&c)[4], unsigned a0, unsigned a1, unsigned a2, unsigned a3, unsigned b0,
-                                         unsigned b1) {
-    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
-                 : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
-                 : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
-}
 __device__ __forceinline__ float ex2(float x) {
     float y;
     asm("ex2.approx.ftz.f32 %0, %1;\n" : "=f"(y) : "f"(x));
