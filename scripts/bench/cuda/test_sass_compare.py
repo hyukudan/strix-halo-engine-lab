@@ -30,7 +30,11 @@ class SassCompareTests(unittest.TestCase):
         self.assertEqual(self.parse(left + right), self.parse(image() + right + image() + left + image()))
 
     def test_namespace_move_is_normalised(self):
-        self.assertEqual(self.parse(image('_ZN5model4tileEv')), self.parse(image('_ZN4core4tileEv')))
+        # A reviewed move is declared explicitly (--symbol-rename OLD=NEW); an undeclared move still differs.
+        moved = {'_ZN5model4tileEv': '_ZN4core4tileEv'}
+        self.assertEqual(sass_compare.parse_sass(image('_ZN5model4tileEv'), moved),
+                         sass_compare.parse_sass(image('_ZN4core4tileEv'), moved))
+        self.assertNotEqual(self.parse(image('_ZN5model4tileEv')), self.parse(image('_ZN4core4tileEv')))
 
     def test_function_count_is_preserved(self):
         self.assertNotEqual(self.parse(image('_Z4leftv')), self.parse(image('_Z4leftv') + image('_Z5rightv')))
