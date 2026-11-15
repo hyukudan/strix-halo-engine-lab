@@ -74,7 +74,7 @@ Config read_cfg(const gguf::FileInfo& f) {
 }
 
 // ---------------------------------------------------------------- tensors
-struct TensorSpec {
+struct PackTensorSpec {
     std::string name;
     int type = 0;  // ggml: 30 bf16, 8 q8_0, 0 f32
     std::uint64_t in = 0, out = 1, bytes = 0, file_off = 0;
@@ -86,14 +86,14 @@ struct TensorSpec {
 
 // Tensors that take the NVFP4 path: 2-D BF16 weights (every projection, the MTP eh_proj, optional lm_head), never the
 // embedding table (row gather) nor norms / conv / state tensors.
-bool fp4_eligible(const EngineOptions& o, const TensorSpec& t) {
+bool fp4_eligible(const EngineOptions& o, const PackTensorSpec& t) {
     if (o.turbo_weights != TurboWeights::onfly || t.type != 30 || t.out <= 1) return false;
     if (t.name == "token_embd.weight") return false;
     if (t.name == "output.weight" && !o.turbo_lm_head) return false;
     if (t.name.size() < 7 || t.name.compare(t.name.size() - 7, 7, ".weight") != 0) return false;
     return cc::nvfp4_shape_ok(static_cast<std::uint32_t>(t.out), static_cast<std::uint32_t>(t.in));
 }
-void mark_fp4(const EngineOptions& o, std::vector<TensorSpec>& v) {
+void mark_fp4(const EngineOptions& o, std::vector<PackTensorSpec>& v) {
     for (auto& t : v) {
         if (!fp4_eligible(o, t)) continue;
         t.fp4 = true;
@@ -158,7 +158,7 @@ std::uint64_t fnv(const std::string& s) {
 struct WeightStore {
     unsigned char* base = nullptr;
     std::uint64_t total = 0, trunk_bytes = 0;
-    std::map<std::string, TensorSpec> spec;
+    std::map<std::string, PackTensorSpec> spec;
     std::map<std::string, std::uint64_t> off;
     [[nodiscard]] bool has(const std::string& n) const { return off.count(n) != 0; }
     [[nodiscard]] const void* ptr(const std::string& n) const { return base + off.at(n); }
@@ -187,7 +187,7 @@ struct WeightStore {
     }
 };
 
-void layout(WeightStore& W, const std::vector<TensorSpec>& specs, std::uint32_t layers) {
+void layout(WeightStore& W, const std::vector<PackTensorSpec>& specs, std::uint32_t layers) {
     std::uint64_t total = 0;
     for (const auto& t : specs) {
         W.spec[t.name] = t;
@@ -200,8 +200,8 @@ void layout(WeightStore& W, const std::vector<TensorSpec>& specs, std::uint32_t 
     CK(cudaMalloc(reinterpret_cast<void**>(&W.base), total));
 }
 
-std::vector<TensorSpec> specs_from_gguf(const gguf::FileInfo& f, std::uint32_t layers, bool load_mtp) {
-    std::vector<TensorSpec> v;
+std::vector<PackTensorSpec> specs_from_gguf(const gguf::FileInfo& f, std::uint32_t layers, bool load_mtp) {
+    std::vector<PackTensorSpec> v;
     for (const auto& t : f.tensors) {
         const std::string pre = "blk." + std::to_string(layers) + ".";
         if (t.name.rfind(pre, 0) == 0 && !load_mtp) continue;
@@ -209,7 +209,7 @@ std::vector<TensorSpec> specs_from_gguf(const gguf::FileInfo& f, std::uint32_t l
             const std::uint32_t idx = static_cast<std::uint32_t>(std::stoul(t.name.substr(4)));
             if (idx > layers) continue;
         }
-        TensorSpec s;
+        PackTensorSpec s;
         s.name = t.name;
         s.type = static_cast<int>(t.ggml_type);
         s.in = t.dimensions.at(0);
@@ -222,11 +222,11 @@ std::vector<TensorSpec> specs_from_gguf(const gguf::FileInfo& f, std::uint32_t l
 }
 
 // Tensor list of the qwen35 contract (design section 2) plus the fill rule of each tensor.
-std::vector<std::pair<TensorSpec, FillSpec>> synth_specs(const Config& c, PackFormat pack, bool with_mtp) {
-    std::vector<std::pair<TensorSpec, FillSpec>> v;
+std::vector<std::pair<PackTensorSpec, FillSpec>> synth_specs(const Config& c, PackFormat pack, bool with_mtp) {
+    std::vector<std::pair<PackTensorSpec, FillSpec>> v;
     const int wt = pack == PackFormat::bf16 ? 30 : 8;
     auto W = [&](const std::string& n, std::uint64_t in, std::uint64_t out, float gain) {
-        TensorSpec s;
+        PackTensorSpec s;
         s.name = n;
         s.type = wt;
         s.in = in;
@@ -235,7 +235,7 @@ std::vector<std::pair<TensorSpec, FillSpec>> synth_specs(const Config& c, PackFo
         v.push_back({s, FillSpec{Fill::weight, 0.0f, gain * std::sqrt(3.0f / static_cast<float>(in))}});
     };
     auto F = [&](const std::string& n, std::uint64_t cnt, std::uint64_t cols, float base, float amp) {
-        TensorSpec s;
+        PackTensorSpec s;
         s.name = n;
         s.type = 0;
         s.in = cols;
@@ -724,7 +724,7 @@ std::unique_ptr<CudaEngine> CudaEngine::synthetic(const Config& cfg, PackFormat 
     const auto t0 = std::chrono::steady_clock::now();
     if (opt.turbo_weights == TurboWeights::onfly) pack = PackFormat::bf16;  // onfly source is BF16
     const auto sp = synth_specs(cfg, pack, opt.load_mtp);
-    std::vector<TensorSpec> specs;
+    std::vector<PackTensorSpec> specs;
     for (const auto& [t, f] : sp) specs.push_back(t);
     mark_fp4(opt, specs);
     layout(P.W, specs, cfg.layers);
