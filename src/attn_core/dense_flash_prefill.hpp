@@ -306,6 +306,10 @@ __host__ __device__ constexpr std::size_t workspace_floats(unsigned rows, unsign
     return splits > 1U ? std::size_t(splits) * rows * heads * (dim + 2U) : 0U;
 }
 template <class P>
+// Call cuts: the P.V WMMA rounds keys (2i, 2i+1) as a pair even when P of key 2i+1 is zero, so a call ending at an
+// even absolute position gives its last row other bits than a run that also holds the next key's V (packed pad = 0
+// here). The kernel cannot see that V; callers commit at chunk_contract::kWmmaKPairRows and recompute the open row
+// (src/core/chunk_contract.hpp section 4). Every other row and every aligned call keep their bits.
 // seg_tiles != 0 (identity dense-flash-absseg-v1/s<seg_tiles>, opt-in): split z covers the ABSOLUTE key tiles
 // [z * seg_tiles, (z + 1) * seg_tiles), so a row's partials and their ascending combine do not depend on the call's
 // rows or neighbouring queries (src/core/chunk_contract.hpp). The caller passes splits >= absolute_segment_count of the

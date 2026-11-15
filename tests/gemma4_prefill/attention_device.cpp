@@ -1,6 +1,7 @@
 #include "gemma4/prefill/device.hpp"
 #include "gemma4/prefill/attention.hpp"
 #include "../gemma4_gpu/test.hpp"
+#include "core/chunk_contract.hpp"
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
@@ -88,8 +89,11 @@ int bench() {
 }
 // chunkinv-attn-state-v1 fixture (--chunkinv [N]): one global D512 layer over an N-key prompt, run as calls of
 // 512/256/64/16 rows and with a first call of 1/15/31/33 rows, every call on the flash core with split-K enabled.
-// Prints one FNV-1a per plan of all output rows. STRIX_G4_PREFILL_FLASH_ABSSEG=1: every plan must be bitwise equal
-// (dense-flash-absseg-v1); unset: the block-share split is reported (negative control, expected to differ).
+// Calls follow chunk_contract::plan_call with block kWmmaKPairRows: a non-final call commits rows up to the last even
+// absolute position and the next call recomputes the open row (chunk_contract.hpp section 4). Prints one FNV-1a per
+// plan of all output rows. STRIX_G4_PREFILL_FLASH_ABSSEG=1: every plan must be bitwise equal (dense-flash-absseg-v1,
+// hard failure); unset: the block-share split is reported (negative control, expected to differ).
+// STRIX_CHUNKINV_QUICK=1 skips the c64 / c16 plans (timing). STRIX_CHUNKINV_NO_CARRY=1: every call commits all its rows (negative control: odd cuts differ in the last row).
 int chunkinv(unsigned n) {
     constexpr unsigned dim = 512, head_count = 8, width = 2 * dim;
     std::uint64_t seed = 0x51ed2701ULL;
@@ -106,6 +110,10 @@ int chunkinv(unsigned n) {
     gpu::Buffer dr(rows_max * sizeof(gpu::KvRead));
     const char* env = std::getenv("STRIX_G4_PREFILL_FLASH_ABSSEG");
     const bool absseg = env && std::string_view(env) == "1";
+    const char* nc = std::getenv("STRIX_CHUNKINV_NO_CARRY");
+    const char* qk = std::getenv("STRIX_CHUNKINV_QUICK"); // timing runs: skip the c64 / c16 plans
+    const bool quick = qk && *qk == '1';
+    const unsigned commit_block = nc && *nc == '1' ? 1U : strix::chunk_contract::kWmmaKPairRows;
     struct Plan { const char* name; unsigned first, chunk; };
     std::vector<unsigned long long> digests;
     std::vector<float> first_plan;
@@ -114,11 +122,12 @@ int chunkinv(unsigned n) {
     for (const Plan plan : {Plan{"c512", 512, 512}, Plan{"c256", 256, 256}, Plan{"c64", 64, 64}, Plan{"c16", 16, 16},
                             Plan{"p1+c512", 1, 512}, Plan{"p15+c512", 15, 512}, Plan{"p31+c512", 31, 512}, Plan{"p33+c512", 33, 512},
                             Plan{"p16+c512", 16, 512}, Plan{"p48+c256", 48, 256}}) {
+        if (quick && plan.chunk < 256U) { digests.push_back(0); ms_total[idx++] = 0.0; continue; }
         failure.zero();
         gpu::synchronize();
         const auto begin = std::chrono::steady_clock::now();
-        for (unsigned c0 = 0; c0 < n;) {
-            const unsigned rows = std::min(n - c0, c0 ? plan.chunk : plan.first);
+        for (unsigned c0 = 0, call = 0; c0 < n; ++call) {
+            const unsigned rows = std::min(n - c0, call ? plan.chunk : plan.first);
             std::vector<gpu::KvRead> reads(rows);
             for (unsigned r = 0; r < rows; ++r)
                 reads[r] = {dk.as<float>(), dv.as<float>(), dt.as<std::uint64_t>(), dk.as<float>() + std::size_t(c0) * width,
@@ -128,7 +137,7 @@ int chunkinv(unsigned n) {
                                 out.as<float>() + std::size_t(c0) * head_count * dim, failure.as<unsigned>(), nullptr, packed.data(),
                                 stride, c0 + rows, true, 0, c0 + rows, ws.data(), ws.size());
             gpu::synchronize();
-            c0 += rows;
+            c0 = unsigned(strix::chunk_contract::plan_call(c0, c0 + rows, commit_block, c0 + rows == n).commit_end);
         }
         ms_total[idx++] = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - begin).count();
         unsigned flag = 0; failure.download(&flag, 4); CHECK(flag == 0);
@@ -138,21 +147,32 @@ int chunkinv(unsigned n) {
         const auto* b = reinterpret_cast<const unsigned char*>(o.data());
         for (std::size_t i = 0; i < o.size() * sizeof(float); ++i) h = (h ^ b[i]) * 1099511628211ULL;
         digests.push_back(h);
-        long first_row = -1;
         if (first_plan.empty()) first_plan = o;
-        else for (std::size_t i = 0; i < o.size(); ++i)
-            if (std::memcmp(&o[i], &first_plan[i], 4) != 0) { first_row = long(i / (head_count * dim)); break; }
-        if (first_row >= 0) std::printf("chunkinv first differing row %ld\n", first_row);
+        else {
+            const std::size_t row_floats = std::size_t(head_count) * dim;
+            unsigned differing = 0, at = 0;
+            char list[160] = {};
+            for (unsigned r = 0; r < n; ++r)
+                if (std::memcmp(&o[r * row_floats], &first_plan[r * row_floats], row_floats * 4) != 0 && ++differing <= 8)
+                    at += unsigned(std::snprintf(list + at, sizeof(list) - at, " %u", r));
+            double worst = 0.0;
+            unsigned worst_ulp = 0;
+            for (std::size_t i = 0; i < o.size(); ++i) {
+                worst = std::max(worst, double(std::fabs(o[i] - first_plan[i])));
+                unsigned ua, ub; std::memcpy(&ua, &o[i], 4); std::memcpy(&ub, &first_plan[i], 4);
+                worst_ulp = std::max(worst_ulp, ua > ub ? ua - ub : ub - ua);
+            }
+            if (differing) std::printf("chunkinv %s: %u differing rows, first:%s; max abs %.3g, max ulp %u\n", plan.name, differing, list, worst, worst_ulp);
+        }
         std::printf("chunkinv n %u %s %s: bits %016llx ms %.1f\n", n, absseg ? "absseg" : "block-share", plan.name, h, ms_total[idx - 1]);
     }
-    // Plans 0-3 and 8-9 cut on absolute 16-row boundaries; 4-7 (first call 1/15/31/33 rows) do not. Measured: the
-    // flash core's LAST row of a call that ends inside a 16-row tile differs from the aligned run (pre-existing, both
-    // split identities), so only 16-aligned cuts are bound by dense-flash-absseg-v1.
+    // Plans 0-3 and 8-9 cut on absolute 16-row boundaries; 4-7 (first call 1/15/31/33 rows) do not.
     bool aligned = true, unaligned = true;
-    for (std::size_t i = 0; i < digests.size(); ++i) (i >= 4 && i < 8 ? unaligned : aligned) &= digests[i] == digests[0];
+    for (std::size_t i = 0; i < digests.size(); ++i) (i >= 4 && i < 8 ? unaligned : aligned) &= digests[i] == digests[0] || !digests[i];
     std::printf("chunkinv n %u %s: 16-aligned plans %s, unaligned first calls %s\n", n,
                 absseg ? "dense-flash-absseg-v1" : "block-share", aligned ? "EQUAL" : "DIFFER", unaligned ? "EQUAL" : "DIFFER");
     if (absseg) CHECK(aligned);
+    if (absseg && commit_block > 1U) CHECK(unaligned);
     return 0;
 }
 } // namespace

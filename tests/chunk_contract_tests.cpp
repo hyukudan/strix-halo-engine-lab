@@ -14,8 +14,8 @@ namespace {
 int g_fail = 0;
 #define CHECK(c) do { if (!(c)) { std::printf("FAIL %s:%d %s\n", __FILE__, __LINE__, #c); ++g_fail; } } while (0)
 
-float score(unsigned q, unsigned k) { return std::sin(0.37F * q + 1.13F * k) * 4.0F; }
-float value(unsigned k) { return std::cos(0.71F * k) + 0.001F * k; }
+float score(unsigned q, unsigned k) { return std::sin(0.37F * float(q) + 1.13F * float(k)) * 4.0F; }
+float value(unsigned k) { return std::cos(0.71F * float(k)) + 0.001F * float(k); }
 
 struct Part { float m, l, o; };
 // One segment of one query, 16-key tiles ascending, keys > q masked (fully masked tile = no-op).
@@ -131,6 +131,10 @@ int main() {
     CHECK(cc::plan_call(0, 33, 32, false).commit_end == 32 && cc::plan_call(0, 33, 32, false).carry_tokens == 1);
     CHECK(cc::plan_call(32, 40, 32, false).commit_end == 32);
     CHECK(cc::plan_call(32, 40, 32, true).commit_end == 40);
+    // Section 4: the WMMA attention open row (odd call end from an even start) is carried; even ends commit all.
+    CHECK(cc::plan_call(0, 15, cc::kWmmaKPairRows, false).commit_end == 14 && cc::plan_call(0, 15, cc::kWmmaKPairRows, false).carry_tokens == 1);
+    CHECK(cc::plan_call(0, 1, cc::kWmmaKPairRows, false).commit_end == 0 && cc::plan_call(14, 526, cc::kWmmaKPairRows, false).carry_tokens == 0);
+    CHECK(32 % cc::kWmmaKPairRows == 0 && 16 % cc::kWmmaKPairRows == 0);
     CHECK(cc::chunk_contract_tag("gdn-c32-r3", 32, 4) == "gdn-c32-r3+chunkinv-attn-state-v1/b32/s4");
     CHECK(cc::absolute_segment(5, 9, 4, 1).tile_begin == 5 && cc::absolute_segment(5, 9, 4, 1).tile_end == 8);
     {   // plan predicate: T-multiple blocks + tails; a 16-row tail before the last 32 boundary is not canonical

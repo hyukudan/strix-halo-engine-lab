@@ -18,6 +18,14 @@
 //    to the last absolute block boundary; the open tail tokens are carried and recomputed by the next call (the
 //    "recompute its prefix" option). A prefix-cache entry is stored only at a committed boundary. The final call
 //    closes its tail exactly as a whole-prompt run does, at the same absolute position.
+// 4. WMMA K pairs (gfx11 / gfx1151, measured): v_wmma_f32_16x16x16_f16 adds the products of keys (2i, 2i+1) as one
+//    pair, and a zero P of key 2i+1 does not remove that key's V from the pair's rounding (row 0 with A[0][15] = 0
+//    changes when B row 15 changes in 1521 of 2000 random cases; 0 of 2000 when A[0][14] is zero too). So the last
+//    row of an attention call that ends at an EVEN absolute position depends on the V of the next key: zero (packed
+//    pad) in that call, the real value in a run that covers it. Masking cannot fix it (the next V does not exist yet)
+//    and the aligned path keeps its bits, so the open row is a carry: a non-final call commits rows up to the last
+//    even absolute position, plan_call(committed, call_end, kWmmaKPairRows, final), and the next call recomputes it
+//    through every layer. Every block recurrence above (32) and every 16-row tile cut already satisfies it.
 // 3. Identity: every state / prefix-cache version that relies on 1-2 folds chunk_contract_tag() in, so entries made
 //    under the old per-call closing are never reused by the new contract (and vice versa).
 #include <cstdint>
@@ -26,6 +34,8 @@
 namespace strix::chunk_contract {
 
 inline constexpr const char* kContractName = "chunkinv-attn-state-v1";
+// Section 4: commit granularity of the WMMA attention cores (src/attn_core, gfx11 K-pair accumulation).
+inline constexpr unsigned kWmmaKPairRows = 2;
 
 struct Segment {
     unsigned tile_begin = 0;  // inclusive, absolute 16-key tile index
