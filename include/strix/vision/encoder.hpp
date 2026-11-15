@@ -95,6 +95,10 @@ struct EncoderOutput {
     // Non-zero: the hidden rows stayed on the device of the backend whose encode_for_projection() returned this
     // output (`hidden` is then empty); only that backend's merge_project() of the same encode reads them.
     std::uint64_t device_epoch = 0;
+    std::shared_ptr<const void> device_owner{};  // keeps the owner token unique even after backend destruction
+    bool resident_for(const std::shared_ptr<const void>& owner, std::uint64_t epoch) const {
+        return device_owner && device_owner == owner && device_epoch != 0 && device_epoch == epoch;
+    }
 };
 // Projected rows of one image as the cache and the splice store them.
 struct ProjectedRows {
@@ -127,7 +131,7 @@ struct MergeProjector {
     bool row_major = true;
     Activation act = Activation::gelu;
     Tensor w1, b1, w2, b2;
-    unsigned tokens(unsigned grid_h, unsigned grid_w) const;  // merged rows; throws on a zero ratio
+    unsigned tokens(unsigned grid_h, unsigned grid_w) const;  // throws on empty or unrepresentable geometry
 };
 
 // y[r][o] = sum_k x[r][k] * w[o][k] + bias[o] for row-major x [rows][w.cols], y [rows][w.rows]. Adapters run their
@@ -137,8 +141,8 @@ public:
     virtual ~DenseOps() = default;
     virtual void linear(const Tensor& w, const Tensor& bias, const float* x, std::size_t rows, float* y) = 0;
     // The whole projector. Default (host): unshuffle, linear(), activate(), linear(), reading hidden.hidden; a device
-    // backend chains the four steps on the device (same values: the linears are its linear(), the activation the same
-    // FP64 formula). rows: [tokens][w2.rows] host floats.
+    // backend chains the four steps on the device. The same FP64 activation formula does not guarantee identical
+    // host/device transcendental rounding. rows: [tokens][w2.rows] host floats.
     virtual void merge_project(const EncoderOutput& hidden, unsigned grid_h, unsigned grid_w, const MergeProjector&, float* rows);
     // Start-time hook: build now what the first linear(w, bias) would build (a device panel). Host: nothing to do.
     virtual void prepare_linear(const Tensor& w, const Tensor& bias) {
@@ -161,11 +165,13 @@ public:
 };
 
 // Diagnostic rounding model of a device arithmetic inside the host reference (default: none = the FP32 oracle,
-// bit for bit). It places the FP16 operand roundings of vision-f16-v1 one site at a time, so a gate failure can be
-// attributed to a rounding site (precision) or to none of them (a defect). Never an adapter arithmetic.
+// bit for bit). It places the FP16 operand roundings of vision-f16-v1 one site at a time to study sensitivity.
+// Accumulation and transcendental evaluation remain FP64 (attn_order: FP32 chains in the core's order, still with
+// std::exp2): this is not a bitwise device oracle or proof of a defect.
+// Never an adapter arithmetic; the shared rounded identity is diagnostic only, not a cache/qualification identity.
 struct ReferenceRounding {
     bool linear_inputs_f16 = false;  // every linear input rounded to FP16 (the single-operand device policy)
-    // The flash core's operands Q, K, V and the probabilities P, as FP16 terms per operand: 0 = FP32 (no rounding),
+    // The flash core's operands Q, K, V and the probabilities P (rounded at each 16-key online maximum), as FP16 terms per operand: 0 = FP32 (no rounding),
     // 1 = one FP16 term (the one-term attention), 2 = hi + lo (the two-term attention: lo = FP16 of the remainder).
     // This operand model rounds the operands only: it keeps lo x lo (the device drops it) and multiplies and sums in
     // FP64 (error bounds by format and range: src/attn_core/two_term_model.hpp).
@@ -232,7 +238,7 @@ struct EncodeStats {
     double total_ms = 0.0;
     std::vector<double> layer_ms;
 };
-// Wall time of the last load() by step (a receipt: the steps run in this order per panel, so they add up).
+// Wall time of the last load() by step (approximate receipt; total also includes uninstrumented overhead).
 struct EncoderLoadStats {
     double scan_ms = 0.0;          // per-row magnitude pass over the source weights
     double host_alloc_ms = 0.0;    // zeroed host panel buffer
@@ -256,7 +262,11 @@ public:
     void load(const EncoderWeights&);  // FP16 panels to the device; lazy callers call it on the first image
     void unload();                     // drops panels and workspace
     bool loaded() const;
-    std::size_t device_bytes() const;  // panels + workspace currently held
+    std::size_t device_bytes() const;  // panels + workspace + projector scratch currently held
+    std::size_t pinned_host_bytes() const;  // retained input staging, separate from device_bytes()
+    static bool project_device();  // governed, process-cached, default on (STRIX_VISION_PROJECT_DEVICE=0 = host graph); also available in host-only builds
+    // Identity of the tower attention terms (1 or 2) and the projector placement; also available in host-only builds.
+    static const char* effective_arithmetic(unsigned attention_terms = attention_terms_from_env());
     const EncoderLoadStats& load_stats() const;
 
     EncoderOutput encode(const PatchGrid&, const PositionInputs&) override;
@@ -268,11 +278,12 @@ public:
     // Workspace for `rows` rows in `tiles` tiles allocated now (encode() still grows it for a larger input).
     void reserve(unsigned rows, unsigned tiles) override;
     // Hidden rows stay in the workspace when STRIX_VISION_PROJECT_DEVICE (default 1) is on.
+    // This numerical candidate has a separate arithmetic identity; node qualification: rows bitwise equal to the host projector; --projector-gate covers the remaining arms.
     EncoderOutput encode_for_projection(const PatchGrid&, const PositionInputs&) override;
     // Device chain: unshuffle kernel, linear1, activation kernel (FP64, the host formula), linear2, one download.
     // STRIX_VISION_PROJECT_DEVICE=0: the host graph of DenseOps (A/B and bitwise check).
     void merge_project(const EncoderOutput& hidden, unsigned grid_h, unsigned grid_w, const MergeProjector&, float* rows) override;
-    const char* arithmetic() const override;  // kArithmeticAttn2 or kArithmetic, by EncoderOptions::attention_terms
+    const char* arithmetic() const override;  // effective_arithmetic(EncoderOptions::attention_terms)
 
 private:
     struct Impl;

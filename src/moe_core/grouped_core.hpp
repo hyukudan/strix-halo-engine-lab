@@ -27,8 +27,8 @@ template <template <int> class WeightDecode> struct GroupedDecodeTraits {
 };
 
 template <template <int> class WeightDecode, class ExpertLayout, class InputTransform, class Epilogue,
-          class Traits = GroupedDecodeTraits<WeightDecode>>
-struct GroupedCore : GroupedPrefillPolicy<> {
+          class Traits = GroupedDecodeTraits<WeightDecode>, class Policy = GroupedPrefillPolicy<>>
+struct GroupedCore : Policy {
     using Input = InputTransform;
     using Output = Epilogue;
 
@@ -394,9 +394,13 @@ static __device__ __forceinline__ Half16 pipe_load_a(const unsigned char* base, 
     return *(GlobalHalf16*)(base + offset);
 }
 
+// MT row tiles in two A banks: bank 0 = tiles [0, G) loaded before the decode, bank 1 = [G, MT) after it.
+// FullRows = false (tail rows, partial blocks) only guards the store; the A loads stay unguarded, so the input must be
+// padded to the block's MT x 16 rows (padded rows hold stale data; WMMA rows are independent).
 template <int Bits, int MT, int G, bool FullRows = true, bool Simplify = false>
 static __device__ void item_pipe(const Item& it, unsigned bx, unsigned by, unsigned bz) {
-    static_assert(MT == 8 && G == 4 && FullRows);
+    static_assert(MT >= 1 && MT <= 8 && G == (MT < 4 ? MT : 4));
+    constexpr int G1 = MT - G;  // bank 1 tiles
     using NW = typename WeightDecode<Bits>::Norm;
     const int lane = static_cast<int>(threadIdx.x & 31U);
     const int wave = static_cast<int>(threadIdx.x >> 5U);
@@ -479,9 +483,9 @@ static __device__ void item_pipe(const Item& it, unsigned bx, unsigned by, unsig
             b0 = as_half16(f0);
             b1 = as_half16(f1);
         }
-        Half16 a1[G];
+        Half16 a1[G1 > 0 ? G1 : 1];
 #pragma unroll
-        for (int m = 0; m < G; ++m) {
+        for (int m = 0; m < G1; ++m) {
             const auto* ab = reinterpret_cast<const unsigned char*>(dev::uniform(
                 x + (static_cast<std::size_t>(G + m) * tiles_k + static_cast<unsigned>(tile_k)) * 256U));
             a1[m] = pipe_load_a(ab, static_cast<std::uint32_t>(c) * 32U);
@@ -497,7 +501,7 @@ static __device__ void item_pipe(const Item& it, unsigned bx, unsigned by, unsig
             acc1[m] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a0[m], b1, acc1[m]);
         }
 #pragma unroll
-        for (int m = 0; m < G; ++m) {
+        for (int m = 0; m < G1; ++m) {
             acc0[G + m] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a1[m], b0, acc0[G + m]);
             acc1[G + m] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a1[m], b1, acc1[G + m]);
         }
@@ -508,6 +512,7 @@ static __device__ void item_pipe(const Item& it, unsigned bx, unsigned by, unsig
 #pragma unroll
         for (int j = 0; j < 8; ++j) {
             const unsigned row = first_row + static_cast<unsigned>(16 * m + 2 * j + (lane >> 4));
+            if (!FullRows && row >= it.rows) continue;
             auto* dst = it.part + (static_cast<std::size_t>(bz) * it.rows + row) * it.output;
             dst[col0] = acc0[m][j];
             dst[col0 + 16U] = acc1[m][j];
@@ -520,7 +525,14 @@ static __device__ __forceinline__ void pipe_or_tail(const Item& it, unsigned bx,
     // Uniform check includes row0 for exact-fit remainder items.
     if (it.row0 + by * 16U * static_cast<unsigned>(MT) + 16U * static_cast<unsigned>(MT) <= it.rows)
         item_pipe<Bits, MT, G, true, Simplify>(it, bx, by, bz);
+    else if constexpr (Policy::kPipeTail) item_pipe<Bits, MT, G, false, Simplify>(it, bx, by, bz);
     else item_core_v3<Bits, MT, 0, true>(it, bx, by, bz);
+}
+
+// Tail class MT (1..7) on the pipelined loop: G = min(MT, 4), row guard on the store (Policy::kPipeTail callers).
+template <int Bits, int MT, bool Simplify>
+static __device__ __forceinline__ void pipe_tail(const Item& it, unsigned bx, unsigned by, unsigned bz) {
+    item_pipe<Bits, MT, (MT < 4 ? MT : 4), false, Simplify>(it, bx, by, bz);
 }
 
 

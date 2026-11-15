@@ -10,6 +10,8 @@
 // Sent once per new digest: both ends keep an EmbedFrameLedger of what the peer holds, updated in manifest order by
 // the same rule (LRU of a fixed number of spans), so the sender knows without a round trip which payloads to omit.
 // A frame naming a digest the receiver no longer holds is a protocol error (the ledgers diverged).
+// Encoding, receiving and transport failures are terminal for the pair's frame session: updates may already
+// have touched either ledger. Do not retry with those objects; restart both ends with fresh ledgers/receivers.
 //
 // Wire (host byte order; both ranks are the same architecture, as for every pair frame):
 //   header   u32 magic 'EMBF', u32 version 1, u32 spans, u32 manifest CRC-32C (of the entries)
@@ -43,6 +45,25 @@ inline constexpr std::uint32_t kEmbedFrameMagic = 0x46424D45U;  // "EMBF"
 inline constexpr std::uint32_t kEmbedFrameVersion = 1U;
 inline constexpr std::size_t kEmbedFrameHeaderBytes = 16U, kEmbedFrameEntryBytes = 64U;
 inline constexpr std::uint32_t kEmbedFrameLedgerSpans = 64U;  // spans a peer keeps (default of both ends)
+
+// Transfer an already agreed frame length in ordered, bounded exchanges. Exactly one of out/in carries
+// the frame: the sender discards replies, the receiver sends zeros. Both peers use the same max_bytes
+// and callback tags; their transport's exchange sequence preserves ordering within that tag.
+template <class Exchange>
+void transfer_embed_frame_bytes(std::span<const std::byte> out, std::span<std::byte> in,
+                               std::size_t max_bytes, Exchange&& exchange) {
+    if (max_bytes == 0U || (!out.empty() && !in.empty()))
+        throw std::invalid_argument("embed frame transfer: invalid limit or direction");
+    const bool receiving = !in.empty();
+    const std::size_t n = receiving ? in.size() : out.size();
+    std::vector<std::byte> scratch(std::min(max_bytes, n), std::byte{0});
+    for (std::size_t at = 0; at < n;) {
+        const std::size_t take = std::min(max_bytes, n - at);
+        if (receiving) exchange(std::span<const std::byte>(scratch).first(take), in.subspan(at, take));
+        else exchange(out.subspan(at, take), std::span<std::byte>(scratch).first(take));
+        at += take;
+    }
+}
 
 // What the peer holds, by digest, most recent first. Both ends apply touch() to the manifest entries in order;
 // touch returns the digest it evicted (if any) so the receiver drops that payload.

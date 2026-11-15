@@ -13,6 +13,9 @@ read and what "exact" covers: [methodology](../../methodology.md). Build instruc
 
 ## Run: the pair
 
+**Weights:** [hyukudan/GLM-5.3-Flash-exl3-mirror](https://huggingface.co/hyukudan/GLM-5.3-Flash-exl3-mirror) (mirror of `turboderp/GLM-5.3-Flash-exl3`, 4.05 bpw, used as
+published). Files and revisions: [reproduce](../../reproduce.md#models-and-provenance).
+
 Optional GLM token sharding is a qualified FAST memory profile. It is off by default; `STRIX_GLM_KV_SHARD=auto`
 (with `STRIX_GLM_PF_PIPELINE=1`) selects sharding only after all permitted replicated scratch/window candidates
 fail startup admission on either rank;
@@ -174,6 +177,8 @@ workspace, install/staging, late safety and startup reserve terms in GiB.
 
 | Mode | Prompt / context | Measured | Build / exactness |
 |---|---|---:|---|
+| Prefill, `fast` profile (opt-in; quality qualification in progress) | 8K, engine, fresh process, more than 110 GiB free memory on both nodes | **8.92 s = 918 tok/s**; with one node's memory full of page cache at launch the same run took 9.5-10.1 s (the driver pauses the GPU queues while pages are reclaimed during load): free memory on both nodes before a pair timing | main `ae06f9466`; logits and state hashes equal across runs |
+| Served prefill under load, `fast` (opt-in; quality qualification in progress) | 8K prompt admitted while one stream decodes, ABAB x3 | TTFT **15.03-15.06 s** with chunks grouped by the decode cohort (default) vs 18.50-18.55 s with `STRIX_SERVE_PREFILL_INTERLEAVE=0`; decoding lane 2.32 vs 1.89 tok/s during the prefill, longest gap 1.80 vs 1.20 s | #590; 8K request tokens equal the request alone |
 | Greedy decode, R1 | 31-token chat prompt + 64 generated tokens | **45.29 ms/token = 22.1 tok/s**; **51 %** of calculated 23.2 ms floor | `1836c99c`; tokens equal the reference |
 | Batch decode, R1 | Eight independent rows, benchmark context unspecified | **122.0 ms/step = 65.5 tok/s aggregate** | `1836c99c`; tokens equal the earlier real-pair reference |
 | Exact chunked prefill | 1K / 8K / 32K benchmark prompts, kind unspecified | TTFT **4.268 / 34.70 / 144.75 s** (240 / 236 / 226 tok/s) | `875ca821`, integrated in `41d8cfdc`; both ranks' logits bitwise equal the previous exact prefill |

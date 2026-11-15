@@ -16,6 +16,7 @@
 #endif
 #if defined(STRIX_PARITY_MINIMAX)
 #include "minimax/engine/mm_defaults.hpp"
+#include "minimax/engine/mm_profile_table.hpp"
 #endif
 #if defined(STRIX_PARITY_DS41)
 #include "strix/deepseek41_pair_defaults.hpp"
@@ -124,6 +125,25 @@ void minimax() {
         {"serve.*", "scheduler / speculation policy between concurrent requests; no CLI counterpart"},
     };
     gate("minimax", cli, server, allowed);
+    // FAST prefill profile rows (mm_profile_table.hpp): every row is printed by both entry points and resolves the
+    // same with the bundle on, with an explicit OFF beating it, and on the FAST_I4 format (member not selected).
+    for (const auto& keys : {std::map<std::string, std::string>{{"STRIX_MM_FAST_PREFILL", "1"}},
+                             std::map<std::string, std::string>{{"STRIX_MM_FAST_PREFILL", "1"}, {"STRIX_MM_PF_MSA_FLASH", "0"}},
+                             std::map<std::string, std::string>{{"STRIX_MM_FAST_PREFILL", "1"}, {"STRIX_MMX_MODEL_FORMAT", "fast_i4"}},
+                             std::map<std::string, std::string>{{"STRIX_MM_PF_MSA_FLASH", "2"}, {"STRIX_MM_PF_MSA_FLASH_LAYERS", "50-59"}}}) {
+        const md::Lookup env = [&keys](const char* k) -> const char* {
+            const auto it = keys.find(k);
+            return it == keys.end() ? nullptr : it->second.c_str();
+        };
+        const auto c = sp::from_lines(md::effective_config(md::parse_cli("rank", {}), env));
+        const auto s = sp::from_lines(md::effective_config(md::parse_cli("serve", {}), env));
+        for (const auto& row : md::profile_table)
+            check(c.count(std::string(row.env)) == 1 && s.count(std::string(row.env)) == 1,
+                  "minimax: profile row " + std::string(row.env) + " printed by both entry points");
+        for (const char* k : {"prefill.fast_profile", "prefill.fast_policies", "prefill.identity", "profile_fingerprint"})
+            check(c.count(k) == 1 && s.count(k) == 1, std::string("minimax: ") + k + " printed by both entry points");
+        gate("minimax+fast", c, s, allowed);
+    }
 }
 #endif
 

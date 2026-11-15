@@ -170,6 +170,40 @@ inline bool gdn_vec_epilogue() {
     static const bool on = [] { const char* v = std::getenv("STRIX_QPF2K_GDN_VEC_EPILOGUE"); return !v || v[0] != '0' || v[1] != '\0'; }();
     return on;
 }
+// Vector epilogue as a site trait. A site opts in with `static constexpr unsigned dense_vector_store = <bit>`, a host
+// `vector_store_supported()` (4 adjacent outputs of one segment share one aligned store) and a device
+// `store4(out, r, f4)` writing the same values as four store() calls. STRIX_QPF2K_DENSE_VEC_SITES selects the sites
+// (bits as site_enabled: 1 GDN in, 2 GDN out, 4 QSA q|k|v, 8 QSA out; 64 GDN in as BF16 rows, the FAST route).
+// Default 1 = the GDN input site only, as before; STRIX_QPF2K_GDN_VEC_EPILOGUE=0 still clears bit 1. Same bits in every
+// arm: only the store width changes. Any engine's tiled site binds it by declaring the trait.
+inline unsigned vec_sites() {
+    static const unsigned mask = [] {
+        const int n = strix::envcfg::integer("STRIX_QPF2K_DENSE_VEC_SITES", 1);
+        const unsigned m = n >= 0 ? static_cast<unsigned>(n) : 1U;
+        return gdn_vec_epilogue() ? m : m & ~1U;
+    }();
+    return mask;
+}
+// Lean pinned form (form 4) as a site trait: `static constexpr unsigned dense_lean_site = <bit>`; STRIX_QPF2K_DENSE_LEAN_SITES
+// (bits as site_enabled: 8 QSA out, 32 shared down; default 0) binds form 4 for those sites in FP16-scratch and BF16-inline
+// A modes (FP32 inline A spills at 192 VGPRs and keeps form 3), above K 2560 as well. Same per-output arithmetic.
+inline unsigned lean_sites() {
+    static const unsigned mask = [] { const int n = strix::envcfg::integer("STRIX_QPF2K_DENSE_LEAN_SITES", 0); return n > 0 ? static_cast<unsigned>(n) : 0U; }();
+    return mask;
+}
+template <class Site> bool lean_site() {
+    if constexpr (requires { Site::dense_lean_site; }) return (lean_sites() & Site::dense_lean_site) != 0U;
+    else return false;
+}
+// Four BF16 words (already rounded by the site's own conversion) as one 8-byte store; p 8-byte aligned.
+__device__ __forceinline__ void store4_u16(std::uint16_t* p, std::uint16_t a, std::uint16_t b, std::uint16_t c, std::uint16_t d) {
+    using u2 = unsigned __attribute__((ext_vector_type(2)));
+    *reinterpret_cast<u2*>(p) = u2{a | (static_cast<unsigned>(b) << 16U), c | (static_cast<unsigned>(d) << 16U)};
+}
+// Host test of a single-row BF16 output (row r at base + r * stride bytes, output o at element o) for store4_u16.
+inline bool bf16_store4_ok(const void* base, std::uint64_t stride, std::uint32_t outputs) {
+    return reinterpret_cast<std::uintptr_t>(base) % 8U == 0U && stride % 8U == 0U && outputs % 4U == 0U;
+}
 template <unsigned BSlot> __device__ __forceinline__ f8 wmma_pinned(Frag a, Frag b, f8 c) {
     if constexpr (BSlot == 0U) asm("v_wmma_f32_16x16x16_f16 %0, %1, %2, %0" : "+&v"(c) : "{v[183:190]}"(a), "{v[166:173]}"(b));
     else asm("v_wmma_f32_16x16x16_f16 %0, %1, %2, %0" : "+&v"(c) : "{v[183:190]}"(a), "{v[158:165]}"(b));
@@ -662,6 +696,7 @@ template <class Site> unsigned form(unsigned mode) {
     if (mode == kPre && pre != ~0U) return pre;
     if (all != ~0U) return all;
     if (mode == kF32) return 3U;
+    if (lean_site<Site>()) return 4U;  // STRIX_QPF2K_DENSE_LEAN_SITES
     if (mode == kBf16) return 4U;  // rev 6c (falls back to form 0 on segments not 256-aligned: shared gate|up)
     if constexpr (requires { Site::qpf2k_pre_form; }) return Site::qpf2k_pre_form;
     else return 3U;
@@ -712,10 +747,10 @@ void launch_projection(const Site& site, std::uint32_t rows, hipStream_t stream,
     if (form_id >= 3U)  // 256-output tiles: every segment boundary a multiple of 256, else form 0 (same bits)
         for (unsigned m = 1; m < site.segments.count; ++m) if (site.segments.first[m] % 256U) form_id = 0U;
     if (Mode == kF32 && form_id == 4U) form_id = 3U;  // FP32 A staged inline does not fit 192 VGPRs: form 3 (same bits)
-    if constexpr (Probe == 0U && requires { site.vector_store_supported(); } && !requires { Site::dense_vector_epilogue; }) {
+    if constexpr (Probe == 0U && requires { Site::dense_vector_store; } && !requires { Site::dense_vector_epilogue; }) {
         // Unpinned scratch-A + Q8 + the vector epilogue spills; preserve the
         // original scalar route there. Decide once before wrapping the site.
-        if (gdn_vec_epilogue() && (Mode != kPre || wmma_pin()) &&
+        if ((vec_sites() & Site::dense_vector_store) != 0U && (Mode != kPre || wmma_pin()) &&
             (form_id == 4U || (Mode == kBf16 && form_id == 0U)) && site.vector_store_supported()) {
             DenseVectorEpilogue<Site> vector_site{};
             static_cast<Site&>(vector_site) = site;
@@ -774,7 +809,7 @@ void launch(const Site& site, std::uint32_t rows, hipStream_t stream, bool any_o
         // Default form 4 only up to K 2560: above it the 40 resident blocks' B tiles (256 x K x 34/32 B each) outgrow the
         // 32 MB MALL (mi t1 K sweep: form4/form3 0.995 @2560, 1.075 @3072, 1.61 @4096..5120). No engine site is affected
         // today (form-4 sites are K 2560); an explicit form_id is kept as given (fixture sweeps). Same bits either way.
-        if (form_id == 4U && site.width > 2560U) form_id = 3U;
+        if (form_id == 4U && site.width > 2560U && !lean_site<Site>()) form_id = 3U;
     }
     // Forms 3/4 tile 256 outputs: every segment boundary must be a multiple of 256 (else form 0, same bits).
     if (form_id >= 3U)

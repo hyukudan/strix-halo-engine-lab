@@ -27,6 +27,11 @@ los ranks coinciden. [Contrato de implementación](../../minimax-grouped-prefill
 
 ## Ejecución
 
+**Pesos:** [hyukudan/MiniMax-M3.1-Flash-EXL3-EAQ-v1-3.06-bpw-mirror](https://huggingface.co/hyukudan/MiniMax-M3.1-Flash-EXL3-EAQ-v1-3.06-bpw-mirror) (réplica de
+`Mia-AiLab/MiniMax-M3.1-Flash-EXL3-EAQ-v1-3.06-bpw`, usada tal cual se publica; nuestros packs de draft EXL3 de 4 bits en
+`minimax-drafts/`) y [hyukudan/MiniMax-M3.1-Flash-DFlash2-mirror](https://huggingface.co/hyukudan/MiniMax-M3.1-Flash-DFlash2-mirror) (origen del draft). Ficheros y revisiones:
+[reproducir](../../reproduce.md#models-and-provenance).
+
 Ejecute una vez por nodo con `R` establecido en 0 o 1 y assets EXL3 coincidentes:
 
 ```sh
@@ -96,6 +101,7 @@ un tiempo de prefill un 2.3–2.6% menor con IDs de token completos idénticos; 
 
 | Modo | Prompt / contexto | Resultado medido | Build / exactitud |
 |---|---|---|---|
+| Prefill combinado | 8K, valores por defecto (exacto), segunda sesión en caliente en el proceso, 3 ejecuciones | **12.24-12.25 s = 669 tok/s** (primera ejecución 13.30 s); 3.40 M ciclos de GPU por token por GPU. El perfil FAST de prefill `STRIX_MM_FAST_PREFILL=1` existe (opcional, desactivado por defecto) y aún no está calificado en el dispositivo | main `ae06f9466`; hashes de estado iguales en ambos ranks en cada ejecución |
 | Decode greedy | prompts de benchmark de 1K / 8K, en frío | **43.30 / 45.06 ms/token** (23.10 / 22.19 tok/s); 44.57 / 46.10 ms/token en `8cc30ac0` (256 tokens) | árbol público del PR #59; los ranks coinciden, IDs de referencia iguales |
 | Prefill combinado | prompt de benchmark de 8K | **14.04 s**, 583 tok/s (brazos alternos en un proceso, 13.85–14.29 s); **45–50 %** del suelo de kernel calculado de 6.3–7.0 s; 17.731 s en `e0bad3d1` (línea base 21.874 s) | #334 `c225cdaa2`; estado y filas finales de ambos ranks iguales a las referencias |
 | Prefill combinado nuevo | prompt de benchmark de 32K | **63.48 s**, 516 tok/s (tres ejecuciones por brazo, en ambos órdenes); **41–46 %** del suelo de kernel calculado de 26–29 s; 91.508 s en `e0bad3d1` | #334 `c225cdaa2`; hash de resultado igual en las seis ejecuciones, los ranks coinciden |

@@ -1,5 +1,6 @@
 // HIP runner of the shared vision encoder, arithmetic identity "vision-f16-attn2-v1" (default: two-term attention)
 // or "vision-f16-v1" (EncoderOptions::attention_terms 1, one-term attention), class FAST.
+// The device projector (default on) adds its identity suffix: see Encoder::effective_arithmetic().
 //
 // Every linear (patch embedding over flattened patches, qkv, out, MLP, projector) is the shared dense FP16 tall GEMM
 // (core/f16_dense_tall.hpp): weights as FP16 panels with a power-of-two tensor scale (undone exactly in the FP32
@@ -571,13 +572,10 @@ struct Encoder::Impl {
     Pinned stage;                                  // inputs of one encode (patches, position addend, cos, sin)
     Dev px, py, pact, py2, plo, pylo, phid;        // projector / linear() scratch, grow only
     std::uint64_t epoch = 0;                       // encodes run; EncoderOutput::device_epoch of a resident result
+    const std::shared_ptr<const void> owner = std::make_shared<const char>(char{0});
     const float* hid = nullptr;                    // resident hidden rows of encode `epoch` (null: none)
     unsigned hid_pitch = 0;
 
-    static bool project_device() {
-        static const bool on = envcfg::flag("STRIX_VISION_PROJECT_DEVICE", true);
-        return on;
-    }
     const Panel& panel_for(const Tensor& w, const Tensor& bias) {
         auto it = projector.find(w.data);
         if (it == projector.end()) it = projector.emplace(w.data, make_panel(w, bias)).first;
@@ -713,7 +711,7 @@ Encoder::Encoder(EncoderConfig cfg, EncoderOptions opt) : impl_(std::make_unique
     impl_->failure = Dev(layout::kAlign);
 }
 Encoder::~Encoder() = default;
-const char* Encoder::arithmetic() const { return impl_->opt.attention_terms == 2U ? kArithmeticAttn2 : kArithmetic; }
+const char* Encoder::arithmetic() const { return effective_arithmetic(impl_->opt.attention_terms); }
 
 void Encoder::load(const EncoderWeights& w) {
     auto& im = *impl_;
@@ -739,8 +737,10 @@ void Encoder::load(const EncoderWeights& w) {
         im.blocks.push_back(std::move(d));
     }
     if (im.cfg.final_norm) {
+        const auto tv = LoadClock::now();
         im.fnw = make_vector(w.final_norm_w, im.cfg.width);
         im.fnb = make_vector(w.final_norm_b, im.cfg.width);
+        ls.vectors_ms += ms_from(tv);
     }
     im.loaded = true;
     ls.total_ms = std::chrono::duration<double, std::milli>(LoadClock::now() - t0).count();
@@ -777,6 +777,8 @@ std::size_t Encoder::device_bytes() const {
     return b + im.px.n + im.py.n + im.pact.n + im.py2.n + im.plo.n + im.pylo.n + im.phid.n;
 }
 
+std::size_t Encoder::pinned_host_bytes() const { return impl_->stage.n; }
+
 EncoderOutput Encoder::encode(const PatchGrid& grid, const PositionInputs& pos) {
     EncodeStats stats;
     return encode(grid, pos, stats);
@@ -788,7 +790,7 @@ EncoderOutput Encoder::encode(const PatchGrid& grid, const PositionInputs& pos, 
 
 EncoderOutput Encoder::encode_for_projection(const PatchGrid& grid, const PositionInputs& pos) {
     EncodeStats stats;
-    return run(grid, pos, stats, Impl::project_device());
+    return run(grid, pos, stats, project_device());
 }
 
 void Encoder::reserve(unsigned rows, unsigned tiles) {
@@ -957,6 +959,7 @@ EncoderOutput Encoder::run(const PatchGrid& grid, const PositionInputs& pos, Enc
         im.hid = hidden;
         im.hid_pitch = g.wp;
         out.device_epoch = im.epoch;
+        out.device_owner = im.owner;
     }
     stats.total_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
     return out;
@@ -988,20 +991,18 @@ void Encoder::linear(const Tensor& w, const Tensor& bias, const float* x, std::s
 void Encoder::merge_project(const EncoderOutput& hidden, unsigned grid_h, unsigned grid_w, const MergeProjector& m, float* rows) {
     auto& im = *impl_;
     const bool resident = hidden.device_epoch != 0;
-    if (resident && (hidden.device_epoch != im.epoch || !im.hid))
+    if (resident && (!hidden.resident_for(im.owner, im.epoch) || !im.hid))
         throw std::logic_error("vision encoder: the device hidden rows of this output were overwritten");
-    if (!Impl::project_device()) {  // host graph through linear(); encode_for_projection() downloaded the rows
+    if (!project_device()) {  // host graph through linear(); encode_for_projection() downloaded the rows
         DenseOps::merge_project(hidden, grid_h, grid_w, m, rows);
         return;
     }
     const unsigned R = m.ratio, W = hidden.width;
-    if (!R || !W || !rows || !m.w1 || !m.w2 || hidden.rows != grid_h * grid_w || m.w1.cols != std::size_t{W} * R * R ||
-        m.w2.cols != m.w1.rows || (!resident && hidden.hidden.size() != std::size_t{hidden.rows} * W))
-        throw std::invalid_argument("vision encoder: merge projector operands");
+    const auto geometry = layout::projector_geometry(hidden, grid_h, grid_w, m, rows, resident);
+    const unsigned mw = geometry.mw, tokens = geometry.tokens;
+    if (tokens > 0x00FFFFFFU) throw std::invalid_argument("vision encoder: merge projector rows");
     const Panel& p1 = im.panel_for(m.w1, m.b1);
     const Panel& p2 = im.panel_for(m.w2, m.b2);
-    const unsigned mw = (grid_w + R - 1U) / R, tokens = m.tokens(grid_h, grid_w);
-    if (!tokens || tokens > 0x00FFFFFFU) throw std::invalid_argument("vision encoder: merge projector rows");
     const auto stream = im.stream;
     const float* src = im.hid;
     unsigned pitch = im.hid_pitch;

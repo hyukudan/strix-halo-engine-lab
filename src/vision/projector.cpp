@@ -4,13 +4,63 @@
 #include "strix/vision/encoder.hpp"
 
 #include "encoder_layout.hpp"
+#include "strix/env_flags.hpp"
 
 #include <cmath>
 #include <cstddef>
+#include <limits>
 #include <stdexcept>
 #include <vector>
 
 namespace strix::vision {
+
+bool Encoder::project_device() {
+    static const bool on = envcfg::flag("STRIX_VISION_PROJECT_DEVICE", true);
+    return on;
+}
+
+const char* Encoder::effective_arithmetic(unsigned attention_terms) {
+    const bool two = attention_terms == 2U;
+    if (project_device()) return two ? "vision-f16-attn2-v1-project-device-f64-v1" : "vision-f16-v1-project-device-f64-v1";
+    return two ? kArithmeticAttn2 : kArithmetic;
+}
+
+layout::ProjectorGeometry layout::merge_geometry(unsigned grid_h, unsigned grid_w, unsigned ratio) {
+    constexpr auto limit = std::numeric_limits<unsigned>::max();
+    const std::uint64_t h = grid_h, w = grid_w, r = ratio;
+    if (!h || !w || !r || h * w > limit || r * r > limit)
+        throw std::invalid_argument("vision encoder: merge projector grid");
+    const auto mh = (h + r - 1U) / r, mw = (w + r - 1U) / r;
+    // The unchanged unshuffle kernel uses unsigned coordinates, including zero-filled edge cells.
+    if (mh * mw > limit || mh * r > limit || mw * r > limit)
+        throw std::invalid_argument("vision encoder: merge projector grid range");
+    return {static_cast<unsigned>(h * w), static_cast<unsigned>(mh), static_cast<unsigned>(mw),
+            static_cast<unsigned>(mh * mw), 0};
+}
+
+layout::ProjectorGeometry layout::projector_geometry(const EncoderOutput& hidden, unsigned grid_h, unsigned grid_w,
+                                                     const MergeProjector& m, const float* rows, bool resident) {
+    auto g = merge_geometry(grid_h, grid_w, m.ratio);
+    const std::uint64_t in = std::uint64_t{hidden.width} * m.ratio * m.ratio;
+    // Leave room for GEMM panel padding in unsigned dimensions on both backends.
+    constexpr auto limit = std::numeric_limits<unsigned>::max() - 127U;
+    if (!hidden.width || !rows || !m.w1 || !m.w2 || hidden.rows != g.rows || in > limit || m.w1.cols != in ||
+        m.w1.rows > limit || m.w2.rows > limit || m.w2.cols != m.w1.rows)
+        throw std::invalid_argument("vision encoder: merge projector operands");
+    const auto elements = [](std::size_t n, std::size_t width) {
+        if (!width || n > std::numeric_limits<std::size_t>::max() / sizeof(float) / width)
+            throw std::invalid_argument("vision encoder: merge projector storage range");
+        return n * width;
+    };
+    const auto hidden_size = elements(g.rows, hidden.width);
+    if (!resident && hidden.hidden.size() != hidden_size)
+        throw std::invalid_argument("vision encoder: merge projector hidden rows");
+    g.in = static_cast<unsigned>(in);
+    (void)elements(g.tokens, round_up(g.in, kGemmIn));
+    (void)elements(g.tokens, round_up(static_cast<unsigned>(m.w1.rows), kGemmIn));
+    (void)elements(g.tokens, round_up(static_cast<unsigned>(m.w2.rows), kGemmOut));
+    return g;
+}
 
 float activate(Activation a, float v) {
     const double x = static_cast<double>(v);
@@ -23,17 +73,14 @@ float activate(Activation a, float v) {
 }
 
 unsigned MergeProjector::tokens(unsigned grid_h, unsigned grid_w) const {
-    if (!ratio) throw std::invalid_argument("vision encoder: merge projector ratio");
-    return ((grid_h + ratio - 1U) / ratio) * ((grid_w + ratio - 1U) / ratio);
+    return layout::merge_geometry(grid_h, grid_w, ratio).tokens;
 }
 
 void DenseOps::merge_project(const EncoderOutput& hidden, unsigned grid_h, unsigned grid_w, const MergeProjector& m, float* rows) {
     const unsigned R = m.ratio, W = hidden.width;
-    if (!R || !W || !rows || !m.w1 || !m.w2 || hidden.rows != grid_h * grid_w || hidden.hidden.size() != std::size_t{hidden.rows} * W ||
-        m.w1.cols != std::size_t{W} * R * R || m.w2.cols != m.w1.rows)
-        throw std::invalid_argument("vision encoder: merge projector operands");
-    const unsigned mh = (grid_h + R - 1U) / R, mw = (grid_w + R - 1U) / R, tokens = mh * mw;
-    const std::size_t in = std::size_t{W} * R * R, P = m.w1.rows;
+    const auto g = layout::projector_geometry(hidden, grid_h, grid_w, m, rows);
+    const unsigned mh = g.mh, mw = g.mw, tokens = g.tokens;
+    const std::size_t in = g.in, P = m.w1.rows;
     // Unshuffle; the vector starts as zeros, so cells past the grid edge stay zero.
     std::vector<float> merged(std::size_t{tokens} * in);
     for (unsigned my = 0; my < mh; ++my)

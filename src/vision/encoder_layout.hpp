@@ -10,6 +10,13 @@
 
 namespace strix::vision::layout {
 
+struct ProjectorGeometry {
+    unsigned rows = 0, mh = 0, mw = 0, tokens = 0, in = 0;
+};
+ProjectorGeometry merge_geometry(unsigned grid_h, unsigned grid_w, unsigned ratio);
+ProjectorGeometry projector_geometry(const EncoderOutput&, unsigned grid_h, unsigned grid_w, const MergeProjector&,
+                                     const float* rows, bool resident = false);
+
 inline constexpr unsigned kGemmIn = 128;  // f16_dense_tall: in % 128 == 0
 inline constexpr unsigned kGemmOut = 16;  // 16 outputs per column tile
 inline constexpr std::size_t kAlign = 256;
@@ -86,8 +93,10 @@ inline Geometry geometry(const EncoderConfig& c, unsigned rows, unsigned slots, 
     // (1550 rows under a 1280-row cap ran a 270-row chunk at a third of the big chunk's rate).
     const std::size_t parts = (n + cap - 1U) / cap;
     const std::size_t even = parts ? (n + parts - 1U) / parts : 0U;
-    const std::size_t chunk = (even + 127U) / 128U * 128U;  // <= cap (a multiple of 128)
-    g.chunk = static_cast<unsigned>(std::min<std::size_t>(chunk, n));
+    const std::size_t execution_chunk = (even + 127U) / 128U * 128U;  // <= cap (a multiple of 128)
+    g.chunk = static_cast<unsigned>(std::min<std::size_t>(execution_chunk, n));
+    // Allocation must cover every smaller admitted image, even when balancing reduces this execution's chunk.
+    const std::size_t chunk = std::min(cap, (n + 127U) / 128U * 128U);
     g.mid = aligned(chunk * g.m116 * 4U);
     g.act = aligned(chunk * g.mp * 4U);
     g.o2 = aligned(chunk * g.w16 * 4U);
