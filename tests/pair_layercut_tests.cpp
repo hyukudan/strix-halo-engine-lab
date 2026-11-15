@@ -181,6 +181,8 @@ int main() try {
         require(lc::resolve(fifo, input).xport == lc::Xport::fifo && lc::resolve(fifo, input).kv_frag == 256, "xport cli");
         lc::Cli bad_frag; bad_frag.kv_frag = "100";
         rejects([&] { (void)lc::resolve(bad_frag, input); }, "STRIX_SPLIT_KV_FRAG");
+        lc::Cli lk; lk.act = "link";
+        require(lc::resolve(lk, input).act == lc::Act::link && std::string(lc::act_name(lc::Act::link)) == "link", "act link");
         lc::Cli bad_x; bad_x.xport = "lifo";
         rejects([&] { (void)lc::resolve(bad_x, input); }, "STRIX_SPLIT_XPORT");
     }

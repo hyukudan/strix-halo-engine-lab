@@ -11,11 +11,13 @@ namespace strix::pair::layercut {
 namespace chain = strix::pair::chain;
 inline constexpr std::uint32_t kAct = 0x4C43'4101U, kKv = 0x4C43'4B02U;
 inline constexpr std::uint32_t kMetaV2 = 2;  // Meta::version of the ACT-first contract (Pieces)
-enum class Act { relay, direct };
+// relay: rank 0 forwards ACT to rank 1 over TCP (--cut-relay); link: over the pair link inside the engine (one control
+// exchange per chunk); direct: the producer sends ACT to both ranks. relay and link send the same bytes from the producer.
+enum class Act { relay, direct, link };
 // act-first: Meta v2, ACT urgent over every producer link, KV in the gaps (fragments); fifo: Meta v1, ACT -> KV -> next block.
 enum class Xport { act_first, fifo };
 inline const char* xport_name(Xport x) { return x == Xport::act_first ? "act-first" : "fifo"; }
-inline const char* act_name(Act a) { return a == Act::relay ? "relay" : "direct"; }
+inline const char* act_name(Act a) { return a == Act::relay ? "relay" : a == Act::link ? "link" : "direct"; }
 struct Cli { std::optional<std::string> split, cut, block, act, xport, kv_frag; };
 struct Inputs {
     chain::ModelShape model;
@@ -68,7 +70,8 @@ inline Resolved resolve(const Cli& cli, const Inputs& input, Lookup env = [](con
     else throw std::invalid_argument("STRIX_SPLIT: expected device-only|handoff-full|layer-cut|auto");
     if (a.text == "relay") out.act = Act::relay;
     else if (a.text == "direct") out.act = Act::direct;
-    else throw std::invalid_argument("STRIX_SPLIT_ACT: expected relay|direct");
+    else if (a.text == "link") out.act = Act::link;
+    else throw std::invalid_argument("STRIX_SPLIT_ACT: expected relay|direct|link");
     if (x.text == "act-first") out.xport = Xport::act_first;
     else if (x.text == "fifo") out.xport = Xport::fifo;
     else throw std::invalid_argument("STRIX_SPLIT_XPORT: expected act-first|fifo");

@@ -66,7 +66,9 @@ std::vector<std::uint32_t> layercut_session(mm::Engine& eng, strix::handoff::Lis
     strix::handoff::Listener* relay_listener, const std::string& relay_to, const lc::Resolved& cfg,
     const std::vector<std::uint32_t>& prompt, int steps, const std::string& name, const std::string& out_dir, unsigned req) {
     if (prompt.empty() || steps < 0) throw std::invalid_argument("layercut: empty prompt / negative steps");
-    const bool relay = cfg.act == lc::Act::relay;
+    const bool relay = cfg.act == lc::Act::relay;      // rank 0 forwards ACT over TCP (--cut-relay)
+    const bool link = cfg.act == lc::Act::link;        // the engine forwards rank 0's ACT over the pair link
+    const bool replicated = cfg.act != lc::Act::direct; // ACT reaches rank 0 only, flagged kRelay
     if (relay && ((eng.rank() == 0 && relay_to.empty()) || (eng.rank() == 1 && !relay_listener)))
         throw std::invalid_argument("layercut relay needs --cut-relay on rank 0 and --cut-relay-listen on rank 1");
     std::printf("rank %u layercut-listen %s #%u: waiting\n", eng.rank(), name.c_str(), req); std::fflush(stdout);
@@ -138,7 +140,7 @@ std::vector<std::uint32_t> layercut_session(mm::Engine& eng, strix::handoff::Lis
     std::thread relay_finisher;
     auto receive = [&](strix::handoff::Session& source, bool acts, bool states, bool forward) {
         try {
-            lc::Pieces order(expected, acts, states, relay && acts);
+            lc::Pieces order(expected, acts, states, replicated && acts);
             strix::handoff::Piece piece;
             while (source.next(piece)) {
                 order.accept(piece.header, piece.plain.size(), 1280);
@@ -177,7 +179,7 @@ std::vector<std::uint32_t> layercut_session(mm::Engine& eng, strix::handoff::Lis
     std::uint32_t next = 0;
     double prefill = 0, imported = 0, agree_s = 0, reply_at = 0;
     try {
-        main_reader = std::thread([&] { receive(*session, !relay || eng.rank() == 0, true, relay && eng.rank() == 0); });
+        main_reader = std::thread([&] { receive(*session, !replicated || eng.rank() == 0, true, relay && eng.rank() == 0); });
         if (relay_session) act_reader = std::thread([&] { receive(*relay_session, true, false, false); });
         eng.prefill_begin_cut(0, prompt, 0, cfg.cut, [&](std::uint64_t row0, std::size_t rows, float* dst, hipStream_t stream) {
             const auto t = Clock::now();
@@ -189,7 +191,7 @@ std::vector<std::uint32_t> layercut_session(mm::Engine& eng, strix::handoff::Lis
             if (error) std::rethrow_exception(error);
             lock.unlock();
             cut_hip(hipMemcpyAsync(dst, act.data + row0 * mlc::seam_bytes, rows * mlc::seam_bytes, hipMemcpyHostToDevice, stream), "layercut fetch");
-        });
+        }, link);
         while (!eng.prefill_resume(~0U, &next)) {}
         prefill = secs(start, Clock::now());
         // STRIX_MM_QUALITY_OUT=PREFIX (+ STRIX_MM_QUALITY_ROWS=N): the same raw FP32 dumps as a --session prefill, named

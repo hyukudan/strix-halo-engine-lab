@@ -278,7 +278,7 @@ void run_layercut(const lc::Resolved& cfg, Store& store, const std::vector<std::
                 if (rank == 0 || cfg.act == lc::Act::direct) {
                     const strix::bp_codec::Region region{act_host, std::size_t{desc.rows} * mlc::seam_bytes, 4};
                     const strix::handoff::PieceHeader header{lc::kAct, static_cast<std::uint32_t>(b),
-                        cfg.act == lc::Act::relay ? strix::handoff::kRelay : 0U, desc.row0, desc.rows};
+                        cfg.act != lc::Act::direct ? strix::handoff::kRelay : 0U, desc.row0, desc.rows};
                     auto done = [times, slot_mutex, slot_cv, slot_pending, rank, b] {
                         {
                             std::lock_guard<std::mutex> lock(times->mutex);
