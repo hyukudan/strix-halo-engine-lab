@@ -50,6 +50,7 @@ struct ScopeRule { const char* dir; const char* prefix; bool recursive; const ch
 constexpr ScopeRule scope_rules[] = {
     {"src/minimax", "", true, "strix_minimax_{engine,assets,defaults,session,serve,pfx,dspark,moe_opt_hip,model_description}"},
     {"src/moe_core", "", true, "shared MoE device core included by the MiniMax engine kernels"},
+    {"src/cuda/models/minimax", "", true, "MiniMax RTX prefill (CUDA backend, was src/minimax/rtxpf/cuda)"},
     {"src/dspark_common", "", true, "drafter kernels included by strix_minimax_dspark"},
     {"src/xport", "", true, "strix_xport INTERFACE linked by strix_minimax_engine (xfer)"},
     {"include/strix/minimax", "", true, "public headers of the strix_minimax_* libraries"},

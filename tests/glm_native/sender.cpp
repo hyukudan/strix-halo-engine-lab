@@ -1,5 +1,5 @@
 // CPU-only client exercising the production sender against the actual receiver.
-#include "glm/rtxpf/producer/sender.hpp"
+#include "cuda/models/glm/producer/sender.hpp"
 #include <cstdlib>
 #include <iostream>
 using namespace strix::glm::rtxpf::producer;

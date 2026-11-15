@@ -1,5 +1,5 @@
 #include "strix/ds41_prefill.hpp"
-#include "strix/cuda_ds41_replay.hpp"
+#include "strix/cuda/ds41_replay.hpp"
 #include "strix/ds41_memory_budget.hpp"
 #include "strix/ds41_state_transfer.hpp"
 

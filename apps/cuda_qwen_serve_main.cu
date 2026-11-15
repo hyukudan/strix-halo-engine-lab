@@ -12,7 +12,7 @@
 // Sessions of slots 1.. are allocated when a slot is first needed (one ahead of demand), only while cudaMemGetInfo free
 // VRAM >= session bytes + --slot-margin-mib (env STRIX_QRTX_SLOT_MARGIN_MIB, default 2048: the WDDM fallback engaged at ~1.4 GiB free); otherwise that slot is
 // refused for the server's life and requests wait for a slot with a session (never a WDDM system-memory spill). Every
-// engine allocation also refuses past the card (strix/cuda_vram_guard.hpp). --block-rows N: one engine block size of N
+// engine allocation also refuses past the card (strix/cuda/vram_guard.hpp). --block-rows N: one engine block size of N
 // rows instead of 1024/2048/4096/8192 (whole-prompt prefill when nothing decodes; less activation memory).
 // Prefill while others decode (decode first): chunks of --prefill-chunk rows (default 1024) between the decode steps.
 // STRIX_QRTX_PREFILL_OVERLAP=1 runs the chunks on a second stream beside the steps (opt-in); --prefill-chunk auto sizes
@@ -25,8 +25,8 @@
 // Token-block prefix checkpoints restore exact prompt state before the remaining prefill rows.
 #include "strix/device/cuda_enumerator.hpp"
 #include "cuda_qwen_prefix_cache.hpp"
-#include "strix/cuda_qwen_cohort.hpp"
-#include "strix/cuda_qwen_prefill.hpp"
+#include "strix/cuda/qwen_cohort.hpp"
+#include "strix/cuda/qwen_prefill.hpp"
 #include "strix/serve/api.hpp"
 #include "strix/serve/bpe_tokenizer.hpp"
 #include "strix/serve/engine.hpp"

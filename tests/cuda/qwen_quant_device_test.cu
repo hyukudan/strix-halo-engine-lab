@@ -2,8 +2,8 @@
 // GGUF files, the GPU decode of every 32-value group must equal the host decode bit for bit (the host decode equals the
 // host reference oracle: qwen_quant_host_test), and transcode::to_q8_0 must equal the same rule computed on the host.
 //   qwen_quant_device_test <file.gguf>...       (GPU; exit 0 = all equal)
-#include "strix/cuda_qwen_quant.cuh"
-#include "strix/cuda_qwen_transcode.hpp"
+#include "strix/cuda/qwen_quant.cuh"
+#include "strix/cuda/qwen_transcode.hpp"
 #include "strix/ggml_dequant.hpp"
 #include "strix/gguf_reader.hpp"
 

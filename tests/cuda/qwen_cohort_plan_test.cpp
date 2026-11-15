@@ -1,5 +1,5 @@
-// Host test of the cohort window packing (include/strix/cuda_qwen_cohort_plan.hpp); no GPU.
-#include "strix/cuda_qwen_cohort_plan.hpp"
+// Host test of the cohort window packing (include/strix/cuda/qwen_cohort_plan.hpp); no GPU.
+#include "strix/cuda/qwen_cohort_plan.hpp"
 
 #include <cstdio>
 #include <cstdlib>
