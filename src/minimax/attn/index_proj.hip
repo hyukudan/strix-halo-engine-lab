@@ -299,9 +299,14 @@ struct IndexCols {
         for (unsigned i = 0; i < 8U; ++i) nb[i] = *(tall::detail::GlobalU4*)(p + static_cast<std::size_t>(i) * kProjOut * 16U);
     }
 };
-template <unsigned TC> __global__ __launch_bounds__(256) void proj_wmma_kernel(IndexProjView v) {
+// CF: column blocks on grid.x (core kColumnFast): the 24 / TC CTAs of a row block share its x through L2. Rows on
+// grid.x (CF = false, bench arm) re-stream x from memory once per column block: 4096 rows tc 4 4290 us vs slab 2740.
+template <bool CF> struct IndexColsOrder : IndexCols {
+    static constexpr bool kColumnFast = CF;
+};
+template <unsigned TC, bool CF> __global__ __launch_bounds__(256) void proj_wmma_kernel(IndexProjView v) {
     __shared__ tall::Storage<TC> lds;
-    tall::core<TC>(v.x, kProjIn, v.rows, IndexCols{v.w, v.iq, v.ik}, lds);
+    tall::core<TC>(v.x, kProjIn, v.rows, IndexColsOrder<CF>{{v.w, v.iq, v.ik}}, lds);
 }
 
 using strix::hip_check;
@@ -423,14 +428,18 @@ void enqueue_index_proj_slab(const IndexProjView& v, hipStream_t stream) {
     hip_check(hipGetLastError(), "index_proj slab");
 }
 
-void enqueue_index_proj_wmma(const IndexProjView& v, hipStream_t stream, unsigned tc) {
+template <unsigned TC> void launch_wmma(const IndexProjView& v, hipStream_t stream, bool rows_fast) {
+    const unsigned rb = (v.rows + tall::kRows - 1U) / tall::kRows, cb = kWmmaTiles / TC;
+    if (rows_fast) hipLaunchKernelGGL((proj_wmma_kernel<TC, false>), dim3(rb, cb), dim3(256), 0, stream, v);
+    else hipLaunchKernelGGL((proj_wmma_kernel<TC, true>), dim3(cb, rb), dim3(256), 0, stream, v);
+}
+void enqueue_index_proj_wmma(const IndexProjView& v, hipStream_t stream, unsigned tc, bool rows_fast) {
     if (v.rows == 0 || static_cast<std::uint64_t>(v.rows) * kProjIn * 4U >= (std::uint64_t{1} << 32U))
         throw std::invalid_argument("index_proj wmma: rows must be 1 .. 174762");
-    const unsigned gx = (v.rows + tall::kRows - 1U) / tall::kRows;
     switch (tc) {
-    case 4: hipLaunchKernelGGL(proj_wmma_kernel<4>, dim3(gx, kWmmaTiles / 4U), dim3(256), 0, stream, v); break;
-    case 2: hipLaunchKernelGGL(proj_wmma_kernel<2>, dim3(gx, kWmmaTiles / 2U), dim3(256), 0, stream, v); break;
-    case 1: hipLaunchKernelGGL(proj_wmma_kernel<1>, dim3(gx, kWmmaTiles), dim3(256), 0, stream, v); break;
+    case 4: launch_wmma<4>(v, stream, rows_fast); break;
+    case 2: launch_wmma<2>(v, stream, rows_fast); break;
+    case 1: launch_wmma<1>(v, stream, rows_fast); break;
     default: throw std::invalid_argument("index_proj wmma: tc must be 4, 2 or 1");
     }
     hip_check(hipGetLastError(), "index_proj wmma");

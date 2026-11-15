@@ -47,8 +47,9 @@ void enqueue_index_proj_decode_lds(const IndexProjView& v, hipStream_t stream);
 // core (core/f16_dense_tall.hpp): x rounded to FP16 (RNE), the packed FP16 weights as stored, per (16-row,
 // 16-output) tile one WMMA chain from +0 over the 16-wide k units ascending. The weights are staged straight from
 // the packed chunk-major layout above (no second copy). tc = column tiles per CTA (4, 2 or 1; 24 tiles in all):
-// every tc gives the same bits. Any rows >= 1; rows * 6144 * 4 < 2^32.
-void enqueue_index_proj_wmma(const IndexProjView& v, hipStream_t stream, unsigned tc = 4);
+// every tc gives the same bits. Any rows >= 1; rows * 6144 * 4 < 2^32. CTA order: column blocks fastest (the
+// blocks of one row block share x in L2); rows_fast = true is the measured-slower order, kept for the bench.
+void enqueue_index_proj_wmma(const IndexProjView& v, hipStream_t stream, unsigned tc = 4, bool rows_fast = false);
 // Diagnostics (bench only, wrong outputs for modes 1-3): rows 1 (ring 32) or > 1 (row pairs, ring 16); mode 0 = the
 // decode kernel, 1 = no weight loads, 2 = pure FMA chain, 3 = no FMAs (weight + activation streams).
 void enqueue_index_proj_diag(const IndexProjView& v, int mode, hipStream_t stream);
