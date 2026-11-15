@@ -328,6 +328,20 @@ bool prefill_o_b_one() {
     const char* v = std::getenv("STRIX_DS41_PREFILL_O_B_ONE");
     return !(v && v[0] == '0');
 }
+// Routed-MoE and window schedule (bitwise; read per call, defaults from the shared resolver deepseek41_pair_defaults):
+// STRIX_DS41_PREFILL_MOE_PASS_WINDOW (default 1; 0 off): one MoE window per pass (ds41::moe_window_rows) up to
+// STRIX_DS41_PREFILL_MOE_WINDOW_CAP rows (default 8192), instead of moe_chunk_rows windows (rows are independent in the
+// MoE: the same bits; fewer expert reads per pass above 4,096 rows).
+// STRIX_DS41_PREFILL_JOINT_LAYER (=1 on): the joint expert pass when the LAYER's rows are at most
+// STRIX_DS41_PREFILL_JOINT_LAYER_ROWS (default 1024; ds41::moe_joint_layer), besides the prompt rule T <= joint_max_rows.
+// STRIX_DS41_PREFILL_WINDOW_DRAIN (default 1; 0 off; bit 1 = drain the main stream and the lanes before a chunk's windows,
+// bit 2 = after them): host synchronisation at the points --timing synchronises at. Bit 1 alone holds the whole gain: with
+// the main stream drained, the lanes' wait on chunk_ready is already satisfied when their window launches are queued.
+bool prefill_moe_pass_window() { return strix::envcfg::flag("STRIX_DS41_PREFILL_MOE_PASS_WINDOW", true, strix::EnvFlagMatch::exact); }
+std::uint32_t prefill_moe_window_cap() { return strix::envcfg::number<std::uint32_t>("STRIX_DS41_PREFILL_MOE_WINDOW_CAP", 8192U, 1U, 65536U); }
+bool prefill_joint_layer() { return strix::envcfg::flag("STRIX_DS41_PREFILL_JOINT_LAYER", false, strix::EnvFlagMatch::exact); }
+std::uint32_t prefill_joint_layer_rows() { return strix::envcfg::number<std::uint32_t>("STRIX_DS41_PREFILL_JOINT_LAYER_ROWS", 1024U, 0U, 65536U); }
+unsigned prefill_window_drain() { return strix::envcfg::number<unsigned>("STRIX_DS41_PREFILL_WINDOW_DRAIN", 1U, 0U, 3U); }
 bool prefill_o_low_a8_fused() {
     const char* v = std::getenv("STRIX_DS41_PREFILL_O_LOW_A8_FUSED");
     return !(v && v[0] == '0');
@@ -389,6 +403,7 @@ struct DevicePrefill::Impl {
     std::map<std::string, Dev<std::uint8_t>> weights;
     std::unique_ptr<ds41::EngramRowReader> engram_reader;
     // the routed-expert MoE of every layer (one scratch; STRIX_DS41_PREFILL_MOE_PERSIST=0: one object per layer)
+    bool moe_window_auto = false;
     std::unique_ptr<ds41::PrefillMoe> moe;
     bool moe_persist = true;
     // resumable runs (PrefillTask): the task whose run is in progress (its worker thread runs run_from and stops at the
@@ -769,6 +784,8 @@ DevicePrefill::DevicePrefill(const std::filesystem::path& gguf, const PrefillOpt
     if (const char* e = std::getenv("STRIX_DS41_PREFILL_FP16_A8"); e != nullptr && std::string(e) == "1") options.fp16_keep_a8 = true;
     if (const char* e = std::getenv("STRIX_DS41_PREFILL_FP16_FAST"); e != nullptr && std::string(e) == "1") options.fp16_fast = true;
     if (const char* e = std::getenv("STRIX_DS41_PREFILL_FP16_WSPLIT"); e != nullptr && std::string(e) == "1") options.fp16_wsplit = true;
+    m.moe_window_auto = options.moe_chunk_rows == 0U;
+    if (m.moe_window_auto) options.moe_chunk_rows = 4096U;
     m.options = options;
     if (options.world != 1U && options.world != 2U) throw std::invalid_argument("deepseek41 prefill: world must be 1 or 2");
     if (options.world == 2U && (options.communicator == nullptr || options.rank > 1U))
@@ -2554,6 +2571,13 @@ PrefillResult DevicePrefill::run_from(std::span<const std::uint32_t> tokens, std
                     result.attention_parts[k] += seconds_since(t_part);
                     t_part = std::chrono::steady_clock::now();
                 };
+                // window drain (bitwise, schedule only): the --timing synchronisation at the window loop's edges
+                const unsigned window_drain = m.options.timing ? 0U : prefill_window_drain();
+                const auto drain_windows = [&](unsigned bit) {
+                    if ((window_drain & bit) == 0U) return;
+                    check(hipStreamSynchronize(st), "window drain");
+                    for (auto& ln : m.lanes) check(hipStreamSynchronize(ln.stream), "window drain");
+                };
                 const auto f16 = [&](const std::string& w, const float* in, std::uint32_t width, std::uint32_t count, float* out, std::uint32_t r0) {
                     if (r0 == Tn) return;
                     ds41::F16RowsView v;
@@ -2857,6 +2881,7 @@ PrefillResult DevicePrefill::run_from(std::span<const std::uint32_t> tokens, std
                     }
                     if (!first_q_b_done || r0 != o0) q_b_chunk(r0, n);
                     mark_part(2);
+                    drain_windows(1U);
                     check(hipEventRecord(m.chunk_ready, st), "chunk ready");
                     for (auto& ln : m.lanes) check(hipStreamWaitEvent(ln.stream, m.chunk_ready, 0), "lane wait");
                     // STRIX_DS41_PREFILL_O_A8_FUSED (default on, =0 off): the exact attention combine writes o's A8 codes,
@@ -2963,6 +2988,7 @@ PrefillResult DevicePrefill::run_from(std::span<const std::uint32_t> tokens, std
                         check(hipStreamWaitEvent(st, ln.done, 0), "chunk join");
                     }
                     mark_part(3);
+                    drain_windows(2U);
                     if (!fast_o_a && !o_a8_fused) ds41::enqueue_quantize_a8(m.o.p, QL, n, m.ocodes.p, m.odeltas.p, m.osums.p, st);
                     const bool o_low_a8 = prefill_o_low_a8_fused();
                     bool o_low_quantized = false;  // every o-group's dense call wrote its A8 of o_low
@@ -3287,16 +3313,34 @@ PrefillResult DevicePrefill::run_from(std::span<const std::uint32_t> tokens, std
                 w.inter = I_routed;
                 w.down_width = down_width;
                 w.limit = static_cast<float>(c.swiglu_limit);
-                const std::uint32_t MC = m.options.moe_chunk_rows;
+                // Window size is arithmetic-independent (S4 on/off hashes equal). A rank-local
+                // allocation fallback changes timing only; no cross-rank exchange is needed.
+                const std::uint32_t pass_rows = std::max(no, split ? Tp - local_of(peer, R0.o0) : 0U);
+                const auto task_cap = m.task != nullptr ? m.task->opt.moe_chunk_rows : 0U;
+                const auto base_rows = task_cap != 0U ? std::min(task_cap, m.options.moe_chunk_rows) : m.options.moe_chunk_rows;
+                const auto desired_rows = ds41::bounded_moe_window_rows(m.options.moe_chunk_rows, C, pass_rows,
+                    prefill_moe_window_cap(), prefill_moe_pass_window() && m.moe_window_auto, task_cap);
+                const auto make_moe = [&](std::uint32_t rows) {
+                    return std::make_unique<ds41::PrefillMoe>(w, K, c.n_routed_experts,
+                        m.expert_tp ? c.n_routed_experts : m.plan.expert_split, rows,
+                        m.distributed() ? m.expert_first : 0U, m.distributed() ? m.expert_end : 0U);
+                };
                 std::unique_ptr<ds41::PrefillMoe> layer_moe;
-                if (!m.moe_persist || !m.moe) {
-                    layer_moe = std::make_unique<ds41::PrefillMoe>(w, K, c.n_routed_experts, m.expert_tp ? c.n_routed_experts : m.plan.expert_split, MC,
-                                                                   m.distributed() ? m.expert_first : 0U, m.distributed() ? m.expert_end : 0U);
-                    if (m.moe_persist) m.moe = std::move(layer_moe);
-                } else {
-                    m.moe->set_weights(w);  // the previous layer's work on the stream keeps its own weights
+                auto& scratch = m.moe_persist ? m.moe : layer_moe;
+                // Establish the previously fitting window before attempting optional growth.
+                if (!scratch) scratch = make_moe(base_rows);
+                if (scratch->chunk_rows() < desired_rows) {
+                    check(hipStreamSynchronize(st), "moe window grow");
+                    const auto owned = m.distributed() ? m.expert_end - m.expert_first : c.n_routed_experts;
+                    const auto bytes = ds41::prefill_moe_layout(desired_rows, K, owned, w.hidden, w.inter, w.down_width).bytes;
+                    std::size_t free_bytes = 0, total_bytes = 0;
+                    // The full replacement is additional storage until the old scratch can be freed.
+                    if (hipMemGetInfo(&free_bytes, &total_bytes) == hipSuccess)
+                        (void)ds41::try_grow_moe_scratch(scratch, bytes, free_bytes, [&] { return make_moe(desired_rows); });
                 }
-                ds41::PrefillMoe& moe = layer_moe ? *layer_moe : *m.moe;
+                scratch->set_weights(w);
+                ds41::PrefillMoe& moe = *scratch;
+                const std::uint32_t MC = moe.chunk_rows();
                 // A task's MoE chunk TMC <= MC: the same PrefillMoe (no second scratch) on views of TMC rows (chunk 0 of
                 // the view; the outputs are indexed relative to the view's first row). Rows are independent in the MoE,
                 // so the bits are those of the MC chunks. Without a task (or TMC = MC) the chunks of MC rows as before.
@@ -3372,6 +3416,10 @@ PrefillResult DevicePrefill::run_from(std::span<const std::uint32_t> tokens, std
                     pin.deltas = m.peer_xdeltas.p + std::size_t{p0} * H / 32U;
                     // both ranks send max(np, no) rows (the same message size); staged: in one message
                     const std::uint32_t nmax = std::max(np, no);
+                    // joint expert pass: the run rule (joint_sel: T <= joint_max_rows, or the group pass) or, with the joint-layer lever, the LAYER's rows
+                    // (np + no, the same on both ranks): the cone layers' second pass reads every expert again for few rows
+                    const bool joint = m.moe_joint || joint_sel ||
+                                       (prefill_joint_layer() && ds41::moe_joint_layer(np, no, prefill_joint_layer_rows()));
                     const std::size_t half_bytes = std::size_t{nmax} * H * 4U;
                     const dist::Tag half_tag{static_cast<std::uint32_t>(dist::TagKind::half_sum), layer, 0U};
                     // A task parks only at a boundary its grant runs out at, and the scheduler may then run other exchanges
@@ -3379,7 +3427,7 @@ PrefillResult DevicePrefill::run_from(std::span<const std::uint32_t> tokens, std
                     // of this layer runs now (same unit and grant on both ranks), and if this size takes the host path
                     // (the same route table on both ranks); otherwise the copy path through half_other / half_recv.
                     float* peer_half = m.staged_half && nmax > 0U &&
-                                               (m.task == nullptr || m.moe_joint || joint_sel ||
+                                               (m.task == nullptr || joint ||
                                                 m.task->runs_through(PrefillUnitLevel::finest, pieces(np) + pieces(no) + 1U))
                                            ? static_cast<float*>(prefill_wire.send_staging(half_bytes))
                                            : nullptr;
@@ -3387,7 +3435,7 @@ PrefillResult DevicePrefill::run_from(std::span<const std::uint32_t> tokens, std
                     std::optional<xport::Ds41HalfSumStagedExchange<PrefillRawCommunicator, hipStream_t, dist::Tag>>
                         prefill_half_exchange;
                     if (!staged) peer_half = m.half_other.p;
-                    if (m.moe_joint || joint_sel) {  // one expert pass over [peer rows; own rows], the peer rows' half sums first
+                    if (joint) {  // one expert pass over [peer rows; own rows], the peer rows' half sums first
                         cut(PrefillUnitLevel::finest, s.layer, "moe.joint");
                         moe.enqueue_half_joint(pin, in, moe_half, peer_half, m.half_own.p, st, m.half_ready[0]);
                         if (staged) prefill_half_exchange.emplace(prefill_wire, st, peer_half, half_bytes, half_tag);
@@ -3406,7 +3454,7 @@ PrefillResult DevicePrefill::run_from(std::span<const std::uint32_t> tokens, std
                     }
                     // task: the half sums' exchange and the canonical sum as their own unit (two-pass form: the joint
                     // pass is one unit already); the same place on both ranks
-                    if (!(m.moe_joint || joint_sel)) cut(PrefillUnitLevel::finest, s.layer, "moe.sum");
+                    if (!joint) cut(PrefillUnitLevel::finest, s.layer, "moe.sum");
                     if (staged) {
                         const auto* recv = static_cast<const float*>(prefill_half_exchange->finish(st));
                         const float* low = me == 0U ? m.half_own.p : recv;

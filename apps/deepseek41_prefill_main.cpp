@@ -68,7 +68,7 @@ void barrier(strix::dist::Communicator& comm, std::uint32_t round) {
 
 struct Args {
     std::string model, prompt_path, transport, loads_out, hashes_out, seed_out;
-    std::uint32_t rank = 0, world = 1, layers = 40, rows = 0, chunk = 1024, window = 8, lanes = 4, moe_chunk = 4096, repeat = 1, warmup = 0,
+    std::uint32_t rank = 0, world = 1, layers = 40, rows = 0, chunk = 1024, window = 8, lanes = 4, moe_chunk = 0, repeat = 1, warmup = 0,
                   split_min_rows = strix::deepseek41::PrefillOptions{}.split_min_rows,
                   joint_max_rows = strix::deepseek41::PrefillOptions{}.joint_max_rows;
     unsigned connect_timeout = 60;

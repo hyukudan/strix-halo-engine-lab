@@ -15,6 +15,8 @@ environment variable, the shipped value, the value that restores the previous pa
 | deepseek41-pair | attn_tile_f16 | `STRIX_DS41_ATTN_TILE_F16` |  | 0 |  |
 | deepseek41-pair | serve_warm | `STRIX_DS41_SERVE_WARM` |  | 0 |  |
 | deepseek41-pair | dspark_calib | `STRIX_DS41_DSPARK_CALIB` |  | 0 |  |
+| deepseek41-pair | window_drain | `STRIX_DS41_PREFILL_WINDOW_DRAIN` |  | 0 |  |
+| deepseek41-pair | moe_pass_window | `STRIX_DS41_PREFILL_MOE_PASS_WINDOW` |  | 0 |  |
 | glm-pair | hp-crc-parallel | `STRIX_DIST_CRC_PARALLEL` | 1 | 0 | Measurement: hp host path, exact TTFT 1K -8.5 %, 8K -3.1 %, logits fnv matches reference 16/16 |
 | glm-pair | hp-crc-overlap | `STRIX_DIST_HOST_CRC_OVERLAP` | 1 | 0 | Measurement: hp host path, exact TTFT 1K -8.5 %, 8K -3.1 %, logits fnv matches reference 16/16 |
 | glm-pair | hp-chunk-bytes | `STRIX_DIST_HOST_CHUNK_BYTES` | 1048576 | 0 | Measurement: hp host path, exact TTFT 1K -8.5 %, 8K -3.1 %, logits fnv matches reference 16/16 |
