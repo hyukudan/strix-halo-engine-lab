@@ -4931,6 +4931,12 @@ if(STRIX_FAMILY_MINIMAX)
         target_compile_features(strix-minimax-auto-tests PRIVATE cxx_std_20)
         strix_target_warnings(strix-minimax-auto-tests)
         add_test(NAME strix-minimax-auto-tests COMMAND strix-minimax-auto-tests)
+        # Chunk-invariant order contract: host reference of the bound K chain across chunk sizes and tails.
+        add_executable(strix-chunk-order-contract-tests tests/chunk_order_contract_tests.cpp)
+        target_include_directories(strix-chunk-order-contract-tests PRIVATE src include)
+        target_compile_features(strix-chunk-order-contract-tests PRIVATE cxx_std_20)
+        strix_target_warnings(strix-chunk-order-contract-tests)
+        add_test(NAME strix-chunk-order-contract-tests COMMAND strix-chunk-order-contract-tests)
         # Pure host policy census; source receipts reject unaudited selectors.
         add_executable(strix-minimax-route-identity-tests tests/minimax_route_identity_tests.cpp)
         target_link_libraries(strix-minimax-route-identity-tests PRIVATE strix_minimax_defaults)

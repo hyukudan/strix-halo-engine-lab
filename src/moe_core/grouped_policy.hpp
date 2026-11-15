@@ -21,6 +21,26 @@ struct GroupedPrefillPolicy {
     static constexpr bool kPipeTail = PipeTail;
 };
 
+// Per-matrix numeric order contract (chunk invariance). It fixes the K chain of every output: S partitions with K16
+// boundaries floor(k16*s/S), each from +0 in ascending K16, partials added in ascending s before the epilogue. It takes
+// NO rows, occupancy or group count: geometry (MT, column items, persistent CTAs, groups) is free to change around it
+// and never changes bits. splits == 0 means "unbound": the engine keeps its legacy adaptive (rows-dependent) choice.
+struct GroupedMatrixOrder {
+    unsigned splits = 0;
+    STRIX_MOE_GROUPED_HD constexpr bool bound() const { return splits != 0; }
+    // The split one call uses: the bound value, or the engine's adaptive value when unbound.
+    STRIX_MOE_GROUPED_HD constexpr unsigned resolve(unsigned adaptive) const { return splits ? splits : adaptive; }
+};
+struct GroupedSplitContract {
+    GroupedMatrixOrder gate, up, down;
+    unsigned version = 0;  // 0 = adaptive legacy; >0 = named invariant contract (part of the numeric identity)
+    STRIX_MOE_GROUPED_HD constexpr bool invariant() const { return gate.bound() && up.bound() && down.bound(); }
+};
+// Unbound: every matrix keeps its engine's adaptive split (today's DS41, GLM, Qwen and MiniMax adaptive identities).
+inline constexpr GroupedSplitContract kGroupedAdaptiveContract{};
+// S = 1 everywhere: the order the adaptive policies already use for experts with >= 97 rows (gate/up) / >= 17 (down).
+inline constexpr GroupedSplitContract kGroupedSingleChainContract{{1U}, {1U}, {1U}, 1U};
+
 template <class Policy = GroupedPrefillPolicy<>, unsigned PaddedPitch = 72U>
 struct GroupedLdsRing {
     static constexpr unsigned pitch = Policy::xor64 ? 64U : PaddedPitch;
