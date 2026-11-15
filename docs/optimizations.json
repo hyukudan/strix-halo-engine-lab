@@ -710,6 +710,17 @@
   },
   {
     "engine": "qwen",
+    "name": "Paired GLU store for the shared-expert preimage",
+    "flag_or_env": "STRIX_QPF2K_GLU_PAIR",
+    "default": "1",
+    "exact": "Bitwise: the shared-pre fixture (32..8192 rows, nine gate/up payload kinds including non-finite values, two streams) gives equal FP16 preimage, gate, outputs and overflow count on every route, plus an RNE oracle; final logits are identical at 8K, 32K and 128K.",
+    "gain": "Shared-expert kernels per 8K request 146.6 -> 128.0 ms (-18.6 ms), at 32K -68 ms (traced, one node); request level within clock noise (-0.1 % at 8K, -0.5 % at 32K)",
+    "preconditions": "STRIX_QPF2K_SHARED_PRE admitted, tiled gate|up admitted for the same rows, features a multiple of 16.",
+    "off_switch": "STRIX_QPF2K_GLU_PAIR=0",
+    "doc_anchor": "docs/optimizations.md#qwen-glu-pair"
+  },
+  {
+    "engine": "qwen",
     "name": "MoE ordered merge + BF16 commit",
     "flag_or_env": "STRIX_QPF2K_MOE_MC",
     "default": "1 (mode 1; mode 2 needs an explicit value)",
@@ -2731,6 +2742,17 @@
     "preconditions": "STRIX_GLM_PF_WMMA=1 (FAST prefill); ragged tiles of routed MoE groups, shared slices and dense calls.",
     "off_switch": "STRIX_GLM_PF_WMMA_LIVE_FRAG=0 (computes every fragment, same bits)",
     "doc_anchor": "docs/optimizations.md#glm-pf-wmma-live-fragments"
+  },
+  {
+    "engine": "glm",
+    "name": "FAST shared expert on 128-row slices",
+    "flag_or_env": "STRIX_GLM_PF_WMMA_SHARED128",
+    "default": "on wherever the FAST WMMA prefill runs with 128-row tiles",
+    "exact": "Bitwise to the glm-pf-wmma-x identity (64-row slices equal on every buffer in hip_glm_pf_wmma_tests arm 7; pair 8K logits of both ranks equal).",
+    "gain": "Pair FAST 8K warm 8.606 -> 8.571 s (-0.4 %, 2 ABAB pairs); whole MoE call at 2048 rows 26.73 -> 26.54 ms.",
+    "preconditions": "STRIX_GLM_PF_WMMA=1 and STRIX_GLM_PF_WMMA_ROWS=128 (default).",
+    "off_switch": "STRIX_GLM_PF_WMMA_SHARED128=0 (64-row shared slices, same bits)",
+    "doc_anchor": "docs/optimizations.md#glm-pf-wmma-shared128"
   },
   {
     "engine": "glm",

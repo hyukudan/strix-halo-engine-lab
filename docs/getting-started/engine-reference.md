@@ -266,6 +266,7 @@ deferred at startup, so MTP/HTTP serving, cohorts and other binaries keep their 
 | `STRIX_QPF2K_SCORE_ROWS=auto` | Stage-batch QSA scorer: 32 rows above 4096 blocks, 16 otherwise. | `STRIX_QPF2K_SCORE_ROWS=0` (16 rows) |
 | `STRIX_PREFILL_PLE_BATCH=1` | PLE 64-row groups; wide lane recipe, layout and scratch admission still apply. | `STRIX_PREFILL_PLE_BATCH=0` |
 | `STRIX_QPF2K_SHARED_PRE=1` | Shared-expert FP16 operand preimage; existing tiled down admission and fallback apply. | `STRIX_QPF2K_SHARED_PRE=0` |
+| `STRIX_QPF2K_GLU_PAIR=1` | With the preimage admitted, the paired gate\|up epilogue writes it directly (bitwise); `=2` uses form 0 for the paired kernel. | `STRIX_QPF2K_GLU_PAIR=0` (activation pre-kernel) |
 | `STRIX_QPF2K_MOE_MC=1` | Ordered MoE merge + BF16 commit (mode 1) behind the existing DA16/ROUTE=14 certificate. | `STRIX_QPF2K_MOE_MC=0` |
 | `STRIX_QPF2K_MOE_HDR=1` | Gate/up superblock header reuse within the DA16 tune 80/82 path. | `STRIX_QPF2K_MOE_HDR=0` |
 | `STRIX_QPF2K_MOE_XOR64=1` | MoE 64-assignment DA16 tune (automatic tune only) with XOR-permuted LDS rows (three CTAs per WGP) from 3,072 rows; 128-assignment batches (from 4,915 rows for 512 experts, top-10) are unchanged. | `STRIX_QPF2K_MOE_XOR64=0` |
