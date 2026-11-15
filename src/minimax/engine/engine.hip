@@ -2887,8 +2887,7 @@ struct Engine::Impl {
             last_skip0 = skip0;
             if (skip0 != 0 && !pf_headless_logged) {
                 pf_headless_logged = true;
-                std::fprintf(stderr, "strix-minimax: prefill headless chunks: last layer cache-only for %zu of %zu chunks (STRIX_MM_PF_HEADLESS=0 runs them full)
-",
+                std::fprintf(stderr, "strix-minimax: prefill headless chunks: last layer cache-only for %zu of %zu chunks (STRIX_MM_PF_HEADLESS=0 runs them full)\n",
                              skip0, m);
             }
             const auto* i4 = i4_on && i4_jit_layer(L) ? jit_acquire(L, L1) : nullptr;
