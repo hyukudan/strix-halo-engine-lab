@@ -912,10 +912,10 @@ void serve_prefill_admission_tests(const ModelContract& model, const ModelManife
     {
         auto ceiling=geometric;ceiling.context_tokens=131200;
         ceiling.mtp.runtime_bytes=134217728;ceiling.mtp.runtime_automatic=false;
-        bool refused=false;
+        bool ceiling_refused=false;
         try {(void)http_mtp_memory(ceiling,model,{},manifest,{},gib_bytes,gib_bytes,4096);}
-        catch(const std::runtime_error& e) {refused=std::string_view(e.what()).find("runtime budget")!=std::string_view::npos;}
-        expect(refused,"explicit 128 MiB ceiling refuses native long context before HTTP allocation");
+        catch(const std::runtime_error& e) {ceiling_refused=std::string_view(e.what()).find("runtime budget")!=std::string_view::npos;}
+        expect(ceiling_refused,"explicit 128 MiB ceiling refuses native long context before HTTP allocation");
         ceiling.mtp.runtime_automatic=true;
         const auto automatic=http_mtp_memory(ceiling,model,{},manifest,{},gib_bytes,gib_bytes,4096);
         ceiling.mtp.runtime_automatic=false;
