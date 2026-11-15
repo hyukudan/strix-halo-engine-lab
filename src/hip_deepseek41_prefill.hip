@@ -403,6 +403,7 @@ struct DevicePrefill::Impl {
     std::map<std::string, Dev<std::uint8_t>> weights;
     std::unique_ptr<ds41::EngramRowReader> engram_reader;
     // the routed-expert MoE of every layer (one scratch; STRIX_DS41_PREFILL_MOE_PERSIST=0: one object per layer)
+    bool moe_window_auto = false;
     std::unique_ptr<ds41::PrefillMoe> moe;
     bool moe_persist = true;
     // resumable runs (PrefillTask): the task whose run is in progress (its worker thread runs run_from and stops at the
@@ -783,6 +784,8 @@ DevicePrefill::DevicePrefill(const std::filesystem::path& gguf, const PrefillOpt
     if (const char* e = std::getenv("STRIX_DS41_PREFILL_FP16_A8"); e != nullptr && std::string(e) == "1") options.fp16_keep_a8 = true;
     if (const char* e = std::getenv("STRIX_DS41_PREFILL_FP16_FAST"); e != nullptr && std::string(e) == "1") options.fp16_fast = true;
     if (const char* e = std::getenv("STRIX_DS41_PREFILL_FP16_WSPLIT"); e != nullptr && std::string(e) == "1") options.fp16_wsplit = true;
+    m.moe_window_auto = options.moe_chunk_rows == 0U;
+    if (m.moe_window_auto) options.moe_chunk_rows = 4096U;
     m.options = options;
     if (options.world != 1U && options.world != 2U) throw std::invalid_argument("deepseek41 prefill: world must be 1 or 2");
     if (options.world == 2U && (options.communicator == nullptr || options.rank > 1U))
@@ -3310,26 +3313,34 @@ PrefillResult DevicePrefill::run_from(std::span<const std::uint32_t> tokens, std
                 w.inter = I_routed;
                 w.down_width = down_width;
                 w.limit = static_cast<float>(c.swiglu_limit);
-                // MoE window: moe_chunk_rows, or (pass window) one window per pass up to the cap: the pass rows are the
-                // larger of the peer and own rows, the same value on both ranks. The persistent MoE only grows (its
-                // scratch is free once the stream drained); the bits do not depend on the window (rows are independent).
+                // Window size is arithmetic-independent (S4 on/off hashes equal). A rank-local
+                // allocation fallback changes timing only; no cross-rank exchange is needed.
                 const std::uint32_t pass_rows = std::max(no, split ? Tp - local_of(peer, R0.o0) : 0U);
-                const std::uint32_t MCw = prefill_moe_pass_window()
-                    ? ds41::moe_window_rows(m.options.moe_chunk_rows, C, pass_rows, prefill_moe_window_cap()) : m.options.moe_chunk_rows;
-                if (m.moe_persist && m.moe && m.moe->chunk_rows() < MCw) {
-                    check(hipStreamSynchronize(st), "moe window grow");
-                    m.moe.reset();
-                }
+                const auto task_cap = m.task != nullptr ? m.task->opt.moe_chunk_rows : 0U;
+                const auto base_rows = task_cap != 0U ? std::min(task_cap, m.options.moe_chunk_rows) : m.options.moe_chunk_rows;
+                const auto desired_rows = ds41::bounded_moe_window_rows(m.options.moe_chunk_rows, C, pass_rows,
+                    prefill_moe_window_cap(), prefill_moe_pass_window() && m.moe_window_auto, task_cap);
+                const auto make_moe = [&](std::uint32_t rows) {
+                    return std::make_unique<ds41::PrefillMoe>(w, K, c.n_routed_experts,
+                        m.expert_tp ? c.n_routed_experts : m.plan.expert_split, rows,
+                        m.distributed() ? m.expert_first : 0U, m.distributed() ? m.expert_end : 0U);
+                };
                 std::unique_ptr<ds41::PrefillMoe> layer_moe;
-                if (!m.moe_persist || !m.moe) {
-                    layer_moe = std::make_unique<ds41::PrefillMoe>(w, K, c.n_routed_experts, m.expert_tp ? c.n_routed_experts : m.plan.expert_split, MCw,
-                                                                   m.distributed() ? m.expert_first : 0U, m.distributed() ? m.expert_end : 0U);
-                    if (m.moe_persist) m.moe = std::move(layer_moe);
-                } else {
-                    m.moe->set_weights(w);  // the previous layer's work on the stream keeps its own weights
+                auto& scratch = m.moe_persist ? m.moe : layer_moe;
+                // Establish the previously fitting window before attempting optional growth.
+                if (!scratch) scratch = make_moe(base_rows);
+                if (scratch->chunk_rows() < desired_rows) {
+                    check(hipStreamSynchronize(st), "moe window grow");
+                    const auto owned = m.distributed() ? m.expert_end - m.expert_first : c.n_routed_experts;
+                    const auto bytes = ds41::prefill_moe_layout(desired_rows, K, owned, w.hidden, w.inter, w.down_width).bytes;
+                    std::size_t free_bytes = 0, total_bytes = 0;
+                    // The full replacement is additional storage until the old scratch can be freed.
+                    if (hipMemGetInfo(&free_bytes, &total_bytes) == hipSuccess)
+                        (void)ds41::try_grow_moe_scratch(scratch, bytes, free_bytes, [&] { return make_moe(desired_rows); });
                 }
-                ds41::PrefillMoe& moe = layer_moe ? *layer_moe : *m.moe;
-                const std::uint32_t MC = moe.chunk_rows();  // >= MCw: a persistent MoE of an earlier, larger window
+                scratch->set_weights(w);
+                ds41::PrefillMoe& moe = *scratch;
+                const std::uint32_t MC = moe.chunk_rows();
                 // A task's MoE chunk TMC <= MC: the same PrefillMoe (no second scratch) on views of TMC rows (chunk 0 of
                 // the view; the outputs are indexed relative to the view's first row). Rows are independent in the MoE,
                 // so the bits are those of the MC chunks. Without a task (or TMC = MC) the chunks of MC rows as before.

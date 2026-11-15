@@ -221,11 +221,61 @@ void test_state_transfer_framing() {
         if (mutation == 1U) bad.push_back(0);
         if (mutation == 2U) bad[0] ^= 1U;
         if (mutation == 3U) bad[12] = 2U;
-        if (mutation == 4U) std::fill_n(bad.begin() + 29, 8, 255U);  // vector length UINT64_MAX
+        if (mutation == 4U) std::fill_n(bad.begin() + 29, 8, std::uint8_t{255});  // vector length UINT64_MAX
         try { (void)plan_state_transfer_v1(bad); }
         catch (const std::invalid_argument&) { ++rejected; }
     }
     expect(rejected == 5U, "v2 framing rejects truncation, trailing bytes, history mismatch and overflowing lengths");
+}
+
+void test_moe_growth() {
+    using strix::ds41::try_grow_moe_scratch;
+    using strix::ds41::bounded_moe_window_rows;
+    expect(bounded_moe_window_rows(4096, 1024, 5800, 8192, true, 0) == 6144,
+           "automatic pass growth remains enabled");
+    expect(bounded_moe_window_rows(4096, 1024, 5800, 8192, false, 0) == 4096,
+           "explicit window (including default value) or S4 off forbids growth");
+    expect(bounded_moe_window_rows(4096, 1024, 5800, 8192, true, 2048) == 2048,
+           "scheduled slice caps scratch below base window");
+    expect(bounded_moe_window_rows(4096, 1024, 5800, 8192, true, 5000) == 5000,
+           "scheduled slice caps growth without rounding above executed rows");
+    struct Scratch {
+        std::uint32_t rows;
+        std::uint64_t bytes;
+        std::uint64_t& used;
+        Scratch(std::uint32_t r, std::uint64_t b, std::uint64_t& u)
+            : rows(r), bytes(b), used(u) { used += bytes; }
+        ~Scratch() { used -= bytes; }
+    };
+    const auto size = [](std::uint32_t rows) {
+        return strix::ds41::prefill_moe_layout(rows, 8, 128, 7168, 2048, 2048).bytes;
+    };
+    std::uint64_t used = 0;
+    auto scratch = std::make_unique<Scratch>(4096, size(4096), used);
+    const auto* original = scratch.get();
+    auto budget = used + size(6144) - 1U;
+    unsigned attempts = 0;
+    const auto allocate = [&] {
+        ++attempts;
+        if (size(6144) > budget - used) throw std::bad_alloc();
+        return std::make_unique<Scratch>(6144, size(6144), used);
+    };
+    expect(!try_grow_moe_scratch(scratch, size(6144), budget - used, allocate),
+           "growth refuses insufficient simultaneous headroom");
+    expect(attempts == 0 && scratch.get() == original && used == size(4096),
+           "refusal preserves old allocation without calling allocator");
+    // Headroom can disappear after the query; the allocator enforces the actual budget.
+    expect(!try_grow_moe_scratch(scratch, size(6144), size(6144), allocate),
+           "growth catches allocation failure after admission");
+    expect(attempts == 1 && scratch.get() == original && scratch->rows == 4096 && used == size(4096),
+           "allocation failure retains usable old window and scratch");
+    expect((5800U + scratch->rows - 1U) / scratch->rows == 2U,
+           "fallback still executes two windows");
+    budget = used + size(6144);
+    expect(try_grow_moe_scratch(scratch, size(6144), budget - used, allocate),
+           "growth succeeds with room for both allocations");
+    expect(attempts == 2 && scratch->rows == 6144 && used == size(6144),
+           "successful growth releases old allocation only after replacement");
 }
 
 void test_moe_schedule() {
@@ -251,6 +301,7 @@ int main() {
     test_routes();
     test_plan();
     test_moe_schedule();
+    test_moe_growth();
     // Bounded replay must leave complete final rings, all requested head rows,
     // and the encoder/source-cache inputs. Exercise unaligned prompt lengths
     // and call sizes, as well as the 8K/32K qualification shapes.

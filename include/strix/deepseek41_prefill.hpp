@@ -67,7 +67,7 @@ struct PrefillOptions {
     std::uint32_t window_rows = 8;       // rows per attention window (1..attn::kMaxCallRows; also the unit of the row split)
     // rows per routed-MoE chunk (a multiple of chunk_rows; the expert weights are read once per chunk); world 2 sends
     // a chunk's half sums in pieces of chunk_rows rows on a communication stream while the next chunk runs
-    std::uint32_t moe_chunk_rows = 4096;
+    std::uint32_t moe_chunk_rows = 0;  // 0: automatic, starting at 4096; nonzero: hard upper bound
     std::uint32_t attention_lanes = 4;   // streams the windows of a chunk are spread over (index, select, attention)
     // world 2: tensor-parallel attention as the two-rank decode forward: rank r runs q_b of heads [32r, 32r + 32), their
     // attention, wo_a of o-groups [4r, 4r + 4) and wo_b's K-half r; the halves of every chunk are exchanged and
