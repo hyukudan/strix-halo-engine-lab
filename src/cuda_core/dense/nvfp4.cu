@@ -61,7 +61,7 @@ __device__ __forceinline__ void mma16816(float (&c)[4], std::uint32_t a0, std::u
 
 // ---------------------------------------------------------------------------------------------------------------- GEMV
 constexpr int kWarpsPerBlock = 4;
-std::uint32_t g_target_warps = 640;  // split-K target (depends on the shape only, never on rows)
+std::uint32_t g_target_warps = 1000;  // split-K target (depends on the shape only, never on rows)
 
 struct LoadRegs {
     uint4 d0, d1, sc;
@@ -135,14 +135,37 @@ __device__ __forceinline__ void compute_chunk(const LoadRegs (&L)[MT], const boo
 // grid (ceil(ntiles / (4 MT)), ks, nw): the 4 warps of a block take 4 MT consecutive output tiles and share the
 // activation slab through shared memory; blockIdx.y selects the K range. part = [z][ks][rows][out] FP32; when DIRECT
 // (ks == 1, single weight) the epilogue y = acc * gscale (+ resid) is written straight to y.
-template <int RB, int MT, bool DIRECT>
-__global__ void __launch_bounds__(kWarpsPerBlock * 32)
-    fp4_gemv(const unsigned char* w0, const unsigned char* w1, const float* x, float* part, float* y, const float* resid,
-             float gs0, std::uint32_t out, std::uint32_t in, std::uint32_t rows, std::uint32_t ks) {
+struct Job {
+    const unsigned char* w[2];  // [1] != null: fused gate/up (silu(w0 x) * (w1 x))
+    float* part;                // split-K partials [z][ks][rows][out]
+    float* y;
+    const float* resid;
+    float gs[2];
+    std::uint32_t out, ks, g0;  // g0 = first grid.x block of this job
+};
+struct Jobs {
+    Job j[4];
+    int n;
+};
+
+template <int RB, int MT>
+__global__ void __launch_bounds__(kWarpsPerBlock * 32) fp4_gemv(const Jobs jobs, const float* x, std::uint32_t in, std::uint32_t rows) {
     extern __shared__ uint2 xs_dyn[];
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    int ji = 0;
+#pragma unroll
+    for (int q = 1; q < 4; ++q)
+        if (q < jobs.n && blockIdx.x >= jobs.j[q].g0) ji = q;
+    const Job& J = jobs.j[ji];
+    const std::uint32_t ks = J.ks, out = J.out;
+    if (blockIdx.y >= ks || (blockIdx.z == 1 && J.w[1] == nullptr)) return;  // block-uniform
+    const std::uint32_t bx = blockIdx.x - J.g0;
+    float* const part = J.part;
+    float* const y = J.y;
+    const float* const resid = J.resid;
+    const float gs0 = J.gs[0];
     const std::uint32_t kidx = blockIdx.y;
-    const unsigned char* w = blockIdx.z == 0 ? w0 : w1;
+    const unsigned char* w = J.w[blockIdx.z];
     const std::uint32_t nch = in >> 7, ntiles = out >> 4;
     const std::uint32_t c0 = static_cast<std::uint32_t>(static_cast<std::uint64_t>(kidx) * nch / ks);
     const std::uint32_t c1 = static_cast<std::uint32_t>(static_cast<std::uint64_t>(kidx + 1) * nch / ks);
@@ -150,7 +173,7 @@ __global__ void __launch_bounds__(kWarpsPerBlock * 32)
     const unsigned char* base[MT];
 #pragma unroll
     for (int mt = 0; mt < MT; ++mt) {
-        const std::uint32_t m = (blockIdx.x * kWarpsPerBlock + warp) * MT + mt;
+        const std::uint32_t m = (bx * kWarpsPerBlock + warp) * MT + mt;
         on[mt] = m < ntiles;
         base[mt] = w + static_cast<std::size_t>(on[mt] ? m : 0) * nch * kNvfp4RecordBytes;
     }
@@ -197,7 +220,7 @@ __global__ void __launch_bounds__(kWarpsPerBlock * 32)
 #pragma unroll
     for (int mt = 0; mt < MT; ++mt) {
         if (!on[mt]) continue;
-        const std::uint32_t m = (blockIdx.x * kWarpsPerBlock + warp) * MT + mt;
+        const std::uint32_t m = (bx * kWarpsPerBlock + warp) * MT + mt;
 #pragma unroll
         for (int rb = 0; rb < RB; ++rb)
 #pragma unroll
@@ -205,7 +228,7 @@ __global__ void __launch_bounds__(kWarpsPerBlock * 32)
                 const std::uint32_t n = static_cast<std::uint32_t>(rb * 8 + 2 * t + (q & 1));
                 const std::uint32_t o = m * 16 + static_cast<std::uint32_t>(g + ((q >> 1) << 3));
                 if (n >= rows) continue;
-                if constexpr (DIRECT) {
+                if (ks == 1) {
                     float v = __fmul_rn(acc[mt][rb][q], gs0);
                     if (resid != nullptr) v = __fadd_rn(resid[static_cast<std::size_t>(n) * out + o], v);
                     y[static_cast<std::size_t>(n) * out + o] = v;
@@ -216,46 +239,56 @@ __global__ void __launch_bounds__(kWarpsPerBlock * 32)
     }
 }
 
-template <bool FUSED>
-__global__ void fp4_reduce(const float* part, float* y, const float* resid, float gs0, float gs1, std::uint32_t out,
-                           std::uint32_t rows, std::uint32_t ks) {
+// grid (blocks over the largest job, njobs): finalises every job with ks > 1.
+__global__ void fp4_reduce(const Jobs jobs, std::uint32_t rows) {
+    const Job& J = jobs.j[blockIdx.y];
+    if (J.ks <= 1) return;
     const std::size_t idx = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    if (idx >= static_cast<std::size_t>(out) * rows) return;
-    const std::size_t stride = static_cast<std::size_t>(out) * rows;
+    if (idx >= static_cast<std::size_t>(J.out) * rows) return;
+    const std::size_t stride = static_cast<std::size_t>(J.out) * rows;
+    const float* part = J.part;
     float s = part[idx];
-    for (std::uint32_t k = 1; k < ks; ++k) s = __fadd_rn(s, part[k * stride + idx]);
-    float v = __fmul_rn(s, gs0);
-    if constexpr (FUSED) {
-        const std::size_t off = static_cast<std::size_t>(ks) * stride;
+    for (std::uint32_t k = 1; k < J.ks; ++k) s = __fadd_rn(s, part[k * stride + idx]);
+    float v = __fmul_rn(s, J.gs[0]);
+    if (J.w[1] != nullptr) {
+        const std::size_t off = static_cast<std::size_t>(J.ks) * stride;
         float u = part[off + idx];
-        for (std::uint32_t k = 1; k < ks; ++k) u = __fadd_rn(u, part[off + k * stride + idx]);
-        v = __fmul_rn(cc_silu(v), __fmul_rn(u, gs1));
-    } else if (resid != nullptr) {
-        v = __fadd_rn(resid[idx], v);
+        for (std::uint32_t k = 1; k < J.ks; ++k) u = __fadd_rn(u, part[off + k * stride + idx]);
+        v = __fmul_rn(cc_silu(v), __fmul_rn(u, J.gs[1]));
+    } else if (J.resid != nullptr) {
+        v = __fadd_rn(J.resid[idx], v);
     }
-    y[idx] = v;
+    J.y[idx] = v;
 }
 
 float* g_ws = nullptr;
 std::size_t g_ws_bytes = 0;
 
-template <int RB, int MT, bool DIRECT>
-cudaError_t launch_gemv(const unsigned char* w0, const unsigned char* w1, const float* x, float* part, float* y,
-                        const float* resid, float gs0, float gs1, std::uint32_t out, std::uint32_t in, std::uint32_t rows,
-                        std::uint32_t ks, std::uint32_t nw, cudaStream_t s) {
-    const dim3 grid((out / 16 + kWarpsPerBlock * MT - 1) / (kWarpsPerBlock * MT), ks, nw);
-    fp4_gemv<RB, MT, DIRECT><<<grid, kWarpsPerBlock * 32, kSlab * RB * 2048, s>>>(w0, w1, x, part, y, resid, gs0, out, in, rows, ks);
+template <int RB, int MT>
+cudaError_t launch_gemv(Jobs& jobs, const float* x, std::uint32_t in, std::uint32_t rows, cudaStream_t s) {
+    std::uint32_t gx = 0, maxks = 1, maxout = 0;
+    bool fused = false, any_split = false;
+    for (int q = 0; q < jobs.n; ++q) {
+        jobs.j[q].g0 = gx;
+        gx += (jobs.j[q].out / 16 + kWarpsPerBlock * MT - 1) / (kWarpsPerBlock * MT);
+        maxks = std::max(maxks, jobs.j[q].ks);
+        maxout = std::max(maxout, jobs.j[q].out);
+        fused = fused || jobs.j[q].w[1] != nullptr;
+        any_split = any_split || jobs.j[q].ks > 1;
+    }
+    fp4_gemv<RB, MT><<<dim3(gx, maxks, fused ? 2 : 1), kWarpsPerBlock * 32, kSlab * RB * 2048, s>>>(jobs, x, in, rows);
+    cudaError_t e = cudaGetLastError();
+    if (e != cudaSuccess || !any_split) return e;
+    const std::size_t n = static_cast<std::size_t>(maxout) * rows;
+    fp4_reduce<<<dim3(static_cast<unsigned>((n + 255) / 256), static_cast<unsigned>(jobs.n)), 256, 0, s>>>(jobs, rows);
     return cudaGetLastError();
 }
 
-template <bool DIRECT>
-cudaError_t by_rb(const unsigned char* w0, const unsigned char* w1, const float* x, float* part, float* y,
-                  const float* resid, float gs0, float gs1, std::uint32_t out, std::uint32_t in, std::uint32_t rows,
-                  std::uint32_t ks, std::uint32_t nw, cudaStream_t s) {
-    if (rows <= 8) return launch_gemv<1, 4, DIRECT>(w0, w1, x, part, y, resid, gs0, gs1, out, in, rows, ks, nw, s);
-    if (rows <= 16) return launch_gemv<2, 4, DIRECT>(w0, w1, x, part, y, resid, gs0, gs1, out, in, rows, ks, nw, s);
-    if (rows <= 24) return launch_gemv<3, 2, DIRECT>(w0, w1, x, part, y, resid, gs0, gs1, out, in, rows, ks, nw, s);
-    return launch_gemv<4, 2, DIRECT>(w0, w1, x, part, y, resid, gs0, gs1, out, in, rows, ks, nw, s);
+cudaError_t launch_by_rows(Jobs& jobs, const float* x, std::uint32_t in, std::uint32_t rows, cudaStream_t s) {
+    if (rows <= 8) return launch_gemv<1, 4>(jobs, x, in, rows, s);
+    if (rows <= 16) return launch_gemv<2, 4>(jobs, x, in, rows, s);
+    if (rows <= 24) return launch_gemv<3, 2>(jobs, x, in, rows, s);
+    return launch_gemv<4, 2>(jobs, x, in, rows, s);
 }
 
 bool ok(const DenseWeight& w, std::uint32_t rows) {
@@ -374,7 +407,7 @@ cudaError_t quantize(const void* src, std::uint32_t out, std::uint32_t in, void*
 
 }  // namespace
 
-void nvfp4_set_split_target(std::uint32_t warps) { g_target_warps = warps ? warps : 640; }
+void nvfp4_set_split_target(std::uint32_t warps) { g_target_warps = warps ? warps : 1000; }
 
 std::uint32_t nvfp4_split_k(std::uint32_t out, std::uint32_t in) {
     const std::uint32_t nch = in >> 7, groups = std::max<std::uint32_t>(1, (out / 16 + 15) / 16);
@@ -392,33 +425,69 @@ cudaError_t nvfp4_quantize_f32(const float* src, std::uint32_t out, std::uint32_
 
 cudaError_t nvfp4_reserve_workspace(std::size_t bytes) { return ensure_ws(bytes); }
 
+namespace {
+// Shared by the single, fused and multi entry points: builds the job table (split-K partial buffers carved from the
+// workspace) and launches. ks per job is nvfp4_split_k(out, in) (fused gate/up: at least 2), independent of rows.
+cudaError_t run_jobs(Jobs& jobs, const float* x, std::uint32_t in, std::uint32_t rows, cudaStream_t s) {
+    std::size_t need = 0;
+    for (int q = 0; q < jobs.n; ++q) {
+        Job& J = jobs.j[q];
+        J.ks = nvfp4_split_k(J.out, in);
+        if (J.w[1] != nullptr) J.ks = std::max<std::uint32_t>(J.ks, 2);
+        if (J.ks > 1) need += static_cast<std::size_t>(J.w[1] ? 2 : 1) * J.ks * rows * J.out * 4;
+    }
+    cudaError_t e = need ? ensure_ws(need) : cudaSuccess;
+    if (e != cudaSuccess) return e;
+    std::size_t off = 0;
+    for (int q = 0; q < jobs.n; ++q) {
+        Job& J = jobs.j[q];
+        J.part = nullptr;
+        if (J.ks > 1) {
+            J.part = g_ws + off / 4;
+            off += static_cast<std::size_t>(J.w[1] ? 2 : 1) * J.ks * rows * J.out * 4;
+        }
+    }
+    return launch_by_rows(jobs, x, in, rows, s);
+}
+}  // namespace
+
+cudaError_t nvfp4_dense_rows_multi(const Nvfp4Job* jobs, std::uint32_t n, const float* x, std::uint32_t rows, cudaStream_t s) {
+    if (n == 0 || n > 4) return cudaErrorInvalidValue;
+    Jobs J{};
+    J.n = static_cast<int>(n);
+    for (std::uint32_t q = 0; q < n; ++q) {
+        const DenseWeight& w = jobs[q].w;
+        if (!ok(w, rows) || w.in != jobs[0].w.in) return cudaErrorInvalidValue;
+        J.j[q].w[0] = static_cast<const unsigned char*>(w.data);
+        J.j[q].w[1] = nullptr;
+        J.j[q].y = jobs[q].y;
+        J.j[q].resid = jobs[q].residual;
+        J.j[q].gs[0] = w.gscale;
+        J.j[q].gs[1] = 1.0f;
+        J.j[q].out = w.out;
+    }
+    return run_jobs(J, x, jobs[0].w.in, rows, s);
+}
+
 cudaError_t nvfp4_dense_rows(const DenseWeight& w, const float* x, float* y, std::uint32_t rows, const float* residual,
                              cudaStream_t s) {
-    if (!ok(w, rows)) return cudaErrorInvalidValue;
-    const std::uint32_t ks = nvfp4_split_k(w.out, w.in);
-    const auto* wd = static_cast<const unsigned char*>(w.data);
-    if (ks == 1) return by_rb<true>(wd, wd, x, nullptr, y, residual, w.gscale, 1.0f, w.out, w.in, rows, 1, 1, s);
-    cudaError_t e = ensure_ws(static_cast<std::size_t>(ks) * rows * w.out * 4);
-    if (e != cudaSuccess) return e;
-    e = by_rb<false>(wd, wd, x, g_ws, y, residual, w.gscale, 1.0f, w.out, w.in, rows, ks, 1, s);
-    if (e != cudaSuccess) return e;
-    const std::size_t n = static_cast<std::size_t>(w.out) * rows;
-    fp4_reduce<false><<<static_cast<unsigned>((n + 255) / 256), 256, 0, s>>>(g_ws, y, residual, w.gscale, 1.0f, w.out, rows, ks);
-    return cudaGetLastError();
+    const Nvfp4Job job{w, y, residual};
+    return nvfp4_dense_rows_multi(&job, 1, x, rows, s);
 }
 
 cudaError_t nvfp4_gate_up_silu_rows(const DenseWeight& gate, const DenseWeight& up, const float* x, float* y,
                                     std::uint32_t rows, cudaStream_t s) {
     if (!ok(gate, rows) || !ok(up, rows) || gate.out != up.out || gate.in != up.in) return cudaErrorInvalidValue;
-    const std::uint32_t ks = nvfp4_split_k(gate.out, gate.in);
-    cudaError_t e = ensure_ws(static_cast<std::size_t>(2) * ks * rows * gate.out * 4);
-    if (e != cudaSuccess) return e;
-    e = by_rb<false>(static_cast<const unsigned char*>(gate.data), static_cast<const unsigned char*>(up.data), x, g_ws,
-                     nullptr, nullptr, gate.gscale, up.gscale, gate.out, gate.in, rows, ks, 2, s);
-    if (e != cudaSuccess) return e;
-    const std::size_t n = static_cast<std::size_t>(gate.out) * rows;
-    fp4_reduce<true><<<static_cast<unsigned>((n + 255) / 256), 256, 0, s>>>(g_ws, y, nullptr, gate.gscale, up.gscale, gate.out, rows, ks);
-    return cudaGetLastError();
+    Jobs J{};
+    J.n = 1;
+    J.j[0].w[0] = static_cast<const unsigned char*>(gate.data);
+    J.j[0].w[1] = static_cast<const unsigned char*>(up.data);
+    J.j[0].y = y;
+    J.j[0].resid = nullptr;
+    J.j[0].gs[0] = gate.gscale;
+    J.j[0].gs[1] = up.gscale;
+    J.j[0].out = gate.out;
+    return run_jobs(J, x, gate.in, rows, s);
 }
 
 // ------------------------------------------------------------------------------------------------- host reference

@@ -9,6 +9,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <initializer_list>
 #include <map>
 #include <sstream>
 #include <stdexcept>
@@ -261,6 +262,24 @@ struct Engine {
         }
     }
 
+    bool multi_launch = true;  // TURBO lever --turbo-multi-launch: bitwise equal to separate calls, fewer launches
+    // GEMVs that read the same activations: one launch when all weights are NVFP4 and the lever is on.
+    void dense_multi(const float* xin, std::uint32_t rows, std::initializer_list<std::pair<std::string, float*>> list) {
+        cc::Nvfp4Job jobs[4];
+        std::uint32_t n = 0;
+        bool all_fp4 = multi_launch;
+        for (const auto& [name, dst] : list) {
+            jobs[n] = {W.dense(name), dst, nullptr};
+            all_fp4 = all_fp4 && jobs[n].w.format == cc::WeightFormat::nvfp4;
+            ++n;
+        }
+        if (all_fp4) {
+            CK(cc::nvfp4_dense_rows_multi(jobs, n, xin, rows, s));
+        } else {
+            for (std::uint32_t i = 0; i < n; ++i) CK(cc::dense_rows(jobs[i].w, xin, jobs[i].y, rows, nullptr, s));
+        }
+    }
+
     std::string nm(std::uint32_t l, const char* suffix) const { return "blk." + std::to_string(l) + "." + suffix; }
 
     // Runs `rows` tokens at positions pos0.. . If logits_rows: lm_head over all rows into `logits` ([rows][vocab]);
@@ -273,19 +292,15 @@ struct Engine {
         for (std::uint32_t l = 0; l < c.layers; ++l) {
             CK(cc::rmsnorm(x, hv, W.f32(nm(l, "attn_norm.weight")), xn, hv, c.eps, s));
             if (!c.is_attn(l)) {
-                CK(cc::dense_rows(W.dense(nm(l, "attn_qkv.weight")), xn, qkv, rows, nullptr, s));
-                CK(cc::dense_rows(W.dense(nm(l, "attn_gate.weight")), xn, z, rows, nullptr, s));
-                CK(cc::dense_rows(W.dense(nm(l, "ssm_beta.weight")), xn, br, rows, nullptr, s));
-                CK(cc::dense_rows(W.dense(nm(l, "ssm_alpha.weight")), xn, ar, rows, nullptr, s));
+                dense_multi(xn, rows, {{nm(l, "attn_qkv.weight"), qkv}, {nm(l, "attn_gate.weight"), z},
+                                       {nm(l, "ssm_beta.weight"), br}, {nm(l, "ssm_alpha.weight"), ar}});
                 cc::GdnLayer gl{W.f32(nm(l, "ssm_conv1d.weight")), W.f32(nm(l, "ssm_a")), W.f32(nm(l, "ssm_dt.bias")),
                                 W.f32(nm(l, "ssm_norm.weight"))};
                 CK(cc::gdn_decode(gd, gl, {conv_state[l], delta_state[l]}, qkv, z, ar, br, gout, rows, c.eps, s));
                 CK(cc::dense_rows(W.dense(nm(l, "ssm_out.weight")), gout, x, rows, x, s));
             } else {
                 const std::uint32_t D = c.head_dim, qgw = c.heads * D * 2;
-                CK(cc::dense_rows(W.dense(nm(l, "attn_q.weight")), xn, qg, rows, nullptr, s));
-                CK(cc::dense_rows(W.dense(nm(l, "attn_k.weight")), xn, k, rows, nullptr, s));
-                CK(cc::dense_rows(W.dense(nm(l, "attn_v.weight")), xn, v, rows, nullptr, s));
+                dense_multi(xn, rows, {{nm(l, "attn_q.weight"), qg}, {nm(l, "attn_k.weight"), k}, {nm(l, "attn_v.weight"), v}});
                 const cc::GroupedView qsrc{rows, c.heads, D, qgw, 2 * D}, qdst{rows, c.heads, D, c.heads * D, D};
                 const cc::GroupedView kv{rows, c.kv_heads, D, c.kv_heads * D, D};
                 CK(cc::rmsnorm(qg, qsrc, W.f32(nm(l, "attn_q_norm.weight")), q, qdst, c.eps, s));
@@ -390,6 +405,7 @@ int main(int argc, char** argv) {
                      E.c.hidden, E.c.inter, E.c.vocab, E.c.heads, E.c.kv_heads, E.c.head_dim, E.c.key_heads, E.c.value_heads,
                      E.c.value_dim);
         const auto t0 = std::chrono::steady_clock::now();
+        E.multi_launch = turbo.multi_launch;
         load_weights(model, info, E.W, turbo);
         E.init(max_pos);
         std::fprintf(stderr, "loaded %.2f GB in %.1f s\n", E.W.total / 1e9,
@@ -449,6 +465,7 @@ int main(int argc, char** argv) {
             ++pos;
         }
         clk.end();
+        std::printf("identity: %s\n", turbo.identity().c_str());
         std::printf("generated:");
         for (auto t : gen) std::printf(" %u", t);
         std::printf("\n");

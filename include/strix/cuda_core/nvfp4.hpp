@@ -46,11 +46,19 @@ cudaError_t nvfp4_quantize_f32(const float* src, std::uint32_t out, std::uint32_
 // capturing a graph).
 cudaError_t nvfp4_dense_rows(const DenseWeight& w, const float* x, float* y, std::uint32_t rows, const float* residual,
                              cudaStream_t stream);
+// Up to 4 GEMVs that read the SAME activations x (e.g. qkv/z/beta/alpha, or q/k/v) in one launch: same arithmetic and
+// bits as separate nvfp4_dense_rows calls (per-job split-K factor), fewer launches and one shared ramp/tail.
+struct Nvfp4Job {
+    DenseWeight w;
+    float* y;
+    const float* residual;
+};
+cudaError_t nvfp4_dense_rows_multi(const Nvfp4Job* jobs, std::uint32_t n, const float* x, std::uint32_t rows, cudaStream_t stream);
 // y = silu(gate x) * (up x), same format/shape; same arithmetic and order as two nvfp4_dense_rows + epilogue.
 cudaError_t nvfp4_gate_up_silu_rows(const DenseWeight& gate, const DenseWeight& up, const float* x, float* y,
                                     std::uint32_t rows, cudaStream_t stream);
 cudaError_t nvfp4_reserve_workspace(std::size_t bytes);
-// Tuning/test hook: target number of blocks used to pick the split-K factor (default 640; 0 = default).
+// Tuning/test hook: target number of blocks used to pick the split-K factor (default 1000; 0 = default).
 void nvfp4_set_split_target(std::uint32_t warps);
 // Split-K factor used for (out, in) (diagnostics / tests).
 std::uint32_t nvfp4_split_k(std::uint32_t out, std::uint32_t in);

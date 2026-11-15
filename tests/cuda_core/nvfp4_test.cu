@@ -145,6 +145,20 @@ static void test_shape(std::uint32_t out, std::uint32_t in, std::mt19937& rng) {
         for (std::size_t i = 0; i < std::size_t(3) * out; ++i) same = same && (y[i] == res[i] + y32[i]);
         expect(same, "residual = fl(residual + (W x)) bitwise");
     }
+    {   // multi-job launch == separate calls, bitwise
+        float* d_y2;
+        CK(cudaMalloc(&d_y2, std::size_t(R) * out * 4));
+        const cc::Nvfp4Job jobs[2] = {{W, d_y, nullptr}, {W, d_y2, d_res}};
+        CK(cc::nvfp4_dense_rows_multi(jobs, 2, d_x, 5, 0));
+        CK(cudaDeviceSynchronize());
+        std::vector<float> ya(std::size_t(5) * out), yb(std::size_t(5) * out);
+        CK(cudaMemcpy(ya.data(), d_y, ya.size() * 4, cudaMemcpyDeviceToHost));
+        CK(cudaMemcpy(yb.data(), d_y2, yb.size() * 4, cudaMemcpyDeviceToHost));
+        bool same = std::memcmp(ya.data(), y32.data(), ya.size() * 4) == 0;
+        for (std::size_t i = 0; i < yb.size(); ++i) same = same && yb[i] == res[i] + y32[i];
+        expect(same, "multi-job launch bitwise == separate calls (plain + residual)");
+        cudaFree(d_y2);
+    }
     {
         cc::DenseWeight U = W;  // up == gate weights: y = silu(g) * g
         CK(cc::nvfp4_gate_up_silu_rows(W, U, d_x, d_y, 4, 0));

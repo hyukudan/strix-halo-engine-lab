@@ -8,6 +8,7 @@
 //   --turbo-bits 4                 bit width (4 = NVFP4; 3/2 later)
 //   --turbo-lm-head nvfp4|bf16     lm_head follows the weight source (nvfp4) or stays BF16
 //   --synthetic-27b                full-size random device weights, no disk (timing only)
+//   --turbo-multi-launch 0|1       one launch for GEMVs sharing x (bitwise neutral)
 //   --print-effective-config       print identity + levers and exit
 #include <cstdio>
 #include <functional>
@@ -23,6 +24,7 @@ struct Options {
     unsigned bits = 4;
     bool lm_head_fp4 = true;
     bool synthetic = false;
+    bool multi_launch = true;  // --turbo-multi-launch 0|1: one launch for GEMVs sharing x (bitwise equal to separate calls)
     bool print_cfg = false;
 
     [[nodiscard]] bool onfly() const { return src == Src::onfly; }
@@ -45,6 +47,8 @@ struct Options {
             const std::string v = next();
             if (v != "nvfp4" && v != "bf16") throw std::runtime_error("--turbo-lm-head expects nvfp4|bf16");
             lm_head_fp4 = v == "nvfp4";
+        } else if (a == "--turbo-multi-launch") {
+            multi_launch = next() != "0";
         } else if (a == "--synthetic-27b") {
             synthetic = true;
         } else if (a == "--print-effective-config") {
@@ -57,8 +61,8 @@ struct Options {
     void print(std::FILE* f) const {
         std::fprintf(f, "effective-config:\n  identity: %s\n  prefix-cache-key: %s (never shared across identities)\n", identity().c_str(),
                      identity().c_str());
-        std::fprintf(f, "  turbo-weights: %s\n  turbo-bits: %u\n  turbo-lm-head: %s\n", src == Src::off ? "off (exact BF16)" : src == Src::native ? "native" : "onfly",
-                     bits, src == Src::onfly ? (lm_head_fp4 ? "nvfp4" : "bf16") : "n/a");
+        std::fprintf(f, "  turbo-weights: %s\n  turbo-bits: %u\n  turbo-lm-head: %s\n  turbo-multi-launch: %s (bitwise neutral)\n", src == Src::off ? "off (exact BF16)" : src == Src::native ? "native" : "onfly",
+                     bits, src == Src::onfly ? (lm_head_fp4 ? "nvfp4" : "bf16") : "n/a", multi_launch ? "on" : "off");
         if (src == Src::onfly)
             std::fprintf(f, "  format: NVFP4 e2m1 + e4m3/16 + FP32 global; RTN; GEMV f16 mma, FP32 accumulate, activations RN f16\n");
         if (synthetic) std::fprintf(f, "  weights: synthetic 27B shapes generated on device (no disk)\n");
