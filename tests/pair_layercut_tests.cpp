@@ -38,7 +38,7 @@ int main() try {
     std::map<std::string, std::string> env;
     auto lookup = [&](const char* k) -> const char* { auto it = env.find(k); return it == env.end() ? nullptr : it->second.c_str(); };
     auto r = lc::resolve({}, input, lookup);
-    require(r.split == lc::chain::Split::device_only && r.block == 2048 && r.act == lc::Act::relay, "default route");
+    require(r.split == lc::chain::Split::device_only && r.block == 2048 && r.act == lc::Act::link, "default route");
     require(r.lines.find("split split device-only (default)") != std::string::npos, "default origin");
     env = {{"STRIX_SPLIT", "layer-cut"}, {"STRIX_SPLIT_CUT", "12"}, {"STRIX_SPLIT_BLOCK", "512"}, {"STRIX_SPLIT_ACT", "direct"}};
     r = lc::resolve({}, input, lookup);

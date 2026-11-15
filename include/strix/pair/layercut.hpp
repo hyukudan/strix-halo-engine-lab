@@ -27,7 +27,7 @@ struct Inputs {
 struct Resolved {
     chain::Split split = chain::Split::device_only;
     std::uint32_t cut = 0, block = 2048;
-    Act act = Act::relay;
+    Act act = Act::link;  // measured bitwise-equal to relay and faster (lcfix receipts); relay = the TCP off switch
     Xport xport = Xport::act_first;
     std::uint32_t kv_frag = 1024;  // act-first: KV rows per piece (bounds how long a new ACT waits behind one KV piece)
     bool planned = false;
@@ -59,7 +59,7 @@ inline Resolved resolve(const Cli& cli, const Inputs& input, Lookup env = [](con
     auto s = read(cli.split, "STRIX_SPLIT", "device-only");
     auto c = read(cli.cut, "STRIX_SPLIT_CUT", "auto");
     auto b = read(cli.block, "STRIX_SPLIT_BLOCK", "2048");
-    auto a = read(cli.act, "STRIX_SPLIT_ACT", "relay");
+    auto a = read(cli.act, "STRIX_SPLIT_ACT", "link");
     auto x = read(cli.xport, "STRIX_SPLIT_XPORT", "act-first");
     auto f = read(cli.kv_frag, "STRIX_SPLIT_KV_FRAG", "1024");
     Resolved out;

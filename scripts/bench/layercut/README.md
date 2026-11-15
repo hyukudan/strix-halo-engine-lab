@@ -57,7 +57,7 @@ prefill policies append `;` and the existing prefill policy identity. Copy that 
 The shared resolver is `include/strix/pair/layercut.hpp`: CLI overrides environment, then defaults.
 `--split` / `STRIX_SPLIT`: `device-only` (default), `handoff-full`, `layer-cut`, `auto`.
 `--cut` / `STRIX_SPLIT_CUT`: 1..59 or `auto`; `--cut-block` / `STRIX_SPLIT_BLOCK`: positive multiple of 16,
-or `auto` (default 2048); `--cut-act` / `STRIX_SPLIT_ACT`: `relay` (default), `link` or `direct`.
+or `auto` (default 2048); `--cut-act` / `STRIX_SPLIT_ACT`: `link` (default), `relay` or `direct`.
 `link` sends the same producer bytes as `relay`, but rank 0's rows reach rank 1 over the pair's own link inside the
 engine (one control exchange per prefill chunk, at the same schedule point on both ranks); no relay ports.
 `--cut-xport` / `STRIX_SPLIT_XPORT`: `act-first` (default; contract v2) or `fifo` (v1, the previous order, off switch).

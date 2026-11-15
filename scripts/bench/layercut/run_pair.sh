@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Run on rank 0. Paths are arguments and must exist at the same relative location on both nodes.
-# ACT=relay (default: TCP relay rank 0 -> rank 1 at PEER_IP:RELAY_PORT) | link (over the pair link, no relay port) | direct.
+# ACT=link (default: over the pair link, RELAY_PORT unused) | relay (TCP relay rank 0 -> rank 1 at PEER_IP:RELAY_PORT) | direct.
 set -euo pipefail
 if (( $# < 8 )); then
     echo "usage: $0 BINARY MODEL_DIR PROMPT.u32 PEER_SSH_HOST PEER_IP BASE_PORT RELAY_PORT K [C=2048] [STEPS=64] [COUNT=2] [OUT_DIR=layercut-out]" >&2
@@ -16,7 +16,7 @@ bytes=$(wc -c < "$prompt")
 (( bytes > 0 && bytes % 4 == 0 )) || { echo 'Prompt must contain complete u32 token IDs' >&2; exit 2; }
 capacity=$((bytes / 4 + steps + 1))
 mkdir -p -- "$out"
-act=${ACT:-relay}
+act=${ACT:-link}
 [[ $act == relay || $act == link || $act == direct ]] || { echo 'ACT must be relay, link or direct' >&2; exit 2; }
 common=(--layercut-listen "cut:$prompt:$port:$steps:$count" --cut "$cut" --cut-block "$block" --cut-act "$act" --capacity "$capacity")
 r0x=() r1x=()
