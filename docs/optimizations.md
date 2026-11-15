@@ -4279,13 +4279,17 @@ The pipelined prefill seam no longer writes p0 + p1 back into the partial buffer
 The exchange hands both partials (rank order) to a pair variant of the fused expand kernel, which forms y = p0 + p1 with
 the exchange's sum expression on load; the summed rows are never stored. The receive staging (or the remote half region)
 is released after the expand, so the next exchange still overlaps the following FFN / attention. `STRIX_GLM_PF_HC_HOIST`
-places the expand's loads ahead of its dependent steps (`=2` adds restrict qualifiers); every expression and its order
-are unchanged.
+places the expand's loads ahead of its dependent steps (`=2` adds restrict qualifiers, which leave the ISA unchanged;
+`=3` keeps the row's 20 mixing coefficients and each step's 4 inputs in registers: 608 -> 101 loads per thread). Every
+expression and its order are unchanged. `=3` is faster alone on the GPU (2.308 -> 2.242 ms per 2,048 rows) but not in
+the overlapped prefill (its kernel time grows under the concurrent stream, the 8,192-token wall is unchanged), so the
+default stays 1. The v2 chain that follows takes `STRIX_GLM_PF_HC_CHAIN_ROWS` = auto | 64 | 32 | 16 | 8 rows per block
+(same bits); auto is 32 because 8 rows, faster alone at 2,048 rows (-2 %), is 20 % slower in the overlapped prefill.
 
 - **Preconditions:** Exact chunked prefill with async half regions and the fused `STRIX_GLM_PF_HC_FUSE=1` form.
 - **Automatic selection:** Unset resolves to 1 for both; the resolver reports `STRIX_GLM_PF_SUMEXP`. Explicit values win; other values are rejected.
 - **Fallback notice:** None.
-- **Exactness evidence:** Pair kernel bitwise equal to the sum followed by the fused expand over the device stress set (35 checks, 0 failures); hoist placements 0 / 1 / 2 bitwise (47 checks, 0 failures); pair logits bitwise on both ranks at 1K, 8K and 32K.
+- **Exactness evidence:** Pair kernel bitwise equal to the sum followed by the fused expand over the device stress set (35 checks, 0 failures); hoist placements 0 / 1 / 2 bitwise (47 checks, 0 failures); hoist 3 equal except NaN payloads (expand CTA gate 1,102 checks, 0 failures; pair logits and state bitwise at 8K, exact and FAST); pair logits bitwise on both ranks at 1K, 8K and 32K.
 - **Off switch:** STRIX_GLM_PF_SUMEXP=0 (sum, then the fused expand, previous seam order); STRIX_GLM_PF_HC_HOIST=0; --baseline
 - **Measured gain:** Seam sum + fused expand 4.26 -> 3.91 ms per call (-8.2 %); 8,192-token TTFT unchanged within noise (14.34-14.40 s on both arms)
 - **Implementation / evidence:** [resolver](../apps/glm_rank_defaults.hpp), [prefill kernels](../src/glm/prefill/glm_prefill.hip), [engine seam](../src/glm/engine/engine.hip)

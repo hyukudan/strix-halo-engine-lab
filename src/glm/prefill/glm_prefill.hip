@@ -2503,6 +2503,10 @@ __global__ __launch_bounds__(256) void hc_norm_factor_rows_kernel(const float* X
 //   3: as 2, and the loads are placed explicitly: the row's 20 mix coefficients (m[kHc..2kHc), c[0..16)) once into
 //      registers before the first step, and each step's 4 X values once before its 4 outputs (otherwise every output
 //      reloads them behind the previous store). X, mix and Xo never alias (X / Xo are the two residual buffers).
+//      ISA (pair, two rows per CTA): 608 -> 101 global loads, 263 -> 68 waits per thread, VGPR 107 -> 132. Alone on the
+//      GPU 2.308 -> 2.242 ms per 2,048 rows; in the overlapped product the kernel's own time grows (it now competes with
+//      the other stream for bandwidth) and the prefill wall is unchanged, so the default stays 1. Bits: equal except
+//      NaN payloads (an fadd / fmul with two NaN operands may be commuted; flags and every non-NaN word are equal).
 // One row's B steps and its fmaf chain; shared by the one-row kernel below and hc_expand_cta_kernel. Returns the
 // chain value a and the row's nonfinite flag; the caller reduces a over the row.
 template <bool kPair, unsigned kHoist>
@@ -2753,10 +2757,16 @@ unsigned hc_rows_tile() {  // STRIX_GLM_PF_HC_TILE = 64 | 32 | 16 (same bits), l
 }
 // The v2 chain's rows per CTA (T = 2 x Rows threads, one thread = 4 rows x Cols / 8 outputs). Same bits for every
 // tile: each output's chain is fmaf over k ascending (stages of kHcK, then k) and never crosses rows or CTAs.
-// STRIX_GLM_PF_HC_CHAIN_ROWS = auto (default) | 64 | 32 | 16 | 8; auto picks by the launch's rows (fixture table).
-// Auto table (isolated fixture hcchainbench, normed form, ABBA): rows 2048 tile 8 1.083 vs 32 1.105 ms (-1.9 %),
-// rows 4096 tile 8 2.091 vs 2.045 ms (+2.3 %); 64 / 16 and 8 outputs per CTA lose at both. Crossover: <= 2048 rows.
-unsigned hc_chain_rows_auto(unsigned rows) { return rows <= 2048 ? 8U : 32U; }
+// STRIX_GLM_PF_HC_CHAIN_ROWS = auto (default) | 64 | 32 | 16 | 8.
+// Measured (normed form, ms per launch): ALONE on the GPU (fixture hcchainbench, ABBA, two processes) tile 8 wins at
+// 2048 rows (1.083-1.084 vs 1.105-1.110, -1.9..-2.3 %) and loses at 4096 (+1.7..+2.3 %); 64 / 16 and 8 outputs per CTA
+// lose at both. In the product every launch (2048 rows) overlaps the other half's stream, and there tile 8 loses
+// (pair trace, 178 launches per prefill: 398-415 ms vs 309-367 ms, +20 %: 16-thread CTAs leave half of each wave32
+// idle while the concurrent kernel competes for the SIMDs). So auto = 32 in every product regime; 8 stays selectable.
+unsigned hc_chain_rows_auto(unsigned rows) {
+    (void)rows;
+    return 32U;
+}
 template <bool FromX>
 void hc_chain_launch_rows(unsigned t, const float* F, const float* fn, float* z, unsigned rows, const float* rr, bool cols8,
                           hipStream_t s) {
