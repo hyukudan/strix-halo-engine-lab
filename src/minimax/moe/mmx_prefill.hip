@@ -920,7 +920,8 @@ void launch_band_class(const pfk::Item* items_d, unsigned n, unsigned ctas, hipS
 void launch_class(const pfk::Item* items_d, unsigned n, unsigned ctas, unsigned cls, hipStream_t stream, bool pair = false,
                   bool tail_pipe = false) {
     if (cls == 7 && prefill_pipe() != 0) {
-        const bool simplify = prefill_pipe() == 2, tail = tail_pipe && prefill_pipe_tail(7);
+        // N16 takes the guarded tail on mtfit items (166 VGPR, occupancy 9); its scalar-core fallback form holds 222.
+        const bool simplify = prefill_pipe() == 2, tail = tail_pipe && (prefill_pipe_tail(7) || prefill_pipe_n16());
         if (prefill_p1_packed() && tail) launch_pipe_class<true, true>(items_d, n, ctas, stream, pair, simplify);
         else if (prefill_p1_packed()) launch_pipe_class<true>(items_d, n, ctas, stream, pair, simplify);
         else if (tail) launch_pipe_class<false, true>(items_d, n, ctas, stream, pair, simplify);
@@ -1466,9 +1467,10 @@ template <int MT> void launch_dq_pipe_tail(const Queue& q, const dim3& g, hipStr
 }
 template <bool Tail> void launch_dq_pipe(const Queue& q, const dim3& g, hipStream_t stream, bool pair) {
     const bool simplify = prefill_pipe() == 2, packed = prefill_p1_packed();
-    if (prefill_pipe_n16() && simplify) hipLaunchKernelGGL((dq_pipe_n16_kernel<true, false, Tail>), g, dim3(256), 0, stream, q);
-    else if (prefill_pipe_n16() && packed) hipLaunchKernelGGL((dq_pipe_n16_kernel<false, true, Tail>), g, dim3(256), 0, stream, q);
-    else if (prefill_pipe_n16()) hipLaunchKernelGGL((dq_pipe_n16_kernel<false, false, Tail>), g, dim3(256), 0, stream, q);
+    // N16: the device plan is always mtfit, so the partial blocks take the guarded tail (166 VGPR instead of 222).
+    if (prefill_pipe_n16() && simplify) hipLaunchKernelGGL((dq_pipe_n16_kernel<true, false, true>), g, dim3(256), 0, stream, q);
+    else if (prefill_pipe_n16() && packed) hipLaunchKernelGGL((dq_pipe_n16_kernel<false, true, true>), g, dim3(256), 0, stream, q);
+    else if (prefill_pipe_n16()) hipLaunchKernelGGL((dq_pipe_n16_kernel<false, false, true>), g, dim3(256), 0, stream, q);
     else if (pair && simplify) hipLaunchKernelGGL((dq_pipe_pair_kernel<true, false, Tail>), g, dim3(128), 0, stream, q);
     else if (pair && packed) hipLaunchKernelGGL((dq_pipe_pair_kernel<false, true, Tail>), g, dim3(128), 0, stream, q);
     else if (pair) hipLaunchKernelGGL((dq_pipe_pair_kernel<false, false, Tail>), g, dim3(128), 0, stream, q);
