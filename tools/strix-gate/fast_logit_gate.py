@@ -454,8 +454,10 @@ RECEIPT_PREFIX = "strix-route-receipt "
 MM_OUTPUT_SWITCHES = frozenset({"STRIX_MM_QUALITY_OUT", "STRIX_MM_QUALITY_ROWS", "STRIX_MM_QUALITY_SELECT", "STRIX_MM_STATE_FNV",
                                 "STRIX_MM_DIAG_ATTN_ULP"})
 # The FAST layer set's own lever and switches: ignored by config_difference (candidate == reference + this layer set).
-MM_FAST_SWITCHES = frozenset({"STRIX_MM_PF_MSA_FLASH", "STRIX_MM_PF_MSA_FLASH_LAYERS", "STRIX_MM_FAST_PREFILL"})
-MM_FAST_LEVERS = frozenset({"minimax.msa_flash"})
+# The index projection member (minimax-index-proj-wmma-v1) is part of the witnessed FAST layer set too.
+MM_FAST_SWITCHES = frozenset({"STRIX_MM_PF_MSA_FLASH", "STRIX_MM_PF_MSA_FLASH_LAYERS", "STRIX_MM_FAST_PREFILL",
+                              "STRIX_MM_PF_IDX_WMMA", "STRIX_MM_PF_IDX_WMMA_LAYERS"})
+MM_FAST_LEVERS = frozenset({"minimax.msa_flash", "minimax.index_proj_wmma"})
 MM_DIAG = re.compile(rb'DIAG attn ulp: layer (\d+) seed (\d+) rows (\d+) pos0 (\d+) values (\d+) prompt ("(?:[^"\\]|\\.)*")\s*')
 
 
@@ -524,6 +526,18 @@ def minimax_execution(log, rank, prompts):
         if not layers:
             raise GateError("witness: MSA flash selected on no layer")
         fast = {"policy": "msa-flash", "msa_flash_mode": 10 + int(m.group(1)), "layers": layers}
+    # Index projections on WMMA (receipts before the lever existed: absent = off). The FAST layer set is the union,
+    # so the floor's onset is the first layer either member changes.
+    ip = re.fullmatch(r"(0|1:layers=([01]+))", levers.get("minimax.index_proj_wmma", "0"))
+    if not ip:
+        raise GateError(f"witness: unexpected minimax.index_proj_wmma value {levers['minimax.index_proj_wmma']!r}")
+    if ip.group(2) is not None:
+        idx_layers = [i for i, ch in enumerate(ip.group(2)) if ch == "1"]
+        if not idx_layers:
+            raise GateError("witness: index projection WMMA selected on no layer")
+        fast = ({"policy": "index-proj", "msa_flash_mode": 10, "layers": idx_layers} if fast is None else
+                {"policy": "msa-flash+index-proj", "msa_flash_mode": fast["msa_flash_mode"],
+                 "layers": sorted(set(fast["layers"]) | set(idx_layers))})
     plain = levers["minimax.moe_prefill_format"] == "exl3" and levers["minimax.prefill_identity"] == "default"
     profile = ("fast-prefill" if fast else "exact") if plain else "other"
     diag, covered = [], set()

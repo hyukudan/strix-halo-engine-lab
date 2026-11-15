@@ -151,6 +151,7 @@ public:
         e_ = own_.alloc<float>(std::size_t{Qmax_} * Hm_ * kEStride);
         ob_ = own_.alloc<float>(std::size_t{Qmax_} * Hm_ * kKvLora);
         sh_ = own_.alloc<float>(R * kHidden);
+        xt_ = own_.alloc<_Float16>(R * kHidden);  // x16 tiles of x (core f16_dense_tall): KDA / indexer WMMA groups
         if (moe_route_.legacy_arena) {
             moe_wsb_ = prefill_moe_workspace_bound(Rmax_);
             moe_ws_ = own_.alloc<unsigned char>(moe_wsb_);
@@ -168,6 +169,7 @@ public:
             throw std::invalid_argument("STRIX_GLM_PF_KDA_PACK must be 0 or 1");
         kda_pack_ = kp && std::string(kp) == "1";  // 1 = contiguous KDA projections + pack_qkv (the pre-strided form)
         kda_wmma_ = kda_wmma::enabled();  // FAST identity glm-pf-kda-wmma-v1 (f_a / g_a / b / f_b / g_b on WMMA): default with STRIX_GLM_PF_WMMA=1
+        idxproj_wmma_ = idxproj_wmma::enabled();  // FAST identity glm-pf-idxproj-wmma-v1 (indexer wk / gate / weights_proj on WMMA)
         (void)exact::tile_rows();
         route_ids_.resize(R * kTopE);
         route_weights_.resize(R * kTopE);
@@ -208,6 +210,7 @@ public:
                                 std::max<std::uint64_t>(C, std::uint64_t{Hm} * kMlaDim) + C + 2 * kQLora + std::uint64_t{Hm} * kMlaDim +
                                 2 * kKvLora + std::uint64_t{kIdxHeads} * kIdxDim + 2 * kIdxDim + kIdxHeads + kHidden;
         std::uint64_t b = R * f * 4 + indexer_workspace_bytes(Rmax) + R * kMaxTokens * 4 + R * 4;
+        b += R * kHidden * 2;  // xt_ (x16 tiles)
         b += std::uint64_t{attention_rows} * Hm * (2 * kKvLora + kEStride) * 4;
         if (route.legacy_arena) b += prefill_moe_workspace_bound(Rmax);
         b += exact_workspace_bytes(Hk, Hm, Rmax);
@@ -278,7 +281,7 @@ public:
             if (kda_wmma_ && kda_wmma::supported(D::WType::F16, kHidden, px, 3, R) &&
                 kda_wmma::supported(D::WType::F16, kKdaDim, &pf, 1, R) && kda_wmma::supported(D::WType::F16, kKdaDim, &pg, 1, R)) {
                 // FAST (default with the FAST route): the same five projections on the shared dense FP16 WMMA core.
-                kda_wmma::dense_group(x, kHidden, px, 3, R, c.stream);
+                kda_wmma::dense_group(x, kHidden, px, 3, R, c.stream, xt_);  // x16 form from kX16Rows rows (same bits)
                 kda_wmma::dense_group(ta_, kKdaDim, &pf, 1, R, c.stream);
                 kda_wmma::dense_group(tb128_, kKdaDim, &pg, 1, R, c.stream);
             } else {
@@ -314,7 +317,11 @@ public:
                             st.pooled + static_cast<std::size_t>(slot) * (st.cap / kKpool) * kIdxDim, static_cast<unsigned>(st.cap)};
         {  // wk, gate and weights_proj of x in one dense v3 launch (wh_ is read only by the indexer below); same bits
             const DenseProj px[3] = {{w.wk, 0, kIdxDim, key_}, {w.gate, 0, kIdxDim, gate_}, {w.weights_proj, 0, kIdxHeads, wh_}};
-            dense_rows_group(x, D::WType::F16, kHidden, px, 3, R, c.stream);
+            if (idxproj_wmma_ && kda_wmma::supported(D::WType::F16, kHidden, px, 3, R)) {
+                kda_wmma::dense_group(x, kHidden, px, 3, R, c.stream, xt_, idxproj_wmma::calls);  // FAST glm-pf-idxproj-wmma-v1
+            } else {
+                dense_rows_group(x, D::WType::F16, kHidden, px, 3, R, c.stream);
+            }
         }
         if (st.shard) {
             st.shard->prefill_rows(w, st, c,
@@ -608,6 +615,8 @@ private:
     bool exact_on_ = false;
     bool kda_pack_ = false;
     bool kda_wmma_ = false;
+    bool idxproj_wmma_ = false;
+    _Float16* xt_ = nullptr;
     void* moe_ws_ = nullptr;
     std::size_t moe_wsb_ = 0;
     float *eo_, *ge_, *ue_, *ae_, *sh1_;

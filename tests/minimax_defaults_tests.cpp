@@ -8,6 +8,7 @@
 #include "strix/dist/transport_spec.hpp"
 #include "strix/minimax/session_startup.hpp"
 
+#include <algorithm>
 #include <cstdlib>
 #include <array>
 #include <cstring>
@@ -708,6 +709,49 @@ void test_fast_prefill_profile() {
         }
         const EnvMap different{{"STRIX_MM_PF_MSA_FLASH", "1"}, {"STRIX_MM_PF_MSA_FLASH_LAYERS", "41-59"}};
         check(!agree(one, different), "fast agreement: different masks remain rejected");
+        // FAST index projections (minimax-index-proj-wmma-v1): opt-in member, its own layer set (builtin 40-59).
+        EnvMap idx = bundle;
+        idx["STRIX_MM_PF_IDX_WMMA"] = "1";
+        const auto pi = md::prefill_policy(lookup(idx));
+        check(pi.idx_wmma && pi.idx_wmma_layers == "40-59" && pi.msa_flash == 1 &&
+                  pi.policies == "msa-flash-bf16-l40-v1+minimax-index-proj-wmma-v1-l40-59" &&
+                  md::prefill_identity(lookup(idx)) == "prefill_msa=msa-flash-bf16-l40-v1;prefill_idxproj=minimax-index-proj-wmma-v1-l40-59",
+              "fast idx: explicit member runs beside the bundle, own cache field");
+        check(!md::prefill_policy(lookup(bundle)).idx_wmma, "fast idx: not a bundle member before its gate");
+        check(agree(idx, idx) && !agree(idx, bundle) && !agree(bundle, idx), "fast idx: one rank only is rejected");
+        EnvMap idx_zero = bundle;
+        idx_zero["STRIX_MM_PF_IDX_WMMA"] = "0";
+        idx_zero["STRIX_MM_PF_IDX_WMMA_LAYERS"] = "0-59";
+        check(agree(idx_zero, bundle) && md::prefill_identity(lookup(idx_zero)) == md::prefill_identity(lookup(bundle)),
+              "fast idx: explicit OFF with an unused layer set is the bundle's run");
+        EnvMap idx_other = idx;
+        idx_other["STRIX_MM_PF_IDX_WMMA_LAYERS"] = "30-59";
+        check(!agree(idx, idx_other), "fast idx: different layer sets rejected");
+        const EnvMap idx_only{{"STRIX_MM_PF_IDX_WMMA", "1"}, {"STRIX_MM_PF_IDX_WMMA_LAYERS", "40-49,50-59"}};
+        check(md::prefill_identity(lookup(idx_only)) == "prefill_idxproj=minimax-index-proj-wmma-v1-l40-59",
+              "fast idx: alone, only the idxproj field");
+        EnvMap idx_none = idx;
+        idx_none["STRIX_MM_PF_IDX_WMMA_LAYERS"] = "none";
+        check(!md::prefill_policy(lookup(idx_none)).idx_wmma && !md::prefill_policy(lookup(idx_none)).note.empty(),
+              "fast idx: empty layer set declines with a note");
+        bool threw = false;
+        try { (void)md::prefill_policy(lookup(EnvMap{{"STRIX_MM_PF_IDX_WMMA", "2"}})); } catch (const std::invalid_argument&) { threw = true; }
+        check(threw, "fast idx: invalid value rejected");
+        // ONE RESOLVER: rank and serve resolve the same request to the same prefill lines.
+        const auto prefill_lines = [](const std::string& cfg) {
+            std::string out;
+            for (std::size_t a = 0; a < cfg.size();) {
+                const std::size_t b = std::min(cfg.find('\n', a), cfg.size());
+                if (cfg.compare(a, 8, "prefill.") == 0 || cfg.compare(a, 19, "STRIX_MM_PF_IDX_WMM") == 0) out += cfg.substr(a, b - a + 1);
+                a = b + 1;
+            }
+            return out;
+        };
+        const auto rank_cfg = md::effective_config(md::parse_cli("rank", {}), lookup(idx));
+        const auto serve_cfg = md::effective_config(md::parse_cli("serve", {}), lookup(idx));
+        check(prefill_lines(rank_cfg) == prefill_lines(serve_cfg) && rank_cfg.find("\nprefill.idx_wmma=1\n") != std::string::npos &&
+                  rank_cfg.find("\nprefill.idx_wmma_layers=40-59\n") != std::string::npos,
+              "fast idx: rank and serve resolve the same prefill policy");
     }
 }
 

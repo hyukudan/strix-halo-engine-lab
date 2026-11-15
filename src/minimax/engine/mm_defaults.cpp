@@ -239,8 +239,24 @@ PrefillPolicy prefill_policy(const Lookup& env) {
                          : std::string("msa-flash-bf16") + (p.msa_flash == 2 ? "-2term" : "") + "-l" + p.msa_flash_layers;
     if (i4 && fp::switch_on(env(kFastBundle.env)) && !fp::set(raw))
         p.note = std::string(flash.policy) + " not selected by " + kFastBundle.env + " on STRIX_MMX_MODEL_FORMAT=fast_i4";
+    // Index projections on the shared WMMA core (opt-in member, mm_profile_table.hpp kIdxWmmaPolicy).
+    const char* iw = env("STRIX_MM_PF_IDX_WMMA");
+    if (fp::set(iw) && std::strcmp(iw, "0") != 0 && std::strcmp(iw, "1") != 0)
+        throw std::invalid_argument("STRIX_MM_PF_IDX_WMMA must be 0 or 1");
+    p.idx_wmma_asked = fp::set(iw) ? iw : "default";
+    p.idx_wmma = fp::set(iw) && std::strcmp(iw, "1") == 0;
+    const char* il = env("STRIX_MM_PF_IDX_WMMA_LAYERS");
+    const auto imask = strix::core::parse_layer_set(fp::set(il) ? il : kIdxWmmaLayers, 0, kMsaLayers, "STRIX_MM_PF_IDX_WMMA_LAYERS");
+    p.idx_wmma_layers = fp::layer_ranges(kMsaLayers, [&](unsigned l) { return imask.test(l); });
+    if (p.idx_wmma && imask.count() == 0) {
+        p.idx_wmma = false;
+        p.note += std::string(p.note.empty() ? "" : "; ") + "STRIX_MM_PF_IDX_WMMA_LAYERS selects no layers";
+    }
+    if (p.idx_wmma) p.policies += (p.policies.empty() ? "" : "+") + idx_wmma_policy(p.idx_wmma_layers);
     return p;
 }
+
+std::string idx_wmma_policy(const std::string& layers) { return std::string(kIdxWmmaPolicy) + "-l" + layers; }
 
 const profile::Engine& profile_engine() {
     static const profile::Engine engine{"minimax-pair", "", profile_table, false};
@@ -258,6 +274,10 @@ profile::Resolution profile_resolution(const Lookup& env) {
             return p.msa_flash == 0 && p.msa_flash_asked == "default" ? nullptr : effective_mode.c_str();
         if (std::strcmp(key, "STRIX_MM_PF_MSA_FLASH_LAYERS") == 0)
             return p.msa_flash == 0 ? nullptr : p.msa_flash_layers.c_str();
+        if (std::strcmp(key, "STRIX_MM_PF_IDX_WMMA") == 0)
+            return !p.idx_wmma && p.idx_wmma_asked == "default" ? nullptr : p.idx_wmma ? "1" : "0";
+        if (std::strcmp(key, "STRIX_MM_PF_IDX_WMMA_LAYERS") == 0)
+            return p.idx_wmma ? p.idx_wmma_layers.c_str() : nullptr;
         return base(key);
     };
     return profile::resolve(profile_engine(), in);
@@ -274,7 +294,17 @@ void check_peer(const std::function<void(const void*, void*, std::size_t)>& exch
 
 std::string prefill_identity(const Lookup& env) {
     const auto p = prefill_policy(env);
-    std::string out = p.policies.empty() ? std::string() : "prefill_msa=" + p.policies;
+    // MSA attention policies under prefill_msa (unchanged form), the index projection member under prefill_idxproj.
+    std::string msa, idx;
+    for (std::size_t a = 0; a < p.policies.size();) {
+        const std::size_t b = std::min(p.policies.find('+', a), p.policies.size());
+        const std::string one = p.policies.substr(a, b - a);
+        std::string& dst = one.rfind(kIdxWmmaPolicy, 0) == 0 ? idx : msa;
+        dst += (dst.empty() ? "" : "+") + one;
+        a = b + 1;
+    }
+    std::string out = msa.empty() ? std::string() : "prefill_msa=" + msa;
+    if (!idx.empty()) out += std::string(out.empty() ? "" : ";") + "prefill_idxproj=" + idx;
     if (fast_i4_format(env)) out += std::string(out.empty() ? "" : ";") + "moe_prefill_format=fast_i4";
     return out;
 }
@@ -510,11 +540,14 @@ std::string effective_config(const Cli& cli, const Lookup& env) {
         for (const auto& e : pr.entries) o << e.lever->env << "=" << e.value << "\n";
         const auto id = prefill_identity(env);
         const bool bundle_requested = strix::fast_profile::switch_on(env(kFastBundle.env));
-        o << "prefill.fast_profile=" << (bundle_requested && !pf.policies.empty() ? kFastBundle.profile : "off") << "\n"
+        o << "prefill.fast_profile=" << (bundle_requested && pf.msa_flash != 0 ? kFastBundle.profile : "off") << "\n"
           << "prefill.fast_profile_requested=" << (bundle_requested ? kFastBundle.profile : "off") << "\n"
           << "prefill.msa_flash_requested=" << pf.msa_flash_requested << "\n"
           << "prefill.msa_flash_source=" << pf.msa_flash_asked << "\n"
           << "prefill.msa_flash_layers_requested=" << pf.msa_flash_layers_requested << "\n"
+          << "prefill.idx_wmma=" << (pf.idx_wmma ? "1" : "0") << "\n"
+          << "prefill.idx_wmma_source=" << pf.idx_wmma_asked << "\n"
+          << "prefill.idx_wmma_layers=" << (pf.idx_wmma ? pf.idx_wmma_layers : std::string("none")) << "\n"
           << "prefill.fast_policies=" << (pf.policies.empty() ? "none" : pf.policies) << "\n"
           << "prefill.fast_note=" << (pf.note.empty() ? "none" : pf.note) << "\n"
           << "prefill.identity=" << (id.empty() ? "default" : id) << "\n"

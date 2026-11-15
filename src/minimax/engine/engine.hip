@@ -675,6 +675,13 @@ struct Engine::Impl {
     unsigned pf_msa_flash = 0;
     std::string pf_msa_flash_asked = "default";  // receipt: "default", the explicit value or "fast_prefill"
     strix::core::LayerSet pf_msa_flash_layers;  // STRIX_MM_PF_MSA_FLASH_LAYERS: layers that use it (unset: defaults::kMsaFlashLayers)
+    // STRIX_MM_PF_IDX_WMMA=1 (minimax-index-proj-wmma-v1): prefill index projections (rows > 8) of the layers in
+    // pf_idx_wmma_layers on the shared FP16 WMMA core; pf_idx_xt = its x16 tiles (max_rows x 6144 FP16).
+    bool pf_idx_wmma = false;
+    std::string pf_idx_wmma_asked = "default";
+    strix::core::LayerSet pf_idx_wmma_layers;
+    _Float16* pf_idx_xt = nullptr;
+    std::size_t pf_idx_xt_rows = 0;
     bool pf_msa_batch = true;  // STRIX_MM_PF_MSA_BATCH (default ON, exact measurement): independent scratch per prefill window
     unsigned pf_msa_windows = 0;
     float *pf_scores = nullptr, *pf_partial = nullptr;
@@ -959,11 +966,17 @@ struct Engine::Impl {
             pf_msa_flash = policy.msa_flash_requested;
             pf_msa_flash_asked = policy.msa_flash_asked;
             pf_msa_flash_layers = strix::core::parse_layer_set(policy.msa_flash_layers.c_str(), 0, kLayers, "STRIX_MM_PF_MSA_FLASH_LAYERS");
+            pf_idx_wmma = policy.idx_wmma;
+            pf_idx_wmma_asked = policy.idx_wmma_asked;
+            pf_idx_wmma_layers = strix::core::parse_layer_set(policy.idx_wmma_layers.c_str(), 0, kLayers, "STRIX_MM_PF_IDX_WMMA_LAYERS");
             if (!policy.note.empty()) std::fprintf(stderr, "minimax fast prefill: %s\n", policy.note.c_str());
         }
         if (pf_msa_flash != 0 && defaults::msa_flash_decline_reason(pf_msa_rework != 0, attn_prefill_fused,
                                                                   pf_msa_flash_layers.count()) == nullptr)
             std::fprintf(stderr, "prefill identity mm-pf-msa-flash FAST (bf16 WMMA key-split MSA attend, %u-term operands, %u layers)\n", pf_msa_flash, pf_msa_flash_layers.count());
+        if (pf_idx_wmma)
+            std::fprintf(stderr, "prefill identity %s FAST (index projections on the shared FP16 WMMA core, %u layers)\n",
+                         defaults::idx_wmma_policy(defaults::prefill_policy(strix::envcfg::text).idx_wmma_layers).c_str(), pf_idx_wmma_layers.count());
         if (i4_shadow && !model_fast_i4)
             throw std::invalid_argument("STRIX_MMX_FAST_I4_SHADOW needs STRIX_MMX_MODEL_FORMAT=fast_i4");
         if (model_fast_i4) {
@@ -1217,6 +1230,9 @@ struct Engine::Impl {
         rr::lever("minimax.msa_flash", pf_msa_flash_asked,
                   std::to_string(flash) + (flash ? ":layers=" + mask(pf_msa_flash_layers, 0) : ""),
                   flash ? rr::Reason::selected : rr::Reason::disabled);
+        rr::lever("minimax.index_proj_wmma", pf_idx_wmma_asked,
+                  pf_idx_wmma && !fp32_prefill ? "1:layers=" + mask(pf_idx_wmma_layers, 0) : std::string("0"),
+                  pf_idx_wmma && !fp32_prefill ? rr::Reason::selected : rr::Reason::disabled);
         rr::lever("minimax.prefill_identity", fp32_prefill ? "fp32" : "default", fp32_prefill ? "fp32" : "default");
         rr::lever("minimax.moe_kernels", moe_opt ? "1" : "0", moe_opt ? "1" : "0");
     }
@@ -1395,6 +1411,10 @@ struct Engine::Impl {
                 i4_shadow_outputs = dalloc<float>(2U * T * kHidden);
                 i4_shadow_sums = dalloc<float>(4);
             }
+        }
+        if (pf_idx_wmma) {  // x16 tiles of the FAST index projections: one chunk (max_rows rows) at a time
+            pf_idx_xt_rows = opt.max_rows;
+            pf_idx_xt = dalloc<_Float16>(pf_idx_xt_rows * kHidden);
         }
         hip_ok(hipEventCreateWithFlags(&routes_ready, hipEventDisableTiming), "route event");
         if (fp32_prefill) {  // FP32 identity workspaces: expert pairs (T x 4 rows) at the widest site
@@ -1947,10 +1967,16 @@ struct Engine::Impl {
             const bool conc = index_route == route::IndexLayout::packed && (gemv ? index_conc && !f32 : pf_idx_conc != 0);
             const strix::minimax::attn::IndexProjView ipv{hn, y.wip, iq, ik, static_cast<std::uint32_t>(n)};
             const std::size_t ie = pf_idx_member * kLayers + L;
+            // FAST index projections (STRIX_MM_PF_IDX_WMMA): prefill rows > 8 of the selected layers, exact prefill base.
+            const bool idx_fast = pf_idx_wmma && !gemv && !f32 && n > 8 && index_route == route::IndexLayout::packed &&
+                                  pf_idx_wmma_layers.test(L);
+            // x16 workspace for chunks up to max_rows; a longer call takes the direct WMMA form (same bits).
+            _Float16* const idx_xt = idx_fast && n <= pf_idx_xt_rows ? pf_idx_xt : nullptr;
             // hn belongs to this chunk; q/k/v only read it. Join below precedes
             // prep (the first iq/ik reader), every hn write and the next chunk.
+            if (conc && idx_fast && idx_xt == nullptr) throw std::logic_error("minimax index proj: FAST side-stream call beyond max_rows");
             if (conc) strix::minimax::attn::index_proj_fork(ipv, nullptr, idx_side,
-                gemv ? idx_fork[L] : pf_idx_conc == 2 ? pf_idx_fork_device[ie] : pf_idx_fork[ie]);
+                gemv ? idx_fork[L] : pf_idx_conc == 2 ? pf_idx_fork_device[ie] : pf_idx_fork[ie], idx_fast ? idx_xt : nullptr);
             if (tl && lin_opt) tl->mark("qkv-projections", true);
             if (f32) {
                 if (tl) tl->mark("q-projection", true);
@@ -2006,6 +2032,9 @@ struct Engine::Impl {
             if (conc) {
                 strix::minimax::attn::index_proj_join(nullptr, idx_side,
                     gemv ? idx_join[L] : pf_idx_conc == 2 ? pf_idx_join_device[ie] : pf_idx_join[ie]);
+            } else if (idx_fast) {  // FAST minimax-index-proj-wmma-v1 (x16 tiles from kFastTilesRows rows; forms same bits)
+                if (idx_xt != nullptr) strix::minimax::attn::enqueue_index_proj_fast(ipv, idx_xt, nullptr);
+                else strix::minimax::attn::enqueue_index_proj_wmma(ipv, nullptr);
             } else if (index_route == route::IndexLayout::packed) {  // decode register ring / prefill tiles, same bits
                 strix::minimax::attn::enqueue_index_proj(ipv, nullptr);
             } else if (index_route == route::IndexLayout::fp16_block) {
