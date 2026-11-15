@@ -87,7 +87,8 @@ struct BlockTimes { double buf_wait = 0, gpu = 0, act_q = -1, act_sent[2]{-1, -1
 
 void run_layercut(const lc::Resolved& cfg, Store& store, const std::vector<std::uint16_t>& table,
                   const float* w_in0, const cu::RopeRow* rope, const std::vector<std::uint32_t>& tokens,
-                  const std::string& destinations, const std::string& pair_identity, unsigned repeat, bool bp) {
+                  const std::string& destinations, const std::string& pair_identity, unsigned repeat, bool bp,
+                  bool abab_xport = false) {
     const auto endpoints = strix::handoff::parse_path_map(destinations);
     if (endpoints.size() != 2 || tokens.empty() || tokens.size() > UINT32_MAX || repeat == 0)
         throw std::invalid_argument("layercut: needs one nonempty prompt, two --send endpoints and --repeat >= 1");
@@ -109,7 +110,9 @@ void run_layercut(const lc::Resolved& cfg, Store& store, const std::vector<std::
         ~CopyStream() { cudaStreamSynchronize(value); cudaStreamDestroy(value); }
     } copy_owner;
     const auto copy = copy_owner.value;
-    const bool act_first = cfg.xport == lc::Xport::act_first;
+    // --abab-xport (bench): runs alternate the resolved xport and the other one, both rings allocated once
+    const bool first_v2 = cfg.xport == lc::Xport::act_first;
+    const bool need_v2 = first_v2 || abab_xport, need_v1 = !first_v2 || abab_xport;
     const unsigned frag = std::min(cfg.kv_frag, block);
     std::unique_ptr<CutSlot[]> ring;
     std::unique_ptr<ActSlot[]> act_ring;
@@ -120,13 +123,14 @@ void run_layercut(const lc::Resolved& cfg, Store& store, const std::vector<std::
         ~KvStream() { cudaStreamSynchronize(value); cudaStreamDestroy(value); }
     };
     std::unique_ptr<KvStream[]> kv_streams;
-    if (act_first) {
+    if (need_v2) {
         act_ring = std::make_unique<ActSlot[]>(2);
         for (unsigned i = 0; i < 2; ++i) act_ring[i].alloc(block, copy);
         kv_streams = std::make_unique<KvStream[]>(2);
         const std::size_t frag_bytes = std::size_t{frag} * 1280;
         for (auto& p : pool) p.alloc(std::max<std::size_t>(8, (std::size_t{32} << 20) / frag_bytes), frag_bytes);
-    } else {
+    }
+    if (need_v1) {
         ring = std::make_unique<CutSlot[]>(2);
         for (unsigned i = 0; i < 2; ++i) ring[i].alloc(cut, block, copy);
     }
@@ -135,6 +139,7 @@ void run_layercut(const lc::Resolved& cfg, Store& store, const std::vector<std::
     std::printf("identity %s\n", id.c_str());
     struct Times { std::mutex mutex; Clock::time_point start; double act = 0, kv = 0; std::vector<BlockTimes> blocks; };
     for (unsigned it = 0; it < repeat; ++it) {
+        const bool act_first = abab_xport ? ((it % 2 == 0) == first_v2) : first_v2;
         strix::handoff::SenderOptions options;
         options.codec = bp ? strix::handoff::Codec::bp_v1 : strix::handoff::Codec::identity;
         if (act_first) {
@@ -360,7 +365,7 @@ void run_layercut(const lc::Resolved& cfg, Store& store, const std::vector<std::
         const auto s0 = sender[0]->stats(), s1 = sender[1]->stats();
         const auto ls = lanes ? lanes->stats() : strix::handoff::Lanes::Stats{};
         std::printf("lcfix-xport pc run %u %s kv_frag %u codec %s wire %.3f/%.3f GB encode %.3f/%.3f s last_byte %.3f/%.3f s bulk_held %.3f s\n",
-            it, lc::xport_name(cfg.xport), act_first ? frag : block, bp ? "bp-v1" : "identity", s0.wire_bytes / 1e9, s1.wire_bytes / 1e9,
+            it, act_first ? "act-first" : "fifo", act_first ? frag : block, bp ? "bp-v1" : "identity", s0.wire_bytes / 1e9, s1.wire_bytes / 1e9,
             s0.encode_seconds, s1.encode_seconds, s0.last_byte, s1.last_byte, ls.bulk_held_s);
         std::fflush(stdout);
     }

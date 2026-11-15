@@ -268,6 +268,14 @@ std::vector<std::uint32_t> layercut_session(mm::Engine& eng, strix::handoff::Lis
                         tl_act[b], tl_relay->at[b], tl_kv[b], fetch_at, fetch_wait);
         }
         const auto rs = session->stats();
+        // exactness witness: XXH64 of every ACT byte this rank staged (rank 0, or both ranks with direct)
+        char act_digest[32] = "none";
+        if (!replicated || eng.rank() == 0) {
+            strix::handoff::Xxh64 x(0);
+            x.update(act.data, prompt.size() * mlc::seam_bytes);
+            std::snprintf(act_digest, sizeof act_digest, "%016llx", static_cast<unsigned long long>(x.digest()));
+        }
+        std::printf("lcfix-act r%u req %u act xxh64 %s rows %zu\n", eng.rank(), req, act_digest, prompt.size());
         std::printf("lcfix-rank r%u req %u contract v%u prefill %.3f import %.3f agree %.3f reply %.3f recv wait %.3f decode %.3f end %.3f%s\n",
                     eng.rank(), req, expected.version, prefill, imported, agree_s, reply_at, rs.wait_seconds, rs.decode_seconds, rs.end,
                     relay_session ? " (ACT on the relay session)" : "");

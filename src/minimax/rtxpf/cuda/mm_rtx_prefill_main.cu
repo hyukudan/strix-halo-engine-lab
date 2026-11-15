@@ -427,7 +427,7 @@ int main(int argc, char** argv) {
         bool print_effective = false;
         std::string cut_pair_identity = "default";
         std::string send_to;
-        bool codec_bp = false;
+        bool codec_bp = false, abab_xport = false;
         int resident = -1, pinned_n = -1;
         std::string replay_dir, blob_cache;
         struct Prompt {
@@ -455,6 +455,7 @@ int main(int argc, char** argv) {
             if (a == "--repeat") { repeat = static_cast<unsigned>(std::stoul(argv[++i])); continue; }
             if (a == "--send") { send_to = argv[++i]; continue; }
             if (a == "--codec") { codec_bp = std::string(argv[++i]) == "bp"; continue; }
+            if (a == "--abab-xport") { abab_xport = true; continue; }  // bench: layer-cut runs alternate xport (the resolved one first)
             if (a == "--replay-state") { replay_dir = argv[++i]; continue; }
             if (a == "--pinned") { pinned_n = std::stoi(argv[++i]); continue; }
             if (a == "--blob-cache") { blob_cache = argv[++i]; continue; }
@@ -672,7 +673,7 @@ int main(int argc, char** argv) {
         }
 
         if (layer_cut) {
-            run_layercut(cut_cfg, st, table, w_in0, rope_d, prompts[0].tokens, send_to, cut_pair_identity, repeat, codec_bp);
+            run_layercut(cut_cfg, st, table, w_in0, rope_d, prompts[0].tokens, send_to, cut_pair_identity, repeat, codec_bp, abab_xport);
             return 0;
         }
         // groups: gate mode = all prompts batched in one pass; timing mode = one prompt at a time
