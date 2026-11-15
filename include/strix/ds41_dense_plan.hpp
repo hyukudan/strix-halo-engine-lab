@@ -19,7 +19,7 @@ enum DenseSiteKind : std::uint32_t { kDenseQa = 0, kDenseKv, kDenseQb, kDenseOa,
 inline constexpr std::uint32_t kGroupContractVersion = 2;  // 1: exact only (PR #591); 2: + FAST levers per member route
 // The group FAST identity fixture (each member of a FAST group == its solo FAST run, logits and state, both ranks) passed
 // on both nodes: FAST serving groups by default (serve::qualify_fast). false: FAST groups only with STRIX_SERVE_PREFILL_GROUP=auto.
-inline constexpr bool kGroupFastQualified = false;
+inline constexpr bool kGroupFastQualified = true;  // 11-15: identity fixture PASS (6 arms, both ranks), C8 +2.8 %
 
 struct DenseConeRows {
     std::uint32_t k0 = 0, o0 = 0;  // first global row of the layer's window K/V and of its outputs (multiples of W)
