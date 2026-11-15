@@ -239,6 +239,15 @@ PrefillPolicy prefill_policy(const Lookup& env) {
                          : std::string("msa-flash-bf16") + (p.msa_flash == 2 ? "-2term" : "") + "-l" + p.msa_flash_layers;
     if (i4 && fp::switch_on(env(kFastBundle.env)) && !fp::set(raw))
         p.note = std::string(flash.policy) + " not selected by " + kFastBundle.env + " on STRIX_MMX_MODEL_FORMAT=fast_i4";
+    // FAST router product (opt-in, own switch): the layers it runs on; layers without a router (dense) are ignored.
+    const char* router = env("STRIX_MM_PF_ROUTER_WMMA");
+    if (fp::set(router) && std::strcmp(router, "0") != 0 && std::strcmp(router, "1") != 0)
+        throw std::invalid_argument("STRIX_MM_PF_ROUTER_WMMA must be 0 or 1");
+    const char* rlayers = env("STRIX_MM_PF_ROUTER_WMMA_LAYERS");
+    const auto rmask = strix::core::parse_layer_set(fp::set(rlayers) ? rlayers : kRouterWmmaLayers, 0, kMsaLayers,
+                                                    "STRIX_MM_PF_ROUTER_WMMA_LAYERS");
+    p.router_wmma_layers = fp::layer_ranges(kMsaLayers, [&](unsigned l) { return rmask.test(l); });
+    p.router_wmma = fp::set(router) && std::strcmp(router, "1") == 0 && rmask.count() != 0;
     return p;
 }
 
@@ -258,6 +267,9 @@ profile::Resolution profile_resolution(const Lookup& env) {
             return p.msa_flash == 0 && p.msa_flash_asked == "default" ? nullptr : effective_mode.c_str();
         if (std::strcmp(key, "STRIX_MM_PF_MSA_FLASH_LAYERS") == 0)
             return p.msa_flash == 0 ? nullptr : p.msa_flash_layers.c_str();
+        // The same for the FAST router product: unset or 0 is the builtin, its layer set counts only while it runs.
+        if (std::strcmp(key, "STRIX_MM_PF_ROUTER_WMMA") == 0) return p.router_wmma ? "1" : nullptr;
+        if (std::strcmp(key, "STRIX_MM_PF_ROUTER_WMMA_LAYERS") == 0) return p.router_wmma ? p.router_wmma_layers.c_str() : nullptr;
         return base(key);
     };
     return profile::resolve(profile_engine(), in);
@@ -275,6 +287,7 @@ void check_peer(const std::function<void(const void*, void*, std::size_t)>& exch
 std::string prefill_identity(const Lookup& env) {
     const auto p = prefill_policy(env);
     std::string out = p.policies.empty() ? std::string() : "prefill_msa=" + p.policies;
+    if (p.router_wmma) out += std::string(out.empty() ? "" : ";") + "prefill_router=mm-pf-router-wmma-v1-l" + p.router_wmma_layers;
     if (fast_i4_format(env)) out += std::string(out.empty() ? "" : ";") + "moe_prefill_format=fast_i4";
     return out;
 }

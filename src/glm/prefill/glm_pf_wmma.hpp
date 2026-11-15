@@ -2,6 +2,8 @@
 // FAST identity glm-pf-wmma-x, host side (no HIP): calls that actually ran on the WMMA linears, so a run's identity
 // line reports executed arithmetic, not only the requested switch (STRIX_GLM_PF_WMMA=1 still leaves the dense calls
 // below the X3 threshold and the MoE calls below V11 on the exact cores).
+#include "strix/env_flags.hpp"
+
 #include <atomic>
 #include <cstdint>
 #include <cstdlib>
@@ -31,3 +33,15 @@ inline bool enabled() {
 }
 inline std::atomic<std::uint64_t> calls{0};  // launches that ran on the WMMA core (identity reporting)
 }  // namespace strix::glm::pf::kda_wmma
+
+namespace strix::glm::pf::router_wmma {
+// FAST identity glm-pf-router-wmma-v1 (glm_pf_router_wmma.hpp): the prefill router logits on the shared dense FP16
+// WMMA core. Opt-in (STRIX_GLM_PF_ROUTER_WMMA=1), with or without the FAST route, until its quality gate passes;
+// unset or 0 = the exact R1 chains. Part of the TP2 startup agreement (rank_defaults::kPfRouterWmmaConfig).
+inline bool enabled() {
+    static const bool on = strix::envcfg::flag("STRIX_GLM_PF_ROUTER_WMMA", false);
+    return on;
+}
+inline std::atomic<std::uint64_t> calls{0};  // calls that ran on the WMMA core (identity reporting)
+inline std::atomic<const char*> form_used{"none"};  // launch form of the last call (core::f16_dense_tall::matrix_form_name)
+}  // namespace strix::glm::pf::router_wmma

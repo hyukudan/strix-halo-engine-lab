@@ -564,6 +564,12 @@ void test_startup_agreement() {
         kda[1] |= rd::kPfKdaWmmaConfig;
         pair(kda, kda, rd::max_rows_auto(tf), rd::max_rows_auto(tf), false);
         pair(kda, fast, false, false, true);
+        auto router = kda;  // the FAST router product (opt-in): one rank with it and one without is refused
+        router[1] |= rd::kPfRouterWmmaConfig;
+        pair(router, router, rd::max_rows_auto(tf), rd::max_rows_auto(tf), false);
+        pair(router, kda, false, false, true);
+        CHECK((rd::kPfRouterWmmaConfig & (rd::kPfKdaWmmaConfig | rd::kPfAttnWmmaConfig | rd::kPfWmmaConfig | rd::kFastI4Config |
+                                          rd::kAutoRowsConfig | (3U << rd::kIdxWmmaShift))) == 0);
     }
     // External Xfer, including fixed and baseline modes, never enters this host handshake.
     for (const auto& extra : {Args{}, Args{"--baseline"}, Args{"--max-rows", "8192"}}) {

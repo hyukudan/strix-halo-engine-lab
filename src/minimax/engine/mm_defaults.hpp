@@ -58,6 +58,8 @@ struct PrefillPolicy {
     std::string msa_flash_layers;                  // layer set text the engine parses (builtin kMsaFlashLayers)
     std::string msa_flash_layers_requested;        // original layer syntax, for provenance only
     std::string msa_flash_asked;                   // "default", the explicit value, or "fast_prefill" (bundle)
+    bool router_wmma = false;                      // STRIX_MM_PF_ROUTER_WMMA=1: FAST router product (mm-pf-router-wmma-v1)
+    std::string router_wmma_layers;                // its layer set (builtin kRouterWmmaLayers), canonical ranges
     std::string policies;                          // named FAST policies that run, '+'-joined; empty: none
     std::string note;                              // why a bundle member does not run; empty: none
 };

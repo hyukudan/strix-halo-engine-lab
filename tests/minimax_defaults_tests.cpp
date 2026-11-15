@@ -711,6 +711,54 @@ void test_fast_prefill_profile() {
     }
 }
 
+// FAST mm-pf-router-wmma-v1: one resolver (prefill_policy) for the engine, the cache identity, the effective config and
+// the rank agreement; opt-in, its layer set read only while it runs.
+void test_router_wmma() {
+    const auto none_fp = strix::profile::resolve(strix::profile::Engine{"minimax-pair", "", {}, false}, {}).fingerprint();
+    const auto fp = [](const EnvMap& m) { return md::profile_resolution(lookup(m)).fingerprint(); };
+    const EnvMap off, zero{{"STRIX_MM_PF_ROUTER_WMMA", "0"}}, unused{{"STRIX_MM_PF_ROUTER_WMMA_LAYERS", "3-59"}};
+    for (const EnvMap* m : {&off, &zero, &unused}) {
+        const auto p = md::prefill_policy(lookup(*m));
+        check(!p.router_wmma && p.policies.empty() && md::prefill_identity(lookup(*m)).empty() && fp(*m) == none_fp,
+              "router wmma: off / unused layer set keep the legacy identity");
+    }
+    const EnvMap on{{"STRIX_MM_PF_ROUTER_WMMA", "1"}}, all{{"STRIX_MM_PF_ROUTER_WMMA", "1"}, {"STRIX_MM_PF_ROUTER_WMMA_LAYERS", "3-59"}};
+    const auto p = md::prefill_policy(lookup(on));
+    check(p.router_wmma && p.router_wmma_layers == "40-59" && p.msa_flash == 0 && p.policies.empty(), "router wmma: default layer set 40-59");
+    check(md::prefill_identity(lookup(on)) == "prefill_router=mm-pf-router-wmma-v1-l40-59", "router wmma: cache identity names policy and layers");
+    check(md::prefill_identity(lookup(all)) == "prefill_router=mm-pf-router-wmma-v1-l3-59" && fp(all) != fp(on) && fp(on) != none_fp,
+          "router wmma: the layer set is part of the identity while on");
+    const auto cfg = md::effective_config(md::Cli{}, lookup(on));
+    check(cfg.find("STRIX_MM_PF_ROUTER_WMMA=1\n") != std::string::npos && cfg.find("STRIX_MM_PF_ROUTER_WMMA_LAYERS=40-59\n") != std::string::npos &&
+              cfg.find("prefill.identity=prefill_router=mm-pf-router-wmma-v1-l40-59\n") != std::string::npos,
+          "router wmma: effective config shows the resolved values");
+    const EnvMap both{{"STRIX_MM_PF_ROUTER_WMMA", "1"}, {"STRIX_MM_PF_MSA_FLASH", "1"}};
+    check(md::prefill_identity(lookup(both)) == "prefill_msa=msa-flash-bf16-l40-v1;prefill_router=mm-pf-router-wmma-v1-l40-59",
+          "router wmma: composes with the MSA flash member");
+    bool threw = false;
+    try { (void)md::prefill_policy(lookup(EnvMap{{"STRIX_MM_PF_ROUTER_WMMA", "2"}})); } catch (const std::invalid_argument&) { threw = true; }
+    check(threw, "router wmma: values other than 0 / 1 are refused");
+    const auto hello = [](const strix::profile::Resolution& r) {
+        std::vector<unsigned char> bytes;
+        md::check_peer(r, [&](const void* o, void* i, std::size_t n) {
+            bytes.assign(static_cast<const unsigned char*>(o), static_cast<const unsigned char*>(o) + n);
+            std::memcpy(i, o, n);
+        });
+        return bytes;
+    };
+    const auto agree = [&](const EnvMap& mine, const EnvMap& peer) {
+        const auto peer_bytes = hello(md::profile_resolution(lookup(peer)));
+        try {
+            md::check_peer(md::profile_resolution(lookup(mine)), [&](const void*, void* i, std::size_t n) {
+                std::memcpy(i, peer_bytes.data(), n < peer_bytes.size() ? n : peer_bytes.size());
+            });
+        } catch (const std::runtime_error&) { return false; }
+        return true;
+    };
+    check(agree(on, on) && !agree(on, off) && !agree(off, on) && !agree(on, all), "router wmma: ranks must resolve the same switch and layer set");
+    check(agree(off, zero) && agree(off, unused), "router wmma: off forms agree with the plain invocation");
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -733,6 +781,7 @@ int main(int argc, char** argv) {
         test_session_startup();
         test_apply();
         test_fast_prefill_profile();
+        test_router_wmma();
     } catch (const std::exception& e) {
         std::cerr << "FAIL: " << e.what() << "\n";
         return 1;

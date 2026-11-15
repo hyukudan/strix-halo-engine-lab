@@ -31,6 +31,7 @@
 #include <concepts>
 #include <cstddef>
 #include <cstdint>
+#include <type_traits>
 
 namespace strix::core::f16_dense_tall {
 using Half16 = _Float16 __attribute__((ext_vector_type(16)));
@@ -86,6 +87,11 @@ template <class C> concept ColsStage = requires(const C& c, U4* nb) { c.stage(0U
 template <class C> concept ColsFragment = requires(const C& c) { { c.fragment(0U, 0U) } -> std::same_as<Half16>; };
 template <class C> inline constexpr unsigned kCtaWaves = 8U;
 template <class C> requires requires { C::kWaves; } inline constexpr unsigned kCtaWaves<C> = C::kWaves;
+//   kColumnsFastest (default false): blockIdx.x = column block, blockIdx.y = row block (launch grid (column blocks,
+//     row blocks)), so the column blocks of one row block are dispatched together and their x reads meet in L2: one
+//     DRAM read of x per launch instead of one per column block. The arithmetic is unchanged.
+template <class C> inline constexpr bool kColumnsFastest = false;
+template <class C> requires requires { C::kColumnsFastest; } inline constexpr bool kColumnsFastest<C> = C::kColumnsFastest;
 
 // Pitch 36 dwords per column: b128 accesses stay aligned and columns rotate banks. 2,304 bytes per column tile.
 template <unsigned TC> struct alignas(16) Storage {
@@ -140,7 +146,8 @@ __device__ __forceinline__ void core(const float* x, unsigned in, unsigned nr, C
     // No 8-tile width: its WMMAs sink below the fragment reads of the whole stage and the kernel spills (124+ VGPRs).
     static_assert(TC == 1 || TC == 2 || TC == 4 || TC == 16);
     const unsigned tid = threadIdx.x, lane = tid & 31U, wave = tid >> 5U, c = lane & 15U;
-    const unsigned row0 = blockIdx.x * (16U * kCtaWaves<Cols>) + wave * 16U;
+    const unsigned rb = kColumnsFastest<Cols> ? blockIdx.y : blockIdx.x, cb = kColumnsFastest<Cols> ? blockIdx.x : blockIdx.y;
+    const unsigned row0 = rb * (16U * kCtaWaves<Cols>) + wave * 16U;
     const unsigned units = detail::uni(in) / 16U;
     const auto* xb = reinterpret_cast<const unsigned char*>(detail::uniform(x));
     // Rows past nr read row 0 (their sums are never stored).
@@ -151,7 +158,7 @@ __device__ __forceinline__ void core(const float* x, unsigned in, unsigned nr, C
     };
     // Stager role: thread tid owns column tid of the CTA's column block.
     const bool stager = tid < 16U * TC;
-    const unsigned stile = blockIdx.y * TC + (stager ? tid / 16U : 0U);
+    const unsigned stile = cb * TC + (stager ? tid / 16U : 0U);
     const auto* wp = ColsStage<Cols> ? nullptr : reinterpret_cast<const unsigned char*>(cols.tile(stile).w) +
                                                      static_cast<std::size_t>(tid & 15U) * in * 2U;
     U4 nb[8];
@@ -196,9 +203,9 @@ __device__ __forceinline__ void core(const float* x, unsigned in, unsigned nr, C
     store.run([&](auto& s) __attribute__((always_inline)) {
 #pragma unroll
         for (unsigned t = 0; t < TC; ++t) {
-            const ColumnTile ct = cols.tile(blockIdx.y * TC + t);
+            const ColumnTile ct = cols.tile(cb * TC + t);
             if (!detail::uni(ct.live ? 1U : 0U)) continue;
-            const auto st = s.open(blockIdx.y * TC + t, ct, c);
+            const auto st = s.open(cb * TC + t, ct, c);
 #pragma unroll
             for (unsigned j = 0; j < 8U; ++j) {
                 const unsigned r = row0 + 2U * j + (lane >> 4U);
@@ -207,6 +214,113 @@ __device__ __forceinline__ void core(const float* x, unsigned in, unsigned nr, C
         }
         s.close();
     });
+}
+
+// ---------------------------------------------------------------- one matrix, guarded (FAST products that feed a selection)
+// Guarded<Store>: the same stores, plus flags[r] = 1 for a row with a non-finite sum. x is rounded to FP16 in the A
+// fragments, so a finite |x| > 65504 becomes inf and every sum of that row is inf or NaN (inf * 0 = NaN): the flag is
+// complete for overflow. The adapter's fallback kernel then calls exact_rows(), which recomputes the flagged rows with
+// the family's exact chain and clears the flags (zeroed once at allocation, left zero by every fallback).
+template <class Inner> struct Guarded {
+    Inner inner;
+    unsigned* flags;  // [rows]
+    template <class S> struct View {
+        S& s;
+        unsigned* flags;
+        __device__ __forceinline__ auto open(unsigned i, const ColumnTile& ct, unsigned c) const { return s.open(i, ct, c); }
+        template <class T> __device__ __forceinline__ void put(const T& t, unsigned r, float v) const {
+            if (!__builtin_isfinite(v)) flags[r] = 1U;
+            s.put(t, r, v);
+        }
+        __device__ __forceinline__ void close() const { s.close(); }
+    };
+    template <class F> __device__ __forceinline__ void run(F&& f) {
+        inner.run([&](auto& s) __attribute__((always_inline)) {
+            View<std::remove_reference_t<decltype(s)>> v{s, flags};
+            f(v);
+        });
+    }
+};
+
+// The fallback walk, run by every thread of a CTA: CTA b covers rows [b * span, min((b + 1) * span, rows)) in steps of
+// blockDim.x rows; a step lists its flagged rows in LDS (list[blockDim.x], *count), calls row(r) once per listed row
+// with every thread (barrier after each) and clears their flags. Nothing flagged: one flag read per row.
+template <class Row>
+__device__ __forceinline__ void exact_rows(unsigned* flags, unsigned rows, unsigned span, unsigned* list, unsigned* count, Row&& row) {
+    const unsigned first = blockIdx.x * span, last = first + span < rows ? first + span : rows;
+    for (unsigned base = first; base < last; base += blockDim.x) {
+        if (threadIdx.x == 0U) *count = 0U;
+        __syncthreads();
+        const unsigned r = base + threadIdx.x;
+        const bool mine = r < last && flags[r] != 0U;
+        if (mine) list[atomicAdd(count, 1U)] = r;
+        __syncthreads();
+        const unsigned n = *count;
+        for (unsigned i = 0; i < n; ++i) {
+            row(list[i]);
+            __syncthreads();
+        }
+        if (mine) flags[r] = 0U;
+        __syncthreads();  // every thread read *count before the next step resets it
+    }
+}
+
+// Columns of one [n][in] FP16 matrix (n % 16 == 0): tile t = outputs [16 t, 16 t + 16); tiles past n / 16 are dead
+// (they read tile 0). The store receives y + 16 t and stride (RawStore: y[r * stride + column]).
+template <bool ColumnsFastest> struct MatrixCols {
+    static constexpr bool kColumnsFastest = ColumnsFastest;
+    const _Float16* w;
+    float* y;
+    unsigned in, stride, tiles, tile0;
+    __device__ __forceinline__ ColumnTile tile(unsigned i) const {
+        const unsigned t = tile0 + i;
+        if (t < tiles) return {w + static_cast<std::size_t>(t) * 16U * in, y + t * 16U, stride, true};
+        return {w, y, stride, false};
+    }
+};
+
+template <unsigned TC, bool ColumnsFastest, class Store>
+__global__ __launch_bounds__(256) void matrix_kernel(const float* x, unsigned rows, MatrixCols<ColumnsFastest> cols, Store store) {
+    __shared__ Storage<TC> lds;
+    core<TC>(x, cols.in, rows, cols, lds, store, true);
+}
+
+// Launch forms of a one-matrix product, all with the same bits (each tile's chain does not depend on the form):
+//   plan   : 16-tile CTA columns, the remainder in plan()'s width (one x read per launch: two when n % 256 != 0)
+//   narrow4: 4-tile CTA columns, column-fastest grid, one launch (the column blocks of a row block share x in L2)
+//   wide16 : 16-tile CTA columns, column-fastest grid, one launch, dead tiles up to a multiple of 16
+// STRIX_F16_MATRIX_FORM = auto (adapter's choice) | plan | narrow4 | wide16.
+enum class MatrixForm : unsigned { plan = 0, narrow4 = 1, wide16 = 2 };
+inline MatrixForm matrix_form(MatrixForm automatic) {
+    static const int f = envcfg::choice("STRIX_F16_MATRIX_FORM", {"auto", "plan", "narrow4", "wide16"}, 0);
+    return f <= 0 ? automatic : static_cast<MatrixForm>(f - 1);
+}
+inline const char* matrix_form_name(MatrixForm f) {
+    return f == MatrixForm::narrow4 ? "narrow4" : f == MatrixForm::wide16 ? "wide16" : "plan";
+}
+
+// y-side contract as core (in % 128 == 0, rows * in * 4 < 2^32, n % 16 == 0); the caller checks.
+template <class Store>
+inline void launch_matrix(MatrixForm form, const float* x, unsigned rows, const _Float16* w, unsigned in, unsigned n, float* y,
+                          unsigned stride, const Store& store, hipStream_t s) {
+    const unsigned tiles = n / 16U, gr = (rows + kRows - 1U) / kRows;
+    if (form == MatrixForm::narrow4) {
+        matrix_kernel<4, true, Store><<<dim3((tiles + 3U) / 4U, gr), 256, 0, s>>>(x, rows, MatrixCols<true>{w, y, in, stride, tiles, 0U}, store);
+        return;
+    }
+    if (form == MatrixForm::wide16) {
+        matrix_kernel<16, true, Store><<<dim3((tiles + 15U) / 16U, gr), 256, 0, s>>>(x, rows, MatrixCols<true>{w, y, in, stride, tiles, 0U}, store);
+        return;
+    }
+    const Plan pl = plan(tiles, rows, true);
+    if (pl.full) matrix_kernel<16, false, Store><<<dim3(gr, pl.full), 256, 0, s>>>(x, rows, MatrixCols<false>{w, y, in, stride, tiles, 0U}, store);
+    const MatrixCols<false> rest{w, y, in, stride, tiles, pl.full * 16U};
+    switch (pl.tc) {
+    case 4: matrix_kernel<4, false, Store><<<dim3(gr, pl.gy), 256, 0, s>>>(x, rows, rest, store); break;
+    case 2: matrix_kernel<2, false, Store><<<dim3(gr, pl.gy), 256, 0, s>>>(x, rows, rest, store); break;
+    case 1: matrix_kernel<1, false, Store><<<dim3(gr, pl.gy), 256, 0, s>>>(x, rows, rest, store); break;
+    default: break;
+    }
 }
 
 }  // namespace strix::core::f16_dense_tall

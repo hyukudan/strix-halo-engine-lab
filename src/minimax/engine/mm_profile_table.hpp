@@ -25,6 +25,10 @@ inline constexpr strix::fast_profile::Member kFastMembers[] = {
 };
 inline constexpr strix::fast_profile::Bundle kFastBundle{"STRIX_MM_FAST_PREFILL", "mm-fast-pf-v1", kFastMembers};
 inline constexpr const char* kMsaFlashLayers = "40-59";  // passes the FAST gate on EXL3 at 8K and 32K; 30-59 8K only
+// FAST mm-pf-router-wmma-v1 (STRIX_MM_PF_ROUTER_WMMA=1, opt-in, not a bundle member until its gate passes): the prefill
+// router product of the MoE layers in STRIX_MM_PF_ROUTER_WMMA_LAYERS on the shared FP16 WMMA core. The default set is
+// the flash set: a change in a shallower layer alters every later selection (the onset rule of the MSA gate).
+inline constexpr const char* kRouterWmmaLayers = "40-59";
 inline constexpr unsigned kMsaLayers = 60;
 
 // Named one-term policies (canonical layer ranges -> policy id), unchanged FAST gate (KL <= 0.02, top-1 >= 93 %,
@@ -52,13 +56,18 @@ static_assert(msa_flash_policy(kMsaFlashLayers) != nullptr &&
               "the bundle member's policy id names the bundle's layer set");
 
 // Bundle selection is requested provenance; only effective members enter agreement.
-inline constexpr std::array<strix::profile::Lever, 2> profile_table{{
+inline constexpr std::array<strix::profile::Lever, 4> profile_table{{
     // Prefill only: MSA attention of windows > 8 rows; selection, block lists and K/V caches unchanged.
     {"msa_flash", "STRIX_MM_PF_MSA_FLASH", "", {"", "", ""}, "0", strix::profile::Kind::bit_changing,
      {true, false, true}, {true, true, true}, "", "0",
      "msa-flash-bf16-l40-v1 (EXL3 gate PASS 8K KL 0.0012, 32K KL 0.0029); 2 = two-term operands", false, {}, true},
     {"msa_flash_layers", "STRIX_MM_PF_MSA_FLASH_LAYERS", "", {"", "", ""}, kMsaFlashLayers, strix::profile::Kind::bit_changing,
      {true, false, true}, {true, true, true}, "", "", "FAST MSA flash layer set (read only while msa_flash is on)", false, {}, true},
+    // Prefill only: router product of the listed MoE layers on the FP16 WMMA core; sigmoid, bias and selection unchanged.
+    {"router_wmma", "STRIX_MM_PF_ROUTER_WMMA", "", {"", "", ""}, "0", strix::profile::Kind::bit_changing,
+     {true, false, true}, {true, true, true}, "", "0", "mm-pf-router-wmma-v1 (opt-in; quality gate pending)", false, {}, true},
+    {"router_wmma_layers", "STRIX_MM_PF_ROUTER_WMMA_LAYERS", "", {"", "", ""}, kRouterWmmaLayers, strix::profile::Kind::bit_changing,
+     {true, false, true}, {true, true, true}, "", "", "FAST router layer set (read only while router_wmma is on)", false, {}, true},
 }};
 
 }  // namespace strix::minimax::defaults

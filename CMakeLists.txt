@@ -5142,6 +5142,10 @@ if(STRIX_FAMILY_MINIMAX)
             target_link_libraries(strix-hip-minimax-moe-tests PRIVATE strix_minimax_msa_hip)
             add_test(NAME strix-hip-minimax-moe-tests COMMAND strix-hip-minimax-moe-tests)
             list(APPEND strix_minimax_msa_hip_targets strix-hip-minimax-moe-tests)
+            add_executable(strix-hip-mm-router-wmma-tests tests/hip_mm_router_wmma_tests.hip)  # FAST mm-pf-router-wmma-v1: forms, fallback, drift, timing
+            target_link_libraries(strix-hip-mm-router-wmma-tests PRIVATE strix_minimax_msa_hip)
+            add_test(NAME strix-hip-mm-router-wmma-tests COMMAND strix-hip-mm-router-wmma-tests)
+            list(APPEND strix_minimax_msa_hip_targets strix-hip-mm-router-wmma-tests)
             add_executable(strix-hip-mm-fp32id-tests tests/hip_mm_fp32_identity_tests.hip)
             target_link_libraries(strix-hip-mm-fp32id-tests PRIVATE strix_minimax_moe_opt_hip)
             target_compile_options(strix-hip-mm-fp32id-tests PRIVATE -ffp-contract=off)
@@ -5458,6 +5462,9 @@ if(STRIX_FAMILY_GLM5)
             add_executable(strix-hip-glm5-pf-kda-wmma-tests tests/hip_glm_pf_kda_wmma_tests.hip)  # FAST glm-pf-kda-wmma-v1 contract + drift gate + timing
             target_link_libraries(strix-hip-glm5-pf-kda-wmma-tests PRIVATE strix_glm5_engine)
             list(APPEND strix_glm5_hip_targets strix-hip-glm5-pf-kda-wmma-tests)
+            add_executable(strix-hip-glm5-pf-router-wmma-tests tests/hip_glm_pf_router_wmma_tests.hip)  # FAST glm-pf-router-wmma-v1: forms, fallback, drift, timing
+            target_link_libraries(strix-hip-glm5-pf-router-wmma-tests PRIVATE strix_glm5_engine)
+            list(APPEND strix_glm5_hip_targets strix-hip-glm5-pf-router-wmma-tests)
             add_executable(strix-hip-fma-rows-tests tests/hip_fma_rows_tests.hip)  # shared exact FMA-rows core: bitwise gate + timing
             target_link_libraries(strix-hip-fma-rows-tests PRIVATE strix_glm5_engine)
             list(APPEND strix_glm5_hip_targets strix-hip-fma-rows-tests)

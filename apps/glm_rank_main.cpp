@@ -385,6 +385,10 @@ int main(int argc, char** argv) {
             throw std::invalid_argument("the FAST KDA projections (STRIX_GLM_PF_KDA_WMMA, default with STRIX_GLM_PF_WMMA=1) with --world 2 "
                                         "need the startup agreement (--decode N, --tf or --pf-ttft, comm exchange) so both ranks "
                                         "are checked to run the same prefill identity");
+        if (opt.world == 2 && !startup_handshake && strix::glm::pf::router_wmma::enabled())
+            throw std::invalid_argument("the FAST prefill router (STRIX_GLM_PF_ROUTER_WMMA=1) with --world 2 needs the startup agreement "
+                                        "(--decode N, --tf or --pf-ttft, comm exchange) so both ranks are checked to run the same "
+                                        "prefill identity");
         if (opt.world == 2 && !startup_handshake && strix::glm::pf::wmma_x::enabled())
             throw std::invalid_argument("STRIX_GLM_PF_WMMA=1 with --world 2 needs the startup agreement (--decode N, --tf or --pf-ttft, "
                                         "comm exchange) so both ranks are checked to run the same prefill identity");
@@ -432,7 +436,8 @@ int main(int argc, char** argv) {
                 (eng.model_fast_i4() ? rd::kFastI4Config : 0U) |                 // and the model format (also in the load vote)
                 (strix::glm::pf::attn_wmma::enabled() ? rd::kPfAttnWmmaConfig : 0U) |
                 (strix::glm::pf::kda_wmma::enabled() ? rd::kPfKdaWmmaConfig : 0U) |
-                (idx_wmma << rd::kIdxWmmaShift);                                   // FAST indexer identity, ditto
+                (strix::glm::pf::router_wmma::enabled() ? rd::kPfRouterWmmaConfig : 0U) |
+                (idx_wmma << rd::kIdxWmmaShift);                                  // FAST indexer identity, ditto
             const auto result = rd::startup_agreement(
                 {eligible ? 1U : 0U, packed, opt.max_rows, decode_n,
                  static_cast<std::uint32_t>(opt.capacity), static_cast<std::uint32_t>(opt.capacity >> 32), opt.slots, prompt_hash},
@@ -1127,6 +1132,10 @@ int main(int argc, char** argv) {
                 if (const auto kc = strix::glm::pf::kda_wmma::calls.exchange(0); kc != 0)
                     std::printf("rank %u prefill identity glm-pf-kda-wmma-v1 FAST (KDA plain-weight projections on the dense "
                                 "FP16 WMMA core, calls %llu)\n", opt.rank, static_cast<unsigned long long>(kc));
+                if (const auto rc = strix::glm::pf::router_wmma::calls.exchange(0); rc != 0)
+                    std::printf("rank %u prefill identity glm-pf-router-wmma-v1 FAST (router product on the dense FP16 WMMA "
+                                "core, form %s, calls %llu)\n", opt.rank, strix::glm::pf::router_wmma::form_used.load(),
+                                static_cast<unsigned long long>(rc));
             }
             if (!logits_out.empty()) {
                 std::vector<float> lg(eng.vocab_slice());
