@@ -3,7 +3,7 @@
 // __fdiv_rn/__fsqrt_rn) with the operand order of the gfx1151 ISA (disassembly of hip_ple_launcher);
 // rsqrtf/expf are the gfx1151 emulations of amd_math.cuh.
 #include "strix/cuda/qwen_plemtp.hpp"
-#include "../../core/mma_q4_tile.cuh"
+#include "../../core/mma_tile.cuh"
 
 #include <cuda_fp16.h>
 
@@ -591,11 +591,11 @@ __global__ __launch_bounds__(256) void mtp_fused_projection_kernel(const float* 
     }
 }
 
-// 3b. FAST form (Config::forms.mtp_mma): the same projection on FP16 tensor cores (core/mma_q4_tile.cuh), FP32 accumulation,
+// 3b. FAST form (Config::forms.mtp_mma): the same projection on FP16 tensor cores (core/mma_tile.cuh), FP32 accumulation,
 // per-32-K Q4 scale epilogue. Streams: s = 0 is the embedding half (x[0:2560] against weight blocks 0..79), s = 1..4 the four
 // HC streams (x[2560 s : +2560] against weight blocks 80..159, the same weights). CTA 128 rows x 128 outputs; the embedding
 // accumulator stays in registers while the four HC streams run, the epilogue is the exact kernel's rounding chain.
-using MtpTile = strix::cuda::core::mma_q4::Tile<8>;
+using MtpTile = strix::cuda::core::mma::Tile<8>;
 __global__ __launch_bounds__(256) void mtp_fused_projection_mma_kernel(const float* normalized, const std::uint8_t* eh_q4,
     std::uint32_t rows, std::uint16_t* fused, MtpRounding rd) {
     __shared__ MtpTile::Smem sm;
