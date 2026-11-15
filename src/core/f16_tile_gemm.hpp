@@ -35,6 +35,9 @@ using Half16 = _Float16 __attribute__((ext_vector_type(16)));
 using Float8 = float __attribute__((ext_vector_type(8)));
 using Float4 = float __attribute__((ext_vector_type(4)));
 using U4 = std::uint32_t __attribute__((ext_vector_type(4)));
+// A fragment stays 8 dwords (2 x ds_load_b128) and is bit-cast to Half16 only at the WMMA: a <16 x half> value makes
+// gfx11 true16 codegen split and re-pack every dword (v_lshrrev_b32 + v_mov_b16, 192 VALU per stage measured).
+typedef std::uint32_t Frag __attribute__((ext_vector_type(8), aligned(16)));
 
 inline constexpr unsigned kBM = 128, kBN = 128, kBK = 32, kThreads = 256;
 inline constexpr unsigned kPitch = kBK / 2U + 4U;  // dwords per LDS row: 16 data + 4 pad (80 bytes)
@@ -51,6 +54,7 @@ struct Args {
     float* y;
     std::size_t y_row, y_batch;
     unsigned rows, K, N, batches;
+    unsigned order = 0;  // grid: 0 = (column tile, row block, batch); 1 = (column tile, batch, row block)
 };
 
 struct RawStore {
@@ -69,16 +73,13 @@ static_assert(sizeof(Storage) == 20480);
 
 inline bool fits(const Args& p) {
     return p.rows >= 1U && p.K % kBK == 0U && p.N % kBN == 0U && p.batches >= 1U && p.batches <= 65535U &&
-           (p.rows + kBM - 1U) / kBM <= 65535U && p.a_row % 4U == 0U && p.a_batch % 4U == 0U && p.w_ld % 8U == 0U &&
+           (p.rows + kBM - 1U) / kBM <= 65535U && p.order <= 1U && p.a_row % 4U == 0U && p.a_batch % 4U == 0U && p.w_ld % 8U == 0U &&
            p.w_batch % 8U == 0U && reinterpret_cast<std::uintptr_t>(p.a) % 16U == 0U &&
            reinterpret_cast<std::uintptr_t>(p.w) % 16U == 0U;
 }
 
 namespace detail {
-__device__ __forceinline__ Half16 fragment(const std::uint32_t* p) {
-    struct { U4 l, h; } v{*reinterpret_cast<const U4*>(p), *reinterpret_cast<const U4*>(p + 4)};
-    return __builtin_bit_cast(Half16, v);
-}
+__device__ __forceinline__ Frag fragment(const std::uint32_t* p) { return *reinterpret_cast<const Frag*>(p); }
 __device__ __forceinline__ std::uint32_t pack(float lo, float hi) {
     const _Float16 l = static_cast<_Float16>(lo), h = static_cast<_Float16>(hi);
     return static_cast<std::uint32_t>(__builtin_bit_cast(std::uint16_t, l)) |
@@ -89,7 +90,8 @@ __device__ __forceinline__ std::uint32_t pack(float lo, float hi) {
 template <Layout L, class Store>
 __device__ __forceinline__ void core(const Args& p, Storage& lds, const Store& store) {
     const unsigned tid = threadIdx.x, lane = tid & 31U, wave = tid >> 5U, wm = wave & 3U, wn = wave >> 2U;
-    const unsigned n0 = blockIdx.x * kBN, r0 = blockIdx.y * kBM, b = blockIdx.z, c = lane & 15U;
+    const unsigned n0 = blockIdx.x * kBN, r0 = (p.order ? blockIdx.z : blockIdx.y) * kBM, b = p.order ? blockIdx.y : blockIdx.z;
+    const unsigned c = lane & 15U;
     // A stager: row tid / 2, k half (tid % 2) * 16 of the stage. Rows past `rows` read row 0 (never stored).
     const unsigned ar = tid >> 1U, ak = (tid & 1U) * 16U;
     const float* ap = p.a + b * p.a_batch + static_cast<std::size_t>(r0 + ar < p.rows ? r0 + ar : 0U) * p.a_row + ak;
@@ -138,7 +140,7 @@ __device__ __forceinline__ void core(const Args& p, Storage& lds, const Store& s
         if (k0 + kBK < p.K) load(k0 + kBK);  // in flight across this stage's WMMAs
 #pragma unroll
         for (unsigned u = 0; u < 2U; ++u) {
-            Half16 fa[2], fb[4];
+            Frag fa[2], fb[4];
 #pragma unroll
             for (unsigned m = 0; m < 2U; ++m) fa[m] = detail::fragment(&lds.a[32U * wm + 16U * m + c][8U * u]);
 #pragma unroll
@@ -146,7 +148,8 @@ __device__ __forceinline__ void core(const Args& p, Storage& lds, const Store& s
 #pragma unroll
             for (unsigned m = 0; m < 2U; ++m)
 #pragma unroll
-                for (unsigned t = 0; t < 4U; ++t) acc[m][t] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(fa[m], fb[t], acc[m][t]);
+                for (unsigned t = 0; t < 4U; ++t) acc[m][t] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(
+                    __builtin_bit_cast(Half16, fa[m]), __builtin_bit_cast(Half16, fb[t]), acc[m][t]);
         }
     }
     // acc[m][t][j] -> row 32 wm + 16 m + 2 j + lane / 16, column 64 wn + 16 t + lane % 16.
@@ -168,7 +171,10 @@ __global__ __launch_bounds__(kThreads) void gemm_kernel(Args p, Store store) {
     core<L>(p, lds, store);
 }
 
-inline dim3 grid(const Args& p) { return dim3(p.N / kBN, (p.rows + kBM - 1U) / kBM, p.batches); }
+inline dim3 grid(const Args& p) {
+    const unsigned rb = (p.rows + kBM - 1U) / kBM;
+    return p.order ? dim3(p.N / kBN, p.batches, rb) : dim3(p.N / kBN, rb, p.batches);
+}
 
 template <Layout L> inline void gemm(const Args& p, hipStream_t s) {
     gemm_kernel<L, RawStore><<<grid(p), kThreads, 0, s>>>(p, RawStore{p.y, p.y_row, p.y_batch});
