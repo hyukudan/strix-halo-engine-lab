@@ -68,7 +68,7 @@ double share(const Run& r,std::uint32_t rows) {
 } // namespace
 
 int main() {
-    for (const std::size_t count : {0U, 1U, 2U, 8U, 9U, 16U, 19U}) {
+    for (const std::size_t count : {0U, 1U, 2U, 6U, 7U, 8U, 9U, 16U, 19U, 24U}) {
         for (std::size_t round = 0; round < count + 2U; ++round) {
             std::vector<unsigned> seen(count, 0U);
             strix::MtpBatchWindowController controller(count);
@@ -83,6 +83,32 @@ int main() {
                 expect(plan.size() == group.size(), "controller accepts partition with stable global slot IDs");
             }
             expect(std::all_of(seen.begin(), seen.end(), [](unsigned n) { return n == 1U; }), "round covers every live slot once");
+        }
+        // Budget rule above the lane bound: fixed two rows per request, so one group (one target forward, one
+        // weight read) takes up to 16 requests = 32 rows; at or below the bound, and for searching rules, 8.
+        for (std::size_t round = 0; round < count + 2U; ++round) {
+            strix::MtpBatchWindowController budget(count, strix::MtpBatchWindowController::parse_rule("budget"));
+            strix::MtpBatchWindowController search(count);
+            const auto cap = budget.max_group_lanes(count, round);
+            expect(search.max_group_lanes(count, round) == 8U, "searching rule keeps eight requests per group");
+            expect(cap == (count > strix::mtp_serve_row_budget_max_lanes() ? strix::kMtpJointGroupLanesMax : 8U),
+                "budget rule groups up to 16 requests above the lane bound");
+            std::vector<unsigned> seen(count, 0U);
+            const auto groups = strix::mtp_cohort_partition(count, round, cap);
+            expect(groups.size() == (count + cap - 1U) / cap, "fewest groups for the cap");
+            for (const auto& group : groups) {
+                expect(!group.empty() && group.size() <= cap, "group within the cap");
+                std::vector<strix::MtpBatchWindowController::Request> requests;
+                for (const auto slot : group) {
+                    ++seen.at(slot);
+                    requests.push_back({static_cast<std::uint32_t>(slot), 2U, {}});
+                }
+                const auto plan = budget.plan(requests, std::max<std::uint32_t>(32U, 2U * static_cast<std::uint32_t>(group.size())));
+                expect(plan.size() == group.size(), "budget plan covers the group");
+                if (group.size() > strix::mtp_serve_row_budget_max_lanes())
+                    expect(std::all_of(plan.begin(), plan.end(), [](std::uint32_t r) { return r == 2U; }), "fixed two rows above the bound");
+            }
+            expect(std::all_of(seen.begin(), seen.end(), [](unsigned n) { return n == 1U; }), "wide round covers every live slot once");
         }
     }
 

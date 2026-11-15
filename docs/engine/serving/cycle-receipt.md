@@ -9,12 +9,15 @@ extra clock and prints no extra line.
 One line per decode round on the server log:
 
 ```
-serve cycle seq=N lanes=L rows=R useful=U pad=P emitted=E draft_rows=a/b/c/d/e/f/g/h draft_ms=.. verify_ms=.. host_ms=.. ms=.. prompt=0|1 begin_ns=.. end_ns=..
+serve cycle seq=N lanes=L rows=R useful=U pad=P emitted=E draft_rows=a/b/c/d/e/f/g/h draft_ms=.. verify_ms=.. host_ms=.. ms=.. prompt=0|1 begin_ns=.. end_ns=.. admitted=A forwards=F solo=s/n/w/p/a/o
 ```
 
 | Field | Meaning |
 |---|---|
 | `lanes` | Requests that ran target rows in the round. |
+| `admitted` | Requests holding a slot when the round ran (decoding or still reading their prompt). |
+| `forwards` | Target forwards the round ran: one per shared window or group plus one per lane alone. Each reads the shared weights once, so weight bytes = `forwards` x the model's bytes per forward (0 = not reported by the engine). |
+| `solo` | Lanes that verified in a forward of their own, by reason: `single` (only decoding lane), `no_rows` (no window rows, e.g. no draft), `wide`, `padding`, `alone` (only lane of its group or chunk), `no_owner`. |
 | `rows` | Physical verify rows: a lane's rows of a shared window, its own window owner, or the serial rows it consumed. |
 | `useful` / `pad` | Rows that carried the pending row or a drafted candidate, and the rest. `useful + pad = rows`. |
 | `emitted` | Tokens committed to the lanes by the round. |

@@ -193,6 +193,16 @@ std::uint32_t mtp_serve_row_budget_max_lanes() noexcept {
         try {return envcfg::number<std::uint32_t>("STRIX_SERVE_ROW_BUDGET_MAX_LANES",6U,0U,8U);} catch(...) {return 6U;}}();
     return lanes;
 }
+std::uint32_t mtp_serve_joint_group_lanes(std::uint64_t cycle) noexcept {
+    // 0 = "ab" (alternate by cycle), else the lane count.
+    static const std::uint32_t lanes=[]()->std::uint32_t{
+        try {
+            const char* raw=envcfg::text("STRIX_SERVE_JOINT_GROUP_LANES");
+            if(raw && std::string_view(raw)=="ab") return 0U;
+            return envcfg::number<std::uint32_t>("STRIX_SERVE_JOINT_GROUP_LANES",kMtpJointGroupLanesMax,8U,kMtpJointGroupLanesMax);
+        } catch(...) {return kMtpJointGroupLanesMax;}}();
+    return lanes?lanes:(cycle&1U)?8U:kMtpJointGroupLanesMax;
+}
 bool mtp_serve_row_budget_enabled() noexcept {
     static const bool on=envcfg::flag("STRIX_SERVE_ROW_BUDGET",true,EnvFlagMatch::exact);
     return on;
@@ -321,8 +331,10 @@ MtpBatchWindowController::BudgetCost MtpBatchWindowController::budget_cost() con
 }
 std::vector<std::uint32_t> MtpBatchWindowController::budget_rows(std::span<const Request> q,std::uint32_t budget,bool prior,
     PlanInfo* info) const {
-    if(q.empty() || q.size()>8U || budget<2U*q.size())
-        throw std::invalid_argument("joint MTP windows require 1..8 requests and two physical rows each");
+    // Above the lane bound the plan is fixed (no search), so a group may hold up to kMtpJointGroupLanesMax requests.
+    const std::size_t most=q.size()>mtp_serve_row_budget_max_lanes()?kMtpJointGroupLanesMax:8U;
+    if(q.empty() || q.size()>most || budget<2U*q.size())
+        throw std::invalid_argument("joint MTP windows require 1..8 requests (16 above the lane bound) and two physical rows each");
     for(const auto& r:q) if(r.limit!=2U && r.limit!=4U && r.limit!=8U)
         throw std::invalid_argument("joint MTP window limit must be an admitted owner");
     // Regime selection: above the lane bound the measured cycle is faster with the fixed table's two rows per
