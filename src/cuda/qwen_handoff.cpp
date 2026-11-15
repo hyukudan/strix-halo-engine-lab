@@ -2,6 +2,7 @@
 
 #include "qwen_http.hpp"
 #include "strix/model_content_hash.hpp"
+#include "strix/recurrent_state_policy.hpp"
 #include "strix/serve/json.hpp"
 
 #include <algorithm>
@@ -51,7 +52,9 @@ bool is_identity(const std::string& codec) { return codec.empty() || codec == "i
 }  // namespace
 
 std::uint32_t element_width(const std::string& component) {
-    if (component == "recurrent_matrix" || component == "ngram_history" || component == "position_history") return 4;
+    if (component == "recurrent_matrix")  // the stored element of the active recurrent-state contract
+        return static_cast<std::uint32_t>(recurrent_state_element_bytes(recurrent_state_policy().type));
+    if (component == "ngram_history" || component == "position_history") return 4;
     return 2;
 }
 
@@ -174,6 +177,10 @@ const Layout& Sender::layout() {
     if (const auto* c = j.find("max_context")) l.max_context = u64_of(c, "max_context");
     if (const auto* c = j.find("codecs"); c && c->is_array())
         for (const auto& name : c->as_array()) if (name.is_string()) l.codecs.push_back(name.as_string());
+    if (const auto type = recurrent_state_policy().type; type != RecurrentStateType::f32)
+        for (const auto& f : l.fixed)  // the receiver's matrix must be stored under the same contract (no silent conversion)
+            if (f.name == "recurrent_matrix" && f.bytes != recurrent_state_bytes(36ULL * 48 * 128 * 128, type))
+                throw std::invalid_argument(recurrent_state_route_refusal(type, false, "node handoff (peer recurrent_matrix size is not the typed size)"));
     for (const auto& r : l.rows) impl_->row_width.push_back(element_width(r.name));
     for (const auto& f : l.fixed) impl_->fixed_width.push_back(element_width(f.name));
     impl_->have_layout = true;
