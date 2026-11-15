@@ -156,20 +156,30 @@ template <unsigned L> void tree_case(std::mt19937& g) {
     tree_kernel<L, true><<<kCtas, L>>>(din, b);
     check(hipDeviceSynchronize(), "tree kernels");
     const auto ha = down(a, n), hb = down(b, n);
-    unsigned bad = 0U, nan = 0U, payload = 0U;  // payload: both NaN, bits differ (operand order of a NaN + NaN add)
+    // payload: both NaN, bits differ. Reported (slot, kind, first words) but not a failure; any other difference fails.
+    unsigned bad = 0U, nan = 0U, payload = 0U, shown = 0U, by_slot[5] = {}, by_kind[11] = {};
+    const std::size_t per = 2U * L + 3U;
     for (std::size_t i = 0; i < n; ++i) {
         std::uint32_t ua, ub;
         std::memcpy(&ua, &ha[i], 4);
         std::memcpy(&ub, &hb[i], 4);
-        bad += ua != ub;
-        payload += ua != ub && std::isnan(ha[i]) && std::isnan(hb[i]);
+        const bool both_nan = std::isnan(ha[i]) && std::isnan(hb[i]);
+        bad += ua != ub && !both_nan;
         nan += std::isnan(ha[i]);
+        if (ua == ub || !both_nan) continue;
+        ++payload;
+        const std::size_t c = i / per, k = i % per;
+        const unsigned slot = k < L ? 0U : k < 2U * L ? 1U : static_cast<unsigned>(k - 2U * L) + 2U;
+        ++by_slot[slot];
+        ++by_kind[c % 11U];
+        if (shown++ < 3U) std::printf("  L%u payload cta %zu kind %zu slot %u: old %08x new %08x\n", L, c, c % 11U, slot, ua, ub);
     }
     char what[96];
-    std::snprintf(what, sizeof what, "tree L%u bit-identical to the LDS loop", L);
+    std::snprintf(what, sizeof what, "tree L%u bit-identical to the LDS loop (non-NaN bits, NaN positions)", L);
     expect(bad == 0U, what);
-    std::printf("tree L%-4u %u CTAs x 11 kinds: %zu words, %u differ (%u NaN payload only), %u NaN results compared by bits\n", L, kCtas,
-                n, bad, payload, nan);
+    std::printf("tree L%-4u %u CTAs x 11 kinds: %zu words, %u differ beyond NaN payload, %u NaN-payload-only (slots b1 b2 r1 pa pb %u %u %u %u %u;"
+                " kinds 4/5/6/9 %u %u %u %u), %u NaN results\n", L, kCtas, n, bad, payload, by_slot[0], by_slot[1], by_slot[2], by_slot[3],
+                by_slot[4], by_kind[4], by_kind[5], by_kind[6], by_kind[9], nan);
     check(hipFree(din), "free");
     check(hipFree(a), "free");
     check(hipFree(b), "free");
