@@ -57,6 +57,10 @@ IdentityFields identity_fields(const qwen_prefill::Config& c, std::uint32_t bloc
         put("target.storage", std::string(id.storage));
         put("target.pair", std::to_string(id.hash));
     }
+    // FAST prefill forms: only when on, so every OFF key keeps its bytes. A FAST prefix is never served to an exact request.
+    if (c.forms.hc_mma) put("form.hc_mma", "qwen-cuda-hc-f16mma-v1");
+    if (c.forms.mtp_mma) put("form.mtp_mma", "qwen-cuda-mtp-f16mma-v1");
+    if (c.forms.qsa_mma) put("form.qsa_mma", "qwen-cuda-qsa-f16mma-v1");
     model("model", c.model_gguf);
     model("mtp", c.mtp_sidecar_gguf);
     file("draft_vocab", c.draft_vocab);

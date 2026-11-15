@@ -324,7 +324,7 @@ static void gpu_projection_synthetic() {
     for (const auto& cs : kCases) {
         std::vector<std::vector<std::uint8_t>> w;
         for (std::size_t m = 0; m < cs.outs.size(); ++m) w.push_back(make_q8(cs.outs[m], cs.width, 1000U * ci + m));
-        for (std::uint32_t rows : {1U, 5U, 64U, 130U, 256U, 1000U, 4096U})
+        for (std::uint32_t rows : {1U, 5U, 16U, 17U, 64U, 130U, 256U, 1000U, 1024U, 4096U})
             total += run_projection(cs, w, rows, 77U * rows + ci, true, 136U);
         ++ci;
     }

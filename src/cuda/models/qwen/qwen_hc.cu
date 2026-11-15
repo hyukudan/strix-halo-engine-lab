@@ -29,6 +29,7 @@
 //       __shfl_down tree adds (+146..).
 #include "strix/env_flags.hpp"
 #include "strix/cuda/qwen_hc.hpp"
+#include "../../core/mma_tile.cuh"
 
 #include <cuda_fp16.h>
 
@@ -359,6 +360,335 @@ __global__ __launch_bounds__(128) void hc_output_kernel(const float* __restrict_
 #pragma unroll
         for (unsigned s = 0; s < kStreams; ++s) mixed = __fmaf_rn(n[s * kHidden], amd_sigmoid(t, g[s][r]), mixed);
         output[static_cast<std::size_t>(row0 + r) * kHidden + f] = float_to_bf16(__fmul_rn(mixed, 0.25F));
+    }
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// FAST forms (Config::forms.hc_mma): the [P] and [O] GEMMs on FP16 tensor cores (core/mma_tile.cuh: perm8 K order, int8 codes
+// exact in FP16, FP32 accumulation, per-32-K FP32 scale epilogue). Activations x = normalized values (|x| <= sqrt(2560) * |norm
+// weight|) and low = s * sigmoid(s) are far inside the FP16 range, so FP16 (not BF16) is used for the 10-bit mantissa. The
+// FP32 inject weights are rounded to FP16 (the Q8 weights are not rounded). Everything that is not the GEMM (the /4, sigmoid,
+// mix, 0.25, bf16) is the exact kernels' FP32 code.
+namespace cm = strix::cuda::core::mma;
+namespace cp = strix::cuda::core::ptx;
+
+// FP32 sigmoid for the FAST form: the exact kernels emulate the HIP expf/division bit for bit (amd_sigmoid, ~10x the
+// instructions); this is 1 / (1 + expf(-x)) with CUDA's FP32 expf (~1-2 ulp) and a correctly rounded reciprocal.
+__device__ __forceinline__ float fast_sigmoid(float x) { return __frcp_rn(__fadd_rn(1.0F, expf(-x))); }
+
+constexpr unsigned kMmaPitch = 64U + cm::kPadHalves;   // A smem row pitch (halves), chunk = 64 K = 2 scale blocks
+constexpr unsigned kMmaCodePitch = 80U;                // bytes per weight row in smem (64 B + 16 pad)
+constexpr unsigned kMmaOutRows = 64U;                  // rows per CTA of the output kernel (4 m16 tiles)
+
+// MT m16 tiles (16 * MT rows) x (NW * 40) low outputs per CTA; NW warps of 5 n8 tiles each. gridDim.y = 8 / NW splits of the
+// 320 outputs (x is read once per split). Warps also own the inject n tile (4 outputs) of the m tiles w, w + NW, ... (split 0).
+template <unsigned MT, unsigned NW>
+struct ProjCfg {
+    static constexpr unsigned kRowsCta = 16U * MT, kThreads = NW * 32U, kOutCta = NW * 40U;
+    static constexpr unsigned kSmem = 2U * kRowsCta * kMmaPitch * 2U + 2U * kOutCta * kMmaCodePitch + 2U * kOutCta * 8U;
+};
+
+template <unsigned MT, unsigned NW>
+__global__ __launch_bounds__(NW * 32U, 1) void hc_projection_mma_kernel(const float* x_rows, std::uint32_t rows,
+    const std::int8_t* __restrict__ down_codes, const float* __restrict__ down_scales, const float* __restrict__ inject,
+    float* low_rows, float* __restrict__ injection, am::Tables t_) {
+    using Cfg = ProjCfg<MT, NW>;
+    constexpr unsigned kT = Cfg::kThreads, kBM = Cfg::kRowsCta, kNR = Cfg::kOutCta;
+    constexpr unsigned kXI = (kBM * 16U + kT - 1U) / kT, kSI = (kNR + kT - 1U) / kT, kIK = (MT + NW - 1U) / NW;
+    extern __shared__ __align__(16) unsigned char smem_raw[];
+    __half* a_s = reinterpret_cast<__half*>(smem_raw);                                        // [2][BM][72]
+    unsigned char* c_s = smem_raw + 2U * kBM * kMmaPitch * 2U;                                // [2][NR][80]
+    float2* s_s = reinterpret_cast<float2*>(c_s + 2U * kNR * kMmaCodePitch);                  // [2][NR]
+    const unsigned tid = threadIdx.x, warp = tid >> 5U, lane = tid & 31U, g = lane >> 2U, t = lane & 3U;
+    const unsigned row0 = blockIdx.x * kBM, nbase = blockIdx.y * kNR;
+    constexpr unsigned kChunks = kWide / 64U;
+
+    float4 xr[kXI];
+    float2 sr[kSI];
+    const auto load_x = [&](unsigned c) {
+#pragma unroll
+        for (unsigned i = 0; i < kXI; ++i) {
+            const unsigned e = tid + kT * i, r = e >> 4U, m4 = e & 15U;
+            xr[i] = make_float4(0.0F, 0.0F, 0.0F, 0.0F);
+            if (e < kBM * 16U && row0 + r < rows)
+                xr[i] = *reinterpret_cast<const float4*>(x_rows + static_cast<std::size_t>(row0 + r) * kNormalizedPitch + c * 64U + m4 * 4U);
+        }
+#pragma unroll
+        for (unsigned i = 0; i < kSI; ++i) {
+            const unsigned o = tid + kT * i;
+            if (o < kNR) sr[i] = *reinterpret_cast<const float2*>(down_scales + static_cast<std::size_t>(nbase + o) * (kWide / 32U) + c * 2U);
+        }
+    };
+    const auto store_x = [&](unsigned stage) {
+#pragma unroll
+        for (unsigned i = 0; i < kXI; ++i) {
+            const unsigned e = tid + kT * i, r = e >> 4U, m4 = e & 15U;
+            if (e < kBM * 16U) cm::stage_k4(a_s + (stage * kBM + r) * kMmaPitch + (m4 >> 3U) * 32U, m4 & 7U, xr[i]);
+        }
+#pragma unroll
+        for (unsigned i = 0; i < kSI; ++i) {
+            const unsigned o = tid + kT * i;
+            if (o < kNR) s_s[stage * kNR + o] = sr[i];
+        }
+    };
+    const auto issue_codes = [&](unsigned c, unsigned stage) {
+#pragma unroll
+        for (unsigned e = tid; e < kNR * 4U; e += kT) {
+            const unsigned n = e >> 2U, q = e & 3U;
+            cp::cp_async16(c_s + stage * kNR * kMmaCodePitch + n * kMmaCodePitch + q * 16U,
+                down_codes + static_cast<std::size_t>(nbase + n) * kWide + c * 64U + q * 16U);
+        }
+        cp::cp_async_commit();
+    };
+
+    float acc[5][MT][4];  // [n tile][m tile][frag]
+    float ai[kIK][4];
+#pragma unroll
+    for (unsigned m = 0; m < MT; ++m)
+#pragma unroll
+        for (unsigned n = 0; n < 5U; ++n)
+#pragma unroll
+            for (unsigned i = 0; i < 4U; ++i) acc[n][m][i] = 0.0F;
+#pragma unroll
+    for (unsigned k = 0; k < kIK; ++k)
+#pragma unroll
+        for (unsigned i = 0; i < 4U; ++i) ai[k][i] = 0.0F;
+    const bool inj_on = inject != nullptr && blockIdx.y == 0;
+    float iw[2][8];  // inject weights (FP32) of the next chunk's 2 blocks: row g (< 4), k 8t .. 8t+7 of each block
+    const auto load_inj = [&](unsigned c) {
+#pragma unroll
+        for (unsigned b = 0; b < 2U; ++b) {
+            float4 v0 = make_float4(0.0F, 0.0F, 0.0F, 0.0F), v1 = v0;
+            if (g < kStreams) {
+                const float* p = inject + static_cast<std::size_t>(g) * kWide + c * 64U + b * 32U + 8U * t;
+                v0 = *reinterpret_cast<const float4*>(p); v1 = *reinterpret_cast<const float4*>(p + 4);
+            }
+            iw[b][0] = v0.x; iw[b][1] = v0.y; iw[b][2] = v0.z; iw[b][3] = v0.w;
+            iw[b][4] = v1.x; iw[b][5] = v1.y; iw[b][6] = v1.z; iw[b][7] = v1.w;
+        }
+    };
+
+    load_x(0U);
+    issue_codes(0U, 0U);
+    if (inj_on && warp < MT) load_inj(0U);
+    store_x(0U);
+    cp::cp_async_wait<0>();
+    __syncthreads();
+    for (unsigned c = 0; c < kChunks; ++c) {
+        const unsigned stage = c & 1U;
+        if (c + 1U < kChunks) {
+            issue_codes(c + 1U, stage ^ 1U);
+            load_x(c + 1U);
+        }
+#pragma unroll
+        for (unsigned b = 0; b < 2U; ++b) {
+            unsigned a[MT][2][4];
+#pragma unroll
+            for (unsigned m = 0; m < MT; ++m)
+#pragma unroll
+                for (unsigned j = 0; j < 2U; ++j)
+                    cm::ldsm_a(a[m][j], a_s + (stage * kBM + m * 16U) * kMmaPitch + b * 32U + j * 16U, kMmaPitch, lane);
+#pragma unroll
+            for (unsigned n = 0; n < 5U; ++n) {
+                const unsigned nt = warp * 5U + n;
+                unsigned w[2];
+                const uint2 raw = *reinterpret_cast<const uint2*>(c_s + stage * kNR * kMmaCodePitch +
+                    (nt * 8U + g) * kMmaCodePitch + b * 32U + 8U * t);
+                w[0] = raw.x; w[1] = raw.y;
+                const float2 q0 = s_s[stage * kNR + nt * 8U + 2U * t], q1 = s_s[stage * kNR + nt * 8U + 2U * t + 1U];
+                const float s0 = b ? q0.y : q0.x, s1 = b ? q1.y : q1.x;
+                cm::warp_gemm_k32<MT, cm::Int8Codes>(acc[n], a, w, s0, s1);
+            }
+        }
+        if (inj_on) {
+            float cur[2][8];
+#pragma unroll
+            for (unsigned b = 0; b < 2U; ++b)
+#pragma unroll
+                for (unsigned i = 0; i < 8U; ++i) cur[b][i] = iw[b][i];
+            if (warp < MT && c + 1U < kChunks) load_inj(c + 1U);
+#pragma unroll
+            for (unsigned k = 0; k < kIK; ++k) {
+                const unsigned m = warp + k * NW;
+                if (m < MT) {
+#pragma unroll
+                    for (unsigned b = 0; b < 2U; ++b)
+#pragma unroll
+                        for (unsigned j = 0; j < 2U; ++j) {
+                            unsigned a[4];
+                            cm::ldsm_a(a, a_s + (stage * kBM + m * 16U) * kMmaPitch + b * 32U + j * 16U, kMmaPitch, lane);
+                            __half2 h0 = __floats2half2_rn(cur[b][4 * j], cur[b][4 * j + 1]);
+                            __half2 h1 = __floats2half2_rn(cur[b][4 * j + 2], cur[b][4 * j + 3]);
+                            cp::mma_f16(ai[k], a[0], a[1], a[2], a[3], *reinterpret_cast<unsigned*>(&h0), *reinterpret_cast<unsigned*>(&h1));
+                        }
+                }
+            }
+        }
+        if (c + 1U < kChunks) {
+            store_x(stage ^ 1U);
+            cp::cp_async_wait<0>();
+        }
+        __syncthreads();
+    }
+    // Epilogue (exact kernels' FP32 code): scaled = total / 4, sigmoid.
+    const auto finish = [&](float v0, float v1, unsigned row, unsigned o, bool inj) {
+        if (row >= rows) return;
+        const float s0 = __fdiv_rn(v0, static_cast<float>(kStreams)), s1 = __fdiv_rn(v1, static_cast<float>(kStreams));
+        const float g0 = fast_sigmoid(s0), g1 = fast_sigmoid(s1);
+        if (inj) {
+            if (o < kStreams) {
+                injection[static_cast<std::size_t>(row) * kStreams + o] = __fadd_rn(g0, g0);
+                injection[static_cast<std::size_t>(row) * kStreams + o + 1U] = __fadd_rn(g1, g1);
+            }
+        } else {
+            *reinterpret_cast<float2*>(low_rows + static_cast<std::size_t>(row) * kNormalizedPitch + kWide + o) =
+                make_float2(__fmul_rn(s0, g0), __fmul_rn(s1, g1));
+        }
+    };
+#pragma unroll
+    for (unsigned m = 0; m < MT; ++m)
+#pragma unroll
+        for (unsigned n = 0; n < 5U; ++n) {
+            const unsigned o = nbase + (warp * 5U + n) * 8U + 2U * t;
+            finish(acc[n][m][0], acc[n][m][1], row0 + m * 16U + g, o, false);
+            finish(acc[n][m][2], acc[n][m][3], row0 + m * 16U + g + 8U, o, false);
+        }
+    if (inj_on) {
+#pragma unroll
+        for (unsigned k = 0; k < kIK; ++k) {
+            const unsigned m = warp + k * NW;
+            if (m < MT) {
+                finish(ai[k][0], ai[k][1], row0 + m * 16U + g, 2U * t, true);
+                finish(ai[k][2], ai[k][3], row0 + m * 16U + g + 8U, 2U * t, true);
+            }
+        }
+    }
+}
+
+template <unsigned MT, unsigned NW>
+void launch_projection_mma(const HcMixArgs& a, const am::Tables& tables, cudaStream_t stream) {
+    using Cfg = ProjCfg<MT, NW>;
+    static const bool attr = [] {
+        check(cudaFuncSetAttribute(hc_projection_mma_kernel<MT, NW>, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(Cfg::kSmem)),
+            "mma projection attr");
+        return true;
+    }();
+    (void)attr;
+    hc_projection_mma_kernel<MT, NW><<<dim3((a.rows + Cfg::kRowsCta - 1U) / Cfg::kRowsCta, 8U / NW), Cfg::kThreads, Cfg::kSmem, stream>>>(
+        a.normalized, a.rows, a.packed.down_codes, a.packed.down_scales, a.inject, a.normalized, a.injection, tables);
+}
+// Tile shape per row count: fill the 188 SMs (one wave, no tail) while keeping the weight re-reads (per row tile) low.
+void projection_mma(const HcMixArgs& a, const am::Tables& tables, cudaStream_t stream) {
+    struct Opt { unsigned mt, nw; };
+    static const Opt opts[] = {{4U, 8U}, {3U, 8U}, {2U, 8U}, {4U, 4U}, {2U, 4U}, {1U, 4U}};
+    unsigned best = 0; double best_cost = 1e30;
+    for (unsigned i = 0; i < 6U; ++i) {
+        const double tiles = std::ceil(a.rows / (16.0 * opts[i].mt)) * (8U / opts[i].nw);
+        const double res = opts[i].nw == 8U ? 1.0 : 2.0;  // resident CTAs per SM (smem)
+        const double waves = std::ceil(tiles / (188.0 * res));
+        // time ~ waves x CTA work; CTA work ~ (rows per CTA) x (outputs per CTA) / throughput (+ weight stream per row tile)
+        const double work = (16.0 * opts[i].mt) * (opts[i].nw * 40.0) + 640.0 * (opts[i].nw * 40.0) / 8.0 / opts[i].mt;
+        const double cost = waves * work / res;
+        if (cost < best_cost) { best_cost = cost; best = i; }
+    }
+    switch (best) {
+    case 0: launch_projection_mma<4U, 8U>(a, tables, stream); break;
+    case 1: launch_projection_mma<3U, 8U>(a, tables, stream); break;
+    case 2: launch_projection_mma<2U, 8U>(a, tables, stream); break;
+    case 3: launch_projection_mma<4U, 4U>(a, tables, stream); break;
+    case 4: launch_projection_mma<2U, 4U>(a, tables, stream); break;
+    default: launch_projection_mma<1U, 4U>(a, tables, stream); break;
+    }
+}
+
+// [O] up-projection + mix. CTA = 4 warps x (8 features x 4 streams) per pass, kMmaOutPasses passes over features; A = the
+// CTA's 64 rows of low (K = 320) staged once as FP16.
+constexpr unsigned kMmaOutPasses = 5U, kMmaOutPitch = kRank + cm::kPadHalves;
+constexpr unsigned kMmaOutSmem = kMmaOutRows * kMmaOutPitch * 2U;
+
+__global__ __launch_bounds__(128) void hc_output_mma_kernel(const float* __restrict__ normalized, std::uint32_t rows,
+    const std::uint32_t* __restrict__ up_codes, const float* __restrict__ up_scales, std::uint16_t* __restrict__ output,
+    float* __restrict__ gates, am::Tables t_) {
+    extern __shared__ __align__(16) unsigned char smem_raw[];
+    __half* a_s = reinterpret_cast<__half*>(smem_raw);  // [64][328]
+    const unsigned tid = threadIdx.x, warp = tid >> 5U, lane = tid & 31U, g = lane >> 2U, t = lane & 3U;
+    const unsigned row0 = blockIdx.x * kMmaOutRows;
+    for (unsigned e0 = 0; e0 < kMmaOutRows * (kRank / 4U); e0 += 128U * 8U) {  // 8 loads in flight, then the stores
+        float4 v[8];
+#pragma unroll
+        for (unsigned i = 0; i < 8U; ++i) {
+            const unsigned e = e0 + tid + 128U * i, r = e / (kRank / 4U), m4 = e % (kRank / 4U);
+            v[i] = make_float4(0.0F, 0.0F, 0.0F, 0.0F);
+            if (row0 + r < rows) v[i] = *reinterpret_cast<const float4*>(normalized + static_cast<std::size_t>(row0 + r) * kNormalizedPitch + kWide + m4 * 4U);
+        }
+#pragma unroll
+        for (unsigned i = 0; i < 8U; ++i) {
+            const unsigned e = e0 + tid + 128U * i, r = e / (kRank / 4U), m4 = e % (kRank / 4U);
+            cm::stage_k4(a_s + r * kMmaOutPitch + (m4 >> 3U) * 32U, m4 & 7U, v[i]);
+        }
+    }
+    __syncthreads();
+    for (unsigned pass = 0; pass < kMmaOutPasses; ++pass) {
+        const unsigned f0 = (blockIdx.y * kMmaOutPasses + pass) * 32U + warp * 8U;
+        float acc[kStreams][4][4];  // [stream][m tile][frag]
+#pragma unroll
+        for (unsigned s = 0; s < kStreams; ++s)
+#pragma unroll
+            for (unsigned m = 0; m < 4U; ++m)
+#pragma unroll
+                for (unsigned i = 0; i < 4U; ++i) acc[s][m][i] = 0.0F;
+        unsigned wn[kStreams][2];
+        float2 sn[kStreams];
+        const auto load_b = [&](unsigned blk) {
+#pragma unroll
+            for (unsigned s = 0; s < kStreams; ++s) {
+                wn[s][0] = up_codes[(static_cast<std::size_t>(8U * blk + 2U * t) * kStreams + s) * kHidden + f0 + g];
+                wn[s][1] = up_codes[(static_cast<std::size_t>(8U * blk + 2U * t + 1U) * kStreams + s) * kHidden + f0 + g];
+                sn[s] = *reinterpret_cast<const float2*>(up_scales + (static_cast<std::size_t>(blk) * kStreams + s) * kHidden + f0 + 2U * t);
+            }
+        };
+        load_b(0U);
+#pragma unroll
+        for (unsigned blk = 0; blk < kRank / 32U; ++blk) {
+            unsigned w[kStreams][2];
+            float2 sc[kStreams];
+#pragma unroll
+            for (unsigned s = 0; s < kStreams; ++s) { w[s][0] = wn[s][0]; w[s][1] = wn[s][1]; sc[s] = sn[s]; }
+            if (blk + 1U < kRank / 32U) load_b(blk + 1U);
+            unsigned a[4][2][4];
+#pragma unroll
+            for (unsigned m = 0; m < 4U; ++m)
+#pragma unroll
+                for (unsigned j = 0; j < 2U; ++j)
+                    cm::ldsm_a(a[m][j], a_s + (m * 16U) * kMmaOutPitch + blk * 32U + j * 16U, kMmaOutPitch, lane);
+#pragma unroll
+            for (unsigned s = 0; s < kStreams; ++s) cm::warp_gemm_k32<4U, cm::Int8Codes>(acc[s], a, w[s], sc[s].x, sc[s].y);
+        }
+        const unsigned f = f0 + 2U * t;
+#pragma unroll
+        for (unsigned m = 0; m < 4U; ++m)
+#pragma unroll
+            for (unsigned h = 0; h < 2U; ++h) {
+                const unsigned row_raw = row0 + m * 16U + g + 8U * h, row = row_raw < rows ? row_raw : rows - 1U;  // clamp: loads stay in flight
+                if (gates) {
+                    if (row_raw >= rows) continue;
+#pragma unroll
+                    for (unsigned s = 0; s < kStreams; ++s)
+                        *reinterpret_cast<float2*>(gates + (static_cast<std::size_t>(row) * kStreams + s) * kHidden + f) =
+                            make_float2(acc[s][m][2U * h], acc[s][m][2U * h + 1U]);
+                    continue;
+                }
+                float mixed0 = 0.0F, mixed1 = 0.0F;
+#pragma unroll
+                for (unsigned s = 0; s < kStreams; ++s) {
+                    const float2 n = *reinterpret_cast<const float2*>(normalized + static_cast<std::size_t>(row) * kNormalizedPitch + s * kHidden + f);
+                    mixed0 = __fmaf_rn(n.x, fast_sigmoid(acc[s][m][2U * h]), mixed0);
+                    mixed1 = __fmaf_rn(n.y, fast_sigmoid(acc[s][m][2U * h + 1U]), mixed1);
+                }
+                const std::uint32_t packed = static_cast<std::uint32_t>(float_to_bf16(__fmul_rn(mixed0, 0.25F))) |
+                    (static_cast<std::uint32_t>(float_to_bf16(__fmul_rn(mixed1, 0.25F))) << 16U);
+                if (row_raw < rows) *reinterpret_cast<std::uint32_t*>(output + static_cast<std::size_t>(row) * kHidden + f) = packed;
+            }
     }
 }
 
@@ -879,6 +1209,23 @@ void hc_mix(const HcMixArgs& a, const am::Tables& tables, cudaStream_t stream, u
     check(cudaGetLastError(), "norm launch");
     const unsigned out_blocks = kProjLowBlocks + (a.inject ? 1U : 0U);
     // Output blocks fastest (HIP default order): the 6 blocks of one row block run together and share its x rows in L2.
+    if (a.mma) {  // FAST form: tensor-core projection + output (stages bit 1 / bit 2 as the exact path)
+        static const bool attr = [] {
+            check(cudaFuncSetAttribute(hc_output_mma_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(kMmaOutSmem)), "mma attr");
+            return true;
+        }();
+        (void)attr;
+        const unsigned row_tiles = (a.rows + kMmaOutRows - 1U) / kMmaOutRows;
+        if (stages & 2U) projection_mma(a, tables, stream);
+        check(cudaGetLastError(), "mma projection launch");
+        if (stages & 4U) hc_output_mma_kernel<<<dim3(row_tiles, kHidden / (32U * kMmaOutPasses)), 128U, kMmaOutSmem, stream>>>(a.normalized,
+            a.rows, a.packed.up_codes, a.packed.up_scales, a.output, a.gates, tables);
+        check(cudaGetLastError(), "mma output launch");
+        if ((stages & 8U) && a.gates)
+            hc_mix_epilogue_kernel<<<blocks_for(std::size_t{a.rows} * kHidden, 256U), 256U, 0, stream>>>(a.normalized, a.gates, a.rows,
+                a.output, tables);
+        return;
+    }
     if (a.rows <= 8U && stages == 15U && !a.gates && decode_rows_enabled()) {
         hc_mix_rows(a, tables, stream);
         return;
