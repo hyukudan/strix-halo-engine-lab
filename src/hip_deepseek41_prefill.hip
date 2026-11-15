@@ -1,5 +1,4 @@
 #include "strix/env_flags.hpp"
-#include "strix/lever.hpp"
 #include "strix/file_snapshot.hpp"
 #include "strix/hip_check.hpp"
 #include "strix/ds41_prefill_tuning.hpp"
@@ -64,12 +63,6 @@ namespace {
 void check(hipError_t e, const char* what) {
     ::strix::hip_check_prefixed("deepseek41 prefill: ", e, what);
 }
-
-// Diagnostic arm, not an optimisation: image rows choose experts with the text correction bias instead of the VL
-// bias upstream uses (model.py Gate.forward). It isolates what the VL-routed experts contribute to an image answer.
-inline constexpr lever::Decl ds41_image_text_bias_lever{
-    "ds41-image-text-bias", "STRIX_DS41_IMAGE_TEXT_BIAS", lever::Exactness::bit_changing, false, {}, {},
-    "diagnostic arm of the visprefix image-answer study (VISPREFIX-RESULT)"};
 
 std::uint64_t fnv_bytes(const void* data, std::size_t n, std::uint64_t h = 14695981039346656037ULL) {
     const auto* b = static_cast<const std::uint8_t*>(data);
@@ -743,7 +736,6 @@ DevicePrefill::DevicePrefill(const std::filesystem::path& gguf, const PrefillOpt
     }
     if(const char* e=std::getenv("STRIX_DS41_PREFILL_FP16_DENSE");e && std::string(e)=="1")options.fp16_dense=true;
     if(const char* e=std::getenv("STRIX_DS41_PREFILL_BF16_ATTN");e && std::string(e)=="1")options.bf16_attention=true;
-    options.image_text_bias = options.image_text_bias || lever::select(ds41_image_text_bias_lever, {}).on;
     if (const char* e = ds41::fast_profile::attention(); ds41::fast_profile::attention_on()) {  // the lever or STRIX_DS41_FAST_PREFILL
         options.fast_attention = true;
         if (e[0] == '2') options.fast_attention_flash = true;  // ds41-attn-bf16flash-v1
@@ -2255,7 +2247,6 @@ PrefillResult DevicePrefill::run_from(std::span<const std::uint32_t> tokens, std
     // verify_embed_extras: this rank's first image row and first text row, whose residual streams the Engram check
     // compares across every Engram layer (upstream: an image row passes the layer unchanged, a text row does not).
     std::uint32_t verify_image_row = UINT32_MAX, verify_text_row = UINT32_MAX;
-    bool engram_image_seen = false, engram_image_kept = true, engram_text_moved = false;
     if (!embeds.empty() || m.image_rows_set) {
         const std::size_t embed_width = c.hidden_size;
         std::vector<std::uint8_t> embed_flags(Tn, 0);
@@ -2434,15 +2425,9 @@ PrefillResult DevicePrefill::run_from(std::span<const std::uint32_t> tokens, std
             }
             for (; engram_cut < engram_most; ++engram_cut) cut(PrefillUnitLevel::finest, s.layer, "engram.pad");
             if (!m.overlap) check(hipStreamSynchronize(st), "engram");  // overlap: pinned rows, alive until the run's end
-            if (!image_before.empty()) {  // bitwise: a shut gate adds nothing to the image row
-                const auto same_bits = [](const std::vector<float>& a, const std::vector<float>& b) {
-                    return a.size() == b.size() && std::memcmp(a.data(), b.data(), a.size() * sizeof(float)) == 0;
-                };
-                engram_image_seen = true;
-                engram_image_kept = engram_image_kept && same_bits(residual_row(verify_image_row), image_before);
-                engram_text_moved = engram_text_moved || text_before.empty() || !same_bits(residual_row(verify_text_row), text_before);
-                result.embed_image_engram_checked = engram_image_seen && engram_image_kept && engram_text_moved;
-            }
+            if (!image_before.empty() || !text_before.empty())
+                result.observe_embed_engram(image_before, residual_row(verify_image_row),
+                                            text_before, residual_row(verify_text_row));
             break;
         }
         case Op::hc_mix: {
@@ -3233,7 +3218,7 @@ PrefillResult DevicePrefill::run_from(std::span<const std::uint32_t> tokens, std
             v.x = m.x.p + std::size_t{o0} * H;
             v.weight = m.devf(s.weights[0]);
             v.bias = m.devf(s.weights[1]);
-            v.bias_image = m.options.image_text_bias ? v.bias : m.devf(s.weights[2]);  // diagnostic arm: no VL bias
+            v.bias_image = m.devf(s.weights[2]);
             v.image_rows = m.image_rows.p + o0;
             v.rows = no;
             v.hidden = H;
