@@ -757,6 +757,7 @@ DevicePrefill::DevicePrefill(const std::filesystem::path& gguf, const PrefillOpt
     }
     options.fast_dense = options.fast_dense || ds41::fast_profile::dense_on();
     options.fast_moe = options.fast_moe || ds41::fast_profile::moe_on();
+    options.fast_engram = options.fast_engram || ds41::fast_profile::engram_on();
     // Per-shape selector of the FP16 backend: STRIX_DS41_PREFILL_FP16_PROJ (comma list of q_a, kv, q_b, o_a, o_b),
     // STRIX_DS41_PREFILL_FP16_MIN_ROWS (calls of at least that many rows), STRIX_DS41_PREFILL_APPROX_LAYERS=first-end,
     // STRIX_DS41_PREFILL_FP16_A8=1 (operands from the A8 codes)
@@ -1573,8 +1574,10 @@ void DevicePrefill::set_precision_for_new_sequence(const PrefillOptions& p) {
     o.fast_attention_flash = p.fast_attention_flash;
     o.fast_moe = p.fast_moe;
     o.fast_dense = p.fast_dense;
+    o.fast_engram = p.fast_engram;
     ds41::set_fast_dense(p.fast_dense ? 1 : 0);
     ds41::set_fast_moe(p.fast_moe ? 1 : 0);   // process-wide switch of the batch MoE dispatch (one sequence at a time here)
+    ds41::set_fast_engram(p.fast_engram ? 1 : 0);
 }
 
 PrefillResult DevicePrefill::run(std::span<const std::uint32_t> tokens) {
