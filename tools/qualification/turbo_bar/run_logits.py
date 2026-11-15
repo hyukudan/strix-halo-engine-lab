@@ -32,7 +32,10 @@ from tools.qualification.turbo_bar.common import read_ids, read_json, safe_name,
 
 KEEP_ENV = ("PATH", "HOME", "LD_LIBRARY_PATH", "SYSTEMROOT")
 ROUTE_RE = re.compile(r'"?(teacher_forced_tiled_lm_head|teacher_logits_scope|teacher_logits_rows)"?\s*[:=]\s*("[^"]*"|[^\s,}]+)')
-FIXED = ["--teacher-forced-score", "--generate", "1", "--known-prefix-window", "--known-prefix-full-rows"]
+FIXED = ["--teacher-forced-score", "--generate", "1", "--known-prefix-window", "--known-prefix-full-rows",
+         # The tiled known-prefix route requires every budget explicitly (same values as scripts/bench/engines/qwen.sh).
+         "--known-prefix-workspace-budget-bytes", "8589934592", "--known-prefix-host-metadata-budget-bytes", "1073741824",
+         "--known-prefix-uma-budget-bytes", "137438953472", "--known-prefix-host-headroom-bytes", "4294967296"]
 
 
 def clean_env(arm_env):
@@ -197,7 +200,7 @@ def main(argv=None):
     s.add_argument("--out", required=True)
     s.add_argument("--arms", default="")
     s.add_argument("--cases", default="")
-    s.add_argument("--prefill-rows", type=int, default=4096)
+    s.add_argument("--prefill-rows", type=int, default=8192)
     s.add_argument("--soft-seconds", type=float, default=430.0)
     s.add_argument("--reserve-seconds", type=float, default=20.0)
     s.add_argument("--stack-kib", type=int, default=65536)
