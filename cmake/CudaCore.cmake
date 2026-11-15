@@ -58,3 +58,5 @@ target_compile_options(qwen35_cuda_engine_test PRIVATE $<$<COMPILE_LANGUAGE:CUDA
 if(MSVC)
     target_compile_options(qwen35_cuda_engine_test PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/EHsc,/Zc:preprocessor,/utf-8>)
 endif()
+
+include(${CMAKE_CURRENT_LIST_DIR}/Qwen35Spec.cmake)
