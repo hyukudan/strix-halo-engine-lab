@@ -12,6 +12,7 @@ void require(bool ok, const char* message) { if (!ok) throw std::runtime_error(m
 namespace ds41 {
 void set_fast_dense(int) {}
 void set_fast_moe(int) {}
+void set_fast_engram(int) {}
 }
 namespace attn {
 constexpr unsigned kWindow = 128, kHeadDim = 512;

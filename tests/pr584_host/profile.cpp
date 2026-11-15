@@ -69,7 +69,10 @@ int main() {
         require(std::none_of(bundle.set_env.begin(), bundle.set_env.end(),
                              [](const auto& kv) { return kv.first == "STRIX_DS41_FAST_ENGRAM" && kv.second == "1"; }),
                 "bundle selects the unqualified Engram lever");
-        require(agrees(engram, resolve({{"STRIX_DS41_FAST_ENGRAM", "1"}}, true)), "Engram lever differs under --profile fast");
+        require(exported(resolve({{"STRIX_DS41_FAST_ENGRAM", "1"}}, true), "STRIX_DS41_FAST_ENGRAM") == "1" &&
+                    exported(resolve({{"STRIX_DS41_FAST_ENGRAM", "yes"}}), "STRIX_DS41_FAST_ENGRAM") == "0",
+                "Engram lever not canonical (explicit value kept under --profile fast, anything but 1 is 0)");
+        require(agrees(off, resolve({{"STRIX_DS41_FAST_ENGRAM", "0"}})), "explicit Engram OFF changes the pair identity");
         // ONE RESOLVER: the server and the prefill CLI resolve the same request to the same Engram value
         for (const pd::App app : {pd::App::serve, pd::App::prefill}) {
             const auto r = pd::resolve(app, {}, [](const char* key) -> const char* {
