@@ -273,3 +273,33 @@ describe executed API policies; deployment describes placement and budgets.
 For individual controls and off switches, see [toggles](toggles.md). Keep model,
 profile, context, slots and numerical identity fixed when validating a change;
 compare complete token IDs and logits/state, then measure the complete workload.
+
+## Placing one prefill across devices
+
+The device declaration states what connects the units. One line per device sets the link model:
+
+```toml
+[devices.node-a]
+vendor = "amd"
+pci = "0000:c3:00.0"
+roles = ["pair", "decode", "prefill"]
+attach = { kind = "remote", link = "2.5gbe" }   # classes: 1gbe 2.5gbe 5gbe 10gbe 25gbe usb4 usb4-gen2
+                                                #          pcie3x4 pcie4x4 oculink4x4 pcie4x16 pcie5x16
+[links.pair]                                    # a cable between two declared devices
+between = ["node-a", "node-b"]
+class = "usb4"
+```
+
+A class gives nominal rates with a wide uncertainty; `gbps_measured` (useful Gbit/s) and `rtt_us_measured` replace
+them. Remote devices of one machine share its network port (`port`) unless declared otherwise. A role that needs a
+measured rate (`prefill` on a remote device) is still refused until the probe is declared.
+
+`strix::deploy::plan_route` (include/strix/deploy/route.hpp) is the one resolver CLI and server call. From the
+declaration, its link graph and measured stage costs (`strix-stage-costs-v1`: unit, arithmetic identity, prompt
+length, block size, total and fixed ms, optional per-layer work, spread, warm/cold, receipt) it lists every route
+the model announces: prefill where it decodes, prefill elsewhere and hand the state off, or a layer split in blocks
+with the cuts balanced from the measured rates. Each option carries its stages and layer ranges, block size, bytes
+per link, identity, predicted time with uncertainty, rate, memory per rank (through the model's FootprintProvider)
+and the reason it was refused. Unknown memory, an unmeasured import cost, a link without rate or class, or a route
+without a gate receipt is reported and never selected. The objective is `ttft` or `throughput`; a pin forces one
+option or fails with its reason. `contrast()` compares the prediction with receipts and flags misses above 30 %.
