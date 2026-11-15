@@ -15,8 +15,10 @@
 
 #if defined(__HIPCC__) || defined(__CUDACC__)
 #define STRIX_RS_FN __host__ __device__ __forceinline__
+#define STRIX_RS_UNROLL _Pragma("unroll")
 #else
 #define STRIX_RS_FN inline
+#define STRIX_RS_UNROLL
 #endif
 #if defined(__CUDACC__)
 #include <cuda_fp16.h>
@@ -133,10 +135,10 @@ STRIX_RS_FN void load_run(const std::uint16_t* src, float (&out)[N]) {
     static_assert(Type != RecurrentStateType::f32, "f32 kernels keep their incumbent scalar access");
     static_assert(N == 2U || N == 4U || N % 8U == 0U, "run of 2, 4 or 8k elements");
     constexpr unsigned group = N < 8U ? N : 8U, words = group / 2U;
-#pragma unroll
+STRIX_RS_UNROLL
     for (unsigned g = 0; g < N / group; ++g) {
         const auto p = reinterpret_cast<const Pack<words>*>(src)[g];
-#pragma unroll
+STRIX_RS_UNROLL
         for (unsigned i = 0; i < words; ++i) {
             out[g * group + 2U * i] = Codec<Type>::load(static_cast<std::uint16_t>(p.w[i] & 0xffffU));
             out[g * group + 2U * i + 1U] = Codec<Type>::load(static_cast<std::uint16_t>(p.w[i] >> 16));
@@ -148,10 +150,10 @@ STRIX_RS_FN void store_run(std::uint16_t* dst, const float (&in)[N]) {
     static_assert(Type != RecurrentStateType::f32, "f32 kernels keep their incumbent scalar access");
     static_assert(N == 2U || N == 4U || N % 8U == 0U, "run of 2, 4 or 8k elements");
     constexpr unsigned group = N < 8U ? N : 8U, words = group / 2U;
-#pragma unroll
+STRIX_RS_UNROLL
     for (unsigned g = 0; g < N / group; ++g) {
         Pack<words> p;
-#pragma unroll
+STRIX_RS_UNROLL
         for (unsigned i = 0; i < words; ++i)
             p.w[i] = static_cast<std::uint32_t>(Codec<Type>::store(in[g * group + 2U * i])) |
                 (static_cast<std::uint32_t>(Codec<Type>::store(in[g * group + 2U * i + 1U])) << 16);

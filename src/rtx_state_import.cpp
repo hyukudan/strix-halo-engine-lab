@@ -165,7 +165,7 @@ RtxStateStaging::RtxStateStaging(std::shared_ptr<const RtxStateLayout> layout, R
     if (!layout_) throw std::invalid_argument("rtx state import has no layout");
     const auto& l = *layout_;
     if (request_.layout_identity != l.layout_identity)
-        throw std::invalid_argument("rtx state layout identity differs from this engine's (" + rtx_hex_u64(l.layout_identity) + ")");
+        throw std::invalid_argument("rtx state layout identity differs from this engine's (the recurrent state contract, STRIX_RECURRENT_STATE, is part of it: no f32/f16/bf16 conversion on import) (" + rtx_hex_u64(l.layout_identity) + ")");
     if (request_.rotary && *request_.rotary != l.rotary)
         throw std::invalid_argument("rtx state rotary identity mismatch (mode, factor or table SHA256)");
     if (request_.context_tokens && *request_.context_tokens != l.context_tokens)
