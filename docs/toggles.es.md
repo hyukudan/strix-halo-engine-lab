@@ -471,6 +471,7 @@ Sigue el enlace para ver la ganancia, las precondiciones y el interruptor de apa
 | `STRIX_GLM_MOE` | glm | fast | [glm-moe-fast](optimizations.md#glm-moe-fast) |
 | `STRIX_GLM_POST` | glm | fast | [glm-post-exchange-fast](optimizations.md#glm-post-exchange-fast) |
 | `STRIX_GLM_SERVE_G2` | glm | on (with MTP) | [glm-serve-g2](optimizations.md#glm-serve-g2) |
+| `STRIX_GLM_SERVE_PREFILL_UNITS` | glm | 1 | un prompt largo admitido bajo carga se corta en unidades de capa, no en chunks de tokens; `0` = chunks de tokens; [página de GLM](models/glm-5.3/README.es.md) |
 | `STRIX_GLM_STEP_FLAG` | glm | 1 (engine default) | [glm-step-flag](optimizations.md#glm-step-flag) |
 | `STRIX_GLM_TIERB` | glm | fused | [glm-attn-tierb-fused](optimizations.md#glm-attn-tierb-fused) |
 | `STRIX_LM_HEAD_COHORT_LEAN` | qwen | 1 | [qwen-lm-head-cohort-lean](optimizations.md#qwen-lm-head-cohort-lean) |
