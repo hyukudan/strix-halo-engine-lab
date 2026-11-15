@@ -7,7 +7,7 @@ void cut_hip(hipError_t e, const char* what) {
 struct CutPinned {
     std::uint8_t* data = nullptr;
     explicit CutPinned(std::size_t bytes) { cut_hip(hipHostMalloc(reinterpret_cast<void**>(&data), bytes), "layercut pinned"); }
-    ~CutPinned() { hipHostFree(data); }
+    ~CutPinned() { (void)hipHostFree(data); }
     CutPinned(const CutPinned&) = delete;
 };
 std::string cut_pair_identity() {
