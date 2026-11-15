@@ -4,7 +4,7 @@
 
 #include "minimax/moe/mmx_prefill_core.hpp"
 #include "minimax/attn/msa_norm_rope.hpp"  // the q image: the flash prologue's norm + RoPE
-#include "attn_core/wmma_types.hpp"         // and its operand rounding
+#include "../../attn_core/wmma_types.hpp"   // and its operand rounding
 #include "minimax/moe/mmx_trellis_device.hpp"
 #include "core/activation_quant.hpp"
 #include "core/trellis_codec.hpp"

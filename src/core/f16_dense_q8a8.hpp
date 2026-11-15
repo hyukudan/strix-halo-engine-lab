@@ -12,7 +12,7 @@
 // filling View; nothing here names a model.
 // Limits (callers check with supported()): in % 128 == 0, x_stride % 32 == 0, in <= x_stride.
 #include "f16_dense_tall.hpp"
-#include "attn_core/wmma_types.hpp"  // the operand-image epilogue rounds with the attention cores' to_operand
+#include "../attn_core/wmma_types.hpp"  // the operand-image epilogue rounds with the attention cores' to_operand
 
 namespace strix::core::f16_dense_tall::q8a8 {
 inline constexpr char kPolicyName[] = "dense-q8a8-f16-v1";
