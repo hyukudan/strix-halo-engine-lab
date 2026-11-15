@@ -33,7 +33,7 @@ struct Device {
     double capacity_bytes = 0.0;          // weight budget; checked only when the model declares weight bytes
     // Measured per-row cost multiplier by block rows {rows, factor}, ascending rows (piecewise linear in log2 rows,
     // clamped at both ends; empty = 1). Small units cost more per row (launches, fixed waits, smaller GEMMs).
-    std::vector<std::pair<std::uint32_t, double>> unit_scale;
+    std::vector<std::pair<std::uint32_t, double>> unit_scale{};
 };
 struct Link {                             // between device i and i+1
     double forward_bytes_per_ms = 0.0;    // useful rate towards i+1 (0: no link)
@@ -152,7 +152,7 @@ inline Plan evaluate(const std::vector<Device>& devices, const std::vector<Link>
         for (auto hop = decoder; hop < own; ++hop) { reverse_state[hop] += model.state_bytes_per_row[layer]; reverse_fixed[hop] += model.state_fixed_bytes[layer]; }
     }
     struct Resource { double fixed = 0.0, per_row = 0.0; std::string name; const std::vector<std::pair<std::uint32_t, double>>* scale = nullptr; };
-    const auto row_cost = [](const Resource& r, double rows) { return rows * r.per_row * (r.scale ? detail::unit_factor(*r.scale, rows) : 1.0); };
+    const auto row_cost = [](const Resource& r, double n) { return n * r.per_row * (r.scale ? detail::unit_factor(*r.scale, n) : 1.0); };
     std::vector<Resource> resources;
     for (auto device = first; device <= end; ++device) {
         if (device <= plan.last) {
