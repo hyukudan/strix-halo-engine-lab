@@ -17,11 +17,13 @@
 //
 // Hand-off flags: --handoff-codec bp-v1|identity (default bp-v1 when the node's layout lists it, else plain chunks;
 // docs/rtx-state-import.md "Chunk encoding"), --handoff-encode-threads N (4), --handoff-connections N (default 2: chunk
-// POSTs in flight), --handoff-chunk-mib N (32). Release per layer (default; --no-release-by-layer: after each block):
+// POSTs in flight), --handoff-chunk-mib N (32), --handoff-link 1gbe|2.5gbe|10gbe|usb4|oculink|MB/s (declares the link
+// for `--handoff-codec auto` / `--handoff-encode-threads auto`; all four resolve through strix/handoff_policy.hpp). Release per layer (default; --no-release-by-layer: after each block):
 // every block's rows and the last block's GDN recurrent/conv slices are sent per layer while the next layers compute.
 #include "strix/device/cuda_enumerator.hpp"
 #include "strix/cuda_qwen_prefill.hpp"
 #include "strix/serve/json.hpp"
+#include "strix/handoff_policy.hpp"
 
 #include "qwen_handoff.hpp"
 #include "qwen_http.hpp"
@@ -347,8 +349,10 @@ int main(int argc, char** argv) {
     qh::Options handoff;
     // Defaults (measured net2 2026-10-24: exact and faster at every length 1K-32K): bp-v1 chunks when the node lists the
     // codec (else plain), 2 connections. --handoff-codec identity --handoff-connections 1 restores the plain stream.
-    handoff.codec = "bp-v1";
-    handoff.connections = 2;
+    // The values resolve through the shared hand-off resolver (strix/handoff_policy.hpp): CLI > STRIX_HANDOFF_* > these
+    // family defaults; --handoff-link CLASS|MB/s declares the link so `auto` can choose codec and encode threads.
+    const strix::handoff::Choice handoff_family{strix::handoff::Codec::bp_v1, 2, 4, 1};
+    strix::handoff::Request handoff_req;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         auto next = [&]() -> std::string { if (i + 1 >= argc) { std::fprintf(stderr, "%s needs a value\n", a.c_str()); std::exit(1); } return argv[++i]; };
@@ -384,11 +388,25 @@ int main(int argc, char** argv) {
         else if (a == "--port") port = next();
         else if (a == "--api-key-file") { std::FILE* f = std::fopen(next().c_str(), "rb"); char b[256] = {}; if (f) { std::fread(b, 1, 255, f); std::fclose(f); } api_key = b; while (!api_key.empty() && (api_key.back() == '\n' || api_key.back() == '\r')) api_key.pop_back(); }
         else if (a == "--handoff-api-key-file") { std::FILE* f = std::fopen(next().c_str(), "rb"); char b[256] = {}; if (f) { std::fread(b, 1, 255, f); std::fclose(f); } handoff_key = b; while (!handoff_key.empty() && (handoff_key.back() == '\n' || handoff_key.back() == '\r')) handoff_key.pop_back(); }
-        else if (a == "--handoff-codec") handoff.codec = next();
-        else if (a == "--handoff-encode-threads") handoff.encode_threads = static_cast<unsigned>(std::atoi(next().c_str()));
-        else if (a == "--handoff-connections") handoff.connections = static_cast<unsigned>(std::max(1, std::atoi(next().c_str())));
+        else if (a == "--handoff-codec") handoff_req.codec = next();
+        else if (a == "--handoff-encode-threads") handoff_req.encode_threads = next();
+        else if (a == "--handoff-connections") handoff_req.streams = next();
+        else if (a == "--handoff-link") handoff_req.link = next();
         else if (a == "--handoff-chunk-mib") handoff.chunk_bytes = static_cast<std::uint64_t>(std::max(1, std::atoi(next().c_str()))) << 20;
         else { std::fprintf(stderr, "unknown flag %s\n", a.c_str()); return 1; }
+    }
+    try {
+        // HTTP chunk POSTs: the connection count is not the shared-lib stream model (a POST waits for its reply), so it
+        // keeps the family value unless given explicitly.
+        const auto r = strix::handoff::resolve(handoff_family, handoff_req, {}, 16, {false, false});
+        handoff.codec = strix::handoff::codec_name(r.choice.codec);
+        handoff.connections = r.choice.streams;
+        handoff.encode_threads = r.choice.encode_threads;
+        for (const auto& line : r.lines)
+            if (line.rfind("handoff encode_batch", 0) != 0) std::fprintf(stderr, "qwen prefill service: %s\n", line.c_str());
+    } catch (const std::exception& e) {
+        std::fprintf(stderr, "%s\n", e.what());
+        return 1;
     }
     if (c.tables_dir.empty() || c.rope_table.empty()) { std::fprintf(stderr, "--tables and --rope-table are required\n"); return 1; }
     if (c.block_schedule.empty() ||

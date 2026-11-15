@@ -18,7 +18,8 @@ struct View {
 };
 std::vector<View> calls;
 bool supported(const View& v) { return v.in && v.in % 128U == 0U && v.in <= v.x_stride; }
-void enqueue(const View& v, hipStream_t) {
+inline constexpr unsigned kFormRule = ~0U;  // the policy's form argument (weight decode form; the same bits either way)
+void enqueue(const View& v, hipStream_t, unsigned = 0U, unsigned = kFormRule) {
     calls.push_back(v);
     float sum = 0.0F;
     for (unsigned k = 0; k < v.in; ++k) sum = std::fma(static_cast<float>(v.codes[k]), v.deltas[k / 32U], sum);

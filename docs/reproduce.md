@@ -615,6 +615,12 @@ breakdown, GPU clocks per token and a host-node link probe (RTT and useful throu
 process and reports the per-window launch loop of one run: span, GPU idle inside it, time per kernel kind, launches
 per hardware queue, and the compute-unit time the flash kernel and the kernels that cannot share a CU with it leave free.
 
+### MiniMax MSA flash layer ranges (FAST gate)
+
+[`scripts/bench/mmflash/`](../scripts/bench/mmflash/README.md) qualifies a layer range for the FAST MSA flash attention
+(one-term or two-term operands) against the exact path in one detached pair run: onset-matched one-ulp nulls for the
+floor rule, optional multi-site / magnitude nulls as a diagnostic, cold and warm TTFT, evicted_ms and GPU clocks per token.
+
 ## Long-context retrieval and reasoning checks (Qwen)
 
 `tools/qualification/longctx_fidelity/` builds deterministic prompts whose answers are computed by the
