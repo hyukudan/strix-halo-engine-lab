@@ -127,17 +127,17 @@ int main() {
     {   // automatic: the measured decision table (layer-order file tier F = streamed - pinnable, crossover 10 GB)
         std::vector<std::uint64_t> streamed(40, 0);
         for (std::size_t l = 0; l < 20; ++l) streamed[l] = 3'690'000'000ULL;  // 73.8 GB streamed
-        const double gib = double(1ULL << 30);
-        const auto big = resolve_host_pin_order(HostPinOrder::automatic, streamed, 68.0, 57.9 * gib, 0, 2);   // F ~11.6 GB
+        const double one_gib = double(1ULL << 30);
+        const auto big = resolve_host_pin_order(HostPinOrder::automatic, streamed, 68.0, 57.9 * one_gib, 0, 2);   // F ~11.6 GB
         check(big.order == HostPinOrder::interleave && big.host_gib == 64.0 && big.ring_mib == kInterleaveFileRingMib);
         check(big.layer_file_bytes > 10e9);
-        const auto small = resolve_host_pin_order(HostPinOrder::automatic, streamed, 68.0, 80.0 * gib, 0, 2);  // F = 73.8 - 73.0
+        const auto small = resolve_host_pin_order(HostPinOrder::automatic, streamed, 68.0, 80.0 * one_gib, 0, 2);  // F = 73.8 - 73.0
         check(small.order == HostPinOrder::layer && small.host_gib == 68.0 && small.ring_mib == kLegacyFileRingMib);
         const auto unknown = resolve_host_pin_order(HostPinOrder::automatic, streamed, 56.0, -1.0, 0, 2);     // F = 73.8 - 60.1
         check(unknown.order == HostPinOrder::interleave);
         const auto forced = resolve_host_pin_order(HostPinOrder::layer, streamed, 56.0, -1.0, 0, 2);
         check(forced.order == HostPinOrder::layer && forced.ring_mib == kLegacyFileRingMib && forced.layer_file_bytes < 0.0);
-        const auto none = resolve_host_pin_order(HostPinOrder::automatic, streamed, 68.0, 1.0 * gib, 0, 0);
+        const auto none = resolve_host_pin_order(HostPinOrder::automatic, streamed, 68.0, 1.0 * one_gib, 0, 0);
         check(none.order == HostPinOrder::layer);
         check(parse_host_pin_order("auto") == HostPinOrder::automatic);
     }
