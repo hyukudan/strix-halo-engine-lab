@@ -710,6 +710,17 @@
   },
   {
     "engine": "qwen",
+    "name": "Paired GLU store for the shared-expert preimage",
+    "flag_or_env": "STRIX_QPF2K_GLU_PAIR",
+    "default": "1",
+    "exact": "Bitwise: the shared-pre fixture (32..8192 rows, nine gate/up payload kinds including non-finite values, two streams) gives equal FP16 preimage, gate, outputs and overflow count on every route, plus an RNE oracle; final logits are identical at 8K, 32K and 128K.",
+    "gain": "Shared-expert kernels per 8K request 146.6 -> 128.0 ms (-18.6 ms), at 32K -68 ms (traced, one node); request level within clock noise (-0.1 % at 8K, -0.5 % at 32K)",
+    "preconditions": "STRIX_QPF2K_SHARED_PRE admitted, tiled gate|up admitted for the same rows, features a multiple of 16.",
+    "off_switch": "STRIX_QPF2K_GLU_PAIR=0",
+    "doc_anchor": "docs/optimizations.md#qwen-glu-pair"
+  },
+  {
+    "engine": "qwen",
     "name": "MoE ordered merge + BF16 commit",
     "flag_or_env": "STRIX_QPF2K_MOE_MC",
     "default": "1 (mode 1; mode 2 needs an explicit value)",
