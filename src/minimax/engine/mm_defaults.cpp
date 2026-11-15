@@ -225,7 +225,13 @@ PrefillPolicy prefill_policy(const Lookup& env) {
     p.msa_flash_layers = fp::layer_ranges(kMsaLayers, [&](unsigned l) { return mask.test(l); });
     if (p.msa_flash != 0) {
         bool rework = true;
-        for (const auto& r : resolve(env))
+        // Only the rework item and the baseline switch decide it: forwarding every item through a recording lookup
+        // (the engine passes envcfg::text) put the whole defaults set into the FAST arm's receipt, which the floor
+        // gate then refused against an exact reference ("differs beyond its FAST layer set").
+        const Lookup rework_env = [&](const char* k) -> const char* {
+            return std::strcmp(k, "STRIX_MM_PF_MSA_REWORK") == 0 || std::strcmp(k, kBaselineEnv) == 0 ? env(k) : nullptr;
+        };
+        for (const auto& r : resolve(rework_env))
             if (std::strcmp(r.item->env, "STRIX_MM_PF_MSA_REWORK") == 0) rework = r.value != "0";
         const char* fused = env("STRIX_MM_ATTN_PREFILL");
         if (const char* reason = msa_flash_decline_reason(rework, fused == nullptr || std::strcmp(fused, "off") != 0, mask.count())) {

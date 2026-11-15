@@ -737,6 +737,13 @@ void test_fast_prefill_profile() {
         bool threw = false;
         try { (void)md::prefill_policy(lookup(EnvMap{{"STRIX_MM_PF_IDX_WMMA", "2"}})); } catch (const std::invalid_argument&) { threw = true; }
         check(threw, "fast idx: invalid value rejected");
+        {   // The FAST resolution consults only its own switches (the engine records every read into the receipt).
+            const auto base = lookup(idx);
+            std::set<std::string> seen;
+            (void)md::prefill_policy([&](const char* k) -> const char* { seen.insert(k); return base(k); });
+            check(seen.count("STRIX_DIST_CRC_PARALLEL") == 0 && seen.count("STRIX_MM_PF_MSA_REWORK") == 1,
+                  "fast receipt: the flash guard reads the rework item, not the whole defaults set");
+        }
         // ONE RESOLVER: rank and serve resolve the same request to the same prefill lines.
         const auto prefill_lines = [](const std::string& cfg) {
             std::string out;
