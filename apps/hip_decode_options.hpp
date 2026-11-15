@@ -254,6 +254,7 @@ struct Options {
     bool eager_code_load = true;
     bool qwen_router_bf16 = true;
     bool baseline = false;
+    bool rotary_automatic = false; // YaRN factor chosen from an explicit context above the native maximum
     std::string suppressed_yarn_request;
     bool print_effective_config = false;
     std::string deploy_file;
@@ -3395,6 +3396,24 @@ inline Options parse_options(
             options.context_tokens = spec.context; options.context_explicit = true;
         } else spec.context = static_cast<std::uint32_t>(options.context_tokens);
         options.deployment_spec = std::make_shared<const strix::deploy::Spec>(std::move(spec));
+    }
+    // No YaRN request and an explicit context above the native 262,144: the smallest qualified factor that covers
+    // it, for the CLI and serving alike (one parser). --rope-yarn off / STRIX_QWEN_ROPE_YARN=off keep native RoPE
+    // and its refusal; --baseline stays native.
+    // Without --context, only a known prompt that native RoPE refuses (prompt + generation > 262,144, the resolver's
+    // prompt-exceeds-model-context rule) takes the resolver's automatic context (prompt + max(generate, 512) rounded
+    // up to 512) explicitly, so the same factor rule applies. Every prompt native admits keeps native bits.
+    if (!yarn_factor && !options.baseline && !yarn_cli && !yarn_env && !options.context_explicit && !options.tokens.empty() &&
+        static_cast<std::uint64_t>(options.tokens.size()) + options.generate_tokens > strix::RotaryDescriptor::original_max) {
+        const auto need = (static_cast<std::uint64_t>(options.tokens.size()) +
+            std::max<std::uint64_t>(options.generate_tokens, 512U) + 511U) / 512U * 512U;
+        if (strix::automatic_qwen_rope_yarn(need)) { options.context_tokens = need; options.context_explicit = true; }
+    }
+    if (!yarn_factor && !options.baseline && !yarn_cli && !yarn_env && options.context_explicit &&
+        (yarn_factor = strix::automatic_qwen_rope_yarn(options.context_tokens)) != 0U) {
+        options.rotary_automatic = true;
+        std::fprintf(stderr, "Qwen rotary: YaRN factor %u selected automatically (context %llu > native 262144; "
+            "--rope-yarn off keeps native RoPE)\n", yarn_factor, static_cast<unsigned long long>(options.context_tokens));
     }
     options.rotary = strix::validate_qwen_rotary_request(yarn_factor,
         options.context_explicit, options.context_tokens, options.baseline);

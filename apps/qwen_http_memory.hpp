@@ -4,6 +4,7 @@
 #include "qwen_prompt_organization.hpp"
 #include "strix/indexed_attention_workspace.hpp"
 #include "strix/indexed_attention_state.hpp"
+#include "strix/mtp_payload_geometry.hpp"
 #include "strix/q51_known_rows.hpp"
 #include "strix/ple_lookup.hpp"
 
@@ -43,7 +44,8 @@ inline HttpServingMemory http_mtp_memory(const Options& o, const ModelContract& 
             mul(o.context_tokens,predictor.kv_row_bytes),mul(o.context_tokens,predictor.raw_index_row_bytes),UINT64_C(8)})
         if (bytes) pool = add(add(pool,255U)/256U*256U,bytes);
     pool = add(add(pool,255U),selector);
-    if (pool > o.mtp.runtime_bytes) throw std::runtime_error("one-slot:native pool exceeds runtime budget");
+    if (pool > mtp_payload::runtime_budget(model,o.context_tokens,o.mtp.runtime_bytes))
+        throw std::runtime_error("one-slot:native pool exceeds runtime budget");
     SerialSessionStateLayoutRequest request; request.context_tokens=o.context_tokens;
     request.recurrent_storage=o.gdn_recurrent_storage;
     const auto state=build_serial_session_state_layout(model,request);

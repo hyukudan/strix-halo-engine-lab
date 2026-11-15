@@ -74,6 +74,9 @@ inline void require_rotary_producer_identity(const RotaryIdentity& producer, con
 // exactly a no-op, including when the existing hash has value zero.
 std::uint64_t append_rotary_identity(std::uint64_t existing, const RotaryIdentity& rotary);
 std::uint32_t parse_qwen_rope_yarn(std::string_view value);
+// Factor for a context with no YaRN request: 0 up to the native 262,144, then the smallest qualified factor that
+// covers it (2 up to 524,288, 4 up to 1,048,576; the rule of the YaRN MTP route and its QSA pool), 0 above.
+std::uint32_t automatic_qwen_rope_yarn(std::uint64_t context) noexcept;
 RotaryDescriptor validate_qwen_rotary_request(std::uint32_t factor,
     bool context_explicit, std::uint64_t context, bool baseline);
 

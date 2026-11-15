@@ -213,8 +213,13 @@ filtered per GSQ owner, so GSQ runs without the former requirement to disable th
 Long prompts run with the default command up to the model maximum of 262,144 tokens (prompt plus generation):
 the automatic context is clamped to that maximum, the admission estimate credits the PLE pages that reclaim will
 free, and the tile falls back from T16384 (when eligible) to T8192, T4096 and then T2048 before the route declines,
-reporting each failed tile and its reason. A prompt plus generation
-above the maximum is refused (`prompt-exceeds-model-context`); a tile that does not fit the memory budget reports
+reporting each failed tile and its reason. A prompt plus generation above the native 262,144 positions, or an
+explicit `--context` above it, selects YaRN automatically: factor 2 up to 524,288 and factor 4 up to 1,048,576
+(without `--context` the context is the prompt plus max(generation, 512), rounded up to 512); prompts above 524,288
+ids need `--prompt-ids FILE`. `--rope-yarn off` keeps native RoPE, and such a request is then refused
+(`prompt-exceeds-model-context`). Every request native RoPE admits keeps it. The MTP runtime budget is raised to
+the predictor's need at the admitted context (2,304 bytes per position) on the CLI and serving paths alike. A
+two-node prefill pipelines the prompt down to a multiple of 16 rows; the last rows run after the hand-off. A tile that does not fit the memory budget reports
 `insufficient-memory`. Under the priced native pools, at 131,072 and 262,143 real-text
 tokens the default admits automatic T16384, and with `STRIX_QPF2K_T16K=0` it admits T8192
 as before, with no fallback.

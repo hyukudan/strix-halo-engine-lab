@@ -49,6 +49,16 @@ inline Runtime runtime(const ModelContract& m,std::uint64_t capacity) {
     p.reader=selector(m.vocab_size);p.retained=add(add(p.pool,255U),p.reader);
     return p;
 }
+// Runtime budget at an admitted context, the one value the CLI, the HTTP admission and every reservation use. The
+// predictor holds the sidecar layer's KV and raw index for the whole context (2,304 B per row): a declared
+// --mtp-runtime-bytes sized for a shorter context (the production 128 MiB covers about 55K rows) is raised to the
+// actual requirement here instead of refusing the context; memory admission charges this value, never the
+// declared one. A capacity outside the rotary range keeps the declared value for the owner's own refusal.
+inline std::uint64_t runtime_budget(const ModelContract& m,std::uint64_t capacity,std::uint64_t declared) {
+    if(!capacity || capacity>m.effective_max_positions()) return declared;
+    const auto need=runtime(m,capacity).retained;
+    return need>declared?need:declared;
+}
 inline std::uint64_t target_capture(const ModelContract& m,std::uint64_t rows,
     const SerialSessionStateLayout* deferred) {
     if(!rows) throw std::invalid_argument("MTP target capture rows are zero");
