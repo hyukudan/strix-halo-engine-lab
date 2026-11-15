@@ -59,7 +59,8 @@ shape. Order:
 1. **Dense IMMA tile (done)** (`core/dense/q8_a8_imma.cu`): tiled Q8_0 x A8 kernels, repack and tuning dispatch
    share `include/strix/cuda/core/{types,plan,dense}.hpp`; old DeepSeek signatures remain field-by-field adapters.
    `include/strix/device/runtime.hpp` binds the existing descriptor to CUDA capability queries; workspace and stream stay caller-owned.
-   The extraction gate compares every built CUDA object's and executable's normalised SASS against the base build;
+   The extraction gate compares every built CUDA object's and executable's SASS against the base build, moved
+   symbols declared one by one with `--symbol-rename OLD=NEW` (an undeclared namespace move is a difference);
    this is an instruction-preserving move, with no new numerical or workload qualification claim.
 2. **Common numerics and norms** (`core/norms/`): `ds41_cuda_common.{cuh,cu}` (device, workspace, stream, event
    helpers become `core/runtime` pieces), `ds41_core_norm.cu`, Qwen `hc` with the AMD-identical math
