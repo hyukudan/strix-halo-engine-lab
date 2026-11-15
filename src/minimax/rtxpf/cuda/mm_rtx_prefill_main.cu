@@ -455,8 +455,7 @@ int main(int argc, char** argv) {
         const bool ik_once = ps::resolve(ps::decl::minimax, ik_once_cli, -1).shared_once;
         if (ik_ab && replay_dir.empty()) throw std::runtime_error("--ik-once ab needs --replay-state");
         if (!send_to.empty())
-            std::printf("mm-rtx-prefill: hand-off owners %s (STRIX_HANDOFF_SHARED_ONCE / --ik-once): %.0f B per row
-",
+            std::printf("mm-rtx-prefill: hand-off owners %s (STRIX_HANDOFF_SHARED_ONCE / --ik-once): %.0f B per row\n",
                         ik_ab ? "ABAB" : ik_once ? "ik-once" : "per-rank copies",
                         static_cast<double>(ps::host_bytes(ps::decl::minimax, 1, 0, ik_once && !ik_ab)));
         if (!replay_dir.empty()) {  // transport replay, no GPU

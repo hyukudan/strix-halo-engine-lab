@@ -953,8 +953,7 @@ int main(int argc, char** argv) {
             const ps::Resolved owners = ps::resolve(ps::decl::glm, import_dsa_once_cli, -1);
             import_dsa_once = import_dsa_once_cli == 1 || (owners.shared_once && import_dsa_once_cli != 0 && !import_listen.empty() && opt.world == 2);
             if (owners.prefix_first && !import_listen.empty())
-                std::printf("serve import: STRIX_HANDOFF_PREFIX_FIRST is not bound on the GLM import route yet (imports skip the prefix cache)
-");
+                std::printf("serve import: STRIX_HANDOFF_PREFIX_FIRST is not bound on the GLM import route yet (imports skip the prefix cache)\n");
         }
         if (import_gate_on && import_gate.find_first_not_of(',') == std::string::npos)
             return import_gate_empty(import_gate);  // --import-gate "" or ",": an explicit empty suite FAILs before loading

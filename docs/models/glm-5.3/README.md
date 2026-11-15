@@ -282,8 +282,11 @@ Build, unit file and options: [GLM RTX guide](../../../src/glm/rtxpf/README.md).
 layer only) lets the RTX producer prefill long prompts and hand each rank its state. Both ranks stage the hand-off,
 vote on it (the authenticated binding, then both restored) before the last prompt token runs, and any failure before
 that vote falls back to the pair's own prefill on both ranks; a failure inside the last-token collectives stops the
-server (fatal). `--import-dsa-once` (with the producer's `dsa_once`) sends the DSA state to rank 0 only and relays it
-to rank 1 over the pair link (8K: 480 -> 316 MB on the producer link, tokens equal to the version 1 hand-off). Imported prompts carry the FAST identity
+server (fatal). DSA once (hand-off version 2, the default on a pair with `--import-listen`; `--no-import-dsa-once` or
+`STRIX_HANDOFF_SHARED_ONCE=0` restores version 1) sends the DSA state to rank 0 only and relays it to rank 1 over the
+pair link, hash checked (8K: 480 -> 316 MB on the producer link, 4.05 -> 2.67 s at 1 GbE; 32K: 1,461 -> 807 MB,
+12.38 -> 6.90 s; rank 1's merged payload is byte-identical to its version 1 payload, tokens equal). See
+[hand-off owners](../../pair.md#prompt-state-hand-off-one-copy-per-owner). Imported prompts carry the FAST identity
 `glm-pf-rtx-native-v1` (not bitwise the pair's own prefill; each response's `prefill_route` names it).
 `--import-gate` fails unless every routed arm really imported (and a suite with no prompt fails). `--import-model-sha` is
 an operator attestation: the receiver compares it with the producer's hand-off header, it is not computed from the

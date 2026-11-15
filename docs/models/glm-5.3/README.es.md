@@ -301,9 +301,11 @@ opciones: [guía de GLM RTX](../../../src/glm/rtxpf/README.md).
 rango; solo motores con su capa MTP) deja que el productor RTX haga el prefill de los prompts largos y entregue a cada
 rango su estado. Ambos rangos preparan la entrega y votan (la vinculación autenticada y después ambos restaurados) antes
 de ejecutar el último token del prompt; cualquier fallo antes de ese voto vuelve al prefill propio del par en los dos
-rangos, y un fallo dentro de las operaciones colectivas del último token detiene el servidor (fatal). `--import-dsa-once`
-(con `dsa_once` del productor) envía el estado DSA solo al rango 0, que lo retransmite al rango 1 por el enlace del par
-(8K: de 480 a 316 MB en el enlace del productor, con tokens iguales a los de la entrega de la versión 1). Los prompts importados llevan la identidad FAST
+rangos, y un fallo dentro de las operaciones colectivas del último token detiene el servidor (fatal). DSA una vez (entrega versión 2,
+predeterminada en un par con `--import-listen`; `--no-import-dsa-once` o `STRIX_HANDOFF_SHARED_ONCE=0` vuelve a la
+versión 1) envía el estado DSA solo al rango 0, que lo retransmite al rango 1 por el enlace del par con hash comprobado
+(8K: de 480 a 316 MB en el enlace del productor, de 4,05 a 2,67 s a 1 GbE; 32K: de 1.461 a 807 MB, de 12,38 a 6,90 s;
+la carga del rango 1 es idéntica byte a byte a la de la versión 1, tokens iguales). Los prompts importados llevan la identidad FAST
 `glm-pf-rtx-native-v1` (no son bit a bit el prefill propio del par; el `prefill_route` de cada respuesta la nombra).
 `--import-gate` falla si algún brazo enrutado no importó de verdad (y una batería sin prompts también falla).
 `--import-model-sha` es una atestación del operador: el receptor la compara con la cabecera de la entrega del
