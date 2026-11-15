@@ -230,7 +230,15 @@ struct Args : strix::deepseek41::ServeCachePolicy {
 void apply_cache_profile(Args& a) {
     const char* dir = std::getenv("STRIX_DS41_PREFIX_DIR");
     const char* home = std::getenv("HOME");
+    // DAYAUDIT 1: no stored state under a prefill whose continuation differs from its cold run (same rule, both ranks:
+    // the FAST levers are agreed by the pair); the session cache resumes through the same import + extend
+    a.continuation_decline = strix::deepseek41::prefix_continuation_decline();
     a.resolve(a.device_prefill, !a.hetero_listen.empty(), !a.dspark.empty(), dir ? dir : "", home ? home : "");
+    if (!a.continuation_decline.empty()) {
+        a.session_ram_bytes = 0;
+        a.session_dir.clear();
+        std::fprintf(stderr, "prefix cache and session cache: off (%s)\n", a.continuation_decline.c_str());
+    }
 }
 
 void event(const serve::Json& e) {
@@ -2360,6 +2368,7 @@ void lead(const Args& initial, BatchForward& fwd, strix::dist::Communicator& com
         pf.set("prefill_tokens", serve::Json(st.prefill_tokens));
         pf.set("cached_tokens", serve::Json(st.cached_tokens));
         pf.set("prefill_seconds", serve::Json(st.prefill_seconds));
+        if (!a.continuation_decline.empty()) pf.set("prefix_cache_declined", serve::Json(a.continuation_decline));
         if (a.prefix_cache_mb != 0U) {
             const auto& cs = st.cache;
             serve::Json pc = serve::Json::object();

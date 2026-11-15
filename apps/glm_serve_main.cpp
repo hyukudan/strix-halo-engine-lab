@@ -422,6 +422,69 @@ struct EngineOps {
         }
         return b.y0;
     }
+    // Prefill units (STRIX_GLM_SERVE_PREFILL_UNITS=1): the chunked bootstrap above as one prefill_mtp session over
+    // [pos0, pos0 + tokens) paused at layer boundaries. `start` begins it (tokens sent once), every call runs at most
+    // `units` layer units; the call that completes the prompt seeds the slot as the `last` chunk does and returns y0,
+    // the others gs::kPrefillPending. Same pieces as the whole-prompt call, so its trunk rows and drafter pairs are the
+    // idle run's. `units` 0: cancel the session (a cancelled request).
+    std::uint64_t units_end = 0;  // the session's prompt end (the seed's position)
+    std::uint32_t prefill_units(std::uint32_t slot, std::span<const std::uint32_t> tokens, std::uint64_t pos0, bool start,
+                                std::uint32_t units) {
+        if (units == 0) {
+            eng.prefill_mtp_cancel();
+            return gs::kPrefillPending;
+        }
+        plain_call();
+        if (start) {
+            if (bootstrap != sp::BootstrapPolicy::Chunked) throw std::logic_error("prefill units need the chunked MTP bootstrap");
+            if ((prefix_bootstrap_pending >> slot) & 1U) {
+                control.calibration = sp::Calibration{};
+                control.cycle = control.step = 0;
+                spec.at(slot) = {};
+                hp_row.at(slot) = 0;
+                prefix_bootstrap_pending &= ~(1U << slot);
+            }
+            if (pos0 == 0) {  // a new prompt: as sp::bootstrap
+                control.calibration = sp::Calibration{};
+                control.cycle = control.step = 0;
+            }
+            eng.prefill_mtp_begin(slot, tokens, pos0);
+            units_end = pos0 + tokens.size();
+        }
+        const std::uint64_t at = eng.prefill_units_done(), total = eng.prefill_units_total();
+        const bool finishing = at + units >= total;
+        const auto saved = eng.identity_mode();
+        eng.set_identity_mode(ge::IdentityMode::kR1);
+        ge::Engine::MtpPrefillOut b;
+        bool done = false;
+        try {
+            if (finishing) {
+                auto c = control.next(2);
+                done = eng.prefill_mtp_advance(units, c, b);
+                control.consume(c);
+            } else {
+                ge::Exchange::MergeCtl unused{};  // read only by the call that completes the prompt
+                done = eng.prefill_mtp_advance(units, unused, b);
+            }
+        } catch (...) {
+            eng.set_identity_mode(saved);
+            throw;
+        }
+        eng.set_identity_mode(saved);
+        if (done != finishing) throw std::logic_error("prefill units: completion differs from the unit arithmetic");
+        if (!done) return gs::kPrefillPending;
+        sp::Seed sd;
+        sd.y0 = b.y0;
+        sd.draft = b.mtp.id.at(0);
+        sd.confidence = b.mtp.confidence;
+        sd.hp = b.hp;
+        sd.flagged = b.mtp.flagged;
+        sd.p = units_end;
+        seed = sd;
+        seed_slot = slot;
+        seed_slot_spec(slot, sd);
+        return b.y0;
+    }
     // import: the payload staged under `id` (the RTX producer's per-rank state at frontier P = |tokens| - 1, the
     // Engine::restore_state layout), then the last prompt token through the same call the slot's own prefill makes for
     // it (prefill at P, or the MTP bootstrap from P with its seed kept). Returns the first generated token.
@@ -930,6 +993,8 @@ int main(int argc, char** argv) {
         opt.max_rows = static_cast<unsigned>(std::stoul(eff.max_rows.value));
         opt.auto_rows = false;
         opt.exchange_rows = opt.max_rows;
+        // Prefill units (rd::resolve, serving-only): the decode row window is reserved at load, before admission.
+        opt.prefill_units = mtp_on && eff.prefill == "gemv" && eff.prefill_units.value == "1";
         const std::string& id = eff.identity.value;
         if (id != "r1" && id != "r1b" && id != "r1b-all") throw std::invalid_argument("--identity r1|r1b|r1b-all");
         opt.identity = id == "r1" ? ge::IdentityMode::kR1 : id == "r1b" ? ge::IdentityMode::kR1b : ge::IdentityMode::kR1bAll;
@@ -1155,6 +1220,9 @@ int main(int argc, char** argv) {
         lc.prefill_chunk_cap = opt.max_rows;
         lc.prefill_timeline = static_cast<unsigned>(std::max(0, strix::envcfg::integer("STRIX_SERVE_PREFILL_TIMELINE", 0)));
         lc.prefill_chunk_mtp = prefill_chunk_mtp;
+        lc.prefill_units_rows = opt.prefill_units && prefill_chunk_mtp ? opt.max_rows : 0U;  // max_rows after admission
+        lc.prefill_units_layers = opt.layers;
+        lc.prefill_units_admit = [&eng](std::uint64_t rows) { return eng.prefill_units_admit(rows); };
         lc.mtp = mtp_on;
         lc.mtp_cycles = mtp_cycles;
         lc.g2 = g2_on;

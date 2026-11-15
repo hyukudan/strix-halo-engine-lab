@@ -1,7 +1,7 @@
 # Entrada de imágenes
 
 La entrada de imágenes permite que una petición de chat lleve imágenes. Hoy un solo modelo las admite: DeepSeek V4.1
-en el par de dos nodos. Un runtime de visión compartido sirve a todas las familias; cada modelo solo aporta un adaptador
+en el par de dos nodos. Un [runtime de visión compartido](shared-cores.es.md#los-componentes) sirve a todas las familias; cada modelo solo aporta un adaptador
 (la interfaz del adaptador está en [vision-adapters.md](vision-adapters.md), en inglés).
 
 | Modelo | Entrada de imágenes |

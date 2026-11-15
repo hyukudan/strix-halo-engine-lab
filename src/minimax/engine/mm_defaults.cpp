@@ -113,6 +113,8 @@ constexpr Item kItems[] = {
      "Prefill MoE measurement: exact (partials/xt/at/output bitwise), paired MT8 bands for calls >= 2048 rows: MoE call -0.6..-1.0 % 2048 / -0.9..-1.5 % 4096 rows, 1024 mixed"},
     {"pf_moe_tail_stream", "STRIX_MMX_PREFILL_TAIL_STREAM", "1", "0",
      "Prefill MoE measurement: exact (partials/xt/at/output bitwise), tail classes beside MT8: MoE call -1.9 to -3.0 % real routes"},
+    {"pf_moe_pipe_tail", "STRIX_MMX_PREFILL_PIPE_TAIL", "1", "0",
+     "Prefill MoE measurement: bitwise (pipe-tail fixture 12,480 cells, logits and state fnv of both ranks identical), tail rows (MT 1..7) on the pipelined kernel: PAIR TTFT 8K 12.68 -> 12.47 s, 32K 51.81 -> 50.91 s"},
     {"pf_gather_tok", "STRIX_MMX_PREFILL_GATHER_TOK", "1", "0",
      "Prefill MoE measurement: exact (tiled xt/at, partials, output bitwise), gather 6.35 -> 4.14 ms per 4096-row call"},
     {"pf_router_rows", "STRIX_MM_PF_ROUTER_ROWS", "32", "8",
@@ -232,8 +234,8 @@ PrefillPolicy prefill_policy(const Lookup& env) {
         }
     }
     if (p.msa_flash != 0)
-        p.policies = p.msa_flash == 1 && p.msa_flash_layers == kMsaFlashLayers
-                         ? std::string(flash.policy)
+        p.policies = p.msa_flash == 1 && msa_flash_policy(p.msa_flash_layers) != nullptr
+                         ? std::string(msa_flash_policy(p.msa_flash_layers))
                          : std::string("msa-flash-bf16") + (p.msa_flash == 2 ? "-2term" : "") + "-l" + p.msa_flash_layers;
     if (i4 && fp::switch_on(env(kFastBundle.env)) && !fp::set(raw))
         p.note = std::string(flash.policy) + " not selected by " + kFastBundle.env + " on STRIX_MMX_MODEL_FORMAT=fast_i4";

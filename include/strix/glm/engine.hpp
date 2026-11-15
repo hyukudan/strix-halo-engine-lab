@@ -316,6 +316,9 @@ struct Options {
     bool auto_rows = false;             // recheck admission after communication growth, before weights
     unsigned exchange_rows = 0;         // 0 uses max_rows; startup may grow Comm buffers after selection
     std::uint32_t max_rows = 1024;       // rows per forward call (prefill chunk)
+    // Prefill units (serving under load): reserve 8 decode rows above max_rows in every row buffer a forward writes,
+    // so a prefill piece can pause at a layer boundary while decode runs (prefill_mtp_begin / _advance); ~2.2 MiB.
+    bool prefill_units = false;
     std::uint32_t layers = 45;           // first `layers` main layers only (G3 uses 6); the head needs all 45
     bool mtp = true;                     // load layer 45 (MTP) + its DSA state
     bool raw_linears = false;            // keep raw EXL3 copies of every linear (fused seams need them)
@@ -464,6 +467,21 @@ public:
     };
     MtpPrefillOut prefill_mtp(std::uint32_t slot, std::span<const std::uint32_t> tokens, std::uint64_t pos0,
                              Exchange::MergeCtl& ctl);
+    // prefill_mtp as a session of layer units (strix/session/prefill_session.hpp LayerUnits: pieces of max_rows rows,
+    // `layers` units each). begin takes the prompt (no device work); each advance runs at most `units` layer units of
+    // the current piece onward (a piece's MTP cache after its last layer) and returns with no collective in flight;
+    // the call that completes the prompt runs the head and the drafter seed (`ctl` is used only then) and returns true
+    // with `out` as prefill_mtp's. Pausing inside a piece needs Options::prefill_units: while paused, calls of other
+    // slots (<= 8 rows) run in the reserved decode window. prefill_mtp == begin + advance(~0U): same bits.
+    // Partial advances require prefill_units_admit(tokens.size()); otherwise use whole calls/token chunks.
+    void prefill_mtp_begin(std::uint32_t slot, std::span<const std::uint32_t> tokens, std::uint64_t pos0);
+    bool prefill_mtp_advance(std::uint32_t units, Exchange::MergeCtl& ctl, MtpPrefillOut& out);
+    void prefill_mtp_cancel();
+    // True only when every piece can honor an exact layer-unit budget.
+    [[nodiscard]] bool prefill_units_admit(std::uint64_t rows) const;
+    [[nodiscard]] std::uint32_t prefill_units_done() const;
+    [[nodiscard]] std::uint32_t prefill_units_total() const;
+    [[nodiscard]] bool prefill_units_active() const;
 
     // ---- gates (G3 / G4 / replay)
     // Teacher-forced run of the first `layers` layers over `tokens` (slot 0, positions 0..): returns the 4-stream

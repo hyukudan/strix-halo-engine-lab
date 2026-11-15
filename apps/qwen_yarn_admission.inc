@@ -54,6 +54,7 @@ inline constexpr std::array yarn_environment_rules{
     // Q4_K routed MoE direct-B fragments (STRIX_QPF2K_MOE_DIRECT_B): prepared planes from the mapped file and a different B-operand read (src/hip_moe_direct_b.inc);
     // routed experts hold no rotary work. Its route policy admits plain YaRN prefill only (apps/qwen_moe_direct_b.hpp), never the MTP verifier windows.
     YarnEnvironmentRule{"STRIX_QPF2K_MOE_DIRECT_B", YarnEnvironmentClass::nonrotary, "0|1"},
+    YarnEnvironmentRule{"STRIX_QPF2K_GLU_PAIR", YarnEnvironmentClass::nonrotary, "0|1|2"},
     // OFF arms of levers this route does not admit, so a leave-one-out arm of the composition profile (STRIX_QWEN_ALLON=1 STRIX_X=0) is not itself refused.
     // STRIX_PREFILL_MOE_ROUTE_I8: FAST storage that needs the BF16 route; not qualified for YaRN.
     // STRIX_QPF2K_QSA_UNION_CAP: FAST pruning of the selected set (changes attention). STRIX_QPF2K_QSA_UNION_STATS: device-side counters not audited for YaRN.
@@ -209,6 +210,10 @@ inline constexpr std::array yarn_environment_rules{
     YarnEnvironmentRule{"STRIX_PREFILL_MOE_MERGE_VEC", YarnEnvironmentClass::off_switch, "0|1"},
     YarnEnvironmentRule{"STRIX_QPF2K_WMMA_PIN", YarnEnvironmentClass::off_switch, "0|1"},
     YarnEnvironmentRule{"STRIX_QPF2K_HC_UPCOPY", YarnEnvironmentClass::off_switch, "0|1"},
+    // HC_LOW32=1 keeps the FP32 low tail store an out16 projection skips by default (no reader; same bits either way);
+    // HC_LOW32_POISON=1 fills that tail with NaN after the projection (census seam: the final hash must not move).
+    YarnEnvironmentRule{"STRIX_QPF2K_HC_LOW32", YarnEnvironmentClass::off_switch, "0|1"},
+    YarnEnvironmentRule{"STRIX_QPF2K_HC_LOW32_POISON", YarnEnvironmentClass::diagnostic, "0|1"},
     YarnEnvironmentRule{"STRIX_PREFILL_ROUTER_SELECT", YarnEnvironmentClass::off_switch, "0|1"},
     // Unset is stage mode 2 and "1" a different split, so only the OFF arm is classified.
     YarnEnvironmentRule{"STRIX_ROUTER_STAGE_ACT", YarnEnvironmentClass::off_switch, "0"},

@@ -2550,6 +2550,7 @@ int main() { return 0; }"
         src/hip_moe_experts_launcher.hip
         src/hip_ple_launcher.hip
         src/hip_mtp_resources.hip
+        src/session/cycle_pack.hip
         src/hip_mtp_runtime.hip
         src/hip_mtp_draft_head.hip
         src/hip_mtp_fast_draft.hip
@@ -4195,8 +4196,13 @@ if(STRIX_ENABLE_HIP_RUNTIME)
     target_link_libraries(strix-deepseek41-requant-eval PRIVATE strix_ds41_device_forward strix_dist)
     strix_target_warnings(strix-deepseek41-requant-eval)
     # several requests per forward step (BatchForward), its gate/measurement app and the DeepSeek HTTP server
+    # the DS41 Channel (xport::Channel<prefill_xport::Traits>): prefill lease and decode exchanges (STRIX_DS41_DECODE_XPORT)
+    add_library(strix_ds41_xport STATIC src/hip_deepseek41_prefill_xport.hip)
+    target_link_libraries(strix_ds41_xport PUBLIC strix_dist)
+    target_include_directories(strix_ds41_xport PUBLIC include "${STRIX_HIP_INCLUDE_DIR}")
+    list(APPEND strix_ds41_hip_targets strix_ds41_xport)
     add_library(strix_ds41_batch_forward STATIC src/hip_deepseek41_batch_forward.hip)
-    target_link_libraries(strix_ds41_batch_forward PUBLIC strix_ds41_prepared_load strix_ds41_layer_hip strix_ds41_attention_hip strix_ds41_runtime strix_dist strix_ds41_trellis_hip strix_ds41_pipeline)
+    target_link_libraries(strix_ds41_batch_forward PUBLIC strix_ds41_xport strix_ds41_prepared_load strix_ds41_layer_hip strix_ds41_attention_hip strix_ds41_runtime strix_dist strix_ds41_trellis_hip strix_ds41_pipeline)
     target_include_directories(strix_ds41_batch_forward PUBLIC include "${STRIX_HIP_INCLUDE_DIR}")
     list(APPEND strix_ds41_hip_targets strix_ds41_batch_forward)
     add_executable(strix-deepseek41-batch apps/deepseek41_batch_main.cpp)
@@ -4521,8 +4527,8 @@ if(STRIX_ENABLE_HIP_RUNTIME)
 endif()
 # deepseek41 device prefill: T rows of the decode plan per layer (one node or one of two ranks) and its app.
 if(STRIX_ENABLE_HIP_RUNTIME)
-    add_library(strix_ds41_device_prefill STATIC src/hip_deepseek41_prefill.hip src/hip_deepseek41_prefill_xport.hip)
-    target_link_libraries(strix_ds41_device_prefill PUBLIC strix_ds41_device_forward strix_ds41_prefill_hip strix_ds41_layer_hip
+    add_library(strix_ds41_device_prefill STATIC src/hip_deepseek41_prefill.hip)
+    target_link_libraries(strix_ds41_device_prefill PUBLIC strix_ds41_xport strix_ds41_device_forward strix_ds41_prefill_hip strix_ds41_layer_hip
         strix_ds41_attention_hip strix_dist)
     target_include_directories(strix_ds41_device_prefill PUBLIC include "${STRIX_HIP_INCLUDE_DIR}")
     set_target_properties(strix_ds41_device_prefill PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHS}")
