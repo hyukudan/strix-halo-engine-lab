@@ -3,6 +3,7 @@
 #include "strix/qpf2k_defaults.hpp"
 #include "strix/cohort_step_plan.hpp"
 #include "strix/hip_gdn_decode_fuse.hpp"
+#include "strix/hip_gdn_dims.hpp"
 #include "strix/gdn_recurrent_layout_diagnostic.hpp"
 #include "strix/hip_ggml_weight_formats.hpp"
 #ifdef STRIX_BUILD_GDN_LM_WAVE8_DIAGNOSTIC
@@ -2215,6 +2216,28 @@ __global__ void gated_rms_norm_kernel(
             norm_kind,
             threadIdx.x) *
         gate_value;
+}
+
+// Swish-gated variant (qwen35 dense): core = core * rsqrt(mean(core^2)+eps) * w * silu(z). Same reduction tree
+// as gated_rms_norm_kernel (the sigmoid kind keeps its own kernel, so its bits and ISA are untouched).
+__global__ void gated_rms_norm_swish_kernel(
+    float* core, const float* z, const void* norm_weights, SmallWeightKind norm_kind,
+    std::uint32_t heads, std::uint32_t head_dim, float epsilon) {
+    const auto head = static_cast<std::uint32_t>(blockIdx.x);
+    if (head >= heads || threadIdx.x >= head_dim) return;
+    __shared__ float scratch[kRecurrentThreads];
+    const auto index = static_cast<std::uint64_t>(head) * head_dim + threadIdx.x;
+    const float value = core[index];
+    scratch[threadIdx.x] = value * value;
+    __syncthreads();
+    for (std::uint32_t stride = kRecurrentThreads / 2U; stride > 0; stride >>= 1U) {
+        if (threadIdx.x < stride) scratch[threadIdx.x] += scratch[threadIdx.x + stride];
+        __syncthreads();
+    }
+    const float inv = rsqrtf(scratch[0] / static_cast<float>(head_dim) + epsilon);
+    const float zv = z[index];
+    const float gate_value = zv / (1.0F + expf(-zv));
+    core[index] = value * inv * load_small(norm_weights, norm_kind, threadIdx.x) * gate_value;
 }
 
 // Deferred-commit window. Every arithmetic expression and reduction tree below
@@ -7890,6 +7913,39 @@ void hip_gdn_decode_fuse_fixture(const HipGdnDecodeFuseFixture& v, bool fuse,
     hipLaunchKernelGGL(gated_rms_norm_kernel, dim3(v.value_heads), dim3(d), 0, stream,
         v.core, v.z, v.norm, kind, v.value_heads, d, v.rms_epsilon, status);
     check_hip(hipGetLastError(), "HIP GDN decode fusion fixture launch");
+}
+
+void hip_gdn_decode_step_dims(const HipGdnDimsStep& v, void* stream_ptr) {
+    const auto stream = static_cast<hipStream_t>(stream_ptr);
+    constexpr unsigned d = kRecurrentThreads;
+    if (v.head_dim != d || v.value_heads % v.key_heads != 0U || v.kernel == 0U)
+        throw std::invalid_argument("hip_gdn_decode_step_dims: head_dim must be 128 and value_heads a multiple of key_heads");
+    const auto kind = small_weight_kind(v.small_type);
+    const unsigned channels = (2U * v.key_heads + v.value_heads) * d;
+    // Rows run one after the other (R1 per row): row r is bit-identical alone or in any window.
+    for (unsigned r = 0; r < v.rows; ++r) {
+        float* qkv = v.qkv + std::size_t(r) * channels;
+        float* beta = v.beta + std::size_t(r) * v.value_heads;
+        float* gate = v.gate + std::size_t(r) * v.value_heads;
+        float* core = v.core + std::size_t(r) * v.value_heads * d;
+        const float* z = v.z + std::size_t(r) * v.value_heads * d;
+        hipLaunchKernelGGL(conv_update_kernel, dim3((channels + kProjectionThreads - 1U) / kProjectionThreads),
+            dim3(kProjectionThreads), 0, stream, qkv, v.conv_state, v.conv, kind, channels, v.kernel,
+            static_cast<std::uint32_t*>(nullptr));
+        hipLaunchKernelGGL(transform_beta_gate_kernel, dim3((v.value_heads + kProjectionThreads - 1U) / kProjectionThreads),
+            dim3(kProjectionThreads), 0, stream, beta, gate, v.dt, kind, v.a, kind, v.value_heads);
+        hipLaunchKernelGGL(normalize_qk_kernel, dim3(v.key_heads * 2U), dim3(d), 0, stream,
+            qkv, v.key_heads, d, v.qk_epsilon, static_cast<std::uint32_t*>(nullptr));
+        hipLaunchKernelGGL(recurrent_step_kernel, dim3(v.value_heads * (d / kValueTile)), dim3(d), 0, stream,
+            qkv, beta, gate, v.matrix, core, v.key_heads, v.value_heads, d, static_cast<std::uint32_t*>(nullptr));
+        if (v.norm_kind == HipGdnGatedNorm::swish)
+            hipLaunchKernelGGL(gated_rms_norm_swish_kernel, dim3(v.value_heads), dim3(d), 0, stream,
+                core, z, v.norm, kind, v.value_heads, d, v.rms_epsilon);
+        else
+            hipLaunchKernelGGL(gated_rms_norm_kernel, dim3(v.value_heads), dim3(d), 0, stream,
+                core, z, v.norm, kind, v.value_heads, d, v.rms_epsilon, static_cast<std::uint32_t*>(nullptr));
+    }
+    check_hip(hipGetLastError(), "HIP GDN dims decode step launch");
 }
 
 }  // namespace strix
