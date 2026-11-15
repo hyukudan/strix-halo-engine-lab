@@ -26,7 +26,8 @@ env_of() {
   case $1 in
     e*) echo "STRIX_MM_PF_MSA_FLASH=0";;
     n*) local x=${1#n}; echo "STRIX_MM_PF_MSA_FLASH=0 STRIX_MM_DIAG_ATTN_ULP=${x%%s*}:${x##*s}";;
-    f*) local x=${1#f}; echo "STRIX_MM_PF_MSA_FLASH=$(( ${x##*m} - 10 )) STRIX_MM_PF_MSA_FLASH_LAYERS=${x%%m*}";;
+    f*) local x=${1#f} ix=''; if [[ $x == *i* ]]; then ix=${x##*i}; x=${x%i*}; fi
+        echo "STRIX_MM_PF_MSA_FLASH=$(( ${x##*m} - 10 )) STRIX_MM_PF_MSA_FLASH_LAYERS=${x%%m*}${ix:+ STRIX_MM_PF_IDX_WMMA=1 STRIX_MM_PF_IDX_WMMA_LAYERS=$ix}";;
     d*) local x=${1#d} r s g; r=${x%%s*}; s=${x#*s}; g=${s##*g}; s=${s%%g*}; echo "STRIX_MM_PF_MSA_FLASH=0 STRIX_MM_DIAG_ATTN_ULP=$r:$s:$g";;
     *) return 1;;
   esac
@@ -34,7 +35,7 @@ env_of() {
 [[ $REF =~ ^[A-Za-z0-9._-]+$ ]] && [ "$REF" != . ] && [ "$REF" != .. ] || exit 64
 declare -A seen=()
 for a in "$@"; do
-  [[ $a =~ ^(e[A-Za-z0-9._-]+|n[0-9]+s[0-9]+|f[0-9]+-[0-9]+m(11|12)|d[0-9]+-[0-9]+s[0-9]+g[0-9]+)$ ]] || exit 64
+  [[ $a =~ ^(e[A-Za-z0-9._-]+|n[0-9]+s[0-9]+|f[0-9]+-[0-9]+m(11|12)(i[0-9]+-[0-9]+)?|d[0-9]+-[0-9]+s[0-9]+g[0-9]+)$ ]] || exit 64
   [ -z "${seen[$a]:-}" ] || exit 64
   seen[$a]=1
   case $a in f*|d*) printf '%s\t%s\tabsolute\n' "$a-abs" "$a" >> "$K/cmp/expected.tsv";; esac

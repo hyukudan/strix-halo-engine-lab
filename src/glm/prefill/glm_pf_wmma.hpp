@@ -32,6 +32,9 @@ inline bool enabled() {
     throw std::invalid_argument("STRIX_GLM_PF_KDA_WMMA must be 0 or 1");
 }
 inline std::atomic<std::uint64_t> calls{0};  // launches that ran on the WMMA core (identity reporting)
+// x16 tile form of the WMMA groups of x (KDA f_a | g_a | b and the indexer group): same bits as the direct form.
+// STRIX_GLM_PF_X16=0 restores the direct form (A/B and rollback).
+inline bool x16_enabled() { return strix::env_flag_default_on("STRIX_GLM_PF_X16"); }
 inline std::atomic<std::uint64_t> x16_calls{0};  // of those, the x16 tile form (core f16_dense_tall X16Cols; same bits)
 }  // namespace strix::glm::pf::kda_wmma
 

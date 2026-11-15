@@ -169,7 +169,8 @@ public:
             throw std::invalid_argument("STRIX_GLM_PF_KDA_PACK must be 0 or 1");
         kda_pack_ = kp && std::string(kp) == "1";  // 1 = contiguous KDA projections + pack_qkv (the pre-strided form)
         kda_wmma_ = kda_wmma::enabled();  // FAST identity glm-pf-kda-wmma-v1 (f_a / g_a / b / f_b / g_b on WMMA): default with STRIX_GLM_PF_WMMA=1
-        idxproj_wmma_ = idxproj_wmma::enabled();  // FAST identity glm-pf-idxproj-wmma-v1 (indexer wk / gate / weights_proj on WMMA)
+        idxproj_wmma_ = idxproj_wmma::enabled();
+        x16_ = kda_wmma::x16_enabled();  // x16 tiles for the WMMA groups of x (same bits); STRIX_GLM_PF_X16=0: direct form  // FAST identity glm-pf-idxproj-wmma-v1 (indexer wk / gate / weights_proj on WMMA)
         (void)exact::tile_rows();
         route_ids_.resize(R * kTopE);
         route_weights_.resize(R * kTopE);
@@ -281,7 +282,7 @@ public:
             if (kda_wmma_ && kda_wmma::supported(D::WType::F16, kHidden, px, 3, R) &&
                 kda_wmma::supported(D::WType::F16, kKdaDim, &pf, 1, R) && kda_wmma::supported(D::WType::F16, kKdaDim, &pg, 1, R)) {
                 // FAST (default with the FAST route): the same five projections on the shared dense FP16 WMMA core.
-                kda_wmma::dense_group(x, kHidden, px, 3, R, c.stream, xt_);  // x16 form from kX16Rows rows (same bits)
+                kda_wmma::dense_group(x, kHidden, px, 3, R, c.stream, x16_ ? xt_ : nullptr);  // x16 from kX16Rows rows (same bits)
                 kda_wmma::dense_group(ta_, kKdaDim, &pf, 1, R, c.stream);
                 kda_wmma::dense_group(tb128_, kKdaDim, &pg, 1, R, c.stream);
             } else {
@@ -318,7 +319,7 @@ public:
         {  // wk, gate and weights_proj of x in one dense v3 launch (wh_ is read only by the indexer below); same bits
             const DenseProj px[3] = {{w.wk, 0, kIdxDim, key_}, {w.gate, 0, kIdxDim, gate_}, {w.weights_proj, 0, kIdxHeads, wh_}};
             if (idxproj_wmma_ && kda_wmma::supported(D::WType::F16, kHidden, px, 3, R)) {
-                kda_wmma::dense_group(x, kHidden, px, 3, R, c.stream, xt_, idxproj_wmma::calls);  // FAST glm-pf-idxproj-wmma-v1
+                kda_wmma::dense_group(x, kHidden, px, 3, R, c.stream, x16_ ? xt_ : nullptr, idxproj_wmma::calls);  // FAST glm-pf-idxproj-wmma-v1
             } else {
                 dense_rows_group(x, D::WType::F16, kHidden, px, 3, R, c.stream);
             }
@@ -616,6 +617,7 @@ private:
     bool kda_pack_ = false;
     bool kda_wmma_ = false;
     bool idxproj_wmma_ = false;
+    bool x16_ = true;
     _Float16* xt_ = nullptr;
     void* moe_ws_ = nullptr;
     std::size_t moe_wsb_ = 0;
