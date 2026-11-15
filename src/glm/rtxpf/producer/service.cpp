@@ -422,7 +422,7 @@ int main(int argc,char** argv){p::install_crash_report();try{
         std::thread([&,fd]{w::SocketOwner client;client.fd=fd;DWORD timeout=120000;setsockopt(fd,SOL_SOCKET,SO_RCVTIMEO,reinterpret_cast<char*>(&timeout),sizeof timeout);setsockopt(fd,SOL_SOCKET,SO_SNDTIMEO,reinterpret_cast<char*>(&timeout),sizeof timeout);
             try{auto req=request(fd);if(req.method=="GET"&&req.path=="/health"){response(fd,200,health);}
                 else if(req.method=="POST"&&req.path=="/v1/prefill"){
-                    auto body=strix::serve::parse_json(req.body);fields(body,{"tokens","handoff","identity"});auto& handoff=field(body,"handoff");fields(handoff,{"rank0","rank1","key","node_identity","dsa_once"});
+                    auto body=strix::serve::parse_json(req.body);fields(body,{"tokens","handoff","identity"});auto& handoff=field(body,"handoff");fields(handoff,{"rank0","rank1","key","node_identity","dsa_once","index_tail"});
                     // The request supplies the raw shared key as 64 hex digits;
                     // compare to the startup key before connecting to either rank.
                     auto supplied=w::unhex(field(handoff,"key").as_string());auto expected=w::hash(expected_key);
@@ -432,9 +432,11 @@ int main(int argc,char** argv){p::install_crash_report();try{
                     auto node=handoff.find("node_identity")?handoff.find("node_identity")->as_string():"r1b";w::require(node=="r1"||node=="r1b"||node=="r1b-all","node identity");
                     // dsa_once (wire Begin.version 2): rank 1 receives the KDA components only; the pair relays its DSA from rank 0.
                     const bool dsa_once=handoff.find("dsa_once")&&handoff.find("dsa_once")->as_bool();
+                    // index_tail (wire Begin.version 3/4): the DSA index key/gate carry only the open pool block's rows.
+                    const bool index_tail=handoff.find("index_tail")&&handoff.find("index_tail")->as_bool();
                     std::vector<std::uint32_t> tokens;for(auto& t:field(body,"tokens").as_array()){auto n=t.as_int();w::require(n>=0&&n<154880,"token out of vocabulary");tokens.push_back(std::uint32_t(n));}w::require(tokens.size()>=2&&tokens.size()<=capacity,"prompt capacity");
                     std::unique_lock lock(busy,std::try_to_lock);if(!lock.owns_lock()){response(fd,503,"{\"error\":\"producer busy\"}");--connections;return;}
-                    auto started=std::chrono::steady_clock::now();w::Begin b;b.layers=46;b.frontier=tokens.size()-1;b.total=tokens.size();b.node=node;b.producer=id;b.version=dsa_once?2:1;b.model=w::unhex(runtime.model_sha256());b.prompt=w::hash(std::as_bytes(std::span(tokens)));std::random_device random;for(auto& x:b.transaction.bytes)x=std::uint8_t(random());
+                    auto started=std::chrono::steady_clock::now();w::Begin b;b.layers=46;b.frontier=tokens.size()-1;b.total=tokens.size();b.node=node;b.producer=id;b.version=w::wire_version(dsa_once,index_tail);runtime.set_index_tail_export(index_tail);b.model=w::unhex(runtime.model_sha256());b.prompt=w::hash(std::as_bytes(std::span(tokens)));std::random_device random;for(auto& x:b.transaction.bytes)x=std::uint8_t(random());
                     auto connect_rank=[&](unsigned rank){auto begin=b;begin.rank=rank;auto endpoint=field(handoff,rank?"rank1":"rank0").as_string();return std::make_unique<p::Sender>(endpoint,expected_key,begin);};
                     auto c0=std::async(std::launch::async,connect_rank,0),c1=std::async(std::launch::async,connect_rank,1);
                     AsyncSender rank0(c0.get()),rank1(c1.get());

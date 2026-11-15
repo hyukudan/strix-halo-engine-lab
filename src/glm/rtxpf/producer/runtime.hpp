@@ -158,6 +158,9 @@ public:
     void set_row_kernels(const std::string& value); // decode_row_kernels between requests (no session work in flight)
     std::string row_kernels()const;
     void set_dsa_short_skip(bool on); // between commands, no session work in flight
+    // Hand-off index tail (wire v3/v4): export_state downloads and sends only the open pool block's DSA index key /
+    // gate rows [P - P % 4, P); the closed blocks go as pooled rows. Between requests.
+    void set_index_tail_export(bool on);
     bool dsa_short_skip()const;
     // Writes the cache residency (most recent first) to the residency file; "" when off. Between requests.
     std::string save_residency();

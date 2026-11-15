@@ -538,6 +538,9 @@ struct EngineOps {
     // 'DSA once' (--import-dsa-once on every rank): the receivers expect hand-off version 2 and import_state relays rank
     // 0's DSA components to rank 1 (relay: one pair exchange; layout: the full per-rank component list at frontier P).
     bool dsa_once = false;
+    // Index tail (--import-index-tail on every rank: hand-off v3/v4): the DSA index key / gate arrive as the open pool
+    // block only and restore_state leaves the closed blocks' rows at their reset value (never read).
+    strix::state::RawRows index_rows = strix::state::RawRows::full;
     std::function<void(std::span<const std::byte> local, std::span<std::byte> remote, std::uint64_t seq)> relay{};
     std::function<std::vector<gs::StateComponent>(std::uint64_t frontier, std::uint64_t total)> state_layout{};
     std::size_t relay_chunk = 0;
@@ -608,8 +611,8 @@ struct EngineOps {
             },
             [&] {
                 t0 = std::chrono::steady_clock::now();
-                if (!merged.empty()) eng.restore_state(slot, merged, p);
-                else eng.restore_state(slot, mine, p);
+                if (!merged.empty()) eng.restore_state(slot, merged, p, index_rows);
+                else eng.restore_state(slot, mine, p, index_rows);
                 t1 = std::chrono::steady_clock::now();
             },
             [&]() -> std::uint32_t {
@@ -858,6 +861,7 @@ int main(int argc, char** argv) {
         bool import_gate_on = false;          // --import-gate given (an empty list is a gate that FAILs, not serving)
         unsigned import_gate_tokens = 64;
         bool import_dsa_once = false;         // every rank: hand-off v2, rank 0 relays the DSA components to rank 1
+        bool import_index_tail = false;       // every rank: hand-off v3/v4, DSA index key/gate as the open pool block only
         std::vector<std::string> rank_args;  // the options the rank defaults depend on (rd::scan)
         for (int i = 2; i < argc; ++i) {
             const std::string a = argv[i];
@@ -927,6 +931,7 @@ int main(int argc, char** argv) {
             }
             else if (a == "--import-gate-tokens") import_gate_tokens = static_cast<unsigned>(std::stoul(next()));
             else if (a == "--import-dsa-once") import_dsa_once = true;
+            else if (a == "--import-index-tail") import_index_tail = true;
             else if (strix::session::speculation_opt_out_argument(a)) serve_mtp = false;
             else throw std::invalid_argument("unknown option " + a);
         }
@@ -982,8 +987,9 @@ int main(int argc, char** argv) {
                         mtp_on ? "on" : "off", eff.kmax, eff.adaptive ? 1 : 0, mtp_cycles);
             // The RTX import route (FAST identity glm-pf-rtx-native-v1: imported prompts are not bitwise the pair's own
             // prefill; off unless --rtx-prefill / --import-listen are given).
-            std::printf("serve import-route=%s import-listen=%s wire=v%u identity=%s\n", rtx_prefill.empty() ? "off" : "rtx",
-                        import_listen.empty() ? "off" : "on", import_dsa_once ? 2U : 1U,
+            std::printf("serve import-route=%s import-listen=%s wire=v%u index-rows=%s identity=%s\n", rtx_prefill.empty() ? "off" : "rtx",
+                        import_listen.empty() ? "off" : "on", gi::wire_version(import_dsa_once, import_index_tail),
+                        import_index_tail ? "open_tail" : "full",
                         rtx_prefill.empty() && import_listen.empty() ? "exact" : "exact+FAST(glm-pf-rtx-native-v1, imported prompts)");
             return 0;
         }
@@ -1111,7 +1117,7 @@ int main(int argc, char** argv) {
             const auto model = gi::unhex(import_model_sha);
             const unsigned rank = opt.rank;
             const std::string ep = import_listen, node = import_node;
-            const unsigned version = import_dsa_once ? 2U : 1U;
+            const unsigned version = gi::wire_version(import_dsa_once, import_index_tail);
             // One hand-off per import_expect: the header must equal this rank's expectation (model, prompt hash,
             // frontier, layout, rank, node); the frames' payloads, in order, are the Engine::restore_state bytes.
             ops.stager = std::make_unique<gs::ImportStager>([key, model, rank, ep, node, version](std::uint32_t iid, std::span<const std::uint32_t> t,
@@ -1157,9 +1163,11 @@ int main(int argc, char** argv) {
                 };
             }
             ops.dsa_once = import_dsa_once;
+            ops.index_rows = gi::index_form(version);
             // The full per-rank component list of a v1 hand-off (= this rank's restore_state layout) at frontier P.
-            ops.state_layout = [rank](std::uint64_t frontier, std::uint64_t total) {
+            ops.state_layout = [rank, tail = import_index_tail](std::uint64_t frontier, std::uint64_t total) {
                 gi::Begin b;
+                b.version = gi::wire_version(false, tail);  // every component of this rank, index tail when on
                 b.rank = rank;
                 b.frontier = frontier;
                 b.total = total;
@@ -1186,8 +1194,8 @@ int main(int argc, char** argv) {
 
         // RTX import settings every rank must share: a mismatch refuses at hello, before serving.
         if (!import_listen.empty()) {
-            hello.import_flags = 1U | (import_dsa_once ? 2U : 0U);
-            hello.import_wire = import_dsa_once ? 2U : 1U;
+            hello.import_flags = 1U | (import_dsa_once ? 2U : 0U) | (import_index_tail ? 4U : 0U);
+            hello.import_wire = gi::wire_version(import_dsa_once, import_index_tail);
             hello.import_model_hash = gs::attested_model_hash(import_model_sha);  // canonical: the parsed 32 bytes
         }
         std::signal(SIGINT, on_signal);
@@ -1244,11 +1252,13 @@ int main(int argc, char** argv) {
             // The RTX producer prefills and sends each rank its state (POST /v1/prefill, the hand-off of service.cpp);
             // it answers only after both ranks sealed, so the call runs off the lead's thread. Any non-200 marks the
             // import failed and the slot prefills itself at once.
-            lc.rtx_prefill = [failed, rtx, ep0, ep1, node, key_hex, dsa_once = import_dsa_once](std::span<const std::uint32_t> prompt, std::uint32_t iid) {
+            lc.rtx_prefill = [failed, rtx, ep0, ep1, node, key_hex, dsa_once = import_dsa_once,
+                              index_tail = import_index_tail](std::span<const std::uint32_t> prompt, std::uint32_t iid) {
                 std::string body = "{\"tokens\":[";
                 for (std::size_t i = 0; i < prompt.size(); ++i) body += (i ? "," : "") + std::to_string(prompt[i]);
                 body += "],\"identity\":\"glm-pf-rtx-native-v1\",\"handoff\":{\"rank0\":\"" + ep0 + "\",\"rank1\":\"" + ep1 + "\",\"key\":\"" +
-                        key_hex + "\",\"node_identity\":\"" + node + "\"" + (dsa_once ? ",\"dsa_once\":true" : "") + "}}";
+                        key_hex + "\",\"node_identity\":\"" + node + "\"" + (dsa_once ? ",\"dsa_once\":true" : "") +
+                        (index_tail ? ",\"index_tail\":true" : "") + "}}";
                 std::thread([failed, rtx, body, iid] {
                     int status = 0;
                     std::string reply;

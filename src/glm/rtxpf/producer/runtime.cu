@@ -15,6 +15,7 @@
 #include "state_slices.hpp"
 #include "strix/serve/json.hpp"
 #include "strix/model_content_hash.hpp"
+#include "glm/rtxpf/import/glm_state_layout.hpp"
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
@@ -622,6 +623,7 @@ struct Runtime::Impl {
     DsaState dstate(){return {latent.as<U16>(),key.as<U16>(),gate.as<U16>(),pooled.as<float>(),capacity};}
     // Prefill writes either the shared release buffers (legacy) or one resident
     // per-layer state set (session). Legacy pointers/launches are unchanged.
+    bool index_tail_export=false;  // hand-off v3/v4: index key/gate exported as the open pool block only
     bool in_session=false;
     float* kst(unsigned l){return in_session?kda_s.as<float>()+std::size_t(kda_slot(l))*(kda_state_bytes/4):state.as<float>();}
     float* kcv(unsigned l){return in_session?kda_c.as<float>()+std::size_t(kda_slot(l))*(kda_conv_bytes/4):conv.as<float>();}
@@ -661,7 +663,10 @@ struct Runtime::Impl {
             }
         }else{
             auto d=dstate(l);
-            for(auto pair:{std::pair<const void*,unsigned>{d.latent,2},{d.key,3},{d.gate,4},{d.pooled,5}}){auto bytes=pair.second==2?std::size_t(P)*1024:pair.second==5?std::size_t(P/4)*512:std::size_t(P)*256;if(!bytes)continue;auto out=download(pair.first,bytes);for(unsigned rank=0;rank<2;++rank)sink(rank,l,pair.second,out);}
+            // Index key / gate: the full prefix, or with the index tail only the open pool block's rows (the slot rows
+            // the wire's component_rows() names); one download serves both ranks.
+            const auto index=state_layout::index_rows(index_tail_export?strix::state::RawRows::open_tail:strix::state::RawRows::full,P);
+            for(auto pair:{std::pair<const void*,unsigned>{d.latent,2},{d.key,3},{d.gate,4},{d.pooled,5}}){const bool idx=pair.second==3||pair.second==4;auto bytes=pair.second==2?std::size_t(P)*1024:pair.second==5?std::size_t(P/4)*512:std::size_t(index.rows)*256;if(!bytes)continue;auto out=download(static_cast<const std::byte*>(pair.first)+(idx?std::size_t(index.first)*256:0),bytes);for(unsigned rank=0;rank<2;++rank)sink(rank,l,pair.second,out);}
         }
     }
     DsaIndex index(const std::string& id){if(id=="glm-pf-rtx-native-v1"||id==dsa_identity)return DsaIndex::fp32;for(auto v:{DsaIndex::mma,DsaIndex::mma_proj_fp32_score,DsaIndex::fp32_proj_mma_score,DsaIndex::tf32x3})if(id==dsa_index_identity(v))return v;throw std::runtime_error("unsupported producer identity");}
@@ -1618,6 +1623,7 @@ std::string Runtime::plan_budget(const std::string& model,unsigned cap,unsigned 
 std::string Runtime::memory_report(const std::string& stage){return p_->memory_json(stage).dump();}
 void Runtime::set_decode_profile(bool on){if(on){p_->timeline.enable();p_->index_query_pool.enable();}else p_->timeline.on=false;if(p_->ts_tier){if(on)p_->ts_tier->enable_census();else p_->ts_tier->census_on=false;}}
 void Runtime::set_row_kernels(const std::string& v){ck(cudaStreamSynchronize(p_->compute.s));set_row_kernels_value(p_->dopt,v);}
+void Runtime::set_index_tail_export(bool on){ck(cudaStreamSynchronize(p_->compute.s));p_->index_tail_export=on;}
 void Runtime::set_dsa_short_skip(bool on){ck(cudaStreamSynchronize(p_->compute.s));p_->dopt.dsa_short_skip=on;p_->tier_plan.set("dsa_short_skip",on?1:0);}
 bool Runtime::dsa_short_skip()const{return p_->dopt.dsa_short_skip;}
 std::string Runtime::row_kernels()const{return row_kernels_name(p_->dopt);}
