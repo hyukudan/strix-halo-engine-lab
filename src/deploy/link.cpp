@@ -2,7 +2,7 @@
 
 #include <algorithm>
 #include <array>
-#include <functional>
+#include <limits>
 
 namespace strix::deploy {
 namespace {
@@ -79,48 +79,71 @@ PathResult best_path(const LinkGraph& graph, std::string_view from, std::string_
         return out;
     }
     if (from == to) { out.path = LinkPath{}; return out; }
-    std::vector<std::size_t> stack;
-    std::vector<std::string_view> visited{from};
+    const auto N = graph.nodes.size();
+    const auto index = [&](std::string_view id) {
+        return static_cast<std::size_t>(std::find(graph.nodes.begin(), graph.nodes.end(), id) - graph.nodes.begin());
+    };
+    const auto source = index(from), target = index(to);
+    const double inf = std::numeric_limits<double>::infinity();
+    struct Arc { std::size_t next, edge; double rate; };
+    std::vector<std::vector<Arc>> adj(N);
     std::string blocked;
-    // Rank: larger bottleneck (copy-free counts as infinite), then smaller rtt, then fewer edges.
-    const auto better = [](const LinkPath& x, const LinkPath& y) {
-        const double bx = x.copy_free() ? 1e300 : x.gbytes_ps, by = y.copy_free() ? 1e300 : y.gbytes_ps;
-        if (bx != by) return bx > by;
-        if (x.rtt_us != y.rtt_us) return x.rtt_us < y.rtt_us;
-        return x.edges.size() < y.edges.size();
-    };
-    std::function<void(std::string_view)> walk = [&](std::string_view at) {
-        if (at == to) {
-            LinkPath p;
-            p.edges = stack;
-            for (const auto i : stack) {
-                const auto& e = graph.edges[i];
-                p.rtt_us += e.rtt_us;
-                p.uncertainty = std::max(p.uncertainty, e.uncertainty);
-                if (e.source != RateSource::integrated)
-                    p.gbytes_ps = p.gbytes_ps == 0 ? e.gbytes_ps : std::min(p.gbytes_ps, e.gbytes_ps);
-            }
-            if (!out.path || better(p, *out.path)) out.path = std::move(p);
-            return;
+    for (std::size_t i = 0; i < graph.edges.size(); ++i) {
+        const auto& e = graph.edges[i];
+        if (e.source == RateSource::unknown) {
+            if (blocked.empty()) blocked = e.name + " has no measured rate and no link class";
+            continue;
         }
-        for (std::size_t i = 0; i < graph.edges.size(); ++i) {
-            const auto& e = graph.edges[i];
-            const std::string_view next = e.a == at ? std::string_view(e.b) : e.b == at ? std::string_view(e.a) : std::string_view();
-            if (next.empty() || std::find(visited.begin(), visited.end(), next) != visited.end()) continue;
-            if (e.source == RateSource::unknown) {
-                if (blocked.empty()) blocked = e.name + " has no measured rate and no link class";
-                continue;
-            }
-            visited.push_back(next);
-            stack.push_back(i);
-            walk(next);
-            visited.pop_back();
-            stack.pop_back();
-        }
-    };
-    walk(from);
-    if (!out.path)
+        const auto a = index(e.a), b = index(e.b);
+        if (a == N || b == N) continue;
+        const double rate = e.source == RateSource::integrated ? inf : e.gbytes_ps;
+        if (!(rate > 0) || !(e.rtt_us >= 0)) continue;
+        adj[a].push_back({b, i, rate});
+        adj[b].push_back({a, i, rate});
+    }
+    // Widest path, then shortest RTT/fewest hops restricted to that bottleneck.
+    // Two label-setting passes avoid enumerating exponentially many simple paths.
+    std::vector<double> width(N, 0), distance(N, inf);
+    std::vector<bool> done(N, false);
+    width[source] = inf;
+    for (std::size_t step = 0; step < N; ++step) {
+        std::size_t at = N;
+        for (std::size_t i = 0; i < N; ++i)
+            if (!done[i] && (at == N || width[i] > width[at])) at = i;
+        if (at == N || width[at] == 0) break;
+        done[at] = true;
+        for (const auto& a : adj[at]) width[a.next] = std::max(width[a.next], std::min(width[at], a.rate));
+    }
+    if (width[target] == 0) {
         out.reason = blocked.empty() ? "no declared link joins " + std::string(from) + " and " + std::string(to) : blocked;
+        return out;
+    }
+    std::fill(done.begin(), done.end(), false);
+    std::vector<std::size_t> hops(N, N), previous(N, N), edge(N, 0);
+    distance[source] = 0; hops[source] = 0;
+    for (std::size_t step = 0; step < N; ++step) {
+        std::size_t at = N;
+        for (std::size_t i = 0; i < N; ++i)
+            if (!done[i] && (at == N || distance[i] < distance[at] ||
+                            (distance[i] == distance[at] && hops[i] < hops[at]))) at = i;
+        if (at == N || distance[at] == inf) break;
+        done[at] = true;
+        for (const auto& a : adj[at]) {
+            if (done[a.next] || a.rate < width[target]) continue;
+            const double d = distance[at] + graph.edges[a.edge].rtt_us;
+            if (d < distance[a.next] || (d == distance[a.next] && hops[at] + 1 < hops[a.next])) {
+                distance[a.next] = d; hops[a.next] = hops[at] + 1;
+                previous[a.next] = at; edge[a.next] = a.edge;
+            }
+        }
+    }
+    LinkPath p;
+    for (auto at = target; at != source; at = previous[at]) p.edges.push_back(edge[at]);
+    std::reverse(p.edges.begin(), p.edges.end());
+    p.gbytes_ps = width[target] == inf ? 0 : width[target];
+    p.rtt_us = distance[target];
+    for (const auto i : p.edges) p.uncertainty = std::max(p.uncertainty, graph.edges[i].uncertainty);
+    out.path = std::move(p);
     return out;
 }
 

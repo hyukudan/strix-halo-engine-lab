@@ -54,10 +54,12 @@ struct PathResult {
 };
 
 // Best path: the largest bottleneck rate, then the smallest round trip, then the fewest edges. Pieces stream, so a
-// multi-hop transfer is limited by its slowest edge, not by the sum of hops.
+// multi-hop transfer on independent resources is limited by its slowest edge. Route timing additionally
+// accounts for repeated/shared resource use. Search is polynomial (widest path, then RTT/hop minimization).
 [[nodiscard]] PathResult best_path(const LinkGraph& graph, std::string_view from, std::string_view to);
 
-// Milliseconds to move `bytes` in `messages` acknowledged messages over `path` (one round trip per message).
+// Isolated-path lower bound, assuming independent hop resources (one round trip per message).
+// The route planner uses graph resource accounting when resources are shared or repeated.
 [[nodiscard]] double transfer_ms(const LinkPath& path, std::uint64_t bytes, std::uint64_t messages = 1) noexcept;
 
 } // namespace strix::deploy

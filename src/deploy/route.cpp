@@ -55,6 +55,12 @@ std::string join(const std::vector<std::string>& unit) {
     for (const auto& id : unit) out += (out.empty() ? "" : "+") + id;
     return out;
 }
+bool unique_unit(const std::vector<std::string>& unit) {
+    return !unit.empty() && std::set<std::string>(unit.begin(), unit.end()).size() == unit.size();
+}
+bool overlaps(const std::vector<std::string>& a, const std::vector<std::string>& b) {
+    return std::any_of(a.begin(), a.end(), [&](const auto& id) { return std::find(b.begin(), b.end(), id) != b.end(); });
+}
 std::string quote(const std::string& s) {
     static constexpr char hex[] = "0123456789abcdef";
     std::string out = "\"";
@@ -132,6 +138,7 @@ struct Ctx {
     LinkGraph graph;
     std::uint64_t rows = 0, margin = 0;
     std::uint32_t slots = 1;
+    mutable std::map<std::pair<std::string, std::string>, PathResult> paths;
 };
 
 const device::Descriptor* descriptor(const Ctx& c, const std::string& id) {
@@ -146,16 +153,16 @@ std::string role_check(const Ctx& c, const std::vector<std::string>& unit, bool 
         const auto* d = descriptor(c, id);
         if (!d) return "device " + id + " is not declared";
         if (d->excluded) return "device " + id + " is excluded" + (d->reason.empty() ? "" : ": " + d->reason);
-        std::string why;
-        bool ok = false;
-        if (decoding)
+        if (decoding) {
+            bool ok = false;
             for (const auto* role : {"decode", "pair", "replica"})
                 if (device::role_refusal(*d, role).empty()) ok = true;
-        if (!ok && prefill_stage) {
-            why = device::role_refusal(*d, "prefill");
-            ok = why.empty();
+            if (!ok) return "device " + id + " takes no decode, pair or replica role";
         }
-        if (!ok) return why.empty() ? "device " + id + " takes no decode, pair or replica role" : why;
+        if (prefill_stage) {
+            const auto why = device::role_refusal(*d, "prefill");
+            if (!why.empty()) return why;
+        }
     }
     return {};
 }
@@ -202,7 +209,10 @@ std::string memory_check(const Ctx& c, RouteStage& stage, bool whole_model) {
 }
 // Path between the first devices of two units (rank 0 receives; relay inside a unit is the model's own interconnect).
 PathResult path(const Ctx& c, const std::vector<std::string>& from, const std::vector<std::string>& to) {
-    return best_path(c.graph, from.front(), to.front());
+    const auto key = std::make_pair(from.front(), to.front());
+    auto [it, inserted] = c.paths.try_emplace(key);
+    if (inserted) it->second = best_path(c.graph, key.first, key.second);
+    return it->second;
 }
 std::string rate_of(const Ctx& c, const LinkPath& p) {
     RateSource worst = RateSource::integrated;
@@ -219,14 +229,15 @@ RouteTransfer transfer(const Ctx& c, std::string what, const std::vector<std::st
     return t;
 }
 std::uint64_t messages(const Protocol& p, std::uint64_t bytes) {
-    return p.piece_bytes ? std::max<std::uint64_t>(1, (bytes + p.piece_bytes - 1) / p.piece_bytes) : 1;
+    return p.piece_bytes ? std::max<std::uint64_t>(1, bytes / p.piece_bytes + (bytes % p.piece_bytes != 0)) : 1;
 }
 // Time of several transfers that run together: each shared resource carries the sum of its transfers' bytes.
-double shared_ms(const Ctx& c, const std::vector<std::pair<LinkPath, std::uint64_t>>& moves, double* uncertainty) {
+double shared_ms(const Ctx& c, const Protocol& protocol,
+                 const std::vector<std::pair<LinkPath, std::uint64_t>>& moves, double* uncertainty = nullptr) {
     std::map<std::string, double> busy;
     double rtt = 0, worst_rel = 0;
     for (const auto& [p, bytes] : moves) {
-        rtt = std::max(rtt, p.rtt_us / 1e3);
+        rtt = std::max(rtt, static_cast<double>(messages(protocol, bytes)) * p.rtt_us / 1e3);
         worst_rel = std::max(worst_rel, p.uncertainty);
         for (const auto i : p.edges) {
             const auto& e = c.graph.edges[i];
@@ -238,6 +249,19 @@ double shared_ms(const Ctx& c, const std::vector<std::pair<LinkPath, std::uint64
     for (const auto& [name, ms] : busy) worst = std::max(worst, ms);
     if (uncertainty) *uncertainty = worst_rel;
     return worst + rtt;
+}
+
+// Identical full blocks followed by one possibly short block. Each operation waits for both its
+// preceding operation and its own preceding block. Shared link demand also limits block launches.
+double pipeline_ms(const std::vector<std::pair<double, double>>& operations, std::uint64_t blocks, double shared) {
+    double prefix = 0, cycle = shared, finish = 0;
+    for (const auto& [full, last] : operations) {
+        prefix += full;
+        cycle = std::max(cycle, full);
+        const double previous = blocks > 1 ? prefix + static_cast<double>(blocks - 2) * cycle : 0;
+        finish = std::max(finish, previous) + last;
+    }
+    return finish;
 }
 
 struct Unit { std::vector<std::string> unit; std::string identity, topology; };
@@ -291,7 +315,7 @@ StageCostTable parse_stage_costs(std::string_view toml) {
         const auto* unit = find(t, "unit");
         if (!unit) bad(key + ".unit", "required");
         for (const auto& id : array(*unit, key + ".unit")) e.unit.push_back(text(id, key + ".unit"));
-        if (e.unit.empty()) bad(key + ".unit", "needs at least one device id");
+        if (!unique_unit(e.unit)) bad(key + ".unit", "needs distinct device ids and at least one device");
         if (const auto* x = find(t, "topology")) e.topology = text(*x, key + ".topology");
         if (e.unit.size() > 1 && !find(t, "topology")) bad(key + ".topology", "required for a unit of several devices");
         const auto* identity = find(t, "identity");
@@ -343,7 +367,27 @@ RoutePlan plan_route(const RouteRequest& request, const Inventory& inventory, co
                      const StageCostTable& costs) {
     RoutePlan plan;
     plan.request = request;
-    Ctx c{request, inventory, provider, costs, link_graph(inventory.declaration)};
+    const auto refuse = [&](std::string reason) { plan.reason = std::move(reason); return plan; };
+    try { validate_spec(request.spec); } catch (const std::exception& e) { return refuse(e.what()); }
+    if (request.prompt > request.spec.context) return refuse("prompt exceeds admitted context");
+    const auto max_slots = provider.footprints().max_slots();
+    if (!max_slots || max_slots > 65536) return refuse("provider: invalid maximum slots");
+    if (request.spec.slots > max_slots) return refuse("slots: pinned count exceeds provider limit");
+    if (!request.decode.empty() && !unique_unit(request.decode)) return refuse("decode unit needs distinct device ids");
+    for (const auto& e : costs.entries)
+        if (!unique_unit(e.unit)) return refuse("cost unit needs distinct device ids");
+    const auto protocols = provider.protocols();
+    for (const auto& p : protocols)
+        if (std::find(p.chunks.begin(), p.chunks.end(), 0U) != p.chunks.end()) return refuse("protocol chunks must be positive");
+    // Fail closed rather than select a winner from a truncated search. Limits also bound recursion depth.
+    if (provider.layers() > 4096 || inventory.declaration.devices.size() > 256 || costs.entries.size() > 4096 ||
+        protocols.size() > 128) return refuse("route planning size limit exceeded");
+    for (const auto& p : protocols)
+        if (p.stages.size() > 64 || p.chunks.size() > 64) return refuse("route planning size limit exceeded");
+    std::size_t work_left = 100000;
+    bool exhausted = false;
+    const auto spend = [&] { if (work_left) { --work_left; return true; } exhausted = true; return false; };
+    Ctx c{request, inventory, provider, costs, link_graph(inventory.declaration), 0, 0, 1, {}};
     c.rows = request.prompt ? request.prompt : request.spec.context;
     c.slots = request.spec.slots ? request.spec.slots : 1;
     c.margin = static_cast<std::uint64_t>(std::ceil(request.spec.memory.margin_gib * 1073741824.0));
@@ -363,9 +407,11 @@ RoutePlan plan_route(const RouteRequest& request, const Inventory& inventory, co
         plan.options.push_back(std::move(o));
     };
 
-    for (const auto& p : provider.protocols()) {
+    for (const auto& p : protocols) {
+        if (!spend()) break;
         if (p.kind == "local" && p.stages.size() == 1) {
             for (const auto& u : units_with(costs, p.stages[0])) {
+                if (!spend()) break;
                 RouteOption o;
                 o.kind = "local"; o.protocol = p.name; o.identity = p.identity; o.decode = u.unit;
                 o.label = "local:" + join(u.unit) + "/" + p.identity;
@@ -392,7 +438,8 @@ RoutePlan plan_route(const RouteRequest& request, const Inventory& inventory, co
                                 consumers.end());
             for (const auto& pu : producers)
                 for (const auto& cu : consumers) {
-                    if (pu.unit == cu.unit) continue;
+                    if (!spend()) break;
+                    if (overlaps(pu.unit, cu.unit)) continue; // no shared-ownership contract
                     RouteOption o;
                     o.kind = "handoff"; o.protocol = p.name; o.identity = p.identity; o.decode = cu.unit;
                     o.label = "handoff:" + join(pu.unit) + "->" + join(cu.unit) + "/" + p.identity;
@@ -404,7 +451,7 @@ RoutePlan plan_route(const RouteRequest& request, const Inventory& inventory, co
                     if (!route.path) refusal = "no link " + join(pu.unit) + " -> " + join(cu.unit) + ": " + route.reason;
                     if (est && route.path) {
                         s0.cost = est->entry->name; s0.ms = est->ms;
-                        const double x = transfer_ms(*route.path, bytes, messages(p, bytes));
+                        const double x = shared_ms(c, p, {{*route.path, bytes}});
                         const double import_ms = p.import_ms < 0 ? 0 : p.import_ms + p.import_ms_per_mb * static_cast<double>(bytes) / 1e6;
                         o.transfers.push_back(transfer(c, "state", pu.unit, cu.unit, *route.path, bytes, x));
                         o.bytes = bytes;
@@ -433,8 +480,10 @@ RoutePlan plan_route(const RouteRequest& request, const Inventory& inventory, co
                 if (provider.seam_bytes(k, c.rows)) legal.push_back(k);
             std::vector<Unit> pick(S);
             std::function<void(std::size_t)> assign = [&](std::size_t s) {
+                if (!spend()) return;
                 if (s < S) {
                     for (const auto& u : choice[s]) {
+                        if (!spend()) return;
                         bool reused = false;
                         for (std::size_t q = 0; q < s; ++q)
                             for (const auto& id : u.unit)
@@ -446,36 +495,42 @@ RoutePlan plan_route(const RouteRequest& request, const Inventory& inventory, co
                     return;
                 }
                 const auto decode = request.decode.empty() ? pick.back().unit : request.decode;
-                // Per-stage per-row rate at this prompt and relative layer work.
-                std::vector<Estimate> est(S);
-                std::vector<std::vector<double>> work(S);
-                std::vector<char> borrowed(S, 0);
-                std::string notes, missing;
-                for (std::size_t q = 0; q < S && missing.empty(); ++q) {
-                    const auto e = estimate(entries_for(costs, join(pick[q].unit), pick[q].identity, 0), c.rows);
-                    if (!e) { missing = "no stage cost for " + join(pick[q].unit) + "/" + pick[q].identity; break; }
-                    est[q] = *e;
-                    bool lent = false;
-                    auto w = layer_work(c, *e->entry, notes, lent);
-                    borrowed[q] = lent ? 1 : 0;
-                    if (!w) missing = "no per-layer work for " + join(pick[q].unit) + ": a layer split cannot be predicted";
-                    else work[q] = std::move(*w);
-                }
-                // Per-layer ms per row on each stage's own unit (heterogeneous costs for pair::predict_chain).
-                std::vector<std::vector<double>> per_layer(S);
-                std::vector<std::span<const double>> spans(S);
-                double tail = 0;
-                for (std::size_t q = 0; q < S && missing.empty(); ++q) {
-                    double all = 0;
-                    for (const auto w : work[q]) all += w;
-                    const double scale = (est[q].ms - est[q].fixed_ms) / n / all;
-                    per_layer[q].assign(work[q].begin(), work[q].begin() + L);
-                    for (auto& w : per_layer[q]) w *= scale;
-                    spans[q] = per_layer[q];
-                    if (q + 1 == S) tail = work[q][L] * scale;
-                }
                 const auto chunks = p.chunks.empty() ? std::vector<std::uint32_t>{static_cast<std::uint32_t>(c.rows)} : p.chunks;
                 for (const auto chunk : chunks) {
+                    if (!spend()) return;
+                    // Per-stage per-row rate at this prompt and relative layer work.
+                    std::vector<Estimate> est(S);
+                    std::vector<std::vector<double>> work(S);
+                    std::vector<char> borrowed(S, 0);
+                    std::string notes, missing;
+                    for (std::size_t q = 0; q < S && missing.empty(); ++q) {
+                        auto points = entries_for(costs, join(pick[q].unit), pick[q].identity, chunk);
+                        if (points.empty()) {
+                            points = entries_for(costs, join(pick[q].unit), pick[q].identity, 0);
+                            notes += (notes.empty() ? "" : "; ") + std::string("no matching chunk calibration for ") + join(pick[q].unit);
+                        }
+                        const auto e = estimate(points, c.rows);
+                        if (!e) { missing = "no stage cost for " + join(pick[q].unit) + "/" + pick[q].identity; break; }
+                        est[q] = *e;
+                        bool lent = false;
+                        auto w = layer_work(c, *e->entry, notes, lent);
+                        borrowed[q] = lent ? 1 : 0;
+                        if (!w) missing = "no per-layer work for " + join(pick[q].unit) + ": a layer split cannot be predicted";
+                        else work[q] = std::move(*w);
+                    }
+                    // Per-layer ms per row on each stage's own unit (heterogeneous costs for pair::predict_chain).
+                    std::vector<std::vector<double>> per_layer(S);
+                    std::vector<std::span<const double>> spans(S);
+                    double tail = 0;
+                    for (std::size_t q = 0; q < S && missing.empty(); ++q) {
+                        double all = 0;
+                        for (const auto w : work[q]) all += w;
+                        const double scale = (est[q].ms - est[q].fixed_ms) / n / all;
+                        per_layer[q].assign(work[q].begin(), work[q].begin() + L);
+                        for (auto& w : per_layer[q]) w *= scale;
+                        spans[q] = per_layer[q];
+                        if (q + 1 == S) tail = work[q][L] * scale;
+                    }
                     RouteOption best;
                     double best_score = std::numeric_limits<double>::infinity();
                     int best_rank = 3;
@@ -489,7 +544,8 @@ RoutePlan plan_route(const RouteRequest& request, const Inventory& inventory, co
                         const auto m = (c.rows + C - 1) / C;
                         const auto last = c.rows - (m - 1) * C;
                         std::string refusal;
-                        double bottleneck = 0, path_last = 0, fixed = 0, unc = 0;
+                        double bottleneck = 0, fixed = 0, unc = 0;
+                        std::vector<std::pair<double, double>> operations;
                         std::vector<std::pair<LinkPath, std::uint64_t>> per_block;
                         std::vector<std::uint32_t> ends(cuts);
                         ends.push_back(L);
@@ -500,7 +556,7 @@ RoutePlan plan_route(const RouteRequest& request, const Inventory& inventory, co
                             RouteStage st{pick[q].unit, pick[q].identity, pick[q].topology, est[q].entry->name, begin, end,
                                           rate * static_cast<double>(C), {}};
                             bottleneck = std::max(bottleneck, st.ms);
-                            path_last += rate * static_cast<double>(last);
+                            operations.emplace_back(st.ms, rate * static_cast<double>(last));
                             fixed = std::max(fixed, est[q].fixed_ms);
                             // A stage rate taken from a whole-model receipt (not a block receipt at this size) and
                             // borrowed layer work are hypotheses: each widens the stage's uncertainty by 10 %.
@@ -515,8 +571,8 @@ RoutePlan plan_route(const RouteRequest& request, const Inventory& inventory, co
                                     if (refusal.empty()) refusal = "no link " + join(pick[q].unit) + " -> " + join(pick[q + 1].unit) + ": " + route.reason;
                                     continue;
                                 }
-                                const double x = transfer_ms(*route.path, seam * C);
-                                path_last += transfer_ms(*route.path, seam * last);
+                                const double x = shared_ms(c, p, {{*route.path, seam * C}});
+                                operations.emplace_back(x, shared_ms(c, p, {{*route.path, seam * last}}));
                                 unc += x * static_cast<double>(m) * route.path->uncertainty;
                                 o.transfers.push_back(transfer(c, "seam", pick[q].unit, pick[q + 1].unit, *route.path, seam * c.rows, x));
                                 o.bytes += seam * c.rows;
@@ -525,7 +581,8 @@ RoutePlan plan_route(const RouteRequest& request, const Inventory& inventory, co
                         }
                         o.label = "layers:" + o.label + "@" + std::to_string(chunk) + "/" + p.identity;
                         double rel = 0;
-                        bottleneck = std::max(bottleneck, per_block.empty() ? 0.0 : shared_ms(c, per_block, &rel));
+                        const double shared = shared_ms(c, p, per_block, &rel);
+                        bottleneck = std::max(bottleneck, shared);
                         // Final state to the decoder: every stage not on it sends its layers' state; together on shared links.
                         std::vector<std::pair<LinkPath, std::uint64_t>> state;
                         std::uint64_t state_total = 0;
@@ -538,18 +595,18 @@ RoutePlan plan_route(const RouteRequest& request, const Inventory& inventory, co
                                 continue;
                             }
                             o.transfers.push_back(transfer(c, "state", pick[q].unit, decode, *route.path, bytes,
-                                                           transfer_ms(*route.path, bytes, messages(p, bytes))));
+                                                           shared_ms(c, p, {{*route.path, bytes}})));
                             state.emplace_back(*route.path, bytes);
                             state_total += bytes;
                         }
                         o.bytes += state_total;
                         double state_rel = 0;
-                        const double state_ms = state.empty() ? 0 : shared_ms(c, state, &state_rel);
+                        const double state_ms = shared_ms(c, p, state, &state_rel);
                         const double import_ms = state.empty() || p.import_ms < 0 ? 0
                             : p.import_ms + p.import_ms_per_mb * static_cast<double>(state_total) / 1e6;
                         if (!state.empty() && p.import_ms < 0 && refusal.empty()) refusal = "import cost of " + p.identity + " is not measured";
                         o.predicted = refusal.empty() || refusal.rfind("import", 0) == 0;
-                        o.predicted_ms = static_cast<double>(m - 1) * bottleneck + path_last + fixed + state_ms + import_ms;
+                        o.predicted_ms = pipeline_ms(operations, m, shared) + fixed + state_ms + import_ms;
                         o.uncertainty_ms = unc + state_ms * state_rel + import_ms * 0.15;
                         o.rows_per_s = std::min(static_cast<double>(C) / bottleneck,
                                                 state.empty() ? std::numeric_limits<double>::infinity() : n / (state_ms + import_ms)) * 1e3;
@@ -560,15 +617,17 @@ RoutePlan plan_route(const RouteRequest& request, const Inventory& inventory, co
                         // Rank: clean before refused before unpredicted; then the objective.
                         const int rank = !o.predicted ? 2 : refusal.empty() ? 0 : 1;
                         const double value = request.objective == Objective::ttft ? o.predicted_ms : -o.rows_per_s;
-                        if (evaluated == 1 || rank < best_rank || (rank == best_rank && value < best_score)) {
+                        if ((!request.pin.empty() && o.label == request.pin) || ((request.pin.empty() || best.label != request.pin) &&
+                            (evaluated == 1 || rank < best_rank || (rank == best_rank && value < best_score)))) {
                             best_rank = rank;
                             best_score = value;
                             best = std::move(o);
                         }
                     };
                     std::function<void(std::size_t, std::size_t)> cut = [&](std::size_t q, std::size_t from) {
+                        if (!spend()) return;
                         if (q + 1 == S) { evaluate(); return; }
-                        for (std::size_t i = from; i < legal.size(); ++i) { cuts[q] = legal[i]; cut(q + 1, i + 1); }
+                        for (std::size_t i = from; i < legal.size() && !exhausted; ++i) { cuts[q] = legal[i]; cut(q + 1, i + 1); }
                     };
                     if (missing.empty() && legal.size() + 1 >= S) cut(0, 0);
                     if (!evaluated) {
@@ -593,7 +652,10 @@ RoutePlan plan_route(const RouteRequest& request, const Inventory& inventory, co
                         RouteStage d{decode, p.stages.back(), topology, "", 0, 0, 0, {}};
                         refusal = topology.empty() ? "no stage cost states the topology of decode unit " + join(decode)
                                                    : role_check(c, decode, false, true);
+                        for (const auto& u : pick)
+                            if (overlaps(u.unit, decode)) refusal = "decoder overlaps a stage without shared ownership";
                         if (refusal.empty()) refusal = memory_check(c, d, true);
+                        best.stages.push_back(std::move(d)); // explicit decoder admission, serialized with every rank
                     }
                     finish(best, p, refusal, stage_notes);
                 }
@@ -606,6 +668,7 @@ RoutePlan plan_route(const RouteRequest& request, const Inventory& inventory, co
         }
     }
 
+    if (exhausted) { plan.options.clear(); return refuse("route planning work limit exceeded"); }
     // Selection: the objective over selectable options; enumeration order breaks ties.
     const auto better = [&](const RouteOption& a, const RouteOption& b) {
         return request.objective == Objective::ttft ? a.predicted_ms < b.predicted_ms : a.rows_per_s > b.rows_per_s;
