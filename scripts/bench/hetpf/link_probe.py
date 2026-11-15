@@ -10,7 +10,7 @@ One connection per measurement; first byte = op, then an 8-byte little-endian co
   'd' BYTES  the node sends BYTES (download, node -> host)
 Throughput is bytes / (first byte sent .. last byte acknowledged or received), in MB/s (1e6 B/s) and Gbit/s.
 --state-bytes prints the predicted upload time of a state of that size at the measured median rate.
-The server exits after --idle-exit seconds without a connection (default 120), so it never outlives the probe.
+The server has idle and absolute lifetime limits, bounded workers, counts and connection deadlines.
 """
 import argparse
 import json
@@ -44,38 +44,87 @@ def drain(s, n):
         got += len(b)
 
 
+class DeadlineSocket:
+    """One absolute deadline, including slow clients that keep making progress."""
+    def __init__(self, sock, deadline):
+        self.sock, self.deadline = sock, deadline
+
+    def call(self, method, arg):
+        left = self.deadline - time.monotonic()
+        if left <= 0:
+            raise TimeoutError('probe deadline')
+        self.sock.settimeout(left)
+        return getattr(self.sock, method)(arg)
+
+    def recv(self, n):
+        return self.call('recv', n)
+
+    def sendall(self, data):
+        return self.call('sendall', data)
+
+
 class Handler(socketserver.BaseRequestHandler):
     def handle(self):
-        s = self.request
-        s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-        self.server.last = time.time()
-        op = recv_exact(s, 1)
-        (n,) = struct.unpack('<Q', recv_exact(s, 8))
-        if op == b'p':
-            for _ in range(n):
-                s.sendall(recv_exact(s, 1))
-        elif op == b'u':
-            drain(s, n)
-            s.sendall(struct.pack('<Q', n))
-        elif op == b'd':
-            block = b'\0' * CHUNK
-            left = n
-            while left:
-                k = min(CHUNK, left)
-                s.sendall(block[:k])
-                left -= k
-        self.server.last = time.time()
+        self.request.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        s = DeadlineSocket(self.request, min(self.server.end, time.monotonic() + self.server.operation_timeout))
+        try:
+            op = recv_exact(s, 1)
+            (n,) = struct.unpack('<Q', recv_exact(s, 8))
+            if op not in (b'p', b'u', b'd') or n > (10000 if op == b'p' else 256 * CHUNK):
+                return
+            if op == b'p':
+                for _ in range(n):
+                    s.sendall(recv_exact(s, 1))
+            elif op == b'u':
+                drain(s, n)
+                s.sendall(struct.pack('<Q', n))
+            else:
+                block = b'\0' * CHUNK
+                while n:
+                    k = min(CHUNK, n)
+                    s.sendall(block[:k])
+                    n -= k
+        except (OSError, ConnectionError):
+            pass
+
+
+class ProbeServer(socketserver.ThreadingTCPServer):
+    daemon_threads = True
+    block_on_close = False
+
+    def __init__(self, address, lifetime=180, operation_timeout=30, workers=4):
+        self.slots = threading.BoundedSemaphore(workers)
+        self.last = time.monotonic()
+        self.end = self.last + lifetime
+        self.operation_timeout = operation_timeout
+        super().__init__(address, Handler)
+        self.timeout = 0.2
+
+    def process_request(self, request, address):
+        if time.monotonic() >= self.end or not self.slots.acquire(blocking=False):
+            self.shutdown_request(request)
+            return
+        self.last = time.monotonic()
+        try:
+            super().process_request(request, address)
+        except Exception:
+            self.slots.release()
+            raise
+
+    def process_request_thread(self, request, address):
+        try:
+            super().process_request_thread(request, address)
+        finally:
+            self.slots.release()
 
 
 def serve(a):
-    srv = socketserver.ThreadingTCPServer((a.bind, a.port), Handler)
-    srv.daemon_threads = True
-    srv.last = time.time()
-    threading.Thread(target=srv.serve_forever, daemon=True).start()
-    print(f'link_probe serving {a.bind}:{a.port}', flush=True)
-    while time.time() - srv.last < a.idle_exit:
-        time.sleep(1)
-    srv.shutdown()
+    if a.bind in ('0.0.0.0', '::', ''):
+        raise ValueError('bind a specific interface address')
+    with ProbeServer((a.bind, a.port), a.lifetime, a.operation_timeout) as srv:
+        print(f'link_probe serving {a.bind}:{a.port}', flush=True)
+        while time.monotonic() < min(srv.end, srv.last + a.idle_exit):
+            srv.handle_request()
 
 
 def connect(a):
@@ -85,7 +134,7 @@ def connect(a):
 
 
 def probe(a):
-    out = {'host': a.host, 'port': a.port, 'mib': a.mib, 'reps': a.reps}
+    out = {'run_id': a.run_id, 'host': a.host, 'port': a.port, 'mib': a.mib, 'reps': a.reps}
     s = connect(a)
     s.sendall(b'p' + struct.pack('<Q', a.pings))
     rtt = []
@@ -135,11 +184,14 @@ def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = p.add_subparsers(dest='cmd', required=True)
     s = sub.add_parser('serve')
-    s.add_argument('--bind', default='0.0.0.0')
+    s.add_argument('--bind', required=True)
     s.add_argument('--port', type=int, required=True)
     s.add_argument('--idle-exit', type=float, default=120)
+    s.add_argument('--lifetime', type=float, default=180)
+    s.add_argument('--operation-timeout', type=float, default=30)
     c = sub.add_parser('probe')
     c.add_argument('--host', required=True)
+    c.add_argument('--run-id', required=True)
     c.add_argument('--port', type=int, required=True)
     c.add_argument('--mib', type=int, default=64)
     c.add_argument('--reps', type=int, default=3)
