@@ -616,6 +616,12 @@ OUT_DIR`: exact vs every WMMA launch form, overflow fallback rows, GPU clock and
 prefill (`glm_score.sh PEER BIN MODEL PROMPT OUT [ENV...]`, last 256 rows) and its FAST gate comparison
 (`score_cmp.py REF CAND PROMPT`: KL <= 0.02, top-1 >= 93 %, dNLL <= +0.01).
 
+### MiniMax MSA flash layer ranges (FAST gate)
+
+[`scripts/bench/mmflash/`](../scripts/bench/mmflash/README.md) qualifies a layer range for the FAST MSA flash attention
+(one-term or two-term operands) against the exact path in one detached pair run: onset-matched one-ulp nulls for the
+floor rule, optional multi-site / magnitude nulls as a diagnostic, cold and warm TTFT, evicted_ms and GPU clocks per token.
+
 ## Long-context retrieval and reasoning checks (Qwen)
 
 `tools/qualification/longctx_fidelity/` builds deterministic prompts whose answers are computed by the
