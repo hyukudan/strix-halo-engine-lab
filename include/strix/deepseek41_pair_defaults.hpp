@@ -84,6 +84,9 @@ struct Resolved {
     std::vector<std::string> notices;                          // one line each
     bool print_only = false;                                   // --print-effective-config (removed from args)
     std::optional<strix::profile::Resolution> profile;         // --profile (removed from args); always resolved
+    // STRIX_DS41_DECODE_XPORT as BatchForward resolves it (strix/ds41_decode_xport.hpp): "communicator" / "channel",
+    // then the origin ("default" / "explicit"). One rule for CLI, serve and engine; both ranks also agree at load.
+    std::string decode_xport;
 };
 
 using Getenv = std::function<const char*(const char*)>;

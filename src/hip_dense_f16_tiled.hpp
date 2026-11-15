@@ -27,6 +27,7 @@
 #include <map>
 #include <mutex>
 #include "strix/qpf2k_defaults.hpp"
+#include "core/glu_pair.hpp"
 
 namespace strix::q8_rows::tiled {
 
@@ -259,11 +260,19 @@ __global__ __attribute__((amdgpu_flat_work_group_size(1, TileShape<BN>::threads)
     const unsigned char* wbase;
     std::uint32_t boff;
     {
-        unsigned seg; std::uint32_t row;
-        static_cast<void>(segment_row(site.segments, n0, width, seg, row));
-        wbase = site.segments.weights[seg];
-        const std::uint32_t last = min(site.segments.first[seg + 1U], outputs) - 1U - site.segments.first[seg];
-        boff = min(row + bo, last) * rowbytes + 16U * bh;
+        if constexpr (requires { Site::glu_pair; }) {
+            // Paired site (core/glu_pair.hpp): wave w stages outputs n0 + 16 w .. + 15, one 16-block of one segment, so
+            // the segment base stays uniform per wave; the row is that output's feature column.
+            static_assert(Threads / 32U * core::glu_pair::kBlock == BN);
+            wbase = site.segments.weights[core::glu_pair::segment(n0 + core::glu_pair::kBlock * wave)];
+            boff = min(core::glu_pair::column(n0 + bo), site.segments.first[1] - 1U) * rowbytes + 16U * bh;
+        } else {
+            unsigned seg; std::uint32_t row;
+            static_cast<void>(segment_row(site.segments, n0, width, seg, row));
+            wbase = site.segments.weights[seg];
+            const std::uint32_t last = min(site.segments.first[seg + 1U], outputs) - 1U - site.segments.first[seg];
+            boff = min(row + bo, last) * rowbytes + 16U * bh;
+        }
     }
     u32x4 areg[AChunks];
     unsigned bscale, bq[5];
@@ -453,6 +462,25 @@ __global__ __attribute__((amdgpu_flat_work_group_size(1, TileShape<BN>::threads)
         }
         return;
     }
+    if constexpr (requires { Site::glu_pair; } && !NoStores) {
+        // Paired GLU store: sub-tiles 2k / 2k + 1 of a wave are gate / up of the same 16 features (n0 + wn * kWN is a
+        // multiple of 32 outputs), so each lane holds both operands of one (row, feature). All lanes reach the store.
+        static_assert(kNT % 2U == 0U && kWN % (2U * core::glu_pair::kBlock) == 0U);
+#pragma unroll
+        for (unsigned t = 0; t < kMT; ++t)
+#pragma unroll
+            for (unsigned u = 0; u < kNT; u += 2U) {
+                const std::uint32_t out = n0 + wn * kWN + 16U * u + lane % 16U;
+                const std::uint32_t feature = core::glu_pair::column(out);
+#pragma unroll
+                for (unsigned e = 0; e < 8U; ++e) {
+                    const std::uint32_t r = m0 + wm * kWM + 16U * t + 2U * e + lane / 16U;
+                    site.store_pair(feature, r, out < outputs && r < rows, acc[t][u][e], acc[t][u + 1U][e]);
+                }
+            }
+        return;
+    }
+    if constexpr (!requires { Site::glu_pair; }) {  // paired sites store only through store_pair (above)
 #pragma unroll
     for (unsigned t = 0; t < kMT; ++t)
 #pragma unroll
@@ -467,6 +495,7 @@ __global__ __attribute__((amdgpu_flat_work_group_size(1, TileShape<BN>::threads)
                 } else if (r < rows) site.store(out, r, acc[t][u][e]);
             }
         }
+    }
 }
 
 // Form 1/2 (STRIX_QPF2K_DENSE_FORM): the same 256 x 128 block tile, operands, K16 order and stores, run by 16 waves
@@ -722,9 +751,12 @@ template <class Site> unsigned mode_of(const Site& site) {
 // dword-aligned Q8 segments whose boundaries are multiples of 128, 32-bit operand offsets, at least one row.
 template <class Site> bool supported(const Site& site, std::uint32_t rows, unsigned mode) {
     if (!rows || !dense_a8_width(site.width) || !site.outputs || !site.segments.count || site.segments.count > kMaxSegments) return false;
+    constexpr bool paired = requires { Site::glu_pair; };
+    // Paired sites (core/glu_pair.hpp): exactly gate and up of one feature count, interleaved per 16-block.
+    if (paired && (site.segments.count != 2U || !core::glu_pair::geometry(site.segments.first[1], site.outputs))) return false;
     for (unsigned m = 0; m < site.segments.count; ++m) {
         if (reinterpret_cast<std::uintptr_t>(site.segments.weights[m]) % 4U) return false;
-        if (m && site.segments.first[m] % kBN) return false;  // a 128-output tile never straddles two segments
+        if (!paired && m && site.segments.first[m] % kBN) return false;  // a 128-output tile never straddles two segments
     }
     if (site.segments.first[site.segments.count] != site.outputs) return false;
     const std::uint64_t rows_up = (static_cast<std::uint64_t>(rows) + kBM - 1U) / kBM * kBM;
@@ -743,10 +775,15 @@ template <class Site> bool supported(const Site& site, std::uint32_t rows) { ret
 // Launch of one projection kernel (form, A mode) over all rows.
 template <class Site, unsigned Mode, unsigned Probe = 0U>
 void launch_projection(const Site& site, std::uint32_t rows, hipStream_t stream, bool any_order, unsigned form_id, std::uint32_t raster_m,
-    const _Float16* a16) {
-    if (form_id >= 3U)  // 256-output tiles: every segment boundary a multiple of 256, else form 0 (same bits)
+    const _Float16* a16, unsigned* effective_form = nullptr) {
+    if constexpr (requires { Site::glu_pair; }) {
+        // Paired sites never straddle a segment inside a wave; their store exists in project_kernel only (forms 0/3/4).
+        if (form_id == 1U || form_id == 2U) form_id = 0U;
+    } else if (form_id >= 3U)  // 256-output tiles: every segment boundary a multiple of 256, else form 0 (same bits)
         for (unsigned m = 1; m < site.segments.count; ++m) if (site.segments.first[m] % 256U) form_id = 0U;
-    if (Mode == kF32 && form_id == 4U) form_id = 3U;  // FP32 A staged inline does not fit 192 VGPRs: form 3 (same bits)
+    if constexpr (Mode == kF32)  // FP32 A staged inline does not fit 192 VGPRs: form 3 (same bits).
+        if (form_id == 4U) form_id = 3U;
+    if (effective_form) *effective_form = form_id;
     if constexpr (Probe == 0U && requires { Site::dense_vector_store; } && !requires { Site::dense_vector_epilogue; }) {
         // Unpinned scratch-A + Q8 + the vector epilogue spills; preserve the
         // original scalar route there. Decide once before wrapping the site.
@@ -784,9 +821,11 @@ void launch_projection(const Site& site, std::uint32_t rows, hipStream_t stream,
             else lean();
         }
     } else {
-        if (form_id == 1U) go(project2_kernel<Site, Mode, 512U, 32U, 2U, Probe>, 512U);
-        else if (form_id == 2U) go(project2_kernel<Site, Mode, 512U, 32U, 1U, Probe>, 512U);
-        else if (form_id == 3U) go(project_kernel<Site, Mode, Probe, 256U>, 512U);
+        if constexpr (!requires { Site::glu_pair; }) {  // paired sites: forms 1/2 were mapped to form 0 above
+            if (form_id == 1U) { go(project2_kernel<Site, Mode, 512U, 32U, 2U, Probe>, 512U); return; }
+            if (form_id == 2U) { go(project2_kernel<Site, Mode, 512U, 32U, 1U, Probe>, 512U); return; }
+        }
+        if (form_id == 3U) go(project_kernel<Site, Mode, Probe, 256U>, 512U);
         else if (form_id == 4U) {
             if constexpr (Mode != kF32) {
                 if (wmma_pin()) go(project_kernel<Site, Mode, Probe, 256U, true, true>, 512U);
@@ -802,7 +841,7 @@ void launch_projection(const Site& site, std::uint32_t rows, hipStream_t stream,
 // itself when inline) independent of the kernel queued just before it, as launch_dense_f16's convert.
 template <class Site, unsigned Probe = 0U>
 void launch(const Site& site, std::uint32_t rows, hipStream_t stream, bool any_order = false, unsigned mode = ~0U, unsigned raster_m = 0U,
-    unsigned form_id = ~0U) {
+    unsigned form_id = ~0U, unsigned* effective_form = nullptr) {
     if (mode == ~0U) mode = mode_of(site);
     if (form_id == ~0U) {
         form_id = form<Site>(mode);
@@ -812,7 +851,7 @@ void launch(const Site& site, std::uint32_t rows, hipStream_t stream, bool any_o
         if (form_id == 4U && site.width > 2560U && !lean_site<Site>()) form_id = 3U;
     }
     // Forms 3/4 tile 256 outputs: every segment boundary must be a multiple of 256 (else form 0, same bits).
-    if (form_id >= 3U)
+    if (form_id >= 3U && !requires { Site::glu_pair; })  // paired sites: per-wave segments (launch_projection)
         for (unsigned m = 1; m < site.segments.count; ++m) if (site.segments.first[m] % 256U) form_id = 0U;
     if (mode == kF32 && form_id == 4U) form_id = 3U;  // as launch_projection (the trace shows the form that runs)
     if (!supported(site, rows, mode)) throw std::invalid_argument("q8_rows tiled: unsupported dense projection");
@@ -833,11 +872,11 @@ void launch(const Site& site, std::uint32_t rows, hipStream_t stream, bool any_o
             hipExtLaunchKernelGGL(HIP_KERNEL_NAME(convert_kernel<Site>), grid, dim3(256U), 0, stream, nullptr, nullptr, hipExtAnyOrderLaunch,
                 site, rows, a16, dense_f16_overflow_counter());
         else hipLaunchKernelGGL(HIP_KERNEL_NAME(convert_kernel<Site>), grid, dim3(256U), 0, stream, site, rows, a16, dense_f16_overflow_counter());
-        launch_projection<Site, kPre, Probe>(site, rows, stream, false, form_id, raster_m, a16);
+        launch_projection<Site, kPre, Probe>(site, rows, stream, false, form_id, raster_m, a16, effective_form);
         return;
     }
-    if constexpr (sizeof(typename Site::Input) == 4U) launch_projection<Site, kF32, Probe>(site, rows, stream, any_order, form_id, raster_m, nullptr);
-    else launch_projection<Site, kBf16, Probe>(site, rows, stream, any_order, form_id, raster_m, nullptr);
+    if constexpr (sizeof(typename Site::Input) == 4U) launch_projection<Site, kF32, Probe>(site, rows, stream, any_order, form_id, raster_m, nullptr, effective_form);
+    else launch_projection<Site, kBf16, Probe>(site, rows, stream, any_order, form_id, raster_m, nullptr, effective_form);
 }
 
 }  // namespace strix::q8_rows::tiled

@@ -2196,6 +2196,14 @@ void yarn_admission_tests(const gguf::FileInfo& info, const ModelManifest& manif
         for (const char* name : {"STRIX_QSA_UNION_MERGE", "STRIX_QSA_SCORE_ROWS64", "STRIX_PREFILL_MOE_MERGE_VEC"})
             expect(yarn_environment_refusal({{name, "1"}}, 2).empty(), "YaRN admits the explicit default arm of code-default items");
         for (const char* value : {"0", "1"}) {
+            auto low32 = request; low32.environment["STRIX_QPF2K_HC_LOW32"] = value;
+            const auto admitted = resolve(low32, memory);
+            expect(yarn_environment_refusal({{"STRIX_QPF2K_HC_LOW32", value}}, 2).empty() && admitted.admitted,
+                value[0] == '0' ? "YaRN admits default LOW32 omission" : "YaRN admits LOW32 rollback stores");
+            expect(admitted.environment.at("STRIX_QPF2K_HC_LOW32") == value, "YaRN preserves either explicit LOW32 arm");
+        }
+        expect(!yarn_environment_refusal({{"STRIX_QPF2K_HC_LOW32", "2"}}, 2).empty(), "LOW32 values stay bounded");
+        for (const char* value : {"0", "1"}) {
             auto launch = request; launch.environment["STRIX_QPF2K_GDN_COOP_LAUNCH"] = value;
             const auto admitted = resolve(launch, memory);
             expect(yarn_environment_refusal({{"STRIX_QPF2K_GDN_COOP_LAUNCH", value}}, 2).empty() && admitted.admitted &&

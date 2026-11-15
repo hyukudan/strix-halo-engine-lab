@@ -892,6 +892,21 @@ Build the shared expert's FP16 operand once for gate/up and down; the existing t
 - **Measured gain:** ~-1 % TTFT at 32K; combined five-item set -0.71 s (-3.2 %) at 32K vs all five off (interleaved, same build)
 - **Implementation / evidence:** [defaults](../include/strix/qpf2k_defaults.hpp), [engine reference](getting-started/engine-reference.md)
 
+<a id="qwen-glu-pair"></a>
+
+### Paired GLU store for the shared-expert preimage
+
+**Engine:** `qwen` (shared policy `src/core/glu_pair.hpp`). **Control:** `STRIX_QPF2K_GLU_PAIR`. **Default:** 1.
+
+When the shared-expert preimage is admitted, the tiled gate|up interleaves 16-output blocks of gate and up. Each lane then holds both operands of one (row, feature), and the epilogue writes the FP16 activation directly. Neither the FP32 gate|up image nor the activation pass is materialized. The activation pass shrinks to the shared gate's dot, which runs before the gate|up so the preimage stays cache-resident for its down. With the item off, the pre-kernel no longer writes the FP32 activation that has no reader.
+
+- **Preconditions:** `STRIX_QPF2K_SHARED_PRE` admitted (its own preconditions apply), tiled gate|up admitted for the same rows, features a multiple of 16.
+- **Fallback notice:** `=0` keeps the activation pre-kernel; `=2` forces form 0 for the paired kernel (default: form 4). Any failed check keeps the pre-kernel route.
+- **Exactness evidence:** Bitwise: the shared-pre fixture (32..8192 rows, nine gate/up payload kinds including non-finite values, two streams) gives equal FP16 preimage, gate, outputs and overflow count on every route, plus an RNE oracle. Final logits are identical at 8K, 32K and 128K. The product is one `v_mul_f32`; without that, LLVM folds it with the FP16 cast into `v_fma_mixlo_f16` (1 ulp).
+- **Off switch:** STRIX_QPF2K_GLU_PAIR=0
+- **Measured gain:** Shared-expert kernels per 8K request 146.6 -> 128.0 ms (-18.6 ms), at 32K -68 ms (traced, one node). The request-level effect (-0.1 % at 8K, -0.5 % at 32K) is within clock noise.
+- **Implementation / evidence:** [policy](../src/core/glu_pair.hpp), [tiled kernel](../src/hip_dense_f16_tiled.hpp)
+
 <a id="qwen-moe-merge-commit"></a>
 
 ### MoE ordered merge + BF16 commit
@@ -2906,6 +2921,22 @@ Run the small row-tile classes (MT 1-7, each with its own launch and register bu
 - **Measured gain:** MoE call, real weights and routes of one layer, 5 interleaved runs: 4096 rows 49.31 -> 47.81 ms (-3.0 %), 2048 rows -1.9 %, 1024 rows -1.9 %. Two Strix Halo nodes over 2x USB4, in-process A B A B A B A: 1K TTFT -0.1 to -1.1 % (every B faster, two runs), 8K mean -1.6 % (5 of 6 arms faster, one +2.3 % within the 8K noise); 32K fresh process per arm (A B A, B A B): TTFT -0.8 % / -0.3 % against the bracketing arms, MoE GPU time 24.46 -> 24.21 s (mean of 3). Merging the tail classes into one launch instead is slower (+1.5 % at 4096 rows): the merged kernel takes the largest class's registers.
 - **Implementation / evidence:** [kernel](../src/minimax/moe/mmx_prefill.hip), [resolver](../src/minimax/engine/mm_defaults.cpp), [bench tests](../tests/hip_mmx_moe_bench.hip)
 
+<a id="mm-pf-pipe-tail"></a>
+
+### Prefill MoE tail rows on the pipelined kernel
+
+**Engine:** `minimax`. **Control:** `STRIX_MMX_PREFILL_PIPE_TAIL`. **Default:** 1.
+
+The partial last block of an expert (row tiles MT 1-7) runs the pipelined grouped kernel (`item_pipe` with `FullRows = false`: the store is guarded, the loads stay unguarded inside the group's 16-row padding) instead of the scalar tail core. Shared policy `GroupedPrefillPolicy<.., PipeTail>::kPipeTail` (`src/moe_core/grouped_policy.hpp`).
+
+- **Preconditions:** MT-fit row plans (`STRIX_MMX_PREFILL_MTFIT=1`, the default); other plans keep the old tail core. Class MT8 partial stays on the old kernel (that form spills).
+- **Automatic selection:** Resolver supplies 1 only when unset; explicit values win; an even mask (bit = MT) selects classes for diagnosis.
+- **Fallback notice:** None needed: =0 is the former tail core.
+- **Exactness evidence:** Device fixture `strix-hip-mmx-moe-bench --pipe-tail-test` (launch-checked): 12,480 cells memcmp vs item_core_v3 with NaN-padded rows. Pair model: logits identical to the S1-off binary on 768 rows at 8K and 256 rows at 32K; state digests of both ranks equal to the reference.
+- **Measured gain:** PAIR, one process per ticket, valid runs (no kfd eviction inside the TTFT window on either rank): 8K 12.68 -> 12.47 s, 32K 51.81 -> 50.91 s.
+- **Off switch:** STRIX_MMX_PREFILL_PIPE_TAIL=0
+- **Implementation / evidence:** [resolver](../src/minimax/engine/mm_defaults.cpp), [kernel](../src/moe_core/grouped_core.hpp)
+
 <a id="mm-pf-pipe-pair"></a>
 
 ### Prefill MoE paired MT8 PIPE bands
@@ -4425,6 +4456,35 @@ loop; only a wave with a dead fragment takes the predicated loop.
 - **Resources:** no kernel gains a register spill; the 128-row gate/up kernel uses 238 VGPR (239 before), occupancy and LDS bytes are unchanged.
 - **Implementation / evidence:** [shared core](../src/moe_core/grouped_f16.hpp), [GLM adapter](../src/glm/prefill/glm_pf_wmma_x.hpp), [test](../tests/hip_glm_pf_wmma_tests.hip)
 
+<a id="glm-pf-wmma-shared128"></a>
+
+### FAST shared expert on 128-row slices
+
+**Engine:** `glm` (shared core `moe_core::folded_f16`). **Control:** `STRIX_GLM_PF_WMMA_SHARED128`. **Default:** on wherever the FAST WMMA prefill runs with 128-row tiles.
+
+The shared expert holds every row of the call. Its rows were sliced by 64, so each FP16 weight tile was decoded once per 64
+rows; the slices are now 128 rows on the 128-row core (the folded F16 span runs the 128-row tile, the last partial slice the
+smallest covering tile), so each tile is decoded once per 128 rows and the LDS fills halve.
+
+- **Preconditions:** `STRIX_GLM_PF_WMMA=1`, 128-row tiles (`STRIX_GLM_PF_WMMA_ROWS=128`, the default).
+- **Exactness evidence:** Bitwise to the glm-pf-wmma-x identity: every row keeps its arithmetic; `hip_glm_pf_wmma_tests` arm 7 (64-row slices) equals the default on every buffer (1026 checks, 0 failures); pair 8K logits of both ranks equal with the switch off and on.
+- **Off switch:** `STRIX_GLM_PF_WMMA_SHARED128=0` (64-row shared slices, same bits)
+- **Measured gain:** Pair FAST 8K, warm (second prefill of the process): 8.606 -> 8.571 s (-0.4 %, two ABAB pairs, 953-957 tok/s); whole MoE call at 2048 rows on one node 26.73 -> 26.54 ms.
+- **Resources:** no register spill; LDS of the shared kernels is the 128-row storage of the routed full-tile kernel.
+
+<a id="glm-route-wave"></a>
+
+### GLM router selection: one wave per row
+
+**Engine:** `glm` (shared `moe_core::route_wave_topk`). **Control:** none (exact). **Default:** on.
+
+The top-8 expert selection ran on lane 0 of a 32-thread work-group per row (288 sigmoids and eight 288-wide scans in
+series). Each lane now owns nine experts; the eight passes use the shared wave selection on the 32-bit ordered keys
+(largest key, ties to the lower expert id), and the sort, the ascending denominator and the weights stay on lane 0.
+
+- **Exactness evidence:** Bitwise: a device stress set of 4096 rows (random, mass ties, signed zeros, infinities, NaN, saturated sigmoids; three bias sets; 1, 7, 32 and 4096 rows) equals the former serial kernel in ids and weights; pair 8K and 32K logits of both ranks equal the previous binary.
+- **Measured gain:** route kernel at 4096 rows 1.116 -> 0.033 ms; pair exact 8K warm 12.478 -> 12.366 s (-0.9 %, 3 ABAB pairs), 32K 51.265 -> 51.064 s.
+
 <a id="glm-pf-kda-wmma"></a>
 
 ### FAST KDA plain-weight projections on WMMA (glm-pf-kda-wmma-v1)
@@ -4872,6 +4932,9 @@ Three parts make the route faster than the image:
 - **Full-width projection** (`STRIX_QPF2K_HC_PROJ_TILE`, default 64 rows per block; 32 and 16 selectable, 0 selects
   the five-column-block form). One block owns 64 rows and all 320 low outputs, so each normalized value is formed
   once instead of once per column block.
+- **No unread FP32 low tail** (`STRIX_QPF2K_HC_LOW32`, default 0). The out16 output reads the FP16 low image only, so
+  the projection no longer writes the 1,280-byte FP32 low values of each row (1.02 GB per 8192-row block over 97 HC
+  sites). The check mode and every FP32 output still write them. `STRIX_QPF2K_HC_LOW32=1` restores the store.
 - **Output epilogue.** The stream loads of a block are issued before the first pinned multiply. Interleaved with
   the pinned multiplies, each load was waited for alone.
 - **Stream mirror.** Stream rows whose pitch is a multiple of 4096 bytes alias when a block reads many rows at the

@@ -132,6 +132,7 @@ imagen y `session_id`. Los demás modelos aún no admiten imágenes. Detalles: [
   por un intercambio de 20 KB ([par](docs/pair.es.md)).
 - Cada valor por defecto tiene una ganancia medida y un interruptor de apagado ([optimizaciones](docs/optimizations.md)).
 - Añadir un modelo: [docs/engine/adding-a-model.es.md](docs/engine/adding-a-model.es.md).
+- Mapa de los núcleos compartidos y qué modelo usa cada uno: [docs/engine/shared-cores.es.md](docs/engine/shared-cores.es.md).
 
 ## Documentación
 
@@ -142,7 +143,7 @@ imagen y `session_id`. Los demás modelos aún no admiten imágenes. Detalles: [
 | Par y servicio | [par](docs/pair.es.md) · [configuración del par](docs/pair-setup.es.md) · [servicio](docs/serving.es.md) · [GPU discreta](docs/discrete-gpu.es.md) |
 | Interruptores | [toggles](docs/toggles.es.md) · [optimizaciones](docs/optimizations.md) ([JSON](docs/optimizations.json)) |
 | Números | [rendimiento](docs/performance.md) · [ganancias medidas](docs/measured-gains.es.md) · [metodología](docs/methodology.es.md) |
-| Internos | [arquitectura](docs/architecture/README.md) · [registro de decisiones](docs/decisions/decision-register.md) · [estado de implementación](docs/reference/implementation-status.md) · [fuentes](docs/reference/sources-ledger.md) |
+| Internos | [arquitectura](docs/architecture/README.md) · [núcleos compartidos](docs/engine/shared-cores.es.md) · [registro de decisiones](docs/decisions/decision-register.md) · [estado de implementación](docs/reference/implementation-status.md) · [fuentes](docs/reference/sources-ledger.md) |
 | Índice | [índice completo de la documentación](docs/README.md) · [AGENTS.md](AGENTS.md) |
 
 <a id="related-repositories"></a>

@@ -132,6 +132,7 @@ models do not take images yet. Details: [image input](docs/engine/vision.md).
   20 KB exchange ([pair](docs/pair.md)).
 - Every default has a measured gain and an off switch ([optimizations](docs/optimizations.md)).
 - Adding a model: [docs/engine/adding-a-model.md](docs/engine/adding-a-model.md).
+- Map of the shared cores and which model uses each: [docs/engine/shared-cores.md](docs/engine/shared-cores.md).
 
 ## Documentation
 
@@ -142,7 +143,7 @@ models do not take images yet. Details: [image input](docs/engine/vision.md).
 | Pair and serving | [pair](docs/pair.md) · [pair setup](docs/pair-setup.md) · [serving](docs/serving.md) · [discrete GPU](docs/discrete-gpu.md) |
 | Switches | [toggles](docs/toggles.md) · [optimizations](docs/optimizations.md) ([JSON](docs/optimizations.json)) |
 | Numbers | [performance](docs/performance.md) · [measured gains](docs/measured-gains.md) · [methodology](docs/methodology.md) |
-| Internals | [architecture](docs/architecture/README.md) · [decision register](docs/decisions/decision-register.md) · [implementation status](docs/reference/implementation-status.md) · [sources](docs/reference/sources-ledger.md) |
+| Internals | [architecture](docs/architecture/README.md) · [shared cores](docs/engine/shared-cores.md) · [decision register](docs/decisions/decision-register.md) · [implementation status](docs/reference/implementation-status.md) · [sources](docs/reference/sources-ledger.md) |
 | Index | [full documentation index](docs/README.md) · [AGENTS.md](AGENTS.md) |
 
 <a id="related-repositories"></a>
