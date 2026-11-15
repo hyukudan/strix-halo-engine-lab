@@ -8,6 +8,7 @@
 #include <deque>
 #include <iostream>
 #include <memory>
+#include <optional>
 
 namespace {
 struct Wire {
@@ -31,6 +32,97 @@ struct Wire {
     void stop() { std::lock_guard lock(mutex); closed = true; cv.notify_all(); }
 };
 void require(bool value) { if (!value) throw std::runtime_error("pair prefill schedule assertion failed"); }
+
+void route_mode_checks() {
+    using namespace strix::qwen_pp;
+    for (const char* chunk : {static_cast<const char*>(nullptr), "4096"}) {
+        for (const bool single_tiles : {false, true}) {
+            const auto handoff = resolve_pair_route(8192, 8192, chunk, nullptr, {}, false,
+                single_tiles, PairExecution::handoff);
+            require(handoff.route.prefix == 0U && handoff.chunks == 0U);
+            require(handoff.tile_rows == (single_tiles ? 8192U : 4096U));
+            const auto forced = resolve_pair_route(8192, 8192, chunk, nullptr, {}, false,
+                single_tiles, PairExecution::prefill_only);
+            require(forced.route.prefix == 8192U && forced.tile_rows == 4096U);
+            require(forced.chunk.rows == 4096U && forced.chunks == 2U);
+            require(std::string_view(forced.route.reason) == "pipeline-prefill-only");
+        }
+    }
+    // A length-model decline must also preserve an explicit chunk in forced mode.
+    const auto forced = resolve_pair_route(2048, 2048, "1024", nullptr, {}, true, true,
+        PairExecution::prefill_only);
+    require(forced.model.mode == strix::pair::Mode::single && forced.route.prefix == 2048U);
+    require(forced.tile_rows == 1024U && forced.chunks == 2U);
+    const auto short_fixed = resolve_pair_route(6144, 8192, nullptr, nullptr, {}, false, true,
+        PairExecution::prefill_only);
+    require(short_fixed.route.prefix == 6144U && short_fixed.chunk.rows == 4096U && short_fixed.chunks == 2U);
+}
+
+struct ScopedPairEnv {
+    const char* name;
+    std::optional<std::string> saved;
+    explicit ScopedPairEnv(const char* key) : name(key) {
+        if (const char* value = strix::envcfg::text(name)) saved = value;
+    }
+    static void set(const char* key, const char* value) {
+#if defined(_WIN32)
+        require(_putenv_s(key, value ? value : "") == 0);
+#else
+        require((value ? ::setenv(key, value, 1) : ::unsetenv(key)) == 0);
+#endif
+    }
+    ~ScopedPairEnv() {
+#if defined(_WIN32)
+        (void)_putenv_s(name, saved ? saved->c_str() : "");
+#else
+        if (saved) (void)::setenv(name, saved->c_str(), 1);
+        else (void)::unsetenv(name);
+#endif
+    }
+};
+
+void policy_inspection_checks() {
+    using namespace strix::qwen_pp;
+    ScopedPairEnv chunk_env("STRIX_QWEN_PAIR_CHUNK_POLICY"), tiles_env("STRIX_QWEN_PAIR_SINGLE_TILES");
+    for (const char* chunk : {static_cast<const char*>(nullptr), "0"}) {
+        for (const char* tiles : {static_cast<const char*>(nullptr), "0"}) {
+            ScopedPairEnv::set(chunk_env.name, chunk);
+            ScopedPairEnv::set(tiles_env.name, tiles);
+            const auto policy = resolve_pair_policy(8192, PairExecution::handoff);
+            const auto config = strix::serve::parse_json(inspect_pair_policy("{\"kept\":true}", policy));
+            require(config.find("kept") && config.find("kept")->as_bool());
+            const auto* pair = config.find("qwen_pair");
+            require(pair && pair->find("route")->as_string() == "pending-device-admission");
+            require(pair->find("tile_rows")->is_null() && pair->find("execution")->as_string() == "handoff");
+            for (const auto& item : {std::pair{chunk_env.name, chunk}, std::pair{tiles_env.name, tiles}}) {
+                const auto* control = pair->find(item.first);
+                require(control && control->find("requested")->as_string() == (item.second ? "0" : "auto"));
+                require(control->find("effective")->as_bool() == (item.second == nullptr));
+                const auto registry = strix::envcfg::registered();
+                const auto entry = std::find_if(registry.begin(), registry.end(),
+                    [&](const auto& e) { return e.name == item.first; });
+                require(entry != registry.end() && entry->set == (item.second != nullptr));
+                require(entry->value == (item.second ? "0" : "1"));
+            }
+            // Execution consumes the saved choices even if the environment subsequently changes.
+            ScopedPairEnv::set(chunk_env.name, "1");
+            ScopedPairEnv::set(tiles_env.name, "1");
+            const auto route = resolve_pair_route(8192, 8192, nullptr, nullptr, {},
+                policy.chunk_policy.on, policy.single_tiles.on, policy.execution);
+            require(route.route.prefix == (chunk ? 0U : 8192U));
+            require(route.tile_rows == (!chunk ? 2048U : (tiles ? 4096U : 8192U)));
+        }
+    }
+    for (const char* name : {chunk_env.name, tiles_env.name}) {
+        ScopedPairEnv::set(chunk_env.name, nullptr);
+        ScopedPairEnv::set(tiles_env.name, nullptr);
+        ScopedPairEnv::set(name, "invalid");
+        bool rejected = false;
+        try { (void)resolve_pair_policy(8192, PairExecution::prefill_only); }
+        catch (const std::invalid_argument& error) { rejected = std::string_view(error.what()).find(name) != std::string_view::npos; }
+        require(rejected);
+    }
+}
 struct MockStaging final : strix::qwen_pp::PipeStaging {
     std::vector<std::byte> storage;
     std::mutex& mutex;
@@ -178,13 +270,16 @@ void route_checks() {
     require(r.route.prefix == 0U && r.tile_rows == 4096U);
     r = resolve_pair_route(32768, 16384, nullptr, nullptr, prediction, false, true);
     require(r.route.prefix == 32768U && r.chunk.rows == 4096U && r.tile_rows == 4096U);
-    // A cost file keeps the cost-model route under either policy.
+    // A transfer-bearing cost file keeps the cost-model route under either policy.
     LayerCosts costs; costs.layers.fill(0.001); costs.has_transfer = true;
     costs.transfer_ms_per_row = 0.01; costs.fixed_ms = 20;
     const auto cut = predict_cut(costs, 24);
     const auto with_costs = resolve_pair_route(32768, 16384, nullptr, &costs, cut, true, true);
     require(std::string_view(with_costs.policy) == "fixed" &&
         std::string_view(with_costs.route.reason) == choose_prompt_route(32768, 4096, &costs, cut).reason);
+    costs.has_transfer = false;
+    const auto layer_only = resolve_pair_route(8192, 8192, nullptr, &costs, cut, true, true);
+    require(std::string_view(layer_only.policy) == "length" && layer_only.route.prefix == 8192U);
     // Defaults: the length policy from 8,192 context tokens, single-route tiles always; "0"/"1" override.
     namespace lv = strix::lever;
     require(!lv::select(chunk_policy_lever, {0U, 4096U, 0U}, nullptr).on);
@@ -592,9 +687,16 @@ void timeline_checks() {
 }
 int main(int argc, char** argv) {
     try {
+        if (argc == 2 && std::string_view(argv[1]) == "--route-mode-only") {
+            route_mode_checks(); return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--policy-inspection-only") {
+            policy_inspection_checks(); return 0;
+        }
         if (argc == 2 && std::string_view(argv[1]) == "--device-checked-only") {
             device_checked_piece_checks(); return 0;
         }
+        route_mode_checks(); policy_inspection_checks();
         balance_checks(); half_cut_checks(); route_checks(); chunk_checks(); blocked_send_overlap_checks(); crc_checks(); fault_checks(); routed_piece_checks(); crc_fold_checks(); device_checked_piece_checks(); timeline_checks(); copy_rows_checks();
         Wire forward, backward;
         std::mutex received_mutex; std::condition_variable received_cv; std::uint64_t received_chunks = 0;

@@ -36,6 +36,8 @@ struct Policy {
 // N balanced chunks is stage A of chunk 0, then every chunk of stage B:
 //   wall(N) = (N + 1) / 2 x P(n / N) + seam_ms + handoff_fixed_ms + handoff_ms_per_row x n.
 // The chunk minimising wall wins; the pipeline is chosen only if that beats single_ms_per_row x n.
+// This estimate averages rows across chunks and assumes balanced stages. Execution uses full chunks
+// and a shorter tail: qualify uneven tails and unbalanced cuts before treating estimates as timings.
 struct PipelineCost {
     double fixed_ms = 0.0;           // per chunk, both stages
     double ms_per_row = 0.0;         // per chunk row, both stages
