@@ -27,6 +27,7 @@
 #include <map>
 #include <mutex>
 #include "strix/qpf2k_defaults.hpp"
+#include "core/glu_pair.hpp"
 
 namespace strix::q8_rows::tiled {
 
@@ -259,11 +260,19 @@ __global__ __attribute__((amdgpu_flat_work_group_size(1, TileShape<BN>::threads)
     const unsigned char* wbase;
     std::uint32_t boff;
     {
-        unsigned seg; std::uint32_t row;
-        static_cast<void>(segment_row(site.segments, n0, width, seg, row));
-        wbase = site.segments.weights[seg];
-        const std::uint32_t last = min(site.segments.first[seg + 1U], outputs) - 1U - site.segments.first[seg];
-        boff = min(row + bo, last) * rowbytes + 16U * bh;
+        if constexpr (requires { Site::glu_pair; }) {
+            // Paired site (core/glu_pair.hpp): wave w stages outputs n0 + 16 w .. + 15, one 16-block of one segment, so
+            // the segment base stays uniform per wave; the row is that output's feature column.
+            static_assert(Threads / 32U * core::glu_pair::kBlock == BN);
+            wbase = site.segments.weights[core::glu_pair::segment(n0 + core::glu_pair::kBlock * wave)];
+            boff = min(core::glu_pair::column(n0 + bo), site.segments.first[1] - 1U) * rowbytes + 16U * bh;
+        } else {
+            unsigned seg; std::uint32_t row;
+            static_cast<void>(segment_row(site.segments, n0, width, seg, row));
+            wbase = site.segments.weights[seg];
+            const std::uint32_t last = min(site.segments.first[seg + 1U], outputs) - 1U - site.segments.first[seg];
+            boff = min(row + bo, last) * rowbytes + 16U * bh;
+        }
     }
     u32x4 areg[AChunks];
     unsigned bscale, bq[5];
@@ -451,6 +460,24 @@ __global__ __attribute__((amdgpu_flat_work_group_size(1, TileShape<BN>::threads)
             }
             lds_barrier(); // every reader finishes before the next strip
         }
+        return;
+    }
+    if constexpr (requires { Site::glu_pair; } && !NoStores) {
+        // Paired GLU store: sub-tiles 2k / 2k + 1 of a wave are gate / up of the same 16 features (n0 + wn * kWN is a
+        // multiple of 32 outputs), so each lane holds both operands of one (row, feature). All lanes reach the store.
+        static_assert(kNT % 2U == 0U && kWN % (2U * core::glu_pair::kBlock) == 0U);
+#pragma unroll
+        for (unsigned t = 0; t < kMT; ++t)
+#pragma unroll
+            for (unsigned u = 0; u < kNT; u += 2U) {
+                const std::uint32_t out = n0 + wn * kWN + 16U * u + lane % 16U;
+                const std::uint32_t feature = core::glu_pair::column(out);
+#pragma unroll
+                for (unsigned e = 0; e < 8U; ++e) {
+                    const std::uint32_t r = m0 + wm * kWM + 16U * t + 2U * e + lane / 16U;
+                    site.store_pair(feature, r, out < outputs && r < rows, acc[t][u][e], acc[t][u + 1U][e]);
+                }
+            }
         return;
     }
 #pragma unroll
@@ -722,9 +749,12 @@ template <class Site> unsigned mode_of(const Site& site) {
 // dword-aligned Q8 segments whose boundaries are multiples of 128, 32-bit operand offsets, at least one row.
 template <class Site> bool supported(const Site& site, std::uint32_t rows, unsigned mode) {
     if (!rows || !dense_a8_width(site.width) || !site.outputs || !site.segments.count || site.segments.count > kMaxSegments) return false;
+    constexpr bool paired = requires { Site::glu_pair; };
+    // Paired sites (core/glu_pair.hpp): exactly gate and up of one feature count, interleaved per 16-block.
+    if (paired && (site.segments.count != 2U || !core::glu_pair::geometry(site.segments.first[1], site.outputs))) return false;
     for (unsigned m = 0; m < site.segments.count; ++m) {
         if (reinterpret_cast<std::uintptr_t>(site.segments.weights[m]) % 4U) return false;
-        if (m && site.segments.first[m] % kBN) return false;  // a 128-output tile never straddles two segments
+        if (!paired && m && site.segments.first[m] % kBN) return false;  // a 128-output tile never straddles two segments
     }
     if (site.segments.first[site.segments.count] != site.outputs) return false;
     const std::uint64_t rows_up = (static_cast<std::uint64_t>(rows) + kBM - 1U) / kBM * kBM;
@@ -744,7 +774,10 @@ template <class Site> bool supported(const Site& site, std::uint32_t rows) { ret
 template <class Site, unsigned Mode, unsigned Probe = 0U>
 void launch_projection(const Site& site, std::uint32_t rows, hipStream_t stream, bool any_order, unsigned form_id, std::uint32_t raster_m,
     const _Float16* a16) {
-    if (form_id >= 3U)  // 256-output tiles: every segment boundary a multiple of 256, else form 0 (same bits)
+    if constexpr (requires { Site::glu_pair; }) {
+        // Paired sites never straddle a segment inside a wave; their store exists in project_kernel only (forms 0/3/4).
+        if (form_id == 1U || form_id == 2U) form_id = 0U;
+    } else if (form_id >= 3U)  // 256-output tiles: every segment boundary a multiple of 256, else form 0 (same bits)
         for (unsigned m = 1; m < site.segments.count; ++m) if (site.segments.first[m] % 256U) form_id = 0U;
     if (Mode == kF32 && form_id == 4U) form_id = 3U;  // FP32 A staged inline does not fit 192 VGPRs: form 3 (same bits)
     if constexpr (Probe == 0U && requires { Site::dense_vector_store; } && !requires { Site::dense_vector_epilogue; }) {
@@ -812,7 +845,7 @@ void launch(const Site& site, std::uint32_t rows, hipStream_t stream, bool any_o
         if (form_id == 4U && site.width > 2560U && !lean_site<Site>()) form_id = 3U;
     }
     // Forms 3/4 tile 256 outputs: every segment boundary must be a multiple of 256 (else form 0, same bits).
-    if (form_id >= 3U)
+    if (form_id >= 3U && !requires { Site::glu_pair; })  // paired sites: per-wave segments (launch_projection)
         for (unsigned m = 1; m < site.segments.count; ++m) if (site.segments.first[m] % 256U) form_id = 0U;
     if (mode == kF32 && form_id == 4U) form_id = 3U;  // as launch_projection (the trace shows the form that runs)
     if (!supported(site, rows, mode)) throw std::invalid_argument("q8_rows tiled: unsupported dense projection");

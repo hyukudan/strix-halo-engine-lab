@@ -9,6 +9,7 @@
 #include <string>
 #include <memory>
 #include <span>
+#include <vector>
 
 namespace strix {
 
@@ -122,9 +123,12 @@ void shared_expert_known_window_rows_launch_detached(std::span<const ExecutionDi
     const HipSharedExpertLauncherConfig& config, void* stream, std::uintptr_t workspace, std::uint64_t workspace_bytes);
 // Byte-identity fixture seam: force either producer, preserving all production admission checks. Optional device
 // gate/up rows (2 * intermediate floats, compact) replace the projection result before activation on the owned stream.
+// glu_pair: -1 = production STRIX_QPF2K_GLU_PAIR, 0 = activation pre-kernel, 1 / 2 = paired gate|up store (2: form 0).
 unsigned shared_expert_shared_pre_fixture_overflow_count();
 bool shared_expert_shared_pre_fixture_launch(std::span<const ExecutionDispatchContext> rows,
-    const HipSharedExpertLauncherConfig& config, bool shared_pre, const float* injected_gate_up = nullptr);
+    const HipSharedExpertLauncherConfig& config, bool shared_pre, const float* injected_gate_up = nullptr, int glu_pair = -1);
+// The FP16 preimage rows the shared-pre producer left for `stream` (features halves per row, the pitch tail dropped).
+std::vector<std::uint16_t> shared_expert_shared_pre_fixture_a16(void* stream, std::uint32_t rows, std::uint32_t features);
 // Prefill: all T rows of a shared-expert step (8-row tiles of one strided view).
 void shared_expert_known_prefill_rows_preflight(std::span<const ExecutionDispatchContext> rows,
     const HipSharedExpertLauncherConfig& config);
