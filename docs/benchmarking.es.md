@@ -70,6 +70,11 @@ Los prompts de las clases de decodificación están en `scripts/bench/prompts/cl
 cambia un orden de magnitud entre prosa, una edición de código y CSV a JSON, así que la decodificación servida se
 informa siempre por clase.
 
+Barra de calidad TURBO: `tools/qualification/turbo_bar/` ([README](../tools/qualification/turbo_bar/README.md)) mide
+E (ruta exacta) frente a R (un pack menor de los mismos pesos con los mismos núcleos) y T (TURBO): KL, top-1 y
+dNLL sobre logits completos, tareas puntuadas, recuperación, intervalos pareados del 95 % (INCONCLUSO si no
+resuelven) y una frontera velocidad/calidad. `rpack_kquant.py` produce R; `models.json` declara E/R/T por modelo.
+
 ## Comprobaciones
 
 `scripts/bench/tests/run.sh` comprueba la sintaxis de todos los kits, pasa shellcheck si está instalado y ejecuta
