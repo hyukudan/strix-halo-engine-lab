@@ -7,6 +7,7 @@
 // Build (gfx1151): clang++ -x hip --offload-arch=gfx1151 -mno-wavefrontsize64 --rocm-path=<rocm> -O3 -std=c++20
 //   -Isrc -Iinclude --hip-link src/minimax/attn/index_proj.hip src/minimax/attn/index_proj_tests.hip -o index-proj-tests
 #include "index_proj.hpp"
+#include "strix/env_flags.hpp"
 
 #include <algorithm>
 #include <bit>
@@ -361,12 +362,11 @@ void bench_wmma(std::mt19937& rng) {
                             "diag-1colblock", "wmma-x16(conv+wmma)", "wmma-x16-only"};
     // "x16" (default): slab|tc4, tc4|x16, tc4|x16-only, slab|x16; "diag": slab|tc4, tc4|x-cached, tc4|one column block;
     // "orders": slab|tc4, rowsfast|tc4, tc4|tc2, tc4|vgpr192
-    const char* series = std::getenv("STRIX_MMATTN_WMMA_SERIES");
-    const std::string sname = series != nullptr ? series : "x16";
+    const int series = strix::envcfg::choice("STRIX_MMATTN_WMMA_SERIES", {"x16", "diag", "orders"}, 0);
     const std::vector<std::pair<int, int>> pairs =
-        sname == "orders" ? std::vector<std::pair<int, int>>{{0, 1}, {2, 1}, {1, 3}, {1, 5}}
-        : sname == "diag" ? std::vector<std::pair<int, int>>{{0, 1}, {1, 4}, {1, 6}}
-                          : std::vector<std::pair<int, int>>{{0, 1}, {1, 7}, {1, 8}, {0, 7}};
+        series == 2 ? std::vector<std::pair<int, int>>{{0, 1}, {2, 1}, {1, 3}, {1, 5}}
+        : series == 1 ? std::vector<std::pair<int, int>>{{0, 1}, {1, 4}, {1, 6}}
+                      : std::vector<std::pair<int, int>>{{0, 1}, {1, 7}, {1, 8}, {0, 7}};
     for (const auto& [a, b] : pairs)
         for (unsigned rows : {4096U, 1024U, 2048U, 8192U}) {
             const unsigned layers = rows > 2048 ? 12 : 30;
