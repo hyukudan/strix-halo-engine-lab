@@ -931,6 +931,7 @@ struct ApiService::Impl {
             throw ApiError(400, "invalid_request_error", "prompt of " + std::to_string(prompt) + " tokens does not fit the context of " +
                 std::to_string(context) + " tokens", "messages");
         const auto room = static_cast<double>(context - prompt);
+        if (request_context_ceiling) requested = std::min(requested, room);
         if (config.strict_context_limit && requested > room)
             throw ApiError(400, "invalid_request_error", "request exceeds context capacity", "max_tokens");
         return static_cast<std::uint32_t>(std::max(1.0, std::min(requested, room)));

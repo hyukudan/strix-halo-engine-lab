@@ -76,7 +76,7 @@ int run(int argc, char** argv, const ServiceFactories& factories, std::ostream& 
         using config_file::Kind;
         static constexpr config_file::Option shell_options[] = {
             {"model", "--model", Kind::value}, {"registry_root", "--registry-root", Kind::path}, {"registry", "--registry", Kind::path},
-            {"description", "--description", Kind::path}, {"bind", "--bind", Kind::value}, {"port", "--port", Kind::value}};
+            {"description", "--description", Kind::value}, {"bind", "--bind", Kind::value}, {"port", "--port", Kind::value}};
         auto file = config_file::expand(argc, argv, shell_options);
         if (file.print) { out << file.effective; return 0; }
         std::vector<char*> expanded;

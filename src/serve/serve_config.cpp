@@ -3,6 +3,7 @@
 #include "strix/model_description.hpp"
 
 #include <array>
+#include <cerrno>
 #include <charconv>
 #include <filesystem>
 #include <fstream>
@@ -12,6 +13,7 @@
 #include <stdexcept>
 
 #if !defined(_WIN32)
+#include <fcntl.h>
 #include <sys/stat.h>
 #include <unistd.h>
 #endif
@@ -86,7 +88,10 @@ bool looks_secret(std::string_view key) {
 }
 
 bool cli_has(const std::vector<std::string>& args, std::string_view flag) {
-    for (const auto& a : args) if (a == flag || (a.size() > flag.size() && std::string_view(a).starts_with(flag) && a[flag.size()] == '=')) return true;
+    for (const auto& a : args) {
+        if (a == "--") break;
+        if (a == flag || (a.size() > flag.size() && std::string_view(a).starts_with(flag) && a[flag.size()] == '=')) return true;
+    }
     return false;
 }
 
@@ -96,14 +101,37 @@ std::string toml_string(std::string_view s) {
     return out + "\"";
 }
 
-void check_trusted(const std::string& path) {
+std::string read_trusted(const std::string& path) {
 #if !defined(_WIN32)
+    // Keep the validated file open: replacing the pathname must not change the bytes read.
+    // NONBLOCK lets fstat reject a FIFO without waiting for a writer.
+    const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC | O_NONBLOCK);
+    if (fd < 0) throw std::invalid_argument(path + ": cannot open serve config");
+    struct Close { int descriptor; ~Close() { ::close(descriptor); } } close_fd{fd};
     struct stat st{};
-    if (::stat(path.c_str(), &st) != 0) throw std::invalid_argument(path + ": cannot stat serve config");
+    if (::fstat(fd, &st) != 0) throw std::invalid_argument(path + ": cannot stat serve config");
+    if (!S_ISREG(st.st_mode)) throw std::invalid_argument(path + ": serve config must be a regular file");
     if (st.st_mode & (S_IWGRP | S_IWOTH)) throw std::invalid_argument(path + ": serve config is writable by other users; refusing it");
     if (st.st_uid != ::geteuid() && st.st_uid != 0) throw std::invalid_argument(path + ": serve config is owned by another user; refusing it");
+    std::string text;
+    std::array<char, 8192> buffer{};
+    for (;;) {
+        const auto n = ::read(fd, buffer.data(), buffer.size());
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            throw std::invalid_argument(path + ": cannot read serve config");
+        }
+        if (n == 0) return text;
+        text.append(buffer.data(), static_cast<std::size_t>(n));
+    }
 #else
-    (void)path;  // Windows: the file ACL is the operator's responsibility (documented)
+    // Windows: the file ACL is the operator's responsibility (documented).
+    std::ifstream input(path, std::ios::binary);
+    if (!input) throw std::invalid_argument(path + ": cannot open serve config");
+    std::ostringstream text;
+    text << input.rdbuf();
+    if (input.bad()) throw std::invalid_argument(path + ": cannot read serve config");
+    return text.str();
 #endif
 }
 
@@ -123,7 +151,7 @@ Expanded expand_text(std::string_view text, const std::string& file_path, const 
     flatten(parsed.fields, {}, entries);
     std::map<std::string_view, const Option*, std::less<>> by_key;
     for (const auto& option : table) by_key.emplace(option.key, &option);
-    const fs::path base = fs::path(file_path).parent_path();
+    const fs::path base = fs::absolute(file_path).parent_path();
     std::vector<std::string> from_file;
     std::ostringstream effective;
     effective << "# effective serve options (file " << file_path << " + command line; the command line wins)\n";
@@ -192,6 +220,7 @@ Expanded expand_text(std::string_view text, const std::string& file_path, const 
         }
     }
     for (std::size_t i = 0; i < cli.size(); ++i) {
+        if (cli[i] == "--") break;
         for (const auto& option : table) {
             const std::string_view arg = cli[i];
             const bool exact = arg == option.flag, with_value = arg.starts_with(option.flag) && arg.size() > option.flag.size() && arg[option.flag.size()] == '=';
@@ -215,6 +244,10 @@ Expanded expand(int argc, const char* const* argv, std::span<const Option> table
     bool print = false, seen = false;
     for (int i = 0; i < argc; ++i) {
         const std::string_view a = argv[i];
+        if (i > 0 && a == "--") {
+            for (; i < argc; ++i) args.emplace_back(argv[i]);
+            break;
+        }
         if (i > 0 && a == "--print-serve-config") { print = true; continue; }
         if (i > 0 && (a == "--serve-config" || a.starts_with("--serve-config="))) {
             if (seen) throw std::invalid_argument("--serve-config given twice");
@@ -235,12 +268,7 @@ Expanded expand(int argc, const char* const* argv, std::span<const Option> table
         return out;
     }
     if (file.empty()) throw std::invalid_argument("--serve-config requires a file");
-    check_trusted(file);
-    std::ifstream input(file, std::ios::binary);
-    if (!input) throw std::invalid_argument(file + ": cannot open serve config");
-    std::ostringstream text;
-    text << input.rdbuf();
-    auto out = expand_text(text.str(), file, args, table);
+    auto out = expand_text(read_trusted(file), file, args, table);
     out.print = print;
     return out;
 }

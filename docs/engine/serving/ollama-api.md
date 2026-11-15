@@ -49,5 +49,5 @@ are resident). Streamed: `application/x-ndjson`, one line per delta, tool calls 
 `done` line. Errors are `{"error": "..."}` with the HTTP status; an error during a stream is one error line.
 SSE keepalive comments have no NDJSON form and are not sent; a client that disconnects still cancels the generation.
 
-Cost: re-encoding one streamed token frame takes a few microseconds on the host (`strix-serve-api-tests` prints it),
-against milliseconds per decoded token.
+`strix-serve-api-tests` reports the host cost of translating one streamed token frame. This microbenchmark
+does not measure full HTTP/decode overhead or establish a percentage of end-to-end generation time.

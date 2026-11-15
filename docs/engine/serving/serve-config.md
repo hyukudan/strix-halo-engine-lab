@@ -15,12 +15,19 @@ Rules:
 - Validated before any weight is read: TOML syntax and duplicate keys (line and column), unknown keys, wrong value
   types, conflicting sources, all with `FILE:LINE`. Nothing is accepted and ignored.
 - The command line wins: a flag given on the command line drops the file's value; a list given on the command
-  line replaces the file's whole list.
-- Relative paths (`mtp_bundle`, `release_manifest`, `http.api_key_file`, ...) resolve against the file's directory.
+  line replaces the file's whole list. In the shell, `--` ends shell options; the family tail is passed verbatim
+  and does not override or appear in the shell's effective configuration.
+- Relative paths (`mtp_bundle`, `release_manifest`, `http.api_key_file`, ...) become absolute paths against the
+  config file's directory. Shell `registry_root` and `registry` each resolve against that directory independently;
+  an explicit resolved `registry` is not prefixed by `registry_root`. An omitted `registry` retains the default
+  `models/registry.toml` under the root; relative command-line `--registry` paths also remain relative to the root.
+- Shell `description` is a registry-relative selector, matching the entry's `description` string. It is not
+  expanded against the config directory (for example, `description = "models/m.toml"`).
 - Secrets: inline credentials (`*key`, `*token`, `*secret`, `*password`) are refused; use the `*_file` option. A
   secret given on the command line is printed as `<redacted>`.
-- Untrusted files: on Linux a file writable by group/others or owned by another user is refused. On Windows the
-  file ACL is the operator's responsibility.
+- Untrusted files: on Linux the opened descriptor must name a regular file owned by the effective user or root
+  and not writable by group/others. Validation and reading use that same descriptor. On Windows the file ACL
+  is the operator's responsibility.
 - `--print-serve-config` prints the effective options with their origin (`FILE:LINE` or `command line`) and exits
   before loading. The family's own `--print-effective-config` still prints the fully resolved values.
 

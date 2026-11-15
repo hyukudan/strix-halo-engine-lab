@@ -13,6 +13,16 @@ namespace {
 
 [[noreturn]] void bad(const std::string& code, const std::string& message) { throw RequestError(400, code, message); }
 
+std::int64_t integer_option(const Json& value, std::string_view key, bool allow_unbounded = false) {
+    std::int64_t n = 0;
+    try { n = value.as_int(); }
+    catch (const JsonError&) { bad("invalid_option", "options." + std::string(key) + " must be an integer in the signed 64-bit range"); }
+    if (n < 1 && !(allow_unbounded && (n == -1 || n == -2)))
+        bad("invalid_option", "options." + std::string(key) + (allow_unbounded
+            ? " must be positive, -1 (unbounded) or -2 (fill the context)" : " must be a positive integer"));
+    return n;
+}
+
 Json obj(std::initializer_list<Json::Member> members) { return Json(Json::Object(members)); }
 
 std::string rfc3339(std::chrono::system_clock::time_point t) {
@@ -125,17 +135,14 @@ void options_into(const Json* options, const Served& served, Json& body, Transla
         if (done) continue;
         if (resource.contains(key)) { out.no_effect.push_back(key); continue; }
         if (key == "num_predict") {
-            if (!value.is_number() || value.as_double() != static_cast<double>(value.as_int())) bad("invalid_option", "options.num_predict must be an integer");
-            const auto n = value.as_int();
+            const auto n = integer_option(value, key, true);
             if (n > 0) body.set("max_tokens", Json(n));
-            else if (n != -1 && n != -2) bad("invalid_option", "options.num_predict must be positive, -1 (unbounded) or -2 (fill the context)");
         } else if (key == "stop") {
             if (value.is_string()) { Json list = Json::array(); list.push(value); body.set("stop", std::move(list)); }
             else if (value.is_array()) body.set("stop", value);
             else bad("invalid_option", "options.stop must be a string or an array of strings");
         } else if (key == "num_ctx") {
-            if (!value.is_number() || value.as_int() < 1) bad("invalid_option", "options.num_ctx must be a positive integer");
-            const auto n = static_cast<std::uint64_t>(value.as_int());
+            const auto n = static_cast<std::uint64_t>(integer_option(value, key));
             // Below the served context it is a hard bound (no truncation, no context shift); at or above it, no effect.
             if (n < served.context_tokens) out.context_ceiling = n; else out.no_effect.push_back(key);
         } else if (key == "typical_p" || key == "tfs_z") {
@@ -150,7 +157,7 @@ void options_into(const Json* options, const Served& served, Json& body, Transla
             out.no_effect.push_back(key);
         } else if (key == "penalize_newline") {
             if (!value.is_bool()) bad("invalid_option", "options.penalize_newline must be a boolean");
-            if (value.as_bool() && !penalties_neutral) bad("unsupported_option", "options.penalize_newline is not executed by this engine");
+            if (!penalties_neutral) bad("unsupported_option", "options.penalize_newline with active penalties is not executed by this engine");
             out.no_effect.push_back(key);
         } else bad("unknown_option", "options." + key + " is not a known option");
     }
