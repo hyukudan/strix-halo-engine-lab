@@ -156,18 +156,20 @@ template <unsigned L> void tree_case(std::mt19937& g) {
     tree_kernel<L, true><<<kCtas, L>>>(din, b);
     check(hipDeviceSynchronize(), "tree kernels");
     const auto ha = down(a, n), hb = down(b, n);
-    unsigned bad = 0U, nan = 0U;
+    unsigned bad = 0U, nan = 0U, payload = 0U;  // payload: both NaN, bits differ (operand order of a NaN + NaN add)
     for (std::size_t i = 0; i < n; ++i) {
         std::uint32_t ua, ub;
         std::memcpy(&ua, &ha[i], 4);
         std::memcpy(&ub, &hb[i], 4);
         bad += ua != ub;
+        payload += ua != ub && std::isnan(ha[i]) && std::isnan(hb[i]);
         nan += std::isnan(ha[i]);
     }
     char what[96];
     std::snprintf(what, sizeof what, "tree L%u bit-identical to the LDS loop", L);
     expect(bad == 0U, what);
-    std::printf("tree L%-4u %u CTAs x 11 kinds: %zu words, %u differ, %u NaN results compared by bits\n", L, kCtas, n, bad, nan);
+    std::printf("tree L%-4u %u CTAs x 11 kinds: %zu words, %u differ (%u NaN payload only), %u NaN results compared by bits\n", L, kCtas,
+                n, bad, payload, nan);
     check(hipFree(din), "free");
     check(hipFree(a), "free");
     check(hipFree(b), "free");

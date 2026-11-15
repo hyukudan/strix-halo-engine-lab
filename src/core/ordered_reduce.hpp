@@ -22,13 +22,22 @@
 
 namespace strix::core::ordered_reduce {
 
+// One level: own + other, in that operand order. The empty asm keeps the exchange a separate v_mov_dpp: folded into
+// v_add_f32_dpp the DPP operand must be src0, which computes other + own (same value for every non-NaN sum, but the
+// other operand's payload when both are NaN), measured on gfx1151.
+template <unsigned H> __device__ __forceinline__ float level(float v) {
+    float other = ::strix::qwen_dpp::down_tree32<H>(v);
+    asm volatile("" : "+v"(other));
+    return v + other;
+}
+
 // Levels 16..1 of the tree in wave 0: on entry lane l < 32 holds the level-32 sum s[l] + s[l + 32].
 __device__ __forceinline__ float wave0_levels(float v) {
-    v = v + ::strix::qwen_dpp::down_tree32<16U>(v);
-    v = v + ::strix::qwen_dpp::down_tree32<8U>(v);
-    v = v + ::strix::qwen_dpp::down_tree32<4U>(v);
-    v = v + ::strix::qwen_dpp::down_tree32<2U>(v);
-    v = v + ::strix::qwen_dpp::down_tree32<1U>(v);
+    v = level<16U>(v);
+    v = level<8U>(v);
+    v = level<4U>(v);
+    v = level<2U>(v);
+    v = level<1U>(v);
     return v;
 }
 
