@@ -1139,6 +1139,7 @@ struct Engine::Impl {
         hip_ok(hipDeviceSynchronize(), "load head");
         lib.release_staging();
         alloc();
+        require_invariant_dense();  // reject an unexecutable identity before receipts or inference
         if (model_fast_i4) setup_fast_i4();
         route_levers();  // shared route receipt: requested vs effective, part of the rank fingerprint
         LoadReport r;
@@ -1940,20 +1941,43 @@ struct Engine::Impl {
             if (lib_off_contract(n, j.w)) return true;
         return false;
     }
-    bool dense_qkv(std::size_t n, const mmoe::PrefillDenseJob (&jobs)[3]) const {
-        if (pf_ws == nullptr || (!dense_forced(n, jobs) && (!pf_dense_qkv || n < kDenseQkvMinRows))) return false;
-        for (const auto& j : jobs)  // raw weights loaded, same input width, implemented bit width; else the library
+    template <std::size_t N> bool dense_available(std::size_t n, const mmoe::PrefillDenseJob (&jobs)[N]) const {
+        if (pf_ws == nullptr) return false;
+        for (const auto& j : jobs)  // raw weights loaded, same input width, implemented bit width
             if (j.w.trellis == nullptr || j.w.input != jobs[0].w.input || !mmoe::prefill_dense_supported(j.w)) return false;
-        return mmoe::prefill_dense_workspace_bytes(jobs, 3, static_cast<unsigned>(n)) <= pf_ws_bytes;
+        return mmoe::prefill_dense_workspace_bytes(jobs, static_cast<unsigned>(N), static_cast<unsigned>(n)) <= pf_ws_bytes;
+    }
+    // Invariant prefill must cover every layer and every tail, even when the preferred dense routes are OFF.
+    // With fixed S=1, workspace size is monotone in rows, so max_rows bounds every admitted chunk.
+    void require_invariant_dense() const {
+        if (!mmoe::prefill_order_invariant()) return;
+        if (!linears_loaded || !moe_opt)
+            throw std::invalid_argument("STRIX_MMX_PF_ORDER=invariant requires STRIX_MM_LINEARS!=off and STRIX_MM_MOE!=off");
+        for (const auto& y : layers) {
+            const mmoe::PrefillDenseJob qkv[3] = {{y.rq, q}, {y.rk, k}, {y.rv, v}};
+            const mmoe::PrefillDenseJob o1[1] = {{y.ro, part}};
+            if (!dense_available(opt.max_rows, qkv) || !dense_available(opt.max_rows, o1))
+                throw std::invalid_argument("STRIX_MMX_PF_ORDER=invariant requires supported resident q/k/v/o weights and sufficient prefill workspace");
+        }
+    }
+    template <std::size_t N> bool dense_admit(std::size_t n, const mmoe::PrefillDenseJob (&jobs)[N], bool preferred) const {
+        if (gemv) return false;  // decode and verification retain their existing GEMV arithmetic
+        const bool forced = dense_forced(n, jobs);
+        if (!forced && !preferred) return false;
+        const bool available = dense_available(n, jobs);
+        if (forced && !available)
+            throw std::runtime_error("STRIX_MMX_PF_ORDER=invariant dense route unavailable; refusing adaptive fallback");
+        return available;
+    }
+    bool dense_qkv(std::size_t n, const mmoe::PrefillDenseJob (&jobs)[3]) const {
+        return dense_admit(n, jobs, pf_dense_qkv && n >= kDenseQkvMinRows);
     }
 
     // Prefill o_proj on the v4 core only for exactly 4096-row pieces (bench pfdv4 o: 0.96 at 4096 rows, 1.10 at 1024 rows;
     // larger --max-rows pieces are not qualified).
     static constexpr std::size_t kDenseORows = 4096;
     bool dense_o(std::size_t n, const mmoe::PrefillDenseJob (&job)[1]) const {
-        return (dense_forced(n, job) || (pf_dense_o && n == kDenseORows)) && pf_ws != nullptr && job[0].w.trellis != nullptr &&
-               mmoe::prefill_dense_supported(job[0].w) &&
-               mmoe::prefill_dense_workspace_bytes(job, 1, static_cast<unsigned>(n)) <= pf_ws_bytes;
+        return dense_admit(n, job, pf_dense_o && n == kDenseORows);
     }
 
     // Layer L up to the attention partial: q/k/v + index projections, MSA, o_proj -> out (n rows; h / hn: the rows').

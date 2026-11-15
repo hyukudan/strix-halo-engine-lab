@@ -615,7 +615,11 @@ breakdown, GPU clocks per token and a host-node link probe (RTT and useful throu
 gate/up/down, MoE part `mmx-pf-moe-s1-v1`) and `core::fixed_linear_contract` for the dense q/k/v/o (S = 1; the v4 core
 runs every call whose `strix_gemm` split would differ): together the identity `mmx-pf-linear-s1-v1`, cache field
 `prefill_order=mmx-pf-linear-s1-v1`, receipt lever `minimax.linear_order`. `adaptive` keeps today's rows-dependent
-splits. Dense device gate: `strix-hip-mmx-moe-bench --test --tests test_prefill_dense` (chunks 256/1024/4096/whole,
+splits. Invariant order applies only to prefill; decode and verification retain their existing routes, including
+`STRIX_MM_LINEARS=load`. Startup rejects `STRIX_MM_LINEARS=off`, `STRIX_MM_MOE=off`, unsupported or missing dense
+weights, and insufficient dense workspace. Mandatory dense dispatch fails explicitly instead of falling back.
+Host engine-route regressions: configure `tests/pr665_host`, build Release, then run `ctest --output-on-failure -C Release`.
+Dense device gate: `strix-hip-mmx-moe-bench --test --tests test_prefill_dense` (chunks 256/1024/4096/whole,
 4096 + 1..17 tails, 1..17-row calls, library cross-check, adaptive control). Quality: the FAST logit gate floor rule with
 layer-0 nulls (`tools/strix-gate/README.md`, onset-matched floor). Gates:
 `strix-chunk-order-contract-tests` (host order reference, chunks 256/1024/4096/whole and 1..17-row tails) and
