@@ -31,3 +31,13 @@ inline bool enabled() {
 }
 inline std::atomic<std::uint64_t> calls{0};  // launches that ran on the WMMA core (identity reporting)
 }  // namespace strix::glm::pf::kda_wmma
+
+#include "strix/env_flags.hpp"
+
+namespace strix::glm::pf::mla_wmma {
+// FAST identity glm-pf-mla-wmma-v1 (glm_pf_mla_wmma.hpp): the MLA absorb / out GEMMs on the shared short-K FP16 WMMA
+// tile GEMM (core/f16_tile_gemm.hpp). Opt-in until its FAST gate passes: STRIX_GLM_PF_MLA_WMMA=1 selects it, unset or 0
+// keeps the exact FP32 GEMM. Part of the TP2 startup agreement (rank_defaults::kPfMlaWmmaConfig).
+inline bool enabled() { return envcfg::flag("STRIX_GLM_PF_MLA_WMMA", false); }
+inline std::atomic<std::uint64_t> calls{0};  // launches that ran on the WMMA core (identity reporting)
+}  // namespace strix::glm::pf::mla_wmma

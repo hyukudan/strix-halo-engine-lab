@@ -32,6 +32,7 @@ inline constexpr std::uint32_t kPfWmmaConfig = 1U << 12;  // STRIX_GLM_PF_WMMA=1
 inline constexpr std::uint32_t kFastI4Config = 1U << 13;  // STRIX_GLM_MODEL_FORMAT=fast_i4 on this rank
 inline constexpr std::uint32_t kPfAttnWmmaConfig = 1U << 14;  // FAST attention core (glm-pf-attn-wmma) on this rank
 inline constexpr std::uint32_t kPfKdaWmmaConfig = 1U << 17;  // FAST KDA projections (glm-pf-kda-wmma-v1) on this rank
+inline constexpr std::uint32_t kPfMlaWmmaConfig = 1U << 18;  // FAST MLA absorb/out GEMMs (glm-pf-mla-wmma-v1) on this rank
 inline constexpr unsigned kIdxWmmaShift = 15;  // 2 bits: STRIX_IDX_WMMA mode (0 off, 1 bf16, 2 f16) on this rank
 
 struct StartupResult { unsigned rows; bool eligible; };

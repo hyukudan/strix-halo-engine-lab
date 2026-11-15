@@ -8,6 +8,8 @@
 #include "glm/prefill/glm_pf_workspace.hpp"
 #include "glm/prefill/glm_pf_aux.hpp"
 #include "glm/prefill/glm_pf_attn_wmma.hpp"
+#include "glm/prefill/glm_pf_mla_wmma.hpp"
+#include "glm/prefill/glm_pf_wmma.hpp"
 #include "attn_core/sparse_flash_wmma.hpp"
 #include "attn_core/index_score_band.hpp"
 #include "attn_core/index_score_wmma.hpp"
@@ -3482,6 +3484,16 @@ bool mla_e_lane_major(unsigned heads) {
     return !mla_v1() && (v == 5 || v == 7 || v == 10) && heads == 32;
 }
 
+// FAST glm-pf-mla-wmma-v1 (STRIX_GLM_PF_MLA_WMMA=1, opt-in): absorb (kOut = false) / out GEMM on the shared short-K FP16
+// WMMA tile GEMM (glm_pf_mla_wmma.hpp); false = not selected, the caller runs its exact GEMM version.
+template <bool kOut>
+bool mla_gemm_wmma(const float* x, const std::uint16_t* kv_b, unsigned heads, unsigned C, float* y, hipStream_t s) {
+    if (!mla_wmma::enabled() || !mla_wmma::fits<kKvLora, kMlaDim>(x, x, kv_b, heads, C)) return false;
+    mla_wmma::gemm<kKvLora, kMlaDim, kOut>(x, kv_b, heads, C, y, s);
+    mla_wmma::calls.fetch_add(1, std::memory_order_relaxed);
+    return true;
+}
+
 void mla_attention_rows_versions(const DsaSlot& slot, const std::uint32_t* tokens, const std::uint32_t* n, const float* q,
                         const std::uint16_t* kv_b, unsigned heads, float* qt, float* e, float* ob, float* o, unsigned C,
                         hipStream_t s, unsigned scores_v, unsigned obar_v, unsigned gemm_v) {
@@ -3493,7 +3505,8 @@ void mla_attention_rows_versions(const DsaSlot& slot, const std::uint32_t* token
         const bool q16 = obar_v >= 22 && gemm_v == 3;
         const unsigned keys = obar_v % 2 == 1 ? 16U : 32U;
         mla_mark(0, s);
-        if (q16) mla_gemm_rows_v3_kernel<false, true><<<dim3(kKvLora / kG3C, (C + kG3R - 1) / kG3R, heads), 256, 0, s>>>(q, kv_b, heads, C, qt);
+        if (!q16 && mla_gemm_wmma<false>(q, kv_b, heads, C, qt, s)) {
+        } else if (q16) mla_gemm_rows_v3_kernel<false, true><<<dim3(kKvLora / kG3C, (C + kG3R - 1) / kG3R, heads), 256, 0, s>>>(q, kv_b, heads, C, qt);
         else if (gemm_v == 3) mla_gemm_rows_v3_kernel<false><<<dim3(kKvLora / kG3C, (C + kG3R - 1) / kG3R, heads), 256, 0, s>>>(q, kv_b, heads, C, qt);
         else if (gemm_v == 2) mla_gemm_rows_v2_kernel<false><<<dim3((C + kG2R - 1) / kG2R, kKvLora / kG2C, heads), 256, 0, s>>>(q, kv_b, heads, C, qt);
         else mla_gemm_rows_kernel<false><<<dim3((C + kGT - 1) / kGT, kKvLora / kGT, heads), 256, 0, s>>>(q, kv_b, heads, C, qt);
@@ -3503,7 +3516,8 @@ void mla_attention_rows_versions(const DsaSlot& slot, const std::uint32_t* token
         mla_mark(3, s);
         mla_flash_rows(slot, tokens, n, qt, ob, C, keys, q16, s);
         mla_mark(4, s);
-        if (gemm_v == 3) mla_gemm_rows_v3_kernel<true><<<dim3(kMlaDim / kG3C, (C + kG3R - 1) / kG3R, heads), 256, 0, s>>>(ob, kv_b, heads, C, o);
+        if (mla_gemm_wmma<true>(ob, kv_b, heads, C, o, s)) {
+        } else if (gemm_v == 3) mla_gemm_rows_v3_kernel<true><<<dim3(kMlaDim / kG3C, (C + kG3R - 1) / kG3R, heads), 256, 0, s>>>(ob, kv_b, heads, C, o);
         else if (gemm_v == 2) mla_gemm_rows_v2_kernel<true><<<dim3((C + kG2R - 1) / kG2R, kMlaDim / kG2C, heads), 256, 0, s>>>(ob, kv_b, heads, C, o);
         else mla_gemm_rows_kernel<true><<<dim3((C + kGT - 1) / kGT, kMlaDim / kGT, heads), 256, 0, s>>>(ob, kv_b, heads, C, o);
         ok(hipGetLastError(), "glm pf mla out");
@@ -3523,7 +3537,8 @@ void mla_attention_rows_versions(const DsaSlot& slot, const std::uint32_t* token
         if (heads == 32) mla_scores_rows_kernel<32><<<sg, 256, 0, s>>>(slot, tokens, n, qt, e);
         else mla_scores_rows_kernel<64><<<sg, 256, 0, s>>>(slot, tokens, n, qt, e);
     } else {
-        if (gemm_v == 3) mla_gemm_rows_v3_kernel<false><<<dim3(kKvLora / kG3C, (C + kG3R - 1) / kG3R, heads), 256, 0, s>>>(q, kv_b, heads, C, qt);
+        if (mla_gemm_wmma<false>(q, kv_b, heads, C, qt, s)) {
+        } else if (gemm_v == 3) mla_gemm_rows_v3_kernel<false><<<dim3(kKvLora / kG3C, (C + kG3R - 1) / kG3R, heads), 256, 0, s>>>(q, kv_b, heads, C, qt);
         else if (gemm_v == 2) mla_gemm_rows_v2_kernel<false><<<dim3((C + kG2R - 1) / kG2R, kKvLora / kG2C, heads), 256, 0, s>>>(q, kv_b, heads, C, qt);
         else mla_gemm_rows_kernel<false><<<dim3((C + kGT - 1) / kGT, kKvLora / kGT, heads), 256, 0, s>>>(q, kv_b, heads, C, qt);
         mla_mark(1, s);
@@ -3566,7 +3581,8 @@ void mla_attention_rows_versions(const DsaSlot& slot, const std::uint32_t* token
         else if (obv == 4) mla_obar_v4_kernel<<<dim3(heads / kOb4Heads, kKvLora / kOb4Dims, C), 256, 0, s>>>(slot, tokens, n, heads, e, ob);
         else mla_obar_v2_kernel<<<dim3(kKvLora / kOb2Lat, C), 256, 0, s>>>(slot, tokens, n, heads, e, ob);
         mla_mark(4, s);
-        if (gemm_v == 3) mla_gemm_rows_v3_kernel<true><<<dim3(kMlaDim / kG3C, (C + kG3R - 1) / kG3R, heads), 256, 0, s>>>(ob, kv_b, heads, C, o);
+        if (mla_gemm_wmma<true>(ob, kv_b, heads, C, o, s)) {
+        } else if (gemm_v == 3) mla_gemm_rows_v3_kernel<true><<<dim3(kMlaDim / kG3C, (C + kG3R - 1) / kG3R, heads), 256, 0, s>>>(ob, kv_b, heads, C, o);
         else if (gemm_v == 2) mla_gemm_rows_v2_kernel<true><<<dim3((C + kG2R - 1) / kG2R, kMlaDim / kG2C, heads), 256, 0, s>>>(ob, kv_b, heads, C, o);
         else mla_gemm_rows_kernel<true><<<dim3((C + kGT - 1) / kGT, kMlaDim / kGT, heads), 256, 0, s>>>(ob, kv_b, heads, C, o);
     }
