@@ -3625,6 +3625,11 @@ void Engine::set_prefill_msa_batch(bool on) {
     impl_->pf_msa_batch = on;
 }
 bool Engine::prefill_msa_batch() const { return impl_->pf_msa_batch; }
+void Engine::set_prefill_headless(bool on) {
+    impl_->no_task("set_prefill_headless");
+    impl_->pf_headless = on;
+}
+bool Engine::prefill_headless() const { return impl_->pf_headless; }
 void Engine::set_prefill_msa_rework(unsigned mode) {
     impl_->no_task("set_prefill_msa_rework");
     impl_->set_prefill_msa_rework(mode);
