@@ -20,8 +20,9 @@ Entry points stay in `apps/cuda_*` and tests in `tests/cuda/`; the GLM producer 
 ## Phase 1 (layout, bitwise)
 
 Files were moved, not rewritten; the arithmetic of every kernel is unchanged (the SASS of every CUDA object of the
-DeepSeek, Qwen, GLM and MiniMax builds compares equal before and after). Identical helpers that several files
-carried are defined once:
+DeepSeek, Qwen, GLM and MiniMax builds compares equal before and after, with `scripts/bench/cuda/sass_compare.py
+--base <old build> --new <new build>`, the byte gate for every later extraction too). Identical helpers that
+several files carried are defined once:
 
 | Helper | Was in | Now |
 |---|---|---|
