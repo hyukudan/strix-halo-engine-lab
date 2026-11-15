@@ -54,6 +54,8 @@ WMMA por mosaico desde +0 con k ascendente. Encima viven políticas con nombre. 
 ([`f16_dense_q8a8.hpp`](../../src/core/f16_dense_q8a8.hpp), espacio de nombres `strix::core::f16_dense_tall::q8a8`)
 calcula pesos Q8_0 x activaciones A8 como una cadena FP16 por salida en lugar de los productos enteros exactos;
 DeepSeek V4.1 la enlaza (ejemplo abajo).
+Sus stagers decodifican dos pesos por operación FP16 empaquetada (`kWPacked`, `STRIX_F16_Q8A8_WPACK`, por defecto on, mismos
+bits; el kit `ds41/dense-forms` mide ambas formas y comprueba los bits).
 
 **Núcleo en mosaico y bucles enteros** ([`src/core/tiled_core.hpp`](../../src/core/tiled_core.hpp)). El núcleo
 WMMA de prefill de la biblioteca, solo cabecera para que los motores lo instancien con sus adaptadores en lugar de

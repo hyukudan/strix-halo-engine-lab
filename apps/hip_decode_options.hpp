@@ -1,5 +1,6 @@
 #include "strix/ctx_exact_memory.hpp"
 #include "strix/deploy/binding.hpp"
+#include "strix/serve/serve_config.hpp"
 #pragma once
 #include "strix/rotary_descriptor.hpp"
 #include "strix/qsa_committed_pool.hpp"
@@ -1838,9 +1839,45 @@ inline void apply_prefix_cache_environment(Options& o, Lookup lookup) {
     }
 }
 
+// The serve options a --serve-config file may set for this CLI (src/serve/serve_config.cpp expands them in front of
+// the command line; the parser below validates and resolves them exactly as the equivalent flags).
+inline std::span<const strix::serve::config_file::Option> hip_serve_config_options() {
+    using strix::serve::config_file::Kind;
+    static constexpr strix::serve::config_file::Option table[] = {
+        {"context", "--context", Kind::value}, {"deploy", "--deploy", Kind::value},
+        {"mtp_bundle", "--mtp-bundle", Kind::path}, {"release_manifest", "--release-manifest", Kind::path},
+        {"model_retained_budget", "--model-retained-budget", Kind::value}, {"model_setup_peak_budget", "--model-setup-peak-budget", Kind::value},
+        {"prefill.exact_fp16", "--prefill-exact-fp16", Kind::flag, 0, "--config"},
+        {"prefill.disable", "--prefill-disable", Kind::list, ',', "--config"},
+        {"http.serve", "--http-serve", Kind::flag}, {"http.port", "--http-port", Kind::value}, {"http.bind", "--http-bind", Kind::value},
+        {"http.model_id", "--http-model-id", Kind::value}, {"http.api_key_file", "--http-api-key-file", Kind::path},
+        {"http.batch", "--http-batch", Kind::value}, {"http.max_queue", "--http-max-queue", Kind::value},
+        {"http.max_connections", "--http-max-connections", Kind::value}, {"http.default_max_tokens", "--http-default-max-tokens", Kind::value},
+        {"http.default_temperature", "--http-default-temperature", Kind::value}, {"http.default_top_k", "--http-default-top-k", Kind::value},
+        {"http.default_top_p", "--http-default-top-p", Kind::value}, {"http.default_min_p", "--http-default-min-p", Kind::value},
+        {"http.sampling", "--http-sampling", Kind::value}, {"http.sse_keepalive", "--http-sse-keepalive", Kind::value},
+        {"http.sse_progress_interval", "--http-sse-progress-interval", Kind::value},
+        {"http.responses", "--http-responses", Kind::on_off}, {"http.capabilities", "--http-capabilities", Kind::on_off},
+        {"http.stream_receipts", "--http-stream-receipts", Kind::on_off}, {"http.constraints", "--http-constraints", Kind::on_off},
+        {"http.logprobs", "--http-logprobs", Kind::on_off}, {"http.logit_transforms", "--http-logit-transforms", Kind::on_off},
+        {"http.thinking_budget", "--http-thinking-budget", Kind::on_off}, {"http.selection_mtp", "--http-selection-mtp", Kind::on_off},
+        {"http.selection_fast", "--http-selection-fast", Kind::on_off},
+    };
+    return table;
+}
+
 inline Options parse_options(
     int argc,
     char** argv, bool defer_qpf2k_defaults = false, std::string bundle_path = {}) {
+    if (bundle_path.empty()) {  // --serve-config FILE: validated and expanded before anything is read or loaded
+        auto file = strix::serve::config_file::expand(argc, argv, hip_serve_config_options());
+        if (file.print) { std::cout << file.effective << std::flush; std::exit(0); }
+        if (file.used) {
+            std::vector<char*> pointers;
+            for (auto& arg : file.argv) pointers.push_back(arg.data());
+            return parse_options(static_cast<int>(pointers.size()), pointers.data(), defer_qpf2k_defaults, bundle_path);
+        }
+    }
     if (argc>=2 && bundle_path.empty()) {
         std::string bundle;
         const char* inherited_yarn=std::getenv("STRIX_QWEN_ROPE_YARN");

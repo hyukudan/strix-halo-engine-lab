@@ -357,10 +357,10 @@ inline bool max_rows_auto(const Effective& e) {
     return e.max_rows.source == "auto-8192" || e.max_rows.source == "auto-4096-memory";
 }
 
-// The serve entry point (strix-glm5-serve) resolves the SAME request as the CLI through scan / resolve above. These two
-// functions are everything serving changes, so the parity gate (tests/serve_cli_parity_tests.cpp) sees exactly what the
-// server runs: the speculation opt-out is forwarded as "--mtp-spec 0", and an automatic exchange-row choice starts at the
-// fallback (the server has no startup handshake that could size the larger one).
+// The serve entry point (strix-glm5-serve) resolves the SAME request as the CLI through scan / resolve above. This
+// function is everything serving changes, so the parity gate (tests/serve_cli_parity_tests.cpp) sees exactly what the
+// server runs: a normal decode, and the speculation opt-out forwarded as "--mtp-spec 0". Automatic max-rows is admitted
+// at load by the same function as the CLI (glm_auto_rows.hpp admit_auto_rows).
 inline std::vector<std::string> serve_request_args(std::vector<std::string> rank_args, bool serve_mtp) {
     rank_args.insert(rank_args.end(), {"--decode", "1"});
     if (!serve_mtp) {
@@ -369,15 +369,9 @@ inline std::vector<std::string> serve_request_args(std::vector<std::string> rank
     }
     return rank_args;
 }
-inline void serve_adjust(Effective& e) {
-    if (max_rows_auto(e)) e.max_rows = {std::to_string(kFallbackMaxRows), "auto-4096-serve"};
-}
 inline Effective resolve_serve(const std::vector<std::string>& rank_args, bool serve_mtp,
                                const EnvGet& env, const ModelFacts& facts = {}) {
-    auto e = resolve(scan(serve_request_args(rank_args, serve_mtp)), env, facts);
-    // Serving always resolves a normal decode; its fixed row fallback replaces startup admission.
-    serve_adjust(e);
-    return e;
+    return resolve(scan(serve_request_args(rank_args, serve_mtp)), env, facts);
 }
 
 // The predicate dry-runs the load and prefill admissions, including their current margins.
