@@ -5,12 +5,17 @@
 #include "ops/norm/reference.hpp"
 #include "strix/ds41_formats.hpp"
 
+#include <array>
+#include <atomic>
 #include <bit>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <random>
 #include <span>
+#include <stdexcept>
+#include <thread>
+#include <type_traits>
 #include <vector>
 
 namespace {
@@ -20,6 +25,127 @@ void expect(bool ok, const char* what, std::size_t i) {
     if (!ok && failures++ < 10) std::printf("FAIL %s at %zu\n", what, i);
 }
 bool same(float a, float b) { return std::bit_cast<std::uint32_t>(a) == std::bit_cast<std::uint32_t>(b); }
+
+void test_retained_selection() {
+    const bool owns_table = !std::is_reference_v<decltype(strix::cpu::select(strix::cpu::Caps{}))>;
+    expect(owns_table, "selection returns an owned table", 0);
+    if (!owns_table) return;  // Fail the old API without deliberately invoking its data race.
+    const auto& retained = strix::cpu::select(strix::cpu::caps());
+    std::atomic<bool> started{false};
+    bool worker_ok = true;
+    std::thread worker([&] {
+        std::array<std::uint8_t, 34> weight{};
+        weight[1] = 0x3c;  // half 1
+        for (std::size_t j = 2; j < weight.size(); ++j) weight[j] = 1;
+        std::array<std::int8_t, 32> codes{};
+        codes.fill(1);
+        const float delta = 1.0F;
+        float y = 0.0F;
+        const strix::cpu::Q8a8View v{weight.data(), codes.data(), &delta, &y, 34, 32, 1, 1, 32, 1, 0};
+        started.store(true, std::memory_order_release);
+        for (unsigned i = 0; i < 4096; ++i) {
+            retained.gemv_q8_0_a8(v, {});
+            worker_ok = worker_ok && same(y, 32.0F);
+        }
+    });
+    while (!started.load(std::memory_order_acquire)) std::this_thread::yield();
+    const strix::cpu::Stream stream{};
+    const float x = 1.0F;
+    float y = 0.0F;
+    for (unsigned i = 0; i < 4096; ++i) {
+        const auto next = strix::cpu::select(i % 2U ? strix::cpu::caps() : strix::cpu::Caps{});
+        expect(next.gemv_q8_0_a8 != nullptr, "reselection", i);
+        strix::cpu::Norm::run(&x, nullptr, 0, 1, 1e-6F, &y, 1, &stream);
+    }
+    worker.join();
+    expect(worker_ok, "retained table concurrent selection and norm", 0);
+}
+
+void test_invalid_widths(const strix::cpu::Kernels& k) {
+    for (const std::uint32_t width : {31U, 33U}) {
+        std::array<float, 64> x{};
+        x.fill(1.0F);
+        std::array<std::int8_t, 64> codes{};
+        codes.fill(17);
+        std::array<float, 2> deltas{19.0F, 19.0F};
+        std::array<std::int32_t, 2> sums{23, 23};
+        bool rejected = false;
+        try { k.quantize_a8(x.data(), width, codes.data(), deltas.data(), sums.data()); }
+        catch (const std::invalid_argument&) { rejected = true; }
+        expect(rejected, "a8 rejects partial group", width);
+        for (const auto code : codes) expect(code == 17, "rejected a8 codes untouched", width);
+        for (const auto delta : deltas) expect(same(delta, 19.0F), "rejected a8 deltas untouched", width);
+        for (const auto sum : sums) expect(sum == 23, "rejected a8 sums untouched", width);
+        std::array<std::uint8_t, 68> weight{};
+        for (const std::uint32_t accumulate : {0U, 1U}) {
+            float y = 29.0F;
+            const strix::cpu::Q8a8View v{weight.data(), codes.data(), deltas.data(), &y,
+                                        68, width, 1, 1, 64, 1, accumulate};
+            rejected = false;
+            try { k.gemv_q8_0_a8(v, {}); }
+            catch (const std::invalid_argument&) { rejected = true; }
+            expect(rejected, "gemv rejects partial group", width);
+            expect(same(y, 29.0F), "rejected gemv output untouched", width);
+        }
+    }
+}
+
+void test_product_order(const strix::cpu::Kernels& k) {
+    // Independent powers-of-two fixture: lane 0 rounds (2^24 + 1) before cancelling
+    // lane 16; lane 1 then leaves 1. Seeding a lane with the existing output is wrong.
+    std::array<std::uint8_t, 33 * 34> weight{};
+    std::array<std::int8_t, 33 * 32> codes{};
+    codes.fill(1);
+    std::array<float, 33> deltas{};
+    for (std::size_t g = 0; g < 33; ++g) {
+        weight[g * 34 + 1] = 0x3c;
+        weight[g * 34 + 2] = 1;
+    }
+    deltas[0] = 0x1p24F;
+    deltas[16] = -0x1p24F;
+    deltas[1] = deltas[32] = 1.0F;
+    float y = -1.0F;
+    strix::cpu::Q8a8View v{weight.data(), codes.data(), deltas.data(), &y,
+                          33 * 34, 33 * 32, 1, 1, 33 * 32, 1, 0};
+    k.gemv_q8_0_a8(v, {});
+    expect(same(y, 1.0F), "group and butterfly rounding order", 0);
+    y = -1.0F;
+    v.accumulate = 1;
+    k.gemv_q8_0_a8(v, {});
+    expect(same(y, 0.0F), "accumulate after cancellation", 0);
+}
+
+void test_padded_tiny_subnormal(const strix::cpu::Kernels& k) {
+    // Two rows, one group each; odd weight stride also exercises unaligned scales.
+    std::array<std::uint8_t, 70> weight{};
+    weight[0] = 1;  // smallest positive half subnormal: 2^-24
+    weight[35] = 0xff; weight[36] = 0x83;  // largest negative subnormal: -1023 * 2^-24
+    for (std::size_t j = 0; j < 32; ++j) weight[2 + j] = weight[37 + j] = 1;
+    std::array<float, 32> x{};
+    std::array<std::int8_t, 128> codes{};
+    codes.fill(17);
+    std::array<float, 4> deltas{19.0F, 19.0F, 19.0F, 19.0F};
+    std::array<std::int32_t, 4> sums{23, 23, 23, 23};
+    for (std::size_t r = 0; r < 2; ++r) {
+        x.fill(r == 0 ? 0x1p-120F : 127.0F);
+        k.quantize_a8(x.data(), 32, codes.data() + r * 64, deltas.data() + r * 2, sums.data() + r * 2);
+        expect(same(deltas[r * 2], 1.0F), "tiny/normal delta", r);
+        expect(sums[r * 2] == (r == 0 ? 0 : 4064), "tiny/normal sum", r);
+        for (std::size_t j = 0; j < 32; ++j) {
+            expect(codes[r * 64 + j] == (r == 0 ? 0 : 127), "tiny/normal code", j);
+            expect(codes[r * 64 + 32 + j] == 17, "code padding", j);
+        }
+        expect(same(deltas[r * 2 + 1], 19.0F) && sums[r * 2 + 1] == 23, "scale/sum padding", r);
+    }
+    std::array<float, 6> y{};
+    y.fill(29.0F);
+    const strix::cpu::Q8a8View v{weight.data(), codes.data(), deltas.data(), y.data(), 35, 32, 2, 2, 64, 3, 0};
+    k.gemv_q8_0_a8(v, {});
+    expect(same(y[0], 0.0F) && same(y[1], 0.0F), "tiny group product", 0);
+    expect(same(y[3], 4064.0F * 0x1p-24F), "positive half subnormal product", 0);
+    expect(same(y[4], -4157472.0F * 0x1p-24F), "negative half subnormal product", 0);
+    expect(same(y[2], 29.0F) && same(y[5], 29.0F), "output padding", 0);
+}
 
 struct HostNormTraits {
     using Input = float;
@@ -82,10 +208,13 @@ void test_q8_0(const strix::cpu::Kernels& k, std::mt19937& rng, std::uint32_t wi
             expect(same(y[static_cast<std::size_t>(r) * count + o], ref), "q8_0 gemv", o);
         }
     // accumulate: out += product, one rounding after the product
-    std::vector<float> y2 = y;
+    std::vector<float> y2(y.size());
+    for (std::size_t i = 0; i < y.size(); ++i)
+        y2[i] = i % 3U == 0 ? -y[i] : (i % 3U == 1 ? std::nextafter(-y[i], 1.0F) : nd(rng));
+    const auto initial = y2;
     const strix::cpu::Q8a8View va{w.data(), codes.data(), deltas.data(), y2.data(), row_bytes, width, count, rows, width, count, 1};
     k.gemv_q8_0_a8(va, strix::cpu::Stream{});
-    for (std::size_t i = 0; i < y.size(); ++i) expect(same(y2[i], y[i] + y[i]), "q8_0 accumulate", i);
+    for (std::size_t i = 0; i < y.size(); ++i) expect(same(y2[i], initial[i] + y[i]), "q8_0 accumulate", i);
 }
 
 void test_norm(std::mt19937& rng, unsigned n, unsigned rows) {
@@ -97,13 +226,20 @@ void test_norm(std::mt19937& rng, unsigned n, unsigned rows) {
     strix::cpu::Norm::run(x.data(), w.data(), 0, n, 1e-6F, y.data(), rows, &s);
     strix::ops::norm::reference<HostNormTraits>(x.data(), w.data(), 0, n, 1e-6F, ref.data(), rows);
     for (std::size_t i = 0; i < y.size(); ++i) expect(same(y[i], ref[i]), "rmsnorm", i);
+    auto in_place = x;
+    strix::cpu::Norm::run(in_place.data(), w.data(), 0, n, 1e-6F, in_place.data(), rows, &s);
+    for (std::size_t i = 0; i < y.size(); ++i) expect(same(in_place[i], ref[i]), "rmsnorm in place", i);
     strix::cpu::Norm::run(x.data(), nullptr, 0, n, 1e-6F, y.data(), rows, &s);
     strix::ops::norm::reference<HostNormTraits>(x.data(), nullptr, 0, n, 1e-6F, ref.data(), rows);
     for (std::size_t i = 0; i < y.size(); ++i) expect(same(y[i], ref[i]), "rmsnorm unscaled", i);
+    in_place = x;
+    strix::cpu::Norm::run(in_place.data(), nullptr, 0, n, 1e-6F, in_place.data(), rows, &s);
+    for (std::size_t i = 0; i < y.size(); ++i) expect(same(in_place[i], ref[i]), "rmsnorm unscaled in place", i);
 }
 }  // namespace
 
 int main() {
+    test_retained_selection();
     std::mt19937 rng(1112U);
     const auto host = strix::cpu::caps();
     const auto& selected = strix::cpu::select(host);
@@ -111,11 +247,15 @@ int main() {
                 strix::cpu::isa_name(selected.isa), host.avx2, host.avx512f, host.avx512vnni, host.amx_int8,
                 host.neon, host.sve);
     for (const auto* k : {&strix::cpu::reference_kernels(), &selected}) {
+        test_invalid_widths(*k);
+        test_product_order(*k);
+        test_padded_tiny_subnormal(*k);
         test_q8_0(*k, rng, 32, 5, 1);
         test_q8_0(*k, rng, 2048, 64, 3);
         test_q8_0(*k, rng, 7168 + 32, 17, 2);  // groups not a multiple of the lane count
     }
     test_norm(rng, 96, 3);
+    for (const unsigned n : {1U, 127U, 128U, 129U, 511U, 512U, 513U}) test_norm(rng, n, 2);
     test_norm(rng, 4096, 2);
     test_norm(rng, 7168, 1);
     std::printf("%u checks, %u failures\n", checks, failures);

@@ -80,10 +80,8 @@ const char* isa_name(Isa isa) noexcept {
     return "unknown";
 }
 
-const Kernels& select(const Caps& c) noexcept {
-    // Rebuilt on each call (a few pointer copies); the returned table is per thread.
-    static thread_local Kernels table;
-    table = reference_kernels();
+Kernels select(const Caps& c) noexcept {
+    Kernels table = reference_kernels();
     if (c.avx512f && c.avx512bw) fill(table, arch::avx512::kernels());
     if (c.neon) fill(table, arch::neon::kernels());
     return table;

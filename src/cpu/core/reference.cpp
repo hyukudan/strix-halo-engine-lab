@@ -1,12 +1,13 @@
 // Scalar, exact reference of the CPU backend. It is the oracle every ISA specialisation must match
 // bit for bit; it is written for the declared operation order, not for speed.
 #include "cpu/core/backend.hpp"
+#include "core/integer_math.hpp"
 
 #include <algorithm>
 #include <array>
 #include <bit>
 #include <cmath>
-#include <cstring>
+#include <stdexcept>
 
 namespace strix::cpu {
 
@@ -25,6 +26,8 @@ namespace {
 
 void ref_quantize_a8(const float* x, std::size_t width, std::int8_t* codes, float* deltas,
                      std::int32_t* sums) {
+    if (width % q8_0_group != 0U)
+        throw std::invalid_argument("CPU A8 activation width must be a multiple of 32");
     for (std::size_t g = 0; g < width / q8_0_group; ++g) {
         const float* xg = x + g * q8_0_group;
         float amax = 0.0F;
@@ -43,33 +46,26 @@ void ref_quantize_a8(const float* x, std::size_t width, std::int8_t* codes, floa
     }
 }
 
-float butterfly(std::array<float, product_lanes> v) noexcept {
-    for (unsigned d = 16U; d; d /= 2U) {
-        std::array<float, product_lanes> next{};
-        for (unsigned l = 0; l < product_lanes; ++l) next[l] = v[l] + v[l ^ d];
-        v = next;
-    }
-    return v[0];
-}
-
 void ref_gemv_q8_0_a8(const Q8a8View& v, const Stream&) {
+    if (v.in % q8_0_group != 0U)
+        throw std::invalid_argument("CPU Q8_0 product width must be a multiple of 32");
     const std::size_t groups = v.in / q8_0_group;
     for (std::uint32_t r = 0; r < v.rows; ++r) {
         const std::int8_t* xc = v.codes + static_cast<std::size_t>(r) * v.x_stride;
         const float* xd = v.deltas + static_cast<std::size_t>(r) * (v.x_stride / q8_0_group);
         for (std::uint32_t o = 0; o < v.count; ++o) {
             const std::uint8_t* row = v.weight + static_cast<std::size_t>(o) * v.row_bytes;
-            std::array<float, product_lanes> lanes{};
+            float lanes[product_lanes]{};
             for (std::size_t g = 0; g < groups; ++g) {
                 const std::uint8_t* block = row + g * q8_0_block_bytes;
                 const float scale = half_to_float(static_cast<std::uint16_t>(block[0] | (block[1] << 8U)));
                 std::int32_t dot = 0;
                 for (std::size_t j = 0; j < q8_0_group; ++j)
                     dot += static_cast<std::int8_t>(block[2 + j]) * xc[g * q8_0_group + j];
-                lanes[g % product_lanes] = lanes[g % product_lanes] + static_cast<float>(dot) * (scale * xd[g]);
+                lanes[g % product_lanes] = lanes[g % product_lanes] + core::integer_math::product(dot, scale, xd[g]);
             }
             float& y = v.out[static_cast<std::size_t>(r) * v.out_stride + o];
-            const float p = butterfly(lanes);
+            const float p = core::integer_math::tree32(lanes);
             y = v.accumulate ? y + p : p;
         }
     }

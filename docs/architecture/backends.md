@@ -17,7 +17,7 @@ truly model-specific. There are no per-model kernel copies.
 | Core | Location | Backend-neutral part | HIP-only by construction |
 |---|---|---|---|
 | Norms | `src/ops/norm/norm.hpp`, `reference.hpp` | `Norm<Traits>`: types, `ReductionOrder`, `lanes(n)`, `launch` via traits; host reference | `norm_device.hpp` |
-| Dense Q8_0 x A8 | `src/core/f16_dense_q8a8.hpp` | the `View` struct (weight, codes, deltas, out, strides, accumulate) and the policy name | the body: `_Float16` vectors, `address_space(1)`, `__device__` |
+| Dense Q8_0 x A8 | `src/core/f16_dense_q8a8.hpp` | related operand layout (`weight`, `codes`, `deltas`, `out`, strides, `accumulate`, plus `k_bytes` and `tile0`) | FAST FP16-rounded operands and WMMA arithmetic; `_Float16` vectors, `address_space(1)`, `__device__` |
 | Dense f16 tall / tiled | `src/core/f16_dense_tall.hpp`, tiled core | `ColumnTile` geometry, `row_layout.hpp` (`RowLayoutPolicy`, 64-byte rows) | WMMA fragments, `hip_runtime.h` |
 | Trellis linear | `src/core/backend.hpp` | `DeviceWeights`, `linear_split_count`, `resolve_linear` (plan) | `hipError_t`, `hipStream_t` in every launch signature |
 | Integer math | `src/core/integer_math.hpp` | `product`, `affine`, `iq4`: host and device (`STRIX_INT_HD`) | none |
@@ -50,7 +50,9 @@ bits, and the host reference is the oracle.
 | Group | Operation | Contract |
 |---|---|---|
 | Activation quant | `quantize_a8(x, width) -> codes, deltas, sums` | groups of 32, `delta = amax/127`, `rint`, clamp +-127, tiny/zero group -> delta 1 |
-| Dense GEMV/GEMM | `gemv_<fmt>_a8(View)`, `gemm_<fmt>(View, plan)` for Q8_0, Q2_K, IQ2_XXS, MXFP4, f16, bf16, trellis (EXL3) | per-group `float(int dot) * (sw * sa)` (`integer_math::product`); groups strided over 32 lanes, butterfly; `accumulate` adds once after the product |
+| Integer decode products | Q8_0, IQ2_XXS, MXFP4 x A8 | per-group `float(int dot) * (sw * sa)` (`integer_math::product`); groups strided over 32 lanes, butterfly; `accumulate` adds once after the product |
+| Affine decode product | Q2_K x A8 | separately round `d * float(dot)` and `dmin * float(minimum)`, then subtract and multiply by the activation delta; groups strided over 32 lanes, butterfly |
+| Floating / trellis GEMV/GEMM | f16, bf16, trellis (exllamav3 format) | the selected plan declares operand rounding, accumulation and split order; the integer-dot contract does not apply |
 | Grouped MoE | `grouped(items, WeightDecode, ExpertLayout, InputTransform, Epilogue)` | the dense contract per expert; split partials summed in plan order |
 | Attention prefill | `flash_prefill<Policy>(args, heads, workspace, splits)` | online softmax of `online_softmax.hpp`, masks of `masks.hpp`, key-split merge in split order |
 | Attention decode | `sparse_flash_keysplit<Policy>` | same, one query row per head group |
@@ -63,6 +65,11 @@ A backend exposes `caps()` and `select(caps) -> Kernels`, a table of entry point
 register a table with only the entries they implement; gaps are filled from the backend's
 reference. Selection is by capability bits, never by model name, and every specialised entry must
 match the reference bit for bit before it registers.
+CPU selection returns a table by value, so later selections cannot modify a retained table.
+Current CPU capability detection is only a scaffold: x86 reports hardware feature bits,
+ARM uses compile-time features, and `sve_bits` is zero. Runtime and OS vector-state
+admission (including XCR0 and AMX permission) must be complete before registering
+instructions that require it. Both specialisation tables are currently empty.
 
 ## CPU backend
 
@@ -81,9 +88,16 @@ dotprod/i8mm, SVE). AVX2 joins as `src/cpu/arch/avx2` when needed. Build option
 - **Numerics**: compiled with contraction off (`-ffp-contract=off`, `/fp:precise`). Integer dots are
   exact in int32, so a SIMD kernel only has to keep the declared float order: per-group product,
   group g into lane g % 32, then the butterfly.
-- **Scaffolded now**: `quantize_a8`, `gemv_q8_0_a8` (the `Q8a8View` mirrors the HIP dense view) and
+- **Scaffolded now**: `quantize_a8`, `gemv_q8_0_a8` (the `Q8a8View` has a related layout to the HIP
+  dense view, but omits `k_bytes` and `tile0` and uses a different arithmetic contract) and
   RMSNorm bound to the shared `Norm<Traits>`; tests in `tests/cpu_backend_host_tests.cpp` compare
   them bitwise with `ds41::quantize_a8`, `ds41::product_q8_0` and `ops::norm::reference`.
+  A8 width and GEMV `in` must be multiples of 32; every table entry rejects other widths
+  with `std::invalid_argument` before writing output. Zero width is allowed. Callers supply
+  sufficient buffers and strides, with `x_stride` a multiple of 32. Valid calls allocate no memory.
+  Tests cover retained-table selection, width rejection, padded strides, tiny groups, half
+  subnormals, cancellation, and norm thresholds/tails/aliasing. Both table runs currently use
+  scalar code; these host checks establish neither ISA specialisation nor native GPU equivalence.
 - **Next**: AVX-512 VNNI and NEON SDOT `gemv_q8_0_a8` (same bits); Q2_K / IQ2_XXS / MXFP4 decode
   products from the `ds41_formats` contracts; grouped MoE through the existing policy split;
   attention via the `sparse_flash_keysplit` policy contract with host policies; AMX for prefill GEMM.

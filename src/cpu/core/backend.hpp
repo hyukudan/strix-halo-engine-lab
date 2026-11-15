@@ -4,7 +4,7 @@
 // src/cpu/arch/<isa> are layer 3 and are chosen by capability (caps()), never by model.
 //
 // Every operation is declared with the arithmetic contract of the shared core it implements, so a
-// result is bitwise comparable with the host reference of that core and with the GPU backends:
+// result is bitwise comparable with host references implementing the same contract:
 //   - gemv_q8_0_a8: the Q8_0 x A8 decode product (32-weight groups, int32 dot per group,
 //     float(dot) * (scale_w * delta_x), group g into lane g % 32, lanes combined by the butterfly
 //     v[l] += v[l ^ d] for d = 16 .. 1, result lane 0).
@@ -12,7 +12,8 @@
 //     delta 1 and codes 0 for an all-zero group or amax < 2^-119.
 //   - rmsnorm: strix::ops::norm::ReductionOrder::lane_strided_fma_lds_halving with the lane count
 //     of NormTraits::lanes.
-// No allocation, no hidden threads: the caller owns every buffer. Compile with contraction off.
+// Valid calls allocate no memory and start no hidden threads: the caller owns every buffer.
+// Compile with contraction off.
 #include <cstddef>
 #include <cstdint>
 
@@ -44,7 +45,9 @@ inline constexpr std::size_t q8_0_block_bytes = 34;  // FP16 scale (little endia
 inline constexpr std::size_t product_lanes = 32;
 float half_to_float(std::uint16_t bits) noexcept;
 
-// Q8_0 x A8 dense view (same fields as the HIP dense core view, src/core/f16_dense_q8a8.hpp).
+// Related layout to src/core/f16_dense_q8a8.hpp, without its k_bytes/tile0 fields.
+// That HIP core uses FAST FP16-rounded operands, not this integer-dot arithmetic contract.
+// Caller supplies sufficient buffers and strides; x_stride is a multiple of 32.
 struct Q8a8View {
     const std::uint8_t* weight;  // output o at weight + o * row_bytes
     const std::int8_t* codes;    // A8 codes, row r at codes + r * x_stride
@@ -57,6 +60,8 @@ struct Q8a8View {
 // --------------------------------------------------------------------------- kernel table
 // One table per ISA specialisation; entries a specialisation does not provide stay null and the
 // selector fills them from the reference. Every entry keeps the reference's bits.
+// All quantize_a8 / gemv_q8_0_a8 entries throw std::invalid_argument for width / in
+// not divisible by 32, before writing any output. Zero width is allowed.
 struct Kernels {
     Isa isa = Isa::scalar;
     void (*quantize_a8)(const float* x, std::size_t width, std::int8_t* codes, float* deltas,
@@ -67,7 +72,8 @@ struct Kernels {
 };
 const Kernels& reference_kernels() noexcept;
 // Best table for the host: specialisations in priority order, gaps filled from the reference.
-const Kernels& select(const Caps& c) noexcept;
+// Returned by value: subsequent selections and selecting-thread exit cannot invalidate it.
+Kernels select(const Caps& c) noexcept;
 
 // ------------------------------------------------------------------- shared-norm binding
 // Binds strix::ops::norm::Norm<> (the shared, backend-neutral norm interface) to this backend.
