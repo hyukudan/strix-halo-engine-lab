@@ -641,7 +641,7 @@ void test_common_adapter() {
 void test_decode_xport() {
     namespace ds = strix::ds41;
     const std::pair<const char*, const char*> cases[] = {
-        {nullptr, "communicator (default)"}, {"communicator", "communicator (explicit)"}, {"channel", "channel (explicit)"},
+        {nullptr, "channel (default)"}, {"communicator", "communicator (explicit)"}, {"channel", "channel (explicit)"},
         {"0", "communicator (explicit)"}, {"1", "channel (explicit)"}};
     for (const auto& [value, expected] : cases) {
         World w;
@@ -666,8 +666,12 @@ void test_decode_xport() {
         refused = true;
     }
     check(refused, "decode xport: an unknown value is refused");
-    check(ds::decode_xport_lever.exactness == strix::lever::Exactness::bitwise && !ds::decode_xport_lever.default_on,
-          "decode xport: bitwise lever, communicator by default");
+    check(ds::decode_xport_lever.exactness == strix::lever::Exactness::bitwise && ds::decode_xport_lever.default_on,
+          "decode xport: bitwise lever, channel by default");
+    World base;
+    base.env["STRIX_DS41_BASELINE"] = "1";
+    const auto b = base.run(pd::App::serve, plain(receipts[0]));
+    check(env_of(b)["STRIX_DS41_DECODE_XPORT"] == "0" && b.decode_xport == "communicator (baseline)", "decode xport: STRIX_DS41_BASELINE=1 sets the communicator");
 }
 
 }  // namespace

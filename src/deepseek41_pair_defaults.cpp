@@ -228,6 +228,7 @@ std::span<const strix::profile::DefaultItem> default_items() {
         {"attn_tile_f16", "STRIX_DS41_ATTN_TILE_F16", "", "0", ""},
         {"serve_warm", "STRIX_DS41_SERVE_WARM", "", "0", ""},
         {"dspark_calib", "STRIX_DS41_DSPARK_CALIB", "", "0", ""},
+        {"decode_xport", "STRIX_DS41_DECODE_XPORT", "", "0", ""},
     };
     return items;
 }
@@ -277,12 +278,14 @@ Resolved resolve(App app, const std::vector<std::string>& in, const Getenv& raw_
         if (env(name) == nullptr) r.set_env.emplace_back(name, std::move(value));
     };
     const auto notice = [&](const std::string& s) { r.notices.push_back(std::string("deepseek41 defaults: ") + s); };
-    {
-        const auto xport = strix::ds41::decode_xport_choice(env(strix::ds41::decode_xport_lever.env.data()));
-        r.decode_xport = std::string(strix::ds41::decode_xport_name(xport.on)) + " (" + strix::lever::origin_name(xport.origin) + ")";
-    }
-
     const bool baseline = set(env("STRIX_DS41_BASELINE")) && !zero(env("STRIX_DS41_BASELINE"));
+    {
+        // The engine reads the variable after the app applied set_env: STRIX_DS41_BASELINE=1 puts the communicator there.
+        const char* value = env(strix::ds41::decode_xport_lever.env.data());
+        const auto xport = strix::ds41::decode_xport_choice(baseline && !set(value) ? "0" : value);
+        r.decode_xport = std::string(strix::ds41::decode_xport_name(xport.on)) + " (" +
+                         (baseline && !set(value) ? "baseline" : strix::lever::origin_name(xport.origin)) + ")";
+    }
     if (baseline) {
         for (const auto& row : default_items()) {
             const auto value = strix::profile::resolve_default(row, true, env);
