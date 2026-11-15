@@ -607,16 +607,18 @@ void test_fast_prefill_profile() {
         const auto p = md::prefill_policy(lookup(declined));
         check(p.msa_flash == 0 && p.msa_flash_requested == 1 && p.policies.empty() && !p.note.empty() && p.msa_flash_asked == "fast_prefill",
               "fast admission: static guard declines flash and preserves request: " + std::string(guard.first));
-        check(md::prefill_identity(lookup(declined)).empty() && fp(declined) == none_fp,
-              "fast admission: declined policy leaves no FAST cache field or agreement input");
+        // The router member does not depend on the flash guards: it still runs and is the only FAST identity left.
+        check(md::prefill_identity(lookup(declined)) == "prefill_router=mm-pf-router-wmma-v1-l40-59" && p.router_wmma &&
+                  fp(declined) == fp(EnvMap{{"STRIX_MM_PF_ROUTER_WMMA", "1"}}),
+              "fast admission: declined flash leaves only the router member in the cache field and agreement input");
         const auto cfg = md::effective_config(md::parse_cli("rank", {}), lookup(declined));
         check(cfg.find("\nSTRIX_MM_PF_MSA_FLASH=0\n") != std::string::npos &&
               cfg.find("\nprefill.fast_policies=none\n") != std::string::npos &&
-              cfg.find("\nprefill.fast_profile=off\n") != std::string::npos &&
-              cfg.find("\nprefill.fast_profile_requested=mm-fast-pf-v1\n") != std::string::npos &&
+              cfg.find("\nprefill.fast_profile=mm-fast-pf-v2\n") != std::string::npos &&
+              cfg.find("\nprefill.fast_profile_requested=mm-fast-pf-v2\n") != std::string::npos &&
               cfg.find("\nprefill.msa_flash_requested=1\n") != std::string::npos &&
               cfg.find("\nprefill.msa_flash_layers_requested=" + p.msa_flash_layers_requested + "\n") != std::string::npos &&
-              cfg.find("\nprefill.identity=default\n") != std::string::npos,
+              cfg.find("\nprefill.identity=prefill_router=mm-pf-router-wmma-v1-l40-59\n") != std::string::npos,
               "fast admission: effective receipt matches disabled execution route");
     }
     check(md::msa_flash_decline_reason(false, true, 20) != nullptr &&
@@ -628,19 +630,26 @@ void test_fast_prefill_profile() {
         const auto p = md::prefill_policy(lookup(bundle));
         check(p.msa_flash == 1 && p.msa_flash_layers == "40-59" && p.msa_flash_asked == "fast_prefill" &&
               p.policies == "msa-flash-bf16-l40-v1", "fast profile: bundle selects msa-flash-bf16-l40-v1");
-        check(md::prefill_identity(lookup(bundle)) == "prefill_msa=msa-flash-bf16-l40-v1", "fast profile: cache identity names the policy");
+        check(p.router_wmma && p.router_wmma_layers == "40-59", "fast profile: bundle selects mm-pf-router-wmma-v1 on 40-59");
+        check(md::prefill_identity(lookup(bundle)) == "prefill_msa=msa-flash-bf16-l40-v1;prefill_router=mm-pf-router-wmma-v1-l40-59",
+              "fast profile: cache identity names both policies");
         check(fp(bundle) != none_fp, "fast profile: bundle changes the profile fingerprint");
         const auto r = md::profile_resolution(lookup(bundle));
         check(r.find("msa_flash") != nullptr && r.find("msa_flash")->value == "1", "fast profile: governed row carries the member");
         const auto cfg = md::effective_config(md::parse_cli("rank", {}), lookup(bundle));
         check(cfg.find("\nSTRIX_MM_PF_MSA_FLASH=1\n") != std::string::npos &&
               cfg.find("\nprefill.fast_policies=msa-flash-bf16-l40-v1\n") != std::string::npos &&
-              cfg.find("\nprefill.fast_profile=mm-fast-pf-v1\n") != std::string::npos, "fast profile: effective config prints the rows");
+              cfg.find("\nprefill.fast_profile=mm-fast-pf-v2\n") != std::string::npos, "fast profile: effective config prints the rows");
     }
     {   // An explicit member wins: OFF beats the bundle, 2 replaces its value.
         const EnvMap explicit_off{{"STRIX_MM_FAST_PREFILL", "1"}, {"STRIX_MM_PF_MSA_FLASH", "0"}};
         const auto p = md::prefill_policy(lookup(explicit_off));
-        check(p.msa_flash == 0 && p.policies.empty() && md::prefill_identity(lookup(explicit_off)).empty(), "fast profile: explicit OFF beats the bundle");
+        check(p.msa_flash == 0 && p.policies.empty() && md::prefill_identity(lookup(explicit_off)) == "prefill_router=mm-pf-router-wmma-v1-l40-59",
+              "fast profile: explicit OFF beats the bundle (the other member stays)");
+        const EnvMap router_off{{"STRIX_MM_FAST_PREFILL", "1"}, {"STRIX_MM_PF_ROUTER_WMMA", "0"}};
+        check(!md::prefill_policy(lookup(router_off)).router_wmma &&
+                  md::prefill_identity(lookup(router_off)) == "prefill_msa=msa-flash-bf16-l40-v1",
+              "fast profile: explicit router OFF beats the bundle");
         const auto r = md::profile_resolution(lookup(explicit_off));
         const auto* row = r.find("msa_flash");
         check(row != nullptr && row->status == strix::profile::Status::off, "fast profile: explicit OFF recorded as off");
@@ -654,7 +663,7 @@ void test_fast_prefill_profile() {
         const EnvMap l30_env{{"STRIX_MM_FAST_PREFILL", "1"}, {"STRIX_MM_PF_MSA_FLASH_LAYERS", "30-39,40-59"}};
         const auto l30 = md::prefill_policy(lookup(l30_env));
         check(l30.msa_flash == 1 && l30.msa_flash_layers == "30-59" && l30.policies == "msa-flash-bf16-l30-v1" &&
-                  md::prefill_identity(lookup(l30_env)) == "prefill_msa=msa-flash-bf16-l30-v1",
+                  md::prefill_identity(lookup(l30_env)) == "prefill_msa=msa-flash-bf16-l30-v1;prefill_router=mm-pf-router-wmma-v1-l40-59",
               "fast profile: layers 30-59 = msa-flash-bf16-l30-v1");
     }
     {   // EXL3 base only: the bundle does not select it on FAST_I4; an explicit value still does.
@@ -699,7 +708,9 @@ void test_fast_prefill_profile() {
         check(!agree(bundle, off) && !agree(off, bundle), "fast profile: bundle on one rank only is rejected");
         check(!agree(two, one), "fast profile: member value mismatch rejected");
         check(agree(same, bundle), "fast profile: an explicit value equal to the bundle's is the same run");
-        check(agree(one, bundle) && agree(bundle, one), "fast agreement: bundle-only and explicit-only agree");
+        const EnvMap members{{"STRIX_MM_PF_MSA_FLASH", "1"}, {"STRIX_MM_PF_ROUTER_WMMA", "1"}};
+        check(agree(members, bundle) && agree(bundle, members), "fast agreement: bundle-only and explicit-only agree");
+        check(!agree(one, bundle) && !agree(bundle, one), "fast agreement: a missing bundle member is a different run");
         for (const char* layers : {"40-49,50-59", "!0-39", "50-59,40-55", "040-059"}) {
             const EnvMap equivalent{{"STRIX_MM_PF_MSA_FLASH", "1"}, {"STRIX_MM_PF_MSA_FLASH_LAYERS", layers}};
             check(agree(one, equivalent) && agree(equivalent, one), "fast agreement: equivalent parsed layer masks agree");

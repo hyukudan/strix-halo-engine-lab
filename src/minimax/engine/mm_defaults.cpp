@@ -239,15 +239,17 @@ PrefillPolicy prefill_policy(const Lookup& env) {
                          : std::string("msa-flash-bf16") + (p.msa_flash == 2 ? "-2term" : "") + "-l" + p.msa_flash_layers;
     if (i4 && fp::switch_on(env(kFastBundle.env)) && !fp::set(raw))
         p.note = std::string(flash.policy) + " not selected by " + kFastBundle.env + " on STRIX_MMX_MODEL_FORMAT=fast_i4";
-    // FAST router product (opt-in, own switch): the layers it runs on; layers without a router (dense) are ignored.
+    // FAST router product (bundle member or its own switch): the layers it runs on; layers without a router (dense)
+    // are ignored. Admitted like the flash member (EXL3 MoE base only); an explicit value wins.
     const char* router = env("STRIX_MM_PF_ROUTER_WMMA");
     if (fp::set(router) && std::strcmp(router, "0") != 0 && std::strcmp(router, "1") != 0)
         throw std::invalid_argument("STRIX_MM_PF_ROUTER_WMMA must be 0 or 1");
+    const auto rit = p.canonical.find("STRIX_MM_PF_ROUTER_WMMA");
     const char* rlayers = env("STRIX_MM_PF_ROUTER_WMMA_LAYERS");
     const auto rmask = strix::core::parse_layer_set(fp::set(rlayers) ? rlayers : kRouterWmmaLayers, 0, kMsaLayers,
                                                     "STRIX_MM_PF_ROUTER_WMMA_LAYERS");
     p.router_wmma_layers = fp::layer_ranges(kMsaLayers, [&](unsigned l) { return rmask.test(l); });
-    p.router_wmma = fp::set(router) && std::strcmp(router, "1") == 0 && rmask.count() != 0;
+    p.router_wmma = rit != p.canonical.end() && rit->second == "1" && rmask.count() != 0;
     return p;
 }
 
@@ -490,7 +492,7 @@ std::string effective_config(const Cli& cli, const Lookup& env) {
         for (const auto& e : pr.entries) o << e.lever->env << "=" << e.value << "\n";
         const auto id = prefill_identity(env);
         const bool bundle_requested = strix::fast_profile::switch_on(env(kFastBundle.env));
-        o << "prefill.fast_profile=" << (bundle_requested && !pf.policies.empty() ? kFastBundle.profile : "off") << "\n"
+        o << "prefill.fast_profile=" << (bundle_requested && (!pf.policies.empty() || pf.router_wmma) ? kFastBundle.profile : "off") << "\n"
           << "prefill.fast_profile_requested=" << (bundle_requested ? kFastBundle.profile : "off") << "\n"
           << "prefill.msa_flash_requested=" << pf.msa_flash_requested << "\n"
           << "prefill.msa_flash_source=" << pf.msa_flash_asked << "\n"
