@@ -413,6 +413,9 @@ struct BatchSpeculator::ParkedPlan {
     std::vector<ds::Draft> drafts;
     std::vector<std::uint32_t> window_rows;
     std::vector<bool> drafted, lookup;
+    std::vector<bool> arbiter_used;
+    std::vector<strix::spec::Decision> arbiter_decision;
+    double planned_draft_ms = 0.0;
     std::vector<std::uint32_t> lookup_cap;
     std::uint32_t lookup_mask = 0;
     std::uint32_t planned_drafting = 0, planned_decoders = 0, planned_total = 0;
@@ -437,6 +440,9 @@ std::shared_ptr<BatchSpeculator::ParkedPlan> BatchSpeculator::park() {
     p->window_rows = std::move(window_rows_);
     p->drafted = std::move(drafted_);
     p->lookup = std::move(lookup_);
+    p->arbiter_used = std::move(arbiter_used_);
+    p->arbiter_decision = std::move(arbiter_decision_);
+    p->planned_draft_ms = planned_draft_ms_;
     p->lookup_cap = std::move(lookup_cap_);
     p->lookup_mask = lookup_mask_;
     p->planned_drafting = planned_drafting_;
@@ -450,6 +456,9 @@ std::shared_ptr<BatchSpeculator::ParkedPlan> BatchSpeculator::park() {
     window_rows_.clear();
     drafted_.clear();
     lookup_.clear();
+    arbiter_used_.clear();
+    arbiter_decision_.clear();
+    planned_draft_ms_ = 0.0;
     lookup_cap_.clear();
     return p;
 }
@@ -461,6 +470,9 @@ void BatchSpeculator::resume(const std::shared_ptr<ParkedPlan>& p) {
     window_rows_ = p->window_rows;
     drafted_ = p->drafted;
     lookup_ = p->lookup;
+    arbiter_used_ = p->arbiter_used;
+    arbiter_decision_ = p->arbiter_decision;
+    planned_draft_ms_ = p->planned_draft_ms;
     lookup_cap_ = p->lookup_cap;
     lookup_mask_ = p->lookup_mask;
     planned_drafting_ = p->planned_drafting;
@@ -594,7 +606,9 @@ const PlannedStep& BatchSpeculator::plan(std::span<BatchSequence* const> seqs, s
             // spec.arbiter.ds41: one decoding request, no prompt rows -> the shared arbiter scores the copy proposal
             // (cumulative survival bounded once, copy runs resumed by the cursor) against the request's measured DSpark
             // rate as a black box (tokens per complete pass including its draft); its decision replaces the rate test below
-            const bool use_arbiter = L.arbiter && nd == 1U && chunks.empty() && base > 0.0 && row > 0.0 && budget > nd + lookup_rows;
+            // An unpriced model arm needs the legacy warm-up before source arbitration.
+            const bool use_arbiter = L.arbiter && nd == 1U && chunks.empty() && base > 0.0 && row > 0.0 &&
+                                     budget > nd + lookup_rows && (!dspark_may || draft > 0.0);
             if (L.arbiter && !use_arbiter) L.arbiter->reset_pending();  // a pass it does not observe
             if (use_arbiter) {
                 auto& A = *L.arbiter;
@@ -621,8 +635,7 @@ const PlannedStep& BatchSpeculator::plan(std::span<BatchSequence* const> seqs, s
                     tr.alternative = in.model_pass_ms > 0.0 ? in.model_pass_tokens / in.model_pass_ms * 1e3 : 0.0;
                     tr.cap = d.source == strix::spec::Source::lookup ? d.k : 0U;
                 }
-                // DSpark unmeasured with a possible draft (no price yet): it runs first, as below
-                if (d.source != strix::spec::Source::lookup || d.k == 0U || (dspark_may && !(draft > 0.0))) continue;
+                if (d.source != strix::spec::Source::lookup || d.k == 0U) continue;
                 const std::uint32_t cap = std::min<std::uint32_t>({d.k, static_cast<std::uint32_t>(L.proposal.tokens.size()), lrows - 1U});
                 if (cap == 0U) continue;
                 given[k].assign(cap, 1.0);
@@ -686,6 +699,10 @@ const PlannedStep& BatchSpeculator::plan(std::span<BatchSequence* const> seqs, s
             // (a step with prompt rows may draft before a measured decode step of nd: those steps are never cost samples)
             drafting = controller_.plan_drafts(slots, limit1, budget1);
         }
+        // The arbiter owns source admission; the controller only sizes an admitted model window below.
+        for (std::uint32_t k = 0; k < nd; ++k)
+            if (arbiter_used_[dec[k]])
+                drafting[k] = arbiter_decision_[dec[k]].source == strix::spec::Source::model && limit1[k] > 1U;
     }
     std::vector<ds::Draft> drafts(nd);
     std::uint32_t ndraft = 0;

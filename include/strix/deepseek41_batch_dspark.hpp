@@ -299,7 +299,6 @@ private:
     std::vector<bool> arbiter_used_;
     std::vector<strix::spec::Decision> arbiter_decision_;
     double planned_draft_ms_ = 0.0;  // a lone decoding request's draft wall this plan (ms)
-    std::vector<double> arbiter_draft_ms_;
     std::vector<std::array<std::uint32_t, max_copy_drafts + 1U>> looked_tokens_;  // per owner: a lookup window's row tokens
     // STRIX_DS41_LOOKUP_LOG=1 (diagnostic, rank 0): per decoding request and step, the lookup candidate, its predicted
     // rate against the alternative and what ran (stderr "dspark lookup:" lines), for calibration and agreement studies
