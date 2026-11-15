@@ -106,8 +106,10 @@ public:
     Sender(const Sender&) = delete;
     Sender& operator=(const Sender&) = delete;
 
-    // `width` hints the element size of the bytes (2 for BF16, 4 for FP32) to the codec.
-    void submit(const PieceHeader& header, std::span<const bp_codec::Region> regions, std::function<void()> release = {});
+    // `width` hints the element size of the bytes (2 for BF16, 4 for FP32) to the codec. `identity` sends this piece
+    // uncoded even in a bp-v1 session (every receiver accepts an identity frame; a latency-critical piece skips the codec).
+    void submit(const PieceHeader& header, std::span<const bp_codec::Region> regions, std::function<void()> release = {},
+                bool identity = false);
     void submit(const PieceHeader& header, std::vector<std::uint8_t> bytes, std::uint32_t width = 1);
     // Every piece on the wire, END + manifest sent on every stream; waits for and returns the receiver's reply.
     // Rethrows the first transport or encoder error.

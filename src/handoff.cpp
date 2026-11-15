@@ -510,6 +510,7 @@ struct Sender::Impl {
         Frame f;
         std::vector<bp_codec::Region> regions;
         Release release;
+        bool identity = false;  // uncoded even in a bp-v1 session
     };
     struct Output {
         Frame f;
@@ -579,7 +580,7 @@ struct Sender::Impl {
                 hash_descriptor(h, out.f);
                 for (const auto& r : in.regions) h.update(r.data, r.bytes);
                 out.f.hash = h.digest();
-                if (codec == Codec::bp_v1 && plain > 0) {
+                if (codec == Codec::bp_v1 && plain > 0 && !in.identity) {
                     out.wire = bp_codec::encode(in.regions, pool.get(), opt.encode);
                     out.f.codec = static_cast<std::uint8_t>(Codec::bp_v1);
                     out.f.wire_bytes = out.wire.size();
@@ -711,7 +712,8 @@ Sender::~Sender() {
     if (impl_ && !impl_->finished && !impl_->finishing) abort("sender destroyed before finish()");
 }
 
-void Sender::submit(const PieceHeader& header, std::span<const bp_codec::Region> regions, std::function<void()> release) {
+void Sender::submit(const PieceHeader& header, std::span<const bp_codec::Region> regions, std::function<void()> release,
+                    bool identity) {
     auto& I = *impl_;
     std::size_t bytes = 0;
     for (const auto& r : regions) bytes += r.bytes;
@@ -744,6 +746,7 @@ void Sender::submit(const PieceHeader& header, std::span<const bp_codec::Region>
     in.f.seq = I.next_seq++;
     in.regions.assign(regions.begin(), regions.end());
     in.release = std::move(rel);
+    in.identity = identity;
     I.inputs.push_back(std::move(in));
     I.cv.notify_all();
 }
