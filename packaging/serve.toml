@@ -1,0 +1,10 @@
+# Strix serve configuration (--serve-config). Linux: /etc/strix/serve.toml; Windows: %ProgramData%\Strix\serve.toml.
+# Every key is a command-line option of the serving binary; the command line wins over this file.
+# Unknown keys, wrong types and inline secrets are refused with FILE:LINE before any weight is read.
+# Keys and rules: docs/engine/serving/serve-config.md. The model path is not set here: the Linux service takes it
+# from STRIX_MODEL in /etc/strix/strix.env, the Windows start script from serve.args.
+
+[http]
+serve = true
+bind = "127.0.0.1"
+port = 8080

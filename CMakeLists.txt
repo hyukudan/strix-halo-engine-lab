@@ -15,6 +15,10 @@ endif()
 
 project(strix_engine_lab VERSION 0.1.0 LANGUAGES CXX)
 
+# Install rules and CPack packages (docs/install.md). Deferred to the end of this file so every target exists,
+# also in the CUDA-only modes below that return() early.
+cmake_language(DEFER CALL include "${CMAKE_CURRENT_SOURCE_DIR}/packaging/StrixPackaging.cmake")
+
 option(STRIX_LEGACY_MAINS "Build legacy Gemma4 and MiniMax serve executables" ON)
 
 # Standalone CUDA Qwen prefill and host-only scheduling/codec checks.
@@ -811,9 +815,7 @@ add_library(strix_glm_session_owner STATIC src/glm/serve/glm_session_owner.cpp)
 target_include_directories(strix_glm_session_owner PUBLIC src)
 target_link_libraries(strix_glm_session_owner PUBLIC strix_session_owner)
 strix_target_warnings(strix_glm_session_owner)
-add_executable(strix-skeleton-serve examples/skeleton_engine/main.cpp)
-target_link_libraries(strix-skeleton-serve PRIVATE strix_session_shell)
-strix_target_warnings(strix-skeleton-serve)
+# strix-skeleton-serve is defined with strix-serve in cmake/StrixSession.cmake (every build mode).
 if(BUILD_TESTING)
     add_executable(skeleton_engine_tests tests/skeleton_engine_tests.cpp)
     target_link_libraries(skeleton_engine_tests PRIVATE strix_session_shell)

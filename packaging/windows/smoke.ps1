@@ -1,0 +1,84 @@
+<#
+.SYNOPSIS
+Post-install smoke test of the Strix Windows package (installed prefix or extracted ZIP).
+
+.DESCRIPTION
+Every bin\strix-*.exe must load (no missing DLL) and answer --help. strix-skeleton-serve, when present, must
+answer GET /health = 200 without weights. With -ServeArgs (a real model), the default server is started with
+those arguments and /health must answer 200 within -HealthSeconds. With -EffectiveConfigArgs the server's
+--print-effective-config must exit 0. One PASS/FAIL/SKIP line per check; exit code 1 on any FAIL.
+
+.EXAMPLE
+powershell -ExecutionPolicy Bypass -File smoke.ps1
+#>
+[CmdletBinding()]
+param(
+    [string]$Prefix = $PSScriptRoot,
+    [int]$Port = 18080,
+    [string[]]$ServeArgs = @(),
+    [string[]]$EffectiveConfigArgs = @(),
+    [int]$HealthSeconds = 600
+)
+$ErrorActionPreference = 'Stop'
+$script:fails = 0; $script:passes = 0
+function Pass($m) { $script:passes++; Write-Host "PASS $m" }
+function Fail($m) { $script:fails++; Write-Host "FAIL $m" }
+function Skip($m) { Write-Host "SKIP $m" }
+
+# Start-Process joins arguments with spaces: quote the ones that contain spaces.
+function Join-Quoted([string[]]$arguments) { ($arguments | ForEach-Object { if ($_ -match '\s') { '"' + $_ + '"' } else { $_ } }) -join ' ' }
+
+function Invoke-Bounded([string]$exe, [string[]]$arguments, [int]$seconds) {
+    $out = [IO.Path]::GetTempFileName(); $err = [IO.Path]::GetTempFileName()
+    $p = Start-Process -FilePath $exe -ArgumentList (Join-Quoted $arguments) -NoNewWindow -PassThru `
+        -RedirectStandardOutput $out -RedirectStandardError $err
+    if (-not $p.WaitForExit($seconds * 1000)) { $p.Kill(); $code = 'timeout' } else { $code = $p.ExitCode }
+    $text = (Get-Content $out -Raw) + (Get-Content $err -Raw)
+    Remove-Item $out, $err -Force
+    return @{ Code = $code; Text = [string]$text }
+}
+
+function Test-Health([int]$port) {
+    try { return (Invoke-WebRequest -UseBasicParsing -TimeoutSec 2 -Uri "http://127.0.0.1:$port/health").StatusCode }
+    catch { return 0 }
+}
+
+$bin = Join-Path $Prefix 'bin'
+if (-not (Test-Path $bin)) { Write-Host "FAIL no bin directory at $bin"; exit 1 }
+foreach ($exe in Get-ChildItem -Path $bin -Filter 'strix-*.exe') {
+    $r = Invoke-Bounded $exe.FullName @('--help') 30
+    if ($r.Code -eq -1073741515) { Fail "$($exe.Name): a required DLL is missing (0xC0000135)" }
+    elseif ($r.Code -eq 'timeout') { Fail "$($exe.Name) --help: timeout" }
+    elseif ($r.Code -eq 0 -or $r.Text -match '(?i)usage|options') { Pass "$($exe.Name) --help (rc=$($r.Code))" }
+    else { Fail "$($exe.Name) --help: rc=$($r.Code): $($r.Text.Substring(0, [Math]::Min(160, $r.Text.Length)))" }
+}
+
+$skel = Join-Path $bin 'strix-skeleton-serve.exe'
+$reg = Join-Path $Prefix 'share\strix\examples\skeleton_engine'
+$server = Get-ChildItem -Path $bin -Filter 'strix-cuda-*-serve.exe' -ErrorAction SilentlyContinue | Select-Object -First 1
+if ((Test-Path $skel) -and (Test-Path (Join-Path $reg 'models\registry.toml'))) {
+    $p = Start-Process -FilePath $skel -NoNewWindow -PassThru -ArgumentList (Join-Quoted @('--registry-root', $reg,
+        '--registry', 'models/registry.toml', '--model', 'skeleton', '--bind', '127.0.0.1', '--port', "$Port"))
+    $code = 0
+    for ($i = 0; $i -lt 50 -and $code -ne 200 -and -not $p.HasExited; $i++) { Start-Sleep -Milliseconds 200; $code = Test-Health $Port }
+    if (-not $p.HasExited) { $p.Kill() }
+    if ($code -eq 200) { Pass 'strix-skeleton-serve GET /health = 200' } else { Fail "strix-skeleton-serve GET /health = $code" }
+} elseif ($ServeArgs.Count -gt 0 -and $server) {
+    $p = Start-Process -FilePath $server.FullName -NoNewWindow -PassThru -ArgumentList (Join-Quoted ($ServeArgs + @('--bind', '127.0.0.1', '--port', "$Port")))
+    $code = 0; $deadline = (Get-Date).AddSeconds($HealthSeconds)
+    while ((Get-Date) -lt $deadline -and $code -ne 200 -and -not $p.HasExited) { Start-Sleep -Seconds 2; $code = Test-Health $Port }
+    if (-not $p.HasExited) { $p.Kill() }
+    if ($code -eq 200) { Pass "$($server.Name) GET /health = 200" } else { Fail "$($server.Name) GET /health = $code" }
+} else {
+    Skip 'health: this package has no weight-free server; pass -ServeArgs with a model to check /health'
+}
+
+if ($EffectiveConfigArgs.Count -gt 0 -and $server) {
+    $r = Invoke-Bounded $server.FullName ($EffectiveConfigArgs + @('--print-effective-config')) 300
+    if ($r.Code -eq 0) { Pass "$($server.Name) --print-effective-config" } else { Fail "$($server.Name) --print-effective-config rc=$($r.Code)" }
+} else {
+    Skip '--print-effective-config: needs -EffectiveConfigArgs with a model'
+}
+Write-Host "smoke: $($script:passes) passed, $($script:fails) failed"
+if ($script:fails -gt 0) { exit 1 }
+exit 0
