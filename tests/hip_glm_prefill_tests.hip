@@ -1389,10 +1389,21 @@ void test_dsa(const std::string& cases, std::mt19937& g) {
                 if (H == 32) {  // FAST fused core: bf16 q-tilde image (22 / 23) == FP32 q-tilde (20 / 21), bit for bit
                     bool img = true;
                     for (unsigned ov : {20U, 21U}) {
+                        const auto reset_image_buffers = [&] {
+                            hok(hipMemset(qt, 0xFF, (nq + 17) * sizeof(float)), "poison q-tilde image/unused half/guard");
+                            hok(hipMemset(ob, 0xFF, (nq + 17) * sizeof(float)), "poison image o-bar/guard");
+                            hok(hipMemset(out, 0xFF, (no + 17) * sizeof(float)), "poison image output/guard");
+                        };
+                        reset_image_buffers();
                         call(7, ov, 3);
+                        const auto q32 = down(qt, nq);
                         const auto ob32 = down(ob, nq + 17), o32 = down(out, no + 17);
+                        reset_image_buffers();
                         call(7, ov + 2, 3);
-                        img &= bits_eq(ob32, down(ob, nq + 17)) && bits_eq(o32, down(out, no + 17)) && guard_ok(down(qt, nq + 17), nq);
+                        const auto q16 = down(reinterpret_cast<const std::uint16_t*>(qt), nq);
+                        // Finite query/absorb inputs: packed contents witness the image route, not just equal outputs.
+                        for (std::size_t j = 0; j < nq; ++j) img &= is_finite(q32[j]) && q16[j] == float_to_bf16(q32[j]);
+                        img &= bits_eq(ob32, down(ob, nq + 17)) && bits_eq(o32, down(out, no + 17)) && guard_ok(down(qt, nq + 17), nq / 2);
                     }
                     check(img, std::string("MLA attn-wmma bf16 q-tilde image (22/23) == FP32 q-tilde (20/21) bitwise o-bar/out/guards H=32") +
                           (ieee ? " NaN/+Inf/-Inf latent" : " signed-zero/subnormal latent"));
