@@ -9,33 +9,71 @@
 namespace strix {
 namespace {
 constexpr unsigned kThreads = kLogprobPartialLanes;
-constexpr unsigned kTop = kLogprobPartialTop;
 static_assert(kThreads == 256U, "the kernel's fold assumes 256 lanes");
 
 __device__ __forceinline__ bool ahead(float va, std::uint32_t ia, float vb, std::uint32_t ib) {
     return va > vb || (va == vb && ia < ib);
 }
+// kBatch strided entries of one lane loaded before any is used (several loads in flight); used in index order, so the
+// lane's summation order is the contract's.
+constexpr unsigned kBatch = 32;
+__device__ __forceinline__ void load_batch(const float* __restrict__ row, std::uint32_t base, std::uint32_t count, float* xs) {
+#pragma unroll
+    for (unsigned u = 0; u < kBatch; ++u) {
+        const std::uint32_t i = base + u * kThreads;
+        xs[u] = i < count ? row[i] : 0.0F;
+    }
+}
+__device__ __forceinline__ float infinity() { return __int_as_float(0x7F800000); }
 __device__ __forceinline__ bool finite(float x) { return (__float_as_uint(x) & 0x7F800000U) != 0x7F800000U; }
 
-// LDS: per-thread top lists (256 x 20 x 8 B = 40 KiB) + the fold arrays.
+// Two passes over the row (the second from cache):
+// 1. maximum, nonfinite count and each lane's best entry (value descending, lowest ID first);
+// 2. the contract's FP32 exp sum, the target counts, and the top candidates: every entry ranking at or ahead of tau,
+//    the `top`-th best lane maximum (every finite entry when fewer lanes hold one). The `top` best lane maxima are `top` distinct entries, so the true top lies inside
+//    the candidates; they are at most `top` lanes' entries (cap kCandidates). Ranks inside the candidates give the
+//    sorted top (a total order: the result never depends on the candidates' arrival order). A row whose candidates
+//    exceed the cap takes `top` exact selection passes instead (same result, slower).
+constexpr unsigned kCandidates = 2048;
 __global__ __launch_bounds__(kThreads) void logprob_partials_kernel(const float* __restrict__ logits, std::uint32_t count,
     std::uint32_t stride, std::uint32_t first, std::uint32_t top, const LogprobTarget* __restrict__ targets,
     LogprobPartial* __restrict__ out) {
-    __shared__ float list_v[kTop][kThreads];
-    __shared__ std::uint32_t list_i[kTop][kThreads];
-    __shared__ float fold_f[kThreads];
-    __shared__ std::uint32_t fold_u[kThreads], fold_w[kThreads], fold_x[kThreads];
+    __shared__ float cand_v[kCandidates];
+    __shared__ std::uint32_t cand_i[kCandidates];
+    __shared__ float fold_f[kThreads], lane_v[kThreads];
+    __shared__ std::uint32_t fold_u[kThreads], fold_w[kThreads], fold_x[kThreads], lane_i[kThreads];
+    __shared__ std::uint32_t n_cand;
+    __shared__ float tau_v;
+    __shared__ std::uint32_t tau_i;
     const unsigned t = threadIdx.x;
     const float* row = logits + static_cast<std::size_t>(blockIdx.x) * stride;
-    // 1. maximum and nonfinite count (order-free)
-    float m = -INFINITY;
-    std::uint32_t bad = 0;
-    for (std::uint32_t i = t; i < count; i += kThreads) {
-        const float x = row[i];
-        if (finite(x)) m = fmaxf(m, x); else ++bad;
+    LogprobTarget target{};
+    if (targets != nullptr) target = targets[blockIdx.x];
+    const bool has_target = target.id != kLogprobNoTarget;
+    const bool found = has_target && target.id >= first && target.id - first < count;
+    if (found) { target.logit = row[target.id - first]; target.logit_known = true; }
+    const bool counting = has_target && target.logit_known;
+    // 1.
+    float m = -infinity(), bv = -infinity();
+    std::uint32_t bad = 0, bi = 0xFFFFFFFFU;
+    for (std::uint32_t base = t; base < count; base += kThreads * kBatch) {
+        float xs[kBatch];
+        load_batch(row, base, count, xs);
+#pragma unroll
+        for (unsigned u = 0; u < kBatch; ++u) {
+            const std::uint32_t i = base + u * kThreads;
+            if (i >= count) break;
+            const float x = xs[u];
+            if (!finite(x)) { ++bad; continue; }
+            m = fmaxf(m, x);
+            if (bi == 0xFFFFFFFFU || x > bv) { bv = x; bi = first + i; }
+        }
     }
     fold_f[t] = m;
     fold_u[t] = bad;
+    lane_v[t] = bv;
+    lane_i[t] = bi;
+    if (t == 0U) n_cand = 0U;
     __syncthreads();
     for (unsigned half = kThreads / 2U; half > 0U; half /= 2U) {
         if (t < half) { fold_f[t] = fmaxf(fold_f[t], fold_f[t + half]); fold_u[t] += fold_u[t + half]; }
@@ -43,28 +81,45 @@ __global__ __launch_bounds__(kThreads) void logprob_partials_kernel(const float*
     }
     const float maximum = fold_f[0];
     const std::uint32_t nonfinite = fold_u[0];
-    __syncthreads();
-    // 2. the contract's FP32 sum: lane t sums entries t, t + 256, ... in turn, then the lanes fold pairwise
-    float s = 0.0F;
-    for (std::uint32_t i = t; i < count; i += kThreads) {
-        const float x = row[i];
-        if (finite(x)) s += expf(x - maximum);
+    // tau: the lane maximum of rank min(top, live lanes) - 1 among the live lanes (ranks are unique: IDs differ)
+    std::uint32_t live = 0, rank = 0;
+    for (unsigned l = 0; l < kThreads; ++l) {
+        if (lane_i[l] == 0xFFFFFFFFU) continue;
+        ++live;
+        if (bi != 0xFFFFFFFFU && l != t && ahead(lane_v[l], lane_i[l], bv, bi)) ++rank;
     }
-    fold_f[t] = s;
-    // 3. the target: its logit (this slice, or the caller's), then the entries ahead of it (integers, order-free)
-    LogprobTarget target{};
-    if (targets != nullptr) target = targets[blockIdx.x];
-    const bool has_target = target.id != kLogprobNoTarget;
-    const bool found = has_target && target.id >= first && target.id - first < count;
-    if (found) { target.logit = row[target.id - first]; target.logit_known = true; }
+    // fewer live lanes than `top`: every finite entry is a candidate (tau = the lowest possible key)
+    const std::uint32_t finite_count = count - nonfinite;
+    const std::uint32_t want = top < finite_count ? top : finite_count;
+    if (t == 0U && live < top) { tau_v = -infinity(); tau_i = 0xFFFFFFFFU; }
+    if (want != 0U && live >= top && bi != 0xFFFFFFFFU && rank == top - 1U) { tau_v = bv; tau_i = bi; }
+    __syncthreads();
+    // 2.
+    float s = 0.0F;
     std::uint32_t greater = 0, ties = 0;
-    if (has_target && target.logit_known)
-        for (std::uint32_t i = t; i < count; i += kThreads) {
-            const float x = row[i];
-            if (!finite(x)) continue;
+    const float tv = tau_v;
+    const std::uint32_t ti = tau_i;
+    for (std::uint32_t base = t; base < count; base += kThreads * kBatch) {
+      float xs[kBatch];
+      load_batch(row, base, count, xs);
+#pragma unroll
+      for (unsigned u = 0; u < kBatch; ++u) {
+        const std::uint32_t i = base + u * kThreads;
+        if (i >= count) break;
+        const float x = xs[u];
+        if (!finite(x)) continue;
+        s += expf(x - maximum);
+        if (counting) {
             if (x > target.logit) ++greater;
             else if (x == target.logit && first + i < target.id) ++ties;
         }
+        if (want != 0U && (x > tv || (x == tv && first + i <= ti))) {
+            const std::uint32_t at = atomicAdd(&n_cand, 1U);
+            if (at < kCandidates) { cand_v[at] = x; cand_i[at] = first + i; }
+        }
+      }
+    }
+    fold_f[t] = s;
     fold_w[t] = greater;
     fold_x[t] = ties;
     __syncthreads();
@@ -73,58 +128,53 @@ __global__ __launch_bounds__(kThreads) void logprob_partials_kernel(const float*
         __syncthreads();
     }
     LogprobPartial* p = out + blockIdx.x;
+    const std::uint32_t c = n_cand;
     if (t == 0U) {
         p->max = maximum;
         p->sum = fold_f[0];
         p->target = found ? target.logit : 0.0F;
-        p->flags = (found ? LogprobPartial::kFound : 0U) | (has_target && target.logit_known ? LogprobPartial::kCounted : 0U);
+        p->flags = (found ? LogprobPartial::kFound : 0U) | (counting ? LogprobPartial::kCounted : 0U);
         p->greater = fold_w[0];
         p->ties_lower = fold_x[0];
         p->nonfinite = nonfinite;
+        p->top_count = want;
     }
-    // 4. top: each lane keeps its own sorted list (its IDs ascend, so a later equal value never displaces), then `top`
-    // rounds pick the best list head (value descending, lowest ID first)
-    std::uint32_t n = 0;
-    if (top != 0U)
+    if (want == 0U) return;
+    if (c <= kCandidates) {
+        for (std::uint32_t k = t; k < c; k += kThreads) {
+            std::uint32_t r = 0;
+            for (std::uint32_t j = 0; j < c; ++j) r += ahead(cand_v[j], cand_i[j], cand_v[k], cand_i[k]) ? 1U : 0U;
+            if (r < want) { p->top_value[r] = cand_v[k]; p->top_id[r] = cand_i[k]; }
+        }
+        return;
+    }
+    // overflow: `want` exact passes, each the best entry strictly behind the previous one
+    float pv = infinity();
+    std::uint32_t pi = 0U;
+    for (std::uint32_t k = 0; k < want; ++k) {
+        float v = -infinity();
+        std::uint32_t id = 0xFFFFFFFFU;
         for (std::uint32_t i = t; i < count; i += kThreads) {
             const float x = row[i];
-            if (!finite(x)) continue;
-            const std::uint32_t id = first + i;
-            if (n == top && !ahead(x, id, list_v[top - 1U][t], list_i[top - 1U][t])) continue;
-            std::uint32_t at = n < top ? n : top - 1U;
-            while (at > 0U && ahead(x, id, list_v[at - 1U][t], list_i[at - 1U][t])) {
-                list_v[at][t] = list_v[at - 1U][t];
-                list_i[at][t] = list_i[at - 1U][t];
-                --at;
-            }
-            list_v[at][t] = x;
-            list_i[at][t] = id;
-            if (n < top) ++n;
+            if (!finite(x) || (k != 0U && !ahead(pv, pi, x, first + i))) continue;
+            if (id == 0xFFFFFFFFU || ahead(x, first + i, v, id)) { v = x; id = first + i; }
         }
-    std::uint32_t head = 0, taken = 0;
-    for (std::uint32_t k = 0; k < top; ++k) {
-        const bool live = head < n;
-        fold_f[t] = live ? list_v[head][t] : -INFINITY;
-        fold_u[t] = live ? list_i[head][t] : 0xFFFFFFFFU;
-        fold_w[t] = live ? t : 0xFFFFFFFFU;
+        fold_f[t] = v;
+        fold_u[t] = id;
         __syncthreads();
         for (unsigned half = kThreads / 2U; half > 0U; half /= 2U) {
-            if (t < half && fold_w[t + half] != 0xFFFFFFFFU &&
-                (fold_w[t] == 0xFFFFFFFFU || ahead(fold_f[t + half], fold_u[t + half], fold_f[t], fold_u[t]))) {
+            if (t < half && fold_u[t + half] != 0xFFFFFFFFU &&
+                (fold_u[t] == 0xFFFFFFFFU || ahead(fold_f[t + half], fold_u[t + half], fold_f[t], fold_u[t]))) {
                 fold_f[t] = fold_f[t + half];
                 fold_u[t] = fold_u[t + half];
-                fold_w[t] = fold_w[t + half];
             }
             __syncthreads();
         }
-        const std::uint32_t winner = fold_w[0];
-        if (winner == 0xFFFFFFFFU) break;  // uniform: every lane reads the same fold_w[0]
-        if (t == 0U) { p->top_value[k] = fold_f[0]; p->top_id[k] = fold_u[0]; }
-        if (t == winner) ++head;
-        ++taken;
+        pv = fold_f[0];
+        pi = fold_u[0];
+        if (t == 0U) { p->top_value[k] = pv; p->top_id[k] = pi; }
         __syncthreads();
     }
-    if (t == 0U) p->top_count = taken;
 }
 } // namespace
 

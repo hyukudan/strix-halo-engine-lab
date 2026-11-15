@@ -2610,11 +2610,18 @@ int main() { return 0; }"
         src/hip_integer_projection_runtime.hip
         src/hip_lm_head_launcher.hip
         src/hip_generation_output.hip
-        src/hip_logprob_partials.hip
         src/hip_moe_overlap_dispatcher.hip
         src/hip_shared_expert_launcher.hip
         src/hip_dense_trellis.hip
     )
+    # HIP backend core, model-agnostic: logprob partials of device rows (strix/logprob_partials.hpp); its own small
+    # library so any engine binds it without the whole runtime (DS41 batch forward, the runtime's own users).
+    add_library(strix_hip_logprob STATIC src/hip_logprob_partials.hip)
+    target_include_directories(strix_hip_logprob PUBLIC include)
+    target_include_directories(strix_hip_logprob SYSTEM PUBLIC "${STRIX_HIP_INCLUDE_DIR}")
+    set_target_properties(strix_hip_logprob PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHS}")
+    target_link_libraries(strix_hip_logprob PUBLIC strix_core "${STRIX_HIP_RUNTIME_LIBRARY}")
+    target_compile_definitions(strix_hip_logprob PUBLIC $<$<COMPILE_LANGUAGE:CXX>:__HIP_PLATFORM_AMD__=1>)
     target_include_directories(
         strix_hip_runtime
         PUBLIC
@@ -2647,6 +2654,7 @@ int main() { return 0; }"
         strix_hip_runtime
         PUBLIC
         strix_core
+        strix_hip_logprob
         "${STRIX_HIP_RUNTIME_LIBRARY}"
     )
     if(STRIX_ENABLE_EXPERIMENTAL_Q4K_A8_RUNTIME)
@@ -4245,6 +4253,7 @@ if(STRIX_ENABLE_HIP_RUNTIME)
     target_include_directories(strix_ds41_xport PUBLIC include "${STRIX_HIP_INCLUDE_DIR}")
     list(APPEND strix_ds41_hip_targets strix_ds41_xport)
     add_library(strix_ds41_batch_forward STATIC src/hip_deepseek41_batch_forward.hip)
+    target_link_libraries(strix_ds41_batch_forward PUBLIC strix_hip_logprob)
     target_link_libraries(strix_ds41_batch_forward PUBLIC strix_ds41_xport strix_ds41_prepared_load strix_ds41_layer_hip strix_ds41_attention_hip strix_ds41_runtime strix_dist strix_ds41_trellis_hip strix_ds41_pipeline)
     target_include_directories(strix_ds41_batch_forward PUBLIC include "${STRIX_HIP_INCLUDE_DIR}")
     list(APPEND strix_ds41_hip_targets strix_ds41_batch_forward)
@@ -4653,6 +4662,19 @@ if(STRIX_ENABLE_CUDA_DS41)
     target_link_libraries(strix_ds41_cuda PUBLIC strix_ds41_layer strix_ds41_formats strix_family_deepseek41 strix_device CUDA::cudart)
     target_include_directories(strix_ds41_cuda PUBLIC include)
     set(strix_ds41_cuda_targets strix_ds41_cuda)
+    # CUDA backend core, model-agnostic: logprob partials of device rows (same contract as src/hip_logprob_partials.hip)
+    add_library(strix_cuda_logprob STATIC src/cuda/logprob_partials.cu)
+    target_link_libraries(strix_cuda_logprob PUBLIC strix_core CUDA::cudart)
+    target_include_directories(strix_cuda_logprob PUBLIC include)
+    target_compile_options(strix_cuda_logprob PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--fmad=false>)
+    list(APPEND strix_ds41_cuda_targets strix_cuda_logprob)
+    if(BUILD_TESTING)
+        add_executable(strix-cuda-logprob-partials-tests tests/cuda/logprob_partials_tests.cu)
+        target_link_libraries(strix-cuda-logprob-partials-tests PRIVATE strix_cuda_logprob strix_core)
+        target_compile_options(strix-cuda-logprob-partials-tests PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--fmad=false>)
+        add_test(NAME strix-cuda-logprob-partials-tests COMMAND strix-cuda-logprob-partials-tests)
+        list(APPEND strix_ds41_cuda_targets strix-cuda-logprob-partials-tests)
+    endif()
     if(BUILD_TESTING)
         add_executable(strix-cuda-ds41-core-tests tests/cuda/ds41_core_tests.cu)
         target_link_libraries(strix-cuda-ds41-core-tests PRIVATE strix_ds41_cuda strix_ds41_layer strix_ds41_formats)

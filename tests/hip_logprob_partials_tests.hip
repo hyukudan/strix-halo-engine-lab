@@ -37,7 +37,7 @@ struct Device {
     }
     ~Device() { (void)hipFree(logits); (void)hipFree(targets); (void)hipFree(out); }
 };
-int bench(std::uint32_t rows) {
+int bench(std::uint32_t rows, std::uint32_t top) {
     constexpr std::uint32_t count = 64640;
     std::vector<float> host(std::size_t{rows} * count);
     for (auto& x : host) x = next_logit(16.0F);
@@ -48,7 +48,7 @@ int bench(std::uint32_t rows) {
     hipEvent_t a{}, b{};
     check(hipEventCreate(&a), "event");
     check(hipEventCreate(&b), "event");
-    const strix::HipLogprobPartialsView v{d.logits, rows, count, count, 0U, 20U, nullptr, d.out};
+    const strix::HipLogprobPartialsView v{d.logits, rows, count, count, 0U, top, nullptr, d.out};
     for (int i = 0; i < 20; ++i) strix::enqueue_hip_logprob_partials(v, st);
     check(hipStreamSynchronize(st), "warm");
     constexpr int iters = 200;
@@ -59,7 +59,7 @@ int bench(std::uint32_t rows) {
     float ms = 0.0F;
     check(hipEventElapsedTime(&ms, a, b), "elapsed");
     const double us = 1e3 * ms / iters;
-    std::printf("bench rows %u count %u: %.2f us per step (%.2f us/row), %.1f GB/s logits read, %zu B partials out\n", rows, count, us,
+    std::printf("bench rows %u top %u count %u: %.2f us per step (%.2f us/row), %.1f GB/s logits read, %zu B partials out\n", rows, top, count, us,
                 us / rows, (double(rows) * count * 4.0) / (us * 1e3), std::size_t{rows} * sizeof(strix::LogprobPartial));
     (void)hipEventDestroy(a); (void)hipEventDestroy(b); (void)hipStreamDestroy(st);
     return 0;
@@ -67,13 +67,16 @@ int bench(std::uint32_t rows) {
 } // namespace
 
 int main(int argc, char** argv) {
-    if (argc == 3 && std::strcmp(argv[1], "--bench") == 0) return bench(static_cast<std::uint32_t>(std::stoul(argv[2])));
+    if (argc >= 3 && std::strcmp(argv[1], "--bench") == 0)
+        return bench(static_cast<std::uint32_t>(std::stoul(argv[2])), argc >= 4 ? static_cast<std::uint32_t>(std::stoul(argv[3])) : 20U);
     constexpr std::uint32_t V = 129280, rows = 6;
     std::vector<float> host(std::size_t{rows} * V);
     for (std::uint32_t r = 0; r < rows; ++r)
         for (std::uint32_t i = 0; i < V; ++i) host[std::size_t{r} * V + i] = next_logit(r % 2U ? 40.0F : 4.0F);
     host[2U * V + 500] = 70.0F;                                        // a peaked row
     for (std::uint32_t i = 0; i < V; ++i) host[3U * V + i] = 1.25F;   // all ties
+    for (std::uint32_t i = 0; i < V; ++i)  // 20 lanes of rising maxima: > 2048 top candidates (the exact-pass path)
+        if (i % 256U < 20U) host[4U * V + i] = 10.0F + static_cast<float>(i % 256U) * 100.0F + static_cast<float>(i) * 1e-3F;
     std::vector<strix::LogprobTarget> targets(rows);
     for (std::uint32_t r = 0; r < rows; ++r) targets[r] = {r * 20011U % V, host[std::size_t{r} * V + r * 20011U % V], true};
     targets[4].id = strix::kLogprobNoTarget;
@@ -113,6 +116,7 @@ int main(int argc, char** argv) {
         if (score.has_target) worst_ref = std::max(worst_ref, std::abs(score.target_logprob - ref.back().log_probability));
         if (r == 3U) expect(score.top.size() == 20U && score.top[0].id == 0U && score.top[19].id == 19U, "ties order by ID");
         if (r == 2U) expect(score.top[0].id == 500U, "peaked row");
+        if (r == 4U) expect(score.top.size() == 20U && score.top[0].id == 256U * 504U + 19U, "candidate overflow row");
     }
     expect(worst_ref <= strix::kLogprobPartialTolerance, "device partials within the documented tolerance");
     std::printf("hip logprob partials: worst vs FP64 %.3e nats, worst sum vs host lane order %.3e relative\n", worst_ref, worst_host);

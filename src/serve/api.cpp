@@ -684,8 +684,11 @@ struct ApiService::Impl {
         out.set("prefill_progress", Json(config.engine_progress));
         out.set("thinking_budget", Json(config.engine_thinking_budget));
         out.set("thinking_budget_policy", config.engine_thinking_budget ? Json("thinking-budget-v1") : Json());
+        out.set("prompt_logprobs", Json(config.engine_prompt_logprobs));
         out.set("logprobs", Json(config.engine_logprobs)); out.set("penalties", Json(config.engine_logit_transforms)); out.set("logit_bias", Json(config.engine_logit_transforms));
-        Json scoring = Json::object(); scoring.set("max_top_logprobs", Json(20)); scoring.set("basis", Json("target-row-log-softmax")); scoring.set("execution", Json("serial-host"));
+        Json scoring = Json::object(); scoring.set("max_top_logprobs", Json(20)); scoring.set("basis", Json("target-row-log-softmax")); scoring.set("execution", Json(config.scoring_execution));
+        scoring.set("precision", Json(config.scoring_precision)); scoring.set("values", Json(config.engine_logit_transforms ? "raw, or transformed when logit transforms are active" : "raw"));
+        scoring.set("prompt_logprobs", Json(config.engine_prompt_logprobs));
         if (config.engine_logprobs) out.set("scoring", std::move(scoring));
         if (config.engine_logit_transforms) { Json t = Json::object(); t.set("identity", Json("logit-transform-v1")); t.set("execution", Json("serial-host")); t.set("sampling", Json(false)); out.set("logit_transforms", std::move(t)); }
         out.set("json_object", Json(config.engine_constraints));
@@ -1112,6 +1115,8 @@ struct ApiService::Impl {
             if (completion && n > 0) bad("top_logprobs", "completions uses logprobs in [0,5]");
             top = completion ? top : static_cast<std::uint32_t>(n); scores = scores || top > 0;
         }
+        if (const auto* v = body.find("prompt_logprobs"); v && !v->is_null() && !config.engine_prompt_logprobs)
+            bad("prompt_logprobs", "this engine does not score prompt tokens (see /v1/capabilities)");
         if (scores && !config.engine_logprobs) bad(body.find("logprobs") || body.find("include") ? "logprobs" : "top_logprobs", "this engine does not execute logprobs (see /v1/capabilities)");
         if (t.active() && !config.engine_logit_transforms) bad(t.presence != 0 ? "presence_penalty" : t.frequency != 0 ? "frequency_penalty" : t.repetition != 1 ? "repetition_penalty" : "logit_bias", "this engine does not execute logit transforms (see /v1/capabilities)");
         if (!scores && !t.active()) return base;
@@ -1227,6 +1232,7 @@ struct ApiService::Impl {
         }
         if (spec.logprobs) {
             Json scoring = Json::object(); scoring.set("basis", Json("target-row-log-softmax"));
+            scoring.set("values", Json(spec.transform.active() ? "transformed" : "raw"));
             scoring.set("transform", Json(spec.transform.active() ? "logit-transform-v1" : "none")); scoring.set("constrained", Json(bool(spec.program)));
             out.set("scoring", std::move(scoring));
         }
