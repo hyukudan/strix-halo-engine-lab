@@ -77,7 +77,8 @@ public:
         const float* hidden_pre = nullptr;   // MTP block output before mtp.norm (feed back for chains, convention 'pre')
         const float* hidden_post = nullptr;  // after mtp.norm
     };
-    MtpOut mtp_forward(const std::uint32_t* next_tokens, const float* hidden_dev, std::uint32_t rows, std::uint32_t pos0);
+    MtpOut mtp_forward(const std::uint32_t* next_tokens, const float* hidden_dev, std::uint32_t rows, std::uint32_t pos0,
+                    bool want_top = true);  // want_top=false: skip lm_head + argmax (logits/top null): KV/hidden only
 
     // Host copies (synchronize the stream).
     void read_logits(const RowsOut& o, std::uint32_t row, float* host_vocab) const;

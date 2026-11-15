@@ -114,12 +114,13 @@ private:
         const auto total = static_cast<std::uint32_t>(ring_next_.size());
         while (off < total) {
             const std::uint32_t n = std::min<std::uint32_t>(32, total - off);
-            const auto m = e_.mtp_forward(ring_next_.data() + off, ring_ + static_cast<std::size_t>(off) * hid_, n, mtp_pos_);
+            const bool final_chunk = off + n == total;  // only the last row's draft is needed: earlier chunks skip lm_head
+            const auto m = e_.mtp_forward(ring_next_.data() + off, ring_ + static_cast<std::size_t>(off) * hid_, n, mtp_pos_, final_chunk);
             ++chain_calls;
             chain_rows += n;
             mtp_pos_ += n;
             off += n;
-            if (off == total) {
+            if (final_chunk) {
                 read_last(m, n);
             }
         }
@@ -140,22 +141,23 @@ private:
         // carry_ = MTP hidden after the last committed row; d1_ = its prediction (the token after the anchor's successor)
         std::uint32_t pos = mtp_pos_;  // speculative rows from here on are overwritten by the next flush
         std::uint32_t tok = d1_;       // chain token for the next step when there is no prefix
-        for (const auto c : prefix) {  // feed the copy tokens: the step after the last one predicts the extension
-            tok = step(c, pos++);
-        }
+        for (std::size_t i = 0; i < prefix.size(); ++i)  // feed the copy tokens: only the last step's prediction is used
+            tok = step(prefix[i], pos++, i + 1 == prefix.size());
         for (std::uint32_t j = 0; j < k; ++j) {
             out.push_back(tok);
             if (j + 1 < k) tok = step(tok, pos++);
         }
     }
-    std::uint32_t step(std::uint32_t input_token, std::uint32_t pos) {
-        const auto m = e_.mtp_forward(&input_token, carry_, 1, pos);
+    std::uint32_t step(std::uint32_t input_token, std::uint32_t pos, bool want_top = true) {
+        const auto m = e_.mtp_forward(&input_token, carry_, 1, pos, want_top);
         ++chain_calls;
         ++chain_rows;
-        RowsOut ro;
-        ro.top = m.top;
         std::uint32_t t = 0;
-        e_.read_top(ro, 1, &t);
+        if (want_top) {
+            RowsOut ro;
+            ro.top = m.top;
+            e_.read_top(ro, 1, &t);
+        }
         const float* h = chain_pre_ ? m.hidden_pre : m.hidden_post;
         cudaMemcpyAsync(carry_, h, hid_ * sizeof(float), cudaMemcpyDeviceToDevice, e_.stream());
         return t;

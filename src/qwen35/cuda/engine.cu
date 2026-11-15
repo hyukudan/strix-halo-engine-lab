@@ -593,7 +593,7 @@ struct CudaEngine::Impl {
         last_rows = 0;
     }
 
-    CudaEngine::MtpOut mtp(const std::uint32_t* next_tokens, const float* hidden_dev, std::uint32_t rows, std::uint32_t pos0) {
+    CudaEngine::MtpOut mtp(const std::uint32_t* next_tokens, const float* hidden_dev, std::uint32_t rows, std::uint32_t pos0, bool want_top) {
         if (!mtp_ok) throw std::runtime_error("mtp_forward: no MTP tensors loaded");
         if (rows == 0 || rows > RM || pos0 + rows > opt.max_positions) throw std::runtime_error("mtp_forward: bad rows/pos0");
         const std::uint32_t H = c.hidden;
@@ -614,11 +614,13 @@ struct CudaEngine::Impl {
         mlp(M, b, rows);
         // mx holds the block output (pre mtp.norm); the hidden export needs it intact, so normalise into mxn.
         CK(cc::rmsnorm(mx, hv, m_shnorm, mxn, hv, c.rms_eps, s));
-        CK(cc::dense_rows(head, mxn, mlogits, rows, nullptr, s));
-        CK(cc::argmax_rows(mlogits, c.vocab, rows, d_mtop, d_argws, s));
         CudaEngine::MtpOut o;
-        o.logits = mlogits;
-        o.top = d_mtop;
+        if (want_top) {
+            CK(cc::dense_rows(head, mxn, mlogits, rows, nullptr, s));
+            CK(cc::argmax_rows(mlogits, c.vocab, rows, d_mtop, d_argws, s));
+            o.logits = mlogits;
+            o.top = d_mtop;
+        }
         o.hidden_pre = mx;
         o.hidden_post = mxn;
         return o;
@@ -707,8 +709,8 @@ RowsOut CudaEngine::forward_rows(const std::uint32_t* tokens, std::uint32_t rows
 }
 void CudaEngine::commit(std::uint32_t k) { p_->commit_rows(k); }
 CudaEngine::MtpOut CudaEngine::mtp_forward(const std::uint32_t* next_tokens, const float* hidden_dev, std::uint32_t rows,
-                                           std::uint32_t pos0) {
-    return p_->mtp(next_tokens, hidden_dev, rows, pos0);
+                                           std::uint32_t pos0, bool want_top) {
+    return p_->mtp(next_tokens, hidden_dev, rows, pos0, want_top);
 }
 void CudaEngine::read_logits(const RowsOut& o, std::uint32_t row, float* host) const {
     CK(cudaMemcpyAsync(host, o.logits + static_cast<std::size_t>(row) * p_->c.vocab, static_cast<std::size_t>(p_->c.vocab) * 4,
