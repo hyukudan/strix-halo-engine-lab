@@ -459,6 +459,7 @@ inline MtpDecodeBatchServe make_http_batch_serve(const Options& options, std::st
             request.draft_depth_max = job.draft_depth_max;
             request.tool_draft = job.tool_draft;
             request.ngram_peers = job.ngram_peers;
+            request.tool_source = job.tool_source;
             std::string sampling = job.constraint && job.constraint->transform.active() ? "greedy-logit-transform-v1" : "greedy";
             if (samples && job.sampling.temperature > 0.0) {
                 TokenSamplingPolicy policy;

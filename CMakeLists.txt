@@ -148,7 +148,8 @@ find_package(Threads REQUIRED)
 include(cmake/StrixStateCache.cmake)
 
 # Prompt-lookup (n-gram) index shared by the engines' drafting (it only proposes draft tokens: verification decides).
-add_library(strix_lookup STATIC src/lookup/index.cpp)
+# Tool-result source (src/session/tool_source.cpp): restored tool text as an auxiliary lookup corpus.
+add_library(strix_lookup STATIC src/lookup/index.cpp src/session/tool_source.cpp)
 target_include_directories(strix_lookup PUBLIC include)
 target_compile_features(strix_lookup PUBLIC cxx_std_20)
 strix_target_warnings(strix_lookup)
@@ -353,7 +354,7 @@ add_library(strix_core STATIC
 endif()
 target_include_directories(strix_core PUBLIC include)
 target_compile_features(strix_core PUBLIC cxx_std_20)
-target_link_libraries(strix_core PUBLIC Threads::Threads strix_state_cache)
+target_link_libraries(strix_core PUBLIC Threads::Threads strix_state_cache strix_lookup)  # mtp_ngram_draft: tool-source corpus
 if(STRIX_USE_OPENSSL_SHA256)
     find_package(OpenSSL REQUIRED COMPONENTS Crypto)
     target_link_libraries(strix_state_cache PRIVATE OpenSSL::Crypto)
@@ -905,6 +906,12 @@ if(BUILD_TESTING)
     target_link_libraries(strix-spec-drafting-tests PRIVATE strix_spec)
     strix_target_warnings(strix-spec-drafting-tests)
     add_test(NAME strix-spec-drafting-tests COMMAND strix-spec-drafting-tests)
+    # Host only: the n-gram extension is compiled in directly (strix_core needs a device toolchain).
+    add_executable(strix-tool-source-tests tests/tool_source_tests.cpp src/mtp_ngram_draft.cpp)
+    target_link_libraries(strix-tool-source-tests PRIVATE strix_lookup)
+    strix_target_warnings(strix-tool-source-tests)
+    add_test(NAME strix-tool-source-tests COMMAND strix-tool-source-tests)
+    set_tests_properties(strix-tool-source-tests PROPERTIES LABELS "cpu" TIMEOUT 30)
     add_executable(strix-batch-nested-recipe-tests tests/batch_nested_recipe_tests.cpp)
     target_include_directories(strix-batch-nested-recipe-tests PRIVATE include)
     target_compile_features(strix-batch-nested-recipe-tests PRIVATE cxx_std_20)

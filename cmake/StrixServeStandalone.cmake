@@ -26,7 +26,7 @@ function(strix_add_standalone_serve serve_target handoff_target)
     target_include_directories(${serve_target} PUBLIC ${_root}/include PRIVATE ${_root}/src/serve "${CMAKE_BINARY_DIR}/generated")
     target_compile_features(${serve_target} PUBLIC cxx_std_20)
     # src/serve/api.cpp calls the shared power sampler: linked by name, this graph has no HIP gate to carry it.
-    target_link_libraries(${serve_target} PUBLIC ${handoff_target} strix_power strix_session)  # api.cpp builds the per-request EmbedTable
+    target_link_libraries(${serve_target} PUBLIC ${handoff_target} strix_power strix_session strix_lookup)  # api.cpp builds the per-request EmbedTable and tool source
     if(MSVC)
         target_compile_definitions(${serve_target} PRIVATE _CRT_SECURE_NO_WARNINGS)
         target_compile_definitions(${handoff_target} PRIVATE _CRT_SECURE_NO_WARNINGS)

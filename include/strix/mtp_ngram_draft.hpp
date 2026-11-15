@@ -12,7 +12,10 @@
 // against the tokens the verifier emitted, whether it was used or not ("shadow" scoring, host work
 // only), starting from a pessimistic prior. Below the floor the extension is not proposed, so a request
 // that does not copy (free prose, summaries) never sees an extension row.
+#include "strix/lookup/index.hpp"
+
 #include <cstddef>
+#include <memory>
 #include <cstdint>
 #include <span>
 #include <unordered_map>
@@ -27,6 +30,8 @@ struct MtpNgramDraftConfig {
     double floor = 0.5;                            // first extension row must reach this acceptance
     // Cross-request lookup (set_peers): the shortest suffix matched in another request's committed context.
     std::uint32_t peer_min_suffix = 4;
+    // Tool-result source (set_tool_source): the shortest suffix matched in the restored tool text.
+    std::uint32_t tool_min_suffix = 2;
 };
 
 struct MtpNgramDraftStats {
@@ -37,6 +42,9 @@ struct MtpNgramDraftStats {
     std::uint64_t extension_rows = 0;  // extension rows proposed to the verifier
     std::uint64_t accepted_rows = 0;   // extension rows accepted by the target
     std::uint64_t peer_cycles = 0, peer_extension_rows = 0, peer_accepted_rows = 0; // the subset from set_peers
+    // set_tool_source: cycles with a tool-source candidate, cycles it was chosen, its rows given / accepted, and
+    // its shadow rows that equal the emitted tokens (scored whether chosen or not).
+    std::uint64_t tool_candidates = 0, tool_cycles = 0, tool_extension_rows = 0, tool_accepted_rows = 0, tool_shadow_right_rows = 0;
 };
 
 class MtpNgramDraft {
@@ -62,6 +70,14 @@ public:
     // an extension from them. Pointers are borrowed: the caller refreshes them (empty = off) before each cycle.
     void set_peers(std::vector<const MtpNgramDraft*> peers) { peers_ = std::move(peers); }
     [[nodiscard]] double peer_acceptance(std::size_t row) const;
+    // Opt-in tool-result source (strix/session/tool_source.hpp): the request's tool results restored to their
+    // original text (numbering removed, JSON escapes decoded), as a fixed corpus. Each cycle the longest suffix (up to
+    // 16 tokens) of context + confident drafts is also matched there; the candidate has its own learned acceptance
+    // cells and BOTH candidates are shadow-scored every cycle, so the one proposed is the one with the larger learned
+    // expected accepted rows (ties: the longer match). Null (the default, and after reset): exactly the route
+    // without it. Set after reset(); the corpus is shared read-only.
+    void set_tool_source(std::shared_ptr<const lookup::Corpus> source) { tool_ = std::move(source); }
+    [[nodiscard]] double tool_acceptance(std::uint32_t suffix, std::size_t row) const;
     // Longest-suffix lookup over the context followed by `extra` (exposed for tests).
     std::vector<std::uint32_t> lookup(std::span<const std::uint32_t> extra, std::size_t length,
         std::uint32_t& suffix, std::uint32_t& support) const;
@@ -82,12 +98,16 @@ private:
     std::vector<const MtpNgramDraft*> peers_;
     // Continuation of the longest suffix of (context_ + extra) found in a peer's committed context.
     std::vector<std::uint32_t> peer_lookup(std::span<const std::uint32_t> extra, std::size_t length) const;
-    [[nodiscard]] std::size_t shadow_cell(std::size_t row) const noexcept;
+    std::vector<std::uint32_t> tool_lookup(std::span<const std::uint32_t> extra, std::size_t length, std::uint32_t& suffix) const;
+    std::shared_ptr<const lookup::Corpus> tool_;
     struct Shadow {
         bool valid = false;
         std::vector<std::uint32_t> prefix, tokens;  // confident drafts it continues, extension rows
-        std::uint32_t suffix = 0; bool supported = false; bool peer = false; std::size_t used = 0;
-    } shadow_;
+        std::uint32_t suffix = 0; bool supported = false; bool peer = false; bool tool = false; std::size_t used = 0;
+    } shadow_, alternate_;  // alternate_: the candidate not proposed (tool source only), scored for learning
+    [[nodiscard]] std::size_t shadow_cell(const Shadow& shadow, std::size_t row) const noexcept;
+    [[nodiscard]] double expected_rows(const Shadow& shadow) const;
+    void score(Shadow& shadow, std::span<const std::uint32_t> emitted);
     MtpNgramDraftStats stats_;
 };
 

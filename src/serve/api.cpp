@@ -9,6 +9,7 @@
 #include "strix/serve/request_fields.hpp"
 #include "strix/serve/session_api.hpp"
 #include "strix/serve/token_memo.hpp"
+#include "strix/session/tool_source.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -429,6 +430,29 @@ struct ApiService::Impl {
     // Prompt ids of recent chat turns: a turn that resends its history encodes only the new tail (exactly the
     // tokenizer's ids; STRIX_SERVE_TOKEN_MEMO=0 encodes every prompt in full).
     mutable TokenMemo token_memo;
+    // The request's tool results (chat "tool" messages: string content or text parts), restored and tokenized once.
+    std::shared_ptr<const lookup::Corpus> request_tool_source(const Json& body) const {
+        const auto* messages = body.find("messages");
+        if (!messages || !messages->is_array()) return {};
+        std::vector<std::string_view> results;
+        for (const auto& m : messages->as_array()) {
+            if (!m.is_object()) continue;
+            const auto* role = m.find("role");
+            const auto* content = m.find("content");
+            if (!role || !role->is_string() || role->as_string() != "tool" || !content) continue;
+            if (content->is_string()) results.push_back(content->as_string());
+            else if (content->is_array())
+                for (const auto& part : content->as_array())
+                    if (const auto* t = part.is_object() ? part.find("text") : nullptr; t && t->is_string()) results.push_back(t->as_string());
+        }
+        if (results.empty()) return {};
+        session::ToolSourceStats stats;
+        auto corpus = session::build_tool_source(results, [&](std::string_view text) { return tokenizer->encode(text, false); },
+                                                 {}, &stats);
+        std::fprintf(stderr, "tool-source: results %u blocks %u scanned %zu B restored %zu B tokens %zu build %.3f ms\n",
+                     stats.results, stats.blocks, stats.scanned_bytes, stats.restored_bytes, stats.tokens, stats.build_ms);
+        return corpus;
+    }
     std::vector<std::uint32_t> encode_prompt(std::string_view text) const {
         return TokenMemo::enabled_by_default() ? token_memo.encode(*tokenizer, text, true) : tokenizer->encode(text, true);
     }
@@ -1474,9 +1498,17 @@ struct ApiService::Impl {
             if (!peers->is_bool()) throw ApiError(400, "invalid_request_error", "ngram_peers must be a boolean", "ngram_peers");
             job.ngram_peers = peers->as_bool();
         }
+        if (const auto* tl = body.find("tool_lookup"); tl && !tl->is_null()) {
+            if (!tl->is_bool()) throw ApiError(400, "invalid_request_error", "tool_lookup must be a boolean", "tool_lookup");
+            job.tool_lookup = tl->as_bool();
+        }
         if (!job.session_id.empty() && (job.ngram_draft.value_or(false) || job.tool_draft.value_or(false) ||
-            job.ngram_peers.value_or(false) || job.draft_depth_max))
+            job.ngram_peers.value_or(false) || job.tool_lookup.value_or(false) || job.draft_depth_max))
             throw ApiError(400, "invalid_request_error", "session mode requires its fixed draft policy; request draft overrides are unsupported");
+        // Tool-result source of the context lookup (strix/session/tool_source.hpp): greedy unconstrained requests only.
+        if (job.tool_lookup.value_or(session::tool_source_default()) && job.session_id.empty() && !job.constraint &&
+            sampling.temperature <= 0.0 && tokenizer && job.ngram_draft.value_or(true))
+            job.tool_source = request_tool_source(body);
         if (api_request_scope) {
             job.client_gone = [connection = api_request_scope->connection] { return connection->gone(); };
             if (config.prepare_job) family_call([&] { config.prepare_job(api_request_scope->request, body, job); });

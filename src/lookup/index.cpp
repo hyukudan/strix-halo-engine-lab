@@ -114,4 +114,41 @@ private:
 
 std::unique_ptr<Index> make_ngram_index(const IndexConfig& config) { return std::make_unique<NgramIndex>(config); }
 
+Corpus::Corpus(std::span<const std::uint32_t> tokens) {
+    IndexConfig config;
+    config.capacity = static_cast<std::uint32_t>(std::max<std::size_t>(64, tokens.size() + 1)); // every position kept
+    index_ = make_ngram_index(config);
+    bool open = false;
+    for (const auto t : tokens) {
+        index_->append(t);
+        if (t != corpus_break) open = true;
+        else if (open) { ++blocks_; open = false; }
+    }
+    if (open) ++blocks_;
+    if (tokens.empty() || tokens.back() != corpus_break) index_->append(corpus_break);
+}
+
+Match Corpus::match(std::span<const std::uint32_t> suffix, std::uint32_t min_length, std::uint32_t want) const {
+    // The suffix is the index's `extra`: only corpus positions are indexed, so every occurrence lies in the corpus.
+    // Windows longer than the suffix reach the corpus's final break (a block start then), so the reported length is
+    // capped at the suffix; the continuation stops at the block's break (the final one at the latest).
+    if (suffix.empty()) return {};
+    auto m = index_->longest(suffix, min_length, want);
+    if (!m.length) return {};
+    m.length = std::min<std::uint32_t>(m.length, static_cast<std::uint32_t>(suffix.size()));
+    if (m.length < std::max(1U, min_length)) return {};
+    std::uint32_t k = 0;
+    while (k < m.available && m.next[k] != corpus_break) ++k;
+    m.available = k;
+    m.distance = 0;
+    return m;
+}
+
+std::size_t Corpus::continuation(std::uint64_t source_end, std::span<std::uint32_t> out) const {
+    const auto n = index_->continuation(source_end, {}, out);
+    std::size_t k = 0;
+    while (k < n && out[k] != corpus_break) ++k;
+    return k;
+}
+
 } // namespace strix::lookup

@@ -59,5 +59,31 @@ struct IndexConfig {
 // collisions resolved by token comparison), token ring of `capacity`.
 [[nodiscard]] std::unique_ptr<Index> make_ngram_index(const IndexConfig& config = {});
 
+// Separates the blocks of a Corpus; never a vocabulary id, so no query matches across it and no continuation
+// runs past it.
+inline constexpr std::uint32_t corpus_break = 0xFFFFFFFFU;
+
+// A fixed auxiliary token corpus (e.g. restored tool results, strix/session/tool_source.hpp) matched against an
+// external suffix: the stream being decoded is not part of it. Same index as above (every position kept), each
+// block ended by corpus_break. Read-only after construction, so drafters of concurrent requests may share one.
+class Corpus {
+public:
+    // `tokens`: blocks separated by corpus_break (a final break is added).
+    explicit Corpus(std::span<const std::uint32_t> tokens);
+    // Longest suffix of `suffix` (>= min_length, hashed at most 16 tokens, extended exactly up to suffix.size())
+    // that occurs in the corpus, newest occurrence, with up to `want` (<= max_draft) continuation tokens before the
+    // block's end. length 0: no occurrence. source_end: corpus position of the match's last token.
+    [[nodiscard]] Match match(std::span<const std::uint32_t> suffix, std::uint32_t min_length, std::uint32_t want) const;
+    // Continuation after corpus position source_end, up to out.size() tokens, stopping at the block's end.
+    [[nodiscard]] std::size_t continuation(std::uint64_t source_end, std::span<std::uint32_t> out) const;
+    [[nodiscard]] std::uint64_t tokens() const { return index_->tokens(); }
+    [[nodiscard]] std::size_t blocks() const { return blocks_; }
+    [[nodiscard]] std::size_t bytes() const { return index_->bytes(); }
+
+private:
+    std::unique_ptr<Index> index_;
+    std::size_t blocks_ = 0;
+};
+
 } // namespace strix::lookup
 

@@ -1,6 +1,7 @@
 #include "strix/mtp_ngram_draft.hpp"
 
 #include <algorithm>
+#include <array>
 #include <stdexcept>
 
 namespace strix {
@@ -8,6 +9,13 @@ namespace {
 constexpr std::size_t kSuffixCells = 3;  // suffix 2, 3, 4+
 constexpr std::size_t kRowCells = 3;     // row 0, 1-2, 3+
 constexpr std::size_t kPeerFirst = kSuffixCells * 2 * kRowCells; // then one row-bucketed group for peer proposals
+constexpr std::size_t kToolFirst = kPeerFirst + kRowCells;          // then tool-source cells: suffix 2-3, 4-7, 8+ x rows
+constexpr std::size_t kCells = kToolFirst + kSuffixCells * kRowCells;
+constexpr std::size_t kToolQuery = 16;                              // context + drafts suffix matched in the tool source
+std::size_t row_cell(std::size_t row) noexcept { return row == 0 ? 0 : (row < 3 ? 1 : 2); }
+std::size_t tool_cell(std::uint32_t suffix, std::size_t row) noexcept {
+    return kToolFirst + (suffix < 4 ? 0 : (suffix < 8 ? 1 : 2)) * kRowCells + row_cell(row);
+}
 
 std::uint64_t mix(std::uint64_t h, std::uint32_t t) noexcept {
     h ^= t + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
@@ -36,10 +44,12 @@ std::size_t MtpNgramDraft::cell(std::uint32_t suffix, bool supported, std::size_
 void MtpNgramDraft::reset(std::span<const std::uint32_t> prompt) {
     context_.clear();
     index_.clear();
-    right_.assign(kPeerFirst + kRowCells, config_.prior * config_.prior_weight);
-    tried_.assign(kPeerFirst + kRowCells, config_.prior_weight);
+    right_.assign(kCells, config_.prior * config_.prior_weight);
+    tried_.assign(kCells, config_.prior_weight);
     started_ = false;
     shadow_ = {};
+    alternate_ = {};
+    tool_.reset();
     stats_ = {};
     context_.reserve(prompt.size() + 1024);
     for (const auto t : prompt) push(t);
@@ -62,8 +72,43 @@ double MtpNgramDraft::peer_acceptance(std::size_t row) const {
     return right_[c] / tried_[c];
 }
 
-std::size_t MtpNgramDraft::shadow_cell(std::size_t row) const noexcept {
-    return shadow_.peer ? kPeerFirst + (row == 0 ? 0 : (row < 3 ? 1 : 2)) : cell(shadow_.suffix, shadow_.supported, row);
+double MtpNgramDraft::tool_acceptance(std::uint32_t suffix, std::size_t row) const {
+    const auto c = tool_cell(suffix, row);
+    return right_[c] / tried_[c];
+}
+
+std::size_t MtpNgramDraft::shadow_cell(const Shadow& shadow, std::size_t row) const noexcept {
+    if (shadow.tool) return tool_cell(shadow.suffix, row);
+    return shadow.peer ? kPeerFirst + row_cell(row) : cell(shadow.suffix, shadow.supported, row);
+}
+
+// Learned expected accepted rows of a candidate: sum over rows of the product of its row acceptances (each row's
+// cell counts tries given every earlier row was right).
+double MtpNgramDraft::expected_rows(const Shadow& shadow) const {
+    double survive = 1.0, sum = 0.0;
+    for (std::size_t r = 0; r < shadow.tokens.size(); ++r) {
+        const auto c = shadow_cell(shadow, r);
+        survive *= right_[c] / tried_[c];
+        sum += survive;
+    }
+    return sum;
+}
+
+std::vector<std::uint32_t> MtpNgramDraft::tool_lookup(std::span<const std::uint32_t> extra, std::size_t length,
+    std::uint32_t& suffix) const {
+    suffix = 0;
+    std::array<std::uint32_t, kToolQuery> query{};
+    const auto total = context_.size() + extra.size();
+    const auto n = std::min<std::size_t>(kToolQuery, total);
+    for (std::size_t k = 0; k < n; ++k) {
+        const auto i = total - n + k;
+        query[k] = i < context_.size() ? context_[i] : extra[i - context_.size()];
+    }
+    const auto m = tool_->match(std::span<const std::uint32_t>(query.data(), n), std::max(1U, config_.tool_min_suffix),
+        static_cast<std::uint32_t>(std::min<std::size_t>(length, lookup::max_draft)));
+    if (!m.length || !m.available) return {};
+    suffix = m.length;
+    return {m.next.begin(), m.next.begin() + m.available};
 }
 
 std::vector<std::uint32_t> MtpNgramDraft::peer_lookup(std::span<const std::uint32_t> extra, std::size_t length) const {
@@ -137,6 +182,7 @@ std::vector<std::uint32_t> MtpNgramDraft::begin_cycle(std::uint32_t pending, std
     acceptance_out.clear();
     if (!started_) { push(pending); started_ = true; }
     shadow_ = {};
+    alternate_ = {};
     confident = std::min(confident, drafts.size());
     // Only a chain that stopped before the window could be filled gets an extension.
     if (!confident || confident >= room) return {};
@@ -146,19 +192,39 @@ std::vector<std::uint32_t> MtpNgramDraft::begin_cycle(std::uint32_t pending, std
     auto tokens = lookup(prefix, length, suffix, support);
     bool peer = false;
     if (tokens.empty() && !peers_.empty()) { tokens = peer_lookup(prefix, length); peer = !tokens.empty(); }
-    if (tokens.empty()) return {};
+    Shadow tool;
+    if (tool_) {
+        tool.tokens = tool_lookup(prefix, length, tool.suffix);
+        tool.tool = !tool.tokens.empty();
+    }
+    if (tokens.empty() && !tool.tool) return {};
     shadow_.valid = true;
     shadow_.prefix.assign(prefix.begin(), prefix.end());
-    shadow_.tokens = tokens;
+    shadow_.tokens = std::move(tokens);
     shadow_.suffix = suffix;
     shadow_.supported = support >= 2;
     shadow_.peer = peer;
+    if (tool.tool) {
+        // Both candidates are scored at finish_cycle; the one proposed has the larger learned expected rows.
+        ++stats_.tool_candidates;
+        tool.valid = true;
+        tool.prefix = shadow_.prefix;
+        const bool own = !shadow_.tokens.empty();
+        const double e_tool = expected_rows(tool), e_own = own ? expected_rows(shadow_) : -1.0;
+        if (e_tool > e_own || (e_tool == e_own && tool.suffix >= shadow_.suffix)) {
+            if (own) alternate_ = std::move(shadow_);
+            shadow_ = std::move(tool);
+            ++stats_.tool_cycles;
+        } else {
+            alternate_ = std::move(tool);
+        }
+    }
     ++stats_.cycles;
-    if (peer) ++stats_.peer_cycles;
-    const auto row_acceptance = [&](std::size_t r) { return peer ? peer_acceptance(r) : acceptance(suffix, shadow_.supported, r); };
+    if (shadow_.peer) ++stats_.peer_cycles;
+    const auto row_acceptance = [&](std::size_t r) { const auto c = shadow_cell(shadow_, r); return right_[c] / tried_[c]; };
     if (row_acceptance(0) < config_.floor) return {};
-    for (std::size_t r = 0; r < tokens.size(); ++r) acceptance_out.push_back(row_acceptance(r));
-    return tokens;
+    for (std::size_t r = 0; r < shadow_.tokens.size(); ++r) acceptance_out.push_back(row_acceptance(r));
+    return shadow_.tokens;
 }
 
 void MtpNgramDraft::used(std::size_t rows) {
@@ -167,26 +233,39 @@ void MtpNgramDraft::used(std::size_t rows) {
     ++stats_.extended_cycles;
     stats_.extension_rows += shadow_.used;
     if (shadow_.peer) stats_.peer_extension_rows += shadow_.used;
+    if (shadow_.tool) stats_.tool_extension_rows += shadow_.used;
+}
+
+void MtpNgramDraft::score(Shadow& shadow, std::span<const std::uint32_t> emitted) {
+    const bool primary = &shadow == &shadow_;
+    // The extension was in play only if every confident draft it continues was emitted as drafted.
+    const auto p = shadow.prefix.size();
+    if (emitted.size() > p && std::equal(shadow.prefix.begin(), shadow.prefix.end(), emitted.begin())) {
+        const auto truth = emitted.subspan(p);
+        if (primary) ++stats_.scored_cycles;
+        for (std::size_t k = 0; k < shadow.tokens.size() && k < truth.size(); ++k) {
+            const auto c = shadow_cell(shadow, k);
+            const bool right = shadow.tokens[k] == truth[k];
+            tried_[c] += 1.0;
+            if (right) {
+                right_[c] += 1.0;
+                if (primary) ++stats_.shadow_right_rows;
+                if (shadow.tool) ++stats_.tool_shadow_right_rows;
+            }
+            if (right && primary && k < shadow.used) {
+                ++stats_.accepted_rows;
+                if (shadow.peer) ++stats_.peer_accepted_rows;
+                if (shadow.tool) ++stats_.tool_accepted_rows;
+            }
+            if (!right) break;
+        }
+    }
+    shadow = {};
 }
 
 void MtpNgramDraft::finish_cycle(std::span<const std::uint32_t> emitted) {
-    if (shadow_.valid) {
-        // The extension was in play only if every confident draft it continues was emitted as drafted.
-        const auto p = shadow_.prefix.size();
-        if (emitted.size() > p && std::equal(shadow_.prefix.begin(), shadow_.prefix.end(), emitted.begin())) {
-            const auto truth = emitted.subspan(p);
-            ++stats_.scored_cycles;
-            for (std::size_t k = 0; k < shadow_.tokens.size() && k < truth.size(); ++k) {
-                const auto c = shadow_cell(k);
-                const bool right = shadow_.tokens[k] == truth[k];
-                tried_[c] += 1.0;
-                if (right) { right_[c] += 1.0; ++stats_.shadow_right_rows; }
-                if (right && k < shadow_.used) { ++stats_.accepted_rows; if (shadow_.peer) ++stats_.peer_accepted_rows; }
-                if (!right) break;
-            }
-        }
-        shadow_ = {};
-    }
+    if (shadow_.valid) score(shadow_, emitted);
+    if (alternate_.valid) score(alternate_, emitted);
     for (const auto t : emitted) push(t);
 }
 

@@ -187,6 +187,9 @@ const MtpContextDraftStats* HipMtpGreedyRuntime::context_stats() const noexcept 
 const MtpNgramDraftStats* HipMtpGreedyRuntime::ngram_stats() const noexcept {
     return impl_->ngram?&impl_->ngram->stats():nullptr;
 }
+void HipMtpGreedyRuntime::set_ngram_tool_source(std::shared_ptr<const lookup::Corpus> source) {
+    if(impl_->ngram && source) impl_->ngram->set_tool_source(std::move(source));
+}
 void HipMtpGreedyRuntime::set_draft_min_probability(float p) {
     auto& i=*impl_;require(!i.busy && !i.cycled && p>=0.0F && p<=1.0F,"MTP draft minimum probability is set once in [0, 1] before cycles");
     i.min_probability=p;

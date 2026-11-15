@@ -1129,6 +1129,7 @@ struct MtpBatchRequest {
     std::uint32_t draft_depth_max = 0; // request field "draft_depth_max": predictor drafts per cycle at most (0: engine)
     std::optional<bool> tool_draft;    // request field "tool_draft": strict tool-call frames (unset: STRIX_BATCH_TOOL_DRAFT)
     std::optional<bool> ngram_peers;   // request field "ngram_peers": cross-request lookup (unset: STRIX_BATCH_NGRAM_PEERS)
+    std::shared_ptr<const lookup::Corpus> tool_source; // restored tool results for the n-gram extension (null: none)
     // Newly verified tokens (the first call carries the prompt's own prediction); false cancels.
     std::function<bool(std::span<const std::uint32_t>)> on_tokens;
     std::function<void(serve::GenerationProgress)> on_progress;
@@ -2064,6 +2065,7 @@ private:
             if (s.window) s.greedy->use_window_verifier(s.window);
             if (m.draft_chain) s.greedy->set_draft_min_probability(mtp_draft_min_probability(m));
             if (!s.request.constraint && enable_context) enable_context(*s.greedy, s.request.prompt, s.request.sampler, s.request.ngram_draft);
+            if (!s.request.constraint && s.request.tool_source) s.greedy->set_ngram_tool_source(s.request.tool_source);
             if (s.request.draft_depth_max) s.greedy->set_draft_depth_max(s.request.draft_depth_max);
             if (!s.request.constraint && (s.request.tool_draft ? *s.request.tool_draft : tool_draft_default) && frame_tokens[0] != frame_tokens[1] &&
                 !s.request.sampler && s.window && !s.window->survival_controller() && m.draft_chain) {
@@ -2124,6 +2126,13 @@ private:
             if (const auto* ng = s.greedy->ngram_stats()) {
                 s.result.ngram_rows = ng->extension_rows; s.result.ngram_accepted = ng->accepted_rows;
                 s.result.source_shadow = ng->cycles; s.result.source_scored = ng->scored_cycles; s.result.source_right = ng->shadow_right_rows;
+                if (s.request.tool_source)
+                    std::fprintf(stderr, "tool-source request %llu: corpus %llu tokens candidates %llu chosen %llu rows %llu accepted %llu "
+                        "shadow_right %llu | ngram rows %llu accepted %llu\n", static_cast<unsigned long long>(s.order),
+                        static_cast<unsigned long long>(s.request.tool_source->tokens()), static_cast<unsigned long long>(ng->tool_candidates),
+                        static_cast<unsigned long long>(ng->tool_cycles), static_cast<unsigned long long>(ng->tool_extension_rows),
+                        static_cast<unsigned long long>(ng->tool_accepted_rows), static_cast<unsigned long long>(ng->tool_shadow_right_rows),
+                        static_cast<unsigned long long>(ng->extension_rows), static_cast<unsigned long long>(ng->accepted_rows));
             }
             if (const auto* cd = s.greedy->context_stats()) {
                 s.result.ngram_rows = cd->extension_rows; s.result.ngram_accepted = cd->accepted_rows;

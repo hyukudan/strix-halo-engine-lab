@@ -2,6 +2,7 @@
 #include "strix/serve/chat_template.hpp"
 
 #include "strix/serve/short_first.hpp"
+#include "strix/lookup/index.hpp"
 
 #include <array>
 #include <atomic>
@@ -196,6 +197,10 @@ struct GenerationJob {
     // Request field "ngram_peers" (batched decoding): cross-request lookup on/off for this request's n-gram
     // extension; unset = the engine's setting (STRIX_BATCH_NGRAM_PEERS, off by default). Drafts only.
     std::optional<bool> ngram_peers;
+    // Request field "tool_lookup": the n-gram extension also looks up the request's tool results restored to their
+    // original text (strix/session/tool_source.hpp); unset = the server setting (STRIX_TOOL_LOOKUP). Drafts only.
+    std::optional<bool> tool_lookup;
+    std::shared_ptr<const lookup::Corpus> tool_source; // built by the frontend when tool_lookup resolves on; null: none
     std::function<bool(std::span<const std::uint32_t>)> on_tokens;
     // Set by GenerationQueue::submit: the request was submitted after the instrumentation armed, so every armed
     // measurement of it (first token, drafts) is complete. Engines measure only these requests. When the armed period

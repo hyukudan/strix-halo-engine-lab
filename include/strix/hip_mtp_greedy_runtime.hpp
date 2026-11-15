@@ -52,6 +52,9 @@ public:
     // (begin_cycle_draft without the cost model) do not use it.
     void enable_ngram_draft(std::span<const std::uint32_t> prompt,MtpNgramDraftConfig config={});
     [[nodiscard]] const MtpNgramDraftStats* ngram_stats() const noexcept;
+    // Tool-result source of the extension above (MtpNgramDraft::set_tool_source): after enable_ngram_draft; no-op
+    // without the extension or with a null source.
+    void set_ngram_tool_source(std::shared_ptr<const lookup::Corpus> source);
     // Opt-in context copy/n-gram drafter (strix/mtp_context_draft.hpp) instead of the extension above:
     // same prerequisites; it may also replace the chain with a gated context span before any predictor forward.
     // observe_only (after enable_ngram_draft): ordinary cycles keep the extension above unchanged; the context
