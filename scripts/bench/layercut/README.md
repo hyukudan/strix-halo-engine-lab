@@ -113,4 +113,18 @@ A mixed production pair profile is not automatically equal to either all-CUDA or
 Inject wrong metadata, repeated/missing pieces, connection close, relay failure and stalled peers; verify no token reply
 or decode uses incomplete state and all readers/copies retire. Check memory under long prompts and bounded ring pressure.
 Run complete workloads and interleaved medians only after fidelity passes; record kernel/IOMMU state with timing receipts.
-No native execution or fidelity result is established by the host tests.
+No native execution or fidelity result is established by the host tests (native receipts: see the PR / docs).
+
+## Measured recipe (MiniMax M3.1, 1 GbE)
+
+- Ports: rank r listens on BASE_PORT + r, so the relay port of rank 1 must differ from BASE_PORT + 1; the producer sends
+  to HOST0:BASE_PORT,HOST1:BASE_PORT+1.
+- Pipelining needs the pair's prefill unit (chunk rows x interleave group) to be at most one block: run the ranks with
+  `STRIX_MM_PF_GROUP=2 --max-rows C/2` for `--cut-block C`. With the default group (4) an 8K prompt is one unit and the
+  pair starts only after the last block (no overlap).
+- Exactness gate: ranks with `STRIX_MM_PREFILL_IDENTITY=fp32` and the producer with `--cut-pair-identity fp32`; the
+  layer-cut "state fnv" line must equal the node-only FP32 `--session` state fnv on both ranks.
+- Quality: `STRIX_MM_QUALITY_OUT=PREFIX STRIX_MM_QUALITY_ROWS=N` on the ranks dumps the prefill logits of a `--session`
+  (PREFIX-NAME-*) and of the layer-cut (PREFIX-cut-NAME-*); copy rank 1's files next to rank 0's and run
+  `logits_compare.py REF_PREFIX TEST_PREFIX N` (top-1 agreement, KL, top-2 margins). Dumps sit before the KV import:
+  do not time those runs.
