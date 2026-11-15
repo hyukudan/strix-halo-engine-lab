@@ -322,6 +322,19 @@ public:
     [[nodiscard]] const void* finish_staged(hipStream_t stream);
     void release_staged(hipStream_t stream);
     [[nodiscard]] const CommunicatorStats& stats() const noexcept { return stats_; }
+    // A borrower calls this only after draining its progress thread, with
+    // deltas since its previous snapshot. Seconds are progress-thread elapsed
+    // time (producer wait + wire + check), overlapping device execution; they
+    // are not additional step wall time. The wait is also included in stage.
+    void account_borrowed_transport(std::uint64_t exchanges, std::uint64_t bytes,
+                                    double producer_wait, double wire, double check) noexcept {
+        stats_.exchanges += exchanges;
+        stats_.bytes_sent += bytes;
+        stats_.seconds += producer_wait + wire + check;
+        stats_.stage += producer_wait;
+        stats_.wire += wire;
+        stats_.check += check;
+    }
     [[nodiscard]] const Group& group() const noexcept { return group_; }
     [[nodiscard]] std::string transport_name() const;
     // The transport, for a module that borrows it between this communicator's exchanges (both ranks at the same point,

@@ -591,13 +591,22 @@ void test_startup_agreement() {
     CHECK(exchanges == 0);
     CHECK(!rd::has_startup_handshake(2, "comm", false, false));
     CHECK(!rd::has_startup_handshake(2, "comm", true, true));
-    // --tf adds a config-only agreement on two comm ranks; other reference gates and xfer/world 1 stay exchange-free.
+    // --tf and --pf-ttft (both set reference_gate) add a config-only agreement on two comm ranks; other reference gates
+    // and xfer/world 1 stay exchange-free, and the rows stay on the fixed fallback (no startup handshake).
     CHECK(rd::has_config_agreement(2, "comm", false, true, true));
     CHECK(rd::has_config_agreement(2, "comm", true, true, true));
     CHECK(rd::has_config_agreement(2, "comm", true, false, false));
     CHECK(!rd::has_config_agreement(2, "comm", true, true, false));
     CHECK(!rd::has_config_agreement(2, "xfer", false, true, true));
     CHECK(!rd::has_config_agreement(1, "comm", false, true, true));
+    {
+        rd::Effective pf;
+        pf.max_rows = {"8192", "auto-8192"};
+        const bool comm = true, handshake = rd::has_startup_handshake(2, "comm", false, true);
+        CHECK(rd::has_config_agreement(2, "comm", false, true, true) && !handshake);
+        rd::fallback_without_handshake(pf, comm, handshake);
+        CHECK(pf.max_rows.value == "4096");
+    }
 }
 
 void test_no_handshake_fallback() {

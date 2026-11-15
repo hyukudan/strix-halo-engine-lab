@@ -81,7 +81,7 @@ donde existe.
 
 | Modelo | Uno / par | Exacto / FAST | Memoria | Pesos |
 |---|---|---|---|---|
-| Qwen3.8-Flash-Next (UD-Q4_K_XL) | uno (2 réplicas detrás de un router) | exacto por defecto; `fast` | 111 GB de pesos en un nodo de 128 GB | [GGUF UD-Q4_K_XL](https://huggingface.co/hyukudan/Qwen3.8-Flash-Next-GGUF-mirror) (réplica de `unsloth`, leído tal cual se publica); cabeza de draft MTP Q8_0 destilada en local, no publicada |
+| Qwen3.8-Flash-Next (UD-Q4_K_XL) | uno (2 réplicas detrás de un router) | exacto por defecto; `fast` | 111 GB de pesos en un nodo de 128 GB | [GGUF UD-Q4_K_XL](https://huggingface.co/hyukudan/Qwen3.8-Flash-Next-GGUF-mirror) (réplica de `unsloth`, leído tal cual se publica); [cabeza de draft MTP Q8_0 destilada](https://huggingface.co/hyukudan/Qwen3.8-Flash-Next-MTP-distillG-Q8_0) |
 | DeepSeek V4.1 Flash (expertos de 2 bits, denso trellis de 6.5 bits) | par por USB4 | exacto por defecto; `fast` | 2 x 128 GB | [GGUF de expertos](https://huggingface.co/hyukudan/deepseek-v4.1-flash-gguf-mirror), [capa densa](https://huggingface.co/hyukudan/DeepSeek-V4.1-Flash-1017-strix-dense-U6), [packs trellis](https://huggingface.co/hyukudan/DeepSeek-V4.1-Flash-1017-strix-trellis-EXL3) |
 | MiniMax M3.1 Flash (EXL3 3.06 bpw) | par TP2 | exacto | 2 x 128 GB | [EXL3 3.06 bpw](https://huggingface.co/hyukudan/MiniMax-M3.1-Flash-EXL3-EAQ-v1-3.06-bpw-mirror) (réplica de `Mia-AiLab`, con nuestro draft EXL3); [origen del draft](https://huggingface.co/hyukudan/MiniMax-M3.1-Flash-DFlash2-mirror) |
 | GLM-5.3 Flash (EXL3 4.05 bpw) | par TP2 | exacto; prefill WMMA opcional | 2 x 128 GB | [EXL3 4.05 bpw](https://huggingface.co/hyukudan/GLM-5.3-Flash-exl3-mirror) (réplica de `turboderp`) |
@@ -98,6 +98,27 @@ servicio de Qwen y GLM en una tarjeta (borrador). Vea [uso de una GPU discreta](
 
 Cada interruptor, su valor por defecto y cuándo otro hardware quiere otro valor: [toggles](docs/toggles.es.md).
 
+## Entrada de imágenes
+
+DeepSeek V4.1 en el par de dos nodos acepta imágenes en chat completions al estilo OpenAI. Añada una parte `image_url`
+a un mensaje de usuario. Está desactivada por defecto: arranque el servidor con `--vision <GGUF de visión>` en el rank 0,
+junto con `--prefill-path device`.
+
+```bash
+curl http://localhost:8080/v1/chat/completions -H 'Content-Type: application/json' -d '{
+  "messages": [{"role": "user", "content": [
+    {"type": "text", "text": "Describe this image."},
+    {"type": "image_url", "image_url": {"url": "data:image/png;base64,..."}}]}]}'
+```
+
+Medido en el par de dos nodos, DeepSeek V4.1 Q2, un PNG de 37x23 ampliado a 1550 parches (200 filas de imagen + 21
+tokens de texto): primera petición 1,46-1,87 s hasta el primer token (codificación de la imagen 0,93-1,07 s, trama de
+2,0 MB al rank 1 en 4-5 ms, prefill del LM unos 0,46 s); la misma imagen otra vez 0,53-0,61 s (acierto de la caché de
+embeddings); decode 39-41 tok/s.
+
+Límites: solo PNG y JPEG; se rechazan las imágenes que superan el presupuesto de filas, el vídeo y las peticiones con
+imagen y `session_id`. Los demás modelos aún no admiten imágenes. Detalles: [entrada de imágenes](docs/engine/vision.es.md).
+
 ## Cómo funciona
 
 - Un núcleo de kernels compartido: lectores GGUF y EXL3, kernels de matrices cuantizadas, atención, el planificador de
@@ -111,6 +132,7 @@ Cada interruptor, su valor por defecto y cuándo otro hardware quiere otro valor
   por un intercambio de 20 KB ([par](docs/pair.es.md)).
 - Cada valor por defecto tiene una ganancia medida y un interruptor de apagado ([optimizaciones](docs/optimizations.md)).
 - Añadir un modelo: [docs/engine/adding-a-model.es.md](docs/engine/adding-a-model.es.md).
+- Mapa de los núcleos compartidos y qué modelo usa cada uno: [docs/engine/shared-cores.es.md](docs/engine/shared-cores.es.md).
 
 ## Documentación
 
@@ -121,7 +143,7 @@ Cada interruptor, su valor por defecto y cuándo otro hardware quiere otro valor
 | Par y servicio | [par](docs/pair.es.md) · [configuración del par](docs/pair-setup.es.md) · [servicio](docs/serving.es.md) · [GPU discreta](docs/discrete-gpu.es.md) |
 | Interruptores | [toggles](docs/toggles.es.md) · [optimizaciones](docs/optimizations.md) ([JSON](docs/optimizations.json)) |
 | Números | [rendimiento](docs/performance.md) · [ganancias medidas](docs/measured-gains.es.md) · [metodología](docs/methodology.es.md) |
-| Internos | [arquitectura](docs/architecture/README.md) · [registro de decisiones](docs/decisions/decision-register.md) · [estado de implementación](docs/reference/implementation-status.md) · [fuentes](docs/reference/sources-ledger.md) |
+| Internos | [arquitectura](docs/architecture/README.md) · [núcleos compartidos](docs/engine/shared-cores.es.md) · [registro de decisiones](docs/decisions/decision-register.md) · [estado de implementación](docs/reference/implementation-status.md) · [fuentes](docs/reference/sources-ledger.md) |
 | Índice | [índice completo de la documentación](docs/README.md) · [AGENTS.md](AGENTS.md) |
 
 <a id="related-repositories"></a>

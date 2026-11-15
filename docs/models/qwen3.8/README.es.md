@@ -15,7 +15,7 @@ comandos de lanzamiento, los perfiles y los interruptores de ajuste. Cómo se le
 
 **Pesos:** [hyukudan/Qwen3.8-Flash-Next-GGUF-mirror](https://huggingface.co/hyukudan/Qwen3.8-Flash-Next-GGUF-mirror) (réplica de `unsloth/Qwen3.8-Flash-Next-GGUF`): el motor lee el GGUF
 `UD-Q4_K_XL` tal cual se publica, unido en un fichero; las palancas opcionales solo añaden copias en el dispositivo al
-cargar. La cabeza de draft MTP Q8_0 destilada se construye en local y no se publica (el `MTP/*.gguf` base de la réplica
+cargar. La cabeza de draft MTP Q8_0 destilada se publica en [hyukudan/Qwen3.8-Flash-Next-MTP-distillG-Q8_0](https://huggingface.co/hyukudan/Qwen3.8-Flash-Next-MTP-distillG-Q8_0) (el `MTP/*.gguf` base de la réplica
 es otra cabeza). Ficheros y revisiones: [reproducir](../../reproduce.md#models-and-provenance).
 
 Ejecución recomendada: el comando simple selecciona los valores predeterminados de producción, 256 tokens.

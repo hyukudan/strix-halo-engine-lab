@@ -698,6 +698,22 @@ unsigned prefill_dense_band() {
     return static_cast<unsigned>(g_dense_band_override < 0 ? prefill_dense_band_default() : g_dense_band_override);
 }
 
+// STRIX_MMX_PREFILL_PIPE_TAIL (v4 + mtfit items; lever pf_moe_pipe_tail): 0 (default) = tail classes on item_core_v3;
+// 1 = the tail classes MT 1..7 on the pipelined loop (= mask 254); an even mask = bit MT (2..256) per class. Bit 256
+// (the MT8 remainders on item_pipe<8, 4, false> under PIPE) fails the ISA gate (256 VGPR, spills, scratch): diagnosis
+// only, never part of 1. Same items, grids, K splits and bits (test_prefill_pipe_tail). The unguarded A loads need the
+// mtfit items (one block of ceil(rows / 16) tiles per tail), so a plan without mtfit keeps the old kernels.
+unsigned prefill_pipe_tail_mask() {  // bit c = class c (MT c + 1)
+    static const unsigned mask = [] {
+        const unsigned v = strix::envcfg::number<unsigned>("STRIX_MMX_PREFILL_PIPE_TAIL", 0U, 0U, 511U);
+        if (v > 1U && (v & 1U) != 0U)
+            throw std::invalid_argument("STRIX_MMX_PREFILL_PIPE_TAIL must be 0, 1 or an even class mask (bit MT, 2..510)");
+        return v == 1U ? 0x7FU : v >> 1U;
+    }();
+    return mask;
+}
+bool prefill_pipe_tail(unsigned cls) { return ((prefill_pipe_tail_mask() >> cls) & 1U) != 0U; }
+
 // STRIX_MMX_PREFILL_TAIL_STREAM (v4 + mtfit): 1 (default) = the tail-class launches (MT 1..7) of each stage run on a side
 // stream beside the MT8 launch, joined before the stage's consumer; 0 = every class launch on the caller's stream.
 // Same items, kernels and bits; the classes write disjoint partials.
@@ -854,16 +870,27 @@ bool prefill_p1_packed() {
     return enabled;
 }
 
-template <bool Packed>
+template <bool Packed, bool Tail = false>
 void launch_pipe_class(const pfk::Item* items_d, unsigned n, unsigned ctas, hipStream_t stream, bool pair, bool simplify) {
     if (pair && simplify)
-        hipLaunchKernelGGL(pfk::grouped_pipe_pair_kernel<true>, dim3(ctas), dim3(128), 0, stream, items_d, n);
+        hipLaunchKernelGGL((pfk::grouped_pipe_pair_kernel<true, false, Tail>), dim3(ctas), dim3(128), 0, stream, items_d, n);
     else if (pair)
-        hipLaunchKernelGGL((pfk::grouped_pipe_pair_kernel<false, Packed>), dim3(ctas), dim3(128), 0, stream, items_d, n);
+        hipLaunchKernelGGL((pfk::grouped_pipe_pair_kernel<false, Packed, Tail>), dim3(ctas), dim3(128), 0, stream, items_d, n);
     else if (simplify)
-        hipLaunchKernelGGL((pfk::grouped_pipe_kernel<8, 4, true>), dim3(ctas), dim3(128), 0, stream, items_d, n);
+        hipLaunchKernelGGL((pfk::grouped_pipe_kernel<8, 4, true, false, Tail>), dim3(ctas), dim3(128), 0, stream, items_d, n);
     else
-        hipLaunchKernelGGL((pfk::grouped_pipe_kernel<8, 4, false, Packed>), dim3(ctas), dim3(128), 0, stream, items_d, n);
+        hipLaunchKernelGGL((pfk::grouped_pipe_kernel<8, 4, false, Packed, Tail>), dim3(ctas), dim3(128), 0, stream, items_d, n);
+}
+
+// Host-plan tail class MT on the pipelined loop (prefill_pipe_tail), decode form as the MT8 PIPE launch.
+template <int MT>
+void launch_pipe_tail_class(const pfk::Item* items_d, unsigned n, unsigned ctas, hipStream_t stream) {
+    if (prefill_pipe() == 2)
+        hipLaunchKernelGGL((pfk::grouped_pipe_tail_kernel<MT, true, false>), dim3(ctas), dim3(128), 0, stream, items_d, n);
+    else if (prefill_p1_packed())
+        hipLaunchKernelGGL((pfk::grouped_pipe_tail_kernel<MT, false, true>), dim3(ctas), dim3(128), 0, stream, items_d, n);
+    else
+        hipLaunchKernelGGL((pfk::grouped_pipe_tail_kernel<MT, false, false>), dim3(ctas), dim3(128), 0, stream, items_d, n);
 }
 
 template <int W>
@@ -876,14 +903,27 @@ void launch_band_class(const pfk::Item* items_d, unsigned n, unsigned ctas, hipS
         hipLaunchKernelGGL((pfk::grouped_pipe_band_kernel<W, false, false>), dim3(ctas), dim3(W * 32), 0, stream, items_d, n);
 }
 
-void launch_class(const pfk::Item* items_d, unsigned n, unsigned ctas, unsigned cls, hipStream_t stream, bool pair = false) {
+// tail_pipe: the items come from an mtfit plan, so prefill_pipe_tail may move their tail classes to the pipelined loop.
+void launch_class(const pfk::Item* items_d, unsigned n, unsigned ctas, unsigned cls, hipStream_t stream, bool pair = false,
+                  bool tail_pipe = false) {
     if (cls == 7 && prefill_pipe() != 0) {
-        const bool simplify = prefill_pipe() == 2;
-        if (prefill_p1_packed())
-            launch_pipe_class<true>(items_d, n, ctas, stream, pair, simplify);
-        else
-            launch_pipe_class<false>(items_d, n, ctas, stream, pair, simplify);
+        const bool simplify = prefill_pipe() == 2, tail = tail_pipe && prefill_pipe_tail(7);
+        if (prefill_p1_packed() && tail) launch_pipe_class<true, true>(items_d, n, ctas, stream, pair, simplify);
+        else if (prefill_p1_packed()) launch_pipe_class<true>(items_d, n, ctas, stream, pair, simplify);
+        else if (tail) launch_pipe_class<false, true>(items_d, n, ctas, stream, pair, simplify);
+        else launch_pipe_class<false>(items_d, n, ctas, stream, pair, simplify);
         return;
+    }
+    if (cls < 7 && tail_pipe && prefill_pipe_tail(cls)) {
+        switch (cls) {
+            case 0: launch_pipe_tail_class<1>(items_d, n, ctas, stream); return;
+            case 1: launch_pipe_tail_class<2>(items_d, n, ctas, stream); return;
+            case 2: launch_pipe_tail_class<3>(items_d, n, ctas, stream); return;
+            case 3: launch_pipe_tail_class<4>(items_d, n, ctas, stream); return;
+            case 4: launch_pipe_tail_class<5>(items_d, n, ctas, stream); return;
+            case 5: launch_pipe_tail_class<6>(items_d, n, ctas, stream); return;
+            default: launch_pipe_tail_class<7>(items_d, n, ctas, stream); return;
+        }
     }
     if (cls == 7 && prefill_core8() != 0) {
         if (prefill_core8() == 1)
@@ -906,7 +946,7 @@ void launch_class(const pfk::Item* items_d, unsigned n, unsigned ctas, unsigned 
 // pair = this MoE call's paired MT8 PIPE bands
 void launch_v2(const pfk::Item* items_d, const std::vector<pfk::Item>& list, unsigned ctas, unsigned cls, hipStream_t stream, bool pair) {
     if (list.empty()) return;
-    launch_class(items_d, static_cast<unsigned>(list.size()), ctas, cls, stream, pair);
+    launch_class(items_d, static_cast<unsigned>(list.size()), ctas, cls, stream, pair, prefill_mtfit());
 }
 
 template <int MT>
@@ -1366,17 +1406,25 @@ template <int MT> __global__ __launch_bounds__(128) void dq_v4_kernel(Queue q) {
 #undef STRIX_MMX_CALL
     });
 }
-template <bool Simplify, bool Packed> __global__ __launch_bounds__(128) void dq_pipe_kernel(Queue q) {
+// Tail classes MT 1..7 on the pipelined loop (STRIX_MMX_PREFILL_PIPE_TAIL): the items of dq_v4_kernel<MT>, same partials.
+template <int MT, bool Simplify, bool Packed> __global__ __launch_bounds__(128) void dq_pipe_tail_kernel(Queue q) {
     dp::run_items(q, [](const pfk::Item& it, unsigned bx, unsigned by, unsigned bz) {
-#define STRIX_MMX_CALL(B) pfk::pipe_or_tail<B, 8, 4, Simplify, Packed>(it, bx, by, bz)
+#define STRIX_MMX_CALL(B) pfk::pipe_tail<B, MT, Simplify, Packed>(it, bx, by, bz)
         STRIX_MMX_BITS_SWITCH(STRIX_MMX_CALL)
 #undef STRIX_MMX_CALL
     });
 }
-template <bool Simplify, bool Packed> __global__ __launch_bounds__(128) void dq_pipe_pair_kernel(Queue q) {
+template <bool Simplify, bool Packed, bool Tail = false> __global__ __launch_bounds__(128) void dq_pipe_kernel(Queue q) {
+    dp::run_items(q, [](const pfk::Item& it, unsigned bx, unsigned by, unsigned bz) {
+#define STRIX_MMX_CALL(B) pfk::pipe_or_tail<B, 8, 4, Simplify, Packed, Tail>(it, bx, by, bz)
+        STRIX_MMX_BITS_SWITCH(STRIX_MMX_CALL)
+#undef STRIX_MMX_CALL
+    });
+}
+template <bool Simplify, bool Packed, bool Tail = false> __global__ __launch_bounds__(128) void dq_pipe_pair_kernel(Queue q) {
     __shared__ pfk::Half16 exchange[128];  // as grouped_pipe_pair_kernel
     dp::run_items(q, [&](const pfk::Item& it, unsigned bx, unsigned by, unsigned bz) {
-#define STRIX_MMX_CALL(B) pfk::pipe_pair_or_tail<B, Simplify, Packed>(it, bx, by, bz, exchange)
+#define STRIX_MMX_CALL(B) pfk::pipe_pair_or_tail<B, Simplify, Packed, Tail>(it, bx, by, bz, exchange)
         STRIX_MMX_BITS_SWITCH(STRIX_MMX_CALL)
 #undef STRIX_MMX_CALL
     });
@@ -1391,8 +1439,35 @@ template <int Core8> __global__ __launch_bounds__(128) void dq_core8_kernel(Queu
 }
 #undef STRIX_MMX_BITS_SWITCH
 
+template <int MT> void launch_dq_pipe_tail(const Queue& q, const dim3& g, hipStream_t stream) {
+    if (prefill_pipe() == 2) hipLaunchKernelGGL((dq_pipe_tail_kernel<MT, true, false>), g, dim3(128), 0, stream, q);
+    else if (prefill_p1_packed()) hipLaunchKernelGGL((dq_pipe_tail_kernel<MT, false, true>), g, dim3(128), 0, stream, q);
+    else hipLaunchKernelGGL((dq_pipe_tail_kernel<MT, false, false>), g, dim3(128), 0, stream, q);
+}
+template <bool Tail> void launch_dq_pipe(const Queue& q, const dim3& g, hipStream_t stream, bool pair) {
+    const bool simplify = prefill_pipe() == 2, packed = prefill_p1_packed();
+    if (pair && simplify) hipLaunchKernelGGL((dq_pipe_pair_kernel<true, false, Tail>), g, dim3(128), 0, stream, q);
+    else if (pair && packed) hipLaunchKernelGGL((dq_pipe_pair_kernel<false, true, Tail>), g, dim3(128), 0, stream, q);
+    else if (pair) hipLaunchKernelGGL((dq_pipe_pair_kernel<false, false, Tail>), g, dim3(128), 0, stream, q);
+    else if (simplify) hipLaunchKernelGGL((dq_pipe_kernel<true, false, Tail>), g, dim3(128), 0, stream, q);
+    else if (packed) hipLaunchKernelGGL((dq_pipe_kernel<false, true, Tail>), g, dim3(128), 0, stream, q);
+    else hipLaunchKernelGGL((dq_pipe_kernel<false, false, Tail>), g, dim3(128), 0, stream, q);
+}
+
+// The device-queue plan is always mtfit (prefill_moe_device_plan), so prefill_pipe_tail applies to every class here.
 void launch_dq_class(const Queue& q, unsigned cls, unsigned grid, hipStream_t stream, bool pair) {
     const dim3 g(grid);
+    if (cls < 7 && prefill_pipe_tail(cls)) {
+        switch (cls) {
+            case 0: launch_dq_pipe_tail<1>(q, g, stream); return;
+            case 1: launch_dq_pipe_tail<2>(q, g, stream); return;
+            case 2: launch_dq_pipe_tail<3>(q, g, stream); return;
+            case 3: launch_dq_pipe_tail<4>(q, g, stream); return;
+            case 4: launch_dq_pipe_tail<5>(q, g, stream); return;
+            case 5: launch_dq_pipe_tail<6>(q, g, stream); return;
+            default: launch_dq_pipe_tail<7>(q, g, stream); return;
+        }
+    }
     switch (cls) {
         case 0: hipLaunchKernelGGL(dq_v4_kernel<1>, g, dim3(128), 0, stream, q); return;
         case 1: hipLaunchKernelGGL(dq_v4_kernel<2>, g, dim3(128), 0, stream, q); return;
@@ -1405,13 +1480,8 @@ void launch_dq_class(const Queue& q, unsigned cls, unsigned grid, hipStream_t st
     }
     // Class 7: the kernel that launch_class<4> selects, from the same switches.
     if (prefill_pipe() != 0) {
-        const bool simplify = prefill_pipe() == 2, packed = prefill_p1_packed();
-        if (pair && simplify) hipLaunchKernelGGL((dq_pipe_pair_kernel<true, false>), g, dim3(128), 0, stream, q);
-        else if (pair && packed) hipLaunchKernelGGL((dq_pipe_pair_kernel<false, true>), g, dim3(128), 0, stream, q);
-        else if (pair) hipLaunchKernelGGL((dq_pipe_pair_kernel<false, false>), g, dim3(128), 0, stream, q);
-        else if (simplify) hipLaunchKernelGGL((dq_pipe_kernel<true, false>), g, dim3(128), 0, stream, q);
-        else if (packed) hipLaunchKernelGGL((dq_pipe_kernel<false, true>), g, dim3(128), 0, stream, q);
-        else hipLaunchKernelGGL((dq_pipe_kernel<false, false>), g, dim3(128), 0, stream, q);
+        if (prefill_pipe_tail(7)) launch_dq_pipe<true>(q, g, stream, pair);
+        else launch_dq_pipe<false>(q, g, stream, pair);
         return;
     }
     if (prefill_core8() == 1) hipLaunchKernelGGL((dq_core8_kernel<1>), g, dim3(128), 0, stream, q);

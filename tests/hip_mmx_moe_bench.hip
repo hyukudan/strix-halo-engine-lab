@@ -3170,6 +3170,149 @@ struct Bench {
     }
 };
 
+// test_prefill_pipe_tail (STRIX_MMX_PREFILL_PIPE_TAIL): tail classes MT 1..7 on pfk::pipe_tail and the MT8 partial
+// block on pipe_or_tail with the kPipeTail policy against item_core_v3 (dq_v4), bits {3,4,5,6,8} x rows
+// {1,15,17,47,100,112,120} (MT8: {113,120,127}) x splits {1,2,4,8} x row0 {0,128} x decode {scalar,packed}: memcmp of
+// the partials (sentinel-filled) with NaN in every padded input row. K={512,80,16} covers equal, uneven and empty
+// split ranges. Direct-core coverage only: no dispatch or Simplify=true qualification. Synthetic weights; no model needed.
+template <int MT> __global__ __launch_bounds__(128) void pipe_tail_ref_kernel(opt::pfk::Item it) {
+    const unsigned local = blockIdx.x, bx = local % it.gx, by = (local / it.gx) % it.gy, bz = local / (it.gx * it.gy);
+    switch (it.bits) {
+        case 3: opt::pfk::item_core_v3<3, MT, 0, true>(it, bx, by, bz); break;
+        case 4: opt::pfk::item_core_v3<4, MT, 0, true>(it, bx, by, bz); break;
+        case 5: opt::pfk::item_core_v3<5, MT, 0, true>(it, bx, by, bz); break;
+        case 6: opt::pfk::item_core_v3<6, MT, 0, true>(it, bx, by, bz); break;
+        default: opt::pfk::item_core_v3<8, MT, 0, true>(it, bx, by, bz); break;
+    }
+}
+template <int MT, bool Packed> __device__ __forceinline__ void pipe_tail_arm(const opt::pfk::Item& it, unsigned bx, unsigned by, unsigned bz) {
+#define STRIX_PT_CALL(B)                                                                                        \
+    if constexpr (MT == 8) opt::pfk::pipe_or_tail<B, 8, 4, false, Packed, true>(it, bx, by, bz);           \
+    else opt::pfk::pipe_tail<B, MT, false, Packed>(it, bx, by, bz)
+    switch (it.bits) {
+        case 3: STRIX_PT_CALL(3); break;
+        case 4: STRIX_PT_CALL(4); break;
+        case 5: STRIX_PT_CALL(5); break;
+        case 6: STRIX_PT_CALL(6); break;
+        default: STRIX_PT_CALL(8); break;
+    }
+#undef STRIX_PT_CALL
+}
+template <int MT, bool Packed> __global__ __launch_bounds__(128) void pipe_tail_new_kernel(opt::pfk::Item it) {
+    const unsigned local = blockIdx.x, bx = local % it.gx, by = (local / it.gx) % it.gy, bz = local / (it.gx * it.gy);
+    pipe_tail_arm<MT, Packed>(it, bx, by, bz);
+}
+
+template <int MT>
+std::size_t pipe_tail_cells(const std::uint32_t* trellis_d, unsigned bits, unsigned in, unsigned out, std::mt19937& rng) {
+    const std::vector<unsigned> row_set = MT == 8 ? std::vector<unsigned>{113, 120, 127} : std::vector<unsigned>{1, 15, 17, 47, 100, 112, 120};
+    const unsigned tiles_k = in / 16;
+    std::size_t cells = 0;
+    for (const unsigned live : row_set)
+        for (const unsigned row0 : {0U, 128U}) {
+            const unsigned gy = (live + 16U * MT - 1U) / (16U * MT), padded = row0 + gy * 16U * MT, rows = row0 + live;
+            // Tile-major input: [padded / 16][tiles_k][16 rows][16 halves]; NaN in every row >= rows.
+            std::vector<std::uint16_t> x(static_cast<std::size_t>(padded) * in);
+            std::uniform_real_distribution<float> u(-1.0F, 1.0F);
+            for (unsigned r = 0; r < padded; ++r)
+                for (unsigned k = 0; k < in; ++k) {
+                    const std::size_t at = (static_cast<std::size_t>(r / 16) * tiles_k + k / 16) * 256 + (r % 16) * 16 + k % 16;
+                    x[at] = r < rows ? f16_bits(u(rng)) : std::uint16_t{0x7e00};
+                }
+            _Float16* x_d = nullptr;
+            hip_ok(hipMalloc(&x_d, x.size() * 2), "pipe tail x");
+            hip_ok(hipMemcpy(x_d, x.data(), x.size() * 2, hipMemcpyHostToDevice), "pipe tail x copy");
+            for (const unsigned splits : {1U, 2U, 4U, 8U}) {
+                const std::size_t n = static_cast<std::size_t>(splits) * rows * out;
+                const std::string cell = "test_prefill_pipe_tail: bits " + std::to_string(bits) + " MT " + std::to_string(MT) +
+                                         " K " + std::to_string(in) + " rows " + std::to_string(live) + " row0 " +
+                                         std::to_string(row0) + " splits " + std::to_string(splits);
+                const auto check_output = [&](const std::vector<std::uint32_t>& output, const char* arm) {
+                    for (std::size_t i = 0; i < output.size(); ++i) {
+                        const bool prefix = (i / out) % rows < row0;
+                        const bool sentinel = output[i] == 0xa5a5a5a5U;
+                        if (prefix ? !sentinel : sentinel)
+                            throw std::runtime_error(cell + " " + arm + (prefix ? ": prefix overwritten at word " : ": live output unwritten at word ") +
+                                                     std::to_string(i));
+                    }
+                };
+                float *a_d = nullptr, *b_d = nullptr;
+                hip_ok(hipMalloc(&a_d, n * 4), "pipe tail part");
+                hip_ok(hipMalloc(&b_d, n * 4), "pipe tail part");
+                hip_ok(hipMemset(a_d, 0xA5, n * 4), "pipe tail sentinel");
+                hip_ok(hipMemset(b_d, 0xA5, n * 4), "pipe tail sentinel");
+                opt::pfk::Item it{};
+                it.trellis = trellis_d;
+                it.x = x_d;
+                it.input = in;
+                it.output = out;
+                it.bits = bits;
+                it.rows = rows;
+                it.splits = splits;
+                it.gx = out / 128;
+                it.gy = gy;
+                it.row0 = row0;
+                const dim3 grid(it.gx * gy * splits);
+                it.part = a_d;
+                hipLaunchKernelGGL((pipe_tail_ref_kernel<MT>), grid, dim3(128), 0, nullptr, it);
+                hip_ok(hipGetLastError(), (cell + " reference launch").c_str());
+                std::vector<std::uint32_t> ref(n), got(n);
+                hip_ok(hipMemcpy(ref.data(), a_d, n * 4, hipMemcpyDeviceToHost), "pipe tail ref");
+                check_output(ref, "reference");
+                for (const bool packed : {false, true}) {
+                    hip_ok(hipMemset(b_d, 0xA5, n * 4), "pipe tail sentinel");
+                    it.part = b_d;
+                    const char* arm = packed ? "packed" : "scalar";
+                    if (packed) hipLaunchKernelGGL((pipe_tail_new_kernel<MT, true>), grid, dim3(128), 0, nullptr, it);
+                    else hipLaunchKernelGGL((pipe_tail_new_kernel<MT, false>), grid, dim3(128), 0, nullptr, it);
+                    hip_ok(hipGetLastError(), (cell + " " + arm + " launch").c_str());
+                    hip_ok(hipMemcpy(got.data(), b_d, n * 4, hipMemcpyDeviceToHost), "pipe tail got");
+                    check_output(got, arm);
+                    if (std::memcmp(ref.data(), got.data(), n * 4) != 0) {
+                        std::size_t i = 0;
+                        while (ref[i] == got[i]) ++i;
+                        throw std::runtime_error(cell + " " + arm + ": first diff at word " + std::to_string(i));
+                    }
+                    ++cells;
+                }
+                (void)hipFree(a_d);
+                (void)hipFree(b_d);
+            }
+            (void)hipFree(x_d);
+        }
+    return cells;
+}
+
+void test_prefill_pipe_tail() {
+    constexpr unsigned kOut = 256;  // two CTA columns
+    std::mt19937 rng(20261114U);
+    std::size_t cells = 0;
+    for (const unsigned bits : {3U, 4U, 5U, 6U, 8U}) {
+        std::size_t words = 0;
+        switch (bits) {
+            case 3: words = opt::pfk::Norm<3>::kWords; break;
+            case 4: words = opt::pfk::Norm<4>::kWords; break;
+            case 5: words = opt::pfk::Norm<5>::kWords; break;
+            case 6: words = opt::pfk::Norm<6>::kWords; break;
+            default: words = opt::pfk::Norm<8>::kWords; break;
+        }
+        for (const unsigned kIn : {512U, 80U, 16U}) {
+            std::vector<std::uint32_t> w(words * (kIn / 16) * (kOut / 16));
+            for (auto& v : w) v = static_cast<std::uint32_t>(rng());
+            std::uint32_t* w_d = nullptr;
+            hip_ok(hipMalloc(&w_d, w.size() * 4), "pipe tail weights");
+            hip_ok(hipMemcpy(w_d, w.data(), w.size() * 4, hipMemcpyHostToDevice), "pipe tail weights copy");
+            cells += pipe_tail_cells<1>(w_d, bits, kIn, kOut, rng) + pipe_tail_cells<2>(w_d, bits, kIn, kOut, rng) +
+                     pipe_tail_cells<3>(w_d, bits, kIn, kOut, rng) + pipe_tail_cells<4>(w_d, bits, kIn, kOut, rng) +
+                     pipe_tail_cells<5>(w_d, bits, kIn, kOut, rng) + pipe_tail_cells<6>(w_d, bits, kIn, kOut, rng) +
+                     pipe_tail_cells<7>(w_d, bits, kIn, kOut, rng) + pipe_tail_cells<8>(w_d, bits, kIn, kOut, rng);
+            (void)hipFree(w_d);
+        }
+    }
+    hip_ok(hipDeviceSynchronize(), "pipe tail sync");
+    std::printf("test_prefill_pipe_tail: PASS, %zu cells bitwise (partials memcmp vs item_core_v3, NaN padded rows)\n", cells);
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -3182,6 +3325,7 @@ int main(int argc, char** argv) {
                 return argv[++i];
             };
             if (a == "--test") o.test = true;
+            else if (a == "--pipe-tail-test") { test_prefill_pipe_tail(); return 0; }  // synthetic, no model
             else if (a == "--bench") o.bench = true;
             else if (a == "--reps") o.reps = std::stoi(next());
             else if (a == "--iters") o.iters = std::stoi(next());

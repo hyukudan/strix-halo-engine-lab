@@ -119,6 +119,7 @@ and manifests. Unpinned sizes must be read from actual manifests/files; bpw is n
 | Engine | Mirror repository | Upstream source + revision | Files / layout | Size | License notes |
 |---|---|---|---|---|---|
 | Qwen | [Qwen3.8-Flash-Next-GGUF-mirror](https://huggingface.co/hyukudan/Qwen3.8-Flash-Next-GGUF-mirror) | `unsloth/Qwen3.8-Flash-Next-GGUF@38bb39ee` | `UD-Q4_K_XL/*.gguf`, merged as `Qwen3.8-Flash-Next-UD-Q4_K_XL.gguf`; public base `MTP/*.gguf` | Target about 111.33 GB; default distilled sidecar 2,786,568,256 bytes | Qwen Community License; base MTP is not distill-g. |
+| Qwen distill-g MTP head | [Qwen3.8-Flash-Next-MTP-distillG-Q8_0](https://huggingface.co/hyukudan/Qwen3.8-Flash-Next-MTP-distillG-Q8_0) | Distilled from the base `MTP/*.gguf` of `unsloth/Qwen3.8-Flash-Next-GGUF@38bb39ee` | `mtp-Qwen3.8-Flash-Next-shared-distillG-Q8_0.gguf` | 2,786,568,256 bytes, SHA-256 `5516d3ce407783a424315b6a2a0d8b06341665bb3541b98e5db0fe944add4c3c` | Qwen Community License (`LICENSE` in the repository); fetched at revision `1233b2ca` through its `SHA256SUMS`. |
 | Qwen GSQ | [Qwen3.8-Flash-Next-GSQ-hybrid-Q2](https://huggingface.co/hyukudan/Qwen3.8-Flash-Next-GSQ-hybrid-Q2) | `ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF@ed59f920` (unmodified Q2_0 and IQ3_S mirror: [Qwen3.8-Flash-Next-GSQ-RCO-GGUF-mirror](https://huggingface.co/hyukudan/Qwen3.8-Flash-Next-GSQ-RCO-GGUF-mirror)) plus project composition recipe | `hybrid-q2.gguf`; same distilled draft/vocabulary prerequisites | Unpinned | Qwen Community License; separate numerical/quality identity. |
 | Qwen YaRN MTP bundle | Project recipe in this repository | Expanded distill-g pins and explicit 1M budgets | [`recipes/qwen-distill-g-yarn.mtp-bundle.json`](../recipes/qwen-distill-g-yarn.mtp-bundle.json); copy beside the GGUF as `<model>.mtp-bundle.json` | JSON only; sidecar and the `draft-vocab/` directory supplied separately | Preserves draft provenance; calibration caches locally on first use. |
 | DeepSeek pair/RTX | [deepseek-v4.1-flash-gguf-mirror](https://huggingface.co/hyukudan/deepseek-v4.1-flash-gguf-mirror) | `kyuz0/deepseek-v4.1-flash-gguf@20408f69` | `DeepSeek-V4.1-Flash-1017-Q2.gguf`, `DeepSeek-V4.1-Flash-1017-DSpark-MXFP4.gguf` | 365,713,686,528 + 7,966,294,016 bytes | MIT; preserve notices. |
@@ -154,7 +155,9 @@ receipt and state below. Qwen continues to use its separate `draft-vocab/` direc
 For explicit CPU bundle integrity checks, see [release asset verification](operations/release-assets.md).
 
 Qwen additionally requires `mtp-Qwen3.8-Flash-Next-shared-distillG-Q8_0.gguf` and `draft-vocab/`.
-The fetcher explicitly does not supply the locally distilled sidecar; never rename base MTP
+The Qwen fetch recipe downloads the distilled sidecar from [hyukudan/Qwen3.8-Flash-Next-MTP-distillG-Q8_0](https://huggingface.co/hyukudan/Qwen3.8-Flash-Next-MTP-distillG-Q8_0)
+at a pinned revision, verifies it against that repository's `SHA256SUMS`
+(SHA-256 `5516d3ce407783a424315b6a2a0d8b06341665bb3541b98e5db0fe944add4c3c`) and places it beside the model. Never rename base MTP
 as distill-g. Even `plain` precheck requires these assets. RTX additionally needs deployment
 `MODEL.receipt.json` and exported `STATE.bin`, not downloaded or shipped. The receipt binds
 model hash, size and modification time; state must be a valid attention-state export.
@@ -659,7 +662,7 @@ measured by this adapter. Without `drafter-mtp/` the drafter arm is skipped and 
   Kit token exactness and reference candidates remain unavailable for MTP. Prompt lists are accepted.
 - The GLM pair HTTP server (`strix-glm5-serve`, see the [GLM page](models/glm-5.3/README.md#glm-serve)) is not driven
   by the kit yet; GLM RTX exposes a file queue, not this HTTP interface.
-- Default Qwen distill-g and some project assets still need separate publication/supply.
+- Default Qwen distill-g is published ([hyukudan/Qwen3.8-Flash-Next-MTP-distillG-Q8_0](https://huggingface.co/hyukudan/Qwen3.8-Flash-Next-MTP-distillG-Q8_0)) and the Qwen fetch recipe downloads it; some other project assets still need separate publication/supply.
   Full-profile prerequisites remain required for prefill-only/plain-only runs.
 - List/all presence checks are not profile-aware for GSQ. Check does not establish native
   execution or fidelity; skip verification cannot establish model content.

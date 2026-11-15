@@ -373,19 +373,20 @@ int main(int argc, char** argv) {
             }
         }
         if (pf_swap_moe && (opt.world != 2 || pf_gate.empty())) throw std::invalid_argument("--pf-swap-moe needs --world 2 and --pf-gate");
-        const bool startup_handshake = rd::has_config_agreement(opt.world, xch_kind, decode_n > 0, reference_gate, !tf_tokens.empty());
+        const bool startup_handshake = rd::has_config_agreement(opt.world, xch_kind, decode_n > 0, reference_gate,
+                                                                !tf_tokens.empty() || !pf_ttft.empty());
         // FAST glm-pf-wmma-x is a per-rank env switch, checked by the startup agreement (kPfWmmaConfig). Modes without
-        // that handshake (or the --tf config-only agreement) cannot verify that both ranks run the same identity, so FAST is refused there (no new exchange).
+        // that handshake (or the --tf / --pf-ttft config-only agreement) cannot verify that both ranks run the same identity, so FAST is refused there (no new exchange).
         if (opt.world == 2 && !startup_handshake && strix::glm::pf::attn_wmma::enabled())
             throw std::invalid_argument("the FAST attention core (STRIX_GLM_PF_ATTN_WMMA, default with STRIX_GLM_PF_WMMA=1) with --world 2 "
-                                        "needs the startup agreement (--decode N or --tf, comm exchange) so both ranks "
+                                        "needs the startup agreement (--decode N, --tf or --pf-ttft, comm exchange) so both ranks "
                                         "are checked to run the same prefill identity");
         if (opt.world == 2 && !startup_handshake && strix::glm::pf::kda_wmma::enabled())
             throw std::invalid_argument("the FAST KDA projections (STRIX_GLM_PF_KDA_WMMA, default with STRIX_GLM_PF_WMMA=1) with --world 2 "
-                                        "need the startup agreement (--decode N or --tf, comm exchange) so both ranks "
+                                        "need the startup agreement (--decode N, --tf or --pf-ttft, comm exchange) so both ranks "
                                         "are checked to run the same prefill identity");
         if (opt.world == 2 && !startup_handshake && strix::glm::pf::wmma_x::enabled())
-            throw std::invalid_argument("STRIX_GLM_PF_WMMA=1 with --world 2 needs the startup agreement (--decode N or --tf, "
+            throw std::invalid_argument("STRIX_GLM_PF_WMMA=1 with --world 2 needs the startup agreement (--decode N, --tf or --pf-ttft, "
                                         "comm exchange) so both ranks are checked to run the same prefill identity");
         // FAST indexer scores (STRIX_IDX_WMMA) change the DSA selection: the same agreement rule as glm-pf-wmma-x.
         // Unset or exact: WMMA scores with exact rescoring of the cut-off, the pool lists of the exact kernels, so it is
@@ -395,7 +396,7 @@ int main(int argc, char** argv) {
             throw std::invalid_argument("STRIX_IDX_WMMA: GLM takes 0, bf16, f16 or exact (bf16x2 needs BF16 keys)");
         const unsigned idx_wmma = idx_mode == strix::attn_core::idx::kModeExact ? 0U : idx_mode;
         if (opt.world == 2 && !startup_handshake && idx_wmma != 0)
-            throw std::invalid_argument("STRIX_IDX_WMMA with --world 2 needs the startup agreement (--decode N or --tf, comm exchange) "
+            throw std::invalid_argument("STRIX_IDX_WMMA with --world 2 needs the startup agreement (--decode N, --tf or --pf-ttft, comm exchange) "
                                         "so both ranks are checked to run the same indexer identity");
         if (idx_wmma != 0)
             std::printf("rank %u prefill identity glm-idx-wmma FAST (STRIX_IDX_WMMA=%s, DSA indexer scores on WMMA)\n", opt.rank,

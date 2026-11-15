@@ -82,7 +82,7 @@ Every engine's build and launch command: [getting started](docs/getting-started/
 
 | Model | Single / pair | Exact / FAST | Memory | Weights |
 |---|---|---|---|---|
-| Qwen3.8-Flash-Next (UD-Q4_K_XL) | single (2 replicas behind a router) | exact default; `fast` | 111 GB weights on a 128 GB node | [UD-Q4_K_XL GGUF](https://huggingface.co/hyukudan/Qwen3.8-Flash-Next-GGUF-mirror) (mirror of `unsloth`, read as published); Q8_0 MTP draft head distilled locally, not published |
+| Qwen3.8-Flash-Next (UD-Q4_K_XL) | single (2 replicas behind a router) | exact default; `fast` | 111 GB weights on a 128 GB node | [UD-Q4_K_XL GGUF](https://huggingface.co/hyukudan/Qwen3.8-Flash-Next-GGUF-mirror) (mirror of `unsloth`, read as published); [distilled Q8_0 MTP draft head](https://huggingface.co/hyukudan/Qwen3.8-Flash-Next-MTP-distillG-Q8_0) |
 | DeepSeek V4.1 Flash (2-bit experts, 6.5-bit trellis dense) | pair over USB4 | exact default; `fast` | 2 x 128 GB | [expert GGUF](https://huggingface.co/hyukudan/deepseek-v4.1-flash-gguf-mirror), [dense overlay](https://huggingface.co/hyukudan/DeepSeek-V4.1-Flash-1017-strix-dense-U6), [trellis packs](https://huggingface.co/hyukudan/DeepSeek-V4.1-Flash-1017-strix-trellis-EXL3) |
 | MiniMax M3.1 Flash (EXL3 3.06 bpw) | pair TP2 | exact | 2 x 128 GB | [EXL3 3.06 bpw](https://huggingface.co/hyukudan/MiniMax-M3.1-Flash-EXL3-EAQ-v1-3.06-bpw-mirror) (mirror of `Mia-AiLab`, with our EXL3 draft); [draft source](https://huggingface.co/hyukudan/MiniMax-M3.1-Flash-DFlash2-mirror) |
 | GLM-5.3 Flash (EXL3 4.05 bpw) | pair TP2 | exact; opt-in WMMA prefill | 2 x 128 GB | [EXL3 4.05 bpw](https://huggingface.co/hyukudan/GLM-5.3-Flash-exl3-mirror) (mirror of `turboderp`) |
@@ -99,6 +99,26 @@ GLM on one card (draft). See [using a discrete GPU](docs/discrete-gpu.md).
 
 Every switch, its default and when other hardware wants a different value: [toggles](docs/toggles.md).
 
+## Image input
+
+DeepSeek V4.1 on the two-node pair accepts images in OpenAI-style chat completions. Add an `image_url` part to a user
+message. It is off by default: start the server with `--vision <vision GGUF>` on rank 0, together with
+`--prefill-path device`.
+
+```bash
+curl http://localhost:8080/v1/chat/completions -H 'Content-Type: application/json' -d '{
+  "messages": [{"role": "user", "content": [
+    {"type": "text", "text": "Describe this image."},
+    {"type": "image_url", "image_url": {"url": "data:image/png;base64,..."}}]}]}'
+```
+
+Measured on the two-node pair, DeepSeek V4.1 Q2, one 37x23 PNG upscaled to 1550 patches (200 image rows + 21 text
+tokens): first request 1.46-1.87 s to first token (image encode 0.93-1.07 s, 2.0 MB frame to rank 1 in 4-5 ms, LM
+prefill about 0.46 s); the same image again 0.53-0.61 s (embed cache hit); decode 39-41 tok/s.
+
+Limits: PNG and JPEG only; images over the row budget, video, and image requests with `session_id` are refused. Other
+models do not take images yet. Details: [image input](docs/engine/vision.md).
+
 ## How it works
 
 - One shared kernel core: GGUF and EXL3 readers, quantized matrix kernels, attention, the memory planner and the
@@ -112,6 +132,7 @@ Every switch, its default and when other hardware wants a different value: [togg
   20 KB exchange ([pair](docs/pair.md)).
 - Every default has a measured gain and an off switch ([optimizations](docs/optimizations.md)).
 - Adding a model: [docs/engine/adding-a-model.md](docs/engine/adding-a-model.md).
+- Map of the shared cores and which model uses each: [docs/engine/shared-cores.md](docs/engine/shared-cores.md).
 
 ## Documentation
 
@@ -122,7 +143,7 @@ Every switch, its default and when other hardware wants a different value: [togg
 | Pair and serving | [pair](docs/pair.md) · [pair setup](docs/pair-setup.md) · [serving](docs/serving.md) · [discrete GPU](docs/discrete-gpu.md) |
 | Switches | [toggles](docs/toggles.md) · [optimizations](docs/optimizations.md) ([JSON](docs/optimizations.json)) |
 | Numbers | [performance](docs/performance.md) · [measured gains](docs/measured-gains.md) · [methodology](docs/methodology.md) |
-| Internals | [architecture](docs/architecture/README.md) · [decision register](docs/decisions/decision-register.md) · [implementation status](docs/reference/implementation-status.md) · [sources](docs/reference/sources-ledger.md) |
+| Internals | [architecture](docs/architecture/README.md) · [shared cores](docs/engine/shared-cores.md) · [decision register](docs/decisions/decision-register.md) · [implementation status](docs/reference/implementation-status.md) · [sources](docs/reference/sources-ledger.md) |
 | Index | [full documentation index](docs/README.md) · [AGENTS.md](AGENTS.md) |
 
 <a id="related-repositories"></a>

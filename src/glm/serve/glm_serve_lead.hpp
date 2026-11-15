@@ -16,6 +16,7 @@
 #include "glm/serve/glm_serve_import.hpp"
 #include "strix/serve/engine.hpp"
 #include "strix/serve/prefill_interleave.hpp"
+#include "strix/session/prefill_session.hpp"
 #include "glm/serve/glm_session_owner.hpp"
 #include "strix/serve/glm_chat.hpp"
 
@@ -114,6 +115,13 @@ struct LeadConfig {
     // base/whole-prompt calls can exceed it and the engine must split them internally.
     strix::serve::PrefillInterleave interleave;
     unsigned prefill_chunk_cap = 0;
+    // Prefill units (STRIX_GLM_SERVE_PREFILL_UNITS=1; 0 rows = token chunks): an MTP prompt chunked beside decoding
+    // requests runs as one engine session paused at layer boundaries of its pieces of `prefill_units_rows` rows (the
+    // engine's max_rows), `prefill_units_layers` units per piece (strix/session/prefill_session.hpp LayerUnits).
+    std::uint32_t prefill_units_rows = 0;
+    std::uint32_t prefill_units_layers = 45;
+    // Engine admission for all pieces of the remaining prompt; absent means token chunks.
+    std::function<bool(std::uint64_t)> prefill_units_admit;
     // 1: one `prefill-timeline` line per chunked prompt on stderr.
     unsigned prefill_timeline = 0;
     bool prefill_chunk_mtp = true;   // false: MTP-bootstrap prompts are prefilled whole (only plain prompts chunk)
@@ -312,6 +320,10 @@ private:
         double ms_per_token = 0, decode_ms = 0;
         unsigned decode_rounds = 0;
         strix::serve::PrefillTimeline timeline;
+        // prefill units (LeadConfig::prefill_units_rows): one engine session over [done, n), its layer units
+        bool units = false;
+        std::uint64_t units_done = 0, units_total = 0;
+        double ms_per_unit = 0;
     };
 
     void control_turn() {
@@ -514,6 +526,16 @@ private:
     }
     // A cancelled prompt in prefill or waiting for its import: its slot is freed (the next prefill there resets it).
     void drop_prefill(std::optional<Prefilling>& p) {
+        if (p->units) {  // both ranks drop the engine's session (a paused piece holds the row buffers)
+            Control x;
+            x.cmd = static_cast<std::uint32_t>(Cmd::prefill);
+            x.pslot = p->slot;
+            x.ppos = p->done;
+            x.pflags = kPrefillMtp | kPrefillUnits;
+            x.budget = 0;
+            (void)engine_round(x);
+            p->units = false;
+        }
         strix::serve::GenerationStats st;
         st.finish = "cancelled";
         st.prompt_tokens = request(p->a).prompt.size();
@@ -531,27 +553,65 @@ private:
         const auto& prompt = request(p.a).prompt;
         const std::size_t n = prompt.size();
         const unsigned lanes = decoding_count();
-        const auto plan = cfg_.interleave.plan(p.chunk, n - p.done, lanes, cfg_.prefill_chunk_cap, p.ms_per_token);
-        const std::size_t m = plan.tokens;
-        decode_debt_.charge(plan);
-        const bool last = p.done + m == n;
         Control c;
         c.cmd = static_cast<std::uint32_t>(Cmd::prefill);
-        c.resets = p.done == 0 ? 1U << p.slot : 0U;
         c.pslot = p.slot;
-        c.plen = static_cast<std::uint32_t>(m);
         c.ppos = p.done;
-        c.pflags = (p.a.mtp_ok ? kPrefillMtp : 0U) | (last ? kPrefillLast : 0U);
-        std::vector<std::uint32_t> chunk(prompt.begin() + static_cast<std::ptrdiff_t>(p.done),
-                                         prompt.begin() + static_cast<std::ptrdiff_t>(p.done + m));
-        const bool timeline = cfg_.prefill_timeline != 0 && (p.done != 0 || !last);  // chunked prompts only
+        std::size_t m = 0;      // prompt tokens this call completes
+        std::uint64_t u = 0;    // prefill units: layer units of this call
+        bool last = false;
+        std::vector<std::uint32_t> chunk;
+        // Prefill units: an MTP prompt that would be chunked beside decoding requests runs as ONE prefill_mtp session
+        // over the rest of the prompt (pieces of max_rows rows, as the whole-prompt call) paused at layer boundaries.
+        // Each call runs the base chunk's work in layer units of the current piece (LayerUnits::base_units) through
+        // the same pacer; grouping is capped at one base-equivalent: a layer unit has no per-call pass to amortize.
+        // A prompt that fits one base chunk keeps the token call (one call either way).
+        if (p.units || (cfg_.prefill_units_rows != 0 && p.a.mtp_ok && p.chunk != 0 && lanes != 0 && n - p.done > p.chunk &&
+                        cfg_.prefill_units_admit && cfg_.prefill_units_admit(n - p.done))) {
+            const bool start = !p.units;
+            if (start) {
+                const strix::session::LayerUnits lu{n - p.done, cfg_.prefill_units_rows, cfg_.prefill_units_layers};
+                p.units = true;
+                p.units_done = 0;
+                p.units_total = lu.total();
+            }
+            const strix::session::LayerUnits lu{n - p.done, cfg_.prefill_units_rows, cfg_.prefill_units_layers};
+            const std::uint64_t base = lu.base_units(p.chunk, p.units_done);
+            const auto plan = cfg_.interleave.plan(base, p.units_total - p.units_done, lanes, base, p.ms_per_unit);
+            u = plan.tokens;
+            decode_debt_.charge(plan);
+            last = p.units_done + u == p.units_total;
+            m = last ? n - p.done : 0;
+            c.resets = start && p.done == 0 ? 1U << p.slot : 0U;
+            c.plen = start ? static_cast<std::uint32_t>(n - p.done) : 0U;
+            c.budget = static_cast<std::uint32_t>(u);
+            c.pflags = kPrefillMtp | kPrefillUnits | (start ? kPrefillStart : 0U) | (last ? kPrefillLast : 0U);
+            if (start) chunk.assign(prompt.begin() + static_cast<std::ptrdiff_t>(p.done), prompt.end());
+        } else {
+            const auto plan = cfg_.interleave.plan(p.chunk, n - p.done, lanes, cfg_.prefill_chunk_cap, p.ms_per_token);
+            m = plan.tokens;
+            decode_debt_.charge(plan);
+            last = p.done + m == n;
+            c.resets = p.done == 0 ? 1U << p.slot : 0U;
+            c.plen = static_cast<std::uint32_t>(m);
+            c.pflags = (p.a.mtp_ok ? kPrefillMtp : 0U) | (last ? kPrefillLast : 0U);
+            chunk.assign(prompt.begin() + static_cast<std::ptrdiff_t>(p.done), prompt.begin() + static_cast<std::ptrdiff_t>(p.done + m));
+        }
+        const bool timeline = cfg_.prefill_timeline != 0 && (p.done != 0 || !last || p.units);  // chunked prompts only
         strix::serve::PrefillTimeline::Chunk tc;
         control_ms_ = 0;
         const auto t0 = Clock::now();
         const auto out = engine_round(c, &chunk);
         const auto t1 = Clock::now();
         const double chunk_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
-        if (lanes != 0 && m != 0) p.ms_per_token = std::max(chunk_ms / static_cast<double>(m), 1e-9);
+        if (p.units) {
+            if (lanes != 0 && u != 0) p.ms_per_unit = std::max(chunk_ms / static_cast<double>(u), 1e-9);
+            p.units_done += u;
+            if (out.empty() || (out.at(0) == kPrefillPending) == last)
+                throw std::logic_error("prefill units: the engine's completion differs from the lead's unit arithmetic");
+        } else if (lanes != 0 && m != 0) {
+            p.ms_per_token = std::max(chunk_ms / static_cast<double>(m), 1e-9);
+        }
         if (timeline) {
             tc.tokens = static_cast<std::uint32_t>(m);
             tc.decoding = lanes;
@@ -856,6 +916,9 @@ private:
             return import_fallback(false, mine == failed ? "rank0_staging_failed" : peer == failed ? "rank1_staging_failed"
                                           : rtx_down    ? "rtx_unavailable"
                                                         : "timeout");
+        // Keep receiving/reporting while another prompt owns the engine session, even between pieces.
+        // The import's suffix starts a new prefill session; only the lead may order that on both ranks.
+        if (pf_ && pf_->units) return;
         commit_import(waited);
     }
 

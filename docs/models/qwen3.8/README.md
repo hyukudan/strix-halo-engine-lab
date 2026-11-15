@@ -15,7 +15,7 @@ instructions: [getting started](../../getting-started/README.md).
 
 **Weights:** [hyukudan/Qwen3.8-Flash-Next-GGUF-mirror](https://huggingface.co/hyukudan/Qwen3.8-Flash-Next-GGUF-mirror) (mirror of `unsloth/Qwen3.8-Flash-Next-GGUF`): the engine reads the
 `UD-Q4_K_XL` GGUF as published, merged into one file; opt-in levers only add device copies at load. The distilled
-Q8_0 MTP draft head is built locally and not published (the mirror's base `MTP/*.gguf` is a different head).
+Q8_0 MTP draft head is published at [hyukudan/Qwen3.8-Flash-Next-MTP-distillG-Q8_0](https://huggingface.co/hyukudan/Qwen3.8-Flash-Next-MTP-distillG-Q8_0) (the mirror's base `MTP/*.gguf` is a different head).
 Files and revisions: [reproduce](../../reproduce.md#models-and-provenance).
 
 Recommended run: the plain command selects the production defaults, 256 tokens.
