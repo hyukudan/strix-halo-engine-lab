@@ -317,8 +317,8 @@ class Case(unittest.TestCase):
             self.assertEqual(p["rule"], "KL <= 0.02, top-1 >= 0.93, dNLL <= 0.01")
             self.assertEqual((p["dnll_rule"]["rule"], p["dnll_rule"]["limit"], p["dnll_rule"]["nulls"]), ("abs", 0.01, []))
 
-    def turbo(self, t_logits, r_logits, *extra, r_sha="B", t_sha="A", declare=True, with_r=True):
-        e, _ = self.arm("E", "e1", select=False, model_sha="A")
+    def turbo(self, t_logits, r_logits, *extra, r_sha="b" * 64, t_sha="a" * 64, declare=True, with_r=True):
+        e, _ = self.arm("E", "e1", select=False, model_sha="a" * 64)
         t, _ = self.arm("T", "t1", t_logits, select=False, model_sha=t_sha)
         args = ["--mode", "turbo"]
         if with_r:
@@ -327,6 +327,48 @@ class Case(unittest.TestCase):
             if declare:
                 args += ["--reference-sha", r_sha]
         return self.cmp(e, t, *args, *extra)
+
+    def test_turbo_requires_known_pack_identities(self):
+        e, erc = self.arm("E", "e1", select=False)
+        t, trc = self.arm("T", "t1", select=False)
+        r, rrc = self.arm("R", "r1", select=False)
+        self.assertEqual(erc + trc + rrc, [0] * 6)
+        self.assertEqual(self.cmp(e, t, "--mode", "turbo", "--reference-pack-arm", str(r)), 2)
+        for value in (None, "", "A", "g" * 64, 42):
+            with self.subTest(sha=value), self.assertRaises(g.GateError):
+                g.arm_sha([{"model_sha": value}])
+        with self.assertRaises(g.GateError):
+            g.arm_sha([{"model_sha": "a" * 64}, {}])
+        self.assertEqual(g.arm_sha([{"execution": {"model_sha256": "A" * 64}}]), "a" * 64)
+        self.assertEqual(g.arm_sha([{"model_sha": "a" * 64, "execution": {"model_sha256": "A" * 64}}]), "a" * 64)
+
+    def test_turbo_rejects_declared_witness_sha_conflict(self):
+        e, _ = self.arm("E", "e1", select=False, witness="exact", model_sha="b" * 64)
+        t, _ = self.arm("T", "t1", select=False, witness="exact", model_sha="b" * 64)
+        r, _ = self.arm("R", "r1", select=False, witness="exact", model_sha="b" * 64)
+        self.assertEqual(self.cmp(e, t, "--mode", "turbo", "--reference-pack-arm", str(r)), 2)
+        with self.assertRaises(g.GateError):
+            g.arm_sha([{"model_sha": "b" * 64, "execution": {"model_sha256": "a" * 64}}])
+
+    def test_turbo_absolute_task_failures_without_task_reference(self):
+        e, _ = self.arm("E", "e1", select=False, model_sha="a" * 64)
+        t, _ = self.arm("T", "t1", select=False, model_sha="a" * 64)
+        r, _ = self.arm("R", "r1", select=False, model_sha="a" * 64)
+        path, receipt = self.root / "tasks.json", self.root / "receipt.json"
+        args = ["--mode", "turbo", "--reference-pack-arm", str(r), "--task-results", str(path), "--receipt", str(receipt)]
+        for category in ("json", "code", "math", "retrieval", "tools"):
+            task = {"name": "case", "category": category, "E": {"passed": 10, "total": 10},
+                    "T": {"passed": 0, "total": 10}}
+            with self.subTest(category=category):
+                path.write_text(json.dumps({"tasks": [task]}), encoding="utf-8")
+                self.assertEqual(self.cmp(e, t, *args), 1)
+                doc = json.loads(receipt.read_text(encoding="utf-8"))
+                self.assertEqual(doc["verdict"], "FAIL")
+                self.assertTrue(any(category in name for name in doc["failing"]))
+                self.assertFalse(any(c["name"].endswith(":vs-R") for c in doc["checks"]))
+                task["T"]["passed"] = 10
+                path.write_text(json.dumps({"tasks": [task]}), encoding="utf-8")
+                self.assertEqual(self.cmp(e, t, *args), 3)
 
     def test_turbo_pass_fail_and_no_reference(self):
         near = self.logits + self.rng.normal(scale=1e-2, size=self.logits.shape).astype("<f4")
@@ -340,23 +382,23 @@ class Case(unittest.TestCase):
         near = self.logits + self.rng.normal(scale=1e-2, size=self.logits.shape).astype("<f4")
         self.assertEqual(self.turbo(near, self.noisy(2.0, 5), declare=False), 2)
         self.tearDown(); self.setUp()
-        e, _ = self.arm("E", "e1", select=False, model_sha="A")
-        t, _ = self.arm("T", "t1", near, select=False, model_sha="A")
-        r, _ = self.arm("R", "r1", self.noisy(2.0, 5), select=False, model_sha="B")
+        e, _ = self.arm("E", "e1", select=False, model_sha="a" * 64)
+        t, _ = self.arm("T", "t1", near, select=False, model_sha="a" * 64)
+        r, _ = self.arm("R", "r1", self.noisy(2.0, 5), select=False, model_sha="b" * 64)
         base = ["--mode", "turbo", "--reference-pack-arm", str(r)]
-        self.assertEqual(self.cmp(e, t, *base, "--reference-sha", "C"), 2)
+        self.assertEqual(self.cmp(e, t, *base, "--reference-sha", "c" * 64), 2)
         buf = io.StringIO()
         with contextlib.redirect_stderr(buf), contextlib.redirect_stdout(io.StringIO()):
-            g.main(["compare", str(e), str(t), "--ranks", "0", "1", "--tokens", f"p={self.tok}", *base, "--reference-sha", "C"])
-        self.assertIn("C", buf.getvalue())
-        self.assertIn("B", buf.getvalue())
-        self.assertEqual(self.cmp(e, t, *base, "--reference-sha", "B"), 0)
+            g.main(["compare", str(e), str(t), "--ranks", "0", "1", "--tokens", f"p={self.tok}", *base, "--reference-sha", "c" * 64])
+        self.assertIn("c" * 64, buf.getvalue())
+        self.assertIn("b" * 64, buf.getvalue())
+        self.assertEqual(self.cmp(e, t, *base, "--reference-sha", "b" * 64), 0)
 
     def test_turbo_candidate_sha_must_be_declared(self):
         near = self.logits + self.rng.normal(scale=1e-2, size=self.logits.shape).astype("<f4")
-        self.assertEqual(self.turbo(near, self.noisy(2.0, 5), t_sha="T2"), 2)
+        self.assertEqual(self.turbo(near, self.noisy(2.0, 5), t_sha="d" * 64), 2)
         self.tearDown(); self.setUp()
-        self.assertEqual(self.turbo(near, self.noisy(2.0, 5), "--candidate-sha", "T2", t_sha="T2"), 0)
+        self.assertEqual(self.turbo(near, self.noisy(2.0, 5), "--candidate-sha", "d" * 64, t_sha="d" * 64), 0)
 
     def test_task_results_wilson_and_verdict(self):
         lo, hi = g.wilson(8, 10)
@@ -400,7 +442,7 @@ class Case(unittest.TestCase):
         self.assertEqual(rc["schema"], "strix-turbo-receipt/v1")
         self.assertEqual(rc["routes"]["effective_config"], ["route=a", "route=b"])
         self.assertEqual(rc["hardware"]["gpu_clock_mhz"], 2900)
-        self.assertEqual((rc["pack"]["R_sha"], rc["pack"]["calibration"]), ("B", "cal1"))
+        self.assertEqual((rc["pack"]["R_sha"], rc["pack"]["calibration"]), ("b" * 64, "cal1"))
         self.assertEqual(rc["performance"]["tok_s"], 12.5)
         self.assertEqual(rc["performance"]["missing"], ["bytes_per_token", "ttft_ms", "p95_ms"])
 

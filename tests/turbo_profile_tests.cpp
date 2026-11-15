@@ -163,6 +163,10 @@ void weights_toggle() {
     require(native.cache_namespace() != onfly.cache_namespace(), "weight sources never share a cache namespace");
     require(native.fingerprint() != onfly.fingerprint(), "weight sources never agree between ranks");
     const auto pending = through({"--profile", "turbo", "--turbo-weights", "onfly"}, {});
+    require(!throws([&] {
+        require(!p::exports(pending, std::map<std::string, std::string>{}).empty() &&
+                pending.describe().find("onfly") != std::string::npos, "pending weight proposal contains exports and reason");
+    }), "pending weights remain inspectable as a pure export proposal");
     require(throws([&] { p::apply(pending, [](const char*, const char*) { return true; }); }),
             "apply refuses an unhonoured weight request");
 }
@@ -172,6 +176,14 @@ void cache_keys() {
                   "hip-gfx1151;lineage=ep"};
     require(k.complete() && t::may_reuse(k, k), "a complete identical key may reuse");
     auto other = k;
+    auto delimited = k;
+    delimited.order = "a;state=b";
+    delimited.state = "c";
+    other.order = "a";
+    other.state = "b;state=c";
+    require(!t::may_reuse(delimited, other) && delimited.text() != other.text() && delimited.id() != other.id(),
+            "delimiters in adjacent fields cannot alias complete cache keys");
+    other = k;
     other.profile = "fast";
     require(!t::may_reuse(k, other) && k.id() != other.id(), "caches never cross profiles");
     for (auto field : {&t::CacheKey::model, &t::CacheKey::weights_sha, &t::CacheKey::levers, &t::CacheKey::weights,
@@ -185,10 +197,10 @@ void cache_keys() {
     }
     require(!t::may_reuse(k, k.drafter()) && k.drafter().text().find("role=drafter") != std::string::npos,
             "drafter caches are separate from the target's");
-    // Verified (speculative) decode uses the serial TURBO target key: the verifier's state is the serial run's.
+    // Key mechanics only: this does not exercise a speculative engine or establish its cache correctness.
     const auto serial = k, verified = k;
     require(t::may_reuse(serial, verified) && !t::may_reuse(serial.drafter(), verified),
-            "verified decode shares the serial TURBO target key, not the drafter's");
+            "identical target keys share, while their drafter keys remain separate");
     require(t::drafter_namespace("turbo=x").find("role=drafter") != std::string::npos && t::drafter_namespace("").empty(),
             "drafter namespace derives from the target's");
     const std::map<std::string, std::string> vars{{"STRIX_TURBO_CACHE_NS", "turbo=q"}};
@@ -197,7 +209,7 @@ void cache_keys() {
 }
 
 void rank_agreement_and_one_resolution() {
-    // The CLI (rank) and the serve front end spell the same request differently; the one resolver must agree.
+    // Parser spelling equivalence only; actual CLI/serve front ends are not exercised by this fixture.
     const std::map<std::string, std::string> vars{{"T_DENSE", "1"}};
     const auto cli = through({"--profile", "turbo", "--flash", "0", "--turbo-weights", "native"}, vars);
     const auto serve = through({"--turbo-weights=native", "--flash=0", "--profile=turbo"}, vars);

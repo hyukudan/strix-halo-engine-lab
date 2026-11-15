@@ -866,25 +866,45 @@ def wilson(passed, total, z=Z95):
     return [max(0.0, centre - half), min(1.0, centre + half)]
 
 
+def checked_model_sha(sha):
+    if not isinstance(sha, str) or len(sha) != 64 or any(c not in "0123456789abcdefABCDEF" for c in sha):
+        raise GateError("TURBO requires a nonempty SHA-256 model digest for every participating rank")
+    return sha.lower()
+
+
 def arm_sha(manifests):
-    """The weights/pack sha an arm's seal records (--model-sha, else the execution witness model_sha256), or None."""
-    shas = {m.get("model_sha") or (m.get("execution") or {}).get("model_sha256") for m in manifests}
+    """Require a consistent, known weights identity for every rank of a TURBO arm."""
+    shas = set()
+    for m in manifests:
+        declared = m.get("model_sha")
+        witnessed = (m.get("execution") or {}).get("model_sha256")
+        for sha in (declared, witnessed):
+            if sha is not None:
+                checked_model_sha(sha)
+        if declared is not None and witnessed is not None and declared.lower() != witnessed.lower():
+            raise GateError("declared model sha disagrees with execution witness model_sha256")
+        shas.add(checked_model_sha(declared or witnessed))
     if len(shas) != 1:
         raise GateError("ranks of one arm record different model shas")
     return shas.pop()
 
 
 def check_pack_shas(sha_e, sha_t, sha_r, a):
+    sha_e, sha_t = checked_model_sha(sha_e), checked_model_sha(sha_t)
+    if a.reference_pack_arm:
+        sha_r = checked_model_sha(sha_r)
+    candidate_sha = checked_model_sha(a.candidate_sha) if a.candidate_sha is not None else None
+    reference_sha = checked_model_sha(a.reference_sha) if a.reference_sha is not None else None
     if a.reference_sha and not a.reference_pack_arm:
         raise GateError("--reference-sha without --reference-pack-arm")
     if sha_t != sha_e and not a.candidate_sha:
         raise GateError(f"candidate sha {sha_t} differs from the reference E sha {sha_e} and --candidate-sha does not declare it")
-    if a.candidate_sha and a.candidate_sha != sha_t:
+    if candidate_sha and candidate_sha != sha_t:
         raise GateError(f"--candidate-sha {a.candidate_sha} does not match the candidate seal {sha_t}")
     if a.reference_pack_arm:
         if sha_r != sha_e and not a.reference_sha:
             raise GateError(f"reference pack sha {sha_r} differs from E sha {sha_e} and --reference-sha does not declare it")
-        if a.reference_sha and a.reference_sha != sha_r:
+        if reference_sha and reference_sha != sha_r:
             raise GateError(f"--reference-sha {a.reference_sha} does not match the reference pack seal {sha_r}")
 
 
@@ -951,13 +971,15 @@ def task_summary(tasks):
 def task_checks(summary, limits):
     checks = []
     for cat, row in summary.items():
-        if cat == "overall" or row["R"] is None:
+        if cat == "overall":
             continue
         e, t, r = row["E"], row["T"], row["R"]
-        drop_t, drop_r = e["rate"] - t["rate"], e["rate"] - r["rate"]
-        overlap = t["wilson95"][1] >= r["wilson95"][0] and r["wilson95"][1] >= t["wilson95"][0]
-        checks.append({"name": f"task:{cat}:vs-R", "value": drop_t, "limit": drop_r,
-                       "pass": drop_t <= drop_r or overlap, "overlap": overlap})
+        drop_t = e["rate"] - t["rate"]
+        if r is not None:
+            drop_r = e["rate"] - r["rate"]
+            overlap = t["wilson95"][1] >= r["wilson95"][0] and r["wilson95"][1] >= t["wilson95"][0]
+            checks.append({"name": f"task:{cat}:vs-R", "value": drop_t, "limit": drop_r,
+                           "pass": drop_t <= drop_r or overlap, "overlap": overlap})
         if cat in limits:
             checks.append({"name": f"task:{cat}:drop-vs-E", "value": drop_t * 100, "limit": limits[cat],
                            "pass": drop_t * 100 <= limits[cat] + 1e-9})
@@ -982,6 +1004,7 @@ def compare_turbo(a):
     nulls = []
     for nd in a.null_arm or []:
         dn, mn = load_arm(nd, ranks)
+        arm_sha(mn)  # Null controls also need known, consistent pack identities.
         nulls.append((dn, mn))
         others.append((f"null arm {nd}", mn))
     for label, m in others:

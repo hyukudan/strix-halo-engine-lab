@@ -413,7 +413,7 @@ inline bool applied(Status status) {
 template <class Keys>
 inline std::vector<std::pair<std::string, std::string>> exports(const Resolution& resolution, const Keys& canonical) {
     std::vector<std::pair<std::string, std::string>> out;
-    resolution.weights.require_honoured();  // as apply(): an unhonoured weight request never runs
+    // Pure proposal: inspection may describe a pending weight request. Execution uses apply().
     for (const auto& e : resolution.entries)
         if (!e.lever->env.empty() && (applied(e.status) || canonical.contains(std::string(e.lever->env))))
             out.emplace_back(std::string(e.lever->env), e.value);

@@ -298,9 +298,16 @@ Per row, U95(KL_T-KL_R), U95(disagreement_T-disagreement_R) and U95(dNLL_T-dNLL_
 paired rows). Optional absolute safety limits: `--turbo-max-kl`, `--turbo-min-top1`, `--turbo-max-dnll`. `--null-arm`
 controls are measured against E and reported (not a verdict input).
 
+The normal-approximation intervals treat sampled rows (and paired T-minus-R differences) as independent
+observations with finite variance and enough samples for the approximation. Tokens within a prompt may be
+correlated, making these intervals overconfident; they do not establish prompt-level uncertainty or model
+qualification. Such claims require independently sampled prompts and prompt-level resampling or another
+validated treatment of clustering. Task Wilson intervals likewise assume independent Bernoulli trials.
+
 Pack identity: `seal --model-sha SHA` records the weights/pack sha (else the execution witness `model_sha256` is used).
 E and T must share it unless `--candidate-sha` declares T's; R may differ from E only with `--reference-sha` equal to R's
-sealed value. An undeclared or mismatching sha is an error (exit 2, both shas named).
+sealed value. Every participating rank, including null controls, needs a valid SHA-256 digest. A declared digest
+must agree with an available execution witness. Missing, invalid, undeclared or mismatching identities are errors (exit 2).
 
 `--task-results JSON`: `{"tasks":[{"name":"t1","category":"code|math|retrieval|tools|json|prose","E":{"passed":8,"total":10},"T":{...},"R":{...}}]}`.
 Per category and overall the receipt carries passed/total/rate and a Wilson 95 % interval per arm. Checks per category:

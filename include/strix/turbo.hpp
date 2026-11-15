@@ -68,6 +68,15 @@ struct WeightsRequest {  // explicit CLI spellings (take_options fills it)
     std::optional<std::string> source{}, bits{}, pack{};
 };
 
+inline bool has_weight_request(const WeightsRequest& request, const Env& env) {
+    if (request.source || request.bits || request.pack) return true;
+    for (const auto key : {kWeightsEnv, kBitsEnv, kPackEnv}) {
+        const char* value = env ? env(key.data()) : nullptr;
+        if (value != nullptr && *value != 0) return true;
+    }
+    return false;
+}
+
 struct Weights {
     Source requested = Source::native, effective = Source::native;
     unsigned requested_bits = 0, effective_bits = 0;  // 0: the pack's own widths (native)
@@ -166,11 +175,12 @@ struct CacheKey {
     CacheRole role = CacheRole::target;
 
     [[nodiscard]] std::string text() const {
-        std::string out = "strix-cache-key/v1;";
+        std::string out = "strix-cache-key/v2;";
         const std::pair<const char*, const std::string*> fields[] = {
             {"model", &model}, {"weights_sha", &weights_sha}, {"profile", &profile}, {"levers", &levers},
             {"weights", &weights}, {"order", &order}, {"state", &state}, {"rotary", &rotary}, {"backend", &backend}};
-        for (const auto& [k, v] : fields) out += std::string(k) + "=" + (v->empty() ? std::string("?") : *v) + ";";
+        for (const auto& [k, v] : fields)
+            out += std::string(k) + "=" + std::to_string(v->size()) + ":" + *v + ";";
         return out + "role=" + (role == CacheRole::target ? "target" : "drafter") + ";";
     }
     [[nodiscard]] std::uint64_t id() const { return host_fnv::field(host_fnv::offset64, text()); }
@@ -181,9 +191,10 @@ struct CacheKey {
         return true;
     }
     [[nodiscard]] CacheKey drafter() const { CacheKey k = *this; k.role = CacheRole::drafter; return k; }
+    bool operator==(const CacheKey&) const = default;
 };
 inline bool may_reuse(const CacheKey& stored, const CacheKey& wanted) {
-    return stored.complete() && wanted.complete() && stored.text() == wanted.text();
+    return stored.complete() && wanted.complete() && stored == wanted;
 }
 
 // Namespace text of a TURBO run that the engines' existing cache-key builders append (prefix, session): versioned

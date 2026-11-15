@@ -485,6 +485,7 @@ Effective::Effective(App app, int& argc, char**& argv, const Build& build) {
         return out;
     };
     auto r = resolve(app, in, [](const char* n) { return static_cast<const char*>(std::getenv(n)); }, probe, build);
+    if (!r.print_only && r.profile) r.profile->weights.require_honoured();
     for (const auto& [k, v] : r.set_env) {
 #ifdef _WIN32
         _putenv_s(k.c_str(), v.c_str());
