@@ -170,8 +170,9 @@ Refused with exit 2 (no verdict): fewer than three nulls, a null whose binary di
 candidate's, whose prompts or token files differ, or whose run id repeats the reference, the
 candidate or another null; `--null-arm` without `--dnll-rule floor`; floor with
 `--expect-identical`; and any `--engine` / `--profile` pair that `DNLL_POLICY` in the script does not
-grant the floor rule. Today the table holds one entry, `ds41` / `fast-prefill`; every other engine and
-profile keeps the absolute dNLL <= 0.01 (the default, unchanged). Widening the table is a policy
+grant the floor rule. Today the table holds two entries, `ds41` / `fast-prefill` and `minimax` /
+`fast-prefill` (next section); every other engine and profile keeps the absolute dNLL <= 0.01 (the
+default, unchanged). Widening the table is a policy
 decision. Under the floor rule the report prints and records (`pooled.dnll_rule` in `--json`) the
 rule, engine, profile, each null (run id, arm, env, rows, KL, top-1, dNLL), mean, sd, the limit and
 the absolute 0.01 verdict as a reference column; with the default rule `pooled.dnll_rule` records
@@ -221,6 +222,56 @@ Mean plus two sample standard deviations from three controls is an empirical
 policy threshold, not a confidence bound or model-fidelity result. Synthetic
 host tests establish validation and arithmetic only; compiler, native execution,
 model fidelity and complete-workload qualification remain separate gates.
+
+### Onset-matched floor (MiniMax FAST prefill)
+
+```sh
+python tools/strix-gate/fast_logit_gate.py compare EXACT CAND --ranks 0 1 --tokens ... \
+    --dnll-rule floor --engine minimax --profile fast-prefill --null-arm N1 --null-arm N2 --null-arm N3
+```
+
+On MiniMax one fp16-surviving ulp anywhere flips near-tie block selections (top-16) and expert
+routes (top-4 of 128), so a layer-0 null already lands at KL ~0.5, top-1 ~88 % and a dNLL that
+swings by +-0.1 between seeds: a floor built on it would pass anything. The rule therefore matches
+the null to the candidate: each null is a one-ulp change of the attention output (the tensor MSA
+flash replaces) at the candidate's FIRST FAST layer, and the gate checks the null's control layer
+against the candidate's witnessed layer set. With >= 3 such nulls (distinct seeds, same binary,
+prompts and reference) the candidate must pass all of (`MM_FLOOR` in the script):
+
+| check | rule |
+|---|---|
+| `kl`, `top1` | pooled KL <= mean + 2 sd of the nulls; top-1 >= mean - 2 sd |
+| `dnll` | pooled dNLL <= min(mean + 2 sd, 0.03): a wide floor never relaxes the bar past 3 x 0.01 |
+| `kl_q50`, `kl_q90`, `kl_q99` | each per-row KL quantile <= mean + 2 sd of the nulls' same quantile (a diffuse shift cannot hide under heavy null tails) |
+| `sign` | rows with abs(dNLL) >= 1e-3: one-sided binomial P(X >= worse) >= 0.01 against p0 = max(0.5, pooled null worse share); more chaos adds rows, not slack |
+| `copy` | copy rows (the last 8 prompt tokens occurred earlier and were followed by the true token; token-only, the same rows for every arm): next-token misses beyond the reference's <= worst null + max(1, ceil(1 %)) |
+
+The absolute KL / top-1 / dNLL verdict is printed and stored (`pooled.abs_pass`) as a reference.
+The candidate must differ from the reference only in its FAST layer set: its `base_config_sha256`
+(numerical configuration without the MSA flash lever and switches) must equal the reference's.
+Mean + 2 sd of three controls is a policy threshold, not a bound: a candidate drawn exactly like
+the nulls fails one such check about 11 % of the time (t with 2 degrees of freedom).
+
+### Witness producer: `witness`
+
+```sh
+python3 fast_logit_gate.py witness --dir RUN --rank R --run-id ID --binary BIN --rows 256 --select \
+    --attest sel_mode=4 --prompt NAME=TOKENS.u32 --engine minimax --engine-log RUN/rR.log --model MODEL_DIR \
+    --out RUN/execution-rR.json
+python3 fast_logit_gate.py seal ... --execution-witness RUN/execution-rR.json
+```
+
+Run by the launcher on the rank's node after the engine exits. The MiniMax adapter reads the
+rank's process route receipt (`strix-route-receipt {...}`): engine; profile `exact` (MSA flash
+off, EXL3, default prefill identity), `fast-prefill` (MSA flash on, otherwise the same) or
+`other`; `fast` = MSA flash mode (10 + `STRIX_MM_PF_MSA_FLASH`: 11 one-term, 12 two-term) and
+layers; `numerical_config_sha256` over the effective levers and switch set without output-only
+switches; `base_config_sha256` the same without the MSA flash lever and switches. The control
+comes only from the engine's own null-control lines (`DIAG attn ulp: layer L seed S ...`, a lab
+diagnostic build): one layer and seed, at least one event per prompt, otherwise refused.
+`model_sha256` is the ordered model bundle without re-reading tensor payloads: every file's path
+and size, the safetensors headers and the full bytes of files <= 64 MiB. The prompts map is the
+one `seal` computes. Same trust boundary as above: launcher statements, not proofs.
 
 When both arms carry selection dumps (`PREFIX-<prompt>-sel-r<rank>.u32`; MiniMax writes them
 with `STRIX_MM_QUALITY_SELECT=1` next to `STRIX_MM_QUALITY_OUT`), `compare` also reports, per
