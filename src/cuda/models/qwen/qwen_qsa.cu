@@ -42,8 +42,11 @@ void check(cudaError_t e, const char* what) {
 constexpr unsigned kIdxRows = 8, kIdxOuts = 4, kIdxOutputs = kIndexQWidth + kIndexDim, kIdxSlice = 64;
 constexpr unsigned kIdxPairs = kIdxRows * kIdxOuts;  // 32
 constexpr std::size_t kIdxSmem = kIdxRows * kHidden * sizeof(std::uint16_t) + kIdxPairs * 256U * sizeof(float);
-static_assert(kIdxSlice % kIdxOuts == 0 && kIdxOutputs % kIdxSlice == 0);
+// Decode form (rows <= 8): kIdxWide outputs per CTA (same per-output arithmetic), 640/kIdxWide CTAs instead of 10.
+constexpr unsigned kIdxWide = 4;
+static_assert(kIdxSlice % kIdxOuts == 0 && kIdxOutputs % kIdxSlice == 0 && kIdxWide % kIdxOuts == 0 && kIdxOutputs % kIdxWide == 0);
 
+template <unsigned kSlice>
 __global__ __launch_bounds__(256) void indexer_kernel(const std::uint16_t* __restrict__ hidden, std::uint32_t rows,
     const std::uint16_t* __restrict__ wq, const std::uint16_t* __restrict__ wk, float* __restrict__ iq, float* __restrict__ ik) {
     extern __shared__ __align__(16) unsigned char smem[];
@@ -59,7 +62,7 @@ __global__ __launch_bounds__(256) void indexer_kernel(const std::uint16_t* __res
         for (unsigned i = t; i < total; i += 256U) dst[i] = i < n ? src[i] : make_uint4(0, 0, 0, 0);
     }
     __syncthreads();
-    for (unsigned o0 = blockIdx.y * kIdxSlice; o0 < (blockIdx.y + 1U) * kIdxSlice; o0 += kIdxOuts) {
+    for (unsigned o0 = blockIdx.y * kSlice; o0 < (blockIdx.y + 1U) * kSlice; o0 += kIdxOuts) {
         float w[kIdxOuts][10];
 #pragma unroll
         for (unsigned oo = 0; oo < kIdxOuts; ++oo) {
@@ -748,6 +751,93 @@ __global__ __launch_bounds__(kOutThreads) void attention_output_head_kernel(cons
     attention_output_head_kernel_body(q_gate, first_position, all_selected, kv, all_scores, output, tables);
 }
 
+// STRIX_QRTX_QSA_HEAD (default 1): same per-thread chains (s0/s1 = fma(w[slot], v, s), slots ascending from 0) and epilogue as the
+// body above, but the V rows (512 B per slot for this KV head) are streamed by cp.async into a ring of 7 stages x 8 slots
+// (6 stages in flight, one __syncthreads per stage) and the scores/tokens of every slot are preloaded once, so the walk over the
+// slots no longer pays one L2 round trip per 8 slots. Static smem 45 KB.
+constexpr unsigned kPipeKeys = 8, kPipeStages = 7, kVRowBytes = kHeadDim * 2U;
+__device__ __forceinline__ void qsa_cp16(void* dst, const void* src) {
+    const auto d = static_cast<unsigned>(__cvta_generic_to_shared(dst));
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" ::"r"(d), "l"(src) : "memory");
+}
+__device__ __forceinline__ void qsa_cp_commit() { asm volatile("cp.async.commit_group;\n" ::: "memory"); }
+template <int N>
+__device__ __forceinline__ void qsa_cp_wait() { asm volatile("cp.async.wait_group %0;\n" ::"n"(N) : "memory"); }
+__device__ __forceinline__ void attention_output_head_pipe_body(const float* __restrict__ q_gate,
+    std::uint64_t first_position, const std::uint32_t* __restrict__ all_selected, const std::uint16_t* __restrict__ kv,
+    const float* __restrict__ all_scores, float* __restrict__ output, am::Tables tables) {
+    __shared__ __align__(16) unsigned char ring[kPipeStages * kPipeKeys * kVRowBytes];
+    __shared__ float ws[kMaxSelected];
+    __shared__ std::uint32_t tok[kMaxSelected];
+    const auto head = blockIdx.x, r = blockIdx.y, t = threadIdx.x, kvh = head / kG;
+    const auto count = selected_count(first_position + r);
+    const std::uint32_t* selected = all_selected + static_cast<std::uint64_t>(r) * kMaxSelected;
+    const float* scores = all_scores + (static_cast<std::uint64_t>(r) * kHeads + head) * kMaxSelected;
+    const std::uint16_t* vsrc = kv + kKvWidth + kvh * kHeadDim;
+    for (unsigned i = t; i < count; i += kOutThreads) { ws[i] = scores[i]; tok[i] = selected[i]; }
+    __syncthreads();
+    const unsigned nst = (count + kPipeKeys - 1U) / kPipeKeys;
+    auto issue = [&](unsigned st) {
+        if (st < nst) {
+            unsigned char* slot = ring + (st % kPipeStages) * kPipeKeys * kVRowBytes;
+            for (unsigned j = t; j < kPipeKeys * 32U; j += kOutThreads) {
+                const unsigned b = j >> 5U, key = st * kPipeKeys + b;
+                if (key < count) qsa_cp16(slot + b * kVRowBytes + (j & 31U) * 16U, vsrc + static_cast<std::uint64_t>(tok[key]) * (kKvWidth * 2ULL) + (j & 31U) * 8U);
+            }
+        }
+        qsa_cp_commit();
+    };
+#pragma unroll
+    for (unsigned s = 0; s + 1U < kPipeStages; ++s) issue(s);
+    float s0 = 0.0F, s1 = 0.0F;
+    for (unsigned st = 0; st < nst; ++st) {
+        qsa_cp_wait<static_cast<int>(kPipeStages) - 2>();
+        __syncthreads();
+        issue(st + kPipeStages - 1U);
+        const unsigned char* slot = ring + (st % kPipeStages) * kPipeKeys * kVRowBytes + 4U * t;
+        const unsigned n = min(kPipeKeys, count - st * kPipeKeys);
+        if (n == kPipeKeys) {
+#pragma unroll
+            for (unsigned b = 0; b < kPipeKeys; ++b) {
+                const auto raw = *reinterpret_cast<const std::uint32_t*>(slot + b * kVRowBytes);
+                const float w = ws[st * kPipeKeys + b];
+                s0 = __fmaf_rn(w, __uint_as_float(raw << 16U), s0);
+                s1 = __fmaf_rn(w, __uint_as_float(raw & 0xffff0000U), s1);
+            }
+        } else {
+            for (unsigned b = 0; b < n; ++b) {
+                const auto raw = *reinterpret_cast<const std::uint32_t*>(slot + b * kVRowBytes);
+                const float w = ws[st * kPipeKeys + b];
+                s0 = __fmaf_rn(w, __uint_as_float(raw << 16U), s0);
+                s1 = __fmaf_rn(w, __uint_as_float(raw & 0xffff0000U), s1);
+            }
+        }
+    }
+    const float* qg = q_gate + static_cast<std::uint64_t>(r) * kQGateWidth;
+    float* out = output + static_cast<std::uint64_t>(r) * kAttnWidth;
+#pragma unroll
+    for (unsigned e = 0; e < 2U; ++e) {
+        const auto f = 2U * t + e;
+        const float attn = round_bf16(e ? s1 : s0);
+        const float g = qg[static_cast<std::uint64_t>(head) * kHeadDim * 2ULL + kHeadDim + f];
+        const float gate = round_bf16(__fdiv_rn(1.0F, __fadd_rn(1.0F, am::amd_expf(tables, -g))));
+        out[static_cast<std::uint64_t>(head) * kHeadDim + f] = round_bf16(__fmul_rn(attn, gate));
+    }
+}
+__global__ __launch_bounds__(kOutThreads) void attention_output_head_pipe_kernel(const float* __restrict__ q_gate,
+    std::uint64_t first_position, const std::uint32_t* __restrict__ all_selected, const std::uint16_t* __restrict__ kv,
+    const float* __restrict__ all_scores, float* __restrict__ output, am::Tables tables) {
+    attention_output_head_pipe_body(q_gate, first_position, all_selected, kv, all_scores, output, tables);
+}
+bool head_pipe_enabled() {
+    static const bool on = strix::envcfg::flag("STRIX_QRTX_QSA_HEAD", true);
+    return on;
+}
+bool idx_wide_enabled() {
+    static const bool on = strix::envcfg::flag("STRIX_QRTX_QSA_IDX", true);
+    return on;
+}
+
 // ------------------------------------------------------------------------------------------------------------------
 // Multi-segment launches (decode cohort windows, layer_core_multi): one launch per step for every session of a window.
 // Every block (score kernel: every wave) belongs to one segment and runs the single-call body with that segment's
@@ -837,6 +927,13 @@ __global__ __launch_bounds__(kOutThreads) void attention_output_head_multi_kerne
     const unsigned seg = seg_of(map, blockIdx.y);
     attention_output_head_kernel_body(q_gate, base_position(map, seg), all_selected, map.kv[seg], all_scores, output, tables);
 }
+template <class MapArg>
+__global__ __launch_bounds__(kOutThreads) void attention_output_head_multi_pipe_kernel(const float* __restrict__ q_gate, MapArg mapa,
+    const std::uint32_t* __restrict__ all_selected, const float* __restrict__ all_scores, float* __restrict__ output, am::Tables tables) {
+    const SegmentMap& map = map_of(mapa);
+    const unsigned seg = seg_of(map, blockIdx.y);
+    attention_output_head_pipe_body(q_gate, base_position(map, seg), all_selected, map.kv[seg], all_scores, output, tables);
+}
 
 }  // namespace
 
@@ -867,12 +964,15 @@ void indexer_projection(const std::uint16_t* hidden, std::uint32_t rows, const L
     float* index_key, cudaStream_t stream) {
     if (!rows) return;
     static const bool attr = [] {
-        check(cudaFuncSetAttribute(indexer_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(kIdxSmem)), "indexer smem attr");
+        check(cudaFuncSetAttribute(indexer_kernel<kIdxSlice>, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(kIdxSmem)), "indexer smem attr");
+        check(cudaFuncSetAttribute(indexer_kernel<kIdxWide>, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(kIdxSmem)), "indexer smem attr");
         return true;
     }();
     (void)attr;
-    const dim3 grid((rows + kIdxRows - 1U) / kIdxRows, (kIdxOutputs + kIdxSlice - 1U) / kIdxSlice);
-    indexer_kernel<<<grid, 256, kIdxSmem, stream>>>(hidden, rows, w.index_q_proj, w.index_k_proj, index_query, index_key);
+    if (rows <= kIdxRows && idx_wide_enabled())
+        indexer_kernel<kIdxWide><<<dim3(1, kIdxOutputs / kIdxWide), 256, kIdxSmem, stream>>>(hidden, rows, w.index_q_proj, w.index_k_proj, index_query, index_key);
+    else
+    indexer_kernel<kIdxSlice><<<dim3((rows + kIdxRows - 1U) / kIdxRows, (kIdxOutputs + kIdxSlice - 1U) / kIdxSlice), 256, kIdxSmem, stream>>>(hidden, rows, w.index_q_proj, w.index_k_proj, index_query, index_key);
     check(cudaGetLastError(), "indexer launch");
 }
 
@@ -942,7 +1042,10 @@ void attention_softmax(std::uint32_t rows, std::uint64_t first_position, float* 
 void attention_values(const float* q_gate, std::uint32_t rows, std::uint64_t first_position, const std::uint32_t* selected,
     const std::uint16_t* kv, const float* scores, float* attention_output, const amdmath::Tables& tables, cudaStream_t stream) {
     if (!rows) return;
-    if (rows <= 8U && decode_rows_enabled())
+    if (rows <= 8U && decode_rows_enabled() && head_pipe_enabled())
+        attention_output_head_pipe_kernel<<<dim3(kHeads, rows), kOutThreads, 0, stream>>>(q_gate, first_position, selected, kv, scores,
+            attention_output, tables);
+    else if (rows <= 8U && decode_rows_enabled())
         attention_output_head_kernel<<<dim3(kHeads, rows), kOutThreads, 0, stream>>>(q_gate, first_position, selected, kv, scores,
             attention_output, tables);
     else
@@ -1082,7 +1185,10 @@ void launch_multi(const RowBuffers& b, MapArg map, const MultiShape& shape, cons
     softmax_multi_kernel<<<dim3(kHeads, rows), 256, 0, stream>>>(ws.scores, map, tables);
     check(cudaGetLastError(), "softmax multi launch");
     // keyed on the segment rows (as per-segment layer_core), not on the window total
-    if (shape.head_all)
+    if (shape.head_all && head_pipe_enabled())
+        attention_output_head_multi_pipe_kernel<<<dim3(kHeads, rows), kOutThreads, 0, stream>>>(b.q_gate, map, ws.selected, ws.scores,
+            b.attention_output, tables);
+    else if (shape.head_all)
         attention_output_head_multi_kernel<<<dim3(kHeads, rows), kOutThreads, 0, stream>>>(b.q_gate, map, ws.selected, ws.scores,
             b.attention_output, tables);
     else

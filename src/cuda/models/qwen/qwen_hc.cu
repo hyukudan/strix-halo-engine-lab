@@ -717,6 +717,209 @@ __global__ __launch_bounds__(256) void route_select_kernel(const float* __restri
 }
 
 // ---------------------------------------------------------------------------------------------------------------------
+// Latency-hiding forms of the decode router / select / HC-up kernels (STRIX_QRTX_ROUTE_PIPE, STRIX_QRTX_SELECT_WARP,
+// STRIX_QRTX_HC_OUT_REG; default on). Same FP32 chains in the same order as the kernels above: bit-identical.
+__device__ __forceinline__ void hc_cp16(void* dst, const void* src) {
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" ::"r"(static_cast<unsigned>(__cvta_generic_to_shared(dst))), "l"(src)
+                 : "memory");
+}
+__device__ __forceinline__ void hc_cp_commit() { asm volatile("cp.async.commit_group;\n" ::: "memory"); }
+template <int N> __device__ __forceinline__ void hc_cp_wait() { asm volatile("cp.async.wait_group %0;\n" ::"n"(N) : "memory"); }
+
+// Router logits: block = 4 experts (128 blocks, 128 threads). The 4 x 2560 FP32 weights and the R BF16 rows are staged with
+// 16 B cp.async in 10 chunks of 256 k, ALL issued up front (10 MB in flight card-wide); the chain threads (e, r) < 4 R
+// wait chunk by chunk and run the same serial fmaf chain k = 0..2559 from 0, 8 k per LDS.128 pair.
+constexpr unsigned kRtvChunk = 256U, kRtvChunks = kHidden / kRtvChunk, kRtvWP = kHidden + 4U, kRtvXP = kHidden + 8U;
+// One 256-k chunk of the pipelined router chain, then the next (compile-time recursion: wait_group needs an immediate).
+template <unsigned C>
+__device__ __forceinline__ void route_pipe_chunk(const float* wrow, const std::uint16_t* xrow, bool chain, float& acc) {
+    hc_cp_wait<static_cast<int>(kRtvChunks - 1U - C)>();
+    __syncthreads();
+    if (chain) {
+        const float4* wp = reinterpret_cast<const float4*>(wrow + C * kRtvChunk);
+        const uint4* xp = reinterpret_cast<const uint4*>(xrow + C * kRtvChunk);
+#pragma unroll 4
+        for (unsigned g = 0; g < kRtvChunk / 8U; ++g) {
+            const uint4 xv = xp[g];
+            const float4 a = wp[2U * g], b = wp[2U * g + 1U];
+            acc = __fmaf_rn(__uint_as_float(xv.x << 16U), a.x, acc);
+            acc = __fmaf_rn(__uint_as_float(xv.x & 0xffff0000U), a.y, acc);
+            acc = __fmaf_rn(__uint_as_float(xv.y << 16U), a.z, acc);
+            acc = __fmaf_rn(__uint_as_float(xv.y & 0xffff0000U), a.w, acc);
+            acc = __fmaf_rn(__uint_as_float(xv.z << 16U), b.x, acc);
+            acc = __fmaf_rn(__uint_as_float(xv.z & 0xffff0000U), b.y, acc);
+            acc = __fmaf_rn(__uint_as_float(xv.w << 16U), b.z, acc);
+            acc = __fmaf_rn(__uint_as_float(xv.w & 0xffff0000U), b.w, acc);
+        }
+    }
+    if constexpr (C + 1U < kRtvChunks) route_pipe_chunk<C + 1U>(wrow, xrow, chain, acc);
+}
+template <unsigned R>
+__global__ __launch_bounds__(128) void route_logits_pipe_kernel(const std::uint16_t* __restrict__ hidden, const float* __restrict__ w,
+    float* __restrict__ logits) {
+    extern __shared__ __align__(16) float rtv_smem[];
+    float* ws = rtv_smem;                                                                  // [4][kRtvWP]
+    auto* xs = reinterpret_cast<std::uint16_t*>(rtv_smem + kRtePerBlock * kRtvWP);          // BF16 [R][kRtvXP]
+    const unsigned e0 = blockIdx.x * kRtePerBlock, tid = threadIdx.x;
+#pragma unroll
+    for (unsigned c = 0; c < kRtvChunks; ++c) {
+        for (unsigned i = tid; i < kRtePerBlock * (kRtvChunk / 4U); i += 128U) {
+            const unsigned e = i / (kRtvChunk / 4U), v = i % (kRtvChunk / 4U);
+            hc_cp16(ws + e * kRtvWP + c * kRtvChunk + v * 4U, w + static_cast<std::size_t>(e0 + e) * kHidden + c * kRtvChunk + v * 4U);
+        }
+        for (unsigned i = tid; i < R * (kRtvChunk / 8U); i += 128U) {
+            const unsigned r = i / (kRtvChunk / 8U), v = i % (kRtvChunk / 8U);
+            hc_cp16(xs + r * kRtvXP + c * kRtvChunk + v * 8U, hidden + static_cast<std::size_t>(r) * kHidden + c * kRtvChunk + v * 8U);
+        }
+        hc_cp_commit();
+    }
+    const unsigned e = tid / R, r = tid % R;
+    const bool chain = tid < kRtePerBlock * R;
+    float acc = 0.0F;
+    route_pipe_chunk<0U>(ws + e * kRtvWP, xs + r * kRtvXP, chain, acc);
+    if (chain) logits[static_cast<std::size_t>(r) * kExperts + e0 + e] = acc;
+}
+
+// Route select with 4 barriers instead of 20: thread t owns experts t and t + 256 (as route_select_kernel); max by shuffles +
+// one smem exchange (order independent); the sum tree levels 128/64/32 are read by warp 0 from smem (a_m = a[l + 32 m]:
+// (m, m + 4), (m, m + 2), (0, 1)), levels 16..1 are shfl_down. Same adds in the same pairs: bit-identical.
+__global__ __launch_bounds__(256) void route_select_warp_kernel(const float* __restrict__ workspace, std::uint32_t top_k,
+    bool normalize, std::uint32_t* __restrict__ ids, float* __restrict__ weights, am::Tables t) {
+    constexpr unsigned kWave = 32U, kCandidates = kExperts / kWave;
+    const unsigned row = blockIdx.x, tid = threadIdx.x, lane = tid % 32U, warp = tid / 32U;
+    __shared__ float sa[256];
+    __shared__ float sl[kExperts];
+    __shared__ float wmax[8];
+    __shared__ float sden;
+    __shared__ float best_values[32];
+    __shared__ unsigned best_indices[32];
+    const float x0 = workspace[static_cast<std::size_t>(row) * kExperts + tid], x1 = workspace[static_cast<std::size_t>(row) * kExperts + tid + 256U];
+    float local_max = fmaxf(fmaxf(-INFINITY, x0), x1);
+#pragma unroll
+    for (unsigned mask = 16U; mask > 0U; mask >>= 1U) local_max = fmaxf(local_max, __shfl_xor_sync(0xffffffffU, local_max, mask));
+    if (lane == 0U) wmax[warp] = local_max;
+    __syncthreads();
+    float maximum = wmax[0];
+#pragma unroll
+    for (unsigned w = 1; w < 8U; ++w) maximum = fmaxf(maximum, wmax[w]);
+    const float p0 = am::amd_expf(t, __fsub_rn(x0, maximum)), p1 = am::amd_expf(t, __fsub_rn(x1, maximum));
+    sa[tid] = __fadd_rn(__fadd_rn(0.0F, p0), p1);
+    __syncthreads();
+    if (warp == 0U) {
+        float a[8];
+#pragma unroll
+        for (unsigned m = 0; m < 8U; ++m) a[m] = sa[lane + 32U * m];
+        float t1[4], t2[2];
+#pragma unroll
+        for (unsigned m = 0; m < 4U; ++m) t1[m] = __fadd_rn(a[m], a[m + 4U]);
+#pragma unroll
+        for (unsigned m = 0; m < 2U; ++m) t2[m] = __fadd_rn(t1[m], t1[m + 2U]);
+        float v = __fadd_rn(t2[0], t2[1]);
+#pragma unroll
+        for (unsigned stride = 16U; stride > 0U; stride >>= 1U) v = __fadd_rn(v, __shfl_down_sync(0xffffffffU, v, stride));
+        if (lane == 0U) sden = v;
+    }
+    __syncthreads();
+    const float denominator = sden;
+    sl[tid] = __fdiv_rn(p0, denominator);
+    sl[tid + 256U] = __fdiv_rn(p1, denominator);
+    __syncthreads();
+    if (warp != 0U) return;
+    float values[kCandidates];
+#pragma unroll
+    for (unsigned i = 0; i < kCandidates; ++i) values[i] = sl[lane + kWave * i];
+    unsigned available = 0;
+#pragma unroll
+    for (unsigned i = 0; i < kCandidates; ++i)
+        if (values[i] == values[i]) available |= 1U << i;
+    for (unsigned slot = 0; slot < top_k; ++slot) {
+        bool has = false;
+        float best = -INFINITY;
+        unsigned index = kExperts;
+#pragma unroll
+        for (unsigned i = 0; i < kCandidates; ++i)
+            if ((available & (1U << i)) != 0U) {
+                const unsigned expert = lane + kWave * i;
+                if (!has || better(values[i], expert, best, index)) { has = true; best = values[i]; index = expert; }
+            }
+#pragma unroll
+        for (unsigned mask = kWave / 2U; mask > 0U; mask >>= 1U) {
+            const float other = __shfl_xor_sync(0xffffffffU, best, static_cast<int>(mask));
+            const unsigned other_index = __shfl_xor_sync(0xffffffffU, index, static_cast<int>(mask));
+            const int other_has = __shfl_xor_sync(0xffffffffU, static_cast<int>(has), static_cast<int>(mask));
+            if (other_has != 0 && (!has || better(other, other_index, best, index))) { has = true; best = other; index = other_index; }
+        }
+        if (lane == 0U) { best_values[slot] = has ? best : -INFINITY; best_indices[slot] = has ? index : kExperts; }
+        if (has && index % kWave == lane) available &= ~(1U << (index / kWave));
+    }
+    __syncwarp();
+    if (lane == 0U) {
+        float selected_sum = 0.0F;
+        for (unsigned slot = 0; slot < top_k; ++slot) selected_sum = __fadd_rn(selected_sum, best_values[slot]);
+        if (!normalize) selected_sum = 1.0F;
+        for (unsigned slot = 0; slot < top_k; ++slot) {
+            ids[static_cast<std::size_t>(row) * top_k + slot] = best_indices[slot];
+            weights[static_cast<std::size_t>(row) * top_k + slot] = __fdiv_rn(best_values[slot], selected_sum);
+        }
+    }
+}
+
+// [O] with the whole 80-word weight chain of a thread loaded into registers before any compute (all loads in flight at
+// once), FB features x 4 streams per block. The chain per (row, feature, stream) is unchanged.
+template <unsigned R, unsigned RG, unsigned FB>
+__global__ __launch_bounds__(FB * 4U) void hc_output_rows_reg_kernel(const float* __restrict__ normalized,
+    const std::uint32_t* __restrict__ up_codes, const float* __restrict__ up_scales, std::uint16_t* __restrict__ output,
+    am::Tables t) {
+    __shared__ float lows[kRank][RG];
+    const unsigned r0 = blockIdx.y * RG;
+    const unsigned s = threadIdx.x % 4U, f = blockIdx.x * FB + threadIdx.x / 4U;
+    std::uint32_t words[kRank / 4U];
+    float scales[kRank / 32U];
+#pragma unroll
+    for (unsigned q = 0; q < kRank / 4U; ++q) words[q] = up_codes[(static_cast<std::size_t>(q) * kStreams + s) * kHidden + f];
+#pragma unroll
+    for (unsigned q = 0; q < kRank / 32U; ++q) scales[q] = up_scales[(static_cast<std::size_t>(q) * kStreams + s) * kHidden + f];
+    for (unsigned i = threadIdx.x; i < kRank * RG; i += FB * 4U)
+        lows[i / RG][i % RG] =
+            r0 + i % RG < R ? normalized[static_cast<std::size_t>(r0 + i % RG) * kNormalizedPitch + kWide + i / RG] : 0.0F;
+    __syncthreads();
+    float g[RG];
+#pragma unroll
+    for (unsigned r = 0; r < RG; ++r) g[r] = 0.0F;
+#pragma unroll
+    for (unsigned q = 0; q < kRank / 4U; ++q) {
+        const float scale = scales[q / 8U];
+        const std::uint32_t word = words[q];
+#pragma unroll
+        for (unsigned j = 0; j < 4U; ++j) {
+            const float c = __fmul_rn(scale, static_cast<float>(static_cast<signed char>((word >> (8U * j)) & 255U)));
+#pragma unroll
+            for (unsigned r = 0; r < RG; ++r) g[r] = __fmaf_rn(lows[4U * q + j][r], c, g[r]);
+        }
+    }
+    const unsigned base = (threadIdx.x % 32U) & ~3U;
+#pragma unroll
+    for (unsigned rr = 0; rr < RG; ++rr) {
+        if (r0 + rr >= R) break;
+        const unsigned r = r0 + rr;
+        const float term = amd_sigmoid(t, g[rr]);
+        const float n = normalized[static_cast<std::size_t>(r) * kNormalizedPitch + s * kHidden + f];
+        float sig[4], nv[4];
+#pragma unroll
+        for (unsigned k = 0; k < 4U; ++k) {
+            sig[k] = __shfl_sync(0xffffffffU, term, base + k);
+            nv[k] = __shfl_sync(0xffffffffU, n, base + k);
+        }
+        if (s == 0U) {
+            float mixed = 0.0F;
+#pragma unroll
+            for (unsigned k = 0; k < 4U; ++k) mixed = __fmaf_rn(nv[k], sig[k], mixed);
+            output[static_cast<std::size_t>(r) * kHidden + f] = float_to_bf16(__fmul_rn(mixed, 0.25F));
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
 // [L] prefetch8_wave_q8_lm_head_kernel<u16, 8> (hip_lm_head_launcher.hip:475-520): warp per vocab row; lane L leaf l
 // accumulates partial[l] = fma(x[c + 8L + l], scale * code, partial[l]) over chunks c = 0, 256, ..., 2304; then
 // for d = 16, 8, 4, 2, 1: lanes < d add lane + d; lane 0: p0+=p4, p1+=p5, p2+=p6, p3+=p7; p0+=p2, p1+=p3; p0+=p1.
@@ -896,18 +1099,23 @@ bool hc_rows_split_enabled() {
     return on;
 }
 template <unsigned R, unsigned OG, unsigned RG, unsigned RO>
-void hc_mix_rows_g(const HcMixArgs& a, const am::Tables& tables, cudaStream_t stream) {
+void hc_mix_rows_g(const HcMixArgs& a, const am::Tables& tables, cudaStream_t stream, bool split) {
     hc_projection_rows_kernel<R, OG, RG><<<dim3(kRank / OG + (a.inject ? 1U : 0U), (R + RG - 1U) / RG), 512U, 0, stream>>>(
         a.normalized, a.packed.down_codes, a.packed.down_scales, a.inject, a.normalized, a.injection, tables);
     check(cudaGetLastError(), "projection rows launch");
+    static const bool reg = strix::envcfg::flag("STRIX_QRTX_HC_OUT_REG", true);
+    if (reg && split)  // legacy seam (HC_ROWS_SPLIT=0) keeps the old kernel
+        hc_output_rows_reg_kernel<R, RO, 16U><<<dim3(kHidden / 16U, (R + RO - 1U) / RO), 64U, 0, stream>>>(a.normalized,
+            a.packed.up_codes, a.packed.up_scales, a.output, tables);
+    else
     hc_output_rows_kernel<R, RO><<<dim3(kHidden / 32U, (R + RO - 1U) / RO), 128U, 0, stream>>>(a.normalized, a.packed.up_codes,
         a.packed.up_scales, a.output, tables);
     check(cudaGetLastError(), "output rows launch");
 }
 template <unsigned R> void hc_mix_rows_r(const HcMixArgs& a, const am::Tables& tables, cudaStream_t stream) {
     constexpr unsigned OG = R >= 8U ? 8U : R >= 4U ? 4U : R >= 2U ? 2U : 1U, RG = R >= 8U ? 2U : 1U, RO = R >= 4U ? 2U : 1U;
-    if (hc_rows_split_enabled()) hc_mix_rows_g<R, OG, RG, RO>(a, tables, stream);
-    else hc_mix_rows_g<R, 1U, R, R>(a, tables, stream);
+    if (hc_rows_split_enabled()) hc_mix_rows_g<R, OG, RG, RO>(a, tables, stream, true);
+    else hc_mix_rows_g<R, 1U, R, R>(a, tables, stream, false);
 }
 void hc_mix_rows(const HcMixArgs& a, const am::Tables& tables, cudaStream_t stream) {
     switch (a.rows) {
@@ -930,6 +1138,15 @@ template <unsigned R, bool SPLIT> void route_rows_rs(const std::uint16_t* hidden
     static const cudaError_t attr =
         cudaFuncSetAttribute(route_logits_rows_kernel<R, SPLIT>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
     check(attr, "route logits rows smem");
+    static const bool pipe = strix::envcfg::flag("STRIX_QRTX_ROUTE_PIPE", true);
+    if (SPLIT && pipe && (reinterpret_cast<std::uintptr_t>(hidden) & 15U) == 0U && (reinterpret_cast<std::uintptr_t>(w) & 15U) == 0U) {
+        constexpr unsigned psmem = kRtePerBlock * kRtvWP * 4U + R * kRtvXP * 2U;
+        static const cudaError_t pattr =
+            cudaFuncSetAttribute(route_logits_pipe_kernel<R>, cudaFuncAttributeMaxDynamicSharedMemorySize, psmem);
+        check(pattr, "route logits pipe smem");
+        route_logits_pipe_kernel<R><<<kExperts / kRtePerBlock, 128U, psmem, stream>>>(hidden, w, logits);
+        return;
+    }
     route_logits_rows_kernel<R, SPLIT><<<kExperts / kRtePerBlock, 256U, smem, stream>>>(hidden, w, logits);
 }
 template <unsigned R> void route_rows_r(const std::uint16_t* hidden, const float* w, float* logits, cudaStream_t stream) {
@@ -1012,7 +1229,9 @@ void route_select(const float* logits, std::uint32_t rows, std::uint32_t top_k, 
     std::uint32_t* ids, float* weights, cudaStream_t stream) {
     if (top_k == 0U || top_k > 32U) throw std::invalid_argument("qwen_hc route_select: top_k must be 1..32");
     if (!rows) return;
-    route_select_kernel<<<rows, 256U, 0, stream>>>(logits, top_k, normalize, ids, weights, tables);
+    static const bool warp = strix::envcfg::flag("STRIX_QRTX_SELECT_WARP", true);
+    if (warp) route_select_warp_kernel<<<rows, 256U, 0, stream>>>(logits, top_k, normalize, ids, weights, tables);
+    else route_select_kernel<<<rows, 256U, 0, stream>>>(logits, top_k, normalize, ids, weights, tables);
     check(cudaGetLastError(), "route select launch");
 }
 void lm_head(const std::uint16_t* hidden, const void* output_q8, std::uint32_t vocab, float* logits, cudaStream_t stream) {

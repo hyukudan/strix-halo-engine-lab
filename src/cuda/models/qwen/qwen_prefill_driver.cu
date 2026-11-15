@@ -1547,10 +1547,9 @@ void Prefill::Impl::commit_one(SessionState& s, std::uint32_t keep) {
         for (std::uint32_t o = 0; o < 36; ++o) {
             float* base = win_rows + (std::uint64_t{o} * kMaxWindowRows + off) * gdn_stride;
             const gdn::Rows gr{base, base + 10240, base + 16384, base + 16432, base + 16480, gdn_stride};
-            gdn::launch_recurrence_split(gr, keep, s.gdn_state + o * gdn::kMatrixFloats, s.gdn_other + o * gdn::kMatrixFloats,
-                gdn_scratch, tables, stream);
-            gdn::launch_conv_rollback(win_raw + (std::uint64_t{o} * kMaxWindowRows + off) * gdn::kConvWidth, keep,
-                s.conv_before + o * gdn::kConvStateHalfs, s.gdn_conv + o * gdn::kConvStateHalfs, stream);
+            gdn::launch_commit_replay(gr, keep, s.gdn_state + o * gdn::kMatrixFloats, s.gdn_other + o * gdn::kMatrixFloats,
+                win_raw + (std::uint64_t{o} * kMaxWindowRows + off) * gdn::kConvWidth, s.conv_before + o * gdn::kConvStateHalfs,
+                s.gdn_conv + o * gdn::kConvStateHalfs, gdn_scratch, tables, stream);
         }
         pm::launch_ple_conv_rollback(s.ple_before, ple_keys + off * pm::kExpanded, pm::kExpanded, keep, s.ple_conv, stream);
         s.ngram[0] = s.ngram_before[0];
