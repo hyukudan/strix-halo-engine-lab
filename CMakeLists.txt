@@ -5564,6 +5564,10 @@ if(BUILD_TESTING)
     endif()
     add_test(NAME strix-qwen-chain-plan-1gbe COMMAND strix-qwen-chain-plan --rows 32768 --card-rate 4320
         --node-rate 1600 --link-mbps 118 --decoder card)
+    set_tests_properties(strix-qwen-chain-plan-1gbe PROPERTIES
+        PASS_REGULAR_EXPRESSION "chosen card[.][.]card decoder=card cuts=0/48")
+    add_test(NAME strix-qwen-chain-plan-invalid-numbers COMMAND ${CMAKE_COMMAND}
+        -DPLANNER=$<TARGET_FILE:strix-qwen-chain-plan> -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/check_chain_cli.cmake)
     add_executable(strix-qwen-prefill-pair-tests tests/qwen_prefill_pair_tests.cpp)
     target_include_directories(strix-qwen-prefill-pair-tests PRIVATE include src)
     target_compile_features(strix-qwen-prefill-pair-tests PRIVATE cxx_std_20)
