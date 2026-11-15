@@ -424,6 +424,21 @@ void shared_pre_fixtures(bool bench) {
                     for (const int pair : {0, 2}) {
                         const auto c = f.run_pre(true, device, stream, true, -1, pair);
                         require(dead(c.arena) == dead(b.arena), "paired gate|up changed output / gate / tail bytes");
+                        if (c.a16 != b.a16) {
+                            std::size_t n = 0, shown = 0;
+                            for (std::size_t k = 0; k < b.a16.size() && k < c.a16.size(); ++k) {
+                                if (b.a16[k] == c.a16[k]) continue;
+                                if (shown++ < 6) {
+                                    float act = 0.0F;
+                                    std::memcpy(&act, a.arena.data() + static_cast<std::size_t>(f.temporary[k / 640U].address - f.scratch.address) + (k % 640U) * sizeof(float), sizeof(act));
+                                    std::cerr << "a16 diff rows " << rows << " kind " << kind << " pair " << pair << " r " << k / 640U << " i " << k % 640U
+                                              << std::hex << " prod 0x" << b.a16[k] << " route 0x" << c.a16[k] << " oracle 0x"
+                                              << __builtin_bit_cast(std::uint16_t, static_cast<_Float16>(act)) << std::dec << "\n";
+                                }
+                                ++n;
+                            }
+                            std::cerr << "a16 diffs " << n << " of " << b.a16.size() << " (sizes " << b.a16.size() << "/" << c.a16.size() << ")\n";
+                        }
                         require(c.a16 == b.a16, "paired gate|up FP16 preimage bytes differ");
                         require(c.overflow == b.overflow, "paired gate|up overflow counter delta differs");
                     }
