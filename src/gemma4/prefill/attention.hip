@@ -1,6 +1,7 @@
 #include "device.hpp"
 #include "attention.hpp"
 #include <hip/hip_runtime.h>
+#include "strix/env_flags.hpp"
 #include "../../attn_core/dense_flash_prefill.hpp"
 #include <algorithm>
 #include <cstdio>
@@ -531,8 +532,7 @@ void attention_flash(const float* q, const gpu::KvRead* reads, unsigned rows, un
     // 8 segments of 512 tiles cover max_positions; a call that cannot hold its segments fails closed.
     unsigned seg_tiles = 0;
     static const bool absseg = [] {
-        const auto* p = std::getenv("STRIX_G4_PREFILL_FLASH_ABSSEG");
-        const bool on = p && std::string_view(p) == "1";
+        const bool on = envcfg::flag("STRIX_G4_PREFILL_FLASH_ABSSEG", false, EnvFlagMatch::exact);
         if (on) std::fprintf(stderr, "G4 flash split identity dense-flash-absseg-v1/s%u (opt-in)\n", kAbsSegTiles);
         return on;
     }();
