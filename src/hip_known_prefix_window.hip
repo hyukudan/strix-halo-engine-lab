@@ -1595,6 +1595,11 @@ struct HipKnownPrefixWindow::Impl {
     const DeferredMoeFirstError* packed_status = nullptr;
     bool packed_completion = false;
     bool can_pack_completion() const { return !defer_current && deferred_pending < 0; }
+    bool plan_packed_completion(session::CyclePackLayout& layout, bool member) const {
+        return can_pack_completion() &&
+            (!(window.routed_expert_union_steps && !member) || layout.try_add(sizeof(q51_known_rows::Summary))) &&
+            (!config.deferred_moe_status || layout.try_add(sizeof(DeferredMoeFirstError)));
+    }
     void stage_packed_completion(session::CyclePack& pack) {
         if(!can_pack_completion()) throw std::logic_error("packed cohort completion requires an owner without deferred blocks");
         packed_summary=nullptr;packed_status=nullptr;
@@ -2356,9 +2361,16 @@ struct HipKnownPrefixWindow::Impl {
             // records each owner's complete() reads with its own copy and fence are gathered by one kernel and
             // fenced once; the owners then check them in the same order as below.
             host_phase_mark("7a cohort launch");
-            const bool pack = session::serve_cycle_pack_choice(members.size()).on &&
-                std::all_of(members.begin(), members.end(), [](const auto& m) { return m.impl->can_pack_completion(); }) &&
-                std::all_of(chunks.begin(), chunks.end(), [](const auto& c) { return !c.primary || c.primary->can_pack_completion(); });
+            const bool pack = [&] {
+                if (!session::serve_cycle_pack_choice(members.size()).on) return false;
+                session::CyclePackLayout layout;
+                for (std::size_t c = 0; c < chunks.size(); ++c)
+                    if (chunks[c].primary && !chunks[c].primary->plan_packed_completion(layout, !union_ran[c])) return false;
+                if (wide_union_rows && !layout.try_add(sizeof(q51_known_rows::Summary))) return false;
+                for (const auto& m : members)
+                    if (!m.impl->plan_packed_completion(layout, m.impl->cohort_member)) return false;
+                return true;
+            }();
             const q51_known_rows::Summary* wide_summary = nullptr;
             if (pack) {
                 if (!lead.cycle_pack) lead.cycle_pack = std::make_unique<session::CyclePack>();

@@ -786,18 +786,25 @@ void pack_predictor_owners(std::span<const HipMtpGreedyCohortMember> members,con
 }
 // Defers every member's reconciliation completion through its finish loop; settle() then fences them once.
 struct PackedReconcile {
+    struct FailMember {
+        std::span<const HipMtpGreedyCohortMember> members;
+        void operator()(std::size_t k) const noexcept {
+            members[k].runtime->defer_reconcile_for_cycle_pack(false);
+            members[k].runtime->fail_cycle();
+        }
+    };
     std::span<const HipMtpGreedyCohortMember> members;
-    std::vector<bool> take;
+    session::CyclePackSettlement<FailMember> settlement;
     bool on=false;
-    PackedReconcile(std::span<const HipMtpGreedyCohortMember> m,std::size_t n):members(m),take(m.size(),false),on(cohort_cycle_pack(n)) {}
-    void defer(std::size_t member) {if(on){take[member]=true;members[member].runtime->defer_reconcile_for_cycle_pack(true);}}
+    PackedReconcile(std::span<const HipMtpGreedyCohortMember> m,std::size_t n):members(m),settlement(m.size(),FailMember{m}),on(cohort_cycle_pack(n)) {}
+    void defer(std::size_t member) {if(on){settlement.take(member);members[member].runtime->defer_reconcile_for_cycle_pack(true);}}
     void settle() {
         if(!on) return;
-        pack_predictor_owners(members,take);
-        for(std::size_t k=0;k<members.size();++k) if(take[k]) {
+        pack_predictor_owners(members,settlement.selected());
+        settlement.settle([&](std::size_t k) {
             members[k].runtime->defer_reconcile_for_cycle_pack(false);
             members[k].runtime->native_runtime().resources().settle_deferred();
-        }
+        });
     }
 };
 void default_small_cohorts(std::span<const HipMtpGreedyCohortMember> members,

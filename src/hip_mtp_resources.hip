@@ -63,7 +63,7 @@ struct HipMtpResources::Impl {
     HipRuntimeAllocationDescription pool_lease;
     hipStream_t stream=nullptr;
     bool pending=false,failed=false,deferred=false;
-    bool packed=false; std::array<std::uint32_t,2> packed_status{}; // STRIX_SERVE_CYCLE_PACK: fenced by complete_packed
+    session::CyclePackProof packed; // STRIX_SERVE_CYCLE_PACK: fenced by complete_packed
     std::array<std::uint64_t,3> deferred_counts{};
     mutable bool validation_entry=false;
     const RuntimeTensorBinding* sidecar_data=nullptr;
@@ -269,6 +269,7 @@ void HipMtpResources::require_idle(bool carry_deferred) const {
 }
 void HipMtpResources::mark_submitted() {
     validate_stage();
+    impl_->packed.invalidate(); // new work requires a fresh fence, even when carrying deferred work
     if(impl_->deferred) {impl_->deferred=false;++impl_->deferred_counts[1];}
     impl_->pending=true;
 }
@@ -287,8 +288,7 @@ void HipMtpResources::complete() {
     auto& p=*impl_;validate_stage();require(p.pending,"MTP completion requires submitted native work");
     try {
         std::array<std::uint32_t,2> status{};
-        if(p.packed) {p.packed=false;status=p.packed_status;} // the cycle pack already fenced this stream
-        else {
+        if(!p.packed.consume(status)) {
             const auto source=view(HipMtpBuffer::status);
             hip_check_message(hipMemcpyAsync(status.data(),reinterpret_cast<const void*>(source.address),8U,hipMemcpyDeviceToHost,p.stream),"MTP status transfer failed");
             hip_check_message(hipStreamSynchronize(p.stream),"MTP native completion failed");
@@ -300,9 +300,11 @@ void HipMtpResources::complete() {
 void HipMtpResources::complete_packed(std::span<const HipMtpResources* const> owners,session::CyclePack& pack) {
     std::vector<HipMtpResources*> live;
     // Every HipMtpResources is a heap object owned through a non-const shared_ptr (create()), as in settle_deferred.
-    for(const auto* o:owners) if(o && o->impl_->pending && !o->impl_->packed && std::find(live.begin(),live.end(),o)==live.end())
+    for(const auto* o:owners) if(o && o->impl_->pending && !o->impl_->packed.ready() && std::find(live.begin(),live.end(),o)==live.end())
         live.push_back(const_cast<HipMtpResources*>(o));
     if(live.size()<2U) return; // one owner: its own complete() is already a single copy and fence
+    session::CyclePackLayout layout;
+    if(!layout.try_add(8U,live.size())) return; // oversized cohorts retain individual copies/fences
     std::vector<const std::uint32_t*> slots;slots.reserve(live.size());
     std::vector<hipEvent_t> joins;
     const auto release=[&]{for(auto e:joins) (void)hipEventDestroy(e);joins.clear();};
@@ -326,9 +328,9 @@ void HipMtpResources::complete_packed(std::span<const HipMtpResources* const> ow
     release();
     for(std::size_t k=0;k<live.size();++k) {
         auto& p=*live[k]->impl_;
-        p.packed_status={slots[k][0],slots[k][1]};p.packed=true;
+        p.packed.publish({slots[k][0],slots[k][1]});
     }
 }
-void HipMtpResources::fail() noexcept {impl_->failed=true;impl_->packed=false;if(impl_->guard) impl_->guard->recover_or_fail_stop();impl_->pending=false;impl_->deferred=false;}
+void HipMtpResources::fail() noexcept {impl_->failed=true;impl_->packed.invalidate();if(impl_->guard) impl_->guard->recover_or_fail_stop();impl_->pending=false;impl_->deferred=false;}
 bool HipMtpResources::failed() const noexcept {return impl_->failed;}
 } // namespace strix
