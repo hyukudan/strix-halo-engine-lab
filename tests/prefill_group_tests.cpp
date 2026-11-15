@@ -73,8 +73,11 @@ int main() {
               "both ranks reach the same limits");
         PrefillGroupCapacity w16 = cap0; w16.window_rows = 16;
         check(agree_prefill_group(def, cap0, prefill_group_words(def, w16)).capacity.members == 0U, "window rows differ: no group");
-        check(prefill_group_words(agree_prefill_group(def, cap0, prefill_group_words(def, cap0)).policy, cap0) == prefill_group_words(def, cap0),
+        const auto equal = agree_prefill_group(def, cap0, prefill_group_words(def, cap0));
+        check(prefill_group_words(equal.policy, equal.capacity) == prefill_group_words(def, cap0),
               "equal ranks: unchanged");
+        check(plan_prefill_group(c8, equal.policy, kDs41, kInf, equal.capacity) == ids({100, 101, 102, 103, 104, 105, 106, 107}),
+              "equal ranks: all eight candidates still group");
     }
     // Members cap and rows cap.
     PrefillGroupPolicy p3 = def; p3.max_members = 3;
