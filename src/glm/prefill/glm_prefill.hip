@@ -2754,10 +2754,9 @@ unsigned hc_rows_tile() {  // STRIX_GLM_PF_HC_TILE = 64 | 32 | 16 (same bits), l
 // The v2 chain's rows per CTA (T = 2 x Rows threads, one thread = 4 rows x Cols / 8 outputs). Same bits for every
 // tile: each output's chain is fmaf over k ascending (stages of kHcK, then k) and never crosses rows or CTAs.
 // STRIX_GLM_PF_HC_CHAIN_ROWS = auto (default) | 64 | 32 | 16 | 8; auto picks by the launch's rows (fixture table).
-unsigned hc_chain_rows_auto(unsigned rows) {
-    (void)rows;
-    return 32U;
-}
+// Auto table (isolated fixture hcchainbench, normed form, ABBA): rows 2048 tile 8 1.083 vs 32 1.105 ms (-1.9 %),
+// rows 4096 tile 8 2.091 vs 2.045 ms (+2.3 %); 64 / 16 and 8 outputs per CTA lose at both. Crossover: <= 2048 rows.
+unsigned hc_chain_rows_auto(unsigned rows) { return rows <= 2048 ? 8U : 32U; }
 template <bool FromX>
 void hc_chain_launch_rows(unsigned t, const float* F, const float* fn, float* z, unsigned rows, const float* rr, bool cols8,
                           hipStream_t s) {

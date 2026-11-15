@@ -1,5 +1,6 @@
 // Fixture-free gate for the expand CTA placement. Included after hc_special.
 // Every payload is compared by memcmp, including NaNs, signed zeros and both guards.
+#include <cmath>
 __global__ void hc_cta_sum2_kernel(const float* y0, const float* y1, float* sum, std::size_t count) {
     const std::size_t i = static_cast<std::size_t>(blockIdx.x) * 256 + threadIdx.x;
     if (i < count) sum[i] = y0[i] + y1[i];
