@@ -609,6 +609,13 @@ failure may prevent final report delivery; inspect retained evidence privately.
 the state handed to the pair, the pair alone, the CUDA device alone), cold and warm, in one detached run with a phase
 breakdown, GPU clocks per token and a host-node link probe (RTT and useful throughput both ways).
 
+### DeepSeek V4.1 pair prefill A/B arm
+
+[`scripts/bench/ds41pair/prefill_ab.sh`](../scripts/bench/ds41pair/prefill_ab.sh) runs one arm of a two-node prefill
+A/B inside a pair GPU ticket (rank 1 on the peer, same binary by sha): cold and warm wall time, logits hashes of both
+ranks, GPU busy and clock per timed run, kfd evicted_ms growth and minimum MemAvailable on both nodes, optionally the
+per-exchange communicator trace. Alternate arms A B A B ... across tickets for a strict ABAB.
+
 ## Long-context retrieval and reasoning checks (Qwen)
 
 `tools/qualification/longctx_fidelity/` builds deterministic prompts whose answers are computed by the
