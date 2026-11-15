@@ -1280,6 +1280,7 @@ std::uint64_t DevicePrefill::owned_weight_bytes(const std::filesystem::path& ggu
     return need;
 }
 std::string DevicePrefill::overlay_description() const { return impl_->overlay ? impl_->overlay->describe() : std::string{}; }
+std::filesystem::path DevicePrefill::overlay_path() const { return impl_->overlay ? impl_->overlay->path() : std::filesystem::path{}; }
 
 namespace {
 
@@ -1591,6 +1592,7 @@ void DevicePrefill::set_precision_for_new_sequence(const PrefillOptions& p) {
     o.fast_moe = p.fast_moe;
     o.fast_dense = p.fast_dense;
     o.decoder_replay_rows = p.decoder_replay_rows;
+    o.decoder_replay_override = p.decoder_replay_override;
     ds41::set_fast_dense(p.fast_dense ? 1 : 0);
     ds41::set_fast_moe(p.fast_moe ? 1 : 0);   // process-wide switch of the batch MoE dispatch (one sequence at a time here)
 }
@@ -1708,8 +1710,10 @@ PrefillResult DevicePrefill::run_from(std::span<const std::uint32_t> tokens, std
     // the bounded decoder replay's bound (0 off) and oracle form, agreed by both ranks with the deferral below
     // (PrefillOptions::decoder_replay_rows, else the environment). A run from position 0 only: a later run (extend)
     // continues from the bounded state with the exact plan.
-    const std::uint32_t bounded = P0 != 0U ? 0U : m.options.decoder_replay_rows != 0U ? m.options.decoder_replay_rows : prefill_decoder_replay_rows();
+    const std::uint32_t bounded = P0 != 0U ? 0U : (m.options.decoder_replay_override || m.options.decoder_replay_rows != 0U) ? m.options.decoder_replay_rows : prefill_decoder_replay_rows();
     const bool bounded_oracle = bounded != 0U && prefill_decoder_replay_oracle();
+    result.decoder_replay_rows = bounded;
+    result.decoder_replay_oracle = bounded_oracle;
     bool defer = false;
     {
         const std::uint32_t next_rows = std::exchange(m.defer_next, 0U);

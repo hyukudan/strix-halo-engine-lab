@@ -234,6 +234,13 @@ policy threshold, not a confidence bound or model-fidelity result. Synthetic
 host tests establish validation and arithmetic only; compiler, native execution,
 model fidelity and complete-workload qualification remain separate gates.
 
+DS41 gate arms explicitly disable inherited decoder replay unless their label sets a bound.
+Witnesses record the resolved replay mode and hash the actual target and effective overlay
+contents; both ranks must agree on that content. The producer uses `row_split=false` and
+128-aligned prefill boundaries. Its evidence does not qualify row-split serving or arbitrary
+tails. Whole-run replay rejects snapshots, group passes and decoder deferral; serving needs
+an explicit admission contract for scheduler/cache operations before qualification.
+
 When both arms carry selection dumps (`PREFIX-<prompt>-sel-r<rank>.u32`; MiniMax writes them
 with `STRIX_MM_QUALITY_SELECT=1` next to `STRIX_MM_QUALITY_OUT`), `compare` also reports, per
 layer, the (row, head) slots whose selected block set differs and the first layer and position

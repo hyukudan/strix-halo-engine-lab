@@ -1,6 +1,7 @@
 #pragma once
 // Arm labels of the prefill quality tools (deepseek41_prefill_quality_main.cpp, deepseek41_prefill_continue_main.cpp).
 #include "strix/deepseek41_prefill.hpp"
+#include "strix/model_content_hash.hpp"
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -16,6 +17,7 @@ namespace strix::deepseek41::quality {
 // hash of the seed instead of the last-bit flip, so seeds sample the noise floor).
 inline PrefillOptions arm_precision(const std::string& label) {
     PrefillOptions o;
+    o.decoder_replay_override = true;  // every named arm is explicit, including exact/null OFF
     if (label == "exact") return o;
     if (label == "dense") { o.fp16_dense = true; return o; }
     if (label == "attention") { o.bf16_attention = true; return o; }
@@ -72,7 +74,14 @@ inline PrefillOptions arm_precision(const std::string& label) {
 
 // Profile of an arm for the gate's execution witness: "exact" (incumbent arithmetic; the null controls perturb it),
 // "fast-prefill" (the FAST prefill levers fast3 / fast3b<R>), else "diagnostic" (no floor-rule role).
+inline PrefillOptions executed_precision(PrefillOptions o, const PrefillResult& run) {
+    o.decoder_replay_rows = run.decoder_replay_rows;
+    o.decoder_replay_override = true;
+    return o;
+}
+
 inline std::string arm_profile(const PrefillOptions& o) {
+    if (!o.decoder_replay_override && o.decoder_replay_rows == 0U) return "diagnostic";  // unresolved inheritance
     const bool fast3 = o.fast_attention && o.fast_attention_flash && o.fast_moe && o.fast_dense;
     const bool other = o.fp16_dense || o.bf16_attention || o.fp16_fast || o.fp16_keep_a8 || o.fp16_wsplit ||
                        o.fp16_projections != 31U || o.approx_layer_first != 0U || o.approx_layer_end != 1000U || o.fp16_min_rows != 0U;
@@ -80,6 +89,17 @@ inline std::string arm_profile(const PrefillOptions& o) {
     if (fast3 && o.null_ulp_layer < 0) return "fast-prefill";
     if (!o.fast_attention && !o.fast_attention_flash && !o.fast_moe && !o.fast_dense && o.decoder_replay_rows == 0U) return "exact";
     return "diagnostic";
+}
+
+// Full content reads, independent of paths and pinned metadata. The caller verifies
+// the loader snapshot before/after hashing so these are the files actually loaded.
+inline std::string model_witness(const std::filesystem::path& target, const std::filesystem::path& overlay) {
+    const auto hash = [](const std::filesystem::path& path) {
+        return model_content_identity_hex(sha256_file_content(path, FileHashPolicy::full));
+    };
+    const std::string content = "ds41-quality-model-v2\ntarget_sha256=" + hash(target) +
+        "\noverlay_sha256=" + (overlay.empty() ? "none" : hash(overlay)) + "\n";
+    return model_content_identity_hex(sha256_bytes(std::as_bytes(std::span(content))));
 }
 
 }  // namespace strix::deepseek41::quality

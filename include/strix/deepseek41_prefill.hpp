@@ -97,8 +97,10 @@ struct PrefillOptions {
     // equal those of a full prefill.
     bool cone = true;
     // FAST policy ds41-decoder-replay-bounded-v1: the bound R (rows, a multiple of 128) of the next runs from position 0;
-    // 0: STRIX_DS41_DECODER_REPLAY (default 0, off). set_precision_for_new_sequence applies it (quality arms).
+    // 0 inherits STRIX_DS41_DECODER_REPLAY unless decoder_replay_override is set (explicit OFF).
+    // set_precision_for_new_sequence applies both fields (quality arms).
     std::uint32_t decoder_replay_rows = 0;
+    bool decoder_replay_override = false;
     // rows of the drafter's seed (0: none): the last draft_rows rows of a run; the cone also covers them, and the run
     // keeps their inputs of the last three layers (both ranks hold every seed row; draft_seed())
     std::uint32_t draft_rows = 0;
@@ -156,6 +158,8 @@ struct PrefillResult {
     std::vector<PrefillLayerTrace> trace; // options.trace
     std::vector<float> logits;        // last row (world 2 without gather_logits: this rank's slice, other entries zero)
     std::uint32_t next_token = 0;
+    std::uint32_t decoder_replay_rows = 0;  // resolved bound of this run; continuations report 0
+    bool decoder_replay_oracle = false;
     bool decoder_deferred = false;     // set_decoder_deferral admitted: no logits / next token / seed, decode state completed by the next run
     std::vector<std::uint64_t> stream_hashes;  // last row, after each layer (stream_hashes)
     bool embed_dead_hash_checked = false, embed_image_router_checked = false; // verify_embed_extras evidence
@@ -253,6 +257,7 @@ public:
     ~DevicePrefill();
     // The overlay's path, identity, tensor count, bytes and content FNV (empty without an overlay).
     [[nodiscard]] std::string overlay_description() const;
+    [[nodiscard]] std::filesystem::path overlay_path() const;  // effective loaded overlay, empty if absent
     DevicePrefill(const DevicePrefill&) = delete;
     DevicePrefill& operator=(const DevicePrefill&) = delete;
 

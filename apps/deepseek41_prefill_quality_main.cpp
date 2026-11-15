@@ -104,13 +104,14 @@ std::string sha_hex(const std::string& s) { return sha_hex(s.data(), s.size()); 
 // configuration and the dumps this process wrote. Canonical numerical configuration: every precision field of the arm
 // except the null control (null_ulp_layer, null_seed), the loaded run form, the FAST dense threshold and the process's
 // STRIX_* environment, one "key=value" line each in a fixed order (environment sorted).
-std::string numerical_config(const PrefillOptions& a, const PrefillOptions& load) {
+std::string numerical_config(const PrefillOptions& a, const PrefillOptions& load, bool replay_oracle) {
     std::ostringstream o;
     o << "ds41-numcfg-v1\nfp16_dense=" << a.fp16_dense << "\nbf16_attention=" << a.bf16_attention << "\nfast_attention=" << a.fast_attention
       << "\nfast_attention_flash=" << a.fast_attention_flash << "\nfast_moe=" << a.fast_moe << "\nfast_dense=" << a.fast_dense
       << "\nfp16_projections=" << a.fp16_projections << "\napprox_layers=" << a.approx_layer_first << "-" << a.approx_layer_end
       << "\nfp16_min_rows=" << a.fp16_min_rows << "\nfp16_keep_a8=" << a.fp16_keep_a8 << "\nfp16_fast=" << a.fp16_fast
-      << "\nfp16_wsplit=" << a.fp16_wsplit << "\ndecoder_replay_rows=" << a.decoder_replay_rows << "\ncone=" << load.cone
+      << "\nfp16_wsplit=" << a.fp16_wsplit << "\ndecoder_replay_rows=" << a.decoder_replay_rows
+      << "\ndecoder_replay_oracle=" << replay_oracle << "\nprefill_cone=1\ncontinuation_cone=0\ncontinuation_decoder_replay_rows=0"
       << "\nrow_split=" << load.row_split << "\nquality_head_rows=" << load.quality_head_rows << "\nmax_positions=" << load.max_positions
       << "\nwindow_rows=" << load.window_rows << "\nworld=" << load.world
       << "\nfast_dense_min_rows=" << strix::ds41::fast_profile::dense_min_rows() << "\n";
@@ -170,7 +171,9 @@ int main(int argc,char** argv) try {
     strix::dist::Communicator comm(strix::dist::Group{rank,2,1,0x616d647072656669ULL},std::move(transport),std::size_t(32)<<20);
     strix::deepseek41::PrefillOptions o;o.rank=rank;o.world=2;o.communicator=&comm;
     o.max_positions=8192;o.row_split=false;o.cone=false;o.quality_head_rows=64;
+    const strix::LoaderCapture gate_capture(!gate_dir.empty());
     strix::deepseek41::DevicePrefill prefill(argv[1],o);
+    const auto gate_files=strix::LoaderCapture::snapshot();
     std::printf("loaded rank=%u seconds=%.3f weights=%llu overlay=%s trace=%d\n",rank,prefill.load_seconds(),static_cast<unsigned long long>(prefill.weight_bytes()),prefill.overlay_description().c_str(),trace);std::fflush(stdout);
     std::ifstream manifest(argv[2]);if(!manifest)throw std::runtime_error("manifest");
     struct Flags {
@@ -187,13 +190,17 @@ int main(int argc,char** argv) try {
     // GATE_DIR/tok/<case>.u32 and, at the end, GATE_DIR/<arm>/execution-r0.json from the executed configuration.
     std::map<std::string,GateArm> gate_arms;
     std::string gate_binary,gate_model;
+    if(!gate_dir.empty()){
+        strix::verify_loader_snapshot(gate_files);
+        gate_model=strix::deepseek41::quality::model_witness(argv[1],prefill.overlay_path());
+        strix::verify_loader_snapshot(gate_files);
+        std::string peer_model(gate_model.size(),'\0');
+        comm.exchange_host(std::as_bytes(std::span(gate_model)),std::as_writable_bytes(std::span(peer_model)),
+                           strix::dist::Tag{static_cast<std::uint32_t>(strix::dist::TagKind::control),0x6d6f646cU,0U});
+        if(peer_model!=gate_model)throw std::runtime_error("gate mode: ranks loaded different model content");
+    }
     if(!gate_dir.empty() && rank==0){
         gate_binary=strix::model_content_identity_hex(strix::sha256_file_content("/proc/self/exe",nullptr));
-        // the loaded model's identity line (pinned source file, loaded weight bytes, overlay content), not a re-hash
-        std::ostringstream m;
-        m<<"ds41-model-v1\npinned_target_sha256="<<strix::deepseek41::pinned_file(strix::deepseek41::PinnedFileKind::target_q2).sha256_hex
-         <<"\nweights="<<prefill.weight_bytes()<<"\noverlay="<<prefill.overlay_description()<<"\n";
-        gate_model=sha_hex(m.str());
     }
     const auto unix_now=static_cast<long long>(std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count());
     std::string name,path;unsigned n;
@@ -226,6 +233,7 @@ int main(int argc,char** argv) try {
             if(hipMemcpy(&peer_stop,flags.p+1,4,hipMemcpyDeviceToHost)!=hipSuccess)throw std::runtime_error("budget flag download");
             if(stop || peer_stop){
                 std::printf("budget_stop next=%s arm=%s elapsed=%.3f\n",name.c_str(),label.c_str(),elapsed);std::fflush(stdout);
+                if(!gate_dir.empty())strix::verify_loader_snapshot(gate_files);
                 if(!gate_dir.empty() && rank==0)write_witnesses(gate_dir,gate_arms,rank,gate_binary,gate_model);
                 return 0;
             }
@@ -236,9 +244,13 @@ int main(int argc,char** argv) try {
                 const std::span<const std::uint32_t> all(ids.data(),total);
                 const auto t0=std::chrono::steady_clock::now();
                 std::uint32_t next=0;
+                auto executed=precision;
+                bool replay_oracle=false;
                 auto pass=[&]{
                     prefill.set_cone(true);  // the prefill as served (exact suffix replay, or the arm's bounded plan)
                     auto a=prefill.run(all.first(P));
+                    executed=strix::deepseek41::quality::executed_precision(precision,a);
+                    replay_oracle=a.decoder_replay_oracle;
                     prefill.set_cone(false);  // the 64 teacher rows: every row of every layer
                     auto b=prefill.extend(all.subspan(P,64));
                     const std::size_t V=a.logits.size();
@@ -270,10 +282,10 @@ int main(int argc,char** argv) try {
                     auto& g=gate_arms[label];
                     if(g.run_id.empty()){
                         g.run_id=label+"-"+std::to_string(unix_now)+"-"+std::to_string(::getpid());
-                        g.profile=strix::deepseek41::quality::arm_profile(precision);
+                        g.profile=strix::deepseek41::quality::arm_profile(executed);
                         g.control=precision.null_ulp_layer<0?std::string("null"):"{\"kind\":\""+std::string(precision.null_ulp_layer==0?"layer0-null":"layer-null")+
                                   "\",\"layer\":"+std::to_string(precision.null_ulp_layer)+",\"magnitude\":1,\"unit\":\"ulp\"}";
-                        g.numcfg=numerical_config(precision,o);
+                        g.numcfg=numerical_config(executed,o,replay_oracle);
                     }
                     std::ostringstream e;
                     e<<"{\"tokens\":"<<total<<",\"tokens_sha256\":\""<<sha_hex(all.data(),std::size_t(total)*4)<<"\",\"rows\":65,\"files\":{\"tf\":{\"name\":\""
@@ -329,6 +341,7 @@ int main(int argc,char** argv) try {
             std::fflush(stdout);
         }
     }
+    if(!gate_dir.empty())strix::verify_loader_snapshot(gate_files);
     if(!gate_dir.empty() && rank==0)write_witnesses(gate_dir,gate_arms,rank,gate_binary,gate_model);
     return 0;
 }catch(const std::exception& e){std::fprintf(stderr,"prefill-quality: %s\n",e.what());return 2;}

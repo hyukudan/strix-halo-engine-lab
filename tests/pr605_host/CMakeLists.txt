@@ -1,0 +1,23 @@
+cmake_minimum_required(VERSION 3.24)
+if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
+    project(strix_pr605_host LANGUAGES CXX)
+    enable_testing()
+endif()
+get_filename_component(ROOT "${CMAKE_CURRENT_LIST_DIR}/../.." ABSOLUTE)
+find_package(Python3 REQUIRED COMPONENTS Interpreter)
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+    "${CMAKE_CURRENT_SOURCE_DIR}/extract.py" "${ROOT}/src/hip_deepseek41_prefill.hip")
+execute_process(COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/extract.py"
+    "${ROOT}" "${CMAKE_CURRENT_BINARY_DIR}" COMMAND_ERROR_IS_FATAL ANY)
+add_executable(pr605-host regression.cpp "${ROOT}/src/model_content_hash.cpp"
+    "${ROOT}/src/model_runtime_binding.cpp")
+target_include_directories(pr605-host PRIVATE "${ROOT}/include" "${ROOT}/apps" "${CMAKE_CURRENT_BINARY_DIR}")
+target_compile_features(pr605-host PRIVATE cxx_std_20)
+if(MSVC)
+    target_compile_definitions(pr605-host PRIVATE _CRT_SECURE_NO_WARNINGS NOMINMAX)
+    target_compile_options(pr605-host PRIVATE /W4 /WX /utf-8)
+else()
+    target_compile_options(pr605-host PRIVATE -Wall -Wextra -Wpedantic -Werror)
+endif()
+add_test(NAME pr605-replay-reference COMMAND pr605-host replay)
+add_test(NAME pr605-model-content COMMAND pr605-host model)
