@@ -4582,6 +4582,32 @@ main loop unchanged). The out GEMM still reads FP32 o-bar.
 - **Resources:** no spill; fused core 256 VGPR and absorb 128 VGPR as before; same scratch buffer (the image uses half of it).
 - **Implementation / evidence:** [hook](../src/attn_core/sparse_flash_wmma.hpp), [GLM absorb + policy](../src/glm/prefill/glm_prefill.hip), [test](../tests/hip_glm_prefill_tests.hip), [bench](../tests/hip_glm_pf_layer_bench.hip), [pair A/B kit](../scripts/bench/glm/prefill-pair.sh) (arms `--profile fast` with and without `STRIX_GLM_PF_MLA_QT16=0`)
 
+<a id="ds41-pf-flash-q16"></a>
+
+### DS41 FAST flash reads q as a bf16 image after RoPE
+
+**Engine:** `deepseek41` (shared cores `core::f16_dense_tall::q8a8` image store, `attn_core::sparse` query_op). **Control:** `STRIX_DS41_FAST_ATTN_Q16`. **Default:** on in ds41-attn-bf16flash-v1 layers when q_b runs on dense-q8a8-f16-v1.
+
+The q_b epilogue applies the flash prologue's own RoPE (`rope_pair`, dims 448..511) and rounding (`tile::to_bf16`) and stores the bf16 image in q's memory; the flash core loads it through `query_op` with no FP32 prologue. Other q_b forms keep FP32 q.
+
+- **Exactness evidence:** Bitwise. `strix-hip-ds41-fast-dense-tests` image vs prologue 0 differing values (10 shapes); pair 11,594 logits fnv equal in all 12 processes (both ranks, both arms).
+- **Off switch:** `STRIX_DS41_FAST_ATTN_Q16=0` (FP32 q, same bits)
+- **Measured gain:** q_b 2048 x 1024 x 8192: 1.505 -> 1.352 ms. Pair 11,594 warm, strict ABAB 3 pairs: d +15 / +30 / -29 ms (no wall gain beyond noise).
+- **Implementation / evidence:** [image store](../src/core/f16_dense_q8a8.hpp), [q_b](../src/hip_ds41_layer.hip), [policy](../src/hip_ds41_attention_flash.inl), [test](../tests/hip_ds41_fast_dense_tests.hip)
+
+<a id="mm-pf-msa-q16"></a>
+
+### MiniMax MSA FAST flash reads q as a bf16 image after norm + RoPE
+
+**Engine:** `minimax` (shared core `attn_core::sparse` key-split query_op / query_op_lo). **Control:** `STRIX_MM_PF_MSA_Q16`. **Default:** on in mode 11 / 12 layers when q comes from the v4 dense core (1024+ rows).
+
+The q finish (`dense_finish_kernel`) moves each head row to the prologue's lane layout, runs the same `msa::norm_rope_lane` (one definition, `msa_norm_rope.hpp`) and stores `pack2<bf16>` (mode 12 also the lo terms) in q's memory; the key-split core loads it through `query_op`. Rows below 1024 use the library GEMM (no epilogue) and keep FP32 q.
+
+- **Exactness evidence:** Bitwise. `strix-hip-mmx-moe-bench --tests test_prefill_dense`: q image and lo equal to the prologue at T 9..4096 and band 4; pair 8K state and final-rows fnv equal in all 6 runs.
+- **Off switch:** `STRIX_MM_PF_MSA_Q16=0` (FP32 q, same bits)
+- **Measured gain:** pair 8K warm, strict ABAB 3 pairs: d -1.87 / -1.10 / -0.50 s; larger than the byte saving explains (directional, being traced).
+- **Implementation / evidence:** [hook](../src/attn_core/sparse_flash_keysplit.hpp), [q finish](../src/minimax/moe/mmx_prefill.hip), [policy](../src/minimax/attn/msa_flash_policy.hpp), [test](../tests/hip_mmx_moe_bench.hip)
+
 <a id="mm-pf-msa-flash"></a>
 
 ### FAST key-split MSA attention core (mm-pf-msa-flash)
