@@ -91,12 +91,21 @@ static bool same(const std::vector<float>& a, const std::vector<float>& b) {
 }
 
 int main() {
-    for (const auto pack : {q::PackFormat::bf16, q::PackFormat::q8_0}) {
-        std::printf("pack %s\n", pack == q::PackFormat::bf16 ? "bf16" : "q8_0");
+    // variants: 0 bf16, 1 q8_0, 2 nvfp4 onfly (all 2-D incl. lm_head, ssm beta/alpha, multi launches), 3 nvfp4 onfly lm_head bf16
+    for (int var = 0; var < 4; ++var) {
+        const auto pack = var == 1 ? q::PackFormat::q8_0 : q::PackFormat::bf16;
+        std::printf("variant %d: %s%s\n", var, var == 0 ? "bf16" : var == 1 ? "q8_0" : "nvfp4 onfly", var == 3 ? " lm_head bf16" : "");
         q::EngineOptions opt;
         opt.max_positions = 512;
         opt.quiet = true;
-        auto E = q::CudaEngine::synthetic(small_cfg(), pack, opt, 7);
+        q::Config cfg = small_cfg();
+        if (var >= 2) {
+            opt.turbo_weights = q::TurboWeights::onfly;
+            opt.turbo_lm_head = var == 2;
+            cfg.gdn_value_heads = 16;  // ssm beta/alpha out = 16: NVFP4-eligible, exercises the 4-job multi launch
+        }
+        auto E = q::CudaEngine::synthetic(cfg, pack, opt, 7);
+        if (var >= 2) CHECK(E->nvfp4_tensors() > 40, "nvfp4 tensors converted");
         std::mt19937 rng(99);
         std::vector<std::uint32_t> tok(160);
         for (auto& t : tok) t = rng() % 2048;
@@ -112,6 +121,20 @@ int main() {
         run_chain(*E, tok, chg, rng, false);
         CHECK(same(ser.logits, chg.logits), "graph-off chain logits differ from serial");
         E->set_graphs(true);
+        if (var >= 2) {  // multi-launch lever off must be bitwise equal too (separate GEMV launches)
+            opt.multi_gemv = false;
+            auto E2 = q::CudaEngine::synthetic(cfg, pack, opt, 7);
+            Rec s2;
+            run_serial(*E2, tok, s2);
+            CHECK(same(ser.logits, s2.logits), "multi-launch off differs");
+        }
+        if (var >= 2) {  // multi-launch lever off must be bitwise equal too (separate GEMV launches)
+            opt.multi_gemv = false;
+            auto E2 = q::CudaEngine::synthetic(cfg, pack, opt, 7);
+            Rec s2;
+            run_serial(*E2, tok, s2);
+            CHECK(same(ser.logits, s2.logits), "multi-launch off differs");
+        }
         // MTP: one call with rows == the same rows one at a time
         if (E->has_mtp()) {
             const auto& c = E->config();

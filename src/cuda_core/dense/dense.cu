@@ -1,5 +1,6 @@
 // Dense rows 1..16: BF16 / Q8_0 / F32 weights, FP32 accumulation in the fixed order documented in dense.hpp.
 #include "strix/cuda_core/dense.hpp"
+#include "strix/cuda_core/nvfp4.hpp"
 
 #include "../common.cuh"
 #include "dense_mma.hpp"
@@ -344,12 +345,21 @@ DenseArith dense_arith() { return g_arith; }
 
 cudaError_t dense_rows(const DenseWeight& w, const float* x, float* y, std::uint32_t rows, const float* residual,
                        cudaStream_t stream) {
+    if (w.format == WeightFormat::nvfp4) return nvfp4_dense_rows(w, x, y, rows, residual, stream);
     return dense_rows_multi(&w, &y, 1, x, rows, residual, stream);
 }
 
 cudaError_t dense_rows_multi(const DenseWeight* ws, float* const* ys, int n, const float* x, std::uint32_t rows,
                              const float* residual, cudaStream_t stream) {
     if (n < 1 || n > kMaxMulti || (residual != nullptr && n != 1)) return cudaErrorInvalidValue;
+    if (ws[0].format == WeightFormat::nvfp4) {  // W4A16 GEMV: one launch for jobs sharing x, bitwise equal to separate calls
+        Nvfp4Job jobs[kMaxMulti];
+        for (int j = 0; j < n; ++j) {
+            if (ws[j].format != WeightFormat::nvfp4 || ws[j].in != ws[0].in) return cudaErrorInvalidValue;
+            jobs[j] = Nvfp4Job{ws[j], ys[j], residual};
+        }
+        return nvfp4_dense_rows_multi(jobs, static_cast<std::uint32_t>(n), x, rows, stream);
+    }
     MultiArgs ma{};
     ma.n = n;
     std::uint32_t total = 0;
@@ -374,6 +384,7 @@ cudaError_t dense_rows_multi(const DenseWeight* ws, float* const* ys, int n, con
 
 cudaError_t dense_gate_up_silu_rows(const DenseWeight& gate, const DenseWeight& up, const float* x, float* y,
                                     std::uint32_t rows, cudaStream_t stream) {
+    if (gate.format == WeightFormat::nvfp4) return nvfp4_gate_up_silu_rows(gate, up, x, y, rows, stream);
     if (!valid(gate, rows) || !valid(up, rows) || gate.format != up.format || gate.in != up.in || gate.out != up.out)
         return cudaErrorInvalidValue;
     MultiArgs ma{};
