@@ -89,9 +89,13 @@ fi
 
 hip="$bindir/strix-hip-decode-token"
 if [ -x "$hip" ] && [ -n "$model" ]; then
-    out=$(timeout 120 "$hip" "$model" --print-effective-config 2>&1 </dev/null); rc=$?
+    out=$(timeout 120 "$hip" "$model" 1 --http-serve --print-effective-config 2>&1 </dev/null); rc=$?
     if [ $rc -eq 0 ]; then pass "strix-hip-decode-token --print-effective-config ($(printf '%s' "$out" | wc -l) lines)"
-    else fail "strix-hip-decode-token --print-effective-config rc=$rc: $(printf '%s' "$out" | tail -n 2 | tr '\n' ' ' | cut -c1-200)"; fi
+    else
+        why=$(printf '%s' "$out" | grep -v '^strix-route-receipt' | grep -m 2 -iE "error|refus|invalid|required|cannot|missing")
+        [ -n "$why" ] || why=$(printf '%s' "$out" | grep -v '^strix-route-receipt' | tail -n 2)
+        fail "strix-hip-decode-token --print-effective-config rc=$rc: $(printf '%s' "$why" | tr '\n' ' ' | cut -c1-240)"
+    fi
 elif [ -x "$hip" ]; then
     skip "--print-effective-config: needs --model FILE.gguf"
 fi
