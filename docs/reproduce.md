@@ -609,6 +609,12 @@ failure may prevent final report delivery; inspect retained evidence privately.
 the state handed to the pair, the pair alone, the CUDA device alone), cold and warm, in one detached run with a phase
 breakdown, GPU clocks per token and a host-node link probe (RTT and useful throughput both ways).
 
+### MiniMax MSA flash layer ranges (FAST gate)
+
+[`scripts/bench/mmflash/`](../scripts/bench/mmflash/README.md) qualifies a layer range for the FAST MSA flash attention
+(one-term or two-term operands) against the exact path in one detached pair run: onset-matched one-ulp nulls for the
+floor rule, optional multi-site / magnitude nulls as a diagnostic, cold and warm TTFT, evicted_ms and GPU clocks per token.
+
 ## Long-context retrieval and reasoning checks (Qwen)
 
 `tools/qualification/longctx_fidelity/` builds deterministic prompts whose answers are computed by the

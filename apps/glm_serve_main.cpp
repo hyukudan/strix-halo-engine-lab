@@ -49,6 +49,7 @@
 // request ends the decoder at a cycle boundary (deferred rows flushed) and batched plain steps follow.
 #include "strix/device/hip_gate.hpp"
 #include "glm_rank_defaults.hpp"
+#include "glm_auto_rows.hpp"
 #include "strix/env_flags.hpp"
 #include "glm_rank_startup.hpp"
 #include "glm_rank_transport.hpp"
@@ -952,9 +953,8 @@ int main(int argc, char** argv) {
         if (selftest > 32) throw std::invalid_argument("--selftest N: 1..32");
 
         // Engine configuration: the rank app's resolution of a normal decode (MTP self-speculation and its exact chunked
-        // bootstrap when the model has a complete MTP head; STRIX_GLM_SERVE_MTP=0 resolves as --mtp-spec 0). No decode
-        // handshake here (both ranks resolve on their own and hello compares the result), so automatic max-rows takes its
-        // fixed fallback.
+        // bootstrap when the model has a complete MTP head; STRIX_GLM_SERVE_MTP=0 resolves as --mtp-spec 0). Automatic
+        // max-rows runs the CLI's load-time admission (rd::admit_auto_rows) and a row merge between the two ranks.
         auto eff = rd::resolve_serve(rank_args, serve_mtp, rd::process_env(), rd::probe_model_mtp(argv[1]));
         const bool mtp_on = eff.mtp_spec.value == "1" && (eff.prefill == "gemv" || eff.prefill == "ref");
         if (!deployment.file.empty() || deployment.check) {
@@ -991,8 +991,9 @@ int main(int argc, char** argv) {
         opt.mtp = mtp_on;
         opt.spec = mtp_on;
         opt.max_rows = static_cast<unsigned>(std::stoul(eff.max_rows.value));
-        opt.auto_rows = false;
-        opt.exchange_rows = opt.max_rows;
+        opt.auto_rows = rd::max_rows_auto(eff);
+        // As the CLI: the exchange starts at the fallback and grows once the 8192-row candidate is admitted on both ranks.
+        opt.exchange_rows = opt.auto_rows ? rd::kFallbackMaxRows : opt.max_rows;
         // Prefill units (rd::resolve, serving-only): the decode row window is reserved at load, before admission.
         opt.prefill_units = mtp_on && eff.prefill == "gemv" && eff.prefill_units.value == "1";
         const std::string& id = eff.identity.value;
@@ -1028,13 +1029,38 @@ int main(int argc, char** argv) {
         }
         opt.host_budget = prefix_cache_bytes;  // the prefix snapshots are this process's RSS: not a watchdog breach
         ge::Engine eng(opt, comm.get());
-        const auto lr = eng.load([&](const ge::mem::LoadAdmission&) { return opt.max_rows; });
-        if (prefill_mode != "ref") {
-            namespace pf = strix::glm::pf;
-            const unsigned heads = 64 / opt.world;
-            eng.set_prefill(pf::make_prefill_path(heads, heads, opt.capacity, opt.max_rows,
-                                                  prefill_mode == "gemv" ? pf::TierB::gemv : pf::TierB::wmma));
-        }
+        const auto pf_tier = prefill_mode == "gemv" ? strix::glm::pf::TierB::gemv : strix::glm::pf::TierB::wmma;
+        rd::PrefillLoad prefill_load{{opt.rank, opt.world, opt.capacity, opt.mtp, prefill_mode == "ref", pf_tier}};
+        bool rows_mode_checked = false;
+        const auto lr = prefill_load.load(eng, opt, [&](const ge::mem::LoadAdmission& admission) {
+            // Both ranks must be in the same max-rows mode before the automatic admission's votes (a peer in a fixed mode
+            // would never answer them).
+            if (!rows_mode_checked && comm) {
+                rows_mode_checked = true;
+                std::uint32_t mode = opt.auto_rows ? 1U : 0U, peer_mode = mode;
+                comm->exchange_host(std::as_bytes(std::span{&mode, 1}), std::as_writable_bytes(std::span{&peer_mode, 1}),
+                                    {static_cast<std::uint32_t>(strix::dist::TagKind::raw_slots), 0xFFFFFFFAU, 0U});
+                if (peer_mode != mode) throw std::runtime_error("TP2 ranks resolved different max-rows modes (automatic vs fixed)");
+            }
+            prefill_load.margin = std::max(strix::glm::pf::admission_margin_bytes(), admission.margins.ram);
+            if (!opt.auto_rows) return opt.max_rows;
+            // The CLI's margins: the 8 GiB OS/peer/runtime headroom at both checks.
+            prefill_load.margin = std::max({strix::glm::pf::admission_margin_bytes(), admission.margins.ram, rd::kMaxRowsSafetyBytes});
+            const rd::AutoRowsPlan plan{opt.rank, opt.world, opt.capacity, opt.mtp, prefill_mode == "ref", pf_tier};
+            opt.max_rows = rd::admit_auto_rows(eff, admission, plan, prefill_load.margin, [&](std::uint32_t fits) {
+                std::uint32_t peer_fits = fits;
+                if (comm)
+                    comm->exchange_host(std::as_bytes(std::span{&fits, 1}), std::as_writable_bytes(std::span{&peer_fits, 1}),
+                        {static_cast<std::uint32_t>(strix::dist::TagKind::raw_slots), 0xFFFFFFFBU, admission.recheck ? 1U : 0U});
+                return peer_fits;
+            }, [&](unsigned rows) {
+                return rd::recheck_rows(rows, comm != nullptr,
+                    [&](auto* proposal, unsigned n, auto& ctl) { eng.exchange()->merge(proposal, n, ctl, nullptr); });
+            });
+            if (comm) comm->resize_bytes(std::size_t{opt.max_rows} * 4096 * sizeof(float) + 4096);
+            std::fprintf(stderr, "rank %u max-rows=%u (%s)\n", opt.rank, opt.max_rows, eff.max_rows.source.c_str());
+            return opt.max_rows;
+        });
         std::printf("rank %u: load %.1f s, %.1f GiB read, device %.1f GiB, identity %s, decode-xch %s, prefill %s pipeline %u\n",
                     opt.rank, lr.seconds, lr.gib_read, lr.device_gib, ge::identity_mode_name(eng.identity_mode()),
                     opt.world == 1 ? "local" : eng.decode_xfer_enabled() ? "xfer" : "comm", prefill_mode.c_str(), eng.prefill_pipeline());
