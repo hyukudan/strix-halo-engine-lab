@@ -66,7 +66,9 @@ struct LogprobEntry {
     double logprob = 0.0;
 };
 struct LogprobRowScore {
-    double log_normalizer = 0.0;  // max + log(sum): logprob(x) = x - log_normalizer
+    double log_normalizer = 0.0;  // max + log(sum), informational: may lose the centered term at large offsets
+    double maximum = 0.0;
+    double centered_log_normalizer = 0.0;  // logprob(x) = (double(x) - maximum) - centered_log_normalizer
     bool has_target = false;
     double target_logprob = 0.0;
     std::uint64_t target_rank = 0;  // 1 = best (value descending, lowest ID first among equals); 0 = unknown

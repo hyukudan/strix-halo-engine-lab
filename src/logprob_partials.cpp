@@ -78,7 +78,9 @@ LogprobRowScore combine_logprob_partials(std::span<const LogprobPartial> slices,
     for (const auto& p : slices)
         if (p.sum > 0.0F) sum += static_cast<double>(p.sum) * std::exp(static_cast<double>(p.max) - maximum);
     LogprobRowScore out;
-    out.log_normalizer = maximum + std::log(sum);
+    out.maximum = maximum;
+    out.centered_log_normalizer = std::log(sum);
+    out.log_normalizer = maximum + out.centered_log_normalizer;
     // merged top: each slice list is sorted; take the best head `top` times
     std::vector<std::uint32_t> head(slices.size(), 0U);
     for (std::uint32_t k = 0; k < top; ++k) {
@@ -91,7 +93,7 @@ LogprobRowScore combine_logprob_partials(std::span<const LogprobPartial> slices,
         }
         if (best == slices.size()) break;
         const auto& p = slices[best];
-        out.top.push_back({p.top_id[head[best]], static_cast<double>(p.top_value[head[best]]) - out.log_normalizer});
+        out.top.push_back({p.top_id[head[best]], (static_cast<double>(p.top_value[head[best]]) - maximum) - out.centered_log_normalizer});
         ++head[best];
     }
     if (target_id != kLogprobNoTarget) {
@@ -104,7 +106,7 @@ LogprobRowScore combine_logprob_partials(std::span<const LogprobPartial> slices,
         }
         if (found != 1U) throw std::invalid_argument("logprob partials: target found in " + std::to_string(found) + " slices");
         out.has_target = true;
-        out.target_logprob = static_cast<double>(logit) - out.log_normalizer;
+        out.target_logprob = (static_cast<double>(logit) - maximum) - out.centered_log_normalizer;
         if (counted == slices.size()) out.target_rank = rank;
         else
             for (std::size_t k = 0; k < out.top.size(); ++k)

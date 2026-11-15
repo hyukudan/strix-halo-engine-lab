@@ -369,6 +369,7 @@ std::uint64_t workspace_bytes_for(const TargetModel& model, const BatchForwardOp
     n += W * H + 2U * W * H / 32U * 4U;                                                    // FFN input A8
     n += W * K * I + 2U * W * K * I / 32U * 4U + W * I + 2U * W * I / 32U * 4U;            // expert activations A8
     n += (W * partial_blocks + 5U * W) * sizeof(ds41::ArgmaxCandidate);                     // argmax
+    n += 2U * W * sizeof(LogprobPartial);                                                 // score_own, score_other (also when scoring is off)
     n += 2U * (W * H + W * H / 2U) * 4U;                                                   // half sums (+ split shared down rows)
     n += 2U * (W * I / 2U + W * I / 64U * 4U);                                             // split shared activation halves
     n += 6U * (W * K + 1U) * 4U + 2U * std::max<std::uint64_t>(options.layers, 1U) * 4U;                                                // built routes

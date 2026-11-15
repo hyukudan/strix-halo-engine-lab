@@ -182,6 +182,8 @@ public:
     // after the head, the 192-byte partials of the step's rows travel in one exchange (world 2), and the host merges
     // them in FP64. Both ranks must set the same mask before the same step (the serve control block carries it).
     // 0 (the default) adds no launch, byte or exchange; the tokens are those of the unscored step either way.
+    // Any nonzero mask reduces and transfers ALL step rows, even if no current row belongs to a selected slot;
+    // only host merging is selective. Serving admission must budget this full-step cost. Scratch is always reserved.
     void set_score_slots(std::uint64_t mask) noexcept { score_slots_ = mask; }
     [[nodiscard]] std::uint64_t score_slots() const noexcept { return score_slots_; }
     // Row r of the last step: its score when its slot was scored, else null.

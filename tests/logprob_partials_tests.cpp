@@ -61,6 +61,18 @@ void check_row(const std::vector<float>& row, std::uint32_t slices, std::uint32_
 } // namespace
 
 int main() {
+    for (const float offset : {1e20F, -1e20F}) {
+        const std::vector<float> large(2, offset);
+        for (const std::uint32_t slices : {1U, 2U}) {
+            for (const std::uint32_t top : {0U, 2U}) check_row(large, slices, top, 0U, true);
+            const auto score = strix::combine_logprob_partials(split(large, slices, 2U, {0U, offset, true}), 2U, 0U);
+            expect(std::abs(score.target_logprob + std::log(2.0)) < 1e-12, "large-offset target stays centered");
+            for (const auto& entry : score.top)
+                expect(std::abs(entry.logprob + std::log(2.0)) < 1e-12, "large-offset top stays centered");
+            expect(std::abs((static_cast<double>(offset) - score.maximum) - score.centered_log_normalizer + std::log(2.0)) < 1e-12,
+                   "retained centered normalizer supports further scores");
+        }
+    }
     constexpr std::uint32_t V = 129280;  // DeepSeek V4 vocabulary (two ranks: 64,640 per slice)
     std::vector<float> row(V);
     for (const float scale : {4.0F, 40.0F}) {

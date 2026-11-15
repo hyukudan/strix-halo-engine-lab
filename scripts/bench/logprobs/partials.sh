@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Logprob partial kernels (strix/logprob_partials.hpp): correctness against the FP64 reference and the kernel cost per
 # step at several row counts (DS41 rank slice: 64,640 entries per row). One GPU, one process per arm.
-# Usage: partials.sh --bin PATH [--rows "1 8 32 128"] [--top 20]
+# Usage: bash partials.sh --bin PATH [--rows "1 8 32 128"] [--top 20]
 #   PATH: strix-hip-logprob-partials-tests or strix-cuda-logprob-partials-tests (select the device with the
 #   platform's visibility variable before calling; the script never chooses one).
 set -euo pipefail

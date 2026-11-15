@@ -1331,6 +1331,10 @@ int main() try {
         check(at(scores.as_array()[0], "logprob").as_double() == -std::log(sum), "wire logprob exactly equals reference");
         check(at(at(result, "strix"), "scoring").find("basis")->as_string() == "target-row-log-softmax", "score basis receipt");
         check(at(at(result, "strix"), "scoring").find("values")->as_string() == "raw", "score values receipt: raw target row");
+        check(at(at(at(result, "strix"), "scoring"), "execution").as_string() == constrained_config.scoring_execution,
+              "score receipt execution matches configured route");
+        check(at(at(at(result, "strix"), "scoring"), "precision").as_string() == constrained_config.scoring_precision,
+              "score receipt precision matches configured route");
         for(const auto* marker:{"ROUTE_MTP","ROUTE_OFF"}) {
             auto routed=base;routed.set("messages",parse_json(std::string("[{\"role\":\"user\",\"content\":\"")+marker+"\"}]"));
             const auto wire=parse_json(call("/v1/chat/completions",routed,false).body);

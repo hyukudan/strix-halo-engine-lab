@@ -85,38 +85,40 @@ int main(int argc, char** argv) {
     check(hipMemcpy(d.logits, host.data(), host.size() * 4U, hipMemcpyHostToDevice), "copy");
     check(hipMemcpy(d.targets, targets.data(), rows * sizeof(strix::LogprobTarget), hipMemcpyHostToDevice), "copy");
     const std::uint32_t half = V / 2U;
-    // two slices of every row, as two ranks: [0, half) and [half, V), partials [slice][row]
-    strix::enqueue_hip_logprob_partials({d.logits, rows, half, V, 0U, 20U, d.targets, d.out}, nullptr);
-    strix::enqueue_hip_logprob_partials({d.logits + half, rows, V - half, V, half, 20U, d.targets, d.out + rows}, nullptr);
-    std::vector<strix::LogprobPartial> got(2U * rows);
-    check(hipMemcpy(got.data(), d.out, got.size() * sizeof(strix::LogprobPartial), hipMemcpyDeviceToHost), "copy back");
     double worst_ref = 0.0, worst_host = 0.0;
-    for (std::uint32_t r = 0; r < rows; ++r) {
-        const std::span<const float> row(host.data() + std::size_t{r} * V, V);
-        const strix::LogprobPartial host_parts[2] = {strix::logprob_partial_host(row.subspan(0, half), 0U, 20U, targets[r]),
-                                                     strix::logprob_partial_host(row.subspan(half), half, 20U, targets[r])};
-        const strix::LogprobPartial dev_parts[2] = {got[r], got[rows + r]};
-        for (int s = 0; s < 2; ++s) {
-            const auto& h = host_parts[s];
-            const auto& g = dev_parts[s];
-            expect(h.max == g.max && h.flags == g.flags && h.greater == g.greater && h.ties_lower == g.ties_lower &&
-                       h.nonfinite == g.nonfinite && h.top_count == g.top_count && h.target == g.target,
-                   "device partial fields equal the host oracle");
-            for (std::uint32_t k = 0; k < h.top_count && k < 20U; ++k)
-                expect(h.top_id[k] == g.top_id[k] && h.top_value[k] == g.top_value[k], "device top equals the host oracle");
-            worst_host = std::max(worst_host, std::abs(double(h.sum) - double(g.sum)) / double(h.sum));
+    for (const std::uint32_t top : {0U, 20U}) {  // target-only and top-list scoring
+        // two slices of every row, as two ranks: [0, half) and [half, V), partials [slice][row]
+        strix::enqueue_hip_logprob_partials({d.logits, rows, half, V, 0U, top, d.targets, d.out}, nullptr);
+        strix::enqueue_hip_logprob_partials({d.logits + half, rows, V - half, V, half, top, d.targets, d.out + rows}, nullptr);
+        std::vector<strix::LogprobPartial> got(2U * rows);
+        check(hipMemcpy(got.data(), d.out, got.size() * sizeof(strix::LogprobPartial), hipMemcpyDeviceToHost), "copy back");
+        for (std::uint32_t r = 0; r < rows; ++r) {
+            const std::span<const float> row(host.data() + std::size_t{r} * V, V);
+            const strix::LogprobPartial host_parts[2] = {strix::logprob_partial_host(row.subspan(0, half), 0U, top, targets[r]),
+                                                         strix::logprob_partial_host(row.subspan(half), half, top, targets[r])};
+            const strix::LogprobPartial dev_parts[2] = {got[r], got[rows + r]};
+            for (int s = 0; s < 2; ++s) {
+                const auto& h = host_parts[s];
+                const auto& g = dev_parts[s];
+                expect(h.max == g.max && h.flags == g.flags && h.greater == g.greater && h.ties_lower == g.ties_lower &&
+                           h.nonfinite == g.nonfinite && h.top_count == g.top_count && h.target == g.target,
+                       "device partial fields equal the host oracle");
+                for (std::uint32_t k = 0; k < h.top_count && k < 20U; ++k)
+                    expect(h.top_id[k] == g.top_id[k] && h.top_value[k] == g.top_value[k], "device top equals the host oracle");
+                worst_host = std::max(worst_host, std::abs(double(h.sum) - double(g.sum)) / double(h.sum));
+            }
+            const auto score = strix::combine_logprob_partials(dev_parts, top, targets[r].id);
+            std::vector<std::uint32_t> ids;
+            for (const auto& e : score.top) ids.push_back(e.id);
+            if (score.has_target) ids.push_back(targets[r].id);
+            std::vector<strix::RequestedLogprob> ref(ids.size());
+            strix::compute_requested_logprobs(row, ids, ref);
+            for (std::size_t k = 0; k < score.top.size(); ++k) worst_ref = std::max(worst_ref, std::abs(score.top[k].logprob - ref[k].log_probability));
+            if (score.has_target) worst_ref = std::max(worst_ref, std::abs(score.target_logprob - ref.back().log_probability));
+            if (top != 0U && r == 3U) expect(score.top.size() == 20U && score.top[0].id == 0U && score.top[19].id == 19U, "ties order by ID");
+            if (top != 0U && r == 2U) expect(score.top[0].id == 500U, "peaked row");
+            if (top != 0U && r == 4U) expect(score.top.size() == 20U && score.top[0].id == 256U * 504U + 19U, "candidate overflow row");
         }
-        const auto score = strix::combine_logprob_partials(dev_parts, 20U, targets[r].id);
-        std::vector<std::uint32_t> ids;
-        for (const auto& e : score.top) ids.push_back(e.id);
-        if (score.has_target) ids.push_back(targets[r].id);
-        std::vector<strix::RequestedLogprob> ref(ids.size());
-        strix::compute_requested_logprobs(row, ids, ref);
-        for (std::size_t k = 0; k < score.top.size(); ++k) worst_ref = std::max(worst_ref, std::abs(score.top[k].logprob - ref[k].log_probability));
-        if (score.has_target) worst_ref = std::max(worst_ref, std::abs(score.target_logprob - ref.back().log_probability));
-        if (r == 3U) expect(score.top.size() == 20U && score.top[0].id == 0U && score.top[19].id == 19U, "ties order by ID");
-        if (r == 2U) expect(score.top[0].id == 500U, "peaked row");
-        if (r == 4U) expect(score.top.size() == 20U && score.top[0].id == 256U * 504U + 19U, "candidate overflow row");
     }
     expect(worst_ref <= strix::kLogprobPartialTolerance, "device partials within the documented tolerance");
     std::printf("hip logprob partials: worst vs FP64 %.3e nats, worst sum vs host lane order %.3e relative\n", worst_ref, worst_host);
