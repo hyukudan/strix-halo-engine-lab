@@ -1,4 +1,11 @@
-# Qwen3.8-27B host model declaration
+# Dense (non-hybrid) Qwen-style host model declaration
+
+Scope: the checkpoint-format and dense-decoder host layer. It rejects hybrid attention
+(`layer_types` other than `full_attention`), so it does NOT admit the released
+Qwen3.8-27B, which interleaves 48 gated-delta-net and 16 gated full-attention layers;
+that model is declared by the `qwen35` family (`include/strix/qwen35/config.hpp`).
+What this change shares with it is the mapped storage, safetensors/GGUF archive,
+NVFP4 import view and RoPE/geometry parser.
 
 Home: shared (host shared). File ownership, GGUF decoding, safetensors indexing,
 NVFP4 views, dense config parsing and dense graph construction are shared code.
