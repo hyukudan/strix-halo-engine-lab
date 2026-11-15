@@ -2709,7 +2709,7 @@ struct Bench {
     }
     // Dense v4 chunk invariance (STRIX_MMX_PF_ORDER=invariant binds core::fixed_linear_contract): every group's output over
     // T rows computed whole == computed in segments of 256 / 1024 / 4096 rows, 4096 + 1..17 tails and 1..17-row calls,
-    // bitwise; the adaptive control (gemm_splits by rows) differs at T=8192. Where the library's split equals the fixed
+    // bitwise; the adaptive control (gemm_splits by rows) must differ in some chunking. Where the library's split equals the fixed
     // one (> 8 rows, S = 1) the invariant v4 output also equals strix_gemm (the engine keeps the library there).
     void run_dense_segments(const std::vector<DenseSite*>& g, const float* in, const std::vector<float*>& outs, unsigned T,
                             unsigned seg, void* ws) {
@@ -2740,7 +2740,7 @@ struct Bench {
             }
             void* ws = nullptr;
             hip_ok(hipMalloc(&ws, ws_bytes), "dense ws");
-            unsigned pass = 0, cells = 0, lib_same = 0, lib_cells = 0;
+            unsigned pass = 0, cells = 0, lib_same = 0, lib_cells = 0, control_cases = 0;
             for (const Case& k : cases) {
                 std::vector<float> hin(std::size_t{k.T} * K);
                 std::normal_distribution<float> nd(0.0F, 1.0F);
@@ -2791,17 +2791,15 @@ struct Bench {
                         }
                     }
                 }
-                if (k.T == 8192) {
-                    check(control_differs, "dense negative control: adaptive split should change bits at 256-row segments " + group_name(g));
-                    std::printf("dense chunk invariance %s T=8192 adaptive control: %s\n", group_name(g).c_str(),
-                                control_differs ? "differs (expected)" : "SAME");
-                }
+                if (control_differs) ++control_cases;
                 hip_ok(hipFree(in), "free");
                 for (auto* x : whole) hip_ok(hipFree(x), "free");
                 for (auto* x : part) hip_ok(hipFree(x), "free");
             }
-            std::printf("dense chunk invariance %s invariant: %u/%u bitwise; library == invariant v4 %u/%u\n", group_name(g).c_str(),
-                        pass, cells, lib_same, lib_cells);
+            // Adaptive control: some chunking must differ (q / o: only the short calls, where the library split is > 1).
+            check(control_cases > 0, "dense negative control: adaptive split should change bits in some chunking " + group_name(g));
+            std::printf("dense chunk invariance %s invariant: %u/%u bitwise; library == invariant v4 %u/%u; adaptive control "
+                        "differs in %u/%zu cases\n", group_name(g).c_str(), pass, cells, lib_same, lib_cells, control_cases, cases.size());
             std::fflush(stdout);
             hip_ok(hipFree(ws), "free");
         }
