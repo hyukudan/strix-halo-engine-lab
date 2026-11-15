@@ -32,6 +32,7 @@
 #include "strix/session/speculation_default.hpp"
 #include "strix/mtp_depth_window_controller.hpp"
 #include <cerrno>
+#include <charconv>
 #include <fstream>
 #include <functional>
 #include <iterator>
@@ -390,6 +391,10 @@ struct Options {
     std::vector<std::uint32_t> logprob_token_ids;
     bool teacher_forced_score = false;
     std::string teacher_logits_path;
+    // --teacher-logits-rows PATH: ascending row positions (whitespace-separated decimals) the teacher
+    // logits file keeps (TMLLOG02); every row is still scored. Quality kits: spread prompt positions.
+    std::vector<std::uint64_t> teacher_logits_rows;
+    bool teacher_logits_rows_supplied = false;
     // Dense Q6P32 pack of an emulated checkpoint (strix/hip_q6p_pack.hpp).
     std::string dense_q6p_pack_path;
     std::string dense_trellis_pack_path;
@@ -990,6 +995,8 @@ inline void validate_resolved_requested_logprobs(const Options& options, std::ui
 inline void validate_teacher_forced_score(const Options& options) {
     if (!options.teacher_logits_path.empty() && !options.teacher_forced_score)
         throw std::invalid_argument("teacher logits file requires teacher-forced score");
+    if (options.teacher_logits_rows_supplied && options.teacher_logits_path.empty())
+        throw std::invalid_argument("teacher logits rows require a teacher logits file");
     if (!options.teacher_forced_score) return;
     if ((options.known_prefix_window || options.known_prefix_prefill_rows || options.known_prefix_expert_union ||
          options.known_prefix_full_rows) &&
@@ -1929,7 +1936,7 @@ inline Options parse_options(
             "[--mtp --mtp-sidecar FILE --mtp-sidecar-sha256 HEX (--mtp-golden FILE --mtp-golden-sha256 HEX | --mtp-golden-dump FILE) [--mtp-window-expert-union --mtp-window-expert-union-bytes N] [--mtp-window-hyper-mix] [--mtp-window-qsa-rows] [--mtp-window-prefix] [--mtp-draft-chain [--mtp-draft-vocab FILE[,FILE...]|auto:DIR] [--mtp-draft-context-vocab N] [--mtp-draft-exact] [--mtp-draft-q4] [--mtp-ngram-draft[=on|off|auto|ctx|copy|wide]]] [--mtp-draft-profile base|distill-d|distill-g] (explicit source/conversion/cast/budget options required)] "
             "[--profile default|fast|quality] [--allow-pending] [--optimization-profile auto|manual] [--prefill-moe-route-bf16 on|off] [--baseline] [--print-effective-config] [--prefill-exact-fp16] [--prefill-disable NAME[,NAME...]] [--config FILE] [--execution-inventory] [--host-dispatch-telemetry] [--execution-telemetry-trace] [--device-queue-trace] "
             "[--numerical-profile exact-v5|hc-splitk-f32-v1|q51-a8-down-v1|hc-splitk-f32+q51-a8-down-v1|q51-q80-a8-down-v1|hc-splitk-f32+q51-q80-a8-down-v1|hc-splitk-f32+q51-q80-a8-down+q5k-a8-gateup-v1|hc-deferred-norm-f32+q51-q80-a8-down-v1|hc-deferred-norm-f32+q51-q80-a8-down+q5k-a8-gateup-v1|hc-splitk-f32+q51-q80-a8-down+q5k-a8-gateup+dense-a8-v1|hc-deferred-norm-f32+q51-q80-a8-down+q5k-a8-gateup+dense-a8-v1] [--prefill-numerical-profile NAME] "
-            "[--teacher-forced-score --generate 1 [--teacher-logits-file PATH]] [--dense-q6p-pack PATH] [--dense-trellis-pack PATH] "
+            "[--teacher-forced-score --generate 1 [--teacher-logits-file PATH [--teacher-logits-rows PATH]]] [--dense-q6p-pack PATH] [--dense-trellis-pack PATH] "
             "[--gpu-greedy-token] [--logprob-token ID ...] [--offline-tuning-cache FILE [--offline-compile-provenance FILE]] [--gdn-recurrent-layout baseline|stride32|stride33|transposed] [--gdn-recurrent-storage key-value|value-key] [--attention-kv-storage bf16|kv-int8-tok-v1] [--known-prefix-window --known-prefix-rows 2|4|8 --known-prefix-expert-union] [--known-window-router-rows] [--known-prefix-prefill-rows 16..16384 --known-prefix-workspace-budget-bytes N --known-prefix-host-metadata-budget-bytes N --known-prefix-uma-budget-bytes N --known-prefix-host-headroom-bytes N] [--prompt-lookup [--prompt-lookup-depth 0|1|2 | --prompt-lookup-adaptive] [--prompt-lookup-snapshot occupied-kv-v1 --prompt-lookup-snapshot-bytes N]] [--serve-prefix-u32le FILE ... --serve-concurrency 1|2|4 [--serve-tensor-cohort-rows 2|4 | --serve-prefill-rows 2|4|8|16..2048 --serve-prefill-workspace-budget-bytes N --serve-prefill-host-metadata-budget-bytes N] --serve-memory-budget-bytes N --serve-request-budget-bytes N --serve-headroom-bytes N] [--gdn-islands] [--qsa-hierarchical-selection] [--qsa-gqa-heads-per-block 1|2|4] [--prepared-eager] [--moe-shared-overlap [--moe-token-cost-policy]] [--moe-overlap-arena-budget-bytes N] [--batched-moe-activation] [--validation-final-state DIR] [--validation-final-state-max-bytes N] [--reference FILE] [--max-logit-error X] "
             "[--context N [--unqualified-context]] [--residency register|copy] [--coalesce-gap BYTES] [--model-copy-tier none|normalization|hot_nonexpert|experts --model-copy-payload-bytes N --model-retained-budget N --model-setup-peak-budget N] "
             "[--planned-ple-io] [--ple-cpu-helper-threads 1..8] [--ple-cache-rows N --ple-cache-budget-bytes N] [--ple-max-rows-per-io N] [--ple-max-inflight-ios N] "
@@ -2112,6 +2119,30 @@ inline Options parse_options(
             if (value.empty() || value.starts_with("--"))
                 throw std::invalid_argument("teacher logits file requires a nonempty path");
             options.teacher_logits_path = value;
+            continue;
+        }
+        if (argument == "--teacher-logits-rows" || argument.starts_with("--teacher-logits-rows=")) {
+            if (options.teacher_logits_rows_supplied)
+                throw std::invalid_argument("duplicate teacher logits rows option");
+            const auto value = argument == "--teacher-logits-rows" ?
+                (index + 1 < argc ? std::string_view(argv[++index]) : std::string_view{}) :
+                argument.substr(std::string_view("--teacher-logits-rows=").size());
+            if (value.empty() || value.starts_with("--"))
+                throw std::invalid_argument("teacher logits rows requires a nonempty path");
+            std::ifstream rows_file{std::string(value)};
+            if (!rows_file) throw std::invalid_argument("cannot read teacher logits rows file");
+            std::string word;
+            while (rows_file >> word) {
+                std::uint64_t row = 0;
+                const auto parsed = std::from_chars(word.data(), word.data() + word.size(), row);
+                if (parsed.ec != std::errc{} || parsed.ptr != word.data() + word.size() ||
+                    (!options.teacher_logits_rows.empty() && row <= options.teacher_logits_rows.back()))
+                    throw std::invalid_argument("teacher logits rows must be ascending decimal positions");
+                options.teacher_logits_rows.push_back(row);
+            }
+            if (options.teacher_logits_rows.empty() || options.teacher_logits_rows.size() > 65536U)
+                throw std::invalid_argument("teacher logits rows file must list 1..65536 positions");
+            options.teacher_logits_rows_supplied = true;
             continue;
         }
         if (argument == "--teacher-forced-score") {
