@@ -1859,8 +1859,7 @@ int main(int argc, char** argv) {
         }
         if (mode == "hcchain" || mode == "hcchainbench") {
             test_hc_chain(g, want_timing && mode == "hcchainbench");
-            std::printf("checks: %d failures: %d
-", checks, failures);
+            std::printf("checks: %d failures: %d\n", checks, failures);
             return failures ? 1 : 0;
         }
         if (mode == "hcexpand" || mode == "hcexpandbench") {
