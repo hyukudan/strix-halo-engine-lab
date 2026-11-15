@@ -1,4 +1,5 @@
 #include "strix/handoff.hpp"
+#include "strix/env_flags.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -118,10 +119,15 @@ void send_all(sock_t s, const void* p, std::size_t n) {
     }
 }
 
+// MSG_WAITALL: one wake-up per request instead of one per arriving segment burst. Without it a receiver at 1 GbE
+// burned ~1 core for 118 MB/s (8.5 s CPU per GB; 0.1-0.3 s per GB on loopback, where bursts are large). A timeout or a
+// cancel still returns the partial count or an error, which the loop handles as before.
+// Rollback: STRIX_HANDOFF_RECV_WAITALL=0 (recorded for --print-effective-config).
 void recv_all(sock_t s, void* p, std::size_t n) {
+    static const int flags = envcfg::flag("STRIX_HANDOFF_RECV_WAITALL", true) ? MSG_WAITALL : 0;
     char* b = static_cast<char*>(p);
     while (n) {
-        const auto k = ::recv(s, b, static_cast<int>(std::min<std::size_t>(n, std::size_t{1} << 24)), 0);
+        const auto k = ::recv(s, b, static_cast<int>(std::min<std::size_t>(n, std::size_t{1} << 24)), flags);
         if (k == 0) throw std::runtime_error("handoff: connection closed by the peer");
         if (k < 0) throw std::runtime_error("handoff: receive failed, cancelled or timed out (error " + std::to_string(last_error()) + ")");
         b += k;
@@ -557,55 +563,72 @@ struct Sender::Impl {
         shutdown_all();
     }
 
+    // Hash + encode one piece (identity: hash only, the bytes stay the caller's). Runs on the encoder thread or, for a
+    // batch, on a pool worker (bp_codec::encode then nests its block tasks in the same pool).
+    void prepare(Input& in, Output& out) {
+        out.f = in.f;
+        std::uint64_t plain = 0;
+        for (const auto& r : in.regions) plain += r.bytes;
+        out.f.plain_bytes = plain;
+        Xxh64 h;
+        hash_descriptor(h, out.f);
+        for (const auto& r : in.regions) h.update(r.data, r.bytes);
+        out.f.hash = h.digest();
+        if (codec == Codec::bp_v1 && plain > 0) {
+            out.wire = bp_codec::encode(in.regions, pool.get(), opt.encode);
+            out.f.codec = static_cast<std::uint8_t>(Codec::bp_v1);
+            out.f.wire_bytes = out.wire.size();
+            in.release.run();
+        } else {
+            out.f.codec = static_cast<std::uint8_t>(Codec::identity);
+            out.f.wire_bytes = plain;
+            out.regions = std::move(in.regions);
+            out.release = std::move(in.release);
+        }
+    }
+
     void encode_loop() {
         try {
             for (;;) {
-                Input in;
+                // bp-v1 with encode_batch > 1: every queued piece (up to encode_batch) is encoded side by side on the
+                // pool, so pieces of one codec block (<= 1 MiB) no longer encode on one thread; output order and the
+                // bytes of every frame are the same as one at a time.
+                std::vector<Input> batch;
                 {
                     std::unique_lock<std::mutex> g(m);
                     cv.wait(g, [&] { return aborted || !inputs.empty() || closed; });
-                    if (aborted) return;  // `in` and the queues release their callbacks on destruction
+                    if (aborted) return;  // `batch` and the queues release their callbacks on destruction
                     if (inputs.empty()) return;
-                    in = std::move(inputs.front());
-                    inputs.pop_front();
+                    const bool wide = codec == Codec::bp_v1 && pool && pool->threads() > 0 && opt.encode_batch > 1;
+                    const std::size_t take = wide ? std::min<std::size_t>(inputs.size(), opt.encode_batch) : 1;
+                    for (std::size_t i = 0; i < take; ++i) {
+                        batch.push_back(std::move(inputs.front()));
+                        inputs.pop_front();
+                    }
                 }
                 const auto t0 = Clock::now();
-                Output out;
-                out.f = in.f;
-                std::uint64_t plain = 0;
-                for (const auto& r : in.regions) plain += r.bytes;
-                out.f.plain_bytes = plain;
-                Xxh64 h;
-                hash_descriptor(h, out.f);
-                for (const auto& r : in.regions) h.update(r.data, r.bytes);
-                out.f.hash = h.digest();
-                if (codec == Codec::bp_v1 && plain > 0) {
-                    out.wire = bp_codec::encode(in.regions, pool.get(), opt.encode);
-                    out.f.codec = static_cast<std::uint8_t>(Codec::bp_v1);
-                    out.f.wire_bytes = out.wire.size();
-                    in.release.run();
-                } else {
-                    out.f.codec = static_cast<std::uint8_t>(Codec::identity);
-                    out.f.wire_bytes = plain;
-                    out.regions = std::move(in.regions);
-                    out.release = std::move(in.release);
-                }
+                std::vector<Output> outs(batch.size());
+                if (batch.size() == 1) prepare(batch[0], outs[0]);
+                else pool->run(batch.size(), [&](std::size_t i) { prepare(batch[i], outs[i]); });
                 const double dt = secs(t0, Clock::now());
-                std::unique_lock<std::mutex> g(m);
-                encode_s += dt;
-                // Back-pressure on encoded bytes only (identity bytes are the caller's memory, bounded by submit()).
-                cv.wait(g, [&] { return aborted || queued_wire == 0 || queued_wire + out.wire.size() <= opt.max_queued_wire_bytes; });
-                if (aborted) {
-                    g.unlock();
-                    return;
+                for (std::size_t i = 0; i < outs.size(); ++i) {
+                    Output& out = outs[i];
+                    std::unique_lock<std::mutex> g(m);
+                    if (i == 0) encode_s += dt;
+                    // Back-pressure on encoded bytes only (identity bytes are the caller's memory, bounded by submit()).
+                    cv.wait(g, [&] { return aborted || queued_wire == 0 || queued_wire + out.wire.size() <= opt.max_queued_wire_bytes; });
+                    if (aborted) {
+                        g.unlock();
+                        return;
+                    }
+                    queued_wire += out.wire.size();
+                    plain_total += out.f.plain_bytes;
+                    wire_total += out.f.wire_bytes;
+                    ++pieces;
+                    fold.update(&out.f.hash, 8);
+                    outputs[out.f.seq % socks.size()].push_back(std::move(out));
+                    cv.notify_all();
                 }
-                queued_wire += out.wire.size();
-                plain_total += plain;
-                wire_total += out.f.wire_bytes;
-                ++pieces;
-                fold.update(&out.f.hash, 8);
-                outputs[out.f.seq % socks.size()].push_back(std::move(out));
-                cv.notify_all();
             }
         } catch (...) {
             fail(std::current_exception());

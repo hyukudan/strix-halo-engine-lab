@@ -73,6 +73,9 @@ struct SenderOptions {
     Codec codec = Codec::bp_v1;   // falls back to identity when the receiver does not accept it
     unsigned streams = 1;          // TCP connections to the same endpoint (1..64); piece seq s goes on stream s % N
     unsigned encode_threads = 8;   // bp-v1 worker pool
+    // bp-v1: queued pieces encoded side by side on the pool (1 = one at a time). Same frames either way; 16 lifted 1 MiB
+    // pieces from 1.30 to 2.07-2.13 GB/s on loopback (8 threads) and left the 1 GbE Qwen 32K tail unchanged.
+    unsigned encode_batch = 16;
     std::size_t max_queued_wire_bytes = std::size_t{512} << 20;  // encoded-but-unsent bytes before encoding waits
     std::size_t max_pending_plain_bytes = 0;  // submitted-but-unreleased caller bytes before submit() waits; 0 = no bound
     int socket_buffer = 32 << 20;
