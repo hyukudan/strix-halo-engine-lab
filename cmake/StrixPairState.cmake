@@ -14,3 +14,24 @@ if(COMMAND strix_target_warnings)
 endif()
 add_test(NAME strix-pair-state-owners-tests COMMAND strix-pair-state-owners-tests)
 set_tests_properties(strix-pair-state-owners-tests PROPERTIES LABELS "cpu" TIMEOUT 30)
+
+# Pin actual serialized traffic, separately from the declaration's tensor capacity estimates.
+add_executable(pair_state_serialized_tests
+    ${CMAKE_CURRENT_LIST_DIR}/../tests/pair_state_serialized_tests.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/../src/deepseek41_attention_state.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/../src/ds41_attention.cpp)
+target_include_directories(pair_state_serialized_tests PRIVATE ${CMAKE_CURRENT_LIST_DIR}/../include)
+target_compile_features(pair_state_serialized_tests PRIVATE cxx_std_20)
+if(MSVC)
+    target_compile_definitions(pair_state_serialized_tests PRIVATE _CRT_SECURE_NO_WARNINGS)
+endif()
+if(COMMAND strix_target_warnings)
+    strix_target_warnings(pair_state_serialized_tests)
+endif()
+add_test(NAME pr656-ds41-serialized COMMAND pair_state_serialized_tests)
+set_tests_properties(pr656-ds41-serialized PROPERTIES LABELS "cpu" TIMEOUT 30)
+find_package(Python3 QUIET COMPONENTS Interpreter)
+if(Python3_Interpreter_FOUND)
+    add_test(NAME pr656-probe-median COMMAND "${Python3_EXECUTABLE}" -B "${CMAKE_CURRENT_LIST_DIR}/../tests/owners_probe_tests.py")
+    set_tests_properties(pr656-probe-median PROPERTIES LABELS "cpu" TIMEOUT 30)
+endif()

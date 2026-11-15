@@ -387,6 +387,8 @@ std::vector<std::uint32_t> listen_session(mm::Engine& eng, int lfd, const std::s
     int mode = -1;  // -1 = not agreed yet, 0 = per-rank copies, 1 = index keys once
     double t_relay = 0;
     const std::size_t kv = rows * 1024;
+    const auto prompt_hash = strix::pair::state::state_hash(reinterpret_cast<const std::uint8_t*>(prompt.data()), prompt.size() * sizeof(prompt[0]));
+    const auto name_hash = strix::pair::state::state_hash(reinterpret_cast<const std::uint8_t*>(name.data()), name.size());
     for (;;) {
         std::uint32_t hdr32[2];
         std::uint64_t hdr64[2];
@@ -395,7 +397,7 @@ std::vector<std::uint32_t> listen_session(mm::Engine& eng, int lfd, const std::s
         const std::uint32_t m = hdr32[0];
         const bool bp = m == 0x42524d4dU || m == 0x4A524d4dU, once = m == 0x49524d4dU || m == 0x4A524d4dU;
         if (m != 0x58524d4dU && m != 0x42524d4dU && !once) throw std::runtime_error("offload-listen: bad frame");
-        if (hdr32[1] == 0xffffffffU) break;
+        const bool end = hdr32[1] == 0xffffffffU;
         if (mode < 0) {  // both ranks at their first frame: the same mode or both refuse
             if (once && !relay) throw std::runtime_error("offload-listen: index keys once needs the pair link");
             const std::uint64_t mine[1] = {once ? 1U : 0U};
@@ -404,9 +406,12 @@ std::vector<std::uint32_t> listen_session(mm::Engine& eng, int lfd, const std::s
             if (relay && peer[0] != mine[0])
                 throw std::runtime_error("offload-listen: the ranks got different hand-off modes (index keys once on one rank only)");
             mode = once ? 1 : 0;
-        } else if ((mode == 1) != once) {
+        } else if (!end && (mode == 1) != once) {
             throw std::runtime_error("offload-listen: hand-off mode changed inside a session");
         }
+        if (mode == 1)
+            strix::pair::state::relay_agree({req, prompt_hash, hdr32[1], 0, hdr64[0], name_hash}, relay, seq++);
+        if (end) break;
         // Plain bytes this rank receives: the whole block, or the K/V head on rank 1 with index keys once.
         const std::size_t plain = once && eng.rank() == 1 ? kv : block.size();
         if (hdr64[0] != rows || (!bp && hdr64[1] != plain)) throw std::runtime_error("offload-listen: row count differs from the prompt");

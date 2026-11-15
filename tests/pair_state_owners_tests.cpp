@@ -61,6 +61,7 @@ void glm_tables() {
     CHECK(full(dc::glm, 131071, true).relay_bytes == 2617221120ULL);  // 2,617.22 MB: the v1 second copy, now on the pair link
 }
 
+// Capacity estimates only; serialized fixtures are checked in pair_state_serialized_tests.cpp.
 void ds41_tables() {
     for (const std::uint64_t n : {32768ULL, 131072ULL}) {
         CHECK(full(dc::ds41, n, false).host_bytes == 2ULL * (894ULL * n + 2900992ULL));  // a copy per rank
@@ -215,6 +216,52 @@ std::pair<std::string, std::string> run_relay(FakeLink& link, std::vector<std::u
     return {e0, e1};
 }
 
+void replay_mode() {
+    st::SharedOnceMode mode;
+    const auto enabled = [&](unsigned repeat) {
+        const bool once = st::resolve(dc::minimax, mode.cli, -1, "1", nullptr, false).shared_once;
+        return mode.ab ? repeat % 2 == 1 : once;
+    };
+    mode.set(true, true);  // --ik-once ab
+    CHECK(!enabled(0) && enabled(1));
+    mode.set(false);       // --no-ik-once overrides AB and environment ON
+    CHECK(!mode.ab && !enabled(0) && !enabled(1));
+    mode.set(true, true);
+    mode.set(true);        // a later plain --ik-once also cancels AB
+    CHECK(!mode.ab && enabled(0) && enabled(1));
+    mode.set(false);
+    mode.set(true, true);  // last option may re-enable AB
+    CHECK(!enabled(0) && enabled(1));
+}
+
+void relay_identity() {
+    // Same-sized K/V and IK, but opposite layer order: refuse before either layer is imported.
+    // Also bind the session, prompt, row interval and terminal frame, not just the ordinal exchange.
+    for (unsigned field = 0; field <= 7; ++field) {
+        FakeLink link;
+        std::string errors[2];
+        unsigned imported[2] = {};
+        std::thread peers[2];
+        for (unsigned r = 0; r < 2; ++r) peers[r] = std::thread([&, r] {
+            try {
+                for (std::uint64_t layer = 0; layer < 2; ++layer) {
+                    st::RelayIdentity id{7, 99, layer, 0, 128, 123};
+                    if (r == 1 && field < 6) {
+                        if (field == 2) id[2] = 1 - layer;
+                        else ++id[field];
+                    }
+                    if (r == 1 && field == 7) id[2] = 0xffffffffU;  // early end marker
+                    st::relay_agree(id, [&](auto a, auto b, auto q) { link.xchg(r, a, b, q); }, layer);
+                    ++imported[r];
+                }
+            } catch (const std::exception& e) { errors[r] = e.what(); }
+        });
+        for (auto& peer : peers) peer.join();
+        if (field == 6) CHECK(errors[0].empty() && errors[1].empty() && imported[0] == 2 && imported[1] == 2);
+        else CHECK(!errors[0].empty() && !errors[1].empty() && imported[0] == 0 && imported[1] == 0);
+    }
+}
+
 void relay() {
     std::vector<std::uint8_t> src(5U << 20);
     for (std::size_t i = 0; i < src.size(); ++i) src[i] = static_cast<std::uint8_t>((i * 2654435761U) >> 13);
@@ -225,14 +272,14 @@ void relay() {
         const auto [e0, e1] = run_relay(link, src, dst, 1U << 20, &next);
         CHECK(e0.empty() && e1.empty());
         CHECK(dst == src);
-        CHECK(next == 10 + 1 + 5);  // header + five 1 MiB chunks
+        CHECK(next == 10 + 2 + 5);  // header + five 1 MiB chunks + verification vote
     }
     {
-        FakeLink link;  // a corrupted chunk fails the receiving rank
+        FakeLink link;  // a corrupted chunk fails both ranks before either returns
         link.flip = 13;
         std::vector<std::uint8_t> dst(src.size());
         const auto [e0, e1] = run_relay(link, src, dst, 1U << 20);
-        CHECK(e0.empty());
+        CHECK(e0.find("hash mismatch") != std::string::npos);
         CHECK(e1.find("hash mismatch") != std::string::npos);
     }
     {
@@ -254,6 +301,8 @@ int main() {
     prefix_agreement();
     fixed_state_survives_prefix();
     resolver();
+    replay_mode();
+    relay_identity();
     relay();
     if (failures == 0) std::printf("pair state owners: all checks passed\n");
     return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;

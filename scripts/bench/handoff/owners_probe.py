@@ -15,6 +15,7 @@ Strict ABAB; the first arm of the run is reported as cold, the rest as warm.
 """
 import argparse
 import socket
+import statistics
 import struct
 import sys
 import threading
@@ -127,7 +128,7 @@ def send(args):
         s = sorted(r[3] for r in warm if r[1] == arm)
         if s:
             print('%s warm arm %s: median %.3f s over %d (min %.3f max %.3f)' % (
-                args.family, arm, s[len(s) // 2], len(s), s[0], s[-1]))
+                args.family, arm, statistics.median(s), len(s), s[0], s[-1]))
 
 
 def main():

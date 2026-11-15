@@ -74,3 +74,9 @@ piezas compartidas van una vez al rango 0, que las retransmite al rango 1 por el
 (predeterminado); MiniMax claves de índice una vez de 5.033 a 4.530 MB (`--ik-once` en el productor, opcional; 8K de
 11,14 a 10,04 s). El modo prefijo primero (`STRIX_HANDOFF_PREFIX_FIRST`, apagado) envía sólo las filas que los rangos no
 tienen, cuando la familia tenga el recibo de invariancia de filas con la longitud del prompt.
+
+Los tiempos del planificador son cotas optimistas del enlace con solapamiento perfecto; GLM recibe el estado completo
+antes de retransmitirlo. No miden la latencia total ni califican la equivalencia nativa del modelo o del estado.
+Las transferencias todavía usan diseños por familia; la transferencia de prefijos no está conectada y ninguna familia
+declara invariancia de filas. DS41 estima capacidad de tensores/tokens; `ds41_serialized_bytes` usa los vectores reales
+y el diseño del serializador para contar también el enmarcado y los top-k cortos o ausentes.

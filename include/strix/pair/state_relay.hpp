@@ -7,11 +7,11 @@
 //            together, before any payload moves.
 //   payload  chunks of at most `chunk` bytes, relay rank -> peer. xchg(local, remote, seq) is one symmetric pair
 //            exchange (remote empty = not wanted); the peer sends its destination block back, which the source ignores.
-//   check    the peer hashes what it received and throws on a mismatch, so a relayed piece is verified end to end like
-//            the host link's pieces (piece, range and hash; the first failure fails the import).
-// Returns the next free seq (seq0 + 1 + chunks), so a caller can relay several pieces on one tag space. `hash` is
+//   check    both ranks exchange verification status, then both throw if the received hash differs.
+// Returns the next free seq (seq0 + 2 + chunks), so a caller can relay several pieces on one tag space. `hash` is
 // state_hash below unless the family already links a faster one (bp_codec::xxh64).
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -50,6 +50,16 @@ struct RelayStats {
     double ms = 0;
 };
 
+// Bind ordinal exchanges to the same session, prompt, piece and row range before moving payloads.
+// Include end markers as pieces so an early end also makes both ranks reject together.
+using RelayIdentity = std::array<std::uint64_t, 6>;  // session, prompt hash, piece, row0, rows, session-name hash
+template <class Xchg>
+void relay_agree(const RelayIdentity& identity, Xchg&& xchg, std::uint64_t seq) {
+    RelayIdentity peer{};
+    xchg(std::as_bytes(std::span(identity)), std::as_writable_bytes(std::span(peer)), seq);
+    if (peer != identity) throw std::runtime_error("state relay: session / piece / row range mismatch");
+}
+
 template <class Xchg, class Hash>
 std::uint64_t relay_piece(bool source, bool ok, std::span<std::uint8_t> bytes, std::size_t chunk, Xchg&& xchg, Hash&& hash,
                           std::uint64_t seq0 = 0, RelayStats* stats = nullptr) {
@@ -71,11 +81,14 @@ std::uint64_t relay_piece(bool source, bool ok, std::span<std::uint8_t> bytes, s
         if (source) xchg(std::as_bytes(part), std::span<std::byte>(), seq);
         else xchg(std::as_bytes(part), std::as_writable_bytes(part), seq);  // the block it sends back is copied out first
     }
-    if (!source && static_cast<std::uint64_t>(hash(bytes.data(), bytes.size())) != peer[2])
+    const std::uint64_t verified = source || static_cast<std::uint64_t>(hash(bytes.data(), bytes.size())) == peer[2] ? 1U : 0U;
+    std::uint64_t peer_verified = 0;
+    xchg(std::as_bytes(std::span(&verified, 1)), std::as_writable_bytes(std::span(&peer_verified, 1)), seq++);
+    if (verified != 1U || peer_verified != 1U)
         throw std::runtime_error("state relay: relayed piece hash mismatch (" + std::to_string(bytes.size()) + " bytes)");
     if (stats) {
         stats->bytes += bytes.size();
-        stats->chunks += seq - seq0 - 1;
+        stats->chunks += seq - seq0 - 2;
         stats->ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
     }
     return seq;

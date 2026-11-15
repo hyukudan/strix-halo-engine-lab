@@ -4,6 +4,7 @@
 // today (file:line in each piece); a format change updates the row here and the host test that pins its totals.
 #include <array>
 
+#include "strix/deepseek41_attention_state.hpp"
 #include "strix/pair/state_owners.hpp"
 
 namespace strix::pair::state::decl {
@@ -38,7 +39,9 @@ inline constexpr Family glm{"glm-5.3", "P = N - 1", glm_pieces, 2, 64, false, tr
 // DeepSeek V4.1 pair: the whole serialized state is the same on both ranks; the serve app already takes ONE copy and
 // rank 0 relays it (apps/deepseek41_serve_main.cpp:2874-2875). Four KV sources (three ratio-2 at N/2 entries, one at
 // N), FP4 KV 288 B + FP4 IK 68 B per entry (include/strix/ds41_attention.hpp:28-36), token ids 4 B, 40 window rings
-// of capacity 136 x 528 B, and the remaining fixed fields of today's format. rows = N.
+// of capacity 136 x 528 B. rows = N. This is a tensor/token capacity estimate, NOT serialized traffic:
+// carry/top-k capacity assumes three 1024-float carries and eight full 512-entry top-k vectors, and excludes framing.
+// Use ds41_serialized_bytes with the actual state for wire traffic (short/absent vectors included).
 inline constexpr std::array<Piece, 7> ds41_pieces{{
     {"kv_ratio2", 0, Owner::shared, Extent::rows, 288, 3, 0, 1, 2, 0, "src/ds41_attention.cpp:130-146"},
     {"kv_full", 1, Owner::shared, Extent::rows, 288, 1, 0, 1, 1, 0, "src/ds41_attention.cpp:130-146"},
@@ -46,10 +49,27 @@ inline constexpr std::array<Piece, 7> ds41_pieces{{
     {"ik_full", 3, Owner::shared, Extent::rows, 68, 1, 0, 1, 1, 0, "include/strix/ds41_attention.hpp:28-36"},
     {"token_ids", 4, Owner::shared, Extent::rows, 4, 1, 0, 1, 1, 0, "src/hip_deepseek41_batch_forward.hip:1490-1526"},
     {"window_rings", 5, Owner::shared, Extent::fixed, 136U * 528U, 40, 0, 1, 1, 0, "src/hip_ds41_attention.hip:122,1375-1395"},
-    {"carry_topk", 6, Owner::shared, Extent::fixed, 28672, 1, 0, 1, 1, 0, "src/hip_deepseek41_device_forward.hip:1247-1263"},
+    {"carry_topk_capacity", 6, Owner::shared, Extent::fixed, 28672, 1, 0, 1, 1, 0, "src/hip_deepseek41_device_forward.hip:1247-1263"},
 }};
 inline constexpr Family ds41{"deepseek-v4.1", "N", ds41_pieces, 2, 256, false, true,
                              "shipped relay: apps/deepseek41_serve_main.cpp:2874-2875"};
+
+// Reuse the serializer's layout, including every vector length, header and digest; no second wire-size formula.
+[[nodiscard]] inline std::uint64_t ds41_serialized_bytes(const deepseek41::AttentionState& state) {
+    deepseek41::AttentionFrame frame;
+    frame.token_count = state.tokens.size();
+    for (const auto& layer : state.layers) {
+        deepseek41::AttentionFrameLayer f;
+        f.ring_bytes = layer.ring.size();
+        f.kv_bytes = layer.kv.size();
+        f.idx_bytes = layer.idx_keys.size();
+        f.carry_floats = layer.carry.size();
+        f.topk_count = layer.topk.size();
+        frame.layers.push_back(f);
+    }
+    deepseek41::plan_attention_frame(frame);
+    return frame.total;
+}
 
 // Qwen3.8-Flash-Next: 48 layers, QSA at (layer + 1) % 4 == 0 (apps/hip_qwen_prefill_mtp_handoff.inc:165), GDN on the
 // other 36. On a pair each layer's state belongs to the stage that runs it (src/distributed_stage_state.cpp:76-104);

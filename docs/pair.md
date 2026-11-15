@@ -72,3 +72,9 @@ host's NIC is shared by both destinations, so a second copy costs its full wire 
 (`STRIX_HANDOFF_PREFIX_FIRST`, off) ships only the rows the ranks do not already hold, once a family has the
 prompt-length row invariance receipt. Switches: `STRIX_HANDOFF_SHARED_ONCE` / the family's flag, recorded by
 `--print-effective-config`.
+
+Planner times are optimistic wire bounds assuming perfect host/relay overlap; GLM currently stages the host payload
+before relaying. They are not completion latency or native model/state qualification. Live family transfer layouts
+are not yet driven by the declarations, and prefix transfer is unbound; no shipped family declares row invariance.
+DS41's declaration estimates tensor/token capacity; `ds41_serialized_bytes` uses the actual vectors and serializer
+layout for traffic, including framing and short or absent top-k data.

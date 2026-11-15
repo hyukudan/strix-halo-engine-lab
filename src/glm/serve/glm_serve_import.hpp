@@ -328,7 +328,7 @@ std::vector<std::uint8_t> dsa_relay(unsigned rank, bool ok, std::span<const std:
         }
     }
     // The relay leg itself is the shared one (strix/pair/state_relay.hpp): header {ok, bytes, hash} both ways, chunks
-    // rank 0 -> rank 1, and rank 1 checks the hash of what it received.
+    // rank 0 -> rank 1, then both ranks vote on the received hash before returning.
     strix::pair::state::RelayStats rs;
     try {
         (void)strix::pair::state::relay_piece(rank == 0, prepared, std::span<std::uint8_t>(dsa), chunk,
@@ -382,7 +382,7 @@ template <class Xchg, class Relay, class Restore, class Suffix>
 std::uint32_t import_transaction(bool prepared, const std::string& why, const Binding& binding, std::uint64_t frontier, Xchg&& vote,
                                  Relay&& relay, Restore&& restore, Suffix&& suffix) {
     import_vote("prepare", prepared, why, binding, frontier, vote, 1);
-    relay();  // its own header vote: both throw together
+    relay();  // header and final hash votes: both throw together
     bool restored = true;
     std::string err;
     try {

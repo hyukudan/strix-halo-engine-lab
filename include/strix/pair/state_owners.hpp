@@ -128,7 +128,8 @@ struct Plan {
     std::uint64_t host_bytes = 0;              // sum (one NIC)
     std::uint64_t relay_bytes = 0;             // pair interconnect
     std::uint64_t ids_bytes = 0;               // suffix token ids (Mode::ids)
-    double host_s = 0, relay_s = 0, recompute_s = 0, predicted_s = 0;  // wire-bound estimate; relay overlaps the host link
+    // Optimistic wire bound assuming perfect overlap, not completion latency (GLM stages before relaying).
+    double host_s = 0, relay_s = 0, recompute_s = 0, predicted_s = 0;
     std::string reason;
 };
 
@@ -263,6 +264,13 @@ inline constexpr lever::Decl prefix_first_lever{"handoff-prefix-first", "STRIX_H
 
 struct Resolved {
     bool shared_once = false, prefix_first = false;
+};
+
+// Last CLI option wins, including replay's alternating mode. Environment resolution still uses cli.
+struct SharedOnceMode {
+    int cli = -1;
+    bool ab = false;
+    void set(bool on, bool alternate = false) { cli = on ? 1 : 0; ab = on && alternate; }
 };
 // One resolver for the CLI and the server of a family: `cli_*` is the command-line value (-1 unset, 0 off, 1 on); it
 // wins over the environment, which wins over the family default. Records both switches for --print-effective-config.

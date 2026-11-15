@@ -421,8 +421,7 @@ int main(int argc, char** argv) {
         unsigned n_layers = kLayers, repeat = 1;
         std::string send_to;
         bool codec_bp = false;
-        int ik_once_cli = -1;  // --ik-once 1 / --no-ik-once 0: index keys once, rank 0 relays (strix/pair/state_owners.hpp)
-        bool ik_ab = false;    // --ik-once ab (replay only): alternate per repeat, per-rank copies first
+        strix::pair::state::SharedOnceMode ik_mode;  // off / on / alternating replay; last option wins
         int resident = -1, pinned_n = -1;
         std::string replay_dir, blob_cache;
         struct Prompt {
@@ -438,11 +437,12 @@ int main(int argc, char** argv) {
             if (a == "--send") { send_to = argv[++i]; continue; }
             if (a == "--codec") { codec_bp = std::string(argv[++i]) == "bp"; continue; }
             if (a == "--ik-once") {
-                if (i + 1 < argc && std::string(argv[i + 1]) == "ab") { ik_ab = true; ++i; }
-                ik_once_cli = 1;
+                const bool ab = i + 1 < argc && std::string(argv[i + 1]) == "ab";
+                if (ab) ++i;
+                ik_mode.set(true, ab);
                 continue;
             }
-            if (a == "--no-ik-once") { ik_once_cli = 0; continue; }
+            if (a == "--no-ik-once") { ik_mode.set(false); continue; }
             if (a == "--replay-state") { replay_dir = argv[++i]; continue; }
             if (a == "--pinned") { pinned_n = std::stoi(argv[++i]); continue; }
             if (a == "--blob-cache") { blob_cache = argv[++i]; continue; }
@@ -452,12 +452,12 @@ int main(int argc, char** argv) {
         // One resolver for the hand-off owners (shared with the ranks): flag, then STRIX_HANDOFF_SHARED_ONCE, then the
         // MiniMax default (per-rank copies until its pair receipt). The ranks follow the frame magic.
         namespace ps = strix::pair::state;
-        const bool ik_once = ps::resolve(ps::decl::minimax, ik_once_cli, -1).shared_once;
-        if (ik_ab && replay_dir.empty()) throw std::runtime_error("--ik-once ab needs --replay-state");
+        const bool ik_once = ps::resolve(ps::decl::minimax, ik_mode.cli, -1).shared_once;
+        if (ik_mode.ab && replay_dir.empty()) throw std::runtime_error("--ik-once ab needs --replay-state");
         if (!send_to.empty())
             std::printf("mm-rtx-prefill: hand-off owners %s (STRIX_HANDOFF_SHARED_ONCE / --ik-once): %.0f B per row\n",
-                        ik_ab ? "ABAB" : ik_once ? "ik-once" : "per-rank copies",
-                        static_cast<double>(ps::host_bytes(ps::decl::minimax, 1, 0, ik_once && !ik_ab)));
+                        ik_mode.ab ? "ABAB" : ik_once ? "ik-once" : "per-rank copies",
+                        static_cast<double>(ps::host_bytes(ps::decl::minimax, 1, 0, ik_once && !ik_mode.ab)));
         if (!replay_dir.empty()) {  // transport replay, no GPU
             WSADATA wsa;
             if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) throw std::runtime_error("WSAStartup");
@@ -473,7 +473,7 @@ int main(int argc, char** argv) {
                     f.read(reinterpret_cast<char*>(st[r].data()), static_cast<std::streamsize>(st[r].size()));
                 }
                 for (unsigned it = 0; it < repeat; ++it) {
-                    const bool bp = codec_bp && !ik_ab ? (it % 2 == 1) : codec_bp;  // --codec bp: identity, bp, identity, ...
+                    const bool bp = codec_bp && !ik_mode.ab ? (it % 2 == 1) : codec_bp;  // --codec bp: identity, bp, identity, ...
                     Sender snd[2];
                     const auto c = send_to.find(',');
                     snd[0].open(send_to.substr(0, c));
@@ -486,7 +486,7 @@ int main(int argc, char** argv) {
                     for (unsigned r = 0; r < 2; ++r)
                         th[r] = std::thread([&, r]() {
                             // --ik-once ab: odd repeats send the index keys once (ABAB in one process, same state files)
-                            const bool once = ik_ab ? (it % 2 == 1) : ik_once;
+                            const bool once = ik_mode.ab ? (it % 2 == 1) : ik_once;
                             const std::uint64_t sent = r == 1 && once ? rows * 1024 : bytes;
                             for (unsigned L = 0; L < n_layers; ++L) {
                                 const std::uint8_t* p = st[r].data() + static_cast<std::size_t>(L) * bytes;
@@ -513,7 +513,7 @@ int main(int argc, char** argv) {
                     const double mb = static_cast<double>(wire[0] + wire[1]) / 1e6;
                     std::printf("mm-rtx-prefill: replay %s #%u %s%s: sent rank0 %.3f s rank1 %.3f s, wire %.1f MB (%.3f of %.1f MB plain), "
                                 "%.1f MB/s plain-equivalent, reply (token %u) at %.3f s\n",
-                                pr.name.c_str(), it, bp ? "bp-v1" : "identity", (ik_ab ? (it % 2 == 1) : ik_once) ? " ik-once" : "", t_sent[0], t_sent[1], mb,
+                                pr.name.c_str(), it, bp ? "bp-v1" : "identity", (ik_mode.ab ? (it % 2 == 1) : ik_once) ? " ik-once" : "", t_sent[0], t_sent[1], mb,
                                 mb / (2.0 * static_cast<double>(bytes) * n_layers / 1e6), 2.0 * static_cast<double>(bytes) * n_layers / 1e6,
                                 2.0 * static_cast<double>(bytes) * n_layers / 1e6 / std::max(t_sent[0], t_sent[1]), token, ttft);
                     std::fflush(stdout);
