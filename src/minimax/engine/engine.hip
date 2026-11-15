@@ -1327,9 +1327,9 @@ struct Engine::Impl {
             jit_timing[L].moe_started = false;
         }
     }
-    void jit_count(unsigned L, bool i4, std::size_t calls = 1) {
+    void jit_count(unsigned L, bool i4, std::size_t n = 1) {  // n, not calls: -Wshadow of Impl::calls
         if (!jit_stats) return;
-        task.i4_stats.layer[L].count(i4, calls);
+        task.i4_stats.layer[L].count(i4, n);
     }
     void jit_release(unsigned L) {
         jit_moe_end(L);
