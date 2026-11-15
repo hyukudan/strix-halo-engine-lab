@@ -6,26 +6,43 @@
 namespace strix::cuda_core {
 namespace {
 
-template <int R>
-__device__ __forceinline__ void dot_bf16(const std::uint16_t* wrow, const float* x, std::uint32_t in, std::uint32_t rows,
-                                         int lane, float (&acc)[R]) {
+// acc <- acc + w * x in the documented order. With CC_DENSE_FMA the product is not rounded separately (one fused rounding).
+__device__ __forceinline__ float mac(float acc, float w, float x) {
+#ifdef CC_DENSE_FMA
+    return __fmaf_rn(w, x, acc);
+#else
+    return __fadd_rn(acc, __fmul_rn(w, x));
+#endif
+}
+
+// ORO consecutive output rows per warp: the x values of a chunk are loaded once and applied to every weight row (identical
+// per-(output, row) arithmetic and order as ORO = 1).
+template <int R, int ORO>
+__device__ __forceinline__ void dot_bf16(const std::uint16_t* wrow, std::size_t row_stride, const float* x, std::uint32_t in,
+                                         std::uint32_t rows, int lane, float (&acc)[ORO][R]) {
     const std::uint32_t nch = in >> 3;
-    const uint4* wv = reinterpret_cast<const uint4*>(wrow);
-#pragma unroll 4
+#pragma unroll 2
     for (std::uint32_t c = lane; c < nch; c += 32) {
-        const uint4 u = __ldg(wv + c);
-        const float w[8] = {bf16_lo(u.x), bf16_hi(u.x), bf16_lo(u.y), bf16_hi(u.y),
-                            bf16_lo(u.z), bf16_hi(u.z), bf16_lo(u.w), bf16_hi(u.w)};
+        float w[ORO][8];
+#pragma unroll
+        for (int oi = 0; oi < ORO; ++oi) {
+            const uint4 u = __ldg(reinterpret_cast<const uint4*>(wrow + oi * row_stride) + c);
+            w[oi][0] = bf16_lo(u.x); w[oi][1] = bf16_hi(u.x); w[oi][2] = bf16_lo(u.y); w[oi][3] = bf16_hi(u.y);
+            w[oi][4] = bf16_lo(u.z); w[oi][5] = bf16_hi(u.z); w[oi][6] = bf16_lo(u.w); w[oi][7] = bf16_hi(u.w);
+        }
 #pragma unroll
         for (int r = 0; r < R; ++r) {
             if (static_cast<std::uint32_t>(r) < rows) {
                 const float4* xp = reinterpret_cast<const float4*>(x + static_cast<std::size_t>(r) * in + c * 8);
-                const float4 a = xp[0], b = xp[1];
-                const float xv[8] = {a.x, a.y, a.z, a.w, b.x, b.y, b.z, b.w};
-                float s = acc[r];
+                const float4 a = xp[0], b2 = xp[1];
+                const float xv[8] = {a.x, a.y, a.z, a.w, b2.x, b2.y, b2.z, b2.w};
 #pragma unroll
-                for (int j = 0; j < 8; ++j) s = __fadd_rn(s, __fmul_rn(w[j], xv[j]));
-                acc[r] = s;
+                for (int oi = 0; oi < ORO; ++oi) {
+                    float sacc = acc[oi][r];
+#pragma unroll
+                    for (int j = 0; j < 8; ++j) sacc = mac(sacc, w[oi][j], xv[j]);
+                    acc[oi][r] = sacc;
+                }
             }
         }
     }
@@ -86,15 +103,18 @@ __device__ __forceinline__ void dot_q8(const unsigned char* wrow, const float* x
     }
 }
 
-template <WeightFormat F, int R>
+template <WeightFormat F, int R, int ORO>
 __device__ __forceinline__ void dot_any(const void* w, std::uint32_t o, const float* x, std::uint32_t in, std::uint32_t rows,
-                                        int lane, float (&acc)[R]) {
+                                        int lane, float (&acc)[ORO][R]) {
     if constexpr (F == WeightFormat::bf16) {
-        dot_bf16<R>(static_cast<const std::uint16_t*>(w) + static_cast<std::size_t>(o) * in, x, in, rows, lane, acc);
-    } else if constexpr (F == WeightFormat::f32) {
-        dot_f32<R>(static_cast<const float*>(w) + static_cast<std::size_t>(o) * in, x, in, rows, lane, acc);
+        dot_bf16<R, ORO>(static_cast<const std::uint16_t*>(w) + static_cast<std::size_t>(o) * in, in, x, in, rows, lane, acc);
     } else {
-        dot_q8<R>(static_cast<const unsigned char*>(w) + static_cast<std::size_t>(o) * (in >> 5) * 34, x, in, rows, lane, acc);
+        static_assert(ORO == 1, "only bf16 has multi-row warps");
+        float(&a1)[R] = acc[0];
+        if constexpr (F == WeightFormat::f32)
+            dot_f32<R>(static_cast<const float*>(w) + static_cast<std::size_t>(o) * in, x, in, rows, lane, a1);
+        else
+            dot_q8<R>(static_cast<const unsigned char*>(w) + static_cast<std::size_t>(o) * (in >> 5) * 34, x, in, rows, lane, a1);
     }
 }
 
@@ -120,15 +140,15 @@ __device__ __forceinline__ void prefetch_row(const void* w, std::uint32_t o, std
     if (static_cast<std::size_t>(lane) * 128 < row_bytes) asm volatile("prefetch.global.L2 [%0];" ::"l"(p));
 }
 
-template <WeightFormat F, int R, bool FUSED>
+template <WeightFormat F, int R, bool FUSED, int ORO>
 __global__ void __launch_bounds__(kWarpsPerBlock * 32)
     dense_kernel(MultiArgs ma, const void* w1, const float* x, const float* resid, std::uint32_t in, std::uint32_t rows) {
     pdl_trigger();
-    const std::uint32_t g = blockIdx.x * kWarpsPerBlock + (threadIdx.x >> 5);
-    if (g >= ma.row_end[kMaxMulti - 1]) {
+    const std::uint32_t g = blockIdx.x * kWarpsPerBlock + (threadIdx.x >> 5);  // warp group: ORO consecutive output rows
+    if (g >= ma.row_end[kMaxMulti - 1]) {  // row_end counts groups and is padded with the total
         pdl_wait();
         return;
-    }  // row_end is padded with the total
+    }
     // compile-time unrolled selection: no dynamic indexing of the kernel parameter array (would force a local-memory copy)
     const void* wsel = ma.w[0];
     float* y = ma.y[0];
@@ -142,48 +162,69 @@ __global__ void __launch_bounds__(kWarpsPerBlock * 32)
             out = ma.out[jj + 1];
         }
     }
-    const std::uint32_t o = g - start;
-    const int lane0 = threadIdx.x & 31;
-    prefetch_row<F>(wsel, o, in, lane0);
-    if constexpr (FUSED) prefetch_row<F>(w1, o, in, lane0);
-    pdl_wait();
+    const std::uint32_t o0 = (g - start) * ORO;
     const int lane = threadIdx.x & 31;
-    float a0[R], a1[R];
+    prefetch_row<F>(wsel, o0, in, lane);
+    if constexpr (FUSED) prefetch_row<F>(w1, o0, in, lane);
+    pdl_wait();
+    float a0[ORO][R], a1[ORO][R];
 #pragma unroll
-    for (int r = 0; r < R; ++r) a0[r] = a1[r] = 0.0f;
-    dot_any<F, R>(wsel, o, x, in, rows, lane, a0);
-    if constexpr (FUSED) dot_any<F, R>(w1, o, x, in, rows, lane, a1);
+    for (int oi = 0; oi < ORO; ++oi)
 #pragma unroll
-    for (int r = 0; r < R; ++r) {
-        const float gsum = warp_sum_xor(a0[r]);
-        float v = gsum;
-        if constexpr (FUSED) {
-            const float u = warp_sum_xor(a1[r]);
-            v = __fmul_rn(cc_silu(gsum), u);
-        } else if (resid != nullptr) {
-            const std::size_t idx = static_cast<std::size_t>(r) * out + o;
-            if (static_cast<std::uint32_t>(r) < rows) v = __fadd_rn(resid[idx], gsum);
+        for (int r = 0; r < R; ++r) a0[oi][r] = a1[oi][r] = 0.0f;
+    dot_any<F, R, ORO>(wsel, o0, x, in, rows, lane, a0);
+    if constexpr (FUSED) dot_any<F, R, ORO>(w1, o0, x, in, rows, lane, a1);
+#pragma unroll
+    for (int oi = 0; oi < ORO; ++oi) {
+        const std::uint32_t o = o0 + oi;
+#pragma unroll
+        for (int r = 0; r < R; ++r) {
+            const float gsum = warp_sum_xor(a0[oi][r]);
+            float v = gsum;
+            if constexpr (FUSED) {
+                const float u = warp_sum_xor(a1[oi][r]);
+                v = __fmul_rn(cc_silu(gsum), u);
+            } else if (resid != nullptr) {
+                const std::size_t idx = static_cast<std::size_t>(r) * out + o;
+                if (static_cast<std::uint32_t>(r) < rows) v = __fadd_rn(resid[idx], gsum);
+            }
+            if (lane == 0 && static_cast<std::uint32_t>(r) < rows) y[static_cast<std::size_t>(r) * out + o] = v;
         }
-        if (lane == 0 && static_cast<std::uint32_t>(r) < rows) y[static_cast<std::size_t>(r) * out + o] = v;
     }
 }
 
-template <WeightFormat F, int R, bool FUSED>
+template <WeightFormat F, int R, bool FUSED, int ORO>
 cudaError_t launch(const MultiArgs& ma, const void* w1, const float* x, const float* resid, std::uint32_t in, std::uint32_t rows,
                    cudaStream_t s) {
-    const std::uint32_t total = ma.row_end[ma.n - 1];
-    return launch_pdl(dense_kernel<F, R, FUSED>, dim3((total + kWarpsPerBlock - 1) / kWarpsPerBlock), dim3(kWarpsPerBlock * 32), s, ma, w1, x, resid, in, rows);
+    const std::uint32_t total = ma.row_end[kMaxMulti - 1];
+    return launch_pdl(dense_kernel<F, R, FUSED, ORO>, dim3((total + kWarpsPerBlock - 1) / kWarpsPerBlock), dim3(kWarpsPerBlock * 32), s,
+                      ma, w1, x, resid, in, rows);
+}
+
+// Output rows per warp by row count (bf16 only): more rows share each x load as the row count grows.
+template <WeightFormat F, int R, bool FUSED>
+cudaError_t launch_oro(const MultiArgs& ma, std::uint32_t oro, const void* w1, const float* x, const float* resid, std::uint32_t in,
+                       std::uint32_t rows, cudaStream_t s) {
+    if constexpr (F == WeightFormat::bf16) {
+        if constexpr (R >= 4 && R <= 8) {
+            if (oro == 4) return launch<F, R, FUSED, 4>(ma, w1, x, resid, in, rows, s);
+        }
+        if constexpr (R >= 16 && !(FUSED && R > 16)) {
+            if (oro == 2) return launch<F, R, FUSED, 2>(ma, w1, x, resid, in, rows, s);
+        }
+    }
+    return launch<F, R, FUSED, 1>(ma, w1, x, resid, in, rows, s);
 }
 
 template <WeightFormat F, bool FUSED>
-cudaError_t by_rows(const MultiArgs& ma, const void* w1, const float* x, const float* resid, std::uint32_t in, std::uint32_t rows,
-                    cudaStream_t s) {
-    if (rows <= 1) return launch<F, 1, FUSED>(ma, w1, x, resid, in, rows, s);
-    if (rows <= 2) return launch<F, 2, FUSED>(ma, w1, x, resid, in, rows, s);
-    if (rows <= 4) return launch<F, 4, FUSED>(ma, w1, x, resid, in, rows, s);
-    if (rows <= 8) return launch<F, 8, FUSED>(ma, w1, x, resid, in, rows, s);
-    if (rows <= 16) return launch<F, 16, FUSED>(ma, w1, x, resid, in, rows, s);
-    return launch<F, 32, FUSED>(ma, w1, x, resid, in, rows, s);
+cudaError_t by_rows(const MultiArgs& ma, std::uint32_t oro, const void* w1, const float* x, const float* resid, std::uint32_t in,
+                    std::uint32_t rows, cudaStream_t s) {
+    if (rows <= 1) return launch_oro<F, 1, FUSED>(ma, oro, w1, x, resid, in, rows, s);
+    if (rows <= 2) return launch_oro<F, 2, FUSED>(ma, oro, w1, x, resid, in, rows, s);
+    if (rows <= 4) return launch_oro<F, 4, FUSED>(ma, oro, w1, x, resid, in, rows, s);
+    if (rows <= 8) return launch_oro<F, 8, FUSED>(ma, oro, w1, x, resid, in, rows, s);
+    if (rows <= 16) return launch_oro<F, 16, FUSED>(ma, oro, w1, x, resid, in, rows, s);
+    return launch_oro<F, 32, FUSED>(ma, oro, w1, x, resid, in, rows, s);
 }
 
 bool valid(const DenseWeight& w, std::uint32_t rows) {
@@ -191,13 +232,25 @@ bool valid(const DenseWeight& w, std::uint32_t rows) {
     return w.format == WeightFormat::q8_0 ? (w.in % 32 == 0) : (w.in % 8 == 0);
 }
 
+// ma.row_end is given in ROWS here; it is converted to groups of `oro` rows when every weight has out % oro == 0.
 template <bool FUSED>
-cudaError_t dispatch(const MultiArgs& ma, const DenseWeight& a, const void* w1, const float* x, const float* resid,
+cudaError_t dispatch(MultiArgs ma, const DenseWeight& a, const void* w1, const float* x, const float* resid,
                      std::uint32_t rows, cudaStream_t s) {
+    std::uint32_t oro = 1;
+    if (a.format == WeightFormat::bf16 && rows >= 4) {
+        const bool small = rows <= 8;  // row bucket 4 / 8 -> 4 outputs per warp; bucket 16 / 32 -> 2 (32 only unfused)
+        oro = small ? 4 : ((FUSED && rows > 16) ? 1 : 2);
+        for (int j = 0; j < ma.n; ++j) {
+            if (ma.out[j] % oro != 0) oro = 1;
+        }
+        if (oro > 1) {
+            for (int j = 0; j < kMaxMulti; ++j) ma.row_end[j] /= oro;
+        }
+    }
     switch (a.format) {
-        case WeightFormat::bf16: return by_rows<WeightFormat::bf16, FUSED>(ma, w1, x, resid, a.in, rows, s);
-        case WeightFormat::q8_0: return by_rows<WeightFormat::q8_0, FUSED>(ma, w1, x, resid, a.in, rows, s);
-        case WeightFormat::f32: return by_rows<WeightFormat::f32, FUSED>(ma, w1, x, resid, a.in, rows, s);
+        case WeightFormat::bf16: return by_rows<WeightFormat::bf16, FUSED>(ma, oro, w1, x, resid, a.in, rows, s);
+        case WeightFormat::q8_0: return by_rows<WeightFormat::q8_0, FUSED>(ma, 1, w1, x, resid, a.in, rows, s);
+        case WeightFormat::f32: return by_rows<WeightFormat::f32, FUSED>(ma, 1, w1, x, resid, a.in, rows, s);
     }
     return cudaErrorInvalidValue;
 }
