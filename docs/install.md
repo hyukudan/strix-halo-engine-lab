@@ -19,8 +19,8 @@ was compiled for and the status of each one.
 | OS | Backend | Architecture | Status | Package |
 |---|---|---|---|---|
 | Linux x86_64 | HIP / ROCm | gfx1151 (Strix Halo, RDNA 3.5) | qualified | `strix-hip` DEB / RPM / tar.gz |
-| Linux x86_64 | HIP / ROCm | gfx1200, gfx1201 (RDNA 4) | unqualified, see [other AMD targets](#other-amd-targets) | build with `--hip-archs` |
-| Linux x86_64 | HIP / ROCm | gfx942, gfx950 (CDNA 3 / CDNA 4) | unqualified, see [other AMD targets](#other-amd-targets) | build with `--hip-archs` |
+| Linux x86_64 | HIP / ROCm | gfx1200, gfx1201 (RDNA 4) | unqualified; does not compile yet, see [other AMD targets](#other-amd-targets) | none in 0.1.0 |
+| Linux x86_64 | HIP / ROCm | gfx942, gfx950 (CDNA 3 / CDNA 4) | unqualified; does not compile yet, see [other AMD targets](#other-amd-targets) | none in 0.1.0 |
 | Windows 11 x64 | CUDA | sm_120 (RTX PRO 6000 Blackwell) | qualified | `strix-cuda-qwen-*.zip`, `strix-cuda-ds41-*.zip` |
 | Windows 11 x64 | CUDA | other `CMAKE_CUDA_ARCHITECTURES` (the DeepSeek backend names sm_89 and sm_86) | unqualified | build with `package.cmd ... ARCHS` |
 | Linux x86_64 | CUDA | sm_120 and others | unqualified: CMake configures it, never measured | `package.sh ... cuda-qwen` |
@@ -34,8 +34,15 @@ requirement of one-node packages, and no kernel module is shipped.
 
 `STRIX_HIP_ARCHS` (CMake) selects the HIP targets of every HIP program; `packaging/package.sh BUILD hip --hip-archs
 "gfx1151;gfx1201"` builds one `strix-hip` for several targets, and its description and `build-hip.txt` mark each
-one qualified or unqualified. The build of every listed target is measured in the
-[package build record](#package-build-record) below.
+one qualified or unqualified.
+
+Measured for 0.1.0 (`--hip-archs "gfx1151;gfx1200;gfx1201;gfx942;gfx950"`): the build stops for gfx1200 and gfx942
+in ten HIP sources that call RDNA 3 instructions without an architecture guard: the `wmma_*_w32` builtins (need
+`wmma-256b-insts`, 75 errors), `permlanex16` (`gfx10-insts`, 28) and `sudot4` (`dot8-insts`, 20), for example
+`src/hip_ds41_rn_wide.hip:110`, `src/core/integer_operand.hpp:60`, `src/moe_core/hip_ds41_prefill_variants.inc:219`,
+`src/hip_q8_rows_gemv.hpp`, `src/core/f16_dense_tall.hpp`, `src/moe_core/dense_a8_small.inc`. Those call sites
+have to select their instruction through the capability layer (`strix/hip_arch_caps.hpp`) before an RDNA 4 or
+CDNA package can be built; until then `strix-hip` is gfx1151 only.
 
 ## Runtime dependencies
 

@@ -152,7 +152,13 @@ else()
     # Untagged builds sort before the tagged release: 0.1.0-0.git<sha> < 0.1.0-1.
     set(_strix_pkg_release_default "0.git${_strix_pkg_short}")
 endif()
-set(STRIX_PACKAGE_RELEASE "${_strix_pkg_release_default}" CACHE STRING "Package release number (DEB/RPM)")
+# Recomputed at every configure (a new commit or tag changes it); a non-empty cache value overrides it.
+set(STRIX_PACKAGE_RELEASE_OVERRIDE "" CACHE STRING "Package release number (DEB/RPM); empty: from the git tag")
+if(STRIX_PACKAGE_RELEASE_OVERRIDE STREQUAL "")
+    set(STRIX_PACKAGE_RELEASE "${_strix_pkg_release_default}")
+else()
+    set(STRIX_PACKAGE_RELEASE "${STRIX_PACKAGE_RELEASE_OVERRIDE}")
+endif()
 
 set(_strix_pkg_receipt "format: strix-package-build/1\nversion: ${PROJECT_VERSION}-${STRIX_PACKAGE_RELEASE}\n")
 string(APPEND _strix_pkg_receipt "revision: ${_strix_pkg_sha}\nbuild-mode: ${_strix_pkg_flavor}\n")

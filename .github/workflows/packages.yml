@@ -47,7 +47,7 @@ jobs:
       - name: Smoke test the extracted tar.gz
         run: |
           mkdir -p build/tgz-root
-          for t in build/pkg-host/strix-*.tar.gz; do tar -xzf "$t" -C build/tgz-root --strip-components=1; done
+          for t in build/pkg-host/strix-*.tar.gz; do tar -xzf "$t" -C build/tgz-root; done
           bash packaging/smoke.sh --root build/tgz-root --require-health
 
       - name: Install the DEB packages and smoke test
@@ -94,7 +94,7 @@ jobs:
             for p in build/pkg-hip/strix-*.deb; do dpkg-deb -I "$p" | sed -n "1,25p"; dpkg-deb -c "$p"; done
             for p in build/pkg-hip/strix-*.rpm; do rpm -qip "$p" | head -12; rpm -qlp "$p"; done
             cat build/pkg-hip/packaging/build-hip.txt
-            mkdir -p build/hip-root && tar -xzf build/pkg-hip/strix-hip-*.tar.gz -C build/hip-root --strip-components=1
+            mkdir -p build/hip-root && tar -xzf build/pkg-hip/strix-hip-*.tar.gz -C build/hip-root
             bash packaging/smoke.sh --root build/hip-root
           ' 2>&1 | tee hip-packages.log | tail -n 80
 

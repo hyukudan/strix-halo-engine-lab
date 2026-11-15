@@ -19,8 +19,8 @@ destino a través de la capa de capacidades; no se ha medido ni su velocidad ni 
 | SO | Backend | Arquitectura | Estado | Paquete |
 |---|---|---|---|---|
 | Linux x86_64 | HIP / ROCm | gfx1151 (Strix Halo, RDNA 3.5) | cualificado | `strix-hip` DEB / RPM / tar.gz |
-| Linux x86_64 | HIP / ROCm | gfx1200, gfx1201 (RDNA 4) | no cualificado, ver [otros destinos AMD](#otros-destinos-amd) | compilar con `--hip-archs` |
-| Linux x86_64 | HIP / ROCm | gfx942, gfx950 (CDNA 3 / CDNA 4) | no cualificado, ver [otros destinos AMD](#otros-destinos-amd) | compilar con `--hip-archs` |
+| Linux x86_64 | HIP / ROCm | gfx1200, gfx1201 (RDNA 4) | no cualificado; aún no compila, ver [otros destinos AMD](#otros-destinos-amd) | ninguno en 0.1.0 |
+| Linux x86_64 | HIP / ROCm | gfx942, gfx950 (CDNA 3 / CDNA 4) | no cualificado; aún no compila, ver [otros destinos AMD](#otros-destinos-amd) | ninguno en 0.1.0 |
 | Windows 11 x64 | CUDA | sm_120 (RTX PRO 6000 Blackwell) | cualificado | `strix-cuda-qwen-*.zip`, `strix-cuda-ds41-*.zip` |
 | Windows 11 x64 | CUDA | otros `CMAKE_CUDA_ARCHITECTURES` (el backend DeepSeek nombra sm_89 y sm_86) | no cualificado | compilar con `package.cmd ... ARCHS` |
 | Linux x86_64 | CUDA | sm_120 y otros | no cualificado: CMake lo configura, nunca medido | `package.sh ... cuda-qwen` |
@@ -34,8 +34,16 @@ no lo necesitan los paquetes de un nodo, y no se distribuye ningún módulo de k
 
 `STRIX_HIP_ARCHS` (CMake) elige los destinos HIP de todos los programas HIP; `packaging/package.sh BUILD hip
 --hip-archs "gfx1151;gfx1201"` construye un `strix-hip` para varios destinos, y su descripción y `build-hip.txt`
-marcan cada uno como cualificado o no. La compilación de cada destino listado está medida en el
-[registro de compilación](#registro-de-compilación-de-paquetes).
+marcan cada uno como cualificado o no.
+
+Medido para 0.1.0 (`--hip-archs "gfx1151;gfx1200;gfx1201;gfx942;gfx950"`): la compilación se detiene para gfx1200 y
+gfx942 en diez fuentes HIP que llaman a instrucciones RDNA 3 sin guarda de arquitectura: los builtins `wmma_*_w32`
+(necesitan `wmma-256b-insts`, 75 errores), `permlanex16` (`gfx10-insts`, 28) y `sudot4` (`dot8-insts`, 20), por
+ejemplo `src/hip_ds41_rn_wide.hip:110`, `src/core/integer_operand.hpp:60`,
+`src/moe_core/hip_ds41_prefill_variants.inc:219`, `src/hip_q8_rows_gemv.hpp`, `src/core/f16_dense_tall.hpp`,
+`src/moe_core/dense_a8_small.inc`. Esas llamadas deben elegir su instrucción mediante la capa de capacidades
+(`strix/hip_arch_caps.hpp`) antes de poder construir un paquete RDNA 4 o CDNA; hasta entonces `strix-hip` es solo
+gfx1151.
 
 ## Dependencias en ejecución
 

@@ -39,8 +39,9 @@ cmake -S "$src" -B "$build" "${common[@]}" "${opts[@]}" "${extra[@]}" >"$build/c
     { tail -n 20 "$build/configure.log"; exit 1; }
 flavor=$mode
 receipt="$build/packaging/build-$flavor.txt"
-# The executables this tree installs, from the configure receipt ("  component:target" lines).
-mapfile -t targets < <(sed -n 's/^  [a-z]*:\(strix-[A-Za-z0-9_.-]*\)$/\1/p' "$receipt")
+# The executables of the components this tree packages, from the configure receipt ("  component:target").
+case "$mode" in host) comps='core\|tools' ;; hip) comps='hip' ;; *) comps='cuda' ;; esac
+mapfile -t targets < <(sed -n "s/^  \\($comps\\):\\(strix-[A-Za-z0-9_.-]*\\)\$/\\2/p" "$receipt")
 [ ${#targets[@]} -gt 0 ] || { echo "package.sh: no packaged executables in $receipt" >&2; exit 1; }
 cmake --build "$build" -j "$jobs" --target "${targets[@]}" >"$build/build.log" 2>&1 ||
     { tail -n 20 "$build/build.log"; exit 1; }
