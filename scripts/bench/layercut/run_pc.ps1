@@ -11,7 +11,7 @@ param(
     [int]$Repeat = 2,
     [ValidateSet('relay','direct')][string]$Act = 'relay',
     [ValidateSet('identity','bp')][string]$Codec = 'identity',
-    [string]$PairIdentity = 'default',
+    [string]$PairIdentity = 'default/c4096',
     [string]$Binary = "$PSScriptRoot/../../../src/minimax/rtxpf/cuda/mm-rtx-prefill.exe",
     [string]$OutputDir = 'layercut-out'
 )

@@ -17,10 +17,14 @@ struct Inputs {
     chain::ModelShape model;
     std::uint64_t rows = 0;
     double rtx_rows_s = 0, pair_rows_s = 0, link_mbps = 0;
+    std::uint32_t pair_grain = 0;  // identity_grain(pair identity): blocks are multiples of it; 0 = any block
+    // Measured pair cost multiplier by block rows (chain::Device::unit_scale; empty = the declared rate at every block).
+    std::vector<std::pair<std::uint32_t, double>> pair_unit_scale;
 };
 struct Resolved {
     chain::Split split = chain::Split::device_only;
     std::uint32_t cut = 0, block = 2048;
+    std::uint32_t grain = 0;  // Inputs::pair_grain the block honours (identity_grain)
     Act act = Act::relay;
     bool planned = false;
     std::uint32_t first = 0;
@@ -33,6 +37,23 @@ inline std::uint32_t number(std::string_view value, const char* key) {
     if (r.ec != std::errc{} || r.ptr != value.data() + value.size() || value.empty())
         throw std::invalid_argument(std::string(key) + ": expected an unsigned decimal integer");
     return n;
+}
+// Identity grain (shared rule, strix/pair/prefill_group.hpp kReuseChunks). A pair prefill whose bits depend on its
+// chunk boundaries names its chunk rows in its identity as "<id>/c<rows>[;policies]". MiniMax production: a row's MoE
+// K split class follows the rows its expert holds in the row's own chunk (src/minimax/moe/mmx_prefill.hip gw_class,
+// route_identity.hpp gemm_splits), so 1024-row chunks change the logits of 4096-row chunks; the group width does not.
+// The cut layers reproduce the pair-alone bits only when every block starts at a multiple of those rows. Returns the
+// rows; 0 for "fp32" (row-invariant, gate T1). An unnamed chunk-dependent identity is an error, never a guess.
+inline std::uint32_t identity_grain(std::string_view pair_identity) {
+    const auto base = pair_identity.substr(0, pair_identity.find(';'));
+    if (base == "fp32") return 0;
+    const auto at = base.rfind("/c");
+    if (at == std::string_view::npos)
+        throw std::invalid_argument("layercut pair identity '" + std::string(pair_identity) +
+                                    "': name the pair chunk rows as <id>/c<rows> (its bits depend on the chunking)");
+    const auto rows = number(base.substr(at + 2), "layercut pair identity chunk rows");
+    if (rows == 0 || rows % 16 != 0) throw std::invalid_argument("layercut pair identity: chunk rows must be a positive multiple of 16");
+    return rows;
 }
 inline double link_class(std::string_view s) {
     if (s == "1gbe") return 118;
@@ -65,9 +86,16 @@ inline Resolved resolve(const Cli& cli, const Inputs& input, Lookup env = [](con
         out.cut = number(c.text, "STRIX_SPLIT_CUT");
         if (out.cut == 0 || out.cut >= input.model.layers) throw std::invalid_argument("STRIX_SPLIT_CUT: outside [1,L-1]");
     }
+    const std::uint32_t grain = input.pair_grain;
+    out.grain = grain;
+    if (grain != 0 && b.origin == "default") b = {std::to_string(grain), "identity grain"};
     if (b.text != "auto") {
         out.block = number(b.text, "STRIX_SPLIT_BLOCK");
         if (out.block == 0 || out.block % 16 != 0) throw std::invalid_argument("STRIX_SPLIT_BLOCK: expected positive multiple of 16");
+        if (grain != 0 && out.block % grain != 0)
+            throw std::invalid_argument("STRIX_SPLIT_BLOCK=" + std::to_string(out.block) + " splits the pair's " +
+                std::to_string(grain) + "-row chunks: the cut layers would not reproduce the pair-alone bits "
+                "(chunk-local MoE split classes); use a multiple of " + std::to_string(grain));
     }
     const bool plan = s.text == "auto" || b.text == "auto" ||
         (c.text == "auto" && (c.origin != "default" || out.split == chain::Split::layer_cut));
@@ -79,9 +107,12 @@ inline Resolved resolve(const Cli& cli, const Inputs& input, Lookup env = [](con
             throw std::invalid_argument("STRIX_SPLIT: auto needs declared RTX/pair rows/s, link MB/s and rows");
         std::vector<chain::Device> devices{{"rtx", chain::scaled_costs(input.rtx_rows_s, input.model.layers)},
                                           {"pair", chain::scaled_costs(input.pair_rows_s, input.model.layers)}};
+        devices[1].unit_scale = input.pair_unit_scale;
         chain::Request req;
         req.split = out.split; req.rows = input.rows; req.decoders = {1};
-        req.blocks = b.text == "auto" ? std::vector<std::uint32_t>{256, 512, 1024, 2048, 4096} : std::vector<std::uint32_t>{out.block};
+        if (b.text != "auto") req.blocks = {out.block};
+        else if (grain == 0) req.blocks = {256, 512, 1024, 2048, 4096};
+        else req.blocks = {grain, 2 * grain, 4 * grain};  // identity-legal candidates only
         if (c.text != "auto") req.legal_cut = [cut = out.cut](std::uint32_t k) { return k == cut; };
         if (out.split == chain::Split::layer_cut) req.cuts = {out.cut};
         const auto best = chain::choose(devices, {{mbps * 1000, mbps * 1000, 0}}, input.model, req).best;
@@ -104,6 +135,7 @@ inline Resolved resolve(const Cli& cli, const Inputs& input, Lookup env = [](con
     line("cut", std::to_string(out.cut), c.origin);
     line("block", std::to_string(out.block), b.origin);
     line("act", act_name(out.act), a.origin);
+    line("grain", std::to_string(grain), grain != 0 ? "pair identity chunk rows" : "row-invariant pair identity");
     return out;
 }
 struct Block { std::uint64_t row0; std::uint32_t rows; };

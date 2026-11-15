@@ -47,7 +47,10 @@ cold and subsequent runs warm. Both ranks finish their requested decode steps be
 The node script uses relay. For direct mode launch both ranks with `--cut-act direct` and omit relay controls;
 use `-Act direct` on the PC. `-Codec bp` selects lossless bp-v1 for every repetition of this route.
 
-The default pair identity is `default`. For the FP32 pair profile, set `STRIX_MM_PREFILL_IDENTITY=fp32`
+The default pair identity is `default/c4096`: production prefill bits depend on the pair's chunk boundaries (a row's
+MoE K split class follows the rows its expert holds in that chunk), so the identity names the pair-alone chunk rows
+(`--max-rows`, default 4096) and every block must be a multiple of them (identity grain; the resolver refuses other
+blocks and `auto` only proposes multiples). For the FP32 pair profile, set `STRIX_MM_PREFILL_IDENTITY=fp32`
 on both nodes (the node script forwards it to rank 1) and use `-PairIdentity fp32` on the PC. Additional active
 prefill policies append `;` and the existing prefill policy identity. Copy that exact string into
 `--cut-pair-identity`; a mismatch is refused before compute.
@@ -57,7 +60,7 @@ prefill policies append `;` and the existing prefill policy identity. Copy that 
 The shared resolver is `include/strix/pair/layercut.hpp`: CLI overrides environment, then defaults.
 `--split` / `STRIX_SPLIT`: `device-only` (default), `handoff-full`, `layer-cut`, `auto`.
 `--cut` / `STRIX_SPLIT_CUT`: 1..59 or `auto`; `--cut-block` / `STRIX_SPLIT_BLOCK`: positive multiple of 16,
-or `auto` (default 2048); `--cut-act` / `STRIX_SPLIT_ACT`: `relay` (default) or `direct`.
+or `auto` (default: the identity grain, 4096 for the default pair identity, else 2048); `--cut-act` / `STRIX_SPLIT_ACT`: `relay` (default) or `direct`.
 The rank route requires `--layercut-listen NAME:PROMPT.u32:BASE_PORT:STEPS:COUNT` and a cut policy on both ranks.
 Relay adds rank 0 `--cut-relay HOST:PORT` and rank 1 `--cut-relay-listen PORT`.
 `--print-effective-config` prints the resolved `split KEY VALUE (cli|env|default|planner)` lines without device work.
@@ -119,9 +122,10 @@ No native execution or fidelity result is established by the host tests (native 
 
 - Ports: rank r listens on BASE_PORT + r, so the relay port of rank 1 must differ from BASE_PORT + 1; the producer sends
   to HOST0:BASE_PORT,HOST1:BASE_PORT+1.
-- Pipelining needs the pair's prefill unit (chunk rows x interleave group) to be at most one block: run the ranks with
-  `STRIX_MM_PF_GROUP=2 --max-rows C/2` for `--cut-block C`. With the default group (4) an 8K prompt is one unit and the
-  pair starts only after the last block (no overlap).
+- Pipelining: the listener runs each block as one prefill unit (`block / max-rows` chunks, bit-neutral) so the pair
+  starts on the first block. Keep the pair-alone `--max-rows`; the old `STRIX_MM_PF_GROUP=2 --max-rows C/2` recipe
+  changed the pair's chunk identity (logits differ from the pair alone) and is refused for the default identity.
+- Unit gate (bit-neutral): a `--session` with `--unit-chunks 1` prints the same state / final-rows fnv as the default.
 - Exactness gate: ranks with `STRIX_MM_PREFILL_IDENTITY=fp32` and the producer with `--cut-pair-identity fp32`; the
   layer-cut "state fnv" line must equal the node-only FP32 `--session` state fnv on both ranks.
 - Quality: `STRIX_MM_QUALITY_OUT=PREFIX STRIX_MM_QUALITY_ROWS=N` on the ranks dumps the prefill logits of a `--session`

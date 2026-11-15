@@ -155,6 +155,50 @@ int main() try {
     require(provider.protocols()[0].gate == "pending" && provider.protocols()[0].name == mm::format &&
         provider.protocols()[0].import_ms < 0 && !provider.range_footprint({}, {}, 0, 0, 24), "unqualified deployment adapter");
     rejects([&] { (void)provider.state_bytes(19, 24, 61); }, "range");
+    // Identity grain: chunk-dependent pair identities name their chunk rows; blocks honour them.
+    require(lc::identity_grain(mm::default_pair_identity()) == 4096 && lc::identity_grain("fp32") == 0 &&
+        lc::identity_grain("fp32;fast_i4") == 0 && lc::identity_grain("default/c2048;moe-w2") == 2048, "identity grain parse");
+    rejects([] { (void)lc::identity_grain("default"); }, "chunk rows");
+    rejects([] { (void)lc::identity_grain("default/c100"); }, "multiple of 16");
+    {
+        const auto none = [](const char*) -> const char* { return nullptr; };
+        lc::Inputs g{mm::chain_shape(), 32769, 4320, 3200, 4600};
+        g.pair_grain = 4096;
+        lc::Cli cut; cut.split = "layer-cut"; cut.cut = "28";
+        const auto d = lc::resolve(cut, g, none);
+        require(d.block == 4096 && d.grain == 4096 && d.lines.find("split block 4096 (identity grain)") != std::string::npos &&
+            d.lines.find("split grain 4096") != std::string::npos, "grain is the default block");
+        cut.block = "2048";
+        rejects([&] { (void)lc::resolve(cut, g, none); }, "STRIX_SPLIT_BLOCK=2048 splits");
+        cut.block = "8192";
+        require(lc::resolve(cut, g, none).block == 8192, "multiple of the grain accepted");
+        cut.block = "auto";
+        const auto a = lc::resolve(cut, g, none);
+        require(a.planned && a.block % 4096 == 0, "auto proposes identity-legal blocks only");
+        g.pair_grain = 0; cut.block = "2048";
+        require(lc::resolve(cut, g, none).block == 2048, "row-invariant identity keeps any block");
+        // One resolver: the listener (grain from its --max-rows) and the producer (grain from --cut-pair-identity)
+        // resolve the same request to the same effective lines.
+        lc::Inputs listener = g, producer = g;
+        listener.pair_grain = lc::identity_grain("default/c" + std::to_string(4096));
+        producer.pair_grain = lc::identity_grain(mm::default_pair_identity());
+        lc::Cli same; same.split = "layer-cut"; same.cut = "28";
+        require(lc::resolve(same, listener, none).lines == lc::resolve(same, producer, none).lines, "listener == producer");
+    }
+    // Measured unit-rows scale: log2-linear, clamped; small blocks cost the pair more per row.
+    {
+        const std::vector<std::pair<std::uint32_t, double>> s{{1024, 1.274}, {4096, 1.0}};
+        require(lc::chain::detail::unit_factor(s, 512) == 1.274 && lc::chain::detail::unit_factor(s, 8192) == 1.0 &&
+            std::abs(lc::chain::detail::unit_factor(s, 2048) - 1.137) < 1e-9 && lc::chain::detail::unit_factor({}, 7) == 1.0,
+            "unit factor interpolation");
+        lc::Inputs u{mm::chain_shape(), 32769, 4320, 3200, 4600};
+        lc::Cli cut; cut.split = "layer-cut"; cut.cut = "28"; cut.block = "auto";
+        const auto none = [](const char*) -> const char* { return nullptr; };
+        const auto flat = lc::resolve(cut, u, none);
+        u.pair_unit_scale = {{256, 3.0}, {1024, 1.274}, {4096, 1.0}};
+        const auto scaled = lc::resolve(cut, u, none);
+        require(scaled.block >= flat.block, "a small-unit penalty never shrinks the planned block");
+    }
     std::puts("PASS: layercut resolver, schedule, metadata, coverage and KV reassembly");
     return 0;
 } catch (const std::exception& e) { std::fprintf(stderr, "FAIL: %s\n", e.what()); return 1; }
