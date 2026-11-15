@@ -5,6 +5,7 @@
 #include "strix/serve/prefill_group.hpp"
 
 #include <cstdint>
+#include <cstring>
 #include <filesystem>
 #include <map>
 #include <memory>
@@ -156,6 +157,28 @@ struct PrefillResult {
     bool decoder_deferred = false;     // set_decoder_deferral admitted: no logits / next token / seed, decode state completed by the next run
     std::vector<std::uint64_t> stream_hashes;  // last row, after each layer (stream_hashes)
     bool embed_dead_hash_checked = false, embed_image_router_checked = false; // verify_embed_extras evidence
+    // Local sampled evidence only: every observed image residual stays bitwise unchanged,
+    // and a text residual in the same run changes in at least one Engram layer.
+    // Missing local rows/layers are inconclusive, never a distributed qualification.
+    bool embed_image_engram_checked = false;
+    bool embed_engram_image_seen = false, embed_engram_text_seen = false;
+    bool embed_engram_image_kept = true, embed_engram_text_moved = false;
+    void observe_embed_engram(std::span<const float> image_before, std::span<const float> image_after,
+                             std::span<const float> text_before, std::span<const float> text_after) {
+        const auto same_bits = [](std::span<const float> a, std::span<const float> b) {
+            return a.size() == b.size() && (a.empty() || std::memcmp(a.data(), b.data(), a.size_bytes()) == 0);
+        };
+        if (!image_before.empty()) {
+            embed_engram_image_seen = true;
+            embed_engram_image_kept = embed_engram_image_kept && same_bits(image_before, image_after);
+        }
+        if (!text_before.empty() && text_before.size() == text_after.size()) {
+            embed_engram_text_seen = true;
+            embed_engram_text_moved = embed_engram_text_moved || !same_bits(text_before, text_after);
+        }
+        embed_image_engram_checked = embed_engram_image_seen && embed_engram_image_kept &&
+                                     embed_engram_text_seen && embed_engram_text_moved;
+    }
     double seconds = 0.0, engram_seconds = 0.0, head_seconds = 0.0;
     double engram_wait_seconds = 0.0;  // overlapped Engram read: the part the run waited for (before the Engram layers)
     std::vector<PrefillLayerTiming> layers;

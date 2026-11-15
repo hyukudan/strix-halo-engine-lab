@@ -1,5 +1,6 @@
 #include "strix/env_flags.hpp"
 #include "strix/ds41_fast_profile.hpp"
+#include "strix/ds41_decode_xport.hpp"
 #include <map>
 #include "strix/deepseek41_pair_defaults.hpp"
 #include "strix/deepseek41_pair_profile_table.hpp"
@@ -231,6 +232,7 @@ std::span<const strix::profile::DefaultItem> default_items() {
         {"window_drain", "STRIX_DS41_PREFILL_WINDOW_DRAIN", "", "0", ""},
         // 2026-11-14 DS41 prefill schedule (bitwise): one MoE window per pass, cap 8192 (ABAB -218 ms at 11,594, hashes equal)
         {"moe_pass_window", "STRIX_DS41_PREFILL_MOE_PASS_WINDOW", "", "0", ""},
+        {"decode_xport", "STRIX_DS41_DECODE_XPORT", "", "0", ""},
     };
     return items;
 }
@@ -274,14 +276,24 @@ Resolved resolve(App app, const std::vector<std::string>& in, const Getenv& raw_
     for (auto& n : r.profile->notices()) r.notices.push_back(std::move(n));
     const Getenv env = [&](const char* name) -> const char* {
         for (const auto& [k, v] : profile_env) if (k == name) return v.c_str();
-        return raw_env(name);
+        const char* value = raw_env(name);
+        // The transport selector treats empty as automatic; baseline must also
+        // export its rollback over an inherited empty value.
+        if (name == strix::ds41::decode_xport_lever.env && !set(value)) return nullptr;
+        return value;
     };
     const auto put = [&](const char* name, std::string value) {
         if (env(name) == nullptr) r.set_env.emplace_back(name, std::move(value));
     };
     const auto notice = [&](const std::string& s) { r.notices.push_back(std::string("deepseek41 defaults: ") + s); };
-
     const bool baseline = set(env("STRIX_DS41_BASELINE")) && !zero(env("STRIX_DS41_BASELINE"));
+    {
+        // The engine reads the variable after the app applied set_env: STRIX_DS41_BASELINE=1 puts the communicator there.
+        const char* value = env(strix::ds41::decode_xport_lever.env.data());
+        const auto xport = strix::ds41::decode_xport_choice(baseline && !set(value) ? "0" : value);
+        r.decode_xport = std::string(strix::ds41::decode_xport_name(xport.on)) + " (" +
+                         (baseline && !set(value) ? "baseline" : strix::lever::origin_name(xport.origin)) + ")";
+    }
     if (baseline) {
         for (const auto& row : default_items()) {
             const auto value = strix::profile::resolve_default(row, true, env);
@@ -416,6 +428,7 @@ std::string describe(App app, const Resolved& r) {
     for (const auto& [k, v] : r.set_env) o << "env " << k << '=' << v << '\n';
     for (const auto& k : r.unset_env) o << "unset " << k << '\n';
     for (const auto& a : r.args) o << "arg " << a << '\n';
+    o << "decode_xport " << r.decode_xport << '\n';
     o << "session cache " << (r.session.enabled ? "on" : "off") << "\n"
       << "session ram_bytes " << r.session.ram_bytes << "\n"
       << "session max_parked " << r.session.max_parked << "\n"
