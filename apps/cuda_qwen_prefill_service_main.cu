@@ -398,8 +398,7 @@ int main(int argc, char** argv) {
     try {
         // HTTP chunk POSTs: the connection count is not the shared-lib stream model (a POST waits for its reply), so it
         // keeps the family value unless given explicitly.
-        if (handoff_req.streams == "auto") throw std::invalid_argument("--handoff-connections auto is not supported (keep >= 2 POSTs in flight)");
-        const auto r = strix::handoff::resolve(handoff_family, handoff_req);
+        const auto r = strix::handoff::resolve(handoff_family, handoff_req, {}, 16, {false, false});
         handoff.codec = strix::handoff::codec_name(r.choice.codec);
         handoff.connections = r.choice.streams;
         handoff.encode_threads = r.choice.encode_threads;

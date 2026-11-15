@@ -9,6 +9,7 @@
 #include <deque>
 #include <exception>
 #include <map>
+#include <limits>
 #include <mutex>
 #include <stdexcept>
 #include <thread>
@@ -587,13 +588,40 @@ struct Sender::Impl {
         }
     }
 
+    std::size_t encode_reservation(const Input& in) const {
+        if (codec != Codec::bp_v1 || std::none_of(in.regions.begin(), in.regions.end(),
+            [](const bp_codec::Region& r) { return r.bytes != 0; })) return 0;
+        // bp-v1 has <=11 bits/symbol, <=4 plane headers per block, a 16-byte
+        // directory entry, and <2 KiB BlockPlan objects. 8 KiB/block covers
+        // metadata plus vector growth (old and new plans coexist); 2x plain
+        // bounds even an explicitly permitted expanding Huffman encoding.
+        // Fixed worker stacks and allocator bookkeeping are outside this budget.
+        std::size_t bytes = 16;
+        const auto add = [&](std::size_t n, std::size_t scale) {
+            if (n > (std::numeric_limits<std::size_t>::max() - bytes) / scale)
+                throw std::length_error("handoff: encoding reservation overflow");
+            bytes += n * scale;
+        };
+        for (const auto& r : in.regions) {
+            const std::size_t w = r.width == 2 || r.width == 4 ? r.width : 1;
+            const auto step = std::max(w, std::min(opt.encode.block_bytes, std::size_t{1} << 30) / w * w);
+            add(r.bytes, 2);
+            add(r.bytes / step + (r.bytes % step != 0), 8192);
+        }
+        return bytes;
+    }
+
     void encode_loop() {
         try {
+#ifdef STRIX_HANDOFF_TESTING
+            if (opt.before_encode) opt.before_encode();
+#endif
             for (;;) {
                 // bp-v1 with encode_batch > 1: every queued piece (up to encode_batch) is encoded side by side on the
                 // pool, so pieces of one codec block (<= 1 MiB) no longer encode on one thread; output order and the
                 // bytes of every frame are the same as one at a time.
                 std::vector<Input> batch;
+                std::vector<std::size_t> reservations;
                 {
                     std::unique_lock<std::mutex> g(m);
                     cv.wait(g, [&] { return aborted || !inputs.empty() || closed; });
@@ -602,9 +630,20 @@ struct Sender::Impl {
                     const bool wide = codec == Codec::bp_v1 && pool && pool->threads() > 0 && opt.encode_batch > 1;
                     const std::size_t take = wide ? std::min<std::size_t>(inputs.size(), opt.encode_batch) : 1;
                     for (std::size_t i = 0; i < take; ++i) {
+                        const auto reserve = encode_reservation(inputs.front());
+                        const auto fits = [&] { return reserve == 0 || (queued_wire == 0 && batch.empty()) ||
+                            (queued_wire <= opt.max_queued_wire_bytes && reserve <= opt.max_queued_wire_bytes - queued_wire); };
+                        if (!batch.empty() && !fits()) break;
+                        cv.wait(g, [&] { return aborted || fits(); });
+                        if (aborted) return;
+                        reservations.push_back(reserve);
                         batch.push_back(std::move(inputs.front()));
                         inputs.pop_front();
+                        queued_wire += reserve;
                     }
+#ifdef STRIX_HANDOFF_TESTING
+                    if (opt.observe_batch) opt.observe_batch(batch.size(), queued_wire);
+#endif
                 }
                 const auto t0 = Clock::now();
                 std::vector<Output> outs(batch.size());
@@ -613,15 +652,18 @@ struct Sender::Impl {
                 const double dt = secs(t0, Clock::now());
                 for (std::size_t i = 0; i < outs.size(); ++i) {
                     Output& out = outs[i];
+#ifdef STRIX_HANDOFF_TESTING
+                    if (opt.observe_frame) opt.observe_frame(out.f.seq,
+                        {reinterpret_cast<const std::uint8_t*>(&out.f), sizeof(out.f)}, out.wire);
+#endif
                     std::unique_lock<std::mutex> g(m);
                     if (i == 0) encode_s += dt;
-                    // Back-pressure on encoded bytes only (identity bytes are the caller's memory, bounded by submit()).
-                    cv.wait(g, [&] { return aborted || queued_wire == 0 || queued_wire + out.wire.size() <= opt.max_queued_wire_bytes; });
                     if (aborted) {
                         g.unlock();
                         return;
                     }
-                    queued_wire += out.wire.size();
+                    if (out.wire.capacity() > reservations[i]) throw std::logic_error("handoff: encoding exceeded reservation");
+                    queued_wire -= reservations[i] - out.wire.capacity();
                     plain_total += out.f.plain_bytes;
                     wire_total += out.f.wire_bytes;
                     ++pieces;
@@ -661,7 +703,9 @@ struct Sender::Impl {
                 out.release.run();
                 std::lock_guard<std::mutex> g(m);
                 last_byte = secs(t_open, Clock::now());
-                queued_wire -= out.wire.size();
+                const auto capacity = out.wire.capacity();
+                std::vector<std::uint8_t>().swap(out.wire);  // release storage before returning its credit
+                queued_wire -= capacity;
                 cv.notify_all();
             }
         } catch (...) {

@@ -1,64 +1,36 @@
-# State hand-off transport: measured link use and the shared policy
+# State hand-off transport and shared policy
 
-The prompt-state hand-off (prefill host -> serving ranks) is shared code: `include/strix/handoff.hpp` /
-`src/handoff.cpp` (framed TCP, 1..64 streams, bp-v1 byte-plane Huffman codec, per-piece XXH64, manifest fold) and
-`include/strix/handoff_policy.hpp` (the cost model and the one resolver of the hand-off options). Every number below
-was measured on 2026-11-15 with `strix-xfer-probe` (no GPU) or `scripts/bench/xfer/copy_probe.cpp`.
+`include/strix/handoff.hpp` and `src/handoff.cpp` implement framed TCP sessions,
+1..64 streams, the project-owned bp-v1 codec, per-piece XXH64 and manifest checks.
+`include/strix/handoff_policy.hpp` provides the shared resolver and an estimated cost model.
 
-## What the link gives today (1 GbE, prefill host -> node)
+## Implementation and qualification
 
-| Pieces | 1 stream | 2 streams | 4 streams |
-|---|---:|---:|---:|
-| 64 KiB | 115.6 MB/s (92.5 % of line) | 117.0 | 113.2 |
-| 1 MiB | 117.1 (93.7 %) | 116.5 | 115.5 |
-| 16 MiB | 118.0 (94.4 %) | 112.6 | 114.7 |
+- `STRIX_HANDOFF_RECV_WAITALL=0` restores the previous receive organization. Both paths
+  advance by actual bytes received, reject EOF/errors and preserve frame validation.
+- `SenderOptions::encode_batch` defaults to 16. A batch also needs space in
+  `max_queued_wire_bytes`: reservations cover conservative encoding workspace and unsent
+  output buffers before encoding starts. A single oversized piece may run alone for
+  progress. Worker stacks, allocator bookkeeping and caller input storage are separate;
+  `max_pending_plain_bytes` controls input credits. Identity retains caller storage.
+- The host tests compare complete decoded payloads and per-sequence encoded frame bytes,
+  force a multi-piece batch, and check bounded/oversized reservations. These establish
+  transport invariants, not inference fidelity or a throughput gain.
+- The copy probe brackets the kernel on its own stream with device events, measures copy
+  events separately, and reports the intersection of their intervals. An interval overlap
+  can include gaps between copies and does not establish continuous hardware concurrency.
+  Device execution must be remeasured; previous host-observed kernel times do not establish
+  interference or its absence. `copy_wall_s` includes host submission and synchronization.
 
-TCP/IPv4 at MTU 1500 carries at most 1448/1538 = 94.1 % of the line as payload: one stream at 16 MiB pieces already
-takes all of it, and more streams do not add anything on this link. The fixed cost of a piece is about 12 us.
+## Adoption sequence
 
-## Codec on real state bytes (a Qwen state dump, one thread / 8 threads)
-
-| Region | bp-v1 ratio | bp-v1 encode | zstd-1 | zstd-1 on byte planes |
-|---|---:|---:|---:|---:|
-| KV rows (BF16) | 1.468 | 2.16 / 5.27 GB/s | 1.265 (0.94 GB/s) | 1.506 (0.63 GB/s) |
-| GDN recurrent matrix (FP32) | 1.171 | 2.22 / 4.75 GB/s | 1.068 | 1.181 (0.80 GB/s) |
-
-lz4 has no entropy stage, so it cannot beat zstd-1 on these bytes, and zstd-1 alone loses to bp-v1. zstd-1 on byte
-planes is 2.6 % / 0.8 % smaller than bp-v1 at about a third of its speed. That would save about 0.15 s on a 32K Qwen
-hand-off at 1 GbE, but there is no zstd on the Windows prefill host, so it is not built. bp-v1 decodes at 11-23 GB/s.
-
-## Staging copies
-
-| Device | D2H pinned | D2H pageable | H2D pinned | H2D pageable | busy kernel beside the copy |
-|---|---:|---:|---:|---:|---|
-| RTX PRO 6000 (PCIe 5.0) | 35.6-49.0 GB/s | 9.8-13.7 | 33-38 | 13-23 | 0.243 -> 0.243 s |
-| Strix Halo node (unified) | 68-90 | 62-83 | 61-81 | 43-82 | 0.184 -> 0.184 s |
-
-An async copy on its own stream overlaps compute fully on both. Pinned staging matters on the discrete card (3.5x
-D2H), but even a pageable copy is 100x faster than 1 GbE. On the node, pageable and pinned cost the same.
-
-## Hand-off seconds at 32K (1 GbE, shared transport, real Qwen bytes, pieces released at the producer's times)
-
-| Case | Wire | Tail after the last ready piece | Link busy |
-|---|---:|---:|---:|
-| Qwen 32K, prefill 7.59 s, bp-v1, per layer and block | 767.7 MB of 1,097.9 | 0.708-0.711 s | 74.7 % |
-| Qwen 32K, identity | 1,097.9 MB | 1.757 s | 94.8 % |
-| DS41 32K, whole state after the prefill (today's v1 shape) | 32.2 MB | 0.284 s (bp-v1 0.212) | - |
-| DS41 32K, streamed per layer | 32.2 MB | 0.012-0.017 s | 13 % |
-
-For Qwen the tail is the last block's rows plus the GDN recurrent state, which is final only when its layer finishes
-the last block. Those 97 MB on the wire are the floor at 1 GbE.
-
-## Library changes (bitwise: the imported bytes are the same)
-
-- `ReceiverOptions` path, `recv_all` with `MSG_WAITALL`: the receiver used to wake per arriving segment burst and
-  burned about one core at 118 MB/s. With the change it uses 0.041-0.056 s of CPU per 134 MB session instead of
-  1.130-1.136 s (-96 %, 3 ABAB pairs), with the same throughput. On the Qwen 32K session the receiver CPU fell from
-  7.24 s to 0.92 s. Rollback: `STRIX_HANDOFF_RECV_WAITALL=0`.
-- `SenderOptions::encode_batch` (default 16): bp-v1 encodes up to 16 queued pieces side by side on the pool.
-  Before, a piece of one codec block (<= 1 MiB) encoded on one thread. 1 MiB pieces went from 1.30 to 2.07-2.13 GB/s
-  and 256 KiB pieces from 1.24 to 2.02-2.11 GB/s on loopback (8 threads, 3 ABAB pairs). The frames are the same bytes,
-  and the 1 GbE Qwen tail is unchanged (0.708 s).
+The probe exercises the shared TCP Sender and receiver. Qwen currently adopts only the
+resolver: its HTTP packer and reply-waiting POST workers remain in the family adapter.
+Shared TCP probe results do not qualify end-to-end Qwen service behavior or other families.
+Next, move reusable packing/posting orchestration into shared transport code, adapt Qwen,
+then migrate the other family senders while retaining only layout/numerical hooks. Each
+adoption needs complete state/token equality and complete-workload timing before promotion.
+That migration is outside this local correction.
 
 ## Shared resolver (`strix/handoff_policy.hpp`)
 
@@ -73,26 +45,25 @@ the last block. Those 97 MB on the wire are the floor at 1 GbE.
 | `STRIX_HANDOFF_ENCODE_THREADS` | `0..256`, `auto` |
 | `STRIX_HANDOFF_ENCODE_BATCH` | `1..256`, `auto` |
 
-`auto` runs `predict()` over the request's pieces for every candidate. It picks the cheapest choice within 1 % of the
+`auto` runs `predict()` over candidates constrained by every explicit or default non-auto setting,
+including batch policy. The diagnostic predicts the final applied choice. It picks the cheapest choice within 1 % of the
 earliest end: identity before bp-v1, then fewer streams, then fewer threads. The defaults stay what each family ships.
 The Qwen prefill service resolves `--handoff-codec/-connections/-encode-threads/-link` through it (connections
-`auto` is refused: an HTTP chunk POST waits for its reply).
+`auto` is refused after CLI/environment precedence: an HTTP chunk POST waits for its reply).
+The HTTP adapter also refuses encode-batch overrides, which it does not execute.
 
-Cost model: wire(piece) = per-piece cost + wire bytes / min(link goodput, streams x per-stream cap); bp-v1 encode =
-plain / min(threads x 2.16, 4.8) GB/s; pieces pass encoder then wire in order; 10 ms session finish. Against the 1 GbE
-receipts: Qwen bp-v1 0.713 vs 0.708 s, identity 1.820 vs 1.757 s, DS41 after 0.284 vs 0.284 s.
+## Model limits
 
-## Predicted tails for the other links (`strix-xfer-probe plan`)
+The model estimates wire(piece) as per-message cost plus wire bytes divided by
+min(link goodput, streams times per-stream cap). Encoding is plain bytes divided by a
+thread-limited codec rate, followed by a wire stage in submission order and a fixed finish
+allowance. The default codec constants originate from Qwen state samples; they are not
+universal family or device properties. Batched estimates assume enough independent ready
+pieces, omit receiver decoding, and include nominal/non-TCP link classes. Calibrate codec
+ratios, encoder/decoder rates, link behavior and producer schedules on the intended host
+and workload before considering production promotion. An undeclared workload uses a
+steady 1 GiB BF16 estimate; predictions and theoretical throughput are not qualification.
+Family defaults stay in force unless explicitly overridden.
 
-| Link | Qwen 32K (prefill 7.59 s) | DS41 32K after / streamed | MiniMax 5.03 GB pure transfer |
-|---|---:|---:|---:|
-| 1 GbE (measured constants) | 0.72 s, bp-v1 | 0.28 / 0.02 s | 29.1 s bp-v1 (42.7 identity) |
-| 2.5 GbE | 0.06-0.08 s | 0.12 / 0.01 s | 11.7 s |
-| 10 GbE | 0.02-0.03 s | 0.04 / 0.01 s | 2.9 s |
-| USB4 host path (4.4 GB/s) | 0.02 s | 0.02 / 0.01 s | 1.05 s |
-| OCuLink (PCIe 4.0 x4, nominal) | 0.01 s | 0.02 / 0.01 s | 0.78 s identity |
-
-From 2.5 GbE up, a per-layer Qwen hand-off hides behind its prefill. From USB4 up, bp-v1 at 8 threads is slower than
-the link, and `auto` picks identity.
-
-Kit: `scripts/bench/xfer/` (README there).
+Kit: `scripts/bench/xfer/`. Store comparative results and source inputs outside Git;
+public records should describe project contracts and independently qualified local behavior.

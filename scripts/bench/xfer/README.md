@@ -19,3 +19,15 @@ No host names here: endpoints and files are arguments.
 
 Order for a two-host run: start the sender first (it retries the connection for up to 15 min), then the listener
 inside the GPU turn of the node. Launching a turn over ssh can block until it ends, so launch it in the background.
+
+Probe sizes accept positive finite bytes with an optional single K/M/G suffix (binary units,
+case insensitive); fractional bytes truncate and quantities below one byte are rejected.
+Plan thread limits are 0..256 (0 uses the caller). Predictions require host/workload calibration;
+shared TCP results are not family HTTP service qualification. Keep comparative inputs/results
+outside Git. State exports validate metadata and payload checksum first and require fresh output
+filenames; existing files and unsafe component identifiers are refused. Copy event intervals
+measure device time separately from host wall time; interval overlap may include submission gaps.
+
+Host regressions only (no engine build): configure `tests/handoff_host`, build Release, then run
+`ctest --test-dir BUILD_DIR -C Release --output-on-failure`. The copy timing regression uses a
+mock device timeline; native CUDA/HIP timing and family-service qualification remain separate.

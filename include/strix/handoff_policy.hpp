@@ -2,11 +2,13 @@
 // strix::handoff policy: ONE resolver for the prompt-state hand-off options of every family (codec, TCP streams,
 // encode threads) and the cost model it decides with. Host only, header only; no sockets here (strix/handoff.hpp).
 //
-// Cost model (docs/xfer.md has the receipts):
+// Estimated cost model (docs/xfer.md states its limits and required calibration):
 //   link     goodput G (payload MB/s after TCP/IP framing), per-message cost a (s), per-stream cap S (one TCP
 //            connection's ceiling, CPU bound on fast links): wire(piece) = a + wire_bytes / min(G, streams x S)
 //   codec    bp-v1 (byte planes + Huffman, strix/bp_codec.hpp): ratio by data class, measured on a real Qwen state
-//            (BF16 rows 1.468, FP32 recurrent matrix 1.171; random 1.0); encode rate min(threads x E1, Emax)
+//            (BF16 rows 1.468, FP32 recurrent matrix 1.171; random 1.0); encode rate min(threads x E1, Emax).
+//            These sample constants are not universal: batching assumes ready pieces, receiver decode is omitted,
+//            and nominal/non-TCP link classes require host/workload calibration before production promotion.
 //   pipeline pieces leave in submit order through two stages, encoder then wire; a piece starts encoding when it is
 //            ready (its layer / block is done) and the encoder is free. predict() returns when the last byte lands.
 // A codec is lossless, streams and threads only schedule: no option here changes a bit of the imported state, so
@@ -25,6 +27,8 @@
 #include <array>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
+#include <optional>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -132,11 +136,33 @@ struct Prediction {
 }
 
 // The cheapest choice within 1 % of the earliest end: identity before bp-v1, fewer streams, fewer threads.
-[[nodiscard]] inline Choice choose(std::span<const PieceLoad> pieces, const LinkClass& link, const CodecModel& codec, unsigned max_threads) {
+struct AutoFields {
+    bool codec = true, streams = true, threads = true, batch = true;
+};
+
+[[nodiscard]] inline Choice choose(std::span<const PieceLoad> pieces, const LinkClass& link, const CodecModel& codec,
+                                   unsigned max_threads, Choice fixed = {}, AutoFields automatic = {}) {
+    if (max_threads > 256) throw std::invalid_argument("handoff: thread limit must be 0..256");
     std::vector<Choice> cands;
-    for (const unsigned s : {1U, 2U, 4U, 8U}) {
-        cands.push_back({Codec::identity, s, 0, 1});
-        for (unsigned t = 1; t <= std::max(1U, max_threads); t *= 2) cands.push_back({Codec::bp_v1, s, t, t > 1 ? 16U : 1U});
+    // Enumerate in the advertised cost order, constraining every non-auto field.
+    for (const auto kind : {Codec::identity, Codec::bp_v1}) {
+        if (!automatic.codec && kind != fixed.codec) continue;
+        const auto streams = automatic.streams ? std::vector<unsigned>{1, 2, 4, 8} : std::vector<unsigned>{fixed.streams};
+        for (const unsigned s : streams) {
+            std::vector<unsigned> threads;
+            if (!automatic.threads) threads.push_back(fixed.encode_threads);
+            else if (kind == Codec::identity || max_threads == 0) threads.push_back(0);
+            else for (unsigned t = 1;;) {
+                threads.push_back(t);
+                if (t > max_threads / 2) break;
+                t *= 2;
+            }
+            for (const unsigned t : threads) {
+                const auto batches = automatic.batch && kind == Codec::bp_v1 && t > 1
+                    ? std::vector<unsigned>{1, 16} : std::vector<unsigned>{automatic.batch ? 1U : fixed.encode_batch};
+                for (const unsigned b : batches) cands.push_back({kind, s, t, b});
+            }
+        }
     }
     double best = 1e300;
     for (const auto& c : cands) best = std::min(best, predict(pieces, link, codec, c).end_s);
@@ -152,8 +178,7 @@ struct Request {  // CLI values ("" = not given: the environment, then the famil
 
 struct Resolved {
     Choice choice;
-    const LinkClass* link = nullptr;  // nullptr: undeclared
-    LinkClass custom{};               // a numeric STRIX_HANDOFF_LINK
+    std::optional<LinkClass> link;  // owned value, including numeric links; empty = undeclared
     std::vector<std::string> lines;   // "handoff <key> <value> (<origin>)" for --print-effective-config
 };
 
@@ -161,7 +186,13 @@ struct Resolved {
 
 // `family` = what the family ships today; `pieces` = the request's load for auto (may be empty: a steady 1 GiB of
 // BF16 rows is assumed); `max_threads` bounds auto's encoder pool (hardware threads of the sender).
-[[nodiscard]] inline Resolved resolve(const Choice& family, Request req, std::span<const PieceLoad> pieces = {}, unsigned max_threads = 16) {
+struct Constraints {
+    bool auto_streams = true;
+    bool encode_batch = true;
+};
+
+[[nodiscard]] inline Resolved resolve(const Choice& family, Request req, std::span<const PieceLoad> pieces = {},
+                                    unsigned max_threads = 16, Constraints constraints = {}) {
     auto pick = [](std::string& cli, const char* env) -> std::string {
         const char* raw = envcfg::text(env);
         return !cli.empty() ? cli : raw ? std::string(raw) : std::string();
@@ -171,38 +202,25 @@ struct Resolved {
                       batch = pick(req.encode_batch, "STRIX_HANDOFF_ENCODE_BATCH");
     Resolved r;
     r.choice = family;
+    if (!constraints.auto_streams && streams == "auto")
+        throw std::invalid_argument("handoff: auto streams are not supported by this adapter (HTTP POSTs wait for replies)");
+    if (!constraints.encode_batch && !batch.empty())
+        throw std::invalid_argument("handoff: encode_batch is not supported by this adapter");
     if (!link.empty()) {
-        r.link = find_link(link);
+        if (const auto* named = find_link(link)) r.link = *named;
         if (!r.link) {
             std::size_t used = 0;
             double v = 0;
             try { v = std::stod(link, &used); } catch (...) { used = 0; }
-            if (used != link.size() || !(v > 0)) throw std::invalid_argument("STRIX_HANDOFF_LINK: unknown link '" + link + "'");
-            r.custom = LinkClass{"custom", v, 60e-6, std::min(v, 1400.0), "declared MB/s"};
-            r.link = &r.custom;
+            if (used != link.size() || !(v > 0) || !std::isfinite(v)) throw std::invalid_argument("STRIX_HANDOFF_LINK: unknown link '" + link + "'");
+            r.link = LinkClass{"custom", v, 60e-6, std::min(v, 1400.0), "declared MB/s"};
         }
     }
     const bool any_auto = codec == "auto" || streams == "auto" || threads == "auto" || batch == "auto";
     if (any_auto && !r.link) throw std::invalid_argument("handoff auto needs a declared link (--handoff-link / STRIX_HANDOFF_LINK)");
-    Choice autoc = family;
-    std::string why;
-    if (any_auto) {
-        std::vector<PieceLoad> steady;
-        if (pieces.empty()) {
-            for (int i = 0; i < 64; ++i) steady.push_back({0.0, 16.0 * (1 << 20), DataClass::bf16});
-            pieces = steady;
-        }
-        autoc = choose(pieces, *r.link, CodecModel{}, max_threads);
-        const auto pr = predict(pieces, *r.link, CodecModel{}, autoc);
-        char buf[160];
-        std::snprintf(buf, sizeof buf, "auto: %s predicts %.3f s, %.0f MB on the wire", std::string(r.link->name).c_str(), pr.end_s, pr.wire_bytes / 1e6);
-        why = buf;
-    }
-    auto origin = [&](const std::string& v, const std::string& cli) { return v.empty() ? std::string("default") : v == "auto" ? why : !cli.empty() ? "cli" : "env"; };
-    if (codec == "auto") r.choice.codec = autoc.codec;
-    else if (codec == "identity" || codec == "off") r.choice.codec = Codec::identity;
+    if (codec == "identity" || codec == "off") r.choice.codec = Codec::identity;
     else if (codec == "bp-v1") r.choice.codec = Codec::bp_v1;
-    else if (!codec.empty()) throw std::invalid_argument("STRIX_HANDOFF_CODEC: expected identity, bp-v1 or auto, got '" + codec + "'");
+    else if (!codec.empty() && codec != "auto") throw std::invalid_argument("STRIX_HANDOFF_CODEC: expected identity, bp-v1 or auto, got '" + codec + "'");
     auto count = [](const std::string& v, unsigned lo, unsigned hi, const char* what) {
         std::size_t used = 0;
         unsigned long n = 0;
@@ -210,12 +228,24 @@ struct Resolved {
         if (used != v.size() || n < lo || n > hi) throw std::invalid_argument(std::string(what) + ": expected " + std::to_string(lo) + ".." + std::to_string(hi) + " or auto, got '" + v + "'");
         return static_cast<unsigned>(n);
     };
-    if (streams == "auto") r.choice.streams = autoc.streams;
-    else if (!streams.empty()) r.choice.streams = count(streams, 1, kMaxStreams, "STRIX_HANDOFF_STREAMS");
-    if (threads == "auto") r.choice.encode_threads = r.choice.codec == Codec::bp_v1 ? std::max(1U, autoc.encode_threads) : 0U;
-    else if (!threads.empty()) r.choice.encode_threads = count(threads, 0, 256, "STRIX_HANDOFF_ENCODE_THREADS");
-    if (batch == "auto") r.choice.encode_batch = r.choice.codec == Codec::bp_v1 ? std::max(1U, autoc.encode_batch) : 1U;
-    else if (!batch.empty()) r.choice.encode_batch = count(batch, 1, 256, "STRIX_HANDOFF_ENCODE_BATCH");
+    if (!streams.empty() && streams != "auto") r.choice.streams = count(streams, 1, kMaxStreams, "STRIX_HANDOFF_STREAMS");
+    if (!threads.empty() && threads != "auto") r.choice.encode_threads = count(threads, 0, 256, "STRIX_HANDOFF_ENCODE_THREADS");
+    if (!batch.empty() && batch != "auto") r.choice.encode_batch = count(batch, 1, 256, "STRIX_HANDOFF_ENCODE_BATCH");
+    std::string why;
+    if (any_auto) {
+        std::vector<PieceLoad> steady;
+        if (pieces.empty()) {
+            for (int i = 0; i < 64; ++i) steady.push_back({0.0, 16.0 * (1 << 20), DataClass::bf16});
+            pieces = steady;
+        }
+        r.choice = choose(pieces, *r.link, CodecModel{}, max_threads, r.choice,
+                          {codec == "auto", streams == "auto", threads == "auto", batch == "auto"});
+        const auto pr = predict(pieces, *r.link, CodecModel{}, r.choice);
+        char buf[160];
+        std::snprintf(buf, sizeof buf, "auto: %s predicts %.3f s, %.0f MB on the wire", std::string(r.link->name).c_str(), pr.end_s, pr.wire_bytes / 1e6);
+        why = buf;
+    }
+    auto origin = [&](const std::string& v, const std::string& cli) { return v.empty() ? std::string("default") : v == "auto" ? why : !cli.empty() ? "cli" : "env"; };
     r.lines.push_back("handoff link " + (r.link ? std::string(r.link->name) : std::string("undeclared")) + (link.empty() ? " (default)" : " (" + origin(link, req.link) + ")"));
     r.lines.push_back(std::string("handoff codec ") + codec_name(r.choice.codec) + " (" + origin(codec, req.codec) + ")");
     r.lines.push_back("handoff streams " + std::to_string(r.choice.streams) + " (" + origin(streams, req.streams) + ")");

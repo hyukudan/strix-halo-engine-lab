@@ -25,6 +25,7 @@ typedef hipDeviceProp_t gpu_prop_t;
 #define BACKEND "cuda"
 typedef cudaDeviceProp gpu_prop_t;
 #endif
+#include <algorithm>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -69,12 +70,23 @@ int main(int argc, char** argv) {
         if (dt > 0.15 || iters > (1 << 28)) break;
         iters *= 2;
     }
+    gpu(Event_t) k_start, k_end, c_start, c_end;
+    CK(gpu(EventCreate)(&k_start));
+    CK(gpu(EventCreate)(&k_end));
+    CK(gpu(EventCreate)(&c_start));
+    CK(gpu(EventCreate)(&c_end));
+    auto elapsed = [&](gpu(Event_t) begin, gpu(Event_t) end) {
+        float ms = 0;
+        CK(gpu(EventElapsedTime)(&ms, begin, end));
+        return static_cast<double>(ms) / 1000.0;
+    };
     double kernel_alone = 0;
     {
-        const double t0 = now_s();
+        CK(gpu(EventRecord)(k_start, ks));
         busy<<<blocks, threads, 0, ks>>>(kbuf, iters);
-        CK(gpu(StreamSynchronize)(ks));
-        kernel_alone = now_s() - t0;
+        CK(gpu(EventRecord)(k_end, ks));
+        CK(gpu(EventSynchronize)(k_end));
+        kernel_alone = elapsed(k_start, k_end);
     }
     for (const size_t n : sizes) {
         void* d = nullptr;
@@ -96,24 +108,41 @@ int main(int argc, char** argv) {
                     copy();  // warm
                     CK(gpu(StreamSynchronize)(cs));
                     const int reps = n >= (size_t{64} << 20) ? 4 : 32;
-                    double k_dt = 0;
+                    double k_dt = 0, overlap = 0;
                     const double t0 = now_s();
-                    if (with_kernel) busy<<<blocks, threads, 0, ks>>>(kbuf, iters);
-                    for (int r = 0; r < reps; ++r) copy();
-                    CK(gpu(StreamSynchronize)(cs));
-                    const double c_dt = now_s() - t0;
                     if (with_kernel) {
-                        CK(gpu(StreamSynchronize)(ks));
-                        k_dt = now_s() - t0;
+                        CK(gpu(EventRecord)(k_start, ks));
+                        busy<<<blocks, threads, 0, ks>>>(kbuf, iters);
+                        CK(gpu(EventRecord)(k_end, ks));
                     }
-                    std::printf("{\"mib\":%zu,\"dir\":\"%s\",\"host\":\"%s\",\"busy_kernel\":%d,\"GBps\":%.2f,\"kernel_alone_s\":%.4f,\"kernel_with_copy_s\":%.4f}\n",
+                    CK(gpu(EventRecord)(c_start, cs));
+                    for (int r = 0; r < reps; ++r) copy();
+                    CK(gpu(EventRecord)(c_end, cs));
+                    CK(gpu(EventSynchronize)(c_end));
+                    const double copy_wall = now_s() - t0;
+                    const double c_dt = elapsed(c_start, c_end);
+                    if (with_kernel) {
+                        CK(gpu(EventSynchronize)(k_end));
+                        k_dt = elapsed(k_start, k_end);
+                        const double copy_start = elapsed(k_start, c_start);
+                        overlap = std::max(0.0, std::min(k_dt, copy_start + c_dt) - std::max(0.0, copy_start));
+                    }
+                    std::printf("{\"mib\":%zu,\"dir\":\"%s\",\"host\":\"%s\",\"busy_kernel\":%d,\"GBps\":%.2f,\"kernel_alone_s\":%.4f,\"kernel_with_copy_s\":%.4f,"
+                                "\"copy_device_s\":%.4f,\"copy_wall_s\":%.4f,\"kernel_copy_interval_overlap_s\":%.4f}\n",
                         n >> 20, dir == 0 ? "h2d" : "d2h", pin ? "pinned" : "pageable", with_kernel,
-                        static_cast<double>(n) * reps / c_dt / 1e9, with_kernel ? kernel_alone : 0.0, k_dt);
+                        static_cast<double>(n) * reps / c_dt / 1e9, with_kernel ? kernel_alone : 0.0, k_dt, c_dt, copy_wall, overlap);
                     std::fflush(stdout);
                 }
         std::free(pageable);
         CK(GPU_FREE_PINNED(pinned));
         CK(gpu(Free)(d));
     }
+    CK(gpu(EventDestroy)(k_start));
+    CK(gpu(EventDestroy)(k_end));
+    CK(gpu(EventDestroy)(c_start));
+    CK(gpu(EventDestroy)(c_end));
+    CK(gpu(Free)(kbuf));
+    CK(gpu(StreamDestroy)(cs));
+    CK(gpu(StreamDestroy)(ks));
     return 0;
 }

@@ -17,12 +17,15 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cerrno>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <iostream>
+#include <limits>
 #include <span>
 #include <sstream>
 #include <stdexcept>
@@ -62,13 +65,32 @@ double cpu_seconds() {
 std::uint64_t parse_bytes(const std::string& s) {
     if (s.empty()) throw std::invalid_argument("empty size");
     char* end = nullptr;
-    const double v = std::strtod(s.c_str(), &end);
+    errno = 0;
+    const long double v = std::strtold(s.c_str(), &end);
+    if (end == s.c_str() || errno == ERANGE || !std::isfinite(v) || v < 0)
+        throw std::invalid_argument("bad size: " + s);
     std::uint64_t mul = 1;
-    if (*end == 'K' || *end == 'k') mul = 1ULL << 10;
-    else if (*end == 'M' || *end == 'm') mul = 1ULL << 20;
-    else if (*end == 'G' || *end == 'g') mul = 1ULL << 30;
-    else if (*end != '\0') throw std::invalid_argument("bad size: " + s);
-    return static_cast<std::uint64_t>(v * static_cast<double>(mul));
+    const std::string suffix(end);
+    if (suffix == "K" || suffix == "k") mul = 1ULL << 10;
+    else if (suffix == "M" || suffix == "m") mul = 1ULL << 20;
+    else if (suffix == "G" || suffix == "g") mul = 1ULL << 30;
+    else if (!suffix.empty()) throw std::invalid_argument("bad size suffix: " + s);
+    const long double scaled = v * static_cast<long double>(mul);
+    // Exclusive power-of-two bounds remain exact even when long double is binary64 (MSVC).
+    // Probe sizes must contain at least one byte; fractional bytes are truncated.
+    if (!std::isfinite(scaled) || scaled < 1 || scaled >= std::ldexp(1.0L, 64) ||
+        scaled >= std::ldexp(1.0L, std::numeric_limits<std::size_t>::digits))
+        throw std::invalid_argument("size must be positive and representable: " + s);
+    const auto bytes = static_cast<std::uint64_t>(scaled);
+    if (bytes > std::vector<std::uint8_t>{}.max_size()) throw std::invalid_argument("size exceeds allocation limit: " + s);
+    return bytes;
+}
+
+unsigned parse_threads(const std::string& s) {
+    std::size_t used = 0;
+    const auto n = std::stoull(s, &used);
+    if (s.empty() || used != s.size() || n > 256) throw std::invalid_argument("threads must be 0..256");
+    return static_cast<unsigned>(n);
 }
 
 std::vector<std::string> split(const std::string& s) {
@@ -323,7 +345,7 @@ int run_plan(int argc, char** argv) {
     for (int i = 2; i + 1 < argc; i += 2) {
         const std::string a = argv[i], v = argv[i + 1];
         if (a == "--schedule") file = v;
-        else if (a == "--threads") threads = static_cast<unsigned>(std::stoul(v));
+        else if (a == "--threads") threads = parse_threads(v);
         else throw std::invalid_argument("unknown option " + a);
     }
     std::ifstream in(file);
