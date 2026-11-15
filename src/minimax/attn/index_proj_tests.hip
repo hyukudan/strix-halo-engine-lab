@@ -338,16 +338,18 @@ void bench_wmma(std::mt19937& rng) {
         hip_ok(hipEventElapsedTime(&ms, e0, e1), "elapsed");
         return 1000.0 * ms / layers;
     };
-    for (int arm = 0; arm < 6; ++arm) launch(arm, 0, 8);  // code objects loaded, not timed
+    for (int arm = 0; arm < 7; ++arm) launch(arm, 0, 8);  // code objects loaded, not timed
     hip_ok(hipStreamSynchronize(st), "sync");
     const double cold_a = timed(0, 4096, 1, false), cold_b = timed(1, 4096, 1, false);
     std::printf("wmma bench cold (first 4096-row call, layer 0) us: slab %.0f wmma-tc4 %.0f\n", cold_a, cold_b);
     // Run 2 (18:25 11-15, column-fast): 4096 rows tc4-rowsfast 4426 vs tc4 1715; tc2 1.21-1.74x of tc4 at 1024..8192.
-    const char* names[6] = {"slab", "wmma-tc4", "wmma-tc4-rowsfast", "wmma-tc2", "diag-xcached", "wmma-tc4-vgpr192"};
-    const char* series = std::getenv("STRIX_MMATTN_WMMA_SERIES");  // "diag" (default): slab|tc4, tc4|xcached, tc4|vgpr192
-    const bool orders = series != nullptr && std::strcmp(series, "orders") == 0;  // "orders": slab|tc4, rowsfast|tc4, tc4|tc2
-    const std::vector<std::pair<int, int>> pairs = orders ? std::vector<std::pair<int, int>>{{0, 1}, {2, 1}, {1, 3}}
-                                                          : std::vector<std::pair<int, int>>{{0, 1}, {1, 4}, {1, 5}};
+    // Run 3 (18:47 11-15, gfxclk busy median 2401 MHz): 4096 rows tc4 1705 vs x-cached 599 us, vs 192-VGPR 3366 us.
+    const char* names[7] = {"slab", "wmma-tc4", "wmma-tc4-rowsfast", "wmma-tc2", "diag-xcached", "wmma-tc4-vgpr192", "diag-1colblock"};
+    // "diag" (default): slab|tc4, tc4|x-cached, tc4|one column block; "orders": slab|tc4, rowsfast|tc4, tc4|tc2, tc4|vgpr192
+    const char* series = std::getenv("STRIX_MMATTN_WMMA_SERIES");
+    const bool orders = series != nullptr && std::strcmp(series, "orders") == 0;
+    const std::vector<std::pair<int, int>> pairs = orders ? std::vector<std::pair<int, int>>{{0, 1}, {2, 1}, {1, 3}, {1, 5}}
+                                                          : std::vector<std::pair<int, int>>{{0, 1}, {1, 4}, {1, 6}};
     for (const auto& [a, b] : pairs)
         for (unsigned rows : {4096U, 1024U, 2048U, 8192U}) {
             const unsigned layers = rows > 2048 ? 12 : 30;

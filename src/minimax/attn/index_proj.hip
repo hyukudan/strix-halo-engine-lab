@@ -466,7 +466,8 @@ void enqueue_index_proj_wmma_diag(const IndexProjView& v, int mode, hipStream_t 
     const dim3 grid(kWmmaTiles / 4U, (v.rows + tall::kRows - 1U) / tall::kRows);
     if (mode == 1) hipLaunchKernelGGL(proj_wmma_xcached_kernel, grid, dim3(256), 0, stream, v);
     else if (mode == 2) hipLaunchKernelGGL(proj_wmma_cap_kernel, grid, dim3(256), 0, stream, v);
-    else throw std::invalid_argument("index_proj wmma diag: mode must be 1 or 2");
+    else if (mode == 3) hipLaunchKernelGGL((proj_wmma_kernel<4, true>), dim3(1, grid.y), dim3(256), 0, stream, v);
+    else throw std::invalid_argument("index_proj wmma diag: mode must be 1, 2 or 3");
     hip_check(hipGetLastError(), "index_proj wmma diag");
 }
 
