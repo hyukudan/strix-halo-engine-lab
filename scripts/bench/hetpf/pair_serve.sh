@@ -6,11 +6,12 @@
 # "epoch_ns busy=% sclk=<dpm line>").
 # Environment (same paths on both nodes): PEER (rank-1 ssh host), BIN (strix-deepseek41-serve), MODEL (Q2 gguf), TRELLIS (dir
 # with ours-K4 and ours-K5), BIND (address the client reaches), PORT, KEYFILE (bearer key file), CTX (default 33280), SLOTS
-# (default 2), ROCM (default /opt/rocm; its bin/ and lib/ are used), EXTRA (more serve arguments).
+# (default 2), ROCM (default /opt/rocm; its bin/ and lib/ are used), CACHE (--cache-profile, default off: a repeated prompt
+# must be prefilled, not served from the prefix cache), EXTRA (more serve arguments).
 set -u
 OUT=$1; MODE=$2; HOLD=$3
 : "${PEER:?}" "${BIN:?}" "${MODEL:?}" "${TRELLIS:?}" "${BIND:?}" "${PORT:?}" "${KEYFILE:?}"
-CTX=${CTX:-33280}; SLOTS=${SLOTS:-2}; ROCM=${ROCM:-/opt/rocm}; EXTRA=${EXTRA:-}
+CTX=${CTX:-33280}; SLOTS=${SLOTS:-2}; ROCM=${ROCM:-/opt/rocm}; EXTRA=${EXTRA:-}; CACHE=${CACHE:-off}
 export PATH=$ROCM/bin:/usr/bin:/bin LD_LIBRARY_PATH=$ROCM/lib
 SSH="ssh -n -o BatchMode=yes -o ConnectTimeout=5 -o ServerAliveInterval=15 -o ServerAliveCountMax=8"
 T0=$(date +%s)
@@ -20,7 +21,7 @@ ENVS="$ENVS STRIX_DS41_TRELLIS=$TRELLIS/ours-K4 STRIX_DS41_TRELLIS_MIX=head=$TRE
 ENVS="$ENVS STRIX_DS41_TRELLIS_DENSE_FULL=1 STRIX_DS41_TRELLIS_HEADOUT=1"
 case $MODE in fast) ENVS="$ENVS STRIX_DS41_FAST_PREFILL=1";; exact) ;; *) echo "bad MODE $MODE"; exit 64;; esac
 A="--transport usb4auto --peer-timeout 120 --prefill-path device --slots $SLOTS --context $CTX --prefill-rows auto --no-dspark"
-A="$A --http-port $PORT --http-bind $BIND --http-api-key-file $KEYFILE $EXTRA"
+A="$A --http-port $PORT --http-bind $BIND --http-api-key-file $KEYFILE --cache-profile $CACHE $EXTRA"
 MON='d=/sys/class/drm/card1/device; [ -d $d ] || d=/sys/class/drm/card0/device; while :; do echo "$(date +%s%N) busy=$(cat $d/gpu_busy_percent) sclk=$(grep "\*" $d/pp_dpm_sclk | tr -d "\n")"; sleep 0.25; done'
 mkdir -p "$OUT"; $SSH "$PEER" "mkdir -p $OUT" || { echo "peer unreachable"; touch "$OUT/done"; exit 3; }
 H0=$(sha256sum "$BIN" | cut -c1-16); H1=$($SSH "$PEER" "sha256sum $BIN" | cut -c1-16)

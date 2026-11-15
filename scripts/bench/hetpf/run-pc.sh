@@ -58,7 +58,7 @@ for t in $TICKETS; do
     --out "$(P "$J")" --service http://127.0.0.1:$SPORT --pair "http://$NODE0_ADDR:$PORT" >> "$OUT/client.log" 2>&1
   $SSH "$NODE0" "touch $D/stop"
   for _ in $(seq 1 60); do $SSH "$NODE0" "[ -e $D/done ]" && break; sleep 2; done
-  mkdir -p "$OUT/$lab"; scp -q "$NODE0:$D/{info.txt,mon0.txt,mon1.txt,ticket.out}" "$OUT/$lab/" 2>/dev/null; MONS+=(--mon "$lab=$(P "$OUT/$lab")")
+  mkdir -p "$OUT/$lab"; for fl in info.txt mon0.txt mon1.txt ticket.out; do scp -q "$NODE0:$D/$fl" "$OUT/$lab/" 2>/dev/null; done; MONS+=(--mon "$lab=$(P "$OUT/$lab")")
   log "$lab done: $(grep -E '^(ready|stop|rc)' "$OUT/$lab/info.txt" 2>/dev/null | tr '\n' ' ')"
 done
 $PY -I "$(P "$K/het_ab.py")" --arms R --ids "$(P "$IDS")" --tokens "$TOKENS" --key "$(P "$KEY")" --label R0 --out "$(P "$J")" \
