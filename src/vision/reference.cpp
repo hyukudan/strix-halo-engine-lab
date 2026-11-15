@@ -21,29 +21,7 @@ namespace {
 
 [[noreturn]] void bad(const std::string& what) { throw std::invalid_argument("vision encoder: " + what); }
 
-float half_to_float(std::uint16_t h) {
-    const std::uint32_t sign = static_cast<std::uint32_t>(h & 0x8000U) << 16U;
-    std::uint32_t exp = (h >> 10U) & 0x1FU, man = h & 0x3FFU, bits;
-    if (exp == 0U) {
-        if (man == 0U) {
-            bits = sign;
-        } else {
-            unsigned shift = 0;
-            while ((man & 0x400U) == 0U) {
-                man <<= 1U;
-                ++shift;
-            }
-            bits = sign | ((113U - shift) << 23U) | ((man & 0x3FFU) << 13U);
-        }
-    } else if (exp == 31U) {
-        bits = sign | 0x7F800000U | (man << 13U);
-    } else {
-        bits = sign | ((exp + 112U) << 23U) | (man << 13U);
-    }
-    float f;
-    std::memcpy(&f, &bits, 4);
-    return f;
-}
+using attn_core::model::half_to_float;
 
 // fn(begin, end) over [0, n) on the host threads; small jobs run inline.
 void parallel_for(std::size_t n, std::size_t work_per_item, const std::function<void(std::size_t, std::size_t)>& fn) {
@@ -321,24 +299,7 @@ void layout::parallel_ranges(std::size_t n, std::size_t work_per_item, const std
     parallel_for(n, work_per_item, fn);
 }
 
-float round_to_f16(float f) {
-    std::uint32_t bits;
-    std::memcpy(&bits, &f, sizeof(bits));
-    const auto sign = static_cast<std::uint16_t>((bits >> 16U) & 0x8000U);
-    const std::uint32_t a = bits & 0x7FFFFFFFU;
-    if (a >= 0x7F800000U) return f;  // preserve infinities and NaNs
-    if (a >= 0x477FF000U) return half_to_float(static_cast<std::uint16_t>(sign | 0x7C00U));
-    if (a < 0x33000000U) return half_to_float(sign);  // below half the least FP16 subnormal
-    const unsigned exponent = a >> 23U;
-    const unsigned shift = exponent < 113U ? 126U - exponent : 13U;
-    const std::uint32_t mantissa = (a & 0x7FFFFFU) | 0x800000U;
-    const std::uint32_t remainder = mantissa & ((1U << shift) - 1U);
-    const std::uint32_t halfway = 1U << (shift - 1U);
-    std::uint32_t rounded = mantissa >> shift;
-    rounded += remainder > halfway || (remainder == halfway && (rounded & 1U));
-    if (exponent >= 113U) rounded += (exponent - 113U) << 10U;
-    return half_to_float(static_cast<std::uint16_t>(sign | rounded));
-}
+float round_to_f16(float f) { return attn_core::model::round_to_f16(f); }
 
 float round_f16_terms(float f, unsigned terms) {
     if (terms == 0U) return f;

@@ -32,10 +32,12 @@
 // The device's exp2 is the hardware approximation (about 1 ulp); the model uses std::exp2. Split-K merges
 // (splits > 1) and a policy's key placement (the vision tower's cyclic bidirectional slots) are not modelled:
 // the model walks the keys it is given, 16 per tile, in order.
+// Agreement is diagnostic evidence, not a bitwise device oracle or a proof of the full numerical bounds.
 #include <cmath>
 #include <cstdint>
 #include <cstring>
 #include <limits>
+#include <vector>
 
 namespace strix::attn_core::model {
 
@@ -43,6 +45,50 @@ enum class Format { f16, bf16 };
 
 inline double unit_roundoff(Format f) { return f == Format::f16 ? 0x1p-11 : 0x1p-8; }
 inline double half_min_step(Format f) { return f == Format::f16 ? 0x1p-25 : 0x1p-150; }
+
+// Bit-based FP16 conversion shared by host diagnostics; independent of the floating-point rounding mode.
+inline float half_to_float(std::uint16_t h) {
+    const std::uint32_t sign = static_cast<std::uint32_t>(h & 0x8000U) << 16U;
+    std::uint32_t exp = (h >> 10U) & 0x1FU, man = h & 0x3FFU, bits;
+    if (exp == 0U) {
+        if (man == 0U) {
+            bits = sign;
+        } else {
+            unsigned shift = 0;
+            while ((man & 0x400U) == 0U) {
+                man <<= 1U;
+                ++shift;
+            }
+            bits = sign | ((113U - shift) << 23U) | ((man & 0x3FFU) << 13U);
+        }
+    } else if (exp == 31U) {
+        bits = sign | 0x7F800000U | (man << 13U);
+    } else {
+        bits = sign | ((exp + 112U) << 23U) | (man << 13U);
+    }
+    float f;
+    std::memcpy(&f, &bits, 4);
+    return f;
+}
+
+inline float round_to_f16(float f) {
+    std::uint32_t bits;
+    std::memcpy(&bits, &f, sizeof(bits));
+    const auto sign = static_cast<std::uint16_t>((bits >> 16U) & 0x8000U);
+    const std::uint32_t a = bits & 0x7FFFFFFFU;
+    if (a >= 0x7F800000U) return f;  // preserve infinities and NaNs
+    if (a >= 0x477FF000U) return half_to_float(static_cast<std::uint16_t>(sign | 0x7C00U));
+    if (a < 0x33000000U) return half_to_float(sign);  // below half the least FP16 subnormal
+    const unsigned exponent = a >> 23U;
+    const unsigned shift = exponent < 113U ? 126U - exponent : 13U;
+    const std::uint32_t mantissa = (a & 0x7FFFFFU) | 0x800000U;
+    const std::uint32_t remainder = mantissa & ((1U << shift) - 1U);
+    const std::uint32_t halfway = 1U << (shift - 1U);
+    std::uint32_t rounded = mantissa >> shift;
+    rounded += remainder > halfway || (remainder == halfway && (rounded & 1U));
+    if (exponent >= 113U) rounded += (exponent - 113U) << 10U;
+    return half_to_float(static_cast<std::uint16_t>(sign | rounded));
+}
 
 // RNE to the operand format, as a float (f16: subnormals kept, |x| >= 65520 -> infinity; bf16: FP32 bits).
 inline float round_operand(float x, Format f) {
@@ -55,13 +101,7 @@ inline float round_operand(float x, Format f) {
         std::memcpy(&r, &u, 4);
         return r;
     }
-    const float a = std::fabs(x);
-    if (a >= 65520.0F) return std::copysign(std::numeric_limits<float>::infinity(), x);
-    if (a < 0x1p-14F) return std::copysign(std::nearbyint(a * 0x1p24F) * 0x1p-24F, x);  // subnormal grid 2^-24
-    int e = 0;
-    (void)std::frexp(a, &e);  // a = m 2^e, m in [0.5, 1): 11 significant bits -> step 2^(e - 11)
-    const float step = std::ldexp(1.0F, e - 11);
-    return std::copysign(std::nearbyint(a / step) * step, x);
+    return round_to_f16(x);
 }
 
 struct Terms {
@@ -125,8 +165,7 @@ inline float dense_dot(const Terms* q, const Terms* k, unsigned dp, unsigned ter
 template <class KeyAt, class ValueAt>
 void dense_row(const Terms* q, unsigned nk, KeyAt key, ValueAt value, unsigned dp, float scale_log2, unsigned terms, Format f,
                float* out) {
-    constexpr unsigned kMaxDim = 1024;
-    float acc[kMaxDim] = {};
+    std::vector<float> acc(dp, 0.0F);
     float maximum = -std::numeric_limits<float>::infinity(), denominator = 0.0F;
     for (unsigned kt = 0; kt < nk; kt += 16U) {
         const unsigned n = nk - kt < 16U ? nk - kt : 16U;
@@ -145,7 +184,7 @@ void dense_row(const Terms* q, unsigned nk, KeyAt key, ValueAt value, unsigned d
         }
         denominator = denominator * alpha + sum;
         maximum = m;
-        for (unsigned d = 0; d < dp && d < kMaxDim; ++d) {
+        for (unsigned d = 0; d < dp; ++d) {
             double hh = 0.0, hl = 0.0, lh = 0.0;
             for (unsigned j = 0; j < n; ++j) {
                 const Terms v = value(kt + j)[d];
@@ -161,7 +200,7 @@ void dense_row(const Terms* q, unsigned nk, KeyAt key, ValueAt value, unsigned d
             acc[d] = static_cast<float>(double(c) + hh);
         }
     }
-    for (unsigned d = 0; d < dp && d < kMaxDim; ++d) out[d] = acc[d] / denominator;
+    for (unsigned d = 0; d < dp; ++d) out[d] = acc[d] / denominator;
 }
 
 }  // namespace strix::attn_core::model

@@ -7,6 +7,8 @@
 #include "vision_encoder_toy.hpp"
 
 #include <algorithm>
+#include <bit>
+#include <cfenv>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -483,6 +485,73 @@ void test_plan() {
 // The shared two-term model (src/attn_core/two_term_model.hpp): its RNE agrees with the reference's own FP16
 // rounding; split errors and product errors stay inside the format- and range-conditioned bounds (f16 and bf16,
 // normal remainders, subnormal remainders, subnormal values, near overflow); below 2^-14 two terms gain nothing.
+void test_two_term_large_head() {
+    namespace tm = strix::attn_core::model;
+    constexpr unsigned dp = 1026U;
+    const std::vector<tm::Terms> q(dp, {0.0F, 0.0F});
+    for (const auto f : {tm::Format::f16, tm::Format::bf16}) {
+        for (unsigned terms : {1U, 2U}) {
+            std::vector<tm::Terms> v(dp);
+            std::vector<float> want(dp);
+            for (unsigned d = 0; d < dp; ++d) {
+                v[d] = tm::split(static_cast<float>(d % 8U + 1U) + 0x1p-12F, f, terms);
+                want[d] = v[d].hi + v[d].lo;
+            }
+            for (unsigned nk : {1U, 17U}) {
+                std::vector<float> out(dp + 2U, -123.0F);
+                tm::dense_row(q.data(), nk, [&](unsigned) { return q.data(); },
+                              [&](unsigned) { return v.data(); }, dp, 1.0F, terms, f, out.data() + 1U);
+                CHECK(std::equal(want.begin(), want.end(), out.begin() + 1));
+                CHECK(out.front() == -123.0F && out.back() == -123.0F);
+            }
+        }
+    }
+}
+
+void test_f16_rounding_modes() {
+    namespace tm = strix::attn_core::model;
+    struct RestoreRounding {
+        int mode = std::fegetround();
+        ~RestoreRounding() { (void)std::fesetround(mode); }
+    } restore;
+    CHECK(restore.mode != -1);
+    const float inf = std::numeric_limits<float>::infinity();
+    const float nan = std::bit_cast<float>(std::uint32_t{0x7FC12345U});
+    const struct { float input, expected; } cases[] = {
+        {0.0F, 0.0F}, {0x1p-149F, 0.0F}, {0x1p-25F, 0.0F},
+        {0x1.8p-24F, 0x1p-23F}, {0x1p-24F, 0x1p-24F},
+        {0x1.ffcp-15F, 0x1p-14F}, {0x1p-14F, 0x1p-14F},
+        {0x1.002p0F, 1.0F}, {0x1.003p0F, 0x1.004p0F},
+        {0x1.006p0F, 0x1.008p0F}, {65519.0F, 65504.0F},
+        {65520.0F, inf}, {inf, inf}, {nan, nan}
+    };
+    for (int mode : {FE_TONEAREST, FE_DOWNWARD, FE_UPWARD, FE_TOWARDZERO}) {
+        CHECK(std::fesetround(mode) == 0);
+        for (const auto& c : cases) {
+            for (bool negative : {false, true}) {
+                const std::uint32_t sign = negative ? 0x80000000U : 0U;
+                const float x = std::bit_cast<float>(std::bit_cast<std::uint32_t>(c.input) | sign);
+                const auto expected = std::bit_cast<std::uint32_t>(c.expected) | sign;
+                CHECK(std::bit_cast<std::uint32_t>(tm::round_operand(x, tm::Format::f16)) == expected);
+                CHECK(std::bit_cast<std::uint32_t>(round_to_f16(x)) == expected);
+            }
+        }
+        const float x = 0x1.003p0F;
+        const tm::Terms q{0.0F, 0.0F};
+        for (unsigned terms : {1U, 2U}) {
+            const auto v = tm::split(x, tm::Format::f16, terms);
+            CHECK(v.hi == 0x1.004p0F);
+            CHECK(v.lo == (terms == 1U ? 0.0F : -0x1p-12F));
+            CHECK(std::fabs(double(x) - v.hi - v.lo) <= tm::operand_bound(x, tm::Format::f16, terms));
+            float out = -123.0F;
+            tm::dense_row(&q, 1U, [&](unsigned) { return &q; }, [&](unsigned) { return &v; },
+                          1U, 1.0F, terms, tm::Format::f16, &out);
+            CHECK(out == (terms == 1U ? 0x1.004p0F : x));
+        }
+        CHECK(std::fegetround() == mode);
+    }
+}
+
 void test_two_term_model() {
     namespace tm = strix::attn_core::model;
     std::uint64_t s = 0x9E3779B97F4A7C15ULL;
@@ -875,6 +944,8 @@ int main(int argc, char** argv) {
         test_taps_and_types();
         test_plan();
         test_two_term_model();
+        test_two_term_large_head();
+        test_f16_rounding_modes();
         test_attention_terms();
         test_cache();
         test_encode_cached();
