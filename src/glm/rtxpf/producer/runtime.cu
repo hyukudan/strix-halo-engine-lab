@@ -623,7 +623,6 @@ struct Runtime::Impl {
     DsaState dstate(){return {latent.as<U16>(),key.as<U16>(),gate.as<U16>(),pooled.as<float>(),capacity};}
     // Prefill writes either the shared release buffers (legacy) or one resident
     // per-layer state set (session). Legacy pointers/launches are unchanged.
-    bool index_tail_export=false;  // hand-off v3/v4: index key/gate exported as the open pool block only
     bool in_session=false;
     float* kst(unsigned l){return in_session?kda_s.as<float>()+std::size_t(kda_slot(l))*(kda_state_bytes/4):state.as<float>();}
     float* kcv(unsigned l){return in_session?kda_c.as<float>()+std::size_t(kda_slot(l))*(kda_conv_bytes/4):conv.as<float>();}
@@ -645,7 +644,7 @@ struct Runtime::Impl {
         norm<<<n,256,0,compute.s>>>(collapsed.as<float>(),weight,normalized_out,n);
     }
     void post(const float* x,const float* y,float* out,unsigned n){hc_expand_kernel<<<dim3(16,n),256,0,compute.s>>>(x,mix.as<float>(),y,out,flag.as<unsigned>(),0);}
-    void export_state(unsigned l,unsigned P,const StateSink& sink){
+    void export_state(unsigned l,unsigned P,const StateSink& sink,strix::state::RawRows index_rows){
         ck(cudaStreamSynchronize(compute.s));unsigned bad=0;ck(cudaMemcpy(&bad,flag.p,4,cudaMemcpyDeviceToHost));need(!bad,"nonfinite prefix; abort handoff");
         auto release=Json::object();release.set("layer",int(l));release.set("state_ready_ms",std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-request_start).count());releases.push(release);
         // Host temporaries of this layer's export, charged for their lifetime: KDA
@@ -665,18 +664,18 @@ struct Runtime::Impl {
             auto d=dstate(l);
             // Index key / gate: the full prefix, or with the index tail only the open pool block's rows (the slot rows
             // the wire's component_rows() names); one download serves both ranks.
-            const auto index=state_layout::index_rows(index_tail_export?strix::state::RawRows::open_tail:strix::state::RawRows::full,P);
+            const auto index=state_layout::index_rows(index_rows,P);
             for(auto pair:{std::pair<const void*,unsigned>{d.latent,2},{d.key,3},{d.gate,4},{d.pooled,5}}){const bool idx=pair.second==3||pair.second==4;auto bytes=pair.second==2?std::size_t(P)*1024:pair.second==5?std::size_t(P/4)*512:std::size_t(index.rows)*256;if(!bytes)continue;auto out=download(static_cast<const std::byte*>(pair.first)+(idx?std::size_t(index.first)*256:0),bytes);for(unsigned rank=0;rank<2;++rank)sink(rank,l,pair.second,out);}
         }
     }
     DsaIndex index(const std::string& id){if(id=="glm-pf-rtx-native-v1"||id==dsa_identity)return DsaIndex::fp32;for(auto v:{DsaIndex::mma,DsaIndex::mma_proj_fp32_score,DsaIndex::fp32_proj_mma_score,DsaIndex::tf32x3})if(id==dsa_index_identity(v))return v;throw std::runtime_error("unsupported producer identity");}
-    void run(std::span<const U32> input,const std::string& identity,const StateSink& sink){
+    void run(std::span<const U32> input,const std::string& identity,const StateSink& sink,strix::state::RawRows index_rows=strix::state::RawRows::full){
         choose_tile(input.size());
-        try{run_prefill(input,identity,sink);record_tile();record_prefill_cache();write_census_rows();}
+        try{run_prefill(input,identity,sink,index_rows);record_tile();record_prefill_cache();write_census_rows();}
         catch(const std::exception& e){if(prefill_via_cache&&ts_tier)ts_tier->abort_prefill(e.what());throw;}
         catch(...){if(prefill_via_cache&&ts_tier)ts_tier->abort_prefill("prefill: non-standard exception");throw;}
     }
-    void run_prefill(std::span<const U32> input,const std::string& identity,const StateSink& sink){
+    void run_prefill(std::span<const U32> input,const std::string& identity,const StateSink& sink,strix::state::RawRows index_rows){
         prefill_counters0=cache_counters();if(ts_tier)ts_tier->acquire_ms.clear();
         if(prefill_via_cache&&ts_tier)ts_tier->choose_overlap(dopt.prefill_overlap); // once per prefill: held layers, no token
         if(prefill_via_cache&&ts_tier)ts_tier->choose_clean_evict(dopt.prefill_clean_evict,dopt.tier_clean_evict); // between tokens; restored with the spares
@@ -727,7 +726,7 @@ struct Runtime::Impl {
             if(!serial_stage){auto begin=std::chrono::steady_clock::now();stage(l+1,false);staging_ms+=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-begin).count();}
             pm(int(l),DecodePhase::stage); // the layer's release and the next layer's staging
             if(in_session&&is_kda_layer(l)&&!kda_open_rows(P)){ck(cudaMemcpyAsync(cks(l),kst(l),kda_state_bytes,cudaMemcpyDeviceToDevice,compute.s));ck(cudaMemcpyAsync(ckc(l),kcv(l),kda_conv_bytes,cudaMemcpyDeviceToDevice,compute.s));}
-            if(!in_session){check_finite<<<unsigned((state.bytes/4+255)/256),256,0,compute.s>>>(state.as<float>(),state.bytes/4,flag.as<unsigned>());export_state(l,P,sink);pm(int(l),DecodePhase::state_export);}
+            if(!in_session){check_finite<<<unsigned((state.bytes/4+255)/256),256,0,compute.s>>>(state.as<float>(),state.bytes/4,flag.as<unsigned>());export_state(l,P,sink,index_rows);pm(int(l),DecodePhase::state_export);}
             else if(is_kda_layer(l))check_finite<<<unsigned((kda_state_bytes/4+255)/256),256,0,compute.s>>>(kst(l),kda_state_bytes/4,flag.as<unsigned>());
             if(l>=3)ck(cudaEventRecord(ring[l%2].retired.e,compute.s));
         }
@@ -750,7 +749,7 @@ struct Runtime::Impl {
         // token (or explicitly, untimed, after a TTFT prefill); a prefill-only request never pays it.
         if(prefill_via_cache&&ts_tier&&ts_tier->restore)restore_pending=true;
         pm(45,DecodePhase::stage); // the MTP layer's release and the decode spare target again
-        ck(cudaEventRecord(ring[1].retired.e,compute.s));if(!in_session){export_state(45,P,sink);pm(45,DecodePhase::state_export);}ck(cudaStreamSynchronize(compute.s));ck(cudaGetLastError());
+        ck(cudaEventRecord(ring[1].retired.e,compute.s));if(!in_session){export_state(45,P,sink,index_rows);pm(45,DecodePhase::state_export);}ck(cudaStreamSynchronize(compute.s));ck(cudaGetLastError());
         if(in_session){unsigned bad=0;ck(cudaMemcpy(&bad,flag.p,4,cudaMemcpyDeviceToHost));need(!bad,"nonfinite session prefill");}
         unsigned read_mask=(file_ring_bytes[0]?1u:0u)|(file_ring_bytes[1]?2u:0u);
         need(prefill_via_cache||!require_file_tier||file_tier_covered(file_count,file_bytes,read_mask,both_file_rings),"requested file tier performed no reads or missed a ring");
@@ -1576,7 +1575,7 @@ struct Runtime::Impl {
     }
     void export_session(const StateSink& sink){
         need(decode_mode&&sess.open(),"no open session to export");const unsigned P=sess.frontier();ck(cudaStreamSynchronize(compute.s));
-        ck(cudaMemsetAsync(flag.p,0,4,compute.s));in_session=true;try{for(unsigned l=0;l<46;++l)export_state(l,P,sink);}catch(...){in_session=false;throw;}in_session=false;
+        ck(cudaMemsetAsync(flag.p,0,4,compute.s));in_session=true;try{for(unsigned l=0;l<46;++l)export_state(l,P,sink,strix::state::RawRows::full);}catch(...){in_session=false;throw;}in_session=false;
     }
     std::string replay_digest(){
         need(decode_mode&&sess.open(),"no open session");const unsigned P=sess.frontier(),open=kda_open_rows(P);strix::Sha256Fast sha;std::vector<std::byte> buf(kda_state_bytes);
@@ -1623,7 +1622,6 @@ std::string Runtime::plan_budget(const std::string& model,unsigned cap,unsigned 
 std::string Runtime::memory_report(const std::string& stage){return p_->memory_json(stage).dump();}
 void Runtime::set_decode_profile(bool on){if(on){p_->timeline.enable();p_->index_query_pool.enable();}else p_->timeline.on=false;if(p_->ts_tier){if(on)p_->ts_tier->enable_census();else p_->ts_tier->census_on=false;}}
 void Runtime::set_row_kernels(const std::string& v){ck(cudaStreamSynchronize(p_->compute.s));set_row_kernels_value(p_->dopt,v);}
-void Runtime::set_index_tail_export(bool on){ck(cudaStreamSynchronize(p_->compute.s));p_->index_tail_export=on;}
 void Runtime::set_dsa_short_skip(bool on){ck(cudaStreamSynchronize(p_->compute.s));p_->dopt.dsa_short_skip=on;p_->tier_plan.set("dsa_short_skip",on?1:0);}
 bool Runtime::dsa_short_skip()const{return p_->dopt.dsa_short_skip;}
 std::string Runtime::row_kernels()const{return row_kernels_name(p_->dopt);}
@@ -1704,7 +1702,7 @@ std::string Runtime::generate(std::span<const U32> prompt,unsigned max_new,std::
     receipt.set("expert_traffic",t);receipt.set("steps",steps);receipt.set("expert_tier",p_->tier->backend());receipt.set("fetched_expert_cache",std::string(p_->tier->backend())=="reference"?"none":"tierstream");
     receipt.set("final_frontier",int(p_->sess.frontier()));return receipt.dump();
 }
-void Runtime::prefill(std::span<const U32> t,const std::string& id,const StateSink& sink){try{p_->run(t,id,sink);}catch(...){
+void Runtime::prefill(std::span<const U32> t,const std::string& id,const StateSink& sink,strix::state::RawRows index_rows){try{p_->run(t,id,sink,index_rows);}catch(...){
     // A failed request can leave work on either stream. Drain all producers
     // before any persistent ring/event/workspace is reused by the next request.
     cudaStreamSynchronize(p_->compute.s);cudaStreamSynchronize(p_->decode.s);cudaStreamSynchronize(p_->h2d.s);

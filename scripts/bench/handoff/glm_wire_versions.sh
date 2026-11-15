@@ -33,13 +33,18 @@ while read -r version rank frontier; do
         res=""
         tries=0
         while [ $rc -ne 0 ] && [ $tries -lt 3000 ]; do  # up to ~10 min waiting for this arm's receiver
-            res=$(GLM_TEST_WIRE_VERSION=$version GLM_TEST_FRONTIER=$frontier "$exe" "$ep" "$key" "$prompt" "$model" ok "$rank" 2>&1 < /dev/null | tail -1)
+            res=$(GLM_TEST_WIRE_VERSION=$version GLM_TEST_FRONTIER=$frontier "$exe" "$ep" "$key" "$prompt" "$model" ok "$rank" 2>&1 < /dev/null)
+            rc=$?
+            res=$(printf '%s\n' "$res" | tail -1)
             case "$res" in
-                LOCALLY_SEALED*) rc=0 ;;
-                *) tries=$((tries + 1)); sleep 0.2 ;;
+                LOCALLY_SEALED*) ;;  # success requires both the marker and the executable's zero status
+                *) if [ $rc -eq 0 ]; then rc=1; fi ;;
             esac
+            if [ $rc -ne 0 ]; then tries=$((tries + 1)); sleep 0.2; fi
         done
         secs=$(echo "$res" | sed -n 's/.*seconds=\([0-9.e+-]*\).*/\1/p')
         printf 'send\t%s\t%s\t%s\t%s\t%s\t%s\n' "$version" "$rank" "$frontier" "$rc" "${secs:-NA}" "$res" >> "$out"
     fi
+    # Keep the failure receipt, but never advance to another arm after a failed transfer.
+    if [ $rc -ne 0 ]; then exit "$rc"; fi
 done < "$arms"

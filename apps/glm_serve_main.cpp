@@ -1575,7 +1575,7 @@ int main(int argc, char** argv) {
                                     (rtx_prefill.empty() ? std::string()
                                                          : std::string("; prompts of >= ") + std::to_string(import_min_tokens) +
                                                                " tokens may take the RTX prefill route (FAST identity glm-pf-rtx-native-v1, wire v" +
-                                                               (import_dsa_once ? "2" : "1") + ", not bitwise the pair's own prefill; "
+                                                               std::to_string(gi::wire_version(import_dsa_once, import_index_tail)) + ", not bitwise the pair's own prefill; "
                                                                "each response's prefill_route names its route)");
         if (!api_key_file.empty()) {
             auto key = file_text(api_key_file);

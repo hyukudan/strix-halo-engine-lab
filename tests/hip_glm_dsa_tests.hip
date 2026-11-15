@@ -275,8 +275,9 @@ void test_index_tail(const std::string& cases, std::mt19937& g) {
         }
         const unsigned end = P + K;
         caches &= down(full.latent, static_cast<std::size_t>(end) * kKvLora) == down(tail.latent, static_cast<std::size_t>(end) * kKvLora);
-        caches &= down(full.pooled, static_cast<std::size_t>(end / kKpool) * kIdxDim) ==
-                  down(tail.pooled, static_cast<std::size_t>(end / kKpool) * kIdxDim);
+        const auto pooled_full = down(full.pooled, static_cast<std::size_t>(end / kKpool) * kIdxDim);
+        const auto pooled_tail = down(tail.pooled, static_cast<std::size_t>(end / kKpool) * kIdxDim);
+        caches &= std::memcmp(pooled_full.data(), pooled_tail.data(), pooled_full.size() * sizeof(float)) == 0;
         const auto kf = down(full.ikey, static_cast<std::size_t>(end) * kIdxDim), kt = down(tail.ikey, static_cast<std::size_t>(end) * kIdxDim);
         const auto gf = down(full.igate, static_cast<std::size_t>(end) * kIdxDim), gt = down(tail.igate, static_cast<std::size_t>(end) * kIdxDim);
         const auto f0 = static_cast<std::ptrdiff_t>(static_cast<std::size_t>(first) * kIdxDim);

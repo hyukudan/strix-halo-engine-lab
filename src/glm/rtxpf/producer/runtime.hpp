@@ -1,5 +1,6 @@
 #pragma once
 #include "../row_r2.hpp"
+#include "strix/block_summary_state.hpp"
 #include <cstddef>
 #include <functional>
 #include <memory>
@@ -158,15 +159,14 @@ public:
     void set_row_kernels(const std::string& value); // decode_row_kernels between requests (no session work in flight)
     std::string row_kernels()const;
     void set_dsa_short_skip(bool on); // between commands, no session work in flight
-    // Hand-off index tail (wire v3/v4): export_state downloads and sends only the open pool block's DSA index key /
-    // gate rows [P - P % 4, P); the closed blocks go as pooled rows. Between requests.
-    void set_index_tail_export(bool on);
     bool dsa_short_skip()const;
     // Writes the cache residency (most recent first) to the residency file; "" when off. Between requests.
     std::string save_residency();
     std::string model_sha256()const;
     std::string timings()const;
-    void prefill(std::span<const std::uint32_t> tokens,const std::string& identity,const StateSink&);
+    // Hand-off v3/v4 can export only the open index pool block; ordinary exports keep full rows.
+    void prefill(std::span<const std::uint32_t> tokens,const std::string& identity,const StateSink&,
+                 strix::state::RawRows index_rows=strix::state::RawRows::full);
     std::string self_check(std::span<const std::uint32_t> tokens,const std::string& identity,unsigned reference_tile=256);
     // Prefill row tile: the last one used (the startup allocation before any request), the
     // one allocated at startup, and a per-request override (valid_schedule, at most the
