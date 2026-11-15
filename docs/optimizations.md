@@ -1084,7 +1084,7 @@ Four exact changes to the one-row (plain, non-MTP) decode step, each with its ow
 
 ### Qwen R1 GDN preparation fusion / Fusión de preparación GDN R1
 
-**Control:** `STRIX_QWEN_DECODE_FUSE`. **Default:** OFF (opt-in with `STRIX_QWEN_DECODE_FUSE=1`; part of `STRIX_QWEN_ALLON`). **OFF:** unset it.
+**Control:** `STRIX_QWEN_DECODE_FUSE`. **Default:** ON (code default, same tokens; plain one-row decode 41.60 -> 41.37 ms per step, strict ABAB of 3 pairs). **OFF:** `STRIX_QWEN_DECODE_FUSE=0`.
 Restart after changing the switch. `--baseline`, `STRIX_BASELINE=1`, `STRIX_QPF2K_DEFAULTS=0`
 and GSQ owners disable it. `--print-effective-config` reports the resolved switch and suppression
 reason in `long_context_items`; the requested environment retains its provenance.
@@ -1130,7 +1130,7 @@ python3 tests/qwen_decode_fuse_gate.py --binary build/strix-hip-decode-token --m
   --prompt-1k prompts/1k.ids --prompt-32k prompts/32k.ids --output ../private-decode-fuse-gate
 ```
 
-**Español.** Desactivado por defecto (opción `STRIX_QWEN_DECODE_FUSE=1`, parte de `STRIX_QWEN_ALLON`); sin ella se mantiene la secuencia anterior tras
+**Español.** Activado por defecto (mismos tokens; `STRIX_QWEN_DECODE_FUSE=0` lo desactiva); sin ella se mantiene la secuencia anterior tras
 reiniciar. Baseline, `STRIX_QPF2K_DEFAULTS=0` y modelos GSQ también lo desactivan. La inspección
 informa del valor efectivo y del motivo de desactivación. En R1 de dimensión 128 se fusionan
 convolución, transformación beta/gate y normalización Q/K con los mismos cuerpos de dispositivo,

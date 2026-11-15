@@ -5,6 +5,7 @@
 #include "strix/hip_argmax_core.hpp"
 #include "strix/ds41_prefill_tuning.hpp"
 #include "strix/ds41_fast_profile.hpp"
+#include "strix/ds41_prefill_precision.hpp"
 #include "strix/hip_ds41_layer.hpp"
 #include "strix/hip_ds41_prefill.hpp"
 #include "strix/ds41_exact_flags.hpp"
@@ -3233,7 +3234,8 @@ int fast_dense_mode = -1;
 void set_fast_dense(int mode) { fast_dense_mode = mode; }
 static bool fast_dense_on() {
     static const bool env = fast_profile::dense_on();  // the lever or STRIX_DS41_FAST_PREFILL
-    return fast_dense_mode >= 0 ? fast_dense_mode != 0 : env;
+    // a running DevicePrefill's own precision first (strix/ds41_prefill_precision.hpp), else the override or env
+    return effective_fast(&PrefillPrecision::fast_dense, fast_dense_mode, env);
 }
 static bool enqueue_fast_dense(const Q8A8DensePrefillView& v, void* stream) {
     static const unsigned min_rows = fast_profile::dense_min_rows();

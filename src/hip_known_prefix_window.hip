@@ -34,6 +34,8 @@
 #include "strix/prepared_tensor_views.hpp"
 #include "strix/known_window_cohort.hpp"
 #include "strix/hip_mtp_target_window.hpp"
+#include "strix/session/cycle_pack.hpp"
+#include "strix/host_phase_timing.hpp"
 
 #include <algorithm>
 #include <array>
@@ -1565,20 +1567,48 @@ struct HipKnownPrefixWindow::Impl {
     DeferredCompletion* deferred_slots = nullptr;
     // Pinned host copy of a wide cohort union summary, read on this (lead) owner's stream before it completes.
     q51_known_rows::Summary* wide_union_host = nullptr;
+    // STRIX_SERVE_CYCLE_PACK: the lead owner's per-cycle completion pack (created on first packed cycle).
+    std::unique_ptr<session::CyclePack> cycle_pack;
     std::array<hipEvent_t, 2> deferred_events{};
     int deferred_pending = -1;
     unsigned deferred_next = 0;
     bool defer_current = false;
     std::uint64_t deferred_blocks = 0, deferred_checked = 0;
+    const void* completion_union_source(std::uint32_t prefill_rows_done) {
+        return reinterpret_cast<const void*>(full_prefill_union()?prefill_union(prefill_rows_done).memory.arena_base:routed_workspace.memory.arena_base);
+    }
+    std::uint32_t completion_prefill_rows() const {
+        return full_prefill_union()?(prefill_union_rows?prefill_union_rows:prefill->logical_rows):0U;
+    }
     void enqueue_completion_reads(q51_known_rows::Summary* summary, DeferredMoeFirstError* status, std::uint32_t prefill_rows_done) {
         if(window.routed_expert_union_steps && !cohort_member)
-            hip_check(hipMemcpyAsync(summary,
-                reinterpret_cast<const void*>(full_prefill_union()?prefill_union(prefill_rows_done).memory.arena_base:routed_workspace.memory.arena_base),
+            hip_check(hipMemcpyAsync(summary,completion_union_source(prefill_rows_done),
                 sizeof(*summary),hipMemcpyDeviceToHost,scope.stream),"read latest routed expert union metadata");
         if (config.deferred_moe_status)
             hip_check(hipMemcpyAsync(status,
                 reinterpret_cast<const void*>(scope.deferred_moe_status.arena_base), sizeof(*status),
                 hipMemcpyDeviceToHost, scope.stream), "read completed known-window deferred status");
+    }
+    // STRIX_SERVE_CYCLE_PACK: the same completion records as enqueue_completion_reads, as slots of the cycle's pack.
+    // The cycle gathers and waits once; complete() then checks these slots without its own copy and fence.
+    const q51_known_rows::Summary* packed_summary = nullptr;
+    const DeferredMoeFirstError* packed_status = nullptr;
+    bool packed_completion = false;
+    bool can_pack_completion() const { return !defer_current && deferred_pending < 0; }
+    bool plan_packed_completion(session::CyclePackLayout& layout, bool member) const {
+        return can_pack_completion() &&
+            (!(window.routed_expert_union_steps && !member) || layout.try_add(sizeof(q51_known_rows::Summary))) &&
+            (!config.deferred_moe_status || layout.try_add(sizeof(DeferredMoeFirstError)));
+    }
+    void stage_packed_completion(session::CyclePack& pack) {
+        if(!can_pack_completion()) throw std::logic_error("packed cohort completion requires an owner without deferred blocks");
+        packed_summary=nullptr;packed_status=nullptr;
+        if(window.routed_expert_union_steps && !cohort_member)
+            packed_summary=static_cast<const q51_known_rows::Summary*>(pack.add(completion_union_source(completion_prefill_rows()),sizeof(q51_known_rows::Summary)));
+        if(config.deferred_moe_status)
+            packed_status=static_cast<const DeferredMoeFirstError*>(pack.add(
+                reinterpret_cast<const void*>(scope.deferred_moe_status.arena_base),sizeof(DeferredMoeFirstError)));
+        packed_completion=true;
     }
     void finish_deferred_completion() {
         if (deferred_pending < 0) return;
@@ -1610,7 +1640,16 @@ struct HipKnownPrefixWindow::Impl {
     }
     void complete() {
         guard.require_original();
-        const auto prefill_rows_done=full_prefill_union()?(prefill_union_rows?prefill_union_rows:prefill->logical_rows):0U;
+        const auto prefill_rows_done=completion_prefill_rows();
+        if(packed_completion) {
+            // The cycle's pack already fenced this stream (one wait for all owners): check the packed records.
+            packed_completion=false;defer_current=false;
+            if(packed_summary) pending_union_summary=*packed_summary;
+            if(packed_status) completion_status=*packed_status;
+            packed_summary=nullptr;packed_status=nullptr;
+            check_completion(prefill_rows_done);
+            return;
+        }
         const bool defer=defer_current && prefill;
         defer_current=false;
         if(defer) {
@@ -2318,6 +2357,39 @@ struct HipKnownPrefixWindow::Impl {
                 for (const auto& [mode, n] : own_modes) std::fprintf(stderr, " %d:%u", mode, n);
                 std::fprintf(stderr, ")\n");
             }
+            // STRIX_SERVE_CYCLE_PACK: every owner of the cycle runs on the lead stream (checked at launch), so the
+            // records each owner's complete() reads with its own copy and fence are gathered by one kernel and
+            // fenced once; the owners then check them in the same order as below.
+            host_phase_mark("7a cohort launch");
+            const bool pack = [&] {
+                if (!session::serve_cycle_pack_choice(members.size()).on) return false;
+                session::CyclePackLayout layout;
+                for (std::size_t c = 0; c < chunks.size(); ++c)
+                    if (chunks[c].primary && !chunks[c].primary->plan_packed_completion(layout, !union_ran[c])) return false;
+                if (wide_union_rows && !layout.try_add(sizeof(q51_known_rows::Summary))) return false;
+                for (const auto& m : members)
+                    if (!m.impl->plan_packed_completion(layout, m.impl->cohort_member)) return false;
+                return true;
+            }();
+            const q51_known_rows::Summary* wide_summary = nullptr;
+            if (pack) {
+                if (!lead.cycle_pack) lead.cycle_pack = std::make_unique<session::CyclePack>();
+                auto& cycle = *lead.cycle_pack;
+                cycle.begin();
+                for (std::size_t c = 0; c < chunks.size(); ++c) {
+                    auto* primary = chunks[c].primary;
+                    if (!primary) continue;
+                    primary->cohort_member = !union_ran[c];
+                    struct Reset { bool& flag; ~Reset() { flag = false; } } reset{primary->cohort_member};
+                    primary->stage_packed_completion(cycle);
+                }
+                if (wide_union_rows)
+                    wide_summary = static_cast<const q51_known_rows::Summary*>(cycle.add(
+                        reinterpret_cast<const void*>(lead.cohort_union(wide_union_rows).memory.arena_base), sizeof(q51_known_rows::Summary)));
+                for (auto& m : members) m.impl->stage_packed_completion(cycle);
+                cycle.gather(lead.scope.stream);
+                cycle.wait(lead.scope.stream);
+            }
             for (std::size_t c = 0; c < chunks.size(); ++c) {
                 auto* primary = chunks[c].primary;
                 if (!primary) continue;
@@ -2328,7 +2400,7 @@ struct HipKnownPrefixWindow::Impl {
                 struct Reset { bool& flag; ~Reset() { flag = false; } } reset{primary->cohort_member};
                 primary->complete();
             }
-            if (wide_union_rows) {
+            if (wide_union_rows && !pack) {
                 // The last wide union's summary, read on the lead stream; the lead's complete() below fences it.
                 if (!lead.wide_union_host) {
                     void* p = nullptr;
@@ -2337,6 +2409,7 @@ struct HipKnownPrefixWindow::Impl {
                 }
                 hip_check(hipMemcpyAsync(lead.wide_union_host, reinterpret_cast<const void*>(lead.cohort_union(wide_union_rows).memory.arena_base),
                     sizeof(q51_known_rows::Summary), hipMemcpyDeviceToHost, lead.scope.stream), "read wide cohort routed union metadata");
+                wide_summary = lead.wide_union_host;
             }
             const bool lead_defers = lead.defer_current; // complete() clears it; a deferred lead leaves its stream running
             for (auto& m : members) {
@@ -2344,10 +2417,11 @@ struct HipKnownPrefixWindow::Impl {
                 m.run->complete();
                 m.impl->require_shared_joined();
             }
+            host_phase_mark("7b cohort completion");
             if (wide_union_rows) {
                 // The last wide union's summary (the stream is complete): its rows, assignments and status.
                 if (lead_defers) hip_check(hipStreamSynchronize(lead.scope.stream), "complete wide cohort union read");
-                const auto s = *lead.wide_union_host;
+                const auto s = *wide_summary;
                 const auto assignments = wide_union_rows * lead.routed_config.top_k;
                 if (s.status || s.version != 1U || s.logical_rows != wide_union_rows || s.assignments != assignments ||
                     !s.touched || s.touched > assignments || s.batches < s.touched || s.batches > assignments ||
@@ -2363,10 +2437,12 @@ struct HipKnownPrefixWindow::Impl {
                     if (m.begun) m.impl->guard.recover_or_fail_stop();
                 }
                 m.impl->failed = true;
+                m.impl->packed_completion = false;
             }
             for (std::size_t c = 0; c < chunks.size(); ++c) {
                 if (!chunks[c].primary) continue;
                 chunks[c].primary->failed = true;
+                chunks[c].primary->packed_completion = false;
                 if (primary_launched[c]) chunks[c].primary->guard.recover_or_fail_stop();
             }
             throw;
