@@ -59,4 +59,22 @@ if(BUILD_TESTING)
         strix_target_warnings(strix-intel-backend-host-tests)
     endif()
     add_test(NAME strix-intel-backend-host-tests COMMAND strix-intel-backend-host-tests)
+    add_test(NAME strix-intel-dense-boundaries COMMAND strix-intel-backend-host-tests dense)
+    add_test(NAME strix-intel-memory-boundaries COMMAND strix-intel-backend-host-tests memory)
+
+    # Compile the real exception boundary with a host-only SYCL fault double, never -fsycl.
+    add_executable(strix-intel-sycl-boundary-tests
+        ${_strix_intel_root}/tests/intel_backend_sycl_failures.cpp
+        ${_strix_intel_root}/src/intel/core/backend.cpp)
+    target_include_directories(strix-intel-sycl-boundary-tests BEFORE PRIVATE
+        ${_strix_intel_root}/tests/intel_sycl_stub ${_strix_intel_root}/src ${_strix_intel_root}/include)
+    target_compile_definitions(strix-intel-sycl-boundary-tests PRIVATE STRIX_HAVE_SYCL=1)
+    target_compile_features(strix-intel-sycl-boundary-tests PRIVATE cxx_std_20)
+    target_link_libraries(strix-intel-sycl-boundary-tests PRIVATE strix_device_intel)
+    if(COMMAND strix_target_warnings)
+        strix_target_warnings(strix-intel-sycl-boundary-tests)
+    endif()
+    foreach(_case async sync open)
+        add_test(NAME strix-intel-sycl-${_case}-failures COMMAND strix-intel-sycl-boundary-tests ${_case})
+    endforeach()
 endif()

@@ -5,6 +5,7 @@
 #include "strix/device/intel_enumerator.hpp"
 
 #include <cmath>
+#include <bit>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -132,6 +133,67 @@ void listing() {
     require(device::level_zero_selector(1) == "level_zero:1", "selector");
 }
 
+void dense_boundaries_and_bits() {
+    std::uint8_t weight[136]{};
+    std::int8_t codes[128]{};
+    float deltas[4]{4096.0F, 1.0F, 4096.0F, 1.0F};
+    float out = 0.0F;
+    intel::dense::Q8A8View v{weight, codes, deltas, &out, 136, 0, 128, 1, 1, 128, 1, 0};
+    require(intel::dense::supported(v), "exact row boundary accepted");
+    v.k_bytes = 0xffffffe0U;
+    require(!intel::dense::supported(v), "wrapped K offset rejected");
+    v.k_bytes = 1;
+    require(!intel::dense::supported(v), "one byte beyond row rejected");
+    v.k_bytes = 0;
+    v.in = v.x_stride = 0xffffff80U;
+    v.row_bytes = 0xffffffffU;
+    require(!intel::dense::supported(v), "wrapped block product rejected");
+    v.in = v.x_stride = 128;
+    v.k_bytes = 0xffffffffU - 136U;
+    require(intel::dense::supported(v), "max row exact fit accepted without execution");
+    ++v.k_bytes;
+    require(!intel::dense::supported(v), "max row overflow rejected");
+    v.k_bytes = 0;
+    v.row_bytes = 136;
+    v.rows = 0;
+    require(!intel::dense::supported(v), "zero rows rejected");
+    v.rows = 1;
+    v.count = 0;
+    require(!intel::dense::supported(v), "zero count rejected");
+    v.count = 1;
+    v.in = 0;
+    require(!intel::dense::supported(v), "zero input rejected");
+    v.in = 128;
+    // Literal half encodings; ascending FP32 gives ((2^24 + 1) - 2^24) + 1 = 1,
+    // whereas a double accumulator gives 2. No conversion helper supplies the expectation.
+    for (std::size_t b = 0; b < 4; ++b) {
+        const std::uint16_t bits = b % 2 == 0 ? 0x6c00U : 0x3c00U;
+        std::memcpy(weight + b * 34, &bits, sizeof bits);
+        weight[b * 34 + 2] = b == 2 ? 0xffU : 1U;
+        codes[b * 32] = 1;
+    }
+    intel::dense::run_reference(v);
+    require(std::bit_cast<std::uint32_t>(out) == 0x3f800000U, "ascending FP32 bits");
+    v.accumulate = 1;
+    intel::dense::run_reference(v);
+    require(std::bit_cast<std::uint32_t>(out) == 0x40000000U, "accumulated FP32 bits");
+}
+
+void memory_boundaries() {
+    const auto parse = [](const char* size) {
+        return device::parse_xpu_smi(std::string("Device ID,Device Name,Memory Physical Size\n0,card,") + size + "\n");
+    };
+    for (const char* size : {"nan MiB", "inf MiB", "-inf GiB", "-1 MiB", "1e300 GiB", "1e309 MiB",
+                             "17179869184 GiB", "18014398509481984 KiB"}) {
+        bool refused = false;
+        try { (void)parse(size); } catch (const std::invalid_argument&) { refused = true; }
+        require(refused, "nonfinite/overflow memory rejected");
+    }
+    require(parse("0 MiB")[0].memory_bytes == 0, "zero memory");
+    require(parse("0.00048828125 KiB")[0].memory_bytes == 1, "half byte rounds up");
+    require(parse("18014398509481982 KiB")[0].memory_bytes == 0xfffffffffffff800ULL, "below 2^64 accepted");
+}
+
 void arch_and_stubs() {
     require(intel::arch::xe2::selects("xe2-bmg") && intel::arch::xe2::selects("xe3-ptl") && !intel::arch::xe2::selects(""), "selects");
     require(intel::arch::xe2::kSubgroup == 16U, "sub-group");
@@ -147,17 +209,23 @@ void arch_and_stubs() {
 }
 } // namespace
 
-int main() {
+int main(int argc, char** argv) {
 #ifdef _MSC_VER
     _set_abort_behavior(0, _WRITE_ABORT_MSG | _CALL_REPORTFAULT);
     _CrtSetReportMode(_CRT_ASSERT, _CRTDBG_MODE_FILE);
     _CrtSetReportFile(_CRT_ASSERT, _CRTDBG_FILE_STDERR);
 #endif
     try {
-        half_rounding();
-        dense_reference();
-        listing();
-        arch_and_stubs();
+        const std::string name = argc == 2 ? argv[1] : "";
+        if (name == "dense") dense_boundaries_and_bits();
+        else if (name == "memory") memory_boundaries();
+        else {
+            require(name.empty(), "unknown test name");
+            half_rounding();
+            dense_reference();
+            listing();
+            arch_and_stubs();
+        }
     } catch (const std::exception& e) {
         std::fprintf(stderr, "intel backend host tests: FAIL: %s\n", e.what());
         return 1;

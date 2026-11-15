@@ -1,6 +1,6 @@
 # Intel GPU backend (SYCL / oneAPI, Level Zero)
 
-Status: scaffold. The host side builds and is tested on every platform; the SYCL device side is written against SYCL
+Status: scaffold. Recorded host evidence is an MSVC Release run; other platforms are not qualified. The SYCL device side is written against SYCL
 2020 and the Intel extensions but has not been compiled yet (no oneAPI toolchain on the build hosts). The shared
 backend interface is described in `docs/architecture/backends.md` (separate branch, not edited here); this page is the
 Intel section of it.
@@ -14,7 +14,8 @@ Layering (MODULAR BY DEVICE):
 | 3. Arch specialisation | `src/intel/arch/xe2` (Arc B `xe2-bmg`, Lunar Lake `xe2-lnl`; Panther Lake `xe3-ptl` until `arch/xe3` exists), chosen by `Capabilities::arch` |
 
 No model names appear under `src/intel`. A model binds a shared core by filling its view (for example
-`dense::Q8A8View`, the same fields as `f16_dense_tall::q8a8::View`).
+`dense::Q8A8View`, corresponding data fields to `f16_dense_tall::q8a8::View`, without its launch-only `tile0`).
+The portable view and oracle still need extraction into `src/core` and adoption by both launches.
 
 ## 1. Interface mapping
 
@@ -62,7 +63,7 @@ Memory budgeting stays in the shared layer: the backend reports `global_bytes` a
 Configure:
 
 ```
-# host only, any compiler (what CI runs):
+# host only (recorded evidence: MSVC Release):
 cmake -S src/intel -B build-intel && cmake --build build-intel --config Release && ctest --test-dir build-intel -C Release
 # full tree, opt-in:
 cmake -B build -DSTRIX_BACKEND_INTEL=ON
@@ -73,6 +74,10 @@ cmake -B build-sycl -G Ninja -DCMAKE_CXX_COMPILER=icpx -DSTRIX_BACKEND_INTEL=ON
 `cmake/StrixIntel.cmake` turns SYCL on only when `CMAKE_CXX_COMPILER_ID` is `IntelLLVM` and a `-fsycl` program
 compiles; otherwise it prints one status line and builds the host part. `STRIX_BACKEND_INTEL` is OFF by default and
 nothing in the HIP or CUDA configuration changes.
+
+Host regressions include independent FP32 bit patterns and injected SYCL boundary failures using a test double.
+These do not compile against oneAPI or execute on a device. Qualification still requires a real SYCL build,
+device/reference execution gates with an explicit arithmetic identity, and device-gate integration.
 
 ## 3. What ports first
 

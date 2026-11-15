@@ -1,6 +1,7 @@
 #include "strix/device/intel_enumerator.hpp"
 
 #include <cstdio>
+#include <cmath>
 #include <stdexcept>
 #include <string>
 
@@ -55,14 +56,17 @@ bool lower_contains(std::string_view text, std::string_view needle) {
 std::uint64_t parse_memory(const std::string& text) {
     std::size_t used = 0;
     const double value = std::stod(text, &used);
-    if (value < 0.0) throw std::invalid_argument("memory");
+    if (!std::isfinite(value) || value < 0.0) throw std::invalid_argument("memory");
     const auto unit = trim(std::string_view(text).substr(used));
     double scale = 1.0;
     if (unit.empty() || lower_contains(unit, "mib") || lower_contains(unit, "mb")) scale = 1024.0 * 1024.0;
     else if (lower_contains(unit, "gib") || lower_contains(unit, "gb")) scale = 1024.0 * 1024.0 * 1024.0;
     else if (lower_contains(unit, "kib") || lower_contains(unit, "kb")) scale = 1024.0;
     else throw std::invalid_argument("memory unit");
-    return static_cast<std::uint64_t>(value * scale + 0.5);
+    const double rounded = std::floor(value * scale + 0.5);
+    // 2^64 is an exact exclusive bound; double(UINT64_MAX) rounds up to it.
+    if (!std::isfinite(rounded) || rounded >= 0x1p64) throw std::invalid_argument("memory range");
+    return static_cast<std::uint64_t>(rounded);
 }
 } // namespace
 

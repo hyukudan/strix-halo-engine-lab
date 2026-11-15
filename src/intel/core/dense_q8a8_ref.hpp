@@ -1,10 +1,10 @@
 #pragma once
 // Reference kernel of the shared dense policy dense-q8a8-f16-v1 (src/core/f16_dense_q8a8.hpp) for the Intel backend:
 //   y[r][o] (+)= sum_k fp16(code_w * d) * fp16(code_a * delta), FP32 accumulation, k ascending, from +0.
-// Same View fields and limits as the HIP policy, so an engine binds both backends from one description. One work item
+// Data fields correspond to the HIP policy; its launch-only tile0 is omitted. One work item
 // computes one (r, o) cell; the body is plain C++ and is the same function the host loop and a SYCL parallel_for call.
 // It is the correctness oracle of the XMX path (arch/xe2), not a fast path: XMX (DPAS) sums k in hardware order, so
-// device-vs-reference checks use a tolerance; the reference is bit-exact against itself on every compiler.
+// device-vs-reference checks require a declared tolerance; host tests do not qualify device arithmetic.
 #include "fp16.hpp"
 
 #include <cstdint>
@@ -25,8 +25,10 @@ struct Q8A8View {
 };
 
 inline bool supported(const Q8A8View& v) {
-    return v.weight && v.codes && v.deltas && v.out && v.in % 128U == 0U && v.x_stride % 32U == 0U && v.in <= v.x_stride &&
-           v.row_bytes >= v.k_bytes + v.in / 32U * 34U && v.out_stride >= v.count;
+    const std::uint64_t required = static_cast<std::uint64_t>(v.k_bytes) + static_cast<std::uint64_t>(v.in / 32U) * 34U;
+    return v.weight && v.codes && v.deltas && v.out && v.rows && v.count && v.in &&
+           v.in % 128U == 0U && v.x_stride % 32U == 0U && v.in <= v.x_stride &&
+           required <= v.row_bytes && v.out_stride >= v.count;
 }
 
 inline void q8a8_cell(const Q8A8View& v, std::uint32_t r, std::uint32_t o) {
@@ -35,11 +37,12 @@ inline void q8a8_cell(const Q8A8View& v, std::uint32_t r, std::uint32_t o) {
     const float* delta = v.deltas + static_cast<std::size_t>(r) * (v.x_stride / 32U);
     float acc = 0.0F;
     for (std::uint32_t b = 0; b < v.in / 32U; ++b) {
+        const std::size_t block_offset = static_cast<std::size_t>(b) * 34U;
         std::uint16_t scale_bits = 0;
-        std::memcpy(&scale_bits, w + b * 34U, sizeof scale_bits);
+        std::memcpy(&scale_bits, w + block_offset, sizeof scale_bits);
         const float d = fp16::to_float(scale_bits);
         for (std::uint32_t j = 0; j < 32U; ++j) {
-            const auto code_w = static_cast<std::int8_t>(w[b * 34U + 2U + j]);
+            const auto code_w = static_cast<std::int8_t>(w[block_offset + 2U + j]);
             const float w16 = fp16::round(static_cast<float>(code_w) * d);
             const float a16 = fp16::round(static_cast<float>(a[b * 32U + j]) * delta[b]);
             acc += w16 * a16;

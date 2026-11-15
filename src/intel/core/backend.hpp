@@ -30,9 +30,14 @@ struct Capabilities {
 };
 
 struct Queue {
-    void* impl = nullptr;  // sycl::queue* when STRIX_HAVE_SYCL, else always null
+    // Opaque backend state. The successful opener owns it and must close exactly once.
+    // Copies are borrowed handles: never close a copy or use one after the owner closes.
+    // Calls on a handle must finish before close; synchronize queued USM users before release.
+    void* impl = nullptr;
 };
 
+// Open requires an empty handle; failure leaves it and capabilities unchanged.
+// Asynchronous failures are sticky and reported by synchronize; close cannot report errors.
 [[nodiscard]] bool sycl_built() noexcept;  // true when this build carries the SYCL backend
 [[nodiscard]] Status open_queue(int level_zero_ordinal, Queue* queue, Capabilities* caps);
 void close_queue(Queue& queue) noexcept;
