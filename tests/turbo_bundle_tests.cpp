@@ -83,7 +83,7 @@ void families() {
     require(find(r, "engram_wmma") != nullptr && find(r, "engram_wmma")->status == p::Status::pending, "ds41 engram pending");
     require(find(r, "decoder_replay") != nullptr && find(r, "decoder_replay")->status == p::Status::pending, "ds41 replay pending");
     generic(ds, p::Name::fast, none, r);
-    require(find(r, "attention_f16wmma")->value == "1", "ds41 fast unchanged (f16wmma)");
+    require(find(r, "attention_f16wmma")->requested == "1", "ds41 fast unchanged (f16wmma)");
     generic(ds, p::Name::standard, none, r);
     require(find(r, "engram_wmma") == nullptr || find(r, "engram_wmma")->status == p::Status::builtin, "ds41 default unchanged");
 
