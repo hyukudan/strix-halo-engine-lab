@@ -90,6 +90,7 @@ struct PrefillOptions {
     bool engram_direct_io = true;        // Engram rows from the NVMe with O_DIRECT (else the file mapping)
     bool stream_hashes = false;          // FNV of the last row's residual stream after each layer (gate against decode)
     bool verify_embed_extras = false;    // identity gate only: independent dead-hash and device image-router probes
+    bool image_text_bias = false;        // diagnostic, changes bits: image rows routed with the text bias (STRIX_DS41_IMAGE_TEXT_BIAS)
     bool gather_logits = true;           // world 2: exchange the vocabulary slices so both ranks hold every logit
     bool timing = false;                 // per-layer wall times (synchronises at every layer end)
     // Exact suffix replay (the full 40 layers only): decoder layers compute only the cone of rows the final state and
