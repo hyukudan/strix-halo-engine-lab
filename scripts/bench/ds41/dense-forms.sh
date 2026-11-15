@@ -9,6 +9,7 @@
 #        form 0. Then per rows: --forms REPS ROUNDS ROWS, strict ABAB rounds (every round runs every form once; cold =
 #        round 0, warm = median of the others, d = per-round difference to form 0), "census" = launches per layer-chunk
 #        x warm ms and x113 layer-chunks (rank 0 at 11.6K in 1,024-row chunks; the last chunk of a rank is ~680 rows).
+# No prefill receipt (receipt.py wants a prefill anchor); each run's dir keeps the sampler (clock, kfd evictions) and meta.
 set -u
 here=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck source=scripts/bench/common/runlib.sh
@@ -32,5 +33,4 @@ for r in ${rows//,/ }; do
     kit_fits 20 || { echo "== rows $r SKIP (left $(kit_left) s)"; continue; }
     kit_run "$out/f$r" 60 "$bin" --forms "$reps" "$rounds" "$r"
     grep -aE '^(fm|census)|FAIL' "$out/f$r/stdout" | grep -v 'form 0 |' | cut -c1-200 | sed 's/^/== /'
-    { kit_receipt "$out/f$r" "f$r" 2>&1 || true; } | head -2 | sed 's/^/== receipt /'
 done
