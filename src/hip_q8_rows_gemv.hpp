@@ -58,6 +58,9 @@
 #include "strix/hip_gsq_a8_groups.hpp"
 #include "moe_core/dense_a8_small_layout.hpp"
 #include "strix/known_window_cohort.hpp"
+#include "core/iu4_onfly.hpp"
+#include "core/w4a16.hpp"
+#include "strix/onfly_i4.hpp"
 
 namespace strix {
 // Launches that drop the AQL barrier bit for kernels proven independent of the one queued
@@ -1934,6 +1937,7 @@ template <class Site> void launch_dense_a8_gsq(const Site& site, const DenseA8Sl
 // projection reads) and one barrier-ordered projection launch (dot4 rows <= 8, WMMA
 // 16/32/64).
 #include "moe_core/dense_a8_small.inc"
+// (hip_q8_rows_iu4.hpp: its core includes are at the top of this file)
 #include "hip_q8_rows_iu4.hpp"
 
 template <class Site> void launch_dense_a8(const Site& site, hipStream_t stream, bool any_order) {

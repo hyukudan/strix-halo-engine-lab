@@ -75,6 +75,16 @@ const Tensor* find(const void* original_address) noexcept;
 // Registered copies (lock-free; launchers skip the lookup when zero) and successful find() calls.
 std::uint64_t count() noexcept;
 std::uint64_t hits() noexcept;
+// The independent MTP golden replay validates the EXACT arithmetic: onfly INT4 dispatch is suspended on the calling thread
+// while it runs (the INT4 copies are lossy by design and are never compared with the exact golden).
+inline thread_local int suspend_depth = 0;
+[[nodiscard]] inline bool suspended() noexcept { return suspend_depth != 0; }
+struct SuspendScope {
+    SuspendScope() noexcept { ++suspend_depth; }
+    ~SuspendScope() { --suspend_depth; }
+    SuspendScope(const SuspendScope&) = delete;
+    SuspendScope& operator=(const SuspendScope&) = delete;
+};
 }  // namespace iu4
 
 }  // namespace strix::q6p

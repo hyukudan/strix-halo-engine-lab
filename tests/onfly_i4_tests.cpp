@@ -119,7 +119,7 @@ int main() {
     }, true);
     expect(via_cli.identity() == via_env.identity() && via_cli.active() && via_cli.groups == 5U, "CLI and environment resolve to the same value");
     expect(via_cli.identity() != onfly_i4::resolve({}, no_env, true).identity(), "groups and rule enter the identity");
-    for (const auto& bad : {onfly_i4::Request{"nope"}, onfly_i4::Request{"", "fast"}}) {
+    for (const auto& bad : {onfly_i4::Request{"nope", ""}, onfly_i4::Request{"", "fast"}}) {
         bool refused = false;
         try { (void)onfly_i4::resolve(bad, no_env, true); } catch (const std::invalid_argument&) { refused = true; }
         expect(refused, "unsupported request refused with a reason");
