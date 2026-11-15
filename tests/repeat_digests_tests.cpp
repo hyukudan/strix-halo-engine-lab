@@ -12,6 +12,14 @@ void expect(bool ok, const char* message) {
 }  // namespace
 
 int main() try {
+    strix::RepeatDigests insufficient;
+    expect(insufficient.equal() && insufficient.report("p").find("0 comparisons (insufficient repetitions)") != std::string::npos,
+           "zero runs do not establish repeatability");
+    insufficient.add({0, "A", 1, 2, 3});
+    insufficient.add({1, "B", 4, 5, 6});
+    for (const auto* arm : {"A", "B"})
+        expect(insufficient.report("p").find(std::string("arm ") + arm + ": 1 runs, 0 comparisons (insufficient repetitions)") != std::string::npos,
+               "singleton arms do not establish repeatability");
     strix::RepeatDigests same;
     for (std::uint32_t k = 0; k < 3; ++k) same.add({k, "", 0x10257ebdULL, 0x55ULL, 42U});
     expect(same.equal(), "equal repetitions");
@@ -34,6 +42,13 @@ int main() try {
     streams.add({1, "", 1U, 0xABU, 3U});
     expect(!streams.equal(), "a different stream digest is a mismatch");
 
+    strix::RepeatDigests tokens;
+    tokens.add({0, "", 1U, 2U, 3U});
+    tokens.add({1, "", 1U, 2U, 4U});
+    tokens.add({2, "", 1U, 2U, 3U});
+    expect(!tokens.equal(), "next-token-only drift is retained even after recovery");
+    expect(tokens.report("p").find("3 runs, 2 comparisons") != std::string::npos, "comparison count excludes reference");
+
     strix::RepeatDigests ab;  // A/B arms compare only within their own arm
     ab.add({0, "OFF", 1U, 0, 3U});
     ab.add({1, "SEL", 2U, 0, 3U});
@@ -44,6 +59,8 @@ int main() try {
     const strix::RepeatDigests::Run* ref = nullptr;
     const auto* bad = ab.first_mismatch(&ref);
     expect(bad != nullptr && bad->index == 4U && ref != nullptr && ref->index == 1U, "compared with the first run of its arm");
+    expect(ab.report("p").find("arm OFF: 2 runs, 1 comparisons") != std::string::npos &&
+               ab.report("p").find("arm SEL: 3 runs, 2 comparisons") != std::string::npos, "counts stay within each arm");
     std::puts("repeat digests: ok");
     return 0;
 } catch (const std::exception& e) {

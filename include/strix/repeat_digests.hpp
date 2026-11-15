@@ -41,7 +41,7 @@ public:
     }
     [[nodiscard]] bool equal() const noexcept { return first_mismatch() == nullptr; }
 
-    // One line per repetition, then the verdict ("repeat digests: N runs, equal" or "REPEAT DIGEST MISMATCH: ...").
+    // Repetitions and comparison counts per arm, then the equality verdict.
     [[nodiscard]] std::string report(const std::string& who) const {
         std::string out;
         char line[256];
@@ -49,6 +49,20 @@ public:
             std::snprintf(line, sizeof line, "%s repeat %u%s%s: next token %u, logits_fnv %016llx, streams %016llx\n", who.c_str(), r.index,
                           r.arm.empty() ? "" : " arm ", r.arm.c_str(), r.next_token, static_cast<unsigned long long>(r.logits),
                           static_cast<unsigned long long>(r.streams));
+            out += line;
+        }
+        if (runs_.empty()) out += who + " repeat evidence: 0 comparisons (insufficient repetitions)\n";
+        for (std::size_t i = 0; i < runs_.size(); ++i) {
+            bool first = true;
+            for (std::size_t j = 0; j < i; ++j)
+                if (runs_[j].arm == runs_[i].arm) { first = false; break; }
+            if (!first) continue;
+            std::size_t count = 0;
+            for (const auto& r : runs_)
+                if (r.arm == runs_[i].arm) ++count;
+            std::snprintf(line, sizeof line, "%s repeat arm %s: %zu runs, %zu comparisons%s\n", who.c_str(),
+                          runs_[i].arm.empty() ? "<default>" : runs_[i].arm.c_str(), count, count - 1U,
+                          count < 2U ? " (insufficient repetitions)" : "");
             out += line;
         }
         const Run* ref = nullptr;

@@ -306,12 +306,17 @@ strix::deepseek41::PrefillResult ttft_runs(const Args& a, strix::deepseek41::Dev
     };
     if (a.ttft_warmup != 0U)
         one(std::span<const std::uint32_t>(prompt).first(std::min<std::size_t>(a.ttft_warmup, prompt.size())), 900U, "warm-up run");
+    strix::RepeatDigests repeats;  // the short warm-up is not a measured repetition
     for (std::uint32_t k = 0; k < a.repeat; ++k) {
         char label[32];
         std::snprintf(label, sizeof(label), "run %u", k);
         one(prompt, k, label);
+        repeats.add(repeat_run(k, {}, r));
         if (print) print_result(comm == nullptr ? "prefill" : "rank prefill", r, prompt.size(), a.timing, loads_out);
     }
+    const unsigned rank = comm == nullptr ? 0U : comm->group().rank;
+    write_receipts(a, pre, r, rank);
+    check_repeats(repeats, comm == nullptr ? "prefill" : "rank " + std::to_string(rank));
     return r;
 }
 
@@ -839,7 +844,7 @@ void run_rank(const Args& a, const std::vector<std::uint32_t>& prompt, std::uint
     o.world = 2;
     o.communicator = &comm;
     const bool decode_reference = a.reference && (a.transport != "emulate" || a.decode_reference);
-    o.stream_hashes = decode_reference || out_state != nullptr || a.embed_identity;
+    o.stream_hashes = decode_reference || out_state != nullptr || a.embed_identity || !a.hashes_out.empty();
     o.verify_embed_extras = a.embed_identity;
     strix::deepseek41::PrefillResult r;
     std::vector<std::pair<std::string, std::uint64_t>> state;
