@@ -19,6 +19,7 @@ se pasan como argumentos, y el segundo nodo de un par es el alias ssh de `KIT_PE
 | `abab.py` | `order` imprime el orden ABAB estricto; `summary OUT [--metric M]` da medianas por brazo, deltas por ronda y comprobaciones de identidad. |
 | `serve-decode.sh` | Arranca un servidor (y su rango 1 en el par), espera a que esté listo, ejecuta `tools/serve_bench.py` por clase de decodificación y lo para. `--client-cmd` ejecuta cualquier otro cliente en su lugar. |
 | `serve_receipts.py` | Convierte los resultados servidos en recibos (`agg_C<n>`, `e2e_C<n>`, `req_C<n>`, `ttft_C<n>`). |
+| `forwards_ab.py` | Ciclos de decode estables por (carriles, pasadas del modelo) desde los recibos de ciclo: el A/B en proceso de `STRIX_SERVE_JOINT_GROUP_LANES=ab`. |
 | `prompt_ids.py` | Ficheros de prompt de cualquier longitud (`p<N>.ids`, `.csv` o `.u32`). Cada uno es el texto semilla tokenizado una vez, repetido y truncado, con un sha256 por prompt. |
 
 Cada directorio de ejecución guarda `cmd.txt`, `stdout`, `stdout.ts`, `stderr`, `stderr.ts` (la hora de llegada de cada línea),
