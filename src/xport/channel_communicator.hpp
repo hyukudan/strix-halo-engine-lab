@@ -2,6 +2,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <stdexcept>
 #include <vector>
 
 namespace strix::xport {
@@ -75,8 +76,26 @@ public:
         auto& event = consumers_[static_cast<std::size_t>((held_ - 1U) % consumers_.size())];
         runtime_.record(event, stream);
     }
+    // Device-local producer output (e.g. a GEMV plan that cannot write host-coherent memory): one Channel kernel copies
+    // it into the TX slot and publishes; the consumer then takes the zero-copy view of finish_staged() and retires it
+    // with release_staged(). Channel route only (the legacy route has its own staged-ready producers).
+    void start_staged_copy(Stream stream, const void* local, std::size_t bytes, const Tag& tag) {
+        if (!channel_ || !bytes || bytes > channel_->options().capacity)
+            throw std::logic_error("xport: start_staged_copy needs the Channel route and bytes within its capacity");
+        before_send(stream);
+        channel_->send_copy(local, bytes, Runtime::tag(tag));
+    }
     // Ready-view vocabulary is required by the existing DS41 facade's type
-    // contract. Those calls remain on the legacy decode route.
+    // contract. Those calls remain on the legacy decode route; on the Channel
+    // route no ready view is offered, so callers take their staged / copy paths.
+    auto prepare_staged_ready(Stream stream, std::size_t bytes) {
+        if (!channel_) return legacy_->prepare_staged_ready(stream, bytes);
+        return decltype(legacy_->prepare_staged_ready(stream, bytes)){};
+    }
+    std::uint32_t staged_ready_chunk_rows(std::uint32_t rows, std::size_t row_bytes) const {
+        return channel_ ? 0U : legacy_->staged_ready_chunk_rows(rows, row_bytes);
+    }
+    std::size_t capacity() const { return channel_ ? channel_->options().capacity : 0U; }
     auto finish_staged_ready() { return legacy_->finish_staged_ready(); }
     void start_staged_ready(Stream stream, std::size_t bytes, const Tag& tag) {
         legacy_->start_staged_ready(stream, bytes, tag);

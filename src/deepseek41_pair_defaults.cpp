@@ -1,5 +1,6 @@
 #include "strix/env_flags.hpp"
 #include "strix/ds41_fast_profile.hpp"
+#include "strix/ds41_decode_xport.hpp"
 #include <map>
 #include "strix/deepseek41_pair_defaults.hpp"
 #include "strix/deepseek41_pair_profile_table.hpp"
@@ -276,6 +277,10 @@ Resolved resolve(App app, const std::vector<std::string>& in, const Getenv& raw_
         if (env(name) == nullptr) r.set_env.emplace_back(name, std::move(value));
     };
     const auto notice = [&](const std::string& s) { r.notices.push_back(std::string("deepseek41 defaults: ") + s); };
+    {
+        const auto xport = strix::ds41::decode_xport_choice(env(strix::ds41::decode_xport_lever.env.data()));
+        r.decode_xport = std::string(strix::ds41::decode_xport_name(xport.on)) + " (" + strix::lever::origin_name(xport.origin) + ")";
+    }
 
     const bool baseline = set(env("STRIX_DS41_BASELINE")) && !zero(env("STRIX_DS41_BASELINE"));
     if (baseline) {
@@ -412,6 +417,7 @@ std::string describe(App app, const Resolved& r) {
     for (const auto& [k, v] : r.set_env) o << "env " << k << '=' << v << '\n';
     for (const auto& k : r.unset_env) o << "unset " << k << '\n';
     for (const auto& a : r.args) o << "arg " << a << '\n';
+    o << "decode_xport " << r.decode_xport << '\n';
     o << "session cache " << (r.session.enabled ? "on" : "off") << "\n"
       << "session ram_bytes " << r.session.ram_bytes << "\n"
       << "session max_parked " << r.session.max_parked << "\n"

@@ -1,4 +1,5 @@
 #include "strix/deepseek41_pair_defaults.hpp"
+#include "strix/ds41_decode_xport.hpp"
 #include "strix/deepseek41_pair_profile_table.hpp"
 
 #include <algorithm>
@@ -635,9 +636,44 @@ void test_common_adapter() {
     }
 }
 
+// ONE RESOLVER: STRIX_DS41_DECODE_XPORT resolves to the same transport for the CLI apps and the server, through the
+// same rule the engine applies (strix/ds41_decode_xport.hpp), and a bad value is refused at startup.
+void test_decode_xport() {
+    namespace ds = strix::ds41;
+    const std::pair<const char*, const char*> cases[] = {
+        {nullptr, "communicator (default)"}, {"communicator", "communicator (explicit)"}, {"channel", "channel (explicit)"},
+        {"0", "communicator (explicit)"}, {"1", "channel (explicit)"}};
+    for (const auto& [value, expected] : cases) {
+        World w;
+        if (value) w.env[std::string(ds::decode_xport_lever.env)] = value;
+        const auto engine = ds::decode_xport_choice(value);
+        for (const auto app : {pd::App::rank, pd::App::batch, pd::App::serve}) {
+            const auto r = w.run(app, plain(receipts[0]));
+            check(r.decode_xport == expected, std::string("decode xport ") + pd::app_name(app) + " " + (value ? value : "unset") + ": " +
+                                                  r.decode_xport);
+            check(r.decode_xport.rfind(ds::decode_xport_name(engine.on), 0) == 0,
+                  std::string("decode xport: engine and ") + pd::app_name(app) + " disagree");
+            check(pd::describe(app, r).find("decode_xport " + std::string(expected)) != std::string::npos,
+                  std::string("decode xport: effective config of ") + pd::app_name(app));
+        }
+    }
+    World bad;
+    bad.env[std::string(ds::decode_xport_lever.env)] = "fast";
+    bool refused = false;
+    try {
+        (void)bad.run(pd::App::serve, plain(receipts[0]));
+    } catch (const std::invalid_argument&) {
+        refused = true;
+    }
+    check(refused, "decode xport: an unknown value is refused");
+    check(ds::decode_xport_lever.exactness == strix::lever::Exactness::bitwise && !ds::decode_xport_lever.default_on,
+          "decode xport: bitwise lever, communicator by default");
+}
+
 }  // namespace
 
 int main() {
+    test_decode_xport();
     test_equivalence();
     test_off_switches();
     test_fallbacks();
