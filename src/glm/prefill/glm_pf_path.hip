@@ -283,8 +283,10 @@ public:
                 kda_wmma::supported(D::WType::F16, kKdaDim, &pf, 1, R) && kda_wmma::supported(D::WType::F16, kKdaDim, &pg, 1, R)) {
                 // FAST (default with the FAST route): the same five projections on the shared dense FP16 WMMA core.
                 kda_wmma::dense_group(x, kHidden, px, 3, R, c.stream, x16_ ? xt_ : nullptr);  // x16 from kX16Rows rows (same bits)
-                kda_wmma::dense_group(ta_, kKdaDim, &pf, 1, R, c.stream);
-                kda_wmma::dense_group(tb128_, kKdaDim, &pg, 1, R, c.stream);
+                // f_b / g_b (128 -> C): x16 tiles of ta_ / tb128_ reuse xt_ after the group above (same stream, ordered);
+                // the direct form re-streams FP32 rows per 16-tile column (unit bench 4096 rows: 2.07 / 1.09 ms -> 0.84 / 0.41).
+                kda_wmma::dense_group(ta_, kKdaDim, &pf, 1, R, c.stream, x16_ ? xt_ : nullptr);
+                kda_wmma::dense_group(tb128_, kKdaDim, &pg, 1, R, c.stream, x16_ ? xt_ : nullptr);
             } else {
                 dense_rows_group(x, D::WType::F16, kHidden, px, 3, R, c.stream);
                 dense_rows(ta_, w.f_b, D::WType::F16, kKdaDim, 0, C, f_, R, c.stream);
