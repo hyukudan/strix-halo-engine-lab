@@ -1250,18 +1250,30 @@ __global__ __launch_bounds__(256) void mla_gemm_rows_v2_kernel(const float* A, c
 // Grid: x = column tile (fastest), y = row tile, z = head, so the NC / 128 CTAs that share one A tile run back to back
 // and read it from L2 (with rows fastest, a head's whole A slice, C x 1 KiB at a 32 KiB row stride, was streamed once
 // per column tile: absorb per row went 2.3 -> 4.1 us from C 2048 to 4096). Placement only: same per-output chains.
+// Heads-mid order (STRIX_GLM_PF_MLA_GEMM_HEADS, default 1; 0 = the order above): grid x = column tile, y = head,
+// z = row tile. With one head in flight every resident CTA reads rows of the same 1 KiB head slice at the 32 / 64 KiB
+// row stride of [C][H][K], so the requests camp on a few memory channels; with the heads of a row tile in flight the
+// slices spread over the whole row. Measured on the shared WMMA tile core (same layout, C 4096): absorb 6.8 -> 3.4 ms,
+// out 6.4 -> 4.5 ms; group sizes 4..16 equal the plain heads-mid order. Placement only: the same bits.
 constexpr unsigned kG3R = 128, kG3C = 128, kG3K = 16, kG3Pad = 132;
+inline bool g3_heads_mid() { return mla_gemm::heads_mid(); }
+inline dim3 g3_grid(unsigned nc, unsigned C, unsigned heads, bool heads_mid) {
+    const unsigned rows = (C + kG3R - 1) / kG3R;
+    return heads_mid ? dim3(nc / kG3C, heads, rows) : dim3(nc / kG3C, rows, heads);
+}
 #include "glm/prefill/glm_pf_mla_gemm_vopd.inc"
 // kQ16 (absorb only): the epilogue stores the bf16 image tile::to_bf16(acc) of the unchanged FP32 chains, [C][H][512]
 // u16 in Y's memory, i.e. exactly the operand bits the FAST flash core makes of FP32 q-tilde (frag_from_f32<bf16>):
 // half the q-tilde bytes written here and read there.
 template <bool kOut, bool kQ16 = false>
-__global__ __launch_bounds__(256) void mla_gemm_rows_v3_kernel(const float* A, const std::uint16_t* kv_b, unsigned heads, unsigned C, float* Y) {
+__global__ __launch_bounds__(256) void mla_gemm_rows_v3_kernel(const float* A, const std::uint16_t* kv_b, unsigned heads, unsigned C, float* Y,
+                                                               bool heads_mid) {
     static_assert(!(kOut && kQ16), "the out GEMM keeps its FP32 output");
     constexpr unsigned K = kOut ? kKvLora : kMlaDim, NC = kOut ? kMlaDim : kKvLora;
     __shared__ alignas(16) float as[kG3K][kG3Pad];
     __shared__ alignas(16) float ws[kG3K][kG3Pad];
-    const unsigned r0 = blockIdx.y * kG3R, c0 = blockIdx.x * kG3C, h = blockIdx.z, tid = threadIdx.x, tr = tid / 16, tc = tid % 16;
+    const unsigned r0 = (heads_mid ? blockIdx.z : blockIdx.y) * kG3R, c0 = blockIdx.x * kG3C, h = heads_mid ? blockIdx.y : blockIdx.z;
+    const unsigned tid = threadIdx.x, tr = tid / 16, tc = tid % 16;
     float4 ar[2];
     uint4 wr;
     auto load = [&](unsigned k0) {
@@ -3506,8 +3518,8 @@ void mla_attention_rows_versions(const DsaSlot& slot, const std::uint32_t* token
         const unsigned keys = obar_v % 2 == 1 ? 16U : 32U;
         mla_mark(0, s);
         if (!q16 && mla_gemm_wmma<false>(q, kv_b, heads, C, qt, s)) {
-        } else if (q16) mla_gemm_rows_v3_kernel<false, true><<<dim3(kKvLora / kG3C, (C + kG3R - 1) / kG3R, heads), 256, 0, s>>>(q, kv_b, heads, C, qt);
-        else if (gemm_v == 3) mla_gemm_rows_v3_kernel<false><<<dim3(kKvLora / kG3C, (C + kG3R - 1) / kG3R, heads), 256, 0, s>>>(q, kv_b, heads, C, qt);
+        } else if (q16) mla_gemm_rows_v3_kernel<false, true><<<g3_grid(kKvLora, C, heads, g3_heads_mid()), 256, 0, s>>>(q, kv_b, heads, C, qt, g3_heads_mid());
+        else if (gemm_v == 3) mla_gemm_rows_v3_kernel<false><<<g3_grid(kKvLora, C, heads, g3_heads_mid()), 256, 0, s>>>(q, kv_b, heads, C, qt, g3_heads_mid());
         else if (gemm_v == 2) mla_gemm_rows_v2_kernel<false><<<dim3((C + kG2R - 1) / kG2R, kKvLora / kG2C, heads), 256, 0, s>>>(q, kv_b, heads, C, qt);
         else mla_gemm_rows_kernel<false><<<dim3((C + kGT - 1) / kGT, kKvLora / kGT, heads), 256, 0, s>>>(q, kv_b, heads, C, qt);
         ok(hipGetLastError(), "glm pf mla absorb");
@@ -3517,7 +3529,7 @@ void mla_attention_rows_versions(const DsaSlot& slot, const std::uint32_t* token
         mla_flash_rows(slot, tokens, n, qt, ob, C, keys, q16, s);
         mla_mark(4, s);
         if (mla_gemm_wmma<true>(ob, kv_b, heads, C, o, s)) {
-        } else if (gemm_v == 3) mla_gemm_rows_v3_kernel<true><<<dim3(kMlaDim / kG3C, (C + kG3R - 1) / kG3R, heads), 256, 0, s>>>(ob, kv_b, heads, C, o);
+        } else if (gemm_v == 3) mla_gemm_rows_v3_kernel<true><<<g3_grid(kMlaDim, C, heads, g3_heads_mid()), 256, 0, s>>>(ob, kv_b, heads, C, o, g3_heads_mid());
         else if (gemm_v == 2) mla_gemm_rows_v2_kernel<true><<<dim3((C + kG2R - 1) / kG2R, kMlaDim / kG2C, heads), 256, 0, s>>>(ob, kv_b, heads, C, o);
         else mla_gemm_rows_kernel<true><<<dim3((C + kGT - 1) / kGT, kMlaDim / kGT, heads), 256, 0, s>>>(ob, kv_b, heads, C, o);
         ok(hipGetLastError(), "glm pf mla out");
@@ -3538,7 +3550,7 @@ void mla_attention_rows_versions(const DsaSlot& slot, const std::uint32_t* token
         else mla_scores_rows_kernel<64><<<sg, 256, 0, s>>>(slot, tokens, n, qt, e);
     } else {
         if (mla_gemm_wmma<false>(q, kv_b, heads, C, qt, s)) {
-        } else if (gemm_v == 3) mla_gemm_rows_v3_kernel<false><<<dim3(kKvLora / kG3C, (C + kG3R - 1) / kG3R, heads), 256, 0, s>>>(q, kv_b, heads, C, qt);
+        } else if (gemm_v == 3) mla_gemm_rows_v3_kernel<false><<<g3_grid(kKvLora, C, heads, g3_heads_mid()), 256, 0, s>>>(q, kv_b, heads, C, qt, g3_heads_mid());
         else if (gemm_v == 2) mla_gemm_rows_v2_kernel<false><<<dim3((C + kG2R - 1) / kG2R, kKvLora / kG2C, heads), 256, 0, s>>>(q, kv_b, heads, C, qt);
         else mla_gemm_rows_kernel<false><<<dim3((C + kGT - 1) / kGT, kKvLora / kGT, heads), 256, 0, s>>>(q, kv_b, heads, C, qt);
         mla_mark(1, s);
@@ -3582,7 +3594,7 @@ void mla_attention_rows_versions(const DsaSlot& slot, const std::uint32_t* token
         else mla_obar_v2_kernel<<<dim3(kKvLora / kOb2Lat, C), 256, 0, s>>>(slot, tokens, n, heads, e, ob);
         mla_mark(4, s);
         if (mla_gemm_wmma<true>(ob, kv_b, heads, C, o, s)) {
-        } else if (gemm_v == 3) mla_gemm_rows_v3_kernel<true><<<dim3(kMlaDim / kG3C, (C + kG3R - 1) / kG3R, heads), 256, 0, s>>>(ob, kv_b, heads, C, o);
+        } else if (gemm_v == 3) mla_gemm_rows_v3_kernel<true><<<g3_grid(kMlaDim, C, heads, g3_heads_mid()), 256, 0, s>>>(ob, kv_b, heads, C, o, g3_heads_mid());
         else if (gemm_v == 2) mla_gemm_rows_v2_kernel<true><<<dim3((C + kG2R - 1) / kG2R, kMlaDim / kG2C, heads), 256, 0, s>>>(ob, kv_b, heads, C, o);
         else mla_gemm_rows_kernel<true><<<dim3((C + kGT - 1) / kGT, kMlaDim / kGT, heads), 256, 0, s>>>(ob, kv_b, heads, C, o);
     }

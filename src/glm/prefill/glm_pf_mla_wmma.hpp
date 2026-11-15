@@ -33,6 +33,7 @@ inline ftg::Args args(const float* x, const std::uint16_t* kv_b, unsigned heads,
     p.K = K;
     p.N = N;
     p.batches = heads;
+    p.order = 1;  // heads of a row tile in flight: the [C][H][K] rows sit at a 32 / 64 KiB stride (channel camping)
     return p;
 }
 

@@ -41,3 +41,9 @@ namespace strix::glm::pf::mla_wmma {
 inline bool enabled() { return envcfg::flag("STRIX_GLM_PF_MLA_WMMA", false); }
 inline std::atomic<std::uint64_t> calls{0};  // launches that ran on the WMMA core (identity reporting)
 }  // namespace strix::glm::pf::mla_wmma
+
+namespace strix::glm::pf::mla_gemm {
+// Exact MLA absorb / out GEMM placement (glm_prefill.hip mla_gemm_rows_v3_kernel): heads-mid CTA order, the same bits.
+// Default on; STRIX_GLM_PF_MLA_GEMM_HEADS=0 restores the rows-then-head order.
+inline bool heads_mid() { return envcfg::flag("STRIX_GLM_PF_MLA_GEMM_HEADS", true); }
+}  // namespace strix::glm::pf::mla_gemm
