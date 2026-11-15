@@ -174,7 +174,10 @@ const char* status_name(Status status) {
 }
 Name parse(std::string_view value) {
     // Preserve the app's legacy diagnostic while sharing the name parser.
-    if (value == "turbo" || !strix::profile::is_name(value)) throw std::invalid_argument("profile must be default, fast or quality");
+    // 'turbo' is a shared name, but gemma4 has no versioned TURBO name and its rows have three columns
+    // (strix/profiles/gemma4.hpp Lever::value): refused here, before any column index.
+    if (!strix::profile::is_name(value) || value == "turbo")
+        throw std::invalid_argument("profile must be default, fast or quality");
     return strix::profile::parse(value);
 }
 strix::profile::ExecutionReceipt host_receipt(strix::profile::NumericalIdentity known) {

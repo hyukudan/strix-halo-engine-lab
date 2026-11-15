@@ -215,6 +215,9 @@ Selection select(const Inputs& inputs) {
     }
     if (cli) s.name = *cli;
     else if (const char* v = environment(inputs.env, "STRIX_DS41_PROFILE"); v && *v) s.name = parse(v);
+    if (s.name == Name::turbo)  // PROVISIONAL decline, reason at resolve(): refused at selection, before any work
+        throw std::invalid_argument("ds41 RTX: --profile turbo is not bound on this backend yet (pending: RTX cache "
+                                    "namespace and turbo column; use the pair engine's ds41-turbo-v1)");
     if (const char* v = environment(inputs.env, "STRIX_DS41_PROFILE_ALLOW_PENDING"); v && std::string_view(v) == "1")
         s.allow_pending = true;
     return s;
