@@ -1,3 +1,4 @@
+#include <cassert>
 #include "strix/env_flags.hpp"
 #include "strix/file_snapshot.hpp"
 #include "strix/hip_check.hpp"
@@ -1738,6 +1739,12 @@ PrefillResult DevicePrefill::run_from(std::span<const std::uint32_t> tokens, std
     }
     // bounded decoder replay (FAST policy ds41-decoder-replay-bounded-v1): v1 is a fresh prompt's whole cone only
     if (bounded != 0U) {
+        if (m.options.draft_rows > bounded)
+            throw std::invalid_argument("ds41-decoder-replay-bounded-v1: draft_rows = " + std::to_string(m.options.draft_rows) +
+                                        " exceeds R = " + std::to_string(bounded));
+        if (ds41::bounded_replay_floor_unit % W != 0U)
+            throw std::invalid_argument("ds41-decoder-replay-bounded-v1: window_rows = " + std::to_string(W) +
+                                        " must divide the fixed floor unit = " + std::to_string(ds41::bounded_replay_floor_unit));
         if (bounded % attn::kWindow != 0U || bounded % W != 0U)
             throw std::invalid_argument("ds41-decoder-replay-bounded-v1: the bound must be a multiple of 128 and of window_rows");
         if (bounded < ds41::bounded_replay_min_rows)
@@ -1766,14 +1773,22 @@ PrefillResult DevicePrefill::run_from(std::span<const std::uint32_t> tokens, std
         g.draft_rows = m.options.draft_rows;
         const auto plan = bounded != 0U && !bounded_oracle ? ds41::plan_bounded_replay(g, 0U, T, bounded) : ds41::plan_suffix_replay(g, 0U, T);
         const auto down = [&](std::uint64_t v) { return static_cast<std::uint32_t>(v / W * W); };
-        const std::uint32_t key_cut = bounded != 0U && T > bounded ? down(T - bounded) : 0U;  // the decoder layers' key floor
+        // ds41-decoder-replay-bounded-v1: fixed 256-row floor, independent of scheduling window_rows.
+        static_assert(ds41::bounded_replay_floor_unit == attn::kMaxCallRows);
+        const auto key_cut = bounded != 0U ? static_cast<std::uint32_t>(ds41::bounded_replay_key_floor(T, bounded)) : 0U;
         for (const auto& pl : plan.layers) {
             if (pl.layer >= m.options.layers) continue;
             auto& r = rows[pl.layer];
             r.o0 = down(pl.out_begin);
             r.k0 = down(pl.kv_begin);
+            if (bounded != 0U && pl.layer >= first_decoder) {
+                r.kf = key_cut;
+                r.o0 = std::max(r.o0, key_cut);
+                r.k0 = std::max(r.k0, key_cut);
+                // Clamping also protects Release and the oracle: no query below the key floor.
+                assert(r.o0 >= r.kf && r.k0 >= r.kf);
+            }
             r.x0 = m.roles[pl.layer].owns_kv ? 0U : r.k0;
-            if (pl.layer >= first_decoder) r.kf = key_cut;  // bounded: == k0; oracle: the exact cone's rows, the same floor
         }
         // in-run snapshot points: also the cone of the state at p (one contiguous suffix per layer: the union)
         for (const auto p : m.snap_points) {

@@ -174,11 +174,10 @@ SuffixReplayPlan plan_bounded_replay(const SuffixReplayGeometry& g, std::uint64_
     SuffixReplayPlan plan;
     plan.cached = cached; plan.total = total;
     plan.layers.resize(g.layers);
-    const auto t = static_cast<std::int64_t>(total);
-    const std::uint64_t cut = clamp_down(t - static_cast<std::int64_t>(bound), cached);
-    // drafter rows beyond the bound: every decoder layer covers them (a layer's input rows are its predecessor's outputs)
-    const std::uint64_t draft = g.draft_rows && g.draft_layers ? clamp_down(t - static_cast<std::int64_t>(g.draft_rows), cached) : cut;
-    const std::uint64_t begin = std::min(cut, draft);
+    if (g.draft_rows > bound)
+        throw std::invalid_argument("ds41-decoder-replay-bounded-v1: draft_rows = " + std::to_string(g.draft_rows) +
+                                    " exceeds R = " + std::to_string(bound));
+    const std::uint64_t begin = std::max(cached, bounded_replay_key_floor(total, bound));
     for (std::uint32_t layer = 0; layer < g.layers; ++layer) {
         auto& l = plan.layers[layer];
         l.layer = layer;
