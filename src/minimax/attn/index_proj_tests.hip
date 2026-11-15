@@ -214,6 +214,7 @@ void wmma_tests(std::mt19937& rng) {
     const std::size_t nq = std::size_t(maxT) * ma::kProjQ, nk = std::size_t(maxT) * ma::kProjK;
     float *eq = dev(std::vector<float>(nq)), *ek = dev(std::vector<float>(nk)), *cq = dev(std::vector<float>(nq)),
           *ck = dev(std::vector<float>(nk)), *iq = dev(std::vector<float>(nq)), *ik = dev(std::vector<float>(nk));
+    _Float16* xt = dev(std::vector<_Float16>(std::size_t(maxT) * kHidden));
     auto rel_l2 = [](const std::vector<float>& a, const std::vector<float>& b, double& max_rel) {
         double num = 0, den = 0, mx = 0;
         for (std::size_t i = 0; i < a.size(); ++i) {
@@ -271,15 +272,20 @@ void wmma_tests(std::mt19937& rng) {
                 std::fprintf(stderr, "FAIL: wmma rows %u tc %u rows_fast %d guard %d finite %d\n", rows, tc, int(rows_fast), int(guard), int(finite));
             }
         }
-        ma::enqueue_index_proj_wmma_diag({x, w.packed, iq, ik, rows}, 2, nullptr);  // the 192-VGPR form: same bits
-        hip_ok(hipDeviceSynchronize(), "sync");
-        if (host(iq, first_q.size()) != first_q || host(ik, first_k.size()) != first_k) {
-            ++g_fail;
-            std::fprintf(stderr, "FAIL: wmma rows %u 192-VGPR form differs from tc 4\n", rows);
+        for (int form = 0; form < 2; ++form) {  // the 192-VGPR form and the x16 tiles form: same bits as tc 4
+            hip_ok(hipMemset(iq, 0xFF, nq * 4), "memset");
+            hip_ok(hipMemset(ik, 0xFF, nk * 4), "memset");
+            if (form == 0) ma::enqueue_index_proj_wmma_diag({x, w.packed, iq, ik, rows}, 2, nullptr);
+            else ma::enqueue_index_proj_wmma_x16({x, w.packed, iq, ik, rows}, xt, nullptr);
+            hip_ok(hipDeviceSynchronize(), "sync");
+            if (host(iq, first_q.size()) != first_q || host(ik, first_k.size()) != first_k) {
+                ++g_fail;
+                std::fprintf(stderr, "FAIL: wmma rows %u %s form differs from tc 4\n", rows, form == 0 ? "192-VGPR" : "x16");
+            }
         }
     }
     for (void* p : {static_cast<void*>(x), static_cast<void*>(x16), static_cast<void*>(eq), static_cast<void*>(ek), static_cast<void*>(cq),
-                    static_cast<void*>(ck), static_cast<void*>(iq), static_cast<void*>(ik)})
+                    static_cast<void*>(ck), static_cast<void*>(iq), static_cast<void*>(ik), static_cast<void*>(xt)})
         (void)hipFree(p);
     free_weights(w);
 }
@@ -317,6 +323,7 @@ void bench_wmma(std::mt19937& rng) {
     for (auto& v : xh) v = n(rng);
     float* x = dev(xh);
     float *iq = dev(std::vector<float>(std::size_t(maxT) * ma::kProjQ)), *ik = dev(std::vector<float>(std::size_t(maxT) * ma::kProjK));
+    _Float16* xt = dev(std::vector<_Float16>(std::size_t(maxT) * kHidden));  // x16 tiles (arm 8 times the WMMA on them alone)
     hipStream_t st;
     hip_ok(hipStreamCreateWithFlags(&st, hipStreamNonBlocking), "stream");
     hipEvent_t e0, e1;
@@ -325,6 +332,7 @@ void bench_wmma(std::mt19937& rng) {
     auto launch = [&](int arm, unsigned l, unsigned rows) {
         const ma::IndexProjView v{x, ws[l].packed, iq, ik, rows};
         if (arm == 0) ma::enqueue_index_proj_slab(v, st);
+        else if (arm >= 7) ma::enqueue_index_proj_wmma_x16(v, xt, st, arm == 7);
         else if (arm >= 4) ma::enqueue_index_proj_wmma_diag(v, arm - 3, st);
         else ma::enqueue_index_proj_wmma(v, st, arm == 3 ? 2U : 4U, arm == 2);
     };
@@ -338,18 +346,23 @@ void bench_wmma(std::mt19937& rng) {
         hip_ok(hipEventElapsedTime(&ms, e0, e1), "elapsed");
         return 1000.0 * ms / layers;
     };
-    for (int arm = 0; arm < 7; ++arm) launch(arm, 0, 8);  // code objects loaded, not timed
+    for (int arm = 0; arm < 9; ++arm) launch(arm, 0, 8);  // code objects loaded, not timed
     hip_ok(hipStreamSynchronize(st), "sync");
     const double cold_a = timed(0, 4096, 1, false), cold_b = timed(1, 4096, 1, false);
     std::printf("wmma bench cold (first 4096-row call, layer 0) us: slab %.0f wmma-tc4 %.0f\n", cold_a, cold_b);
     // Run 2 (18:25 11-15, column-fast): 4096 rows tc4-rowsfast 4426 vs tc4 1715; tc2 1.21-1.74x of tc4 at 1024..8192.
     // Run 3 (18:47 11-15, gfxclk busy median 2401 MHz): 4096 rows tc4 1705 vs x-cached 599 us, vs 192-VGPR 3366 us.
-    const char* names[7] = {"slab", "wmma-tc4", "wmma-tc4-rowsfast", "wmma-tc2", "diag-xcached", "wmma-tc4-vgpr192", "diag-1colblock"};
-    // "diag" (default): slab|tc4, tc4|x-cached, tc4|one column block; "orders": slab|tc4, rowsfast|tc4, tc4|tc2, tc4|vgpr192
+    // Run 4 (19:05): one column block alone (x read once) 4096 rows 1079 us, 2048 431, 1024 100: x stream ~93-114 GB/s.
+    const char* names[9] = {"slab",           "wmma-tc4",       "wmma-tc4-rowsfast", "wmma-tc2", "diag-xcached", "wmma-tc4-vgpr192",
+                            "diag-1colblock", "wmma-x16(conv+wmma)", "wmma-x16-only"};
+    // "x16" (default): slab|tc4, tc4|x16, tc4|x16-only, slab|x16; "diag": slab|tc4, tc4|x-cached, tc4|one column block;
+    // "orders": slab|tc4, rowsfast|tc4, tc4|tc2, tc4|vgpr192
     const char* series = std::getenv("STRIX_MMATTN_WMMA_SERIES");
-    const bool orders = series != nullptr && std::strcmp(series, "orders") == 0;
-    const std::vector<std::pair<int, int>> pairs = orders ? std::vector<std::pair<int, int>>{{0, 1}, {2, 1}, {1, 3}, {1, 5}}
-                                                          : std::vector<std::pair<int, int>>{{0, 1}, {1, 4}, {1, 6}};
+    const std::string sname = series != nullptr ? series : "x16";
+    const std::vector<std::pair<int, int>> pairs =
+        sname == "orders" ? std::vector<std::pair<int, int>>{{0, 1}, {2, 1}, {1, 3}, {1, 5}}
+        : sname == "diag" ? std::vector<std::pair<int, int>>{{0, 1}, {1, 4}, {1, 6}}
+                          : std::vector<std::pair<int, int>>{{0, 1}, {1, 7}, {1, 8}, {0, 7}};
     for (const auto& [a, b] : pairs)
         for (unsigned rows : {4096U, 1024U, 2048U, 8192U}) {
             const unsigned layers = rows > 2048 ? 12 : 30;
@@ -376,6 +389,7 @@ void bench_wmma(std::mt19937& rng) {
     (void)hipFree(x);
     (void)hipFree(iq);
     (void)hipFree(ik);
+    (void)hipFree(xt);
 }
 
 // slab_only (STRIX_MMATTN_BENCH=slab): only the prefill slab gate.

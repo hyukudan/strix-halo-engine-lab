@@ -50,6 +50,10 @@ void enqueue_index_proj_decode_lds(const IndexProjView& v, hipStream_t stream);
 // every tc gives the same bits. Any rows >= 1; rows * 6144 * 4 < 2^32. CTA order: column blocks fastest (the
 // blocks of one row block share x in L2); rows_fast = true is the measured-slower order, kept for the bench.
 void enqueue_index_proj_wmma(const IndexProjView& v, hipStream_t stream, unsigned tc = 4, bool rows_fast = false);
+// The same bits with x first rounded to FP16 into k-tile-major tiles (xt: rows x 6144 FP16, device; the CTAs then
+// read 16 KB contiguous per stage instead of 128 rows 24 KB apart). convert = false reuses xt as already written
+// (bench: the cost a producer that writes the tiles itself would leave).
+void enqueue_index_proj_wmma_x16(const IndexProjView& v, _Float16* xt, hipStream_t stream, bool convert = true);
 // Diagnostics of the tc 4 kernel (bench only): 1 = x rows taken modulo 128 (x stays in cache; wrong outputs),
 // 2 = the same kernel capped at 192 VGPRs (2 CTAs per CU; same bits as enqueue_index_proj_wmma), 3 = only the first
 // column block (outputs 0..63: x read exactly once, 1/6 of the products).
