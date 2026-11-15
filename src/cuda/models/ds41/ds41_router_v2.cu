@@ -11,6 +11,8 @@
 // (Form 1, an x prefetch one step ahead, measured slower on the PRO (scores 14.2 vs 9.8 us): the
 // loop-carried registers stopped nvcc's 4-step unroll, so every step waited for its own L2 round trip.)
 
+#include "../../core/ptx.cuh"
+#include "../../core/reduce.cuh"
 #include "ds41_cuda_common.cuh"
 
 #include "strix/cuda/ds41_router_v2.hpp"
@@ -25,14 +27,9 @@ using detail::require;
 
 constexpr std::uint32_t kWarpsPerBlock = 2, kMaxExpertsPerLane = 16, kMaxHidden = 8192;
 
-__device__ __forceinline__ void cp_async16(void* dst, const void* src) {
-    const auto d = static_cast<std::uint32_t>(__cvta_generic_to_shared(dst));
-    asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" ::"r"(d), "l"(src) : "memory");
-}
+using ::strix::cuda::core::ptx_mem::cp_async16;
 
-__device__ __forceinline__ bool better(float v, std::uint32_t i, float bv, std::uint32_t bi) {
-    return v > bv || (v == bv && i < bi);
-}
+using ::strix::cuda::core::better;
 
 // router_select_kernel's body for row r (one warp), scores read through L2 (written by other blocks). PRE: this
 // lane's bias values are already in bpre (the values the load below would give)

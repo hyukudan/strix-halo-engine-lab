@@ -4,6 +4,7 @@
 // group quantizer, written so that the FP32 operations run in the reference order (the translation units are built
 // without contraction).
 
+#include "../../core/reduce.cuh"
 #include "strix/cuda/ds41_common.hpp"
 #include "strix/ds41_layer.hpp"
 
@@ -23,11 +24,7 @@ inline void require(bool ok, const char* what) {
 }
 
 // The butterfly v[l] = v[l] + v[l ^ d], d = 16 .. 1 (every lane ends with lane 0's value).
-__device__ __forceinline__ float butterfly(float v) {
-#pragma unroll
-    for (unsigned d = 16U; d; d >>= 1U) v = v + __shfl_xor_sync(full_mask, v, d);
-    return v;
-}
+using ::strix::cuda::core::butterfly;
 
 // Lane dot over n elements (lane l: elements l, l + 32, ... ascending, acc = acc + a * b from 0), then the butterfly.
 template <class A, class B>

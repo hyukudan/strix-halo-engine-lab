@@ -1,6 +1,7 @@
 // deepseek41 CUDA layer core: router (scores, biased top-k, weights) and the Q8_0 shared expert. Bitwise the host
 // reference of ds41_moe.hpp (reference_router, reference_window with one Q8_0 expert).
 
+#include "../../core/reduce.cuh"
 #include "ds41_cuda_common.cuh"
 
 #include "strix/cuda/ds41_core.hpp"
@@ -47,9 +48,7 @@ void launch_router_scores(const RouterView& v, std::uint32_t x_stride, std::uint
         v.x + std::size_t{r0} * x_stride, x_stride, v.weight.data, experts, v.weight.width, v.scores + std::size_t{r0} * experts);
 }
 
-__device__ __forceinline__ bool better(float v, std::uint32_t i, float bv, std::uint32_t bi) {
-    return v > bv || (v == bv && i < bi);
-}
+using ::strix::cuda::core::better;
 
 // One warp per row. Expert e = lane + 32 t. Step k: f = first untaken expert; if its key is NaN it is taken (nothing
 // compares greater), else the largest non-NaN untaken key, lowest id on ties: the sequential reference's choice.

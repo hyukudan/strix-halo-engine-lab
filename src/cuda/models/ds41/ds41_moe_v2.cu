@@ -4,6 +4,7 @@
 // outputs, 32 down outputs per block) so every SM keeps tens of KB in flight. The A8 of the SwiGLU output moves from
 // the gate/up epilogue to the down kernel's prologue (the same a8_group on the same values: the same codes).
 
+#include "../../core/ptx.cuh"
 #include "ds41_moe_device.cuh"
 
 #include <cuda_fp16.h>
@@ -31,10 +32,7 @@ __constant__ int c_v2_mode;  // diagnostics only (0 = the exact kernel)
 __constant__ unsigned long long* c_v3_stamps;  // diagnostics only: [block][8 items][4] clock64, nullptr = off
 bool g_grid_v2 = false;
 
-__device__ __forceinline__ void cp_async16(void* dst, const void* src) {
-    const auto d = static_cast<std::uint32_t>(__cvta_generic_to_shared(dst));
-    asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" ::"r"(d), "l"(src) : "memory");
-}
+using ::strix::cuda::core::ptx_mem::cp_async16;
 __device__ __forceinline__ void cp_async_wait_all() { asm volatile("cp.async.wait_all;\n" ::: "memory"); }
 
 // The block's weight slab: n16 16-byte pieces from src to dst, all issued before any wait.

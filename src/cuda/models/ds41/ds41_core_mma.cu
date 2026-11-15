@@ -10,6 +10,8 @@
 // ascending order; the tree levels d >= U are taken inside the unit, the levels d < U across units (in shared memory
 // for S = 1, through a scratch buffer and a second kernel for S > 1).
 
+#include "../../arch/capability.hpp"
+#include "../../core/ptx.cuh"
 #include "ds41_cuda_common.cuh"
 
 #include "strix/cuda/ds41_core.hpp"
@@ -50,11 +52,7 @@ __global__ void repack_kernel(const std::uint8_t* __restrict__ q8, std::uint32_t
     }
 }
 
-__device__ __forceinline__ void mma_s8(const uint4& a, int b0, int b1, int c[4]) {
-    asm volatile("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%10,%10,%10,%10};"
-                 : "=r"(c[0]), "=r"(c[1]), "=r"(c[2]), "=r"(c[3])
-                 : "r"(a.x), "r"(a.y), "r"(a.z), "r"(a.w), "r"(b0), "r"(b1), "r"(0));
-}
+using ::strix::cuda::core::ptx::mma_s8;
 
 struct MmaArgs {
     const uint4* codes;
@@ -494,15 +492,7 @@ void enqueue_q8_0_a8_tiled(const Q8A8View& v, cudaStream_t stream) {
               v.split_scratch};
     // PDL needs sm_90 (the device's image); elsewhere a normal launch
     // PDL needs compute capability 9.0+: cached per device ordinal, API errors fail closed (no PDL)
-    static int pdl_cap[64] = {};  // 0 unknown, 1 yes, 2 no
-    int dev = -1, major = 0;
-    bool pdl_ok = false;
-    if (v.pdl && cudaGetDevice(&dev) == cudaSuccess && dev >= 0 && dev < 64) {
-        if (pdl_cap[dev] == 0)
-            pdl_cap[dev] = cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev) == cudaSuccess && major >= 9 ? 1 : 2;
-        pdl_ok = pdl_cap[dev] == 1;
-    }
-    a.pdl = v.pdl && pdl_ok;
+    a.pdl = v.pdl && ::strix::cuda::arch::has_pdl();
     a.occ = v.occupancy ? v.occupancy : g_q8_occ;
     require(!v.hc_out || (v.hc_residual && v.hc_mixes && v.hc_hidden == v.count && v.first == 0U && !v.accumulate && v.k_halves <= 2U),
             "tiled Q8_0 x A8: the hc_expand epilogue needs count = hidden, first 0, no accumulate");

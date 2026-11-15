@@ -4,6 +4,7 @@
 // declared butterfly and the A8 epilogue. Compiled with --fmad=false (no contraction of the declared
 // FP32 operations), IEEE division and denormals.
 
+#include "../../core/reduce.cuh"
 #include "strix/cuda/ds41_moe.hpp"
 #include "strix/ds41_moe.hpp"
 
@@ -40,11 +41,7 @@ __device__ __forceinline__ std::uint32_t sign_byte(std::uint32_t index) {
 }
 
 // Butterfly of the declared product: v[l] = v[l] + v[l ^ d], d = 16 .. 1; lane 0 holds the reference result.
-__device__ __forceinline__ float butterfly(float v) {
-#pragma unroll
-    for (int d = 16; d >= 1; d /= 2) v = v + __shfl_xor_sync(kFull, v, d);
-    return v;
-}
+using ::strix::cuda::core::butterfly;
 
 // quantize_a8 of one 32-value group held one value per lane: writes the lane's code, returns (delta, sum) in every
 // lane. max ignores NaN as std::max(amax, |x|) does; NaN values give code -127 as the host's clamps.

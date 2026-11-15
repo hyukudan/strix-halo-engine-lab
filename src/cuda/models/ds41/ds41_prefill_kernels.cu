@@ -3,6 +3,8 @@
 // the bits of the decode kernels. The Engram decode / injection and the router selection are those of
 // ds41_core_io.cu / ds41_core_moe.cu (same code, same order).
 
+#include "../../core/ptx.cuh"
+#include "../../core/reduce.cuh"
 #include "ds41_cuda_common.cuh"
 
 #include "strix/cuda/ds41_prefill_kernels.hpp"
@@ -29,13 +31,9 @@ struct Launch {
     std::uint32_t job_count, rows;
 };
 
-__device__ __forceinline__ void cp_async16(void* dst, const void* src) {
-    const auto d = static_cast<unsigned>(__cvta_generic_to_shared(dst));
-    asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" ::"r"(d), "l"(src));
-}
-__device__ __forceinline__ void cp_async_commit() { asm volatile("cp.async.commit_group;\n" ::); }
-template <int N>
-__device__ __forceinline__ void cp_async_wait() { asm volatile("cp.async.wait_group %0;\n" ::"n"(N)); }
+using ::strix::cuda::core::ptx::cp_async16;
+using ::strix::cuda::core::ptx::cp_async_commit;
+using ::strix::cuda::core::ptx::cp_async_wait;
 
 // Exact conversions of the weight to FP32 (F16 -> F32 is exact; arithmetic NaN results are canonical either way).
 __device__ __forceinline__ float wvalue(std::uint16_t h) { return __half2float(__ushort_as_half(h)); }
@@ -238,9 +236,7 @@ std::size_t align256(std::size_t n) { return (n + 255U) / 256U * 256U; }
 // ---- router selection (ds41_core_moe.cu) ----------------------------------------------------------------------------
 constexpr std::uint32_t kMaxExpertsPerLane = 16;
 
-__device__ __forceinline__ bool better(float v, std::uint32_t i, float bv, std::uint32_t bi) {
-    return v > bv || (v == bv && i < bi);
-}
+using ::strix::cuda::core::better;
 
 // One warp per row. Expert e = lane + 32 t. Step k: f = first untaken expert; if its key is NaN it is taken (nothing
 // compares greater), else the largest non-NaN untaken key, lowest id on ties: the sequential reference's choice.

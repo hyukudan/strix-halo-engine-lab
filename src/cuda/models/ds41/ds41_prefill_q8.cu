@@ -11,6 +11,8 @@
 // codes (512 bytes per 16 outputs, fragment order), the 16 FP16 scales of each tile, 32 activation codes and the delta
 // of each row. float(dot) is formed as (1.5 * 2^23 + dot) - 1.5 * 2^23, exact for |dot| < 2^22 (|dot| <= 32 * 128 * 127).
 
+#include "../../core/ptx.cuh"
+#include "../../core/reduce.cuh"
 #include "ds41_cuda_common.cuh"
 
 #include "strix/cuda/ds41_prefill_q8.hpp"
@@ -21,26 +23,14 @@ namespace {
 
 using detail::require;
 
-__device__ __forceinline__ void cp_async16(void* dst, const void* src) {
-    const auto d = static_cast<unsigned>(__cvta_generic_to_shared(dst));
-    asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" ::"r"(d), "l"(src));
-}
-__device__ __forceinline__ void cp_async4(void* dst, const void* src) {
-    const auto d = static_cast<unsigned>(__cvta_generic_to_shared(dst));
-    asm volatile("cp.async.ca.shared.global [%0], [%1], 4;\n" ::"r"(d), "l"(src));
-}
-__device__ __forceinline__ void cp_async_commit() { asm volatile("cp.async.commit_group;\n" ::); }
-template <int N>
-__device__ __forceinline__ void cp_async_wait() { asm volatile("cp.async.wait_group %0;\n" ::"n"(N)); }
-
-__device__ __forceinline__ void mma_s8(const uint4& a, int b0, int b1, int c[4]) {
-    asm volatile("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%10,%10,%10,%10};"
-                 : "=r"(c[0]), "=r"(c[1]), "=r"(c[2]), "=r"(c[3])
-                 : "r"(a.x), "r"(a.y), "r"(a.z), "r"(a.w), "r"(b0), "r"(b1), "r"(0));
-}
+using ::strix::cuda::core::ptx::cp_async16;
+using ::strix::cuda::core::ptx::cp_async4;
+using ::strix::cuda::core::ptx::cp_async_commit;
+using ::strix::cuda::core::ptx::cp_async_wait;
+using ::strix::cuda::core::ptx::mma_s8;
 
 // float(i), exact for |i| < 2^22.
-__device__ __forceinline__ float dot_float(int i) { return __int_as_float(0x4B400000 + i) - 12582912.0F; }
+using ::strix::cuda::core::dot_float;
 
 // IEEE half to float, exact (subnormal halves through the FP32 multiply by 2^112, denormals kept; Inf / NaN by the
 // exponent mask), on the integer / FMA pipes instead of the conversion unit.

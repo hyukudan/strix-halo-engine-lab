@@ -1,6 +1,7 @@
 // deepseek41 CUDA layer core: RMSNorm (with the hyper-connection collapse and A8 fused), hc mixes with the Sinkhorn
 // split, and the hyper-connection expansion. Bitwise the host reference of ds41_layer.hpp.
 
+#include "../../arch/capability.hpp"
 #include "ds41_cuda_common.cuh"
 
 #include "strix/cuda/ds41_core.hpp"
@@ -370,13 +371,7 @@ void enqueue_hc_mixes_norm(const HcMixView& m, const NormView& n, cudaStream_t s
     launch_hc_partial(m.stream, m.fn, total_n, chunks, m.rows, m.partial, stream);
     const std::uint32_t parts = (n.n + chunk - 1U) / chunk;
     // set_hc_norm_cluster(true) on compute capability 9.0+ (cached per device ordinal; API errors fail closed)
-    static int cap[64] = {};  // 0 unknown, 1 yes, 2 no
-    int dev = -1, major = 0;
-    bool use = false;
-    if (g_hc_cluster && parts <= kClusterParts && cudaGetDevice(&dev) == cudaSuccess && dev >= 0 && dev < 64) {
-        if (cap[dev] == 0) cap[dev] = cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev) == cudaSuccess && major >= 9 ? 1 : 2;
-        use = cap[dev] == 1;
-    }
+    const bool use = g_hc_cluster && parts <= kClusterParts && ::strix::cuda::arch::has_clusters();
     if (use) {
         cudaLaunchConfig_t cfg{};
         cfg.gridDim = dim3(parts, n.rows);

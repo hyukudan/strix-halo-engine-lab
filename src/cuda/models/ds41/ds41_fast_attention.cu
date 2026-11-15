@@ -14,6 +14,7 @@
 //    denominator at the end;
 //  - epilogue: O / l, inverse RoPE of the last 64 dims, FP32 o and / or the A8 rows of o (quantize_a8 per 32 values).
 // Only mma.sync / ldmatrix / cp.async (sm_80+); the shared layout fits the 99 KB opt-in of sm_89 and sm_120.
+#include "../../core/ptx.cuh"
 #include "strix/cuda/ds41_fast_attention.hpp"
 
 #include <cuda_fp16.h>
@@ -52,11 +53,8 @@ static_assert(kFastSmem <= 99U * 1024U);
 // half offset of 16-byte chunk c of row `row` (64 chunks per 512-half row; XOR of the low 3 bits by the row)
 __device__ __forceinline__ unsigned swz(unsigned row, unsigned chunk) { return row * kHeadDim + ((chunk ^ (row & 7U)) << 3U); }
 
-__device__ __forceinline__ unsigned smem_addr(const void* p) { return static_cast<unsigned>(__cvta_generic_to_shared(p)); }
-__device__ __forceinline__ void ldsm_x4(unsigned (&r)[4], const void* p) {
-    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
-                 : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3]) : "r"(smem_addr(p)));
-}
+using ::strix::cuda::core::ptx::smem_addr;
+using ::strix::cuda::core::ptx::ldsm_x4;
 __device__ __forceinline__ void ldsm_x4_t(unsigned (&r)[4], const void* p) {
     asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0,%1,%2,%3}, [%4];\n"
                  : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3]) : "r"(smem_addr(p)));
@@ -67,11 +65,9 @@ __device__ __forceinline__ void mma16816(float (&c)[4], const unsigned (&a)[4], 
                  : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
 }
 // 16 bytes global -> shared, zero-filled past src_bytes (0 or 16)
-__device__ __forceinline__ void cp_async16(void* dst, const void* src, unsigned src_bytes) {
-    asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n" ::"r"(smem_addr(dst)), "l"(src), "r"(src_bytes) : "memory");
-}
-__device__ __forceinline__ void cp_async_commit() { asm volatile("cp.async.commit_group;\n" ::: "memory"); }
-__device__ __forceinline__ void cp_async_wait_all() { asm volatile("cp.async.wait_group 0;\n" ::: "memory"); }
+using ::strix::cuda::core::ptx_mem::cp_async16;
+using ::strix::cuda::core::ptx_mem::cp_async_commit;
+using ::strix::cuda::core::ptx_mem::cp_async_wait_all;
 __device__ __forceinline__ float ex2(float x) {
     float y;
     asm("ex2.approx.ftz.f32 %0, %1;" : "=f"(y) : "f"(x));

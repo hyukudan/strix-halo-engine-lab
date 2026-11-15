@@ -1,5 +1,6 @@
 // deepseek41 CUDA parts-host kernels: resident-expert routes and the seeded combine (cuda_ds41_parts_host.hpp).
 
+#include "../../core/reduce.cuh"
 #include "strix/cuda/ds41_parts_host.hpp"
 
 #include "ds41_resident_routes.cuh"
@@ -16,30 +17,7 @@ constexpr unsigned kFull = 0xffffffffU;
 constexpr int kThreads = 256;
 
 // Block-wide exclusive scan of one value per thread (blockDim.x a multiple of 32, <= 1024); returns the total.
-__device__ std::uint32_t block_exclusive_scan(std::uint32_t& value, std::uint32_t* warp_sums) {
-    const std::uint32_t lane = threadIdx.x & 31U, warp = threadIdx.x / 32U, warps = blockDim.x / 32U;
-    std::uint32_t inclusive = value;
-    for (int d = 1; d < 32; d *= 2) {
-        const std::uint32_t other = __shfl_up_sync(kFull, inclusive, d);
-        if (lane >= static_cast<std::uint32_t>(d)) inclusive += other;
-    }
-    if (lane == 31U) warp_sums[warp] = inclusive;
-    __syncthreads();
-    if (warp == 0U) {
-        std::uint32_t s = lane < warps ? warp_sums[lane] : 0U, inc = s;
-        for (int d = 1; d < 32; d *= 2) {
-            const std::uint32_t other = __shfl_up_sync(kFull, inc, d);
-            if (lane >= static_cast<std::uint32_t>(d)) inc += other;
-        }
-        if (lane < warps) warp_sums[lane] = inc - s;
-        if (lane == 31U) warp_sums[32] = inc;
-    }
-    __syncthreads();
-    value = warp_sums[warp] + inclusive - value;
-    const std::uint32_t total = warp_sums[32];
-    __syncthreads();
-    return total;
-}
+using ::strix::cuda::core::block_exclusive_scan;
 
 __global__ __launch_bounds__(1024) void resident_routes_kernel(ResidentRoutesView v) {
     __shared__ std::uint32_t count[1024];

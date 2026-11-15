@@ -1,6 +1,7 @@
 // deepseek41 routed experts on CUDA: A8, device routes, decode GEMVs (gate/up IQ2_XXS + SwiGLU + A8, down Q2_K),
 // the combine and the layer driver. Declared arithmetic: cuda_ds41_moe.hpp and docs/models/deepseek-v4.1/cuda-numeric-identity.md.
 
+#include "../../core/reduce.cuh"
 #include "ds41_moe_device.cuh"
 
 #include "strix/ds41_formats.hpp"
@@ -29,30 +30,7 @@ void upload_grid() {
 
 // ------------------------------------------------------------------------------------------------------ routes
 // Block-wide exclusive scan of one value per thread (blockDim.x a multiple of 32, <= 1024); returns the total.
-__device__ std::uint32_t block_exclusive_scan(std::uint32_t& value, std::uint32_t* warp_sums) {
-    const std::uint32_t lane = threadIdx.x & 31U, warp = threadIdx.x / 32U, warps = blockDim.x / 32U;
-    std::uint32_t inclusive = value;
-    for (int d = 1; d < 32; d *= 2) {
-        const std::uint32_t other = __shfl_up_sync(kFull, inclusive, d);
-        if (lane >= static_cast<std::uint32_t>(d)) inclusive += other;
-    }
-    if (lane == 31U) warp_sums[warp] = inclusive;
-    __syncthreads();
-    if (warp == 0U) {
-        std::uint32_t s = lane < warps ? warp_sums[lane] : 0U, inc = s;
-        for (int d = 1; d < 32; d *= 2) {
-            const std::uint32_t other = __shfl_up_sync(kFull, inc, d);
-            if (lane >= static_cast<std::uint32_t>(d)) inc += other;
-        }
-        if (lane < warps) warp_sums[lane] = inc - s;
-        if (lane == 31U) warp_sums[32] = inc;
-    }
-    __syncthreads();
-    value = warp_sums[warp] + inclusive - value;
-    const std::uint32_t total = warp_sums[32];
-    __syncthreads();
-    return total;
-}
+using ::strix::cuda::core::block_exclusive_scan;
 
 struct RouteArgs {
     const std::uint32_t* ids;

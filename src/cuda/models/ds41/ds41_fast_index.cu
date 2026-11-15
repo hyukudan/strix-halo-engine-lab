@@ -10,6 +10,7 @@
 //    (positions x heads, 128 values = 4 k steps), relu and the weighted head sum in registers.
 // A block of 8 warps covers 16 rows (2 per warp, the query fragments held in registers) and a range of positions in
 // tiles of 64 (cp.async into two swizzled buffers). FP8 mma needs sm_89 or later.
+#include "../../core/ptx.cuh"
 #include "strix/cuda/ds41_fast_attention.hpp"
 
 #include <cuda_fp8.h>
@@ -31,16 +32,11 @@ struct FastQPrep {
 };
 static_assert(sizeof(FastQPrep) == kFastIdxPrepBytes);
 
-__device__ __forceinline__ unsigned smem_addr(const void* p) { return static_cast<unsigned>(__cvta_generic_to_shared(p)); }
-__device__ __forceinline__ void cp_async16(void* dst, const void* src, unsigned src_bytes) {
-    asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n" ::"r"(smem_addr(dst)), "l"(src), "r"(src_bytes) : "memory");
-}
-__device__ __forceinline__ void cp_async_commit() { asm volatile("cp.async.commit_group;\n" ::: "memory"); }
-__device__ __forceinline__ void cp_async_wait_all() { asm volatile("cp.async.wait_group 0;\n" ::: "memory"); }
-__device__ __forceinline__ void ldsm_x4(unsigned (&r)[4], const void* p) {
-    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
-                 : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3]) : "r"(smem_addr(p)));
-}
+using ::strix::cuda::core::ptx::smem_addr;
+using ::strix::cuda::core::ptx_mem::cp_async16;
+using ::strix::cuda::core::ptx_mem::cp_async_commit;
+using ::strix::cuda::core::ptx_mem::cp_async_wait_all;
+using ::strix::cuda::core::ptx::ldsm_x4;
 __device__ __forceinline__ void mma_e4m3(float (&c)[4], const unsigned (&a)[4], unsigned b0, unsigned b1) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 890
     asm volatile("mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
