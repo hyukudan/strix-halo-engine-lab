@@ -368,6 +368,7 @@ public:
     static constexpr std::uint32_t kSoloRouteClass = 0x80000000U;  // a class no other prompt shares (stays solo)
     // The dense route of every projection site (both ranks, every layer) of a fresh solo run of `rows` rows: the shared
     // descriptor of the group pass and the bounded decoder replay (strix/ds41_dense_plan.hpp).
+    // Throws std::invalid_argument when rows exceeds a nonzero chunk_rows; multi-chunk runs are not represented.
     [[nodiscard]] prefill_plan::DensePlan dense_plan(std::uint32_t rows) const;
     [[nodiscard]] serve::PrefillGroupCapacity group_capacity() const noexcept;
     // Why options keep every prompt solo (nullptr: a group pass is supported). The FAST levers group (GRPFAST): flash

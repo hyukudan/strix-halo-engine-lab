@@ -16,7 +16,7 @@ namespace strix::ds41 {
 
 enum DenseSiteKind : std::uint32_t { kDenseQa = 0, kDenseKv, kDenseQb, kDenseOa, kDenseOb, kDenseSites };
 
-inline constexpr std::uint32_t kGroupContractVersion = 2;  // 1: exact only (PR #591); 2: + FAST levers per member route
+inline constexpr std::uint32_t kGroupContractVersion = 3;  // 3: canonical dense-plan fingerprint in the rank handshake
 // The group FAST identity fixture (each member of a FAST group == its solo FAST run, logits and state, both ranks) passed
 // on both nodes: FAST serving groups by default (serve::qualify_fast). false: FAST groups only with STRIX_SERVE_PREFILL_GROUP=auto.
 inline constexpr bool kGroupFastQualified = true;  // 11-15: identity fixture PASS (6 arms, both ranks), C8 +2.8 %
@@ -46,9 +46,14 @@ struct DenseRunGeometry {
     return n;
 }
 
-// rules: [rank][site] (world x kDenseSites). Chunked sites (q_b, o_a, o_b) record their first chunk's call: a plan
-// describes every call of the run only when !dense_multi_chunk(g) (a group member is always one chunk).
+[[nodiscard]] inline bool dense_multi_chunk(const DenseRunGeometry& g) noexcept {
+    return g.chunk_rows != 0U && g.rows > g.chunk_rows;
+}
+
+// rules: [rank][site] (world x kDenseSites). Only single-chunk runs are represented; reject larger runs rather than
+// returning an incomplete descriptor. This conservative bound also applies to split/cone runs.
 [[nodiscard]] inline prefill_plan::DensePlan plan_dense(const DenseRunGeometry& g, std::span<const prefill_plan::DenseRule> rules) {
+    if (dense_multi_chunk(g)) throw std::invalid_argument("plan_dense: multi-chunk runs are not represented");
     const std::uint32_t ranks = std::max(g.world, 1U);
     if (rules.size() != std::size_t{ranks} * kDenseSites) throw std::invalid_argument("plan_dense: rules are [rank][site]");
     if (!g.cone.empty() && g.cone.size() < g.layers) throw std::invalid_argument("plan_dense: cone rows per layer");
@@ -64,10 +69,6 @@ struct DenseRunGeometry {
             for (std::uint32_t s = 0; s < kDenseSites; ++s) p.at(r, l, s) = prefill_plan::make_site(rules[std::size_t{r} * kDenseSites + s], rows[s]);
         }
     return p;
-}
-
-[[nodiscard]] inline bool dense_multi_chunk(const DenseRunGeometry& g) noexcept {
-    return g.chunk_rows != 0U && g.rows > g.chunk_rows;
 }
 
 }  // namespace strix::ds41

@@ -49,6 +49,11 @@ bool mismatch_of(std::initializer_list<const pp::DensePlan*> members, std::uint3
     return mismatch;
 }
 void dense_plan_tests() {
+    bool multi_chunk_rejected = false;
+    try { (void)plan(4097U, true); }
+    catch (const std::invalid_argument&) { multi_chunk_rejected = true; }
+    check(multi_chunk_rejected, "multi-chunk plan must not expose only its first chunk");
+    check(plan(4096U, true).at(0, 0, d4::kDenseQb).rows == 4096U, "single chunk boundary admitted");
     // the spec's counterexample: two 80-row members (TP form) keep the exact dense kernels although they sum to 160 rows
     const auto a80 = plan(80U, true), b80 = plan(80U, true), s160 = plan(160U, true);
     check(a80.at(0, 0, d4::kDenseQa).route == pp::DenseRoute::dense_exact, "80 rows: q_a exact under FAST");
@@ -101,6 +106,23 @@ void dense_plan_tests() {
     pp::DenseClassTable t;
     check(t.intern(pp::signature(a80)) == 0U && t.intern(pp::signature(c200)) == 1U && t.intern(pp::signature(plan(64U, true))) == 0U,
           "class table interns exact signatures");
+    pp::DenseClassTable other_table;
+    check(other_table.intern(pp::signature(c200)) == 0U, "independent tables alias ordinal zero for different plans");
+    const auto hash = [](const pp::DensePlan& p) { return pp::fingerprint(std::span(&p, 1U)); };
+    check(hash(a80) != hash(c200), "canonical fingerprint detects aliased ordinals with different effective routes");
+    check(hash(a80) == hash(plan(64U, true)), "same arithmetic fingerprint despite different row counts");
+    check(hash(a80) != hash(e80), "fingerprint includes K parts");
+    auto changed = a80;
+    changed.at(0, 0, d4::kDenseQa).k_offset += 32U;
+    check(hash(a80) != hash(changed), "fingerprint includes K offset");
+    changed = a80;
+    changed.at(0, 0, d4::kDenseQa).k += 32U;
+    check(hash(a80) != hash(changed), "fingerprint includes K width");
+    changed = a80;
+    changed.at(0, 0, d4::kDenseQa).accumulate = true;
+    check(hash(a80) != hash(changed), "fingerprint includes accumulation policy");
+    check(pp::fingerprint(std::vector{a80, c200}) != pp::fingerprint(std::vector{c200, a80}),
+          "fingerprint includes every member in order");
     (void)none;
 }
 void qualification_tests() {

@@ -498,7 +498,8 @@ struct DevicePrefill::Impl {
     // ---- the route plan of a fresh solo run (strix/ds41_dense_plan.hpp), shared by the group pass and the bounded replay ----
     // The selectors as run_from applies them on a fresh solo run of `rows` rows: q_a / kv take the dense entry when
     // dense_q_a / dense_kv (any rows), q_b / o_a from dense_min_rows rows (dense_q_b / dense_o_a), o_b always; inside it the
-    // FAST form (options.fast_dense, the layer's switch set with it) from STRIX_DS41_FAST_DENSE_MIN_ROWS rows. fast_supported
+    // FAST form (options.fast_dense, installed by run_from's execution precision scope for solo and group dispatch)
+    // from STRIX_DS41_FAST_DENSE_MIN_ROWS rows. fast_supported
     // stays true: q8a8::supported does not depend on rows, so where a member's route is dense_fast the group's selector over
     // the summed rows decides as the member's did; claiming support can only split a group, never pin a member away from its
     // solo form. The FP16 backend (fp16_dense) is not planned: a group pass declines it.
@@ -547,6 +548,7 @@ struct DevicePrefill::Impl {
         dense_class.assign(group.empty() ? 0U : std::size_t{options.group_rows} + 1U, DevicePrefill::kSoloRouteClass);
         prefill_plan::DenseClassTable table;
         for (std::uint32_t rows = 1; rows < dense_class.size(); ++rows) {
+            if (options.chunk_rows != 0U && rows > options.chunk_rows) continue;  // no complete plan: solo only
             const auto id = table.intern(prefill_plan::signature(dense_plan(rows)));
             if (id < 256U) dense_class[rows] = id << 8;
         }
@@ -4154,17 +4156,20 @@ std::vector<PrefillResult> DevicePrefill::run_group(std::span<const PrefillSegme
                 plan.dense[std::size_t{l} * ds41::kDenseSites + site] = prefill_plan::common_route(ptr, o.rank, l, site, mismatch);
         if (mismatch) throw std::logic_error("deepseek41 prefill: run_group: member-dense-dispatch-mismatch (equal classes, different routes)");
     }
-    if (m.distributed()) {  // both ranks: the same contract, members and route class before the first collective of the layers
+    if (m.distributed()) {  // both ranks: the same contract, members and canonical plans before the first layer collective
         std::uint32_t rows_fnv = 2166136261U;
         for (const auto r : plan.seg_rows) rows_fnv = (rows_fnv ^ r) * 16777619U;
-        const std::array<std::uint32_t, 8> mine{ds41::kGroupContractVersion, n, cls, rows_fnv, m.options.fast_dense ? 1U : 0U,
+        const auto dense_fingerprint = prefill_plan::fingerprint(member_plans);
+        const std::array<std::uint32_t, 10> mine{ds41::kGroupContractVersion, n, cls & 0xFFU, rows_fnv, m.options.fast_dense ? 1U : 0U,
                                                 m.options.fast_moe ? 1U : 0U,
                                                 m.options.fast_attention ? (m.options.fast_attention_flash ? 2U : 1U) : 0U,
-                                                m.options.bf16_attention ? 1U : 0U};
-        std::array<std::uint32_t, 8> other{};
+                                                m.options.bf16_attention ? 1U : 0U,
+                                                static_cast<std::uint32_t>(dense_fingerprint),
+                                                static_cast<std::uint32_t>(dense_fingerprint >> 32)};
+        std::array<std::uint32_t, 10> other{};
         m.options.communicator->exchange_host(std::as_bytes(std::span(mine)), std::as_writable_bytes(std::span(other)),
                                               dist::Tag{static_cast<std::uint32_t>(dist::TagKind::control), 0x67727031U, n});
-        if (other != mine) throw std::runtime_error("deepseek41 prefill: run_group: the ranks disagree on the group contract / members / route class");
+        if (other != mine) throw std::runtime_error("deepseek41 prefill: run_group: the ranks disagree on the group contract / members / dense plans");
     }
     m.defer_next = 0;  // exact levers off in a group pass: decoder deferral, Engram lookahead (snapshot points refused above)
     m.engram_next.clear();

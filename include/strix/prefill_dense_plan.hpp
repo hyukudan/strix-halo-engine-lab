@@ -100,6 +100,21 @@ struct DensePlan {
     return out;
 }
 
+// Canonical cross-owner/rank identity of ordered member plans, independent of local class-table ordinals.
+// FNV-1a over explicitly ordered bytes of the arithmetic signatures (not native object representations).
+[[nodiscard]] inline std::uint64_t fingerprint(std::span<const DensePlan> plans) {
+    std::uint64_t h = 14695981039346656037ULL;
+    const auto word = [&h](std::uint32_t v) {
+        for (unsigned shift = 0; shift < 32U; shift += 8U) h = (h ^ ((v >> shift) & 0xFFU)) * 1099511628211ULL;
+    };
+    const auto count = static_cast<std::uint64_t>(plans.size());
+    word(static_cast<std::uint32_t>(count));
+    word(static_cast<std::uint32_t>(count >> 32));
+    for (const auto& p : plans)
+        for (const auto v : signature(p)) word(v);
+    return h;
+}
+
 // The common route of the members at (rank, layer, site): `none` when no member runs it. `mismatch` is set when two
 // members that both run the site took different routes or K splits (they cannot share one call of that site).
 [[nodiscard]] inline DenseRoute common_route(std::span<const DensePlan* const> members, std::uint32_t rank, std::uint32_t layer,
