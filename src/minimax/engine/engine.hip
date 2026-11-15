@@ -11,6 +11,7 @@
 // post-exchange (h += p0 + p1, post-attention norm, router top-4) -> dense MLP or shared + routed experts (ascending
 // expert id per token, batch invariant) -> exchange X2 + fused post-exchange (next input norm / final norm).
 // Linears: strix_gemm for prefill / gate calls, strix_gemv for decode steps (<= 8 rows).
+#include "strix/prefill_headless.hpp"
 #include "strix/minimax/engine.hpp"
 #include "strix/dist/communicator.hpp"
 #include "strix/pair/prefill_group.hpp"
@@ -675,6 +676,11 @@ struct Engine::Impl {
     unsigned pf_msa_flash = 0;
     std::string pf_msa_flash_asked = "default";  // receipt: "default", the explicit value or "fast_prefill"
     strix::core::LayerSet pf_msa_flash_layers;  // STRIX_MM_PF_MSA_FLASH_LAYERS: layers that use it (unset: defaults::kMsaFlashLayers)
+    // STRIX_MM_PF_HEADLESS (default ON, exact): the last layer of a headless chunk runs cache-only (strix/prefill_headless.hpp):
+    // q/k/v + index projections and the cache prep unchanged, no attention / o_proj / exchanges / FFN for that chunk.
+    bool pf_headless = true;
+    bool pf_headless_logged = false;
+    std::uint64_t pf_headless_chunks = 0;  // chunks that ran their last layer cache-only
     bool pf_msa_batch = true;  // STRIX_MM_PF_MSA_BATCH (default ON, exact measurement): independent scratch per prefill window
     unsigned pf_msa_windows = 0;
     float *pf_scores = nullptr, *pf_partial = nullptr;
@@ -882,6 +888,7 @@ struct Engine::Impl {
         }
         pf_attend4 = env_flag("STRIX_MM_PF_ATTEND4", true);
         pf_msa_batch = env_flag("STRIX_MM_PF_MSA_BATCH", true);
+        pf_headless = env_flag("STRIX_MM_PF_HEADLESS", true);
         if (const char* value = std::getenv("STRIX_MM_PF_IDX_CONC")) {
             const std::string mode(value);
             if (mode != "0" && mode != "1" && mode != "2")
@@ -1936,8 +1943,12 @@ struct Engine::Impl {
     }
 
     // Layer L up to the attention partial: q/k/v + index projections, MSA, o_proj -> out (n rows; h / hn: the rows').
-    void stage_attn(unsigned L, std::size_t n, std::span<const Row> rows, std::uint32_t slot, std::uint64_t pos0, float* out) {
+    // cache_only (headless chunk, prefill_group): returns true when the batched prefill stage ran its cache prep only
+    // (no attention output, no o_proj: `out` is not written); any other route runs the full stage and returns false.
+    bool stage_attn(unsigned L, std::size_t n, std::span<const Row> rows, std::uint32_t slot, std::uint64_t pos0, float* out,
+                    bool cache_only = false) {
         if (tl) tl->context(task.c + pf_idx_member, L);
+        bool did_cache_only = false;
         {
             const bool f32 = fp32_prefill && !gemv;  // FP32 prefill identity
             const Layer& y = layers[L];
@@ -2072,7 +2083,13 @@ struct Engine::Impl {
                         dv.idx_count = pf_cnt;
                         dv.partial = pf_partial;
                         dv.ticket = pf_ticket;
-                        mfused::enqueue_prefill({dv, static_cast<std::uint32_t>(n), pos0, pf_msa_windows, 0, pf_idx_tile && n > 8, pf_idx_rows, n > 8 ? (pf_msa_flash != 0 && pf_msa_rework != 0 && pf_msa_flash_layers.test(L) ? 10U + pf_msa_flash : pf_msa_rework) : 0U}, nullptr, tl ? PrefillTimeline::msa_mark : nullptr, tl);
+                        const mfused::PrefillView pfv{dv, static_cast<std::uint32_t>(n), pos0, pf_msa_windows, 0, pf_idx_tile && n > 8, pf_idx_rows, n > 8 ? (pf_msa_flash != 0 && pf_msa_rework != 0 && pf_msa_flash_layers.test(L) ? 10U + pf_msa_flash : pf_msa_rework) : 0U};
+                        if (cache_only) {
+                            mfused::enqueue_prefill_cache_only(pfv, nullptr, tl ? PrefillTimeline::msa_mark : nullptr, tl);
+                            did_cache_only = true;
+                        } else {
+                            mfused::enqueue_prefill(pfv, nullptr, tl ? PrefillTimeline::msa_mark : nullptr, tl);
+                        }
                         break;
                     }
                     mfused::enqueue_decode(dv, nullptr);
@@ -2156,6 +2173,7 @@ struct Engine::Impl {
             if (tl && !traced_batch) tl->mark("msa", false);
             lap(prof.msa);
             tmark(tmark_at(L, 1));
+            if (did_cache_only) return true;  // headless chunk: nothing reads its attention output
             if (tl) tl->mark("o-projection", true);
             if (f32) {
                 f32_linear(y.ro, attn, kQLocal, out, kHidden, n);
@@ -2176,6 +2194,7 @@ struct Engine::Impl {
             lap(prof.o_proj);
             tmark(tmark_at(L, 2));
         }
+        return false;
     }
 
     // Layer L's FFN on hn (after the attention exchange): dense MLP or router-routed experts + shared -> out.
@@ -2836,9 +2855,17 @@ struct Engine::Impl {
         const bool pf_stats = task.open;
         if (i4_on) jit_begin();
         else if (pf_stats) jit_collect();
+        std::size_t last_skip0 = 0;  // headless chunks of the last layer (their final post is not run)
         for (unsigned L = L0; L < L1; ++L) {
             const Layer& y = layers[L];
             if (tl) tl->context(task.c, L);
+            // Headless chunks (strix/prefill_headless.hpp): at the last layer every chunk but the last runs cache-only;
+            // skip0 = the leading chunks that did, whose exchanges, post, router, FFN and final post are not run (both
+            // ranks decide from the same inputs). Rows of other chunks are observed with taps or output digests.
+            const unsigned headless = pf_headless ? strix::prefill_headless::headless_chunks(L, kLayers, static_cast<unsigned>(m),
+                                                                                              L1 == kLayers, taps_on || check_prompt_outputs)
+                                                  : 0U;
+            std::size_t skip0 = 0;
             for (std::size_t c = 0; c < m; ++c) {
                 use(c);
                 if (L > L0) {
@@ -2849,8 +2876,20 @@ struct Engine::Impl {
                     if (tl) tl->mark("ffn-post", false);
                 }  // L0 > 0: done at the pause
                 float* o = out_of(c);
-                stage_attn(L, N[c], {}, slot, pos0 + c * opt.max_rows, o);
+                if (stage_attn(L, N[c], {}, slot, pos0 + c * opt.max_rows, o, c < headless)) {
+                    if (skip0 != c) throw std::logic_error("prefill_group: headless chunks must lead the unit");
+                    skip0 = c + 1;
+                    ++pf_headless_chunks;
+                    continue;
+                }
                 send(c, 0, L, o);
+            }
+            last_skip0 = skip0;
+            if (skip0 != 0 && !pf_headless_logged) {
+                pf_headless_logged = true;
+                std::fprintf(stderr, "strix-minimax: prefill headless chunks: last layer cache-only for %zu of %zu chunks (STRIX_MM_PF_HEADLESS=0 runs them full)
+",
+                             skip0, m);
             }
             const auto* i4 = i4_on && i4_jit_layer(L) ? jit_acquire(L, L1) : nullptr;
             const strix::route::LayerScope route_layer(gemv || L < kFirstMoe ? ~0U : L, route_i4_reason(L, i4 != nullptr));
@@ -2864,7 +2903,7 @@ struct Engine::Impl {
             };
             const std::size_t moe_w = pf_moe_width(L, i4 != nullptr, m);
             if (i4 == nullptr && pf_stats && y.moe) jit_moe_begin(L);  // EXL3 timing does not depend on the row gate
-            for (std::size_t c0 = 0; c0 < m;) {
+            for (std::size_t c0 = skip0; c0 < m;) {
                 // A sub-group runs as one group-wide MoE call when every member writes its own output buffer (the
                 // module's TX slots in place, or the communicator's per-member partials) and has the rows the
                 // group-wide plan needs; any other span keeps one call per chunk.
@@ -2911,7 +2950,7 @@ struct Engine::Impl {
             }
             if (i4 != nullptr) jit_release(L); else jit_moe_end(L);
         }
-        for (std::size_t c = 0; c < m; ++c) {
+        for (std::size_t c = L1 == kLayers ? last_skip0 : 0; c < m; ++c) {
             use(c);
             const auto view = recv(c);
             if (tl) tl->mark("ffn-post", true);
