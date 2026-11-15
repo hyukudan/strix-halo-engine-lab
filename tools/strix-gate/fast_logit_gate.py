@@ -132,16 +132,15 @@ def execution_witness(doc):
 
 
 def config_difference(ref, cand):
-    """First lever or switch, outside the FAST layer set's own, where two witnessed configurations disagree: levers must
-    match exactly; switches are compared where both runs consulted them (a receipt lists only the switches its code path
-    read before it was printed, so a flash run lists more than an exact one). None = they agree."""
+    """First difference outside the FAST allowlist. Receipts omit defaulted switches, so a missing entry cannot prove
+    equivalence to an explicit value: refuse one-sided entries too. None = the witnessed maps agree."""
     lr, lc = ({k: v for k, v in c["levers"].items() if k not in MM_FAST_LEVERS} for c in (ref, cand))
     if lr != lc:
         return "lever " + next(k for k in sorted(set(lr) | set(lc)) if lr.get(k) != lc.get(k))
     sr, sc = ref["switches"], cand["switches"]
-    for k in sorted(set(sr) & set(sc) - MM_FAST_SWITCHES):
-        if sr[k] != sc[k]:
-            return f"switch {k}={sr[k]!r} vs {sc[k]!r}"
+    for k in sorted((set(sr) | set(sc)) - MM_FAST_SWITCHES):
+        if sr.get(k) != sc.get(k):
+            return f"switch {k}={sr.get(k)!r} vs {sc.get(k)!r}"
     return None
 
 
@@ -245,13 +244,15 @@ def copy_rows(tokens, rows, k=MM_FLOOR["copy_k"]):
     total = len(t)
     first = total - rows
     mask = np.zeros(max(0, total - 1 - first), dtype=bool)
-    last = {}
+    # Only scored history keys need tracking; a long prompt must not grow this map beyond the scored tail.
+    last = {t[p - k + 1:p + 1].tobytes(): None for p in range(max(k - 1, first), total - 1)}
     for p in range(k - 1, total - 1):
         key = t[p - k + 1:p + 1].tobytes()
         if p >= first:
             q = last.get(key)
             mask[p - first] = q is not None and t[q + 1] == t[p + 1]
-        last[key] = p
+        if key in last:
+            last[key] = p
     return mask
 
 
@@ -455,7 +456,7 @@ MM_OUTPUT_SWITCHES = frozenset({"STRIX_MM_QUALITY_OUT", "STRIX_MM_QUALITY_ROWS",
 # The FAST layer set's own lever and switches: ignored by config_difference (candidate == reference + this layer set).
 MM_FAST_SWITCHES = frozenset({"STRIX_MM_PF_MSA_FLASH", "STRIX_MM_PF_MSA_FLASH_LAYERS", "STRIX_MM_FAST_PREFILL"})
 MM_FAST_LEVERS = frozenset({"minimax.msa_flash"})
-MM_DIAG = re.compile(rb"^DIAG attn ulp: layer (\d+) seed (\d+) rows (\d+) pos0 (\d+) values (\d+)\s*$", re.M)
+MM_DIAG = re.compile(rb'DIAG attn ulp: layer (\d+) seed (\d+) rows (\d+) pos0 (\d+) values (\d+) prompt ("(?:[^"\\]|\\.)*")\s*')
 
 
 def canonical_sha(obj):
@@ -463,9 +464,7 @@ def canonical_sha(obj):
 
 
 def model_bundle_sha256(root):
-    """Identity of the ordered model asset bundle without re-reading tensor payloads: every regular file (sorted relative
-    path) with its size and a digest: safetensors -> sha256 of the 8-byte length + JSON header; files <= 64 MiB -> full
-    sha256; larger files -> sha256 of the first and last MiB."""
+    """Identity of every model asset: sorted relative path, size and complete content digest (including tensor payloads)."""
     root = pathlib.Path(root)
     if not root.is_dir():
         raise GateError(f"witness: no model directory {root}")
@@ -477,30 +476,19 @@ def model_bundle_sha256(root):
             if not p.is_file():
                 continue
             size = p.stat().st_size
-            h = hashlib.sha256()
-            with open(p, "rb") as fh:
-                if f.endswith(".safetensors"):
+            if f.endswith(".safetensors"):
+                with open(p, "rb") as fh:
                     head = fh.read(8)
                     n = int.from_bytes(head, "little") if len(head) == 8 else -1
                     if n <= 0 or n > (256 << 20) or 8 + n > size:
                         raise GateError(f"witness: {p} has no safetensors header")
-                    h.update(head + fh.read(n))
-                    kind = "safetensors-header"
-                elif size <= (64 << 20):
-                    h.update(fh.read())
-                    kind = "full"
-                else:
-                    h.update(fh.read(1 << 20))
-                    fh.seek(size - (1 << 20))
-                    h.update(fh.read(1 << 20))
-                    kind = "ends"
-            entries.append([p.relative_to(root).as_posix(), size, kind, h.hexdigest()])
+            entries.append([p.relative_to(root).as_posix(), size, "full", sha256_file(p)])
     if not entries:
         raise GateError(f"witness: empty model directory {root}")
     return canonical_sha({"files": entries})
 
 
-def minimax_execution(log, rank, n_prompts):
+def minimax_execution(log, rank, prompts):
     """MiniMax adapter: engine / profile / configuration identities from the rank's process route receipt, the control
     from the null-control log lines ("DIAG attn ulp: layer L seed S ..."; none = no control)."""
     receipts = []
@@ -538,14 +526,31 @@ def minimax_execution(log, rank, n_prompts):
         fast = {"policy": "msa-flash", "msa_flash_mode": 10 + int(m.group(1)), "layers": layers}
     plain = levers["minimax.moe_prefill_format"] == "exl3" and levers["minimax.prefill_identity"] == "default"
     profile = ("fast-prefill" if fast else "exact") if plain else "other"
-    diag = MM_DIAG.findall(log)
+    diag, covered = [], set()
+    for line in log.splitlines():
+        if not line.startswith(b"DIAG attn ulp:"):
+            continue
+        event = MM_DIAG.fullmatch(line)
+        if event is None:
+            raise GateError("witness: null-control event lacks a prompt identity or is malformed")
+        try:
+            prompt = json.loads(event[6])
+        except (ValueError, UnicodeError) as e:
+            raise GateError("witness: invalid null-control prompt identity") from e
+        layer, seed, rows, pos0, values = map(int, event.groups()[:5])
+        if prompt not in prompts:
+            raise GateError(f"witness: null-control event names unsealed prompt {prompt!r}")
+        if rows == 0 or values == 0 or pos0 + rows > prompts[prompt]["tokens"]:
+            raise GateError(f"witness: empty or out-of-range null-control event for {prompt!r}")
+        covered.add(prompt)
+        diag.append((layer, seed))
     control = None
     if diag:
         layer_set, seed_set = {int(x[0]) for x in diag}, {int(x[1]) for x in diag}
         if len(layer_set) != 1 or len(seed_set) != 1:
             raise GateError(f"witness: the null control fired at layers {sorted(layer_set)} with seeds {sorted(seed_set)}")
-        if len(diag) < n_prompts:
-            raise GateError(f"witness: {len(diag)} null-control events for {n_prompts} prompts")
+        if covered != set(prompts):
+            raise GateError(f"witness: null-control events missing for prompts {sorted(set(prompts) - covered)}")
         control = {"kind": MM_NULL_KIND, "layer": layer_set.pop(), "magnitude": 1, "unit": "ulp", "seed": seed_set.pop()}
     return {"engine": "minimax", "profile": profile, "fast": fast, "control": control,
             "numerical_config_sha256": canonical_sha({"engine": "minimax", "levers": levers, "switches": sw}),
@@ -569,7 +574,7 @@ def witness(a):
     prompts = dump_entries(a, parse_pairs(a.attest, "--attest"))
     w = {"schema": WITNESS_SCHEMA, "run_id": a.run_id, "rank": a.rank, "binary_sha256": sha256_file(binary),
          "model_sha256": model_bundle_sha256(a.model), "prompts": prompts,
-         **WITNESS_ADAPTERS[a.engine](log, a.rank, len(prompts))}
+          **WITNESS_ADAPTERS[a.engine](log, a.rank, prompts)}
     execution_witness({"execution": w, "run_id": a.run_id, "rank": a.rank, "binary": {"sha256": w["binary_sha256"]},
                        "prompts": prompts})
     tmp = out.with_suffix(".tmp")
@@ -748,7 +753,9 @@ def compare(a):
         for m in ma + mb + [m for _, mn in nulls for m in mn]:
             if m["prompts"][name]["tokens_sha256"] != tok_sha:
                 raise GateError(f"{name}: a sealed run used a different token file than --tokens")
-        tok = tok_of[name] = np.fromfile(tokens[name], "<u4").astype(np.int64)
+        tok = np.fromfile(tokens[name], "<u4").astype(np.int64)
+        if nulls:
+            tok_of[name] = tok
         r = compare_logits(da, ma, db, mb, name, tok)
         results.append(r)
         copy_masks.append(copy_rows(tok, r["rows"]))

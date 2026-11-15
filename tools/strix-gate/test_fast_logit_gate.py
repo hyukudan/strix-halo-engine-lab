@@ -354,23 +354,26 @@ class MiniMaxFloor(unittest.TestCase):
                           {"name": "minimax.prefill_identity", "requested": "default", "effective": "default", "reason": "selected"}],
                "switches": {"set": {"STRIX_MM_PF_MSA_FLASH": "0" if fast is None else str(fast[0] - 10), "STRIX_X": extra,
                                     "STRIX_MM_QUALITY_OUT": f"/runs/{rank}-{fast}-{extra}-{self.rng.integers(1 << 30)}/q"}}}
-        if fast is not None:  # like the engine: the flash path consults (and lists) more switches than the exact one
-            doc["switches"]["set"].update({"STRIX_MM_PF_MSA_FLASH_LAYERS": f"{fast[1]}-59", "STRIX_MMX_MOE_WIDE": "2"})
+        if fast is not None:
+            doc["switches"]["set"]["STRIX_MM_PF_MSA_FLASH_LAYERS"] = f"{fast[1]}-59"
         return "strix-route-receipt " + json.dumps(doc)
 
-    def mm_arm(self, name, logits, fast=None, control=None, extra="b", log=None):
+    def mm_arm(self, name, logits, fast=None, control=None, extra="b", log=None, prompts=("p",)):
         """Dumps for two ranks, an engine log per rank, then `witness` and `seal` exactly as a launcher would."""
         d = self.root / name
         d.mkdir()
         rcs = []
         for rank, (lo, hi) in enumerate(((0, MW[0]), (MW[0], sum(MW)))):
-            logits[:, lo:hi].astype("<f4").tofile(d / f"q-p-tf-r{rank}.f32")
+            for prompt in prompts:
+                logits[:, lo:hi].astype("<f4").tofile(d / f"q-{prompt}-tf-r{rank}.f32")
             lines = ["mm rank: load", self.receipt(rank, fast, extra)]
             if control is not None:
-                lines += [f"DIAG attn ulp: layer {control[0]} seed {control[1]} rows 64 pos0 {p} values 99" for p in (0, 64)]
+                lines += [f"DIAG attn ulp: layer {control[0]} seed {control[1]} rows {min(64, MT - p)} pos0 {p} values 99"
+                          f" prompt {json.dumps(prompt)}" for prompt in prompts for p in (0, 64)]
             (d / f"r{rank}.log").write_text("\n".join(log(rank) if log else lines) + "\n", encoding="utf-8")
-            common = ["--dir", str(d), "--rank", str(rank), "--run-id", name, "--binary", str(self.binary), "--rows", str(MR),
-                      "--prompt", f"p={self.tok}"]
+            common = ["--dir", str(d), "--rank", str(rank), "--run-id", name, "--binary", str(self.binary), "--rows", str(MR)]
+            for prompt in prompts:
+                common += ["--prompt", f"{prompt}={self.tok}"]
             rc = run(["witness", *common, "--engine", "minimax", "--engine-log", str(d / f"r{rank}.log"), "--model",
                       str(self.model), "--out", str(d / f"execution-r{rank}.json")])
             if rc == 0:
@@ -443,8 +446,8 @@ class MiniMaxFloor(unittest.TestCase):
         bad = {"no receipt": lambda r: ["mm rank: load"],
                "two receipts": lambda r: [self.receipt(r), self.receipt(r)],
                "other rank only": lambda r: [self.receipt(1 - r)],
-               "control at two layers": lambda r: [self.receipt(r), "DIAG attn ulp: layer 3 seed 1 rows 9 pos0 0 values 1",
-                                                   "DIAG attn ulp: layer 4 seed 1 rows 9 pos0 0 values 1"],
+               "control at two layers": lambda r: [self.receipt(r), 'DIAG attn ulp: layer 3 seed 1 rows 9 pos0 0 values 1 prompt "p"',
+                                                   'DIAG attn ulp: layer 4 seed 1 rows 9 pos0 0 values 1 prompt "p"'],
                "bad flash value": lambda r: [self.receipt(r).replace('"effective": "0"', '"effective": "1"')]}
         for i, (why, log) in enumerate(bad.items()):
             with self.subTest(why=why):
@@ -460,6 +463,79 @@ class MiniMaxFloor(unittest.TestCase):
         changed, _ = self.mm_arm("changed", self.ref)
         self.assertNotEqual(json.loads((changed / "execution-r0.json").read_text(encoding="utf-8"))["model_sha256"],
                             w["e"]["model_sha256"])
+
+    def test_model_identity_binds_payload(self):
+        weights = self.model / "model-00001-of-00001.safetensors"
+        before = g.model_bundle_sha256(self.model)
+        payload = weights.read_bytes()
+        weights.write_bytes(payload[:-1] + b"\x01")
+        self.assertNotEqual(before, g.model_bundle_sha256(self.model))
+
+    def test_copy_rows_matches_full_history(self):
+        rng = np.random.default_rng(625)
+        for total in (4, 19, 128):
+            tokens = rng.integers(0, 3, size=total)
+            for rows in (1, min(8, total), total):
+                for k in (1, 3, 8):
+                    expected = []
+                    for p in range(total - rows, total - 1):
+                        earlier = [q for q in range(k - 1, p) if p >= k - 1 and
+                                   np.array_equal(tokens[q - k + 1:q + 1], tokens[p - k + 1:p + 1])]
+                        expected.append(bool(earlier) and tokens[earlier[-1] + 1] == tokens[p + 1])
+                    self.assertEqual(g.copy_rows(tokens, rows, k).tolist(), expected)
+
+    def test_model_identity_binds_large_file_middle(self):
+        large = self.model / "weights.bin"
+        with large.open("wb") as f:
+            f.truncate((64 << 20) + 1)
+        before = g.model_bundle_sha256(self.model)
+        with large.open("r+b") as f:
+            f.seek(32 << 20)
+            f.write(b"\x01")
+        self.assertNotEqual(before, g.model_bundle_sha256(self.model))
+
+    def test_floor_refuses_payload_replacement(self):
+        ref, cand, nulls = self.fixture()
+        weights = self.model / "model-00001-of-00001.safetensors"
+        payload = weights.read_bytes()
+        weights.write_bytes(payload[:-1] + b"\x01")
+        other, rc = self.mm_arm("new-weights", self.ref, fast=(12, 30))
+        self.assertEqual(rc, [0, 0])
+        self.assertEqual(self.cmp(ref, other, nulls), 2)
+
+    def test_floor_refuses_one_sided_switches(self):
+        base = {"levers": {}, "switches": {}}
+        override = {"levers": {}, "switches": {"STRIX_MMX_PREFILL_PIPE_TAIL": "0"}}
+        self.assertIsNotNone(g.config_difference(base, override))
+        self.assertIsNotNone(g.config_difference(override, base))
+        self.assertIsNone(g.config_difference(override, override))
+        ref, cand, nulls = self.fixture()
+        for i, value in enumerate(("0", "1")):
+            def log(rank):
+                line = self.receipt(rank, (12, 30))
+                doc = json.loads(line[len(g.RECEIPT_PREFIX):])
+                doc["switches"]["set"]["STRIX_MMX_PREFILL_PIPE_TAIL"] = value
+                return [g.RECEIPT_PREFIX + json.dumps(doc)]
+            other, rc = self.mm_arm(f"override{i}", self.ref, log=log)
+            self.assertEqual(rc, [0, 0])
+            self.assertEqual(self.cmp(ref, other, nulls), 2)
+
+    def test_control_requires_per_prompt_nonzero_events(self):
+        event = "DIAG attn ulp: layer 30 seed 7 rows 64 pos0 0 values 99"
+        bad = {
+            "unbound": [event, event.replace("pos0 0", "pos0 64")],
+            "only-p": [event + ' prompt "p"', event.replace("pos0 0", "pos0 64") + ' prompt "p"'],
+            "zero-values": [event + ' prompt "p"', event.replace("values 99", "values 0") + ' prompt "q"'],
+            "zero-rows": [event + ' prompt "p"', event.replace("rows 64", "rows 0") + ' prompt "q"'],
+            "out-of-range": [event + ' prompt "p"', event.replace("pos0 0", f"pos0 {MT}") + ' prompt "q"'],
+            "unknown": [event + ' prompt "p"', event + ' prompt "unknown"'],
+        }
+        for name, events in bad.items():
+            with self.subTest(name=name):
+                d, rc = self.mm_arm(name, self.ref, prompts=("p", "q"), log=lambda r: [self.receipt(r), *events])
+                self.assertEqual(rc, [2, 2])
+                self.assertFalse((d / "execution-r0.json").exists())
+        self.assertEqual(self.mm_arm("covered", self.ref, prompts=("p", "q"), control=(30, 7))[1], [0, 0])
 
     def test_floor_end_to_end(self):
         ref, cand, nulls = self.fixture()

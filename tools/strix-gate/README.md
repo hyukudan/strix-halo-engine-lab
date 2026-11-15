@@ -248,9 +248,10 @@ prompts and reference) the candidate must pass all of (`MM_FLOOR` in the script)
 
 The absolute KL / top-1 / dNLL verdict is printed and stored (`pooled.abs_pass`) as a reference.
 The candidate must differ from the reference only in its FAST layer set: every receipt lever other
-than `minimax.msa_flash` must be equal, and so must every switch both runs consulted, except the MSA
-flash switches (a receipt lists only the switches its code path read before it was printed, so a
-flash run lists more than an exact one).
+than `minimax.msa_flash` must be equal, and so must every recorded switch outside the explicit
+FAST allowlist (`STRIX_MM_PF_MSA_FLASH`, `STRIX_MM_PF_MSA_FLASH_LAYERS`, `STRIX_MM_FAST_PREFILL`).
+Receipts omit defaulted switches and cannot distinguish them from unconsulted switches; a
+one-sided entry outside that allowlist is therefore refused, even if it explicitly selects a default.
 Mean + 2 sd of three controls is a policy threshold, not a bound: a candidate drawn exactly like
 the nulls fails one such check about 11 % of the time (t with 2 degrees of freedom).
 
@@ -269,11 +270,17 @@ off, EXL3, default prefill identity), `fast-prefill` (MSA flash on, otherwise th
 `other`; `fast` = MSA flash mode (10 + `STRIX_MM_PF_MSA_FLASH`: 11 one-term, 12 two-term) and
 layers; `numerical_config_sha256` over the effective levers and switch set without output-only
 switches, and `config` = those levers and switches (for the comparison above). The control
-comes only from the engine's own null-control lines (`DIAG attn ulp: layer L seed S ...`, a lab
-diagnostic build): one layer and seed, at least one event per prompt, otherwise refused.
-`model_sha256` is the ordered model bundle without re-reading tensor payloads: every file's path
-and size, the safetensors headers and the full bytes of files <= 64 MiB. The prompts map is the
-one `seal` computes. Same trust boundary as above: launcher statements, not proofs.
+comes only from the engine's own null-control lines in a lab diagnostic build:
+`DIAG attn ulp: layer L seed S rows N pos0 P values V prompt "NAME"`.
+The prompt name is a JSON string matching a sealed prompt. All events must use one layer and seed,
+have positive row/value counts and a row span inside that prompt; every sealed prompt must have
+an event. Unlabelled, malformed and incomplete control logs are refused. The lab emitter must
+supply these prompt identities; this gate does not add native diagnostic instrumentation.
+`model_sha256` binds every file's relative path, size and full-content SHA-256, including all tensor
+payloads and large-file middles. Producing a witness reads the complete model bundle; keep assets
+immutable from execution through witness generation. Regenerate older header/sample-based witnesses.
+The prompts map is the one `seal` computes. Same trust boundary as above: launcher statements,
+not proofs of which assets, binary or log belong to a completed run.
 
 When both arms carry selection dumps (`PREFIX-<prompt>-sel-r<rank>.u32`; MiniMax writes them
 with `STRIX_MM_QUALITY_SELECT=1` next to `STRIX_MM_QUALITY_OUT`), `compare` also reports, per
