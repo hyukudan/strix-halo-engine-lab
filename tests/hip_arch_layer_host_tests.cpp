@@ -15,6 +15,8 @@ static_assert(a::Tuning::value.lds_bytes == 65536U);
 static_assert(a::Tuning::unified && a::Tuning::value.qualified);
 static_assert(a::Tuning::value.matrix == a::Matrix::Wmma16Rdna3 && a::Tuning::value.matrix_int4 && !a::Tuning::value.matrix_fp8);
 // Declared, unqualified targets.
+static_assert(!a::caps(a::Target::Gfx1200).matrix_int4);
+static_assert(!a::ArchTraits<a::Target::Gfx1201>::value.matrix_int4);
 static_assert(a::ArchTraits<a::Target::Gfx1201>::value.matrix_fp8 && !a::ArchTraits<a::Target::Gfx1201>::unified);
 static_assert(!a::ArchTraits<a::Target::Gfx942>::wave32 && a::caps(a::Target::Gfx942).matrix == a::Matrix::Mfma);
 static_assert(a::caps(a::Target::Gfx950).lds_bytes > a::kGfx1151.lds_bytes);

@@ -386,6 +386,8 @@ if(BUILD_TESTING)
     add_test(NAME strix-hip-arch-layer-host-tests COMMAND strix-hip-arch-layer-host-tests)
     find_package(Python3 COMPONENTS Interpreter QUIET)
     if(Python3_Interpreter_FOUND)
+        add_test(NAME strix-hip-arch-target-host-tests COMMAND "${Python3_EXECUTABLE}"
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/hip_arch_target_host_tests.py" --compiler "${CMAKE_CXX_COMPILER}")
         add_test(NAME strix-hip-arch-caps-host-tests COMMAND "${Python3_EXECUTABLE}"
             "${CMAKE_CURRENT_SOURCE_DIR}/tests/hip_arch_caps_host_tests.py" --compiler "${CMAKE_CXX_COMPILER}")
     endif()

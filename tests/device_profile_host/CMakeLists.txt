@@ -28,5 +28,7 @@ else()
     target_compile_options(strix-hip-arch-layer-host-tests PRIVATE -Wall -Wextra -Werror -Wshadow -Wsign-conversion)
 endif()
 add_test(NAME strix-hip-arch-layer-host-tests COMMAND strix-hip-arch-layer-host-tests)
+add_test(NAME strix-hip-arch-target-host-tests COMMAND "${Python3_EXECUTABLE}"
+    "${CMAKE_CURRENT_LIST_DIR}/../hip_arch_target_host_tests.py" --compiler "${CMAKE_CXX_COMPILER}")
 add_test(NAME strix-hip-archs-rdna4-cdna COMMAND "${CMAKE_COMMAND}" "-DSTRIX_HIP_ARCHS=gfx1151;gfx1201;gfx942" "-DEXPECTED=gfx1151;gfx1201;gfx942"
     -P "${CMAKE_CURRENT_LIST_DIR}/archs_test.cmake")

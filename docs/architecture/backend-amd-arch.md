@@ -10,7 +10,8 @@ discrete (gfx1200 / gfx1201) and CDNA3/4 (gfx942 / gfx950), and the risks.
 ### Build
 - `cmake/StrixHipArchs.cmake:9` `STRIX_HIP_ARCHS` defaults to `gfx1151`; already a configurable list, consumed by every
   HIP target through `HIP_ARCHITECTURES` (`CMakeLists.txt:2389`, `2399`, `2458`, `2479`, `2486`, `2493`, `2499`, `2504`, ...).
-  No raw `--offload-arch` flags in the shared-core build. Building another arch compiles but does not qualify it.
+  No raw `--offload-arch` flags in the shared-core build. Arch-list tests check configuration only; they provide no
+  RDNA4/CDNA device compilation evidence. Compilation and native qualification require separate gates.
 - `cmake/h3_10_gemm.cmake:4` the qualified device compile contract names wave32.
 - `include/strix/hip_arch_caps.hpp` macro-level instruction availability; RDNA3 / RDNA3.5 only, unknown targets fail
   closed (gfx12xx and gfx9xx get no WMMA / DPP / sudot4 today).
@@ -58,7 +59,9 @@ discrete (gfx1200 / gfx1201) and CDNA3/4 (gfx942 / gfx950), and the risks.
   `qualified`.
 - Rows: gfx1151 (qualified), gfx1200, gfx1201, gfx942, gfx950 (declared, not qualified).
 - `ArchTraits<Target>`: compile-time dispatch; kernels template on `Target` and branch with `if constexpr` on the caps.
-- `kCompileTarget`: target of the current device pass (host pass and unknown targets resolve to gfx1151).
+- `kCompileTarget`: target of the current device pass; host passes resolve to gfx1151. Unsupported device passes
+  resolve to `Unknown`, with zero budgets, no matrix support, unknown memory kind and no qualification.
+  Host syntax tests cover synthetic target macros; they do not compile device instructions.
 - `kTuningTarget` / `Tuning`: target of host-side selection rules. Fixed to gfx1151 so the host and every device pass
   agree; a host rule must never read `kCompileTarget`, since the host pass cannot see which device arch will run.
 
