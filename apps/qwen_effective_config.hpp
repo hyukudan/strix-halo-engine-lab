@@ -538,9 +538,10 @@ inline EffectiveConfig initialize_prefill_config(const RequestedOptions& request
         const auto excluded = prefill_option_bit(PrefillOption::hc_output_wmma) |
             prefill_option_bit(PrefillOption::index_proj_wmma) | prefill_option_bit(PrefillOption::gdn_fp16_chunk) |
             prefill_option_bit(PrefillOption::index_score_wmma) |
+            prefill_option_bit(PrefillOption::ple_rows_f16) | prefill_option_bit(PrefillOption::gdn_gates_f16) |
             (result.prefill_option_mask & kPrefillGdnChunkRev3);
         result.options.prefill_disabled |= excluded;
-        result.prefill_option_mask &= ~excluded;
+        result.prefill_option_mask = normalize_prefill_options(result.prefill_option_mask & ~excluded);
     }
     result.options.resolved_prefill_option_mask = result.prefill_option_mask;
     const auto budget = result.environment.find("STRIX_QPF2K_QSA_BUDGET");
@@ -1237,10 +1238,12 @@ inline void resolve_serve_prefill(EffectiveConfig& result, const ModelContract& 
                     if (!governed_mtp(c)) throw;
                     const auto excluded = prefill_option_bit(PrefillOption::hc_output_wmma) |
                         prefill_option_bit(PrefillOption::index_proj_wmma) | prefill_option_bit(PrefillOption::gdn_fp16_chunk) |
-                        prefill_option_bit(PrefillOption::index_score_wmma) | (result.prefill_option_mask & kPrefillGdnChunkRev3);
+                        prefill_option_bit(PrefillOption::index_score_wmma) |
+                        prefill_option_bit(PrefillOption::ple_rows_f16) | prefill_option_bit(PrefillOption::gdn_gates_f16) |
+                        (result.prefill_option_mask & kPrefillGdnChunkRev3);
                     auto governed = c;
                     governed.prefill_disabled |= excluded;
-                    governed.resolved_prefill_option_mask = result.prefill_option_mask & ~excluded;
+                    governed.resolved_prefill_option_mask = normalize_prefill_options(result.prefill_option_mask & ~excluded);
                     bool admitted = true;
                     try { validate_prefill_numerical_profile_cli(governed); }
                     catch (const std::exception&) { admitted = false; }
@@ -1419,8 +1422,8 @@ inline void resolve_serve_prefill(EffectiveConfig& result, const ModelContract& 
                 result.sources["--prefill-numerical-profile"] = OptionSource::automatic;
                 arithmetic = std::string("arithmetic fp16 (automatic, same rule as the single-request route") +
                     (decode_adopted ? "; decode profile dense-a8 automatic" : "") +
-                    (governed_mtp_exclusion ? "; governed MTP: hc_output_wmma, index_proj_wmma, index_score_wmma and "
-                        "gdn_fp16_chunk stay off)" : ")");
+                    (governed_mtp_exclusion ? "; governed MTP: hc_output_wmma, index_proj_wmma, index_score_wmma, "
+                        "gdn_fp16_chunk, ple_rows_f16 and gdn_gates_f16 stay off)" : ")");
                 if (governed_mtp_exclusion) result.prefill_option_mask = *o.resolved_prefill_option_mask;
             } else if (!fp16_declined.empty()) arithmetic += "; automatic fp16 declined: " + fp16_declined;
             result.arithmetic_fallback = o.prefill_profile_automatic ? std::string() : fp16_declined;
@@ -1560,6 +1563,12 @@ inline serve::Json cache_activation_json(const Options& o) {
     out.set("runner",serve::Json(std::string(a.runner==CacheRunner::pending?"pending-runner":a.runner==CacheRunner::cli?"cli-target-tiled":a.runner==CacheRunner::batch_mtp?"http-mtp-batch":a.runner==CacheRunner::single_mtp?"http-mtp-fixed":"http-target")));
     out.set("family",serve::Json(a.family)); out.set("evidence_id",serve::Json(a.evidence_id));
     out.set("automatic_qualified",serve::Json(a.automatic_qualified));
+    if(a.budget_policy) {
+        out.set("budget_rule",serve::Json(serve::cache_budget_rule_name(a.budget_policy->rule)));
+        out.set("budget_share_pct",serve::Json(static_cast<std::uint64_t>(a.budget_policy->share_pct)));
+        out.set("budget_share_cap_bytes",serve::Json(a.budget_policy->cap_bytes));
+        out.set("budget_share_cap_scope",serve::Json("share-component-before-legacy-floor"));
+    }
     out.set("phase",serve::Json(a.automatic_path && !a.decision_phase.empty()?a.decision_phase:(a.finalized?"post-residency":"inspection")));
     for (const auto& [name,value]: {std::pair{"B",a.B},{"S",a.S},{"H",a.H},{"F",a.F},{"E",a.E},
             {"context_off",a.context_off},{"slots_off",a.slots_off},
@@ -1637,9 +1646,12 @@ inline serve::Json cache_family_identity_json(const CacheFamilyIdentity& id) {
     return out;
 }
 // Called only on the automatic path after the actual runner/identity is bound.
-inline bool apply_automatic_cache_fit(Options& o, const CacheLateFit& fit) {
+inline bool apply_automatic_cache_fit(Options& o, const CacheLateFit& observed) {
     auto& a=*o.cache_activation;
     if(!automatic_cache_work(o)) return false;
+    // The one budget-rule resolution for CLI and server (default: the incumbent legacy rule).
+    auto fit=observed; fit.budget_policy=serve::cache_budget_policy_from_env();
+    a.budget_policy=fit.budget_policy;
     const auto result=fit.cgroup_ancestry_unproven ? CacheFitResult{0,"cgroup-ancestry-unproven"} : fit_cache_late(fit);
     a.S=fit.S; a.H=std::max(UINT64_C(4)<<30,fit.headroom); a.F=fit.F;
     if(fit.E && *fit.E<=UINT64_MAX-(UINT64_C(256)<<20)) a.E=*fit.E+(UINT64_C(256)<<20);
@@ -1900,6 +1912,7 @@ inline void intersect_cache_cgroup_limits(PrefillMemory& result, const std::stri
 // visibility is unknown capacity and declines; HIP is never initialized here.
 inline PrefillMemory observe_prefill_memory(PrefillCapabilities& capabilities, bool cache_limits=false) {
     PrefillMemory result;
+    (void)capabilities; // used only by the Linux sysfs observation below
     (void)cache_limits;
     const auto observed = observe_linux_uma_memory();
     if (observed.memory.observation_identity) {

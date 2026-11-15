@@ -303,8 +303,9 @@ void enqueue_combine_argmax(const ArgmaxCandidate* a, const ArgmaxCandidate* b, 
 // Engram: raw rows (row_count x 264 B) to bfloat16-rounded FP32 values (row_count x 256).
 void enqueue_engram_rows_bf16(const std::uint8_t* rows, std::uint32_t row_count, float* out, void* stream);
 // Gated injection: stream rows x (hc * hidden) updated in place from kv rows x (hidden * (hc + 1)).
+// gate_off (device, rows bytes, may be null): nonzero = an image position: gate 0 on every copy (upstream's token_mask).
 void enqueue_engram_inject(float* hc_stream, const float* kv, const float* q_norm, const float* k_norm, std::uint32_t rows,
-                           std::uint32_t hidden, float eps, void* stream);
+                           std::uint32_t hidden, float eps, void* stream, const std::uint8_t* gate_off = nullptr);
 
 // ---- launch accesses ---------------------------------------------------------------------------
 // The device bytes a call may read or write, for launchers that track cache lines across dependent

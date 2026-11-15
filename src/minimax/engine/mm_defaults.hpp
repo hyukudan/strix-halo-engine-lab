@@ -13,6 +13,7 @@
 #include <cstdint>
 #include <cstddef>
 #include <functional>
+#include <map>
 #include <span>
 #include <string>
 #include <vector>
@@ -46,6 +47,32 @@ using Lookup = profile::Lookup;
 
 bool baseline(const Lookup& env);                 // STRIX_MM_BASELINE set and not 0
 std::vector<Resolved> resolve(const Lookup& env);  // pure: same order as items()
+
+// FAST prefill profile (default-OFF governed rows, mm_profile_table.hpp). The one resolver of the bundle
+// STRIX_MM_FAST_PREFILL and its members: the engine (prefill MSA attention), the session-cache identity, the effective
+// config and the rank agreement all call it. Invalid member values throw std::invalid_argument naming the variable.
+struct PrefillPolicy {
+    std::map<std::string, std::string> canonical;  // expanded bundle switch and members (strix/fast_profile.hpp)
+    unsigned msa_flash = 0;                        // 0 exact in-block kernel, 1 one-term BF16, 2 two-term operands
+    unsigned msa_flash_requested = 0;              // selected before static execution guards
+    std::string msa_flash_layers;                  // layer set text the engine parses (builtin kMsaFlashLayers)
+    std::string msa_flash_layers_requested;        // original layer syntax, for provenance only
+    std::string msa_flash_asked;                   // "default", the explicit value, or "fast_prefill" (bundle)
+    std::string policies;                          // named FAST policies that run, '+'-joined; empty: none
+    std::string note;                              // why a bundle member does not run; empty: none
+};
+// Static execution guards, also used by the engine receipt after runtime control changes.
+const char* msa_flash_decline_reason(bool rework, bool fused, unsigned layers);
+PrefillPolicy prefill_policy(const Lookup& env);
+const profile::Engine& profile_engine();                 // tag "minimax-pair", table profile_table
+profile::Resolution profile_resolution(const Lookup& env);
+// Cache / receipt identity of the active prefill policies; empty with every governed row at its builtin and the EXL3
+// MoE format. This field's omission alone does not establish complete cache compatibility.
+std::string prefill_identity(const Lookup& env);
+// Rank agreement of the profile rows (strix::profile::check_peer over the process environment): both ranks call it at
+// the same startup point with the control-channel byte exchange; a mismatch throws naming both fingerprints.
+void check_peer(const std::function<void(const void*, void*, std::size_t)>& exchange);
+void check_peer(const profile::Resolution& mine, const std::function<void(const void*, void*, std::size_t)>& exchange);
 
 // Partial host receipt, not evidence of execution or asset compatibility. Records
 // the engine's declared arithmetic and selected prefill route, without probing a

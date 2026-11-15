@@ -497,6 +497,22 @@ std::string env_or(const char* name, const char* fallback = "") {
 
 }  // namespace
 
+std::string prefix_continuation_decline() {
+    namespace fp = strix::ds41::fast_profile;
+    std::string why;
+    const auto add = [&why](const std::string& s) { why += (why.empty() ? "" : "; ") + s; };
+    // DevicePrefill::Impl::flash_attn_at (src/hip_deepseek41_prefill.hip): flash_run = (P0 == 0)
+    if (fp::attention_on() && fp::attention_flash())
+        add("FAST attention ds41-attn-bf16flash-v1 runs only from position 0: a restored state or a later piece continues on "
+            "ds41-attn-f16wmma-v1");
+    // enqueue_fast_dense (src/hip_ds41_layer.hip): rows < STRIX_DS41_FAST_DENSE_MIN_ROWS keep the exact kernels, and the
+    // prefill's dense selectors test the rows of the piece as well: another cut changes the route of the same prompt
+    if (fp::dense_on())
+        add("FAST dense ds41-dense-f16-v1 selects its route by the rows of each piece (dense_min_rows=" +
+            std::to_string(fp::dense_min_rows()) + "): a cache hit or another cut changes the arithmetic of the same prompt");
+    return why;
+}
+
 PrefixNamespace prefix_namespace_from_env(bool expert_tp_decode) {
     // bump the version when the meaning of a state changes without any of the inputs below changing
     std::string t = "ds41-prefix-ns=1;";
