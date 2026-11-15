@@ -19,7 +19,7 @@ struct Inputs {
     double rtx_rows_s = 0, pair_rows_s = 0, link_mbps = 0;
     std::uint32_t pair_grain = 0;  // identity_grain(pair identity): blocks are multiples of it; 0 = any block
     // Measured pair cost multiplier by block rows (chain::Device::unit_scale; empty = the declared rate at every block).
-    std::vector<std::pair<std::uint32_t, double>> pair_unit_scale;
+    std::vector<std::pair<std::uint32_t, double>> pair_unit_scale{};
 };
 struct Resolved {
     chain::Split split = chain::Split::device_only;
