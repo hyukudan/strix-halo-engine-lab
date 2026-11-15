@@ -4441,6 +4441,35 @@ loop; only a wave with a dead fragment takes the predicated loop.
 - **Resources:** no kernel gains a register spill; the 128-row gate/up kernel uses 238 VGPR (239 before), occupancy and LDS bytes are unchanged.
 - **Implementation / evidence:** [shared core](../src/moe_core/grouped_f16.hpp), [GLM adapter](../src/glm/prefill/glm_pf_wmma_x.hpp), [test](../tests/hip_glm_pf_wmma_tests.hip)
 
+<a id="glm-pf-wmma-shared128"></a>
+
+### FAST shared expert on 128-row slices
+
+**Engine:** `glm` (shared core `moe_core::folded_f16`). **Control:** `STRIX_GLM_PF_WMMA_SHARED128`. **Default:** on wherever the FAST WMMA prefill runs with 128-row tiles.
+
+The shared expert holds every row of the call. Its rows were sliced by 64, so each FP16 weight tile was decoded once per 64
+rows; the slices are now 128 rows on the 128-row core (the folded F16 span runs the 128-row tile, the last partial slice the
+smallest covering tile), so each tile is decoded once per 128 rows and the LDS fills halve.
+
+- **Preconditions:** `STRIX_GLM_PF_WMMA=1`, 128-row tiles (`STRIX_GLM_PF_WMMA_ROWS=128`, the default).
+- **Exactness evidence:** Bitwise to the glm-pf-wmma-x identity: every row keeps its arithmetic; `hip_glm_pf_wmma_tests` arm 7 (64-row slices) equals the default on every buffer (1026 checks, 0 failures); pair 8K logits of both ranks equal with the switch off and on.
+- **Off switch:** `STRIX_GLM_PF_WMMA_SHARED128=0` (64-row shared slices, same bits)
+- **Measured gain:** Pair FAST 8K, warm (second prefill of the process): 8.606 -> 8.571 s (-0.4 %, two ABAB pairs, 953-957 tok/s); whole MoE call at 2048 rows on one node 26.73 -> 26.54 ms.
+- **Resources:** no register spill; LDS of the shared kernels is the 128-row storage of the routed full-tile kernel.
+
+<a id="glm-route-wave"></a>
+
+### GLM router selection: one wave per row
+
+**Engine:** `glm` (shared `moe_core::route_wave_topk`). **Control:** none (exact). **Default:** on.
+
+The top-8 expert selection ran on lane 0 of a 32-thread work-group per row (288 sigmoids and eight 288-wide scans in
+series). Each lane now owns nine experts; the eight passes use the shared wave selection on the 32-bit ordered keys
+(largest key, ties to the lower expert id), and the sort, the ascending denominator and the weights stay on lane 0.
+
+- **Exactness evidence:** Bitwise: a device stress set of 4096 rows (random, mass ties, signed zeros, infinities, NaN, saturated sigmoids; three bias sets; 1, 7, 32 and 4096 rows) equals the former serial kernel in ids and weights; pair 8K and 32K logits of both ranks equal the previous binary.
+- **Measured gain:** route kernel at 4096 rows 1.116 -> 0.033 ms; pair exact 8K warm 12.478 -> 12.366 s (-0.9 %, 3 ABAB pairs), 32K 51.265 -> 51.064 s.
+
 <a id="glm-pf-kda-wmma"></a>
 
 ### FAST KDA plain-weight projections on WMMA (glm-pf-kda-wmma-v1)
