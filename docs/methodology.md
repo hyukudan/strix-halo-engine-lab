@@ -79,6 +79,9 @@ bash scripts/bench/bench.sh run --engine E --only exactness --suite quick --json
 ```
 
 `EXACT`, `MISMATCH` and `NO-REFERENCE` are distinct verdicts. Missing reference data is not a pass.
+
+Chunk invariance (`chunkinv-attn-state-v1`, `src/core/chunk_contract.hpp`): `scripts/bench/chunkinv/fixtures.sh
+BUILD_DIR OUT_DIR` runs the GDN open-tail, dense flash split and WMMA K-pair fixtures on one GPU.
 CPU tests and config inspection do not qualify native execution.
 
 <a id="how-it-works"></a>
