@@ -1,5 +1,8 @@
 #pragma once
 
+#include <stdexcept>
+#include <string_view>
+
 // Shared grouped-prefill storage policy. Engines opt into XOR64 explicitly;
 // the default leaves their padded/linear storage contract unchanged.
 #if defined(__HIPCC__)
@@ -40,6 +43,14 @@ struct GroupedSplitContract {
 inline constexpr GroupedSplitContract kGroupedAdaptiveContract{};
 // S = 1 everywhere: the order the adaptive policies already use for experts with >= 97 rows (gate/up) / >= 17 (down).
 inline constexpr GroupedSplitContract kGroupedSingleChainContract{{1U}, {1U}, {1U}, 1U};
+
+// Host policy parsing is shared; engines own the environment key and startup receipt.
+inline const GroupedSplitContract& resolve_grouped_order(const char* requested) {
+    const std::string_view mode = requested != nullptr ? requested : "";
+    if (mode.empty() || mode == "adaptive") return kGroupedAdaptiveContract;
+    if (mode == "invariant") return kGroupedSingleChainContract;
+    throw std::invalid_argument("prefill MoE order must be adaptive or invariant");
+}
 
 template <class Policy = GroupedPrefillPolicy<>, unsigned PaddedPitch = 72U>
 struct GroupedLdsRing {

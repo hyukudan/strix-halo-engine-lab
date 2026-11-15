@@ -617,6 +617,11 @@ gate/up/down, identity `mmx-pf-moe-s1-v1`); the default `adaptive` keeps today's
 `strix-hip-mmx-moe-bench --test --tests test_prefill_chunk_invariance` (device bytes). One pair run (TTFT, state FNV,
 MemAvailable, kfd `evicted_ms`, busy/sclk) is `scripts/bench/chunkinv/pair_run.sh --bin RANK --model DIR --peer HOST
 --out DIR STRIX_MMX_PF_ORDER=... -- <rank args>`, run inside the caller's pair GPU turn.
+Each run creates a fresh `DIR/run.*` on both hosts and preserves existing contents; peer collisions fail.
+Relative inputs are resolved from each host's launch directory. Failed ranks, collection failures or missing
+TTFT/state/token records return nonzero. The device fixture covers device-planned final outputs only, not
+host-planner cross-chunk equality, intermediate buffers, every variant or complete model state. The dense
+contract helper has test consumers only; neither fixture qualifies production dense or whole-engine invariance.
 
 ## Long-context retrieval and reasoning checks (Qwen)
 

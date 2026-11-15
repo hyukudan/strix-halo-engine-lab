@@ -128,6 +128,14 @@ void chunk_invariance() {
 
 int main() {
     try {
+        require(!mc::resolve_grouped_order(nullptr).invariant(), "unset mode must stay adaptive");
+        require(!mc::resolve_grouped_order("").invariant(), "empty mode must stay adaptive");
+        require(!mc::resolve_grouped_order("adaptive").invariant(), "adaptive mode must stay adaptive");
+        require(mc::resolve_grouped_order("invariant").invariant(), "invariant mode must bind every matrix");
+        bool invalid = false;
+        try { (void)mc::resolve_grouped_order("typo"); }
+        catch (const std::invalid_argument&) { invalid = true; }
+        require(invalid, "invalid mode must be rejected");
         contract_shape();
         chunk_invariance();
         std::cout << "chunk order contract: PASS\n";
