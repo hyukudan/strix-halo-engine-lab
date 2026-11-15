@@ -66,6 +66,9 @@ struct MiniMaxPolicies {
     strix::core::LayerSet i4_exl3_layers = strix::core::parse_layer_set(fast_i4::kQualityExl3Layers, kFirstMoe, kLayers, "kept");
     strix::core::LayerSet i4_a8_layers = strix::core::parse_layer_set("!", kFirstMoe, kLayers, "a8");
     strix::core::LayerSet pf_msa_flash_layers = strix::core::parse_layer_set("50-61", 0, kLayers, "flash");
+    bool pf_idx_wmma = false;
+    std::string pf_idx_wmma_asked = "default";
+    strix::core::LayerSet pf_idx_wmma_layers = strix::core::parse_layer_set("40-59", 0, kLayers, "idx");
 @MINIMAX_LEVERS@
     std::uint64_t fingerprint() const { rr::reset(); route_levers(); return rr::fingerprint(); }
 };
