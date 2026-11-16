@@ -28,6 +28,7 @@ include(${WFMT_ROOT}/cmake/StrixIntel.cmake)
 add_executable(strix-wfmt-host-tests main.cpp contracts.cpp census.cpp compare.cpp
     reference.cpp geometry.cpp fixtures/iq3_s_cases.cpp
     resolve.cpp cache.cpp effective_config.cpp runtime.cpp readers.cpp admission.cpp reference_admission.cpp cpu.cpp intel.cpp
+    ${WFMT_ROOT}/src/core/weight_archive.cpp
     ${WFMT_ROOT}/src/vision/gguf_weights.cpp
     ${WFMT_ROOT}/src/gemma4/model/safetensors.cpp)
 target_link_libraries(strix-wfmt-host-tests PRIVATE strix-weight strix_backend_cpu strix_intel_core)
