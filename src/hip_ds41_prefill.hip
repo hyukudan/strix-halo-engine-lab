@@ -10,6 +10,7 @@
 #include <hip/hip_runtime.h>
 
 #include "moe_core/grouped_integer_decode.hpp"
+#include "moe_core/grouped_a8_f16.hpp"
 #include "ds41_integer_operand.hpp"  // shared tiled core route (STRIX_DS41_PF_CORE=1, FAST_I4)
 
 #include "strix/ds41_moe.hpp"
@@ -698,6 +699,31 @@ static bool fast_moe_order() {
     const char* e = std::getenv("STRIX_DS41_FAST_MOE_ORDER");
     return !(e && e[0] == '0');
 }
+bool ds41_f16_moe_weights_fit(WeightFormat format, const void* data, std::uint64_t bytes) {
+    if (format != WeightFormat::iq2_xxs && format != WeightFormat::q2_k) return false;
+    const auto size = block_bytes(format);
+    if ((!data && bytes) || bytes % size) return false;
+    const auto* p = static_cast<const unsigned char*>(data);
+    const auto read_half = [](const unsigned char* src) {
+        unsigned short bits; std::memcpy(&bits, src, 2);
+        return __half2float(__ushort_as_half(bits));
+    };
+    // Conservative metadata bounds (no scan of individual weight codes required).
+    for (std::uint64_t at = 0; at < bytes; at += size) {
+        if (format == WeightFormat::iq2_xxs) {
+            // grid magnitudes <= 43; (0.5+s)/4 <= 3.875.
+            const float bound = fabsf(read_half(p + at)) * (43.0F * 3.875F);
+            if (!(bound <= 65504.0F)) return false;
+        } else {
+            const float d = fabsf(read_half(p + at + 80U)), m = fabsf(read_half(p + at + 82U));
+            if (!(d * 45.0F + m * 15.0F <= 65504.0F)) return false;
+        }
+    }
+    return true;
+}
+bool fast_moe_f16() {
+    return strix::envcfg::flag("STRIX_DS41_FAST_MOE_F16", false, strix::EnvFlagMatch::exact);
+}
 bool fast_moe() {
     static const bool env = fast_profile::moe_on();  // the lever or STRIX_DS41_FAST_PREFILL
     // a running DevicePrefill's own precision first (strix/ds41_prefill_precision.hpp), else the override or env
@@ -781,12 +807,21 @@ void enqueue_prefill_gate_up(WeightFormat format, const PrefillGateUpView& view,
     }
     if (fast_moe() && format == WeightFormat::iq2_xxs && view.hidden % 256U == 0U && view.inter % 128U == 0U &&
         view.routes.batch_rows <= relaxed_rows) {
+        if (fast_moe_f16()) {
+        if (fast_moe_order() && view.routes.max_batches <= 65535U)  // grid y limit
+            hipLaunchKernelGGL(HIP_KERNEL_NAME(relaxed_f16_gate_up_kernel<WeightFormat::iq2_xxs, true>), dim3(view.inter / 128U, view.routes.max_batches),
+                               dim3(relaxed_threads), 0, queue, view);
+        else
+            hipLaunchKernelGGL(HIP_KERNEL_NAME(relaxed_f16_gate_up_kernel<WeightFormat::iq2_xxs, false>), dim3(view.routes.max_batches, view.inter / 128U),
+                               dim3(relaxed_threads), 0, queue, view);
+        } else {
         if (fast_moe_order() && view.routes.max_batches <= 65535U)  // grid y limit
             hipLaunchKernelGGL(HIP_KERNEL_NAME(relaxed_gate_up_kernel<WeightFormat::iq2_xxs, true>), dim3(view.inter / 128U, view.routes.max_batches),
                                dim3(relaxed_threads), 0, queue, view);
         else
             hipLaunchKernelGGL(HIP_KERNEL_NAME(relaxed_gate_up_kernel<WeightFormat::iq2_xxs, false>), dim3(view.routes.max_batches, view.inter / 128U),
                                dim3(relaxed_threads), 0, queue, view);
+        }
         check(hipGetLastError(), "prefill gate/up launch (relaxed)");
         return;
     }
@@ -853,10 +888,17 @@ void enqueue_prefill_down(WeightFormat format, const PrefillDownView& view, void
         const bool rows32 = !(rows_env && std::strcmp(rows_env, "64") == 0) && view.routes.batch_rows <= 32U;
         const bool swap = fast_moe_order() && view.routes.max_batches <= 65535U;  // grid y limit
         const dim3 grid = swap ? dim3(view.outputs / 256U, view.routes.max_batches) : dim3(view.routes.max_batches, view.outputs / 256U);
+        if (fast_moe_f16()) {
+        if (swap && rows32) hipLaunchKernelGGL(HIP_KERNEL_NAME(relaxed_f16_down_kernel<WeightFormat::q2_k, true, 32U>), grid, dim3(relaxed_threads), 0, queue, view);
+        else if (swap) hipLaunchKernelGGL(HIP_KERNEL_NAME(relaxed_f16_down_kernel<WeightFormat::q2_k, true>), grid, dim3(relaxed_threads), 0, queue, view);
+        else if (rows32) hipLaunchKernelGGL(HIP_KERNEL_NAME(relaxed_f16_down_kernel<WeightFormat::q2_k, false, 32U>), grid, dim3(relaxed_threads), 0, queue, view);
+        else hipLaunchKernelGGL(HIP_KERNEL_NAME(relaxed_f16_down_kernel<WeightFormat::q2_k, false>), grid, dim3(relaxed_threads), 0, queue, view);
+        } else {
         if (swap && rows32) hipLaunchKernelGGL(HIP_KERNEL_NAME(relaxed_down_kernel<WeightFormat::q2_k, true, 32U>), grid, dim3(relaxed_threads), 0, queue, view);
         else if (swap) hipLaunchKernelGGL(HIP_KERNEL_NAME(relaxed_down_kernel<WeightFormat::q2_k, true>), grid, dim3(relaxed_threads), 0, queue, view);
         else if (rows32) hipLaunchKernelGGL(HIP_KERNEL_NAME(relaxed_down_kernel<WeightFormat::q2_k, false, 32U>), grid, dim3(relaxed_threads), 0, queue, view);
         else hipLaunchKernelGGL(HIP_KERNEL_NAME(relaxed_down_kernel<WeightFormat::q2_k, false>), grid, dim3(relaxed_threads), 0, queue, view);
+        }
         check(hipGetLastError(), "prefill down launch (relaxed)");
         return;
     }

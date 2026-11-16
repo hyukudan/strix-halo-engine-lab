@@ -102,6 +102,11 @@ void enqueue_prefill_gate_up(WeightFormat format, const PrefillGateUpView& view,
 // one expert per block; same A8 activations, weight integers and group dots. Test override: 1 on, 0 off, -1 environment.
 void set_fast_moe(int mode);
 [[nodiscard]] bool fast_moe();
+// Experimental FP16 operand policy, read per call; only used inside fast_moe().
+[[nodiscard]] bool fast_moe_f16();
+// Check each host tensor once before enabling FAST_MOE_F16. A conservative metadata-only
+// bound; false means the caller must retain the relaxed integer kernels. No device fallback.
+[[nodiscard]] bool ds41_f16_moe_weights_fit(WeightFormat format, const void* host_data, std::uint64_t bytes);
 // Draft FAST_I4: original GGUF weights decoded in-kernel to IU4, A8 input
 // requantized to A4 per K32. Default OFF. STRIX_DS41_FAST_I4=1; scope
 // STRIX_DS41_FAST_I4_SCOPE=all (default) or gu. Separate numerical identity
