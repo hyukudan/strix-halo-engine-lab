@@ -32,6 +32,7 @@
 #include "strix/teacher_logit_spool.hpp"
 #include "strix/hip_q6p_pack.hpp"
 #include "strix/hip_qwen_router_bf16.hpp"
+#include "strix/hip_qwen_onfly_i4.hpp"
 #include "strix/qwen_router_bf16.hpp"
 #include "strix/hip_dense_trellis_pack.hpp"
 #include "strix/q6p_registry.hpp"
@@ -2703,6 +2704,18 @@ static int run_decode_entry(
         auto views = shared_model_inventory.pinned_views;
         views.insert(views.end(), inventory.pinned_views.begin(), inventory.pinned_views.end());
         shared_model_inventory = strix::build_uma_owner_inventory(views);
+    }
+    // TURBO+ onfly INT4 g64 copies of the dense decode projections (--turbo-weights onfly): after the router copy, before any kernel plan.
+    const auto onfly_i4_owner = strix::load_hip_qwen_onfly_i4(manifest, model_residency.binding(), options.turbo);
+    if (options.turbo.active()) {
+        const auto inventory = onfly_i4_owner->owner_inventory(onfly_i4_owner);
+        auto views = shared_model_inventory.pinned_views;
+        views.insert(views.end(), inventory.pinned_views.begin(), inventory.pinned_views.end());
+        shared_model_inventory = strix::build_uma_owner_inventory(views);
+        optimization_profile_receipt += onfly_i4_owner->receipt_json();
+        std::cerr << "turbo-weights onfly " << onfly_i4_owner->resolved.identity() << ": " << onfly_i4_owner->copies.size() << " tensors, "
+                  << onfly_i4_owner->source_bytes << " Q8_0 bytes -> " << onfly_i4_owner->copy_bytes << " INT4 bytes in "
+                  << onfly_i4_owner->convert_seconds << " s (" << strix::onfly_i4::groups_text(options.turbo.groups) << ")\n";
     }
     optimization_profile_receipt += "  \"qwen_router_bf16_enabled\":" + std::string(options.qwen_router_bf16 ? "true" : "false") + ",\n" +
         "  \"qwen_router_bf16_bytes\":" + std::to_string(router_bf16_owner->bytes) + ",\n" +

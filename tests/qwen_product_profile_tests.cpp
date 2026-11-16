@@ -106,7 +106,7 @@ void product() {
     check(pr::resolve(pr::Name::quality, inputs).json().find("\"note\":\"quality: no quality rows for this model, using default\"") != std::string::npos &&
         pr::resolve(pr::Name::standard, inputs).json().find("\"note\"") == std::string::npos, "quality receipt names the default it runs");
     for (const auto& lever : pr::levers()) {
-        check(!lever.name.empty() && !lever.option.empty() && !lever.source.empty(), "editable table has provenance and option");
+        check(!lever.name.empty() && (!lever.option.empty() || !lever.env.empty()) && !lever.source.empty(), "editable table has provenance and a CLI or environment control");
         check(lever.value[0].empty() && lever.value[2].empty(), "default and quality leave every lever alone");
         check(!lever.ready[1] && lever.runnable[1] == (lever.name == "qsa_budget" || lever.name == "moe_route_bf16" || lever.name == "gdn_fp16_chunk" ||
                 lever.name == "moe_route_prune"),

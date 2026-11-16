@@ -164,18 +164,31 @@ public:
     virtual const char* arithmetic() const = 0;  // part of the adapter identity
 };
 
+// Diagnostic rounding model of a device arithmetic inside the host reference (default: none = the FP32 oracle,
+// bit for bit). It places the FP16 operand roundings of vision-f16-v1 one site at a time to study sensitivity.
+// Accumulation and transcendental evaluation remain FP64: this is not a bitwise device oracle or proof of a defect.
+// Never an adapter arithmetic; the shared rounded identity is diagnostic only, not a cache/qualification identity.
+struct ReferenceRounding {
+    bool linear_inputs_f16 = false;  // every linear input rounded to FP16 (the single-operand device policy)
+    bool attention_f16 = false;      // Q/K/V and probabilities at each 16-key online maximum rounded to FP16
+    bool any() const { return linear_inputs_f16 || attention_f16; }
+};
+float round_to_f16(float);  // nearest-even FP16 value as a float (subnormals kept, overflow -> infinity)
+
 class ReferenceEncoder final : public EncoderBackend {
 public:
-    ReferenceEncoder(EncoderConfig, const EncoderWeights&);  // the weights outlive the encoder
+    ReferenceEncoder(EncoderConfig, const EncoderWeights&, ReferenceRounding = {});  // the weights outlive the encoder
     EncoderOutput encode(const PatchGrid&, const PositionInputs&) override;
     void linear(const Tensor& w, const Tensor& bias, const float* x, std::size_t rows, float* y) override;
-    const char* arithmetic() const override { return "vision-ref-f32"; }
+    const char* arithmetic() const override { return rounding_.any() ? "vision-ref-f32-rounded" : "vision-ref-f32"; }
 
 private:
     EncoderConfig cfg_;
     const EncoderWeights* weights_;
+    ReferenceRounding rounding_;
 };
-EncoderOutput reference_encode(const EncoderConfig&, const EncoderWeights&, const PatchGrid&, const PositionInputs&);
+EncoderOutput reference_encode(const EncoderConfig&, const EncoderWeights&, const PatchGrid&, const PositionInputs&,
+                               const ReferenceRounding& = {});
 
 // Host copy of rows into an embedding buffer: dst[dst_row[i]][0 .. width) = fp32(src row src_row[i]).
 void splice_rows_host(float* dst, std::size_t dst_stride, const ProjectedRows& src, const std::uint32_t* dst_row,
@@ -185,7 +198,7 @@ void splice_rows_host(float* dst, std::size_t dst_stride, const ProjectedRows& s
 
 struct EncoderOptions {
     bool split_activations = false;                   // hi + lo FP16 operands for every linear input (two GEMMs)
-    std::size_t mlp_workspace_bytes = 96U << 20U;     // cap of the chunked MLP buffers
+    std::size_t mlp_workspace_bytes = 160U << 20U;    // cap of the chunked MLP buffers (2304 rows split, 4352 single)
     void* stream = nullptr;                           // hipStream_t; null = default stream
 };
 // Device bytes of one tower, exact for the runner: what a family reports to its memory budget before admission.
@@ -204,6 +217,16 @@ struct EncodeStats {
     double total_ms = 0.0;
     std::vector<double> layer_ms;
 };
+// Wall time of the last load() by step (approximate receipt; total also includes uninstrumented overhead).
+struct EncoderLoadStats {
+    double scan_ms = 0.0;          // per-row magnitude pass over the source weights
+    double host_alloc_ms = 0.0;    // zeroed host panel buffer
+    double convert_ms = 0.0;       // source -> scaled FP16 panel
+    double device_alloc_ms = 0.0;  // device buffers of panel + bias
+    double upload_ms = 0.0;        // host -> device copies of panel + bias
+    double vectors_ms = 0.0;       // norm vectors (allocation + upload)
+    double total_ms = 0.0;
+};
 
 // Defined in the HIP library only (src/vision/encoder.hip).
 class Encoder final : public EncoderBackend {
@@ -221,6 +244,7 @@ public:
     std::size_t pinned_host_bytes() const;  // retained input staging, separate from device_bytes()
     static bool project_device();  // governed, process-cached, default on (STRIX_VISION_PROJECT_DEVICE=0 = host graph); also available in host-only builds
     static const char* effective_arithmetic();
+    const EncoderLoadStats& load_stats() const;
 
     EncoderOutput encode(const PatchGrid&, const PositionInputs&) override;
     EncoderOutput encode(const PatchGrid&, const PositionInputs&, EncodeStats&);
