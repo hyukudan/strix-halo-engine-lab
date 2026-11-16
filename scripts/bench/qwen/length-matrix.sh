@@ -61,9 +61,6 @@ IFS=, read -ra S <<<"$sizes"; IFS=, read -ra M <<<"$modes"
 for ((r = 0; r < rounds; r++)); do
     for s in "${S[@]}"; do
         n=$(tokens_of "$s"); f=$ids/p$n.ids; pf=$pids/p$n.ids
-        # Single-process power JSON arrives after decode and has no execution timestamps.
-        # It cannot anchor external telemetry. Keep --need-prefill fail-closed until the
-        # engine supplies a timestamped prefill endpoint; token counts do not name a phase.
         [[ -s $f ]] || { echo "== s$s SKIP: no $f"; continue; }
         for m in "${M[@]}"; do
             for a in "${arms[@]}"; do
@@ -72,7 +69,7 @@ for ((r = 0; r < rounds; r++)); do
                 tag=s$s-$m-$name-$r need=$(need_of "$n" "$m")
                 kit_fits "$need" || { echo "== $tag SKIP (left $(kit_left) s < $need)"; continue; }
                 cap=$(($(kit_left) - 3))
-                export KIT_TAG=$tag KIT_ARM=s$s-$m-$name KIT_ROUND=$r KIT_TOKENS=$n KIT_WORKLOAD=s$s-$m KIT_RECEIPT_ARGS="--need-prefill"
+                export KIT_TAG=$tag KIT_ARM=s$s-$m-$name KIT_ROUND=$r KIT_TOKENS=$n KIT_WORKLOAD=s$s-$m KIT_RECEIPT_ARGS='--need-prefill'
                 # Single-node runs print no prefill line: the figure is the whole request (prefill + --gen tokens +
                 # readback) from the result JSON, published as a prefill upper bound. Arrival stamps give only
                 # conservative envelopes including earlier samples. Require request validity for all metrics
