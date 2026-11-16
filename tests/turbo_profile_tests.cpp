@@ -3,6 +3,7 @@
 #include "strix/engine_profile.hpp"
 #include "strix/profiles/qwen.hpp"
 #include "strix/turbo.hpp"
+#include "../apps/hip_decode_options.hpp"
 
 #include <cstdio>
 #include <cstdlib>
@@ -266,9 +267,31 @@ void qwen_adapter() {
     q::Inputs opts;
     for (int i = 1; i < 5; ++i) require(q::take_option(5, const_cast<char**>(argv), i, name, opts), "qwen takes the option");
     require(name == p::Name::turbo && opts.weights.source == std::string("onfly"), "qwen option values");
+    const auto admitted = q::resolve(p::Name::turbo, opts);
+    require(admitted.weights.honoured() && !throws([&] { q::apply(admitted, [](const char*, const char*) { return true; }); }),
+            "qwen admits the implemented onfly loader");
+    strix::decode_cli::Options route;
+    route.turbo.source = strix::onfly_i4::Source::onfly;
+    require(!throws([&] { strix::decode_cli::validate_onfly_i4_routes(route); }), "onfly single runner admitted");
+    for (unsigned rows = 1; rows <= 8; ++rows)
+        require(!throws([&] { strix::onfly_i4::require_serial_projection(rows, false); }), "onfly rows 1..8 admitted");
+    for (unsigned rows : {0U, 9U})
+        require(throws([&] { strix::onfly_i4::require_serial_projection(rows, false); }), "onfly unsupported rows refused");
+    route.mtp.cohort.emplace_back();
+    require(throws([&] { strix::decode_cli::validate_onfly_i4_routes(route); }), "onfly MTP cohorts refused");
+    route.mtp.cohort.clear();
+    route.http_serve = true;
+    for (int batch : {-1, 1, 2}) {
+        route.http_batch = batch;
+        require(throws([&] { strix::decode_cli::validate_onfly_i4_routes(route); }), "onfly HTTP batch adapters refused");
+    }
+    route.http_batch = 0;
+    require(!throws([&] { strix::decode_cli::validate_onfly_i4_routes(route); }), "onfly HTTP single runner admitted");
+    opts.weights.source = "converted";
+    opts.weights.pack = "model-int4.pack";
     const auto refused = q::resolve(p::Name::turbo, opts);
     require(!refused.weights.honoured() && throws([&] { q::apply(refused, [](const char*, const char*) { return true; }); }),
-            "qwen refuses onfly until its loader is in the build");
+            "qwen refuses converted weights until its loader is in the build");
 }
 
 }  // namespace

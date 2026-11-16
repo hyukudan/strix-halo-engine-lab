@@ -31,11 +31,10 @@ inline constexpr std::array<strix::profile::Lever, 7> profile_table{{
      {true, false, true}, {true, true, true}, "", "0", "explicit FAST bundle; native qualification required", false, {}, true},
     {"dense_min_rows", "STRIX_DS41_FAST_DENSE_MIN_ROWS", "", {"", "", ""}, "128", strix::profile::Kind::bit_changing,
      {true, false, true}, {true, true, true}, "", "", "FAST dense dispatch threshold", false, {}, true},
-    // PENDING turbo cells (no code on this branch): the lever exists only on an open PR; the row names it so the turbo
-    // identity never silently drops it. runnable is false until the PR merges and the env is wired to the cell.
-    {"engram_wmma", "STRIX_DS41_FAST_ENGRAM", "", {"", "", "", "1"}, "0", strix::profile::Kind::bit_changing,
-     {true, false, true, false}, {false, false, false, false}, "", "0",
-     "pending: Engram f16 WMMA (open PR #636, STRIX_DS41_FAST_ENGRAM); cell flips with that merge", false, {}, true},
+    // Prefill only: the Engram KV projection on the shared FP16 WMMA core (ds41-engram-f16wmma-v1); views whose x would overflow FP16
+    // keep the exact kernel. Explicit only (not a FAST bundle member) until its qualification receipt.
+    {"engram_f16wmma", "STRIX_DS41_FAST_ENGRAM", "", {"", "", ""}, "0", strix::profile::Kind::bit_changing,
+     {true, false, true}, {true, true, true}, "", "0", "explicit FAST Engram projection; native qualification required", false, {}, true},
     {"decoder_replay", "STRIX_DS41_DECODER_REPLAY", "", {"", "", "", "128"}, "0", strix::profile::Kind::bit_changing,
      {true, false, true, false}, {false, false, false, false}, "", "0",
      "pending: decoder replay R=128 under the turbo identity ds41-replay-r128 (open PR #605 admits R >= 256 only; R=256 stays the alternative)", false, {}, true},

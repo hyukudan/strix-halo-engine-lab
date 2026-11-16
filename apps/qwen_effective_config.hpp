@@ -1,4 +1,5 @@
 #pragma once
+#include <strix/weight/family.hpp>
 
 #include "strix/deploy/device.hpp"
 #include "strix/deploy/footprint.hpp"
@@ -129,6 +130,7 @@ struct EffectiveConfig {
     std::map<std::string, std::uint64_t> admission;
     QwenRouterBf16Reservation router_bf16_reservation;
     RotaryIdentity rotary_identity;
+    std::shared_ptr<const strix::weight::FamilyPlans> weight_plans{};
 };
 // Inspection knows resolved arithmetic, not an executed workload or its assets.
 // Native qualification callers may attach their actual compiled lineage.
@@ -180,7 +182,7 @@ inline Environment requested_prefill_environment(Get get) {
             "STRIX_QSA_DECODE_FUSED_MAXIMA", "STRIX_QSA_DECODE_ATTN_V2", "STRIX_QSA_DECODE_VALUE_V2", "STRIX_MOE_R1_GLUE_FUSE", "STRIX_QWEN_DECODE_FUSE",
             "STRIX_QPF2K_COMPACT_IMAGES", "STRIX_QPF2K_INDEX_BATCH", "STRIX_EAGER_CODE_LOAD", "HIP_ENABLE_DEFERRED_LOADING", "STRIX_QPF2K_EARLY_SETUP", "STRIX_CTX_EXACT_MEMORY", "STRIX_QSA_SCORE_RING", "STRIX_QSA_SCORE_RING_ROWS", "STRIX_TERMINAL_LOGITS_ARENA",
             "STRIX_SESSION_CACHE", "STRIX_SESSION_DISK", "XDG_CACHE_HOME", "HOME",
-            "STRIX_PREFIX_BATCH_CERT", "STRIX_QWEN_YARN_MTP", "STRIX_QWEN_YARN_HOST_RESERVE", "STRIX_PLE_ROLLING_CAP_BYTES", "STRIX_PLE_ROLLING", "STRIX_PLE_ROLLING_POSITIONS", "STRIX_PREFIX_CACHE", "STRIX_PREFIX_CACHE_RETENTION",
+            "STRIX_PREFIX_BATCH_CERT", "STRIX_BATCH_CACHE_SOLO", "STRIX_QWEN_YARN_MTP", "STRIX_QWEN_YARN_HOST_RESERVE", "STRIX_PLE_ROLLING_CAP_BYTES", "STRIX_PLE_ROLLING", "STRIX_PLE_ROLLING_POSITIONS", "STRIX_PREFIX_CACHE", "STRIX_PREFIX_CACHE_RETENTION",
             "STRIX_PREFIX_CACHE_INFLIGHT", "STRIX_PREFIX_CACHE_DISK", "STRIX_PREFIX_CACHE_DURABLE", "STRIX_PREFIX_FAIR_RECLAIM_IDLE",
             "STRIX_SERVE_PREFILL", "STRIX_SERVE_ROUTE", "STRIX_SERVE_PREFILL_ORG", "STRIX_SERVE_T16K", "STRIX_SERVE_FP16_MTP", "STRIX_PLE_WARM", "STRIX_PLE_SERVE_RESERVE", "STRIX_PLE_REWARM", "STRIX_BATCH_PROMPT_SMALL", "STRIX_QPF2K_MOE_ROUTE_BF16",
             "STRIX_QPF2K_HC_RECOMPUTE_NORM", "STRIX_INTPREFILL_MOE_TUNE", "STRIX_QPF2K_MOE", "STRIX_QPF2K_MOE_SMALL", "STRIX_QPF2K_QSA_BUDGET", "STRIX_QPF2K_MOE_DIRECT_B"})
@@ -541,6 +543,8 @@ inline EffectiveConfig initialize_prefill_config(const RequestedOptions& request
         const auto it = result.environment.find(name);
         return it == result.environment.end() ? nullptr : it->second.c_str();
     }, request.options.product_profile.weights.effective == strix::profile::turbo::Source::onfly);
+    result.options.product_profile.onfly = result.options.turbo;
+    validate_onfly_i4_routes(result.options);
     if (result.options.eager_code_load && !result.environment.contains("HIP_ENABLE_DEFERRED_LOADING"))
         result.environment["HIP_ENABLE_DEFERRED_LOADING"] = "0";
     result.prefill_option_mask = resolve_prefill_options([&](const char* name) -> const char* {
@@ -1547,6 +1551,28 @@ inline void resolve_http_session_ram(EffectiveConfig& result, const PrefillMemor
             std::min(*memory.available,o.known_prefill_uma_budget));
     } catch (const std::exception& e) { result.error=e.what(); }
 }
+// HTTP batch route restore. Capture and restore on this route need strict L0 (HipPrefixStateCacheSession::set_plan):
+// an explicit host budget without --prefix-batch-cert l0 stores nothing (unchanged explicit semantics). L0 admits only
+// the solo suffix class (qwen_suffix_solo_class), so the batch scheduler then runs every prompt alone: no nested prompts, no
+// prompt groups, no prompt-window cohorts (scheduling only; each prompt's units and per-row arithmetic are unchanged).
+// STRIX_BATCH_CACHE_SOLO=0 keeps the incumbent scheduler; its restores decline batch-suffix-not-solo.
+// AUTO stays declined until a batch row is qualified (qwen_cache_admission.hpp).
+// Startup supplies the admitted route (zero for the single runner) before constructing runners or cache identities.
+inline void resolve_batch_cache_scheduler(Options& o, const Environment& env,
+    std::optional<std::uint32_t> admitted_slots=std::nullopt) {
+    if(admitted_slots) o.http_batch=*admitted_slots;
+    o.batch_cache_solo=false;
+    if(!admitted_slots && o.http_serve && o.mtp.enabled && !o.http_batch_explicit && o.http_batch==1) {
+        o.batch_cache_solo_reason="capacity-pending";return;
+    }
+    if(!o.http_serve || !o.mtp.enabled || o.http_batch<=1) {o.batch_cache_solo_reason="not-batch";return;}
+    if(o.baseline || !cache_defaults_suppression(o,env).empty()) {o.batch_cache_solo_reason="suppressed";return;}
+    auto& a=*o.cache_activation;
+    if(a.automatic_path) {o.batch_cache_solo_reason="automatic-unqualified";return;}
+    if(!o.prefix_cache || !o.prefix_cache_host_bytes || o.prefix_batch_cert!=1) {o.batch_cache_solo_reason="no-l0-restore";return;}
+    if(env_is(env,"STRIX_BATCH_CACHE_SOLO","0")) {o.batch_cache_solo_reason="STRIX_BATCH_CACHE_SOLO=0";return;}
+    o.batch_cache_solo=true; o.batch_cache_solo_reason="l0-restore";
+}
 inline void resolve_prefix_defaults(Options& o, const ModelContract& model,
     const Environment& env, std::optional<std::uint64_t> available,
     std::span<const SessionRouteQualification> qualifications=prefix_auto_route_qualifications) {
@@ -1565,11 +1591,14 @@ inline void resolve_prefix_defaults(Options& o, const ModelContract& model,
         a.reason=o.http_serve?"pending-post-residency":o.prefix_cache_then_prompts.empty()?"no-reuse-route":"serial-capture-cost-unqualified";
         a.cert_reason="pending-post-residency";
     }
+    resolve_batch_cache_scheduler(o,env);
 }
 inline serve::Json cache_activation_json(const Options& o) {
     const auto& a=*o.cache_activation;
     auto out=serve::Json::object();
     out.set("requested",serve::Json(a.prefix_requested));
+    out.set("batch_cache_solo",serve::Json(o.batch_cache_solo));
+    out.set("batch_cache_solo_reason",serve::Json(o.batch_cache_solo_reason));
     out.set("effective",a.finalized?serve::Json(a.prefix):serve::Json());
     out.set("session_requested",serve::Json(a.session_requested));
     out.set("session_effective",a.finalized?serve::Json(a.session):serve::Json());
@@ -2125,6 +2154,7 @@ inline std::string effective_config_json(const EffectiveConfig& config) {
         out << "{\"rotary\":" << (config.rotary_identity.descriptor().mode() == RotaryMode::yarn ?
             config.rotary_identity.json() : o.rotary.json()) << ',';
     else out << "{\"rotary\":" << o.rotary.json() << ',';
+    out << "\"weight_plans\":" << serve::Json(strix::weight::family_plan_notice(config.weight_plans)).dump() << ',';
     out << "\"profile\":" << o.product_profile.json() << ',';
     if (!o.suppressed_yarn_request.empty())
         out << "\"suppressed_yarn_request\":\"" << yarn_json_error(o.suppressed_yarn_request) << "\",";
@@ -2345,7 +2375,7 @@ inline std::string effective_config_json(const EffectiveConfig& config) {
         << "\",\"reserved_device_bytes\":" << config.router_bf16_reservation.device_bytes
         << ",\"setup_host_bytes\":" << config.router_bf16_reservation.setup_host_bytes
         << ",\"qualification\":\"per-tensor-bit-check\",\"phase\":\"pending-model-load\"}";
-    out << ",\"turbo_weights\":{\"source\":\"" << (o.turbo.active() ? "onfly" : "native") << "\",\"bits\":" << o.turbo.bits
+    if (o.turbo.active()) out << ",\"turbo_weights\":{\"source\":\"" << (o.turbo.active() ? "onfly" : "native") << "\",\"bits\":" << o.turbo.bits
         << ",\"identity\":\"" << (o.turbo.active() ? o.turbo.identity() : std::string("native")) << "\",\"groups\":\""
         << (o.turbo.active() ? strix::onfly_i4::groups_text(o.turbo.groups) : std::string("none")) << "\",\"scale_rule\":\""
         << strix::onfly_i4::scale_rule_name(o.turbo.scale_rule) << "\",\"scope\":\""

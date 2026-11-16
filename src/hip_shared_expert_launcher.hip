@@ -1,5 +1,7 @@
+#include "strix/cohort_step_plan.hpp"
 #include "strix/env_flags.hpp"
 #include "core/row_layout.hpp"
+#include "core/ordered_reduce.hpp"
 #include "strix/hip_qwen_dpp_reduce.hpp"
 #include "strix/moe_q4k_a8_contract.hpp"
 #include "strix/hip_mtp_fast_draft.hpp"
@@ -587,13 +589,9 @@ __global__ void __launch_bounds__(kThreads) rows_shared_activation_scalar_kernel
     float sum = 0.0F;
     for (std::uint32_t feature = static_cast<std::uint32_t>(threadIdx.x); feature < input_width; feature += kThreads)
         sum += load_activation(&input[feature]) * load_weight<WeightKind::f32>(scalar_weights, input_width, 0, feature);
-    scratch[threadIdx.x] = sum;
-    __syncthreads();
-    for (std::uint32_t stride = kThreads / 2U; stride > 0; stride >>= 1U) {
-        if (threadIdx.x < stride) scratch[threadIdx.x] += scratch[threadIdx.x + stride];
-        __syncthreads();
-    }
-    if (threadIdx.x == 0) workspace[intermediate_size] = 1.0F / (1.0F + expf(-scratch[0]));
+    // The scratch halving tree, levels 16..1 in wave 0 registers (same pairing and bits, 3 barriers instead of 9).
+    const float dot = ::strix::core::ordered_reduce::tree_to_lane0<kThreads>(scratch, sum, threadIdx.x);
+    if (threadIdx.x == 0) workspace[intermediate_size] = 1.0F / (1.0F + expf(-dot));
 }
 
 // Cohort rows: the same activation and scalar gate as rows_shared_activation_scalar_kernel for rows that are not
@@ -618,13 +616,9 @@ __global__ void __launch_bounds__(kThreads) rows_shared_activation_scalar_site_k
     float sum = 0.0F;
     for (std::uint32_t feature = static_cast<std::uint32_t>(threadIdx.x); feature < input_width; feature += kThreads)
         sum += load_activation(&input[feature]) * load_weight<WeightKind::f32>(scalar_weights, input_width, 0, feature);
-    scratch[threadIdx.x] = sum;
-    __syncthreads();
-    for (std::uint32_t stride = kThreads / 2U; stride > 0; stride >>= 1U) {
-        if (threadIdx.x < stride) scratch[threadIdx.x] += scratch[threadIdx.x + stride];
-        __syncthreads();
-    }
-    if (threadIdx.x == 0) workspace[intermediate_size] = 1.0F / (1.0F + expf(-scratch[0]));
+    // The scratch halving tree, levels 16..1 in wave 0 registers (same pairing and bits, 3 barriers instead of 9).
+    const float dot = ::strix::core::ordered_reduce::tree_to_lane0<kThreads>(scratch, sum, threadIdx.x);
+    if (threadIdx.x == 0) workspace[intermediate_size] = 1.0F / (1.0F + expf(-dot));
 }
 
 // The shared gate of one row: the scalar dot (thread-strided sums, the 256-leaf tree) and its sigmoid at
@@ -636,13 +630,9 @@ __device__ __forceinline__ void shared_gate_dot(float* workspace, const std::uin
 #pragma unroll 10
     for (std::uint32_t feature = static_cast<std::uint32_t>(threadIdx.x); feature < input_width; feature += kThreads)
         sum += load_activation(&input[feature]) * load_weight<WeightKind::f32>(scalar_weights, input_width, 0, feature);
-    scratch[threadIdx.x] = sum;
-    __syncthreads();
-    for (std::uint32_t stride = kThreads / 2U; stride > 0; stride >>= 1U) {
-        if (threadIdx.x < stride) scratch[threadIdx.x] += scratch[threadIdx.x + stride];
-        __syncthreads();
-    }
-    if (threadIdx.x == 0) workspace[intermediate_size] = 1.0F / (1.0F + expf(-scratch[0]));
+    // The scratch halving tree, levels 16..1 in wave 0 registers (same pairing and bits, 3 barriers instead of 9).
+    const float dot = ::strix::core::ordered_reduce::tree_to_lane0<kThreads>(scratch, sum, threadIdx.x);
+    if (threadIdx.x == 0) workspace[intermediate_size] = 1.0F / (1.0F + expf(-dot));
 }
 // Paired route (core/glu_pair.hpp): the gate|up epilogue already wrote act16, only the shared gate remains (one CTA per row).
 __global__ void __launch_bounds__(kThreads) rows_shared_gate_dot_kernel(std::uint64_t workspace_base,
@@ -2689,10 +2679,10 @@ void known_shared_cohort_enqueue(std::span<const KnownSharedR2Views> segments, s
 void shared_expert_known_window_cohort_launch(std::span<const std::span<const ExecutionDispatchContext>> segments,
     const HipSharedExpertLauncherConfig& config, void* raw_stream, std::uintptr_t workspace, std::uint64_t workspace_bytes) {
     const auto stream = static_cast<hipStream_t>(raw_stream);
-    if (segments.size() < 2U || segments.size() > 8U || !stream)
-        throw std::invalid_argument("known-window cohort shared rows require two to eight sessions and a stream");
-    std::array<KnownSharedR2Views, 8> views{};
-    std::array<unsigned, 8> counts{};
+    if (segments.size() < 2U || segments.size() > kCohortWideMaxSessions || !stream)
+        throw std::invalid_argument("known-window cohort shared rows require two to sixteen sessions and a stream");
+    std::array<KnownSharedR2Views, kCohortWideMaxSessions> views{};
+    std::array<unsigned, kCohortWideMaxSessions> counts{};
     unsigned total = 0;
     std::uint64_t workspace_extent = 0;
     for (std::size_t k = 0; k < segments.size(); ++k) {

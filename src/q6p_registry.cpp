@@ -143,7 +143,7 @@ namespace iu4 {
 namespace {
 struct Registry {
     std::shared_mutex mutex;
-    std::unordered_map<const void*, Tensor> tensors;
+    std::unordered_map<const void*, std::shared_ptr<const Tensor>> tensors;
     std::atomic<std::uint64_t> count{0}, hits{0};
 };
 Registry& registry() {
@@ -152,26 +152,34 @@ Registry& registry() {
 }
 }  // namespace
 void register_tensor(const void* original_address, const Tensor& tensor) {
+    if (!tensor.backing) throw std::invalid_argument("onfly INT4 registration requires a backing lease");
+    auto snapshot = std::make_shared<const Tensor>(tensor);
     auto& r = registry();
-    const std::unique_lock lock(r.mutex);
-    r.tensors[original_address] = tensor;
-    r.count.store(r.tensors.size(), std::memory_order_release);
+    {
+        const std::unique_lock lock(r.mutex);
+        r.tensors[original_address].swap(snapshot);
+        r.count.store(r.tensors.size(), std::memory_order_release);
+    } // Release retired backing outside the registry lock.
 }
 void unregister_tensor(const void* original_address, const unsigned char* copy_address) noexcept {
+    std::shared_ptr<const Tensor> retired;
     auto& r = registry();
     const std::unique_lock lock(r.mutex);
     const auto it = r.tensors.find(original_address);
-    if (it != r.tensors.end() && it->second.base == copy_address) r.tensors.erase(it);
+    if (it != r.tensors.end() && it->second->base == copy_address) {
+        retired = std::move(it->second);
+        r.tensors.erase(it);
+    }
     r.count.store(r.tensors.size(), std::memory_order_release);
 }
-const Tensor* find(const void* original_address) noexcept {
+std::shared_ptr<const Tensor> find(const void* original_address) noexcept {
     auto& r = registry();
     if (!r.count.load(std::memory_order_acquire)) return nullptr;
     const std::shared_lock lock(r.mutex);
     const auto it = r.tensors.find(original_address);
     if (it == r.tensors.end()) return nullptr;
     r.hits.fetch_add(1U, std::memory_order_relaxed);
-    return &it->second;
+    return it->second;
 }
 std::uint64_t count() noexcept { return registry().count.load(std::memory_order_acquire); }
 std::uint64_t hits() noexcept { return registry().hits.load(std::memory_order_relaxed); }

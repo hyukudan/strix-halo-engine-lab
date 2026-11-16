@@ -16,6 +16,7 @@
 #include "strix/deepseek41_model.hpp"
 #include "strix/model_content_hash.hpp"
 #include "strix/vision/compare.hpp"
+#include "strix/vision/embed_cache.hpp"
 #include "strix/vision/encoder.hpp"
 #include "strix/vision/gguf_weights.hpp"
 #include "strix/vision/image.hpp"
@@ -201,9 +202,41 @@ int diagnose(const std::string& names, const std::filesystem::path& dir, const d
 }
 #endif
 
+// --bench FILE.png: the serve path of one image without a cache (decode + patches, then encode_cached: positions,
+// encode, project), reps times on the loaded backend. --prepare: prepare_backend first (projector panels, workspace;
+// --warm adds the grey warm-up image), as the server does at start. Rep 1 carries what is still first-use.
+int bench(const std::string& png_path, unsigned reps, int prepare, ds::VisionAdapter& adapter, const vision::EncoderWeights& weights,
+          vision::EncoderBackend& backend) {
+    const std::vector<std::uint8_t> png = read_raw<std::uint8_t>(png_path);
+    if (prepare >= 0) {
+        const auto t0 = Clock::now();
+        const vision::PrepareReport r = vision::prepare_backend(adapter, backend, weights, prepare > 0);
+        std::printf("bench prepare %.2f ms (linears %zu, reserved rows %u, prepare %.2f ms, warm-up rows %u %.2f ms)\n", ms_since(t0),
+                    r.linears, r.reserved_rows, r.prepare_ms, r.warmup_rows, r.warmup_ms);
+    }
+    std::uint64_t first_fnv = 0;
+    for (unsigned rep = 0; rep < reps; ++rep) {
+        auto t0 = Clock::now();
+        const vision::Image image = vision::decode(png);
+        const vision::PatchGrid g = adapter.patches(image);
+        const double pre_ms = ms_since(t0);
+        t0 = Clock::now();
+        const auto enc = vision::encode_cached(adapter, backend, weights, nullptr, vision::Digest{}, g);
+        const double enc_ms = ms_since(t0);
+        std::uint64_t h = 1469598103934665603ULL;
+        for (const auto v : enc.rows->bf16) h = (h ^ v) * 1099511628211ULL;
+        if (rep == 0) first_fnv = h;
+        std::printf("bench rep %u: patches %u grid %ux%u rows %u | preprocess %.2f ms encode_cached %.2f ms | rows fnv %016llx %s\n",
+                    rep + 1U, g.rows, g.grid_h, g.grid_w, enc.rows->rows, pre_ms, enc_ms, static_cast<unsigned long long>(h),
+                    h == first_fnv ? "same" : "DIFFERS");
+    }
+    return 0;
+}
+
 int run(int argc, char** argv) {
-    std::string model, ref, backend_name = "host", only, diagnose_names;
-    unsigned host_max_patches = 200;
+    std::string model, ref, backend_name = "host", only, diagnose_names, bench_png;
+    unsigned host_max_patches = 200, bench_reps = 3;
+    int bench_prepare = -1;  // -1 none, 0 prepare_backend, 1 prepare_backend + warm-up
     bool split = false, no_split = false, unpinned = false;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
@@ -220,9 +253,14 @@ int run(int argc, char** argv) {
         else if (a == "--no-split") no_split = true;
         else if (a == "--unpinned") unpinned = true;
         else if (a == "--diagnose") diagnose_names = next();
+        else if (a == "--bench") bench_png = next();
+        else if (a == "--reps") bench_reps = static_cast<unsigned>(std::stoul(next()));
+        else if (a == "--prepare") bench_prepare = 0;
+        else if (a == "--warm") bench_prepare = 1;
         else throw std::invalid_argument("unknown option " + a);
     }
-    if (model.empty() || ref.empty()) throw std::invalid_argument("usage: --model FILE.gguf --ref DIR [--backend host|hip]");
+    if (model.empty() || (ref.empty() && bench_png.empty()))
+        throw std::invalid_argument("usage: --model FILE.gguf (--ref DIR | --bench FILE.png [--reps N]) [--backend host|hip]");
     const bool device = backend_name == "hip";
     if (!device && backend_name != "host") throw std::invalid_argument("--backend host|hip");
 
@@ -279,6 +317,7 @@ int run(int argc, char** argv) {
 #endif
     if (!backend) backend = std::make_unique<vision::ReferenceEncoder>(cfg, weights);
     std::printf("backend %s\n", backend->arithmetic());
+    if (!bench_png.empty()) return bench(bench_png, bench_reps, bench_prepare, adapter, weights, *backend);
 
     const double cos_mean_gate = device ? 0.9995 : 0.99999, cos_min_gate = device ? 0.998 : 0.99999;
     const double rel_gate = device ? 0.02 : 0.01;

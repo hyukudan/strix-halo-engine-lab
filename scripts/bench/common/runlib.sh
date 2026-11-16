@@ -50,6 +50,22 @@ kit_peer() {
 }
 kit_peer_root() { echo "${KIT_PEER_ROOT:-$KIT_ROOT}"; }
 
+# kit_peer_inputs ARG...: fail fast, before any GPU time, when the peer rank cannot read an input the local rank
+# reads. Each ARG is a path, NAME=PATH, or a ':'-separated spec (e.g. d:/p/x.u32:128); every absolute field that
+# exists locally must be readable on KIT_PEER under the same path. A missing input names every missing path.
+kit_peer_inputs() {
+    local a f miss need=()
+    for a in "$@"; do
+        IFS=: read -ra F <<<"${a#*=}"
+        for f in "${F[@]}"; do [[ $f == /* && -e $f ]] && need+=("$f"); done
+    done
+    ((${#need[@]})) || return 0
+    miss=$(kit_peer "for f in $(printf '%q ' "${need[@]}"); do [ -r \"\$f\" ] || echo \"\$f\"; done") ||
+        kit_die 'peer input check failed (peer unreachable)'
+    [[ -z $miss ]] || kit_die "peer $KIT_PEER is missing inputs: $(echo $miss)"
+    kit_log "peer inputs ok (${#need[@]} paths)"
+}
+
 # kit_same_binary LOCAL_BIN [PEER_BIN]: abort a pair ticket when the two nodes run different binaries.
 kit_same_binary() {
     local a b

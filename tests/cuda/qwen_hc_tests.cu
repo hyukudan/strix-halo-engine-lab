@@ -1,4 +1,4 @@
-// Tests of src/cuda/qwen_hc.cu (family "hc"): literal host references of the HIP kernels vs the CUDA kernels, bit for bit.
+// Tests of src/cuda/models/qwen/qwen_hc.cu (family "hc"): literal host references of the HIP kernels vs the CUDA kernels, bit for bit.
 //   qwen_hc_tests [--tables DIR] [--fixture FILE] [--skip-real] [--skip-perf]
 // Tables default qrtx-build\tables; the GGUF comes from tests/cuda/qwen_gguf_host.hpp. With --fixture (or when
 // qrtx-build\fx\d64.dump exists) the HIP step dump is replayed: hyper mixes, router, inject, combine, expand,
@@ -6,7 +6,7 @@
 //
 // The host references follow the HIP source and the gfx1151 ISA literally (see the header comment of qwen_hc.cu):
 // each FMA is std::fma, every other operation one IEEE single operation (no contraction: fp_contract off below).
-// expf/rsqrtf on the host are a transliteration of src/cuda/qwen_amd_math.cuh over the same table files.
+// expf/rsqrtf on the host are a transliteration of include/strix/cuda/amd_math.cuh over the same table files.
 #if defined(_MSC_VER) && !defined(__CUDA_ARCH__)
 #pragma fp_contract(off)
 #pragma float_control(precise, on)
@@ -29,10 +29,10 @@
 #include <string>
 #include <vector>
 
-#include "qwen_amd_math_tables.hpp"
+#include "strix/cuda/amd_math_tables.hpp"
 #include "qwen_fixture.hpp"
 #include "qwen_gguf_host.hpp"
-#include "strix/cuda_qwen_hc.hpp"
+#include "strix/cuda/qwen_hc.hpp"
 
 namespace hc = strix::cuda::qwen_hc;
 namespace am = strix::cuda::amdmath;
@@ -71,7 +71,7 @@ static std::uint16_t float_to_half(float f) {  // RNE, used only to build synthe
     return static_cast<std::uint16_t>(s | r);
 }
 
-// Host port of qwen_amd_math.cuh (same tables, same algorithm).
+// Host port of amd_math.cuh (same tables, same algorithm).
 struct HostMath {
     std::vector<std::uint32_t> exp_bits, rsq_bits;
     std::map<std::uint32_t, float> exp_hard, rsq_hard;
