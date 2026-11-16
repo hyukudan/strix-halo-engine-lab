@@ -1,4 +1,5 @@
 """Version 1 portable capture records. Hashes are receipts, never equality proofs."""
+import hashlib
 import json
 import pathlib
 import struct
@@ -16,7 +17,7 @@ def fnv1a64(data):
 
 
 def write_record(path, metadata, sections):
-    if not sections or set(sections) - SECTIONS:
+    if not any(sections.values()) or set(sections) - SECTIONS:
         raise ValueError("unknown or empty byte sections")
     header = dict(metadata)
     header["sections"] = [{"name": key, "bytes": len(value), "fnv1a64": fnv1a64(value)}
@@ -51,9 +52,58 @@ def read_record(path):
             if len(data) != count or fnv1a64(data) != section["fnv1a64"]:
                 raise ValueError(f"truncated or invalid receipt: {name}")
             sections[name] = data
-        if not sections or stream.read(1):
+        if not any(sections.values()) or stream.read(1):
             raise ValueError("empty sections or trailing bytes")
     return header, sections
+
+
+def read_matrix(path):
+    """A matrix freezes record names, semantic metadata and exact section sizes."""
+    matrix = json.loads(pathlib.Path(path).read_text())
+    if matrix.get("schema") != "wfmt.matrix@1" or not matrix.get("cases"):
+        raise ValueError("nonempty wfmt.matrix@1 required")
+    names = set()
+    for case in matrix["cases"]:
+        name = case["file"]
+        parts = pathlib.PurePosixPath(name)
+        if (not name.endswith(".wfmt") or parts.is_absolute() or ".." in parts.parts
+                or "\\" in name or ":" in name or str(parts) != name or name in names):
+            raise ValueError("invalid or duplicate matrix record name")
+        names.add(name)
+        for key in ("case", "arithmetic"):
+            if not isinstance(case[key], str) or not case[key]:
+                raise ValueError("missing matrix identity")
+        if not isinstance(case["shape"], list) or any(type(n) is not int or n < 0 for n in case["shape"]):
+            raise ValueError("invalid matrix shape")
+        required, optional = case["required_sections"], case.get("optional_sections", {})
+        if not required or set(required) & set(optional):
+            raise ValueError("required evidence or disjoint optional sections missing")
+        for sizes, minimum in ((required, 1), (optional, 0)):
+            if set(sizes) - SECTIONS or any(type(n) is not int or n < minimum for n in sizes.values()):
+                raise ValueError("invalid matrix section lengths")
+    return matrix
+
+
+def validate_inventory(directory, matrix):
+    directory = pathlib.Path(directory)
+    files = {p.relative_to(directory).as_posix(): p for p in directory.rglob("*.wfmt")}
+    expected = {case["file"]: case for case in matrix["cases"]}
+    if files.keys() != expected.keys():
+        raise ValueError("capture inventory differs from matrix")
+    hashes = {}
+    for name, path in sorted(files.items()):
+        meta, sections = read_record(path)
+        case = expected[name]
+        if any(meta.get(key) != case.get(key) for key in ("case", "arithmetic", "shape", "format", "image")):
+            raise ValueError(f"capture metadata differs from matrix: {name}")
+        required = case["required_sections"]
+        sizes = {**required, **case.get("optional_sections", {})}
+        if not set(required) <= sections.keys() or sections.keys() - sizes.keys():
+            raise ValueError(f"capture sections differ from matrix: {name}")
+        if any(len(data) != sizes[key] for key, data in sections.items()):
+            raise ValueError(f"capture lengths differ from matrix: {name}")
+        hashes[name] = hashlib.sha256(path.read_bytes()).hexdigest()
+    return hashes
 
 
 def compare_record(old, new):

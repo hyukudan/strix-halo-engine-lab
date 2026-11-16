@@ -2,9 +2,11 @@
 #include <array>
 namespace strix::weight {
 namespace {
-// Descriptive frozen contracts; these records never select a production kernel.
+// Descriptive migration inventory, not complete frozen arithmetic specifications.
+// Unspecified boundaries must be frozen and qualified before implementation migration.
+// These records never select a production kernel.
 constexpr auto contracts = std::to_array<ArithmeticDescriptor>({
-  {{"cpu-q8a8-tree32", 1}, Exactness::legacy_bitwise, "RNE signed A8, groups32", "raw Q8_0 int8", "int32 dot32 then float(dot)*(dw*dx)", "g into lane g%32", "32 lanes", "xor butterfly 16,8,4,2,1", "none", "none", false, false},
+  {{"cpu-q8a8-tree32", 1}, Exactness::legacy_bitwise, "groups32; amax=max(abs(x)); delta=1 if amax<2^-119 else amax/127; tiny 0<amax<2^-119 -> codes0; otherwise nearbyint(x/delta), clamp[-127,127] (RNE environment)", "raw Q8_0 int8", "int32 dot32 then float(dot)*(dw*dx)", "+0 lanes; g ascending into lane g%32", "32 lanes", "xor butterfly 16,8,4,2,1; output=p or old_output+p when accumulate", "none", "none", false, false},
   {{"intel-q8a8-f16-ascending", 1}, Exactness::legacy_bitwise, "RNE signed A8, groups32", "F16(code*scale)", "F16 operands -> FP32 product", "k ascending", "one output", "ascending from +0", "none", "none", false, false},
   {{"dense-q8a8-f16-v1", 1}, Exactness::fast, "A8 -> F16", "Q8_0 -> F16", "HIP WMMA FP32", "CTA fixed K partitions", "CTA", "ascending partitions", "none", "none", false, false},
   {{"ds41-group-product", 1}, Exactness::legacy_bitwise, "existing group operand", "format delegate", "ordered group product", "format-defined", "format-defined", "existing decoder order", "none", "none", false, false},
