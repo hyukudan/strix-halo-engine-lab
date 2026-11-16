@@ -27,6 +27,7 @@
 #include "strix/env_flags.hpp"
 
 #include <hip/hip_runtime.h>
+#include "../hip/weight/arch/gfx1151_sources.hpp"
 
 #include <concepts>
 #include <cstddef>
@@ -166,8 +167,8 @@ __device__ __forceinline__ void core(const float* x, unsigned in, unsigned nr, C
         if constexpr (ColsStage<Cols>) {
             cols.stage(stile, tid & 15U, unit, nb);
         } else {
-#pragma unroll
-            for (unsigned i = 0; i < 8U; ++i) nb[i] = *(detail::GlobalU4*)(wp + std::size_t{unit} * 32U + 16U * i);
+            // Every existing raw-F16 Columns policy receives this default source.
+            ::strix::weight::hip::RawF16Source::stage(wp,unit,nb);
         }
     };
     // A wave with no live row keeps its staging and barrier duties and skips its row loads and WMMAs.
