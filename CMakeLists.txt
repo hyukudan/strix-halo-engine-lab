@@ -2904,6 +2904,7 @@ int main() { return 0; }"
         set_target_properties(strix_qwen35_hip_engine PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHS}")
         set_source_files_properties(src/qwen35/hip/engine.hip PROPERTIES COMPILE_OPTIONS "-ffp-contract=off")
         target_link_libraries(strix_qwen35_hip_engine PUBLIC strix_hip_runtime strix_core)
+        target_include_directories(strix_qwen35_hip_engine PRIVATE src)  # attn_core headers include "attn_core/..."
         add_executable(strix-hip-qwen35-decode apps/hip_qwen35_decode_main.hip)
         set_target_properties(strix-hip-qwen35-decode PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHS}")
         target_link_libraries(strix-hip-qwen35-decode PRIVATE strix_qwen35_hip_engine)
