@@ -99,3 +99,7 @@ are unchanged, so the logits are bit-identical. Switches: `STRIX_QRTX_QSA_GRAPH=
 Served decode by prompt class: `scripts/bench/cuda/qwen_serve_classes.py` (prose / edit / json, C1 / C4 / C8, cold and
 warm passes, ids of every request) with `scripts/bench/cuda/qwen_classes_prompts.json`, and strict ABAB server arms with
 `scripts/bench/cuda/qwen_serve_abab.sh` (server, model flags, arms and client are parameters; GPU clock samples per arm).
+Summarise arms with `scripts/bench/cuda/qwen_serve_summary.py OUT`: C1 means only over prompts run in both passes, C1
+requests shorter than 16 tokens (the model ends early: prose slice 0 stops after 1 token) are listed and skipped, cold and
+warm side by side per arm. Comparing a 2-prompt warm mean that contains a 1-token request with an 8-prompt cold mean is
+what made warm look slower than cold in #680.
