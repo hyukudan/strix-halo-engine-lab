@@ -69,3 +69,10 @@ subsequent resolver calls do not re-scan weights. The counting-source fixture
 checks this distinction and a malformed FP8-code fixture verifies that full
 admission keeps its value gate. A Linux host fixture also instantiates GLM's
 production index and compares its legacy byte ranges with the shared map.
+
+For a non-circular compatibility gate, the kit's legacy wrapper adapter compiles
+unchanged against the immediately preceding revision and the candidate. It
+records each public API's dtype, shape, offset, length, acceptance and raw bytes,
+then uses the same versioned writer and byte comparator. The root host session
+fixture also covers aliases: asset identity retains all path references, while
+one opened physical shard contributes one tensor table.
