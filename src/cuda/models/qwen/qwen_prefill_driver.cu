@@ -28,6 +28,7 @@
 #include "strix/cuda/qwen_transcode.hpp"
 #include "strix/gguf_reader.hpp"
 #include "strix/cuda/vram_guard.hpp"
+#include "strix/rows_fit.hpp"
 
 #include "strix/cuda/amd_math_tables.hpp"
 
@@ -46,6 +47,7 @@
 #include <limits>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <vector>
 
@@ -422,6 +424,7 @@ struct Prefill::Impl : BlockFields {
     std::uint64_t host_bytes = 0;
 
     std::string describe;
+    std::string block_fit_note;  // "8192->6144 rows (reserve 512 MiB)" when the block fit reduced the capacity
     std::uint32_t transcoded = 0;              // tensors transcoded at load
     StateCopyStream state_copy;
     cudaStream_t state_copy_stream(SessionState& s) {
@@ -440,6 +443,7 @@ struct Prefill::Impl : BlockFields {
     void upload_mtp();
     void allocate();
     void allocate_block(std::uint32_t rows, std::uint32_t qsa_chunk, bool engine_set);
+    void allocate_fitted_block();
     static void free_block(BlockFields& b) noexcept;
     int stream_priority_high = 0, stream_priority_low = 0;  // cudaDeviceGetStreamPriorityRange (greatest, least)
     // ---- prefill overlap: a second BlockFields set (own stream and scratch) for prefill chunks enqueued while decode
@@ -754,10 +758,46 @@ void Prefill::Impl::allocate_block(std::uint32_t rows, std::uint32_t qsa_chunk, 
     }
 }
 
+// Block fit (Config::block_fit, strix/rows_fit.hpp): the engine block set is the one consumer whose size is a free
+// choice, so it is allocated after weights, decode buffers, draft and session 0, with the largest capacity (1024-row
+// steps from the schedule maximum) that still leaves block_fit_reserve_mib free; the schedule is clamped to it.
+// Bitwise: block rows only change how many rows a launch covers.
+void Prefill::Impl::allocate_fitted_block() {
+    const auto want = round_up(*std::max_element(cfg.block_schedule.begin(), cfg.block_schedule.end()), 16U);
+    const std::uint64_t reserve = std::uint64_t{cfg.block_fit_reserve_mib} << 20U;
+    const auto drop = [&] {  // the engine stream lives in BlockFields but is not the block's: keep it
+        cudaStream_t keep = stream;
+        stream = nullptr;
+        free_block(static_cast<BlockFields&>(*this));
+        stream = keep;
+    };
+    const auto fit = strix::rows_fit::fit(want, std::min<std::uint32_t>(want, 1024U), 1024U, [&](std::uint32_t rows) {
+        try {
+            allocate_block(rows, std::min<std::uint32_t>(rows, 1024U), true);
+        } catch (const std::runtime_error& e) {
+            const std::string_view what(e.what());
+            if (what.find("VRAM full") == std::string_view::npos && what.find("out of memory") == std::string_view::npos) throw;
+            drop();
+            return false;
+        }
+        std::size_t free = 0, total = 0;
+        ck(cudaMemGetInfo(&free, &total), "block fit");
+        if (free >= reserve) return true;
+        drop();
+        return false;
+    });
+    if (fit.reduced()) {
+        cfg.block_schedule = strix::rows_fit::clamp_schedule(cfg.block_schedule, cap);
+        cfg.final_block_rows = std::min(cfg.final_block_rows, cap);
+        block_fit_note = std::to_string(fit.want) + "->" + std::to_string(cap) + " rows (reserve " +
+                         std::to_string(cfg.block_fit_reserve_mib) + " MiB)";
+    }
+}
+
 void Prefill::Impl::allocate() {
     gdn_stride = 10240 + 6144 + 48 + 48 + 6144;
     const auto rows = round_up(*std::max_element(cfg.block_schedule.begin(), cfg.block_schedule.end()), 16U);
-    allocate_block(rows, std::min<std::uint32_t>(rows, 1024U), true);
+    if (!cfg.block_fit) allocate_block(rows, std::min<std::uint32_t>(rows, 1024U), true);  // fit: after session 0
     if (cfg.decode) {
         head_logits = dev_zero<float>(std::uint64_t{kMaxWindowRows} * hc::kVocab, "head logits");
         argmax_dev = dev_zero<std::uint32_t>(kMaxWindowRows, "argmax");
@@ -903,6 +943,7 @@ Prefill::Prefill(const Config& config) : impl_(std::make_unique<Impl>()) {
     m.allocate();
     m.upload_draft();
     m.new_session();  // session 0: the single-session API
+    if (m.cfg.block_fit) m.allocate_fitted_block();  // last: the block capacity takes what the fixed buffers left
     {
         const char* v = std::getenv("STRIX_QRTX_GRAPHS");
         m.use_graphs = !(v && v[0] == '0');
@@ -918,6 +959,10 @@ Prefill::Prefill(const Config& config) : impl_(std::make_unique<Impl>()) {
                   static_cast<double>(m.w.bytes) / 1e9, std::chrono::duration<double>(Clock::now() - t0).count(), m.cap,
                   config.max_positions, m.transcoded, m.native_experts ? "true" : "false");
     m.describe = buf; // OFF receipt remains the original byte sequence.
+    if (!m.block_fit_note.empty()) {  // only when the fit reduced the capacity: other receipts keep their bytes
+        m.describe.pop_back();
+        m.describe += ",\"block_fit\":\"" + m.block_fit_note + "\"}";
+    }
     if (m.route_policy.enabled) {
         const auto id = numerical_identity();
         char identity_hash[17];

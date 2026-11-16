@@ -3,6 +3,7 @@
 // differences. No CUDA, no GPU, no process environment (the resolver reads the lookup it is given).
 #include "strix/cuda/qwen_options.hpp"
 #include "strix/cuda/qwen_prefix_identity.hpp"
+#include "strix/rows_fit.hpp"
 
 #include <cstdio>
 #include <array>
@@ -60,6 +61,8 @@ std::set<std::string> diff(const qp::Config& a, const qp::Config& b) {
     ne("block_schedule", a.block_schedule != b.block_schedule);
     ne("tail_large", a.tail_large != b.tail_large);
     ne("final_block_rows", a.final_block_rows != b.final_block_rows);
+    ne("block_fit", a.block_fit != b.block_fit);
+    ne("block_fit_reserve_mib", a.block_fit_reserve_mib != b.block_fit_reserve_mib);
     ne("device", a.device != b.device);
     ne("ple_host_pinned", a.ple_host_pinned != b.ple_host_pinned);
     ne("release_by_layer", a.release_by_layer != b.release_by_layer);
@@ -347,12 +350,43 @@ void snapshot_forms() {
 }
 }  // namespace
 
+// Block fit: shared rows_fit planner (fake allocator) and the resolver binding (every entry, typed schedule strict).
+void block_fit() {
+    namespace rf = strix::rows_fit;
+    check(rf::next_lower(8192, 1024, 1024) == 7168 && rf::next_lower(8200, 1024, 1024) == 8192 &&
+              rf::next_lower(1500, 1024, 1024) == 1024 && rf::next_lower(1024, 1024, 1024) == 0,
+          "next_lower steps to the multiple below, floors at min_rows, stops at min_rows");
+    // per-row bytes 700, budget 5,000,000: 7168 rows fit (5,017,600 does not; 6144 -> 4,300,800 does)
+    std::vector<std::uint32_t> tried;
+    const auto fits = [&](std::uint32_t rows) { tried.push_back(rows); return std::uint64_t{rows} * 700U <= 5'000'000U; };
+    auto r = rf::fit(8192, 1024, 1024, fits);
+    check(r.rows == 6144 && r.reduced() && r.tries == 3 && tried == std::vector<std::uint32_t>({8192, 7168, 6144}),
+          "fit steps 8192 -> 7168 -> 6144 and keeps the first that fits");
+    r = rf::fit(4096, 1024, 1024, fits);
+    check(r.rows == 4096 && !r.reduced() && r.tries == 1, "a capacity that fits is kept on the first try");
+    bool threw = false;
+    try { (void)rf::fit(8192, 1024, 1024, [](std::uint32_t) { return false; }); } catch (const std::runtime_error&) { threw = true; }
+    check(threw, "nothing fits: the load is refused");
+    check(rf::clamp_schedule({1024, 2048, 4096, 8192}, 6144) == std::vector<std::uint32_t>({1024, 2048, 4096, 6144}) &&
+              rf::clamp_schedule({8192}, 4096) == std::vector<std::uint32_t>({4096}),
+          "the schedule is clamped to the fitted capacity, small ramp blocks kept");
+    const Env off{{"STRIX_QRTX_BLOCK_FIT", "0"}}, bad{{"STRIX_QRTX_BLOCK_FIT", "yes"}};
+    for (const auto e : {qo::Entry::serve, qo::Entry::cli, qo::Entry::prefill_service}) {
+        check(one({}, e).config.block_fit, "block fit on by default on every entry");
+        check(!one({}, e, off).config.block_fit, "STRIX_QRTX_BLOCK_FIT=0 turns it off");
+        check(!one({"--block-rows", "8192"}, e).config.block_fit && !one({"--blocks", "1024,2048,4096,8192"}, e).config.block_fit,
+              "a typed schedule is the caller's: no fit");
+    }
+    check(refuses({}, bad, qo::Entry::serve), "STRIX_QRTX_BLOCK_FIT accepts 0 or 1 only");
+}
+
 int main() {
     try {
         profiles();
         overrides();
         common_options();
         flat_blocks();
+        block_fit();
         identities();
         effective_config();
         route_governors();

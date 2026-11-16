@@ -44,6 +44,14 @@ inline constexpr ::strix::lever::Decl flat_blocks_lever{
     .name = "qwen_cuda_flat_blocks", .env = "STRIX_QRTX_FLAT_BLOCKS", .exactness = ::strix::lever::Exactness::bitwise,
     .default_on = true, .source = "docs/engine/serving/qwen-cuda-prefill.md: flat-block receipt (strict ABAB, bit-equal logit dumps)"};
 
+// Block fit: the block workspace is allocated after everything else and its capacity steps down (1024 rows) until it fits
+// the free VRAM, instead of refusing the load (Qwen3.8-Flash-Next at 256K: the 8192-row block leaves no room for the
+// session KV; 4096 fits). Every entry, so CLI = serve. Bitwise: block rows do not change bits; with room for the schedule
+// maximum nothing changes but the allocation order. A typed --blocks / --block-rows stays strict.
+inline constexpr ::strix::lever::Decl block_fit_lever{
+    .name = "qwen_cuda_block_fit", .env = "STRIX_QRTX_BLOCK_FIT", .exactness = ::strix::lever::Exactness::bitwise,
+    .default_on = true, .source = "wave4/next1112/RTXLONG-RESULT.md: 256K fitted-block receipt (bit-equal logit dumps)"};
+
 struct Difference {
     std::string name, value, reason;
 };
@@ -167,6 +175,11 @@ inline Resolved resolve(const Request& r, Entry entry, std::string_view default_
             }
         }
     } else if (r.release_by_layer) c.release_by_layer = *r.release_by_layer;
+    {  // every entry: CLI = serve
+        const std::string key(block_fit_lever.env);
+        const char* raw = r.inputs.env ? r.inputs.env(key.c_str()) : ::strix::envcfg::text(key.c_str());
+        c.block_fit = !r.blocks_typed && ::strix::lever::select(block_fit_lever, {}, raw).on;
+    }
     if (entry != Entry::serve && c.model_gguf.empty() && !default_model.empty()) {
         c.model_gguf = std::string(default_model);
         name("model_gguf", c.model_gguf, "prefill service default file name when --model is absent");
@@ -212,6 +225,7 @@ inline std::string effective_config_json(const Resolved& r) {
     engine.set("max_positions", J(static_cast<std::uint64_t>(c.max_positions)));
     engine.set("tail_large", J(c.tail_large));
     engine.set("final_block_rows", J(static_cast<std::uint64_t>(c.final_block_rows)));
+    engine.set("block_fit", J(c.block_fit));
     auto blocks = J::array();
     for (const auto b : c.block_schedule) blocks.push(J(static_cast<std::uint64_t>(b)));
     engine.set("block_schedule", std::move(blocks));

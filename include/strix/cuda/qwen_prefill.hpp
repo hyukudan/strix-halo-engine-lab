@@ -35,6 +35,12 @@ struct Config {
     std::vector<std::uint32_t> block_schedule{1024, 2048, 4096, 8192};  // rows per block; the last entry repeats
     bool tail_large = true;           // rotate final remainder to front; same count and capacity (--block-schedule default = off)
     std::uint32_t final_block_rows = 0; // optional tail reservation within loaded max block
+    // Fit the block capacity to the VRAM left after weights, decode buffers and session 0 (strix/rows_fit.hpp): the block
+    // workspace is allocated last and steps down by 1024 rows until it fits with block_fit_reserve_mib free; the schedule is
+    // clamped to the fitted capacity. Bitwise (block rows never change the per-row arithmetic). Off: allocate the schedule
+    // maximum before the decode buffers and refuse when anything later does not fit (the pre-fit behaviour).
+    bool block_fit = false;
+    std::uint32_t block_fit_reserve_mib = 512;
     int device = 0;
     bool ple_host_pinned = true;       // per_layer_token_embd (28.8 GB) in pinned host memory, gathered on the host
     // Release per layer: every block's KV/index rows of layer l, and in the last block each GDN layer's recurrent/conv
