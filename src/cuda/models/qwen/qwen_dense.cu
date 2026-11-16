@@ -489,7 +489,7 @@ template <Store S, unsigned R, unsigned KO> cudaError_t launch_rows_ks_o(cudaStr
 }
 template <Store S, unsigned R> cudaError_t launch_rows_ks_r(cudaStream_t stream, const KSite& k, const std::int8_t* codes,
                                                            const float* deltas, std::uint32_t pitch) {
-    static const int ko = [] { const char* e = std::getenv("STRIX_QRTX_KSO"); return e ? std::atoi(e) : 0; }();
+    static const int ko = [] { const char* e = strix::envcfg::text("STRIX_QRTX_KSO"); return e ? std::atoi(e) : 0; }();
     const std::uint32_t nb = k.width / 32U;
     const int pick = ko ? ko : (nb >= 128U ? 4 : 8);
     return pick == 4 ? launch_rows_ks_o<S, R, 4>(stream, k, codes, deltas, pitch)
@@ -524,7 +524,7 @@ template <Store S> cudaError_t launch_rows_ks(cudaStream_t stream, const KSite& 
 //   1 = every fitting site, 0 = never (old K-split kernel everywhere). Bits are identical in every mode.
 int rows_cp_mode() {
     static const int mode = [] {
-        const char* e = std::getenv("STRIX_QRTX_ROWS_CP");
+        const char* e = strix::envcfg::text("STRIX_QRTX_ROWS_CP");
         if (e == nullptr || *e == 0 || std::strcmp(e, "auto") == 0) return 2;
         return std::atoi(e) != 0 ? 1 : 0;
     }();
@@ -535,7 +535,7 @@ bool rows_cp_wanted(const KSite& k, unsigned rows) {
     const int mode = rows_cp_mode();
     if (mode != 2) return mode == 1;
     static const double limit = [] {
-        const char* e = std::getenv("STRIX_QRTX_ROWS_CP_MB");
+        const char* e = strix::envcfg::text("STRIX_QRTX_ROWS_CP_MB");
         return (e != nullptr && *e != 0 ? std::atof(e) : 4.0) * 1048576.0;
     }();
     const double bytes = static_cast<double>(k.outputs) * (k.width / 32U) * 34.0;
