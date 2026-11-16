@@ -336,7 +336,7 @@ static int test_nvfp4_fused() {
         CK(cudaFree(dg)); CK(cudaFree(du)); CK(cudaFree(dx));
         CK(cudaFree(g)); CK(cudaFree(u)); CK(cudaFree(separate)); CK(cudaFree(fused));
     }
-    cc::nvfp4_release_workspace();
+    cc::nvfp4_release_workspace(nullptr);  // the test runs on the default stream
     return 0;
 }
 
