@@ -731,6 +731,21 @@ class MiniMaxFloor(unittest.TestCase):
         self.assertTrue(p["pass"], [x for x in d["checks"] if not x["pass"]])  # a candidate drawn like the nulls passes
         self.assertEqual(p["abs_pass"], p["kl"] <= 0.02 and p["top1"] >= 0.93 and p["dnll"] <= 0.01)
 
+    def test_floor_without_copy_observations_cannot_pass(self):
+        self.tokens = np.random.default_rng(680).integers(0, sum(MW), MT, dtype=np.int64)
+        self.assertFalse(g.copy_rows(self.tokens, MR).any())
+        self.tokens.astype("<u4").tofile(self.tok)
+        ref, cand, nulls = self.fixture(null_scale=0, cand=self.ref)
+        out = self.root / "no-copy.json"
+        self.assertEqual(self.cmp(ref, cand, nulls, out=out), 1)
+        pooled = json.loads(out.read_text(encoding="utf-8"))["pooled"]
+        self.assertFalse(pooled["pass"])
+        checks = {c["name"]: c for c in pooled["dnll_rule"]["checks"]}
+        self.assertTrue(all(c["pass"] for name, c in checks.items() if name != "copy"))
+        self.assertFalse(checks["copy"]["pass"])
+        self.assertEqual(checks["copy"]["rows"], 0)
+        self.assertEqual(checks["copy"]["reason"], "insufficient copy evidence")
+
     def test_floor_never_tighter_than_absolute(self):
         ref, _ = self.mm_arm("ref", self.ref)
         nulls = []

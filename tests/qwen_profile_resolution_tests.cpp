@@ -152,11 +152,11 @@ void defaults_matrix() {
     strix::qpf2k::baseline=saved;
 }
 void pending_weights_inspection() {
-    const auto o = options({"decoder", "model.gguf", "1", "--profile", "turbo", "--turbo-weights", "onfly",
+    const auto o = options({"decoder", "model.gguf", "1", "--profile", "turbo", "--turbo-weights", "converted",
                             "--print-effective-config"});
     const auto c = dc::resolve_effective_config({o, {}}, strix::ModelContract::qwen38_flash_next(), {}, {}, "", {}, {});
     const auto text = dc::effective_config_json(c);
-    check(text.find("onfly") != std::string::npos && text.find("pending") != std::string::npos,
+    check(text.find("converted") != std::string::npos && text.find("pending") != std::string::npos,
           "inspection must serialize the refused weight request");
     bool refused = false;
     bool exported = false;

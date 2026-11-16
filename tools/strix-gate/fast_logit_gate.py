@@ -328,8 +328,11 @@ def minimax_floor_checks(c, nulls, policy=MM_FLOOR, max_kl=0.02, min_top1=0.93, 
     extra = c["copy_miss"] - c["copy_miss_ref"]
     worst = max(0, max(n["copy_miss"] - n["copy_miss_ref"] for n in nulls))
     slack = max(1, math.ceil(policy["copy_slack_frac"] * c["copy_rows"]))
-    add("copy", extra, worst + slack, extra <= worst + slack, rows=c["copy_rows"], miss_ref=c["copy_miss_ref"],
-        miss=c["copy_miss"], worst_null=worst, power=c["copy_rows"] > 0)
+    # Nonempty coverage is necessary; it does not establish a statistically powered sample size.
+    observed = c["copy_rows"] > 0
+    add("copy", extra, worst + slack, observed and extra <= worst + slack, rows=c["copy_rows"], miss_ref=c["copy_miss_ref"],
+        miss=c["copy_miss"], worst_null=worst, power=observed,
+        reason="observed copy rows" if observed else "insufficient copy evidence")
     return checks
 
 
