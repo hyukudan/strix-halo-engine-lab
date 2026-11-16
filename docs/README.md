@@ -8,6 +8,7 @@ work as it stood on their date; documents marked **Superseded** name their repla
 ## Getting started
 
 - [Getting started: requirements, build and run](getting-started/README.md) ([Español](getting-started/README.es.md)): Requirements per engine, the complete build, where each engine's launch command lives.
+- [Install the release packages](install.md) ([Español](install.es.md)): Support matrix (OS x backend x arch, qualified or not), runtime dependencies, DEB / RPM / tar.gz / Windows ZIP, service, smoke test, package build kit (`packaging/`).
 - [Using a discrete GPU (optional)](discrete-gpu.md) ([Español](discrete-gpu.es.md)): Tested card, driver and CUDA, what runs where for each NVIDIA route, measured gains, when a route does not help, pinning the GPU, troubleshooting.
 - [Engine reference](getting-started/engine-reference.md): Decode configuration, build options, full CLI, prefill, draft vocab, env switches, repo layout, docs map.
 - [Toggles](toggles.md) ([Español](toggles.es.md)): Every switch, its default, profiles, the regime rule, CLI flags, CMake options and env index.

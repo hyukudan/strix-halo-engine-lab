@@ -1,5 +1,6 @@
 #pragma once
 #include "../dsa_selection.hpp"
+#include "../../../core/chunk_contract.hpp"
 // Host-only single-session decode contract (draft identity glm-dec-rtx-native-v1).
 // One pending token: for logical sequence S of length N, trunk state holds rows
 // S[0..N-2], MTP holds pairs (hidden[j],S[j+1]) for j<N-1, S[N-1] is pending and
@@ -42,6 +43,11 @@ inline unsigned kda_block_start(unsigned P){return P-P%kda_block;}
 inline unsigned kda_open_rows(unsigned P){return P%kda_block;}
 inline unsigned kda_replay_rows(unsigned P){return P%kda_block+1;}
 inline bool kda_promotes(unsigned P){return P%kda_block==kda_block-1;}
+// chunkinv-attn-state-v1 (src/core/chunk_contract.hpp section 2): a call commits KDA state at the last absolute B32
+// boundary, kda_block_start(P) == plan_call(0, P, kda_block, false).commit_end, and the open block is replayed from
+// that checkpoint (kda.cu enqueue_kda cp->row). Named identity of that contract; B32 also satisfies the K-pair rule.
+static_assert(kda_block%chunk_contract::kWmmaKPairRows==0,"KDA block must be a WMMA K-pair multiple");
+inline std::string kda_chunk_identity(){return chunk_contract::chunk_contract_tag("glm-kda-b32",kda_block,0);}
 // DSA one-row append at absolute position `first`.
 inline bool dsa_completes_pool(unsigned first){return (first+1)%4==0;}
 inline unsigned dsa_scored_pools(unsigned first){return (first+1)/4;}
