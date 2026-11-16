@@ -221,10 +221,8 @@ inline void withdraw_declined(const Resolution& resolution, const Lookup& get = 
             throw std::runtime_error("cannot withdraw profile switch " + key);
     }
 }
-// Apply after route admission, before device switch readers. Emit notices
-// once at startup; if a re-exec is added, emit them in its final process image.
-inline void apply(const Resolution& resolution, const Export& put = export_environment) {
-    resolution.weights.require_honoured();  // after --print-effective-config printed the refusal
+// Pure proposal for a local map, including pending weights during inspection.
+inline void propose_exports(const Resolution& resolution, const Export& put) {
     if (resolution.is_turbo() && !put(std::string(::strix::profile::turbo::kCacheNamespaceEnv).c_str(),
                                       resolution.cache_namespace().c_str()))
         throw std::runtime_error("cannot export " + std::string(::strix::profile::turbo::kCacheNamespaceEnv));
@@ -238,6 +236,11 @@ inline void apply(const Resolution& resolution, const Export& put = export_envir
             !put(marker_key(lever).c_str(), marker(resolution.profile, entry.status, entry.value).c_str()))
             throw std::runtime_error("cannot export profile switch " + std::string(lever.env));
     }
+}
+// Admit execution after route resolution and before device switch readers.
+inline void apply(const Resolution& resolution, const Export& put = export_environment) {
+    resolution.weights.require_honoured();
+    propose_exports(resolution, put);
 }
 // Profile policy has no numerical identity bytes of its own. Only applied
 // arithmetic switches belong in session/prefix identities.

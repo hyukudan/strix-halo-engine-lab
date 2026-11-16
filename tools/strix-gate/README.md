@@ -269,7 +269,11 @@ rank's process route receipt (`strix-route-receipt {...}`): engine; profile `exa
 off, EXL3, default prefill identity), `fast-prefill` (MSA flash on, otherwise the same) or
 `other`; `fast` = MSA flash mode (10 + `STRIX_MM_PF_MSA_FLASH`: 11 one-term, 12 two-term) and
 layers; `numerical_config_sha256` over the effective levers and switch set without output-only
-switches, and `config` = those levers and switches (for the comparison above). The control
+switches, and `config` = those levers and switches (for the comparison above).
+The index-projection WMMA member additionally requires `minimax-index-proj-executed` records,
+emitted after the prefill completion fence: matching rank, executed layer mask and each sealed
+prompt's token count and little-endian token FNV-1a64. A selected startup lever alone is insufficient.
+The control
 comes only from the engine's own null-control lines in a lab diagnostic build:
 `DIAG attn ulp: layer L seed S rows N pos0 P values V prompt "NAME"`.
 The prompt name is a JSON string matching a sealed prompt. All events must use one layer and seed,
@@ -298,9 +302,16 @@ Per row, U95(KL_T-KL_R), U95(disagreement_T-disagreement_R) and U95(dNLL_T-dNLL_
 paired rows). Optional absolute safety limits: `--turbo-max-kl`, `--turbo-min-top1`, `--turbo-max-dnll`. `--null-arm`
 controls are measured against E and reported (not a verdict input).
 
+The normal-approximation intervals treat sampled rows (and paired T-minus-R differences) as independent
+observations with finite variance and enough samples for the approximation. Tokens within a prompt may be
+correlated, making these intervals overconfident; they do not establish prompt-level uncertainty or model
+qualification. Such claims require independently sampled prompts and prompt-level resampling or another
+validated treatment of clustering. Task Wilson intervals likewise assume independent Bernoulli trials.
+
 Pack identity: `seal --model-sha SHA` records the weights/pack sha (else the execution witness `model_sha256` is used).
 E and T must share it unless `--candidate-sha` declares T's; R may differ from E only with `--reference-sha` equal to R's
-sealed value. An undeclared or mismatching sha is an error (exit 2, both shas named).
+sealed value. Every participating rank, including null controls, needs a valid SHA-256 digest. A declared digest
+must agree with an available execution witness. Missing, invalid, undeclared or mismatching identities are errors (exit 2).
 
 `--task-results JSON`: `{"tasks":[{"name":"t1","category":"code|math|retrieval|tools|json|prose","E":{"passed":8,"total":10},"T":{...},"R":{...}}]}`.
 Per category and overall the receipt carries passed/total/rate and a Wilson 95 % interval per arm. Checks per category:
@@ -315,3 +326,11 @@ or a task without `R`; never PASS, but a failing check still reports FAIL).
 hardware, gpu_clock_mhz), `routes` {effective_config: lines of `--effective-config FILE`, execution_witness from the seals},
 `metrics` (mean + 95 % interval for T and R), `checks`, `tasks`, `controls`, `performance` (`--perf JSON`: tok_s,
 bytes_per_token, ttft_ms, p95_ms; absent keys are null and listed in `missing`).
+
+## GLM scored prefill compare: `glm_score_nll.py`
+
+The GLM rank captures the last N prompt rows' logits with `STRIX_GLM_PF_SCORE_LAST=N` and
+`STRIX_GLM_PF_SCORE_OUT=DIR/NAME-tf` (one vocabulary slice per rank). `glm_score_nll.py --dir DIR --ref X1 --test I1
+--prompt P.u32 --vocab-size V [--rows 256] [--json OUT]` (V is the model's full vocabulary size) prints NLL ref/test, dNLL (offset-1 target = the scored rule), mean KL and
+top-1 agreement. The prompt must be the length being gated: a `.u32` file holds 4 bytes per token (a 32,768-byte file
+is an 8K prompt). Tests: `python -m unittest test_glm_score_nll` in this directory.

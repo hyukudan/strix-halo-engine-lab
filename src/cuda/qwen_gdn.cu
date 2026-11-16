@@ -20,13 +20,16 @@
 //          v_add eps (:156647); v_rsq_f32 (:156656); inv*v (:156667), *w (:156670), gate*(.) (:156674) with
 //          gate = 1/(1+expf(-z)).
 #include "strix/cuda_qwen_gdn.hpp"
+#include "../attn_core/recurrent_state.hpp"
 
 #include <stdexcept>
+#include <type_traits>
 
 namespace strix::cuda::qwen_gdn {
 namespace {
 
 namespace am = strix::cuda::amdmath;
+namespace rstate = strix::attn_core::rstate;
 constexpr unsigned kFull = 0xffffffffU;
 
 __device__ __forceinline__ float bf16_to_float(std::uint16_t b) { return __uint_as_float(static_cast<std::uint32_t>(b) << 16); }
@@ -262,7 +265,11 @@ __global__ __launch_bounds__(256) void decay_kernel(Rows rows, std::uint32_t cou
     if (i >= count * kValueHeads) return;
     decay[i] = am::amd_expf(t, rows.gate[static_cast<std::uint64_t>(i / kValueHeads) * rows.stride + i % kValueHeads]);
 }
-template <unsigned G>
+// ST = stored element of the state (f32 = incumbent code; f16 / bf16: FP32 arithmetic, widened on load, narrowed on store).
+// RR (16-bit only) = round the register state through the stored type after EVERY row (decode / window / commit replay: as
+// if stored per token); prefill (RR false) keeps FP32 inside the call and narrows once at the end. Elements of one thread
+// are G*128 apart, so the 16-bit access is scalar through the codec.
+template <unsigned G, RecurrentStateType ST, bool RR>
 __device__ __forceinline__ void recurrence_body(const Rows& rows, std::uint32_t count, const float* state_in, float* state_out,
     const float* __restrict__ decays) {
     using Sh = RecShape<G>;
@@ -316,8 +323,11 @@ __device__ __forceinline__ void recurrence_body(const Rows& rows, std::uint32_t 
     };
     float S[K];
 #pragma unroll
-    for (unsigned j = 0; j < K; ++j)
-        S[j] = state_in[(static_cast<std::uint64_t>(value_head) * kHeadDim + sub + j * G) * kHeadDim + column];
+    for (unsigned j = 0; j < K; ++j) {
+        const std::uint64_t at = (static_cast<std::uint64_t>(value_head) * kHeadDim + sub + j * G) * kHeadDim + column;
+        if constexpr (ST == RecurrentStateType::f32) S[j] = state_in[at];
+        else S[j] = rstate::Codec<ST>::load(reinterpret_cast<const std::uint16_t*>(state_in)[at]);
+    }
     const unsigned chunks = (count + Chunk - 1U) / Chunk;
     fetch(0U);
     commit(stage[0]);
@@ -373,24 +383,31 @@ __device__ __forceinline__ void recurrence_body(const Rows& rows, std::uint32_t 
             for (unsigned m = G / 2U; m; m /= 2U) out = __fadd_rn(out, __shfl_xor_sync(kFull, out, m));
             if (sub == 0U) *core = out;
             core += rows.stride;
+            if constexpr (RR && ST != RecurrentStateType::f32) {
+#pragma unroll
+                for (unsigned j = 0; j < K; ++j) S[j] = rstate::round_in_register<ST>(S[j]);
+            }
         }
         if (more) commit(stage[(c + 1U) & 1U]);
         __syncthreads();
     }
 #pragma unroll
-    for (unsigned j = 0; j < K; ++j)
-        state_out[(static_cast<std::uint64_t>(value_head) * kHeadDim + sub + j * G) * kHeadDim + column] = S[j];
+    for (unsigned j = 0; j < K; ++j) {
+        const std::uint64_t at = (static_cast<std::uint64_t>(value_head) * kHeadDim + sub + j * G) * kHeadDim + column;
+        if constexpr (ST == RecurrentStateType::f32) state_out[at] = S[j];
+        else reinterpret_cast<std::uint16_t*>(state_out)[at] = rstate::Codec<ST>::store(S[j]);
+    }
 }
-template <unsigned G>
+template <unsigned G, RecurrentStateType ST, bool RR>
 __global__ __launch_bounds__(RecShape<G>::Threads) void recurrence_kernel(Rows rows, std::uint32_t count,
     DevRef<float> in_ref, DevRef<float> out_ref, const float* __restrict__ decays) {
-    recurrence_body<G>(rows, count, in_ref.get(), out_ref.get(), decays);
+    recurrence_body<G, ST, RR>(rows, count, in_ref.get(), out_ref.get(), decays);
 }
 // one grid slice (blockIdx.y) per segment: its rows, its state, its rows' decays (decay rows are window rows)
-template <unsigned G>
+template <unsigned G, RecurrentStateType ST, bool RR>
 __global__ __launch_bounds__(RecShape<G>::Threads) void recurrence_multi_kernel(Rows rows, Segments segs, const float* __restrict__ decays) {
     const Segment& s = segs.s[blockIdx.y];
-    recurrence_body<G>(segment_rows(rows, s.row), s.count, s.state_in.get(), s.state_out.get(),
+    recurrence_body<G, ST, RR>(segment_rows(rows, s.row), s.count, s.state_in.get(), s.state_out.get(),
         decays + static_cast<std::uint64_t>(s.row) * kValueHeads);
 }
 
@@ -513,6 +530,15 @@ void launch_recurrence_split(const Rows& rows, std::uint32_t count, const float*
 }
 
 namespace {
+// 0 f32 | 1 f16 prefill | 2 f16 per-row | 3 bf16 prefill | 4 bf16 per-row (round_each_row is meaningless for f32: same code)
+unsigned state_mode(const Tuning& tuning) {
+    switch (tuning.state_type) {
+    case RecurrentStateType::f32: return 0;
+    case RecurrentStateType::f16: return tuning.round_each_row ? 2U : 1U;
+    case RecurrentStateType::bf16: return tuning.round_each_row ? 4U : 3U;
+    }
+    throw std::invalid_argument("qwen_gdn: unknown recurrent state type");
+}
 void launch_recurrence_ref(const Rows& rows, std::uint32_t count, DevRef<float> state_in, DevRef<float> state_out, void* scratch,
     const amdmath::Tables& t, cudaStream_t stream, Tuning tuning) {
     check_rows(rows);
@@ -525,12 +551,21 @@ void launch_recurrence_ref(const Rows& rows, std::uint32_t count, DevRef<float> 
     const auto go = [&](auto kernel, unsigned g) {
         kernel<<<kValueHeads * (kHeadDim / 32U), 32U * g, 0, stream>>>(rows, count, state_in, state_out, decay);
     };
-    switch (tuning.lanes) {
-    case 2: go(recurrence_kernel<2>, 2); break;
-    case 4: go(recurrence_kernel<4>, 4); break;
-    case 8: go(recurrence_kernel<8>, 8); break;
-    case 16: go(recurrence_kernel<16>, 16); break;
-    default: throw std::invalid_argument("qwen_gdn: lanes must be 2, 4, 8 or 16");
+    const auto lanes = [&](auto select) {
+        switch (tuning.lanes) {
+        case 2: go(select(std::integral_constant<unsigned, 2>{}), 2); break;
+        case 4: go(select(std::integral_constant<unsigned, 4>{}), 4); break;
+        case 8: go(select(std::integral_constant<unsigned, 8>{}), 8); break;
+        case 16: go(select(std::integral_constant<unsigned, 16>{}), 16); break;
+        default: throw std::invalid_argument("qwen_gdn: lanes must be 2, 4, 8 or 16");
+        }
+    };
+    switch (state_mode(tuning)) {
+    case 0: lanes([](auto g) { return recurrence_kernel<decltype(g)::value, RecurrentStateType::f32, false>; }); break;
+    case 1: lanes([](auto g) { return recurrence_kernel<decltype(g)::value, RecurrentStateType::f16, false>; }); break;
+    case 2: lanes([](auto g) { return recurrence_kernel<decltype(g)::value, RecurrentStateType::f16, true>; }); break;
+    case 3: lanes([](auto g) { return recurrence_kernel<decltype(g)::value, RecurrentStateType::bf16, false>; }); break;
+    default: lanes([](auto g) { return recurrence_kernel<decltype(g)::value, RecurrentStateType::bf16, true>; }); break;
     }
     check(cudaGetLastError(), "recurrence launch");
 }
@@ -601,12 +636,21 @@ void launch_core_multi(const std::uint16_t* input, std::uint64_t input_stride, c
     const auto go = [&](auto kernel, unsigned g) {
         kernel<<<dim3(kValueHeads * (kHeadDim / 32U), segs.n), 32U * g, 0, stream>>>(rows, segs, decay);
     };
-    switch (tuning.lanes) {
-    case 2: go(recurrence_multi_kernel<2>, 2); break;
-    case 4: go(recurrence_multi_kernel<4>, 4); break;
-    case 8: go(recurrence_multi_kernel<8>, 8); break;
-    case 16: go(recurrence_multi_kernel<16>, 16); break;
-    default: throw std::invalid_argument("qwen_gdn: lanes must be 2, 4, 8 or 16");
+    const auto lanes = [&](auto select) {
+        switch (tuning.lanes) {
+        case 2: go(select(std::integral_constant<unsigned, 2>{}), 2); break;
+        case 4: go(select(std::integral_constant<unsigned, 4>{}), 4); break;
+        case 8: go(select(std::integral_constant<unsigned, 8>{}), 8); break;
+        case 16: go(select(std::integral_constant<unsigned, 16>{}), 16); break;
+        default: throw std::invalid_argument("qwen_gdn: lanes must be 2, 4, 8 or 16");
+        }
+    };
+    switch (state_mode(tuning)) {
+    case 0: lanes([](auto g) { return recurrence_multi_kernel<decltype(g)::value, RecurrentStateType::f32, false>; }); break;
+    case 1: lanes([](auto g) { return recurrence_multi_kernel<decltype(g)::value, RecurrentStateType::f16, false>; }); break;
+    case 2: lanes([](auto g) { return recurrence_multi_kernel<decltype(g)::value, RecurrentStateType::f16, true>; }); break;
+    case 3: lanes([](auto g) { return recurrence_multi_kernel<decltype(g)::value, RecurrentStateType::bf16, false>; }); break;
+    default: lanes([](auto g) { return recurrence_multi_kernel<decltype(g)::value, RecurrentStateType::bf16, true>; }); break;
     }
     check(cudaGetLastError(), "recurrence multi launch");
     // K6 over all rows (row-wise)

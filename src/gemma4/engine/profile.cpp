@@ -272,6 +272,7 @@ std::string Resolution::json() const {
 }
 
 Resolution resolve(Name profile, App app, const Inputs& inputs, std::span<const Lever> levers) {
+    if (profile == Name::turbo) throw std::invalid_argument("Gemma does not support profile turbo");
     Resolution out;
     out.name = profile;
     out.app = app;

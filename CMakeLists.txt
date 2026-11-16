@@ -14,6 +14,7 @@ if(NOT strix_multi_config AND "${CMAKE_BUILD_TYPE}" STREQUAL "")
 endif()
 
 project(strix_engine_lab VERSION 0.1.0 LANGUAGES CXX)
+include(cmake/StrixWeight.cmake)
 option(STRIX_WFMT_TESTS "Build shared weight-format contract tests" OFF)
 if(STRIX_WFMT_TESTS)
     enable_testing()
@@ -51,6 +52,7 @@ if(STRIX_CUDA_QWEN_ONLY)
     include(CTest)
     include(cmake/StrixSession.cmake)
     include(cmake/QwenCuda.cmake)
+    include(cmake/StrixDenseModels.cmake)
     include(cmake/StrixLevers.cmake)
     return()
 endif()
@@ -193,6 +195,7 @@ add_library(strix_core STATIC
     src/model_manifest.cpp
     src/model_family_registry.cpp
     src/cost_table_cache.cpp
+    src/logprob_partials.cpp
 )
 else()
 add_library(strix_core STATIC
@@ -201,6 +204,7 @@ add_library(strix_core STATIC
     src/greedy_serving_scheduler.cpp
     src/serving_cohort.cpp
     src/generation_output.cpp
+    src/logprob_partials.cpp
     src/known_prompt_chunks.cpp
     src/known_prefix_prefill.cpp
     src/known_prefix_prefill_runtime.cpp
@@ -397,6 +401,11 @@ target_include_directories(strix_ds41_http_session_owner PUBLIC src)
 target_link_libraries(strix_ds41_http_session_owner PUBLIC strix_session_owner)
 strix_target_warnings(strix_ds41_http_session_owner)
 if(BUILD_TESTING)
+    add_executable(strix-exact-reduce-contract-tests tests/exact_reduce_contract_tests.cpp)
+    target_compile_features(strix-exact-reduce-contract-tests PRIVATE cxx_std_20)
+    strix_target_warnings(strix-exact-reduce-contract-tests)
+    add_test(NAME strix-exact-reduce-contract-tests COMMAND strix-exact-reduce-contract-tests)
+
     add_executable(strix-dist-transport-spec-tests tests/dist_transport_spec_tests.cpp)
     target_include_directories(strix-dist-transport-spec-tests PRIVATE include)
     target_compile_features(strix-dist-transport-spec-tests PRIVATE cxx_std_20)
@@ -720,6 +729,7 @@ strix_target_warnings(strix-memory-plan)
 add_library(strix_model_graph STATIC src/model_graph/model_graph.cpp src/model_graph/plan.cpp)
 target_compile_features(strix_model_graph PUBLIC cxx_std_20)
 strix_target_warnings(strix_model_graph)
+include(cmake/StrixDenseModels.cmake)
 
 add_library(strix_model_description STATIC src/model_description.cpp)
 target_include_directories(strix_model_description PUBLIC include)
@@ -954,6 +964,11 @@ if(BUILD_TESTING)
     target_link_libraries(strix-spec-drafting-tests PRIVATE strix_spec)
     strix_target_warnings(strix-spec-drafting-tests)
     add_test(NAME strix-spec-drafting-tests COMMAND strix-spec-drafting-tests)
+    # Host execution of the production plan/lifecycle blocks, with GPU boundaries stubbed.
+    find_package(Python3 COMPONENTS Interpreter QUIET)
+    if(Python3_Interpreter_FOUND)
+        add_subdirectory(tests/dspark_host)
+    endif()
     add_executable(strix-batch-nested-recipe-tests tests/batch_nested_recipe_tests.cpp)
     target_include_directories(strix-batch-nested-recipe-tests PRIVATE include)
     target_compile_features(strix-batch-nested-recipe-tests PRIVATE cxx_std_20)
@@ -1355,6 +1370,10 @@ if(BUILD_TESTING)
     target_link_libraries(strix-generation-output-tests PRIVATE strix_core)
     strix_target_warnings(strix-generation-output-tests)
     add_test(NAME strix-generation-output-tests COMMAND strix-generation-output-tests)
+    add_executable(strix-logprob-partials-tests tests/logprob_partials_tests.cpp)
+    target_link_libraries(strix-logprob-partials-tests PRIVATE strix_core)
+    strix_target_warnings(strix-logprob-partials-tests)
+    add_test(NAME strix-logprob-partials-tests COMMAND strix-logprob-partials-tests)
     add_executable(strix-greedy-serving-scheduler-tests tests/greedy_serving_scheduler_tests.cpp)
     target_link_libraries(strix-greedy-serving-scheduler-tests PRIVATE strix_core)
     strix_target_warnings(strix-greedy-serving-scheduler-tests)
@@ -1470,6 +1489,24 @@ if(BUILD_TESTING)
     target_link_libraries(strix-gdn-output-admission-tests PRIVATE strix_core)
     strix_target_warnings(strix-gdn-output-admission-tests)
     add_test(NAME strix-gdn-output-admission-tests COMMAND strix-gdn-output-admission-tests)
+    add_executable(strix-recurrent-state-codec-tests tests/recurrent_state_codec_tests.cpp)
+    target_link_libraries(strix-recurrent-state-codec-tests PRIVATE strix_core)
+    target_include_directories(strix-recurrent-state-codec-tests PRIVATE src)
+    strix_target_warnings(strix-recurrent-state-codec-tests)
+    add_test(NAME strix-recurrent-state-codec-tests COMMAND strix-recurrent-state-codec-tests)
+    add_executable(strix-recurrent-state-admission-tests tests/recurrent_state_admission_tests.cpp)
+    target_link_libraries(strix-recurrent-state-admission-tests PRIVATE strix_core)
+    target_include_directories(strix-recurrent-state-admission-tests PRIVATE src)
+    strix_target_warnings(strix-recurrent-state-admission-tests)
+    foreach(state IN ITEMS f32 f16 bf16 empty invalid)
+        add_test(NAME strix-recurrent-state-admission-${state}
+            COMMAND strix-recurrent-state-admission-tests ${state})
+    endforeach()
+    find_package(Python3 COMPONENTS Interpreter QUIET)
+    if(Python3_Interpreter_FOUND)
+        add_test(NAME strix-recurrent-state-boundary-tests
+            COMMAND ${Python3_EXECUTABLE} -B ${CMAKE_SOURCE_DIR}/tests/recurrent_state_boundary_tests.py)
+    endif()
     add_executable(strix-virtual-q8-gdn-oracle-tests tests/virtual_q8_gdn_oracle_tests.cpp)
     target_compile_features(strix-virtual-q8-gdn-oracle-tests PRIVATE cxx_std_20)
     strix_target_warnings(strix-virtual-q8-gdn-oracle-tests)
@@ -2222,6 +2259,13 @@ if(BUILD_TESTING)
     target_link_libraries(strix-hip-mtp-decode-options-tests PRIVATE strix_core)
     strix_target_warnings(strix-hip-mtp-decode-options-tests)
     add_test(NAME strix-hip-mtp-decode-options-tests COMMAND strix-hip-mtp-decode-options-tests)
+    add_executable(strix-pair-baseline-tests tests/pair_baseline_tests.cpp)
+    target_link_libraries(strix-pair-baseline-tests PRIVATE strix_core strix_serve_config strix_serve_json)
+    target_include_directories(strix-pair-baseline-tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    strix_target_warnings(strix-pair-baseline-tests)
+    foreach(mode cli env default)
+        add_test(NAME strix-pair-baseline-${mode}-tests COMMAND strix-pair-baseline-tests ${mode})
+    endforeach()
 
     add_executable(strix-mtp-forward-golden-file-tests tests/mtp_forward_golden_file_tests.cpp)
     target_link_libraries(strix-mtp-forward-golden-file-tests PRIVATE strix_core)
@@ -2606,6 +2650,12 @@ int main() { return 0; }"
             target_compile_options(strix-hip-route-prune-tests PRIVATE -mno-wavefrontsize64 -fno-fast-math -ffp-contract=off -fhip-fp32-correctly-rounded-divide-sqrt -fdenormal-fp-math=ieee)
             strix_target_warnings(strix-hip-route-prune-tests)
             add_test(NAME strix-hip-route-prune-tests COMMAND strix-hip-route-prune-tests)
+            add_executable(strix-hip-exact-reduce-tests tests/hip_exact_reduce_tests.hip)  # core/ordered_reduce trees + CSR wave scan vs the LDS loops
+            target_link_libraries(strix-hip-exact-reduce-tests PRIVATE strix_core)
+            set_target_properties(strix-hip-exact-reduce-tests PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHS}")
+            target_compile_options(strix-hip-exact-reduce-tests PRIVATE -mno-wavefrontsize64 -fno-fast-math -ffp-contract=off -fhip-fp32-correctly-rounded-divide-sqrt -fdenormal-fp-math=ieee)
+            strix_target_warnings(strix-hip-exact-reduce-tests)
+            add_test(NAME strix-hip-exact-reduce-tests COMMAND strix-hip-exact-reduce-tests)
             add_test(NAME strix-hip-moe-wmma-prefill-tests COMMAND strix-hip-moe-wmma-prefill-tests)
             add_test(NAME strix-hip-moe-route-bf16-tests COMMAND strix-hip-moe-wmma-prefill-tests route-bf16)
             add_test(NAME strix-hip-moe-prefill-pool16k-tests COMMAND strix-hip-moe-wmma-prefill-tests pool16k)
@@ -2690,6 +2740,14 @@ int main() { return 0; }"
         src/hip_shared_expert_launcher.hip
         src/hip_dense_trellis.hip
     )
+    # HIP backend core, model-agnostic: logprob partials of device rows (strix/logprob_partials.hpp); its own small
+    # library so any engine binds it without the whole runtime (DS41 batch forward, the runtime's own users).
+    add_library(strix_hip_logprob STATIC src/hip_logprob_partials.hip)
+    target_include_directories(strix_hip_logprob PUBLIC include)
+    target_include_directories(strix_hip_logprob SYSTEM PUBLIC "${STRIX_HIP_INCLUDE_DIR}")
+    set_target_properties(strix_hip_logprob PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHS}")
+    target_link_libraries(strix_hip_logprob PUBLIC strix_core "${STRIX_HIP_RUNTIME_LIBRARY}")
+    target_compile_definitions(strix_hip_logprob PUBLIC $<$<COMPILE_LANGUAGE:CXX>:__HIP_PLATFORM_AMD__=1>)
     target_include_directories(
         strix_hip_runtime
         PUBLIC
@@ -2722,6 +2780,7 @@ int main() { return 0; }"
         strix_hip_runtime
         PUBLIC
         strix_core
+        strix_hip_logprob
         "${STRIX_HIP_RUNTIME_LIBRARY}"
     )
     if(STRIX_ENABLE_EXPERIMENTAL_Q4K_A8_RUNTIME)
@@ -2731,6 +2790,9 @@ int main() { return 0; }"
     set_source_files_properties(src/hip_qsa_selection_diagnostic.hip
         PROPERTIES COMPILE_OPTIONS "-mno-wavefrontsize64;-fno-fast-math")
     set_source_files_properties(src/hip_dense_trellis.hip
+        PROPERTIES COMPILE_OPTIONS "-mno-wavefrontsize64;-fno-fast-math;-ffp-contract=off;-fdenormal-fp-math=ieee")
+    # logprob partials: the nonfinite test and the contract's FP32 lane order hold as written
+    set_source_files_properties(src/hip_logprob_partials.hip tests/hip_logprob_partials_tests.hip
         PROPERTIES COMPILE_OPTIONS "-mno-wavefrontsize64;-fno-fast-math;-ffp-contract=off;-fdenormal-fp-math=ieee")
     set_source_files_properties(src/hip_mtp_input_fusion.hip
         PROPERTIES COMPILE_OPTIONS "-mno-wavefrontsize64;-fno-fast-math;-ffp-contract=off;-fhip-fp32-correctly-rounded-divide-sqrt;-fdenormal-fp-math=ieee")
@@ -3204,6 +3266,7 @@ int main() { return 0; }"
         set_target_properties(strix-hip-gdn-deferred-window-tests PROPERTIES
             HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHS}")
         target_link_libraries(strix-hip-gdn-deferred-window-tests PRIVATE strix_hip_runtime)
+        target_include_directories(strix-hip-gdn-deferred-window-tests PRIVATE src)
         target_compile_definitions(strix-hip-gdn-deferred-window-tests PRIVATE STRIX_BUILD_KNOWN_WINDOW_DIAGNOSTIC=1)
         target_compile_options(strix-hip-gdn-deferred-window-tests PRIVATE
             -mno-wavefrontsize64 -fno-fast-math -ffp-contract=off -fdenormal-fp-math=ieee)
@@ -3716,6 +3779,11 @@ int main() { return 0; }"
         target_link_libraries(strix-hip-generation-output-tests PRIVATE strix_hip_runtime)
         strix_target_warnings(strix-hip-generation-output-tests)
         add_test(NAME strix-hip-generation-output-tests COMMAND strix-hip-generation-output-tests)
+        add_executable(strix-hip-logprob-partials-tests tests/hip_logprob_partials_tests.hip)
+        set_target_properties(strix-hip-logprob-partials-tests PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHS}")
+        target_link_libraries(strix-hip-logprob-partials-tests PRIVATE strix_hip_runtime strix_core)
+        strix_target_warnings(strix-hip-logprob-partials-tests)
+        add_test(NAME strix-hip-logprob-partials-tests COMMAND strix-hip-logprob-partials-tests)
         set_target_properties(strix-hip-gdn-lm-wave8-diagnostic-tests PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHS}")
         target_link_libraries(strix-hip-gdn-lm-wave8-diagnostic-tests PRIVATE strix_hip_runtime)
         strix_target_warnings(strix-hip-gdn-lm-wave8-diagnostic-tests)
@@ -4322,6 +4390,7 @@ if(STRIX_ENABLE_HIP_RUNTIME)
     target_include_directories(strix_ds41_xport PUBLIC include "${STRIX_HIP_INCLUDE_DIR}")
     list(APPEND strix_ds41_hip_targets strix_ds41_xport)
     add_library(strix_ds41_batch_forward STATIC src/hip_deepseek41_batch_forward.hip)
+    target_link_libraries(strix_ds41_batch_forward PUBLIC strix_hip_logprob)
     target_link_libraries(strix_ds41_batch_forward PUBLIC strix_ds41_xport strix_ds41_prepared_load strix_ds41_layer_hip strix_ds41_attention_hip strix_ds41_runtime strix_dist strix_ds41_trellis_hip strix_ds41_pipeline)
     target_include_directories(strix_ds41_batch_forward PUBLIC include "${STRIX_HIP_INCLUDE_DIR}")
     list(APPEND strix_ds41_hip_targets strix_ds41_batch_forward)
@@ -4625,7 +4694,7 @@ if(STRIX_ENABLE_HIP_RUNTIME)
     list(APPEND strix_ds41_dspark_hip_targets strix-ds41-dspark-rank)
     # DSpark windows inside BatchForward (several requests per step): drafting contexts per request, the planner
     add_library(strix_ds41_batch_dspark STATIC src/hip_deepseek41_batch_dspark.hip)
-    target_link_libraries(strix_ds41_batch_dspark PUBLIC strix_ds41_dspark_hip strix_ds41_batch_forward strix_lookup)
+    target_link_libraries(strix_ds41_batch_dspark PUBLIC strix_ds41_dspark_hip strix_ds41_batch_forward strix_lookup strix_spec)
     list(APPEND strix_ds41_dspark_hip_targets strix_ds41_batch_dspark)
     add_executable(strix-deepseek41-dspark-rank apps/deepseek41_dspark_rank_main.hip)
     target_link_libraries(strix-deepseek41-dspark-rank PRIVATE strix_ds41_dspark_hip strix_ds41_device_forward strix_dist)
@@ -4732,6 +4801,19 @@ if(STRIX_ENABLE_CUDA_DS41)
     target_link_libraries(strix_ds41_cuda PUBLIC strix_ds41_layer strix_ds41_formats strix_family_deepseek41 strix_device CUDA::cudart)
     target_include_directories(strix_ds41_cuda PUBLIC include)
     set(strix_ds41_cuda_targets strix_ds41_cuda)
+    # CUDA backend core, model-agnostic: logprob partials of device rows (same contract as src/hip_logprob_partials.hip)
+    add_library(strix_cuda_logprob STATIC src/cuda/logprob_partials.cu)
+    target_link_libraries(strix_cuda_logprob PUBLIC strix_core CUDA::cudart)
+    target_include_directories(strix_cuda_logprob PUBLIC include)
+    target_compile_options(strix_cuda_logprob PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--fmad=false>)
+    list(APPEND strix_ds41_cuda_targets strix_cuda_logprob)
+    if(BUILD_TESTING)
+        add_executable(strix-cuda-logprob-partials-tests tests/cuda/logprob_partials_tests.cu)
+        target_link_libraries(strix-cuda-logprob-partials-tests PRIVATE strix_cuda_logprob strix_core)
+        target_compile_options(strix-cuda-logprob-partials-tests PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--fmad=false>)
+        add_test(NAME strix-cuda-logprob-partials-tests COMMAND strix-cuda-logprob-partials-tests)
+        list(APPEND strix_ds41_cuda_targets strix-cuda-logprob-partials-tests)
+    endif()
     if(BUILD_TESTING)
         add_executable(strix-cuda-ds41-core-tests tests/cuda/ds41_core_tests.cu)
         target_link_libraries(strix-cuda-ds41-core-tests PRIVATE strix_ds41_cuda strix_ds41_layer strix_ds41_formats)
@@ -5647,6 +5729,13 @@ if(BUILD_TESTING AND STRIX_FAMILY_DEEPSEEK41)
         COMMAND ${Python3_EXECUTABLE} -B ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_rtx_session_gate.py)
     set_tests_properties(strix-ds41-session-cache-tests strix-rtx-session-gate-tests PROPERTIES LABELS "cpu;session" TIMEOUT 120)
 endif()
+if(BUILD_TESTING)
+    find_package(Python3 COMPONENTS Interpreter QUIET)
+    if(Python3_Interpreter_FOUND)
+        add_test(NAME strix-mmflash-ranges-tests
+            COMMAND ${Python3_EXECUTABLE} -B ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_mmflash_ranges.py)
+    endif()
+endif()
 
 # Host-only layer-split wire-layout gate; native Qwen execution is qualified separately.
 if(BUILD_TESTING)
@@ -5677,6 +5766,12 @@ if(BUILD_TESTING)
     target_compile_features(strix-pair-regime-tests PRIVATE cxx_std_20)
     strix_target_warnings(strix-pair-regime-tests)
     add_test(NAME strix-pair-regime-tests COMMAND strix-pair-regime-tests)
+    add_executable(strix-pair-stage-pipes-tests tests/pair_stage_pipes_tests.cpp)
+    target_include_directories(strix-pair-stage-pipes-tests PRIVATE include)
+    target_compile_features(strix-pair-stage-pipes-tests PRIVATE cxx_std_20)
+    target_link_libraries(strix-pair-stage-pipes-tests PRIVATE Threads::Threads)
+    strix_target_warnings(strix-pair-stage-pipes-tests)
+    add_test(NAME strix-pair-stage-pipes-tests COMMAND strix-pair-stage-pipes-tests)
     add_executable(strix-pair-chain-tests tests/pair_chain_tests.cpp)
     target_include_directories(strix-pair-chain-tests PRIVATE include)
     target_compile_features(strix-pair-chain-tests PRIVATE cxx_std_20)
