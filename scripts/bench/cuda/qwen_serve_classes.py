@@ -47,7 +47,7 @@ def stream(base, prompt, max_tokens, timeout):
                 tokens=(usage or {}).get('completion_tokens'), ids=rtx.get('ids'), error=error,
                 decode_tps=(strix or {}).get('decode_tokens_per_second'), tpc=rtx.get('tokens_per_cycle'), cf=rtx.get('copy_first_steps'),
                 cx=rtx.get('context_extended_steps'), cr=rtx.get('context_rows'), hu=rtx.get('context_host_us'),
-                rps=rtx.get('rows_per_step'))
+                rps=rtx.get('rows_per_step'), cw=rtx.get('copy_wide_steps'))
 
 
 def barrier(n, fn):
@@ -128,7 +128,7 @@ def main():
                 ref.append(r['ids'])
                 ids_out.write(json.dumps(dict(pas=pas, cls=cls, c=1, i=i, ids=r['ids'])) + '\n')
                 say(f'{pas} {cls} C1 i={i} prompt={len(p)} tokens={r["tokens"]} decode_tps={r["decode_tps"]} '
-                    f'short={int((r["tokens"] or 0) < a.min_decode_tokens)} tpc={r["tpc"]} cf={r["cf"]} cx={r["cx"]} cr={r["cr"]} hu={r["hu"]} rps={r["rps"]} err={r["error"]}')
+                    f'short={int((r["tokens"] or 0) < a.min_decode_tokens)} tpc={r["tpc"]} cf={r["cf"]} cx={r["cx"]} cr={r["cr"]} hu={r["hu"]} rps={r["rps"]} cw={r.get("cw")} err={r["error"]}')
             if pas == 'cold':
                 sets[cls + '_ref'] = ref
             for c in (4, 8):
