@@ -4969,6 +4969,24 @@
     {
       "family": "qwen",
       "match": "contains",
+      "legacy_pattern": ".ssm_a",
+      "role": "auxiliary",
+      "standalone": true,
+      "expert_axis": "0 only for expert-indexed logical rank>2",
+      "allowlist": "src/weight/adapters/qwen.cpp"
+    },
+    {
+      "family": "qwen",
+      "match": "contains",
+      "legacy_pattern": ".ssm_d",
+      "role": "auxiliary",
+      "standalone": true,
+      "expert_axis": "0 only for expert-indexed logical rank>2",
+      "allowlist": "src/weight/adapters/qwen.cpp"
+    },
+    {
+      "family": "qwen",
+      "match": "contains",
       "legacy_pattern": "embed",
       "role": "embedding",
       "standalone": false,
@@ -5836,15 +5854,6 @@
       "legacy_pattern": "rope.inv_freq",
       "role": "auxiliary",
       "standalone": true,
-      "expert_axis": "0 only for expert-indexed logical rank>2",
-      "allowlist": "src/weight/adapters/h3.cpp"
-    },
-    {
-      "family": "h3",
-      "match": "contains",
-      "legacy_pattern": "embed",
-      "role": "embedding",
-      "standalone": false,
       "expert_axis": "0 only for expert-indexed logical rank>2",
       "allowlist": "src/weight/adapters/h3.cpp"
     },

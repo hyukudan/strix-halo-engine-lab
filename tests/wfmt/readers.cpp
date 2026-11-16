@@ -1,5 +1,9 @@
 #include "strix/weight/admission.hpp"
 #include "strix/ds41_native_fp8.hpp"
+#include "strix/vision/gguf_weights.hpp"
+#include "gemma4/model/model.hpp"
+#include "h3/block/safetensors.hpp"
+#include <cstring>
 #include <algorithm>
 #include <array>
 #include <chrono>
@@ -24,6 +28,16 @@ bool wfmt_readers_test() try {
     check(index.tensors[1].payload.range.offset==payload+128 && index.tensors[1].payload.range.bytes==68,"GGUF exact byte range");
     auto retained=index.tensors[1].payload;index={};source.reset();std::array<Byte,68> bytes{};check(bool(read_slice(retained,bytes)),"source survives index destruction");
     check(std::equal(bytes.begin(),bytes.end(),gg.begin()+payload+128),"GGUF payload unchanged");
+    WeightMap vision_owned;
+    {
+        auto vision_source=memory_source(gg);auto vision_stream=source_stream(vision_source);auto info=strix::gguf::read(*vision_stream,gg.size());
+        strix::vision::GgufWeights legacy_vision(std::move(info),std::move(gg));const auto tensor=legacy_vision.tensor("a.weight");
+        check(tensor.rows==2 && tensor.cols==32,"vision legacy shape unchanged");
+        check(std::memcmp(tensor.data,legacy_vision.bytes().data()+payload,128)==0,"vision legacy operand bytes unchanged");
+        vision_owned=legacy_vision.weight_map();check(vision_owned.size()==1,"vision requested tensor enters common admission");
+        bool unsupported=false;try{(void)legacy_vision.tensor("b.weight");}catch(const std::invalid_argument&){unsupported=true;}check(unsupported,"vision unsupported quant remains rejected");
+    }
+    std::array<Byte,128> vision_bytes{};check(bool(read_slice(vision_owned[0].weight.payload,vision_bytes)),"vision common map retains memory after legacy source destruction");
     auto wire=safe(R"({"a.weight":{"dtype":"BF16","shape":[2,2],"data_offsets":[0,8]},"aux":{"dtype":"I64","shape":[1],"data_offsets":[8,16]}})",16);
     TensorIndex st;check(bool(index_safetensors(memory_source(wire,"sub-a/model.safetensors"),st)),"safetensors typed index");check(st.tensors.size()==2 && st.tensors[1].wire_dtype=="I64","typed dtype preserved");
     auto same=memory_source(wire,"sub-b/model.safetensors");TensorIndex other;check(bool(index_safetensors(same,other)),"other shard");check(st.tensors[0].id!=other.tensors[0].id,"same-basename relative shard paths remain distinct");
@@ -42,6 +56,13 @@ bool wfmt_readers_test() try {
     std::filesystem::create_directory(directory);const auto path=directory/"model.safetensors";
     struct Cleanup{std::filesystem::path p;~Cleanup(){std::error_code ec;std::filesystem::remove(p,ec);std::filesystem::remove(p.parent_path(),ec);}} cleanup{path};
     {std::ofstream f(path,std::ios::binary);f.write(reinterpret_cast<const char*>(wire.data()),std::streamsize(wire.size()));}
+    {
+        auto gemma=strix::gemma4::read_safetensors(path);check(gemma.tensors.size()==2,"Gemma common parser tensor census");
+        const auto& tensor=gemma.tensors[0];check(tensor.dtype=="BF16" && tensor.shape==std::vector<std::uint64_t>({2,2}) && tensor.bytes==8,"Gemma legacy type/shape preserved");
+        check(std::memcmp(gemma.storage->data()+tensor.offset,wire.data()+tensor.offset,8)==0,"Gemma mapped operand bytes unchanged");
+        strix::h3::block::SafeTensors h3(path.string());const auto values=h3.read_vec<std::uint16_t>("a.weight",strix::h3::block::StDtype::bf16);
+        check(values.size()==4 && std::memcmp(values.data(),wire.data()+tensor.offset,8)==0,"H3 legacy read_vec bytes unchanged");
+    }
     std::shared_ptr<const Source> file;check(bool(open_source(path.string(),file)),"file source open");
     const auto digest=file->identity();check(digest.bytes==digest_bytes(wire).bytes,"source identity is SHA256 content, not metadata");
     TensorIndex file_index;check(bool(index_safetensors(file,file_index)),"file index");
