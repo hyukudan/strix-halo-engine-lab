@@ -1088,6 +1088,7 @@
         "linears",
         "note_default_export",
         "pf_async_min_rows",
+        "product_option",
         "reference",
         "resolve",
         "resolve_default",
@@ -1140,6 +1141,7 @@
       "operations": [
         "agree_max_rows",
         "block",
+        "has_weight_request",
         "invalid_argument",
         "is_reference_gate",
         "kernel",
@@ -1332,16 +1334,21 @@
         "activation_fragment",
         "block",
         "blocks",
+        "columns",
         "enqueue",
+        "enqueue_image",
         "enqueue_parts",
         "fragment",
         "hipLaunchKernelGGL",
         "kernel",
+        "kernel_image",
         "launch",
         "launch_form",
+        "launch_image",
         "rows",
         "stage",
         "supported",
+        "supported_image",
         "tile"
       ],
       "images": [
@@ -1614,6 +1621,7 @@
         "enqueue_q8_0_a8_ready",
         "enqueue_q8_0_a8_rn",
         "enqueue_q8_0_a8_rn_ready",
+        "enqueue_q_b_rope_image",
         "enqueue_quantize_a8",
         "enqueue_rms_norm",
         "enqueue_rope",
@@ -1698,6 +1706,7 @@
         "site_a8_group",
         "site_fast_kernel",
         "supported",
+        "supported_image",
         "swiglu_a8_kernel",
         "tile",
         "tiles",
@@ -3910,6 +3919,7 @@
       "status": "incumbent",
       "capture": "legacy-public-entrypoint",
       "operations": [
+        "alloc_rows",
         "allocate_block",
         "block",
         "bytes",
@@ -3922,6 +3932,7 @@
         "export_rows",
         "first_max_rows",
         "fixed_bytes",
+        "fixed_session_bytes",
         "fread",
         "free_block",
         "gather_rows",
@@ -3964,8 +3975,10 @@
         "recurrent_state_type_name",
         "row_bytes",
         "rows",
+        "rows_bytes_at",
         "run_block",
         "session_bytes",
+        "session_bytes_at",
         "state_bytes",
         "supported",
         "tensor",
@@ -4159,8 +4172,7 @@
         "q8_fast_kernel",
         "quantize_a8_fast_kernel",
         "rows",
-        "rows_",
-        "volatile"
+        "rows_"
       ]
     },
     {
@@ -4311,8 +4323,7 @@
         "launch_shape",
         "load",
         "router_select_kernel",
-        "stage",
-        "volatile"
+        "stage"
       ]
     },
     {
