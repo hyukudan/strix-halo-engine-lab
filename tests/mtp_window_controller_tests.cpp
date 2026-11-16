@@ -79,6 +79,8 @@ int main() {
         // One resolver: the serving default (no STRIX_MTP_JOINT_PLAN) is the plain budget rule with the auto lane table,
         // the same value the CLI cohort path resolves.
         expect(C::parse_rule("budget").measured_lanes==strix::mtp_serve_row_measured_lanes(),"plain budget takes the lane table");
+        expect(strix::mtp_serve_row_measured_lane_list("7,8")==((1U<<7U)|(1U<<8U)) && strix::mtp_serve_row_measured_lane_list("7")==(1U<<7U)
+            && strix::mtp_serve_row_measured_lane_list("9")==0U && strix::mtp_serve_row_measured_lane_list("7,x")==0U,"lane list override");
         if(!std::getenv("STRIX_SERVE_ROW_MEASURED") && !std::getenv("STRIX_MTP_JOINT_PLAN") && !std::getenv("STRIX_SERVE_ROW_BUDGET"))
             expect(C::rule_from_env(false).measured_lanes==strix::kMtpRowMeasuredAutoLanes,"serve and CLI default = auto table");
         const std::array<float,7> p{1,1,1,1,1,1,1};

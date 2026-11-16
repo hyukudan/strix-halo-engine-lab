@@ -210,12 +210,28 @@ const char* mtp_serve_row_measured_choice() noexcept {
     static const char* choice=[]()->const char* {
         const char* v=envcfg::text("STRIX_SERVE_ROW_MEASURED");
         if(!v || !*v || std::string_view(v)=="auto") return "auto";
-        return std::string_view(v)=="0"?"0":"1";}();
+        if(std::string_view(v)=="0" || std::string_view(v)=="1") return std::string_view(v)=="0"?"0":"1";
+        return "list";}();
     return choice;
 }
+std::uint32_t mtp_serve_row_measured_lane_list(std::string_view text) noexcept {
+    // "7,8": the listed lane counts (1..8); anything else in the list = none (the affine fit).
+    std::uint32_t mask=0;
+    for(std::size_t at=0;at<text.size();) {
+        const auto end=std::min(text.find(',',at),text.size());
+        const auto item=text.substr(at,end-at);
+        if(item.size()!=1U || item[0]<'1' || item[0]>'8') return 0U;
+        mask|=1U<<static_cast<std::uint32_t>(item[0]-'0');
+        at=end+1U;
+    }
+    return mask;
+}
 std::uint32_t mtp_serve_row_measured_lanes() noexcept {
-    const std::string_view c=mtp_serve_row_measured_choice();
-    return c=="auto"?kMtpRowMeasuredAutoLanes:c=="1"?0x1FEU:0U;
+    static const std::uint32_t lanes=[]{
+        const std::string_view c=mtp_serve_row_measured_choice();
+        if(c=="list") {const char* v=envcfg::text("STRIX_SERVE_ROW_MEASURED");return mtp_serve_row_measured_lane_list(v?v:"");}
+        return c=="auto"?kMtpRowMeasuredAutoLanes:c=="1"?0x1FEU:0U;}();
+    return lanes;
 }
 bool mtp_serve_row_budget_enabled() noexcept {
     static const bool on=envcfg::flag("STRIX_SERVE_ROW_BUDGET",true,EnvFlagMatch::exact);

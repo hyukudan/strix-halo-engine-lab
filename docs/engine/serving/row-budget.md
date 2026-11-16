@@ -46,7 +46,7 @@ Measured topology pricing (`STRIX_SERVE_ROW_MEASURED`, default `auto`): at the l
 (`kMtpRowMeasuredAutoLanes`, now 7 requests) the budget prices each owner topology (how many requests hold 2, 4 or 8 rows)
 by its own measured cycle time (three samples or more) and its delivered tokens, and takes the assignment with the most
 expected tokens per millisecond (an exact search over owner counts). It also runs the bounded probes above the lane bound,
-so 7 requests can leave the fixed two rows when four rows each measure faster per token. `1` uses it at every count 1-8,
+so 7 requests can leave the fixed two rows when four rows each measure faster per token. `1` uses it at every count 1-8, a list such as `7,8` at those counts,
 `0` keeps the affine fit everywhere. Joint rule texts for in-process A/B: `budget-measured` (all counts), `budget-fit`
 (none). `--print-effective-config` / the serve lever list show `row_measured` with the lane mask.
 
