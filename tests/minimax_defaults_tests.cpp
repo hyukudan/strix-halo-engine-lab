@@ -163,6 +163,26 @@ void test_receipts(const char* path) {
     }
 }
 
+// Pair pipeline declaration (MMPIPE-PLAN PR-4): CLI rank and serve resolve the same row, TP2 with the layout reason.
+void test_pair_pipeline_declaration() {
+    const EnvMap none;
+    const std::string want = "prefill.pair_pipeline=off pair.pipeline mode=tensor chunk=";
+    const std::string reason = "reason=layout: src/minimax/engine/engine.hip:89-91,1120-1131 needs +41.6 GB/node, free 31.0 GB";
+    std::string rows[2];
+    const char* apps[2] = {"rank", "serve"};
+    for (int i = 0; i < 2; ++i) {
+        const std::vector<std::string> args = i == 0 ? std::vector<std::string>{"model", "0", "tcp", "out"} : std::vector<std::string>{};
+        for (const auto& line : lines(md::effective_config(md::parse_cli(apps[i], args), lookup(none))))
+            if (line.rfind("prefill.pair_pipeline=", 0) == 0) rows[i] = line;
+        check(rows[i].rfind(want, 0) == 0 && rows[i].find(reason) != std::string::npos, std::string(apps[i]) + ": pair pipeline row " + rows[i]);
+    }
+    check(rows[0] == rows[1], "CLI and serve resolve the same pair pipeline row");
+    const auto at8k = md::pair_pipeline_choice(8192U);
+    check(at8k.pipeline_ms > 9500.0 && at8k.pipeline_ms < 9700.0 && at8k.alt_ms > 9809.0 && at8k.alt_ms < 9811.0,
+        "MiniMax 8K best pipeline ~9.6 s vs TP2 9.81 s");
+    check(md::pair_pipeline_choice(32768U).mode == strix::pair::Mode::tensor, "32K stays TP2 (layout)");
+}
+
 void test_off_switches() {
     const EnvMap none;
     const auto on_lines = lines(md::effective_config(md::Cli{}, lookup(none)));
@@ -756,6 +776,7 @@ int main(int argc, char** argv) {
         test_table();
         test_receipts(argv[1]);
         test_off_switches();
+        test_pair_pipeline_declaration();
         test_resolution_sources();
         test_baseline();
         test_host_receipt();

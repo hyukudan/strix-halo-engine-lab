@@ -10,6 +10,7 @@
 // explicit per-item value still wins in both modes. apply() exports each unset item's resolved value into the process
 // environment, so the readers in the engine, the exchange modules and the dist layer see exactly what
 // --print-effective-config prints.
+#include "strix/pair/regime.hpp"
 #include <cstdint>
 #include <cstddef>
 #include <functional>
@@ -64,6 +65,10 @@ struct PrefillPolicy {
 // Static execution guards, also used by the engine receipt after runtime control changes.
 const char* msa_flash_decline_reason(bool rework, bool fused, unsigned layers);
 PrefillPolicy prefill_policy(const Lookup& env);
+// Pair pipeline rule (include/strix/pair/regime.hpp) with the MiniMax TP2 costs: the TP2 slices are fixed at load
+// (engine.hip:89-91 kWorld/kQLocal/kKVLocal/kIdxLocal/kExpertLocal, :1120-1131 rank expert slices), and holding
+// the whole stage layers next to them needs +41.6 GB/node with ~31 GB free, so every length stays on TP2.
+strix::pair::PipelineChoice pair_pipeline_choice(std::uint64_t rows);
 const profile::Engine& profile_engine();                 // tag "minimax-pair", table profile_table
 profile::Resolution profile_resolution(const Lookup& env);
 // Cache / receipt identity of the active prefill policies; empty with every governed row at its builtin and the EXL3
