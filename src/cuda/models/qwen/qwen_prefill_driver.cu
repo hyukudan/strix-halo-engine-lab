@@ -1196,7 +1196,7 @@ void Prefill::Impl::run_block(const Segment* seg, std::uint32_t count, std::uint
         ew.up = static_cast<const std::uint8_t*>(lw[l].p[k_ffn_up_exps_weight]);
         ew.down = static_cast<const std::uint8_t*>(lw[l].p[k_ffn_down_exps_weight]);
         nv.push("moe_routed");
-        moe::enqueue(mr, pad, kHidden, ew, tables, nullptr, stream);
+        moe::enqueue(mr, pad, kHidden, ew, tables, nullptr, stream, cfg.forms.moe_mma && !window);  // FAST form: prefill blocks only
         nv.pop();
         if (window) {
             moe_sticky_kernel<<<1, 32, 0, stream>>>(csr.summary, moe_status, 4, pad, moe_sticky);

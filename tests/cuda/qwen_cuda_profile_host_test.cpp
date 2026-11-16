@@ -70,6 +70,7 @@ std::set<std::string> diff(const qp::Config& a, const qp::Config& b) {
     ne("forms.hc_mma", a.forms.hc_mma != b.forms.hc_mma);
     ne("forms.mtp_mma", a.forms.mtp_mma != b.forms.mtp_mma);
     ne("forms.qsa_mma", a.forms.qsa_mma != b.forms.qsa_mma);
+    ne("forms.moe_mma", a.forms.moe_mma != b.forms.moe_mma);
     return d;
 }
 // serve vs cli: the same request. Fails on a Resolution, contract or Config difference that is not named.
@@ -106,15 +107,15 @@ void profiles() {
         same_request("exact", a);
         const auto r = one(a, qo::Entry::cli);
         check(!r.choice.fast() && r.contract == "qwen-cuda;prefill=exact", "default/exact is the exact CUDA path");
-        check(!r.config.forms.hc_mma && !r.config.forms.mtp_mma && !r.config.forms.qsa_mma && r.config.moe_route_bf16 == false, "exact: all forms off");
+        check(!r.config.forms.hc_mma && !r.config.forms.mtp_mma && !r.config.forms.qsa_mma && !r.config.forms.moe_mma && r.config.moe_route_bf16 == false, "exact: all forms off");
         check(r.resolution.entries.empty(), "default lists no rows");
     }
     check(one({"--profile", "exact"}, qo::Entry::cli).resolution.json() == one({"--profile", "default"}, qo::Entry::cli).resolution.json(), "exact is an alias of default");
     same_request("fast", {"--profile", "fast"});
     const auto fast = one({"--profile", "fast"}, qo::Entry::serve);
-    check(fast.config.forms.hc_mma && fast.config.forms.mtp_mma && fast.config.forms.qsa_mma, "fast: the three forms on");
-    check(fast.contract == "qwen-cuda;prefill=fast;forms=hc_mma,mtp_mma,qsa_mma;moe_route_bf16=0", "fast contract: " + fast.contract);
-    for (const char* f : {"hc_mma", "mtp_mma", "qsa_mma"}) check(status(fast, f) == "provisional", std::string("fast: ") + f + " provisional");
+    check(fast.config.forms.hc_mma && fast.config.forms.mtp_mma && fast.config.forms.qsa_mma && fast.config.forms.moe_mma, "fast: the four forms on");
+    check(fast.contract == "qwen-cuda;prefill=fast;forms=hc_mma,mtp_mma,qsa_mma,moe_mma;moe_route_bf16=0", "fast contract: " + fast.contract);
+    for (const char* f : {"hc_mma", "mtp_mma", "qsa_mma", "moe_mma"}) check(status(fast, f) == "provisional", std::string("fast: ") + f + " provisional");
     for (const char* f : {"moe_route_bf16", "qsa_budget", "gdn_fp16_chunk", "output_head"})
         check(status(fast, f) == "pending", std::string("fast: ") + f + " pending (listed, not used)");
     check(fast.config.moe_route_bf16 == false, "fast: pending route storage is not applied");
@@ -129,9 +130,26 @@ void profiles() {
 void overrides() {
     same_request("fast-hc-off", {"--profile", "fast", "--hc-mma", "off"});
     auto r = one({"--profile", "fast", "--hc-mma", "off"}, qo::Entry::cli);
-    check(!r.config.forms.hc_mma && r.config.forms.mtp_mma && r.config.forms.qsa_mma, "--hc-mma off wins over the profile");
+    check(!r.config.forms.hc_mma && r.config.forms.mtp_mma && r.config.forms.qsa_mma && r.config.forms.moe_mma, "--hc-mma off wins over the profile");
     check(status(r, "hc_mma") == "off", "hc_mma status off");
-    check(r.contract == "qwen-cuda;prefill=fast;forms=mtp_mma,qsa_mma;moe_route_bf16=0", r.contract);
+    check(r.contract == "qwen-cuda;prefill=fast;forms=mtp_mma,qsa_mma,moe_mma;moe_route_bf16=0", r.contract);
+    // moe_mma: option and env of the table row, CLI beats env, off wins over the fast profile.
+    same_request("fast-moe-off", {"--profile", "fast", "--moe-mma", "off"});
+    r = one({"--profile", "fast", "--moe-mma", "off"}, qo::Entry::cli);
+    check(!r.config.forms.moe_mma && r.config.forms.hc_mma && status(r, "moe_mma") == "off", "--moe-mma off wins over the profile");
+    check(r.contract == "qwen-cuda;prefill=fast;forms=hc_mma,mtp_mma,qsa_mma;moe_route_bf16=0", r.contract);
+    Env moe_env{{"STRIX_QRTX_MOE_MMA", "0"}};
+    same_request("fast-env-moe-off", {"--profile", "fast"}, moe_env);
+    r = one({"--profile", "fast"}, qo::Entry::serve, moe_env);
+    check(!r.config.forms.moe_mma && status(r, "moe_mma") == "off", "STRIX_QRTX_MOE_MMA=0 reaches only through the lookup");
+    moe_env = {{"STRIX_QRTX_MOE_MMA", "1"}};
+    r = one({}, qo::Entry::prefill_service, moe_env);
+    check(r.config.forms.moe_mma && !r.config.forms.hc_mma && status(r, "moe_mma") == "explicit-env" && r.contract == "qwen-cuda;prefill=fast;forms=moe_mma;moe_route_bf16=0",
+          "env turns the MoE form on in the default profile: " + r.contract);
+    r = one({"--moe-mma", "off"}, qo::Entry::cli, moe_env);
+    check(!r.config.forms.moe_mma, "CLI beats env (moe_mma)");
+    r = one({"--moe-mma", "1"}, qo::Entry::cli);
+    check(r.config.forms.moe_mma && !r.config.forms.hc_mma && cp::form_identities(r.choice) == "qwen-cuda-moe-i8fma-v1", "--moe-mma 1 alone: " + cp::form_identities(r.choice));
     Env env{{"STRIX_QRTX_QSA_MMA", "0"}};
     same_request("fast-env-qsa-off", {"--profile", "fast"}, env);
     r = one({"--profile", "fast"}, qo::Entry::serve, env);
@@ -217,14 +235,14 @@ void identities() {
     const auto off = fields(c);
     for (const auto& [k, v] : off) check(k.rfind("form.", 0) != 0, "OFF keys carry no form field: " + k);
     std::set<std::string> keys{px::canonical_identity(off)};
-    for (int which = 0; which < 3; ++which) {
+    for (int which = 0; which < 4; ++which) {
         auto f = c;
-        (which == 0 ? f.forms.hc_mma : which == 1 ? f.forms.mtp_mma : f.forms.qsa_mma) = true;
+        (which == 0 ? f.forms.hc_mma : which == 1 ? f.forms.mtp_mma : which == 2 ? f.forms.qsa_mma : f.forms.moe_mma) = true;
         const auto on = fields(f);
         check(on.size() == off.size() + 1, "one form adds exactly one identity field");
         check(keys.insert(px::canonical_identity(on)).second, "each form changes the prefix identity");
         bool found = false;
-        for (const auto& [k, v] : on) found |= k.rfind("form.", 0) == 0 && v == cp::form_identities(cp::Choice{false, which == 0, which == 1, which == 2});
+        for (const auto& [k, v] : on) found |= k.rfind("form.", 0) == 0 && v == cp::form_identities(cp::Choice{false, which == 0, which == 1, which == 2, which == 3});
         check(found, "prefix identity field carries the form identity string");
     }
     fs::remove_all(dir);

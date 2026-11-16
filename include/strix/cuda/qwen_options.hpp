@@ -96,7 +96,7 @@ inline bool take(int argc, char** argv, int& i, Request& r) {
 
 // Maps a lever Resolution onto the engine Config: the only place that does.
 inline void apply(const cp::Choice& choice, qp::Config& config) {
-    config.forms = {choice.hc_mma, choice.mtp_mma, choice.qsa_mma};
+    config.forms = {choice.hc_mma, choice.mtp_mma, choice.qsa_mma, choice.moe_mma};
     config.moe_route_bf16 = choice.moe_route_bf16;  // explicit: the resolver already read the environment
 }
 
@@ -143,6 +143,7 @@ inline std::string effective_config_json(const Resolved& r) {
     forms.set("hc_mma", J(c.forms.hc_mma));
     forms.set("mtp_mma", J(c.forms.mtp_mma));
     forms.set("qsa_mma", J(c.forms.qsa_mma));
+    forms.set("moe_mma", J(c.forms.moe_mma));
     forms.set("moe_route_bf16", J(c.moe_route_bf16.value_or(false)));
     out.set("forms", std::move(forms));
     out.set("form_identities", J(cp::form_identities(r.choice)));
@@ -181,7 +182,7 @@ inline constexpr std::uint64_t fnv64(std::string_view s) {
     return h;
 }
 inline cp::Choice choice_of(const qp::Config& c) {
-    return {c.moe_route_bf16.value_or(false), c.forms.hc_mma, c.forms.mtp_mma, c.forms.qsa_mma};
+    return {c.moe_route_bf16.value_or(false), c.forms.hc_mma, c.forms.mtp_mma, c.forms.qsa_mma, c.forms.moe_mma};
 }
 // Hand-off producer id: the exact CUDA path keeps its historical id bytes; a FAST arithmetic folds its contract in, so an
 // exact-identity node refuses a FAST state (different producer id).
