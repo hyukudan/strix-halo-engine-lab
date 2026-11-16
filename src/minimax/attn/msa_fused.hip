@@ -2717,7 +2717,7 @@ namespace {
 // The batched prefill view contract (shared by the full stage and the cache-only stage).
 void check_prefill_view(const PrefillView& p) {
     const DecodeView& v = p.window;
-    if (p.msa_rework > 12 || (p.index_rows != 16 && p.index_rows != 32 && p.index_rows != 64) ||
+    if (p.msa_rework > 13 || (p.index_rows != 16 && p.index_rows != 32 && p.index_rows != 64) ||
         p.rows == 0 || p.scratch_windows == 0 || p.first_window != 0 || v.seqs != 1 ||
         v.q_heads != 32 || v.kv_heads != 2 || v.idx_heads != 2 || v.shard_count != 1 || v.shard_rank != 0 ||
         v.max_blocks == 0 || v.max_blocks > kMaxBlocks || (attend_version(v) != 3 && attend_version(v) != 4) ||
