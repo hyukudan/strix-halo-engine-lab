@@ -3,6 +3,7 @@
 #include "../src/core/chunk_contract.hpp"
 #include "qwen_pair_transport.hpp"
 #include "strix/qwen_prefill_pair.hpp"
+#include "strix/qwen_prefill_stages.hpp"
 #include "strix/qwen_prefill_handoff.hpp"
 #include "strix/qwen_prefill_pipe_dump.hpp"
 #include "strix/qwen_prefill_balance.hpp"
@@ -5796,6 +5797,91 @@ static int run_decode_entry(
                     " bytes=" + std::to_string(bytes) + " fnv1a64=" + std::to_string(hash) + metadata + "\n");
             }
         };
+        // PR-3 identity gate (MMPIPE-PLAN, option C): STRIX_QWEN_PF_STAGE_EMULATE=v runs the interleaved (stage, chunk)
+        // order of 2v stages (v per rank) on ONE node: one cursor and one session, a frontier per stage swapped in
+        // around each step, the step's layer range in qwen_pp::pipe_step, seams kept per (chunk, boundary). v = 0 runs
+        // the same step loop without a split. Prints logits SHA-256, a state digest and the folded lineage.
+        if (const char* emulate_text = std::getenv("STRIX_QWEN_PF_STAGE_EMULATE");
+            emulate_text && *emulate_text && !strix::qwen_pp::pipe_enabled()) {
+            const auto emulate_v = static_cast<std::uint32_t>(std::strtoul(emulate_text, nullptr, 10));
+            if (!known_prefill_plan || !known_prefix_owner || model.hidden_layers != 48 || options.tokens.empty())
+                throw std::invalid_argument("stage emulation requires the 48-layer tiled model and a prompt");
+            strix::pair::StageMap emulate_map;
+            if (const char* map_text = std::getenv("STRIX_PAIR_STAGE_MAP"); map_text && *map_text && emulate_v)
+                emulate_map = strix::pair::StageMap::parse(map_text, 48U);
+            else if (emulate_v) emulate_map = strix::qwen_pp::even_map(emulate_v, 48U);
+            else emulate_map.cuts = {strix::pair::StageCut(0U), strix::pair::StageCut(48U)};
+            const auto emulate_stages = emulate_map.stages();
+            strix::KnownPromptChunkRequest emulate_req;
+            emulate_req.prompt_tokens = options.tokens;
+            emulate_req.start_position = session.next_position;
+            emulate_req.vocab_size = request.vocab_size; emulate_req.context_capacity = request.context_capacity;
+            emulate_req.max_new_tokens = 0U; emulate_req.eos_token_id = request.eos_token_id;
+            emulate_req.logical_rows = options.known_prefix_prefill_rows ? options.known_prefix_prefill_rows : options.known_prefix_rows;
+            emulate_req.tiled_prefill = true;
+            emulate_req.output_policy = options.known_prefix_output_policy;
+            emulate_req.all_row_heads = false;
+            emulate_req.schedule_extensions = true;
+            emulate_req.schedule_defer = false;  // a deferred block would complete across a stage switch
+            emulate_req.ladder_tail_rows = options.known_prefix_ladder_tail_rows;
+            strix::KnownPromptChunkCursor emulate_chunks(emulate_req, *known_prefix_backend, backend);
+            for (auto& tail : known_tail_backends) emulate_chunks.set_tail_backend(*tail);
+            const auto emulate_units = emulate_chunks.cold_plan().size();
+            std::vector<strix::KnownPromptChunkStageView> emulate_views(emulate_stages, emulate_chunks.stage_view());
+            std::vector<strix::qwen_pp::StageFrontier> emulate_frontiers(emulate_stages,
+                strix::qwen_pp::StageFrontier{session.next_position, session.committed_tokens, session.arithmetic_lineage});
+            struct StepReset {
+                ~StepReset() { strix::qwen_pp::pipe_step = {}; }
+            } emulate_step_reset;
+            const auto emulate_swap = [&](std::uint32_t stage) {
+                emulate_chunks.swap_stage(emulate_views[stage]);
+                auto& front = emulate_frontiers[stage];
+                std::swap(session.next_position, front.next_position);
+                std::swap(session.committed_tokens, front.committed_tokens);
+                std::swap(session.arithmetic_lineage, front.lineage);
+            };
+            const auto emulate_start = std::chrono::steady_clock::now();
+            for (const auto& step : strix::qwen_pp::local_order(emulate_stages, emulate_units)) {
+                emulate_swap(step.stage);
+                strix::qwen_pp::pipe_step = {true, step.stage, emulate_stages, step.chunk, emulate_stages == 1U ?
+                    strix::qwen_pp::LayerRange{0U, 48U, false} : strix::qwen_pp::stage_range(emulate_map, step.stage)};
+                const bool ran = emulate_chunks.advance();
+                strix::qwen_pp::pipe_step = {};
+                emulate_swap(step.stage);
+                if (!ran) throw std::runtime_error("stage emulation: cursor ended before its planned units");
+            }
+            const auto emulate_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - emulate_start).count();
+            // The last stage holds the terminal logits; the session frontier is the last stage's, its lineage the fold.
+            emulate_chunks.swap_stage(emulate_views.back());
+            session.next_position = emulate_frontiers.back().next_position;
+            session.committed_tokens = emulate_frontiers.back().committed_tokens;
+            session.arithmetic_lineage = strix::qwen_pp::fold_stage_lineages(emulate_frontiers);
+            const auto emulate_frontier = emulate_chunks.frontier();
+            if (!emulate_frontier.valid || emulate_frontier.logits.size() != model.vocab_size)
+                throw std::runtime_error("stage emulation: no terminal logits");
+            check_hip(hipDeviceSynchronize(), "stage emulation state digest fence");
+            std::uint64_t emulate_state = 14695981039346656037ULL, emulate_state_bytes = 0;
+            std::vector<std::uint64_t> emulate_staging(strix::qwen_pp::seam_piece_bytes / sizeof(std::uint64_t));
+            for (const auto& view : pair_state_views(0U, 48U))
+                for (std::uint64_t offset = 0; offset < view.second.bytes;) {
+                    const auto size = static_cast<std::size_t>(std::min<std::uint64_t>(
+                        emulate_staging.size() * sizeof(std::uint64_t), view.second.bytes - offset));
+                    std::fill(emulate_staging.begin(), emulate_staging.end(), 0ULL);
+                    check_hip(hipMemcpy(emulate_staging.data(), reinterpret_cast<const void*>(view.second.address + offset),
+                        size, hipMemcpyDeviceToHost), "stage emulation state digest D2H");
+                    for (std::size_t word = 0; word < (size + 7U) / 8U; ++word)
+                        emulate_state = (emulate_state ^ emulate_staging[word]) * 1099511628211ULL;
+                    offset += size; emulate_state_bytes += size;
+                }
+            std::cout << "{\"stage_emulation\":" << emulate_v << ",\"map\":\"" << emulate_map.text() << "\",\"units\":" << emulate_units
+                << ",\"position\":" << session.next_position << ",\"lineage_history\":" << session.arithmetic_lineage.history_identity
+                << ",\"lineage_intervals\":" << session.arithmetic_lineage.intervals.size()
+                << ",\"lineage_tainted\":" << (session.arithmetic_lineage.tainted ? "true" : "false")
+                << ",\"state_fnv64w\":" << emulate_state << ",\"state_bytes\":" << emulate_state_bytes
+                << ",\"logits_sha256\":\"" << strix::model_content_identity_hex(strix::sha256_bytes(
+                    std::as_bytes(std::span<const float>(emulate_frontier.logits)))) << "\",\"wall_ms\":" << emulate_ms << "}\n";
+            return 0;
+        }
         if (strix::qwen_pp::pipe_enabled() && (!strix::qwen_pp::decode_enabled() || pair_prompt_route.prefix)) {
             const auto pair_prompt_size = strix::qwen_pp::decode_enabled() ? pair_prompt_route.prefix : options.tokens.size();
             if (!known_prefill_plan || !known_prefix_owner || model.hidden_layers != 48 || options.tokens.empty() ||

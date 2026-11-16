@@ -1,5 +1,6 @@
 #include "strix/qwen_prefill_pair.hpp"
 #include "strix/qwen_prefill_balance.hpp"
+#include "strix/qwen_prefill_stages.hpp"
 #include "xport/crc32c_fold.hpp"
 #include <atomic>
 #include <algorithm>
@@ -685,6 +686,46 @@ void timeline_checks() {
     for (const char* needle : {"rank=0 step=2 ", "rank=1 step=2 ", "rank=0 sum steps=3", "rank=1 sum steps=3"})
         require(lines.find(needle) != std::string::npos);
 }
+// PR-3: stage ranges, the one-node interleaved order and the per-stage lineage fold.
+void stage_checks() {
+    const auto map = strix::qwen_pp::even_map(3U, 48U);
+    require(map.text() == "0,8,16,24,32,40,48");
+    const auto first = strix::qwen_pp::stage_range(map, 0U), mid = strix::qwen_pp::stage_range(map, 3U),
+        last = strix::qwen_pp::stage_range(map, 5U);
+    require(first.enabled && first.begin == 0U && first.end == 8U && mid.begin == 24U && mid.end == 32U &&
+        last.begin == 40U && last.end == 48U && !last.end_half);
+    bool threw = false;
+    try { (void)strix::qwen_pp::stage_range(map, 6U); } catch (const std::out_of_range&) { threw = true; }
+    require(threw);
+    // Every (s, c) once; (s-1, c) and (s, c-1) before (s, c).
+    for (const std::uint64_t chunks : {1ULL, 3ULL, 4ULL, 9ULL}) {
+        const auto order = strix::qwen_pp::local_order(6U, chunks);
+        require(order.size() == 6U * chunks);
+        std::vector<std::vector<int>> at(6U, std::vector<int>(chunks, -1));
+        for (std::size_t i = 0; i < order.size(); ++i) {
+            require(at[order[i].stage][order[i].chunk] < 0);
+            at[order[i].stage][order[i].chunk] = static_cast<int>(i);
+        }
+        for (std::uint32_t s = 0; s < 6U; ++s) for (std::uint64_t c = 0; c < chunks; ++c) {
+            if (s) require(at[s - 1U][c] < at[s][c]);
+            if (c) require(at[s][c - 1U] < at[s][c]);
+        }
+    }
+    // Fold: equal stage chains reduce to the one-stage chain; any differing stage taints it.
+    strix::qwen_pp::StageFrontier a;
+    a.next_position = 4096U; a.committed_tokens = 4096U;
+    a.lineage.intervals = {{0U, 2048U, strix::ArithmeticProducer::prefill_chunk, 1U, 2U, 3U},
+        {2048U, 4096U, strix::ArithmeticProducer::prefill_chunk, 1U, 2U, 3U}};
+    a.lineage.history_identity = 77U;
+    std::vector<strix::qwen_pp::StageFrontier> stages(4U, a);
+    const auto folded = strix::qwen_pp::fold_stage_lineages(stages);
+    require(!folded.tainted && folded.intervals == a.lineage.intervals && folded.history_identity == 77U);
+    require(!strix::qwen_pp::fold_stage_lineages(std::span(stages).first(1U)).tainted);
+    stages[2].lineage.intervals[1].reduction_plan_identity = 9U;
+    require(strix::qwen_pp::fold_stage_lineages(stages).tainted);
+    stages[2] = a; stages[3].next_position = 2048U;
+    require(strix::qwen_pp::fold_stage_lineages(stages).tainted);
+}
 int main(int argc, char** argv) {
     try {
         if (argc == 2 && std::string_view(argv[1]) == "--route-mode-only") {
@@ -697,7 +738,7 @@ int main(int argc, char** argv) {
             device_checked_piece_checks(); return 0;
         }
         route_mode_checks(); policy_inspection_checks();
-        balance_checks(); half_cut_checks(); route_checks(); chunk_checks(); blocked_send_overlap_checks(); crc_checks(); fault_checks(); routed_piece_checks(); crc_fold_checks(); device_checked_piece_checks(); timeline_checks(); copy_rows_checks();
+        balance_checks(); half_cut_checks(); route_checks(); chunk_checks(); blocked_send_overlap_checks(); crc_checks(); fault_checks(); routed_piece_checks(); stage_checks(); crc_fold_checks(); device_checked_piece_checks(); timeline_checks(); copy_rows_checks();
         Wire forward, backward;
         std::mutex received_mutex; std::condition_variable received_cv; std::uint64_t received_chunks = 0;
         const auto abort = [&] { forward.stop(); backward.stop(); };
