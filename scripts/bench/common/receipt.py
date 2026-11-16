@@ -192,6 +192,13 @@ def cmd_summarize(args):
     if not pf and not args.family:
         pat, pf = prefill_values(out, args.prefill_regex or DEFAULT_PREFILL)
         timing, stream_name = out, "stdout"
+    if not pf and not args.family:
+        # Producers that print no prefill line (Qwen single-node: only the result JSON) give the figure as a JSON
+        # field in ms; the timed window is then placed by --anchor-regex on stderr (stderr.ts has the stamps).
+        for key in args.prefill_json or []:
+            if isinstance(out_json.get(key), (int, float)) and out_json[key] > 0:
+                pat, pf, timing, stream_name = None, [float(out_json[key])], err, "stderr"
+                break
     warm = pf[-1] if pf else 0.0
     cold = pf[0] if pf else 0.0
     tl = stamps(os.path.join(d, stream_name + ".ts"))
@@ -307,6 +314,8 @@ def main(argv=None):
     s.add_argument("--tokens", type=int, default=0, help="prompt tokens, for prefill tok/s and clocks per token")
     s.add_argument("--family", choices=tuple(FAMILY_PREFILL))
     s.add_argument("--prefill-regex", action="append", help="regex with one float group; suffix @s = seconds")
+    s.add_argument("--prefill-json", action="append",
+                   help="result-JSON key with the figure in ms, used when no --prefill-regex line matched (needs --anchor-regex)")
     s.add_argument("--anchor-regex", help="stderr line that ends the timed prefill (default: the figure's own line)")
     s.add_argument("--metric", action="append", help="NAME=REGEX (one float group, last match)")
     s.add_argument("--min-avail-gb", type=float, default=float(os.environ.get("KIT_MIN_AVAIL_GB", "2")))
