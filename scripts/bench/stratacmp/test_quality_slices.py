@@ -12,6 +12,16 @@ spec.loader.exec_module(native)
 
 
 class SelectionSliceTests(unittest.TestCase):
+    def test_teacher_kv_is_explicit_and_overrides_serving_config(self):
+        config = {"exe": "engine", "args": ["--kv", "int8", "--max-context", "100"]}
+        for requested, expected in ((None, "fp16"), ("int8", "int8")):
+            argv = native.engine_args(config, 522, *([] if requested is None else [requested]))
+            self.assertEqual(argv.count("--kv"), 1)
+            self.assertEqual(argv[argv.index("--kv") + 1], expected)
+            self.assertEqual(argv[argv.index("--max-context") + 1], "522")
+        with self.assertRaises(ValueError):
+            native.engine_args(config, 522, "unknown")
+
     def test_disjoint_shards_reconstruct_frozen_order(self):
         frozen = [64, 128, 256, 512, 1024]
         first, a = native.selection_slice(frozen, 0, 2)

@@ -26,8 +26,10 @@ def free_gb():
     return os.sysconf("SC_AVPHYS_PAGES") * os.sysconf("SC_PAGE_SIZE") / 2**30
 
 
-def engine_args(config, context):
-    fixed = {"--gpu": "0", "--kv": "fp16", "--suffix-draft": "0", "--lookup-max-t": "0",
+def engine_args(config, context, kv="fp16"):
+    if kv not in ("fp16", "int8"):
+        raise ValueError("unsupported teacher KV format")
+    fixed = {"--gpu": "0", "--kv": kv, "--suffix-draft": "0", "--lookup-max-t": "0",
              "--prompt-cache": "0", "--conversation-cache-mib": "0", "--prefill": "auto",
              "--max-context": str(context)}
     args = list(config["args"])
@@ -62,6 +64,8 @@ def main():
     for option in ("config", "manifest", "corpus", "case", "out"):
         p.add_argument("--" + option, required=True)
     p.add_argument("--timeout", type=float, default=120)
+    p.add_argument("--kv", choices=("fp16", "int8"), default="fp16",
+                   help="teacher KV format; int8 diagnoses the serving route")
     p.add_argument("--selection-start", type=int, default=0)
     p.add_argument("--selection-count", type=int)
     a = p.parse_args()
@@ -83,7 +87,7 @@ def main():
     selected_path = out / "selected.positions"
     selected_path.write_text("\n".join(map(str, positions)) + "\n")
     config = json.loads(Path(a.config).read_text(encoding="utf-8-sig"))
-    argv = engine_args(config, len(ids) + 8)
+    argv = engine_args(config, len(ids) + 8, a.kv)
     env = dict(os.environ, **config.get("env", {}))
     env.update(CUDA_DEVICE_ORDER="PCI_BUS_ID", CUDA_VISIBLE_DEVICES="0", STRATA_ROUTE_TAIL_SKIP="0",
                STRATA_PREFILL_CPU_SHARE="0", STRATA_DUMP_FIRST_LOGITS=str(out / "first"))

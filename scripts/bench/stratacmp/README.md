@@ -15,6 +15,10 @@ intrusive profiler scopes attribute kernels; cold/warm throughput comes from the
 
 ## Teacher-forced quality
 
+The native teacher defaults to FP16 KV. Pass `strata-first.py --kv int8` for a separately
+declared diagnostic of int8 serving arithmetic; its receipt records the effective arguments.
+Keep that candidate separate from the FP16 control and the formal frozen quality gate.
+
 Build the Release target `strix-cuda-qwen-logits`. It uses the production CUDA `Prefill` API without drafts,
 consumes every input token in order, and stores only selected full-vocabulary rows in the existing TURBO
 TMLLOG02 format. After any initial prefix before the first selection, this diagnostic accepts teacher
