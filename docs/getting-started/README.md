@@ -88,6 +88,6 @@ Each engine's launch contract, profiles and long-context options are on its page
   [standalone RTX](../models/deepseek-v4.1/README.md#deepseek-standalone-rtx); RTX + pair:
   [pipeline stages](../models/deepseek-v4.1/pipeline-stages.md).
 - [MiniMax M3.1 Flash pair](../models/minimax-m3.1/README.md#minimax-pair).
-- [GLM-5.3 Flash pair](../models/glm-5.3/README.md#glm-pair) and [GLM on one RTX PRO 6000](../../src/glm/rtxpf/README.md).
+- [GLM-5.3 Flash pair](../models/glm-5.3/README.md#glm-pair) and [GLM on one RTX PRO 6000](../../src/cuda/models/glm/README.md).
 - [Nemotron 3.5 Bolt E4B](../models/nemotron-3.5-bolt-e4b/README.md#build-and-run) (opt-in build).
 - Exposing the servers, authentication and limits: [serving](../serving.md#exposing-the-servers).

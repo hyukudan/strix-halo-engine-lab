@@ -12,7 +12,8 @@ onset-matched one-ulp nulls for the floor rule, and optional multi-site / magnit
   comparisons in a fresh `ranges.XXXXXX` directory beside `MMF_RUN` (path printed at startup).
   `ranges.status`: 0 = pass, 1 = completed gate failure, 2 = incomplete/error; this is also the exit status.
   `ranges.done` exists only for complete evidence (0 or 1). `ranges.summary` lists only expected current reports,
-  checked against the reference/candidate manifests. Arm syntax: `e<tag>`, `n<L>s<seed>`, `f<A>-<B>m<11|12>`, `d<A>-<B>s<seed>g<mag>`.
+  checked against the reference/candidate manifests. Arm syntax: `e<tag>`, `n<L>s<seed>`, `f<A>-<B>m<11|12>[i<C>-<D>]` (`i`: plus the FAST index projections
+  `STRIX_MM_PF_IDX_WMMA=1` on layers C-D; the floor onset is the first layer of either set), `d<A>-<B>s<seed>g<mag>`.
 - `summary.py`: timing line per run (cold / warm TTFT, busy, sclk, evicted_ms, GPU clocks per token) and the result table.
 - `null_patch.py`: patches scratch copies of `src/minimax/engine/engine.hip` and `apps/minimax_rank_main.cpp`
   (never merged), needed by the `n` and `d` arms. Pass the scratch engine path; the launcher is found in that tree.

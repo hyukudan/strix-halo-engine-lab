@@ -175,15 +175,15 @@ follow-up agent turns restore their cached prefix and prefill only the new token
 Build, then the measured run (exactness and speed; an HTTP server for this route is not tested end to end yet):
 
 ```powershell
-pwsh src/glm/rtxpf/producer/build.ps1 -BuildDir BUILD_DIR -Fresh -Parallel 2 `
+pwsh src/cuda/models/glm/producer/build.ps1 -BuildDir BUILD_DIR -Fresh -Parallel 2 `
     -TierstreamSource TIERSTREAM_DIR [-CutlassDir CUTLASS_DIR]
-python -B src/glm/rtxpf/producer/decode_qualification_window.py --build BUILD_DIR `
+python -B src/cuda/models/glm/producer/decode_qualification_window.py --build BUILD_DIR `
     --model MODEL_DIR --prompt-dir PROMPT_DIR --unit-file OUT_DIR/glm-units.bin `
     --unit-manifest-sha256 MANIFEST_SHA256 --full-card --allow-gpu
 ```
 
 For a smaller card replace `--full-card` with `--vram-total-gib 24 --ram-total-gib 32` (or your own caps). The unit
-file, every option and the measured rows: [GLM RTX guide](../src/glm/rtxpf/README.md).
+file, every option and the measured rows: [GLM RTX guide](../src/cuda/models/glm/README.md).
 
 The GLM service (`glm_native_service`) also takes `--dgpu auto|<uuid>`: it checks through NVML, before any CUDA call,
 that the card is an `sm_120` RTX PRO (`auto` picks the eligible card with the most memory) and pins it; `--dgpu off` is

@@ -11,7 +11,7 @@ scratch = pathlib.Path(tempfile.gettempdir())
 binary = pathlib.Path(sys.argv[1]).resolve()
 
 def copy_scope(dest):
-    for rel in ("src/minimax", "src/moe_core", "src/dspark_common", "src/xport",
+    for rel in ("src/minimax", "src/cuda/models/minimax", "src/moe_core", "src/dspark_common", "src/xport",
                 "include/strix/minimax", "include/strix/session", "src/session"):
         shutil.copytree(root / rel, dest / rel)
     (dest / "include/strix/serve").mkdir(parents=True)

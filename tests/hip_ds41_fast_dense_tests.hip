@@ -4,6 +4,7 @@
 // --no-timing: one repetition (the ctest form). Both modes first check the packed weight decode (all scales x codes) and
 // that every form of the policy gives form 0's bits; --forms [reps [rounds [rows]]] times the forms on DS41 chunk shapes.
 #include "core/f16_dense_q8a8.hpp"
+#include "strix/ds41_attention.hpp"
 #include "strix/hip_ds41_layer.hpp"
 #include "hip_ds41_fast_dense_args.hpp"
 
@@ -52,6 +53,59 @@ template <class F> double timed(F&& f, unsigned reps) {
     for (unsigned i = 0; i < reps; ++i) f();
     ck(hipDeviceSynchronize(), "sync");
     return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count() / reps;
+}
+
+// The DS41 flash prologue's query math (hip_ds41_attention_flash.inl query16: FP32 q, rope512 on the pairs of dims
+// 448..511 of each 512-wide head; then frag_from_f32 = to_bf16 per value), one thread per 16-dim chunk.
+__global__ void prologue_image(const float* q, const strix::ds41::attn::RopeRow* rope, unsigned rows, unsigned count, std::uint16_t* out) {
+    const std::size_t i = blockIdx.x * 256ULL + threadIdx.x;
+    if (i >= std::size_t{rows} * count / 16U) return;
+    const unsigned r = static_cast<unsigned>(i * 16U / count), chunk = static_cast<unsigned>(i * 16U % count % 512U / 16U);
+    float x[16];
+    for (unsigned k = 0; k < 16U; ++k) x[k] = q[i * 16U + k];
+    if (chunk >= 28U)
+        for (unsigned k = 0; k < 8U; ++k) {
+            const unsigned p = 8U * (chunk - 28U) + k;
+            strix::ds41::attn::rope_pair(x[2U * k], x[2U * k + 1U], rope[r].c[p], rope[r].s[p], false);
+        }
+    for (unsigned k = 0; k < 16U; ++k) out[i * 16U + k] = strix::attn_core::tile::to_operand<strix::attn_core::tile::Operand::bf16>(x[k]);
+}
+// enqueue_q_b_rope_image (q_b's image for the flash core's query_op) against the prologue on the FAST FP32 output:
+// bitwise equal, taken from the FAST dense rule's rows on, declined (nothing launched) below.
+bool run_image(strix::ds41::Q8A8DensePrefillView v, const Dev<float>& fast, const Case& c, unsigned reps) {
+    namespace attn = strix::ds41::attn;
+    std::vector<attn::RopeRow> hr(c.rows);
+    std::uniform_real_distribution<float> th(-3.14159F, 3.14159F);
+    for (auto& row : hr)
+        for (unsigned p = 0; p < attn::kRopePairs; ++p) {
+            const float t = th(rng);
+            row.c[p] = std::cos(t), row.s[p] = std::sin(t);
+        }
+    Dev<attn::RopeRow> dr(c.rows);
+    dr.up(hr);
+    Dev<std::uint16_t> image(std::size_t{c.rows} * c.count), ref(std::size_t{c.rows} * c.count);
+    strix::ds41::set_fast_dense(1);
+    v.out = fast.p;  // run()'s FAST FP32 output; the image form does not write it
+    const bool want = c.rows >= 128U && c.parts == 1U && !c.acc && c.count % 512U == 0U;
+    const bool taken = strix::ds41::enqueue_q_b_rope_image(v, image.p, dr.p, nullptr);
+    if (!taken) {
+        std::printf("img %5u %5u | declined %s\n", c.rows, c.count, want ? "FAIL" : "ok");
+        return !want;
+    }
+    if (!want) {
+        std::printf("img %5u %5u | unexpected admission FAIL\n", c.rows, c.count);
+        return false;
+    }
+    const double ti = timed([&] { (void)strix::ds41::enqueue_q_b_rope_image(v, image.p, dr.p, nullptr); }, reps);
+    const unsigned chunks = c.rows * c.count / 16U;
+    hipLaunchKernelGGL(prologue_image, dim3((chunks + 255U) / 256U), dim3(256), 0, nullptr, fast.p, dr.p, c.rows, c.count, ref.p);
+    ck(hipDeviceSynchronize(), "image sync");
+    const auto hi = image.down(), hp = ref.down();
+    std::size_t diff = 0;
+    for (std::size_t i = 0; i < hi.size(); ++i) diff += hi[i] != hp[i];
+    const bool ok = want && diff == 0U;
+    std::printf("img %5u %5u | image %8.4f ms | differing %zu of %zu %s\n", c.rows, c.count, ti, diff, hi.size(), ok ? "ok" : "FAIL");
+    return ok;
 }
 
 bool run(const Case& c, unsigned reps) {
@@ -128,7 +182,8 @@ bool run(const Case& c, unsigned reps) {
     const bool ok = geometry_equal && bad == 0U && (lever ? rel > 0.0 && rel < 3e-3 : rel == 0.0);
     std::printf("fd %5u %5u %5u parts %u acc %d | exact %8.4f | fast %8.4f | w8 %8.4f w16 %8.4f | rule %2u | rel_l2 %.3e %s\n", c.rows,
                 c.in, c.count, c.parts, int(c.acc), te, tf, tw[0], tw[1], q8a8::waves_for(c.rows, c.in), rel, ok ? "ok" : "FAIL");
-    return ok;
+    const bool image_ok = run_image(v, fast, c, reps);
+    return ok && image_ok;
 }
 
 namespace q8a8 = strix::core::f16_dense_tall::q8a8;
@@ -299,6 +354,7 @@ int main(int argc, char** argv) {
         {1024, 1024, 4096, 1, false}, {2048, 1024, 8192, 1, false}, {4096, 1024, 8192, 1, false}, {1024, 1536, 4096, 1, false},
         {1024, 4096, 1024, 1, false}, {1024, 8192, 1024, 2, false}, {2048, 8192, 1024, 2, false}, {1024, 4096, 4096, 1, false},
         {300, 1024, 1000, 1, false},  {513, 256, 40, 1, false},    {256, 1024, 512, 1, true},
+        {129, 1024, 512, 1, false},   {300, 1024, 512, 1, false},  {513, 256, 512, 1, false},
     };
     for (const auto& c : cases) ok = run(c, reps) && ok;
     strix::ds41::set_fast_dense(-1);
