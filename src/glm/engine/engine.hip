@@ -5,6 +5,7 @@
 #include "xport/channel.hpp"
 #include "xport/communicator_backend.hpp"
 #include "glm/xfer/glm_traits.hpp"
+#include "glm/rtxpf/import/glm_state_layout.hpp"
 // GLM-5.3-Flash engine (see include/strix/glm/engine.hpp, design notes).
 //
 // Skeleton v1: correctness first. Per layer: mHC pre (Tier A) -> RMSNorm -> attention seam -> TP reduction -> mHC
@@ -2952,7 +2953,12 @@ struct Engine::Impl {
     }
 
     // Device regions of one slot's snapshot, in serialization order (frontier caps the DSA prefix).
-    template <typename F> void for_each_state_region(std::uint32_t slot, std::uint64_t frontier, F&& f) const {
+    template <typename F>
+    void for_each_state_region(std::uint32_t slot, std::uint64_t frontier, F&& f,
+                               strix::state::RawRows index_rows = strix::state::RawRows::full) const {
+        if (index_rows != strix::state::RawRows::full && kv_shard)
+            throw std::invalid_argument("state layout: the DSA index tail form needs the unsharded DSA (a kv-sharded slot "
+                                        "serializes its owned prefix, kvshard::owned_prefix)");
         for (const LayerW& w : layers) {
             if (w.kda) {
                 const std::size_t s = static_cast<std::size_t>(kda_heads) * kKdaDim * kKdaDim, c = 3ULL * kda_heads * kKdaDim * 3;
@@ -2963,16 +2969,19 @@ struct Engine::Impl {
                 const auto global_n = std::min<std::uint64_t>(w.dst.cap, frontier);
                 const std::size_t n = static_cast<std::size_t>(w.dst.shard ? kvshard::owned_prefix(global_n, opt.rank) : global_n);
                 f(w.dst.latent + slot * cap * kKvLora, n * kKvLora * 2);
-                f(w.dst.ikey + slot * cap * kIdxDim, n * kIdxDim * 2);
-                f(w.dst.igate + slot * cap * kIdxDim, n * kIdxDim * 2);
+                // index key / gate: the window of the form (full: [0, n); open_tail: the open pool block only)
+                const auto index = strix::glm::state_layout::index_rows(index_rows, n);
+                f(w.dst.ikey + (slot * cap + index.first) * kIdxDim, index.rows * kIdxDim * 2);
+                f(w.dst.igate + (slot * cap + index.first) * kIdxDim, index.rows * kIdxDim * 2);
                 f(w.dst.pooled + slot * (cap / kKpool) * kIdxDim, (n / kKpool) * kIdxDim * 4);
             }
         }
     }
 
-    std::size_t state_payload_bytes(std::uint32_t slot, std::uint64_t frontier) const {
+    std::size_t state_payload_bytes(std::uint32_t slot, std::uint64_t frontier,
+                                    strix::state::RawRows index_rows = strix::state::RawRows::full) const {
         std::size_t total = 0;
-        for_each_state_region(slot, frontier, [&](const void*, std::size_t bytes) { total += bytes; });
+        for_each_state_region(slot, frontier, [&](const void*, std::size_t bytes) { total += bytes; }, index_rows);
         return total;
     }
 
@@ -2994,22 +3003,23 @@ struct Engine::Impl {
         return out;
     }
 
-    void restore_state(std::uint32_t slot, std::span<const std::uint8_t> in, std::uint64_t frontier) {
+    void restore_state(std::uint32_t slot, std::span<const std::uint8_t> in, std::uint64_t frontier,
+                       strix::state::RawRows index_rows = strix::state::RawRows::full) {
         if (slot >= opt.slots) throw std::out_of_range("restore_state: slot");
         const std::size_t key_bytes = kv_shard ? sizeof(kvshard::SnapshotKey) : 0;
-        const std::size_t payload = state_payload_bytes(slot, frontier);
+        const std::size_t payload = state_payload_bytes(slot, frontier, index_rows);
         if (kv_shard)
             kvshard::validate_snapshot(in.data(), in.size(), true,
                                        kvshard::snapshot_key(opt.capacity, opt.rank, std::min(opt.capacity, frontier), payload));
         else kvshard::validate_snapshot(in.data(), in.size(), false);
         if (in.size() < key_bytes + payload) throw std::invalid_argument("restore_state: state shorter than this engine's layout");
         if (in.size() > key_bytes + payload) throw std::invalid_argument("restore_state: state longer than this engine's layout");
-        reset(slot);  // memsets on the stream; the copies below are queued after them
+        reset(slot);  // memsets on the stream; the copies below are queued after them (index tail: the holes keep them)
         std::size_t o = key_bytes;
         for_each_state_region(slot, frontier, [&](const void* p, std::size_t bytes) {
             if (bytes) hip_ok(hipMemcpyAsync(const_cast<void*>(p), in.data() + o, bytes, hipMemcpyHostToDevice, stream), "restore");
             o += bytes;
-        });
+        }, index_rows);
         hip_ok(hipStreamSynchronize(stream), "restore sync");
     }
 };
@@ -3189,6 +3199,10 @@ std::vector<std::uint8_t> Engine::state_bytes_upto(std::uint32_t slot, std::uint
 }
 void Engine::restore_state(std::uint32_t slot, std::span<const std::uint8_t> bytes, std::uint64_t frontier) {
     impl_->restore_state(slot, bytes, frontier);
+}
+void Engine::restore_state(std::uint32_t slot, std::span<const std::uint8_t> bytes, std::uint64_t frontier,
+                           strix::state::RawRows index_rows) {
+    impl_->restore_state(slot, bytes, frontier, index_rows);
 }
 Engine::MtpOut Engine::mtp(std::uint32_t slot, const float* h, std::span<const std::uint32_t> tokens, std::uint64_t mtp_pos0,
                            Exchange::MergeCtl& ctl) {
