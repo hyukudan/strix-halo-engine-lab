@@ -61,8 +61,6 @@ IFS=, read -ra S <<<"$sizes"; IFS=, read -ra M <<<"$modes"
 for ((r = 0; r < rounds; r++)); do
     for s in "${S[@]}"; do
         n=$(tokens_of "$s"); f=$ids/p$n.ids; pf=$pids/p$n.ids
-        # Single-process runs print no prefill-wall-ms line: take the prefill window of the engine's own power receipt
-        # (the stdout record whose token count is exactly the prompt).
         [[ -s $f ]] || { echo "== s$s SKIP: no $f"; continue; }
         for m in "${M[@]}"; do
             for a in "${arms[@]}"; do

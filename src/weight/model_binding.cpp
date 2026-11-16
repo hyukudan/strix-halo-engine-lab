@@ -41,6 +41,9 @@ Status bind_model(const TensorIndex& index,const FamilySchema& schema,WeightMap&
     std::vector<TensorBinding> bindings;std::vector<Parameters> parameters;
     for(const auto& raw:index.tensors) {
         if(schema.text_only && index.container!=Container::gguf && !raw.name.starts_with(schema.text_prefix) && raw.name!=schema.text_head)continue;
+        // A tensor above the WeightView rank cannot be a view; it stays in the index (byte range) and
+        // only an engine that reads it uses it, so it never fails a family's text-weight admission.
+        if(raw.opaque())continue;
         const bool trellis=raw.name.ends_with(".trellis");
         const bool standalone=std::any_of(schema.roles.begin(),schema.roles.end(),[&](const auto& p){return p.standalone && p.matches(raw.name);});
         const bool weight=raw.name.ends_with(".weight") || raw.name.ends_with("_weight") || standalone;

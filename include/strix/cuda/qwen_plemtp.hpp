@@ -127,7 +127,8 @@ struct MtpRounding {
 // bit 3 a non-finite or BF16-overflowing cache value (validate_mtp_cache_casts; the row is then not stored).
 void launch_mtp_cache_rows(const MtpWeights& w, const MtpRounding& rounding, const std::uint16_t* hidden,
     const std::uint32_t* next_tokens, std::uint32_t rows, std::uint64_t position0, std::uint16_t* kv, std::uint16_t* raw_index,
-    void* workspace, std::uint32_t* status, const amdmath::Tables& tables, cudaStream_t stream);
+    void* workspace, std::uint32_t* status, const amdmath::Tables& tables, cudaStream_t stream,
+    const std::uint64_t* position_dev = nullptr);  // non-null: position0 read from device memory (graph replays)
 
 // Intermediate views of the workspace (tests): offsets in bytes for `rows` rows.
 struct MtpWorkspaceViews {

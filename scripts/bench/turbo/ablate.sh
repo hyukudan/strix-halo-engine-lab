@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 # Leave-one-out ablation of a TURBO lever manifest, packed into GPU tickets.
 #
-#   bash ablate.sh arms FAMILY [--pending] [--only id,id]  print the arms, one 'NAME|ARGS|ENV' per line
-#   bash ablate.sh run FAMILY --out DIR --kit KIT [--queue CMD] [--per-ticket N] [--pending] [--only ids]
+#   ablate.sh arms FAMILY [--pending] [--only id,id]       print the arms, one 'NAME|ARGS|ENV' per line
+#   ablate.sh run  FAMILY --out DIR --kit KIT [--queue CMD] [--per-ticket N] [--pending] [--only ids]
 #                  [--rounds R] -- KITARGS...               one ticket per group of arms (default arm always first)
 #
-# FAMILY = a scripts/bench/turbo/<family>.levers manifest (id|group|env|args|tag|state|note|off_env). ALL takes the first lever
+# FAMILY = a scripts/bench/turbo/<family>.levers manifest (id|group|env|args|tag|state|note|off-env). ALL takes the first lever
 # of every group whose state is "main" (plus "pending" with --pending); an alternative of a group is its own arm
 # 'alt-<id>' (ALL with that lever replacing the group's first). Arms: default, all, no-<id> for each lever of ALL, alt-*.
 # KIT is a path under scripts/bench/ (e.g. qwen/length-matrix); KITARGS go to it after the generated --arm words.
@@ -29,6 +29,7 @@ while IFS='|' read -r i g e a t s n o; do
     [[ -z $i || $i == \#* ]] && continue
     [[ $s == main || $pending == 1 ]] || continue
     [[ -n $only && ",$only," != *",$i,"* ]] && continue
+    [[ -n $o ]] || { echo "ablate: missing OFF assignments for $i" >&2; exit 64; }
     ids+=("$i") grp+=("$g") env+=("$e") arg+=("$a") state+=("$s") off+=("$o")
 done <"$man"
 seen=' '; first=()
@@ -52,17 +53,24 @@ emit() {
 case $mode in
     arms) emit ;;
     run)
-        [[ -n $out && -n $kit ]] || { echo 'ablate run needs --out and --kit' >&2; exit 64; }
-        [[ $per =~ ^[0-9]+$ && ${#per} -le 9 ]] && ((10#$per >= 2)) || {
-            echo 'ablate: --per-ticket must be an integer at least 2 (at most 9 digits)' >&2; exit 64;
+        # Bound the decimal input before shell arithmetic (including overflow / octal traps).
+        [[ $per =~ ^[1-9][0-9]{0,8}$ ]] && ((per >= 2)) || {
+            echo 'ablate: --per-ticket must be an integer >=2 (at most 9 digits)' >&2; exit 64;
         }
-        per=$((10#$per))
+        ((pending == 0)) || { echo 'ablate: pending controls are inspection-only; qualify their adapters before running' >&2; exit 64; }
+        ((${#first[@]})) || { echo "ablate: $fam has no runnable bundle levers" >&2; exit 64; }
+        [[ -n $out && -n $kit ]] || { echo 'ablate run needs --out and --kit' >&2; exit 64; }
         mapfile -t A < <(emit); d=${A[0]}; rest=("${A[@]:1}"); g=0
         for ((i = 0; i < ${#rest[@]}; i += per - 1)); do
             words=(--arm "$d"); for a in "${rest[@]:i:per-1}"; do words+=(--arm "$a"); done
             label=turbo3-bundle-$fam-g$g; dir=$out/g$g
-            if [[ -n $queue ]]; then $queue "$label" bash "$here/../common/ticket.sh" "$dir" "$kit" "${words[@]}" --rounds "$rounds" "$@"
-            else gpu-turn.sh "$label" bash "$here/../common/ticket.sh" "$dir" "$kit" "${words[@]}" --rounds "$rounds" "$@"; fi
+            wrapper=${queue:-gpu-turn.sh}
+            $wrapper "$label" bash "$here/../common/ticket.sh" "$dir" "$kit" "${words[@]}" --rounds "$rounds" "$@"
+            rc=$?
+            if ((rc != 0)); then
+                echo "ablate: failed group $g ($label), output $dir, queue status $rc; retry this group before continuing" >&2
+                exit "$rc"
+            fi
             g=$((g + 1))
         done ;;
     *) sed -n '2,14p' "$0" ;;
