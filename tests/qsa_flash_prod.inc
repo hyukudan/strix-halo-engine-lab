@@ -12,6 +12,8 @@
 #include "strix/qpf2k_defaults.hpp"
 #include "strix/hip_qwen_dpp_reduce.hpp"  // qwen_dpp::xor32 used by hip_qsa_prefill_flash.inc
 #include <hip/hip_runtime.h>
+#include "../src/attn_core/index_score_wmma.hpp"
+#include "../src/attn_core/index_score_band.hpp"
 #include <hip/hip_fp16.h>
 #include "../src/hip_rounded_stage_image.hpp"
 #include "../src/attn_core/selected_flash_prefill.hpp"
@@ -26,6 +28,7 @@
 #include <random>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <vector>
 #include <type_traits>
 

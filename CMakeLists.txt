@@ -3610,6 +3610,14 @@ int main() { return 0; }"
         add_test(NAME strix-hip-qsa-index-score-wmma-tests COMMAND strix-hip-qsa-index-score-wmma-tests)
         set_tests_properties(strix-hip-qsa-index-score-wmma-tests PROPERTIES ENVIRONMENT "STRIX_QPF2K_SCORE_ROWS=auto")
 
+        add_executable(strix-hip-qsa-index-band-tests tests/qsa_index_band.hip)
+        target_include_directories(strix-hip-qsa-index-band-tests PRIVATE include src)
+        set_target_properties(strix-hip-qsa-index-band-tests PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHS}")
+        target_compile_options(strix-hip-qsa-index-band-tests PRIVATE -mno-wavefrontsize64 -fno-fast-math -ffp-contract=off -fhip-fp32-correctly-rounded-divide-sqrt -fdenormal-fp-math=ieee)
+        strix_target_warnings(strix-hip-qsa-index-band-tests)
+        add_test(NAME strix-hip-qsa-index-band-tests COMMAND strix-hip-qsa-index-band-tests)
+        set_tests_properties(strix-hip-qsa-index-band-tests PROPERTIES SKIP_RETURN_CODE 77 ENVIRONMENT "STRIX_QSA_INDEX_BAND=1")
+
         add_executable(strix-hip-qsa-output-projection-tests tests/hip_qsa_output_projection_tests.hip)
         target_compile_definitions(strix-hip-qsa-output-projection-tests PRIVATE STRIX_BUILD_QSA_OUTPUT_PROJECTION_DIAGNOSTIC=1)
         target_link_libraries(strix-hip-qsa-output-projection-tests PRIVATE strix_hip_runtime)
