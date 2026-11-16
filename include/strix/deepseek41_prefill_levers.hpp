@@ -172,6 +172,8 @@ inline constexpr PrefillLever kPrefillLevers[] = {
     {"STRIX_DS41_PREFILL_HC_COLLAPSE", PrefillLeverClass::runtime},
     {"STRIX_DS41_PREFILL_HC_FUSE", PrefillLeverClass::runtime},
     {"STRIX_DS41_PREFILL_JOINT", PrefillLeverClass::construct},
+    {"STRIX_DS41_PREFILL_JOINT_LAYER", PrefillLeverClass::reload},  // construction or capacity policy requires a fresh resident object
+    {"STRIX_DS41_PREFILL_JOINT_LAYER_ROWS", PrefillLeverClass::reload},  // construction or capacity policy requires a fresh resident object
     {"STRIX_DS41_PREFILL_JOINT_MAX_ROWS", PrefillLeverClass::construct},
     {"STRIX_DS41_PREFILL_LEASE", PrefillLeverClass::runtime},
     {"STRIX_DS41_PREFILL_MEM_GUARD_GIB", PrefillLeverClass::reload},  // checked once before loading
@@ -187,6 +189,7 @@ inline constexpr PrefillLever kPrefillLevers[] = {
     {"STRIX_DS41_PREFILL_MOE_V2_PIPE", PrefillLeverClass::reload},
     {"STRIX_DS41_PREFILL_MOE_V2_Q8", PrefillLeverClass::reload},
     {"STRIX_DS41_PREFILL_MOE_V2_SIGNS", PrefillLeverClass::reload},
+    {"STRIX_DS41_PREFILL_MOE_WINDOW_CAP", PrefillLeverClass::reload},  // construction or capacity policy requires a fresh resident object
     {"STRIX_DS41_PREFILL_OVERLAP", PrefillLeverClass::construct},
     {"STRIX_DS41_PREFILL_O_A8_FUSED", PrefillLeverClass::runtime},
     {"STRIX_DS41_PREFILL_O_B_ONE", PrefillLeverClass::runtime},
