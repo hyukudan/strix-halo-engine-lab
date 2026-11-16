@@ -68,7 +68,7 @@ add_executable(qwen_cohort_plan_test tests/cuda/qwen_cohort_plan_test.cpp)
 target_include_directories(qwen_cohort_plan_test PRIVATE include)
 add_test(NAME qwen_cohort_plan COMMAND qwen_cohort_plan_test)
 add_executable(qwen_cohort_e2e tests/cuda/qwen_cohort_e2e.cu)
-target_link_libraries(qwen_cohort_e2e PRIVATE strix_qwen_cuda strix_qwen_handoff)
+target_link_libraries(qwen_cohort_e2e PRIVATE strix_qwen_cuda strix_qwen_handoff strix_mtp_depth)
 # Multi-segment QSA core == per-segment layer_core on random data (device, no model): qwen_qsa_multi_test <tables dir>
 add_executable(qwen_qsa_multi_test tests/cuda/qwen_qsa_multi_test.cu)
 target_link_libraries(qwen_qsa_multi_test PRIVATE strix_qwen_cuda)

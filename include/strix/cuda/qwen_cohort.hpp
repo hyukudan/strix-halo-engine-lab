@@ -128,7 +128,9 @@ struct StreamStep {
     std::vector<std::uint32_t> tokens;   // the verified tokens of this step (argmax of the kept rows), >= 1
     std::vector<float> logits;           // [tokens][vocab] when StepOptions::want_logits
     std::uint32_t rows = 0;              // window rows this session used (1 + drafts verified)
-    std::uint32_t drafted = 0;           // draft tokens computed (before packing)
+    std::uint32_t drafted = 0;           // predictor work, before context replacement and packing (depth controller)
+    std::uint32_t mtp_proposed = 0, mtp_accepted = 0;          // predictor rows verified / accepted
+    std::uint32_t context_proposed = 0, context_accepted = 0;  // context rows verified / accepted
     std::uint32_t window_sessions = 0;   // sessions sharing its window
     std::uint32_t window_rows = 0;       // rows of its window
     // The session's rows failed (non-finite logits, or a routed-MoE failure that it raised alone): no tokens; its window
@@ -160,6 +162,7 @@ inline std::vector<StreamStep> step(qp::Prefill& p, std::vector<Stream>& streams
     std::vector<StreamStep> out(n);
     std::vector<std::vector<std::uint32_t>> rows(n);
     std::vector<std::uint32_t> want(n);
+    std::vector<std::uint32_t> mtp_prefix(n, 0);
     for (const auto& s : streams)
         if (p.length(s.session) != s.position)
             throw std::logic_error("cohort step: stream position " + std::to_string(s.position) + " != session length " +
@@ -185,10 +188,15 @@ inline std::vector<StreamStep> step(qp::Prefill& p, std::vector<Stream>& streams
         auto* c = streams[i].context;
         if (!c) continue;
         c->copy_first = false;
-        if (room[i] == 0) continue;
         std::vector<double> acceptance;
         const auto h0 = Clock::now();
-        copy[i] = c->drafter.begin_copy_cycle(streams[i].pending, room[i], acceptance, o.min_p, c->mtp_expected);
+        if (room[i] == 0) {
+            // Observe pending exactly once even before any draft capacity becomes available.
+            // The shared zero-room cycle initializes history without building proposals.
+            (void)c->drafter.begin_cycle(streams[i].pending, {}, 0, 0, acceptance, o.min_p);
+        } else {
+            copy[i] = c->drafter.begin_copy_cycle(streams[i].pending, room[i], acceptance, o.min_p, c->mtp_expected);
+        }
         if (copy[i].size() > room[i]) copy[i].resize(room[i]);
         if (!copy[i].empty()) { c->copy_first = true; requests[i].depth = 0; }
         c->host_us += std::chrono::duration<double, std::micro>(Clock::now() - h0).count();
@@ -210,6 +218,8 @@ inline std::vector<StreamStep> step(qp::Prefill& p, std::vector<Stream>& streams
         auto& s = streams[i];
         auto& d = drafts[i];
         auto* c = s.context;
+        out[i].drafted = static_cast<std::uint32_t>(d.tokens.size());
+        mtp_prefix[i] = out[i].drafted;
         if (c && c->copy_first) {
             d.tokens = copy[i];
             ++c->copy_first_steps;
@@ -230,6 +240,7 @@ inline std::vector<StreamStep> step(qp::Prefill& p, std::vector<Stream>& streams
             c->host_us += std::chrono::duration<double, std::micro>(Clock::now() - h0).count();
             if (!ext.empty()) {
                 const std::size_t kept = std::min<std::size_t>(c->drafter.kept_drafts(), d.tokens.size());
+                mtp_prefix[i] = static_cast<std::uint32_t>(kept);
                 d.tokens.resize(kept);
                 for (std::size_t r = 0; r < ext.size() && d.tokens.size() < room[i]; ++r) d.tokens.push_back(ext[r]);
                 ++c->extended_steps;
@@ -237,9 +248,8 @@ inline std::vector<StreamStep> step(qp::Prefill& p, std::vector<Stream>& streams
             }
         }
         rows[i].insert(rows[i].end(), d.tokens.begin(), d.tokens.end());
-        out[i].drafted = c && c->copy_first ? 0U : static_cast<std::uint32_t>(d.tokens.size());
-        const std::uint64_t room = o.max_positions > s.position ? o.max_positions - s.position : 0U;
-        want[i] = static_cast<std::uint32_t>(std::min<std::uint64_t>(rows[i].size(), std::max<std::uint64_t>(room, 1U)));
+        const std::uint64_t position_room = o.max_positions > s.position ? o.max_positions - s.position : 0U;
+        want[i] = static_cast<std::uint32_t>(std::min<std::uint64_t>(rows[i].size(), std::max<std::uint64_t>(position_room, 1U)));
     }
     const auto t1 = Clock::now();
     std::uint32_t windows_run = 0, rows_run = 0;
@@ -276,6 +286,10 @@ inline std::vector<StreamStep> step(qp::Prefill& p, std::vector<Stream>& streams
             keep[j] = k;
             auto& st = out[e.index];
             st.rows = e.rows;
+            st.mtp_proposed = std::min(mtp_prefix[e.index], e.rows - 1U);
+            st.context_proposed = e.rows - 1U - st.mtp_proposed;
+            st.mtp_accepted = std::min(st.mtp_proposed, k - 1U);
+            st.context_accepted = k - 1U - st.mtp_accepted;
             st.window_rows = total;
             st.tokens.assign(r[j].argmax.begin(), r[j].argmax.begin() + k);
             if (o.want_logits) st.logits.assign(r[j].logits.begin(), r[j].logits.begin() + static_cast<std::ptrdiff_t>(r[j].logits.size() / e.rows * k));
@@ -305,7 +319,7 @@ inline std::vector<StreamStep> step(qp::Prefill& p, std::vector<Stream>& streams
         c->drafter.finish_cycle(out[i].tokens, verified, accepted);
         c->host_us += std::chrono::duration<double, std::micro>(Clock::now() - h0).count();
         if (c->copy_first) c->context_accepted += accepted;
-        else if (room[i] > 0) c->mtp_expected = c->mtp_expected < 0.0 ? static_cast<double>(accepted) : 0.75 * c->mtp_expected + 0.25 * static_cast<double>(accepted);
+        else if (room[i] > 0) c->mtp_expected = c->mtp_expected < 0.0 ? static_cast<double>(out[i].mtp_accepted) : 0.75 * c->mtp_expected + 0.25 * static_cast<double>(out[i].mtp_accepted);
     }
     if (timing) {
         timing->draft_ms += std::chrono::duration<double, std::milli>(t1 - t0).count();

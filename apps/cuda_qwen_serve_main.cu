@@ -628,11 +628,14 @@ private:
                 finish(s, step.error, "length");
                 continue;
             }
-            if (lone) dh_->finish_fixed(opt.depth, step.tokens.size() - 1, std::chrono::duration<double, std::milli>(Clock::now() - ts).count(),
-                                        step.drafted == opt.depth && step.rows == opt.depth + 1U);
+            // Context windows do not measure predictor acceptance or its whole-step cost.
+            if (lone && step.drafted > 0 && step.context_proposed == 0) dh_->finish_fixed(opt.depth, step.mtp_accepted, std::chrono::duration<double, std::milli>(Clock::now() - ts).count(),
+                                        step.drafted == opt.depth && step.mtp_proposed == opt.depth && step.rows == opt.depth + 1U);
             ++s.st.cycles;
-            s.st.proposed += step.drafted;
-            s.st.accepted += step.tokens.size() - 1;
+            s.st.proposed += step.mtp_proposed;
+            s.st.accepted += step.mtp_accepted;
+            s.st.ngram_rows += step.context_proposed;
+            s.st.ngram_accepted += step.context_accepted;
             s.rows += step.rows;
             s.window_sessions += step.window_sessions;
             s.max_window_sessions = std::max<std::uint64_t>(s.max_window_sessions, step.window_sessions);
@@ -712,7 +715,9 @@ int main(int argc, char** argv) {
         const auto o = parse(argc, argv);
         std::cerr << "strix-cuda-qwen-serve: loading " << o.engine.model_gguf << std::endl;
         if (!o.engine.mtp_sidecar_gguf.empty() && o.mtp_depth > 0) std::cerr << "strix-cuda-qwen-serve: " << strix::mtp_depth_state_line(o.min_p) << ", mtp_depth=" << o.mtp_depth
-            << ", context_draft=" << qc::context_mode_name(qc::context_mode_default()) << std::endl;
+            << ", context_draft=" << qc::context_mode_name(qc::context_mode_default())
+            << ", context_draft_effective=" << qc::context_mode_name(o.http_slots > 1 ? qc::context_mode_default() : qc::ContextMode::off)
+            << ", context_draft_applicable=" << (o.http_slots > 1 ? "cohort" : "no (single-slot loop)") << std::endl;
         qp::Prefill engine(o.engine);
         std::cerr << "strix-cuda-qwen-serve: loaded " << engine.describe() << std::endl;
         const auto tokenizer = serve::BpeTokenizer::load_gguf(o.engine.model_gguf);
