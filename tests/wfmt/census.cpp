@@ -33,6 +33,33 @@ std::set<std::string> strings(const Json& j) {
     for (const auto& v : j.as_array()) require(out.insert(v.as_string()).second, "duplicate string");
     return out;
 }
+std::set<std::string> matched_formats(const std::string& text, const std::regex& pattern) {
+    std::set<std::string> out;
+    for (auto i = std::sregex_iterator(text.begin(), text.end(), pattern); i != std::sregex_iterator(); ++i) {
+        auto name = (*i)[1].str();
+        if (name == "engram_row") name = "Engram";
+        else std::transform(name.begin(), name.end(), name.begin(), [](unsigned char c) { return char(std::toupper(c)); });
+        out.insert(name);
+    }
+    require(!out.empty(), "empty enumerable format support");
+    return out;
+}
+void check_formats(const std::string& source, const std::string& text, const std::set<std::string>& formats) {
+    if (source == "src/ds41_formats.cpp") {
+        const auto decoded = matched_formats(text, std::regex(R"(\bvoid\s+decode_([a-z0-9_]+)\s*\()"));
+        require(formats == decoded, "DS41 per-decoder storage support changed");
+    } else if (source == "include/strix/cuda_qwen_quant.cuh") {
+        const auto geometry = text.find("QQ_HD Geometry geometry(");
+        const auto end = text.find("namespace detail", geometry);
+        const auto decoder = text.find("QQ_HD void decode_group(", end);
+        const auto decoder_end = text.find("QQ_HD void decode_row_group(", decoder);
+        require(geometry != std::string::npos && end != std::string::npos &&
+                decoder != std::string::npos && decoder_end != std::string::npos, "CUDA support boundaries missing");
+        const std::regex cases(R"(\bcase\s+t_([a-z0-9_]+)\s*:)");
+        require(formats == matched_formats(text.substr(geometry, end - geometry), cases), "CUDA geometry support changed");
+        require(formats == matched_formats(text.substr(decoder, decoder_end - decoder), cases), "CUDA decoder support changed");
+    }
+}
 }
 int wfmt_census_test() {
     const std::filesystem::path root(STRIX_WFMT_SOURCE_DIR);
@@ -51,7 +78,25 @@ int wfmt_census_test() {
         files.insert(source);
         require(!field(binding, "owner").as_string().empty(), "unowned binding " + id);
         assigned.insert(field(binding, "migration").as_string());
-        require(!field(binding, "formats").as_array().empty(), "missing storage identity " + id);
+        const auto formats = strings(field(binding, "formats"));
+        const auto* image_field = binding.find("images");
+        const auto images = image_field ? strings(*image_field) : std::set<std::string>{};
+        require(!formats.empty() || !images.empty(), "missing storage/image identity " + id);
+        for (const auto* image : {"CB4", "U5", "U6", "Q6P32", "prepared-image", "exl3.mul1.tiles16", "exl3.gemma.transport"})
+            require(!formats.count(image), "derived image listed as storage " + id);
+        check_formats(source, text, formats);
+        if (source == "src/ds41_formats.cpp" || source == "include/strix/cuda_qwen_quant.cuh") {
+            // Negative host cases: missing support and copied category-wide extras must fail.
+            for (bool missing : {true, false}) {
+                auto wrong = formats;
+                if (missing) wrong.erase(wrong.begin());
+                else wrong.insert("UNSUPPORTED");
+                bool rejected = false;
+                try { check_formats(source, text, wrong); }
+                catch (const std::runtime_error&) { rejected = true; }
+                require(rejected, "format support guard accepted a corrupt binding");
+            }
+        }
         require(!field(binding, "arithmetic").as_string().empty(), "missing arithmetic identity " + id);
         std::set<std::string> discovered;
         for (auto i = std::sregex_iterator(text.begin(), text.end(), operation); i != std::sregex_iterator(); ++i) {

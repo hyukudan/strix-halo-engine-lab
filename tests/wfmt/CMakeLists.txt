@@ -39,3 +39,7 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
         add_test(NAME nvfp4_${case} COMMAND nvfp4_${case})
     endforeach()
 endif()
+
+find_package(Python3 REQUIRED COMPONENTS Interpreter)
+add_test(NAME wfmt.tools COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_LIST_DIR}/test_tools.py)
+set_tests_properties(wfmt.tools PROPERTIES ENVIRONMENT "PYTHONDONTWRITEBYTECODE=1")

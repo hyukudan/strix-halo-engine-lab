@@ -423,25 +423,13 @@
       "source": "src/ds41_formats.cpp",
       "backend": "host",
       "formats": [
-        "F32",
-        "F16",
-        "BF16",
-        "Q2_0",
-        "Q4_0",
-        "Q5_0",
-        "Q5_1",
+        "IQ2_XXS",
+        "Q2_K",
+        "MXFP4",
         "Q8_0",
-        "Q3_K",
-        "Q4_K",
-        "Q5_K",
-        "Q6_K",
-        "IQ4_NL",
-        "IQ4_XS",
-        "IQ2_S",
-        "IQ3_XXS",
-        "IQ3_S"
+        "Engram"
       ],
-      "arithmetic": "legacy host decode",
+      "arithmetic": "per-format group decode/product; Engram E4M3 codes with E8M0 group scales",
       "migration": "P02",
       "owner": "shared-weight-layer-maintainer",
       "status": "incumbent",
@@ -1265,8 +1253,7 @@
       "backend": "hip",
       "formats": [
         "Q8_0",
-        "F16",
-        "Q6P32"
+        "F16"
       ],
       "arithmetic": "dense-q8a8-f16-v1; legacy row reductions",
       "migration": "P06",
@@ -1290,6 +1277,9 @@
         "stage",
         "supported",
         "tile"
+      ],
+      "images": [
+        "Q6P32"
       ]
     },
     {
@@ -1298,8 +1288,7 @@
       "backend": "hip",
       "formats": [
         "Q8_0",
-        "F16",
-        "Q6P32"
+        "F16"
       ],
       "arithmetic": "dense-q8a8-f16-v1; legacy row reductions",
       "migration": "P06",
@@ -1319,6 +1308,9 @@
         "tile",
         "tiles",
         "volatile"
+      ],
+      "images": [
+        "Q6P32"
       ]
     },
     {
@@ -1327,8 +1319,7 @@
       "backend": "hip",
       "formats": [
         "Q8_0",
-        "F16",
-        "Q6P32"
+        "F16"
       ],
       "arithmetic": "dense-q8a8-f16-v1; legacy row reductions",
       "migration": "P06",
@@ -1410,6 +1401,9 @@
         "volatile",
         "wide_kernel",
         "wide_stage"
+      ],
+      "images": [
+        "Q6P32"
       ]
     },
     {
@@ -1418,8 +1412,7 @@
       "backend": "hip",
       "formats": [
         "Q8_0",
-        "F16",
-        "Q6P32"
+        "F16"
       ],
       "arithmetic": "dense-q8a8-f16-v1; legacy row reductions",
       "migration": "P06",
@@ -1434,6 +1427,9 @@
         "load_group",
         "row_bytes",
         "weights"
+      ],
+      "images": [
+        "Q6P32"
       ]
     },
     {
@@ -1442,8 +1438,7 @@
       "backend": "hip",
       "formats": [
         "Q8_0",
-        "F16",
-        "Q6P32"
+        "F16"
       ],
       "arithmetic": "dense-q8a8-f16-v1; legacy row reductions",
       "migration": "P06",
@@ -1599,6 +1594,9 @@
         "tiles",
         "valid",
         "volatile"
+      ],
+      "images": [
+        "Q6P32"
       ]
     },
     {
@@ -1607,8 +1605,7 @@
       "backend": "hip",
       "formats": [
         "Q8_0",
-        "F16",
-        "Q6P32"
+        "F16"
       ],
       "arithmetic": "dense-q8a8-f16-v1; legacy row reductions",
       "migration": "P06",
@@ -1622,6 +1619,9 @@
         "quantize_a8_row32",
         "tensor",
         "weight_row"
+      ],
+      "images": [
+        "Q6P32"
       ]
     },
     {
@@ -1630,8 +1630,7 @@
       "backend": "hip",
       "formats": [
         "Q8_0",
-        "F16",
-        "Q6P32"
+        "F16"
       ],
       "arithmetic": "dense-q8a8-f16-v1; legacy row reductions",
       "migration": "P06",
@@ -1685,6 +1684,9 @@
         "store_stage",
         "tile",
         "x16_tiles_kernel"
+      ],
+      "images": [
+        "Q6P32"
       ]
     },
     {
@@ -1693,8 +1695,7 @@
       "backend": "hip",
       "formats": [
         "Q8_0",
-        "F16",
-        "Q6P32"
+        "F16"
       ],
       "arithmetic": "dense-q8a8-f16-v1; legacy row reductions",
       "migration": "P06",
@@ -1708,6 +1709,9 @@
         "kernels",
         "supported",
         "tile"
+      ],
+      "images": [
+        "Q6P32"
       ]
     },
     {
@@ -1743,8 +1747,6 @@
         "dense_type",
         "down_type",
         "gate_type",
-        "gsq_block_bytes",
-        "gsq_block_elements",
         "iq_type",
         "row_bytes",
         "types"
@@ -2226,10 +2228,7 @@
       "id": "hip-trellis:src/core/trellis_format.hpp",
       "source": "src/core/trellis_format.hpp",
       "backend": "hip",
-      "formats": [
-        "exl3.mul1.tiles16",
-        "exl3.gemma.transport"
-      ],
+      "formats": [],
       "arithmetic": "linear-v1 linear-v2 g4-exl3-v1 g4-exl3-v2 g4-exl3-v3 WMMA-pf-v1",
       "migration": "P08",
       "owner": "shared-weight-layer-maintainer",
@@ -2240,16 +2239,17 @@
         "state_bytes",
         "tile",
         "tile_bytes"
+      ],
+      "images": [
+        "exl3.mul1.tiles16",
+        "exl3.gemma.transport"
       ]
     },
     {
       "id": "hip-trellis:src/core/linear_plan.hpp",
       "source": "src/core/linear_plan.hpp",
       "backend": "hip",
-      "formats": [
-        "exl3.mul1.tiles16",
-        "exl3.gemma.transport"
-      ],
+      "formats": [],
       "arithmetic": "linear-v1 linear-v2 g4-exl3-v1 g4-exl3-v2 g4-exl3-v3 WMMA-pf-v1",
       "migration": "P08",
       "owner": "shared-weight-layer-maintainer",
@@ -2268,16 +2268,17 @@
         "make_linear_execution",
         "measured_linear_tile",
         "numeric_partition_bucket_rows"
+      ],
+      "images": [
+        "exl3.mul1.tiles16",
+        "exl3.gemma.transport"
       ]
     },
     {
       "id": "hip-trellis:include/strix/ds41_trellis.hpp",
       "source": "include/strix/ds41_trellis.hpp",
       "backend": "hip",
-      "formats": [
-        "exl3.mul1.tiles16",
-        "exl3.gemma.transport"
-      ],
+      "formats": [],
       "arithmetic": "linear-v1 linear-v2 g4-exl3-v1 g4-exl3-v2 g4-exl3-v3 WMMA-pf-v1",
       "migration": "P08",
       "owner": "shared-weight-layer-maintainer",
@@ -2319,16 +2320,17 @@
         "trellis_shared_grouped_enabled",
         "trellis_site_bytes",
         "trellis_weights_namespace"
+      ],
+      "images": [
+        "exl3.mul1.tiles16",
+        "exl3.gemma.transport"
       ]
     },
     {
       "id": "hip-trellis:src/moe_core/exl3_trellis.hpp",
       "source": "src/moe_core/exl3_trellis.hpp",
       "backend": "hip",
-      "formats": [
-        "exl3.mul1.tiles16",
-        "exl3.gemma.transport"
-      ],
+      "formats": [],
       "arithmetic": "linear-v1 linear-v2 g4-exl3-v1 g4-exl3-v2 g4-exl3-v3 WMMA-pf-v1",
       "migration": "P08",
       "owner": "shared-weight-layer-maintainer",
@@ -2351,16 +2353,17 @@
         "transform_block_at",
         "transform_block_values",
         "volatile"
+      ],
+      "images": [
+        "exl3.mul1.tiles16",
+        "exl3.gemma.transport"
       ]
     },
     {
       "id": "hip-trellis:src/minimax/moe/mmx_prefill.hip",
       "source": "src/minimax/moe/mmx_prefill.hip",
       "backend": "hip",
-      "formats": [
-        "exl3.mul1.tiles16",
-        "exl3.gemma.transport"
-      ],
+      "formats": [],
       "arithmetic": "linear-v1 linear-v2 g4-exl3-v1 g4-exl3-v2 g4-exl3-v3 WMMA-pf-v1",
       "migration": "P08",
       "owner": "shared-weight-layer-maintainer",
@@ -2449,16 +2452,17 @@
         "tile",
         "tiled_at",
         "wmma_grouped_kernel"
+      ],
+      "images": [
+        "exl3.mul1.tiles16",
+        "exl3.gemma.transport"
       ]
     },
     {
       "id": "hip-trellis:src/glm/prefill/glm_moe_traits.hpp",
       "source": "src/glm/prefill/glm_moe_traits.hpp",
       "backend": "hip",
-      "formats": [
-        "exl3.mul1.tiles16",
-        "exl3.gemma.transport"
-      ],
+      "formats": [],
       "arithmetic": "linear-v1 linear-v2 g4-exl3-v1 g4-exl3-v2 g4-exl3-v3 WMMA-pf-v1",
       "migration": "P08",
       "owner": "shared-weight-layer-maintainer",
@@ -2467,16 +2471,17 @@
       "operations": [
         "finish_block",
         "tile"
+      ],
+      "images": [
+        "exl3.mul1.tiles16",
+        "exl3.gemma.transport"
       ]
     },
     {
       "id": "hip-trellis:src/gemma4/exl3/format.hpp",
       "source": "src/gemma4/exl3/format.hpp",
       "backend": "hip",
-      "formats": [
-        "exl3.mul1.tiles16",
-        "exl3.gemma.transport"
-      ],
+      "formats": [],
       "arithmetic": "linear-v1 linear-v2 g4-exl3-v1 g4-exl3-v2 g4-exl3-v3 WMMA-pf-v1",
       "migration": "P08",
       "owner": "shared-weight-layer-maintainer",
@@ -2496,16 +2501,17 @@
         "g4-exl3-v2",
         "g4-exl3-v3",
         "WMMA-pf-v1"
+      ],
+      "images": [
+        "exl3.mul1.tiles16",
+        "exl3.gemma.transport"
       ]
     },
     {
       "id": "hip-trellis:src/gemma4/exl3/device.hip",
       "source": "src/gemma4/exl3/device.hip",
       "backend": "hip",
-      "formats": [
-        "exl3.mul1.tiles16",
-        "exl3.gemma.transport"
-      ],
+      "formats": [],
       "arithmetic": "linear-v1 linear-v2 g4-exl3-v1 g4-exl3-v2 g4-exl3-v3 WMMA-pf-v1",
       "migration": "P08",
       "owner": "shared-weight-layer-maintainer",
@@ -2584,16 +2590,17 @@
         "transformed_bytes",
         "volatile",
         "wmma_kernel"
+      ],
+      "images": [
+        "exl3.mul1.tiles16",
+        "exl3.gemma.transport"
       ]
     },
     {
       "id": "hip-trellis:src/gemma4/prefill/reference.cpp",
       "source": "src/gemma4/prefill/reference.cpp",
       "backend": "hip",
-      "formats": [
-        "exl3.mul1.tiles16",
-        "exl3.gemma.transport"
-      ],
+      "formats": [],
       "arithmetic": "linear-v1 linear-v2 g4-exl3-v1 g4-exl3-v2 g4-exl3-v3 WMMA-pf-v1",
       "migration": "P08",
       "owner": "shared-weight-layer-maintainer",
@@ -2608,6 +2615,10 @@
         "validate_tables",
         "validate_weights",
         "weight_at"
+      ],
+      "images": [
+        "exl3.mul1.tiles16",
+        "exl3.gemma.transport"
       ]
     },
     {
@@ -2619,9 +2630,6 @@
         "Q2_K",
         "MXFP4",
         "Q8_0",
-        "CB4",
-        "U5",
-        "U6",
         "E4M3-E8M0",
         "F32",
         "F16",
@@ -2640,6 +2648,11 @@
         "k_scale_min",
         "scales_h",
         "supported"
+      ],
+      "images": [
+        "CB4",
+        "U5",
+        "U6"
       ]
     },
     {
@@ -2651,9 +2664,6 @@
         "Q2_K",
         "MXFP4",
         "Q8_0",
-        "CB4",
-        "U5",
-        "U6",
         "E4M3-E8M0",
         "F32",
         "F16",
@@ -2684,6 +2694,11 @@
         "q2_k_group",
         "q8_0_group",
         "quantize_a8"
+      ],
+      "images": [
+        "CB4",
+        "U5",
+        "U6"
       ]
     },
     {
@@ -2695,9 +2710,6 @@
         "Q2_K",
         "MXFP4",
         "Q8_0",
-        "CB4",
-        "U5",
-        "U6",
         "E4M3-E8M0",
         "F32",
         "F16",
@@ -2722,6 +2734,11 @@
         "scale_value",
         "stages",
         "weights"
+      ],
+      "images": [
+        "CB4",
+        "U5",
+        "U6"
       ]
     },
     {
@@ -2733,9 +2750,6 @@
         "Q2_K",
         "MXFP4",
         "Q8_0",
-        "CB4",
-        "U5",
-        "U6",
         "E4M3-E8M0",
         "F32",
         "F16",
@@ -2880,6 +2894,11 @@
         "tp_down_rows",
         "volatile",
         "weight_rsrc"
+      ],
+      "images": [
+        "CB4",
+        "U5",
+        "U6"
       ]
     },
     {
@@ -2891,9 +2910,6 @@
         "Q2_K",
         "MXFP4",
         "Q8_0",
-        "CB4",
-        "U5",
-        "U6",
         "E4M3-E8M0",
         "F32",
         "F16",
@@ -3055,6 +3071,11 @@
         "weights_overlay",
         "workspace_bytes",
         "workspace_bytes_for"
+      ],
+      "images": [
+        "CB4",
+        "U5",
+        "U6"
       ]
     },
     {
@@ -3066,9 +3087,6 @@
         "Q2_K",
         "MXFP4",
         "Q8_0",
-        "CB4",
-        "U5",
-        "U6",
         "E4M3-E8M0",
         "F32",
         "F16",
@@ -3095,6 +3113,11 @@
         "tensors",
         "weight_bytes",
         "weights"
+      ],
+      "images": [
+        "CB4",
+        "U5",
+        "U6"
       ]
     },
     {
@@ -3106,9 +3129,6 @@
         "Q2_K",
         "MXFP4",
         "Q8_0",
-        "CB4",
-        "U5",
-        "U6",
         "E4M3-E8M0",
         "F32",
         "F16",
@@ -3136,6 +3156,11 @@
         "read_fp8_tensor",
         "resolve_safetensors_checkpoint",
         "weight"
+      ],
+      "images": [
+        "CB4",
+        "U5",
+        "U6"
       ]
     },
     {
@@ -3147,9 +3172,6 @@
         "Q2_K",
         "MXFP4",
         "Q8_0",
-        "CB4",
-        "U5",
-        "U6",
         "E4M3-E8M0",
         "F32",
         "F16",
@@ -3200,6 +3222,11 @@
         "tile",
         "tiled_linear_kernel",
         "valid_rows"
+      ],
+      "images": [
+        "CB4",
+        "U5",
+        "U6"
       ]
     },
     {
@@ -3211,9 +3238,6 @@
         "Q2_K",
         "MXFP4",
         "Q8_0",
-        "CB4",
-        "U5",
-        "U6",
         "E4M3-E8M0",
         "F32",
         "F16",
@@ -3254,6 +3278,11 @@
         "shared_rows_kernel",
         "staged_rows_preferred",
         "weights"
+      ],
+      "images": [
+        "CB4",
+        "U5",
+        "U6"
       ]
     },
     {
@@ -3265,9 +3294,6 @@
         "Q2_K",
         "MXFP4",
         "Q8_0",
-        "CB4",
-        "U5",
-        "U6",
         "E4M3-E8M0",
         "F32",
         "F16",
@@ -3308,6 +3334,11 @@
         "volatile",
         "weights",
         "weights_"
+      ],
+      "images": [
+        "CB4",
+        "U5",
+        "U6"
       ]
     },
     {
@@ -3319,9 +3350,6 @@
         "Q2_K",
         "MXFP4",
         "Q8_0",
-        "CB4",
-        "U5",
-        "U6",
         "E4M3-E8M0",
         "F32",
         "F16",
@@ -3366,6 +3394,11 @@
         "unload",
         "valid",
         "validate"
+      ],
+      "images": [
+        "CB4",
+        "U5",
+        "U6"
       ]
     },
     {
@@ -3377,9 +3410,6 @@
         "Q2_K",
         "MXFP4",
         "Q8_0",
-        "CB4",
-        "U5",
-        "U6",
         "E4M3-E8M0",
         "F32",
         "F16",
@@ -3411,6 +3441,11 @@
         "tensors",
         "validate",
         "weights"
+      ],
+      "images": [
+        "CB4",
+        "U5",
+        "U6"
       ]
     },
     {
@@ -3422,9 +3457,6 @@
         "Q2_K",
         "MXFP4",
         "Q8_0",
-        "CB4",
-        "U5",
-        "U6",
         "E4M3-E8M0",
         "F32",
         "F16",
@@ -3462,6 +3494,11 @@
         "patch_linear_row",
         "rotate_quantize_row",
         "unpack_audio"
+      ],
+      "images": [
+        "CB4",
+        "U5",
+        "U6"
       ]
     },
     {
@@ -3473,9 +3510,6 @@
         "Q2_K",
         "MXFP4",
         "Q8_0",
-        "CB4",
-        "U5",
-        "U6",
         "E4M3-E8M0",
         "F32",
         "F16",
@@ -3529,6 +3563,11 @@
         "upload",
         "upload_operand",
         "uploaded"
+      ],
+      "images": [
+        "CB4",
+        "U5",
+        "U6"
       ]
     },
     {
@@ -3540,9 +3579,6 @@
         "Q2_K",
         "MXFP4",
         "Q8_0",
-        "CB4",
-        "U5",
-        "U6",
         "E4M3-E8M0",
         "F32",
         "F16",
@@ -3562,6 +3598,11 @@
         "ext_vector_type",
         "hipLaunchKernelGGL",
         "invalid_argument"
+      ],
+      "images": [
+        "CB4",
+        "U5",
+        "U6"
       ]
     },
     {
@@ -3573,9 +3614,6 @@
         "Q2_K",
         "MXFP4",
         "Q8_0",
-        "CB4",
-        "U5",
-        "U6",
         "E4M3-E8M0",
         "F32",
         "F16",
@@ -3592,6 +3630,11 @@
         "bytes",
         "invalid_argument",
         "validate"
+      ],
+      "images": [
+        "CB4",
+        "U5",
+        "U6"
       ]
     },
     {
@@ -3599,11 +3642,24 @@
       "source": "include/strix/cuda_qwen_quant.cuh",
       "backend": "cuda",
       "formats": [
-        "Q8_0",
         "F32",
-        "IQ4_NL"
+        "F16",
+        "BF16",
+        "Q4_0",
+        "Q5_0",
+        "Q5_1",
+        "Q8_0",
+        "Q2_0",
+        "Q4_K",
+        "Q5_K",
+        "Q6_K",
+        "IQ4_NL",
+        "IQ4_XS",
+        "IQ2_S",
+        "IQ3_XXS",
+        "IQ3_S"
       ],
-      "arithmetic": "legacy Q8 transcode; IMMA",
+      "arithmetic": "per-format FP32 group decode",
       "migration": "P10",
       "owner": "shared-weight-layer-maintainer",
       "status": "incumbent",
@@ -4293,9 +4349,7 @@
       "id": "cuda:src/cuda/ds41_hot_residency.cpp",
       "source": "src/cuda/ds41_hot_residency.cpp",
       "backend": "cuda",
-      "formats": [
-        "prepared-image"
-      ],
+      "formats": [],
       "arithmetic": "DS41-residency",
       "migration": "P12",
       "owner": "shared-weight-layer-maintainer",
@@ -4317,15 +4371,16 @@
         "source_bytes",
         "take_source",
         "tensor_offset"
+      ],
+      "images": [
+        "prepared-image"
       ]
     },
     {
       "id": "cuda:src/cuda/core/arch/sm120/nvfp4.cuh",
       "source": "src/cuda/core/arch/sm120/nvfp4.cuh",
       "backend": "cuda",
-      "formats": [
-        "prepared-image"
-      ],
+      "formats": [],
       "arithmetic": "nvfp4-mma-f32-v1",
       "migration": "P13",
       "owner": "shared-weight-layer-maintainer",
@@ -4334,15 +4389,16 @@
       "operations": [
         "__syncthreads",
         "volatile"
+      ],
+      "images": [
+        "prepared-image"
       ]
     },
     {
       "id": "hip:src/gemma4/dflash/device.hip",
       "source": "src/gemma4/dflash/device.hip",
       "backend": "hip",
-      "formats": [
-        "prepared-image"
-      ],
+      "formats": [],
       "arithmetic": "legacy-prepared-F16",
       "migration": "P09",
       "owner": "shared-weight-layer-maintainer",
@@ -4369,15 +4425,16 @@
         "stage_append",
         "upload",
         "validate"
+      ],
+      "images": [
+        "prepared-image"
       ]
     },
     {
       "id": "hip:src/gemma4/eagle/device.hip",
       "source": "src/gemma4/eagle/device.hip",
       "backend": "hip",
-      "formats": [
-        "prepared-image"
-      ],
+      "formats": [],
       "arithmetic": "legacy-prepared-F16",
       "migration": "P09",
       "owner": "shared-weight-layer-maintainer",
@@ -4405,15 +4462,16 @@
         "tap_norm_kernel",
         "upload",
         "validate"
+      ],
+      "images": [
+        "prepared-image"
       ]
     },
     {
       "id": "hip:src/gemma4/eagle/mtp/device.hip",
       "source": "src/gemma4/eagle/mtp/device.hip",
       "backend": "hip",
-      "formats": [
-        "prepared-image"
-      ],
+      "formats": [],
       "arithmetic": "legacy-prepared-F16",
       "migration": "P09",
       "owner": "shared-weight-layer-maintainer",
@@ -4437,6 +4495,9 @@
         "topk_kernel",
         "upload",
         "validate"
+      ],
+      "images": [
+        "prepared-image"
       ]
     }
   ],
