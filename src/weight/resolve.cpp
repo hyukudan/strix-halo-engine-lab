@@ -1,4 +1,5 @@
 #include <strix/weight/resolve.hpp>
+#include <strix/weight/admission.hpp>
 #include <algorithm>
 #include <cmath>
 #include <limits>
@@ -63,7 +64,7 @@ static Status resolve_impl(const Registry& registry, const ResolveRequest& r, st
     const auto* format = find_format(registry, r.tensor->weight.storage);
     if (!format) return {Error::unknown_format, "unknown storage descriptor"};
     if (!format->semantic_decode_supported) return {Error::unsupported_arithmetic, "parse-only or typed-only descriptor has no compute route"};
-    { auto s = validate_map(registry, WeightMap{*r.tensor}); if (!s) return s; }
+    { auto s = validate_binding(registry, *r.tensor); if (!s) return s; }
     const Candidate* selected = nullptr;
     Digest256 receipt{};
     Status decline{Error::unqualified, "no qualified incumbent registration; dependency=backend source; fixture=legacy byte capture; removal=register and byte-qualify the existing route"};

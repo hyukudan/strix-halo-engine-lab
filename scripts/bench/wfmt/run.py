@@ -45,6 +45,18 @@ def main():
         cases = list(root.iter("testcase"))
         if not cases or any(case.find("skipped") is not None for case in cases):
             raise ValueError("empty or skipped mandatory cases")
+        provenance = []
+        for directory in (args.baseline, args.candidate):
+            metadata = json.loads((directory / "summary.json").read_text())
+            required = ("source", "compiler", "architecture", "flags", "device", "executable_sha256", "matrix_sha256")
+            if not metadata.get("pass") or any(not metadata.get(key) for key in required):
+                raise ValueError("capture provenance is incomplete")
+            if args.pr != "P01" and metadata.get("fixture_only", True):
+                raise ValueError("protocol-only fixtures cannot qualify a numerical PR")
+            provenance.append(metadata)
+        for key in ("compiler", "architecture", "flags", "device"):
+            if provenance[0][key] != provenance[1][key]:
+                raise ValueError("baseline/candidate provenance differs: " + key)
         command = [sys.executable, str(pathlib.Path(__file__).with_name("compare.py")),
                    "--baseline", str(args.baseline), "--candidate", str(args.candidate),
                    "--require-bytes", "--out", str(args.output / "compare")]

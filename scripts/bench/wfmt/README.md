@@ -20,8 +20,12 @@ production kernel. P01 changes no production operation; later migration PRs add
 test-only adapters before replacing numerical bodies.
 
 For actual adapters, run `capture.py --exe EXECUTABLE --matrix MATRIX --out DIR
---compiler VERSION --architecture ARCH --source SOURCE --flags FLAGS --device ID`.
-The executable receives `--wfmt-capture DIR --wfmt-matrix MATRIX`. It must emit
+--compiler VERSION --architecture ARCH --source SOURCE --flags FLAGS --device ID
+--adapter reference|native|backend`. Use `--source-ref COMMIT` with an archived source tree.
+Source commit and exact compiler flags are required. `--adapter protocol` is explicitly fixture-only.
+The reference adapter uses `--wfmt-reference-capture DIR`; backend fixtures use
+`--wfmt-backend-capture DIR`; native hooks use `--wfmt-capture DIR --wfmt-matrix MATRIX`.
+A protocol fixture is rejected for numerical adapters. Each adapter must emit
 nonempty `.wfmt` records or capture fails. Capture stores executable/matrix SHA256,
 source commit, flags, compiler, architecture and device. Frozen binaries and all
 raw payloads stay outside Git. `--runner` is an optional shell-style argv prefix;
