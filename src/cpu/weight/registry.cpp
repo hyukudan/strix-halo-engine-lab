@@ -11,11 +11,15 @@ Status eligible(const WeightView& weight,const Workload& work,const Hardware& ha
 Status dispatch(const Plan& plan,const WeightView& weight,const KernelArguments& envelope,void* output) {
  if(plan.selected.kernel!=q8_tree32_kernel || !(plan.selected.arithmetic==ArithmeticId{"cpu-q8a8-tree32",1}) ||
     plan.selected.strategy!=Strategy::native) return {Error::unsupported_arithmetic,"CPU registry only provides raw Q8_0 tree32 incumbent"};
- if(envelope.schema!=q8_tree32_kernel || envelope.abi_revision!=1 || envelope.bytes!=sizeof(DenseArguments) || !envelope.data)
+ if(envelope.schema!=q8_tree32_kernel || envelope.abi_revision!=2 || envelope.bytes!=sizeof(DenseArguments) || !envelope.data)
   return {Error::malformed,"CPU Q8 typed launch schema/ABI"};
  const auto& args=*static_cast<const DenseArguments*>(envelope.data);
+ const auto binding=args.binding.retain();
+ auto status=binding.validate(weight,args.view.weight,args.view.row_bytes); if(!status) return status;
+ if(binding.is_image()) return {Error::unsupported_backend,"CPU launch requires a host binding"};
  auto view=args.view; view.out=static_cast<float*>(output);
- auto status=validate_view(view); if(!status) return status;
+ view.weight=binding.data(); view.row_bytes=binding.row_bytes();
+ status=validate_view(view); if(!status) return status;
  status=validate_q8_shape(weight,view.count,view.in); if(!status) return status;
  const auto* kernels=::strix::cpu::registered_weight_kernels(::strix::cpu::Isa::scalar);
  if(!kernels || !kernels->gemv_q8_0_a8) return {Error::unavailable_isa,"CPU scalar Q8 registration missing"};

@@ -18,6 +18,7 @@ inline constexpr KernelId q8_tree32_kernel=0x43505501;
 struct DenseArguments {
  ::strix::cpu::Q8a8View view;
  ::strix::cpu::Stream stream;
+ Q8BindingRef binding;
 };
 std::span<const Candidate> candidates() noexcept;
 Status validate_view(const ::strix::cpu::Q8a8View&);
@@ -33,6 +34,6 @@ void set_partial_sink(PartialSink,void*) noexcept;
 namespace strix::weight {
 template<> struct ArgumentTraits<cpu::DenseArguments> {
  static constexpr KernelId schema=cpu::q8_tree32_kernel;
- static constexpr std::uint32_t abi_revision=1;
+ static constexpr std::uint32_t abi_revision=2;
 };
 }

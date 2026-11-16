@@ -32,9 +32,9 @@ bool cpu_case(std::string_view directory,std::uint32_t rows,std::uint32_t n,std:
  if(!check(bool(status),status.detail)) return false;
  HostQ8Binding binding;
  status=prepare_host_q8(weight,binding); if(!check(bool(status),status.detail)) return false;
- cpu::DenseArguments args{old,{}};
- args.view.weight=binding.data(); args.view.row_bytes=binding.row_bytes; args.view.out=f.actual.data();
- const cpu::Q8RawSource<cpu::CpuTree32> source{binding.data(),binding.row_bytes};
+ cpu::DenseArguments args{old,{},binding};
+ args.view.weight=binding.data(); args.view.row_bytes=binding.row_bytes(); args.view.out=f.actual.data();
+ const cpu::Q8RawSource<cpu::CpuTree32> source{binding.data(),binding.row_bytes()};
  for(std::uint32_t o=0;o<n;++o) for(std::uint32_t g=0;g<k/32;++g) {
   const auto* raw=f.weights->data()+std::size_t(o)*f.row_bytes+std::size_t(g)*34;
   const auto* block=source.block(o,g);
@@ -71,13 +71,15 @@ bool cpu_case(std::string_view directory,std::uint32_t rows,std::uint32_t n,std:
  }
  const auto name="cpu-"+std::to_string(rows)+"-"+std::to_string(n)+"-"+std::to_string(k)+"-"+std::to_string(accumulate);
  if(!record_dense(directory,name,"cpu-q8a8-tree32@1",weight,f,actual_partials)) return false;
+ if(!binding_rejections(weight,args,[&](const cpu::DenseArguments& bad) { return cpu::enqueue_dense(weight,bad); })) return false;
  std::weak_ptr<std::vector<std::uint8_t>> owner=f.weights; f.weights.reset();
  if(owner.expired()) return false;
- weight={}; binding={};
+ weight={}; binding={}; args.binding={};
  return check(owner.expired(),"CPU weight source retained an unexpected owner");
 }
 bool cpu_cases(std::string_view directory) {
  std::size_t cases=0;
+ if(!cpu_case(directory,1,2,32,0,1)) return false; // 68-byte binding, legacy row stride 41.
  for(auto rows:tails) for(auto k:{32u,64u,128u,256u,1024u,1056u}) for(unsigned accumulate:{0u,1u}) {
   const auto n=1u+2u*(rows%4);
   if(!cpu_case(directory,rows,n,k,accumulate,static_cast<std::uint32_t>(++cases))) return false;

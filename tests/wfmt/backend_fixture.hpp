@@ -56,6 +56,25 @@ template<class T> bool same_bytes(const std::vector<T>& a,const std::vector<T>& 
 inline bool check(bool condition,std::string_view message) {
  if(!condition) std::cerr << message << '\n'; return condition;
 }
+template<class Arguments,class Launch>
+bool binding_rejections(const WeightView& weight,const Arguments& args,Launch launch) {
+ auto bad=args; bad.binding={};
+ if(!check(launch(bad).code==Error::malformed,"missing Q8 owning binding accepted")) return false;
+ bad=args; bad.view.row_bytes+=7;
+ if(!check(launch(bad).code==Error::malformed,"compact Q8 image accepted stale padded stride")) return false;
+ auto bytes=std::make_shared<std::vector<Byte>>(static_cast<std::size_t>(weight.payload.range.bytes));
+ if(!read_slice(weight.payload,*bytes)) return false;
+ (*bytes)[2]^=Byte{1};
+ WeightView other{};
+ if(!q8_weight_from_legacy(*bytes,bytes,args.view.count,args.view.in,args.view.row_bytes,0,weight.tensor,other)) return false;
+ HostQ8Binding replacement;
+ if(!prepare_host_q8(other,replacement)) return false;
+ bad=args; bad.view.weight=replacement.data();
+ if(!check(launch(bad).code==Error::malformed,"unowned Q8 operand accepted")) return false;
+ bad.binding=replacement;
+ if(!check(launch(bad).code==Error::stale_source,"same-shaped Q8 binding from another source accepted")) return false;
+ return true;
+}
 inline bool resolved(const WeightView& weight,const Candidate& candidate,std::uint32_t rows,Plan& plan) {
  WeightMapEntry tensor{}; tensor.weight=weight; tensor.binding.tensor=weight.tensor;
  tensor.binding.role=Role::dense_up; tensor.binding.logical_shape=weight.shape; tensor.binding.expert_axis=UINT32_MAX;

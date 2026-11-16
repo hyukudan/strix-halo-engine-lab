@@ -3,6 +3,14 @@
 #include <functional>
 #include <mutex>
 namespace strix::weight {
+struct Retirement {
+    std::vector<void*> events;
+    // Streams whose last-use event could not be recorded. They must be drained
+    // (or fenced successfully) before reclamation, including failed conversion.
+    std::vector<void*> unresolved_streams;
+    // Release only after actual reclamation; quarantine retains this charge.
+    std::shared_ptr<void> reservation;
+};
 struct RuntimeCallbacks {
     std::function<Status(std::uint64_t, void*&)> allocate;
     std::function<void(void*)> free;
@@ -11,8 +19,10 @@ struct RuntimeCallbacks {
     std::function<bool(void*)> event_complete;
     std::function<void(void*)> destroy_event;
     std::function<Status(const WeightView&, const Plan&, void*, ExecutionContext&)> convert;
-    // Transfers ownership of an allocation and its events to a backend-local retirement queue.
-    std::function<void(void*, std::vector<void*>, ExecutionContext)> retire;
+    // Transfers allocation, fences and budget ownership. Must not throw.
+    // Callbacks can block under cache locks: non-reentrant; never call
+    // back into this cache. Streams must outlive retirement of unresolved uses.
+    std::function<void(void*, Retirement, ExecutionContext)> retire;
     std::function<Status(const Plan&, const WeightView&, const KernelArguments&, void*, void*, std::size_t, ExecutionContext&)> enqueue;
 };
 struct ExecutionContext {

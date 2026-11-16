@@ -1116,6 +1116,7 @@
         "invalid_argument",
         "resolve",
         "resolve_default",
+        "resolve_dspark_settings",
         "resolve_sessions"
       ]
     },
@@ -3804,10 +3805,13 @@
         "q8_0_bytes",
         "quantize_project",
         "read_file",
+        "recurrent_state_bytes",
+        "recurrent_state_type_name",
         "row_bytes",
         "rows",
         "run_block",
         "session_bytes",
+        "state_bytes",
         "supported",
         "tensor",
         "type",

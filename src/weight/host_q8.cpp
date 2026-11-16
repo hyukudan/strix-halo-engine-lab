@@ -76,11 +76,38 @@ Status prepare_host_q8(const WeightView& weight,HostQ8Binding& out) {
  if(weight.payload.range.bytes>SIZE_MAX) return {Error::memory_budget,"Q8 host image size overflow"};
  try {
   HostQ8Binding result;
-  result.source=weight; result.outputs=static_cast<std::uint32_t>(weight.shape.dims[0]); result.width=static_cast<std::uint32_t>(weight.shape.dims[1]);
-  result.row_bytes=static_cast<std::uint32_t>(Q8Storage::row_bytes(result.width));
-  result.bytes.resize(static_cast<std::size_t>(weight.payload.range.bytes));
-  status=read_slice(weight.payload,result.bytes); if(!status) return status;
+  result.source_=weight;
+  auto bytes=std::make_shared<std::vector<Byte>>(static_cast<std::size_t>(weight.payload.range.bytes));
+  status=read_slice(weight.payload,*bytes); if(!status) return status;
+  result.bytes_=std::move(bytes);
   out=std::move(result); return {Error::ok,{}};
  } catch(const std::bad_alloc&) { return {Error::memory_budget,"Q8 host image allocation"}; }
+}
+Status HostQ8Binding::validate(const WeightView& weight,const std::uint8_t* pointer,std::uint32_t stride,std::uint32_t prefix) const {
+ if(!data()) return {Error::malformed,"Q8 launch requires an owning prepared binding"};
+ auto status=validate_q8_shape(weight,source_.shape.dims[0],source_.shape.dims[1]); if(!status) return status;
+ if(weight.tensor!=source_.tensor || weight.payload.source!=source_.payload.source ||
+    weight.payload.range.offset!=source_.payload.range.offset || weight.payload.range.bytes!=source_.payload.range.bytes ||
+    weight.byte_strides!=source_.byte_strides || weight.has_byte_strides!=source_.has_byte_strides)
+  return {Error::stale_source,"Q8 binding belongs to a different source"};
+ if(pointer!=data() || stride!=row_bytes() || prefix)
+  return {Error::malformed,"Q8 raw pointer/stride/prefix differs from prepared binding"};
+ return {Error::ok,{}};
+}
+Status HostQ8Binding::acquire(ExecutionContext& context,ImageLease& lease) const {
+ if(!image_ || !cache_) return {Error::unsupported_backend,"native Q8 launch requires a prepared runtime image"};
+ return acquire_image(*cache_,key_,plan_,source_,context,lease);
+}
+Status prepare_q8_image(const WeightView& weight,const Plan& plan,std::shared_ptr<ImageCache> cache,
+                        ExecutionContext& context,HostQ8Binding& out) {
+ auto status=validate_q8_shape(weight,weight.shape.dims[0],weight.shape.dims[1]); if(!status) return status;
+ if(!cache || plan.selected.resources.image_bytes!=weight.payload.range.bytes)
+  return {Error::malformed,"Q8 runtime image must contain the complete compact payload"};
+ HostQ8Binding result; result.source_=weight; result.plan_=plan; result.cache_=std::move(cache);
+ status=make_image_key(weight,plan,"q8-compact","q8-binding-v2",result.key_); if(!status) return status;
+ result.image_=std::make_shared<ImageLease>();
+ status=acquire_image(*result.cache_,result.key_,plan,weight,context,*result.image_); if(!status) return status;
+ status=record_last_use(*result.image_,context); if(!status) return status;
+ out=std::move(result); return {Error::ok,{}};
 }
 }

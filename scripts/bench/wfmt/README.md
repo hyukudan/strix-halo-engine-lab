@@ -21,7 +21,7 @@ test-only adapters before replacing numerical bodies.
 
 For actual adapters, run `capture.py --exe EXECUTABLE --matrix MATRIX --out DIR
 --compiler VERSION --architecture ARCH --source SOURCE --flags FLAGS --device ID
---adapter reference|native|backend`. Use `--source-ref COMMIT` with an archived source tree.
+--adapter reference|native|backend`. Use `--source SOURCE --source-ref COMMIT` with an archived source tree; COMMIT must be a full 40- or 64-hex revision declared by the archive producer (this does not verify archive contents).
 Source commit and exact compiler flags are required. `--adapter protocol` is explicitly fixture-only.
 The reference adapter uses `--wfmt-reference-capture DIR`; backend fixtures use
 `--wfmt-backend-capture DIR`; native hooks use `--wfmt-capture DIR --wfmt-matrix MATRIX`.

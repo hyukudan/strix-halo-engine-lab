@@ -19,15 +19,29 @@ def source_revision(value):
     return value.lower()
 
 
+def source_identity(source, source_ref):
+    if source_ref is not None:
+        if (len(source_ref) not in (40, 64) or
+                any(c not in "0123456789abcdefABCDEF" for c in source_ref)):
+            raise ValueError("source-ref must be a full 40- or 64-hex commit")
+        if source is None or not source.is_dir():
+            raise ValueError("source-ref requires an existing --source directory")
+        return source_ref.lower()
+    if source is not None:
+        return subprocess.check_output(
+            ["git", "-C", str(source), "rev-parse", "HEAD"], text=True).strip()
+    return None
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--exe", required=True, type=pathlib.Path)
     parser.add_argument("--matrix", required=True, type=pathlib.Path)
     parser.add_argument("--out", required=True, type=pathlib.Path)
-    source = parser.add_mutually_exclusive_group()
-    source.add_argument("--source", type=pathlib.Path)
-    source.add_argument("--source-revision", type=source_revision,
-                        help="commit ID for an externally frozen source archive")
+    parser.add_argument("--source", type=pathlib.Path)
+    parser.add_argument("--source-ref", help="full commit identity for an archived --source tree")
+    parser.add_argument("--source-revision", type=source_revision,
+                        help="commit ID for an externally frozen source archive (no --source)")
     parser.add_argument("--adapter", choices=("protocol", "reference", "native", "backend", "hip-transfer"), default="protocol")
     parser.add_argument("--compiler", required=True)
     parser.add_argument("--architecture", required=True)
@@ -51,11 +65,11 @@ def main():
         matrix_bytes = matrix.read_bytes()
         summary["executable_sha256"] = hashlib.sha256(exe.read_bytes()).hexdigest()
         summary["matrix_sha256"] = hashlib.sha256(matrix_bytes).hexdigest()
-        if args.source:
-            summary["source"] = subprocess.check_output(
-                ["git", "-C", str(args.source), "rev-parse", "HEAD"], text=True).strip()
-        elif args.source_revision:
-            summary["source"] = args.source_revision
+        if args.source_revision and (args.source or args.source_ref):
+            raise ValueError("--source-revision excludes --source/--source-ref")
+        source = args.source_revision or source_identity(args.source, args.source_ref)
+        if source is not None:
+            summary["source"] = source
         extra = args.args[1:] if args.args[:1] == ["--"] else args.args
         summary["adapter_args"] = extra
         adapter_args = ["--wfmt-capture", str(args.out.resolve()), "--wfmt-matrix", str(matrix)]

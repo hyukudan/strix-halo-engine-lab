@@ -31,15 +31,20 @@ struct Api {
     template<class... Args> static auto EventRecord(Args&&... args) { return cudaEventRecord(std::forward<Args>(args)...); }
     template<class... Args> static auto StreamWaitEvent(Args&&... args) { return cudaStreamWaitEvent(std::forward<Args>(args)...); }
     template<class... Args> static auto Memcpy(Args&&... args) { return cudaMemcpy(std::forward<Args>(args)...); }
+    template<class... Args> static auto StreamQuery(Args&&... args) { return cudaStreamQuery(std::forward<Args>(args)...); }
+    template<class... Args> static auto StreamSynchronize(Args&&... args) { return cudaStreamSynchronize(std::forward<Args>(args)...); }
+    template<class... Args> static auto EventSynchronize(Args&&... args) { return cudaEventSynchronize(std::forward<Args>(args)...); }
     static std::string arch(const Properties& p) { return "sm_"+std::to_string(p.major)+std::to_string(p.minor); }
 };
 }
+void shutdown_native_runtime() { strix::weight::detail::NativeRuntime<Api>::shutdown(); }
 strix::weight::Status bind_native_runtime(void* stream,std::uint32_t device,strix::weight::ExecutionContext& context,strix::weight::Hardware& hardware) {
     return strix::weight::detail::NativeRuntime<Api>::bind(stream,device,context,hardware);
 }
 }
 #else
 namespace strix::cuda::weight {
+void shutdown_native_runtime() {}
 strix::weight::Status bind_native_runtime(void*,std::uint32_t,strix::weight::ExecutionContext&,strix::weight::Hardware&) {
     return {strix::weight::Error::unsupported_backend,"native runtime is not compiled; no implicit CPU offload"};
 }

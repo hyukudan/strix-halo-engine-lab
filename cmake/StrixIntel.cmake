@@ -67,6 +67,7 @@ if(BUILD_TESTING)
     # Compile the real exception boundary with a host-only SYCL fault double, never -fsycl.
     add_executable(strix-intel-sycl-boundary-tests
         ${_strix_intel_root}/tests/intel_backend_sycl_failures.cpp
+        ${_strix_intel_root}/tests/wfmt/intel_queue.cpp
         ${_strix_intel_root}/src/intel/weight/registry.cpp
         ${_strix_intel_root}/src/intel/core/backend.cpp)
     target_include_directories(strix-intel-sycl-boundary-tests BEFORE PRIVATE
@@ -77,7 +78,7 @@ if(BUILD_TESTING)
     if(COMMAND strix_target_warnings)
         strix_target_warnings(strix-intel-sycl-boundary-tests)
     endif()
-    foreach(_case async sync open)
+    foreach(_case async sync open queues)
         add_test(NAME strix-intel-sycl-${_case}-failures COMMAND strix-intel-sycl-boundary-tests ${_case})
     endforeach()
 endif()
