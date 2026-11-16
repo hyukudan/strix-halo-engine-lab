@@ -53,6 +53,17 @@ bool dense_t2_remap_enabled() {
     return on;
 }
 
+// STRIX_QRTX_DENSE_T2_A16=0: the remap loader (4-byte .ca copies) instead of the aligned-window loader (16-byte .cg
+// copies of the 80-byte aligned window that holds a stage's 68 raw bytes). Bitwise: the same raw bytes reach the reader,
+// which adds the window's word shift. Needs row_bytes % 16 == 0 and 16-aligned segments (launcher check).
+inline constexpr strix::lever::Decl dense_t2_a16_lever{
+    .name = "qwen_dense_t2_a16", .env = "STRIX_QRTX_DENSE_T2_A16", .exactness = strix::lever::Exactness::bitwise,
+    .default_on = false, .source = "qwen_dense_tests --bench-shape 16-11: equal hashes, 2-stage ring +13 % slower (L2 bytes, see RTXFAST6R)"};
+bool dense_t2_a16_enabled() {
+    static const bool on = strix::lever::select(dense_t2_a16_lever, {}).on;
+    return on;
+}
+
 // STRIX_QRTX_DENSE_T4=0: tile2 (2 K blocks per stage, 4-byte weight copies) instead of project_tile4_kernel (4 K blocks
 // per stage, 8-byte weight copies). Bitwise: same per-output chain, blocks ascending. Needs the remap lever on.
 inline constexpr strix::lever::Decl dense_t4_lever{
@@ -322,8 +333,8 @@ constexpr int kT2Smem = 2 * kT2Stage;
 // The old loader (17 lanes per row, 9 pointers hoisted per thread) spilled 112 B under the 128-register cap of
 // launch_bounds(256, 2) and reloaded them each stage; one CTA per SM with 249 registers was measured faster than two
 // capped CTAs (2.267 vs 2.410 ms) and than a 4-stage ring with one barrier per stage (2.506 ms).
-template <Store S, bool Remap>
-__global__ __launch_bounds__(kThreads, Remap ? 1 : 2) void project_tile2_kernel(KSite site, std::uint32_t rows, const std::int8_t* codes,
+template <Store S, int L, int NS = 2>   // L: 0 first loader, 1 remap, 2 aligned window; NS: ring stages (> 2: L == 2 only)
+__global__ __launch_bounds__(kThreads, L != 0 ? 1 : 2) void project_tile2_kernel(KSite site, std::uint32_t rows, const std::int8_t* codes,
                                                                     const float* deltas, std::uint32_t pitch) {
     extern __shared__ __align__(16) unsigned char smem[];
     const int tid = static_cast<int>(threadIdx.x), lane = tid & 31, warp = tid >> 5, gid = lane >> 2, tig = lane & 3;
@@ -361,7 +372,22 @@ __global__ __launch_bounds__(kThreads, Remap ? 1 : 2) void project_tile2_kernel(
             cp_async16(A + r * kT2Rw + c * 4U, ok ? codes + static_cast<std::uint64_t>(gr) * width + kb0 * 32U + c * 16U : codes, ok);
         }
         const unsigned char* wstage = wbase + static_cast<std::uint64_t>(kb0) * 34U;
-        if constexpr (Remap) {
+        if constexpr (L == 2) {
+            // Aligned window: the stage's 68 bytes start at kb0 * 34 = 68 s, i.e. (s mod 4) words past a 16-byte boundary
+            // (row_bytes % 16 == 0, 16-aligned segment); the 80-byte window [68 s - 4 (s mod 4), + 80) never leaves the row
+            // (the last stage has s mod 4 == 3 and ends at row_bytes) and fills the 80-byte row pitch exactly. 128 rows x 5
+            // chunks = 640 16-byte copies: chunks tid, tid + 256, tid + 512 (< 640).
+            const unsigned char* wwin = wstage - (s & 3U) * 4U;
+#pragma unroll
+            for (int k = 0; k < 3; ++k) {
+                const std::uint32_t c = static_cast<std::uint32_t>(tid) + 256U * k, r = c / 5U, q = c - r * 5U;
+                if (k < 2 || c < 640U) {
+                    const bool ok = r < nrows;
+                    cp_async16(B + r * kT2Rw + q * 4U, ok ? reinterpret_cast<const std::int8_t*>(wwin + static_cast<std::uint64_t>(r) * row_bytes + q * 16U)
+                                                          : reinterpret_cast<const std::int8_t*>(site.seg[0].w), ok);
+                }
+            }
+        } else if constexpr (L == 1) {
             // 16 lanes per row take words 0..15 (64 contiguous bytes), rows (tid >> 4) + 16 k; word 16 of row tid (tid < 128).
             // Stage-invariant addresses: one row pointer stepped by 16 rows, shared-memory offsets are immediates.
         {
@@ -404,17 +430,30 @@ __global__ __launch_bounds__(kThreads, Remap ? 1 : 2) void project_tile2_kernel(
 #pragma unroll
             for (int e = 0; e < 4; ++e) acc[a][b][e] = 0.0F;
 
-    load_stage(0U, 0);
-    cp_async_commit();
-    for (std::uint32_t s = 0; s < stages; ++s) {
-#ifndef T2_NOLOAD
-        if (s + 1U < stages) load_stage(s + 1U, static_cast<int>((s + 1U) & 1U));
-#endif
+    static_assert(NS == 2 || L == 2, "deeper rings only with the aligned-window loader (no L1 dependence)");
+#pragma unroll
+    for (int p = 0; p < NS - 1; ++p) {
+        if (static_cast<std::uint32_t>(p) < stages) load_stage(static_cast<std::uint32_t>(p), p);
         cp_async_commit();
-        cp_async_wait1();
-        __syncthreads();
-        const unsigned char* base = smem + (s & 1U) * kT2Stage;
-        const auto* B = reinterpret_cast<const std::uint32_t*>(base + kT2A);
+    }
+    for (std::uint32_t s = 0; s < stages; ++s) {
+        if constexpr (NS == 2) {
+#ifndef T2_NOLOAD
+            if (s + 1U < stages) load_stage(s + 1U, static_cast<int>((s + 1U) & 1U));
+#endif
+            cp_async_commit();
+            cp_async_wait1();
+            __syncthreads();
+        } else {
+            // One barrier per stage: after it stage s is visible and every warp has left stage s - 1, whose buffer
+            // ((s + NS - 1) % NS) takes stage s + NS - 1.
+            asm volatile("cp.async.wait_group %0;\n" ::"n"(NS - 2));
+            __syncthreads();
+            if (s + NS - 1U < stages) load_stage(s + NS - 1U, static_cast<int>((s + NS - 1U) % NS));
+            cp_async_commit();
+        }
+        const unsigned char* base = smem + (s % NS) * kT2Stage;
+        const auto* B = reinterpret_cast<const std::uint32_t*>(base + kT2A) + (L == 2 ? (s & 3U) : 0U);   // window shift
         const auto* D = reinterpret_cast<const float*>(base + kT2A + kT2B);
         const auto* SC = reinterpret_cast<const std::uint32_t*>(base + kT2A + kT2B + kT2D);
 #pragma unroll
@@ -455,7 +494,7 @@ __global__ __launch_bounds__(kThreads, Remap ? 1 : 2) void project_tile2_kernel(
                     }
                 }
         }
-        __syncthreads();
+        if constexpr (NS == 2) __syncthreads();
     }
 #pragma unroll
     for (int mt = 0; mt < 4; ++mt)
@@ -906,13 +945,36 @@ template <Store S> cudaError_t launch_project(cudaStream_t stream, const KSite& 
         static std::once_flag once2;
         static cudaError_t attr2 = cudaSuccess;
         std::call_once(once2, [] {
-            attr2 = cudaFuncSetAttribute(project_tile2_kernel<S, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, kT2Smem);
+            attr2 = cudaFuncSetAttribute(project_tile2_kernel<S, 2>, cudaFuncAttributeMaxDynamicSharedMemorySize, kT2Smem);
             if (attr2 == cudaSuccess)
-                attr2 = cudaFuncSetAttribute(project_tile2_kernel<S, false>, cudaFuncAttributeMaxDynamicSharedMemorySize, kT2Smem);
+                attr2 = cudaFuncSetAttribute(project_tile2_kernel<S, 2, 3>, cudaFuncAttributeMaxDynamicSharedMemorySize, 3 * kT2Stage);
+            if (attr2 == cudaSuccess)
+                attr2 = cudaFuncSetAttribute(project_tile2_kernel<S, 2, 4>, cudaFuncAttributeMaxDynamicSharedMemorySize, 4 * kT2Stage);
+            if (attr2 == cudaSuccess)
+                attr2 = cudaFuncSetAttribute(project_tile2_kernel<S, 1>, cudaFuncAttributeMaxDynamicSharedMemorySize, kT2Smem);
+            if (attr2 == cudaSuccess)
+                attr2 = cudaFuncSetAttribute(project_tile2_kernel<S, 0>, cudaFuncAttributeMaxDynamicSharedMemorySize, kT2Smem);
+            // Diagnostic (microbench only, scheduling-only): shared-memory carveout hint in percent for the tiled kernels.
+            if (const char* cv = std::getenv("STRIX_QRTX_DENSE_CARVEOUT"); attr2 == cudaSuccess && cv && cv[0]) {
+                const int pct = std::atoi(cv);
+                attr2 = cudaFuncSetAttribute(project_tile2_kernel<S, 2>, cudaFuncAttributePreferredSharedMemoryCarveout, pct);
+                if (attr2 == cudaSuccess)
+                    attr2 = cudaFuncSetAttribute(project_tile2_kernel<S, 1>, cudaFuncAttributePreferredSharedMemoryCarveout, pct);
+                if (attr2 == cudaSuccess)
+                    attr2 = cudaFuncSetAttribute(project_tile2_kernel<S, 0>, cudaFuncAttributePreferredSharedMemoryCarveout, pct);
+            }
         });
         if (attr2 != cudaSuccess) return attr2;
-        if (dense_t2_remap_enabled()) project_tile2_kernel<S, true><<<grid, kThreads, kT2Smem, stream>>>(k, rows, codes, deltas, pitch);
-        else project_tile2_kernel<S, false><<<grid, kThreads, kT2Smem, stream>>>(k, rows, codes, deltas, pitch);
+        bool a16 = (k.width / 32U) % 8U == 0U;   // aligned window: row_bytes % 16 == 0 and 16-aligned segments
+        for (std::uint32_t m = 0; m < k.nseg; ++m) a16 = a16 && (reinterpret_cast<std::uintptr_t>(k.seg[m].w) & 15U) == 0U;
+        if (a16 && dense_t2_remap_enabled() && dense_t2_a16_enabled()) {
+            static const int ns = [] { const char* e = std::getenv("STRIX_QRTX_DENSE_T2_NS"); return e && e[0] ? std::atoi(e) : 2; }();
+            if (ns == 4) project_tile2_kernel<S, 2, 4><<<grid, kThreads, 4 * kT2Stage, stream>>>(k, rows, codes, deltas, pitch);
+            else if (ns == 3) project_tile2_kernel<S, 2, 3><<<grid, kThreads, 3 * kT2Stage, stream>>>(k, rows, codes, deltas, pitch);
+            else project_tile2_kernel<S, 2><<<grid, kThreads, kT2Smem, stream>>>(k, rows, codes, deltas, pitch);
+        }
+        else if (dense_t2_remap_enabled()) project_tile2_kernel<S, 1><<<grid, kThreads, kT2Smem, stream>>>(k, rows, codes, deltas, pitch);
+        else project_tile2_kernel<S, 0><<<grid, kThreads, kT2Smem, stream>>>(k, rows, codes, deltas, pitch);
         return cudaGetLastError();
     }
     static std::once_flag once;
