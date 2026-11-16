@@ -53,6 +53,46 @@ __global__ void __launch_bounds__(128) conv_pre_kernel(const float* __restrict__
     }
 }
 
+
+// Row-parallel twin of conv_pre_kernel for prefill chunks (BITWISE the same per-row arithmetic): block (128 channels, RB rows).
+// The conv taps of row r are raw rows r-3..r-1 (negative = committed conv state).
+constexpr std::uint32_t kConvRows = 32;
+__global__ void __launch_bounds__(128) conv_prefill_kernel(const float* __restrict__ w, const float* __restrict__ conv_state,
+                                                           const float* __restrict__ raw, float* qc, std::uint32_t channels,
+                                                           std::uint32_t rows, std::uint32_t q_blocks, std::uint32_t qk_blocks,
+                                                           float qscale) {
+    __shared__ float red[4];
+    const std::uint32_t c = blockIdx.x * 128 + threadIdx.x;
+    const std::uint32_t r0 = blockIdx.y * kConvRows, r1 = min(rows, r0 + kConvRows);
+    const float w0 = w[c * 4], w1 = w[c * 4 + 1], w2 = w[c * 4 + 2], w3 = w[c * 4 + 3];
+    float s[3];
+#pragma unroll
+    for (int i = 0; i < 3; ++i) {
+        const int idx = static_cast<int>(r0) - 3 + i;
+        s[i] = idx >= 0 ? raw[static_cast<std::size_t>(idx) * channels + c] : conv_state[c * 3 + (idx + 3)];
+    }
+    float s0 = s[0], s1 = s[1], s2 = s[2];
+    const bool qk = blockIdx.x < qk_blocks;
+    const float scale = blockIdx.x < q_blocks ? qscale : 1.0f;
+    for (std::uint32_t r = r0; r < r1; ++r) {
+        const float x = raw[static_cast<std::size_t>(r) * channels + c];
+        float sum = __fmul_rn(w0, s0);
+        sum = __fadd_rn(sum, __fmul_rn(w1, s1));
+        sum = __fadd_rn(sum, __fmul_rn(w2, s2));
+        sum = __fadd_rn(sum, __fmul_rn(w3, x));
+        float y = cc_silu(sum);
+        s0 = s1;
+        s1 = s2;
+        s2 = x;
+        if (qk) {
+            const float ss = block_sum128(__fmul_rn(y, y), red);
+            const float inv = __fdiv_rn(1.0f, __fsqrt_rn(__fadd_rn(ss, 1e-6f)));
+            y = __fmul_rn(__fmul_rn(y, inv), scale);
+        }
+        qc[static_cast<std::size_t>(r) * channels + c] = y;
+    }
+}
+
 struct DeltaArgs {
     float* base;         // [2][heads][128][128]
     const float* qkvc;   // [rows][channels]
@@ -191,6 +231,29 @@ cudaError_t gdn_commit(const GdnDims& d, const GdnCommitLayer* layers, std::uint
     }
     conv_commit_kernel<<<dim3(C / 128, n), 128, 0, stream>>>(b, C, k);
     if (auto e = cudaGetLastError(); e != cudaSuccess) return e;
+    flip_kernel<<<1, 1, 0, stream>>>(parity_dev);
+    return cudaGetLastError();
+}
+
+cudaError_t gdn_prefill_layer(const GdnDims& d, const GdnLayer& layer, const GdnState& state, const GdnWindow& win, const float* z,
+                              float* out, std::uint32_t rows, float eps, const std::uint32_t* parity_dev, cudaStream_t stream) {
+    if (d.key_dim != 128 || d.value_dim != 128 || d.conv_kernel != 4 || rows == 0) return cudaErrorInvalidValue;
+    const std::uint32_t C = d.conv_channels();
+    const float qscale = static_cast<float>(1.0 / std::sqrt(static_cast<double>(d.key_dim)));
+    conv_prefill_kernel<<<dim3(C / 128, (rows + kConvRows - 1) / kConvRows), 128, 0, stream>>>(
+        layer.conv_w, state.conv, win.raw, win.qkv_c, C, rows, d.key_heads, 2 * d.key_heads, qscale);
+    if (auto e = cudaGetLastError(); e != cudaSuccess) return e;
+    DeltaArgs a{state.delta_base, win.qkv_c, win.a_raw, win.b_raw, layer.ssm_a, layer.dt_bias, layer.norm_gain, z, out,
+                nullptr, nullptr};
+    delta_window_kernel<<<dim3(d.value_heads), 128, 0, stream>>>(a, d, rows, parity_dev, eps);
+    if (auto e = cudaGetLastError(); e != cudaSuccess) return e;
+    CommitBatch b{};
+    b.a[0] = DeltaArgs{state.delta_base, win.qkv_c, win.a_raw, win.b_raw, layer.ssm_a, layer.dt_bias, nullptr, nullptr, nullptr, state.conv, win.raw};
+    conv_commit_kernel<<<dim3(C / 128, 1), 128, 0, stream>>>(b, C, rows);
+    return cudaGetLastError();
+}
+
+cudaError_t gdn_prefill_flip(std::uint32_t* parity_dev, cudaStream_t stream) {
     flip_kernel<<<1, 1, 0, stream>>>(parity_dev);
     return cudaGetLastError();
 }

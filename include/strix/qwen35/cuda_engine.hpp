@@ -27,6 +27,13 @@ enum class LogitRows : std::uint8_t { none, last, all };
 // TURBO weight source (owner requirement): off = exact pack as is; native = TURBO policy without weight change;
 // onfly = BF16 2-D weights rounded at load to NVFP4 (RTN per 16, kept only in VRAM). `converted` is not implemented yet.
 enum class TurboWeights : std::uint8_t { off, native, onfly };
+// Prefill arithmetic policy for CudaEngine::prefill (the large-M path). exact: dense on the large-M tensor-core GEMM with the decode
+// reduction order + decode attention in 32-row windows + sequential GDN: bitwise equal to forward_rows windows + commit.
+// flash: exact dense, causal flash attention (bf16 P, online softmax; FAST attention, differs from decode attention).
+// fast: flash + activation split of ONE bf16 term (mma1; nvfp4 weights are unchanged: their activation is f16 already).
+// fast2: flash + two bf16 terms (mma2).
+enum class PrefillArith : std::uint8_t { exact, flash, fast, fast2 };
+[[nodiscard]] const char* prefill_arith_name(PrefillArith a);
 
 struct EngineOptions {
     std::uint32_t max_positions = 4096;  // KV capacity per attention layer (and for the MTP layer)
@@ -40,6 +47,10 @@ struct EngineOptions {
     std::uint32_t turbo_bits = 4;   // 4 = NVFP4 (3/2 later)
     bool turbo_lm_head = true;      // onfly: lm_head follows the source (true) or stays BF16 (false)
     // multi_gemv (above) is also the TURBO multi-launch lever.
+    // Large-M prefill (CudaEngine::prefill). Default exact = bitwise equal to the windowed path.
+    PrefillArith prefill_arith = PrefillArith::exact;
+    std::uint32_t prefill_chunk = 2048;  // rows per large-M chunk (multiple of 128, <= 8192); buffers are allocated on first use
+    bool prefill_big = true;             // false: prefill() runs forward_rows windows of 32 + commit (reference / fallback)
 };
 
 // Named identity of the arithmetic + weight source; also the prefix-cache key (caches never mix identities).
@@ -81,6 +92,12 @@ public:
 
     // rows 1..32 (cuda_core::kMaxRows). tokens: host array. Async on stream(); read outputs after synchronizing.
     RowsOut forward_rows(const std::uint32_t* tokens, std::uint32_t rows, LogitRows want = LogitRows::all);
+    // Prefill n tokens (any n >= 1) at positions committed() .. committed()+n-1 and COMMIT them (same committed state as forward_rows
+    // windows + commit(rows) under PrefillArith::exact). Returns the logits / argmax / hidden of the LAST token (want = last; none
+    // skips the lm_head). Runs the large-M tensor-core path in chunks of options().prefill_chunk rows; falls back to windows when
+    // prefill_big is off, dense arith is fp32 or a weight shape is unsupported. Async on stream(); no CUDA graphs.
+    RowsOut prefill(const std::uint32_t* tokens, std::uint32_t n, LogitRows want = LogitRows::last);
+    [[nodiscard]] bool prefill_is_big() const;  // whether prefill() takes the large-M path for this engine
     // Accepts the first k rows of the last forward_rows window (0 <= k <= rows). Async on stream().
     void commit(std::uint32_t k);
 

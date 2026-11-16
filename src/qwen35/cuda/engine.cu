@@ -17,6 +17,7 @@
 #include "strix/cuda_core/gdn.hpp"
 #include "strix/cuda_core/nvfp4.hpp"
 #include "strix/cuda_core/norms.hpp"
+#include "strix/cuda_core/dense_big.hpp"
 #include "strix/cuda_core/rope.hpp"
 #include "strix/gguf_reader.hpp"
 
@@ -632,6 +633,197 @@ struct CudaEngine::Impl {
         last_rows = 0;
     }
 
+    // ============================================================ large-M prefill (see cuda_engine.hpp prefill())
+    struct Pf {
+        bool ready = false;
+        std::uint32_t C = 0;
+        float *x = nullptr, *xn = nullptr, *z = nullptr, *gout = nullptr, *raw = nullptr, *qkvc = nullptr, *ar = nullptr, *br = nullptr,
+              *qg = nullptr, *q = nullptr, *k = nullptr, *v = nullptr, *ao = nullptr, *hid = nullptr;
+        std::uint32_t *ids = nullptr, *wpos = nullptr;
+        // activation split cache for the current x
+        const float* act_x = nullptr;
+        std::uint32_t act_in = 0, act_rows = 0;
+        cc::BigAct act[2];
+        bool have[2] = {false, false};
+        int terms = 3;
+    } pf;
+
+    [[nodiscard]] bool big_supported() const {
+        if (!opt.prefill_big || cc::dense_arith() == cc::DenseArith::fp32) return false;
+        if (opt.prefill_chunk == 0 || opt.prefill_chunk % 128 != 0 || opt.prefill_chunk > 8192) return false;
+        for (const LayerW& w : L) {
+            const cc::DenseWeight all[] = {w.qkv, w.gate, w.beta, w.alpha, w.out, w.q, w.k, w.v, w.o, w.ffn_gate, w.ffn_up, w.ffn_down};
+            for (const auto& d : all)
+                if (d.data != nullptr && !cc::dense_big_supported(d)) return false;
+        }
+        return c.head_dim == 256 && gd.key_dim == 128 && gd.value_dim == 128;
+    }
+
+    void pf_init() {
+        if (pf.ready && pf.C == opt.prefill_chunk) return;
+        const std::uint32_t C = opt.prefill_chunk, H = c.hidden;
+        pf.C = C;
+        pf.x = alloc<float>(static_cast<std::size_t>(C) * H);
+        pf.xn = alloc<float>(static_cast<std::size_t>(C) * H);
+        pf.z = alloc<float>(static_cast<std::size_t>(C) * gd.v_width());
+        pf.gout = alloc<float>(static_cast<std::size_t>(C) * gd.v_width());
+        pf.raw = alloc<float>(static_cast<std::size_t>(C) * gd.conv_channels());
+        pf.qkvc = alloc<float>(static_cast<std::size_t>(C) * gd.conv_channels());
+        pf.ar = alloc<float>(static_cast<std::size_t>(C) * gd.value_heads);
+        pf.br = alloc<float>(static_cast<std::size_t>(C) * gd.value_heads);
+        pf.qg = alloc<float>(static_cast<std::size_t>(C) * c.q_gate_width());
+        pf.q = alloc<float>(static_cast<std::size_t>(C) * c.heads * c.head_dim);
+        pf.k = alloc<float>(static_cast<std::size_t>(C) * c.kv_width());
+        pf.v = alloc<float>(static_cast<std::size_t>(C) * c.kv_width());
+        pf.ao = alloc<float>(static_cast<std::size_t>(C) * c.heads * c.head_dim);
+        pf.hid = alloc<float>(static_cast<std::size_t>(C) * c.intermediate);
+        pf.ids = alloc<std::uint32_t>(C);
+        pf.wpos = alloc<std::uint32_t>(C / 32 + 1);
+        CK(cc::dense_big_reserve(C, std::max(c.intermediate, H), static_cast<std::uint64_t>(c.intermediate) * H, 3));
+        pf.ready = true;
+    }
+
+    [[nodiscard]] int pf_terms() const {
+        if (opt.prefill_arith == PrefillArith::fast) return 1;
+        if (opt.prefill_arith == PrefillArith::fast2) return 2;
+        const auto a = cc::dense_arith();
+        return a == cc::DenseArith::mma3 ? 3 : a == cc::DenseArith::mma2 ? 2 : 1;
+    }
+
+    // the activation planes of x for weight w (split lazily, cached until x changes)
+    const cc::BigAct& pf_act(const float* x, std::uint32_t rows, const cc::DenseWeight& w) {
+        if (pf.act_x != x || pf.act_in != w.in || pf.act_rows != rows) {
+            pf.have[0] = pf.have[1] = false;
+            pf.act_x = x;
+            pf.act_in = w.in;
+            pf.act_rows = rows;
+        }
+        const int cls = w.format == cc::WeightFormat::nvfp4 ? 1 : 0;
+        if (!pf.have[cls]) {
+            CK(cc::dense_big_split(x, rows, w.in, w.format, pf.terms, &pf.act[cls], s));
+            pf.have[cls] = true;
+        }
+        return pf.act[cls];
+    }
+    void pf_dirty() {
+        pf.act_x = nullptr;
+        pf.have[0] = pf.have[1] = false;
+    }
+
+    void pf_gemm(const cc::DenseWeight& w, const float* x, std::uint32_t rows, float* y, const float* aux, cc::BigEpi epi) {
+        const cc::BigAct& a = pf_act(x, rows, w);
+        CK(cc::dense_big_gemm(w, a, y, aux, epi, s));
+    }
+
+    void pf_mlp(const LayerW& w, std::uint32_t rows) {
+        const cc::GroupedView hv{rows, 1, c.hidden, c.hidden, c.hidden};
+        CK(cc::rmsnorm(pf.x, hv, w.post_norm, pf.xn, hv, c.rms_eps, s));
+        pf_dirty();
+        pf_gemm(w.ffn_gate, pf.xn, rows, pf.hid, nullptr, cc::BigEpi::none);
+        pf_gemm(w.ffn_up, pf.xn, rows, pf.hid, pf.hid, cc::BigEpi::silu_mul);  // y = silu(gate) * up, in place
+        pf_dirty();
+        pf_gemm(w.ffn_down, pf.hid, rows, pf.x, pf.x, cc::BigEpi::residual);
+        pf_dirty();
+    }
+
+    void pf_attn(std::uint32_t l, const LayerW& w, std::uint32_t rows, std::uint32_t pos0) {
+        const std::uint32_t D = c.head_dim, qgw = c.heads * D * 2;
+        pf_gemm(w.q, pf.xn, rows, pf.qg, nullptr, cc::BigEpi::none);
+        pf_gemm(w.k, pf.xn, rows, pf.k, nullptr, cc::BigEpi::none);
+        pf_gemm(w.v, pf.xn, rows, pf.v, nullptr, cc::BigEpi::none);
+        const cc::GroupedView qsrc{rows, c.heads, D, qgw, 2 * D}, qdst{rows, c.heads, D, c.heads * D, D};
+        const cc::GroupedView kvv{rows, c.kv_heads, D, c.kv_heads * D, D};
+        CK(cc::rmsnorm(pf.qg, qsrc, w.qn, pf.q, qdst, c.rms_eps, s));
+        CK(cc::rmsnorm(pf.k, kvv, w.kn, pf.k, kvv, c.rms_eps, s));
+        CK(cc::rope_apply(pf.q, qdst, c.rotary_dim, cos_t, sin_t, d_pos, s));
+        CK(cc::rope_apply(pf.k, kvv, c.rotary_dim, cos_t, sin_t, d_pos, s));
+        CK(cc::kv_store(ad, pf.k, pf.v, kc[l], vc[l], d_pos, rows, s));
+        if (opt.prefill_arith == PrefillArith::exact) {
+            for (std::uint32_t r0 = 0, wi = 0; r0 < rows; r0 += RM, ++wi) {
+                const std::uint32_t rw = std::min<std::uint32_t>(RM, rows - r0);
+                const cc::GroupedView qs{rw, c.heads, D, qgw, 2 * D}, qd{rw, c.heads, D, c.heads * D, D};
+                CK(cc::attention_decode(ad, pf.q + static_cast<std::size_t>(r0) * c.heads * D, qd,
+                                        pf.qg + static_cast<std::size_t>(r0) * qgw + D, qs, kc[l], vc[l], pf.wpos + wi, rw,
+                                        pf.ao + static_cast<std::size_t>(r0) * c.heads * D, scratch, s));
+            }
+        } else {
+            CK(cc::attention_prefill_flash(ad, pf.q, qdst, pf.qg + D, qsrc, kc[l], vc[l], pos0, rows, pf.ao, s));
+        }
+        pf_dirty();
+        pf_gemm(w.o, pf.ao, rows, pf.x, pf.x, cc::BigEpi::residual);
+        pf_dirty();
+    }
+
+    // one chunk of `rows` tokens at positions pos0.. through all layers; x ends in pf.x
+    void pf_chunk(const std::uint32_t* tokens, std::uint32_t rows, std::uint32_t pos0) {
+        const std::uint32_t H = c.hidden;
+        const cc::GroupedView hv{rows, 1, H, H, H};
+        CK(cudaMemcpyAsync(pf.ids, tokens, static_cast<std::size_t>(rows) * 4, cudaMemcpyHostToDevice, s));
+        CK(cudaMemcpyAsync(d_pos, &pos0, 4, cudaMemcpyHostToDevice, s));
+        CK(cc::iota_u32(pf.wpos, (rows + RM - 1) / RM, pos0, RM, s));
+        CK(cc::embedding_rows(embd, pf.ids, pf.x, rows, s));
+        std::uint32_t gi = 0;
+        for (std::uint32_t l = 0; l < c.layers; ++l) {
+            const LayerW& w = L[l];
+            CK(cc::rmsnorm(pf.x, hv, w.attn_norm, pf.xn, hv, c.rms_eps, s));
+            pf_dirty();
+            if (!w.attn) {
+                pf_gemm(w.qkv, pf.xn, rows, pf.raw, nullptr, cc::BigEpi::none);
+                pf_gemm(w.gate, pf.xn, rows, pf.z, nullptr, cc::BigEpi::none);
+                pf_gemm(w.beta, pf.xn, rows, pf.br, nullptr, cc::BigEpi::none);
+                pf_gemm(w.alpha, pf.xn, rows, pf.ar, nullptr, cc::BigEpi::none);
+                const auto& cl = commit_layers[gi++];
+                CK(cc::gdn_prefill_layer(gd, cl.layer, cl.state, cc::GdnWindow{pf.raw, pf.qkvc, pf.ar, pf.br}, pf.z, pf.gout, rows, c.rms_eps,
+                                         d_parity, s));
+                pf_gemm(w.out, pf.gout, rows, pf.x, pf.x, cc::BigEpi::residual);
+                pf_dirty();
+            } else {
+                pf_attn(l, w, rows, pos0);
+            }
+            pf_mlp(w, rows);
+        }
+        CK(cc::gdn_prefill_flip(d_parity, s));
+    }
+
+    RowsOut prefill(const std::uint32_t* tokens, std::uint32_t n, LogitRows want) {
+        if (n == 0) throw std::runtime_error("prefill: n must be >= 1");
+        if (committed + n > opt.max_positions) throw std::runtime_error("prefill: max_positions exceeded");
+        last_rows = 0;
+        if (!big_supported()) {  // windows + commit
+            RowsOut o;
+            for (std::uint32_t p = 0; p < n; p += RM) {
+                const std::uint32_t r = std::min<std::uint32_t>(RM, n - p);
+                o = forward(tokens + p, r, p + r == n ? want : LogitRows::none);
+                commit_rows(r);
+            }
+            return o;
+        }
+        pf_init();
+        pf.terms = pf_terms();
+        const std::uint32_t H = c.hidden;
+        for (std::uint32_t p = 0; p < n; p += pf.C) {
+            const std::uint32_t r = std::min<std::uint32_t>(pf.C, n - p);
+            pf_chunk(tokens + p, r, committed);
+            committed += r;
+            if (p + r == n) {
+                // last token: final norm + lm_head on its row, exported through the decode buffers (row 0)
+                CK(cudaMemcpyAsync(x, pf.x + static_cast<std::size_t>(r - 1) * H, static_cast<std::size_t>(H) * 4, cudaMemcpyDeviceToDevice, s));
+                const cc::GroupedView h1{1, 1, H, H, H};
+                CK(cc::rmsnorm(x, h1, out_norm, xn, h1, c.rms_eps, s));
+                if (want != LogitRows::none) {
+                    CK(cc::dense_rows(head, xn, logits, 1, nullptr, s));
+                    CK(cc::argmax_rows(logits, c.vocab, 1, d_top, d_argws, s));
+                }
+            }
+        }
+        RowsOut o;
+        o.logits = want == LogitRows::none ? nullptr : logits;
+        o.top = want == LogitRows::none ? nullptr : d_top;
+        o.hidden_post = xn;
+        o.hidden_pre = x;
+        return o;
+    }
+
     CudaEngine::MtpOut mtp(const std::uint32_t* next_tokens, const float* hidden_dev, std::uint32_t rows, std::uint32_t pos0, bool want_top) {
         if (!mtp_ok) throw std::runtime_error("mtp_forward: no MTP tensors loaded");
         if (rows == 0 || rows > RM || pos0 + rows > opt.max_positions) throw std::runtime_error("mtp_forward: bad rows/pos0");
@@ -761,7 +953,13 @@ std::unique_ptr<CudaEngine> CudaEngine::synthetic(const Config& cfg, PackFormat 
     return e;
 }
 
+static std::string engine_identity_base(const EngineOptions& o, const char* arith);
 std::string engine_identity(const EngineOptions& o, const char* arith) {
+    std::string base = engine_identity_base(o, arith);
+    if (o.prefill_arith != PrefillArith::exact) base += std::string("-pf-") + prefill_arith_name(o.prefill_arith);
+    return base;
+}
+static std::string engine_identity_base(const EngineOptions& o, const char* arith) {
     const std::string a = arith ? arith : "mma3";
     if (o.turbo_weights == TurboWeights::off) return "qwen35-cuda-exact-" + a + "-v1";
     if (o.turbo_weights == TurboWeights::native) return "qwen35-turbo-native-" + a + "-v1";
@@ -801,6 +999,12 @@ RowsOut CudaEngine::forward_rows(const std::uint32_t* tokens, std::uint32_t rows
     return p_->forward(tokens, rows, want);
 }
 void CudaEngine::commit(std::uint32_t k) { p_->commit_rows(k); }
+RowsOut CudaEngine::prefill(const std::uint32_t* tokens, std::uint32_t n, LogitRows want) { return p_->prefill(tokens, n, want); }
+bool CudaEngine::prefill_is_big() const { return p_->big_supported(); }
+const char* prefill_arith_name(PrefillArith a) {
+    static const char* n[] = {"exact", "flash", "fast", "fast2"};
+    return n[static_cast<int>(a)];
+}
 CudaEngine::MtpOut CudaEngine::mtp_forward(const std::uint32_t* next_tokens, const float* hidden_dev, std::uint32_t rows,
                                            std::uint32_t pos0, bool want_top) {
     return p_->mtp(next_tokens, hidden_dev, rows, pos0, want_top);

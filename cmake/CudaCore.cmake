@@ -27,9 +27,11 @@ add_library(strix_cuda_core STATIC
     $<TARGET_OBJECTS:strix_cuda_core_fp4>
     ${_cc_root}/src/cuda_core/dense/dense.cu
     ${_cc_root}/src/cuda_core/dense/dense_mma.cu
+    ${_cc_root}/src/cuda_core/dense/dense_big.cu
     ${_cc_root}/src/cuda_core/norms/norms.cu
     ${_cc_root}/src/cuda_core/norms/rope.cu
     ${_cc_root}/src/cuda_core/attention/attention.cu
+    ${_cc_root}/src/cuda_core/attention/attention_flash.cu
     ${_cc_root}/src/cuda_core/gdn/gdn.cu)
 target_include_directories(strix_cuda_core PUBLIC ${_cc_root}/include)
 # Identity: no FMA contraction, IEEE division and sqrt, no flush-to-zero (as the existing Qwen CUDA build).
@@ -74,4 +76,11 @@ target_link_libraries(cuda_core_nvfp4_test PRIVATE strix_cuda_core)
 target_compile_options(cuda_core_nvfp4_test PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--fmad=false;--prec-div=true;--prec-sqrt=true;--ftz=false>)
 if(MSVC)
     target_compile_options(cuda_core_nvfp4_test PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/EHsc,/Zc:preprocessor,/utf-8>)
+endif()
+
+add_executable(cuda_core_dense_big_test ${_cc_root}/tests/cuda_core/dense_big_test.cu)
+target_link_libraries(cuda_core_dense_big_test PRIVATE strix_cuda_core)
+target_compile_options(cuda_core_dense_big_test PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--fmad=false;--prec-div=true;--prec-sqrt=true;--ftz=false>)
+if(MSVC)
+    target_compile_options(cuda_core_dense_big_test PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/EHsc,/Zc:preprocessor,/utf-8>)
 endif()

@@ -101,6 +101,8 @@ int main(int argc, char** argv) {
         bool graphs = true, multi = true, bwp = false, pdl = false, print_cfg = false;
         q::EngineOptions topt;  // TURBO levers (defaults = exact)
         std::string arith_name = "mma3";
+        std::string pf_arith;            // --prefill-arith exact|flash|fast|fast2: large-M prefill (absent: windows of --rows)
+        std::uint32_t pf_chunk = 2048, pf_repeat = 1;
         for (int i = 1; i < argc; ++i) {
             const std::string a = argv[i];
             auto next = [&]() -> std::string {
@@ -116,6 +118,9 @@ int main(int argc, char** argv) {
             else if (a == "--rows") rows_cap = static_cast<std::uint32_t>(std::stoul(next()));
             else if (a == "--decode-rows") decode_rows = static_cast<std::uint32_t>(std::stoul(next()));
             else if (a == "--max-pos") max_pos = static_cast<std::uint32_t>(std::stoul(next()));
+            else if (a == "--prefill-arith") pf_arith = next();
+            else if (a == "--prefill-chunk") pf_chunk = static_cast<std::uint32_t>(std::stoul(next()));
+            else if (a == "--prefill-repeat") pf_repeat = static_cast<std::uint32_t>(std::stoul(next()));
             else if (a == "--layers") layers_override = static_cast<std::uint32_t>(std::stoul(next()));
             else if (a == "--graphs") graphs = next() != "0";
             else if (a == "--bw-probe") bwp = true;
@@ -169,6 +174,14 @@ int main(int argc, char** argv) {
             while (std::getline(ss, t, ',')) prompt.push_back(static_cast<std::uint32_t>(std::stoul(t)));
         }
         q::EngineOptions opt = topt;
+        if (!pf_arith.empty()) {
+            if (pf_arith == "exact") opt.prefill_arith = q::PrefillArith::exact;
+            else if (pf_arith == "flash") opt.prefill_arith = q::PrefillArith::flash;
+            else if (pf_arith == "fast") opt.prefill_arith = q::PrefillArith::fast;
+            else if (pf_arith == "fast2") opt.prefill_arith = q::PrefillArith::fast2;
+            else throw std::runtime_error("--prefill-arith expects exact|flash|fast|fast2");
+            opt.prefill_chunk = pf_chunk;
+        }
         opt.use_graphs = graphs;
         opt.multi_gemv = multi;
         opt.pdl = pdl;
@@ -205,8 +218,21 @@ int main(int argc, char** argv) {
         std::vector<std::uint32_t> top1;
         std::vector<float> hid_all;
         std::uint32_t next_tok = 0;
+        if (!pf_arith.empty() && !df) {  // large-M prefill: pf_repeat prefills per process, FIRST = cold, LAST = warm
+            for (std::uint32_t rep = 0; rep < pf_repeat; ++rep) {
+                E->reset();
+                const auto t0 = std::chrono::steady_clock::now();
+                const auto o = E->prefill(prompt.data(), static_cast<std::uint32_t>(prompt.size()), q::LogitRows::last);
+                E->sync();
+                const double sec = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+                E->read_top(o, 1, &next_tok);
+                std::fprintf(stderr, "prefill[%u/%u] %s %zu tokens in %.3f s = %.1f tok/s (%s) top1 %u
+", rep + 1, pf_repeat, pf_arith.c_str(),
+                             prompt.size(), sec, static_cast<double>(prompt.size()) / sec, rep == 0 ? "FIRST/cold" : rep + 1 == pf_repeat ? "LAST/warm" : "mid", next_tok);
+            }
+        }
         const auto tp0 = std::chrono::steady_clock::now();
-        for (std::size_t p = 0; p < prompt.size(); p += rows_cap) {
+        for (std::size_t p = (!pf_arith.empty() && !df) ? prompt.size() : 0; p < prompt.size(); p += rows_cap) {
             const std::uint32_t rows = static_cast<std::uint32_t>(std::min<std::size_t>(rows_cap, prompt.size() - p));
             const bool last = p + rows == prompt.size();
             const auto want = df ? q::LogitRows::all : (last ? q::LogitRows::last : q::LogitRows::none);

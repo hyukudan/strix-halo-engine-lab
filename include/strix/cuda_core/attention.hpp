@@ -38,4 +38,14 @@ cudaError_t attention_decode(const AttentionDims& d, const float* q, const Group
                              const std::uint32_t* pos0_dev, std::uint32_t rows, float* out /*[rows][heads][head_dim]*/,
                              float* scratch, cudaStream_t stream);
 
+// PREFILL attention (FAST class, NOT bitwise equal to attention_decode): causal flash attention over the BF16 KV cache for a chunk of
+// `rows` query rows at positions pos0 .. pos0 + rows - 1 (the chunk's own K/V must already be stored by kv_store). Q is rounded to bf16,
+// scores and the online softmax are FP32, P is rounded to bf16 for the PV mma (FP32 accumulate); out = o * sigmoid(gate) like
+// attention_decode. head_dim 256, GQA group <= 8. q/gate/out use the same grouped views as attention_decode.
+cudaError_t attention_prefill_flash(const AttentionDims& d, const float* q, const GroupedView& qv, const float* gate, const GroupedView& gv,
+                                    const __nv_bfloat16* k_cache, const __nv_bfloat16* v_cache, std::uint32_t pos0, std::uint32_t rows,
+                                    float* out, cudaStream_t stream);
+// p[i] = base + step * i for i < n (small device helper used to address attention windows).
+cudaError_t iota_u32(std::uint32_t* p, std::uint32_t n, std::uint32_t base, std::uint32_t step, cudaStream_t stream);
+
 }  // namespace strix::cuda_core
