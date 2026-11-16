@@ -481,13 +481,12 @@ bool native_types(const Weights& w) {
     return !(a8_gate && a8_down);
 }
 
-bool enqueue(const Rows& v, std::uint32_t rows, std::uint32_t clear_words, const Weights& w, const amdmath::Tables& tables,
-             std::uint32_t* record, cudaStream_t s, bool moe_mma) {
+bool enqueue_routed(const Rows& v, std::uint32_t rows, const Weights& w, const amdmath::Tables& tables, cudaStream_t s,
+                    bool moe_mma) {
     validate_expert_arithmetic(w,moe_mma);
     validate_route_storage(v, rows);
     if (v.route_bf16 && (native_types(w) || w.arithmetic==ExpertArithmetic::gsq_a8_dot4))
         qwen_route::require_composition(true, qwen_route::Composition::other_weight_pack);
-    enqueue_prologue(v, rows, clear_words, s);
     enqueue_csr(v, rows, s);
     if (native_types(w)) {
         if (!v.intermediates.base) throw std::invalid_argument("MoE native expert types need Rows::intermediates");
@@ -498,15 +497,27 @@ bool enqueue(const Rows& v, std::uint32_t rows, std::uint32_t clear_words, const
         check(cudaGetLastError(), "MoE native gate/up");
         native_down_kernel<NativeSource,MoeBinding><<<dim3(tiles, hidden / 32U), 1024, 0, s>>>(w.down, w.down_type, v);
         check(cudaGetLastError(), "MoE native down");
-        enqueue_merge(v, rows, s);
-        enqueue_commit(v, rows, record, s);
-        return false;
+        return false;   // native experts: candidate MMA arithmetic did not run
     }
     enqueue_project(v, rows, w, tables, s, moe_mma);
     enqueue_down(v, rows, w, s, moe_mma);
+    return moe_mma;
+}
+void enqueue_combine(const Rows& v, std::uint32_t rows, std::uint32_t* record, cudaStream_t s) {
     enqueue_merge(v, rows, s);
     enqueue_commit(v, rows, record, s);
-    return moe_mma;
+}
+
+bool enqueue(const Rows& v, std::uint32_t rows, std::uint32_t clear_words, const Weights& w, const amdmath::Tables& tables,
+             std::uint32_t* record, cudaStream_t s, bool moe_mma) {
+    validate_expert_arithmetic(w,moe_mma);
+    validate_route_storage(v, rows);
+    if (v.route_bf16 && (native_types(w) || w.arithmetic==ExpertArithmetic::gsq_a8_dot4))
+        qwen_route::require_composition(true, qwen_route::Composition::other_weight_pack);
+    enqueue_prologue(v, rows, clear_words, s);
+    const bool dispatched = enqueue_routed(v, rows, w, tables, s, moe_mma);
+    enqueue_combine(v, rows, record, s);
+    return dispatched;
 }
 
 }  // namespace strix::cuda::qwen_moe
