@@ -1173,7 +1173,9 @@ HipMtpVerifiedTargetRows HipMtpWindowVerifier::verify(SerialSessionContext& sess
             pending=ticket.predicted_token();out.committed_rows.push_back(std::move(ticket));out.emitted_tokens.push_back(pending);
             if(index<candidates.size()) out.verified_candidates=std::max(out.verified_candidates,static_cast<std::uint32_t>(index+1U));
             const bool accepted=index<candidates.size() && candidates[index]==pending;
-            if(accepted)++out.accepted_candidates;
+            // Full-chain diagnostics force a one-row commit even when a draft
+            // matches. It is agreement, not an accepted extra emission.
+            if(accepted && !diagnostic)++out.accepted_candidates;
             if(diagnostic || is_eos(pending) || !accepted)break;
         }
         log_verification_rows(initial.source_position(),1U,1U,candidates,out.emitted_tokens,probabilities,out.accepted_candidates,eos,budget,diagnostic);
