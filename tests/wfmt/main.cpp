@@ -2,7 +2,6 @@
 #include <iostream>
 #include <exception>
 #include <string_view>
-#include <exception>
 int wfmt_census_test();
 bool wfmt_readers_test();
 bool wfmt_admission_test();

@@ -192,7 +192,7 @@ private:
                 return {413, R"({"error":"prompt does not fit the node context"})"};
             const std::vector<std::uint32_t> prefix(job.tokens.begin(), job.tokens.begin() + static_cast<std::ptrdiff_t>(position));
             if (job.local_rows >= position) return {400, R"({"error":"local_rows must be below the prompt length - 1"})"};
-            sender.begin(prefix, position, qo::handoff_numerical_id(kNumericalName, qo::choice_of(config_)), kReduction, kStateUpdate, job.local_rows);
+            sender.begin(prefix, position, qo::handoff_numerical_id_config(kNumericalName, config_), kReduction, kStateUpdate, job.local_rows);
             // Cooperative: the node prefills prompt[0, q] itself meanwhile (its prefix cache keeps the checkpoint at q).
             std::future<std::pair<int, std::string>> node_prefix;
             double node_prefix_s = 0;
