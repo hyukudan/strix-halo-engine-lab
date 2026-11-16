@@ -1,4 +1,5 @@
 #pragma once
+#include "strix/env_flags.hpp"
 // In-process A/B arms (shared host layer, every rank app can bind it): one process loads the weights once and runs
 // several switch sets ("arms") in a strict ABAB order, so a bundle ticket measures all arms of an ABAB without one
 // reload per arm. Spec: "LABEL:K=V+K=V;LABEL2:-" ('/' also separates arms: shell-safe; "-" = the launch environment). Before each arm every key named by
@@ -88,7 +89,7 @@ inline Arms parse(const std::string& spec) {
             bool seen = false;
             for (const auto& l : out.launch) seen = seen || l.first == k;
             if (!seen) {
-                const char* raw = std::getenv(k.c_str());
+                const char* raw = envcfg::text(k.c_str());
                 out.launch.emplace_back(k, raw ? std::optional<std::string>(raw) : std::nullopt);
             }
         }
@@ -100,12 +101,14 @@ inline Arms parse(const std::string& spec) {
 }
 
 inline void apply(const Arms& all, const Arm& arm) {
+    if (all.launch.empty() && arm.kv.empty()) return;
     for (const auto& [k, v] : all.launch) set_env(k, v);
     for (const auto& [k, v] : arm.kv) set_env(k, v);
     generation_ref().fetch_add(1, std::memory_order_acq_rel);
 }
 
 inline void restore(const Arms& all) {
+    if (all.launch.empty()) return;
     for (const auto& [k, v] : all.launch) set_env(k, v);
     generation_ref().fetch_add(1, std::memory_order_acq_rel);
 }

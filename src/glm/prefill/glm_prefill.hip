@@ -3508,7 +3508,8 @@ __global__ void __launch_bounds__(256) topk_overlap_kernel(const std::uint32_t* 
     if (threadIdx.x == 0) atomicAdd(&g_topk_ovl[cls][0], sum);
 }
 static void topk_overlap_diag(const std::uint32_t* tokens, const std::uint32_t* n, unsigned C, hipStream_t s) {
-    if (!strix::envcfg::flag("STRIX_GLM_PF_TOPK_OVERLAP", false)) return;
+    static strix::env_arms::Resolved<bool> enabled;
+    if (!enabled.get([] { return strix::envcfg::flag("STRIX_GLM_PF_TOPK_OVERLAP", false); })) return;
     unsigned long long z[2][4] = {};
     ok(hipMemcpyToSymbolAsync(HIP_SYMBOL(g_topk_ovl), z, sizeof z, 0, hipMemcpyHostToDevice, s), "glm pf topk overlap clear");
     topk_overlap_kernel<<<(C + 7) / 8, 256, 0, s>>>(tokens, n, C);
