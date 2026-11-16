@@ -179,6 +179,17 @@ inline Resolved resolve(const Request& r, Entry entry, std::string_view default_
     return out;
 }
 
+inline ::strix::serve::Json forms_json(const qwen_prefill::Config::Forms& f, bool moe_route_bf16) {
+    using J = ::strix::serve::Json;
+    auto forms = J::object();
+    forms.set("hc_mma", J(f.hc_mma));
+    forms.set("mtp_mma", J(f.mtp_mma));
+    forms.set("qsa_mma", J(f.qsa_mma));
+    forms.set("moe_mma", J(f.moe_mma));
+    forms.set("moe_route_bf16", J(moe_route_bf16));
+    return forms;
+}
+
 inline std::string effective_config_json(const Resolved& r) {
     using J = ::strix::serve::Json;
     const auto& c = r.config;
@@ -186,13 +197,7 @@ inline std::string effective_config_json(const Resolved& r) {
     out.set("entry", J(entry_name(r.entry)));
     out.set("profile", J(pr::name(r.resolution.profile)));
     out.set("arithmetic_contract", J(r.contract));
-    auto forms = J::object();
-    forms.set("hc_mma", J(c.forms.hc_mma));
-    forms.set("mtp_mma", J(c.forms.mtp_mma));
-    forms.set("qsa_mma", J(c.forms.qsa_mma));
-    forms.set("moe_mma", J(c.forms.moe_mma));
-    forms.set("moe_route_bf16", J(c.moe_route_bf16.value_or(false)));
-    out.set("forms", std::move(forms));
+    out.set("forms", forms_json(c.forms, c.moe_route_bf16.value_or(false)));
     auto route = J::object();
     route.set("requested", J(c.route_policy->requested));
     route.set("effective", J(c.route_policy->enabled));
