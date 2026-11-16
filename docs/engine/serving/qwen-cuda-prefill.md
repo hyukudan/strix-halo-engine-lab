@@ -44,6 +44,8 @@ medians; ramp typed as `--blocks 1024,2048,4096,8192`, flat = the default):
 Identity: `qwen_tf_logits` logit dumps (64 teacher-forced rows, 8K and 32K prompts, 63,569,920 bytes each) are
 byte-identical between the ramp and the flat schedule, in the exact profile and in the FAST profile, so the FAST gate
 receipt is unchanged. Kit: `scripts/bench/cuda/qwen_fast/prefill_abab.sh` with the two arms above.
+These dumps establish target-logit equality only at the measured lengths. Complete recurrent, cache and MTP
+state equality across schedules remains an outstanding native qualification gate.
 
 `--final-block-rows N` optionally reserves a specific tail size after that
 transformation, moving rows between existing blocks without adding blocks. Zero

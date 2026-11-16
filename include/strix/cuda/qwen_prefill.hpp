@@ -102,6 +102,9 @@ struct Timing {
     double total_s = 0, first_block_s = 0;
     std::vector<double> block_s;       // per block, device time
     std::uint64_t rows = 0;
+    // Forms dispatched by this run, reported only after successful device synchronization.
+    Config::Forms executed_forms;
+    bool executed_moe_route_bf16 = false;
 };
 
 // One decode/verify step: rows consecutive tokens at positions [position, position + rows) continuing the session

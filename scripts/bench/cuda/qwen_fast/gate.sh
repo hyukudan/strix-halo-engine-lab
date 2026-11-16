@@ -73,6 +73,19 @@ if (c['entry'] != 'serve' or c['arithmetic_contract'] != contract
         or c['form_identities'] != ','.join(i for n, i in zip(names, ids) if forms[n])
         or fast != (sys.argv[2] == 'fast')):
     raise SystemExit('arm does not match resolved arithmetic contract')
+executions = c.get('executions')
+if not isinstance(executions, list) or not executions:
+    raise SystemExit('missing completed execution receipts')
+targets = ['hc_mma', 'qsa_mma', 'moe_mma', 'moe_route_bf16']
+for execution in executions:
+    active = execution['forms']
+    if (set(active) != set(forms) or any(type(v) is not bool for v in active.values())
+            or type(execution['rows']) is not int or execution['rows'] <= 0
+            or any(active[n] and not forms[n] for n in forms)
+            or any(active[n] != forms[n] for n in targets)):
+        raise SystemExit('invalid executed forms')
+    if any(active[n] for n in targets) != (sys.argv[2] == 'fast'):
+        raise SystemExit('arm has no executed target-changing form (MTP-only is not a target-logit gate)')
 print(json.dumps(c, sort_keys=True, separators=(',', ':')))
 PY
     ) || { echo "invalid effective configuration for $arm" >&2; exit 2; }
