@@ -17,6 +17,7 @@
 //             (:221-236); v_mul u*q (:238); scalar dot v_dual_fmac_f32 sum = w * x + sum over features tid, tid+256, ...
 //             ascending (:281); LDS tree strides 128..1, v_add_f32 (:301-401); 1/(1 + expf(-s)) (:416-457, IEEE div).
 #include "strix/env_flags.hpp"
+#include "strix/cuda/core/decode_rows.hpp"
 #include "strix/cuda/qwen_dense.hpp"
 
 #include <cuda_fp16.h>
@@ -737,6 +738,21 @@ __global__ __launch_bounds__(256) void shared_activation_kernel(float* workspace
 
 template <Store S> cudaError_t launch_project(cudaStream_t stream, const KSite& k, std::uint32_t rows, const std::int8_t* codes,
                                               const float* deltas, std::uint32_t pitch) {
+    // 9..16 rows (core::decode_rows_max): <= 8-row decode pieces. A piece sees rows r0.. through offset codes / deltas /
+    // outputs / gates; each (row, output) chain is row-local, so the bits are the tiled kernel's.
+    if (rows > core::kDecodePieceRows && rows <= core::decode_rows_max() && k.width <= 6144U && decode_rows_enabled()) {
+        constexpr std::uint64_t elem = S == Store::f32 || S == Store::f32_round_bf16 ? 4U : 2U;
+        for (std::uint32_t r0 = 0; r0 < rows; r0 += core::kDecodePieceRows) {
+            KSite p = k;
+            for (std::uint32_t m = 0; m < k.nseg; ++m)
+                p.seg[m].out = static_cast<unsigned char*>(k.seg[m].out) + std::uint64_t{r0} * k.seg[m].stride * elem;
+            if (p.gate) p.gate += std::uint64_t{r0} * k.gate_stride;
+            const cudaError_t e = launch_project<S>(stream, p, std::min(rows - r0, core::kDecodePieceRows),
+                                                    codes + std::uint64_t{r0} * k.width, deltas + r0, pitch);
+            if (e != cudaSuccess) return e;
+        }
+        return cudaSuccess;
+    }
     if (rows <= 8U && k.width <= 6144U && decode_rows_enabled())
         return rows_ksplit_enabled() ? (rows_cp_fits(k) && rows_cp_wanted(k, rows) ? launch_rows_cp<S>(stream, k, rows, codes, deltas, pitch)
                                                         : launch_rows_ks<S>(stream, k, rows, codes, deltas, pitch))

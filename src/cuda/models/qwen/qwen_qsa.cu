@@ -3,6 +3,7 @@
 // the gfx1151 disassembly of hip_indexed_attention_launcher (S: line numbers).
 // Every FP operation is an explicit IEEE intrinsic (__fadd_rn, __fmul_rn, __fmaf_rn, __fdiv_rn) in the HIP order.
 #include "strix/env_flags.hpp"
+#include "strix/cuda/core/decode_rows.hpp"
 #include "strix/cuda/qwen_qsa.hpp"
 #include "strix/cuda/vram_guard.hpp"
 
@@ -1042,10 +1043,10 @@ void attention_softmax(std::uint32_t rows, std::uint64_t first_position, float* 
 void attention_values(const float* q_gate, std::uint32_t rows, std::uint64_t first_position, const std::uint32_t* selected,
     const std::uint16_t* kv, const float* scores, float* attention_output, const amdmath::Tables& tables, cudaStream_t stream) {
     if (!rows) return;
-    if (rows <= 8U && decode_rows_enabled() && head_pipe_enabled())
+    if (rows <= core::decode_rows_max() && decode_rows_enabled() && head_pipe_enabled())   // per-(head, row) blocks: any row count
         attention_output_head_pipe_kernel<<<dim3(kHeads, rows), kOutThreads, 0, stream>>>(q_gate, first_position, selected, kv, scores,
             attention_output, tables);
-    else if (rows <= 8U && decode_rows_enabled())
+    else if (rows <= core::decode_rows_max() && decode_rows_enabled())
         attention_output_head_kernel<<<dim3(kHeads, rows), kOutThreads, 0, stream>>>(q_gate, first_position, selected, kv, scores,
             attention_output, tables);
     else
@@ -1120,7 +1121,7 @@ bool prepare_multi(const SegmentState* segs, std::uint32_t n, const Workspace& w
     map.first_row[n] = rows;
     // the output kernel per-segment layer_core chooses for each segment (head kernel: <= 8 rows with the decode kernels on);
     // the multi launch needs one choice for all, else per segment
-    const bool head_all = max_rows <= 8U && decode_rows_enabled(), rows_all = !decode_rows_enabled() || min_rows > 8U;
+    const bool head_all = max_rows <= core::decode_rows_max() && decode_rows_enabled(), rows_all = !decode_rows_enabled() || min_rows > core::decode_rows_max();
     if (rows > ws.chunk_rows || score_wave || !(head_all || rows_all)) return false;  // outside the multi-launch shapes
     // pooled keys per session (host-side valid counts, as layer_core), block-score waves, attention slots
     std::uint32_t pool = 0, waves = 0, slots = 0;
@@ -1230,7 +1231,7 @@ bool graph_shape(const std::uint32_t* seg_rows, std::uint32_t n, const Workspace
         pool += seg_rows[i] / kRatio + 1U;  // new complete blocks of a window that starts where the last one committed
         waves += (seg_rows[i] + kScoreRowsPerWave - 1U) / kScoreRowsPerWave * chunks;
     }
-    const bool head_all = max_rows <= 8U && decode_rows_enabled(), rows_all = !decode_rows_enabled() || min_rows > 8U;
+    const bool head_all = max_rows <= core::decode_rows_max() && decode_rows_enabled(), rows_all = !decode_rows_enabled() || min_rows > core::decode_rows_max();
     if (rows > ws.chunk_rows || score_wave || !(head_all || rows_all)) return false;
     static const std::uint32_t sms = [] {
         int dev = 0, count = 0;
