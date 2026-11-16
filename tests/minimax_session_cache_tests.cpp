@@ -529,6 +529,42 @@ int main() {
       std::memcpy(data.data() + 8 + header.size(), &value, sizeof(value));
       return data;
     };
+#ifdef __linux__
+    {
+      // Structurally valid EXL3 transport rejected only by value admission.
+      const auto model = dir / "nonfinite-pack";
+      std::filesystem::create_directories(model);
+      const std::string header = R"({"layer.trellis":{"dtype":"I16","shape":[8,8,32],"data_offsets":[0,4096]},"layer.suh":{"dtype":"F16","shape":[128],"data_offsets":[4096,4352]},"layer.svh":{"dtype":"F16","shape":[128],"data_offsets":[4352,4608]}})";
+      Bytes data(8 + header.size() + 4608, 0);
+      const auto length = static_cast<std::uint64_t>(header.size());
+      std::memcpy(data.data(), &length, 8);
+      std::memcpy(data.data() + 8, header.data(), header.size());
+      for (std::size_t at = 4096; at < 4608; at += 2) {
+        data[8 + header.size() + at] = 0;
+        data[8 + header.size() + at + 1] = 0x3c; // F16 one
+      }
+      atomic_write(model / "model.safetensors", data);
+      { strix::minimax::engine::detail::PackReader valid(model.string());
+        check(valid.weight_map().size() == 1, "finite transform fixture admitted"); }
+      data[8 + header.size() + 4097] = 0x7c; // F16 infinity
+      atomic_write(model / "model.safetensors", data);
+      const auto fd_count = [] {
+        std::size_t count = 0;
+        for ([[maybe_unused]] const auto& entry : std::filesystem::directory_iterator("/proc/self/fd")) ++count;
+        return count;
+      };
+      const auto before = fd_count();
+      for (unsigned attempt = 0; attempt < 8; ++attempt) {
+        bool refused = false;
+        try { strix::minimax::engine::detail::PackReader invalid(model.string()); }
+        catch (const std::runtime_error& error) {
+          refused = std::string_view(error.what()).starts_with("MiniMax admission:");
+        }
+        check(refused, "nonfinite transform rejected by admission");
+        check(fd_count() == before, "rejected PackReader construction closes every descriptor");
+      }
+    }
+#endif
     for (const auto& name : {"visible.safetensors", ".weights.safetensors", ".cache/weights.safetensors", "sub/.cache/opaque-shard"}) {
       const auto path = dir / "model" / name;
       std::filesystem::create_directories(path.parent_path());

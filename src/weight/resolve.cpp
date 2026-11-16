@@ -75,12 +75,17 @@ static Status resolve_impl(const Registry& registry, const ResolveRequest& r, st
     }
     // A measured decision is valid only for this exact compiler/device/regime and arithmetic.
     // Iterate in registration order to keep ties deterministic.
-    if (r.use_qualified_decisions) for (const auto& c : candidates) {
+    const auto incumbent = std::find_if(candidates.begin(), candidates.end(), [&](const auto& c) { return c.kernel == r.incumbent; });
+    if (r.use_qualified_decisions && !(r.build_identity == Digest256{}) && incumbent != candidates.end()) for (const auto& c : candidates) {
         if (!eligible(r, c)) continue;
         for (const auto& q : qualifications) {
-            if (!validate_qualification(q) || q.incumbent != r.incumbent || q.replacement != c.kernel ||
+            if (!validate_qualification(q) || !(q.build_identity == r.build_identity) ||
+                !(q.incumbent_implementation == incumbent->implementation) || !(q.replacement_implementation == c.implementation) ||
                 !(q.arithmetic == r.required_arithmetic) || q.compiler_id != r.hardware.compiler_id ||
                 q.device_class != r.hardware.device_class || q.shape_regime != shape_regime(r.workload)) continue;
+            // Persistent content IDs become local dispatch IDs only after matching
+            // the loaded build and an unambiguous implementation registration.
+            if (std::count_if(candidates.begin(), candidates.end(), [&](const auto& candidate) { return candidate.implementation == c.implementation; }) != 1) continue;
             if (c.exactness == Exactness::fast && !q.quality_passed) continue;
             selected = &c; receipt = q.receipt; break;
         }

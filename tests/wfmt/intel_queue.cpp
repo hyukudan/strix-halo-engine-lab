@@ -48,8 +48,9 @@ void wfmt_intel_queue_test() {
   require(i::copy({context.stream},out,bytes->data(),bytes->size())==i::Status::ok,"queued image copy");
   return w::Status{w::Error::ok,{}};
  };
- api->retire=[&](void* pointer,std::vector<void*> events,w::ExecutionContext) {
-  for(auto* event:events) {
+ api->retire=[&](void* pointer,w::Retirement retirement,w::ExecutionContext) {
+  require(retirement.unresolved_streams.empty(),"retired image with an unresolved last-use stream");
+  for(auto* event:retirement.events) {
    require(api->event_complete(event),"retired image before last use completed");
    api->destroy_event(event);
   }

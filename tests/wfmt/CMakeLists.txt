@@ -30,13 +30,14 @@ add_executable(strix-wfmt-host-tests main.cpp contracts.cpp census.cpp compare.c
     reference.cpp geometry.cpp fixtures/iq3_s_cases.cpp
     resolve.cpp cache.cpp effective_config.cpp runtime.cpp readers.cpp admission.cpp reference_admission.cpp cpu.cpp intel.cpp
     ${WFMT_ROOT}/src/vision/gguf_weights.cpp
-    ${WFMT_ROOT}/src/gemma4/model/safetensors.cpp)
+    ${WFMT_ROOT}/src/gemma4/model/safetensors.cpp
+    ${WFMT_ROOT}/src/core/weight_archive.cpp)
 target_link_libraries(strix-wfmt-host-tests PRIVATE strix-weight strix_backend_cpu strix_intel_core)
 target_include_directories(strix-wfmt-host-tests PRIVATE ${WFMT_ROOT}/src ${WFMT_ROOT}/apps)
 target_compile_definitions(strix-wfmt-host-tests PRIVATE STRIX_WFMT_SOURCE_DIR="${WFMT_ROOT}")
 if(MSVC)
     target_compile_options(strix-weight PRIVATE /fp:strict)
-    target_compile_options(strix-wfmt-host-tests PRIVATE /fp:strict)
+    target_compile_options(strix-wfmt-host-tests PRIVATE /fp:strict /D_CRT_SECURE_NO_WARNINGS)
 else()
     target_compile_options(strix-weight PRIVATE -ffp-contract=off)
     target_compile_options(strix-wfmt-host-tests PRIVATE -ffp-contract=off)
@@ -91,4 +92,8 @@ if(UNIX)
 endif()
 find_package(Python3 REQUIRED COMPONENTS Interpreter)
 add_test(NAME wfmt.tools COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_LIST_DIR}/test_tools.py)
-set_tests_properties(wfmt.tools PROPERTIES ENVIRONMENT "PYTHONDONTWRITEBYTECODE=1")
+add_test(NAME wfmt.legacy-source COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_LIST_DIR}/test_legacy_compare.py)
+set_tests_properties(wfmt.tools wfmt.legacy-source PROPERTIES ENVIRONMENT "PYTHONDONTWRITEBYTECODE=1")
+
+add_test(NAME wfmt.capture-source COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_LIST_DIR}/capture_source.py)
+set_tests_properties(wfmt.capture-source PROPERTIES ENVIRONMENT "PYTHONDONTWRITEBYTECODE=1")

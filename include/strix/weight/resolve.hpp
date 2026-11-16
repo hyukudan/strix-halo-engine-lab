@@ -29,6 +29,9 @@ struct Candidate {
   Backend backend; Strategy strategy; Exactness exactness;
   std::uint64_t required_isa; Resources resources; CostDescriptor cost;
   Status (*validate)(const WeightView&, const Workload&, const Hardware&) = nullptr;
+  // Content identity verified by the dispatch registrar against the loaded
+  // implementation (including reductions/tails), never copied from a receipt.
+  Digest256 implementation{};
 };
 struct ResolveRequest {
   const WeightMapEntry* tensor; Hardware hardware; Workload workload;
@@ -36,10 +39,14 @@ struct ResolveRequest {
   KernelId incumbent; bool allow_fast;
   bool override_strategy; Strategy forced_strategy;
   bool use_qualified_decisions = true;
+  // Verified content digest of the loaded executable and kernel modules.
+  // A source commit/compiler label is insufficient. Absent identity fails closed.
+  Digest256 build_identity{};
 };
 struct Qualification {
   Digest256 receipt; std::string device_class, compiler_id, shape_regime;
-  KernelId incumbent, replacement; ArithmeticId arithmetic;
+  Digest256 build_identity, incumbent_implementation, replacement_implementation;
+  ArithmeticId arithmetic;
   bool byte_equal, faster, quality_passed;
 };
 struct Plan {

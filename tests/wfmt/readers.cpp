@@ -59,13 +59,25 @@ bool wfmt_readers_test() try {
     std::filesystem::create_directory(directory);const auto path=directory/"model.safetensors";
     struct Cleanup{std::filesystem::path p;~Cleanup(){std::error_code ec;std::filesystem::remove(p,ec);std::filesystem::remove(p.parent_path(),ec);}} cleanup{path};
     {std::ofstream f(path,std::ios::binary);f.write(reinterpret_cast<const char*>(wire.data()),std::streamsize(wire.size()));}
+    std::weak_ptr<strix::gemma4::MappedFile> mapped_owner;
+    Slice mapped_slice;
     {
         auto gemma=strix::gemma4::read_safetensors(path);check(gemma.tensors.size()==2,"Gemma common parser tensor census");
         const auto& tensor=gemma.tensors[0];check(tensor.dtype=="BF16" && tensor.shape==std::vector<std::uint64_t>({2,2}) && tensor.bytes==8,"Gemma legacy type/shape preserved");
         check(std::memcmp(gemma.storage->data()+tensor.offset,wire.data()+tensor.offset,8)==0,"Gemma mapped operand bytes unchanged");
         strix::h3::block::SafeTensors h3(path.string());const auto values=h3.read_vec<std::uint16_t>("a.weight",strix::h3::block::StDtype::bf16);
         check(values.size()==4 && std::memcmp(values.data(),wire.data()+tensor.offset,8)==0,"H3 legacy read_vec bytes unchanged");
+        mapped_owner=gemma.storage;mapped_slice=gemma.index.tensors[0].payload;
     }
+    check(!mapped_owner.expired(),"Gemma admission retains the execution mapping itself");
+    std::array<Byte,8> mapped_bytes{};
+    check(bool(read_slice(mapped_slice,mapped_bytes)),"Gemma slice survives wrapper destruction");
+    {
+        const auto mapping=mapped_owner.lock();
+        check(std::memcmp(mapped_bytes.data(),mapping->data()+mapped_slice.range.offset,8)==0,"Gemma admission and execution use the same backing bytes");
+    }
+    mapped_slice={};
+    check(mapped_owner.expired(),"Gemma mapping released after its last slice");
     std::shared_ptr<const Source> file;check(bool(open_source(path.string(),file)),"file source open");
     const auto digest=file->identity();check(digest.bytes==digest_bytes(wire).bytes,"source identity is SHA256 content, not metadata");
     TensorIndex file_index;check(bool(index_safetensors(file,file_index)),"file index");

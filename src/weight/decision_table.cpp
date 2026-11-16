@@ -8,7 +8,8 @@
 namespace strix::weight {
 Status validate_qualification(const Qualification& q) {
     if (q.receipt == Digest256{} || q.device_class.empty() || q.compiler_id.empty() || q.shape_regime.empty() ||
-        !q.incumbent || !q.replacement || !q.byte_equal || !q.faster || q.arithmetic.name.empty() || !q.arithmetic.revision)
+        q.build_identity == Digest256{} || q.incumbent_implementation == Digest256{} ||
+        q.replacement_implementation == Digest256{} || !q.byte_equal || !q.faster || q.arithmetic.name.empty() || !q.arithmetic.revision)
         return {Error::unqualified, "measured decision requires content receipt, compiler, device, regime and byte-equal faster evidence"};
     return {Error::ok, {}};
 }
@@ -54,25 +55,29 @@ Status import_decisions(std::string_view json, DecisionTable& out) {
     try {
         const auto root=strix::serve::parse_json_unique(json);
         const auto* schema=root.find("schema"); const auto* rows=root.find("decisions");
-        if (!schema || schema->as_string()!="wfmt.decisions@1" || !rows || !rows->is_array())
+        if (!schema || schema->as_string()!="wfmt.decisions@2" || !rows || !rows->is_array())
             return {Error::malformed,"unknown decision schema"};
         for (const auto& [key,value]:root.as_object()) { (void)value; if (key!="schema" && key!="decisions") return {Error::malformed,"unknown decision table key"}; }
         DecisionTable table; std::set<std::string> keys;
         for (const auto& row:rows->as_array()) {
             auto field=[&](const char* name) -> const strix::serve::Json& { const auto* v=row.find(name); if (!v) throw std::runtime_error(std::string("missing ")+name); return *v; };
-            const std::set<std::string> allowed{"receipt","device_class","compiler_id","compiler_flags","source_commit","shape_regime","incumbent","replacement","arithmetic","byte_equal","faster","quality_passed"};
+            const std::set<std::string> allowed{"receipt","build_identity","device_class","compiler_id","compiler_flags","source_commit","shape_regime","incumbent","replacement","arithmetic","byte_equal","faster","quality_passed"};
             for (const auto& [key,value]:row.as_object()) { (void)value; if (!allowed.contains(key)) throw std::runtime_error("unknown decision semantic key"); }
             Qualification q{};
             auto hex=[](char c) -> int { if(c>='0' && c<='9') return c-'0'; if(c>='a' && c<='f') return c-'a'+10; if(c>='A' && c<='F') return c-'A'+10; return -1; };
-            const auto& receipt=field("receipt").as_string(); if(receipt.size()!=64) throw std::runtime_error("invalid byte receipt digest");
-            for(std::size_t i=0;i<32;++i) { int a=hex(receipt[2*i]),b=hex(receipt[2*i+1]); if(a<0 || b<0) throw std::runtime_error("invalid receipt hex"); q.receipt.bytes[i]=static_cast<std::uint8_t>(a*16+b); }
+            auto digest=[&](const char* name) {
+                Digest256 result{}; const auto& value=field(name).as_string();
+                if(value.size()!=64) throw std::runtime_error("invalid content digest length");
+                for(std::size_t i=0;i<32;++i) { int a=hex(value[2*i]),b=hex(value[2*i+1]); if(a<0 || b<0) throw std::runtime_error("invalid content digest hex"); result.bytes[i]=static_cast<std::uint8_t>(a*16+b); }
+                return result;
+            };
+            q.receipt=digest("receipt"); q.build_identity=digest("build_identity");
+            q.incumbent_implementation=digest("incumbent"); q.replacement_implementation=digest("replacement");
             const auto& commit=field("source_commit").as_string();
             if ((commit.size()!=40 && commit.size()!=64) || !std::all_of(commit.begin(),commit.end(),[&](char c){return hex(c)>=0;})) throw std::runtime_error("missing source commit identity");
             const auto& flags=field("compiler_flags").as_string(); if(flags.empty()) throw std::runtime_error("missing compiler flags");
             q.device_class=field("device_class").as_string(); q.compiler_id=field("compiler_id").as_string()+"|"+flags;
             q.shape_regime=field("shape_regime").as_string();
-            auto id=[&](const char* name) { const auto n=field(name).as_int(); if(n<=0 || n>UINT32_MAX) throw std::runtime_error("invalid kernel id"); return static_cast<KernelId>(n); };
-            q.incumbent=id("incumbent"); q.replacement=id("replacement");
             const auto& arithmetic=field("arithmetic").as_string(); const auto at=arithmetic.rfind('@');
             if(at==std::string::npos || at==0) throw std::runtime_error("unversioned arithmetic id");
             std::uint32_t revision=0; const auto parsed=std::from_chars(arithmetic.data()+at+1,arithmetic.data()+arithmetic.size(),revision);
@@ -81,7 +86,7 @@ Status import_decisions(std::string_view json, DecisionTable& out) {
             q.arithmetic={*table.owned_arithmetic.back(),revision};
             q.byte_equal=field("byte_equal").as_bool(); q.faster=field("faster").as_bool(); q.quality_passed=field("quality_passed").as_bool();
             auto status=validate_qualification(q); if(!status) return status;
-            const auto key=q.device_class+"/"+q.compiler_id+"/"+q.shape_regime+"/"+std::to_string(q.incumbent)+"/"+std::to_string(q.replacement)+"/"+serialize_id(q.arithmetic);
+            const auto key=q.device_class+"/"+q.compiler_id+"/"+q.shape_regime+"/"+field("build_identity").as_string()+"/"+field("incumbent").as_string()+"/"+field("replacement").as_string()+"/"+serialize_id(q.arithmetic);
             if(!keys.insert(key).second) throw std::runtime_error("duplicate measured decision");
             table.entries.push_back(q); table.source_commits.push_back(commit); table.compiler_flags.push_back(flags);
         }

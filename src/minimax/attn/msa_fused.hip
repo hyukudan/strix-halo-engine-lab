@@ -2663,27 +2663,81 @@ void audit_prefill_index(const PrefillView& p, hipStream_t stream) {
 namespace {
 std::FILE* g_select_dump = nullptr;
 
+// Dump-session staging, reused across batches. Pinned async copies remove the previous pageable staging path;
+// the root cause of the observed 32K fault remains unproven. Clean runs alone establish neither causality nor equality.
+// Callers must serialize set_select_dump and all dump producers, including recovery after an exception.
+struct SelectDumpHost {
+    std::uint32_t* cnt = nullptr;
+    std::uint32_t* ids = nullptr;
+    std::size_t cap = 0;  // entries of cnt (ids holds cap * kTopK)
+    hipStream_t stream = nullptr;
+    bool pending = false;  // separate flag: the default (null) stream is valid
+
+    void drain() {
+        if (!pending) return;
+        hip_check(hipStreamSynchronize(stream), "minimax select dump sync");
+        pending = false;
+    }
+    void release() {
+        drain();  // also covers a failed enqueue after an earlier successful copy
+        if (cnt != nullptr) hip_check(hipHostFree(cnt), "minimax select dump free staging");
+        cnt = ids = nullptr;
+        cap = 0;
+    }
+    SelectDumpHost() = default;
+    SelectDumpHost(const SelectDumpHost&) = delete;
+    SelectDumpHost& operator=(const SelectDumpHost&) = delete;
+    ~SelectDumpHost() {
+        try { release(); }
+        catch (const std::exception& e) {
+            // A failed drain must not free storage that a queued copy may still use.
+            std::fprintf(stderr, "minimax select dump cleanup: %s\n", e.what());
+        }
+    }
+};
+SelectDumpHost g_select_host;
+
+void select_host_reserve(std::size_t rg) {
+    g_select_host.drain();
+    if (rg <= g_select_host.cap) return;
+    g_select_host.release();
+    // One owned allocation avoids a partially allocated pair when allocation fails.
+    hip_check(hipHostMalloc(reinterpret_cast<void**>(&g_select_host.cnt), rg * (1 + kTopK) * sizeof(std::uint32_t),
+                            hipHostMallocDefault), "minimax select dump pinned staging");
+    g_select_host.ids = g_select_host.cnt + rg;
+    g_select_host.cap = rg;
+}
+
 // One record per sparse batch (msa_select_dump.hpp): the ids the attend launch selected for [first_window * 16, rows).
 void dump_prefill_select(const PrefillView& p, hipStream_t stream) {
     const DecodeView& v = p.window;
-    const std::size_t r0 = std::size_t{p.first_window} * kMaxRows, rows = p.rows - r0, rg = rows * v.kv_heads;
-    std::vector<std::uint32_t> cnt(rg), ids(rg * kTopK);
-    hip_check(hipStreamSynchronize(stream), "minimax select dump sync");
-    hip_check(hipMemcpy(cnt.data(), v.idx_count + r0 * v.kv_heads, rg * sizeof(std::uint32_t), hipMemcpyDeviceToHost),
-          "minimax select dump counts");
-    hip_check(hipMemcpy(ids.data(), v.idx + r0 * v.kv_heads * kTopK, rg * kTopK * sizeof(std::uint32_t), hipMemcpyDeviceToHost),
-          "minimax select dump ids");
+    const std::size_t r0 = std::size_t{p.first_window} * kMaxRows;
+    if (p.rows <= r0) throw std::invalid_argument("minimax select dump: no sparse rows in the batch");
+    const std::size_t rows = p.rows - r0, rg = rows * v.kv_heads;
+    select_host_reserve(rg);
+    g_select_host.stream = stream;
+    g_select_host.pending = true;  // set before enqueue: failures must still drain before reuse/free
+    hip_check(hipMemcpyAsync(g_select_host.cnt, v.idx_count + r0 * v.kv_heads, rg * sizeof(std::uint32_t), hipMemcpyDeviceToHost,
+                             stream),
+              "minimax select dump counts");
+    hip_check(hipMemcpyAsync(g_select_host.ids, v.idx + r0 * v.kv_heads * kTopK, rg * kTopK * sizeof(std::uint32_t),
+                             hipMemcpyDeviceToHost, stream),
+              "minimax select dump ids");
+    g_select_host.drain();
+    const std::uint32_t* const cnt = g_select_host.cnt;
+    const std::uint32_t* const ids = g_select_host.ids;
     const std::uint64_t pos = p.pos0 + r0;
     const std::uint32_t head[8] = {0x444C4553U, 1U, aidx::wmma_mode(aidx::kModeExact), static_cast<std::uint32_t>(pos),
                                    static_cast<std::uint32_t>(pos >> 32), static_cast<std::uint32_t>(rows), v.kv_heads, kTopK};
     if (std::fwrite(head, sizeof(head), 1, g_select_dump) != 1 ||
-        std::fwrite(cnt.data(), sizeof(std::uint32_t), cnt.size(), g_select_dump) != cnt.size() ||
-        std::fwrite(ids.data(), sizeof(std::uint32_t), ids.size(), g_select_dump) != ids.size())
+        std::fwrite(cnt, sizeof(std::uint32_t), rg, g_select_dump) != rg ||
+        std::fwrite(ids, sizeof(std::uint32_t), rg * kTopK, g_select_dump) != rg * kTopK)
         throw std::runtime_error("minimax select dump: short write");
 }
 }  // namespace
 
 void set_select_dump(const char* path) {
+    g_select_host.release();  // retain the session for retry if draining/freeing fails
     if (g_select_dump != nullptr) {
         std::FILE* const f = g_select_dump;
         g_select_dump = nullptr;

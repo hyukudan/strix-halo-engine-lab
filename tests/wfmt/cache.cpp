@@ -8,12 +8,13 @@ namespace {
 using namespace strix::weight;
 struct Memory final : Source {
     std::array<Byte,16> bytes{};
+    std::function<void()> on_identity;
     Status read(ByteRange r, std::span<Byte> out) const override {
         if (r.offset>bytes.size() || r.bytes>bytes.size()-r.offset || out.size()!=r.bytes) return {Error::malformed,"range"};
         std::memcpy(out.data(),bytes.data()+r.offset,out.size()); return {Error::ok,{}};
     }
     std::uint64_t size() const noexcept override { return bytes.size(); }
-    Digest256 identity() const override { return digest_bytes(bytes); }
+    Digest256 identity() const override { if (on_identity) on_identity(); return digest_bytes(bytes); }
 };
 }
 bool wfmt_cache_test() {
@@ -46,18 +47,29 @@ bool wfmt_cache_test() {
     auto callbacks=std::make_shared<RuntimeCallbacks>(*context.callbacks);
     auto convert=callbacks->convert; auto allocate=callbacks->allocate; auto retire=callbacks->retire;
     callbacks->allocate=[&](std::uint64_t bytes,void*& data) { ++allocations; return allocate(bytes,data); };
-    callbacks->convert=[&](const WeightView& v,const Plan& p,void* data,ExecutionContext& c) { ++conversions; std::this_thread::yield(); return convert(v,p,data,c); };
+    std::promise<void> conversion_started, allow_conversion;
+    auto release_conversion=allow_conversion.get_future().share();
+    callbacks->convert=[&](const WeightView& v,const Plan& p,void* data,ExecutionContext& c) { ++conversions; conversion_started.set_value(); release_conversion.wait(); return convert(v,p,data,c); };
     callbacks->event_complete=[&](void*) { return complete.load(); };
-    callbacks->retire=[&](void* data,std::vector<void*> events,ExecutionContext c) { ++retired; retire(data,std::move(events),std::move(c)); };
+    callbacks->retire=[&](void* data,Retirement pending,ExecutionContext c) { ++retired; retire(data,std::move(pending),std::move(c)); };
     context.callbacks=callbacks;
     ImageCache concurrent(16);
     auto acquire=[&] { ImageLease lease; auto local=context; if (!acquire_image(concurrent,changed,plan,view,local,lease)) return ImageLease{}; return lease; };
-    auto a=std::async(std::launch::async,acquire); auto b=std::async(std::launch::async,acquire);
-    auto la=a.get(); auto lb=b.get();
-    if (!la || !lb || la.data()!=lb.data() || conversions!=1 || allocations!=1) return false;
+    auto a=std::async(std::launch::async,acquire);
+    conversion_started.get_future().wait();
+    std::promise<void> second_started;
+    std::atomic<bool> entered=false;
+    source->on_identity=[&] { if (!entered.exchange(true)) second_started.set_value(); };
+    auto b=std::async(std::launch::async,acquire);
+    second_started.get_future().wait();
+    const bool blocked=b.wait_for(std::chrono::milliseconds(20))==std::future_status::timeout;
+    allow_conversion.set_value();
+    auto la=a.get(); auto lb=b.get(); source->on_identity={};
+    if (!blocked || !la || !lb || la.data()!=lb.data() || conversions!=1 || allocations!=1) return false;
     la=ImageLease{}; lb=ImageLease{};
     if (concurrent.evict_completed(16)!=0) return false;
     complete=true; if (concurrent.evict_completed(16)!=16 || retired!=1) return false;
+    callbacks->convert=convert;
     // Every failure releases its reservation and allows a subsequent successful acquisition.
     callbacks->convert=[](const WeightView&,const Plan&,void*,ExecutionContext&) -> Status { return {Error::device_failure,"injected conversion failure"}; };
     ImageCache failed(16);
@@ -72,5 +84,51 @@ bool wfmt_cache_test() {
     callbacks->record_event=cpu_execution_context().callbacks->record_event;
     callbacks->allocate=[](std::uint64_t,void*&) -> Status { return {Error::memory_budget,"injected allocation failure"}; };
     ImageCache allocation_failure(16);
-    return acquire_image(allocation_failure,changed,plan,view,context,first).code==Error::memory_budget && allocation_failure.bytes_reserved()==0;
+    if (acquire_image(allocation_failure,changed,plan,view,context,first).code!=Error::memory_budget || allocation_failure.bytes_reserved()!=0) return false;
+    // A failed last-use on B must survive both explicit recording and destructor retry.
+    int stream_a=0, stream_b=0;
+    auto pending_callbacks=std::make_shared<RuntimeCallbacks>(*cpu_execution_context().callbacks);
+    Retirement pending; void* retired_data=nullptr;
+    pending_callbacks->retire=[&](void* data,Retirement item,ExecutionContext) { retired_data=data; pending=std::move(item); };
+    auto ca=cpu_execution_context(); ca.callbacks=pending_callbacks; ca.stream=&stream_a;
+    auto cb=ca; cb.stream=&stream_b;
+    {
+        ImageCache last_use(16); ImageLease a_lease,b_lease;
+        if (!acquire_image(last_use,changed,plan,view,ca,a_lease) || !acquire_image(last_use,changed,plan,view,cb,b_lease)) return false;
+        pending_callbacks->record_event=[&](ExecutionContext& c,void*& event) -> Status {
+            if (c.stream==&stream_b) return {Error::device_failure,"B last-use failure"};
+            event=nullptr; return {Error::ok,{}};
+        };
+        if (record_last_use(b_lease,cb)) return false;
+    }
+    if (!retired_data || pending.unresolved_streams.size()!=1 || pending.unresolved_streams[0]!=&stream_b) return false;
+    pending_callbacks->free(retired_data); pending={}; retired_data=nullptr;
+    // Deferred failures and completed-entry eviction retain admission charges.
+    pending_callbacks->record_event=cpu_execution_context().callbacks->record_event;
+    pending_callbacks->convert=[](const WeightView&,const Plan&,void*,ExecutionContext&) -> Status { return {Error::device_failure,"conversion"}; };
+    ImageCache deferred(16);
+    if (acquire_image(deferred,changed,plan,view,ca,first) || deferred.bytes_reserved()!=16) return false;
+    if (acquire_image(deferred,changed,plan,view,ca,first).code!=Error::memory_budget) return false;
+    pending_callbacks->free(retired_data); pending={}; retired_data=nullptr;
+    if (deferred.bytes_reserved()!=0) return false;
+    pending_callbacks->convert=convert;
+    if (!acquire_image(deferred,changed,plan,view,ca,first)) return false;
+    first={}; deferred.evict_completed(16);
+    if (deferred.bytes_reserved()!=16 || acquire_image(deferred,changed,plan,view,ca,first).code!=Error::memory_budget) return false;
+    pending_callbacks->free(retired_data); pending={}; retired_data=nullptr;
+    pending_callbacks->record_event=[](ExecutionContext&,void*&) -> Status { return {Error::device_failure,"readiness"}; };
+    if (acquire_image(deferred,changed,plan,view,ca,first) || deferred.bytes_reserved()!=16) return false;
+    if (acquire_image(deferred,changed,plan,view,ca,first).code!=Error::memory_budget) return false;
+    pending_callbacks->free(retired_data); pending={}; retired_data=nullptr;
+    pending_callbacks->record_event=cpu_execution_context().callbacks->record_event;
+    // Async conversion workspace remains charged until readiness completes.
+    complete=false; pending_callbacks->event_complete=[&](void*) { return complete.load(); };
+    plan.selected.resources.workspace_bytes=8;
+    ImageCache workspace(24);
+    if (!acquire_image(workspace,changed,plan,view,ca,first) || workspace.bytes_reserved()!=24) return false;
+    complete=true;
+    if (!record_last_use(first,ca) || workspace.bytes_reserved()!=16) return false;
+    first={}; workspace.evict_completed(24);
+    pending_callbacks->free(retired_data); pending={};
+    return workspace.bytes_reserved()==0;
 }
