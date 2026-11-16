@@ -21,6 +21,8 @@
 #include "minimax/moe/mmx_moe.hpp"
 #include "minimax/moe/mmx_prefill.hpp"
 #include "minimax/moe/mmx_prefill_core.hpp"
+#include "minimax/attn/msa_norm_rope.hpp"
+#include "attn_core/wmma_types.hpp"
 #include "minimax/moe/mmx_trellis_device.hpp"
 #include "minimax_gate_common.hpp"
 #include "strix/hip_minimax_moe.hpp"
@@ -43,6 +45,23 @@
 namespace {
 
 namespace opt = strix::minimax::moe::opt;
+
+// The MSA flash prologue on an FP32 q (msa_flash_policy.hpp query + sparse_flash_keysplit.hpp staging): one wave per
+// (row, 128-dim head), load4 layout, norm_rope_lane, pack2<bf16>; lo = the Split terms. Reference for the q image.
+__global__ void msa_q_image_ref(const float* q, const float* w, const strix::minimax::msa::RopeRow* rope, unsigned rows, unsigned n,
+                                std::uint16_t* hi, std::uint16_t* lo) {
+    namespace tile = strix::attn_core::tile;
+    constexpr tile::Operand O = tile::Operand::bf16;
+    const unsigned wave = (blockIdx.x * blockDim.x + threadIdx.x) >> 5U, lane = threadIdx.x & 31U, heads = n / 128U;
+    if (wave >= rows * heads) return;
+    const unsigned row = wave / heads, h = wave % heads;
+    const std::size_t at = static_cast<std::size_t>(row) * n + h * 128U + lane * 4U;
+    float x[4] = {q[at], q[at + 1], q[at + 2], q[at + 3]};
+    strix::minimax::msa::norm_rope_lane(x, w, rope[row], lane);
+    *reinterpret_cast<uint2*>(hi + at) = make_uint2(tile::pack2<O>(x[0], x[1]), tile::pack2<O>(x[2], x[3]));
+    for (unsigned d = 0; d < 4U; ++d) x[d] -= tile::operand_value<O>(tile::to_operand<O>(x[d]));
+    *reinterpret_cast<uint2*>(lo + at) = make_uint2(tile::pack2<O>(x[0], x[1]), tile::pack2<O>(x[2], x[3]));
+}
 namespace mref = strix::minimax::moe;
 
 constexpr unsigned H = opt::kHidden, IR = opt::kInter;
@@ -1663,6 +1682,80 @@ struct Bench {
             free_group(f);
         }
     }
+    // Chunk invariance (STRIX_MMX_PF_ORDER=invariant): the same rows through one device call per chunk of 256, 1024,
+    // 4096 and the whole call, plus 4096 + 1..17 row tails, are bitwise equal. Adaptive is the negative control.
+    void run_chunked(const Prefill& q, const opt::ExpertSlices* ex_d, unsigned T, unsigned seg, float* out) {
+        const std::size_t bytes = opt::prefill_moe_workspace_bound(std::min(seg, T));
+        void* ws = nullptr;
+        hip_ok(hipMalloc(&ws, bytes), "chunk ws");
+        for (unsigned c0 = 0; c0 < T; c0 += seg) {
+            const unsigned n = std::min(seg, T - c0);
+            std::vector<std::uint32_t> routes(std::size_t{n} * 8);
+            for (unsigned t = 0; t < n; ++t)
+                for (unsigned k = 0; k < 4; ++k) {
+                    const std::size_t g = std::size_t{c0} + t;
+                    routes[std::size_t{t} * 4 + k] = q.ids[g * 4 + k];
+                    std::memcpy(&routes[std::size_t{n} * 4 + std::size_t{t} * 4 + k], &q.w4[g * 4 + k], 4);
+                }
+            auto* routes_d = dalloc<std::uint32_t>(routes.size());
+            hip_ok(hipMemcpy(routes_d, routes.data(), routes.size() * 4, hipMemcpyHostToDevice), "routes");
+            opt::PrefillMoeDeviceView dv;
+            dv.rows = n;
+            dv.y = q.yy + std::size_t{c0} * H;
+            dv.routes = routes_d;
+            dv.experts = ex_d;
+            dv.shared = L.shared;
+            dv.out = out + std::size_t{c0} * H;
+            opt::enqueue_prefill_moe_device(dv, ws, bytes, nullptr);
+            hip_ok(hipDeviceSynchronize(), "chunked call");
+            opt::prefill_moe_device_check();
+            hip_ok(hipFree(routes_d), "free");
+        }
+        hip_ok(hipFree(ws), "free");
+    }
+    void test_prefill_chunk_invariance() {
+        struct Case { unsigned T; std::vector<unsigned> segs; };
+        std::vector<Case> cases = {{8192, {256, 1024, 4096}}};
+        for (unsigned t = 1; t <= 17; ++t) cases.push_back({4096 + t, {4096}});
+        for (unsigned t = 1; t <= 17; ++t) cases.push_back({t, {1}});
+        for (const Case& k : cases) {
+            Prefill q = make_prefill(k.T);
+            auto* ex_d = dalloc<opt::ExpertSlices>(opt::kExperts);
+            hip_ok(hipMemcpy(ex_d, q.ex.data(), opt::kExperts * sizeof(opt::ExpertSlices), hipMemcpyHostToDevice), "experts");
+            float* whole = dalloc<float>(std::size_t{k.T} * H);
+            float* part = dalloc<float>(std::size_t{k.T} * H);
+            bool control_differs = false;
+            for (int order : {1, 0}) {
+                opt::set_prefill_moe_order(order);
+                hip_ok(hipMemset(whole, 0xff, std::size_t{k.T} * H * 4), "poison");
+                run_chunked(q, ex_d, k.T, k.T, whole);
+                const auto ref = d2h(whole, std::size_t{k.T} * H);
+                for (unsigned seg : k.segs) {
+                    hip_ok(hipMemset(part, 0xff, std::size_t{k.T} * H * 4), "poison");
+                    run_chunked(q, ex_d, k.T, seg, part);
+                    std::size_t at = 0;
+                    const bool same = same_bits(ref, d2h(part, std::size_t{k.T} * H), &at);
+                    if (order == 1) {
+                        check(same, "chunk invariance T=" + std::to_string(k.T) + " seg=" + std::to_string(seg) +
+                                    " differs at " + std::to_string(at));
+                        std::printf("prefill chunk invariance T=%u seg=%u invariant: bitwise\n", k.T, seg);
+                    } else {
+                        control_differs |= !same;
+                    }
+                }
+            }
+            opt::set_prefill_moe_order(-1);
+            if (k.T == 8192) {
+                check(control_differs, "negative control: adaptive split should change bits with chunking");
+                std::printf("prefill chunk invariance T=8192 adaptive control: differs (expected)\n");
+            }
+            std::fflush(stdout);
+            hip_ok(hipFree(whole), "free");
+            hip_ok(hipFree(part), "free");
+            hip_ok(hipFree(ex_d), "free");
+            free_prefill(q);
+        }
+    }
     // Whole calls, interleaved: A = one device-planned call per chunk, B = the group-wide call (same bits).
     void bench_prefill_group() {
         for (unsigned S : {2U, 4U}) {
@@ -2622,6 +2715,35 @@ struct Bench {
                 const std::string cell = "dense_v4 " + group_name(g) + " T" + std::to_string(T) +
                                          (band != 0 ? " band" + std::to_string(band) : std::string());
                 check(all, cell + " differs:" + detail);
+                if (g[0]->name == "q" && g[0]->output % 128U == 0U) {
+                    // the q image (MSA FAST flash query_op): dense finish image + lo == the flash prologue on the FP32 q
+                    const std::size_t qn = std::size_t{T} * g[0]->output;
+                    std::vector<float> hw(128), hr(std::size_t{T} * sizeof(strix::minimax::msa::RopeRow) / 4U);
+                    std::uniform_real_distribution<float> ud(-1.0F, 1.0F);
+                    for (auto& x : hw) x = 0.25F * ud(rng);
+                    for (auto& x : hr) x = ud(rng);
+                    float* dw = dupload(hw);
+                    float* drope = dupload(hr);
+                    auto* img = dalloc<std::uint16_t>(2 * qn);
+                    auto* ref = dalloc<std::uint16_t>(2 * qn);
+                    hip_ok(hipMemset(img, 0xff, 4 * qn), "poison");
+                    std::vector<opt::PrefillDenseJob> jobs;
+                    for (std::size_t i = 0; i < g.size(); ++i) jobs.push_back({g[i]->copies[0].dev, v4Out[i]});
+                    jobs[0].image = img, jobs[0].image_lo = img + qn, jobs[0].image_w = dw, jobs[0].image_rope = drope;
+                    opt::enqueue_prefill_dense(jobs.data(), static_cast<unsigned>(jobs.size()), in, T, ws, bytes, nullptr);
+                    const unsigned waves = T * (g[0]->output / 128U);
+                    hipLaunchKernelGGL(msa_q_image_ref, dim3((waves + 7U) / 8U), dim3(256), 0, nullptr, v4Out[0], dw,
+                                       reinterpret_cast<const strix::minimax::msa::RopeRow*>(drope), T, g[0]->output, ref, ref + qn);
+                    hip_ok(hipDeviceSynchronize(), "image sync");
+                    std::vector<std::uint16_t> a(2 * qn), b(2 * qn);
+                    hip_ok(hipMemcpy(a.data(), img, 4 * qn, hipMemcpyDeviceToHost), "d2h");
+                    hip_ok(hipMemcpy(b.data(), ref, 4 * qn, hipMemcpyDeviceToHost), "d2h");
+                    std::size_t diff = 0;
+                    for (std::size_t j = 0; j < a.size(); ++j) diff += a[j] != b[j];
+                    check(diff == 0U, cell + " q image differs");
+                    detail += diff == 0U ? " q-image bitwise" : " q-image DIFF " + std::to_string(diff);
+                    hip_ok(hipFree(dw), "free"), hip_ok(hipFree(drope), "free"), hip_ok(hipFree(img), "free"), hip_ok(hipFree(ref), "free");
+                }
                 std::printf("%s:%s (splits", cell.c_str(), detail.c_str());
                 for (auto* ds : g) std::printf(" %u", opt::gemm_splits(ds->input, ds->output, ds->copies[0].dev.bits, T));
                 std::printf(")\n");
@@ -3385,6 +3507,7 @@ int main(int argc, char** argv) {
             if (!o.no_moe) test_section("test_prefill", [&] { b.test_prefill(); });
             if (!o.no_moe) test_section("test_prefill_device", [&] { b.test_prefill_device(); });
             if (!o.no_moe) test_section("test_prefill_group", [&] { b.test_prefill_group(); });
+            if (!o.no_moe) test_section("test_prefill_chunk_invariance", [&] { b.test_prefill_chunk_invariance(); });
             if (!o.no_moe) test_section("test_prefill_mtfit", [&] { b.test_prefill_mtfit(); });
             if (!o.no_moe) test_section("test_prefill_core8", [&] { b.test_prefill_core8(); });
             if (!o.no_moe && o.tests == "test_prefill_pipe") test_section("test_prefill_pipe", [&] { b.test_prefill_pipe(); });

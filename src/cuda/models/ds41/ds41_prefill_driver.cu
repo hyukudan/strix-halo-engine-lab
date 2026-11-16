@@ -1,3 +1,4 @@
+#include "strix/weight/admission.hpp"
 // deepseek41 CUDA prefill driver (cuda_ds41_prefill.hpp): the DevicePrefill plan on the CUDA layer kernels, with the
 // cone, the tiered routed-expert provider and the Engram rows from the model file.
 
@@ -70,45 +71,20 @@ struct SafetensorBlob {
     std::vector<std::uint8_t> bytes;
 };
 SafetensorBlob read_safetensor(const std::filesystem::path& path, const std::string& name) {
-    std::ifstream f(path, std::ios::binary);
-    if (!f) throw std::runtime_error("trellis pack: cannot open " + path.string());
-    std::uint64_t n = 0;
-    f.read(reinterpret_cast<char*>(&n), 8);
-    if (!f || n < 2U || n > (std::uint64_t{64} << 20U)) throw std::runtime_error("trellis pack: bad header in " + path.string());
-    std::string h(static_cast<std::size_t>(n), '\0');
-    f.read(h.data(), static_cast<std::streamsize>(n));
-    const std::string key = "\"" + name + "\"";
-    const auto at = h.find(key);
-    if (at == std::string::npos) throw std::runtime_error("trellis pack: no tensor " + name + " in " + path.string());
-    const auto end = h.find('}', at);
-    const std::string d = h.substr(at, end - at);
-    SafetensorBlob b;
-    const auto field = [&](const char* k) {
-        const auto p = d.find(std::string("\"") + k + "\"");
-        if (p == std::string::npos) throw std::runtime_error("trellis pack: tensor " + name + " without " + k);
-        return d.substr(d.find(':', p) + 1U);
-    };
-    {
-        const auto v = field("dtype");
-        const auto q0 = v.find('"'), q1 = v.find('"', q0 + 1U);
-        b.dtype = v.substr(q0 + 1U, q1 - q0 - 1U);
+    std::shared_ptr<const weight::Source> source;
+    auto status = weight::open_source(path.string(), source);
+    weight::TensorIndex index;
+    if (status) status = weight::index_safetensors(source, index);
+    if (!status) throw std::runtime_error("trellis pack: " + status.detail);
+    for (const auto& raw : index.tensors) if (raw.name == name) {
+        SafetensorBlob blob; blob.dtype = raw.wire_dtype;
+        blob.shape.assign(raw.shape.dims.begin(), raw.shape.dims.begin() + raw.shape.rank);
+        blob.bytes.resize(static_cast<std::size_t>(raw.payload.range.bytes));
+        status = weight::read_slice(raw.payload, {reinterpret_cast<weight::Byte*>(blob.bytes.data()), blob.bytes.size()});
+        if (!status) throw std::runtime_error("trellis pack: " + status.detail);
+        return blob;
     }
-    const auto numbers = [](const std::string& v) {
-        std::vector<std::uint64_t> out;
-        const auto open = v.find('['), close = v.find(']');
-        std::stringstream ss(v.substr(open + 1U, close - open - 1U));
-        for (std::string t; std::getline(ss, t, ',');)
-            if (t.find_first_of("0123456789") != std::string::npos) out.push_back(std::stoull(t));
-        return out;
-    };
-    b.shape = numbers(field("shape"));
-    const auto off = numbers(field("data_offsets"));
-    if (off.size() != 2U || off[1] < off[0]) throw std::runtime_error("trellis pack: bad offsets of " + name);
-    b.bytes.resize(static_cast<std::size_t>(off[1] - off[0]));
-    f.seekg(static_cast<std::streamoff>(8U + n + off[0]));
-    f.read(reinterpret_cast<char*>(b.bytes.data()), static_cast<std::streamsize>(b.bytes.size()));
-    if (!f) throw std::runtime_error("trellis pack: short read of " + name);
-    return b;
+    throw std::runtime_error("trellis pack: missing tensor " + name);
 }
 // The pair library's split count of a GEMV of R <= 8 rows at integer K (its vector policy for every geometry and K
 // without a measured override; the overrides are K5 / K6 only): output <= 1024: 32; output <= 4096 and input >= 4096:

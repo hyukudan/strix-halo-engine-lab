@@ -258,10 +258,23 @@ void log_line_format() {
     r.begin_ns = 123;
     r.end_ns = 456;
     r.add_draft_depth(2, 4);
+    r.admitted = 6;
+    r.forwards = 2;
+    r.solo[static_cast<std::size_t>(CycleSoloReason::no_rows)] = 1;
     check(format_cycle_receipt(r, 7) ==
         "serve cycle seq=7 lanes=4 rows=16 useful=13 pad=3 emitted=14 draft_rows=0/4/0/0/0/0/0/0 draft_ms=20.500000 "
-        "verify_ms=138.000000 host_ms=2.750000 ms=161.250000 prompt=1 begin_ns=123 end_ns=456",
+        "verify_ms=138.000000 host_ms=2.750000 ms=161.250000 prompt=1 begin_ns=123 end_ns=456 admitted=6 forwards=2 "
+        "solo=0/1/0/0/0/0",
         "log line format");
+    check(std::string(cycle_solo_reason_name(1)) == "no_rows" && std::string(cycle_solo_reason_name(99)) == "unknown",
+        "solo reason names");
+    CycleLedger ledger(4);
+    check(ledger.add(r), "receipt with forwards accepted");
+    const auto j = parse_json(ledger.json());
+    const auto& totals = at(j, "totals");
+    check(at(totals, "forwards").as_int() == 2 && at(totals, "admitted").as_int() == 6, "ledger totals carry admitted and forwards");
+    const auto& solo = at(totals, "solo").as_array();
+    check(solo.size() == kCycleSoloReasons && solo[1].as_int() == 1, "ledger totals carry solo reasons");
 }
 } // namespace
 

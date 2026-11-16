@@ -150,6 +150,16 @@ The node side uses `--rtx-state-import` with `--http-serve` (without `--http-bat
 changes. Service build and protocol: [Qwen CUDA prefill service](engine/serving/qwen-cuda-prefill.md) and
 [RTX state import](rtx-state-import.md).
 
+Splitting one prompt by layers over the card and both nodes (card -> node A -> node B) is planned by the shared
+chain planner (`include/strix/pair/chain.hpp`); the route itself is not available yet. To see what a link would buy,
+run the host tool with your measured rates, e.g. `strix-qwen-chain-plan --rows 32768 --card-rate 4320
+--node-rate 1600 --link-mbps 118` (add `--costs <node layer costs json>` for measured per-layer node costs). On a
+1 Gbit/s link it keeps the whole prefill on the card; from 2.5 Gbit/s it predicts a three-way split.
+Reverse row state waits for each producing block and relay, with one coalesced message per block/hop.
+The host planner rejects simulations above 1,000,000 resource updates; search has a 20,000,000-unit
+budget counting enumeration and simulated resource updates, and refuses a partial winner on exhaustion.
+Uniform rates and scaled layer costs are prediction assumptions; these host results do not qualify a native route.
+
 ## Qwen3.8-Flash-Next, served from one RTX
 
 `strix-cuda-qwen-serve` serves the model from one RTX PRO 6000 without a node: OpenAI and Anthropic APIs, SSE,
