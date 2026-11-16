@@ -4,6 +4,7 @@
 // src/hip_minimax_msa.hip (K1-K4) in the same order, so the outputs are bit-identical; what changes is who computes
 // it (fewer launches, N sequences per launch) and how the caches are read (coalesced tiles through LDS).
 #include "msa_fused.hpp"
+#include "msa_norm_rope.hpp"
 #include "msa_inblock_layout.hpp"
 #include "msa_select_dump.hpp"
 #include "attn_core/index_score_band.hpp"
@@ -28,36 +29,11 @@ using InblockLayout = inblock::Layout<kHeadDim, kMaxChunks, kGroup, kTile>;
 static_assert(InblockLayout::kSharedBytes == 18496);
 constexpr unsigned kCountMax = 256;         // selection: rank by counting up to this many candidates, else radix
 
-__device__ __forceinline__ float butterfly_sum(float v) {
-    for (unsigned d = 16; d >= 1; d >>= 1U) v = v + __shfl_xor(v, static_cast<int>(d), 32);
-    return v;
-}
+// butterfly_sum, norm_rope_lane: msa_norm_rope.hpp (shared with the q projection finish)
 __device__ __forceinline__ float max_of(float a, float b) { return a < b ? b : a; }  // std::max(a, b)
 __device__ __forceinline__ float lo_bf16(std::uint32_t w) { return u2f(w << 16U); }
 __device__ __forceinline__ float hi_bf16(std::uint32_t w) { return u2f(w & 0xFFFF0000U); }
 
-// Lane l holds dims 4l..4l+3 of one head in x[4]. Norm + RoPE in place (host head_norm_rope order); identical to the
-// K1 helper.
-__device__ __forceinline__ void norm_rope_lane(float* x, const float* w, const RopeRow& rope, unsigned lane) {
-    float acc = 0.0F;
-    for (unsigned i = 0; i < kDimsPerLane; ++i) acc = __builtin_fmaf(x[i], x[i], acc);
-    const float sum = butterfly_sum(acc);
-    const float r = 1.0F / __builtin_sqrtf(sum / static_cast<float>(kHeadDim) + kNormEps);
-    for (unsigned i = 0; i < kDimsPerLane; ++i) x[i] = (x[i] * r) * (1.0F + w[lane * kDimsPerLane + i]);
-    float partner[kDimsPerLane];
-    for (unsigned i = 0; i < kDimsPerLane; ++i) partner[i] = __shfl_xor(x[i], 8, 32);
-    if (lane < 8) {
-        for (unsigned i = 0; i < kDimsPerLane; ++i) {
-            const unsigned d = lane * kDimsPerLane + i;
-            x[i] = __builtin_fmaf(-partner[i], rope.sin[d], x[i] * rope.cos[d]);
-        }
-    } else if (lane < 16) {
-        for (unsigned i = 0; i < kDimsPerLane; ++i) {
-            const unsigned d = (lane - 8) * kDimsPerLane + i;
-            x[i] = __builtin_fmaf(partner[i], rope.sin[d], x[i] * rope.cos[d]);
-        }
-    }
-}
 __device__ __forceinline__ void load4(float* x, const float* src, unsigned lane) {
     const float4 f = *reinterpret_cast<const float4*>(src + lane * kDimsPerLane);
     x[0] = f.x;
@@ -171,6 +147,8 @@ __device__ void prep_kv(const DecodeView& v) {
 // Preserve local row/block coordinates and operation order inside each window.
 __host__ __device__ DecodeView prefill_offset(DecodeView v, unsigned r0) {
     v.q += static_cast<std::size_t>(r0) * v.q_heads * kHeadDim;
+    if (v.q16) v.q16 += static_cast<std::size_t>(r0) * v.q_heads * kHeadDim;
+    if (v.q16_lo) v.q16_lo += static_cast<std::size_t>(r0) * v.q_heads * kHeadDim;
     v.k += static_cast<std::size_t>(r0) * v.kv_heads * kHeadDim;
     v.v += static_cast<std::size_t>(r0) * v.kv_heads * kHeadDim;
     v.iq += static_cast<std::size_t>(r0) * v.idx_heads * kIdxDim;
@@ -2372,7 +2350,11 @@ template <bool DENSE> void launch_prefill_attend(const PrefillView& p, unsigned 
             namespace ks = strix::attn_core::sparse;
             const dim3 grid((scheduled.rows - p.first_window * kMaxRows) * v.kv_heads), block(ks::KeySplit<kGroup, kHeadDim>::kThreads);
             const MsaFlashArgs args{scheduled, DENSE ? 1U : 0U};
-            if (p.msa_rework == 12) hipLaunchKernelGGL((ks::flash_rows_keysplit_kernel<MsaFlashPolicy, true>), grid, block, 0, stream, args);
+            // the q projection finish's image when it wrote one (query_op; same bits), else the FP32 q
+            const bool q16 = v.q16 != nullptr && (p.msa_rework != 12 || v.q16_lo != nullptr);
+            if (p.msa_rework == 12 && q16) hipLaunchKernelGGL((ks::flash_rows_keysplit_kernel<MsaFlashQ16Policy, true>), grid, block, 0, stream, args);
+            else if (p.msa_rework == 12) hipLaunchKernelGGL((ks::flash_rows_keysplit_kernel<MsaFlashPolicy, true>), grid, block, 0, stream, args);
+            else if (q16) hipLaunchKernelGGL((ks::flash_rows_keysplit_kernel<MsaFlashQ16Policy, false>), grid, block, 0, stream, args);
             else hipLaunchKernelGGL((ks::flash_rows_keysplit_kernel<MsaFlashPolicy, false>), grid, block, 0, stream, args);
             hip_check(hipGetLastError(), "minimax prefill flash attend");
             return;
