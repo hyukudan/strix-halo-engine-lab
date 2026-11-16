@@ -66,6 +66,20 @@ bool wfmt_readers_test() try {
         TensorBinding b{};b.tensor=v.id;b.role=Role::embedding;b.expert_axis=UINT32_MAX;b.admitted_formats={{"plain.bf16",1}};
         WeightMap direct;const auto status=admit(builtin_registry(),{&r5,{&b,1},{}},direct);
         check(!status && status.code==Error::unsupported_shape,"explicit view of an opaque tensor rejected per tensor");
+        {
+            // File-backed legacy tables (shared archive used by Gemma / Qwen vision, H3) keep the full rank-5 extents.
+            const auto dir=std::filesystem::temp_directory_path()/("wfmt-rank5-"+std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+            std::filesystem::create_directory(dir);const auto file=dir/"model.safetensors";
+            struct Gone{std::filesystem::path p;~Gone(){std::error_code ec;std::filesystem::remove(p,ec);std::filesystem::remove(p.parent_path(),ec);}} gone{file};
+            {std::ofstream f(file,std::ios::binary);f.write(reinterpret_cast<const char*>(rank5.data()),std::streamsize(rank5.size()));}
+            {
+                auto archive=strix::gemma4::read_safetensors(file);check(archive.tensors.size()==2,"rank-5 archive census");
+                const auto& t=archive.tensors[0].name.starts_with("vision")?archive.tensors[0]:archive.tensors[1];
+                check(t.shape==std::vector<std::uint64_t>({2,3,2,1,1}) && t.bytes==24,"archive keeps rank-5 extents");
+                strix::h3::block::SafeTensors h3(file.string());const auto& h=h3.at("vision_tower.patch_embedding.weight");
+                check(h.shape==std::vector<std::int64_t>({2,3,2,1,1}),"H3 table keeps rank-5 extents");
+            }
+        }
         std::string ones;for(unsigned k=0;k<256;++k)ones+=k?",1":"1";
         check(!index_safetensors(memory_source(safe(R"({"a":{"dtype":"F32","shape":[)"+ones+R"(],"data_offsets":[0,4]}})",4)),other),"absurd rank rejected");
     }
