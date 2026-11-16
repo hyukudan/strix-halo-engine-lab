@@ -57,17 +57,24 @@ inline constexpr Lever table[] = {
      .target = "qwen-cuda-qsa-f16mma-v1", .off = "0",
      .source = "QSA prefill attention on FP16 tensor cores, FP32 accumulation; qualification in progress; changes logits",
      .provisional = {false, true, false}},
+    {.name = "moe_mma", .env = "STRIX_QRTX_MOE_MMA", .option = "--moe-mma",
+     .value = {"", "1", ""}, .builtin = "0",
+     .kind = Kind::bit_changing, .ready = {true, false, true}, .runnable = {false, true, false},
+     .target = "qwen-cuda-moe-i8fma-v1", .off = "0",
+     .source = "routed-MoE prefill gate/up and down on int8 tensor cores with one FP32 FMA chain per output; qualification in progress; changes logits",
+     .provisional = {false, true, false}},
 };
 inline std::span<const Lever> levers() { return table; }
 
 inline constexpr std::string_view kHcIdentity = "qwen-cuda-hc-f16mma-v1";
 inline constexpr std::string_view kMtpIdentity = "qwen-cuda-mtp-f16mma-v1";
 inline constexpr std::string_view kQsaIdentity = "qwen-cuda-qsa-f16mma-v1";
+inline constexpr std::string_view kMoeIdentity = "qwen-cuda-moe-i8fma-v1";
 
 // The runnable levers a resolution selects. Pending, off and builtin-off rows select nothing.
 struct Choice {
-    bool moe_route_bf16 = false, hc_mma = false, mtp_mma = false, qsa_mma = false;
-    bool fast() const { return moe_route_bf16 || hc_mma || mtp_mma || qsa_mma; }
+    bool moe_route_bf16 = false, hc_mma = false, mtp_mma = false, qsa_mma = false, moe_mma = false;
+    bool fast() const { return moe_route_bf16 || hc_mma || mtp_mma || qsa_mma || moe_mma; }
     bool operator==(const Choice&) const = default;
 };
 
@@ -88,11 +95,12 @@ inline Choice choose(const pr::Resolution& r) {
     c.hc_mma = lever_on(r, "hc_mma");
     c.mtp_mma = lever_on(r, "mtp_mma");
     c.qsa_mma = lever_on(r, "qsa_mma");
+    c.moe_mma = lever_on(r, "moe_mma");
     return c;
 }
 inline std::string forms_list(const Choice& c) {
     std::string out;
-    for (const auto& [on, name] : {std::pair{c.hc_mma, "hc_mma"}, std::pair{c.mtp_mma, "mtp_mma"}, std::pair{c.qsa_mma, "qsa_mma"}})
+    for (const auto& [on, name] : {std::pair{c.hc_mma, "hc_mma"}, std::pair{c.mtp_mma, "mtp_mma"}, std::pair{c.qsa_mma, "qsa_mma"}, std::pair{c.moe_mma, "moe_mma"}})
         if (on) out += (out.empty() ? "" : ",") + std::string(name);
     return out;
 }
@@ -110,6 +118,7 @@ inline std::string form_identities(const Choice& c) {
     add(c.hc_mma, kHcIdentity);
     add(c.mtp_mma, kMtpIdentity);
     add(c.qsa_mma, kQsaIdentity);
+    add(c.moe_mma, kMoeIdentity);
     return out;
 }
 inline ::strix::profile::ExecutionReceipt receipt(const Choice& c, std::string_view prefill_lineage = {}) {

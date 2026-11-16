@@ -61,6 +61,7 @@ IdentityFields identity_fields(const qwen_prefill::Config& c, std::uint32_t bloc
     if (c.forms.hc_mma) put("form.hc_mma", "qwen-cuda-hc-f16mma-v1");
     if (c.forms.mtp_mma) put("form.mtp_mma", "qwen-cuda-mtp-f16mma-v1");
     if (c.forms.qsa_mma) put("form.qsa_mma", "qwen-cuda-qsa-f16mma-v1");
+    if (c.forms.moe_mma) put("form.moe_mma", "qwen-cuda-moe-i8fma-v1");
     model("model", c.model_gguf);
     model("mtp", c.mtp_sidecar_gguf);
     file("draft_vocab", c.draft_vocab);

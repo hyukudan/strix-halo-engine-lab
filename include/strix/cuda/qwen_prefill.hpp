@@ -61,6 +61,7 @@ struct Config {
         bool hc_mma = false;   // hyper-connection projection / output on FP16 tensor cores, FP32 accumulation
         bool mtp_mma = false;  // MTP fused projection on FP16 tensor cores, FP32 accumulation
         bool qsa_mma = false;  // QSA prefill attention (scores and output) on FP16 tensor cores, FP32 accumulation
+        bool moe_mma = false;  // routed-MoE prefill project/down: int8 IMMA block dots, ONE FP32 FMA chain per output (not the HIP four)
     } forms;
 };
 

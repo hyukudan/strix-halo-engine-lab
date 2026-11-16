@@ -18,11 +18,7 @@ namespace strix::cuda::core::imma {
 
 // D = A(16x32 s8 row) x B(32x8 s8 col) + seed; d[i] bits = 0x4B400000 + dot.
 __device__ __forceinline__ void mma_seeded(int (&d)[4], const std::uint32_t (&a)[4], const std::uint32_t (&b)[2]) {
-    constexpr int kMagic = 0x4B400000;
-    asm volatile(
-        "mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%10,%10,%10,%10};\n"
-        : "=r"(d[0]), "=r"(d[1]), "=r"(d[2]), "=r"(d[3])
-        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]), "r"(kMagic));
+    ptx::mma_s8_seeded(d, a[0], a[1], a[2], a[3], b[0], b[1], 0x4B400000);
 }
 
 // acc = fma(dw * dl, float(dot), acc): the HIP v_mul_f32 / v_fmac_f32 chain, unchanged by tiling.
