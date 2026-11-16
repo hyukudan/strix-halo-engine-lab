@@ -703,6 +703,12 @@ bool fast_moe() {
     // a running DevicePrefill's own precision first (strix/ds41_prefill_precision.hpp), else the override or env
     return effective_fast(&PrefillPrecision::fast_moe, fast_moe_mode, env);
 }
+// FAST lever ds41-moe-f16wmma-v1 (with fast_moe): the relaxed kernels' FP16-operand form. Per execution (PrefillPrecision), else
+// STRIX_DS41_FAST_MOE_F16; no process-wide setter.
+bool fast_moe_f16() {
+    static const bool env = fast_profile::moe_f16_on();
+    return effective_fast(&PrefillPrecision::fast_moe_f16, -1, env);
+}
 int fast_i4_mode = -1;
 void set_fast_i4(int mode) { fast_i4_mode = mode; }
 bool fast_i4() {

@@ -52,6 +52,9 @@ struct PrefillOptions {
     // (swiglu_a8) between them, as the CUDA backend's FAST shared expert; calls under STRIX_DS41_FAST_DENSE_MIN_ROWS rows and
     // views the core does not take keep the exact expert kernels. Resolved like fast_engram.
     bool fast_shared = false;
+    // FAST lever ds41-moe-f16wmma-v1 (STRIX_DS41_FAST_MOE_F16=1, explicit; acts with fast_moe): the relaxed routed-expert kernels
+    // in their FP16-operand form (A8 rows and decoded weights rounded once to FP16, FP32 accumulation over the whole K).
+    bool fast_moe_f16 = false;
     // Diagnostics/selection for the non-exact paths (no effect while both switches above are off, except null_ulp_layer):
     // projection bits 1 q_a, 2 kv, 4 q_b, 8 o_a, 16 o_b; layers [approx_layer_first, approx_layer_end); FP16 only at
     // calls of at least fp16_min_rows rows; fp16_keep_a8: FP16 operands from the A8 codes (the exact path's activations)
@@ -373,7 +376,7 @@ public:
     [[nodiscard]] std::uint32_t route_class(std::uint32_t rows) const noexcept;
     [[nodiscard]] serve::PrefillGroupCapacity group_capacity() const noexcept;
     [[nodiscard]] static bool group_options_supported(const PrefillOptions& o) noexcept {
-        return !(o.fp16_dense || o.bf16_attention || o.fast_attention || o.fast_attention_flash || o.fast_dense || o.fast_moe || o.fast_engram || o.fast_shared || o.trace || o.stream_hashes ||
+        return !(o.fp16_dense || o.bf16_attention || o.fast_attention || o.fast_attention_flash || o.fast_dense || o.fast_moe || o.fast_engram || o.fast_shared || o.fast_moe_f16 || o.trace || o.stream_hashes ||
                  o.routing_loads || o.quality_head_rows > 1U || o.null_ulp_layer >= 0 || o.verify_embed_extras);
     }
     // Members / rows per member the group states hold (PrefillOptions::group_members / group_rows); 0 = no group pass.
