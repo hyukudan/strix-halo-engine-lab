@@ -8,7 +8,7 @@ import platform
 import shlex
 import subprocess
 import sys
-from records import read_record
+from records import read_matrix, validate_inventory
 
 
 def main():
@@ -26,20 +26,23 @@ def main():
     parser.add_argument("args", nargs=argparse.REMAINDER)
     args = parser.parse_args()
     args.out.mkdir(parents=True, exist_ok=True)
-    if list(args.out.glob("*.wfmt")):
+    if list(args.out.rglob("*.wfmt")):
         parser.error("output already contains records; use a fresh capture directory")
-    summary = {"schema": "wfmt.capture@1", "pass": False,
+    summary = {"schema": "wfmt.capture@2", "pass": False,
                "compiler": args.compiler, "architecture": args.architecture,
                "flags": args.flags, "device": args.device, "platform": platform.platform()}
     try:
         exe = args.exe.resolve(strict=True)
         matrix = args.matrix.resolve(strict=True)
+        contract = read_matrix(matrix)
+        matrix_bytes = matrix.read_bytes()
         summary["executable_sha256"] = hashlib.sha256(exe.read_bytes()).hexdigest()
-        summary["matrix_sha256"] = hashlib.sha256(matrix.read_bytes()).hexdigest()
+        summary["matrix_sha256"] = hashlib.sha256(matrix_bytes).hexdigest()
         if args.source:
             summary["source"] = subprocess.check_output(
                 ["git", "-C", str(args.source), "rev-parse", "HEAD"], text=True).strip()
         extra = args.args[1:] if args.args[:1] == ["--"] else args.args
+        summary["adapter_args"] = extra
         command = shlex.split(args.runner) + [str(exe), "--wfmt-capture", str(args.out.resolve()),
                    "--wfmt-matrix", str(matrix)] + extra
         with (args.out / "capture.log").open("w") as log:
@@ -47,13 +50,10 @@ def main():
                                     timeout=args.timeout, check=False)
         if result.returncode:
             raise ValueError(f"capture adapter exit {result.returncode}")
-        records = list(args.out.glob("*.wfmt"))
-        if not records:
-            raise ValueError("capture adapter produced no byte records")
-        for record in records:
-            read_record(record)
-        summary.update({"pass": True, "records": len(records)})
-    except (ValueError, OSError, subprocess.SubprocessError) as error:
+        (args.out / "matrix.json").write_bytes(matrix_bytes)
+        records = validate_inventory(args.out, contract)
+        summary.update({"pass": True, "records": len(records), "record_sha256": records})
+    except (ValueError, OSError, KeyError, TypeError, AttributeError, subprocess.SubprocessError) as error:
         summary["error"] = str(error)
     (args.out / "summary.json").write_text(json.dumps(summary, indent=2) + "\n")
     print(json.dumps(summary, sort_keys=True))
