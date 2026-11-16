@@ -450,6 +450,7 @@ void onfly_decode_bench(hipStream_t stream) {
             }
             const SingleDecodeSetting requested_single;
             const auto single_decode = requested_single.policy();
+            const bool single_decode_device = q8_rows::iu4_single_decode_device_qualified();
             if (rows >= 7U) {
                 for (const auto mode : {Mode::rows, Mode::rows_a8}) {
                     require(setenv("STRIX_IU4_R8_SINGLE_DECODE", "0", 1) == 0, "set row-half control");
@@ -474,10 +475,11 @@ void onfly_decode_bench(hipStream_t stream) {
                     << " native_us=" << native_us << " onfly_us=" << onfly_us << " native_bytes=" << f.weights.bytes
                     << " onfly_bytes=" << bytes << " native_GBs=" << static_cast<double>(f.weights.bytes) / native_us / 1000.0
                     << " onfly_GBs=" << static_cast<double>(bytes) / onfly_us / 1000.0 << " iu4_launches=" << launches
-                    << " pack_loads=" << (launches ? core::iu4_rows::packed_loads(rows, width / 64U, single_decode) : 1U)
-                    << " single_decode=" << core::iu4_rows::single_decode_applies(rows, width / 64U, single_decode)
-                    << " single_decode_policy=" << (requested_single.value.empty() ? "0" : requested_single.value)
-                    << " single_decode_admitted=" << core::iu4_rows::staged_single_decode_admitted(rows, width / 64U)
+                    << " pack_loads=" << (launches ? core::iu4_rows::packed_loads(rows, width / 64U, single_decode, outputs, single_decode_device) : 1U)
+                    << " single_decode=" << core::iu4_rows::single_decode_applies(rows, width / 64U, single_decode, outputs, single_decode_device)
+                    << " single_decode_policy=" << core::iu4_rows::single_decode_policy_name(single_decode)
+                    << " single_decode_admitted=" << core::iu4_rows::measured_single_decode_admitted(rows, width / 64U, outputs)
+                    << " single_decode_lds_blocks_preserved=" << core::iu4_rows::staged_single_decode_admitted(rows, width / 64U)
                     << " row_policy_bitwise=1" << '\n';
             }
             q6p::iu4::unregister_tensor(original, base);

@@ -229,6 +229,38 @@ int main() {
     expect(decode_cli::effective_prefill_argv(cli.options) == decode_cli::effective_prefill_argv(serve.options), "CLI and server give the same cache argv");
     expect(decode_cli::effective_prefill_argv(cli.options) != decode_cli::effective_prefill_argv(native.options), "onfly never shares a cache key with native");
     expect(!native.options.turbo.active(), "native default");
+    const auto& cli_rows = cli.options.turbo.row_decode;
+    const auto& serve_rows = serve.options.turbo.row_decode;
+    using RowsPolicy = core::iu4_rows::SingleDecodePolicy;
+    expect(cli_rows.requested == serve_rows.requested && cli_rows.effective == serve_rows.effective &&
+           cli_rows.reason == serve_rows.reason && cli_rows.effective == RowsPolicy::automatic,
+           "CLI and server use one automatic row-decode resolver");
+    expect(native.options.turbo.row_decode.effective == RowsPolicy::split &&
+           native.options.turbo.row_decode.reason == "native-weights", "native row-decode disabled");
+    const auto split_rows = decode_cli::initialize_prefill_config({options_for({"--profile", "turbo", "--turbo-weights", "onfly"}),
+        {{"STRIX_IU4_R8_SINGLE_DECODE", "0"}}});
+    expect(split_rows.options.turbo.row_decode.effective == RowsPolicy::split &&
+           split_rows.options.turbo.row_decode.reason == "explicit-off", "row-decode off switch resolved");
+    const auto force_rows = core::iu4_rows::resolve_single_decode_policy(true, "force");
+    expect(force_rows.effective == RowsPolicy::force && force_rows.reason == "diagnostic-force", "row-decode diagnostic force");
+    expect(core::iu4_rows::measured_single_decode_device("gfx1151:xnack-", 32) &&
+           !core::iu4_rows::measured_single_decode_device("gfx1150", 32) &&
+           !core::iu4_rows::measured_single_decode_device("gfx1151", 64), "only measured device qualifies automatically");
+    for (const unsigned rows : {7U, 8U}) {
+        expect(core::iu4_rows::single_decode_applies(rows, 96U, cli_rows.effective, 2560U, true),
+               "measured G96 output shape selected");
+        expect(!core::iu4_rows::single_decode_applies(rows, 96U, cli_rows.effective, 2560U, false) &&
+               !core::iu4_rows::single_decode_applies(rows, 96U, cli_rows.effective, 4096U, true) &&
+               !core::iu4_rows::single_decode_applies(rows, 40U, cli_rows.effective, 2560U, true),
+               "unqualified device, shape and losing regime keep split rows");
+    }
+    expect(core::iu4_rows::single_decode_applies(8U, 40U, force_rows.effective, 10240U, false),
+           "diagnostic force remains available for losing and unqualified regimes");
+    const auto row_receipt = decode_cli::effective_config_json(cli);
+    expect(row_receipt.find("\"row_decode\":{\"requested\":\"auto\",\"effective\":\"auto\",\"enabled\":true") != std::string::npos &&
+           row_receipt.find("pending-device-and-shape") != std::string::npos, "receipt reports automatic conditional plan");
+    expect(decode_cli::effective_config_json(native).find("\"effective\":\"split\",\"enabled\":false,\"reason\":\"native-weights\"") !=
+           std::string::npos, "receipt reports native row-decode disabled");
 
     // Registry.
     int tensor = 0;

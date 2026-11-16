@@ -18,9 +18,26 @@ struct Iu4Weights { const unsigned char* base[kMaxSegments]; };
 
 // Plan per (rows R, groups G): S waves split the K groups of a pass, GC groups are staged per pass (G % GC == 0). Rows
 // The control uses two 4-row halves for rows 7-8. Staged-dot single decode is
-// automatic admission preserves the resident block count; force is diagnostic.
+// selected for the measured G96 output shape on gfx1151; force is diagnostic.
 using core::iu4_rows::Iu4Plan;
 using core::iu4_rows::iu4_plan;
+
+// Properties are cached per calling thread and current device, including device
+// changes. The hot path only reads HIP's current-device index, not properties.
+inline bool iu4_single_decode_device_qualified() {
+    int device = -1;
+    if (hipGetDevice(&device) != hipSuccess) return false;
+    static thread_local int cached_device = -1;
+    static thread_local bool qualified = false;
+    if (cached_device != device) {
+        hipDeviceProp_t properties{};
+        if (hipGetDeviceProperties(&properties, device) != hipSuccess) return false;
+        qualified = core::iu4_rows::measured_single_decode_device(properties.gcnArchName,
+                                                                 static_cast<unsigned>(properties.warpSize));
+        cached_device = device;
+    }
+    return qualified;
+}
 
 // Grid: one block per (segment, 64 output columns); G = K / 64 groups in G / GC passes, S waves split each pass.
 template <class Site, unsigned S, unsigned G, unsigned GC, bool FromSlot, bool SingleDecode = false>
@@ -120,8 +137,11 @@ template <class Site> bool launch_iu4_rows(const Site& site, hipStream_t stream,
             if constexpr (Site::rows * GC * 128U <= kIu4StageBytes) {  // staged FP16 rows must fit the LDS budget
                 if constexpr (Site::rows >= 7U) {
                     const char* raw = strix::envcfg::text("STRIX_IU4_R8_SINGLE_DECODE");
-                    const auto policy = core::iu4_rows::parse_single_decode_policy(raw ? raw : "");
-                    if (core::iu4_rows::single_decode_applies(Site::rows, G, policy)) {
+                    const auto policy = core::iu4_rows::resolve_single_decode_policy(true, raw ? raw : "").effective;
+                    const unsigned outputs = site.segments.first[site.segments.count] - site.segments.first[0];
+                    const bool device_qualified = policy == core::iu4_rows::SingleDecodePolicy::automatic &&
+                        core::iu4_rows::measured_single_decode_admitted(Site::rows, G, outputs) && iu4_single_decode_device_qualified();
+                    if (core::iu4_rows::single_decode_applies(Site::rows, G, policy, outputs, device_qualified)) {
                         if (slot) go(project_rows_iu4_kernel<Site, S, G, GC, true, true>, slot->codes, slot->deltas);
                         else go(project_rows_iu4_kernel<Site, S, G, GC, false, true>, nullptr, nullptr);
                     } else {

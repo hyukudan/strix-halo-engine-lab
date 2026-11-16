@@ -13,6 +13,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include "core/iu4_rows_plan.hpp"
 
 namespace strix::onfly_i4 {
 
@@ -31,6 +32,7 @@ struct Resolved {
     Source source = Source::native;
     unsigned bits = 4, groups = all_groups;
     int scale_rule = kScaleFullRange;
+    core::iu4_rows::SingleDecodeResolution row_decode;
     [[nodiscard]] bool active() const { return source == Source::onfly; }
     // Identity for cache keys / receipts; empty for native (byte-identical to the unmodified engine).
     [[nodiscard]] std::string identity() const {
@@ -85,6 +87,7 @@ inline Resolved resolve(const Request& cli, const std::function<const char*(cons
     else if (rule == "legacy") r.scale_rule = kScaleLegacy;
     else if (rule == "mse") r.scale_rule = kScaleMse;
     else throw std::invalid_argument("--turbo-onfly-scale-rule: expected legacy, full or mse");
+    r.row_decode = core::iu4_rows::resolve_single_decode_policy(r.active(), pick({}, "STRIX_IU4_R8_SINGLE_DECODE"));
     return r;
 }
 

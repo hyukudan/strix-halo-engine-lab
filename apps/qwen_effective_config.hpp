@@ -2349,7 +2349,14 @@ inline std::string effective_config_json(const EffectiveConfig& config) {
         << ",\"identity\":\"" << (o.turbo.active() ? o.turbo.identity() : std::string("native")) << "\",\"groups\":\""
         << (o.turbo.active() ? strix::onfly_i4::groups_text(o.turbo.groups) : std::string("none")) << "\",\"scale_rule\":\""
         << strix::onfly_i4::scale_rule_name(o.turbo.scale_rule) << "\",\"scope\":\""
-        << (o.turbo.active() ? std::string(strix::onfly_i4::kScopeNote) : std::string("native packs")) << "\"}";
+        << (o.turbo.active() ? std::string(strix::onfly_i4::kScopeNote) : std::string("native packs")) << "\""
+        << ",\"row_decode\":{\"requested\":\"" << core::iu4_rows::single_decode_policy_name(o.turbo.row_decode.requested)
+        << "\",\"effective\":\"" << core::iu4_rows::single_decode_policy_name(o.turbo.row_decode.effective)
+        << "\",\"enabled\":" << (o.turbo.row_decode.effective == core::iu4_rows::SingleDecodePolicy::split ? "false" : "true")
+        << ",\"reason\":\"" << o.turbo.row_decode.reason
+        << "\",\"automatic_scope\":\"rows7-8-k6144-n2560\",\"device_requirement\":\"gfx1151-wave32\""
+        << ",\"phase\":\"" << (o.turbo.row_decode.effective == core::iu4_rows::SingleDecodePolicy::automatic ?
+            "pending-device-and-shape" : "resolved") << "\"}}";
     out << ",\"hc_lowband_policy\":" << (config.environment.contains("STRIX_QPF2K_HC_LOWBAND") ?
         std::strtoul(config.environment.at("STRIX_QPF2K_HC_LOWBAND").c_str(), nullptr, 0) : 0U);
     out << ",\"hc_lowband_route\":\"exact-fp16-output-only\"";
