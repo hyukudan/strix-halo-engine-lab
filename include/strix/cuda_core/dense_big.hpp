@@ -15,6 +15,12 @@
 
 namespace strix::cuda_core {
 
+// Scratch (planes, expanded weights) of one stream context. nullptr in every call = the module default context (single stream).
+// Concurrent streams need one context each.
+struct BigCtx;
+[[nodiscard]] BigCtx* dense_big_ctx_create();
+void dense_big_ctx_destroy(BigCtx* ctx);
+
 // Activation planes made by dense_big_split (device memory owned by the module; valid until the next split).
 struct BigAct {
     const void* planes = nullptr;  // [terms][rows_pad][in] 16-bit (bf16 hi, mid, lo | f16 permuted)
@@ -34,14 +40,16 @@ enum class BigEpi : std::uint8_t {
 // Splits x (FP32 [rows][in]) into the planes weights of format `fmt` need. terms: 1..3 (bf16 and q8_0 only; nvfp4 ignores it).
 // rows <= max rows given to dense_big_reserve. `in` % 32 == 0.
 cudaError_t dense_big_split(const float* x, std::uint32_t rows, std::uint32_t in, WeightFormat fmt, int terms, BigAct* out,
-                            cudaStream_t stream);
+                            cudaStream_t stream, BigCtx* ctx = nullptr);
 // y[r][o] = epilogue(W x_r), r < a.rows. The planes must come from dense_big_split with the same format class as w.
-cudaError_t dense_big_gemm(const DenseWeight& w, const BigAct& a, float* y, const float* aux, BigEpi epi, cudaStream_t stream);
+cudaError_t dense_big_gemm(const DenseWeight& w, const BigAct& a, float* y, const float* aux, BigEpi epi, cudaStream_t stream,
+                           BigCtx* ctx = nullptr);
 // Grows the module's scratch (planes, expanded weights) once, outside any measured region. max_in / max_out_in as elements.
-cudaError_t dense_big_reserve(std::uint32_t max_rows, std::uint32_t max_in, std::uint64_t max_weight_elems, int max_terms);
+cudaError_t dense_big_reserve(std::uint32_t max_rows, std::uint32_t max_in, std::uint64_t max_weight_elems, int max_terms,
+                              BigCtx* ctx = nullptr);
 // Release the scratch.
-void dense_big_release();
+void dense_big_release(BigCtx* ctx = nullptr);
 // Diagnostics: bytes currently reserved.
-[[nodiscard]] std::uint64_t dense_big_reserved_bytes();
+[[nodiscard]] std::uint64_t dense_big_reserved_bytes(const BigCtx* ctx = nullptr);
 
 }  // namespace strix::cuda_core

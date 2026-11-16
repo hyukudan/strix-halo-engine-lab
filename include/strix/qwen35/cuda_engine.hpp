@@ -50,6 +50,7 @@ struct EngineOptions {
     // Large-M prefill (CudaEngine::prefill). Default exact = bitwise equal to the windowed path.
     PrefillArith prefill_arith = PrefillArith::exact;
     std::uint32_t prefill_chunk = 2048;  // rows per large-M chunk (multiple of 128, <= 8192); buffers are allocated on first use
+    std::uint32_t prefill_slots = 2;     // chunks in flight (1..2): 2 overlaps the sequential GDN kernel of one chunk with the GEMMs of the next
     bool prefill_big = true;             // false: prefill() runs forward_rows windows of 32 + commit (reference / fallback)
 };
 
@@ -95,7 +96,7 @@ public:
     // Prefill n tokens (any n >= 1) at positions committed() .. committed()+n-1 and COMMIT them (same committed state as forward_rows
     // windows + commit(rows) under PrefillArith::exact). Returns the logits / argmax / hidden of the LAST token (want = last; none
     // skips the lm_head). Runs the large-M tensor-core path in chunks of options().prefill_chunk rows; falls back to windows when
-    // prefill_big is off, dense arith is fp32 or a weight shape is unsupported. Async on stream(); no CUDA graphs.
+    // prefill_big is off, dense arith is fp32 or a weight shape is unsupported. Synchronises the host at the end (own streams); no CUDA graphs.
     RowsOut prefill(const std::uint32_t* tokens, std::uint32_t n, LogitRows want = LogitRows::last);
     [[nodiscard]] bool prefill_is_big() const;  // whether prefill() takes the large-M path for this engine
     // Accepts the first k rows of the last forward_rows window (0 <= k <= rows). Async on stream().

@@ -18,6 +18,16 @@
 #include "../common.cuh"
 
 namespace strix::cuda_core {
+// Scratch of one stream context: activation planes, expanded weight, q8 scales (grow-only).
+struct BigCtx {
+    void* planes[2] = {nullptr, nullptr};  // slot 0: bf16 planes, slot 1: f16 plane (both may be live for one x)
+    std::uint64_t planes_bytes[2] = {0, 0};
+    void* wexp = nullptr;
+    std::uint64_t wexp_bytes = 0;
+    float* scales = nullptr;
+    std::uint64_t scales_bytes = 0;
+};
+
 namespace {
 
 constexpr int BM = 128, BK = 32;
@@ -56,43 +66,52 @@ __device__ __forceinline__ void mma(float (&c)[4], const std::uint32_t (&a)[4], 
                      : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
 }
 
-template <int T, int NT>
+// BKB = 32-blocks per pipeline unit (1 or 2): a unit is BKB consecutive blocks of one segment.
+template <int T, int NT, int BKB>
 struct Cfg {
     static constexpr int BN = 4 * NT * 8;
-    static constexpr int A_ELEMS = BM * BK, B_ELEMS = T * BN * BK;
+    static constexpr int UK = BK * BKB, RU = 8 * BKB;  // elements per row of a unit, 8-byte units per row
+    static constexpr int A_ELEMS = BM * UK, B_ELEMS = T * BN * UK;
     static constexpr int STAGE_ELEMS = A_ELEMS + B_ELEMS;
-    static constexpr int STAGES = (STAGE_ELEMS * 2 * 4 <= 99 * 1024) ? 4 : 3;
+    static constexpr int STAGES = (STAGE_ELEMS * 2 * 4 <= 99 * 1024) ? 4 : (STAGE_ELEMS * 2 * 3 <= 99 * 1024) ? 3 : 2;
     static constexpr int SMEM = STAGES * STAGE_ELEMS * 2;
 };
+// XOR mask on the 8-byte unit index of a shared row (conflict-free LDS.64 fragment reads)
+template <int BKB>
+__device__ __forceinline__ int swz_mask(std::uint32_t row) {
+    if constexpr (BKB == 1) return (row >> 1) & 1;
+    else return (row & 1) | (((row >> 1) & 1) << 3);
+}
 
-template <int T, int NT>
+template <int T, int NT, int BKB>
 __device__ __forceinline__ void load_unit(const BigArgs& a, std::uint16_t* sbase, std::uint32_t o0, std::uint32_t r0, std::uint32_t kb) {
-    using C = Cfg<T, NT>;
+    using C = Cfg<T, NT, BKB>;
     const std::uint32_t tid = threadIdx.x;
     const std::uint32_t sb = static_cast<std::uint32_t>(__cvta_generic_to_shared(sbase));
 #pragma unroll
-    for (int i = 0; i < BM * 8 / 256; ++i) {
-        const std::uint32_t idx = tid + 256 * i, r = idx >> 3, u = idx & 7;
+    for (int i = 0; i < BM * C::RU / 256; ++i) {
+        const std::uint32_t idx = tid + 256 * i, r = idx / C::RU, u = idx % C::RU;
         const std::uint32_t orow = min(o0 + r, a.out - 1);
         const std::uint16_t* src = a.A + static_cast<std::size_t>(orow) * a.in + kb * 32 + u * 4;
-        cp8(sb + (r * 32 + ((u ^ ((r >> 1) & 1)) * 4)) * 2, src);
+        cp8(sb + (r * C::UK + ((u ^ swz_mask<BKB>(r)) * 4)) * 2, src);
     }
 #pragma unroll
     for (int t = 0; t < T; ++t)
 #pragma unroll
-        for (int i = 0; i < C::BN * 8 / 256; ++i) {
-            const std::uint32_t idx = tid + 256 * i, r = idx >> 3, u = idx & 7;
+        for (int i = 0; i < C::BN * C::RU / 256; ++i) {
+            const std::uint32_t idx = tid + 256 * i, r = idx / C::RU, u = idx % C::RU;
             const std::uint16_t* src = a.P + (static_cast<std::size_t>(t) * a.rows_pad + r0 + r) * a.in + kb * 32 + u * 4;
-            cp8(sb + (C::A_ELEMS + (t * C::BN + r) * 32 + ((u ^ ((r >> 1) & 1)) * 4)) * 2, src);
+            cp8(sb + (C::A_ELEMS + (t * C::BN + r) * C::UK + ((u ^ swz_mask<BKB>(r)) * 4)) * 2, src);
         }
 }
 
-template <bool F16, int T, int NT, int MODE>
+template <bool F16, int T, int NT, int MODE, int BKB>
 __global__ void __launch_bounds__(256, 1) big_kernel(const BigArgs a) {
-    using C = Cfg<T, NT>;
+    using C = Cfg<T, NT, BKB>;
     extern __shared__ __align__(16) std::uint16_t smem[];
     const std::uint32_t o0 = blockIdx.x * BM, r0 = blockIdx.y * C::BN;
-    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, q = lane & 3, swz = (g >> 1) & 1;
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, q = lane & 3;
+    const int swz = swz_mask<BKB>(g);  // (row & 3) == (g & 3) for every row this thread reads
     const int wm = warp & 1, wn = warp >> 1;
     float S[4][NT][4], acc[4][NT][4];
 #pragma unroll
@@ -106,7 +125,7 @@ __global__ void __launch_bounds__(256, 1) big_kernel(const BigArgs a) {
     std::uint32_t nload = 0;
 #pragma unroll
     for (int s = 0; s < C::STAGES - 1; ++s) {
-        if (nload < nkb) load_unit<T, NT>(a, smem + s * C::STAGE_ELEMS, o0, r0, a.kbs[nload]);
+        if (nload < nkb) load_unit<T, NT, BKB>(a, smem + s * C::STAGE_ELEMS, o0, r0, a.kbs[nload]);
         ++nload;
         cp_commit();
     }
@@ -117,15 +136,17 @@ __global__ void __launch_bounds__(256, 1) big_kernel(const BigArgs a) {
         for (; n < seg_stop; ++n) {
             cp_wait<C::STAGES - 2>();
             __syncthreads();
-            if (nload < nkb) load_unit<T, NT>(a, smem + (nload % C::STAGES) * C::STAGE_ELEMS, o0, r0, a.kbs[nload]);
+            if (nload < nkb) load_unit<T, NT, BKB>(a, smem + (nload % C::STAGES) * C::STAGE_ELEMS, o0, r0, a.kbs[nload]);
             ++nload;
             cp_commit();
             const std::uint16_t* sA = smem + (n % C::STAGES) * C::STAGE_ELEMS;
             const std::uint16_t* sB = sA + C::A_ELEMS;
+#pragma unroll
+            for (int blk = 0; blk < BKB; ++blk) {
             float scl[4][2];
             [[maybe_unused]] float part[4][NT][4];
             if constexpr (MODE == kFold) {
-                const std::uint32_t kb = a.kbs[n];
+                const std::uint32_t kb = a.kbs[n] + blk;
                 const std::uint32_t nb = a.in >> 5;
 #pragma unroll
                 for (int mt = 0; mt < 4; ++mt)
@@ -143,19 +164,19 @@ __global__ void __launch_bounds__(256, 1) big_kernel(const BigArgs a) {
             }
 #pragma unroll
             for (int s = 0; s < 2; ++s) {
-                const int pu = (2 * q + s) ^ swz;
+                const int pu = (blk * 8 + 2 * q + s) ^ swz;
                 uint2 af[4][2];
 #pragma unroll
                 for (int mt = 0; mt < 4; ++mt)
 #pragma unroll
                     for (int h = 0; h < 2; ++h)
-                        af[mt][h] = *reinterpret_cast<const uint2*>(sA + (wm * 64 + mt * 16 + h * 8 + g) * 32 + pu * 4);
+                        af[mt][h] = *reinterpret_cast<const uint2*>(sA + (wm * 64 + mt * 16 + h * 8 + g) * C::UK + pu * 4);
 #pragma unroll
                 for (int nt = 0; nt < NT; ++nt) {
                     uint2 bf[T];
 #pragma unroll
                     for (int t = 0; t < T; ++t)
-                        bf[t] = *reinterpret_cast<const uint2*>(sB + (t * C::BN + wn * NT * 8 + nt * 8 + g) * 32 + pu * 4);
+                        bf[t] = *reinterpret_cast<const uint2*>(sB + (t * C::BN + wn * NT * 8 + nt * 8 + g) * C::UK + pu * 4);
 #pragma unroll
                     for (int mt = 0; mt < 4; ++mt) {
                         const std::uint32_t av[4] = {af[mt][0].x, af[mt][1].x, af[mt][0].y, af[mt][1].y};
@@ -178,6 +199,7 @@ __global__ void __launch_bounds__(256, 1) big_kernel(const BigArgs a) {
                         acc[mt][nt][3] = __fadd_rn(acc[mt][nt][3], __fmul_rn(scl[mt][1], part[mt][nt][3]));
                     }
             }
+            }  // blk
         }
         // segment end: S = S + acc (the first segment initialises S), acc = 0
 #pragma unroll
@@ -300,14 +322,8 @@ std::map<std::tuple<int, std::uint32_t, std::uint32_t, std::uint32_t>, Table>& t
     static std::map<std::tuple<int, std::uint32_t, std::uint32_t, std::uint32_t>, Table> t;
     return t;
 }
-struct Scratch {
-    void* planes[2] = {nullptr, nullptr};  // slot 0: bf16 planes, slot 1: f16 plane (both may be live for one x)
-    std::uint64_t planes_bytes[2] = {0, 0};
-    void* wexp = nullptr;
-    std::uint64_t wexp_bytes = 0;
-    float* scales = nullptr;
-    std::uint64_t scales_bytes = 0;
-};
+using Scratch = BigCtx;
+bool g_bkb2 = true;
 Scratch& scratch() {
     static Scratch s;
     return s;
@@ -323,11 +339,11 @@ cudaError_t grow(void** p, std::uint64_t* have, std::uint64_t need) {
     return cudaSuccess;
 }
 
-const Table* get_table(Mode mode, std::uint32_t out, std::uint32_t in) {
+const Table* get_table(Mode mode, std::uint32_t out, std::uint32_t in, int bkb) {
     const std::uint32_t nkb = in >> 5;
     std::uint32_t key2 = 0;
     if (mode == kSplit) key2 = nvfp4_split_k(out, in);
-    const auto key = std::make_tuple(static_cast<int>(mode), in, mode == kSplit ? key2 : 0u, 0u);
+    const auto key = std::make_tuple(static_cast<int>(mode), in, mode == kSplit ? key2 : 0u, static_cast<std::uint32_t>(bkb));
     auto it = tables().find(key);
     if (it != tables().end()) return &it->second;
     std::vector<int> kbs, ends;
@@ -349,6 +365,13 @@ const Table* get_table(Mode mode, std::uint32_t out, std::uint32_t in) {
             ends.push_back(static_cast<int>(kbs.size()));
         }
     }
+    if (bkb > 1) {  // units of bkb consecutive blocks (every segment is a multiple of bkb long and bkb-aligned: in % 128 == 0)
+        std::vector<int> ub, ue;
+        for (std::size_t i = 0; i < kbs.size(); i += bkb) ub.push_back(kbs[i]);
+        for (int e : ends) ue.push_back(e / bkb);
+        kbs = ub;
+        ends = ue;
+    }
     Table t;
     t.nkb = static_cast<std::uint32_t>(kbs.size());
     t.nseg = static_cast<std::uint32_t>(ends.size());
@@ -359,16 +382,16 @@ const Table* get_table(Mode mode, std::uint32_t out, std::uint32_t in) {
     return &tables().emplace(key, t).first->second;
 }
 
-template <bool F16, int T, int NT, int MODE>
+template <bool F16, int T, int NT, int MODE, int BKB>
 cudaError_t launch(const BigArgs& a, std::uint32_t out, std::uint32_t rows, cudaStream_t s) {
-    using C = Cfg<T, NT>;
+    using C = Cfg<T, NT, BKB>;
     static bool attr = false;
     if (!attr) {
-        if (auto e = cudaFuncSetAttribute(big_kernel<F16, T, NT, MODE>, cudaFuncAttributeMaxDynamicSharedMemorySize, C::SMEM); e != cudaSuccess) return e;
+        if (auto e = cudaFuncSetAttribute(big_kernel<F16, T, NT, MODE, BKB>, cudaFuncAttributeMaxDynamicSharedMemorySize, C::SMEM); e != cudaSuccess) return e;
         attr = true;
     }
     const dim3 grid((out + BM - 1) / BM, (rows + C::BN - 1) / C::BN);
-    big_kernel<F16, T, NT, MODE><<<grid, 256, C::SMEM, s>>>(a);
+    big_kernel<F16, T, NT, MODE, BKB><<<grid, 256, C::SMEM, s>>>(a);
     return cudaGetLastError();
 }
 
@@ -381,8 +404,8 @@ bool dense_big_supported(const DenseWeight& w) {
     return false;
 }
 
-cudaError_t dense_big_reserve(std::uint32_t max_rows, std::uint32_t max_in, std::uint64_t max_weight_elems, int max_terms) {
-    Scratch& S = scratch();
+cudaError_t dense_big_reserve(std::uint32_t max_rows, std::uint32_t max_in, std::uint64_t max_weight_elems, int max_terms, BigCtx* ctx) {
+    Scratch& S = ctx ? *ctx : scratch();
     const std::uint32_t rp = (max_rows + 127) / 128 * 128;
     if (auto e = grow(&S.planes[0], &S.planes_bytes[0], static_cast<std::uint64_t>(std::max(1, max_terms)) * rp * max_in * 2); e != cudaSuccess) return e;
     if (auto e = grow(&S.planes[1], &S.planes_bytes[1], static_cast<std::uint64_t>(rp) * max_in * 2); e != cudaSuccess) return e;
@@ -390,19 +413,28 @@ cudaError_t dense_big_reserve(std::uint32_t max_rows, std::uint32_t max_in, std:
     return grow(reinterpret_cast<void**>(&S.scales), &S.scales_bytes, max_weight_elems / 32 * 4);
 }
 
-void dense_big_release() {
-    Scratch& S = scratch();
+void dense_big_release(BigCtx* ctx) {
+    Scratch& S = ctx ? *ctx : scratch();
     for (void* p : S.planes)
         if (p) cudaFree(p);
     if (S.wexp) cudaFree(S.wexp);
     if (S.scales) cudaFree(S.scales);
     S = Scratch{};
 }
-std::uint64_t dense_big_reserved_bytes() { return scratch().planes_bytes[0] + scratch().planes_bytes[1] + scratch().wexp_bytes + scratch().scales_bytes; }
+std::uint64_t dense_big_reserved_bytes(const BigCtx* ctx) {
+    const Scratch& S = ctx ? *ctx : scratch();
+    return S.planes_bytes[0] + S.planes_bytes[1] + S.wexp_bytes + S.scales_bytes;
+}
+BigCtx* dense_big_ctx_create() { return new BigCtx(); }
+void dense_big_ctx_destroy(BigCtx* ctx) {
+    if (!ctx) return;
+    dense_big_release(ctx);
+    delete ctx;
+}
 
-cudaError_t dense_big_split(const float* x, std::uint32_t rows, std::uint32_t in, WeightFormat fmt, int terms, BigAct* out, cudaStream_t s) {
+cudaError_t dense_big_split(const float* x, std::uint32_t rows, std::uint32_t in, WeightFormat fmt, int terms, BigAct* out, cudaStream_t s, BigCtx* ctx) {
     if (rows == 0 || in % 32 != 0 || terms < 1 || terms > 3) return cudaErrorInvalidValue;
-    Scratch& S = scratch();
+    Scratch& S = ctx ? *ctx : scratch();
     const std::uint32_t rp = (rows + 127) / 128 * 128;
     const bool f16 = fmt == WeightFormat::nvfp4;
     const int T = f16 ? 1 : terms;
@@ -429,10 +461,10 @@ cudaError_t dense_big_split(const float* x, std::uint32_t rows, std::uint32_t in
     return cudaSuccess;
 }
 
-cudaError_t dense_big_gemm(const DenseWeight& w, const BigAct& a, float* y, const float* aux, BigEpi epi, cudaStream_t s) {
+cudaError_t dense_big_gemm(const DenseWeight& w, const BigAct& a, float* y, const float* aux, BigEpi epi, cudaStream_t s, BigCtx* ctx) {
     if (!dense_big_supported(w) || a.in != w.in || a.f16 != (w.format == WeightFormat::nvfp4)) return cudaErrorInvalidValue;
     if (epi != BigEpi::none && aux == nullptr) return cudaErrorInvalidValue;
-    Scratch& S = scratch();
+    Scratch& S = ctx ? *ctx : scratch();
     BigArgs ba{};
     ba.P = static_cast<const std::uint16_t*>(a.planes);
     ba.y = y;
@@ -463,21 +495,22 @@ cudaError_t dense_big_gemm(const DenseWeight& w, const BigAct& a, float* y, cons
         if (auto e = nvfp4_expand_f16(w, S.wexp, s); e != cudaSuccess) return e;
         ba.A = static_cast<const std::uint16_t*>(S.wexp);
     }
-    const Table* tb = get_table(mode, w.out, w.in);
+    const int bkb = (w.in % 128 == 0 && a.terms <= 2 && g_bkb2) ? 2 : 1;
+    const Table* tb = get_table(mode, w.out, w.in, bkb);
     if (tb == nullptr) return cudaErrorMemoryAllocation;
     ba.kbs = tb->kbs;
     ba.seg_end = tb->seg_end;
     ba.nseg = tb->nseg;
     ba.nkb = tb->nkb;
-    if (mode == kSplit) return launch<true, 1, 4, kSplit>(ba, w.out, a.rows, s);
+    if (mode == kSplit) return bkb == 2 ? launch<true, 1, 4, kSplit, 2>(ba, w.out, a.rows, s) : launch<true, 1, 4, kSplit, 1>(ba, w.out, a.rows, s);
     if (mode == kFold) {
-        if (a.terms == 1) return launch<false, 1, 2, kFold>(ba, w.out, a.rows, s);
-        if (a.terms == 2) return launch<false, 2, 2, kFold>(ba, w.out, a.rows, s);
-        return launch<false, 3, 2, kFold>(ba, w.out, a.rows, s);
+        if (a.terms == 1) return bkb == 2 ? launch<false, 1, 4, kFold, 2>(ba, w.out, a.rows, s) : launch<false, 1, 2, kFold, 1>(ba, w.out, a.rows, s);
+        if (a.terms == 2) return bkb == 2 ? launch<false, 2, 2, kFold, 2>(ba, w.out, a.rows, s) : launch<false, 2, 2, kFold, 1>(ba, w.out, a.rows, s);
+        return launch<false, 3, 2, kFold, 1>(ba, w.out, a.rows, s);
     }
-    if (a.terms == 1) return launch<false, 1, 4, kChain>(ba, w.out, a.rows, s);
-    if (a.terms == 2) return launch<false, 2, 4, kChain>(ba, w.out, a.rows, s);
-    return launch<false, 3, 4, kChain>(ba, w.out, a.rows, s);
+    if (a.terms == 1) return bkb == 2 ? launch<false, 1, 4, kChain, 2>(ba, w.out, a.rows, s) : launch<false, 1, 4, kChain, 1>(ba, w.out, a.rows, s);
+    if (a.terms == 2) return bkb == 2 ? launch<false, 2, 4, kChain, 2>(ba, w.out, a.rows, s) : launch<false, 2, 4, kChain, 1>(ba, w.out, a.rows, s);
+    return launch<false, 3, 4, kChain, 1>(ba, w.out, a.rows, s);
 }
 
 }  // namespace strix::cuda_core

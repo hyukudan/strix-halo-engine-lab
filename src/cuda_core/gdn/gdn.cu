@@ -128,19 +128,31 @@ __device__ __forceinline__ void delta_body(const DeltaArgs& a, const GdnDims& d,
     for (int k = 0; k < K; ++k) S[k] = sp[static_cast<std::size_t>(k) * d.value_dim];
     pdl_wait();
     const float dtb = a.dt_bias[h], sa = a.ssm_a[h];
-    for (std::uint32_t r = 0; r < rows; ++r) {
+    // row inputs are prefetched one row ahead (loads only: the arithmetic and its order are unchanged)
+    float c_ks = 0.f, c_qs = 0.f, c_v = 0.f, c_b = 0.f, c_a = 0.f, c_z = 0.f;
+    auto fetch = [&](std::uint32_t r) {
         const float* row = a.qkvc + static_cast<std::size_t>(r) * channels;
-        ks[t] = row[d.qk_width() + kh * K + t];
-        if constexpr (OUT) qs[t] = row[kh * K + t];
-        const float braw = a.b_raw[static_cast<std::size_t>(r) * d.value_heads + h];
-        const float araw = a.a_raw[static_cast<std::size_t>(r) * d.value_heads + h];
-        const float beta = cc_sigmoid(braw);
-        const float xin = __fadd_rn(araw, dtb);
+        c_ks = row[d.qk_width() + kh * K + t];
+        if constexpr (OUT) {
+            c_qs = row[kh * K + t];
+            c_z = a.z[static_cast<std::size_t>(r) * d.v_width() + h * d.value_dim + t];
+        }
+        c_v = row[2 * d.qk_width() + h * d.value_dim + t];
+        c_b = a.b_raw[static_cast<std::size_t>(r) * d.value_heads + h];
+        c_a = a.a_raw[static_cast<std::size_t>(r) * d.value_heads + h];
+    };
+    if (rows > 0) fetch(0);
+    for (std::uint32_t r = 0; r < rows; ++r) {
+        ks[t] = c_ks;
+        if constexpr (OUT) qs[t] = c_qs;
+        const float vcol = c_v, zv = c_z;
+        const float beta = cc_sigmoid(c_b);
+        const float xin = __fadd_rn(c_a, dtb);
         const float sp_ = xin > 20.0f ? xin : cc_log1pf(cc_expf(xin));
         const float g = __fmul_rn(sa, sp_);
         const float decay = cc_expf(g);
-        const float vcol = row[2 * d.qk_width() + h * d.value_dim + t];
         __syncthreads();
+        if (r + 1 < rows) fetch(r + 1);
         float kv = 0.0f;
 #pragma unroll
         for (int k = 0; k < K; ++k) {
@@ -159,7 +171,7 @@ __device__ __forceinline__ void delta_body(const DeltaArgs& a, const GdnDims& d,
             const float inv = __fdiv_rn(1.0f, __fsqrt_rn(__fadd_rn(__fdiv_rn(ss, 128.0f), eps)));
             float v = __fmul_rn(acc, inv);
             v = __fmul_rn(v, a.gain[t]);
-            v = __fmul_rn(v, cc_silu(a.z[static_cast<std::size_t>(r) * d.v_width() + h * d.value_dim + t]));
+            v = __fmul_rn(v, cc_silu(zv));
             a.out[static_cast<std::size_t>(r) * d.v_width() + h * d.value_dim + t] = v;
         } else {
 #pragma unroll

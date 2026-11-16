@@ -102,7 +102,7 @@ int main(int argc, char** argv) {
         q::EngineOptions topt;  // TURBO levers (defaults = exact)
         std::string arith_name = "mma3";
         std::string pf_arith;            // --prefill-arith exact|flash|fast|fast2: large-M prefill (absent: windows of --rows)
-        std::uint32_t pf_chunk = 2048, pf_repeat = 1;
+        std::uint32_t pf_chunk = 2048, pf_repeat = 1, pf_slots = 2;
         for (int i = 1; i < argc; ++i) {
             const std::string a = argv[i];
             auto next = [&]() -> std::string {
@@ -120,6 +120,7 @@ int main(int argc, char** argv) {
             else if (a == "--max-pos") max_pos = static_cast<std::uint32_t>(std::stoul(next()));
             else if (a == "--prefill-arith") pf_arith = next();
             else if (a == "--prefill-chunk") pf_chunk = static_cast<std::uint32_t>(std::stoul(next()));
+            else if (a == "--prefill-slots") pf_slots = static_cast<std::uint32_t>(std::stoul(next()));
             else if (a == "--prefill-repeat") pf_repeat = static_cast<std::uint32_t>(std::stoul(next()));
             else if (a == "--layers") layers_override = static_cast<std::uint32_t>(std::stoul(next()));
             else if (a == "--graphs") graphs = next() != "0";
@@ -181,6 +182,7 @@ int main(int argc, char** argv) {
             else if (pf_arith == "fast2") opt.prefill_arith = q::PrefillArith::fast2;
             else throw std::runtime_error("--prefill-arith expects exact|flash|fast|fast2");
             opt.prefill_chunk = pf_chunk;
+            opt.prefill_slots = pf_slots;
         }
         opt.use_graphs = graphs;
         opt.multi_gemv = multi;
