@@ -266,25 +266,45 @@ def percentile(values, q):
     return ordered[low] + (ordered[high] - ordered[low]) * (position - low)
 
 
-def peak_1s(times, tokens):
-    """Highest emitted-token rate over any 1 s window starting at a chunk arrival (tok/s); None when the chunks
-    span less than 1 s. A chunk carries tokens / len(times) tokens on average (an MTP window may stream several),
-    so the window's chunk count is scaled by that ratio: emitted tokens only."""
-    if not times or not tokens or max(times) - min(times) < 1.0:
+def peak_1s(times, chunk_token_counts):
+    """Peak tokens in a half-open 1 s arrival window; None without measured counts for every chunk,
+    or when arrivals span less than 1 s. Total usage cannot recover variable chunk sizes."""
+    if (not times or not isinstance(chunk_token_counts, (list, tuple))
+            or len(times) != len(chunk_token_counts)
+            or any(type(n) is not int or n < 0 for n in chunk_token_counts)
+            or max(times) - min(times) < 1.0):
         return None
-    ts, best, j = sorted(times), 0, 0
-    for i, t in enumerate(ts):
-        while j < len(ts) and ts[j] < t + 1.0:
+    chunks, best, total, j = sorted(zip(times, chunk_token_counts)), 0, 0, 0
+    for t, count in chunks:
+        while j < len(chunks) and chunks[j][0] < t + 1.0:
+            total += chunks[j][1]
             j += 1
-        best = max(best, j - i)
-    return best * tokens / len(ts)
+        best = max(best, total)
+        total -= count
+    return float(best)
+
+
+def peak_events_1s(events):
+    """Pool measured chunks, never per-request usage ratios; incomplete measurements yield None."""
+    times, counts = [], []
+    for event in events:
+        ts = event.get("token_times") or []
+        if event.get("error") is not None or not ts:
+            continue
+        ns = event.get("chunk_token_counts")
+        if not isinstance(ns, (list, tuple)) or len(ns) != len(ts):
+            return None
+        times.extend(ts)
+        counts.extend(ns)
+    return peak_1s(times, counts)
 
 
 def request_metrics(event):
     """One request's event record -> its numbers.
 
     event: arrival (s), token_times (s, one per content chunk), tokens (usage completion tokens, or None: the
-    chunk count is used), optional error. A request with fewer than two tokens has no per-request rate."""
+    chunk count is used), optional error and chunk_token_counts (measured tokens per content chunk).
+    A request with fewer than two tokens has no per-request rate. Without per-chunk counts the peak is unknown."""
     times = event.get("token_times") or []
     tokens = event.get("tokens")
     if tokens is None:
@@ -293,7 +313,7 @@ def request_metrics(event):
     rate = (tokens - 1) / (last - first) if tokens >= 2 and times and last > first else None
     return dict(tokens=tokens, arrival=event["arrival"], first_token=first, last_token=last,
                 ttft_s=first - event["arrival"] if first is not None else None, tok_s=rate,
-                peak_1s_tok_s=peak_1s(times, tokens), prompt_tokens=event.get("prompt_tokens"), restored_tokens=event.get("restored_tokens"),
+                peak_1s_tok_s=peak_1s(times, event.get("chunk_token_counts")), prompt_tokens=event.get("prompt_tokens"), restored_tokens=event.get("restored_tokens"),
                 ids_sha256=event.get("ids_sha256"), error=event.get("error"))
 
 
@@ -312,8 +332,7 @@ def burst_metrics(events):
         ttft_p50_s=percentile(ttft, 50), ttft_p95_s=percentile(ttft, 95),
         per_request_tok_s_p50=percentile(rates, 50), per_request_tok_s_min=min(rates) if rates else None,
         sum_per_request_tok_s=sum(rates) if rates else None,
-        peak_1s_tok_s=peak_1s([t for e in events if e.get("error") is None for t in (e.get("token_times") or [])],
-                              tokens),
+        peak_1s_tok_s=peak_events_1s(events),
         prompt_tokens=sum(r["prompt_tokens"] or 0 for r in done),
         prompt_tokens_restored=sum(restored) if restored else None,
         ids_sha256=[r["ids_sha256"] for r in requests],

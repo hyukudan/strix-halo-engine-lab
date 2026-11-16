@@ -4,13 +4,14 @@
     prefill_client.py --url URL --out RUN_DIR [--chat] [--body-extra JSON] PROMPT_FILE...
 
 Each prompt file is sent once, in order, as its own C1 request with max_tokens 1 (tools/serve_bench.py does the
-request). Give at least two files per length with different first lines (distinct prefixes: no prefix-cache hit);
-the first request of a length is reported as "cold", the last as "warm". The context actually filled is the
+request). Rows preserve file order; this client neither groups by length nor infers cold/warm cache state.
+Use distinct prefixes when measuring uncached prefill. The context actually filled is the
 server's usage.prompt_tokens. Prefill tok/s = prompt_tokens / client TTFT (TTFT includes queueing, tokenization and
 the first sampled token, the same for every engine). Writes RUN_DIR/client-result.json (completed, failed, rows).
 """
 import argparse
 import json
+import math
 import pathlib
 import subprocess
 import sys
@@ -42,9 +43,17 @@ def main(argv=None):
         try:
             client = json.loads(res.read_text(encoding="utf-8"))["bursts"][0]["client"]
             row.update(prompt_tokens=client["prompt_tokens"], ttft_s=client["ttft_p50_s"], failed=client["failed"])
-            row["prefill_tok_s"] = (row["prompt_tokens"] / row["ttft_s"]) if row["ttft_s"] else None
+            if type(row["prompt_tokens"]) is not int or row["prompt_tokens"] <= 0:
+                raise ValueError("positive measured usage.prompt_tokens required")
+            if (type(row["ttft_s"]) not in (int, float) or not math.isfinite(row["ttft_s"])
+                    or row["ttft_s"] <= 0):
+                raise ValueError("finite positive TTFT required")
+            rate = row["prompt_tokens"] / row["ttft_s"]
+            if not math.isfinite(rate) or rate <= 0:
+                raise ValueError("finite positive prefill throughput required")
+            row["prefill_tok_s"] = rate
         except (OSError, KeyError, IndexError, ValueError, TypeError) as e:
-            row.update(error=f"{type(e).__name__}: {e}", failed=1)
+            row.update(error=f"{type(e).__name__}: {e}", failed=1, prefill_tok_s=None)
         failed += 1 if rc or row.get("failed") else 0
         rows.append(row)
         print(json.dumps(row), flush=True)

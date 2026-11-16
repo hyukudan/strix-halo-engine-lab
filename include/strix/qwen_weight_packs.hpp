@@ -54,7 +54,8 @@ inline constexpr std::array<weight_pack::Decl, 3> family{{
      "as qwen38-gsq-rco-iq3s-v1 for any mix of decodable types (unqualified composite)", native_all}}};
 
 inline weight_pack::Admission admit(std::span<const weight_pack::Tensor> tensors) {
-    return weight_pack::admit(family, tensors);
+    static constexpr std::array<weight_pack::TypePair, 1> paired{{{"_gate_exps", "_up_exps"}}};
+    return weight_pack::admit(family, tensors, paired);
 }
 // The one entry point of the engine (driver load) and of --print-effective-config: the merged tensor list of every part.
 inline weight_pack::Admission admit_file(const gguf::FileInfo& info) {
@@ -72,11 +73,6 @@ inline weight_pack::Admission admit_model(const std::string& path) {
     }
     return admit_file(all);
 }
-inline std::string hex64(std::uint64_t x) {
-    char b[17];
-    for (int i = 15; i >= 0; --i, x >>= 4U) b[i] = "0123456789abcdef"[x & 15U];
-    b[16] = 0;
-    return b;
-}
+using weight_pack::hex64;
 
 }  // namespace strix::qwen_packs
