@@ -45,10 +45,11 @@ inline unsigned score_rows(std::uint32_t max_blocks) {
     return qsa_auto_score_rows(max_blocks, qpf2k::long_context_item_enabled("STRIX_QSA_SCORE_ROWS64"));
 }
 // STRIX_QSA_SCORE_SPLIT_LOADS (default on; 0 = the previous merged-load form): score_kernel's SplitLoads (see
-// head_dot). Bit-identical either way; startup-cached, restart between A/B arms.
+// head_dot). The requested value is startup-cached; shared baseline/master/model
+// suppression is applied after the cache, as for the other exact organization items.
 inline bool score_split_loads() {
     static const bool on = strix::envcfg::flag("STRIX_QSA_SCORE_SPLIT_LOADS", true);
-    return on;
+    return on && !qpf2k::long_context_item_suppression("STRIX_QSA_SCORE_SPLIT_LOADS");
 }
 constexpr unsigned kGroup = 4U; // blocks per selection group (score_kernel maxima, select_kernel)
 typedef __attribute__((address_space(4))) const float* uniform_ptr;
