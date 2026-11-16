@@ -36,6 +36,13 @@ python tools/qwen35/xcheck_transformers.py HF_DIR DIR/ref.npz            # one-s
 ```
 Cross-check on the synthetic model (GGUF bf16 -> ref_forward vs transformers Qwen3NextForCausalLM, f32): max |dlogit| 1.1e-5,
 top-1 8/8. Q8_0 uses ggml reference rounding (blocks of 32, d = amax/127 as f16, round half away from zero).
+Real pack (2026-11-16): CUDA exact q8_0 vs ref_forward f64 on a 15-token chat prompt + 31 greedy tokens: max |dlogit| 0.032
+(0.06 % of the logit range), top-1 46/46, greedy 31/31.
+
+Measurement kits (`scripts/bench/qwen35/`, parametrised; hosts/paths are arguments):
+`run_classes.sh BIN GGUF OUT [N]` exact drafting per prompt class (code/json/prose, EXACT gate inside);
+`rows_table.sh BIN "MODEL_ARGS" "ROWS"` verify-window ms per rows; `nsys_step.sh NSYS BIN OUT "ARGS"` per-kernel step table;
+`turbo_quality.py REF.bin TURBO.bin VOCAB [ALIGNED_ROWS]` TURBO gate (KL, top-1, error clustering).
 
 ## Sizes (parameters: trunk 24.35 B + head 1.27 B; vision skipped)
 BF16 pack ~51.2 GB per decode pass; Q8_0 pack ~27.2 GB (34/32 bytes per weight). GDN state 151 MB, KV 64 KiB/position (bf16).
