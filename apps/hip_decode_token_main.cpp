@@ -2687,7 +2687,7 @@ static int run_decode_entry(
         views.insert(views.end(), inventory.pinned_views.begin(), inventory.pinned_views.end());
         shared_model_inventory = strix::build_uma_owner_inventory(views);
         optimization_profile_receipt += onfly_i4_owner->receipt_json();
-        std::cerr << "turbo-weights onfly " << strix::onfly_i4::kIdentity << ": " << onfly_i4_owner->copies.size() << " tensors, "
+        std::cerr << "turbo-weights onfly " << onfly_i4_owner->resolved.identity() << ": " << onfly_i4_owner->copies.size() << " tensors, "
                   << onfly_i4_owner->source_bytes << " Q8_0 bytes -> " << onfly_i4_owner->copy_bytes << " INT4 bytes in "
                   << onfly_i4_owner->convert_seconds << " s (" << strix::onfly_i4::groups_text(options.turbo.groups) << ")\n";
     }

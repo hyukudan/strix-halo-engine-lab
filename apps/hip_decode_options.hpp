@@ -1676,7 +1676,11 @@ inline void validate_mtp_cli(const Options& o,bool resolved=false) {
                 throw std::invalid_argument("MTP cohort request requires 3..4097 prompt tokens within the context and a pinned golden");
     }
 }
+inline void validate_onfly_i4_routes(const Options& o) {
+    onfly_i4::require_serial(o.turbo.active(), !o.mtp.cohort.empty() || (o.http_serve && o.http_batch));
+}
 inline void validate_resolved_mtp_cli(const Options& o) {
+    validate_onfly_i4_routes(o);
     validate_mtp_cli(o,true);
     if(o.mtp.enabled && o.mtp.window_rows && (!o.deferred_moe_status || !o.virtual_q8_gdn_input || !o.prefetch_q8_gdn_input ||
        !o.virtual_q8_gdn_output || !o.wave8_q8_gdn_input || !o.wave8_q8_gdn_output))

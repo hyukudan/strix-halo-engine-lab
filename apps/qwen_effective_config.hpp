@@ -541,6 +541,8 @@ inline EffectiveConfig initialize_prefill_config(const RequestedOptions& request
         const auto it = result.environment.find(name);
         return it == result.environment.end() ? nullptr : it->second.c_str();
     }, request.options.product_profile.weights.effective == strix::profile::turbo::Source::onfly);
+    result.options.product_profile.onfly = result.options.turbo;
+    validate_onfly_i4_routes(result.options);
     if (result.options.eager_code_load && !result.environment.contains("HIP_ENABLE_DEFERRED_LOADING"))
         result.environment["HIP_ENABLE_DEFERRED_LOADING"] = "0";
     result.prefill_option_mask = resolve_prefill_options([&](const char* name) -> const char* {

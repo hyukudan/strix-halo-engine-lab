@@ -5,6 +5,7 @@
 #include "strix/q6p_registry.hpp"
 
 #include <cmath>
+#include <array>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -186,16 +187,19 @@ int main() {
     const auto serve = decode_cli::initialize_prefill_config({options_for({"--profile", "turbo", "--turbo-weights", "onfly"}), {{"STRIX_TURBO_ONFLY_GROUPS", "gdn_in,gdn_out"}}});
     const auto native = decode_cli::initialize_prefill_config({options_for({}), {}});
     expect(cli.options.turbo.identity() == serve.options.turbo.identity() && cli.options.turbo.active(), "CLI and server resolve the same effective turbo value");
+    expect(cli.options.product_profile.onfly.identity() == cli.options.turbo.identity() &&
+           serve.options.product_profile.onfly.identity() == serve.options.turbo.identity(), "capabilities retain the resolved request");
     expect(decode_cli::effective_prefill_argv(cli.options) == decode_cli::effective_prefill_argv(serve.options), "CLI and server give the same cache argv");
     expect(decode_cli::effective_prefill_argv(cli.options) != decode_cli::effective_prefill_argv(native.options), "onfly never shares a cache key with native");
     expect(!native.options.turbo.active(), "native default");
 
     // Registry.
     int tensor = 0;
-    unsigned char copy[8]{};
+    const auto backing = std::make_shared<std::array<unsigned char, 8>>();
+    auto* copy = backing->data();
     expect(q6p::iu4::find(&tensor) == nullptr && q6p::iu4::count() == 0, "registry empty");
-    q6p::iu4::register_tensor(&tensor, {copy, 70, 192});
-    const auto* found = q6p::iu4::find(&tensor);
+    q6p::iu4::register_tensor(&tensor, {copy, 70, 192, backing});
+    const auto found = q6p::iu4::find(&tensor);
     expect(found && found->rows == 70 && found->cols == 192 && q6p::iu4::count() == 1, "registered copy found");
     q6p::iu4::unregister_tensor(&tensor, copy + 1);
     expect(q6p::iu4::find(&tensor) != nullptr, "unregister of another owner's copy is a no-op");

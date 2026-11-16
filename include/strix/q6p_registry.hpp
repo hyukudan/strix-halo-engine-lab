@@ -1,4 +1,6 @@
 #pragma once
+#include <memory>
+#include "strix/onfly_i4.hpp"
 
 // Q6P32 dense weights (6.5 bits per weight) that stand in for Q8_0 tensors.
 //
@@ -69,10 +71,13 @@ namespace iu4 {
 struct Tensor {
     const unsigned char* base = nullptr;
     std::uint32_t rows = 0, cols = 0;
+    // Must own base; its final deleter must wait for submitted GPU work before freeing.
+    std::shared_ptr<const void> backing;
 };
 void register_tensor(const void* original_address, const Tensor& tensor);
 void unregister_tensor(const void* original_address, const unsigned char* copy_address) noexcept;
-const Tensor* find(const void* original_address) noexcept;
+// Immutable metadata and backing lease, valid across retirement/replacement.
+std::shared_ptr<const Tensor> find(const void* original_address) noexcept;
 // Registered copies (lock-free; launchers skip the lookup when zero) and successful find() calls.
 std::uint64_t count() noexcept;
 std::uint64_t hits() noexcept;

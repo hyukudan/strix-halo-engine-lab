@@ -20,12 +20,14 @@ public:
         const void* original = nullptr;
         void* device = nullptr;
         std::uint64_t bytes = 0, lease = 0;
+        std::shared_ptr<const void> backing;
     };
     std::vector<Copy> copies;
     std::uint64_t copy_bytes = 0, source_bytes = 0, skipped = 0;
     std::array<std::uint64_t, 4> group_tensors{}, group_copy_bytes{};  // indexed by log2(Group)
     double convert_seconds = 0.0;
-    HipQwenOnflyI4() = default;
+    const onfly_i4::Resolved resolved;
+    explicit HipQwenOnflyI4(onfly_i4::Resolved request = {}) : resolved(request) {}
     HipQwenOnflyI4(const HipQwenOnflyI4&) = delete;
     HipQwenOnflyI4& operator=(const HipQwenOnflyI4&) = delete;
     ~HipQwenOnflyI4();

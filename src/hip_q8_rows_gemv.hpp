@@ -59,6 +59,7 @@
 #include "moe_core/dense_a8_small_layout.hpp"
 #include "strix/known_window_cohort.hpp"
 #include "core/iu4_onfly.hpp"
+#include "core/iu4_plan.hpp"
 #include "core/w4a16.hpp"
 #include "strix/onfly_i4.hpp"
 

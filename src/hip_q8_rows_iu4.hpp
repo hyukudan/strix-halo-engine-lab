@@ -3,7 +3,7 @@
 // `static constexpr unsigned turbo_group` (one bit of strix::turbo_onfly_groups); the launch uses the INT4 copies
 // (q6p::iu4 registry, built at load by hip_qwen_onfly_i4.cpp) when EVERY segment of the site has one, else the
 // Q8_0 kernels run unchanged. Shared kernel over the one W4A16 small-M core (core/w4a16.hpp): activations (BF16 / F32
-// rows, or the dense A8 slot codes * deltas) are staged once per block as FP16, F32 accumulation, a block of S waves
+// rows) are staged once per block as FP16, F32 accumulation, a block of S waves
 // splits K and reduces its partial sums in LDS in a fixed order (deterministic), Site::store is the epilogue.
 // Included from hip_q8_rows_gemv.hpp (namespace strix::q8_rows).
 
@@ -18,13 +18,8 @@ struct Iu4Weights { const unsigned char* base[kMaxSegments]; };
 
 // Plan per (rows R, groups G): S waves split the K groups of a pass, GC groups are staged per pass (G % GC == 0). Rows
 // 7-8 run the core as two 4-row halves (one 8-row core spills VGPRs); wide K is staged in several passes to fit the LDS budget.
-struct Iu4Plan { unsigned S, GC; };
-constexpr Iu4Plan iu4_plan(unsigned R, unsigned G) {
-    if (G == 32U) return Iu4Plan{4U, 32U};
-    if (G == 40U) return Iu4Plan{4U, 40U};
-    if (G == 64U) return R >= 6U ? Iu4Plan{8U, 32U} : Iu4Plan{8U, 64U};
-    return R >= 4U ? Iu4Plan{8U, 32U} : Iu4Plan{8U, 96U};  // G == 96
-}
+using core::iu4::row_plan;
+constexpr auto iu4_plan(unsigned R, unsigned G) { return row_plan(R, G); }
 
 // Grid: one block per (segment, 64 output columns); G = K / 64 groups in G / GC passes, S waves split each pass.
 template <class Site, unsigned S, unsigned G, unsigned GC, bool FromSlot>
@@ -91,22 +86,26 @@ __global__ __launch_bounds__(32 * S) void project_rows_iu4_kernel(Site site, Iu4
     }
 }
 
-// True when the INT4 form launched. slot != nullptr: activations from the dense A8 slot (producer-quantized rows).
+// True when INT4 launched. A8 slots remain exclusively for the Q8 fallback.
+// Even with a slot, use the original site rows and the serial FP16 conversion.
 template <class Site> bool launch_iu4_rows(const Site& site, hipStream_t stream, bool any_order, const DenseA8Slot* slot) {
     if constexpr (Site::rows > 8U || !iu4_group_of<Site>()) return false;
     else {
         if (!q6p::iu4::count() || q6p::iu4::suspended()) return false;
         const unsigned width = site.width;
-        if (width % 64U || site.segments.count == 0U ) return false;
+        if (!onfly_i4::dispatch_width(width) || site.segments.count == 0U ) return false;
         Iu4Weights w{};
+        std::shared_ptr<const q6p::iu4::Tensor> leases[kMaxSegments];
         unsigned blocks = 0;
         for (unsigned m = 0; m < site.segments.count; ++m) {
-            const auto* t = q6p::iu4::find(site.segments.weights[m]);
+            const auto t = q6p::iu4::find(site.segments.weights[m]);
             const unsigned n = site.segments.first[m + 1U] - site.segments.first[m];
             if (!t || t->cols != width || t->rows != n || site.segments.types[m]) return false;
             w.base[m] = t->base;
+            leases[m] = t;
             blocks += (n + 63U) / 64U;
         }
+        onfly_i4::require_serial_projection(Site::rows, false);
         const auto run = [&]<unsigned G>() {
             constexpr unsigned S = iu4_plan(Site::rows, G).S, GC = iu4_plan(Site::rows, G).GC;
             const auto go = [&](auto kernel, const std::int8_t* codes, const float* deltas) {
@@ -116,8 +115,7 @@ template <class Site> bool launch_iu4_rows(const Site& site, hipStream_t stream,
                 else hipLaunchKernelGGL(kernel, dim3(blocks), dim3(32U * S), 0, stream, site, w, codes, deltas);
             };
             if constexpr (Site::rows * GC * 128U <= kIu4StageBytes) {  // staged FP16 rows must fit the LDS budget
-                if (slot) go(project_rows_iu4_kernel<Site, S, G, GC, true>, slot->codes, slot->deltas);
-                else go(project_rows_iu4_kernel<Site, S, G, GC, false>, nullptr, nullptr);
+                go(project_rows_iu4_kernel<Site, S, G, GC, iu4_plan(Site::rows, G).from_a8_slot>, nullptr, nullptr);
             }
         };
         switch (width / 64U) {
