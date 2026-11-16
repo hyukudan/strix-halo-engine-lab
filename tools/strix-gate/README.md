@@ -289,3 +289,11 @@ where the arms part. This is a cross-run comparison: after the first difference 
 different activations, so later differences include propagation, not only local rounding.
 
 `python -m unittest discover -s tools/strix-gate -p 'test_*.py'` covers it with synthetic dumps.
+
+## GLM scored prefill compare: `glm_score_nll.py`
+
+The GLM rank captures the last N prompt rows' logits with `STRIX_GLM_PF_SCORE_LAST=N` and
+`STRIX_GLM_PF_SCORE_OUT=DIR/NAME-tf` (one vocabulary slice per rank). `glm_score_nll.py --dir DIR --ref X1 --test I1
+--prompt P.u32 [--rows 256] [--json OUT]` prints NLL ref/test, dNLL (offset-1 target = the scored rule), mean KL and
+top-1 agreement. The prompt must be the length being gated: a `.u32` file holds 4 bytes per token (a 32,768-byte file
+is an 8K prompt). Tests: `python -m unittest test_glm_score_nll` in this directory.
