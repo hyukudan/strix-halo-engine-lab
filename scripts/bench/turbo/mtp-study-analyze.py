@@ -211,6 +211,16 @@ def compare_logits(left, right, left_run, right_run, context_only=False):
             kl=float(np.sum(np.exp(lx) * (lx - ly))),
             top1_equal=int(tx == ty), bitwise=bitwise))
     return dict(left_records=dict(lc), right_records=dict(rc),
+                matched_left_rows=len({key for key, _ in pairs}),
+                matched_right_rows=len({key for _, key in pairs}),
+                left_frontier_rows=sum(key[2] == 0 for key in l),
+                right_frontier_rows=sum(key[2] == 0 for key in r),
+                matched_left_frontier_rows=sum(key[2] == 0 for key, _ in pairs),
+                matched_right_frontier_rows=len({key for _, key in pairs if key[2] == 0}),
+                completion_ledger_pairs=[dict(request=i,
+                    equal=bool(left_run[0][i].get('token_ids')) and
+                          left_run[0][i].get('token_ids') == right_run[0][i].get('token_ids'))
+                    for i in range(min(len(left_run[0]), len(right_run[0])))],
                 matching='full-context' if context_only else 'full-context-and-physical-row',
                 disagreement_examples=disagreement_examples,
                 row_pairs=[dict(left_rows=lr, left_row=lrow, right_rows=rr, right_row=rrow, **c)

@@ -68,9 +68,13 @@ class ContextMatching(unittest.TestCase):
             write_dump(right, [(100, [5]), (101, [42])])
             matched = study.compare_logits(left, right, run([5, 42]), run([5, 42]), context_only=True)
             self.assertEqual(matched['matched_context_rows'], 2)
+            self.assertEqual(matched['matched_right_rows'], 2)
+            self.assertEqual(matched['matched_right_frontier_rows'], matched['right_frontier_rows'])
+            self.assertTrue(matched['completion_ledger_pairs'][0]['equal'])
             self.assertTrue(any(r['left_row'] == 1 and r['right_row'] == 0 for r in matched['row_pairs']))
             changed = study.compare_logits(left, right, run([5, 8]), run([5, 8]), context_only=True)
             self.assertEqual(changed['matched_context_rows'], 1)
+            self.assertEqual(changed['matched_right_rows'], 1)
 
     def test_speculative_input_need_not_match_eventual_completion(self):
         with tempfile.TemporaryDirectory() as tmp:
