@@ -1992,7 +1992,7 @@ inline std::string effective_config_notice(const EffectiveConfig& config) {
     const auto witness = budget ? "Qwen prefill QSA budget: ranked_slots=" + std::to_string(budget) +
         " local_tail=unchanged decode_verify=unchanged identity=" +
         prefill_identity_name(config.prefill_option_mask, budget) + "; qualification=in-progress\n" : std::string{};
-    return witness + effective_config_route_notice(config) + strix::weight::family_plan_notice(config.weight_plans);
+    return witness + effective_config_route_notice(config);
 }
 inline std::vector<std::string> effective_prefill_argv(const Options& o) {
     std::vector<std::string> args{"--context", std::to_string(o.context_tokens)};

@@ -39,7 +39,7 @@ def main():
     parser.add_argument("--fixture", type=pathlib.Path, help="write protocol fixture, never a kernel receipt")
     parser.add_argument("--out", type=pathlib.Path)
     args = parser.parse_args()
-    summary = {"schema": "wfmt.compare@1", "pass": False}
+    summary = {"schema": "wfmt.compare@1", "pass": False, "mode": "protocol-comparison"}
     try:
         if args.fixture:
             args.fixture.mkdir(parents=True, exist_ok=True)

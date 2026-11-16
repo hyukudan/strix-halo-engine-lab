@@ -19,6 +19,7 @@ second node of a pair is the ssh alias in `KIT_PEER`.
 | `abab.py` | `order` prints the strict ABAB order; `summary OUT [--metric M]` gives per-arm medians, per-round deltas and identity checks. |
 | `serve-decode.sh` | Starts a server (and its rank 1 on the peer), waits until it is ready, runs `tools/serve_bench.py` per decode class, then stops it. `--client-cmd` runs any other client instead. |
 | `serve_receipts.py` | Turns served results into receipts (`agg_C<n>`, `e2e_C<n>`, `req_C<n>`, `ttft_C<n>`). |
+| `forwards_ab.py` | Steady decode cycles by (lanes, target forwards) from the cycle receipts: the in-process A/B of `STRIX_SERVE_JOINT_GROUP_LANES=ab`. |
 | `prompt_ids.py` | Prompt files for any length (`p<N>.ids`, `.csv` or `.u32`). Each one is the seed text tokenized once, repeated and truncated, with a sha256 per prompt. |
 
 Every run directory holds `cmd.txt`, `stdout`, `stdout.ts`, `stderr`, `stderr.ts` (the arrival time of every line), `samples.tsv`,

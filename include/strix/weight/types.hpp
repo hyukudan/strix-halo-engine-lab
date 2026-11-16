@@ -11,6 +11,10 @@
 namespace strix::weight {
 using Byte = std::byte;
 using TensorId = std::uint64_t;
+// All string_views and spans in this API are borrowed. Their backing storage must
+// outlive every descriptor, registry, view and copy using it without relocation.
+// String storage stays immutable; spans permit mutation only as their types allow.
+// Dynamic registries must retain their own stable storage; IDs do not intern names.
 struct Id { std::string_view name; std::uint32_t revision; };
 using FormatId = Id;
 using ArithmeticId = Id;

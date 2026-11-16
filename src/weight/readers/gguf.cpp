@@ -8,6 +8,7 @@ Status index_gguf(const gguf::FileInfo& parsed,std::shared_ptr<const Source> sou
         TensorIndex result;result.container=Container::gguf;result.schema="gguf@3";result.owner=source;
         auto status=digest_slice({source,{0,parsed.data_offset}},result.header_identity);if(!status)return status;
         for(const auto& t:parsed.tensors) {
+            if(t.dimensions.empty() || t.dimensions.size()>4)return {Error::unsupported_shape,"GGUF logical rank outside 1..4"};
             RawTensor raw;raw.id=tensor_id(*source,t.name,result.header_identity);raw.name=t.name;raw.wire_type=t.ggml_type;
             raw.shape.rank=std::uint8_t(t.dimensions.size());
             // The public shape is row-major logical [N,K]; GGUF stores contiguous K first.

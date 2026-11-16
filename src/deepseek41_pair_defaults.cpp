@@ -427,9 +427,9 @@ Resolved resolve(App app, const std::vector<std::string>& in, const Getenv& raw_
 
 std::string describe(App app, const Resolved& r) {
     std::ostringstream o;
-    o << strix::weight::family_plan_notice(r.weight_plans);
     o << "app " << app_name(app) << '\n';
     if (r.profile) o << r.profile->describe();
+    o << strix::weight::family_plan_notice(r.weight_plans);
     for (const auto& [k, v] : r.set_env) o << "env " << k << '=' << v << '\n';
     for (const auto& k : r.unset_env) o << "unset " << k << '\n';
     for (const auto& a : r.args) o << "arg " << a << '\n';

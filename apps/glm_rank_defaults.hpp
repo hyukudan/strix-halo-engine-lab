@@ -402,7 +402,7 @@ inline void apply_env(const Effective& e, const std::function<void(const char*, 
 }
 
 inline std::string print(const Effective& e) {
-    std::string s = strix::weight::family_plan_notice(e.weight_plans);
+    std::string s;
     auto line = [&](const std::string& k, const Value& v) { s += "effective " + k + "=" + v.value + " (" + v.source + ")\n"; };
     s += std::string("effective baseline=") + (e.baseline ? "1" : "0") + "\n";
     line("identity", e.identity);
@@ -456,6 +456,7 @@ inline std::string print(const Effective& e) {
         s += std::string("effective env ") + it.env + "=" + v.value + " (" + v.source + ", item " + it.name + resolved + ")\n";
     }
     if (e.product) s += e.product->describe();
+    s += strix::weight::family_plan_notice(e.weight_plans);
     return s;
 }
 

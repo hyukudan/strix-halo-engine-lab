@@ -7,6 +7,7 @@
 #include <iostream>
 #include <stdexcept>
 using namespace strix::weight;
+bool wfmt_reference_admission_test();
 namespace {
 void check(bool ok,const char* s){if(!ok)throw std::runtime_error(s);}
 struct CountingSource final:Source {
@@ -27,6 +28,7 @@ TensorIndex fixture(std::vector<Fixture> fields) {
 std::vector<Byte> text_bytes(std::string_view text){return {reinterpret_cast<const Byte*>(text.data()),reinterpret_cast<const Byte*>(text.data()+text.size())};}
 }
 bool wfmt_admission_test() try {
+    check(wfmt_reference_admission_test(),"host reference admission negative coverage");
     std::array<Byte,128> bytes{};auto source=memory_source(bytes,"admission");TensorIndex index;index.container=Container::gguf;index.owner=source;
     RawTensor t{};t.id=tensor_id(*source,"x.weight");t.name="x.weight";t.wire_type=1;t.shape={{{2,32,0,0}},2};t.payload={source,{0,128}};index.tensors.push_back(t);
     TensorBinding binding{};binding.tensor=t.id;binding.role=Role::dense_up;binding.logical_shape=t.shape;binding.expert_axis=UINT32_MAX;binding.admitted_formats={{"plain.f16",1}};

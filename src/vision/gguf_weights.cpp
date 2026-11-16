@@ -99,7 +99,7 @@ Tensor GgufWeights::tensor(std::string_view name) {
         case 30: out.type = Tensor::Type::bf16; element = 2; break;
         default: throw std::invalid_argument("vision weights: tensor " + t.name + " has an unsupported storage type");
     }
-    if (t.dimensions.empty()) throw std::invalid_argument("vision weights: tensor " + t.name + " has no dimensions");
+    if (t.dimensions.empty() || t.dimensions.size() > 4) throw std::invalid_argument("vision weights: tensor " + t.name + " has unsupported rank");
     std::uint64_t rows = t.dimensions.back(), cols = 1;
     if (t.dimensions.size() == 1) {
         cols = 1;

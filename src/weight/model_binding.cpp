@@ -57,7 +57,7 @@ Status bind_model(const TensorIndex& index,const FamilySchema& schema,WeightMap&
             if(!schema.transformed)return {Error::unknown_format,"family does not admit tile trellis transport"};
             if(raw.shape.rank!=3 || raw.shape.dims[0]>UINT64_MAX/16 || raw.shape.dims[1]>UINT64_MAX/16)return {Error::unsupported_shape,"invalid trellis tile shape"};
             b.logical_shape={{{raw.shape.dims[1]*16,raw.shape.dims[0]*16,0,0}},2};p.transform="exl3.mul1.tiles16@1";
-            if(schema.family=="glm" || schema.family=="minimax")p.codebook_encoding="legacy-fixed-mul1@1";
+            if(schema.fixed_mul1)p.codebook_encoding="legacy-fixed-mul1@1";
             b.expert_axis=UINT32_MAX;
         }else if(schema.native_fp8 && raw.wire_dtype=="F8_E4M3")p.transform="block.e4m3-e8m0.32x32@1";
         else if(schema.channel_quant && raw.wire_dtype=="I8") {auto status=channel_parameters(index,raw,p,b.logical_shape);if(!status)return status;}

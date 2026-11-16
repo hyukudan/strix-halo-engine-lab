@@ -27,7 +27,7 @@ include(${WFMT_ROOT}/cmake/StrixBackendCpu.cmake)
 include(${WFMT_ROOT}/cmake/StrixIntel.cmake)
 add_executable(strix-wfmt-host-tests main.cpp contracts.cpp census.cpp compare.cpp
     reference.cpp geometry.cpp fixtures/iq3_s_cases.cpp
-    resolve.cpp cache.cpp effective_config.cpp runtime.cpp readers.cpp admission.cpp cpu.cpp intel.cpp
+    resolve.cpp cache.cpp effective_config.cpp runtime.cpp readers.cpp admission.cpp reference_admission.cpp cpu.cpp intel.cpp
     ${WFMT_ROOT}/src/vision/gguf_weights.cpp
     ${WFMT_ROOT}/src/gemma4/model/safetensors.cpp)
 target_link_libraries(strix-wfmt-host-tests PRIVATE strix-weight strix_backend_cpu strix_intel_core)
@@ -40,7 +40,7 @@ else()
     target_compile_options(strix-weight PRIVATE -ffp-contract=off)
     target_compile_options(strix-wfmt-host-tests PRIVATE -ffp-contract=off)
 endif()
-foreach(case contracts census compare reference geometry iq3s readers admission resolve cache effective-config runtime cpu intel)
+foreach(case contracts census compare reference geometry iq3s readers admission resolve cache effective-config runtime cpu intel strides arithmetic group-reads)
     add_test(NAME wfmt.${case} COMMAND strix-wfmt-host-tests ${case})
 endforeach()
 foreach(backend cpu intel)
@@ -83,3 +83,6 @@ if(UNIX)
     target_link_libraries(strix-wfmt-legacy-reader-tests PRIVATE strix-weight)
     add_test(NAME wfmt.glm-reader COMMAND strix-wfmt-legacy-reader-tests)
 endif()
+find_package(Python3 REQUIRED COMPONENTS Interpreter)
+add_test(NAME wfmt.tools COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_LIST_DIR}/test_tools.py)
+set_tests_properties(wfmt.tools PROPERTIES ENVIRONMENT "PYTHONDONTWRITEBYTECODE=1")

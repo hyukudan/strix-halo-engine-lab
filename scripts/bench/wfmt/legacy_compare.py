@@ -34,7 +34,7 @@ def main():
     parser.add_argument("--verify-session", action="store_true")
     args = parser.parse_args()
     kit = pathlib.Path(__file__).resolve().parent
-    matrix = args.candidate_source / "tests/wfmt/bindings.json"
+    matrix = args.candidate_source / "tests/wfmt" / ("legacy-matrix-windows.json" if platform.system() == "Windows" else "legacy-matrix.json")
     args.output.mkdir(parents=True, exist_ok=True)
     summary = {"schema": "wfmt.legacy-wrappers@1", "pass": False,
                "baseline_revision": args.baseline_revision, "candidate_revision": args.candidate_revision,
