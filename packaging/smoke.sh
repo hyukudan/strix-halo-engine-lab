@@ -88,7 +88,8 @@ for exe in "$bindir"/strix-*; do
     elif [ $rc -eq 0 ]; then
         pass "$name --help (rc=$rc)"
     elif { [ "${out%%$'\n'*}" = "usage: $name" ] ||
-           [[ "$out" == "usage: $name "* ]]; } &&
+           [[ "$out" == "usage: $name "* ]] ||
+           [[ "$out" == "$name: usage: $name "* ]]; } &&
          ! printf '%s' "$out" | grep -qiE 'Traceback|ImportError|ModuleNotFoundError'; then
         pass "$name usage (rc=$rc)"
     elif printf '%s' "$out" | grep -qiE "error while loading shared libraries|symbol lookup error"; then
