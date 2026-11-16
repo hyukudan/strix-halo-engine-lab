@@ -14,6 +14,11 @@ if(NOT strix_multi_config AND "${CMAKE_BUILD_TYPE}" STREQUAL "")
 endif()
 
 project(strix_engine_lab VERSION 0.1.0 LANGUAGES CXX)
+option(STRIX_WFMT_TESTS "Build shared weight-format contract tests" OFF)
+if(STRIX_WFMT_TESTS)
+    enable_testing()
+    add_subdirectory(tests/wfmt)
+endif()
 if(MSVC)
     # Portable C library calls (getenv, fopen) are used on purpose; unknown loop pragmas (unroll), padding
     # from alignas and code after Linux-only stubs that throw on Windows (C4702) are expected. Without this,
