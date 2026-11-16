@@ -5,9 +5,11 @@
 // receipt (argv + env, tests/fixtures/minimax_production_receipt.txt), serve's routed default is checked separately, every off switch restores its item's former
 // value, STRIX_MM_BASELINE=1 restores all of them, and apply() exports what --print-effective-config prints.
 #include "minimax/engine/mm_defaults.hpp"
+#include "strix/env_flags.hpp"
 #include "strix/dist/transport_spec.hpp"
 #include "strix/minimax/session_startup.hpp"
 
+#include <algorithm>
 #include <cstdlib>
 #include <array>
 #include <cstring>
@@ -568,6 +570,15 @@ void test_apply() {
             check(md::from_defaults(it.env), std::string("from_defaults ") + it.env);
         }
     }
+    // Shared recorder: a read of an exported default records as default; a user value stays "set" (receipt switches).
+    for (const char* name : {"STRIX_MM_PF_MSA_REWORK", "STRIX_MM_XB_PUBLISH"}) {
+        (void)strix::envcfg::text(name);
+        bool found = false, set = false;
+        for (const auto& e : strix::envcfg::registered())
+            if (e.name == name) { found = true; set = e.set; }
+        const bool user = std::strcmp(name, "STRIX_MM_XB_PUBLISH") == 0;
+        check(found && set == user, std::string("envcfg records exported default as default, user value as set: ") + name);
+    }
     // Exercise the actual app entry with and without inspection, for both rank arguments.
     for (const char* name : {"STRIX_MM_SERVE_SCHED", "STRIX_MM_SERVE_SERVICE_MS", "STRIX_MM_SERVE_GAP_MS",
                              "STRIX_MM_SERVE_SHORT_FIRST", "STRIX_MM_SERVE_NEST", "STRIX_MM_SERVE_DSPARK", "STRIX_MM_SERVE_DSPARK_INFLIGHT"}) {
@@ -740,6 +751,77 @@ void test_fast_prefill_profile() {
         }
         const EnvMap different{{"STRIX_MM_PF_MSA_FLASH", "1"}, {"STRIX_MM_PF_MSA_FLASH_LAYERS", "41-59"}};
         check(!agree(one, different), "fast agreement: different masks remain rejected");
+        // FAST index projections (minimax-index-proj-wmma-v1): opt-in member, its own layer set (builtin 40-59).
+        EnvMap idx = bundle;
+        idx["STRIX_MM_PF_IDX_WMMA"] = "1";
+        const auto pi = md::prefill_policy(lookup(idx));
+        check(pi.idx_wmma && pi.idx_wmma_layers == "40-59" && pi.msa_flash == 1 &&
+                  pi.policies == "msa-flash-bf16-l40-v1+minimax-index-proj-wmma-v1-l40-59" &&
+                  md::prefill_identity(lookup(idx)) == "prefill_msa=msa-flash-bf16-l40-v1;prefill_idxproj=minimax-index-proj-wmma-v1-l40-59",
+              "fast idx: explicit member runs beside the bundle, own cache field");
+        check(!md::prefill_policy(lookup(bundle)).idx_wmma, "fast idx: not a bundle member before its gate");
+        for (const char* layout : {"tiled", "off"}) {
+            auto declined = idx;
+            declined["STRIX_MM_INDEX_PROJ"] = layout;
+            auto disabled = declined;
+            disabled["STRIX_MM_PF_IDX_WMMA"] = "0";
+            const auto policy = md::prefill_policy(lookup(declined));
+            check(!policy.idx_wmma && !policy.note.empty() && policy.idx_wmma_asked == "1" &&
+                      policy.policies == md::prefill_policy(lookup(disabled)).policies &&
+                      md::prefill_identity(lookup(declined)) == md::prefill_identity(lookup(disabled)) && agree(declined, disabled),
+                  "fast idx: incompatible layout declines in policy, identity and rank agreement");
+            for (const char* app : {"rank", "serve"}) {
+                const auto cfg = md::effective_config(md::parse_cli(app, {}), lookup(declined));
+                check(cfg.find("\nprefill.idx_wmma=0\n") != std::string::npos &&
+                          cfg.find("\nprefill.idx_wmma_layers=none\n") != std::string::npos &&
+                          cfg.find("minimax-index-proj-wmma") == std::string::npos,
+                      "fast idx: effective config declines incompatible layout");
+            }
+        }
+        auto idx_fp32 = idx;
+        idx_fp32["STRIX_MM_PREFILL_IDENTITY"] = "fp32";
+        check(!md::prefill_policy(lookup(idx_fp32)).idx_wmma, "fast idx: FP32 prefill declines");
+        check(agree(idx, idx) && !agree(idx, bundle) && !agree(bundle, idx), "fast idx: one rank only is rejected");
+        EnvMap idx_zero = bundle;
+        idx_zero["STRIX_MM_PF_IDX_WMMA"] = "0";
+        idx_zero["STRIX_MM_PF_IDX_WMMA_LAYERS"] = "0-59";
+        check(agree(idx_zero, bundle) && md::prefill_identity(lookup(idx_zero)) == md::prefill_identity(lookup(bundle)),
+              "fast idx: explicit OFF with an unused layer set is the bundle's run");
+        EnvMap idx_other = idx;
+        idx_other["STRIX_MM_PF_IDX_WMMA_LAYERS"] = "30-59";
+        check(!agree(idx, idx_other), "fast idx: different layer sets rejected");
+        const EnvMap idx_only{{"STRIX_MM_PF_IDX_WMMA", "1"}, {"STRIX_MM_PF_IDX_WMMA_LAYERS", "40-49,50-59"}};
+        check(md::prefill_identity(lookup(idx_only)) == "prefill_idxproj=minimax-index-proj-wmma-v1-l40-59",
+              "fast idx: alone, only the idxproj field");
+        EnvMap idx_none = idx;
+        idx_none["STRIX_MM_PF_IDX_WMMA_LAYERS"] = "none";
+        check(!md::prefill_policy(lookup(idx_none)).idx_wmma && !md::prefill_policy(lookup(idx_none)).note.empty(),
+              "fast idx: empty layer set declines with a note");
+        bool threw = false;
+        try { (void)md::prefill_policy(lookup(EnvMap{{"STRIX_MM_PF_IDX_WMMA", "2"}})); } catch (const std::invalid_argument&) { threw = true; }
+        check(threw, "fast idx: invalid value rejected");
+        {   // The FAST resolution consults only its own switches (the engine records every read into the receipt).
+            const auto base = lookup(idx);
+            std::set<std::string> seen;
+            (void)md::prefill_policy([&](const char* k) -> const char* { seen.insert(k); return base(k); });
+            check(seen.count("STRIX_DIST_CRC_PARALLEL") == 0 && seen.count("STRIX_MM_PF_MSA_REWORK") == 1,
+                  "fast receipt: the flash guard reads the rework item, not the whole defaults set");
+        }
+        // ONE RESOLVER: rank and serve resolve the same request to the same prefill lines.
+        const auto prefill_lines = [](const std::string& cfg) {
+            std::string out;
+            for (std::size_t a = 0; a < cfg.size();) {
+                const std::size_t b = std::min(cfg.find('\n', a), cfg.size());
+                if (cfg.compare(a, 8, "prefill.") == 0 || cfg.compare(a, 19, "STRIX_MM_PF_IDX_WMM") == 0) out += cfg.substr(a, b - a + 1);
+                a = b + 1;
+            }
+            return out;
+        };
+        const auto rank_cfg = md::effective_config(md::parse_cli("rank", {}), lookup(idx));
+        const auto serve_cfg = md::effective_config(md::parse_cli("serve", {}), lookup(idx));
+        check(prefill_lines(rank_cfg) == prefill_lines(serve_cfg) && rank_cfg.find("\nprefill.idx_wmma=1\n") != std::string::npos &&
+                  rank_cfg.find("\nprefill.idx_wmma_layers=40-59\n") != std::string::npos,
+              "fast idx: rank and serve resolve the same prefill policy");
     }
 }
 

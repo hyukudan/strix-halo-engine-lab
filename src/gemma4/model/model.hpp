@@ -1,4 +1,5 @@
 #pragma once
+#include "strix/weight/admission.hpp"
 
 #include "gemma4/contracts/g4_types.hpp"
 #include "strix/serve/json.hpp"

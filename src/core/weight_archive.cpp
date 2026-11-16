@@ -79,58 +79,21 @@ const serve::Json& require(const serve::Json& value, const char* key) {
     if (!p) throw std::runtime_error(std::string("missing asset field: ") + key);
     return *p;
 }
-std::uint64_t integer(const serve::Json& value) {
-    const auto n = value.as_int();
-    if (n < 0) throw std::runtime_error("negative asset extent");
-    return std::uint64_t(n);
-}
 }
 SafeFile read_safetensors(const std::filesystem::path& path) {
-
     SafeFile out;
     out.storage = std::make_shared<MappedFile>(path);
-    const auto* data = out.storage->data();
-    const auto size = out.storage->size();
-    if (size < 8) throw std::runtime_error("truncated safetensors prefix");
-    std::uint64_t header = 0;
-    for (unsigned i = 0; i < 8; ++i) header |= std::uint64_t(data[i]) << (8U * i);
-    if (header > 64ULL * 1024 * 1024 || header > size - 8) throw std::runtime_error("invalid safetensors header size");
-    const auto root = serve::parse_json_unique(std::string_view(reinterpret_cast<const char*>(data + 8), std::size_t(header)));
-    const auto begin = 8 + header;
-    std::vector<std::pair<std::uint64_t, std::uint64_t>> ranges;
-    const std::map<std::string, std::size_t> dtypes = {{"BF16",2},{"F16",2},{"F32",4},{"F64",8},
-        {"I8",1},{"U8",1},{"BOOL",1},{"I16",2},{"U16",2},{"I32",4},{"U32",4},{"I64",8},{"U64",8},{"F8_E4M3",1},{"F8_E4M3FN",1},{"F8_E5M2",1}};
-    for (const auto& [name, desc] : root.as_object()) {
-        if (name == "__metadata__") {
-            for (const auto& [key, value] : desc.as_object()) { (void)key; (void)value.as_string(); }
-            continue;
-        }
-        SafeTensor t; t.name = name; t.dtype = require(desc, "dtype").as_string();
-        if (desc.as_object().size() != 3) throw std::runtime_error("unsupported safetensors descriptor fields/strides");
-        const auto dt = dtypes.find(t.dtype);
-        if (dt == dtypes.end()) throw std::runtime_error("unsupported safetensors dtype: " + t.dtype);
-        std::uint64_t count = 1;
-        for (const auto& n : require(desc, "shape").as_array()) {
-            const auto dim = integer(n);
-            if (dim != 0 && count > UINT64_MAX / dim) throw std::runtime_error("safetensors shape overflow");
-            count *= dim; t.shape.push_back(dim);
-        }
-        if (t.shape.size() > 8 || count > UINT64_MAX / dt->second) throw std::runtime_error("safetensors extent overflow");
-        const auto& offsets = require(desc, "data_offsets").as_array();
-        if (offsets.size() != 2) throw std::runtime_error("safetensors offsets need two elements");
-        const auto b = integer(offsets[0]), e = integer(offsets[1]);
-        if (e < b || e > size - begin || e - b != count * dt->second) throw std::runtime_error("invalid safetensors range: " + name);
-        t.offset = begin + b; t.bytes = e - b;
-        if (e != b) ranges.emplace_back(b, e);
+    const auto source = weight::view_source(
+        std::as_bytes(std::span(out.storage->data(), out.storage->size())), out.storage,
+        path.filename().generic_string());
+    const auto status = weight::index_safetensors(source, out.index);
+    if (!status) throw std::runtime_error(status.detail);
+    for (const auto& raw : out.index.tensors) {
+        SafeTensor t; t.name = raw.name; t.dtype = raw.wire_dtype;
+        t.shape.assign(raw.shape.dims.begin(), raw.shape.dims.begin() + raw.shape.rank);
+        t.offset = raw.payload.range.offset; t.bytes = raw.payload.range.bytes;
         out.tensors.push_back(std::move(t));
     }
-    std::sort(ranges.begin(), ranges.end());
-    std::uint64_t end = 0;
-    for (const auto& [b, e] : ranges) {
-        if (b != end) throw std::runtime_error("safetensors overlap or unclaimed hole");
-        end = e;
-    }
-    if (end != size - begin) throw std::runtime_error("unclaimed safetensors payload");
     return out;
 }
 std::span<const std::byte> Tensor::bytes() const {

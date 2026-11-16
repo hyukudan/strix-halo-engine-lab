@@ -95,3 +95,27 @@ two prefills per process (first cold, last warm), ABAB at least three pairs,
 clocks, busy fraction, time, tokens and clocks/token alongside throughput. Such
 long cases must be partitioned into bounded tickets. Capture hooks are test-only;
 they copy existing buffers rather than recomputing arithmetic.
+
+The legacy wrapper gate injects one test-only adapter into both the preceding
+source revision and the candidate. It captures accepted dtype, shape, byte range
+and payload through the existing DS41, H3, Gemma, vision and (on POSIX) GLM and
+MiniMax APIs. The same record writer and synthetic fixtures run in both binaries;
+no old parser implementation is copied into the kit. Run inside the CPU build
+lane with both source refs and revisions supplied:
+
+```sh
+python3 scripts/bench/wfmt/legacy_compare.py --baseline-source "$OLD_SOURCE" \
+  --candidate-source "$NEW_SOURCE" --baseline-revision "$OLD_REF" \
+  --candidate-revision "$NEW_REF" --build-root "$BUILD_ROOT" \
+  --output "$RECEIPTS" --verify-session
+```
+
+The optional session check records the preceding revision's known aliased-shard
+failure and requires the candidate to pass. Generated fixtures, binaries, logs,
+provenance and byte receipts stay outside Git. The aliased-shard loader keeps all
+asset-receipt path references while indexing each opened physical file once.
+
+Both source arguments must be clean checkout roots whose HEAD is the requested
+revision. The driver verifies both commits and tree IDs before configuring either
+build, rejecting tracked edits, untracked files and dirty submodules. Keep build
+and receipt directories outside the source checkouts (or ignored).

@@ -285,7 +285,7 @@ class ToolTests(unittest.TestCase):
         decoded = {name.upper() if name != "engram_row" else "Engram"
                    for name in re.findall(r"\bvoid\s+decode_([a-z0-9_]+)\s*\(", (ROOT / ds).read_text())}
         self.assertEqual(set(by_source[ds]["formats"]), decoded)
-        cuda = "include/strix/cuda_qwen_quant.cuh"
+        cuda = "include/strix/cuda/qwen_quant.cuh"
         source = (ROOT / cuda).read_text()
         geometry = source.split("QQ_HD Geometry geometry(")[1].split("namespace detail")[0]
         decoder = source.split("QQ_HD void decode_group(")[1].split("QQ_HD void decode_row_group(")[0]

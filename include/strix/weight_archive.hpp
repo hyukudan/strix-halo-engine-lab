@@ -1,6 +1,7 @@
 #pragma once
 
 #include "strix/gguf_reader.hpp"
+#include "strix/weight/admission.hpp"
 #include "strix/serve/json.hpp"
 #include <cstddef>
 #include <cstdint>
@@ -39,6 +40,7 @@ struct SafeTensor {
 struct SafeFile {
     std::shared_ptr<MappedFile> storage;
     std::vector<SafeTensor> tensors;
+    weight::TensorIndex index;
 };
 [[nodiscard]] serve::Json read_json(const std::filesystem::path& path);
 [[nodiscard]] SafeFile read_safetensors(const std::filesystem::path& path);

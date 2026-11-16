@@ -1,4 +1,5 @@
 include_guard(GLOBAL)
+include("${CMAKE_CURRENT_LIST_DIR}/StrixWeight.cmake")
 # Also usable by the small standalone host-test project, with no HIP/CUDA dependency.
 set(strix_dense_root "${CMAKE_CURRENT_LIST_DIR}/..")
 if(NOT TARGET strix_serve_json)
@@ -20,7 +21,7 @@ add_library(strix_weight_archive STATIC
     "${strix_dense_root}/src/iq4_nl.cpp")
 target_compile_features(strix_weight_archive PUBLIC cxx_std_20)
 target_include_directories(strix_weight_archive PUBLIC "${strix_dense_root}/include")
-target_link_libraries(strix_weight_archive PUBLIC strix_serve_json)
+target_link_libraries(strix_weight_archive PUBLIC strix_serve_json strix-weight)
 target_link_libraries(strix_model_graph PUBLIC strix_weight_archive)
 add_library(strix_qwen27_model STATIC "${strix_dense_root}/src/qwen27/model.cpp"
     "${strix_dense_root}/src/model_family_registry.cpp")
