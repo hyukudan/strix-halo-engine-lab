@@ -3,6 +3,7 @@
 import argparse
 import hashlib
 import json
+import re
 import struct
 import sys
 from pathlib import Path
@@ -26,7 +27,8 @@ def selections(count, stride):
     if stride < 1:
         raise ValueError("stride must be positive")
     # Dumped final prompt row predicts an unknown generated token; exclude it from labeled losses.
-    return [p for p in range(count - 1) if p % stride == 0]
+    # CUDA verify needs a nonempty prefilled state; its API cannot observe row zero.
+    return [p for p in range(1, count - 1) if p % stride == 0]
 
 
 def convert(raw, ids_path, stride, out):
@@ -38,7 +40,7 @@ def convert(raw, ids_path, stride, out):
     vocab, rows = struct.unpack("<ii", header)
     positions = selections(len(ids), stride)
     # Strata max-new=1 stores multiples of stride plus the final prompt position once.
-    expected_rows = len(positions) + 1
+    expected_rows = len(positions) + 2  # unsupported row zero and unlabeled final row
     if vocab != 248320 or rows != expected_rows or Path(raw).stat().st_size != 8 + rows * vocab * 4:
         raise ValueError("Strata logits dimensions/size do not match IDS, stride and max-new=1")
     data = np.memmap(raw, dtype="<f4", mode="r", offset=8, shape=(rows, vocab))
@@ -46,9 +48,12 @@ def convert(raw, ids_path, stride, out):
         raise ValueError("nonfinite Strata logits")
     if Path(out).exists():
         raise ValueError("output exists")
-    spool.write(out, ids, positions, data[:len(positions)], version=2)
+    if not positions:
+        raise ValueError("no supported selected positions")
+    spool.write(out, ids, positions, data[1:1+len(positions)], version=2)
     return {"source_sha256": sha256_file(raw), "ids_sha256": sha256_file(ids_path),
-            "stride": stride, "dropped_unlabeled_final_row": True, "rows": len(positions)}
+            "stride": stride, "dropped_unlabeled_final_row": True, "dropped_unsupported_row_zero": True,
+            "rows": len(positions)}
 
 
 def compare(reference, arms):
@@ -109,16 +114,21 @@ def receipt(args):
     # Full stream validation includes each row's label, position and finite-logit checks.
     for _ in spool.read(args.spool):
         pass
+    engine_log = Path(args.engine_log).read_text(encoding="utf-8", errors="replace")
+    match = re.search(r"teacher batching: step_rows=(\d+) prefix_rows=(\d+) context_capacity=(\d+) block_rows=(\d+)", engine_log)
+    if not match:
+        raise ValueError("missing actual teacher batch/config receipt in engine log")
+    effective = dict(zip(("step_rows", "prefix_rows", "context_capacity", "block_rows"), map(int, match.groups())))
     return {"schema": "stratacmp-diagnostic-receipt/v1", "manifest_core_sha256": frozen["frozen"]["core_sha256"],
             "manifest_version": frozen["version"], "arm": args.arm, "identity": spec["identity"],
             "arithmetic": spec["arithmetic"], "binary_sha256": binary_sha,
             "weights_sha256": [w["sha256"] for w in spec["weights"]],
             "payload_sha256": sha256_file(args.spool), "engine_log_sha256": sha256_file(args.engine_log),
-            "engine_log": Path(args.engine_log).read_text(encoding="utf-8", errors="replace"),
+            "engine_log": engine_log, "effective_teacher": effective,
             "inputs_sha256": hashlib.sha256(header["inputs"].tobytes()).hexdigest(),
             "positions": header["positions"].tolist() if header["positions"] is not None else list(range(header["rows"])),
             "rows": header["rows"], "vocab": header["vocab"],
-            "effective_scope": "scalar teacher-forced decode after optional prefix; no drafts; full-vocabulary selected rows",
+            "effective_scope": "teacher-forced decode after optional prefix; no drafts; full-vocabulary selected rows",
             "context_input_tokens": len(header["inputs"]),
             "scope": "diagnostic; not a TURBO qualification receipt"}
 
@@ -137,6 +147,7 @@ def main():
         p.add_argument("--" + option, required=True)
     p = sub.add_parser("compare")
     p.add_argument("--reference", required=True); p.add_argument("--arm", action="append", required=True)
+    p.add_argument("--receipt", action="append", default=[], help="ARM=JSON; same CUDA teacher shape required")
     p.add_argument("--out", required=True)
     p = sub.add_parser("receipt")
     for option in ("manifest", "arm", "spool", "binary", "engine-log", "out"):
@@ -151,6 +162,16 @@ def main():
         Path(str(args.out) + ".source.json").write_text(json.dumps(result, indent=2) + "\n")
     elif args.command == "compare":
         result = compare(args.reference, args.arm)
+        receipts = {name: json.loads(Path(path).read_text()) for name, path in (x.split("=", 1) for x in args.receipt)}
+        configs = []
+        for name, record in receipts.items():
+            if result["payload_sha256"].get(name) != record.get("payload_sha256"):
+                raise ValueError("teacher receipt does not bind compared payload")
+            config = record["effective_teacher"]
+            configs.append(tuple(config[k] for k in ("step_rows", "prefix_rows", "context_capacity", "block_rows")))
+        if len(set(configs)) > 1:
+            raise ValueError("CUDA teacher batch/prefix/context/block settings differ across arms")
+        result["teacher_batch_validation"] = "matched supplied receipts" if receipts else "unverified diagnostic only; no E/R/T gate"
         Path(args.out).write_text(json.dumps(result, indent=2) + "\n")
     else:
         result = receipt(args)

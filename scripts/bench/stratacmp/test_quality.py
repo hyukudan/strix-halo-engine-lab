@@ -22,8 +22,8 @@ class QualityTests(unittest.TestCase):
             self.assertEqual(got[1][3][17], 1)
 
     def test_spread_has_true_next_token(self):
-        self.assertEqual(quality.selections(9, 3), [0, 3, 6])
-        self.assertEqual(quality.selections(10, 3), [0, 3, 6])
+        self.assertEqual(quality.selections(9, 3), [3, 6])
+        self.assertEqual(quality.selections(10, 3), [3, 6])
         with self.assertRaises(ValueError):
             quality.selections(9, 0)
 
@@ -36,8 +36,8 @@ class QualityTests(unittest.TestCase):
             (d / "raw").write_bytes(struct.pack("<ii", 248320, 3) + rows.tobytes())
             quality.convert(d / "raw", d / "ids", 2, d / "out")
             got = list(quality.spool.read(d / "out"))
-            self.assertEqual([(p, label) for p, _, label, _ in got], [(0, 1), (2, 3)])
-            self.assertEqual(got[1][3][7], 3)
+            self.assertEqual([(p, label) for p, _, label, _ in got], [(2, 3)])
+            self.assertEqual(got[0][3][7], 3)
             with self.assertRaises(ValueError):
                 quality.convert(d / "raw", d / "ids", 1, d / "bad")
 

@@ -7,16 +7,33 @@ come from arguments. Keep one model family resident and use the device declarati
 
 Build the Release target `strix-cuda-qwen-logits`. It uses the production CUDA `Prefill` API without drafts,
 consumes every input token in order, and stores only selected full-vocabulary rows in the existing TURBO
-TMLLOG02 format. After any initial prefix before the first selection, this diagnostic uses scalar decode;
-its runtime is not a prefill benchmark. It accepts device declaration flags through the usual start gate.
+TMLLOG02 format. After any initial prefix before the first selection, this diagnostic accepts teacher
+windows of 1..8 consecutive forced tokens; only windows containing a selected position copy full logits
+to the host. It emits selected slices in order and checks every returned full row for finite values. Its
+runtime is not a prefill benchmark. It accepts device declaration flags through the usual start gate.
 
 Prepare a whitespace-separated ID file using the exact same tokenizer for every arm. For a Strata stride
 of 256, create the selected positions and run our exporter (CAP must hold all input IDs):
 
 ```sh
 python scripts/bench/stratacmp/quality.py positions --ids CASE.ids --stride 256 --out CASE.positions
-strix-cuda-qwen-logits MODEL TABLES ROPE CASE.ids CASE.positions CAP E.bin 1024
+strix-cuda-qwen-logits MODEL TABLES ROPE CASE.ids CASE.positions CAP E.bin 1024 8
 ```
+
+The last argument is `STEP_ROWS`; omitted it preserves the scalar reference (`1`). The API accepts up to
+8 decode rows (`qwen_prefill_driver.cu`, `Prefill::verify_cohort`); above 8 it changes to a padded prefill
+shape. Keep the same teacher window, initial prefix, context capacity and prefill block across CUDA E/R/T
+arms. Eight-row export is available without a kernel change; the default remains 1 until the GSQ raw-logit
+1-vs-8 identity gate is measured. This preserves the established scalar numerical reference rather than
+assuming the different launch shape is exact. Once that gate passes, use 8 for the whole paired run.
+Record the actual `teacher batching:` engine line with `quality.py receipt`; `compare --receipt E=...`
+`--receipt R=... --receipt T:ours-gsq=...` rejects different CUDA teacher settings or payload hashes.
+Metrics without these receipts are labeled unverified diagnostics and cannot qualify an E/R/T gate.
+Position zero is unsupported by CUDA `verify` because it requires nonempty prefilled state; frozen TURBO
+spread positions start at 64. The stride diagnostic omits row zero consistently in both engines.
+
+The full 48-parent, two-length corpus is roughly two million forced tokens; a completed pilot or one case
+does not establish that the full kit ran. Report actual cases/rows and preserve partial-run status.
 
 The existing `tools/qualification/turbo_bar/models.json` declares E as `qwen38-udq4kxl-exact` and R as
 `qwen38-udq4kxl-R-exps3-v1` (controlled expert-block reduction from E). GSQ runs belong to named T arms;
@@ -56,7 +73,7 @@ actual effective args and request order. The runner does not create/replace R or
 converts previously collected `PREFIX.0`, `PREFIX.1`, ... rows when their external request-order record
 proves this same conditioning contract.
 
-The converter drops the final prompt row because its next generated token is not a true corpus label.
+The converter drops row zero (unsupported by CUDA's state API) and the final prompt row because its next generated token is not a true corpus label.
 All earlier selected positions retain their true next-token label. It rejects wrong dimensions, incomplete
 payloads and nonfinite logits. Comparison reuses TURBO's full-vocabulary KL(E||arm), top-1 disagreement
 and dNLL calculations; it rejects differing input IDs, positions, labels, or row counts. The output reports
