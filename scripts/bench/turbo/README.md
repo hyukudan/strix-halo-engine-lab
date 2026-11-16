@@ -30,7 +30,7 @@ The shared row-decode resolver and runtime use the same `STRIX_IU4_R8_SINGLE_DEC
 |`0`, `off`|Split decode.|
 |`force`|Diagnostic single decode for every legal group count (32/40/64/96) at 7/8 rows.|
 
-Effective configuration prints `turbo_weights.row_decode` requested/effective/enabled/reason/scope/device_requirement fields. Inspection that has not selected a device and projection shape reports `pending-device-and-shape`; it does not claim that every projection uses single decode. Full-model before/after qualification remains separate from the projection fixture.
+Effective configuration prints `turbo_weights.row_decode` requested/effective/enabled/reason/scope/device_requirement fields. Inspection that has not selected a device and projection shape reports `phase=pending-device-and-shape`; it does not claim that every projection uses single decode. Here `enabled` reports whether the automatic policy is enabled; cached device capability and projection shape determine actual kernel dispatch. Full-model before/after qualification remains separate from the projection fixture.
 
 `python3 scripts/bench/turbo/mtp-study-pairs.py OUTPUT_ROOT --before-binary BEFORE --after-binary AFTER --prefix mtp --pairs 3` pools the declared interleaved exact/before/after cold and warm receipts and checks before/after token IDs.
 
