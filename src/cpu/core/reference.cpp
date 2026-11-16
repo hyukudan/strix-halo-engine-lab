@@ -1,9 +1,7 @@
 // Scalar, exact reference of the CPU backend. It is the oracle every ISA specialisation must match
 // bit for bit; it is written for the declared operation order, not for speed.
 #include "cpu/core/backend.hpp"
-#if defined(STRIX_WFMT_CAPTURE)
 #include "cpu/weight/source.hpp"
-#endif
 #include "core/integer_math.hpp"
 
 #include <algorithm>
@@ -60,18 +58,19 @@ void ref_gemv_q8_0_a8(const Q8a8View& v, const Stream&) {
     if (v.in % q8_0_group != 0U)
         throw std::invalid_argument("CPU Q8_0 product width must be a multiple of 32");
     const std::size_t groups = v.in / q8_0_group;
+    using Source = weight::cpu::Q8RawSource<weight::cpu::CpuTree32>;
+    const Source source{v.weight, v.row_bytes};
     for (std::uint32_t r = 0; r < v.rows; ++r) {
         const std::int8_t* xc = v.codes + static_cast<std::size_t>(r) * v.x_stride;
         const float* xd = v.deltas + static_cast<std::size_t>(r) * (v.x_stride / q8_0_group);
         for (std::uint32_t o = 0; o < v.count; ++o) {
-            const std::uint8_t* row = v.weight + static_cast<std::size_t>(o) * v.row_bytes;
             float lanes[product_lanes]{};
             for (std::size_t g = 0; g < groups; ++g) {
-                const std::uint8_t* block = row + g * q8_0_block_bytes;
-                const float scale = half_to_float(static_cast<std::uint16_t>(block[0] | (block[1] << 8U)));
+                const std::uint8_t* block = source.block(o, g);
+                const float scale = Source::scale(block);
                 std::int32_t dot = 0;
                 for (std::size_t j = 0; j < q8_0_group; ++j)
-                    dot += static_cast<std::int8_t>(block[2 + j]) * xc[g * q8_0_group + j];
+                    dot += Source::code(block, j) * xc[g * q8_0_group + j];
                 lanes[g % product_lanes] = lanes[g % product_lanes] + core::integer_math::product(dot, scale, xd[g]);
             }
             float& y = v.out[static_cast<std::size_t>(r) * v.out_stride + o];

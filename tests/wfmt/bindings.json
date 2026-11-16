@@ -1216,14 +1216,17 @@
       "status": "incumbent",
       "capture": "legacy-public-entrypoint",
       "operations": [
+        "block",
         "invalid_argument",
         "product",
         "ref_gemv_q8_0_a8",
         "ref_quantize_a8",
-        "reference_kernels"
+        "reference_kernels",
+        "scale"
       ],
       "operand_source": "src/cpu/weight/source.hpp",
-      "source_registry": "src/cpu/weight/registry.cpp"
+      "source_registry": "src/cpu/weight/registry.cpp",
+      "kernel_address_migration": "bound: CPU raw Q8 source"
     },
     {
       "id": "cpu:src/cpu/core/select.cpp",
@@ -1290,9 +1293,13 @@
       "status": "incumbent",
       "capture": "legacy-public-entrypoint",
       "operations": [
+        "row_bytes",
         "run_reference",
         "supported"
-      ]
+      ],
+      "operand_source": "src/intel/weight/source.hpp",
+      "source_registry": "src/intel/weight/registry.cpp",
+      "kernel_address_migration": "deferred: kernel-body edit outside current authorization"
     },
     {
       "id": "intel:src/intel/core/backend.cpp",
