@@ -3,6 +3,8 @@
 #include "minimax/engine/route_identity.hpp"
 
 #include "minimax/moe/mmx_prefill_core.hpp"
+#include "minimax/attn/msa_norm_rope.hpp"  // the q image: the flash prologue's norm + RoPE
+#include "../../attn_core/wmma_types.hpp"   // and its operand rounding
 #include "minimax/moe/mmx_trellis_device.hpp"
 #include "core/activation_quant.hpp"
 #include "core/trellis_codec.hpp"
@@ -415,6 +417,10 @@ struct DenseArgs {
     _Float16* xt[kMaxDenseJobs];
     const float* part[kMaxDenseJobs];
     float* out[kMaxDenseJobs];
+    std::uint16_t* image[kMaxDenseJobs];     // PrefillDenseJob::image (null: out)
+    std::uint16_t* image_lo[kMaxDenseJobs];
+    const float* image_w[kMaxDenseJobs];
+    const msa::RopeRow* image_rope[kMaxDenseJobs];
     unsigned n[kMaxDenseJobs], splits[kMaxDenseJobs];
     unsigned count, rows, k;
 };
@@ -456,6 +462,29 @@ __global__ __launch_bounds__(256) void dense_finish_kernel(DenseArgs a) {
     const unsigned nb = a.n[m] / 128U, row = q / nb, b = q % nb;
     float v[4];
     finish_block(a.part[m], a.splits[m], a.rows, row, a.n[m], b, a.svh[m], lane, v);
+    if (a.image[m] != nullptr) {  // wave-uniform: block b = one 128-dim head of the row
+        // the flash prologue's layout (msa_norm_rope.hpp): lane l takes dims 4l..4l+3; dim d is on lane d & 31, slot
+        // d >> 5 = l >> 3 (moves only, no arithmetic)
+        namespace tile = strix::attn_core::tile;
+        constexpr tile::Operand O = tile::Operand::bf16;
+        float x[4];
+#pragma unroll
+        for (unsigned i = 0; i < 4U; ++i) {
+            const int src = static_cast<int>((4U * lane + i) & 31U);
+            const float t0 = __shfl(v[0], src, 32), t1 = __shfl(v[1], src, 32), t2 = __shfl(v[2], src, 32), t3 = __shfl(v[3], src, 32);
+            const unsigned s = lane >> 3U;
+            x[i] = s == 0U ? t0 : s == 1U ? t1 : s == 2U ? t2 : t3;
+        }
+        msa::norm_rope_lane(x, a.image_w[m], a.image_rope[m][row], lane);
+        const std::size_t at = static_cast<std::size_t>(row) * a.n[m] + b * 128U + lane * 4U;
+        *reinterpret_cast<uint2*>(a.image[m] + at) = make_uint2(tile::pack2<O>(x[0], x[1]), tile::pack2<O>(x[2], x[3]));
+        if (a.image_lo[m] != nullptr) {
+#pragma unroll
+            for (unsigned d = 0; d < 4U; ++d) x[d] -= tile::operand_value<O>(tile::to_operand<O>(x[d]));
+            *reinterpret_cast<uint2*>(a.image_lo[m] + at) = make_uint2(tile::pack2<O>(x[0], x[1]), tile::pack2<O>(x[2], x[3]));
+        }
+        return;
+    }
 #pragma unroll
     for (int j = 0; j < 4; ++j)
         a.out[m][static_cast<std::size_t>(row) * a.n[m] + b * 128U + lane + 32U * static_cast<unsigned>(j)] = v[j];
@@ -2177,6 +2206,8 @@ void enqueue_prefill_dense(const PrefillDenseJob* jobs, unsigned count, const fl
         a.xt[m] = reinterpret_cast<_Float16*>(ws + p.off_xt[m]);
         a.part[m] = reinterpret_cast<const float*>(ws + p.off_part[m]);
         a.out[m] = jobs[m].out;
+        a.image[m] = jobs[m].image, a.image_lo[m] = jobs[m].image_lo, a.image_w[m] = jobs[m].image_w;
+        a.image_rope[m] = static_cast<const msa::RopeRow*>(jobs[m].image_rope);
         a.n[m] = jobs[m].w.output;
         a.splits[m] = p.splits[m];
         waves += rows * (jobs[m].w.output / 128);

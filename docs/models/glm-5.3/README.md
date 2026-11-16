@@ -131,11 +131,11 @@ are unchanged. Disabling the cache restores the 8 GiB default.
 
 ## Run: one RTX PRO 6000
 
-Windows only, opt-in: build with `pwsh src/glm/rtxpf/producer/build.ps1` against a tierstream source export, build
+Windows only, opt-in: build with `pwsh src/cuda/models/glm/producer/build.ps1` against a tierstream source export, build
 the unit file once with `glm_unit_file.exe`, then run `decode_qualification_window.py --full-card --allow-gpu`. The service itself also takes
 `--dgpu auto|<uuid>` to pick the RTX PRO before CUDA starts (`off` is refused: no CPU path). Every
 step, the pinned tierstream commit and the options (`--profile`, `--print-effective-config`, `--vram-total-gib`) are
-in the [GLM RTX guide](../../../src/glm/rtxpf/README.md).
+in the [GLM RTX guide](../../../src/cuda/models/glm/README.md).
 
 <a id="how-fast"></a>
 
@@ -276,7 +276,7 @@ With 24 GiB VRAM + 32 GiB host RAM (most experts streamed from the unit file on 
 (auto, 76 % of the experts on the unit file) decode is **0.77 / 0.75 tok/s** warm / cold at 1K (mean of two loads,
 24-token bench). With the opt-in two-stage file prefetch (`--tier-landing-blocks 16`, three striped
 drives) decode was 20-40 % faster than without it in the same windows, identical output (repeats varied by 15-55 %).
-Build, unit file and options: [GLM RTX guide](../../../src/glm/rtxpf/README.md).
+Build, unit file and options: [GLM RTX guide](../../../src/cuda/models/glm/README.md).
 
 **RTX prefill into the pair (FAST, off by default).** `strix-glm5-serve --rtx-prefill HOST:PORT --import-listen IP:PORT
 --import-peer IP:PORT --import-key FILE --import-model-sha SHA` (every rank `--import-listen`; engines with their MTP
@@ -310,5 +310,5 @@ prefill time for long prompts. With the producer launched with its cache (first 
 
 The changelog of every default-on GLM lever with its measured gain, exactness evidence and off switch is in
 [measured gains](../../measured-gains.md); the full catalog is [docs/optimizations.md](../../optimizations.md#glm).
-GLM RTX build, unit file and options: [GLM RTX guide](../../../src/glm/rtxpf/README.md); native RTX prefill notes:
+GLM RTX build, unit file and options: [GLM RTX guide](../../../src/cuda/models/glm/README.md); native RTX prefill notes:
 [docs/models/glm/rtx-prefill-native.md](../glm/rtx-prefill-native.md).
