@@ -1792,8 +1792,6 @@
         "dense_type",
         "down_type",
         "gate_type",
-        "gsq_block_bytes",
-        "gsq_block_elements",
         "iq_type",
         "row_bytes",
         "types"
