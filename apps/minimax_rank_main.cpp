@@ -1032,7 +1032,7 @@ std::uint64_t ab_flag(mm::Engine& eng, const std::string& flag, const std::vecto
         }
         else if (flag == "pfmsa") eng.set_prefill_msa_batch(on);
         else if (flag == "pfdensemlp") eng.set_prefill_dense_mlp(on);  // layers 0-2 dense MLP: strix_gemm (A) / v4 core (B)
-        else if (flag == "pfflashkeys") eng.set_prefill_flash_keys(on ? 1U : 0U);  // FAST flash: incumbent loads (A) / keys first (B)
+        else if (flag == "pfflashkeys") eng.set_prefill_flash_keys(on ? 2U : 0U);  // FAST flash: incumbent loads (A) / key halves (B)
         else if (flag == "pfheadless") eng.set_prefill_headless(on);  // last layer of headless chunks: full (A) / cache-only (B)
         else if (flag == "pfattn4") eng.set_prefill_attend4(on);
         else if (flag == "pfidxconc") eng.set_prefill_index_concurrent(on ? idx_conc_b : 0);
@@ -1208,7 +1208,7 @@ std::uint64_t ab_flag(mm::Engine& eng, const std::string& flag, const std::vecto
     else if (flag == "pftiled") strix_trellis_lab_set_wmma_tiled(-1);
     else if (flag == "pfheadless") eng.set_prefill_headless(start_arm);
     else if (flag == "pfdensemlp") eng.set_prefill_dense_mlp(start_arm);
-    else if (flag == "pfflashkeys") eng.set_prefill_flash_keys(start_arm ? 1U : 0U);
+    else if (flag == "pfflashkeys") eng.set_prefill_flash_keys(start_arm ? 2U : 0U);
     else if (flag == "pfi4") strix::minimax::moe::opt::set_prefill_iu4(-1);
     else if (flag == "pfall") {
         eng.set_prefill_msa_batch(msa0);

@@ -120,6 +120,7 @@ const std::map<std::string, std::string> kFormer = {
     {"STRIX_MMX_MOE_PIPE", "0"},
     {"STRIX_MM_PF_HEADLESS", "0"},
     {"STRIX_MM_PF_DENSE_MLP", "0"},
+    {"STRIX_MM_PF_FLASH_KEYS", "0"},
 };
 
 void test_table() {
