@@ -17,6 +17,24 @@ node import (same greedy IDs as node-only prefill in every request), TTFT drops
 `--block-schedule default` (or `"block_schedule":"default"` per request) turns it
 off and restores the original order.
 
+### Flat blocks on the serve entry
+
+`strix-cuda-qwen-serve` (and the gate tool `qwen_tf_logits`, which resolves as the serve entry) runs an untyped
+schedule as one repeating block of the schedule maximum: `8192`, so 8192 rows are one block instead of
+`1024,1024,2048,4096`, and 43008 rows are `2048,8192 x5` instead of eight blocks. The allocation is unchanged (every
+workspace is already sized from the maximum) and so are the bits. The reason is work per token: every block pays the
+per-launch skeleton of each kernel once, and the routed MoE visits every expert once per (layer, block) whatever the
+row count (a tile of 20 rows costs almost as much as a tile of 64: the measured fit of the FAST project kernel is
+1.4 us per tile plus 15 ns per assignment). The ramp exists for the hand-off entries, where a small first block
+releases state to the node early; a decode session exports nothing, so the resolver names `block_schedule` among the
+serve differences with this reason. The prefill service and the CLI entry keep the ramp (not measured on the hand-off
+path). Lever `qwen_cuda_flat_blocks` (bitwise, default on): `STRIX_QRTX_FLAT_BLOCKS=0` or a typed `--blocks` /
+`--block-rows` keeps the caller's schedule. Larger blocks were measured and not adopted: `--block-rows 16384` is not
+faster at 32K / 42K (the MoE route workspace of 16384 rows leaves the cache-friendly range) and peaks 5 GB higher.
+
+Scout receipt (server, one pair, warm prefill, FAST profile; ramp -> flat): 8192 rows 1277 -> 1123 ms, 32768 rows 4816 -> 4689 ms,
+43008 rows 6421 -> 6355 ms. The strict ABAB table and the byte comparison of the logit dumps follow in this section.
+
 `--final-block-rows N` optionally reserves a specific tail size after that
 transformation, moving rows between existing blocks without adding blocks. Zero
 disables the reservation. The feasible tail range is
