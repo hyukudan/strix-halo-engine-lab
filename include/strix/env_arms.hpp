@@ -5,7 +5,9 @@
 // any arm is restored to its launch value, then that arm's pairs are set. Only switches read per call (getenv /
 // envcfg, not cached at startup) are valid arm keys; both ranks of a pair must get the same spec (same CLI).
 #include <algorithm>
+#include <atomic>
 #include <cstdlib>
+#include <mutex>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -13,6 +15,34 @@
 #include <vector>
 
 namespace strix::env_arms {
+
+// Arms generation: apply() / restore() bump it. A switch cached for the process lifetime ("resolve once", so every
+// reader in a prefill agrees) holds its value in Resolved<T>: resolved on first use and again only after an arm changed
+// the environment (between prefills, on the thread that runs them). Without arms it is the plain once-per-process value.
+inline std::atomic<unsigned>& generation_ref() {
+    static std::atomic<unsigned> g{0};
+    return g;
+}
+inline unsigned generation() { return generation_ref().load(std::memory_order_acquire); }
+
+template <class T> class Resolved {
+public:
+    template <class F> T get(F&& resolve) {
+        const unsigned g = generation();
+        if (gen_.load(std::memory_order_acquire) == g) return value_.load(std::memory_order_relaxed);
+        std::lock_guard<std::mutex> lock(m_);
+        if (gen_.load(std::memory_order_relaxed) != g) {
+            value_.store(resolve(), std::memory_order_relaxed);
+            gen_.store(g, std::memory_order_release);
+        }
+        return value_.load(std::memory_order_relaxed);
+    }
+
+private:
+    std::atomic<unsigned> gen_{~0U};
+    std::atomic<T> value_{};
+    std::mutex m_;
+};
 
 struct Arm {
     std::string label;
@@ -72,10 +102,12 @@ inline Arms parse(const std::string& spec) {
 inline void apply(const Arms& all, const Arm& arm) {
     for (const auto& [k, v] : all.launch) set_env(k, v);
     for (const auto& [k, v] : arm.kv) set_env(k, v);
+    generation_ref().fetch_add(1, std::memory_order_acq_rel);
 }
 
 inline void restore(const Arms& all) {
     for (const auto& [k, v] : all.launch) set_env(k, v);
+    generation_ref().fetch_add(1, std::memory_order_acq_rel);
 }
 
 }  // namespace strix::env_arms

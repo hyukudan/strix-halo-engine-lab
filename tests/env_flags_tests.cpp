@@ -136,6 +136,12 @@ int main() {
         strix::env_arms::apply(arms, arms.arms[1]);
         strix::env_arms::restore(arms);
         check(val(key) == "L" && val("STRIX_ENV_ARMS_TEST_X") == "<unset>");
+        strix::env_arms::Resolved<bool> cached;  // resolved once, again only after an arm changed the environment
+        int resolves = 0;
+        check(cached.get([&] { ++resolves; return true; }) && cached.get([&] { ++resolves; return false; }) && resolves == 1);
+        strix::env_arms::apply(arms, arms.arms[0]);
+        check(!cached.get([&] { ++resolves; return false; }) && resolves == 2);
+        strix::env_arms::restore(arms);
         bool threw = false;
         try { (void)strix::env_arms::parse("B:K"); } catch (const std::invalid_argument&) { threw = true; }
         check(threw);
