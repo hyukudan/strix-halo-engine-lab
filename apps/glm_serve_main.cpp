@@ -881,10 +881,15 @@ int main(int argc, char** argv) {
             else if (a == "--baseline") rank_args.push_back(a);
             // Product profile: resolved by the shared resolver in rd::scan, the same rule as strix-glm5-rank.
             else if (a == "--allow-pending") rank_args.push_back(a);
+            else if (a == strix::profile::turbo::kWeightsOption || a == strix::profile::turbo::kBitsOption ||
+                     a == strix::profile::turbo::kPackOption) {  // the same weight toggle as strix-glm5-rank
+                rank_args.push_back(a);
+                rank_args.push_back(next());
+            }
             else if (a == "--profile" || a.rfind("--profile=", 0) == 0) {
                 const std::string name = a == "--profile" ? next() : a.substr(10);
                 if (!strix::profile::is_name(name))
-                    throw std::invalid_argument("--profile must be default, fast or quality (got '" + name + "')");
+                    throw std::invalid_argument("--profile must be default, fast, quality or turbo (got '" + name + "')");
                 rank_args.push_back("--profile");
                 rank_args.push_back(name);
             }

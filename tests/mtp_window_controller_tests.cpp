@@ -1,3 +1,4 @@
+#include "strix/cohort_step_plan.hpp"
 #include "strix/mtp_cohort_partition.hpp"
 #include "strix/mtp_window_controller.hpp"
 #include "strix/mtp_batch_window_controller.hpp"
@@ -89,12 +90,14 @@ int main() {
         for (std::size_t round = 0; round < count + 2U; ++round) {
             strix::MtpBatchWindowController budget(count, strix::MtpBatchWindowController::parse_rule("budget"));
             strix::MtpBatchWindowController search(count);
-            // The cap under test: 16 (the opt-in STRIX_SERVE_JOINT_GROUP_LANES=16 form) above the bound.
+            // The cap under test: 16 (the default; STRIX_SERVE_JOINT_GROUP_LANES=8 is the old form) above the bound.
             const auto cap = count > strix::mtp_serve_row_budget_max_lanes() ? std::size_t{strix::kMtpJointGroupLanesMax} : std::size_t{8U};
             expect(search.max_group_lanes(count, round) == 8U, "searching rule keeps eight requests per group");
             expect(budget.max_group_lanes(count, round) == (count > strix::mtp_serve_row_budget_max_lanes() ?
                 strix::mtp_serve_joint_group_lanes(round) : 8U), "budget rule cap follows the switch above the lane bound");
-            expect(strix::mtp_serve_joint_group_lanes(round) == 8U, "default keeps one forward per eight requests");
+            expect(strix::mtp_serve_joint_group_lanes(round) == strix::kMtpJointGroupLanesMax,
+                "default: one forward per sixteen requests above the lane bound");
+            expect(strix::kMtpJointGroupLanesMax <= strix::kCohortWideMaxSessions, "a group fits one wide cohort step");
             std::vector<unsigned> seen(count, 0U);
             const auto groups = strix::mtp_cohort_partition(count, round, cap);
             expect(groups.size() == (count + cap - 1U) / cap, "fewest groups for the cap");

@@ -28,8 +28,8 @@ struct MtpBatchPlanRule {bool pooled=false; bool calibrated=false; std::uint32_t
 // request gets the fixed table's two rows: measured, the budget wins at 2 to 6 requests and loses at 8.
 [[nodiscard]] std::uint32_t mtp_serve_row_budget_max_lanes() noexcept;
 // Most decoding requests one joint group (one target forward) takes above the lane bound, where every request has
-// the fixed two rows: STRIX_SERVE_JOINT_GROUP_LANES, 8..16 (16 = 32 rows, the widest shared step); default 8 = one
-// forward per eight requests, because a 9-lane single group stalled on the device (opt-in until fixed). "ab" alternates 8 and 16 by joint cycle (measurement).
+// the fixed two rows: STRIX_SERVE_JOINT_GROUP_LANES, 8..16 (16 = 32 rows, the widest shared step); default 16 (one
+// weight read for up to 16 requests, same ids as 8; 8 = old form, one forward per eight). "ab" alternates 8 and 16 by joint cycle (measurement).
 // Scheduling only: every row keeps its arithmetic in the 9..32-row wide steps.
 inline constexpr std::uint32_t kMtpJointGroupLanesMax=16U;
 [[nodiscard]] std::uint32_t mtp_serve_joint_group_lanes(std::uint64_t cycle=0) noexcept;
