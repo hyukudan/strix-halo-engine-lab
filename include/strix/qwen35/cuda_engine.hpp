@@ -53,6 +53,10 @@ struct EngineOptions {
     PrefillArith prefill_arith = PrefillArith::exact;
     std::uint32_t prefill_chunk = 2048;  // rows per large-M chunk (multiple of 128, <= 8192); buffers are allocated on first use
     std::uint32_t prefill_slots = 2;     // chunks in flight (1..2): 2 overlaps the sequential GDN kernel of one chunk with the GEMMs of the next
+    // bounded submission (cuda_core/submit_window.hpp): the host queues at most this many chunks ahead of the GPU (waits on
+    // chunk i - N before queuing chunk i). Scheduling only, bitwise. 0 = unbounded (whole prefill queued before one sync).
+    std::uint32_t prefill_inflight = 3;
+    std::uint32_t prefill_ramp = 0;      // > 0: first chunks grow ramp, 2*ramp, ... (< prefill_chunk) from idle; 0 = off
     bool prefill_big = true;             // false: prefill() runs forward_rows windows of 32 + commit (reference / fallback)
 };
 
