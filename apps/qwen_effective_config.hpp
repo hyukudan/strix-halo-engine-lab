@@ -2347,7 +2347,7 @@ inline std::string effective_config_json(const EffectiveConfig& config) {
         << "\",\"reserved_device_bytes\":" << config.router_bf16_reservation.device_bytes
         << ",\"setup_host_bytes\":" << config.router_bf16_reservation.setup_host_bytes
         << ",\"qualification\":\"per-tensor-bit-check\",\"phase\":\"pending-model-load\"}";
-    out << ",\"turbo_weights\":{\"source\":\"" << (o.turbo.active() ? "onfly" : "native") << "\",\"bits\":" << o.turbo.bits
+    if (o.turbo.active()) out << ",\"turbo_weights\":{\"source\":\"" << (o.turbo.active() ? "onfly" : "native") << "\",\"bits\":" << o.turbo.bits
         << ",\"identity\":\"" << (o.turbo.active() ? o.turbo.identity() : std::string("native")) << "\",\"groups\":\""
         << (o.turbo.active() ? strix::onfly_i4::groups_text(o.turbo.groups) : std::string("none")) << "\",\"scale_rule\":\""
         << strix::onfly_i4::scale_rule_name(o.turbo.scale_rule) << "\",\"scope\":\""

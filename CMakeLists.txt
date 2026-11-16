@@ -5683,4 +5683,5 @@ set_property(SOURCE
     tests/qwen_yarn_schedule_tests.cpp
     tests/rotary_descriptor_tests.cpp
     tests/serve_api_tests.cpp
+    tests/turbo_profile_tests.cpp
     APPEND PROPERTY INCLUDE_DIRECTORIES "${CMAKE_CURRENT_SOURCE_DIR}/src")
