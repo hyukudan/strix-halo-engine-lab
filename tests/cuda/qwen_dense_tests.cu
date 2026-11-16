@@ -262,6 +262,21 @@ static std::size_t run_projection(const Case& cs, const std::vector<std::vector<
         CK(qd::quantize_project(nullptr, site, rows, cs.input, in.p, width, codes.p, deltas.p, pitch));
         CK(cudaDeviceSynchronize());
     }
+#ifdef STRIX_WFMT_CAPTURE
+    std::vector<float> observed_partials;
+    std::uint32_t captured_outputs = 0;
+    if (!wfmt_capture_directory.empty()) {
+        std::vector<std::vector<std::uint8_t>> production;
+        for (const auto& out : outs) production.push_back(out->down());
+        for (const auto n : cs.outs) captured_outputs += n;
+        Dev<float> partials(static_cast<std::size_t>(width / 32U) * rows * captured_outputs);
+        CK(qd::capture_project_partials(nullptr, site, rows, codes.p, deltas.p, pitch, partials.p));
+        CK(cudaDeviceSynchronize());
+        observed_partials = partials.down();
+        for (std::size_t m = 0; m < outs.size(); ++m)
+            check(production[m] == outs[m]->down(), "diagnostic matches production output");
+    }
+#endif
     // host reference on the checked rows
     std::vector<std::int8_t> hc(static_cast<std::size_t>(rows) * width);
     std::vector<float> hd(static_cast<std::size_t>(width / 32U) * pitch);
@@ -283,6 +298,12 @@ static std::size_t run_projection(const Case& cs, const std::vector<std::vector<
             // Observe the exact production buffers, not host recomputations.
             const auto observed_codes = codes.down();
             const auto observed_scales = deltas.down();
+            std::uint32_t begin = 0;
+            for (std::uint32_t j = 0; j < m; ++j) begin += cs.outs[j];
+            std::vector<float> segment_partials;
+            for (std::size_t line = 0; line < static_cast<std::size_t>(width / 32U) * rows; ++line)
+                segment_partials.insert(segment_partials.end(), observed_partials.data() + line * captured_outputs + begin,
+                                         observed_partials.data() + line * captured_outputs + begin + cs.outs[m]);
             const std::uint64_t shape[]{rows, width, cs.outs[m], static_cast<std::uint64_t>(cs.store), m};
             const std::string name = "cuda-dense-" + std::to_string(wfmt_capture_index++);
             check(strix::weight::test::write_cuda_capture(wfmt_capture_directory, name,
@@ -291,6 +312,7 @@ static std::size_t run_projection(const Case& cs, const std::vector<std::vector<
                  {"activation_codes", std::as_bytes(std::span(observed_codes))},
                  {"activation_scales", std::as_bytes(std::span(observed_scales))},
                  {"sidecars", std::as_bytes(std::span(gate))},
+                 {"partials", std::as_bytes(std::span(segment_partials))},
                  {"output", std::as_bytes(std::span(got))}}), "write " + name);
         }
 #endif

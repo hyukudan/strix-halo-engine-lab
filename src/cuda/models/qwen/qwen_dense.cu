@@ -118,6 +118,23 @@ __global__ __launch_bounds__(256) void quantize_kernel(std::uint32_t rows, std::
 // float(dot) = bits - 1.5*2^23, one exact subtraction). Every thread owns 64 (row, output) accumulators and walks the
 // blocks in ascending order: the HIP chain acc = fma(dw * delta, float(dot), acc), unchanged by tiling.
 // Pipeline: stages of 4 blocks (codes 128 x 128 B, raw Q8_0 bytes 128 x 136 B, deltas 4 x 128), cp.async double buffer.
+// Empty production observer is erased at compile time. The capture build also
+// instantiates the identical arithmetic with register-partial stores.
+struct NoCapture {
+    __device__ __forceinline__ static void record(unsigned, unsigned, unsigned, float) {}
+};
+#ifdef STRIX_WFMT_CAPTURE
+struct PartialCaptureConfig { float* output; unsigned rows, outputs; };
+__device__ PartialCaptureConfig partial_capture_config;
+struct PartialCapture {
+    __device__ __forceinline__ static void record(unsigned block, unsigned row, unsigned output, float value) {
+        const auto c = partial_capture_config;
+        if (row < c.rows && output < c.outputs)
+            c.output[(static_cast<std::uint64_t>(block) * c.rows + row) * c.outputs + output] = value;
+    }
+};
+#endif
+
 struct KSeg { const unsigned char* w; void* out; std::uint64_t stride; std::uint32_t begin, end; };
 struct KSite {
     KSeg seg[kMaxSegments];
@@ -164,7 +181,7 @@ __device__ __forceinline__ void store_value(const KSite& site, std::uint32_t row
     }
 }
 
-template <Store S>
+template <Store S, class Capture = NoCapture>
 __global__ __launch_bounds__(kThreads) void project_kernel(KSite site, std::uint32_t rows, const std::int8_t* codes,
                                                           const float* deltas, std::uint32_t pitch) {
     extern __shared__ __align__(16) unsigned char smem[];
@@ -270,6 +287,8 @@ __global__ __launch_bounds__(kThreads) void project_kernel(KSite site, std::uint
                         const float dot = __fsub_rn(__int_as_float(d[e]), 12582912.0F);   // exact float(dot_b)
                         const float p = __fmul_rn(dw[nt][e & 1], dl[mt][e >> 1]);         // v_mul_f32 dw * delta
                         acc[mt][nt][e] = __fmaf_rn(p, dot, acc[mt][nt][e]);               // v_fmac_f32
+                        Capture::record(s * kKB + j, m0 + wm * 64 + mt * 16 + gid + 8 * (e >> 1),
+                                        n0 + wn * 32 + nt * 8 + 2 * tig + (e & 1), acc[mt][nt][e]);
                     }
                 }
         }
@@ -308,7 +327,7 @@ constexpr int kT2Smem = 2 * kT2Stage;
 // The old loader (17 lanes per row, 9 pointers hoisted per thread) spilled 112 B under the 128-register cap of
 // launch_bounds(256, 2) and reloaded them each stage; one CTA per SM with 249 registers was measured faster than two
 // capped CTAs (2.267 vs 2.410 ms) and than a 4-stage ring with one barrier per stage (2.506 ms).
-template <Store S, bool Remap>
+template <Store S, bool Remap, class Capture = NoCapture>
 __global__ __launch_bounds__(kThreads, Remap ? 1 : 2) void project_tile2_kernel(KSite site, std::uint32_t rows, const std::int8_t* codes,
                                                                     const float* deltas, std::uint32_t pitch) {
     extern __shared__ __align__(16) unsigned char smem[];
@@ -437,6 +456,8 @@ __global__ __launch_bounds__(kThreads, Remap ? 1 : 2) void project_tile2_kernel(
                         acc[mt][nt][e] = __int_as_float(__float_as_int(acc[mt][nt][e]) ^ d[e]);
 #else
                         acc[mt][nt][e] = core::imma::block_acc(d[e], dw[nt][e & 1], dl[mt][e >> 1], acc[mt][nt][e]);
+                        Capture::record(s * 2 + j, m0 + wm * 64 + mt * 16 + gid + 8 * (e >> 1),
+                                        n0 + wn * 32 + nt * 8 + 2 * tig + (e & 1), acc[mt][nt][e]);
 #endif
                     }
                 }
@@ -467,7 +488,7 @@ __global__ __launch_bounds__(kThreads, Remap ? 1 : 2) void project_tile2_kernel(
 // stores); for RP >= 4 a transpose-reduce (xor 2 then xor 1, each level keeping half of the rows), so lane q finishes
 // rows (q >> 1) * RP/2 + (q & 1) * RP/4 .. + RP/4 and runs only their chains. Activations sit in shared memory.
 constexpr unsigned kRowsThreads = 128, kRowsQuads = kRowsThreads / 4;
-template <Store S, unsigned R, unsigned RP>
+template <Store S, unsigned R, unsigned RP, class Capture = NoCapture>
 __global__ __launch_bounds__(kRowsThreads) void project_rows_kernel(KSite site, const std::int8_t* codes, const float* deltas,
                                                                    std::uint32_t pitch) {
     extern __shared__ __align__(16) unsigned char smem[];
@@ -530,6 +551,7 @@ __global__ __launch_bounds__(kRowsThreads) void project_rows_kernel(KSite site, 
         for (unsigned i = 0; i < OWN; ++i) {
             const float p = __fmul_rn(dw, D[(first + i) * nblocks + b]);    // v_mul_f32 dw * delta
             acc[i] = __fmaf_rn(p, static_cast<float>(dot[i]), acc[i]);      // v_fmac_f32 (float(dot) exact, |dot| < 2^24)
+            if (RP >= 4U || q == 0U) Capture::record(b, first + i, n, acc[i]);
         }
     }
     if (!valid || (RP < 4U && q != 0U)) return;
@@ -538,30 +560,30 @@ __global__ __launch_bounds__(kRowsThreads) void project_rows_kernel(KSite site, 
         if (first + i < R) store_value<S>(site, first + i, n, acc[i]);
 }
 
-template <Store S, unsigned R> cudaError_t launch_rows_r(cudaStream_t stream, const KSite& k, const std::int8_t* codes,
+template <Store S, unsigned R, class Capture = NoCapture> cudaError_t launch_rows_r(cudaStream_t stream, const KSite& k, const std::int8_t* codes,
                                                         const float* deltas, std::uint32_t pitch) {
     constexpr unsigned RP = R <= 1U ? 1U : R <= 2U ? 2U : R <= 4U ? 4U : 8U;
     const std::uint32_t smem = RP * k.width + RP * (k.width / 32U) * 4U;
     static std::once_flag once;
     static cudaError_t attr = cudaSuccess;
     std::call_once(once, [] {
-        attr = cudaFuncSetAttribute(project_rows_kernel<S, R, RP>, cudaFuncAttributeMaxDynamicSharedMemorySize, 8 * 6144 + 8 * 192 * 4);
+        attr = cudaFuncSetAttribute(project_rows_kernel<S, R, RP, Capture>, cudaFuncAttributeMaxDynamicSharedMemorySize, 8 * 6144 + 8 * 192 * 4);
     });
     if (attr != cudaSuccess) return attr;
-    project_rows_kernel<S, R, RP><<<(k.outputs + kRowsQuads - 1U) / kRowsQuads, kRowsThreads, smem, stream>>>(k, codes, deltas, pitch);
+    project_rows_kernel<S, R, RP, Capture><<<(k.outputs + kRowsQuads - 1U) / kRowsQuads, kRowsThreads, smem, stream>>>(k, codes, deltas, pitch);
     return cudaGetLastError();
 }
-template <Store S> cudaError_t launch_rows(cudaStream_t stream, const KSite& k, std::uint32_t rows, const std::int8_t* codes,
+template <Store S, class Capture = NoCapture> cudaError_t launch_rows(cudaStream_t stream, const KSite& k, std::uint32_t rows, const std::int8_t* codes,
                                            const float* deltas, std::uint32_t pitch) {
     switch (rows) {
-    case 1: return launch_rows_r<S, 1>(stream, k, codes, deltas, pitch);
-    case 2: return launch_rows_r<S, 2>(stream, k, codes, deltas, pitch);
-    case 3: return launch_rows_r<S, 3>(stream, k, codes, deltas, pitch);
-    case 4: return launch_rows_r<S, 4>(stream, k, codes, deltas, pitch);
-    case 5: return launch_rows_r<S, 5>(stream, k, codes, deltas, pitch);
-    case 6: return launch_rows_r<S, 6>(stream, k, codes, deltas, pitch);
-    case 7: return launch_rows_r<S, 7>(stream, k, codes, deltas, pitch);
-    default: return launch_rows_r<S, 8>(stream, k, codes, deltas, pitch);
+    case 1: return launch_rows_r<S, 1, Capture>(stream, k, codes, deltas, pitch);
+    case 2: return launch_rows_r<S, 2, Capture>(stream, k, codes, deltas, pitch);
+    case 3: return launch_rows_r<S, 3, Capture>(stream, k, codes, deltas, pitch);
+    case 4: return launch_rows_r<S, 4, Capture>(stream, k, codes, deltas, pitch);
+    case 5: return launch_rows_r<S, 5, Capture>(stream, k, codes, deltas, pitch);
+    case 6: return launch_rows_r<S, 6, Capture>(stream, k, codes, deltas, pitch);
+    case 7: return launch_rows_r<S, 7, Capture>(stream, k, codes, deltas, pitch);
+    default: return launch_rows_r<S, 8, Capture>(stream, k, codes, deltas, pitch);
     }
 }
 
@@ -579,7 +601,7 @@ bool rows_ksplit_enabled() {
     static const bool on = strix::envcfg::flag("STRIX_QRTX_ROWS_KSPLIT", true);
     return on;
 }
-template <Store S, unsigned R, unsigned RP>
+template <Store S, unsigned R, unsigned RP, class Capture = NoCapture>
 __global__ __launch_bounds__(1024) void project_rows_ks_kernel(KSite site, const std::int8_t* codes, const float* deltas,
                                                               std::uint32_t pitch) {
     extern __shared__ __align__(16) unsigned char smem[];
@@ -654,36 +676,37 @@ __global__ __launch_bounds__(1024) void project_rows_ks_kernel(KSite site, const
         for (std::uint32_t b = 0; b < nblocks; ++b) {
             const float p = __fmul_rn(DW[b * kKsOut + o], D[b * RP + r]);                       // v_mul_f32 dw * delta
             acc = __fmaf_rn(p, static_cast<float>(DOT[(b * kKsOut + o) * RP + r]), acc);        // v_fmac_f32
+            Capture::record(b, r, n, acc);
         }
         store_value<S>(site, r, n, acc);
     }
 }
 
-template <Store S, unsigned R> cudaError_t launch_rows_ks_r(cudaStream_t stream, const KSite& k, const std::int8_t* codes,
+template <Store S, unsigned R, class Capture = NoCapture> cudaError_t launch_rows_ks_r(cudaStream_t stream, const KSite& k, const std::int8_t* codes,
                                                            const float* deltas, std::uint32_t pitch) {
     constexpr unsigned RP = R <= 1U ? 1U : R <= 2U ? 2U : R <= 4U ? 4U : 8U;
     const std::uint32_t nb = k.width / 32U, smem = nb * (kKsOut * RP + kKsOut + RP) * 4U;
     static std::once_flag once;
     static cudaError_t attr = cudaSuccess;
     std::call_once(once, [] {
-        attr = cudaFuncSetAttribute(project_rows_ks_kernel<S, R, RP>, cudaFuncAttributeMaxDynamicSharedMemorySize,
+        attr = cudaFuncSetAttribute(project_rows_ks_kernel<S, R, RP, Capture>, cudaFuncAttributeMaxDynamicSharedMemorySize,
                                     256 * (kKsOut * 8 + kKsOut + 8) * 4);
     });
     if (attr != cudaSuccess) return attr;
-    project_rows_ks_kernel<S, R, RP><<<(k.outputs + kKsOut - 1U) / kKsOut, 32U * ((nb + 7U) / 8U), smem, stream>>>(k, codes, deltas, pitch);
+    project_rows_ks_kernel<S, R, RP, Capture><<<(k.outputs + kKsOut - 1U) / kKsOut, 32U * ((nb + 7U) / 8U), smem, stream>>>(k, codes, deltas, pitch);
     return cudaGetLastError();
 }
-template <Store S> cudaError_t launch_rows_ks(cudaStream_t stream, const KSite& k, std::uint32_t rows, const std::int8_t* codes,
+template <Store S, class Capture = NoCapture> cudaError_t launch_rows_ks(cudaStream_t stream, const KSite& k, std::uint32_t rows, const std::int8_t* codes,
                                               const float* deltas, std::uint32_t pitch) {
     switch (rows) {
-    case 1: return launch_rows_ks_r<S, 1>(stream, k, codes, deltas, pitch);
-    case 2: return launch_rows_ks_r<S, 2>(stream, k, codes, deltas, pitch);
-    case 3: return launch_rows_ks_r<S, 3>(stream, k, codes, deltas, pitch);
-    case 4: return launch_rows_ks_r<S, 4>(stream, k, codes, deltas, pitch);
-    case 5: return launch_rows_ks_r<S, 5>(stream, k, codes, deltas, pitch);
-    case 6: return launch_rows_ks_r<S, 6>(stream, k, codes, deltas, pitch);
-    case 7: return launch_rows_ks_r<S, 7>(stream, k, codes, deltas, pitch);
-    default: return launch_rows_ks_r<S, 8>(stream, k, codes, deltas, pitch);
+    case 1: return launch_rows_ks_r<S, 1, Capture>(stream, k, codes, deltas, pitch);
+    case 2: return launch_rows_ks_r<S, 2, Capture>(stream, k, codes, deltas, pitch);
+    case 3: return launch_rows_ks_r<S, 3, Capture>(stream, k, codes, deltas, pitch);
+    case 4: return launch_rows_ks_r<S, 4, Capture>(stream, k, codes, deltas, pitch);
+    case 5: return launch_rows_ks_r<S, 5, Capture>(stream, k, codes, deltas, pitch);
+    case 6: return launch_rows_ks_r<S, 6, Capture>(stream, k, codes, deltas, pitch);
+    case 7: return launch_rows_ks_r<S, 7, Capture>(stream, k, codes, deltas, pitch);
+    default: return launch_rows_ks_r<S, 8, Capture>(stream, k, codes, deltas, pitch);
     }
 }
 
@@ -723,30 +746,30 @@ bool segments_tile_aligned(const KSite& k) {
     return true;
 }
 
-template <Store S> cudaError_t launch_project(cudaStream_t stream, const KSite& k, std::uint32_t rows, const std::int8_t* codes,
+template <Store S, class Capture = NoCapture> cudaError_t launch_project(cudaStream_t stream, const KSite& k, std::uint32_t rows, const std::int8_t* codes,
                                               const float* deltas, std::uint32_t pitch) {
     if (rows <= 8U && k.width <= 6144U && decode_rows_enabled())
-        return rows_ksplit_enabled() ? launch_rows_ks<S>(stream, k, rows, codes, deltas, pitch)
-                                     : launch_rows<S>(stream, k, rows, codes, deltas, pitch);
+        return rows_ksplit_enabled() ? launch_rows_ks<S, Capture>(stream, k, rows, codes, deltas, pitch)
+                                     : launch_rows<S, Capture>(stream, k, rows, codes, deltas, pitch);
     const dim3 grid((k.outputs + kBN - 1U) / kBN, (rows + kBM - 1U) / kBM);
     if (dense_tile2_enabled() && (k.width / 32U) % 2U == 0U && segments_tile_aligned(k)) {
         static std::once_flag once2;
         static cudaError_t attr2 = cudaSuccess;
         std::call_once(once2, [] {
-            attr2 = cudaFuncSetAttribute(project_tile2_kernel<S, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, kT2Smem);
+            attr2 = cudaFuncSetAttribute(project_tile2_kernel<S, true, Capture>, cudaFuncAttributeMaxDynamicSharedMemorySize, kT2Smem);
             if (attr2 == cudaSuccess)
-                attr2 = cudaFuncSetAttribute(project_tile2_kernel<S, false>, cudaFuncAttributeMaxDynamicSharedMemorySize, kT2Smem);
+                attr2 = cudaFuncSetAttribute(project_tile2_kernel<S, false, Capture>, cudaFuncAttributeMaxDynamicSharedMemorySize, kT2Smem);
         });
         if (attr2 != cudaSuccess) return attr2;
-        if (dense_t2_remap_enabled()) project_tile2_kernel<S, true><<<grid, kThreads, kT2Smem, stream>>>(k, rows, codes, deltas, pitch);
-        else project_tile2_kernel<S, false><<<grid, kThreads, kT2Smem, stream>>>(k, rows, codes, deltas, pitch);
+        if (dense_t2_remap_enabled()) project_tile2_kernel<S, true, Capture><<<grid, kThreads, kT2Smem, stream>>>(k, rows, codes, deltas, pitch);
+        else project_tile2_kernel<S, false, Capture><<<grid, kThreads, kT2Smem, stream>>>(k, rows, codes, deltas, pitch);
         return cudaGetLastError();
     }
     static std::once_flag once;
     static cudaError_t attr = cudaSuccess;
-    std::call_once(once, [] { attr = cudaFuncSetAttribute(project_kernel<S>, cudaFuncAttributeMaxDynamicSharedMemorySize, kSmem); });
+    std::call_once(once, [] { attr = cudaFuncSetAttribute(project_kernel<S, Capture>, cudaFuncAttributeMaxDynamicSharedMemorySize, kSmem); });
     if (attr != cudaSuccess) return attr;
-    project_kernel<S><<<grid, kThreads, kSmem, stream>>>(k, rows, codes, deltas, pitch);
+    project_kernel<S, Capture><<<grid, kThreads, kSmem, stream>>>(k, rows, codes, deltas, pitch);
     return cudaGetLastError();
 }
 
@@ -763,7 +786,8 @@ cudaError_t quantize(cudaStream_t stream, std::uint32_t rows, std::uint32_t widt
     return cudaGetLastError();
 }
 
-cudaError_t project(cudaStream_t stream, const Site& site, std::uint32_t rows, const std::int8_t* codes, const float* deltas,
+template<class Capture>
+cudaError_t project_observed(cudaStream_t stream, const Site& site, std::uint32_t rows, const std::int8_t* codes, const float* deltas,
                     std::uint32_t pitch) {
     if (!rows) return cudaSuccess;
     if (site.width == 0U || site.width % 64U != 0U || site.segments == 0U || site.segments > kMaxSegments || pitch < rows ||
@@ -780,13 +804,29 @@ cudaError_t project(cudaStream_t stream, const Site& site, std::uint32_t rows, c
     }
     k.nseg = site.segments; k.width = site.width; k.outputs = n; k.gate = site.gate; k.gate_stride = site.gate_stride;
     switch (site.store) {
-    case Store::f32: return launch_project<Store::f32>(stream, k, rows, codes, deltas, pitch);
-    case Store::f32_round_bf16: return launch_project<Store::f32_round_bf16>(stream, k, rows, codes, deltas, pitch);
-    case Store::bf16: return launch_project<Store::bf16>(stream, k, rows, codes, deltas, pitch);
-    case Store::bf16_gated: return launch_project<Store::bf16_gated>(stream, k, rows, codes, deltas, pitch);
+    case Store::f32: return launch_project<Store::f32, Capture>(stream, k, rows, codes, deltas, pitch);
+    case Store::f32_round_bf16: return launch_project<Store::f32_round_bf16, Capture>(stream, k, rows, codes, deltas, pitch);
+    case Store::bf16: return launch_project<Store::bf16, Capture>(stream, k, rows, codes, deltas, pitch);
+    case Store::bf16_gated: return launch_project<Store::bf16_gated, Capture>(stream, k, rows, codes, deltas, pitch);
     }
     return cudaErrorInvalidValue;
 }
+
+cudaError_t project(cudaStream_t stream, const Site& site, std::uint32_t rows, const std::int8_t* codes,
+                    const float* deltas, std::uint32_t pitch) {
+    return project_observed<NoCapture>(stream, site, rows, codes, deltas, pitch);
+}
+#ifdef STRIX_WFMT_CAPTURE
+cudaError_t capture_project_partials(cudaStream_t stream, const Site& site, std::uint32_t rows,
+                                    const std::int8_t* codes, const float* deltas, std::uint32_t pitch, float* partials) {
+    unsigned outputs = 0;
+    for (unsigned i = 0; i < site.segments; ++i) outputs += site.segment[i].outputs;
+    const PartialCaptureConfig capture{partials, rows, outputs};
+    const auto copied = cudaMemcpyToSymbol(partial_capture_config, &capture, sizeof(capture), 0, cudaMemcpyHostToDevice);
+    if (copied != cudaSuccess) return copied;
+    return project_observed<PartialCapture>(stream, site, rows, codes, deltas, pitch);
+}
+#endif
 
 cudaError_t quantize_project(cudaStream_t stream, const Site& site, std::uint32_t rows, Input type, const void* input,
                              std::uint64_t input_stride, std::int8_t* codes, float* deltas, std::uint32_t pitch) {
