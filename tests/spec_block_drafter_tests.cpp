@@ -190,6 +190,12 @@ int main() {
         BD_CHECK(g_clock / n < tok_ms_serial * 1.10, "useless chain costs %.2f ms/token vs serial %.2f", g_clock / n, tok_ms_serial);
         (void)r;
     }
+    {  // a chain at ~66 % per-token acceptance on prose must keep drafting: misses in a row are routine, not a retreat
+        const auto w = make_world("prose", 700, n, 5);
+        g_clock = 0.0;
+        const auto r = run(w, n, 0.66, true, true, true, true);
+        BD_CHECK(double(r.serial_steps) < 0.15 * double(r.steps), "66 %% chain: %llu of %llu passes serial", (unsigned long long)r.serial_steps, (unsigned long long)r.steps);
+    }
     std::printf("block drafter tests ok: %d cases, copy blocks %llu, chain blocks %llu, hybrid blocks %llu; edit %.2f vs serial %.2f ms/token\n",
                 cases, (unsigned long long)copies, (unsigned long long)chains, (unsigned long long)hybrids, tok_ms_all_loop, tok_ms_serial);
     return 0;
