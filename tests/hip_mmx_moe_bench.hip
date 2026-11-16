@@ -21,6 +21,8 @@
 #include "minimax/moe/mmx_moe.hpp"
 #include "minimax/moe/mmx_prefill.hpp"
 #include "minimax/moe/mmx_prefill_core.hpp"
+#include "minimax/attn/msa_norm_rope.hpp"
+#include "attn_core/wmma_types.hpp"
 #include "minimax/moe/mmx_trellis_device.hpp"
 #include "minimax_gate_common.hpp"
 #include "strix/hip_minimax_moe.hpp"
@@ -43,6 +45,23 @@
 namespace {
 
 namespace opt = strix::minimax::moe::opt;
+
+// The MSA flash prologue on an FP32 q (msa_flash_policy.hpp query + sparse_flash_keysplit.hpp staging): one wave per
+// (row, 128-dim head), load4 layout, norm_rope_lane, pack2<bf16>; lo = the Split terms. Reference for the q image.
+__global__ void msa_q_image_ref(const float* q, const float* w, const strix::minimax::msa::RopeRow* rope, unsigned rows, unsigned n,
+                                std::uint16_t* hi, std::uint16_t* lo) {
+    namespace tile = strix::attn_core::tile;
+    constexpr tile::Operand O = tile::Operand::bf16;
+    const unsigned wave = (blockIdx.x * blockDim.x + threadIdx.x) >> 5U, lane = threadIdx.x & 31U, heads = n / 128U;
+    if (wave >= rows * heads) return;
+    const unsigned row = wave / heads, h = wave % heads;
+    const std::size_t at = static_cast<std::size_t>(row) * n + h * 128U + lane * 4U;
+    float x[4] = {q[at], q[at + 1], q[at + 2], q[at + 3]};
+    strix::minimax::msa::norm_rope_lane(x, w, rope[row], lane);
+    *reinterpret_cast<uint2*>(hi + at) = make_uint2(tile::pack2<O>(x[0], x[1]), tile::pack2<O>(x[2], x[3]));
+    for (unsigned d = 0; d < 4U; ++d) x[d] -= tile::operand_value<O>(tile::to_operand<O>(x[d]));
+    *reinterpret_cast<uint2*>(lo + at) = make_uint2(tile::pack2<O>(x[0], x[1]), tile::pack2<O>(x[2], x[3]));
+}
 namespace mref = strix::minimax::moe;
 
 constexpr unsigned H = opt::kHidden, IR = opt::kInter;
@@ -518,6 +537,7 @@ struct Options {
     std::string routes, tests;
     bool no_load = false;
     unsigned syn_bits = 3;
+    unsigned dense_bits = 5;  // --dense-bits: synthetic dense MLP weights (real packs retain their widths)
     bool diverse = false;
     bool diverse_fallback = false;  // explicit negative-reader gate, never singleton qualification
     std::string singletons = "min";  // --singletons min|max|COUNT; infeasible cells are skipped
@@ -788,8 +808,9 @@ struct Bench {
             {"v", a + "v_proj", true, r * 256, 256, H, 256, 6, 64},
             {"o", a + "o_proj", false, r * 4096, 4096, 4096, H, 6, 16},
             {"head", "language_model.lm_head", true, r * 100096, r == 0 ? 100096U : 99968U, H, r == 0 ? 100096U : 99968U, 8, 1},
-            {"dense_gate", kP + "layers.0.mlp.gate_proj", true, r * 6144, 6144, H, 6144, 5, 8},
-            {"dense_down", kP + "layers.0.mlp.down_proj", false, r * 6144, 6144, 6144, H, 5, 8},
+            {"dense_gate", kP + "layers.0.mlp.gate_proj", true, r * 6144, 6144, H, 6144, o.dense_bits, 8},
+            {"dense_up", kP + "layers.0.mlp.up_proj", true, r * 6144, 6144, H, 6144, o.dense_bits, 8},
+            {"dense_down", kP + "layers.0.mlp.down_proj", false, r * 6144, 6144, 6144, H, o.dense_bits, 8},
             {"xgate", b + "experts.0.w1", true, r * IR, IR, H, IR, 3, 32},
             {"xdown", b + "experts.0.w2", false, r * IR, IR, IR, H, 3, 32},
         };
@@ -800,7 +821,7 @@ struct Bench {
             ds.input = sp.in;
             ds.output = sp.out;
             for (unsigned c = 0; c < sp.copies; ++c)
-                ds.copies.push_back(mk(sp.prefix, sp.out_slice, sp.first, sp.n, sp.in, sp.out, sp.bits, 5000 + dense.size() * 100 + c));
+                ds.copies.push_back(mk(sp.prefix, sp.out_slice, sp.first, sp.n, sp.in, sp.out, sp.bits, 5000 + dense.size() * 100 + c + r * 100000));
             dense.push_back(std::move(ds));
         }
         // Scratch and workspaces.
@@ -2616,20 +2637,28 @@ struct Bench {
 
     // Dense prefill sites through strix_gemm (the engine's prefill identity) at T rows: us and TFLOPS.
     // Dense prefill linears on the v4 core (opt::enqueue_prefill_dense) == the library strix_gemm, bitwise, for the
-    // attention sites alone and k+v in one call; outputs start poisoned.
+    // attention and dense MLP sites, including grouped gate+up; outputs start poisoned.
     std::vector<std::vector<DenseSite*>> dense_v4_groups() {
         std::vector<std::vector<DenseSite*>> g;
         DenseSite *q = nullptr, *k = nullptr, *v = nullptr, *ov = nullptr;
+        DenseSite *gate = nullptr, *up = nullptr, *down = nullptr;
         for (auto& ds : dense) {
             if (ds.name == "q") q = &ds;
             if (ds.name == "k") k = &ds;
             if (ds.name == "v") v = &ds;
             if (ds.name == "o") ov = &ds;
+            if (ds.name == "dense_gate") gate = &ds;
+            if (ds.name == "dense_up") up = &ds;
+            if (ds.name == "dense_down") down = &ds;
         }
         if (k != nullptr && v != nullptr) g.push_back({k, v});
         if (q != nullptr) g.push_back({q});
         if (ov != nullptr) g.push_back({ov});
         if (q != nullptr && k != nullptr && v != nullptr) g.push_back({q, k, v});
+        if (gate != nullptr) g.push_back({gate});
+        if (up != nullptr) g.push_back({up});
+        if (down != nullptr) g.push_back({down});
+        if (gate != nullptr && up != nullptr) g.push_back({gate, up});
         return g;
     }
     void run_dense_v4(const std::vector<DenseSite*>& g, const float* in, std::vector<float*>& outs, unsigned T, void* ws, std::size_t ws_bytes, std::size_t copy) {
@@ -2641,6 +2670,36 @@ struct Bench {
         std::vector<opt::PrefillDenseJob> jobs;
         for (auto* ds : g) jobs.push_back({ds->copies[0].dev, reinterpret_cast<float*>(1)});
         return opt::prefill_dense_workspace_bytes(jobs.data(), static_cast<unsigned>(jobs.size()), T);
+    }
+    void test_dense_mlp_chain(const std::vector<DenseSite*>& gu, std::vector<float*>& libOut,
+                              std::vector<float*>& v4Out, unsigned T, void* ws, std::size_t bytes) {
+        DenseSite* down = nullptr;
+        for (auto& ds : dense) if (ds.name == "dense_down") down = &ds;
+        if (down == nullptr) throw std::logic_error("dense MLP gate requires down weights");
+        const std::size_t hidden = std::size_t{T} * gu[0]->output;
+        const std::size_t output = std::size_t{T} * down->output;
+        float* ref = dalloc<float>(output);
+        std::vector<float*> got{dalloc<float>(output)};
+        hip_ok(hipMemset(ref, 0xff, output * sizeof(float)), "poison MLP reference");
+        hip_ok(hipMemset(got[0], 0xff, output * sizeof(float)), "poison MLP candidate");
+        hipLaunchKernelGGL(swiglu_kernel, dim3(grid(hidden)), dim3(256), 0, nullptr, libOut[0], libOut[1], libOut[0], hidden);
+        hipLaunchKernelGGL(swiglu_kernel, dim3(grid(hidden)), dim3(256), 0, nullptr, v4Out[0], v4Out[1], v4Out[0], hidden);
+        lib.gemm_wmma(down->copies[0].lib, down->input, down->output, libOut[0], ref, T);
+        // Reuse the gate/up workspace on the same stream, exactly as the engine does.
+        run_dense_v4({down}, v4Out[0], got, T, ws, bytes, 0);
+        hip_ok(hipDeviceSynchronize(), "dense MLP sync");
+        const auto actA = d2h(libOut[0], hidden), actB = d2h(v4Out[0], hidden);
+        const auto outA = d2h(ref, output), outB = d2h(got[0], output);
+        const auto finite = [](const std::vector<float>& x) {
+            return std::all_of(x.begin(), x.end(), [](float v) { return std::isfinite(v); });
+        };
+        const bool same = finite(actA) && finite(actB) && finite(outA) && finite(outB) &&
+                          same_bits(actA, actB) && same_bits(outA, outB);
+        check(same, "dense_v4 composed SwiGLU/down differs or contains poison");
+        std::printf("dense_v4 chain rank %u bits %u/%u/%u T%u: %s\n", o.rank, gu[0]->copies[0].dev.bits,
+                    gu[1]->copies[0].dev.bits, down->copies[0].dev.bits, T, same ? "bitwise" : "DIFF");
+        hip_ok(hipFree(ref), "free");
+        hip_ok(hipFree(got[0]), "free");
     }
     void test_prefill_dense() {
         {  // unsupported bit widths are refused (the engine then keeps the library call)
@@ -2675,7 +2734,11 @@ struct Bench {
                     hip_ok(hipMemset(libOut.back(), 0xff, std::size_t{T} * ds->output * 4), "poison");
                     hip_ok(hipMemset(v4Out.back(), 0xff, std::size_t{T} * ds->output * 4), "poison");
                 }
-                const std::size_t bytes = dense_v4_bytes(g, T);
+                const bool mlp_chain = T == 4096 && g.size() == 2 && g[0]->name == "dense_gate" && g[1]->name == "dense_up";
+                std::size_t bytes = dense_v4_bytes(g, T);
+                if (mlp_chain) {
+                    for (auto& ds : dense) if (ds.name == "dense_down") bytes = std::max(bytes, dense_v4_bytes({&ds}, T));
+                }
                 void* ws = nullptr;
                 hip_ok(hipMalloc(&ws, bytes), "dense ws");
                 hip_ok(hipMemset(ws, 0xff, bytes), "poison ws");
@@ -2686,7 +2749,9 @@ struct Bench {
                 std::string detail;
                 for (std::size_t i = 0; i < g.size(); ++i) {
                     const auto a = d2h(libOut[i], std::size_t{T} * g[i]->output), b = d2h(v4Out[i], std::size_t{T} * g[i]->output);
-                    const bool same = same_bits(a, b);
+                    const bool same = same_bits(a, b) &&
+                        std::all_of(a.begin(), a.end(), [](float x) { return std::isfinite(x); }) &&
+                        std::all_of(b.begin(), b.end(), [](float x) { return std::isfinite(x); });
                     std::size_t diff = 0;
                     for (std::size_t j = 0; j < a.size(); ++j)
                         if (std::memcmp(&a[j], &b[j], 4) != 0) ++diff;
@@ -2696,10 +2761,40 @@ struct Bench {
                 const std::string cell = "dense_v4 " + group_name(g) + " T" + std::to_string(T) +
                                          (band != 0 ? " band" + std::to_string(band) : std::string());
                 check(all, cell + " differs:" + detail);
+                if (g[0]->name == "q" && g[0]->output % 128U == 0U) {
+                    // the q image (MSA FAST flash query_op): dense finish image + lo == the flash prologue on the FP32 q
+                    const std::size_t qn = std::size_t{T} * g[0]->output;
+                    std::vector<float> hw(128), hr(std::size_t{T} * sizeof(strix::minimax::msa::RopeRow) / 4U);
+                    std::uniform_real_distribution<float> ud(-1.0F, 1.0F);
+                    for (auto& x : hw) x = 0.25F * ud(rng);
+                    for (auto& x : hr) x = ud(rng);
+                    float* dw = dupload(hw);
+                    float* drope = dupload(hr);
+                    auto* img = dalloc<std::uint16_t>(2 * qn);
+                    auto* ref = dalloc<std::uint16_t>(2 * qn);
+                    hip_ok(hipMemset(img, 0xff, 4 * qn), "poison");
+                    std::vector<opt::PrefillDenseJob> jobs;
+                    for (std::size_t i = 0; i < g.size(); ++i) jobs.push_back({g[i]->copies[0].dev, v4Out[i]});
+                    jobs[0].image = img, jobs[0].image_lo = img + qn, jobs[0].image_w = dw, jobs[0].image_rope = drope;
+                    opt::enqueue_prefill_dense(jobs.data(), static_cast<unsigned>(jobs.size()), in, T, ws, bytes, nullptr);
+                    const unsigned waves = T * (g[0]->output / 128U);
+                    hipLaunchKernelGGL(msa_q_image_ref, dim3((waves + 7U) / 8U), dim3(256), 0, nullptr, v4Out[0], dw,
+                                       reinterpret_cast<const strix::minimax::msa::RopeRow*>(drope), T, g[0]->output, ref, ref + qn);
+                    hip_ok(hipDeviceSynchronize(), "image sync");
+                    std::vector<std::uint16_t> a(2 * qn), b(2 * qn);
+                    hip_ok(hipMemcpy(a.data(), img, 4 * qn, hipMemcpyDeviceToHost), "d2h");
+                    hip_ok(hipMemcpy(b.data(), ref, 4 * qn, hipMemcpyDeviceToHost), "d2h");
+                    std::size_t diff = 0;
+                    for (std::size_t j = 0; j < a.size(); ++j) diff += a[j] != b[j];
+                    check(diff == 0U, cell + " q image differs");
+                    detail += diff == 0U ? " q-image bitwise" : " q-image DIFF " + std::to_string(diff);
+                    hip_ok(hipFree(dw), "free"), hip_ok(hipFree(drope), "free"), hip_ok(hipFree(img), "free"), hip_ok(hipFree(ref), "free");
+                }
                 std::printf("%s:%s (splits", cell.c_str(), detail.c_str());
                 for (auto* ds : g) std::printf(" %u", opt::gemm_splits(ds->input, ds->output, ds->copies[0].dev.bits, T));
                 std::printf(")\n");
                 std::fflush(stdout);
+                if (mlp_chain) test_dense_mlp_chain(g, libOut, v4Out, T, ws, bytes);
                 hip_ok(hipFree(ws), "free");
                 hip_ok(hipFree(in), "free");
                 for (auto* x : libOut) hip_ok(hipFree(x), "free");
@@ -3412,6 +3507,7 @@ int main(int argc, char** argv) {
             else if (a == "--tests") { o.tests = next(); o.test = true; }
             else if (a == "--no-load") o.no_load = true;
             else if (a == "--syn-bits") o.syn_bits = static_cast<unsigned>(std::stoul(next()));
+            else if (a == "--dense-bits") o.dense_bits = static_cast<unsigned>(std::stoul(next()));
             else if (a == "--diverse") o.diverse = true;
             else if (a == "--diverse-fallback") { o.diverse = true; o.diverse_fallback = true; }
             else if (a == "--singletons") o.singletons = next();
@@ -3421,6 +3517,8 @@ int main(int argc, char** argv) {
         if (o.reps < 1 || o.iters < 1 || o.reps > 1000 || o.iters > 10000)
             throw std::invalid_argument("reps/iters must be positive (maximum 1000/10000)");
         if (o.rank > 1) throw std::invalid_argument("rank must be 0 or 1");
+        if (o.dense_bits != 3 && o.dense_bits != 4 && o.dense_bits != 5 && o.dense_bits != 6 && o.dense_bits != 8)
+            throw std::invalid_argument("dense-bits must be 3, 4, 5, 6 or 8");
         if (!o.test && !o.bench) o.test = o.bench = true;
         hipDeviceProp_t prop{};
         hip_ok(hipGetDeviceProperties(&prop, 0), "props");

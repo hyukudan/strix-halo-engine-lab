@@ -19,6 +19,7 @@ Cycle receipts are read from the server log (--log, the bytes the burst appended
 
   serve cycle seq=.. lanes=.. rows=.. useful=.. pad=.. emitted=.. draft_rows=a/b/.. draft_ms=.. verify_ms=..
       host_ms=.. ms=.. prompt=0|1 begin_ns=.. end_ns=..        (strix/serve/cycle_receipt.hpp, STRIX_SERVE_RECEIPT=1)
+      [admitted=.. forwards=.. solo=single/no_rows/wide/padding/alone/no_owner]   (optional; forwards = logical target executions)
   batch cycle sessions=.. groups=.. rows=.. solo=.. emitted=.. ms=.. begin_ns=.. end_ns=..   (older cycle log)
 
 The older form has no prompt flag and no useful/padding split; the report says so instead of guessing.
@@ -86,12 +87,16 @@ def parse_cycles(log):
         draft_rows = None
         if re.fullmatch(r"\d+(/\d+)*", fields.get("draft_rows", "")):
             draft_rows = [int(v) for v in fields["draft_rows"].split("/")]
+        solo = None
+        if re.fullmatch(r"\d+(/\d+)*", fields.get("solo", "")):
+            solo = [int(v) for v in fields["solo"].split("/")]
         cycles.append(dict(form="serve", lanes=values["lanes"], rows=values["rows"], useful=values["useful"],
                            pad=values["pad"], emitted=values["emitted"], ms=float(values["ms"]),
                            prompt=bool(values["prompt"]) if values.get("prompt") is not None else None,
                            draft_ms=values.get("draft_ms"), verify_ms=values.get("verify_ms"),
                            host_ms=values.get("host_ms"), draft_rows=draft_rows,
-                           begin_ns=values.get("begin_ns"), end_ns=values.get("end_ns")))
+                           begin_ns=values.get("begin_ns"), end_ns=values.get("end_ns"),
+                           admitted=values.get("admitted"), forwards=values.get("forwards"), solo=solo))
     if cycles:
         return cycles
     for line in BATCH_CYCLE.findall(log):

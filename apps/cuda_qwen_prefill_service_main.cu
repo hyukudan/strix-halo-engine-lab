@@ -1,4 +1,4 @@
-// strix-cuda-qwen-prefill-service: the bit-exact CUDA Qwen prefill (include/strix/cuda_qwen_prefill.hpp) resident behind a
+// strix-cuda-qwen-prefill-service: the bit-exact CUDA Qwen prefill (include/strix/cuda/qwen_prefill.hpp) resident behind a
 // small HTTP/1.1 server. One request at a time on the GPU, in arrival order.
 //
 //   GET  /health      {"status":"ok"|"failed","busy":bool,"queued":n,"model":"qwen3.8-flash-next","max_positions":n,...}
@@ -21,7 +21,7 @@
 // for `--handoff-codec auto` / `--handoff-encode-threads auto`; all four resolve through strix/handoff_policy.hpp). Release per layer (default; --no-release-by-layer: after each block):
 // every block's rows and the last block's GDN recurrent/conv slices are sent per layer while the next layers compute.
 #include "strix/device/cuda_enumerator.hpp"
-#include "strix/cuda_qwen_prefill.hpp"
+#include "strix/cuda/qwen_prefill.hpp"
 #include "strix/serve/json.hpp"
 #include "strix/handoff_policy.hpp"
 
@@ -340,6 +340,17 @@ void handle(Service& svc, http::Sock s, std::uint32_t max_positions, const std::
 }  // namespace
 
 int main(int argc, char** argv) {
+    // --help answers before any device or file is touched (post-install smoke: the binary and its DLLs load).
+    {
+        if (strix::device::wants_help(argc, argv)) {
+            std::printf("usage: strix-cuda-qwen-prefill-service --model FILE.gguf --tables DIR --rope-table FILE\n"
+                        "         [--mtp-sidecar FILE] [--max-positions N] [--bind ADDR] [--port N]\n"
+                        "         [--devices FILE | --device-id ID]\n"
+                        "Exact CUDA Qwen prefill for a node (state hand-off). Protocol and options:\n"
+                        "docs/engine/serving/qwen-cuda-prefill.md\n");
+            return 0;
+        }
+    }
     // Start gate: resolves the declared device (--devices FILE, --device-id ID, STRIX_DEVICES, STRIX_DEVICE), refuses an
     // excluded or undeclared card, restricts the process to the chosen one and prints the "device:" receipt line.
     strix::device::bind_cuda_main(argc, argv);

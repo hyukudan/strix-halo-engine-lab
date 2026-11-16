@@ -4,6 +4,7 @@
 // src/hip_minimax_msa.hip (K1-K4) in the same order, so the outputs are bit-identical; what changes is who computes
 // it (fewer launches, N sequences per launch) and how the caches are read (coalesced tiles through LDS).
 #include "msa_fused.hpp"
+#include "msa_norm_rope.hpp"
 #include "msa_inblock_layout.hpp"
 #include "msa_select_dump.hpp"
 #include "attn_core/index_score_band.hpp"
@@ -29,36 +30,11 @@ using InblockLayout = inblock::Layout<kHeadDim, kMaxChunks, kGroup, kTile>;
 static_assert(InblockLayout::kSharedBytes == 18496);
 constexpr unsigned kCountMax = 256;         // selection: rank by counting up to this many candidates, else radix
 
-__device__ __forceinline__ float butterfly_sum(float v) {
-    for (unsigned d = 16; d >= 1; d >>= 1U) v = v + __shfl_xor(v, static_cast<int>(d), 32);
-    return v;
-}
+// butterfly_sum, norm_rope_lane: msa_norm_rope.hpp (shared with the q projection finish)
 __device__ __forceinline__ float max_of(float a, float b) { return a < b ? b : a; }  // std::max(a, b)
 __device__ __forceinline__ float lo_bf16(std::uint32_t w) { return u2f(w << 16U); }
 __device__ __forceinline__ float hi_bf16(std::uint32_t w) { return u2f(w & 0xFFFF0000U); }
 
-// Lane l holds dims 4l..4l+3 of one head in x[4]. Norm + RoPE in place (host head_norm_rope order); identical to the
-// K1 helper.
-__device__ __forceinline__ void norm_rope_lane(float* x, const float* w, const RopeRow& rope, unsigned lane) {
-    float acc = 0.0F;
-    for (unsigned i = 0; i < kDimsPerLane; ++i) acc = __builtin_fmaf(x[i], x[i], acc);
-    const float sum = butterfly_sum(acc);
-    const float r = 1.0F / __builtin_sqrtf(sum / static_cast<float>(kHeadDim) + kNormEps);
-    for (unsigned i = 0; i < kDimsPerLane; ++i) x[i] = (x[i] * r) * (1.0F + w[lane * kDimsPerLane + i]);
-    float partner[kDimsPerLane];
-    for (unsigned i = 0; i < kDimsPerLane; ++i) partner[i] = __shfl_xor(x[i], 8, 32);
-    if (lane < 8) {
-        for (unsigned i = 0; i < kDimsPerLane; ++i) {
-            const unsigned d = lane * kDimsPerLane + i;
-            x[i] = __builtin_fmaf(-partner[i], rope.sin[d], x[i] * rope.cos[d]);
-        }
-    } else if (lane < 16) {
-        for (unsigned i = 0; i < kDimsPerLane; ++i) {
-            const unsigned d = (lane - 8) * kDimsPerLane + i;
-            x[i] = __builtin_fmaf(partner[i], rope.sin[d], x[i] * rope.cos[d]);
-        }
-    }
-}
 __device__ __forceinline__ void load4(float* x, const float* src, unsigned lane) {
     const float4 f = *reinterpret_cast<const float4*>(src + lane * kDimsPerLane);
     x[0] = f.x;
@@ -172,6 +148,8 @@ __device__ void prep_kv(const DecodeView& v) {
 // Preserve local row/block coordinates and operation order inside each window.
 __host__ __device__ DecodeView prefill_offset(DecodeView v, unsigned r0) {
     v.q += static_cast<std::size_t>(r0) * v.q_heads * kHeadDim;
+    if (v.q16) v.q16 += static_cast<std::size_t>(r0) * v.q_heads * kHeadDim;
+    if (v.q16_lo) v.q16_lo += static_cast<std::size_t>(r0) * v.q_heads * kHeadDim;
     v.k += static_cast<std::size_t>(r0) * v.kv_heads * kHeadDim;
     v.v += static_cast<std::size_t>(r0) * v.kv_heads * kHeadDim;
     v.iq += static_cast<std::size_t>(r0) * v.idx_heads * kIdxDim;
@@ -1332,6 +1310,11 @@ __device__ __forceinline__ void group_scores_h(const uint2* tile, unsigned grp, 
     }
 }
 
+// chunkinv-attn-state-v1 (src/core/chunk_contract.hpp): bound as is. Every MSA mode cuts a row's keys into absolute
+// 128-key blocks of its own position (block_count(pos + 1), idx_count per row), the partial combine runs in ascending
+// block order (prefill_combine_kernel), exact modes accumulate per row in scalar FMA, and the FAST key-split core
+// zeroes the V of keys past the visible count (attn_core/sparse_flash_keysplit.hpp), so no partition or WMMA K pair
+// depends on neighbouring queries or the call's rows. Index scores are per (row, key) with no key reduction.
 // Number of valid 128-key partials for positions [0, end).
 __host__ __device__ std::uint64_t prefill_chunk_prefix(std::uint64_t end) {
     const std::uint64_t limit = kTopK * kBlock;
@@ -2347,7 +2330,8 @@ std::size_t prefill_window_bytes(std::uint32_t max_blocks) {
 }
 
 namespace {
-template <bool DENSE> void launch_prefill_attend(const PrefillView& p, unsigned windows, hipStream_t stream) {
+template <bool DENSE> void launch_prefill_attend(const PrefillView& p, unsigned windows, hipStream_t stream,
+                                              std::array<std::uint64_t, 3>* flash_launches) {
     if (windows == 0) return;
     const DecodeView& v = p.window;
     if (p.msa_rework != 0) {
@@ -2389,10 +2373,17 @@ template <bool DENSE> void launch_prefill_attend(const PrefillView& p, unsigned 
             namespace ks = strix::attn_core::sparse;
             const dim3 grid((scheduled.rows - p.first_window * kMaxRows) * v.kv_heads), block(ks::KeySplit<kGroup, kHeadDim>::kThreads);
             const MsaFlashArgs args{scheduled, DENSE ? 1U : 0U};
+            // the q projection finish's image when it wrote one (query_op; same bits), else the FP32 q
+            const bool q16 = v.q16 != nullptr && (p.msa_rework != 12 || v.q16_lo != nullptr);
             // p.flash_keys: load schedule of the core (same bits): 0 incumbent, 1 keys first, 2 key halves.
             const auto go = [&](auto split, auto opt) {
+                if (q16) {
+                hipLaunchKernelGGL((ks::flash_rows_keysplit_kernel<MsaFlashQ16Policy, decltype(split)::value, decltype(opt)::value>), grid,
+                                   block, 0, stream, args);
+                } else {
                 hipLaunchKernelGGL((ks::flash_rows_keysplit_kernel<MsaFlashPolicy, decltype(split)::value, decltype(opt)::value>), grid,
                                    block, 0, stream, args);
+                }
             };
             using U0 = std::integral_constant<unsigned, 0U>;
             using U1 = std::integral_constant<unsigned, ks::kKsKeysFirst>;
@@ -2402,6 +2393,7 @@ template <bool DENSE> void launch_prefill_attend(const PrefillView& p, unsigned 
             else if (p.flash_keys == 2U) two ? go(std::true_type{}, U2{}) : go(std::false_type{}, U2{});
             else two ? go(std::true_type{}, U0{}) : go(std::false_type{}, U0{});
             hip_check(hipGetLastError(), "minimax prefill flash attend");
+            if (flash_launches != nullptr) ++(*flash_launches)[p.flash_keys <= 2U ? p.flash_keys : 0U];
             return;
         }
         if (p.msa_rework == 10) {
@@ -2690,27 +2682,81 @@ void audit_prefill_index(const PrefillView& p, hipStream_t stream) {
 namespace {
 std::FILE* g_select_dump = nullptr;
 
+// Dump-session staging, reused across batches. Pinned async copies remove the previous pageable staging path;
+// the root cause of the observed 32K fault remains unproven. Clean runs alone establish neither causality nor equality.
+// Callers must serialize set_select_dump and all dump producers, including recovery after an exception.
+struct SelectDumpHost {
+    std::uint32_t* cnt = nullptr;
+    std::uint32_t* ids = nullptr;
+    std::size_t cap = 0;  // entries of cnt (ids holds cap * kTopK)
+    hipStream_t stream = nullptr;
+    bool pending = false;  // separate flag: the default (null) stream is valid
+
+    void drain() {
+        if (!pending) return;
+        hip_check(hipStreamSynchronize(stream), "minimax select dump sync");
+        pending = false;
+    }
+    void release() {
+        drain();  // also covers a failed enqueue after an earlier successful copy
+        if (cnt != nullptr) hip_check(hipHostFree(cnt), "minimax select dump free staging");
+        cnt = ids = nullptr;
+        cap = 0;
+    }
+    SelectDumpHost() = default;
+    SelectDumpHost(const SelectDumpHost&) = delete;
+    SelectDumpHost& operator=(const SelectDumpHost&) = delete;
+    ~SelectDumpHost() {
+        try { release(); }
+        catch (const std::exception& e) {
+            // A failed drain must not free storage that a queued copy may still use.
+            std::fprintf(stderr, "minimax select dump cleanup: %s\n", e.what());
+        }
+    }
+};
+SelectDumpHost g_select_host;
+
+void select_host_reserve(std::size_t rg) {
+    g_select_host.drain();
+    if (rg <= g_select_host.cap) return;
+    g_select_host.release();
+    // One owned allocation avoids a partially allocated pair when allocation fails.
+    hip_check(hipHostMalloc(reinterpret_cast<void**>(&g_select_host.cnt), rg * (1 + kTopK) * sizeof(std::uint32_t),
+                            hipHostMallocDefault), "minimax select dump pinned staging");
+    g_select_host.ids = g_select_host.cnt + rg;
+    g_select_host.cap = rg;
+}
+
 // One record per sparse batch (msa_select_dump.hpp): the ids the attend launch selected for [first_window * 16, rows).
 void dump_prefill_select(const PrefillView& p, hipStream_t stream) {
     const DecodeView& v = p.window;
-    const std::size_t r0 = std::size_t{p.first_window} * kMaxRows, rows = p.rows - r0, rg = rows * v.kv_heads;
-    std::vector<std::uint32_t> cnt(rg), ids(rg * kTopK);
-    hip_check(hipStreamSynchronize(stream), "minimax select dump sync");
-    hip_check(hipMemcpy(cnt.data(), v.idx_count + r0 * v.kv_heads, rg * sizeof(std::uint32_t), hipMemcpyDeviceToHost),
-          "minimax select dump counts");
-    hip_check(hipMemcpy(ids.data(), v.idx + r0 * v.kv_heads * kTopK, rg * kTopK * sizeof(std::uint32_t), hipMemcpyDeviceToHost),
-          "minimax select dump ids");
+    const std::size_t r0 = std::size_t{p.first_window} * kMaxRows;
+    if (p.rows <= r0) throw std::invalid_argument("minimax select dump: no sparse rows in the batch");
+    const std::size_t rows = p.rows - r0, rg = rows * v.kv_heads;
+    select_host_reserve(rg);
+    g_select_host.stream = stream;
+    g_select_host.pending = true;  // set before enqueue: failures must still drain before reuse/free
+    hip_check(hipMemcpyAsync(g_select_host.cnt, v.idx_count + r0 * v.kv_heads, rg * sizeof(std::uint32_t), hipMemcpyDeviceToHost,
+                             stream),
+              "minimax select dump counts");
+    hip_check(hipMemcpyAsync(g_select_host.ids, v.idx + r0 * v.kv_heads * kTopK, rg * kTopK * sizeof(std::uint32_t),
+                             hipMemcpyDeviceToHost, stream),
+              "minimax select dump ids");
+    g_select_host.drain();
+    const std::uint32_t* const cnt = g_select_host.cnt;
+    const std::uint32_t* const ids = g_select_host.ids;
     const std::uint64_t pos = p.pos0 + r0;
     const std::uint32_t head[8] = {0x444C4553U, 1U, aidx::wmma_mode(aidx::kModeExact), static_cast<std::uint32_t>(pos),
                                    static_cast<std::uint32_t>(pos >> 32), static_cast<std::uint32_t>(rows), v.kv_heads, kTopK};
     if (std::fwrite(head, sizeof(head), 1, g_select_dump) != 1 ||
-        std::fwrite(cnt.data(), sizeof(std::uint32_t), cnt.size(), g_select_dump) != cnt.size() ||
-        std::fwrite(ids.data(), sizeof(std::uint32_t), ids.size(), g_select_dump) != ids.size())
+        std::fwrite(cnt, sizeof(std::uint32_t), rg, g_select_dump) != rg ||
+        std::fwrite(ids, sizeof(std::uint32_t), rg * kTopK, g_select_dump) != rg * kTopK)
         throw std::runtime_error("minimax select dump: short write");
 }
 }  // namespace
 
 void set_select_dump(const char* path) {
+    g_select_host.release();  // retain the session for retry if draining/freeing fails
     if (g_select_dump != nullptr) {
         std::FILE* const f = g_select_dump;
         g_select_dump = nullptr;
@@ -2755,7 +2801,8 @@ void enqueue_prefill_cache_only(const PrefillView& p, hipStream_t stream, Prefil
     launch_prefill_prep(p, stream, marker, user);
 }
 
-void enqueue_prefill(const PrefillView& p, hipStream_t stream, PrefillStageMarker marker, void* user) {
+void enqueue_prefill(const PrefillView& p, hipStream_t stream, PrefillStageMarker marker, void* user,
+                     std::array<std::uint64_t, 3>* flash_launches) {
     check_prefill_view(p);
     const DecodeView& v = p.window;
     launch_prefill_prep(p, stream, marker, user);
@@ -2775,13 +2822,13 @@ void enqueue_prefill(const PrefillView& p, hipStream_t stream, PrefillStageMarke
             enqueue_prefill_index(batch, stream);
             if (marker != nullptr) marker(user, "index-scoring", false);
             if (marker != nullptr) marker(user, "attend", true);
-            launch_prefill_attend<false>(batch, sparse, stream);
+            launch_prefill_attend<false>(batch, sparse, stream, flash_launches);
             if (marker != nullptr) marker(user, "attend", false);
             if (g_select_dump != nullptr) dump_prefill_select(batch, stream);
         }
         batch.first_window = 0;
         if (dense != 0 && marker != nullptr) marker(user, "attend", true);
-        launch_prefill_attend<true>(batch, dense, stream);
+        launch_prefill_attend<true>(batch, dense, stream, flash_launches);
         if (dense != 0 && marker != nullptr) marker(user, "attend", false);
         first += nw;
     }

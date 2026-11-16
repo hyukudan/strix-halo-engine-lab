@@ -44,6 +44,14 @@
 //                                                 called by a whole wave: lane owns dims 4 lane .. 4 lane + 3 (FP32,
 //                                                 final values; the policy may use wave shuffles, e.g. a norm)
 //   static __device__ float* out(const Args&, const Row&)                                     FP32 [H][D]
+// Optional (a policy without it compiles to the code above):
+//   static __device__ const std::uint16_t* query_op(const Args&, const Row&)
+//                                 replaces query(): the row's H heads already in the operand type, [H][D], 16-B aligned,
+//                                 loaded as fragments with no conversion and no staging. Same bits as query() when the
+//                                 producer stored tile::to_operand<kOp>(x) of query()'s values (MiniMax: the q
+//                                 projection finish, mmx_prefill.hip). Split also needs
+//   static __device__ const std::uint16_t* query_op_lo(const Args&, const Row&)
+//                                 the lo terms to_operand(x - operand_value(to_operand(x))), [H][D], 8-B aligned
 // Launch: flash_rows_keysplit_kernel<P, Split><<<work_groups, KeySplit<P::kHeads, P::kDim>::kThreads, 0, stream>>>(args).
 #include "attn_core/flash_tile.hpp"
 
@@ -81,12 +89,15 @@ template <unsigned H, unsigned D> struct KeySplit {
     }
 };
 
-// Opt (load schedule only; same operands, same WMMA order, every output bit unchanged):
-//   0             incumbent: the compiler sinks each key fragment load to its WMMA, so a tile pays kKs serial
-//                 L2 round trips (one s_waitcnt vmcnt(0) per QK step).
-//   kKsKeysFirst  all kKs key fragments are issued first, then the value pieces, behind a scheduling barrier:
-//                 the QK chain waits once for the keys while the values are still in flight.
-//   kKsKeysHalves the same with the keys in two halves around the value loads (half the key registers live).
+template <class P>
+concept RowQueryOp = requires(const typename P::Args& a, const typename P::Row& r, const std::uint16_t*& p) { p = P::query_op(a, r); };
+
+// Opt (source load schedule only; same operands and WMMA order):
+//   0             incumbent: each key fragment is loaded immediately before its QK operation.
+//   kKsKeysFirst  all key fragments precede the value loads and a scheduling barrier.
+//   kKsKeysHalves key loads are grouped in two halves around the value loads, both before QK.
+// Register liveness, waits and overlap require compiler/ISA evidence for each instantiation;
+// source ordering alone establishes neither reduced register pressure nor native bitwise equality.
 inline constexpr unsigned kKsKeysFirst = 1U, kKsKeysHalves = 2U;
 template <class P, bool Split = false, unsigned Opt = 0U>
 __global__ __launch_bounds__((KeySplit<P::kHeads, P::kDim>::kThreads)) void flash_rows_keysplit_kernel(typename P::Args a) {
@@ -103,25 +114,42 @@ __global__ __launch_bounds__((KeySplit<P::kHeads, P::kDim>::kThreads)) void flas
     typename P::Row row;
     if (!P::begin(a, blockIdx.x, row)) return;
     const unsigned tid = threadIdx.x, w = tid >> 5U, lane = tid & 31U, ln = lane & 15U, hf = lane >> 4U;
-    // Queries: wave w prepares heads w, w + 4, ... (lane = 4 dims), rounded once to the operand type.
-#pragma unroll
-    for (unsigned i = 0; i < H / G::kWaves; ++i) {
-        const unsigned head = i * G::kWaves + w;
-        float x[4];
-        P::query(a, row, head, lane, x);
-        *reinterpret_cast<U2*>(lds + (head * D + lane * 4U) * 2U) = U2{tile::pack2<O>(x[0], x[1]), tile::pack2<O>(x[2], x[3])};
-        if constexpr (Split) {
-#pragma unroll
-            for (unsigned d = 0; d < 4; ++d) x[d] -= tile::operand_value<O>(tile::to_operand<O>(x[d]));
-            *reinterpret_cast<U2*>(lds + G::kQlo + (head * D + lane * 4U) * 2U) =
-                U2{tile::pack2<O>(x[0], x[1]), tile::pack2<O>(x[2], x[3])};
-        }
-    }
-    __syncthreads();
     Frag qf[G::kKs];
+    if constexpr (RowQueryOp<P>) {
+        // the producer's operand image: fragments straight from memory; Split stages the lo image where the key loop
+        // reads it (above the V^T area, so one barrier)
+        if constexpr (Split) {
+            const std::uint16_t* lo = P::query_op_lo(a, row);
 #pragma unroll
-    for (unsigned k = 0; k < G::kKs; ++k) qf[k] = tile::frag32(lds + (ln * D + 16U * k) * 2U);
-    __syncthreads();  // the V^T tiles reuse the staging area
+            for (unsigned i = 0; i < H / G::kWaves; ++i) {
+                const unsigned head = i * G::kWaves + w;
+                *reinterpret_cast<U2*>(lds + G::kQlo + (head * D + lane * 4U) * 2U) = *reinterpret_cast<const U2*>(lo + head * D + lane * 4U);
+            }
+        }
+        const std::uint16_t* qo = P::query_op(a, row);
+#pragma unroll
+        for (unsigned k = 0; k < G::kKs; ++k) qf[k] = tile::frag32(qo + ln * D + 16U * k);
+        if constexpr (Split) __syncthreads();
+    } else {
+        // Queries: wave w prepares heads w, w + 4, ... (lane = 4 dims), rounded once to the operand type.
+#pragma unroll
+        for (unsigned i = 0; i < H / G::kWaves; ++i) {
+            const unsigned head = i * G::kWaves + w;
+            float x[4];
+            P::query(a, row, head, lane, x);
+            *reinterpret_cast<U2*>(lds + (head * D + lane * 4U) * 2U) = U2{tile::pack2<O>(x[0], x[1]), tile::pack2<O>(x[2], x[3])};
+            if constexpr (Split) {
+#pragma unroll
+                for (unsigned d = 0; d < 4; ++d) x[d] -= tile::operand_value<O>(tile::to_operand<O>(x[d]));
+                *reinterpret_cast<U2*>(lds + G::kQlo + (head * D + lane * 4U) * 2U) =
+                    U2{tile::pack2<O>(x[0], x[1]), tile::pack2<O>(x[2], x[3])};
+            }
+        }
+        __syncthreads();
+#pragma unroll
+        for (unsigned k = 0; k < G::kKs; ++k) qf[k] = tile::frag32(lds + (ln * D + 16U * k) * 2U);
+        __syncthreads();  // the V^T tiles reuse the staging area
+    }
     Acc o[G::kKs];
 #pragma unroll
     for (unsigned c = 0; c < G::kKs; ++c) o[c] = tile::acc_zero();

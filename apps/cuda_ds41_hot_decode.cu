@@ -14,10 +14,10 @@
 // steps (timing; no reference). One JSON line per step: tokens, FNV, match, wall / device ms, remote layers, slots,
 // answer items, RTT (sum, max), server time, dynamic hits / copies; --timeline: one line per (step, layer).
 #include "strix/device/cuda_enumerator.hpp"
-#include "strix/cuda_ds41_hot_residency.hpp"
-#include "strix/cuda_ds41_hot_site.hpp"
-#include "strix/cuda_ds41_parts_host_driver.hpp"
-#include "strix/cuda_ds41_prefill.hpp"
+#include "strix/cuda/ds41_hot_residency.hpp"
+#include "strix/cuda/ds41_hot_site.hpp"
+#include "strix/cuda/ds41_parts_host_driver.hpp"
+#include "strix/cuda/ds41_prefill.hpp"
 #include "strix/deepseek41_attention_state.hpp"
 #include "strix/ds41_hot_placement.hpp"
 

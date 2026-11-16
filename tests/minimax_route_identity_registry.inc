@@ -45,6 +45,8 @@
 {"prefill-router-tiled", 'a', "router lane chain (j = lane mod 32 ascending) + xor butterfly + ordered top-4 scan", "hip-minimax-moe-tests router_batch_tests: tiled 32 vs fused/4/8 bytes for every kind and tail; mm_defaults.cpp pf_router_rows (default 32 = tiled v2)", ""},
 // src/minimax/engine/engine.hip: dense_o (STRIX_MM_PF_DENSE_O) - o_proj through enqueue_prefill_dense on full pieces
 {"prefill-dense-o", 'a', "EXL3 matrix+library gemm_splits+per-row WMMA chain+ordered split finish", "hip-mmx-moe-bench test_prefill_dense o == strix_gemm bitwise (T 9..4096); 4096-row pieces only; mm_defaults.cpp pf_dense_o", ""},
+// src/minimax/engine/engine.hip: dense_mlp; mm_defaults.cpp: pf_dense_mlp; apps/minimax_rank_main.cpp: ab_flag
+{"prefill-dense-mlp", 'a', "STRIX_MM_PF_DENSE_MLP default ON, baseline/OFF=0; layers 0-2, 4096 rows, supported raw weights+workspace; fixed WMMA chain and ordered split finish", "hip_mmx_moe_bench.hip test_dense_mlp_chain bitwise intermediates/output; --ab pfdensemlp state/final rows plus every A=0/B>0 candidate-call coverage; minimax_ab_qualify_host rejects fallback/stale/contaminated/partial coverage; minimax_route_identity_tests.cpp default/baseline/override checks (host checks are not native qualification)", ""},
 // src/minimax/engine/engine.hip: MSA scratch cap (STRIX_MM_PF_MSA_SCRATCH_MB) - windows per batch only
 {"prefill-msa-scratch", 'a', "independent MSA windows; batch size only", "msa_fused_tests.hip every-batch bytes (scratch=1/125 and full); mm_defaults.cpp pf_msa_scratch_mb", ""},
 // src/minimax/attn/msa_fused.hip: enqueue_prefill_index (STRIX_IDX_WMMA, default exact), prefill_index_refine_kernel
@@ -83,7 +85,7 @@
 {"rtx-tile", 'a', "F32 identity version+matrix+input order", "fp32_identity_device.inc f32_core_body; hip-mm-fp32id-tests; mm_fp32_identity_tests.cu", ""},
 // src/minimax/rtxpf/fp32_identity.hpp: resolve_core_version; cuda/fp32_identity.cu
 {"rtx-core", 'a', "FP32 identity+matrix+input order; v3/v3.1 decode", "mm_fp32_identity_tests.cu default/env/explicit and all 65536 mul1 states vs host; full-model gate at 1K/8K code prompts, both ranks", ""},
-// src/minimax/rtxpf/cuda/mm_rtx_prefill_main.cu:635
+// src/cuda/models/minimax/mm_rtx_prefill_main.cu:635
 {"io-cache", 'a', "model tensor content+dtype+rank slices", "weight loader sizes/format validation; actual dependency notices preserved", ""},
 // src/minimax/dspark/hip_minimax_dspark.hip:755
 {"draft-native-linears", 'a', "drafter model dtype+matrix+reduction contract", "hip_minimax_dspark_tests.hip linears/attention bitwise gates; mm_defaults.cpp draft linears contract", ""},
@@ -121,7 +123,7 @@
 {"draft-append", 'c', "BLOCKED until draft append absolute-position plan fixed or pin vector per row", "UNCOVERED append32 vs8 intermediate/cache byte identity", "draft append FC GEMM32 vs GEMV8, then K/V projected context (first library core op opaque)"},
 // src/minimax/moe/mmx_prefill.hip:881
 {"diagnostic-cores", 'c', "BLOCKED in production; diagnostic-only plan", "UNCOVERED for production by design; expected-wrong-output timing APIs", "first skipped A/weight load or attention compute in diagnostic producer"},
-// src/minimax/rtxpf/cuda/mm_rtx_kernels.cu:601
+// src/cuda/models/minimax/mm_rtx_kernels.cu:601
 {"rtx-attention", 'c', "BLOCKED handoff until MSA cache/output bytes match exact producer plan", "UNCOVERED full native/CUDA MSA model fidelity for all positions/cuts", "RTX MSA index score or attention QK/PV legacy vs shared (first op needs CUDA byte gate)"},
 // src/minimax/engine/engine.hip: park_task / resume_parked; src/minimax/serve/minimax_lead.hpp: nested_candidate
 {"prefill-nest", 'a', "model+profile+original ordered chunk/group rows+positions+slot generation; sequential bank ownership", "GPU covered on both ranks, check-only resume-check: 512-token child in 7-layer units with 4608-token parent parked at layers 7/31 beside a decoder, 10/10 IDENTICAL; whole 511-token child with parent parked at layer 17, 6/6 IDENTICAL; complete 128-token continuations, all prompt outputs, committed state, first/continuation logits, frozen groups and standalone B1/mixed decode; HTTP token IDs identical policy ON/OFF; timing evidence in serving documentation", ""},
@@ -156,3 +158,6 @@
 // src/core/moe_i4_chain.hpp launch_chain; src/minimax/moe/mmx_prefill_iu4.inc. The resolved STRIX_MOE_I4_CHAIN_GSAVE
 // boolean is read once per call and passed to the shared plan policy.
 {"prefill-i4-chain-plan", 'a', "requested IU4 plan+STRIX_MOE_I4_CHAIN_GSAVE+scratch admission; a scratch-form paired launch the device rejects (spill or residency) retries the register-save form on plan 1, then a second tile list for the down", "moe_i4_chain_host_tests.cpp plan policy (admission, insufficient and zero scratch); every admitted form computes the same integers; UNCOVERED native MiniMax fallback execution", ""},
+
+// include/strix/pinned_host.hpp; src/minimax/pfx/pf_exchange.hip; src/dist_communicator.cpp
+{"host-anon-pin", 'a', "STRIX_HOST_ANON_PIN=0/1; automatic integrated GPU only; cached at startup; >=2 MiB anonymous locked long-term-pinned mapped buffers, small/refused pin falls back to hipHostMalloc; matching release; no arithmetic change", "minimax_route_identity_tests.cpp host_pin_selector automatic/override/invalid source contracts; source audit edit/removal negatives; UNCOVERED native pair complete token/logit/state equality under pin success, refusal and OFF", ""},

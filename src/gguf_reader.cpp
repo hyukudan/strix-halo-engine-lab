@@ -1,5 +1,6 @@
 #include "strix/model_input.hpp"
 #include "strix/gguf_reader.hpp"
+#include "strix/weight/registry.hpp"
 
 #include <algorithm>
 #include <array>
@@ -420,42 +421,13 @@ private:
 
 std::optional<TensorTypeGeometry> tensor_type_geometry(
     std::uint32_t type) noexcept {
-    switch (type) {
-    case 0: return TensorTypeGeometry{1, 4};
-    case 1: return TensorTypeGeometry{1, 2};
-    case 2: return TensorTypeGeometry{32, 18};
-    case 3: return TensorTypeGeometry{32, 20};
-    case 6: return TensorTypeGeometry{32, 22};
-    case 7: return TensorTypeGeometry{32, 24};
-    case 8: return TensorTypeGeometry{32, 34};
-    case 9: return TensorTypeGeometry{32, 36};
-    case 10: return TensorTypeGeometry{256, 84};
-    case 11: return TensorTypeGeometry{256, 110};
-    case 12: return TensorTypeGeometry{256, 144};
-    case 13: return TensorTypeGeometry{256, 176};
-    case 14: return TensorTypeGeometry{256, 210};
-    case 15: return TensorTypeGeometry{256, 292};
-    case 16: return TensorTypeGeometry{256, 66};
-    case 17: return TensorTypeGeometry{256, 74};
-    case 18: return TensorTypeGeometry{256, 98};
-    case 19: return TensorTypeGeometry{256, 50};
-    case 20: return TensorTypeGeometry{32, 18};
-    case 21: return TensorTypeGeometry{256, 110};
-    case 22: return TensorTypeGeometry{256, 82};
-    case 23: return TensorTypeGeometry{256, 136};
-    case 24: return TensorTypeGeometry{1, 1};
-    case 25: return TensorTypeGeometry{1, 2};
-    case 26: return TensorTypeGeometry{1, 4};
-    case 27: return TensorTypeGeometry{1, 8};
-    case 28: return TensorTypeGeometry{1, 8};
-    case 29: return TensorTypeGeometry{256, 56};
-    case 30: return TensorTypeGeometry{1, 2};
-    case 34: return TensorTypeGeometry{256, 54};
-    case 35: return TensorTypeGeometry{256, 66};
-    case 39: return TensorTypeGeometry{32, 17};
-    case 42: return TensorTypeGeometry{64, 18};
-    default: return std::nullopt;
-    }
+    // Container recognition uses the same exact geometry catalog as admission.
+    // The reader's rank, overflow, removed-ID and payload bounds checks stay above.
+    try {
+        weight::Geometry geometry{};
+        if (!weight::format_geometry(weight::gguf_format(type), {}, geometry)) return std::nullopt;
+        return TensorTypeGeometry{geometry.block_elements, geometry.block_bytes};
+    } catch (...) { return std::nullopt; }
 }
 
 const MetadataEntry* FileInfo::find_metadata(const std::string& key) const {
