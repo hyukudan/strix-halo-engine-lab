@@ -266,6 +266,8 @@ Resolved resolve(App app, const std::vector<std::string>& in, const Getenv& raw_
         fp::set(value) || fp::switch_on(raw_env("STRIX_DS41_FAST_PREFILL")) || fp::switch_on(raw_env("STRIX_DS41_FAST_DENSE")))
         fast_env.emplace("STRIX_DS41_FAST_DENSE_MIN_ROWS", std::to_string(
             strix::ds41::fast_profile::dense_min_rows_value(value)));
+    // The explicit Engram lever (not a bundle member): canonical value exported when set, like the members.
+    if (const auto& e = strix::ds41::fast_profile::kEngram; fp::set(raw_env(e.env))) fast_env.emplace(e.env, fp::canonical(e, raw_env(e.env)));
     profile_inputs.env = fp::lookup(fast_env, raw_env);
     strix::profile::take_options(profile_engine(), user, profile_inputs);
     r.profile = strix::profile::resolve(profile_engine(), profile_inputs);

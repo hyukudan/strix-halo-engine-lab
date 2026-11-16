@@ -26,6 +26,14 @@ if(MSVC)
         $<$<COMPILE_LANGUAGE:CXX>:/wd4389> $<$<COMPILE_LANGUAGE:CXX>:/wd4459>)
 endif()
 
+# Isolated shared CUDA-core qualification, with no model/runtime dependency.
+option(STRIX_CUDA_NVFP4_ONLY "Build only shared NVFP4 host/native checks" OFF)
+if(STRIX_CUDA_NVFP4_ONLY)
+    enable_testing()
+    add_subdirectory(tests/nvfp4)
+    return()
+endif()
+
 option(STRIX_LEGACY_MAINS "Build legacy Gemma4 and MiniMax serve executables" ON)
 
 # Standalone CUDA Qwen prefill and host-only scheduling/codec checks.
@@ -4995,6 +5003,12 @@ if(STRIX_FAMILY_MINIMAX)
         target_compile_features(strix-minimax-auto-tests PRIVATE cxx_std_20)
         strix_target_warnings(strix-minimax-auto-tests)
         add_test(NAME strix-minimax-auto-tests COMMAND strix-minimax-auto-tests)
+        # Chunk-invariant order contract: host reference of the bound K chain across chunk sizes and tails.
+        add_executable(strix-chunk-order-contract-tests tests/chunk_order_contract_tests.cpp)
+        target_include_directories(strix-chunk-order-contract-tests PRIVATE src include)
+        target_compile_features(strix-chunk-order-contract-tests PRIVATE cxx_std_20)
+        strix_target_warnings(strix-chunk-order-contract-tests)
+        add_test(NAME strix-chunk-order-contract-tests COMMAND strix-chunk-order-contract-tests)
         # Pure host policy census; source receipts reject unaudited selectors.
         add_executable(strix-minimax-route-identity-tests tests/minimax_route_identity_tests.cpp)
         target_link_libraries(strix-minimax-route-identity-tests PRIVATE strix_minimax_defaults)

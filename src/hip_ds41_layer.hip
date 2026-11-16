@@ -2748,11 +2748,93 @@ bool engram_f16_pf_admitted(const F16RowsView& v) noexcept {
     return engram_f16_pf_supported(v) && (v.rows + 47U) / 48U * 48U * 8U <= (v.rows + 63U) / 64U * 64U * 9U;
 }
 
-void enqueue_engram_f16_rows(const F16RowsView& v, void* stream) {
+// FAST lever ds41-engram-f16wmma-v1 (STRIX_DS41_FAST_ENGRAM=1 or set_fast_engram(1 / 0; -1 = the environment); default
+// off): the Engram KV projection on the shared dense FP16 WMMA core (core/f16_dense_tall.hpp, 128-row CTAs x 256
+// columns) instead of the exact FP32 FMA chains of f16_tiled_pf (measured 4.2 TFLOPS: 77 ms per 1,024 rows).
+// Contract (the shared core's): x is rounded to FP16 (RNE); BF16 values of 2^-17 <= |x| < 2^16 convert exactly, smaller
+// ones lose low bits in FP16's subnormal range (absolute error <= 2^-25); the products are then exact in FP32 and the
+// sums run in WMMA order (one chain per row tile and column tile, 16-wide k units ascending). A scan flags |x| >= 65520 (FP16 RNE overflow),
+// Inf and NaN (FP16 would overflow); then the WMMA launch exits and the exact separate kernel runs instead (the lever-off
+// bits), without a host sync. Shapes the exact tile path does not admit keep the exact path.
+int fast_engram_mode = -1;
+void set_fast_engram(int mode) { fast_engram_mode = mode; }
+static bool fast_engram_on() {
+    static const bool env = fast_profile::engram_on();
+    return fast_engram_mode >= 0 ? fast_engram_mode != 0 : env;
+}
+namespace {
+// Sets *flag when any x of the view would overflow FP16 under RNE: |x| >= 65520 (FP32 bits 0x477FF000), Inf and NaN.
+__global__ __launch_bounds__(256) void engram_x_f16_scan(F16RowsView v, unsigned* flag) {
+    const std::size_t per_row = v.width / 4U, total = per_row * v.rows;
+    bool out = false;
+    for (std::size_t i = static_cast<std::size_t>(blockIdx.x) * 256U + threadIdx.x; i < total; i += static_cast<std::size_t>(gridDim.x) * 256U) {
+        const std::size_t row = i / per_row, c = i - row * per_row;
+        const uint4 e = *reinterpret_cast<const uint4*>(v.x + row * v.x_stride + c * 4U);
+        const unsigned words[4] = {e.x, e.y, e.z, e.w};
+#pragma unroll
+        for (unsigned k = 0; k < 4; ++k) {
+            const unsigned m = words[k] & 0x7FFFFFFFU;
+            out = out || m >= 0x477FF000U;  // 65520: FP16 RNE overflows from here (Inf and NaN included)
+        }
+    }
+    if (out) atomicOr(flag, 1U);
+}
+struct EngramWmmaArgs {
+    const float* x;
+    const _Float16* w;  // [n][in] row-major
+    float* y;           // [rows][stride]
+    unsigned in, rows, n, stride, skip_idle;
+    const unsigned* flag;
+};
+struct EngramWmmaCols {
+    const EngramWmmaArgs& a;
+    __device__ __forceinline__ strix::core::f16_dense_tall::ColumnTile tile(unsigned t) const {
+        if (t < a.n / 16U) return {a.w + static_cast<std::size_t>(t) * 16U * a.in, a.y + t * 16U, a.stride, true};
+        return {a.w, a.y, a.stride, false};
+    }
+};
+__global__ __launch_bounds__(256) void engram_wmma_kernel(EngramWmmaArgs a) {
+    if (*a.flag != 0U) return;  // an x outside the exact FP16 set: the exact kernel below runs this view
+    __shared__ strix::core::f16_dense_tall::Storage<16> lds;
+    strix::core::f16_dense_tall::core<16>(a.x, a.in, a.rows, EngramWmmaCols{a}, lds, strix::core::f16_dense_tall::RawStore{},
+                                          a.skip_idle != 0U);
+}
+}  // namespace
+
+bool engram_f16_wmma_supported(const F16RowsView& v) noexcept {
+    return engram_f16_pf_admitted(v) && v.x_stride == v.width && v.width % 128U == 0U && v.count % 256U == 0U;
+}
+
+static bool enqueue_engram_f16_wmma(const F16RowsView& v, void* stream) {
+    // The device flag is per stream (not capturable, not shareable across the per-thread default stream's threads).
+    if (as_stream(stream) == hipStreamPerThread) return false;
+    hipStreamCaptureStatus capture = hipStreamCaptureStatusNone;
+    hip_check(hipStreamIsCapturing(as_stream(stream), &capture), "Engram WMMA capture status");
+    if (capture != hipStreamCaptureStatusNone) return false;
+    EngramWideFlag& w = engram_wide_flag(stream);
+    const std::lock_guard<std::mutex> submit(w.submit);
+    hip_check(hipMemsetAsync(w.p, 0, sizeof(unsigned), as_stream(stream)), "Engram FP16 scan reset");
+    hipLaunchKernelGGL(engram_x_f16_scan, dim3(256), dim3(256), 0, as_stream(stream), v, w.p);
+    const EngramWmmaArgs a{v.x, reinterpret_cast<const _Float16*>(v.weight), v.out, v.width, v.rows, v.count, v.out_stride,
+                           strix::core::f16_dense_tall::tail_policy() ? 1U : 0U, w.p};
+    hipLaunchKernelGGL(engram_wmma_kernel, dim3((v.rows + 127U) / 128U, v.count / 256U), dim3(256), 0, as_stream(stream), a);
+    const unsigned row_tiles = (v.rows + 47U) / 48U, output_tiles = (v.count + 63U) / 64U;
+    hipLaunchKernelGGL((f16_tiled_pf_kernel<48, 64, 8, 6, false>), dim3(row_tiles * output_tiles), dim3(48U / 6U * (64U / 16U) * 32U),
+                       0, as_stream(stream), v, row_tiles, output_tiles, static_cast<const unsigned*>(w.p));
+    hip_check(hipGetLastError(), "Engram FP16 WMMA launch");
+    return true;
+}
+
+void enqueue_engram_f16_rows(const F16RowsView& v, void* stream, bool fast_engram) {
     // Read on every call (in-process A/B); =0 restores enqueue_f16_rows with all its controls.
     const char* e = std::getenv("STRIX_DS41_ENGRAM_F16_PF");
+    if (fast_engram && !(e && e[0] == '0') && engram_f16_wmma_supported(v) && enqueue_engram_f16_wmma(v, stream)) return;
     if (!(e && e[0] == '0') && engram_f16_pf_admitted(v)) enqueue_engram_f16_pf(v, stream);
     else enqueue_f16_rows(v, stream);
+}
+
+void enqueue_engram_f16_rows(const F16RowsView& v, void* stream) {
+    enqueue_engram_f16_rows(v, stream, fast_engram_on());
 }
 
 void enqueue_f16_rows_pair(const F16RowsView& a, const F16RowsView& b, void* stream) {
