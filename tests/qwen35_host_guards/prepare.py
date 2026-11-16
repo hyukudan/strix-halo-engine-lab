@@ -22,5 +22,5 @@ a = text.index("#ifdef _WIN32", text.index("struct Clock")) if "struct Clock" in
 opening = text[a:text.index("#endif", a)+len("#endif")]
 a = text.index("#ifdef _WIN32", a+len(opening))
 closing = text[a:text.index("#endif", a)+len("#endif")]
-(out / "sampler.inc").write_text("#undef _WIN32\n#define _popen forbidden_windows_popen\n#define _pclose forbidden_windows_pclose\nstatic FILE* popen(const char*, const char*) { return stdout; }\nstatic int pclose(FILE*) { return 0; }\nstatic int portable_sampler() {\n" + opening + "\n" + closing + "\nreturn p ? 0 : 1;\n}\n")
+(out / "sampler.inc").write_text("#undef _WIN32\n#define _popen forbidden_windows_popen\n#define _pclose forbidden_windows_pclose\n#define popen qwen35_guard_popen\n#define pclose qwen35_guard_pclose\nstatic FILE* popen(const char*, const char*) { return stdout; }\nstatic int pclose(FILE*) { return 0; }\nstatic int portable_sampler() {\n" + opening + "\n" + closing + "\nreturn p ? 0 : 1;\n}\n")
 (out / "maxrel.inc").write_text(extract("tests/cuda_core/cuda_core_test.cu", "static double maxrel(", "static std::uint32_t* dpos("))
