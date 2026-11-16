@@ -434,7 +434,15 @@ void test_plan() {
     const EncoderPlan p = plan(c, 9216, 1);
     CHECK(p.head_pad == 64);
     CHECK(p.mlp_chunk_rows % 128U == 0U && p.mlp_chunk_rows >= 128U && p.mlp_chunk_rows < 9216U);
-    CHECK(p.mlp_bytes <= (std::size_t{96} << 20U) + 3U * strix::vision::layout::kAlign);
+    CHECK(p.mlp_bytes <= EncoderOptions{}.mlp_workspace_bytes + 3U * strix::vision::layout::kAlign);
+    // Balanced chunks: 9216 rows under the default cap run as equal chunks (no small tail chunk).
+    CHECK(9216U % p.mlp_chunk_rows == 0U);
+    CHECK(plan(c, 1550, 1).mlp_chunk_rows == 1550U);  // under the cap: one chunk (was 1280 + a 270-row tail)
+    {
+        EncoderOptions small;
+        small.mlp_workspace_bytes = 96U << 20U;  // 37,888 B per single-operand row: cap 2560 rows
+        CHECK(plan(c, 3888, 1, small).mlp_chunk_rows == 2048U);  // 2048 + 1840, not 2560 + 1328
+    }
     // FP16 panels: 32 x (3.15 M + 1.05 M + 5.77 M + 2.88 M) + patch, two bytes each = 785 MiB
     CHECK(p.weight_bytes > std::size_t{780} << 20U && p.weight_bytes < std::size_t{800} << 20U);
     const EncoderPlan small = plan(c, 1521, 1);

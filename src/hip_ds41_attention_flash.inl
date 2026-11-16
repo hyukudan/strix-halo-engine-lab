@@ -77,6 +77,14 @@ struct FlashAttentionPolicy {
     }
     __device__ static __forceinline__ void emit(const Args& v, unsigned wg, unsigned head, unsigned dim, float o) { part(v, wg, head)[2U + dim] = o; }
 };
+// The same policy reading the q_b epilogue's BF16 image of q after RoPE (AttentionView::q16; query_op of the shared
+// core): the image is to_bf16(rope512(q)) of the FP32 q query16 loads, so the fragments and every result are the
+// same bits; no FP32 prologue, half the query bytes (STRIX_DS41_FAST_ATTN_Q16=0 keeps the FP32 q).
+struct FlashAttentionQ16Policy : FlashAttentionPolicy {
+    __device__ static __forceinline__ const std::uint16_t* query_op(const Args& v, unsigned wg) {
+        return v.q16 + (static_cast<std::size_t>(row(v, wg)) * v.heads + head0(v, wg)) * kHeadDim;
+    }
+};
 
 // the row's single partial (slot 0) through the unchanged combine
 __global__ __launch_bounds__(32) void attention_flash_combine_kernel(AttentionView v) {

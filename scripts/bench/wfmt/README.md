@@ -4,6 +4,12 @@ This shared kit preserves distinct storage, image and arithmetic identities. It
 does not select faster arithmetic or supply model assets. Build and receipt
 directories are caller inputs and must remain outside version control.
 
+HIP production kernels exercise the extracted storage helpers. `BoundCore`,
+generic `load_fragment` entry points and the source admission registry remain
+scaffolding covered by fixtures, not production launch policy. Existing row
+construction adapters remain in place; consolidating them and connecting the
+typed facade requires a separate migration and native qualification.
+
 Invoke `build.sh` through the deployment's CPU build lane, passing `--source`,
 `--build`, `--backend` and optionally `--toolchain` and repeatable `--target`.
 Backends are `host`, `hip`, `cuda-qwen`, `cuda-ds41`, `cpu`, `intel` and `nvfp4`.
@@ -57,7 +63,7 @@ Each section has `name`, `bytes`, and a 16-digit hexadecimal `fnv1a64`. Names ar
 initialise them identically. Preserve signed zeros and defined NaN payloads.
 
 `run.py --build BUILD --baseline OLD --candidate NEW --backend BACKEND --pr P01
---output RECEIPTS [--runner RUNNER]` runs the selected mandatory CTest group,
+--output RECEIPTS [--runner RUNNER --partition-tests]` runs the selected mandatory CTest group,
 requires every named test exactly once with successful JUnit status, then compares
 captures. P01 requires contracts, census, compare and tools; P02 requires reference,
 geometry and iq3s; P03 readers and admission; P04 resolve, cache and effective-config;
@@ -65,6 +71,8 @@ P05 cpu (all names prefixed `wfmt.`). P02 additionally requires the DS41 formats
 native-fp8 and trellis-identity host tests for host/hip/cuda-ds41, and both NVFP4
 host tests for host/nvfp4. P05 additionally requires `wfmt.intel` and the Intel
 backend-host-tests, dense-boundaries and memory-boundaries tests for host/intel.
+P06/P07/P08 require the HIP backend, their `wfmt.hip-dense`/`wfmt.hip-gsq`/
+`wfmt.hip-trellis` cases, and every corresponding native suite listed in `run.py`.
 Unimplemented or unregistered required tests fail; backend names are validated.
 The runner requires successful version 2 receipts for both arms, verifies their
 matrix/inventory/content hashes, and requires matching compiler, flags, architecture,
@@ -77,6 +85,25 @@ after the build lane exits. Partition cases so each GPU ticket fits 120 seconds;
 the runner's timeout cannot be increased above that limit. Pass additional
 family gates separately until they are registered in the binding census. No
 missing fixture is silently treated as a passing gate.
+
+Queued runners require `--partition-tests`: each mandatory CTest receives its own
+sequential ticket, with CTest's timeout applied inside that ticket. FIFO queue time
+does not consume the execution timeout. The deployment runner must also cap the
+whole ticket at 120 seconds (for example, `GPU_TURN_MAX=120`); use its quiet timing
+label convention. Each partition's JUnit inventory is checked before aggregating
+the complete mandatory inventory into `ctest.xml`.
+
+For native transfer captures, execute `capture.py --adapter hip-transfer` inside
+an already-held bounded GPU ticket. Its timeout then covers execution only.
+Compile the test with `STRIX_WFMT_CAPTURE=1` and include
+`hip_transfer_capture.hpp` after HIP/test headers. Set each retained route's
+arithmetic, logical shape and storage ID with `capture::set_context`; use
+`capture::emit` for named activation, prepared and partial buffers. Successful
+H2D/D2H copies provide additional source/output records without changing payloads.
+Run the predecessor once to produce raw records, freeze their inventory using
+`matrix_from_records.py --baseline RAW --out MATRIX`, then capture both arms
+against that same immutable matrix. `capture.py --source-revision FULL_COMMIT_ID`
+records frozen archive provenance when the source has no Git directory.
 
 `isa.py --old OLD --new NEW --backend hip|cuda --symbols SYMBOLS.json --out DIR`
 disassembles required symbols and retains raw and address-normalised streams.
@@ -93,6 +120,14 @@ of required symbol substrings. Any changed instruction/resource stream fails
 for review; byte equality alone cannot whitelist codegen changes. Review spills,
 registers, shared/LDS bytes and occupancy, and retain timing receipts plus a
 written explanation. No kernel is changed by P01.
+
+For a required source trait that changes mangled names, `--symbol-map PAIRS.json`
+accepts explicit `[{"old":"FULL_OLD_SYMBOL","new":"FULL_NEW_SYMBOL"}]` pairs.
+Both sides must be one-to-one and present in the selected functions. Only those
+names and function placement are normalised: instruction order within each
+function, every unmapped function, and every resource/descriptor value remain
+mandatory. The receipt retains the pairs; missing, duplicate or extra functions
+and changed instructions/resources cannot be excused by the map.
 
 Whole-model performance qualification supplies model/prompt paths externally:
 two prefills per process (first cold, last warm), ABAB at least three pairs,
