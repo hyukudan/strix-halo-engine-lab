@@ -2917,6 +2917,11 @@ int main() { return 0; }"
             target_link_libraries(strix-hip-f16-dense-iu4-tests PRIVATE strix_hip_runtime strix_core)
             target_include_directories(strix-hip-f16-dense-iu4-tests PRIVATE src)
             add_test(NAME strix-hip-f16-dense-iu4-tests COMMAND strix-hip-f16-dense-iu4-tests)
+            # Shared FAST wide-window attention (flash over the dense_decode BF16 cache) vs the decode form
+            add_executable(strix-hip-dense-decode-flash-tests tests/hip_dense_decode_flash_tests.hip)
+            set_target_properties(strix-hip-dense-decode-flash-tests PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHS}")
+            target_include_directories(strix-hip-dense-decode-flash-tests PRIVATE src)
+            add_test(NAME strix-hip-dense-decode-flash-tests COMMAND strix-hip-dense-decode-flash-tests)
         endif()
         if(STRIX_CHECK_KERNEL_SCRATCH)
             strix_check_kernel_scratch(strix-hip-qwen35-decode)
