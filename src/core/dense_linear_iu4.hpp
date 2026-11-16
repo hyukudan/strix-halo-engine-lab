@@ -8,13 +8,15 @@
 //     address: broadcast, L1 resident).
 //   - One block = 8 waves = 64 output columns; the 8 waves split K in contiguous ranges of K / 8 (G / 8 = MaxG K64
 //     groups each), reduce their partial sums in LDS in a fixed ascending order (deterministic, no atomics).
-//   - Rows are padded to the bucket R (1/2/4/8/16); the core runs 4-row calls (an 8-row core spills VGPRs), rows past
-//     nrows are neither computed nor stored. Weights of the later 4-row calls are re-read from L1 / L2.
+//   - Rows are padded to the bucket R (1/2/4/8/16); rows past nrows are neither computed nor stored. Default: ONE core
+//     call over all R rows (every weight word read once, bitwise equal to the chunked form: per-row op order is
+//     identical). STRIX_IU4_ROW_REUSE=0 selects the old 4-row chunk calls (weights re-streamed per chunk).
 // Home: shared (backend core, HIP): no model names; any dense projection can bind it (qwen35 now).
 #if defined(__HIPCC__)
 #include <hip/hip_runtime.h>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <stdexcept>
 
 #include "w4a16.hpp"
@@ -43,10 +45,10 @@ __global__ void to_f16_kernel(const float* x, _Float16* h, std::size_t count) {
     }
 }
 
-template <unsigned R, unsigned MaxG>
+template <unsigned R, unsigned MaxG, unsigned Rc = R>
 __global__ void __launch_bounds__(32 * kWaves) kernel(const std::uint8_t* w, unsigned inputs, unsigned outputs, const _Float16* xh,
                                                       float* out, unsigned nrows) {
-    constexpr unsigned S = kWaves, Rc = R >= 8U ? 4U : R, KT = MaxG * 4U;
+    constexpr unsigned S = kWaves, KT = MaxG * 4U;
     __shared__ float part[R * S * 64];
     const unsigned lane = threadIdx.x & 31U, wave = threadIdx.x / 32U, quad = blockIdx.x;
     const auto* ws = reinterpret_cast<const std::uint16_t*>(w + packed_bytes(outputs, inputs));
@@ -79,13 +81,29 @@ __global__ void __launch_bounds__(32 * kWaves) kernel(const std::uint8_t* w, uns
     }
 }
 
+inline bool row_reuse() {
+    static const bool on = [] { const char* e = std::getenv("STRIX_IU4_ROW_REUSE"); return !(e && e[0] == '0'); }();
+    return on;
+}
+
 template <unsigned R>
 void launch_bucket(const std::uint8_t* w, unsigned inputs, unsigned outputs, const _Float16* xh, float* out, unsigned rows, hipStream_t s) {
     const dim3 grid(outputs / 64U), block(32U * kWaves);
+    constexpr unsigned C = R >= 8U ? 4U : R;
+    const bool reuse = R <= 4U || row_reuse();
     switch (inputs / 512U) {
-    case 10U: kernel<R, 10U><<<grid, block, 0, s>>>(w, inputs, outputs, xh, out, rows); break;
-    case 12U: kernel<R, 12U><<<grid, block, 0, s>>>(w, inputs, outputs, xh, out, rows); break;
-    default: kernel<R, 34U><<<grid, block, 0, s>>>(w, inputs, outputs, xh, out, rows); break;
+    case 10U:
+        if (reuse) kernel<R, 10U, R><<<grid, block, 0, s>>>(w, inputs, outputs, xh, out, rows);
+        else kernel<R, 10U, C><<<grid, block, 0, s>>>(w, inputs, outputs, xh, out, rows);
+        break;
+    case 12U:
+        if (reuse) kernel<R, 12U, R><<<grid, block, 0, s>>>(w, inputs, outputs, xh, out, rows);
+        else kernel<R, 12U, C><<<grid, block, 0, s>>>(w, inputs, outputs, xh, out, rows);
+        break;
+    default:
+        if (reuse) kernel<R, 34U, R><<<grid, block, 0, s>>>(w, inputs, outputs, xh, out, rows);
+        else kernel<R, 34U, C><<<grid, block, 0, s>>>(w, inputs, outputs, xh, out, rows);
+        break;
     }
 }
 
