@@ -158,7 +158,7 @@ int main(int argc, char** argv) {
         bool slots_verify = false, graphs = true, multi = true, bwp = false, pdl = false, print_cfg = false;
         q::EngineOptions topt;  // TURBO levers (defaults = exact)
         std::string arith_name = "mma3";
-        std::string flash_pipe, flash_tail, pf_attn8;
+        std::string flash_pipe, flash_tail, pf_attn8, dump_cont;
         std::string pf_arith, pf_dump;            // --prefill-arith exact|flash|fast|fast2: large-M prefill (absent: windows of --rows)
         std::uint32_t pf_chunk = 2048, pf_repeat = 1, pf_slots = 2;
         std::uint32_t pf_inflight = q::EngineOptions{}.prefill_inflight, pf_ramp = 0;  // bounded submission / ramp
@@ -219,6 +219,7 @@ int main(int argc, char** argv) {
             } else if (a == "--turbo-save-pack") save_pack = next();  // write the onfly NVFP4 weights of --model (BF16 gguf) as a converted pack, then exit
             else if (a == "--print-effective-config") print_cfg = true;
             else if (a == "--dump-logits") dump = next();
+            else if (a == "--dump-cont") dump_cont = next();  // with --prefill-arith: big prefill, then dump only its last row + decode rows
             else if (a == "--force-gen-file") force_file = next();  // teacher forcing: decode feeds these tokens (comma list), not its own argmax
             else if (a == "--dump-mtp") dump_mtp = next();
             else if (a == "--mtp-hidden") mtp_pre = next() == "pre";
@@ -390,6 +391,11 @@ int main(int argc, char** argv) {
         std::FILE* df = dump.empty() ? nullptr : std::fopen(dump.c_str(), "wb");
         if (!dump.empty() && !df) throw std::runtime_error("cannot open " + dump);
         std::FILE* df_open = nullptr;
+        if (!dump_cont.empty()) {  // continuation dump: row 0 = last prefill row, row j = decode step j (same layout as --dump-logits' tail)
+            if (pf_arith.empty() || df) throw std::runtime_error("--dump-cont needs --prefill-arith and no --dump-logits");
+            df_open = std::fopen(dump_cont.c_str(), "wb");
+            if (!df_open) throw std::runtime_error("cannot open " + dump_cont);
+        }
         std::vector<float> host_logits(static_cast<std::size_t>(cfg.vocab));
         std::vector<std::uint32_t> top1;
         std::vector<float> hid_all;
@@ -402,6 +408,10 @@ int main(int argc, char** argv) {
                 E->sync();
                 const double sec = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
                 E->read_top(o, 1, &next_tok);
+                if (df_open && rep + 1 == pf_repeat) {
+                    E->read_logits(o, 0, host_logits.data());
+                    std::fwrite(host_logits.data(), 4, cfg.vocab, df_open);
+                }
                 if (!pf_dump.empty() && rep + 1 == pf_repeat) {
                     std::vector<float> lg(cfg.vocab);
                     E->read_logits(o, 0, lg.data());
