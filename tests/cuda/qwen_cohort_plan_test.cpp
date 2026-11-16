@@ -155,12 +155,10 @@ int main() {
     // rows, still off at 9 rows (9 / 26 < 8 / 17.35); <= 8 rows never
     {
         const qc::CopyWideModel measured{}, decode16{8.55, 1.1, 26.0};
-        if (qc::copy_wide_pays(16, measured) || qc::copy_wide_pays(8, decode16) || !qc::copy_wide_pays(16, decode16) ||
-            qc::copy_wide_pays(9, decode16)) {
-            std::printf("FAIL copy_wide_pays decision table
-");
-            ++failures;
-        }
+        EXPECT(!qc::copy_wide_pays(16, measured));
+        EXPECT(!qc::copy_wide_pays(8, decode16));
+        EXPECT(qc::copy_wide_pays(16, decode16));
+        EXPECT(!qc::copy_wide_pays(9, decode16));
     }
     std::printf("%s (%d failures)\n", failures == 0 ? "COHORT PLAN PASS" : "COHORT PLAN FAIL", failures);
     return failures == 0 ? 0 : 1;
