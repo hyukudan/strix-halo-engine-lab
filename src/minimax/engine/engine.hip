@@ -852,7 +852,7 @@ struct Engine::Impl {
         shared_first = env_flag("STRIX_MM_SHARED_FIRST", false);
         const char* at = std::getenv("STRIX_MM_ATTN");
         attn_fused = at == nullptr || std::string(at) != "off";  // ON by default (measurement: bitwise, ABA x3 never slower); =off
-        const auto index_policy = route::resolve_index_projection(std::getenv("STRIX_MM_INDEX_PROJ"),
+        const auto index_policy = route::resolve_index_projection(strix::envcfg::text("STRIX_MM_INDEX_PROJ"),
                                                                  env_flag("STRIX_MM_INDEX_DECODE", true));
         index_attn = index_policy.attn;
         index_tiled = index_policy.tiled;
@@ -1231,9 +1231,11 @@ struct Engine::Impl {
         rr::lever("minimax.msa_flash", pf_msa_flash_asked,
                   std::to_string(flash) + (flash ? ":layers=" + mask(pf_msa_flash_layers, 0) : ""),
                   flash ? rr::Reason::selected : rr::Reason::disabled);
+        const bool index_wmma = pf_idx_wmma && !fp32_prefill &&
+            route::index_projection_route({index_attn, index_tiled, index_decode}, 9) == route::IndexLayout::packed;
         rr::lever("minimax.index_proj_wmma", pf_idx_wmma_asked,
-                  pf_idx_wmma && !fp32_prefill ? "1:layers=" + mask(pf_idx_wmma_layers, 0) : std::string("0"),
-                  pf_idx_wmma && !fp32_prefill ? rr::Reason::selected : rr::Reason::disabled);
+                  index_wmma ? "1:layers=" + mask(pf_idx_wmma_layers, 0) : std::string("0"),
+                  index_wmma ? rr::Reason::selected : rr::Reason::disabled);
         rr::lever("minimax.prefill_identity", fp32_prefill ? "fp32" : "default", fp32_prefill ? "fp32" : "default");
         rr::lever("minimax.moe_kernels", moe_opt ? "1" : "0", moe_opt ? "1" : "0");
     }
@@ -2053,6 +2055,7 @@ struct Engine::Impl {
                 hipLaunchKernelGGL(dense_t_kernel, dim3(static_cast<unsigned>(n), kIdxLocal / 128), dim3(128), 0, nullptr, hn, y.wiq, iq, kHidden, kIdxLocal);
                 hipLaunchKernelGGL(dense_t_kernel, dim3(static_cast<unsigned>(n), 1), dim3(128), 0, nullptr, hn, y.wik, ik, kHidden, 128U);
             }
+            if (idx_fast && task.open) task.idx_wmma_executed.set(L);
             if (tl) tl->mark(conc ? "index-join" : "index-projection", false);
             lap(prof.attn_proj);
             tmark(tmark_at(L, 0));
@@ -2475,6 +2478,7 @@ struct Engine::Impl {
         std::size_t c0 = 0, c = 0, chunks = 0, m = 1, rows = 0;  // next chunk's first row / index; the open unit's members, rows
         unsigned layer = 0;                                      // next layer of the open chunk / group (0: not started)
         std::uint64_t output_fnv = 14695981039346656037ULL;
+        strix::core::LayerSet idx_wmma_executed;  // successful submissions, published only after the completion fence
         Engine::PfTaskId id = 0, parent = 0;
         std::uint64_t generation = 0;
         std::unique_ptr<strix::core::i4_shadow::Accumulator<kLayers>> shadow;
@@ -2605,6 +2609,16 @@ struct Engine::Impl {
                 if (pf_active) pf->drain();
                 pf_active = false;
                 hip_ok(hipDeviceSynchronize(), "prefill");
+                if (task.idx_wmma_executed.count() != 0) {
+                    std::uint64_t token_fnv = 14695981039346656037ULL;
+                    for (const auto token : task.toks)
+                        for (unsigned byte = 0; byte < 4; ++byte)
+                            token_fnv = (token_fnv ^ ((token >> (8U * byte)) & 255U)) * 1099511628211ULL;
+                    std::string executed;
+                    for (unsigned l = 0; l < kLayers; ++l) executed += task.idx_wmma_executed.test(l) ? '1' : '0';
+                    std::fprintf(stderr, "minimax-index-proj-executed rank %u tokens %zu token_fnv %016llx layers %s\n",
+                                 opt.rank, task.toks.size(), static_cast<unsigned long long>(token_fnv), executed.c_str());
+                }
                 if (model_fast_i4) jit_collect(true);
                 mmoe::prefill_moe_device_check();  // invalid routes met by a device-planned MoE call (failed exchange)
                 if (task.shadow) task.shadow->print("mm", opt.rank);

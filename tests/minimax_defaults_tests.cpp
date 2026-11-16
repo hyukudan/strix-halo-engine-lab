@@ -728,6 +728,27 @@ void test_fast_prefill_profile() {
                   md::prefill_identity(lookup(idx)) == "prefill_msa=msa-flash-bf16-l40-v1;prefill_idxproj=minimax-index-proj-wmma-v1-l40-59",
               "fast idx: explicit member runs beside the bundle, own cache field");
         check(!md::prefill_policy(lookup(bundle)).idx_wmma, "fast idx: not a bundle member before its gate");
+        for (const char* layout : {"tiled", "off"}) {
+            auto declined = idx;
+            declined["STRIX_MM_INDEX_PROJ"] = layout;
+            auto disabled = declined;
+            disabled["STRIX_MM_PF_IDX_WMMA"] = "0";
+            const auto policy = md::prefill_policy(lookup(declined));
+            check(!policy.idx_wmma && !policy.note.empty() && policy.idx_wmma_asked == "1" &&
+                      policy.policies == md::prefill_policy(lookup(disabled)).policies &&
+                      md::prefill_identity(lookup(declined)) == md::prefill_identity(lookup(disabled)) && agree(declined, disabled),
+                  "fast idx: incompatible layout declines in policy, identity and rank agreement");
+            for (const char* app : {"rank", "serve"}) {
+                const auto cfg = md::effective_config(md::parse_cli(app, {}), lookup(declined));
+                check(cfg.find("\nprefill.idx_wmma=0\n") != std::string::npos &&
+                          cfg.find("\nprefill.idx_wmma_layers=none\n") != std::string::npos &&
+                          cfg.find("minimax-index-proj-wmma") == std::string::npos,
+                      "fast idx: effective config declines incompatible layout");
+            }
+        }
+        auto idx_fp32 = idx;
+        idx_fp32["STRIX_MM_PREFILL_IDENTITY"] = "fp32";
+        check(!md::prefill_policy(lookup(idx_fp32)).idx_wmma, "fast idx: FP32 prefill declines");
         check(agree(idx, idx) && !agree(idx, bundle) && !agree(bundle, idx), "fast idx: one rank only is rejected");
         EnvMap idx_zero = bundle;
         idx_zero["STRIX_MM_PF_IDX_WMMA"] = "0";

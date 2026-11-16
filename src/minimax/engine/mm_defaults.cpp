@@ -259,6 +259,15 @@ PrefillPolicy prefill_policy(const Lookup& env) {
         p.idx_wmma = false;
         p.note += std::string(p.note.empty() ? "" : "; ") + "STRIX_MM_PF_IDX_WMMA_LAYERS selects no layers";
     }
+    // Resolve the same prefill layout as dispatch; decode's <=8-row policy is irrelevant here.
+    const auto index = route::resolve_index_projection(env("STRIX_MM_INDEX_PROJ"), true);
+    const bool packed = route::index_projection_route(index, 9) == route::IndexLayout::packed;
+    const bool fp32 = route::fp32_profile(env("STRIX_MM_PREFILL_IDENTITY"));
+    if (p.idx_wmma && (!packed || fp32)) {
+        p.idx_wmma = false;
+        p.note += std::string(p.note.empty() ? "" : "; ") +
+                  (!packed ? "index WMMA requires STRIX_MM_INDEX_PROJ=attn" : "index WMMA requires the default prefill identity");
+    }
     if (p.idx_wmma) p.policies += (p.policies.empty() ? "" : "+") + idx_wmma_policy(p.idx_wmma_layers);
     return p;
 }

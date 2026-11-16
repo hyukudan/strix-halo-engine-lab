@@ -79,7 +79,9 @@ void run_case(std::mt19937& rng, unsigned in, const std::vector<unsigned>& ns, u
     const auto wmma16 = [&] { K::dense_group(dx, in, px.data(), count, R, nullptr, xt); };
     exact();
     wmma();
+    const auto x16_before = K::x16_calls.load(std::memory_order_relaxed);
     if (x16) wmma16();
+    check(K::x16_calls.load(std::memory_order_relaxed) == x16_before + (x16 ? 1U : 0U), tag + " x16 dispatch count");
     ok(hipDeviceSynchronize(), "sync");
     for (unsigned i = 0; i < count; ++i) {
         const unsigned n = pr[i].n;
@@ -162,6 +164,7 @@ int main() {
         run_case(rng, 4096, {128, 128, 32}, 2049, false);  // x16 form, partial last row block (indexer / KDA shape)
         run_case(rng, 4096, {128, 128, 64}, 4100, false);  // x16 form, 20 tiles -> 4-tile columns
         run_case(rng, 256, {48}, 33, false);  // 4-tile kernel only, dead tile
+        run_case(rng, 256, {48}, 2049, false);  // odd tile count: dense_x16_kernel<1>, partial row block
         const P::DenseProj bad{nullptr, 0, 24, nullptr};
         check(!K::supported(D::WType::F16, 4096, &bad, 1, 8), "ragged width is not supported");
         check(!K::supported(D::WType::BF16, 4096, &bad, 1, 8), "BF16 weights are not supported");
