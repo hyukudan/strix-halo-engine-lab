@@ -35,6 +35,7 @@ WeightView fixture(const FormatDescriptor& format,std::uint32_t seed) {
  Geometry g{}; if(!format.geometry(view.parameters,g)) throw std::runtime_error("fixture geometry"); view.geometry=g;
  auto width=std::uint64_t(g.block_elements),rows=std::uint64_t(1);
  const auto name=format.id.name;
+ if(name.starts_with("exl3.")) view.parameters.bits=seed==0?4:seed==1?5:seed==UINT32_MAX?8:6;
  if(name=="block.e4m3-e8m0.32x32") { width=32; rows=32; }
  if(name=="nvidia.nvfp4") width=64;
  if(name.starts_with("linear.")) { width=256; rows=2; view.parameters.transform="convrot256"; }
@@ -162,9 +163,10 @@ bool run_references(std::string_view directory) {
    if(!directory.empty()) {
     std::string name(format.id.name); std::replace(name.begin(),name.end(),'.','_'); name+="-"+std::to_string(seed);
     const auto base=std::filesystem::path(directory)/"baseline",candidate=std::filesystem::path(directory)/"candidate";
-    const auto raw=source_bytes(view.payload);
-    if(!write_capture_record(base.string(),name,serialize_id(format.id),std::span(view.shape.dims).first(view.shape.rank),raw,old) ||
-       !write_capture_record(candidate.string(),name,serialize_id(format.id),std::span(view.shape.dims).first(view.shape.rank),raw,result)) return false;
+    const auto raw=source_bytes(view.payload); std::vector<Byte> sidecars;
+    for(const auto& part:view.sidecars) { const auto bytes=source_bytes(part.data); sidecars.insert(sidecars.end(),bytes.begin(),bytes.end()); }
+    if(!write_capture_record(base.string(),name,serialize_id(format.id),std::span(view.shape.dims).first(view.shape.rank),raw,old,sidecars) ||
+       !write_capture_record(candidate.string(),name,serialize_id(format.id),std::span(view.shape.dims).first(view.shape.rank),raw,result,sidecars)) return false;
    }
    // Output slice and negative output-size checks are independent of format decoding.
    std::array<Byte,4> last{}; DecodeBuffer tail{last,0};

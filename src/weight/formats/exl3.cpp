@@ -25,7 +25,7 @@ Status decode_exl3(const WeightView& view,const std::vector<Byte>& raw,std::vect
  if(gemma) {
   strix::gemma4::LinearView linear{data,static_cast<unsigned>(rows),static_cast<unsigned>(width),
        static_cast<std::size_t>(width*view.parameters.bits/8),strix::gemma4::WeightFormat::exl3_mul1};
-  validate(linear);
+  gemma4::exl3::validate(linear);
  }
  // Decode the transformed-domain coefficients. Input/output transforms remain
  // attached to the arithmetic identity; this never invents an unrotated matrix.

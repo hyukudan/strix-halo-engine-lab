@@ -28,5 +28,6 @@ bool compare_case();
 bool capture_case(std::string_view output_directory);
 bool write_capture_record(std::string_view directory, std::string_view name,
                           std::string_view format, std::span<const std::uint64_t> shape,
-                          std::span<const std::byte> source, std::span<const std::byte> output);
+                          std::span<const std::byte> source, std::span<const std::byte> output,
+                          std::span<const std::byte> sidecars = {});
 }

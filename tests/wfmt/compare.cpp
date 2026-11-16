@@ -53,7 +53,7 @@ bool capture_case(std::string_view output_directory) {
 }
 bool write_capture_record(std::string_view directory,std::string_view name,std::string_view format,
                           std::span<const std::uint64_t> shape,std::span<const std::byte> source,
-                          std::span<const std::byte> output) {
+                          std::span<const std::byte> output,std::span<const std::byte> sidecars) {
     std::error_code error;
     const std::filesystem::path path(directory);
     std::filesystem::create_directories(path,error); if(error) return false;
@@ -62,9 +62,9 @@ bool write_capture_record(std::string_view directory,std::string_view name,std::
            << "\",\"arithmetic\":\"legacy-host-decode@1\",\"shape\":[";
     for(std::size_t i=0;i<shape.size();++i) { if(i) header << ','; header << shape[i]; }
     header << "],\"sections\":[";
-    const std::array<std::span<const std::byte>,2> sections{source,output};
-    const std::array<const char*,2> names{"source","output"};
-    for(std::size_t i=0;i<2;++i) {
+    const std::array<std::span<const std::byte>,3> sections{source,sidecars,output};
+    const std::array<const char*,3> names{"source","sidecars","output"};
+    for(std::size_t i=0;i<sections.size();++i) {
         if(i) header << ',';
         header << "{\"name\":\"" << names[i] << "\",\"bytes\":" << std::dec << sections[i].size()
                << ",\"fnv1a64\":\"" << std::hex << std::setw(16) << std::setfill('0')

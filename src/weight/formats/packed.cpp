@@ -7,10 +7,10 @@
 namespace strix::weight::detail {
 std::span<const FormatDescriptor> packed_formats() {
  static const FormatDescriptor formats[] = {
-  descriptor({"image.cb4",1},"derived-cb4",quantized_linear,true,fixed<32,18>,true),
-  descriptor({"image.u5",1},"derived-u5",quantized_linear,true,fixed<32,22>,true),
-  descriptor({"image.u6",1},"derived-u6",quantized_linear,true,fixed<32,26>,true),
-  descriptor({"image.q6p32",1},"derived-q6p32",quantized_linear,true,fixed<32,26>,true)
+  descriptor({"image.cb4",1},"derived-cb4",quantized_linear,true,fixed<32,18>),
+  descriptor({"image.u5",1},"derived-u5",quantized_linear,true,fixed<32,22>),
+  descriptor({"image.u6",1},"derived-u6",quantized_linear,true,fixed<32,26>),
+  descriptor({"image.q6p32",1},"derived-q6p32",quantized_linear,true,fixed<32,26>)
  };
  return formats;
 }
