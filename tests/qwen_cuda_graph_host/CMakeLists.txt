@@ -9,7 +9,7 @@ add_custom_command(OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/production.inc"
     VERBATIM)
 add_executable(strix-qwen-cuda-graph-host-tests host.cpp "${CMAKE_CURRENT_BINARY_DIR}/production.inc")
 target_compile_features(strix-qwen-cuda-graph-host-tests PRIVATE cxx_std_20)
-target_include_directories(strix-qwen-cuda-graph-host-tests PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")
+target_include_directories(strix-qwen-cuda-graph-host-tests PRIVATE "${CMAKE_CURRENT_BINARY_DIR}" "${PROJECT_SOURCE_DIR}/include")
 if(MSVC)
     target_compile_options(strix-qwen-cuda-graph-host-tests PRIVATE /W4 /WX /permissive-)
 else()
