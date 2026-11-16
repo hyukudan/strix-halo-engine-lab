@@ -12,6 +12,7 @@
 // filling View; nothing here names a model.
 // Limits (callers check with supported()): in % 128 == 0, x_stride % 32 == 0, in <= x_stride.
 #include "f16_dense_tall.hpp"
+#include "../attn_core/wmma_types.hpp"  // the operand-image epilogue rounds with the attention cores' to_operand
 
 namespace strix::core::f16_dense_tall::q8a8 {
 inline constexpr char kPolicyName[] = "dense-q8a8-f16-v1";
@@ -148,9 +149,48 @@ struct Store {
     template <class F> __device__ __forceinline__ void run(F&& f) { f(*this); }
 };
 
+// Operand-image epilogue: the producer side of attn_core's query_op hook (attn_core/sparse_flash_wmma.hpp). Each
+// output's FP32 sum, after the engine's pair transform E::pair(e, r, o, x0, x1) on the column pair (o, o + 1) (o even;
+// e.g. RoPE), is stored as tile::to_operand<E::kOp>(x) into image[r * out_stride + o] instead of out (out is not
+// written). A consumer that applied the same transform and rounding to the FP32 outputs gets the same bits: the sum
+// is the same register value either way and to_operand is the consumer's rounding function. Halves the output bytes.
+// Policy E: using Args; static constexpr tile::Operand kOp; static __device__ void pair(const Args&, unsigned r,
+// unsigned o, float& x0, float& x1). Limits (supported_image()): one K part, no accumulate, count even.
+template <class E> struct StoreImage {
+    std::uint32_t count, tile0;
+    std::uint16_t* image;
+    typename E::Args e;
+    struct Tile {
+        std::uint16_t* y;
+        unsigned stride, o;
+        bool live;
+    };
+    __device__ __forceinline__ Tile open(unsigned i, const ColumnTile& ct, unsigned c) const {
+        const unsigned o = 16U * (tile0 + i) + c;
+        return {f16_dense_tall::detail::uniform(image + 16U * (tile0 + i)), f16_dense_tall::detail::uni(ct.stride), o, o < count};
+    }
+    // lanes (c, c ^ 1) hold columns (o, o ^ 1) of the same row and call put together (the row depends on lane / 16)
+    __device__ __forceinline__ void put(const Tile& t, unsigned r, float value) const {
+        const float partner = __shfl_xor(value, 1, 32);
+        if (!t.live || (t.o & 1U) != 0U) return;
+        float x0 = value, x1 = partner;
+        E::pair(e, r, t.o, x0, x1);
+        *reinterpret_cast<std::uint32_t*>(t.y + static_cast<std::size_t>(r) * t.stride + (t.o & 15U)) =
+            static_cast<std::uint32_t>(attn_core::tile::to_operand<E::kOp>(x0)) |
+            (static_cast<std::uint32_t>(attn_core::tile::to_operand<E::kOp>(x1)) << 16U);
+    }
+    __device__ __forceinline__ void close() const {}
+    template <class F> __device__ __forceinline__ void run(F&& f) { f(*this); }
+};
+
 template <unsigned TC, unsigned Waves, unsigned Form> __global__ __launch_bounds__(32 * Waves) void kernel(View v) {
     __shared__ Storage<TC> lds;
     core<TC>(nullptr, v.in, v.rows, Cols<Waves, Form>{v}, lds, Store{v.count, v.tile0, v.accumulate});
+}
+template <unsigned TC, unsigned Waves, class E>
+__global__ __launch_bounds__(32 * Waves) void kernel_image(View v, std::uint16_t* image, typename E::Args e) {
+    __shared__ Storage<TC> lds;
+    core<TC>(nullptr, v.in, v.rows, Cols<Waves>{v}, lds, StoreImage<E>{v.count, v.tile0, image, e});
 }
 
 inline bool supported(const View& v) {
@@ -196,6 +236,27 @@ inline void enqueue(const View& v, hipStream_t stream, unsigned waves = 0U, unsi
     const unsigned f = form_for(form);
     if (waves_for(v.rows, v.in, waves) == 16U) launch_form<16>(v, f, stream);
     else launch_form<8>(v, f, stream);
+}
+
+// The operand-image form (StoreImage): same grid, same chains, same CTA rule as enqueue.
+inline bool supported_image(const View& v, const std::uint16_t* image) {
+    return supported(v) && image != nullptr && v.accumulate == 0U && v.count % 2U == 0U && v.out_stride % 2U == 0U &&
+           reinterpret_cast<std::uintptr_t>(image) % 4U == 0U;
+}
+template <unsigned Waves, class E> inline void launch_image(View v, std::uint16_t* image, typename E::Args e, hipStream_t stream) {
+    const unsigned tiles = (v.count + 15U) / 16U, gx = (v.rows + 16U * Waves - 1U) / (16U * Waves);
+    const Plan pl = plan(tiles, v.rows, true);
+    v.tile0 = 0U;
+    if (pl.full) hipLaunchKernelGGL((kernel_image<16, Waves, E>), dim3(gx, pl.full), dim3(32U * Waves), 0, stream, v, image, e);
+    v.tile0 = 16U * pl.full;
+    if (pl.tc == 1U) hipLaunchKernelGGL((kernel_image<1, Waves, E>), dim3(gx, pl.gy), dim3(32U * Waves), 0, stream, v, image, e);
+    if (pl.tc == 2U) hipLaunchKernelGGL((kernel_image<2, Waves, E>), dim3(gx, pl.gy), dim3(32U * Waves), 0, stream, v, image, e);
+    if (pl.tc == 4U) hipLaunchKernelGGL((kernel_image<4, Waves, E>), dim3(gx, pl.gy), dim3(32U * Waves), 0, stream, v, image, e);
+}
+// Caller checks supported_image(v, image) and the launch error.
+template <class E> inline void enqueue_image(const View& v, std::uint16_t* image, typename E::Args e, hipStream_t stream, unsigned waves = 0U) {
+    if (waves_for(v.rows, v.in, waves) == 16U) launch_image<16, E>(v, image, e, stream);
+    else launch_image<8, E>(v, image, e, stream);
 }
 // Independent FP32 chains per K part, added in unfused order by Store.
 // Caller validates each equal-width part; the stream orders the output additions.
