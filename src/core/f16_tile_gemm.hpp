@@ -17,6 +17,8 @@
 //           20 KB LDS stage (rows of 32 halves + 8 pad: b128 fragment reads are bank-conflict free); the next stage's
 //           global loads are issued before this stage's WMMAs (register prefetch), so 2-3 CTAs fit one CU and one CTA's
 //           loads / epilogue overlap another's WMMAs.
+//           A may instead arrive as FP16 bits (Args::a16, e.g. the FP16 image its producer stored): loaded as is,
+//           half the A bytes, the same operand bits as the FP32 -> FP16 staging of the values it was made from.
 //   W     : Layout::NK = w[n][k] (k contiguous): two b128 loads per thread and stage, stored as is.
 //           Layout::KN = w[k][n] (n contiguous): lane = k loads 16 columns (two b128) and writes them transposed with
 //           16 ds_store_b16 (a wave writes 64 contiguous bytes per store), so no transposed weight copy is kept.
@@ -52,6 +54,8 @@ enum class Layout { NK, KN };  // weight element (n, k) at w[n * ldw + k] (NK) o
 // y + b * y_batch + r * y_row + n.
 struct Args {
     const float* a;
+    const std::uint16_t* a16 = nullptr;  // when set: A is already FP16 bits (same strides), read instead of `a`. Same
+                                         // bits as `a` when the producer stored static_cast<_Float16>(x) (RNE)
     std::size_t a_row, a_batch;
     const std::uint16_t* w;  // FP16 bits
     std::size_t w_ld, w_batch;
@@ -87,8 +91,10 @@ static_assert(sizeof(Storage) == 20480);
 
 inline bool fits(const Args& p) {
     return p.rows >= 1U && p.K % kBK == 0U && p.N % kBN == 0U && p.batches >= 1U && p.batches <= 65535U &&
-           (p.rows + kBM - 1U) / kBM <= 65535U && p.order <= 2U && p.group >= 1U && p.batches % p.group == 0U && (p.order != 2U || p.N / kBN * p.group <= 65535U) && p.a_row % 4U == 0U && p.a_batch % 4U == 0U && p.w_ld % 8U == 0U &&
-           p.w_batch % 8U == 0U && reinterpret_cast<std::uintptr_t>(p.a) % 16U == 0U &&
+           (p.rows + kBM - 1U) / kBM <= 65535U && p.order <= 2U && p.group >= 1U && p.batches % p.group == 0U && (p.order != 2U || p.N / kBN * p.group <= 65535U) && p.w_ld % 8U == 0U &&
+           (p.a16 != nullptr ? p.a_row % 8U == 0U && p.a_batch % 8U == 0U && reinterpret_cast<std::uintptr_t>(p.a16) % 16U == 0U
+                             : p.a_row % 4U == 0U && p.a_batch % 4U == 0U && reinterpret_cast<std::uintptr_t>(p.a) % 16U == 0U) &&
+           p.w_batch % 8U == 0U &&
            reinterpret_cast<std::uintptr_t>(p.w) % 16U == 0U;
 }
 
@@ -101,7 +107,7 @@ __device__ __forceinline__ std::uint32_t pack(float lo, float hi) {
 }
 }  // namespace detail
 
-template <Layout L, class Store>
+template <Layout L, class Store, bool kA16 = false>
 __device__ __forceinline__ void core(const Args& p, Storage& lds, const Store& store) {
     const unsigned tid = threadIdx.x, lane = tid & 31U, wave = tid >> 5U, wm = wave & 3U, wn = wave >> 2U;
     const unsigned nt = p.N / kBN;
@@ -111,28 +117,41 @@ __device__ __forceinline__ void core(const Args& p, Storage& lds, const Store& s
     const unsigned c = lane & 15U;
     // A stager: row tid / 2, k half (tid % 2) * 16 of the stage. Rows past `rows` read row 0 (never stored).
     const unsigned ar = tid >> 1U, ak = (tid & 1U) * 16U;
-    const float* ap = p.a + b * p.a_batch + static_cast<std::size_t>(r0 + ar < p.rows ? r0 + ar : 0U) * p.a_row + ak;
+    const std::size_t aoff = b * p.a_batch + static_cast<std::size_t>(r0 + ar < p.rows ? r0 + ar : 0U) * p.a_row + ak;
+    const float* ap = kA16 ? nullptr : p.a + aoff;
+    const std::uint16_t* ap16 = kA16 ? p.a16 + aoff : nullptr;
     // W stager. NK: column n0 + tid / 2, k half (tid % 2) * 16. KN: k = lane, columns n0 + 16 * wave .. + 15.
     const std::uint16_t* wp = p.w + b * p.w_batch +
                               (L == Layout::NK ? static_cast<std::size_t>(n0 + (tid >> 1U)) * p.w_ld + (tid & 1U) * 16U
                                                : static_cast<std::size_t>(lane) * p.w_ld + n0 + 16U * wave);
     Float4 ra[4];
+    U4 ra16[2];
     U4 rb[2];
     const auto load = [&](unsigned k0) __attribute__((always_inline)) {
+        if constexpr (kA16) {
+            ra16[0] = *reinterpret_cast<const U4*>(ap16 + k0);
+            ra16[1] = *reinterpret_cast<const U4*>(ap16 + k0 + 8U);
+        } else {
 #pragma unroll
-        for (unsigned i = 0; i < 4U; ++i) ra[i] = *reinterpret_cast<const Float4*>(ap + k0 + 4U * i);
+            for (unsigned i = 0; i < 4U; ++i) ra[i] = *reinterpret_cast<const Float4*>(ap + k0 + 4U * i);
+        }
         const std::uint16_t* q = wp + (L == Layout::NK ? std::size_t{k0} : std::size_t{k0} * p.w_ld);
         rb[0] = *reinterpret_cast<const U4*>(q);
         rb[1] = *reinterpret_cast<const U4*>(q + 8);
     };
     const auto publish = [&]() __attribute__((always_inline)) {
         U4 h0, h1;
+        if constexpr (kA16) {
+            h0 = ra16[0];
+            h1 = ra16[1];
+        } else {
 #pragma unroll
-        for (unsigned i = 0; i < 4U; ++i) {
-            const Float4 f = ra[i];
-            const std::uint32_t lo = detail::pack(f[0], f[1]), hi = detail::pack(f[2], f[3]);
-            if (i < 2U) { h0[2U * i] = lo; h0[2U * i + 1U] = hi; }
-            else { h1[2U * (i - 2U)] = lo; h1[2U * (i - 2U) + 1U] = hi; }
+            for (unsigned i = 0; i < 4U; ++i) {
+                const Float4 f = ra[i];
+                const std::uint32_t lo = detail::pack(f[0], f[1]), hi = detail::pack(f[2], f[3]);
+                if (i < 2U) { h0[2U * i] = lo; h0[2U * i + 1U] = hi; }
+                else { h1[2U * (i - 2U)] = lo; h1[2U * (i - 2U) + 1U] = hi; }
+            }
         }
         *reinterpret_cast<U4*>(&lds.a[ar][ak / 2U]) = h0;
         *reinterpret_cast<U4*>(&lds.a[ar][ak / 2U + 4U]) = h1;
@@ -182,10 +201,10 @@ __device__ __forceinline__ void core(const Args& p, Storage& lds, const Store& s
         }
 }
 
-template <Layout L, class Store>
+template <Layout L, class Store, bool kA16 = false>
 __global__ __launch_bounds__(kThreads) void gemm_kernel(Args p, Store store) {
     __shared__ Storage lds;
-    core<L>(p, lds, store);
+    core<L, Store, kA16>(p, lds, store);
 }
 
 inline dim3 grid(const Args& p) {
@@ -195,7 +214,8 @@ inline dim3 grid(const Args& p) {
 }
 
 template <Layout L, class Store> inline void gemm(const Args& p, const Store& store, hipStream_t s) {
-    gemm_kernel<L, Store><<<grid(p), kThreads, 0, s>>>(p, store);
+    if (p.a16 != nullptr) gemm_kernel<L, Store, true><<<grid(p), kThreads, 0, s>>>(p, store);
+    else gemm_kernel<L, Store><<<grid(p), kThreads, 0, s>>>(p, store);
 }
 template <Layout L> inline void gemm(const Args& p, hipStream_t s) { gemm<L>(p, RawStore{p.y, p.y_row, p.y_batch}, s); }
 // Bf16Store into y's memory (the u16 image occupies its first half; same element strides).

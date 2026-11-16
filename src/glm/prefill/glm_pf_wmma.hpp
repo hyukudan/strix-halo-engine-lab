@@ -39,6 +39,9 @@ namespace strix::glm::pf::mla_wmma {
 // tile GEMM (core/f16_tile_gemm.hpp). Opt-in until its FAST gate passes: STRIX_GLM_PF_MLA_WMMA=1 selects it, unset or 0
 // keeps the exact FP32 GEMM. Part of the TP2 startup agreement (rank_defaults::kPfMlaWmmaConfig).
 inline bool enabled() { return envcfg::flag("STRIX_GLM_PF_MLA_WMMA", false); }
+// With it: the fused flash core stores o-bar as the FP16 image the out GEMM's staging would make (same bits, half the
+// o-bar bytes written and read). Default on; STRIX_GLM_PF_MLA_OB16=0 restores the FP32 o-bar.
+inline bool ob16() { return envcfg::flag("STRIX_GLM_PF_MLA_OB16", true); }
 inline std::atomic<std::uint64_t> calls{0};  // launches that ran on the WMMA core (identity reporting)
 }  // namespace strix::glm::pf::mla_wmma
 

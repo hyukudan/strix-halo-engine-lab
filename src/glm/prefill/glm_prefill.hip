@@ -3461,12 +3461,26 @@ struct GlmMlaFlashQ16Policy : GlmMlaFlashPolicy {
         return reinterpret_cast<const std::uint16_t*>(a.qt) + static_cast<std::size_t>(r) * kHeads * kKvLora;
     }
 };
+// FP16 o-bar image (FAST MLA WMMA out GEMM only: it rounds its FP32 A operand with the same static_cast<_Float16>, so
+// the out GEMM sees the same bits from half the bytes; flash writes half too). [C][H][512] u16 in ob's memory.
+template <class Base> struct GlmMlaFlashOb16 : Base {
+    static constexpr attn_core::tile::Operand kOutOp = attn_core::tile::Operand::f16;
+    __device__ static std::uint16_t* out_op(const typename Base::Args& a, unsigned r) {
+        return reinterpret_cast<std::uint16_t*>(a.ob) + static_cast<std::size_t>(r) * Base::kHeads * kKvLora;
+    }
+};
 static void mla_flash_rows(const DsaSlot& sl, const std::uint32_t* tokens, const std::uint32_t* n, const float* qt, float* ob, unsigned C,
-                    unsigned keys, bool q16, hipStream_t s) {
+                    unsigned keys, bool q16, hipStream_t s, bool ob16 = false) {
     namespace M = strix::attn_core::sparse;
     const GlmMlaFlashPolicy::Args a{sl.latent, tokens, n, qt, ob};
     constexpr unsigned T16 = M::Geometry<32, kKvLora, 16>::kThreads, T32 = M::Geometry<32, kKvLora, 32>::kThreads;
-    if (q16 && keys == 16) M::flash_rows_kernel<GlmMlaFlashQ16Policy, 16><<<C, T16, 0, s>>>(a);
+    using O16 = GlmMlaFlashOb16<GlmMlaFlashPolicy>;
+    using QO16 = GlmMlaFlashOb16<GlmMlaFlashQ16Policy>;
+    if (ob16 && q16 && keys == 16) M::flash_rows_kernel<QO16, 16><<<C, T16, 0, s>>>(a);
+    else if (ob16 && q16) M::flash_rows_kernel<QO16, 32><<<C, T32, 0, s>>>(a);
+    else if (ob16 && keys == 16) M::flash_rows_kernel<O16, 16><<<C, T16, 0, s>>>(a);
+    else if (ob16) M::flash_rows_kernel<O16, 32><<<C, T32, 0, s>>>(a);
+    else if (q16 && keys == 16) M::flash_rows_kernel<GlmMlaFlashQ16Policy, 16><<<C, T16, 0, s>>>(a);
     else if (q16) M::flash_rows_kernel<GlmMlaFlashQ16Policy, 32><<<C, T32, 0, s>>>(a);
     else if (keys == 16) M::flash_rows_kernel<GlmMlaFlashPolicy, 16><<<C, T16, 0, s>>>(a);
     else M::flash_rows_kernel<GlmMlaFlashPolicy, 32><<<C, T32, 0, s>>>(a);
@@ -3504,9 +3518,10 @@ bool mla_wmma_selected(const float* x, const std::uint16_t* kv_b, unsigned heads
 }
 // image (absorb only): y receives the bf16 q-tilde image the fused core 22 / 23 reads (same bits as its own conversion).
 template <bool kOut>
-bool mla_gemm_wmma(const float* x, const std::uint16_t* kv_b, unsigned heads, unsigned C, float* y, hipStream_t s, bool image = false) {
+bool mla_gemm_wmma(const float* x, const std::uint16_t* kv_b, unsigned heads, unsigned C, float* y, hipStream_t s, bool image = false,
+                   bool a16 = false) {
     if (!mla_wmma_selected(x, kv_b, heads, C)) return false;
-    mla_wmma::gemm<kKvLora, kMlaDim, kOut>(x, kv_b, heads, C, y, s, image);
+    mla_wmma::gemm<kKvLora, kMlaDim, kOut>(x, kv_b, heads, C, y, s, image, a16);
     mla_wmma::calls.fetch_add(1, std::memory_order_relaxed);
     return true;
 }
@@ -3531,9 +3546,10 @@ void mla_attention_rows_versions(const DsaSlot& slot, const std::uint32_t* token
         mla_mark(1, s);
         mla_mark(2, s);
         mla_mark(3, s);
-        mla_flash_rows(slot, tokens, n, qt, ob, C, keys, q16, s);
+        const bool ob16 = mla_wmma::ob16() && mla_wmma_selected(ob, kv_b, heads, C);  // out GEMM on WMMA: FP16 o-bar image
+        mla_flash_rows(slot, tokens, n, qt, ob, C, keys, q16, s, ob16);
         mla_mark(4, s);
-        if (mla_gemm_wmma<true>(ob, kv_b, heads, C, o, s)) {
+        if (mla_gemm_wmma<true>(ob, kv_b, heads, C, o, s, false, ob16)) {
         } else if (gemm_v == 3) mla_gemm_rows_v3_kernel<true><<<g3_grid(kMlaDim, C, heads, g3_heads_mid()), 256, 0, s>>>(ob, kv_b, heads, C, o, g3_heads_mid());
         else if (gemm_v == 2) mla_gemm_rows_v2_kernel<true><<<dim3((C + kG2R - 1) / kG2R, kMlaDim / kG2C, heads), 256, 0, s>>>(ob, kv_b, heads, C, o);
         else mla_gemm_rows_kernel<true><<<dim3((C + kGT - 1) / kGT, kMlaDim / kGT, heads), 256, 0, s>>>(ob, kv_b, heads, C, o);

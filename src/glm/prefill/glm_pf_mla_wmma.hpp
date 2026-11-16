@@ -40,8 +40,11 @@ inline ftg::Args args(const float* x, const std::uint16_t* kv_b, unsigned heads,
 // y = per-head GEMM of x (absorb: kOut = false, out: kOut = true) for C rows. image (absorb only): y receives the bf16
 // q-tilde image [C][heads][Lora] u16 (glm_prefill.hip fused core 22 / 23) instead of FP32 sums.
 template <unsigned Lora, unsigned Dim, bool kOut>
-inline void gemm(const float* x, const std::uint16_t* kv_b, unsigned heads, unsigned C, float* y, hipStream_t s, bool image = false) {
-    const auto p = args<Lora, Dim, kOut>(x, kv_b, heads, C, y);
+// a16: x holds FP16 bits (the o-bar image the flash core stored), same element strides.
+inline void gemm(const float* x, const std::uint16_t* kv_b, unsigned heads, unsigned C, float* y, hipStream_t s, bool image = false,
+                 bool a16 = false) {
+    auto p = args<Lora, Dim, kOut>(x, kv_b, heads, C, y);
+    if (a16) p.a16 = reinterpret_cast<const std::uint16_t*>(x);
     if constexpr (kOut) ftg::gemm<ftg::Layout::NK>(p, s);
     else if (image) ftg::gemm_bf16<ftg::Layout::KN>(p, s);
     else ftg::gemm<ftg::Layout::KN>(p, s);

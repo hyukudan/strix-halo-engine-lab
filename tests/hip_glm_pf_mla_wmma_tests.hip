@@ -68,6 +68,22 @@ template <bool kOut> void run(unsigned heads, unsigned C, std::mt19937& g, bool 
         for (std::size_t i = yn; i < zn; ++i) bad += z[i] != 0xA5A5U;
         check(bad == 0, "absorb H" + std::to_string(heads) + " C" + std::to_string(C) + " bf16 image == to_bf16(FP32 sums), guard kept");
     }
+    if constexpr (kOut) {  // FP16 o-bar image input (flash out_op): bitwise equal to the FP32-input run, guard kept
+        std::vector<std::uint16_t> xh(xn);
+        for (std::size_t i = 0; i < xn; ++i) xh[i] = f2h(x[i]);
+        std::uint16_t* dxh;
+        float* dy2;
+        ok(hipMalloc(&dxh, xn * 2), "xh"); ok(hipMalloc(&dy2, (yn + guard) * 4), "y2");
+        ok(hipMemcpy(dxh, xh.data(), xn * 2, hipMemcpyHostToDevice), "xh h2d");
+        std::vector<float> y2(yn + guard, kGuard);
+        ok(hipMemcpy(dy2, y2.data(), y2.size() * 4, hipMemcpyHostToDevice), "y2 h2d");
+        M::gemm<kLora, kDim, kOut>(reinterpret_cast<const float*>(dxh), dk, heads, C, dy2, nullptr, false, true);
+        ok(hipGetLastError(), "a16 launch");
+        ok(hipMemcpy(y2.data(), dy2, y2.size() * 4, hipMemcpyDeviceToHost), "y2 d2h");
+        ok(hipFree(dxh), "xh free"); ok(hipFree(dy2), "y2 free");
+        check(std::memcmp(y.data(), y2.data(), y.size() * 4) == 0,
+              "out H" + std::to_string(heads) + " C" + std::to_string(C) + " FP16 A image == FP32 A (bitwise, guard kept)");
+    }
     // Sampled rows: the first, the last, fragment / CTA edges and a stride; every head, every output.
     std::vector<unsigned> rows{0, C - 1};
     for (unsigned r : {15U, 16U, 127U, 128U, 129U}) if (r < C) rows.push_back(r);
