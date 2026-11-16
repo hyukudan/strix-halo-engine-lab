@@ -702,7 +702,11 @@ void test_decode_xport() {
 
 }  // namespace
 
-int main() {
+int main(int argc, char** argv) {
+    if (argc > 1 && std::string(argv[1]) == "--print-effective-config") {
+        pd::Effective effective(pd::App::serve, argc, argv, {});
+        return 1;  // Inspection must exit successfully before returning here.
+    }
     test_decode_xport();
     test_equivalence();
     test_off_switches();
