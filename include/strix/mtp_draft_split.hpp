@@ -17,6 +17,8 @@
 #include <cstdlib>
 #include <string>
 
+#include "strix/env_flags.hpp"
+
 namespace strix::mtp {
 
 class DraftSplit {
@@ -27,9 +29,9 @@ public:
     explicit DraftSplit(int mode = -1, double host_turn = 0.25, std::uint64_t min_samples = 8)
         : mode_(mode), host_turn_(host_turn), min_samples_(min_samples) {}
 
-    // -1 / 0 / N from an environment variable (unset, empty or "auto" -> -1).
+    // -1 / 0 / N from an environment variable (unset, empty or "auto" -> -1), recorded for the effective config.
     static int mode_from_env(const char* name) {
-        const char* e = std::getenv(name);
+        const char* e = strix::envcfg::text(name);
         if (!e || !*e || std::string(e) == "auto") return -1;
         return std::atoi(e);
     }
