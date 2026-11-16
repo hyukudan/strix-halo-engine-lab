@@ -57,9 +57,10 @@ The HIP DMA-BUF export path needs HIP 7 or newer; older headers make that path r
 model and the host settings that help it are in [memory budget](operations/memory-budget.md); the packages never
 change kernel, GTT, IOMMU or boot settings.
 
-DEB dependencies of `strix-core` and `strix-tools` come from `dpkg-shlibdeps`. `strix-hip` declares the tested
-ROCm range instead of the build host's ROCm packages: `libamdhip64-7 (>= 7.1.0) | hip-runtime-amd (>= 7.1.0)`
-(distribution or AMD repository; override with `-DSTRIX_PACKAGE_DEB_HIP_DEPENDS=...`). RPM requirements come from
+DEB executable ABI dependencies come from `dpkg-shlibdeps`, including versioned C/C++ runtimes and HIP SONAME
+providers. `strix-hip` additionally declares `libamdhip64-7 (>= 7.1.0) | hip-runtime-amd (>= 7.1.0)`
+(override this additional constraint with `-DSTRIX_PACKAGE_DEB_HIP_DEPENDS=...`). Build-host ROCm package
+requirements are retained; cross-distribution portability is not established. RPM requirements come from
 `rpmbuild`'s automatic library scan (`libamdhip64.so.N`), so they resolve on any RPM distribution that ships ROCm.
 
 ## Install on Linux
@@ -91,9 +92,9 @@ The packages create the `strix` system account and install `strix.service`, but 
 
 1. Put the model where `strix` can read it, e.g. `/var/lib/strix/models/`.
 2. Set `STRIX_MODEL` (first GGUF part) and optional `STRIX_SERVE_ARGS` in `/etc/strix/strix.env`.
-3. Edit `/etc/strix/serve.toml`: every key is an option of `strix-hip-decode-token`; the format, validation and
-   precedence (the command line wins) are in [serve configuration](engine/serving/serve-config.md). The file must
-   not be writable by group or others.
+3. Set HTTP options in `STRIX_SERVE_ARGS` (for example `--http-port 9000`). The unit supplies token `1` for
+   CLI bootstrap and `--http-serve`; requests supply their own prompts. Defaults are `127.0.0.1:8080`.
+   `serve.toml` is a reserved example and is not read by this service.
 4. `sudo systemctl enable --now strix`, then `journalctl -u strix -f`; `curl http://127.0.0.1:8080/health`.
 
 Upgrades keep both files (DEB conffiles, RPM `%config(noreplace)`). Removal stops the service and keeps
@@ -113,7 +114,9 @@ Upgrades keep both files (DEB conffiles, RPM `%config(noreplace)`). Removal stop
    now). The servers are console programs, so a scheduled task runs them without a service wrapper; output goes to
    `%ProgramData%\Strix\logs\strix-serve.log`.
 
-`uninstall.ps1` removes the task, the PATH entry and the program folder, and keeps `%ProgramData%\Strix`.
+`uninstall.ps1` removes recorded, unmodified program files and empty owned directories. It keeps configuration
+(also inside the prefix), added models, pre-existing content and modified files. Installations without an
+ownership manifest are left untouched. Installation refuses collisions with unowned or modified files.
 `strix-start.ps1` passes `--serve-config serve.toml` to a server whose `--help` lists that option; the CUDA servers
 take their options from `serve.args` until they bind the shared serve-config expander.
 
@@ -123,7 +126,7 @@ take their options from `serve.args` until they bind the shared serve-config exp
 |---|---|
 | Linux, installed | `/usr/share/strix/support/smoke-core.sh --require-health` (also `smoke-hip.sh`; add `--model FILE.gguf` for the effective-config check) |
 | Linux, extracted tar.gz | `bash usr/share/strix/support/smoke-core.sh --root DIR` |
-| Windows | `powershell -ExecutionPolicy Bypass -File smoke.ps1` (in the prefix or the extracted ZIP; `-ServeArgs` with model options also checks `/health` of the real server) |
+| Windows | `powershell -ExecutionPolicy Bypass -File smoke.ps1`; Qwen: `-ServeArgs` checks HTTP health. DeepSeek: `-EffectiveConfigArgs` runs `--print-config`; its spool service has no HTTP health endpoint. Unsupported explicit checks fail. |
 
 Checks: every `strix-*` program loads (no missing library or DLL) and answers `--help`; `strix-skeleton-serve`
 answers `GET /health` = 200 without weights; with a model, `strix-hip-decode-token --print-effective-config`

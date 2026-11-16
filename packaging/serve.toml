@@ -1,8 +1,6 @@
-# Strix serve configuration (--serve-config). Linux: /etc/strix/serve.toml; Windows: %ProgramData%\Strix\serve.toml.
-# Every key is a command-line option of the serving binary; the command line wins over this file.
-# Unknown keys, wrong types and inline secrets are refused with FILE:LINE before any weight is read.
-# Keys and rules: docs/engine/serving/serve-config.md. The model path is not set here: the Linux service takes it
-# from STRIX_MODEL in /etc/strix/strix.env, the Windows start script from serve.args.
+# Reserved configuration example. The packaged binaries do not currently read this file.
+# Configure Linux through STRIX_MODEL / STRIX_SERVE_ARGS in strix.env and Windows through serve.args.
+# strix-start.ps1 will use this file only if a future binary advertises --serve-config in --help.
 
 [http]
 serve = true

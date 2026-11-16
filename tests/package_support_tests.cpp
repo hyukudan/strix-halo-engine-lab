@@ -1,6 +1,6 @@
-// The release support matrix (packaging/StrixSupportMatrix.cmake, docs/install.md) must agree with the HIP arch
-// capability layer: every Target in include/strix/hip/arch.hpp is listed, and exactly the qualified ones are
-// listed as qualified. A new qualified target fails here until the packages and the install page say so.
+// Compare the packaging lists with the explicitly enumerated HIP targets below.
+// This does not discover new enum members or validate the installation pages.
+// Platform qualification is separately covered by tests/packaging.
 #include "strix/hip/arch.hpp"
 
 #include <cstdio>

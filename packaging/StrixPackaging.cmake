@@ -125,13 +125,44 @@ install(DIRECTORY "${_strix_pkg_src}/docs/" DESTINATION "${CMAKE_INSTALL_DATADIR
     PATTERN "coord" EXCLUDE PATTERN "decisions" EXCLUDE)
 # Post-install smoke test, one copy per package so each package can be checked alone.
 if(WIN32)
+    # Launcher and smoke share the installed backend's actual CLI contracts.
+    if(STRIX_CUDA_DS41_ONLY)
+        set(_strix_server "strix-cuda-ds41-replica")
+        set(_strix_inspect "--print-config")
+        set(_strix_health false)
+    else()
+        set(_strix_server "strix-cuda-qwen-serve")
+        set(_strix_inspect "")
+        set(_strix_health true)
+    endif()
+    file(WRITE "${_strix_pkg_out}/server.json"
+        "{\"binary\":\"${_strix_server}\",\"inspect\":\"${_strix_inspect}\",\"health\":${_strix_health}}\n")
+    install(FILES "${_strix_pkg_out}/server.json" DESTINATION "${CMAKE_INSTALL_DATADIR}/strix/support" COMPONENT cuda)
     install(FILES "${_strix_pkg_dir}/windows/smoke.ps1" DESTINATION "." COMPONENT cuda)
 else()
-    foreach(_c IN ITEMS core hip cuda)
+    foreach(_c IN ITEMS core tools hip cuda)
         install(PROGRAMS "${_strix_pkg_dir}/smoke.sh" DESTINATION "${CMAKE_INSTALL_DATADIR}/strix/support"
             RENAME "smoke-${_c}.sh" COMPONENT ${_c})
     endforeach()
 endif()
+
+# Expected executable sets come from the same target selection as the install rules.
+foreach(_c IN ITEMS core tools hip cuda)
+    set(_expected "")
+    foreach(_entry IN LISTS _strix_pkg_installed)
+        if(_entry MATCHES "^${_c}:(.+)$")
+            string(APPEND _expected "${CMAKE_MATCH_1}${CMAKE_EXECUTABLE_SUFFIX}\n")
+        endif()
+    endforeach()
+    if(_c STREQUAL "tools" AND NOT WIN32)
+        string(APPEND _expected "strix-bitcalc-cmp\n")
+    endif()
+    if(NOT _expected STREQUAL "")
+        file(WRITE "${_strix_pkg_out}/executables-${_c}.txt" "${_expected}")
+        install(FILES "${_strix_pkg_out}/executables-${_c}.txt"
+            DESTINATION "${CMAKE_INSTALL_DATADIR}/strix/support" COMPONENT ${_c})
+    endif()
+endforeach()
 
 # ---- build receipt (backend, archs and their qualification) ---------------------------------------------------
 find_package(Git QUIET)
@@ -298,9 +329,8 @@ else()
     set(CPACK_DEBIAN_PACKAGE_SECTION "science")
     set(CPACK_DEBIAN_PACKAGE_CONTROL_STRICT_PERMISSION TRUE)
     find_program(STRIX_DPKG_SHLIBDEPS dpkg-shlibdeps)
-    # strix-hip declares the tested ROCm range instead of what dpkg-shlibdeps finds on the build host (that pins the
-    # host's ROCm generation package, e.g. amdrocm-runtime10.1): the distribution's libamdhip64-7 or AMD's
-    # hip-runtime-amd, HIP 7.1 or newer (the HIP 7 DMA-BUF path; tested with HIP 7.16).
+    # Keep the toolchain's versioned ABI requirements, including the actual HIP SONAME provider.
+    # The tested HIP range supplements the scan; it must never replace it.
     set(STRIX_PACKAGE_DEB_HIP_DEPENDS "libamdhip64-7 (>= 7.1.0) | hip-runtime-amd (>= 7.1.0)" CACHE STRING
         "DEB Depends of strix-hip on the ROCm runtime (tested range)")
     set(_strix_deb_cxx_explicit "libc6, libstdc++6, libgcc-s1, ")
@@ -314,8 +344,12 @@ else()
     set(CPACK_DEBIAN_CORE_PACKAGE_DEPENDS "${_strix_deb_cxx}")
     string(REGEX REPLACE ", $" "" CPACK_DEBIAN_CORE_PACKAGE_DEPENDS "${CPACK_DEBIAN_CORE_PACKAGE_DEPENDS}")
     set(CPACK_DEBIAN_TOOLS_PACKAGE_DEPENDS "${_strix_deb_cxx}python3, python3-numpy")
-    set(CPACK_DEBIAN_HIP_PACKAGE_SHLIBDEPS OFF)
-    set(CPACK_DEBIAN_HIP_PACKAGE_DEPENDS "${_strix_deb_cxx_explicit}${STRIX_PACKAGE_DEB_HIP_DEPENDS}")
+    if(STRIX_PACKAGE_BACKEND STREQUAL "hip" AND STRIX_DPKG_DEB AND
+       (NOT STRIX_DPKG_SHLIBDEPS OR NOT EXISTS "/etc/debian_version"))
+        message(FATAL_ERROR "HIP DEBs require dpkg-shlibdeps and a Debian shlibs database")
+    endif()
+    set(CPACK_DEBIAN_HIP_PACKAGE_SHLIBDEPS ON)
+    set(CPACK_DEBIAN_HIP_PACKAGE_DEPENDS "${STRIX_PACKAGE_DEB_HIP_DEPENDS}")
     set(CPACK_DEBIAN_CUDA_PACKAGE_DEPENDS "${CPACK_DEBIAN_CORE_PACKAGE_DEPENDS}")
     set(CPACK_DEBIAN_HIP_PACKAGE_SUGGESTS "strix-core, strix-tools, strix-docs")
     set(CPACK_DEBIAN_DOCS_PACKAGE_ARCHITECTURE all)

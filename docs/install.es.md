@@ -58,10 +58,10 @@ La ruta de exportación DMA-BUF de HIP necesita HIP 7 o posterior; con cabeceras
 soportado". La memoria por modelo y los ajustes del host que la ayudan están en
 [presupuesto de memoria](operations/memory-budget.md); los paquetes nunca cambian kernel, GTT, IOMMU ni arranque.
 
-Las dependencias DEB de `strix-core` y `strix-tools` salen de `dpkg-shlibdeps`. `strix-hip` declara el rango
-ROCm probado en lugar de los paquetes ROCm del host de compilación:
-`libamdhip64-7 (>= 7.1.0) | hip-runtime-amd (>= 7.1.0)` (distribución o repositorio de AMD; se cambia con
-`-DSTRIX_PACKAGE_DEB_HIP_DEPENDS=...`). Los requisitos RPM salen del
+Las dependencias ABI de los ejecutables DEB salen de `dpkg-shlibdeps`, incluidos los runtimes C/C++ con versión
+y los proveedores del SONAME HIP. `strix-hip` añade `libamdhip64-7 (>= 7.1.0) | hip-runtime-amd (>= 7.1.0)`
+(esta restricción adicional se cambia con `-DSTRIX_PACKAGE_DEB_HIP_DEPENDS=...`). Se conservan los requisitos
+ROCm del host; no se establece portabilidad entre distribuciones. Los requisitos RPM salen del
 análisis automático de bibliotecas de `rpmbuild` (`libamdhip64.so.N`) y se resuelven en cualquier distribución RPM
 con ROCm.
 
@@ -94,9 +94,9 @@ Los paquetes crean la cuenta de sistema `strix` e instalan `strix.service`, pero
 
 1. Colocar el modelo donde `strix` pueda leerlo, p. ej. `/var/lib/strix/models/`.
 2. Fijar `STRIX_MODEL` (primera parte GGUF) y, si hace falta, `STRIX_SERVE_ARGS` en `/etc/strix/strix.env`.
-3. Editar `/etc/strix/serve.toml`: cada clave es una opción de `strix-hip-decode-token`; formato, validación y
-   precedencia (gana la línea de órdenes) en [configuración de servicio](engine/serving/serve-config.md). El
-   fichero no puede ser escribible por grupo u otros.
+3. Fijar las opciones HTTP en `STRIX_SERVE_ARGS` (por ejemplo `--http-port 9000`). La unidad pasa el token `1`
+   para iniciar el CLI y `--http-serve`; cada petición aporta su propio prompt. Por defecto: `127.0.0.1:8080`.
+   `serve.toml` es un ejemplo reservado y este servicio no lo lee.
 4. `sudo systemctl enable --now strix`, luego `journalctl -u strix -f`; `curl http://127.0.0.1:8080/health`.
 
 Las actualizaciones conservan ambos ficheros (conffiles en DEB, `%config(noreplace)` en RPM). Al desinstalar se
@@ -116,7 +116,9 @@ para el servicio y se conservan `/etc/strix`, `/var/lib/strix` y la cuenta.
    arranca ahora). Los servidores son programas de consola, así que una tarea programada los ejecuta sin envoltorio
    de servicio; la salida va a `%ProgramData%\Strix\logs\strix-serve.log`.
 
-`uninstall.ps1` quita la tarea, la entrada del PATH y la carpeta de programas, y conserva `%ProgramData%\Strix`.
+`uninstall.ps1` elimina los ficheros registrados sin modificar y los directorios propios vacíos. Conserva la
+configuración (también dentro del prefijo), modelos añadidos, contenido previo y ficheros modificados. Sin
+manifiesto de propiedad no elimina nada. La instalación rechaza colisiones con ficheros ajenos o modificados.
 `strix-start.ps1` pasa `--serve-config serve.toml` a un servidor cuyo `--help` liste esa opción; los servidores
 CUDA toman sus opciones de `serve.args` hasta que enlacen el expansor compartido de serve-config.
 
@@ -126,7 +128,7 @@ CUDA toman sus opciones de `serve.args` hasta que enlacen el expansor compartido
 |---|---|
 | Linux, instalado | `/usr/share/strix/support/smoke-core.sh --require-health` (también `smoke-hip.sh`; `--model FICHERO.gguf` añade la comprobación de configuración efectiva) |
 | Linux, tar.gz extraído | `bash usr/share/strix/support/smoke-core.sh --root DIR` |
-| Windows | `powershell -ExecutionPolicy Bypass -File smoke.ps1` (en el prefijo o en el ZIP extraído; `-ServeArgs` con las opciones del modelo comprueba también `/health` del servidor real) |
+| Windows | `powershell -ExecutionPolicy Bypass -File smoke.ps1`; Qwen: `-ServeArgs` comprueba HTTP. DeepSeek: `-EffectiveConfigArgs` ejecuta `--print-config`; su servicio de cola no ofrece HTTP. Las comprobaciones explícitas no compatibles fallan. |
 
 Comprueba: cada programa `strix-*` carga (sin biblioteca o DLL ausente) y responde a `--help`;
 `strix-skeleton-serve` responde `GET /health` = 200 sin pesos; con un modelo, `strix-hip-decode-token

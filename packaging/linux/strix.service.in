@@ -13,7 +13,8 @@ SupplementaryGroups=render video
 EnvironmentFile=@STRIX_PKG_SYSCONFDIR@/strix.env
 StateDirectory=strix
 WorkingDirectory=/var/lib/strix
-ExecStart=@STRIX_PKG_BINDIR@/strix-hip-decode-token ${STRIX_MODEL} --serve-config @STRIX_PKG_SYSCONFDIR@/serve.toml $STRIX_SERVE_ARGS
+# Token 1 satisfies the CLI bootstrap contract; HTTP requests supply their own prompts.
+ExecStart=@STRIX_PKG_BINDIR@/strix-hip-decode-token ${STRIX_MODEL} 1 --http-serve $STRIX_SERVE_ARGS
 Restart=on-failure
 RestartSec=5
 NoNewPrivileges=true

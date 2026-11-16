@@ -6,6 +6,29 @@
 # strix-skeleton-serve answers GET /health = 200 without weights; with --model, strix-hip-decode-token
 # --print-effective-config resolves the model. Prints one PASS/FAIL/SKIP line per check; exit 1 on any FAIL.
 set -u
+# Shared CI entry point: listing errors must fail before the forbidden-content search.
+if [ "${1:-}" = "--check-packages" ]; then
+    [ $# -eq 2 ] || exit 2
+    listing=$(mktemp) || exit 1
+    trap 'rm -f "$listing"' EXIT
+    count=0
+    for package in "$2"/strix-*.deb "$2"/strix-*.rpm "$2"/strix-*.tar.gz "$2"/strix-*.zip; do
+        [ -f "$package" ] || continue
+        count=$((count + 1))
+        case "$package" in
+            *.deb) dpkg-deb -c "$package" >>"$listing" || exit 1 ;;
+            *.rpm) rpm -qlp "$package" >>"$listing" || exit 1 ;;
+            *.tar.gz) tar -tzf "$package" >>"$listing" || exit 1 ;;
+            *.zip) unzip -Z1 "$package" >>"$listing" || exit 1 ;;
+        esac
+    done
+    [ "$count" -gt 0 ] || { echo 'FAIL no packages to inspect'; exit 1; }
+    grep -E '(^|/)(lab|artifacts)/|\.gguf$|\.safetensors$|mmproj' "$listing"
+    result=$?
+    [ "$result" -eq 1 ] || { echo 'FAIL forbidden content or listing search error'; exit 1; }
+    echo "PASS inspected $count packages"
+    exit 0
+fi
 root=/ prefix=/usr port=18080 model="" require_health=0
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -26,8 +49,19 @@ fail() { fails=$((fails + 1)); echo "FAIL $*"; }
 skip() { echo "SKIP $*"; }
 
 [ -d "$bindir" ] || { echo "FAIL no bin directory at $bindir"; exit 1; }
+expected=0 checked=0
+for manifest in "$datadir"/support/executables-*.txt; do
+    [ -f "$manifest" ] || continue
+    while IFS= read -r name; do
+        [ -n "$name" ] || continue
+        expected=$((expected + 1))
+        [ -x "$bindir/$name" ] || fail "expected executable missing: $name"
+    done <"$manifest"
+done
+[ "$expected" -gt 0 ] || fail 'no expected executable manifest installed'
 for exe in "$bindir"/strix-*; do
     [ -x "$exe" ] || continue
+    checked=$((checked + 1))
     name=$(basename "$exe")
     if file -b "$exe" 2>/dev/null | grep -q ELF && command -v ldd >/dev/null 2>&1; then
         missing=$(ldd "$exe" 2>/dev/null | grep "not found" | head -3 | tr -s ' \t' ' ')
@@ -36,22 +70,42 @@ for exe in "$bindir"/strix-*; do
     out=$(timeout 30 "$exe" --help 2>&1 </dev/null); rc=$?
     if [ $rc -eq 124 ] || [ $rc -ge 128 ]; then
         fail "$name --help: rc=$rc (timeout or signal)"
-    elif [ $rc -eq 0 ] || printf '%s' "$out" | grep -qiE "usage|options"; then
+    elif [ $rc -eq 0 ]; then
         pass "$name --help (rc=$rc)"
+    elif { [ $rc -eq 1 ] || [ $rc -eq 2 ]; } &&
+         printf '%s' "$out" | grep -qiE '^(error: )?usage: ' &&
+         ! printf '%s' "$out" | grep -qiE 'Traceback|ImportError|ModuleNotFoundError'; then
+        pass "$name usage (rc=$rc)"
     elif printf '%s' "$out" | grep -qiE "error while loading shared libraries|symbol lookup error"; then
         fail "$name --help: rc=$rc: $(printf '%s' "$out" | head -2 | tr '\n' ' ' | cut -c1-160)"
-    elif printf '%s' "$out" | grep -qiE "device gate: refusing to start: cannot enumerate"; then
+    elif [ $rc -eq 1 ] && printf '%s' "$out" | grep -qiE "device gate: refusing to start: cannot enumerate"; then
         # Libraries resolved and the start gate ran; with no visible GPU nothing more can run (HIP mains bind first).
         nogpu=$((nogpu + 1))
         pass "$name loads (no visible GPU: the device gate refused before --help)"
-    elif [ -n "$out" ]; then
-        # The program loaded and its own parser answered (it has no --help yet): the package is intact.
-        nohelp=$((nohelp + 1))
-        pass "$name loads (no --help: $(printf '%s' "$out" | head -1 | cut -c1-100))"
     else
-        fail "$name --help: rc=$rc and no output"
+        # Only these known no-help responses establish that the program loaded.
+        parser_ok=0
+        if [ $rc -eq 1 ]; then
+            case "$name:$out" in
+                'strix-inspect-gguf:error: cannot open GGUF file'|\
+                'strix-model-manifest:error: cannot open GGUF file'|\
+                'strix-memory-plan:error: unknown argument: --help') parser_ok=1 ;;
+            esac
+            if [ "$name" = strix-deepseek41-expert-server ]; then
+                case "$out" in
+                    $'{"event":"POISONED","error":"unknown option --help"}\nerror: unknown option --help'|\
+                    $'error: unknown option --help\n{"event":"POISONED","error":"unknown option --help"}') parser_ok=1 ;;
+                esac
+            fi
+        fi
+        if [ "$parser_ok" -eq 1 ]; then
+            nohelp=$((nohelp + 1)); pass "$name known parser response (rc=$rc)"
+        else
+            fail "$name --help: rc=$rc: $(printf '%s' "$out" | head -2 | tr '\n' ' ' | cut -c1-160)"
+        fi
     fi
 done
+[ "$checked" -gt 0 ] || fail 'no executables checked'
 
 probe() {
     if command -v curl >/dev/null 2>&1; then

@@ -28,9 +28,8 @@ if (Test-Path $argsFile) {
     }
 }
 if ($Binary -eq '') {
-    foreach ($candidate in 'strix-cuda-qwen-serve', 'strix-cuda-ds41-replica') {
-        if (Test-Path (Join-Path $bin "$candidate.exe")) { $Binary = $candidate; break }
-    }
+    $metadata = Get-Content -LiteralPath (Join-Path $PSScriptRoot 'share\strix\support\server.json') -Raw | ConvertFrom-Json
+    $Binary = $metadata.binary
 }
 $exe = Join-Path $bin "$Binary.exe"
 if (-not (Test-Path $exe)) { throw "strix-start.ps1: no server binary '$Binary' in $bin" }

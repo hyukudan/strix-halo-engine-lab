@@ -22,11 +22,53 @@ $ErrorActionPreference = 'Stop'
 $src = $PSScriptRoot
 if (-not (Test-Path (Join-Path $src 'bin'))) { throw "install.ps1: run it from the extracted package (no bin\ next to it)" }
 
-New-Item -ItemType Directory -Force -Path $Prefix | Out-Null
-foreach ($dir in 'bin', 'share') {
-    if (Test-Path (Join-Path $src $dir)) { Copy-Item -Recurse -Force -Path (Join-Path $src $dir) -Destination $Prefix }
+$Prefix = [IO.Path]::GetFullPath($Prefix).TrimEnd('\')
+$ConfigDir = [IO.Path]::GetFullPath($ConfigDir).TrimEnd('\')
+$manifestPath = Join-Path $Prefix 'install-manifest.json'
+$previous = @{}
+$old = $null
+if (Test-Path -LiteralPath $manifestPath) {
+    $old = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json
+    foreach ($entry in $old.Files) { $previous[$entry.Path] = $entry.Sha256 }
 }
-Copy-Item -Force -Path (Join-Path $src '*.ps1') -Destination $Prefix
+$files = @(foreach ($dir in 'bin', 'share') {
+    Get-ChildItem -LiteralPath (Join-Path $src $dir) -File -Recurse -ErrorAction SilentlyContinue
+}) + @(Get-ChildItem -Path (Join-Path $src '*.ps1') -File)
+# Preflight all destinations; do not adopt or overwrite unrelated files.
+foreach ($file in $files) {
+    $relative = $file.FullName.Substring($src.Length + 1)
+    $dst = Join-Path $Prefix $relative
+    if ($dst -eq $ConfigDir -or $dst.StartsWith($ConfigDir + '\', [StringComparison]::OrdinalIgnoreCase)) {
+        throw "configuration overlaps an installed file: $dst"
+    }
+    for ($dir = $dst; $dir; $dir = Split-Path $dir) {
+        if ((Test-Path -LiteralPath $dir) -and
+            ((Get-Item -LiteralPath $dir).Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+            throw "installation path traverses a reparse point: $dir"
+        }
+    }
+    if ((Test-Path -LiteralPath $dst) -and
+        (-not $previous.ContainsKey($relative) -or
+         (Get-FileHash -LiteralPath $dst).Hash -ne $previous[$relative])) {
+        throw "refusing to overwrite unowned or modified file: $dst"
+    }
+}
+if ((Test-Path -LiteralPath (Join-Path $Prefix 'install.txt')) -and -not $previous.ContainsKey('install.txt')) {
+    throw 'existing install.txt has no ownership manifest; leave the old installation intact'
+}
+$ownedDirs = @()
+if ($old) { $ownedDirs += @($old.Directories) }
+foreach ($file in $files) {
+    $relative = $file.FullName.Substring($src.Length + 1)
+    $dst = Join-Path $Prefix $relative
+    for ($dir = Split-Path $dst; $dir -and -not (Test-Path -LiteralPath $dir); $dir = Split-Path $dir) {
+        if ($dir -eq $Prefix) { $ownedDirs += '.'; break }
+        $ownedDirs += $dir.Substring($Prefix.Length + 1)
+    }
+    New-Item -ItemType Directory -Force -Path (Split-Path $dst) | Out-Null
+    Copy-Item -LiteralPath $file.FullName -Destination $dst -Force
+    $previous[$relative] = (Get-FileHash -LiteralPath $dst).Hash
+}
 
 New-Item -ItemType Directory -Force -Path $ConfigDir | Out-Null
 foreach ($name in 'serve.toml', 'serve.args', 'devices.example.toml') {
@@ -61,5 +103,13 @@ $build = Get-ChildItem -Path (Join-Path $Prefix 'share\strix\support') -Filter '
     Select-Object -First 1
 if ($build) { $receipt += Get-Content $build.FullName -TotalCount 4 }
 Set-Content -Path (Join-Path $Prefix 'install.txt') -Value $receipt
+$previous['install.txt'] = (Get-FileHash -LiteralPath (Join-Path $Prefix 'install.txt')).Hash
+$manifest = @{
+    ConfigDir = $ConfigDir
+    RegisteredTask = [bool]($RegisterTask -or ($old -and $old.RegisteredTask))
+    Directories = @($ownedDirs | Select-Object -Unique)
+    Files = @(foreach ($name in $previous.Keys) { @{ Path = $name; Sha256 = $previous[$name] } })
+}
+$manifest | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $manifestPath
 Write-Host "installed to $Prefix; edit $ConfigDir\serve.args (model paths), then run strix-start.ps1"
 Write-Host "smoke test: powershell -ExecutionPolicy Bypass -File `"$Prefix\smoke.ps1`""
