@@ -29,7 +29,7 @@ Status decode_channel(const WeightView& view,const std::vector<Byte>& raw,std::v
  const auto rows=view.shape.dims[0],width=view.shape.dims[1];
  std::vector<float> channel;
  auto status=float_sidecar(view,"channel_scales",rows,channel); if(!status) return status;
- for(float scale:channel) if(!std::isfinite(scale) || scale<0) return {Error::malformed,"channel scale must be nonnegative finite"};
+ for(float scale:channel) if(!std::isfinite(scale)) return {Error::malformed,"channel scale must be finite"};
  if(view.storage.name=="linear.i8-channel-convrot256") {
   for(std::size_t i=0;i<out.size();++i) out[i]=float(static_cast<std::int8_t>(std::to_integer<std::uint8_t>(raw[i])))*channel[i/width];
   return {Error::ok,{}};

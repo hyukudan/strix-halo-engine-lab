@@ -3,14 +3,18 @@
 namespace strix::weight::detail {
 namespace {
 Status geometry(const Parameters& p,Geometry& out) {
- if(p.bits!=4 && p.bits!=5 && p.bits!=6 && p.bits!=8) return {Error::malformed,"EXL3 bits must be 4,5,6,8"};
+ if(p.bits<1 || p.bits>8) return {Error::malformed,"EXL3 bits must be in 1..8"};
  out={256,32*p.bits,16,16,16,16,1,false}; return {Error::ok,{}};
+}
+Status gemma_geometry(const Parameters& p,Geometry& out) {
+ if(p.bits!=4 && p.bits!=5 && p.bits!=6 && p.bits!=8) return {Error::malformed,"Gemma EXL3 bits must be 4,5,6,8"};
+ return geometry(p,out);
 }
 }
 std::span<const FormatDescriptor> exl3_formats() {
  static const FormatDescriptor formats[] = {
   descriptor({"exl3.mul1.tiles16",1},"EXL3:mul1:tiles16",transformed_linear,true,geometry),
-  descriptor({"exl3.gemma.transport",1},"Gemma:EXL3:contiguous",transformed_linear,true,geometry)
+  descriptor({"exl3.gemma.transport",1},"Gemma:EXL3:contiguous",transformed_linear,true,gemma_geometry)
  };
  return formats;
 }

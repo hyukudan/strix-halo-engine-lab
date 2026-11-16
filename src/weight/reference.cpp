@@ -62,7 +62,7 @@ Status validate_special(const WeightView& view) {
  if(name.starts_with("linear.")) {
   if(view.shape.rank!=2 || width%256 || view.parameters.transform!="convrot256") return {Error::unsupported_shape,"channel quant requires K multiple of 256 and convrot256"};
   status=required(view,"channel_scales",Scalar::f32,{{rows,0,0,0},1},part); if(!status) return status;
-  status=scan(part->data,4,nonnegative_f32); if(!status) return status;
+  status=scan(part->data,4,finite_f32); if(!status) return status;
   if(name=="linear.w4a8-grouped") {
    const auto group=view.parameters.group_size;
    if(!group || width%group) return {Error::unsupported_shape,"W4A8 group does not divide K"};
@@ -81,6 +81,11 @@ Status validate_special(const WeightView& view) {
  if(name.starts_with("exl3.")) {
   if(view.shape.rank!=2 || width%128 || rows%128 || view.parameters.transform!="hadamard128") return {Error::unsupported_shape,"EXL3 requires declared H128 transform geometry"};
   if(name=="exl3.mul1.tiles16") {
+   status=required(view,"codebook_marker",Scalar::i32,{{1,0,0,0},1},part); if(!status) return status;
+   status=scan(part->data,4,[](const Byte* p) {
+    return std::to_integer<unsigned>(p[0])==0x2d && std::to_integer<unsigned>(p[1])==0xd1 &&
+           std::to_integer<unsigned>(p[2])==0xdc && std::to_integer<unsigned>(p[3])==0x83;
+   }); if(!status) return status;
    status=required(view,"input_scale",Scalar::f16,{{width,0,0,0},1},part); if(!status) return status;
    status=scan(part->data,2,finite_half); if(!status) return status;
    status=required(view,"output_scale",Scalar::f16,{{rows,0,0,0},1},part); if(!status) return status;

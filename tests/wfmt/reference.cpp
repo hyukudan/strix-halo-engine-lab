@@ -73,6 +73,7 @@ WeightView fixture(const FormatDescriptor& format,std::uint32_t seed) {
   const auto scales=halves(rows+width); std::copy(scales.begin(),scales.end(),raw.begin());
  }
  if(name=="exl3.mul1.tiles16") {
+  view.sidecars.push_back(named("codebook_marker",Scalar::i32,{{1,0,0,0},1},{Byte{0x2d},Byte{0xd1},Byte{0xdc},Byte{0x83}}));
   view.sidecars.push_back(named("input_scale",Scalar::f16,{{width,0,0,0},1},halves(width)));
   view.sidecars.push_back(named("output_scale",Scalar::f16,{{rows,0,0,0},1},halves(rows)));
  }
@@ -181,5 +182,61 @@ bool run_references(std::string_view directory) {
  return true;
 }
 }
-bool wfmt_reference_test() { return run_references({}); }
+bool wfmt_reference_test() {
+ if(!run_references({})) return false;
+ // Exhaustive scalar encodings exercise signed zeros, supported subnormals,
+ // infinities and every NaN payload through the unchanged widening delegate.
+ std::vector<std::uint16_t> encodings(65536);
+ for(unsigned i=0;i<encodings.size();++i) encodings[i]=static_cast<std::uint16_t>(i);
+ for(auto id:{FormatId{"plain.f16",1},FormatId{"plain.bf16",1}}) {
+  const auto* format=find_format(builtin_registry(),id); if(!format) return false;
+  auto view=fixture(*format,0); view.shape=matrix(1,encodings.size());
+  view.payload=memory(bytes_of(std::span<const std::uint16_t>(encodings)));
+  std::vector<float> old; if(!legacy_decode(view,old)) return false;
+  std::vector<Byte> bytes(old.size()*4); DecodeBuffer output{bytes,0};
+  if(!decode_reference(builtin_registry(),view,{0,old.size(),{},Scalar::f32},output) ||
+     !std::equal(bytes.begin(),bytes.end(),std::as_bytes(std::span(old)).begin())) return false;
+ }
+ const auto* fp4=find_format(builtin_registry(),{"nvidia.nvfp4",1}); if(!fp4) return false;
+ for(unsigned scale=0;scale<256;++scale) for(unsigned code=0;code<16;++code) {
+  auto view=fixture(*fp4,0);
+  view.payload=memory(std::vector<Byte>(32,Byte(code|(code<<4))));
+  view.sidecars[0].data=memory(std::vector<Byte>(4,Byte(scale)));
+  std::vector<Byte> bytes(64*4); DecodeBuffer output{bytes,0};
+  const auto status=decode_reference(builtin_registry(),view,{0,64,{},Scalar::f32},output);
+  if(scale>=127) { if(status) return false; continue; }
+  if(!status) return false;
+  namespace nv=strix::cuda::core::nvfp4;
+  const float value=(nv::e2m1(static_cast<std::uint8_t>(code))*nv::e4m3(static_cast<std::uint8_t>(scale)))*1.0F;
+  for(unsigned i=0;i<64;++i) if(std::memcmp(bytes.data()+4*i,&value,4)) return false;
+ }
+ const auto* trellis=find_format(builtin_registry(),{"exl3.mul1.tiles16",1}); if(!trellis) return false;
+ for(unsigned bits=1;bits<=8;++bits) {
+  auto view=fixture(*trellis,0); view.parameters.bits=bits;
+  if(!trellis->geometry(view.parameters,view.geometry)) return false;
+  view.payload=memory(seeded(view.shape.dims[0]*view.shape.dims[1]*bits/8,bits));
+  std::vector<float> old; if(!legacy_decode(view,old)) return false;
+  std::vector<Byte> bytes(old.size()*4); DecodeBuffer output{bytes,0};
+  if(!decode_reference(builtin_registry(),view,{0,old.size(),{},Scalar::f32},output) ||
+     !std::equal(bytes.begin(),bytes.end(),std::as_bytes(std::span(old)).begin())) return false;
+ }
+ for(const auto& format:builtin_registry().formats) {
+  if(!format.semantic_decode_supported) continue;
+  auto view=fixture(format,1); view.payload.range.offset=UINT64_MAX;
+  if(validate_weight(view)) return false;
+  view=fixture(format,1); ++view.shape.dims[view.shape.rank-1];
+  if(validate_weight(view)) return false;
+  view=fixture(format,1);
+  if(!view.sidecars.empty()) {
+   auto missing=view; missing.sidecars.erase(missing.sidecars.begin());
+   if(validate_weight(missing)) return false;
+   auto wrong=view; wrong.sidecars[0].scalar=Scalar::f64;
+   if(validate_weight(wrong)) return false;
+   auto duplicate=view; duplicate.sidecars.push_back(view.sidecars[0]);
+   if(validate_weight(duplicate)) return false;
+  }
+ }
+ std::cout << "exhaustive-F16/BF16=131072 NVFP4-code-scale=4096 trellis-bits=1..8 malformed-schema PASS\n";
+ return true;
+}
 bool wfmt_reference_capture(std::string_view directory) { return run_references(directory); }
