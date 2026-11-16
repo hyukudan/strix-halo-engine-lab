@@ -324,7 +324,7 @@ static void gpu_projection_synthetic() {
     for (const auto& cs : kCases) {
         std::vector<std::vector<std::uint8_t>> w;
         for (std::size_t m = 0; m < cs.outs.size(); ++m) w.push_back(make_q8(cs.outs[m], cs.width, 1000U * ci + m));
-        for (std::uint32_t rows : {1U, 5U, 64U, 130U, 256U, 1000U, 4096U})
+        for (std::uint32_t rows : {1U, 5U, 8U, 9U, 13U, 16U, 64U, 130U, 256U, 1000U, 4096U})
             total += run_projection(cs, w, rows, 77U * rows + ci, true, 136U);
         ++ci;
     }
@@ -495,6 +495,52 @@ static void bench() {
     std::printf("bench quantize 8192 x 2560 (bf16): %.3f ms/iter\n", ms / iters);
 }
 
+// --bench-rows: decode-shaped projections (the Qwen sites, rows 1/8/9/16) with L2-cold weights: the weights rotate over
+// copies totalling >= 384 MB (the sm_120 L2 holds a whole site). STRIX_QRTX_DENSE_ROWS16=0/1 picks the 9..16 form.
+static void bench_rows() {
+    for (const auto& cs : kCases) {
+        std::size_t bytes = 0;
+        for (auto o : cs.outs) bytes += static_cast<std::size_t>(o) * (cs.width / 32U) * 34U;
+        const int copies = static_cast<int>((384ULL << 20) / bytes + 1U);
+        std::vector<std::unique_ptr<Dev<std::uint8_t>>> w;
+        for (int c = 0; c < copies; ++c)
+            for (std::size_t m = 0; m < cs.outs.size(); ++m) w.push_back(std::make_unique<Dev<std::uint8_t>>(make_q8(cs.outs[m], cs.width, 100U * c + m)));
+        const std::uint32_t rmax = 16U, width = cs.width;
+        const auto x = make_rows(rmax, width, true, 9, false);
+        Dev<std::uint16_t> in(to_bf16(x));
+        Dev<std::int8_t> codes(static_cast<std::size_t>(rmax) * width);
+        Dev<float> deltas(static_cast<std::size_t>(width / 32U) * rmax);
+        std::vector<std::unique_ptr<Dev<float>>> outs;
+        for (auto o : cs.outs) outs.push_back(std::make_unique<Dev<float>>(static_cast<std::size_t>(rmax) * o));
+        std::vector<float> g(rmax * 3U, 0.5F);
+        Dev<float> gate(g);
+        CK(qd::quantize(nullptr, rmax, width, qd::Input::bf16, in.p, width, codes.p, deltas.p, rmax));
+        std::vector<qd::Site> sites(copies);
+        for (int c = 0; c < copies; ++c) {
+            auto& site = sites[c];
+            site.store = cs.store; site.width = width; site.segments = static_cast<std::uint32_t>(cs.outs.size());
+            for (std::size_t m = 0; m < cs.outs.size(); ++m)
+                site.segment[m] = {w[c * cs.outs.size() + m]->p, cs.outs[m], outs[m]->p, cs.outs[m]};
+            if (cs.store == qd::Store::bf16_gated) { site.gate = gate.p; site.gate_stride = 3U; }
+        }
+        cudaEvent_t a, b;
+        CK(cudaEventCreate(&a)); CK(cudaEventCreate(&b));
+        for (std::uint32_t rows : {1U, 8U, 9U, 16U}) {
+            for (int c = 0; c < copies; ++c) CK(qd::project(nullptr, sites[c], rows, codes.p, deltas.p, rmax));
+            const int iters = 40 * copies;
+            CK(cudaEventRecord(a));
+            for (int i = 0; i < iters; ++i) CK(qd::project(nullptr, sites[i % copies], rows, codes.p, deltas.p, rmax));
+            CK(cudaEventRecord(b)); CK(cudaEventSynchronize(b));
+            float ms = 0; CK(cudaEventElapsedTime(&ms, a, b));
+            const double us = 1000.0 * ms / iters;
+            std::printf("bench-rows %-16s rows %2u: %7.2f us/call  %6.0f GB/s (weights %.1f MB)
+", cs.name, rows, us,
+                        static_cast<double>(bytes) / (us * 1e-6) / 1e9, bytes / 1e6);
+        }
+        CK(cudaEventDestroy(a)); CK(cudaEventDestroy(b));
+    }
+}
+
 static void list_fixture(const std::string& path) {
     strix::qwen_fixture::Dump dump(path);
     std::map<std::tuple<std::uint32_t, bool, std::uint32_t>, const strix::qwen_fixture::Record*> first;
@@ -559,12 +605,13 @@ static void replay_shared(const std::string& path, const strix::qwen_gguf::Model
 }
 
 int main(int argc, char** argv) {
-    bool gpu = false, do_bench = false;
+    bool gpu = false, do_bench = false, do_bench_rows = false;
     std::string fixture;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         if (a == "--gpu") gpu = true;
         else if (a == "--bench") do_bench = true;
+        else if (a == "--bench-rows") do_bench_rows = true;
         else if (a == "--fixture" && i + 1 < argc) fixture = argv[++i];
     }
     host_tests();
@@ -597,7 +644,7 @@ int main(int argc, char** argv) {
         std::printf("note: gguf unavailable (%s); real-weight tests skipped\n", e.what());
         model.reset();
     }
-    if (gpu || do_bench) {
+    if (gpu || do_bench || do_bench_rows) {
         CK(cudaSetDevice(0));
         cudaDeviceProp p{};
         CK(cudaGetDeviceProperties(&p, 0));
@@ -618,6 +665,7 @@ int main(int argc, char** argv) {
         std::printf("gpu tests %.1f s\n", std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
     }
     if (do_bench) bench();
+    if (do_bench_rows) bench_rows();
     if (!fixture.empty()) {
         if (std::getenv("QWEN_DENSE_LIST")) list_fixture(fixture);
         if (model) {
