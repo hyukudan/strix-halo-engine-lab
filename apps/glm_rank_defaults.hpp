@@ -455,8 +455,8 @@ inline std::string print(const Effective& e) {
         }
         s += std::string("effective env ") + it.env + "=" + v.value + " (" + v.source + ", item " + it.name + resolved + ")\n";
     }
-    if (e.product) s += e.product->describe();
     s += strix::weight::family_plan_notice(e.weight_plans);
+    if (e.product) s += e.product->describe();
     return s;
 }
 
