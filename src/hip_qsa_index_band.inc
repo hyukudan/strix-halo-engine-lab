@@ -80,21 +80,57 @@ __global__ __launch_bounds__(1024) void key_norm_max_kernel(const void* keys, bo
     m = idx::group_reduce(m, slots, [](float x, float y) { return fmaxf(x, y); });
     if (threadIdx.x == 0U) *bound = m;
 }
-__device__ __forceinline__ float band_exact_score(const BandRow& row, const BandState& state, unsigned b) {
-    float k[kDim];
-    band_load_key(row.keys, row.packed, b, k);
-    unsigned lo = 0xffffffffU, hi = 0U;
-    const unsigned first = b & ~31U;
-    // Match score_kernel's 32-block tile, clipped to the LAUNCH's scored prefix,
-    // not the row's visible prefix. Replicating the last range changes no extrema.
-    for (unsigned i = first; i < first + 32U && i < row.scored_blocks; ++i) {
-        const uint2 r = row.ranges[i]; lo = min(lo, r.x); hi = max(hi, r.y);
+// Exact score of block b by one whole wave (every lane calls it with the same b; every lane returns the value),
+// bitwise equal to score_kernel's block_score<Fused>(q, k, head_dim) for that block:
+//   * Fused: fused_exact(row exponent range, range of b's 32-block score tile [32 (b / 32), + 32) clipped to the
+//     LAUNCH's scored prefix - score_kernel's wave tile; lanes past the prefix reuse the last block's range there,
+//     which changes no extremum);
+//   * lane l computes leaf<Fused>(q, k, l) (the same four products / FMAs, contraction off);
+//   * head_dot's tree is a[i] = leaf(i) + leaf(16 + i) (i < 16, both leaf groups), then a[l] + a[l + 8],
+//     a[l] + a[l + 4], a[l] + a[l + 2], a[0] + a[1]: the shuffle-down steps 16, 8, 4, 2, 1 below form exactly these
+//     sums (IEEE addition is commutative, so only the grouping matters, and it is the same);
+//   * block_score's sum over heads in order h = 0..3 of fmaxf(dot, 0), then / sqrtf(head_dim).
+// Registers: 4 key and 4 query values per lane (the per-thread form held 128 keys and spilled in the selector).
+__device__ __forceinline__ float band_exact_score_wave(const BandRow& row, const BandState& state, unsigned b) {
+#pragma clang fp contract(off)
+    const unsigned lane = threadIdx.x % 32U, first = b & ~31U;
+    const uint2 r = row.ranges[first + lane < row.scored_blocks ? first + lane : row.scored_blocks - 1U];
+    const bool fused = fused_exact(state.lo, state.hi, lo_exponent(wave_min_u(r.x)), hi_exponent(wave_max_u(r.y)));
+    float k[4];
+    const auto base = static_cast<std::uint64_t>(b) * kDim + lane;
+#pragma unroll
+    for (unsigned j = 0; j < 4U; ++j)
+        k[j] = row.packed ? __uint_as_float(static_cast<unsigned>(static_cast<const std::uint16_t*>(row.keys)[base + 32U * j]) << 16U)
+                          : static_cast<const float*>(row.keys)[base + 32U * j];
+    float total = 0.0F;
+#pragma unroll
+    for (unsigned h = 0; h < kHeads; ++h) {
+        const float* q = row.query + h * kDim + lane;
+        const float q0 = q[0], q1 = q[32], q2 = q[64], q3 = q[96];
+        float x;
+        if (fused) {
+            const float p2 = q2 * k[2], p3 = q3 * k[3];
+            x = __builtin_fmaf(q0, k[0], p2) + __builtin_fmaf(q1, k[1], p3);
+        } else {
+            const float p0 = q0 * k[0], p1 = q1 * k[1], p2 = q2 * k[2], p3 = q3 * k[3];
+            x = (p0 + p2) + (p1 + p3);
+        }
+        x = x + __shfl_down(x, 16U, 32);
+        x = x + __shfl_down(x, 8U, 32);
+        x = x + __shfl_down(x, 4U, 32);
+        x = x + __shfl_down(x, 2U, 32);
+        x = x + __shfl_down(x, 1U, 32);
+        total += fmaxf(__shfl(x, 0, 32), 0.0F);
     }
-    return fused_exact(state.lo, state.hi, lo_exponent(lo), hi_exponent(hi))
-        ? block_score<true>(row.query, k, row.head_dim) : block_score<false>(row.query, k, row.head_dim);
+    return total / sqrtf(static_cast<float>(row.head_dim));
 }
+// Exact scores of every block below `blocks` (wave-cooperative), then a barrier.
 __device__ __forceinline__ void band_rescore_all(float* scores, unsigned blocks, const BandRow& row, const BandState& state) {
-    for (unsigned b = threadIdx.x; b < blocks; b += kSelectThreads) scores[b] = band_exact_score(row, state, b);
+    const unsigned lane = threadIdx.x % 32U, wave = threadIdx.x / 32U;
+    for (unsigned b = wave; b < blocks; b += kSelectWaves) {
+        const float v = band_exact_score_wave(row, state, b);
+        if (lane == 0U) scores[b] = v;
+    }
     __syncthreads();
 }
 

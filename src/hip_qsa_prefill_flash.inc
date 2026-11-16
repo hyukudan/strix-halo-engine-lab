@@ -444,11 +444,16 @@ __device__ __forceinline__ void select_row_body(float* const scores, std::uint32
         for (unsigned i = tid; i < n; i += kSelectThreads)
             if (cand[i] > -INFINITY && (select_key(cand[i]) & mask) == prefix) t = fminf(t, cand[i]);
         t = idx::group_reduce(t, band_storage.slots, [](float x, float y) { return fminf(x, y); });
-        for (unsigned i = tid; i < n; i += kSelectThreads) {
-            const unsigned b = cand_group[i / kGroup] * kGroup + i % kGroup;
-            if (b < complete && idx::in_band(cand[i], t, band_storage.state.delta)) {
-                cand[i] = scores[b] = band_exact_score(band, band_storage.state, b);
-                if constexpr (Stats) atomicAdd(&stats[kBandSize], 1U);
+        // Wave w tests candidates [32 c, + 32) for c = w, w + 32, ...; every band hit is rescored by the whole wave.
+        for (unsigned c0 = (tid / 32U) * 32U; c0 < n; c0 += kSelectThreads) {
+            const unsigned i = c0 + tid % 32U;
+            const unsigned b = i < n ? cand_group[i / kGroup] * kGroup + i % kGroup : 0U;
+            const bool hit = i < n && b < complete && idx::in_band(cand[i], t, band_storage.state.delta);
+            for (unsigned long long m = __ballot(hit); m; m &= m - 1ULL) {
+                const unsigned l = static_cast<unsigned>(__builtin_ctzll(m)), bi = __shfl(b, static_cast<int>(l), 32);
+                const float v = band_exact_score_wave(band, band_storage.state, bi);
+                if (tid % 32U == l) { cand[i] = v; scores[b] = v; }
+                if constexpr (Stats) if (tid % 32U == 0U) atomicAdd(&stats[kBandSize], 1U);
             }
         }
         __syncthreads();
@@ -469,12 +474,19 @@ __device__ __forceinline__ void select_row_body(float* const scores, std::uint32
             const auto block = cand_group[i / kGroup] * kGroup + i % kGroup, slot = g + min(e, need);
             for (std::uint32_t offset = 0; offset < compress_ratio; ++offset)
                 selected[slot * compress_ratio + offset] = block * compress_ratio + offset;
-            if constexpr (Band) if (band_on) {
-                if (preserve_scores) scores[block] = band_exact_score(band, band_storage.state, block);
-            }
             if (!preserve_scores) scores[block] = -INFINITY;
         }
         greater_before += tile >> 16U; equal_before += tile & 0xffffU;
+    }
+    if constexpr (Band) if (band_on && preserve_scores) {
+        // Score readers (FAST union cap) get the exact value of every selected block (outside the band the stored
+        // value was the WMMA approximation): wave-cooperative rescore over the selected slots.
+        __syncthreads();
+        for (unsigned s = tid / 32U; s < block_topk; s += kSelectWaves) {
+            const unsigned block = selected[s * compress_ratio] / compress_ratio;
+            const float v = band_exact_score_wave(band, band_storage.state, block);
+            if (tid % 32U == 0U) scores[block] = v;
+        }
     }
     const auto complete_tokens = complete * compress_ratio, selected_complete = block_topk * compress_ratio;
     for (auto token = complete_tokens + tid; token < visible; token += kSelectThreads)
