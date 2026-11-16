@@ -21,6 +21,7 @@
 #include <cstdlib>
 #include <stdexcept>
 
+#include "strix/env_flags.hpp"
 #include "w4a16.hpp"
 
 namespace strix::core::dense_iu4 {
@@ -85,7 +86,7 @@ __global__ void __launch_bounds__(32 * kWaves) kernel(const std::uint8_t* w, uns
 
 // STRIX_IU4_ROW_REUSE: unset/1 = core calls of up to 8 rows (default), 0 = old 4-row chunks.
 inline bool row_reuse() {
-    static const bool on = [] { const char* e = std::getenv("STRIX_IU4_ROW_REUSE"); return !(e && e[0] == '0'); }();
+    static const bool on = envcfg::flag("STRIX_IU4_ROW_REUSE", true);  // recorded in the effective config
     return on;
 }
 
