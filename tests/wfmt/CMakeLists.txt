@@ -133,6 +133,9 @@ if(STRIX_WFMT_BACKEND STREQUAL "hip")
         -fhip-fp32-correctly-rounded-divide-sqrt -fdenormal-fp-math=ieee)
     target_link_libraries(strix-wfmt-hip-gsq-tests PRIVATE strix_hip_runtime strix_core ${WFMT_HIP_RUNTIME})
     target_link_libraries(strix-wfmt-hip-gsq-tests PRIVATE $<TARGET_NAME_IF_EXISTS:strix_q4k_a8_contract>)
+    # The included known-rows TU calls the prologue launchers of the probe library; linking it also
+    # carries the production STRIX_DPP_REDUCE definition into the fixture TU.
+    target_link_libraries(strix-wfmt-hip-gsq-tests PRIVATE $<TARGET_NAME_IF_EXISTS:strix_q4k_a8_hip_probe>)
     if(STRIX_WFMT_CAPTURE)
         target_compile_definitions(strix-wfmt-hip-gsq-tests PRIVATE STRIX_WFMT_CAPTURE=1)
     endif()
