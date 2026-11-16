@@ -287,7 +287,7 @@ bool batched(const char* name, unsigned rows, unsigned in, unsigned count, unsig
     dw.up(w), da.up(a), dd.up(dl);
     q8a8::View f{};
     f.weight = dw.p, f.codes = da.p, f.deltas = dd.p, f.row_bytes = row_bytes, f.in = in, f.count = count, f.rows = rows;
-    f.x_stride = width, f.out_stride = outs;
+    f.x_stride = width, f.out_stride = outs, f.out = base.p;
     const auto per_group = [&](float* y) {
         for (unsigned g = 0; g < groups; ++g) {
             auto v = f;
