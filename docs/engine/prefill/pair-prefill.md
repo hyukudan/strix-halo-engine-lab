@@ -185,3 +185,7 @@ so their performance crossover remains unqualified.
 
 For Qwen, `--baseline` or `STRIX_BASELINE=1` disables both automatic pair defaults
 (chunk policy and single-node tiles). Explicit pair lever switches retain precedence.
+`stage_map.hpp` holds the interleaved seam: `StageMap` (2v stages, stage s on rank s % 2, text `0,12,24,36,48`),
+`balance_map` (whole-layer cuts minimising the slowest stage) and `StagePipes` (one two-slot pipe per direction, each on
+its own ordered transport; execution order = groups of at most 4 chunks, depth-first inside a group, so both
+directions stay live with two slots). Wire v4 (`[43]` boundary, `[44]` map FNV) only when v > 1; v = 1 stays wire v3.

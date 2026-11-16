@@ -4,6 +4,7 @@
 // MiniMax M3.1 defaults-on resolver: the table of default-ON items, the baseline master switch and the canonical
 // effective configuration (see mm_defaults.hpp).
 #include "minimax/engine/mm_defaults.hpp"
+#include "strix/env_flags.hpp"
 #include "minimax/engine/mm_profile_table.hpp"
 #include "minimax/engine/route_identity.hpp"
 #include "core/layer_set.hpp"
@@ -226,7 +227,13 @@ PrefillPolicy prefill_policy(const Lookup& env) {
     p.msa_flash_layers = fp::layer_ranges(kMsaLayers, [&](unsigned l) { return mask.test(l); });
     if (p.msa_flash != 0) {
         bool rework = true;
-        for (const auto& r : resolve(env))
+        // Only the rework item and the baseline switch decide it: forwarding every item through a recording lookup
+        // (the engine passes envcfg::text) put the whole defaults set into the FAST arm's receipt, which the floor
+        // gate then refused against an exact reference ("differs beyond its FAST layer set").
+        const Lookup rework_env = [&](const char* k) -> const char* {
+            return std::strcmp(k, "STRIX_MM_PF_MSA_REWORK") == 0 || std::strcmp(k, kBaselineEnv) == 0 ? env(k) : nullptr;
+        };
+        for (const auto& r : resolve(rework_env))
             if (std::strcmp(r.item->env, "STRIX_MM_PF_MSA_REWORK") == 0) rework = r.value != "0";
         const char* fused = env("STRIX_MM_ATTN_PREFILL");
         if (const char* reason = msa_flash_decline_reason(rework, fused == nullptr || std::strcmp(fused, "off") != 0, mask.count())) {
@@ -240,7 +247,47 @@ PrefillPolicy prefill_policy(const Lookup& env) {
                          : std::string("msa-flash-bf16") + (p.msa_flash == 2 ? "-2term" : "") + "-l" + p.msa_flash_layers;
     if (i4 && fp::switch_on(env(kFastBundle.env)) && !fp::set(raw))
         p.note = std::string(flash.policy) + " not selected by " + kFastBundle.env + " on STRIX_MMX_MODEL_FORMAT=fast_i4";
+    // Index projections on the shared WMMA core (opt-in member, mm_profile_table.hpp kIdxWmmaPolicy).
+    const char* iw = env("STRIX_MM_PF_IDX_WMMA");
+    if (fp::set(iw) && std::strcmp(iw, "0") != 0 && std::strcmp(iw, "1") != 0)
+        throw std::invalid_argument("STRIX_MM_PF_IDX_WMMA must be 0 or 1");
+    p.idx_wmma_asked = fp::set(iw) ? iw : "default";
+    p.idx_wmma = fp::set(iw) && std::strcmp(iw, "1") == 0;
+    const char* il = env("STRIX_MM_PF_IDX_WMMA_LAYERS");
+    const auto imask = strix::core::parse_layer_set(fp::set(il) ? il : kIdxWmmaLayers, 0, kMsaLayers, "STRIX_MM_PF_IDX_WMMA_LAYERS");
+    p.idx_wmma_layers = fp::layer_ranges(kMsaLayers, [&](unsigned l) { return imask.test(l); });
+    if (p.idx_wmma && imask.count() == 0) {
+        p.idx_wmma = false;
+        p.note += std::string(p.note.empty() ? "" : "; ") + "STRIX_MM_PF_IDX_WMMA_LAYERS selects no layers";
+    }
+    // Resolve the same prefill layout as dispatch; decode's <=8-row policy is irrelevant here.
+    const auto index = route::resolve_index_projection(env("STRIX_MM_INDEX_PROJ"), true);
+    const bool packed = route::index_projection_route(index, 9) == route::IndexLayout::packed;
+    const bool fp32 = route::fp32_profile(env("STRIX_MM_PREFILL_IDENTITY"));
+    if (p.idx_wmma && (!packed || fp32)) {
+        p.idx_wmma = false;
+        p.note += std::string(p.note.empty() ? "" : "; ") +
+                  (!packed ? "index WMMA requires STRIX_MM_INDEX_PROJ=attn" : "index WMMA requires the default prefill identity");
+    }
+    if (p.idx_wmma) p.policies += (p.policies.empty() ? "" : "+") + idx_wmma_policy(p.idx_wmma_layers);
     return p;
+}
+
+std::string idx_wmma_policy(const std::string& layers) { return std::string(kIdxWmmaPolicy) + "-l" + layers; }
+
+strix::pair::PipelineChoice pair_pipeline_choice(std::uint64_t rows) {
+    // Hypothetical reference only: memory is assumed, not measured. This choice cannot enable execution.
+    // MMPIPE-PLAN section 1 (8K FAST stack): P(u) = 580 + 1.9946 u ms per chunk over both ranks (W 8.75 s at 4,096
+    // rows, 9.33 s at 2,048), FP32 seam 22 ms per 4,096 rows at 4.58 GB/s, TP2 resident 9,810 ms at 8K.
+    strix::pair::PipelineCost cost{580.0, 1.9946, 0.0, 0.0, 0.0, 0.0};
+    cost.hop_ms_per_row = 22.0 / 4096.0;
+    cost.tp_ms_per_row = 9810.0 / 8192.0;
+    static constexpr std::array<std::uint32_t, 4> chunks{1024U, 2048U, 4096U, 8192U};
+    static constexpr std::array<std::uint32_t, 6> virtual_stages{1U, 2U, 3U, 5U, 6U, 10U};
+    const strix::pair::LayoutDecl reference_layout{strix::pair::Residency::tensor_split, 31.0e9, 41.6e9,
+        "src/minimax/engine/engine.hip:89-91,1120-1131"};
+    return strix::pair::choose_pipeline(rows, cost, chunks, [](std::uint32_t) { return true; }, virtual_stages,
+        [](std::uint32_t v) { return 2U * v <= 60U; }, reference_layout);
 }
 
 const profile::Engine& profile_engine() {
@@ -259,6 +306,10 @@ profile::Resolution profile_resolution(const Lookup& env) {
             return p.msa_flash == 0 && p.msa_flash_asked == "default" ? nullptr : effective_mode.c_str();
         if (std::strcmp(key, "STRIX_MM_PF_MSA_FLASH_LAYERS") == 0)
             return p.msa_flash == 0 ? nullptr : p.msa_flash_layers.c_str();
+        if (std::strcmp(key, "STRIX_MM_PF_IDX_WMMA") == 0)
+            return !p.idx_wmma && p.idx_wmma_asked == "default" ? nullptr : p.idx_wmma ? "1" : "0";
+        if (std::strcmp(key, "STRIX_MM_PF_IDX_WMMA_LAYERS") == 0)
+            return p.idx_wmma ? p.idx_wmma_layers.c_str() : nullptr;
         return base(key);
     };
     return profile::resolve(profile_engine(), in);
@@ -275,7 +326,17 @@ void check_peer(const std::function<void(const void*, void*, std::size_t)>& exch
 
 std::string prefill_identity(const Lookup& env) {
     const auto p = prefill_policy(env);
-    std::string out = p.policies.empty() ? std::string() : "prefill_msa=" + p.policies;
+    // MSA attention policies under prefill_msa (unchanged form), the index projection member under prefill_idxproj.
+    std::string msa, idx;
+    for (std::size_t a = 0; a < p.policies.size();) {
+        const std::size_t b = std::min(p.policies.find('+', a), p.policies.size());
+        const std::string one = p.policies.substr(a, b - a);
+        std::string& dst = one.rfind(kIdxWmmaPolicy, 0) == 0 ? idx : msa;
+        dst += (dst.empty() ? "" : "+") + one;
+        a = b + 1;
+    }
+    std::string out = msa.empty() ? std::string() : "prefill_msa=" + msa;
+    if (!idx.empty()) out += std::string(out.empty() ? "" : ";") + "prefill_idxproj=" + idx;
     if (fast_i4_format(env)) out += std::string(out.empty() ? "" : ";") + "moe_prefill_format=fast_i4";
     return out;
 }
@@ -303,7 +364,7 @@ void apply() {
     const Lookup env = process_env;
     for (const Resolved& r : resolve(env)) {
         if (r.source == Source::env) continue;
-        (void)export_env(r.item->env, r.value.c_str(), 0);
+        if (export_env(r.item->env, r.value.c_str(), 0) == 0) strix::envcfg::note_default_export(r.item->env, r.value.c_str());
         g_exported.insert(r.item->env);
     }
     if (baseline(env))
@@ -515,13 +576,21 @@ std::string effective_config(const Cli& cli, const Lookup& env) {
         for (const auto& e : pr.entries) o << e.lever->env << "=" << e.value << "\n";
         const auto id = prefill_identity(env);
         const bool bundle_requested = strix::fast_profile::switch_on(env(kFastBundle.env));
-        o << "prefill.fast_profile=" << (bundle_requested && !pf.policies.empty() ? kFastBundle.profile : "off") << "\n"
+        const auto pipeline_reference = pair_pipeline_choice(8192U);
+        o << "prefill.fast_profile=" << (bundle_requested && pf.msa_flash != 0 ? kFastBundle.profile : "off") << "\n"
           << "prefill.fast_profile_requested=" << (bundle_requested ? kFastBundle.profile : "off") << "\n"
           << "prefill.msa_flash_requested=" << pf.msa_flash_requested << "\n"
           << "prefill.msa_flash_source=" << pf.msa_flash_asked << "\n"
           << "prefill.msa_flash_layers_requested=" << pf.msa_flash_layers_requested << "\n"
+          << "prefill.idx_wmma=" << (pf.idx_wmma ? "1" : "0") << "\n"
+          << "prefill.idx_wmma_source=" << pf.idx_wmma_asked << "\n"
+          << "prefill.idx_wmma_layers=" << (pf.idx_wmma ? pf.idx_wmma_layers : std::string("none")) << "\n"
           << "prefill.fast_policies=" << (pf.policies.empty() ? "none" : pf.policies) << "\n"
           << "prefill.fast_note=" << (pf.note.empty() ? "none" : pf.note) << "\n"
+          << "prefill.pair_pipeline=off mode=tensor residency=tensor_split free_memory=pending "
+             "reason=layout: tensor-split weights; pipeline execution unimplemented\n"
+          << "prefill.pair_pipeline_reference=estimate profile=FAST rows=8192 assumed_free_gb=31.0 assumed_extra_gb=41.6 "
+          << strix::pair::effective_line(pipeline_reference) << "\n"
           << "prefill.identity=" << (id.empty() ? "default" : id) << "\n"
           << "profile_fingerprint=" << profile::hex_identity(pr.fingerprint()) << "\n";
     }
@@ -558,6 +627,7 @@ std::string effective_config(const Cli& cli, const Lookup& env) {
         if (cli.app == "serve" && row.serving_reason != nullptr && env(row.name) == nullptr)
             o << "host." << row.name << ".serving_reason=" << row.serving_reason << "\n";
     }
+    o << strix::weight::family_plan_notice(cli.weight_plans);
     return o.str();
 }
 

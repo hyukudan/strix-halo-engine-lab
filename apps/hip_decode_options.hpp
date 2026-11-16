@@ -135,6 +135,7 @@ struct MtpCliOptions {
     std::string conversion,normalized_rounding,projection_rounding,sidecar_residency;
     std::uint64_t sidecar_bytes=0,header_bytes=0,sidecar_retained_bytes=0,sidecar_setup_bytes=0;
     std::uint64_t golden_max_bytes=0,replay_host_bytes=0,runtime_bytes=0,target_capture_bytes=0;
+    bool runtime_automatic=false; // only the automatically discovered bundle may grow its runtime budget
     std::uint64_t policy_identity=0;
     std::uint32_t candidate_depth=0,window_rows=0;
     // Adaptive verifier: several prefix owners (window_rows is the largest) and the
@@ -1981,6 +1982,7 @@ inline Options parse_options(
                 for (auto& arg:expanded) pointers.push_back(arg.data());
                 auto result=parse_options(static_cast<int>(pointers.size()),pointers.data(),defer_qpf2k_defaults,
                     off?"serial-retry":bundle);
+                result.mtp.runtime_automatic = !off && decision.source=="default";
                 if (off) {result.mtp_bundle_path.clear();result.yarn_decode_source="env";}
                 else verify_mtp_bundle_sidecar(result.mtp.sidecar,result.mtp.sidecar_sha256,result.mtp.sidecar_bytes);
                 return result;
@@ -3493,6 +3495,12 @@ inline Options parse_options(
         } else spec.context = static_cast<std::uint32_t>(options.context_tokens);
         options.deployment_spec = std::make_shared<const strix::deploy::Spec>(std::move(spec));
     }
+    // CLI and server share this refusal. Capacity never opts into experimental arithmetic.
+    // Validate a known native prompt's complete extent even when --context was omitted.
+    if (!yarn_factor || options.baseline)
+        (void)strix::validate_qwen_rotary_request(0, options.context_explicit,
+            std::max(options.context_tokens, static_cast<std::uint64_t>(options.tokens.size()) + options.generate_tokens),
+            options.baseline);
     options.rotary = strix::validate_qwen_rotary_request(yarn_factor,
         options.context_explicit, options.context_tokens, options.baseline);
     options.mtp_native_bundle = !options.mtp_bundle_path.empty() && options.rotary.mode()!=strix::RotaryMode::yarn;

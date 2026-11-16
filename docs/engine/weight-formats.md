@@ -12,7 +12,7 @@ recognition is recorded separately from model admission. Derived CB4/U5/U6,
 Q6P32 and prepared operands are images; they are not additional GGUF wire types.
 MXFP4 and native NVFP4 remain distinct storage contracts.
 
-`wfmt.census` checks the reader's complete geometry switch and inventories
+`wfmt.census` checks the reader's complete registry-backed geometry map and inventories
 format-related operations in each declared source file. Adding or removing an
 operation requires reviewing its binding and migration assignment. The keyword
 scan is a closure guard for the declared files, not a substitute for reviewing
@@ -51,3 +51,49 @@ not claim device execution or new numerical qualification.
 Home: shared (host shared contracts and test infrastructure). The shared layer
 serves all model families; vendor operand sources and instruction specialisations
 are introduced in their assigned migration steps.
+
+P03 introduces owning positioned sources and a common GGUF/safetensors index.
+File sources retain their read handle, check size/change snapshots, and compute a
+full SHA-256 content identity lazily. A tensor ID includes its pack-relative shard namespace, bounded header digest
+and name. Identical node copies retain the same ID; same-basename shards in
+different pack subdirectories remain distinct. Slices keep sources alive after an index or loader is destroyed.
+
+Admission validates exact format allowlists, role masks, logical shapes, expert
+axes, payload bounds and semantic sidecars before publishing a map. GGUF native
+axis order is normalized to logical row-major shape: `[N,K]` for matrices.
+Safetensors dtypes remain scalar storage descriptions until a verified schema
+binds FP8 scale grids, trellis transforms or H3 channel/group quantization.
+Malformed ranges, duplicate names, overflow, unsupported transforms and missing
+sidecars fail with a structured status. No allocation failure changes arithmetic.
+
+Existing model shape checks and execution/upload paths remain authoritative.
+Gemma manifests, MiniMax pack readers, GLM indices and H3 readers expose admitted
+maps; Qwen CUDA also records each legacy conversion recipe while retaining the
+source format. Qwen and MiniMax declaration-only model description files have no
+loaded tensors, so their actual weight loaders perform admission. GLM's legacy
+fixed mul1 codebook is explicit even when its old container omits a marker.
+The reader tests verify source lifetime, content identities, mutation rejection,
+mixed GGUF formats and the existing DS41 positioned-read byte contract.
+
+`validate_binding` reuses the same allowlist/shape/schema policy without reading
+numerical payloads. Admission still performs the bounded value checks once;
+subsequent resolver calls do not re-scan weights. The counting-source fixture
+checks this distinction and a malformed FP8-code fixture verifies that full
+admission keeps its value gate. A Linux host fixture also instantiates GLM's
+production index and compares its legacy byte ranges with the shared map.
+
+For a non-circular compatibility gate, the kit's legacy wrapper adapter compiles
+unchanged against the immediately preceding revision and the candidate. It
+records each public API's dtype, shape, offset, length, acceptance and raw bytes,
+then uses the same versioned writer and byte comparator. The root host session
+fixture also covers aliases: asset identity retains all path references, while
+one opened physical shard contributes one tensor table.
+
+Migration remains partial: wrappers retain legacy execution representations, and
+MiniMax still parses shard headers for both its execution table and shared index.
+The legacy capture fixtures cover small plain tensors and selected refusal paths;
+they do not qualify conversion or transformed-pack compatibility, model fidelity,
+complete logits/state equality, or timing. The compatibility driver requires clean
+checkouts at the requested commits and records their verified commit/tree IDs
+before configuring either build. Source-derived logical shapes are not independent
+graph-shape validation.

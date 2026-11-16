@@ -14,6 +14,7 @@
 #include <stdexcept>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <iostream>
 #include <fstream>
@@ -429,6 +430,7 @@ std::string describe(App app, const Resolved& r) {
     std::ostringstream o;
     o << "app " << app_name(app) << '\n';
     if (r.profile) o << r.profile->describe();
+    o << strix::weight::family_plan_notice(r.weight_plans);
     for (const auto& [k, v] : r.set_env) o << "env " << k << '=' << v << '\n';
     for (const auto& k : r.unset_env) o << "unset " << k << '\n';
     for (const auto& a : r.args) o << "arg " << a << '\n';
@@ -442,6 +444,14 @@ std::string describe(App app, const Resolved& r) {
       << "session reason " << r.session.reason << "\n";
     for (const auto& n : r.notices) o << "notice " << n << '\n';
     return o.str();
+}
+
+DsparkSettings resolve_dspark_settings() {
+    const char* raw = ::strix::envcfg::text("STRIX_DS41_COPY_ROWS");
+    const bool copy_rows8 = raw != nullptr && std::strcmp(raw, "8") == 0;  // anything else: six rows
+    // Report the row count rather than the raw text.
+    ::strix::envcfg::record("STRIX_DS41_COPY_ROWS", raw, copy_rows8 ? "8" : "6");
+    return {copy_rows8, ::strix::envcfg::flag("STRIX_DS41_SPEC_ARBITER", false)};
 }
 
 Effective::Effective(App app, int& argc, char**& argv, const Build& build) {
@@ -507,6 +517,7 @@ Effective::Effective(App app, int& argc, char**& argv, const Build& build) {
     profile_json_storage() = r.profile ? r.profile->json() : std::string();
     profile_storage() = r.profile;
     if (r.print_only) {
+        (void)resolve_dspark_settings();
         std::cout << describe(app, r) << ::strix::envcfg::describe();
         std::cout.flush();
         std::exit(0);

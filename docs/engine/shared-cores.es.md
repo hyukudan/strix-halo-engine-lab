@@ -55,12 +55,16 @@ WMMA por mosaico desde +0 con k ascendente. Encima viven políticas con nombre. 
 calcula pesos Q8_0 x activaciones A8 como una cadena FP16 por salida en lugar de los productos enteros exactos;
 DeepSeek V4.1 la enlaza (ejemplo abajo).
 Sus stagers decodifican dos pesos por operación FP16 empaquetada (`kWPacked`, `STRIX_F16_Q8A8_WPACK`, por defecto on, mismos
-bits; el kit `ds41/dense-forms` mide ambas formas y comprueba los bits). El rasgo opcional `kColumnFast` pone los
-bloques de columnas en `grid.x`: los CTA de un bloque de filas comparten x en L2 (mismos bits). La proyección de
-índice FAST de MiniMax `minimax-index-proj-wmma-v1` ([`src/minimax/attn/index_proj.hpp`](../../src/minimax/attn/index_proj.hpp))
-enlaza el núcleo con `stage()` leyendo sus pesos empaquetados y, desde 2.048 filas, x redondeada antes en mosaicos
-FP16 por k. Kit: `STRIX_MMATTN_BENCH=wmma` en `src/minimax/attn/index_proj_tests.hip` (ABAB estricto, series `x16` /
-`diag` / `orders` en `STRIX_MMATTN_WMMA_SERIES`; línea de compilación en la cabecera del archivo).
+bits; el kit `ds41/dense-forms` mide ambas formas y comprueba los bits). El rasgo opcional `kColumnFast` pone los bloques de columnas en `grid.x`:
+los CTA de un bloque de filas comparten x en L2 (mismos bits). La proyección de índice FAST de MiniMax
+`minimax-index-proj-wmma-v1` ([`src/minimax/attn/index_proj.hpp`](../../src/minimax/attn/index_proj.hpp)) enlaza el
+núcleo con `stage()` leyendo sus pesos empaquetados y, desde 2.048 filas, x redondeada antes en mosaicos FP16 por
+k. Esa forma x16 es compartida (`X16Cols<Base>`, `enqueue_x16_tiles`, `kX16Rows` en el núcleo; mismos bits que la ruta
+x FP32): MiniMax la usa en las proyecciones de índice (`STRIX_MM_PF_IDX_WMMA=1`, capas `STRIX_MM_PF_IDX_WMMA_LAYERS`,
+por defecto 40-59, opcional hasta su gate), GLM en los grupos WMMA de x de `kda_wmma::dense_group` (KDA f_a | g_a | b;
+`STRIX_GLM_PF_X16=0` = forma directa) y en sus proyecciones del indexador FAST `glm-pf-idxproj-wmma-v1`
+(`STRIX_GLM_PF_IDXPROJ_WMMA=1`, opcional hasta su gate). Kit: `STRIX_MMATTN_BENCH=wmma` en `src/minimax/attn/index_proj_tests.hip` (ABAB estricto, series `x16` / `diag` /
+`orders` en `STRIX_MMATTN_WMMA_SERIES`; línea de compilación en la cabecera del archivo).
 
 **Núcleo en mosaico y bucles enteros** ([`src/core/tiled_core.hpp`](../../src/core/tiled_core.hpp)). El núcleo
 WMMA de prefill de la biblioteca, solo cabecera para que los motores lo instancien con sus adaptadores en lugar de
