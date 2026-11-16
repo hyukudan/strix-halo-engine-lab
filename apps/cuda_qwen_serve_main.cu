@@ -657,6 +657,17 @@ private:
 }  // namespace
 
 int main(int argc, char** argv) {
+    // --help answers before any device or file is touched (post-install smoke: the binary and its DLLs load).
+    {
+        if (strix::device::wants_help(argc, argv)) {
+            std::cout << "usage: strix-cuda-qwen-serve --model FIRST_PART.gguf --tables DIR --rope-table FILE\n"
+                         "         [--mtp-sidecar FILE] [--draft-vocab FILE] [--bind ADDR] [--port N]\n"
+                         "         [--api-key-file FILE] [--prefix-cache on|off] [--devices FILE | --device-id ID]\n"
+                         "Serves Qwen3.8-Flash-Next from one CUDA GPU (OpenAI and Anthropic APIs, /health).\n"
+                         "Every option and default: docs/models/qwen3.8/rtx-serve.md\n";
+            return 0;
+        }
+    }
     // Start gate: resolves the declared device (--devices FILE, --device-id ID, STRIX_DEVICES, STRIX_DEVICE), refuses an
     // excluded or undeclared card, restricts the process to the chosen one and prints the "device:" receipt line.
     strix::device::bind_cuda_main(argc, argv);

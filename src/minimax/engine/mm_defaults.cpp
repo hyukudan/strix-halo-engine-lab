@@ -7,6 +7,7 @@
 #include "minimax/engine/mm_profile_table.hpp"
 #include "minimax/engine/route_identity.hpp"
 #include "core/layer_set.hpp"
+#include "moe_core/grouped_policy.hpp"
 #include "minimax/serve/minimax_sched.hpp"
 #include "minimax/dspark/minimax_auto.hpp"
 #include "strix/session/speculation_default.hpp"
@@ -502,6 +503,10 @@ std::string effective_config(const Cli& cli, const Lookup& env) {
         const char* v = env(r);
         o << r << "=" << (v != nullptr ? v : "default") << "\n";
     }
+    const char* order_asked = env("STRIX_MMX_PF_ORDER");
+    const auto& order = strix::moe_core::resolve_grouped_order(order_asked);
+    o << "STRIX_MMX_PF_ORDER.requested=" << (order_asked ? order_asked : "default") << "\n"
+      << "STRIX_MMX_PF_ORDER.effective=" << (order.invariant() ? "invariant" : "adaptive") << "\n";
     o << "build.gu4_scalar=" << (STRIX_MM_GU4_SCALAR ? "on" : "off") << "\n";
     for (const Resolved& r : resolve(env)) o << r.item->env << "=" << r.value << "\n";
     {   // FAST prefill profile rows (default OFF): the same resolution the engine, the cache identity and the ranks use.
