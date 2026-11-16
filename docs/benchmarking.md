@@ -79,3 +79,5 @@ and prompt formats.
 Vision scores are synthetic-image word-matching heuristics, not a general image-understanding accuracy measure. ABAB comparisons require an explicit `--base ARM` within a comparable workload group.
 
 Served runs share the ticket deadline and require both ranks, telemetry and completed requests to pass. Custom clients must write `KIT_RUN_DIR/client-result.json` with positive `completed` and zero `failed`, and exit successfully. Intentional TERM shutdown is recorded separately from server failure. Missing prefill timings remain unqualified; request latency is a separate metric.
+
+For controlled exact/onfly decode diagnosis, see [the TURBO decode measurement kit](../scripts/bench/turbo/README.md) (header layout census, small-row projection benchmark and diagnostic trace adapters).

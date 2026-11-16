@@ -3170,6 +3170,7 @@ int main() { return 0; }"
         set_target_properties(strix-hip-q8-rows-projection-tests PROPERTIES
             HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHS}")
         target_link_libraries(strix-hip-q8-rows-projection-tests PRIVATE strix_hip_runtime)
+        target_include_directories(strix-hip-q8-rows-projection-tests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
         target_compile_definitions(strix-hip-q8-rows-projection-tests PRIVATE STRIX_BUILD_KNOWN_WINDOW_DIAGNOSTIC=1)
         target_compile_options(strix-hip-q8-rows-projection-tests PRIVATE
             -mno-wavefrontsize64 -fno-fast-math -ffp-contract=off -fdenormal-fp-math=ieee)
