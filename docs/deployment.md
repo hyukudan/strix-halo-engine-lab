@@ -294,7 +294,8 @@ A class gives nominal rates with a wide uncertainty; `gbps_measured` (useful Gbi
 them. Remote devices of one machine share its network port (`port`) unless declared otherwise. A role that needs a
 measured rate (`prefill` on a remote device) is still refused until the probe is declared.
 
-`strix::deploy::plan_route` (include/strix/deploy/route.hpp) is the one resolver CLI and server call. From the
+`strix::deploy::plan_route` (include/strix/deploy/route.hpp) is an unbound shared host planner; production CLI/server
+callers and model adapters have not been added. From the
 declaration, its link graph and measured stage costs (`strix-stage-costs-v1`: unit, arithmetic identity, prompt
 length, block size, total and fixed ms, optional per-layer work, spread, warm/cold, receipt) it lists every route
 the model announces: prefill where it decodes, prefill elsewhere and hand the state off, or a layer split in blocks
@@ -303,3 +304,11 @@ per link, identity, predicted time with uncertainty, rate, memory per rank (thro
 and the reason it was refused. Unknown memory, an unmeasured import cost, a link without rate or class, or a route
 without a gate receipt is reported and never selected. The objective is `ttft` or `throughput`; a pin forces one
 option or fails with its reason. `contrast()` compares the prediction with receipts and flags misses above 30 %.
+
+Warm-receipt preference, borrowed layer work, extrapolation and pipeline throughput are modelling assumptions.
+Synthetic host tests and a nonempty gate string do not qualify native performance or numerical execution.
+Before production binding, adapters must define the mapping from protocol/cost arithmetic identities to footprint
+formats; choosing the first matching advertised format is currently only a synthetic planning convention.
+Search limits refuse the whole plan: 100,000 search steps, 4,096 layers/cost entries, 256 devices, 128 protocols,
+and 64 stages/chunks per protocol. An off-chain decoder is recorded as a zero-prefill-range stage with full-model
+rank budgets. Overlapping units have no shared-ownership contract and cannot form a handoff.

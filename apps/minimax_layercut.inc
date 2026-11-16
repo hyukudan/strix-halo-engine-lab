@@ -75,6 +75,10 @@ std::vector<std::uint32_t> layercut_session(mm::Engine& eng, strix::handoff::Lis
         throw std::invalid_argument("layercut relay needs --cut-relay on rank 0 and --cut-relay-listen on rank 1");
     std::printf("rank %u layercut-listen %s #%u: waiting\n", eng.rank(), name.c_str(), req); std::fflush(stdout);
     auto session = listener.accept();
+    lc::StartupScope startup([&]() noexcept {
+        session->cancel("layercut startup failed");
+        if (relay && relay_listener) relay_listener->shutdown();
+    });
     std::unique_ptr<strix::handoff::Session> relay_session;
     std::unique_ptr<strix::handoff::Sender> relay_sender;
     const auto start = Clock::now();
@@ -88,22 +92,6 @@ std::vector<std::uint32_t> layercut_session(mm::Engine& eng, strix::handoff::Lis
     try { check_hello(session->hello()); }
     catch (...) { session->abort("layercut hello/meta mismatch"); throw; }
     std::printf("identity %s\n", id.c_str());
-    if (relay && eng.rank() == 0) {
-        const auto paths = strix::handoff::parse_path_map(relay_to);
-        if (paths.size() != 1) throw std::invalid_argument("--cut-relay needs one HOST:PORT");
-        auto h = session->hello(); h.rank = 1;
-        strix::handoff::SenderOptions options;
-        options.codec = strix::handoff::Codec::identity;
-        options.max_pending_plain_bytes = std::size_t{2} * cfg.block * mlc::seam_bytes;
-        relay_sender = std::make_unique<strix::handoff::Sender>(paths[0], h, options);
-    } else if (relay) {
-        relay_session = relay_listener->accept();
-        try {
-            check_hello(relay_session->hello());
-            if (relay_session->hello().session != session->hello().session)
-                throw std::invalid_argument("layercut relay: session mismatch");
-        } catch (...) { relay_session->abort("layercut relay hello mismatch"); session->abort("relay mismatch"); throw; }
-    }
     // Full prompt staging is intentionally retained until HIP is done reading it. KV layout is component-major.
     if (prompt.size() > std::numeric_limits<std::size_t>::max() / mlc::seam_bytes)
         throw std::invalid_argument("layercut prompt staging overflow");
@@ -116,10 +104,15 @@ std::vector<std::uint32_t> layercut_session(mm::Engine& eng, strix::handoff::Lis
     double first = -1, last = -1, wait_act = 0;
     // Cancellation wakes both the transport reader and a fetch blocked on missing rows.
     const auto fail = [&](std::exception_ptr e) {
-        { std::lock_guard<std::mutex> lock(mutex); if (!error) error = e; cv.notify_all(); }
+        startup.fail(); // wake relay accept before any peer/engine teardown can wait
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            if (!error) error = e;
+            if (relay_session) relay_session->cancel("layercut peer failed");
+            cv.notify_all();
+        }
         try { eng.abort("layercut receive/compute failed"); } catch (...) {}
         session->cancel("layercut receive/compute failed");
-        if (relay_session) relay_session->cancel("layercut peer failed");
         if (relay_sender) relay_sender->abort("layercut peer failed");
     };
     const auto check_error = [&] {
@@ -160,7 +153,27 @@ std::vector<std::uint32_t> layercut_session(mm::Engine& eng, strix::handoff::Lis
     std::uint32_t next = 0;
     double prefill = 0, imported = 0;
     try {
+        if (relay && eng.rank() == 0) {
+            const auto paths = strix::handoff::parse_path_map(relay_to);
+            if (paths.size() != 1) throw std::invalid_argument("--cut-relay needs one HOST:PORT");
+            auto h = session->hello(); h.rank = 1;
+            strix::handoff::SenderOptions options;
+            options.codec = strix::handoff::Codec::identity;
+            options.connect_timeout = std::chrono::seconds(120);
+            options.reply_timeout = std::chrono::seconds(120);
+            options.max_pending_plain_bytes = std::size_t{2} * cfg.block * mlc::seam_bytes;
+            relay_sender = std::make_unique<strix::handoff::Sender>(paths[0], h, options);
+        }
         main_reader = std::thread([&] { receive(*session, !relay || eng.rank() == 0, true, relay && eng.rank() == 0); });
+        if (relay && eng.rank() == 1) {
+            auto accepted = relay_listener->accept();
+            { std::lock_guard<std::mutex> lock(mutex); relay_session = std::move(accepted); }
+            check_hello(relay_session->hello());
+            if (relay_session->hello().session != session->hello().session)
+                throw std::invalid_argument("layercut relay: session mismatch");
+        }
+        check_error();
+        startup.complete();
         if (relay_session) act_reader = std::thread([&] { receive(*relay_session, true, false, false); });
         eng.prefill_begin_cut(0, prompt, 0, cfg.cut, [&](std::uint64_t row0, std::size_t rows, float* dst, hipStream_t stream) {
             const auto t = Clock::now();

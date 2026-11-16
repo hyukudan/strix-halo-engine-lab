@@ -12,7 +12,7 @@
 #include <string_view>
 #include <vector>
 
-// Route planner for one prefill (shared by every engine, CLI and server alike): from the device declaration, its link
+// Unbound shared host planner for one prefill (no production engine/CLI/server adapter yet): from the declaration, its link
 // graph and measured stage costs, enumerate "prefill where it decodes" (local), "prefill on one unit and hand the
 // state off" (handoff) and "split the layers across units in blocks" (layers); predict each one's time with its
 // uncertainty and bytes per link; refuse what does not fit, is not executable or not qualified; choose by objective.
@@ -91,6 +91,8 @@ public:
     [[nodiscard]] virtual std::uint64_t state_bytes(std::uint64_t rows, std::uint32_t begin, std::uint32_t end) const = 0;
     [[nodiscard]] virtual std::vector<Protocol> protocols() const = 0;
     // Memory of a stage that holds only layers [begin, end); nullopt = unknown, and the option is refused.
+    // Adapter prerequisite: bind each arithmetic identity to an explicit footprint Format. The current
+    // first-matching format selection is only a synthetic planning convention, not qualified admission.
     [[nodiscard]] virtual std::optional<Footprint> range_footprint(const Spec&, const Candidate&, std::uint32_t /*rank*/,
                                                                    std::uint32_t /*begin*/, std::uint32_t /*end*/) const {
         return std::nullopt;
@@ -125,7 +127,7 @@ struct RouteRequest {
 struct RouteStage {
     std::vector<std::string> unit;
     std::string identity, topology, cost; // cost = stage-cost entry used
-    std::uint32_t begin = 0, end = 0;     // layer range
+    std::uint32_t begin = 0, end = 0;     // prefill range; [0,0) with ranks = decoder-only full-model admission
     double ms = 0;                        // whole-prompt compute on this stage (layers: one block)
     std::vector<RankBudget> ranks;        // memory admission per device of the unit (fit_rank)
 };
@@ -161,8 +163,10 @@ struct RoutePlan {
     [[nodiscard]] std::string hash() const;    // canonical JSON, FNV-1a-64, 16 lowercase hex digits
 };
 
-// The one resolver: CLI and server call this with the same request and inventory; only `inventory.load` may differ,
-// and every option it changes names the load in its reason.
+// Shared planner entry point, not yet bound to production callers. Idle load is deterministic;
+// live prefill load changes name the load in their reason. Limits refuse the entire plan rather than
+// choose from a truncated search: 100,000 search steps, 4,096 layers/costs, 256 devices, 128 protocols,
+// 64 stages/chunks per protocol. Endpoint paths are cached within one call.
 [[nodiscard]] RoutePlan plan_route(const RouteRequest& request, const Inventory& inventory, const RouteProvider& provider,
                                    const StageCostTable& costs);
 

@@ -10,8 +10,8 @@
 //   done[r][j] = max(done[r-1][j], done[r][j-1]) + t_r(rows_j),
 // t_stage = block_fixed_ms + rows x sum(layer ms/row) (+ tail), t_hop = latency_ms + rows x bytes_per_row / bandwidth.
 // After the prefill one `decoder` device owns the whole state: per-row state of layers owned elsewhere streams per
-// block over the hops on its way (forward hops join the flow shop; reverse hops are a separate resource bounded by
-// first-block finish + their total load) and fixed state bytes cross once at the end, store-and-forward per hop.
+// block over the hops on its way (forward hops join the flow shop; reverse hops wait for their producing stage
+// and upstream relay, coalescing one message per block/hop). Fixed state crosses once at the end, store-and-forward.
 // Costs come from the engine's measured receipts; a device without costs never runs layers and a needed link
 // without bandwidth rejects the plan (unknown is not infinite).
 #include <algorithm>
@@ -25,6 +25,9 @@
 #include <vector>
 
 namespace strix::pair::chain {
+// Host prediction only: bound resource updates per plan and total search work. Exhaustion never returns a winner.
+inline constexpr std::uint64_t max_plan_work = 1'000'000U;
+inline constexpr std::uint64_t max_search_work = 20'000'000U;
 struct Device {
     std::string name;
     std::vector<double> layer_ms_per_row; // one per model layer; empty: decoder-only device
@@ -122,18 +125,21 @@ inline Plan evaluate(const std::vector<Device>& devices, const std::vector<Link>
     plan.decoder = decoder;
     plan.cuts = std::move(cuts);
     plan.block = block;
-    const auto stages = plan.stages();
-    plan.last = first + (stages == 0U ? 0U : stages - 1U);
     const auto reject = [&](std::string why) { plan.valid = false; plan.reason = std::move(why); return plan; };
-    if (stages == 0U || rows == 0U || block == 0U) return reject("empty plan");
-    if (plan.last >= devices.size() || decoder >= devices.size() || links.size() + 1U < devices.size())
+    if (plan.cuts.size() < 2U || rows == 0U || block == 0U) return reject("empty plan");
+    if (devices.size() > std::numeric_limits<std::uint32_t>::max() || first >= devices.size() ||
+        plan.cuts.size() - 1U > devices.size() - first || decoder >= devices.size() || links.size() < devices.size() - 1U)
         return reject("device or link outside the declaration");
+    const auto stages = plan.stages();
+    plan.last = first + stages - 1U;
     if (plan.cuts.front() != 0U || plan.cuts.back() != model.layers) return reject("cuts do not cover the model");
+    for (std::uint32_t s = 0; s < stages; ++s)
+        if (plan.cuts[s + 1U] > model.layers || plan.cuts[s] >= plan.cuts[s + 1U])
+            return reject("cuts must be in bounds and strictly increasing");
     const auto has = [&](const std::vector<double>& values) { return values.size() == model.layers; };
     if (!has(model.state_bytes_per_row) || !has(model.state_fixed_bytes)) return reject("model state shape missing");
     for (std::uint32_t s = 0; s < stages; ++s) {
         const auto& device = devices[first + s];
-        if (plan.cuts[s] >= plan.cuts[s + 1U]) return reject("empty stage " + device.name);
         if (device.layer_ms_per_row.size() != model.layers) return reject("no layer costs for " + device.name);
         if (!model.weight_bytes.empty()) {
             if (model.weight_bytes.size() != model.layers) return reject("model weight shape mismatch");
@@ -171,9 +177,16 @@ inline Plan evaluate(const std::vector<Device>& devices, const std::vector<Link>
                 "link " + devices[device].name + "->" + devices[device + 1U].name});
         }
     }
-    plan.blocks = (rows + block - 1U) / block;
+    plan.blocks = rows / block + (rows % block != 0U);
+    const auto reverse_hops = plan.last > decoder ? plan.last - decoder : 0U;
+    const auto work_per_block = resources.size() + reverse_hops;
+    if (plan.blocks > max_plan_work / work_per_block) return reject("plan work limit exceeded");
+    for (auto hop = decoder; hop < plan.last; ++hop)
+        if ((reverse_state[hop] > 0.0 || reverse_fixed[hop] > 0.0) && !(links[hop].reverse_bytes_per_ms > 0.0))
+            return reject("no reverse link " + devices[hop + 1U].name + "->" + devices[hop].name);
     std::vector<double> done(resources.size(), 0.0);
-    double first_done = 0.0;
+    std::vector<double> reverse_done(devices.size(), 0.0);
+    double reverse_ms = 0.0;
     for (std::uint64_t j = 0; j < plan.blocks; ++j) {
         const auto block_rows = static_cast<double>(j + 1U == plan.blocks ? rows - j * block : block);
         double previous = 0.0;
@@ -181,7 +194,17 @@ inline Plan evaluate(const std::vector<Device>& devices, const std::vector<Link>
             done[r] = std::max(previous, done[r]) + resources[r].fixed + row_cost(resources[r], block_rows);
             previous = done[r];
         }
-        if (j == 0U) first_done = done.front();
+        double relay = 0.0;
+        for (auto device = plan.last; device > decoder; --device) {
+            const auto hop = device - 1U;
+            if (reverse_state[hop] == 0.0) continue;
+            // A stage's completion is at resource 2*s; devices before first only relay.
+            const double produced = device >= first ? done[2U * (device - first)] : 0.0;
+            reverse_done[hop] = std::max({reverse_done[hop], relay, produced}) + links[hop].latency_ms +
+                block_rows * reverse_state[hop] / links[hop].reverse_bytes_per_ms;
+            relay = reverse_done[hop];
+        }
+        reverse_ms = std::max(reverse_ms, relay);
     }
     plan.makespan_ms = done.back();
     double best_block = -1.0;
@@ -190,13 +213,11 @@ inline Plan evaluate(const std::vector<Device>& devices, const std::vector<Link>
         (resource.name.starts_with("stage") ? plan.stage_block_ms : plan.hop_block_ms).push_back(t);
         if (t > best_block) { best_block = t; plan.bottleneck = resource.name; }
     }
-    // Reverse state: an independent direction of each link, busy from the first finished block on.
-    double reverse_ms = 0.0, fixed_ms = 0.0;
+    double fixed_ms = 0.0;
     for (std::uint32_t hop = 0; hop + 1U < devices.size(); ++hop) {
-        if (reverse_state[hop] > 0.0 || reverse_fixed[hop] > 0.0) {
+        if (reverse_fixed[hop] > 0.0) {
             if (!(links[hop].reverse_bytes_per_ms > 0.0))
                 return reject("no reverse link " + devices[hop + 1U].name + "->" + devices[hop].name);
-            reverse_ms = std::max(reverse_ms, static_cast<double>(rows) * reverse_state[hop] / links[hop].reverse_bytes_per_ms);
             fixed_ms += reverse_fixed[hop] / links[hop].reverse_bytes_per_ms + links[hop].latency_ms;
         }
         if (forward_fixed[hop] > 0.0) {
@@ -206,7 +227,7 @@ inline Plan evaluate(const std::vector<Device>& devices, const std::vector<Link>
         }
     }
     plan.fixed_state_ms = fixed_ms;
-    plan.wall_ms = std::max(plan.makespan_ms, first_done + reverse_ms) + fixed_ms;
+    plan.wall_ms = std::max(plan.makespan_ms, reverse_ms) + fixed_ms;
     plan.valid = std::isfinite(plan.wall_ms);
     plan.reason = plan.valid ? "bottleneck " + plan.bottleneck : "non-finite cost";
     return plan;
@@ -223,6 +244,11 @@ inline Choice choose(const std::vector<Device>& devices, const std::vector<Link>
     const auto legal = [&](std::uint32_t cut) { return !request.legal_cut || request.legal_cut(cut); };
     const auto cap = request.max_stages == 0U ? static_cast<std::uint32_t>(devices.size()) : request.max_stages;
     Choice choice;
+    std::uint64_t work_left = max_search_work;
+    const auto charge = [&](std::uint64_t work) {
+        if (work > work_left) throw std::invalid_argument("chain search work limit exceeded");
+        work_left -= work;
+    };
     const auto better = [](const Plan& a, const Plan& b) {
         if (!b.valid) return a.valid;
         if (!a.valid) return false;
@@ -244,6 +270,7 @@ inline Choice choose(const std::vector<Device>& devices, const std::vector<Link>
         if (count > model.layers) break;
         for (std::uint32_t first = 0; first + count <= devices.size(); ++first) {
             for (const auto decoder : request.decoders) {
+                charge(1U);
                 if (!wanted(count, first, decoder)) continue;
                 Plan run_best;
                 run_best.first = first; run_best.last = first + count - 1U; run_best.decoder = decoder;
@@ -253,7 +280,10 @@ inline Choice choose(const std::vector<Device>& devices, const std::vector<Link>
                 const std::function<void(std::uint32_t)> place = [&](std::uint32_t index) {
                     if (index == count) {
                         for (const auto block : blocks) {
+                            charge(1U);
                             auto plan = evaluate(devices, links, model, request.rows, first, decoder, cuts, block);
+                            if (!plan.stage_block_ms.empty()) charge(plan.blocks * (plan.stage_block_ms.size() + plan.hop_block_ms.size() +
+                                (plan.last > decoder ? plan.last - decoder : 0U)));
                             if (better(plan, run_best) || (!run_best.valid && !plan.valid && run_best.reason == "no legal cut set"))
                                 run_best = std::move(plan);
                         }
@@ -261,6 +291,7 @@ inline Choice choose(const std::vector<Device>& devices, const std::vector<Link>
                     }
                     const auto forced = request.split == Split::layer_cut ? request.cuts[index - 1U] : 0U;
                     for (auto cut = cuts[index - 1U] + 1U; cut + (count - index) <= model.layers; ++cut) {
+                        charge(1U);
                         if (!legal(cut) || (forced != 0U && cut != forced)) continue;
                         cuts[index] = cut;
                         place(index + 1U);
@@ -280,7 +311,7 @@ inline Choice choose(const std::vector<Device>& devices, const std::vector<Link>
 // Uniform per-layer costs for a device whose receipts give only a whole-model rate (rows/s): a search seed,
 // never a qualified cost. Shape follows `reference` (another device's measured per-layer vector) when given.
 inline std::vector<double> scaled_costs(double rows_per_s, std::uint32_t layers, std::span<const double> reference = {}) {
-    if (!(rows_per_s > 0.0) || layers == 0U) throw std::invalid_argument("scaled costs need a rate and layers");
+    if (!std::isfinite(rows_per_s) || !(rows_per_s > 0.0) || layers == 0U) throw std::invalid_argument("scaled costs need a finite rate and layers");
     const double total_ms = 1000.0 / rows_per_s;
     std::vector<double> costs(layers, total_ms / layers);
     if (reference.size() == layers) {
