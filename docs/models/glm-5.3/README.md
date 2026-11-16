@@ -284,7 +284,12 @@ layer only) lets the RTX producer prefill long prompts and hand each rank its st
 vote on it (the authenticated binding, then both restored) before the last prompt token runs, and any failure before
 that vote falls back to the pair's own prefill on both ranks; a failure inside the last-token collectives stops the
 server (fatal). `--import-dsa-once` (with the producer's `dsa_once`) sends the DSA state to rank 0 only and relays it
-to rank 1 over the pair link (8K: 480 -> 316 MB on the producer link, tokens equal to the version 1 hand-off). Imported prompts carry the FAST identity
+to rank 1 over the pair link (8K: 480 -> 316 MB on the producer link, tokens equal to the version 1 hand-off). `--import-index-tail`
+(every rank, with the producer's `index_tail`; wire version 3, or 4 with `--import-dsa-once`) sends the DSA index key and
+gate of the open pool block only (`P % 4` rows): the closed blocks travel as their pooled FP32 rows, which is all the
+decode, prefill and MTP kernels read (`include/strix/block_summary_state.hpp`). 32K: 806.92 -> 605.62 MB for both ranks
+with DSA once; 128K: -805.28 MB. Opt-in; `tests/hip_glm_dsa_tests.hip` checks the continuation bitwise with the omitted
+rows poisoned, and `scripts/bench/handoff/glm_wire_versions.sh` times the wire versions over a real link. Imported prompts carry the FAST identity
 `glm-pf-rtx-native-v1` (not bitwise the pair's own prefill; each response's `prefill_route` names it).
 `--import-gate` fails unless every routed arm really imported (and a suite with no prompt fails). `--import-model-sha` is
 an operator attestation: the receiver compares it with the producer's hand-off header, it is not computed from the

@@ -4562,6 +4562,26 @@ memory. The absorb and out GEMMs stay on the exact v3 kernels (an f16 WMMA versi
 - **Measured gain:** Layer bench (C 2048 rows, gfx1151): scores+softmax+o-bar 17.3 -> 6.7 us/row at the 8K position, 22.9 -> 7.2 at 32K (2.6x / 3.2x); MLA total 21.3 -> 11.2 / 27.3 -> 11.4 us/row. Pair FAST, fresh process per arm: 8K prefill 10.600 -> 9.695 s (-0.905 s, -8.5 %, 2 ABAB pairs, with the removed WMMA GEMM); 32K 44.30 -> 40.26 s (-4.03 s, -9.1 %; one F / core / F set: 43.54, 40.26, 45.05 s). FAST_I4 not measured.
 - **Implementation / evidence:** [core](../src/attn_core/sparse_flash_wmma.hpp), [helpers](../src/attn_core/flash_tile.hpp), [GLM policy](../src/glm/prefill/glm_prefill.hip), [test](../tests/hip_attn_core_sparse_tests.hip), [bench](../tests/hip_glm_pf_layer_bench.hip)
 
+<a id="glm-pf-mla-qt16"></a>
+
+### FAST fused attention core reads q-tilde as a bf16 image
+
+**Engine:** `glm` (shared core `attn_core::sparse`). **Control:** `STRIX_GLM_PF_MLA_QT16`. **Default:** on wherever the FAST fused MLA core runs with the v3 absorb GEMM.
+
+The fused core rounded each FP32 q-tilde value to bf16 when it loaded its query fragments, so the absorb GEMM wrote
+4 bytes per value that the core read back only to round. The absorb GEMM now keeps its FP32 chains and stores the
+rounded value itself (`tile::to_bf16`, the core's own rounding), and the core loads those operand bits through the
+shared core's optional `query_op` policy hook with no conversion: half the q-tilde bytes written and read (268 MB per
+4096-row launch), and the core's query prologue loses its rounding code (2,722 -> 798 instructions in the kernel,
+main loop unchanged). The out GEMM still reads FP32 o-bar.
+
+- **Preconditions:** `STRIX_GLM_PF_WMMA=1` with the fused core, 32 heads per rank, absorb GEMM v3 (the default); other GEMM versions keep FP32 q-tilde.
+- **Exactness evidence:** Bitwise to the glm-pf-attn-wmma identity. `hip_glm_prefill_tests` (`STRIX_GLM_PF_TEST_ONLY=mla`): o-bar, MLA output and guard regions equal for T 32 and T 16, finite and NaN/Inf latents; layer bench arm 23 equals arm 21; pair 8K logits of both ranks equal in every A/B run.
+- **Off switch:** `STRIX_GLM_PF_MLA_QT16=0` (FP32 q-tilde, same bits)
+- **Measured gain:** Pair FAST 8K, warm (second prefill of the process): 8.617 -> 8.524 s median (-99 ms, three ABAB pairs -196 / -50 / -99 ms), 951 -> 961 tok/s, GPU clocks per token 2894k -> 2845k. Layer bench (C 4096, one node): absorb 9.52 -> 7.37 ms, fused core 27.74 -> 26.37 ms per launch. Cold first prefills follow the KFD eviction time of the run, not the switch.
+- **Resources:** no spill; fused core 256 VGPR and absorb 128 VGPR as before; same scratch buffer (the image uses half of it).
+- **Implementation / evidence:** [hook](../src/attn_core/sparse_flash_wmma.hpp), [GLM absorb + policy](../src/glm/prefill/glm_prefill.hip), [test](../tests/hip_glm_prefill_tests.hip), [bench](../tests/hip_glm_pf_layer_bench.hip), [pair A/B kit](../scripts/bench/glm/prefill-pair.sh) (arms `--profile fast` with and without `STRIX_GLM_PF_MLA_QT16=0`)
+
 <a id="mm-pf-msa-flash"></a>
 
 ### FAST key-split MSA attention core (mm-pf-msa-flash)

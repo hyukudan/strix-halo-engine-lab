@@ -13,7 +13,9 @@ API routes) is host-only code with no GPU dependency; its contracts are tested w
 ## Starting the server
 
 Serving runs on the tiled MTP route, so it takes the flags of a tiled MTP request (see
-[prefix-state-cache.md](prefix-state-cache.md#mtp) and [mtp-native-cli.md](../speculative/mtp-native-cli.md)) plus:
+[prefix-state-cache.md](prefix-state-cache.md#mtp) and [mtp-native-cli.md](../speculative/mtp-native-cli.md)) plus
+the flags below. The serve options can also come from a TOML file (`--serve-config FILE`, the command line wins,
+`--print-serve-config` shows the result): see [serve-config.md](serve-config.md).
 
 | Flag | Default | Meaning |
 |---|---|---|
@@ -507,6 +509,12 @@ with `input_schema`, `thinking` (`{"type":"enabled"}` or `{"type":"disabled"}`),
 `end_turn`, `max_tokens`, `stop_sequence` or `tool_use`. Streaming emits `message_start`,
 `content_block_start`, `content_block_delta` (`thinking_delta`, `text_delta`, `input_json_delta`),
 `content_block_stop`, `message_delta` and `message_stop`.
+
+### Ollama-compatible routes
+
+`/api/chat`, `/api/generate`, `/api/tags`, `/api/show`, `/api/ps` and `/api/version` run on the same chat and
+completions handlers (same prompt IDs, tokens, admission and counters as the equivalent OpenAI request), with NDJSON
+streaming and `{"error": ...}` bodies. See [ollama-api.md](ollama-api.md).
 
 ### Responses (stateless)
 

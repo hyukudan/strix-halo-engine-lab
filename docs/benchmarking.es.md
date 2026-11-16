@@ -19,6 +19,7 @@ se pasan como argumentos, y el segundo nodo de un par es el alias ssh de `KIT_PE
 | `abab.py` | `order` imprime el orden ABAB estricto; `summary OUT [--metric M]` da medianas por brazo, deltas por ronda y comprobaciones de identidad. |
 | `serve-decode.sh` | Arranca un servidor (y su rango 1 en el par), espera a que esté listo, ejecuta `tools/serve_bench.py` por clase de decodificación y lo para. `--client-cmd` ejecuta cualquier otro cliente en su lugar. |
 | `serve_receipts.py` | Convierte los resultados servidos en recibos (`agg_C<n>`, `e2e_C<n>`, `req_C<n>`, `ttft_C<n>`). |
+| `forwards_ab.py` | Ciclos de decode estables por (carriles, pasadas del modelo) desde los recibos de ciclo: el A/B en proceso de `STRIX_SERVE_JOINT_GROUP_LANES=ab`. |
 | `prompt_ids.py` | Ficheros de prompt de cualquier longitud (`p<N>.ids`, `.csv` o `.u32`). Cada uno es el texto semilla tokenizado una vez, repetido y truncado, con un sha256 por prompt. |
 
 Cada directorio de ejecución guarda `cmd.txt`, `stdout`, `stdout.ts`, `stderr`, `stderr.ts` (la hora de llegada de cada línea),
@@ -57,11 +58,15 @@ que el ticket):
 | `qwen/serve-decode` | Decodificación servida de Qwen, clases prosa / edición / json con 1, 4 y 8 chats; un brazo por ticket. | `qwen/serve-decode --bin B --model Q.gguf --arm 'wide\|--mtp-ngram-draft=wide\|' --round 0` |
 | `ds41/prefill-pair` | Prefill del par DeepSeek V4.1, longitud × filas × brazo, frío y caliente en un proceso (`--ttft-timing --repeat 2`); el FNV de los logits de los dos rangos debe coincidir. | `ds41/prefill-pair --bin strix-deepseek41-prefill --model M --ids DIR --sizes 8K,32K --arm 'exact\|\|'` |
 | `ds41/serve-decode` | Decodificación servida del par DeepSeek V4.1, clases prosa / edición / json con 1, 4 y 8 chats (recibos de ciclo del servidor, extremo a extremo, TTFT). | `ds41/serve-decode --bin-dir DIR --model M --arm 'ctl\|\|' --round 0` (luego `abab.py summary OUT --metric e2e_C8`) |
+| `ds41/dense-forms` | Formas de decodificación de pesos (FP32 escalar / FP16 empaquetada) de la política densa compartida `dense-q8a8-f16-v1` en las formas por trozo del rango 0 de DS41: puerta exhaustiva del stager, identidad de bits de cada forma, tiempos de kernel ABAB estricto y censo por capa-trozo. | `ds41/dense-forms --bin strix-hip-ds41-fast-dense-tests [--rows 1024,680]` |
 | `glm/prefill-pair` | Prefill del par GLM, exacto contra FAST, varios prompts en una carga (`--pf-ttft`), el primer prompt en frío y el último en caliente; acuerdo entre rangos en el FNV de logits y de estado. | `glm/prefill-pair --bin strix-glm5-rank --model DIR --prompts p8192.u32,p8192.u32` |
 | `minimax/fast-gate` | Puerta de calidad FAST de MiniMax con la regla absoluta dNLL admitida: referencia y candidato, ambos rangos, luego seal y compare de `tools/strix-gate/fast_logit_gate.py` (`--dnll-rule abs`). | GPU: `minimax/fast-gate run --bin strix-minimax-rank --model DIR --arm 'cand\|\|STRIX_X=1' --sessions s8k=p.u32`; CPU: `fast-gate.sh seal ...`, `fast-gate.sh compare --ref ref --cand cand --dnll-rule abs` |
+| unidad: proyección de índice MiniMax | Slab exacto contra FAST `minimax-index-proj-wmma-v1` (directa, mosaicos x16, diagnósticos), ABAB estricto de 3 pares con 1.024 / 2.048 / 4.096 / 8.192 filas, subconjunto fijo de las primeras 12 (4.096/8.192 filas) o 30 (1.024/2.048 filas) de 60 capas; tiempos x16-only sujetos a igualdad completa de bytes con WMMA directa; cifras x16-only históricas retiradas hasta repetir la medición, primera llamada en frío, `evicted_ms` de kfd. | `STRIX_MMATTN_BENCH=wmma STRIX_MMATTN_WMMA_SERIES=x16 index-proj-tests` (línea de compilación en `src/minimax/attn/index_proj_tests.hip`) |
 | `vision/battery` | Batería de contenido de visión: una respuesta greedy por imagen sintética, puntuada a partir de los píxeles (`score.py`): colores presentes o ausentes, patrón, orientación, regla de la paleta. | `vision/battery --bin-dir DIR --model M --vision V.gguf --images IMGDIR`, luego `python3 scripts/bench/vision/score.py IMGDIR OUT/*/battery.json` |
 | `rtx/ds41-rtx-pair-batch` | Decodificación por lotes RTX + par de DeepSeek V4.1, C2 / C4 / C8: FRONT en la RTX sobre `[0, cut)` con `strix-cuda-ds41-multi-front`, TAIL en el par con `strix-deepseek41-batch --hetero-listen`, 2 grupos en vuelo; `--mode both` compara cada petición con su ejecución solo en el par. | ticket del nodo: `rtx/ds41-rtx-pair-batch tail --bin strix-deepseek41-batch --model M --prompts a.csv,...,h.csv --token-file TOK --n 2,4,8 --generate 48`; host RTX: `scripts/bench/rtx/ds41-rtx-pair-batch.sh front --bin strix-cuda-ds41-multi-front --model M --stage NODO:7841 --token-file TOK` |
 | `rtx/serve-route` | Rutas RTX servidas (Qwen entero en una RTX, o cualquier servidor RTX compatible con OpenAI), clases de decodificación con 1, 4 y 8 chats. | `scripts/bench/rtx/serve-route.sh --route qwen --bin strix-cuda-qwen-serve --model Q.gguf -- --tables T --rope-table R --mtp-sidecar S --draft-vocab V` |
+| `logprobs/partials` | Kernels de parciales de logprobs (HIP o CUDA): parciales del dispositivo frente a la referencia FP64 y al orden de carriles del host, y el coste del kernel por paso con 1 / 8 / 32 / 128 filas de un tramo de 64.640 entradas (el coste activado de puntuar). | `bash scripts/bench/logprobs/partials.sh --bin strix-hip-logprob-partials-tests --rows "1 8 32 128"` |
+| `kfdevict` | Evicciones de colas KFD sin root: sonda dentro del proceso (eventos de evicción propios con su causa, restauración, asignaciones userptr), muestreador del nodo de `evicted_ms` frente a contadores de reclaim / compactación y ventanas de GPU ocupada, generador de presión de memoria controlada y micro A/B de respaldos de memoria host. | `scripts/bench/kfdevict/README.md` |
 
 El servicio de prefill DeepSeek en la RTX (`strix-cuda-ds41-prefill-service`) se mide con
 `tools/ds41_prefill_service_client.py`. Las rutas en sí se describen en [discrete-gpu.es.md](discrete-gpu.es.md).
@@ -69,6 +74,11 @@ El servicio de prefill DeepSeek en la RTX (`strix-cuda-ds41-prefill-service`) se
 Los prompts de las clases de decodificación están en `scripts/bench/prompts/classes/`. La aceptación de los borradores
 cambia un orden de magnitud entre prosa, una edición de código y CSV a JSON, así que la decodificación servida se
 informa siempre por clase.
+
+Barra de calidad TURBO: `tools/qualification/turbo_bar/` ([README](../tools/qualification/turbo_bar/README.md)) mide
+E (ruta exacta) frente a R (un pack menor de los mismos pesos con los mismos núcleos) y T (TURBO): KL, top-1 y
+dNLL sobre logits completos, tareas puntuadas, recuperación, intervalos pareados del 95 % (INCONCLUSO si no
+resuelven) y una frontera velocidad/calidad. `rpack_kquant.py` produce R; `models.json` declara E/R/T por modelo.
 
 ## Comprobaciones
 
