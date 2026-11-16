@@ -272,6 +272,15 @@ __global__ void capture_raw_kernel(const float* qkv, const float* beta, const fl
     }
 }
 
+// MTP input: out[r] = [a[r] (H) | b[r] (H)] (eh_proj consumes the concatenation enorm(embed) | hnorm(hidden)).
+__global__ void concat2_kernel(const float* a, const float* b, float* out, unsigned rows, unsigned H) {
+    for (unsigned i = blockIdx.x * blockDim.x + threadIdx.x; i < rows * H; i += gridDim.x * blockDim.x) {
+        const unsigned r = i / H, c = i % H;
+        out[std::size_t(r) * 2U * H + c] = a[i];
+        out[std::size_t(r) * 2U * H + H + c] = b[i];
+    }
+}
+
 }  // namespace
 
 struct HipEngine::Impl {
@@ -292,6 +301,23 @@ struct HipEngine::Impl {
           *q_in = nullptr, *kk = nullptr, *vv = nullptr, *qn = nullptr, *ctx = nullptr, *gu = nullptr, *logits = nullptr;
     int *d_ids = nullptr, *d_arg = nullptr;
     unsigned committed = 0, pending = 0;
+
+    // MTP layer (load_mtp): own tensors, own bf16 KV (max_positions), own scratch; the trunk's embedding / lm_head are shared.
+    struct MtpData {
+        bool ok = false;
+        Layer blk;
+        Tensor enorm, hnorm, shnorm, eh;
+        float *tA = nullptr, *tB = nullptr, *cat = nullptr, *mx = nullptr, *mxn = nullptr, *hpost = nullptr, *mlogits = nullptr;
+        int *ids = nullptr, *top = nullptr;
+        ~MtpData() {
+            auto fr = [](auto* p) { if (p) (void)hipFree(p); };
+            for (Tensor* t : {&blk.attn_norm, &blk.post_norm, &blk.gate, &blk.up, &blk.down, &blk.q, &blk.k, &blk.v, &blk.o, &blk.qnorm,
+                              &blk.knorm, &enorm, &hnorm, &shnorm, &eh}) fr(t->data);
+            fr(blk.k_cache); fr(blk.v_cache);
+            for (auto* p : {tA, tB, cat, mx, mxn, hpost, mlogits}) fr(p);
+            fr(ids); fr(top);
+        }
+    } mtp;
 
     ~Impl() {
         auto fr = [](auto* p) { if (p) (void)hipFree(p); };
@@ -473,6 +499,11 @@ struct HipEngine::Impl {
             add_kernel<<<nb, 256, 0, stream>>>(x, proj, n * H);
         }
         HipRowsOut out;
+        if (mtp.ok) {  // trunk hidden of every row for the MTP chain (same final norm as the logits path)
+            rmsnorm(x, onorm, H, cfg.rms_eps, mtp.hpost, n, stream);
+            out.hidden_post = mtp.hpost;
+            out.hidden_pre = x;
+        }
         if (want != LogitRows::none) {
             const unsigned first = want == LogitRows::last ? n - 1U : 0U, m = want == LogitRows::last ? 1U : n;
             rmsnorm(x + std::size_t(first) * H, onorm, H, cfg.rms_eps, xn, m, stream);
@@ -485,6 +516,91 @@ struct HipEngine::Impl {
         if (defer) pending = n;
         else committed += n;
         return out;
+    }
+
+    void load_mtp(const std::string& path) {
+        if (mtp.ok) throw std::logic_error("load_mtp: already loaded");
+        Loader loader(path);
+        const std::string b = "blk." + std::to_string(cfg.layers) + ".";
+        auto& y = mtp.blk;
+        y.attn_norm = loader.load(b + "attn_norm");
+        y.post_norm = loader.load(b + "post_attention_norm");
+        y.gate = loader.load(b + "ffn_gate");
+        y.up = loader.load(b + "ffn_up");
+        y.down = loader.load(b + "ffn_down");
+        y.q = loader.load(b + "attn_q");
+        y.k = loader.load(b + "attn_k");
+        y.v = loader.load(b + "attn_v");
+        y.o = loader.load(b + "attn_output");
+        y.qnorm = loader.load(b + "attn_q_norm");
+        y.knorm = loader.load(b + "attn_k_norm");
+        mtp.enorm = loader.load(b + "nextn.enorm");
+        mtp.hnorm = loader.load(b + "nextn.hnorm");
+        mtp.shnorm = loader.load(b + "nextn.shared_head_norm");
+        mtp.eh = loader.load(b + "nextn.eh_proj");
+        for (const Tensor* t : {&y.attn_norm, &y.post_norm, &y.qnorm, &y.knorm, &mtp.enorm, &mtp.hnorm, &mtp.shnorm})
+            if (t->fmt != 0U) throw std::runtime_error("MTP norms must be F32");
+        if (mtp.eh.inputs != 2U * H || mtp.eh.outputs != H || y.q.outputs != 2U * QW || y.k.outputs != KW || y.gate.outputs != I)
+            throw std::runtime_error("MTP tensor shapes do not match the trunk config");
+        const std::size_t kb = std::size_t(opt.max_positions) * KW * 2U;
+        alloc0(&y.k_cache, kb);
+        alloc0(&y.v_cache, kb);
+        const unsigned RS = std::max(kMaxRows, opt.prefill_rows);
+        alloc0(&mtp.tA, std::size_t(kMaxRows) * H * 4U);
+        alloc0(&mtp.tB, std::size_t(kMaxRows) * H * 4U);
+        alloc0(&mtp.cat, std::size_t(kMaxRows) * 2U * H * 4U);
+        alloc0(&mtp.mx, std::size_t(kMaxRows) * H * 4U);
+        alloc0(&mtp.mxn, std::size_t(kMaxRows) * H * 4U);
+        alloc0(&mtp.hpost, std::size_t(RS) * H * 4U);
+        alloc0(&mtp.mlogits, std::size_t(kMaxRows) * V * 4U);
+        alloc0(&mtp.ids, kMaxRows * 4U);
+        alloc0(&mtp.top, kMaxRows * 4U);
+        mtp.ok = true;
+        if (!opt.quiet) std::printf("mtp loaded %.2f GiB (blk.%u)\n", double(loader.total()) / double(1ULL << 30), cfg.layers);
+    }
+
+    // Same math as the CUDA MTP layer: cat(enorm(embed(tok)), hnorm(hidden)) -> eh_proj -> one full-attention block (own KV) ->
+    // shared_head_norm -> trunk lm_head. Scratch of the trunk window (q_in, kk, vv, qn, ctx, gu, proj) is reused: calls are
+    // stream-ordered between passes.
+    HipMtpOut mtp_run(const std::uint32_t* next_tokens, const float* hidden_dev, unsigned n, unsigned pos0, bool want_top) {
+        if (!mtp.ok) throw std::runtime_error("mtp_forward: no MTP tensors loaded");
+        if (n < 1U || n > kMaxRows) throw std::invalid_argument("mtp_forward: rows must be 1..16");
+        core::require_capacity(pos0, n, opt.max_positions);
+        core::validate_token_ids(next_tokens, n, cfg.vocab);
+        auto& y = mtp.blk;
+        HK(hipMemcpyAsync(mtp.ids, next_tokens, n * 4U, hipMemcpyHostToDevice, stream));
+        embed_kernel<<<n, 256, 0, stream>>>(embd.data, embd.fmt, embd.row_bytes, H, mtp.ids, mtp.tA);
+        rmsnorm(mtp.tA, mtp.enorm, H, cfg.rms_eps, mtp.mxn, n, stream);
+        rmsnorm(hidden_dev, mtp.hnorm, H, cfg.rms_eps, mtp.tB, n, stream);
+        concat2_kernel<<<(n * H + 255U) / 256U, 256, 0, stream>>>(mtp.mxn, mtp.tB, mtp.cat, n, H);
+        linear(mtp.eh, mtp.cat, mtp.mx, n, stream);
+        const unsigned nb = (n * H + 255U) / 256U;
+        rmsnorm(mtp.mx, y.attn_norm, H, cfg.rms_eps, mtp.mxn, n, stream);
+        linear(y.q, mtp.mxn, q_in, n, stream);
+        linear(y.k, mtp.mxn, kk, n, stream);
+        linear(y.v, mtp.mxn, vv, n, stream);
+        attn_core::dense_decode::Params p{n, cfg.heads, cfg.kv_heads, 2U * D, cfg.rotary_dim, pos0, cfg.rms_eps,
+                                          1.0F / std::sqrt(float(D)), cfg.rope_theta, true};
+        attn_core::dense_decode::launch<256>(p, q_in, kk, vv, reinterpret_cast<const float*>(y.qnorm.data),
+                                             reinterpret_cast<const float*>(y.knorm.data), qn, y.k_cache, y.v_cache, ctx, stream);
+        linear(y.o, ctx, proj, n, stream);
+        add_kernel<<<nb, 256, 0, stream>>>(mtp.mx, proj, n * H);
+        rmsnorm(mtp.mx, y.post_norm, H, cfg.rms_eps, mtp.mxn, n, stream);
+        glu(y.gate, y.up, mtp.mxn, gu, n, stream);
+        linear(y.down, gu, proj, n, stream);
+        add_kernel<<<nb, 256, 0, stream>>>(mtp.mx, proj, n * H);
+        rmsnorm(mtp.mx, mtp.shnorm, H, cfg.rms_eps, mtp.mxn, n, stream);  // mx (pre-norm block output) stays intact for 'pre'
+        HipMtpOut o;
+        if (want_top) {
+            linear(head, mtp.mxn, mtp.mlogits, n, stream);
+            argmax_kernel<<<n, 1024, 0, stream>>>(mtp.mlogits, V, mtp.top);
+            o.logits = mtp.mlogits;
+            o.top = reinterpret_cast<const std::uint32_t*>(mtp.top);
+        }
+        HK(hipGetLastError());
+        o.hidden_pre = mtp.mx;
+        o.hidden_post = mtp.mxn;
+        return o;
     }
 };
 
@@ -530,5 +646,20 @@ void HipEngine::bench_seek(std::uint32_t pos) {
     p_->pending = 0;
 }
 void HipEngine::sync() const { HK(hipStreamSynchronize(p_->stream)); }
+
+void HipEngine::load_mtp(const std::string& path) { p_->load_mtp(path); }
+bool HipEngine::has_mtp() const { return p_->mtp.ok; }
+HipMtpOut HipEngine::mtp_forward(const std::uint32_t* t, const float* hidden_dev, std::uint32_t rows, std::uint32_t pos0, bool want_top) {
+    return p_->mtp_run(t, hidden_dev, rows, pos0, want_top);
+}
+float* HipEngine::alloc_f32(std::size_t n) const {
+    float* q = nullptr;
+    HK(hipMalloc(&q, n * sizeof(float)));
+    return q;
+}
+void HipEngine::free_f32(float* q) const { (void)hipFree(q); }
+void HipEngine::copy_f32_async(float* dst, const float* src, std::size_t n) const {
+    HK(hipMemcpyAsync(dst, src, n * sizeof(float), hipMemcpyDeviceToDevice, p_->stream));
+}
 
 }  // namespace strix::qwen35

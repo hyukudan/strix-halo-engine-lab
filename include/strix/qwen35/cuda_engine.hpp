@@ -87,6 +87,7 @@ struct SlotRows {
 
 class CudaEngine {
 public:
+    using Rows = RowsOut;  // shared MtpChain binding (strix/spec/mtp_chain.hpp)
     ~CudaEngine();
     CudaEngine(const CudaEngine&) = delete;
     CudaEngine& operator=(const CudaEngine&) = delete;
