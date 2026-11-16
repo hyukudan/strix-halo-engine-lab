@@ -43,9 +43,19 @@ add_executable(qwen_decode_e2e tests/cuda/qwen_decode_e2e.cu)
 target_link_libraries(qwen_decode_e2e PRIVATE strix_qwen_cuda strix_qwen_handoff)
 add_executable(qwen_decode_bench tests/cuda/qwen_decode_bench.cu)
 target_link_libraries(qwen_decode_bench PRIVATE strix_qwen_cuda)
-add_executable(qwen_dense_tests tests/cuda/qwen_dense_tests.cu)
+# Compile an instrumented copy into the test executable; the archive's dense object is not linked.
+add_executable(qwen_dense_tests tests/cuda/qwen_dense_tests.cu src/cuda/models/qwen/qwen_dense.cu)
+target_compile_definitions(qwen_dense_tests PRIVATE STRIX_QWEN_DENSE_TEST_DISPATCH)
+target_compile_options(qwen_dense_tests PRIVATE $<TARGET_PROPERTY:strix_qwen_cuda,COMPILE_OPTIONS>)
 target_include_directories(qwen_dense_tests PRIVATE tests/cuda)
 target_link_libraries(qwen_dense_tests PRIVATE strix_qwen_cuda)
+foreach(arm IN ITEMS 0 1)
+    add_test(NAME qwen_dense_rows16_${arm} COMMAND ${CMAKE_COMMAND} -E env
+        STRIX_QRTX_DENSE_ROWS16=${arm} STRIX_CUDA_DECODE_ROWS_MAX=16 STRIX_QRTX_DECODE_KERNELS=1
+        STRIX_QRTX_ROWS_KSPLIT=1 STRIX_QRTX_ROWS_CP=0 STRIX_QRTX_KSO=4
+        $<TARGET_FILE:qwen_dense_tests> --rows16 ${arm})
+    set_tests_properties(qwen_dense_rows16_${arm} PROPERTIES LABELS gpu RUN_SERIAL TRUE)
+endforeach()
 add_executable(strix-cuda-qwen-serve apps/cuda_qwen_serve_main.cu)
 # Shared MTP window controllers (also linked by the HIP engine): measured-cost depth/rows policy and its host adapter.
 add_library(strix_mtp_depth STATIC src/mtp_window_controller.cpp src/mtp_depth_window_controller.cpp src/serve/row_budget.cpp

@@ -1554,9 +1554,14 @@ struct ApiService::Impl {
             job.copy_rows = static_cast<std::uint32_t>(rows->as_int());
         }
         if (const auto* rows = body.find("window_rows"); rows && !rows->is_null()) {
-            if (!rows->is_number() || rows->as_int() < 0 || rows->as_int() > 16)
+            std::int64_t value = -1;
+            try { value = rows->as_int(); }
+            catch (const JsonError&) {
                 throw ApiError(400, "invalid_request_error", "window_rows must be an integer in [0, 16]", "window_rows");
-            job.window_rows = static_cast<std::uint32_t>(rows->as_int());
+            }
+            if (value < 0 || value > 16)
+                throw ApiError(400, "invalid_request_error", "window_rows must be an integer in [0, 16]", "window_rows");
+            job.window_rows = static_cast<std::uint32_t>(value);
         }
         if (const auto* tool = body.find("tool_draft"); tool && !tool->is_null()) {
             if (!tool->is_bool()) throw ApiError(400, "invalid_request_error", "tool_draft must be a boolean", "tool_draft");

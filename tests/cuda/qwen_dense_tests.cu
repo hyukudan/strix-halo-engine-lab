@@ -2,6 +2,7 @@
 // tests/cuda/qwen_dense_ref.hpp, bit for bit.
 //   qwen_dense_tests                 host-only tests (no CUDA call)
 //   qwen_dense_tests --gpu           + CUDA vs host: synthetic edge cases, real Q8_0 weights, shared expert
+//   ctest -R qwen_dense_rows16       isolated ON/OFF dispatch qualification (no model/table assets required)
 //   qwen_dense_tests --bench         GMAC/s of 8192 x 2560 x 16384 (GDN qkv||z shape)
 //   qwen_dense_tests --fixture F     list the records of a STRIX_QRTX_STEP_DUMP file (and replay when recognised)
 // Env: STRIX_QWEN_GGUF (model), STRIX_QRTX_TABLES (default qrtx-build\tables).
@@ -33,6 +34,17 @@ static int g_fail = 0, g_pass = 0;
 #define CK(x) do { cudaError_t e_ = (x); if (e_ != cudaSuccess) { std::fprintf(stderr, "%s:%d %s\n", __FILE__, __LINE__, cudaGetErrorString(e_)); std::exit(2); } } while (0)
 static void check(bool ok, const std::string& what) {
     if (ok) ++g_pass; else { ++g_fail; std::printf("FAIL %s\n", what.c_str()); }
+}
+
+static int g_rows16 = -1;
+static unsigned g_dispatches = 0;
+namespace strix::cuda::qwen_dense {
+void test_dispatch(std::uint32_t rows, bool one_pass) {
+    if (g_rows16 < 0) return;
+    ++g_dispatches;
+    std::printf("dispatch rows=%u form=%s\n", rows, one_pass ? "rp16" : "split8");
+    check(one_pass == (g_rows16 == 1), "requested dense dispatch");
+}
 }
 
 // ---------------------------------------------------------------------------------------------------------------------
@@ -324,8 +336,12 @@ static void gpu_projection_synthetic() {
     for (const auto& cs : kCases) {
         std::vector<std::vector<std::uint8_t>> w;
         for (std::size_t m = 0; m < cs.outs.size(); ++m) w.push_back(make_q8(cs.outs[m], cs.width, 1000U * ci + m));
-        for (std::uint32_t rows : {1U, 5U, 8U, 9U, 13U, 16U, 64U, 130U, 256U, 1000U, 4096U})
+        for (std::uint32_t rows : {1U, 5U, 8U, 9U, 13U, 16U, 64U, 130U, 256U, 1000U, 4096U}) {
+            if (g_rows16 >= 0 && rows != 9U && rows != 13U && rows != 16U) continue;
+            const auto before = g_dispatches;
             total += run_projection(cs, w, rows, 77U * rows + ci, true, 136U);
+            if (g_rows16 >= 0) check(g_dispatches == before + 1U, "eligible projection dispatched exactly once");
+        }
         ++ci;
     }
     std::printf("synthetic projection: %zu (row, output) values compared\n", total);
@@ -613,6 +629,16 @@ int main(int argc, char** argv) {
         else if (a == "--bench") do_bench = true;
         else if (a == "--bench-rows") do_bench_rows = true;
         else if (a == "--fixture" && i + 1 < argc) fixture = argv[++i];
+        else if (a == "--rows16" && i + 1 < argc) {
+            const std::string arm = argv[++i];
+            if (arm != "0" && arm != "1") return 2;
+            g_rows16 = arm == "1" ? 1 : 0;
+        }
+    }
+    if (g_rows16 >= 0) {
+        CK(cudaSetDevice(0));
+        gpu_projection_synthetic();
+        return g_fail ? 1 : 0;
     }
     host_tests();
     std::unique_ptr<strix::qwen_gguf::Model> model;
@@ -651,6 +677,7 @@ int main(int argc, char** argv) {
         std::printf("device: %s sm_%d%d\n", p.name, p.major, p.minor);
     }
     if (gpu) {
+        std::printf("note: --gpu inherits dispatch policy; RP16 qualification requires both qwen_dense_rows16 CTests\n");
         const auto t0 = std::chrono::steady_clock::now();
         gpu_quantize_tests();
         gpu_projection_synthetic();

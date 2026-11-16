@@ -28,6 +28,10 @@
 #include <mutex>
 
 namespace strix::cuda::qwen_dense {
+#ifdef STRIX_QWEN_DENSE_TEST_DISPATCH
+// Defined by the test executable; absent from production builds.
+void test_dispatch(std::uint32_t rows, bool one_pass);
+#endif
 namespace {
 
 // STRIX_QRTX_DECODE_KERNELS=0: keep the tiled kernels at rows <= 8 too (reference seam for the decode-shaped ones).
@@ -762,9 +766,16 @@ template <Store S> cudaError_t launch_project(cudaStream_t stream, const KSite& 
     // 9..16 rows (core::decode_rows_max): <= 8-row decode pieces. A piece sees rows r0.. through offset codes / deltas /
     // outputs / gates; each (row, output) chain is row-local, so the bits are the tiled kernel's.
     if (rows > core::kDecodePieceRows && rows <= core::decode_rows_max() && k.width <= 6144U && decode_rows_enabled() &&
-        rows_ksplit_enabled() && rows16_enabled())
+        rows_ksplit_enabled() && rows16_enabled()) {
+#ifdef STRIX_QWEN_DENSE_TEST_DISPATCH
+        test_dispatch(rows, true);
+#endif
         return launch_rows_ks<S>(stream, k, rows, codes, deltas, pitch);   // one weight pass for 9..16 rows
+    }
     if (rows > core::kDecodePieceRows && rows <= core::decode_rows_max() && k.width <= 6144U && decode_rows_enabled()) {
+#ifdef STRIX_QWEN_DENSE_TEST_DISPATCH
+        test_dispatch(rows, false);
+#endif
         constexpr std::uint64_t elem = S == Store::f32 || S == Store::f32_round_bf16 ? 4U : 2U;
         for (std::uint32_t r0 = 0; r0 < rows; r0 += core::kDecodePieceRows) {
             KSite p = k;
