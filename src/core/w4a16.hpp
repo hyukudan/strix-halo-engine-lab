@@ -11,11 +11,15 @@
 #include <hip/hip_runtime.h>
 #include <cstddef>
 #include <cstdint>
+#include "core/iu4_rows_plan.hpp"
 
 namespace strix::core::w4a16 {
 
 using Half2 = _Float16 __attribute__((ext_vector_type(2)));
 using Float2 = float __attribute__((ext_vector_type(2)));
+// Volatile access through a generic pointer lowers to FLAT plus global-memory
+// completion waits. Preserve the local address space explicitly for dot staging.
+using LocalFloat2 = Float2 __attribute__((address_space(3)));
 using U4 = std::uint32_t __attribute__((ext_vector_type(4)));
 
 // Nibbles at bit s and 16 + s of w as FP16 pair (exact): ((n ^ 8) | 0x6400) = 1024 + n + 8 (two's complement n), - 1032.
@@ -101,7 +105,7 @@ __device__ __forceinline__ void wave_rows(const std::uint8_t* wq, const std::uin
                 if (row >= nrows) break;
                 if constexpr (StoreDots) {
                     if (t) {
-                        const Float2 previous = reinterpret_cast<volatile Float2*>(staged_dot)[row * 32U + lane];
+                        const Float2 previous = ((volatile LocalFloat2*)staged_dot)[row * 32U + lane];
                         dot[d][0] = previous[0]; dot[d][1] = previous[1];
                     } else dot[d][0] = dot[d][1] = 0.0F;
                 }
@@ -121,7 +125,7 @@ __device__ __forceinline__ void wave_rows(const std::uint8_t* wq, const std::uin
                     dot[d][1] = __builtin_amdgcn_fdot2(wn[3][j], ph[j], dot[d][1], false);
                 }
                 if constexpr (StoreDots) {
-                    if (t < 3U) reinterpret_cast<volatile Float2*>(staged_dot)[row * 32U + lane] = Float2{dot[d][0], dot[d][1]};
+                    if (t < 3U) ((volatile LocalFloat2*)staged_dot)[row * 32U + lane] = Float2{dot[d][0], dot[d][1]};
                     else {
                         acc[row][0] = __builtin_fmaf(s0, dot[d][0], acc[row][0]);
                         acc[row][1] = __builtin_fmaf(s1, dot[d][1], acc[row][1]);

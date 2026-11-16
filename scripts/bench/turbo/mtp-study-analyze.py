@@ -180,7 +180,8 @@ def main():
     runs = [load_run(path) for path in a.runs]
     result = {'runs': {str(path): [dict(request=n, cls=cls, depth=d, **counts,
                   equality=counts['equal'] / counts['compared'],
-                  conditional_acceptance=counts['accepted'] / max(1, counts['reached']),
+                  conditional_acceptance=counts['accepted'] / counts['reached'] if counts['reached'] else None,
+                  counterfactual_conditional_acceptance=counts['expected_greedy_accept'] / counts['reached'] if counts['reached'] else None,
                   mean_proposal_p=counts['proposal_p_sum'] / counts['compared'],
                   normal_accounting_gap=counts['accounting_gap'])
                   for (n, cls, d), counts in sorted(run[3].items())]

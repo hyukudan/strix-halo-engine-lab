@@ -4,6 +4,7 @@
 #include "strix/q6p_registry.hpp"
 #include "strix/env_flags.hpp"
 #include "core/iu4_onfly.hpp"
+#include "core/iu4_rows_plan.hpp"
 #include "core/wmma_tiled.hpp"
 
 #include <hip/hip_runtime.h>
@@ -286,10 +287,28 @@ float median_us(const Fixture& f, Mode mode, bool cold, const Buffer& flush, hip
     std::sort(samples.begin(), samples.end());
     return samples[samples.size() / 2U];
 }
+struct SingleDecodeSetting {
+    bool present;
+    std::string value;
+    SingleDecodeSetting() {
+        const char* raw = envcfg::text("STRIX_IU4_R8_SINGLE_DECODE");
+        present = raw != nullptr;
+        value = raw ? raw : "";
+    }
+    core::iu4_rows::SingleDecodePolicy policy() const {
+        return core::iu4_rows::parse_single_decode_policy(value);
+    }
+    void restore() const {
+        const int rc = present ? setenv("STRIX_IU4_R8_SINGLE_DECODE", value.c_str(), 1) : unsetenv("STRIX_IU4_R8_SINGLE_DECODE");
+        require(rc == 0, "restore requested row policy");
+    }
+};
+
 // Same weight/input pointers across row buckets: isolate regrouping of FP32
 // partial sums from quantization error or changes in activations.
 void onfly_row_invariance(hipStream_t stream) {
-    const bool requested_single = envcfg::flag("STRIX_IU4_R8_SINGLE_DECODE", false);
+    const SingleDecodeSetting requested_single;
+    static_cast<void>(requested_single.policy());
     unsigned observations = 0;
     struct Difference {
         std::uint32_t changed = 0, top_reference = 0, top_actual = 0;
@@ -359,7 +378,7 @@ void onfly_row_invariance(hipStream_t stream) {
                     const q6p::iu4::SuspendScope suspended;
                     require(setenv("STRIX_IU4_R8_SINGLE_DECODE", "0", 1) == 0, "set native row control");
                     native = f.run(mode, stream)[0];
-                    require(setenv("STRIX_IU4_R8_SINGLE_DECODE", "1", 1) == 0, "set native row candidate");
+                    require(setenv("STRIX_IU4_R8_SINGLE_DECODE", "force", 1) == 0, "set native row candidate");
                     require(f.run(mode, stream)[0] == native, "single-decode switch changed native output bits");
                 }
                 if (rows == 1U) native_reference = native;
@@ -384,7 +403,7 @@ void onfly_row_invariance(hipStream_t stream) {
                 require(halves_launches > 0U, "row-invariance arm silently bypassed IU4");
                 if (rows == 1U) halves_reference = halves;
                 emit("iu4-halves", halves_reference, halves, halves_launches);
-                require(setenv("STRIX_IU4_R8_SINGLE_DECODE", "1", 1) == 0, "set full-row policy");
+                require(setenv("STRIX_IU4_R8_SINGLE_DECODE", "force", 1) == 0, "set full-row policy");
                 before = q6p::iu4::launches.load();
                 const auto single = f.run(mode, stream)[0];
                 const auto single_launches = q6p::iu4::launches.load() - before;
@@ -397,7 +416,7 @@ void onfly_row_invariance(hipStream_t stream) {
         require(f.weights.download() == weight_seed, "row-invariance weights changed between buckets");
         q6p::iu4::unregister_tensor(original, base);
     }
-    require(setenv("STRIX_IU4_R8_SINGLE_DECODE", requested_single ? "1" : "0", 1) == 0, "restore requested row policy");
+    requested_single.restore();
     std::cout << "onfly-row-invariance-complete observations=" << observations
         << " same_bucket_policies_bitwise=1 native_switch_bitwise=1\n";
 }
@@ -429,15 +448,16 @@ void onfly_decode_bench(hipStream_t stream) {
                 require(f.run(Mode::rows, stream) == exact, "onfly benchmark native arm changed bits");
                 require(f.run(Mode::rows_a8, stream) == exact_a8, "onfly benchmark native A8 arm changed bits");
             }
-            const bool single_decode = envcfg::flag("STRIX_IU4_R8_SINGLE_DECODE", false);
+            const SingleDecodeSetting requested_single;
+            const auto single_decode = requested_single.policy();
             if (rows >= 7U) {
                 for (const auto mode : {Mode::rows, Mode::rows_a8}) {
                     require(setenv("STRIX_IU4_R8_SINGLE_DECODE", "0", 1) == 0, "set row-half control");
                     const auto control = f.run(mode, stream);
-                    require(setenv("STRIX_IU4_R8_SINGLE_DECODE", "1", 1) == 0, "set single-decode candidate");
+                    require(setenv("STRIX_IU4_R8_SINGLE_DECODE", "force", 1) == 0, "set single-decode candidate");
                     require(f.run(mode, stream) == control, "single-decode R7/R8 changed output bits");
                 }
-                require(setenv("STRIX_IU4_R8_SINGLE_DECODE", single_decode ? "1" : "0", 1) == 0, "restore row-half policy");
+                requested_single.restore();
             }
             for (const bool cold : {true, false}) for (const auto mode : {Mode::rows, Mode::rows_a8}) {
                 float native_us = 0.0F;
@@ -454,8 +474,11 @@ void onfly_decode_bench(hipStream_t stream) {
                     << " native_us=" << native_us << " onfly_us=" << onfly_us << " native_bytes=" << f.weights.bytes
                     << " onfly_bytes=" << bytes << " native_GBs=" << static_cast<double>(f.weights.bytes) / native_us / 1000.0
                     << " onfly_GBs=" << static_cast<double>(bytes) / onfly_us / 1000.0 << " iu4_launches=" << launches
-                    << " pack_loads=" << (launches && rows >= 7U && !single_decode ? 2U : 1U)
-                    << " single_decode=" << single_decode << " row_policy_bitwise=1" << '\n';
+                    << " pack_loads=" << (launches ? core::iu4_rows::packed_loads(rows, width / 64U, single_decode) : 1U)
+                    << " single_decode=" << core::iu4_rows::single_decode_applies(rows, width / 64U, single_decode)
+                    << " single_decode_policy=" << (requested_single.value.empty() ? "0" : requested_single.value)
+                    << " single_decode_admitted=" << core::iu4_rows::staged_single_decode_admitted(rows, width / 64U)
+                    << " row_policy_bitwise=1" << '\n';
             }
             q6p::iu4::unregister_tensor(original, base);
         }
