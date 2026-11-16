@@ -10,6 +10,7 @@
 // The node then runs row p itself (first token, MTP adoption). Under this profile the bits do not depend on the row
 // blocking (verified on the node: T = 1024 and T = 256 give identical state), so the blocks here are free.
 #pragma once
+#include "strix/weight/admission.hpp"
 
 #include "strix/qwen_prefill_trace.hpp"
 #include "strix/qwen_prefill_schedule.hpp"
@@ -146,6 +147,8 @@ class Prefill {
 public:
     explicit Prefill(const Config& config);
     ~Prefill();
+    const weight::WeightMap& weight_map() const noexcept;
+    const std::vector<weight::LegacyConversion>& weight_conversions() const noexcept;
     Prefill(const Prefill&) = delete;
     Prefill& operator=(const Prefill&) = delete;
 

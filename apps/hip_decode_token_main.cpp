@@ -1,3 +1,4 @@
+#include "strix/weight/admission.hpp"
 #include "strix/device/hip_gate.hpp"
 #include "strix/env_flags.hpp"
 #include "../src/core/chunk_contract.hpp"
@@ -1562,6 +1563,13 @@ static int run_decode_entry(
         strix::gguf::read_file(
             options.model_path);
     strix::qwen_description::refuse_unless_described(model, info);
+    std::shared_ptr<const strix::weight::Source> weight_source;
+    auto weight_status = strix::weight::open_source(options.model_path, weight_source);
+    strix::weight::TensorIndex weight_index;
+    if (weight_status) weight_status = strix::weight::index_gguf(info, weight_source, weight_index);
+    strix::weight::WeightMap admitted_weights;
+    if (weight_status) weight_status = strix::weight::bind_qwen(weight_index, admitted_weights);
+    if (!weight_status) throw std::runtime_error("Qwen weight admission: " + weight_status.detail);
     const auto manifest =
         strix::build_model_manifest(
             info);
