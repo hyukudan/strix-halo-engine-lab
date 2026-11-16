@@ -1,5 +1,5 @@
-# qwen-turbo-v1 lever manifest (data for the shared `--profile turbo` column; opt-in, defaults unchanged).
-# id | group | env (space separated NAME=VALUE) | CLI args | identity tag | state (main|pending) | note
+# qwen-turbo-v1 study lever manifest (independent of profile tables; opt-in, defaults unchanged).
+# id | group | env (space separated NAME=VALUE) | CLI args | identity tag | state (main|pending) | note | optional off_env
 # group: lever ids sharing a group are alternatives (one value each); ALL takes the first listed of each group.
 index_proj|index_proj|STRIX_PREFILL_INDEX_PROJ_WMMA=1||idxproj16|main|BF16 indexer projections
 index_score|index_score|STRIX_PREFILL_INDEX_SCORE_WMMA=1||idxscore16|main|BF16 index scores

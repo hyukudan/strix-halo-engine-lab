@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 # Leave-one-out ablation of a TURBO lever manifest, packed into GPU tickets.
 #
-#   ablate.sh arms FAMILY [--pending] [--only id,id]       print the arms, one 'NAME|ARGS|ENV' per line
-#   ablate.sh run  FAMILY --out DIR --kit KIT [--queue CMD] [--per-ticket N] [--pending] [--only ids]
+#   bash ablate.sh arms FAMILY [--pending] [--only id,id]  print the arms, one 'NAME|ARGS|ENV' per line
+#   bash ablate.sh run FAMILY --out DIR --kit KIT [--queue CMD] [--per-ticket N] [--pending] [--only ids]
 #                  [--rounds R] -- KITARGS...               one ticket per group of arms (default arm always first)
 #
-# FAMILY = a scripts/bench/turbo/<family>.levers manifest (id|group|env|args|tag|state|note). ALL takes the first lever
+# FAMILY = a scripts/bench/turbo/<family>.levers manifest (id|group|env|args|tag|state|note|off_env). ALL takes the first lever
 # of every group whose state is "main" (plus "pending" with --pending); an alternative of a group is its own arm
 # 'alt-<id>' (ALL with that lever replacing the group's first). Arms: default, all, no-<id> for each lever of ALL, alt-*.
 # KIT is a path under scripts/bench/ (e.g. qwen/length-matrix); KITARGS go to it after the generated --arm words.
@@ -24,19 +24,19 @@ while (($#)); do
 done
 man=$here/$fam.levers
 [[ -f $man ]] || { echo "ablate: no manifest $man" >&2; exit 64; }
-ids=() grp=() env=() arg=() state=()
-while IFS='|' read -r i g e a t s n; do
+ids=() grp=() env=() arg=() state=() off=()
+while IFS='|' read -r i g e a t s n o; do
     [[ -z $i || $i == \#* ]] && continue
     [[ $s == main || $pending == 1 ]] || continue
     [[ -n $only && ",$only," != *",$i,"* ]] && continue
-    ids+=("$i") grp+=("$g") env+=("$e") arg+=("$a") state+=("$s")
+    ids+=("$i") grp+=("$g") env+=("$e") arg+=("$a") state+=("$s") off+=("$o")
 done <"$man"
 seen=' '; first=()
 for k in "${!ids[@]}"; do [[ $seen == *" ${grp[k]} "* ]] || { seen+="${grp[k]} "; first+=("$k"); }; done
 armof() { # armof NAME skip_index [replace_index]
     local e='' a='' k
     for k in "${first[@]}"; do
-        [[ $k == "$2" ]] && continue
+        if [[ $k == "$2" ]]; then e+="${off[k]} "; continue; fi
         [[ -n ${3:-} && ${grp[k]} == "${grp[$3]}" ]] && continue
         e+="${env[k]} " a+="${arg[k]} "
     done
@@ -53,6 +53,10 @@ case $mode in
     arms) emit ;;
     run)
         [[ -n $out && -n $kit ]] || { echo 'ablate run needs --out and --kit' >&2; exit 64; }
+        [[ $per =~ ^[0-9]+$ && ${#per} -le 9 ]] && ((10#$per >= 2)) || {
+            echo 'ablate: --per-ticket must be an integer at least 2 (at most 9 digits)' >&2; exit 64;
+        }
+        per=$((10#$per))
         mapfile -t A < <(emit); d=${A[0]}; rest=("${A[@]:1}"); g=0
         for ((i = 0; i < ${#rest[@]}; i += per - 1)); do
             words=(--arm "$d"); for a in "${rest[@]:i:per-1}"; do words+=(--arm "$a"); done

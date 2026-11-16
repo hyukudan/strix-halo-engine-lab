@@ -67,7 +67,8 @@ def census(path, rows, emitted):
     topk = next((v for k, v in meta.items() if k.endswith(".expert_used_count")), 0)
     groups = {k: {"tensors": 0, "q8_bytes": 0, "int4_bytes": 0, "shapes": {}}
               for k in ("gdn_in", "gdn_out", "qsa_io", "shared_expert")}
-    dense = moe = embed = 0
+    dense = moe = embed = saving = unused = fallback_copy = 0
+    fallback_tensors = 0
     for i, (name, dims, kind, offset) in enumerate(tensors):
         end = tensors[i + 1][3] if i + 1 < nt else os.path.getsize(path) - data
         size = math.prod(dims) // 32 * 34 if kind == 8 else end - offset
@@ -88,30 +89,39 @@ def census(path, rows, emitted):
         elif name.endswith(("ffn_gate_shexp.weight", "ffn_up_shexp.weight", "ffn_down_shexp.weight")):
             group = "shared_expert"
         if group and kind == 8 and len(dims) == 2:
+            k, n = dims
+            # Mirror qwen_onfly_i4_candidate and launch_iu4_rows. Allocation
+            # alone does not mean the projection dispatch consumes the copy.
+            convertible = (0 < k <= 0xFFFFFFFF and 0 < n <= 0xFFFFFFFF
+                           and k % 64 == 0)
+            copy = math.ceil(n / 64) * 64 * k * 17 // 32 if convertible else 0
+            eligible = convertible and rows <= 8 and k // 64 in (32, 40, 64, 96)
+            if eligible:
+                saving += size - copy
+            else:
+                fallback_tensors += 1
+                fallback_copy += copy
+                if name.endswith("ffn_down_shexp.weight"):
+                    unused += copy
             g = groups[group]
             g["tensors"] += 1
             g["q8_bytes"] += size
-            g["int4_bytes"] += math.ceil(dims[1] / 64) * 64 * dims[0] * 17 // 32
+            g["int4_bytes"] += copy
             shape = "x".join(map(str, dims))
             g["shapes"][shape] = g["shapes"].get(shape, 0) + 1
     if not experts or not topk:
         raise ValueError("expert counts unavailable; cannot infer active MoE bytes")
-    converted_saving = sum(g["q8_bytes"] - g["int4_bytes"] for g in groups.values())
-    # The current launcher accepts K/64 in {32, 40, 64, 96}; K=640
-    # shared-down copies are allocated but not consumed by this path.
-    unused = sum(math.ceil(dims[1] / 64) * 64 * dims[0] * 17 // 32
-                 for name, dims, kind, _ in tensors
-                 if kind == 8 and len(dims) == 2
-                 and name.endswith("ffn_down_shexp.weight") and dims[0] // 64 not in (32, 40, 64, 96))
-    saving = converted_saving - unused if rows <= 8 else 0
     exact = [dense + moe * min(experts, topk * u) / experts for u in (1, rows)]
     return {"schema": "decode-layout/v1", "metadata": meta, "groups": groups,
             "dense_bytes_per_pass": dense, "all_expert_bytes": moe,
             "embedding_bytes_excluded": embed, "verify_rows": rows,
             "emitted_per_pass": emitted, "onfly_copy_bytes": sum(g["int4_bytes"] for g in groups.values()),
             "unconsumed_shared_down_copy_bytes": unused,
+            "unconsumed_copy_bytes": fallback_copy,
+            "q8_fallback_tensors": fallback_tensors,
             "logical_saved_bytes_per_pass": saving,
-            "onfly_row_route": "eligible" if rows <= 8 else "Q8 fallback for a single wide projection call",
+            "onfly_row_route": ("Q8 fallback for a single wide projection call" if rows > 8 else
+                                "contains Q8 fallback shapes" if fallback_tensors else "eligible"),
             "exact_logical_weight_bytes_per_pass_bounds": exact,
             "onfly_logical_weight_bytes_per_pass_bounds": [b - saving for b in exact],
             "exact_logical_weight_bytes_per_emitted_token_bounds": [b / emitted for b in exact],

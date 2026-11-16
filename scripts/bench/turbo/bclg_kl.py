@@ -6,6 +6,7 @@ Record 0 is the prefill's last row (the prompt-conditioned distribution); later 
 comparable only while both runs emitted the same tokens (stop at the first step whose emitted token differs).
 """
 import struct, sys
+from itertools import zip_longest
 import numpy as np
 
 
@@ -13,11 +14,17 @@ def records(path):
     with open(path, "rb") as f:
         while True:
             h = f.read(24)
-            if len(h) < 24:
+            if not h:
                 return
+            if len(h) != 24:
+                raise ValueError(f"{path}: incomplete BCLG header")
             magic, step, pos, argmax, emitted, n = struct.unpack("<6I", h)
-            assert magic == 0x42434C47, path
-            yield step, argmax, emitted, np.frombuffer(f.read(4 * n), np.float32).astype(np.float64)
+            if magic != 0x42434C47 or not n or argmax >= n or emitted >= n:
+                raise ValueError(f"{path}: invalid BCLG header")
+            payload = f.read(4 * n)
+            if len(payload) != 4 * n:
+                raise ValueError(f"{path}: incomplete BCLG payload")
+            yield step, pos, argmax, emitted, np.frombuffer(payload, '<f4').astype(np.float64)
 
 
 def lse(x):
@@ -31,7 +38,13 @@ def main():
         cand = list(records(cp))
         kl, t1, dn = [], 0, []
         n = 0
-        for (s, a, e, lr), (s2, a2, e2, lc) in zip(ref, cand):
+        for rr, cr in zip_longest(ref, cand):
+            if rr is None or cr is None:
+                raise ValueError(f"{cp}: unmatched records before token divergence")
+            s, pos, a, e, lr = rr
+            s2, pos2, a2, e2, lc = cr
+            if (s, pos, len(lr)) != (s2, pos2, len(lc)):
+                raise ValueError(f"{cp}: step/position/vocabulary mismatch")
             lpr, lpc = lr - lse(lr), lc - lse(lc)
             kl.append(float((np.exp(lpr) * (lpr - lpc)).sum()))
             t1 += int(a == a2)

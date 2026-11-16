@@ -1,4 +1,4 @@
-# minimax-turbo-v1 lever manifest (pair).
+# minimax-turbo-v1 study lever manifest (pair; layers 40-59 + fast_i4 differ from the profile table).
 msa_flash|flash|STRIX_MM_PF_MSA_FLASH=1 STRIX_MM_PF_MSA_FLASH_LAYERS=40-59||msa-flash-bf16-l40-v1|main|one-term flash, layers 40-59 (gate passes)
 msa_flash_all|flash|STRIX_MM_PF_MSA_FLASH=1 STRIX_MM_PF_MSA_FLASH_LAYERS=0-59||msa-flash-bf16-l0-v1|pending|mode 11 on every layer (evaluate by tasks)
 moe_invariant|moe|STRIX_MOE_ORDER=invariant||mm-moe-invariant|pending|#662 rows-free MoE order
