@@ -139,6 +139,7 @@ def compare_logits(left, right, left_run, right_run, context_only=False):
     r, rc = indexed_logits(right, right_run)
     stats = collections.defaultdict(list)
     row_pairs = collections.defaultdict(collections.Counter)
+    disagreement_examples = []
     joint = collections.defaultdict(lambda: collections.Counter(
         matched_target_rows=0, left_draft_rows=0, right_draft_rows=0,
         left_draft_left_target_equal=0, left_draft_right_target_equal=0,
@@ -180,6 +181,15 @@ def compare_logits(left, right, left_run, right_run, context_only=False):
         rows.update(rows=1, top1_equal=int(tx == ty), bitwise=bitwise)
         rows['max_abs'] = max(rows['max_abs'], float(np.max(np.abs(x.astype(np.float64) - y))))
         px, py = proposal(left_run, key, lf, tx), proposal(right_run, key, rf, ty)
+        if tx != ty and len(disagreement_examples) < 16:
+            fields = ('at', 'd', 'budget', 'proposal', 'target', 'reached', 'eligible', 'eos',
+                      'greedy_accept', 'diagnostic', 'accepted')
+            disagreement_examples.append(dict(
+                cls=CLASSES[req['lane']], request=key[0], position=key[1],
+                left_rows=lf[4], left_row=lf[3], right_rows=rf[4], right_row=rf[3],
+                left_top1=tx, right_top1=ty,
+                left_proposal={k: px[k] for k in fields} if px is not None else None,
+                right_proposal={k: py[k] for k in fields} if py is not None else None))
         depth = px['d'] if px is not None else py['d'] if py is not None else key[2] + 1
         j = joint[(CLASSES[req['lane']], depth)]
         j['matched_target_rows'] += 1
@@ -202,6 +212,7 @@ def compare_logits(left, right, left_run, right_run, context_only=False):
             top1_equal=int(tx == ty), bitwise=bitwise))
     return dict(left_records=dict(lc), right_records=dict(rc),
                 matching='full-context' if context_only else 'full-context-and-physical-row',
+                disagreement_examples=disagreement_examples,
                 row_pairs=[dict(left_rows=lr, left_row=lrow, right_rows=rr, right_row=rrow, **c)
                            for (lr, lrow, rr, rrow), c in sorted(row_pairs.items())],
                 proposal_vs_targets=[dict(cls=cls, depth=depth, **c,
