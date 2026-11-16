@@ -21,7 +21,7 @@ repeticiones e interruptores de apagado en [rendimiento](docs/performance.md) y 
 | Qwen3.8-Flash-Next | 2 nodos (prefill en pipeline, opcional) | - | 2,968 tok/s a 32K (exacto), 3,191 (`fast`, opcional; calificación de calidad en curso); por debajo de 28,672 filas de prompt el par lee el prompt en un nodo |
 | DeepSeek V4.1 Flash | par | 70.6 tok/s (DSpark, código) | 1,165 tok/s a 8K, 1,285 a 32K (exacto); 1,377 / 1,546 con el perfil FAST de prefill (opcional; [puerta de calidad relativa al suelo superada](docs/models/deepseek-v4.1/README.es.md#puerta-de-calidad-del-prefill-fast)) |
 | MiniMax M3.1 Flash | par | 23.10 tok/s (1K) | 669 tok/s a 8K, 529 a 32K (exacto) |
-| GLM-5.3 Flash | par | 44.5 tok/s (MTP, código) | 541 tok/s a 8K, 529 a 32K (exacto); 918 a 8K (`fast`, opcional; calificación de calidad en curso) |
+| GLM-5.3 Flash | par | 44.5 tok/s (MTP, código) | 664 tok/s a 8K (exacto, segundo prefill en caliente), 642 a 32K (exacto); `fast` (opcional; calificación de calidad en curso) a 8K: 957 en caliente, 918 en proceso nuevo |
 | Nemotron 3.5 Bolt E4B | 1 nodo | 91.9 tok/s (C1) | 2,780 tok/s a 8K, 2,336 a 32K (`fast`) |
 | Nemotron 3.5 Bolt E4B | 2 nodos (prefill en pipeline, opcional) | - | 4,804 tok/s a 8K, 3,965 a 32K (`fast`, mismos bytes que 1 nodo) |
 | MiniMax H3 | par | clip de 5 s 1344x768 con audio en 405.5 s | - |

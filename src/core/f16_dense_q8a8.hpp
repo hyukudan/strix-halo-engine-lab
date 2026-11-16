@@ -28,16 +28,39 @@ struct View {
     std::uint32_t accumulate;    // out += sum
 };
 
+// Forms (bits of the kernel template; every form gives the contract's bits):
+//   kWPacked : the stagers decode weights two at a time in packed FP16 (w16_pair) instead of one FP32 product each.
+inline constexpr unsigned kWPacked = 1U;
+
 namespace detail {
 using GlobalBytes16 = const U4 __attribute__((address_space(1), aligned(1)));
 using GlobalBytes4 = const std::uint32_t __attribute__((address_space(1), aligned(1)));
 using Half8 = _Float16 __attribute__((ext_vector_type(8)));
+using Half2 = _Float16 __attribute__((ext_vector_type(2)));
 __device__ __forceinline__ float code(std::uint32_t word, unsigned byte) {  // signed byte `byte` of a little-endian word
     return static_cast<float>(static_cast<std::int32_t>(word << (24U - 8U * byte)) >> 24);
 }
+// w16 of the contract for byte `byte` of a word of codes: the FP32 product is exact (8 x 11 significant bits).
+__device__ __forceinline__ _Float16 w16_scalar(std::uint32_t word, unsigned byte, float scale) {
+    return static_cast<_Float16>(code(word, byte) * scale);
+}
+// The same bits for the two codes of one 16-bit half of a word (hi: bytes 2 and 3). `biased` = word ^ 0x80808080 holds
+// code + 128 per byte; v_perm_b32 puts 0x64 above each byte, i.e. the FP16 integer 1024 + code + 128; the packed
+// subtraction of 1152 is exact (|code| <= 128, so code is an FP16 integer) and one packed FP16 multiply rounds the exact
+// product code * scale once (RNE), the single rounding of the FP32 path: equal for subnormal, infinite and NaN scales
+// too (the device test compares all 65,536 scales x 256 codes bit for bit).
+__device__ __forceinline__ Half2 w16_pair(std::uint32_t biased, unsigned hi, Half2 scale2) {
+    const std::uint32_t bits = __builtin_amdgcn_perm(0x64646464U, biased, hi ? 0x04030402U : 0x04010400U);
+    const _Float16 bias = static_cast<_Float16>(1152.0F);
+    return (__builtin_bit_cast(Half2, bits) - Half2{bias, bias}) * scale2;
+}
+// a16 of the contract: fp16_rne(float(code) * delta), delta FP32 (never narrowed)
+__device__ __forceinline__ _Float16 a16_value(std::uint32_t word, unsigned byte, float delta) {
+    return static_cast<_Float16>(code(word, byte) * delta);
+}
 }  // namespace detail
 
-template <unsigned Waves> struct Cols {
+template <unsigned Waves, unsigned Form = 0U> struct Cols {
     static constexpr unsigned kWaves = Waves;
     View v;
     __device__ __forceinline__ ColumnTile tile(unsigned i) const {
@@ -55,6 +78,28 @@ template <unsigned Waves> struct Cols {
             d[4U * i] = t[0], d[4U * i + 1U] = t[1], d[4U * i + 2U] = t[2], d[4U * i + 3U] = t[3];
         }
         d[16] = *(detail::GlobalBytes4*)(p + 64U);
+        if constexpr ((Form & kWPacked) != 0U) {
+            std::uint32_t x[17];
+#pragma unroll
+            for (unsigned i = 0; i < 17U; ++i) x[i] = d[i] ^ 0x80808080U;
+#pragma unroll
+            for (unsigned b = 0; b < 2U; ++b) {
+                const unsigned at = 34U * b;  // the scale's half of word at / 4 (at % 4 is 0 or 2)
+                const std::uint32_t s = (d[at / 4U] >> (8U * (at % 4U))) & 0xffffU;
+                const detail::Half2 scale2 = __builtin_bit_cast(detail::Half2, s | (s << 16U));
+#pragma unroll
+                for (unsigned q = 0; q < 4U; ++q) {
+                    U4 h;
+#pragma unroll
+                    for (unsigned j = 0; j < 4U; ++j) {  // codes at bytes at + 2 + 8 q + 2 j, + 1: one half of a word
+                        const unsigned byte = at + 2U + 8U * q + 2U * j;
+                        h[j] = __builtin_bit_cast(std::uint32_t, detail::w16_pair(x[byte / 4U], (byte % 4U) / 2U, scale2));
+                    }
+                    nb[4U * b + q] = h;
+                }
+            }
+            return;
+        }
 #pragma unroll
         for (unsigned b = 0; b < 2U; ++b) {
             const unsigned at = 34U * b;  // block: scale at bytes at, at + 1; codes from at + 2
@@ -66,19 +111,19 @@ template <unsigned Waves> struct Cols {
 #pragma unroll
                 for (unsigned i = 0; i < 8U; ++i) {
                     const unsigned byte = at + 2U + 8U * q + i;
-                    h[i] = static_cast<_Float16>(detail::code(d[byte / 4U], byte % 4U) * scale);
+                    h[i] = detail::w16_scalar(d[byte / 4U], byte % 4U, scale);
                 }
                 nb[4U * b + q] = __builtin_bit_cast(U4, h);
             }
         }
     }
     __device__ __forceinline__ Half16 fragment(unsigned row, unsigned unit) const {
-        const auto* p = reinterpret_cast<const std::uint8_t*>(v.codes) + static_cast<std::size_t>(row) * v.x_stride + 16U * unit;
-        const U4 t = *(detail::GlobalBytes16*)p;
+        const std::size_t at = static_cast<std::size_t>(row) * v.x_stride + 16U * unit;
         const float delta = v.deltas[static_cast<std::size_t>(row) * (v.x_stride / 32U) + unit / 2U];
+        const U4 t = *(detail::GlobalBytes16*)(reinterpret_cast<const std::uint8_t*>(v.codes) + at);
         Half16 h;
 #pragma unroll
-        for (unsigned i = 0; i < 16U; ++i) h[i] = static_cast<_Float16>(detail::code(t[i / 4U], i % 4U) * delta);
+        for (unsigned i = 0; i < 16U; ++i) h[i] = detail::a16_value(t[i / 4U], i % 4U, delta);
         return h;
     }
 };
@@ -103,9 +148,9 @@ struct Store {
     template <class F> __device__ __forceinline__ void run(F&& f) { f(*this); }
 };
 
-template <unsigned TC, unsigned Waves> __global__ __launch_bounds__(32 * Waves) void kernel(View v) {
+template <unsigned TC, unsigned Waves, unsigned Form> __global__ __launch_bounds__(32 * Waves) void kernel(View v) {
     __shared__ Storage<TC> lds;
-    core<TC>(nullptr, v.in, v.rows, Cols<Waves>{v}, lds, Store{v.count, v.tile0, v.accumulate});
+    core<TC>(nullptr, v.in, v.rows, Cols<Waves, Form>{v}, lds, Store{v.count, v.tile0, v.accumulate});
 }
 
 inline bool supported(const View& v) {
@@ -123,27 +168,40 @@ inline unsigned waves_for(unsigned rows, unsigned in, unsigned waves = 0U) {
     return waves == 8U || waves == 16U ? waves : rows >= 512U && (in >= 8192U || rows < 1024U) ? 16U : 8U;
 }
 
-template <unsigned Waves> inline void launch(View v, hipStream_t stream) {
+// Form of a call (kWPacked or 0; the same bits either way). kFormRule = STRIX_F16_Q8A8_WPACK (default on; 0 = the scalar
+// FP32 decode of every weight, the previous form).
+inline constexpr unsigned kFormRule = ~0U;
+inline unsigned form_for(unsigned form = kFormRule) {
+    static const unsigned rule = envcfg::flag("STRIX_F16_Q8A8_WPACK", true) ? kWPacked : 0U;
+    return (form == kFormRule ? rule : form) & kWPacked;
+}
+
+template <unsigned Waves, unsigned Form> inline void launch(View v, hipStream_t stream) {
     const unsigned tiles = (v.count + 15U) / 16U, gx = (v.rows + 16U * Waves - 1U) / (16U * Waves);
     const Plan pl = plan(tiles, v.rows, true);
     v.tile0 = 0U;
-    if (pl.full) hipLaunchKernelGGL((kernel<16, Waves>), dim3(gx, pl.full), dim3(32U * Waves), 0, stream, v);
+    if (pl.full) hipLaunchKernelGGL((kernel<16, Waves, Form>), dim3(gx, pl.full), dim3(32U * Waves), 0, stream, v);
     v.tile0 = 16U * pl.full;
-    if (pl.tc == 1U) hipLaunchKernelGGL((kernel<1, Waves>), dim3(gx, pl.gy), dim3(32U * Waves), 0, stream, v);
-    if (pl.tc == 2U) hipLaunchKernelGGL((kernel<2, Waves>), dim3(gx, pl.gy), dim3(32U * Waves), 0, stream, v);
-    if (pl.tc == 4U) hipLaunchKernelGGL((kernel<4, Waves>), dim3(gx, pl.gy), dim3(32U * Waves), 0, stream, v);
+    if (pl.tc == 1U) hipLaunchKernelGGL((kernel<1, Waves, Form>), dim3(gx, pl.gy), dim3(32U * Waves), 0, stream, v);
+    if (pl.tc == 2U) hipLaunchKernelGGL((kernel<2, Waves, Form>), dim3(gx, pl.gy), dim3(32U * Waves), 0, stream, v);
+    if (pl.tc == 4U) hipLaunchKernelGGL((kernel<4, Waves, Form>), dim3(gx, pl.gy), dim3(32U * Waves), 0, stream, v);
+}
+template <unsigned Waves> inline void launch_form(const View& v, unsigned form, hipStream_t stream) {
+    if (form == kWPacked) launch<Waves, kWPacked>(v, stream);
+    else launch<Waves, 0U>(v, stream);
 }
 
 // Caller checks supported(v) and the launch error (hipGetLastError).
-inline void enqueue(const View& v, hipStream_t stream, unsigned waves = 0U) {
-    if (waves_for(v.rows, v.in, waves) == 16U) launch<16>(v, stream);
-    else launch<8>(v, stream);
+inline void enqueue(const View& v, hipStream_t stream, unsigned waves = 0U, unsigned form = kFormRule) {
+    const unsigned f = form_for(form);
+    if (waves_for(v.rows, v.in, waves) == 16U) launch_form<16>(v, f, stream);
+    else launch_form<8>(v, f, stream);
 }
 // Independent FP32 chains per K part, added in unfused order by Store.
 // Caller validates each equal-width part; the stream orders the output additions.
-inline void enqueue_parts(View v, unsigned parts, hipStream_t stream) {
+inline void enqueue_parts(View v, unsigned parts, hipStream_t stream, unsigned form = kFormRule) {
     for (unsigned part = 0; part < parts; ++part) {
-        enqueue(v, stream);
+        enqueue(v, stream, 0U, form);
         if (part + 1U == parts) break;
         v.k_bytes += v.in / 32U * 34U;
         v.codes += v.in;

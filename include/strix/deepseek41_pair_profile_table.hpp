@@ -12,7 +12,7 @@
 // (docs/optimizations.json). No quality pack: 'quality' runs default with one notice.
 namespace strix::deepseek41::pair_defaults {
 
-inline constexpr std::array<strix::profile::Lever, 6> profile_table{{
+inline constexpr std::array<strix::profile::Lever, 7> profile_table{{
     // Prefill only (device prefill of the serve and the prefill app). FP32 softmax statistics.
     {"attention_f16wmma", "STRIX_DS41_FAST_ATTN", "", {"", "1", ""}, "0", strix::profile::Kind::bit_changing,
      {true, false, true}, {true, true, true}, "ds41-attn-f16wmma-v1", "0",
@@ -35,6 +35,10 @@ inline constexpr std::array<strix::profile::Lever, 6> profile_table{{
     // profile; set, it enters the profile fingerprint (rank agreement, prefix-cache identity).
     {"decoder_replay_bounded", "STRIX_DS41_DECODER_REPLAY", "", {"", "", ""}, "0", strix::profile::Kind::bit_changing,
      {true, false, true}, {true, true, true}, "", "0", "explicit FAST policy ds41-decoder-replay-bounded-v1; gate-qualified from R = 256 (smaller bounds refused)", false, {}, true},
+    // Prefill only: the Engram KV projection on the shared FP16 WMMA core (ds41-engram-f16wmma-v1); views whose x would overflow FP16
+    // keep the exact kernel. Explicit only (not a FAST bundle member) until its qualification receipt.
+    {"engram_f16wmma", "STRIX_DS41_FAST_ENGRAM", "", {"", "", ""}, "0", strix::profile::Kind::bit_changing,
+     {true, false, true}, {true, true, true}, "", "0", "explicit FAST Engram projection; native qualification required", false, {}, true},
 }};
 
 }  // namespace strix::deepseek41::pair_defaults

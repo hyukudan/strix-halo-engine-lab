@@ -15,7 +15,13 @@ namespace strix::deepseek41::quality {
 // qa kv qb oa ob (projections; none = all), l<first>t<end> (layers), a8 (FP16 operands from the A8 codes), r<rows>
 // (FP16 only at calls of >= rows rows), f (FP16 output form: STRIX_DS41_PREFILL_FP16_FAST), s<seed> (null: +-1 ulp by a
 // hash of the seed instead of the last-bit flip, so seeds sample the noise floor).
+// Prefix eng_ (any arm, e.g. eng_fast3, eng_exact; labels are [a-z0-9_]): adds the FAST lever ds41-engram-f16wmma-v1 (Engram projection on WMMA).
 inline PrefillOptions arm_precision(const std::string& label) {
+    if (label.rfind("eng_", 0) == 0 && label.size() > 4) {
+        PrefillOptions e = arm_precision(label.substr(4));
+        e.fast_engram = true;
+        return e;
+    }
     PrefillOptions o;
     o.decoder_replay_override = true;  // every named arm is explicit, including exact/null OFF
     if (label == "exact") return o;
@@ -87,7 +93,7 @@ inline std::string arm_profile(const PrefillOptions& o) {
                        o.fp16_projections != 31U || o.approx_layer_first != 0U || o.approx_layer_end != 1000U || o.fp16_min_rows != 0U;
     if (other) return "diagnostic";
     if (fast3 && o.null_ulp_layer < 0) return "fast-prefill";
-    if (!o.fast_attention && !o.fast_attention_flash && !o.fast_moe && !o.fast_dense && o.decoder_replay_rows == 0U) return "exact";
+    if (!o.fast_attention && !o.fast_attention_flash && !o.fast_moe && !o.fast_dense && !o.fast_engram && o.decoder_replay_rows == 0U) return "exact";
     return "diagnostic";
 }
 

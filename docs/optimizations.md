@@ -892,6 +892,21 @@ Build the shared expert's FP16 operand once for gate/up and down; the existing t
 - **Measured gain:** ~-1 % TTFT at 32K; combined five-item set -0.71 s (-3.2 %) at 32K vs all five off (interleaved, same build)
 - **Implementation / evidence:** [defaults](../include/strix/qpf2k_defaults.hpp), [engine reference](getting-started/engine-reference.md)
 
+<a id="qwen-glu-pair"></a>
+
+### Paired GLU store for the shared-expert preimage
+
+**Engine:** `qwen` (shared policy `src/core/glu_pair.hpp`). **Control:** `STRIX_QPF2K_GLU_PAIR`. **Default:** 1.
+
+When the shared-expert preimage is admitted, the tiled gate|up interleaves 16-output blocks of gate and up. Each lane then holds both operands of one (row, feature), and the epilogue writes the FP16 activation directly. Neither the FP32 gate|up image nor the activation pass is materialized. The activation pass shrinks to the shared gate's dot, which runs before the gate|up so the preimage stays cache-resident for its down. With the item off, the pre-kernel no longer writes the FP32 activation that has no reader.
+
+- **Preconditions:** `STRIX_QPF2K_SHARED_PRE` admitted (its own preconditions apply), tiled gate|up admitted for the same rows, features a multiple of 16.
+- **Fallback notice:** `=0` keeps the activation pre-kernel; `=2` forces form 0 for the paired kernel (default: form 4). Any failed check keeps the pre-kernel route.
+- **Exactness evidence:** Bitwise: the shared-pre fixture (32..8192 rows, nine gate/up payload kinds including non-finite values, two streams) gives equal FP16 preimage, gate, outputs and overflow count on every route, plus an RNE oracle. Final logits are identical at 8K, 32K and 128K. The product is one `v_mul_f32`; without that, LLVM folds it with the FP16 cast into `v_fma_mixlo_f16` (1 ulp).
+- **Off switch:** STRIX_QPF2K_GLU_PAIR=0
+- **Measured gain:** Shared-expert kernels per 8K request 146.6 -> 128.0 ms (-18.6 ms), at 32K -68 ms (traced, one node). The request-level effect (-0.1 % at 8K, -0.5 % at 32K) is within clock noise.
+- **Implementation / evidence:** [policy](../src/core/glu_pair.hpp), [tiled kernel](../src/hip_dense_f16_tiled.hpp)
+
 <a id="qwen-moe-merge-commit"></a>
 
 ### MoE ordered merge + BF16 commit
@@ -1069,7 +1084,7 @@ Four exact changes to the one-row (plain, non-MTP) decode step, each with its ow
 
 ### Qwen R1 GDN preparation fusion / Fusión de preparación GDN R1
 
-**Control:** `STRIX_QWEN_DECODE_FUSE`. **Default:** OFF (opt-in with `STRIX_QWEN_DECODE_FUSE=1`; part of `STRIX_QWEN_ALLON`). **OFF:** unset it.
+**Control:** `STRIX_QWEN_DECODE_FUSE`. **Default:** ON (code default, same tokens; plain one-row decode 41.60 -> 41.37 ms per step, strict ABAB of 3 pairs). **OFF:** `STRIX_QWEN_DECODE_FUSE=0`.
 Restart after changing the switch. `--baseline`, `STRIX_BASELINE=1`, `STRIX_QPF2K_DEFAULTS=0`
 and GSQ owners disable it. `--print-effective-config` reports the resolved switch and suppression
 reason in `long_context_items`; the requested environment retains its provenance.
@@ -1115,7 +1130,7 @@ python3 tests/qwen_decode_fuse_gate.py --binary build/strix-hip-decode-token --m
   --prompt-1k prompts/1k.ids --prompt-32k prompts/32k.ids --output ../private-decode-fuse-gate
 ```
 
-**Español.** Desactivado por defecto (opción `STRIX_QWEN_DECODE_FUSE=1`, parte de `STRIX_QWEN_ALLON`); sin ella se mantiene la secuencia anterior tras
+**Español.** Activado por defecto (mismos tokens; `STRIX_QWEN_DECODE_FUSE=0` lo desactiva); sin ella se mantiene la secuencia anterior tras
 reiniciar. Baseline, `STRIX_QPF2K_DEFAULTS=0` y modelos GSQ también lo desactivan. La inspección
 informa del valor efectivo y del motivo de desactivación. En R1 de dimensión 128 se fusionan
 convolución, transformación beta/gate y normalización Q/K con los mismos cuerpos de dispositivo,
@@ -4441,6 +4456,35 @@ loop; only a wave with a dead fragment takes the predicated loop.
 - **Resources:** no kernel gains a register spill; the 128-row gate/up kernel uses 238 VGPR (239 before), occupancy and LDS bytes are unchanged.
 - **Implementation / evidence:** [shared core](../src/moe_core/grouped_f16.hpp), [GLM adapter](../src/glm/prefill/glm_pf_wmma_x.hpp), [test](../tests/hip_glm_pf_wmma_tests.hip)
 
+<a id="glm-pf-wmma-shared128"></a>
+
+### FAST shared expert on 128-row slices
+
+**Engine:** `glm` (shared core `moe_core::folded_f16`). **Control:** `STRIX_GLM_PF_WMMA_SHARED128`. **Default:** on wherever the FAST WMMA prefill runs with 128-row tiles.
+
+The shared expert holds every row of the call. Its rows were sliced by 64, so each FP16 weight tile was decoded once per 64
+rows; the slices are now 128 rows on the 128-row core (the folded F16 span runs the 128-row tile, the last partial slice the
+smallest covering tile), so each tile is decoded once per 128 rows and the LDS fills halve.
+
+- **Preconditions:** `STRIX_GLM_PF_WMMA=1`, 128-row tiles (`STRIX_GLM_PF_WMMA_ROWS=128`, the default).
+- **Exactness evidence:** Bitwise to the glm-pf-wmma-x identity: every row keeps its arithmetic; `hip_glm_pf_wmma_tests` arm 7 (64-row slices) equals the default on every buffer (1026 checks, 0 failures); pair 8K logits of both ranks equal with the switch off and on.
+- **Off switch:** `STRIX_GLM_PF_WMMA_SHARED128=0` (64-row shared slices, same bits)
+- **Measured gain:** Pair FAST 8K, warm (second prefill of the process): 8.606 -> 8.571 s (-0.4 %, two ABAB pairs, 953-957 tok/s); whole MoE call at 2048 rows on one node 26.73 -> 26.54 ms.
+- **Resources:** no register spill; LDS of the shared kernels is the 128-row storage of the routed full-tile kernel.
+
+<a id="glm-route-wave"></a>
+
+### GLM router selection: one wave per row
+
+**Engine:** `glm` (shared `moe_core::route_wave_topk`). **Control:** none (exact). **Default:** on.
+
+The top-8 expert selection ran on lane 0 of a 32-thread work-group per row (288 sigmoids and eight 288-wide scans in
+series). Each lane now owns nine experts; the eight passes use the shared wave selection on the 32-bit ordered keys
+(largest key, ties to the lower expert id), and the sort, the ascending denominator and the weights stay on lane 0.
+
+- **Exactness evidence:** Bitwise: a device stress set of 4096 rows (random, mass ties, signed zeros, infinities, NaN, saturated sigmoids; three bias sets; 1, 7, 32 and 4096 rows) equals the former serial kernel in ids and weights; pair 8K and 32K logits of both ranks equal the previous binary.
+- **Measured gain:** route kernel at 4096 rows 1.116 -> 0.033 ms; pair exact 8K warm 12.478 -> 12.366 s (-0.9 %, 3 ABAB pairs), 32K 51.265 -> 51.064 s.
+
 <a id="glm-pf-kda-wmma"></a>
 
 ### FAST KDA plain-weight projections on WMMA (glm-pf-kda-wmma-v1)
@@ -4517,6 +4561,26 @@ memory. The absorb and out GEMMs stay on the exact v3 kernels (an f16 WMMA versi
 - **Off switch:** STRIX_GLM_PF_ATTN_WMMA=0 (or exact mode)
 - **Measured gain:** Layer bench (C 2048 rows, gfx1151): scores+softmax+o-bar 17.3 -> 6.7 us/row at the 8K position, 22.9 -> 7.2 at 32K (2.6x / 3.2x); MLA total 21.3 -> 11.2 / 27.3 -> 11.4 us/row. Pair FAST, fresh process per arm: 8K prefill 10.600 -> 9.695 s (-0.905 s, -8.5 %, 2 ABAB pairs, with the removed WMMA GEMM); 32K 44.30 -> 40.26 s (-4.03 s, -9.1 %; one F / core / F set: 43.54, 40.26, 45.05 s). FAST_I4 not measured.
 - **Implementation / evidence:** [core](../src/attn_core/sparse_flash_wmma.hpp), [helpers](../src/attn_core/flash_tile.hpp), [GLM policy](../src/glm/prefill/glm_prefill.hip), [test](../tests/hip_attn_core_sparse_tests.hip), [bench](../tests/hip_glm_pf_layer_bench.hip)
+
+<a id="glm-pf-mla-qt16"></a>
+
+### FAST fused attention core reads q-tilde as a bf16 image
+
+**Engine:** `glm` (shared core `attn_core::sparse`). **Control:** `STRIX_GLM_PF_MLA_QT16`. **Default:** on wherever the FAST fused MLA core runs with the v3 absorb GEMM.
+
+The fused core rounded each FP32 q-tilde value to bf16 when it loaded its query fragments, so the absorb GEMM wrote
+4 bytes per value that the core read back only to round. The absorb GEMM now keeps its FP32 chains and stores the
+rounded value itself (`tile::to_bf16`, the core's own rounding), and the core loads those operand bits through the
+shared core's optional `query_op` policy hook with no conversion: half the q-tilde bytes written and read (268 MB per
+4096-row launch), and the core's query prologue loses its rounding code (2,722 -> 798 instructions in the kernel,
+main loop unchanged). The out GEMM still reads FP32 o-bar.
+
+- **Preconditions:** `STRIX_GLM_PF_WMMA=1` with the fused core, 32 heads per rank, absorb GEMM v3 (the default); other GEMM versions keep FP32 q-tilde.
+- **Exactness evidence:** Bitwise to the glm-pf-attn-wmma identity. `hip_glm_prefill_tests` (`STRIX_GLM_PF_TEST_ONLY=mla`): o-bar, MLA output and guard regions equal for T 32 and T 16, finite and NaN/Inf latents; layer bench arm 23 equals arm 21; pair 8K logits of both ranks equal in every A/B run.
+- **Off switch:** `STRIX_GLM_PF_MLA_QT16=0` (FP32 q-tilde, same bits)
+- **Measured gain:** Pair FAST 8K, warm (second prefill of the process): 8.617 -> 8.524 s median (-99 ms, three ABAB pairs -196 / -50 / -99 ms), 951 -> 961 tok/s, GPU clocks per token 2894k -> 2845k. Layer bench (C 4096, one node): absorb 9.52 -> 7.37 ms, fused core 27.74 -> 26.37 ms per launch. Cold first prefills follow the KFD eviction time of the run, not the switch.
+- **Resources:** no spill; fused core 256 VGPR and absorb 128 VGPR as before; same scratch buffer (the image uses half of it).
+- **Implementation / evidence:** [hook](../src/attn_core/sparse_flash_wmma.hpp), [GLM absorb + policy](../src/glm/prefill/glm_prefill.hip), [test](../tests/hip_glm_prefill_tests.hip), [bench](../tests/hip_glm_pf_layer_bench.hip), [pair A/B kit](../scripts/bench/glm/prefill-pair.sh) (arms `--profile fast` with and without `STRIX_GLM_PF_MLA_QT16=0`)
 
 <a id="mm-pf-msa-flash"></a>
 
