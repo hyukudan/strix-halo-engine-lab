@@ -67,6 +67,10 @@ target_compile_options(qwen_qsa_multi_test PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--
 add_executable(qwen_qsa_mma_test tests/cuda/qwen_qsa_mma_test.cu)
 target_link_libraries(qwen_qsa_mma_test PRIVATE strix_qwen_cuda)
 target_compile_options(qwen_qsa_mma_test PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--fmad=false>)
+# QSA index scores: shared-tree form == warp-shuffle form byte for byte (device, no model) + --bench timing
+add_executable(qwen_qsa_score_tree_test tests/cuda/qwen_qsa_score_tree_test.cu)
+target_link_libraries(qwen_qsa_score_tree_test PRIVATE strix_qwen_cuda)
+target_compile_options(qwen_qsa_score_tree_test PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--fmad=false>)
 
 # Prefix storage and compatibility planning are host-only; no CUDA initialization in their tests.
 add_library(strix_qwen_prefix STATIC src/prefix_state_cache.cpp src/cuda/models/qwen/qwen_prefix_identity.cpp)

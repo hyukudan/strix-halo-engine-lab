@@ -98,6 +98,11 @@ void block_pool(const std::uint16_t* raw_index, std::uint32_t first_block, std::
 // block_score_pooled_rows_kernel<Rows,4>: block_scores[r][b] for b < complete(r) of every row with complete(r) > 512.
 void block_scores(const float* index_query, std::uint32_t rows, std::uint64_t first_position, const float* pooled_keys,
     float* block_scores, std::uint32_t max_blocks, cudaStream_t stream);
+// Explicit form (tests / microbench): tree = block_score_tree_kernel (default, STRIX_QRTX_QSA_SCORE_TREE), false = the
+// warp-shuffle block_score_kernel. Both write the same bits to the same entries.
+enum class ScoreForm : std::uint8_t { shuffle = 0, tree = 1 };
+void block_scores_form(ScoreForm form, const float* index_query, std::uint32_t rows, std::uint64_t first_position,
+    const float* pooled_keys, float* block_scores, std::uint32_t max_blocks, cudaStream_t stream);
 // select_rows_kernel: selected[r][0..count(r)) (also sets the selected block scores to -inf, as HIP).
 void select_rows(float* block_scores, std::uint32_t max_blocks, std::uint32_t rows, std::uint64_t first_position,
     std::uint32_t* selected, cudaStream_t stream);

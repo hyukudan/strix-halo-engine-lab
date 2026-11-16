@@ -4,6 +4,7 @@
 // Every FP operation is an explicit IEEE intrinsic (__fadd_rn, __fmul_rn, __fmaf_rn, __fdiv_rn) in the HIP order.
 #include "../../core/attention_tile.cuh"
 #include "strix/env_flags.hpp"
+#include "strix/lever.hpp"
 #include "strix/cuda/qwen_qsa.hpp"
 #include "strix/cuda/vram_guard.hpp"
 
@@ -311,6 +312,101 @@ __global__ __launch_bounds__(256) void block_score_kernel(const float* __restric
     std::uint64_t first_position, const float* __restrict__ pooled_keys, std::uint32_t scored_blocks,
     float* __restrict__ block_scores, std::uint32_t max_blocks) {
     block_score_body(index_query, rows, first_position, pooled_keys, scored_blocks, block_scores, max_blocks, 0U);
+}
+
+// block_score_tree_kernel: the SAME score bits as block_score_body without its 13 shuffles per (row, block). One thread
+// owns (row, head) and keeps q[128] in registers; the CTA (64 rows x 4 heads) streams 32-block key tiles through shared
+// memory (broadcast reads). Per (row, block, head) the thread forms v[L] = (q[L]k[L] + q[L+64]k[L+64]) + (q[L+32]k[L+32] +
+// q[L+96]k[L+96]) for L = 0..31 (lane L's `partial` above) and adds them in scatter's pairing tree (L + L^16, then ^8, ^4,
+// ^2, ^1; IEEE addition is commutative, so only the pairing matters). Heads combine in order 0 + relu(h0) + .. + relu(h3)
+// through 4 shuffles inside the row's lane quad, then / sqrtf(128). Scores are staged per tile and written row-coalesced
+// with the incumbent's write condition (row < rows, block < complete(row) when complete > 512).
+// STRIX_QRTX_QSA_SCORE_TREE=0: the warp-shuffle block_score_kernel (off switch). Bitwise: same products, tree and head order.
+inline constexpr strix::lever::Decl score_tree_lever{
+    .name = "qwen_qsa_score_tree", .env = "STRIX_QRTX_QSA_SCORE_TREE", .exactness = strix::lever::Exactness::bitwise,
+    .default_on = true, .source = "tests/cuda/qwen_qsa_tests.cu: byte equality vs block_score_kernel"};
+bool score_tree_enabled() {
+    static const bool on = strix::lever::select(score_tree_lever, {}).on;
+    return on;
+}
+constexpr unsigned kTreeRows = 64, kTreeTile = 32, kTreeSeg = 256;
+static_assert(kIndexHeads == 4U && kIndexDim == 128U, "block_score_tree_kernel maps 4 heads x 128 features");
+__global__ __launch_bounds__(256, 1) void block_score_tree_kernel(const float* __restrict__ index_query, std::uint32_t rows,
+    std::uint64_t first_position, const float* __restrict__ pooled_keys, std::uint32_t scored_blocks,
+    float* __restrict__ block_scores, std::uint32_t max_blocks) {
+    __shared__ __align__(16) float sk[kTreeTile * kIndexDim];
+    __shared__ float ss[kTreeRows][kTreeTile + 1U];
+    const unsigned tid = threadIdx.x, lane = tid & 31U, rr = tid / 4U, h = tid & 3U;
+    const std::uint32_t r0 = blockIdx.x * kTreeRows, r = r0 + rr;
+    const std::uint32_t s0 = blockIdx.y * kTreeSeg, s1 = min(scored_blocks, s0 + kTreeSeg);
+    const std::uint32_t last_row = min(rows, r0 + kTreeRows) - 1U;  // complete() is nondecreasing in the row
+    const auto limit_of = [&](std::uint32_t row) -> std::uint32_t {
+        const auto complete = static_cast<std::uint32_t>((first_position + row + 1U) / kRatio);
+        return complete > kTopK ? complete : 0U;
+    };
+    if (s0 >= s1 || s0 >= limit_of(last_row)) return;  // uniform per CTA, before any barrier
+    float q[kIndexDim];
+#pragma unroll
+    for (unsigned d = 0; d < kIndexDim; d += 4U) {
+        float4 v = make_float4(0.0F, 0.0F, 0.0F, 0.0F);
+        if (r < rows) v = *reinterpret_cast<const float4*>(index_query + static_cast<std::uint64_t>(r) * kIndexQWidth + h * kIndexDim + d);
+        q[d] = v.x; q[d + 1U] = v.y; q[d + 2U] = v.z; q[d + 3U] = v.w;
+    }
+    const float scale = __fsqrt_rn(static_cast<float>(kIndexDim));
+    for (std::uint32_t b0 = s0; b0 < s1; b0 += kTreeTile) {
+        const unsigned nb = min(kTreeTile, s1 - b0);
+        __syncthreads();  // previous tile's sk / ss fully consumed
+        for (unsigned e = tid; e < kTreeTile * kIndexDim / 4U; e += 256U) {
+            const unsigned blk = e / (kIndexDim / 4U);
+            float4 v = make_float4(0.0F, 0.0F, 0.0F, 0.0F);
+            if (blk < nb) v = reinterpret_cast<const float4*>(pooled_keys + static_cast<std::uint64_t>(b0) * kIndexDim)[e];
+            reinterpret_cast<float4*>(sk)[e] = v;
+        }
+        __syncthreads();
+        for (unsigned i = 0; i < nb; ++i) {
+            const float* k = sk + i * kIndexDim;
+            float a[16];
+#pragma unroll
+            for (unsigned g = 0; g < 4U; ++g) {
+                float v[8];  // v[0..3] = lanes 4g..4g+3, v[4..7] = lanes 4g+16..4g+19
+#pragma unroll
+                for (unsigned half = 0; half < 2U; ++half) {
+                    const unsigned L = 4U * g + 16U * half;
+                    const float4 k0 = *reinterpret_cast<const float4*>(k + L), k1 = *reinterpret_cast<const float4*>(k + L + 32U);
+                    const float4 k2 = *reinterpret_cast<const float4*>(k + L + 64U), k3 = *reinterpret_cast<const float4*>(k + L + 96U);
+                    const float kk0[4] = {k0.x, k0.y, k0.z, k0.w}, kk1[4] = {k1.x, k1.y, k1.z, k1.w};
+                    const float kk2[4] = {k2.x, k2.y, k2.z, k2.w}, kk3[4] = {k3.x, k3.y, k3.z, k3.w};
+#pragma unroll
+                    for (unsigned c = 0; c < 4U; ++c) {
+                        const float p0 = __fmul_rn(q[L + c], kk0[c]), p1 = __fmul_rn(q[L + c + 32U], kk1[c]);
+                        const float p2 = __fmul_rn(q[L + c + 64U], kk2[c]), p3 = __fmul_rn(q[L + c + 96U], kk3[c]);
+                        v[4U * half + c] = __fadd_rn(__fadd_rn(p0, p2), __fadd_rn(p1, p3));
+                    }
+                }
+#pragma unroll
+                for (unsigned c = 0; c < 4U; ++c) a[4U * g + c] = __fadd_rn(v[c], v[4U + c]);  // L + (L ^ 16)
+            }
+#pragma unroll
+            for (unsigned l = 0; l < 8U; ++l) a[l] = __fadd_rn(a[l], a[l + 8U]);  // ^8
+#pragma unroll
+            for (unsigned l = 0; l < 4U; ++l) a[l] = __fadd_rn(a[l], a[l + 4U]);  // ^4
+#pragma unroll
+            for (unsigned l = 0; l < 2U; ++l) a[l] = __fadd_rn(a[l], a[l + 2U]);  // ^2
+            const float head_sum = __fadd_rn(a[0], a[1]);                         // ^1
+            float total = 0.0F;
+#pragma unroll
+            for (unsigned hh = 0; hh < kIndexHeads; ++hh)
+                total = __fadd_rn(total, fmaxf(__shfl_sync(kFull, head_sum, static_cast<int>((lane & ~3U) | hh)), 0.0F));
+            if (h == 0U) ss[rr][i] = __fdiv_rn(total, scale);
+        }
+        __syncthreads();
+        for (unsigned e = tid; e < kTreeRows * kTreeTile; e += 256U) {
+            const unsigned row_in = e / kTreeTile, i = e % kTreeTile;
+            const std::uint32_t row = r0 + row_in;
+            if (row < rows && i < nb && b0 + i < limit_of(row))
+                block_scores[static_cast<std::uint64_t>(row) * max_blocks + b0 + i] = ss[row_in][i];
+        }
+    }
 }
 
 // ------------------------------------------------------------------------------------------------------------------
@@ -976,9 +1072,21 @@ void block_pool(const std::uint16_t* raw_index, std::uint32_t first_block, std::
 
 void block_scores(const float* index_query, std::uint32_t rows, std::uint64_t first_position, const float* pooled_keys,
     float* scores, std::uint32_t max_blocks, cudaStream_t stream) {
+    block_scores_form(score_tree_enabled() ? ScoreForm::tree : ScoreForm::shuffle, index_query, rows, first_position, pooled_keys,
+        scores, max_blocks, stream);
+}
+
+void block_scores_form(ScoreForm form, const float* index_query, std::uint32_t rows, std::uint64_t first_position,
+    const float* pooled_keys, float* scores, std::uint32_t max_blocks, cudaStream_t stream) {
     if (!rows) return;
     const auto scored = static_cast<std::uint32_t>((first_position + rows) / kRatio);  // complete blocks of the last row
     if (scored <= kTopK) return;
+    if (form == ScoreForm::tree) {
+        const dim3 grid((rows + kTreeRows - 1U) / kTreeRows, (scored + kTreeSeg - 1U) / kTreeSeg);
+        block_score_tree_kernel<<<grid, 256, 0, stream>>>(index_query, rows, first_position, pooled_keys, scored, scores, max_blocks);
+        check(cudaGetLastError(), "block score tree launch");
+        return;
+    }
     const auto waves = static_cast<std::uint64_t>((rows + kScoreRowsPerWave - 1U) / kScoreRowsPerWave) * ((scored + 31U) / 32U);
     block_score_kernel<<<static_cast<std::uint32_t>((waves + 7U) / 8U), 256, 0, stream>>>(index_query, rows, first_position,
         pooled_keys, scored, scores, max_blocks);
