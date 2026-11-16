@@ -428,6 +428,9 @@ if(BUILD_TESTING)
             "${CMAKE_CURRENT_SOURCE_DIR}/tests/hip_arch_target_host_tests.py" --compiler "${CMAKE_CXX_COMPILER}")
         add_test(NAME strix-hip-arch-caps-host-tests COMMAND "${Python3_EXECUTABLE}"
             "${CMAKE_CURRENT_SOURCE_DIR}/tests/hip_arch_caps_host_tests.py" --compiler "${CMAKE_CXX_COMPILER}")
+        # Bench kit receipts: request / prefill / decode windows and the shared rejection gates.
+        add_test(NAME strix-bench-receipt-window-tests COMMAND "${Python3_EXECUTABLE}" -B -m unittest discover
+            -s "${CMAKE_CURRENT_SOURCE_DIR}/scripts/bench/tests" -p test_request_window.py)
     endif()
 endif()
 add_library(strix_xport INTERFACE)

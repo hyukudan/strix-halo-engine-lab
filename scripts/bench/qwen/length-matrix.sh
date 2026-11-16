@@ -71,11 +71,11 @@ for ((r = 0; r < rounds; r++)); do
                 cap=$(($(kit_left) - 3))
                 export KIT_TAG=$tag KIT_ARM=s$s-$m-$name KIT_ROUND=$r KIT_TOKENS=$n KIT_WORKLOAD=s$s-$m KIT_RECEIPT_ARGS='--need-prefill'
                 # Single-node runs print no prefill line: the figure is the whole request (prefill + --gen tokens +
-                # readback) from the result JSON, published as a prefill upper bound. receipt.py checks the request
-                # [block - R, result stamp], prefill [block - R, block] and decode [block, result stamp] windows;
-                # this prefill receipt is decided by the prefill window, the decode/request verdicts sit beside it.
+                # readback) from the result JSON, published as a prefill upper bound. Arrival stamps give only
+                # conservative envelopes including earlier samples. Require request validity for all metrics
+                # derived from its duration, including prefill bounds and prompt tokens per request second.
                 if [[ $m == full ]]; then
-                    KIT_RECEIPT_ARGS+=' --request-json generation_request_elapsed_ms --anchor-regex ^qpf2k.sched.block.rows --scope prefill'
+                    KIT_RECEIPT_ARGS+=' --request-json generation_request_elapsed_ms --anchor-regex ^qpf2k.sched.block.rows --scope request'
                 fi
                 echo "#### $tag args[${args}] env[${envs}] t+$(($(date +%s) - KIT_T0))s"
                 case $m in

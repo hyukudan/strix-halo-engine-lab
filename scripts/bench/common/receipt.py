@@ -15,11 +15,11 @@ Power, clock and GPU busy are integrated over the warm prefill window [anchor - 
 time stamp of the line that carried the figure (stdout.ts or stderr.ts). GPU clocks per token = busy x sclk x window / tokens.
 
 Request figure (--request-json KEY, for producers that print only the result JSON): the figure is the whole request,
-so it is published as a prefill UPPER BOUND (prefill_ms_bounds, prefill_source) and three windows are checked:
-request [anchor - R, J], prefill [anchor - R, anchor], decode [anchor, J] (anchor = last --anchor-regex line, printed
-by the prefill; J = first stamp of the result object, printed after the request stop). Each window has its own
-evicted_ms and valid_<window>; --scope (default request) picks `valid`, so a prefill receipt stays valid when only
-decode was hit and vice versa.
+so it is published as a prefill UPPER BOUND (prefill_ms_bounds, prefill_source). Arrival stamps only bound ends:
+request and decode include all samples through result arrival; prefill includes all samples through witness arrival.
+These conservative sampled envelopes include load and reader delay, and cannot isolate decode from prefill.
+Each has evicted_ms and valid_<window>; --scope (default request) picks `valid`. Metrics derived from request
+duration must use request scope. Power/clock telemetry is labelled as an estimated prefill envelope.
 
 Validity (a receipt with valid=false is excluded by abab.py and its reasons are printed):
   rc != 0; kfd evicted_ms grew inside the timed window (memory pressure moved our buffers while timing; growth
@@ -172,34 +172,33 @@ def window_rows(rows, t0, t1):
 
 
 def request_windows(rows, anchor, request_ms, out, out_tl):
-    """Request, prefill and decode windows for a figure that is the whole request (--request-json).
+    """Conservative sampled envelopes for a whole-request figure (--request-json).
 
-    The request stop is bracketed by two stamped witnesses: the --anchor-regex line (printed by the prefill, so
-    before the stop) and the first line of the result object on stdout (printed after the stop; its stamp is the
-    arrival, never earlier). With R = request ms the start lies in [anchor - R, J - R], so
-      request = [anchor - R, J]   prefill = [anchor - R, anchor]   decode = [anchor, J]
-    each contains the true interval; a sample interval that straddles a boundary is charged to both sides."""
+    Readers may consume both witnesses after the request stops. Neither arrival minus R nor witness arrival
+    bounds the request/decode start from below. Include every earlier sample for each scope; decode cannot be
+    separated from prefill. Arrival bounds only the corresponding end. Duration bounds are just [0, R].
+    A sample interval straddling an end is charged conservatively; coverage still needs at least R before J.
+    Telemetry cannot establish coverage before sampling began."""
     reasons = []
     lines = out.splitlines()
     idx = [i for i, line in enumerate(lines) if line.startswith("{")]
     stop_hi = out_tl[idx[-1]][0] if idx and idx[-1] < len(out_tl) else 0.0
     if not anchor:
-        reasons.append("no prefill witness (--anchor-regex) to bound the request stop")
+        reasons.append("no prefill witness (--anchor-regex) to bound the prefill end")
     if not stop_hi:
         reasons.append("result object on stdout not stamped (stdout.ts)")
     elif anchor and stop_hi < anchor:
         reasons.append("result object stamped before the prefill witness")
     if reasons:
         anchor = stop_hi = anchor or stop_hi
-    t0 = anchor - request_ms / 1e3
+    t0 = min(rows[0][0] if rows else 0.0, stop_hi - request_ms / 1e3)
     windows = {}
-    for name, (a, b) in (("prefill", (t0, anchor)), ("decode", (anchor, stop_hi)), ("request", (t0, stop_hi))):
+    for name, (a, b) in (("prefill", (t0, anchor)), ("decode", (t0, stop_hi)), ("request", (t0, stop_hi))):
         w, covered = window_rows(rows, a, b)
         windows[name] = dict(t0=round(a, 3), t1=round(b, 3), evicted_ms=(growth([r[8] for r in w]) if len(w) > 1 else -1),
                              covered=covered and not reasons)
-    slack = max(0.0, stop_hi - anchor) * 1e3
-    return dict(windows=windows, reasons=reasons, decode_ms_bound=round(slack, 1),
-                prefill_ms_bounds=[round(max(0.0, request_ms - slack), 1), round(request_ms, 1)])
+    return dict(windows=windows, reasons=reasons, decode_ms_bound=round(request_ms, 1),
+                prefill_ms_bounds=[0.0, round(request_ms, 1)])
 
 
 def integrate(rows, t0, t1):
@@ -264,13 +263,16 @@ def cmd_summarize(args):
         if idx and idx[-1] < len(tl):
             anchor = tl[idx[-1]][0]
     rows = samples(os.path.join(d, "samples.tsv"))
-    joules, cyc, busy, span, temp = integrate(rows, anchor - warm / 1e3, anchor)
+    req = request_windows(rows, anchor, request_ms, out, stamps(os.path.join(d, "stdout.ts"))) if req_key else None
+    telemetry_t0, telemetry_t1 = anchor - warm / 1e3, anchor
+    if req is not None:
+        telemetry_t0, telemetry_t1 = (req["windows"]["prefill"][key] for key in ("t0", "t1"))
+    joules, cyc, busy, span, temp = integrate(rows, telemetry_t0, telemetry_t1)
     sp = span or 1.0
     ev = [r[8] for r in rows]
     t0w = anchor - warm / 1e3
     window, covered = window_rows(rows, t0w, anchor) if pf else (rows, True)
     evw = [r[8] for r in window]
-    req = request_windows(rows, anchor, request_ms, out, stamps(os.path.join(d, "stdout.ts"))) if req_key else None
     avail = [r[6] for r in rows]
     klog = [l for l in read_text(os.path.join(d, "klog.txt")).splitlines() if l.strip()]
     metrics = {}
@@ -304,8 +306,21 @@ def cmd_summarize(args):
         klog_events=len(klog))
     sampler_error = read_text(os.path.join(d, "sampler.error"))
     warnings = []
+    common = process_reasons(meta)
+    if klog:
+        (common if args.strict_klog else warnings).append("klog %d events: %s" % (len(klog), klog[0][-80:]))
+    if rows and not any(r[6] for r in rows):
+        warnings.append("host memory and kfd evictions not sampled on this host")
+    if args.need_prefill and not pf:
+        common.append("no prefill figure")
+    for rx in args.require or []:
+        if not re.search(rx, text, re.M):
+            common.append("missing /%s/" % rx[:40])
+    for rx in (args.reject if args.reject is not None else DEFAULT_REJECT):
+        if re.search(rx, text, re.M):
+            common.append("stderr /%s/" % rx[:30])
     if req is None:
-        reasons = process_reasons(meta) + telemetry_reasons(
+        reasons = common + telemetry_reasons(
             rows, args.min_avail_gb, rec["evicted_ms_run"] if args.evict_whole_run else rec["evicted_ms_window"],
             sampler_error=sampler_error)
         if pf and (not anchor or not covered):
@@ -313,9 +328,8 @@ def cmd_summarize(args):
         if rec["evicted_ms_run"] > 0 and rec["evicted_ms_window"] <= 0:
             warnings.append("kfd evicted_ms +%d outside the timed window (load)" % rec["evicted_ms_run"])
     else:
-        # One receipt, three scopes: the prefill figure stays valid when only decode was hit and vice versa;
-        # `valid` follows --scope, the other verdicts are kept beside it.
-        common = process_reasons(meta) + telemetry_reasons(rows, args.min_avail_gb, 0, sampler_error=sampler_error)
+        # All scopes share process/log/witness gates; only envelope coverage and pressure differ.
+        common += telemetry_reasons(rows, args.min_avail_gb, 0, sampler_error=sampler_error)
         verdicts = {}
         for name, w in req["windows"].items():
             r = list(common)
@@ -331,26 +345,15 @@ def cmd_summarize(args):
         rec.update(scope=args.scope, request_ms=request_ms, request_key=req_key, windows=req["windows"],
                    prefill_source="request-json %s: upper bound (includes the generated tokens and readback)" % req_key,
                    prefill_ms_bounds=req["prefill_ms_bounds"], decode_ms_bound=req["decode_ms_bound"],
+                   telemetry_source="estimated prefill envelope (includes load and reader delay)",
+                   telemetry_window=dict(t0=telemetry_t0, t1=telemetry_t1),
                    evicted_ms_window=req["windows"][args.scope]["evicted_ms"])
         for name in ("prefill", "decode", "request"):
             if name != args.scope and verdicts[name]:
                 warnings.append("%s receipt INVALID (%s)" % (name, "; ".join(verdicts[name])))
         if rec["evicted_ms_run"] > max(0, req["windows"]["request"]["evicted_ms"]):
-            warnings.append("kfd evicted_ms +%d outside the request window (load/teardown)" % (
+            warnings.append("kfd evicted_ms +%d outside the request window (after result arrival)" % (
                 rec["evicted_ms_run"] - max(0, req["windows"]["request"]["evicted_ms"])))
-    if klog:
-        (reasons if args.strict_klog else warnings).append("klog %d events: %s" % (len(klog), klog[0][-80:]))
-    if rows and not any(r[6] for r in rows):
-        warnings.append("host memory and kfd evictions not sampled on this host")
-    if args.need_prefill and not pf:
-        reasons.append("no prefill figure")
-    for rx in args.require or []:
-        if not re.search(rx, text, re.M):
-            reasons.append("missing /%s/" % rx[:40])
-    for rx in (args.reject if args.reject is not None else DEFAULT_REJECT):
-        m = re.search(rx, text, re.M)
-        if m:
-            reasons.append("stderr /%s/" % rx[:30])
     rec["valid"] = not reasons
     rec["invalid_reasons"] = reasons
     rec["warnings"] = warnings

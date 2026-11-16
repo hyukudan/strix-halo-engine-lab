@@ -1,16 +1,18 @@
 #!/usr/bin/env python3
-"""receipt.py --request-json: the request window is the true request (start .. generation_request_stop), with
-prefill and decode sub-windows judged separately (audit of the full-mode anchor in the Qwen length matrix)."""
+"""Host regressions for conservative request envelopes and shared receipt validity gates."""
 import os
+import contextlib
+import io
 import re
 import shlex
 import sys
 import tempfile
 import unittest
+from types import SimpleNamespace
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
-from test_runner import load, make_run, receipt, sample  # noqa: E402
+from test_runner import abab, load, make_run, receipt, sample  # noqa: E402
 
 LENGTH_MATRIX = os.path.join(HERE, "..", "qwen", "length-matrix.sh")
 R_MS = 4000.0  # request: start 16.0, prefill block line 20.0, result object stamped 20.5
@@ -19,7 +21,8 @@ BLOCK_T, RESULT_T = 20.0, 20.5
 
 def full_mode_args():
     """The receipt arguments length-matrix.sh binds for full mode (the real binding, not a copy)."""
-    text = open(LENGTH_MATRIX).read()
+    with open(LENGTH_MATRIX) as stream:
+        text = stream.read()
     base = re.search(r"KIT_RECEIPT_ARGS='([^']*)'", text).group(1)
     extra = re.search(r"if \[\[ \$m == full \]\]; then\s+KIT_RECEIPT_ARGS\+='([^']*)'", text).group(1)
     return shlex.split(base + extra)
@@ -27,12 +30,13 @@ def full_mode_args():
 
 class RequestWindow(unittest.TestCase):
     def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory()
+        self.tmp = tempfile.TemporaryDirectory(dir=HERE)
 
     def tearDown(self):
         self.tmp.cleanup()
 
-    def run_arm(self, evict_at=(), extra=None, stamp_result=True, block=True):
+    def run_arm(self, evict_at=(), extra=None, stamp_result=True, block=True,
+                block_t=BLOCK_T, result_t=RESULT_T, klog="", stderr_text="", rc=0):
         d = os.path.join(self.tmp.name, "arm")
         ev, rows = 0, []
         for i in range(0, 101):  # samples every 0.25 s over [0, 25]
@@ -41,11 +45,13 @@ class RequestWindow(unittest.TestCase):
             rows.append(sample(t, ev=ev))
         lines = [(1.0, "loading weights"), (16.1, "qpf2k HC out16 active (rows 8192)")]
         if block:
-            lines.append((BLOCK_T, "qpf2k sched block rows 8192 detached_shared 0 late 0"))
+            lines.append((block_t, "qpf2k sched block rows 8192 detached_shared 0 late 0"))
+        if stderr_text:
+            lines.append((22.0, stderr_text))
         lines.append((22.0, "strix power: {}"))
-        out = [(0.5, "banner"), (RESULT_T, "{"), (RESULT_T, '  "generation_request_elapsed_ms":%.2f,' % R_MS),
-               (RESULT_T, '  "generated_tokens": [279]'), (RESULT_T, "}")]
-        make_run(d, lines, rows, stdout="".join(l + "\n" for _, l in out))
+        out = [(0.5, "banner"), (result_t, "{"), (result_t, '  "generation_request_elapsed_ms":%.2f,' % R_MS),
+               (result_t, '  "generated_tokens": [279, 280]'), (result_t, "}")]
+        make_run(d, lines, rows, stdout="".join(l + "\n" for _, l in out), klog=klog, rc=rc)
         if stamp_result:
             with open(os.path.join(d, "stdout.ts"), "w") as f:
                 f.write("".join("%.3f %s\n" % (t, l) for t, l in out))
@@ -60,19 +66,22 @@ class RequestWindow(unittest.TestCase):
     def test_full_mode_binding_uses_request_windows(self):
         args = full_mode_args()
         self.assertIn("--request-json", args)
-        self.assertEqual(args[args.index("--scope") + 1], "prefill")
+        self.assertEqual(args[args.index("--scope") + 1], "request")
 
-    def test_windows_span_the_true_request(self):
+    def test_windows_are_conservative_sampled_envelopes(self):
         rec = self.run_arm()
         w = rec["windows"]
-        self.assertEqual((w["request"]["t0"], w["request"]["t1"]), (16.0, RESULT_T))
-        self.assertEqual((w["prefill"]["t0"], w["prefill"]["t1"]), (16.0, BLOCK_T))
-        self.assertEqual((w["decode"]["t0"], w["decode"]["t1"]), (BLOCK_T, RESULT_T))
+        self.assertEqual((w["request"]["t0"], w["request"]["t1"]), (0.0, RESULT_T))
+        self.assertEqual((w["prefill"]["t0"], w["prefill"]["t1"]), (0.0, BLOCK_T))
+        self.assertEqual((w["decode"]["t0"], w["decode"]["t1"]), (0.0, RESULT_T))
         self.assertTrue(rec["valid"] and rec["valid_prefill"] and rec["valid_decode"] and rec["valid_request"])
-        self.assertEqual(rec["prefill_ms_bounds"], [R_MS - 500.0, R_MS])
-        self.assertEqual(rec["decode_ms_bound"], 500.0)
+        self.assertEqual(rec["prefill_ms_bounds"], [0.0, R_MS])
+        self.assertEqual(rec["decode_ms_bound"], R_MS)
         self.assertIn("upper bound", rec["prefill_source"])
         self.assertEqual(rec["request_ms"], R_MS)
+        self.assertIn("estimated", rec["telemetry_source"])
+        self.assertEqual(rec["window_s"], BLOCK_T)
+        self.assertEqual(rec["joules"], 50 * BLOCK_T)
 
     def test_decode_eviction_counts_in_request_not_prefill(self):
         # The audited regression: an eviction after the prefill block line but before the request stop.
@@ -80,23 +89,64 @@ class RequestWindow(unittest.TestCase):
         self.assertGreater(rec["windows"]["decode"]["evicted_ms"], 0)
         self.assertGreater(rec["windows"]["request"]["evicted_ms"], 0)
         self.assertEqual(rec["windows"]["prefill"]["evicted_ms"], 0)
-        self.assertTrue(rec["valid"] and rec["valid_prefill"])
+        self.assertFalse(rec["valid"])
+        self.assertTrue(rec["valid_prefill"])
         self.assertFalse(rec["valid_decode"] or rec["valid_request"])
-        self.assertTrue(any("request receipt INVALID" in w for w in rec["warnings"]))
-        req = self.run_arm(evict_at=(20.3,), extra=full_mode_args()[:-2] + ["--scope", "request"])
-        self.assertFalse(req["valid"])
-        self.assertIn("kfd evicted_ms +100 in the request window", req["invalid_reasons"])
+        self.assertIn("kfd evicted_ms +100 in the request window", rec["invalid_reasons"])
+        pf = self.run_arm(evict_at=(20.3,), extra=full_mode_args()[:-2] + ["--scope", "prefill"])
+        self.assertTrue(pf["valid"] and pf["valid_prefill"])
+        self.assertFalse(pf["valid_request"])
 
-    def test_prefill_eviction_keeps_decode_valid(self):
+    def test_prefill_eviction_also_counts_in_decode_envelope(self):
         rec = self.run_arm(evict_at=(18.0,))
         self.assertFalse(rec["valid"] or rec["valid_prefill"] or rec["valid_request"])
-        self.assertTrue(rec["valid_decode"])
+        self.assertFalse(rec["valid_decode"])
 
-    def test_load_and_teardown_are_outside_the_request(self):
+    def test_abab_excludes_decode_pressured_request_duration(self):
+        self.run_arm(evict_at=(20.3,))
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            abab.cmd_summary(SimpleNamespace(out=self.tmp.name, base="missing", metric="request_latency_ms"))
+        self.assertIn("arm | 0/1 |", output.getvalue())
+
+    def test_load_is_conservatively_included_but_teardown_is_outside(self):
         rec = self.run_arm(evict_at=(5.0, 23.0))
-        self.assertTrue(rec["valid_prefill"] and rec["valid_decode"] and rec["valid_request"])
+        self.assertFalse(rec["valid_prefill"] or rec["valid_decode"] or rec["valid_request"])
+        self.assertEqual(rec["windows"]["request"]["evicted_ms"], 100)
         self.assertEqual(rec["evicted_ms_run"], 200)
         self.assertTrue(any("outside the request window" in w for w in rec["warnings"]))
+
+    def test_teardown_only_is_valid_unless_whole_run_is_required(self):
+        rec = self.run_arm(evict_at=(23.0,))
+        self.assertTrue(all(rec[key] for key in ("valid", "valid_prefill", "valid_decode", "valid_request")))
+        rec = self.run_arm(evict_at=(23.0,), extra=full_mode_args() + ["--evict-whole-run"])
+        self.assertFalse(any(rec[key] for key in ("valid", "valid_prefill", "valid_decode", "valid_request")))
+
+    def test_delayed_reader_cannot_hide_early_request_eviction(self):
+        # Actual request [16, 20], witness emitted at 19.5, read at 21; result read at 21.5.
+        for eviction in (16.5, 19.75):
+            rec = self.run_arm(evict_at=(eviction,), block_t=21.0, result_t=21.5)
+            for key in ("valid", "valid_prefill", "valid_decode", "valid_request"):
+                self.assertFalse(rec[key], (eviction, key))
+            self.assertEqual(rec["windows"]["request"]["evicted_ms"], 100)
+
+    def test_shared_rejections_invalidate_every_scope(self):
+        cases = [(["--strict-klog"], dict(klog="amdgpu reset\n"), "klog"),
+                 (["--require", "missing witness"], {}, "missing /"),
+                 (["--reject", "bad witness"], dict(stderr_text="bad witness"), "stderr /"),
+                 ([], dict(stderr_text="operation timed out"), "stderr /"),
+                 ([], dict(rc=1), "rc=1")]
+        for options, kw, reason in cases:
+            for scope in ("request", "prefill", "decode"):
+                rec = self.run_arm(extra=full_mode_args()[:-2] + ["--scope", scope] + options, **kw)
+                for key in ("valid", "valid_prefill", "valid_decode", "valid_request"):
+                    self.assertFalse(rec[key], (options, scope, key))
+                self.assertTrue(any(reason in r for r in rec["invalid_reasons"]))
+
+    def test_non_strict_klog_remains_a_warning(self):
+        rec = self.run_arm(klog="amdgpu reset\n")
+        self.assertTrue(all(rec[key] for key in ("valid", "valid_prefill", "valid_decode", "valid_request")))
+        self.assertTrue(any("klog" in w for w in rec["warnings"]))
 
     def test_unstamped_result_or_missing_witness_fails_closed(self):
         for kw in (dict(stamp_result=False), dict(block=False)):
