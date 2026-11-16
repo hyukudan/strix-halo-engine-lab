@@ -172,11 +172,11 @@ struct DenseNumeric {
     // Diagnostics (microbench only, scheduling-only), as in #735's launcher: ring depth of the aligned-window
     // tile2 (2 default, 3 or 4) and the shared-memory carveout hint in percent (< 0: none).
     static int dense_t2_ring_stages() {
-        static const int ns = [] { const char* e = std::getenv("STRIX_QRTX_DENSE_T2_NS"); return e && e[0] ? std::atoi(e) : 2; }();
+        static const int ns = [] { const char* e = strix::envcfg::text("STRIX_QRTX_DENSE_T2_NS"); return e && e[0] ? std::atoi(e) : 2; }();
         return ns;
     }
     static int dense_carveout_percent() {
-        const char* cv = std::getenv("STRIX_QRTX_DENSE_CARVEOUT");
+        const char* cv = strix::envcfg::text("STRIX_QRTX_DENSE_CARVEOUT");
         return cv && cv[0] ? std::atoi(cv) : -1;
     }
 };

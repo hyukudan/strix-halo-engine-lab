@@ -31,6 +31,60 @@ def normalise(text, symbols):
     return lines
 
 
+def symbol_maps(pairs):
+    if not isinstance(pairs, list) or not pairs:
+        raise ValueError("nonempty explicit symbol-pair array required")
+    old, new = {}, {}
+    for index, pair in enumerate(pairs):
+        if not isinstance(pair, dict) or set(pair) != {"old", "new"}:
+            raise ValueError("symbol pairs require exactly old and new names")
+        a, b = pair["old"], pair["new"]
+        if any(not isinstance(name, str) or not name or any(c.isspace() for c in name) for name in (a, b)):
+            raise ValueError("full symbol names required")
+        if a in old or b in new:
+            raise ValueError("symbol map must be bijective")
+        old[a] = new[b] = f"WFMT_PAIR_{index:06d}"
+    return old, new
+
+
+def mapped_stream(stream, mapping):
+    groups, current = {}, None
+    for line in stream:
+        if line.startswith("FUNCTION "):
+            name = line[len("FUNCTION "):]
+            if name in groups:
+                raise ValueError("duplicate selected function")
+            current = groups[name] = []
+        elif current is not None:
+            current.append(line)
+        else:
+            raise ValueError("instruction outside selected function")
+    if mapping.keys() - groups.keys():
+        raise ValueError("mapped symbol missing from selected functions")
+    translated = {}
+    replacements = {**mapping, **{key + ".kd": value + ".kd" for key, value in mapping.items()}}
+    pattern = re.compile(r"(?<![A-Za-z0-9_.$])(?:" +
+                         "|".join(re.escape(key) for key in sorted(replacements, key=len, reverse=True)) +
+                         r")(?![A-Za-z0-9_.$])")
+    for name, body in groups.items():
+        canonical = mapping.get(name, name)
+        if canonical in translated:
+            raise ValueError("canonical symbol collision")
+        translated[canonical] = [pattern.sub(lambda match: replacements[match[0]], line) for line in body]
+    # Symbol-only changes may reorder functions, never operations within one.
+    return [line for name, body in sorted(translated.items()) for line in ["FUNCTION " + name, *body]]
+
+
+def mapped_resources(resources, mapping):
+    result = {}
+    for name, values in resources.items():
+        canonical = mapping.get(name, name)
+        if canonical in result:
+            raise ValueError("canonical resource symbol collision")
+        result[canonical] = values
+    return result
+
+
 def hip_image(binary, directory, architecture, objcopy, bundler):
     data = binary.read_bytes()
     if data[:6] == b"\x7fELF\x02\x01" and len(data) >= 20 and struct.unpack_from("<H", data, 18)[0] == 224:
@@ -124,6 +178,8 @@ def main():
     parser.add_argument("--backend", required=True, choices=("hip", "cuda"))
     parser.add_argument("--symbols", required=True, type=pathlib.Path,
                         help="JSON array of required symbol substrings")
+    parser.add_argument("--symbol-map", type=pathlib.Path,
+                        help="explicit bijective [{old: full_symbol, new: full_symbol}] name pairs")
     parser.add_argument("--out", required=True, type=pathlib.Path)
     parser.add_argument("--tool", help="llvm-objdump or cuobjdump path")
     parser.add_argument("--readelf", default="llvm-readelf")
@@ -137,11 +193,16 @@ def main():
         symbols = json.loads(args.symbols.read_text())
         if not isinstance(symbols, list) or not symbols or not all(isinstance(s, str) and s for s in symbols):
             raise ValueError("nonempty required symbol array expected")
+        mappings = None
+        if args.symbol_map:
+            pairs = json.loads(args.symbol_map.read_text())
+            mappings = symbol_maps(pairs)
+            summary["symbol_pairs"] = pairs
         tool = args.tool or ("llvm-objdump" if args.backend == "hip" else "cuobjdump")
         options = (["--disassemble", "--mcpu=" + args.architecture] if args.backend == "hip" else
                    ["--dump-sass", "--dump-resource-usage"])
         streams = []
-        for name, binary in (("old", args.old), ("new", args.new)):
+        for index, (name, binary) in enumerate((("old", args.old), ("new", args.new))):
             resources = None
             if args.backend == "hip":
                 binary = hip_image(binary.resolve(), args.out.resolve() / (name + ".device"),
@@ -159,6 +220,10 @@ def main():
             if not stream or any(not any(line.startswith("FUNCTION ") and symbol in line for line in stream)
                                  for symbol in symbols):
                 raise ValueError(f"empty {name} operation stream")
+            if mappings is not None:
+                stream = mapped_stream(stream, mappings[index])
+                if resources is not None:
+                    resources = mapped_resources(resources, mappings[index])
             if resources is not None:
                 stream.append("RESOURCES " + json.dumps(resources, sort_keys=True))
             (args.out / (name + ".normalised.txt")).write_text("\n".join(stream) + "\n")

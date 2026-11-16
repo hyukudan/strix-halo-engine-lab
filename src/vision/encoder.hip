@@ -389,7 +389,18 @@ struct Panel {
     std::size_t bytes() const { return w.n + b.n; }
 };
 
-Panel make_panel(const Tensor& w, const Tensor& bias) {
+using LoadClock = std::chrono::steady_clock;
+double ms_from(LoadClock::time_point& t) {  // ms since t, and t moves to now
+    const auto now = LoadClock::now();
+    const double ms = std::chrono::duration<double, std::milli>(now - t).count();
+    t = now;
+    return ms;
+}
+
+Panel make_panel(const Tensor& w, const Tensor& bias, EncoderLoadStats* st = nullptr) {
+    EncoderLoadStats none;
+    EncoderLoadStats& ls = st ? *st : none;
+    auto t = LoadClock::now();
     if (!w || !w.rows || !w.cols || w.rows > 0x00FFFFFFU || w.cols > 0x00FFFFFFU) throw std::invalid_argument("vision encoder: linear shape");
     if (bias && bias.size() != w.rows) throw std::invalid_argument("vision encoder: linear bias");
     Panel p;
@@ -415,6 +426,7 @@ Panel make_panel(const Tensor& w, const Tensor& bias) {
         }
     });
     if (nonfinite) throw std::invalid_argument("vision encoder: nonfinite weight");
+    ls.scan_ms += ms_from(t);
     float top = 0.0F;
     for (const float t : row_top) top = std::max(top, t);
     // Largest magnitude lands in [2^13, 2^14): far from the FP16 overflow, small entries far from the subnormals.
@@ -423,6 +435,7 @@ Panel make_panel(const Tensor& w, const Tensor& bias) {
     // v * 2^k == ldexp(v, k) bit for bit: 2^k (|k| <= 60) is a normal float and both round the exact product once.
     const float scale = std::ldexp(1.0F, k);
     std::vector<_Float16> h(std::size_t{p.n16} * p.inp, static_cast<_Float16>(0.0F));
+    ls.host_alloc_ms += ms_from(t);
     layout::parallel_ranges(p.n, p.in, [&](std::size_t o0, std::size_t o1) {
         for (std::size_t o = o0; o < o1; ++o)
             for (std::size_t c = 0; c < p.in; ++c) h[o * p.inp + c] = static_cast<_Float16>(w.at(o * p.in + c) * scale);
@@ -430,10 +443,13 @@ Panel make_panel(const Tensor& w, const Tensor& bias) {
     std::vector<float> b(p.n16, 0.0F);
     if (bias)
         for (std::size_t o = 0; o < p.n; ++o) b[o] = bias.at(o);
+    ls.convert_ms += ms_from(t);
     p.w = Dev(layout::aligned(h.size() * 2U));
     p.b = Dev(layout::aligned(b.size() * 4U));
+    ls.device_alloc_ms += ms_from(t);
     ck(hipMemcpy(p.w.p, h.data(), h.size() * 2U, hipMemcpyHostToDevice), "panel upload");
     ck(hipMemcpy(p.b.p, b.data(), b.size() * 4U, hipMemcpyHostToDevice), "bias upload");
+    ls.upload_ms += ms_from(t);
     return p;
 }
 
@@ -520,6 +536,7 @@ struct Encoder::Impl {
     EncoderOptions opt;
     hipStream_t stream = nullptr;
     bool loaded = false;
+    EncoderLoadStats load_stats;
     Panel patch;
     std::vector<Block> blocks;
     Dev fnw, fnb, failure, ws;
@@ -671,26 +688,36 @@ void Encoder::load(const EncoderWeights& w) {
     auto& im = *impl_;
     validate(im.cfg, w);
     unload();
-    im.patch = make_panel(w.patch_w, w.patch_b);
+    EncoderLoadStats& ls = im.load_stats;
+    ls = {};
+    const auto t0 = LoadClock::now();
+    im.patch = make_panel(w.patch_w, w.patch_b, &ls);
     im.blocks.reserve(w.blocks.size());
     for (const auto& b : w.blocks) {
         Block d;
-        d.qkv = make_panel(b.qkv_w, b.qkv_b);
-        d.out = make_panel(b.out_w, b.out_b);
-        d.mlp1 = make_panel(b.mlp1_w, b.mlp1_b);
-        d.mlp2 = make_panel(b.mlp2_w, b.mlp2_b);
+        d.qkv = make_panel(b.qkv_w, b.qkv_b, &ls);
+        d.out = make_panel(b.out_w, b.out_b, &ls);
+        d.mlp1 = make_panel(b.mlp1_w, b.mlp1_b, &ls);
+        d.mlp2 = make_panel(b.mlp2_w, b.mlp2_b, &ls);
+        auto tv = LoadClock::now();
         d.n1w = make_vector(b.norm1_w, im.cfg.width);
         d.n1b = make_vector(b.norm1_b, im.cfg.width);
         d.n2w = make_vector(b.norm2_w, im.cfg.width);
         d.n2b = make_vector(b.norm2_b, im.cfg.width);
+        ls.vectors_ms += ms_from(tv);
         im.blocks.push_back(std::move(d));
     }
     if (im.cfg.final_norm) {
+        auto tv = LoadClock::now();
         im.fnw = make_vector(w.final_norm_w, im.cfg.width);
         im.fnb = make_vector(w.final_norm_b, im.cfg.width);
+        ls.vectors_ms += ms_from(tv);
     }
     im.loaded = true;
+    ls.total_ms = std::chrono::duration<double, std::milli>(LoadClock::now() - t0).count();
 }
+
+const EncoderLoadStats& Encoder::load_stats() const { return impl_->load_stats; }
 
 void Encoder::unload() {
     auto& im = *impl_;

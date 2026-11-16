@@ -36,6 +36,7 @@ Status check(const Registry& registry,const WeightMapEntry& e,bool scan_values=t
 }
 const RawTensor* named(const TensorIndex& index,std::string_view name) {for(const auto& t:index.tensors)if(t.name==name)return &t;return nullptr;}
 Status normalise(const Registry& registry,const TensorIndex& index,const RawTensor& raw,const TensorBinding& binding,const Parameters& params,WeightView& out) {
+    if(raw.opaque())return {Error::unsupported_shape,"tensor rank exceeds WeightView rank: "+raw.name};
     if(raw.shape.rank>raw.shape.dims.size())return {Error::unsupported_shape,"storage rank exceeds four"};
     if(binding.logical_shape.rank>binding.logical_shape.dims.size())return {Error::unsupported_shape,"binding rank exceeds four"};
     WeightView w{};w.tensor=raw.id;w.shape=raw.shape;w.payload=raw.payload;w.parameters=params;

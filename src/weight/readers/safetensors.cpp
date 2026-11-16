@@ -31,9 +31,10 @@ Status index_safetensors(std::shared_ptr<const Source> source,TensorIndex& out) 
             if(d.as_object().size()!=3)return {Error::malformed,"unsupported safetensors fields/strides"};
             RawTensor t;t.name=name;t.id=tensor_id(*source,name,result.header_identity);t.wire_dtype=require(d,"dtype").as_string();
             auto width=widths.find(t.wire_dtype);if(width==widths.end())return {Error::unknown_format,"unrecognised safetensors dtype "+t.wire_dtype};
-            const auto& shape=require(d,"shape").as_array();if(shape.size()>4)return {Error::unsupported_shape,"safetensors rank exceeds WeightView rank"};
-            t.shape.rank=std::uint8_t(shape.size());std::uint64_t count=1;
-            for(std::size_t i=0;i<shape.size();++i){auto dim=integer(shape[i]);if(dim && count>UINT64_MAX/dim)return {Error::malformed,"safetensors shape overflow"};count*=dim;t.shape.dims[i]=dim;}
+            const auto& shape=require(d,"shape").as_array();if(shape.size()>255)return {Error::malformed,"safetensors rank out of range"};
+            // Rank above the WeightView rank is indexed opaquely (see RawTensor::opaque) instead of failing the whole file.
+            const bool viewable=shape.size()<=t.shape.dims.size();t.shape.rank=viewable?std::uint8_t(shape.size()):std::uint8_t(0);std::uint64_t count=1;
+            for(std::size_t i=0;i<shape.size();++i){auto dim=integer(shape[i]);if(dim && count>UINT64_MAX/dim)return {Error::malformed,"safetensors shape overflow"};count*=dim;t.extents.push_back(dim);if(viewable)t.shape.dims[i]=dim;}
             const auto& offsets=require(d,"data_offsets").as_array();if(offsets.size()!=2)return {Error::malformed,"safetensors needs two offsets"};
             auto first=integer(offsets[0]),last=integer(offsets[1]);
             if(count>UINT64_MAX/width->second || last<first || last>source->size()-base || last-first!=count*width->second)
