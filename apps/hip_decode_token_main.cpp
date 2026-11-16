@@ -1,5 +1,6 @@
 #include "strix/device/hip_gate.hpp"
 #include "strix/env_flags.hpp"
+#include "../src/core/chunk_contract.hpp"
 #include "qwen_pair_transport.hpp"
 #include "strix/qwen_prefill_pair.hpp"
 #include "strix/qwen_prefill_handoff.hpp"
@@ -5974,6 +5975,16 @@ static int run_decode_entry(
             strix::KnownPromptChunkCursor chunks(paired, *known_prefix_backend,
                 options.teacher_forced_score ? *generation_backend : static_cast<strix::SerialGreedyStepBackend&>(backend));
             for (auto& tail : known_tail_backends) chunks.set_tail_backend(*tail);
+            // chunkinv-attn-state-v1 witness (src/core/chunk_contract.hpp): with GDN FAST (C32, closes its partial block per
+            // call) the call plan is chunk-invariant when every call before the last absolute 32-row boundary ends on one.
+            if (strix::prefill_option_enabled(strix::PrefillOption::gdn_fp16_chunk) && paired.tiled_prefill) {
+                std::vector<std::uint64_t> ends;
+                for (const auto& unit : chunks.cold_plan()) ends.push_back(unit.end);
+                const bool canonical = strix::chunk_contract::block_plan_canonical(ends, paired.start_position, 32U);
+                std::fprintf(stderr, "chunkinv %s: GDN FAST plan T%u start %llu rows %zu units %zu -> %s\n",
+                    strix::chunk_contract::kContractName, paired.logical_rows, static_cast<unsigned long long>(paired.start_position),
+                    prompt.size(), ends.size(), canonical ? "canonical" : "NOT canonical (unaligned start/interior end or non-increasing ends)");
+            }
             if(prefix_state) {
                 strix::decode_cli::QwenTiledPlanConfig plan;
                 plan.rows=paired.logical_rows;

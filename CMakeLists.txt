@@ -40,6 +40,10 @@ if(STRIX_CUDA_NVFP4_ONLY)
     return()
 endif()
 
+# Install rules and CPack packages (docs/install.md). Deferred to the end of this file so every target exists,
+# also in the CUDA-only modes below that return() early.
+cmake_language(DEFER CALL include "${CMAKE_CURRENT_SOURCE_DIR}/packaging/StrixPackaging.cmake")
+
 option(STRIX_LEGACY_MAINS "Build legacy Gemma4 and MiniMax serve executables" ON)
 
 # Standalone CUDA Qwen prefill and host-only scheduling/codec checks.
@@ -580,6 +584,20 @@ if(BUILD_TESTING)
     strix_target_warnings(strix-env-flags-tests)
     add_test(NAME strix-env-flags-tests COMMAND strix-env-flags-tests)
     set_tests_properties(strix-env-flags-tests PROPERTIES LABELS "cpu;env")
+    add_executable(strix-chunk-contract-tests tests/chunk_contract_tests.cpp)
+    target_include_directories(strix-chunk-contract-tests PRIVATE src)
+    target_compile_features(strix-chunk-contract-tests PRIVATE cxx_std_20)
+    strix_target_warnings(strix-chunk-contract-tests)
+    add_test(NAME strix-chunk-contract-tests COMMAND strix-chunk-contract-tests)
+    set_tests_properties(strix-chunk-contract-tests PROPERTIES LABELS "cpu;chunkinv")
+    find_program(STRIX_CHUNKINV_BASH NAMES bash)
+    if(STRIX_CHUNKINV_BASH)
+        add_test(NAME strix-chunkinv-fixtures-tests COMMAND "${STRIX_CHUNKINV_BASH}"
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/chunkinv_fixtures_tests.sh"
+            "${CMAKE_CURRENT_SOURCE_DIR}/scripts/bench/chunkinv/fixtures.sh"
+            "${CMAKE_CURRENT_BINARY_DIR}/chunkinv-fixtures-host")
+        set_tests_properties(strix-chunkinv-fixtures-tests PROPERTIES LABELS "cpu;chunkinv")
+    endif()
     add_executable(strix-engine-profile-common-tests tests/engine_profile_common_tests.cpp)
     target_include_directories(strix-engine-profile-common-tests PRIVATE include)
     target_compile_features(strix-engine-profile-common-tests PRIVATE cxx_std_20)
@@ -845,9 +863,7 @@ add_library(strix_glm_session_owner STATIC src/glm/serve/glm_session_owner.cpp)
 target_include_directories(strix_glm_session_owner PUBLIC src)
 target_link_libraries(strix_glm_session_owner PUBLIC strix_session_owner)
 strix_target_warnings(strix_glm_session_owner)
-add_executable(strix-skeleton-serve examples/skeleton_engine/main.cpp)
-target_link_libraries(strix-skeleton-serve PRIVATE strix_session_shell)
-strix_target_warnings(strix-skeleton-serve)
+# strix-skeleton-serve is defined with strix-serve in cmake/StrixSession.cmake (every build mode).
 if(BUILD_TESTING)
     add_executable(skeleton_engine_tests tests/skeleton_engine_tests.cpp)
     target_link_libraries(skeleton_engine_tests PRIVATE strix_session_shell)
