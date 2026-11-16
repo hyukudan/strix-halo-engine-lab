@@ -450,7 +450,9 @@ struct Prefill::Impl : BlockFields {
 
 void Prefill::Impl::upload_model() {
     // Retain admission of the original merged headers. `info` below describes device storage after transcode.
-    admission = qwen_packs::admit_model(cfg.model_gguf);
+    admission = qwen_packs::admit_model(cfg.model_gguf,qwen_packs::expert_arithmetic_name(cfg.expert_arithmetic));
+    if(cfg.expert_arithmetic==qwen_packs::ExpertArithmetic::gsq_a8_dot4 && cfg.forms.moe_mma)
+        throw std::invalid_argument("GSQ A8: single-chain moe_mma composition unqualified");
     if (!admission.pack) throw std::runtime_error("Qwen weight pack not admitted: " + admission.reason);
     constexpr std::uint64_t kChunk = std::uint64_t{256} << 20;
     std::uint8_t* staging[2] = {nullptr, nullptr};
@@ -574,10 +576,13 @@ void Prefill::Impl::upload_model() {
             if (t.name == blk + ".ffn_down_exps.weight") lw[l].down_type = t.ggml_type;
         }
         moe::Weights probe;
+        probe.arithmetic=cfg.expert_arithmetic;
         probe.gate_type = lw[l].gate_type;
         probe.down_type = lw[l].down_type;
         native_experts = native_experts || moe::native_types(probe);
     }
+    if(cfg.expert_arithmetic==qwen_packs::ExpertArithmetic::gsq_a8_dot4 && route_policy.enabled)
+        qwen_route::require_composition(true,qwen_route::Composition::other_weight_pack);
     // Validate the route against source admission. FAST dense transcodes may still have A8 experts.
     if (admission.pack->arithmetic == "exact" && native_experts)
         throw std::logic_error(std::string("Qwen weight pack ") + std::string(admission.pack->id) + " disagrees with the expert route");
@@ -1171,6 +1176,7 @@ void Prefill::Impl::run_block(const Segment* seg, std::uint32_t count, std::uint
         mr.output = {routed_out, kHidden * 2};
         mr.csr = csr;
         moe::Weights ew;
+        ew.arithmetic=cfg.expert_arithmetic;
         ew.gate_type = lw[l].gate_type;
         ew.down_type = lw[l].down_type;
         ew.gate = static_cast<const std::uint8_t*>(lw[l].p[k_ffn_gate_exps_weight]);
