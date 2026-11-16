@@ -4547,9 +4547,11 @@ same operand bits from half the bytes on both sides.
 - **Measured:** layer bench C 4096 us/row, FAST arm with the q-tilde image (absorb / o-bar / out): 0.876 / 6.436 /
   1.859 -> 0.617 / 6.362 / 0.959 (-5.0 ms per call, 22 calls per rank at 8K); o-bar image alone -0.69 ms per call.
   - **Pair (8K FAST, 3 strict ABAB pairs, before the two images):** warm 8.504 -> 8.399 s (963 -> 975 tok/s), cold
-  9.847 -> 9.489 s, against FAST without it. Rebased ABAB with both images: pending.
+  9.847 -> 9.489 s, against FAST without it. Rebased ABAB with both images: pending. Component image checks and layer timings do not qualify
+    the complete current-head workload or establish its performance/fidelity gates.
 - **Off switch:** `STRIX_GLM_PF_MLA_WMMA=0` (exact FP32 GEMMs inside FAST), `STRIX_GLM_PF_MLA_OB16=0` (FP32 o-bar); both
-  ranks of a pair must resolve the same value (startup agreement bit).
+  ranks of a pair must resolve the same value (startup agreement bit). Restart after changing these controls or
+  `STRIX_GLM_PF_MLA_GEMM_HEADS`; values are cached after application defaults, shared by receipts and dispatch.
 
 <a id="f16-dense-epilogue-tail"></a>
 

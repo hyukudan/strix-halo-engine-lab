@@ -29,22 +29,15 @@
 // element strides, half the output bytes; the sums themselves are unchanged).
 //   put(b, r, n, v): row r < rows, column n, v = the chain's sum. One call per output.
 // Limits (callers check with fits()): K % 32 == 0, N % 128 == 0, rows >= 1, 16-byte aligned a / w / y row starts.
+#if defined(__HIPCC__)
 #include "attn_core/wmma_types.hpp"
-
 #include <hip/hip_runtime.h>
+#endif
 
 #include <cstddef>
 #include <cstdint>
 
 namespace strix::core::f16_tile_gemm {
-using Half16 = _Float16 __attribute__((ext_vector_type(16)));
-using Float8 = float __attribute__((ext_vector_type(8)));
-using Float4 = float __attribute__((ext_vector_type(4)));
-using U4 = std::uint32_t __attribute__((ext_vector_type(4)));
-// A fragment stays 8 dwords (2 x ds_load_b128) and is bit-cast to Half16 only at the WMMA: a <16 x half> value makes
-// gfx11 true16 codegen split and re-pack every dword (v_lshrrev_b32 + v_mov_b16, 192 VALU per stage measured).
-typedef std::uint32_t Frag __attribute__((ext_vector_type(8), aligned(16)));
-
 inline constexpr unsigned kBM = 128, kBN = 128, kBK = 32, kThreads = 256;
 inline constexpr unsigned kPitch = kBK / 2U + 4U;  // dwords per LDS row: 16 data + 4 pad (80 bytes)
 
@@ -66,6 +59,24 @@ struct Args {
     // batches: (column tile x batch in group, row block, group). Placement only: the bits never depend on it.
     unsigned order = 0, group = 1;
 };
+
+inline bool fits(const Args& p) {
+    return p.rows >= 1U && p.K >= kBK && p.K % kBK == 0U && p.N >= kBN && p.N % kBN == 0U && p.batches >= 1U && p.batches <= 65535U &&
+           p.rows <= 65535U * kBM && p.order <= 2U && p.group >= 1U && p.batches % p.group == 0U && (p.order != 2U || p.N / kBN <= 65535U / p.group) && p.w_ld % 8U == 0U &&
+           (p.a16 != nullptr ? p.a_row % 8U == 0U && p.a_batch % 8U == 0U && reinterpret_cast<std::uintptr_t>(p.a16) % 16U == 0U
+                             : p.a_row % 4U == 0U && p.a_batch % 4U == 0U && reinterpret_cast<std::uintptr_t>(p.a) % 16U == 0U) &&
+           p.w_batch % 8U == 0U &&
+           reinterpret_cast<std::uintptr_t>(p.w) % 16U == 0U;
+}
+
+#if defined(__HIPCC__)
+using Half16 = _Float16 __attribute__((ext_vector_type(16)));
+using Float8 = float __attribute__((ext_vector_type(8)));
+using Float4 = float __attribute__((ext_vector_type(4)));
+using U4 = std::uint32_t __attribute__((ext_vector_type(4)));
+// A fragment stays 8 dwords (2 x ds_load_b128) and is bit-cast to Half16 only at the WMMA: a <16 x half> value makes
+// gfx11 true16 codegen split and re-pack every dword (v_lshrrev_b32 + v_mov_b16, 192 VALU per stage measured).
+typedef std::uint32_t Frag __attribute__((ext_vector_type(8), aligned(16)));
 
 struct RawStore {
     float* y;
@@ -89,14 +100,6 @@ struct alignas(16) Storage {
 };
 static_assert(sizeof(Storage) == 20480);
 
-inline bool fits(const Args& p) {
-    return p.rows >= 1U && p.K % kBK == 0U && p.N % kBN == 0U && p.batches >= 1U && p.batches <= 65535U &&
-           (p.rows + kBM - 1U) / kBM <= 65535U && p.order <= 2U && p.group >= 1U && p.batches % p.group == 0U && (p.order != 2U || p.N / kBN * p.group <= 65535U) && p.w_ld % 8U == 0U &&
-           (p.a16 != nullptr ? p.a_row % 8U == 0U && p.a_batch % 8U == 0U && reinterpret_cast<std::uintptr_t>(p.a16) % 16U == 0U
-                             : p.a_row % 4U == 0U && p.a_batch % 4U == 0U && reinterpret_cast<std::uintptr_t>(p.a) % 16U == 0U) &&
-           p.w_batch % 8U == 0U &&
-           reinterpret_cast<std::uintptr_t>(p.w) % 16U == 0U;
-}
 
 namespace detail {
 __device__ __forceinline__ Frag fragment(const std::uint32_t* p) { return *reinterpret_cast<const Frag*>(p); }
@@ -222,5 +225,7 @@ template <Layout L> inline void gemm(const Args& p, hipStream_t s) { gemm<L>(p, 
 template <Layout L> inline void gemm_bf16(const Args& p, hipStream_t s) {
     gemm<L>(p, Bf16Store{reinterpret_cast<std::uint16_t*>(p.y), p.y_row, p.y_batch}, s);
 }
+
+#endif  // defined(__HIPCC__): Args and fits also support host admission tests.
 
 }  // namespace strix::core::f16_tile_gemm
