@@ -12,9 +12,13 @@
 #include <random>
 #include <stdexcept>
 #include <thread>
+#include <type_traits>
 #include <vector>
 
 namespace {
+static_assert(!std::is_move_constructible_v<strix::pair::StagePipes>, "receive validator requires a stable owner");
+static_assert(!std::is_move_assignable_v<strix::pair::StagePipes>, "receive validator requires a stable owner");
+
 void require(bool ok, const char* what) { if (!ok) throw std::runtime_error(what); }
 // One ordered byte stream (one direction of a loopback transport).
 class Stream {
@@ -66,13 +70,17 @@ strix::pair::PipeOptions options() {
     return out;
 }
 // Runs both ranks through the shared order; returns the last stage's chunk order on rank 1.
-std::vector<std::uint64_t> run(const strix::pair::StageMap& map, std::uint64_t chunks, unsigned seed, Channel* forward_log = nullptr) {
+std::vector<std::uint64_t> run(const strix::pair::StageMap& map, std::uint64_t chunks, unsigned seed,
+    Channel* forward_log = nullptr, std::size_t extra_bytes = 0) {
     Channel forward, reverse;
     Channel& fwd = forward_log ? *forward_log : forward;
     std::vector<std::uint64_t> finished;
     std::atomic<bool> failed{false};
     std::string error;
     std::mutex error_mutex;
+    const auto size = [&](std::uint64_t chunk, std::uint32_t boundary) {
+        return payload_bytes(chunk, boundary) + (boundary == 0U ? extra_bytes : 0U);
+    };
     const auto rank_body = [&](unsigned rank) {
         try {
             std::mt19937 rng(seed * 2U + rank);
@@ -85,7 +93,7 @@ std::vector<std::uint64_t> run(const strix::pair::StageMap& map, std::uint64_t c
                 if (step.stage > 0U) {
                     const auto b = step.stage - 1U;
                     auto& in = pipes.acquire_in(step.chunk, b);
-                    require(in.payload.size() == payload_bytes(step.chunk, b), "payload size kept");
+                    require(in.payload.size() == size(step.chunk, b), "payload size kept");
                     for (std::size_t i = 0; i < in.payload.size(); ++i)
                         require(in.payload[i] == pattern(step.chunk, b, i), "payload bytes kept");
                     pipes.release_in(step.chunk, b);
@@ -93,8 +101,8 @@ std::vector<std::uint64_t> run(const strix::pair::StageMap& map, std::uint64_t c
                 if (step.stage + 1U < map.stages()) {
                     auto& out = pipes.acquire_out(step.chunk, step.stage);
                     out.header[0] = 0x5345414dULL;
-                    out.header[3] = payload_bytes(step.chunk, step.stage);
-                    out.resize(payload_bytes(step.chunk, step.stage));
+                    out.header[3] = size(step.chunk, step.stage);
+                    out.resize(size(step.chunk, step.stage));
                     for (std::size_t i = 0; i < out.payload.size(); ++i) out.payload[i] = pattern(step.chunk, step.stage, i);
                     pipes.release_out(step.chunk, step.stage);
                 } else {
@@ -125,8 +133,11 @@ int main() try {
         const auto single = StageMap::single(StageCut(22U, true), 48U);
         require(single.text() == "0,22.5,48" && single.stage_of(22U) == 0U && single.stage_of(23U) == 1U, "half cut keeps the cut layer's state on A");
         bool threw = false;
-        try { (void)StageMap::parse("0,10,20", 30U); } catch (const std::invalid_argument&) { threw = true; }
+        try { (void)StageMap::parse("0,10,20,30", 30U); } catch (const std::invalid_argument&) { threw = true; }
         require(threw, "odd stage count rejected");
+        threw = false;
+        try { (void)StageMap::parse("0,10,20", 30U); } catch (const std::invalid_argument&) { threw = true; }
+        require(threw, "wrong endpoint rejected");
         require(StageMap::parse("0,24,48", 48U).fnv() != StageMap::parse("0,23,48", 48U).fnv(), "map FNV differs");
     }
     {  // balance_map: uniform MiniMax-like 60 layers (v = 5) and a Qwen-like 48 layers with a head tail
@@ -165,9 +176,9 @@ int main() try {
         r0.join(); r1.join();
         require(staged.ab.log() == plain.ab.log(), "v=1 forward bytes identical to a plain pipe (wire v3)");
     }
-    {  // 1,000 random schedules, v in {1,2,3,5}, C in {2,3,4,8}
+    {  // At least 1,000 random schedules, including partial groups after a full group.
         const std::array<const char*, 4> maps{"0,24,48", "0,12,24,36,48", "0,8,16,24,32,40,48", "0,5,10,15,20,25,30,35,40,45,48"};
-        const std::array<std::uint64_t, 4> chunk_counts{2U, 3U, 4U, 8U};
+        const std::array<std::uint64_t, 6> chunk_counts{2U, 3U, 4U, 5U, 7U, 8U};
         unsigned runs = 0;
         for (unsigned seed = 0; runs < 1000U; ++seed)
             for (const auto* text : maps)
@@ -179,6 +190,29 @@ int main() try {
                     ++runs;
                 }
         std::printf("stage pipes: %u schedules\n", runs);
+    }
+    {  // A full piece followed by a partial piece, with payload and CRC checks through both ranks.
+        const auto done = run(StageMap::parse("0,12,24,36,48", 48U), 1U, 0U, nullptr, strix::pair::seam_piece_bytes);
+        require(done == std::vector<std::uint64_t>{0U}, "multi-piece frame consumed");
+    }
+    for (const std::size_t word : {42U, 43U, 44U}) {  // Reject malformed v4 headers before engine validation.
+        const auto map = StageMap::parse("0,12,24,36,48", 48U);
+        Channel f, r;
+        std::atomic<unsigned> engine_calls{0U};
+        auto opts = options();
+        opts.validate = [&](const strix::pair::PipeHeader&, std::uint64_t) -> std::size_t {
+            ++engine_calls;
+            throw std::runtime_error("engine validator reached");
+        };
+        strix::pair::StagePipes pipes(1U, map, 1U, f.end(1U), r.end(1U), opts);
+        strix::pair::PipeHeader header{};
+        header[42] = 4U;
+        header[44] = map.fnv();
+        header[word] ^= 1U;
+        f.ab.send(std::as_bytes(std::span(header)));
+        bool threw = false;
+        try { (void)pipes.acquire_in(0U, 0U); } catch (const std::runtime_error&) { threw = true; }
+        require(threw && engine_calls == 0U, "malformed v4 header rejected before engine validation");
     }
     {  // out-of-order use is refused
         const auto map = StageMap::parse("0,12,24,36,48", 48U);

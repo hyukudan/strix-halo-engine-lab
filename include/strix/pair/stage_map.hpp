@@ -149,6 +149,10 @@ public:
                 staging, checksum, in_link.transfer_piece);
         }
     }
+    // Receive workers capture this wrapper; its address must stay stable until they stop.
+    StagePipes(StagePipes&&) = delete;
+    StagePipes& operator=(StagePipes&&) = delete;
+
     const StageMap& map() const noexcept { return map_; }
     std::uint64_t chunks() const noexcept { return chunks_; }
     std::uint64_t wire_version() const noexcept { return map_.stages() > 2U ? 4U : 3U; }
