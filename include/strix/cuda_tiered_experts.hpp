@@ -10,7 +10,10 @@
 // gather   copies each miss's rawdots into the card's rawdots[row][slot] and ORs the host row status.
 // All kernels take device pointers and per-launch constants only: capturable in a CUDA graph and replayable (the table
 // is device memory that is written between replays). One exchange region serves every layer (stream order serialises
-// the layers); the host worker answers one job at a time.
+// the layers); the host worker answers one job at a time. After timeout, dead is
+// sticky: later publishes leave all exchange inputs untouched and waits fail.
+// Quiesce the producing stream, then destroy/join TierWorker before destroying,
+// resetting or reusing exchange storage. A GPU timeout is not a CPU cancellation.
 #pragma once
 
 #include <cuda_runtime.h>
@@ -126,7 +129,7 @@ struct WorkerStats {
 class TierWorker {
 public:
     TierWorker(const Exchange& ex, std::vector<strix::cpu::expert::LayerWeights> layers, strix::cpu::expert::Executor& executor);
-    ~TierWorker();
+    ~TierWorker();  // drains/acknowledges the outstanding job; producer must be quiescent
     TierWorker(const TierWorker&) = delete;
     TierWorker& operator=(const TierWorker&) = delete;
     [[nodiscard]] WorkerStats stats() const;

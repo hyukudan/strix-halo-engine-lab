@@ -32,6 +32,9 @@ __global__ __launch_bounds__(256) void publish_kernel(TierDev d, std::uint32_t l
                                                       const std::int32_t* table, std::uint32_t zero_slot,
                                                       const std::int8_t* codes, const float* deltas, const std::int32_t* sums,
                                                       std::uint32_t* counts) {
+    // The preceding wait can time out while the CPU still owns these inputs.
+    // dead is stable for the whole launch (all exchange kernels use one stream).
+    if (*reinterpret_cast<volatile std::uint32_t*>(&d.state->dead)) return;
     __shared__ std::uint32_t any_miss, last_block;
     const std::uint32_t row = blockIdx.x, t = threadIdx.x;
     const bool live = row < rows;
@@ -265,9 +268,13 @@ void TierWorker::loop() {
     const std::uint32_t groups = lay.hidden / 32U;
     auto idle_since = clock::now();
     std::uint64_t answered = 0;
-    while (!stop_.load(std::memory_order_acquire)) {
+    for (;;) {
+        // Observe stop before published: after the producer is quiescent, shutdown
+        // must still answer its final publication before exchange storage can go.
+        const bool stopping = stop_.load(std::memory_order_acquire);
         const std::uint64_t seq = ex_.published().load(std::memory_order_acquire);
         if (seq == answered) {
+            if (stopping) break;
             if (clock::now() - idle_since > std::chrono::milliseconds(2)) std::this_thread::sleep_for(std::chrono::microseconds(50));
             else std::this_thread::yield();
             continue;
