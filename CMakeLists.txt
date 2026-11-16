@@ -5724,6 +5724,13 @@ if(BUILD_TESTING AND STRIX_FAMILY_DEEPSEEK41)
         COMMAND ${Python3_EXECUTABLE} -B ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_rtx_session_gate.py)
     set_tests_properties(strix-ds41-session-cache-tests strix-rtx-session-gate-tests PROPERTIES LABELS "cpu;session" TIMEOUT 120)
 endif()
+if(BUILD_TESTING)
+    find_package(Python3 COMPONENTS Interpreter QUIET)
+    if(Python3_Interpreter_FOUND)
+        add_test(NAME strix-mmflash-ranges-tests
+            COMMAND ${Python3_EXECUTABLE} -B ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_mmflash_ranges.py)
+    endif()
+endif()
 
 # Host-only layer-split wire-layout gate; native Qwen execution is qualified separately.
 if(BUILD_TESTING)
