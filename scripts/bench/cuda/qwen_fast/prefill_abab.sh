@@ -14,6 +14,20 @@ HERE=$(cd "$(dirname "$0")" && pwd)
 PORT=${PORT:-8095}; GPU=${GPU_INDEX:-0}; PY=${PYTHON:-python}
 mkdir -p "$OUT"; trap 'touch "$OUT/.done"' EXIT
 smi() { nvidia-smi -i "$GPU" --query-gpu=memory.used,utilization.gpu,clocks.sm --format=csv,noheader,nounits | tr -d ' \r'; }
+# Stop the server of one arm without hanging: a native Windows exe ignores the shell's signal, so take its Windows pid at
+# stop time (after the exec, from /proc or the pid listening on PORT), force it, then wait with a bound.
+stop_server() {
+  local spid=$1 wpid="" i
+  if command -v taskkill > /dev/null 2>&1; then
+    wpid=$(cat "/proc/$spid/winpid" 2>/dev/null || true)
+    [ -n "$wpid" ] && taskkill //F //PID "$wpid" > /dev/null 2>&1
+    wpid=$(netstat -ano 2>/dev/null | tr -d '\r' | awk -v p=":$PORT" '$1=="TCP" && $2 ~ p"$" && $4=="LISTENING" {print $5; exit}')
+    [ -n "$wpid" ] && [ "$wpid" != 0 ] && taskkill //F //PID "$wpid" > /dev/null 2>&1
+  fi
+  kill "$spid" 2>/dev/null
+  for i in $(seq 1 60); do kill -0 "$spid" 2>/dev/null || return 0; sleep 1; done
+  echo "warning: server pid $spid still alive after 60 s" >&2
+}
 EXTRA=()
 [ -n "${MTP:-}" ] && EXTRA+=(--mtp-sidecar "$MTP")
 [ -n "${VOCAB:-}" ] && EXTRA+=(--draft-vocab "$VOCAB")
@@ -26,13 +40,12 @@ for spec in "${LIST[@]}"; do
   # shellcheck disable=SC2086
   env $envs "$SERVE" --model "$MODEL" --tables "$TABLES" --rope-table "$ROPE" "${EXTRA[@]}" --port "$PORT" \
     ${COMMON:---max-positions 34816 --http-slots 1} $flags > "$A/serve.log" 2>&1 &
-  SPID=$!; WPID=$(cat /proc/$SPID/winpid 2>/dev/null || true)
+  SPID=$!
   ( while kill -0 $SPID 2>/dev/null; do echo "$(date +%s.%N | cut -c1-14) $(smi)" >> "$A/smi.samples"; sleep 0.5; done ) & MPID=$!
   # shellcheck disable=SC2086
   timeout "${LIMIT_S:-900}" "$PY" -I "$HERE/prefill_client.py" "http://127.0.0.1:$PORT" "$IDS" "$A/client.txt" \
     ${CLIENT_ARGS:---lens 8192,32768 --runs 2} > "$A/client.log" 2>&1; rc=$?
-  if [ -n "$WPID" ]; then taskkill //F //PID "$WPID" > /dev/null 2>&1; fi
-  kill $SPID 2>/dev/null; wait $SPID 2>/dev/null; sleep 2; kill $MPID 2>/dev/null
+  stop_server "$SPID"; sleep 2; kill $MPID 2>/dev/null
   { echo "== arm $name rc $rc env [$envs] flags [$flags]"
     grep -E 'profile|identity|VRAM after load|rror' "$A/serve.log" | head -4 | cut -c1-240
     grep -E '^pf ' "$A/client.txt" | cut -c1-200
