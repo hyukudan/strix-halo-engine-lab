@@ -43,6 +43,9 @@ add_executable(qwen_decode_e2e tests/cuda/qwen_decode_e2e.cu)
 target_link_libraries(qwen_decode_e2e PRIVATE strix_qwen_cuda strix_qwen_handoff)
 add_executable(qwen_decode_bench tests/cuda/qwen_decode_bench.cu)
 target_link_libraries(qwen_decode_bench PRIVATE strix_qwen_cuda)
+add_executable(qwen_dense_tests tests/cuda/qwen_dense_tests.cu)
+target_include_directories(qwen_dense_tests PRIVATE tests/cuda)
+target_link_libraries(qwen_dense_tests PRIVATE strix_qwen_cuda)
 add_executable(strix-cuda-qwen-serve apps/cuda_qwen_serve_main.cu)
 # Shared MTP window controllers (also linked by the HIP engine): measured-cost depth/rows policy and its host adapter.
 add_library(strix_mtp_depth STATIC src/mtp_window_controller.cpp src/mtp_depth_window_controller.cpp src/serve/row_budget.cpp

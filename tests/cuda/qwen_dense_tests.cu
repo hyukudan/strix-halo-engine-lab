@@ -533,8 +533,7 @@ static void bench_rows() {
             CK(cudaEventRecord(b)); CK(cudaEventSynchronize(b));
             float ms = 0; CK(cudaEventElapsedTime(&ms, a, b));
             const double us = 1000.0 * ms / iters;
-            std::printf("bench-rows %-16s rows %2u: %7.2f us/call  %6.0f GB/s (weights %.1f MB)
-", cs.name, rows, us,
+            std::printf("bench-rows %-16s rows %2u: %7.2f us/call  %6.0f GB/s (weights %.1f MB)\n", cs.name, rows, us,
                         static_cast<double>(bytes) / (us * 1e-6) / 1e9, bytes / 1e6);
         }
         CK(cudaEventDestroy(a)); CK(cudaEventDestroy(b));
