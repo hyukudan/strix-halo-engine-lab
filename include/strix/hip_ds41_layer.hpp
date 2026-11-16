@@ -267,7 +267,7 @@ bool enqueue_q8_0_a8_dense_prefill(const Q8A8DensePrefillView& view, void* strea
 // dense-q8a8-f16-v1): group g reads weight + g * weight_group_bytes and codes / deltas from column g * view.width, and
 // writes out columns from g * view.count. Bits: those of the per-group calls. Returns false, with nothing enqueued, when
 // the FAST dense form does not take the call or STRIX_DS41_FAST_DENSE_BATCH=0: the caller then makes the per-group calls.
-// The outputs' A8 (a8_codes) is never written here.
+// Invalid dense views, including k_parts != 1, are declined before enqueueing. The outputs' A8 (a8_codes) is never written here.
 bool enqueue_q8_0_a8_fast_dense_groups(const Q8A8DensePrefillView& view, unsigned groups, std::size_t weight_group_bytes, void* stream);
 // F16 projection (weight [count rows of width]): out[r * out_stride + o] = f16_row_dot(row first + o, x_r),
 // any number of rows (above 8 a tiled kernel with the same lane classes and butterfly, so the same bits).

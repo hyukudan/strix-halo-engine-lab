@@ -29,6 +29,8 @@ struct View {
     // Batched form (grid z): `batch` independent products of the same shape in ONE launch; product z reads
     // weight + z * batch_weight_bytes, codes + z * batch_in, deltas + z * batch_in / 32 and writes out + z * batch_out.
     // Each product's bits are those of its own call (scheduling only). 0 or 1 = one product (the fields are not read).
+    // Caller guarantees disjoint output regions across products (including every row, also when accumulating).
+    // supported() checks shape admission only; it does not check output overlap or allocation extents.
     std::uint32_t batch = 0U, batch_in = 0U, batch_out = 0U;
     std::uint64_t batch_weight_bytes = 0U;
 };
