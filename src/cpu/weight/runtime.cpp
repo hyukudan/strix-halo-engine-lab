@@ -16,7 +16,7 @@ ExecutionContext cpu_execution_context() {
         cb->wait_event = [](ExecutionContext&, void*) -> Status { return {Error::ok, {}}; };
         cb->event_complete = [](void*) { return true; };
         cb->destroy_event = [](void*) {};
-        cb->retire = [](void* p, std::vector<void*>, ExecutionContext) { std::free(p); };
+        cb->retire = [](void* p, Retirement, ExecutionContext) { std::free(p); };
         cb->convert = [](const WeightView& w, const Plan& plan, void* p, ExecutionContext&) -> Status {
             if (plan.selected.strategy != Strategy::native || plan.selected.resources.image_bytes != w.payload.range.bytes)
                 return {Error::unsupported_arithmetic, "CPU conversion source is not registered"};

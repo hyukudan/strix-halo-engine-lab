@@ -28,7 +28,8 @@ bool wfmt_resolve_test() {
     old.image={"image.raw",1}; old.backend=Backend::cpu; old.strategy=Strategy::native; old.exactness=Exactness::legacy_bitwise;
     old.cost.packed_bytes_per_weight={4,1}; old.cost.image_bytes_per_weight={4,1};
     old.cost.decode={{0,1},{0,1},{0,1},{0,1},{0,1},{0,1},{0,1},{0,1}};
-    Candidate next=old; next.kernel=2;
+    old.implementation.bytes[0]=1;
+    Candidate next=old; next.kernel=2; next.implementation.bytes[0]=2;
     std::array candidates{old,next};
     ResolveRequest r{}; r.tensor=&t; r.hardware.backend=Backend::cpu; r.hardware.compiler_id="test-compiler";
     r.hardware.device_class="test-device"; r.hardware.free_bytes=1024; r.hardware.cache_budget_bytes=1024;
@@ -36,10 +37,20 @@ bool wfmt_resolve_test() {
     Plan out{};
     if (!resolve(reg,r,candidates,{},out) || out.selected.kernel!=1 || !std::isnan(out.predicted_us)) return false;
     Qualification q{}; q.receipt.bytes[0]=1; q.compiler_id=r.hardware.compiler_id; q.device_class=r.hardware.device_class;
-    q.shape_regime=shape_regime(r.workload); q.incumbent=1; q.replacement=2; q.arithmetic=old.arithmetic;
+    q.shape_regime=shape_regime(r.workload); q.incumbent_implementation=old.implementation; q.replacement_implementation=next.implementation; q.arithmetic=old.arithmetic;
+    r.build_identity.bytes[0]=42; q.build_identity=r.build_identity;
     q.byte_equal=q.faster=true;
     std::array qs{q};
     if (!resolve(reg,r,candidates,qs,out) || out.selected.kernel!=2) return false;
+    r.build_identity.bytes[0]=43;
+    if (!resolve(reg,r,candidates,qs,out) || out.selected.kernel!=1) return false;
+    r.build_identity=q.build_identity; candidates[1].implementation.bytes[0]=3;
+    if (!resolve(reg,r,candidates,qs,out) || out.selected.kernel!=1) return false;
+    candidates[1]=next; candidates[1].kernel=20; // Persistent identity maps to this build's dispatch ID.
+    if (!resolve(reg,r,candidates,qs,out) || out.selected.kernel!=20) return false;
+    candidates[1]=next; r.build_identity={};
+    if (!resolve(reg,r,candidates,qs,out) || out.selected.kernel!=1) return false;
+    r.build_identity=q.build_identity;
     r.workload.m=2; if (!resolve(reg,r,candidates,qs,out) || out.selected.kernel!=1) return false;
     r.workload.m=1; apply_decision_override(r,"0");
     if (!resolve(reg,r,candidates,qs,out) || out.selected.kernel!=1) return false;
@@ -64,11 +75,21 @@ bool wfmt_resolve_test() {
     if (!estimate_cost(old,r.hardware,r.workload,us) || std::abs(us-0.016)>1.e-12) return false;
     DecisionTable table;
     const std::string receipt(64,'1'), commit(40,'a');
-    const auto document=std::string("{\"schema\":\"wfmt.decisions@1\",\"decisions\":[{\"receipt\":\"")+receipt+
-        "\",\"source_commit\":\""+commit+"\",\"device_class\":\"cpu\",\"compiler_id\":\"test\",\"compiler_flags\":\"strict\","
-        "\"shape_regime\":\"1:1:4\",\"incumbent\":1,\"replacement\":2,\"arithmetic\":\"cpu-q8a8-tree32@1\",\"byte_equal\":true,\"faster\":true,\"quality_passed\":false}]}";
+    const auto document=std::string("{\"schema\":\"wfmt.decisions@2\",\"decisions\":[{\"receipt\":\"")+receipt+
+        "\",\"build_identity\":\""+receipt+"\",\"source_commit\":\""+commit+"\",\"device_class\":\"cpu\",\"compiler_id\":\"test\",\"compiler_flags\":\"strict\","
+        "\"shape_regime\":\"1:1:4\",\"incumbent\":\""+std::string(64,'2')+"\",\"replacement\":\""+std::string(64,'3')+"\",\"arithmetic\":\"cpu-q8a8-tree32@1\",\"byte_equal\":true,\"faster\":true,\"quality_passed\":false}]}";
     if(!import_decisions(document,table) || table.entries.size()!=1 || serialize_id(table.entries[0].arithmetic)!="cpu-q8a8-tree32@1" || table.entries[0].compiler_id!="test|strict") return false;
-    if(import_decisions("{}",table) || import_decisions("{\"schema\":\"wfmt.decisions@1\",\"schema\":0}",table)) return false;
+    auto imported=table.entries[0]; imported.shape_regime=shape_regime(r.workload);
+    r.hardware.compiler_id=imported.compiler_id; r.hardware.device_class=imported.device_class;
+    r.build_identity=imported.build_identity; r.maximum_permission=Exactness::legacy_bitwise;
+    candidates={old,next}; candidates[0].implementation=imported.incumbent_implementation;
+    candidates[1].implementation=imported.replacement_implementation;
+    if (!resolve(reg,r,candidates,std::span(&imported,1),out) || out.selected.kernel!=2) return false;
+    r.build_identity.bytes[0]^=1;
+    if (!resolve(reg,r,candidates,std::span(&imported,1),out) || out.selected.kernel!=1) return false;
+    auto obsolete=document; obsolete.replace(obsolete.find("wfmt.decisions@2"),16,"wfmt.decisions@1");
+    if (import_decisions(obsolete,table)) return false;
+    if(import_decisions("{}",table) || import_decisions("{\"schema\":\"wfmt.decisions@2\",\"schema\":0}",table)) return false;
     auto profile = strix::DeviceProfile{}; profile.arch_name="gfx1151"; profile.wave_size=32; profile.free_memory_bytes=100;
     auto hardware=hardware_from_profile(profile,"compiler");
     return hardware.backend==Backend::hip && hardware.arch=="gfx1151" && hardware.free_bytes==100;

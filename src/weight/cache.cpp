@@ -1,6 +1,7 @@
 #include <strix/weight/cache.hpp>
 #include <strix/weight/source.hpp>
 #include <algorithm>
+#include <atomic>
 #include <condition_variable>
 #include <cstring>
 #include <limits>
@@ -25,29 +26,41 @@ bool callbacks_valid(const ExecutionContext& c) {
 }
 }
 struct ImageLease::Entry {
+    struct Charge {
+        std::shared_ptr<std::atomic<std::uint64_t>> reserved;
+        std::uint64_t bytes = 0;
+        ~Charge() { if (reserved) reserved->fetch_sub(bytes); }
+    };
+    struct Charges { std::shared_ptr<Charge> image, workspace; };
+    std::shared_ptr<Charges> charges;
     std::mutex mutex;
     std::condition_variable ready;
     bool building = true, poisoned = false;
     Status status{Error::ok, {}};
     void* allocation = nullptr;
-    std::uint64_t bytes = 0;
     std::shared_ptr<const RuntimeCallbacks> callbacks;
     ExecutionContext context;
     std::vector<void*> events;
+    std::vector<void*> unresolved_streams;
     void* readiness = nullptr;
     bool has_readiness = false;
     ~Entry() {
-        if (allocation) callbacks->retire(allocation, std::move(events), context);
+        if (allocation) callbacks->retire(allocation, {std::move(events), std::move(unresolved_streams), std::move(charges)}, context);
         else if (callbacks) for (auto event : events) callbacks->destroy_event(event);
     }
     bool completed() {
         std::lock_guard lock(mutex);
+        release_workspace();
         return !building && !poisoned && std::all_of(events.begin(), events.end(), [&](void* e) { return callbacks->event_complete(e); });
+    }
+    void release_workspace() {
+        if (has_readiness && callbacks->event_complete(readiness)) charges->workspace.reset();
     }
 };
 struct ImageCache::State {
     mutable std::mutex mutex;
-    std::uint64_t budget = 0, reserved = 0;
+    std::uint64_t budget = 0;
+    std::shared_ptr<std::atomic<std::uint64_t>> reserved = std::make_shared<std::atomic<std::uint64_t>>(0);
     bool bound = false;
     Backend backend{};
     std::uint32_t device_index = 0;
@@ -56,7 +69,8 @@ struct ImageCache::State {
         std::uint64_t freed = 0;
         for (auto it = entries.begin(); it != entries.end() && freed < wanted;) {
             if (it->second.use_count() == 1 && it->second->completed()) {
-                freed += it->second->bytes; reserved -= it->second->bytes; it = entries.erase(it);
+                const auto before = reserved->load(); it = entries.erase(it);
+                freed += before - reserved->load();
             } else ++it;
         }
         return freed;
@@ -64,9 +78,12 @@ struct ImageCache::State {
 };
 ImageCache::ImageCache(std::uint64_t budget) : state_(std::make_shared<State>()) { state_->budget = budget; }
 ImageCache::~ImageCache() = default;
-void ImageCache::set_budget(std::uint64_t budget) { std::lock_guard lock(state_->mutex); state_->budget = budget; if (state_->reserved > budget) state_->evict(state_->reserved - budget); }
+void ImageCache::set_budget(std::uint64_t budget) {
+    std::lock_guard lock(state_->mutex); state_->budget = budget;
+    const auto reserved = state_->reserved->load(); if (reserved > budget) state_->evict(reserved - budget);
+}
 std::uint64_t ImageCache::evict_completed(std::uint64_t requested) { std::lock_guard lock(state_->mutex); return state_->evict(requested); }
-std::uint64_t ImageCache::bytes_reserved() const { std::lock_guard lock(state_->mutex); return state_->reserved; }
+std::uint64_t ImageCache::bytes_reserved() const { return state_->reserved->load(); }
 ImageLease::~ImageLease() { if (entry_ && !used_) { auto ignored = record_last_use(*this, context_); (void)ignored; } }
 ImageLease::ImageLease(ImageLease&& other) noexcept : entry_(std::move(other.entry_)), context_(std::move(other.context_)), used_(other.used_) {}
 ImageLease& ImageLease::operator=(ImageLease&& other) noexcept {
@@ -82,8 +99,14 @@ Status record_last_use(ImageLease& lease, ExecutionContext& context) {
     std::lock_guard lock(entry.mutex);
     void* event = nullptr;
     Status status{Error::device_failure, "last-use event callback failed"};
-    try { status = context.callbacks->record_event(context, event); } catch (...) { entry.poisoned = true; return status; }
-    if (!status) { entry.poisoned = true; return status; }
+    try { status = context.callbacks->record_event(context, event); } catch (...) {}
+    if (!status) {
+        entry.poisoned = true;
+        if (std::find(entry.unresolved_streams.begin(), entry.unresolved_streams.end(), context.stream) == entry.unresolved_streams.end())
+            entry.unresolved_streams.push_back(context.stream);
+        return status;
+    }
+    entry.release_workspace();
     for (auto it = entry.events.begin(); it != entry.events.end();) {
         if (context.callbacks->event_complete(*it)) { if (entry.has_readiness && *it == entry.readiness) entry.has_readiness = false; context.callbacks->destroy_event(*it); it = entry.events.erase(it); }
         else ++it;
@@ -122,10 +145,17 @@ Status acquire_image(ImageCache& cache, const ImageKey& key, const Plan& plan, c
         if (it != cache.state_->entries.end()) entry = it->second;
         else {
             if (total > cache.state_->budget) return {Error::memory_budget, "image exceeds cache budget"};
-            if (cache.state_->reserved > cache.state_->budget - total) cache.state_->evict(cache.state_->reserved - (cache.state_->budget - total));
-            if (cache.state_->reserved > cache.state_->budget - total) return {Error::memory_budget, "in-use images prevent reservation"};
-            entry = std::make_shared<ImageLease::Entry>(); entry->bytes = bytes; entry->callbacks = context.callbacks; entry->context = context;
-            cache.state_->entries.emplace(serialized, entry); cache.state_->reserved += total; creator = true;
+            const auto reserved = cache.state_->reserved->load();
+            if (reserved > cache.state_->budget - total) cache.state_->evict(reserved - (cache.state_->budget - total));
+            if (cache.state_->reserved->load() > cache.state_->budget - total) return {Error::memory_budget, "in-use or retiring images prevent reservation"};
+            entry = std::make_shared<ImageLease::Entry>(); entry->callbacks = context.callbacks; entry->context = context;
+            entry->charges = std::make_shared<ImageLease::Entry::Charges>();
+            entry->charges->image = std::make_shared<ImageLease::Entry::Charge>();
+            entry->charges->image->reserved = cache.state_->reserved; entry->charges->image->bytes = 0;
+            entry->charges->workspace = std::make_shared<ImageLease::Entry::Charge>();
+            entry->charges->workspace->reserved = cache.state_->reserved; entry->charges->workspace->bytes = 0;
+            cache.state_->entries.emplace(serialized, entry); cache.state_->reserved->fetch_add(total);
+            entry->charges->image->bytes = bytes; entry->charges->workspace->bytes = temporary; creator = true;
         }
     }
     if (creator) {
@@ -141,11 +171,12 @@ Status acquire_image(ImageCache& cache, const ImageKey& key, const Plan& plan, c
         } catch (...) { status = {Error::device_failure, "image allocation/conversion/event failure"}; }
         {
             std::lock_guard lock(entry->mutex); entry->status = status; entry->building = false;
+            if (!status && entry->allocation) entry->unresolved_streams.push_back(context.stream);
+            entry->release_workspace();
         }
         {
             std::lock_guard lock(cache.state_->mutex);
-            cache.state_->reserved -= temporary;
-            if (!status) { cache.state_->reserved -= bytes; cache.state_->entries.erase(serialized); }
+            if (!status) cache.state_->entries.erase(serialized);
         }
         entry->ready.notify_all();
     }
