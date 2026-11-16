@@ -605,9 +605,38 @@ int main(int argc, char** argv) {
                 const char* had = std::getenv("STRIX_ATTN_FLASH_PF");
                 const std::optional<std::string> keep = had ? std::optional<std::string>(had) : std::nullopt;
                 const bool pf = strix::attn_core::sparse::flash_pf_enabled();
-                strix::env_arms::set_env("STRIX_ATTN_FLASH_PF", std::string(pf ? "0" : "1"));
-                strix::env_arms::generation_ref().fetch_add(1, std::memory_order_acq_rel);
-                P::mla_attention_rows_versions(slot, tok, n, qb, kv_b, kHeadsR, qt, e, ob, mo, C, g_hs, 7, ov[2], gv[2]);
+                hipEvent_t ev0, ev1;
+                hok(hipEventCreate(&ev0), "event");
+                hok(hipEventCreate(&ev1), "event");
+                const auto run23 = [&](bool on) {  // whole fused arm 23 (absorb + flash + out), ms
+                    strix::env_arms::set_env("STRIX_ATTN_FLASH_PF", std::string(on ? "1" : "0"));
+                    strix::env_arms::generation_ref().fetch_add(1, std::memory_order_acq_rel);
+                    hok(hipEventRecord(ev0, g_hs), "record");
+                    P::mla_attention_rows_versions(slot, tok, n, qb, kv_b, kHeadsR, qt, e, ob, mo, C, g_hs, 7, ov[2], gv[2]);
+                    hok(hipEventRecord(ev1, g_hs), "record");
+                    hok(hipEventSynchronize(ev1), "sync");
+                    float ms = 0.0F;
+                    hok(hipEventElapsedTime(&ms, ev0, ev1), "elapsed");
+                    return ms;
+                };
+                run23(pf);
+                run23(!pf);
+                float t_on[4], t_off[4];  // strict ABAB, 4 pairs; the last call runs the non-default loop (checked below)
+                for (unsigned rep = 0; rep < 4; ++rep) {
+                    const float a1 = run23(pf), a2 = run23(!pf);
+                    t_on[rep] = pf ? a1 : a2;
+                    t_off[rep] = pf ? a2 : a1;
+                }
+                std::printf("   flash PF ABAB arm 23 ms on:");
+                for (float x : t_on) std::printf(" %.3f", x);
+                std::printf(" off:");
+                for (float x : t_off) std::printf(" %.3f", x);
+                std::sort(t_on, t_on + 4);
+                std::sort(t_off, t_off + 4);
+                std::printf(" | median on %.3f off %.3f (%+.2f %%)\n", 0.5F * (t_on[1] + t_on[2]), 0.5F * (t_off[1] + t_off[2]),
+                            100.0F * ((t_on[1] + t_on[2]) / (t_off[1] + t_off[2]) - 1.0F));
+                hok(hipEventDestroy(ev0), "event");
+                hok(hipEventDestroy(ev1), "event");
                 hok(hipMemcpyAsync(ob_f.data(), ob, nob * 4, hipMemcpyDeviceToHost, g_hs), "cp");
                 hok(hipMemcpyAsync(mo_f.data(), mo, nmo * 4, hipMemcpyDeviceToHost, g_hs), "cp");
                 hok(hipStreamSynchronize(g_hs), "sync");
