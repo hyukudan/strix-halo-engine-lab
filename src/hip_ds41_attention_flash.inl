@@ -77,6 +77,14 @@ struct FlashAttentionPolicy {
     }
     __device__ static __forceinline__ void emit(const Args& v, unsigned wg, unsigned head, unsigned dim, float o) { part(v, wg, head)[2U + dim] = o; }
 };
+// The same policy reading the q_b epilogue's BF16 image of q after RoPE (AttentionView::q16; query_op of the shared
+// core): the image is to_bf16(rope512(q)) of the FP32 q query16 loads, so the fragments and every result are the
+// same bits; no FP32 prologue, half the query bytes (STRIX_DS41_FAST_ATTN_Q16=0 keeps the FP32 q).
+struct FlashAttentionQ16Policy : FlashAttentionPolicy {
+    __device__ static __forceinline__ const std::uint16_t* query_op(const Args& v, unsigned wg) {
+        return v.q16 + (static_cast<std::size_t>(row(v, wg)) * v.heads + head0(v, wg)) * kHeadDim;
+    }
+};
 
 // policy ds41-decoder-replay-bounded-v1: the window keys from the layer's key_floor (visible_keys_floor); the ring slots of
 // the real positions. Its own instantiation of the flash core: FlashAttentionPolicy's code is untouched.
@@ -95,6 +103,12 @@ struct FlashAttentionFloorPolicy : FlashAttentionPolicy {
             return slot;
         }
         return v.capacity + v.idx[static_cast<std::size_t>(r) * v.topk + j - nw];
+    }
+};
+// both: the floored window keys and the q_b epilogue's BF16 query image (same bits as each form alone)
+struct FlashAttentionFloorQ16Policy : FlashAttentionFloorPolicy {
+    __device__ static __forceinline__ const std::uint16_t* query_op(const Args& v, unsigned wg) {
+        return FlashAttentionQ16Policy::query_op(v, wg);
     }
 };
 // the row's single partial (slot 0) through the unchanged combine

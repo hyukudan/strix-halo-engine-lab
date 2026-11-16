@@ -300,6 +300,10 @@ bool resident_from_env() {
     return !v || !*v || std::strcmp(v, "0") != 0;
 }
 
+void layout::parallel_ranges(std::size_t n, std::size_t work_per_item, const std::function<void(std::size_t, std::size_t)>& fn) {
+    parallel_for(n, work_per_item, fn);
+}
+
 ReferenceEncoder::ReferenceEncoder(EncoderConfig c, const EncoderWeights& w) : cfg_(std::move(c)), weights_(&w) { validate(cfg_, w); }
 EncoderOutput ReferenceEncoder::encode(const PatchGrid& g, const PositionInputs& p) { return reference_encode(cfg_, *weights_, g, p); }
 void ReferenceEncoder::linear(const Tensor& w, const Tensor& bias, const float* x, std::size_t rows, float* y) { linear_ref(w, bias, x, rows, y); }
