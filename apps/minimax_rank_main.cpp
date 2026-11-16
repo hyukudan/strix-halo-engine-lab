@@ -1,4 +1,5 @@
 #include "strix/route_receipt.hpp"
+#include "strix/prefill_headless.hpp"
 #include "strix/device/hip_gate.hpp"
 #include "strix/dist/open_transport.hpp"
 // strix-minimax-rank: one rank of the MiniMax M3.1 Flash TP2 engine (both ranks run the same command line).
@@ -1129,10 +1130,21 @@ std::uint64_t ab_flag(mm::Engine& eng, const std::string& flag, const std::vecto
     for (int r = 0; r < prefills; ++r) {
         set(r % 2 == 1);
         const auto dense_before = eng.prefill_dense_mlp_count();
+        const auto headless_before = eng.prefill_headless_chunks();
         const auto t0 = Clock::now();
         first[static_cast<std::size_t>(r)] = eng.prefill(0, prompt, 0);
         ttft[r % 2].push_back(secs(t0, Clock::now()));
         dense_mlp_calls.push_back(eng.prefill_dense_mlp_count() - dense_before);
+        if (flag == "pfheadless") {
+            const auto headless_after = eng.prefill_headless_chunks();
+            const auto expected = eng.prefill_headless_expected(prompt.size());
+            const bool qualified = strix::prefill_headless::qualified_arm(r % 2 == 1, headless_before, headless_after, expected);
+            std::printf("rank %u ab-pfheadless: prefill %d arm %c cache-only chunks %llu expected %zu: %s\n",
+                        eng.rank(), r, r % 2 == 1 ? 'B' : 'A',
+                        static_cast<unsigned long long>(headless_after - headless_before), r % 2 == 1 ? expected : 0,
+                        qualified ? "activation verified" : "UNQUALIFIED (inactive or unexpected activation)");
+            if (!qualified) g_exact_fail = true;  // matching hashes alone cannot qualify this run
+        }
         if (hash_state) {
             states.push_back(eng.state_fnv(0, prompt.size()));
             outs.push_back(eng.prefill_out_fnv());
