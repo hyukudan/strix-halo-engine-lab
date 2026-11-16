@@ -18,7 +18,8 @@ include(cmake/StrixWeight.cmake)
 option(STRIX_WFMT_TESTS "Build shared weight-format contract tests" OFF)
 if(STRIX_WFMT_TESTS)
     enable_testing()
-    add_subdirectory(tests/wfmt)
+    # Register before vendor early returns, instantiate after native dependencies.
+    cmake_language(DEFER CALL add_subdirectory tests/wfmt)
 endif()
 if(MSVC)
     # Portable C library calls (getenv, fopen) are used on purpose; unknown loop pragmas (unroll), padding
