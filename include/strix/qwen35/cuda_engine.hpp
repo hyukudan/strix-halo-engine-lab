@@ -17,6 +17,7 @@
 
 #include <cuda_runtime.h>
 
+#include "strix/cuda_core/attention.hpp"
 #include "strix/cuda_core/dense.hpp"
 #include "strix/qwen35/config.hpp"
 
@@ -54,6 +55,11 @@ struct EngineOptions {
     std::uint32_t prefill_chunk = 2048;  // rows per large-M chunk (multiple of 128, <= 8192); buffers are allocated on first use
     std::uint32_t prefill_slots = 2;     // chunks in flight (1..2): 2 overlaps the sequential GDN kernel of one chunk with the GEMMs of the next
     bool prefill_big = true;             // false: prefill() runs forward_rows windows of 32 + commit (reference / fallback)
+    // Long-context prefill attention (non-exact prefill policies only; the exact policy keeps attention_decode).
+    // flash_pipe: shared-memory pipeline of the flash kernel (scheduling only, bitwise equal across pipes).
+    cuda_core::FlashPipe flash_pipe = cuda_core::FlashPipe::pad2;
+    // attn8: e4m3 flash attention over an e4m3 shadow of the KV cache (bit-changing, own identity suffix "-a8"; FAST gate required).
+    bool prefill_attn8 = false;
 };
 
 // Named identity of the arithmetic + weight source; also the prefix-cache key (caches never mix identities).
@@ -62,7 +68,9 @@ struct EngineOptions {
     static const char* pf_names[] = {"exact", "flash", "fast", "fast2", "fast8"};
     const std::string a = names[static_cast<unsigned>(o.dense_arithmetic)];
     // a non-exact prefill policy is a different arithmetic identity (prefix caches never mix them)
-    const std::string pf = o.prefill_arith == PrefillArith::exact ? "" : std::string("-pf-") + pf_names[static_cast<unsigned>(o.prefill_arith)];
+    const std::string pf = o.prefill_arith == PrefillArith::exact
+        ? ""
+        : std::string("-pf-") + pf_names[static_cast<unsigned>(o.prefill_arith)] + (o.prefill_attn8 ? "-a8" : "");
     if (o.turbo_weights == TurboWeights::off) return "qwen35-cuda-exact-" + a + "-v1" + pf;
     if (o.turbo_weights == TurboWeights::native) return "qwen35-turbo-native-" + a + "-v1" + pf;
     return "qwen35-turbo-nvfp4-onfly-rtn16-v2-retained-" + a + (o.turbo_lm_head ? "" : "-lmhead-bf16") + pf;
