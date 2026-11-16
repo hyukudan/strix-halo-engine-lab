@@ -604,6 +604,7 @@ static void replay_shared(const std::string& path, const strix::qwen_gguf::Model
 }
 
 int main(int argc, char** argv) {
+    std::setvbuf(stdout, nullptr, _IONBF, 0);   // a crash keeps the lines printed so far
     bool gpu = false, do_bench = false, do_bench_rows = false;
     std::string fixture;
     for (int i = 1; i < argc; ++i) {
