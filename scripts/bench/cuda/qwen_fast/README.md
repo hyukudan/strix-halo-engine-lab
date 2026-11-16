@@ -21,6 +21,8 @@ Pieces
   The client owns and cleans up only its launched child; occupied ports and early child exits fail the arm.
   Prefix caching is forced OFF and samples require a reported zero cached-token count. Supply at least
   `runs * sum(lens)` input IDs: slices are disjoint, never truncated or wrapped (81,920 IDs for the defaults).
+- `ident.sh`: byte identity of teacher-forced logit dumps between arms (`--arm 'NAME|ENV=v|--flags'`, the first arm is the
+  reference): the proof that a bitwise lever is bitwise. One process per arm, every dump compared; exit 0 all identical.
 - `mkprompt.py`: builds `NAME.u32` token files from .u32 files, id lists or text (text is tokenised with `strix-tokenize`,
   the server's tokenizer, against a GGUF; nothing is downloaded).
 

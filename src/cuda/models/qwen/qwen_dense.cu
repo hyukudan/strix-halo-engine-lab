@@ -53,6 +53,16 @@ bool dense_t2_remap_enabled() {
     return on;
 }
 
+// STRIX_QRTX_DENSE_T4=0: tile2 (2 K blocks per stage, 4-byte weight copies) instead of project_tile4_kernel (4 K blocks
+// per stage, 8-byte weight copies). Bitwise: same per-output chain, blocks ascending. Needs the remap lever on.
+inline constexpr strix::lever::Decl dense_t4_lever{
+    .name = "qwen_dense_t4", .env = "STRIX_QRTX_DENSE_T4", .exactness = strix::lever::Exactness::bitwise,
+    .default_on = false, .source = "tests/cuda/qwen_dense_tests.cu --bench-shape: equal output hashes, 5 site shapes"};
+bool dense_t4_enabled() {
+    static const bool on = strix::lever::select(dense_t4_lever, {}).on;
+    return on;
+}
+
 constexpr int kBM = 128, kBN = 128, kKB = 4, kThreads = 256, kRowWords = 36;
 constexpr int kStageA = kBM * kRowWords * 4, kStageB = kBN * kRowWords * 4, kStageD = kKB * kBM * 4;
 constexpr int kStage = kStageA + kStageB + kStageD;
@@ -134,6 +144,10 @@ __device__ __forceinline__ unsigned find_seg(const KSite& s, std::uint32_t n) {
 __device__ __forceinline__ void cp_async4(void* smem, const void* g, bool ok) {
     const unsigned s = static_cast<unsigned>(__cvta_generic_to_shared(smem));
     asm volatile("cp.async.ca.shared.global [%0], [%1], 4, %2;\n" ::"r"(s), "l"(g), "r"(ok ? 4 : 0));
+}
+__device__ __forceinline__ void cp_async8(void* smem, const void* g, bool ok) {
+    const unsigned s = static_cast<unsigned>(__cvta_generic_to_shared(smem));
+    asm volatile("cp.async.ca.shared.global [%0], [%1], 8, %2;\n" ::"r"(s), "l"(g), "r"(ok ? 8 : 0));
 }
 __device__ __forceinline__ void cp_async16(void* smem, const void* g, bool ok) {
     const unsigned s = static_cast<unsigned>(__cvta_generic_to_shared(smem));
@@ -460,6 +474,153 @@ __global__ __launch_bounds__(kThreads, Remap ? 1 : 2) void project_tile2_kernel(
 }
 
 // ---------------------------------------------------------------------------------------------------------------------
+// Tile4 (lever qwen_dense_t4, bitwise: same IMMA per 32-K block and the same FP32 chain, blocks ascending): the remap
+// tile with 4 K blocks per stage. The raw Q8_0 bytes of a stage are 136 B per weight row at offset kb0 * 34 with kb0 % 4
+// == 0, so with row_bytes % 8 == 0 (nblocks % 4 == 0) and 8-byte aligned segments every weight copy is 8 bytes: 16 lanes
+// take dwords 0..15 of a row, dword 16 by one thread per row. Loader copies per thread per 4 K blocks 25 -> 16.5 (A 4 x
+// 16 B, B 8.5 x 8 B, scales 2, deltas 2) and one barrier pair per 4 blocks instead of per 2. Row pitch 36 words (144 B):
+// the B reads (rows gid, words tig + c) hit banks 4 gid + tig + c (conflict-free) and 144 mod 128 = 16 keeps ldmatrix
+// conflict-free. Blocks 2 and 3 of a stage read like blocks 0 and 1 shifted by 17 words. 80 KB double buffer, 1 CTA/SM.
+constexpr int kT4Rw = 36;
+constexpr int kT4A = kBM * kT4Rw * 4, kT4B = kBN * kT4Rw * 4, kT4D = 4 * kBM * 4, kT4S = 4 * kBN * 4;
+constexpr int kT4Stage = kT4A + kT4B + kT4D + kT4S;
+constexpr int kT4Smem = 2 * kT4Stage;
+
+template <Store S>
+__global__ __launch_bounds__(kThreads, 1) void project_tile4_kernel(KSite site, std::uint32_t rows, const std::int8_t* codes,
+                                                                    const float* deltas, std::uint32_t pitch) {
+    extern __shared__ __align__(16) unsigned char smem[];
+    const int tid = static_cast<int>(threadIdx.x), lane = tid & 31, warp = tid >> 5, gid = lane >> 2, tig = lane & 3;
+    const int wm = warp & 1, wn = warp >> 1;
+    const std::uint32_t m0 = blockIdx.y * kBM, n0 = blockIdx.x * kBN;
+    const std::uint32_t width = site.width, nblocks = width / 32U, row_bytes = nblocks * 34U;
+    const std::uint32_t stages = nblocks / 4U;
+
+    const KSeg& tseg = site.seg[find_seg(site, n0)];
+    const unsigned char* wbase = tseg.w + static_cast<std::uint64_t>(n0 - tseg.begin) * row_bytes;
+    const std::uint32_t nrows = n0 < site.outputs ? min(static_cast<std::uint32_t>(kBN), site.outputs - n0) : 0U;
+    const int sn = tid & 127, sj = tid >> 7;   // scale / delta loader: output (or row) sn, blocks sj and sj + 2
+    const bool svalid = static_cast<std::uint32_t>(sn) < nrows;
+    const unsigned char* srow = wbase + static_cast<std::uint64_t>(sn) * row_bytes;
+    const std::uint32_t sgr = m0 + static_cast<std::uint32_t>(sn);
+    const bool dvalid = sgr < rows;
+    // Same reader-order slots as tile2: S[j][wn][tig][nt][c] words, D[j][wm][gid][mt * 2 + h] floats; j stride 128 in both.
+    const int s_off = (((sj * 4 + (sn >> 5)) * 4 + ((sn >> 1) & 3)) * 4 + ((sn >> 3) & 3)) * 2 + (sn & 1);
+    const int d_off = ((sj * 2 + (sn >> 6)) * 8 + (sn & 7)) * 8 + ((sn >> 4) & 3) * 2 + ((sn >> 3) & 1);
+    const std::uint32_t r0 = static_cast<std::uint32_t>(tid) >> 4U, w = static_cast<std::uint32_t>(tid) & 15U;
+    const std::uint64_t step = static_cast<std::uint64_t>(row_bytes) * 16U;
+
+    const auto load_stage = [&](std::uint32_t s, int buf) {
+        unsigned char* base = smem + buf * kT4Stage;
+        auto* A = reinterpret_cast<std::uint32_t*>(base);
+        auto* B = reinterpret_cast<std::uint32_t*>(base + kT4A);
+        auto* D = reinterpret_cast<float*>(base + kT4A + kT4B);
+        auto* SC = reinterpret_cast<std::uint32_t*>(base + kT4A + kT4B + kT4D);
+        const std::uint32_t kb0 = s * 4U;
+#pragma unroll
+        for (int k = 0; k < 4; ++k) {
+            const std::uint32_t i = static_cast<std::uint32_t>(tid + k * kThreads), r = i >> 3, c = i & 7U, gr = m0 + r;
+            const bool ok = gr < rows;
+            cp_async16(A + r * kT4Rw + c * 4U, ok ? codes + static_cast<std::uint64_t>(gr) * width + kb0 * 32U + c * 16U : codes, ok);
+        }
+        const unsigned char* g = wbase + static_cast<std::uint64_t>(kb0) * 34U + static_cast<std::uint64_t>(r0) * row_bytes + w * 8U;
+        std::uint32_t* sb = B + r0 * kT4Rw + w * 2U;
+#pragma unroll
+        for (int k = 0; k < 8; ++k) {
+            const bool ok = r0 + 16U * k < nrows;
+            cp_async8(sb + 16 * kT4Rw * k, ok ? static_cast<const void*>(g + step * k) : static_cast<const void*>(site.seg[0].w), ok);
+        }
+        const unsigned char* sstage = srow + static_cast<std::uint64_t>(kb0) * 34U;
+        if (tid < 128)
+            cp_async8(B + sn * kT4Rw + 32, svalid ? static_cast<const void*>(sstage + 128) : static_cast<const void*>(site.seg[0].w), svalid);
+#pragma unroll
+        for (int jj = 0; jj < 2; ++jj) {
+            const int j = sj + 2 * jj;   // scale of block kb0 + j: low half of word 0 / 17 (even j), high half of word 8 / 25 (odd j)
+            const auto* ssrc = reinterpret_cast<const std::uint32_t*>(sstage) + (j * 17) / 2;
+            cp_async4(SC + s_off + 256 * jj, svalid ? ssrc : reinterpret_cast<const std::uint32_t*>(site.seg[0].w), svalid);
+            cp_async4(D + d_off + 256 * jj, dvalid ? deltas + static_cast<std::uint64_t>(kb0 + j) * pitch + sgr : deltas, dvalid);
+        }
+    };
+
+    float acc[4][4][4];
+#pragma unroll
+    for (int a = 0; a < 4; ++a)
+#pragma unroll
+        for (int b = 0; b < 4; ++b)
+#pragma unroll
+            for (int e = 0; e < 4; ++e) acc[a][b][e] = 0.0F;
+
+    load_stage(0U, 0);
+    cp_async_commit();
+    for (std::uint32_t s = 0; s < stages; ++s) {
+        if (s + 1U < stages) load_stage(s + 1U, static_cast<int>((s + 1U) & 1U));
+        cp_async_commit();
+        cp_async_wait1();
+        __syncthreads();
+        const unsigned char* base = smem + (s & 1U) * kT4Stage;
+        const auto* B = reinterpret_cast<const std::uint32_t*>(base + kT4A);
+        const auto* D = reinterpret_cast<const float*>(base + kT4A + kT4B);
+        const auto* SC = reinterpret_cast<const std::uint32_t*>(base + kT4A + kT4B + kT4D);
+#ifdef T4_ROLL
+#pragma unroll 1
+        for (int hb = 0; hb < 2; ++hb)   // rolled pair loop: the loop body stays the size of tile2's
+#pragma unroll
+        for (int jj = 0; jj < 2; ++jj) {
+            const int j = hb * 2 + jj;
+#else
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {   // blocks ascending: the HIP chain order
+#endif
+            std::uint32_t a[4][4];
+#pragma unroll
+            for (int mt = 0; mt < 4; ++mt)
+                core::imma::load_a_frag(a[mt], base + (wm * 64 + mt * 16) * (kT4Rw * 4) + j * 32, kT4Rw * 4, lane);
+            const float4 d0 = *reinterpret_cast<const float4*>(D + ((j * 2 + wm) * 8 + gid) * 8);
+            const float4 d1 = *reinterpret_cast<const float4*>(D + ((j * 2 + wm) * 8 + gid) * 8 + 4);
+            const float dl[4][2] = {{d0.x, d0.y}, {d0.z, d0.w}, {d1.x, d1.y}, {d1.z, d1.w}};
+            const uint4 s0 = *reinterpret_cast<const uint4*>(SC + ((j * 4 + wn) * 4 + tig) * 8);
+            const uint4 s1 = *reinterpret_cast<const uint4*>(SC + ((j * 4 + wn) * 4 + tig) * 8 + 4);
+            const std::uint32_t sw[8] = {s0.x, s0.y, s0.z, s0.w, s1.x, s1.y, s1.z, s1.w};
+            std::uint32_t b[4][2];
+            float dw[4][2];
+#pragma unroll
+            for (int nt = 0; nt < 4; ++nt) {
+                const std::uint32_t* W = B + (wn * 32 + nt * 8 + gid) * kT4Rw + tig + (j >= 2 ? 17 : 0);
+                if ((j & 1) == 0) { b[nt][0] = __byte_perm(W[0], W[1], 0x5432); b[nt][1] = __byte_perm(W[4], W[5], 0x5432); }
+                else { b[nt][0] = W[9]; b[nt][1] = W[13]; }
+#pragma unroll
+                for (int c = 0; c < 2; ++c)
+                    dw[nt][c] = (j & 1) == 0 ? core::imma::half_lo(sw[nt * 2 + c]) : core::imma::half_hi(sw[nt * 2 + c]);
+            }
+#pragma unroll
+            for (int mt = 0; mt < 4; ++mt)
+#pragma unroll
+                for (int nt = 0; nt < 4; ++nt) {
+                    int d[4];
+                    core::imma::mma_seeded(d, a[mt], b[nt]);
+#pragma unroll
+                    for (int e = 0; e < 4; ++e) acc[mt][nt][e] = core::imma::block_acc(d[e], dw[nt][e & 1], dl[mt][e >> 1], acc[mt][nt][e]);
+                }
+        }
+        __syncthreads();
+    }
+#pragma unroll
+    for (int mt = 0; mt < 4; ++mt)
+#pragma unroll
+        for (int hh = 0; hh < 2; ++hh) {
+            const std::uint32_t row = m0 + static_cast<std::uint32_t>(wm * 64 + mt * 16 + gid + 8 * hh);
+            if (row >= rows) continue;
+#pragma unroll
+            for (int nt = 0; nt < 4; ++nt)
+#pragma unroll
+                for (int c = 0; c < 2; ++c) {
+                    const std::uint32_t n = n0 + static_cast<std::uint32_t>(wn * 32 + nt * 8 + 2 * tig + c);
+                    if (n < site.outputs) store_value<S>(site, row, n, acc[mt][nt][2 * hh + c]);
+                }
+        }
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
 // Decode projection (rows <= 8): the same per-(row, output) chain acc = fma(dw * delta, float(dot_b), acc) over blocks
 // b ascending, laid out for few rows. A quad of lanes owns one output: lane q takes codes 8q..8q+7 of each block and
 // holds partial integer dots for all RP rows (RP = rows padded to 1, 2, 4 or 8). The exact group dots are completed by
@@ -730,6 +891,18 @@ template <Store S> cudaError_t launch_project(cudaStream_t stream, const KSite& 
                                      : launch_rows<S>(stream, k, rows, codes, deltas, pitch);
     const dim3 grid((k.outputs + kBN - 1U) / kBN, (rows + kBM - 1U) / kBM);
     if (dense_tile2_enabled() && (k.width / 32U) % 2U == 0U && segments_tile_aligned(k)) {
+        bool w8 = (k.width / 32U) % 4U == 0U;   // tile4: 8-byte weight copies need row_bytes % 8 == 0 and 8-aligned segments
+        for (std::uint32_t m = 0; m < k.nseg; ++m) w8 = w8 && (reinterpret_cast<std::uintptr_t>(k.seg[m].w) & 7U) == 0U;
+        if (w8 && dense_t2_remap_enabled() && dense_t4_enabled()) {
+            static std::once_flag once4;
+            static cudaError_t attr4 = cudaSuccess;
+            std::call_once(once4, [] {
+                attr4 = cudaFuncSetAttribute(project_tile4_kernel<S>, cudaFuncAttributeMaxDynamicSharedMemorySize, kT4Smem);
+            });
+            if (attr4 != cudaSuccess) return attr4;
+            project_tile4_kernel<S><<<grid, kThreads, kT4Smem, stream>>>(k, rows, codes, deltas, pitch);
+            return cudaGetLastError();
+        }
         static std::once_flag once2;
         static cudaError_t attr2 = cudaSuccess;
         std::call_once(once2, [] {
