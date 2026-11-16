@@ -3469,9 +3469,60 @@ template <class Base> struct GlmMlaFlashOb16 : Base {
         return reinterpret_cast<std::uint16_t*>(a.ob) + static_cast<std::size_t>(r) * Base::kHeads * kKvLora;
     }
 };
+// Diagnostic (STRIX_GLM_PF_TOPK_OVERLAP=1; reads the lists only, no effect on bits; syncs the stream per call, so not for
+// timing): how many keys neighbouring query rows share, the input of the row-group flash analysis. Per aligned group of
+// 8 rows: the sum of the list sizes and the union size of each aligned pair, quad and the octet (LDS bitmap of cache
+// positions mod 2^17), split dense (every row's n < kIdxTopk: causal prefix, all keys) / sparse.
+__device__ unsigned long long g_topk_ovl[2][4];  // [dense, sparse][sum n, union 2, union 4, union 8]
+constexpr unsigned kOvlBits = 1U << 17;
+__global__ void __launch_bounds__(256) topk_overlap_kernel(const std::uint32_t* tokens, const std::uint32_t* n, unsigned C) {
+    __shared__ unsigned bm[kOvlBits / 32];
+    __shared__ unsigned cnt;
+    const unsigned r0 = blockIdx.x * 8, rows = min(8U, C - r0);
+    bool dense = true;
+    unsigned long long sum = 0;
+    for (unsigned i = 0; i < rows; ++i) {
+        sum += n[r0 + i];
+        dense = dense && n[r0 + i] < kIdxTopk;
+    }
+    const unsigned cls = dense ? 0U : 1U;
+    for (unsigned lg = 1; lg <= 3; ++lg) {
+        const unsigned g = 1U << lg;
+        for (unsigned s0 = 0; s0 < rows; s0 += g) {
+            for (unsigned w = threadIdx.x; w < kOvlBits / 32; w += blockDim.x) bm[w] = 0;
+            if (threadIdx.x == 0) cnt = 0;
+            __syncthreads();
+            unsigned mine = 0;
+            for (unsigned i = s0; i < min(s0 + g, rows); ++i) {
+                const std::uint32_t* t = tokens + static_cast<std::size_t>(r0 + i) * kMaxTokens;
+                for (unsigned j = threadIdx.x; j < n[r0 + i]; j += blockDim.x) {
+                    const unsigned p = t[j] % kOvlBits, bit = 1U << (p & 31U);
+                    if (!(atomicOr(&bm[p >> 5], bit) & bit)) ++mine;
+                }
+            }
+            atomicAdd(&cnt, mine);
+            __syncthreads();
+            if (threadIdx.x == 0) atomicAdd(&g_topk_ovl[cls][lg], static_cast<unsigned long long>(cnt));
+            __syncthreads();
+        }
+    }
+    if (threadIdx.x == 0) atomicAdd(&g_topk_ovl[cls][0], sum);
+}
+static void topk_overlap_diag(const std::uint32_t* tokens, const std::uint32_t* n, unsigned C, hipStream_t s) {
+    if (!strix::envcfg::flag("STRIX_GLM_PF_TOPK_OVERLAP", false)) return;
+    unsigned long long z[2][4] = {};
+    ok(hipMemcpyToSymbolAsync(HIP_SYMBOL(g_topk_ovl), z, sizeof z, 0, hipMemcpyHostToDevice, s), "glm pf topk overlap clear");
+    topk_overlap_kernel<<<(C + 7) / 8, 256, 0, s>>>(tokens, n, C);
+    ok(hipGetLastError(), "glm pf topk overlap");
+    ok(hipMemcpyFromSymbolAsync(z, HIP_SYMBOL(g_topk_ovl), sizeof z, 0, hipMemcpyDeviceToHost, s), "glm pf topk overlap read");
+    ok(hipStreamSynchronize(s), "glm pf topk overlap sync");
+    std::printf("glm pf topk overlap C %u dense n %llu u2 %llu u4 %llu u8 %llu sparse n %llu u2 %llu u4 %llu u8 %llu\n", C, z[0][0], z[0][1],
+                z[0][2], z[0][3], z[1][0], z[1][1], z[1][2], z[1][3]);
+}
 static void mla_flash_rows(const DsaSlot& sl, const std::uint32_t* tokens, const std::uint32_t* n, const float* qt, float* ob, unsigned C,
                     unsigned keys, bool q16, hipStream_t s, bool ob16 = false) {
     namespace M = strix::attn_core::sparse;
+    topk_overlap_diag(tokens, n, C, s);
     const GlmMlaFlashPolicy::Args a{sl.latent, tokens, n, qt, ob};
     constexpr unsigned T16 = M::Geometry<32, kKvLora, 16>::kThreads, T32 = M::Geometry<32, kKvLora, 32>::kThreads;
     using O16 = GlmMlaFlashOb16<GlmMlaFlashPolicy>;
