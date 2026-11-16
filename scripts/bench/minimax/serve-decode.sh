@@ -10,6 +10,7 @@
 # --peer-bin/--peer-model). Ready = the server's own "READY rank 0" line, so the measured start needs no HTTP client.
 # --start-only stops at READY (start-time diagnosis; fits a short ticket). One server start per call fits one GPU
 # ticket; strict ABAB = tickets A0 B0 A1 B1 with the SAME OUT (abab.py pairs arms by --round).
+# Requests ask for the generated token ids (return_token_ids), so two arms compare with serve_bench.py --compare.
 # Example arms: 'ctl||'  'serial||STRIX_SERVE_STARTUP_OVERLAP=0'.
 set -u
 here=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
@@ -41,7 +42,7 @@ client=()
 ((start_only)) && client=(--client-cmd 'printf "{\"completed\":1,\"failed\":0}\n" >"$KIT_RUN_DIR/client-result.json"')
 tag=$name-$round
 bash "$here/../common/serve-decode.sh" --tag "$tag" --arm "$name" --round "$round" --port "$port" "${chat[@]}" \
-    --ready-log '^READY rank 0' --classes "$classes" --concurrency "$conc" --max-tokens "$maxt" "${client[@]}" \
+    --ready-log '^READY rank 0' --body-extra '{"return_token_ids":true}' --classes "$classes" --concurrency "$conc" --max-tokens "$maxt" "${client[@]}" \
     --peer-cmd "$peer" -- env "${B[@]}" "${E[@]}" "$bin" "$model" "${common[@]}" "${A[@]}" --rank 0 --bind 127.0.0.1 --port "$port"
 rc=$?
 d=${KIT_OUT:-bench-out}/$tag
