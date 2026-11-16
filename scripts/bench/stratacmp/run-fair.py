@@ -19,6 +19,7 @@ import importlib.util
 import json
 import os
 import pathlib
+import signal
 import subprocess
 import sys
 import threading
@@ -97,18 +98,29 @@ def wait_ready(proc, arm, timeout):
 
 
 def stop_owned(proc):
-    if proc.poll() is not None:
-        return
     if os.name == "nt":
+        if proc.poll() is not None:
+            return
         # Only this Popen process and its descendants; never match names globally.
         subprocess.run(["taskkill", "/PID", str(proc.pid), "/T", "/F"], capture_output=True)
     else:
-        proc.terminate()
+        # Popen owns a new session: descendants retain this group after its leader exits.
+        try:
+            os.killpg(proc.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
     try:
         proc.wait(timeout=20)
     except subprocess.TimeoutExpired:
-        proc.kill()
-        proc.wait(timeout=5)
+        if os.name == "nt":
+            proc.kill()
+    finally:
+        if os.name != "nt":
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+    proc.wait(timeout=5)
 
 
 def client(arm, prompts, concurrency, tokens, out, timeout):
@@ -140,7 +152,8 @@ def run_one(config, arm, workload, pair, out, args):
                     cmd=arm["cmd"], records=[], status="running")
     write(out / "run.json", manifest)
     with (out / "server.log").open("w", encoding="utf-8") as log, Sampler() as sampler:
-        proc = subprocess.Popen(arm["cmd"], cwd=arm.get("cwd"), env=env, stdout=log, stderr=subprocess.STDOUT)
+        proc = subprocess.Popen(arm["cmd"], cwd=arm.get("cwd"), env=env, stdout=log, stderr=subprocess.STDOUT,
+                                start_new_session=os.name != "nt")
         owner = None
         manifest["pid"] = proc.pid
         try:

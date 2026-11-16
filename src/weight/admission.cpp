@@ -13,9 +13,9 @@ namespace {
 bool same_shape(const Shape& a,const Shape& b) {if(a.rank!=b.rank)return false;for(unsigned i=0;i<a.rank;++i)if(a.dims[i]!=b.dims[i])return false;return true;}
 Status check(const Registry& registry,const WeightMapEntry& e,bool scan_values=true) {
     const auto& b=e.binding;const auto& w=e.weight;
+    if(b.logical_shape.rank>4 || w.shape.rank>4)return {Error::unsupported_shape,"binding or weight rank exceeds four"};
     if(b.tensor!=w.tensor)return {Error::malformed,"binding tensor identity mismatch"};
     if(!same_shape(b.logical_shape,w.shape))return {Error::unsupported_shape,"binding logical shape mismatch"};
-    if(w.shape.rank>4)return {Error::unsupported_shape,"weight rank exceeds four"};
     for(unsigned i=0;i<w.shape.rank;++i)if(!w.shape.dims[i])return {Error::unsupported_shape,"empty executable weight dimension"};
     if(b.expert_axis!=UINT32_MAX && b.expert_axis>=w.shape.rank)return {Error::unsupported_shape,"expert axis outside logical shape"};
     const auto* format=find_format(registry,w.storage);if(!format)return {Error::unknown_format,"unregistered weight format "+serialize_id(w.storage)};
@@ -35,6 +35,7 @@ Status check(const Registry& registry,const WeightMapEntry& e,bool scan_values=t
 }
 const RawTensor* named(const TensorIndex& index,std::string_view name) {for(const auto& t:index.tensors)if(t.name==name)return &t;return nullptr;}
 Status normalise(const Registry& registry,const TensorIndex& index,const RawTensor& raw,const TensorBinding& binding,const Parameters& params,WeightView& out) {
+    if(raw.shape.rank>4 || binding.logical_shape.rank>4)return {Error::unsupported_shape,"raw or binding rank exceeds four"};
     WeightView w{};w.tensor=raw.id;w.shape=raw.shape;w.payload=raw.payload;w.parameters=params;
     w.storage=index.container==Container::gguf?gguf_format(raw.wire_type):safetensors_format(raw.wire_dtype);
     // A caller must explicitly select this semantic schema, then all companion dtype/shape rules are verified.
