@@ -88,7 +88,7 @@ inline std::uint32_t window_rows_default() {
     static const std::uint32_t rows = [] {
         const char* v = std::getenv("STRIX_QRTX_WINDOW_ROWS");
         // default 8. STRIX_QRTX_WINDOW_ROWS=16 (with the backend's 9..16-row decode pieces) lets the marginal rule widen on
-        // the live acceptance; not default yet: process-level C4/C8 arms (rtxmax5r t12/t14) were noisier than the effect
+        // the live acceptance; not default yet: process-level C4/C8 arms were noisier than the effect
         // (edit C1, budget-independent, moved 10 %), an in-process per-request budget A/B is the pending receipt
         const long n = v ? std::strtol(v, nullptr, 10) : static_cast<long>(kWindowRows);
         return static_cast<std::uint32_t>(std::clamp<long>(n, 1, static_cast<long>(kMaxWindowRows)));
@@ -161,7 +161,7 @@ inline double copy_wide_accept_default() {
 // (served edit C1 -29 %, 3 ABAB pairs). Costs require manual recalibration after kernel changes; other devices need
 // separate qualification. A calibrated wide cost under ~34 ms enables auto (STRIX_QRTX_COPY_WIDE_MS). With the
 // backend's 9..16-row decode pieces (core::decode_rows_max() 16, the default) the calibrated sm_120 wide cost is 29.2 ms
-// (rtxmax5r t11) -> 16 / 29.2 = 0.55 tokens/ms: on at 16 rows (copy_wide_measured, by cap).
+// -> 16 / 29.2 = 0.55 tokens/ms: on at 16 rows (copy_wide_measured, by cap).
 // STRIX_QRTX_COPY_WIDE=1 forces it on, 0 off; the request field copy_rows
 // forces the rows of one request (measurement).
 inline const CopyWideModel& copy_wide_model() {

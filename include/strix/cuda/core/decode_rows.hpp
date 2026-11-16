@@ -2,7 +2,7 @@
 // Decode-shaped row cap of the CUDA backend (shared by every model's row kernels, any arch).
 // The decode-shaped (few-row) forms were written for <= 8 rows. A 9..16-row verify window (one chat's wide copy window,
 // or two chats' 8-row windows in one pass) used to fall back to the tiled prefill forms, which cost a flat ~62 ms per
-// Qwen step on sm_120 against 17 ms at 8 rows (rtxmax5 t9). Up to this cap, a family runs its decode form instead:
+// Qwen step on sm_120 against 17 ms at 8 rows. Up to this cap, a family runs its decode form instead:
 // either the form already loops over 8-row pieces, or the call is split into <= 8-row pieces. Either way every
 // (row, output) chain is the one of the tiled form, so the bits do not change (rows never mix inside a chain).
 // STRIX_CUDA_DECODE_ROWS_MAX = 8 restores the old switch point; values are clamped to 8..16.

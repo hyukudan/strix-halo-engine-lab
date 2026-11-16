@@ -94,9 +94,9 @@ inline std::uint32_t window_of(std::uint32_t index, std::uint32_t sessions, std:
 struct WideModel {
     double a_ms = 10.5, b_ms = 2.81, wide_ms = 62.0, accept = 0.65, min_gain = 0.02;
 };
-// Cohort costs by the backend's decode row cap. Cap 16 (9..16-row decode pieces): the 16-row window costs the c12a
-// 8-row cohort window (33 ms) x the measured single-session ratio T=16 / T=8 = 29.2 / 17.3 = 1.69 (rtxmax5r t11) =
-// 55.7 ms, and a wider budget must win by 5 % (t12, one forced pair, budget 16 vs 8: edit C4 +11 %, edit C8 +19 %,
+// Cohort costs by the backend's decode row cap. Cap 16 (9..16-row decode pieces): the 16-row window costs the
+// 8-row cohort window (33 ms) x the measured single-session ratio T=16 / T=8 = 29.2 / 17.3 = 1.69 =
+// 55.7 ms, and a wider budget must win by 5 % (one forced pair, budget 16 vs 8: edit C4 +11 %, edit C8 +19 %,
 // json C8 +16 % (p ~0.9) taken; json C4 -6 %, prose C4 -50 %, prose C8 -5 % (p ~0.5) refused with the live p).
 inline WideModel wide_measured(unsigned decode_rows_cap) {
     WideModel m;
@@ -137,8 +137,8 @@ struct CopyWideModel {
     double narrow_a_ms = 8.55, narrow_b_ms = 1.1, wide_ms = 62.5;
 };
 // Measured sm_120 decision table by the backend's decode row cap (strix/cuda/core/decode_rows.hpp), qwen_decode_bench on
-// the RTX PRO 6000: cap 8 -> 9..16 rows on the tiled prefill forms, 62.5 ms flat (rtxmax5 t9); cap 16 -> 8-row decode
-// pieces, 27.6 ms at 9 .. 29.2 ms at 16 (windows of 9..16 rows are padded to 16) (rtxmax5r t11). Served edit C1
+// the RTX PRO 6000: cap 8 -> 9..16 rows on the tiled prefill forms, 62.5 ms flat; cap 16 -> 8-row decode
+// pieces, 27.6 ms at 9 .. 29.2 ms at 16 (windows of 9..16 rows are padded to 16). Served edit C1
 // copy_rows 16 vs 8: -29 % at cap 8, +12.7 % at cap 16 (3 ABAB pairs each, ids equal).
 inline CopyWideModel copy_wide_measured(unsigned decode_rows_cap) {
     CopyWideModel m;
