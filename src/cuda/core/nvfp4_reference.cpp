@@ -15,7 +15,7 @@ float e4m3(std::uint8_t c) {
 }
 std::uint8_t encode_e2m1(float x) {
     if (!std::isfinite(x)) throw std::invalid_argument("nonfinite FP4 input");
-    const float a = std::fabs(x);
+    const float a = std::min(std::fabs(x), 6.f);
     unsigned best = 0;
     float d = a;
     for (unsigned i=1; i<8; ++i) {

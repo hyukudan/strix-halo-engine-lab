@@ -24,6 +24,10 @@ int main() try {
         check(encode_e4m3(mid)==(i%2?i+1:i),"FP8 RNE tie");
     }
     check(encode_e2m1(100)==7 && encode_e4m3(1000)==126,"saturate");
+    for(const float magnitude : {1073741824.f, std::numeric_limits<float>::max()}) {
+        check(encode_e2m1(magnitude)==7,"FP4 large positive finite saturation");
+        check(encode_e2m1(-magnitude)==15,"FP4 large negative finite saturation");
+    }
     check(std::isnan(e4m3(127)) && std::isnan(e4m3(128)),"invalid scale encoding");
     rejects([] { encode_e2m1(INFINITY); });
     rejects([] { encode_e4m3(-1); });

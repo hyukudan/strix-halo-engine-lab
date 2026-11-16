@@ -1,5 +1,6 @@
 #include "strix/cuda/core/nvfp4_cuda.hpp"
 #include "strix/env_flags.hpp"
+#include "tolerance.hpp"
 #include <cuda_fp4.h>
 #include <cuda_fp8.h>
 #ifdef STRIX_NVFP4_NVML
@@ -123,11 +124,11 @@ static void fixture(unsigned m,unsigned n,unsigned k,bool exact,bool residual,bo
                 abs_sum+=std::fabs(u*w)*.25;
             }
             const double err=std::fabs(double(got[i])-ref[i]);
-            maxerr=std::max(maxerr,err/std::max(1.,abs_sum));
-            if(err>2.e-6*abs_sum+1.e-5) {
+            if(!test::within_accumulation_tolerance(got[i],ref[i],abs_sum)) {
                 std::cerr<<"at "<<r<<','<<c<<" got "<<got[i]<<" expected "<<ref[i]<<" abs_sum "<<abs_sum<<'\n';
                 throw std::runtime_error("FP32 accumulation tolerance");
             }
+            maxerr=std::max(maxerr,err/std::max(1.,abs_sum));
         }
     }
     auto bad=p; ++bad.splits;
