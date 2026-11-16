@@ -119,6 +119,8 @@ const std::map<std::string, std::string> kFormer = {
     {"STRIX_MM_XB_WARM_O", "0"},           {"STRIX_MMX_MOE_TIGHT_GRID", "0"},
     {"STRIX_MMX_MOE_PIPE", "0"},           {"STRIX_MMX_PF_ORDER", "adaptive"},
 };
+// Cache identity field of the default chunk-invariant linear order (table item pf_order).
+const std::string kOrderId = "prefill_order=mmx-pf-linear-s1-v1";
 
 void test_table() {
     static_assert(std::is_same_v<md::Item, strix::profile::DefaultItem>);
@@ -180,7 +182,9 @@ void test_off_switches() {
             if (cli.app == "rank") {
                 std::size_t diff = 0;
                 for (const auto& l : off_lines) if (!l.starts_with("session_")) diff += on_lines.count(l) == 0 ? 1 : 0;
-                check(diff == 1, std::string(it.env) + " off changes one rank line");
+                // The linear order also names its cache identity, so its off form changes the prefill.identity line too.
+                const std::size_t want = std::strcmp(it.env, "STRIX_MMX_PF_ORDER") == 0 ? 2 : 1;
+                check(diff == want, std::string(it.env) + " off changes one rank line (plus the identity line for the order)");
             }
         }
     }
@@ -605,7 +609,8 @@ void test_fast_prefill_profile() {
         check(fp(unused) == none_fp && md::prefill_policy(lookup(unused)).msa_flash == 0,
               "fast profile: an unused layer set and a non-'1' switch keep the legacy fingerprint");
         const EnvMap zero{{"STRIX_MM_PF_MSA_FLASH", "0"}};
-        check(md::prefill_identity(lookup(zero)).empty() && fp(zero) == none_fp, "fast profile: explicit OFF alone is the legacy identity");
+        check(md::prefill_identity(lookup(zero)) == kOrderId && fp(zero) == none_fp,
+              "fast profile: explicit OFF alone is the plain identity (only the default order field)");
     }
     const EnvMap bundle{{"STRIX_MM_FAST_PREFILL", "1"}};
     for (const auto& guard : {std::pair{"STRIX_MM_PF_MSA_REWORK", "0"},
@@ -618,7 +623,9 @@ void test_fast_prefill_profile() {
         const auto p = md::prefill_policy(lookup(declined));
         check(p.msa_flash == 0 && p.msa_flash_requested == 1 && p.policies.empty() && !p.note.empty() && p.msa_flash_asked == "fast_prefill",
               "fast admission: static guard declines flash and preserves request: " + std::string(guard.first));
-        check(md::prefill_identity(lookup(declined)).empty() && fp(declined) == none_fp,
+        // Only the default linear-order field remains (none under the baseline switch, which restores adaptive).
+        const std::string order_id = md::linear_order(lookup(declined)) == "invariant" ? kOrderId : std::string();
+        check(md::prefill_identity(lookup(declined)) == order_id && fp(declined) == none_fp,
               "fast admission: declined policy leaves no FAST cache field or agreement input");
         const auto cfg = md::effective_config(md::parse_cli("rank", {}), lookup(declined));
         check(cfg.find("\nSTRIX_MM_PF_MSA_FLASH=0\n") != std::string::npos &&
@@ -627,7 +634,7 @@ void test_fast_prefill_profile() {
               cfg.find("\nprefill.fast_profile_requested=mm-fast-pf-v1\n") != std::string::npos &&
               cfg.find("\nprefill.msa_flash_requested=1\n") != std::string::npos &&
               cfg.find("\nprefill.msa_flash_layers_requested=" + p.msa_flash_layers_requested + "\n") != std::string::npos &&
-              cfg.find("\nprefill.identity=default\n") != std::string::npos,
+              cfg.find("\nprefill.identity=" + (order_id.empty() ? std::string("default") : order_id) + "\n") != std::string::npos,
               "fast admission: effective receipt matches disabled execution route");
     }
     check(md::msa_flash_decline_reason(false, true, 20) != nullptr &&
@@ -639,7 +646,7 @@ void test_fast_prefill_profile() {
         const auto p = md::prefill_policy(lookup(bundle));
         check(p.msa_flash == 1 && p.msa_flash_layers == "40-59" && p.msa_flash_asked == "fast_prefill" &&
               p.policies == "msa-flash-bf16-l40-v1", "fast profile: bundle selects msa-flash-bf16-l40-v1");
-        check(md::prefill_identity(lookup(bundle)) == "prefill_msa=msa-flash-bf16-l40-v1", "fast profile: cache identity names the policy");
+        check(md::prefill_identity(lookup(bundle)) == "prefill_msa=msa-flash-bf16-l40-v1;" + kOrderId, "fast profile: cache identity names the policy");
         check(fp(bundle) != none_fp, "fast profile: bundle changes the profile fingerprint");
         const auto r = md::profile_resolution(lookup(bundle));
         check(r.find("msa_flash") != nullptr && r.find("msa_flash")->value == "1", "fast profile: governed row carries the member");
@@ -651,7 +658,7 @@ void test_fast_prefill_profile() {
     {   // An explicit member wins: OFF beats the bundle, 2 replaces its value.
         const EnvMap explicit_off{{"STRIX_MM_FAST_PREFILL", "1"}, {"STRIX_MM_PF_MSA_FLASH", "0"}};
         const auto p = md::prefill_policy(lookup(explicit_off));
-        check(p.msa_flash == 0 && p.policies.empty() && md::prefill_identity(lookup(explicit_off)).empty(), "fast profile: explicit OFF beats the bundle");
+        check(p.msa_flash == 0 && p.policies.empty() && md::prefill_identity(lookup(explicit_off)) == kOrderId, "fast profile: explicit OFF beats the bundle");
         const auto r = md::profile_resolution(lookup(explicit_off));
         const auto* row = r.find("msa_flash");
         check(row != nullptr && row->status == strix::profile::Status::off, "fast profile: explicit OFF recorded as off");
@@ -665,14 +672,14 @@ void test_fast_prefill_profile() {
         const EnvMap l30_env{{"STRIX_MM_FAST_PREFILL", "1"}, {"STRIX_MM_PF_MSA_FLASH_LAYERS", "30-39,40-59"}};
         const auto l30 = md::prefill_policy(lookup(l30_env));
         check(l30.msa_flash == 1 && l30.msa_flash_layers == "30-59" && l30.policies == "msa-flash-bf16-l30-v1" &&
-                  md::prefill_identity(lookup(l30_env)) == "prefill_msa=msa-flash-bf16-l30-v1",
+                  md::prefill_identity(lookup(l30_env)) == "prefill_msa=msa-flash-bf16-l30-v1;" + kOrderId,
               "fast profile: layers 30-59 = msa-flash-bf16-l30-v1");
     }
     {   // EXL3 base only: the bundle does not select it on FAST_I4; an explicit value still does.
         const EnvMap i4{{"STRIX_MM_FAST_PREFILL", "1"}, {"STRIX_MMX_MODEL_FORMAT", "fast_i4"}};
         const auto p = md::prefill_policy(lookup(i4));
         check(p.msa_flash == 0 && !p.note.empty(), "fast profile: bundle excludes the flash member on fast_i4");
-        check(md::prefill_identity(lookup(i4)) == "moe_prefill_format=fast_i4", "fast profile: fast_i4 is part of the cache identity");
+        check(md::prefill_identity(lookup(i4)) == "moe_prefill_format=fast_i4;" + kOrderId, "fast profile: fast_i4 is part of the cache identity");
         EnvMap i4_explicit = i4;
         i4_explicit["STRIX_MM_PF_MSA_FLASH"] = "1";
         check(md::prefill_policy(lookup(i4_explicit)).msa_flash == 1, "fast profile: explicit flash on fast_i4 wins");
