@@ -205,6 +205,7 @@ void SafetensorsCheckpoint::read(const Tensor& t, std::uint8_t* out) const {
     }
     auto status = weight::read_slice(slice, {reinterpret_cast<weight::Byte*>(out), static_cast<std::size_t>(t.bytes)});
     if (!status) throw std::runtime_error("ds41 native fp8: " + status.detail);
+    slice.source->discard(slice.range);
 }
 
 Fp8Tensor read_fp8_tensor(SafetensorsCheckpoint& checkpoint, const std::string& original, std::size_t rows, std::size_t width) {
