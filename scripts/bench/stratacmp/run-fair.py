@@ -30,6 +30,9 @@ BENCH = ROOT / "tools/serve_bench.py"
 SPEC = importlib.util.spec_from_file_location("serve_bench", BENCH)
 bench = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(bench)
+OWNER_SPEC = importlib.util.spec_from_file_location("native_emissions", ROOT / "scripts/bench/common/native-emissions.py")
+owner_api = importlib.util.module_from_spec(OWNER_SPEC)
+OWNER_SPEC.loader.exec_module(owner_api)
 
 
 def write(path, obj):
@@ -123,18 +126,25 @@ def client(arm, prompts, concurrency, tokens, out, timeout):
 
 
 def run_one(config, arm, workload, pair, out, args):
+    until = time.monotonic() + args.release_wait_s
+    while True:
+        ram, memory = free_ram(), gpu_sample()["memory_mib"]
+        if ram >= 20 * 1024**3 and memory < args.idle_memory_mib:
+            break
+        if time.monotonic() >= until:
+            raise RuntimeError(f"resources not released before load: RAM {ram / 1024**3:.1f} GiB, GPU 0 {memory} MiB")
+        time.sleep(2)
     out.mkdir(parents=True, exist_ok=False)
-    if free_ram() < 20 * 1024**3:
-        raise RuntimeError("free physical RAM below 20 GiB before load")
-    if gpu_sample()["memory_mib"] >= args.idle_memory_mib:
-        raise RuntimeError("GPU 0 already occupied before load")
     env = dict(os.environ, **arm.get("env", {}), CUDA_DEVICE_ORDER="PCI_BUS_ID", CUDA_VISIBLE_DEVICES="0")
     manifest = dict(arm=arm["name"], pair=pair, workload=workload, pack_identity=config["pack_identity"],
                     cmd=arm["cmd"], records=[], status="running")
     write(out / "run.json", manifest)
     with (out / "server.log").open("w", encoding="utf-8") as log, Sampler() as sampler:
         proc = subprocess.Popen(arm["cmd"], cwd=arm.get("cwd"), env=env, stdout=log, stderr=subprocess.STDOUT)
+        owner = None
+        manifest["pid"] = proc.pid
         try:
+            owner = owner_api.windows_job(proc)
             wait_ready(proc, arm, args.ready_s)
             if workload.startswith("decode-"):
                 kind = workload.removeprefix("decode-")
@@ -161,6 +171,8 @@ def run_one(config, arm, workload, pair, out, args):
             raise
         finally:
             stop_owned(proc)
+            if owner:
+                owner[0].CloseHandle(owner[1])  # also owns children whose parent exited first
             manifest["samples"] = sampler.samples
             manifest["sampler_errors"] = sampler.errors
             write(out / "run.json", manifest)
@@ -209,11 +221,15 @@ def main():
     p.add_argument("--context-tolerance", type=float, default=0.05)
     p.add_argument("--plan", action="store_true")
     p.add_argument("--run-index", type=int, help="run one fixed plan entry in a separately reserved FIFO window")
+    p.add_argument("--resume", action="store_true", help="preserve completed entries of the identical frozen plan")
+    p.add_argument("--release-wait-s", type=float, default=30, help="bounded wait for owned-process resource teardown")
     args = p.parse_args()
     if args.pairs < 3:
         p.error("strict ABAB requires at least three pairs")
     if not 0 <= args.context_tolerance < 1:
         p.error("context tolerance must be in [0,1)")
+    if args.release_wait_s < 0:
+        p.error("release-wait-s must be nonnegative")
     config = json.loads(args.config.read_text(encoding="utf-8"))
     hashes = validate(config)
     plan = [(workload, pair, arm) for workload in ("decode-prose", "decode-edit", "decode-json", "8192", "32768", "43008")
@@ -223,7 +239,7 @@ def main():
         return 0
     if args.run_index is not None and not 0 <= args.run_index < len(plan):
         p.error("run-index is outside the fixed plan")
-    args.out.mkdir(parents=True, exist_ok=args.run_index is not None)
+    args.out.mkdir(parents=True, exist_ok=args.run_index is not None or args.resume)
     for name, expected in (("config.json", config), ("prompt-sha256.json", hashes)):
         path = args.out / name
         if path.exists() and json.loads(path.read_text(encoding="utf-8")) != expected:
@@ -232,7 +248,17 @@ def main():
     for index, (workload, pair, arm) in enumerate(plan):
         if args.run_index is not None and index != args.run_index:
             continue
-        run_one(config, arm, workload, pair, args.out / f"{index:02}-{arm['name']}-{workload}", args)
+        entry = args.out / f"{index:02}-{arm['name']}-{workload}"
+        if args.resume and (entry / "run.json").exists():
+            saved = json.loads((entry / "run.json").read_text())
+            expected = dict(arm=arm["name"], workload=workload, pair=pair, pack_identity=config["pack_identity"])
+            if saved.get("status") != "complete" or any(saved.get(k) != v for k, v in expected.items()):
+                p.error(f"{entry.name} is incomplete or mismatched; preserve it before retrying")
+            if not saved.get("records") or any(not (entry / rec["file"]).is_file() for rec in saved["records"]):
+                p.error(f"{entry.name} is missing completed receipts")
+            print(f"resume kept {entry.name}", flush=True)
+            continue
+        run_one(config, arm, workload, pair, entry, args)
     if all((args.out / f"{i:02}-{a['name']}-{w}" / "run.json").exists() and
            json.loads((args.out / f"{i:02}-{a['name']}-{w}" / "run.json").read_text())["status"] == "complete"
            for i, (w, _, a) in enumerate(plan)):

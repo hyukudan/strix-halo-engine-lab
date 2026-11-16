@@ -5,6 +5,9 @@ come from arguments. Keep one model family resident and use the device declarati
 Use `--plan` to list the fixed ABAB order, then `--run-index N` to execute one entry per reserved
 FIFO window into the same output directory. Config and prompt hashes must remain identical;
 the completion marker is written only after every plan entry has a complete receipt.
+`--resume` keeps completed receipts only when config, prompt hashes and entry identities match; failed entries
+must be preserved separately before retrying. Windows server trees use a close-on-owner-exit job, and each
+load waits up to `--release-wait-s` (default 30) for GPU 0 and at least 20 GiB host RAM to be released.
 For kernel attribution, `qwen_decode_bench ... N G --greedy-only` closes its CUDA profiler range after
 the serial C1 emissions, excluding upload, initial prefill and the later teacher-window sweeps.
 
