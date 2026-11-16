@@ -56,6 +56,9 @@ add_executable(qwen_decode_bench tests/cuda/qwen_decode_bench.cu)
 target_link_libraries(qwen_decode_bench PRIVATE strix_qwen_cuda)
 add_executable(strix-cuda-qwen-serve apps/cuda_qwen_serve_main.cu)
 target_link_libraries(strix-cuda-qwen-serve PRIVATE strix_qwen_cuda strix_serve_win)
+add_test(NAME qwen_cuda_inspect_without_device
+    COMMAND "${CMAKE_COMMAND}" "-DSERVER=$<TARGET_FILE:strix-cuda-qwen-serve>"
+            -P "${CMAKE_SOURCE_DIR}/tests/cuda/inspect_without_device.cmake")
 if(MSVC)
     target_compile_options(strix-cuda-qwen-serve PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/EHsc,/Zc:preprocessor,/utf-8>)
 endif()
