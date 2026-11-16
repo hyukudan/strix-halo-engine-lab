@@ -7,6 +7,7 @@
 // STRIX_WFMT_GSQ_REPORT=1 reports a mismatch and keeps going (diagnosis); the default throws.
 #include "../../src/hip_moe_q4k_a8_known_rows.hip"
 #include "strix/env_flags.hpp"
+#include "hip_gsq_checks.hpp"
 #include <hip/hip_runtime.h>
 #include <algorithm>
 #include <array>
@@ -167,15 +168,8 @@ struct Trace {
 #endif
 };
 
-struct Snapshot {
-    std::vector<float> output, dd, raw;
-    std::vector<signed char> dcodes;
-    std::vector<int> ds;
-};
-bool same(const Snapshot& a, const Snapshot& b) {
-    const auto eq = [](const auto& x, const auto& y) { return x.size() == y.size() && (x.empty() || !std::memcmp(x.data(), y.data(), x.size() * sizeof x[0])); };
-    return eq(a.output, b.output) && eq(a.dd, b.dd) && eq(a.raw, b.raw) && eq(a.dcodes, b.dcodes) && eq(a.ds, b.ds);
-}
+using strix::wfmt_gsq::Snapshot;
+using strix::wfmt_gsq::same;
 
 // One record per arm: every output the chain writes (gate/up + activation, down codes/scales/sums, rawdots).
 void emit_outputs(const Snapshot& s) {
@@ -215,6 +209,7 @@ struct Case {
         s.dd = dd->read<float>(T * dd_row / 4U);
         s.ds = ds->read<int>(T * dd_row / 4U);
         s.raw = raw->read<float>(T * raw_row / 4U);
+        strix::wfmt_gsq::check_snapshot(s, status->read<unsigned>(T), table->read<unsigned>(1U)[0]);
         return s;
     }
 };
@@ -351,6 +346,38 @@ std::pair<Words, Words> run_window(Case& c, unsigned g, unsigned r) {
 }
 
 std::size_t g_cases = 0;
+// Independent window executions, one token at a time, retain the original
+// payloads, activation bytes and both expert slots (including duplicates).
+void run_row_windows(Case& c) {
+    const auto& sp = c.spec;
+    Buffer table(41U * sizeof(unsigned));
+    auto* base = table.as<unsigned>();
+    const kr::DeviceCsr csr{base, base, base, base + 32U, base + 34U, base + 36U, base + 38U};
+    for (unsigned row = 0; row < sp.T; ++row) {
+        const auto words = strix::wfmt_gsq::row_csr(c.csr.words, c.csr.batches, c.csr.rows,
+            c.csr.slots, c.csr.experts, c.csr.begins, row);
+        raw_upload(base, words.data(), sizeof words);
+        kr::DeviceRows view{};
+        view.codes[0] = c.codes->as<signed char>() + static_cast<std::size_t>(row) * sp.H;
+        view.deltas[0] = c.deltas->as<float>() + static_cast<std::size_t>(row) * (sp.H / 32U);
+        view.sums[0] = c.sums->as<int>() + static_cast<std::size_t>(row) * (sp.H / 32U);
+        view.status[0] = c.status->as<unsigned>() + row;
+        view.output[0] = reinterpret_cast<float*>(c.output->as<unsigned char>() + row * c.out_row);
+        view.down_codes[0] = reinterpret_cast<signed char*>(c.dcodes->as<unsigned char>() + row * c.dcodes_row);
+        view.down_deltas[0] = reinterpret_cast<float*>(c.dd->as<unsigned char>() + row * c.dd_row);
+        view.down_sums[0] = reinterpret_cast<int*>(c.ds->as<unsigned char>() + row * c.dd_row);
+        view.rawdots[0] = reinterpret_cast<float*>(c.raw->as<unsigned char>() + row * c.raw_row);
+        with_gate(c.type, [&]<std::uint32_t T>() {
+            hipLaunchKernelGGL((kr::project_window_iq<T, 2U>), dim3(sp.N / 32U, 2U), dim3(256), 0, 0,
+                c.gate->as<unsigned char>(), c.up->as<unsigned char>(), view, csr, 1U, sp.H, sp.N);
+        });
+        check(hipGetLastError()); check(hipDeviceSynchronize());
+        hipLaunchKernelGGL((kr::down_window_iq<ga::type_iq4_nl, 2U>), dim3(sp.H / 64U, 2U), dim3(256), 0, 0,
+            c.down->as<unsigned char>(), view, csr, 1U, sp.H, sp.N);
+        check(hipGetLastError()); check(hipDeviceSynchronize());
+        expect(table.read<unsigned>(1U)[0] == 0U, "one-row window CSR status");
+    }
+}
 void run_case(std::uint32_t type, const Spec& spec, bool window) {
     const std::string name = std::string("hip.gsq.") + type_name(type) + ".t" + std::to_string(spec.T) + ".h" + std::to_string(spec.H) +
         ".n" + std::to_string(spec.N) + (spec.dup ? ".dup" : "");
@@ -367,7 +394,13 @@ void run_case(std::uint32_t type, const Spec& spec, bool window) {
     emit_partials(run_prefill(c));
     const auto reference = c.snapshot();
     emit_outputs(reference);
-    if (!window) { ++g_cases; return; }
+    if (!window) {
+        c.clear();
+        run_row_windows(c);
+        expect(same(c.snapshot(), reference), name + ": one-row windows differ from prefill");
+        ++g_cases;
+        return;
+    }
     // Window arm as the launcher selects: G 2 / 16 for 2 / 16 rows, else 4; Rows 2 / 4 / 16 for 2 / 4 / 16 rows, else 8.
     const unsigned g = spec.T == 2U ? 2U : spec.T == 16U ? 16U : 4U;
     const unsigned r = spec.T == 2U ? 2U : spec.T == 4U ? 4U : spec.T == 16U ? 16U : 8U;
@@ -384,10 +417,6 @@ void run_case(std::uint32_t type, const Spec& spec, bool window) {
             c.clear(); (void)run_window(c, gg, rr);
             expect(same(c.snapshot(), reference), name + ": window G=" + std::to_string(gg) + " Rows=" + std::to_string(rr) + " differs from prefill");
         }
-    // Sanity: the chain wrote something (a dead launch would make both arms equal and empty).
-    bool any = false;
-    for (const float v : reference.raw) any |= v != 0.0F;
-    expect(any, name + ": all-zero down output");
     ++g_cases;
 }
 }  // namespace
