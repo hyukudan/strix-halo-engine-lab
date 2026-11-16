@@ -43,6 +43,10 @@ struct PrefillOptions {
     // the MoE dispatch; set_precision_for_new_sequence applies an explicit value (quality arms).
     bool fast_moe = false;
     bool fast_dense = false;  // FAST lever ds41-dense-f16-v1 (STRIX_DS41_FAST_DENSE=1): dense Q8_0 x A8 products in one FP16 WMMA chain
+    // FAST lever ds41-engram-f16wmma-v1 (STRIX_DS41_FAST_ENGRAM=1, explicit, not in the FAST bundle yet): the Engram KV
+    // projection on the shared FP16 WMMA core; views with an x that would overflow FP16 keep the exact kernel.
+    // Resolved at construction (option OR environment), then passed per execution; the precision setter replaces it.
+    bool fast_engram = false;
     // Diagnostics/selection for the non-exact paths (no effect while both switches above are off, except null_ulp_layer):
     // projection bits 1 q_a, 2 kv, 4 q_b, 8 o_a, 16 o_b; layers [approx_layer_first, approx_layer_end); FP16 only at
     // calls of at least fp16_min_rows rows; fp16_keep_a8: FP16 operands from the A8 codes (the exact path's activations)
@@ -364,7 +368,7 @@ public:
     [[nodiscard]] std::uint32_t route_class(std::uint32_t rows) const noexcept;
     [[nodiscard]] serve::PrefillGroupCapacity group_capacity() const noexcept;
     [[nodiscard]] static bool group_options_supported(const PrefillOptions& o) noexcept {
-        return !(o.fp16_dense || o.bf16_attention || o.fast_attention || o.fast_attention_flash || o.fast_dense || o.fast_moe || o.trace || o.stream_hashes ||
+        return !(o.fp16_dense || o.bf16_attention || o.fast_attention || o.fast_attention_flash || o.fast_dense || o.fast_moe || o.fast_engram || o.trace || o.stream_hashes ||
                  o.routing_loads || o.quality_head_rows > 1U || o.null_ulp_layer >= 0 || o.verify_embed_extras);
     }
     // Members / rows per member the group states hold (PrefillOptions::group_members / group_rows); 0 = no group pass.

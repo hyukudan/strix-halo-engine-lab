@@ -13,6 +13,7 @@ namespace ds41 {
 int process_wide_writes = 0;  // DAYAUDIT 2: a precision change of one object must not write the process-wide modes
 void set_fast_dense(int) { ++process_wide_writes; }
 void set_fast_moe(int) { ++process_wide_writes; }
+void set_fast_engram(int) { ++process_wide_writes; }
 }
 namespace attn {
 constexpr unsigned kWindow = 128, kHeadDim = 512;
