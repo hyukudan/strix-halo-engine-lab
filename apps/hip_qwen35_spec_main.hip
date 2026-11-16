@@ -520,8 +520,7 @@ int main(int argc, char** argv) try {
                     (unsigned long long)by_source[2], mean_e, quantile(per_step, 0.5), quantile(per_step, 0.9),
                     1000.0 * double(out.size() - 1) / wall, wall / double(std::max<std::size_t>(per_step.size(), 1)), best, prompt.size(), prefill_ms);
         for (unsigned r = 1; r <= 16U; ++r)
-            if (windows[r]) std::printf("verify-window %u: %llu calls
-", r, (unsigned long long)windows[r]);
+            if (windows[r]) std::printf("verify-window %u: %llu calls\n", r, (unsigned long long)windows[r]);
         if (use_chain && chain_glue)
             std::printf("mtp[%s]: hidden %s chain_k %u, mtp_forward calls %llu rows %llu, draft() %llu calls %.1f ms total = %.2f ms/draft, %.2f ms/mtp_forward call; "
                         "chain-source passes %llu (%.1f %%), hybrid blocks %llu (ext proposed %llu accepted %llu)\n",

@@ -599,12 +599,12 @@ struct HipEngine::Impl {
         auto& y = mtp.blk;
         HK(hipMemcpyAsync(mtp.ids, next_tokens, n * 4U, hipMemcpyHostToDevice, stream));
         embed_kernel<<<n, 256, 0, stream>>>(embd.data, embd.fmt, embd.row_bytes, H, mtp.ids, mtp.tA);
-        rmsnorm(mtp.tA, mtp.enorm, H, cfg.rms_eps, mtp.mxn, n, stream, wide, iu4);
-        rmsnorm(hidden_dev, mtp.hnorm, H, cfg.rms_eps, mtp.tB, n, stream, wide, iu4);
+        rmsnorm(mtp.tA, mtp.enorm, H, cfg.rms_eps, mtp.mxn, n, stream);
+        rmsnorm(hidden_dev, mtp.hnorm, H, cfg.rms_eps, mtp.tB, n, stream);
         concat2_kernel<<<(n * H + 255U) / 256U, 256, 0, stream>>>(mtp.mxn, mtp.tB, mtp.cat, n, H);
         linear(mtp.eh, mtp.cat, mtp.mx, n, stream, wide, iu4);
         const unsigned nb = (n * H + 255U) / 256U;
-        rmsnorm(mtp.mx, y.attn_norm, H, cfg.rms_eps, mtp.mxn, n, stream, wide, iu4);
+        rmsnorm(mtp.mx, y.attn_norm, H, cfg.rms_eps, mtp.mxn, n, stream);
         linear(y.q, mtp.mxn, q_in, n, stream, wide, iu4);
         linear(y.k, mtp.mxn, kk, n, stream, wide, iu4);
         linear(y.v, mtp.mxn, vv, n, stream, wide, iu4);
@@ -614,11 +614,11 @@ struct HipEngine::Impl {
                                              reinterpret_cast<const float*>(y.knorm.data), qn, y.k_cache, y.v_cache, ctx, stream);
         linear(y.o, ctx, proj, n, stream, wide, iu4);
         add_kernel<<<nb, 256, 0, stream>>>(mtp.mx, proj, n * H);
-        rmsnorm(mtp.mx, y.post_norm, H, cfg.rms_eps, mtp.mxn, n, stream, wide, iu4);
+        rmsnorm(mtp.mx, y.post_norm, H, cfg.rms_eps, mtp.mxn, n, stream);
         glu(y.gate, y.up, mtp.mxn, gu, n, stream, wide, iu4);
         linear(y.down, gu, proj, n, stream, wide, iu4);
         add_kernel<<<nb, 256, 0, stream>>>(mtp.mx, proj, n * H);
-        rmsnorm(mtp.mx, mtp.shnorm, H, cfg.rms_eps, mtp.mxn, n, stream, wide, iu4);  // mx (pre-norm block output) stays intact for 'pre'
+        rmsnorm(mtp.mx, mtp.shnorm, H, cfg.rms_eps, mtp.mxn, n, stream);  // mx (pre-norm block output) stays intact for 'pre'
         HipMtpOut o;
         if (want_top) {
             linear(head, mtp.mxn, mtp.mlogits, n, stream, wide, iu4);
