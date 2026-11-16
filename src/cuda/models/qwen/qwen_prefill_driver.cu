@@ -771,6 +771,7 @@ void Prefill::Impl::allocate_fitted_block() {
         free_block(static_cast<BlockFields&>(*this));
         stream = keep;
     };
+    std::uint64_t fit_free_mib = 0, fit_total_mib = 0;
     const auto fit = strix::rows_fit::fit(want, std::min<std::uint32_t>(want, 1024U), 1024U, [&](std::uint32_t rows) {
         try {
             allocate_block(rows, std::min<std::uint32_t>(rows, 1024U), true);
@@ -782,7 +783,11 @@ void Prefill::Impl::allocate_fitted_block() {
         }
         std::size_t free_bytes = 0, total_bytes = 0;
         ck(cudaMemGetInfo(&free_bytes, &total_bytes), "block fit");
-        if (free_bytes >= reserve) return true;
+        if (free_bytes >= reserve) {
+            fit_free_mib = free_bytes >> 20U;  // counter: CUDA-visible free VRAM left by the chosen capacity
+            fit_total_mib = total_bytes >> 20U;
+            return true;
+        }
         drop();
         return false;
     });
@@ -790,7 +795,8 @@ void Prefill::Impl::allocate_fitted_block() {
         cfg.block_schedule = strix::rows_fit::clamp_schedule(cfg.block_schedule, cap);
         cfg.final_block_rows = std::min(cfg.final_block_rows, cap);
         block_fit_note = std::to_string(fit.want) + "->" + std::to_string(cap) + " rows (reserve " +
-                         std::to_string(cfg.block_fit_reserve_mib) + " MiB)";
+                         std::to_string(cfg.block_fit_reserve_mib) + " MiB; CUDA free " + std::to_string(fit_free_mib) +
+                         " of " + std::to_string(fit_total_mib) + " MiB)";
     }
 }
 
