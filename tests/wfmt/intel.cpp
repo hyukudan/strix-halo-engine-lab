@@ -13,9 +13,9 @@ bool intel_case(std::string_view directory,std::uint32_t rows,std::uint32_t n,st
  if(!check(bool(status),status.detail)) return false;
  HostQ8Binding binding;
  status=prepare_host_q8(weight,binding); if(!check(bool(status),status.detail)) return false;
- intel::DenseArguments args{old};
- args.view.weight=binding.data(); args.view.row_bytes=binding.row_bytes; args.view.k_bytes=0; args.view.out=f.actual.data();
- const intel::Q8F16Source<intel::IntelAscending> source{binding.data(),binding.row_bytes,0};
+ intel::DenseArguments args{old,binding};
+ args.view.weight=binding.data(); args.view.row_bytes=binding.row_bytes(); args.view.k_bytes=0; args.view.out=f.actual.data();
+ const intel::Q8F16Source<intel::IntelAscending> source{binding.data(),binding.row_bytes(),0};
  for(std::uint32_t o=0;o<n;++o) for(std::uint32_t g=0;g<k/32;++g) {
   const auto* raw=f.weights->data()+std::size_t(o)*f.row_bytes+f.prefix+std::size_t(g)*34;
   const auto* block=source.block(o,g);
@@ -41,6 +41,9 @@ bool intel_case(std::string_view directory,std::uint32_t rows,std::uint32_t n,st
  if(!check(bool(status),status.detail) || !check(same_bytes(f.expected,f.actual),"Intel generic host oracle output differs")) return false;
  const auto name="intel-"+std::to_string(rows)+"-"+std::to_string(n)+"-"+std::to_string(k)+"-"+std::to_string(accumulate);
  if(!record_dense(directory,name,"intel-q8a8-f16-ascending@1",weight,f)) return false;
+ if(!binding_rejections(weight,args,[&](const intel::DenseArguments& bad) { return intel::enqueue_dense(weight,bad,context); })) return false;
+ auto stale_prefix=args; stale_prefix.view.k_bytes=7;
+ if(intel::enqueue_dense(weight,stale_prefix,context).code!=Error::malformed) return false;
  const auto final=f.actual;
  auto native=intel::native_execution_context({});
  const auto native_result=intel::enqueue_dense(weight,args,native);
@@ -57,6 +60,7 @@ bool intel_case(std::string_view directory,std::uint32_t rows,std::uint32_t n,st
 }
 bool intel_cases(std::string_view directory) {
  std::size_t cases=0;
+ if(!intel_case(directory,1,2,128,0,1)) return false;
  for(auto rows:tails) for(auto k:{128u,256u,1024u}) for(unsigned accumulate:{0u,1u})
   if(!intel_case(directory,rows,1u+2u*(rows%4),k,accumulate,static_cast<std::uint32_t>(++cases))) return false;
  for(auto n:tails) for(unsigned accumulate:{0u,1u})

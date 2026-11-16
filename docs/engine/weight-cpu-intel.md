@@ -20,16 +20,24 @@ and explicitly prepare a contiguous host binding when requested. They retain
 the original storage identity. Preparation never occurs in a numerical loop.
 
 CPU direct and generic enqueue use one registration and typed argument schema.
+Typed ABI v2 retains an immutable prepared binding, validates its source and rejects
+raw pointer/stride/prefix disagreement. Legacy raw kernel APIs remain separate.
 Intel's explicitly named `reference_execution_context()` is a host oracle.
 Its native context always invokes the existing Intel backend enqueue boundary;
 a build without SYCL returns unavailable and never evaluates the host oracle as
 an offload fallback. Native source installation retains the vendor runtime's
-allocation, event and copy callbacks. Queue and USM lifetimes remain caller-owned.
+allocation, event and copy callbacks only when their stream already uses `Queue::impl`.
+Dispatch uses the executing context's stream. `prepare_native_q8` prepares compact
+Q8 images through the runtime copy callback and shared image cache; each launch
+waits for readiness and records last use on that same stream. Queues and activation
+USM lifetimes remain caller-owned; prepared bindings retain weight storage.
 
 The Intel cell and SYCL kernel bodies remain unchanged. Mechanical substitution
 of their raw addressing is isolated pending authorization under the no-kernel-edit
 scope. Host operand traits and wrappers can be qualified without claiming that
 this deferred kernel migration has occurred.
+The current host fixtures establish preparation/wrapper equivalence, not historical
+bitwise preservation. That claim requires the frozen-executable comparisons below.
 
 Configure `tests/wfmt` with Release and `STRIX_WFMT_CAPTURE=OFF` for production
 output receipts. `STRIX_WFMT_CAPTURE=ON` adds a diagnostic copy of the existing

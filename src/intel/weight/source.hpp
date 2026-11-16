@@ -20,21 +20,23 @@ template<> struct Q8F16Source<IntelAscending> {
  }
 };
 inline constexpr KernelId q8_f16_ascending_kernel=0x494e5401;
-struct DenseArguments { ::strix::intel::dense::Q8A8View view; };
+struct DenseArguments { ::strix::intel::dense::Q8A8View view; Q8BindingRef binding; };
 std::span<const Candidate> candidates() noexcept;
 Status validate_view(const ::strix::intel::dense::Q8A8View&);
 Status from_legacy(const ::strix::intel::dense::Q8A8View&,std::span<const Byte>,std::shared_ptr<const void>,TensorId,WeightView&);
 // This context is an explicit host oracle, never selected as a model offload fallback.
 ExecutionContext reference_execution_context();
 // Native dispatch always calls the existing SYCL boundary and preserves not_built.
-// The borrowed queue and every USM operand must outlive its submitted work.
+// The stream is Queue::impl for enqueue AND all adapter callbacks. Installation
+// rejects a different existing stream. Queues/activation operands remain borrowed.
 ExecutionContext native_execution_context(::strix::intel::Queue);
 Status install_native_sources(::strix::intel::Queue,ExecutionContext&);
+Status prepare_native_q8(const WeightView&,std::shared_ptr<ImageCache>,ExecutionContext&,HostQ8Binding&);
 Status enqueue_dense(const WeightView&,const DenseArguments&,ExecutionContext&);
 }
 namespace strix::weight {
 template<> struct ArgumentTraits<intel::DenseArguments> {
  static constexpr KernelId schema=intel::q8_f16_ascending_kernel;
- static constexpr std::uint32_t abi_revision=1;
+ static constexpr std::uint32_t abi_revision=2;
 };
 }

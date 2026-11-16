@@ -11,14 +11,18 @@ Status eligible(const WeightView& weight,const Workload& work,const Hardware& ha
  return validate_q8_shape(weight,work.n,work.k);
 }
 Status launch_view(const Plan& plan,const WeightView& weight,const KernelArguments& envelope,void* output,
-                   ::strix::intel::dense::Q8A8View& view) {
+                   ::strix::intel::dense::Q8A8View& view,HostQ8Binding& binding) {
  if(plan.selected.kernel!=q8_f16_ascending_kernel ||
     !(plan.selected.arithmetic==ArithmeticId{"intel-q8a8-f16-ascending",1}) || plan.selected.strategy!=Strategy::native)
   return {Error::unsupported_arithmetic,"Intel registry only provides the existing ascending F16 operand policy"};
- if(envelope.schema!=q8_f16_ascending_kernel || envelope.abi_revision!=1 || envelope.bytes!=sizeof(DenseArguments) || !envelope.data)
+ if(envelope.schema!=q8_f16_ascending_kernel || envelope.abi_revision!=2 || envelope.bytes!=sizeof(DenseArguments) || !envelope.data)
   return {Error::malformed,"Intel Q8 typed launch schema/ABI"};
- view=static_cast<const DenseArguments*>(envelope.data)->view; view.out=static_cast<float*>(output);
- auto status=validate_view(view); if(!status) return status;
+ const auto& args=*static_cast<const DenseArguments*>(envelope.data);
+ binding=args.binding.retain();
+ auto status=binding.validate(weight,args.view.weight,args.view.row_bytes,args.view.k_bytes); if(!status) return status;
+ view=args.view; view.out=static_cast<float*>(output);
+ view.weight=binding.data(); view.row_bytes=binding.row_bytes(); view.k_bytes=0;
+ status=validate_view(view); if(!status) return status;
  return validate_q8_shape(weight,view.count,view.in);
 }
 Status native_status(::strix::intel::Status status) {
@@ -52,7 +56,10 @@ ExecutionContext reference_execution_context() {
  auto callbacks=std::make_shared<RuntimeCallbacks>(*context.callbacks);
  callbacks->enqueue=[](const Plan& plan,const WeightView& weight,const KernelArguments& args,void* output,void*,std::size_t,ExecutionContext&) -> Status {
   ::strix::intel::dense::Q8A8View view;
-  auto status=launch_view(plan,weight,args,output,view); if(!status) return status;
+  HostQ8Binding binding;
+  auto status=launch_view(plan,weight,args,output,view,binding); if(!status) return status;
+  if(binding.is_image())
+   return {Error::unsupported_backend,"host oracle requires a host binding"};
   ::strix::intel::dense::run_reference(view); return {Error::ok,{}};
  };
  context.callbacks=std::move(callbacks); return context;
@@ -64,16 +71,32 @@ ExecutionContext native_execution_context(::strix::intel::Queue queue) {
 }
 Status install_native_sources(::strix::intel::Queue queue,ExecutionContext& context) {
  if(context.backend!=Backend::intel) return {Error::unsupported_backend,"Intel source registration requires an Intel runtime context"};
+ if(context.stream!=queue.impl && (context.callbacks || context.stream))
+  return {Error::unsupported_backend,"Intel adapter stream must already use Queue::impl"};
  // Preserve vendor allocation/event/copy callbacks installed by the runtime.
  // An empty context gains enqueue only, never CPU allocation or host fallback.
  auto callbacks=context.callbacks?std::make_shared<RuntimeCallbacks>(*context.callbacks):std::make_shared<RuntimeCallbacks>();
- callbacks->enqueue=[queue](const Plan& plan,const WeightView& weight,const KernelArguments& args,void* output,void*,std::size_t,ExecutionContext&) -> Status {
+ callbacks->enqueue=[](const Plan& plan,const WeightView& weight,const KernelArguments& args,void* output,void*,std::size_t,ExecutionContext& executing) -> Status {
   ::strix::intel::dense::Q8A8View view;
-  auto status=launch_view(plan,weight,args,output,view); if(!status) return status;
-  return native_status(::strix::intel::enqueue_dense_q8a8(queue,view));
+  HostQ8Binding binding;
+  auto status=launch_view(plan,weight,args,output,view,binding); if(!status) return status;
+  if(!::strix::intel::sycl_built()) return native_status(::strix::intel::Status::not_built);
+  if(!executing.stream) return native_status(::strix::intel::Status::invalid);
+  ImageLease lease;
+  status=binding.acquire(executing,lease); if(!status) return status;
+  view.weight=static_cast<const std::uint8_t*>(lease.data());
+  const auto launched=native_status(::strix::intel::enqueue_dense_q8a8({executing.stream},view));
+  // Fence even a failed submission: the runtime may have accepted some work.
+  status=record_last_use(lease,executing);
+  return launched?status:launched;
  };
  context.callbacks=std::move(callbacks); context.stream=queue.impl;
  return {Error::ok,{}};
+}
+Status prepare_native_q8(const WeightView& weight,std::shared_ptr<ImageCache> cache,ExecutionContext& context,HostQ8Binding& out) {
+ if(context.backend!=Backend::intel) return {Error::unsupported_backend,"Intel Q8 preparation requires Intel runtime"};
+ Plan plan{}; plan.selected=candidates()[0]; plan.selected.resources.image_bytes=weight.payload.range.bytes;
+ return prepare_q8_image(weight,plan,std::move(cache),context,out);
 }
 Status enqueue_dense(const WeightView& weight,const DenseArguments& args,ExecutionContext& context) {
  Plan plan{}; plan.selected=candidates()[0]; auto launch=args;

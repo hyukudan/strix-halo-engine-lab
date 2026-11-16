@@ -1,6 +1,7 @@
 #pragma once
 #include "source.hpp"
 #include "registry.hpp"
+#include "cache.hpp"
 namespace strix::weight {
 // One vendor-free storage contract; operand rounding and reduction remain typed.
 struct Q8Storage {
@@ -19,13 +20,39 @@ struct Q8Storage {
 Status q8_weight_from_legacy(std::span<const Byte>,std::shared_ptr<const void> owner,
                             std::uint32_t outputs,std::uint32_t width,std::uint32_t row_bytes,
                             std::uint32_t k_bytes,TensorId,WeightView&);
-struct HostQ8Binding {
- WeightView source;
- std::vector<Byte> bytes;
- std::uint32_t outputs=0,width=0,row_bytes=0;
- const std::uint8_t* data() const noexcept { return reinterpret_cast<const std::uint8_t*>(bytes.data()); }
+class HostQ8Binding {
+ WeightView source_{};
+ std::shared_ptr<const std::vector<Byte>> bytes_;
+ std::shared_ptr<ImageCache> cache_;
+ std::shared_ptr<ImageLease> image_;
+ Plan plan_{};
+ ImageKey key_{};
+ friend Status prepare_host_q8(const WeightView&,HostQ8Binding&);
+ friend Status prepare_q8_image(const WeightView&,const Plan&,std::shared_ptr<ImageCache>,ExecutionContext&,HostQ8Binding&);
+public:
+ const std::uint8_t* data() const noexcept {
+  return image_?static_cast<const std::uint8_t*>(image_->data()):
+   bytes_?reinterpret_cast<const std::uint8_t*>(bytes_->data()):nullptr;
+ }
+ std::uint32_t row_bytes() const noexcept { return static_cast<std::uint32_t>(Q8Storage::row_bytes(source_.shape.dims[1])); }
+ // Immutable prepared storage; copies retain both the source and executed image.
+ Status validate(const WeightView&,const std::uint8_t*,std::uint32_t stride,std::uint32_t prefix=0) const;
+ bool is_image() const noexcept { return bool(image_); }
+ Status acquire(ExecutionContext&,ImageLease&) const;
+};
+// Launch envelopes are POD and consumed synchronously. Borrow the prepared owner
+// only until dispatch, which retains it (and fences native last use) before return.
+class Q8BindingRef {
+ const HostQ8Binding* binding_=nullptr;
+public:
+ Q8BindingRef()=default;
+ Q8BindingRef(const HostQ8Binding& binding):binding_(&binding) {}
+ Q8BindingRef(const HostQ8Binding&&)=delete;
+ HostQ8Binding retain() const { return binding_?*binding_:HostQ8Binding{}; }
 };
 // Explicit preparation, never allocation or conversion inside a numerical loop.
 Status prepare_host_q8(const WeightView&,HostQ8Binding&);
+// Uses the runtime's compact Q8 copy contract and its readiness/retirement events.
+Status prepare_q8_image(const WeightView&,const Plan&,std::shared_ptr<ImageCache>,ExecutionContext&,HostQ8Binding&);
 Status validate_q8_shape(const WeightView&,std::uint64_t outputs,std::uint64_t width);
 }
