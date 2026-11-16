@@ -942,7 +942,6 @@ if(BUILD_TESTING)
     set_tests_properties(strix-governed-checkpoint-io-tests PROPERTIES LABELS "cpu" TIMEOUT 120)
     add_executable(strix-rotary-descriptor-tests tests/rotary_descriptor_tests.cpp)
     target_link_libraries(strix-rotary-descriptor-tests PRIVATE strix_core strix_serve)
-    target_include_directories(strix-rotary-descriptor-tests PRIVATE src)
     strix_target_warnings(strix-rotary-descriptor-tests)
     add_test(NAME strix-rotary-descriptor-tests COMMAND strix-rotary-descriptor-tests)
     add_executable(strix-qwen-yarn-table-tests tests/qwen_yarn_table_tests.cpp)
@@ -5662,3 +5661,12 @@ include("${CMAKE_CURRENT_LIST_DIR}/cmake/servespec/hook.cmake")
 if(STRIX_BACKEND_CPU)
     include("${CMAKE_CURRENT_LIST_DIR}/cmake/StrixBackendCpu.cmake")
 endif()
+
+# Host fixtures that include qwen_effective_config transitively consume the onfly core header.
+foreach(strix_qwen_fixture strix-rotary-descriptor-tests strix-serve-api-tests
+        strix-qwen-startup-policy-tests strix-qwen-router-bf16-tests strix-qwen-mtp-bundle-tests
+        strix-qwen-product-profile-tests strix-qwen-profile-resolution-tests)
+    if(TARGET ${strix_qwen_fixture})
+        target_include_directories(${strix_qwen_fixture} PRIVATE src)
+    endif()
+endforeach()
