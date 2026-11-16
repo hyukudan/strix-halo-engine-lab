@@ -27,6 +27,7 @@
 #include "strix/env_flags.hpp"
 
 #include <hip/hip_runtime.h>
+#include "../hip/weight/arch/gfx1151_sources.hpp"
 
 #include <concepts>
 #include <cstddef>
@@ -166,8 +167,8 @@ __device__ __forceinline__ void core(const float* x, unsigned in, unsigned nr, C
         if constexpr (ColsStage<Cols>) {
             cols.stage(stile, tid & 15U, unit, nb);
         } else {
-#pragma unroll
-            for (unsigned i = 0; i < 8U; ++i) nb[i] = *(detail::GlobalU4*)(wp + std::size_t{unit} * 32U + 16U * i);
+            // Every existing raw-F16 Columns policy receives this default source.
+            ::strix::weight::hip::RawF16Source::stage(wp,unit,nb);
         }
     };
     // A wave with no live row keeps its staging and barrier duties and skips its row loads and WMMAs.
@@ -193,8 +194,12 @@ __device__ __forceinline__ void core(const float* x, unsigned in, unsigned nr, C
                 const Half16 a = an;
                 if (kk + 1U < 4U || s == 0U || u0 + 4U < units) an = frag(u0 + kk + 1U);
 #pragma unroll
-                for (unsigned t = 0; t < TC; ++t)
+                for (unsigned t = 0; t < TC; ++t) {
                     acc[t] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a, detail::staged_fragment(&lds.w[16U * t + c][kk * 8U]), acc[t]);
+#if defined(STRIX_WFMT_CAPTURE) && STRIX_WFMT_CAPTURE
+                    if constexpr (requires { cols.capture_partial(acc[t]); }) cols.capture_partial(acc[t]);
+#endif
+                }
             }
         }
     }
@@ -215,5 +220,47 @@ __device__ __forceinline__ void core(const float* x, unsigned in, unsigned nr, C
         s.close();
     });
 }
+
+// x16 tile form (shared; same bits as the FP32 x path): x rounded to FP16 ONCE by the core's own cast (RNE) into
+// k-tile-major tiles, element (g, r, j) at (g * rows + r) * 64 + j for input k = 64 g + j. A CTA stage then reads 128
+// rows x 128 contiguous bytes instead of 128 FP32 rows `in` floats apart, and the core's per-fragment conversions go
+// away. Measured (MiniMax index projection, 4096 x 6144 -> 384): rows-major FP32 x streamed at 93-114 GB/s with
+// 16-32 CTAs, the tiles at ~214 GB/s; WMMA alone 0.54 ms = ~73 % of the WMMA peak. Pays from ~2048 rows (below, x fits
+// the MALL and the direct form wins). Workspace: x16_bytes(rows, in). The launch is column-fast (kColumnFast), so the
+// column blocks of one row block share its tiles through L2.
+inline constexpr unsigned kX16Rows = 2048;  // measured crossover (MiniMax index projection ABAB: 1024 direct, 2048 x16)
+inline std::size_t x16_bytes(unsigned rows, unsigned in) { return static_cast<std::size_t>(rows) * in * 2U; }
+// One thread per 8-input chunk (in % 64 == 0).
+template <int = 0> __global__ __launch_bounds__(256) void x16_tiles_kernel(const float* __restrict__ x, _Float16* __restrict__ xt,
+                                                                          unsigned rows, unsigned in) {
+    const unsigned chunks = in / 8U;
+    const std::size_t i = static_cast<std::size_t>(blockIdx.x) * 256U + threadIdx.x;
+    if (i >= static_cast<std::size_t>(rows) * chunks) return;
+    const unsigned r = static_cast<unsigned>(i / chunks), c = static_cast<unsigned>(i % chunks);
+    const float4 a = *reinterpret_cast<const float4*>(x + static_cast<std::size_t>(r) * in + c * 8U);
+    const float4 b = *reinterpret_cast<const float4*>(x + static_cast<std::size_t>(r) * in + c * 8U + 4U);
+    using H8 = _Float16 __attribute__((ext_vector_type(8)));
+    const H8 h = {static_cast<_Float16>(a.x), static_cast<_Float16>(a.y), static_cast<_Float16>(a.z), static_cast<_Float16>(a.w),
+                  static_cast<_Float16>(b.x), static_cast<_Float16>(b.y), static_cast<_Float16>(b.z), static_cast<_Float16>(b.w)};
+    *reinterpret_cast<H8*>(xt + (static_cast<std::size_t>(c / 8U) * rows + r) * 64U + (c % 8U) * 8U) = h;
+}
+inline void enqueue_x16_tiles(const float* x, _Float16* xt, unsigned rows, unsigned in, hipStream_t s) {
+    const std::size_t n = static_cast<std::size_t>(rows) * (in / 8U);
+    if (n) hipLaunchKernelGGL(x16_tiles_kernel<>, dim3(static_cast<unsigned>((n + 255U) / 256U)), dim3(256), 0, s, x, xt, rows, in);
+}
+// Cols mixin: Base's tile / stage hooks, A fragments from the x16 tiles, column-fast CTA order
+// (launch dim3(column blocks, row blocks)).
+template <class Base> struct X16Cols : Base {
+    static constexpr bool kColumnFast = true;
+    const _Float16* xt;
+    unsigned rows;
+    __device__ __forceinline__ Half16 fragment(unsigned row, unsigned unit) const {
+        using GH16 = const Half16 __attribute__((address_space(1)));
+        const _Float16* p = detail::uniform(xt) + (static_cast<std::size_t>(unit / 4U) * detail::uni(rows) + row) * 64U + (unit % 4U) * 16U;
+        return *(GH16*)p;
+    }
+};
+// Column width of a column-fast x16 launch: the widest of 4 / 2 / 1 tiles that divides `tiles` (no dead tiles).
+inline unsigned x16_tc(unsigned tiles) { return tiles % 4U == 0 ? 4U : tiles % 2U == 0 ? 2U : 1U; }
 
 }  // namespace strix::core::f16_dense_tall
