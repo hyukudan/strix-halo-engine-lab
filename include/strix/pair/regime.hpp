@@ -14,6 +14,7 @@
 #include <cstdio>
 #include <limits>
 #include <span>
+#include <stdexcept>
 #include <string>
 #include <utility>
 #include <vector>
@@ -117,14 +118,23 @@ struct LayoutDecl {
 
 // Interleaved virtual stages: C chunks x 2v stages; stage s runs on rank s % 2 and its output (boundary s)
 // crosses to the other rank, forward (rank 0 -> 1, even boundaries, v per chunk) or reverse (odd, v - 1).
-// Execution order per rank (shared by the cost rule and pair::StagePipes): chunks in groups of at most
+// Unbound host planning API: no engine stage-pipe execution or layout adapter is bound here yet.
+// Proposed execution order per rank: chunks in groups of at most
 // `group`; within a group depth-first (round k: every chunk of the group through stage 2k + rank). A fully
 // depth-first order over C chunks would buffer a whole round of reverse frames; with the two-slot pipe the
 // producer stalls for good once a group exceeds 2 x 2 + 1 = 5 chunks, so groups are capped at 4.
 inline constexpr std::uint32_t stage_group_chunks = 4U;
+// Bound host simulation storage and work to one million stage/chunk events (tens of MiB).
+inline constexpr std::uint64_t max_stage_events = 1U << 20U;
+[[nodiscard]] inline bool valid_stage_shape(std::uint64_t chunks, std::uint32_t v, std::uint32_t group) {
+    return chunks != 0U && v != 0U && v <= max_stage_events / 2U && group != 0U &&
+        chunks <= max_stage_events / (2U * v);
+}
 // Position of (chunk, boundary) in its direction's frame order (the pipe sequence).
 [[nodiscard]] inline std::uint64_t stage_sequence(std::uint64_t chunk, std::uint32_t boundary, std::uint64_t chunks,
     std::uint32_t v, std::uint32_t group = stage_group_chunks) {
+    if (!valid_stage_shape(chunks, v, group) || chunk >= chunks || boundary >= 2U * v - 1U)
+        throw std::invalid_argument("pair stage sequence: invalid or oversized shape/index");
     const std::uint64_t rounds = boundary % 2U == 0U ? v : v - 1U;
     const std::uint64_t base = chunk - chunk % group;
     const std::uint64_t size = std::min<std::uint64_t>(group, chunks - base);
@@ -133,11 +143,14 @@ inline constexpr std::uint32_t stage_group_chunks = 4U;
 // Deterministic event simulation of that order: stage time P(n / C) / 2v (balanced chunks and stages); hop =
 // hop_latency_ms + hop_ms_per_row x rows on one FIFO link per direction; the producer of frame q waits until
 // frame q - 2 of its direction is consumed (two slots); plus seam_ms and the hand-off terms. Returns +inf for
-// an order that cannot complete. At v = 1 with no hop cost this is pipeline_wall_ms exactly.
+// an invalid/oversized shape or an order that cannot complete. Empty rows cost zero.
+// At v = 1 with no hop cost this equals the averaged-tail analytical pipeline_wall_ms estimate.
 [[nodiscard]] inline double interleaved_wall_ms(std::uint64_t rows, std::uint32_t chunk, std::uint32_t v,
     const PipelineCost& cost, std::uint32_t group = stage_group_chunks) {
-    if (rows == 0U || chunk == 0U || v == 0U || group == 0U) return 0.0;
-    const std::uint64_t chunks = (rows + chunk - 1U) / chunk;
+    if (chunk == 0U || v == 0U || group == 0U) return std::numeric_limits<double>::infinity();
+    if (rows == 0U) return 0.0;
+    const std::uint64_t chunks = rows / chunk + (rows % chunk != 0U);
+    if (!valid_stage_shape(chunks, v, group)) return std::numeric_limits<double>::infinity();
     const auto n = static_cast<double>(rows);
     const double u = n / static_cast<double>(chunks);
     const std::uint32_t stages = 2U * v;
@@ -216,9 +229,10 @@ template <class Legal, class LegalV>
         for (const auto v : virtual_stages) {
             if (v == 0U || !legal_v(v)) continue;
             const auto wall = interleaved_wall_ms(rows, chunk, v, cost);
+            if (wall == std::numeric_limits<double>::infinity()) continue;
             if (best.chunk == 0U || wall < best.pipeline_ms) {
                 best.chunk = chunk;
-                best.chunks = (rows + chunk - 1U) / chunk;
+                best.chunks = rows / chunk + (rows % chunk != 0U);
                 best.virtual_stages = v;
                 best.pipeline_ms = wall;
             }
@@ -244,10 +258,10 @@ template <class Legal, class LegalV>
     return best;
 }
 
-// Effective-config line (CLI = serve): `pair.pipeline mode=.. chunk=.. virtual=.. predicted_ms=.. alt_ms=.. reason=..`.
+// Host planning diagnostic; candidate_pipeline_ms can describe a rejected candidate.
 [[nodiscard]] inline std::string effective_line(const PipelineChoice& choice) {
     char text[160];
-    std::snprintf(text, sizeof text, "pair.pipeline mode=%s chunk=%u virtual=%u predicted_ms=%.0f alt_ms=%.0f reason=",
+    std::snprintf(text, sizeof text, "pair.pipeline mode=%s chunk=%u virtual=%u candidate_pipeline_ms=%.0f alt_ms=%.0f reason=",
         mode_name(choice.mode), choice.chunk, choice.virtual_stages, choice.pipeline_ms, choice.alt_ms);
     return text + choice.reason;
 }
