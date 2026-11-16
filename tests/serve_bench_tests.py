@@ -11,6 +11,7 @@ import tempfile
 import threading
 import time
 import unittest
+from unittest import mock
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "tools"))
 import serve_bench as sb  # noqa: E402
@@ -232,6 +233,60 @@ class Ledger(unittest.TestCase):
         slow = sb.compare(base, result(["a", "b"], 29.0, 80.0), 1.0)
         self.assertEqual((slow["verdict"], slow["rows"][0]["within_noise"]), ("FAIL", False))
         self.assertEqual(sb.compare(base, result([None, None], 30.0, 80.0), 1.0)["rows"][0]["ids"], "unavailable")
+
+
+class MeasuredStream(unittest.TestCase):
+    def stream(self, chunks):
+        wire = b"".join(b"data: " + json.dumps(c).encode() + b"\n\n" for c in chunks)
+        wire += b"data: [DONE]\n\n"
+        ticks = iter(i * 0.6 for i in range(len(chunks) + 2))
+        with mock.patch.object(sb.urllib.request, "urlopen", return_value=io.BytesIO(wire)):
+            return sb.stream_request("http://localhost/fixture", {}, 1, clock=lambda: next(ticks))
+
+    @staticmethod
+    def chat(text, field="content", tokens=None):
+        tokens = list(text) if tokens is None else tokens
+        return dict(choices=[dict(delta={field: text}, logprobs={field: [dict(token=t) for t in tokens]})])
+
+    def test_measured_chat_reasoning_and_terminal_metadata(self):
+        # Unequal chunks: the measured peak is 1+4, rather than a usage average.
+        final = dict(choices=[dict(delta={}, finish_reason="stop",
+                                  logprobs=dict(content=[dict(token="full final array")]))],
+                     usage=dict(completion_tokens=7), strix=dict(token_ids=list(range(7))))
+        event = self.stream([self.chat("AB"), self.chat("r", "reasoning_content"), self.chat("WXYZ"), final])
+        self.assertEqual(event["chunk_token_counts"], [2, 1, 4])
+        self.assertEqual(len(event["token_times"]), 3)
+        self.assertEqual(sb.request_metrics(event)["peak_1s_tok_s"], 5)
+
+    def test_completion_entries_are_per_chunk_not_alternatives(self):
+        def completion(text, tokens):
+            return dict(choices=[dict(text=text, logprobs=dict(tokens=tokens, top_logprobs=[{"x": -1}] * 20))])
+        event = self.stream([completion("ab", ["a", "b"]), completion("c", ["c"]),
+                             completion("defg", ["de", "fg"]), dict(usage=dict(completion_tokens=5))])
+        self.assertEqual(event["chunk_token_counts"], [2, 1, 2])
+        self.assertEqual(sb.request_metrics(event)["peak_1s_tok_s"], 3)
+
+    def test_missing_or_cumulative_counts_invalidate_whole_event(self):
+        for middle in (dict(choices=[dict(delta=dict(content="X"))]),
+                       self.chat("X", tokens=["A", "B", "X"]),
+                       dict(choices=[dict(delta=dict(content="X"), logprobs=dict(content=["X"]))])):
+            event = self.stream([self.chat("AB"), middle, self.chat("YZ"),
+                                 dict(usage=dict(completion_tokens=5), strix=dict(token_ids=list(range(5))))])
+            self.assertIsNone(event["chunk_token_counts"])
+            self.assertIsNone(sb.request_metrics(event)["peak_1s_tok_s"])
+
+    def test_usage_mismatch_does_not_extrapolate_textless_tokens(self):
+        event = self.stream([self.chat("AB"), self.chat("X"), self.chat("YZ"),
+                             dict(usage=dict(completion_tokens=6))])
+        self.assertIsNone(event["chunk_token_counts"])
+        self.assertIsNone(sb.request_metrics(event)["peak_1s_tok_s"])
+
+    def test_byte_fallback_entries_align_to_actual_chunk(self):
+        chunk = dict(choices=[dict(delta=dict(content="é"), logprobs=dict(content=[
+            dict(token="bytes:C3", bytes=[195]), dict(token="bytes:A9", bytes=[169])]))])
+        self.assertEqual(sb.measured_chunk_tokens(chunk), 2)
+        chunk["choices"][0]["delta"]["content"] = "x"
+        self.assertIsNone(sb.measured_chunk_tokens(chunk))
 
 
 class StreamHandler(http.server.BaseHTTPRequestHandler):

@@ -384,9 +384,58 @@ def _chunk_has_text(chunk):
     return False
 
 
+def measured_chunk_tokens(chunk):
+    """Count only per-token logprob entries aligned to this chunk's emitted text.
+
+    Chat uses logprobs.content/reasoning_content; completions use logprobs.tokens.
+    Arrays of alternatives, final usage, and cumulative token IDs are not counts.
+    Unknown or unaligned entries make the chunk unmeasured, rather than estimated.
+    """
+    def aligned(entries, text, chat):
+        if not isinstance(entries, list) or not entries:
+            return None
+        if chat:
+            if not all(isinstance(e, dict) and isinstance(e.get("token"), str) for e in entries):
+                return None
+            spellings = [e["token"] for e in entries]
+        else:
+            if not all(isinstance(e, str) for e in entries):
+                return None
+            spellings = entries
+        if "".join(spellings) == text:
+            return len(entries)
+        # Standard chat logprobs can spell byte-fallback tokens differently from
+        # their decoded text. Their actual bytes still provide direct alignment.
+        if chat and all(isinstance(e.get("bytes"), list) and
+                        all(type(b) is int and 0 <= b <= 255 for b in e["bytes"]) for e in entries):
+            raw = bytes(b for e in entries for b in e["bytes"])
+            if raw.decode("utf-8", errors="replace") == text:
+                return len(entries)
+        return None
+
+    total, measured = 0, False
+    for choice in chunk.get("choices") or []:
+        logprobs = choice.get("logprobs") or {}
+        if not isinstance(logprobs, dict):
+            return None
+        if choice.get("text"):
+            count = aligned(logprobs.get("tokens"), choice["text"], False)
+            if count is None:
+                return None
+            total, measured = total + count, True
+        delta = choice.get("delta") or {}
+        for field in ("content", "reasoning_content"):
+            if delta.get(field):
+                count = aligned(logprobs.get(field), delta[field], True)
+                if count is None:
+                    return None
+                total, measured = total + count, True
+    return total if measured else None
+
+
 def stream_request(url, body, timeout, clock=time.perf_counter):
     """Sends one streamed request and returns its event record (see request_metrics)."""
-    event = dict(arrival=clock(), token_times=[], tokens=None, error=None)
+    event = dict(arrival=clock(), token_times=[], chunk_token_counts=[], tokens=None, error=None)
     request = urllib.request.Request(url, data=json.dumps(body).encode(), headers={"Content-Type": "application/json"})
     try:
         with urllib.request.urlopen(request, timeout=timeout) as response:
@@ -403,6 +452,11 @@ def stream_request(url, body, timeout, clock=time.perf_counter):
                     break
                 if _chunk_has_text(chunk):
                     event["token_times"].append(now)
+                    count = measured_chunk_tokens(chunk)
+                    if count is None:
+                        event["chunk_token_counts"] = None
+                    elif event["chunk_token_counts"] is not None:
+                        event["chunk_token_counts"].append(count)
                 usage = chunk.get("usage")
                 if isinstance(usage, dict):
                     if isinstance(usage.get("completion_tokens"), int):
@@ -421,6 +475,11 @@ def stream_request(url, body, timeout, clock=time.perf_counter):
                         break
     except (urllib.error.URLError, OSError, ValueError) as error:
         event["error"] = f"{type(error).__name__}: {error}"[:200]
+    # A usage mismatch can reveal omitted textless/EOS tokens. Never distribute
+    # those tokens over chunks or derive a count from final/cumulative metadata.
+    if (event["chunk_token_counts"] is not None and event["tokens"] is not None
+            and sum(event["chunk_token_counts"]) != event["tokens"]):
+        event["chunk_token_counts"] = None
     return event
 
 
