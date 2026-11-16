@@ -43,6 +43,7 @@ struct BigArgs {
     float* y;
     const float* aux;
     std::uint32_t out, in, rows, rows_pad, nseg, nkb;
+    std::uint32_t tiles_x, tiles_y, group;  // CTA raster: groups of `group` out tiles walk all row tiles (weight panel stays in L2)
     float gscale;
     int epi;
 };
@@ -109,7 +110,14 @@ template <bool F16, int T, int NT, int MODE, int BKB>
 __global__ void __launch_bounds__(256, 1) big_kernel(const BigArgs a) {
     using C = Cfg<T, NT, BKB>;
     extern __shared__ __align__(16) std::uint16_t smem[];
-    const std::uint32_t o0 = blockIdx.x * BM, r0 = blockIdx.y * C::BN;
+    std::uint32_t tx, ty;
+    {
+        const std::uint32_t per = a.group * a.tiles_y, grp = blockIdx.x / per, rem = blockIdx.x % per;
+        const std::uint32_t gsz = min(a.group, a.tiles_x - grp * a.group);
+        ty = rem / gsz;
+        tx = grp * a.group + rem % gsz;
+    }
+    const std::uint32_t o0 = tx * BM, r0 = ty * C::BN;
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, q = lane & 3;
     const int swz = swz_mask<BKB>(g);  // (row & 3) == (g & 3) for every row this thread reads
     const int wm = warp & 1, wn = warp >> 1;
@@ -324,6 +332,7 @@ std::map<std::tuple<int, std::uint32_t, std::uint32_t, std::uint32_t>, Table>& t
 }
 using Scratch = BigCtx;
 bool g_bkb2 = true;
+std::uint32_t g_group = 16;
 Scratch& scratch() {
     static Scratch s;
     return s;
@@ -390,8 +399,11 @@ cudaError_t launch(const BigArgs& a, std::uint32_t out, std::uint32_t rows, cuda
         if (auto e = cudaFuncSetAttribute(big_kernel<F16, T, NT, MODE, BKB>, cudaFuncAttributeMaxDynamicSharedMemorySize, C::SMEM); e != cudaSuccess) return e;
         attr = true;
     }
-    const dim3 grid((out + BM - 1) / BM, (rows + C::BN - 1) / C::BN);
-    big_kernel<F16, T, NT, MODE, BKB><<<grid, 256, C::SMEM, s>>>(a);
+    BigArgs b = a;
+    b.tiles_x = (out + BM - 1) / BM;
+    b.tiles_y = (rows + C::BN - 1) / C::BN;
+    b.group = std::min<std::uint32_t>(b.tiles_x, g_group);
+    big_kernel<F16, T, NT, MODE, BKB><<<b.tiles_x * b.tiles_y, 256, C::SMEM, s>>>(b);
     return cudaGetLastError();
 }
 
