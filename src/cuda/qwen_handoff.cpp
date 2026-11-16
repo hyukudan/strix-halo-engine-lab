@@ -156,6 +156,8 @@ Sender::~Sender() {
 }
 
 const Layout& Sender::layout() {
+    // v1 echoes the consumer identity; it does not negotiate the producer codec.
+    require_f32_recurrent_state(recurrent_state_policy().type, "node handoff (no producer state contract)");
     if (impl_->have_layout) return impl_->layout;
     const auto t0 = Clock::now();
     auto [status, body] = impl_->client.get(impl_->base_path + "/layout", impl_->auth);
@@ -177,10 +179,6 @@ const Layout& Sender::layout() {
     if (const auto* c = j.find("max_context")) l.max_context = u64_of(c, "max_context");
     if (const auto* c = j.find("codecs"); c && c->is_array())
         for (const auto& name : c->as_array()) if (name.is_string()) l.codecs.push_back(name.as_string());
-    if (const auto type = recurrent_state_policy().type; type != RecurrentStateType::f32)
-        for (const auto& f : l.fixed)  // the receiver's matrix must be stored under the same contract (no silent conversion)
-            if (f.name == "recurrent_matrix" && f.bytes != recurrent_state_bytes(36ULL * 48 * 128 * 128, type))
-                throw std::invalid_argument(recurrent_state_route_refusal(type, false, "node handoff (peer recurrent_matrix size is not the typed size)"));
     for (const auto& r : l.rows) impl_->row_width.push_back(element_width(r.name));
     for (const auto& f : l.fixed) impl_->fixed_width.push_back(element_width(f.name));
     impl_->have_layout = true;

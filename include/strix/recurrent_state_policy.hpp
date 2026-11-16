@@ -7,6 +7,7 @@
 #include "strix/env_flags.hpp"
 #include "strix/recurrent_state_type.hpp"
 
+#include <stdexcept>
 #include <string>
 
 namespace strix {
@@ -35,7 +36,7 @@ struct RecurrentStatePolicy {
 // Process-wide resolution (read once, recorded).
 [[nodiscard]] inline RecurrentStatePolicy recurrent_state_policy() {
     static const RecurrentStatePolicy policy = [] {
-        const char* raw = std::getenv(kRecurrentStateEnv);
+        const char* raw = envcfg::text(kRecurrentStateEnv);
         const auto resolved = recurrent_state_policy_from(raw);
         envcfg::record(kRecurrentStateEnv, raw, recurrent_state_type_name(resolved.type));
         return resolved;
@@ -50,6 +51,14 @@ struct RecurrentStatePolicy {
     if (type == RecurrentStateType::f32 || route_typed) return {};
     return std::string(kRecurrentStateEnv) + "=" + recurrent_state_type_name(type) + " refused: route " + route +
         " reads/writes the recurrent state as f32 only (no typed form yet)";
+}
+
+// Fail closed at application/protocol boundaries whose typed-state contract is
+// not qualified. Storage support in a kernel alone does not admit composition.
+inline void require_f32_recurrent_state(RecurrentStateType type, const char* route) {
+    if (type != RecurrentStateType::f32)
+        throw std::invalid_argument(std::string(kRecurrentStateEnv) + "=" + recurrent_state_type_name(type) +
+            " refused: " + route + " requires f32 recurrent state");
 }
 
 }  // namespace strix

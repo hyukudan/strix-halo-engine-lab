@@ -840,7 +840,10 @@ void Prefill::Impl::drop_graph(std::map<GraphKey, StepGraph>::iterator it) {
 Prefill::Prefill(const Config& config) : impl_(std::make_unique<Impl>()) {
     auto& m = *impl_;
     m.route_policy = qwen_route::environment(config.moe_route_bf16);
-    m.state_type = recurrent_state_policy().type;  // resolved once; every GDN route below is typed, none falls back to f32 code
+    m.state_type = recurrent_state_policy().type;
+    // Typed prefill currently rounds at call boundaries. Reject before device or
+    // cache setup until rounding is independent of scheduling and prefix history.
+    require_f32_recurrent_state(m.state_type, "CUDA application (schedule-independent prefill and prefix reuse unqualified)");
     m.state_layer_floats = recurrent_state_bytes(gdn::kMatrixFloats, m.state_type) / sizeof(float);
     m.cfg = config;
     m.cfg.moe_route_bf16 = m.route_policy.enabled; // freeze before device work

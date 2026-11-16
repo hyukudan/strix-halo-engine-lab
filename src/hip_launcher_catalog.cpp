@@ -1,4 +1,3 @@
-#include "strix/recurrent_state_policy.hpp"
 #include "strix/hip_launcher_catalog.hpp"
 
 #include "strix/runtime_launchers.hpp"
@@ -45,7 +44,6 @@ HipGdnLauncherConfig make_gdn_config(const ModelContract& model,
     config.wave8_q8_output_projection = wave8_output;
     config.recurrent_layout = recurrent_layout;
     config.recurrent_storage = recurrent_storage;
-    config.recurrent_state = recurrent_state_policy().type;  // STRIX_RECURRENT_STATE: one resolver for CLI and server
     config.dense_a8_projections = dense_a8;
     config.dense_f16_prefill = dense_f16;
     config.dense_trellis_projections = dense_trellis;

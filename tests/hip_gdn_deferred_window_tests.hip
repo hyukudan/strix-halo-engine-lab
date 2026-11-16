@@ -106,10 +106,9 @@ template <class T> std::vector<T> uniform(std::size_t count, float lo, float hi,
     }
     return result;
 }
-// Buffer image of a recurrent state: the matrix buffer stays FP32-sized; a 16-bit type fills its first
-// 2 * count bytes through the host codec (RNE) and leaves the tail zero.
+// Exact allocation-sized image: typed fixtures must not hide f32 reads or writes in an oversized tail.
 std::vector<std::byte> state_image(const std::vector<float>& values, RecurrentStateType type) {
-    std::vector<std::byte> image(values.size() * sizeof(float), std::byte{0});
+    std::vector<std::byte> image(static_cast<std::size_t>(recurrent_state_bytes(values.size(), type)), std::byte{0});
     if (type == RecurrentStateType::f32) { std::memcpy(image.data(), values.data(), image.size()); return image; }
     for (std::size_t i = 0; i < values.size(); ++i) {
         const std::uint16_t half = type == RecurrentStateType::f16 ? rstate::f16_from_f32_host(values[i]) : rstate::bf16_from_f32(values[i]);
@@ -143,7 +142,7 @@ struct Fixture {
     Fixture(GdnRecurrentStorage storage, HipGdnRecurrentLayout layout, bool q8, bool bf16_weights, unsigned seed,
         RecurrentStateType type = RecurrentStateType::f32)
         : q8_gates(q8), bf16_small(bf16_weights), state_type(type) {
-        config.recurrent_state = type;
+        config.model.recurrent_state = type;
         config.virtual_q8_input_projections = config.prefetch_q8_input_projections = config.wave8_q8_input_projections = true;
         config.virtual_q8_output_projection = config.wave8_q8_output_projection = true;
         config.recurrent_storage = storage; config.recurrent_layout = layout;
@@ -169,7 +168,7 @@ struct Fixture {
         state_image0 = state_image(state0, type);
         history0 = uniform<std::uint16_t>(static_cast<std::size_t>(conv_width) * kernel, -1.0F, 1.0F, rng);
         for (auto* side : {&window, &serial}) {
-            side->matrix = owner.allocate(state_floats * sizeof(float));
+            side->matrix = owner.allocate(state_image0.size());
             side->conv = owner.allocate(history0.size() * sizeof(std::uint16_t));
             side->retained = owner.allocate(static_cast<std::size_t>(gdn_window_retained_bytes(config.model)));
             for (unsigned row = 0; row < 16U; ++row) {
@@ -294,7 +293,7 @@ void cohort_scenarios(Fixture& f, unsigned& cases) {
         session.image = state_image(session.state, f.state_type);
         session.history = uniform<std::uint16_t>(static_cast<std::size_t>(conv_width) * kernel, -1.0F, 1.0F, rng);
         for (auto* side : {&session.together, &session.alone}) {
-            side->matrix = f.owner.allocate(state_floats * sizeof(float));
+            side->matrix = f.owner.allocate(f.state_image0.size());
             side->conv = f.owner.allocate(session.history.size() * sizeof(std::uint16_t));
             side->retained = f.owner.allocate(static_cast<std::size_t>(gdn_window_retained_bytes(f.config.model)));
             for (unsigned row = 0; row < 16U; ++row) {
@@ -567,7 +566,7 @@ void benchmark_state(bool cold, RecurrentStateType type = RecurrentStateType::f3
     std::vector<Side> chats(8);
     std::vector<Buffer> controls;
     for (auto& chat : chats) {
-        chat.matrix = f.owner.allocate(state_floats * sizeof(float)); write(chat.matrix, f.state_image0);
+        chat.matrix = f.owner.allocate(f.state_image0.size()); write(chat.matrix, f.state_image0);
         chat.conv = f.owner.allocate(f.history0.size() * sizeof(std::uint16_t)); write(chat.conv, f.history0);
         chat.retained = f.owner.allocate(static_cast<std::size_t>(gdn_window_retained_bytes(f.config.model)));
         for (unsigned row = 0; row < 2U; ++row) {

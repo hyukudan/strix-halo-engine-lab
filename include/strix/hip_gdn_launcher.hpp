@@ -33,8 +33,7 @@ struct HipGdnLauncherConfig {
     HipGdnRecurrentLayout recurrent_layout = HipGdnRecurrentLayout::baseline;
     // Chosen with the session allocation/import; never converted per token.
     GdnRecurrentStorage recurrent_storage = GdnRecurrentStorage::key_value;
-    // Element type of the matrix state (FP32 arithmetic always); f16/bf16 are FAST opt-in contracts.
-    RecurrentStateType recurrent_state = RecurrentStateType::f32;
+    // model.recurrent_state owns allocation, dispatch and identity together.
     // Dense A8 numerical profile (dense-a8-q80-v1): every Q8_0 projection of the
     // step (R1, windows and prompt rows) runs Q8_0 x per-32 int8 activations
     // through q8_rows::launch_dense_a8. Different numerics from the exact path.
