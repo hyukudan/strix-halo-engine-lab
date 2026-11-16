@@ -1,6 +1,6 @@
 // Decode timing of the CUDA Qwen engine (one model load; no logits leave the device).
 //   qwen_decode_bench <tables dir> <rope table> <max positions> <tokens file> <prompt N> <generate G>
-// Prefills rows [0, N-1), then reports: serial greedy steps (T = 1), verify windows of T = 2..8 rows over the serial
+// Prefills rows [0, N-1), then reports: serial greedy steps (T = 1), verify windows of T = 2..STRIX_QWEN_TMAX (default 8, up to 16) rows over the serial
 // tokens (ms per window), and MTP speculative decode (depth 7, min-p STRIX_QWEN_MIN_P or 0.7) when a sidecar is set.
 #include "strix/cuda/qwen_prefill.hpp"
 
@@ -61,7 +61,9 @@ int main(int argc, char** argv) {
     const auto med = [](const std::vector<double>& v) { const std::size_t k = v.size(); return k % 2 ? v[k / 2] : 0.5 * (v[k / 2 - 1] + v[k / 2]); };
     std::sort(ms.begin(), ms.end());
     std::printf("serial T=1: median %.2f ms (%.1f tok/s), min %.2f\n", med(ms), 1000.0 / med(ms), ms[0]);
-    for (std::uint32_t t = 2; t <= 8; ++t) {
+    // STRIX_QWEN_TMAX (default 8, up to 16): the widest window; 9..16 = one session's copy window (prefill-shaped families)
+    const std::uint32_t tmax = [] { const char* v = std::getenv("STRIX_QWEN_TMAX"); const int x = v ? std::atoi(v) : 8; return static_cast<std::uint32_t>(x < 2 ? 2 : x > 16 ? 16 : x); }();
+    for (std::uint32_t t = 2; t <= tmax; ++t) {
         std::vector<std::uint32_t> pre(seq.begin(), seq.begin() + static_cast<std::ptrdiff_t>(n));
         p.run(pre, n - 1, drop);
         std::vector<double> w;

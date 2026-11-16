@@ -4,7 +4,7 @@
 // last prompt row is the first step). Prints each token with the SHA-256 of its FP32 logits row (the node's
 // STRIX_SERIAL_LOGITS_DIGEST) and the node's step chain SHA256(prev || consumed position LE8 || row SHA256)
 // (STRIX_MTP_STEP_LOGITS_DIGEST, include/strix/mtp_step_logits_digest.hpp).
-// Batch-width invariance: replays the same prompt + generated tokens as verify windows of T = 2..8 rows from a fresh
+// Batch-width invariance: replays the same prompt + generated tokens as verify windows of T = 2..STRIX_QWEN_TMAX (default 8, up to 16) rows from a fresh
 // prefill and requires every row's argmax and logits digest to equal the serial step's. With a ref file (node greedy
 // tokens, comma/space separated), the serial tokens must equal its first G entries.
 #include "strix/cuda/qwen_prefill.hpp"
@@ -114,7 +114,9 @@ int main(int argc, char** argv) {
         bad += !ok;
     }
     // batch-width invariance: windows of T rows over [n-1, n-1+g) (the last window may be shorter)
-    for (std::uint32_t t = 2; t <= 8; ++t) {
+    // STRIX_QWEN_TMAX (default 8, up to 16): the widest window; 9..16 = one session's copy window (prefill-shaped families)
+    const std::uint32_t tmax = [] { const char* v = std::getenv("STRIX_QWEN_TMAX"); const int x = v ? std::atoi(v) : 8; return static_cast<std::uint32_t>(x < 2 ? 2 : x > 16 ? 16 : x); }();
+    for (std::uint32_t t = 2; t <= tmax; ++t) {
         std::vector<std::uint32_t> pre(seq.begin(), seq.begin() + static_cast<std::ptrdiff_t>(n));
         p.run(pre, n - 1, drop);
         std::uint32_t diff = 0;
@@ -136,7 +138,8 @@ int main(int argc, char** argv) {
     }
     // rollback: windows of T rows over the greedy sequence, committing only `keep` rows (cycling 1..T), so the next
     // window recomputes the dropped rows from rolled-back GDN/conv/PLE/n-gram state; every row must equal serial.
-    for (const std::uint32_t t : {8U, 3U}) {
+    for (const std::uint32_t t : {tmax > 8U ? tmax : 0U, 8U, 3U}) {
+        if (t == 0) continue;
         std::vector<std::uint32_t> pre(seq.begin(), seq.begin() + static_cast<std::ptrdiff_t>(n));
         p.run(pre, n - 1, drop);
         std::uint32_t diff = 0, windows = 0, rows_done = 0;
