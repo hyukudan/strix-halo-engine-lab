@@ -2360,7 +2360,7 @@ inline std::string effective_config_json(const EffectiveConfig& config) {
         << ",\"row_reduction\":{\"requested\":\"" << core::iu4_rows::row_reduction_name(o.turbo.row_reduction.requested)
         << "\",\"effective\":\"" << (o.turbo.row_reduction.active ? core::iu4_rows::row_reduction_name(o.turbo.row_reduction.effective) : "native")
         << "\",\"contract\":\"" << (o.turbo.row_reduction.active ? core::iu4_rows::row_reduction_contract(o.turbo.row_reduction.effective) : "native")
-        << "\",\"experimental\":" << (o.turbo.row_reduction.effective == core::iu4_rows::RowReduction::canonical ? "true" : "false")
+        << "\",\"quality_gate_pending\":" << (o.turbo.row_reduction.effective == core::iu4_rows::RowReduction::canonical ? "true" : "false")
         << ",\"scope\":\"IU4 G64/G96 reductions; native weights unchanged\"}}";
     out << ",\"hc_lowband_policy\":" << (config.environment.contains("STRIX_QPF2K_HC_LOWBAND") ?
         std::strtoul(config.environment.at("STRIX_QPF2K_HC_LOWBAND").c_str(), nullptr, 0) : 0U);

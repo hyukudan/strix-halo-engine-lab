@@ -285,8 +285,8 @@ int main() {
     }
     expect(core::iu4_rows::iu4_plan(1U, 96U).GC == 96U && core::iu4_rows::iu4_plan(1U, 64U).GC == 64U &&
            core::iu4_rows::iu4_plan(8U, 96U).GC == 32U, "legacy row-dependent plan preserved");
-    expect(decode_cli::effective_config_json(canonical_cli).find("\"contract\":\"iu4-g64g96-gc32-v1\",\"experimental\":true") !=
-           std::string::npos, "receipt names the experimental numerical contract");
+    expect(decode_cli::effective_config_json(canonical_cli).find("\"contract\":\"iu4-g64g96-gc32-v1\",\"quality_gate_pending\":true") !=
+           std::string::npos, "receipt names the pending-gate numerical contract");
     bool invalid_reduction = false;
     try { static_cast<void>(core::iu4_rows::parse_row_reduction("unknown")); }
     catch (const std::invalid_argument&) { invalid_reduction = true; }
