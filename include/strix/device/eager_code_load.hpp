@@ -29,6 +29,9 @@
 #if defined(__unix__)
 #include <unistd.h>
 #endif
+#if defined(__linux__)
+#include <sys/prctl.h>
+#endif
 
 namespace strix::device {
 
@@ -56,9 +59,25 @@ inline std::vector<std::string> split_process_arguments(std::string_view cmdline
     return arguments;
 }
 
-// Restarts the running image with its original arguments. Returns only when exec failed (message on stderr): the
-// process then continues with deferred loading, which is correct, only slower on the first request.
-inline void restart_own_image(char** argv) {
+// /proc/self/exe keeps the running inode even after a deployment replaces or unlinks its pathname.
+// Linux names that restarted process "exe"; restore the executable's name separately, never as an exec target.
+inline void restore_own_image_name() {
+#if defined(__linux__)
+    char comm[16]{};
+    if (::prctl(PR_GET_NAME, comm) != 0 || std::strcmp(comm, "exe") != 0) return;
+    char self[4096];
+    const auto n = ::readlink("/proc/self/exe", self, sizeof(self) - 1);
+    if (n <= 0) return;
+    std::string path(self, static_cast<std::size_t>(n));
+    constexpr std::string_view deleted = " (deleted)";
+    if (path.ends_with(deleted)) path.resize(path.size() - deleted.size());
+    const auto name = path.substr(path.find_last_of('/') + 1U);
+    (void)::prctl(PR_SET_NAME, name.c_str());
+#endif
+}
+
+// Returns the exec error only on failure. Success replaces this image and never returns.
+inline int restart_own_image(char** argv) {
 #if defined(__unix__)
     std::fflush(nullptr);
     std::ifstream cmdline("/proc/self/cmdline", std::ios::binary);
@@ -67,38 +86,61 @@ inline void restart_own_image(char** argv) {
     std::vector<char*> restart;
     for (const auto& argument : original) restart.push_back(const_cast<char*>(argument.c_str()));
     restart.push_back(nullptr);
-    // Exec the resolved binary path, not "/proc/self/exe": the kernel names the new image after the exec'd path, so the
-    // latter turns the process name (comm) into "exe" and name-based tools (pgrep, samplers, reapers) lose the engine.
-    char self[4096];
-    const auto n = ::readlink("/proc/self/exe", self, sizeof(self) - 1);
-    if (n > 0) self[n] = '\0';
-    ::execv(n > 0 ? self : "/proc/self/exe", original.empty() ? argv : restart.data());
-    std::fprintf(stderr, "eager code loading: restart failed (%s); continuing with deferred loading\n", std::strerror(errno));
+    ::execv("/proc/self/exe", original.empty() ? argv : restart.data());
+    return errno;
 #else
     (void)argv;
+    return ENOSYS;
+#endif
+}
+
+inline int& code_load_restart_error() {
+    static int error = 0;
+    return error;
+}
+
+// Own the inserted value until exec succeeds. A failed exec must not certify this already-registered image as eager.
+template<class Get, class Put, class Erase, class Restart>
+inline int try_eager_code_load_restart(bool enabled, Get get, Put put, Erase erase, Restart restart) {
+    if (!apply_eager_code_loading(enabled, get, put)) return 0;
+    const int error = restart();
+    code_load_restart_error() = error;
+    if (!erase("HIP_ENABLE_DEFERRED_LOADING"))
+        throw std::runtime_error("cannot roll back HIP eager code loading after failed restart");
+    return error;
+}
+
+inline void restart_with_eager_code_loading(bool enabled, char** argv) {
+#if defined(__unix__)
+    const int error = try_eager_code_load_restart(enabled,
+        [](const char* name) { return strix::envcfg::text(name); },
+        [](const char* name, const char* value) { return ::setenv(name, value, 0) == 0; },
+        [](const char* name) { return ::unsetenv(name) == 0; },
+        [&] { return restart_own_image(argv); });
+    if (error) std::fprintf(stderr, "eager code loading: restart failed (%s); continuing with deferred loading\n",
+        std::strerror(error));
+#else
+    (void)enabled; (void)argv;
 #endif
 }
 
 // Who decides for this binary. shared = the start gate applies the default below; engine = the binary resolves its own
-// policy later (it has engine options that can decline eager loading) and calls apply_eager_code_loading itself.
+// policy later (it has engine options that can decline eager loading) and calls restart_with_eager_code_loading.
 enum class CodeLoad { shared, engine };
 
 // The start gate's call: eager unless STRIX_EAGER_CODE_LOAD=0 or HIP_ENABLE_DEFERRED_LOADING is already set.
 inline void eager_code_load_or_restart(char** argv, CodeLoad who = CodeLoad::shared) {
-#if defined(__unix__)
+    restore_own_image_name();
     if (who != CodeLoad::shared) return;
-    if (apply_eager_code_loading(true, [](const char* name) { return std::getenv(name); },
-            [](const char* name, const char* value) { return ::setenv(name, value, 0) == 0; }))
-        restart_own_image(argv);
-#else
-    (void)argv; (void)who;  // no HIP runtime image restart off Linux
-#endif
+    restart_with_eager_code_loading(true, argv);
 }
 
 // Receipt line of the resolved mode (the restarted image prints it): "code load: eager|deferred (<why>)".
 inline std::string code_load_receipt(CodeLoad who = CodeLoad::shared) {
-    const char* hip = std::getenv("HIP_ENABLE_DEFERRED_LOADING");
+    const char* hip = strix::envcfg::text("HIP_ENABLE_DEFERRED_LOADING");
     const char* policy = strix::envcfg::text("STRIX_EAGER_CODE_LOAD");
+    if (code_load_restart_error())
+        return std::string("code load: deferred (restart failed: ") + std::strerror(code_load_restart_error()) + ")";
     const bool eager = hip && std::string_view(hip) == "0";
     std::string why = policy && policy[0] == '0' ? "STRIX_EAGER_CODE_LOAD=0"
         : who == CodeLoad::engine ? "engine policy"

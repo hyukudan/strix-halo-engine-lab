@@ -1403,12 +1403,9 @@ static int run_decode_entry(
     // Inspection predicts this policy without changing the process environment.
     // A value set here is already too late for this image, so restart it once with the value in its
     // environment; the restarted image finds the value set and continues without restarting again.
-    if (!options.print_effective_config && !options.print_cache_family &&
-        strix::decode_cli::apply_eager_code_loading(options.eager_code_load && !options.baseline &&
-            !(std::getenv("STRIX_QPF2K_DEFAULTS") && std::getenv("STRIX_QPF2K_DEFAULTS")[0] == '0'),
-            [](const char* name) { return std::getenv(name); },
-            [](const char* name, const char* value) { return ::setenv(name, value, 0) == 0; })) {
-        strix::device::restart_own_image(argv);  // shared home: strix/device/eager_code_load.hpp
+    if (!options.print_effective_config && !options.print_cache_family) {
+        strix::device::restart_with_eager_code_loading(options.eager_code_load && !options.baseline &&
+            strix::envcfg::flag("STRIX_QPF2K_DEFAULTS", true, strix::EnvFlagMatch::first_character), argv);
     }
     if (allon_active)
         std::fprintf(stderr, "qwen allon long-prompt gate: rows=%zu, off: %s\n",
