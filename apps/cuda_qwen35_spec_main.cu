@@ -70,6 +70,7 @@ int main(int argc, char** argv) {
         std::string model, synth, ids_arg, ids_file, sources = "copy,chain,hybrid", chain_hidden = "post", label = "run";
         std::uint32_t n_gen = 256, prompt_len = 64, layers_override = 0, max_pos = 0, max_block = 32, chain_k = 7;
         double oracle = -1.0;
+        std::uint32_t trace_n = 0;
         bool cost_table = false, check = true, graphs = true, seed_costs = true, turbo_lm_head = true;
         q::TurboWeights turbo = q::TurboWeights::off;
         for (int i = 1; i < argc; ++i) {
@@ -90,6 +91,7 @@ int main(int argc, char** argv) {
             else if (a == "--chain-k") chain_k = std::uint32_t(std::stoul(next()));
             else if (a == "--oracle") oracle = std::stod(next());
             else if (a == "--cost-table") cost_table = true;
+            else if (a == "--trace") trace_n = std::uint32_t(std::stoul(next()));
             else if (a == "--check") check = next() != "0";
             else if (a == "--graphs") graphs = next() != "0";
             else if (a == "--seed-costs") seed_costs = next() != "0";
@@ -287,6 +289,14 @@ int main(int argc, char** argv) {
             p.context = E->committed();
             const auto r = spec.step(out, p);
             if (r.emitted == 0) break;
+            if (per_step.size() < trace_n) {
+                const auto& A = drafter.arbiter().last_arms();
+                const auto& Sc = drafter.arbiter().last_arm_scores();
+                std::printf("T%zu src%u rows%u prop%u acc%u em%u ver%.2f dr%.2f | ser %.4f cpy k%u e%.2f ms%.2f %.4f | mdl k%u e%.2f ms%.2f %.4f probe%d | cc1 %.2f cc2 %.2f\n",
+                            per_step.size(), unsigned(r.source), r.rows, r.proposed, r.accepted, r.emitted, r.verify_ms, r.draft_ms,
+                            Sc[0], A[1].k, A[1].expected_tokens, A[1].expected_ms, Sc[1], A[2].k, A[2].expected_tokens, A[2].expected_ms,
+                            Sc[2], int(A[2].probe), drafter.chain_cost_ms(1), drafter.chain_cost_ms(2));
+            }
             ++by_source[std::size_t(r.source)];
             per_step.push_back(double(r.emitted));
             tick_ms.push_back(now_ms() - t0);

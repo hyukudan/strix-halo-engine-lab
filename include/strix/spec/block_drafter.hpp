@@ -85,6 +85,7 @@ public:
     [[nodiscard]] const Arbiter& arbiter() const { return arbiter_; }
     [[nodiscard]] const SpecStats& stats() const { return stats_; }
     [[nodiscard]] double now_ms() const;
+    [[nodiscard]] double chain_cost_ms(std::uint32_t steps) const { return chain_ms(steps); }
     // Extension bookkeeping (hybrid) for reports.
     std::uint64_t hybrid_blocks = 0, hybrid_ext_proposed = 0, hybrid_ext_accepted = 0;
 
