@@ -1,4 +1,5 @@
 #include "strix/weight/admission.hpp"
+#include "strix/weight/registry.hpp"
 #include "strix/ds41_native_fp8.hpp"
 #include "strix/vision/gguf_weights.hpp"
 #include "gemma4/model/model.hpp"
@@ -51,6 +52,23 @@ bool wfmt_readers_test() try {
     check(!index_safetensors(memory_source(safe(R"({"a":{"dtype":"F32","shape":[1],"data_offsets":[0,4]},"b":{"dtype":"F32","shape":[1],"data_offsets":[0,4]}})",4)),other),"overlap rejected");
     check(!index_safetensors(memory_source(safe(R"({"a":{"dtype":"F32","shape":[9223372036854775807,4],"data_offsets":[0,4]}})",4)),other),"shape overflow rejected");
     check(!index_safetensors(memory_source(safe(R"({"a":{"dtype":"F32","shape":[1],"data_offsets":[4,8]}})",8)),other),"unclaimed hole rejected");
+    {
+        // A rank-5 tensor (Conv3d patch embedding of a vision tower) must not fail the index; it is kept opaque.
+        auto rank5=safe(R"({"vision_tower.patch_embedding.weight":{"dtype":"BF16","shape":[2,3,2,1,1],"data_offsets":[0,24]},"model.layers.0.mlp.down_proj.weight":{"dtype":"BF16","shape":[2,2],"data_offsets":[24,32]}})",32);
+        TensorIndex r5;check(bool(index_safetensors(memory_source(rank5,"model-vision.safetensors"),r5)),"rank-5 safetensors indexed");
+        check(r5.tensors.size()==2,"rank-5 index census");
+        const auto& v=r5.tensors[0].name.starts_with("vision")?r5.tensors[0]:r5.tensors[1];
+        const auto& d=r5.tensors[0].name.starts_with("vision")?r5.tensors[1]:r5.tensors[0];
+        check(v.opaque() && v.shape.rank==0 && v.extents==std::vector<std::uint64_t>({2,3,2,1,1}),"rank-5 tensor opaque with full extents");
+        check(v.wire_dtype=="BF16" && v.payload.range.bytes==24,"opaque tensor keeps dtype and byte range");
+        check(!d.opaque() && d.shape.rank==2 && d.shape.dims[0]==2 && d.shape.dims[1]==2 && d.extents==std::vector<std::uint64_t>({2,2}),"viewable tensor shape unchanged");
+        WeightMap mm;check(bool(bind_minimax(r5,mm)) && mm.size()==1,"family binding skips the opaque tensor and admits the rest");
+        TensorBinding b{};b.tensor=v.id;b.role=Role::embedding;b.expert_axis=UINT32_MAX;b.admitted_formats={{"plain.bf16",1}};
+        WeightMap direct;const auto status=admit(builtin_registry(),{&r5,{&b,1},{}},direct);
+        check(!status && status.code==Error::unsupported_shape,"explicit view of an opaque tensor rejected per tensor");
+        std::string ones;for(unsigned k=0;k<256;++k)ones+=k?",1":"1";
+        check(!index_safetensors(memory_source(safe(R"({"a":{"dtype":"F32","shape":[)"+ones+R"(],"data_offsets":[0,4]}})",4)),other),"absurd rank rejected");
+    }
     check(!index_pack(memory_source(wire),other),"unverified pack schema rejected");
     auto packed=safe(R"({"__metadata__":{"strix.weight.schema":"exl3.mul1.tiles16@1"},"x":{"dtype":"I16","shape":[1],"data_offsets":[0,2]}})",2);
     check(bool(index_pack(memory_source(packed),other)) && other.container==Container::pack,"declared pack indexed without advertising compute");
