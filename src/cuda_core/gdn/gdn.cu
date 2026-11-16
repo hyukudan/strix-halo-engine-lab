@@ -358,7 +358,7 @@ cudaError_t gdn_prefill_layer(const GdnDims& d, const GdnLayer& layer, const Gdn
     if (auto e = cudaGetLastError(); e != cudaSuccess) return e;
     DeltaArgs a{state.delta_base, win.qkv_c, win.a_raw, win.b_raw, layer.ssm_a, layer.dt_bias, layer.norm_gain, z, out,
                 nullptr, nullptr};
-    delta_window_kernel<<<dim3(d.value_heads), 128, 0, stream>>>(a, d, rows, parity_dev, eps);
+    delta_window_kernel<<<dim3(d.value_heads), 128, 0, stream>>>(a, d, rows, parity_dev, eps, GdnSlotTable{});
     if (auto e = cudaGetLastError(); e != cudaSuccess) return e;
     CommitBatch b{};
     b.a[0] = DeltaArgs{state.delta_base, win.qkv_c, win.a_raw, win.b_raw, layer.ssm_a, layer.dt_bias, nullptr, nullptr, nullptr, state.conv, win.raw};
