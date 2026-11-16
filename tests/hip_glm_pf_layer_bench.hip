@@ -10,6 +10,7 @@
 #include "attn_core/sparse_flash_wmma.hpp"
 #include "glm/kernels/glm_dsa.hpp"
 #include "glm/kernels/glm_tier_a.hpp"
+#include "glm/prefill/glm_pf_mla_wmma.hpp"
 #include "glm/prefill/glm_pf_moe.hpp"
 #include "glm/prefill/glm_prefill.hpp"
 #include "strix_trellis.h"
@@ -649,27 +650,26 @@ int main(int argc, char** argv) {
                 std::printf("   flash pipelined loads (STRIX_ATTN_FLASH_PF %d vs %d): o-bar + out bitwise %s\n", pf ? 1 : 0, pf ? 0 : 1,
                             same ? "equal" : "DIFFER");
                 if (!same) die("STRIX_ATTN_FLASH_PF arms differ (must be bitwise)");
-                // FP16 o-bar image (STRIX_GLM_PF_MLA_OB16) vs the FP32 o-bar: the out GEMM output must be the same bits
-                // (both round o / l to FP16 RNE); report the differing elements by row / head if not.
-                const char* hb = std::getenv("STRIX_GLM_PF_MLA_OB16");
-                const std::optional<std::string> kb = hb ? std::optional<std::string>(hb) : std::nullopt;
-                strix::env_arms::set_env("STRIX_GLM_PF_MLA_OB16", std::string("0"));
-                strix::env_arms::generation_ref().fetch_add(1, std::memory_order_acq_rel);
-                P::mla_attention_rows_versions(slot, tok, n, qb, kv_b, kHeadsR, qt, e, ob, mo, C, g_hs, 7, ov[2], gv[2]);
-                hok(hipMemcpyAsync(mo_f.data(), mo, nmo * 4, hipMemcpyDeviceToHost, g_hs), "cp");
-                hok(hipStreamSynchronize(g_hs), "sync");
-                strix::env_arms::set_env("STRIX_GLM_PF_MLA_OB16", kb);
-                strix::env_arms::generation_ref().fetch_add(1, std::memory_order_acq_rel);
+                // FP16 o-bar image vs the FP32 o-bar on the explicit FAST dispatch (WMMA absorb / out): the out GEMM output
+                // must be the same bits (both round o / l to FP16 RNE); report the differing elements if not.
+                std::vector<float> mo_i(nmo);
+                for (unsigned image = 0; image < 2; ++image) {
+                    P::mla_attention_rows_selected(slot, tok, n, qb, kv_b, kHeadsR, qt, e, ob, mo, C, g_hs, 7, 23, 3, 0,
+                                                   {P::mla_gemm::Arithmetic::wmma, image != 0, true});
+                    hok(hipMemcpyAsync(image ? mo_f.data() : mo_i.data(), mo, nmo * 4, hipMemcpyDeviceToHost, g_hs), "cp");
+                    hok(hipStreamSynchronize(g_hs), "sync");
+                }
+                const std::vector<float>& mo_ref = mo_i;
                 std::size_t nd = 0, first = nmo, last = 0;
                 double dmax = 0.0;
                 for (std::size_t i = 0; i < nmo; ++i)
-                    if (std::memcmp(&mo_q32[i], &mo_f[i], sizeof(float)) != 0) {
+                    if (std::memcmp(&mo_ref[i], &mo_f[i], sizeof(float)) != 0) {
                         ++nd;
                         first = std::min(first, i);
                         last = i;
-                        dmax = std::max(dmax, static_cast<double>(std::fabs(mo_q32[i] - mo_f[i])));
+                        dmax = std::max(dmax, static_cast<double>(std::fabs(mo_ref[i] - mo_f[i])));
                     }
-                std::printf("   MLA out, o-bar image OB16 default vs OB16=0: %zu / %zu elements differ (first %zu last %zu, per row %zu, max|d| %.3e)\n",
+                std::printf("   MLA out (FAST wmma dispatch), o-bar FP16 image vs FP32: %zu / %zu elements differ (first %zu last %zu, per row %zu, max|d| %.3e)\n",
                             nd, nmo, nd ? first : 0, nd ? last : 0, nmo / C, dmax);
             }
         }
