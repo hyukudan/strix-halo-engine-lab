@@ -70,8 +70,9 @@ Status enqueue(const Plan&, const WeightView&, const KernelArguments&,
 template<class Args> struct ArgumentTraits; // backend registration supplies schema and ABI
 // An lvalue envelope is consumed synchronously; no temporary launch record may escape.
 template<class Args> KernelArguments arguments(Args& args) {
-  static_assert(std::is_standard_layout_v<Args> && std::is_trivially_copyable_v<Args>);
-  return {ArgumentTraits<Args>::schema, ArgumentTraits<Args>::abi_revision, &args, sizeof(Args)};
+  using Type = std::remove_cv_t<Args>;
+  static_assert(std::is_standard_layout_v<Type> && std::is_trivially_copyable_v<Type>);
+  return {ArgumentTraits<Type>::schema, ArgumentTraits<Type>::abi_revision, &args, sizeof(Type)};
 }
 template<class Args> KernelArguments arguments(const Args&&) = delete;
 bool operator==(const Digest256&, const Digest256&) noexcept;

@@ -54,6 +54,9 @@ bool wfmt_resolve_test() {
     if (resolve(reg,r,std::span(candidates.data(),1),{},out)) return false;
     r.maximum_permission=Exactness::fast; r.allow_fast=true;
     if (!resolve(reg,r,std::span(candidates.data(),1),{},out)) return false;
+    // A specifically requested historical FAST route is still its own migration baseline.
+    r.maximum_permission=Exactness::legacy_bitwise;
+    if (!resolve(reg,r,std::span(candidates.data(),1),{},out) || out.selected.exactness!=Exactness::fast) return false;
     r.maximum_permission=Exactness::operand_exact;
     if (resolve(reg,r,std::span(candidates.data(),1),{},out)) return false;
     double us=0; if (estimate_cost(old,r.hardware,r.workload,us) || !std::isnan(us)) return false;

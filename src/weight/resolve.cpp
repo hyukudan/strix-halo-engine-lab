@@ -40,7 +40,7 @@ Status eligible(const ResolveRequest& r, const Candidate& c) {
         return {Error::unsupported_arithmetic, "operand-exact permission is restricted to operand tests"};
     if (c.exactness == Exactness::operand_exact && r.maximum_permission != Exactness::operand_exact)
         return {Error::unsupported_arithmetic, "operand tests cannot become a model execution path"};
-    if (c.exactness == Exactness::fast && (!r.allow_fast || r.maximum_permission != Exactness::fast))
+    if (c.exactness == Exactness::fast && (!r.allow_fast || r.maximum_permission == Exactness::operand_exact))
         return {Error::unqualified, "FAST requires explicit permission and named arithmetic"};
     if ((c.required_isa & r.hardware.isa_mask) != c.required_isa) return {Error::unavailable_isa, "required ISA is unavailable"};
     if (c.resources.registers > r.hardware.registers_per_thread_limit && r.hardware.registers_per_thread_limit)
