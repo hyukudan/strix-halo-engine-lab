@@ -105,6 +105,8 @@ constexpr Item kItems[] = {
      "Prefill: exact (== strix_gemm bitwise, the pf_dense_qkv contract); dense MLP of layers 0-2 on the v4 core for 4096-row pieces"},
     {"pf_flash_keys", "STRIX_MM_PF_FLASH_KEYS", "2", "0",
      "Prefill: schedule only, same bits (FAST flash output fnv identical); key fragments in two halves around the value loads (attn_core kKsKeysHalves)"},
+    {"pf_msa_rg_rows", "STRIX_MM_PF_MSA_RG_ROWS", "auto", "4",
+     "Prefill: schedule only, same bits (row-group flash mode 3 output independent of rows); auto = 8 rows per work-group on dense windows, 4 on sparse rows (attn_core RowGroup Rows; bench scripts/bench/mmattn)"},
     {"pf_headless", "STRIX_MM_PF_HEADLESS", "1", "0",
      "Prefill: exact (state + final rows fnv identical); last layer cache-only for every chunk but the last (strix/prefill_headless.hpp)"},
     {"pf_attend4", "STRIX_MM_PF_ATTEND4", "1", "0", "Prefill measurement: exact, pfall TTFT 1K -17 %, 8K -20 %"},
