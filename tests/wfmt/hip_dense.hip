@@ -13,6 +13,7 @@
 #if __has_include("../../src/hip/weight/registry.hpp")
 #include "../../src/hip/weight/registry.hpp"
 #include "strix/weight/source.hpp"
+#include "strix/weight/registry.hpp"
 #define WFMT_HAS_NATIVE_SOURCES 1
 #endif
 #ifdef STRIX_WFMT_CAPTURE
@@ -225,9 +226,9 @@ int main() try {
     static_assert(std::is_trivially_copyable_v<wh::MatrixView>);
     auto fixture=weights(128U,17U);
     strix::weight::WeightView view{};
-    view.storage={"gguf.q8_0",1};view.shape={{{128U,17U,0U,0U}},2};
+    view.storage={"gguf.q8_0",1};view.shape={{17U,128U,0U,0U},2};
     view.payload={strix::weight::memory_source(std::as_bytes(std::span(fixture))),{0U,fixture.size()}};
-    view.has_byte_strides=true;view.byte_strides={1U,136U,0U,0U};
+    if(!strix::weight::format_geometry(view.storage,view.parameters,view.geometry)) throw std::runtime_error("Q8 source geometry");
     wh::LaunchShape shape{1U,17U,128U,136U,128U,17U,0U};
     const auto* registered=wh::find_source(view.storage,"f16-tile");
     if(wh::sources().size()!=6U || !registered || !registered->validate(view,shape)) throw std::runtime_error("HIP source registration validation");
