@@ -27,7 +27,7 @@ constexpr Iu4Plan iu4_plan(unsigned R, unsigned G) {
 }
 
 // Grid: one block per (segment, 64 output columns); G = K / 64 groups in G / GC passes, S waves split each pass.
-template <class Site, unsigned S, unsigned G, unsigned GC, bool FromSlot>
+template <class Site, unsigned S, unsigned G, unsigned GC, bool FromSlot, bool SingleDecode = false>
 __global__ __launch_bounds__(32 * S) void project_rows_iu4_kernel(Site site, Iu4Weights weights, const std::int8_t* codes,
                                                                   const float* deltas) {
     constexpr unsigned R = Site::rows, K = G * 64U, Kc = GC * 64U, MaxG = GC / S, Threads = 32U * S;
@@ -66,7 +66,9 @@ __global__ __launch_bounds__(32 * S) void project_rows_iu4_kernel(Site site, Iu4
             }
         __syncthreads();
         const unsigned kl = wave * MaxG * 4U, k0 = pass * GC * 4U + kl;
-        constexpr unsigned Rc = R >= 7U ? 4U : R;  // the second half re-reads the wave's weights from L1 / L2
+        // Keep each row's dot/group/reduction order unchanged. The full-row form
+        // reuses the same nibble decode across both halves; the control limits VGPR use.
+        constexpr unsigned Rc = R >= 7U && !SingleDecode ? 4U : R;
 #pragma unroll
         for (unsigned h = 0; h * Rc < R; ++h)
             core::w4a16::wave_rows<Rc, MaxG * 4U, MaxG>(wq, ws, n_pad, K, k0, k0 + MaxG * 4U, quad * 4U, xs + h * Rc * Kc + kl * 16U, Kc,
@@ -116,8 +118,18 @@ template <class Site> bool launch_iu4_rows(const Site& site, hipStream_t stream,
                 else hipLaunchKernelGGL(kernel, dim3(blocks), dim3(32U * S), 0, stream, site, w, codes, deltas);
             };
             if constexpr (Site::rows * GC * 128U <= kIu4StageBytes) {  // staged FP16 rows must fit the LDS budget
-                if (slot) go(project_rows_iu4_kernel<Site, S, G, GC, true>, slot->codes, slot->deltas);
-                else go(project_rows_iu4_kernel<Site, S, G, GC, false>, nullptr, nullptr);
+                if constexpr (Site::rows >= 7U) {
+                    if (strix::envcfg::flag("STRIX_IU4_R8_SINGLE_DECODE", false)) {
+                        if (slot) go(project_rows_iu4_kernel<Site, S, G, GC, true, true>, slot->codes, slot->deltas);
+                        else go(project_rows_iu4_kernel<Site, S, G, GC, false, true>, nullptr, nullptr);
+                    } else {
+                        if (slot) go(project_rows_iu4_kernel<Site, S, G, GC, true>, slot->codes, slot->deltas);
+                        else go(project_rows_iu4_kernel<Site, S, G, GC, false>, nullptr, nullptr);
+                    }
+                } else {
+                    if (slot) go(project_rows_iu4_kernel<Site, S, G, GC, true>, slot->codes, slot->deltas);
+                    else go(project_rows_iu4_kernel<Site, S, G, GC, false>, nullptr, nullptr);
+                }
             }
         };
         switch (width / 64U) {

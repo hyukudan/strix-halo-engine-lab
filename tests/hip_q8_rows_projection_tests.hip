@@ -287,14 +287,14 @@ float median_us(const Fixture& f, Mode mode, bool cold, const Buffer& flush, hip
     return samples[samples.size() / 2U];
 }
 // Diagnostic only: one load-time conversion per fixture; native and IU4 use the same production site.
-// Bandwidth is logical unique weight bytes / GPU event time, not measured DRAM traffic. At rows 7/8
-// the IU4 kernel loads its weights twice through the cache; report that separately from unique bytes.
+// Bandwidth is logical unique weight bytes / GPU event time, not measured DRAM traffic.
+// Compare both row-half policies bytewise before timing the requested policy.
 void onfly_decode_bench(hipStream_t stream) {
     Buffer flush(256ULL << 20U);
     check(hipMemset(reinterpret_cast<void*>(flush.address), 1, flush.bytes), "init flush");
     for (const auto site : sites) {
         const auto [width, outputs] = model_shape(site);
-        for (const unsigned rows : {1U, 2U, 4U, 8U}) {
+        for (const unsigned rows : {1U, 2U, 4U, 7U, 8U}) {
             Fixture f(site, rows, width, outputs); f.prepare(0);
             const auto exact = f.run(Mode::rows, stream);
             const auto exact_a8 = f.run(Mode::rows_a8, stream);
@@ -312,6 +312,16 @@ void onfly_decode_bench(hipStream_t stream) {
                 require(f.run(Mode::rows, stream) == exact, "onfly benchmark native arm changed bits");
                 require(f.run(Mode::rows_a8, stream) == exact_a8, "onfly benchmark native A8 arm changed bits");
             }
+            const bool single_decode = envcfg::flag("STRIX_IU4_R8_SINGLE_DECODE", false);
+            if (rows >= 7U) {
+                for (const auto mode : {Mode::rows, Mode::rows_a8}) {
+                    require(setenv("STRIX_IU4_R8_SINGLE_DECODE", "0", 1) == 0, "set row-half control");
+                    const auto control = f.run(mode, stream);
+                    require(setenv("STRIX_IU4_R8_SINGLE_DECODE", "1", 1) == 0, "set single-decode candidate");
+                    require(f.run(mode, stream) == control, "single-decode R7/R8 changed output bits");
+                }
+                require(setenv("STRIX_IU4_R8_SINGLE_DECODE", single_decode ? "1" : "0", 1) == 0, "restore row-half policy");
+            }
             for (const bool cold : {true, false}) for (const auto mode : {Mode::rows, Mode::rows_a8}) {
                 float native_us = 0.0F;
                 {
@@ -327,7 +337,8 @@ void onfly_decode_bench(hipStream_t stream) {
                     << " native_us=" << native_us << " onfly_us=" << onfly_us << " native_bytes=" << f.weights.bytes
                     << " onfly_bytes=" << bytes << " native_GBs=" << static_cast<double>(f.weights.bytes) / native_us / 1000.0
                     << " onfly_GBs=" << static_cast<double>(bytes) / onfly_us / 1000.0 << " iu4_launches=" << launches
-                    << " pack_loads=" << (launches && rows >= 7U ? 2U : 1U) << '\n';
+                    << " pack_loads=" << (launches && rows >= 7U && !single_decode ? 2U : 1U)
+                    << " single_decode=" << single_decode << " row_policy_bitwise=1" << '\n';
             }
             q6p::iu4::unregister_tensor(original, base);
         }
