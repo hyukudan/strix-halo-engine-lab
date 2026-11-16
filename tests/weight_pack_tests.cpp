@@ -35,6 +35,24 @@ Inv layer(std::uint32_t gate, std::uint32_t up, std::uint32_t down, std::uint32_
 int main() {
     using strix::qwen_packs::admit;
     {
+        const auto inv=layer(t::iq3_s,t::iq3_s,t::iq4_nl,t::q6_k,t::bf16);
+        const auto legacy=admit(inv.view());
+        const auto selected=admit(inv.view(),strix::qwen_packs::gsq_a8_contract);
+        check(legacy.pack && legacy.pack->id=="qwen38-gsq-rco-iq3s-v1","omitted arithmetic preserves native pack");
+        check(selected.pack && selected.pack->id=="qwen38-gsq-rco-iq3s-a8-v1","explicit A8 selects supported GSQ pack");
+        check(selected.pack && selected.pack->arithmetic=="fast:gsq-iq3s-a8-dot4-cuda-v1","GSQ A8 names new FAST contract");
+        check(selected.fingerprint==legacy.fingerprint,"arithmetic selection retains source inventory identity");
+        check(!admit(inv.view(),"unknown-arithmetic").pack,"unknown arithmetic cannot fall back");
+        const auto wrong=layer(t::q4_k,t::q4_k,t::q8_0,t::q8_0,t::bf16);
+        check(!admit(wrong.view(),strix::qwen_packs::gsq_a8_contract).pack,"explicit GSQ rejects legacy arithmetic storage");
+        const auto mismatch=layer(t::iq3_s,t::iq2_s,t::iq4_nl,t::q6_k,t::bf16);
+        check(!admit(mismatch.view(),strix::qwen_packs::gsq_a8_contract).pack,"GSQ paired source types remain required");
+        std::vector<strix::weight_pack::Tensor> empty;
+        check(!admit(empty,strix::qwen_packs::gsq_a8_contract).pack,"GSQ empty pack rejected");
+        const auto no_experts=std::vector<strix::weight_pack::Tensor>{{"output.weight",t::q8_0,inv.dims}};
+        check(!admit(no_experts,strix::qwen_packs::gsq_a8_contract).pack,"GSQ arithmetic requires expert graph");
+    }
+    {
         const auto inv = layer(t::q4_k, t::q4_k, t::q5_1, t::q8_0, t::q8_0);
         const auto a = admit(inv.view());
         check(a.pack && a.pack->id == "qwen38-ud-q4kxl-a8-v1", "product file -> product pack");

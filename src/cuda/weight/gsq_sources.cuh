@@ -173,7 +173,7 @@ template<unsigned T> struct GsqDecode {
         const float d=quant::detail::fp16(std::uint16_t(x[0])|(std::uint16_t(x[1])<<8));
         b=0.0F;
         if constexpr(T==20 || T==42) a=d;
-        if constexpr(T==21) a=d*float(1+2*int((x[106+s/2]>>(4*(s%2)))&15));
+        if constexpr(T==21) a=d*float(1+2*int((x[::strix::weight::formats::Iq3S::scales+s/2]>>(4*(s%2)))&15));
         if constexpr(T==18) {
             const unsigned off=66+4*s;
             const unsigned aux=unsigned(x[off])|(unsigned(x[off+1])<<8)|(unsigned(x[off+2])<<16)|(unsigned(x[off+3])<<24);
@@ -194,10 +194,11 @@ template<unsigned T> struct GsqDecode {
             return int(quant::detail::kvalue((qs[k%16]>>(4*(k/16)))&15));
         }
         if constexpr(T==21) {
-            const unsigned l=k/8,j=k%8,qh=x[66+s];
-            const unsigned idx=x[2+8*s+2*l+j/4]|((qh<<(8-2*l-j/4))&256);
+            using Iq=::strix::weight::formats::Iq3S;
+            const unsigned l=k/8,j=k%8,qh=x[Iq::qh+s];
+            const unsigned idx=x[Iq::qs+8*s+2*l+j/4]|((qh<<(8-2*l-j/4))&256);
             const unsigned grid=quant::detail::iq3s_grid(idx);
-            return int((grid>>(8*(j%4)))&255)*((x[74+4*s+l]>>j)&1?-1:1);
+            return int((grid>>(8*(j%4)))&255)*((x[Iq::signs+4*s+l]>>j)&1?-1:1);
         }
         if constexpr(T==18) {
             const unsigned off=66+4*s;
