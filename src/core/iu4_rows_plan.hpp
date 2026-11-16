@@ -8,6 +8,9 @@
 namespace strix::core::iu4_rows {
 
 struct Iu4Plan { unsigned S, GC; };
+constexpr bool supports_groups(unsigned groups) {
+    return groups == 32U || groups == 40U || groups == 64U || groups == 96U;
+}
 enum class SingleDecodePolicy { split, automatic, force };
 inline SingleDecodePolicy parse_single_decode_policy(std::string_view value) {
     if (value.empty() || value == "0") return SingleDecodePolicy::split;
@@ -32,7 +35,7 @@ constexpr bool staged_single_decode_admitted(unsigned rows, unsigned groups) {
 }
 // force is diagnostic: measure every legal group before qualifying a crossover.
 constexpr bool single_decode_applies(unsigned rows, unsigned groups, SingleDecodePolicy policy) {
-    if (rows < 7U || rows > 8U || (groups != 32U && groups != 40U && groups != 64U && groups != 96U)) return false;
+    if (rows < 7U || rows > 8U || !supports_groups(groups)) return false;
     return policy == SingleDecodePolicy::force ||
            (policy == SingleDecodePolicy::automatic && staged_single_decode_admitted(rows, groups));
 }

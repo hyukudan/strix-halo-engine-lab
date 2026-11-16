@@ -2,6 +2,7 @@
 // (CLI and server resolve one request through one function), cache identity and the q6p::iu4 registry.
 #include "../apps/qwen_effective_config.hpp"
 #include "core/iu4_onfly.hpp"
+#include "strix/qwen_onfly_i4.hpp"
 #include "strix/q6p_registry.hpp"
 
 #include <cmath>
@@ -172,6 +173,45 @@ int main() {
     expect(onfly_i4::classify("blk.3.attn_qkv.weight") == onfly_i4::gdn_in && onfly_i4::classify("blk.3.ssm_out.weight") == onfly_i4::gdn_out &&
            onfly_i4::classify("blk.3.attn_output.weight") == onfly_i4::qsa_io && onfly_i4::classify("blk.3.ffn_down_shexp.weight") == onfly_i4::shared_expert &&
            onfly_i4::classify("blk.3.ffn_gate_inp.weight") == 0U && onfly_i4::classify("token_embd.weight") == 0U, "tensor groups");
+
+    // The loader and admission reserve the same consumed images. A mixed-layer
+    // manifest catches unused copies being counted even when every shape is a
+    // valid Q8 matrix: shared-down K640 has no small-row IU4 consumer.
+    ModelManifest copy_manifest;
+    const auto add_projection = [&](const std::string& name, std::uint64_t k, std::uint64_t n) {
+        ManifestTensor t;
+        t.name = name; t.dimensions = {k, n}; t.ggml_type = 8U;
+        t.byte_size = n * (k / 32U) * 34U;
+        copy_manifest.tensors.push_back(t);
+    };
+    for (unsigned layer = 0; layer < 48U; ++layer) {
+        const auto prefix = "blk." + std::to_string(layer) + ".";
+        if (layer < 36U) {
+            add_projection(prefix + "attn_qkv.weight", 2560U, 10240U);
+            add_projection(prefix + "attn_gate.weight", 2560U, 6144U);
+            add_projection(prefix + "ssm_out.weight", 6144U, 2560U);
+        } else {
+            add_projection(prefix + "attn_q.weight", 2560U, 12288U);
+            add_projection(prefix + "attn_k.weight", 2560U, 512U);
+            add_projection(prefix + "attn_v.weight", 2560U, 512U);
+            add_projection(prefix + "attn_output.weight", 6144U, 2560U);
+        }
+        add_projection(prefix + "ffn_gate_shexp.weight", 2560U, 640U);
+        add_projection(prefix + "ffn_up_shexp.weight", 2560U, 640U);
+        add_projection(prefix + "ffn_down_shexp.weight", 640U, 2560U);
+    }
+    const auto all_copies = onfly_i4::resolve({}, no_env, true);
+    std::size_t copied_tensors = 0;
+    std::uint64_t loader_copy_bytes = 0;
+    for (const auto& t : copy_manifest.tensors) if (qwen_onfly_i4_candidate(t, all_copies)) {
+        ++copied_tensors;
+        loader_copy_bytes += core::onfly::copy_bytes(t.dimensions[1], t.dimensions[0]);
+    }
+    expect(copy_manifest.tensors.size() == 300U && copied_tensors == 252U, "only consumed projection tensors get copies");
+    expect(loader_copy_bytes == 1504051200ULL && qwen_onfly_i4_reservation(copy_manifest, all_copies) == loader_copy_bytes,
+           "reservation matches loader-selected images without unused shared-down copies");
+    expect(qwen_onfly_i4_reservation(copy_manifest, onfly_i4::resolve({}, no_env, false)) == 0U,
+           "native reserves no INT4 images");
 
     // One resolver for the CLI and the server: the same request through Options + environment (what both build) agrees,
     // the identity enters the cache argv, native keeps the historical argv.
