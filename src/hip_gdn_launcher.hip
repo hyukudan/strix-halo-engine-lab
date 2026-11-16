@@ -8136,7 +8136,7 @@ __global__ void normalize_qk_rows_kernel(float* qkv, std::uint32_t key_heads, st
                       static_cast<std::uint32_t*>(nullptr), blockIdx.x, scratch);
 }
 static bool gdn_dims_row_launch() {
-    static const bool on = [] { const char* e = std::getenv("STRIX_GDN_DIMS_ROW_LAUNCH"); return e && e[0] == '1'; }();
+    static const bool on = strix::envcfg::flag("STRIX_GDN_DIMS_ROW_LAUNCH", false);
     return on;
 }
 

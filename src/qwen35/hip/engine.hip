@@ -17,6 +17,7 @@
 #include <string>
 #include <vector>
 
+#include "strix/env_flags.hpp"
 #include "strix/gguf_reader.hpp"
 #include "strix/hip_gdn_dims.hpp"
 #include "../../attn_core/dense_decode.hpp"
@@ -355,7 +356,7 @@ struct HipEngine::Impl {
     std::size_t fws_floats = 0;
     unsigned* ffail = nullptr;
     bool wide_flash(unsigned n) const {
-        static const bool off = [] { const char* e = std::getenv("STRIX_Q35_WIDE_ATTN"); return e && std::string(e) == "decode"; }();
+        static const bool off = strix::envcfg::choice("STRIX_Q35_WIDE_ATTN", {"flash", "decode"}, 0) == 1;
         return n > kMaxRows && vt_stride && !off;
     }
 
