@@ -205,11 +205,8 @@ cudaError_t attention_prefill_flash(const AttentionDims& d, const float* q, cons
                                     float* out, cudaStream_t stream) {
     if (d.head_dim != D || rows == 0 || d.kv_heads == 0 || d.heads % d.kv_heads != 0 || d.heads / d.kv_heads > 8 || pos0 + rows > d.max_positions)
         return cudaErrorInvalidValue;
-    static bool attr = false;
-    if (!attr) {
-        if (auto e = cudaFuncSetAttribute(flash_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM_BYTES); e != cudaSuccess) return e;
-        attr = true;
-    }
+    // Attributes belong to the current device; CUDA serializes the update.
+    if (auto e = cudaFuncSetAttribute(flash_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM_BYTES); e != cudaSuccess) return e;
     flash_kernel<<<dim3((rows + QB - 1) / QB, d.heads), 256, SMEM_BYTES, stream>>>(d, q, qv, gate, gv, k_cache, v_cache, pos0, rows, out);
     return cudaGetLastError();
 }

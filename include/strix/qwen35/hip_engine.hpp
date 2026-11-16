@@ -33,6 +33,7 @@ struct HipRowsOut {
 
 class HipEngine {
 public:
+    using LogitRows = qwen35::LogitRows;
     ~HipEngine();
     HipEngine(const HipEngine&) = delete;
     HipEngine& operator=(const HipEngine&) = delete;

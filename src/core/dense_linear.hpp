@@ -12,6 +12,23 @@
 #include <string_view>
 
 namespace strix::core {
+// Exact small-row sweeps: never round a logical tail up into adjacent storage.
+template <class F>
+void dense_row_sweeps(unsigned rows, F&& run) {
+    unsigned offset = 0;
+    for (unsigned tile = 16; tile; tile /= 2)
+        while (rows - offset >= tile) {
+            run(offset, tile);
+            offset += tile;
+        }
+}
+
+// Non-owning execution scratch view; its backend context owns the allocations.
+struct DenseWideScratch {
+    std::int8_t* codes = nullptr;
+    float *deltas = nullptr, *g = nullptr, *u = nullptr;
+};
+
 // Host admission for embedding/dense inputs, shared by backend adapters.
 inline std::uint32_t parse_u32(std::string_view text) {
     std::uint32_t value = 0;
