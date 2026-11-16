@@ -77,6 +77,7 @@ inline constexpr PrefillLever kPrefillLevers[] = {
     {"STRIX_DS41_COMPRESS_AHEAD", PrefillLeverClass::cached},
     {"STRIX_DS41_COMPRESS_FAST", PrefillLeverClass::cached},
     {"STRIX_DS41_COMPRESS_RING", PrefillLeverClass::reload},
+    {"STRIX_DS41_COPY_ROWS", PrefillLeverClass::reload},  // startup pair resolver (deepseek41_pair_defaults) reads/exports it once
     {"STRIX_DS41_DECODE_PREFETCH", PrefillLeverClass::reload},
     {"STRIX_DS41_DECODE_XPORT", PrefillLeverClass::reload},  // startup resolver applies this policy before resident arms
     {"STRIX_DS41_DEFER_DECODER", PrefillLeverClass::cached},
@@ -120,6 +121,7 @@ inline constexpr PrefillLever kPrefillLevers[] = {
     {"STRIX_DS41_F16_TILED", PrefillLeverClass::reload},
     {"STRIX_DS41_F16_WIDE", PrefillLeverClass::reload},
     {"STRIX_DS41_FAST_ATTN", PrefillLeverClass::reload},  // startup pair resolver (deepseek41_pair_defaults) reads/exports it once
+    {"STRIX_DS41_FAST_ATTN_Q16", PrefillLeverClass::reload},  // static once per process (hip_deepseek41_prefill.hip)
     {"STRIX_DS41_FAST_DENSE", PrefillLeverClass::reload},  // startup pair resolver (deepseek41_pair_defaults) reads/exports it once
     {"STRIX_DS41_FAST_DENSE_MIN_ROWS", PrefillLeverClass::reload},  // startup pair resolver (deepseek41_pair_defaults) reads/exports it once
     {"STRIX_DS41_FAST_ENGRAM", PrefillLeverClass::reload},  // startup pair resolver exports the Engram policy
@@ -223,6 +225,7 @@ inline constexpr PrefillLever kPrefillLevers[] = {
     {"STRIX_DS41_SHARED_DOWN_FUSED", PrefillLeverClass::reload},  // admission at load; route frozen once used
     {"STRIX_DS41_SHARED_GROUPED", PrefillLeverClass::reload},  // admission at load
     {"STRIX_DS41_SHEXP_TP", PrefillLeverClass::reload},
+    {"STRIX_DS41_SPEC_ARBITER", PrefillLeverClass::reload},  // startup pair resolver (deepseek41_pair_defaults) reads/exports it once
     {"STRIX_DS41_SPLIT_SHARED", PrefillLeverClass::reload},
     {"STRIX_DS41_TOUCH_BATCH", PrefillLeverClass::cached},
     {"STRIX_DS41_TP_DOWN", PrefillLeverClass::reload},
