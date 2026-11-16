@@ -20,6 +20,7 @@
 #include "strix/cuda_core/dense_big.hpp"
 #include "strix/cuda_core/rope.hpp"
 #include "strix/gguf_reader.hpp"
+#include "strix/wave_fit.hpp"
 #include "../../core/dense_linear.hpp"
 
 namespace cc = strix::cuda_core;
@@ -955,6 +956,24 @@ struct CudaEngine::Impl {
         CK(cc::dense_big_reserve(C, std::max(c.intermediate, H), static_cast<std::uint64_t>(c.intermediate) * H, 3, sl.bc));
     }
 
+    // Rows per prefill step: opt.prefill_chunk, or for prompts >= opt.prefill_wave_min_tokens the wave-aligned rows of the
+    // flash grid (strix/wave_fit.hpp; <= prefill_chunk, so the slot buffers are unchanged). Scheduling only.
+    std::uint32_t pf_wave_rows = 0;  // resolved once per engine (device geometry)
+    std::uint32_t pf_step_rows(std::uint32_t n) {
+        const std::uint32_t C = opt.prefill_chunk;
+        if (opt.prefill_wave_min_tokens == 0 || n < opt.prefill_wave_min_tokens) return C;
+        if (pf_wave_rows == 0) {
+            cc::AttentionDims d{};
+            d.heads = c.heads;
+            cc::FlashGrid g{};
+            int dev = 0;
+            CK(cudaGetDevice(&dev));
+            CK(cc::attention_prefill_flash_grid(d, opt.flash_pipe, dev, &g));
+            pf_wave_rows = strix::wave_fit::rows({g.tile_rows, g.ctas_per_tile, g.sms, g.ctas_per_sm}, C, std::min<std::uint32_t>(C, 1024U), 128U);
+        }
+        return pf_wave_rows;
+    }
+
     void pf_init(std::uint32_t nslots) {
         if (pf.C != opt.prefill_chunk && !pf.sl.empty()) throw std::runtime_error("prefill: prefill_chunk cannot change after the first prefill");
         pf.C = opt.prefill_chunk;
@@ -1090,7 +1109,7 @@ struct CudaEngine::Impl {
             }
             return o;
         }
-        const std::uint32_t C = opt.prefill_chunk, nchunks = (n + C - 1) / C, H = c.hidden;
+        const std::uint32_t C = pf_step_rows(n), nchunks = (n + C - 1) / C, H = c.hidden;  // C <= opt.prefill_chunk (buffers)
         pf_init(std::min<std::uint32_t>(std::max<std::uint32_t>(1, opt.prefill_slots), nchunks));
         pf.terms = pf_terms();
         if (attn8_on()) {
@@ -1293,6 +1312,9 @@ void print_effective_config(const EngineOptions& o, const char* arith, std::FILE
                  o.turbo_bits, o.turbo_weights == TurboWeights::onfly ? (o.turbo_lm_head ? "nvfp4" : "bf16") : "n/a", o.multi_gemv ? "on" : "off");
     if (o.turbo_weights == TurboWeights::onfly)
         std::fprintf(f, "  format: NVFP4 e2m1 + e4m3/16 + FP32 global; RTN; GEMV f16 mma, FP32 accumulate, activations RN f16, rows 1..32 bitwise row-invariant\n");
+    if (o.prefill_wave_min_tokens == 0) std::fprintf(f, "  prefill-wave-steps: off (steps of prefill_chunk; --prefill-wave-min N turns it on)\n");
+    else std::fprintf(f, "  prefill-wave-steps: prompts >= %u tokens step by wave-aligned rows <= prefill_chunk (scheduling only, bitwise)\n",
+                      o.prefill_wave_min_tokens);
     std::fprintf(f, "  prefill-flash-pipe: %s (scheduling only, bitwise equal across pipes)\n  prefill-attn8: %s\n",
                  o.flash_pipe == cuda_core::FlashPipe::swz3 ? "swz3" : "pad2",
                  o.prefill_arith == PrefillArith::exact ? "n/a (exact prefill keeps attention_decode)"

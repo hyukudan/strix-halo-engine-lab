@@ -160,7 +160,7 @@ int main(int argc, char** argv) {
         std::string arith_name = "mma3";
         std::string flash_pipe, pf_attn8, dump_cont;
         std::string pf_arith, pf_dump;            // --prefill-arith exact|flash|fast|fast2: large-M prefill (absent: windows of --rows)
-        std::uint32_t pf_chunk = 2048, pf_repeat = 1, pf_slots = 2;
+        std::uint32_t pf_chunk = 2048, pf_repeat = 1, pf_slots = 2, pf_wave_min = 0;
         for (int i = 1; i < argc; ++i) {
             const std::string a = argv[i];
             auto next = [&]() -> std::string {
@@ -180,6 +180,7 @@ int main(int argc, char** argv) {
             else if (a == "--flash-pipe") flash_pipe = next();         // pad2|swz3 (bitwise equal; scheduling only)
             else if (a == "--prefill-attn8") pf_attn8 = next();        // on|off: e4m3 flash attention (FAST, identity -a8)
             else if (a == "--prefill-chunk") pf_chunk = strix::core::parse_u32(next());
+            else if (a == "--prefill-wave-min") pf_wave_min = strix::core::parse_u32(next());  // 0 = off; wave-aligned steps
             else if (a == "--prefill-dump") pf_dump = next();  // last-token logits of the LAST prefill (float32 [vocab])
             else if (a == "--prefill-slots") pf_slots = strix::core::parse_u32(next());
             else if (a == "--prefill-repeat") pf_repeat = strix::core::parse_u32(next());
@@ -255,6 +256,7 @@ int main(int argc, char** argv) {
             else if (pf_arith == "fast8") opt.prefill_arith = q::PrefillArith::fast8;
             else throw std::runtime_error("--prefill-arith expects windows|exact|flash|fast|fast2|fast8");
             opt.prefill_chunk = pf_chunk;
+            opt.prefill_wave_min_tokens = pf_wave_min;
             opt.prefill_slots = pf_slots;
         }
         if (flash_pipe == "swz3") opt.flash_pipe = strix::cuda_core::FlashPipe::swz3;
