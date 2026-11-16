@@ -689,8 +689,11 @@ struct ApiService::Impl {
         out.set("prefill_progress", Json(config.engine_progress));
         out.set("thinking_budget", Json(config.engine_thinking_budget));
         out.set("thinking_budget_policy", config.engine_thinking_budget ? Json("thinking-budget-v1") : Json());
+        out.set("prompt_logprobs", Json(config.engine_prompt_logprobs));
         out.set("logprobs", Json(config.engine_logprobs)); out.set("penalties", Json(config.engine_logit_transforms)); out.set("logit_bias", Json(config.engine_logit_transforms));
-        Json scoring = Json::object(); scoring.set("max_top_logprobs", Json(20)); scoring.set("basis", Json("target-row-log-softmax")); scoring.set("execution", Json("serial-host"));
+        Json scoring = Json::object(); scoring.set("max_top_logprobs", Json(20)); scoring.set("basis", Json("target-row-log-softmax")); scoring.set("execution", Json(config.scoring_execution));
+        scoring.set("precision", Json(config.scoring_precision)); scoring.set("values", Json(config.engine_logit_transforms ? "raw, or transformed when logit transforms are active" : "raw"));
+        scoring.set("prompt_logprobs", Json(config.engine_prompt_logprobs));
         if (config.engine_logprobs) out.set("scoring", std::move(scoring));
         if (config.engine_logit_transforms) { Json t = Json::object(); t.set("identity", Json("logit-transform-v1")); t.set("execution", Json("serial-host")); t.set("sampling", Json(false)); out.set("logit_transforms", std::move(t)); }
         out.set("json_object", Json(config.engine_constraints));
@@ -1186,6 +1189,8 @@ struct ApiService::Impl {
             if (completion && n > 0) bad("top_logprobs", "completions uses logprobs in [0,5]");
             top = completion ? top : static_cast<std::uint32_t>(n); scores = scores || top > 0;
         }
+        if (const auto* v = body.find("prompt_logprobs"); v && !v->is_null() && !config.engine_prompt_logprobs)
+            bad("prompt_logprobs", "this engine does not score prompt tokens (see /v1/capabilities)");
         if (scores && !config.engine_logprobs) bad(body.find("logprobs") || body.find("include") ? "logprobs" : "top_logprobs", "this engine does not execute logprobs (see /v1/capabilities)");
         if (t.active() && !config.engine_logit_transforms) bad(t.presence != 0 ? "presence_penalty" : t.frequency != 0 ? "frequency_penalty" : t.repetition != 1 ? "repetition_penalty" : "logit_bias", "this engine does not execute logit transforms (see /v1/capabilities)");
         if (!scores && !t.active()) return base;
@@ -1291,7 +1296,7 @@ struct ApiService::Impl {
         spec->thinking = std::move(thinking);
         return spec;
     }
-    static void selection_json(Json& out, const ConstraintSpec& spec, const ConstraintVerdict& verdict) {
+    void selection_json(Json& out, const ConstraintSpec& spec, const ConstraintVerdict& verdict) const {
         out.set("selection_execution",Json(verdict.execution));
         out.set("selection_fallback",verdict.execution_fallback.empty()?Json():Json(verdict.execution_fallback));
         if (spec.transform.active()) {
@@ -1301,6 +1306,9 @@ struct ApiService::Impl {
         }
         if (spec.logprobs) {
             Json scoring = Json::object(); scoring.set("basis", Json("target-row-log-softmax"));
+            scoring.set("execution", Json(config.scoring_execution));
+            scoring.set("precision", Json(config.scoring_precision));
+            scoring.set("values", Json(spec.transform.active() ? "transformed" : "raw"));
             scoring.set("transform", Json(spec.transform.active() ? "logit-transform-v1" : "none")); scoring.set("constrained", Json(bool(spec.program)));
             out.set("scoring", std::move(scoring));
         }
@@ -1629,8 +1637,8 @@ struct ApiService::Impl {
             config.timed_completion_envelope ? "invalid_request_error" : "server_error", o.error, "", o.stats.error_code);
     }
     // "return_token_ids": true adds the generated token IDs (stop token included) for exactness checks.
-    static Json engine_json(const Outcome& o, const std::string& note, const Json& body) { return with_media(engine_json_text(o, note, body)); }
-    static Json engine_json_text(const Outcome& o, const std::string& note, const Json& body) {
+    Json engine_json(const Outcome& o, const std::string& note, const Json& body) const { return with_media(engine_json_text(o, note, body)); }
+    Json engine_json_text(const Outcome& o, const std::string& note, const Json& body) const {
         Json e = Json::object();
         if (bool_or(body, "return_token_ids", false)) {
             Json ids = Json::array();

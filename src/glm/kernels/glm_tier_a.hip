@@ -6,6 +6,7 @@
 #include "strix/hip_qwen_dpp_reduce.hpp"
 #include "moe_core/route.hpp"
 #include "../../ops/norm/norm_device.hpp"
+#include "../../core/ordered_reduce.hpp"
 
 #include <stdexcept>
 #include <string>
@@ -29,18 +30,10 @@ __device__ __forceinline__ void flag_if(unsigned* flag, float v) {
     if (flag && !is_finite(v)) atomicOr(flag, 1U);
 }
 
-// R2 tree in LDS over L lanes (s has L entries; lane l holds its partial). Returns s[0] to every lane.
+// R2 tree over L lanes (s has L entries; lane l holds its partial). Returns s[0] to every lane. The halving order
+// s[l] + s[l + h] is the host tree_sum's; levels 16..1 run in wave 0 registers (core/ordered_reduce.hpp, same bits).
 template <unsigned L> __device__ __forceinline__ float lds_tree(float* s, float part) {
-    const unsigned l = threadIdx.x;
-    s[l] = part;
-    __syncthreads();
-    for (unsigned h = L / 2; h > 0; h >>= 1U) {
-        if (l < h) s[l] = s[l] + s[l + h];
-        __syncthreads();
-    }
-    const float r = s[0];
-    __syncthreads();
-    return r;
+    return ::strix::core::ordered_reduce::tree_broadcast<L>(s, part, threadIdx.x);
 }
 
 // ---------------------------------------------------------------- R1 dense chain
