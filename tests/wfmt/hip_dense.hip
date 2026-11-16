@@ -259,8 +259,9 @@ template<unsigned R> void row_partials() {
 template<unsigned R> void signed_partials() {
     using namespace strix::q8_rows;
     context("hip.signed-a8.partial.r"+std::to_string(R),"hip-signed-a8-block-chain@1",{R,1U,256U},"gguf.q8_0@1");
+    constexpr unsigned threads=R<=8U?256U:R*8U;
     auto w=weights(256U,1U);std::vector<float> x(R*256U,0.125F);
-    Buffer dw(w.size()),dx(x.size()*4U),dy(R*4U),codes(dense_a8_pitch<R>()*256U),deltas(dense_a8_pitch<R>()*8U*4U),trace(256U*kPartialSlots*4U),counts(256U*4U);
+    Buffer dw(w.size()),dx(x.size()*4U),dy(R*4U),codes(dense_a8_pitch<R>()*256U),deltas(dense_a8_pitch<R>()*8U*4U),trace(threads*kPartialSlots*4U),counts(threads*4U);
     dw.upload(w);dx.upload(x);auto* tp=trace.as<float>();auto* cp=counts.as<unsigned>();
     check(hipMemcpyToSymbol(HIP_SYMBOL(partial_trace),&tp,sizeof(tp)));check(hipMemcpyToSymbol(HIP_SYMBOL(partial_count),&cp,sizeof(cp)));
     Site<R,true> site{};site.segments=segments({{dw.p,1U}});site.width=256;site.outputs=1;site.output=dy.as<float>();
@@ -268,13 +269,13 @@ template<unsigned R> void signed_partials() {
     hipLaunchKernelGGL((dense_a8_quantize_kernel<Site<R,true>>),dim3((R*32U+255U)/256U),dim3(256),0,0,site,codes.as<std::int8_t>(),deltas.as<float>());
     codes.read<std::int8_t>(R*256U);deltas.read<float>(dense_a8_pitch<R>()*8U);
     const auto read=[&] {
-        check(hipGetLastError());dy.read<float>(R);auto values=trace.read<float>(256U*kPartialSlots);const auto used=counts.read<unsigned>(256U);
+        check(hipGetLastError());dy.read<float>(R);auto values=trace.read<float>(threads*kPartialSlots);const auto used=counts.read<unsigned>(threads);
         unsigned total=0;for(unsigned n:used) {if(n>kPartialSlots) throw std::runtime_error("signed diagnostic partial capacity");total+=n;}
 #ifdef STRIX_WFMT_CAPTURE
         if(!total) throw std::runtime_error("missing signed diagnostic partials");
         strix::weight::capture::emit("partials",values.data(),values.size()*sizeof(float));
 #endif
-        check(hipMemset(trace.p,0,256U*kPartialSlots*4U));check(hipMemset(counts.p,0,256U*4U));
+        check(hipMemset(trace.p,0,threads*kPartialSlots*4U));check(hipMemset(counts.p,0,threads*4U));
     };
     if constexpr(R<=8U) {
         hipLaunchKernelGGL((project_rows_dense_a8_kernel<Site<R,true>,1U,false,false>),dim3(1),dim3(256),0,0,site,codes.as<std::int8_t>(),deltas.as<float>());read();
