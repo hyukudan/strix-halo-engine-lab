@@ -12,6 +12,13 @@ spec.loader.exec_module(native)
 
 
 class SelectionSliceTests(unittest.TestCase):
+    def test_request_cannot_change_frozen_teacher_arithmetic(self):
+        native.validate_teacher_kv({}, "fp16")
+        native.validate_teacher_kv({"teacher_kv": "int8"}, "int8")
+        for protocol, requested in (({}, "int8"), ({"teacher_kv": "int8"}, "fp16")):
+            with self.assertRaises(ValueError):
+                native.validate_teacher_kv(protocol, requested)
+
     def test_teacher_kv_is_explicit_and_overrides_serving_config(self):
         config = {"exe": "engine", "args": ["--kv", "int8", "--max-context", "100"]}
         for requested, expected in ((None, "fp16"), ("int8", "int8")):

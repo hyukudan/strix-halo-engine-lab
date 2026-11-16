@@ -26,6 +26,11 @@ def free_gb():
     return os.sysconf("SC_AVPHYS_PAGES") * os.sysconf("SC_PAGE_SIZE") / 2**30
 
 
+def validate_teacher_kv(protocol, requested):
+    if requested != protocol.get("teacher_kv", "fp16"):
+        raise ValueError("teacher KV differs from frozen protocol")
+
+
 def engine_args(config, context, kv="fp16"):
     if kv not in ("fp16", "int8"):
         raise ValueError("unsupported teacher KV format")
@@ -70,6 +75,7 @@ def main():
     p.add_argument("--selection-count", type=int)
     a = p.parse_args()
     frozen = mf.load(a.manifest)
+    validate_teacher_kv(frozen["protocol"], a.kv)
     corpus = Path(a.corpus)
     doc = json.loads((corpus / "corpus.json").read_text())
     if not frozen.get("frozen") or canon_sha(doc) != frozen["protocol"]["corpus_sha256"]:
