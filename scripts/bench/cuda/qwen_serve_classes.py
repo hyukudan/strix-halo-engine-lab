@@ -21,8 +21,12 @@ import urllib.request
 from pathlib import Path
 
 
+EXTRA = {}  # --extra-json: request fields merged into every body (measurement switches, e.g. {"copy_rows": 8})
+
+
 def stream(base, prompt, max_tokens, timeout):
     body = dict(prompt=prompt, max_tokens=max_tokens, temperature=0, stream=True, return_token_ids=True)
+    body.update(EXTRA)
     req = urllib.request.Request(base + '/v1/completions', json.dumps(body).encode(), {'Content-Type': 'application/json'})
     t0 = time.perf_counter()
     first, usage, strix, error = None, None, None, None
@@ -100,7 +104,10 @@ def main():
     ap.add_argument('--health-s', type=int, default=600)
     ap.add_argument('--warm-c1', type=int, default=8, help='C1 prompts repeated in the warm pass (same prompts as cold)')
     ap.add_argument('--min-decode-tokens', type=int, default=16, help='C1 requests with fewer tokens are flagged short=1')
+    ap.add_argument('--extra-json', default='', help='JSON object merged into every request body (per-request switches)')
     a = ap.parse_args()
+    if a.extra_json:
+        EXTRA.update(json.loads(a.extra_json))
     from tokenizers import Tokenizer  # local tokenizer.json, no download
     tok = Tokenizer.from_file(a.tokenizer)
     kit = json.loads(Path(a.prompts).read_text(encoding='utf-8'))

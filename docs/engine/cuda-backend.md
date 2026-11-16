@@ -111,6 +111,13 @@ Measured (3 ABAB pairs, ids equal): edit C1 +13.6 %, C4 +3.5 %, C8 +2.1 %, json 
 host time ~50 us per stream per cycle on requests that never copy). The server's `rtx` stats carry `copy_first_steps`,
 `context_rows` and `context_host_us`.
 
+Wide copy windows (`STRIX_QRTX_COPY_ROWS`, request field `copy_rows`, 1..16, <= 8 = off): a session alone in its step
+whose context holds a long unanimous anchor (the shared `MtpContextDraft::propose_wide`: anchor >= `copy_anchor`, no known
+edit in the span, learned copy acceptance >= `STRIX_QRTX_COPY_WIDE_ACCEPT`) verifies `copy_rows - 1` context rows in one
+9..16-row window (the prefill-shaped families) and commits at the first rejected row (exact rollback). Each row's bits
+equal its serial step (`qwen_decode_e2e` with `STRIX_QWEN_TMAX=16`: windows of 2..16 rows and 16-row rollback). Stats:
+`copy_wide_steps`, `copy_wide_rows`, `copy_wide_accepted`.
+
 Served decode by prompt class: `scripts/bench/cuda/qwen_serve_classes.py` (prose / edit / json, C1 / C4 / C8, cold and
 warm passes, ids of every request) with `scripts/bench/cuda/qwen_classes_prompts.json`, and strict ABAB server arms with
 `scripts/bench/cuda/qwen_serve_abab.sh` (server, model flags, arms and client are parameters; an arm's extra server flags
@@ -119,3 +126,5 @@ Summarise arms with `scripts/bench/cuda/qwen_serve_summary.py OUT`: C1 means onl
 requests shorter than 16 tokens (the model ends early: prose slice 0 stops after 1 token) are listed and skipped, cold and
 warm side by side per arm. Comparing a 2-prompt warm mean that contains a 1-token request with an 8-prompt cold mean is
 what made warm look slower than cold in #680.
+Arms that differ only by request fields run inside one server load with `scripts/bench/cuda/qwen_serve_inproc_abab.sh`
+(`ARMS='A|{"copy_rows":8} ;; B|{"copy_rows":16}'`, the client's `--extra-json`): 3 pairs fit a 10-minute GPU turn.

@@ -75,6 +75,7 @@ struct Stream {
     std::uint64_t position = 0;
     std::uint32_t depth_max = 0;  // per-request draft cap (0: the step's depth)
     ContextDraft* context = nullptr;  // borrowed; null = MTP drafts only
+    std::uint32_t copy_rows = 0;      // per-request wide copy window rows (0: the step's; request field "copy_rows")
 };
 
 inline std::uint32_t window_rows_default() {
@@ -228,8 +229,9 @@ inline std::vector<StreamStep> step(qp::Prefill& p, std::vector<Stream>& streams
             (void)c->drafter.begin_cycle(streams[i].pending, {}, 0, 0, acceptance, o.min_p);
         } else {
             bool wide = false;
-            if (n == 1 && copy_rows > kWindowRows && c->copy_edit) {
-                copy[i] = c->drafter.propose_wide(streams[i].pending, copy_rows - 1U, wide_accept);
+            const std::uint32_t wide_rows = streams[i].copy_rows ? std::min(streams[i].copy_rows, kMaxWindowRows) : copy_rows;
+            if (n == 1 && wide_rows > kWindowRows && c->copy_edit) {
+                copy[i] = c->drafter.propose_wide(streams[i].pending, wide_rows - 1U, wide_accept);
                 wide = !copy[i].empty();
             }
             if (wide) {
