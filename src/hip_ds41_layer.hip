@@ -3319,7 +3319,8 @@ static bool fast_dense_on() {
     // a running DevicePrefill's own precision first (strix/ds41_prefill_precision.hpp), else the override or env
     return effective_fast(&PrefillPrecision::fast_dense, fast_dense_mode, env);
 }
-static bool enqueue_fast_dense(const Q8A8DensePrefillView& v, void* stream) {
+// groups > 1: the batched form of the shared core (one launch, product g = group g; see enqueue_q8_0_a8_fast_dense_groups)
+static bool enqueue_fast_dense(const Q8A8DensePrefillView& v, void* stream, unsigned groups = 1U, std::size_t weight_group_bytes = 0U) {
     static const unsigned min_rows = fast_profile::dense_min_rows();
     namespace q8a8 = strix::core::f16_dense_tall::q8a8;
     q8a8::View f{};
@@ -3328,10 +3329,19 @@ static bool enqueue_fast_dense(const Q8A8DensePrefillView& v, void* stream) {
     f.k_bytes = v.k_offset / 32U * 34U;
     f.in = v.width, f.count = v.count, f.rows = v.rows, f.x_stride = v.x_stride, f.out_stride = v.out_stride;
     f.accumulate = v.accumulate ? 1U : 0U;
+    if (groups > 1U) f.batch = groups, f.batch_in = v.width, f.batch_out = v.count, f.batch_weight_bytes = weight_group_bytes;
     if (v.rows < min_rows || !q8a8::supported(f)) return false;
     q8a8::enqueue_parts(f, v.k_parts, as_stream(stream));
     hip_check(hipGetLastError(), "Q8_0 x A8 FP16 dense launch");
     return true;
+}
+bool enqueue_q8_0_a8_fast_dense_groups(const Q8A8DensePrefillView& v, unsigned groups, std::size_t weight_group_bytes, void* stream) {
+    // STRIX_DS41_FAST_DENSE_BATCH (default on; 0 = one launch per group, the previous form): scheduling only, same bits
+    static const bool batch = strix::envcfg::flag("STRIX_DS41_FAST_DENSE_BATCH", true);
+    if (!batch || groups < 2U || !fast_dense_on() || v.k_parts > 1U || v.accumulate || !v.weight || !v.codes || !v.deltas || !v.out ||
+        v.width % 32U != 0U || std::uint64_t{v.width} * groups > v.x_stride || std::uint64_t{v.count} * groups > v.out_stride)
+        return false;
+    return enqueue_fast_dense(v, stream, groups, weight_group_bytes);
 }
 
 bool enqueue_q8_0_a8_dense_prefill(const Q8A8DensePrefillView& v, void* stream) {
