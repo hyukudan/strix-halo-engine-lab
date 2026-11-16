@@ -9,8 +9,10 @@
 //   - One block = 8 waves = 64 output columns; the 8 waves split K in contiguous ranges of K / 8 (G / 8 = MaxG K64
 //     groups each), reduce their partial sums in LDS in a fixed ascending order (deterministic, no atomics).
 //   - Rows are padded to the bucket R (1/2/4/8/16); rows past nrows are neither computed nor stored. Default: core
-//     call over all R rows (every weight word read once, bitwise equal to the chunked form: per-row op order is
-//     identical). STRIX_IU4_ROW_REUSE=0 selects the old 4-row chunk calls (weights re-streamed per chunk).
+//     calls of up to 8 rows (R <= 8: one call, every weight word read once; R = 16: two 8-row calls), bitwise equal
+//     to the chunked form (per-row op order is identical). One call over 16 rows was measured slower (rows 16
+//     verify 272.8 vs 220.7 ms, Strix 27B IU4) and spills (private segment 144 B): not offered.
+//     STRIX_IU4_ROW_REUSE=0 selects the old 4-row chunk calls (weights re-streamed per chunk).
 // Home: shared (backend core, HIP): no model names; any dense projection can bind it (qwen35 now).
 #if defined(__HIPCC__)
 #include <hip/hip_runtime.h>
@@ -81,33 +83,28 @@ __global__ void __launch_bounds__(32 * kWaves) kernel(const std::uint8_t* w, uns
     }
 }
 
-// STRIX_IU4_ROW_REUSE: unset/1 = core calls of up to 8 rows (default), 0 = old 4-row chunks, 2 = one call over all rows.
-inline int row_reuse() {
-    static const int mode = [] { const char* e = std::getenv("STRIX_IU4_ROW_REUSE"); return e ? std::atoi(e) : 1; }();
-    return mode;
+// STRIX_IU4_ROW_REUSE: unset/1 = core calls of up to 8 rows (default), 0 = old 4-row chunks.
+inline bool row_reuse() {
+    static const bool on = [] { const char* e = std::getenv("STRIX_IU4_ROW_REUSE"); return !(e && e[0] == '0'); }();
+    return on;
 }
 
 template <unsigned R>
 void launch_bucket(const std::uint8_t* w, unsigned inputs, unsigned outputs, const _Float16* xh, float* out, unsigned rows, hipStream_t s) {
     const dim3 grid(outputs / 64U), block(32U * kWaves);
     constexpr unsigned C = R >= 8U ? 4U : R, M = R > 8U ? 8U : R;
-    const int mode = row_reuse();
-    const bool reuse = R <= 4U || mode == 2;
-    const bool mid = !reuse && mode != 0;
+    const bool mid = R <= 4U || row_reuse();
     switch (inputs / 512U) {
     case 10U:
-        if (reuse) kernel<R, 10U, R><<<grid, block, 0, s>>>(w, inputs, outputs, xh, out, rows);
-        else if (mid) kernel<R, 10U, M><<<grid, block, 0, s>>>(w, inputs, outputs, xh, out, rows);
+        if (mid) kernel<R, 10U, M><<<grid, block, 0, s>>>(w, inputs, outputs, xh, out, rows);
         else kernel<R, 10U, C><<<grid, block, 0, s>>>(w, inputs, outputs, xh, out, rows);
         break;
     case 12U:
-        if (reuse) kernel<R, 12U, R><<<grid, block, 0, s>>>(w, inputs, outputs, xh, out, rows);
-        else if (mid) kernel<R, 12U, M><<<grid, block, 0, s>>>(w, inputs, outputs, xh, out, rows);
+        if (mid) kernel<R, 12U, M><<<grid, block, 0, s>>>(w, inputs, outputs, xh, out, rows);
         else kernel<R, 12U, C><<<grid, block, 0, s>>>(w, inputs, outputs, xh, out, rows);
         break;
     default:
-        if (reuse) kernel<R, 34U, R><<<grid, block, 0, s>>>(w, inputs, outputs, xh, out, rows);
-        else if (mid) kernel<R, 34U, M><<<grid, block, 0, s>>>(w, inputs, outputs, xh, out, rows);
+        if (mid) kernel<R, 34U, M><<<grid, block, 0, s>>>(w, inputs, outputs, xh, out, rows);
         else kernel<R, 34U, C><<<grid, block, 0, s>>>(w, inputs, outputs, xh, out, rows);
         break;
     }
