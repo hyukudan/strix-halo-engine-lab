@@ -10,7 +10,8 @@
       "block_elements": 1,
       "block_bytes": 4,
       "execution": "legacy-oracle",
-      "format_id": "gguf.f32@1"
+      "format_id": "gguf.f32@1",
+      "canonical_format": "plain.f32@1"
     },
     {
       "wire_id": 1,
@@ -18,7 +19,8 @@
       "block_elements": 1,
       "block_bytes": 2,
       "execution": "legacy-oracle",
-      "format_id": "gguf.f16@1"
+      "format_id": "gguf.f16@1",
+      "canonical_format": "plain.f16@1"
     },
     {
       "wire_id": 2,
@@ -26,7 +28,8 @@
       "block_elements": 32,
       "block_bytes": 18,
       "execution": "legacy-oracle",
-      "format_id": "gguf.q4_0@1"
+      "format_id": "gguf.q4_0@1",
+      "canonical_format": "gguf.q4_0@1"
     },
     {
       "wire_id": 3,
@@ -34,7 +37,8 @@
       "block_elements": 32,
       "block_bytes": 20,
       "execution": "parse-only",
-      "format_id": "gguf.q4_1@1"
+      "format_id": "gguf.q4_1@1",
+      "canonical_format": "gguf.q4_1@1"
     },
     {
       "wire_id": 6,
@@ -42,7 +46,8 @@
       "block_elements": 32,
       "block_bytes": 22,
       "execution": "legacy-oracle",
-      "format_id": "gguf.q5_0@1"
+      "format_id": "gguf.q5_0@1",
+      "canonical_format": "gguf.q5_0@1"
     },
     {
       "wire_id": 7,
@@ -50,7 +55,8 @@
       "block_elements": 32,
       "block_bytes": 24,
       "execution": "legacy-oracle",
-      "format_id": "gguf.q5_1@1"
+      "format_id": "gguf.q5_1@1",
+      "canonical_format": "gguf.q5_1@1"
     },
     {
       "wire_id": 8,
@@ -58,7 +64,8 @@
       "block_elements": 32,
       "block_bytes": 34,
       "execution": "legacy-oracle",
-      "format_id": "gguf.q8_0@1"
+      "format_id": "gguf.q8_0@1",
+      "canonical_format": "gguf.q8_0@1"
     },
     {
       "wire_id": 9,
@@ -66,7 +73,8 @@
       "block_elements": 32,
       "block_bytes": 36,
       "execution": "parse-only",
-      "format_id": "gguf.q8_1@1"
+      "format_id": "gguf.q8_1@1",
+      "canonical_format": "gguf.q8_1@1"
     },
     {
       "wire_id": 10,
@@ -74,7 +82,8 @@
       "block_elements": 256,
       "block_bytes": 84,
       "execution": "legacy-oracle",
-      "format_id": "gguf.q2_k@1"
+      "format_id": "gguf.q2_k@1",
+      "canonical_format": "gguf.q2_k@1"
     },
     {
       "wire_id": 11,
@@ -82,7 +91,8 @@
       "block_elements": 256,
       "block_bytes": 110,
       "execution": "legacy-oracle",
-      "format_id": "gguf.q3_k@1"
+      "format_id": "gguf.q3_k@1",
+      "canonical_format": "gguf.q3_k@1"
     },
     {
       "wire_id": 12,
@@ -90,7 +100,8 @@
       "block_elements": 256,
       "block_bytes": 144,
       "execution": "legacy-oracle",
-      "format_id": "gguf.q4_k@1"
+      "format_id": "gguf.q4_k@1",
+      "canonical_format": "gguf.q4_k@1"
     },
     {
       "wire_id": 13,
@@ -98,7 +109,8 @@
       "block_elements": 256,
       "block_bytes": 176,
       "execution": "legacy-oracle",
-      "format_id": "gguf.q5_k@1"
+      "format_id": "gguf.q5_k@1",
+      "canonical_format": "gguf.q5_k@1"
     },
     {
       "wire_id": 14,
@@ -106,7 +118,8 @@
       "block_elements": 256,
       "block_bytes": 210,
       "execution": "legacy-oracle",
-      "format_id": "gguf.q6_k@1"
+      "format_id": "gguf.q6_k@1",
+      "canonical_format": "gguf.q6_k@1"
     },
     {
       "wire_id": 15,
@@ -114,7 +127,8 @@
       "block_elements": 256,
       "block_bytes": 292,
       "execution": "parse-only",
-      "format_id": "gguf.q8_k@1"
+      "format_id": "gguf.q8_k@1",
+      "canonical_format": "gguf.q8_k@1"
     },
     {
       "wire_id": 16,
@@ -122,7 +136,8 @@
       "block_elements": 256,
       "block_bytes": 66,
       "execution": "legacy-oracle",
-      "format_id": "gguf.iq2_xxs@1"
+      "format_id": "gguf.iq2_xxs@1",
+      "canonical_format": "gguf.iq2_xxs@1"
     },
     {
       "wire_id": 17,
@@ -130,7 +145,8 @@
       "block_elements": 256,
       "block_bytes": 74,
       "execution": "parse-only",
-      "format_id": "gguf.iq2_xs@1"
+      "format_id": "gguf.iq2_xs@1",
+      "canonical_format": "gguf.iq2_xs@1"
     },
     {
       "wire_id": 18,
@@ -138,7 +154,8 @@
       "block_elements": 256,
       "block_bytes": 98,
       "execution": "legacy-oracle",
-      "format_id": "gguf.iq3_xxs@1"
+      "format_id": "gguf.iq3_xxs@1",
+      "canonical_format": "gguf.iq3_xxs@1"
     },
     {
       "wire_id": 19,
@@ -146,7 +163,8 @@
       "block_elements": 256,
       "block_bytes": 50,
       "execution": "parse-only",
-      "format_id": "gguf.iq1_s@1"
+      "format_id": "gguf.iq1_s@1",
+      "canonical_format": "gguf.iq1_s@1"
     },
     {
       "wire_id": 20,
@@ -154,7 +172,8 @@
       "block_elements": 32,
       "block_bytes": 18,
       "execution": "legacy-oracle",
-      "format_id": "gguf.iq4_nl@1"
+      "format_id": "gguf.iq4_nl@1",
+      "canonical_format": "gguf.iq4_nl@1"
     },
     {
       "wire_id": 21,
@@ -162,7 +181,8 @@
       "block_elements": 256,
       "block_bytes": 110,
       "execution": "legacy-oracle",
-      "format_id": "gguf.iq3_s@1"
+      "format_id": "gguf.iq3_s@1",
+      "canonical_format": "gguf.iq3_s@1"
     },
     {
       "wire_id": 22,
@@ -170,7 +190,8 @@
       "block_elements": 256,
       "block_bytes": 82,
       "execution": "legacy-oracle",
-      "format_id": "gguf.iq2_s@1"
+      "format_id": "gguf.iq2_s@1",
+      "canonical_format": "gguf.iq2_s@1"
     },
     {
       "wire_id": 23,
@@ -178,7 +199,8 @@
       "block_elements": 256,
       "block_bytes": 136,
       "execution": "legacy-oracle",
-      "format_id": "gguf.iq4_xs@1"
+      "format_id": "gguf.iq4_xs@1",
+      "canonical_format": "gguf.iq4_xs@1"
     },
     {
       "wire_id": 24,
@@ -186,7 +208,8 @@
       "block_elements": 1,
       "block_bytes": 1,
       "execution": "typed-only",
-      "format_id": "gguf.i8@1"
+      "format_id": "gguf.i8@1",
+      "canonical_format": "typed.i8@1"
     },
     {
       "wire_id": 25,
@@ -194,7 +217,8 @@
       "block_elements": 1,
       "block_bytes": 2,
       "execution": "typed-only",
-      "format_id": "gguf.i16@1"
+      "format_id": "gguf.i16@1",
+      "canonical_format": "typed.i16@1"
     },
     {
       "wire_id": 26,
@@ -202,7 +226,8 @@
       "block_elements": 1,
       "block_bytes": 4,
       "execution": "typed-only",
-      "format_id": "gguf.i32@1"
+      "format_id": "gguf.i32@1",
+      "canonical_format": "typed.i32@1"
     },
     {
       "wire_id": 27,
@@ -210,7 +235,8 @@
       "block_elements": 1,
       "block_bytes": 8,
       "execution": "typed-only",
-      "format_id": "gguf.i64@1"
+      "format_id": "gguf.i64@1",
+      "canonical_format": "typed.i64@1"
     },
     {
       "wire_id": 28,
@@ -218,7 +244,8 @@
       "block_elements": 1,
       "block_bytes": 8,
       "execution": "typed-only",
-      "format_id": "gguf.f64@1"
+      "format_id": "gguf.f64@1",
+      "canonical_format": "typed.f64@1"
     },
     {
       "wire_id": 29,
@@ -226,7 +253,8 @@
       "block_elements": 256,
       "block_bytes": 56,
       "execution": "parse-only",
-      "format_id": "gguf.iq1_m@1"
+      "format_id": "gguf.iq1_m@1",
+      "canonical_format": "gguf.iq1_m@1"
     },
     {
       "wire_id": 30,
@@ -234,7 +262,8 @@
       "block_elements": 1,
       "block_bytes": 2,
       "execution": "legacy-oracle",
-      "format_id": "gguf.bf16@1"
+      "format_id": "gguf.bf16@1",
+      "canonical_format": "plain.bf16@1"
     },
     {
       "wire_id": 34,
@@ -242,7 +271,8 @@
       "block_elements": 256,
       "block_bytes": 54,
       "execution": "parse-only",
-      "format_id": "gguf.tq1_0@1"
+      "format_id": "gguf.tq1_0@1",
+      "canonical_format": "gguf.tq1_0@1"
     },
     {
       "wire_id": 35,
@@ -250,7 +280,8 @@
       "block_elements": 256,
       "block_bytes": 66,
       "execution": "parse-only",
-      "format_id": "gguf.tq2_0@1"
+      "format_id": "gguf.tq2_0@1",
+      "canonical_format": "gguf.tq2_0@1"
     },
     {
       "wire_id": 39,
@@ -258,7 +289,8 @@
       "block_elements": 32,
       "block_bytes": 17,
       "execution": "legacy-oracle",
-      "format_id": "gguf.mxfp4@1"
+      "format_id": "gguf.mxfp4@1",
+      "canonical_format": "gguf.mxfp4@1"
     },
     {
       "wire_id": 42,
@@ -266,7 +298,8 @@
       "block_elements": 64,
       "block_bytes": 18,
       "execution": "legacy-oracle",
-      "format_id": "gguf.q2_0.strix@1"
+      "format_id": "gguf.q2_0.strix@1",
+      "canonical_format": "gguf.q2_0.strix@1"
     }
   ],
   "rejected_gguf_ids": [
@@ -310,7 +343,7 @@
     {
       "pr": "P03",
       "owner": "shared-weight-layer-maintainer",
-      "state": "pending",
+      "state": "implemented-host-validation-pending",
       "closure": "all assigned bindings migrated and required byte receipts pass"
     },
     {
@@ -489,13 +522,15 @@
         "fp8_tensor_bytes",
         "fp8_tensor_check",
         "fp8_weight",
+        "index_safetensors",
         "invalid_argument",
         "load_header",
-        "pread",
+        "open_source",
         "product_fp8",
         "read",
         "read_bytes",
         "read_fp8_tensor",
+        "read_slice",
         "resolve_safetensors_checkpoint",
         "tensor"
       ]
@@ -675,7 +710,7 @@
       "arithmetic": "index/admission only",
       "migration": "P03",
       "owner": "shared-weight-layer-maintainer",
-      "status": "incumbent",
+      "status": "migrated",
       "capture": "legacy-public-entrypoint",
       "operations": [
         "Reader",
@@ -709,7 +744,7 @@
       "arithmetic": "index/admission only",
       "migration": "P03",
       "owner": "shared-weight-layer-maintainer",
-      "status": "incumbent",
+      "status": "migrated",
       "capture": "legacy-public-entrypoint",
       "operations": [
         "SafetensorsCheckpoint",
@@ -717,13 +752,15 @@
         "fp8_tensor_bytes",
         "fp8_tensor_check",
         "fp8_weight",
+        "index_safetensors",
         "invalid_argument",
         "load_header",
-        "pread",
+        "open_source",
         "product_fp8",
         "read",
         "read_bytes",
         "read_fp8_tensor",
+        "read_slice",
         "resolve_safetensors_checkpoint",
         "tensor"
       ]
@@ -740,11 +777,14 @@
       "arithmetic": "index/admission only",
       "migration": "P03",
       "owner": "shared-weight-layer-maintainer",
-      "status": "incumbent",
+      "status": "migrated",
       "capture": "legacy-public-entrypoint",
       "operations": [
+        "as_bytes",
+        "index_safetensors",
         "read_json",
-        "read_safetensors"
+        "read_safetensors",
+        "view_source"
       ]
     },
     {
@@ -759,7 +799,7 @@
       "arithmetic": "index/admission only",
       "migration": "P03",
       "owner": "shared-weight-layer-maintainer",
-      "status": "incumbent",
+      "status": "migrated",
       "capture": "legacy-public-entrypoint",
       "operations": [
         "frozen_compatibility_tensor",
@@ -791,13 +831,16 @@
       "arithmetic": "index/admission only",
       "migration": "P03",
       "owner": "shared-weight-layer-maintainer",
-      "status": "incumbent",
+      "status": "migrated",
       "capture": "legacy-public-entrypoint",
       "operations": [
         "SafeTensors",
-        "fread",
+        "admitted_weights",
+        "index_safetensors",
         "nbytes",
+        "open_source",
         "parse_st_dtype",
+        "read",
         "read_raw",
         "read_vec",
         "reader",
@@ -817,7 +860,7 @@
       "arithmetic": "index/admission only",
       "migration": "P03",
       "owner": "shared-weight-layer-maintainer",
-      "status": "incumbent",
+      "status": "data-adapter",
       "capture": "legacy-public-entrypoint",
       "operations": [
         "contract_from_description",
@@ -841,7 +884,7 @@
       "arithmetic": "index/admission only",
       "migration": "P03",
       "owner": "shared-weight-layer-maintainer",
-      "status": "incumbent",
+      "status": "data-adapter",
       "capture": "legacy-public-entrypoint",
       "operations": [
         "header_payload_bytes",
@@ -864,7 +907,7 @@
       "arithmetic": "index/admission only",
       "migration": "P03",
       "owner": "shared-weight-layer-maintainer",
-      "status": "incumbent",
+      "status": "data-adapter",
       "capture": "legacy-public-entrypoint",
       "operations": [
         "load",
@@ -890,13 +933,14 @@
       "arithmetic": "index/admission only",
       "migration": "P03",
       "owner": "shared-weight-layer-maintainer",
-      "status": "incumbent",
+      "status": "migrated",
       "capture": "legacy-public-entrypoint",
       "operations": [
         "frozen_compatibility_tensor",
         "gguf_tensor_name",
         "hash_bytes",
         "load_gguf_model",
+        "open_source",
         "read_file",
         "validate_finite",
         "validate_manifest",
@@ -915,7 +959,7 @@
       "arithmetic": "index/admission only",
       "migration": "P03",
       "owner": "shared-weight-layer-maintainer",
-      "status": "incumbent",
+      "status": "migrated",
       "capture": "legacy-public-entrypoint",
       "operations": [
         "GgufWeights",
@@ -926,7 +970,9 @@
         "pos_type",
         "read",
         "read_all",
-        "tensor"
+        "tensor",
+        "tensor_id",
+        "view_source"
       ]
     },
     {
@@ -3146,6 +3192,7 @@
       "operations": [
         "SafetensorsCheckpoint",
         "Weight",
+        "admitted_weights",
         "fp8_dot_scale",
         "fp8_tensor_bytes",
         "fp8_tensor_check",
@@ -3157,6 +3204,7 @@
         "read",
         "read_fp8_tensor",
         "resolve_safetensors_checkpoint",
+        "tensor_index",
         "weight"
       ],
       "images": [
@@ -3425,6 +3473,7 @@
       "status": "incumbent",
       "capture": "legacy-public-entrypoint",
       "operations": [
+        "admitted_weights",
         "check_quant_config",
         "count_blocks",
         "invalid_argument",
@@ -3728,6 +3777,7 @@
         "mtp_workspace_bytes",
         "multi_scratch_bytes",
         "native_types",
+        "open_source",
         "pack",
         "plan_blocks",
         "ple_hash_contract",
@@ -3750,7 +3800,9 @@
         "upload_mtp",
         "upload_ple",
         "validate_blocks",
-        "validate_snapshot"
+        "validate_snapshot",
+        "weight_conversions",
+        "weight_map"
       ]
     },
     {
@@ -4218,6 +4270,7 @@
         "gate_expert_bytes",
         "hc_mix_workspace_bytes",
         "head_tiled",
+        "index_safetensors",
         "invalid_argument",
         "launch",
         "layer_bytes",
@@ -4228,6 +4281,7 @@
         "make_decode_resident",
         "moe_fast_workspace_bytes",
         "moe_layer_workspace_bytes",
+        "open_source",
         "packed_bytes",
         "pinned_bytes",
         "pk_rows",
@@ -4240,6 +4294,7 @@
         "read_records",
         "read_records_queued",
         "read_safetensor",
+        "read_slice",
         "reader_",
         "reads",
         "release_idle_preload",
@@ -4501,6 +4556,344 @@
       "images": [
         "prepared-image"
       ]
+    },
+    {
+      "id": "admission:src/weight/source.cpp",
+      "source": "src/weight/source.cpp",
+      "backend": "host",
+      "formats": [
+        "per-tensor-original-storage"
+      ],
+      "arithmetic": "unchanged incumbent",
+      "migration": "P03",
+      "owner": "shared-weight-layer-maintainer",
+      "status": "migrated",
+      "capture": "host-fixtures",
+      "operations": [
+        "FileSource",
+        "MemorySource",
+        "NamespaceSource",
+        "SourceBuffer",
+        "SourceStream",
+        "ViewSource",
+        "bytes_",
+        "digest_bytes",
+        "fread",
+        "memory_source",
+        "namespace_source",
+        "off_type",
+        "open_source",
+        "pos_type",
+        "read",
+        "read_slice",
+        "source_",
+        "source_stream",
+        "tensor_id",
+        "to_int_type",
+        "view_source"
+      ]
+    },
+    {
+      "id": "admission:src/weight/admission.cpp",
+      "source": "src/weight/admission.cpp",
+      "backend": "host",
+      "formats": [
+        "per-tensor-original-storage"
+      ],
+      "arithmetic": "unchanged incumbent",
+      "migration": "P03",
+      "owner": "shared-weight-layer-maintainer",
+      "status": "migrated",
+      "capture": "host-fixtures",
+      "operations": [
+        "as_bytes",
+        "dequantize_row",
+        "memory_source",
+        "namespace_source",
+        "read_slice",
+        "safetensors_format",
+        "tensor_id",
+        "valid_slice",
+        "validate",
+        "validate_binding",
+        "validate_map",
+        "validate_metadata"
+      ]
+    },
+    {
+      "id": "admission:src/weight/model_binding.cpp",
+      "source": "src/weight/model_binding.cpp",
+      "backend": "host",
+      "formats": [
+        "per-tensor-original-storage"
+      ],
+      "arithmetic": "unchanged incumbent",
+      "migration": "P03",
+      "owner": "shared-weight-layer-maintainer",
+      "status": "migrated",
+      "capture": "host-fixtures",
+      "operations": [
+        "bytes",
+        "digest_bytes",
+        "read_slice"
+      ]
+    },
+    {
+      "id": "admission:src/minimax/engine/mm_pack.cpp",
+      "source": "src/minimax/engine/mm_pack.cpp",
+      "backend": "host",
+      "formats": [
+        "per-tensor-original-storage"
+      ],
+      "arithmetic": "unchanged incumbent",
+      "migration": "P03",
+      "owner": "shared-weight-layer-maintainer",
+      "status": "migrated",
+      "capture": "host-fixtures",
+      "operations": [
+        "PackReader",
+        "header_payload_bytes",
+        "index_safetensors",
+        "loaded_file",
+        "open_source",
+        "pack_files",
+        "pread",
+        "pread_all",
+        "read",
+        "reads"
+      ]
+    },
+    {
+      "id": "admission:src/glm/load/glm_rank_plan.cpp",
+      "source": "src/glm/load/glm_rank_plan.cpp",
+      "backend": "host",
+      "formats": [
+        "per-tensor-original-storage"
+      ],
+      "arithmetic": "unchanged incumbent",
+      "migration": "P03",
+      "owner": "shared-weight-layer-maintainer",
+      "status": "migrated",
+      "capture": "host-fixtures",
+      "operations": [
+        "dtype_bytes",
+        "index_safetensors",
+        "invalid_argument",
+        "open_source",
+        "probe",
+        "read_text",
+        "readdir"
+      ]
+    },
+    {
+      "id": "admission:apps/hip_decode_token_main.cpp",
+      "source": "apps/hip_decode_token_main.cpp",
+      "backend": "host",
+      "formats": [
+        "per-tensor-original-storage"
+      ],
+      "arithmetic": "unchanged incumbent",
+      "migration": "P03",
+      "owner": "shared-weight-layer-maintainer",
+      "status": "migrated",
+      "capture": "host-fixtures",
+      "operations": [
+        "MappedModelIoSource",
+        "STRIX_DECODE_ENTRY",
+        "STRIX_QSA_DECODE_POOL",
+        "add_tiled",
+        "additional_bytes",
+        "after_block",
+        "apply_eager_code_loading",
+        "as_bytes",
+        "as_writable_bytes",
+        "assess_serial_decode_replay",
+        "base_kv_bytes_per_token",
+        "block",
+        "block_member",
+        "block_plan_canonical",
+        "blocks",
+        "build_model_tensor_index",
+        "build_ple_hash_contract",
+        "build_serial_decode_execution_plan",
+        "build_serial_execution_tensor_requirements",
+        "bytes",
+        "cache_mtp_contract_qualified",
+        "cache_reservation_bytes",
+        "cache_unpaid_slot_bytes",
+        "capture_prefix_restore_source",
+        "common_decode_plan",
+        "compile_execution_tensor_access_plan",
+        "compile_launch_plan",
+        "copied_bytes",
+        "credit_bytes",
+        "decode",
+        "decode_allowance",
+        "decode_enabled",
+        "defaults_scope",
+        "disable_store_before_ready",
+        "drain_block_spool",
+        "file_backed_missing_bytes",
+        "file_backed_unregistered_bytes",
+        "find_runtime_tensor_binding",
+        "fixed_bytes",
+        "generate_qwen_yarn_rows",
+        "http_slot_retained_bytes",
+        "invalid_argument",
+        "kernels_enabled",
+        "known_prefill_rows_range",
+        "latest_snapshot_payload_bytes",
+        "load",
+        "load_costs",
+        "load_hip_dense_trellis_pack",
+        "load_hip_q6p_pack",
+        "load_hip_qwen_router_bf16",
+        "load_mtp_cli_assets",
+        "load_offline_compile_provenance",
+        "load_offline_tuning_cache_file",
+        "logical_rows",
+        "make_cohort_tiled_run",
+        "make_decode_integer_head_config",
+        "maximum_rows_",
+        "model_graph_from_contract",
+        "mtp_calibration_rows",
+        "mtp_tiled_prompt",
+        "open_read_only",
+        "open_source",
+        "output_reservation_bytes",
+        "owner_bytes",
+        "pair_timing_columns",
+        "parse_stage_cut",
+        "payload_bytes",
+        "payload_sha256",
+        "ple_rolling_prompt_supported",
+        "prefill_chunk_rows",
+        "prepare_first_block_admission",
+        "product",
+        "prompt_group_rows",
+        "qsa_decode_pool_bf16",
+        "qsa_decode_pool_route",
+        "qsa_mtp_pool_bytes",
+        "read",
+        "read_at",
+        "read_file",
+        "read_linux_uma_text",
+        "read_mtp_forward_golden_file",
+        "read_only_registered_mapping_accounting",
+        "read_prefix_cache_prompt",
+        "read_q6p_pack_header",
+        "read_rtx_state_import_metadata",
+        "read_serial_decode_reference",
+        "read_serving_prefix",
+        "read_session_checkpoint",
+        "readahead",
+        "readmit_registered",
+        "readmit_registered_yarn_mtp",
+        "record_block",
+        "register_complete_hip_kernel_catalog",
+        "registered_bytes",
+        "registered_locked_bytes",
+        "request_block",
+        "requested_reservation_bytes",
+        "required_scratch_bytes",
+        "required_weight_bytes",
+        "reserved_bytes",
+        "resolve",
+        "resolve_effective_config",
+        "resolve_execution_buffer",
+        "resolve_gdn_layer_state",
+        "resolve_http_bridge_capacity",
+        "resolve_indexed_attention_layer_state",
+        "resolve_session_state",
+        "resolved",
+        "resolved_cache_family",
+        "resources",
+        "resources_",
+        "rolling_cap_bytes",
+        "row_bytes",
+        "rows",
+        "run_decode_entry",
+        "run_mtp_decode_bridge",
+        "scratch_bytes",
+        "selective_copy_payload_bytes",
+        "serve_available",
+        "set_all_rows_sink",
+        "set_mtp_product_profile",
+        "sha256_bytes",
+        "snapshot_bytes",
+        "source_execution_identity",
+        "stage",
+        "stage_rtx_state_import_file",
+        "table_bytes",
+        "tensors",
+        "tile",
+        "tiled_rows",
+        "typed",
+        "valid",
+        "validate_a8_down_content",
+        "validate_a8_down_manifest",
+        "validate_decode_projection",
+        "validate_effective_startup",
+        "validate_final_generation_state_budget",
+        "validate_http_serving_memory",
+        "validate_moe_token_cost_options",
+        "validate_mtp_target_input_export",
+        "validate_output_steps",
+        "validate_prompt_tensor_contract",
+        "validate_q5k_a8_manifest",
+        "validate_qwen_rotary_reader",
+        "validate_resident_weights",
+        "validate_resolved_attention_kv_storage",
+        "validate_resolved_device_queue_trace",
+        "validate_resolved_gdn_islands",
+        "validate_resolved_gdn_recurrent_layout",
+        "validate_resolved_gdn_recurrent_storage",
+        "validate_resolved_hc_projection_next_tile",
+        "validate_resolved_known_prefix_window",
+        "validate_resolved_mtp_cli",
+        "validate_resolved_ple_cache",
+        "validate_resolved_ple_cpu_helpers",
+        "validate_resolved_prefix_roundtrip",
+        "validate_resolved_prompt_lookup",
+        "validate_resolved_q51_slot_parallel_down",
+        "validate_resolved_q8_projection_organization",
+        "validate_resolved_qsa_gqa",
+        "validate_resolved_qsa_hierarchical_selection",
+        "validate_resolved_requested_logprobs",
+        "validate_resolved_serving",
+        "validate_resolved_teacher_forced_score",
+        "validate_runtime",
+        "validate_serial_decode_engine_logits",
+        "validate_serial_decode_reference_vocabulary",
+        "validate_sibling_serial_executions",
+        "validate_slot_parallel_manifest",
+        "validate_tensor_access",
+        "validate_unchanged",
+        "validate_virtual_q8_gdn_output_manifest",
+        "validate_wave_router_model_inputs",
+        "warm_file_backed_tensors",
+        "weights_"
+      ]
+    },
+    {
+      "id": "admission:src/weight/formats/plain.cpp",
+      "source": "src/weight/formats/plain.cpp",
+      "backend": "host",
+      "formats": [
+        "plain.f32",
+        "plain.f16",
+        "plain.bf16"
+      ],
+      "arithmetic": "unchanged scalar interpretation",
+      "migration": "P03",
+      "owner": "shared-weight-layer-maintainer",
+      "status": "migrated",
+      "capture": "host-row-lookup-fixture",
+      "operations": [
+        "decode_plain",
+        "dequantize_row",
+        "gguf_type"
+      ]
     }
   ],
   "operation_scan_keywords": [
@@ -4541,6 +4934,7 @@
   ],
   "closure_files": [
     "apps/glm_rank_defaults.hpp",
+    "apps/hip_decode_token_main.cpp",
     "apps/qwen_effective_config.hpp",
     "include/strix/cuda/core/nvfp4.hpp",
     "include/strix/cuda_qwen_quant.cuh",
@@ -4602,6 +4996,7 @@
     "src/ggml_dequant.cpp",
     "src/gguf_reader.cpp",
     "src/glm/load/glm_model_description.cpp",
+    "src/glm/load/glm_rank_plan.cpp",
     "src/glm/prefill/glm_moe_traits.hpp",
     "src/glm/prefill/glm_pf_kda_wmma.hpp",
     "src/h3/block/device_forward.hip",
@@ -4621,6 +5016,7 @@
     "src/intel/core/dense_q8a8_ref.hpp",
     "src/minimax/attn/index_proj.hip",
     "src/minimax/engine/mm_defaults.cpp",
+    "src/minimax/engine/mm_pack.cpp",
     "src/minimax/model_description.cpp",
     "src/minimax/moe/mmx_prefill.hip",
     "src/moe_core/exl3_trellis.hpp",
@@ -4628,6 +5024,1251 @@
     "src/moe_core/hip_moe_gsq_weights.inc",
     "src/qwen_model_description.cpp",
     "src/vision/encoder.hip",
-    "src/vision/gguf_weights.cpp"
+    "src/vision/gguf_weights.cpp",
+    "src/weight/admission.cpp",
+    "src/weight/formats/plain.cpp",
+    "src/weight/model_binding.cpp",
+    "src/weight/source.cpp"
+  ],
+  "role_bindings": [
+    {
+      "family": "qwen",
+      "match": "contains",
+      "legacy_pattern": ".ssm_a",
+      "role": "auxiliary",
+      "standalone": true,
+      "expert_axis": "0 only for expert-indexed logical rank>2",
+      "allowlist": "src/weight/adapters/qwen.cpp"
+    },
+    {
+      "family": "qwen",
+      "match": "contains",
+      "legacy_pattern": ".ssm_d",
+      "role": "auxiliary",
+      "standalone": true,
+      "expert_axis": "0 only for expert-indexed logical rank>2",
+      "allowlist": "src/weight/adapters/qwen.cpp"
+    },
+    {
+      "family": "qwen",
+      "match": "contains",
+      "legacy_pattern": "embed",
+      "role": "embedding",
+      "standalone": false,
+      "expert_axis": "0 only for expert-indexed logical rank>2",
+      "allowlist": "src/weight/adapters/qwen.cpp"
+    },
+    {
+      "family": "qwen",
+      "match": "contains",
+      "legacy_pattern": "token_embd",
+      "role": "embedding",
+      "standalone": false,
+      "expert_axis": "0 only for expert-indexed logical rank>2",
+      "allowlist": "src/weight/adapters/qwen.cpp"
+    },
+    {
+      "family": "qwen",
+      "match": "contains",
+      "legacy_pattern": "lm_head",
+      "role": "head",
+      "standalone": false,
+      "expert_axis": "0 only for expert-indexed logical rank>2",
+      "allowlist": "src/weight/adapters/qwen.cpp"
+    },
+    {
+      "family": "qwen",
+      "match": "contains",
+      "legacy_pattern": "output.weight",
+      "role": "head",
+      "standalone": false,
+      "expert_axis": "0 only for expert-indexed logical rank>2",
+      "allowlist": "src/weight/adapters/qwen.cpp"
+    },
+    {
+      "family": "qwen",
+      "match": "contains",
+      "legacy_pattern": "ffn_gate_inp",
+      "role": "router",
+      "standalone": false,
+      "expert_axis": "0 only for expert-indexed logical rank>2",
+      "allowlist": "src/weight/adapters/qwen.cpp"
+    },
+    {
+      "family": "qwen",
+      "match": "contains",
+      "legacy_pattern": "router",
+      "role": "router",
+      "standalone": false,
+      "expert_axis": "0 only for expert-indexed logical rank>2",
+      "allowlist": "src/weight/adapters/qwen.cpp"
+    },
+    {
+      "family": "qwen",
+      "match": "contains",
+      "legacy_pattern": "norm",
+      "role": "norm",
+      "standalone": false,
+      "expert_axis": "0 only for expert-indexed logical rank>2",
+      "allowlist": "src/weight/adapters/qwen.cpp"
+    },
+    {
+      "family": "qwen",
+      "match": "contains",
+      "legacy_pattern": ".bias",
+      "role": "bias",
+      "standalone": false,
+      "expert_axis": "0 only for expert-indexed logical rank>2",
+      "allowlist": "src/weight/adapters/qwen.cpp"
+    },
+    {
+      "family": "qwen",
+      "match": "contains",
+      "legacy_pattern": "q_proj",
+      "role": "attention_q",
+      "standalone": false,
+      "expert_axis": "0 only for expert-indexed logical rank>2",
+      "allowlist": "src/weight/adapters/qwen.cpp"
+    },
+    {
+      "family": "qwen",
+      "match": "contains",
+      "legacy_pattern": "attn_q",
+      "role": "attention_q",
+      "standalone": false,
+      "expert_axis": "0 only for expert-indexed logical rank>2",
+      "allowlist": "src/weight/adapters/qwen.cpp"
+    },
+    {
+      "family": "qwen",
+      "match": "contains",
+      "legacy_pattern": "k_proj",
+      "role": "attention_k",
+      "standalone": false,
+      "expert_axis": "0 only for expert-indexed logical rank>2",
+      "allowlist": "src/weight/adapters/qwen.cpp"
+    },
+    {
+      "family": "qwen",
+      "match": "contains",
+      "legacy_pattern": "attn_k",
+      "role": "attention_k",
+      "standalone": false,
+      "expert_axis": "0 only for expert-indexed logical rank>2",
+      "allowlist": "src/weight/adapters/qwen.cpp"
+    },
+    {
+      "family": "qwen",
+      "match": "contains",
+      "legacy_pattern": "v_proj",
+      "role": "attention_v",
+      "standalone": false,
+      "expert_axis": "0 only for expert-indexed logical rank>2",
+      "allowlist": "src/weight/adapters/qwen.cpp"
+    },
+    {
+      "family": "qwen",
+      "match": "contains",
+      "legacy_pattern": "attn_v",
+      "role": "attention_v",
+      "standalone": false,
+      "expert_axis": "0 only for expert-indexed logical rank>2",
+      "allowlist": "src/weight/adapters/qwen.cpp"
+    },
+    {
+      "family": "qwen",
+      "match": "contains",
+      "legacy_pattern": "o_proj",
+      "role": "attention_o",
+      "standalone": false,
+      "expert_axis": "0 only for expert-indexed logical rank>2",
+      "allowlist": "src/weight/adapters/qwen.cpp"
+    },
+    {
+      "family": "qwen",
+      "match": "contains",
+      "legacy_pattern": "attn_output",
+      "role": "attention_o",
+      "standalone": false,
+      "expert_axis": "0 only for expert-indexed logical rank>2",
+      "allowlist": "src/weight/adapters/qwen.cpp"
+    },
+    {
+      "family": "qwen",
+      "match": "contains",
+      "legacy_pattern": "down",
+      "role": "dense_down",
+      "standalone": false,
+      "expert_axis": "0 only for expert-indexed logical rank>2",
+      "allowlist": "src/weight/adapters/qwen.cpp"
+    },
+    {
+      "family": "qwen",
+      "match": "contains",
+      "legacy_pattern": "gate",
+      "role": "dense_gate",
+      "standalone": false,
+      "expert_axis": "0 only for expert-indexed logical rank>2",
+      "allowlist": "src/weight/adapters/qwen.cpp"
+    },
+    {
+      "family": "qwen",
+      "match": "contains",
+      "legacy_pattern": "up",
+      "role": "dense_up",
+      "standalone": false,
+      "expert_axis": "0 only for expert-indexed logical rank>2",
+      "allowlist": "src/weight/adapters/qwen.cpp"
+    },
+    {
+      "family": "ds41",
+      "match": "contains",
+      "legacy_pattern": "embed",
+      "role": "embedding",
+      "standalone": false,
+      "expert_axis": "0 only for expert-indexed logical rank>2",
+      "allowlist": "src/weight/adapters/ds41.cpp"
+    },
+    {
+      "family": "ds41",
+      "match": "contains",
+      "legacy_pattern": "token_embd",
+      "role": "embedding",
+      "standalone": false,
+      "expert_axis": "0 only for expert-indexed logical rank>2",
+      "allowlist": "src/weight/adapters/ds41.cpp"
+    },
+    {
+      "family": "ds41",
+      "match": "contains",
+      "legacy_pattern": "lm_head",
+      "role": "head",
+      "standalone": false,
+      "expert_axis": "0 only for expert-indexed logical rank>2",
+      "allowlist": "src/weight/adapters/ds41.cpp"
+    },
+    {
+      "family": "ds41",
+      "match": "contains",
+      "legacy_pattern": "output.weight",
+      "role": "head",
+      "standalone": false,
+      "expert_axis": "0 only for expert-indexed logical rank>2",
+      "allowlist": "src/weight/adapters/ds41.cpp"
+    },
+    {
+      "family": "ds41",
+      "match": "contains",
+      "legacy_pattern": "ffn_gate_inp",
+      "role": "router",
+      "standalone": false,
+      "expert_axis": "0 only for expert-indexed logical rank>2",
+      "allowlist": "src/weight/adapters/ds41.cpp"
+    },
+    {
+      "family": "ds41",
+      "match": "contains",
+      "legacy_pattern": "router",
+      "role": "router",
+      "standalone": false,
+      "expert_axis": "0 only for expert-indexed logical rank>2",
+      "allowlist": "src/weight/adapters/ds41.cpp"
+    },
+    {
+      "family": "ds41",
+      "match": "contains",
+      "legacy_pattern": "norm",
+      "role": "norm",
+      "standalone": false,
+      "expert_axis": "0 only for expert-indexed logical rank>2",
+      "allowlist": "src/weight/adapters/ds41.cpp"
+    },
+    {
+      "family": "ds41",
+      "match": "contains",
+      "legacy_pattern": ".bias",
+      "role": "bias",
+      "standalone": false,
+      "expert_axis": "0 only for expert-indexed logical rank>2",
+      "allowlist": "src/weight/adapters/ds41.cpp"
+    },
+    {
+      "family": "ds41",
+      "match": "contains",
+      "legacy_pattern": "q_proj",
+      "role": "attention_q",
+      "standalone": false,
+      "expert_axis": "0 only for expert-indexed logical rank>2",
+      "allowlist": "src/weight/adapters/ds41.cpp"
+    },
+    {
+      "family": "ds41",
+      "match": "contains",
+      "legacy_pattern": "attn_q",
+      "role": "attention_q",
+      "standalone": false,
+      "expert_axis": "0 only for expert-indexed logical rank>2",
+      "allowlist": "src/weight/adapters/ds41.cpp"
+    },
+    {
+      "family": "ds41",
+      "match": "contains",
+      "legacy_pattern": "k_proj",
+      "role": "attention_k",
+      "standalone": false,
+      "expert_axis": "0 only for expert-indexed logical rank>2",
+      "allowlist": "src/weight/adapters/ds41.cpp"
+    },
+    {
+      "family": "ds41",
+      "match": "contains",
+      "legacy_pattern": "attn_k",
+      "role": "attention_k",
+      "standalone": false,
+      "expert_axis": "0 only for expert-indexed logical rank>2",
+      "allowlist": "src/weight/adapters/ds41.cpp"
+    },
+    {
+      "family": "ds41",
+      "match": "contains",
+      "legacy_pattern": "v_proj",
+      "role": "attention_v",
+      "standalone": false,
+      "expert_axis": "0 only for expert-indexed logical rank>2",
+      "allowlist": "src/weight/adapters/ds41.cpp"
+    },
+    {
+      "family": "ds41",
+      "match": "contains",
+      "legacy_pattern": "attn_v",
+      "role": "attention_v",
+      "standalone": false,
+      "expert_axis": "0 only for expert-indexed logical rank>2",
+      "allowlist": "src/weight/adapters/ds41.cpp"
+    },
+    {
+      "family": "ds41",
+      "match": "contains",
+      "legacy_pattern": "o_proj",
+      "role": "attention_o",
+      "standalone": false,
+      "expert_axis": "0 only for expert-indexed logical rank>2",
+      "allowlist": "src/weight/adapters/ds41.cpp"
+    },
+    {
+      "family": "ds41",
+      "match": "contains",
+      "legacy_pattern": "attn_output",
+      "role": "attention_o",
+      "standalone": false,
+      "expert_axis": "0 only for expert-indexed logical rank>2",
+      "allowlist": "src/weight/adapters/ds41.cpp"
+    },
+    {
+      "family": "ds41",
+      "match": "contains",
+      "legacy_pattern": "down",
+      "role": "dense_down",
+      "standalone": false,
+      "expert_axis": "0 only for expert-indexed logical rank>2",
+      "allowlist": "src/weight/adapters/ds41.cpp"
+    },
+    {
+      "family": "ds41",
+      "match": "contains",
+      "legacy_pattern": "gate",
+      "role": "dense_gate",
+      "standalone": false,
+      "expert_axis": "0 only for expert-indexed logical rank>2",
+      "allowlist": "src/weight/adapters/ds41.cpp"
+    },
+    {
+      "family": "ds41",
+      "match": "contains",
+      "legacy_pattern": "up",
+      "role": "dense_up",
+      "standalone": false,
+      "expert_axis": "0 only for expert-indexed logical rank>2",
+      "allowlist": "src/weight/adapters/ds41.cpp"
+    },
+    {
+      "family": "minimax",
+      "match": "contains",
+      "legacy_pattern": "embed",
+      "role": "embedding",
+      "standalone": false,
+      "expert_axis": "0 only for expert-indexed logical rank>2",
+      "allowlist": "src/weight/adapters/minimax.cpp"
+    },
+    {
+      "family": "minimax",
+      "match": "contains",
+      "legacy_pattern": "token_embd",
+      "role": "embedding",
+      "standalone": false,
+      "expert_axis": "0 only for expert-indexed logical rank>2",
+      "allowlist": "src/weight/adapters/minimax.cpp"
+    },
+    {
+      "family": "minimax",
+      "match": "contains",
+      "legacy_pattern": "lm_head",
+      "role": "head",
+      "standalone": false,
+      "expert_axis": "0 only for expert-indexed logical rank>2",
+      "allowlist": "src/weight/adapters/minimax.cpp"
+    },
+    {
+      "family": "minimax",
+      "match": "contains",
+      "legacy_pattern": "output.weight",
+      "role": "head",
+      "standalone": false,
+      "expert_axis": "0 only for expert-indexed logical rank>2",
+      "allowlist": "src/weight/adapters/minimax.cpp"
+    },
+    {
+      "family": "minimax",
+      "match": "contains",
+      "legacy_pattern": "ffn_gate_inp",
+      "role": "router",
+      "standalone": false,
+      "expert_axis": "0 only for expert-indexed logical rank>2",
+      "allowlist": "src/weight/adapters/minimax.cpp"
+    },
+    {
+      "family": "minimax",
+      "match": "contains",
+      "legacy_pattern": "router",
+      "role": "router",
+      "standalone": false,
+      "expert_axis": "0 only for expert-indexed logical rank>2",
+      "allowlist": "src/weight/adapters/minimax.cpp"
+    },
+    {
+      "family": "minimax",
+      "match": "contains",
+      "legacy_pattern": "norm",
+      "role": "norm",
+      "standalone": false,
+      "expert_axis": "0 only for expert-indexed logical rank>2",
+      "allowlist": "src/weight/adapters/minimax.cpp"
+    },
+    {
+      "family": "minimax",
+      "match": "contains",
+      "legacy_pattern": ".bias",
+      "role": "bias",
+      "standalone": false,
+      "expert_axis": "0 only for expert-indexed logical rank>2",
+      "allowlist": "src/weight/adapters/minimax.cpp"
+    },
+    {
+      "family": "minimax",
+      "match": "contains",
+      "legacy_pattern": "q_proj",
+      "role": "attention_q",
+      "standalone": false,
+      "expert_axis": "0 only for expert-indexed logical rank>2",
+      "allowlist": "src/weight/adapters/minimax.cpp"
+    },
+    {
+      "family": "minimax",
+      "match": "contains",
+      "legacy_pattern": "attn_q",
+      "role": "attention_q",
+      "standalone": false,
+      "expert_axis": "0 only for expert-indexed logical rank>2",
+      "allowlist": "src/weight/adapters/minimax.cpp"
+    },
+    {
+      "family": "minimax",
+      "match": "contains",
+      "legacy_pattern": "k_proj",
+      "role": "attention_k",
+      "standalone": false,
+      "expert_axis": "0 only for expert-indexed logical rank>2",
+      "allowlist": "src/weight/adapters/minimax.cpp"
+    },
+    {
+      "family": "minimax",
+      "match": "contains",
+      "legacy_pattern": "attn_k",
+      "role": "attention_k",
+      "standalone": false,
+      "expert_axis": "0 only for expert-indexed logical rank>2",
+      "allowlist": "src/weight/adapters/minimax.cpp"
+    },
+    {
+      "family": "minimax",
+      "match": "contains",
+      "legacy_pattern": "v_proj",
+      "role": "attention_v",
+      "standalone": false,
+      "expert_axis": "0 only for expert-indexed logical rank>2",
+      "allowlist": "src/weight/adapters/minimax.cpp"
+    },
+    {
+      "family": "minimax",
+      "match": "contains",
+      "legacy_pattern": "attn_v",
+      "role": "attention_v",
+      "standalone": false,
+      "expert_axis": "0 only for expert-indexed logical rank>2",
+      "allowlist": "src/weight/adapters/minimax.cpp"
+    },
+    {
+      "family": "minimax",
+      "match": "contains",
+      "legacy_pattern": "o_proj",
+      "role": "attention_o",
+      "standalone": false,
+      "expert_axis": "0 only for expert-indexed logical rank>2",
+      "allowlist": "src/weight/adapters/minimax.cpp"
+    },
+    {
+      "family": "minimax",
+      "match": "contains",
+      "legacy_pattern": "attn_output",
+      "role": "attention_o",
+      "standalone": false,
+      "expert_axis": "0 only for expert-indexed logical rank>2",
+      "allowlist": "src/weight/adapters/minimax.cpp"
+    },
+    {
+      "family": "minimax",
+      "match": "contains",
+      "legacy_pattern": "down",
+      "role": "dense_down",
+      "standalone": false,
+      "expert_axis": "0 only for expert-indexed logical rank>2",
+      "allowlist": "src/weight/adapters/minimax.cpp"
+    },
+    {
+      "family": "minimax",
+      "match": "contains",
+      "legacy_pattern": "gate",
+      "role": "dense_gate",
+      "standalone": false,
+      "expert_axis": "0 only for expert-indexed logical rank>2",
+      "allowlist": "src/weight/adapters/minimax.cpp"
+    },
+    {
+      "family": "minimax",
+      "match": "contains",
+      "legacy_pattern": "up",
+      "role": "dense_up",
+      "standalone": false,
+      "expert_axis": "0 only for expert-indexed logical rank>2",
+      "allowlist": "src/weight/adapters/minimax.cpp"
+    },
+    {
+      "family": "glm",
+      "match": "contains",
+      "legacy_pattern": "embed",
+      "role": "embedding",
+      "standalone": false,
+      "expert_axis": "0 only for expert-indexed logical rank>2",
+      "allowlist": "src/weight/adapters/glm.cpp"
+    },
+    {
+      "family": "glm",
+      "match": "contains",
+      "legacy_pattern": "token_embd",
+      "role": "embedding",
+      "standalone": false,
+      "expert_axis": "0 only for expert-indexed logical rank>2",
+      "allowlist": "src/weight/adapters/glm.cpp"
+    },
+    {
+      "family": "glm",
+      "match": "contains",
+      "legacy_pattern": "lm_head",
+      "role": "head",
+      "standalone": false,
+      "expert_axis": "0 only for expert-indexed logical rank>2",
+      "allowlist": "src/weight/adapters/glm.cpp"
+    },
+    {
+      "family": "glm",
+      "match": "contains",
+      "legacy_pattern": "output.weight",
+      "role": "head",
+      "standalone": false,
+      "expert_axis": "0 only for expert-indexed logical rank>2",
+      "allowlist": "src/weight/adapters/glm.cpp"
+    },
+    {
+      "family": "glm",
+      "match": "contains",
+      "legacy_pattern": "ffn_gate_inp",
+      "role": "router",
+      "standalone": false,
+      "expert_axis": "0 only for expert-indexed logical rank>2",
+      "allowlist": "src/weight/adapters/glm.cpp"
+    },
+    {
+      "family": "glm",
+      "match": "contains",
+      "legacy_pattern": "router",
+      "role": "router",
+      "standalone": false,
+      "expert_axis": "0 only for expert-indexed logical rank>2",
+      "allowlist": "src/weight/adapters/glm.cpp"
+    },
+    {
+      "family": "glm",
+      "match": "contains",
+      "legacy_pattern": "norm",
+      "role": "norm",
+      "standalone": false,
+      "expert_axis": "0 only for expert-indexed logical rank>2",
+      "allowlist": "src/weight/adapters/glm.cpp"
+    },
+    {
+      "family": "glm",
+      "match": "contains",
+      "legacy_pattern": ".bias",
+      "role": "bias",
+      "standalone": false,
+      "expert_axis": "0 only for expert-indexed logical rank>2",
+      "allowlist": "src/weight/adapters/glm.cpp"
+    },
+    {
+      "family": "glm",
+      "match": "contains",
+      "legacy_pattern": "q_proj",
+      "role": "attention_q",
+      "standalone": false,
+      "expert_axis": "0 only for expert-indexed logical rank>2",
+      "allowlist": "src/weight/adapters/glm.cpp"
+    },
+    {
+      "family": "glm",
+      "match": "contains",
+      "legacy_pattern": "attn_q",
+      "role": "attention_q",
+      "standalone": false,
+      "expert_axis": "0 only for expert-indexed logical rank>2",
+      "allowlist": "src/weight/adapters/glm.cpp"
+    },
+    {
+      "family": "glm",
+      "match": "contains",
+      "legacy_pattern": "k_proj",
+      "role": "attention_k",
+      "standalone": false,
+      "expert_axis": "0 only for expert-indexed logical rank>2",
+      "allowlist": "src/weight/adapters/glm.cpp"
+    },
+    {
+      "family": "glm",
+      "match": "contains",
+      "legacy_pattern": "attn_k",
+      "role": "attention_k",
+      "standalone": false,
+      "expert_axis": "0 only for expert-indexed logical rank>2",
+      "allowlist": "src/weight/adapters/glm.cpp"
+    },
+    {
+      "family": "glm",
+      "match": "contains",
+      "legacy_pattern": "v_proj",
+      "role": "attention_v",
+      "standalone": false,
+      "expert_axis": "0 only for expert-indexed logical rank>2",
+      "allowlist": "src/weight/adapters/glm.cpp"
+    },
+    {
+      "family": "glm",
+      "match": "contains",
+      "legacy_pattern": "attn_v",
+      "role": "attention_v",
+      "standalone": false,
+      "expert_axis": "0 only for expert-indexed logical rank>2",
+      "allowlist": "src/weight/adapters/glm.cpp"
+    },
+    {
+      "family": "glm",
+      "match": "contains",
+      "legacy_pattern": "o_proj",
+      "role": "attention_o",
+      "standalone": false,
+      "expert_axis": "0 only for expert-indexed logical rank>2",
+      "allowlist": "src/weight/adapters/glm.cpp"
+    },
+    {
+      "family": "glm",
+      "match": "contains",
+      "legacy_pattern": "attn_output",
+      "role": "attention_o",
+      "standalone": false,
+      "expert_axis": "0 only for expert-indexed logical rank>2",
+      "allowlist": "src/weight/adapters/glm.cpp"
+    },
+    {
+      "family": "glm",
+      "match": "contains",
+      "legacy_pattern": "down",
+      "role": "dense_down",
+      "standalone": false,
+      "expert_axis": "0 only for expert-indexed logical rank>2",
+      "allowlist": "src/weight/adapters/glm.cpp"
+    },
+    {
+      "family": "glm",
+      "match": "contains",
+      "legacy_pattern": "gate",
+      "role": "dense_gate",
+      "standalone": false,
+      "expert_axis": "0 only for expert-indexed logical rank>2",
+      "allowlist": "src/weight/adapters/glm.cpp"
+    },
+    {
+      "family": "glm",
+      "match": "contains",
+      "legacy_pattern": "up",
+      "role": "dense_up",
+      "standalone": false,
+      "expert_axis": "0 only for expert-indexed logical rank>2",
+      "allowlist": "src/weight/adapters/glm.cpp"
+    },
+    {
+      "family": "gemma4",
+      "match": "contains",
+      "legacy_pattern": "embed",
+      "role": "embedding",
+      "standalone": false,
+      "expert_axis": "0 only for expert-indexed logical rank>2",
+      "allowlist": "src/weight/adapters/gemma4.cpp"
+    },
+    {
+      "family": "gemma4",
+      "match": "contains",
+      "legacy_pattern": "token_embd",
+      "role": "embedding",
+      "standalone": false,
+      "expert_axis": "0 only for expert-indexed logical rank>2",
+      "allowlist": "src/weight/adapters/gemma4.cpp"
+    },
+    {
+      "family": "gemma4",
+      "match": "contains",
+      "legacy_pattern": "lm_head",
+      "role": "head",
+      "standalone": false,
+      "expert_axis": "0 only for expert-indexed logical rank>2",
+      "allowlist": "src/weight/adapters/gemma4.cpp"
+    },
+    {
+      "family": "gemma4",
+      "match": "contains",
+      "legacy_pattern": "output.weight",
+      "role": "head",
+      "standalone": false,
+      "expert_axis": "0 only for expert-indexed logical rank>2",
+      "allowlist": "src/weight/adapters/gemma4.cpp"
+    },
+    {
+      "family": "gemma4",
+      "match": "contains",
+      "legacy_pattern": "ffn_gate_inp",
+      "role": "router",
+      "standalone": false,
+      "expert_axis": "0 only for expert-indexed logical rank>2",
+      "allowlist": "src/weight/adapters/gemma4.cpp"
+    },
+    {
+      "family": "gemma4",
+      "match": "contains",
+      "legacy_pattern": "router",
+      "role": "router",
+      "standalone": false,
+      "expert_axis": "0 only for expert-indexed logical rank>2",
+      "allowlist": "src/weight/adapters/gemma4.cpp"
+    },
+    {
+      "family": "gemma4",
+      "match": "contains",
+      "legacy_pattern": "norm",
+      "role": "norm",
+      "standalone": false,
+      "expert_axis": "0 only for expert-indexed logical rank>2",
+      "allowlist": "src/weight/adapters/gemma4.cpp"
+    },
+    {
+      "family": "gemma4",
+      "match": "contains",
+      "legacy_pattern": ".bias",
+      "role": "bias",
+      "standalone": false,
+      "expert_axis": "0 only for expert-indexed logical rank>2",
+      "allowlist": "src/weight/adapters/gemma4.cpp"
+    },
+    {
+      "family": "gemma4",
+      "match": "contains",
+      "legacy_pattern": "q_proj",
+      "role": "attention_q",
+      "standalone": false,
+      "expert_axis": "0 only for expert-indexed logical rank>2",
+      "allowlist": "src/weight/adapters/gemma4.cpp"
+    },
+    {
+      "family": "gemma4",
+      "match": "contains",
+      "legacy_pattern": "attn_q",
+      "role": "attention_q",
+      "standalone": false,
+      "expert_axis": "0 only for expert-indexed logical rank>2",
+      "allowlist": "src/weight/adapters/gemma4.cpp"
+    },
+    {
+      "family": "gemma4",
+      "match": "contains",
+      "legacy_pattern": "k_proj",
+      "role": "attention_k",
+      "standalone": false,
+      "expert_axis": "0 only for expert-indexed logical rank>2",
+      "allowlist": "src/weight/adapters/gemma4.cpp"
+    },
+    {
+      "family": "gemma4",
+      "match": "contains",
+      "legacy_pattern": "attn_k",
+      "role": "attention_k",
+      "standalone": false,
+      "expert_axis": "0 only for expert-indexed logical rank>2",
+      "allowlist": "src/weight/adapters/gemma4.cpp"
+    },
+    {
+      "family": "gemma4",
+      "match": "contains",
+      "legacy_pattern": "v_proj",
+      "role": "attention_v",
+      "standalone": false,
+      "expert_axis": "0 only for expert-indexed logical rank>2",
+      "allowlist": "src/weight/adapters/gemma4.cpp"
+    },
+    {
+      "family": "gemma4",
+      "match": "contains",
+      "legacy_pattern": "attn_v",
+      "role": "attention_v",
+      "standalone": false,
+      "expert_axis": "0 only for expert-indexed logical rank>2",
+      "allowlist": "src/weight/adapters/gemma4.cpp"
+    },
+    {
+      "family": "gemma4",
+      "match": "contains",
+      "legacy_pattern": "o_proj",
+      "role": "attention_o",
+      "standalone": false,
+      "expert_axis": "0 only for expert-indexed logical rank>2",
+      "allowlist": "src/weight/adapters/gemma4.cpp"
+    },
+    {
+      "family": "gemma4",
+      "match": "contains",
+      "legacy_pattern": "attn_output",
+      "role": "attention_o",
+      "standalone": false,
+      "expert_axis": "0 only for expert-indexed logical rank>2",
+      "allowlist": "src/weight/adapters/gemma4.cpp"
+    },
+    {
+      "family": "gemma4",
+      "match": "contains",
+      "legacy_pattern": "down",
+      "role": "dense_down",
+      "standalone": false,
+      "expert_axis": "0 only for expert-indexed logical rank>2",
+      "allowlist": "src/weight/adapters/gemma4.cpp"
+    },
+    {
+      "family": "gemma4",
+      "match": "contains",
+      "legacy_pattern": "gate",
+      "role": "dense_gate",
+      "standalone": false,
+      "expert_axis": "0 only for expert-indexed logical rank>2",
+      "allowlist": "src/weight/adapters/gemma4.cpp"
+    },
+    {
+      "family": "gemma4",
+      "match": "contains",
+      "legacy_pattern": "up",
+      "role": "dense_up",
+      "standalone": false,
+      "expert_axis": "0 only for expert-indexed logical rank>2",
+      "allowlist": "src/weight/adapters/gemma4.cpp"
+    },
+    {
+      "family": "h3",
+      "match": "contains",
+      "legacy_pattern": "adaln_t_table",
+      "role": "lookup_row",
+      "standalone": true,
+      "expert_axis": "0 only for expert-indexed logical rank>2",
+      "allowlist": "src/weight/adapters/h3.cpp"
+    },
+    {
+      "family": "h3",
+      "match": "contains",
+      "legacy_pattern": "rope.inv_freq",
+      "role": "auxiliary",
+      "standalone": true,
+      "expert_axis": "0 only for expert-indexed logical rank>2",
+      "allowlist": "src/weight/adapters/h3.cpp"
+    },
+    {
+      "family": "h3",
+      "match": "contains",
+      "legacy_pattern": "token_embd",
+      "role": "embedding",
+      "standalone": false,
+      "expert_axis": "0 only for expert-indexed logical rank>2",
+      "allowlist": "src/weight/adapters/h3.cpp"
+    },
+    {
+      "family": "h3",
+      "match": "contains",
+      "legacy_pattern": "lm_head",
+      "role": "head",
+      "standalone": false,
+      "expert_axis": "0 only for expert-indexed logical rank>2",
+      "allowlist": "src/weight/adapters/h3.cpp"
+    },
+    {
+      "family": "h3",
+      "match": "contains",
+      "legacy_pattern": "output.weight",
+      "role": "head",
+      "standalone": false,
+      "expert_axis": "0 only for expert-indexed logical rank>2",
+      "allowlist": "src/weight/adapters/h3.cpp"
+    },
+    {
+      "family": "h3",
+      "match": "contains",
+      "legacy_pattern": "ffn_gate_inp",
+      "role": "router",
+      "standalone": false,
+      "expert_axis": "0 only for expert-indexed logical rank>2",
+      "allowlist": "src/weight/adapters/h3.cpp"
+    },
+    {
+      "family": "h3",
+      "match": "contains",
+      "legacy_pattern": "router",
+      "role": "router",
+      "standalone": false,
+      "expert_axis": "0 only for expert-indexed logical rank>2",
+      "allowlist": "src/weight/adapters/h3.cpp"
+    },
+    {
+      "family": "h3",
+      "match": "contains",
+      "legacy_pattern": "norm",
+      "role": "norm",
+      "standalone": false,
+      "expert_axis": "0 only for expert-indexed logical rank>2",
+      "allowlist": "src/weight/adapters/h3.cpp"
+    },
+    {
+      "family": "h3",
+      "match": "contains",
+      "legacy_pattern": ".bias",
+      "role": "bias",
+      "standalone": false,
+      "expert_axis": "0 only for expert-indexed logical rank>2",
+      "allowlist": "src/weight/adapters/h3.cpp"
+    },
+    {
+      "family": "h3",
+      "match": "contains",
+      "legacy_pattern": "q_proj",
+      "role": "attention_q",
+      "standalone": false,
+      "expert_axis": "0 only for expert-indexed logical rank>2",
+      "allowlist": "src/weight/adapters/h3.cpp"
+    },
+    {
+      "family": "h3",
+      "match": "contains",
+      "legacy_pattern": "attn_q",
+      "role": "attention_q",
+      "standalone": false,
+      "expert_axis": "0 only for expert-indexed logical rank>2",
+      "allowlist": "src/weight/adapters/h3.cpp"
+    },
+    {
+      "family": "h3",
+      "match": "contains",
+      "legacy_pattern": "k_proj",
+      "role": "attention_k",
+      "standalone": false,
+      "expert_axis": "0 only for expert-indexed logical rank>2",
+      "allowlist": "src/weight/adapters/h3.cpp"
+    },
+    {
+      "family": "h3",
+      "match": "contains",
+      "legacy_pattern": "attn_k",
+      "role": "attention_k",
+      "standalone": false,
+      "expert_axis": "0 only for expert-indexed logical rank>2",
+      "allowlist": "src/weight/adapters/h3.cpp"
+    },
+    {
+      "family": "h3",
+      "match": "contains",
+      "legacy_pattern": "v_proj",
+      "role": "attention_v",
+      "standalone": false,
+      "expert_axis": "0 only for expert-indexed logical rank>2",
+      "allowlist": "src/weight/adapters/h3.cpp"
+    },
+    {
+      "family": "h3",
+      "match": "contains",
+      "legacy_pattern": "attn_v",
+      "role": "attention_v",
+      "standalone": false,
+      "expert_axis": "0 only for expert-indexed logical rank>2",
+      "allowlist": "src/weight/adapters/h3.cpp"
+    },
+    {
+      "family": "h3",
+      "match": "contains",
+      "legacy_pattern": "o_proj",
+      "role": "attention_o",
+      "standalone": false,
+      "expert_axis": "0 only for expert-indexed logical rank>2",
+      "allowlist": "src/weight/adapters/h3.cpp"
+    },
+    {
+      "family": "h3",
+      "match": "contains",
+      "legacy_pattern": "attn_output",
+      "role": "attention_o",
+      "standalone": false,
+      "expert_axis": "0 only for expert-indexed logical rank>2",
+      "allowlist": "src/weight/adapters/h3.cpp"
+    },
+    {
+      "family": "h3",
+      "match": "contains",
+      "legacy_pattern": "down",
+      "role": "dense_down",
+      "standalone": false,
+      "expert_axis": "0 only for expert-indexed logical rank>2",
+      "allowlist": "src/weight/adapters/h3.cpp"
+    },
+    {
+      "family": "h3",
+      "match": "contains",
+      "legacy_pattern": "gate",
+      "role": "dense_gate",
+      "standalone": false,
+      "expert_axis": "0 only for expert-indexed logical rank>2",
+      "allowlist": "src/weight/adapters/h3.cpp"
+    },
+    {
+      "family": "h3",
+      "match": "contains",
+      "legacy_pattern": "up",
+      "role": "dense_up",
+      "standalone": false,
+      "expert_axis": "0 only for expert-indexed logical rank>2",
+      "allowlist": "src/weight/adapters/h3.cpp"
+    },
+    {
+      "family": "vision",
+      "match": "contains",
+      "legacy_pattern": "embed",
+      "role": "embedding",
+      "standalone": false,
+      "expert_axis": "0 only for expert-indexed logical rank>2",
+      "allowlist": "src/weight/adapters/vision.cpp"
+    },
+    {
+      "family": "vision",
+      "match": "contains",
+      "legacy_pattern": "token_embd",
+      "role": "embedding",
+      "standalone": false,
+      "expert_axis": "0 only for expert-indexed logical rank>2",
+      "allowlist": "src/weight/adapters/vision.cpp"
+    },
+    {
+      "family": "vision",
+      "match": "contains",
+      "legacy_pattern": "lm_head",
+      "role": "head",
+      "standalone": false,
+      "expert_axis": "0 only for expert-indexed logical rank>2",
+      "allowlist": "src/weight/adapters/vision.cpp"
+    },
+    {
+      "family": "vision",
+      "match": "contains",
+      "legacy_pattern": "output.weight",
+      "role": "head",
+      "standalone": false,
+      "expert_axis": "0 only for expert-indexed logical rank>2",
+      "allowlist": "src/weight/adapters/vision.cpp"
+    },
+    {
+      "family": "vision",
+      "match": "contains",
+      "legacy_pattern": "ffn_gate_inp",
+      "role": "router",
+      "standalone": false,
+      "expert_axis": "0 only for expert-indexed logical rank>2",
+      "allowlist": "src/weight/adapters/vision.cpp"
+    },
+    {
+      "family": "vision",
+      "match": "contains",
+      "legacy_pattern": "router",
+      "role": "router",
+      "standalone": false,
+      "expert_axis": "0 only for expert-indexed logical rank>2",
+      "allowlist": "src/weight/adapters/vision.cpp"
+    },
+    {
+      "family": "vision",
+      "match": "contains",
+      "legacy_pattern": "norm",
+      "role": "norm",
+      "standalone": false,
+      "expert_axis": "0 only for expert-indexed logical rank>2",
+      "allowlist": "src/weight/adapters/vision.cpp"
+    },
+    {
+      "family": "vision",
+      "match": "contains",
+      "legacy_pattern": ".bias",
+      "role": "bias",
+      "standalone": false,
+      "expert_axis": "0 only for expert-indexed logical rank>2",
+      "allowlist": "src/weight/adapters/vision.cpp"
+    },
+    {
+      "family": "vision",
+      "match": "contains",
+      "legacy_pattern": "q_proj",
+      "role": "attention_q",
+      "standalone": false,
+      "expert_axis": "0 only for expert-indexed logical rank>2",
+      "allowlist": "src/weight/adapters/vision.cpp"
+    },
+    {
+      "family": "vision",
+      "match": "contains",
+      "legacy_pattern": "attn_q",
+      "role": "attention_q",
+      "standalone": false,
+      "expert_axis": "0 only for expert-indexed logical rank>2",
+      "allowlist": "src/weight/adapters/vision.cpp"
+    },
+    {
+      "family": "vision",
+      "match": "contains",
+      "legacy_pattern": "k_proj",
+      "role": "attention_k",
+      "standalone": false,
+      "expert_axis": "0 only for expert-indexed logical rank>2",
+      "allowlist": "src/weight/adapters/vision.cpp"
+    },
+    {
+      "family": "vision",
+      "match": "contains",
+      "legacy_pattern": "attn_k",
+      "role": "attention_k",
+      "standalone": false,
+      "expert_axis": "0 only for expert-indexed logical rank>2",
+      "allowlist": "src/weight/adapters/vision.cpp"
+    },
+    {
+      "family": "vision",
+      "match": "contains",
+      "legacy_pattern": "v_proj",
+      "role": "attention_v",
+      "standalone": false,
+      "expert_axis": "0 only for expert-indexed logical rank>2",
+      "allowlist": "src/weight/adapters/vision.cpp"
+    },
+    {
+      "family": "vision",
+      "match": "contains",
+      "legacy_pattern": "attn_v",
+      "role": "attention_v",
+      "standalone": false,
+      "expert_axis": "0 only for expert-indexed logical rank>2",
+      "allowlist": "src/weight/adapters/vision.cpp"
+    },
+    {
+      "family": "vision",
+      "match": "contains",
+      "legacy_pattern": "o_proj",
+      "role": "attention_o",
+      "standalone": false,
+      "expert_axis": "0 only for expert-indexed logical rank>2",
+      "allowlist": "src/weight/adapters/vision.cpp"
+    },
+    {
+      "family": "vision",
+      "match": "contains",
+      "legacy_pattern": "attn_output",
+      "role": "attention_o",
+      "standalone": false,
+      "expert_axis": "0 only for expert-indexed logical rank>2",
+      "allowlist": "src/weight/adapters/vision.cpp"
+    },
+    {
+      "family": "vision",
+      "match": "contains",
+      "legacy_pattern": "down",
+      "role": "dense_down",
+      "standalone": false,
+      "expert_axis": "0 only for expert-indexed logical rank>2",
+      "allowlist": "src/weight/adapters/vision.cpp"
+    },
+    {
+      "family": "vision",
+      "match": "contains",
+      "legacy_pattern": "gate",
+      "role": "dense_gate",
+      "standalone": false,
+      "expert_axis": "0 only for expert-indexed logical rank>2",
+      "allowlist": "src/weight/adapters/vision.cpp"
+    },
+    {
+      "family": "vision",
+      "match": "contains",
+      "legacy_pattern": "up",
+      "role": "dense_up",
+      "standalone": false,
+      "expert_axis": "0 only for expert-indexed logical rank>2",
+      "allowlist": "src/weight/adapters/vision.cpp"
+    },
+    {
+      "family": "vision",
+      "match": "contains",
+      "legacy_pattern": "",
+      "role": "dense_up",
+      "standalone": true,
+      "expert_axis": "0 only for expert-indexed logical rank>2",
+      "allowlist": "src/weight/adapters/vision.cpp"
+    }
+  ],
+  "source_notes": [
+    "GGUF tensor_type_geometry now forwards canonical registry; census compares every frozen geometry against live reader and enumerates the wire map.",
+    "Declaration-only Qwen/MiniMax model_description loaders do not own tensor data; binding lives at actual HIP/CUDA upload, MiniMax PackReader and GLM Index.",
+    "H3 quant formats require authoritative U8 JSON config; EXL3 needs checked companions and mul1 marker or explicit legacy fixed-codebook graph contract.",
+    "Tensor IDs use pack-relative shard namespace plus bounded container-header SHA256 and tensor name; file Source full content SHA256 remains lazy and guards cache identity."
   ]
 }

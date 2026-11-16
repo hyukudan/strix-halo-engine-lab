@@ -2451,7 +2451,8 @@ inline void run_mtp_decode_bridge(const Options& options,const ModelContract& mo
     }
     }
     const auto assets=parents->assets ? parents->assets : load_mtp_cli_assets(m,model,actual.mapped,actual.manifest,actual.model,generations);
-    HipMtpBudget native_budget;native_budget.retained_bytes=m.runtime_bytes;native_budget.context_capacity=options.context_tokens;
+    HipMtpBudget native_budget;native_budget.retained_bytes=mtp_payload::runtime_budget(model,options.context_tokens,m.runtime_bytes,m.runtime_automatic);
+    native_budget.context_capacity=options.context_tokens;
     native_budget.maximum_candidate_depth=m.candidate_depth;
     native_budget.normalized_rounding=m.normalized_rounding=="fp32"?HipMtpInputRounding::fp32:HipMtpInputRounding::bf16_rne;
     native_budget.projection_rounding=m.projection_rounding=="fp32"?HipMtpInputRounding::fp32:HipMtpInputRounding::bf16_rne;

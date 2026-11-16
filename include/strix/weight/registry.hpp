@@ -11,4 +11,6 @@ FormatId gguf_format(std::uint32_t) noexcept;
 std::uint32_t gguf_type(FormatId) noexcept; // UINT32_MAX if not a GGUF wire alias
 Status format_geometry(FormatId, const Parameters&, Geometry&);
 Status validate_weight(const WeightView&);
+Status validate_metadata(const WeightView&);
+Status validate_binding(const Registry&, const WeightMapEntry&);
 }

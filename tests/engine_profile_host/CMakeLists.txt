@@ -36,6 +36,9 @@ target_compile_definitions(strix-minimax-route-identity-tests PRIVATE STRIX_ROUT
 
 profile_host_test(strix-deepseek41-pair-defaults-tests "${STRIX_ROOT}/tests/deepseek41_pair_defaults_tests.cpp"
     "${STRIX_ROOT}/src/deepseek41_pair_defaults.cpp")
+add_test(NAME strix-deepseek41-dspark-inspection
+    COMMAND "${CMAKE_COMMAND}" "-DTEST_EXE=$<TARGET_FILE:strix-deepseek41-pair-defaults-tests>"
+        -P "${CMAKE_CURRENT_LIST_DIR}/dspark_inspection.cmake")
 profile_host_test(strix-ds41-rtx-profile-tests "${STRIX_ROOT}/tests/ds41_rtx_profile_tests.cpp"
     "${STRIX_ROOT}/src/ds41_rtx_profile.cpp")
 profile_host_test(strix-gemma4-profile-tests "${STRIX_ROOT}/tests/gemma4_profile/profile_tests.cpp"

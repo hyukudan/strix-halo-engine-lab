@@ -177,12 +177,13 @@ inline CutPrediction choose_cut(const LayerCosts& costs, const LegalCuts& legal,
         throw std::invalid_argument("pair prefill model has no legal folded attention-HC cut");
     }
 }
-// Largest prefix accepted by a full tile or a >=16 row, multiple-of-eight tail.
+// Largest prefix the pipeline carries: full tiles, then a remainder on the 16-row tail grain. The cursor runs a
+// remainder as a merged partial block and 64 / 16-row tail blocks, and only its last rem % 16 rows serially; a
+// serial row has no seam (each rank would run its own whole model), so those rows go to the hand-off suffix.
+inline constexpr std::uint32_t pipe_tail_grain = 16U;
 inline std::uint64_t legal_prefix(std::uint64_t prompt, std::uint32_t rows) {
     if (rows < 16U || rows % 8U != 0U) throw std::invalid_argument("pair handoff invalid tile rows");
-    auto prefix = prompt - prompt % 8U;
-    if (prefix % rows == 8U) prefix -= 8U;
-    return prefix;
+    return prompt - prompt % pipe_tail_grain;
 }
 struct PromptRoute { std::uint64_t prefix = 0; const char* reason = "single-short"; };
 inline PromptRoute choose_prompt_route(std::uint64_t prompt, std::uint32_t rows,

@@ -47,6 +47,10 @@ Status format_geometry(FormatId id, const Parameters& parameters, Geometry& geom
  if (!format) return {Error::unknown_format, "unregistered storage identity"};
  return format->geometry(parameters, geometry);
 }
+Status validate_metadata(const WeightView& weight) {
+ try{return detail::validate_metadata(weight);}catch(const std::exception& error){return {Error::malformed,error.what()};}
+}
+
 Status validate_weight(const WeightView& weight) {
  const auto* format = find_format(builtin_registry(), weight.storage);
  if (!format) return {Error::unknown_format, "unregistered storage identity"};
