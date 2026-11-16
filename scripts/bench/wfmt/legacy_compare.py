@@ -7,6 +7,7 @@ import hashlib
 import json
 import pathlib
 import platform
+import re
 import subprocess
 import sys
 
@@ -57,7 +58,12 @@ def main():
                 raise ValueError("legacy capture executable missing")
             cache = (build / "CMakeCache.txt").read_text()
             compiler_line = next(line for line in cache.splitlines() if line.startswith("CMAKE_CXX_COMPILER:"))
+            compiler_info = next(build.glob("CMakeFiles/*/CMakeCXXCompiler.cmake")).read_text()
+            compiler_version = re.search(r'set\(CMAKE_CXX_COMPILER_VERSION "([^"]+)"\)', compiler_info).group(1)
+            flags = {line.split("=", 1)[0]: line.split("=", 1)[1] for line in cache.splitlines()
+                     if line.startswith(("CMAKE_CXX_FLAGS:STRING=", "CMAKE_CXX_FLAGS_RELEASE:STRING="))}
             summary["sources"][mode] = {"revision": revision, "compiler": compiler_line.split("=", 1)[1],
+                                        "compiler_version": compiler_version, "flags": flags,
                                         "binary_sha256": hashlib.sha256(executable.read_bytes()).hexdigest()}
             logged([sys.executable, str(kit / "capture.py"), "--exe", str(executable), "--matrix", str(matrix),
                     "--out", str(args.output / mode), "--compiler", compiler_line.split("=", 1)[1],
@@ -71,6 +77,9 @@ def main():
                     raise ValueError("candidate session regression test failed")
                 if mode == "baseline" and code and "duplicate tensor across safetensors shards: local" not in (args.output / "baseline-session.log").read_text():
                     raise ValueError("baseline session test has an unexpected failure")
+        for key in ("compiler", "compiler_version", "flags"):
+            if summary["sources"]["baseline"][key] != summary["sources"]["candidate"][key]:
+                raise ValueError("baseline and candidate compiler qualification differ: " + key)
         logged([sys.executable, str(kit / "compare.py"), "--baseline", str(args.output / "baseline"),
                 "--candidate", str(args.output / "candidate"), "--require-bytes", "--out", str(args.output / "comparison")],
                args.output / "compare.log")
