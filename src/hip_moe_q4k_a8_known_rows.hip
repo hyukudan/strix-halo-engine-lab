@@ -28,6 +28,7 @@
 #include <string>
 #pragma clang fp contract(off)
 #include "strix/hip_gsq_a8_groups.hpp"
+#include "hip/weight/gsq_partial_trace.hpp"
 #if defined(__HIP_DEVICE_COMPILE__)
 #if !STRIX_HAS_RDNA35_WMMA || !STRIX_HAS_SUDOT4
 #error "A8 CSR gate/up requires RDNA 3.5 packed WMMA and signed-A unsigned-B dot4"
@@ -950,6 +951,9 @@ __device__ __forceinline__ void project_iq_body(const unsigned char* gate,const 
 #pragma unroll
                 for(unsigned a=0;a<G;++a)if(group+a<count) {
                     const float value=gsq_a8::iq_apply<T>(x,reinterpret_cast<const int*>(local_codes[a]+g*32U),local_deltas[a][g]);
+#if defined(STRIX_WFMT_CAPTURE) && STRIX_WFMT_CAPTURE
+                    strix::wfmt_trace::gsq_partial(value);
+#endif
                     acc[m][a]=acc[m][a]+value;
                 }
             }
@@ -1034,6 +1038,9 @@ __device__ __forceinline__ void down_iq_body(const unsigned char* weights,const 
 #pragma unroll
             for(unsigned a=0;a<Rows;++a)if(first+a<count) {
                 const float contribution=gsq_a8::iq_apply<T>(x,reinterpret_cast<const int*>(codes[a]+group*32U),deltas[a][group]);
+#if defined(STRIX_WFMT_CAPTURE) && STRIX_WFMT_CAPTURE
+                strix::wfmt_trace::gsq_partial(contribution);
+#endif
                 acc[a]=acc[a]+contribution;
             }
         }
