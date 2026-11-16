@@ -19,6 +19,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <optional>
 #include <functional>
 #include <map>
 #include <numeric>
@@ -599,6 +600,23 @@ int main(int argc, char** argv) {
                         require_equal(mo_q32, mo_f, "out");
                     }
                 }
+            }
+            if (kArms > 2) {  // the other STRIX_ATTN_FLASH_PF loop (pipelined loads vs single stage) on arm 23: bitwise
+                const char* had = std::getenv("STRIX_ATTN_FLASH_PF");
+                const std::optional<std::string> keep = had ? std::optional<std::string>(had) : std::nullopt;
+                const bool pf = strix::attn_core::sparse::flash_pf_enabled();
+                strix::env_arms::set_env("STRIX_ATTN_FLASH_PF", std::string(pf ? "0" : "1"));
+                strix::env_arms::generation_ref().fetch_add(1, std::memory_order_acq_rel);
+                P::mla_attention_rows_versions(slot, tok, n, qb, kv_b, kHeadsR, qt, e, ob, mo, C, g_hs, 7, ov[2], gv[2]);
+                hok(hipMemcpyAsync(ob_f.data(), ob, nob * 4, hipMemcpyDeviceToHost, g_hs), "cp");
+                hok(hipMemcpyAsync(mo_f.data(), mo, nmo * 4, hipMemcpyDeviceToHost, g_hs), "cp");
+                hok(hipStreamSynchronize(g_hs), "sync");
+                strix::env_arms::set_env("STRIX_ATTN_FLASH_PF", keep);
+                strix::env_arms::generation_ref().fetch_add(1, std::memory_order_acq_rel);
+                const bool same = std::memcmp(ob_q32.data(), ob_f.data(), nob * 4) == 0 && std::memcmp(mo_q32.data(), mo_f.data(), nmo * 4) == 0;
+                std::printf("   flash pipelined loads (STRIX_ATTN_FLASH_PF %d vs %d): o-bar + out bitwise %s\n", pf ? 1 : 0, pf ? 0 : 1,
+                            same ? "equal" : "DIFFER");
+                if (!same) die("STRIX_ATTN_FLASH_PF arms differ (must be bitwise)");
             }
         }
         std::printf("== C=%u t0=%u (DSA rows see P up to %u pools, n up to %u tokens); passes bitwise equal: %s\n", C, t0, cap / kKpool,
