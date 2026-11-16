@@ -216,6 +216,8 @@ public:
     [[nodiscard]] bool prefill_msa_batch() const;
     void set_prefill_headless(bool on);  // STRIX_MM_PF_HEADLESS, default on: last layer cache-only for headless chunks (exact)
     [[nodiscard]] bool prefill_headless() const;
+    [[nodiscard]] std::uint64_t prefill_headless_chunks() const;  // cumulative successful cache-only chunks on this rank
+    [[nodiscard]] std::size_t prefill_headless_expected(std::size_t rows) const;  // qualification target, independent of admission
     void set_prefill_msa_rework(unsigned mode);  // STRIX_MM_PF_MSA_REWORK=0..10; prefill only, default 10
     [[nodiscard]] unsigned prefill_msa_rework() const;
     void set_prefill_attend4(bool on);  // STRIX_MM_PF_ATTEND4, default off; prefill only

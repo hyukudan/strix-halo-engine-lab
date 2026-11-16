@@ -3629,6 +3629,10 @@ void Engine::set_prefill_headless(bool on) {
     impl_->pf_headless = on;
 }
 bool Engine::prefill_headless() const { return impl_->pf_headless; }
+std::uint64_t Engine::prefill_headless_chunks() const { return impl_->pf_headless_chunks; }
+std::size_t Engine::prefill_headless_expected(std::size_t rows) const {
+    return strix::prefill_headless::expected_chunks(rows, impl_->opt.max_rows, impl_->pf_group);
+}
 void Engine::set_prefill_msa_rework(unsigned mode) {
     impl_->no_task("set_prefill_msa_rework");
     impl_->set_prefill_msa_rework(mode);
