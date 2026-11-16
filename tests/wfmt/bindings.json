@@ -780,11 +780,8 @@
       "status": "migrated",
       "capture": "legacy-public-entrypoint",
       "operations": [
-        "as_bytes",
-        "index_safetensors",
         "read_json",
-        "read_safetensors",
-        "view_source"
+        "read_safetensors"
       ]
     },
     {
@@ -1019,6 +1016,7 @@
         "read_linux_uma_text",
         "read_only_registered_mapping_accounting",
         "read_symlink",
+        "resolve_batch_cache_scheduler",
         "resolve_effective_config",
         "resolve_http_session_ram",
         "resolve_legacy_prefix_defaults",
@@ -1088,10 +1086,13 @@
         "host_defaults",
         "invalid_argument",
         "linears",
+        "note_default_export",
         "pf_async_min_rows",
+        "reference",
         "resolve",
         "resolve_default",
         "resolve_grouped_order",
+        "resolve_index_projection",
         "rows"
       ]
     },
@@ -1118,6 +1119,7 @@
         "invalid_argument",
         "resolve",
         "resolve_default",
+        "resolve_dspark_settings",
         "resolve_sessions"
       ]
     },
@@ -1186,8 +1188,11 @@
         "launch",
         "product",
         "reference_kernels",
+        "registered_weight_kernels",
         "scale"
-      ]
+      ],
+      "operand_source": "src/cpu/weight/source.hpp",
+      "source_registry": "src/cpu/weight/registry.cpp"
     },
     {
       "id": "cpu:src/cpu/core/reference.cpp",
@@ -1202,12 +1207,17 @@
       "status": "incumbent",
       "capture": "legacy-public-entrypoint",
       "operations": [
+        "block",
         "invalid_argument",
         "product",
         "ref_gemv_q8_0_a8",
         "ref_quantize_a8",
-        "reference_kernels"
-      ]
+        "reference_kernels",
+        "scale"
+      ],
+      "operand_source": "src/cpu/weight/source.hpp",
+      "source_registry": "src/cpu/weight/registry.cpp",
+      "kernel_address_migration": "bound: CPU raw Q8 source"
     },
     {
       "id": "cpu:src/cpu/core/select.cpp",
@@ -1223,8 +1233,11 @@
       "capture": "legacy-public-entrypoint",
       "operations": [
         "kernels",
-        "reference_kernels"
-      ]
+        "reference_kernels",
+        "registered_weight_kernels"
+      ],
+      "operand_source": "src/cpu/weight/source.hpp",
+      "source_registry": "src/cpu/weight/registry.cpp"
     },
     {
       "id": "cpu:src/cpu/arch/avx512/kernels.cpp",
@@ -1271,9 +1284,13 @@
       "status": "incumbent",
       "capture": "legacy-public-entrypoint",
       "operations": [
+        "row_bytes",
         "run_reference",
         "supported"
-      ]
+      ],
+      "operand_source": "src/intel/weight/source.hpp",
+      "source_registry": "src/intel/weight/registry.cpp",
+      "kernel_address_migration": "deferred: kernel-body edit outside current authorization"
     },
     {
       "id": "intel:src/intel/core/backend.cpp",
@@ -1290,8 +1307,11 @@
       "operations": [
         "enqueue_dense_q8a8",
         "load",
-        "supported"
-      ]
+        "validate_view"
+      ],
+      "operand_source": "src/intel/weight/source.hpp",
+      "source_registry": "src/intel/weight/registry.cpp",
+      "kernel_address_migration": "deferred: kernel-body edit outside current authorization"
     },
     {
       "id": "hip-dense:src/core/f16_dense_q8a8.hpp",
@@ -1304,16 +1324,16 @@
       "arithmetic": "dense-q8a8-f16-v1; legacy row reductions",
       "migration": "P06",
       "owner": "shared-weight-layer-maintainer",
-      "status": "incumbent",
+      "status": "migrated",
       "capture": "legacy-public-entrypoint",
       "operations": [
         "STRIX_F16_Q8A8_WPACK",
         "__launch_bounds__",
+        "activation_fragment",
         "block",
         "blocks",
         "enqueue",
         "enqueue_parts",
-        "ext_vector_type",
         "fragment",
         "hipLaunchKernelGGL",
         "kernel",
@@ -1339,21 +1359,27 @@
       "arithmetic": "dense-q8a8-f16-v1; legacy row reductions",
       "migration": "P06",
       "owner": "shared-weight-layer-maintainer",
-      "status": "incumbent",
+      "status": "migrated",
       "capture": "legacy-public-entrypoint",
       "operations": [
         "__builtin_amdgcn_readfirstlane",
+        "__launch_bounds__",
         "__syncthreads",
         "block",
+        "enqueue_x16_tiles",
         "ext_vector_type",
         "fragment",
+        "hipLaunchKernelGGL",
         "launch",
         "row_fragment",
+        "rows",
         "stage",
         "staged_fragment",
         "tile",
         "tiles",
-        "volatile"
+        "volatile",
+        "x16_bytes",
+        "x16_tiles_kernel"
       ],
       "images": [
         "Q6P32"
@@ -1370,14 +1396,13 @@
       "arithmetic": "dense-q8a8-f16-v1; legacy row reductions",
       "migration": "P06",
       "owner": "shared-weight-layer-maintainer",
-      "status": "incumbent",
+      "status": "migrated",
       "capture": "legacy-public-entrypoint",
       "operations": [
         "HIP_KERNEL_NAME",
         "Kernels",
         "Staged",
         "__builtin_amdgcn_readfirstlane",
-        "__builtin_nontemporal_load",
         "__launch_bounds__",
         "__syncthreads",
         "block",
@@ -1419,8 +1444,9 @@
         "launches",
         "load",
         "load8",
-        "load_group",
+        "load_lane",
         "load_rows",
+        "paired_blocks",
         "project_rows_dense_a8_gsq_kernel",
         "project_rows_dense_a8_kernel",
         "project_rows_dense_a8_wmma_kernel",
@@ -1436,6 +1462,7 @@
         "resident_blocks",
         "rows",
         "scale",
+        "scale_at",
         "segment_type",
         "stage",
         "stage_vectors",
@@ -1453,6 +1480,42 @@
       ]
     },
     {
+      "id": "hip-dense:src/hip/weight/ggml_sources.hpp",
+      "source": "src/hip/weight/ggml_sources.hpp",
+      "backend": "hip",
+      "formats": [
+        "Q8_0",
+        "F16"
+      ],
+      "arithmetic": "storage/address/decode only; caller keeps dense-q8a8-f16-v1 and legacy row reductions",
+      "migration": "P06",
+      "owner": "shared-weight-layer-maintainer",
+      "status": "migrated",
+      "capture": "legacy-public-entrypoint",
+      "operations": [
+        "__builtin_nontemporal_load",
+        "activation_fragment",
+        "block",
+        "decode_group",
+        "ext_vector_type",
+        "load",
+        "load_fragment",
+        "load_group",
+        "load_lane",
+        "paired_blocks",
+        "part_bytes",
+        "rows",
+        "scale",
+        "scale_at",
+        "stage",
+        "supported",
+        "validate"
+      ],
+      "images": [
+        "Q6P32"
+      ]
+    },
+    {
       "id": "hip-dense:src/hip_q6p_weights.hpp",
       "source": "src/hip_q6p_weights.hpp",
       "backend": "hip",
@@ -1463,7 +1526,7 @@
       "arithmetic": "dense-q8a8-f16-v1; legacy row reductions",
       "migration": "P06",
       "owner": "shared-weight-layer-maintainer",
-      "status": "incumbent",
+      "status": "migrated",
       "capture": "legacy-public-entrypoint",
       "operations": [
         "__builtin_amdgcn_readfirstlane",
@@ -1489,7 +1552,7 @@
       "arithmetic": "dense-q8a8-f16-v1; legacy row reductions",
       "migration": "P06",
       "owner": "shared-weight-layer-maintainer",
-      "status": "incumbent",
+      "status": "migrated",
       "capture": "legacy-public-entrypoint",
       "operations": [
         "Contract",
@@ -1656,7 +1719,7 @@
       "arithmetic": "dense-q8a8-f16-v1; legacy row reductions",
       "migration": "P06",
       "owner": "shared-weight-layer-maintainer",
-      "status": "incumbent",
+      "status": "migrated",
       "capture": "legacy-public-entrypoint",
       "operations": [
         "finish_tile",
@@ -1681,14 +1744,13 @@
       "arithmetic": "dense-q8a8-f16-v1; legacy row reductions",
       "migration": "P06",
       "owner": "shared-weight-layer-maintainer",
-      "status": "incumbent",
+      "status": "migrated",
       "capture": "legacy-public-entrypoint",
       "operations": [
         "__builtin_amdgcn_raw_buffer_load_b128",
         "__builtin_amdgcn_readfirstlane",
         "__launch_bounds__",
         "__syncthreads",
-        "bytes",
         "compute_stage",
         "default",
         "enqueue_index_proj",
@@ -1701,6 +1763,7 @@
         "enqueue_index_proj_wmma",
         "enqueue_index_proj_wmma_diag",
         "enqueue_index_proj_wmma_x16",
+        "enqueue_x16_tiles",
         "ext_vector_type",
         "fragment",
         "group",
@@ -1728,8 +1791,7 @@
         "split_default",
         "stage",
         "store_stage",
-        "tile",
-        "x16_tiles_kernel"
+        "tile"
       ],
       "images": [
         "Q6P32"
@@ -1746,15 +1808,19 @@
       "arithmetic": "dense-q8a8-f16-v1; legacy row reductions",
       "migration": "P06",
       "owner": "shared-weight-layer-maintainer",
-      "status": "incumbent",
+      "status": "migrated",
       "capture": "legacy-public-entrypoint",
       "operations": [
         "__launch_bounds__",
+        "columns",
         "dense_group",
         "dense_kernel",
+        "dense_x16_kernel",
+        "enqueue_x16_tiles",
         "kernels",
         "supported",
-        "tile"
+        "tile",
+        "x16_bytes"
       ],
       "images": [
         "Q6P32"
@@ -3028,6 +3094,7 @@
         "enqueue_hc_expand",
         "enqueue_hc_mixes",
         "enqueue_hc_site",
+        "enqueue_hip_logprob_partials",
         "enqueue_index_scores",
         "enqueue_index_scores_segments",
         "enqueue_late_mix",
@@ -3434,6 +3501,9 @@
         "loaded",
         "norm_kernel",
         "pack_kernel",
+        "pinned_host_bytes",
+        "prepare_linear",
+        "project_act_kernel",
         "rows",
         "scale",
         "splice_kernel",
@@ -3442,8 +3512,10 @@
         "sum_kernel",
         "tile",
         "unload",
+        "unshuffle_kernel",
         "valid",
-        "validate"
+        "validate",
+        "workspace_bytes"
       ],
       "images": [
         "CB4",
@@ -3689,8 +3761,8 @@
       ]
     },
     {
-      "id": "cuda-dense:include/strix/cuda_qwen_quant.cuh",
-      "source": "include/strix/cuda_qwen_quant.cuh",
+      "id": "cuda-dense:include/strix/cuda/qwen_quant.cuh",
+      "source": "include/strix/cuda/qwen_quant.cuh",
       "backend": "cuda",
       "formats": [
         "F32",
@@ -3723,8 +3795,8 @@
       ]
     },
     {
-      "id": "cuda-dense:src/cuda/qwen_prefill_driver.cu",
-      "source": "src/cuda/qwen_prefill_driver.cu",
+      "id": "cuda-dense:src/cuda/models/qwen/qwen_prefill_driver.cu",
+      "source": "src/cuda/models/qwen/qwen_prefill_driver.cu",
       "backend": "cuda",
       "formats": [
         "Q8_0",
@@ -3787,10 +3859,13 @@
         "q8_0_bytes",
         "quantize_project",
         "read_file",
+        "recurrent_state_bytes",
+        "recurrent_state_type_name",
         "row_bytes",
         "rows",
         "run_block",
         "session_bytes",
+        "state_bytes",
         "supported",
         "tensor",
         "type",
@@ -3806,8 +3881,8 @@
       ]
     },
     {
-      "id": "cuda-dense:src/cuda/qwen_transcode.cu",
-      "source": "src/cuda/qwen_transcode.cu",
+      "id": "cuda-dense:src/cuda/models/qwen/qwen_transcode.cu",
+      "source": "src/cuda/models/qwen/qwen_transcode.cu",
       "backend": "cuda",
       "formats": [
         "Q8_0",
@@ -3829,8 +3904,8 @@
       ]
     },
     {
-      "id": "cuda-dense:src/cuda/qwen_dense.cu",
-      "source": "src/cuda/qwen_dense.cu",
+      "id": "cuda-dense:src/cuda/models/qwen/qwen_dense.cu",
+      "source": "src/cuda/models/qwen/qwen_dense.cu",
       "backend": "cuda",
       "formats": [
         "Q8_0",
@@ -3869,8 +3944,8 @@
       ]
     },
     {
-      "id": "cuda-dense:src/cuda/qwen_mtp_draft.cu",
-      "source": "src/cuda/qwen_mtp_draft.cu",
+      "id": "cuda-dense:src/cuda/models/qwen/qwen_mtp_draft.cu",
+      "source": "src/cuda/models/qwen/qwen_mtp_draft.cu",
       "backend": "cuda",
       "formats": [
         "Q8_0",
@@ -3896,8 +3971,8 @@
       ]
     },
     {
-      "id": "cuda-dense:src/cuda/qwen_plemtp.cu",
-      "source": "src/cuda/qwen_plemtp.cu",
+      "id": "cuda-dense:src/cuda/models/qwen/qwen_plemtp.cu",
+      "source": "src/cuda/models/qwen/qwen_plemtp.cu",
       "backend": "cuda",
       "formats": [
         "Q8_0",
@@ -3946,8 +4021,8 @@
       ]
     },
     {
-      "id": "cuda-dense:src/cuda/ds41_dense_fast.cu",
-      "source": "src/cuda/ds41_dense_fast.cu",
+      "id": "cuda-dense:src/cuda/models/ds41/ds41_dense_fast.cu",
+      "source": "src/cuda/models/ds41/ds41_dense_fast.cu",
       "backend": "cuda",
       "formats": [
         "Q8_0",
@@ -3988,8 +4063,8 @@
       ]
     },
     {
-      "id": "cuda-expert:src/cuda/qwen_moe.cu",
-      "source": "src/cuda/qwen_moe.cu",
+      "id": "cuda-expert:src/cuda/models/qwen/qwen_moe.cu",
+      "source": "src/cuda/models/qwen/qwen_moe.cu",
       "backend": "cuda",
       "formats": [
         "Q4_K",
@@ -4056,8 +4131,8 @@
       ]
     },
     {
-      "id": "cuda-ds41:src/cuda/ds41_moe.cu",
-      "source": "src/cuda/ds41_moe.cu",
+      "id": "cuda-ds41:src/cuda/models/ds41/ds41_moe.cu",
+      "source": "src/cuda/models/ds41/ds41_moe.cu",
       "backend": "cuda",
       "formats": [
         "IQ2_XXS",
@@ -4105,8 +4180,8 @@
       ]
     },
     {
-      "id": "cuda-ds41:src/cuda/ds41_prefill_kernels.cu",
-      "source": "src/cuda/ds41_prefill_kernels.cu",
+      "id": "cuda-ds41:src/cuda/models/ds41/ds41_prefill_kernels.cu",
+      "source": "src/cuda/models/ds41/ds41_prefill_kernels.cu",
       "backend": "cuda",
       "formats": [
         "IQ2_XXS",
@@ -4140,8 +4215,8 @@
       ]
     },
     {
-      "id": "cuda-ds41:src/cuda/ds41_core_layer.cu",
-      "source": "src/cuda/ds41_core_layer.cu",
+      "id": "cuda-ds41:src/cuda/models/ds41/ds41_core_layer.cu",
+      "source": "src/cuda/models/ds41/ds41_core_layer.cu",
       "backend": "cuda",
       "formats": [
         "IQ2_XXS",
@@ -4184,8 +4259,8 @@
       ]
     },
     {
-      "id": "cuda-ds41:src/cuda/ds41_prefill_driver.cu",
-      "source": "src/cuda/ds41_prefill_driver.cu",
+      "id": "cuda-ds41:src/cuda/models/ds41/ds41_prefill_driver.cu",
+      "source": "src/cuda/models/ds41/ds41_prefill_driver.cu",
       "backend": "cuda",
       "formats": [
         "IQ2_XXS",
@@ -4328,8 +4403,8 @@
       ]
     },
     {
-      "id": "cuda-ds41:src/cuda/trellis.cu",
-      "source": "src/cuda/trellis.cu",
+      "id": "cuda-ds41:src/cuda/core/trellis.cu",
+      "source": "src/cuda/core/trellis.cu",
       "backend": "cuda",
       "formats": [
         "IQ2_XXS",
@@ -4403,8 +4478,8 @@
       ]
     },
     {
-      "id": "cuda:src/cuda/ds41_hot_residency.cpp",
-      "source": "src/cuda/ds41_hot_residency.cpp",
+      "id": "cuda:src/cuda/models/ds41/ds41_hot_residency.cpp",
+      "source": "src/cuda/models/ds41/ds41_hot_residency.cpp",
       "backend": "cuda",
       "formats": [],
       "arithmetic": "DS41-residency",
@@ -4742,6 +4817,7 @@
         "invalid_argument",
         "kernels_enabled",
         "known_prefill_rows_range",
+        "known_prefix_tail_tiles_prompts",
         "latest_snapshot_payload_bytes",
         "load",
         "load_costs",
@@ -4758,6 +4834,8 @@
         "model_graph_from_contract",
         "mtp_calibration_rows",
         "mtp_tiled_prompt",
+        "mtp_wide_copy_retained_bytes",
+        "mtp_wide_copy_rows_effective",
         "open_read_only",
         "open_source",
         "output_reservation_bytes",
@@ -4799,11 +4877,14 @@
         "required_weight_bytes",
         "reserved_bytes",
         "resolve",
+        "resolve_batch_cache_scheduler",
         "resolve_effective_config",
         "resolve_execution_buffer",
         "resolve_gdn_layer_state",
         "resolve_http_bridge_capacity",
         "resolve_indexed_attention_layer_state",
+        "resolve_pair_policy",
+        "resolve_pair_route",
         "resolve_session_state",
         "resolved",
         "resolved_cache_family",
@@ -4894,6 +4975,35 @@
         "dequantize_row",
         "gguf_type"
       ]
+    },
+    {
+      "id": "container:src/core/weight_archive.cpp",
+      "source": "src/core/weight_archive.cpp",
+      "backend": "host",
+      "formats": [
+        "all",
+        "recognised",
+        "storage"
+      ],
+      "arithmetic": "index/admission only",
+      "migration": "P03",
+      "owner": "shared-weight-layer-maintainer",
+      "status": "migrated",
+      "capture": "legacy-public-entrypoint",
+      "operations": [
+        "as_bytes",
+        "bytes",
+        "decode_row",
+        "dequantize_row",
+        "index_safetensors",
+        "load_gguf",
+        "load_safetensors",
+        "read",
+        "read_json",
+        "read_safetensors",
+        "row_bytes",
+        "view_source"
+      ]
     }
   ],
   "operation_scan_keywords": [
@@ -4937,7 +5047,7 @@
     "apps/hip_decode_token_main.cpp",
     "apps/qwen_effective_config.hpp",
     "include/strix/cuda/core/nvfp4.hpp",
-    "include/strix/cuda_qwen_quant.cuh",
+    "include/strix/cuda/qwen_quant.cuh",
     "include/strix/deepseek41_device_forward.hpp",
     "include/strix/device_profile.hpp",
     "include/strix/ds41_dspark.hpp",
@@ -4953,6 +5063,7 @@
     "src/core/linear_plan.hpp",
     "src/core/trellis_codec.hpp",
     "src/core/trellis_format.hpp",
+    "src/core/weight_archive.cpp",
     "src/cpu/arch/avx512/kernels.cpp",
     "src/cpu/arch/neon/kernels.cpp",
     "src/cpu/core/backend.hpp",
@@ -4961,19 +5072,19 @@
     "src/cuda/core/arch/sm120/nvfp4.cuh",
     "src/cuda/core/nvfp4.cu",
     "src/cuda/core/nvfp4_reference.cpp",
-    "src/cuda/ds41_core_layer.cu",
-    "src/cuda/ds41_dense_fast.cu",
-    "src/cuda/ds41_hot_residency.cpp",
-    "src/cuda/ds41_moe.cu",
-    "src/cuda/ds41_prefill_driver.cu",
-    "src/cuda/ds41_prefill_kernels.cu",
-    "src/cuda/qwen_dense.cu",
-    "src/cuda/qwen_moe.cu",
-    "src/cuda/qwen_mtp_draft.cu",
-    "src/cuda/qwen_plemtp.cu",
-    "src/cuda/qwen_prefill_driver.cu",
-    "src/cuda/qwen_transcode.cu",
-    "src/cuda/trellis.cu",
+    "src/cuda/models/ds41/ds41_core_layer.cu",
+    "src/cuda/models/ds41/ds41_dense_fast.cu",
+    "src/cuda/models/ds41/ds41_hot_residency.cpp",
+    "src/cuda/models/ds41/ds41_moe.cu",
+    "src/cuda/models/ds41/ds41_prefill_driver.cu",
+    "src/cuda/models/ds41/ds41_prefill_kernels.cu",
+    "src/cuda/models/qwen/qwen_dense.cu",
+    "src/cuda/models/qwen/qwen_moe.cu",
+    "src/cuda/models/qwen/qwen_mtp_draft.cu",
+    "src/cuda/models/qwen/qwen_plemtp.cu",
+    "src/cuda/models/qwen/qwen_prefill_driver.cu",
+    "src/cuda/models/qwen/qwen_transcode.cu",
+    "src/cuda/core/trellis.cu",
     "src/deepseek41_pair_defaults.cpp",
     "src/ds41_dense_adapter.hpp",
     "src/ds41_formats.cpp",
@@ -5005,6 +5116,7 @@
     "src/h3/block/weights.hpp",
     "src/h3/gemm/dense.hip",
     "src/h3/gemm/operand.hpp",
+    "src/hip/weight/ggml_sources.hpp",
     "src/hip_deepseek41_batch_forward.hip",
     "src/hip_ds41_formats.hip",
     "src/hip_ds41_layer.hip",

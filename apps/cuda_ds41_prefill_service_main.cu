@@ -73,8 +73,8 @@
 // Events on stdout (one JSON line each): {"event":"loaded",...}, {"event":"READY",...}, {"event":"request",...},
 // {"event":"STOPPED"}. SIGINT / SIGTERM stop accepting, finish the running prefill and exit.
 #include "strix/device/cuda_enumerator.hpp"
-#include "strix/cuda_ds41_prefill.hpp"
-#include "strix/cuda_ds41_replay.hpp"
+#include "strix/cuda/ds41_prefill.hpp"
+#include "strix/cuda/ds41_replay.hpp"
 #include "strix/deepseek41_attention_state.hpp"
 #include "strix/model_content_hash.hpp"
 #include "strix/serve/json.hpp"
