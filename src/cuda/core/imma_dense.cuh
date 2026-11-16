@@ -214,6 +214,7 @@ constexpr int kT2Smem = 2 * kT2Stage;
 template <auto S, int L, int NS, class Source, class Numeric, class Capture = NoCapture>   // L: 0 first loader, 1 remap, 2 aligned window; NS: ring stages (> 2: L == 2 only)
 __global__ __launch_bounds__(kThreads, L != 0 ? 1 : 2) void project_tile2_kernel(typename Numeric::Site site, std::uint32_t rows, const std::int8_t* codes,
                                                                     const float* deltas, std::uint32_t pitch) {
+    static_assert(Source::kBlockBytes == 34U, "tile2 loader is laid out for 34-byte Q8_0 blocks");
     extern __shared__ __align__(16) unsigned char smem[];
     const int tid = static_cast<int>(threadIdx.x), lane = tid & 31, warp = tid >> 5, gid = lane >> 2, tig = lane & 3;
     const int wm = warp & 1, wn = warp >> 1;
