@@ -231,7 +231,7 @@ __global__ void __launch_bounds__(kWarpsPerBlock * 32) fp4_gemv(const Jobs jobs,
                 const std::uint32_t n = static_cast<std::uint32_t>(rb * 8 + 2 * t + (q & 1));
                 const std::uint32_t o = m * 16 + static_cast<std::uint32_t>(g + ((q >> 1) << 3));
                 if (n >= rows) continue;
-                if (ks == 1) {
+                if (ks == 1 && J.w[1] == nullptr) {
                     float v = __fmul_rn(acc[mt][rb][q], gs0);
                     if (resid != nullptr) v = __fadd_rn(resid[static_cast<std::size_t>(n) * out + o], v);
                     y[static_cast<std::size_t>(n) * out + o] = v;
@@ -242,10 +242,10 @@ __global__ void __launch_bounds__(kWarpsPerBlock * 32) fp4_gemv(const Jobs jobs,
     }
 }
 
-// grid (blocks over the largest job, njobs): finalises every job with ks > 1.
+// grid (blocks over the largest job, njobs): finalises split-K and fused jobs.
 __global__ void fp4_reduce(const Jobs jobs, std::uint32_t rows) {
     const Job& J = jobs.j[blockIdx.y];
-    if (J.ks <= 1) return;
+    if (J.ks <= 1 && J.w[1] == nullptr) return;
     const std::size_t idx = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (idx >= static_cast<std::size_t>(J.out) * rows) return;
     const std::size_t stride = static_cast<std::size_t>(J.out) * rows;
@@ -282,7 +282,7 @@ cudaError_t launch_gemv(Jobs& jobs, const float* x, std::uint32_t in, std::uint3
     }
     fp4_gemv<RB, MT><<<dim3(gx, maxks, fused ? 2 : 1), kWarpsPerBlock * 32, kSlab * RB * 2048, s>>>(jobs, x, in, rows);
     cudaError_t e = cudaGetLastError();
-    if (e != cudaSuccess || !any_split) return e;
+    if (e != cudaSuccess || (!any_split && !fused)) return e;
     const std::size_t n = static_cast<std::size_t>(maxout) * rows;
     fp4_reduce<<<dim3(static_cast<unsigned>((n + 255) / 256), static_cast<unsigned>(jobs.n)), 256, 0, s>>>(jobs, rows);
     return cudaGetLastError();
@@ -439,14 +439,13 @@ void nvfp4_release_workspace(cudaStream_t stream) {
 
 namespace {
 // Shared by the single, fused and multi entry points: builds the job table (split-K partial buffers carved from the
-// workspace) and launches. ks per job is nvfp4_split_k(out, in) (fused gate/up: at least 2), independent of rows.
+// workspace) and launches. ks per job is nvfp4_split_k(out, in), independent of rows.
 cudaError_t run_jobs(Jobs& jobs, const float* x, std::uint32_t in, std::uint32_t rows, cudaStream_t s) {
     std::size_t need = 0;
     for (int q = 0; q < jobs.n; ++q) {
         Job& J = jobs.j[q];
         J.ks = nvfp4_split_k(J.out, in);
-        if (J.w[1] != nullptr) J.ks = std::max<std::uint32_t>(J.ks, 2);
-        if (J.ks > 1) need += static_cast<std::size_t>(J.w[1] ? 2 : 1) * J.ks * rows * J.out * 4;
+        if (J.ks > 1 || J.w[1] != nullptr) need += static_cast<std::size_t>(J.w[1] ? 2 : 1) * J.ks * rows * J.out * 4;
     }
     float* workspace = nullptr;
     cudaError_t e = need ? ensure_ws(need, s, &workspace) : cudaSuccess;
@@ -455,7 +454,7 @@ cudaError_t run_jobs(Jobs& jobs, const float* x, std::uint32_t in, std::uint32_t
     for (int q = 0; q < jobs.n; ++q) {
         Job& J = jobs.j[q];
         J.part = nullptr;
-        if (J.ks > 1) {
+        if (J.ks > 1 || J.w[1] != nullptr) {
             J.part = workspace + off / 4;
             off += static_cast<std::size_t>(J.w[1] ? 2 : 1) * J.ks * rows * J.out * 4;
         }

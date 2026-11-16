@@ -74,8 +74,6 @@ struct Nvfp4Job {
 };
 cudaError_t nvfp4_dense_rows_multi(const Nvfp4Job* jobs, std::uint32_t n, const float* x, std::uint32_t rows, cudaStream_t stream);
 // y = silu(gate x) * (up x), same format/shape.
-// Known limitation: when separate dots choose one split, fusion forces two and is not bitwise equivalent.
-// A one-split fused epilogue is pending kernel qualification.
 cudaError_t nvfp4_gate_up_silu_rows(const DenseWeight& gate, const DenseWeight& up, const float* x, float* y,
                                     std::uint32_t rows, cudaStream_t stream);
 cudaError_t nvfp4_reserve_workspace(std::size_t bytes, cudaStream_t stream = nullptr);
