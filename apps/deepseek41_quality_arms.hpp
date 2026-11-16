@@ -14,7 +14,13 @@ namespace strix::deepseek41::quality {
 // qa kv qb oa ob (projections; none = all), l<first>t<end> (layers), a8 (FP16 operands from the A8 codes), r<rows>
 // (FP16 only at calls of >= rows rows), f (FP16 output form: STRIX_DS41_PREFILL_FP16_FAST), s<seed> (null: +-1 ulp by a
 // hash of the seed instead of the last-bit flip, so seeds sample the noise floor).
+// Prefix eng_ (any arm, e.g. eng_fast3, eng_exact; labels are [a-z0-9_]): adds the FAST lever ds41-engram-f16wmma-v1 (Engram projection on WMMA).
 inline PrefillOptions arm_precision(const std::string& label) {
+    if (label.rfind("eng_", 0) == 0 && label.size() > 4) {
+        PrefillOptions e = arm_precision(label.substr(4));
+        e.fast_engram = true;
+        return e;
+    }
     PrefillOptions o;
     if (label == "exact") return o;
     if (label == "dense") { o.fp16_dense = true; return o; }

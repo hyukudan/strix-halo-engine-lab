@@ -1,9 +1,11 @@
 #include "strix/device/hip_gate.hpp"
 #include "strix/dist/open_transport.hpp"
 #include "strix/deepseek41_batch_forward.hpp"
+#include "strix/pair/embed_frame.hpp"
 #include "strix/deepseek41_device_forward.hpp"
 #include "strix/deepseek41_pair_defaults.hpp"
 #include "strix/deepseek41_prefill.hpp"
+#include "strix/repeat_digests.hpp"
 #include "strix/dist/communicator.hpp"
 #include "strix/dist/gpu_direct.hpp"
 #include "strix/ds41_expert_tp.hpp"
@@ -37,6 +39,9 @@
 //       [--task-levels whole,layer,phase,finest [--task-rows N,...] [--task-units K | --task-budget MS] [--task-moe-chunk R] [--task-table]
 //        [--interleave G [--bg-rows N]] [--mem-guard-gib G]]
 // --embed-identity A:B (world 1): the identity gate of provided embedding rows, see embed_identity_gate.
+// --repeat K: K runs of the prompt in this process; each run's digests (logits FNV, per-layer stream hashes when
+// collected, next token) are printed ("repeat k: ...") and compared with the first run of the same arm (--select-ab
+// arms apart): a difference prints "REPEAT DIGEST MISMATCH" and fails the tool after the receipts are written.
 // --task-levels: after the runs, the prompt again as resumable PrefillTasks, one per listed unit level ("whole": one
 // step() of every unit; "level:R": with MoE chunks of R rows; "level[:R]@MS": units_within(MS) units per step), K units per step() (default 1) or as many as units_within(MS) predicts (rank 0 decides, rank 1
 // follows); each task's next token, logits, last row's streams, state hashes and exported state digest must equal run()'s.
@@ -67,7 +72,7 @@ void barrier(strix::dist::Communicator& comm, std::uint32_t round) {
 
 struct Args {
     std::string model, prompt_path, transport, loads_out, hashes_out, seed_out;
-    std::uint32_t rank = 0, world = 1, layers = 40, rows = 0, chunk = 1024, window = 8, lanes = 4, moe_chunk = 4096, repeat = 1, warmup = 0,
+    std::uint32_t rank = 0, world = 1, layers = 40, rows = 0, chunk = 1024, window = 8, lanes = 4, moe_chunk = 0, repeat = 1, warmup = 0,
                   split_min_rows = strix::deepseek41::PrefillOptions{}.split_min_rows,
                   joint_max_rows = strix::deepseek41::PrefillOptions{}.joint_max_rows;
     unsigned connect_timeout = 60;
@@ -92,8 +97,8 @@ struct Args {
 };
 
 void validate_embed_identity_args(const Args& a) {
-    if (a.embed_identity && (a.ttft || a.world != 1U))
-        throw std::invalid_argument("--embed-identity requires --world 1 without --ttft-timing");
+    if (a.embed_identity && a.ttft)
+        throw std::invalid_argument("--embed-identity runs without --ttft-timing");
 }
 
 // --ttft-timing: wall time of each stage (host clock), printed as "ttft <stage>: <ms since the previous line> ms (at <ms
@@ -151,6 +156,22 @@ std::vector<std::uint32_t> read_prompt(const std::string& path, std::uint32_t ro
         ids.resize(rows);
     }
     return ids;
+}
+
+// DAYAUDIT 7: one repetition's digests (logits, per-layer stream hashes when collected, next token)
+strix::RepeatDigests::Run repeat_run(std::uint32_t k, std::string arm, const strix::deepseek41::PrefillResult& r) {
+    std::uint64_t streams = 0;
+    if (!r.stream_hashes.empty()) {
+        streams = 14695981039346656037ULL;
+        for (const auto h : r.stream_hashes)
+            for (unsigned b = 0; b < 64U; b += 8U) streams = (streams ^ ((h >> b) & 0xFFU)) * 1099511628211ULL;
+    }
+    return {k, std::move(arm), fnv(r.logits), streams, r.next_token};
+}
+void check_repeats(const strix::RepeatDigests& d, const std::string& who) {
+    std::fputs(d.report(who).c_str(), stdout);
+    std::fflush(stdout);
+    if (!d.equal()) throw std::runtime_error(who + ": repetitions of the same arm differ (REPEAT DIGEST MISMATCH above)");
 }
 
 void print_result(const char* who, const strix::deepseek41::PrefillResult& r, std::size_t rows, bool timing, const std::string& loads_out = {}) {
@@ -285,12 +306,17 @@ strix::deepseek41::PrefillResult ttft_runs(const Args& a, strix::deepseek41::Dev
     };
     if (a.ttft_warmup != 0U)
         one(std::span<const std::uint32_t>(prompt).first(std::min<std::size_t>(a.ttft_warmup, prompt.size())), 900U, "warm-up run");
+    strix::RepeatDigests repeats;  // the short warm-up is not a measured repetition
     for (std::uint32_t k = 0; k < a.repeat; ++k) {
         char label[32];
         std::snprintf(label, sizeof(label), "run %u", k);
         one(prompt, k, label);
+        repeats.add(repeat_run(k, {}, r));
         if (print) print_result(comm == nullptr ? "prefill" : "rank prefill", r, prompt.size(), a.timing, loads_out);
     }
+    const unsigned rank = comm == nullptr ? 0U : comm->group().rank;
+    write_receipts(a, pre, r, rank);
+    check_repeats(repeats, comm == nullptr ? "prefill" : "rank " + std::to_string(rank));
     return r;
 }
 
@@ -540,8 +566,10 @@ int task_gate(const Args& a, strix::deepseek41::DevicePrefill& pre, const std::v
     return bad_all;
 }
 
-// --embed-identity A:B (world 1): the prompt again with rows [A, B) taken from provided embedding rows
-// (DevicePrefill::set_embed_rows) instead of the embedding table.
+// --embed-identity A:B: the prompt again with rows [A, B) taken from provided embedding rows
+// (DevicePrefill::set_embed_rows) instead of the embedding table. World 2: rank 0 reads the rows from its table and
+// ships them to rank 1 in a pair::EmbedFrame (the served path's transport); rank 1 runs every arm on the rows it
+// received, never on its own table's (the pair contract: rows are shipped, not recomputed).
 //   identity : the table's own rows, as plain rows -> every bit of the plain run (logits, next token, the last row's
 //              stream hashes, the attention state hashes)
 //   control  : the rows of the neighbouring tokens -> must differ (the splice is what the layers read)
@@ -549,8 +577,54 @@ int task_gate(const Args& a, strix::deepseek41::DevicePrefill& pre, const std::v
 //   image    : finite logits, independent image-router and dead-hash evidence, and an observable image effect
 //   text     : the plain prompt after the image run -> every bit of the first plain run
 // Exit code 0 only when all of them hold.
+// World 2: rank 0's rows of tokens [A, B) to rank 1 through a pair::EmbedFrame; both return the rows they will splice.
+std::vector<std::uint16_t> framed_embed_rows(strix::dist::Communicator& comm, std::uint32_t rank, std::vector<std::uint16_t> rows,
+                                             std::uint32_t count, std::uint32_t width) {
+    namespace ss = strix::session;
+    const strix::dist::Tag tag{static_cast<std::uint32_t>(strix::dist::TagKind::control), 0x656d6266U, 0U};
+    std::vector<std::byte> frame;
+    ss::EmbedInterner interner;
+    if (rank == 0U) {
+        ss::EmbedRows span;
+        std::uint64_t h = 14695981039346656037ULL;  // the digest of the fixture: FNV of the row bits, repeated
+        for (const auto v : rows) h = (h ^ v) * 1099511628211ULL;
+        for (std::size_t i = 0; i < span.digest.size(); ++i) span.digest[i] = static_cast<std::uint8_t>(h >> (8U * (i % 8U)));
+        span.rows = count;
+        span.width = width;
+        span.data = rows;
+        auto lease = interner.intern(std::move(span));
+        const auto ids = lease.ids();
+        const ss::EmbedTable table(std::vector<ss::EmbedLease>{lease});
+        strix::pair::EmbedFrameLedger peer;
+        frame = strix::pair::encode_embed_frame(table, ids, peer, &strix::dist::crc32c);
+    }
+    std::uint64_t mine = frame.size(), theirs = 0;
+    comm.exchange_host(std::as_bytes(std::span<const std::uint64_t>(&mine, 1U)), std::as_writable_bytes(std::span<std::uint64_t>(&theirs, 1U)), tag);
+    const std::uint64_t bytes = rank == 0U ? mine : theirs;
+    std::vector<std::byte> in(rank == 0U ? 0U : bytes);
+    strix::pair::transfer_embed_frame_bytes(frame, in, comm.max_bytes(), [&](auto out, auto received) {
+        comm.exchange_host(out, received, strix::dist::Tag{tag.kind, tag.layer, 1U});
+    });
+    if (rank == 0U) {
+        std::printf("embed-identity frame: %llu bytes, %u rows x %u to rank 1\n", static_cast<unsigned long long>(bytes), count, width);
+        return rows;
+    }
+    if (in.size() < strix::pair::kEmbedFrameHeaderBytes + 4U) throw std::runtime_error("embed-identity: empty frame");
+    std::uint32_t handle = 0;
+    std::memcpy(&handle, in.data() + strix::pair::kEmbedFrameHeaderBytes, 4U);
+    std::vector<std::uint32_t> ids(count);
+    for (std::uint32_t r = 0; r < count; ++r) ids[r] = ss::embed_id(handle, r);
+    strix::pair::EmbedFrameReceiver rx;
+    const auto got = rx.receive(in, ids, &strix::dist::crc32c);
+    const auto* span = got.table->find(ss::embed_handle(got.ids[0]));
+    if (span == nullptr || span->rows != count || span->width != width) throw std::runtime_error("embed-identity: frame shape");
+    std::printf("embed-identity frame: rank 1 received %llu bytes, rows %s its own table's\n", static_cast<unsigned long long>(bytes),
+                span->data == rows ? "equal to" : "DIFFER from");
+    return span->data;
+}
+
 int embed_identity_gate(const Args& a, strix::deepseek41::DevicePrefill& pre, const std::vector<std::uint32_t>& prompt,
-                        const strix::deepseek41::PrefillResult& ref) {
+                        const strix::deepseek41::PrefillResult& ref, strix::dist::Communicator* comm = nullptr, std::uint32_t rank = 0U) {
     namespace ss = strix::session;
     const std::uint32_t A = a.embed_a, B = a.embed_b;
     if (A >= B || B > prompt.size()) throw std::invalid_argument("--embed-identity: need A < B <= rows");
@@ -574,8 +648,9 @@ int embed_identity_gate(const Args& a, strix::deepseek41::DevicePrefill& pre, co
     };
     const auto ref_state = pre.state_hashes();
     const std::span<const std::uint32_t> span_tokens(prompt.data() + A, B - A);
-    const std::vector<std::uint16_t> rows = pre.embedding_rows(span_tokens);
+    std::vector<std::uint16_t> rows = pre.embedding_rows(span_tokens);
     const std::uint32_t width = static_cast<std::uint32_t>(rows.size() / (B - A));
+    if (comm != nullptr) rows = framed_embed_rows(*comm, rank, std::move(rows), B - A, width);
     struct Out {
         strix::deepseek41::PrefillResult r;
         std::vector<std::pair<std::string, std::uint64_t>> state;
@@ -651,6 +726,9 @@ int embed_identity_gate(const Args& a, strix::deepseek41::DevicePrefill& pre, co
     for (const float v : image.r.logits) finite = finite && std::isfinite(v);
     verdict("image-router", image.r.embed_image_router_checked);
     verdict("image-dead", image.r.embed_dead_hash_checked);
+    if (!image.r.embed_engram_image_seen || !image.r.embed_engram_text_seen)
+        std::printf("embed-identity image-engram rank %u INCONCLUSIVE: missing local image/text Engram evidence\n", rank);
+    verdict("image-engram", image.r.embed_image_engram_checked);
     verdict("image", finite && !same(image, ref, ref_state));
     std::printf("embed-identity image    logits %s the plain run\n",
                 fnv(image.r.logits) == fnv(ref.logits) ? "equal to" : "differ from");
@@ -699,11 +777,14 @@ int run_world1(const Args& a, const std::vector<std::uint32_t>& prompt) {
                 static_cast<double>(pre.weight_bytes()) / 1073741824.0, pre.load_seconds());
     if (const auto ov = pre.overlay_description(); !ov.empty()) std::printf("weights overlay: %s\n", ov.c_str());
     strix::deepseek41::PrefillResult r;
+    strix::RepeatDigests repeats;
     for (std::uint32_t k = 0; k < a.repeat; ++k) {
         r = pre.run(prompt);
         print_result("prefill", r, prompt.size(), a.timing, a.loads_out);
+        repeats.add(repeat_run(k, {}, r));
     }
     write_receipts(a, pre, r, 0U);
+    check_repeats(repeats, "prefill");  // after the receipts (evidence), before anything reads r as the run's result
     if (a.embed_identity) return embed_identity_gate(a, pre, prompt, r);
     if (!a.task_levels.empty()) {
         auto lengths = a.task_rows;
@@ -766,7 +847,8 @@ void run_rank(const Args& a, const std::vector<std::uint32_t>& prompt, std::uint
     o.world = 2;
     o.communicator = &comm;
     const bool decode_reference = a.reference && (a.transport != "emulate" || a.decode_reference);
-    o.stream_hashes = decode_reference || out_state != nullptr;
+    o.stream_hashes = decode_reference || out_state != nullptr || a.embed_identity || !a.hashes_out.empty();
+    o.verify_embed_extras = a.embed_identity;
     strix::deepseek41::PrefillResult r;
     std::vector<std::pair<std::string, std::uint64_t>> state;
     if (a.ttft && !decode_reference && out_state == nullptr) {
@@ -820,15 +902,19 @@ void run_rank(const Args& a, const std::vector<std::uint32_t>& prompt, std::uint
                         static_cast<double>(pre.shared_weight_bytes()) / 1073741824.0);
         if (!a.task_levels.empty()) mem_line(rank, "prefill loaded");
         if (const auto ov = pre.overlay_description(); print && !ov.empty()) std::printf("weights overlay: %s\n", ov.c_str());
+        strix::RepeatDigests repeats;
         for (std::uint32_t k = 0; k < a.repeat; ++k) {
             barrier(comm, k);  // the run's time does not include the peer still loading its weights
+            std::string arm;
             const auto before = comm.stats();
             if (a.select_ab) {
                 const bool on = a.select_pattern.empty() ? k % 2U == 1U : a.select_pattern[k % a.select_pattern.size()] == 'S';
                 pre.set_dense_select(on);
+                arm = on ? "SEL" : "OFF";
                 if (print) std::printf("arm %s (run %u)\n", on ? "SEL" : "OFF", k);
             }
             r = pre.run(prompt);
+            repeats.add(repeat_run(k, arm, r));
             if (print) {
                 print_result(rank == 0U ? "rank 0 prefill" : "rank 1 prefill", r, prompt.size(), a.timing, rank == 0U ? a.loads_out : std::string{});
                 const auto& s = comm.stats();
@@ -840,6 +926,11 @@ void run_rank(const Args& a, const std::vector<std::uint32_t>& prompt, std::uint
             }
         }
         write_receipts(a, pre, r, rank);
+        check_repeats(repeats, "rank " + std::to_string(rank));  // each rank its own digests; either one fails the run
+        if (a.embed_identity) {  // every arm on both ranks; rank 0 judges (each rank's verdict lines carry its own prefix)
+            if (embed_identity_gate(a, pre, prompt, r, &comm, rank) != 0) throw std::runtime_error("embed-identity: FAIL on rank " + std::to_string(rank));
+            return;
+        }
         if (a.state_timing && print) {  // the handoff to a decode forward: the attention state to the host
             const auto t0 = std::chrono::steady_clock::now();
             const auto exported = pre.export_state();

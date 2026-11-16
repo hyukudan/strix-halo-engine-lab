@@ -538,9 +538,10 @@ inline EffectiveConfig initialize_prefill_config(const RequestedOptions& request
         const auto excluded = prefill_option_bit(PrefillOption::hc_output_wmma) |
             prefill_option_bit(PrefillOption::index_proj_wmma) | prefill_option_bit(PrefillOption::gdn_fp16_chunk) |
             prefill_option_bit(PrefillOption::index_score_wmma) |
+            prefill_option_bit(PrefillOption::ple_rows_f16) | prefill_option_bit(PrefillOption::gdn_gates_f16) |
             (result.prefill_option_mask & kPrefillGdnChunkRev3);
         result.options.prefill_disabled |= excluded;
-        result.prefill_option_mask &= ~excluded;
+        result.prefill_option_mask = normalize_prefill_options(result.prefill_option_mask & ~excluded);
     }
     result.options.resolved_prefill_option_mask = result.prefill_option_mask;
     const auto budget = result.environment.find("STRIX_QPF2K_QSA_BUDGET");
@@ -1237,10 +1238,12 @@ inline void resolve_serve_prefill(EffectiveConfig& result, const ModelContract& 
                     if (!governed_mtp(c)) throw;
                     const auto excluded = prefill_option_bit(PrefillOption::hc_output_wmma) |
                         prefill_option_bit(PrefillOption::index_proj_wmma) | prefill_option_bit(PrefillOption::gdn_fp16_chunk) |
-                        prefill_option_bit(PrefillOption::index_score_wmma) | (result.prefill_option_mask & kPrefillGdnChunkRev3);
+                        prefill_option_bit(PrefillOption::index_score_wmma) |
+                        prefill_option_bit(PrefillOption::ple_rows_f16) | prefill_option_bit(PrefillOption::gdn_gates_f16) |
+                        (result.prefill_option_mask & kPrefillGdnChunkRev3);
                     auto governed = c;
                     governed.prefill_disabled |= excluded;
-                    governed.resolved_prefill_option_mask = result.prefill_option_mask & ~excluded;
+                    governed.resolved_prefill_option_mask = normalize_prefill_options(result.prefill_option_mask & ~excluded);
                     bool admitted = true;
                     try { validate_prefill_numerical_profile_cli(governed); }
                     catch (const std::exception&) { admitted = false; }
@@ -1419,8 +1422,8 @@ inline void resolve_serve_prefill(EffectiveConfig& result, const ModelContract& 
                 result.sources["--prefill-numerical-profile"] = OptionSource::automatic;
                 arithmetic = std::string("arithmetic fp16 (automatic, same rule as the single-request route") +
                     (decode_adopted ? "; decode profile dense-a8 automatic" : "") +
-                    (governed_mtp_exclusion ? "; governed MTP: hc_output_wmma, index_proj_wmma, index_score_wmma and "
-                        "gdn_fp16_chunk stay off)" : ")");
+                    (governed_mtp_exclusion ? "; governed MTP: hc_output_wmma, index_proj_wmma, index_score_wmma, "
+                        "gdn_fp16_chunk, ple_rows_f16 and gdn_gates_f16 stay off)" : ")");
                 if (governed_mtp_exclusion) result.prefill_option_mask = *o.resolved_prefill_option_mask;
             } else if (!fp16_declined.empty()) arithmetic += "; automatic fp16 declined: " + fp16_declined;
             result.arithmetic_fallback = o.prefill_profile_automatic ? std::string() : fp16_declined;

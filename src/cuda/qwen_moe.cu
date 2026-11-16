@@ -37,7 +37,13 @@ namespace strix::cuda::qwen_moe {
 namespace {
 
 // Storage primitives only; the HIP DA16 arithmetic/certificate is not imported.
+// CUDA spelling of the HIP width-limited xor shuffle used by the shared include (integer max: bit-neutral).
+__device__ __forceinline__ unsigned qwen_moe_shfl_xor(unsigned v,int delta,int width) {
+    return __shfl_xor_sync(0xffffffffU,v,delta,width);
+}
+#define __shfl_xor qwen_moe_shfl_xor
 #include "../hip_moe_route_bf16.inc"
+#undef __shfl_xor
 
 constexpr int kMagic = 0x4b400000;
 constexpr float kMagicF = 12582912.0F;  // 0x1.8p23

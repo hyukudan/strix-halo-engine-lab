@@ -7,6 +7,7 @@
 #include "minimax/engine/mm_profile_table.hpp"
 #include "minimax/engine/route_identity.hpp"
 #include "core/layer_set.hpp"
+#include "moe_core/grouped_policy.hpp"
 #include "minimax/serve/minimax_sched.hpp"
 #include "minimax/dspark/minimax_auto.hpp"
 #include "strix/session/speculation_default.hpp"
@@ -113,6 +114,8 @@ constexpr Item kItems[] = {
      "Prefill MoE measurement: exact (partials/xt/at/output bitwise), paired MT8 bands for calls >= 2048 rows: MoE call -0.6..-1.0 % 2048 / -0.9..-1.5 % 4096 rows, 1024 mixed"},
     {"pf_moe_tail_stream", "STRIX_MMX_PREFILL_TAIL_STREAM", "1", "0",
      "Prefill MoE measurement: exact (partials/xt/at/output bitwise), tail classes beside MT8: MoE call -1.9 to -3.0 % real routes"},
+    {"pf_moe_pipe_tail", "STRIX_MMX_PREFILL_PIPE_TAIL", "1", "0",
+     "Prefill MoE measurement: bitwise (pipe-tail fixture 12,480 cells, logits and state fnv of both ranks identical), tail rows (MT 1..7) on the pipelined kernel: PAIR TTFT 8K 12.68 -> 12.47 s, 32K 51.81 -> 50.91 s"},
     {"pf_gather_tok", "STRIX_MMX_PREFILL_GATHER_TOK", "1", "0",
      "Prefill MoE measurement: exact (tiled xt/at, partials, output bitwise), gather 6.35 -> 4.14 ms per 4096-row call"},
     {"pf_router_rows", "STRIX_MM_PF_ROUTER_ROWS", "32", "8",
@@ -232,8 +235,8 @@ PrefillPolicy prefill_policy(const Lookup& env) {
         }
     }
     if (p.msa_flash != 0)
-        p.policies = p.msa_flash == 1 && p.msa_flash_layers == kMsaFlashLayers
-                         ? std::string(flash.policy)
+        p.policies = p.msa_flash == 1 && msa_flash_policy(p.msa_flash_layers) != nullptr
+                         ? std::string(msa_flash_policy(p.msa_flash_layers))
                          : std::string("msa-flash-bf16") + (p.msa_flash == 2 ? "-2term" : "") + "-l" + p.msa_flash_layers;
     if (i4 && fp::switch_on(env(kFastBundle.env)) && !fp::set(raw))
         p.note = std::string(flash.policy) + " not selected by " + kFastBundle.env + " on STRIX_MMX_MODEL_FORMAT=fast_i4";
@@ -456,6 +459,39 @@ SessionConfig session_config(const Cli& cli, const Lookup& env, std::uint64_t av
     return c;
 }
 
+namespace {
+constexpr const char* kPeerGone =
+    "a request must fail within a minute when the peer is gone; the CLI waits out an uneven two-rank load";
+constexpr HostDefault kHostDefaults[] = {
+    // The CRC organisation and the 1 MiB host chunks are items of the table above (apply() exports them for both
+    // entry points), so they are not repeated here.
+    // The ranks load at different speeds (44 s vs 166 s under page-cache pressure): the first collective after the
+    // load must not hit the dist layer's 120 s default.
+    {"STRIX_DIST_USB4_TIMEOUT_MS", "600000", "60000", kPeerGone, false},
+    {"STRIX_DIST_WAIT_TIMEOUT_MS", "600000", "60000", kPeerGone, false},
+    // Prefill MoE table ring: exact, 1K -0.5 %, 8K not slower; qualified with one engine owner only.
+    {"STRIX_MM_PF_TABLE_RING", "1", nullptr,
+     "qualified with a single engine owner; not qualified with several sessions sharing the engine", true},
+};
+}  // namespace
+
+std::span<const HostDefault> host_defaults() { return kHostDefaults; }
+
+const char* host_default_value(const HostDefault& row, const std::string& app, const Lookup& env) {
+    if (const char* set = env(row.name)) return set;
+    if (row.optimization) {
+        const char* base = env(kBaselineEnv);
+        if (base != nullptr && std::string(base) == "1") return nullptr;
+    }
+    return app == "serve" ? row.serve : row.rank;
+}
+
+void apply_host_defaults(const std::string& app) {
+    const Lookup lookup = [](const char* key) { return process_env(key); };
+    for (const auto& row : kHostDefaults)
+        if (const char* value = host_default_value(row, app, lookup)) (void)export_env(row.name, value, 0);
+}
+
 std::string effective_config(const Cli& cli, const Lookup& env) {
     std::ostringstream o;
     o << "app=" << cli.app << "\n"
@@ -467,6 +503,10 @@ std::string effective_config(const Cli& cli, const Lookup& env) {
         const char* v = env(r);
         o << r << "=" << (v != nullptr ? v : "default") << "\n";
     }
+    const char* order_asked = env("STRIX_MMX_PF_ORDER");
+    const auto& order = strix::moe_core::resolve_grouped_order(order_asked);
+    o << "STRIX_MMX_PF_ORDER.requested=" << (order_asked ? order_asked : "default") << "\n"
+      << "STRIX_MMX_PF_ORDER.effective=" << (order.invariant() ? "invariant" : "adaptive") << "\n";
     o << "build.gu4_scalar=" << (STRIX_MM_GU4_SCALAR ? "on" : "off") << "\n";
     for (const Resolved& r : resolve(env)) o << r.item->env << "=" << r.value << "\n";
     {   // FAST prefill profile rows (default OFF): the same resolution the engine, the cache identity and the ranks use.
@@ -512,6 +552,12 @@ std::string effective_config(const Cli& cli, const Lookup& env) {
     o << "session_requested=" << (requested ? requested : "auto") << "\n"
       << "session_cache=" << (session.enabled ? "pending" : "off") << "\n"
       << "session_reason=" << (session.enabled ? "runtime admission required" : session.reason) << "\n";
+    for (const auto& row : kHostDefaults) {
+        const char* value = host_default_value(row, cli.app, env);
+        o << "host." << row.name << "=" << (value ? value : "unset") << "\n";
+        if (cli.app == "serve" && row.serving_reason != nullptr && env(row.name) == nullptr)
+            o << "host." << row.name << ".serving_reason=" << row.serving_reason << "\n";
+    }
     return o.str();
 }
 

@@ -70,7 +70,7 @@ struct Shape {
 __device__ inline unsigned window_lo(unsigned p, unsigned window) { return window && p >= window ? p - window + 1U : 0U; }
 
 template <class P>
-__device__ __forceinline__ void flash_body(typename P::Args a, float* ws, unsigned splits) {
+__device__ __forceinline__ void flash_body(typename P::Args a, float* ws, unsigned splits, unsigned seg_tiles) {
     using S = typename P::Shape;
     constexpr unsigned D = S::dim, KP = S::kpitch, SP = S::spitch, F = S::frags, T = S::threads;
     constexpr auto O = P::kOp;
@@ -90,8 +90,13 @@ __device__ __forceinline__ void flash_body(typename P::Args a, float* ws, unsign
     const unsigned pos_first = p0 + row_base, pos_last = pos_first + block_rows - 1U;
     const unsigned key_begin = window_lo(pos_first, window) & ~15U;
     const unsigned tiles_total = (pos_last >> 4) - (key_begin >> 4) + 1U, share = (tiles_total + splits - 1U) / splits;
-    const unsigned kt_begin = key_begin + 16U * min(tiles_total, blockIdx.z * share);
-    const unsigned kt_end = key_begin + 16U * min(tiles_total, (blockIdx.z + 1U) * share); // exclusive
+    unsigned kt_begin = key_begin + 16U * min(tiles_total, blockIdx.z * share);
+    unsigned kt_end = key_begin + 16U * min(tiles_total, (blockIdx.z + 1U) * share); // exclusive
+    if (seg_tiles) { // chunkinv-attn-state-v1: segment z = absolute key tiles [z * seg_tiles, (z + 1) * seg_tiles)
+        const unsigned lo = 16U * blockIdx.z * seg_tiles, hi = lo + 16U * seg_tiles, end = 16U * ((pos_last >> 4) + 1U);
+        kt_begin = max(key_begin, lo);
+        kt_end = max(kt_begin, min(end, hi));
+    }
     // This wave's 16 rows: one query head, 16 consecutive positions.
     const unsigned head = kvh * S::group + tile % S::group, sub = tile / S::group * 16U;
     const bool wave_live = sub < block_rows;
@@ -265,8 +270,8 @@ __device__ __forceinline__ void flash_body(typename P::Args a, float* ws, unsign
 // 1.3x the uncapped 238-VGPR kernel (one work-group per WGP) at 32K.
 template <class P>
 __global__ __launch_bounds__(P::Shape::threads) __attribute__((amdgpu_waves_per_eu(8))) void flash_prefill(
-    typename P::Args a, float* ws, unsigned splits) {
-    flash_body<P>(a, ws, splits);
+    typename P::Args a, float* ws, unsigned splits, unsigned seg_tiles) {
+    flash_body<P>(a, ws, splits, seg_tiles);
 }
 
 // Split-K merge: one work-group per (row, head), D / 4 threads x 4 components.
@@ -301,13 +306,23 @@ __host__ __device__ constexpr std::size_t workspace_floats(unsigned rows, unsign
     return splits > 1U ? std::size_t(splits) * rows * heads * (dim + 2U) : 0U;
 }
 template <class P>
-inline void launch(const typename P::Args& a, unsigned heads, hipStream_t stream, float* ws = nullptr, unsigned splits = 1) {
+// Call cuts: the P.V WMMA rounds keys (2i, 2i+1) as a pair even when P of key 2i+1 is zero, so a call ending at an
+// even absolute position gives its last row other bits than a run that also holds the next key's V (packed pad = 0
+// here). The kernel cannot see that V; callers commit at chunk_contract::kWmmaKPairRows and recompute the open row
+// (src/core/chunk_contract.hpp section 4). Every other row and every aligned call keep their bits.
+// seg_tiles != 0 (identity dense-flash-absseg-v1/s<seg_tiles>, opt-in): split z covers the ABSOLUTE key tiles
+// [z * seg_tiles, (z + 1) * seg_tiles), so a row's partials and their ascending combine do not depend on the call's
+// rows or neighbouring queries (src/core/chunk_contract.hpp). The caller passes splits >= absolute_segment_count of the
+// call's last key; segments a row cannot see stay empty and combine skips them. seg_tiles == 0: block share (default).
+inline void launch(const typename P::Args& a, unsigned heads, hipStream_t stream, float* ws = nullptr, unsigned splits = 1,
+                   unsigned seg_tiles = 0) {
     using S = typename P::Shape;
     const unsigned rows = P::rows(a);
     if (!rows) return;
     if (!ws) splits = 1;
+    if (splits == 1U) seg_tiles = 0; // one segment: the direct path is bitwise the one-segment combine
     const dim3 grid((rows + S::positions - 1U) / S::positions, heads / S::group, splits);
-    hipLaunchKernelGGL(flash_prefill<P>, grid, dim3(S::threads), 0, stream, a, ws, splits);
+    hipLaunchKernelGGL(flash_prefill<P>, grid, dim3(S::threads), 0, stream, a, ws, splits, seg_tiles);
     if (splits > 1U) hipLaunchKernelGGL(combine<P>, dim3(rows, heads), dim3(S::dim / 4U), 0, stream, a, ws, splits);
 }
 
