@@ -107,6 +107,8 @@
 {"model-layout", 'b', "model tensor hashes+TP2 partition+rank order", "G3/G4 model gates; pack validation; F32 model fidelity remains draft pending all gates", ""},
 // src/minimax/moe/mmx_prefill.hip:476
 {"prefill-routed-split", 'c', "BLOCKED until matrix+arithmetic-version fixed S (no expert occupancy)", "UNCOVERED: known failed identity; existing core/mtfit receipts hold S fixed", "L3 routed gate/up WMMA k-tile24 reset vs continuation (rows1->9,S16->8)"},
+// src/minimax/moe/mmx_prefill.hip: prefill_moe_order (STRIX_MMX_PF_ORDER=invariant, opt-in; default adaptive)
+{"prefill-moe-order-invariant", 'b', "named identity mmx-pf-moe-s1-v1: routed+shared gate/up/down fixed S=1 (moe_core::kGroupedSingleChainContract), no expert occupancy", "chunk_order_contract_tests.cpp host order reference + chunk 256/1024/4096/whole and 1..17 tails; hip-mmx-moe-bench --test chunk-invariance device bytes; differs from adaptive for experts < 97 rows", ""},
 // src/minimax/moe/mmx_prefill.hip:477
 {"prefill-shared-split", 'c', "BLOCKED until shared matrix+arithmetic-version fixed S", "UNCOVERED: known failed max_rows identity", "L3 shared gate/up WMMA k-tile24 reset vs continuation (rows1->9,S16->8)"},
 // src/minimax/engine/engine.hip:227

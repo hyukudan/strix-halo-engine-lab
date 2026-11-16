@@ -41,6 +41,44 @@ int main() {
     // Gap budget: 170 + 1.69 x rows <= budget. 20+17 = 37 rows -> 232.5 ms; +23 = 60 -> 271.4 ms.
     check(plan_prefill_group(c8, def, kDs41, 240.0) == ids({100, 101}), "budget bounds the company");
     check(plan_prefill_group(c8, def, kDs41, std::numeric_limits<double>::quiet_NaN()) == ids({100}), "NaN budget: no company");
+    {   // DAYAUDIT 3: the group transport has no embedding rows: an image prompt runs alone and ends the company
+        auto img = burst({20, 17, 23, 21});
+        img[2].image_rows = true;
+        check(plan_prefill_group(img, def, kDs41, kInf) == ids({100, 101}), "an image candidate ends the company");
+        img[0].image_rows = true;
+        check(plan_prefill_group(img, def, kDs41, kInf) == ids({100}), "an image head runs alone");
+        check(std::string(kGroupImageDecline) == "image rows not supported in groups", "image decline reason");
+    }
+    {   // DAYAUDIT 4: asymmetric ranks. Rank 0 holds groups of 8; rank 1 has the group off, or 2 members: rank 0 must
+        // plan with the pair's minimum, never a group of 8 that rank 1 cannot hold.
+        PrefillGroupCapacity cap0;
+        cap0.members = 8; cap0.rows = 512; cap0.member_rows = 63; cap0.windows = 64; cap0.local_rows = 512; cap0.window_rows = 8;
+        cap0.split_class_mask = 1U; cap0.rejected_class_mask = 4U;
+        check(plan_prefill_group(c8, def, kDs41, kInf, cap0).size() == 8U, "rank 0 alone: a group of eight");
+        PrefillGroupPolicy off = def; off.mode = PrefillGroupPolicy::Mode::off;
+        PrefillGroupCapacity none = cap0; none.members = 0;
+        const auto with_off = agree_prefill_group(def, cap0, prefill_group_words(off, none));
+        check(!with_off.policy.groups() && with_off.capacity.members == 0U && std::string(with_off.capacity.reason) == "peer-capacity",
+              "peer group off: no group");
+        check(plan_prefill_group(c8, with_off.policy, kDs41, kInf, with_off.capacity) == ids({100}), "peer group off: rank 0 runs alone");
+        PrefillGroupPolicy two = def; two.max_members = 2;
+        PrefillGroupCapacity cap1 = cap0; cap1.members = 2; cap1.rows = 128;
+        const auto with_two = agree_prefill_group(def, cap0, prefill_group_words(two, cap1));
+        check(with_two.policy.max_members == 2U && with_two.capacity.members == 2U && with_two.capacity.rows == 128U &&
+                  std::string(with_two.capacity.reason) == "pair-minimum", "peer of two members: the minimum");
+        check(plan_prefill_group(c8, with_two.policy, kDs41, kInf, with_two.capacity) == ids({100, 101}), "peer of two: groups of two");
+        // the agreement is symmetric in its result
+        const auto from1 = agree_prefill_group(two, cap1, prefill_group_words(def, cap0));
+        check(prefill_group_words(from1.policy, from1.capacity) == prefill_group_words(with_two.policy, with_two.capacity),
+              "both ranks reach the same limits");
+        PrefillGroupCapacity w16 = cap0; w16.window_rows = 16;
+        check(agree_prefill_group(def, cap0, prefill_group_words(def, w16)).capacity.members == 0U, "window rows differ: no group");
+        const auto equal = agree_prefill_group(def, cap0, prefill_group_words(def, cap0));
+        check(prefill_group_words(equal.policy, equal.capacity) == prefill_group_words(def, cap0),
+              "equal ranks: unchanged");
+        check(plan_prefill_group(c8, equal.policy, kDs41, kInf, equal.capacity) == ids({100, 101, 102, 103, 104, 105, 106, 107}),
+              "equal ranks: all eight candidates still group");
+    }
     // Members cap and rows cap.
     PrefillGroupPolicy p3 = def; p3.max_members = 3;
     check(plan_prefill_group(c8, p3, kDs41, kInf) == ids({100, 101, 102}), "members cap");

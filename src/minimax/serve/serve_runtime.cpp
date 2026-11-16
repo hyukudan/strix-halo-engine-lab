@@ -27,7 +27,6 @@ double secs(Clock::time_point a, Clock::time_point b) { return std::chrono::dura
 // Signal storage outlives every Lead and transport; no monitor thread.
 std::atomic<bool> g_stop{false};
 void on_signal(int) { g_stop.store(true); }
-void default_env(const char* name, const char* value) { (void)::setenv(name,value,0); }
 std::unique_ptr<strix::dist::Transport> open_transport(const std::string& spec, std::uint32_t rank, std::string& receipt,
     std::unique_ptr<strix::dist::DeviceExchange>& gpu_direct) {
     // transport_capabilities 0 preserves the serving capability contract.
@@ -82,12 +81,7 @@ public:
         strix::minimax::defaults::Cli cli;cli.app="serve";cli.transport=transport_spec;
         cli.slots=opt.slots;cli.capacity=opt.capacity;cli.max_rows=opt.max_rows;
         strix::minimax::defaults::SessionConfig session_config;
-        default_env("STRIX_DIST_USB4_TIMEOUT_MS","60000");
-        default_env("STRIX_DIST_WAIT_TIMEOUT_MS","60000");
-        default_env("STRIX_DIST_CRC_PARALLEL","1");
-        default_env("STRIX_DIST_HOST_CRC_OVERLAP","1");
-        default_env("STRIX_DIST_HOST_CHUNK_BYTES","1048576");
-        default_env("STRIX_MMX_CRC","deferred");
+        strix::minimax::defaults::apply_host_defaults("serve");  // the one host-path table, serving column
         g_stop.store(false);
         std::signal(SIGINT,on_signal); std::signal(SIGTERM,on_signal);
         std::string receipt;
