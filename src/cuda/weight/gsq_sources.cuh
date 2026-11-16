@@ -29,6 +29,7 @@ template<unsigned T,class Arch> struct LegacyProjectionSource {
     static_assert(T==12 || T==13);
     static constexpr unsigned project_wb=T==13?176:144,project_qs=T==13?48:16;
     static constexpr bool legacy_fast=true;
+    __host__ __device__ static std::uint64_t project_row_bytes(unsigned k) { return std::uint64_t(k/256)*project_wb; }
     template<unsigned OUTS,unsigned THREADS>
     __device__ static void stage_project(unsigned char* dst,const std::uint8_t* gate,const std::uint8_t* up,
                                          unsigned expert,unsigned out,unsigned hidden,unsigned ffn,unsigned b,unsigned t) {
@@ -91,6 +92,7 @@ template<unsigned T,class Arch> struct LegacyDownSource {
     static_assert(T==7 || T==8);
     static constexpr unsigned down_wb=T==7?24U:34U,down_ws=T==7?112U:144U;
     static constexpr bool legacy_fast=true;
+    __host__ __device__ static std::uint64_t down_row_bytes(unsigned k) { return std::uint64_t(k/32)*down_wb; }
     template<unsigned OUTS,unsigned THREADS>
     __device__ static void stage_down(unsigned char* dst,const std::uint8_t* weights,unsigned expert,
                                       unsigned out,unsigned hidden,unsigned ffn,unsigned c,unsigned t) {
@@ -229,6 +231,8 @@ struct OperandSource<GgmlTag<T>,SignedA8Tag,Arch,GsqIq3SA8Dot4Cuda> {
     static constexpr bool legacy_fast=false;
     static constexpr unsigned project_wb=((256/Decode::be*Decode::bb)+15)&~15U;
     static constexpr unsigned down_wb=32,down_ws=160;
+    __host__ __device__ static std::uint64_t project_row_bytes(unsigned k) { return std::uint64_t(k/Decode::be)*Decode::bb; }
+    __host__ __device__ static std::uint64_t down_row_bytes(unsigned k) { return std::uint64_t(k/Decode::be)*Decode::bb; }
     static ::strix::weight::Status validate(const ::strix::weight::WeightView& view,const LaunchShape& shape) {
         using namespace ::strix::weight;
         constexpr const char* storage=T==18?"gguf.iq3_xxs":T==20?"gguf.iq4_nl":T==21?"gguf.iq3_s":
@@ -334,6 +338,18 @@ struct OperandSource<GgmlTag<T>,SignedA8Tag,Arch,GsqIq3SA8Dot4Cuda> {
     }
     __device__ static float down_value(float d,float,int dot,float) { return __fmul_rn(d,Arch::group_float(dot)); }
     __device__ static float row_down_value(float d,float,int dot,float) { return __fmul_rn(d,float(dot)); }
+};
+
+struct RuntimeGgmlTag {};
+template<class Arch>
+struct OperandSource<RuntimeGgmlTag,NativeScalarTag,Arch,CudaNativeFp32> {
+    __host__ __device__ static std::uint64_t row_bytes(unsigned type,unsigned width) {
+        const auto geometry=quant::geometry(type);
+        return std::uint64_t(width)/geometry.block_elements*geometry.block_bytes;
+    }
+    __device__ static void decode(unsigned type,const std::uint8_t* row,unsigned group,float* out) {
+        quant::decode_row_group(type,row,group,out);
+    }
 };
 
 } // namespace strix::cuda::weight
