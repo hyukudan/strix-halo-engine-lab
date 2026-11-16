@@ -1256,7 +1256,6 @@ __global__ __launch_bounds__(256) void mla_gemm_rows_v2_kernel(const float* A, c
 // slices spread over the whole row. Measured on the shared WMMA tile core (same layout, C 4096): absorb 6.8 -> 3.4 ms,
 // out 6.4 -> 4.5 ms; group sizes 4..16 equal the plain heads-mid order. Placement only: the same bits.
 constexpr unsigned kG3R = 128, kG3C = 128, kG3K = 16, kG3Pad = 132;
-inline bool g3_heads_mid() { return mla_gemm::heads_mid(); }
 inline dim3 g3_grid(unsigned nc, unsigned C, unsigned heads, bool heads_mid) {
     const unsigned rows = (C + kG3R - 1) / kG3R;
     return heads_mid ? dim3(nc / kG3C, heads, rows) : dim3(nc / kG3C, rows, heads);
@@ -3511,46 +3510,47 @@ bool mla_e_lane_major(unsigned heads) {
     return !mla_v1() && (v == 5 || v == 7 || v == 10) && heads == 32;
 }
 
-// FAST glm-pf-mla-wmma-v1 (STRIX_GLM_PF_MLA_WMMA=1, opt-in): absorb (kOut = false) / out GEMM on the shared short-K FP16
+// FAST glm-pf-mla-wmma-v1: absorb (kOut = false) / out GEMM on the shared short-K FP16
 // WMMA tile GEMM (glm_pf_mla_wmma.hpp); false = not selected, the caller runs its exact GEMM version.
-bool mla_wmma_selected(const float* x, const std::uint16_t* kv_b, unsigned heads, unsigned C) {
-    return mla_wmma::enabled() && mla_wmma::fits<kKvLora, kMlaDim>(x, x, kv_b, heads, C);
+bool mla_wmma_selected(const float* x, const std::uint16_t* kv_b, unsigned heads, unsigned C,
+                       const mla_gemm::Dispatch& dispatch) {
+    return dispatch.use_wmma(mla_wmma::fits<kKvLora, kMlaDim>(x, x, kv_b, heads, C));
 }
 // image (absorb only): y receives the bf16 q-tilde image the fused core 22 / 23 reads (same bits as its own conversion).
 template <bool kOut>
-bool mla_gemm_wmma(const float* x, const std::uint16_t* kv_b, unsigned heads, unsigned C, float* y, hipStream_t s, bool image = false,
-                   bool a16 = false) {
-    if (!mla_wmma_selected(x, kv_b, heads, C)) return false;
+bool mla_gemm_wmma(const float* x, const std::uint16_t* kv_b, unsigned heads, unsigned C, float* y, hipStream_t s, const mla_gemm::Dispatch& dispatch,
+                   bool image = false, bool a16 = false) {
+    if (!mla_wmma_selected(x, kv_b, heads, C, dispatch)) return false;
     mla_wmma::gemm<kKvLora, kMlaDim, kOut>(x, kv_b, heads, C, y, s, image, a16);
     mla_wmma::calls.fetch_add(1, std::memory_order_relaxed);
     return true;
 }
 
-void mla_attention_rows_versions(const DsaSlot& slot, const std::uint32_t* tokens, const std::uint32_t* n, const float* q,
+static void mla_attention_rows_impl(const DsaSlot& slot, const std::uint32_t* tokens, const std::uint32_t* n, const float* q,
                         const std::uint16_t* kv_b, unsigned heads, float* qt, float* e, float* ob, float* o, unsigned C,
-                        hipStream_t s, unsigned scores_v, unsigned obar_v, unsigned gemm_v) {
+                        hipStream_t s, unsigned scores_v, unsigned obar_v, unsigned gemm_v, const mla_gemm::Dispatch& dispatch) {
     if (C == 0) return;
     if (heads != 32 && heads != 64) throw std::runtime_error("glm pf mla_attention_rows: heads must be 32 or 64");
     if (gemm_v != 1 && gemm_v != 2 && gemm_v != 3) throw std::runtime_error("glm pf mla_attention_rows_versions: unsupported gemm version");
     if (obar_v >= 20 && obar_v <= 23) {  // FAST fused core (T = 32 / 16, FP32 / bf16 q-tilde): absorb GEMM, flash core, out GEMM
         if (heads != 32) throw std::runtime_error("glm pf mla_attention_rows_versions: the fused attn-wmma core needs heads 32");
-        const bool q16 = obar_v >= 22 && (gemm_v == 3 || mla_wmma_selected(q, kv_b, heads, C));
+        const bool q16 = obar_v >= 22 && (gemm_v == 3 || mla_wmma_selected(q, kv_b, heads, C, dispatch));
         const unsigned keys = obar_v % 2 == 1 ? 16U : 32U;
         mla_mark(0, s);
-        if (mla_gemm_wmma<false>(q, kv_b, heads, C, qt, s, q16)) {
-        } else if (q16) mla_gemm_rows_v3_kernel<false, true><<<g3_grid(kKvLora, C, heads, g3_heads_mid()), 256, 0, s>>>(q, kv_b, heads, C, qt, g3_heads_mid());
-        else if (gemm_v == 3) mla_gemm_rows_v3_kernel<false><<<g3_grid(kKvLora, C, heads, g3_heads_mid()), 256, 0, s>>>(q, kv_b, heads, C, qt, g3_heads_mid());
+        if (mla_gemm_wmma<false>(q, kv_b, heads, C, qt, s, dispatch, q16)) {
+        } else if (q16) mla_gemm_rows_v3_kernel<false, true><<<g3_grid(kKvLora, C, heads, dispatch.heads_mid), 256, 0, s>>>(q, kv_b, heads, C, qt, dispatch.heads_mid);
+        else if (gemm_v == 3) mla_gemm_rows_v3_kernel<false><<<g3_grid(kKvLora, C, heads, dispatch.heads_mid), 256, 0, s>>>(q, kv_b, heads, C, qt, dispatch.heads_mid);
         else if (gemm_v == 2) mla_gemm_rows_v2_kernel<false><<<dim3((C + kG2R - 1) / kG2R, kKvLora / kG2C, heads), 256, 0, s>>>(q, kv_b, heads, C, qt);
         else mla_gemm_rows_kernel<false><<<dim3((C + kGT - 1) / kGT, kKvLora / kGT, heads), 256, 0, s>>>(q, kv_b, heads, C, qt);
         ok(hipGetLastError(), "glm pf mla absorb");
         mla_mark(1, s);
         mla_mark(2, s);
         mla_mark(3, s);
-        const bool ob16 = mla_wmma::ob16() && mla_wmma_selected(ob, kv_b, heads, C);  // out GEMM on WMMA: FP16 o-bar image
+        const bool ob16 = dispatch.ob16 && mla_wmma_selected(ob, kv_b, heads, C, dispatch);  // out GEMM on WMMA: FP16 o-bar image
         mla_flash_rows(slot, tokens, n, qt, ob, C, keys, q16, s, ob16);
         mla_mark(4, s);
-        if (mla_gemm_wmma<true>(ob, kv_b, heads, C, o, s, false, ob16)) {
-        } else if (gemm_v == 3) mla_gemm_rows_v3_kernel<true><<<g3_grid(kMlaDim, C, heads, g3_heads_mid()), 256, 0, s>>>(ob, kv_b, heads, C, o, g3_heads_mid());
+        if (mla_gemm_wmma<true>(ob, kv_b, heads, C, o, s, dispatch, false, ob16)) {
+        } else if (gemm_v == 3) mla_gemm_rows_v3_kernel<true><<<g3_grid(kMlaDim, C, heads, dispatch.heads_mid), 256, 0, s>>>(ob, kv_b, heads, C, o, dispatch.heads_mid);
         else if (gemm_v == 2) mla_gemm_rows_v2_kernel<true><<<dim3((C + kG2R - 1) / kG2R, kMlaDim / kG2C, heads), 256, 0, s>>>(ob, kv_b, heads, C, o);
         else mla_gemm_rows_kernel<true><<<dim3((C + kGT - 1) / kGT, kMlaDim / kGT, heads), 256, 0, s>>>(ob, kv_b, heads, C, o);
         ok(hipGetLastError(), "glm pf mla out");
@@ -3570,8 +3570,8 @@ void mla_attention_rows_versions(const DsaSlot& slot, const std::uint32_t* token
         if (heads == 32) mla_scores_rows_kernel<32><<<sg, 256, 0, s>>>(slot, tokens, n, qt, e);
         else mla_scores_rows_kernel<64><<<sg, 256, 0, s>>>(slot, tokens, n, qt, e);
     } else {
-        if (mla_gemm_wmma<false>(q, kv_b, heads, C, qt, s)) {
-        } else if (gemm_v == 3) mla_gemm_rows_v3_kernel<false><<<g3_grid(kKvLora, C, heads, g3_heads_mid()), 256, 0, s>>>(q, kv_b, heads, C, qt, g3_heads_mid());
+        if (mla_gemm_wmma<false>(q, kv_b, heads, C, qt, s, dispatch)) {
+        } else if (gemm_v == 3) mla_gemm_rows_v3_kernel<false><<<g3_grid(kKvLora, C, heads, dispatch.heads_mid), 256, 0, s>>>(q, kv_b, heads, C, qt, dispatch.heads_mid);
         else if (gemm_v == 2) mla_gemm_rows_v2_kernel<false><<<dim3((C + kG2R - 1) / kG2R, kKvLora / kG2C, heads), 256, 0, s>>>(q, kv_b, heads, C, qt);
         else mla_gemm_rows_kernel<false><<<dim3((C + kGT - 1) / kGT, kKvLora / kGT, heads), 256, 0, s>>>(q, kv_b, heads, C, qt);
         mla_mark(1, s);
@@ -3614,8 +3614,8 @@ void mla_attention_rows_versions(const DsaSlot& slot, const std::uint32_t* token
         else if (obv == 4) mla_obar_v4_kernel<<<dim3(heads / kOb4Heads, kKvLora / kOb4Dims, C), 256, 0, s>>>(slot, tokens, n, heads, e, ob);
         else mla_obar_v2_kernel<<<dim3(kKvLora / kOb2Lat, C), 256, 0, s>>>(slot, tokens, n, heads, e, ob);
         mla_mark(4, s);
-        if (mla_gemm_wmma<true>(ob, kv_b, heads, C, o, s)) {
-        } else if (gemm_v == 3) mla_gemm_rows_v3_kernel<true><<<g3_grid(kMlaDim, C, heads, g3_heads_mid()), 256, 0, s>>>(ob, kv_b, heads, C, o, g3_heads_mid());
+        if (mla_gemm_wmma<true>(ob, kv_b, heads, C, o, s, dispatch)) {
+        } else if (gemm_v == 3) mla_gemm_rows_v3_kernel<true><<<g3_grid(kMlaDim, C, heads, dispatch.heads_mid), 256, 0, s>>>(ob, kv_b, heads, C, o, dispatch.heads_mid);
         else if (gemm_v == 2) mla_gemm_rows_v2_kernel<true><<<dim3((C + kG2R - 1) / kG2R, kMlaDim / kG2C, heads), 256, 0, s>>>(ob, kv_b, heads, C, o);
         else mla_gemm_rows_kernel<true><<<dim3((C + kGT - 1) / kGT, kMlaDim / kGT, heads), 256, 0, s>>>(ob, kv_b, heads, C, o);
     }
@@ -3623,33 +3623,48 @@ void mla_attention_rows_versions(const DsaSlot& slot, const std::uint32_t* token
     mla_mark(5, s);
 }
 
-void mla_attention_rows(const DsaSlot& slot, const std::uint32_t* tokens, const std::uint32_t* n, const float* q,
-                        const std::uint16_t* kv_b, unsigned heads, float* qt, float* e, float* ob, float* o, unsigned C,
-                        hipStream_t s) {
-    mla_attention_rows_versions(slot, tokens, n, q, kv_b, heads, qt, e, ob, o, C, s,
-                                mla_v1() ? 1U : scores_version(), mla_v1() ? 1U : obar_env_version(heads), mla_gemm_version());
-}
-
 void mla_attention_rows_versions(const DsaSlot& slot, const std::uint32_t* tokens, const std::uint32_t* n, const float* q,
                         const std::uint16_t* kv_b, unsigned heads, float* qt, float* e, float* ob, float* o, unsigned C,
-                        hipStream_t s, unsigned scores_v, unsigned obar_v, unsigned gemm_v, unsigned query_window) {
+                        hipStream_t s, unsigned scores_v, unsigned obar_v, unsigned gemm_v) {
+    mla_attention_rows_impl(slot, tokens, n, q, kv_b, heads, qt, e, ob, o, C, s, scores_v, obar_v, gemm_v, {});
+}
+
+void mla_attention_rows_selected(const DsaSlot& slot, const std::uint32_t* tokens, const std::uint32_t* n, const float* q,
+                        const std::uint16_t* kv_b, unsigned heads, float* qt, float* e, float* ob, float* o, unsigned C,
+                        hipStream_t s, unsigned scores_v, unsigned obar_v, unsigned gemm_v, unsigned query_window,
+                        mla_gemm::Dispatch dispatch) {
     if (C == 0) return;
     const unsigned Q = attention_scratch_rows(C, query_window);
     // All KV is already appended/selected. Reuse qt/e/ob on the existing stream;
     // only the query/list/count/output origins move. No recursion or extra waits.
     for (unsigned begin = 0; begin < C; begin += Q) {
         const std::size_t offset = std::size_t{begin} * heads * kMlaDim;
-        mla_attention_rows_versions(slot, tokens + std::size_t{begin} * kMaxTokens, n + begin, q + offset,
-            kv_b, heads, qt, e, ob, o + offset, std::min(Q, C - begin), s, scores_v, obar_v, gemm_v);
+        mla_attention_rows_impl(slot, tokens + std::size_t{begin} * kMaxTokens, n + begin, q + offset,
+            kv_b, heads, qt, e, ob, o + offset, std::min(Q, C - begin), s, scores_v, obar_v, gemm_v, dispatch);
     }
+}
+
+void mla_attention_rows_versions(const DsaSlot& slot, const std::uint32_t* tokens, const std::uint32_t* n, const float* q,
+                        const std::uint16_t* kv_b, unsigned heads, float* qt, float* e, float* ob, float* o, unsigned C,
+                        hipStream_t s, unsigned scores_v, unsigned obar_v, unsigned gemm_v, unsigned query_window) {
+    mla_attention_rows_selected(slot, tokens, n, q, kv_b, heads, qt, e, ob, o, C, s,
+                                scores_v, obar_v, gemm_v, query_window, {});
+}
+
+void mla_attention_rows(const DsaSlot& slot, const std::uint32_t* tokens, const std::uint32_t* n, const float* q,
+                        const std::uint16_t* kv_b, unsigned heads, float* qt, float* e, float* ob, float* o, unsigned C,
+                        hipStream_t s) {
+    mla_attention_rows_impl(slot, tokens, n, q, kv_b, heads, qt, e, ob, o, C, s,
+        mla_v1() ? 1U : scores_version(), mla_v1() ? 1U : obar_env_version(heads), mla_gemm_version(),
+        mla_gemm::automatic_dispatch());
 }
 
 void mla_attention_rows(const DsaSlot& slot, const std::uint32_t* tokens, const std::uint32_t* n, const float* q,
                         const std::uint16_t* kv_b, unsigned heads, float* qt, float* e, float* ob, float* o, unsigned C,
                         hipStream_t s, unsigned query_window) {
-    mla_attention_rows_versions(slot, tokens, n, q, kv_b, heads, qt, e, ob, o, C, s,
-                                mla_v1() ? 1U : scores_version(), mla_v1() ? 1U : obar_env_version(heads), mla_gemm_version(),
-                                query_window);
+    mla_attention_rows_selected(slot, tokens, n, q, kv_b, heads, qt, e, ob, o, C, s,
+        mla_v1() ? 1U : scores_version(), mla_v1() ? 1U : obar_env_version(heads), mla_gemm_version(),
+        query_window, mla_gemm::automatic_dispatch());
 }
 
 }  // namespace strix::glm::pf

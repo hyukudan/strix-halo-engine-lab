@@ -1,12 +1,14 @@
 #pragma once
 // GLM prefill FAST identity glm-pf-mla-wmma-v1: the two per-head MLA GEMMs of a chunk, absorb (q_nope x W_UK -> the
 // 512-wide latent query) and out (o_bar x W_UV -> the 256-wide head output), on the shared short-K FP16 WMMA tile GEMM
-// (core/f16_tile_gemm.hpp) instead of the exact FP32 VOPD chains of mla_gemm_rows_v3. Opt-in (default off):
-// STRIX_GLM_PF_MLA_WMMA=1 (glm_pf_wmma.hpp mla_wmma::enabled). Contract: per output one WMMA chain from +0 over the
+// (core/f16_tile_gemm.hpp) instead of the exact FP32 VOPD chains of mla_gemm_rows_v3. Automatic when FAST is selected;
+// STRIX_GLM_PF_MLA_WMMA overrides it (glm_pf_wmma.hpp mla_wmma::enabled). Contract: per output one WMMA chain from +0 over the
 // 16-wide k units ascending, sum_k fp16(x) * w with FP32 accumulation; softmax, scores and o-bar are unchanged.
 // kv_b of a head h: rows [h * 2 * Dim, h * 2 * Dim + Dim) = W_UK as [k = 0..Dim)[c = 0..Lora) (Layout::KN, the core
 // transposes it in LDS, no weight copy), the next Dim rows = W_UV as [v = 0..Dim)[c = 0..Lora) (Layout::NK).
 #include "core/f16_tile_gemm.hpp"
+#include "glm/prefill/glm_prefill.hpp"
+#include "glm/prefill/glm_pf_wmma.hpp"
 
 #include <hip/hip_runtime.h>
 
@@ -56,3 +58,11 @@ inline bool fits(const float* q, const float* ob, const std::uint16_t* kv_b, uns
 }
 
 }  // namespace strix::glm::pf::mla_wmma
+
+namespace strix::glm::pf {
+// Explicit arithmetic/image/placement selector for FAST gates. Existing versions APIs remain exact.
+void mla_attention_rows_selected(const dev::DsaSlot& slot, const std::uint32_t* tokens, const std::uint32_t* n,
+    const float* q, const std::uint16_t* kv_b, unsigned heads, float* qt, float* e, float* ob, float* o,
+    unsigned C, hipStream_t s, unsigned scores_v, unsigned obar_v, unsigned gemm_v, unsigned query_window,
+    mla_gemm::Dispatch dispatch);
+}  // namespace strix::glm::pf

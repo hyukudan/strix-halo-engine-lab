@@ -5407,6 +5407,27 @@ if(STRIX_FAMILY_GLM5)
         target_compile_features(strix-glm5-rank-defaults-cpu-tests PRIVATE cxx_std_20)
         strix_target_warnings(strix-glm5-rank-defaults-cpu-tests)
         add_test(NAME strix-glm5-rank-defaults-cpu-tests COMMAND strix-glm5-rank-defaults-cpu-tests)
+        # GLM MLA dispatch (host-only): the real explicit/automatic entry points of glm_prefill.hip, compiled with a
+        # recording stub; exact version APIs never take FAST, resolved switches are cached (no copied dispatch logic).
+        file(READ "${CMAKE_CURRENT_SOURCE_DIR}/src/glm/prefill/glm_prefill.hip" strix_glm_mla_prefill_src)
+        set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+            "${CMAKE_CURRENT_SOURCE_DIR}/src/glm/prefill/glm_prefill.hip")
+        string(FIND "${strix_glm_mla_prefill_src}" "\nvoid mla_attention_rows_versions(" strix_glm_mla_begin)
+        if(strix_glm_mla_begin LESS 0)
+            message(FATAL_ERROR "glm_prefill.hip: MLA explicit entry points missing")
+        endif()
+        string(SUBSTRING "${strix_glm_mla_prefill_src}" ${strix_glm_mla_begin} -1 strix_glm_mla_wrappers)
+        string(REPLACE "}  // namespace strix::glm::pf" "" strix_glm_mla_wrappers "${strix_glm_mla_wrappers}")
+        file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/glm_mla_dispatch/mla_wrappers.inc" "${strix_glm_mla_wrappers}")
+        add_executable(strix-glm-mla-dispatch-host-tests tests/glm_mla_dispatch_host_tests.cpp)
+        target_compile_features(strix-glm-mla-dispatch-host-tests PRIVATE cxx_std_20)
+        target_include_directories(strix-glm-mla-dispatch-host-tests PRIVATE src include
+            "${CMAKE_CURRENT_BINARY_DIR}/glm_mla_dispatch")
+        strix_target_warnings(strix-glm-mla-dispatch-host-tests)
+        foreach(mode inherit off force)
+            add_test(NAME strix-glm-mla-dispatch-host-tests-${mode} COMMAND strix-glm-mla-dispatch-host-tests ${mode})
+            set_tests_properties(strix-glm-mla-dispatch-host-tests-${mode} PROPERTIES TIMEOUT 10)
+        endforeach()
         if(TARGET strix_serve)
             # strix-glm5-serve control channel, lead / follower protocol and scheduling on a fake engine (host-only)
             if(NOT MSVC)  # the GLM host arithmetic uses compiler builtins
