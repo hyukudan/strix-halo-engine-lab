@@ -1,5 +1,5 @@
 // Diagnostic teacher forcing over the production CUDA engine; no sampling or draft tokens.
-#include "strix/cuda_qwen_prefill.hpp"
+#include "strix/cuda/qwen_prefill.hpp"
 #include "strix/device/cuda_enumerator.hpp"
 #include <algorithm>
 #include <cmath>

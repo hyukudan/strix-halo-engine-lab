@@ -136,7 +136,7 @@ def main():
                   selection_scope=scope, frozen_positions_sha256=case["positions_sha256"],
                   selected_positions_sha256=sha256_file(selected_path),
                   binary_sha256=sha256_file(config["exe"]), args=argv, requests=records,
-                  effective={"gpu": 0, "kv": "fp16", "prefix_cache": False, "drafting": False,
+                  effective={"gpu": 0, "kv": a.kv, "prefix_cache": False, "drafting": False,
                              "context_capacity": len(ids)+8, "condition_every_prefix_token": True})
     (out / "index.json").write_text(json.dumps(result, indent=2) + "\n")
     print(json.dumps({"case": case["case"], "rows": len(positions),

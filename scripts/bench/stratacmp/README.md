@@ -19,11 +19,6 @@ intrusive profiler scopes attribute kernels; cold/warm throughput comes from the
 
 ## Teacher-forced quality
 
-The native teacher defaults to FP16 KV. Pass `strata-first.py --kv int8` for a separately
-declared diagnostic of int8 serving arithmetic; its receipt records the effective arguments.
-The frozen protocol must declare `teacher_kv: "int8"`; undeclared KV changes are refused.
-Keep that candidate separate from the FP16 control and the formal frozen quality gate.
-
 Build the Release target `strix-cuda-qwen-logits`. It uses the production CUDA `Prefill` API without drafts,
 consumes every input token in order, and stores only selected full-vocabulary rows in the existing TURBO
 TMLLOG02 format. After any initial prefix before the first selection, this diagnostic accepts teacher
@@ -31,8 +26,8 @@ windows of 1..8 consecutive forced tokens; only windows containing a selected po
 to the host. It emits selected slices in order and checks every returned full row for finite values. Its
 runtime is not a prefill benchmark. It accepts device declaration flags through the usual start gate.
 
-Prepare a whitespace-separated ID file using the exact same tokenizer for every arm. For a Strata stride
-of 256, create the selected positions and run our exporter (CAP must hold all input IDs):
+Prepare a whitespace-separated ID file using the exact same tokenizer for every arm. For a diagnostic
+stride of 256, create the selected positions and run the exporter (CAP must hold all input IDs):
 
 ```sh
 python scripts/bench/stratacmp/quality.py positions --ids CASE.ids --stride 256 --out CASE.positions
@@ -49,7 +44,7 @@ Record the actual `teacher batching:` engine line with `quality.py receipt`; `co
 `--receipt R=... --receipt T:ours-gsq=...` rejects different CUDA teacher settings or payload hashes.
 Metrics without these receipts are labeled unverified diagnostics and cannot qualify an E/R/T gate.
 Position zero is unsupported by CUDA `verify` because it requires nonempty prefilled state; frozen TURBO
-spread positions start at 64. The stride diagnostic omits row zero consistently in both engines.
+spread positions start at 64. The stride diagnostic omits row zero consistently in every arm.
 
 The full 48-parent, two-length corpus is roughly two million forced tokens; a completed pilot or one case
 does not establish that the full kit ran. Report actual cases/rows and preserve partial-run status.
@@ -61,37 +56,17 @@ for a formal gate; the stride example above is a diagnostic only. Record binary/
 and resolved routes before running; never relabel a binary
 as exact when it reports a FAST identity. Use an E repeat to quantify reference nondeterminism.
 
-Run Strata offline with the same `CASE.ids`, `--max-new 1 --dump-logits strata.raw --logits-stride 256`,
-`--gpu 0 --kv fp16 --suffix-draft 0 --lookup-max-t 0 --prompt-cache 0`, and the pack's native/PLE arguments.
-Disable tail skipping and CPU prefill sharing through its documented quality controls. The dump must
-contain a header and every expected row; an empty dump is a failure, never a successful quality run.
-Convert and compare:
+Compare project-owned exported rows and bind their qualification receipts:
 
 ```sh
-python scripts/bench/stratacmp/quality.py strata --raw strata.raw --ids CASE.ids --stride 256 --out strata.bin
-python scripts/bench/stratacmp/quality.py compare --reference E.bin --arm R=R.bin --arm T:strata=strata.bin --out metrics.json
+python scripts/bench/stratacmp/quality.py compare --reference E.bin --arm R=R.bin --arm T:candidate=T.bin --out metrics.json
 python scripts/bench/stratacmp/quality.py receipt --manifest frozen.json --arm E --spool E.bin --binary strix-cuda-qwen-logits --engine-log E.log --out E.receipt.json
 python -m unittest discover -s scripts/bench/stratacmp -p test_quality.py
 ```
 
-The native-pack route can bypass the CLI dump site. For that route, `strata-first.py` runs the engine's
-offline stdio serve protocol with `STRATA_DUMP_FIRST_LOGITS`, issues one `GEN 1` per frozen corpus selection
-at position p with exactly IDs `[0,p]`, and records each request hash, prompt length p+1 and true label
-IDs[p+1]. It uses GPU index 0, checks 20 GiB free RAM, disables prefix caches, suffix/lookup drafts, tail
-skipping and CPU prefill sharing, and retains all source rows. Run it inside an authorized GPU window:
-
-```sh
-python scripts/bench/stratacmp/strata-first.py --config strata.json --manifest frozen.json --corpus CORPUS --case CASE --out NEWDIR --timeout 120
-```
-
-The runner's timeout includes loading; size the selected case/window accordingly. It stops only its own
-child process. It rejects a changed corpus hash or selected-ID/position file. The output `logits.bin` is
-directly comparable with CUDA export for that exact corpus case and positions file. `index.json` binds the
-actual effective args and request order. The runner does not create/replace R or certify a statistical pass.
-For a bounded device ticket, add `--selection-start N --selection-count K` to collect a contiguous slice
-of the unchanged frozen selections. The runner writes `selected.positions` for the CUDA exporter and
-records the original selection hash, interval, total count and explicit partial status in `index.json`.
-Use identical slices for every arm. A completed shard does not establish a completed case or quality gate.
+Use identical selected positions for every arm and record partial-run status explicitly.
+A completed shard does not establish a completed case or quality gate. Keep comparative
+inputs and external inspection artifacts in private storage outside Git.
 `quality.py strata-first --prefix PREFIX --ids CASE.ids --positions CASE.positions --out strata.bin` also
 converts previously collected `PREFIX.0`, `PREFIX.1`, ... rows when their external request-order record
 proves this same conditioning contract.
