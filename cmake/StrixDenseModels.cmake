@@ -21,6 +21,7 @@ add_library(strix_weight_archive STATIC
 target_compile_features(strix_weight_archive PUBLIC cxx_std_20)
 target_include_directories(strix_weight_archive PUBLIC "${strix_dense_root}/include")
 target_link_libraries(strix_weight_archive PUBLIC strix_serve_json)
+target_link_libraries(strix_model_graph PUBLIC strix_weight_archive)
 add_library(strix_qwen27_model STATIC "${strix_dense_root}/src/qwen27/model.cpp"
     "${strix_dense_root}/src/model_family_registry.cpp")
 target_link_libraries(strix_qwen27_model PUBLIC strix_weight_archive strix_model_graph)

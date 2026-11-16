@@ -168,8 +168,20 @@ void test_config(const std::filesystem::path& dir) {
         auto bad = strix::serve::parse_json_unique(j.dump()); bad.set("rope_scaling",strix::serve::parse_json_unique(text));
         json_file(path,bad); refuses([&] { (void)q::parse_hf_config(path); });
     }
+    auto aliases = config_json();
+    const auto linear = strix::serve::parse_json_unique(R"({"rope_type":"linear","factor":2})");
+    aliases.set("rope_parameters",Json()); aliases.set("rope_scaling",linear); json_file(path,aliases);
+    const auto fallback = q::parse_hf_config(path);
+    check(fallback.rope.type == "linear" && fallback.rope.factor == 2,"null RoPE alias falls back to scaling");
+    aliases.set("rope_parameters",linear); json_file(path,aliases);
+    refuses([&] { (void)q::parse_hf_config(path); });
+    aliases.set("rope_scaling",Json()); json_file(path,aliases);
+    check(q::parse_hf_config(path).rope == fallback.rope,"null scaling preserves RoPE parameters");
+    aliases.set("rope_parameters",Json()); json_file(path,aliases);
+    check(q::parse_hf_config(path).rope.type == "default","both null RoPE aliases use native policy");
     j.set("rope_scaling",Json()); json_file(path,j); check(q::parse_hf_config(path).rope.type == "default","native RoPE");
     auto graph = q::graph(c); check(graph.layers.size() == 2 && graph.layers[0].attention == strix::model_graph::AttentionFamily::dense,"dense graph");
+    check(graph.model == "qwen-dense","dense-family graph identity");
     check(graph.layers[0].mlps[0].kind == strix::model_graph::MlpKind::dense && graph.layers[0].states.size() == 1,"shared dense/attention declaration");
     check(graph.attachments.empty(),"MTP absent by default");
     auto mtp = c; mtp.mtp_layers = 1;

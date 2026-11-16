@@ -161,7 +161,7 @@ Model load_safetensors(const std::filesystem::path& directory) {
 }
 std::vector<float> Weight::decode_row(std::uint64_t row) const { return nvfp4 ? nvfp4->decode_row(row) : weights::decode_row(tensor,row); }
 const Weight& Model::weight(const std::string& name) const { return tensors.at(name); }
-model_graph::ModelGraph graph(const Config& c) { validate_family(c); return model_graph::dense_decoder_graph(c,"qwen3.8-27b","qwen-dense-v1"); }
+model_graph::ModelGraph graph(const Config& c) { validate_family(c); return model_graph::dense_decoder_graph(c,"qwen-dense","qwen-dense-v1"); }
 void register_family() {
     ModelFamily family; family.name = "qwen27"; family.architectures = architectures;
     family.validate = [](const gguf::FileInfo& info) { (void)parse_gguf_config(info); };

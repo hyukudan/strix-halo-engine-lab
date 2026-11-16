@@ -72,7 +72,8 @@ DenseConfig dense_config_from_hf(const Json& root) {
     const auto* rope = j.find("rope_parameters");
     if (!rope || rope->is_null()) rope = j.find("rope_scaling");
     if (rope && !rope->is_null()) {
-        if (j.find("rope_parameters") && j.find("rope_scaling") && !j.find("rope_scaling")->is_null())
+        if (j.find("rope_parameters") && !j.find("rope_parameters")->is_null() &&
+            j.find("rope_scaling") && !j.find("rope_scaling")->is_null())
             throw std::runtime_error("ambiguous rope_parameters and rope_scaling");
         const auto* type = rope->find("rope_type");
         if (!type) type = rope->find("type");
