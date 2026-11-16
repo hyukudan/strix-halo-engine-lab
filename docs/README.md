@@ -8,6 +8,7 @@ work as it stood on their date; documents marked **Superseded** name their repla
 ## Getting started
 
 - [Getting started: requirements, build and run](getting-started/README.md) ([Español](getting-started/README.es.md)): Requirements per engine, the complete build, where each engine's launch command lives.
+- [Install the release packages](install.md) ([Español](install.es.md)): Support matrix (OS x backend x arch, qualified or not), runtime dependencies, DEB / RPM / tar.gz / Windows ZIP, service, smoke test, package build kit (`packaging/`).
 - [Using a discrete GPU (optional)](discrete-gpu.md) ([Español](discrete-gpu.es.md)): Tested card, driver and CUDA, what runs where for each NVIDIA route, measured gains, when a route does not help, pinning the GPU, troubleshooting.
 - [Engine reference](getting-started/engine-reference.md): Decode configuration, build options, full CLI, prefill, draft vocab, env switches, repo layout, docs map.
 - [Toggles](toggles.md) ([Español](toggles.es.md)): Every switch, its default, profiles, the regime rule, CLI flags, CMake options and env index.
@@ -55,6 +56,7 @@ work as it stood on their date; documents marked **Superseded** name their repla
 
 - [Measured performance](performance.md): All measured speed numbers with date, config and exactness check, per model and for the USB4 link.
 - [Methodology](methodology.md) ([Español](methodology.es.md)): How the tables are read, exactness per engine, model fidelity, defaults and off switches, design decisions.
+- [Measurement kits](benchmarking.md) ([Español](benchmarking.es.md)): The ABAB kits under `scripts/bench/<area>/` (prefill length matrices, served decode classes, FAST gates, vision battery, RTX routes) with their validity rules and commands.
 - [Measured gains](measured-gains.md) ([Español](measured-gains.es.md)): Changelog of every shipped default with its measured gain, exactness evidence and off switch.
 - [Two nodes over USB4](pair.md) ([Español](pair.es.md)): The pair, what it needs, how DeepSeek, MiniMax and GLM run on it, links to the transport internals.
 - [Serving over HTTP](serving.md) ([Español](serving.es.md)): Which server each engine has, serving features, exposing the servers safely.

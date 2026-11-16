@@ -33,6 +33,18 @@ inline constexpr std::size_t kCycleDraftDepths = 8;
 // by_lanes rows of the ledger: lane counts above this share the last row.
 inline constexpr std::size_t kCycleLaneBuckets = 64;
 
+// Why a lane verified in a target forward of its own instead of a shared one (shared across engines; an engine
+// maps its own decline reasons onto these). single: the only decoding lane of the cycle; no_rows: no window rows
+// (e.g. no draft, a serial step); wide: a window too wide to share; padding: its group could not be rounded up;
+// alone: the only lane of its group or chunk; no_owner: no idle primary owner for its chunk.
+enum class CycleSoloReason : std::uint8_t { single = 0, no_rows, wide, padding, alone, no_owner, count };
+inline constexpr std::size_t kCycleSoloReasons = static_cast<std::size_t>(CycleSoloReason::count);
+[[nodiscard]] inline const char* cycle_solo_reason_name(std::size_t i) noexcept {
+    static constexpr const char* names[] = {"single", "no_rows", "wide", "padding", "alone", "no_owner"};
+    static_assert(std::size(names) == kCycleSoloReasons);
+    return i < kCycleSoloReasons ? names[i] : "unknown";
+}
+
 struct CycleReceipt {
     // lanes: requests that decoded in this cycle. physical_rows: verify rows the forward ran;
     // useful_rows: rows that carried a real candidate position; padding_rows: the rest.
@@ -41,6 +53,13 @@ struct CycleReceipt {
     // draft_rows_by_depth[d]: lanes whose draft reached depth d + 1 (depths past the array share the last
     // entry), so acceptance by depth comes out of the same receipt.
     std::array<std::uint32_t, kCycleDraftDepths> draft_rows_by_depth{};
+    // admitted: requests holding a slot when the cycle ran (decoding or still reading their prompt), so
+    // admitted - lanes is the queue of prompts beside the decode. forwards: logical target executions
+    // (0 = not reported). This does not measure weight traffic:
+    // individual operations may use different dispatch and fusion routes.
+    // solo[reason]: lanes that verified in a forward of their own, by CycleSoloReason.
+    std::uint32_t admitted = 0, forwards = 0;
+    std::array<std::uint32_t, kCycleSoloReasons> solo{};
     // total_ms is the wall time of the decode cycle only; a prompt unit of the same scheduler step is not in it.
     double draft_ms = 0.0, verify_ms = 0.0, host_ms = 0.0, total_ms = 0.0;
     // A prompt unit ran in the same scheduler step: the cycle is outside the steady-state window.
@@ -77,7 +96,9 @@ struct CycleReceipt {
     for (std::size_t i = 0; i < kCycleDraftDepths; ++i) o << (i ? "/" : "") << r.draft_rows_by_depth[i];
     o << std::fixed << std::setprecision(6) << " draft_ms=" << r.draft_ms << " verify_ms=" << r.verify_ms
       << " host_ms=" << r.host_ms << " ms=" << r.total_ms << " prompt=" << (r.prompt_unit_ran ? 1 : 0)
-      << " begin_ns=" << r.begin_ns << " end_ns=" << r.end_ns;
+      << " begin_ns=" << r.begin_ns << " end_ns=" << r.end_ns << " admitted=" << r.admitted << " forwards="
+      << r.forwards << " solo=";
+    for (std::size_t i = 0; i < kCycleSoloReasons; ++i) o << (i ? "/" : "") << r.solo[i];
     return o.str();
 }
 
@@ -93,8 +114,9 @@ public:
     };
     struct Totals {
         std::uint64_t cycles = 0, prompt_cycles = 0, lanes = 0, physical_rows = 0, useful_rows = 0, padding_rows = 0,
-            emitted = 0;
+            emitted = 0, admitted = 0, forwards = 0;
         std::array<std::uint64_t, kCycleDraftDepths> draft_rows_by_depth{};
+        std::array<std::uint64_t, kCycleSoloReasons> solo{};
         double draft_ms = 0.0, verify_ms = 0.0, host_ms = 0.0, total_ms = 0.0;
     };
     // Cycles with this many lanes in which no prompt unit ran.
@@ -126,6 +148,9 @@ public:
         totals_.padding_rows += r.padding_rows;
         totals_.emitted += r.emitted;
         for (std::size_t i = 0; i < kCycleDraftDepths; ++i) totals_.draft_rows_by_depth[i] += r.draft_rows_by_depth[i];
+        totals_.admitted += r.admitted;
+        totals_.forwards += r.forwards;
+        for (std::size_t i = 0; i < kCycleSoloReasons; ++i) totals_.solo[i] += r.solo[i];
         totals_.draft_ms += r.draft_ms;
         totals_.verify_ms += r.verify_ms;
         totals_.host_ms += r.host_ms;
@@ -233,6 +258,8 @@ public:
           << totals_.useful_rows << ",\"padding_rows\":" << totals_.padding_rows << ",\"emitted\":" << totals_.emitted
           << ",\"draft_rows_by_depth\":";
         write_array(o, totals_.draft_rows_by_depth);
+        o << ",\"admitted\":" << totals_.admitted << ",\"forwards\":" << totals_.forwards << ",\"solo\":";
+        write_array(o, totals_.solo);
         o << ",\"draft_ms\":" << totals_.draft_ms << ",\"verify_ms\":" << totals_.verify_ms << ",\"host_ms\":"
           << totals_.host_ms << ",\"total_ms\":" << totals_.total_ms << "},\"fit\":{\"fixed_ms\":" << f.fixed_ms
           << ",\"row_ms\":" << f.row_ms << ",\"lane_ms\":" << f.lane_ms << ",\"residual_sd\":" << f.residual_sd
@@ -258,7 +285,10 @@ public:
             write_array(o, r.draft_rows_by_depth);
             o << ",\"draft_ms\":" << r.draft_ms << ",\"verify_ms\":" << r.verify_ms << ",\"host_ms\":" << r.host_ms
               << ",\"total_ms\":" << r.total_ms << ",\"prompt_unit_ran\":" << (r.prompt_unit_ran ? "true" : "false")
-              << ",\"begin_ns\":" << r.begin_ns << ",\"end_ns\":" << r.end_ns << '}';
+              << ",\"begin_ns\":" << r.begin_ns << ",\"end_ns\":" << r.end_ns << ",\"admitted\":" << r.admitted
+              << ",\"forwards\":" << r.forwards << ",\"solo\":";
+            write_array(o, r.solo);
+            o << '}';
             first = false;
         }
         o << "]}";
@@ -266,8 +296,8 @@ public:
     }
 
 private:
-    template <typename T>
-    static void write_array(std::ostringstream& o, const std::array<T, kCycleDraftDepths>& values) {
+    template <typename T, std::size_t N>
+    static void write_array(std::ostringstream& o, const std::array<T, N>& values) {
         o << '[';
         for (std::size_t i = 0; i < values.size(); ++i) o << (i ? "," : "") << values[i];
         o << ']';

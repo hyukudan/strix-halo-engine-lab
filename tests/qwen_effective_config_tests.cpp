@@ -1,4 +1,5 @@
 #include "../apps/qwen_prompt_organization.hpp"
+#include "strix/serve_cli_parity.hpp"
 #include "../apps/qwen_http_memory.hpp"
 #include "../apps/mtp_asset_verification.hpp"
 #include "../apps/qwen_cache_family_contract.hpp"
@@ -362,6 +363,90 @@ void serve_prefill_admission_tests(const ModelContract& model, const ModelManife
     const auto resolve=[&](const RequestedOptions& r,const PrefillMemory& m) {
         return resolve_effective_config(r,model,{},manifest,validated_model_content_identity,{true,true,true},m);
     };
+    {
+        // qcq: an explicit host budget + strict L0 on the HTTP batch route resolves the solo suffix class (the
+        // scheduler the L0 gate below pins by env). No mode, capture, STRIX_BATCH_CACHE_SOLO=0, AUTO and the fixed
+        // route keep the incumbent scheduler. One resolver: the same options reach the bridge and the identity.
+        const Environment base{{"STRIX_BATCH_PROMPT_SMALL","0"}};
+        auto budget=args; budget.insert(budget.end(),{"--prefix-cache-host-bytes","4294967296"});
+        auto l0=budget; l0.insert(l0.end(),{"--prefix-batch-cert","l0"});
+        const auto solo=resolve({parse(l0),base},memory).options;
+        expect(solo.batch_cache_solo && solo.prefix_batch_cert==1 && solo.batch_cache_solo_reason=="l0-restore" &&
+            prefix_batch_cert_execution_mode(solo)==1,"qcq: explicit batch budget + L0 resolves the solo scheduler");
+        auto kept_env=requested_prefill_environment([](const char* name) -> const char* {
+            return std::string_view(name)=="STRIX_BATCH_CACHE_SOLO" || std::string_view(name)=="STRIX_BATCH_PROMPT_SMALL"
+                ? "0" : nullptr;
+        });
+        const auto kept=resolve({parse(l0),kept_env},memory).options;
+        expect(!kept.batch_cache_solo && kept.prefix_batch_cert==1 && kept.batch_cache_solo_reason=="STRIX_BATCH_CACHE_SOLO=0",
+            "qcq: STRIX_BATCH_CACHE_SOLO=0 keeps the incumbent scheduler");
+        auto capture=budget; capture.insert(capture.end(),{"--prefix-batch-cert","capture"});
+        const auto cap=resolve({parse(capture),base},memory).options;
+        expect(!cap.batch_cache_solo && cap.prefix_batch_cert==2 && cap.batch_cache_solo_reason=="no-l0-restore",
+            "qcq: capture-only mode keeps the incumbent scheduler");
+        const auto none=resolve({parse(budget),base},memory).options;
+        expect(!none.batch_cache_solo && none.prefix_batch_cert==0 && none.batch_cache_solo_reason=="no-l0-restore",
+            "qcq: explicit budget without a mode is unchanged");
+        const auto explicit_rows=resolve(request,memory).options;
+        expect(!explicit_rows.cache_activation->automatic_path && !explicit_rows.batch_cache_solo &&
+            explicit_rows.batch_cache_solo_reason=="no-l0-restore",
+            "qcq: explicit checkpoint rows without budget or L0 keep the incumbent scheduler");
+        // Even a zero checkpoint-row override selects explicit cache configuration.
+        auto auto_args=args;
+        const auto rows=std::find(auto_args.begin(),auto_args.end(),"--prefix-cache-block-rows");
+        if(rows==auto_args.end()||rows+1==auto_args.end())
+            throw std::runtime_error("qcq: AUTO fixture lost its --prefix-cache-block-rows pair");
+        auto_args.erase(rows,rows+2);
+        const auto automatic=resolve({parse(auto_args),base},memory).options;
+        expect(automatic.cache_activation->automatic_path && !automatic.batch_cache_solo &&
+            automatic.batch_cache_solo_reason=="automatic-unqualified",
+            "qcq: AUTO batch stays declined (no qualified batch row)");
+        auto fixed=budget; *(std::find(fixed.begin(),fixed.end(),"--http-batch")+1)="1";
+        const auto single=resolve({parse(fixed),base},memory).options;
+        expect(!single.batch_cache_solo && single.batch_cache_solo_reason=="not-batch",
+            "qcq: the fixed route is unchanged");
+    }
+    {
+        // Server / CLI parity (strix/serve_cli_parity.hpp): the same request words through the ONE resolver, once as the
+        // HTTP server (--http-serve --http-batch 2 and its prefix-cache block setting) and once as the CLI. Compare the
+        // environment and the route fields projected below, with the listed field/family allowances. This is not
+        // complete effective-configuration or numerical-identity parity.
+        namespace sp = strix::parity;
+        std::vector<std::string> cli_args;
+        for(std::size_t i=0;i<args.size();++i) {
+            if(args[i]=="--http-serve") continue;
+            if(args[i]=="--http-batch" || args[i]=="--prefix-cache-block-rows") { ++i; continue; }
+            cli_args.push_back(args[i]);
+        }
+        const auto view=[](const EffectiveConfig& c) {
+            sp::Config v;
+            for(const auto& [k,value] : c.environment) v["env:"+k]=value;
+            v["known_prefix_prefill_rows"]=std::to_string(c.options.known_prefix_prefill_rows);
+            v["mtp"]=c.options.mtp.enabled?"1":"0";
+            v["admitted"]=c.admitted?"1":"0";
+            v["tile_fallback"]=c.tile_fallback;
+            v["arithmetic_fallback"]=c.arithmetic_fallback;
+            return v;
+        };
+        const auto served=resolve(request,ample_memory());
+        const auto cli=resolve(RequestedOptions{parse(cli_args),request.environment},ample_memory());
+        static constexpr sp::Allowed allowed[]={
+            // The server has no prompt at startup, so resolve_serve_prefill (apps/qwen_effective_config.hpp) admits the
+            // known-prefix tiled prefill and its organisation for the serving context then; the CLI resolves the same
+            // route from the prompt it is given (same block plan and kernels at 8K: wave4 SRVPAR receipts). Named here so
+            // that serving-only values outside these fields/families fail.
+            {"known_prefix_prefill_rows","serving admits the tiled prefill at startup; the CLI from its prompt"},
+            {"env:STRIX_QPF2K_*","organisation of the tiled prefill admitted at serving startup"},
+            {"env:STRIX_QSA_*","organisation of the tiled prefill admitted at serving startup"},
+            {"env:STRIX_PREFILL_PIPE","organisation of the tiled prefill admitted at serving startup"},
+            {"env:STRIX_PREFILL_PLE_BATCH","organisation of the tiled prefill admitted at serving startup"},
+            {"env:STRIX_INTPREFILL_DENSE_ROWS","organisation of the tiled prefill admitted at serving startup"},
+            {"env:STRIX_DISPATCH_FUSE","serial-route dispatch fusion; the tiled serving route does not use it"},
+        };
+        const auto report=sp::compare(view(cli),view(served),allowed);
+        if(!report.ok()) std::cerr<<sp::text("qwen",report);
+        expect(report.ok(),"qwen: projected CLI/server route fields and environment match within the listed allowances");
+    }
     {
         // Native joining gate shape: pinned MTP server args (C24576, T8192 serving prefill),
         // explicit 4 GiB host budget, --http-batch 3 --prefix-batch-cert l0, gate env.
@@ -909,6 +994,21 @@ void serve_prefill_admission_tests(const ModelContract& model, const ModelManife
     geometric.context_tokens+=1024;
     expect(http_mtp_memory(geometric,model,{},manifest,{},gib_bytes,gib_bytes,4096).slot_host>mapped.slot_host,
         "native predictor pool follows context geometry");
+    {
+        auto ceiling=geometric;ceiling.context_tokens=131200;
+        ceiling.mtp.runtime_bytes=134217728;ceiling.mtp.runtime_automatic=false;
+        bool ceiling_refused=false;
+        try {(void)http_mtp_memory(ceiling,model,{},manifest,{},gib_bytes,gib_bytes,4096);}
+        catch(const std::runtime_error& e) {ceiling_refused=std::string_view(e.what()).find("runtime budget")!=std::string_view::npos;}
+        expect(ceiling_refused,"explicit 128 MiB ceiling refuses native long context before HTTP allocation");
+        ceiling.mtp.runtime_automatic=true;
+        const auto automatic=http_mtp_memory(ceiling,model,{},manifest,{},gib_bytes,gib_bytes,4096);
+        ceiling.mtp.runtime_automatic=false;
+        ceiling.mtp.runtime_bytes=mtp_payload::runtime(model,ceiling.context_tokens).retained;
+        const auto explicit_fit=http_mtp_memory(ceiling,model,{},manifest,{},gib_bytes,gib_bytes,4096);
+        expect(automatic.slot_host==explicit_fit.slot_host && automatic.slot_device==explicit_fit.slot_device,
+            "automatic and sufficient explicit budgets charge the same shared runtime geometry");
+    }
     // Real native owner geometry, independent of the synthetic arena sizes.
     auto owners=startup.options;
     owners.known_prefix_tail_rows.clear();
@@ -3358,14 +3458,14 @@ int main(int argc, char** arguments) {
     {
         EffectiveConfig c;
         const auto reported = [&] { return effective_config_json(c); };
-        expect(reported().find("\"STRIX_QWEN_DECODE_FUSE\":{\"enabled\":false,\"suppression\":\"opt-in-not-requested\"}") != std::string::npos,
-            "R1 decode fusion is an opt-in and reports it off by default");
+        expect(reported().find("\"STRIX_QWEN_DECODE_FUSE\":{\"enabled\":true,\"suppression\":null}") != std::string::npos,
+            "R1 decode fusion is a code default and reports it on");
         c.environment["STRIX_QWEN_DECODE_FUSE"] = "0";
-        expect(reported().find("\"STRIX_QWEN_DECODE_FUSE\":{\"enabled\":false,\"suppression\":\"opt-in-not-requested\"}") != std::string::npos,
-            "R1 decode fusion reports its OFF from the snapshot");
+        expect(reported().find("\"STRIX_QWEN_DECODE_FUSE\":{\"enabled\":false,\"suppression\":\"explicit-off\"}") != std::string::npos,
+            "R1 decode fusion reports its explicit OFF from the snapshot");
         c.environment["STRIX_QWEN_DECODE_FUSE"] = "1";
         expect(reported().find("\"STRIX_QWEN_DECODE_FUSE\":{\"enabled\":true,\"suppression\":null}") != std::string::npos,
-            "R1 decode fusion reports the opt-in ON");
+            "R1 decode fusion reports the explicit ON");
         c.environment["STRIX_QWEN_DECODE_FUSE"] = "1";
         for (const auto* name : {"STRIX_BASELINE", "STRIX_QPF2K_DEFAULTS"}) {
             c.environment[name] = std::string_view(name) == "STRIX_BASELINE" ? "1" : "0";

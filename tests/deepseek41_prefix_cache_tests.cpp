@@ -534,6 +534,37 @@ void test_disk() {
 
 // The namespace covers the bit-relevant configuration: overlay file content, CB4, trellis pack/sites, decode identity;
 // a disk tier written under one namespace is not reused under another (nor by code without a namespace).
+// DAYAUDIT 1 (P0): a stored state is only reusable when the continuation from it computes what a cold run computes.
+// FAST attention bf16flash-v1 (only from position 0) and FAST dense (route by the rows of each piece) do not: both are
+// declined (serve keeps its prefix and session caches off); f16wmma attention and relaxed MoE do not depend on P0 or cut.
+void test_continuation_decline() {
+    for (const char* v : {"STRIX_DS41_FAST_PREFILL", "STRIX_DS41_FAST_ATTN", "STRIX_DS41_FAST_MOE", "STRIX_DS41_FAST_DENSE",
+                          "STRIX_DS41_FAST_DENSE_MIN_ROWS"})
+        unsetenv(v);
+    expect(ds::prefix_continuation_decline().empty(), "decline: the exact default resumes");
+    setenv("STRIX_DS41_FAST_ATTN", "1", 1);
+    expect(ds::prefix_continuation_decline().empty(), "decline: f16wmma attention resumes (no P0 rule)");
+    setenv("STRIX_DS41_FAST_ATTN", "2", 1);
+    expect(ds::prefix_continuation_decline().find("bf16flash") != std::string::npos, "decline: bf16flash runs only from P0 = 0");
+    unsetenv("STRIX_DS41_FAST_ATTN");
+    setenv("STRIX_DS41_FAST_MOE", "1", 1);
+    expect(ds::prefix_continuation_decline().empty(), "decline: relaxed MoE is one identity whatever the cut");
+    unsetenv("STRIX_DS41_FAST_MOE");
+    setenv("STRIX_DS41_FAST_DENSE", "1", 1);
+    setenv("STRIX_DS41_FAST_DENSE_MIN_ROWS", "64", 1);
+    const auto dense = ds::prefix_continuation_decline();
+    expect(dense.find("dense") != std::string::npos && dense.find("dense_min_rows=64") != std::string::npos, "decline: FAST dense routes by piece rows");
+    unsetenv("STRIX_DS41_FAST_DENSE");
+    unsetenv("STRIX_DS41_FAST_DENSE_MIN_ROWS");
+    setenv("STRIX_DS41_FAST_PREFILL", "1", 1);  // the profile: flash + dense
+    const auto profile = ds::prefix_continuation_decline();
+    expect(profile.find("bf16flash") != std::string::npos && profile.find("FAST dense") != std::string::npos, "decline: profile names both");
+    setenv("STRIX_DS41_FAST_ATTN", "1", 1);
+    setenv("STRIX_DS41_FAST_DENSE", "0", 1);
+    expect(ds::prefix_continuation_decline().empty(), "decline: profile with f16wmma and dense off resumes");
+    for (const char* v : {"STRIX_DS41_FAST_PREFILL", "STRIX_DS41_FAST_ATTN", "STRIX_DS41_FAST_DENSE"}) unsetenv(v);
+}
+
 void test_namespace() {
     const auto dir = fresh_dir("namespace");
     fs::create_directories(dir);
@@ -637,6 +668,7 @@ int main() {
     test_pieces();
     test_runs();
     test_disk();
+    test_continuation_decline();
     test_namespace();
     if (failures != 0) {
         std::fprintf(stderr, "%d failure(s)\n", failures);
