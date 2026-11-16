@@ -113,3 +113,13 @@ if(MSVC)
 else()
     target_compile_options(qwen_bf16_mtp_e2e PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=-ffp-contract=off>)
 endif()
+# 16-bit recurrent state (STRIX_RECURRENT_STATE=f16|bf16) in the CUDA GDN recurrence: codec bit-equality with the host,
+# per-row rounding equalities, f32 incumbent bits. Needs the GPU (index 0 only: set CUDA_VISIBLE_DEVICES=0).
+add_executable(qwen_gdn_state16_test tests/cuda/qwen_gdn_state16_test.cu)
+target_link_libraries(qwen_gdn_state16_test PRIVATE strix_qwen_cuda)
+target_compile_options(qwen_gdn_state16_test PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--fmad=false;--prec-div=true;--prec-sqrt=true;--ftz=false>)
+if(MSVC)
+    target_compile_options(qwen_gdn_state16_test PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/EHsc,/Zc:preprocessor,/utf-8>)
+endif()
+add_test(NAME qwen_gdn_state16 COMMAND qwen_gdn_state16_test)
+set_tests_properties(qwen_gdn_state16 PROPERTIES ENVIRONMENT "CUDA_VISIBLE_DEVICES=0")

@@ -994,6 +994,21 @@ void serve_prefill_admission_tests(const ModelContract& model, const ModelManife
     geometric.context_tokens+=1024;
     expect(http_mtp_memory(geometric,model,{},manifest,{},gib_bytes,gib_bytes,4096).slot_host>mapped.slot_host,
         "native predictor pool follows context geometry");
+    {
+        auto ceiling=geometric;ceiling.context_tokens=131200;
+        ceiling.mtp.runtime_bytes=134217728;ceiling.mtp.runtime_automatic=false;
+        bool ceiling_refused=false;
+        try {(void)http_mtp_memory(ceiling,model,{},manifest,{},gib_bytes,gib_bytes,4096);}
+        catch(const std::runtime_error& e) {ceiling_refused=std::string_view(e.what()).find("runtime budget")!=std::string_view::npos;}
+        expect(ceiling_refused,"explicit 128 MiB ceiling refuses native long context before HTTP allocation");
+        ceiling.mtp.runtime_automatic=true;
+        const auto automatic=http_mtp_memory(ceiling,model,{},manifest,{},gib_bytes,gib_bytes,4096);
+        ceiling.mtp.runtime_automatic=false;
+        ceiling.mtp.runtime_bytes=mtp_payload::runtime(model,ceiling.context_tokens).retained;
+        const auto explicit_fit=http_mtp_memory(ceiling,model,{},manifest,{},gib_bytes,gib_bytes,4096);
+        expect(automatic.slot_host==explicit_fit.slot_host && automatic.slot_device==explicit_fit.slot_device,
+            "automatic and sufficient explicit budgets charge the same shared runtime geometry");
+    }
     // Real native owner geometry, independent of the synthetic arena sizes.
     auto owners=startup.options;
     owners.known_prefix_tail_rows.clear();

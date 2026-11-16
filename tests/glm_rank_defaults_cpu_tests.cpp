@@ -568,6 +568,10 @@ void test_startup_agreement() {
         mla[1] |= rd::kPfMlaWmmaConfig;
         pair(mla, mla, rd::max_rows_auto(tf), rd::max_rows_auto(tf), false);
         pair(mla, kda, false, false, true);
+        auto idxproj = kda;  // the FAST indexer projections: one rank without them is refused
+        idxproj[1] |= rd::kPfIdxProjWmmaConfig;
+        pair(idxproj, idxproj, rd::max_rows_auto(tf), rd::max_rows_auto(tf), false);
+        pair(idxproj, kda, false, false, true);
     }
     // External Xfer, including fixed and baseline modes, never enters this host handshake.
     for (const auto& extra : {Args{}, Args{"--baseline"}, Args{"--max-rows", "8192"}}) {

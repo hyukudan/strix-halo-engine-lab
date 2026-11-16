@@ -9,6 +9,8 @@
 #include "strix/hip_gdn_lm_wave8_diagnostic.hpp"
 #endif
 #include "strix/hip_gdn_launcher.hpp"
+#include "strix/recurrent_state_policy.hpp"
+#include "attn_core/recurrent_state.hpp"
 #include "hip_gdn_identity.hpp"
 #include "strix/qpersist.hpp"
 #include "strix/prefill_identity.hpp"
@@ -52,12 +54,29 @@
 #include <cstring>
 #include <limits>
 #include <stdexcept>
+#include <type_traits>
 #include <string>
 #include <string_view>
 #include <utility>
 
 namespace strix {
 namespace {
+
+// Recurrent matrix element type (FP32 arithmetic always; load widens, store narrows once). f32 is the incumbent path.
+namespace rstate = strix::attn_core::rstate;
+template <class F> void with_state_type(RecurrentStateType type, F&& f) {
+    switch (type) {
+    case RecurrentStateType::f16: f(std::integral_constant<RecurrentStateType, RecurrentStateType::f16>{}); break;
+    case RecurrentStateType::bf16: f(std::integral_constant<RecurrentStateType, RecurrentStateType::bf16>{}); break;
+    default: f(std::integral_constant<RecurrentStateType, RecurrentStateType::f32>{}); break;
+    }
+}
+// Refuse a non-f32 state type on a route whose kernels read the matrix as FP32.
+inline void refuse_non_f32_state(const HipGdnLauncherConfig& config, const char* route) {
+    if (config.model.recurrent_state != RecurrentStateType::f32)
+        throw std::invalid_argument(recurrent_state_route_refusal(config.model.recurrent_state, false, route));
+}
+
 
 inline bool gdn_window_tiled_enabled() {
     static const bool enabled = strix::envcfg::flag("STRIX_GDN_WINDOW_TILED", false);
@@ -226,6 +245,12 @@ void validate_config(
     validate_gdn_recurrent_storage(config.recurrent_storage);
     if (config.recurrent_storage != GdnRecurrentStorage::key_value && config.enable_device_graph_inputs)
         throw std::invalid_argument("GDN recurrent storage supports eager execution only");
+    // 16-bit state: only the baseline key-value organization is typed (value-key storage and the LDS layout
+    // kernels read the matrix as FP32 and are refused rather than run on 16-bit data).
+    if (config.recurrent_storage != GdnRecurrentStorage::key_value)
+        refuse_non_f32_state(config, "gdn value-key recurrent storage");
+    if (config.recurrent_layout != HipGdnRecurrentLayout::baseline)
+        refuse_non_f32_state(config, "gdn recurrent LDS layout");
     if (config.prefetch_q8_input_projections && !config.virtual_q8_input_projections)
         throw std::invalid_argument("HIP GDN prefetch Q8 input requires virtual Q8 input");
     if (config.wave8_q8_input_projections) {
@@ -1417,16 +1442,18 @@ __global__ void normalize_qk_kernel(
 
 #include "hip_gdn_decode_fuse.inc"
 
+template <RecurrentStateType S>
 __global__ __launch_bounds__(kRecurrentThreads)
 void recurrent_step_kernel(
     const float* qkv,
     const float* beta,
     const float* gate,
-    float* state,
+    float* state_raw,
     float* core,
     std::uint32_t key_heads,
     std::uint32_t value_heads,
     std::uint32_t head_dim, std::uint32_t* graph_status) {
+    auto* state = reinterpret_cast<typename rstate::Codec<S>::Elem*>(state_raw);
     __shared__ unsigned graph_reject;
     if (graph_status != nullptr) {
         if (threadIdx.x == 0) graph_reject = atomicAdd(graph_status, 0U) != 0;
@@ -1488,6 +1515,13 @@ void recurrent_step_kernel(
     __shared__ float deltas[kValueTile];
 
     float retained[kValueTile];
+    // 16-bit contracts: the thread's 32 contiguous elements load as packed 16-byte runs (one access per 8).
+    float packed_run[S == RecurrentStateType::f32 ? 1U : kValueTile];
+    if constexpr (S != RecurrentStateType::f32)
+        rstate::load_run<S, kValueTile>(state + (static_cast<std::uint64_t>(value_head) * head_dim + lane) * head_dim + value_base,
+            packed_run);
+    else
+        (void)packed_run;
 #pragma unroll
     for (std::uint32_t column = 0;
          column < kValueTile;
@@ -1502,8 +1536,11 @@ void recurrent_step_kernel(
              lane) *
                 head_dim +
             value_index;
+        float stored;
+        if constexpr (S == RecurrentStateType::f32) stored = state[state_index];
+        else stored = packed_run[column];
         retained[column] =
-            state[state_index] *
+            stored *
             expf(
                 gate[value_head]);
         reduction[
@@ -1636,9 +1673,14 @@ void recurrent_step_kernel(
              lane) *
                 head_dim +
             value_index;
-        state[state_index] =
-            retained[column];
+        if constexpr (S == RecurrentStateType::f32)
+            state[state_index] = retained[column];
+        else
+            (void)state_index;
     }
+    if constexpr (S != RecurrentStateType::f32)
+        rstate::store_run<S, kValueTile>(state + (static_cast<std::uint64_t>(value_head) * head_dim + lane) * head_dim + value_base,
+            retained);
 }
 
 #ifdef STRIX_BUILD_KNOWN_WINDOW_DIAGNOSTIC
@@ -2492,10 +2534,23 @@ __device__ __forceinline__ void gdn_window_step(float (&retained)[4][Columns], c
 }
 // Read the tile once, apply the pending rows and write it once (if any), then
 // run the window rows in registers. Row inputs are loaded ahead of their step.
+// 16-bit state contract: a stored state is the narrowed value, so the register state of a window is narrowed and widened
+// after every row exactly as the serial row stores it and the next row loads it (identity, compiled out, for f32).
+template <RecurrentStateType S, std::uint32_t Columns>
+__device__ __forceinline__ void gdn_window_round_state(float (&retained)[4][Columns]) {
+    if constexpr (S != RecurrentStateType::f32) {
+#pragma unroll
+        for (std::uint32_t part = 0; part < 4U; ++part)
+#pragma unroll
+            for (std::uint32_t column = 0; column < Columns; ++column)
+                retained[part][column] = rstate::round_in_register<S>(retained[part][column]);
+    }
+}
 template <unsigned Rows, GdnRecurrentStorage Storage, std::uint32_t Columns = kGdnWindowColumns, bool Scatter = false,
-    bool WholeHead = false>
-__device__ __forceinline__ void gdn_window_recurrence(const GdnWindowRows<Rows ? Rows : 1U>& rows, float* state,
+    bool WholeHead = false, RecurrentStateType S = RecurrentStateType::f32>
+__device__ __forceinline__ void gdn_window_recurrence(const GdnWindowRows<Rows ? Rows : 1U>& rows, float* state_raw,
     const GdnWindowSaved& saved, const GdnWindowControl* control, std::uint32_t key_heads, std::uint32_t head_dim) {
+    auto* state = reinterpret_cast<typename rstate::Codec<S>::Elem*>(state_raw);
     const auto lane = WholeHead ? static_cast<std::uint32_t>(threadIdx.x) & 31U : static_cast<std::uint32_t>(threadIdx.x);
     const auto tiles = head_dim / Columns;
     const auto raw_tile = WholeHead ? static_cast<std::uint32_t>(blockIdx.x) * tiles + static_cast<std::uint32_t>(threadIdx.x) / 32U :
@@ -2536,11 +2591,21 @@ __device__ __forceinline__ void gdn_window_recurrence(const GdnWindowRows<Rows ?
         for (unsigned row = 0; row < Rows; ++row) window[row] = window_inputs(row);
     }
     float retained[4][Columns];
+    // 16-bit key-value runs (Columns contiguous elements per key row) move packed: one access per row run.
+    constexpr bool packed = S != RecurrentStateType::f32 && Storage == GdnRecurrentStorage::key_value;
+    if constexpr (packed) {
+#pragma unroll
+        for (std::uint32_t part = 0; part < 4U; ++part)
+            rstate::load_run<S, Columns>(state + gdn_window_state_index<Storage>(value_head, part * 32U + lane, value_base, head_dim),
+                retained[part]);
+    } else {
 #pragma unroll
     for (std::uint32_t part = 0; part < 4U; ++part)
 #pragma unroll
         for (std::uint32_t column = 0; column < Columns; ++column)
-            retained[part][column] = state[gdn_window_state_index<Storage>(value_head, part * 32U + lane, value_base + column, head_dim)];
+            retained[part][column] = rstate::Codec<S>::load(
+                state[gdn_window_state_index<Storage>(value_head, part * 32U + lane, value_base + column, head_dim)]);
+    }
     const auto pending = gdn_window_pending(control), slot = control->pending_slot & 1U;
     if (pending) {
         auto next = pending_inputs(slot, 0U);
@@ -2548,24 +2613,37 @@ __device__ __forceinline__ void gdn_window_recurrence(const GdnWindowRows<Rows ?
             const auto in = next;
             if (row + 1U < pending) next = pending_inputs(slot, row + 1U);
             gdn_window_step<false, Columns, Scatter>(retained, in, nullptr);
+            gdn_window_round_state<S, Columns>(retained);
         }
+        if constexpr (packed) {
+#pragma unroll
+            for (std::uint32_t part = 0; part < 4U; ++part)
+                rstate::store_run<S, Columns>(
+                    state + gdn_window_state_index<Storage>(value_head, part * 32U + lane, value_base, head_dim), retained[part]);
+        } else {
 #pragma unroll
         for (std::uint32_t part = 0; part < 4U; ++part)
 #pragma unroll
             for (std::uint32_t column = 0; column < Columns; ++column)
                 state[gdn_window_state_index<Storage>(value_head, part * 32U + lane, value_base + column, head_dim)] =
-                    retained[part][column];
+                    rstate::Codec<S>::store(retained[part][column]);
+        }
     }
     if constexpr (Rows != 0U) {
         if constexpr (Scatter) {
             // Keep only the current row's inputs live next to the scatter
             // accumulators. Preloading all eight rows raises VGPR pressure.
 #pragma unroll 1
-            for (unsigned row = 0; row < Rows; ++row)
+            for (unsigned row = 0; row < Rows; ++row) {
                 gdn_window_step<true, Columns, true>(retained, window_inputs(row), rows.core[row] + value_offset);
+                gdn_window_round_state<S, Columns>(retained);
+            }
         } else {
 #pragma unroll
-        for (unsigned row = 0; row < Rows; ++row) gdn_window_step<true, Columns, Scatter>(retained, window[row], rows.core[row] + value_offset);
+        for (unsigned row = 0; row < Rows; ++row) {
+            gdn_window_step<true, Columns, Scatter>(retained, window[row], rows.core[row] + value_offset);
+            gdn_window_round_state<S, Columns>(retained);
+        }
         }
     }
 }
@@ -2647,20 +2725,20 @@ void gdn_window_recurrent_tiled_kernel(GdnWindowRows<Rows> rows, float* state, G
 #pragma unroll
     for (unsigned row = 0; row < Rows; ++row) gdn_window_step<true, Columns>(retained, window[row], rows.core[row] + value_offset);
 }
-template <unsigned Rows, GdnRecurrentStorage Storage, std::uint32_t Columns = kGdnWindowColumns, bool Scatter = false>
+template <unsigned Rows, GdnRecurrentStorage Storage, std::uint32_t Columns = kGdnWindowColumns, bool Scatter = false, RecurrentStateType S = RecurrentStateType::f32>
 __global__ __launch_bounds__(32)
 void gdn_window_recurrent_kernel(GdnWindowRows<Rows> rows, float* state, GdnWindowSaved saved,
     const GdnWindowControl* control, std::uint32_t key_heads, std::uint32_t head_dim) {
-    gdn_window_recurrence<Rows, Storage, Columns, Scatter>(rows, state, saved, control, key_heads, head_dim);
+    gdn_window_recurrence<Rows, Storage, Columns, Scatter, false, S>(rows, state, saved, control, key_heads, head_dim);
 }
-template <GdnRecurrentStorage Storage, std::uint32_t Columns>
+template <GdnRecurrentStorage Storage, std::uint32_t Columns, RecurrentStateType S = RecurrentStateType::f32>
 __global__ __launch_bounds__(32)
 void gdn_window_recurrent_segments_kernel(GdnSegments segments, std::uint32_t key_heads, std::uint32_t head_dim) {
     const auto& s = segments.segment[blockIdx.y];
     switch (s.count) {
-    case 2: gdn_window_recurrence<2, Storage, Columns>(gdn_rows_prefix<2>(s.rows), s.matrix, s.saved, s.control, key_heads, head_dim); break;
-    case 4: gdn_window_recurrence<4, Storage, Columns>(gdn_rows_prefix<4>(s.rows), s.matrix, s.saved, s.control, key_heads, head_dim); break;
-    default: gdn_window_recurrence<8, Storage, Columns>(gdn_rows_prefix<8>(s.rows), s.matrix, s.saved, s.control, key_heads, head_dim); break;
+    case 2: gdn_window_recurrence<2, Storage, Columns, false, false, S>(gdn_rows_prefix<2>(s.rows), s.matrix, s.saved, s.control, key_heads, head_dim); break;
+    case 4: gdn_window_recurrence<4, Storage, Columns, false, false, S>(gdn_rows_prefix<4>(s.rows), s.matrix, s.saved, s.control, key_heads, head_dim); break;
+    default: gdn_window_recurrence<8, Storage, Columns, false, false, S>(gdn_rows_prefix<8>(s.rows), s.matrix, s.saved, s.control, key_heads, head_dim); break;
     }
 }
 // Separate opt-in entry points: adding cases must not change the register allocation
@@ -2682,12 +2760,12 @@ void gdn_window_prepare_anyseg_kernel(GdnSegments segments, const void* conv_wei
     }
 #undef STRIX_GDN_PREPARE_CASE
 }
-template <GdnRecurrentStorage Storage, std::uint32_t Columns>
+template <GdnRecurrentStorage Storage, std::uint32_t Columns, RecurrentStateType S = RecurrentStateType::f32>
 __global__ __launch_bounds__(32)
 void gdn_window_recurrent_anyseg_kernel(GdnSegments segments, std::uint32_t key_heads, std::uint32_t head_dim) {
     const auto& s = segments.segment[blockIdx.y];
 #define STRIX_GDN_RECURRENT_CASE(N) case N: \
-    gdn_window_recurrence<N, Storage, Columns>(gdn_rows_prefix<N>(s.rows), s.matrix, s.saved, s.control, key_heads, head_dim); break
+    gdn_window_recurrence<N, Storage, Columns, false, false, S>(gdn_rows_prefix<N>(s.rows), s.matrix, s.saved, s.control, key_heads, head_dim); break
     switch (s.count) {
     STRIX_GDN_RECURRENT_CASE(1); STRIX_GDN_RECURRENT_CASE(2); STRIX_GDN_RECURRENT_CASE(3); STRIX_GDN_RECURRENT_CASE(4);
     STRIX_GDN_RECURRENT_CASE(5); STRIX_GDN_RECURRENT_CASE(6); STRIX_GDN_RECURRENT_CASE(7); STRIX_GDN_RECURRENT_CASE(8);
@@ -2695,13 +2773,13 @@ void gdn_window_recurrent_anyseg_kernel(GdnSegments segments, std::uint32_t key_
 #undef STRIX_GDN_RECURRENT_CASE
 }
 // Standalone commit of the pending rows: recurrence tiles, then 32-channel conv groups.
-template <GdnRecurrentStorage Storage>
+template <GdnRecurrentStorage Storage, RecurrentStateType S = RecurrentStateType::f32>
 __global__ __launch_bounds__(32)
 void gdn_window_commit_kernel(float* state, std::uint16_t* conv_state, GdnWindowSaved saved,
     const GdnWindowControl* control, std::uint32_t key_heads, std::uint32_t value_heads, std::uint32_t head_dim) {
     const auto tiles = value_heads * (head_dim / kGdnWindowColumns);
     if (blockIdx.x < tiles) {
-        gdn_window_recurrence<0U, Storage>({}, state, saved, control, key_heads, head_dim);
+        gdn_window_recurrence<0U, Storage, kGdnWindowColumns, false, false, S>({}, state, saved, control, key_heads, head_dim);
         return;
     }
     const auto pending = gdn_window_pending(control), slot = control->pending_slot & 1U;
@@ -2751,13 +2829,13 @@ void gdn_window_norm_dense_a8_kernel(GdnWindowRows<Rows> rows, const void* norm_
 // They keep the incumbent tile/leaf arithmetic and physical stores. A local
 // barrier then replaces the launch boundary before the same 128-leaf norm.
 // The norm's surplus lanes write only unused LDS entries and join every barrier.
-template <unsigned Rows, GdnRecurrentStorage Storage, bool Dense>
+template <unsigned Rows, GdnRecurrentStorage Storage, bool Dense, RecurrentStateType S = RecurrentStateType::f32>
 __global__ __launch_bounds__(512)
 void gdn_window_recurrent_norm_kernel(GdnWindowRows<Rows> rows, float* state, GdnWindowSaved saved,
     const GdnWindowControl* control, std::uint32_t key_heads, const void* norm_weights, SmallWeightKind norm_kind,
     float epsilon, std::int8_t* a8_codes, float* a8_deltas, std::uint32_t a8_width) {
     constexpr std::uint32_t head_dim = 128U;
-    gdn_window_recurrence<Rows, Storage, 8U, false, true>(rows, state, saved, control, key_heads, head_dim);
+    gdn_window_recurrence<Rows, Storage, 8U, false, true, S>(rows, state, saved, control, key_heads, head_dim);
     __syncthreads();
     __shared__ float scratch[512];
     const auto lane = static_cast<std::uint32_t>(threadIdx.x);
@@ -3074,10 +3152,11 @@ __device__ __forceinline__ float gdn_lane_group_sum(float sum) {
 }
 // Workgroup barrier for LDS hand-offs only: unlike __syncthreads it does not wait for outstanding global stores.
 __device__ __forceinline__ void gdn_lds_barrier() { asm volatile("s_waitcnt lgkmcnt(0)\n\ts_barrier" ::: "memory"); }
-template <GdnRecurrentStorage Storage, unsigned G, unsigned Waves, unsigned Chunk>
+template <GdnRecurrentStorage Storage, unsigned G, unsigned Waves, unsigned Chunk, RecurrentStateType StateType = RecurrentStateType::f32>
 __global__ __launch_bounds__(Waves * 32U)
-void gdn_prefill_lanes_kernel(GdnPrefillRows rows, std::uint32_t count, float* state, std::uint32_t key_heads) {
+void gdn_prefill_lanes_kernel(GdnPrefillRows rows, std::uint32_t count, float* state_raw, std::uint32_t key_heads) {
 #pragma clang fp contract(off)
+    auto* state = reinterpret_cast<typename rstate::Codec<StateType>::Elem*>(state_raw);
     using Shape = GdnLaneShape<G>;
     constexpr unsigned Threads = Waves * 32U, Columns = Waves * Shape::columns, K = Shape::keys;
     constexpr unsigned KeyQuads = Chunk * 64U / Threads, ValueQuads = (Chunk * Columns / 4U + Threads - 1U) / Threads;
@@ -3133,7 +3212,7 @@ void gdn_prefill_lanes_kernel(GdnPrefillRows rows, std::uint32_t count, float* s
     float retained[K];
 #pragma unroll
     for (unsigned j = 0; j < K; ++j)
-        retained[j] = state[gdn_window_state_index<Storage>(value_head, sub + j * G, column, 128U)];
+        retained[j] = rstate::Codec<StateType>::load(state[gdn_window_state_index<Storage>(value_head, sub + j * G, column, 128U)]);
     fetch(0U);
     commit(stage[0]);
     __syncthreads();
@@ -3172,7 +3251,7 @@ void gdn_prefill_lanes_kernel(GdnPrefillRows rows, std::uint32_t count, float* s
     }
 #pragma unroll
     for (unsigned j = 0; j < K; ++j)
-        state[gdn_window_state_index<Storage>(value_head, sub + j * G, column, 128U)] = retained[j];
+        state[gdn_window_state_index<Storage>(value_head, sub + j * G, column, 128U)] = rstate::Codec<StateType>::store(retained[j]);
 }
 // Gated RMSNorm, one wave per (row, head): lane l holds channels l, l+32, l+64, l+96 (gdn_window_key_sum tree).
 // A8: each 32-channel part is also one dense A8 block of the out projection's input; the wave quantizes it
@@ -4441,10 +4520,12 @@ void emit_gdn_sequence(const PreparedGdnLaunch& prepared, const HipGdnLauncherCo
         kValueTile;
     if (config.recurrent_layout == HipGdnRecurrentLayout::baseline &&
         config.recurrent_storage == GdnRecurrentStorage::key_value) {
-        record_gdn_kernel(target.ledger, reinterpret_cast<const void*>(recurrent_step_kernel),
+        with_state_type(config.model.recurrent_state, [&]([[maybe_unused]] auto state_type) {
+        constexpr RecurrentStateType S = decltype(state_type)::value;
+        record_gdn_kernel(target.ledger, reinterpret_cast<const void*>(recurrent_step_kernel<S>),
             dim3(value_heads * tiles), dim3(kRecurrentThreads));
         hipLaunchKernelGGL(
-            recurrent_step_kernel,
+            recurrent_step_kernel<S>,
             dim3(value_heads * tiles),
             dim3(kRecurrentThreads),
             0,
@@ -4458,10 +4539,12 @@ void emit_gdn_sequence(const PreparedGdnLaunch& prepared, const HipGdnLauncherCo
             key_heads,
             value_heads,
             head_dim, target.graph_status);
+        });
         check_hip(
             hipGetLastError(),
             "HIP GDN recurrent update launch");
     } else {
+        refuse_non_f32_state(config, "gdn recurrent layout / value-key storage");
         if (config.recurrent_storage == GdnRecurrentStorage::value_key)
             emit_gdn_recurrent_layout<GdnRecurrentStorage::value_key>(prepared, config.recurrent_layout, target);
         else
@@ -4634,8 +4717,10 @@ void launch_gdn_known_window_core(const GdnKnownWindowRow& row,
     const auto tiles =
         head_dim /
         kValueTile;
+    with_state_type(config.model.recurrent_state, [&]([[maybe_unused]] auto state_type) {
+    constexpr RecurrentStateType S = decltype(state_type)::value;
     hipLaunchKernelGGL(
-        recurrent_step_kernel,
+        recurrent_step_kernel<S>,
         dim3(value_heads * tiles),
         dim3(kRecurrentThreads),
         0,
@@ -4649,6 +4734,7 @@ void launch_gdn_known_window_core(const GdnKnownWindowRow& row,
         key_heads,
         value_heads,
         head_dim, hip_graph_status());
+    });
     check_hip(
         hipGetLastError(),
         "HIP GDN recurrent update launch");
@@ -5044,6 +5130,7 @@ bool gdn_prefill_rows_shape(const GdnKnownWindowRow& first, const GdnPrefillRows
 }
 void enqueue_gdn_prefill_core_tiles(const std::vector<std::array<GdnKnownWindowRow, 8U>>& tiles,
     const GdnPrefillRows& strided, const HipGdnLauncherConfig& config) {
+    refuse_non_f32_state(config, "gdn_prefill_recurrent_kernel (tile prefill)");
     const auto stream = hip_execution_stream();
     const auto& first = tiles[0][0];
     const auto count = static_cast<std::uint32_t>(tiles.size() * 8U);
@@ -5304,6 +5391,8 @@ void enqueue_gdn_prefill_core_rows(const std::vector<std::array<GdnKnownWindowRo
     const auto count = static_cast<std::uint32_t>(tiles.size() * 8U);
     // The FAST chunked route replaces conv + recurrence + norm after the gates: no fused qpf2k core.
     const bool fp16_chunk = gdn_fp16_chunk_enabled(first, strided);
+    if (fp16_chunk) refuse_non_f32_state(config, "STRIX_QPF2K_GDN_FP16_CHUNK");
+    if (qpf2k & 5U) refuse_non_f32_state(config, "STRIX_QPF2K_GDN");  // cols (1) and fused core (4) read the state as FP32
     if (fp16_chunk) qpf2k &= ~4U;
     // STRIX_GDN_GATE_HEADS: beta/alpha outputs per gates block (1|2|4, default 2; must divide the head count).
     static const auto gate_heads_env = 1U << strix::env_choice("STRIX_GDN_GATE_HEADS", 1, {"1", "2", "4"});
@@ -5649,8 +5738,10 @@ void enqueue_gdn_prefill_core_rows(const std::vector<std::array<GdnKnownWindowRo
     auto* matrix = reinterpret_cast<float*>(first.matrix_state.address);
     const auto launch = [&]<GdnRecurrentStorage S, unsigned G, unsigned W, unsigned C>() {
         constexpr unsigned columns = W * 32U / G;
-        hipLaunchKernelGGL(HIP_KERNEL_NAME(gdn_prefill_lanes_kernel<S, G, W, C>), dim3(first.value_heads * (128U / columns)),
-            dim3(W * 32U), 0, stream, strided, count, matrix, first.key_heads);
+        with_state_type(config.model.recurrent_state, [&]([[maybe_unused]] auto state_type) {
+            hipLaunchKernelGGL(HIP_KERNEL_NAME(gdn_prefill_lanes_kernel<S, G, W, C, decltype(state_type)::value>),
+                dim3(first.value_heads * (128U / columns)), dim3(W * 32U), 0, stream, strided, count, matrix, first.key_heads);
+        });
     };
     const auto by_chunk = [&]<GdnRecurrentStorage S, unsigned G, unsigned W>() {
         if (chunk == 16U) launch.template operator()<S, G, W, 16U>(); else launch.template operator()<S, G, W, 8U>();
@@ -5669,6 +5760,7 @@ void enqueue_gdn_prefill_core_rows(const std::vector<std::array<GdnKnownWindowRo
     // RMSNorm, one block per value head; the same values as the lane recurrence followed by the norm rows kernel).
     static const bool fused_norm = strix::envcfg::flag("STRIX_GDN_FUSED_NORM", false);
     if (fused_norm && first.head_dim == 128U && count >= 256U && count % 8U == 0U) {
+        refuse_non_f32_state(config, "STRIX_GDN_FUSED_NORM");
         const auto fused = [&]<GdnRecurrentStorage S, bool A8>() {
             hipLaunchKernelGGL(HIP_KERNEL_NAME(gdn_gates::gdn_prefill_lanes_norm_kernel<S, 4U, 16U, 8U, A8>), dim3(first.value_heads), dim3(512),
                 0, stream, strided, count, matrix, first.key_heads, first.value_heads,
@@ -6185,6 +6277,7 @@ void enqueue_gdn_window(const GdnWindowLayer& layer, std::span<const GdnWindowRo
     }
     }
     if constexpr (Rows <= kGdnWindowRows) if (parts & 2U) {
+    if (gdn_window_tiled_enabled()) refuse_non_f32_state(config, "STRIX_GDN_WINDOW_TILED");
     const auto saved = gdn_window_saved(config.model, layer.retained);
     // STRIX_GDN_WINDOW_PREPARE_GATES=1: the beta/gate scalars of the prepare spread over (head, row) pairs.
     static const bool parallel_gates = strix::envcfg::flag("STRIX_GDN_WINDOW_PREPARE_GATES", false);
@@ -6212,10 +6305,13 @@ void enqueue_gdn_window(const GdnWindowLayer& layer, std::span<const GdnWindowRo
                 const bool dense = config.dense_a8_projections;
                 if (dense) fused_slot = q8_rows::dense_a8_slot(0U);
                 const auto launch = [&]<GdnRecurrentStorage Storage, bool Dense>() {
-                    hipLaunchKernelGGL(HIP_KERNEL_NAME(gdn_window_recurrent_norm_kernel<Rows, Storage, Dense>),
+                  with_state_type(config.model.recurrent_state, [&]([[maybe_unused]] auto state_type) {
+                    constexpr RecurrentStateType S = decltype(state_type)::value;
+                    hipLaunchKernelGGL(HIP_KERNEL_NAME(gdn_window_recurrent_norm_kernel<Rows, Storage, Dense, S>),
                         dim3(shape.value_heads), dim3(512), 0, stream, rows, layer.matrix, saved, control,
                         shape.key_heads, layer.norm, small_weight_kind(layer.norm_type), config.model.rms_norm_epsilon,
                         fused_slot.codes, fused_slot.deltas, shape.value_width);
+                  });
                 };
                 if (config.recurrent_storage == GdnRecurrentStorage::value_key) {
                     if (dense) launch.template operator()<GdnRecurrentStorage::value_key, true>();
@@ -6231,21 +6327,24 @@ void enqueue_gdn_window(const GdnWindowLayer& layer, std::span<const GdnWindowRo
     const auto recurrence = [&]<std::uint32_t Columns>() {
         const auto tiles = dim3(shape.value_heads * (shape.head_dim / Columns));
         static const bool scatter = strix::envcfg::flag("STRIX_QKERN_GDN_SCATTER", false);
+      with_state_type(config.model.recurrent_state, [&]([[maybe_unused]] auto state_type) {
+        constexpr RecurrentStateType S = decltype(state_type)::value;
         if constexpr (Columns == 4U || Columns == 8U) if (scatter) {
             if (config.recurrent_storage == GdnRecurrentStorage::value_key)
-                hipLaunchKernelGGL(HIP_KERNEL_NAME(gdn_window_recurrent_kernel<Rows, GdnRecurrentStorage::value_key, Columns, true>), tiles,
+                hipLaunchKernelGGL(HIP_KERNEL_NAME(gdn_window_recurrent_kernel<Rows, GdnRecurrentStorage::value_key, Columns, true, S>), tiles,
                     dim3(32), 0, stream, rows, layer.matrix, saved, control, shape.key_heads, shape.head_dim);
             else
-                hipLaunchKernelGGL(HIP_KERNEL_NAME(gdn_window_recurrent_kernel<Rows, GdnRecurrentStorage::key_value, Columns, true>), tiles,
+                hipLaunchKernelGGL(HIP_KERNEL_NAME(gdn_window_recurrent_kernel<Rows, GdnRecurrentStorage::key_value, Columns, true, S>), tiles,
                     dim3(32), 0, stream, rows, layer.matrix, saved, control, shape.key_heads, shape.head_dim);
             return;
         }
         if (config.recurrent_storage == GdnRecurrentStorage::value_key)
-            hipLaunchKernelGGL(HIP_KERNEL_NAME(gdn_window_recurrent_kernel<Rows, GdnRecurrentStorage::value_key, Columns>), tiles,
+            hipLaunchKernelGGL(HIP_KERNEL_NAME(gdn_window_recurrent_kernel<Rows, GdnRecurrentStorage::value_key, Columns, false, S>), tiles,
                 dim3(32), 0, stream, rows, layer.matrix, saved, control, shape.key_heads, shape.head_dim);
         else
-            hipLaunchKernelGGL(HIP_KERNEL_NAME(gdn_window_recurrent_kernel<Rows, GdnRecurrentStorage::key_value, Columns>), tiles,
+            hipLaunchKernelGGL(HIP_KERNEL_NAME(gdn_window_recurrent_kernel<Rows, GdnRecurrentStorage::key_value, Columns, false, S>), tiles,
                 dim3(32), 0, stream, rows, layer.matrix, saved, control, shape.key_heads, shape.head_dim);
+      });
     };
     // STRIX_GDN_WINDOW_TILED=1: key-value storage, coalesced 32-column slices through LDS (columns per wave as above).
     const bool tiled = gdn_window_tiled_enabled();
@@ -6327,14 +6426,17 @@ void gdn_window_commit_enqueue(const GdnWindowLayer& layer, const GdnWindowContr
     const auto saved = gdn_window_saved(config.model, layer.retained);
     const auto grid = dim3(shape.value_heads * (shape.head_dim / kGdnWindowColumns) + shape.conv_width / 32U);
     const auto native = static_cast<hipStream_t>(stream);
+    with_state_type(config.model.recurrent_state, [&]([[maybe_unused]] auto state_type) {
+    constexpr RecurrentStateType S = decltype(state_type)::value;
     if (config.recurrent_storage == GdnRecurrentStorage::value_key)
-        hipLaunchKernelGGL(HIP_KERNEL_NAME(gdn_window_commit_kernel<GdnRecurrentStorage::value_key>), grid,
+        hipLaunchKernelGGL(HIP_KERNEL_NAME(gdn_window_commit_kernel<GdnRecurrentStorage::value_key, S>), grid,
             dim3(32), 0, native, layer.matrix, layer.conv_state, saved, control,
             shape.key_heads, shape.value_heads, shape.head_dim);
     else
-        hipLaunchKernelGGL(HIP_KERNEL_NAME(gdn_window_commit_kernel<GdnRecurrentStorage::key_value>), grid,
+        hipLaunchKernelGGL(HIP_KERNEL_NAME(gdn_window_commit_kernel<GdnRecurrentStorage::key_value, S>), grid,
             dim3(32), 0, native, layer.matrix, layer.conv_state, saved, control,
             shape.key_heads, shape.value_heads, shape.head_dim);
+    });
     check_hip(hipGetLastError(), "GDN window commit launch");
 }
 
@@ -6439,7 +6541,8 @@ GdnCohortBinding bind_gdn_window_cohort(std::span<const HipGdnWindowCohortSegmen
         if (!segment.config || segment.rows.empty() || *segment.rows[0].layer != *segments[0].rows[0].layer ||
             segment.config->gdn.dense_a8_projections != segments[0].config->gdn.dense_a8_projections ||
             segment.config->gdn.dense_trellis_projections != segments[0].config->gdn.dense_trellis_projections ||
-            segment.config->gdn.recurrent_storage != segments[0].config->gdn.recurrent_storage)
+            segment.config->gdn.recurrent_storage != segments[0].config->gdn.recurrent_storage ||
+            segment.config->gdn.model.recurrent_state != segments[0].config->gdn.model.recurrent_state)
             throw std::invalid_argument("GDN cohort window segments differ in layer or arithmetic");
         // Every session segment passes the complete single-session window binding.
         out.segments[s] = bind_gdn_window(segment.rows, *segment.config, true);
@@ -6511,9 +6614,12 @@ static void enqueue_gdn_window_segments(std::span<const GdnWindowCohortSegment> 
     const auto recurrence = [&]<std::uint32_t Columns>() {
         const auto tiles = dim3(shape.value_heads * (shape.head_dim / Columns), count);
         const auto launch = [&]<GdnRecurrentStorage Storage>() {
-            const auto kernel = anyseg ? gdn_window_recurrent_anyseg_kernel<Storage, Columns>
-                : gdn_window_recurrent_segments_kernel<Storage, Columns>;
+          with_state_type(config.model.recurrent_state, [&]([[maybe_unused]] auto state_type) {
+            constexpr RecurrentStateType S = decltype(state_type)::value;
+            const auto kernel = anyseg ? gdn_window_recurrent_anyseg_kernel<Storage, Columns, S>
+                : gdn_window_recurrent_segments_kernel<Storage, Columns, S>;
             hipLaunchKernelGGL(kernel, tiles, dim3(32), 0, stream, all, shape.key_heads, shape.head_dim);
+          });
         };
         if (config.recurrent_storage == GdnRecurrentStorage::value_key) launch.template operator()<GdnRecurrentStorage::value_key>();
         else launch.template operator()<GdnRecurrentStorage::key_value>();
@@ -6651,10 +6757,14 @@ void gdn_window_serial_row_probe(const GdnWindowLayer& layer, const GdnWindowRow
     hipLaunchKernelGGL(normalize_qk_kernel, dim3(shape.key_heads * 2U), dim3(kRecurrentThreads), 0, stream,
         workspace.qkv[0], shape.key_heads, shape.head_dim, config.model.gdn_qk_l2_epsilon, nullptr);
     if (config.recurrent_layout == HipGdnRecurrentLayout::baseline && config.recurrent_storage == GdnRecurrentStorage::key_value) {
-        hipLaunchKernelGGL(recurrent_step_kernel, dim3(shape.value_heads * (shape.head_dim / kValueTile)),
-            dim3(kRecurrentThreads), 0, stream, workspace.qkv[0], workspace.beta[0], workspace.gate[0], layer.matrix,
-            workspace.core[0], shape.key_heads, shape.value_heads, shape.head_dim, nullptr);
+        with_state_type(config.model.recurrent_state, [&]([[maybe_unused]] auto state_type) {
+            constexpr RecurrentStateType S = decltype(state_type)::value;
+            hipLaunchKernelGGL(recurrent_step_kernel<S>, dim3(shape.value_heads * (shape.head_dim / kValueTile)),
+                dim3(kRecurrentThreads), 0, stream, workspace.qkv[0], workspace.beta[0], workspace.gate[0], layer.matrix,
+                workspace.core[0], shape.key_heads, shape.value_heads, shape.head_dim, nullptr);
+        });
     } else {
+        refuse_non_f32_state(config, "gdn window serial reference layout / value-key storage");
         PreparedGdnLaunch prepared{};
         prepared.workspace = {workspace.qkv[0], workspace.z[0], workspace.beta[0], workspace.gate[0], workspace.core[0], 0};
         prepared.matrix_state.address = reinterpret_cast<std::uintptr_t>(layer.matrix);
@@ -6720,6 +6830,8 @@ void gdn_recurrent_window_probe(std::span<const GdnRecurrentWindowRowView> rows,
         for (unsigned r = 0; r < 3U*rows.size(); ++r) require_gdn_known_window_disjoint(writes[i], reads[r]);
         for (unsigned j = 0; j < i; ++j) require_gdn_known_window_disjoint(writes[i], writes[j]);
     }
+    if (recurrent_state_policy().type != RecurrentStateType::f32)  // no config here: the diagnostic is f32-only
+        throw std::invalid_argument(recurrent_state_route_refusal(recurrent_state_policy().type, false, "gdn retained-window diagnostic"));
     const auto native_stream = static_cast<hipStream_t>(stream);
     hipStreamCaptureStatus capture = hipStreamCaptureStatusNone;
     check_hip(hipStreamIsCapturing(native_stream, &capture), "query GDN retained-window diagnostic capture");
@@ -6727,7 +6839,7 @@ void gdn_recurrent_window_probe(std::span<const GdnRecurrentWindowRowView> rows,
     check_hip(hipPeekAtLastError(), "GDN retained-window diagnostic pre-enqueue stale error");
     if (mode == GdnRetainedWindowMode::serial_rows) {
         for (const auto& row : rows) {
-            hipLaunchKernelGGL(recurrent_step_kernel, dim3(value_heads * (head_dim / kValueTile)), dim3(kRecurrentThreads), 0,
+            hipLaunchKernelGGL(recurrent_step_kernel<RecurrentStateType::f32>, dim3(value_heads * (head_dim / kValueTile)), dim3(kRecurrentThreads), 0,
                 native_stream, reinterpret_cast<const float*>(row.qkv.address), reinterpret_cast<const float*>(row.beta.address),
                 reinterpret_cast<const float*>(row.gate.address), reinterpret_cast<float*>(state.address),
                 reinterpret_cast<float*>(row.core.address), key_heads, value_heads, head_dim, nullptr);
@@ -7109,6 +7221,8 @@ void register_hip_gdn_kernel_variant(
         variant.compiler_identity += ":gdn-recurrent" + std::string(gdn_recurrent_layout_marker(config.recurrent_layout));
     if(config.recurrent_storage != GdnRecurrentStorage::key_value)
         variant.compiler_identity += ":gdn-storage" + std::string(gdn_recurrent_storage_marker(config.recurrent_storage));
+    if(config.model.recurrent_state != RecurrentStateType::f32)
+        variant.compiler_identity += std::string(":gdn-state-") + recurrent_state_type_name(config.model.recurrent_state);
     variant.measured_seconds = 0.0;
 
     registry.add(
@@ -7254,7 +7368,8 @@ bool same_island_config(const HipGdnLauncherConfig& a, const HipGdnLauncherConfi
         a.wave8_q8_input_projections == b.wave8_q8_input_projections &&
         a.virtual_q8_output_projection == b.virtual_q8_output_projection &&
         a.wave8_q8_output_projection == b.wave8_q8_output_projection &&
-        a.recurrent_layout == b.recurrent_layout && a.recurrent_storage == b.recurrent_storage;
+        a.recurrent_layout == b.recurrent_layout && a.recurrent_storage == b.recurrent_storage &&
+        a.model.recurrent_state == b.model.recurrent_state;
 }
 
 std::uint64_t island_organization_identity(const HipGdnLauncherConfig& config) noexcept {
@@ -7318,8 +7433,12 @@ void validate_island_graph(hipGraph_t graph, const GdnKernelLedger& ledger,
     if (!gdn_island_recurrent_layout_admitted(config.recurrent_layout) ||
         config.recurrent_storage != GdnRecurrentStorage::key_value)
         throw std::runtime_error("GDN island recurrent configuration is not admitted");
+    const void* step_symbol = nullptr;
+    with_state_type(config.model.recurrent_state, [&]([[maybe_unused]] auto state_type) {
+        step_symbol = reinterpret_cast<const void*>(recurrent_step_kernel<decltype(state_type)::value>);
+    });
     const auto recurrent_symbol = config.recurrent_layout == HipGdnRecurrentLayout::baseline
-        ? reinterpret_cast<const void*>(recurrent_step_kernel)
+        ? step_symbol
         : reinterpret_cast<const void*>(recurrent_layout_diagnostic_kernel<gdn_recurrent_layout_diagnostic::Layout::transposed>);
     for (const auto& expected : ledger) {
         std::size_t selected = count;
@@ -7821,7 +7940,7 @@ namespace gdn_recurrent_layout_diagnostic {
 const void* kernel_symbol(Layout layout) {
     switch (layout) {
     case Layout::reference:
-        return reinterpret_cast<const void*>(recurrent_step_kernel);
+        return reinterpret_cast<const void*>(recurrent_step_kernel<RecurrentStateType::f32>);
     case Layout::stride32:
         return reinterpret_cast<const void*>(recurrent_layout_diagnostic_kernel<Layout::stride32>);
     case Layout::stride33:
@@ -7847,7 +7966,7 @@ void enqueue(Shape shape, const Bindings& bindings, Layout layout, hipStream_t s
     hipLaunchKernelGGL(kernel, dim3(launch.grid_x), dim3(launch.block_x), 0, stream, \
         qkv, beta, gate, state, core, shape.key_heads, shape.value_heads, shape.head_dim, status)
     switch (layout) {
-    case Layout::reference: STRIX_RECURRENT_LAYOUT_LAUNCH(recurrent_step_kernel); break;
+    case Layout::reference: STRIX_RECURRENT_LAYOUT_LAUNCH(recurrent_step_kernel<RecurrentStateType::f32>); break;
     case Layout::stride32:
         STRIX_RECURRENT_LAYOUT_LAUNCH(HIP_KERNEL_NAME(recurrent_layout_diagnostic_kernel<Layout::stride32>)); break;
     case Layout::stride33:
@@ -7883,7 +8002,7 @@ void hip_gdn_decode_fuse_fixture(const HipGdnDecodeFuseFixture& v, bool fuse,
     // qkv|z|beta|gate must be one contiguous image, as in the R1 workspace.
     if (status) hipLaunchKernelGGL(validate_gdn_graph_values, dim3(32), dim3(kProjectionThreads), 0, stream,
         v.qkv, channels + v.value_heads * d + v.value_heads * 2ULL, status);
-    hipLaunchKernelGGL(recurrent_step_kernel, dim3(v.value_heads * (d / kValueTile)), dim3(d), 0, stream,
+    hipLaunchKernelGGL(recurrent_step_kernel<RecurrentStateType::f32>, dim3(v.value_heads * (d / kValueTile)), dim3(d), 0, stream,
         v.qkv, v.beta, v.gate, v.matrix, v.core, v.key_heads, v.value_heads, d, status);
     if (status) hipLaunchKernelGGL(validate_gdn_graph_values, dim3(32), dim3(kProjectionThreads), 0, stream,
         v.core, v.value_heads * d, status);
