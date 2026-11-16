@@ -4,9 +4,11 @@
 // MiniMax M3.1 defaults-on resolver: the table of default-ON items, the baseline master switch and the canonical
 // effective configuration (see mm_defaults.hpp).
 #include "minimax/engine/mm_defaults.hpp"
+#include "strix/env_flags.hpp"
 #include "minimax/engine/mm_profile_table.hpp"
 #include "minimax/engine/route_identity.hpp"
 #include "core/layer_set.hpp"
+#include "moe_core/grouped_policy.hpp"
 #include "minimax/serve/minimax_sched.hpp"
 #include "minimax/dspark/minimax_auto.hpp"
 #include "strix/session/speculation_default.hpp"
@@ -113,6 +115,8 @@ constexpr Item kItems[] = {
      "Prefill MoE measurement: exact (partials/xt/at/output bitwise), paired MT8 bands for calls >= 2048 rows: MoE call -0.6..-1.0 % 2048 / -0.9..-1.5 % 4096 rows, 1024 mixed"},
     {"pf_moe_tail_stream", "STRIX_MMX_PREFILL_TAIL_STREAM", "1", "0",
      "Prefill MoE measurement: exact (partials/xt/at/output bitwise), tail classes beside MT8: MoE call -1.9 to -3.0 % real routes"},
+    {"pf_moe_pipe_tail", "STRIX_MMX_PREFILL_PIPE_TAIL", "1", "0",
+     "Prefill MoE measurement: bitwise (pipe-tail fixture 12,480 cells, logits and state fnv of both ranks identical), tail rows (MT 1..7) on the pipelined kernel: PAIR TTFT 8K 12.68 -> 12.47 s, 32K 51.81 -> 50.91 s"},
     {"pf_gather_tok", "STRIX_MMX_PREFILL_GATHER_TOK", "1", "0",
      "Prefill MoE measurement: exact (tiled xt/at, partials, output bitwise), gather 6.35 -> 4.14 ms per 4096-row call"},
     {"pf_router_rows", "STRIX_MM_PF_ROUTER_ROWS", "32", "8",
@@ -223,7 +227,13 @@ PrefillPolicy prefill_policy(const Lookup& env) {
     p.msa_flash_layers = fp::layer_ranges(kMsaLayers, [&](unsigned l) { return mask.test(l); });
     if (p.msa_flash != 0) {
         bool rework = true;
-        for (const auto& r : resolve(env))
+        // Only the rework item and the baseline switch decide it: forwarding every item through a recording lookup
+        // (the engine passes envcfg::text) put the whole defaults set into the FAST arm's receipt, which the floor
+        // gate then refused against an exact reference ("differs beyond its FAST layer set").
+        const Lookup rework_env = [&](const char* k) -> const char* {
+            return std::strcmp(k, "STRIX_MM_PF_MSA_REWORK") == 0 || std::strcmp(k, kBaselineEnv) == 0 ? env(k) : nullptr;
+        };
+        for (const auto& r : resolve(rework_env))
             if (std::strcmp(r.item->env, "STRIX_MM_PF_MSA_REWORK") == 0) rework = r.value != "0";
         const char* fused = env("STRIX_MM_ATTN_PREFILL");
         if (const char* reason = msa_flash_decline_reason(rework, fused == nullptr || std::strcmp(fused, "off") != 0, mask.count())) {
@@ -232,16 +242,56 @@ PrefillPolicy prefill_policy(const Lookup& env) {
         }
     }
     if (p.msa_flash != 0)
-        p.policies = p.msa_flash == 1 && p.msa_flash_layers == kMsaFlashLayers
-                         ? std::string(flash.policy)
+        p.policies = p.msa_flash == 1 && msa_flash_policy(p.msa_flash_layers) != nullptr
+                         ? std::string(msa_flash_policy(p.msa_flash_layers))
                          : std::string("msa-flash-bf16") + (p.msa_flash == 2 ? "-2term" : "") + "-l" + p.msa_flash_layers;
     if (i4 && fp::switch_on(env(kFastBundle.env)) && !fp::set(raw))
         p.note = std::string(flash.policy) + " not selected by " + kFastBundle.env + " on STRIX_MMX_MODEL_FORMAT=fast_i4";
+    // Index projections on the shared WMMA core (opt-in member, mm_profile_table.hpp kIdxWmmaPolicy).
+    const char* iw = env("STRIX_MM_PF_IDX_WMMA");
+    if (fp::set(iw) && std::strcmp(iw, "0") != 0 && std::strcmp(iw, "1") != 0)
+        throw std::invalid_argument("STRIX_MM_PF_IDX_WMMA must be 0 or 1");
+    p.idx_wmma_asked = fp::set(iw) ? iw : "default";
+    p.idx_wmma = fp::set(iw) && std::strcmp(iw, "1") == 0;
+    const char* il = env("STRIX_MM_PF_IDX_WMMA_LAYERS");
+    const auto imask = strix::core::parse_layer_set(fp::set(il) ? il : kIdxWmmaLayers, 0, kMsaLayers, "STRIX_MM_PF_IDX_WMMA_LAYERS");
+    p.idx_wmma_layers = fp::layer_ranges(kMsaLayers, [&](unsigned l) { return imask.test(l); });
+    if (p.idx_wmma && imask.count() == 0) {
+        p.idx_wmma = false;
+        p.note += std::string(p.note.empty() ? "" : "; ") + "STRIX_MM_PF_IDX_WMMA_LAYERS selects no layers";
+    }
+    // Resolve the same prefill layout as dispatch; decode's <=8-row policy is irrelevant here.
+    const auto index = route::resolve_index_projection(env("STRIX_MM_INDEX_PROJ"), true);
+    const bool packed = route::index_projection_route(index, 9) == route::IndexLayout::packed;
+    const bool fp32 = route::fp32_profile(env("STRIX_MM_PREFILL_IDENTITY"));
+    if (p.idx_wmma && (!packed || fp32)) {
+        p.idx_wmma = false;
+        p.note += std::string(p.note.empty() ? "" : "; ") +
+                  (!packed ? "index WMMA requires STRIX_MM_INDEX_PROJ=attn" : "index WMMA requires the default prefill identity");
+    }
+    if (p.idx_wmma) p.policies += (p.policies.empty() ? "" : "+") + idx_wmma_policy(p.idx_wmma_layers);
     return p;
 }
 
+std::string idx_wmma_policy(const std::string& layers) { return std::string(kIdxWmmaPolicy) + "-l" + layers; }
+
+strix::pair::PipelineChoice pair_pipeline_choice(std::uint64_t rows) {
+    // Hypothetical reference only: memory is assumed, not measured. This choice cannot enable execution.
+    // MMPIPE-PLAN section 1 (8K FAST stack): P(u) = 580 + 1.9946 u ms per chunk over both ranks (W 8.75 s at 4,096
+    // rows, 9.33 s at 2,048), FP32 seam 22 ms per 4,096 rows at 4.58 GB/s, TP2 resident 9,810 ms at 8K.
+    strix::pair::PipelineCost cost{580.0, 1.9946, 0.0, 0.0, 0.0, 0.0};
+    cost.hop_ms_per_row = 22.0 / 4096.0;
+    cost.tp_ms_per_row = 9810.0 / 8192.0;
+    static constexpr std::array<std::uint32_t, 4> chunks{1024U, 2048U, 4096U, 8192U};
+    static constexpr std::array<std::uint32_t, 6> virtual_stages{1U, 2U, 3U, 5U, 6U, 10U};
+    const strix::pair::LayoutDecl reference_layout{strix::pair::Residency::tensor_split, 31.0e9, 41.6e9,
+        "src/minimax/engine/engine.hip:89-91,1120-1131"};
+    return strix::pair::choose_pipeline(rows, cost, chunks, [](std::uint32_t) { return true; }, virtual_stages,
+        [](std::uint32_t v) { return 2U * v <= 60U; }, reference_layout);
+}
+
 const profile::Engine& profile_engine() {
-    static const profile::Engine engine{"minimax-pair", "", profile_table, false};
+    static const profile::Engine engine{"minimax-pair", "", profile_table, false, "minimax-turbo-v1"};
     return engine;
 }
 
@@ -256,9 +306,38 @@ profile::Resolution profile_resolution(const Lookup& env) {
             return p.msa_flash == 0 && p.msa_flash_asked == "default" ? nullptr : effective_mode.c_str();
         if (std::strcmp(key, "STRIX_MM_PF_MSA_FLASH_LAYERS") == 0)
             return p.msa_flash == 0 ? nullptr : p.msa_flash_layers.c_str();
+        if (std::strcmp(key, "STRIX_MM_PF_IDX_WMMA") == 0)
+            return !p.idx_wmma && p.idx_wmma_asked == "default" ? nullptr : p.idx_wmma ? "1" : "0";
+        if (std::strcmp(key, "STRIX_MM_PF_IDX_WMMA_LAYERS") == 0)
+            return p.idx_wmma ? p.idx_wmma_layers.c_str() : nullptr;
         return base(key);
     };
+    // Product profile: '--profile NAME' of rank and serve, exported by print_or_apply() (one value for both apps).
+    if (const char* name = env(kProductProfileEnv); name != nullptr && *name != 0) in.profile = profile::parse(name);
     return profile::resolve(profile_engine(), in);
+}
+
+bool product_option(const std::string& a, const std::function<std::string()>& next, std::string* timing) {
+    if (a == profile::turbo::kWeightsOption || a == profile::turbo::kBitsOption || a == profile::turbo::kPackOption) {
+        (void)next();  // exported by print_or_apply()
+        return true;
+    }
+    if (a == "--timing-profile") {
+        if (timing == nullptr) throw std::invalid_argument("--timing-profile is a strix-minimax-rank option");
+        *timing = next();
+        return true;
+    }
+    if (a != "--profile") return false;
+    const std::string value = next();
+    if (profile::is_name(value)) return true;  // the product profile, exported by print_or_apply()
+    // Explicit compatibility: the old timing spelling NAME:PROMPT.u32:STEPS keeps working on rank, with one notice.
+    if (timing == nullptr || value.find(':') == std::string::npos)
+        throw std::invalid_argument("--profile must be default, fast, quality or turbo (got '" + value +
+                                    "'); the per-phase timing session is --timing-profile NAME:PROMPT.u32:STEPS");
+    std::fprintf(stderr, "strix-minimax-rank: '--profile %s' is the old spelling of '--timing-profile %s'; "
+                         "--profile now names the product profile\n", value.c_str(), value.c_str());
+    *timing = value;
+    return true;
 }
 
 void check_peer(const profile::Resolution& mine, const std::function<void(const void*, void*, std::size_t)>& exchange) {
@@ -272,8 +351,21 @@ void check_peer(const std::function<void(const void*, void*, std::size_t)>& exch
 
 std::string prefill_identity(const Lookup& env) {
     const auto p = prefill_policy(env);
-    std::string out = p.policies.empty() ? std::string() : "prefill_msa=" + p.policies;
+    // MSA attention policies under prefill_msa (unchanged form), the index projection member under prefill_idxproj.
+    std::string msa, idx;
+    for (std::size_t a = 0; a < p.policies.size();) {
+        const std::size_t b = std::min(p.policies.find('+', a), p.policies.size());
+        const std::string one = p.policies.substr(a, b - a);
+        std::string& dst = one.rfind(kIdxWmmaPolicy, 0) == 0 ? idx : msa;
+        dst += (dst.empty() ? "" : "+") + one;
+        a = b + 1;
+    }
+    std::string out = msa.empty() ? std::string() : "prefill_msa=" + msa;
+    if (!idx.empty()) out += std::string(out.empty() ? "" : ";") + "prefill_idxproj=" + idx;
     if (fast_i4_format(env)) out += std::string(out.empty() ? "" : ";") + "moe_prefill_format=fast_i4";
+    // TURBO: versioned name + effective levers + weight identity, even with every lever off (empty outside turbo).
+    if (const auto pr = profile_resolution(env); pr.is_turbo())
+        out += std::string(out.empty() ? "" : ";") + pr.cache_namespace();
     return out;
 }
 
@@ -300,7 +392,7 @@ void apply() {
     const Lookup env = process_env;
     for (const Resolved& r : resolve(env)) {
         if (r.source == Source::env) continue;
-        (void)export_env(r.item->env, r.value.c_str(), 0);
+        if (export_env(r.item->env, r.value.c_str(), 0) == 0) strix::envcfg::note_default_export(r.item->env, r.value.c_str());
         g_exported.insert(r.item->env);
     }
     if (baseline(env))
@@ -456,6 +548,39 @@ SessionConfig session_config(const Cli& cli, const Lookup& env, std::uint64_t av
     return c;
 }
 
+namespace {
+constexpr const char* kPeerGone =
+    "a request must fail within a minute when the peer is gone; the CLI waits out an uneven two-rank load";
+constexpr HostDefault kHostDefaults[] = {
+    // The CRC organisation and the 1 MiB host chunks are items of the table above (apply() exports them for both
+    // entry points), so they are not repeated here.
+    // The ranks load at different speeds (44 s vs 166 s under page-cache pressure): the first collective after the
+    // load must not hit the dist layer's 120 s default.
+    {"STRIX_DIST_USB4_TIMEOUT_MS", "600000", "60000", kPeerGone, false},
+    {"STRIX_DIST_WAIT_TIMEOUT_MS", "600000", "60000", kPeerGone, false},
+    // Prefill MoE table ring: exact, 1K -0.5 %, 8K not slower; qualified with one engine owner only.
+    {"STRIX_MM_PF_TABLE_RING", "1", nullptr,
+     "qualified with a single engine owner; not qualified with several sessions sharing the engine", true},
+};
+}  // namespace
+
+std::span<const HostDefault> host_defaults() { return kHostDefaults; }
+
+const char* host_default_value(const HostDefault& row, const std::string& app, const Lookup& env) {
+    if (const char* set = env(row.name)) return set;
+    if (row.optimization) {
+        const char* base = env(kBaselineEnv);
+        if (base != nullptr && std::string(base) == "1") return nullptr;
+    }
+    return app == "serve" ? row.serve : row.rank;
+}
+
+void apply_host_defaults(const std::string& app) {
+    const Lookup lookup = [](const char* key) { return process_env(key); };
+    for (const auto& row : kHostDefaults)
+        if (const char* value = host_default_value(row, app, lookup)) (void)export_env(row.name, value, 0);
+}
+
 std::string effective_config(const Cli& cli, const Lookup& env) {
     std::ostringstream o;
     o << "app=" << cli.app << "\n"
@@ -467,21 +592,43 @@ std::string effective_config(const Cli& cli, const Lookup& env) {
         const char* v = env(r);
         o << r << "=" << (v != nullptr ? v : "default") << "\n";
     }
+    const char* order_asked = env("STRIX_MMX_PF_ORDER");
+    const auto& order = strix::moe_core::resolve_grouped_order(order_asked);
+    o << "STRIX_MMX_PF_ORDER.requested=" << (order_asked ? order_asked : "default") << "\n"
+      << "STRIX_MMX_PF_ORDER.effective=" << (order.invariant() ? "invariant" : "adaptive") << "\n";
     o << "build.gu4_scalar=" << (STRIX_MM_GU4_SCALAR ? "on" : "off") << "\n";
     for (const Resolved& r : resolve(env)) o << r.item->env << "=" << r.value << "\n";
     {   // FAST prefill profile rows (default OFF): the same resolution the engine, the cache identity and the ranks use.
         const auto pf = prefill_policy(env);
         const auto pr = profile_resolution(env);
         for (const auto& e : pr.entries) o << e.lever->env << "=" << e.value << "\n";
+        if (pr.profile != profile::Name::standard) {  // default prints nothing new (legacy text unchanged)
+            o << "profile.name=" << profile::name(pr.profile) << "\n" << "profile.version=" << pr.versioned() << "\n"
+              << "profile.qualification=" << pr.qualification() << "\n";
+            if (pr.is_turbo())
+                o << "profile.weights_requested=" << pr.weights.requested_text() << "\n"
+                  << "profile.weights=" << pr.weights.identity() << "\n"
+                  << "profile.weights_origin=" << pr.weights.origin << "\n"
+                  << "profile.weights_reason=" << (pr.weights.reason.empty() ? "-" : pr.weights.reason) << "\n"
+                  << "profile.cache_namespace=" << pr.cache_namespace() << "\n";
+        }
         const auto id = prefill_identity(env);
         const bool bundle_requested = strix::fast_profile::switch_on(env(kFastBundle.env));
-        o << "prefill.fast_profile=" << (bundle_requested && !pf.policies.empty() ? kFastBundle.profile : "off") << "\n"
+        const auto pipeline_reference = pair_pipeline_choice(8192U);
+        o << "prefill.fast_profile=" << (bundle_requested && pf.msa_flash != 0 ? kFastBundle.profile : "off") << "\n"
           << "prefill.fast_profile_requested=" << (bundle_requested ? kFastBundle.profile : "off") << "\n"
           << "prefill.msa_flash_requested=" << pf.msa_flash_requested << "\n"
           << "prefill.msa_flash_source=" << pf.msa_flash_asked << "\n"
           << "prefill.msa_flash_layers_requested=" << pf.msa_flash_layers_requested << "\n"
+          << "prefill.idx_wmma=" << (pf.idx_wmma ? "1" : "0") << "\n"
+          << "prefill.idx_wmma_source=" << pf.idx_wmma_asked << "\n"
+          << "prefill.idx_wmma_layers=" << (pf.idx_wmma ? pf.idx_wmma_layers : std::string("none")) << "\n"
           << "prefill.fast_policies=" << (pf.policies.empty() ? "none" : pf.policies) << "\n"
           << "prefill.fast_note=" << (pf.note.empty() ? "none" : pf.note) << "\n"
+          << "prefill.pair_pipeline=off mode=tensor residency=tensor_split free_memory=pending "
+             "reason=layout: tensor-split weights; pipeline execution unimplemented\n"
+          << "prefill.pair_pipeline_reference=estimate profile=FAST rows=8192 assumed_free_gb=31.0 assumed_extra_gb=41.6 "
+          << strix::pair::effective_line(pipeline_reference) << "\n"
           << "prefill.identity=" << (id.empty() ? "default" : id) << "\n"
           << "profile_fingerprint=" << profile::hex_identity(pr.fingerprint()) << "\n";
     }
@@ -512,6 +659,13 @@ std::string effective_config(const Cli& cli, const Lookup& env) {
     o << "session_requested=" << (requested ? requested : "auto") << "\n"
       << "session_cache=" << (session.enabled ? "pending" : "off") << "\n"
       << "session_reason=" << (session.enabled ? "runtime admission required" : session.reason) << "\n";
+    for (const auto& row : kHostDefaults) {
+        const char* value = host_default_value(row, cli.app, env);
+        o << "host." << row.name << "=" << (value ? value : "unset") << "\n";
+        if (cli.app == "serve" && row.serving_reason != nullptr && env(row.name) == nullptr)
+            o << "host." << row.name << ".serving_reason=" << row.serving_reason << "\n";
+    }
+    o << strix::weight::family_plan_notice(cli.weight_plans);
     return o.str();
 }
 
@@ -525,6 +679,18 @@ bool print_or_apply(const std::string& app, int argc, char** argv) {
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         if (a == "--baseline") { (void)export_env(kBaselineEnv, "1", 1); (void)export_env("STRIX_SESSION_CACHE", "0", 1); }
+        // Product profile and TURBO weight toggle: the CLI value wins over an inherited variable (CLI > environment).
+        if (a == "--profile" && i + 1 < argc && profile::is_name(argv[i + 1])) {
+            (void)export_env(kProductProfileEnv, argv[++i], 1);
+            continue;
+        }
+        if (a == profile::turbo::kWeightsOption || a == profile::turbo::kBitsOption || a == profile::turbo::kPackOption) {
+            if (i + 1 >= argc) throw std::invalid_argument("missing value for " + a);
+            const auto key = a == profile::turbo::kWeightsOption ? profile::turbo::kWeightsEnv :
+                a == profile::turbo::kBitsOption ? profile::turbo::kBitsEnv : profile::turbo::kPackEnv;
+            (void)export_env(std::string(key).c_str(), argv[++i], 1);
+            continue;
+        }
         const std::pair<const char*, const char*> flags[] = {
             {"--session-host-budget", "STRIX_SESSION_RAM_BYTES"}, {"--session-cache-dir", "STRIX_SESSION_DIR"},
             {"--session-cache", "STRIX_SESSION_CACHE"}, {"--session-disk", "STRIX_SESSION_DISK"},
@@ -541,7 +707,10 @@ bool print_or_apply(const std::string& app, int argc, char** argv) {
     apply();
     (void)pf_async_min_rows(process_env("STRIX_MM_PF_ASYNC_MIN_ROWS"));
     (void)effective_config(parse_cli(app, args), process_env);
-    if (!print) return false;
+    if (!print) {  // a weight request this build cannot honour refuses the run (printed, not refused, above)
+        profile_resolution(process_env).weights.require_honoured();
+        return false;
+    }
     std::fputs(effective_config(parse_cli(app, args), process_env).c_str(), stdout);
     if (app == "serve") {
         const bool off = serve_policy(process_env).sched == serve::Sched::off;

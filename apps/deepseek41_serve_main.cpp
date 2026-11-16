@@ -118,11 +118,13 @@
 #include "strix/deepseek41_prefill.hpp"
 #include "strix/deepseek41_prefix_cache.hpp"
 #include "strix/serve/prefill_group.hpp"
+#include "strix/ds41_fast_profile.hpp"
 #include "strix/deepseek41_plan.hpp"
 #include "strix/deepseek41_serve_cache_policy.hpp"
 #include "strix/deepseek41_cache_lease.hpp"
 #include "strix/deepseek41_session_cache.hpp"
 #include "strix/serve/session_api.hpp"
+#include "strix/serve/session_reservation.hpp"
 #include "deepseek41/http_session_owner.hpp"
 #include "strix/deepseek41_describe.hpp"
 #include "strix/deploy/binding.hpp"
@@ -184,6 +186,11 @@
 
 namespace {
 
+// --pool-positions: a request reserves prompt + max_tokens + 1 positions (the row its next step writes), capped at the
+// context; the shared per-request rule (strix/serve/session_reservation.hpp, same as the CUDA Qwen server) with no
+// granule (the pool hands out exact position ranges).
+strix::serve::ReservationRule pool_rule(std::uint64_t context) { return {context, 1U, 1U, 1U}; }
+
 using strix::deepseek41::BatchForward;
 using strix::deepseek41::BatchRow;
 using strix::deepseek41::BatchSequence;
@@ -231,7 +238,15 @@ struct Args : strix::deepseek41::ServeCachePolicy {
 void apply_cache_profile(Args& a) {
     const char* dir = std::getenv("STRIX_DS41_PREFIX_DIR");
     const char* home = std::getenv("HOME");
+    // DAYAUDIT 1: no stored state under a prefill whose continuation differs from its cold run (same rule, both ranks:
+    // the FAST levers are agreed by the pair); the session cache resumes through the same import + extend
+    a.continuation_decline = strix::deepseek41::prefix_continuation_decline();
     a.resolve(a.device_prefill, !a.hetero_listen.empty(), !a.dspark.empty(), dir ? dir : "", home ? home : "");
+    if (!a.continuation_decline.empty()) {
+        a.session_ram_bytes = 0;
+        a.session_dir.clear();
+        std::fprintf(stderr, "prefix cache and session cache: off (%s)\n", a.continuation_decline.c_str());
+    }
 }
 
 void event(const serve::Json& e) {
@@ -608,6 +623,22 @@ const serve::PrefillGroupPolicy& prefill_group_policy() {
     return policy;
 }
 
+// DAYAUDIT 4: both ranks right after building their prefill (before the disk reconcile), with the prefill present on
+// both or on neither (the hello agrees the prefill path): rank 0 plans groups with the pair's minimum, so it never
+// sends a group that rank 1 (group off, fewer members or rows) cannot hold.
+serve::PrefillGroupAgreement pair_group_agreement(BatchForward& fwd, const serve::PrefillGroupPolicy& policy,
+                                                  const serve::PrefillGroupCapacity& capacity) {
+    const auto mine = serve::prefill_group_words(policy, capacity);
+    std::array<std::uint64_t, serve::kPrefillGroupWords> peer{};
+    fwd.exchange_host(std::as_bytes(std::span(mine)), std::as_writable_bytes(std::span(peer)));
+    auto r = serve::agree_prefill_group(policy, capacity, peer);
+    if (serve::prefill_group_words(r.policy, r.capacity) != mine)
+        std::fprintf(stderr, "prefill_group: pair minimum (peer members %llu, rows %llu, policy %s %llu members)\n",
+                     static_cast<unsigned long long>(peer[4]), static_cast<unsigned long long>(peer[5]),
+                     peer[0] != 0U ? "auto" : "off", static_cast<unsigned long long>(peer[1]));
+    return r;
+}
+
 // The row-split prefill of two ranks gives each 8-row window to one rank alternately: a run needs more than 8 rows so
 // that each rank has a row. Shorter prompts take the rows path; pieces and resume points leave at least this many rows.
 constexpr std::uint32_t kMinRows = 9U;
@@ -625,7 +656,15 @@ strix::deepseek41::PrefillOptions slot_prefill_options(const Args& a, BatchForwa
     o.shared_weights = fwd.file_form_weights();
     o.expert_tp = strix::ds41::expert_tp::enabled_from_env();  // the batch forward's expert TP (dup layout)
     if (!a.dspark.empty()) o.draft_rows = a.dspark_seed_rows;  // the drafter's seed (both ranks hold it)
-    if (const auto gp = prefill_group_policy(); gp.storage_rows(a.context) >= kMinRows) {
+    // DAYAUDIT 6: no group storage (device states and their budget) when the options the prefill resolves (the FAST
+    // profile, the one resolver strix/ds41_fast_profile.hpp) take no group pass: group_capacity() would refuse them
+    auto resolved = o;
+    resolved.fast_attention = resolved.fast_attention || strix::ds41::fast_profile::attention_on();
+    resolved.fast_attention_flash = resolved.fast_attention_flash || strix::ds41::fast_profile::attention_flash();
+    resolved.fast_dense = resolved.fast_dense || strix::ds41::fast_profile::dense_on();
+    resolved.fast_moe = resolved.fast_moe || strix::ds41::fast_profile::moe_on();
+    if (const auto gp = prefill_group_policy();
+        gp.storage_rows(a.context) >= kMinRows && strix::deepseek41::DevicePrefill::group_options_supported(resolved)) {
         o.group_members = gp.max_members;
         o.group_rows = gp.storage_rows(a.context);
     }
@@ -1579,6 +1618,7 @@ void follow(const Args& initial, BatchForward& fwd, Watchdog& dog, const Prefill
     ready.set("rank", serve::Json(1));
     ready.set("group_id", serve::Json(a.group_id));
     ready.set("epoch", serve::Json(a.epoch));
+    if (prefill) (void)pair_group_agreement(fwd, prefill_group_policy(), prefill->group_capacity());
     if (prefill) prefill->reconcile(fwd, 1U);
     warm_up(a, fwd, prefill, stage, dog, 1U);
     event(ready);
@@ -2159,7 +2199,7 @@ void lead(const Args& initial, BatchForward& fwd, strix::dist::Communicator& com
     agree_session_startup(a, fwd, sessions);
     dog.pause(false);
     const auto sched = strix::deepseek41::sched::options_from_env(a.device_prefill);  // STRIX_DS41_SERVE_SCHED (device: interleave unless =off)
-    const auto group_policy = prefill_group_policy();  // STRIX_SERVE_PREFILL_GROUP (serving-only, family default auto), resolved once
+    const auto group_policy_own = prefill_group_policy();  // STRIX_SERVE_PREFILL_GROUP (serving-only, family default auto), resolved once
     if (sched.mode != strix::deepseek41::sched::Mode::off) {
         if (!a.device_prefill) throw std::invalid_argument("STRIX_DS41_SERVE_SCHED needs --prefill-path device");
         std::fprintf(stderr, "sched: %s (starvation %.1f s, T_dev = %.3f + %.5f P s, unit %u rows, budget %u units / %.0f ms, MoE chunk %u, tasks from %u rows)\n", strix::deepseek41::sched::mode_name(sched.mode),
@@ -2200,7 +2240,10 @@ void lead(const Args& initial, BatchForward& fwd, strix::dist::Communicator& com
     }
     const auto prefill_owner = make_prefill(a.prefill_rows);  // after the drafter (follow() does the same)
     SlotPrefill* const prefill = prefill_owner.get();
-    const auto group_capacity = prefill ? prefill->group_capacity() : serve::PrefillGroupCapacity{0U};
+    const auto group_pair = prefill ? pair_group_agreement(fwd, group_policy_own, prefill->group_capacity())
+                                    : serve::PrefillGroupAgreement{group_policy_own, serve::PrefillGroupCapacity{0U}};
+    const auto& group_policy = group_pair.policy;
+    const auto& group_capacity = group_pair.capacity;
     const char* const group_mode = group_policy.groups() && group_capacity.members >= 2U ? "auto" : "off";
     const char* const group_reason = !group_policy.groups() ? "policy-solo" :
         prefill ? group_capacity.reason : "no-device-prefill";
@@ -2369,6 +2412,7 @@ void lead(const Args& initial, BatchForward& fwd, strix::dist::Communicator& com
         pf.set("prefill_tokens", serve::Json(st.prefill_tokens));
         pf.set("cached_tokens", serve::Json(st.cached_tokens));
         pf.set("prefill_seconds", serve::Json(st.prefill_seconds));
+        if (!a.continuation_decline.empty()) pf.set("prefix_cache_declined", serve::Json(a.continuation_decline));
         if (a.prefix_cache_mb != 0U) {
             const auto& cs = st.cache;
             serve::Json pc = serve::Json::object();
@@ -2819,7 +2863,7 @@ void lead(const Args& initial, BatchForward& fwd, strix::dist::Communicator& com
         const std::uint32_t slot = free_slots.back();
         std::uint32_t want = 0;
         if (a.pool != 0U) {
-            want = static_cast<std::uint32_t>(std::min<std::uint64_t>(a.context, std::uint64_t{st.position} + j.reserve_tokens + 1U));
+            want = static_cast<std::uint32_t>(strix::serve::reservation_positions(pool_rule(a.context), st.position, j.reserve_tokens));
             if (!pool_reserve(slot, want)) {
                 res.status = 503;
                 res.error = "the KV pool has no room for the state";
@@ -3733,7 +3777,7 @@ void lead(const Args& initial, BatchForward& fwd, strix::dist::Communicator& com
                 }
                 if (free_slots.empty()) unpark_oldest();  // a parked state gives its slot to a request that needs one
                 if (a.pool != 0U) {  // room for the prompt and every token it may generate, or wait (FIFO)
-                    const auto want = static_cast<std::uint32_t>(std::min<std::uint64_t>(a.context, prompt.size() + std::uint64_t{request(*r).job.max_tokens} + 1U));
+                    const auto want = static_cast<std::uint32_t>(strix::serve::reservation_positions(pool_rule(a.context), prompt.size(), request(*r).job.max_tokens));
                     if (!pool_reserve(free_slots.back(), want)) {
                         if (want > a.pool) {  // never fits
                             serve::GenerationStats st;
@@ -3826,7 +3870,12 @@ void lead(const Args& initial, BatchForward& fwd, strix::dist::Communicator& com
                                 if (q->seq.prompt.empty() || q->seq.prompt.size() >= sched.min_rows || runtime.ticket_cancelled(q->owner)) continue;
                                 if (prefill->has_cache() && q->seq.prompt.size() >= a.prefix_block) continue;
                                 const auto rows = static_cast<std::uint32_t>(q->seq.prompt.size());
-                                cands.push_back({i, rows, i, prefill->route_class(rows)});
+                                // DAYAUDIT 3: the group message carries no EmbedFrame and GroupMember no embeddings
+                                const bool image = request(*q).job.embeds != nullptr;
+                                static bool group_image_noted = false;  // the image decline is printed once (one serving loop per process)
+                                if (image && !std::exchange(group_image_noted, true))
+                                    std::fprintf(stderr, "prefill group: %s (such a prompt runs alone)\n", serve::kGroupImageDecline);
+                                cands.push_back({i, rows, i, prefill->route_class(rows), image});
                             }
                             const bool decoding = std::any_of(running.begin(), running.end(), [](const auto& q) { return !q->device_prefill; });
                             const double gap_ms = std::chrono::duration<double, std::milli>(Clock::now() - decode_gap_from).count();

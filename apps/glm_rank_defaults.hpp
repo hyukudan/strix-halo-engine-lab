@@ -8,6 +8,7 @@
 // --baseline / STRIX_GLM_BASELINE=1 restores the old path of every item (except where noted) unless that item is set
 // explicitly; a default whose precondition fails falls back with one notice line (prefill auto at world 1, see the app).
 #pragma once
+#include <strix/weight/family.hpp>
 
 #include "glm_model_facts.hpp"
 #include "glm/engine/glm_kvshard_layout.hpp"
@@ -236,6 +237,7 @@ struct Effective {
     std::uint32_t world = 2;
     bool kv_shard = false, kv_shard_auto = false;
     Value identity, prefill_requested, mtp, mtp_spec, spec, decode_xch, max_rows;
+    Value prefill_units;  // STRIX_GLM_SERVE_PREFILL_UNITS (serving-only)
     ModelFacts head;
     bool mtp_spec_candidate = false;
     unsigned kmax = 3;
@@ -243,12 +245,14 @@ struct Effective {
     std::string prefill;  // resolved: gemv | ref | wmma
     std::string xch;
     std::map<std::string, Value> env;  // env name -> effective value
+    std::shared_ptr<const strix::weight::FamilyPlans> weight_plans{};
 };
 
 inline Effective resolve(const Request& r, const EnvGet& env, const ModelFacts& facts = {}) {
     Effective e;
     e.baseline = baseline_requested(r, env);
-    if (r.product.profile || r.product.allow_pending) {
+    if (r.product.profile || r.product.allow_pending ||
+        strix::profile::turbo::has_weight_request(r.product.weights, env)) {
         auto inputs = r.product;
         inputs.env = env;
         e.product = strix::profile::resolve(product_profile_engine, inputs);
@@ -292,6 +296,16 @@ inline Effective resolve(const Request& r, const EnvGet& env, const ModelFacts& 
     if (r.prefill) e.prefill_requested = {*r.prefill, "explicit"};
     else if (const char* v = env("STRIX_GLM_PREFILL")) e.prefill_requested = {v, "explicit"};
     else e.prefill_requested = {e.baseline ? "ref" : "auto", src_b};
+    // Prefill units (serving-only): a long MTP prompt admitted beside decoding requests pauses at layer boundaries of
+    // its max_rows pieces instead of being cut into token chunks. Default on (exact: the idle run's pieces and kernels;
+    // FAST 8K beside one stream TTFT 15.20 -> 10.83 s, 3 runs per arm); 0 restores the token chunks.
+    if (const char* v = env("STRIX_GLM_SERVE_PREFILL_UNITS")) {
+        const std::string s = v;
+        if (s != "0" && s != "1") throw std::invalid_argument("STRIX_GLM_SERVE_PREFILL_UNITS must be 0 or 1");
+        e.prefill_units = {s, "explicit"};
+    } else {
+        e.prefill_units = {"1", "default"};
+    }
     // decode Xfer exchange: STRIX_GLM_DECODE_XCH overrides --decode-xch (engine rule)
     if (const char* v = env("STRIX_GLM_DECODE_XCH")) e.decode_xch = {v, "explicit"};
     else if (r.decode_xch) e.decode_xch = {*r.decode_xch, "explicit"};
@@ -346,10 +360,10 @@ inline bool max_rows_auto(const Effective& e) {
     return e.max_rows.source == "auto-8192" || e.max_rows.source == "auto-4096-memory";
 }
 
-// The serve entry point (strix-glm5-serve) resolves the SAME request as the CLI through scan / resolve above. These two
-// functions are everything serving changes, so the parity gate (tests/serve_cli_parity_tests.cpp) sees exactly what the
-// server runs: the speculation opt-out is forwarded as "--mtp-spec 0", and an automatic exchange-row choice starts at the
-// fallback (the server has no startup handshake that could size the larger one).
+// The serve entry point (strix-glm5-serve) resolves the SAME request as the CLI through scan / resolve above. This
+// function is everything serving changes, so the parity gate (tests/serve_cli_parity_tests.cpp) sees exactly what the
+// server runs: a normal decode, and the speculation opt-out forwarded as "--mtp-spec 0". Automatic max-rows is admitted
+// at load by the same function as the CLI (glm_auto_rows.hpp admit_auto_rows).
 inline std::vector<std::string> serve_request_args(std::vector<std::string> rank_args, bool serve_mtp) {
     rank_args.insert(rank_args.end(), {"--decode", "1"});
     if (!serve_mtp) {
@@ -358,15 +372,9 @@ inline std::vector<std::string> serve_request_args(std::vector<std::string> rank
     }
     return rank_args;
 }
-inline void serve_adjust(Effective& e) {
-    if (max_rows_auto(e)) e.max_rows = {std::to_string(kFallbackMaxRows), "auto-4096-serve"};
-}
 inline Effective resolve_serve(const std::vector<std::string>& rank_args, bool serve_mtp,
                                const EnvGet& env, const ModelFacts& facts = {}) {
-    auto e = resolve(scan(serve_request_args(rank_args, serve_mtp)), env, facts);
-    // Serving always resolves a normal decode; its fixed row fallback replaces startup admission.
-    serve_adjust(e);
-    return e;
+    return resolve(scan(serve_request_args(rank_args, serve_mtp)), env, facts);
 }
 
 // The predicate dry-runs the load and prefill admissions, including their current margins.
@@ -428,6 +436,9 @@ inline std::string print(const Effective& e) {
     s += "effective capacity-layout=" + std::string(layout.sharded ? "sharded" : "replicated") +
         "/" + (layout.routed ? "routed" : "full") + "/qwin=" + std::to_string(layout.query_window) +
         " (initial candidate; admission and rank vote pending; capacity_layout_reason=" + pf::capacity_layout_reason(layout) + ")\n";
+    s += "effective prefill-units=" + e.prefill_units.value + " (" + e.prefill_units.source +
+         "; serving-only: a long prompt beside decoding requests pauses at layer boundaries of its max_rows pieces, "
+         "8 decode rows reserved above max_rows; the CLI has no decode cohort and prefills whole prompts)\n";
     line("decode-xch", e.decode_xch);
     line("max-rows", e.max_rows);
     if (max_rows_auto(e)) s += "effective max-rows-admission=startup-admission-and-rank-min (8192 candidate, 4096 fallback)\n";
@@ -445,6 +456,7 @@ inline std::string print(const Effective& e) {
         }
         s += std::string("effective env ") + it.env + "=" + v.value + " (" + v.source + ", item " + it.name + resolved + ")\n";
     }
+    s += strix::weight::family_plan_notice(e.weight_plans);
     if (e.product) s += e.product->describe();
     return s;
 }

@@ -1,7 +1,7 @@
-// Bit-exact tests of the CUDA Qwen PLE step and MTP cache rows (src/cuda/qwen_plemtp.cu) against literal host
+// Bit-exact tests of the CUDA Qwen PLE step and MTP cache rows (src/cuda/models/qwen/qwen_plemtp.cu) against literal host
 // references of the HIP kernels and, for the host PLE code, against the engine's own C++ (src/ple_lookup.cpp).
 //   qwen_plemtp_tests [--tables DIR] [--gguf PATH] [--fixture DIR]
-// Build: tests\cuda\build_qwen_test.bat <wt> qwen_plemtp_tests <out> <wt>\src\cuda\qwen_plemtp.cu <wt>\src\ple_lookup.cpp
+// Build: tests\cuda\build_qwen_test.bat <wt> qwen_plemtp_tests <out> <wt>\src\cuda\models\qwen\qwen_plemtp.cu <wt>\src\ple_lookup.cpp
 //        <wt>\src\model_contract.cpp <wt>\src\iq4_nl.cpp <wt>\src\model_runtime_binding.cpp
 //        <wt>\tests\cuda\qwen_ple_lookup_link_stubs.cpp
 #include <cuda_runtime.h>
@@ -17,12 +17,12 @@
 #include <string>
 #include <vector>
 
-#include "strix/cuda_qwen_plemtp.hpp"
+#include "strix/cuda/qwen_plemtp.hpp"
 #include "strix/iq4_nl.hpp"
 #include "strix/model_manifest.hpp"
 #include "strix/model_runtime_binding.hpp"
 #include "strix/ple_lookup.hpp"
-#include "qwen_amd_math_tables.hpp"
+#include "strix/cuda/amd_math_tables.hpp"
 #include "qwen_fixture.hpp"
 #include "qwen_gguf_host.hpp"
 
@@ -464,7 +464,7 @@ static void test_ple_tail(const std::string& gguf_path) {
 
 // ---------------------------------------------------------------------------------------------------------------
 // ---------------------------------------------------------------------------------------------------------------
-// MTP cache rows: literal host references of every HIP kernel of one primed row (see src/cuda/qwen_plemtp.cu).
+// MTP cache rows: literal host references of every HIP kernel of one primed row (see src/cuda/models/qwen/qwen_plemtp.cu).
 static std::uint16_t f2bf_quiet(float x) {
     const auto b = fbits(x);
     if ((b & 0x7f800000U) == 0x7f800000U && (b & 0x007fffffU)) return static_cast<std::uint16_t>((b >> 16U) | 0x0040U);

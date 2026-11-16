@@ -509,9 +509,10 @@ int main(int argc, char** argv) {
             for (auto& ev : pe) hok(hipEventCreate(&ev), "ev");
             // Paired stage timings, independent of environment selection. Run with
             // 2048 0 2048 6144 2048 30720 to cover the three qualification positions.
-            // o-bar v10 (default exact) vs the FAST fused attn-wmma core (21: T = 16), gemm v3 on both, order reversed every rep.
-            constexpr unsigned kArms = 2;
-            const unsigned sv[kArms] = {7, 7}, ov[kArms] = {10, 21}, gv[kArms] = {3, 3};
+            // o-bar v10 (default exact) vs the FAST fused attn-wmma core (21: T = 16; 23: T = 16 on the bf16 q-tilde image),
+            // gemm v3 on all, order reversed every rep.
+            constexpr unsigned kArms = 3;
+            const unsigned sv[kArms] = {7, 7, 7}, ov[kArms] = {10, 21, 23}, gv[kArms] = {3, 3, 3};
             float stage_us[kArms][3][5]{};
             for (unsigned rep = 0; rep < 4; ++rep) {
                 // Alternate pair order to limit systematic warm-cache/clock bias.
@@ -555,7 +556,7 @@ int main(int argc, char** argv) {
             for (auto& ev : pe) hok(hipEventDestroy(ev), "ev");
             // FAST fused core vs the exact v10 path on the same inputs: o-bar and MLA output rel L2 / max |d| / cosine.
             const std::size_t nob = static_cast<std::size_t>(C) * kHeadsR * kKvLora, nmo = static_cast<std::size_t>(C) * kHeadsR * kMlaDim;
-            std::vector<float> ob_ref(nob), mo_ref(nmo), ob_f(nob), mo_f(nmo);
+            std::vector<float> ob_ref(nob), mo_ref(nmo), ob_f(nob), mo_f(nmo), ob_q32, mo_q32;
             P::mla_attention_rows_versions(slot, tok, n, qb, kv_b, kHeadsR, qt, e, ob, mo, C, g_hs, 7, 10, 3);
             hok(hipMemcpyAsync(ob_ref.data(), ob, nob * 4, hipMemcpyDeviceToHost, g_hs), "cp");
             hok(hipMemcpyAsync(mo_ref.data(), mo, nmo * 4, hipMemcpyDeviceToHost, g_hs), "cp");
@@ -582,6 +583,22 @@ int main(int argc, char** argv) {
                 hok(hipStreamSynchronize(g_hs), "sync");
                 cmp(ob_ref, ob_f, "o-bar", ov[f] * 10 + gv[f]);
                 cmp(mo_ref, mo_f, "out", ov[f] * 10 + gv[f]);
+                if (f == 1) {  // FP32 q-tilde arm: the bf16-image arm (f 2) must reproduce it bit for bit
+                    ob_q32 = ob_f;
+                    mo_q32 = mo_f;
+                } else if (f == 2) {
+                    const bool same = std::memcmp(ob_q32.data(), ob_f.data(), nob * 4) == 0 && std::memcmp(mo_q32.data(), mo_f.data(), nmo * 4) == 0;
+                    std::printf("   MLA attn-wmma bf16 q-tilde image (23) vs FP32 q-tilde (21): o-bar + out bitwise %s\n", same ? "equal" : "DIFFER");
+                    if (!same) {
+                        const auto require_equal = [](const std::vector<float>& ref, const std::vector<float>& got, const char* tensor) {
+                            for (std::size_t i = 0; i < ref.size(); ++i)
+                                if (std::memcmp(&ref[i], &got[i], sizeof(float)) != 0)
+                                    die("MLA arm 23 vs 21: " + std::string(tensor) + " differs at index " + std::to_string(i));
+                        };
+                        require_equal(ob_q32, ob_f, "o-bar");
+                        require_equal(mo_q32, mo_f, "out");
+                    }
+                }
             }
         }
         std::printf("== C=%u t0=%u (DSA rows see P up to %u pools, n up to %u tokens); passes bitwise equal: %s\n", C, t0, cap / kKpool,
