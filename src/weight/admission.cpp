@@ -54,7 +54,8 @@ Status normalise(const Registry& registry,const TensorIndex& index,const RawTens
         w.sidecars.push_back({"tensor_scale",Scalar::f32,tensor->shape,tensor->payload});
         w.parameters.bits=4;w.parameters.group_size=16;
         w.parameters.scale_encoding="e4m3fn";w.parameters.transform.clear();
-        w.has_byte_strides=true;w.byte_strides={raw.shape.dims[1],0,0,0};
+        // Packed nibbles use descriptor addressing, never scalar byte strides.
+        w.has_byte_strides=false;
     }else if(params.transform=="block.e4m3-e8m0.32x32@1") {
         if(raw.wire_dtype!="F8_E4M3" || raw.shape.rank!=2 || raw.shape.dims[0]%32 || raw.shape.dims[1]%32 || !raw.name.ends_with(".weight"))return {Error::malformed,"invalid native FP8 weight schema"};
         const auto* scale=named(index,raw.name.substr(0,raw.name.size()-7)+".scale");

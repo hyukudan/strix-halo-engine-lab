@@ -46,8 +46,7 @@ Status bind_model(const TensorIndex& index,const FamilySchema& schema,WeightMap&
         const bool standalone=std::any_of(schema.roles.begin(),schema.roles.end(),[&](const auto& p){return p.standalone && raw.name.find(p.pattern)!=std::string::npos;});
         const bool fp4_codes=nvfp4 && raw.name.ends_with(".codes");
         if(nvfp4 && (raw.name.ends_with(".block_scales") || raw.name.ends_with(".tensor_scale"))) {
-            const auto suffix=raw.name.ends_with(".block_scales")?13u:13u;
-            if(!named(index,raw.name.substr(0,raw.name.size()-suffix)+".codes"))
+            if(!named(index,raw.name.substr(0,raw.name.size()-13)+".codes"))
                 return {Error::malformed,"orphan canonical NVFP4 scale sidecar"};
             continue;
         }
@@ -61,6 +60,8 @@ Status bind_model(const TensorIndex& index,const FamilySchema& schema,WeightMap&
         if(expert){if(raw.shape.rank>2)b.expert_axis=0;if(b.role==Role::dense_gate)b.role=Role::expert_gate;if(b.role==Role::dense_up)b.role=Role::expert_up;if(b.role==Role::dense_down)b.role=Role::expert_down;}
         Parameters p{};
         if(fp4_codes) {
+            if(named(index,raw.name.substr(0,raw.name.size()-6)))
+                return {Error::malformed,"duplicate plain and native FP4 logical tensor"};
             if(expert || b.role==Role::embedding || b.role==Role::lookup_row || b.role==Role::router ||
                b.role==Role::norm || b.role==Role::bias || b.role==Role::auxiliary)
                 return {Error::unsupported_role,"native NVFP4 schema requires a dense matrix role"};

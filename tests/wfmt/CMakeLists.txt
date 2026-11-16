@@ -12,6 +12,10 @@ add_executable(strix-wfmt-host-tests main.cpp contracts.cpp census.cpp compare.c
     ${WFMT_ROOT}/src/vision/gguf_weights.cpp
     ${WFMT_ROOT}/src/gemma4/model/safetensors.cpp)
 target_link_libraries(strix-wfmt-host-tests PRIVATE strix-weight)
+add_executable(strix-wfmt-nvfp4-admission-tests nvfp4_admission.cpp)
+target_compile_definitions(strix-wfmt-nvfp4-admission-tests PRIVATE STRIX_WFMT_NVFP4_STANDALONE)
+target_link_libraries(strix-wfmt-nvfp4-admission-tests PRIVATE strix-weight)
+add_test(NAME wfmt.nvfp4-admission COMMAND strix-wfmt-nvfp4-admission-tests)
 target_include_directories(strix-wfmt-host-tests PRIVATE ${WFMT_ROOT}/src ${WFMT_ROOT}/apps)
 target_compile_definitions(strix-wfmt-host-tests PRIVATE STRIX_WFMT_SOURCE_DIR="${WFMT_ROOT}")
 if(MSVC)
