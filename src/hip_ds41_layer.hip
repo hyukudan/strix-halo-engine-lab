@@ -2271,7 +2271,8 @@ void enqueue_hc_site(const HcSiteView& v, void* stream) {
     // read tile 2): 4096 rows 5.22 -> 4.80, 1024 1.348 -> 1.242, 256 0.351 -> 0.341; one read at tile 4 loses at 256 rows
     // (0.380) and gains less above (4.98 at 4096); below 256 rows not measured, so the previous form stays there.
     static const bool once_env = strix::envcfg::flag("STRIX_DS41_HC_COLLAPSE_ONCE", true);
-    const bool once = v.collapse_once == 2 || (v.collapse_once == 0 && once_env && v.rows >= hc_collapse_once_min_rows);
+    const auto collapse_route = hc_collapse_route(v, once_env);
+    const bool once = collapse_route.once;
     const bool one = v.launches == 1 ||
                      (v.launches == 0 && v.rows <= (fast ? hc_site_fast_one_launch_rows : hc_site_one_launch_rows));
     if (!one) {
@@ -2304,7 +2305,7 @@ void enqueue_hc_site(const HcSiteView& v, void* stream) {
         part = part < norm_chunks ? part : norm_chunks;
         const unsigned tiles = (v.rows + g - 1U) / g;
         if (v.collapse_out) {  // one block per hidden chunk (every copy) and tile of at most 4 rows (8: ~100 VGPRs spilled)
-            const unsigned cap = once ? 2U : 4U, gc = g < cap ? g : cap, ctiles = (v.rows + gc - 1U) / gc;
+            const unsigned gc = collapse_route.tile, ctiles = (v.rows + gc - 1U) / gc;
             const auto kernel = once ? (gc == 1 ? hc_site_collapse_kernel<1, true> : hc_site_collapse_kernel<2, true>)
                                      : (gc == 1 ? hc_site_collapse_kernel<1> : gc == 2 ? hc_site_collapse_kernel<2> : hc_site_collapse_kernel<4>);
             hipLaunchKernelGGL(kernel, dim3(mix_chunks / hc_copies * ctiles), dim3(site_threads), 0, as_stream(stream), v, mix_chunks);

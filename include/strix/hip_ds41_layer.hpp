@@ -96,6 +96,18 @@ struct HcSiteView {
     std::uint32_t collapse_once = 0;
 };
 inline constexpr std::uint32_t hc_collapse_once_min_rows = 256;  // smallest measured row count where one read wins
+struct HcCollapseRoute {
+    bool once;
+    std::uint32_t tile;
+};
+// Scheduling selector for the admitted fast collapse site; environment policy is supplied by the caller.
+[[nodiscard]] constexpr HcCollapseRoute hc_collapse_route(const HcSiteView& v, bool once_enabled) {
+    const bool once = v.collapse_once == 2 ||
+                      (v.collapse_once == 0 && once_enabled && v.rows >= hc_collapse_once_min_rows);
+    const auto tile = v.tile ? v.tile : v.rows == 1 ? 1U : v.rows == 2 ? 2U : 4U;
+    const auto cap = once ? 2U : 4U;
+    return {once, tile < cap ? tile : cap};
+}
 inline constexpr std::uint32_t hc_site_one_launch_rows = 4;  // previous kernel, measured: one launch wins at 1-4 rows, loses at 8
 inline constexpr std::uint32_t hc_site_fast_one_launch_rows = 8;  // fast kernel
 [[nodiscard]] std::size_t hc_site_counter_count(std::uint32_t rows);

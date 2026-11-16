@@ -308,7 +308,7 @@ void bench_hc_site(std::mt19937& rng, int iterations) {
 // The prefill site with the collapse (HcSiteView::collapse_out) at prefill row counts: each collapse tile (4, 2, 1)
 // against tile 4 bitwise, in rounds (ABAB), beside the bytes it must move (stream and sub in, stream and collapse out)
 // and a device-to-device copy of the stream as the reachable bandwidth. STRIX_DS41_HC_COLLAPSE_BENCH=1, _ROWS (4096).
-void bench_hc_collapse(std::mt19937& rng, int iterations) {
+bool bench_hc_collapse(std::mt19937& rng, int iterations) {
     constexpr std::uint32_t H = 5120, n = H * hc_copies;
     const char* rows_env = std::getenv("STRIX_DS41_HC_COLLAPSE_BENCH_ROWS");
     const auto R = static_cast<std::uint32_t>(rows_env ? std::stoul(rows_env) : 4096UL);
@@ -358,6 +358,8 @@ void bench_hc_collapse(std::mt19937& rng, int iterations) {
     enqueue_hc_site(view(4, 1), nullptr);  // reference: the previous form, tile 4
     const auto ref = outputs();
     const double bytes = static_cast<double>(R) * (2.0 * n + 2.0 * H) * 4.0;
+    bool form_exact[2][3] = {{true, true, true}, {true, true, true}};
+    bool all_exact = true;
     for (int round = 0; round < 3; ++round) {
         for (const std::uint32_t once : {1U, 2U})
         for (const std::uint32_t tile : {4U, 2U, 1U}) {
@@ -366,8 +368,12 @@ void bench_hc_collapse(std::mt19937& rng, int iterations) {
             check(hipMemset(cout, 0, std::size_t{R} * H * 4), "clear");
             check(hipMemset(mixes, 0, R * sizeof(HcMix)), "clear");
             enqueue_hc_site(view(tile, once), nullptr);
-            const bool exact = round > 0 || outputs() == ref;
+            const bool launch_exact = outputs() == ref;
             const double ms = time_ms(iterations, [&](int) { enqueue_hc_site(view(tile, once), nullptr); });
+            const bool repeated_exact = outputs() == ref;
+            bool& exact = form_exact[once - 1U][tile / 2U];
+            exact = exact && launch_exact && repeated_exact;
+            all_exact = all_exact && exact;
             std::printf("{\"kernel\":\"hc-collapse\",\"round\":%d,\"rows\":%u,\"once\":%u,\"tile\":%u,\"ms\":%.4f,\"gbps\":%.1f,\"exact\":%s}\n",
                         round, R, once == 2 ? 1U : 0U, tile, ms, bytes / ms * 1e-6, exact ? "true" : "false");
         }
@@ -381,6 +387,7 @@ void bench_hc_collapse(std::mt19937& rng, int iterations) {
                     static_cast<void*>(dsub), static_cast<void*>(dem), static_cast<void*>(st), static_cast<void*>(partial),
                     static_cast<void*>(counters), static_cast<void*>(mixes), static_cast<void*>(cout)})
         (void)hipFree(p);
+    return all_exact;
 }
 
 } // namespace
@@ -393,8 +400,7 @@ int main(int argc, char** argv) {
         return 0;
     }
     if (const char* b = std::getenv("STRIX_DS41_HC_COLLAPSE_BENCH"); b && b[0] == '1') {
-        bench_hc_collapse(rng, iterations);
-        return 0;
+        return bench_hc_collapse(rng, iterations) ? 0 : 1;
     }
     const Site sites[] = {
         {"attn_q_a 5120->1280", 5120, 1280, 1}, {"attn_q_b 1280->32768", 1280, 32768, 1},
