@@ -74,6 +74,28 @@ def compare(reference, arms):
                      for a in files if a != "E"}}
 
 
+def convert_first(prefix, ids_path, positions_path, out):
+    ids = inputs(ids_path)
+    positions = [int(x) for x in Path(positions_path).read_text().split()]
+    if not positions or positions != sorted(set(positions)) or positions[0] < 0 or positions[-1] >= len(ids) - 1:
+        raise ValueError("invalid selected positions")
+    if Path(out).exists():
+        raise ValueError("output exists")
+    paths = [Path(str(prefix) + "." + str(i)) for i in range(len(positions))]
+    rows = []
+    for path in paths:
+        if path.stat().st_size != 248320 * 4:
+            raise ValueError("first-logits row has wrong extent")
+        row = np.memmap(path, dtype="<f4", mode="r", shape=(248320,))
+        if not np.isfinite(row).all():
+            raise ValueError("nonfinite first logits")
+        rows.append(row)
+    spool.write(out, ids, positions, rows, version=2)
+    return {"source_sha256": [sha256_file(p) for p in paths], "ids_sha256": sha256_file(ids_path),
+            "positions_sha256": sha256_file(positions_path), "rows": len(rows),
+            "conditioning_contract": "request i consumed IDS[:positions[i]+1]; externally recorded request order required"}
+
+
 def receipt(args):
     frozen = mf.load(args.manifest)
     spec = frozen["arms"]["E" if args.arm == "Erep" else args.arm]
@@ -96,6 +118,8 @@ def receipt(args):
             "inputs_sha256": hashlib.sha256(header["inputs"].tobytes()).hexdigest(),
             "positions": header["positions"].tolist() if header["positions"] is not None else list(range(header["rows"])),
             "rows": header["rows"], "vocab": header["vocab"],
+            "effective_scope": "scalar teacher-forced decode after optional prefix; no drafts; full-vocabulary selected rows",
+            "context_input_tokens": len(header["inputs"]),
             "scope": "diagnostic; not a TURBO qualification receipt"}
 
 
@@ -108,6 +132,9 @@ def main():
     p = sub.add_parser("strata")
     p.add_argument("--raw", required=True); p.add_argument("--ids", required=True)
     p.add_argument("--stride", type=int, default=256); p.add_argument("--out", required=True)
+    p = sub.add_parser("strata-first")
+    for option in ("prefix", "ids", "positions", "out"):
+        p.add_argument("--" + option, required=True)
     p = sub.add_parser("compare")
     p.add_argument("--reference", required=True); p.add_argument("--arm", action="append", required=True)
     p.add_argument("--out", required=True)
@@ -118,8 +145,9 @@ def main():
     if args.command == "positions":
         Path(args.out).write_text("\n".join(map(str, selections(len(inputs(args.ids)), args.stride))) + "\n")
         return
-    if args.command == "strata":
-        result = convert(args.raw, args.ids, args.stride, args.out)
+    if args.command in ("strata", "strata-first"):
+        result = (convert(args.raw, args.ids, args.stride, args.out) if args.command == "strata"
+                  else convert_first(args.prefix, args.ids, args.positions, args.out))
         Path(str(args.out) + ".source.json").write_text(json.dumps(result, indent=2) + "\n")
     elif args.command == "compare":
         result = compare(args.reference, args.arm)

@@ -38,6 +38,24 @@ python scripts/bench/stratacmp/quality.py receipt --manifest frozen.json --arm E
 python -m unittest discover -s scripts/bench/stratacmp -p test_quality.py
 ```
 
+The native-pack route can bypass the CLI dump site. For that route, `strata-first.py` runs the engine's
+offline stdio serve protocol with `STRATA_DUMP_FIRST_LOGITS`, issues one `GEN 1` per frozen corpus selection
+at position p with exactly IDs `[0,p]`, and records each request hash, prompt length p+1 and true label
+IDs[p+1]. It uses GPU index 0, checks 20 GiB free RAM, disables prefix caches, suffix/lookup drafts, tail
+skipping and CPU prefill sharing, and retains all source rows. Run it inside an authorized GPU window:
+
+```sh
+python scripts/bench/stratacmp/strata-first.py --config strata.json --manifest frozen.json --corpus CORPUS --case CASE --out NEWDIR --timeout 120
+```
+
+The runner's timeout includes loading; size the selected case/window accordingly. It stops only its own
+child process. It rejects a changed corpus hash or selected-ID/position file. The output `logits.bin` is
+directly comparable with CUDA export for that exact corpus case and positions file. `index.json` binds the
+actual effective args and request order. The runner does not create/replace R or certify a statistical pass.
+`quality.py strata-first --prefix PREFIX --ids CASE.ids --positions CASE.positions --out strata.bin` also
+converts previously collected `PREFIX.0`, `PREFIX.1`, ... rows when their external request-order record
+proves this same conditioning contract.
+
 The converter drops the final prompt row because its next generated token is not a true corpus label.
 All earlier selected positions retain their true next-token label. It rejects wrong dimensions, incomplete
 payloads and nonfinite logits. Comparison reuses TURBO's full-vocabulary KL(E||arm), top-1 disagreement

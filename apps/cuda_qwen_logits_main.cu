@@ -25,8 +25,8 @@ template<class T> static void put(std::ofstream& f, T value) {
     f.write(reinterpret_cast<const char*>(&value), sizeof(value));
 }
 int main(int argc, char** argv) {
-    strix::device::bind_cuda_main(argc, argv);
     try {
+        strix::device::bind_cuda_main(argc, argv);
         if (argc != 9) throw std::invalid_argument("usage: strix-cuda-qwen-logits MODEL TABLES ROPE IDS POSITIONS CAP OUT BLOCK_ROWS (text uint IDs/positions; positions predict IDS[p+1])");
         const auto input = ids(argv[4]);
         std::ifstream pf(argv[5]);

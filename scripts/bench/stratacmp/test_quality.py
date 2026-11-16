@@ -9,6 +9,18 @@ import quality
 
 
 class QualityTests(unittest.TestCase):
+    def test_native_first_rows_preserve_positions(self):
+        with tempfile.TemporaryDirectory() as directory:
+            d = Path(directory)
+            (d / "ids").write_text("0 1 2 3")
+            (d / "positions").write_text("0 2")
+            for i in range(2):
+                np.full(248320, i, dtype="<f4").tofile(d / ("first." + str(i)))
+            quality.convert_first(d / "first", d / "ids", d / "positions", d / "out")
+            got = list(quality.spool.read(d / "out"))
+            self.assertEqual([r[0] for r in got], [0, 2])
+            self.assertEqual(got[1][3][17], 1)
+
     def test_spread_has_true_next_token(self):
         self.assertEqual(quality.selections(9, 3), [0, 3, 6])
         self.assertEqual(quality.selections(10, 3), [0, 3, 6])
