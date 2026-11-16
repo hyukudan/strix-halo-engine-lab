@@ -6,8 +6,16 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 
 namespace strix::vision::layout {
+
+struct ProjectorGeometry {
+    unsigned rows = 0, mh = 0, mw = 0, tokens = 0, in = 0;
+};
+ProjectorGeometry merge_geometry(unsigned grid_h, unsigned grid_w, unsigned ratio);
+ProjectorGeometry projector_geometry(const EncoderOutput&, unsigned grid_h, unsigned grid_w, const MergeProjector&,
+                                     const float* rows, bool resident = false);
 
 inline constexpr unsigned kGemmIn = 128;  // f16_dense_tall: in % 128 == 0
 inline constexpr unsigned kGemmOut = 16;  // 16 outputs per column tile
@@ -96,5 +104,9 @@ inline std::size_t weight_bytes(const EncoderConfig& c) {
     if (c.final_norm) b += 2U * aligned(std::size_t{c.width} * 4U);
     return b;
 }
+
+// fn(i0, i1) over [0, n) on up to hardware_concurrency threads (one thread under 2^18 units of work); for
+// elementwise passes, whose values cannot depend on the split. Defined in reference.cpp.
+void parallel_ranges(std::size_t n, std::size_t work_per_item, const std::function<void(std::size_t, std::size_t)>& fn);
 
 }  // namespace strix::vision::layout

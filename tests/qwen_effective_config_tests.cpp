@@ -364,6 +364,49 @@ void serve_prefill_admission_tests(const ModelContract& model, const ModelManife
         return resolve_effective_config(r,model,{},manifest,validated_model_content_identity,{true,true,true},m);
     };
     {
+        // qcq: an explicit host budget + strict L0 on the HTTP batch route resolves the solo suffix class (the
+        // scheduler the L0 gate below pins by env). No mode, capture, STRIX_BATCH_CACHE_SOLO=0, AUTO and the fixed
+        // route keep the incumbent scheduler. One resolver: the same options reach the bridge and the identity.
+        const Environment base{{"STRIX_BATCH_PROMPT_SMALL","0"}};
+        auto budget=args; budget.insert(budget.end(),{"--prefix-cache-host-bytes","4294967296"});
+        auto l0=budget; l0.insert(l0.end(),{"--prefix-batch-cert","l0"});
+        const auto solo=resolve({parse(l0),base},memory).options;
+        expect(solo.batch_cache_solo && solo.prefix_batch_cert==1 && solo.batch_cache_solo_reason=="l0-restore" &&
+            prefix_batch_cert_execution_mode(solo)==1,"qcq: explicit batch budget + L0 resolves the solo scheduler");
+        auto kept_env=requested_prefill_environment([](const char* name) -> const char* {
+            return std::string_view(name)=="STRIX_BATCH_CACHE_SOLO" || std::string_view(name)=="STRIX_BATCH_PROMPT_SMALL"
+                ? "0" : nullptr;
+        });
+        const auto kept=resolve({parse(l0),kept_env},memory).options;
+        expect(!kept.batch_cache_solo && kept.prefix_batch_cert==1 && kept.batch_cache_solo_reason=="STRIX_BATCH_CACHE_SOLO=0",
+            "qcq: STRIX_BATCH_CACHE_SOLO=0 keeps the incumbent scheduler");
+        auto capture=budget; capture.insert(capture.end(),{"--prefix-batch-cert","capture"});
+        const auto cap=resolve({parse(capture),base},memory).options;
+        expect(!cap.batch_cache_solo && cap.prefix_batch_cert==2 && cap.batch_cache_solo_reason=="no-l0-restore",
+            "qcq: capture-only mode keeps the incumbent scheduler");
+        const auto none=resolve({parse(budget),base},memory).options;
+        expect(!none.batch_cache_solo && none.prefix_batch_cert==0 && none.batch_cache_solo_reason=="no-l0-restore",
+            "qcq: explicit budget without a mode is unchanged");
+        const auto explicit_rows=resolve(request,memory).options;
+        expect(!explicit_rows.cache_activation->automatic_path && !explicit_rows.batch_cache_solo &&
+            explicit_rows.batch_cache_solo_reason=="no-l0-restore",
+            "qcq: explicit checkpoint rows without budget or L0 keep the incumbent scheduler");
+        // Even a zero checkpoint-row override selects explicit cache configuration.
+        auto auto_args=args;
+        const auto rows=std::find(auto_args.begin(),auto_args.end(),"--prefix-cache-block-rows");
+        if(rows==auto_args.end()||rows+1==auto_args.end())
+            throw std::runtime_error("qcq: AUTO fixture lost its --prefix-cache-block-rows pair");
+        auto_args.erase(rows,rows+2);
+        const auto automatic=resolve({parse(auto_args),base},memory).options;
+        expect(automatic.cache_activation->automatic_path && !automatic.batch_cache_solo &&
+            automatic.batch_cache_solo_reason=="automatic-unqualified",
+            "qcq: AUTO batch stays declined (no qualified batch row)");
+        auto fixed=budget; *(std::find(fixed.begin(),fixed.end(),"--http-batch")+1)="1";
+        const auto single=resolve({parse(fixed),base},memory).options;
+        expect(!single.batch_cache_solo && single.batch_cache_solo_reason=="not-batch",
+            "qcq: the fixed route is unchanged");
+    }
+    {
         // Server / CLI parity (strix/serve_cli_parity.hpp): the same request words through the ONE resolver, once as the
         // HTTP server (--http-serve --http-batch 2 and its prefix-cache block setting) and once as the CLI. Compare the
         // environment and the route fields projected below, with the listed field/family allowances. This is not
@@ -951,6 +994,21 @@ void serve_prefill_admission_tests(const ModelContract& model, const ModelManife
     geometric.context_tokens+=1024;
     expect(http_mtp_memory(geometric,model,{},manifest,{},gib_bytes,gib_bytes,4096).slot_host>mapped.slot_host,
         "native predictor pool follows context geometry");
+    {
+        auto ceiling=geometric;ceiling.context_tokens=131200;
+        ceiling.mtp.runtime_bytes=134217728;ceiling.mtp.runtime_automatic=false;
+        bool ceiling_refused=false;
+        try {(void)http_mtp_memory(ceiling,model,{},manifest,{},gib_bytes,gib_bytes,4096);}
+        catch(const std::runtime_error& e) {ceiling_refused=std::string_view(e.what()).find("runtime budget")!=std::string_view::npos;}
+        expect(ceiling_refused,"explicit 128 MiB ceiling refuses native long context before HTTP allocation");
+        ceiling.mtp.runtime_automatic=true;
+        const auto automatic=http_mtp_memory(ceiling,model,{},manifest,{},gib_bytes,gib_bytes,4096);
+        ceiling.mtp.runtime_automatic=false;
+        ceiling.mtp.runtime_bytes=mtp_payload::runtime(model,ceiling.context_tokens).retained;
+        const auto explicit_fit=http_mtp_memory(ceiling,model,{},manifest,{},gib_bytes,gib_bytes,4096);
+        expect(automatic.slot_host==explicit_fit.slot_host && automatic.slot_device==explicit_fit.slot_device,
+            "automatic and sufficient explicit budgets charge the same shared runtime geometry");
+    }
     // Real native owner geometry, independent of the synthetic arena sizes.
     auto owners=startup.options;
     owners.known_prefix_tail_rows.clear();

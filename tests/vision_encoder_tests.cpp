@@ -9,6 +9,8 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
+#include <limits>
 #include <numeric>
 #include <stdexcept>
 #include <string>
@@ -547,15 +549,218 @@ void test_encode_cached() {
     CHECK(throws([&] { splice_rows_host(embed.data(), 16, *first.rows, dst, bad, 1); }));
 }
 
+// The projector as the DeepSeek adapter computed it before the shared op (host unshuffle, linear, FP64 activation,
+// linear), kept verbatim as the oracle: DenseOps::merge_project must give the same bits.
+std::vector<float> old_projector(const EncoderOutput& h, unsigned gh, unsigned gw, const MergeProjector& m, DenseOps& dense) {
+    const unsigned R = m.ratio, W = h.width, mh = (gh + R - 1U) / R, mw = (gw + R - 1U) / R, tokens = mh * mw;
+    const std::size_t in = std::size_t{W} * R * R, P = m.w1.rows;
+    std::vector<float> merged(std::size_t{tokens} * in);
+    for (unsigned my = 0; my < mh; ++my)
+        for (unsigned mx = 0; mx < mw; ++mx) {
+            float* dst = &merged[(std::size_t{my} * mw + mx) * in];
+            for (unsigned dy = 0; dy < R; ++dy)
+                for (unsigned dx = 0; dx < R; ++dx) {
+                    if (my * R + dy >= gh || mx * R + dx >= gw) continue;
+                    const float* src = &h.hidden[(std::size_t{my * R + dy} * gw + mx * R + dx) * W];
+                    const unsigned slot = m.row_major ? dy * R + dx : dx * R + dy;
+                    for (unsigned c = 0; c < W; ++c) dst[std::size_t{c} * R * R + slot] = src[c];
+                }
+        }
+    std::vector<float> mid(std::size_t{tokens} * P), rows(std::size_t{tokens} * m.w2.rows);
+    dense.linear(m.w1, m.b1, merged.data(), tokens, mid.data());
+    for (float& v : mid) {
+        const double x = static_cast<double>(v);
+        switch (m.act) {
+            case Activation::gelu: v = static_cast<float>(0.5 * x * (1.0 + std::erf(x * 0.70710678118654752440))); break;
+            case Activation::gelu_tanh:
+                v = static_cast<float>(0.5 * x * (1.0 + std::tanh(0.79788456080286535588 * (x + 0.044715 * x * x * x))));
+                break;
+            case Activation::silu: v = static_cast<float>(x / (1.0 + std::exp(-x))); break;
+        }
+    }
+    dense.linear(m.w2, m.b2, mid.data(), tokens, rows.data());
+    return rows;
+}
+
+struct CountingDense final : DenseOps {
+    ReferenceEncoder* ref = nullptr;
+    int linears = 0;
+    void linear(const Tensor& w, const Tensor& b, const float* x, std::size_t rows, float* y) override {
+        ++linears;
+        ref->linear(w, b, x, rows, y);
+    }
+};
+
+void test_merge_project() {
+    EncoderConfig cfg = base_config();
+    Tower t = make_tower(cfg, 81, 12);
+    ReferenceEncoder ref(cfg, t.w);
+    vision_toy::Rng rng{82};
+    const unsigned W = 4, R = 3, P = 7, O = 5;
+    std::vector<float> w1(std::size_t{P} * W * R * R), b1(P), w2(std::size_t{O} * P), b2(O);
+    for (auto* v : {&w1, &b1, &w2, &b2})
+        for (float& x : *v) x = 2.0F * rng.next();
+    for (const unsigned gh : {5U, 6U})
+        for (const unsigned gw : {8U, 3U})
+            for (const bool row_major : {true, false})
+                for (const Activation act : {Activation::gelu, Activation::gelu_tanh, Activation::silu}) {
+                    EncoderOutput h;
+                    h.rows = gh * gw;
+                    h.width = W;
+                    h.hidden.resize(std::size_t{h.rows} * W);
+                    for (float& x : h.hidden) x = 3.0F * rng.next();
+                    MergeProjector m;
+                    m.ratio = R;
+                    m.row_major = row_major;
+                    m.act = act;
+                    m.w1 = Tensor{w1.data(), Tensor::Type::f32, P, std::size_t{W} * R * R};
+                    m.b1 = Tensor{b1.data(), Tensor::Type::f32, P, 1};
+                    m.w2 = Tensor{w2.data(), Tensor::Type::f32, O, P};
+                    m.b2 = Tensor{b2.data(), Tensor::Type::f32, O, 1};
+                    CountingDense dense;
+                    dense.ref = &ref;
+                    const std::vector<float> want = old_projector(h, gh, gw, m, dense);
+                    dense.linears = 0;
+                    std::vector<float> got(want.size(), -1.0F);
+                    dense.merge_project(h, gh, gw, m, got.data());
+                    CHECK(dense.linears == 2);
+                    CHECK(std::size_t{m.tokens(gh, gw)} * O == want.size());
+                    CHECK(std::memcmp(got.data(), want.data(), want.size() * 4U) == 0);  // bit for bit
+                    CHECK(throws([&] { dense.merge_project(h, gh + 1U, gw, m, got.data()); }));
+                }
+    CHECK(activate(Activation::gelu, 0.0F) == 0.0F && activate(Activation::silu, 0.0F) == 0.0F);
+    CHECK(throws([] {
+        MergeProjector z;
+        z.ratio = 0;
+        (void)z.tokens(3, 3);
+    }));
+}
+
+void test_merge_project_overflow() {
+    MergeProjector m;
+    // A failing old implementation stops here, before exercising its unsafe loops.
+    const bool rejects_wrap = throws([&] { (void)m.tokens(65536U, 65537U); });
+    CHECK(rejects_wrap);
+    if (!rejects_wrap) return;
+    EncoderOutput h;
+    h.rows = 65536U;
+    h.width = 1;
+    h.hidden.resize(h.rows);
+    float weight = 1.0F, output = 17.0F;
+    m.w1 = m.w2 = Tensor{&weight, Tensor::Type::f32, 1, 1};
+    CountingDense dense;
+    CHECK(throws([&] { dense.merge_project(h, 65536U, 65537U, m, &output); }));
+    // The resident HIP path calls the same validator without requiring host hidden storage.
+    CHECK(throws([&] { (void)layout::projector_geometry(h, 65536U, 65537U, m, &output, true); }));
+    CHECK(dense.linears == 0 && output == 17.0F);
+    constexpr unsigned max = std::numeric_limits<unsigned>::max();
+    m.ratio = 3;
+    CHECK(m.tokens(max - 1U, 1U) == max / 3U);  // ceil addition used to wrap
+    m.ratio = 2;
+    CHECK(throws([&] { (void)m.tokens(max, 1U); }));  // padded coordinate would wrap
+    m.ratio = max;
+    CHECK(throws([&] { (void)m.tokens(1U, 1U); }));  // ratio squared would wrap
+    m.ratio = 1;
+    CHECK(throws([&] { (void)m.tokens(0U, 1U); }));
+    h.rows = 1;
+    h.width = max;
+    m.ratio = 65535U;
+    CHECK(throws([&] { (void)layout::projector_geometry(h, 1U, 1U, m, &output, true); }));
+}
+
+void test_resident_owner() {
+    const std::shared_ptr<const void> a = std::make_shared<const char>(char{0}), b = std::make_shared<const char>(char{0});
+    EncoderOutput h;
+    h.device_epoch = 1;
+    h.device_owner = a;
+    CHECK(h.resident_for(a, 1));
+    CHECK(!h.resident_for(b, 1));
+    CHECK(!h.resident_for(a, 2));
+    h.device_epoch = 0;
+    CHECK(!h.resident_for(a, 0));
+    h.device_owner.reset();
+    CHECK(!h.resident_for({}, 0));
+}
+
+// prepare_backend: the projector linears and the workspace go through the backend hooks; without warm-up nothing is
+// encoded, with it the adapter's image path runs once (on the path encode_cached picks) and nothing is cached.
+struct RecordingBackend final : EncoderBackend {
+    ReferenceEncoder* ref = nullptr;
+    std::vector<const void*> prepared;
+    unsigned reserved_rows = 0, reserved_tiles = 0;
+    int encodes = 0, resident_encodes = 0;
+    EncoderOutput encode(const PatchGrid& g, const PositionInputs& p) override {
+        ++encodes;
+        return ref->encode(g, p);
+    }
+    EncoderOutput encode_for_projection(const PatchGrid& g, const PositionInputs& p) override {
+        ++resident_encodes;
+        return ref->encode(g, p);
+    }
+    void linear(const Tensor& w, const Tensor& b, const float* x, std::size_t rows, float* y) override { ref->linear(w, b, x, rows, y); }
+    void prepare_linear(const Tensor& w, const Tensor&) override { prepared.push_back(w.data); }
+    void reserve(unsigned rows, unsigned tiles) override {
+        reserved_rows = rows;
+        reserved_tiles = tiles;
+    }
+    const char* arithmetic() const override { return "recording"; }
+};
+
+class PreparedAdapter final : public VisionAdapter {
+public:
+    PreparedAdapter(Tower& t, bool resident) : toy_(t), tower_(t), resident_(resident) {}
+    EncoderConfig config() const override { return toy_.config(); }
+    std::string identity() const override { return toy_.identity(); }
+    ResizeRule resize() const override { return toy_.resize(); }
+    PatchGrid patches(const Image&) const override { return make_grid(tower_.cfg, 2, 3, 91); }
+    void bind(WeightSource& s, EncoderWeights& w) override { toy_.bind(s, w); }
+    void project(EncoderOutput& h, const PatchGrid& g, DenseOps& d, ProjectedRows& o) override { toy_.project(h, g, d, o); }
+    SpanLayout layout(const PatchGrid& g) const override { return toy_.layout(g); }
+    std::vector<std::pair<Tensor, Tensor>> projector_linears() const override {
+        return {{Tensor{tower_.projector.data(), Tensor::Type::f32, tower_.projector_out, tower_.cfg.width}, Tensor{}}};
+    }
+    unsigned max_encoder_rows() const override { return 77; }
+    bool device_resident_hidden() const override { return resident_; }
+
+private:
+    ToyAdapter toy_;
+    Tower& tower_;
+    bool resident_;
+};
+
+void test_prepare_backend() {
+    EncoderConfig cfg = base_config();
+    Tower t = make_tower(cfg, 93, 12);
+    ReferenceEncoder ref(cfg, t.w);
+    for (const bool resident : {false, true}) {
+        PreparedAdapter adapter(t, resident);
+        RecordingBackend backend;
+        backend.ref = &ref;
+        PrepareReport r = prepare_backend(adapter, backend, t.w, false);
+        CHECK(r.linears == 1 && backend.prepared.size() == 1 && backend.prepared[0] == t.projector.data());
+        CHECK(r.reserved_rows == 77 && backend.reserved_rows == 77 && backend.reserved_tiles == 1);
+        CHECK(backend.encodes == 0 && backend.resident_encodes == 0 && r.warmup_rows == 0);
+        r = prepare_backend(adapter, backend, t.w, true);
+        CHECK(r.warmup_rows == 6 && backend.encodes + backend.resident_encodes == 1);
+        CHECK((resident ? backend.resident_encodes : backend.encodes) == 1);
+    }
+}
+
 }  // namespace
 
-int main() {
+int main(int argc, char** argv) {
 #ifdef _MSC_VER
     _set_abort_behavior(0, _WRITE_ABORT_MSG | _CALL_REPORTFAULT);
     _CrtSetReportMode(_CRT_ASSERT, _CRTDBG_MODE_FILE);
     _CrtSetReportFile(_CRT_ASSERT, _CRTDBG_FILE_STDERR);
 #endif
     try {
+        if (argc == 3 && std::strcmp(argv[1], "--project-device") == 0) {
+            const bool device = std::strcmp(argv[2], "on") == 0;
+            CHECK(Encoder::project_device() == device);
+            CHECK(std::strcmp(Encoder::effective_arithmetic(), device ? "vision-f16-v1-project-device-f64-v1" : "vision-f16-v1") == 0);
+            return failures ? 1 : 0;
+        }
         test_bf16();
         test_validate();
         test_positions();
@@ -568,6 +773,10 @@ int main() {
         test_plan();
         test_cache();
         test_encode_cached();
+        test_merge_project();
+        test_merge_project_overflow();
+        test_resident_owner();
+        test_prepare_backend();
     } catch (const std::exception& e) {
         std::fprintf(stderr, "FAIL exception: %s\n", e.what());
         return 1;
