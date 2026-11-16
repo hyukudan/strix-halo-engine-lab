@@ -74,4 +74,12 @@ cudaError_t gdn_window_slots(const GdnDims& d, const GdnLayer& layer, const GdnS
 cudaError_t gdn_commit_slots(const GdnDims& d, const GdnCommitLayer* layers, std::uint32_t n, std::uint32_t groups,
                              const GdnSlotTable& t, const std::uint32_t* accept, bool partial, cudaStream_t stream);
 
+// PREFILL chunk of any `rows` (>= 1): bitwise the same state/outputs as running the rows through gdn_window windows of <= 32 and
+// committing them (conv: row-parallel kernel with the same per-row arithmetic; delta rule: the same sequential kernel over all
+// rows; conv state advanced to the chunk end). The delta result lands on the shadow side: call gdn_prefill_flip once after ALL
+// layers of the chunk ran (every layer reads the committed side). win.raw/qkv_c/a_raw/b_raw hold [rows][...] buffers.
+cudaError_t gdn_prefill_layer(const GdnDims& d, const GdnLayer& layer, const GdnState& state, const GdnWindow& win, const float* z,
+                              float* out, std::uint32_t rows, float eps, const std::uint32_t* parity_dev, cudaStream_t stream);
+cudaError_t gdn_prefill_flip(std::uint32_t* parity_dev, cudaStream_t stream);
+
 }  // namespace strix::cuda_core

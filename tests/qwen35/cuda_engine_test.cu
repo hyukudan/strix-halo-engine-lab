@@ -4,6 +4,7 @@
 //  3. MTP: rows in one call == rows one at a time
 // Home: specific (qwen35 engine test).
 #include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <random>
@@ -196,6 +197,54 @@ int main() {
             // copy_slot: a copy continues bitwise like the original
             E->copy_slot(3, 1);
             CHECK(E->slot_committed(3) == N, "copy_slot length");
+        }
+        // large-M prefill: exact policy == windowed serial decode (logits of the last prompt token and of 8 continuation tokens,
+        // which exercises the committed KV / GDN delta / conv state); flash policy is gated (finite, close, same top-1 mostly).
+        for (int pol = 0; pol < 3; ++pol) {
+            q::EngineOptions po = opt;
+            po.multi_gemv = true;
+            po.prefill_chunk = 128;  // 160 prompt tokens = one full chunk + a 32-row tail chunk
+            po.prefill_arith = pol == 0 ? q::PrefillArith::exact : pol == 1 ? q::PrefillArith::flash : q::PrefillArith::fast8;
+            q::Config pcfg = cfg;
+            pcfg.gdn_value_heads = 16;  // beta/alpha out = 16: serves the large-M path (out % 16 == 0)
+            auto P = q::CudaEngine::synthetic(pcfg, pack, po, 7);
+            CHECK(P->prefill_is_big(), "variant %d: large-M path enabled", var);
+            const std::size_t n = 160, extra = 8;
+            std::vector<std::uint32_t> t2(tok.begin(), tok.begin() + n);
+            for (std::size_t i = 0; i < extra; ++i) t2.push_back(rng() % 2048);
+            auto Ref = q::CudaEngine::synthetic(pcfg, pack, po, 7);
+            Rec sr;
+            run_serial(*Ref, t2, sr);
+            P->reset();
+            const auto o = P->prefill(t2.data(), static_cast<std::uint32_t>(n), q::LogitRows::last);
+            const auto& c2 = P->config();
+            std::vector<float> lp(c2.vocab);
+            P->read_logits(o, 0, lp.data());
+            std::vector<float> lref(sr.logits.begin() + (n - 1) * c2.vocab, sr.logits.begin() + n * c2.vocab);
+            std::vector<float> cont(extra * c2.vocab), cref(sr.logits.begin() + n * c2.vocab, sr.logits.end());
+            for (std::size_t i = 0; i < extra; ++i) {
+                const auto oo = P->forward_rows(&t2[n + i], 1, q::LogitRows::all);
+                P->read_logits(oo, 0, &cont[i * c2.vocab]);
+                P->commit(1);
+            }
+            CHECK(P->committed() == n + extra, "committed length");
+            if (pol == 0) {
+                CHECK(same(lp, lref), "variant %d: prefill(exact) last-token logits differ from serial", var);
+                CHECK(same(cont, cref), "variant %d: prefill(exact) continuation logits differ from serial", var);
+            } else {
+                double mx = 0, ref = 0;
+                std::size_t top_ok = 0;
+                bool fin = true;
+                auto arg = [&](const std::vector<float>& v, std::size_t off) { return std::max_element(v.begin() + off, v.begin() + off + c2.vocab) - (v.begin() + off); };
+                for (std::size_t i = 0; i < cont.size(); ++i) {
+                    fin = fin && std::isfinite(cont[i]);
+                    mx = std::max(mx, static_cast<double>(std::fabs(cont[i] - cref[i])));
+                    ref = std::max(ref, static_cast<double>(std::fabs(cref[i])));
+                }
+                for (std::size_t i = 0; i < extra; ++i) top_ok += arg(cont, i * c2.vocab) == arg(cref, i * c2.vocab);
+                std::printf("  %s prefill vs serial: max|dlogit| %.4g (max|logit| %.4g), top-1 agree %zu/%zu\n", pol == 1 ? "flash" : "fast8", mx, ref, top_ok, extra);
+                CHECK(fin && mx < 0.1 * ref + 1e-3, "variant %d: flash/fast8 prefill finite and close", var);
+            }
         }
         // MTP: one call with rows == the same rows one at a time
         if (E->has_mtp()) {
