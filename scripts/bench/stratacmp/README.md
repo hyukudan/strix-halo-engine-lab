@@ -10,6 +10,8 @@ must be preserved separately before retrying. Windows server trees use a close-o
 load waits up to `--release-wait-s` (default 30) for GPU 0 and at least 20 GiB host RAM to be released.
 For kernel attribution, `qwen_decode_bench ... N G --greedy-only` closes its CUDA profiler range after
 the serial C1 emissions, excluding upload, initial prefill and the later teacher-window sweeps.
+`--prefill-only` instead captures the initial `N-1` input-token prefill and emits no tokens. These
+intrusive profiler scopes attribute kernels; cold/warm throughput comes from the paired serving matrix.
 
 ## Teacher-forced quality
 

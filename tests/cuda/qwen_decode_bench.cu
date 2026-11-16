@@ -31,8 +31,9 @@ static std::vector<std::uint32_t> tokens_of(const std::string& path) {
 }
 
 int main(int argc, char** argv) {
-    if (argc < 7) { std::fprintf(stderr, "usage: qwen_decode_bench tables rope max_positions tokens N G [--greedy-only]\n"); return 1; }
-    if (argc > 7 && (argc != 8 || std::string(argv[7]) != "--greedy-only")) {
+    if (argc < 7) { std::fprintf(stderr, "usage: qwen_decode_bench tables rope max_positions tokens N G [--greedy-only|--prefill-only]\n"); return 1; }
+    const bool prefill_only = argc == 8 && std::string(argv[7]) == "--prefill-only";
+    if (argc > 7 && (argc != 8 || (!prefill_only && std::string(argv[7]) != "--greedy-only"))) {
         std::fprintf(stderr, "unknown benchmark option\n"); return 1;
     }
     qp::Config c;
@@ -52,7 +53,13 @@ int main(int argc, char** argv) {
     std::printf("loaded %s\n", p.describe().c_str());
     const qp::Sink drop = [](const qp::Piece&) {};
     std::vector<std::uint32_t> seq(prompt.begin(), prompt.begin() + static_cast<std::ptrdiff_t>(n));
+    if (prefill_only) cudaProfilerStart();
     p.run(seq, n - 1, drop);
+    if (prefill_only) {
+        cudaProfilerStop();
+        std::printf("profile scope: cold prefill only, %llu input tokens, no emitted tokens\n", static_cast<unsigned long long>(n - 1));
+        return 0;
+    }
     cudaProfilerStart();  // nsys --capture-range=cudaProfilerApi: decode only, not the upload
     std::vector<double> ms;
     for (std::uint32_t i = 0; i < g; ++i) {
