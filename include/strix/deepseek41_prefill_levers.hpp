@@ -78,6 +78,7 @@ inline constexpr PrefillLever kPrefillLevers[] = {
     {"STRIX_DS41_COMPRESS_FAST", PrefillLeverClass::cached},
     {"STRIX_DS41_COMPRESS_RING", PrefillLeverClass::reload},
     {"STRIX_DS41_DECODE_PREFETCH", PrefillLeverClass::reload},
+    {"STRIX_DS41_DECODE_XPORT", PrefillLeverClass::reload},  // startup resolver applies this policy before resident arms
     {"STRIX_DS41_DEFER_DECODER", PrefillLeverClass::cached},
     {"STRIX_DS41_DENSE_FORM", PrefillLeverClass::cached},
     {"STRIX_DS41_DENSE_SELECT", PrefillLeverClass::reload},  // startup pair resolver (deepseek41_pair_defaults) reads/exports it once
@@ -120,8 +121,8 @@ inline constexpr PrefillLever kPrefillLevers[] = {
     {"STRIX_DS41_F16_WIDE", PrefillLeverClass::reload},
     {"STRIX_DS41_FAST_ATTN", PrefillLeverClass::reload},  // startup pair resolver (deepseek41_pair_defaults) reads/exports it once
     {"STRIX_DS41_FAST_DENSE", PrefillLeverClass::reload},  // startup pair resolver (deepseek41_pair_defaults) reads/exports it once
-    {"STRIX_DS41_FAST_ENGRAM", PrefillLeverClass::reload},  // startup pair resolver exports the Engram policy
     {"STRIX_DS41_FAST_DENSE_MIN_ROWS", PrefillLeverClass::reload},  // startup pair resolver (deepseek41_pair_defaults) reads/exports it once
+    {"STRIX_DS41_FAST_ENGRAM", PrefillLeverClass::reload},  // startup pair resolver exports the Engram policy
     {"STRIX_DS41_FAST_I4", PrefillLeverClass::runtime},
     {"STRIX_DS41_FAST_I4_SCOPE", PrefillLeverClass::reload},
     {"STRIX_DS41_FAST_MOE", PrefillLeverClass::reload},  // startup pair resolver (deepseek41_pair_defaults) reads/exports it once
@@ -175,6 +176,7 @@ inline constexpr PrefillLever kPrefillLevers[] = {
     {"STRIX_DS41_PREFILL_LEASE", PrefillLeverClass::runtime},
     {"STRIX_DS41_PREFILL_MEM_GUARD_GIB", PrefillLeverClass::reload},  // checked once before loading
     {"STRIX_DS41_PREFILL_MOE_BAND", PrefillLeverClass::reload},
+    {"STRIX_DS41_PREFILL_MOE_PASS_WINDOW", PrefillLeverClass::reload},  // startup resolver applies this policy before resident arms
     {"STRIX_DS41_PREFILL_MOE_PERSIST", PrefillLeverClass::construct},
     {"STRIX_DS41_PREFILL_MOE_R2", PrefillLeverClass::reload},
     {"STRIX_DS41_PREFILL_MOE_R2_DOWN", PrefillLeverClass::reload},
@@ -199,6 +201,7 @@ inline constexpr PrefillLever kPrefillLevers[] = {
     {"STRIX_DS41_PREFILL_STAGED_GATHER", PrefillLeverClass::construct},  // needs staged_half (reload) as well
     {"STRIX_DS41_PREFILL_STAGED_HALF", PrefillLeverClass::reload},  // sizes the communicator staging buffers at load
     {"STRIX_DS41_PREFILL_WINDOW", PrefillLeverClass::reload},  // sizes the scratch and row-owner maps at load
+    {"STRIX_DS41_PREFILL_WINDOW_DRAIN", PrefillLeverClass::reload},  // startup resolver applies this policy before resident arms
     {"STRIX_DS41_PREFILL_WINDOW_MEAN", PrefillLeverClass::reload},
     {"STRIX_DS41_PREPARED_ROOT", PrefillLeverClass::reload},  // where the weights are loaded from
     {"STRIX_DS41_PROFILE_ALLOW_PENDING", PrefillLeverClass::reload},
