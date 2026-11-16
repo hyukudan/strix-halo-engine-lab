@@ -14,6 +14,17 @@ if(NOT strix_multi_config AND "${CMAKE_BUILD_TYPE}" STREQUAL "")
 endif()
 
 project(strix_engine_lab VERSION 0.1.0 LANGUAGES CXX)
+if(MSVC)
+    # Portable C library calls (getenv, fopen) are used on purpose; unknown loop pragmas (unroll), padding
+    # from alignas and code after Linux-only stubs that throw on Windows (C4702) are expected. Without this,
+    # /WX turns them into C2220 errors in every MSVC target. Conversion, sign-compare and shadow checks
+    # (C4244 C4267 C4389 C4459) stay enforced by the -Wconversion -Wshadow -Werror GCC build; MSVC also
+    # reports them inside standard-library template instantiations, which GCC does not.
+    add_compile_definitions(_CRT_SECURE_NO_WARNINGS)
+    add_compile_options($<$<COMPILE_LANGUAGE:CXX>:/wd4068> $<$<COMPILE_LANGUAGE:CXX>:/wd4324>
+        $<$<COMPILE_LANGUAGE:CXX>:/wd4702> $<$<COMPILE_LANGUAGE:CXX>:/wd4244> $<$<COMPILE_LANGUAGE:CXX>:/wd4267>
+        $<$<COMPILE_LANGUAGE:CXX>:/wd4389> $<$<COMPILE_LANGUAGE:CXX>:/wd4459>)
+endif()
 
 option(STRIX_LEGACY_MAINS "Build legacy Gemma4 and MiniMax serve executables" ON)
 
@@ -4433,9 +4444,11 @@ add_library(strix_ds41_pipeline_front STATIC src/ds41_pipeline_front.cpp)
 target_link_libraries(strix_ds41_pipeline_front PUBLIC strix_ds41_pipeline strix_ds41_runtime)
 strix_target_warnings(strix_ds41_pipeline_front)
 # a FRONT without layers: replays recorded STEP payloads to a TAIL (exactness and TAIL timing without a FRONT's compute)
-add_executable(strix-deepseek41-pipeline-replay apps/deepseek41_pipeline_replay_main.cpp)
-target_link_libraries(strix-deepseek41-pipeline-replay PRIVATE strix_ds41_pipeline)
-strix_target_warnings(strix-deepseek41-pipeline-replay)
+if(NOT WIN32)  # pipeline Connection/Listener implement POSIX sockets only
+    add_executable(strix-deepseek41-pipeline-replay apps/deepseek41_pipeline_replay_main.cpp)
+    target_link_libraries(strix-deepseek41-pipeline-replay PRIVATE strix_ds41_pipeline)
+    strix_target_warnings(strix-deepseek41-pipeline-replay)
+endif()
 if(BUILD_TESTING)
     if(NOT WIN32)  # pipeline Connection/Listener implement POSIX sockets only
         add_executable(strix-ds41-pipeline-wire-tests tests/ds41_pipeline_wire_tests.cpp)

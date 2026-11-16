@@ -609,6 +609,12 @@ failure may prevent final report delivery; inspect retained evidence privately.
 the state handed to the pair, the pair alone, the CUDA device alone), cold and warm, in one detached run with a phase
 breakdown, GPU clocks per token and a host-node link probe (RTT and useful throughput both ways).
 
+### Prefill window-loop census from a kernel trace
+
+[`scripts/bench/prefill-trace/`](../scripts/bench/prefill-trace/README.md) reads a rocprofv3 kernel trace of a prefill
+process and reports the per-window launch loop of one run: span, GPU idle inside it, time per kernel kind, launches
+per hardware queue, and the compute-unit time the flash kernel and the kernels that cannot share a CU with it leave free.
+
 ### MiniMax MSA flash layer ranges (FAST gate)
 
 [`scripts/bench/mmflash/`](../scripts/bench/mmflash/README.md) qualifies a layer range for the FAST MSA flash attention
