@@ -9,7 +9,8 @@ Config: {"pack_identity": "...", "arms": [{"name":"ours", "cmd":[...],
 Paths are supplied by the caller. No models are fetched. --plan validates without loading.
 Each decode class and prefill target gets a fresh server process. Decode is cold C1,
 then warm C1/C4/C8, with cache policy documented in each arm. Cold means process-first request;
-warm means process-last request, with a distinct prefix. The same files feed both arms.
+Warm prefills use the process-last request with a distinct prefix. Decode warm
+rows follow the first cold request. The same files feed both arms.
 """
 import argparse
 import ctypes
