@@ -43,6 +43,10 @@
 //                                 16-B aligned, loaded as fragments with no conversion. Same bits as query() when the
 //                                 producer stored tile::to_operand<kOp>(x) of the FP32 values (GLM: the absorb GEMM
 //                                 epilogue); halves the query bytes written and read
+//   static constexpr tile::Operand kOutOp; static __device__ std::uint16_t* out_op(const Args&, unsigned row)
+//                                 replaces out(): the row's normalised outputs stored as tile::to_operand<kOutOp>(o),
+//                                 [H][D] u16 (a row without keys: zeros); half the output bytes, for a consumer that
+//                                 rounds its operand the same way (GLM: the FAST MLA out GEMM on FP16 WMMA)
 //   static __device__ void emit_state(const Args&, unsigned row, unsigned head, float m, float l)
 //   static __device__ void emit(const Args&, unsigned row, unsigned head, unsigned dim, float o)
 //                                 replace out(): the raw online state (m in log2 units of the scaled score, l, and
@@ -80,6 +84,8 @@ concept PolicyQuery16 = requires(const typename P::Args& a, float (&x)[16]) { P:
 template <class P>
 concept PolicyQueryOp = requires(const typename P::Args& a, const std::uint16_t*& p) { p = P::query_op(a, 0U); };
 template <class P>
+concept PolicyOutOp = requires(const typename P::Args& a, std::uint16_t*& p) { p = P::out_op(a, 0U); P::kOutOp; };
+template <class P>
 concept PolicyRawState = requires(const typename P::Args& a) { P::emit_state(a, 0U, 0U, 0.0F, 0.0F); P::emit(a, 0U, 0U, 0U, 0.0F); };
 
 template <class P, unsigned T>
@@ -96,8 +102,15 @@ __global__ __launch_bounds__((Geometry<P::kHeads, P::kDim, T>::kThreads)) void f
     const unsigned mt = w % G::kMt, qd = w / G::kMt;
     const unsigned n = P::count(a, r);
     float* out = nullptr;
+    std::uint16_t* out16 = nullptr;
     if constexpr (PolicyRawState<P>) {
         if (n == 0) return;
+    } else if constexpr (PolicyOutOp<P>) {
+        out16 = P::out_op(a, r);
+        if (n == 0) {  // zeros, as out() (the operand image of +0 is 0)
+            for (unsigned x = tid; x < H * D; x += G::kThreads) out16[x] = 0U;
+            return;
+        }
     } else {
         out = P::out(a, r);
         if (n == 0) {  // uniform: nothing attended (not produced by the engines; defined as zeros)
@@ -209,8 +222,11 @@ __global__ __launch_bounds__((Geometry<P::kHeads, P::kDim, T>::kThreads)) void f
 #pragma unroll
     for (unsigned c = 0; c < G::kDt; ++c)
 #pragma unroll
-        for (unsigned e = 0; e < 8; ++e)
-            out[static_cast<std::size_t>(mt * 16U + 2U * e + hf) * D + qd * G::kQd + 16U * c + ln] = o[c][e] * iv[e];
+        for (unsigned e = 0; e < 8; ++e) {
+            const std::size_t x = static_cast<std::size_t>(mt * 16U + 2U * e + hf) * D + qd * G::kQd + 16U * c + ln;
+            if constexpr (PolicyOutOp<P>) out16[x] = tile::to_operand<P::kOutOp>(o[c][e] * iv[e]);
+            else out[x] = o[c][e] * iv[e];
+        }
 }
 
 }  // namespace strix::attn_core::sparse

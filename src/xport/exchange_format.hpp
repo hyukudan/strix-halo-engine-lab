@@ -67,8 +67,8 @@ inline ExchangeFormatChoice resolve_exchange_format(const char* raw, bool fast_p
 // The product-profile row an engine adds to its table: bit-changing, builtin f32, left out of the fingerprint at f32
 // (the identity of every engine is unchanged while the row is at its builtin value).
 inline constexpr profile::Lever exchange_format_lever() {
-    return {"tp2_exchange_fmt", kExchangeFormatEnv, "", {"", "", ""}, "f32", profile::Kind::bit_changing,
-            {true, false, true}, {true, true, true}, "", "f32",
+    return {"tp2_exchange_fmt", kExchangeFormatEnv, "", {"", "", "", ""}, "f32", profile::Kind::bit_changing,
+            {true, false, true, false}, {true, true, true, false}, "", "f32",
             "TP2 prefill exchange element format: f32 exact; f16 FAST only (rounded partials, fixed rank-order sum)", false, {}, true};
 }
 

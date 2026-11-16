@@ -1,4 +1,5 @@
 #include "strix/route_receipt.hpp"
+#include "strix/prefill_headless.hpp"
 #include "strix/device/hip_gate.hpp"
 #include "strix/dist/open_transport.hpp"
 // strix-minimax-rank: one rank of the MiniMax M3.1 Flash TP2 engine (both ranks run the same command line).
@@ -18,7 +19,10 @@
 //   --tf ORACLE_DIR [--tf-write]                     full teacher-forced logits of ORACLE_DIR/rows.u32 (G4 form): fnv,
 //                                                     top-1 vs the real next token; --tf-write saves logits_pair.f32
 //   --session NAME:PROMPT.u32:STEPS                  prefill + STEPS greedy decode steps (repeatable)
-//   --profile NAME:PROMPT.u32:STEPS                  the same with synchronised per-phase times (slower)
+//   --timing-profile NAME:PROMPT.u32:STEPS           the same with synchronised per-phase times (slower); the old
+//                                                    spelling --profile NAME:PROMPT.u32:STEPS stays accepted (notice)
+//   --profile default|fast|quality|turbo             product profile (strix-minimax-serve takes the same switch)
+//   --turbo-weights native|onfly|converted           TURBO weight source (+ --turbo-weight-bits, --turbo-weights-pack)
 //   --batch PROMPT.u32:STEPS:N1,N2,...               batched decode (rows = prefixes of the prompt), checked vs alone
 //   --verify-trace NAME:PROMPT.u32:REPS:R1,R2,...    verify-shaped steps (one slot, R rows) timed by R (xfer on/off
 //                                                     ABA) + per-phase GPU trace and distinct routed experts per layer
@@ -1127,11 +1131,25 @@ std::uint64_t ab_flag(mm::Engine& eng, const std::string& flag, const std::vecto
     // pfattn4 / pfmsa / pfmsarework / mtfit / core8 / pftab / pfgufuse / pfidx / pftxuc / pfrouter / pfidxconc / pfkvtile / pftiled: A B A B A B A (every B bracketed by two A prefills); the other prefill flags: A B A B A B
     const int prefills = flag == "attn" || flag == "linears" || flag == "xfer" || flag == "idxdec" || flag == "idxconc" || flag == "xbfold" || flag == "xbwait" || flag == "xbinplace" || flag == "xbboth" || flag == "xbprep" || flag == "xbpub" || flag == "xbwarm" || flag == "xbwarmo" || flag == "moegrid" || flag == "moepipe" || flag == "xbilp" || flag == "xbset" ? 1 : (flag == "pfattn4" || flag == "pfmsa" || flag == "pfmsarework" || flag == "mtfit" || flag == "core8" || flag == "pftab" || flag == "pfgufuse" || flag == "pftails" || flag == "pfpair" || flag == "pfidx" || flag == "pftxuc" || flag == "pfpipe" || flag == "pfrouter" || flag == "pfrouterrows" || flag == "core8v2" || flag == "pfidxconc" || flag == "pfkvtile" || flag == "pftiled" || flag == "pfall" || flag == "pfi4") ? 7 : 6;  // idxattn: both  // decode-only flags: one prefill, no TTFT cells
     first.resize(static_cast<std::size_t>(prefills));
+    std::vector<std::uint64_t> dense_mlp_calls;
     for (int r = 0; r < prefills; ++r) {
         set(r % 2 == 1);
+        const auto dense_before = eng.prefill_dense_mlp_count();
+        const auto headless_before = eng.prefill_headless_chunks();
         const auto t0 = Clock::now();
         first[static_cast<std::size_t>(r)] = eng.prefill(0, prompt, 0);
         ttft[r % 2].push_back(secs(t0, Clock::now()));
+        dense_mlp_calls.push_back(eng.prefill_dense_mlp_count() - dense_before);
+        if (flag == "pfheadless") {
+            const auto headless_after = eng.prefill_headless_chunks();
+            const auto expected = eng.prefill_headless_expected(prompt.size());
+            const bool qualified = strix::prefill_headless::qualified_arm(r % 2 == 1, headless_before, headless_after, expected);
+            std::printf("rank %u ab-pfheadless: prefill %d arm %c cache-only chunks %llu expected %zu: %s\n",
+                        eng.rank(), r, r % 2 == 1 ? 'B' : 'A',
+                        static_cast<unsigned long long>(headless_after - headless_before), r % 2 == 1 ? expected : 0,
+                        qualified ? "activation verified" : "UNQUALIFIED (inactive or unexpected activation)");
+            if (!qualified) g_exact_fail = true;  // matching hashes alone cannot qualify this run
+        }
         if (hash_state) {
             states.push_back(eng.state_fnv(0, prompt.size()));
             outs.push_back(eng.prefill_out_fnv());
@@ -1269,6 +1287,17 @@ std::uint64_t ab_flag(mm::Engine& eng, const std::string& flag, const std::vecto
         if (!same_state || !same_out) g_exact_fail = true;
     }
     if (!same_first) g_exact_fail = true;
+    if (flag == "pfdensemlp") {
+        bool covered = true;
+        std::printf("rank %u ab-%s: candidate calls per prefill (A B A B ...):", eng.rank(), flag.c_str());
+        for (std::size_t i = 0; i < dense_mlp_calls.size(); ++i) {
+            const auto calls = dense_mlp_calls[i];
+            std::printf(" %llu", static_cast<unsigned long long>(calls));
+            covered &= i % 2 == 0 ? calls == 0 : calls > 0;
+        }
+        std::printf(" -> %s\n", covered ? "COVERED (A=0, B>0)" : "UNQUALIFIED (requires A=0 and B>0 on every prefill; fallback equality only)");
+        if (!covered) g_exact_fail = true;
+    }
     std::printf("rank %u ab-%s: decode ms/token median per block (A=off, B=on):", eng.rank(), flag.c_str());
     for (int b = 0; b < blocks; ++b) {
         // drop the block's first 2 steps (arm switch)
@@ -1713,7 +1742,9 @@ int main(int argc, char** argv) {
             else if (a == "--offload") offloads.push_back(next());
             else if (a == "--offload-import") offload_imports.push_back(next());
             else if (a == "--offload-listen") offload_listens.push_back(next());
-            else if (a == "--profile") sessions.push_back("@" + next());  // a session with per-phase timing
+            else if (std::string timing; strix::minimax::defaults::product_option(a, next, &timing)) {
+                if (!timing.empty()) sessions.push_back("@" + timing);  // a session with per-phase timing
+            }
             else if (a == "--batch") batches.push_back(next());
             else if (a == "--verify-trace") vtraces.push_back(next());
             else if (a == "--ab") ab_runs.push_back(next());
