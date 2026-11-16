@@ -22,6 +22,7 @@
 #include "strix/cuda/qwen_dense.hpp"
 #include "strix/cuda/qwen_gdn.hpp"
 #include "strix/cuda/qwen_hc.hpp"
+#include "strix/cuda/amd_math.cuh"
 #include "strix/cuda/qwen_moe.hpp"
 #include "strix/cuda/qwen_mtp_draft.hpp"
 #include "strix/cuda/qwen_plemtp.hpp"
@@ -1010,6 +1011,7 @@ void Prefill::Impl::run_block(const Segment* seg, std::uint32_t count, std::uint
         a.injection = injection;
         a.output = hidden;
         a.mma = cfg.forms.hc_mma && !window;  // FAST form on run()'s prefill blocks only; verify/step windows stay exact
+        a.workspace_layout = hc::HcWorkspaceLayout::automatic;
         hc::hc_mix(a, tables, stream);
         executed_forms.hc_mma |= a.mma;
     };
@@ -1662,6 +1664,7 @@ void Prefill::Impl::step_tail(std::uint32_t rows) {
     a.normalized = normalized;
     a.injection = injection;
     a.output = hidden;
+    a.workspace_layout = hc::HcWorkspaceLayout::automatic;
     hc::hc_mix(a, tables, stream);
     const void* head = w.get("output.weight");
     static const bool head1 = strix::envcfg::flag("STRIX_QRTX_HEAD1", false);
@@ -2350,6 +2353,7 @@ Draft Prefill::draft(SessionId session, std::uint32_t pending, std::uint32_t dep
         hc::HcMixArgs a;
         a.input = in; a.norm = norm; a.inject = inject; a.packed = packed; a.rows = 1;
         a.normalized = m.normalized; a.injection = m.injection; a.output = m.hidden;
+        a.workspace_layout = hc::HcWorkspaceLayout::automatic;
         hc::hc_mix(a, m.tables, m.stream);
     };
     for (std::uint32_t k = 0; k < depth; ++k) {
@@ -2466,6 +2470,7 @@ std::vector<Draft> Prefill::draft_cohort(const std::vector<DraftRequest>& reques
         hc::HcMixArgs a;
         a.input = in; a.norm = norm; a.inject = inject; a.packed = packed; a.rows = rows;
         a.normalized = m.normalized; a.injection = m.injection; a.output = m.hidden;
+        a.workspace_layout = hc::HcWorkspaceLayout::automatic;
         hc::hc_mix(a, m.tables, m.stream);
     };
     const qsa::LayerWeights lw{static_cast<const std::uint16_t*>(mw("indexer.q_proj.weight")),
