@@ -81,7 +81,14 @@ template <unsigned H, unsigned D> struct KeySplit {
     }
 };
 
-template <class P, bool Split = false>
+// Opt (load schedule only; same operands, same WMMA order, every output bit unchanged):
+//   0             incumbent: the compiler sinks each key fragment load to its WMMA, so a tile pays kKs serial
+//                 L2 round trips (one s_waitcnt vmcnt(0) per QK step).
+//   kKsKeysFirst  all kKs key fragments are issued first, then the value pieces, behind a scheduling barrier:
+//                 the QK chain waits once for the keys while the values are still in flight.
+//   kKsKeysHalves the same with the keys in two halves around the value loads (half the key registers live).
+inline constexpr unsigned kKsKeysFirst = 1U, kKsKeysHalves = 2U;
+template <class P, bool Split = false, unsigned Opt = 0U>
 __global__ __launch_bounds__((KeySplit<P::kHeads, P::kDim>::kThreads)) void flash_rows_keysplit_kernel(typename P::Args a) {
     using G = KeySplit<P::kHeads, P::kDim>;
     static_assert(G::merge_slots_cover(), "merge buffer layout");
@@ -128,6 +135,14 @@ __global__ __launch_bounds__((KeySplit<P::kHeads, P::kDim>::kThreads)) void flas
         const unsigned nk = P::seg_keys(a, row, c);
         if (k0 >= nk) continue;  // wave-uniform: tile past the segment's visible keys
         // 1. value pieces (in flight during QK); keys past the visible count contribute zeros
+        constexpr bool kKeysEarly = (Opt & (kKsKeysFirst | kKsKeysHalves)) != 0U;
+        constexpr unsigned kEarly = (Opt & kKsKeysFirst) != 0U ? G::kKs : (Opt & kKsKeysHalves) != 0U ? G::kKs / 2U : 0U;
+        const std::uint16_t* const kr = P::key_row(a, row, c, k0 + ln < nk ? k0 + ln : nk - 1U);
+        Frag kf[G::kKs];
+        if constexpr (kKeysEarly) {
+#pragma unroll
+            for (unsigned x = 0; x < kEarly; ++x) kf[x] = tile::frag32(kr + 16U * x);
+        }
         U4 gv[2][4];
 #pragma unroll
         for (unsigned i = 0; i < 4; ++i) {
@@ -140,17 +155,18 @@ __global__ __launch_bounds__((KeySplit<P::kHeads, P::kDim>::kThreads)) void flas
                 gv[p][i] = ok ? x : U4{0U, 0U, 0U, 0U};
             }
         }
+        if constexpr (kKeysEarly) {
+#pragma unroll
+            for (unsigned x = kEarly; x < G::kKs; ++x) kf[x] = tile::frag32(kr + 16U * x);
+            __builtin_amdgcn_sched_barrier(0);  // keep the loads issued before the QK chain
+        }
         // 2. QK: S^T[key 2e + hf][head ln]
         Acc s = tile::acc_zero();
-        {
-            const unsigned k = k0 + ln;
-            const std::uint16_t* kr = P::key_row(a, row, c, k < nk ? k : nk - 1U);
 #pragma unroll
-            for (unsigned x = 0; x < G::kKs; ++x) {
-                const Frag kf = tile::frag32(kr + 16U * x);
-                if constexpr (Split) s = tile::mma<O>(kf, tile::frag32(lds + G::kQlo + (ln * D + 16U * x) * 2U), s);
-                s = tile::mma<O>(kf, qf[x], s);
-            }
+        for (unsigned x = 0; x < G::kKs; ++x) {
+            if constexpr (!kKeysEarly) kf[x] = tile::frag32(kr + 16U * x);
+            if constexpr (Split) s = tile::mma<O>(kf[x], tile::frag32(lds + G::kQlo + (ln * D + 16U * x) * 2U), s);
+            s = tile::mma<O>(kf[x], qf[x], s);
         }
         // 3. V^T tile of this wave
 #pragma unroll

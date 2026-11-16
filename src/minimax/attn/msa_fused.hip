@@ -2367,8 +2367,18 @@ template <bool DENSE> void launch_prefill_attend(const PrefillView& p, unsigned 
             namespace ks = strix::attn_core::sparse;
             const dim3 grid((scheduled.rows - p.first_window * kMaxRows) * v.kv_heads), block(ks::KeySplit<kGroup, kHeadDim>::kThreads);
             const MsaFlashArgs args{scheduled, DENSE ? 1U : 0U};
-            if (p.msa_rework == 12) hipLaunchKernelGGL((ks::flash_rows_keysplit_kernel<MsaFlashPolicy, true>), grid, block, 0, stream, args);
-            else hipLaunchKernelGGL((ks::flash_rows_keysplit_kernel<MsaFlashPolicy, false>), grid, block, 0, stream, args);
+            // p.flash_keys: load schedule of the core (same bits): 0 incumbent, 1 keys first, 2 key halves.
+            const auto go = [&](auto split, auto opt) {
+                hipLaunchKernelGGL((ks::flash_rows_keysplit_kernel<MsaFlashPolicy, decltype(split)::value, decltype(opt)::value>), grid,
+                                   block, 0, stream, args);
+            };
+            using U0 = std::integral_constant<unsigned, 0U>;
+            using U1 = std::integral_constant<unsigned, ks::kKsKeysFirst>;
+            using U2 = std::integral_constant<unsigned, ks::kKsKeysHalves>;
+            const bool two = p.msa_rework == 12;
+            if (p.flash_keys == 1U) two ? go(std::true_type{}, U1{}) : go(std::false_type{}, U1{});
+            else if (p.flash_keys == 2U) two ? go(std::true_type{}, U2{}) : go(std::false_type{}, U2{});
+            else two ? go(std::true_type{}, U0{}) : go(std::false_type{}, U0{});
             hip_check(hipGetLastError(), "minimax prefill flash attend");
             return;
         }
@@ -2732,7 +2742,8 @@ void enqueue_prefill(const PrefillView& p, hipStream_t stream, PrefillStageMarke
     for (unsigned first = 0; first < windows;) {
         const unsigned nw = windows - first < batch_cap ? windows - first : batch_cap;
         const unsigned r0 = first * kMaxRows;
-        PrefillView batch{prefill_offset(v, r0), p.rows - r0, p.pos0 + r0, p.scratch_windows, 0, p.index_tile, p.index_rows, p.msa_rework};
+        PrefillView batch{prefill_offset(v, r0), p.rows - r0, p.pos0 + r0, p.scratch_windows, 0, p.index_tile, p.index_rows, p.msa_rework,
+                          p.flash_keys};
         if (batch.rows > nw * kMaxRows) batch.rows = nw * kMaxRows;
         const unsigned dense = route::dense_windows(batch.pos0, batch.rows, nw, kMaxRows, kTopK * kBlock);
         const unsigned sparse = nw - dense;

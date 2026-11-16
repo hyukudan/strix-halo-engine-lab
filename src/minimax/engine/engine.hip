@@ -679,6 +679,8 @@ struct Engine::Impl {
     // STRIX_MM_PF_HEADLESS (default ON, exact): the last layer of a headless chunk runs cache-only (strix/prefill_headless.hpp):
     // q/k/v + index projections and the cache prep unchanged, no attention / o_proj / exchanges / FFN for that chunk.
     bool pf_headless = true;
+    // STRIX_MM_PF_FLASH_KEYS (default 1, schedule only, same bits): FAST flash key-fragment load schedule (PrefillView::flash_keys).
+    unsigned pf_flash_keys = 1;
     // STRIX_MM_PF_DENSE_MLP (default ON, exact): the dense MLP of layers 0..kFirstMoe-1 (gate + up, then down) on the v4
     // prefill core for 4096-row pieces (dense_mlp), the q/k/v core contract (== strix_gemm bitwise); 0 keeps strix_gemm.
     bool pf_dense_mlp = true;
@@ -893,6 +895,11 @@ struct Engine::Impl {
         pf_attend4 = env_flag("STRIX_MM_PF_ATTEND4", true);
         pf_msa_batch = env_flag("STRIX_MM_PF_MSA_BATCH", true);
         pf_headless = env_flag("STRIX_MM_PF_HEADLESS", true);
+        if (const char* value = std::getenv("STRIX_MM_PF_FLASH_KEYS")) {
+            const std::string mode(value);
+            if (mode != "0" && mode != "1" && mode != "2") throw std::invalid_argument("STRIX_MM_PF_FLASH_KEYS must be 0, 1 or 2");
+            pf_flash_keys = static_cast<unsigned>(mode[0] - '0');
+        }
         pf_dense_mlp = env_flag("STRIX_MM_PF_DENSE_MLP", true);
         if (const char* value = std::getenv("STRIX_MM_PF_IDX_CONC")) {
             const std::string mode(value);
@@ -2097,7 +2104,7 @@ struct Engine::Impl {
                         dv.idx_count = pf_cnt;
                         dv.partial = pf_partial;
                         dv.ticket = pf_ticket;
-                        const mfused::PrefillView pfv{dv, static_cast<std::uint32_t>(n), pos0, pf_msa_windows, 0, pf_idx_tile && n > 8, pf_idx_rows, n > 8 ? (pf_msa_flash != 0 && pf_msa_rework != 0 && pf_msa_flash_layers.test(L) ? 10U + pf_msa_flash : pf_msa_rework) : 0U};
+                        const mfused::PrefillView pfv{dv, static_cast<std::uint32_t>(n), pos0, pf_msa_windows, 0, pf_idx_tile && n > 8, pf_idx_rows, n > 8 ? (pf_msa_flash != 0 && pf_msa_rework != 0 && pf_msa_flash_layers.test(L) ? 10U + pf_msa_flash : pf_msa_rework) : 0U, pf_flash_keys};
                         if (cache_only) {
                             mfused::enqueue_prefill_cache_only(pfv, nullptr, tl ? PrefillTimeline::msa_mark : nullptr, tl);
                             did_cache_only = true;
