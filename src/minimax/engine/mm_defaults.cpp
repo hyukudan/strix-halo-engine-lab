@@ -243,6 +243,14 @@ PrefillPolicy prefill_policy(const Lookup& env) {
                          : std::string("msa-flash-bf16") + (p.msa_flash == 2 ? "-2term" : "") + "-l" + p.msa_flash_layers;
     if (i4 && fp::switch_on(env(kFastBundle.env)) && !fp::set(raw))
         p.note = std::string(flash.policy) + " not selected by " + kFastBundle.env + " on STRIX_MMX_MODEL_FORMAT=fast_i4";
+    // Shared TP2 exchange format: an explicit f16 is its own named FAST policy (tp2-xchg-f16-v0), like an explicit
+    // FAST member; the exact baseline (STRIX_MM_BASELINE=1) refuses it (fail closed) and no profile selects it.
+    const auto xf = strix::xport::resolve_exchange_format(env(strix::xport::kExchangeFormatEnv), !baseline(env),
+                                                          "tp2-xchg-f16-v0, not under STRIX_MM_BASELINE=1");
+    p.exchange_fmt = xf.format;
+    p.exchange_fmt_reason = xf.reason;
+    if (xf.format == strix::xport::ExchangeFormat::f16)
+        p.policies += std::string(p.policies.empty() ? "" : "+") + "tp2-xchg-f16-v0";
     return p;
 }
 
@@ -278,7 +286,9 @@ void check_peer(const std::function<void(const void*, void*, std::size_t)>& exch
 
 std::string prefill_identity(const Lookup& env) {
     const auto p = prefill_policy(env);
-    std::string out = p.policies.empty() ? std::string() : "prefill_msa=" + p.policies;
+    std::string out = p.msa_flash == 0 ? std::string() : "prefill_msa=" + p.policies.substr(0, p.policies.find("+tp2-xchg"));
+    if (p.exchange_fmt != strix::xport::ExchangeFormat::f32)
+        out += std::string(out.empty() ? "" : ";") + "tp2_exchange_fmt=" + strix::xport::exchange_format_name(p.exchange_fmt);
     if (fast_i4_format(env)) out += std::string(out.empty() ? "" : ";") + "moe_prefill_format=fast_i4";
     return out;
 }
@@ -521,6 +531,7 @@ std::string effective_config(const Cli& cli, const Lookup& env) {
           << "prefill.msa_flash_layers_requested=" << pf.msa_flash_layers_requested << "\n"
           << "prefill.fast_policies=" << (pf.policies.empty() ? "none" : pf.policies) << "\n"
           << "prefill.fast_note=" << (pf.note.empty() ? "none" : pf.note) << "\n"
+          << "prefill.tp2_exchange_fmt=" << strix::xport::exchange_format_name(pf.exchange_fmt) << " (" << pf.exchange_fmt_reason << ")\n"
           << "prefill.identity=" << (id.empty() ? "default" : id) << "\n"
           << "profile_fingerprint=" << profile::hex_identity(pr.fingerprint()) << "\n";
     }

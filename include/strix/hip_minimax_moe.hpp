@@ -32,6 +32,9 @@ struct PostExchangeView {
     // STRIX_MM_XB_POSTILP: issue every load of h / part0 / part1 before the first store (h must not overlap a partial;
     // checked at enqueue). Same arithmetic, same bits.
     unsigned ilp = 0;  // 0 plain, 1 loads-first, 2 partials staged through LDS with 16-byte loads (same bits)
+    // STRIX_TP2_EXCHANGE_FMT=f16 (prefill, xport/exchange_format.hpp): part0 / part1 point at binary16 rows (R x 6144
+    // halves each), widened exactly to FP32 at the load; false: FP32 partials (every other path, bitwise unchanged).
+    bool half_parts = false;
     unsigned prep_jobs = 0;
     const std::uint16_t* prep_suh[4] = {nullptr, nullptr, nullptr, nullptr};
     void* prep_xt[4] = {nullptr, nullptr, nullptr, nullptr};  // _Float16 rows

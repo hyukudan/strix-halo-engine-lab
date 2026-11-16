@@ -9,6 +9,7 @@
 // selected by the FAST prefill bundle switch only.
 #include "strix/engine_profile.hpp"
 #include "strix/fast_profile.hpp"
+#include "xport/exchange_format.hpp"
 
 #include <array>
 #include <string_view>
@@ -52,13 +53,16 @@ static_assert(msa_flash_policy(kMsaFlashLayers) != nullptr &&
               "the bundle member's policy id names the bundle's layer set");
 
 // Bundle selection is requested provenance; only effective members enter agreement.
-inline constexpr std::array<strix::profile::Lever, 2> profile_table{{
+inline constexpr std::array<strix::profile::Lever, 3> profile_table{{
     // Prefill only: MSA attention of windows > 8 rows; selection, block lists and K/V caches unchanged.
     {"msa_flash", "STRIX_MM_PF_MSA_FLASH", "", {"", "", ""}, "0", strix::profile::Kind::bit_changing,
      {true, false, true}, {true, true, true}, "", "0",
      "msa-flash-bf16-l40-v1 (EXL3 gate PASS 8K KL 0.0012, 32K KL 0.0029); 2 = two-term operands", false, {}, true},
     {"msa_flash_layers", "STRIX_MM_PF_MSA_FLASH_LAYERS", "", {"", "", ""}, kMsaFlashLayers, strix::profile::Kind::bit_changing,
      {true, false, true}, {true, true, true}, "", "", "FAST MSA flash layer set (read only while msa_flash is on)", false, {}, true},
+    // Prefill only: TP2 exchange element format (shared trait xport/exchange_format.hpp); explicit f16 = FAST policy
+    // tp2-xchg-f16-v0 (refused under STRIX_MM_BASELINE=1), never selected by a profile.
+    strix::xport::exchange_format_lever(),
 }};
 
 }  // namespace strix::minimax::defaults

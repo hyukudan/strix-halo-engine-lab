@@ -454,8 +454,11 @@ RECEIPT_PREFIX = "strix-route-receipt "
 MM_OUTPUT_SWITCHES = frozenset({"STRIX_MM_QUALITY_OUT", "STRIX_MM_QUALITY_ROWS", "STRIX_MM_QUALITY_SELECT", "STRIX_MM_STATE_FNV",
                                 "STRIX_MM_DIAG_ATTN_ULP"})
 # The FAST layer set's own lever and switches: ignored by config_difference (candidate == reference + this layer set).
-MM_FAST_SWITCHES = frozenset({"STRIX_MM_PF_MSA_FLASH", "STRIX_MM_PF_MSA_FLASH_LAYERS", "STRIX_MM_FAST_PREFILL"})
-MM_FAST_LEVERS = frozenset({"minimax.msa_flash"})
+# STRIX_TP2_EXCHANGE_FMT / minimax.tp2_exchange_fmt: the shared TP2 exchange format (f16 = FAST from layer 0).
+MM_FAST_SWITCHES = frozenset({"STRIX_MM_PF_MSA_FLASH", "STRIX_MM_PF_MSA_FLASH_LAYERS", "STRIX_MM_FAST_PREFILL",
+                              "STRIX_TP2_EXCHANGE_FMT"})
+MM_FAST_LEVERS = frozenset({"minimax.msa_flash", "minimax.tp2_exchange_fmt"})
+MM_LAYERS = 60
 MM_DIAG = re.compile(rb'DIAG attn ulp: layer (\d+) seed (\d+) rows (\d+) pos0 (\d+) values (\d+) prompt ("(?:[^"\\]|\\.)*")\s*')
 
 
@@ -524,6 +527,13 @@ def minimax_execution(log, rank, prompts):
         if not layers:
             raise GateError("witness: MSA flash selected on no layer")
         fast = {"policy": "msa-flash", "msa_flash_mode": 10 + int(m.group(1)), "layers": layers}
+    xchg = levers.get("minimax.tp2_exchange_fmt", "f32")
+    if xchg not in ("f32", "f16"):
+        raise GateError(f"witness: unexpected minimax.tp2_exchange_fmt value {xchg!r}")
+    if xchg == "f16":  # every layer's two exchanges round the partials: the FAST onset is layer 0
+        fast = fast or {"policy": "", "msa_flash_mode": 10, "layers": []}
+        fast["policy"] = (fast["policy"] + "+" if fast["policy"] else "") + "tp2-xchg-f16"
+        fast["layers"] = sorted(set(fast["layers"]) | set(range(MM_LAYERS)))
     plain = levers["minimax.moe_prefill_format"] == "exl3" and levers["minimax.prefill_identity"] == "default"
     profile = ("fast-prefill" if fast else "exact") if plain else "other"
     diag, covered = [], set()
