@@ -80,12 +80,12 @@ void families() {
     generic(ds, p::Name::turbo, none, r);
     require(find(r, "attention_f16wmma") != nullptr && find(r, "attention_f16wmma")->value == "2", "ds41 turbo attention = bf16flash");
     require(find(r, "dense_f16") != nullptr && find(r, "dense_f16")->value == "1", "ds41 turbo dense f16");
-    require(find(r, "engram_wmma") != nullptr && find(r, "engram_wmma")->status == p::Status::pending, "ds41 engram pending");
+    require(find(r, "engram_f16wmma") != nullptr && find(r, "engram_f16wmma")->status == p::Status::builtin, "ds41 turbo leaves the explicit-only Engram row at its builtin");
     require(find(r, "decoder_replay") != nullptr && find(r, "decoder_replay")->status == p::Status::pending, "ds41 replay pending");
     generic(ds, p::Name::fast, none, r);
     require(find(r, "attention_f16wmma")->requested == "1", "ds41 fast unchanged (f16wmma)");
     generic(ds, p::Name::standard, none, r);
-    require(find(r, "engram_wmma") == nullptr || find(r, "engram_wmma")->status == p::Status::builtin, "ds41 default unchanged");
+    require(find(r, "engram_f16wmma") == nullptr || find(r, "engram_f16wmma")->status == p::Status::builtin, "ds41 default unchanged");
 
     const p::Engine mm{"minimax-pair", "", strix::minimax::defaults::profile_table, false, "minimax-turbo-v1"};
     generic(mm, p::Name::turbo, none, r);
