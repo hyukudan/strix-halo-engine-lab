@@ -3662,6 +3662,12 @@ void Engine::set_prefill_dense_mlp(bool on) {
     impl_->pf_dense_mlp = on;
 }
 bool Engine::prefill_dense_mlp() const { return impl_->pf_dense_mlp; }
+void Engine::set_prefill_flash_keys(unsigned mode) {
+    impl_->no_task("set_prefill_flash_keys");
+    if (mode > 2) throw std::invalid_argument("prefill flash keys must be 0, 1 or 2");
+    impl_->pf_flash_keys = mode;
+}
+unsigned Engine::prefill_flash_keys() const { return impl_->pf_flash_keys; }
 void Engine::set_prefill_msa_rework(unsigned mode) {
     impl_->no_task("set_prefill_msa_rework");
     impl_->set_prefill_msa_rework(mode);
