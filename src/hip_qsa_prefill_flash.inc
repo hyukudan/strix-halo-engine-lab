@@ -51,7 +51,10 @@ inline bool score_split_loads() {
     return on;
 }
 inline bool index_band() {
-    static const bool on = strix::envcfg::flag("STRIX_QSA_INDEX_BAND", true);
+    // STRIX_QSA_INDEX_BAND (default off; 1 = f16 WMMA scores on attn_core + band-exact selection, bitwise-identical
+    // selected set and logits, gate PASS 32K / 128K 11-16). Measured SLOWER today (rocprofv3 128K: scorer 2,967 ->
+    // 2,742 ms, select 718 -> 1,635 ms, bound reduction +232 ms; QLONG-RESULT.md section 3), so not default-on yet.
+    static const bool on = strix::envcfg::flag("STRIX_QSA_INDEX_BAND", false);
     if (!on) return false; // OFF does not inspect the device
     static const bool supported = [] {
         int device = 0;

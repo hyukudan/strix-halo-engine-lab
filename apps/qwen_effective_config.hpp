@@ -2331,7 +2331,7 @@ inline std::string effective_config_json(const EffectiveConfig& config) {
     item("STRIX_PREFILL_MOE_MERGE_VEC", qpf2k::long_context_item_suppression("STRIX_PREFILL_MOE_MERGE_VEC", config.gsq_owner), false);
     const auto band = config.environment.find("STRIX_QSA_INDEX_BAND");
     out << "},\"qsa_index_band\":{\"requested\":"
-        << (band == config.environment.end() || band->second.empty() || band->second[0] != '0' ? "true" : "false")
+        << (band != config.environment.end() && !band->second.empty() && band->second[0] != '0' ? "true" : "false")
         << ",\"read_once_per_process\":true,\"identity\":\"exact-selected-set\"";
     out << "},\"gdn_core_launch\":{\"requested\":";
     const auto coop = config.environment.find("STRIX_QPF2K_GDN_COOP_LAUNCH");
