@@ -138,8 +138,7 @@ int main(int argc, char** argv) try {
     }
     pf_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_pf0).count();
     if (repeat > 1U)
-        std::printf("prefill %u/%u (%s): %zu tokens %.1f ms = %.1f tok/s
-", pass + 1U, repeat,
+        std::printf("prefill %u/%u (%s): %zu tokens %.1f ms = %.1f tok/s\n", pass + 1U, repeat,
                     pass == 0U ? "cold" : pass + 1U == repeat ? "warm" : "mid", prompt.size(), pf_ms, double(prompt.size()) * 1000.0 / pf_ms);
     }
     std::printf("prompt %zu tokens: %.1f ms\n", prompt.size(), pf_ms);
