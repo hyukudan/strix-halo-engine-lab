@@ -17,6 +17,23 @@ SPEC.loader.exec_module(native)
 
 
 class NativeEmissions(unittest.TestCase):
+    def test_repeated_invocations_expand_unique_trace_paths(self):
+        with tempfile.TemporaryDirectory() as folder:
+            template = pathlib.Path(folder) / "native-{pid}-{time_ns}.jsonl"
+            code = "import sys; sys.stdin.buffer.read(); print('T 42',flush=True)"
+            for _ in range(2):
+                proc = subprocess.run([sys.executable, str(SCRIPT), "run", "--out", str(template),
+                                       "--token-pattern", r"T (?P<token>\d+)", "--", sys.executable, "-c", code],
+                                      input=b"", capture_output=True, timeout=10)
+                self.assertEqual(proc.returncode, 0, proc.stderr.decode(errors="replace"))
+            traces = sorted(pathlib.Path(folder).glob("native-*.jsonl"))
+            self.assertEqual(len(traces), 2)
+            self.assertNotEqual(traces[0].name, traces[1].name)
+            for path in traces:
+                self.assertNotIn("{", path.name)
+                rows = [json.loads(line) for line in path.read_text().splitlines()]
+                self.assertEqual([row["token"] for row in rows if "token" in row], [42])
+
     @unittest.skipUnless(os.name == "nt", "Windows owned-child job lifecycle")
     def test_forced_proxy_cleanup_terminates_owned_native_child(self):
         from ctypes import wintypes as w

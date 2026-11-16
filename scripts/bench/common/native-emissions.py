@@ -88,6 +88,7 @@ def run(args):
     command = args.command[1:] if args.command[:1] == ["--"] else args.command
     if not command:
         raise ValueError("missing native command")
+    args.out = pathlib.Path(str(args.out).replace("{pid}", str(os.getpid())).replace("{time_ns}", str(time.time_ns())))
     args.out.parent.mkdir(parents=True, exist_ok=True)
     # Unbuffered writes survive an owned server's forced process-tree cleanup. This is an instrumented peak run.
     with args.out.open("xb", buffering=0) as log:

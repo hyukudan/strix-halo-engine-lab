@@ -8,6 +8,9 @@ when its stdout line arrives. It does not tokenize text or infer counts from arb
 
 Run the native command through `run --out TRACE --token-pattern REGEX -- COMMAND ...`. Point an owned
 server's native command declaration at this proxy; keep executable and output paths in runtime config.
+The output path may contain literal `{pid}` and `{time_ns}` placeholders, expanded by each proxy
+process before opening its new trace (for example, `native-{pid}-{time_ns}.jsonl`). Other text is
+unchanged. This lets an immutable server config start repeated native processes without reusing files.
 After the client burst and owned cleanup, run `peak --trace TRACE --receipt CLIENT_JSON --out PEAK_JSON`.
 The client receipt must contain the complete `events` from `tools/serve_bench.py`, including final usage
 and `[DONE]` arrival (`finished`). Client and proxy must run on the same host and Python monotonic clock.
