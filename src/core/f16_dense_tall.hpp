@@ -216,4 +216,46 @@ __device__ __forceinline__ void core(const float* x, unsigned in, unsigned nr, C
     });
 }
 
+// x16 tile form (shared; same bits as the FP32 x path): x rounded to FP16 ONCE by the core's own cast (RNE) into
+// k-tile-major tiles, element (g, r, j) at (g * rows + r) * 64 + j for input k = 64 g + j. A CTA stage then reads 128
+// rows x 128 contiguous bytes instead of 128 FP32 rows `in` floats apart, and the core's per-fragment conversions go
+// away. Measured (MiniMax index projection, 4096 x 6144 -> 384): rows-major FP32 x streamed at 93-114 GB/s with
+// 16-32 CTAs, the tiles at ~214 GB/s; WMMA alone 0.54 ms = ~73 % of the WMMA peak. Pays from ~2048 rows (below, x fits
+// the MALL and the direct form wins). Workspace: x16_bytes(rows, in). The launch is column-fast (kColumnFast), so the
+// column blocks of one row block share its tiles through L2.
+inline constexpr unsigned kX16Rows = 2048;  // measured crossover (MiniMax index projection ABAB: 1024 direct, 2048 x16)
+inline std::size_t x16_bytes(unsigned rows, unsigned in) { return static_cast<std::size_t>(rows) * in * 2U; }
+// One thread per 8-input chunk (in % 64 == 0).
+template <int = 0> __global__ __launch_bounds__(256) void x16_tiles_kernel(const float* __restrict__ x, _Float16* __restrict__ xt,
+                                                                          unsigned rows, unsigned in) {
+    const unsigned chunks = in / 8U;
+    const std::size_t i = static_cast<std::size_t>(blockIdx.x) * 256U + threadIdx.x;
+    if (i >= static_cast<std::size_t>(rows) * chunks) return;
+    const unsigned r = static_cast<unsigned>(i / chunks), c = static_cast<unsigned>(i % chunks);
+    const float4 a = *reinterpret_cast<const float4*>(x + static_cast<std::size_t>(r) * in + c * 8U);
+    const float4 b = *reinterpret_cast<const float4*>(x + static_cast<std::size_t>(r) * in + c * 8U + 4U);
+    using H8 = _Float16 __attribute__((ext_vector_type(8)));
+    const H8 h = {static_cast<_Float16>(a.x), static_cast<_Float16>(a.y), static_cast<_Float16>(a.z), static_cast<_Float16>(a.w),
+                  static_cast<_Float16>(b.x), static_cast<_Float16>(b.y), static_cast<_Float16>(b.z), static_cast<_Float16>(b.w)};
+    *reinterpret_cast<H8*>(xt + (static_cast<std::size_t>(c / 8U) * rows + r) * 64U + (c % 8U) * 8U) = h;
+}
+inline void enqueue_x16_tiles(const float* x, _Float16* xt, unsigned rows, unsigned in, hipStream_t s) {
+    const std::size_t n = static_cast<std::size_t>(rows) * (in / 8U);
+    if (n) hipLaunchKernelGGL(x16_tiles_kernel<>, dim3(static_cast<unsigned>((n + 255U) / 256U)), dim3(256), 0, s, x, xt, rows, in);
+}
+// Cols mixin: Base's tile / stage hooks, A fragments from the x16 tiles, column-fast CTA order
+// (launch dim3(column blocks, row blocks)).
+template <class Base> struct X16Cols : Base {
+    static constexpr bool kColumnFast = true;
+    const _Float16* xt;
+    unsigned rows;
+    __device__ __forceinline__ Half16 fragment(unsigned row, unsigned unit) const {
+        using GH16 = const Half16 __attribute__((address_space(1)));
+        const _Float16* p = detail::uniform(xt) + (static_cast<std::size_t>(unit / 4U) * detail::uni(rows) + row) * 64U + (unit % 4U) * 16U;
+        return *(GH16*)p;
+    }
+};
+// Column width of a column-fast x16 launch: the widest of 4 / 2 / 1 tiles that divides `tiles` (no dead tiles).
+inline unsigned x16_tc(unsigned tiles) { return tiles % 4U == 0 ? 4U : tiles % 2U == 0 ? 2U : 1U; }
+
 }  // namespace strix::core::f16_dense_tall

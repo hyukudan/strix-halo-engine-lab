@@ -49,7 +49,7 @@ void check_formats(const std::string& source, const std::string& text, const std
     if (source == "src/ds41_formats.cpp") {
         const auto decoded = matched_formats(text, std::regex(R"(\bvoid\s+decode_([a-z0-9_]+)\s*\()"));
         require(formats == decoded, "DS41 per-decoder storage support changed");
-    } else if (source == "include/strix/cuda_qwen_quant.cuh") {
+    } else if (source == "include/strix/cuda/qwen_quant.cuh") {
         const auto geometry = text.find("QQ_HD Geometry geometry(");
         const auto end = text.find("namespace detail", geometry);
         const auto decoder = text.find("QQ_HD void decode_group(", end);
@@ -86,7 +86,7 @@ int wfmt_census_test() {
         for (const auto* image : {"CB4", "U5", "U6", "Q6P32", "prepared-image", "exl3.mul1.tiles16", "exl3.gemma.transport"})
             require(!formats.count(image), "derived image listed as storage " + id);
         check_formats(source, text, formats);
-        if (source == "src/ds41_formats.cpp" || source == "include/strix/cuda_qwen_quant.cuh") {
+        if (source == "src/ds41_formats.cpp" || source == "include/strix/cuda/qwen_quant.cuh") {
             // Negative host cases: missing support and copied category-wide extras must fail.
             for (bool missing : {true, false}) {
                 auto wrong = formats;
