@@ -8,6 +8,10 @@ the completion marker is written only after every plan entry has a complete rece
 `--resume` keeps completed receipts only when config, prompt hashes and entry identities match; failed entries
 must be preserved separately before retrying. Windows server trees use a close-on-owner-exit job, and each
 load waits up to `--release-wait-s` (default 30) for GPU 0 and at least 20 GiB host RAM to be released.
+For a separately instrumented peak supplement, a frozen config may set `group_decode_classes: true`.
+This runs prose/edit/json in each loaded process, retaining ABAB order per class and avoiding repeated
+loads. Only the first prose request is process-cold; the first edit/json requests are intermediate,
+and their subsequent requests are warm. Keep this supplement separate from the default timing matrix.
 For kernel attribution, `qwen_decode_bench ... N G --greedy-only` closes its CUDA profiler range after
 the serial C1 emissions, excluding upload, initial prefill and the later teacher-window sweeps.
 `--prefill-only` instead captures the initial `N-1` input-token prefill and emits no tokens. These

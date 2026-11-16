@@ -31,6 +31,31 @@ class Sampler:
 
 
 class RunnerLifecycle(unittest.TestCase):
+    def test_grouped_classes_have_one_process_cold_request(self):
+        with tempfile.TemporaryDirectory() as folder, contextlib.ExitStack() as patches:
+            root = pathlib.Path(folder)
+            arm = dict(name="a", cmd=["fixture"], url="http://127.0.0.1:1")
+            config = dict(pack_identity="test", decode_prompts={k: [k] for k in ("prose", "edit", "json")})
+            args = types.SimpleNamespace(release_wait_s=0, idle_memory_mib=2048, ready_s=1, timeout=1, tokens=3)
+            def client(arm, prompts, concurrency, tokens, out, timeout):
+                out.write_text("{}")
+                return dict(file=out.name, start=0, end=1)
+            for name, value in (("free_ram", 32 * 1024**3), ("gpu_sample", dict(memory_mib=0)),
+                                ("wait_ready", None), ("stop_owned", None)):
+                patches.enter_context(mock.patch.object(runner, name, return_value=value))
+            patches.enter_context(mock.patch.object(runner, "Sampler", Sampler))
+            patches.enter_context(mock.patch.object(runner.subprocess, "Popen", return_value=types.SimpleNamespace(pid=123)))
+            patches.enter_context(mock.patch.object(runner.owner_api, "windows_job", return_value=None))
+            patches.enter_context(mock.patch.object(runner, "client", side_effect=client))
+            patches.enter_context(contextlib.redirect_stdout(io.StringIO()))
+            runner.run_one(config, arm, "decode-all", 1, root / "entry", args)
+            records = json.loads((root / "entry/run.json").read_text())["records"]
+            self.assertEqual(len({row["file"] for row in records}), 12)
+            self.assertEqual([(row["kind"], row["state"]) for row in records if row["state"] != "warm"],
+                             [("prose", "cold"), ("edit", "intermediate"), ("json", "intermediate")])
+            for kind in config["decode_prompts"]:
+                self.assertEqual([row["concurrency"] for row in records if row["kind"] == kind and row["state"] == "warm"], [1, 4, 8])
+
     @unittest.skipUnless(os.name == "nt", "real Windows Job ownership")
     def test_server_parent_exit_does_not_leave_owned_child(self):
         from ctypes import wintypes as w

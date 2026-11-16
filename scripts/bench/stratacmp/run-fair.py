@@ -147,12 +147,14 @@ def run_one(config, arm, workload, pair, out, args):
             owner = owner_api.windows_job(proc)
             wait_ready(proc, arm, args.ready_s)
             if workload.startswith("decode-"):
-                kind = workload.removeprefix("decode-")
-                prompts = config["decode_prompts"][kind]
-                for state, concurrency in (("cold", 1), ("warm", 1), ("warm", 4), ("warm", 8)):
-                    rec = client(arm, prompts, concurrency, args.tokens,
-                                 out / f"{kind}-{state}-c{concurrency}.json", args.timeout)
-                    manifest["records"].append(dict(rec, kind=kind, concurrency=concurrency, state=state))
+                kinds = ("prose", "edit", "json") if workload == "decode-all" else (workload.removeprefix("decode-"),)
+                for ordinal, kind in enumerate(kinds):
+                    prompts = config["decode_prompts"][kind]
+                    first = "cold" if ordinal == 0 else "intermediate"
+                    for state, concurrency in ((first, 1), ("warm", 1), ("warm", 4), ("warm", 8)):
+                        rec = client(arm, prompts, concurrency, args.tokens,
+                                     out / f"{kind}-{state}-c{concurrency}.json", args.timeout)
+                        manifest["records"].append(dict(rec, kind=kind, concurrency=concurrency, state=state))
             else:
                 prompts = config["prefill_prompts"][workload]
                 for i, prompt in enumerate(prompts):
@@ -180,6 +182,8 @@ def run_one(config, arm, workload, pair, out, args):
 
 
 def validate(config):
+    if not isinstance(config.get("group_decode_classes", False), bool):
+        raise ValueError("group_decode_classes must be boolean")
     if not config.get("pack_identity") or len(config["arms"]) != 2:
         raise ValueError("require pack_identity and exactly two arms")
     if len({arm["name"] for arm in config["arms"]}) != 2:
@@ -232,7 +236,8 @@ def main():
         p.error("release-wait-s must be nonnegative")
     config = json.loads(args.config.read_text(encoding="utf-8"))
     hashes = validate(config)
-    plan = [(workload, pair, arm) for workload in ("decode-prose", "decode-edit", "decode-json", "8192", "32768", "43008")
+    workloads = ("decode-all",) if config.get("group_decode_classes") else ("decode-prose", "decode-edit", "decode-json", "8192", "32768", "43008")
+    plan = [(workload, pair, arm) for workload in workloads
             for pair in range(1, args.pairs + 1) for arm in config["arms"]]
     if args.plan:
         print(json.dumps(dict(order=[f"{w}:{pair}:{a['name']}" for w, pair, a in plan], prompt_sha256=hashes), indent=1))
