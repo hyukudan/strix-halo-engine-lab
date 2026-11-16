@@ -24,7 +24,7 @@ TensorIndex fixture(std::vector<Fixture> fields) {
     const auto text=header.dump();std::vector<Byte> bytes;for(unsigned i=0;i<8;++i)bytes.push_back(Byte((text.size()>>(i*8))&255));for(char c:text)bytes.push_back(Byte(c));for(const auto& f:fields)bytes.insert(bytes.end(),f.bytes.begin(),f.bytes.end());
     TensorIndex index;check(bool(index_safetensors(memory_source(bytes,"schema-fixture"),index)),"schema fixture parses");return index;
 }
-std::vector<Byte> bytes(std::string_view text){return {reinterpret_cast<const Byte*>(text.data()),reinterpret_cast<const Byte*>(text.data()+text.size())};}
+std::vector<Byte> text_bytes(std::string_view text){return {reinterpret_cast<const Byte*>(text.data()),reinterpret_cast<const Byte*>(text.data()+text.size())};}
 }
 bool wfmt_admission_test() try {
     std::array<Byte,128> bytes{};auto source=memory_source(bytes,"admission");TensorIndex index;index.container=Container::gguf;index.owner=source;
@@ -48,7 +48,7 @@ bool wfmt_admission_test() try {
     WeightMap transformed;
     auto table=fixture({{"adaln_t_table","F32",{2,4},floats(8)}});check(bool(bind_h3(table,transformed)),"H3 existing F32 row lookup");
     check(transformed.size()==1 && transformed[0].binding.role==Role::lookup_row,"H3 row lookup role retained");
-    const auto config=bytes(R"({"format":"int8_tensorwise","convrot":true,"convrot_groupsize":256})");
+    const auto config=text_bytes(R"({"format":"int8_tensorwise","convrot":true,"convrot_groupsize":256})");
     auto channel=fixture({{"layer.weight","I8",{1,256},std::vector<Byte>(256)},
         {"layer.weight_scale","F32",{1,1},floats(1)},
         {"layer.comfy_quant","U8",{config.size()},config}});
@@ -58,7 +58,7 @@ bool wfmt_admission_test() try {
     transformed[0].weight.payload.source=counted;for(auto& side:transformed[0].weight.sidecars)side.data.source=counted;
     check(bool(validate_binding(builtin_registry(),transformed[0])) && counted->bytes_read==0,"resolver metadata check performs no numerical source reads");
     check(bool(validate_map(builtin_registry(),transformed)) && counted->bytes_read>0,"one-time admission still checks scale values");
-    const auto packed_config=bytes(R"({"format":"asym_w4a8_int8","group_size":16})");
+    const auto packed_config=text_bytes(R"({"format":"asym_w4a8_int8","group_size":16})");
     auto packed=fixture({{"layer.weight","I8",{1,128},std::vector<Byte>(128)},
         {"layer.weight_s_rel","F32",{1,16},floats(16)}, {"layer.weight_s_channel","F32",{1},floats(1)},
         {"layer.weight_codebook","BF16",{16},std::vector<Byte>(32)},
