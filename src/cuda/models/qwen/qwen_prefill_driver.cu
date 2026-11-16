@@ -29,6 +29,7 @@
 #include "strix/cuda/qwen_transcode.hpp"
 #include "strix/gguf_reader.hpp"
 #include "strix/cuda/vram_guard.hpp"
+#include "strix/qwen_weight_packs.hpp"
 
 #include "strix/cuda/amd_math_tables.hpp"
 
@@ -79,18 +80,7 @@ constexpr std::uint32_t qsa_ordinal(std::uint32_t layer) { return layer / 4U; }
 std::uint32_t round_up(std::uint32_t v, std::uint32_t m) { return (v + m - 1U) / m * m; }
 
 // The parts of a split GGUF ("...-00001-of-00002.gguf"): every part in order; otherwise the file itself.
-std::vector<std::string> model_parts(const std::string& path) {
-    const auto at = path.rfind("-00001-of-");
-    if (at == std::string::npos || path.size() < at + 20) return {path};
-    const auto total = static_cast<unsigned>(std::stoul(path.substr(at + 10, 5)));
-    std::vector<std::string> parts;
-    for (unsigned i = 1; i <= total; ++i) {
-        char index[8];
-        std::snprintf(index, sizeof(index), "%05u", i);
-        parts.push_back(path.substr(0, at + 1) + index + path.substr(at + 6));
-    }
-    return parts;
-}
+std::vector<std::string> model_parts(const std::string& path) { return weight_pack::gguf_parts(path); }
 bool ends_with(const std::string& s, const char* tail) {
     const std::size_t n = std::strlen(tail);
     return s.size() >= n && s.compare(s.size() - n, n, tail) == 0;
@@ -314,6 +304,7 @@ struct Prefill::Impl : BlockFields {
     gguf::FileInfo info;                       // tensors of every part, with the types as stored on the device
     std::string ple_part;                      // the part holding per_layer_token_embd
     bool native_experts = false;               // some layer's experts need the native MoE path
+    weight_pack::Admission admission;          // the declared weight pack the file is (strix/qwen_weight_packs.hpp)
     Weights w;
     std::vector<hc::HcPacked> hc_attn, hc_ffn;  // per layer
     struct LayerPtrs { void* p[kLayerTensors]{}; std::uint32_t gate_type = 0, down_type = 0; };
@@ -458,6 +449,9 @@ struct Prefill::Impl : BlockFields {
 };
 
 void Prefill::Impl::upload_model() {
+    // Retain admission of the original merged headers. `info` below describes device storage after transcode.
+    admission = qwen_packs::admit_model(cfg.model_gguf);
+    if (!admission.pack) throw std::runtime_error("Qwen weight pack not admitted: " + admission.reason);
     constexpr std::uint64_t kChunk = std::uint64_t{256} << 20;
     std::uint8_t* staging[2] = {nullptr, nullptr};
     ck(cudaMallocHost(&staging[0], kChunk), "pinned staging");
@@ -584,6 +578,9 @@ void Prefill::Impl::upload_model() {
         probe.down_type = lw[l].down_type;
         native_experts = native_experts || moe::native_types(probe);
     }
+    // Validate the route against source admission. FAST dense transcodes may still have A8 experts.
+    if (admission.pack->arithmetic == "exact" && native_experts)
+        throw std::logic_error(std::string("Qwen weight pack ") + std::string(admission.pack->id) + " disagrees with the expert route");
     ck(cudaStreamSynchronize(stream), "hc pack");
 }
 
@@ -926,11 +923,15 @@ Prefill::Prefill(const Config& config) : impl_(std::make_unique<Impl>()) {
         const char* ms = std::getenv("STRIX_QRTX_MULTISEG");
         m.multiseg = !(ms && ms[0] == '0');
     }
-    char buf[384];
+    char buf[512];
     std::snprintf(buf, sizeof(buf), "{\"weights_gb\":%.2f,\"upload_s\":%.1f,\"block_rows\":%u,\"max_positions\":%u,"
-                  "\"transcoded_tensors\":%u,\"native_experts\":%s}",
+                  "\"transcoded_tensors\":%u,\"native_experts\":%s,\"weight_pack\":\"%.*s\",\"pack_arithmetic\":\"%.*s\","
+                  "\"pack_fingerprint\":\"%s\"}",
                   static_cast<double>(m.w.bytes) / 1e9, std::chrono::duration<double>(Clock::now() - t0).count(), m.cap,
-                  config.max_positions, m.transcoded, m.native_experts ? "true" : "false");
+                  config.max_positions, m.transcoded, m.native_experts ? "true" : "false",
+                  static_cast<int>(m.admission.pack->id.size()), m.admission.pack->id.data(),
+                  static_cast<int>(m.admission.pack->arithmetic.size()), m.admission.pack->arithmetic.data(),
+                  qwen_packs::hex64(m.admission.fingerprint).c_str());
     m.describe = buf; // OFF receipt remains the original byte sequence.
     if (m.route_policy.enabled) {
         const auto id = numerical_identity();
