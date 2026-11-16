@@ -31,11 +31,12 @@ template <class Site, unsigned S, unsigned G, unsigned GC, bool FromSlot, bool S
 __global__ __launch_bounds__(32 * S) void project_rows_iu4_kernel(Site site, Iu4Weights weights, const std::int8_t* codes,
                                                                   const float* deltas) {
     constexpr unsigned R = Site::rows, K = G * 64U, Kc = GC * 64U, MaxG = GC / S, Threads = 32U * S;
+    constexpr bool StoreDots = false;  // the shared core retains LDS staging as a compile-time policy
     static_assert(G % GC == 0U && GC % S == 0U && MaxG % 2U == 0U && R >= 1U && R <= 8U && R * Kc * 2U <= kIu4StageBytes);
-    static_assert(!SingleDecode || R * Kc * 2U + R * 32U * S * sizeof(core::w4a16::Float2) <= 64U * 1024U);
+    static_assert(!SingleDecode || !StoreDots || R * Kc * 2U + R * 32U * S * sizeof(core::w4a16::Float2) <= 64U * 1024U);
     static_assert(Kc * 2U >= S * 256U, "partial sums alias the staged activations");
     __shared__ __attribute__((aligned(16))) _Float16 xs[R * Kc];
-    __shared__ core::w4a16::Float2 staged_dot[SingleDecode && R >= 7U ? R * 32U * S : 1U];
+    __shared__ core::w4a16::Float2 staged_dot[SingleDecode && StoreDots && R >= 7U ? R * 32U * S : 1U];
     const unsigned tid = threadIdx.x, lane = tid & 31U, wave = tid / 32U;
     // Block -> (segment m, 64-column quad).
     unsigned m = 0, quad = blockIdx.x;
@@ -73,10 +74,10 @@ __global__ __launch_bounds__(32 * S) void project_rows_iu4_kernel(Site site, Iu4
         constexpr unsigned Rc = R >= 7U && !SingleDecode ? 4U : R;
 #pragma unroll
         for (unsigned h = 0; h * Rc < R; ++h)
-            core::w4a16::wave_rows<Rc, MaxG * 4U, MaxG, SingleDecode>(wq, ws, n_pad, K, k0, k0 + MaxG * 4U, quad * 4U, xs + h * Rc * Kc + kl * 16U, Kc,
+            core::w4a16::wave_rows<Rc, MaxG * 4U, MaxG, SingleDecode, StoreDots>(wq, ws, n_pad, K, k0, k0 + MaxG * 4U, quad * 4U, xs + h * Rc * Kc + kl * 16U, Kc,
                 lane, R - h * Rc < Rc ? R - h * Rc : Rc,
                 [&](unsigned, unsigned r, unsigned column, float value) { res[h * Rc + r][column & 1U] += value; },
-                SingleDecode ? staged_dot + wave * R * 32U : nullptr);
+                SingleDecode && StoreDots ? staged_dot + wave * R * 32U : nullptr);
     }
     __syncthreads();  // every wave is done reading the staged rows: reuse them for the partial sums
     float* part = reinterpret_cast<float*>(xs);

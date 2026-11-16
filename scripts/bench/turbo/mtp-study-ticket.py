@@ -21,6 +21,8 @@ for arm in plan:
     if left < 25:
         raise SystemExit(f"insufficient startup budget before {arm['tag']}: {left}s")
     env = dict(os.environ, LEFT=str(left), SLOTS="2", MAXTOK=str(arm.get("tokens", 192)))
+    env.update({str(k): str(v) for k, v in arm.get("adapter_env", {}).items()})
+    env["TURBODEC_HTTP_BATCH"] = str(arm.get("http_batch", 16))
     env["TURBODEC_PROMPT_MODULE"] = str(kit / arm.get("prompts", "decode-study-inventory.py"))
     env["XARGS"] = shlex.join(arm.get("args", []))
     # XARGS is consumed as shell words by the existing adapter. Only simple
