@@ -115,7 +115,7 @@ old `--profile NAME:PROMPT.u32:STEPS` still works, with a notice). Quality bar:
 `tools/strix-gate/fast_logit_gate.py compare --mode turbo` (see its README).
 
 Qwen on CUDA (sm_120, `strix-cuda-qwen-serve` and `qwen_decode_e2e`, one resolver
-in [cuda_qwen_turbo.hpp](../../include/strix/cuda_qwen_turbo.hpp)): `--profile turbo
+in [cuda/qwen_turbo.hpp](../../include/strix/cuda/qwen_turbo.hpp)): `--profile turbo
 --turbo-weights onfly` converts the dense Q8_0 projections (GDN in/out, QSA q/k/v/o,
 shared expert) once at load to NVFP4 (identity `onfly-nvfp4-rtn-g16`, about +1.6 GB
 beside the pack) and decode windows read them through the shared

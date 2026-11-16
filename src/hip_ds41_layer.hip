@@ -15,6 +15,7 @@
 #include "strix/hip_ds41_rn_wide.hpp"
 #include "strix/hip_ds41_f8_rows_fast.hpp"
 
+#include "strix/ds41_attention.hpp"  // q_b's RoPE image (enqueue_q_b_rope_image): RopeRow, rope_pair
 #include "strix/hip_ds41_formats.hpp"
 
 #include <hip/hip_fp16.h>
@@ -3319,18 +3320,47 @@ static bool fast_dense_on() {
     // a running DevicePrefill's own precision first (strix/ds41_prefill_precision.hpp), else the override or env
     return effective_fast(&PrefillPrecision::fast_dense, fast_dense_mode, env);
 }
-static bool enqueue_fast_dense(const Q8A8DensePrefillView& v, void* stream) {
-    static const unsigned min_rows = fast_profile::dense_min_rows();
-    namespace q8a8 = strix::core::f16_dense_tall::q8a8;
-    q8a8::View f{};
+static strix::core::f16_dense_tall::q8a8::View fast_dense_view(const Q8A8DensePrefillView& v) {
+    strix::core::f16_dense_tall::q8a8::View f{};
     f.weight = v.weight, f.codes = v.codes, f.deltas = v.deltas, f.out = v.out;
     f.row_bytes = (v.row_width ? v.row_width : v.width) / 32U * 34U;
     f.k_bytes = v.k_offset / 32U * 34U;
     f.in = v.width, f.count = v.count, f.rows = v.rows, f.x_stride = v.x_stride, f.out_stride = v.out_stride;
     f.accumulate = v.accumulate ? 1U : 0U;
+    return f;
+}
+static bool enqueue_fast_dense(const Q8A8DensePrefillView& v, void* stream) {
+    static const unsigned min_rows = fast_profile::dense_min_rows();
+    namespace q8a8 = strix::core::f16_dense_tall::q8a8;
+    const q8a8::View f = fast_dense_view(v);
     if (v.rows < min_rows || !q8a8::supported(f)) return false;
     q8a8::enqueue_parts(f, v.k_parts, as_stream(stream));
     hip_check(hipGetLastError(), "Q8_0 x A8 FP16 dense launch");
+    return true;
+}
+
+// q_b's operand image for the flash core's query_op (hip_ds41_attention_flash.inl FlashAttentionQ16Policy): the pair
+// transform is the flash prologue's rope512 (rope_pair on pairs (d, d + 1), d = o % 512 >= 448, pair (d - 448) / 2,
+// the row's table), so image = to_bf16(rope(q)) with the bits query16 + frag_from_f32 produced from the FP32 q.
+struct QbRopeImage {
+    using Args = const attn::RopeRow*;
+    static constexpr strix::attn_core::tile::Operand kOp = strix::attn_core::tile::Operand::bf16;
+    static __device__ __forceinline__ void pair(const Args& rope, unsigned r, unsigned o, float& x0, float& x1) {
+        const unsigned d = o % attn::kHeadDim;
+        if (d < attn::kHeadDim - attn::kRopeDim) return;
+        const unsigned p = (d - (attn::kHeadDim - attn::kRopeDim)) / 2U;
+        attn::rope_pair(x0, x1, rope[r].c[p], rope[r].s[p], false);
+    }
+};
+bool enqueue_q_b_rope_image(const Q8A8DensePrefillView& v, std::uint16_t* image, const void* rope, void* stream) {
+    static const unsigned min_rows = fast_profile::dense_min_rows();
+    namespace q8a8 = strix::core::f16_dense_tall::q8a8;
+    const q8a8::View f = fast_dense_view(v);
+    if (!fast_dense_on() || rope == nullptr || v.k_parts != 1U || v.a8_codes != nullptr || v.rows < min_rows ||
+        v.count % attn::kHeadDim != 0U || !q8a8::supported_image(f, image))
+        return false;
+    q8a8::enqueue_image<QbRopeImage>(f, image, static_cast<const attn::RopeRow*>(rope), as_stream(stream));
+    hip_check(hipGetLastError(), "Q8_0 x A8 FP16 dense q image launch");
     return true;
 }
 

@@ -12,7 +12,7 @@
 #include <vector>
 
 #include "strix/cuda/core/nvfp4_a8_cuda.hpp"
-#include "strix/cuda_qwen_dense.hpp"
+#include "strix/cuda/qwen_dense.hpp"
 
 namespace a8 = strix::cuda::core::nvfp4_a8;
 namespace dn = strix::cuda::qwen_dense;

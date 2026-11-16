@@ -1,5 +1,5 @@
 // ONE RESOLVER (Qwen CUDA): the serve and CLI spellings of the same request resolve to the same effective values
-// through strix/cuda_qwen_turbo.hpp; TURBO identities, refusals (never a silent native fallback), prefix identity
+// through strix/cuda/qwen_turbo.hpp; TURBO identities, refusals (never a silent native fallback), prefix identity
 // namespace, and the HIP / INT4 identities unchanged.
 #include <cstdio>
 #include <filesystem>
@@ -7,8 +7,8 @@
 #include <string>
 #include <vector>
 
-#include "strix/cuda_qwen_prefix_identity.hpp"
-#include "strix/cuda_qwen_turbo.hpp"
+#include "strix/cuda/qwen_prefix_identity.hpp"
+#include "strix/cuda/qwen_turbo.hpp"
 
 namespace qt = strix::cuda::qwen_turbo;
 namespace tb = strix::profile::turbo;

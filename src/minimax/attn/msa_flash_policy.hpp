@@ -70,3 +70,10 @@ struct MsaFlashPolicy {
     }
     static __device__ __forceinline__ float* out(const Args&, const Row& x) { return x.o; }
 };
+// The same policy reading the q projection finish's operand image (DecodeView::q16 / q16_lo; query_op of the key-split
+// core): the image is pack2<bf16> of query()'s values (load4 + norm_rope_lane, msa_norm_rope.hpp), so the fragments
+// and every result are the same bits; no FP32 load, norm or RoPE in the prologue. Same offset as x.q in the image.
+struct MsaFlashQ16Policy : MsaFlashPolicy {
+    static __device__ __forceinline__ const std::uint16_t* query_op(const Args& a, const Row& x) { return a.p.window.q16 + (x.q - a.p.window.q); }
+    static __device__ __forceinline__ const std::uint16_t* query_op_lo(const Args& a, const Row& x) { return a.p.window.q16_lo + (x.q - a.p.window.q); }
+};
