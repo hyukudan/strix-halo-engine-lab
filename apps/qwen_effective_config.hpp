@@ -1805,7 +1805,7 @@ inline EffectiveConfig resolve_effective_config(const RequestedOptions& request,
     // options and model writers; no candidate reaches process switch readers yet.
     auto proposed = request;
     admit_product_profile(proposed.options);
-    qwen::profile::apply(proposed.options.product_profile, [&](const char* key, const char* value) {
+    qwen::profile::propose_exports(proposed.options.product_profile, [&](const char* key, const char* value) {
         if (!qwen::profile::metadata_environment(key)) proposed.environment[key] = value;
         return true;
     });

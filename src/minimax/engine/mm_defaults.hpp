@@ -76,6 +76,15 @@ PrefillPolicy prefill_policy(const Lookup& env);
 strix::pair::PipelineChoice pair_pipeline_choice(std::uint64_t rows);
 const profile::Engine& profile_engine();                 // tag "minimax-pair", table profile_table
 profile::Resolution profile_resolution(const Lookup& env);
+// Product profile (default|fast|quality|turbo) and TURBO weight toggle of strix-minimax-rank and strix-minimax-serve:
+// print_or_apply() takes '--profile NAME' (a product name) and --turbo-weights / --turbo-weight-bits /
+// --turbo-weights-pack from argv and exports them (STRIX_MM_PRODUCT_PROFILE, STRIX_TURBO_WEIGHTS*) before anything
+// resolves, so both apps feed profile_resolution() the same values. The per-phase timing session is
+// '--timing-profile NAME:PROMPT.u32:STEPS'; the old '--profile NAME:PROMPT.u32:STEPS' stays accepted with one notice.
+inline constexpr const char* kProductProfileEnv = "STRIX_MM_PRODUCT_PROFILE";
+// The apps' own option loops call this: true when `a` is one of the options above (its value skipped). `timing`
+// (rank only; nullptr in serve) receives a timing session spec ('--timing-profile', or the old '--profile' spelling).
+bool product_option(const std::string& a, const std::function<std::string()>& next, std::string* timing);
 // Cache / receipt identity of the active prefill policies; empty with every governed row at its builtin and the EXL3
 // MoE format. This field's omission alone does not establish complete cache compatibility.
 std::string prefill_identity(const Lookup& env);

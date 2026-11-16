@@ -32,7 +32,10 @@ struct Config {
     std::string mtp_sidecar_gguf;      // MTP sidecar (distillG/D Q8_0); empty = no MTP rows (non-MTP node route)
     std::string tables_dir;            // gfx1151 math tables (amd_math_tables.hpp)
     std::string rope_table;            // cs[position][32] float2 from the node (rope_cs_262144.bin)
-    std::uint32_t max_positions = 32768;
+    std::uint32_t max_positions = 32768;   // context cap: the largest session; rope/QSA workspaces are sized to it
+    // Positions of session 0 and of create_session() without an argument (0: max_positions). A server sets it small
+    // and sizes each request's session with reserve_session() (strix/serve/session_reservation.hpp).
+    std::uint32_t session_positions = 0;
     std::vector<std::uint32_t> block_schedule{1024, 2048, 4096, 8192};  // rows per block; the last entry repeats
     bool tail_large = true;           // rotate final remainder to front; same count and capacity (--block-schedule default = off)
     std::uint32_t final_block_rows = 0; // optional tail reservation within loaded max block
@@ -171,10 +174,18 @@ public:
     Draft draft(std::uint32_t pending, std::uint32_t depth, float min_probability);
 
     // ---- multi-session decode (Config::decode)
-    // A new session (fresh state, length 0): allocates ~P * 30 KB + 0.23 GB of device memory (P = max_positions).
+    // A new session (fresh state, length 0): allocates session_bytes_at(P) = ~P * 31.6 KB + 0.23 GB of device memory
+    // (P = Config::session_positions, else max_positions; or `positions`).
     SessionId create_session();
+    SessionId create_session(std::uint64_t positions);
     void destroy_session(SessionId session);        // not session 0; drops the graphs that captured it
-    [[nodiscard]] std::uint64_t session_bytes() const;  // device bytes of one session's state
+    // New position buffers of 1..max_positions for an idle session (session 0 too): its state is discarded (length 0)
+    // and the graphs that captured it are dropped. Every write past capacity() is refused (run, chunks, verify, drafts).
+    void reserve_session(SessionId session, std::uint64_t positions);
+    [[nodiscard]] std::uint64_t capacity(SessionId session) const;
+    [[nodiscard]] std::uint64_t session_bytes() const;  // device bytes of session 0's state
+    [[nodiscard]] std::uint64_t session_bytes(SessionId session) const;
+    [[nodiscard]] std::uint64_t session_bytes_at(std::uint64_t positions) const;  // exact bytes a session of P allocates
     [[nodiscard]] std::uint64_t length(SessionId session) const;
     // Component-major rows: 12 KV arrays (count * 1024 BF16 each), 12 raw-index arrays
     // (count * 128 BF16 each), then MTP KV and raw index when a sidecar is loaded.
