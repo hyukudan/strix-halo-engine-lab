@@ -11,8 +11,9 @@ and per lane, cycle ms (draft + target), window tok/s (emitted / cycle ms), the 
 end-to-end tok/s and the ordered per-request id hashes. --pairs A,B names two arm prefixes: bursts NAME=A<k> and
 B<k> of one concurrency are compared (ids per request, window tok/s, wall tok/s). Only the standard library.
 
-The result burst is the one whose live lanes (min(concurrency, slots)) equal the C of NAME (c<C>-...): exactly one
-must match, or RES.JSON#K names burst K, which must match too; otherwise the run stops (no silent first burst).
+The result burst is the one whose live lanes equal the C of NAME (c<C>-...): use min(concurrency, slots), or
+observed steady.active_lanes backed by steady cycles when slots are unknown. Exactly one must match, or
+RES.JSON#K names burst K, which must match too; otherwise the run stops (no silent first burst).
 The identity verdict is fail-closed: IDENTICAL only with both arms present, every burst successful (0 failed), the
 same request count everywhere and a complete non-null hash per request; otherwise UNAVAILABLE (reason). With --pairs
 the exit status is 1 unless every compared concurrency is IDENTICAL.
@@ -53,7 +54,16 @@ def topo(members):
 def live_lanes(burst):
     slots = burst.get("slots")
     c = burst.get("concurrency")
-    return min(c, slots) if isinstance(c, int) and isinstance(slots, int) and slots > 0 else c
+    if type(c) is not int or c <= 0:
+        return None
+    if type(slots) is int and slots > 0:
+        return min(c, slots)
+    steady = burst.get("steady")
+    if isinstance(steady, dict):
+        active, count = steady.get("active_lanes"), steady.get("cycles")
+        if type(active) is int and 0 < active <= c and type(count) is int and count > 0:
+            return active
+    return None
 
 
 def select_burst(res, lanes, index=None):
@@ -63,12 +73,18 @@ def select_burst(res, lanes, index=None):
         if not 0 <= index < len(bursts):
             raise ValueError("burst index %d out of range (%d bursts)" % (index, len(bursts)))
         b = bursts[index]
-        if live_lanes(b) != lanes:
-            raise ValueError("burst %d has %s live lanes, the window has %d" % (index, live_lanes(b), lanes))
+        active = live_lanes(b)
+        if active is None:
+            raise ValueError("burst %d: unavailable live-lane evidence" % index)
+        if active != lanes:
+            raise ValueError("burst %d has %s live lanes, the window has %d" % (index, active, lanes))
         return b
     matches = [b for b in bursts if live_lanes(b) == lanes]
     if len(matches) != 1:
-        raise ValueError("%d bursts with %d live lanes (of %d): name one with RES.JSON#K" % (len(matches), lanes, len(bursts)))
+        unavailable = sum(live_lanes(b) is None for b in bursts)
+        reason = "; %d bursts have unavailable live-lane evidence" % unavailable if unavailable else ""
+        raise ValueError("%d bursts with %d live lanes (of %d): name one with RES.JSON#K%s"
+                         % (len(matches), lanes, len(bursts), reason))
     return matches[0]
 
 

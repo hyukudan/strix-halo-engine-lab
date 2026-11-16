@@ -61,6 +61,35 @@ class SelectBurst(unittest.TestCase):
         # Eight requests on seven slots decode seven live lanes.
         self.assertEqual(sc.select_burst(dict(bursts=[burst(8, ["h"] * 8, slots=7)]), 7)["concurrency"], 8)
 
+    def test_unknown_slots_observed_lanes(self):
+        b = burst(8, ["h"] * 8, slots=None)
+        b["steady"].update(active_lanes=7, cycles=100)
+        self.assertIs(sc.select_burst(b, 7), b)
+        self.assertIs(sc.select_burst(b, 7, 0), b)
+        with self.assertRaises(ValueError):
+            sc.select_burst(b, 8, 0)
+        with self.assertRaises(ValueError):
+            sc.select_burst(dict(bursts=[b, b]), 7)
+        self.assertIs(sc.select_burst(dict(bursts=[b, b]), 7, 1), b)
+
+    def test_unknown_slots_require_valid_observation(self):
+        invalid = [None, {}, dict(active_lanes=7), dict(cycles=100)]
+        invalid += [dict(active_lanes=n, cycles=100) for n in (None, 0, -1, 9, True, 7.0, "7")]
+        invalid += [dict(active_lanes=7, cycles=n) for n in (None, 0, -1, True, 100.0, "100")]
+        for steady in invalid:
+            with self.subTest(steady=steady):
+                b = burst(8, ["h"] * 8, slots=None)
+                b["steady"] = steady
+                self.assertIsNone(sc.live_lanes(b))
+                for index in (None, 0):
+                    with self.assertRaisesRegex(ValueError, "unavailable.*evidence"):
+                        sc.select_burst(b, 8, index)
+
+    def test_known_slots_take_precedence(self):
+        b = burst(8, ["h"] * 8, slots=8)
+        b["steady"].update(active_lanes=7, cycles=100)
+        self.assertEqual(sc.live_lanes(b), 8)
+
 
 class IdentityVerdict(unittest.TestCase):
     def test_identical_and_differ(self):
@@ -133,6 +162,16 @@ class MainEndToEnd(unittest.TestCase):
         self.assertEqual(rc, 0, out)
         self.assertIn("ids IDENTICAL", out)
         self.assertIn("wall 90.0 -> 99.0", out)
+
+    def test_unknown_slots_pair_automatic_and_explicit(self):
+        b = burst(8, ["h"] * 8, slots=None)
+        b["steady"].update(active_lanes=7, cycles=100)
+        for suffix in ("", "#0"):
+            with self.subTest(suffix=suffix):
+                rc, out = self.run_main(dict(a=b, b=b),
+                                        [("c7-A1", 1, 4, "a", suffix), ("c7-B1", 1, 4, "b", suffix)])
+                self.assertEqual(rc, 0, out)
+                self.assertIn("ids IDENTICAL", out)
 
     def test_only_one_arm_fails_closed(self):
         files = dict(a=dict(bursts=[burst(7, ["h"] * 7)]))
