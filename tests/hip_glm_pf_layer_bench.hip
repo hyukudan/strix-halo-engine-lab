@@ -649,6 +649,28 @@ int main(int argc, char** argv) {
                 std::printf("   flash pipelined loads (STRIX_ATTN_FLASH_PF %d vs %d): o-bar + out bitwise %s\n", pf ? 1 : 0, pf ? 0 : 1,
                             same ? "equal" : "DIFFER");
                 if (!same) die("STRIX_ATTN_FLASH_PF arms differ (must be bitwise)");
+                // FP16 o-bar image (STRIX_GLM_PF_MLA_OB16) vs the FP32 o-bar: the out GEMM output must be the same bits
+                // (both round o / l to FP16 RNE); report the differing elements by row / head if not.
+                const char* hb = std::getenv("STRIX_GLM_PF_MLA_OB16");
+                const std::optional<std::string> kb = hb ? std::optional<std::string>(hb) : std::nullopt;
+                strix::env_arms::set_env("STRIX_GLM_PF_MLA_OB16", std::string("0"));
+                strix::env_arms::generation_ref().fetch_add(1, std::memory_order_acq_rel);
+                P::mla_attention_rows_versions(slot, tok, n, qb, kv_b, kHeadsR, qt, e, ob, mo, C, g_hs, 7, ov[2], gv[2]);
+                hok(hipMemcpyAsync(mo_f.data(), mo, nmo * 4, hipMemcpyDeviceToHost, g_hs), "cp");
+                hok(hipStreamSynchronize(g_hs), "sync");
+                strix::env_arms::set_env("STRIX_GLM_PF_MLA_OB16", kb);
+                strix::env_arms::generation_ref().fetch_add(1, std::memory_order_acq_rel);
+                std::size_t nd = 0, first = nmo, last = 0;
+                double dmax = 0.0;
+                for (std::size_t i = 0; i < nmo; ++i)
+                    if (std::memcmp(&mo_q32[i], &mo_f[i], sizeof(float)) != 0) {
+                        ++nd;
+                        first = std::min(first, i);
+                        last = i;
+                        dmax = std::max(dmax, static_cast<double>(std::fabs(mo_q32[i] - mo_f[i])));
+                    }
+                std::printf("   MLA out, o-bar image OB16 default vs OB16=0: %zu / %zu elements differ (first %zu last %zu, per row %zu, max|d| %.3e)\n",
+                            nd, nmo, nd ? first : 0, nd ? last : 0, nmo / C, dmax);
             }
         }
         std::printf("== C=%u t0=%u (DSA rows see P up to %u pools, n up to %u tokens); passes bitwise equal: %s\n", C, t0, cap / kKpool,
