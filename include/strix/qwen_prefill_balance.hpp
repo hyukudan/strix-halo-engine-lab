@@ -2,6 +2,8 @@
 #include "strix/serve/json.hpp"
 #include "strix/pair/balance.hpp"
 #include "strix/pair/pipe.hpp"
+#include "strix/pair/regime.hpp"
+#include "strix/lever.hpp"
 #include <array>
 #include <algorithm>
 #include <vector>
@@ -245,5 +247,98 @@ inline ChunkChoice choose_chunk(const char* value, std::uint32_t legacy, std::ui
             return {rows, "auto-cost-model"};
     }
     return {legacy, "auto-transfer-bound"};
+}
+// Measured two-stage costs (14-nov pair receipts: exact, host USB4 route, cut 23): per chunk, both stages,
+// P(c) = 168 + 0.5474 c ms (2,415 at 4,096 rows, 1,288 at 2,048, 752 at 1,024); seam latency 35 ms once;
+// hand-off 28 + 0.0028 n ms (51 at 8K, 120 at 32K); one node 0.536 ms/row with its own T8192/T16384 tiles.
+inline constexpr pair::PipelineCost pipeline_cost{168.0, 0.5474, 35.0, 28.0, 0.0028, 0.536};
+// This cut-23 calibration also routes explicit alternate cuts; those need separate native qualification.
+inline constexpr std::array<std::uint32_t, 5> pipeline_chunk_candidates{1024U, 2048U, 4096U, 8192U, 16384U};
+// qwen.pair_chunk_policy: ON = length (pair::choose_pipeline picks route and chunk per prompt length),
+// OFF = fixed (4,096-row chunks, pipeline from 28,672 rows without a cost file). Both arms are bitwise.
+// ON from 8,192 context tokens (measured, exact, logits equal to one node): 8K 4 x 2,048 3,302-3,309 ms
+// (2,476-2,481 tok/s) vs fixed 4,358-4,365 ms; 32K identical plan (2,932-2,968 both); 128K 16 x 8,192
+// 41,668 ms (3,146 tok/s) vs 32 x 4,096 42,778 ms. Below 8,192 (4K: 4 x 1,024 predicted) not measured: fixed.
+inline constexpr lever::Decl chunk_policy_lever{
+    "qwen.pair_chunk_policy", "STRIX_QWEN_PAIR_CHUNK_POLICY", lever::Exactness::bitwise, false,
+    {lever::Axis::context, 8192U, false, true}, {},
+    "pair receipts 14/15-nov: 8K 2,476-2,481 vs 1,877-1,880 tok/s; 32K equal; 128K 3,146 vs 3,064"};
+// qwen.pair_single_tiles: when the pair declines a prompt (single route), rank 0 keeps the one-node tile
+// instead of the pipeline chunk (8K: 4,096-row tiles 1,752 tok/s vs one node's 8,192-row tiles 1,860).
+inline constexpr lever::Decl single_tiles_lever{
+    "qwen.pair_single_tiles", "STRIX_QWEN_PAIR_SINGLE_TILES", lever::Exactness::bitwise, true, {}, {},
+    "pair receipts 14-nov: 8K single route 1,752 tok/s at 4,096-row tiles, one node 1,853-1,867"};
+enum class PairExecution { handoff, prefill_only };
+struct PairPolicy {
+    lever::Choice chunk_policy;
+    lever::Choice single_tiles;
+    PairExecution execution = PairExecution::handoff;
+};
+// Select once before read-only inspection and retain these choices for execution.
+inline PairPolicy resolve_pair_policy(std::uint64_t prompt, PairExecution execution) {
+    const lever::Inputs inputs{0U, prompt, 0U};
+    return {lever::select(chunk_policy_lever, inputs), lever::select(single_tiles_lever, inputs), execution};
+}
+inline std::string inspect_pair_policy(std::string_view config, const PairPolicy& policy) {
+    using serve::Json;
+    const auto control = [](lever::Choice choice) {
+        return Json(Json::Object{
+            {"requested", choice.origin == lever::Origin::explicit_switch ? (choice.on ? "1" : "0") : "auto"},
+            {"effective", choice.on}, {"source", lever::origin_name(choice.origin)}});
+    };
+    auto out = serve::parse_json(config);
+    out.as_object().emplace_back("qwen_pair", Json::Object{
+        {std::string(chunk_policy_lever.env), control(policy.chunk_policy)},
+        {std::string(single_tiles_lever.env), control(policy.single_tiles)},
+        {"execution", policy.execution == PairExecution::handoff ? "handoff" : "prefill-only"},
+        {"route", "pending-device-admission"}, {"tile_rows", nullptr}});
+    return out.dump();
+}
+struct PairRoute {
+    ChunkChoice chunk;               // pipeline chunk rows (the pipe's tile)
+    PromptRoute route;               // prefix > 0: the pipeline prefills that prefix
+    std::uint32_t tile_rows = 0;     // known-prefix prefill tile this process runs
+    std::uint64_t chunks = 0;        // actual pipeline chunks (not the model's candidate)
+    const char* policy = "fixed";
+    pair::PipelineChoice model{};    // length policy only: the predicted walls
+};
+// The one resolver of the pair route (CLI and any server front end call this, never a second branch).
+// Transfer-bearing costs retain the old cost-model route. Layer-only costs still select the cut,
+// but use the calibrated length route when enabled. An explicit chunk is its only candidate.
+inline PairRoute resolve_pair_route(std::uint64_t prompt, std::uint32_t legacy, const char* chunk_value,
+    const LayerCosts* costs, const CutPrediction& prediction, bool length_policy, bool single_tiles,
+    PairExecution execution = PairExecution::handoff) {
+    PairRoute out;
+    out.chunk = choose_chunk(chunk_value, legacy, prompt, costs, prediction);
+    if (length_policy && !(costs && costs->has_transfer)) {
+        out.policy = "length";
+        const std::array<std::uint32_t, 1> explicit_rows{out.chunk.rows};
+        const bool fixed_rows = chunk_value != nullptr;
+        const auto candidates = fixed_rows ? std::span<const std::uint32_t>(explicit_rows)
+                                           : std::span<const std::uint32_t>(pipeline_chunk_candidates);
+        // Prefill-only runs the entire prompt (below), so its candidates must hold for the full prompt;
+        // trimming to a legal prefix is only sound when the suffix is handed off.
+        const bool full_prompt = execution == PairExecution::prefill_only;
+        out.model = pair::choose_pipeline(prompt - prompt % 8U, pipeline_cost, candidates, [&](std::uint32_t rows) {
+            if (full_prompt) return rows <= legacy && rows < prompt && valid_chunk(rows, prompt);
+            const auto prefix = legal_prefix(prompt, rows);
+            return rows <= legacy && rows < prefix && valid_chunk(rows, prefix);
+        });
+        if (out.model.mode == pair::Mode::pipeline) {
+            if (!fixed_rows) out.chunk = {out.model.chunk, "length-model"};
+            out.route = {legal_prefix(prompt, out.chunk.rows), "pipeline-length-model"};
+        } else {
+            out.route = {0U, "single-length-model"};
+        }
+    } else {
+        out.route = choose_prompt_route(prompt, out.chunk.rows, costs, prediction);
+    }
+    // Prefill-only has no single-node fallback or suffix handoff; it always runs the entire prompt.
+    // Execution still validates full-prompt tails before launching the pipe.
+    if (execution == PairExecution::prefill_only) out.route = {prompt, "pipeline-prefill-only"};
+    out.tile_rows = out.route.prefix == 0U && single_tiles ? legacy : out.chunk.rows;
+    if (out.route.prefix && out.tile_rows)
+        out.chunks = (out.route.prefix + out.tile_rows - 1U) / out.tile_rows;
+    return out;
 }
 } // namespace strix::qwen_pp

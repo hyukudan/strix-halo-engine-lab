@@ -15,6 +15,7 @@
 // calls; the engine owns weights and state, seams own only their scratch.
 #include "glm/spec/glm_spec_merge.hpp"
 #include "strix/pair/producer_publish.hpp"
+#include "strix/block_summary_state.hpp"
 
 #include <array>
 #include <cstddef>
@@ -496,6 +497,10 @@ public:
     // Inverse of state_bytes_upto (same capacity / layers / mtp): reset(slot), then every segment written back, so the
     // slot continues at `frontier` as if it had run there (G4 runs across turns; gate SR). Throws on a size mismatch.
     void restore_state(std::uint32_t slot, std::span<const std::uint8_t> bytes, std::uint64_t frontier);
+    // The same with the DSA index key / gate in `index_rows` form: open_tail carries only the open pool block's rows
+    // [frontier - frontier % 4, frontier) (hand-off v3/v4); the closed blocks' rows stay at their reset value, never read
+    // (strix/block_summary_state.hpp contract). Refused on kv-sharded DSA.
+    void restore_state(std::uint32_t slot, std::span<const std::uint8_t> bytes, std::uint64_t frontier, strix::state::RawRows index_rows);
 
     void set_profiling(bool on);
     [[nodiscard]] const Profile& profile() const;
