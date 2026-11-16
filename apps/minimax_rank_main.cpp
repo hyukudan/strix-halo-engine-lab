@@ -985,8 +985,7 @@ std::uint64_t ab_flag(mm::Engine& eng, const std::string& flag, const std::vecto
     const FlashArm fa = flag == "pfmsaflash" ? flash_arm("STRIX_MM_AB_FLASH_A", "1") : FlashArm{0U, 0U};
     const FlashArm fb = flag == "pfmsaflash" ? flash_arm("STRIX_MM_AB_FLASH_B", "3") : FlashArm{0U, 0U};
     const unsigned flash0 = eng.prefill_msa_flash(), rg_rows0 = eng.prefill_rg_rows();
-    if (flag == "pfmsaflash") std::printf("pfmsaflash arms A=%u r%u B=%u r%u
-", fa.mode, fa.rows, fb.mode, fb.rows);
+    if (flag == "pfmsaflash") std::printf("pfmsaflash arms A=%u r%u B=%u r%u\n", fa.mode, fa.rows, fb.mode, fb.rows);
     const std::string pipe_on = std::getenv("STRIX_MM_AB_PIPE") != nullptr ? std::getenv("STRIX_MM_AB_PIPE") : "2";  // moepipe B form
     const char* pipe_env = std::getenv("STRIX_MMX_MOE_PIPE");  // restored after the A/B
     const std::string moe_pipe0 = pipe_env != nullptr ? pipe_env : "";
