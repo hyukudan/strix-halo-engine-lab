@@ -54,10 +54,14 @@ ascending k. Named policies sit on top of it. The policy `dense-q8a8-f16-v1`
 Q8_0 weights x A8 activations as one FP16 chain per output instead of the exact integer products; DeepSeek V4.1
 binds it (worked example below).
 Its stagers decode two weights per packed FP16 operation (`kWPacked`, `STRIX_F16_Q8A8_WPACK`, default on, same bits;
-the kit `ds41/dense-forms` times both forms and gates the bits). The optional `kColumnFast` trait puts the column
-blocks on `grid.x`, so the CTAs of one row block share x in L2 (same bits). MiniMax's FAST index projection
-`minimax-index-proj-wmma-v1` ([`src/minimax/attn/index_proj.hpp`](../../src/minimax/attn/index_proj.hpp)) binds the
-core with `stage()` reading its packed weights and, from 2,048 rows, x pre-rounded into k-tile-major FP16 tiles. Kit:
+the kit `ds41/dense-forms` times both forms and gates the bits). The optional `kColumnFast` trait puts the column blocks on `grid.x`, so the CTAs
+of one row block share x in L2 (same bits). MiniMax's FAST index projection `minimax-index-proj-wmma-v1`
+([`src/minimax/attn/index_proj.hpp`](../../src/minimax/attn/index_proj.hpp)) binds the core with `stage()` reading its
+packed weights and, from 2,048 rows, x pre-rounded into k-tile-major FP16 tiles. That x16 tile form is shared
+(`X16Cols<Base>`, `enqueue_x16_tiles`, `kX16Rows` in the core; same bits as the FP32 x path): MiniMax binds it for
+the index projections (`STRIX_MM_PF_IDX_WMMA=1`, layers `STRIX_MM_PF_IDX_WMMA_LAYERS`, default 40-59, opt-in until its
+gate), GLM for the WMMA groups of x in `kda_wmma::dense_group` (KDA f_a | g_a | b; `STRIX_GLM_PF_X16=0` = direct form)
+and its FAST indexer projections `glm-pf-idxproj-wmma-v1` (`STRIX_GLM_PF_IDXPROJ_WMMA=1`, opt-in until its gate). Kit:
 `STRIX_MMATTN_BENCH=wmma` on `src/minimax/attn/index_proj_tests.hip` (strict ABAB, series `x16` / `diag` / `orders`
 in `STRIX_MMATTN_WMMA_SERIES`; build line in the file header).
 

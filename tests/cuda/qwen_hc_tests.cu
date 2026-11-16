@@ -33,6 +33,7 @@
 #include "qwen_fixture.hpp"
 #include "qwen_gguf_host.hpp"
 #include "strix/cuda/qwen_hc.hpp"
+#include "strix/cuda/amd_math.cuh"
 
 namespace hc = strix::cuda::qwen_hc;
 namespace am = strix::cuda::amdmath;
@@ -860,6 +861,47 @@ static void test_hc_mma(const am::Tables& t, const char* tag, float down_lo, flo
         CK(cudaMemset(normalized.p, 0xff, normalized.n * 4)); CK(cudaMemset(injection.p, 0xff, injection.n * 4)); CK(cudaMemset(out.p, 0xff, out.n * 2));
         a.mma = true; hc::hc_mix(a, t, nullptr); CK(cudaDeviceSynchronize());
         const auto nm = normalized.get(); const auto im = injection.get(); const auto om = out.get();
+        // Keep the independent full-workspace references above. Compact owns only
+        // inverses and low values; compare its low/injection/output for both forms,
+        // including separate producer/consumer calls.
+        if (rows <= 65U) for (bool mma : {false, true}) {
+            a.mma = mma;
+            a.workspace_layout = hc::HcWorkspaceLayout::compact;
+            for (bool staged : {false, true}) {
+                CK(cudaMemset(normalized.p, 0xff, normalized.n * sizeof(float)));
+                if (staged) for (unsigned stage : {1U, 2U, 4U}) hc::hc_mix(a, t, nullptr, stage);
+                else hc::hc_mix(a, t, nullptr);
+                CK(cudaDeviceSynchronize());
+                const auto compact = normalized.get();
+                std::vector<float> expected_low, compact_low;
+                const auto& full = mma ? nm : ne;
+                for (unsigned row = 0; row < rows; ++row) for (unsigned k = 0; k < RK; ++k) {
+                    const auto at = static_cast<std::size_t>(row) * P + W + k;
+                    expected_low.push_back(full[at]); compact_low.push_back(compact[at]);
+                }
+                const std::string label = std::string("compact ") + (mma ? "mma" : "exact") +
+                    (staged ? " staged" : " complete") + " rows=" + std::to_string(rows);
+                same(label + " low", expected_low, compact_low, false, RK);
+                if (with_inject) same(label + " injection", mma ? im : ie, injection.get(), false, S);
+                same(label + " output", mma ? om : oe, out.get(), false, H);
+            }
+        }
+        // A valid scalar input view need not satisfy compact vector alignment.
+        if (rows == 16U) {
+            auto shifted_input = input; shifted_input.insert(shifted_input.begin(), 0);
+            auto shifted_norm = w.norm; shifted_norm.insert(shifted_norm.begin(), 0.0F);
+            Dev<std::uint16_t> unaligned_input(shifted_input);
+            Dev<float> unaligned_norm(shifted_norm);
+            a.input = unaligned_input.p + 1; a.norm = unaligned_norm.p + 1;
+            a.workspace_layout = hc::HcWorkspaceLayout::automatic;
+            for (bool mma : {false, true}) {
+                a.mma = mma; hc::hc_mix(a, t, nullptr); CK(cudaDeviceSynchronize());
+                same("unaligned full workspace", mma ? nm : ne, normalized.get(), false, P);
+                same("unaligned output", mma ? om : oe, out.get(), false, H);
+            }
+            a.input = in.p; a.norm = norm.p;
+        }
+        a.workspace_layout = hc::HcWorkspaceLayout::full;
         const unsigned tail = rows % 64U ? rows - rows % 64U : (rows > 64U ? rows - 64U : 0U);
         Err low, lowc[3], lowk[2], io, ioc[3], ou, ouc[3], ouf[3];
         const auto rc = [&](unsigned r) { return r < 16U ? 0U : (r >= tail ? 2U : 1U); };

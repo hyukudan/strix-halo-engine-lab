@@ -87,4 +87,13 @@ Kernels select(const Caps& c) noexcept {
     return table;
 }
 
+const Kernels* registered_weight_kernels(Isa isa) noexcept {
+    switch (isa) {
+    case Isa::scalar: return &reference_kernels();
+    case Isa::avx512: return caps().avx512f && caps().avx512bw ? arch::avx512::kernels() : nullptr;
+    case Isa::neon: return caps().neon ? arch::neon::kernels() : nullptr;
+    default: return nullptr;
+    }
+}
+
 }  // namespace strix::cpu

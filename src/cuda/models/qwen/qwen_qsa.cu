@@ -43,8 +43,11 @@ void check(cudaError_t e, const char* what) {
 constexpr unsigned kIdxRows = 8, kIdxOuts = 4, kIdxOutputs = kIndexQWidth + kIndexDim, kIdxSlice = 64;
 constexpr unsigned kIdxPairs = kIdxRows * kIdxOuts;  // 32
 constexpr std::size_t kIdxSmem = kIdxRows * kHidden * sizeof(std::uint16_t) + kIdxPairs * 256U * sizeof(float);
-static_assert(kIdxSlice % kIdxOuts == 0 && kIdxOutputs % kIdxSlice == 0);
+// Decode form (rows <= 8): kIdxWide outputs per CTA (same per-output arithmetic), 640/kIdxWide CTAs instead of 10.
+constexpr unsigned kIdxWide = 4;
+static_assert(kIdxSlice % kIdxOuts == 0 && kIdxOutputs % kIdxSlice == 0 && kIdxWide % kIdxOuts == 0 && kIdxOutputs % kIdxWide == 0);
 
+template <unsigned kSlice>
 __global__ __launch_bounds__(256) void indexer_kernel(const std::uint16_t* __restrict__ hidden, std::uint32_t rows,
     const std::uint16_t* __restrict__ wq, const std::uint16_t* __restrict__ wk, float* __restrict__ iq, float* __restrict__ ik) {
     extern __shared__ __align__(16) unsigned char smem[];
@@ -60,7 +63,7 @@ __global__ __launch_bounds__(256) void indexer_kernel(const std::uint16_t* __res
         for (unsigned i = t; i < total; i += 256U) dst[i] = i < n ? src[i] : make_uint4(0, 0, 0, 0);
     }
     __syncthreads();
-    for (unsigned o0 = blockIdx.y * kIdxSlice; o0 < (blockIdx.y + 1U) * kIdxSlice; o0 += kIdxOuts) {
+    for (unsigned o0 = blockIdx.y * kSlice; o0 < (blockIdx.y + 1U) * kSlice; o0 += kIdxOuts) {
         float w[kIdxOuts][10];
 #pragma unroll
         for (unsigned oo = 0; oo < kIdxOuts; ++oo) {
@@ -182,10 +185,10 @@ __global__ void store_kernel(const float* __restrict__ ik, const float* __restri
 //   sq = mean*mean (S:317641), LDS tree 64..1; inv = rsqrtf(sq/128 + eps) (S:317677-317705);
 //   round_bf16((mean*inv)*w) (S:317706, 317709); RoPE at position 4*block: fma(+-b, sin, a*cos) (S:318275, 318296,
 //   318305) exactly as norm_rope; round_bf16.
-__device__ __forceinline__ void block_pool_kernel_body(const std::uint16_t* __restrict__ raw, std::uint32_t first_block,
+// block = the pooled block this CTA computes (the launchers pass first_block + blockIdx.x, or a grid-stride index)
+__device__ __forceinline__ void block_pool_kernel_body(const std::uint16_t* __restrict__ raw, std::uint32_t block,
     const float* __restrict__ key_norm, const float2* __restrict__ cs, am::Tables tables, float* __restrict__ pooled_keys) {
     __shared__ float pooled[kIndexDim], scratch[kIndexDim];
-    const auto block = first_block + blockIdx.x;
     const auto f = threadIdx.x;
     const auto token_start = static_cast<std::uint64_t>(block) * kRatio;
     float mean = 0.0F;
@@ -214,7 +217,7 @@ __device__ __forceinline__ void block_pool_kernel_body(const std::uint16_t* __re
 }
 __global__ void block_pool_kernel(const std::uint16_t* __restrict__ raw, std::uint32_t first_block,
     const float* __restrict__ key_norm, const float2* __restrict__ cs, am::Tables tables, float* __restrict__ pooled_keys) {
-    block_pool_kernel_body(raw, first_block, key_norm, cs, tables, pooled_keys);
+    block_pool_kernel_body(raw, first_block + blockIdx.x, key_norm, cs, tables, pooled_keys);
 }
 
 // ------------------------------------------------------------------------------------------------------------------
@@ -254,10 +257,10 @@ template <unsigned P> __device__ __forceinline__ unsigned scatter_head(unsigned 
 constexpr unsigned kScoreRowsPerWave = 4;
 __device__ __forceinline__ void block_score_body(const float* __restrict__ index_query, std::uint32_t rows,
     std::uint64_t first_position, const float* __restrict__ pooled_keys, std::uint32_t scored_blocks,
-    float* __restrict__ block_scores, std::uint32_t max_blocks, std::uint32_t wave_base) {
+    float* __restrict__ block_scores, std::uint32_t max_blocks, std::uint32_t wave) {
+    // wave = this warp's wave within the segment (blockIdx.x * 8 + warp, minus the segment's first wave)
     constexpr unsigned R = kScoreRowsPerWave;
     const unsigned lane = threadIdx.x & 31U;
-    const auto wave = blockIdx.x * 8U + threadIdx.x / 32U - wave_base;
     const auto chunks = (scored_blocks + 31U) / 32U;
     const auto r0 = wave / chunks * R, base = wave % chunks * 32U;
     if (r0 >= rows) return;
@@ -310,7 +313,8 @@ __device__ __forceinline__ void block_score_body(const float* __restrict__ index
 __global__ __launch_bounds__(256) void block_score_kernel(const float* __restrict__ index_query, std::uint32_t rows,
     std::uint64_t first_position, const float* __restrict__ pooled_keys, std::uint32_t scored_blocks,
     float* __restrict__ block_scores, std::uint32_t max_blocks) {
-    block_score_body(index_query, rows, first_position, pooled_keys, scored_blocks, block_scores, max_blocks, 0U);
+    block_score_body(index_query, rows, first_position, pooled_keys, scored_blocks, block_scores, max_blocks,
+        blockIdx.x * 8U + threadIdx.x / 32U);
 }
 
 // ------------------------------------------------------------------------------------------------------------------
@@ -748,6 +752,93 @@ __global__ __launch_bounds__(kOutThreads) void attention_output_head_kernel(cons
     attention_output_head_kernel_body(q_gate, first_position, all_selected, kv, all_scores, output, tables);
 }
 
+// STRIX_QRTX_QSA_HEAD (default 1): same per-thread chains (s0/s1 = fma(w[slot], v, s), slots ascending from 0) and epilogue as the
+// body above, but the V rows (512 B per slot for this KV head) are streamed by cp.async into a ring of 7 stages x 8 slots
+// (6 stages in flight, one __syncthreads per stage) and the scores/tokens of every slot are preloaded once, so the walk over the
+// slots no longer pays one L2 round trip per 8 slots. Static smem 45 KB.
+constexpr unsigned kPipeKeys = 8, kPipeStages = 7, kVRowBytes = kHeadDim * 2U;
+__device__ __forceinline__ void qsa_cp16(void* dst, const void* src) {
+    const auto d = static_cast<unsigned>(__cvta_generic_to_shared(dst));
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" ::"r"(d), "l"(src) : "memory");
+}
+__device__ __forceinline__ void qsa_cp_commit() { asm volatile("cp.async.commit_group;\n" ::: "memory"); }
+template <int N>
+__device__ __forceinline__ void qsa_cp_wait() { asm volatile("cp.async.wait_group %0;\n" ::"n"(N) : "memory"); }
+__device__ __forceinline__ void attention_output_head_pipe_body(const float* __restrict__ q_gate,
+    std::uint64_t first_position, const std::uint32_t* __restrict__ all_selected, const std::uint16_t* __restrict__ kv,
+    const float* __restrict__ all_scores, float* __restrict__ output, am::Tables tables) {
+    __shared__ __align__(16) unsigned char ring[kPipeStages * kPipeKeys * kVRowBytes];
+    __shared__ float ws[kMaxSelected];
+    __shared__ std::uint32_t tok[kMaxSelected];
+    const auto head = blockIdx.x, r = blockIdx.y, t = threadIdx.x, kvh = head / kG;
+    const auto count = selected_count(first_position + r);
+    const std::uint32_t* selected = all_selected + static_cast<std::uint64_t>(r) * kMaxSelected;
+    const float* scores = all_scores + (static_cast<std::uint64_t>(r) * kHeads + head) * kMaxSelected;
+    const std::uint16_t* vsrc = kv + kKvWidth + kvh * kHeadDim;
+    for (unsigned i = t; i < count; i += kOutThreads) { ws[i] = scores[i]; tok[i] = selected[i]; }
+    __syncthreads();
+    const unsigned nst = (count + kPipeKeys - 1U) / kPipeKeys;
+    auto issue = [&](unsigned st) {
+        if (st < nst) {
+            unsigned char* slot = ring + (st % kPipeStages) * kPipeKeys * kVRowBytes;
+            for (unsigned j = t; j < kPipeKeys * 32U; j += kOutThreads) {
+                const unsigned b = j >> 5U, key = st * kPipeKeys + b;
+                if (key < count) qsa_cp16(slot + b * kVRowBytes + (j & 31U) * 16U, vsrc + static_cast<std::uint64_t>(tok[key]) * (kKvWidth * 2ULL) + (j & 31U) * 8U);
+            }
+        }
+        qsa_cp_commit();
+    };
+#pragma unroll
+    for (unsigned s = 0; s + 1U < kPipeStages; ++s) issue(s);
+    float s0 = 0.0F, s1 = 0.0F;
+    for (unsigned st = 0; st < nst; ++st) {
+        qsa_cp_wait<static_cast<int>(kPipeStages) - 2>();
+        __syncthreads();
+        issue(st + kPipeStages - 1U);
+        const unsigned char* slot = ring + (st % kPipeStages) * kPipeKeys * kVRowBytes + 4U * t;
+        const unsigned n = min(kPipeKeys, count - st * kPipeKeys);
+        if (n == kPipeKeys) {
+#pragma unroll
+            for (unsigned b = 0; b < kPipeKeys; ++b) {
+                const auto raw = *reinterpret_cast<const std::uint32_t*>(slot + b * kVRowBytes);
+                const float w = ws[st * kPipeKeys + b];
+                s0 = __fmaf_rn(w, __uint_as_float(raw << 16U), s0);
+                s1 = __fmaf_rn(w, __uint_as_float(raw & 0xffff0000U), s1);
+            }
+        } else {
+            for (unsigned b = 0; b < n; ++b) {
+                const auto raw = *reinterpret_cast<const std::uint32_t*>(slot + b * kVRowBytes);
+                const float w = ws[st * kPipeKeys + b];
+                s0 = __fmaf_rn(w, __uint_as_float(raw << 16U), s0);
+                s1 = __fmaf_rn(w, __uint_as_float(raw & 0xffff0000U), s1);
+            }
+        }
+    }
+    const float* qg = q_gate + static_cast<std::uint64_t>(r) * kQGateWidth;
+    float* out = output + static_cast<std::uint64_t>(r) * kAttnWidth;
+#pragma unroll
+    for (unsigned e = 0; e < 2U; ++e) {
+        const auto f = 2U * t + e;
+        const float attn = round_bf16(e ? s1 : s0);
+        const float g = qg[static_cast<std::uint64_t>(head) * kHeadDim * 2ULL + kHeadDim + f];
+        const float gate = round_bf16(__fdiv_rn(1.0F, __fadd_rn(1.0F, am::amd_expf(tables, -g))));
+        out[static_cast<std::uint64_t>(head) * kHeadDim + f] = round_bf16(__fmul_rn(attn, gate));
+    }
+}
+__global__ __launch_bounds__(kOutThreads) void attention_output_head_pipe_kernel(const float* __restrict__ q_gate,
+    std::uint64_t first_position, const std::uint32_t* __restrict__ all_selected, const std::uint16_t* __restrict__ kv,
+    const float* __restrict__ all_scores, float* __restrict__ output, am::Tables tables) {
+    attention_output_head_pipe_body(q_gate, first_position, all_selected, kv, all_scores, output, tables);
+}
+bool head_pipe_enabled() {
+    static const bool on = strix::envcfg::flag("STRIX_QRTX_QSA_HEAD", true);
+    return on;
+}
+bool idx_wide_enabled() {
+    static const bool on = strix::envcfg::flag("STRIX_QRTX_QSA_IDX", true);
+    return on;
+}
+
 // ------------------------------------------------------------------------------------------------------------------
 // FAST form (Config::forms.qsa_mma): the whole attention of a prefill row (scores + softmax + weighted values + gate) as one
 // flash kernel on BF16 tensor cores (core/attention_tile.cuh). CTA = (KV head, row), 3 warps; the row's selected keys are
@@ -864,52 +955,89 @@ __device__ __forceinline__ unsigned seg_of(const SegmentMap& m, unsigned row) {
     return seg;
 }
 __device__ __forceinline__ std::uint64_t base_position(const SegmentMap& m, unsigned seg) { return m.position[seg] - m.first_row[seg]; }
+// The map arrives by value (eager launches) or as a device descriptor (graph replays: the positions, pooled ranges and wave
+// counts change every window while the captured launches stay fixed). Same bodies either way.
+__device__ __forceinline__ const SegmentMap& map_of(const SegmentMap& m) { return m; }
+__device__ __forceinline__ const SegmentMap& map_of(const SegmentMap* m) { return *m; }
 
+template <class MapArg>
 __global__ void norm_rope_multi_kernel(float* __restrict__ values, std::uint64_t row_stride, std::uint32_t head_dim,
-    std::uint32_t head_stride, const float* __restrict__ norm, SegmentMap map, const float2* __restrict__ cs, am::Tables tables) {
+    std::uint32_t head_stride, const float* __restrict__ norm, MapArg mapa, const float2* __restrict__ cs, am::Tables tables) {
+    const SegmentMap& map = map_of(mapa);
     norm_rope_kernel_body(values, row_stride, head_dim, head_stride, norm, base_position(map, seg_of(map, blockIdx.y)), cs, tables);
 }
-__global__ void store_multi_kernel(const float* __restrict__ ik, const float* __restrict__ k, const float* __restrict__ v, SegmentMap map) {
+template <class MapArg>
+__global__ void store_multi_kernel(const float* __restrict__ ik, const float* __restrict__ k, const float* __restrict__ v, MapArg mapa) {
+    const SegmentMap& map = map_of(mapa);
     const unsigned seg = seg_of(map, blockIdx.y);
     store_kernel_body(ik, k, v, base_position(map, seg), map.raw_index[seg], map.kv[seg]);
 }
-__global__ void block_pool_multi_kernel(SegmentMap map, const float* __restrict__ key_norm, const float2* __restrict__ cs,
+// grid-stride over the window's pooled blocks (eager grid = the block count: one pass per CTA)
+template <class MapArg>
+__global__ void block_pool_multi_kernel(MapArg mapa, const float* __restrict__ key_norm, const float2* __restrict__ cs,
     am::Tables tables) {
-    unsigned seg = 0;
-    while (seg + 1U < map.n && blockIdx.x >= map.pool_begin[seg + 1U]) ++seg;
-    block_pool_kernel_body(map.raw_index[seg], map.pool_first[seg] - map.pool_begin[seg], key_norm, cs, tables, map.pooled[seg]);
+    const SegmentMap& map = map_of(mapa);
+    const unsigned total = map.pool_begin[map.n];
+    for (unsigned i = blockIdx.x; i < total; i += gridDim.x) {
+        unsigned seg = 0;
+        while (seg + 1U < map.n && i >= map.pool_begin[seg + 1U]) ++seg;
+        block_pool_kernel_body(map.raw_index[seg], map.pool_first[seg] - map.pool_begin[seg] + i, key_norm, cs, tables, map.pooled[seg]);
+        __syncthreads();  // the next block reuses the shared buffers
+    }
 }
-__global__ __launch_bounds__(256) void block_score_multi_kernel(const float* __restrict__ index_query, SegmentMap map,
+// grid-stride over the waves (8 per CTA; eager grid = ceil(waves / 8): one pass)
+template <class MapArg>
+__global__ __launch_bounds__(256) void block_score_multi_kernel(const float* __restrict__ index_query, MapArg mapa,
     float* __restrict__ block_scores, std::uint32_t max_blocks) {
-    const auto wave = blockIdx.x * 8U + threadIdx.x / 32U;
-    if (wave >= map.score_begin[map.n]) return;
-    unsigned seg = 0;
-    while (seg + 1U < map.n && wave >= map.score_begin[seg + 1U]) ++seg;
-    const auto row = map.first_row[seg];
-    block_score_body(index_query + static_cast<std::uint64_t>(row) * kIndexQWidth, map.first_row[seg + 1U] - row, map.position[seg],
-        map.pooled[seg], map.scored[seg], block_scores + static_cast<std::uint64_t>(row) * max_blocks, max_blocks, map.score_begin[seg]);
+    const SegmentMap& map = map_of(mapa);
+    const unsigned total = map.score_begin[map.n];
+    for (unsigned wave = blockIdx.x * 8U + threadIdx.x / 32U; wave < total; wave += gridDim.x * 8U) {
+        unsigned seg = 0;
+        while (seg + 1U < map.n && wave >= map.score_begin[seg + 1U]) ++seg;
+        const auto row = map.first_row[seg];
+        block_score_body(index_query + static_cast<std::uint64_t>(row) * kIndexQWidth, map.first_row[seg + 1U] - row, map.position[seg],
+            map.pooled[seg], map.scored[seg], block_scores + static_cast<std::uint64_t>(row) * max_blocks, max_blocks,
+            wave - map.score_begin[seg]);
+    }
 }
+template <class MapArg>
 __global__ __launch_bounds__(kSelectThreads) void select_multi_kernel(float* __restrict__ all_scores, std::uint32_t max_blocks,
-    SegmentMap map, std::uint32_t* __restrict__ all_selected) {
+    MapArg mapa, std::uint32_t* __restrict__ all_selected) {
+    const SegmentMap& map = map_of(mapa);
     select_kernel_body(all_scores, max_blocks, base_position(map, seg_of(map, blockIdx.x)), all_selected);
 }
-__global__ __launch_bounds__(128) void attention_score_half_multi_kernel(const float* __restrict__ q_gate, SegmentMap map,
+template <class MapArg>
+__global__ __launch_bounds__(128) void attention_score_half_multi_kernel(const float* __restrict__ q_gate, MapArg mapa,
     const std::uint32_t* __restrict__ all_selected, float* __restrict__ all_scores) {
+    const SegmentMap& map = map_of(mapa);
     const unsigned seg = seg_of(map, blockIdx.z);
     attention_score_half_kernel_body(q_gate, base_position(map, seg), all_selected, map.kv[seg], all_scores);
 }
-__global__ __launch_bounds__(256) void softmax_multi_kernel(float* __restrict__ all_scores, SegmentMap map, am::Tables tables) {
+template <class MapArg>
+__global__ __launch_bounds__(256) void softmax_multi_kernel(float* __restrict__ all_scores, MapArg mapa, am::Tables tables) {
+    const SegmentMap& map = map_of(mapa);
     softmax_kernel_body(all_scores, base_position(map, seg_of(map, blockIdx.y)), tables);
 }
-__global__ __launch_bounds__(kOutThreads) void attention_output_multi_kernel(const float* __restrict__ q_gate, SegmentMap map,
+template <class MapArg>
+__global__ __launch_bounds__(kOutThreads) void attention_output_multi_kernel(const float* __restrict__ q_gate, MapArg mapa,
     const std::uint32_t* __restrict__ all_selected, const float* __restrict__ all_scores, float* __restrict__ output, am::Tables tables) {
+    const SegmentMap& map = map_of(mapa);
     const unsigned seg = seg_of(map, blockIdx.y);
     attention_output_kernel_body(q_gate, base_position(map, seg), all_selected, map.kv[seg], all_scores, output, tables);
 }
-__global__ __launch_bounds__(kOutThreads) void attention_output_head_multi_kernel(const float* __restrict__ q_gate, SegmentMap map,
+template <class MapArg>
+__global__ __launch_bounds__(kOutThreads) void attention_output_head_multi_kernel(const float* __restrict__ q_gate, MapArg mapa,
     const std::uint32_t* __restrict__ all_selected, const float* __restrict__ all_scores, float* __restrict__ output, am::Tables tables) {
+    const SegmentMap& map = map_of(mapa);
     const unsigned seg = seg_of(map, blockIdx.y);
     attention_output_head_kernel_body(q_gate, base_position(map, seg), all_selected, map.kv[seg], all_scores, output, tables);
+}
+template <class MapArg>
+__global__ __launch_bounds__(kOutThreads) void attention_output_head_multi_pipe_kernel(const float* __restrict__ q_gate, MapArg mapa,
+    const std::uint32_t* __restrict__ all_selected, const float* __restrict__ all_scores, float* __restrict__ output, am::Tables tables) {
+    const SegmentMap& map = map_of(mapa);
+    const unsigned seg = seg_of(map, blockIdx.y);
+    attention_output_head_pipe_body(q_gate, base_position(map, seg), all_selected, map.kv[seg], all_scores, output, tables);
 }
 
 }  // namespace
@@ -941,12 +1069,15 @@ void indexer_projection(const std::uint16_t* hidden, std::uint32_t rows, const L
     float* index_key, cudaStream_t stream) {
     if (!rows) return;
     static const bool attr = [] {
-        check(cudaFuncSetAttribute(indexer_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(kIdxSmem)), "indexer smem attr");
+        check(cudaFuncSetAttribute(indexer_kernel<kIdxSlice>, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(kIdxSmem)), "indexer smem attr");
+        check(cudaFuncSetAttribute(indexer_kernel<kIdxWide>, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(kIdxSmem)), "indexer smem attr");
         return true;
     }();
     (void)attr;
-    const dim3 grid((rows + kIdxRows - 1U) / kIdxRows, (kIdxOutputs + kIdxSlice - 1U) / kIdxSlice);
-    indexer_kernel<<<grid, 256, kIdxSmem, stream>>>(hidden, rows, w.index_q_proj, w.index_k_proj, index_query, index_key);
+    if (rows <= kIdxRows && idx_wide_enabled())
+        indexer_kernel<kIdxWide><<<dim3(1, kIdxOutputs / kIdxWide), 256, kIdxSmem, stream>>>(hidden, rows, w.index_q_proj, w.index_k_proj, index_query, index_key);
+    else
+    indexer_kernel<kIdxSlice><<<dim3((rows + kIdxRows - 1U) / kIdxRows, (kIdxOutputs + kIdxSlice - 1U) / kIdxSlice), 256, kIdxSmem, stream>>>(hidden, rows, w.index_q_proj, w.index_k_proj, index_query, index_key);
     check(cudaGetLastError(), "indexer launch");
 }
 
@@ -1016,7 +1147,10 @@ void attention_softmax(std::uint32_t rows, std::uint64_t first_position, float* 
 void attention_values(const float* q_gate, std::uint32_t rows, std::uint64_t first_position, const std::uint32_t* selected,
     const std::uint16_t* kv, const float* scores, float* attention_output, const amdmath::Tables& tables, cudaStream_t stream) {
     if (!rows) return;
-    if (rows <= 8U && decode_rows_enabled())
+    if (rows <= 8U && decode_rows_enabled() && head_pipe_enabled())
+        attention_output_head_pipe_kernel<<<dim3(kHeads, rows), kOutThreads, 0, stream>>>(q_gate, first_position, selected, kv, scores,
+            attention_output, tables);
+    else if (rows <= 8U && decode_rows_enabled())
         attention_output_head_kernel<<<dim3(kHeads, rows), kOutThreads, 0, stream>>>(q_gate, first_position, selected, kv, scores,
             attention_output, tables);
     else
@@ -1075,13 +1209,13 @@ void layer_core(const RowBuffers& b, std::uint32_t rows, std::uint64_t first_pos
     }
 }
 
-void layer_core_multi(const RowBuffers& b, const SegmentState* segs, std::uint32_t n, const LayerWeights& w, const RopeTable* cs,
-    const amdmath::Tables& tables, Workspace& ws, cudaStream_t stream) {
+bool prepare_multi(const SegmentState* segs, std::uint32_t n, const Workspace& ws, SegmentMap& map, MultiShape& shape,
+    std::uint32_t* valid_after) {
     if (n == 0 || n > kMaxSegments) throw std::invalid_argument("qwen_qsa layer_core_multi: 1..8 segments");
     static const bool score_wave = strix::envcfg::flag("STRIX_QSA_SCORE_WAVE", false);
     // Every check and the whole segment map before the first launch; the host pooled-valid counts are written only after
     // the launches (a throw here leaves the sessions as they were).
-    SegmentMap map{};
+    map = SegmentMap{};
     map.n = n;
     std::uint32_t rows = 0, max_rows = 0, min_rows = 0xffffffffU;
     for (std::uint32_t i = 0; i < n; ++i) {
@@ -1104,25 +1238,16 @@ void layer_core_multi(const RowBuffers& b, const SegmentState* segs, std::uint32
     // the output kernel per-segment layer_core chooses for each segment (head kernel: <= 8 rows with the decode kernels on);
     // the multi launch needs one choice for all, else per segment
     const bool head_all = max_rows <= 8U && decode_rows_enabled(), rows_all = !decode_rows_enabled() || min_rows > 8U;
-    if (rows > ws.chunk_rows || score_wave || !(head_all || rows_all)) {  // outside the multi-launch shapes: one call per segment
-        for (std::uint32_t i = 0; i < n; ++i) {
-            const std::uint64_t r = map.first_row[i];
-            const RowBuffers sb{b.hidden + r * kHidden, b.q_gate + r * kQGateWidth, b.k + r * kKvWidth, b.v + r * kKvWidth,
-                                b.index_query + r * kIndexQWidth, b.index_key + r * kIndexDim, b.attention_output + r * kAttnWidth};
-            layer_core(sb, segs[i].rows, segs[i].first_position, w, segs[i].state, cs, tables, ws, stream);
-        }
-        return;
-    }
+    if (rows > ws.chunk_rows || score_wave || !(head_all || rows_all)) return false;  // outside the multi-launch shapes
     // pooled keys per session (host-side valid counts, as layer_core), block-score waves, attention slots
     std::uint32_t pool = 0, waves = 0, slots = 0;
-    std::uint32_t valid_after[kMaxSegments] = {};
     for (std::uint32_t i = 0; i < n; ++i) {
         const auto& g = segs[i];
         const auto last_complete = static_cast<std::uint32_t>((g.first_position + g.rows) / kRatio);
         map.pooled[i] = g.state.pooled ? g.state.pooled : ws.pooled_keys;
         map.pool_begin[i] = pool;
         map.pool_first[i] = 0;
-        if (g.state.pooled) valid_after[i] = *g.state.pooled_valid;
+        valid_after[i] = g.state.pooled ? *g.state.pooled_valid : 0U;
         if (last_complete > kTopK) {
             std::uint32_t first = 0;
             if (g.state.pooled) first = std::min(*g.state.pooled_valid, static_cast<std::uint32_t>(g.first_position / kRatio));
@@ -1139,6 +1264,19 @@ void layer_core_multi(const RowBuffers& b, const SegmentState* segs, std::uint32
     }
     map.pool_begin[n] = pool;
     map.score_begin[n] = waves;
+    shape.rows = rows;
+    shape.head_all = head_all;
+    shape.pool_grid = pool;
+    shape.score_grid = (waves + 7U) / 8U;
+    shape.slot_runs = (slots + kRun - 1U) / kRun;
+    return true;
+}
+
+namespace {
+template <class MapArg>
+void launch_multi(const RowBuffers& b, MapArg map, const MultiShape& shape, const LayerWeights& w, const RopeTable* cs,
+    const amdmath::Tables& tables, Workspace& ws, cudaStream_t stream) {
+    const auto rows = shape.rows;
     indexer_projection(b.hidden, rows, w, b.index_query, b.index_key, stream);  // row-wise
     norm_rope_multi_kernel<<<dim3(kIndexHeads, rows), kIndexDim, 2U * kIndexDim * sizeof(float), stream>>>(b.index_query, kIndexQWidth,
         kIndexDim, kIndexDim, w.index_q_norm, map, cs, tables);
@@ -1149,29 +1287,91 @@ void layer_core_multi(const RowBuffers& b, const SegmentState* segs, std::uint32
     check(cudaGetLastError(), "norm_rope multi launch");
     store_multi_kernel<<<dim3(kKvWidth / 256U, rows), 256, 0, stream>>>(b.index_key, b.k, b.v, map);
     check(cudaGetLastError(), "store multi launch");
-    if (pool) {
-        block_pool_multi_kernel<<<pool, kIndexDim, 0, stream>>>(map, w.index_k_norm, cs, tables);
+    if (shape.pool_grid) {
+        block_pool_multi_kernel<<<shape.pool_grid, kIndexDim, 0, stream>>>(map, w.index_k_norm, cs, tables);
         check(cudaGetLastError(), "block pool multi launch");
     }
-    if (waves) {
-        block_score_multi_kernel<<<(waves + 7U) / 8U, 256, 0, stream>>>(b.index_query, map, ws.block_scores, ws.max_blocks);
+    if (shape.score_grid) {
+        block_score_multi_kernel<<<shape.score_grid, 256, 0, stream>>>(b.index_query, map, ws.block_scores, ws.max_blocks);
         check(cudaGetLastError(), "block score multi launch");
     }
     select_multi_kernel<<<rows, kSelectThreads, 0, stream>>>(ws.block_scores, ws.max_blocks, map, ws.selected);
     check(cudaGetLastError(), "select multi launch");
-    attention_score_half_multi_kernel<<<dim3((slots + kRun - 1U) / kRun, kKvHeads, rows), 128, 0, stream>>>(b.q_gate, map, ws.selected,
-        ws.scores);
+    attention_score_half_multi_kernel<<<dim3(shape.slot_runs, kKvHeads, rows), 128, 0, stream>>>(b.q_gate, map, ws.selected, ws.scores);
     check(cudaGetLastError(), "score multi launch");
     softmax_multi_kernel<<<dim3(kHeads, rows), 256, 0, stream>>>(ws.scores, map, tables);
     check(cudaGetLastError(), "softmax multi launch");
     // keyed on the segment rows (as per-segment layer_core), not on the window total
-    if (head_all)
+    if (shape.head_all && head_pipe_enabled())
+        attention_output_head_multi_pipe_kernel<<<dim3(kHeads, rows), kOutThreads, 0, stream>>>(b.q_gate, map, ws.selected, ws.scores,
+            b.attention_output, tables);
+    else if (shape.head_all)
         attention_output_head_multi_kernel<<<dim3(kHeads, rows), kOutThreads, 0, stream>>>(b.q_gate, map, ws.selected, ws.scores,
             b.attention_output, tables);
     else
         attention_output_multi_kernel<<<dim3(kKvHeads, rows), kOutThreads, 0, stream>>>(b.q_gate, map, ws.selected, ws.scores,
             b.attention_output, tables);
     check(cudaGetLastError(), "output multi launch");
+}
+}  // namespace
+
+void layer_core_multi(const RowBuffers& b, const SegmentState* segs, std::uint32_t n, const LayerWeights& w, const RopeTable* cs,
+    const amdmath::Tables& tables, Workspace& ws, cudaStream_t stream) {
+    SegmentMap map{};
+    MultiShape shape{};
+    std::uint32_t valid_after[kMaxSegments] = {};
+    if (!prepare_multi(segs, n, ws, map, shape, valid_after)) {  // outside the multi-launch shapes: one call per segment
+        for (std::uint32_t i = 0; i < n; ++i) {
+            const std::uint64_t r = map.first_row[i];
+            const RowBuffers sb{b.hidden + r * kHidden, b.q_gate + r * kQGateWidth, b.k + r * kKvWidth, b.v + r * kKvWidth,
+                                b.index_query + r * kIndexQWidth, b.index_key + r * kIndexDim, b.attention_output + r * kAttnWidth};
+            layer_core(sb, segs[i].rows, segs[i].first_position, w, segs[i].state, cs, tables, ws, stream);
+        }
+        return;
+    }
+    launch_multi(b, map, shape, w, cs, tables, ws, stream);
+    for (std::uint32_t i = 0; i < n; ++i)
+        if (segs[i].state.pooled) *segs[i].state.pooled_valid = valid_after[i];
+}
+
+bool graph_shape(const std::uint32_t* seg_rows, std::uint32_t n, const Workspace& ws, MultiShape& shape) {
+    if (n == 0 || n > kMaxSegments) return false;
+    static const bool score_wave = strix::envcfg::flag("STRIX_QSA_SCORE_WAVE", false);
+    std::uint32_t rows = 0, max_rows = 0, min_rows = 0xffffffffU, waves = 0;
+    const std::uint32_t chunks = (ws.max_blocks + 31U) / 32U;  // waves per row group at the workspace's last block
+    for (std::uint32_t i = 0; i < n; ++i) {
+        if (seg_rows[i] == 0) return false;
+        rows += seg_rows[i];
+        max_rows = std::max(max_rows, seg_rows[i]);
+        min_rows = std::min(min_rows, seg_rows[i]);
+        waves += (seg_rows[i] + kScoreRowsPerWave - 1U) / kScoreRowsPerWave * chunks;
+    }
+    const bool head_all = max_rows <= 8U && decode_rows_enabled(), rows_all = !decode_rows_enabled() || min_rows > 8U;
+    if (rows > ws.chunk_rows || score_wave || !(head_all || rows_all)) return false;
+    static const std::uint32_t sms = [] {
+        int dev = 0, count = 0;
+        if (cudaGetDevice(&dev) != cudaSuccess || cudaDeviceGetAttribute(&count, cudaDevAttrMultiProcessorCount, dev) != cudaSuccess) return 64U;
+        return static_cast<std::uint32_t>(std::max(count, 1));
+    }();
+    shape.rows = rows;
+    shape.head_all = head_all;
+    // Replay may start with a cold pool, regardless of the window's row count. Empty CTAs exit in the existing kernel.
+    shape.pool_grid = 2U * sms;
+    shape.score_grid = std::max(1U, std::min((waves + 7U) / 8U, 2U * sms));   // grid-stride beyond
+    shape.slot_runs = (kMaxSelected + kRun - 1U) / kRun;                      // runs past a row's selected count return at once
+    return true;
+}
+
+void layer_core_device(const RowBuffers& b, const SegmentMap* device_map, const MultiShape& shape, const LayerWeights& w,
+    const RopeTable* cs, const amdmath::Tables& tables, Workspace& ws, cudaStream_t stream) {
+    launch_multi(b, device_map, shape, w, cs, tables, ws, stream);
+}
+
+void prepare_replay(const SegmentState* segs, std::uint32_t n, const Workspace& ws, SegmentMap& map) {
+    MultiShape shape{};
+    std::uint32_t valid_after[kMaxSegments] = {};
+    if (!prepare_multi(segs, n, ws, map, shape, valid_after))
+        throw std::logic_error("qwen_qsa prepare_replay: window outside the captured multi-launch shape");
     for (std::uint32_t i = 0; i < n; ++i)
         if (segs[i].state.pooled) *segs[i].state.pooled_valid = valid_after[i];
 }

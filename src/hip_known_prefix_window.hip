@@ -1950,7 +1950,9 @@ struct HipKnownPrefixWindow::Impl {
             } else if (!m.run->wide_step(i) || own != mode) return false;
             total += m.run->rows();
         }
-        if (total < 9U || total > 32U) return false;
+        // Sessions above the launchers' segment tables would throw mid-cohort (the 9-session stall): such a step
+        // runs per chunk instead.
+        if (total < 9U || total > 32U || members.size() > kCohortWideMaxSessions) return false;
         static const bool joint=strix::envcfg::flag("STRIX_MTP_BATCH_JOINT", false);
         switch (mode) {
         case KnownWindowStepMode::moe_route_rows:
@@ -1991,7 +1993,7 @@ struct HipKnownPrefixWindow::Impl {
     }
     // The routed union of every member's rows on the lead member (A8 profile, 16 or 32 rows).
     static bool cohort_wide_union(std::span<CohortMember> members) {
-        if (!cohort_wide_enabled("moe")) return false;
+        if (!cohort_wide_enabled("moe") || members.size() > kCohortWideMaxSessions) return false;
         std::uint32_t total = 0;
         for (const auto& m : members) {
             const auto& c = m.impl->routed_config;

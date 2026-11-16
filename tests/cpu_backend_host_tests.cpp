@@ -30,7 +30,8 @@ void test_retained_selection() {
     const bool owns_table = !std::is_reference_v<decltype(strix::cpu::select(strix::cpu::Caps{}))>;
     expect(owns_table, "selection returns an owned table", 0);
     if (!owns_table) return;  // Fail the old API without deliberately invoking its data race.
-    const auto& retained = strix::cpu::select(strix::cpu::caps());
+    const auto capabilities = strix::cpu::caps();
+    const auto& retained = strix::cpu::select(capabilities);
     std::atomic<bool> started{false};
     bool worker_ok = true;
     std::thread worker([&] {

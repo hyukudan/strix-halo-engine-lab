@@ -1,3 +1,4 @@
+#include "strix/weight/admission.hpp"
 // CUDA Qwen prefill driver (see include/strix/cuda/qwen_prefill.hpp): model upload, per-block step loop in the HIP
 // step order, node state export. The arithmetic lives in the family libraries (qwen_hc, qwen_dense, qwen_gdn, qwen_qsa,
 // qwen_moe, qwen_ple, qwen_mtp), each bit-identical to its HIP kernels; this file only wires buffers and order.
@@ -21,12 +22,16 @@
 #include "strix/cuda/qwen_dense.hpp"
 #include "strix/cuda/qwen_gdn.hpp"
 #include "strix/cuda/qwen_hc.hpp"
+#include "strix/cuda/amd_math.cuh"
 #include "strix/cuda/qwen_moe.hpp"
 #include "strix/cuda/qwen_mtp_draft.hpp"
 #include "strix/cuda/qwen_plemtp.hpp"
 #include "strix/cuda/qwen_qsa.hpp"
+#include "strix/mtp_draft_split.hpp"
 #include "strix/cuda/qwen_transcode.hpp"
 #include "strix/gguf_reader.hpp"
+#include "qwen_tier_adapter.hpp"
+#include <filesystem>
 #include "strix/cuda/vram_guard.hpp"
 #include "strix/rows_fit.hpp"
 
@@ -36,6 +41,7 @@
 #include <nvtx3/nvToolsExt.h>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cstdio>
@@ -44,6 +50,7 @@
 #include <exception>
 #include <functional>
 #include <map>
+#include "strix/recurrent_state_policy.hpp"
 #include <limits>
 #include <stdexcept>
 #include <string>
@@ -137,6 +144,7 @@ struct Weights {
 
 template <class T> T* dev_alloc(std::uint64_t count, const char* what) {
     void* p = nullptr;
+    tiered::require_budget(std::max<std::uint64_t>(count, 1) * sizeof(T), what);
     strix::cuda::require_vram(std::max<std::uint64_t>(count, 1) * sizeof(T), what);
     ck(cudaMalloc(&p, std::max<std::uint64_t>(count, 1) * sizeof(T)), what);
     return static_cast<T*>(p);
@@ -184,8 +192,10 @@ struct SessionState {
     std::uint32_t window_offset = 0;            // first row of this session in the cohort window
     std::uint64_t window_position = 0;
     std::vector<std::uint32_t> window_tokens;
-    std::vector<void*> allocations;
-    std::uint64_t bytes = 0;
+    std::vector<void*> allocations;      // fixed-size buffers (GDN/conv state, held row)
+    std::vector<void*> row_allocations;  // position buffers, sized to `capacity`
+    std::uint64_t capacity = 0;          // positions the row buffers hold (<= Config::max_positions; reserve_session)
+    std::uint64_t bytes = 0;             // device bytes of all of the above
 };
 
 struct StateCopyStream {
@@ -302,6 +312,16 @@ struct BlockFields {
 struct Prefill::Impl : BlockFields {
     Config cfg;
     qwen_route::Policy route_policy;
+    // Stored element of the GDN recurrent matrices (STRIX_RECURRENT_STATE, resolved once in the constructor). gdn_state /
+    // gdn_other keep their float* type but hold 2-byte elements for f16 / bf16: state_layer_floats = float-sized units of one
+    // layer's matrix (kMatrixFloats for f32, half of it for 16-bit; kMatrixFloats is even).
+    RecurrentStateType state_type = RecurrentStateType::f32;
+    std::uint64_t state_layer_floats = gdn::kMatrixFloats;
+    [[nodiscard]] std::uint64_t state_bytes(std::uint64_t layers) const {
+        return recurrent_state_bytes(layers * gdn::kMatrixFloats, state_type);
+    }
+    // per_row: decode / window / commit-replay launches narrow the state after every row; prefill narrows once at the store
+    [[nodiscard]] gdn::Tuning gdn_tuning(bool per_row) const { return gdn::Tuning{4, state_type, per_row}; }
     std::uint64_t snapshot_binding = qwen_route::new_engine_binding();
     cudaStream_t copy_stream = nullptr;                    // release_by_layer: per-layer D2H
     cudaStream_t side_stream = nullptr;                    // decode: the shared expert beside the routed MoE
@@ -310,6 +330,8 @@ struct Prefill::Impl : BlockFields {
     std::function<void(std::uint32_t)> after_layer;        // called (host) after layer l's launches of a block
     am::Tables tables{};
     qsa::RopeTable* rope = nullptr;
+    weight::WeightMap source_weights;
+    std::vector<weight::LegacyConversion> source_conversions;
     gguf::FileInfo info;                       // tensors of every part, with the types as stored on the device
     std::string ple_part;                      // the part holding per_layer_token_embd
     bool native_experts = false;               // some layer's experts need the native MoE path
@@ -338,6 +360,18 @@ struct Prefill::Impl : BlockFields {
     std::map<GraphKey, std::uint32_t> warmed;      // eager runs per key before capture (lazy attributes, once flags)
     std::function<void(std::uint32_t)> qsa_cut;    // capture: called at each QSA core instead of launching it
     bool use_graphs = true;
+    // Tiered expert residency (null = fully resident: today's route, nothing below is touched)
+    ResidencyPlan plan;
+    std::unique_ptr<QwenTier> tier;
+    std::uint32_t tier_prefill_failure = 0;       // sticky until engine destruction
+    std::uint32_t* tier_routes = nullptr;          // tiered: slot routes [cap][kTopK] the routed kernels read
+    std::uint64_t engine_bytes = 0;                // device bytes held once loaded (measured)
+    void tier_step_end(std::uint64_t filled);      // between steps (stream synchronized): planner + expert moves;
+                                                   // filled = highest position written (receipt: context filled)
+    std::FILE* trace_file = nullptr;               // Config::expert_trace (diagnostic)
+    std::uint32_t* trace_host = nullptr;          // pinned [layer][rows][top_k]
+    std::uint32_t trace_cap = 0, trace_step = 0;
+    ~Impl() { if (trace_file) std::fclose(trace_file); if (trace_host) cudaFreeHost(trace_host); }
     std::size_t graph_cap = 512;                   // layouts up to 16 rows (C8 with 1-draft windows: 256)
     std::uint64_t graph_clock = 0, graph_captures = 0, graph_replays = 0, graph_evictions = 0, eager_windows = 0;
     void drop_graph(std::map<GraphKey, StepGraph>::iterator it);
@@ -350,6 +384,17 @@ struct Prefill::Impl : BlockFields {
     bool graph_table = true;                       // STRIX_QRTX_GRAPH_TABLE=0: graphs bake session pointers (keyed by session)
     bool table_mode = false;                       // run_block / window_prologue emit table-relative launches (capture)
     void qsa_core(std::uint32_t l, const Segment& seg);
+    // ---- QSA inside the step graph (STRIX_QRTX_QSA_GRAPH, default on): the captured cores read their segment maps from a
+    // device table that the replay writes first (one graph per window, no cuts); same kernels and order as qsa_layer.
+    // Maps [0, 12) = the window's QSA layers, [12, 12 + 7) = the draft chain's steps.
+    static constexpr std::uint32_t kQsaMaps = 12U + kMaxStepRows;
+    qsa::SegmentMap* qsa_maps = nullptr;           // device [kQsaMaps]
+    qsa::SegmentMap* qsa_maps_pinned = nullptr;    // host source of the captured copy
+    bool qsa_graph = true;
+    const qsa::MultiShape* qsa_dev_shape = nullptr;  // capture: run_block emits qsa_layer_dev with this shape
+    qsa::LayerWeights qsa_weights(std::uint32_t l) const;
+    void qsa_layer_dev(std::uint32_t l, const Segment* seg, std::uint32_t count);
+    void qsa_replay_maps(const Segment* seg, std::uint32_t count);  // host maps of the 12 layers + pooled-valid counts
     // every segment's QSA core of layer l: one launch per step across the segments (multiseg, >= 2 segments), else per segment
     void qsa_layer(std::uint32_t l, const Segment* seg, std::uint32_t count);
     bool multiseg = true;                          // STRIX_QRTX_MULTISEG=0: GDN/QSA cores launched per session
@@ -366,7 +411,11 @@ struct Prefill::Impl : BlockFields {
         if (it == sessions.end()) throw std::invalid_argument("unknown decode session " + std::to_string(id));
         return *it->second;
     }
-    SessionState& new_session();
+    SessionState& new_session(std::uint64_t positions);
+    void alloc_rows(SessionState& s, std::uint64_t positions);
+    void drop_session_graphs(SessionId id);
+    [[nodiscard]] std::uint64_t rows_bytes_at(std::uint64_t positions) const;
+    [[nodiscard]] std::uint64_t fixed_session_bytes() const;
     // ---- MTP draft chain (decode + sidecar)
     hc::HcPacked mtp_hc_attn{}, mtp_hc_ffn{}, mtp_hc_head{};
     float *mtp_attn_inject = nullptr, *mtp_ffn_inject = nullptr;   // F32 [4][10240] (sidecar Q8_0 widened)
@@ -378,6 +427,20 @@ struct Prefill::Impl : BlockFields {
     std::uint16_t* draft_wide = nullptr;       // [3][10240]
     std::uint32_t* draft_token = nullptr;      // device word: the token the next draft step embeds
     std::uint32_t* draft_sel = nullptr;        // device [8][2] token, probability
+    // draft chain graphs (STRIX_QRTX_DRAFT_GRAPH, default on): one graph per (session buffers, depth); positions, the pending
+    // token and the QSA maps (qsa_maps[12 + k]) are copied from pinned memory at the start of every replay
+    using DraftKey = std::array<std::uintptr_t, 5>;
+    struct DraftGraph { cudaGraphExec_t exec = nullptr; std::uint64_t used = 0; };
+    std::map<DraftKey, DraftGraph> draft_graphs;
+    std::map<DraftKey, std::uint32_t> draft_warmed;
+    bool draft_graph = true;
+    std::uint64_t* draft_pos = nullptr;         // device [8]
+    std::uint64_t* draft_pos_pinned = nullptr;  // [8] + the pending token word after them
+    std::uint64_t draft_captures = 0, draft_replays = 0;
+    // Draft chain in two graph segments [0, a) and [a, depth) (rtxmax3, shared chooser strix/mtp_draft_split.hpp): the second
+    // runs only when no draft of the first fell below min_p. STRIX_QRTX_DRAFT_SPLIT: unset/auto, 0 = one segment, N = fixed a.
+    strix::mtp::DraftSplit draft_split{strix::mtp::DraftSplit::mode_from_env("STRIX_QRTX_DRAFT_SPLIT")};
+    std::uint64_t draft_split_runs = 0, draft_second_runs = 0;
     // batched draft chains (draft_cohort): row j = the j-th chain by descending depth
     std::uint16_t* bd_wide = nullptr;          // [3][8][10240] attention / mlp / source wide rows
     std::uint16_t* bd_fused = nullptr;         // [8][10240] input-fusion rows
@@ -473,12 +536,24 @@ void Prefill::Impl::upload_model() {
     std::uint64_t scratch_bytes = 0;
     for (const auto& part : model_parts(cfg.model_gguf)) {
     const auto pinfo = gguf::read_file(part);
+    std::shared_ptr<const weight::Source> owner;
+    auto admission = weight::open_source(part,owner);
+    weight::TensorIndex indexed;
+    if (admission) admission = weight::index_gguf(pinfo,owner,indexed);
+    weight::WeightMap admitted;
+    if (admission) admission = weight::bind_qwen(indexed,admitted);
+    if (!admission) throw std::runtime_error("Qwen weight admission: " + admission.detail);
+    source_weights.insert(source_weights.end(),admitted.begin(),admitted.end());
     std::FILE* f = std::fopen(part.c_str(), "rb");
     if (!f) throw std::runtime_error("cannot open " + part);
     for (auto t : pinfo.tensors) {
         if (t.name.rfind("per_layer_token_embd", 0) == 0) { ple_part = part; info.tensors.push_back(t); continue; }  // PLE (host)
         if (t.name == "output.weight" && !cfg.decode) { info.tensors.push_back(t); continue; }                  // head (node)
+        if (tier && t.name.find("_exps.") != std::string::npos) { info.tensors.push_back(t); continue; }        // tiered: host-mapped
         const Target target = transcode_target(t);
+        if (target != Target::native) source_conversions.push_back({std::find_if(indexed.tensors.begin(),indexed.tensors.end(),[&](const auto& raw){return raw.name==t.name;})->id,
+            target == Target::q8_0 ? weight::FormatId{"gguf.q8_0",1} : weight::FormatId{"plain.f32",1},
+            target == Target::q8_0 ? "legacy.qwen.cuda.amax127-f16-roundf@1" : "legacy.qwen.cuda.decode-f32@1"});
         if (target != Target::native && !transcode::supported(t.ggml_type))
             throw std::runtime_error("no decoder for " + t.name + " type " + std::to_string(t.ggml_type));
         void* raw = nullptr;
@@ -487,6 +562,7 @@ void Prefill::Impl::upload_model() {
             if (scratch_bytes < t.byte_size) {
                 ck(cudaStreamSynchronize(stream), "scratch reuse");
                 if (scratch) cudaFree(scratch);
+                tiered::require_budget(t.byte_size, "transcode scratch");
                 strix::cuda::require_vram(t.byte_size, "transcode scratch");
                 ck(cudaMalloc(&scratch, t.byte_size), "transcode scratch");
                 scratch_bytes = t.byte_size;
@@ -559,6 +635,7 @@ void Prefill::Impl::upload_model() {
         w.tensors.erase(it);
     }
     lw.resize(kLayers);
+    if (tier) tier->alloc_slots();
     for (std::uint32_t l = 0; l < kLayers; ++l) {
         const std::string blk = "blk." + std::to_string(l);
         for (std::uint32_t i = 0; i < kLayerTensors; ++i) {
@@ -568,6 +645,11 @@ void Prefill::Impl::upload_model() {
         for (const auto& t : info.tensors) {
             if (t.name == blk + ".ffn_gate_exps.weight") lw[l].gate_type = t.ggml_type;
             if (t.name == blk + ".ffn_down_exps.weight") lw[l].down_type = t.ggml_type;
+        }
+        if (tier) {  // the routed kernels read the slot buffers (slot S = the zero expert)
+            lw[l].p[k_ffn_gate_exps_weight] = const_cast<void*>(tier->slot_gate(l));
+            lw[l].p[k_ffn_up_exps_weight] = const_cast<void*>(tier->slot_up(l));
+            lw[l].p[k_ffn_down_exps_weight] = const_cast<void*>(tier->slot_down(l));
         }
         moe::Weights probe;
         probe.gate_type = lw[l].gate_type;
@@ -671,6 +753,9 @@ void Prefill::Impl::upload_draft() {
     draft_wide = dev_alloc<std::uint16_t>(3 * kWide, "draft wide");
     draft_token = dev_alloc<std::uint32_t>(1, "draft token");
     draft_sel = dev_alloc<std::uint32_t>(2 * kMaxStepRows, "draft selections");
+    draft_pos = dev_zero<std::uint64_t>(kMaxStepRows, "draft positions");
+    ck(cudaMallocHost(&draft_pos_pinned, (kMaxStepRows + 1U) * sizeof(std::uint64_t)), "pinned draft positions");
+    std::memset(draft_pos_pinned, 0, (kMaxStepRows + 1U) * sizeof(std::uint64_t));
     bd_wide = dev_alloc<std::uint16_t>(3ULL * kMaxStepRows * kWide, "batched draft wide");
     bd_fused = dev_alloc<std::uint16_t>(std::uint64_t{kMaxStepRows} * kWide, "batched draft fused");
     bd_logits = dev_alloc<float>(std::uint64_t{kMaxStepRows} * ids.size(), "batched draft logits");
@@ -684,6 +769,7 @@ void Prefill::Impl::upload_draft() {
 // The BlockFields buffers for blocks of up to `rows` rows (the current BlockFields set). qsa_chunk: rows per QSA chunk
 // of the attention workspace (the same for every set, so the chunking never differs between sets).
 void Prefill::Impl::allocate_block(std::uint32_t rows, std::uint32_t qsa_chunk, bool engine_set) {
+    const tiered::AllocationBudget budget(plan.card.free, plan.decision.budget);
     cap = rows;
     const std::uint64_t R = cap;
     ids = dev_zero<std::uint32_t>(R, "ids");
@@ -698,6 +784,7 @@ void Prefill::Impl::allocate_block(std::uint32_t rows, std::uint32_t qsa_chunk, 
     codes = dev_zero<std::int8_t>(R * 6144, "a8 codes");
     deltas = dev_zero<float>(R * (6144 / 32), "a8 deltas");
     gdn_rows = dev_zero<float>(R * gdn_stride, "gdn rows");
+    tiered::require_budget(std::max(gdn::core_scratch_bytes(cap), gdn::multi_scratch_bytes()), "gdn scratch");
     strix::cuda::require_vram(std::max(gdn::core_scratch_bytes(cap), gdn::multi_scratch_bytes()), "gdn scratch");
     ck(cudaMalloc(&gdn_scratch, std::max(gdn::core_scratch_bytes(cap), gdn::multi_scratch_bytes())), "gdn scratch");
     q_gate = dev_zero<float>(R * qsa::kQGateWidth, "q gate");
@@ -706,6 +793,7 @@ void Prefill::Impl::allocate_block(std::uint32_t rows, std::uint32_t qsa_chunk, 
     index_q = dev_zero<float>(R * qsa::kIndexQWidth, "index q");
     index_k = dev_zero<float>(R * qsa::kIndexDim, "index k");
     attn_out = dev_zero<float>(R * qsa::kAttnWidth, "attention out");
+    tiered::require_budget(qsa::workspace_bytes(qsa_chunk, cfg.max_positions), "qsa workspace");
     qws = qsa::allocate_workspace(qsa_chunk, cfg.max_positions);
     logits = dev_zero<float>(R * kExperts, "router logits");
     routes = dev_zero<std::uint32_t>(R * kTopK, "routes");
@@ -749,6 +837,7 @@ void Prefill::Impl::allocate_block(std::uint32_t rows, std::uint32_t qsa_chunk, 
     ple_gates = dev_zero<float>(R * 4, "ple gates");
     ple_status = dev_zero<std::uint32_t>(1, "ple status");
     if (mtp) {
+        tiered::require_budget(pm::mtp_workspace_bytes(cap), "mtp workspace");
         strix::cuda::require_vram(pm::mtp_workspace_bytes(cap), "mtp workspace");
         ck(cudaMalloc(&mtp_ws, pm::mtp_workspace_bytes(cap)), "mtp workspace");
         mtp_next = dev_zero<std::uint32_t>(R, "mtp next");
@@ -771,6 +860,9 @@ void Prefill::Impl::allocate_fitted_block() {
         free_block(static_cast<BlockFields&>(*this));
         stream = keep;
     };
+    // Tier routes are fixed-size per row and outside BlockFields (drop keeps them): allocate them for the
+    // largest capacity first, so the reserve check below sees them; the kernels read the [cap][kTopK] prefix.
+    if (tier) tier_routes = dev_zero<std::uint32_t>(std::uint64_t{want} * kTopK, "tier slot routes");
     std::uint64_t fit_free_mib = 0, fit_total_mib = 0;
     const auto fit = strix::rows_fit::fit(want, std::min<std::uint32_t>(want, 1024U), 1024U, [&](std::uint32_t rows) {
         try {
@@ -803,7 +895,10 @@ void Prefill::Impl::allocate_fitted_block() {
 void Prefill::Impl::allocate() {
     gdn_stride = 10240 + 6144 + 48 + 48 + 6144;
     const auto rows = round_up(*std::max_element(cfg.block_schedule.begin(), cfg.block_schedule.end()), 16U);
-    if (!cfg.block_fit) allocate_block(rows, std::min<std::uint32_t>(rows, 1024U), true);  // fit: after session 0
+    if (!cfg.block_fit) {  // fit: block and tier routes after session 0 (allocate_fitted_block)
+        allocate_block(rows, std::min<std::uint32_t>(rows, 1024U), true);
+        if (tier) tier_routes = dev_zero<std::uint32_t>(std::uint64_t{cap} * kTopK, "tier slot routes");
+    }
     if (cfg.decode) {
         head_logits = dev_zero<float>(std::uint64_t{kMaxWindowRows} * hc::kVocab, "head logits");
         argmax_dev = dev_zero<std::uint32_t>(kMaxWindowRows, "argmax");
@@ -813,24 +908,88 @@ void Prefill::Impl::allocate() {
         seg_table = dev_zero<SegTable>(kMaxStepRows, "graph descriptor table");
         ck(cudaMallocHost(&seg_table_pinned, kMaxStepRows * sizeof(SegTable)), "pinned descriptor table");
         std::memset(seg_table_pinned, 0, kMaxStepRows * sizeof(SegTable));
+        qsa_maps = dev_zero<qsa::SegmentMap>(kQsaMaps, "qsa segment maps");
+        ck(cudaMallocHost(&qsa_maps_pinned, kQsaMaps * sizeof(qsa::SegmentMap)), "pinned qsa segment maps");
+        for (std::uint32_t i = 0; i < kQsaMaps; ++i) qsa_maps_pinned[i] = qsa::SegmentMap{};
         ck(cudaMallocHost(&moe_sticky_pinned, (1 + kMaxWindowRows) * 4), "pinned moe sticky");
         win_rows = dev_zero<float>(std::uint64_t{36} * kMaxWindowRows * gdn_stride, "window gdn rows");
         win_raw = dev_zero<float>(std::uint64_t{36} * kMaxWindowRows * gdn::kConvWidth, "window conv inputs");
     }
     // host staging: every row component's rows plus the fixed blob
     const std::uint64_t P = cfg.max_positions;
-    host_bytes = P * (12ULL * 2048 + 12ULL * 256 + 2048 + 256) + 36 * gdn::kMatrixFloats * 4 + 36 * gdn::kConvStateHalfs * 2 +
+    host_bytes = P * (12ULL * 2048 + 12ULL * 256 + 2048 + 256) + state_bytes(36) + 36 * gdn::kConvStateHalfs * 2 +
                  10240ULL * 9 * 2 + 16 + kWide * 2;
     if (cfg.export_state) ck(cudaMallocHost(&host, host_bytes), "pinned export staging");  // device-only runs need none
 }
 
-// The per-session device state (same buffers and sizes the single-session engine allocated).
-SessionState& Prefill::Impl::new_session() {
-    auto s = std::make_unique<SessionState>();
-    s->id = next_session++;
-    const std::uint64_t P = cfg.max_positions;
+// Device bytes of a session's position buffers at `positions` (alloc_rows allocates exactly these): per QSA ordinal KV
+// P*1024 BF16, raw index P*128 BF16, pooled keys ceil(P/4)*128 F32; with MTP the same three over the predictor cache.
+std::uint64_t Prefill::Impl::rows_bytes_at(std::uint64_t P) const {
+    const std::uint64_t one = P * 1024 * 2 + P * 128 * 2 + (P + 3) / 4 * 128 * 4;
+    return 12U * one + (mtp ? one : 0U);
+}
+
+std::uint64_t Prefill::Impl::fixed_session_bytes() const {
+    std::uint64_t b = state_bytes(36) + 36ULL * gdn::kConvStateHalfs * 2 + 10240ULL * 9 * 2;
+    if (cfg.decode) b += state_bytes(36) + 36ULL * gdn::kConvStateHalfs * 2 + 10240ULL * 9 * 2;
+    if (mtp && cfg.decode) b += kWide * 2;
+    return b;
+}
+
+// The position buffers of one session at `positions` (every kernel indexes them by position only: the capacity is a
+// bound, never a stride). On failure the session keeps no row buffer.
+void Prefill::Impl::alloc_rows(SessionState& s, std::uint64_t P) {
+    if (P == 0 || P > cfg.max_positions) throw std::invalid_argument("session positions 1..max_positions");
+    std::uint64_t added = 0;
+    // Tiered residency: a resize is held to the same card budget as the first allocation (no-op when tiering is off).
+    const tiered::AllocationBudget budget(plan.card.free, plan.decision.budget);
     const auto alloc = [&](std::uint64_t bytes, const char* what) {
         void* p = nullptr;
+        tiered::require_budget(std::max<std::uint64_t>(bytes, 1), what);
+        strix::cuda::require_vram(std::max<std::uint64_t>(bytes, 1), what);
+        ck(cudaMalloc(&p, std::max<std::uint64_t>(bytes, 1)), what);
+        s.row_allocations.push_back(p);
+        s.bytes += bytes;
+        added += bytes;
+        return p;
+    };
+    s.kv.clear();
+    s.raw_index.clear();
+    s.pooled.clear();
+    try {
+        for (std::uint32_t o = 0; o < 12; ++o) {
+            s.kv.push_back(static_cast<std::uint16_t*>(alloc(P * 1024 * 2, "kv")));
+            s.raw_index.push_back(static_cast<std::uint16_t*>(alloc(P * 128 * 2, "raw index")));
+            s.pooled.push_back(static_cast<float*>(alloc((P + 3) / 4 * 128 * 4, "pooled index keys")));
+        }
+        if (mtp) {
+            s.mtp_kv = static_cast<std::uint16_t*>(alloc(P * 1024 * 2, "mtp kv"));
+            s.mtp_pooled = static_cast<float*>(alloc((P + 3) / 4 * 128 * 4, "mtp pooled keys"));
+            s.mtp_index = static_cast<std::uint16_t*>(alloc(P * 128 * 2, "mtp index"));
+        }
+    } catch (...) {
+        for (void* p : s.row_allocations) cudaFree(p);
+        s.row_allocations.clear();
+        s.kv.clear();
+        s.raw_index.clear();
+        s.pooled.clear();
+        s.mtp_kv = s.mtp_index = nullptr;
+        s.mtp_pooled = nullptr;
+        s.bytes -= added;
+        throw;
+    }
+    s.capacity = P;
+}
+
+// The per-session device state (same buffers the single-session engine allocated; position buffers at `positions`).
+SessionState& Prefill::Impl::new_session(std::uint64_t P) {
+    const tiered::AllocationBudget budget(plan.card.free, plan.decision.budget);
+    tiered::require_budget(residency::session_bytes(plan.session, static_cast<std::uint32_t>(P)), "session");
+    auto s = std::make_unique<SessionState>();
+    s->id = next_session++;
+    const auto alloc = [&](std::uint64_t bytes, const char* what) {
+        void* p = nullptr;
+        tiered::require_budget(std::max<std::uint64_t>(bytes, 1), what);
         strix::cuda::require_vram(std::max<std::uint64_t>(bytes, 1), what);
         ck(cudaMalloc(&p, std::max<std::uint64_t>(bytes, 1)), what);
         s->allocations.push_back(p);
@@ -838,28 +997,20 @@ SessionState& Prefill::Impl::new_session() {
         return p;
     };
     try {
-        for (std::uint32_t o = 0; o < 12; ++o) {
-            s->kv.push_back(static_cast<std::uint16_t*>(alloc(P * 1024 * 2, "kv")));
-            s->raw_index.push_back(static_cast<std::uint16_t*>(alloc(P * 128 * 2, "raw index")));
-            s->pooled.push_back(static_cast<float*>(alloc((P + 3) / 4 * 128 * 4, "pooled index keys")));
-        }
-        s->gdn_state = static_cast<float*>(alloc(36 * gdn::kMatrixFloats * 4, "gdn state"));
+        alloc_rows(*s, P);
+        s->gdn_state = static_cast<float*>(alloc(state_bytes(36), "gdn state"));
         s->gdn_base = s->gdn_state;  // graph key parity: which of the two buffers is current
         s->gdn_conv = static_cast<std::uint16_t*>(alloc(36 * gdn::kConvStateHalfs * 2, "gdn conv"));
         s->ple_conv = static_cast<std::uint16_t*>(alloc(10240 * 9 * 2, "ple conv"));
         if (cfg.decode) {
-            s->gdn_other = static_cast<float*>(alloc(36 * gdn::kMatrixFloats * 4, "gdn state window"));
+            s->gdn_other = static_cast<float*>(alloc(state_bytes(36), "gdn state window"));
             s->conv_before = static_cast<std::uint16_t*>(alloc(36 * gdn::kConvStateHalfs * 2, "conv before"));
             s->ple_before = static_cast<std::uint16_t*>(alloc(10240 * 9 * 2, "ple conv before"));
         }
-        if (mtp) {
-            s->mtp_kv = static_cast<std::uint16_t*>(alloc(P * 1024 * 2, "mtp kv"));
-            s->mtp_pooled = static_cast<float*>(alloc((P + 3) / 4 * 128 * 4, "mtp pooled keys"));
-            s->mtp_index = static_cast<std::uint16_t*>(alloc(P * 128 * 2, "mtp index"));
-            if (cfg.decode) s->held = static_cast<std::uint16_t*>(alloc(kWide * 2, "held row"));
-        }
+        if (mtp && cfg.decode) s->held = static_cast<std::uint16_t*>(alloc(kWide * 2, "held row"));
     } catch (...) {
         for (void* p : s->allocations) cudaFree(p);
+        for (void* p : s->row_allocations) cudaFree(p);
         throw;
     }
     s->target_identity = qwen_options::numerical_identity(cfg).hash;
@@ -869,16 +1020,128 @@ SessionState& Prefill::Impl::new_session() {
     return ref;
 }
 
+// Graphs and warm-up counts that captured this session's pointers (keys: session, layout pairs).
+void Prefill::Impl::drop_session_graphs(SessionId session) {
+    const auto uses = [&](const GraphKey& k) {
+        if (!k.empty() && k[0] >= kTableKey - 1U) return false;  // descriptor-table graphs bake no session pointer
+        for (std::size_t i = 0; i < k.size(); i += 2) if (k[i] == session) return true;
+        return false;
+    };
+    for (auto it = graphs.begin(); it != graphs.end();) {
+        if (uses(it->first)) { auto next = std::next(it); drop_graph(it); it = next; } else ++it;
+    }
+    for (auto it = warmed.begin(); it != warmed.end();) it = uses(it->first) ? warmed.erase(it) : std::next(it);
+}
+
 void Prefill::Impl::drop_graph(std::map<GraphKey, StepGraph>::iterator it) {
     for (auto exec : it->second.seg) cudaGraphExecDestroy(exec);
     graphs.erase(it);
     ++graph_evictions;
 }
 
+// ---- residency: decided from the GGUF headers and the live card/host numbers, before any upload ----
+namespace {
+constexpr std::uint32_t kTierRows = 256;  // rows per block of the tiered route (the host exchange's capacity)
+std::uint64_t scratch_estimate(std::uint32_t block_rows) {
+    // ~0.44 MiB of per-row workspace (activations, GDN rows, MoE scratch, raw dots) + fixed pools (GDN, QSA workspace,
+    // head logits, context): measured against cudaMemGetInfo after the load (residency_json "engine_bytes").
+    return std::uint64_t{block_rows} * (448ULL << 10) + (1280ULL << 20);
+}
+}  // namespace
+
+ResidencyPlan plan_residency(const Config& config) {
+    ResidencyPlan r;
+    const auto& bound = strix::device::bind_cuda();
+    ck(cudaSetDevice(bound.visible.ordinal), "set device");
+    auto& m = r.model;
+    m.layers = kLayers;
+    m.experts = kExperts;
+    m.top_k = kTopK;
+    m.expert_bytes.assign(kLayers, 0);
+    std::vector<unsigned> expert_kinds(kLayers, 0);
+    for (const auto& part : model_parts(config.model_gguf)) {
+        for (const auto& t : gguf::read_file(part).tensors) {
+            if (t.name.rfind("per_layer_token_embd", 0) == 0) { m.host_tables += t.byte_size; continue; }
+            if (t.name == "output.weight" && !config.decode) continue;
+            if (t.name.find("_exps.") != std::string::npos) {
+                if (t.name.rfind("blk.", 0) == 0) {
+                    const auto layer = static_cast<std::uint32_t>(std::stoul(t.name.substr(4)));
+                    if (layer < kLayers) {
+                        const auto kind = t.name.find("ffn_gate_exps") != std::string::npos ? 0U
+                            : t.name.find("ffn_up_exps") != std::string::npos ? 1U
+                            : t.name.find("ffn_down_exps") != std::string::npos ? 2U : 3U;
+                        if (kind == 3U || (expert_kinds[layer] & (1U << kind)))
+                            throw std::invalid_argument("residency: unknown or duplicate expert tensor");
+                        validate_qwen_expert(t, kind, kHidden, 640U, kExperts);
+                        expert_kinds[layer] |= 1U << kind;
+                        m.expert_bytes[layer] += t.byte_size / kExperts;
+                    }
+                }
+                continue;
+            }
+            const Target target = transcode_target(t);
+            m.core += target == Target::native ? t.byte_size
+                    : target == Target::q8_0 ? transcode::q8_0_bytes(elements_of(t)) : elements_of(t) * 4U;
+        }
+    }
+    if (std::any_of(expert_kinds.begin(), expert_kinds.end(), [](unsigned kinds) { return kinds != 7U; }))
+        throw std::invalid_argument("residency: missing expert tensor");
+    const bool mtp = !config.mtp_sidecar_gguf.empty();
+    if (mtp) {
+        for (const auto& t : gguf::read_file(config.mtp_sidecar_gguf).tensors) m.mtp_head += t.byte_size;
+        m.core += m.mtp_head;
+    }
+    std::size_t free_bytes = 0, total_bytes = 0;
+    ck(cudaMemGetInfo(&free_bytes, &total_bytes), "memory info");
+    r.card = {total_bytes, free_bytes};
+    r.host.available = host_available_bytes();
+    auto& s = r.session;
+    s.per_position = (12ULL + (mtp ? 1ULL : 0ULL)) * (2048 + 256);
+    s.per_group = (12ULL + (mtp ? 1ULL : 0ULL)) * 128 * 4;
+    s.group_size = 4;
+    s.fixed = (config.decode ? 2ULL : 1ULL) *
+        (36ULL * gdn::kMatrixFloats * sizeof(float) + 36ULL * gdn::kConvStateHalfs * 2 + 10240ULL * 9 * 2);
+    if (mtp && config.decode) s.fixed += kWide * 2;
+    s.margin = 512ULL << 20;
+    s.sessions = 1;
+    s.positions = config.max_positions;
+    const std::uint32_t full_rows = round_up(*std::max_element(config.block_schedule.begin(), config.block_schedule.end()), 16U);
+    s.scratch = scratch_estimate(full_rows);
+    r.block_rows = full_rows;
+    s.position_scratch = [full_rows](std::uint32_t positions) {
+        return qsa::workspace_bytes(std::min(full_rows, 1024U), positions) +
+            std::uint64_t{positions} * qsa::kRotaryPairs * sizeof(qsa::RopeTable);
+    };
+    r.decision = strix::residency::resolve(config.residency, m, r.card, s, r.host);
+    if (r.decision.mode == strix::residency::Mode::tiered) {
+        // the tiered route runs blocks of the exchange's rows: its scratch is smaller, so the pool is re-sized with it
+        s.scratch = scratch_estimate(kTierRows);
+        s.position_scratch = [](std::uint32_t positions) {
+            return qsa::workspace_bytes(kTierRows, positions) +
+                std::uint64_t{positions} * qsa::kRotaryPairs * sizeof(qsa::RopeTable);
+        };
+        r.block_rows = kTierRows;
+        auto forced = config.residency;
+        forced.mode = strix::residency::Mode::tiered;
+        r.decision = strix::residency::resolve(forced, m, r.card, s, r.host);
+    }
+    auto json = strix::residency::decision_json(r.decision);
+    if (!json.empty() && json.back() == '}') json.pop_back();
+    r.json = json + ",\"card_total_bytes\":" + std::to_string(total_bytes) + ",\"card_free_bytes\":" + std::to_string(free_bytes) +
+             ",\"model_core_bytes\":" + std::to_string(m.core) + ",\"host_available_bytes\":" + std::to_string(r.host.available) +
+             ",\"scratch_estimate_bytes\":" + std::to_string(s.scratch + s.position_scratch(r.decision.positions)) + ",\"block_rows\":" + std::to_string(r.block_rows) + "}";
+    return r;
+}
+
 Prefill::Prefill(const Config& config) : impl_(std::make_unique<Impl>()) {
     auto& m = *impl_;
     m.cfg = qwen_options::resolve_route(config);
     m.route_policy = *m.cfg.route_policy; // frozen before device work; no second environment lookup
+    m.state_type = recurrent_state_policy().type;
+    // Typed prefill currently rounds at call boundaries. Reject before device or
+    // cache setup until rounding is independent of scheduling and prefix history.
+    require_f32_recurrent_state(m.state_type, "CUDA application (schedule-independent prefill and prefix reuse unqualified)");
+    m.state_layer_floats = recurrent_state_bytes(gdn::kMatrixFloats, m.state_type) / sizeof(float);
     const auto* diagnostic_graphs = std::getenv("STRIX_QRTX_GRAPHS");
     qwen_mtp_diagnostic::admission(config.diagnostic_bf16_mtp, m.route_policy.enabled,
         config.decode, config.export_state, !config.mtp_sidecar_gguf.empty(),
@@ -905,6 +1168,29 @@ Prefill::Prefill(const Config& config) : impl_(std::make_unique<Impl>()) {
                                      " (select a card with --device-id or STRIX_DEVICE)");
         ck(cudaSetDevice(bound.visible.ordinal), "set device");
     }
+    // Residency is decided before our first allocation. Fully resident (automatic when the model fits, or full): nothing
+    // below this block changes, no allocation, launch or sync is added. Tiered: the experts stay in the memory-mapped GGUF,
+    // the card keeps a slot pool of the hot ones, blocks are capped to the exchange's rows, the position limit may shrink.
+    m.plan = plan_residency(m.cfg);
+    if (!m.plan.decision.ok) throw std::runtime_error("expert residency: " + m.plan.decision.error);
+    const tiered::AllocationBudget budget(m.plan.card.free, m.plan.decision.budget);
+    if (m.plan.decision.mode == strix::residency::Mode::tiered) {
+        if (m.route_policy.enabled)
+            throw std::runtime_error("expert residency: tiered declines BF16 route storage (the host gather writes FP32 raw dots; "
+                                     "qwen_moe.cu merge_kernel<true> reads BF16): use --expert-residency full or unset STRIX_QWEN_MOE_ROUTE_BF16");
+        // slot ids are expert ids of the routed kernels (< 512): the zero slot is the last, so at most 511 experts per layer
+        m.plan.decision.slots_per_layer = std::min(m.plan.decision.slots_per_layer, kExperts - 1U);
+        m.cfg.block_schedule = {kTierRows};
+        m.cfg.final_block_rows = 0;
+        m.cfg.max_positions = m.plan.decision.positions;
+        QwenTier::Init in;
+        in.parts = model_parts(m.cfg.model_gguf);
+        in.tables_dir = m.cfg.tables_dir;
+        in.decision = m.plan.decision;
+        in.model = m.plan.model;
+        in.layout = {kHidden, 640U, kTopK, kExperts, kTierRows};
+        m.tier = std::make_unique<QwenTier>(std::move(in));
+    }
     // Priorities change only which ready blocks the GPU schedules first, never what a kernel computes: the engine and
     // side streams (decode windows) get the highest, the prefill-overlap stream the lowest (decode first).
     if (cudaDeviceGetStreamPriorityRange(&m.stream_priority_low, &m.stream_priority_high) != cudaSuccess) {
@@ -929,11 +1215,18 @@ Prefill::Prefill(const Config& config) : impl_(std::make_unique<Impl>()) {
             ck(cudaEventCreateWithFlags(&m.side_join, cudaEventDisableTiming), "side event");
         }
     }
+    // The table loader uploads at most its six input files plus the small exp2 table.
+    // Reserve that upper bound before entering its internal allocator.
+    std::uint64_t table_bytes = 4096;
+    for (const char* name : {"hard_v_exp_f32.bin", "hard_v_rsq_f32.bin", "hard_v_rcp_f32.bin",
+                             "tbl_exp_pm.bin", "tbl_rsq_1_4.bin", "tbl_rcp_1_2.bin"})
+        table_bytes += std::max<std::uint64_t>(8, std::filesystem::file_size(config.tables_dir + "/" + name));
+    tiered::require_budget(table_bytes, "arithmetic tables");
     m.tables = am::load_tables(config.tables_dir);
     {
         std::FILE* f = std::fopen(config.rope_table.c_str(), "rb");
         if (!f) throw std::runtime_error("cannot open rope table " + config.rope_table);
-        std::vector<qsa::RopeTable> cs(static_cast<std::size_t>(config.max_positions) * qsa::kRotaryPairs);
+        std::vector<qsa::RopeTable> cs(static_cast<std::size_t>(m.cfg.max_positions) * qsa::kRotaryPairs);
         if (std::fread(cs.data(), sizeof(qsa::RopeTable), cs.size(), f) != cs.size())
             throw std::runtime_error("rope table shorter than max_positions");
         std::fclose(f);
@@ -948,7 +1241,7 @@ Prefill::Prefill(const Config& config) : impl_(std::make_unique<Impl>()) {
     m.upload_mtp();
     m.allocate();
     m.upload_draft();
-    m.new_session();  // session 0: the single-session API
+    m.new_session(config.session_positions ? config.session_positions : config.max_positions);  // session 0: the single-session API
     if (m.cfg.block_fit) m.allocate_fitted_block();  // last: the block capacity takes what the fixed buffers left
     {
         const char* v = std::getenv("STRIX_QRTX_GRAPHS");
@@ -958,13 +1251,30 @@ Prefill::Prefill(const Config& config) : impl_(std::make_unique<Impl>()) {
         m.graph_table = !(t && t[0] == '0');
         const char* ms = std::getenv("STRIX_QRTX_MULTISEG");
         m.multiseg = !(ms && ms[0] == '0');
+        m.qsa_graph = strix::envcfg::flag("STRIX_QRTX_QSA_GRAPH", true);
+        m.draft_graph = strix::envcfg::flag("STRIX_QRTX_DRAFT_GRAPH", true);
+    }
+    if (!m.cfg.expert_trace.empty()) {
+        m.trace_file = std::fopen(m.cfg.expert_trace.c_str(), "wb");
+        if (!m.trace_file) throw std::runtime_error("expert trace: cannot open " + m.cfg.expert_trace);
+        const std::uint32_t head[6] = {0x52545845U, 0x00003130U, kLayers, kExperts, kTopK, 0U};  // magic "EXTR01" + 2 zero bytes
+        std::fwrite(head, 4, 6, m.trace_file);
+        m.use_graphs = false;  // the per-layer copies below are eager-only
+    }
+    {
+        std::size_t free_now = 0, total_now = 0;
+        if (cudaMemGetInfo(&free_now, &total_now) == cudaSuccess && m.plan.card.free > free_now) m.engine_bytes = m.plan.card.free - free_now;
     }
     char buf[384];
     std::snprintf(buf, sizeof(buf), "{\"weights_gb\":%.2f,\"upload_s\":%.1f,\"block_rows\":%u,\"max_positions\":%u,"
                   "\"transcoded_tensors\":%u,\"native_experts\":%s}",
                   static_cast<double>(m.w.bytes) / 1e9, std::chrono::duration<double>(Clock::now() - t0).count(), m.cap,
-                  config.max_positions, m.transcoded, m.native_experts ? "true" : "false");
+                  m.cfg.max_positions, m.transcoded, m.native_experts ? "true" : "false");
     m.describe = buf; // OFF receipt remains the original byte sequence.
+    if (m.state_type != RecurrentStateType::f32) {  // f32 keeps the original receipt bytes
+        m.describe.pop_back();
+        m.describe += std::string(",\"recurrent_state\":\"") + recurrent_state_type_name(m.state_type) + "\"}";
+    }
     if (!m.block_fit_note.empty()) {  // only when the fit reduced the capacity: other receipts keep their bytes
         m.describe.pop_back();
         m.describe += ",\"block_fit\":\"" + m.block_fit_note + "\"}";
@@ -984,6 +1294,8 @@ Prefill::Prefill(const Config& config) : impl_(std::make_unique<Impl>()) {
 }
 
 Prefill::~Prefill() = default;
+const weight::WeightMap& Prefill::weight_map() const noexcept { return impl_->source_weights; }
+const std::vector<weight::LegacyConversion>& Prefill::weight_conversions() const noexcept { return impl_->source_conversions; }
 
 std::string Prefill::describe() const {
     if (!impl_->cfg.diagnostic_bf16_mtp) return impl_->describe;
@@ -992,18 +1304,38 @@ std::string Prefill::describe() const {
         ",\"sidecar_weight_bytes\":" + std::to_string(impl_->mw.bytes) + ",\"single_weight_owner\":true}";
 }
 
+void Prefill::Impl::tier_step_end(std::uint64_t filled) { tier->note_context(filled); tier->after_step(stream); }
+bool Prefill::tiered() const { return impl_->tier != nullptr; }
+std::string Prefill::residency_json() const { return impl_->plan.json; }
+std::string Prefill::residency_receipt_json() const {
+    if (!impl_->tier) return "{\"expert_residency\":\"full\"}";
+    return impl_->tier->receipt_json();
+}
+std::uint64_t Prefill::card_budget_bytes() const { return impl_->cfg.residency.vram_budget || impl_->tier ? impl_->plan.decision.budget : 0ULL; }
+std::uint64_t Prefill::engine_device_bytes() const { return impl_->engine_bytes; }
+
 qwen_route::Identity Prefill::numerical_identity() const {
     return qwen_options::numerical_identity(impl_->cfg);
 }
 qwen_route::Policy Prefill::route_storage_policy() const { return impl_->route_policy; }
 
 void Prefill::Impl::run_block(const Segment* seg, std::uint32_t count, std::uint32_t pad) {
+    if (tier_prefill_failure) {
+        for (std::uint32_t i = 0; i < count; ++i) poison(*seg[i].s);
+        throw std::runtime_error("prefill: tiered exchange is poisoned; recreate engine");
+    }
     NvtxScope nv;
     std::uint32_t rows = 0;  // all rows of the block
     for (std::uint32_t i = 0; i < count; ++i) {
         if (seg[i].s->target_identity != qwen_options::numerical_identity(cfg).hash)
             throw std::logic_error("Qwen session target identity mismatch");
         rows += seg[i].rows;
+    }
+    if (trace_file && rows > trace_cap) {
+        ck(cudaStreamSynchronize(stream), "expert trace grow");
+        if (trace_host) ck(cudaFreeHost(trace_host), "expert trace free");
+        ck(cudaHostAlloc(&trace_host, std::uint64_t{rows} * kLayers * kTopK * 4, cudaHostAllocDefault), "expert trace alloc");
+        trace_cap = rows;
     }
     if (pad > rows) ck(cudaMemsetAsync(ids, 0, std::uint64_t{pad} * 4, stream), "ids clear");
     for (std::uint32_t i = 0; i < count; ++i)
@@ -1025,6 +1357,7 @@ void Prefill::Impl::run_block(const Segment* seg, std::uint32_t count, std::uint
         a.injection = injection;
         a.output = hidden;
         a.mma = cfg.forms.hc_mma && !window;  // FAST form on run()'s prefill blocks only; verify/step windows stay exact
+        a.workspace_layout = hc::HcWorkspaceLayout::automatic;
         hc::hc_mix(a, tables, stream);
         executed_forms.hc_mma |= a.mma;
     };
@@ -1098,16 +1431,16 @@ void Prefill::Impl::run_block(const Segment* seg, std::uint32_t count, std::uint
                     x.count = seg[i].rows;
                     if (table_mode) {
                         x.conv = gdn::DevRef<std::uint16_t>{nullptr, &seg_table[i].gdn_conv, std::uint64_t{o} * gdn::kConvStateHalfs};
-                        x.state_in = gdn::DevRef<float>{nullptr, &seg_table[i].gdn_state, std::uint64_t{o} * gdn::kMatrixFloats};
-                        x.state_out = gdn::DevRef<float>{nullptr, &seg_table[i].gdn_other, std::uint64_t{o} * gdn::kMatrixFloats};
+                        x.state_in = gdn::DevRef<float>{nullptr, &seg_table[i].gdn_state, std::uint64_t{o} * state_layer_floats};
+                        x.state_out = gdn::DevRef<float>{nullptr, &seg_table[i].gdn_other, std::uint64_t{o} * state_layer_floats};
                     } else {
                         x.conv = gdn::DevRef<std::uint16_t>{ss.gdn_conv + o * gdn::kConvStateHalfs};
-                        x.state_in = gdn::DevRef<float>{ss.gdn_state + o * gdn::kMatrixFloats};
-                        x.state_out = gdn::DevRef<float>{ss.gdn_other + o * gdn::kMatrixFloats};
+                        x.state_in = gdn::DevRef<float>{ss.gdn_state + o * state_layer_floats};
+                        x.state_out = gdn::DevRef<float>{ss.gdn_other + o * state_layer_floats};
                     }
                 }
                 gdn::launch_core_multi(hidden, kHidden, gr, sg, win_raw + std::uint64_t{o} * kMaxWindowRows * gdn::kConvWidth, gdn_scratch,
-                    gw, tables, stream);
+                    gw, tables, stream, gdn_tuning(true));
             } else
             for (std::uint32_t i = 0; i < count; ++i) {
                 const std::uint64_t off = seg[i].offset;
@@ -1117,16 +1450,19 @@ void Prefill::Impl::run_block(const Segment* seg, std::uint32_t count, std::uint
                 if (window && table_mode)
                     gdn::launch_core_split_ref(hidden + off * kHidden, kHidden, grs, seg[i].rows,
                         gdn::DevRef<std::uint16_t>{nullptr, &seg_table[i].gdn_conv, std::uint64_t{o} * gdn::kConvStateHalfs},
-                        gdn::DevRef<float>{nullptr, &seg_table[i].gdn_state, std::uint64_t{o} * gdn::kMatrixFloats},
-                        gdn::DevRef<float>{nullptr, &seg_table[i].gdn_other, std::uint64_t{o} * gdn::kMatrixFloats},
-                        win_raw + (std::uint64_t{o} * kMaxWindowRows + off) * gdn::kConvWidth, gdn_scratch, gw, tables, stream);
+                        gdn::DevRef<float>{nullptr, &seg_table[i].gdn_state, std::uint64_t{o} * state_layer_floats},
+                        gdn::DevRef<float>{nullptr, &seg_table[i].gdn_other, std::uint64_t{o} * state_layer_floats},
+                        win_raw + (std::uint64_t{o} * kMaxWindowRows + off) * gdn::kConvWidth, gdn_scratch, gw, tables, stream,
+                        nullptr, gdn_tuning(true));
                 else if (window)
                     gdn::launch_core_split(hidden + off * kHidden, kHidden, grs, seg[i].rows, ss.gdn_conv + o * gdn::kConvStateHalfs,
-                        ss.gdn_state + o * gdn::kMatrixFloats, ss.gdn_other + o * gdn::kMatrixFloats,
-                        win_raw + (std::uint64_t{o} * kMaxWindowRows + off) * gdn::kConvWidth, gdn_scratch, gw, tables, stream);
+                        ss.gdn_state + o * state_layer_floats, ss.gdn_other + o * state_layer_floats,
+                        win_raw + (std::uint64_t{o} * kMaxWindowRows + off) * gdn::kConvWidth, gdn_scratch, gw, tables, stream,
+                        nullptr, gdn_tuning(true));
                 else
                     gdn::launch_core(hidden + off * kHidden, kHidden, grs, seg[i].rows, ss.gdn_conv + o * gdn::kConvStateHalfs,
-                                     ss.gdn_state + o * gdn::kMatrixFloats, gdn_scratch, gw, tables, stream);
+                                     ss.gdn_state + o * state_layer_floats, gdn_scratch, gw, tables, stream, nullptr,
+                                     gdn_tuning(false));
             }
             nv.pop();
             nv.push("dense_out");
@@ -1150,6 +1486,7 @@ void Prefill::Impl::run_block(const Segment* seg, std::uint32_t count, std::uint
             nv.pop();
             nv.push("qsa");
             if (qsa_cut) qsa_cut(l);
+            else if (qsa_dev_shape) qsa_layer_dev(l, seg, count);
             else qsa_layer(l, seg, count);
             nv.pop();
             nv.push("dense_out");
@@ -1169,6 +1506,8 @@ void Prefill::Impl::run_block(const Segment* seg, std::uint32_t count, std::uint
         hc::route_logits(hidden, static_cast<const float*>(lw[l].p[k_ffn_gate_inp_weight]), pad, logits, stream);
         hc::route_select(logits, pad, kTopK, true, tables, routes, route_w, stream);
         nv.pop();
+        if (trace_file) ck(cudaMemcpyAsync(trace_host + std::uint64_t{l} * rows * kTopK, routes, std::uint64_t{rows} * kTopK * 4,
+                                           cudaMemcpyDeviceToHost, stream), "expert trace");
         dn::SharedExpert sw;
         sw.gate_q8 = lw[l].p[k_ffn_gate_shexp_weight];
         sw.up_q8 = lw[l].p[k_ffn_up_shexp_weight];
@@ -1211,7 +1550,33 @@ void Prefill::Impl::run_block(const Segment* seg, std::uint32_t count, std::uint
         ew.up = static_cast<const std::uint8_t*>(lw[l].p[k_ffn_up_exps_weight]);
         ew.down = static_cast<const std::uint8_t*>(lw[l].p[k_ffn_down_exps_weight]);
         nv.push("moe_routed");
-        moe::enqueue(mr, pad, kHidden, ew, tables, nullptr, stream, cfg.forms.moe_mma && !window);  // FAST form: prefill blocks only
+        if (!tier) {
+            moe::enqueue(mr, pad, kHidden, ew, tables, nullptr, stream, cfg.forms.moe_mma && !window);
+        } else {
+            // Tiered: the prologue reads the real ids; publish maps them to slots (misses -> the zero slot) and hands the
+            // misses to the host; the routed kernels run on the slot routes; gather brings the host raw dots back.
+            moe::enqueue_prologue(mr, pad, kHidden, stream);
+            tier->publish(l, rows, pad, routes, tier_routes, moe_codes, moe_deltas, moe_sums, stream);
+            mr.routes = {tier_routes, kTopK * 4};
+            moe::enqueue_routed(mr, pad, ew, tables, stream, cfg.forms.moe_mma && !window);
+            tier->wait_gather(rows, moe_raw, mr.rawdots.stride, moe_status, mr.status.stride, csr.summary, stream);
+            if (!window) {
+                // Read every layer before its summary is cleared by the next prologue. No failed
+                // prefill may publish state or reuse a possibly poisoned exchange.
+                std::uint32_t failure = 0;
+                try {
+                    ck(cudaMemcpyAsync(&failure, csr.summary, sizeof(failure), cudaMemcpyDeviceToHost, stream), "prefill MoE status");
+                    ck(cudaStreamSynchronize(stream), "prefill MoE status");
+                    tier_prefill_failure |= failure;
+                    if (tier_prefill_failure) throw std::runtime_error("prefill: tiered expert worker or watchdog failure");
+                } catch (...) {
+                    tier_prefill_failure |= 8U;
+                    for (std::uint32_t i = 0; i < count; ++i) poison(*seg[i].s);
+                    throw;
+                }
+            }
+            moe::enqueue_combine(mr, pad, nullptr, stream);
+        }
         executed_forms.moe_mma |= cfg.forms.moe_mma && !window;
         executed_moe_route_bf16 |= mr.route_bf16;
         nv.pop();
@@ -1229,18 +1594,26 @@ void Prefill::Impl::run_block(const Segment* seg, std::uint32_t count, std::uint
     }
     final_wide = wide;
     ck(cudaGetLastError(), "block launches");
+    if (trace_file) {
+        ck(cudaStreamSynchronize(stream), "expert trace sync");
+        const std::uint32_t head[3] = {0U, trace_step++, rows};
+        std::fwrite(head, 4, 3, trace_file);
+        std::vector<std::uint16_t> ids(std::uint64_t{rows} * kLayers * kTopK);
+        for (std::uint32_t r = 0; r < rows; ++r)
+            for (std::uint32_t l = 0; l < kLayers; ++l)
+                for (std::uint32_t k = 0; k < kTopK; ++k)
+                    ids[(std::uint64_t{r} * kLayers + l) * kTopK + k] =
+                        static_cast<std::uint16_t>(trace_host[(std::uint64_t{l} * rows + r) * kTopK + k]);
+        std::fwrite(ids.data(), 2, ids.size(), trace_file);
+        std::fflush(trace_file);
+    }
 }
 
 void Prefill::Impl::qsa_core(std::uint32_t l, const Segment& seg) {
     const std::uint64_t r = seg.offset;
     const qsa::RowBuffers rb{hidden + r * kHidden, q_gate + r * qsa::kQGateWidth, qk + r * qsa::kKvWidth, qv + r * qsa::kKvWidth,
                              index_q + r * qsa::kIndexQWidth, index_k + r * qsa::kIndexDim, attn_out + r * qsa::kAttnWidth};
-    const qsa::LayerWeights qw{static_cast<const std::uint16_t*>(lw[l].p[k_indexer_q_proj_weight]),
-                               static_cast<const std::uint16_t*>(lw[l].p[k_indexer_k_proj_weight]),
-                               static_cast<const float*>(lw[l].p[k_attn_q_norm_weight]),
-                               static_cast<const float*>(lw[l].p[k_attn_k_norm_weight]),
-                               static_cast<const float*>(lw[l].p[k_indexer_q_norm_weight]),
-                               static_cast<const float*>(lw[l].p[k_indexer_k_norm_weight])};
+    const auto qw = qsa_weights(l);
     const auto o = qsa_ordinal(l);
     SessionState& ss = *seg.s;
     const qsa::LayerState st{ss.kv[o], ss.raw_index[o], ss.pooled[o], &ss.pooled_valid[o]};
@@ -1254,12 +1627,7 @@ void Prefill::Impl::qsa_layer(std::uint32_t l, const Segment* seg, std::uint32_t
         return;
     }
     const qsa::RowBuffers rb{hidden, q_gate, qk, qv, index_q, index_k, attn_out};
-    const qsa::LayerWeights qw{static_cast<const std::uint16_t*>(lw[l].p[k_indexer_q_proj_weight]),
-                               static_cast<const std::uint16_t*>(lw[l].p[k_indexer_k_proj_weight]),
-                               static_cast<const float*>(lw[l].p[k_attn_q_norm_weight]),
-                               static_cast<const float*>(lw[l].p[k_attn_k_norm_weight]),
-                               static_cast<const float*>(lw[l].p[k_indexer_q_norm_weight]),
-                               static_cast<const float*>(lw[l].p[k_indexer_k_norm_weight])};
+    const auto qw = qsa_weights(l);
     const auto o = qsa_ordinal(l);
     qsa::SegmentState st[kMaxStepRows];
     for (std::uint32_t i = 0; i < count; ++i) {
@@ -1269,6 +1637,33 @@ void Prefill::Impl::qsa_layer(std::uint32_t l, const Segment* seg, std::uint32_t
     }
     if (seg[0].offset != 0) throw std::logic_error("qsa_layer: segments must start at row 0");
     qsa::layer_core_multi(rb, st, count, qw, rope, tables, qws, stream);
+}
+
+qsa::LayerWeights Prefill::Impl::qsa_weights(std::uint32_t l) const {
+    return qsa::LayerWeights{static_cast<const std::uint16_t*>(lw[l].p[k_indexer_q_proj_weight]),
+                             static_cast<const std::uint16_t*>(lw[l].p[k_indexer_k_proj_weight]),
+                             static_cast<const float*>(lw[l].p[k_attn_q_norm_weight]),
+                             static_cast<const float*>(lw[l].p[k_attn_k_norm_weight]),
+                             static_cast<const float*>(lw[l].p[k_indexer_q_norm_weight]),
+                             static_cast<const float*>(lw[l].p[k_indexer_k_norm_weight])};
+}
+
+void Prefill::Impl::qsa_layer_dev(std::uint32_t l, const Segment* seg, std::uint32_t count) {
+    for (std::uint32_t i = 0; i < count; ++i)
+        if (seg[i].offset != (i == 0 ? 0U : seg[i - 1].offset + seg[i - 1].rows)) throw std::logic_error("qsa_layer_dev: segments not contiguous");
+    const qsa::RowBuffers rb{hidden, q_gate, qk, qv, index_q, index_k, attn_out};
+    qsa::layer_core_device(rb, qsa_maps + qsa_ordinal(l), *qsa_dev_shape, qsa_weights(l), rope, tables, qws, stream);
+}
+
+void Prefill::Impl::qsa_replay_maps(const Segment* seg, std::uint32_t count) {
+    for (std::uint32_t o = 0; o < 12U; ++o) {
+        qsa::SegmentState st[kMaxStepRows];
+        for (std::uint32_t i = 0; i < count; ++i) {
+            SessionState& ss = *seg[i].s;
+            st[i] = qsa::SegmentState{seg[i].rows, seg[i].p0, qsa::LayerState{ss.kv[o], ss.raw_index[o], ss.pooled[o], &ss.pooled_valid[o]}};
+        }
+        qsa::prepare_replay(st, count, qws, qsa_maps_pinned[o]);
+    }
 }
 
 Timing Prefill::run(const std::vector<std::uint32_t>& tokens, std::uint64_t position, const Sink& sink, const RunOptions& options) {
@@ -1282,7 +1677,7 @@ Timing Prefill::run(SessionId session, const std::vector<std::uint32_t>& tokens,
     if (m.cohort_open) throw std::logic_error("run() with an open decode window");
     if (S.prefilling || m.pre_session) throw std::logic_error("run() while an overlapped prefill chunk is in flight");
     if (position > tokens.size() || position == 0) throw std::invalid_argument("prefill position out of range");
-    if (position > m.cfg.max_positions) throw std::invalid_argument("prompt longer than max_positions");
+    if (position > S.capacity) throw std::invalid_argument("prompt longer than the session's capacity");
     const auto plan = plan_blocks(position, m.cfg.block_schedule,
         options.tail_large.value_or(m.cfg.tail_large),
         options.final_block_rows.value_or(m.cfg.final_block_rows));
@@ -1321,7 +1716,7 @@ Timing Prefill::run(SessionId session, const std::vector<std::uint32_t>& tokens,
         ck(cudaMemsetAsync(S.kv[o], 0, position * 2048, m.stream), "kv clear");
         ck(cudaMemsetAsync(S.raw_index[o], 0, position * 256, m.stream), "index clear");
     }
-    ck(cudaMemsetAsync(S.gdn_state, 0, 36 * gdn::kMatrixFloats * 4, m.stream), "gdn clear");
+    ck(cudaMemsetAsync(S.gdn_state, 0, m.state_bytes(36), m.stream), "gdn clear");
     for (auto& v : S.pooled_valid) v = 0;
     S.mtp_pooled_valid = 0;
     ck(cudaMemsetAsync(S.gdn_conv, 0, 36 * gdn::kConvStateHalfs * 2, m.stream), "conv clear");
@@ -1373,8 +1768,8 @@ Timing Prefill::run(SessionId session, const std::vector<std::uint32_t>& tokens,
                     copy("index.L" + layer, false, p0, rows, S.raw_index[o] + p0 * 128, std::uint64_t{rows} * 256);
                 } else if (last_block) {
                     const auto g = gdn_ordinal(l);
-                    const std::uint64_t mb = std::uint64_t{gdn::kMatrixFloats} * 4, cb = std::uint64_t{gdn::kConvStateHalfs} * 2;
-                    copy("recurrent_matrix", true, g * mb, 0, S.gdn_state + std::uint64_t{g} * gdn::kMatrixFloats, mb);
+                    const std::uint64_t mb = m.state_bytes(1), cb = std::uint64_t{gdn::kConvStateHalfs} * 2;
+                    copy("recurrent_matrix", true, g * mb, 0, S.gdn_state + std::uint64_t{g} * m.state_layer_floats, mb);
                     copy("gdn_convolution", true, g * cb, 0, S.gdn_conv + std::uint64_t{g} * gdn::kConvStateHalfs, cb);
                 }
                 if (l == 1 && last_block) copy("ple_convolution", true, 0, 0, S.ple_conv, 10240ULL * 9 * 2);
@@ -1509,13 +1904,14 @@ Timing Prefill::run(SessionId session, const std::vector<std::uint32_t>& tokens,
     };
     if (!m.cfg.export_state) {  // decode-only session: nothing leaves the device
         ck(cudaStreamSynchronize(m.stream), "prefill");
+        if (m.tier) m.tier_step_end(position);
         timing.rows = position;
         timing.total_s = std::chrono::duration<double>(Clock::now() - t0).count();
         S.length = position;
         return timing;
     }
     if (!m.cfg.release_by_layer) {  // else sent per layer with the last block (release_by_layer)
-        fixed("recurrent_matrix", S.gdn_state, 36 * gdn::kMatrixFloats * 4);
+        fixed("recurrent_matrix", S.gdn_state, m.state_bytes(36));
         fixed("gdn_convolution", S.gdn_conv, 36 * gdn::kConvStateHalfs * 2);
         fixed("ple_convolution", S.ple_conv, 10240 * 9 * 2);
     }
@@ -1527,6 +1923,7 @@ Timing Prefill::run(SessionId session, const std::vector<std::uint32_t>& tokens,
     timing.rows = position;
     S.length = position;
     timing.total_s = std::chrono::duration<double>(Clock::now() - t0).count();
+    if (m.tier) { ck(cudaStreamSynchronize(m.stream), "prefill"); m.tier_step_end(position); }
     return timing;
 }
 
@@ -1552,10 +1949,9 @@ void Prefill::Impl::commit_one(SessionState& s, std::uint32_t keep) {
         for (std::uint32_t o = 0; o < 36; ++o) {
             float* base = win_rows + (std::uint64_t{o} * kMaxWindowRows + off) * gdn_stride;
             const gdn::Rows gr{base, base + 10240, base + 16384, base + 16432, base + 16480, gdn_stride};
-            gdn::launch_recurrence_split(gr, keep, s.gdn_state + o * gdn::kMatrixFloats, s.gdn_other + o * gdn::kMatrixFloats,
-                gdn_scratch, tables, stream);
-            gdn::launch_conv_rollback(win_raw + (std::uint64_t{o} * kMaxWindowRows + off) * gdn::kConvWidth, keep,
-                s.conv_before + o * gdn::kConvStateHalfs, s.gdn_conv + o * gdn::kConvStateHalfs, stream);
+            gdn::launch_commit_replay(gr, keep, s.gdn_state + o * state_layer_floats, s.gdn_other + o * state_layer_floats,
+                win_raw + (std::uint64_t{o} * kMaxWindowRows + off) * gdn::kConvWidth, s.conv_before + o * gdn::kConvStateHalfs,
+                s.gdn_conv + o * gdn::kConvStateHalfs, gdn_scratch, tables, stream, gdn_tuning(true));
         }
         pm::launch_ple_conv_rollback(s.ple_before, ple_keys + off * pm::kExpanded, pm::kExpanded, keep, s.ple_conv, stream);
         s.ngram[0] = s.ngram_before[0];
@@ -1674,6 +2070,7 @@ void Prefill::Impl::step_tail(std::uint32_t rows) {
     a.normalized = normalized;
     a.injection = injection;
     a.output = hidden;
+    a.workspace_layout = hc::HcWorkspaceLayout::automatic;
     hc::hc_mix(a, tables, stream);
     const void* head = w.get("output.weight");
     static const bool head1 = strix::envcfg::flag("STRIX_QRTX_HEAD1", false);
@@ -1698,6 +2095,15 @@ StepResult Prefill::verify(const std::uint32_t* tokens, std::uint32_t rows, std:
     return std::move(r[0]);
 }
 
+namespace {
+// Highest position a cohort window writes (tiered receipt: context actually filled).
+std::uint64_t cohort_high(const std::vector<CohortRows>& cohort) {
+    std::uint64_t h = 0;
+    for (const auto& c : cohort) h = std::max<std::uint64_t>(h, c.position + c.rows);
+    return h;
+}
+}  // namespace
+
 std::vector<StepResult> Prefill::verify_cohort(const std::vector<CohortRows>& cohort, bool want_logits) {
     auto& m = *impl_;
     if (cohort.size() > 1U) qwen_route::require_composition(m.route_policy.enabled, qwen_route::Composition::cohort);
@@ -1716,7 +2122,7 @@ std::vector<StepResult> Prefill::verify_cohort(const std::vector<CohortRows>& co
         if (c.position != s.length)
             throw std::invalid_argument("verify(): position " + std::to_string(c.position) + " != session length " + std::to_string(s.length));
         if (c.rows == 0 || c.rows > kMaxStepRows) throw std::invalid_argument("step rows out of range");
-        if (c.position + c.rows > m.cfg.max_positions) throw std::invalid_argument("step beyond max_positions");
+        if (c.position + c.rows > s.capacity) throw std::invalid_argument("step beyond the session's capacity");
         if (!s.gdn_base || (s.gdn_state != s.gdn_base && s.gdn_other != s.gdn_base))
             throw std::logic_error("decode graphs: GDN buffer parity lost");
         members.push_back(&s);
@@ -1791,6 +2197,11 @@ std::vector<StepResult> Prefill::verify_cohort(const std::vector<CohortRows>& co
                     m.drop_graph(lru);
                 }
                 Impl::StepGraph g;
+                qsa::MultiShape dev_shape{};
+                std::uint32_t seg_rows[kMaxStepRows] = {};
+                bool own_pools = true;  // every session keeps its pooled keys (else each window re-pools from block 0)
+                for (std::uint32_t i = 0; i < n; ++i) { seg_rows[i] = segs[i].rows; own_pools = own_pools && segs[i].s->pooled[0]; }
+                const bool dev_qsa = m.qsa_graph && own_pools && (m.multiseg || n == 1) && qsa::graph_shape(seg_rows, n, m.qws, dev_shape);
                 const auto close = [&] {
                     cudaGraph_t graph = nullptr;
                     ck(cudaStreamEndCapture(m.stream, &graph), "end capture");
@@ -1801,10 +2212,16 @@ std::vector<StepResult> Prefill::verify_cohort(const std::vector<CohortRows>& co
                     g.seg.push_back(exec);
                 };
                 ck(cudaStreamBeginCapture(m.stream, cudaStreamCaptureModeRelaxed), "begin capture");
-                m.qsa_cut = [&](std::uint32_t) {
-                    close();
-                    ck(cudaStreamBeginCapture(m.stream, cudaStreamCaptureModeRelaxed), "begin capture");
-                };
+                if (dev_qsa) {  // one graph: the QSA cores read the maps the replay copies first
+                    ck(cudaMemcpyAsync(m.qsa_maps, m.qsa_maps_pinned, 12U * sizeof(qsa::SegmentMap), cudaMemcpyHostToDevice, m.stream),
+                       "qsa maps");
+                    m.qsa_dev_shape = &dev_shape;
+                } else {
+                    m.qsa_cut = [&](std::uint32_t) {
+                        close();
+                        ck(cudaStreamBeginCapture(m.stream, cudaStreamCaptureModeRelaxed), "begin capture");
+                    };
+                }
                 try {
                     m.table_mode = table;
                     m.window_prologue(segs.data(), n);
@@ -1815,6 +2232,7 @@ std::vector<StepResult> Prefill::verify_cohort(const std::vector<CohortRows>& co
                 } catch (...) {
                     m.table_mode = false;
                     m.qsa_cut = nullptr;
+                    m.qsa_dev_shape = nullptr;
                     cudaStreamCaptureStatus cs = cudaStreamCaptureStatusNone;
                     if (cudaStreamIsCapturing(m.stream, &cs) == cudaSuccess && cs != cudaStreamCaptureStatusNone) {
                         cudaGraph_t graph = nullptr;
@@ -1825,6 +2243,7 @@ std::vector<StepResult> Prefill::verify_cohort(const std::vector<CohortRows>& co
                     throw;
                 }
                 m.qsa_cut = nullptr;
+                m.qsa_dev_shape = nullptr;
                 for (auto* s : members) { s->ngram[0] = s->ngram_before[0]; s->ngram[1] = s->ngram_before[1]; }
                 m.warmed.erase(key);
                 ++m.graph_captures;
@@ -1840,10 +2259,15 @@ std::vector<StepResult> Prefill::verify_cohort(const std::vector<CohortRows>& co
                 pm::ple_hash_rows(m.ple_contract, sg.tokens, sg.rows, sg.p0, sg.s->ngram,
                                   m.ple_ids_host + std::uint64_t{sg.offset} * pm::kPleHeads);
             const auto& seg = it->second.seg;
-            ck(cudaGraphLaunch(seg[0], m.stream), "graph launch");
-            for (std::uint32_t o = 0; o < 12; ++o) {
-                m.qsa_layer(4 * o + 3, segs.data(), n);
-                ck(cudaGraphLaunch(seg[o + 1], m.stream), "graph launch");
+            if (seg.size() == 1) {  // QSA in the graph: this window's maps, then one launch
+                m.qsa_replay_maps(segs.data(), n);
+                ck(cudaGraphLaunch(seg[0], m.stream), "graph launch");
+            } else {
+                ck(cudaGraphLaunch(seg[0], m.stream), "graph launch");
+                for (std::uint32_t o = 0; o < 12; ++o) {
+                    m.qsa_layer(4 * o + 3, segs.data(), n);
+                    ck(cudaGraphLaunch(seg[o + 1], m.stream), "graph launch");
+                }
             }
             ++m.graph_replays;
         }
@@ -1853,6 +2277,7 @@ std::vector<StepResult> Prefill::verify_cohort(const std::vector<CohortRows>& co
             ck(cudaMemcpyAsync(logits.data(), m.head_logits, logits.size() * 4, cudaMemcpyDeviceToHost, m.stream), "logits d2h");
         }
         ck(cudaStreamSynchronize(m.stream), "step");
+        if (m.tier) m.tier_step_end(cohort_high(cohort));
     } catch (...) {
         m.window = false;
         m.qsa_cut = nullptr;
@@ -1901,7 +2326,42 @@ SessionId Prefill::create_session() {
     auto& m = *impl_;
     qwen_route::require_composition(m.route_policy.enabled, qwen_route::Composition::cohort);
     if (!m.cfg.decode) throw std::logic_error("create_session() needs Config::decode");
-    return m.new_session().id;
+    return m.new_session(m.cfg.session_positions ? m.cfg.session_positions : m.cfg.max_positions).id;
+}
+
+SessionId Prefill::create_session(std::uint64_t positions) {
+    auto& m = *impl_;
+    qwen_route::require_composition(m.route_policy.enabled, qwen_route::Composition::cohort);
+    if (!m.cfg.decode) throw std::logic_error("create_session() needs Config::decode");
+    return m.new_session(positions).id;
+}
+
+// New position buffers of `positions` for an idle session (session 0 too); its state is discarded (length 0) and the
+// graphs that captured its old pointers are dropped. Fixed buffers (GDN/conv state) stay.
+void Prefill::reserve_session(SessionId session, std::uint64_t positions) {
+    auto& m = *impl_;
+    auto& s = m.session(session);
+    if (s.window_open || s.prefilling || m.cohort_open) throw std::logic_error("reserve_session() with an open window or a chunk in flight");
+    if (positions == 0 || positions > m.cfg.max_positions) throw std::invalid_argument("reserve_session(): positions 1..max_positions");
+    if (positions == s.capacity) { s.length = 0; return; }
+    ck(cudaStreamSynchronize(m.stream), "session resize");
+    m.drop_session_graphs(session);
+    for (void* p : s.row_allocations) cudaFree(p);
+    s.row_allocations.clear();
+    s.bytes -= m.rows_bytes_at(s.capacity);
+    s.capacity = 0;
+    s.length = 0;
+    std::fill(std::begin(s.pooled_valid), std::end(s.pooled_valid), 0U);
+    s.mtp_pooled_valid = 0;
+    m.alloc_rows(s, positions);  // throws with no row buffer left: the caller re-sizes again or destroys
+}
+
+std::uint64_t Prefill::capacity(SessionId session) const { return impl_->session(session).capacity; }
+
+std::uint64_t Prefill::session_bytes(SessionId session) const { return impl_->session(session).bytes; }
+
+std::uint64_t Prefill::session_bytes_at(std::uint64_t positions) const {
+    return impl_->fixed_session_bytes() + impl_->rows_bytes_at(positions);
 }
 
 void Prefill::destroy_session(SessionId session) {
@@ -1910,16 +2370,8 @@ void Prefill::destroy_session(SessionId session) {
     auto& s = m.session(session);
     if (s.window_open || s.prefilling) throw std::logic_error("destroy_session() with an open window or a chunk in flight");
     ck(cudaStreamSynchronize(m.stream), "session drop");
-    // graphs and warm-up counts that captured this session's pointers (keys: session, layout pairs)
-    const auto uses = [&](const Impl::GraphKey& k) {
-        if (!k.empty() && k[0] >= kTableKey - 1U) return false;  // descriptor-table graphs bake no session pointer
-        for (std::size_t i = 0; i < k.size(); i += 2) if (k[i] == session) return true;
-        return false;
-    };
-    for (auto it = m.graphs.begin(); it != m.graphs.end();) {
-        if (uses(it->first)) { auto next = std::next(it); m.drop_graph(it); it = next; } else ++it;
-    }
-    for (auto it = m.warmed.begin(); it != m.warmed.end();) it = uses(it->first) ? m.warmed.erase(it) : std::next(it);
+    m.drop_session_graphs(session);
+    for (void* p : s.row_allocations) cudaFree(p);
     for (void* p : s.allocations) cudaFree(p);
     m.sessions.erase(session);
 }
@@ -1931,7 +2383,7 @@ std::uint64_t Prefill::length(SessionId session) const { return impl_->session(s
 std::uint64_t Prefill::row_bytes() const { return (12ULL + (impl_->mtp ? 1ULL : 0ULL)) * (2048 + 256); }
 
 std::uint64_t Prefill::fixed_bytes() const {
-    return 36ULL * gdn::kMatrixFloats * sizeof(float) + 36ULL * gdn::kConvStateHalfs * 2 + 10240ULL * 9 * 2 + 8;
+    return impl_->state_bytes(36) + 36ULL * gdn::kConvStateHalfs * 2 + 10240ULL * 9 * 2 + 8;
 }
 
 void Prefill::Impl::copy_rows(SessionState& s, std::uint64_t first, std::uint64_t count, void* data, bool importing, bool target_only) {
@@ -1956,7 +2408,7 @@ void Prefill::Impl::copy_fixed(SessionState& s, void* data, bool importing) {
         cursor += bytes;
     };
     // Preserve the current-buffer parity: pointer graphs key it and table graphs read it at replay.
-    copy(s.gdn_state, 36ULL * gdn::kMatrixFloats * sizeof(float));
+    copy(s.gdn_state, state_bytes(36));
     copy(s.gdn_conv, 36ULL * gdn::kConvStateHalfs * 2);
     copy(s.ple_conv, 10240ULL * 9 * 2);
     copy(s.ngram, sizeof(s.ngram));
@@ -1991,7 +2443,7 @@ void Prefill::import_state(SessionId session, std::uint64_t length, const std::v
     auto& m = *impl_;
     auto& s = m.session(session);
     qwen_route::require_composition(m.route_policy.enabled, qwen_route::Composition::untagged_state_import);
-    if (!fixed || length == 0 || length >= m.cfg.max_positions) throw std::invalid_argument("prefix import length/fixed");
+    if (!fixed || length == 0 || length >= s.capacity) throw std::invalid_argument("prefix import length/fixed");
     std::uint64_t end = 0;
     for (const auto& seg : segments) {
         if (!seg.data || seg.first != end || seg.count == 0 || seg.count > length - end)
@@ -2013,9 +2465,11 @@ void Prefill::import_state(SessionId session, std::uint64_t length, const std::v
 
 CanonicalState Prefill::capture_canonical(SessionId session) {
     auto& m = *impl_;
+    if (const auto refusal = recurrent_state_route_refusal(m.state_type, false, "canonical snapshot (untagged f32 matrix)"); !refusal.empty())
+        throw std::invalid_argument(refusal);
     auto& s = m.session(session);
     if (m.mtp && !m.cfg.diagnostic_bf16_mtp) throw std::invalid_argument("canonical snapshot MTP-sidecar layout is unqualified");
-    if (!s.length || s.length >= m.cfg.max_positions) throw std::invalid_argument("canonical snapshot length");
+    if (!s.length || s.length >= s.capacity) throw std::invalid_argument("canonical snapshot length");
     CanonicalState out;
     out.target = numerical_identity().hash;
     out.engine_binding = m.snapshot_binding;
@@ -2058,9 +2512,11 @@ CanonicalState Prefill::capture_canonical(SessionId session) {
 
 void Prefill::restore_canonical(const CanonicalState& state, SessionId session) {
     auto& m = *impl_;
+    if (const auto refusal = recurrent_state_route_refusal(m.state_type, false, "canonical snapshot (untagged f32 matrix)"); !refusal.empty())
+        throw std::invalid_argument(refusal);
     auto& s = m.session(session);
     if (m.mtp && !m.cfg.diagnostic_bf16_mtp) throw std::invalid_argument("canonical snapshot MTP-sidecar layout is unqualified");
-    if (!state.length || state.length >= m.cfg.max_positions) throw std::invalid_argument("canonical snapshot length");
+    if (!state.length || state.length >= s.capacity) throw std::invalid_argument("canonical snapshot length");
     if (m.cfg.diagnostic_bf16_mtp) {
         const qwen_mtp_diagnostic::Binding expected{numerical_identity().hash,m.snapshot_binding,s.diagnostic_generation,m.cfg.max_positions,
             qwen_route::hash_part(qwen_route::hash_part(0xcbf29ce484222325ULL,m.cfg.mtp_sidecar_gguf),m.cfg.draft_vocab),1};
@@ -2074,7 +2530,7 @@ void Prefill::restore_canonical(const CanonicalState& state, SessionId session) 
     const auto canonical_width = m.cfg.diagnostic_bf16_mtp ? 12ULL * 2304 : row_bytes();
     qwen_route::validate_snapshot(state.target, numerical_identity().hash,
         state.engine_binding, m.snapshot_binding,
-        state.length, m.cfg.max_positions, state.rows.size(), canonical_width,
+        state.length, s.capacity, state.rows.size(), canonical_width,
         state.fixed.size(), fixed_bytes(), state.held.size(), s.held ? kWide * 2U : 0U);
     const auto stream = m.state_copy_stream(s);
     s.length = 0;
@@ -2160,7 +2616,7 @@ std::uint32_t Prefill::Impl::prefill_enqueue(SessionState& S, const std::vector<
             ck(cudaMemsetAsync(S.kv[o], 0, position * 2048, stream), "kv clear");
             ck(cudaMemsetAsync(S.raw_index[o], 0, position * 256, stream), "index clear");
         }
-        ck(cudaMemsetAsync(S.gdn_state, 0, 36 * gdn::kMatrixFloats * 4, stream), "gdn clear");
+        ck(cudaMemsetAsync(S.gdn_state, 0, state_bytes(36), stream), "gdn clear");
         for (auto& v : S.pooled_valid) v = 0;
         S.mtp_pooled_valid = 0;
         ck(cudaMemsetAsync(S.gdn_conv, 0, 36 * gdn::kConvStateHalfs * 2, stream), "conv clear");
@@ -2198,10 +2654,11 @@ std::uint64_t Prefill::prefill_chunk(SessionId session, const std::vector<std::u
     if (m.window || m.table_mode || m.qsa_cut || m.after_layer) throw std::logic_error("prefill_chunk() inside a decode window or capture");
     if (m.cfg.export_state) throw std::logic_error("prefill_chunk() needs Config::export_state = false");
     if (position > tokens.size() || position == 0 || from >= position) throw std::invalid_argument("prefill chunk out of range");
-    if (position > m.cfg.max_positions) throw std::invalid_argument("prompt longer than max_positions");
+    if (position > S.capacity) throw std::invalid_argument("prompt longer than the session's capacity");
     if (from != 0 && from != S.length) throw std::invalid_argument("prefill chunk does not continue the session");
     const auto rows = m.prefill_enqueue(S, tokens, position, from, max_rows);
     ck(cudaStreamSynchronize(m.stream), "prefill chunk");
+    if (m.tier) m.tier_step_end(from + rows);
     S.length = from + rows;
     return S.length;
 }
@@ -2225,6 +2682,7 @@ void Prefill::Impl::free_block(BlockFields& b) noexcept {
 void Prefill::enable_prefill_overlap(std::uint32_t max_rows) {
     auto& m = *impl_;
     qwen_route::require_composition(m.route_policy.enabled, qwen_route::Composition::overlap);
+    if (m.tier) throw std::logic_error("prefill overlap is not available with tiered expert residency (one host exchange serves one stream)");
     if (!m.cfg.decode || m.cfg.export_state) throw std::logic_error("prefill overlap needs a decode engine with export_state = false");
     if (m.cohort_open || m.window || m.table_mode || m.qsa_cut || m.after_layer)
         throw std::logic_error("enable_prefill_overlap() inside a decode window");
@@ -2272,7 +2730,7 @@ void Prefill::prefill_chunk_async(SessionId session, const std::vector<std::uint
     if (S.window_open || S.prefilling) throw std::logic_error("prefill_chunk_async() on a session in a window");
     if (m.cfg.export_state) throw std::logic_error("prefill_chunk() needs Config::export_state = false");
     if (position > tokens.size() || position == 0 || from >= position) throw std::invalid_argument("prefill chunk out of range");
-    if (position > m.cfg.max_positions) throw std::invalid_argument("prompt longer than max_positions");
+    if (position > S.capacity) throw std::invalid_argument("prompt longer than the session's capacity");
     if (from != 0 && from != S.length) throw std::invalid_argument("prefill chunk does not continue the session");
     // enqueue with the prefill set swapped in: every launch reads the prefill stream and buffers; nothing is shared with
     // the decode windows (the session is in no window until prefill_wait()).
@@ -2339,7 +2797,7 @@ Draft Prefill::draft(SessionId session, std::uint32_t pending, std::uint32_t dep
     if (S.length == 0) throw std::logic_error("draft() before run()");
     depth = std::min(depth, kMaxStepRows - 1U);
     // the window that verifies these drafts covers positions [length, length + depth]
-    const std::uint64_t room = m.cfg.max_positions > S.length ? m.cfg.max_positions - S.length - 1U : 0U;
+    const std::uint64_t room = S.capacity > S.length ? S.capacity - S.length - 1U : 0U;
     depth = static_cast<std::uint32_t>(std::min<std::uint64_t>(depth, room));
     Draft out;
     if (depth == 0) return out;
@@ -2347,7 +2805,6 @@ Draft Prefill::draft(SessionId session, std::uint32_t pending, std::uint32_t dep
     const auto mwf = [&](const char* n) { return static_cast<const float*>(mw(n)); };
     const auto mwts = m.mtp_weights();
     const auto views = pm::mtp_workspace_views(m.mtp_ws, 1);
-    ck(cudaMemcpyAsync(m.draft_token, &pending, 4, cudaMemcpyHostToDevice, m.stream), "draft pending");
     const std::uint16_t* source = S.held;  // h_{L-1}, then the chain's wide state
     std::uint16_t* wide_attn = m.draft_wide;
     std::uint16_t* wide_mlp = m.draft_wide + kWide;
@@ -2358,13 +2815,64 @@ Draft Prefill::draft(SessionId session, std::uint32_t pending, std::uint32_t dep
         hc::HcMixArgs a;
         a.input = in; a.norm = norm; a.inject = inject; a.packed = packed; a.rows = 1;
         a.normalized = m.normalized; a.injection = m.injection; a.output = m.hidden;
+        a.workspace_layout = hc::HcWorkspaceLayout::automatic;
         hc::hc_mix(a, m.tables, m.stream);
     };
-    for (std::uint32_t k = 0; k < depth; ++k) {
+    // The whole chain as one graph replay: the same launches with the QSA cores on device maps and the cache positions read
+    // from device memory (the eager chain runs once per key first; any position, pooled state or token replays it).
+    qsa::MultiShape dshape{};
+    const std::uint32_t one_row = 1;
+    const std::uint32_t first_segment = per_step_sync ? depth : m.draft_split.first_segment(depth);
+    if (first_segment < depth) ++m.draft_split_runs;
+    bool stopped = false;
+    for (std::uint32_t k0 = 0, k1 = first_segment; k0 < depth && !stopped; k0 = k1, k1 = depth) {
+    if (k0 > 0) ++m.draft_second_runs;
+    source = k0 ? wide_src : S.held;  // segment 2 continues from the chain's wide state and m.draft_token on the device
+    const Impl::DraftKey dkey{reinterpret_cast<std::uintptr_t>(S.held), reinterpret_cast<std::uintptr_t>(S.mtp_kv),
+                              reinterpret_cast<std::uintptr_t>(S.mtp_index), reinterpret_cast<std::uintptr_t>(S.mtp_pooled),
+                              depth | k0 << 8U | k1 << 16U};
+    cudaGraphExec_t dexec = nullptr;
+    bool capture = false;
+    if (m.use_graphs && m.qsa_graph && m.draft_graph && !per_step_sync && S.mtp_pooled && cudaStreamQuery(m.stream) == cudaSuccess &&
+        qsa::graph_shape(&one_row, 1, m.qws, dshape)) {
+        const auto it = m.draft_graphs.find(dkey);
+        if (it != m.draft_graphs.end()) {
+            dexec = it->second.exec;
+            it->second.used = ++m.graph_clock;
+        } else if (m.draft_warmed.count(dkey)) {
+            capture = true;
+        } else {
+            if (m.draft_warmed.size() > 4096) m.draft_warmed.clear();
+            m.draft_warmed[dkey] = 1;
+        }
+    }
+    const std::uint32_t valid_before = S.mtp_pooled_valid;
+    try {
+    if (dexec || capture) {  // this chain's inputs (the stream is idle: no copy of an earlier replay is in flight)
+        for (std::uint32_t k = k0; k < k1; ++k) {
+            m.draft_pos_pinned[k] = S.length - 1 + k;
+            const qsa::SegmentState st{1, S.length - 1 + k, qsa::LayerState{S.mtp_kv, S.mtp_index, S.mtp_pooled, &S.mtp_pooled_valid}};
+            qsa::prepare_replay(&st, 1, m.qws, m.qsa_maps_pinned[12U + k]);
+        }
+        std::memcpy(m.draft_pos_pinned + kMaxStepRows, &pending, 4);
+    } else if (k0 == 0) {
+        ck(cudaMemcpyAsync(m.draft_token, &pending, 4, cudaMemcpyHostToDevice, m.stream), "draft pending");
+    }
+    if (capture) {
+        ck(cudaStreamBeginCapture(m.stream, cudaStreamCaptureModeRelaxed), "begin draft capture");
+        if (k0 == 0)
+            ck(cudaMemcpyAsync(m.draft_token, m.draft_pos_pinned + kMaxStepRows, 4, cudaMemcpyHostToDevice, m.stream), "draft pending");
+        ck(cudaMemcpyAsync(m.draft_pos, m.draft_pos_pinned, kMaxStepRows * sizeof(std::uint64_t), cudaMemcpyHostToDevice, m.stream),
+           "draft positions");
+        ck(cudaMemcpyAsync(m.qsa_maps + 12 + k0, m.qsa_maps_pinned + 12 + k0, (k1 - k0) * sizeof(qsa::SegmentMap), cudaMemcpyHostToDevice,
+                           m.stream),
+           "draft qsa maps");
+    }
+    for (std::uint32_t k = k0; k < (dexec ? k0 : k1); ++k) {
         const std::uint64_t pos = S.length - 1 + k;
         // input fusion (enorm/hnorm/eh_proj) -> the MTP wide row; also stores a provisional cache row at pos
         pm::launch_mtp_cache_rows(mwts, pm::MtpRounding{}, source, m.draft_token, 1, pos, S.mtp_kv, S.mtp_index, m.mtp_ws,
-            m.mtp_status, m.tables, m.stream);
+            m.mtp_status, m.tables, m.stream, capture ? m.draft_pos + k : nullptr);
         mix(views.fused, mwf("hc_attn_norm.weight"), m.mtp_attn_inject, m.mtp_hc_attn);
         dn::Site in;
         in.store = dn::Store::f32_round_bf16;
@@ -2378,8 +2886,11 @@ Draft Prefill::draft(SessionId session, std::uint32_t pending, std::uint32_t dep
         const qsa::LayerWeights lw{static_cast<const std::uint16_t*>(mw("indexer.q_proj.weight")),
                                    static_cast<const std::uint16_t*>(mw("indexer.k_proj.weight")), mwf("attn_q_norm.weight"),
                                    mwf("attn_k_norm.weight"), mwf("indexer.q_norm.weight"), mwf("indexer.k_norm.weight")};
-        qsa::layer_core(rb, 1, pos, lw, qsa::LayerState{S.mtp_kv, S.mtp_index, S.mtp_pooled, &S.mtp_pooled_valid}, m.rope, m.tables,
-            m.qws, m.stream);
+        if (capture)
+            qsa::layer_core_device(rb, m.qsa_maps + 12U + k, dshape, lw, m.rope, m.tables, m.qws, m.stream);
+        else
+            qsa::layer_core(rb, 1, pos, lw, qsa::LayerState{S.mtp_kv, S.mtp_index, S.mtp_pooled, &S.mtp_pooled_valid}, m.rope,
+                m.tables, m.qws, m.stream);
         dn::Site o;
         o.store = dn::Store::bf16;
         o.width = qsa::kAttnWidth;
@@ -2413,21 +2924,56 @@ Draft Prefill::draft(SessionId session, std::uint32_t pending, std::uint32_t dep
         std::memcpy(&probability, &sel[1], 4);
         out.tokens.push_back(sel[0]);
         out.probability.push_back(probability);
-        if (probability < min_probability) break;  // the node keeps the low draft and stops after it
+        if (probability < min_probability) { stopped = true; break; }  // the node keeps the low draft and stops after it
+    }
+    if (capture) {
+        cudaGraph_t graph = nullptr;
+        ck(cudaStreamEndCapture(m.stream, &graph), "end draft capture");
+        const auto st = cudaGraphInstantiate(&dexec, graph, 0);
+        cudaGraphDestroy(graph);
+        ck(st, "draft graph instantiate");
+        while (m.draft_graphs.size() >= 64) {
+            auto lru = m.draft_graphs.begin();
+            for (auto g = m.draft_graphs.begin(); g != m.draft_graphs.end(); ++g) if (g->second.used < lru->second.used) lru = g;
+            cudaGraphExecDestroy(lru->second.exec);
+            m.draft_graphs.erase(lru);
+        }
+        m.draft_graphs[dkey] = Impl::DraftGraph{dexec, ++m.graph_clock};
+        m.draft_warmed.erase(dkey);
+        ++m.draft_captures;
+    }
+    if (dexec) {
+        ck(cudaGraphLaunch(dexec, m.stream), "draft graph launch");
+        ++m.draft_replays;
+    }
+    } catch (...) {
+        if (capture) {
+            cudaStreamCaptureStatus cs = cudaStreamCaptureStatusNone;
+            if (cudaStreamIsCapturing(m.stream, &cs) == cudaSuccess && cs != cudaStreamCaptureStatusNone) {
+                cudaGraph_t graph = nullptr;
+                cudaStreamEndCapture(m.stream, &graph);
+                if (graph) cudaGraphDestroy(graph);
+            }
+        }
+        if (dexec || capture) S.mtp_pooled_valid = valid_before;  // nothing of this chain ran
+        throw;
     }
     if (!per_step_sync) {
         // every step was launched back to back; one read, then the same stop rule (later steps are discarded)
+        // (one segment = the whole chain: the same stop rule; a stop in segment 1 skips segment 2, whose steps it discards)
         std::uint32_t all[2 * kMaxStepRows];
-        ck(cudaMemcpyAsync(all, m.draft_sel, std::uint64_t{depth} * 8, cudaMemcpyDeviceToHost, m.stream), "draft read");
+        ck(cudaMemcpyAsync(all, m.draft_sel + 2 * k0, std::uint64_t{k1 - k0} * 8, cudaMemcpyDeviceToHost, m.stream), "draft read");
         ck(cudaStreamSynchronize(m.stream), "draft chain");
-        for (std::uint32_t k = 0; k < depth; ++k) {
+        for (std::uint32_t k = k0; k < k1; ++k) {
             float probability;
-            std::memcpy(&probability, &all[2 * k + 1], 4);
-            out.tokens.push_back(all[2 * k]);
+            std::memcpy(&probability, &all[2 * (k - k0) + 1], 4);
+            out.tokens.push_back(all[2 * (k - k0)]);
             out.probability.push_back(probability);
-            if (probability < min_probability) break;
+            if (probability < min_probability) { stopped = true; break; }
         }
     }
+    }  // segments
+    if (!per_step_sync) m.draft_split.note(static_cast<std::uint32_t>(out.tokens.size()));
     return out;
 }
 
@@ -2447,7 +2993,7 @@ std::vector<Draft> Prefill::draft_cohort(const std::vector<DraftRequest>& reques
         if (!S.held) throw std::logic_error("draft() needs Config::decode and an MTP sidecar");
         if (S.prefilling) throw std::logic_error("draft() on a session with a prefill chunk in flight");
         if (S.length == 0) throw std::logic_error("draft() before run()");
-        const std::uint64_t room = m.cfg.max_positions > S.length ? m.cfg.max_positions - S.length - 1U : 0U;
+        const std::uint64_t room = S.capacity > S.length ? S.capacity - S.length - 1U : 0U;
         depth[i] = static_cast<std::uint32_t>(std::min<std::uint64_t>(std::min(requests[i].depth, kMaxStepRows - 1U), room));
         if (depth[i] > 0) order.push_back(i);
     }
@@ -2474,6 +3020,7 @@ std::vector<Draft> Prefill::draft_cohort(const std::vector<DraftRequest>& reques
         hc::HcMixArgs a;
         a.input = in; a.norm = norm; a.inject = inject; a.packed = packed; a.rows = rows;
         a.normalized = m.normalized; a.injection = m.injection; a.output = m.hidden;
+        a.workspace_layout = hc::HcWorkspaceLayout::automatic;
         hc::hc_mix(a, m.tables, m.stream);
     };
     const qsa::LayerWeights lw{static_cast<const std::uint16_t*>(mw("indexer.q_proj.weight")),

@@ -263,6 +263,12 @@ void set_fast_dense(int mode);
 void set_fast_engram(int mode);
 // Returns true when the outputs' A8 (a8_codes) was written.
 bool enqueue_q8_0_a8_dense_prefill(const Q8A8DensePrefillView& view, void* stream);
+// FAST flash layers (ds41-attn-bf16flash-v1), q_b only: when the FAST dense form takes `view` (the same rule as above),
+// writes the BF16 image of q after RoPE (rope[r] for output row r; view.out_stride elements per row) into `image`
+// instead of view.out and returns true; the flash core reads it through query_op with the bits of the FP32 path.
+// Returns false (nothing launched) when the FAST dense form declines: the caller runs the FP32 form.
+// rope: const attn::RopeRow* (strix/ds41_attention.hpp), one per output row.
+bool enqueue_q_b_rope_image(const Q8A8DensePrefillView& view, std::uint16_t* image, const void* rope, void* stream);
 // F16 projection (weight [count rows of width]): out[r * out_stride + o] = f16_row_dot(row first + o, x_r),
 // any number of rows (above 8 a tiled kernel with the same lane classes and butterfly, so the same bits).
 struct F16RowsView {
