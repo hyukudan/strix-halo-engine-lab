@@ -995,7 +995,7 @@ if(BUILD_TESTING)
     set_tests_properties(strix-host-lane-tests PROPERTIES LABELS "cpu" TIMEOUT 120)
     # Shared weight-load queue: overlapped reads, per-ticket staging inside a resident budget, one publication wait.
     add_executable(strix-weight-load-queue-tests tests/weight_load_queue_tests.cpp)
-    target_include_directories(strix-weight-load-queue-tests PRIVATE src)
+    target_include_directories(strix-weight-load-queue-tests PRIVATE src include)
     target_link_libraries(strix-weight-load-queue-tests PRIVATE Threads::Threads)
     target_compile_features(strix-weight-load-queue-tests PRIVATE cxx_std_20)
     strix_target_warnings(strix-weight-load-queue-tests)
