@@ -10,6 +10,11 @@
 #include <iostream>
 #include <stdexcept>
 #include <vector>
+#if __has_include("../../src/hip/weight/registry.hpp")
+#include "../../src/hip/weight/registry.hpp"
+#include "strix/weight/source.hpp"
+#define WFMT_HAS_NATIVE_SOURCES 1
+#endif
 #ifdef STRIX_WFMT_CAPTURE
 #include "../../scripts/bench/wfmt/hip_transfer_capture.hpp"
 #endif
@@ -215,6 +220,25 @@ void dense_case(unsigned k,unsigned n,unsigned rows) {
 }
 }
 int main() try {
+#ifdef WFMT_HAS_NATIVE_SOURCES
+    namespace wh=strix::weight::hip;
+    static_assert(std::is_trivially_copyable_v<wh::MatrixView>);
+    auto fixture=weights(128U,17U);
+    strix::weight::WeightView view{};
+    view.storage={"gguf.q8_0",1};view.shape={{{128U,17U,0U,0U}},2};
+    view.payload={strix::weight::memory_source(std::as_bytes(std::span(fixture))),{0U,fixture.size()}};
+    view.has_byte_strides=true;view.byte_strides={1U,136U,0U,0U};
+    wh::LaunchShape shape{1U,17U,128U,136U,128U,17U,0U};
+    const auto* registered=wh::find_source(view.storage,"f16-tile");
+    if(wh::sources().size()!=6U || !registered || !registered->validate(view,shape)) throw std::runtime_error("HIP source registration validation");
+    shape.activation_stride=127U;
+    if(registered->validate(view,shape)) throw std::runtime_error("HIP source admitted invalid activation stride");
+    shape.activation_stride=128U;shape.k=64U;
+    if(registered->validate(view,shape)) throw std::runtime_error("HIP F16 source admitted partial stage");
+    shape.k=96U;registered=wh::find_source(view.storage,"signed-a8");
+    if(!registered || registered->paired_k!=64U || registered->validate(view,shape)) throw std::runtime_error("HIP signed source admitted odd block pair");
+    if(wh::find_source({"gguf.iq3_s",1},"f16-tile")) throw std::runtime_error("unregistered HIP source unexpectedly admitted");
+#endif
     Buffer op(4096U*3U*2U);hipLaunchKernelGGL(operands_kernel,dim3(16),dim3(256),0,0,op.as<std::uint16_t>());check(hipGetLastError());op.read<std::uint16_t>(4096U*3U);
     partial_case(false);partial_case(true);
     signed_case<1>(256U,17U);signed_case<2>(256U,17U);signed_case<7>(256U,17U);signed_case<8>(256U,17U);
