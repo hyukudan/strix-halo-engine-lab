@@ -82,6 +82,8 @@ struct Stream {
     std::uint32_t depth_max = 0;  // per-request draft cap (0: the step's depth)
     ContextDraft* context = nullptr;  // borrowed; null = MTP drafts only
     std::uint32_t copy_rows = 0;      // per-request wide copy window rows (0: the step's; request field "copy_rows")
+    std::uint32_t window_rows = 0;    // per-request window budget (0: the step's; request field "window_rows"; the
+                                      // step takes the widest one of its streams, packing only)
 };
 
 inline std::uint32_t window_rows_default() {
@@ -231,6 +233,11 @@ struct StepTiming {
 inline std::vector<StreamStep> step(qp::Prefill& p, std::vector<Stream>& streams, const StepOptions& opt, StepTiming* timing = nullptr) {
     using Clock = std::chrono::steady_clock;
     StepOptions o = opt;
+    {
+        std::uint32_t req = 0;
+        for (const auto& s : streams) req = std::max(req, s.window_rows);
+        if (req) o.budget = req;
+    }
     o.budget = std::clamp<std::uint32_t>(o.budget, 1U, kMaxWindowRows);
     if (o.max_positions == 0) o.max_positions = p.max_positions();
     const auto n = static_cast<std::uint32_t>(streams.size());
