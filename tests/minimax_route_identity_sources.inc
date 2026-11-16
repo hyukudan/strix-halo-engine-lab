@@ -230,3 +230,6 @@
 {"src/xport/transport_backend.hpp", 0xe55fde715548edf1ULL},
 {"src/xport/wire.hpp", 0x7f1782a0671f1afdULL},
 {"src/moe_core/route.hpp", 0x3acb79710ef6b1a8ULL},
+{"include/strix/session/cycle_pack.hpp", 0x2c4f745f250c4906ULL},
+{"include/strix/session/prefill_session.hpp", 0x223658661ba6ef38ULL},
+{"src/session/cycle_pack.hip", 0x3638b767c18f834cULL},
