@@ -427,7 +427,6 @@ Resolved resolve(App app, const std::vector<std::string>& in, const Getenv& raw_
 
 std::string describe(App app, const Resolved& r) {
     std::ostringstream o;
-    o << strix::weight::family_plan_notice(r.weight_plans);
     o << "app " << app_name(app) << '\n';
     if (r.profile) o << r.profile->describe();
     for (const auto& [k, v] : r.set_env) o << "env " << k << '=' << v << '\n';
@@ -442,6 +441,7 @@ std::string describe(App app, const Resolved& r) {
       << "session directory " << r.session.directory << "\n"
       << "session reason " << r.session.reason << "\n";
     for (const auto& n : r.notices) o << "notice " << n << '\n';
+    o << strix::weight::family_plan_notice(r.weight_plans);
     return o.str();
 }
 
