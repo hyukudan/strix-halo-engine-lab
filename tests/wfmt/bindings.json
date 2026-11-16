@@ -3690,8 +3690,8 @@
       ]
     },
     {
-      "id": "cuda-dense:include/strix/cuda/qwen_quant.cuh",
-      "source": "include/strix/cuda/qwen_quant.cuh",
+      "id": "cuda-dense:src/cuda/weight/ggml_sources.cuh",
+      "source": "src/cuda/weight/ggml_sources.cuh",
       "backend": "cuda",
       "formats": [
         "F32",
@@ -3720,7 +3720,11 @@
         "block",
         "decode_group",
         "decode_row_group",
-        "scale_min_k4"
+        "gguf_type",
+        "group",
+        "scale_min_k4",
+        "validate",
+        "validate_weight"
       ]
     },
     {
@@ -3848,12 +3852,41 @@
         "_ZN5strix12_GLOBAL__N_136rows_shared_activation_scalar_kernelEmmmmPKvjj",
         "__launch_bounds__",
         "__syncthreads",
-        "block_acc",
         "blocks",
         "decode_rows_enabled",
         "dense_a8_quantize8",
         "dense_tile2_enabled",
         "kernel",
+        "loader",
+        "quantize",
+        "quantize_kernel",
+        "quantize_project",
+        "rows_ksplit_enabled",
+        "rows_shared_activation_scalar_kernel",
+        "shared_activation_kernel"
+      ]
+    },
+    {
+      "id": "cuda-dense:src/cuda/core/imma_dense.cuh",
+      "source": "src/cuda/core/imma_dense.cuh",
+      "backend": "cuda",
+      "formats": [
+        "Q8_0",
+        "F32",
+        "IQ4_NL"
+      ],
+      "arithmetic": "legacy Q8 transcode; IMMA",
+      "migration": "P10",
+      "owner": "shared-weight-layer-maintainer",
+      "status": "incumbent",
+      "capture": "legacy-public-entrypoint",
+      "operations": [
+        "__launch_bounds__",
+        "__syncthreads",
+        "block_acc",
+        "blocks",
+        "decode_rows_enabled",
+        "dense_tile2_enabled",
         "launch_bounds",
         "launch_project",
         "launch_rows",
@@ -3867,14 +3900,10 @@
         "project_rows_kernel",
         "project_rows_ks_kernel",
         "project_tile2_kernel",
-        "quantize",
-        "quantize_kernel",
-        "quantize_project",
         "rows",
         "rows_ksplit_enabled",
-        "rows_shared_activation_scalar_kernel",
+        "scale_bits",
         "segments_tile_aligned",
-        "shared_activation_kernel",
         "stage",
         "tile2",
         "volatile"
@@ -3903,6 +3932,7 @@
         "gather_rows",
         "kernels",
         "q8_to_f32_kernel",
+        "scale",
         "scale_of",
         "select_kernel"
       ]
@@ -3956,6 +3986,7 @@
         "ple_rows_conv_state_kernel",
         "ple_rows_gate_norm_kernel",
         "rows",
+        "scale",
         "validate_mtp_cache_casts"
       ]
     },
@@ -3997,7 +4028,8 @@
         "q8_fast_kernel",
         "quantize_a8_fast_kernel",
         "rows",
-        "rows_"
+        "rows_",
+        "scale_bits"
       ]
     },
     {
@@ -4960,7 +4992,6 @@
     "apps/hip_decode_token_main.cpp",
     "apps/qwen_effective_config.hpp",
     "include/strix/cuda/core/nvfp4.hpp",
-    "include/strix/cuda/qwen_quant.cuh",
     "include/strix/deepseek41_device_forward.hpp",
     "include/strix/device_profile.hpp",
     "include/strix/ds41_dspark.hpp",
@@ -4982,6 +5013,7 @@
     "src/cpu/core/reference.cpp",
     "src/cpu/core/select.cpp",
     "src/cuda/core/arch/sm120/nvfp4.cuh",
+    "src/cuda/core/imma_dense.cuh",
     "src/cuda/core/nvfp4.cu",
     "src/cuda/core/nvfp4_reference.cpp",
     "src/cuda/core/trellis.cu",
@@ -4997,6 +5029,7 @@
     "src/cuda/models/qwen/qwen_plemtp.cu",
     "src/cuda/models/qwen/qwen_prefill_driver.cu",
     "src/cuda/models/qwen/qwen_transcode.cu",
+    "src/cuda/weight/ggml_sources.cuh",
     "src/deepseek41_pair_defaults.cpp",
     "src/ds41_dense_adapter.hpp",
     "src/ds41_formats.cpp",
