@@ -138,11 +138,11 @@ int main() {
         }
         // large-M prefill: exact policy == windowed serial decode (logits of the last prompt token and of 8 continuation tokens,
         // which exercises the committed KV / GDN delta / conv state); flash policy is gated (finite, close, same top-1 mostly).
-        for (int pol = 0; pol < 2; ++pol) {
+        for (int pol = 0; pol < 3; ++pol) {
             q::EngineOptions po = opt;
             po.multi_gemv = true;
             po.prefill_chunk = 128;  // 160 prompt tokens = one full chunk + a 32-row tail chunk
-            po.prefill_arith = pol == 0 ? q::PrefillArith::exact : q::PrefillArith::flash;
+            po.prefill_arith = pol == 0 ? q::PrefillArith::exact : pol == 1 ? q::PrefillArith::flash : q::PrefillArith::fast8;
             q::Config pcfg = cfg;
             pcfg.gdn_value_heads = 16;  // beta/alpha out = 16: serves the large-M path (out % 16 == 0)
             auto P = q::CudaEngine::synthetic(pcfg, pack, po, 7);
@@ -180,8 +180,8 @@ int main() {
                     ref = std::max(ref, static_cast<double>(std::fabs(cref[i])));
                 }
                 for (std::size_t i = 0; i < extra; ++i) top_ok += arg(cont, i * c2.vocab) == arg(cref, i * c2.vocab);
-                std::printf("  flash prefill vs serial: max|dlogit| %.4g (max|logit| %.4g), top-1 agree %zu/%zu\n", mx, ref, top_ok, extra);
-                CHECK(fin && mx < 0.1 * ref + 1e-3, "variant %d: flash prefill finite and close", var);
+                std::printf("  %s prefill vs serial: max|dlogit| %.4g (max|logit| %.4g), top-1 agree %zu/%zu\n", pol == 1 ? "flash" : "fast8", mx, ref, top_ok, extra);
+                CHECK(fin && mx < 0.1 * ref + 1e-3, "variant %d: flash/fast8 prefill finite and close", var);
             }
         }
         // MTP: one call with rows == the same rows one at a time
