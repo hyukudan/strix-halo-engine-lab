@@ -702,7 +702,7 @@ struct CudaEngine::Impl {
     }
 
     [[nodiscard]] int pf_terms() const {
-        if (opt.prefill_arith == PrefillArith::fast) return 1;
+        if (opt.prefill_arith == PrefillArith::fast || opt.prefill_arith == PrefillArith::fast8) return 1;
         if (opt.prefill_arith == PrefillArith::fast2) return 2;
         const auto a = cc::dense_arith();
         return a == cc::DenseArith::mma3 ? 3 : a == cc::DenseArith::mma2 ? 2 : 1;
@@ -718,7 +718,7 @@ struct CudaEngine::Impl {
         }
         const int cls = w.format == cc::WeightFormat::nvfp4 ? 1 : 0;
         if (!sl.have[cls]) {
-            CK(cc::dense_big_split(x, rows, w.in, w.format, pf.terms, &sl.act[cls], sl.st, sl.bc));
+            CK(cc::dense_big_split(x, rows, w.in, w.format, pf.terms, &sl.act[cls], sl.st, sl.bc, opt.prefill_arith == PrefillArith::fast8));
             sl.have[cls] = true;
         }
         return sl.act[cls];
@@ -1042,7 +1042,7 @@ void CudaEngine::commit(std::uint32_t k) { p_->commit_rows(k); }
 RowsOut CudaEngine::prefill(const std::uint32_t* tokens, std::uint32_t n, LogitRows want) { return p_->prefill(tokens, n, want); }
 bool CudaEngine::prefill_is_big() const { return p_->big_supported(); }
 const char* prefill_arith_name(PrefillArith a) {
-    static const char* n[] = {"exact", "flash", "fast", "fast2"};
+    static const char* n[] = {"exact", "flash", "fast", "fast2", "fast8"};
     return n[static_cast<int>(a)];
 }
 CudaEngine::MtpOut CudaEngine::mtp_forward(const std::uint32_t* next_tokens, const float* hidden_dev, std::uint32_t rows,

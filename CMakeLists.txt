@@ -4720,7 +4720,7 @@ if(STRIX_ENABLE_CUDA_DS41)
         add_test(NAME strix-cuda-ds41-attention-alloc-tests COMMAND strix-cuda-ds41-attention-alloc-tests)
     endif()
     if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
-        set(CMAKE_CUDA_ARCHITECTURES "120;89;86")
+        set(CMAKE_CUDA_ARCHITECTURES "120a;89;86")  # 120a: sm_120 plus the e4m3 mma of the FAST prefill GEMM
     endif()
     enable_language(CUDA)
     find_package(CUDAToolkit REQUIRED)

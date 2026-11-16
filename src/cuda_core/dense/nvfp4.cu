@@ -580,4 +580,56 @@ cudaError_t nvfp4_expand_f16(const DenseWeight& w, void* dst_f16, cudaStream_t s
     return cudaGetLastError();
 }
 
+
+namespace {
+// FAST/TURBO e4m3 expansion (src/cuda_core/dense/dense_big.cu big_kernel_f8): one warp per record, lane (g, t) writes 32 contiguous
+// bytes per half-tile row: position 32t + 4j + 2p + e of a 128-input block holds input 16j + 8p + 2t + e. Value = e2m1 * e4m3 / 8
+// rounded to e4m3 (the 1/8 keeps 6 * 448 inside the e4m3 range; the GEMM epilogue multiplies it back together with gscale).
+__global__ void __launch_bounds__(256) expand_e4m3_kernel(const unsigned char* w, std::uint32_t out, std::uint32_t in, unsigned char* dst) {
+    const std::uint32_t rec_id = blockIdx.x * 8 + (threadIdx.x >> 5);
+    const std::uint32_t nch = in >> 7, ntiles = out >> 4;
+    if (rec_id >= ntiles * nch) return;
+    const std::uint32_t m = rec_id / nch, c = rec_id % nch;
+    const int lane = threadIdx.x & 31, g = lane >> 2, t = lane & 3;
+    const unsigned char* rec = w + static_cast<std::size_t>(rec_id) * kNvfp4RecordBytes;
+    const uint4 d[2] = {*reinterpret_cast<const uint4*>(rec + lane * 16), *reinterpret_cast<const uint4*>(rec + 512 + lane * 16)};
+    const uint4 sc = *reinterpret_cast<const uint4*>(rec + 1024 + g * 16);
+    const std::uint32_t scw[4] = {sc.x, sc.y, sc.z, sc.w};
+#pragma unroll
+    for (int h = 0; h < 2; ++h) {
+        const std::uint32_t dw[4] = {d[h].x, d[h].y, d[h].z, d[h].w};
+        unsigned char* row = dst + static_cast<std::size_t>(m * 16 + 8 * h + g) * in + (static_cast<std::size_t>(c) << 7) + 32 * t;
+        std::uint32_t ob[8];
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            std::uint32_t o[4];
+            e2m1_word(dw[i], o);
+#pragma unroll
+            for (int b = 0; b < 4; ++b) {
+                const int j = 2 * i + (b >> 1);
+                const int sb = 8 * h + j;
+                const std::uint32_t s2 = e4m3x2_to_f16x2((scw[sb >> 2] >> (8 * (sb & 3))) & 0xFFFFu);
+                std::uint32_t v = hmul2(o[b], prmt(s2, 0x1010));
+                v = hmul2(v, 0x30003000u);  // * 0.125 (exact in f16)
+                std::uint32_t r;
+                asm("{\n .reg .b16 h;\n cvt.rn.satfinite.e4m3x2.f16x2 h, %1;\n cvt.u32.u16 %0, h;\n}" : "=r"(r) : "r"(v));
+                const int k = 4 * i + b;  // pair index in the thread's 16 pairs
+                if (k & 1) ob[k >> 1] |= (r & 0xFFFFu) << 16;
+                else ob[k >> 1] = r & 0xFFFFu;
+            }
+        }
+        uint4* o4 = reinterpret_cast<uint4*>(row);
+        o4[0] = make_uint4(ob[0], ob[1], ob[2], ob[3]);
+        o4[1] = make_uint4(ob[4], ob[5], ob[6], ob[7]);
+    }
+}
+}  // namespace
+
+cudaError_t nvfp4_expand_e4m3(const DenseWeight& w, void* dst, cudaStream_t stream) {
+    if (w.format != WeightFormat::nvfp4 || !nvfp4_shape_ok(w.out, w.in)) return cudaErrorInvalidValue;
+    const std::uint32_t recs = (w.out >> 4) * (w.in >> 7);
+    expand_e4m3_kernel<<<(recs + 7) / 8, 256, 0, stream>>>(static_cast<const unsigned char*>(w.data), w.out, w.in, static_cast<unsigned char*>(dst));
+    return cudaGetLastError();
+}
+
 }  // namespace strix::cuda_core

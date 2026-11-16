@@ -32,7 +32,8 @@ enum class TurboWeights : std::uint8_t { off, native, onfly };
 // flash: exact dense, causal flash attention (bf16 P, online softmax; FAST attention, differs from decode attention).
 // fast: flash + activation split of ONE bf16 term (mma1; nvfp4 weights are unchanged: their activation is f16 already).
 // fast2: flash + two bf16 terms (mma2).
-enum class PrefillArith : std::uint8_t { exact, flash, fast, fast2 };
+// fast8: fast + nvfp4 weights on the e4m3 x e4m3 mma (activation per-row e4m3, weight e2m1*e4m3 rounded to e4m3): TURBO/FAST, quality-gated.
+enum class PrefillArith : std::uint8_t { exact, flash, fast, fast2, fast8 };
 [[nodiscard]] const char* prefill_arith_name(PrefillArith a);
 
 struct EngineOptions {

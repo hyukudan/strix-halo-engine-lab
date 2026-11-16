@@ -27,6 +27,7 @@ struct BigAct {
     std::uint32_t rows = 0, rows_pad = 0, in = 0;
     int terms = 3;
     bool f16 = false;  // f16 plane (nvfp4 weights) instead of bf16 planes
+    bool f8 = false;   // FAST/TURBO: e4m3 plane + row scales (nvfp4 weights only; dense_big_gemm then runs the e4m3 x e4m3 mma kernel)
 };
 
 enum class BigEpi : std::uint8_t {
@@ -40,7 +41,7 @@ enum class BigEpi : std::uint8_t {
 // Splits x (FP32 [rows][in]) into the planes weights of format `fmt` need. terms: 1..3 (bf16 and q8_0 only; nvfp4 ignores it).
 // rows <= max rows given to dense_big_reserve. `in` % 32 == 0.
 cudaError_t dense_big_split(const float* x, std::uint32_t rows, std::uint32_t in, WeightFormat fmt, int terms, BigAct* out,
-                            cudaStream_t stream, BigCtx* ctx = nullptr);
+                            cudaStream_t stream, BigCtx* ctx = nullptr, bool f8 = false);
 // y[r][o] = epilogue(W x_r), r < a.rows. The planes must come from dense_big_split with the same format class as w.
 cudaError_t dense_big_gemm(const DenseWeight& w, const BigAct& a, float* y, const float* aux, BigEpi epi, cudaStream_t stream,
                            BigCtx* ctx = nullptr);

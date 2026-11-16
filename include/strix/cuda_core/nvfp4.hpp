@@ -67,6 +67,9 @@ std::uint32_t nvfp4_split_k(std::uint32_t out, std::uint32_t in);
 // WITHOUT gscale). Inside every 32-input block the elements are stored in the mma k-fragment order (position 8q + 4s + 2p + e holds
 // input 16s + 2q + 8p + e), so one 8-byte shared-memory read gives a thread's four k of a k16 step.
 cudaError_t nvfp4_expand_f16(const DenseWeight& w, void* dst_f16, cudaStream_t stream);
+// FAST/TURBO prefill: e4m3 [out][in] of (e2m1 * e4m3 / 8) (rounded; WITHOUT gscale), position 32t + 4j + 2p + e of a 128-input block holds
+// input 16j + 8p + 2t + e (the activation quantiser of dense_big uses the same permutation).
+cudaError_t nvfp4_expand_e4m3(const DenseWeight& w, void* dst, cudaStream_t stream);
 
 // Host reference: dequantised float (e2m1 * e4m3 in FP32, WITHOUT gscale) of element (o, k) read from a tile-layout buffer.
 float nvfp4_host_dequant(const unsigned char* tiles, std::uint32_t in, std::uint32_t o, std::uint32_t k);

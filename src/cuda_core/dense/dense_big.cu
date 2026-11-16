@@ -26,6 +26,8 @@ struct BigCtx {
     std::uint64_t wexp_bytes = 0;
     float* scales = nullptr;
     std::uint64_t scales_bytes = 0;
+    float* rscale = nullptr;  // f8 activation row scales [rows_pad]
+    std::uint64_t rscale_bytes = 0;
 };
 
 namespace {
@@ -46,6 +48,7 @@ struct BigArgs {
     std::uint32_t tiles_x, tiles_y, group;  // CTA raster: groups of `group` out tiles walk all row tiles (weight panel stays in L2)
     float gscale;
     int epi;
+    const float* rscale;        // f8 kernel: per activation row dequant scale
 };
 
 __device__ __forceinline__ void cp8(std::uint32_t smem_addr, const void* g) {
@@ -246,6 +249,172 @@ __global__ void __launch_bounds__(256, 1) big_kernel(const BigArgs a) {
         }
 }
 
+
+// ------------------------------------------------------------------------------------ FAST/TURBO e4m3 x e4m3 GEMM (sm_120)
+// y[r][o] = gscale * 8 * rscale[r] * sum_k W8[o][k] * X8[r][k], W8 = nvfp4_expand_e4m3 (permuted inside every 128 inputs), X8 =
+// quant_e4m3_kernel (same permutation). mma.sync m16n8k32 e4m3 (f32 accumulate); no segment order (bit-changing by design).
+// A stage unit is BKB * 64 inputs = BKB * 64 bytes per row; the shared geometry is that of the 16-bit kernel with BKB blocks
+// (rows of 32 * BKB 16-bit words): thread q reads 8-byte units 2q + s, s = 0, 1 (one k32 step each) = a0/a2 resp. b0/b1.
+__device__ __forceinline__ void mma_e4m3(float (&c)[4], const std::uint32_t (&a)[4], std::uint32_t b0, std::uint32_t b1) {
+#if defined(__CUDA_ARCH_FEAT_SM120_ALL)
+    asm volatile("mma.sync.aligned.kind::f8f6f4.m16n8k32.row.col.f32.e4m3.e4m3.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
+                 : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
+                 : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+#else
+    __trap();  // built without sm_120a: the host never selects the e4m3 path
+#endif
+}
+
+template <int NT, int BKB, int STG>
+struct Cfg8 {
+    static constexpr int BN = 4 * NT * 8;
+    static constexpr int UK = BK * BKB, RU = 8 * BKB;  // 16-bit words per row of a unit, 8-byte units per row
+    static constexpr int A_ELEMS = BM * UK, B_ELEMS = BN * UK;
+    static constexpr int STAGE_ELEMS = A_ELEMS + B_ELEMS;
+    static constexpr int SMEM = STG * STAGE_ELEMS * 2;
+};
+
+template <int NT, int BKB, int STG>
+__device__ __forceinline__ void load_unit8(const BigArgs& a, std::uint16_t* sbase, std::uint32_t o0, std::uint32_t r0, std::uint32_t un) {
+    using C = Cfg8<NT, BKB, STG>;
+    const std::uint32_t tid = threadIdx.x;
+    const std::uint32_t sb = static_cast<std::uint32_t>(__cvta_generic_to_shared(sbase));
+    const unsigned char* A8 = reinterpret_cast<const unsigned char*>(a.A);
+    const unsigned char* P8 = reinterpret_cast<const unsigned char*>(a.P);
+#pragma unroll
+    for (int i = 0; i < BM * C::RU / 256; ++i) {
+        const std::uint32_t idx = tid + 256 * i, r = idx / C::RU, u = idx % C::RU;
+        const std::uint32_t orow = min(o0 + r, a.out - 1);
+        cp8(sb + (r * C::UK + ((u ^ swz_mask<BKB>(r)) * 4)) * 2, A8 + static_cast<std::size_t>(orow) * a.in + un * (64 * BKB) + u * 8);
+    }
+#pragma unroll
+    for (int i = 0; i < C::BN * C::RU / 256; ++i) {
+        const std::uint32_t idx = tid + 256 * i, r = idx / C::RU, u = idx % C::RU;
+        cp8(sb + (C::A_ELEMS + r * C::UK + ((u ^ swz_mask<BKB>(r)) * 4)) * 2, P8 + static_cast<std::size_t>(r0 + r) * a.in + un * (64 * BKB) + u * 8);
+    }
+}
+
+template <int NT, int BKB, int STG>
+__global__ void __launch_bounds__(256, 1) big_kernel_f8(const BigArgs a) {
+    using C = Cfg8<NT, BKB, STG>;
+    extern __shared__ __align__(16) std::uint16_t smem[];
+    std::uint32_t tx, ty;
+    {
+        const std::uint32_t per = a.group * a.tiles_y, grp = blockIdx.x / per, rem = blockIdx.x % per;
+        const std::uint32_t gsz = min(a.group, a.tiles_x - grp * a.group);
+        ty = rem / gsz;
+        tx = grp * a.group + rem % gsz;
+    }
+    const std::uint32_t o0 = tx * BM, r0 = ty * C::BN;
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, q = lane & 3;
+    const int swz = swz_mask<BKB>(g);
+    const int wm = warp & 1, wn = warp >> 1;
+    float acc[4][NT][4];
+#pragma unroll
+    for (int i = 0; i < 4; ++i)
+#pragma unroll
+        for (int j = 0; j < NT; ++j)
+#pragma unroll
+            for (int k = 0; k < 4; ++k) acc[i][j][k] = 0.0f;
+    const std::uint32_t nu = a.in / (64 * BKB);
+    std::uint32_t nload = 0;
+#pragma unroll
+    for (int s = 0; s < STG - 1; ++s) {
+        if (nload < nu) load_unit8<NT, BKB, STG>(a, smem + s * C::STAGE_ELEMS, o0, r0, nload);
+        ++nload;
+        cp_commit();
+    }
+    for (std::uint32_t n = 0; n < nu; ++n) {
+        cp_wait<STG - 2>();
+        __syncthreads();
+        if (nload < nu) load_unit8<NT, BKB, STG>(a, smem + (nload % STG) * C::STAGE_ELEMS, o0, r0, nload);
+        ++nload;
+        cp_commit();
+        const std::uint16_t* sA = smem + (n % STG) * C::STAGE_ELEMS;
+        const std::uint16_t* sB = sA + C::A_ELEMS;
+#pragma unroll
+        for (int blk = 0; blk < BKB; ++blk)
+#pragma unroll
+            for (int s = 0; s < 2; ++s) {
+                const int pu = (blk * 8 + 2 * q + s) ^ swz;
+                uint2 af[4][2];
+#pragma unroll
+                for (int mt = 0; mt < 4; ++mt)
+#pragma unroll
+                    for (int h = 0; h < 2; ++h)
+                        af[mt][h] = *reinterpret_cast<const uint2*>(sA + (wm * 64 + mt * 16 + h * 8 + g) * C::UK + pu * 4);
+#pragma unroll
+                for (int nt = 0; nt < NT; ++nt) {
+                    const uint2 bf = *reinterpret_cast<const uint2*>(sB + (wn * NT * 8 + nt * 8 + g) * C::UK + pu * 4);
+#pragma unroll
+                    for (int mt = 0; mt < 4; ++mt) {
+                        const std::uint32_t av[4] = {af[mt][0].x, af[mt][1].x, af[mt][0].y, af[mt][1].y};
+                        mma_e4m3(acc[mt][nt], av, bf.x, bf.y);
+                    }
+                }
+            }
+    }
+    cp_wait<0>();
+    const float gs = a.gscale * 8.0f;
+#pragma unroll
+    for (int mt = 0; mt < 4; ++mt)
+#pragma unroll
+        for (int h = 0; h < 2; ++h) {
+            const std::uint32_t o = o0 + wm * 64 + mt * 16 + h * 8 + g;
+            if (o >= a.out) continue;
+#pragma unroll
+            for (int nt = 0; nt < NT; ++nt)
+#pragma unroll
+                for (int j = 0; j < 2; ++j) {
+                    const std::uint32_t r = r0 + wn * NT * 8 + nt * 8 + 2 * q + j;
+                    if (r >= a.rows) continue;
+                    const std::size_t idx = static_cast<std::size_t>(r) * a.out + o;
+                    float v = __fmul_rn(acc[mt][nt][h * 2 + j], gs * a.rscale[r]);
+                    if (a.epi == 1) v = __fadd_rn(a.aux[idx], v);
+                    else if (a.epi == 2) v = __fmul_rn(cc_silu(a.aux[idx]), v);
+                    a.y[idx] = v;
+                }
+        }
+}
+
+// one block per row: scale = amax / 448, e4m3 bytes in the nvfp4_expand_e4m3 permutation (position 32t + 4j + 2p + e of a 128 block =
+// input 16j + 8p + 2t + e); rows >= `rows` (padding) are zero with scale 1. thread = 4 consecutive output bytes.
+__global__ void __launch_bounds__(256) quant_e4m3_kernel(const float* x, unsigned char* plane, float* rscale, std::uint32_t rows, std::uint32_t in) {
+    const std::uint32_t r = blockIdx.x;
+    unsigned char* dst = plane + static_cast<std::size_t>(r) * in;
+    const std::uint32_t nw = in >> 2;
+    if (r >= rows) {
+        for (std::uint32_t i = threadIdx.x; i < nw; i += 256) reinterpret_cast<std::uint32_t*>(dst)[i] = 0u;
+        if (threadIdx.x == 0) rscale[r] = 1.0f;
+        return;
+    }
+    const float* xr = x + static_cast<std::size_t>(r) * in;
+    float mx = 0.f;
+    for (std::uint32_t i = threadIdx.x; i < nw; i += 256) {
+        const float4 v = *reinterpret_cast<const float4*>(xr + 4 * i);
+        mx = fmaxf(mx, fmaxf(fmaxf(fabsf(v.x), fabsf(v.y)), fmaxf(fabsf(v.z), fabsf(v.w))));
+    }
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, o));
+    __shared__ float red[8];
+    if ((threadIdx.x & 31) == 0) red[threadIdx.x >> 5] = mx;
+    __syncthreads();
+    mx = red[0];
+#pragma unroll
+    for (int i = 1; i < 8; ++i) mx = fmaxf(mx, red[i]);
+    const float sc = mx > 0.f ? mx * (1.0f / 448.0f) : 1.0f, inv = 1.0f / sc;
+    if (threadIdx.x == 0) rscale[r] = sc;
+    for (std::uint32_t m = threadIdx.x; m < nw; m += 256) {
+        const std::uint32_t pos = 4 * m, blk = pos >> 7, rem = pos & 127, t = rem >> 5, j = (rem & 31) >> 2;
+        const float* src = xr + blk * 128 + 16 * j + 2 * t;
+        const float2 lo = *reinterpret_cast<const float2*>(src), hi = *reinterpret_cast<const float2*>(src + 8);
+        std::uint32_t w0, w1;
+        asm("{\n .reg .b16 h;\n cvt.rn.satfinite.e4m3x2.f32 h, %2, %1;\n cvt.u32.u16 %0, h;\n}" : "=r"(w0) : "f"(lo.x * inv), "f"(lo.y * inv));
+        asm("{\n .reg .b16 h;\n cvt.rn.satfinite.e4m3x2.f32 h, %2, %1;\n cvt.u32.u16 %0, h;\n}" : "=r"(w1) : "f"(hi.x * inv), "f"(hi.y * inv));
+        reinterpret_cast<std::uint32_t*>(dst)[m] = (w0 & 0xFFFFu) | (w1 << 16);
+    }
+}
+
 // ---------------------------------------------------------------------------------------------------- split / expand kernels
 // planes: [T][rows_pad][in] bf16; thread = 8 consecutive k of one row.
 template <int T>
@@ -407,6 +576,22 @@ cudaError_t launch(const BigArgs& a, std::uint32_t out, std::uint32_t rows, cuda
     return cudaGetLastError();
 }
 
+template <int NT, int BKB, int STG>
+cudaError_t launch8(const BigArgs& a, std::uint32_t out, std::uint32_t rows, cudaStream_t s) {
+    using C = Cfg8<NT, BKB, STG>;
+    static bool attr = false;
+    if (!attr) {
+        if (auto e = cudaFuncSetAttribute(big_kernel_f8<NT, BKB, STG>, cudaFuncAttributeMaxDynamicSharedMemorySize, C::SMEM); e != cudaSuccess) return e;
+        attr = true;
+    }
+    BigArgs b = a;
+    b.tiles_x = (out + BM - 1) / BM;
+    b.tiles_y = (rows + C::BN - 1) / C::BN;
+    b.group = std::min<std::uint32_t>(b.tiles_x, g_group);
+    big_kernel_f8<NT, BKB, STG><<<b.tiles_x * b.tiles_y, 256, C::SMEM, s>>>(b);
+    return cudaGetLastError();
+}
+
 }  // namespace
 
 bool dense_big_supported(const DenseWeight& w) {
@@ -422,6 +607,7 @@ cudaError_t dense_big_reserve(std::uint32_t max_rows, std::uint32_t max_in, std:
     if (auto e = grow(&S.planes[0], &S.planes_bytes[0], static_cast<std::uint64_t>(std::max(1, max_terms)) * rp * max_in * 2); e != cudaSuccess) return e;
     if (auto e = grow(&S.planes[1], &S.planes_bytes[1], static_cast<std::uint64_t>(rp) * max_in * 2); e != cudaSuccess) return e;
     if (auto e = grow(&S.wexp, &S.wexp_bytes, max_weight_elems * 2); e != cudaSuccess) return e;
+    if (auto e = grow(reinterpret_cast<void**>(&S.rscale), &S.rscale_bytes, static_cast<std::uint64_t>(rp) * 4); e != cudaSuccess) return e;
     return grow(reinterpret_cast<void**>(&S.scales), &S.scales_bytes, max_weight_elems / 32 * 4);
 }
 
@@ -431,11 +617,12 @@ void dense_big_release(BigCtx* ctx) {
         if (p) cudaFree(p);
     if (S.wexp) cudaFree(S.wexp);
     if (S.scales) cudaFree(S.scales);
+    if (S.rscale) cudaFree(S.rscale);
     S = Scratch{};
 }
 std::uint64_t dense_big_reserved_bytes(const BigCtx* ctx) {
     const Scratch& S = ctx ? *ctx : scratch();
-    return S.planes_bytes[0] + S.planes_bytes[1] + S.wexp_bytes + S.scales_bytes;
+    return S.planes_bytes[0] + S.planes_bytes[1] + S.wexp_bytes + S.scales_bytes + S.rscale_bytes;
 }
 BigCtx* dense_big_ctx_create() { return new BigCtx(); }
 void dense_big_ctx_destroy(BigCtx* ctx) {
@@ -444,7 +631,7 @@ void dense_big_ctx_destroy(BigCtx* ctx) {
     delete ctx;
 }
 
-cudaError_t dense_big_split(const float* x, std::uint32_t rows, std::uint32_t in, WeightFormat fmt, int terms, BigAct* out, cudaStream_t s, BigCtx* ctx) {
+cudaError_t dense_big_split(const float* x, std::uint32_t rows, std::uint32_t in, WeightFormat fmt, int terms, BigAct* out, cudaStream_t s, BigCtx* ctx, bool f8) {
     if (rows == 0 || in % 32 != 0 || terms < 1 || terms > 3) return cudaErrorInvalidValue;
     Scratch& S = ctx ? *ctx : scratch();
     const std::uint32_t rp = (rows + 127) / 128 * 128;
@@ -453,10 +640,16 @@ cudaError_t dense_big_split(const float* x, std::uint32_t rows, std::uint32_t in
     const int slot = f16 ? 1 : 0;
     if (auto e = grow(&S.planes[slot], &S.planes_bytes[slot], static_cast<std::uint64_t>(T) * rp * in * 2); e != cudaSuccess) return e;
     std::uint16_t* pl = static_cast<std::uint16_t*>(S.planes[slot]);
-    if (f16) {
+    if (f8 && f16 && in % 128 == 0) {
+        if (auto e = grow(reinterpret_cast<void**>(&S.rscale), &S.rscale_bytes, static_cast<std::uint64_t>(rp) * 4); e != cudaSuccess) return e;
+        quant_e4m3_kernel<<<rp, 256, 0, s>>>(x, static_cast<unsigned char*>(S.planes[slot]), S.rscale, rows, in);
+        out->f8 = true;
+    } else if (f16) {
+        out->f8 = false;
         const std::size_t n = static_cast<std::size_t>(rp) * (in >> 2);
         split_f16_kernel<<<static_cast<unsigned>((n + 255) / 256), 256, 0, s>>>(x, pl, rows, rp, in);
     } else {
+        out->f8 = false;
         const std::size_t n = static_cast<std::size_t>(rp) * (in >> 3);
         const unsigned g = static_cast<unsigned>((n + 255) / 256);
         if (T == 1) split_bf16_kernel<1><<<g, 256, 0, s>>>(x, pl, rows, rp, in);
@@ -501,6 +694,12 @@ cudaError_t dense_big_gemm(const DenseWeight& w, const BigAct& a, float* y, cons
         if (auto e = cudaGetLastError(); e != cudaSuccess) return e;
         ba.A = static_cast<const std::uint16_t*>(S.wexp);
         ba.scales = S.scales;
+    } else if (a.f8) {
+        if (auto e = grow(&S.wexp, &S.wexp_bytes, elems * 2); e != cudaSuccess) return e;
+        if (auto e = nvfp4_expand_e4m3(w, S.wexp, s); e != cudaSuccess) return e;
+        ba.A = static_cast<const std::uint16_t*>(S.wexp);
+        ba.rscale = S.rscale;
+        return launch8<4, 2, 3>(ba, w.out, a.rows, s);
     } else {
         mode = kSplit;
         if (auto e = grow(&S.wexp, &S.wexp_bytes, elems * 2); e != cudaSuccess) return e;
