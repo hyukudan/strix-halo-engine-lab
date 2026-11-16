@@ -359,7 +359,9 @@ Resolved resolve(App app, const std::vector<std::string>& in, const Getenv& raw_
     std::vector<std::string> def;
     const auto transport = last_value(user, "--transport");
     const bool two_ranks = !transport.empty() && transport != "single";
-    if (app == App::rank || app == App::batch) {
+    // One set for every two-rank entry point (rank, batch and the server): the server's built-in values are the same, so
+    // the resolved arguments and the parity gate (tests/serve_cli_parity_tests.cpp) show them for both.
+    if (app == App::rank || app == App::batch || app == App::serve) {
         if (two_ranks && !has(user, "--no-tp-attention")) def.emplace_back("--tp-attention");
         if (!has(user, "--engram-mapped")) def.emplace_back("--engram-direct");
     }
