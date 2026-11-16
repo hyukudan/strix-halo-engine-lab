@@ -14,6 +14,7 @@ if(NOT strix_multi_config AND "${CMAKE_BUILD_TYPE}" STREQUAL "")
 endif()
 
 project(strix_engine_lab VERSION 0.1.0 LANGUAGES CXX)
+include(cmake/StrixWeight.cmake)
 option(STRIX_WFMT_TESTS "Build shared weight-format contract tests" OFF)
 if(STRIX_WFMT_TESTS)
     enable_testing()

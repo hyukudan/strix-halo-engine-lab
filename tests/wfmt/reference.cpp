@@ -1,0 +1,183 @@
+#include "fixture.hpp"
+#include "cases.hpp"
+#include "strix/ggml_dequant.hpp"
+#include "strix/ds41_formats.hpp"
+#include "strix/ds41_packed.hpp"
+#include "strix/ds41_native_fp8.hpp"
+#include "strix/q6p_registry.hpp"
+#include "strix/cuda/core/nvfp4.hpp"
+#include "gemma4/exl3/format.hpp"
+#include "h3/gemm/operand.hpp"
+#include <filesystem>
+#include <cmath>
+namespace strix::weight::test {
+namespace {
+std::vector<Byte> seeded(std::size_t count,std::uint32_t seed) {
+ std::vector<Byte> result(count);
+ for(auto& byte:result) { seed=seed*1664525u+1013904223u; byte=Byte(seed>>24); }
+ return result;
+}
+std::vector<Byte> halves(std::size_t count) {
+ std::vector<std::uint16_t> values(count,0x3c00);
+ return bytes_of(std::span<const std::uint16_t>(values));
+}
+std::vector<Byte> floats(std::size_t count,float value) {
+ std::vector<float> values(count,value); return bytes_of(std::span<const float>(values));
+}
+std::vector<Byte> source_bytes(const Slice& slice) {
+ std::vector<Byte> out(static_cast<std::size_t>(slice.range.bytes));
+ if(!slice.source->read(slice.range,out)) throw std::runtime_error("fixture source read");
+ return out;
+}
+}
+WeightView fixture(const FormatDescriptor& format,std::uint32_t seed) {
+ WeightView view{}; view.storage=format.id; view.parameters.bits=4; view.parameters.group_size=16;
+ Geometry g{}; if(!format.geometry(view.parameters,g)) throw std::runtime_error("fixture geometry"); view.geometry=g;
+ auto width=std::uint64_t(g.block_elements),rows=std::uint64_t(1);
+ const auto name=format.id.name;
+ if(name=="block.e4m3-e8m0.32x32") { width=32; rows=32; }
+ if(name=="nvidia.nvfp4") width=64;
+ if(name.starts_with("linear.")) { width=256; rows=2; view.parameters.transform="convrot256"; }
+ if(name.starts_with("exl3.")) { width=128; rows=128; view.parameters.transform="hadamard128"; }
+ view.shape=matrix(rows,width);
+ std::size_t size=static_cast<std::size_t>(rows*width/g.block_elements*g.block_bytes);
+ if(name=="exl3.gemma.transport") size+=2*(rows+width);
+ auto raw=seeded(size,seed);
+ if(name.starts_with("gguf.") || name.starts_with("image.")) {
+  for(std::size_t offset=0;offset+1<raw.size();offset+=g.block_bytes) {
+   raw[offset]=Byte{0}; raw[offset+1]=Byte{0x3c};
+   if(g.block_bytes>4) { raw[offset+2]=Byte{0}; raw[offset+3]=Byte{0}; }
+  }
+ }
+ if(name=="plain.f32") raw=floats(rows*width,-0.0F);
+ if(name=="plain.f16" || name=="plain.bf16") raw=halves(rows*width);
+ if(name=="block.e4m3-e8m0.32x32") {
+  for(auto& byte:raw) byte&=Byte{0x7e};
+  view.sidecars.push_back(named("block_scales",Scalar::e8m0,matrix(rows/32,width/32),std::vector<Byte>(rows*width/1024,Byte{127})));
+ }
+ if(name=="image.cb4") {
+  std::vector<Byte> table(16); for(unsigned i=0;i<16;++i) table[i]=Byte(static_cast<unsigned char>(int(i)-8));
+  view.sidecars.push_back(named("codebook",Scalar::s8,{{16,0,0,0},1},std::move(table)));
+ }
+ if(name=="nvidia.nvfp4") {
+  view.sidecars.push_back(named("block_scales",Scalar::e4m3fn,matrix(rows,width/16),std::vector<Byte>(rows*width/16,Byte{0x38})));
+  view.sidecars.push_back(named("tensor_scale",Scalar::f32,{{1,0,0,0},1},floats(1,1.0F)));
+ }
+ if(name.starts_with("linear.")) {
+  view.sidecars.push_back(named("channel_scales",Scalar::f32,{{rows,0,0,0},1},floats(rows,0.5F)));
+  if(name=="linear.w4a8-grouped") view.sidecars.push_back(named("group_scales",Scalar::e4m3fn,
+      matrix(rows,width/view.parameters.group_size),std::vector<Byte>(rows*width/view.parameters.group_size,Byte{0x38})));
+ }
+ if(name=="exl3.gemma.transport") {
+  const auto scales=halves(rows+width); std::copy(scales.begin(),scales.end(),raw.begin());
+ }
+ if(name=="exl3.mul1.tiles16") {
+  view.sidecars.push_back(named("input_scale",Scalar::f16,{{width,0,0,0},1},halves(width)));
+  view.sidecars.push_back(named("output_scale",Scalar::f16,{{rows,0,0,0},1},halves(rows)));
+ }
+ view.payload=memory(std::move(raw));
+ return view;
+}
+bool legacy_decode(const WeightView& view,std::vector<float>& out) {
+ const auto raw=source_bytes(view.payload); const auto name=view.storage.name;
+ const auto rows=view.shape.dims[0],width=view.shape.dims[1]; out.resize(rows*width);
+ const auto* bytes=reinterpret_cast<const std::uint8_t*>(raw.data());
+ const auto type=gguf_type(view.storage);
+ if(type!=UINT32_MAX && ggml_dequant::supported(type)) {
+  ggml_dequant::dequantize_row(type,raw,out); return true;
+ }
+ if(name=="gguf.iq2_xxs") {
+  for(std::size_t block=0;block<out.size()/256;++block) ds41::decode_iq2_xxs(std::span<const std::uint8_t,66>(bytes+66*block,66),std::span<float,256>(out.data()+256*block,256)); return true;
+ }
+ if(name=="gguf.q2_k") {
+  for(std::size_t block=0;block<out.size()/256;++block) ds41::decode_q2_k(std::span<const std::uint8_t,84>(bytes+84*block,84),std::span<float,256>(out.data()+256*block,256)); return true;
+ }
+ if(name=="gguf.mxfp4") {
+  for(std::size_t block=0;block<out.size()/32;++block) ds41::decode_mxfp4(std::span<const std::uint8_t,17>(bytes+17*block,17),std::span<float,32>(out.data()+32*block,32)); return true;
+ }
+ if(name=="row.e4m3-e8m0.g32") {
+  for(std::size_t block=0;block<out.size()/256;++block) ds41::decode_engram_row(std::span<const std::uint8_t,264>(bytes+264*block,264),std::span<float,256>(out.data()+256*block,256)); return true;
+ }
+ if(name=="image.q6p32") {
+  std::vector<unsigned char> q8(out.size()/32*34); q6p::to_q8_0(bytes,rows,width,q8.data());
+  ggml_dequant::dequantize_row(8,std::as_bytes(std::span(q8)),out); return true;
+ }
+ if(name.starts_with("image.")) {
+  ds41::PackedChoice choice; choice.kind=name=="image.cb4"?ds41::PackedKind::cb4:name=="image.u5"?ds41::PackedKind::u5:ds41::PackedKind::u6;
+  if(choice.kind==ds41::PackedKind::cb4) { const auto table=source_bytes(view.sidecars[0].data); std::memcpy(choice.table.data(),table.data(),16); }
+  for(std::size_t row=0;row<rows;++row) for(std::size_t g=0;g<width/32;++g) {
+   std::array<std::uint8_t,34> q8{}; ds41::unpack_group(bytes+row*ds41::packed_row_bytes(choice.kind,width),width,g,choice,
+       view.parameters.transform=="planar"?ds41::PackedLayout::planar:ds41::PackedLayout::interleaved,q8.data());
+   ds41::decode_q8_0(q8,std::span<float,32>(out.data()+row*width+32*g,32));
+  } return true;
+ }
+ if(name=="block.e4m3-e8m0.32x32") {
+  const auto scales=source_bytes(view.sidecars[0].data); std::vector<std::uint8_t> joined(raw.size()+scales.size());
+  std::memcpy(joined.data(),raw.data(),raw.size()); std::memcpy(joined.data()+raw.size(),scales.data(),scales.size());
+  for(std::size_t row=0;row<rows;++row) for(std::size_t k=0;k<width;++k) out[row*width+k]=ds41::fp8_weight(joined.data(),rows,width,row,k);
+  return true;
+ }
+ if(name.starts_with("exl3.")) {
+  std::vector<std::uint8_t> transport(2*(rows+width)+rows*width*view.parameters.bits/8);
+  if(name=="exl3.gemma.transport") std::memcpy(transport.data(),raw.data(),raw.size());
+  else {
+   const auto scales=halves(rows+width); std::memcpy(transport.data(),scales.data(),scales.size());
+   std::memcpy(transport.data()+scales.size(),raw.data(),raw.size());
+  }
+  const gemma4::LinearView w{transport.data(),static_cast<unsigned>(rows),static_cast<unsigned>(width),width*view.parameters.bits/8,gemma4::WeightFormat::exl3_mul1};
+  for(unsigned row=0;row<rows;++row) for(unsigned k=0;k<width;++k) out[row*width+k]=gemma4::exl3::rotated_at(w,k,row);
+  return true;
+ }
+ if(name.starts_with("linear.")) {
+  h3::gemm::PackedW4A8 packed; packed.group_size=view.parameters.group_size;
+  if(name=="linear.w4a8-grouped") packed.scales_fp8.assign(rows*width/packed.group_size,0x38);
+  for(std::size_t i=0;i<out.size();++i) {
+   const auto code=name=="linear.w4a8-grouped"?packed.at(reinterpret_cast<const std::int8_t*>(bytes),i):static_cast<std::int8_t>(bytes[i]);
+   out[i]=float(code)*0.5F;
+  } return true;
+ }
+ if(name=="nvidia.nvfp4") {
+  namespace nv=cuda::core::nvfp4;
+  for(std::size_t i=0;i<out.size();++i) out[i]=(nv::e2m1((bytes[i/2]>>(4*(i%2)))&15)*nv::e4m3(0x38))*1.0F;
+  return true;
+ }
+ return false;
+}
+}
+using namespace strix::weight;
+using namespace strix::weight::test;
+namespace {
+bool run_references(std::string_view directory) {
+ std::size_t count=0;
+ for(const auto& format:builtin_registry().formats) {
+  if(!format.semantic_decode_supported) continue;
+  for(std::uint32_t seed:{0u,1u,0x12345678u,UINT32_MAX}) {
+   const auto view=fixture(format,seed); std::vector<float> expected;
+   if(!require(legacy_decode(view,expected),"missing legacy oracle")) return false;
+   std::vector<Byte> result(expected.size()*4); DecodeBuffer output{result,0};
+   const auto status=decode_reference(builtin_registry(),view,{0,expected.size(),{},Scalar::f32},output);
+   if(!status) { std::cerr << serialize_id(view.storage) << ": " << status.detail << '\n'; return false; }
+   const auto old=std::as_bytes(std::span(expected));
+   if(!require(result.size()==old.size() && std::equal(result.begin(),result.end(),old.begin()),"legacy decoder bytes differ")) return false;
+   if(!directory.empty()) {
+    std::string name(format.id.name); std::replace(name.begin(),name.end(),'.','_'); name+="-"+std::to_string(seed);
+    const auto base=std::filesystem::path(directory)/"baseline",candidate=std::filesystem::path(directory)/"candidate";
+    const auto raw=source_bytes(view.payload);
+    if(!write_capture_record(base.string(),name,serialize_id(format.id),std::span(view.shape.dims).first(view.shape.rank),raw,old) ||
+       !write_capture_record(candidate.string(),name,serialize_id(format.id),std::span(view.shape.dims).first(view.shape.rank),raw,result)) return false;
+   }
+   // Output slice and negative output-size checks are independent of format decoding.
+   std::array<Byte,4> last{}; DecodeBuffer tail{last,0};
+   if(!decode_reference(builtin_registry(),view,{expected.size()-1,1,{},Scalar::f32},tail) ||
+      !std::equal(last.begin(),last.end(),old.end()-4)) return false;
+   DecodeBuffer short_buffer{std::span(result).first(3),0};
+   if(decode_reference(builtin_registry(),view,{0,1,{},Scalar::f32},short_buffer)) return false;
+   ++count;
+  }
+ }
+ std::cout << "legacy-reference-cases=" << count << '\n';
+ return true;
+}
+}
+bool wfmt_reference_test() { return run_references({}); }
+bool wfmt_reference_capture(std::string_view directory) { return run_references(directory); }
