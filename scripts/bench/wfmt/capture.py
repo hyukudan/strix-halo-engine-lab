@@ -6,10 +6,17 @@ import json
 import os
 import pathlib
 import platform
+import re
 import shlex
 import subprocess
 import sys
 from records import read_matrix, validate_inventory, read_record
+
+
+def source_revision(value):
+    if not re.fullmatch(r"[0-9a-fA-F]{40}", value):
+        raise argparse.ArgumentTypeError("source revision must be a full 40-hex commit ID")
+    return value.lower()
 
 
 def main():
@@ -17,7 +24,10 @@ def main():
     parser.add_argument("--exe", required=True, type=pathlib.Path)
     parser.add_argument("--matrix", required=True, type=pathlib.Path)
     parser.add_argument("--out", required=True, type=pathlib.Path)
-    parser.add_argument("--source", type=pathlib.Path)
+    source = parser.add_mutually_exclusive_group()
+    source.add_argument("--source", type=pathlib.Path)
+    source.add_argument("--source-revision", type=source_revision,
+                        help="commit ID for an externally frozen source archive")
     parser.add_argument("--adapter", choices=("protocol", "reference", "native", "backend", "hip-transfer"), default="protocol")
     parser.add_argument("--compiler", required=True)
     parser.add_argument("--architecture", required=True)
@@ -44,6 +54,8 @@ def main():
         if args.source:
             summary["source"] = subprocess.check_output(
                 ["git", "-C", str(args.source), "rev-parse", "HEAD"], text=True).strip()
+        elif args.source_revision:
+            summary["source"] = args.source_revision
         extra = args.args[1:] if args.args[:1] == ["--"] else args.args
         summary["adapter_args"] = extra
         adapter_args = ["--wfmt-capture", str(args.out.resolve()), "--wfmt-matrix", str(matrix)]

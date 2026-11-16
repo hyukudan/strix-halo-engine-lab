@@ -109,6 +109,23 @@ class ToolTests(unittest.TestCase):
                 "--out", out, "--compiler", "compiler@1", "--architecture", "gfx1151",
                 "--adapter", "hip-transfer", "--", "gsq"]), 0)
 
+    def test_archive_revision_is_explicit_and_validated(self):
+        out = self.path / "archive"
+        contract = self.path / "archive-matrix.json"
+        contract.write_text(json.dumps(matrix()))
+        revision = "0123456789abcdef" * 2 + "01234567"
+        def adapter(command, **kwargs):
+            write_output(out)
+            return subprocess.CompletedProcess(command, 0)
+        with mock.patch.object(capture.subprocess, "run", side_effect=adapter):
+            self.assertEqual(invoke(capture, ["--exe", self.exe, "--matrix", contract,
+                "--out", out, "--compiler", "compiler@1", "--architecture", "gfx1151",
+                "--source-revision", revision]), 0)
+        self.assertEqual(json.loads((out / "summary.json").read_text())["source"], revision)
+        for invalid in ("HEAD", revision[:9], "z" * 40):
+            with self.assertRaises(capture.argparse.ArgumentTypeError):
+                capture.source_revision(invalid)
+
     def test_frozen_transfer_inventory_cannot_be_replaced_or_drift(self):
         old = self.path / "old"
         write_output(old)
