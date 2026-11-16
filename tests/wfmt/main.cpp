@@ -5,6 +5,9 @@
 int wfmt_census_test();
 bool wfmt_contracts_test();
 bool wfmt_reference_test();
+bool wfmt_strides_test();
+bool wfmt_arithmetic_test();
+bool wfmt_group_reads_test();
 bool wfmt_geometry_test();
 bool wfmt_iq3s_test();
 bool wfmt_reference_capture(std::string_view);
@@ -22,6 +25,9 @@ int main(int argc, char** argv) {
     else if (name == "census") ok = wfmt_census_test() == 0;
     else if (name == "compare") ok = strix::weight::test::compare_case();
     else if (name == "reference") ok = wfmt_reference_test();
+    else if (name == "strides") ok = wfmt_strides_test();
+    else if (name == "arithmetic") ok = wfmt_arithmetic_test();
+    else if (name == "group-reads") ok = wfmt_group_reads_test();
     else if (name == "geometry") ok = wfmt_geometry_test();
     else if (name == "iq3s") ok = wfmt_iq3s_test();
     else return 2;

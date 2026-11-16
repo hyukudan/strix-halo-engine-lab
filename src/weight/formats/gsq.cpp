@@ -25,9 +25,14 @@ Status group(const WeightView& view,std::uint64_t index,SignedGroup32& out) {
  std::uint64_t count=0; status=elements(view.shape,count); if(!status) return status;
  if(index>=count/32) return {Error::unsupported_shape,"signed group outside tensor"};
  Geometry geometry{}; status=format_geometry(view.storage,view.parameters,geometry); if(!status) return status;
- std::vector<Byte> raw; status=read(view.payload,raw); if(!status) return status;
+ // Validation bounds the tensor extent; index bounds make these products and
+ // the source-relative offset safe. Read only the block owning this group.
+ auto block=view.payload;
+ block.range.offset+=(index*32/geometry.block_elements)*geometry.block_bytes;
+ block.range.bytes=geometry.block_bytes;
+ std::vector<Byte> raw; status=read(block,raw); if(!status) return status;
  const auto type=gguf_type(view.storage);
- const auto* x=reinterpret_cast<const std::uint8_t*>(raw.data())+(index*32/geometry.block_elements)*geometry.block_bytes;
+ const auto* x=reinterpret_cast<const std::uint8_t*>(raw.data());
  const auto ib=unsigned((index*32%geometry.block_elements)/32);
  out={}; out.scale_count=1;
  const float d=ggml_dequant::fp16(u16(x));

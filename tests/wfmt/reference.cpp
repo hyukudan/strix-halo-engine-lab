@@ -10,6 +10,9 @@
 #include "h3/gemm/operand.hpp"
 #include <filesystem>
 #include <cmath>
+bool wfmt_strides_test();
+bool wfmt_arithmetic_test();
+bool wfmt_group_reads_test();
 namespace strix::weight::test {
 namespace {
 std::vector<Byte> seeded(std::size_t count,std::uint32_t seed) {
@@ -183,6 +186,7 @@ bool run_references(std::string_view directory) {
 }
 }
 bool wfmt_reference_test() {
+ if(!wfmt_strides_test() || !wfmt_arithmetic_test() || !wfmt_group_reads_test()) return false;
  if(!run_references({})) return false;
  // Exhaustive scalar encodings exercise signed zeros, supported subnormals,
  // infinities and every NaN payload through the unchanged widening delegate.

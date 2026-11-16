@@ -138,6 +138,20 @@ Status validate(const WeightView& view) {
    return {Error::malformed,"payload alignment"};
  if(count/g.block_elements > UINT64_MAX/g.block_bytes) return {Error::malformed,"payload size overflow"};
  auto bytes=count/g.block_elements*g.block_bytes;
+ if(view.has_byte_strides) {
+   // Only scalar row-major storage has a supported byte-stride contract.
+   if(g.block_elements!=1 ||
+      (!view.storage.name.starts_with("plain.") && !view.storage.name.starts_with("typed.")))
+     return {Error::unsupported_shape,"byte strides require contiguous scalar storage"};
+   std::uint64_t stride=g.block_bytes;
+   for(unsigned axis=view.shape.rank;axis>0;--axis) {
+     if(view.byte_strides[axis-1]!=stride)
+       return {Error::unsupported_shape,"noncontiguous byte strides are unsupported"};
+     if(stride>UINT64_MAX/view.shape.dims[axis-1])
+       return {Error::malformed,"byte stride extent overflow"};
+     stride*=view.shape.dims[axis-1];
+   }
+ }
  // Gemma transport has contiguous FP16 input/output sidecars before the rings.
  if(view.storage.name=="exl3.gemma.transport") {
    if(view.shape.rank!=2 || view.shape.dims[0]%128 || view.shape.dims[1]%128)
@@ -195,9 +209,9 @@ Status decode(const WeightView& view,const DecodeRequest& request,DecodeBuffer& 
  if(request.count>SIZE_MAX/sizeof(float) || out.bytes.size()<request.count*sizeof(float))
    return {Error::malformed,"decode output buffer too small"};
  if(count>SIZE_MAX/sizeof(float)) return {Error::memory_budget,"reference tensor exceeds addressable scratch storage"};
- bool known=request.arithmetic.name.empty();
- for(const auto& arithmetic:legacy_arithmetic()) known=known || arithmetic.id==request.arithmetic;
- if(!known) return {Error::unsupported_arithmetic,"unknown arithmetic identity"};
+ // Storage widening does not execute an ArithmeticDescriptor's operand policy.
+ if(!request.arithmetic.name.empty() || request.arithmetic.revision!=0)
+   return {Error::unsupported_arithmetic,"reference decoder supports storage widening only"};
  std::vector<Byte> raw; status=read(view.payload,raw); if(!status) return status;
  std::vector<float> decoded(static_cast<std::size_t>(count));
  const auto name=view.storage.name;
