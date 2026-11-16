@@ -13,8 +13,20 @@ include(${CMAKE_CURRENT_LIST_DIR}/StrixCudaBackend.cmake)
 add_library(strix_qwen_cuda STATIC
     src/cuda/models/qwen/qwen_prefill_driver.cu src/cuda/models/qwen/qwen_hc.cu src/cuda/models/qwen/qwen_dense.cu
     src/cuda/models/qwen/qwen_gdn.cu src/cuda/models/qwen/qwen_qsa.cu src/cuda/models/qwen/qwen_moe.cu
-    src/cuda/models/qwen/qwen_plemtp.cu src/cuda/models/qwen/qwen_mtp_draft.cu src/cuda/models/qwen/qwen_transcode.cu ${STRIX_CUDA_CORE_AMD_MATH_SOURCES} src/gguf_reader.cpp)
+    src/cuda/models/qwen/qwen_plemtp.cu src/cuda/models/qwen/qwen_mtp_draft.cu src/cuda/models/qwen/qwen_transcode.cu src/cuda/tiered_experts.cu
+    ${STRIX_CUDA_CORE_AMD_MATH_SOURCES} src/gguf_reader.cpp)
 target_include_directories(strix_qwen_cuda PUBLIC include src/cuda/models/qwen)
+# Tiered expert residency: the host planner/resolver and the CPU routed-expert executor (bitwise = the card's A8 chains).
+# Only the library targets are needed; the Qwen-only build has no strix_target_warnings, so a no-op stands in for it.
+if(NOT COMMAND strix_target_warnings)
+    function(strix_target_warnings target)
+    endfunction()
+endif()
+include(${CMAKE_CURRENT_LIST_DIR}/StrixResidency.cmake)
+if(NOT TARGET strix_backend_cpu)
+    include(${CMAKE_CURRENT_LIST_DIR}/StrixBackendCpu.cmake)
+endif()
+target_link_libraries(strix_qwen_cuda PUBLIC strix_residency strix_backend_cpu)
 # Every Qwen CUDA binary resolves its device through the start gate (strix-devices-v1) before its first allocation.
 include(${CMAKE_CURRENT_LIST_DIR}/StrixDevice.cmake)
 target_link_libraries(strix_qwen_cuda PUBLIC strix_device strix_cuda_core)
@@ -44,7 +56,16 @@ target_link_libraries(qwen_decode_e2e PRIVATE strix_qwen_cuda strix_qwen_handoff
 add_executable(qwen_decode_bench tests/cuda/qwen_decode_bench.cu)
 target_link_libraries(qwen_decode_bench PRIVATE strix_qwen_cuda)
 add_executable(strix-cuda-qwen-serve apps/cuda_qwen_serve_main.cu)
-target_link_libraries(strix-cuda-qwen-serve PRIVATE strix_qwen_cuda strix_serve_win)
+# Shared MTP window controllers (also linked by the HIP engine): measured-cost depth/rows policy and its host adapter.
+add_library(strix_mtp_depth STATIC src/mtp_window_controller.cpp src/mtp_depth_window_controller.cpp src/serve/row_budget.cpp)
+target_include_directories(strix_mtp_depth PUBLIC include)
+add_executable(qwen_mtp_depth_host_test tests/cuda/qwen_mtp_depth_host_test.cpp)
+target_link_libraries(qwen_mtp_depth_host_test PRIVATE strix_mtp_depth)
+add_test(NAME qwen_mtp_depth_host COMMAND qwen_mtp_depth_host_test)
+add_executable(qwen_mtp_draft_split_test tests/mtp_draft_split_tests.cpp)
+target_link_libraries(qwen_mtp_draft_split_test PRIVATE strix_mtp_depth)
+add_test(NAME qwen_mtp_draft_split COMMAND qwen_mtp_draft_split_test)
+target_link_libraries(strix-cuda-qwen-serve PRIVATE strix_qwen_cuda strix_serve_win strix_mtp_depth)
 if(MSVC)
     target_compile_options(strix-cuda-qwen-serve PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/EHsc,/Zc:preprocessor,/utf-8>)
 endif()
@@ -57,6 +78,10 @@ target_compile_options(qwen_quant_device_test PRIVATE $<$<COMPILE_LANGUAGE:CUDA>
 add_executable(qwen_cohort_plan_test tests/cuda/qwen_cohort_plan_test.cpp)
 target_include_directories(qwen_cohort_plan_test PRIVATE include)
 add_test(NAME qwen_cohort_plan COMMAND qwen_cohort_plan_test)
+# per-request session reservation + the serve's ONE RESOLVER check (host only)
+add_executable(qwen_session_reservation_test tests/session_reservation_tests.cpp)
+target_include_directories(qwen_session_reservation_test PRIVATE include)
+add_test(NAME qwen_session_reservation COMMAND qwen_session_reservation_test)
 add_executable(qwen_cohort_e2e tests/cuda/qwen_cohort_e2e.cu)
 target_link_libraries(qwen_cohort_e2e PRIVATE strix_qwen_cuda strix_qwen_handoff)
 # Multi-segment QSA core == per-segment layer_core on random data (device, no model): qwen_qsa_multi_test <tables dir>
@@ -114,6 +139,13 @@ if(MSVC)
 else()
     target_compile_options(qwen_bf16_mtp_e2e PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=-ffp-contract=off>)
 endif()
+
+# rtxmax exact decode kernels: each new kernel is byte-compared with the old form on random data (device, no model).
+foreach(_qx draft_step gdn_decode hc_rows qsa_decode rows_glue)
+    add_executable(qwen_${_qx}_exact_test tests/cuda/qwen_${_qx}_exact_test.cu)
+    target_link_libraries(qwen_${_qx}_exact_test PRIVATE strix_qwen_cuda)
+    target_compile_options(qwen_${_qx}_exact_test PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--fmad=false>)
+endforeach()
 # 16-bit recurrent state (STRIX_RECURRENT_STATE=f16|bf16) in the CUDA GDN recurrence: codec bit-equality with the host,
 # per-row rounding equalities, f32 incumbent bits. Needs the GPU (index 0 only: set CUDA_VISIBLE_DEVICES=0).
 add_executable(qwen_gdn_state16_test tests/cuda/qwen_gdn_state16_test.cu)
@@ -124,3 +156,17 @@ if(MSVC)
 endif()
 add_test(NAME qwen_gdn_state16 COMMAND qwen_gdn_state16_test)
 set_tests_properties(qwen_gdn_state16 PROPERTIES ENVIRONMENT "CUDA_VISIBLE_DEVICES=0")
+
+# GPU unit test of tiered expert residency: full route vs tiered route (CPU executor) on random weights, bitwise.
+add_executable(qwen_tiered_moe_tests tests/cuda/qwen_tiered_moe_tests.cu)
+target_link_libraries(qwen_tiered_moe_tests PRIVATE strix_qwen_cuda)
+target_compile_options(qwen_tiered_moe_tests PRIVATE
+    $<$<COMPILE_LANGUAGE:CUDA>:--fmad=false;--prec-div=true;--prec-sqrt=true;--ftz=false>)
+if(MSVC)
+    target_compile_options(qwen_tiered_moe_tests PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/EHsc,/Zc:preprocessor,/utf-8>)
+endif()
+
+# serve == bench residency command line (host only, no CUDA)
+add_executable(strix-expert-residency-parity-tests tests/expert_residency_parity_tests.cpp)
+target_link_libraries(strix-expert-residency-parity-tests PRIVATE strix_residency)
+add_test(NAME strix-expert-residency-parity-tests COMMAND strix-expert-residency-parity-tests)

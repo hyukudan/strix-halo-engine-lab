@@ -57,6 +57,12 @@ File sources retain their read handle, check size/change snapshots, and compute 
 full SHA-256 content identity lazily. A tensor ID includes its pack-relative shard namespace, bounded header digest
 and name. Identical node copies retain the same ID; same-basename shards in
 different pack subdirectories remain distinct. Slices keep sources alive after an index or loader is destroyed.
+Every indexed tensor carries its full stored extents (`RawTensor::extents`, any rank). A safetensors
+tensor whose rank exceeds the WeightView rank (four), such as a Conv3d vision patch embedding
+`[1280,3,2,14,14]`, is indexed opaquely: name, dtype, extents and byte range are kept, it is never
+bound by a family schema, and an explicit view of it fails for that tensor only, not for the file.
+Engines that need it read it by byte range; legacy consumer tables receive the full extents. GGUF
+stays limited to rank 1..4 because the container itself stores at most four dimensions.
 
 Admission validates exact format allowlists, role masks, logical shapes, expert
 axes, payload bounds and semantic sidecars before publishing a map. GGUF native

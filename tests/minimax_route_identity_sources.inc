@@ -178,7 +178,7 @@
 {"src/moe_core/hip_moe_f16x_down_body.inc", 0x052911be38e9e8bdULL},
 {"src/moe_core/hip_moe_f16x_project_body.inc", 0xd5be14d0bd88b051ULL},
 {"src/moe_core/hip_moe_gsq_f16_prefill.inc", 0x8c2607af8f600300ULL},
-{"src/moe_core/hip_moe_gsq_weights.inc", 0xcf795f0d79f9f6c0ULL},
+{"src/moe_core/hip_moe_gsq_weights.inc", 0xd960fad228155111ULL},
 {"src/moe_core/hip_moe_gsq_wmma_prefill.inc", 0x505d8bf584761a02ULL},
 {"src/moe_core/hip_moe_prefill_core2.inc", 0x405ce03aa2cf07a3ULL},
 {"src/moe_core/hip_moe_prefill_da16.inc", 0x70da9927db75bbdbULL},

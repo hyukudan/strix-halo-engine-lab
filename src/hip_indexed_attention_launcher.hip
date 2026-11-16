@@ -4102,6 +4102,7 @@ __device__ __forceinline__ float qsa_rows_coefficient(unsigned scale, std::int8_
 }
 // index_q, index_k, q, k, v (five segments) from BF16 rows to BF16-rounded FP32.
 template <unsigned Rows> struct QsaInputRowsSite {
+    static constexpr unsigned turbo_group = strix::onfly_i4::qsa_io;  // TURBO+ onfly INT4 g64 decode (q8_rows/iu4)
     static constexpr bool dense_trellis_inputs = true;
     using Input = std::uint16_t;
     static constexpr unsigned rows = Rows;
@@ -4121,6 +4122,7 @@ template <unsigned Rows> struct QsaInputRowsSite {
     }
 };
 template <unsigned Rows, class InputType = float> struct QsaOutputRowsSite {
+    static constexpr unsigned turbo_group = strix::onfly_i4::qsa_io;  // TURBO+ onfly INT4 g64 decode (q8_rows/iu4)
     using Input = InputType;
     static constexpr unsigned rows = Rows;
     static constexpr bool fused_fma = true;  // Site::fma compiles to v_fmac_f32 (wide VOPD rows)

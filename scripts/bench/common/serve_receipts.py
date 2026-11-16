@@ -79,6 +79,7 @@ def main(argv=None):
                     reasons.append("C%d incomplete/failed requests" % n)
         rec = dict(tag="%s-%s" % (args.tag, name), arm=args.arm if args.client else args.arm + "-" + cls,
                    round=rnd, workload=cls, host=meta.get("host"), bin_sha=meta.get("bin_sha"),
+                   device_bindings=meta.get("device_bindings", []),
                    rc=meta.get("rc"), client_rc=args.client_rc, intentional_shutdown=meta.get("intentional_shutdown", False),
                    wall_ms=meta.get("wall_ms"), mem_start=meta.get("mem"), prefills=0, prefill_ms_cold=0.0,
                    prefill_ms_warm=0.0, tokens=0, tok_s_cold=0.0, tok_s_warm=0.0, sclk_mhz=round(sclk), busy_pct=round(busy, 1),
