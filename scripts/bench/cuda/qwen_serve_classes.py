@@ -1,7 +1,11 @@
 """Qwen served decode by prompt class (prose / edit / json) at C1 / C4 / C8 against one running server.
 
 Each class has 8 distinct prompts. Pass 1 ("cold": first requests of the process) runs the C1 reference of every
-prompt alone, then C4 (prompts 0-3) and C8 (all 8) concurrently; pass 2 ("warm") repeats C1 for prompts 0-1, C4 and C8.
+prompt alone, then C4 (prompts 0-3) and C8 (all 8) concurrently; pass 2 ("warm") repeats C1 for the first --warm-c1
+prompts (default all 8, so cold and warm C1 means cover the SAME prompts), then C4 and C8.
+A C1 request that ends before --min-decode-tokens (the model stops early, e.g. prose slice 0 ends with end-of-text
+after 1 token) has no meaningful decode rate: its line carries short=1 and qwen_serve_summary.py leaves it out of the
+C1 decode means (rtxmax3: averaging a 1-token request into a 2-prompt warm mean made warm look 22 % slower than cold).
 Every concurrent stream must equal its C1 ids (same_as_C1). The ids of every request are written to OUT.ids (one JSON
 line per request) so two server arms can be compared for identity.
 
@@ -130,6 +134,8 @@ def main():
     ap.add_argument('--classes', default='prose,edit,json')
     ap.add_argument('--max-tokens', type=int, default=128)
     ap.add_argument('--health-s', type=int, default=600)
+    ap.add_argument('--warm-c1', type=int, default=8, help='C1 prompts repeated in the warm pass (same prompts as cold)')
+    ap.add_argument('--min-decode-tokens', type=int, default=16, help='C1 requests with fewer tokens are flagged short=1')
     a = ap.parse_args()
     if a.probe_endpoint:
         print(probe_endpoint(a.base))
@@ -171,12 +177,13 @@ def main():
         for cls in a.classes.split(','):
             P = sets[cls]
             ref = []
-            for i, p in enumerate(P if pas == 'cold' else P[:2]):
+            for i, p in enumerate(P if pas == 'cold' else P[:a.warm_c1]):
                 r = stream(a.base, p, a.max_tokens, 900)
                 check(r, sets[cls + '_ref'][i] if pas == 'warm' else None)
                 ref.append(r['ids'])
                 ids_out.write(json.dumps(dict(pas=pas, cls=cls, c=1, i=i, ids=r['ids'])) + '\n')
-                say(f'{pas} {cls} C1 i={i} prompt={len(p)} tokens={r["tokens"]} decode_tps={r["decode_tps"]} err={r["error"]}')
+                say(f'{pas} {cls} C1 i={i} prompt={len(p)} tokens={r["tokens"]} decode_tps={r["decode_tps"]} '
+                    f'short={int((r["tokens"] or 0) < a.min_decode_tokens)} err={r["error"]}')
             if pas == 'cold':
                 sets[cls + '_ref'] = ref
             for c in (4, 8):

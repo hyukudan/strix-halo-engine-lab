@@ -216,8 +216,12 @@ def integrate(rows, t0, t1):
 
 
 def cmd_meta(args):
+    # The gate reports the effective device after environment/CLI selection and discovery.
+    # Keep its complete evidence (including declaration source); absence means unknown.
+    logs = read_text(os.path.join(args.dir, "stderr")) + "\n" + read_text(os.path.join(args.dir, "stdout"))
+    bindings = list(dict.fromkeys(line for line in logs.splitlines() if line.startswith("device: id=")))
     meta = dict(rc=args.rc, wall_ms=args.wall_ms, mem=args.mem.strip(), host=args.host_tag, bin_sha=args.bin_sha,
-                intentional_shutdown=args.intentional_shutdown)
+                intentional_shutdown=args.intentional_shutdown, device_bindings=bindings)
     with open(os.path.join(args.dir, "meta.json"), "w") as stream:
         json.dump(meta, stream)
 
@@ -291,6 +295,7 @@ def cmd_summarize(args):
     rec = dict(
         tag=args.tag, arm=args.arm or args.tag, round=args.round, host=meta.get("host"), bin_sha=meta.get("bin_sha"),
         rc=meta.get("rc"), wall_ms=meta.get("wall_ms"), mem_start=meta.get("mem"),
+        device_bindings=meta.get("device_bindings", []),
         workload=args.workload, prefills=len(pf), prefill_ms_cold=cold, prefill_ms_warm=warm, tokens=tokens,
         prefill_tokens=counts, rank_evidence=[{k: v[k] for k in ("key", "tokens", "logits", "state") if k in v} for v in fr],
         tok_s_cold=(cold_tokens / (cold / 1e3) if cold_tokens and cold else 0.0),

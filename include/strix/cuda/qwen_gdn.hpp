@@ -94,6 +94,11 @@ void launch_recurrence(const Rows& rows, std::uint32_t count, float* state, void
 // windows keep S0 so a partial accept can replay the kept rows from it.
 void launch_recurrence_split(const Rows& rows, std::uint32_t count, const float* state_in, float* state_out, void* scratch,
     const amdmath::Tables& t, cudaStream_t stream, Tuning tuning = {});
+// Commit replay of the kept rows (K5 from the window's S0 + conv-state rollback) in one launch (STRIX_QRTX_GDN_DECODE;
+// 0 = launch_recurrence_split + launch_conv_rollback). rows = the window rows after K4 (qkv/beta/gate), scratch as K5.
+void launch_commit_replay(const Rows& rows, std::uint32_t keep, const float* state_in, float* state_out, const float* raw_qkv,
+    const std::uint16_t* conv_before, std::uint16_t* conv_state, void* scratch, const amdmath::Tables& t, cudaStream_t stream,
+    Tuning tuning = {});
 // K6: gated RMSNorm of core in place (FP32), optionally also the fused A8 codes/deltas.
 void launch_norm(const Rows& rows, std::uint32_t count, const Weights& w, const amdmath::Tables& t, cudaStream_t stream,
     const A8Out* a8 = nullptr);

@@ -30,6 +30,7 @@
 // Token-block prefix checkpoints restore exact prompt state before the remaining prefill rows.
 #include "strix/device/cuda_enumerator.hpp"
 #include "cuda_qwen_prefix_cache.hpp"
+#include "strix/mtp_depth_host.hpp"
 #include "cuda_qwen_serve_policy.hpp"
 #include "strix/env_flags.hpp"
 #include "strix/cuda/qwen_cohort.hpp"
@@ -250,20 +251,48 @@ public:
         st.finish = "length";
         bool first = true;
         std::vector<std::uint32_t> emitted;
+        // Measured-cost depth controller (STRIX_MTP_CONTROLLER=depth, shared with the HIP engine): picks the draft depth
+        // and the verified rows per window; committed ids are unchanged (greedy verify, row-count invariant).
+        strix::MtpDepthHost dh(o_.mtp_depth, o_.min_p, mtp && strix::mtp_depth_controller_enabled());
         while (st.generated_tokens < job.max_tokens) {
             if (pos + 1 >= cap) { st.finish = "context"; break; }
+            const auto tw = Clock::now();
             std::vector<std::uint32_t> rows{pending};
+            std::vector<float> probs;
             if (mtp) {
-                const auto d = e_.draft(pending, depth, o_.min_p);
+                const std::uint32_t want = dh.on() ? dh.plan(depth) : depth;
+                const auto td = Clock::now();
+                const auto d = e_.draft(pending, want, dh.on() ? dh.min_p() : o_.min_p);
+                if (dh.on()) {
+                    dh.note_draft(want,
+                                  std::chrono::duration<double, std::milli>(Clock::now() - td).count());
+                    probs = d.probability;
+                    if (probs.size() > d.tokens.size()) probs.resize(d.tokens.size());
+                }
                 rows.insert(rows.end(), d.tokens.begin(), d.tokens.end());
                 st.proposed += d.tokens.size();
             }
             const auto room = static_cast<std::uint32_t>(std::min<std::uint64_t>(rows.size(), cap - pos));
             rows.resize(room);
+            bool selected = false;
+            if (dh.on()) {
+                probs.resize(std::min<std::size_t>(probs.size(), rows.size() - 1));
+                if (probs.size() + 1 == rows.size()) {
+                    const auto before = rows.size();
+                    rows.resize(dh.select(probs));
+                    st.proposed -= before - rows.size();
+                    selected = true;
+                }  // 1 = serial step
+            }
             const auto r = e_.verify(rows.data(), static_cast<std::uint32_t>(rows.size()), pos);
             std::uint32_t keep = 1;
             while (keep < rows.size() && rows[keep] == r.argmax[keep - 1]) ++keep;
             e_.commit(keep);
+            if (dh.on()) {
+                if (selected) dh.finish(static_cast<std::uint32_t>(rows.size()), keep - 1,
+                    std::chrono::duration<double, std::milli>(Clock::now() - tw).count());
+                else dh.skip();
+            }
             ++st.cycles;
             st.accepted += keep - 1;
             pos += keep;
@@ -310,6 +339,7 @@ class CohortServer {
 public:
     CohortServer(qp::Prefill& engine, const Options& o, serve::GenerationQueue& queue, px::Cache& cache) : e_(engine), o_(o), queue_(queue), cache_(cache) {
         mtp_ = !o_.engine.mtp_sidecar_gguf.empty() && o_.mtp_depth > 0;
+        dh_ = std::make_unique<strix::MtpDepthHost>(std::min<std::uint32_t>(o_.mtp_depth, qc::kWindowRows - 1U), o_.min_p, mtp_ && strix::mtp_depth_controller_enabled());
         if (o_.prefill_overlap) e_.enable_prefill_overlap(o_.prefill_overlap_rows);
         // slot 0 is the engine's session 0 (re-sized per request, never released); the others get theirs at admission
         for (std::uint32_t i = 0; i < o.http_slots; ++i) {
@@ -691,7 +721,9 @@ private:
         qc::StepOptions opt;
         opt.mtp = mtp_;
         opt.depth = std::min<std::uint32_t>(o_.mtp_depth, qc::kWindowRows - 1U);
-        opt.min_p = o_.min_p;
+        opt.min_p = dh_->on() ? dh_->min_p() : o_.min_p;
+        const bool lone = dh_->on() && mtp_ && live.size() == 1 && !inflight_;
+        if (lone) opt.depth = dh_->plan(opt.depth);
         opt.policy = qc::depth_policy_of(o_.cohort_depth);
         opt.max_positions = o_.engine.max_positions;
         std::vector<qc::StreamStep> r;
@@ -716,6 +748,8 @@ private:
                 finish(s, step.error, "length");
                 continue;
             }
+            if (lone) dh_->finish_fixed(opt.depth, step.tokens.size() - 1, std::chrono::duration<double, std::milli>(Clock::now() - ts).count(),
+                                        step.drafted == opt.depth && step.rows == opt.depth + 1U);
             ++s.st.cycles;
             s.st.proposed += step.drafted;
             s.st.accepted += step.tokens.size() - 1;
@@ -777,6 +811,7 @@ private:
     px::Cache& cache_;
     std::vector<Slot> slots_;
     bool mtp_ = false;
+    std::unique_ptr<strix::MtpDepthHost> dh_;  // measured-cost lone-stream depth (STRIX_MTP_CONTROLLER=depth)
     std::uint32_t max_chunk_ = 1024, auto_rows_ = 256, first_rows_ = 0, fit_n_ = 0, inflight_steps_ = 0;
     Slot* inflight_ = nullptr;  // overlap: the slot whose chunk is on the prefill stream
     double step_ms_ = 0, fit_[5] = {0, 0, 0, 0, 0}, fit_a_ = 0, fit_b_ = 0;
@@ -809,6 +844,7 @@ int main(int argc, char** argv) {
             return plan.decision.ok ? 0 : 3;
         }
         std::cerr << "strix-cuda-qwen-serve: loading " << o.engine.model_gguf << std::endl;
+        if (!o.engine.mtp_sidecar_gguf.empty() && o.mtp_depth > 0) std::cerr << "strix-cuda-qwen-serve: " << strix::mtp_depth_state_line(o.min_p) << ", mtp_depth=" << o.mtp_depth << std::endl;
         qp::Prefill engine(o.engine);
         o.engine.max_positions = engine.max_positions();  // resolved limit for admission, cache and capabilities
         std::cerr << "strix-cuda-qwen-serve: loaded " << engine.describe() << std::endl;

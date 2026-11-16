@@ -2352,6 +2352,10 @@ if(BUILD_TESTING)
     target_link_libraries(strix-mtp-depth-window-controller-tests PRIVATE strix_core)
     strix_target_warnings(strix-mtp-depth-window-controller-tests)
     add_test(NAME strix-mtp-depth-window-controller-tests COMMAND strix-mtp-depth-window-controller-tests)
+    add_executable(strix-mtp-draft-split-tests tests/mtp_draft_split_tests.cpp)
+    target_link_libraries(strix-mtp-draft-split-tests PRIVATE strix_core)
+    strix_target_warnings(strix-mtp-draft-split-tests)
+    add_test(NAME strix-mtp-draft-split-tests COMMAND strix-mtp-draft-split-tests)
     add_executable(strix-mtp-shared-execution-witness-tests tests/mtp_shared_execution_witness_tests.cpp)
     target_link_libraries(strix-mtp-shared-execution-witness-tests PRIVATE strix_core)
     strix_target_warnings(strix-mtp-shared-execution-witness-tests)
@@ -2519,6 +2523,8 @@ if(BUILD_TESTING)
             COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/ctest_evidence_tests.py)
         add_test(NAME strix-queue-trace-evidence-tests
             COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/queue_trace_evidence_tests.py)
+        add_test(NAME strix-serve-cycles-tests
+            COMMAND ${Python3_EXECUTABLE} -B ${CMAKE_CURRENT_SOURCE_DIR}/tests/serve_cycles_tests.py)
         add_test(NAME strix-runtime-inventory-tests
             COMMAND ${Python3_EXECUTABLE} -B ${CMAKE_SOURCE_DIR}/tests/runtime_inventory_tests.py)
         # Option qualification kit (needs numpy). Package imports, so run from the source root.

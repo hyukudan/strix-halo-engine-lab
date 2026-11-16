@@ -56,7 +56,16 @@ target_link_libraries(qwen_decode_e2e PRIVATE strix_qwen_cuda strix_qwen_handoff
 add_executable(qwen_decode_bench tests/cuda/qwen_decode_bench.cu)
 target_link_libraries(qwen_decode_bench PRIVATE strix_qwen_cuda)
 add_executable(strix-cuda-qwen-serve apps/cuda_qwen_serve_main.cu)
-target_link_libraries(strix-cuda-qwen-serve PRIVATE strix_qwen_cuda strix_serve_win)
+# Shared MTP window controllers (also linked by the HIP engine): measured-cost depth/rows policy and its host adapter.
+add_library(strix_mtp_depth STATIC src/mtp_window_controller.cpp src/mtp_depth_window_controller.cpp src/serve/row_budget.cpp)
+target_include_directories(strix_mtp_depth PUBLIC include)
+add_executable(qwen_mtp_depth_host_test tests/cuda/qwen_mtp_depth_host_test.cpp)
+target_link_libraries(qwen_mtp_depth_host_test PRIVATE strix_mtp_depth)
+add_test(NAME qwen_mtp_depth_host COMMAND qwen_mtp_depth_host_test)
+add_executable(qwen_mtp_draft_split_test tests/mtp_draft_split_tests.cpp)
+target_link_libraries(qwen_mtp_draft_split_test PRIVATE strix_mtp_depth)
+add_test(NAME qwen_mtp_draft_split COMMAND qwen_mtp_draft_split_test)
+target_link_libraries(strix-cuda-qwen-serve PRIVATE strix_qwen_cuda strix_serve_win strix_mtp_depth)
 if(MSVC)
     target_compile_options(strix-cuda-qwen-serve PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/EHsc,/Zc:preprocessor,/utf-8>)
 endif()
@@ -130,6 +139,13 @@ if(MSVC)
 else()
     target_compile_options(qwen_bf16_mtp_e2e PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=-ffp-contract=off>)
 endif()
+
+# rtxmax exact decode kernels: each new kernel is byte-compared with the old form on random data (device, no model).
+foreach(_qx draft_step gdn_decode hc_rows qsa_decode rows_glue)
+    add_executable(qwen_${_qx}_exact_test tests/cuda/qwen_${_qx}_exact_test.cu)
+    target_link_libraries(qwen_${_qx}_exact_test PRIVATE strix_qwen_cuda)
+    target_compile_options(qwen_${_qx}_exact_test PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--fmad=false>)
+endforeach()
 # 16-bit recurrent state (STRIX_RECURRENT_STATE=f16|bf16) in the CUDA GDN recurrence: codec bit-equality with the host,
 # per-row rounding equalities, f32 incumbent bits. Needs the GPU (index 0 only: set CUDA_VISIBLE_DEVICES=0).
 add_executable(qwen_gdn_state16_test tests/cuda/qwen_gdn_state16_test.cu)
