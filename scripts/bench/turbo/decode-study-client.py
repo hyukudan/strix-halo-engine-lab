@@ -14,6 +14,10 @@ PREFIX, LANES = _t.PREFIX, _t.LANES
 
 port, out_path, arms = int(sys.argv[1]), sys.argv[2], sys.argv[3].split(',')
 maxtok = int(sys.argv[4]) if len(sys.argv) > 4 else 256
+for name in arms:
+    if (len(name) < 2 or name[0] not in 'SC' or not name[1:].isdigit()
+            or not 1 <= int(name[1:]) <= len(LANES)):
+        raise SystemExit(f'invalid arm {name!r}: prompt module has {len(LANES)} lanes')
 url = f"http://127.0.0.1:{port}/v1/chat/completions"
 
 def body(i):
@@ -22,23 +26,22 @@ def body(i):
 
 def one(i, res, t0):
     s = time.time()
-    payload = body(i)
-    request_sha = hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
-    req = urllib.request.Request(url, data=json.dumps(payload).encode(), headers={"Content-Type": "application/json"})
     try:
+        req = urllib.request.Request(url, data=json.dumps(body(i)).encode(), headers={"Content-Type": "application/json"})
         with urllib.request.urlopen(req, timeout=600) as r:
             j = json.loads(r.read())
+        e = time.time()
+        st = j.get("strix", {})
+        ids = st.get("token_ids", [])
+        res[i] = {"lane": i, "start": s - t0, "end": e - t0, "tokens": j["usage"]["completion_tokens"],
+                  "prompt": j["usage"]["prompt_tokens"], "cached": j["usage"].get("prompt_tokens_details", {}).get("cached_tokens"),
+                  "queue_ms": st.get("queue_ms"), "prefill_ms": st.get("prefill_ms"), "decode_ms": st.get("decode_ms"),
+                  "dec_tps": st.get("decode_tokens_per_second"), "acc": st.get("mtp_accepted"), "prop": st.get("mtp_proposed"),
+                  "cycles": st.get("mtp_cycles"), "ids_sha": hashlib.sha256(json.dumps(ids).encode()).hexdigest()[:16],
+                  "finish": j["choices"][0]["finish_reason"]}
     except Exception as e:
         res[i] = {"lane": i, "error": repr(e)}; return
-    e = time.time()
-    st = j.get("strix", {})
-    ids = st.get("token_ids", [])
-    res[i] = {"lane": i, "start": s - t0, "end": e - t0, "tokens": j["usage"]["completion_tokens"],
-              "prompt": j["usage"]["prompt_tokens"], "cached": j["usage"].get("prompt_tokens_details", {}).get("cached_tokens"),
-              "queue_ms": st.get("queue_ms"), "prefill_ms": st.get("prefill_ms"), "decode_ms": st.get("decode_ms"),
-              "dec_tps": st.get("decode_tokens_per_second"), "acc": st.get("mtp_accepted"), "prop": st.get("mtp_proposed"),
-              "cycles": st.get("mtp_cycles"), "ids_sha": hashlib.sha256(json.dumps(ids).encode()).hexdigest()[:16],
-              "finish": j["choices"][0]["finish_reason"], "request_sha256": request_sha}
+    res[i]["request_sha256"] = hashlib.sha256(json.dumps(json.loads(req.data), sort_keys=True).encode()).hexdigest()
     if os.environ.get("TURBODEC_KEEP_TOKEN_IDS") == "1":
         res[i]["token_ids"] = ids
 
@@ -75,6 +78,10 @@ def arm(name):
     print(json.dumps({k: v for k, v in summary.items() if k != "lanes"}), flush=True)
     return summary
 
-with open(out_path, "a") as f:
+failed = False
+with open(out_path, "x") as f:
     for a in arms:
-        f.write(json.dumps(arm(a)) + "\n"); f.flush()
+        result = arm(a)
+        f.write(json.dumps(result) + "\n"); f.flush()
+        failed |= bool(result["errors"]) or any(r["tokens"] <= 0 for r in result["lanes"] if r and "error" not in r)
+sys.exit(1 if failed else 0)

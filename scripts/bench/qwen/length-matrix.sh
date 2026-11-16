@@ -61,9 +61,6 @@ IFS=, read -ra S <<<"$sizes"; IFS=, read -ra M <<<"$modes"
 for ((r = 0; r < rounds; r++)); do
     for s in "${S[@]}"; do
         n=$(tokens_of "$s"); f=$ids/p$n.ids; pf=$pids/p$n.ids
-        # Single-process runs print no prefill-wall-ms line: take the prefill window of the engine's own power receipt
-        # (the stdout record whose token count is exactly the prompt).
-        declare -A pfre=([full]=" --prefill-regex {\"available\":true,\"duration_ms\":([0-9.]+),[^{}]*\"tokens\":$n,")
         [[ -s $f ]] || { echo "== s$s SKIP: no $f"; continue; }
         for m in "${M[@]}"; do
             for a in "${arms[@]}"; do
@@ -72,7 +69,14 @@ for ((r = 0; r < rounds; r++)); do
                 tag=s$s-$m-$name-$r need=$(need_of "$n" "$m")
                 kit_fits "$need" || { echo "== $tag SKIP (left $(kit_left) s < $need)"; continue; }
                 cap=$(($(kit_left) - 3))
-                export KIT_TAG=$tag KIT_ARM=s$s-$m-$name KIT_ROUND=$r KIT_TOKENS=$n KIT_WORKLOAD=s$s-$m KIT_RECEIPT_ARGS="--need-prefill${pfre[$m]:-}"
+                export KIT_TAG=$tag KIT_ARM=s$s-$m-$name KIT_ROUND=$r KIT_TOKENS=$n KIT_WORKLOAD=s$s-$m KIT_RECEIPT_ARGS='--need-prefill'
+                # Single-node runs print no prefill line: the figure is the whole request (prefill + --gen tokens +
+                # readback) from the result JSON, published as a prefill upper bound. Arrival stamps give only
+                # conservative envelopes including earlier samples. Require request validity for all metrics
+                # derived from its duration, including prefill bounds and prompt tokens per request second.
+                if [[ $m == full ]]; then
+                    KIT_RECEIPT_ARGS+=' --request-json generation_request_elapsed_ms --anchor-regex ^qpf2k.sched.block.rows --scope request'
+                fi
                 echo "#### $tag args[${args}] env[${envs}] t+$(($(date +%s) - KIT_T0))s"
                 case $m in
                     full)

@@ -1,5 +1,14 @@
 #!/bin/bash
 # decode-study-ticket.sh TAG BUILD_LABEL ARMS [ENV...]: serve ticket (through gpu-turn.sh): batched HTTP server of build V, cohort arms, clock samples.
+# Shared by the study wrappers; a failed invocation keeps its claim for diagnosis.
+study_claim() {
+  local tag=$1 path
+  for path in "$K/$tag.done" "$K/$tag.complete" "$K/runs/$tag" "$K/runs/$tag-"* "$K/trace-$tag" "$K/trace-$tag-"*; do
+    if [ -e "$path" ]; then echo "existing study output: $path" >&2; return 2; fi
+  done
+  mkdir "$K/$tag.claim" 2>/dev/null || { echo "study already claimed: $tag" >&2; return 2; }
+}
+if [[ ${BASH_SOURCE[0]} != "$0" ]]; then return 0; fi
 K=${TURBODEC_ROOT:?Set TURBODEC_ROOT to the output directory}
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 ADAPTER=${TURBODEC_SERVER_ADAPTER:?Set TURBODEC_SERVER_ADAPTER to the deployment recipe}
@@ -23,11 +32,15 @@ while [ "$(( $(date +%s)-T0 ))" -lt "$((LEFT-8))" ]; do if grep -q "listening on
 echo "listening after $(( $(date +%s)-T0 )) s: $(grep -c "listening on" $OUT/srv.err)" >> $OUT/log.txt
 grep -m2 "http slots\|exceeds explicit budget" $OUT/srv.err | cut -c1-200 >> $OUT/log.txt
 CLIENT_BUDGET=$((LEFT - 8 - ($(date +%s)-T0)))
+CLIENT_RC=1
 if [ "$READY" = 1 ] && [ "$CLIENT_BUDGET" -gt 0 ]; then
-  timeout "$CLIENT_BUDGET" python3 "$SCRIPT_DIR/decode-study-client.py" "$PORT" "$OUT/res.jsonl" "$ARMS" "${MAXTOK:-256}" >> "$OUT/log.txt" 2>&1 || echo "client rc $?" >> "$OUT/log.txt"
+  timeout "$CLIENT_BUDGET" python3 "$SCRIPT_DIR/decode-study-client.py" "$PORT" "$OUT/res.jsonl" "$ARMS" "${MAXTOK:-256}" >> "$OUT/log.txt" 2>&1
+  CLIENT_RC=$?
+  echo "client rc $CLIENT_RC" >> "$OUT/log.txt"
 fi
 if [ "${TURBODEC_C8_IF_BUDGET:-0}" = 1 ] && [ "$READY" = 1 ];then bash "$SCRIPT_DIR/decode-study-c8-hook.sh" "$PORT" "$OUT" "$((LEFT-($(date +%s)-T0)))";fi
 kill -INT $SP 2>/dev/null; for i in $(seq 1 15); do kill -0 $SP 2>/dev/null || break; sleep 1; done; kill -TERM $SP 2>/dev/null; wait $SP
 kill $CP $PP 2>/dev/null
 grep -m3 "lever active" $OUT/srv.err | cut -c1-200 >> $OUT/log.txt
 echo "$TAG done $(( $(date +%s)-T0 )) s" >> $OUT/log.txt
+exit "$CLIENT_RC"

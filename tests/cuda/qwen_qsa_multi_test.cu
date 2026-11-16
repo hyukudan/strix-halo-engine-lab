@@ -4,9 +4,9 @@
 // below and above the pooled-selection regime (> 2048 positions), several long sessions per window, two consecutive
 // windows (the second reuses the pooled caches). Needs a CUDA device; no model.
 //   qwen_qsa_multi_test <tables dir>
-#include "strix/cuda_qwen_qsa.hpp"
+#include "strix/cuda/qwen_qsa.hpp"
 
-#include "qwen_amd_math_tables.hpp"
+#include "strix/cuda/amd_math_tables.hpp"
 
 #include <cuda_runtime.h>
 

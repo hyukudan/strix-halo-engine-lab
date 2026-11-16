@@ -3,7 +3,7 @@
 // `static constexpr unsigned turbo_group` (one bit of strix::turbo_onfly_groups); the launch uses the INT4 copies
 // (q6p::iu4 registry, built at load by hip_qwen_onfly_i4.cpp) when EVERY segment of the site has one, else the
 // Q8_0 kernels run unchanged. Shared kernel over the one W4A16 small-M core (core/w4a16.hpp): activations (BF16 / F32
-// rows, or the dense A8 slot codes * deltas) are staged once per block as FP16, F32 accumulation, a block of S waves
+// rows) are staged once per block as FP16, F32 accumulation, a block of S waves
 // splits K and reduces its partial sums in LDS in a fixed order (deterministic), Site::store is the epilogue.
 // Included from hip_q8_rows_gemv.hpp (namespace strix::q8_rows).
 
@@ -110,22 +110,26 @@ __global__ __launch_bounds__(32 * S) void project_rows_iu4_kernel(Site site, Iu4
     }
 }
 
-// True when the INT4 form launched. slot != nullptr: activations from the dense A8 slot (producer-quantized rows).
+// True when INT4 launched. A8 slots remain exclusively for the Q8 fallback.
+// Even with a slot, use the original site rows and the serial FP16 conversion.
 template <class Site> bool launch_iu4_rows(const Site& site, hipStream_t stream, bool any_order, const DenseA8Slot* slot) {
     if constexpr (Site::rows > 8U || !iu4_group_of<Site>()) return false;
     else {
         if (!q6p::iu4::count() || q6p::iu4::suspended()) return false;
         const unsigned width = site.width;
-        if (width % 64U || site.segments.count == 0U ) return false;
+        if (!onfly_i4::dispatch_width(width) || site.segments.count == 0U ) return false;
         Iu4Weights w{};
+        std::shared_ptr<const q6p::iu4::Tensor> leases[kMaxSegments];
         unsigned blocks = 0;
         for (unsigned m = 0; m < site.segments.count; ++m) {
-            const auto* t = q6p::iu4::find(site.segments.weights[m]);
+            const auto t = q6p::iu4::find(site.segments.weights[m]);
             const unsigned n = site.segments.first[m + 1U] - site.segments.first[m];
             if (!t || t->cols != width || t->rows != n || site.segments.types[m]) return false;
             w.base[m] = t->base;
+            leases[m] = t;
             blocks += (n + 63U) / 64U;
         }
+        onfly_i4::require_serial_projection(Site::rows, false);
         const auto& execution = core::iu4_rows::execution_policy();
         const auto reduction = execution.reduction;
         const auto run = [&]<unsigned G, core::iu4_rows::RowReduction Reduction>() {

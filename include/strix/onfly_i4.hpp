@@ -18,9 +18,21 @@
 namespace strix::onfly_i4 {
 
 enum Group : unsigned { gdn_in = 1U, gdn_out = 2U, qsa_io = 4U, shared_expert = 8U, all_groups = 15U };
-inline constexpr std::string_view kIdentity = "qwen-turbo-plus-onfly-i4g64-v1";
-inline constexpr std::string_view kScopeNote = "decode dense projections (rows <= 8) i4g64; prefill (rows >= 16) q8_0";
+inline constexpr std::string_view kIdentity = "qwen-turbo-plus-onfly-i4g64-v2";
+inline constexpr std::string_view kScopeNote = "decode/window dense projections i4g64; cohort/batching unqualified; prefill (rows >= 16) q8_0";
 inline constexpr int kScaleLegacy = 0, kScaleFullRange = 2001, kScaleMse = 2002;
+inline constexpr bool dispatch_width(std::uint64_t k) {
+    return k == 2048U || k == 2560U || k == 4096U || k == 6144U;
+}
+// Cohort/batch execution remains unqualified. IU4 never consumes A8 slots.
+// Refuse these routes rather than silently falling back to different weights.
+inline void require_serial(bool active, bool window_route) {
+    if (active && window_route)
+        throw std::invalid_argument("onfly INT4 cohort/batching or projection source is not serial-equivalence qualified");
+}
+inline void require_serial_projection(unsigned rows, bool from_a8_slot) {
+    require_serial(true, rows < 1U || rows > 8U || from_a8_slot);
+}
 inline std::string_view scale_rule_name(int rule) { return rule == kScaleLegacy ? "legacy" : rule == kScaleMse ? "mse" : "full"; }
 
 enum class Source : unsigned { native = 0, onfly = 1, converted = 2 };
@@ -42,6 +54,10 @@ struct Resolved {
         if (row_reduction.effective == core::iu4_rows::RowReduction::canonical)
             value += "-" + std::string(core::iu4_rows::row_reduction_contract(row_reduction.effective));
         return value;
+    }
+    [[nodiscard]] std::string json() const {
+        return "{\"identity\":\"" + identity() + "\",\"group_mask\":" + std::to_string(groups) +
+            ",\"scale_rule\":\"" + std::string(scale_rule_name(scale_rule)) + "\"}";
     }
 };
 

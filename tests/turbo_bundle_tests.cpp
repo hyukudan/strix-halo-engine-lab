@@ -6,6 +6,8 @@
 #include "strix/glm_pair_profile_table.hpp"
 #include "strix/profiles/qwen.hpp"
 #include "minimax/engine/mm_profile_table.hpp"
+#include "minimax/engine/mm_defaults.hpp"
+#include "glm/prefill/glm_pf_attn_wmma.hpp"
 
 #include <cstdio>
 #include <map>
@@ -80,19 +82,53 @@ void families() {
     generic(ds, p::Name::turbo, none, r);
     require(find(r, "attention_f16wmma") != nullptr && find(r, "attention_f16wmma")->value == "2", "ds41 turbo attention = bf16flash");
     require(find(r, "dense_f16") != nullptr && find(r, "dense_f16")->value == "1", "ds41 turbo dense f16");
-    require(find(r, "engram_wmma") != nullptr && find(r, "engram_wmma")->status == p::Status::pending, "ds41 engram pending");
+    require(profile_table.size() == 7, "ds41 keeps seven rows after replacing pending Engram");
+    std::size_t engram_rows = 0;
+    for (const auto& row : profile_table)
+        if (std::string_view(row.env) == "STRIX_DS41_FAST_ENGRAM") ++engram_rows;
+    require(engram_rows == 1 && find(r, "engram_wmma") == nullptr, "one real Engram row per env");
+    const auto* engram = find(r, "engram_f16wmma");
+    require(engram != nullptr && engram->status == p::Status::builtin && engram->value == "0" &&
+                std::string_view(engram->lever->value[3]).empty() && !engram->lever->runnable[3],
+            "ds41 real Engram stays explicit-only outside turbo");
     require(find(r, "decoder_replay") != nullptr && find(r, "decoder_replay")->status == p::Status::pending, "ds41 replay pending");
     generic(ds, p::Name::fast, none, r);
     require(find(r, "attention_f16wmma")->requested == "1", "ds41 fast unchanged (f16wmma)");
     generic(ds, p::Name::standard, none, r);
-    require(find(r, "engram_wmma") == nullptr || find(r, "engram_wmma")->status == p::Status::builtin, "ds41 default unchanged");
+    require(find(r, "engram_f16wmma") != nullptr && find(r, "engram_f16wmma")->status == p::Status::builtin, "ds41 default unchanged");
 
     const p::Engine mm{"minimax-pair", "", strix::minimax::defaults::profile_table, false, "minimax-turbo-v1"};
     generic(mm, p::Name::turbo, none, r);
-    require(find(r, "msa_flash")->value == "1" && find(r, "msa_flash_layers")->value == "0-59", "minimax turbo flash 1 on layers 0-59");
+    require(strix::minimax::defaults::profile_table.size() == 6, "minimax retains two base index rows");
+    for (const char* lever : {"idx_wmma", "idx_wmma_layers"}) {
+        const auto* e = find(r, lever);
+        require(e != nullptr && e->status == p::Status::builtin && e->value == e->lever->builtin &&
+                    std::string_view(e->lever->value[3]).empty() && !e->lever->runnable[3],
+                "minimax index rows stay explicit-only outside turbo");
+    }
+    require(find(r, "msa_flash")->status == p::Status::pending && find(r, "msa_flash_layers")->status == p::Status::pending,
+            "minimax turbo flash waits for adapter admission/export");
     require(find(r, "moe_invariant")->status == p::Status::pending, "minimax moe invariant pending");
     generic(mm, p::Name::fast, none, r);
     require(find(r, "msa_flash") == nullptr || find(r, "msa_flash")->status == p::Status::builtin, "minimax fast unchanged");
+
+    namespace md = strix::minimax::defaults;
+    const std::map<std::string, std::string> mm_env{{md::kProductProfileEnv, "turbo"}};
+    const auto admitted = md::profile_resolution(env_of(mm_env));
+    const auto execution = md::prefill_policy(env_of(mm_env));
+    require(find(admitted, "msa_flash")->value == std::to_string(execution.msa_flash),
+            "MiniMax actual adapter receipt matches engine flash mode");
+    require(find(admitted, "msa_flash_layers")->value == execution.msa_flash_layers,
+            "MiniMax actual adapter receipt matches engine layer set");
+    std::map<std::string, std::string> exported;
+    p::apply(admitted, [&](const char* key, const char* value) { exported[key] = value; return true; });
+    require(!exported.contains("STRIX_MM_PF_MSA_FLASH") && !exported.contains("STRIX_MM_PF_MSA_FLASH_LAYERS"),
+            "pending MiniMax proposals never escape through the shared exporter");
+    p::Inputs allow;
+    allow.profile = p::Name::turbo;
+    allow.allow_pending = true;
+    const auto pending = p::resolve(mm, allow);
+    require(find(pending, "msa_flash")->status == p::Status::pending, "allow-pending cannot bypass missing MiniMax adapter");
 
     generic(strix::glm::rank_defaults::product_profile_engine, p::Name::turbo, none, r);
     require(find(r, "pf_wmma")->value == "1", "glm turbo inherits pf_wmma");
@@ -101,8 +137,24 @@ void families() {
 }
 }  // namespace
 
-int main() {
+int main(int argc, char** argv) {
     try {
+        if (argc >= 2 && std::string_view(argv[1]) == "--minimax-cli")
+            return strix::minimax::defaults::print_or_apply("rank", argc - 1, argv + 1) ? 0 : 1;
+        if (argc >= 3 && std::string_view(argv[1]) == "--glm-arm") {
+            for (const char* key : {"STRIX_GLM_PF_WMMA", "STRIX_GLM_PF_ATTN_WMMA", "STRIX_GLM_PF_KDA_WMMA"})
+                require(p::export_environment(key, ""), "clear inherited GLM switch");
+            for (int i = 3; i < argc; ++i) {
+                const std::string assignment = argv[i];
+                const auto eq = assignment.find('=');
+                require(eq != std::string::npos && p::export_environment(assignment.substr(0, eq).c_str(), assignment.substr(eq + 1).c_str()), "set arm switch");
+            }
+            const std::string_view arm = argv[2];
+            require(strix::glm::pf::wmma_x::enabled() == (arm != "default" && arm != "no-pf_wmma"), "GLM dense execution switch");
+            require(strix::glm::pf::attn_wmma::enabled() == (arm != "default" && arm != "no-attn_wmma"), "GLM attention execution switch");
+            require(strix::glm::pf::kda_wmma::enabled() == (arm != "default" && arm != "no-kda_wmma"), "GLM KDA execution switch");
+            return failures == 0 ? 0 : 1;
+        }
         qwen_rows();
         families();
     } catch (const std::exception& e) {
