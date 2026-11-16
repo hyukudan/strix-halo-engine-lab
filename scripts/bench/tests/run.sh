@@ -107,6 +107,7 @@ printf 'PASS fixture schema and markdown render\n'
 "$BENCH_PYTHON" -B scripts/bench/tests/test_tasks.py
 "$BENCH_PYTHON" -B scripts/bench/tests/test_runner.py
 "$BENCH_PYTHON" -B scripts/bench/tests/test_lifecycle.py
+"$BENCH_PYTHON" -B scripts/bench/tests/test_evidence.py
 # Public machine endpoints must contain exactly one JSON document on stdout.
 bash scripts/bench/bench.sh list --json >"$tmp/list.json"
 "$BENCH_PYTHON" -c 'import json,sys; d=json.load(open(sys.argv[1])); assert len(d["engines"])==6' "$tmp/list.json"

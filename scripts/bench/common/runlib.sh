@@ -32,9 +32,10 @@ kit_left() {
 # kit_fits NEED: true when at least NEED seconds (+3 s margin) remain.
 kit_fits() { (($(kit_left) > $1 + 3)); }
 
-# Drop inherited engine levers so an arm only sees what it names (KIT_KEEP_ENV lists exceptions).
+# Drop inherited engine levers; device binding is infrastructure, not an arm's tuning.
+# KIT_KEEP_ENV lists additional exceptions.
 kit_clean_env() {
-    local v keep=" ${KIT_KEEP_ENV:-} "
+    local v keep=" STRIX_DEVICES STRIX_DEVICE ${KIT_KEEP_ENV:-} "
     for v in $(env | sed -n 's/^\(STRIX_[A-Z0-9_]*\)=.*/\1/p'); do
         [[ $keep == *" $v "* ]] || unset "$v"
     done
@@ -49,6 +50,22 @@ kit_peer() {
     ssh -n -o BatchMode=yes -o ServerAliveInterval=15 "$KIT_PEER" "$@"
 }
 kit_peer_root() { echo "${KIT_PEER_ROOT:-$KIT_ROOT}"; }
+
+# kit_peer_inputs ARG...: fail fast, before any GPU time, when the peer rank cannot read an input the local rank
+# reads. Each ARG is a path, NAME=PATH, or a ':'-separated spec (e.g. d:/p/x.u32:128); every absolute field that
+# exists locally must be readable on KIT_PEER under the same path. A missing input names every missing path.
+kit_peer_inputs() {
+    local a f miss need=()
+    for a in "$@"; do
+        IFS=: read -ra F <<<"${a#*=}"
+        for f in "${F[@]}"; do [[ $f == /* && -e $f ]] && need+=("$f"); done
+    done
+    ((${#need[@]})) || return 0
+    miss=$(kit_peer "for f in $(printf '%q ' "${need[@]}"); do [ -r \"\$f\" ] || echo \"\$f\"; done") ||
+        kit_die 'peer input check failed (peer unreachable)'
+    [[ -z $miss ]] || kit_die "peer $KIT_PEER is missing inputs: $(echo $miss)"
+    kit_log "peer inputs ok (${#need[@]} paths)"
+}
 
 # kit_same_binary LOCAL_BIN [PEER_BIN]: abort a pair ticket when the two nodes run different binaries.
 kit_same_binary() {

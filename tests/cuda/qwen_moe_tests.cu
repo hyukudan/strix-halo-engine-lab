@@ -1,4 +1,4 @@
-// Tests of src/cuda/qwen_moe.cu (CUDA routed-MoE prefill, A8 profile) against a literal host transcription of the HIP
+// Tests of src/cuda/models/qwen/qwen_moe.cu (CUDA routed-MoE prefill, A8 profile) against a literal host transcription of the HIP
 // kernels: prefill_prologue/quantize_row (src/hip_moe_q4k_a8_probe.hip:41-73, 159-173), build_prefill_csr
 // (src/hip_moe_q4k_a8_known_rows.hip:403-452, the serial builder the parallel one reproduces), project_prefill_wmma with
 // gate_up_chains (:791-909), down_prefill_wmma with down_chains (:957-1032), known_moe_prefill_merge/commit_kernel
@@ -20,9 +20,9 @@
 #include <string>
 #include <vector>
 
-#include "strix/cuda_qwen_moe.hpp"
-#include "strix/cuda_qwen_route_bf16.hpp"
-#include "qwen_amd_math_tables.hpp"
+#include "strix/cuda/qwen_moe.hpp"
+#include "strix/cuda/qwen_route_bf16.hpp"
+#include "strix/cuda/amd_math_tables.hpp"
 #include "qwen_fixture.hpp"
 #include "qwen_gguf_host.hpp"
 
@@ -52,7 +52,7 @@ static float canon(float x) { return x != x ? f_of(0x7fc00000U) : x; }
 static bool finite(float x) { return (b_of(x) & 0x7f800000U) != 0x7f800000U; }
 
 // ---------------------------------------------------------------------------------------------------------------------
-// Host gfx1151 expf: the same algorithm as amd_expf (src/cuda/qwen_amd_math.cuh, verified exhaustively against gfx1151),
+// Host gfx1151 expf: the same algorithm as amd_expf (include/strix/cuda/amd_math.cuh, verified exhaustively against gfx1151),
 // with the tables read on the host.
 struct HostExp {
     std::vector<u32> bits; std::vector<u32> hard_in; std::vector<float> hard_out;
