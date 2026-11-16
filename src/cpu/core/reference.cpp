@@ -1,6 +1,9 @@
 // Scalar, exact reference of the CPU backend. It is the oracle every ISA specialisation must match
 // bit for bit; it is written for the declared operation order, not for speed.
 #include "cpu/core/backend.hpp"
+#if defined(STRIX_WFMT_CAPTURE)
+#include "cpu/weight/source.hpp"
+#endif
 #include "core/integer_math.hpp"
 
 #include <algorithm>
@@ -21,6 +24,13 @@ float half_to_float(std::uint16_t bits) noexcept {
     if (exponent == 31U) return std::bit_cast<float>(sign | 0x7f800000U | (mantissa << 13U));
     return std::bit_cast<float>(sign | ((exponent + 112U) << 23U) | (mantissa << 13U));
 }
+
+#if defined(STRIX_WFMT_CAPTURE)
+namespace weight_capture {
+thread_local void (*sink)(const float*,std::size_t,void*)=nullptr;
+thread_local void* user=nullptr;
+}
+#endif
 
 namespace {
 
@@ -65,6 +75,9 @@ void ref_gemv_q8_0_a8(const Q8a8View& v, const Stream&) {
                 lanes[g % product_lanes] = lanes[g % product_lanes] + core::integer_math::product(dot, scale, xd[g]);
             }
             float& y = v.out[static_cast<std::size_t>(r) * v.out_stride + o];
+#if defined(STRIX_WFMT_CAPTURE)
+            if (weight_capture::sink) weight_capture::sink(lanes, product_lanes, weight_capture::user);
+#endif
             const float p = core::integer_math::tree32(lanes);
             y = v.accumulate ? y + p : p;
         }
@@ -97,3 +110,12 @@ constexpr Kernels kReference{Isa::scalar, &ref_quantize_a8, &ref_gemv_q8_0_a8, &
 const Kernels& reference_kernels() noexcept { return kReference; }
 
 }  // namespace strix::cpu
+
+#if defined(STRIX_WFMT_CAPTURE)
+namespace strix::weight::cpu {
+void set_partial_sink(PartialSink sink,void* user) noexcept {
+    ::strix::cpu::weight_capture::sink=sink;
+    ::strix::cpu::weight_capture::user=user;
+}
+}
+#endif

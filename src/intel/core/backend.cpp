@@ -1,4 +1,5 @@
 #include "backend.hpp"
+#include "intel/weight/source.hpp"
 
 #include "../arch/xe2/caps.hpp"
 
@@ -120,7 +121,7 @@ Status synchronize(Queue queue) {
 
 Status enqueue_dense_q8a8(Queue queue, const dense::Q8A8View& view) {
     if (!q(queue)) return Status::invalid;
-    if (!dense::supported(view)) return Status::unsupported;
+    if (!::strix::weight::intel::validate_view(view)) return Status::unsupported;
     const dense::Q8A8View v = view;
     return status_boundary([&] {
         q(queue)->queue.parallel_for(sycl::range<2>(v.rows, v.count), [=](sycl::id<2> i) {
@@ -145,7 +146,7 @@ Status release(Queue, void*) { return Status::not_built; }
 Status copy(Queue, void*, const void*, std::size_t) { return Status::not_built; }
 Status synchronize(Queue) { return Status::not_built; }
 Status enqueue_dense_q8a8(Queue, const dense::Q8A8View& view) {
-    return dense::supported(view) ? Status::not_built : Status::unsupported;
+    return ::strix::weight::intel::validate_view(view) ? Status::not_built : Status::unsupported;
 }
 #endif
 

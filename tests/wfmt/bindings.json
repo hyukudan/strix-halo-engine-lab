@@ -1197,8 +1197,11 @@
         "launch",
         "product",
         "reference_kernels",
+        "registered_weight_kernels",
         "scale"
-      ]
+      ],
+      "operand_source": "src/cpu/weight/source.hpp",
+      "source_registry": "src/cpu/weight/registry.cpp"
     },
     {
       "id": "cpu:src/cpu/core/reference.cpp",
@@ -1218,7 +1221,9 @@
         "ref_gemv_q8_0_a8",
         "ref_quantize_a8",
         "reference_kernels"
-      ]
+      ],
+      "operand_source": "src/cpu/weight/source.hpp",
+      "source_registry": "src/cpu/weight/registry.cpp"
     },
     {
       "id": "cpu:src/cpu/core/select.cpp",
@@ -1234,8 +1239,11 @@
       "capture": "legacy-public-entrypoint",
       "operations": [
         "kernels",
-        "reference_kernels"
-      ]
+        "reference_kernels",
+        "registered_weight_kernels"
+      ],
+      "operand_source": "src/cpu/weight/source.hpp",
+      "source_registry": "src/cpu/weight/registry.cpp"
     },
     {
       "id": "cpu:src/cpu/arch/avx512/kernels.cpp",
@@ -1301,8 +1309,11 @@
       "operations": [
         "enqueue_dense_q8a8",
         "load",
-        "supported"
-      ]
+        "validate_view"
+      ],
+      "operand_source": "src/intel/weight/source.hpp",
+      "source_registry": "src/intel/weight/registry.cpp",
+      "kernel_address_migration": "deferred: kernel-body edit outside current authorization"
     },
     {
       "id": "hip-dense:src/core/f16_dense_q8a8.hpp",
