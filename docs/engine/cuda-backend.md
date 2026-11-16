@@ -100,12 +100,16 @@ below min_p (the verify would discard its steps). Kept drafts and verified token
 histogram of kept drafts (shared chooser `include/strix/mtp_draft_split.hpp`, expected steps a + P(kept > a) (depth - a
 + 0.25)). `STRIX_QRTX_DRAFT_SPLIT=0` = one segment, `N` = fixed a. Measured (#680, 3 ABAB pairs): prose C1 +7.3 %, json
 +1.9 %, edit +-0.2 %, window 16.1 -> 14.5 ms at 1.86 tokens/window.
-Context drafter (`STRIX_QRTX_CONTEXT_DRAFT=off|ctx|copy`, printed in the server's start line): the shared host drafter
+Context drafter (`STRIX_QRTX_CONTEXT_DRAFT=first|off|ctx|copy`, default `first`, printed in the server's start line): the shared host drafter
 `include/strix/mtp_context_draft.hpp` (the HIP engine's `--mtp-ngram-draft=ctx|copy`) bound into `qwen_cohort::step`.
 `copy`: a gated context span (long unanimous anchor, learned acceptance above the MTP cycle's) supplies the window's rows
 with no predictor forward; otherwise context rows extend or replace the confident MTP prefix. The commit writes the MTP
 teacher rows of every committed position, so skipping the predictor leaves its cache as after a drafted window; every
-row passes the greedy verify (ids unchanged). The server's `rtx` stats carry `copy_first_steps` and `context_rows`.
+row passes the greedy verify (ids unchanged). `first` (default) uses only the copy-first windows; extension proposals
+are scored for learning but never verified, because a rejected extension row costs ~1.2 ms of routed-expert bytes.
+Measured (3 ABAB pairs, ids equal): edit C1 +13.6 %, C4 +3.5 %, C8 +2.1 %, json +-0.3 %, prose -0.5..-2.8 % (drafter
+host time ~50 us per stream per cycle on requests that never copy). The server's `rtx` stats carry `copy_first_steps`,
+`context_rows` and `context_host_us`.
 
 Served decode by prompt class: `scripts/bench/cuda/qwen_serve_classes.py` (prose / edit / json, C1 / C4 / C8, cold and
 warm passes, ids of every request) with `scripts/bench/cuda/qwen_classes_prompts.json`, and strict ABAB server arms with

@@ -40,11 +40,14 @@ inline ContextMode context_mode_of(const char* v) {
 inline const char* context_mode_name(ContextMode m) {
     return m == ContextMode::first ? "first" : m == ContextMode::copy ? "copy" : m == ContextMode::ctx ? "ctx" : "off";
 }
-// STRIX_QRTX_CONTEXT_DRAFT=off|ctx|copy (unset: the default below), one resolution for every entry point.
+// STRIX_QRTX_CONTEXT_DRAFT=off|first|ctx|copy, one resolution for every entry point. Default first (measured, 3 ABAB
+// pairs, ids equal): edit C1 +13.6 %, C4 +3.5 %, C8 +2.1 %, json +-0.3 %; prose -0.5..-2.8 % = the drafter's host time
+// (~50 us per stream per cycle) on requests that never copy. copy/ctx also verify extension rows: a rejected row costs
+// ~1.2 ms of routed-expert bytes (json C1 -2.9 %), so they stay opt-in.
 inline ContextMode context_mode_default() {
     static const ContextMode m = [] {
         const char* v = strix::envcfg::text("STRIX_QRTX_CONTEXT_DRAFT");
-        return v ? context_mode_of(v) : ContextMode::off;
+        return v ? context_mode_of(v) : ContextMode::first;
     }();
     return m;
 }
