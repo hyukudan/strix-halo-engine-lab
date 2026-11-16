@@ -42,6 +42,14 @@ the arms apart). Scheduling only: the 9..32-row wide steps keep every row's arit
 live requests were not reached on the measured node (nine slots at 8K context); their token ids at 16 submitted
 requests match the old form, and the session split rests on the per-session state ownership above.
 
+Measured topology pricing (`STRIX_SERVE_ROW_MEASURED`, default `auto`): at the lane counts of the decision table
+(`kMtpRowMeasuredAutoLanes`, now 7 requests) the budget prices each owner topology (how many requests hold 2, 4 or 8 rows)
+by its own measured cycle time (three samples or more) and its delivered tokens, and takes the assignment with the most
+expected tokens per millisecond (an exact search over owner counts). It also runs the bounded probes above the lane bound,
+so 7 requests can leave the fixed two rows when four rows each measure faster per token. `1` uses it at every count 1-8,
+`0` keeps the affine fit everywhere. Joint rule texts for in-process A/B: `budget-measured` (all counts), `budget-fit`
+(none). `--print-effective-config` / the serve lever list show `row_measured` with the lane mask.
+
 ## Exactness
 
 Scheduling only. Every emitted token comes from the request's own target rows, so token ids equal those of a

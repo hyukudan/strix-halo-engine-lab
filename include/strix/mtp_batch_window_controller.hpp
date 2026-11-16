@@ -31,9 +31,12 @@ struct MtpBatchPlanRule {bool pooled=false; bool calibrated=false; std::uint32_t
 // decision table kMtpRowMeasuredAutoLanes, 1 = every count 1..8, 0 = none, the affine fit everywhere).
 [[nodiscard]] std::uint32_t mtp_serve_row_measured_lanes() noexcept;
 [[nodiscard]] const char* mtp_serve_row_measured_choice() noexcept; // "auto", "1" or "0"
-// Decision table (cluster receipts 16-nov, one node, served Qwen ABAB in one process, ids identical): lane counts
-// where the measured rule's window tok/s beat the affine fit.
-inline constexpr std::uint32_t kMtpRowMeasuredAutoLanes=(1U<<2U);
+// Decision table (receipts 16-nov, one node, served Qwen, strict ABAB in one process, ids identical): lane counts where
+// the measured rule's decode-window tok/s beat the affine fit. 7 lanes: 102.4 -> 107.9 (+5.4 %, R4 on every lane at
+// 197 ms against R2 at 129 ms). Not set: 2 (+6.9 % then -0.7 %: flat), 4 (-2.8 %, -4.1 %), 6 (+1.0 %, -2.7 %): the
+// draft-confidence yield over-promises the marginal R2 -> R4 lane there; 8 (+1.1 % with evictions in the window:
+// provisional until a clean receipt).
+inline constexpr std::uint32_t kMtpRowMeasuredAutoLanes=(1U<<7U);
 // The batched decode runs its joint cycle with the budget rule. On by default; STRIX_SERVE_ROW_BUDGET=0 (or the
 // baseline mode) restores the fixed rows-per-request table.
 [[nodiscard]] bool mtp_serve_row_budget_enabled() noexcept;
