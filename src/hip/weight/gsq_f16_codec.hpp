@@ -4,6 +4,9 @@
 #include "arch/gfx1151_gsq.hpp"
 #include <hip/hip_fp16.h>
 namespace strix::weight::hip::gsq_detail {
+// Internal linkage, as the incumbent definitions inside the known-rows TU's unnamed namespace: the non-forceinline
+// fetch/convert members are inlined under the same heuristics, so the kernels keep their incumbent code.
+namespace {
 // The incumbent gfx1151 FP16 pair/mix instructions. Bound by one alias, not a template parameter: templating the
 // group structs on the instruction policy changed the scheduling of the IQ4_XS F16 prefill kernels.
 using Instructions=::strix::weight::hip::GsqGfx1151;
@@ -267,4 +270,5 @@ template<unsigned TPC> struct F16Block<gsq_a8::type_q2_0,TPC> {
     __device__ static uint4 raw4(const Raw& r){return {r.w[0],r.w[1],r.w[2],r.w[3]};}
 };
 
+}  // namespace
 }
