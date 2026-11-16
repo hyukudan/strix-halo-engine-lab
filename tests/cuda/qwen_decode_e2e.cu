@@ -7,7 +7,7 @@
 // Batch-width invariance: replays the same prompt + generated tokens as verify windows of T = 2..8 rows from a fresh
 // prefill and requires every row's argmax and logits digest to equal the serial step's. With a ref file (node greedy
 // tokens, comma/space separated), the serial tokens must equal its first G entries.
-#include "strix/cuda_qwen_prefill.hpp"
+#include "strix/cuda/qwen_prefill.hpp"
 #include "strix/model_content_hash.hpp"
 
 #include <array>

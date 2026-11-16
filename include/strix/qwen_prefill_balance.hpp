@@ -177,12 +177,13 @@ inline CutPrediction choose_cut(const LayerCosts& costs, const LegalCuts& legal,
         throw std::invalid_argument("pair prefill model has no legal folded attention-HC cut");
     }
 }
-// Largest prefix accepted by a full tile or a >=16 row, multiple-of-eight tail.
+// Largest prefix the pipeline carries: full tiles, then a remainder on the 16-row tail grain. The cursor runs a
+// remainder as a merged partial block and 64 / 16-row tail blocks, and only its last rem % 16 rows serially; a
+// serial row has no seam (each rank would run its own whole model), so those rows go to the hand-off suffix.
+inline constexpr std::uint32_t pipe_tail_grain = 16U;
 inline std::uint64_t legal_prefix(std::uint64_t prompt, std::uint32_t rows) {
     if (rows < 16U || rows % 8U != 0U) throw std::invalid_argument("pair handoff invalid tile rows");
-    auto prefix = prompt - prompt % 8U;
-    if (prefix % rows == 8U) prefix -= 8U;
-    return prefix;
+    return prompt - prompt % pipe_tail_grain;
 }
 struct PromptRoute { std::uint64_t prefix = 0; const char* reason = "single-short"; };
 inline PromptRoute choose_prompt_route(std::uint64_t prompt, std::uint32_t rows,
@@ -251,7 +252,8 @@ inline ChunkChoice choose_chunk(const char* value, std::uint32_t legacy, std::ui
 // P(c) = 168 + 0.5474 c ms (2,415 at 4,096 rows, 1,288 at 2,048, 752 at 1,024); seam latency 35 ms once;
 // hand-off 28 + 0.0028 n ms (51 at 8K, 120 at 32K); one node 0.536 ms/row with its own T8192/T16384 tiles.
 inline constexpr pair::PipelineCost pipeline_cost{168.0, 0.5474, 35.0, 28.0, 0.0028, 0.536};
-// This cut-23 calibration also routes explicit alternate cuts; those need separate native qualification.
+// Alternate cuts and layer-only cost files still use this balanced cut-23 calibration, not their
+// supplied stage imbalance. Their crossover and native exactness remain unqualified.
 inline constexpr std::array<std::uint32_t, 5> pipeline_chunk_candidates{1024U, 2048U, 4096U, 8192U, 16384U};
 // qwen.pair_chunk_policy: ON = length (pair::choose_pipeline picks route and chunk per prompt length),
 // OFF = fixed (4,096-row chunks, pipeline from 28,672 rows without a cost file). Both arms are bitwise.
@@ -272,18 +274,25 @@ struct PairPolicy {
     lever::Choice chunk_policy;
     lever::Choice single_tiles;
     PairExecution execution = PairExecution::handoff;
+    bool baseline = false;
 };
 // Select once before read-only inspection and retain these choices for execution.
-inline PairPolicy resolve_pair_policy(std::uint64_t prompt, PairExecution execution) {
+inline PairPolicy resolve_pair_policy(std::uint64_t prompt, PairExecution execution, bool baseline) {
     const lever::Inputs inputs{0U, prompt, 0U};
-    return {lever::select(chunk_policy_lever, inputs), lever::select(single_tiles_lever, inputs), execution};
+    const auto select = [&](lever::Decl row) {
+        // Baseline disables automatic defaults; explicit per-lever switches retain precedence.
+        if (baseline) { row.default_on = false; row.regime = {}; }
+        return lever::select(row, inputs);
+    };
+    return {select(chunk_policy_lever), select(single_tiles_lever), execution, baseline};
 }
 inline std::string inspect_pair_policy(std::string_view config, const PairPolicy& policy) {
     using serve::Json;
-    const auto control = [](lever::Choice choice) {
+    const auto control = [&](lever::Choice choice) {
         return Json(Json::Object{
             {"requested", choice.origin == lever::Origin::explicit_switch ? (choice.on ? "1" : "0") : "auto"},
-            {"effective", choice.on}, {"source", lever::origin_name(choice.origin)}});
+            {"effective", choice.on}, {"source", policy.baseline && choice.origin != lever::Origin::explicit_switch
+                ? "baseline" : lever::origin_name(choice.origin)}});
     };
     auto out = serve::parse_json(config);
     out.as_object().emplace_back("qwen_pair", Json::Object{

@@ -1,3 +1,4 @@
+#include "strix/weight/admission.hpp"
 #include "strix/device/hip_gate.hpp"
 #include "strix/env_flags.hpp"
 #include "../src/core/chunk_contract.hpp"
@@ -31,6 +32,7 @@
 #include "strix/teacher_logit_spool.hpp"
 #include "strix/hip_q6p_pack.hpp"
 #include "strix/hip_qwen_router_bf16.hpp"
+#include "strix/hip_qwen_onfly_i4.hpp"
 #include "strix/qwen_router_bf16.hpp"
 #include "strix/hip_dense_trellis_pack.hpp"
 #include "strix/q6p_registry.hpp"
@@ -1562,6 +1564,13 @@ static int run_decode_entry(
         strix::gguf::read_file(
             options.model_path);
     strix::qwen_description::refuse_unless_described(model, info);
+    std::shared_ptr<const strix::weight::Source> weight_source;
+    auto weight_status = strix::weight::open_source(options.model_path, weight_source);
+    strix::weight::TensorIndex weight_index;
+    if (weight_status) weight_status = strix::weight::index_gguf(info, weight_source, weight_index);
+    strix::weight::WeightMap admitted_weights;
+    if (weight_status) weight_status = strix::weight::bind_qwen(weight_index, admitted_weights);
+    if (!weight_status) throw std::runtime_error("Qwen weight admission: " + weight_status.detail);
     const auto manifest =
         strix::build_model_manifest(
             info);
@@ -1721,11 +1730,17 @@ static int run_decode_entry(
         {options, requested_environment, !target_input_export}, model, info, manifest,
         admitted_content, prompt_capabilities, prompt_memory);
     options = effective.options;
+    if (options.mtp.enabled) {
+        const auto& mtp = options.mtp;
+        std::cerr << "MTP runtime budget: requested=" << mtp.runtime_bytes
+            << " effective=" << strix::mtp_payload::runtime_budget(model,options.context_tokens,mtp.runtime_bytes,mtp.runtime_automatic)
+            << " source=" << (mtp.runtime_automatic ? "automatic-bundle" : "explicit") << '\n';
+    }
     std::optional<strix::qwen_pp::PairPolicy> pair_policy;
     if (strix::qwen_pp::pipe_enabled())
         pair_policy = strix::qwen_pp::resolve_pair_policy(options.tokens.size(),
             strix::qwen_pp::decode_enabled() ? strix::qwen_pp::PairExecution::handoff :
-                                             strix::qwen_pp::PairExecution::prefill_only);
+                                             strix::qwen_pp::PairExecution::prefill_only, options.baseline);
     {
         // Shared route receipt: the prefill route this entry point resolved (the CLI and the HTTP server resolve
         // differently from the same switches), requested vs effective, with the selector's own reason text.
@@ -1764,8 +1779,11 @@ static int run_decode_entry(
             rr::lever("qwen.prefill_tile", "auto", "fallback", rr::Reason::no_match, true, effective.tile_fallback);
     }
     // Export only after the resolved route has admitted the profile proposals.
-    strix::qwen::profile::withdraw_declined(options.product_profile);
-    strix::qwen::profile::apply(options.product_profile);
+    // --print-effective-config always prints and exits: it must not write the process environment.
+    if (!options.print_effective_config) {
+        strix::qwen::profile::withdraw_declined(options.product_profile);
+        strix::qwen::profile::apply(options.product_profile);
+    }
     for (const auto& notice : options.product_profile.notices()) std::cerr << notice << '\n';
 #if defined(STRIX_MTP_MODEL_QUALIFICATION_RUNNER)
     strix::tests::set_mtp_product_profile(options.product_profile);
@@ -2686,6 +2704,18 @@ static int run_decode_entry(
         auto views = shared_model_inventory.pinned_views;
         views.insert(views.end(), inventory.pinned_views.begin(), inventory.pinned_views.end());
         shared_model_inventory = strix::build_uma_owner_inventory(views);
+    }
+    // TURBO+ onfly INT4 g64 copies of the dense decode projections (--turbo-weights onfly): after the router copy, before any kernel plan.
+    const auto onfly_i4_owner = strix::load_hip_qwen_onfly_i4(manifest, model_residency.binding(), options.turbo);
+    if (options.turbo.active()) {
+        const auto inventory = onfly_i4_owner->owner_inventory(onfly_i4_owner);
+        auto views = shared_model_inventory.pinned_views;
+        views.insert(views.end(), inventory.pinned_views.begin(), inventory.pinned_views.end());
+        shared_model_inventory = strix::build_uma_owner_inventory(views);
+        optimization_profile_receipt += onfly_i4_owner->receipt_json();
+        std::cerr << "turbo-weights onfly " << onfly_i4_owner->resolved.identity() << ": " << onfly_i4_owner->copies.size() << " tensors, "
+                  << onfly_i4_owner->source_bytes << " Q8_0 bytes -> " << onfly_i4_owner->copy_bytes << " INT4 bytes in "
+                  << onfly_i4_owner->convert_seconds << " s (" << strix::onfly_i4::groups_text(options.turbo.groups) << ")\n";
     }
     optimization_profile_receipt += "  \"qwen_router_bf16_enabled\":" + std::string(options.qwen_router_bf16 ? "true" : "false") + ",\n" +
         "  \"qwen_router_bf16_bytes\":" + std::to_string(router_bf16_owner->bytes) + ",\n" +
@@ -3788,7 +3818,8 @@ static int run_decode_entry(
             strix::decode_cli::PrefillReservationGrowth mtp_growth;
             if (ple_turn) {
                 const auto& m = options.mtp;
-                mtp_growth = strix::decode_cli::mtp_prefill_reservation({m.sidecar_retained_bytes, m.runtime_bytes,
+                mtp_growth = strix::decode_cli::mtp_prefill_reservation({m.sidecar_retained_bytes,
+                    strix::mtp_payload::runtime_budget(model, options.context_tokens, m.runtime_bytes, m.runtime_automatic),
                     m.target_capture_bytes, m.replay_host_bytes, m.golden_max_bytes, m.window_arena_bytes,
                     m.window_capture_bytes, m.window_checkpoint_bytes, m.window_total_bytes,
                     m.window_rows ? static_cast<std::uint32_t>(m.window_rows_set.empty() ? 1U : m.window_rows_set.size()) : 0U,
@@ -4600,7 +4631,8 @@ static int run_decode_entry(
                 cache_slot_retained=retained;
                 const auto mul=strix::decode_cli::prefill_checked_mul;
                 // Native owner budgets bound the geometry charged in serving.slot_*.
-                cache_slot_native=add(add(options.mtp.runtime_bytes,options.mtp.window_total_bytes),options.mtp.target_capture_bytes);
+                cache_slot_native=add(add(strix::mtp_payload::runtime_budget(model,options.context_tokens,options.mtp.runtime_bytes,options.mtp.runtime_automatic),
+                    options.mtp.window_total_bytes),options.mtp.target_capture_bytes);
                 // Request admission builds taps, draft/greedy heads and scratch.
                 // Keep all of them unpaid even when the lane's native owners exist.
                 const auto width=mul(mul(model.hidden_size,model.hc_count),2U);
@@ -4726,7 +4758,8 @@ static int run_decode_entry(
                 cache_ready_commitment=strix::decode_cli::cache_unpaid_slot_bytes(
                     *cache_slot_retained,*cache_slot_native,cache_prompt_transient,batch_slots,eager_slots,eager_slots);
             } else {
-                auto future=prefill_checked_add(options.mtp.runtime_bytes,options.mtp.window_total_bytes);
+                auto future=prefill_checked_add(strix::mtp_payload::runtime_budget(model,options.context_tokens,
+                    options.mtp.runtime_bytes,options.mtp.runtime_automatic),options.mtp.window_total_bytes);
                 future=prefill_checked_add(future,options.mtp.target_capture_bytes);
                 const auto resident_native=future;
                 const auto width=prefill_checked_mul(prefill_checked_mul(model.hidden_size,model.hc_count),2);
@@ -5844,9 +5877,37 @@ static int run_decode_entry(
             auto pair_link = deployment.pair_link
                 ? std::make_unique<strix::qwen_pp::PairTransport>(std::move(deployment.pair_link))
                 : std::make_unique<strix::qwen_pp::PairTransport>(pair_rank);
+            // The cursor's own cold plan fixes the frames: a remainder below T runs as a merged partial block plus
+            // tail blocks, so ceil(P / T) frames would leave the producer filling slots the consumer never reads.
+            const auto pair_req = [&] {
+                strix::KnownPromptChunkRequest r;
+                r.prompt_tokens = std::span<const std::uint32_t>(options.tokens).first(static_cast<std::size_t>(pair_prompt_size));
+                r.start_position = session.next_position;
+                r.vocab_size = request.vocab_size; r.context_capacity = request.context_capacity;
+                r.max_new_tokens = request.max_new_tokens; r.eos_token_id = request.eos_token_id;
+                r.logical_rows = options.known_prefix_prefill_rows ? options.known_prefix_prefill_rows : options.known_prefix_rows;
+                r.tiled_prefill = true;
+                r.output_policy = options.known_prefix_output_policy;
+                r.all_row_heads = false;
+                r.schedule_extensions = true;
+                r.schedule_defer = strix::qpf2k::cli_sched_defers(false);
+                r.ladder_tail_rows = options.known_prefix_ladder_tail_rows;
+                return r;
+            }();
+            const auto pair_plan = [&] {
+                strix::KnownPromptChunkCursor planner(pair_req, *known_prefix_backend, backend);
+                for (auto& tail : known_tail_backends) planner.set_tail_backend(*tail);
+                return strix::known_prompt_pipeline_plan(planner.cold_plan());
+            }();
+            if (!pair_plan.units || pair_plan.serial_rows || pair_plan.rows != pair_prompt_size)
+                throw std::invalid_argument("pair prefill plan has " + std::to_string(pair_plan.serial_rows) +
+                    " serial rows in the pipelined " + std::to_string(pair_prompt_size) + "-row prefix (no seam for a serial row; "
+                    "the tail owners must cover the remainder on the 16-row grain)");
+            std::fprintf(stderr, "qwen-pair plan frames=%llu rows=%llu last-frame-rows=%llu\n",
+                static_cast<unsigned long long>(pair_plan.units), static_cast<unsigned long long>(pair_plan.rows),
+                static_cast<unsigned long long>(pair_plan.unit_rows.back()));
             strix::dist::PipelineTimeline pair_timeline("qwen-prefill", pair_rank, strix::qwen_pp::pair_timing_columns());
-            strix::qwen_pp::Pipe pair_pipe(pair_rank,
-                (pair_prompt_size + known_prefill_plan->logical_rows - 1U) / known_prefill_plan->logical_rows,
+            strix::qwen_pp::Pipe pair_pipe(pair_rank, pair_plan.units,
                 [&](std::span<const std::byte> data) { pair_link->send(data); },
                 [&](std::span<std::byte> data) { pair_link->receive(data); },
                 [&] { pair_link->abort("pair prefill stopped"); }, pair_prediction.stage(),
@@ -5865,31 +5926,23 @@ static int run_decode_entry(
             pair_context.identity ^= compiled.execution_identity ^ known_prefill_plan->prefill_kernel_plan_identity;
             for (const char pair_byte : strix::model_content_identity_hex(mapped.file_sha256()))
                 pair_context.identity = (pair_context.identity ^ static_cast<unsigned char>(pair_byte)) * 1099511628211ULL;
+            // Both ranks must run the same units: a differing plan fails at the first seam header, not as a hang.
+            pair_context.identity = (pair_context.identity ^ pair_plan.identity) * 1099511628211ULL;
             struct PairContextReset {
                 ~PairContextReset() { strix::qwen_pp::pipe_context = {}; }
             } pair_reset;
             const auto pair_start = std::chrono::steady_clock::now();
             std::vector<float> pair_final_logits;
             {   // drive the chunks through the normal cursor/backend (session handoff), not the raw owner
-                strix::KnownPromptChunkRequest pair_req;
-                pair_req.prompt_tokens = std::span<const std::uint32_t>(options.tokens).first(static_cast<std::size_t>(pair_prompt_size));
-                pair_req.start_position = session.next_position;
-                pair_req.vocab_size = request.vocab_size; pair_req.context_capacity = request.context_capacity;
-                pair_req.max_new_tokens = request.max_new_tokens; pair_req.eos_token_id = request.eos_token_id;
-                pair_req.logical_rows = options.known_prefix_prefill_rows ? options.known_prefix_prefill_rows : options.known_prefix_rows;
-                pair_req.tiled_prefill = true;
-                pair_req.output_policy = options.known_prefix_output_policy;
-                pair_req.all_row_heads = false;
-                pair_req.schedule_extensions = true;
-                pair_req.schedule_defer = strix::qpf2k::cli_sched_defers(false);
-                pair_req.ladder_tail_rows = options.known_prefix_ladder_tail_rows;
                 strix::KnownPromptChunkCursor pair_chunks(pair_req, *known_prefix_backend, backend);
                 for (auto& tail : known_tail_backends) pair_chunks.set_tail_backend(*tail);
                 std::size_t pair_position = 0;
                 for (;;) {
                     const auto pair_chunk_start = std::chrono::steady_clock::now();
                     if (!pair_chunks.advance()) break;
-                    const auto pair_rows = std::min<std::size_t>(known_prefill_plan->logical_rows, static_cast<std::size_t>(pair_prompt_size) - pair_position);
+                    const auto pair_rows = static_cast<std::size_t>(pair_chunks.last_unit().end - pair_chunks.last_unit().begin);
+                    if (pair_context.sequence >= pair_plan.units || pair_rows != pair_plan.unit_rows[pair_context.sequence])
+                        throw std::logic_error("pair prefill cursor left its cold plan");
                     if (pair_rank == 1U) pair_pipe.release(pair_context.sequence);
                     if (pair_timeline.enabled()) {
                         const auto pair_chunk_end = std::chrono::steady_clock::now();

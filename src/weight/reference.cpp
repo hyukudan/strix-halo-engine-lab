@@ -35,46 +35,49 @@ Status required(const WeightView& view,std::string_view name,Scalar scalar,Shape
  for(unsigned i=0;i<shape.rank;++i) if(result->shape.dims[i]!=shape.dims[i]) return {Error::malformed,"sidecar shape: "+std::string(name)};
  return {Error::ok,{}};
 }
-Status validate_special(const WeightView& view) {
+Status validate_special(const WeightView& view,bool scan_values) {
+ const auto inspect=[&](const Slice& slice,std::size_t stride,auto predicate) {return scan_values?scan(slice,stride,predicate):Status{Error::ok,{}};};
  const auto name=view.storage.name;
  const auto width=view.shape.dims[view.shape.rank-1],rows=view.shape.rank==2?view.shape.dims[0]:1;
  const NamedSlice* part=nullptr; Status status{Error::ok,{}};
  if(name=="image.cb4") {
   status=required(view,"codebook",Scalar::s8,{{16,0,0,0},1},part); if(!status) return status;
+  if(scan_values) {
   std::vector<Byte> bytes; status=read(part->data,bytes); if(!status) return status;
   for(unsigned i=1;i<16;++i) if(static_cast<std::int8_t>(std::to_integer<unsigned char>(bytes[i]))<
      static_cast<std::int8_t>(std::to_integer<unsigned char>(bytes[i-1]))) return {Error::malformed,"CB4 codebook order"};
+  }
  }
  if(name.starts_with("image.") && name!="image.q6p32" && !view.parameters.transform.empty() &&
     view.parameters.transform!="planar" && view.parameters.transform!="interleaved") return {Error::malformed,"unknown packed layout"};
  if(name=="block.e4m3-e8m0.32x32") {
   status=required(view,"block_scales",Scalar::e8m0,{{rows/32,width/32,0,0},2},part); if(!status) return status;
-  status=scan(part->data,1,[](const Byte* p) { auto e=std::to_integer<unsigned>(*p); return e>=ds41::fp8_min_exponent && e<=ds41::fp8_max_exponent; }); if(!status) return status;
-  return scan(view.payload,1,[](const Byte* p) { return (std::to_integer<unsigned>(*p)&127)!=127; });
+  status=inspect(part->data,1,[](const Byte* p) { auto e=std::to_integer<unsigned>(*p); return e>=ds41::fp8_min_exponent && e<=ds41::fp8_max_exponent; }); if(!status) return status;
+  return inspect(view.payload,1,[](const Byte* p) { return (std::to_integer<unsigned>(*p)&127)!=127; });
  }
  if(name=="nvidia.nvfp4") {
   if(view.shape.rank!=2 || width%64) return {Error::unsupported_shape,"NVFP4 requires matrix K multiple of 64"};
   status=required(view,"block_scales",Scalar::e4m3fn,{{rows,width/16,0,0},2},part); if(!status) return status;
-  status=scan(part->data,1,[](const Byte* p) { return std::to_integer<unsigned>(*p)<127; }); if(!status) return status;
+  status=inspect(part->data,1,[](const Byte* p) { return std::to_integer<unsigned>(*p)<127; }); if(!status) return status;
   status=required(view,"tensor_scale",Scalar::f32,{{1,0,0,0},1},part); if(!status) return status;
-  return scan(part->data,4,[](const Byte* p) { float x=0; std::memcpy(&x,p,4); return std::isfinite(x) && x>0; });
+  return inspect(part->data,4,[](const Byte* p) { float x=0; std::memcpy(&x,p,4); return std::isfinite(x) && x>0; });
  }
  if(name.starts_with("linear.")) {
   if(view.shape.rank!=2 || width%256 || view.parameters.transform!="convrot256") return {Error::unsupported_shape,"channel quant requires K multiple of 256 and convrot256"};
   status=required(view,"channel_scales",Scalar::f32,{{rows,0,0,0},1},part); if(!status) return status;
-  status=scan(part->data,4,finite_f32); if(!status) return status;
+  status=inspect(part->data,4,finite_f32); if(!status) return status;
   if(name=="linear.w4a8-grouped") {
    const auto group=view.parameters.group_size;
    if(!group || width%group) return {Error::unsupported_shape,"W4A8 group does not divide K"};
    const auto* scale=sidecar(view,"group_scales");
    if(!scale || (scale->scalar!=Scalar::e4m3fn && scale->scalar!=Scalar::f32)) return {Error::malformed,"W4A8 group scale dtype"};
    status=required(view,"group_scales",scale->scalar,{{rows,width/group,0,0},2},part); if(!status) return status;
-   if(part->scalar==Scalar::f32) status=scan(part->data,4,nonnegative_f32);
-   else status=scan(part->data,1,[](const Byte* p) { const auto code=std::to_integer<unsigned>(*p); return code<127 || code==128; });
+   if(part->scalar==Scalar::f32) status=inspect(part->data,4,nonnegative_f32);
+   else status=inspect(part->data,1,[](const Byte* p) { const auto code=std::to_integer<unsigned>(*p); return code<127 || code==128; });
    if(!status) return status;
    if(sidecar(view,"codebook")) {
     status=required(view,"codebook",Scalar::f32,{{16,0,0,0},1},part); if(!status) return status;
-    status=scan(part->data,4,finite_f32); if(!status) return status;
+    status=inspect(part->data,4,finite_f32); if(!status) return status;
    }
   }
  }
@@ -82,17 +85,17 @@ Status validate_special(const WeightView& view) {
   if(view.shape.rank!=2 || width%128 || rows%128 || view.parameters.transform!="hadamard128") return {Error::unsupported_shape,"EXL3 requires declared H128 transform geometry"};
   if(name=="exl3.mul1.tiles16") {
    status=required(view,"codebook_marker",Scalar::i32,{{1,0,0,0},1},part); if(!status) return status;
-   status=scan(part->data,4,[](const Byte* p) {
+   status=inspect(part->data,4,[](const Byte* p) {
     return std::to_integer<unsigned>(p[0])==0x2d && std::to_integer<unsigned>(p[1])==0xd1 &&
            std::to_integer<unsigned>(p[2])==0xdc && std::to_integer<unsigned>(p[3])==0x83;
    }); if(!status) return status;
    status=required(view,"input_scale",Scalar::f16,{{width,0,0,0},1},part); if(!status) return status;
-   status=scan(part->data,2,finite_half); if(!status) return status;
+   status=inspect(part->data,2,finite_half); if(!status) return status;
    status=required(view,"output_scale",Scalar::f16,{{rows,0,0,0},1},part); if(!status) return status;
-   return scan(part->data,2,finite_half);
+   return inspect(part->data,2,finite_half);
   }
   auto scales=view.payload; scales.range.bytes=2*(width+rows);
-  return scan(scales,2,finite_half);
+  return inspect(scales,2,finite_half);
  }
  return status;
 }
@@ -127,7 +130,7 @@ Status unavailable(const WeightView&,const DecodeRequest&,DecodeBuffer& out) {
 Status no_group(const WeightView&,std::uint64_t,SignedGroup32&) {
  return {Error::unsupported_arithmetic,"storage has no signed group32 operand contract"};
 }
-Status validate(const WeightView& view) {
+Status validate_impl(const WeightView& view,bool scan_values) {
  std::uint64_t count=0; auto status=elements(view.shape,count); if(!status) return status;
  const auto* format=find_format(builtin_registry(),view.storage);
  if(!format) return {Error::unknown_format,"unregistered storage identity"};
@@ -183,8 +186,11 @@ Status validate(const WeightView& view) {
     return {Error::malformed,"sidecar scalar byte length"};
    status=range_valid(part.data); if(!status) return status;
  }
- return validate_special(view);
+ return validate_special(view,scan_values);
 }
+Status validate(const WeightView& view){return validate_impl(view,true);}
+Status validate_metadata(const WeightView& view){return validate_impl(view,false);}
+
 CostDescriptor cost(const WeightView& view,ImageId) {
  std::uint64_t count=0;
  if(!elements(view.shape,count)) return {};
