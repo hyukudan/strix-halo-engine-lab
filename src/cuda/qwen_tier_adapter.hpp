@@ -206,11 +206,18 @@ public:
         upload_ms_ += std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
     }
 
+    // Highest position written by any session so far (receipt: context actually filled).
+    void note_context(std::uint64_t filled) {
+        const std::lock_guard<std::mutex> lock(mu_);
+        if (filled > context_filled_) context_filled_ = filled;
+    }
+
     [[nodiscard]] residency::Receipt receipt() const {
         const std::lock_guard<std::mutex> lock(mu_);
         auto r = planner_->receipt();
         r.cpu_ms = worker_->stats().cpu_ms;
         r.upload_ms = upload_ms_;
+        r.context_filled = static_cast<std::uint32_t>(context_filled_);
         return r;
     }
     [[nodiscard]] std::string receipt_json() const {
@@ -284,6 +291,7 @@ private:
     cudaEvent_t event_ = nullptr;
     bool seeded_ = false;
     double upload_ms_ = 0;
+    std::uint64_t context_filled_ = 0;
     mutable std::mutex mu_;
 };
 

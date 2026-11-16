@@ -117,7 +117,7 @@ void test_resolve() {
         Decision d = resolve(o, m, {96 * GiB, 96 * GiB}, sessions(), {60 * GiB});
         REQUIRE(!d.ok && has(d.error, "host RAM"));
         ModelBytes m2 = m;
-        m2.host_tables = 40 * GiB;
+        m2.host_tables = 108 * GiB;  // gate = non-resident experts + host tables + 4 GiB > 110 GiB available
         Decision d2 = resolve(o, m2, {96 * GiB, 96 * GiB}, sessions(), {110 * GiB});
         REQUIRE(!d2.ok);
         Decision d3 = resolve(o, m, {96 * GiB, 96 * GiB}, sessions(), {110 * GiB});

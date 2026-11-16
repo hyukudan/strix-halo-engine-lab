@@ -339,7 +339,8 @@ struct Prefill::Impl : BlockFields {
     std::unique_ptr<QwenTier> tier;
     std::uint32_t* tier_routes = nullptr;          // tiered: slot routes [cap][kTopK] the routed kernels read
     std::uint64_t engine_bytes = 0;                // device bytes held once loaded (measured)
-    void tier_step_end();                          // between steps (stream synchronized): planner + expert moves
+    void tier_step_end(std::uint64_t filled);      // between steps (stream synchronized): planner + expert moves;
+                                                   // filled = highest position written (receipt: context filled)
     std::FILE* trace_file = nullptr;               // Config::expert_trace (diagnostic)
     std::uint32_t* trace_host = nullptr;          // pinned [layer][rows][top_k]
     std::uint32_t trace_cap = 0, trace_step = 0;
@@ -1061,7 +1062,7 @@ std::string Prefill::describe() const {
         ",\"sidecar_weight_bytes\":" + std::to_string(impl_->mw.bytes) + ",\"single_weight_owner\":true}";
 }
 
-void Prefill::Impl::tier_step_end() { tier->after_step(stream); }
+void Prefill::Impl::tier_step_end(std::uint64_t filled) { tier->note_context(filled); tier->after_step(stream); }
 bool Prefill::tiered() const { return impl_->tier != nullptr; }
 std::string Prefill::residency_json() const { return impl_->plan.json; }
 std::string Prefill::residency_receipt_json() const {
@@ -1610,7 +1611,7 @@ Timing Prefill::run(SessionId session, const std::vector<std::uint32_t>& tokens,
     };
     if (!m.cfg.export_state) {  // decode-only session: nothing leaves the device
         ck(cudaStreamSynchronize(m.stream), "prefill");
-        if (m.tier) m.tier_step_end();
+        if (m.tier) m.tier_step_end(position);
         timing.rows = position;
         timing.total_s = std::chrono::duration<double>(Clock::now() - t0).count();
         S.length = position;
@@ -1629,7 +1630,7 @@ Timing Prefill::run(SessionId session, const std::vector<std::uint32_t>& tokens,
     timing.rows = position;
     S.length = position;
     timing.total_s = std::chrono::duration<double>(Clock::now() - t0).count();
-    if (m.tier) { ck(cudaStreamSynchronize(m.stream), "prefill"); m.tier_step_end(); }
+    if (m.tier) { ck(cudaStreamSynchronize(m.stream), "prefill"); m.tier_step_end(position); }
     return timing;
 }
 
@@ -1801,6 +1802,15 @@ StepResult Prefill::verify(const std::uint32_t* tokens, std::uint32_t rows, std:
     return std::move(r[0]);
 }
 
+namespace {
+// Highest position a cohort window writes (tiered receipt: context actually filled).
+std::uint64_t cohort_high(const std::vector<CohortRows>& cohort) {
+    std::uint64_t h = 0;
+    for (const auto& c : cohort) h = std::max<std::uint64_t>(h, c.position + c.rows);
+    return h;
+}
+}  // namespace
+
 std::vector<StepResult> Prefill::verify_cohort(const std::vector<CohortRows>& cohort, bool want_logits) {
     auto& m = *impl_;
     if (cohort.size() > 1U) qwen_route::require_composition(m.route_policy.enabled, qwen_route::Composition::cohort);
@@ -1956,7 +1966,7 @@ std::vector<StepResult> Prefill::verify_cohort(const std::vector<CohortRows>& co
             ck(cudaMemcpyAsync(logits.data(), m.head_logits, logits.size() * 4, cudaMemcpyDeviceToHost, m.stream), "logits d2h");
         }
         ck(cudaStreamSynchronize(m.stream), "step");
-        if (m.tier) m.tier_step_end();
+        if (m.tier) m.tier_step_end(cohort_high(cohort));
     } catch (...) {
         m.window = false;
         m.qsa_cut = nullptr;
@@ -2306,7 +2316,7 @@ std::uint64_t Prefill::prefill_chunk(SessionId session, const std::vector<std::u
     if (from != 0 && from != S.length) throw std::invalid_argument("prefill chunk does not continue the session");
     const auto rows = m.prefill_enqueue(S, tokens, position, from, max_rows);
     ck(cudaStreamSynchronize(m.stream), "prefill chunk");
-    if (m.tier) m.tier_step_end();
+    if (m.tier) m.tier_step_end(position);
     S.length = from + rows;
     return S.length;
 }
