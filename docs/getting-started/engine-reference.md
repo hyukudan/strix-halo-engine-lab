@@ -100,7 +100,21 @@ ninja -C build strix-hip-decode-token
 
 ## Command line
 
-Qwen accepts `--profile default|fast|quality` for CLI decode, `--http-serve`,
+TURBO (`--profile turbo`, opt-in by name, never a default) is shared by Qwen,
+DS41 pair, GLM pair and MiniMax pair ([turbo.hpp](../../include/strix/turbo.hpp)):
+versioned names `qwen-turbo-v1`, `ds41-turbo-v1`, `glm-turbo-v1`,
+`minimax-turbo-v1`; an empty turbo cell takes the lever's fast cell; every lever
+keeps its own on/off switch (CLI > environment > profile > builtin). The weight
+toggle `--turbo-weights native|onfly|converted` (`--turbo-weight-bits`,
+`--turbo-weights-pack`, or `STRIX_TURBO_WEIGHTS*`) is printed requested/effective
+with its reason, and a request the build cannot load refuses the run. TURBO
+states use their own cache namespace (`STRIX_TURBO_CACHE_NS`, exported by the
+profile) even with every lever off, and ranks must agree on it. MiniMax rank's
+per-phase timing session is now `--timing-profile NAME:PROMPT.u32:STEPS` (the
+old `--profile NAME:PROMPT.u32:STEPS` still works, with a notice). Quality bar:
+`tools/strix-gate/fast_logit_gate.py compare --mode turbo` (see its README).
+
+Qwen accepts `--profile default|fast|quality|turbo` for CLI decode, `--http-serve`,
 MTP and the MTP qualification runner. Omission means `default`: it exports no
 profile switches and preserves the existing exact bundle, output WMMA and
 automatic prefill pair, including their existing admission guards.

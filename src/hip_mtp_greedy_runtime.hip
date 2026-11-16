@@ -1293,9 +1293,11 @@ std::vector<HipMtpGreedyCycleResult> hip_mtp_greedy_cohort_cycle(std::span<const
         const auto before=stats?*stats:HipMtpGreedyCohortStats{};
         std::vector<HipMtpGreedyCycleResult> out;
         if(joint) {
+            // A group's sessions must fit one wide cohort step (every wide launcher's session table).
+            static_assert(kMtpJointGroupLanesMax<=kCohortWideMaxSessions,"joint group wider than a wide cohort step");
             thread_local std::size_t group_start=0;
             // Above the lane bound (fixed two rows each) STRIX_SERVE_JOINT_GROUP_LANES=9..16 lets one group take up to
-            // that many requests (one target forward reads the weights for all); default 8, one forward per eight.
+            // that many requests (one target forward reads the weights for all); default 16 (8 = one forward per eight).
             const auto cap=joint->max_group_lanes(members.size(),group_start);
             const auto groups=mtp_cohort_partition(members.size(),group_start++,cap);
             out.resize(members.size());
