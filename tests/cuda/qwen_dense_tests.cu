@@ -523,7 +523,12 @@ static void bench_shape(std::uint32_t rows, std::uint32_t width, std::uint32_t o
         best = ms < best ? ms : best;
     }
     const double mac = static_cast<double>(rows) * width * outputs;
-    std::printf("bench-shape %u x %u x %u: best %.3f ms, %.1f TOPS (int8, 2 ops/MAC)\n", rows, width, outputs, best, 2.0 * mac / (best * 1e-3) / 1e12);
+    std::vector<std::uint8_t> host(o.n * sizeof(float));
+    CK(cudaMemcpy(host.data(), o.p, host.size(), cudaMemcpyDeviceToHost));
+    std::uint64_t h = 1469598103934665603ULL;   // FNV-1a over the output bytes: byte identity across kernel variants
+    for (const std::uint8_t c : host) h = (h ^ c) * 1099511628211ULL;
+    std::printf("bench-shape %u x %u x %u: best %.3f ms, %.1f TOPS (int8, 2 ops/MAC), out fnv %016llx\n", rows, width, outputs, best,
+                2.0 * mac / (best * 1e-3) / 1e12, static_cast<unsigned long long>(h));
     CK(cudaEventDestroy(a)); CK(cudaEventDestroy(b));
 }
 
