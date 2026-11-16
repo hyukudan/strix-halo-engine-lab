@@ -7,7 +7,7 @@ get_filename_component(WFMT_ROOT "${CMAKE_CURRENT_LIST_DIR}/../.." ABSOLUTE)
 set(STRIX_WFMT_BACKEND "host" CACHE STRING "Weight-format qualification backend")
 include(${WFMT_ROOT}/cmake/StrixWeight.cmake)
 add_executable(strix-wfmt-host-tests main.cpp contracts.cpp census.cpp compare.cpp
-    reference.cpp geometry.cpp fixtures/iq3_s_cases.cpp readers.cpp admission.cpp
+    reference.cpp geometry.cpp fixtures/iq3_s_cases.cpp readers.cpp admission.cpp reference_admission.cpp
     ${WFMT_ROOT}/src/vision/gguf_weights.cpp
     ${WFMT_ROOT}/src/gemma4/model/safetensors.cpp)
 target_link_libraries(strix-wfmt-host-tests PRIVATE strix-weight)
@@ -20,7 +20,7 @@ else()
     target_compile_options(strix-weight PRIVATE -ffp-contract=off)
     target_compile_options(strix-wfmt-host-tests PRIVATE -ffp-contract=off)
 endif()
-foreach(case contracts census compare reference geometry iq3s readers admission)
+foreach(case contracts census compare reference geometry iq3s readers admission strides arithmetic group-reads)
     add_test(NAME wfmt.${case} COMMAND strix-wfmt-host-tests ${case})
 endforeach()
 if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)

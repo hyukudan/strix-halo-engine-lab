@@ -2,17 +2,18 @@
 #include <iostream>
 #include <exception>
 #include <string_view>
-#include <exception>
 int wfmt_census_test();
 bool wfmt_readers_test();
 bool wfmt_admission_test();
 bool wfmt_contracts_test();
 bool wfmt_reference_test();
+bool wfmt_strides_test();
+bool wfmt_arithmetic_test();
+bool wfmt_group_reads_test();
 bool wfmt_geometry_test();
 bool wfmt_iq3s_test();
 bool wfmt_reference_capture(std::string_view);
 int main(int argc, char** argv) try {
-    try {
     if (argc == 3 && std::string_view(argv[1]) == "--wfmt-reference-capture")
         return wfmt_reference_capture(argv[2]) ? 0 : 1;
     if (argc == 5 && std::string_view(argv[1]) == "--wfmt-capture" &&
@@ -27,15 +28,15 @@ int main(int argc, char** argv) try {
     else if (name == "admission") ok = wfmt_admission_test();
     else if (name == "compare") ok = strix::weight::test::compare_case();
     else if (name == "reference") ok = wfmt_reference_test();
+    else if (name == "strides") ok = wfmt_strides_test();
+    else if (name == "arithmetic") ok = wfmt_arithmetic_test();
+    else if (name == "group-reads") ok = wfmt_group_reads_test();
     else if (name == "geometry") ok = wfmt_geometry_test();
     else if (name == "iq3s") ok = wfmt_iq3s_test();
     else return 2;
     std::cout << name << (ok ? " PASS\n" : " FAIL\n");
     return ok ? 0 : 1;
-    } catch(const std::exception& error) {
-        std::cerr << "weight-format host test exception: " << error.what() << '\n';
-        return 1;
-    }
+
 }
 
 catch(const std::exception& e) { std::cerr << "wfmt: " << e.what() << "\n"; return 1; }
