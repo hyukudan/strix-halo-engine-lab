@@ -443,6 +443,9 @@ struct Prefill::Impl : BlockFields {
 };
 
 void Prefill::Impl::upload_model() {
+    // Retain admission of the original merged headers. `info` below describes device storage after transcode.
+    admission = qwen_packs::admit_model(cfg.model_gguf);
+    if (!admission.pack) throw std::runtime_error("Qwen weight pack not admitted: " + admission.reason);
     constexpr std::uint64_t kChunk = std::uint64_t{256} << 20;
     std::uint8_t* staging[2] = {nullptr, nullptr};
     ck(cudaMallocHost(&staging[0], kChunk), "pinned staging");
@@ -558,11 +561,8 @@ void Prefill::Impl::upload_model() {
         probe.down_type = lw[l].down_type;
         native_experts = native_experts || moe::native_types(probe);
     }
-    // Shared admission (the same call --print-effective-config makes): the file must be a declared pack, and the pack's
-    // route must be the one the kernels take (A8 experts for the exact product pack, native experts otherwise).
-    admission = qwen_packs::admit_file(info);
-    if (!admission.pack) throw std::runtime_error("Qwen weight pack not admitted: " + admission.reason);
-    if ((admission.pack->arithmetic == "exact") == native_experts)
+    // Validate the route against source admission. FAST dense transcodes may still have A8 experts.
+    if (admission.pack->arithmetic == "exact" && native_experts)
         throw std::logic_error(std::string("Qwen weight pack ") + std::string(admission.pack->id) + " disagrees with the expert route");
     ck(cudaStreamSynchronize(stream), "hc pack");
 }

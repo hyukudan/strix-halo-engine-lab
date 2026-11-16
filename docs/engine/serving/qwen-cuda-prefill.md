@@ -101,5 +101,12 @@ routed experts native IQ) and `qwen38-gguf-native-v1` (any other decodable mix, 
 the pack; `strix-cuda-qwen-serve --print-effective-config --model M --tables T --rope-table R` prints the pack id,
 arithmetic class, route, tensor fingerprint and type census without loading weights, and the engine load runs the
 same admission (the `loaded` receipt carries `weight_pack`, `pack_arithmetic`, `pack_fingerprint`).
+Admission uses original merged headers, before upload changes storage types. Gate/up tensors in each layer must
+share a type. Inspection consumes device options but performs no device discovery or binding.
+The fingerprint identifies the named type/dimension inventory, not weight contents or numerical behavior;
+it hashes host-native integer bytes and is not a portable persistent-cache key. Admission borrows its pack
+declaration, which must outlive the receipt. Host fixtures do not qualify device execution or model fidelity.
 Served prefill by length for any OpenAI-compatible server: `scripts/bench/common/prefill_client.py` (a
-`serve-decode.sh --client-cmd` client; client TTFT and usage.prompt_tokens). `tools/serve_bench.py` reports `peak_1s_tok_s`.
+`serve-decode.sh --client-cmd` client; finite positive client TTFT and measured positive usage.prompt_tokens are
+required). Rows preserve input order without cold/warm labels or length grouping. `tools/serve_bench.py` reports
+`peak_1s_tok_s` only with measured per-chunk token counts; ordinary SSE text plus final usage leaves it null.

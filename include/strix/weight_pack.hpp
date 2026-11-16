@@ -7,6 +7,8 @@
 // the CLI cannot disagree about which pack a file is.
 #pragma once
 
+#include "strix/serve/json.hpp"
+
 #include <algorithm>
 #include <cstdint>
 #include <map>
@@ -33,12 +35,19 @@ struct Tensor {
     std::uint32_t ggml_type = 0;
     std::span<const std::uint64_t> dims;
 };
+// Paired tensor names differ only in these role markers and share one storage decoder.
+struct TypePair {
+    std::string_view first, second;
+};
 struct Admission {
     const Decl* pack = nullptr;  // null: no declared pack admits the file
     std::string reason;          // why each declared pack before the admitted one (or every pack) declined
     std::uint64_t fingerprint = 0;
     std::map<std::uint32_t, std::uint64_t> tensors_by_type;
 };
+// This is an inventory identifier, not a weight-content digest or numerical identity. Integer bytes are
+// host-native, so it is not a portable persistent-cache key. `pack` borrows the declaration's lifetime;
+// declarations (and their strings/rules) must outlive receipts. Unique tensor names are required.
 
 // The parts of a split GGUF ("...-00001-of-00002.gguf"): every part in order; otherwise the file itself.
 inline std::vector<std::string> gguf_parts(const std::string& path) {
@@ -78,7 +87,8 @@ inline std::string refusal(const Decl& d, std::span<const Tensor> tensors) {
     }
     return tensors.empty() ? std::string(d.id) + ": no tensors" : std::string();
 }
-inline Admission admit(std::span<const Decl> family, std::span<const Tensor> tensors) {
+inline Admission admit(std::span<const Decl> family, std::span<const Tensor> tensors,
+                       std::span<const TypePair> same_types = {}) {
     Admission a;
     a.fingerprint = 0xcbf29ce484222325ULL;
     std::vector<const Tensor*> by_name;  // name order: the fingerprint does not depend on how parts were merged
@@ -91,12 +101,53 @@ inline Admission admit(std::span<const Decl> family, std::span<const Tensor> ten
         for (const auto d : t.dims) a.fingerprint = fnv(a.fingerprint, &d, sizeof d);
         ++a.tensors_by_type[t.ggml_type];
     }
+    for (const auto& pair : same_types) {
+        for (const auto& t : tensors) {
+            auto from = pair.first, to = pair.second;
+            auto at = t.name.find(from);
+            if (at == std::string_view::npos) {
+                std::swap(from, to);
+                at = t.name.find(from);
+            }
+            if (at == std::string_view::npos) continue;
+            std::string peer(t.name);
+            peer.replace(at, from.size(), to);
+            const auto it = std::find_if(tensors.begin(), tensors.end(),
+                                         [&](const Tensor& other) { return other.name == peer; });
+            if (it == tensors.end() || it->ggml_type != t.ggml_type) {
+                a.reason = std::string(t.name) + " requires same-type partner " + peer;
+                return a;
+            }
+        }
+    }
     for (const auto& d : family) {
         auto why = refusal(d, tensors);
         if (why.empty()) { a.pack = &d; return a; }  // reason keeps why the packs before it declined
         a.reason += (a.reason.empty() ? "" : "; ") + why;
     }
     return a;
+}
+
+inline std::string hex64(std::uint64_t x) {
+    char b[17];
+    for (int i = 15; i >= 0; --i, x >>= 4U) b[i] = "0123456789abcdef"[x & 15U];
+    b[16] = 0;
+    return b;
+}
+
+inline serve::Json to_json(const Admission& a) {
+    auto out = serve::Json::object();
+    out.set("id", a.pack ? serve::Json(a.pack->id) : serve::Json());
+    if (a.pack) {
+        out.set("arithmetic", a.pack->arithmetic);
+        out.set("route", a.pack->route);
+    }
+    out.set("fingerprint", hex64(a.fingerprint));
+    auto census = serve::Json::object();
+    for (const auto& [type, n] : a.tensors_by_type) census.set(std::to_string(type), n);
+    out.set("tensors_by_type", std::move(census));
+    out.set("declined", a.reason);
+    return out;
 }
 
 }  // namespace strix::weight_pack

@@ -35,14 +35,14 @@ Inv layer(std::uint32_t gate, std::uint32_t up, std::uint32_t down, std::uint32_
 int main() {
     using strix::qwen_packs::admit;
     {
-        const auto inv = layer(t::q4_k, t::q5_k, t::q5_1, t::q8_0, t::q8_0);
+        const auto inv = layer(t::q4_k, t::q4_k, t::q5_1, t::q8_0, t::q8_0);
         const auto a = admit(inv.view());
         check(a.pack && a.pack->id == "qwen38-ud-q4kxl-a8-v1", "product file -> product pack");
         check(a.pack && a.pack->arithmetic == "exact", "product pack is exact");
         check(a.tensors_by_type.at(t::f32) == 2, "census counts types");
     }
     {
-        const auto inv = layer(t::iq3_xxs, t::iq2_s, t::q2_0, t::q6_k, t::bf16);
+        const auto inv = layer(t::iq3_xxs, t::iq3_xxs, t::q2_0, t::q6_k, t::bf16);
         const auto a = admit(inv.view());
         check(a.pack && a.pack->id == "qwen38-gsq-rco-iq3s-v1", "GSQ-RCO IQ file -> gsq pack");
         check(a.pack && a.pack->arithmetic.substr(0, 5) == "fast:", "gsq pack is a FAST class");
@@ -61,11 +61,42 @@ int main() {
         check(a.reason.find("type 99") != std::string::npos, "refusal names the type");
     }
     {
-        auto x = layer(t::iq3_xxs, t::iq2_s, t::q2_0, t::q6_k, t::bf16);
+        auto x = layer(t::iq3_xxs, t::iq3_xxs, t::q2_0, t::q6_k, t::bf16);
         const auto f0 = admit(x.view()).fingerprint;
         check(admit(x.view()).fingerprint == f0, "fingerprint is deterministic");
         x.types[0] = t::iq3_s;
         check(admit(x.view()).fingerprint != f0, "fingerprint follows tensor types");
+    }
+    for (const auto gate : {t::q4_k, t::q5_k, t::iq2_s, t::iq3_xxs, t::iq3_s, t::iq4_xs}) {
+        for (const auto up : {t::q4_k, t::q5_k, t::iq2_s, t::iq3_xxs, t::iq3_s, t::iq4_xs}) {
+            const auto a = admit(layer(gate, up, t::q5_1, t::q8_0, t::q8_0).view());
+            check((a.pack != nullptr) == (gate == up), "gate/up must share storage type, including native IQ");
+        }
+    }
+    {
+        auto inv = layer(t::q4_k, t::q4_k, t::q5_1, t::q6_k, t::q8_0);
+        const auto source = admit(inv.view());
+        check(source.pack && source.pack->arithmetic != "exact", "Q6 dense source is FAST even with A8 experts");
+        auto shuffled = inv.view();
+        std::reverse(shuffled.begin(), shuffled.end());
+        check(admit(shuffled).fingerprint == source.fingerprint, "inventory permutation preserves fingerprint");
+        inv.types[3] = inv.types[4] = t::q8_0;
+        const auto storage = admit(inv.view());
+        check(storage.pack && storage.pack->arithmetic == "exact", "transcoded inventory alone resembles product");
+        check(storage.fingerprint != source.fingerprint, "source fingerprint differs from storage");
+    }
+    {
+        auto inv = layer(t::q4_k, t::q4_k, t::q5_1, t::q8_0, t::q8_0);
+        inv.names[1] = "blk.1.ffn_up_exps.weight";
+        check(!admit(inv.view()).pack, "pairing is per layer, not global");
+    }
+    {
+        auto inv = layer(t::q4_k, t::q4_k, 99U, t::q8_0, t::q8_0);
+        inv.names[2] += "\"\\\t\n";
+        const auto a = admit(inv.view());
+        const auto parsed = strix::serve::parse_json(strix::weight_pack::to_json(a).dump());
+        check(parsed.find("declined")->as_string() == a.reason, "JSON refusal round trips untrusted tensor names");
+        check(parsed.find("id")->is_null(), "refused pack has JSON null id");
     }
     check(admit({}).pack == nullptr, "empty inventory is refused");
     std::printf("weight_pack tests: %s\n", failures ? "FAIL" : "PASS");

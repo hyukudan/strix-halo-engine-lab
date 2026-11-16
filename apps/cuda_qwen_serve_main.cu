@@ -660,26 +660,28 @@ private:
 }  // namespace
 
 int main(int argc, char** argv) {
-    // Start gate: resolves the declared device (--devices FILE, --device-id ID, STRIX_DEVICES, STRIX_DEVICE), refuses an
-    // excluded or undeclared card, restricts the process to the chosen one and prints the "device:" receipt line.
-    strix::device::bind_cuda_main(argc, argv);
     try {
+        // Consume device options without discovering or initializing a device during header-only inspection.
+        const auto device_cli = strix::device::take_command_line(argc, argv);
         const auto o = parse(argc, argv);
         if (o.print_effective_config) {  // the same admission the engine load runs (qwen_packs::admit_file)
             const auto ad = strix::qwen_packs::admit_model(o.engine.model_gguf);
-            std::cout << "{\"model\":\"" << o.engine.model_gguf << "\",\"weight_pack\":";
-            if (ad.pack)
-                std::cout << "{\"id\":\"" << ad.pack->id << "\",\"arithmetic\":\"" << ad.pack->arithmetic
-                          << "\",\"route\":\"" << ad.pack->route << "\"";
-            else
-                std::cout << "{\"id\":null";
-            std::cout << ",\"fingerprint\":\"" << strix::qwen_packs::hex64(ad.fingerprint) << "\",\"tensors_by_type\":{";
-            const char* sep = "";
-            for (const auto& [type, n] : ad.tensors_by_type) { std::cout << sep << '"' << type << "\":" << n; sep = ","; }
-            std::cout << "},\"declined\":\"" << ad.reason << "\"},\"http_slots\":" << o.http_slots
-                      << ",\"max_positions\":" << o.engine.max_positions << ",\"prefix_cache\":"
-                      << (o.prefix.enabled ? "true" : "false") << "}\n";
+            auto config = serve::Json::object();
+            config.set("model", o.engine.model_gguf);
+            config.set("weight_pack", strix::weight_pack::to_json(ad));
+            config.set("http_slots", static_cast<std::uint64_t>(o.http_slots));
+            config.set("max_positions", static_cast<std::uint64_t>(o.engine.max_positions));
+            config.set("prefix_cache", o.prefix.enabled);
+            std::cout << config.dump() << '\n';
             return ad.pack ? 0 : 3;
+        }
+        try {
+            strix::device::Request request;
+            request.select = device_cli.select;
+            strix::device::bind_cuda(std::move(request), device_cli.devices_path);
+        } catch (const std::exception& e) {
+            std::cerr << e.what() << std::endl;
+            return 2;
         }
         std::cerr << "strix-cuda-qwen-serve: loading " << o.engine.model_gguf << std::endl;
         qp::Prefill engine(o.engine);

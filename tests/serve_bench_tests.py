@@ -127,10 +127,27 @@ class Requests(unittest.TestCase):
         self.assertIsNone(sb.request_metrics(self.EVENTS[3])["peak_1s_tok_s"])  # spans < 1 s
 
     def test_peak_1s(self):
-        # 10 chunks in the first 0.5 s, then 4 spread over 1.5 s; 28 tokens = 2 per chunk on average.
+        # Measured two tokens per chunk, not an average inferred from usage.
         times = [0.05 * i for i in range(10)] + [0.9, 1.4, 1.9, 2.4]
-        self.assertAlmostEqual(sb.peak_1s(times, 28), 11 * 2.0)  # window [0, 1) holds 11 chunks
-        self.assertIsNone(sb.peak_1s([0.0, 0.5], 2))
+        self.assertAlmostEqual(sb.peak_1s(times, [2] * len(times)), 11 * 2.0)
+        self.assertIsNone(sb.peak_1s([0.0, 0.5], [1, 1]))
+
+    def test_unequal_chunk_peak_and_missing_counts(self):
+        event = dict(arrival=0, token_times=[0, 0.1, 2], tokens=102, chunk_token_counts=[1, 1, 100])
+        self.assertEqual(sb.request_metrics(event)["peak_1s_tok_s"], 100)
+        self.assertEqual(sb.peak_1s([2, 0, 0.1], [100, 1, 1]), 100)
+        self.assertEqual(sb.peak_1s([0, 0, 1], [3, 4, 5]), 7)
+        event.pop("chunk_token_counts")
+        self.assertIsNone(sb.request_metrics(event)["peak_1s_tok_s"])
+        self.assertIsNone(sb.burst_metrics([event])["peak_1s_tok_s"])
+
+    def test_pooled_peak_uses_each_chunk_count(self):
+        a = dict(arrival=0, token_times=[0, 2], tokens=101, chunk_token_counts=[1, 100])
+        b = dict(arrival=0, token_times=[0.1, 2.1], tokens=12, chunk_token_counts=[2, 10])
+        self.assertEqual(sb.burst_metrics([a, b])["peak_1s_tok_s"], 110)
+        self.assertEqual(sb.burst_metrics([a, dict(b, error="failed")])["peak_1s_tok_s"], 100)
+        b.pop("chunk_token_counts")
+        self.assertIsNone(sb.burst_metrics([a, b])["peak_1s_tok_s"])
 
     def test_burst_metrics(self):
         m = sb.burst_metrics(self.EVENTS)
