@@ -19,6 +19,8 @@ add_library(strix-weight STATIC
     ${STRIX_WEIGHT_ROOT}/src/gguf_reader.cpp
     ${STRIX_WEIGHT_ROOT}/src/iq4_nl.cpp
     ${STRIX_WEIGHT_ROOT}/src/ds41_formats.cpp
+    ${STRIX_WEIGHT_ROOT}/src/ds41_moe.cpp
+    ${STRIX_WEIGHT_ROOT}/src/ds41_expert_tp.cpp
     ${STRIX_WEIGHT_ROOT}/src/ds41_packed.cpp
     ${STRIX_WEIGHT_ROOT}/src/ds41_native_fp8.cpp
     ${STRIX_WEIGHT_ROOT}/src/q6p_registry.cpp
