@@ -405,14 +405,19 @@ int main() try {
     if(!strix::weight::format_geometry(view.storage,view.parameters,view.geometry)) throw std::runtime_error("Q8 source geometry");
     wh::LaunchShape shape{1U,17U,128U,136U,128U,17U,0U};
     const auto* registered=wh::find_source(view.storage,"f16-tile");
-    if(wh::sources().size()!=6U || !registered || !registered->validate(view,shape)) throw std::runtime_error("HIP source registration validation");
+    if(wh::sources().size()!=18U || !registered || !registered->validate(view,shape)) throw std::runtime_error("HIP source registration validation");
     shape.activation_stride=127U;
     if(registered->validate(view,shape)) throw std::runtime_error("HIP source admitted invalid activation stride");
     shape.activation_stride=128U;shape.k=64U;
     if(registered->validate(view,shape)) throw std::runtime_error("HIP F16 source admitted partial stage");
     shape.k=96U;registered=wh::find_source(view.storage,"signed-a8");
     if(!registered || registered->paired_k!=64U || registered->validate(view,shape)) throw std::runtime_error("HIP signed source admitted odd block pair");
-    if(wh::find_source({"gguf.iq3_s",1},"f16-tile")) throw std::runtime_error("unregistered HIP source unexpectedly admitted");
+    if(wh::find_source({"gguf.iq2_xxs",1},"f16-tile")) throw std::runtime_error("unregistered HIP source unexpectedly admitted");
+    const auto* gsq=wh::find_source({"gguf.iq3_s",1},"f16-tile");
+    const auto* gsq_a8=wh::find_source({"gguf.iq3_s",1},"signed-a8");
+    const auto* gsq_pair=wh::find_source({"gguf.iq4_nl",1},"f16-tile");
+    if(!gsq || !gsq_a8 || !gsq_pair || gsq->paired_k!=0U || gsq_pair->paired_k!=64U || gsq->validate(view,shape))
+        throw std::runtime_error("HIP GSQ source registration");
 #endif
     strided_raw_case();
     context("hip.q8-f16-operands","dense-q8a8-f16-v1@1",{16U,256U},"gguf.q8_0@1");

@@ -1,5 +1,8 @@
 #include "registry.hpp"
 #include "ggml_sources.hpp"
+#include "gsq_sources.hpp"
+#include "gsq_plan.hpp"
+#include "arch/gfx1151_gsq.hpp"
 #include "strix/weight/registry.hpp"
 #include "strix/weight/host_q8.hpp"
 #include <limits>
@@ -36,6 +39,19 @@ Status Q6SignedSource::validate(const WeightView& w,const LaunchShape& s) {
     if(s.k%64U || s.row_stride_bytes%4U) return {Error::unsupported_shape,"HIP signed-A8 planar source requires even whole-dword block pairs"};
     return {Error::ok,{}};
 }
+// GSQ (IQ* / Q2_0) sources: whole 32-weight groups addressed by row; the geometry is the shared semantic one.
+template<std::uint32_t T,class Arch>
+Status OperandSource<GsqTag<T>,SignedA8Tag,Arch,GsqA8Arithmetic>::validate(const WeightView& w,const LaunchShape& s) {
+    return shape(w,s,::strix::weight::gguf_format(T),block_elements,block_bytes,block_bytes);
+}
+template<std::uint32_t T,class Arch>
+Status OperandSource<GsqTag<T>,F16TileTag,Arch,GsqF16Arithmetic>::validate(const WeightView& w,const LaunchShape& s) {
+    constexpr auto be=::strix::gsq_a8::block_elements(T),bb=::strix::gsq_a8::block_bytes(T);
+    auto status=shape(w,s,::strix::weight::gguf_format(T),be,bb,bb);
+    if(!status) return status;
+    return gsq_f16_launch(w,s,T);
+}
+#define STRIX_GSQ_REGISTER(NAME,TYPE,PAIR)     {{NAME,1},"signed-a8","gsq-a8-groups",32,2,0,0,false,false,GsqSignedSource<TYPE>::validate},     {{NAME,1},"f16-tile","gsq-f16-groups",32,4,64,PAIR,false,false,GsqF16Source<TYPE,GsqGfx1151>::validate}
 std::span<const SourceRegistration> sources() noexcept {
     static const SourceRegistration table[]={
         {{"plain.f16",1},"f16-tile","existing-f16-core",1,2,64,0,false,false,RawF16Source::validate},
@@ -43,10 +59,17 @@ std::span<const SourceRegistration> sources() noexcept {
         {{"gguf.q8_0",1},"native-scalar","existing-row-site",32,2,0,0,false,false,Q8RowsSource::validate},
         {{"image.q6p32",1},"native-scalar","existing-row-site",32,2,0,0,false,false,Q6RowsSource::validate},
         {{"gguf.q8_0",1},"signed-a8","existing-block-chain",32,4,0,64,false,false,Q8SignedSource::validate},
-        {{"image.q6p32",1},"signed-a8","existing-block-chain",32,4,0,64,false,false,Q6SignedSource::validate}
+        {{"image.q6p32",1},"signed-a8","existing-block-chain",32,4,0,64,false,false,Q6SignedSource::validate},
+        STRIX_GSQ_REGISTER("gguf.iq3_s",::strix::gsq_a8::type_iq3_s,0),
+        STRIX_GSQ_REGISTER("gguf.iq3_xxs",::strix::gsq_a8::type_iq3_xxs,0),
+        STRIX_GSQ_REGISTER("gguf.iq2_s",::strix::gsq_a8::type_iq2_s,0),
+        STRIX_GSQ_REGISTER("gguf.iq4_xs",::strix::gsq_a8::type_iq4_xs,0),
+        STRIX_GSQ_REGISTER("gguf.iq4_nl",::strix::gsq_a8::type_iq4_nl,64),
+        STRIX_GSQ_REGISTER("gguf.q2_0.strix",::strix::gsq_a8::type_q2_0,128)
     };
     return table;
 }
+#undef STRIX_GSQ_REGISTER
 const SourceRegistration* find_source(FormatId storage,std::string_view protocol) noexcept {
     for(const auto& s:sources()) if(s.storage==storage && s.protocol==protocol) return &s;
     return nullptr;
