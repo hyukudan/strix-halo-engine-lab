@@ -56,6 +56,17 @@ void route_mode_checks() {
     const auto short_fixed = resolve_pair_route(6144, 8192, nullptr, nullptr, {}, false, true,
         PairExecution::prefill_only);
     require(short_fixed.route.prefix == 6144U && short_fixed.chunk.rows == 4096U && short_fixed.chunks == 2U);
+    // Prefill-only runs the whole prompt: a length-model chunk must leave a full-prompt tail the pipe accepts
+    // (10,248 tokens: 2,048 rows would leave an 8-row tail; 4,096 leaves 2,056).
+    const auto tail = resolve_pair_route(10248, 8192, nullptr, nullptr, {}, true, true,
+        PairExecution::prefill_only);
+    require(tail.route.prefix == 10248U && valid_chunk(tail.chunk.rows, 10248U));
+    for (std::uint64_t prompt = 8192U; prompt <= 40960U; prompt += 8U) {
+        const auto r = resolve_pair_route(prompt, 8192, nullptr, nullptr, {}, true, true,
+            PairExecution::prefill_only);
+        require(r.route.prefix == prompt);
+        if (std::string_view(r.chunk.reason) == "length-model") require(valid_chunk(r.chunk.rows, prompt));
+    }
 }
 
 struct ScopedPairEnv {
@@ -88,7 +99,7 @@ void policy_inspection_checks() {
         for (const char* tiles : {static_cast<const char*>(nullptr), "0"}) {
             ScopedPairEnv::set(chunk_env.name, chunk);
             ScopedPairEnv::set(tiles_env.name, tiles);
-            const auto policy = resolve_pair_policy(8192, PairExecution::handoff);
+            const auto policy = resolve_pair_policy(8192, PairExecution::handoff, false);
             const auto config = strix::serve::parse_json(inspect_pair_policy("{\"kept\":true}", policy));
             require(config.find("kept") && config.find("kept")->as_bool());
             const auto* pair = config.find("qwen_pair");
@@ -118,7 +129,7 @@ void policy_inspection_checks() {
         ScopedPairEnv::set(tiles_env.name, nullptr);
         ScopedPairEnv::set(name, "invalid");
         bool rejected = false;
-        try { (void)resolve_pair_policy(8192, PairExecution::prefill_only); }
+        try { (void)resolve_pair_policy(8192, PairExecution::prefill_only, false); }
         catch (const std::invalid_argument& error) { rejected = std::string_view(error.what()).find(name) != std::string_view::npos; }
         require(rejected);
     }

@@ -553,6 +553,7 @@ HipMtpGreedyCycleResult HipMtpGreedyRuntime::finish_cycle(const HipMtpTargetHidd
     auto& i=*impl_;require(i.busy && !i.failed,"MTP greedy cycle finish requires a drafted cycle");
     auto is_eos=[&](std::uint32_t t){return std::find(eos.begin(),eos.end(),t)!=eos.end();};
     HipMtpGreedyCycleResult out;
+    out.target_forwards=verified.target_forwards;
     out.final_target=initial;
     out.proposed_candidates=static_cast<std::uint32_t>(i.candidates.size());
     try {
@@ -728,6 +729,7 @@ HipMtpGreedyCycleResult HipMtpGreedyRuntime::cycle(const HipMtpTargetHiddenTicke
         for(std::size_t index=0;;++index) {
             replay.push_back({out.final_target,pending});
             const auto drafts=i.target->token_sampler()?i.mtp->sampled_drafts():std::span<const TokenDraft>{};
+            ++out.target_forwards;
             auto completed=i.target->execute_serial(*i.session,i.resources,*i.dispatcher,pending,
                 index<drafts.size()?&drafts[index]:nullptr,
                 transaction?HipMtpHostRowSelector{[&](auto row){
@@ -1292,7 +1294,10 @@ std::vector<HipMtpGreedyCycleResult> hip_mtp_greedy_cohort_cycle(std::span<const
         std::vector<HipMtpGreedyCycleResult> out;
         if(joint) {
             thread_local std::size_t group_start=0;
-            const auto groups=mtp_cohort_partition(members.size(),group_start++);
+            // Above the lane bound (fixed two rows each) STRIX_SERVE_JOINT_GROUP_LANES=9..16 lets one group take up to
+            // that many requests (one target forward reads the weights for all); default 8, one forward per eight.
+            const auto cap=joint->max_group_lanes(members.size(),group_start);
+            const auto groups=mtp_cohort_partition(members.size(),group_start++,cap);
             out.resize(members.size());
             for(const auto& group:groups) {
                 std::vector<HipMtpGreedyCohortMember> part;
@@ -1424,6 +1429,8 @@ std::vector<HipMtpServeLever> hip_mtp_serve_levers() {
         {"joint_window","STRIX_MTP_BATCH_JOINT",joint || mtp_serve_row_budget_enabled(),joint || mtp_serve_row_budget_enabled()?"1":"0"},
         {"row_budget","STRIX_SERVE_ROW_BUDGET",mtp_serve_row_budget_enabled(),mtp_serve_row_budget_enabled()?"1":"0"},
         {"row_budget_max_lanes","STRIX_SERVE_ROW_BUDGET_MAX_LANES",mtp_serve_row_budget_enabled(),std::to_string(mtp_serve_row_budget_max_lanes())},
+        {"joint_group_lanes","STRIX_SERVE_JOINT_GROUP_LANES",mtp_serve_row_budget_enabled() && mtp_serve_joint_group_lanes(0)!=8U,
+            mtp_serve_joint_group_lanes(0)==mtp_serve_joint_group_lanes(1)?std::to_string(mtp_serve_joint_group_lanes(0)):std::string("ab")},
         {"cycle_pack","STRIX_SERVE_CYCLE_PACK",strix::session::serve_cycle_pack_choice(2).on,strix::session::serve_cycle_pack_choice(2).on?"1":"0"},
     };
 }
