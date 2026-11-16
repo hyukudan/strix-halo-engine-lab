@@ -420,6 +420,36 @@ class MiniMaxFloor(unittest.TestCase):
             want = sum(comb(20, j) * 0.6 ** j * 0.4 ** (20 - j) for j in range(w, 21))
             self.assertAlmostEqual(g.binom_sf(w, 20, 0.6), want, places=12)
 
+    def test_witness_index_proj_member(self):
+        """minimax.index_proj_wmma joins the FAST layer set (union); absent lever = off; its switches are FAST-only."""
+        def run(fast, idx, evidence=True, event_rank=0, event_tokens=16, event_layers=None):
+            doc = json.loads(self.receipt(0, fast)[len("strix-route-receipt "):])
+            if idx is not None:
+                doc["levers"].append({"name": "minimax.index_proj_wmma", "requested": "1", "effective": idx, "reason": "selected"})
+                doc["switches"]["set"]["STRIX_MM_PF_IDX_WMMA"] = "1"
+            log = "strix-route-receipt " + json.dumps(doc)
+            digest = g.token_fnv1a64(bytes(64))
+            if evidence and idx and idx.startswith("1:layers="):
+                log += (f"\nminimax-index-proj-executed rank {event_rank} tokens {event_tokens} token_fnv {digest} layers " +
+                        (event_layers if event_layers is not None else idx[len("1:layers="):]))
+            return g.minimax_execution(log.encode(), 0, {"p": {"tokens": 16, "tokens_fnv1a64": digest}})
+        on = "1:layers=" + "".join("1" if 40 <= L else "0" for L in range(60))
+        both = run((11, 40), on)
+        self.assertEqual(both["fast"], {"policy": "msa-flash+index-proj", "msa_flash_mode": 11, "layers": list(range(40, 60))})
+        self.assertEqual(both["profile"], "fast-prefill")
+        alone = run(None, "1:layers=" + "".join("1" if 30 <= L else "0" for L in range(60)))
+        self.assertEqual(alone["fast"], {"policy": "index-proj", "msa_flash_mode": 10, "layers": list(range(30, 60))})
+        self.assertEqual(run((11, 40), "0")["fast"]["policy"], "msa-flash")
+        self.assertIsNone(run(None, None)["fast"])
+        for bad in ("1", "1:layers=" + "0" * 60, "2:layers=1"):
+            with self.assertRaises(g.GateError):
+                run(None, bad)
+        self.assertIsNone(g.config_difference(run((11, 40), None)["config"], both["config"]))
+        for kwargs in ({"evidence": False}, {"event_rank": 1}, {"event_tokens": 8}, {"event_tokens": 17},
+                       {"event_layers": "0" * 60}):
+            with self.subTest(kwargs=kwargs), self.assertRaises(g.GateError):
+                run(None, on, **kwargs)
+
     def test_witness_producer(self):
         e, _ = self.mm_arm("e", self.ref)
         n, _ = self.mm_arm("n", self.noisy(0.1, 1), control=(30, 2))
@@ -558,6 +588,21 @@ class MiniMaxFloor(unittest.TestCase):
         self.assertEqual(rc, 0 if p["pass"] else 1)
         self.assertTrue(p["pass"], [x for x in d["checks"] if not x["pass"]])  # a candidate drawn like the nulls passes
         self.assertEqual(p["abs_pass"], p["kl"] <= 0.02 and p["top1"] >= 0.93 and p["dnll"] <= 0.01)
+
+    def test_floor_without_copy_observations_cannot_pass(self):
+        self.tokens = np.random.default_rng(680).integers(0, sum(MW), MT, dtype=np.int64)
+        self.assertFalse(g.copy_rows(self.tokens, MR).any())
+        self.tokens.astype("<u4").tofile(self.tok)
+        ref, cand, nulls = self.fixture(null_scale=0, cand=self.ref)
+        out = self.root / "no-copy.json"
+        self.assertEqual(self.cmp(ref, cand, nulls, out=out), 1)
+        pooled = json.loads(out.read_text(encoding="utf-8"))["pooled"]
+        self.assertFalse(pooled["pass"])
+        checks = {c["name"]: c for c in pooled["dnll_rule"]["checks"]}
+        self.assertTrue(all(c["pass"] for name, c in checks.items() if name != "copy"))
+        self.assertFalse(checks["copy"]["pass"])
+        self.assertEqual(checks["copy"]["rows"], 0)
+        self.assertEqual(checks["copy"]["reason"], "insufficient copy evidence")
 
     def test_floor_never_tighter_than_absolute(self):
         ref, _ = self.mm_arm("ref", self.ref)

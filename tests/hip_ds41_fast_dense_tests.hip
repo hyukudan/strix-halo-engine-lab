@@ -1,9 +1,11 @@
 // FAST lever ds41-dense-f16-v1 (shared policy core::f16_dense_tall::q8a8, "dense-q8a8-f16-v1"): the dense Q8_0 x A8
 // products in one FP16 WMMA chain against the exact integer products (relative L2 per case) and the time of both.
 // Lines "fd ...": rows in count parts acc | exact ms | fast ms at 128-row CTAs | at 256-row CTAs | rule | rel_l2.
-// --no-timing: one repetition (the ctest form).
+// --no-timing: one repetition (the ctest form). Both modes first check the packed weight decode (all scales x codes) and
+// that every form of the policy gives form 0's bits; --forms [reps [rounds [rows]]] times the forms on DS41 chunk shapes.
 #include "core/f16_dense_q8a8.hpp"
 #include "strix/hip_ds41_layer.hpp"
+#include "hip_ds41_fast_dense_args.hpp"
 
 #include <hip/hip_runtime.h>
 
@@ -100,12 +102,18 @@ bool run(const Case& c, unsigned reps) {
         f.weight = dw.p, f.codes = da.p, f.deltas = dd.p, f.out = scratch.p;
         f.row_bytes = row_bytes, f.in = c.in, f.count = c.count, f.rows = c.rows, f.x_stride = c.in, f.out_stride = c.count;
         std::vector<float> wave8;
+        if (c.parts == 1U && c.rows >= 128U) {  // the library's instantiation (rule form) against form 0, bit for bit
+            q8a8::enqueue(f, nullptr, 0U, 0U);
+            ck(hipDeviceSynchronize(), "form 0 sync");
+            const auto f0 = scratch.down();
+            geometry_equal = std::memcmp(f0.data(), hf.data(), f0.size() * sizeof(float)) == 0;
+        }
         for (unsigned i = 0; i < 2U; ++i) {
             tw[i] = timed([&] { q8a8::enqueue(f, nullptr, i ? 16U : 8U); }, r);
             ck(hipDeviceSynchronize(), "geometry sync");
             const auto result = scratch.down();
             if (i == 0U) wave8 = result;
-            else geometry_equal = std::memcmp(wave8.data(), result.data(), result.size() * sizeof(float)) == 0;
+            else geometry_equal = geometry_equal && std::memcmp(wave8.data(), result.data(), result.size() * sizeof(float)) == 0;
         }
     }
     double num = 0.0, den = 0.0;
@@ -122,11 +130,169 @@ bool run(const Case& c, unsigned reps) {
                 c.in, c.count, c.parts, int(c.acc), te, tf, tw[0], tw[1], q8a8::waves_for(c.rows, c.in), rel, ok ? "ok" : "FAIL");
     return ok;
 }
+
+namespace q8a8 = strix::core::f16_dense_tall::q8a8;
+using U4 = strix::core::f16_dense_tall::U4;
+// The stagers' packed decode (Cols<8, kWPacked>::stage) against the scalar one (Cols<8, 0>::stage) on weights in memory,
+// as the kernel reads them (a check built on register words is not equivalent: the compiler folds their known bits): rows of two Q8_0 blocks, 4 rows per FP16 scale (the 256 code bytes), all 65,536 scales.
+__global__ void stage_decode_check(const std::uint8_t* weight, unsigned* bad) {
+    const unsigned o = blockIdx.x * blockDim.x + threadIdx.x;
+    if (o >= 65536U * 4U) return;
+    q8a8::View v{};
+    v.weight = weight, v.row_bytes = 68U, v.count = 65536U * 4U;
+    U4 ref[8], pk[8];
+    q8a8::Cols<8U, 0U>{v}.stage(o / 16U, o % 16U, 0U, ref);
+    q8a8::Cols<8U, q8a8::kWPacked>{v}.stage(o / 16U, o % 16U, 0U, pk);
+#pragma unroll
+    for (unsigned i = 0; i < 8U; ++i)
+#pragma unroll
+        for (unsigned j = 0; j < 8U; ++j) {
+            const std::uint32_t rb = (ref[i][j / 2U] >> (16U * (j % 2U))) & 0xffffU, pb = (pk[i][j / 2U] >> (16U * (j % 2U))) & 0xffffU;
+            if (rb == pb) continue;
+            atomicAdd(&bad[0], 1U);
+            if ((rb & 0x7fffU) > 0x7c00U && (pb & 0x7fffU) > 0x7c00U) atomicAdd(&bad[1], 1U);
+            atomicMin(&bad[2], (o / 4U) << 8U | (64U * (o % 4U) + 8U * i + j));
+        }
+}
+bool decode_check() {
+    Dev<unsigned> bad(3);
+    bad.up({0U, 0U, ~0U});
+    // the gate: the real stagers on weights read from memory
+    std::vector<std::uint8_t> w(std::size_t{65536U} * 4U * 68U + 64U, 0U);
+    for (std::size_t o = 0; o < 65536U * 4U; ++o)
+        for (unsigned b = 0; b < 2U; ++b) {
+            const std::uint16_t s = static_cast<std::uint16_t>(o / 4U);
+            std::memcpy(&w[o * 68U + 34U * b], &s, 2);
+            for (unsigned i = 0; i < 32U; ++i) w[o * 68U + 34U * b + 2U + i] = static_cast<std::uint8_t>(64U * (o % 4U) + 32U * b + i);
+        }
+    Dev<std::uint8_t> dw(w.size());
+    dw.up(w);
+    hipLaunchKernelGGL(stage_decode_check, dim3(65536U * 4U / 256U), dim3(256), 0, nullptr, dw.p, bad.p);
+    ck(hipGetLastError(), "stage decode check launch");
+    const auto g = bad.down();
+    std::printf("wpack stage decode: %u of 16777216 differ (%u both NaN), first scale 0x%04x code byte 0x%02x %s\n", g[0], g[1],
+                g[0] ? g[2] >> 8U : 0U, g[0] ? g[2] & 255U : 0U, g[0] ? "FAIL" : "ok");
+    return g[0] == 0U;
+}
+
+// Forms of the policy (0, q8a8::kWPacked): each against form 0 bit for bit and, with timing, in ABAB rounds.
+// Shapes: DS41 rank 0 per 1024-row chunk (q_b 1280 -> 32768, o_a 8 groups of 4096 -> 1024, o_b two K parts 4096 -> 5120,
+// q_a 5120 -> 1280, kv 5120 -> 512); `calls` = launches per layer-chunk.
+struct Shape {
+    const char* name;
+    unsigned rows, in, count, parts, calls;
+};
+constexpr unsigned kForms[] = {0U, q8a8::kWPacked};
+constexpr unsigned kFormCount = sizeof(kForms) / sizeof(kForms[0]);
+double chunk_ms[kFormCount] = {};
+
+bool forms(const Shape& c, unsigned reps, unsigned rounds) {
+    const unsigned width = c.in * c.parts, row_bytes = width / 32U * 34U, groups = width / 32U;
+    std::vector<std::uint8_t> w(std::size_t{c.count} * row_bytes + 64U);
+    std::uniform_int_distribution<int> code(-127, 127);
+    std::uniform_real_distribution<float> scale(0.0005F, 0.02F), step(0.002F, 0.05F);
+    for (std::size_t b = 0; b < std::size_t{c.count} * groups; ++b) {
+        const _Float16 d = static_cast<_Float16>(scale(rng));
+        std::memcpy(&w[b * 34U], &d, 2);
+        for (unsigned i = 0; i < 32U; ++i) w[b * 34U + 2U + i] = static_cast<std::uint8_t>(static_cast<std::int8_t>(code(rng)));
+    }
+    std::vector<std::int8_t> a(std::size_t{c.rows} * width);
+    for (auto& x : a) x = static_cast<std::int8_t>(code(rng));
+    std::vector<float> dl(std::size_t{c.rows} * groups);
+    for (auto& x : dl) x = step(rng);
+    Dev<std::uint8_t> dw(w.size());
+    Dev<std::int8_t> da(a.size());
+    Dev<float> dd(dl.size()), base(std::size_t{c.rows} * c.count), out(std::size_t{c.rows} * c.count);
+    dw.up(w), da.up(a), dd.up(dl);
+    q8a8::View f{};
+    f.weight = dw.p, f.codes = da.p, f.deltas = dd.p, f.row_bytes = row_bytes, f.in = c.in, f.count = c.count, f.rows = c.rows;
+    f.x_stride = width, f.out_stride = c.count;
+    f.out = base.p;
+    if (!q8a8::supported(f)) {
+        std::fprintf(stderr, "FAIL unsupported forms shape %s (rows %u)\n", c.name, c.rows);
+        return false;
+    }
+    const auto call = [&](unsigned form, float* y) {
+        f.out = y;
+        q8a8::enqueue_parts(f, c.parts, nullptr, form);
+    };
+    call(0U, base.p);
+    ck(hipDeviceSynchronize(), "form 0");
+    const auto hb = base.down();
+    bool equal = true;
+    for (unsigned k = 1; k < kFormCount; ++k) {
+        ck(hipMemset(out.p, 0xff, out.n * sizeof(float)), "poison");
+        call(kForms[k], out.p);
+        ck(hipDeviceSynchronize(), "form");
+        const auto ho = out.down();
+        const bool eq = std::memcmp(hb.data(), ho.data(), hb.size() * sizeof(float)) == 0;
+        if (!eq) std::printf("fm %s form %u: DIFFERENT bits from form 0\n", c.name, kForms[k]);
+        equal = equal && eq;
+    }
+    if (!rounds) {
+        std::printf("fm %-5s %5u %5u %5u parts %u | forms bit-equal %s\n", c.name, c.rows, width, c.count, c.parts, equal ? "ok" : "FAIL");
+        return equal;
+    }
+    hipEvent_t e0, e1;
+    ck(hipEventCreate(&e0), "event"), ck(hipEventCreate(&e1), "event");
+    const auto timed_ms = [&](auto&& g) {
+        ck(hipEventRecord(e0, nullptr), "record");
+        for (unsigned i = 0; i < reps; ++i) g();
+        ck(hipEventRecord(e1, nullptr), "record");
+        ck(hipEventSynchronize(e1), "event sync");
+        float ms = 0.0F;
+        ck(hipEventElapsedTime(&ms, e0, e1), "elapsed");
+        return double(ms) / reps;
+    };
+    std::vector<double> t[kFormCount];
+    for (unsigned r = 0; r < rounds; ++r)  // strict alternation: every round runs every form once, in the same order
+        for (unsigned k = 0; k < kFormCount; ++k) t[k].push_back(timed_ms([&] { call(kForms[k], out.p); }));
+    const auto median = [](std::vector<double> v) {
+        std::sort(v.begin(), v.end());
+        return v.size() % 2U ? v[v.size() / 2U] : 0.5 * (v[v.size() / 2U - 1U] + v[v.size() / 2U]);
+    };
+    for (unsigned k = 0; k < kFormCount; ++k) {
+        std::vector<double> warm(t[k].begin() + 1, t[k].end()), d;
+        for (unsigned r = 1; r < rounds; ++r) d.push_back(t[k][r] - t[0][r]);
+        const double m = median(warm);
+        chunk_ms[k] += c.calls * m;
+        std::printf("fm %-5s %5u %5u %5u parts %u | form %u | cold %8.4f | warm %8.4f | d %+8.4f (%+.4f..%+.4f) | %s\n", c.name,
+                    c.rows, width, c.count, c.parts, kForms[k], t[k][0], m, k ? median(d) : 0.0,
+                    k ? *std::min_element(d.begin(), d.end()) : 0.0, k ? *std::max_element(d.begin(), d.end()) : 0.0,
+                    equal ? "bits ok" : "BITS FAIL");
+    }
+    (void)hipEventDestroy(e0), (void)hipEventDestroy(e1);
+    return equal;
+}
 }  // namespace
 
 int main(int argc, char** argv) {
+    std::printf("dispatch form %u\n", q8a8::form_for());
+    // --forms [reps [rounds [rows]]]: the forms bench on the DS41 chunk shapes only
+    if (argc > 1 && std::string(argv[1]) == "--forms") {
+        strix::test::DenseFormsArgs args;
+        if (!strix::test::parse_dense_forms_args(argc, argv, args)) {
+            std::fprintf(stderr, "usage: --forms [reps:1..1000 [rounds:2..101 [rows:1..16384]]]\n");
+            return 2;
+        }
+        const auto [reps, rounds, rows] = args;
+        const Shape shapes[] = {{"q_b", rows, 1280, 32768, 1, 1}, {"o_a", rows, 4096, 1024, 1, 8}, {"o_b", rows, 4096, 5120, 2, 1},
+                                {"q_a", rows, 5120, 1280, 1, 1},  {"kv", rows, 5120, 512, 1, 1}};
+        bool ok = decode_check();
+        for (const auto& s : shapes) ok = forms(s, reps, rounds) && ok;
+        for (unsigned k = 0; k < kFormCount; ++k)
+            std::printf("census form %u: %8.3f ms per layer-chunk (d %+7.3f) | x113 layer-chunks (11.6K rank 0) %8.1f ms (d %+6.1f)\n",
+                        kForms[k], chunk_ms[k], chunk_ms[k] - chunk_ms[0], 113.0 * chunk_ms[k], 113.0 * (chunk_ms[k] - chunk_ms[0]));
+        std::printf("%s\n", ok ? "PASS" : "FAIL");
+        return ok ? 0 : 1;
+    }
     const bool timing = !(argc > 1 && std::string(argv[1]) == "--no-timing");
     const unsigned reps = timing ? 20U : 1U;
+    bool ok = decode_check();
+    // every form bit-equal to form 0: partial last tile, two K parts (a16 advances with the codes), a small input
+    const Shape small[] = {{"s1", 256, 1280, 2048, 1, 1}, {"s2", 300, 1024, 1000, 1, 1}, {"s3", 513, 256, 40, 1, 1},
+                           {"s4", 640, 1024, 1024, 2, 1}};
+    for (const auto& s : small) ok = forms(s, 1U, 0U) && ok;
     // q_b-like (in 1024 / 1536, many outputs), o-like (in 4096, two K parts of 4096), partial last tile, accumulate, small
     const Case cases[] = {
         {64, 1024, 512, 1, false},    {128, 1024, 2048, 1, false},  {256, 1024, 2048, 1, false},  {512, 1024, 4096, 1, false},
@@ -134,7 +300,6 @@ int main(int argc, char** argv) {
         {1024, 4096, 1024, 1, false}, {1024, 8192, 1024, 2, false}, {2048, 8192, 1024, 2, false}, {1024, 4096, 4096, 1, false},
         {300, 1024, 1000, 1, false},  {513, 256, 40, 1, false},    {256, 1024, 512, 1, true},
     };
-    bool ok = true;
     for (const auto& c : cases) ok = run(c, reps) && ok;
     strix::ds41::set_fast_dense(-1);
     std::printf("%s\n", ok ? "PASS" : "FAIL");
