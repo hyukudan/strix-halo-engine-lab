@@ -3,6 +3,7 @@
 import argparse
 import hashlib
 import json
+import os
 import pathlib
 import platform
 import shlex
@@ -17,7 +18,7 @@ def main():
     parser.add_argument("--matrix", required=True, type=pathlib.Path)
     parser.add_argument("--out", required=True, type=pathlib.Path)
     parser.add_argument("--source", type=pathlib.Path)
-    parser.add_argument("--adapter", choices=("protocol", "reference", "native", "backend"), default="protocol")
+    parser.add_argument("--adapter", choices=("protocol", "reference", "native", "backend", "hip-transfer"), default="protocol")
     parser.add_argument("--compiler", required=True)
     parser.add_argument("--architecture", required=True)
     parser.add_argument("--flags", default="")
@@ -50,10 +51,14 @@ def main():
             adapter_args = ["--wfmt-reference-capture", str(args.out.resolve())]
         elif args.adapter == "backend":
             adapter_args = ["--wfmt-backend-capture", str(args.out.resolve())]
+        environment = os.environ.copy()
+        if args.adapter == "hip-transfer":
+            adapter_args = []
+            environment["STRIX_WFMT_CAPTURE_DIR"] = str(args.out.resolve())
         command = shlex.split(args.runner) + [str(exe)] + adapter_args + extra
         with (args.out / "capture.log").open("w") as log:
             result = subprocess.run(command, stdout=log, stderr=subprocess.STDOUT,
-                                    timeout=args.timeout, check=False)
+                                    timeout=args.timeout, check=False, env=environment)
         if result.returncode:
             raise ValueError(f"capture adapter exit {result.returncode}")
         if args.adapter != "protocol":

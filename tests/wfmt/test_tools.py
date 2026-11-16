@@ -18,6 +18,7 @@ sys.path.insert(0, str(ROOT / "scripts/bench/wfmt"))
 import capture
 import compare
 import isa
+import matrix_from_records
 import records
 import run
 
@@ -93,6 +94,39 @@ class ToolTests(unittest.TestCase):
         # or inaccessible interpreter executable (e.g. Microsoft Store Python).
         self.exe = self.path / "adapter.bin"
         self.exe.write_bytes(b"wfmt test adapter\n")
+
+    def test_transfer_adapter_uses_environment_and_preserves_test_arguments(self):
+        out = self.path / "transfers"
+        contract = self.path / "transfer-matrix.json"
+        contract.write_text(json.dumps(matrix()))
+        def adapter(command, **kwargs):
+            self.assertEqual(command, [str(self.exe), "gsq"])
+            self.assertEqual(kwargs["env"]["STRIX_WFMT_CAPTURE_DIR"], str(out.resolve()))
+            write_output(out)
+            return subprocess.CompletedProcess(command, 0)
+        with mock.patch.object(capture.subprocess, "run", side_effect=adapter):
+            self.assertEqual(invoke(capture, ["--exe", self.exe, "--matrix", contract,
+                "--out", out, "--compiler", "compiler@1", "--architecture", "gfx1151",
+                "--adapter", "hip-transfer", "--", "gsq"]), 0)
+
+    def test_frozen_transfer_inventory_cannot_be_replaced_or_drift(self):
+        old = self.path / "old"
+        write_output(old)
+        frozen = self.path / "frozen.json"
+        self.assertEqual(invoke(matrix_from_records, ["--baseline", old, "--out", frozen]), 0)
+        original = frozen.read_bytes()
+        self.assertEqual(invoke(matrix_from_records, ["--baseline", old, "--out", frozen]), 1)
+        self.assertEqual(frozen.read_bytes(), original)
+        new = self.path / "new"
+        write_output(new, b"12345")
+        with self.assertRaisesRegex(ValueError, "lengths"):
+            records.validate_inventory(new, records.read_matrix(frozen))
+        damaged = self.path / "damaged"
+        damaged.mkdir()
+        (damaged / "broken.wfmt").write_bytes(b"WFMT")
+        self.assertEqual(invoke(matrix_from_records,
+            ["--baseline", damaged, "--out", self.path / "bad.json"]), 1)
+        self.assertFalse((self.path / "bad.json").exists())
 
     def make_capture(self, name, exit_code=0):
         out = self.path / name
