@@ -559,8 +559,12 @@ void MtpBatchWindowController::observe(std::span<const Request> q,std::span<cons
     costs_[batch_key(rows)].add(target_ms);
     {
         // Measured rule's yield calibration: the model's tokens for the executed rows (before this cycle updates the
-        // histories) against the tokens they delivered (accepted drafts inside the rows + the committed row).
+        // histories) against the tokens they delivered (accepted drafts inside the rows + the committed row). q holds
+        // the complete candidates choose() priced (context rows from external_first on included), so the expectation
+        // and the delivered count describe the same rows. Aged like the topology timing (about the last eight cycles)
+        // so a workload change is not outvoted by the whole history.
         auto& y=yields_[batch_key(rows)];
+        y[0]*=kMtpYieldKeep;y[1]*=kMtpYieldKeep;
         for(std::size_t k=0;k<q.size();++k) {
             const auto r=std::max(rows[k],2U);
             y[0]+=expected(q[k],r,false);
@@ -570,7 +574,8 @@ void MtpBatchWindowController::observe(std::span<const Request> q,std::span<cons
     if(steps && draft_ms>0.0) draft_.add(draft_ms/steps);
     for(std::size_t k=0;k<q.size();++k) {
         auto& h=history_.at(q[k].slot);
-        for(std::size_t d=0;d<q[k].probabilities.size() && d+1U<rows[k] && d<=accepted[k];++d) {
+        // Predictor histories and bins: only predictor drafts (context candidates from external_first on are not).
+        for(std::size_t d=0;d<q[k].probabilities.size() && d<q[k].external_first && d+1U<rows[k] && d<=accepted[k];++d) {
             h.seen[d]+=1.0;if(d<accepted[k]) h.hits[d]+=1.0;
             // Calibration bins (read only by the calibrated rule): every verified predictor draft that was reached.
             const auto b=calibration_bin(std::clamp(static_cast<double>(q[k].probabilities[d]),0.0,1.0));

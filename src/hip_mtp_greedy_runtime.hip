@@ -1217,7 +1217,9 @@ std::vector<HipMtpGreedyCycleResult> joint_cycle(std::span<const HipMtpGreedyCoh
         std::vector<std::uint32_t> accepted;
         std::uint32_t emitted=0;
         for(const auto& r:out) {accepted.push_back(r.accepted_candidates);emitted+=static_cast<std::uint32_t>(r.emitted_tokens.size());}
-        controller.observe(observed,rows,accepted,draft_ms,target_ms,draft_steps);
+        // The complete candidates (context rows included, marked by external_first) as choose() priced them: the yield
+        // calibration compares like with like; observe() updates predictor histories below external_first only.
+        controller.observe(requests,rows,accepted,draft_ms,target_ms,draft_steps);
         if(draft_batch_enabled() && draft_batch_ab()) draft_batch_ab_timing().add(members.size(),draft_ms,draft_ms+target_ms,emitted);
         // STRIX_MTP_BATCH_LOG=2 adds the plan's estimate (of the executed plan, probes included) and per member
         // slot:position:limit:remaining budget:planned rows/predictor steps launched/predictor drafts retained

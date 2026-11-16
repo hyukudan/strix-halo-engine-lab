@@ -134,6 +134,56 @@ int main() {
         }
         for(std::uint32_t i=0;i<8U;++i) placed.reset(i);
         expect(placed.choose(mixed,32)==half,"measured plan places R4 on the accepting lanes");
+        // Audit case (yield calibration vs context candidates): seven lanes, one certain predictor draft and two
+        // certain context drafts each (external_first=1), all accepted in R4. R2 100 ms delivers its 14 tokens, R4
+        // 250 ms delivers 28 = what the complete candidates predict: 14/100 > 28/250, so R2 stays. A predictor-only
+        // expectation (14 for R4) against 28 delivered would inflate R4 to 51.5 tokens and buy it.
+        const std::array<float,3> ext{1,1,1};
+        std::vector<C::Request> seven;
+        for(std::uint32_t i=0;i<7U;++i) {seven.push_back({i,8U,ext});seven.back().external_first=1U;}
+        const std::vector<std::uint32_t> s2(7,2U),s4(7,4U),s1(7,1U),s3(7,3U),s0(7,0U);
+        C context(7,rule);
+        for(int i=0;i<3;++i) {context.observe(seven,s2,s1,0.0,100.0,0U);context.observe(seven,s4,s3,0.0,250.0,0U);}
+        expect(context.choose(seven,32)==s2,"context candidates do not inflate the R4 yield");
+        // The reported failure, reproduced with the old runtime call shape (observe() fed the predictor prefix only).
+        std::vector<C::Request> seven_prefix=seven;
+        for(auto& r:seven_prefix) {r.probabilities=std::span<const float>(ext).first(1);r.external_first=SIZE_MAX;}
+        C truncated(7,rule);
+        for(int i=0;i<3;++i) {truncated.observe(seven_prefix,s2,s1,0.0,100.0,0U);truncated.observe(seven_prefix,s4,s3,0.0,250.0,0U);}
+        expect(truncated.choose(seven,32)==s4,"a predictor-only expectation over-buys R4 (the runtime passes complete candidates)");
+        C context_fast(7,rule);
+        for(int i=0;i<3;++i) {context_fast.observe(seven,s2,s1,0.0,100.0,0U);context_fast.observe(seven,s4,s3,0.0,180.0,0U);}
+        expect(context_fast.choose(seven,32)==s4,"a faster measured R4 with context candidates still wins");
+        // Predictor histories ignore context candidates: observing the complete candidates or the predictor prefix
+        // leaves the same histories (same affine-fit plan for a later predictor-only request).
+        C full(4,C::parse_rule("calibrated")),prefix(4,C::parse_rule("calibrated"));
+        const std::array<float,3> mix{0.9F,0.2F,0.2F};
+        std::vector<C::Request> fq,pq;
+        for(std::uint32_t i=0;i<4U;++i) {
+            fq.push_back({i,8U,mix});fq.back().external_first=1U;
+            pq.push_back({i,8U,std::span<const float>(mix).first(1)});
+        }
+        const std::vector<std::uint32_t> f4(4,4U),f3(4,3U),f1(4,1U);
+        for(int i=0;i<6;++i) {
+            full.observe(fq,f4,f3,1.0,120.0,4U);prefix.observe(pq,f4,f3,1.0,120.0,4U);
+        }
+        // Low-confidence predictor drafts: context candidates counted as accepted 0.2-confidence predictor drafts
+        // would make them look certain and buy deep rows.
+        const std::array<float,7> later{0.2F,0.2F,0.2F,0.2F,0.2F,0.2F,0.2F};
+        std::vector<C::Request> lq;
+        for(std::uint32_t i=0;i<4U;++i) lq.push_back({i,8U,later});
+        expect(full.choose(lq,32)==prefix.choose(lq,32),"context candidates leave predictor histories unchanged");
+        // Estimator lifetime: forty R4 cycles that deliver one token per lane, then the workload changes and R4
+        // delivers its four; the aged calibration follows within sixteen cycles (the whole-history ratio would stay
+        // at ~0.47 and keep R2 at 14/100 against 28*0.47/160).
+        std::vector<C::Request> ctx7;
+        for(std::uint32_t i=0;i<7U;++i) {ctx7.push_back({i,8U,ext});ctx7.back().external_first=0U;}
+        C aged(7,rule);
+        for(int i=0;i<3;++i) aged.observe(ctx7,s2,s1,0.0,100.0,0U);
+        for(int i=0;i<40;++i) aged.observe(ctx7,s4,s0,0.0,160.0,0U);
+        expect(aged.choose(ctx7,32)==s2,"an R4 topology that under-delivers is not bought");
+        for(int i=0;i<16;++i) aged.observe(ctx7,s4,s3,0.0,160.0,0U);
+        expect(aged.choose(ctx7,32)==s4,"the yield calibration ages with the workload");
     }
     for (const std::size_t count : {0U, 1U, 2U, 6U, 7U, 8U, 9U, 16U, 19U, 24U}) {
         for (std::size_t round = 0; round < count + 2U; ++round) {

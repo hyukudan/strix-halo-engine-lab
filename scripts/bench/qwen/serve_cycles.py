@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Per-burst joint MTP cycle table from a served Qwen log (STRIX_MTP_BATCH_LOG=2) and serve_bench results.
 
-Usage: serve_cycles.py --log SRV.ERR --burst NAME:FIRST:LAST:RES.JSON[:EVICTED_MS[:CLOCK_MHZ:BUSY_PCT]] ... [--pairs A,B]
+Usage: serve_cycles.py --log SRV.ERR --burst NAME:FIRST:LAST:RES.JSON[#K][:EVICTED_MS[:CLOCK_MHZ:BUSY_PCT]] ... [--pairs A,B]
 
 FIRST/LAST are the log line numbers (1-based, inclusive) that bracket the burst. For each burst it prints, over the
 joint cycles whose lane count equals the burst's concurrency (the decode window), the cycles, emitted tokens per cycle
@@ -10,6 +10,12 @@ and per lane, cycle ms (draft + target), window tok/s (emitted / cycle ms), the 
 (#R2/#R4/#R8 counts, with each one's mean target ms and emissions), and from the result JSON the steady and
 end-to-end tok/s and the ordered per-request id hashes. --pairs A,B names two arm prefixes: bursts NAME=A<k> and
 B<k> of one concurrency are compared (ids per request, window tok/s, wall tok/s). Only the standard library.
+
+The result burst is the one whose live lanes (min(concurrency, slots)) equal the C of NAME (c<C>-...): exactly one
+must match, or RES.JSON#K names burst K, which must match too; otherwise the run stops (no silent first burst).
+The identity verdict is fail-closed: IDENTICAL only with both arms present, every burst successful (0 failed), the
+same request count everywhere and a complete non-null hash per request; otherwise UNAVAILABLE (reason). With --pairs
+the exit status is 1 unless every compared concurrency is IDENTICAL.
 """
 import argparse
 import collections
@@ -44,7 +50,51 @@ def topo(members):
     return "%d/%d/%d" % tuple(k)
 
 
-def burst_row(name, cyc, res, lanes):
+def live_lanes(burst):
+    slots = burst.get("slots")
+    c = burst.get("concurrency")
+    return min(c, slots) if isinstance(c, int) and isinstance(slots, int) and slots > 0 else c
+
+
+def select_burst(res, lanes, index=None):
+    """The result burst for a log window of `lanes` live lanes; ValueError when absent, ambiguous or mismatched."""
+    bursts = res["bursts"] if isinstance(res, dict) and "bursts" in res else [res]
+    if index is not None:
+        if not 0 <= index < len(bursts):
+            raise ValueError("burst index %d out of range (%d bursts)" % (index, len(bursts)))
+        b = bursts[index]
+        if live_lanes(b) != lanes:
+            raise ValueError("burst %d has %s live lanes, the window has %d" % (index, live_lanes(b), lanes))
+        return b
+    matches = [b for b in bursts if live_lanes(b) == lanes]
+    if len(matches) != 1:
+        raise ValueError("%d bursts with %d live lanes (of %d): name one with RES.JSON#K" % (len(matches), lanes, len(bursts)))
+    return matches[0]
+
+
+def identity_verdict(arm_a, arm_b):
+    """Fail-closed token identity over the bursts (rows) of two arms."""
+    if not arm_a or not arm_b:
+        return "UNAVAILABLE (arm missing)"
+    counts = set()
+    for r in arm_a + arm_b:
+        ids, requests, failed = r.get("ids"), r.get("requests"), r.get("failed")
+        if ids is None or requests is None or failed is None:
+            return "UNAVAILABLE (%s: no result evidence)" % r["name"]
+        if failed != 0:
+            return "UNAVAILABLE (%s: %s failed)" % (r["name"], failed)
+        if not requests or len(ids) != requests:
+            return "UNAVAILABLE (%s: %d hashes for %s requests)" % (r["name"], len(ids), requests)
+        if any(not isinstance(h, str) or not h for h in ids):
+            return "UNAVAILABLE (%s: null hash)" % r["name"]
+        counts.add(requests)
+    if len(counts) != 1:
+        return "UNAVAILABLE (request counts differ: %s)" % sorted(counts)
+    first = arm_a[0]["ids"]
+    return "IDENTICAL" if all(r["ids"] == first for r in arm_a + arm_b) else "DIFFER"
+
+
+def burst_row(name, cyc, res, lanes, index=None):
     window = [c for c in cyc if c["lanes"] == lanes]
     row = dict(name=name, lanes=lanes, cycles=len(window), all_cycles=len(cyc))
     if window:
@@ -64,12 +114,14 @@ def burst_row(name, cyc, res, lanes):
         row["topologies"] = {k: (len(v), statistics.mean(c["target"] for c in v),
                                  statistics.mean(sum(m["emitted"] for m in c["members"]) for c in v))
                              for k, v in sorted(by.items(), key=lambda kv: -len(kv[1]))}
+    row["ids"] = row["requests"] = row["failed"] = None
     if res:
-        b = res["bursts"][0] if "bursts" in res else res
+        b = select_burst(res, lanes, index)
         row["steady_tok_s"] = b["steady"].get("aggregate_tok_s")
         row["e2e_tok_s"] = b["client"].get("end_to_end_tok_s")
         row["ttft_p50_s"] = b["client"].get("ttft_p50_s")
-        row["ids"] = b["client"].get("ids_sha256") or []
+        row["ids"] = b["client"].get("ids_sha256")
+        row["requests"] = b["client"].get("requests")
         row["failed"] = b["client"].get("failed")
     return row
 
@@ -90,13 +142,20 @@ def main():
     for spec in args.burst:
         parts = spec.split(":")
         name, first, last, path = parts[0], int(parts[1]), int(parts[2]), parts[3]
+        index = None
+        if "#" in path:
+            path, k = path.rsplit("#", 1)
+            index = int(k)
         try:
             with open(path) as f:
                 res = json.load(f)
         except (OSError, ValueError):
             res = None
         lanes = int(re.search(r"c(\d+)", name).group(1))
-        row = burst_row(name, cycles(lines[first - 1:last]), res, lanes)
+        try:
+            row = burst_row(name, cycles(lines[first - 1:last]), res, lanes, index)
+        except (ValueError, KeyError, TypeError) as e:
+            raise SystemExit("%s: %s: %s" % (name, path, e))
         row["evicted_ms"] = int(parts[4]) if len(parts) > 4 and parts[4] else None
         row["clock_mhz"] = float(parts[5]) if len(parts) > 5 and parts[5] else None
         row["busy_pct"] = float(parts[6]) if len(parts) > 6 and parts[6] else None
@@ -110,6 +169,7 @@ def main():
             fmt(r.get("cycle_ms")), fmt(r.get("draft_ms")), fmt(r.get("target_ms")), fmt(r.get("rows_per_cycle")),
             fmt(r.get("gap_ms"), 2), fmt(r.get("window_tok_s")), fmt(r.get("steady_tok_s")), fmt(r.get("e2e_tok_s")),
             fmt(r.get("ttft_p50_s"), 2), r["evicted_ms"], fmt(r["clock_mhz"], 0), fmt(r["busy_pct"], 0), tops))
+    ok = True
     if args.pairs:
         a, b = args.pairs.split(",")
         groups = collections.defaultdict(lambda: {a: [], b: []})
@@ -118,8 +178,8 @@ def main():
             if m:
                 groups[int(m.group(1))][m.group(2)].append(r)
         for lanes, g in sorted(groups.items()):
-            ida = [r["ids"] for r in g[a]]
-            same = all(x == ida[0] for x in ida + [r["ids"] for r in g[b]]) if ida else False
+            verdict = identity_verdict(g[a], g[b])
+            ok = ok and verdict == "IDENTICAL"
             clean = all(r["evicted_ms"] == 0 for r in g[a] + g[b])
             def mean(arm, key):
                 vals = [r.get(key) for r in g[arm] if r.get(key) is not None]
@@ -128,8 +188,12 @@ def main():
             delta = lambda x, y: 100.0 * (y / x - 1.0) if x and y else None
             print("C%d %s n=%d/%d: window %s -> %s (%s %%), wall %s -> %s (%s %%), ids %s, evictions %s" % (
                 lanes, "%s->%s" % (a, b), len(g[a]), len(g[b]), fmt(wa), fmt(wb), fmt(delta(wa, wb), 2), fmt(ea), fmt(eb),
-                fmt(delta(ea, eb), 2), "IDENTICAL" if same else "DIFFER", "none" if clean else "PRESENT"))
+                fmt(delta(ea, eb), 2), verdict, "none" if clean else "PRESENT"))
+        if not groups:
+            print("no %s/%s bursts: ids UNAVAILABLE (arm missing)" % (a, b))
+            ok = False
+    return 0 if ok else 1
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

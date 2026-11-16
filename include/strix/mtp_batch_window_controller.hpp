@@ -38,7 +38,13 @@ struct MtpBatchPlanRule {bool pooled=false; bool calibrated=false; std::uint32_t
 // draft-confidence yield over-promises the marginal R2 -> R4 lane there (also with the calibrated acceptance bins:
 // -2.7 %, -3.2 % on clean pairs); 8 (+1.1 %, then +5.5 % with yield calibration, ids identical, but small kfd
 // evictions in every baseline arm: provisional until a clean receipt; STRIX_SERVE_ROW_MEASURED=7,8 turns it on).
+// Qualification boundary: this controller's only consumer is the HIP MTP greedy runtime (served Qwen joint cycle,
+// hip_mtp_greedy_runtime.hip), and the table was measured on that device class only. Another model, backend or device
+// binding this controller starts from 0 (the affine fit) until its own ABAB receipt qualifies a lane count.
 inline constexpr std::uint32_t kMtpRowMeasuredAutoLanes=(1U<<7U);
+// Yield calibration memory: per observed cycle the topology's delivered/predicted totals keep this share (about the
+// last eight cycles, like the topology timing), so a workload change recalibrates instead of being outvoted.
+inline constexpr double kMtpYieldKeep=0.875;
 // The batched decode runs its joint cycle with the budget rule. On by default; STRIX_SERVE_ROW_BUDGET=0 (or the
 // baseline mode) restores the fixed rows-per-request table.
 [[nodiscard]] bool mtp_serve_row_budget_enabled() noexcept;
