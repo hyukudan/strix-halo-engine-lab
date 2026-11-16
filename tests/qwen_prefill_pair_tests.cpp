@@ -99,7 +99,7 @@ void policy_inspection_checks() {
         for (const char* tiles : {static_cast<const char*>(nullptr), "0"}) {
             ScopedPairEnv::set(chunk_env.name, chunk);
             ScopedPairEnv::set(tiles_env.name, tiles);
-            const auto policy = resolve_pair_policy(8192, PairExecution::handoff);
+            const auto policy = resolve_pair_policy(8192, PairExecution::handoff, false);
             const auto config = strix::serve::parse_json(inspect_pair_policy("{\"kept\":true}", policy));
             require(config.find("kept") && config.find("kept")->as_bool());
             const auto* pair = config.find("qwen_pair");
@@ -129,7 +129,7 @@ void policy_inspection_checks() {
         ScopedPairEnv::set(tiles_env.name, nullptr);
         ScopedPairEnv::set(name, "invalid");
         bool rejected = false;
-        try { (void)resolve_pair_policy(8192, PairExecution::prefill_only); }
+        try { (void)resolve_pair_policy(8192, PairExecution::prefill_only, false); }
         catch (const std::invalid_argument& error) { rejected = std::string_view(error.what()).find(name) != std::string_view::npos; }
         require(rejected);
     }

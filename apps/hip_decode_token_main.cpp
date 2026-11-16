@@ -1725,7 +1725,7 @@ static int run_decode_entry(
     if (strix::qwen_pp::pipe_enabled())
         pair_policy = strix::qwen_pp::resolve_pair_policy(options.tokens.size(),
             strix::qwen_pp::decode_enabled() ? strix::qwen_pp::PairExecution::handoff :
-                                             strix::qwen_pp::PairExecution::prefill_only);
+                                             strix::qwen_pp::PairExecution::prefill_only, options.baseline);
     {
         // Shared route receipt: the prefill route this entry point resolved (the CLI and the HTTP server resolve
         // differently from the same switches), requested vs effective, with the selector's own reason text.
