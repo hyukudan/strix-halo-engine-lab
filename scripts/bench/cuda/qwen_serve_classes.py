@@ -104,6 +104,7 @@ def main():
     ap.add_argument('--health-s', type=int, default=600)
     ap.add_argument('--warm-c1', type=int, default=8, help='C1 prompts repeated in the warm pass (same prompts as cold)')
     ap.add_argument('--min-decode-tokens', type=int, default=16, help='C1 requests with fewer tokens are flagged short=1')
+    ap.add_argument('--conc', default='4,8', help='concurrent levels after C1 (comma list; empty = C1 only)')
     ap.add_argument('--extra-json', default='', help='JSON object merged into every request body (per-request switches)')
     a = ap.parse_args()
     if a.extra_json:
@@ -138,7 +139,7 @@ def main():
                     f'short={int((r["tokens"] or 0) < a.min_decode_tokens)} tpc={r["tpc"]} cf={r["cf"]} cx={r["cx"]} cr={r["cr"]} hu={r["hu"]} rps={r["rps"]} cw={r.get("cw")} err={r["error"]}')
             if pas == 'cold':
                 sets[cls + '_ref'] = ref
-            for c in (4, 8):
+            for c in [int(x) for x in a.conc.split(',') if x.strip()]:
                 res, wall = barrier(c, lambda i: stream(a.base, P[i], a.max_tokens, 900))
                 toks = sum((r.get('tokens') or 0) for r in res)
                 same = sum(1 for i, r in enumerate(res) if r.get('ids') and r.get('ids') == sets[cls + '_ref'][i])
