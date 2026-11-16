@@ -207,6 +207,7 @@ Follow the link for the gain, preconditions and off switch. Defaults are shorten
 | `STRIX_DS41_PREFIX_DIAGNOSTICS` | deepseek | ON: 512 MiB/rank, block 256, reserve ... | [deepseek-pair-agent-prefix-cache](engine/serving/prefix-state-cache.md#deepseek-pair-agent-prefix-cache) |
 | `STRIX_PREFIX_CACHE` | qwen | ON on the qualified single tiled-MTP ... | [certified-mtp-subset](engine/serving/prefix-state-cache.md#certified-mtp-subset) |
 | `STRIX_PREFIX_QUEUE_PROTECT` | qwen | off | A waiting request holds a reference on the longest compatible host-tier prefix state; eviction skips it until the request is admitted, cancelled or refused (byte cap). |
+| `STRIX_SERVE_STARTUP_OVERLAP` | shared serve (bound: minimax) | on | Server start: host-only start work that does not depend on the model weights (the MiniMax drafter file) is read on its own thread beside the weight load and collected where it was read before. Same bytes; `0` keeps the serial start. |
 | `STRIX_PREFIX_CACHE_DISK` | qwen | ON: joining wherever the prefix cache... | [certified-restart-and-in-flight-joining](engine/serving/prefix-state-cache.md#certified-restart-and-in-flight-joining) |
 | `STRIX_PREFIX_CACHE_DURABLE` | qwen | ON: joining wherever the prefix cache... | [certified-restart-and-in-flight-joining](engine/serving/prefix-state-cache.md#certified-restart-and-in-flight-joining) |
 | `STRIX_PREFIX_CACHE_INFLIGHT` | qwen | ON: joining wherever the prefix cache... | [certified-restart-and-in-flight-joining](engine/serving/prefix-state-cache.md#certified-restart-and-in-flight-joining) |
