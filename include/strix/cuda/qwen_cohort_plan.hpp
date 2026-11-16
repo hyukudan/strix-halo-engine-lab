@@ -121,7 +121,9 @@ inline std::uint32_t choose_budget(std::uint32_t sessions, std::uint32_t depth, 
     return wide > narrow * (1.0 + m.min_gain) ? budget : kWindowRows;
 }
 
-// Wide copy window costs of one session (decision rule in qwen_cohort.hpp, copy_wide_switch)
+// Wide copy window costs of one session (decision rule in qwen_cohort.hpp, copy_wide_switch).
+// Fixed sm_120 calibration, not runtime measurements or device selection. Recalibrate manually
+// after kernel changes; qualify other devices separately before using this model there.
 struct CopyWideModel {
     double narrow_a_ms = 8.55, narrow_b_ms = 1.1, wide_ms = 62.5;
 };

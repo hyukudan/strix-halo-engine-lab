@@ -114,14 +114,22 @@ host time ~50 us per stream per cycle on requests that never copy). The server's
 Wide copy windows (`STRIX_QRTX_COPY_ROWS`, request field `copy_rows`, 1..16, <= 8 = off): a session alone in its step
 whose context holds a long unanimous anchor (the shared `MtpContextDraft::propose_wide`: anchor >= `copy_anchor`, no known
 edit in the span, learned copy acceptance >= `STRIX_QRTX_COPY_WIDE_ACCEPT`) verifies `copy_rows - 1` context rows in one
-9..16-row window (the prefill-shaped families) and commits at the first rejected row (exact rollback). Each row's bits
-equal its serial step (`qwen_decode_e2e` with `STRIX_QWEN_TMAX=16`: windows of 2..16 rows and 16-row rollback). Stats:
-`copy_wide_steps`, `copy_wide_rows`, `copy_wide_accepted`.
+9..16-row window (the prefill-shaped families) and commits at the first rejected row (exact rollback). Wide serial bit equality is
+gated by `qwen_decode_e2e` with `STRIX_QWEN_TMAX=16`: it requires G >= 137 and checks
+actual widths 2..16, every full-width rollback keep, and a continuation after each keep against serial token/logit
+digests. It does not compare MTP cache payloads or consume the wide commit's cache with a subsequent draft before
+reset; those remain separate native qualification requirements. Stats `copy_wide_steps` and `copy_wide_rows`
+count executed windows above eight rows and their actual proposal rows; `copy_wide_accepted` counts accepted rows.
+The request override applies only to the CUDA Qwen cohort route with a context drafter in `first` or `copy` mode;
+the CUDA single-slot loop and other engines do not bind it. Use this route for measurement arms. Shared API
+applicability reporting and rejection of unsupported overrides remain pending.
 Default `STRIX_QRTX_COPY_WIDE=auto`: on only when a fully accepted wide window beats a fully accepted 8-row window
 under the measured window costs (`CopyWideModel`, qwen_cohort_plan.hpp). On sm_120 one session costs 9.65 ms at 1 row,
 +1.1 ms per row to 17.2 ms at 8, and a flat 62.5 ms at 9..16 rows (prefill-shaped families), so it stays off: forced
-on, edit C1 drops 29 % (3 in-process ABAB pairs, ids equal). It turns on by itself when a decode-shaped 9..16-row form
-brings the wide cost under ~34 ms (`STRIX_QRTX_COPY_WIDE_MS` overrides the model; `=1` / `=0` force it).
+on, edit C1 drops 29 % (3 in-process ABAB pairs, ids equal). This fixed sm_120 model needs manual recalibration
+after kernel changes and separate qualification on other devices; costs are not measured automatically.
+A calibrated wide cost under ~34 ms enables auto (`STRIX_QRTX_COPY_WIDE_MS` overrides the model;
+`STRIX_QRTX_COPY_WIDE=1` / `=0` force it).
 
 Served decode by prompt class: `scripts/bench/cuda/qwen_serve_classes.py` (prose / edit / json, C1 / C4 / C8, cold and
 warm passes, ids of every request) with `scripts/bench/cuda/qwen_classes_prompts.json`, and strict ABAB server arms with

@@ -3,6 +3,7 @@
 // Prefills rows [0, N-1), then reports: serial greedy steps (T = 1), verify windows of T = 2..STRIX_QWEN_TMAX (default 8, up to 16) rows over the serial
 // tokens (ms per window), and MTP speculative decode (depth 7, min-p STRIX_QWEN_MIN_P or 0.7) when a sidecar is set.
 #include "strix/cuda/qwen_prefill.hpp"
+#include "qwen_decode_test_plan.hpp"
 
 #include <cuda_profiler_api.h>
 
@@ -44,7 +45,10 @@ int main(int argc, char** argv) {
     const auto prompt = tokens_of(argv[4]);
     const auto n = static_cast<std::uint64_t>(std::atoll(argv[5]));
     const auto g = static_cast<std::uint32_t>(std::atoi(argv[6]));
-    if (n < 2 || n > prompt.size() || g < 8) { std::fprintf(stderr, "bad N/G\n"); return 1; }
+    const auto tmax = strix::cuda::decode_test::max_width();
+    if (n < 2 || n > prompt.size() || !strix::cuda::decode_test::benchmark_rows_sufficient(g, tmax)) {
+        std::fprintf(stderr, "bad N/G: require valid N and G >= TMAX (%u)\n", tmax); return 1;
+    }
     qp::Prefill p(c);
     std::printf("loaded %s\n", p.describe().c_str());
     const qp::Sink drop = [](const qp::Piece&) {};
@@ -69,7 +73,6 @@ int main(int argc, char** argv) {
     std::sort(ms.begin(), ms.end());
     std::printf("serial T=1: median %.2f ms (%.1f tok/s), min %.2f\n", med(ms), 1000.0 / med(ms), ms[0]);
     // STRIX_QWEN_TMAX (default 8, up to 16): the widest window; 9..16 = one session's copy window (prefill-shaped families)
-    const std::uint32_t tmax = [] { const char* v = std::getenv("STRIX_QWEN_TMAX"); const int x = v ? std::atoi(v) : 8; return static_cast<std::uint32_t>(x < 2 ? 2 : x > 16 ? 16 : x); }();
     for (std::uint32_t t = 2; t <= tmax; ++t) {
         std::vector<std::uint32_t> pre(seq.begin(), seq.begin() + static_cast<std::ptrdiff_t>(n));
         p.run(pre, n - 1, drop);

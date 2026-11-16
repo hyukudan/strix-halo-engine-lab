@@ -15,6 +15,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
+#include <limits>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -127,8 +128,8 @@ inline const WideModel& wide_model() {
 // Wide copy windows: a session alone in its step whose context holds a long unanimous anchor (the shared drafter's
 // propose_wide: suffix >= copy_anchor, every earlier occurrence continuing alike, no known edit inside, learned copy
 // acceptance cells >= copy_wide_accept) verifies copy_rows - 1 context rows in ONE window of copy_rows (9..16) rows on
-// the prefill-shaped families, and commits at the first rejected row (the engine's exact rollback). Tokens are those
-// of the narrow path (every row's bits equal its serial step; qwen_decode_e2e STRIX_QWEN_TMAX=16). Otherwise the
+// the prefill-shaped families, and commits at the first rejected row (the engine's exact rollback). Wide serial
+// equality gate: qwen_decode_e2e STRIX_QWEN_TMAX=16 (G >= 137) plus MTP cache validation. Otherwise the
 // narrow copy-first / MTP window as before. STRIX_QRTX_COPY_ROWS (<= 8 = off), STRIX_QRTX_COPY_WIDE_ACCEPT.
 inline std::uint32_t copy_rows_default() {
     static const std::uint32_t rows = [] {
@@ -148,15 +149,16 @@ inline double copy_wide_accept_default() {
 }
 // The wide copy window's decision (auto): it turns on only when a fully accepted wide window delivers more tokens per
 // ms than a fully accepted 8-row window (the narrow copy-first window it replaces), from the measured window costs of
-// one session. sm_120 RTX PRO 6000 (rtxmax5 t9, qwen_decode_bench): 9.65 ms at 1 row, +1.1 ms per row to 17.2 ms at 8
+// one session. sm_120 RTX PRO 6000 (qwen_decode_bench): 9.65 ms at 1 row, +1.1 ms per row to 17.2 ms at 8
 // rows, 62.5 ms flat for 9..16 rows (prefill-shaped families) -> 16 / 62.5 = 0.26 vs 8 / 17.2 = 0.46 tokens/ms: off
-// (served edit C1 -29 %, 3 ABAB pairs). It turns on by itself once a 9..16-row decode-shaped form brings the wide cost
-// under ~34 ms (STRIX_QRTX_COPY_WIDE_MS). STRIX_QRTX_COPY_WIDE=1 forces it on, 0 off; the request field copy_rows
+// (served edit C1 -29 %, 3 ABAB pairs). Costs require manual recalibration after kernel changes; other devices need
+// separate qualification. A calibrated wide cost under ~34 ms enables auto (STRIX_QRTX_COPY_WIDE_MS).
+// STRIX_QRTX_COPY_WIDE=1 forces it on, 0 off; the request field copy_rows
 // forces the rows of one request (measurement).
 inline const CopyWideModel& copy_wide_model() {
     static const CopyWideModel m = [] {
         CopyWideModel w;
-        if (const char* v = std::getenv("STRIX_QRTX_COPY_WIDE_MS"); v && v[0]) w.wide_ms = std::strtod(v, nullptr);
+        w.wide_ms = strix::envcfg::number<double>("STRIX_QRTX_COPY_WIDE_MS", w.wide_ms, std::numeric_limits<double>::min());
         return w;
     }();
     return m;
@@ -263,8 +265,6 @@ inline std::vector<StreamStep> step(qp::Prefill& p, std::vector<Stream>& streams
                 wide = !copy[i].empty();
             }
             if (wide) {
-                ++c->wide_steps;
-                c->wide_rows += copy[i].size();
                 pack_budget = std::max<std::uint32_t>(pack_budget, static_cast<std::uint32_t>(copy[i].size()) + 1U);
             } else {
                 copy[i] = c->drafter.begin_copy_cycle(streams[i].pending, room[i], acceptance, o.min_p, c->mtp_expected);
@@ -337,6 +337,13 @@ inline std::vector<StreamStep> step(qp::Prefill& p, std::vector<Stream>& streams
         ++windows_run;
         rows_run += total;
         const auto r = p.verify_cohort(cohort, o.want_logits);
+        for (const auto& e : entries) {
+            auto* c = streams[e.index].context;
+            if (c && c->copy_first && e.rows > kWindowRows) {
+                ++c->wide_steps;
+                c->wide_rows += e.rows - 1U;
+            }
+        }
         bool all_ok = true;
         for (const auto& x : r) all_ok = all_ok && x.ok;
         if (!all_ok) {
