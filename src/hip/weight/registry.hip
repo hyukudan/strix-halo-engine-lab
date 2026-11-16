@@ -1,6 +1,7 @@
 #include "registry.hpp"
 #include "ggml_sources.hpp"
 #include "gsq_sources.hpp"
+#include "gsq_plan.hpp"
 #include "arch/gfx1151_gsq.hpp"
 #include "strix/weight/registry.hpp"
 #include "strix/weight/host_q8.hpp"
@@ -48,9 +49,7 @@ Status OperandSource<GsqTag<T>,F16TileTag,Arch,GsqF16Arithmetic>::validate(const
     constexpr auto be=::strix::gsq_a8::block_elements(T),bb=::strix::gsq_a8::block_bytes(T);
     auto status=shape(w,s,::strix::weight::gguf_format(T),be,bb,bb);
     if(!status) return status;
-    if(!supports_row(static_cast<std::uint32_t>(s.k)) || s.row_stride_bytes%4U)
-        return {Error::unsupported_shape,"HIP GSQ F16 source requires whole-dword rows and even 18-byte block pairs"};
-    return {Error::ok,{}};
+    return gsq_f16_launch(w,s,T);
 }
 #define STRIX_GSQ_REGISTER(NAME,TYPE,PAIR)     {{NAME,1},"signed-a8","gsq-a8-groups",32,2,0,0,false,false,GsqSignedSource<TYPE>::validate},     {{NAME,1},"f16-tile","gsq-f16-groups",32,4,64,PAIR,false,false,GsqF16Source<TYPE,GsqGfx1151>::validate}
 std::span<const SourceRegistration> sources() noexcept {

@@ -2,6 +2,7 @@
 #include "source.hpp"
 #include "gsq_group_codec.hpp"
 #include "gsq_f16_codec.hpp"
+#include <type_traits>
 
 namespace strix::weight::hip {
 // Wire-format tags carry storage identity only; arithmetic is a separate policy.
@@ -62,13 +63,14 @@ struct OperandSource<GsqTag<T>,SignedA8Tag,Arch,GsqDenseArithmetic> {
     __device__ __forceinline__ static float2 entry(const Group& g,const int (&codes)[8],float delta) {
         return gsq_detail::dense_entry<T>(g,codes,delta);
     }
-    static Status validate(const WeightView&,const LaunchShape&);
+    // Codec adapter only; no dense registry/admission contract is integrated yet.
 };
 
 // The arch owns instruction packing; the source owns wire addressing/decode.
 // Legacy named decode structs remain forwarding adapters at the tuned core boundary.
 template<std::uint32_t T,class Arch>
 struct OperandSource<GsqTag<T>,F16TileTag,Arch,GsqF16Arithmetic> {
+    static_assert(std::is_same_v<Arch,GsqGfx1151>, "GSQ F16 codec requires the gfx1151 instruction policy");
     static_assert(::strix::gsq_a8::iq_type(T)||T==::strix::gsq_a8::type_q2_0);
     using View=MatrixView;
     template<unsigned TPC> using Block=gsq_detail::F16Block<T,TPC>;  // gfx1151 instructions (gsq_f16_codec.hpp)

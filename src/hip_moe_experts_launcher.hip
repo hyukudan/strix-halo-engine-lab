@@ -1793,15 +1793,7 @@ PreparedMoeExperts prepare_moe_experts(
         "routed down");
 
     if (config.a8_down_q51 || config.a8_down_q80) {
-        const auto layer = *context.layer;
-        const bool q80_layer = layer == 2U || layer == 4U || layer == 30U || layer == 46U || layer == 47U;
-        const auto gate_type = layer == 2U ? 13U : 12U;
-        const bool q20_layer = weight::hip::gsq_q20_layer(moe_q4k_a8::q20_a8_enabled(), tensors.fused_gate_up,
-            tensors.gate.manifest->ggml_type, tensors.up.manifest->ggml_type, tensors.down.manifest->ggml_type);
-        if (!q20_layer && (tensors.fused_gate_up || tensors.gate.manifest->ggml_type != gate_type ||
-            tensors.up.manifest->ggml_type != gate_type ||
-            tensors.down.manifest->ggml_type != (q80_layer ? 8U : 7U)))
-            throw std::invalid_argument("A8 down layer types differ from canonical fallback census");
+        weight::hip::gsq_prepare_a8_down(tensors, *context.layer, moe_q4k_a8::q20_a8_enabled());
     }
 
     if (config.deferred_moe_status) {

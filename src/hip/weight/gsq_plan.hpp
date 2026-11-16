@@ -5,7 +5,9 @@
 // (STRIX_GSQ_Q20_A8 -> moe_q4k_a8::q20_a8_enabled(), STRIX_GSQ_WINDOW_EXPERTS/DENSE keep their
 // meaning at the call site). Every predicate below is the exact pre-P07 predicate of its site.
 #include "strix/gsq_a8_groups.hpp"
+#include "registry.hpp"
 #include <cstdint>
+#include <stdexcept>
 
 namespace strix::weight::hip {
 struct GsqVerdict {
@@ -43,6 +45,18 @@ constexpr bool gsq_rows_whole_dword_paired(std::uint32_t type, std::uint32_t wid
     return width % g::block_elements(type) == 0U && g::row_bytes(type, width) % 4U == 0U &&
            (g::block_bytes(type) != 18U || (width / g::block_elements(type)) % 2U == 0U);
 }
+// Shared with the F16 registry and host tests. Whole blocks alone do not align
+// a rebased IQ3_S (110-byte block), IQ2_S or IQ3_XXS source to a dword.
+inline Status gsq_f16_launch(const WeightView& w, const LaunchShape& s, std::uint32_t type) {
+    const auto geometry = gsq_geometry(type);
+    if (!geometry.valid()) return {Error::unsupported_shape, "invalid GSQ geometry"};
+    auto status = validate_launch(w, s, geometry.elements, geometry.bytes, geometry.bytes);
+    if (!status) return status;
+    if (!gsq_rows_whole_dword_paired(type, static_cast<std::uint32_t>(s.k)) ||
+        s.row_stride_bytes % 4U || s.k_offset_bytes % 4U)
+        return {Error::unsupported_shape, "HIP GSQ F16 source requires whole-dword rows and offsets and even 18-byte block pairs"};
+    return {Error::ok, {}};
+}
 // GSQ gate/up + GSQ down prefill FP16 form capability (gate row = hidden, down row = rows).
 constexpr bool gsq_f16_prefill_capable(std::uint32_t gate_type, std::uint32_t down_type,
                                        std::uint32_t hidden, std::uint32_t rows) noexcept {
@@ -68,6 +82,20 @@ constexpr bool gsq_q20_layer(bool q20_enabled, bool fused_gate_up, std::uint32_t
     namespace g = ::strix::gsq_a8;
     return q20_enabled && !fused_gate_up && g::gate_type(gate_type) && up_type == gate_type &&
            (g::down_type(down_type) || down_type == 7U || down_type == 8U);
+}
+// Preparation owns the optional manifests: inspect the fused representation
+// before evaluating any scalar arguments that require separate gate/up tensors.
+template<class RoutedTensors>
+void gsq_prepare_a8_down(const RoutedTensors& tensors, std::uint32_t layer, bool q20_enabled) {
+    constexpr const char* refusal = "A8 down layer types differ from canonical fallback census";
+    if (tensors.fused_gate_up) throw std::invalid_argument(refusal);
+    const bool q80_layer = layer == 2U || layer == 4U || layer == 30U || layer == 46U || layer == 47U;
+    const auto gate_type = layer == 2U ? 13U : 12U;
+    if (!gsq_q20_layer(q20_enabled, false, tensors.gate.manifest->ggml_type,
+                      tensors.up.manifest->ggml_type, tensors.down.manifest->ggml_type) &&
+        (tensors.gate.manifest->ggml_type != gate_type || tensors.up.manifest->ggml_type != gate_type ||
+         tensors.down.manifest->ggml_type != (q80_layer ? 8U : 7U)))
+        throw std::invalid_argument(refusal);
 }
 // Known-window routed rows: serial Q4K / Q5K (q5k_a8g32_gate_up) / GSQ gate/up are the legal gates.
 constexpr bool gsq_rows_gate_ok(std::uint32_t gate_type, bool q5k_gate_up, bool q20_enabled) noexcept {
