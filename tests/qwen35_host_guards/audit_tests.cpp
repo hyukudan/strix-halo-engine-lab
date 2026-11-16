@@ -60,14 +60,17 @@ unsigned limit = 0;
 float* base_out = nullptr;
 std::vector<unsigned> seen;
 std::vector<const void*> scratch_seen;
-void linear16(const Tensor&, const float*, float* out, unsigned rows, hipStream_t) {
+struct Iu4Scratch { void *xh = nullptr, *g = nullptr, *u = nullptr; };
+void linear16(const Tensor&, const float*, float* out, unsigned rows, hipStream_t, const Iu4Scratch&) {
     // Model the existing dispatcher's physical row rounding.
     unsigned physical = 1;
     while (physical < rows) physical *= 2;
     runtime_require(out >= base_out && out + physical <= base_out + limit);
     seen.push_back(rows);
 }
-void glu16(const Tensor& g, const Tensor&, const float* x, float* out, unsigned rows, hipStream_t s) { linear16(g, x, out, rows, s); }
+void glu16(const Tensor& g, const Tensor&, const float* x, float* out, unsigned rows, hipStream_t s, const Iu4Scratch& iu4) {
+    linear16(g, x, out, rows, s, iu4);
+}
 void wide_quant(const float*, unsigned, unsigned, hipStream_t, const WideScratch& w) { scratch_seen.push_back(w.codes); }
 void wide_dense(const Tensor&, float*, unsigned, hipStream_t, const WideScratch& w) { scratch_seen.push_back(w.codes); }
 void silu_mul_host(const float*, const float*, float*, std::size_t) {}
@@ -80,6 +83,7 @@ int cudaFuncSetAttribute(int kernel, int, int) { ++attributes[{current_device, k
 #include "audit_attributes.inc"
 struct OtherEngine {
     enum class LogitRows { all };
+    using Rows = int;  // forward_rows' output handle (EngineVerifyTarget observer contract)
     unsigned calls = 0;
     int forward_rows(const std::uint32_t*, std::uint32_t, LogitRows) { ++calls; return 0; }
     void read_top(int, std::uint32_t n, std::uint32_t* ids) { std::fill_n(ids, n, 7U); }
@@ -112,17 +116,17 @@ int main() {
     e.committed = 0;
     for (unsigned n = 1; n <= 65; ++n) {
         std::vector<float> v(n); limit = n; base_out = v.data(); seen.clear();
-        linear(Tensor{}, v.data(), v.data(), n, nullptr, WideScratch{});
-        glu(Tensor{}, Tensor{}, v.data(), v.data(), n, nullptr, WideScratch{});
+        linear(Tensor{}, v.data(), v.data(), n, nullptr, WideScratch{}, Iu4Scratch{});
+        glu(Tensor{}, Tensor{}, v.data(), v.data(), n, nullptr, WideScratch{}, Iu4Scratch{});
         unsigned sum = 0; for (auto count : seen) sum += count;
         check(sum == 2 * n, "686-2 exact logical tails");
     }
     std::int8_t ca = 0, cb = 0;
     WideScratch a{&ca, nullptr, nullptr, nullptr}, b{&cb, nullptr, nullptr, nullptr};
     Tensor q8{8, 128, 16};
-    linear(q8, nullptr, nullptr, 64, nullptr, a);
-    linear(q8, nullptr, nullptr, 32, nullptr, b);
-    linear(q8, nullptr, nullptr, 64, nullptr, a);
+    linear(q8, nullptr, nullptr, 64, nullptr, a, Iu4Scratch{});
+    linear(q8, nullptr, nullptr, 32, nullptr, b, Iu4Scratch{});
+    linear(q8, nullptr, nullptr, 64, nullptr, a, Iu4Scratch{});
     check(scratch_seen == std::vector<const void*>{&ca, &ca, &cb, &cb, &ca, &ca}, "686-3 independent wide scratch");
     for (int device = 0; device < 2; ++device) {
         current_device = device;
