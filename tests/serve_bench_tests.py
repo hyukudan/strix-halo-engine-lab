@@ -236,6 +236,31 @@ class Ledger(unittest.TestCase):
 
 
 class MeasuredStream(unittest.TestCase):
+    def test_committed_emission_trace_without_logprobs(self):
+        trace = dict(clock="steady_ns", includes_stop_tokens=True,
+                     events=[[10**18, 2], [10**18 + 900000000, 3], [10**18 + 1100000000, 1]])
+        event = self.stream([dict(choices=[dict(delta=dict(content="visible text"))]),
+                             dict(usage=dict(completion_tokens=6), strix=dict(token_emissions=trace))])
+        self.assertTrue(event["emission_trace_valid"])
+        self.assertIsNone(event["chunk_token_counts"])
+        self.assertEqual(sb.request_metrics(event)["peak_1s_tok_s"], 5)
+        self.assertEqual(event["emission_counts"], [2, 3, 1])
+        # Pool in the same server clock, preserving simultaneous grouped publications.
+        self.assertEqual(sb.peak_events_1s([event, event]), 10)
+
+    def test_bad_emission_trace_never_falls_back_to_chunks(self):
+        good = dict(clock="steady_ns", includes_stop_tokens=True, events=[[1, 1], [1000000001, 1]])
+        for trace in (dict(good, clock="client"), dict(good, events=[[2, 1], [1, 1]]),
+                      dict(good, events=[[1, True], [1000000001, 1]]), dict(good, events=[[1, 1]])):
+            event = self.stream([self.chat("A"), self.chat("B"),
+                                 dict(usage=dict(completion_tokens=2), strix=dict(token_emissions=trace))])
+            self.assertFalse(event["emission_trace_valid"])
+            self.assertIsNone(sb.request_metrics(event)["peak_1s_tok_s"])
+        valid = self.stream([self.chat("A"), self.chat("B"),
+                             dict(usage=dict(completion_tokens=2), strix=dict(token_emissions=good))])
+        missing = self.stream([self.chat("A"), self.chat("B"), dict(usage=dict(completion_tokens=2))])
+        self.assertIsNone(sb.peak_events_1s([valid, missing]))
+
     def stream(self, chunks):
         wire = b"".join(b"data: " + json.dumps(c).encode() + b"\n\n" for c in chunks)
         wire += b"data: [DONE]\n\n"

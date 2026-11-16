@@ -287,7 +287,14 @@ def peak_1s(times, chunk_token_counts):
 def peak_events_1s(events):
     """Pool measured chunks, never per-request usage ratios; incomplete measurements yield None."""
     times, counts = [], []
+    traced = any(event.get("emission_trace_present") for event in events)
     for event in events:
+        if traced:
+            if (event.get("error") is not None or not event.get("emission_trace_valid")):
+                return None
+            times.extend(event["emission_times_ns"])
+            counts.extend(event["emission_counts"])
+            continue
         ts = event.get("token_times") or []
         if event.get("error") is not None or not ts:
             continue
@@ -296,6 +303,9 @@ def peak_events_1s(events):
             return None
         times.extend(ts)
         counts.extend(ns)
+    if traced and times:
+        origin = min(times)
+        times = [(t - origin) / 1e9 for t in times]
     return peak_1s(times, counts)
 
 
@@ -313,7 +323,7 @@ def request_metrics(event):
     rate = (tokens - 1) / (last - first) if tokens >= 2 and times and last > first else None
     return dict(tokens=tokens, arrival=event["arrival"], first_token=first, last_token=last,
                 ttft_s=first - event["arrival"] if first is not None else None, tok_s=rate,
-                peak_1s_tok_s=peak_1s(times, event.get("chunk_token_counts")), prompt_tokens=event.get("prompt_tokens"), restored_tokens=event.get("restored_tokens"),
+                peak_1s_tok_s=peak_events_1s([event]), prompt_tokens=event.get("prompt_tokens"), restored_tokens=event.get("restored_tokens"),
                 ids_sha256=event.get("ids_sha256"), error=event.get("error"))
 
 
@@ -433,6 +443,25 @@ def measured_chunk_tokens(chunk):
     return total if measured else None
 
 
+def validate_emission_trace(trace, tokens):
+    """Validate committed-token publications; their server clock is independent of client arrival time."""
+    if not isinstance(trace, dict) or trace.get("clock") != "steady_ns" or trace.get("includes_stop_tokens") is not True:
+        return None, "unsupported emission trace contract"
+    events = trace.get("events")
+    if not isinstance(events, list) or type(tokens) is not int or tokens < 0:
+        return None, "missing emission events or final usage"
+    times, counts = [], []
+    for event in events:
+        if (not isinstance(event, list) or len(event) != 2 or type(event[0]) is not int or event[0] < 0
+                or type(event[1]) is not int or event[1] <= 0 or (times and event[0] < times[-1])):
+            return None, "invalid or nonmonotonic emission event"
+        times.append(event[0])
+        counts.append(event[1])
+    if sum(counts) != tokens:
+        return None, "emission count differs from final usage"
+    return (times, counts), None
+
+
 def stream_request(url, body, timeout, clock=time.perf_counter):
     """Sends one streamed request and returns its event record (see request_metrics)."""
     event = dict(arrival=clock(), token_times=[], chunk_token_counts=[], tokens=None, error=None)
@@ -445,8 +474,13 @@ def stream_request(url, body, timeout, clock=time.perf_counter):
                 now = clock()
                 payload = line[5:].strip()
                 if payload == b"[DONE]":
+                    event["finished"] = now
                     break
                 chunk = json.loads(payload)
+                trace = find_key(chunk.get("strix"), "token_emissions")
+                if trace is not None:
+                    event["emission_trace_present"] = True
+                    event["emission_trace"] = trace
                 if "error" in chunk:
                     event["error"] = "server error: " + json.dumps(chunk["error"])[:200]
                     break
@@ -480,6 +514,16 @@ def stream_request(url, body, timeout, clock=time.perf_counter):
     if (event["chunk_token_counts"] is not None and event["tokens"] is not None
             and sum(event["chunk_token_counts"]) != event["tokens"]):
         event["chunk_token_counts"] = None
+    if event.get("emission_trace_present"):
+        measured, reason = validate_emission_trace(event.pop("emission_trace"), event["tokens"])
+        event["emission_trace_valid"] = measured is not None
+        event["emission_trace_reason"] = reason
+        event["emission_peak_scope"] = "server committed publications, stop tokens included as in final usage"
+        if measured is not None:
+            ns, counts = measured
+            # Pool integer stamps before subtracting one origin, avoiding long-uptime precision loss.
+            event["emission_times_ns"] = ns
+            event["emission_counts"] = counts
     return event
 
 
