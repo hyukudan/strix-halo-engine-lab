@@ -19,11 +19,11 @@
 
 #include "strix/cuda_core/dense.hpp"
 #include "strix/qwen35/config.hpp"
+#include "strix/qwen35/engine_types.hpp"
 
 namespace strix::qwen35 {
 
 enum class PackFormat : std::uint8_t { bf16, q8_0 };
-enum class LogitRows : std::uint8_t { none, last, all };
 // TURBO weight source (owner requirement): off = exact pack as is; native = TURBO policy without weight change;
 // onfly = BF16 2-D weights rounded at load to NVFP4 (RTN per 16, kept only in VRAM). `converted` is not implemented yet.
 enum class TurboWeights : std::uint8_t { off, native, onfly };
