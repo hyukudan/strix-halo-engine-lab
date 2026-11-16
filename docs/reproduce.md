@@ -616,6 +616,12 @@ OUT_DIR`: exact vs every WMMA launch form, overflow fallback rows, GPU clock and
 prefill (`glm_score.sh PEER BIN MODEL PROMPT OUT [ENV...]`, last 256 rows) and its FAST gate comparison
 (`score_cmp.py REF CAND PROMPT`: KL <= 0.02, top-1 >= 93 %, dNLL <= +0.01).
 
+### Prefill window-loop census from a kernel trace
+
+[`scripts/bench/prefill-trace/`](../scripts/bench/prefill-trace/README.md) reads a rocprofv3 kernel trace of a prefill
+process and reports the per-window launch loop of one run: span, GPU idle inside it, time per kernel kind, launches
+per hardware queue, and the compute-unit time the flash kernel and the kernels that cannot share a CU with it leave free.
+
 ### MiniMax MSA flash layer ranges (FAST gate)
 
 [`scripts/bench/mmflash/`](../scripts/bench/mmflash/README.md) qualifies a layer range for the FAST MSA flash attention

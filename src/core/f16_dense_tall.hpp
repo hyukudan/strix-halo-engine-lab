@@ -95,15 +95,16 @@ __device__ __forceinline__ Half16 staged_fragment(const std::uint32_t* p) {
 //   fragment(row, unit) -> Half16: the lane's A fragment of `row` at k unit `unit`, instead of 16 FP32 loads of x.
 //   kWaves: row waves per CTA (default 8 = 128 rows per weight read); launch with 32 * kWaves threads and
 //     grid.x = ceil(rows / (16 * kWaves)). Stagers stay the first 16 * TC threads.
+//   kColumnFast = true: grid.x = column block, grid.y = row block (launch dim3(column blocks, row blocks)), so the
+//     CTAs of one row block are dispatched together and share its x through L2: x is read from memory about once,
+//     not once per column block. Same bits. For launches with several column blocks whose x exceeds the caches
+//     (measured on the MiniMax index projection, 6 column blocks, 4096 rows: x re-streamed per block at rows-fast).
 template <class C> concept ColsStage = requires(const C& c, U4* nb) { c.stage(0U, 0U, 0U, nb); };
 template <class C> concept ColsFragment = requires(const C& c) { { c.fragment(0U, 0U) } -> std::same_as<Half16>; };
 template <class C> inline constexpr unsigned kCtaWaves = 8U;
 template <class C> requires requires { C::kWaves; } inline constexpr unsigned kCtaWaves<C> = C::kWaves;
-//   kColumnsFastest (default false): blockIdx.x = column block, blockIdx.y = row block (launch grid (column blocks,
-//     row blocks)), so the column blocks of one row block are dispatched together and their x reads meet in L2: one
-//     DRAM read of x per launch instead of one per column block. The arithmetic is unchanged.
-template <class C> inline constexpr bool kColumnsFastest = false;
-template <class C> requires requires { C::kColumnsFastest; } inline constexpr bool kColumnsFastest<C> = C::kColumnsFastest;
+template <class C> inline constexpr bool kColumnFast = false;
+template <class C> requires requires { C::kColumnFast; } inline constexpr bool kColumnFast<C> = C::kColumnFast;
 
 // Pitch 36 dwords per column: b128 accesses stay aligned and columns rotate banks. 2,304 bytes per column tile.
 template <unsigned TC> struct alignas(16) Storage {
@@ -158,8 +159,8 @@ __device__ __forceinline__ void core(const float* x, unsigned in, unsigned nr, C
     // No 8-tile width: its WMMAs sink below the fragment reads of the whole stage and the kernel spills (124+ VGPRs).
     static_assert(TC == 1 || TC == 2 || TC == 4 || TC == 16);
     const unsigned tid = threadIdx.x, lane = tid & 31U, wave = tid >> 5U, c = lane & 15U;
-    const unsigned rb = kColumnsFastest<Cols> ? blockIdx.y : blockIdx.x, cb = kColumnsFastest<Cols> ? blockIdx.x : blockIdx.y;
-    const unsigned row0 = rb * (16U * kCtaWaves<Cols>) + wave * 16U;
+    const unsigned rblock = kColumnFast<Cols> ? blockIdx.y : blockIdx.x, cblock = kColumnFast<Cols> ? blockIdx.x : blockIdx.y;
+    const unsigned row0 = rblock * (16U * kCtaWaves<Cols>) + wave * 16U;
     const unsigned units = detail::uni(in) / 16U;
     const auto* xb = reinterpret_cast<const unsigned char*>(detail::uniform(x));
     // Rows past nr read row 0 (their sums are never stored).
@@ -170,7 +171,7 @@ __device__ __forceinline__ void core(const float* x, unsigned in, unsigned nr, C
     };
     // Stager role: thread tid owns column tid of the CTA's column block.
     const bool stager = tid < 16U * TC;
-    const unsigned stile = cb * TC + (stager ? tid / 16U : 0U);
+    const unsigned stile = cblock * TC + (stager ? tid / 16U : 0U);
     const auto* wp = ColsStage<Cols> ? nullptr : reinterpret_cast<const unsigned char*>(cols.tile(stile).w) +
                                                      static_cast<std::size_t>(tid & 15U) * in * 2U;
     U4 nb[8];
@@ -215,9 +216,9 @@ __device__ __forceinline__ void core(const float* x, unsigned in, unsigned nr, C
     store.run([&](auto& s) __attribute__((always_inline)) {
 #pragma unroll
         for (unsigned t = 0; t < TC; ++t) {
-            const ColumnTile ct = cols.tile(cb * TC + t);
+            const ColumnTile ct = cols.tile(cblock * TC + t);
             if (!detail::uni(ct.live ? 1U : 0U)) continue;
-            const auto st = s.open(cb * TC + t, ct, c);
+            const auto st = s.open(cblock * TC + t, ct, c);
 #pragma unroll
             for (unsigned j = 0; j < 8U; ++j) {
                 const unsigned r = row0 + 2U * j + (lane >> 4U);
@@ -280,7 +281,7 @@ __device__ __forceinline__ void exact_rows(unsigned* flags, unsigned rows, unsig
 // Columns of one [n][in] FP16 matrix (n % 16 == 0): tile t = outputs [16 t, 16 t + 16); tiles past n / 16 are dead
 // (they read tile 0). The store receives y + 16 t and stride (RawStore: y[r * stride + column]).
 template <bool ColumnsFastest> struct MatrixCols {
-    static constexpr bool kColumnsFastest = ColumnsFastest;
+    static constexpr bool kColumnFast = ColumnsFastest;
     const _Float16* w;
     float* y;
     unsigned in, stride, tiles, tile0;
