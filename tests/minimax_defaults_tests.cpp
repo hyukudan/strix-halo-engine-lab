@@ -741,8 +741,20 @@ void test_fast_prefill_profile() {
             const auto base = lookup(idx);
             std::set<std::string> seen;
             (void)md::prefill_policy([&](const char* k) -> const char* { seen.insert(k); return base(k); });
-            check(seen.count("STRIX_DIST_CRC_PARALLEL") == 0 && seen.count("STRIX_MM_PF_MSA_REWORK") == 1,
+            const bool exported = md::from_defaults("STRIX_MM_PF_MSA_REWORK");
+            check(seen.count("STRIX_DIST_CRC_PARALLEL") == 0 && seen.count("STRIX_MM_PF_MSA_REWORK") == (exported ? 0U : 1U),
                   "fast receipt: the flash guard reads the rework item, not the whole defaults set");
+            // After apply() (test_apply ran first): the exported rework default is not read, so the receipt does not
+            // list it as user-set; the flash decision is unchanged.
+            check(exported, "fast receipt: test_apply exported the rework item");
+            std::set<std::string> seen_proc;
+            const auto pp = md::prefill_policy([&](const char* k) -> const char* {
+                seen_proc.insert(k);
+                const char* v = base(k);
+                return v != nullptr ? v : std::getenv(k);
+            });
+            check(seen_proc.count("STRIX_MM_PF_MSA_REWORK") == 0 && pp.msa_flash == md::prefill_policy(base).msa_flash,
+                  "fast receipt: an exported rework default is not recorded and keeps the flash decision");
         }
         // ONE RESOLVER: rank and serve resolve the same request to the same prefill lines.
         const auto prefill_lines = [](const std::string& cfg) {

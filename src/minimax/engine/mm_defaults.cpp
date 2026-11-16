@@ -228,8 +228,11 @@ PrefillPolicy prefill_policy(const Lookup& env) {
         // Only the rework item and the baseline switch decide it: forwarding every item through a recording lookup
         // (the engine passes envcfg::text) put the whole defaults set into the FAST arm's receipt, which the floor
         // gate then refused against an exact reference ("differs beyond its FAST layer set").
+        // A value apply() exported is the item's own default: resolving it unset gives the same mode without a read,
+        // so the FAST arm does not record the exported value as user-set (the exact reference never reads it here).
         const Lookup rework_env = [&](const char* k) -> const char* {
-            return std::strcmp(k, "STRIX_MM_PF_MSA_REWORK") == 0 || std::strcmp(k, kBaselineEnv) == 0 ? env(k) : nullptr;
+            const bool own = std::strcmp(k, "STRIX_MM_PF_MSA_REWORK") == 0 || std::strcmp(k, kBaselineEnv) == 0;
+            return own && !from_defaults(k) ? env(k) : nullptr;
         };
         for (const auto& r : resolve(rework_env))
             if (std::strcmp(r.item->env, "STRIX_MM_PF_MSA_REWORK") == 0) rework = r.value != "0";
