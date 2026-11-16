@@ -8,6 +8,7 @@ struct FamilySchema {
     bool transformed, native_fp8, channel_quant;
     bool text_only;
     std::span<const FormatId> lookup;
+    bool unsigned_trellis=false;
 };
 Status bind_model(const TensorIndex&,const FamilySchema&,WeightMap&);
 }

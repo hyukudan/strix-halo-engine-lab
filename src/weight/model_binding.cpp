@@ -53,6 +53,7 @@ Status bind_model(const TensorIndex& index,const FamilySchema& schema,WeightMap&
         if(expert){if(raw.shape.rank>2)b.expert_axis=0;if(b.role==Role::dense_gate)b.role=Role::expert_gate;if(b.role==Role::dense_up)b.role=Role::expert_up;if(b.role==Role::dense_down)b.role=Role::expert_down;}
         Parameters p{};
         if(trellis) {
+            if(raw.wire_dtype=="U16" && !schema.unsigned_trellis)return {Error::unknown_format,"legacy family graph requires signed I16 trellis transport"};
             if(!schema.transformed)return {Error::unknown_format,"family does not admit tile trellis transport"};
             if(raw.shape.rank!=3 || raw.shape.dims[0]>UINT64_MAX/16 || raw.shape.dims[1]>UINT64_MAX/16)return {Error::unsupported_shape,"invalid trellis tile shape"};
             b.logical_shape={{{raw.shape.dims[1]*16,raw.shape.dims[0]*16,0,0}},2};p.transform="exl3.mul1.tiles16@1";
