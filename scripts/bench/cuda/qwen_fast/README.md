@@ -9,6 +9,10 @@ Pieces
   the gated configuration is the one the server runs.
 - `gate.sh`: runs the exact and the fast arm, seals both with `tools/strix-gate/fast_logit_gate.py`, compares, prints the
   KL / top-1 / dNLL verdict (limits default to KL <= 0.02, top-1 >= 0.93, dNLL <= 0.01).
+- `prefill_abab.sh` + `prefill_client.py`: strict ABAB server prefill arms (fresh server per arm, cold and warm prefill
+  per length, GPU clock / busy samples). Env: SERVE, MODEL, TABLES, ROPE, IDS, OUT, ARMS (`name|ENV=v|--flags ;; ...`),
+  optional MTP, VOCAB, PORT, GPU_INDEX, LIMIT_S, CLIENT_ARGS, COMMON; summary in `$OUT/summary.txt`. Run it inside the GPU
+  ownership wrapper of your lab.
 - `mkprompt.py`: builds `NAME.u32` token files from .u32 files, id lists or text (text is tokenised with `strix-tokenize`,
   the server's tokenizer, against a GGUF; nothing is downloaded).
 
