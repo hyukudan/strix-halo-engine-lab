@@ -654,6 +654,14 @@ int main(int argc, char** argv) {
             for (std::uint32_t rows : {1U,2U,7U,8U,9U,31U,32U,33U,63U,64U,65U,127U,128U,129U})
                 run_projection(cs, weights, rows, rows + store * 101U, true, 129U);
         }
+        // A single segment starts at a tile boundary and exercises tile2;
+        // the preceding split segments exercise the raw136 fallback.
+        for (std::uint32_t store = 0; store < 4; ++store) {
+            const Case cs{"wfmt-tile2", static_cast<qd::Store>(store), qd::Input::bf16, 256U, {129U}};
+            const std::vector<std::vector<std::uint8_t>> weights{make_q8(129U, 256U, 92U)};
+            for (std::uint32_t rows : {1U,2U,7U,8U,9U,31U,32U,33U,63U,64U,65U,127U,128U,129U})
+                run_projection(cs, weights, rows, rows + store * 101U, true, 129U);
+        }
         std::printf("wfmt CUDA dense: %zu production records, %d failures\n", wfmt_capture_index, g_fail);
         return g_fail ? 1 : 0;
     }
