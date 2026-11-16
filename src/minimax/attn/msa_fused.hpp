@@ -12,6 +12,7 @@
 // Two launches per layer instead of five, and N independent sequences (users) in the same two launches. All
 // per-step values (positions, RoPE rows, cache tables) are read from device memory and the grids depend only on the
 // view's shape, so a captured graph can be replayed step after step.
+#include <array>
 #include <cstdint>
 
 #include <hip/hip_runtime.h>
@@ -102,7 +103,8 @@ struct PrefillView {
 };
 using PrefillStageMarker = void (*)(void* user, const char* category, bool before);
 void enqueue_prefill(const PrefillView& v, hipStream_t stream,
-                     PrefillStageMarker marker = nullptr, void* user = nullptr);
+                     PrefillStageMarker marker = nullptr, void* user = nullptr,
+                     std::array<std::uint64_t, 3>* flash_launches = nullptr);
 // Cache-only stage of a headless chunk (strix/prefill_headless.hpp): the same view contract and the same prep launch as
 // enqueue_prefill (K / V / index-key cache rows, same bits), no index scoring, selection or attention; the view's
 // attention outputs are not written.

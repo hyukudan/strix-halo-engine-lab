@@ -81,12 +81,12 @@ template <unsigned H, unsigned D> struct KeySplit {
     }
 };
 
-// Opt (load schedule only; same operands, same WMMA order, every output bit unchanged):
-//   0             incumbent: the compiler sinks each key fragment load to its WMMA, so a tile pays kKs serial
-//                 L2 round trips (one s_waitcnt vmcnt(0) per QK step).
-//   kKsKeysFirst  all kKs key fragments are issued first, then the value pieces, behind a scheduling barrier:
-//                 the QK chain waits once for the keys while the values are still in flight.
-//   kKsKeysHalves the same with the keys in two halves around the value loads (half the key registers live).
+// Opt (source load schedule only; same operands and WMMA order):
+//   0             incumbent: each key fragment is loaded immediately before its QK operation.
+//   kKsKeysFirst  all key fragments precede the value loads and a scheduling barrier.
+//   kKsKeysHalves key loads are grouped in two halves around the value loads, both before QK.
+// Register liveness, waits and overlap require compiler/ISA evidence for each instantiation;
+// source ordering alone establishes neither reduced register pressure nor native bitwise equality.
 inline constexpr unsigned kKsKeysFirst = 1U, kKsKeysHalves = 2U;
 template <class P, bool Split = false, unsigned Opt = 0U>
 __global__ __launch_bounds__((KeySplit<P::kHeads, P::kDim>::kThreads)) void flash_rows_keysplit_kernel(typename P::Args a) {

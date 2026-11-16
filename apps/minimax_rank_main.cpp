@@ -922,8 +922,44 @@ std::map<std::string, std::vector<std::uint32_t>> g_session_tokens;
 // weak, so binaries linked against a library without it still link (`--ab pftiled` then refuses).
 extern "C" void strix_trellis_lab_set_wmma_tiled(int on) __attribute__((weak));
 
+// A/B evidence is local to this engine and each completed prefill, never inferred from equal hashes.
+struct FlashKeysAB {
+    mm::Engine* eng;
+    unsigned saved;
+    std::array<std::uint64_t, 3> before{};
+    FlashKeysAB(mm::Engine& engine, bool active) : eng(active ? &engine : nullptr), saved(engine.prefill_flash_keys()) {
+        if (eng != nullptr && eng->prefill_flash_mode() == 0)
+            throw std::invalid_argument("--ab pfflashkeys: NOT EXERCISED (flash admission disabled)");
+    }
+    void restore() {
+        if (eng != nullptr) {
+            eng->set_prefill_flash_keys(saved);
+            eng = nullptr;
+        }
+    }
+    ~FlashKeysAB() { restore(); }
+    void begin() { if (eng != nullptr) before = eng->prefill_flash_launches(); }
+    void finish(int arm, std::uint64_t state, std::uint64_t out) const {
+        if (eng == nullptr) return;
+        auto counts = eng->prefill_flash_launches();
+        for (std::size_t i = 0; i < counts.size(); ++i) counts[i] -= before[i];
+        const unsigned expected = arm % 2 == 0 ? 0U : 2U;
+        const unsigned schedule = eng->prefill_flash_keys();
+        const unsigned mode = eng->prefill_flash_mode();
+        const bool exercised = mode != 0 && schedule == expected && counts[expected] != 0 &&
+                               counts[1] == 0 && counts[2U - expected] == 0;
+        std::printf("rank %u ab-pfflashkeys: arm %d schedule=%u flash=%u launches[0,1,2]=%llu,%llu,%llu "
+                    "state=%016llx final-rows=%016llx %s\n", eng->rank(), arm, schedule, mode,
+                    static_cast<unsigned long long>(counts[0]), static_cast<unsigned long long>(counts[1]),
+                    static_cast<unsigned long long>(counts[2]), static_cast<unsigned long long>(state),
+                    static_cast<unsigned long long>(out), exercised ? "EXERCISED" : "NOT EXERCISED");
+        if (!exercised) g_exact_fail = true;
+    }
+};
+
 std::uint64_t ab_flag(mm::Engine& eng, const std::string& flag, const std::vector<std::uint32_t>& prompt, int block,
                       const std::vector<std::uint32_t>* reference) {
+    FlashKeysAB flash_keys(eng, flag == "pfflashkeys");
     const int pipe0 = strix::minimax::moe::opt::prefill_pipe_override();
     struct RestorePipe {
         bool active;
@@ -1101,7 +1137,6 @@ std::uint64_t ab_flag(mm::Engine& eng, const std::string& flag, const std::vecto
                          : flag == "pfmsa" ? eng.prefill_msa_batch()
                          : flag == "pfheadless" ? eng.prefill_headless()
                          : flag == "pfdensemlp" ? eng.prefill_dense_mlp()
-                         : flag == "pfflashkeys" ? eng.prefill_flash_keys() != 0
                          : flag == "pfattn4" ? eng.prefill_attend4()
                          : flag == "pfidxconc" ? eng.prefill_index_concurrent() != 0
                          : flag == "pfrouter" ? eng.prefill_router_batch()
@@ -1129,12 +1164,14 @@ std::uint64_t ab_flag(mm::Engine& eng, const std::string& flag, const std::vecto
     first.resize(static_cast<std::size_t>(prefills));
     for (int r = 0; r < prefills; ++r) {
         set(r % 2 == 1);
+        flash_keys.begin();
         const auto t0 = Clock::now();
         first[static_cast<std::size_t>(r)] = eng.prefill(0, prompt, 0);
         ttft[r % 2].push_back(secs(t0, Clock::now()));
         if (hash_state) {
             states.push_back(eng.state_fnv(0, prompt.size()));
             outs.push_back(eng.prefill_out_fnv());
+            flash_keys.finish(r, states.back(), outs.back());
         }
     }
     // xb flags: A B A B A B A (every B bracketed), and matched replay: every block re-decodes the SAME positions with
@@ -1208,7 +1245,7 @@ std::uint64_t ab_flag(mm::Engine& eng, const std::string& flag, const std::vecto
     else if (flag == "pftiled") strix_trellis_lab_set_wmma_tiled(-1);
     else if (flag == "pfheadless") eng.set_prefill_headless(start_arm);
     else if (flag == "pfdensemlp") eng.set_prefill_dense_mlp(start_arm);
-    else if (flag == "pfflashkeys") eng.set_prefill_flash_keys(start_arm ? 2U : 0U);
+    else if (flag == "pfflashkeys") flash_keys.restore();
     else if (flag == "pfi4") strix::minimax::moe::opt::set_prefill_iu4(-1);
     else if (flag == "pfall") {
         eng.set_prefill_msa_batch(msa0);

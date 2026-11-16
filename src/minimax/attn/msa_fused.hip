@@ -2346,7 +2346,8 @@ std::size_t prefill_window_bytes(std::uint32_t max_blocks) {
 }
 
 namespace {
-template <bool DENSE> void launch_prefill_attend(const PrefillView& p, unsigned windows, hipStream_t stream) {
+template <bool DENSE> void launch_prefill_attend(const PrefillView& p, unsigned windows, hipStream_t stream,
+                                              std::array<std::uint64_t, 3>* flash_launches) {
     if (windows == 0) return;
     const DecodeView& v = p.window;
     if (p.msa_rework != 0) {
@@ -2380,6 +2381,7 @@ template <bool DENSE> void launch_prefill_attend(const PrefillView& p, unsigned 
             else if (p.flash_keys == 2U) two ? go(std::true_type{}, U2{}) : go(std::false_type{}, U2{});
             else two ? go(std::true_type{}, U0{}) : go(std::false_type{}, U0{});
             hip_check(hipGetLastError(), "minimax prefill flash attend");
+            if (flash_launches != nullptr) ++(*flash_launches)[p.flash_keys <= 2U ? p.flash_keys : 0U];
             return;
         }
         if (p.msa_rework == 10) {
@@ -2733,7 +2735,8 @@ void enqueue_prefill_cache_only(const PrefillView& p, hipStream_t stream, Prefil
     launch_prefill_prep(p, stream, marker, user);
 }
 
-void enqueue_prefill(const PrefillView& p, hipStream_t stream, PrefillStageMarker marker, void* user) {
+void enqueue_prefill(const PrefillView& p, hipStream_t stream, PrefillStageMarker marker, void* user,
+                     std::array<std::uint64_t, 3>* flash_launches) {
     check_prefill_view(p);
     const DecodeView& v = p.window;
     launch_prefill_prep(p, stream, marker, user);
@@ -2753,13 +2756,13 @@ void enqueue_prefill(const PrefillView& p, hipStream_t stream, PrefillStageMarke
             enqueue_prefill_index(batch, stream);
             if (marker != nullptr) marker(user, "index-scoring", false);
             if (marker != nullptr) marker(user, "attend", true);
-            launch_prefill_attend<false>(batch, sparse, stream);
+            launch_prefill_attend<false>(batch, sparse, stream, flash_launches);
             if (marker != nullptr) marker(user, "attend", false);
             if (g_select_dump != nullptr) dump_prefill_select(batch, stream);
         }
         batch.first_window = 0;
         if (dense != 0 && marker != nullptr) marker(user, "attend", true);
-        launch_prefill_attend<true>(batch, dense, stream);
+        launch_prefill_attend<true>(batch, dense, stream, flash_launches);
         if (dense != 0 && marker != nullptr) marker(user, "attend", false);
         first += nw;
     }

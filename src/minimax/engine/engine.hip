@@ -682,6 +682,7 @@ struct Engine::Impl {
     // STRIX_MM_PF_FLASH_KEYS (default 2 = key halves, schedule only, same bits): FAST flash key-fragment load schedule
     // (PrefillView::flash_keys; 0 = incumbent, 1 = keys first). Bench: scripts/bench/mmattn.
     unsigned pf_flash_keys = 2;
+    std::array<std::uint64_t, 3> pf_flash_launches{};
     // STRIX_MM_PF_DENSE_MLP (default ON, exact): the dense MLP of layers 0..kFirstMoe-1 (gate + up, then down) on the v4
     // prefill core for 4096-row pieces (dense_mlp), the q/k/v core contract (== strix_gemm bitwise); 0 keeps strix_gemm.
     bool pf_dense_mlp = true;
@@ -2110,7 +2111,7 @@ struct Engine::Impl {
                             mfused::enqueue_prefill_cache_only(pfv, nullptr, tl ? PrefillTimeline::msa_mark : nullptr, tl);
                             did_cache_only = true;
                         } else {
-                            mfused::enqueue_prefill(pfv, nullptr, tl ? PrefillTimeline::msa_mark : nullptr, tl);
+                            mfused::enqueue_prefill(pfv, nullptr, tl ? PrefillTimeline::msa_mark : nullptr, tl, &pf_flash_launches);
                         }
                         break;
                     }
@@ -3669,6 +3670,11 @@ void Engine::set_prefill_flash_keys(unsigned mode) {
     impl_->pf_flash_keys = mode;
 }
 unsigned Engine::prefill_flash_keys() const { return impl_->pf_flash_keys; }
+unsigned Engine::prefill_flash_mode() const {
+    return defaults::msa_flash_decline_reason(impl_->pf_msa_rework != 0, impl_->attn_prefill_fused,
+                                             impl_->pf_msa_flash_layers.count()) == nullptr ? impl_->pf_msa_flash : 0U;
+}
+std::array<std::uint64_t, 3> Engine::prefill_flash_launches() const { return impl_->pf_flash_launches; }
 void Engine::set_prefill_msa_rework(unsigned mode) {
     impl_->no_task("set_prefill_msa_rework");
     impl_->set_prefill_msa_rework(mode);
