@@ -16,6 +16,7 @@ struct Api {
     using Error=hipError_t; using Properties=hipDeviceProp_t; using Event=hipEvent_t; using Stream=hipStream_t;
     static constexpr auto backend=strix::weight::Backend::hip;
     static constexpr auto Success=hipSuccess;
+    static constexpr auto OutOfMemory=hipErrorOutOfMemory;
     static constexpr auto EventDisableTiming=hipEventDisableTiming;
     static constexpr auto MemcpyHostToDevice=hipMemcpyHostToDevice;
     template<class... Args> static auto SetDevice(Args&&... args) { return hipSetDevice(std::forward<Args>(args)...); }

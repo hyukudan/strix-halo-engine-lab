@@ -8,7 +8,7 @@ struct Api {
     struct EventData {};
     using Event=EventData*; using Stream=void*;
     static constexpr auto backend=strix::weight::Backend::cuda;
-    static constexpr int Success=0,EventDisableTiming=1,MemcpyHostToDevice=2;
+    static constexpr int Success=0,OutOfMemory=1,EventDisableTiming=1,MemcpyHostToDevice=2;
     inline static int allocations=0,frees=0,events=0;
     inline static bool complete=false;
     static std::string arch(const Properties&) { return "fake-arch"; }

@@ -16,6 +16,7 @@ struct Api {
     using Error=cudaError_t; using Properties=cudaDeviceProp; using Event=cudaEvent_t; using Stream=cudaStream_t;
     static constexpr auto backend=strix::weight::Backend::cuda;
     static constexpr auto Success=cudaSuccess;
+    static constexpr auto OutOfMemory=cudaErrorMemoryAllocation;
     static constexpr auto EventDisableTiming=cudaEventDisableTiming;
     static constexpr auto MemcpyHostToDevice=cudaMemcpyHostToDevice;
     template<class... Args> static auto SetDevice(Args&&... args) { return cudaSetDevice(std::forward<Args>(args)...); }

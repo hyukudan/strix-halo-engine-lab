@@ -55,7 +55,7 @@ Status eligible(const ResolveRequest& r, const Candidate& c) {
     return {Error::ok, {}};
 }
 }
-Status resolve(const Registry& registry, const ResolveRequest& r, std::span<const Candidate> candidates,
+static Status resolve_impl(const Registry& registry, const ResolveRequest& r, std::span<const Candidate> candidates,
                std::span<const Qualification> qualifications, Plan& out) {
     if (!r.tensor) return {Error::malformed, "missing admitted tensor"};
     if (std::none_of(registry.arithmetic.begin(), registry.arithmetic.end(), [&](const auto& a) { return a.id == r.required_arithmetic; }))
@@ -94,6 +94,13 @@ Status resolve(const Registry& registry, const ResolveRequest& r, std::span<cons
     out = std::move(plan);
     return {Error::ok, {}};
 }
+Status resolve(const Registry& registry, const ResolveRequest& request, std::span<const Candidate> candidates,
+               std::span<const Qualification> qualifications, Plan& out) {
+    auto status=resolve_impl(registry,request,candidates,qualifications,out);
+    if (!status) status.detail += "; dependency=descriptor/source eligibility (src/weight/resolve.cpp:eligible); fixture=legacy bytes for this request; removal=satisfy the named constraint and qualify matching arithmetic";
+    return status;
+}
+
 std::string effective_config(const WeightMap& map, std::span<const Plan> plans) {
     std::ostringstream out;
     for (std::size_t i = 0; i < map.size(); ++i) {

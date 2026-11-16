@@ -11,7 +11,7 @@ struct Pending { void* data; std::vector<void*> events; std::uint32_t device; bo
 template<class Api> struct NativeRuntime {
 inline static std::mutex retired_mutex;
 inline static std::vector<Pending> retired;
-static Status check(typename Api::Error error) { return error==Api::Success ? Status{Error::ok,{}} : Status{Error::device_failure,Api::GetErrorString(error)}; }
+static Status check(typename Api::Error error) { return error==Api::Success ? Status{Error::ok,{}} : Status{error==Api::OutOfMemory ? Error::memory_budget : Error::device_failure,Api::GetErrorString(error)}; }
 static void collect() {
     std::lock_guard lock(retired_mutex);
     for (auto it=retired.begin(); it!=retired.end();) {
