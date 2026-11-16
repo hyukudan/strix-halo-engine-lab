@@ -3474,6 +3474,10 @@ static int run_decode_entry(
     strix::qwen_pp::PromptRoute pair_prompt_route;
     const char* pair_cut_env = std::getenv("STRIX_QWEN_PF_PIPE_CUT");
     const char* pair_cost_env = std::getenv("STRIX_QWEN_PF_PIPE_COSTS");
+    // PR-3 stage emulation: the pair chunk (STRIX_QWEN_PF_PIPE_CHUNK) is the tile, as the pair route sets it.
+    if (!strix::qwen_pp::pipe_enabled() && std::getenv("STRIX_QWEN_PF_STAGE_EMULATE") && options.known_prefix_prefill_rows)
+        if (const char* emulate_chunk = std::getenv("STRIX_QWEN_PF_PIPE_CHUNK"); emulate_chunk && *emulate_chunk)
+            options.known_prefix_prefill_rows = static_cast<std::uint32_t>(std::strtoul(emulate_chunk, nullptr, 10));
     if (strix::qwen_pp::pipe_enabled()) {
         strix::qwen_pp::LegalCuts pair_legal{};
         for (std::uint32_t pair_layer = 1; pair_layer < 48U; ++pair_layer) {
