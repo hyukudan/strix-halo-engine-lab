@@ -1190,6 +1190,7 @@ static strix::decode_cli::CacheFamilyIdentity resolved_cache_family(
     c.cohort=strix::decode_cli::MtpBatchRunner::prompt_window_cohort(); c.small=number("STRIX_BATCH_PROMPT_SMALL",0)!=0;
     c.windows=number("STRIX_PROMPT_WINDOW",1)!=0;
     c.nest_rows=number("STRIX_BATCH_NEST_ROWS",2048); c.short_rows=number("STRIX_BATCH_SHORT_FIRST_ROWS",2048);
+    if(options.batch_cache_solo && runner==strix::decode_cli::CacheRunner::batch_mtp) {c.groups=false;c.cohort=false;c.nest_rows=0;}
     c.lookahead=number("STRIX_BATCH_SERVICE_LOOKAHEAD",2); c.cancel=number("STRIX_BATCH_CANCEL_POINTS",1)!=0;
     c.interleave=number("STRIX_BATCH_INTERLEAVE",options.http_serve?1:0);
     const char* service=std::getenv("STRIX_BATCH_SERVICE_MS"); c.service_ms=service?std::max(0.0,std::atof(service)):250;
@@ -1728,6 +1729,11 @@ static int run_decode_entry(
         {options, requested_environment, !target_input_export}, model, info, manifest,
         admitted_content, prompt_capabilities, prompt_memory);
     options = effective.options;
+    std::optional<strix::qwen_pp::PairPolicy> pair_policy;
+    if (strix::qwen_pp::pipe_enabled())
+        pair_policy = strix::qwen_pp::resolve_pair_policy(options.tokens.size(),
+            strix::qwen_pp::decode_enabled() ? strix::qwen_pp::PairExecution::handoff :
+                                             strix::qwen_pp::PairExecution::prefill_only);
     {
         // Shared route receipt: the prefill route this entry point resolved (the CLI and the HTTP server resolve
         // differently from the same switches), requested vs effective, with the selector's own reason text.
@@ -1821,14 +1827,16 @@ static int run_decode_entry(
     std::cerr << effective.serve_prefill_notice << strix::decode_cli::effective_config_notice(effective);
     if (options.print_effective_config && options.deployment_spec) {
         deployment.resolve(effective, model, manifest, mapped.bytes(), prompt_memory);
-        std::cout << deployment.json() << '\n';
+        const auto config = deployment.json();
+        std::cout << (pair_policy ? strix::qwen_pp::inspect_pair_policy(config, *pair_policy) : config) << '\n';
         return deployment.plan->refused ? 2 : 0;
     }
     if (options.http_serve || !options.print_effective_config)
         strix::decode_cli::validate_effective_startup(effective);
     strix::decode_cli::validate_http_serving_memory(options,prompt_memory);
     if (options.print_effective_config) {
-        std::cout << strix::decode_cli::effective_config_json(effective);
+        const auto config = strix::decode_cli::effective_config_json(effective);
+        std::cout << (pair_policy ? strix::qwen_pp::inspect_pair_policy(config, *pair_policy) : config);
         return 0;
     }
     if (options.deployment_spec) {
@@ -3499,11 +3507,16 @@ static int run_decode_entry(
             pair_prediction.half = pair_cut.half;
         }
         const auto pair_legacy_rows = options.known_prefix_prefill_rows;
-        const auto choice = strix::qwen_pp::choose_chunk(std::getenv("STRIX_QWEN_PF_PIPE_CHUNK"),
-            pair_legacy_rows, options.tokens.size(), pair_cost_bucket ? &*pair_cost_bucket : nullptr, pair_prediction);
-        options.known_prefix_prefill_rows = choice.rows;
-        pair_prompt_route = strix::qwen_pp::choose_prompt_route(options.tokens.size(), choice.rows,
-            pair_cost_bucket ? &*pair_cost_bucket : nullptr, pair_prediction);
+        const auto pair_route = strix::qwen_pp::resolve_pair_route(options.tokens.size(), pair_legacy_rows,
+            std::getenv("STRIX_QWEN_PF_PIPE_CHUNK"), pair_cost_bucket ? &*pair_cost_bucket : nullptr, pair_prediction,
+            pair_policy->chunk_policy.on, pair_policy->single_tiles.on, pair_policy->execution);
+        const auto& choice = pair_route.chunk;
+        options.known_prefix_prefill_rows = pair_route.tile_rows;
+        pair_prompt_route = pair_route.route;
+        std::fprintf(stderr, "qwen-pair regime policy=%s mode=%s chunk=%u chunks=%llu model-pipeline-ms=%.0f "
+            "model-single-ms=%.0f tile-rows=%u\n", pair_route.policy, pair_prompt_route.prefix ? "pipeline" : "single",
+            choice.rows, static_cast<unsigned long long>(pair_route.chunks), pair_route.model.pipeline_ms,
+            pair_route.model.single_ms, pair_route.tile_rows);
         std::fprintf(stderr, "qwen-handoff route=%s prefix=%llu suffix=%llu\n", pair_prompt_route.reason,
             static_cast<unsigned long long>(pair_prompt_route.prefix),
             static_cast<unsigned long long>(options.tokens.size() - pair_prompt_route.prefix));
@@ -4138,18 +4151,20 @@ static int run_decode_entry(
                 throw std::logic_error("tiled MTP prompt lacks its tiled prefill owners");
             auto& tiled = parents->tiled;
             tiled.blocks = known_prefix_backend.get(); tiled.block_owner = known_prefix_owner;
-            for (std::size_t t = 0; t < known_tail_backends.size(); ++t)
-                tiled.tails.push_back({known_tail_backends[t].get(), known_tail_owners[t], options.known_prefix_tail_rows[t]});
+            for (std::size_t t = 0; t < known_tail_backends.size(); ++t) {
+                if (strix::decode_cli::known_prefix_tail_tiles_prompts(options, options.known_prefix_tail_rows[t], compiled_prefill.has_value())) {
+                    tiled.tails.push_back({known_tail_backends[t].get(), known_tail_owners[t], options.known_prefix_tail_rows[t]});
+                    strix::decode_cli::QwenPlanOwner owner;
+                    owner.execution=known_tail_plans[t]->prefill_execution_identity;
+                    owner.kernel=known_tail_plans[t]->prefill_kernel_plan_identity;
+                    tiled.numerical_plan.tails.push_back(owner);
+                }
+            }
             for (std::size_t w = 0; w < known_wide_owners.size(); ++w)
                 tiled.wide.push_back({nullptr, known_wide_owners[w], options.mtp.copy_wide_rows[w]});
             tiled.rows = options.known_prefix_prefill_rows;
             tiled.numerical_plan.block.execution=known_prefill_plan->prefill_execution_identity;
             tiled.numerical_plan.block.kernel=known_prefill_plan->prefill_kernel_plan_identity;
-            for(const auto& tail:known_tail_plans) {
-                strix::decode_cli::QwenPlanOwner owner;
-                owner.execution=tail->prefill_execution_identity;owner.kernel=tail->prefill_kernel_plan_identity;
-                tiled.numerical_plan.tails.push_back(owner);
-            }
             tiled.numerical_plan.decode_execution=compiled.execution_identity;
             tiled.numerical_plan.decode_kernel=compiled.kernel_plan_identity;
             tiled.numerical_plan.prefill_execution=compiled_prefill?compiled_prefill->execution_identity:compiled.execution_identity;
@@ -4311,6 +4326,7 @@ static int run_decode_entry(
             std::shared_ptr<strix::HipKnownPrefixWindow> block_owner;
             std::unique_ptr<strix::HipKnownPromptBackend> blocks;
             std::vector<std::shared_ptr<strix::HipKnownPrefixWindow>> tail_owners;
+            std::vector<std::shared_ptr<strix::HipKnownPrefixWindow>> wide_owners;  // split profile: decode-profile wide owners
             std::vector<std::unique_ptr<strix::HipKnownPromptBackend>> tails;
             std::unique_ptr<strix::decode_cli::HipPrefixStateCacheSession> cache;
             // Split prefill profile: the sibling prefill execution's view of this slot's serial scratch and
@@ -4403,6 +4419,13 @@ static int run_decode_entry(
                     known_tail_memories[t]->scratch, model.vocab_size, original_work_device));
                 hand_off(*stack.tails.back());
             }
+            // --mtp-copy-wide-rows under a split prefill profile: the slot's decode-profile wide owners (as the CLI's
+            // known_wide_owners; their scratch is shared like the tails': the server runs a wide cycle only while one
+            // request is active)
+            for (std::size_t w = 0; w < known_wide_plans.size() && w < known_wide_memories.size(); ++w)
+                stack.wide_owners.push_back(std::make_shared<strix::HipKnownPrefixWindow>(*known_wide_plans[w], compiled, model,
+                    catalog_config, stack.parents->resources, known_wide_memories[w]->scratch, known_wide_memories[w]->scope,
+                    std::static_pointer_cast<const void>(known_wide_memories[w]), workspace(known_wide_memories[w])));
             if (prefix_store)
                 stack.cache = std::make_unique<strix::decode_cli::HipPrefixStateCacheSession>(prefix_store, prefix_cache_identity,
                     prefix_cache_unit(options), prefix_cache_every, model, state_layout, stack.memory->state());
@@ -4412,16 +4435,20 @@ static int run_decode_entry(
             if(stack.cache) stack.cache->set_staging_cap(options.prefix_cache_staging_bytes);
             auto& tiled = stack.parents->tiled;
             tiled.blocks = stack.blocks.get(); tiled.block_owner = stack.block_owner;
-            for (std::size_t t = 0; t < stack.tails.size(); ++t)
-                tiled.tails.push_back({stack.tails[t].get(), stack.tail_owners[t], options.known_prefix_tail_rows[t]});
+            for (std::size_t t = 0; t < stack.tails.size(); ++t) {
+                if (strix::decode_cli::known_prefix_tail_tiles_prompts(options, options.known_prefix_tail_rows[t], compiled_prefill.has_value())) {
+                    tiled.tails.push_back({stack.tails[t].get(), stack.tail_owners[t], options.known_prefix_tail_rows[t]});
+                    strix::decode_cli::QwenPlanOwner owner;
+                    owner.execution=known_tail_plans[t]->prefill_execution_identity;
+                    owner.kernel=known_tail_plans[t]->prefill_kernel_plan_identity;
+                    tiled.numerical_plan.tails.push_back(owner);
+                }
+            }
+            for (std::size_t w = 0; w < stack.wide_owners.size(); ++w)
+                tiled.wide.push_back({nullptr, stack.wide_owners[w], options.mtp.copy_wide_rows[w]});
             tiled.rows = options.known_prefix_prefill_rows;
             tiled.numerical_plan.block.execution=known_prefill_plan->prefill_execution_identity;
             tiled.numerical_plan.block.kernel=known_prefill_plan->prefill_kernel_plan_identity;
-            for(const auto& tail:known_tail_plans) {
-                strix::decode_cli::QwenPlanOwner owner;
-                owner.execution=tail->prefill_execution_identity;owner.kernel=tail->prefill_kernel_plan_identity;
-                tiled.numerical_plan.tails.push_back(owner);
-            }
             tiled.numerical_plan.decode_execution=compiled.execution_identity;
             tiled.numerical_plan.decode_kernel=compiled.kernel_plan_identity;
             tiled.numerical_plan.prefill_execution=compiled_prefill?compiled_prefill->execution_identity:compiled.execution_identity;
@@ -4500,7 +4527,12 @@ static int run_decode_entry(
                 if (!observation.gtt_limit || !observation.gtt_used || *observation.gtt_used > *observation.gtt_limit) return {};
                 return *observation.gtt_limit - *observation.gtt_used;
             };
-            const auto serving = prompt_memory.serving(options);
+            auto serving = prompt_memory.serving(options);
+            // The bridge builds a wide workspace for every slot, including slot zero.
+            // The stack probe below does not build these; charge them as future slot commitments.
+            const auto wide_bytes = mtp_wide_copy_retained_bytes(model, state_layout, mtp_wide_copy_rows_effective(options));
+            serving.slot_host = add(serving.slot_host, wide_bytes);
+            serving.slot_device = add(serving.slot_device, wide_bytes);
             // Future commitments exclude the already resident primary stack and tiled arenas.
             auto slot_metadata = known_prefill_plan->host_metadata_payload_bytes;
             for (const auto& tail : known_tail_plans) slot_metadata = add(slot_metadata, tail->host_metadata_payload_bytes);
@@ -4606,10 +4638,13 @@ static int run_decode_entry(
                 ? capacity.slots : 0U;
             const bool pool_fallback = !single_route && !batch_slots &&
                 qsa_mtp_pool_single_fallback_pending(options, strix::qpf2k::has_gsq_gate(manifest));
-            options.http_batch = static_cast<std::uint32_t>(batch_slots);
+            resolve_batch_cache_scheduler(options, requested_environment, static_cast<std::uint32_t>(batch_slots));
             if (pool_fallback) {
                 // Batch sizing excluded the pool; the single runner keeps it only if its one slot still fits with it.
-                const auto single = resolve_http_bridge_capacity(retained, prompt_memory.serving(options),
+                auto single_serving = prompt_memory.serving(options);
+                single_serving.slot_host = add(single_serving.slot_host, wide_bytes);
+                single_serving.slot_device = add(single_serving.slot_device, wide_bytes);
+                const auto single = resolve_http_bridge_capacity(retained, single_serving,
                     fit_host, fit_device, headroom, headroom, 1U);
                 options.qsa_mtp_pool_fallback_unfit = !single.slots;
                 std::cerr << "qsa-mtp-pool single-fallback enabled=" << (single.slots ? 1 : 0) << " reserved_bytes="

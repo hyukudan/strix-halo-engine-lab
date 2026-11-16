@@ -194,6 +194,7 @@ add_library(strix_core STATIC
     src/model_manifest.cpp
     src/model_family_registry.cpp
     src/cost_table_cache.cpp
+    src/logprob_partials.cpp
 )
 else()
 add_library(strix_core STATIC
@@ -202,6 +203,7 @@ add_library(strix_core STATIC
     src/greedy_serving_scheduler.cpp
     src/serving_cohort.cpp
     src/generation_output.cpp
+    src/logprob_partials.cpp
     src/known_prompt_chunks.cpp
     src/known_prefix_prefill.cpp
     src/known_prefix_prefill_runtime.cpp
@@ -398,6 +400,11 @@ target_include_directories(strix_ds41_http_session_owner PUBLIC src)
 target_link_libraries(strix_ds41_http_session_owner PUBLIC strix_session_owner)
 strix_target_warnings(strix_ds41_http_session_owner)
 if(BUILD_TESTING)
+    add_executable(strix-exact-reduce-contract-tests tests/exact_reduce_contract_tests.cpp)
+    target_compile_features(strix-exact-reduce-contract-tests PRIVATE cxx_std_20)
+    strix_target_warnings(strix-exact-reduce-contract-tests)
+    add_test(NAME strix-exact-reduce-contract-tests COMMAND strix-exact-reduce-contract-tests)
+
     add_executable(strix-dist-transport-spec-tests tests/dist_transport_spec_tests.cpp)
     target_include_directories(strix-dist-transport-spec-tests PRIVATE include)
     target_compile_features(strix-dist-transport-spec-tests PRIVATE cxx_std_20)
@@ -1356,6 +1363,10 @@ if(BUILD_TESTING)
     target_link_libraries(strix-generation-output-tests PRIVATE strix_core)
     strix_target_warnings(strix-generation-output-tests)
     add_test(NAME strix-generation-output-tests COMMAND strix-generation-output-tests)
+    add_executable(strix-logprob-partials-tests tests/logprob_partials_tests.cpp)
+    target_link_libraries(strix-logprob-partials-tests PRIVATE strix_core)
+    strix_target_warnings(strix-logprob-partials-tests)
+    add_test(NAME strix-logprob-partials-tests COMMAND strix-logprob-partials-tests)
     add_executable(strix-greedy-serving-scheduler-tests tests/greedy_serving_scheduler_tests.cpp)
     target_link_libraries(strix-greedy-serving-scheduler-tests PRIVATE strix_core)
     strix_target_warnings(strix-greedy-serving-scheduler-tests)
@@ -2602,6 +2613,12 @@ int main() { return 0; }"
             target_compile_options(strix-hip-route-prune-tests PRIVATE -mno-wavefrontsize64 -fno-fast-math -ffp-contract=off -fhip-fp32-correctly-rounded-divide-sqrt -fdenormal-fp-math=ieee)
             strix_target_warnings(strix-hip-route-prune-tests)
             add_test(NAME strix-hip-route-prune-tests COMMAND strix-hip-route-prune-tests)
+            add_executable(strix-hip-exact-reduce-tests tests/hip_exact_reduce_tests.hip)  # core/ordered_reduce trees + CSR wave scan vs the LDS loops
+            target_link_libraries(strix-hip-exact-reduce-tests PRIVATE strix_core)
+            set_target_properties(strix-hip-exact-reduce-tests PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHS}")
+            target_compile_options(strix-hip-exact-reduce-tests PRIVATE -mno-wavefrontsize64 -fno-fast-math -ffp-contract=off -fhip-fp32-correctly-rounded-divide-sqrt -fdenormal-fp-math=ieee)
+            strix_target_warnings(strix-hip-exact-reduce-tests)
+            add_test(NAME strix-hip-exact-reduce-tests COMMAND strix-hip-exact-reduce-tests)
             add_test(NAME strix-hip-moe-wmma-prefill-tests COMMAND strix-hip-moe-wmma-prefill-tests)
             add_test(NAME strix-hip-moe-route-bf16-tests COMMAND strix-hip-moe-wmma-prefill-tests route-bf16)
             add_test(NAME strix-hip-moe-prefill-pool16k-tests COMMAND strix-hip-moe-wmma-prefill-tests pool16k)
@@ -2686,6 +2703,14 @@ int main() { return 0; }"
         src/hip_shared_expert_launcher.hip
         src/hip_dense_trellis.hip
     )
+    # HIP backend core, model-agnostic: logprob partials of device rows (strix/logprob_partials.hpp); its own small
+    # library so any engine binds it without the whole runtime (DS41 batch forward, the runtime's own users).
+    add_library(strix_hip_logprob STATIC src/hip_logprob_partials.hip)
+    target_include_directories(strix_hip_logprob PUBLIC include)
+    target_include_directories(strix_hip_logprob SYSTEM PUBLIC "${STRIX_HIP_INCLUDE_DIR}")
+    set_target_properties(strix_hip_logprob PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHS}")
+    target_link_libraries(strix_hip_logprob PUBLIC strix_core "${STRIX_HIP_RUNTIME_LIBRARY}")
+    target_compile_definitions(strix_hip_logprob PUBLIC $<$<COMPILE_LANGUAGE:CXX>:__HIP_PLATFORM_AMD__=1>)
     target_include_directories(
         strix_hip_runtime
         PUBLIC
@@ -2718,6 +2743,7 @@ int main() { return 0; }"
         strix_hip_runtime
         PUBLIC
         strix_core
+        strix_hip_logprob
         "${STRIX_HIP_RUNTIME_LIBRARY}"
     )
     if(STRIX_ENABLE_EXPERIMENTAL_Q4K_A8_RUNTIME)
@@ -2727,6 +2753,9 @@ int main() { return 0; }"
     set_source_files_properties(src/hip_qsa_selection_diagnostic.hip
         PROPERTIES COMPILE_OPTIONS "-mno-wavefrontsize64;-fno-fast-math")
     set_source_files_properties(src/hip_dense_trellis.hip
+        PROPERTIES COMPILE_OPTIONS "-mno-wavefrontsize64;-fno-fast-math;-ffp-contract=off;-fdenormal-fp-math=ieee")
+    # logprob partials: the nonfinite test and the contract's FP32 lane order hold as written
+    set_source_files_properties(src/hip_logprob_partials.hip tests/hip_logprob_partials_tests.hip
         PROPERTIES COMPILE_OPTIONS "-mno-wavefrontsize64;-fno-fast-math;-ffp-contract=off;-fdenormal-fp-math=ieee")
     set_source_files_properties(src/hip_mtp_input_fusion.hip
         PROPERTIES COMPILE_OPTIONS "-mno-wavefrontsize64;-fno-fast-math;-ffp-contract=off;-fhip-fp32-correctly-rounded-divide-sqrt;-fdenormal-fp-math=ieee")
@@ -3712,6 +3741,11 @@ int main() { return 0; }"
         target_link_libraries(strix-hip-generation-output-tests PRIVATE strix_hip_runtime)
         strix_target_warnings(strix-hip-generation-output-tests)
         add_test(NAME strix-hip-generation-output-tests COMMAND strix-hip-generation-output-tests)
+        add_executable(strix-hip-logprob-partials-tests tests/hip_logprob_partials_tests.hip)
+        set_target_properties(strix-hip-logprob-partials-tests PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHS}")
+        target_link_libraries(strix-hip-logprob-partials-tests PRIVATE strix_hip_runtime strix_core)
+        strix_target_warnings(strix-hip-logprob-partials-tests)
+        add_test(NAME strix-hip-logprob-partials-tests COMMAND strix-hip-logprob-partials-tests)
         set_target_properties(strix-hip-gdn-lm-wave8-diagnostic-tests PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHS}")
         target_link_libraries(strix-hip-gdn-lm-wave8-diagnostic-tests PRIVATE strix_hip_runtime)
         strix_target_warnings(strix-hip-gdn-lm-wave8-diagnostic-tests)
@@ -4318,6 +4352,7 @@ if(STRIX_ENABLE_HIP_RUNTIME)
     target_include_directories(strix_ds41_xport PUBLIC include "${STRIX_HIP_INCLUDE_DIR}")
     list(APPEND strix_ds41_hip_targets strix_ds41_xport)
     add_library(strix_ds41_batch_forward STATIC src/hip_deepseek41_batch_forward.hip)
+    target_link_libraries(strix_ds41_batch_forward PUBLIC strix_hip_logprob)
     target_link_libraries(strix_ds41_batch_forward PUBLIC strix_ds41_xport strix_ds41_prepared_load strix_ds41_layer_hip strix_ds41_attention_hip strix_ds41_runtime strix_dist strix_ds41_trellis_hip strix_ds41_pipeline)
     target_include_directories(strix_ds41_batch_forward PUBLIC include "${STRIX_HIP_INCLUDE_DIR}")
     list(APPEND strix_ds41_hip_targets strix_ds41_batch_forward)
@@ -4719,15 +4754,29 @@ if(STRIX_ENABLE_CUDA_DS41)
     endif()
     enable_language(CUDA)
     find_package(CUDAToolkit REQUIRED)
-    set(STRIX_DS41_CUDA_SOURCES src/cuda/ds41_cuda_common.cu src/cuda/ds41_core.cu src/cuda/ds41_core_norm.cu
-        src/cuda/ds41_core_moe.cu src/cuda/ds41_core_io.cu src/cuda/ds41_core_mma.cu src/cuda/ds41_router_v2.cu
-        src/cuda/ds41_core_layer.cu)
+    set(STRIX_DS41_CUDA_SOURCES src/cuda/models/ds41/ds41_cuda_common.cu src/cuda/models/ds41/ds41_core.cu src/cuda/models/ds41/ds41_core_norm.cu
+        src/cuda/models/ds41/ds41_core_moe.cu src/cuda/models/ds41/ds41_core_io.cu src/cuda/models/ds41/ds41_core_mma.cu src/cuda/models/ds41/ds41_router_v2.cu
+        src/cuda/models/ds41/ds41_core_layer.cu)
     # Every deepseek41 CUDA binary resolves its device through the start gate before its first allocation.
     include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/StrixDevice.cmake)
+    include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/StrixCudaBackend.cmake)
     add_library(strix_ds41_cuda STATIC ${STRIX_DS41_CUDA_SOURCES})
-    target_link_libraries(strix_ds41_cuda PUBLIC strix_ds41_layer strix_ds41_formats strix_family_deepseek41 strix_device CUDA::cudart)
+    target_link_libraries(strix_ds41_cuda PUBLIC strix_ds41_layer strix_ds41_formats strix_family_deepseek41 strix_device strix_cuda_core CUDA::cudart)
     target_include_directories(strix_ds41_cuda PUBLIC include)
     set(strix_ds41_cuda_targets strix_ds41_cuda)
+    # CUDA backend core, model-agnostic: logprob partials of device rows (same contract as src/hip_logprob_partials.hip)
+    add_library(strix_cuda_logprob STATIC src/cuda/logprob_partials.cu)
+    target_link_libraries(strix_cuda_logprob PUBLIC strix_core CUDA::cudart)
+    target_include_directories(strix_cuda_logprob PUBLIC include)
+    target_compile_options(strix_cuda_logprob PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--fmad=false>)
+    list(APPEND strix_ds41_cuda_targets strix_cuda_logprob)
+    if(BUILD_TESTING)
+        add_executable(strix-cuda-logprob-partials-tests tests/cuda/logprob_partials_tests.cu)
+        target_link_libraries(strix-cuda-logprob-partials-tests PRIVATE strix_cuda_logprob strix_core)
+        target_compile_options(strix-cuda-logprob-partials-tests PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--fmad=false>)
+        add_test(NAME strix-cuda-logprob-partials-tests COMMAND strix-cuda-logprob-partials-tests)
+        list(APPEND strix_ds41_cuda_targets strix-cuda-logprob-partials-tests)
+    endif()
     if(BUILD_TESTING)
         add_executable(strix-cuda-ds41-core-tests tests/cuda/ds41_core_tests.cu)
         target_link_libraries(strix-cuda-ds41-core-tests PRIVATE strix_ds41_cuda strix_ds41_layer strix_ds41_formats)
@@ -4753,7 +4802,7 @@ if(STRIX_ENABLE_CUDA_DS41)
         list(APPEND strix_ds41_cuda_targets strix-cuda-ds41-decode-fusions-tests)
     endif()
     # routed experts: decode GEMVs, prefill grouped GEMM, device routes and the combine (docs/models/deepseek-v4.1/cuda-numeric-identity.md)
-    add_library(strix_ds41_cuda_moe STATIC src/cuda/ds41_moe.cu src/cuda/ds41_moe_grouped.cu src/cuda/ds41_moe_fast.cu src/cuda/ds41_moe_v2.cu)
+    add_library(strix_ds41_cuda_moe STATIC src/cuda/models/ds41/ds41_moe.cu src/cuda/models/ds41/ds41_moe_grouped.cu src/cuda/models/ds41/ds41_moe_fast.cu src/cuda/models/ds41/ds41_moe_v2.cu)
     target_link_libraries(strix_ds41_cuda_moe PUBLIC strix_ds41_cuda strix_ds41_formats)
     list(APPEND strix_ds41_cuda_targets strix_ds41_cuda_moe)
     # v1 vs v2 decode kernels on real tensors (bitwise + interleaved timing)
@@ -4777,8 +4826,8 @@ if(STRIX_ENABLE_CUDA_DS41)
         target_link_libraries(strix-cuda-ds41-moe-fast-tests PRIVATE strix_ds41_cuda_moe)
         list(APPEND strix_ds41_cuda_targets strix-cuda-ds41-moe-fast-tests)
     endif()
-    add_library(strix_ds41_cuda_attn STATIC src/cuda/ds41_attention.cu src/cuda/ds41_attention_state.cu src/cuda/ds41_attention_export.cu
-        src/cuda/ds41_fast_attention.cu src/cuda/ds41_fast_index.cu)
+    add_library(strix_ds41_cuda_attn STATIC src/cuda/models/ds41/ds41_attention.cu src/cuda/models/ds41/ds41_attention_state.cu src/cuda/models/ds41/ds41_attention_export.cu
+        src/cuda/models/ds41/ds41_fast_attention.cu src/cuda/models/ds41/ds41_fast_index.cu)
     target_link_libraries(strix_ds41_cuda_attn PUBLIC strix_ds41_cuda strix_ds41_attention strix_ds41_runtime)  # runtime: the decode state format
     list(APPEND strix_ds41_cuda_targets strix_ds41_cuda_attn)
     if(BUILD_TESTING)
@@ -4796,8 +4845,8 @@ if(STRIX_ENABLE_CUDA_DS41)
         list(APPEND strix_ds41_cuda_targets strix-cuda-ds41-fast-attention-tests)
     endif()
     # prefill driver: the DevicePrefill plan on the CUDA kernels, tiered routed experts, Engram rows from the file
-    add_library(strix_ds41_cuda_prefill STATIC src/cuda/ds41_prefill_driver.cu src/cuda/ds41_prefill_kernels.cu src/cuda/ds41_prefill_q8.cu
-        src/cuda/ds41_dense_fast.cu src/cuda/ds41_expert_streamer.cu src/cuda/ds41_gpu_profile.cu src/ds41_file_reader.cpp)
+    add_library(strix_ds41_cuda_prefill STATIC src/cuda/models/ds41/ds41_prefill_driver.cu src/cuda/models/ds41/ds41_prefill_kernels.cu src/cuda/models/ds41/ds41_prefill_q8.cu
+        src/cuda/models/ds41/ds41_dense_fast.cu src/cuda/models/ds41/ds41_expert_streamer.cu src/cuda/models/ds41/ds41_gpu_profile.cu src/ds41_file_reader.cpp)
     target_link_libraries(strix_ds41_cuda_prefill PUBLIC strix_ds41_cuda_attn strix_ds41_cuda_moe strix_ds41_cuda strix_ds41_prefill
         strix_ds41_runtime strix_ds41_layer strix_family_deepseek41 ${CMAKE_DL_LIBS})
     if(STRIX_TIERSTREAM_DIR AND strix_mfile_define)
@@ -4865,14 +4914,14 @@ if(STRIX_ENABLE_CUDA_DS41)
     target_link_libraries(strix-ds41-engram-pages PRIVATE strix_ds41_layer strix_family_deepseek41)
     list(APPEND strix_ds41_cuda_targets strix-ds41-engram-pages)
     # parts-host: resident-expert routes, the seeded combine and the layer driver with expert servers
-    add_library(strix_ds41_cuda_parts_host STATIC src/cuda/ds41_parts_host.cu src/cuda/ds41_parts_host_driver.cpp)
+    add_library(strix_ds41_cuda_parts_host STATIC src/cuda/models/ds41/ds41_parts_host.cu src/cuda/models/ds41/ds41_parts_host_driver.cpp)
     target_link_libraries(strix_ds41_cuda_parts_host PUBLIC strix_ds41_cuda_moe strix_ds41_xrpc)
     if(strix_dsrtxk_bench_needs_parts_host)
         target_link_libraries(strix-cuda-ds41-kern-bench PRIVATE strix_ds41_cuda_parts_host)
     endif()
     list(APPEND strix_ds41_cuda_targets strix_ds41_cuda_parts_host)
     # residency from a hot-expert placement (static + dynamic slots) and the decode replay over recorded routes
-    add_library(strix_ds41_cuda_hot_residency STATIC src/cuda/ds41_hot_residency.cpp src/cuda/ds41_hot_site.cu src/gguf_reader.cpp)
+    add_library(strix_ds41_cuda_hot_residency STATIC src/cuda/models/ds41/ds41_hot_residency.cpp src/cuda/models/ds41/ds41_hot_site.cu src/gguf_reader.cpp)
     target_link_libraries(strix_ds41_cuda_hot_residency PUBLIC strix_ds41_cuda_parts_host strix_ds41_hot_placement CUDA::cuda_driver)
     list(APPEND strix_ds41_cuda_targets strix_ds41_cuda_hot_residency)
     add_executable(strix-cuda-ds41-parts-host-check apps/cuda_ds41_parts_host_check.cpp)
@@ -4886,7 +4935,7 @@ if(STRIX_ENABLE_CUDA_DS41)
     # (device arena + pinned host tier + lookahead): needs a CUDA build of tierstream (STRIX_TIERSTREAM_DIR)
     if(STRIX_TIERSTREAM_DIR)
         target_link_libraries(strix_tierstream INTERFACE CUDA::cudart CUDA::cuda_driver)
-        add_library(strix_ds41_cuda_tier STATIC src/cuda/ds41_tier_site.cu)
+        add_library(strix_ds41_cuda_tier STATIC src/cuda/models/ds41/ds41_tier_site.cu)
         target_link_libraries(strix_ds41_cuda_tier PUBLIC strix_ds41_cuda_hot_residency strix_tierstream)
         list(APPEND strix_ds41_cuda_targets strix_ds41_cuda_tier)
         add_executable(strix-cuda-ds41-replica apps/cuda_ds41_replica.cu)
@@ -4946,7 +4995,7 @@ if(STRIX_ENABLE_CUDA_DS41)
         target_link_libraries(strix-ds41-dspark-table-tests PRIVATE strix_ds41_dspark)
         list(APPEND strix_ds41_cuda_targets strix-ds41-dspark-table-tests)
     endif()
-    add_library(strix_ds41_cuda_dspark STATIC src/cuda/ds41_dspark.cu)
+    add_library(strix_ds41_cuda_dspark STATIC src/cuda/models/ds41/ds41_dspark.cu)
     target_link_libraries(strix_ds41_cuda_dspark PUBLIC strix_ds41_cuda_moe strix_ds41_cuda strix_ds41_dspark)
     list(APPEND strix_ds41_cuda_targets strix_ds41_cuda_dspark)
     add_executable(strix-cuda-ds41-dspark-tests tests/cuda/ds41_dspark_tests.cu)
@@ -4963,7 +5012,7 @@ if(STRIX_ENABLE_CUDA_DS41)
     endif()
     # Strict arithmetic: no contraction into FMA, IEEE division and square root, denormals kept.
     if(STRIX_ENABLE_CUDA_TRELLIS)
-        add_library(strix_cuda_trellis STATIC src/cuda/trellis.cu)
+        add_library(strix_cuda_trellis STATIC ${STRIX_CUDA_CORE_TRELLIS_SOURCES})
         target_link_libraries(strix_cuda_trellis PUBLIC strix_ds41_cuda)
         list(APPEND strix_ds41_cuda_targets strix_cuda_trellis)
         # the decode step's trellis shared expert (CudaPrefillOptions::trellis_shexp)
