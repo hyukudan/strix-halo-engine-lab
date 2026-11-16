@@ -40,6 +40,26 @@ int main() try {
         const auto near = [](double a, double b, double eps) { return a - b < eps && b - a < eps; };
         // (1) v = 1 without hop cost is the two-stage rule, on a rows x chunk grid (Qwen 14-nov costs)
         const PipelineCost qwen{168.0, 0.5474, 35.0, 28.0, 0.0028, 0.536};
+        const auto infinity = std::numeric_limits<double>::infinity();
+        require(interleaved_wall_ms(std::numeric_limits<std::uint64_t>::max(), 2U, 1U, qwen) == infinity,
+            "ceil overflow is rejected before allocation");
+        require(interleaved_wall_ms(8U, 1U, std::numeric_limits<std::uint32_t>::max(), qwen) == infinity,
+            "stage count overflow is rejected before allocation");
+        require(interleaved_wall_ms(strix::pair::max_stage_events, 1U, 1U, qwen) == infinity,
+            "event budget bounds allocation products");
+        require(interleaved_wall_ms(8U, 0U, 1U, qwen) == infinity &&
+            interleaved_wall_ms(8U, 1U, 0U, qwen) == infinity &&
+            interleaved_wall_ms(8U, 1U, 1U, qwen, 0U) == infinity, "zero dimensions rejected");
+        require(strix::pair::valid_stage_shape(strix::pair::max_stage_events / 2U, 1U, 4U) &&
+            !strix::pair::valid_stage_shape(strix::pair::max_stage_events / 2U + 1U, 1U, 4U),
+            "inclusive event limit");
+        for (const auto invalid : {std::array<std::uint32_t, 5>{0U, 0U, 1U, 1U, 0U},
+                {0U, 0U, 1U, 0U, 4U}, {1U, 0U, 1U, 1U, 4U}, {0U, 1U, 1U, 1U, 4U}}) {
+            bool rejected = false;
+            try { (void)strix::pair::stage_sequence(invalid[0], invalid[1], invalid[2], invalid[3], invalid[4]); }
+            catch (const std::invalid_argument&) { rejected = true; }
+            require(rejected, "invalid stage sequence shape/index rejected");
+        }
         for (const std::uint64_t rows : {1000ULL, 3072ULL, 8192ULL, 12345ULL, 32768ULL, 131072ULL})
             for (const std::uint32_t chunk : {512U, 1024U, 2048U, 4096U, 8192U})
                 require(near(interleaved_wall_ms(rows, chunk, 1U, qwen), strix::pair::pipeline_wall_ms(rows, chunk, qwen), 1e-9),
@@ -69,12 +89,20 @@ int main() try {
         const std::array<std::uint32_t, 4> mm_chunks{512U, 1024U, 2048U, 4096U};
         const std::array<std::uint32_t, 6> mm_v{1U, 2U, 3U, 5U, 6U, 10U};
         const auto any = [](std::uint32_t) { return true; };
+        const auto oversized = strix::pair::choose_pipeline(std::numeric_limits<std::uint64_t>::max(),
+            qwen, mm_chunks, any, mm_v, any, {});
+        require(oversized.mode == Mode::single && oversized.chunk == 0U, "oversized candidates are not selected");
         const auto fits60 = [](std::uint32_t v) { return 2U * v <= 60U; };
         strix::pair::LayoutDecl tp2{strix::pair::Residency::tensor_split, 31.0e9, 41.6e9, "engine.hip:89-91,1120-1131"};
         const auto mm8 = strix::pair::choose_pipeline(8192U, mm, mm_chunks, any, mm_v, fits60, tp2);
         require(mm8.mode == Mode::tensor && mm8.reason.rfind("layout: engine.hip:89-91,1120-1131 needs +41.6 GB/node, free 31.0 GB", 0) == 0,
             "MiniMax 8K stays tensor for the layout");
         require(mm8.pipeline_ms > 9500.0 && mm8.pipeline_ms < 9700.0 && near(mm8.alt_ms, 9810.0, 1e-6), "MiniMax best ~9.6 s vs TP 9.81 s");
+        const auto rejected_line = strix::pair::effective_line(mm8);
+        require(rejected_line.find("mode=tensor") != std::string::npos &&
+            rejected_line.find(" candidate_pipeline_ms=") != std::string::npos &&
+            rejected_line.find(" alt_ms=9810 ") != std::string::npos &&
+            rejected_line.find(" predicted_ms=") == std::string::npos, "rejected candidate cost is labelled");
         tp2.node_free_bytes = 150.0e9;  // layout passed: the best pipeline is still inside run noise of TP2
         const auto mm8b = strix::pair::choose_pipeline(8192U, mm, mm_chunks, any, mm_v, fits60, tp2);
         require(mm8b.mode == Mode::tensor && mm8b.reason.rfind("min_gain:", 0) == 0, "MiniMax 8K under min_gain stays tensor");
