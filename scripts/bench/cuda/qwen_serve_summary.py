@@ -74,7 +74,8 @@ for (cls, C), v in sorted(rows.items()):
     wc = ' '.join(f'{100 * (v[(x, "warm")] / v[(x, "cold")] - 1):+7.1f}%' if (x, 'warm') in v and (x, 'cold') in v
                   else f'{"-":>8s}' for x in arms)
     rel = ''.join(f' {100 * (v.get((x, "cold"), 0) / v[(arms[0], "cold")] - 1):+6.1f},{100 * (v.get((x, "warm"), 0) / v[(arms[0], "warm")] - 1):+6.1f}%'
-                  if (arms[0], 'cold') in v and (arms[0], 'warm') in v else f' {"-":>14s}' for x in arms[1:])
+                  if all((y, p) in v for y in (arms[0], x) for p in ('cold', 'warm')) else f' {"-":>14s}'
+                  for x in arms[1:])
     print(f'{cls + " " + C:10s} {cells}  {wc}{rel}')
 diff = [k for k, v in ids.items() if len({json.dumps(x) for x in v.values()}) > 1 or any(x is None for x in v.values())]
 print(f'ids: {len(ids)} requests compared across {len(dirs)} arm runs, {len(diff)} differ or missing', diff[:6])
