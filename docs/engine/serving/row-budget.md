@@ -38,7 +38,9 @@ sessions; every wide launcher's session table holds that many (the GDN prepare/r
 once per eight sessions, each block on its own session's state). An earlier nine-request stall was a launcher that
 accepted only eight sessions. Measured on one node, nine requests: 171.8 against 211.8 ms per cycle, the same token ids
 per request as the old form. `ab` alternates 8 and 16 by cycle (in-process A/B: the receipt's `forwards` field tells
-the arms apart). Scheduling only: the 9..32-row wide steps keep every row's arithmetic.
+the arms apart). Scheduling only: the 9..32-row wide steps keep every row's arithmetic. Coverage: groups of 10 to 16
+live requests were not reached on the measured node (nine slots at 8K context); their token ids at 16 submitted
+requests match the old form, and the session split rests on the per-session state ownership above.
 
 ## Exactness
 

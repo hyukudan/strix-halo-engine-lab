@@ -9,6 +9,9 @@
 #include "strix/hip_gdn_lm_wave8_diagnostic.hpp"
 #endif
 #include "strix/hip_gdn_launcher.hpp"
+// A wide cohort step hands GDN up to kCohortWideMaxSessions sessions: the host segment tables must hold them all.
+static_assert(strix::gdn_window_cohort_max_segments >= strix::kCohortWideMaxSessions,
+              "GDN cohort segment capacity below the shared wide cohort session cap");
 #include "strix/recurrent_state_policy.hpp"
 #include "attn_core/recurrent_state.hpp"
 #include "hip_gdn_identity.hpp"
