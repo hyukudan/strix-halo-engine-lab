@@ -26,6 +26,7 @@
 #include "strix/device/cuda_enumerator.hpp"
 #include "cuda_qwen_prefix_cache.hpp"
 #include "strix/cuda/qwen_cohort.hpp"
+#include "strix/cuda/qwen_options.hpp"
 #include "strix/cuda/qwen_prefill.hpp"
 #include "strix/serve/api.hpp"
 #include "strix/serve/bpe_tokenizer.hpp"
@@ -56,6 +57,7 @@ std::string strix::render_preflight(const PreflightObservation&, const Preflight
 namespace qp = strix::cuda::qwen_prefill;
 namespace qc = strix::cuda::qwen_cohort;
 namespace px = strix::cuda::qwen_prefix;
+namespace qo = strix::cuda::qwen_options;
 namespace serve = strix::serve;
 using Clock = std::chrono::steady_clock;
 
@@ -65,7 +67,8 @@ std::atomic<bool> g_stop{false};
 void on_signal(int) { g_stop.store(true); }
 
 struct Options {
-    qp::Config engine;
+    qp::Config engine;                          // from the shared parser (qwen_options.hpp), serve role applied
+    std::string effective_config;               // --print-effective-config: JSON, printed instead of serving
     px::Settings prefix;
     std::string bind = "127.0.0.1", api_key_file, model_id = "qwen3.8-flash-next";
     int port = 8090;
@@ -85,9 +88,7 @@ struct Options {
 Options parse(int argc, char** argv) {
     Options o;
     if (const char* v = std::getenv("STRIX_QRTX_PREFIX_CACHE")) o.prefix.enabled = v[0] != '0';
-    o.engine.decode = true;
-    o.engine.export_state = false;
-    o.engine.release_by_layer = false;
+    qo::Request request;  // common engine + profile options; serve differences are named in resolve()
     if (const char* v = std::getenv("STRIX_QRTX_HTTP_SLOTS")) o.http_slots = static_cast<std::uint32_t>(std::stoul(v));
     if (const char* v = std::getenv("STRIX_QRTX_SLOT_MARGIN_MIB")) o.slot_margin_mib = static_cast<std::uint32_t>(std::stoul(v));
     for (int i = 1; i < argc; ++i) {
@@ -113,6 +114,7 @@ Options parse(int argc, char** argv) {
             if (end != value.size() || count > UINT32_MAX) throw std::invalid_argument(a + " token count out of range");
             return static_cast<std::uint32_t>(count);
         };
+        if (qo::take(argc, argv, i, request)) continue;
         if (a == "--prefix-cache") {
             const auto value = next();
             if (value != "on" && value != "off") throw std::invalid_argument("--prefix-cache is on or off");
@@ -122,12 +124,6 @@ Options parse(int argc, char** argv) {
         else if (a == "--prefix-cache-stride") o.prefix.stride = cache_count();
         else if (a == "--prefix-cache-host-mb") o.prefix.host_bytes = mib();
         else if (a == "--prefix-cache-vram-mb") o.prefix.vram_bytes = mib();
-        else if (a == "--model") o.engine.model_gguf = next();
-        else if (a == "--mtp-sidecar") o.engine.mtp_sidecar_gguf = next();
-        else if (a == "--draft-vocab") o.engine.draft_vocab = next();
-        else if (a == "--tables") o.engine.tables_dir = next();
-        else if (a == "--rope-table") o.engine.rope_table = next();
-        else if (a == "--max-positions") o.engine.max_positions = static_cast<std::uint32_t>(std::stoul(next()));
         else if (a == "--bind") o.bind = next();
         else if (a == "--port") o.port = std::stoi(next());
         else if (a == "--api-key-file") o.api_key_file = next();
@@ -141,15 +137,15 @@ Options parse(int argc, char** argv) {
         else if (a == "--admit-grace-ms") o.admit_grace_ms = static_cast<std::uint32_t>(std::stoul(next()));
         else if (a == "--cohort-depth") o.cohort_depth = next();
         else if (a == "--slot-margin-mib") o.slot_margin_mib = static_cast<std::uint32_t>(std::stoul(next()));
-        else if (a == "--block-rows") {
-            const auto r = static_cast<std::uint32_t>(std::stoul(next()));
-            if (r < 1024 || r % 16) throw std::invalid_argument("--block-rows must be a multiple of 16 and >= 1024");
-            o.engine.block_schedule = {r};
-        }
         else throw std::invalid_argument("unknown option " + a);
     }
-    if (o.engine.model_gguf.empty() || o.engine.tables_dir.empty() || o.engine.rope_table.empty())
-        throw std::invalid_argument("--model, --tables and --rope-table are required");
+    const auto resolved = qo::resolve(request, qo::Entry::serve);
+    o.engine = resolved.config;
+    if (!request.print_effective_config) {
+        for (const auto& n : resolved.resolution.notices()) std::cerr << n << std::endl;
+        std::cerr << "strix-cuda-qwen-serve: arithmetic " << resolved.contract << std::endl;
+    }
+    if (request.print_effective_config) o.effective_config = qo::effective_config_json(resolved);
     if (const char* v = std::getenv("STRIX_QRTX_COHORT"); v && v[0] == '0') o.http_slots = 1;
     if (o.http_slots == 0) throw std::invalid_argument("--http-slots must be >= 1");
     if (const char* v = std::getenv("STRIX_QRTX_PREFILL_OVERLAP")) o.prefill_overlap = v[0] == '1';
@@ -670,9 +666,13 @@ int main(int argc, char** argv) {
     }
     // Start gate: resolves the declared device (--devices FILE, --device-id ID, STRIX_DEVICES, STRIX_DEVICE), refuses an
     // excluded or undeclared card, restricts the process to the chosen one and prints the "device:" receipt line.
-    strix::device::bind_cuda_main(argc, argv);
     try {
+        const auto device_cli = strix::device::take_command_line(argc, argv);
         const auto o = parse(argc, argv);
+        if (!o.effective_config.empty()) { std::cout << o.effective_config << std::endl; return 0; }
+        strix::device::Request device_request;
+        device_request.select = device_cli.select;
+        strix::device::bind_cuda(std::move(device_request), device_cli.devices_path);
         std::cerr << "strix-cuda-qwen-serve: loading " << o.engine.model_gguf << std::endl;
         qp::Prefill engine(o.engine);
         std::cerr << "strix-cuda-qwen-serve: loaded " << engine.describe() << std::endl;

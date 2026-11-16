@@ -48,6 +48,8 @@ struct HcMixArgs {
     std::uint16_t* output = nullptr;       // BF16 [rows][2560]
     float* gates = nullptr;                // optional scratch [rows][4][2560]: split the sigmoid/mix epilogue into its own
                                            // full-occupancy kernel (same values; nullptr = fused output kernel)
+    bool mma = false;                      // FAST form (Config::forms.hc_mma): projection + output on FP16 tensor cores, FP32 acc
+                                           // (prefill-sized windows only; false = the exact kernels)
 };
 // rows_prepare_hyper_norm + wide2_splitk_hyper_projection<8,Vopd> + wide2_hyper_output<u16,32,RowsFirst> (3 launches).
 // stages (test/timing seam): bit 0 norm, bit 1 projection, bit 2 output (gates), bit 3 split epilogue alone.
