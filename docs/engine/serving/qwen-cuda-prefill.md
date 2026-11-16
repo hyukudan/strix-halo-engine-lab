@@ -32,8 +32,18 @@ path). Lever `qwen_cuda_flat_blocks` (bitwise, default on): `STRIX_QRTX_FLAT_BLO
 `--block-rows` keeps the caller's schedule. Larger blocks were measured and not adopted: `--block-rows 16384` is not
 faster at 32K / 42K (the MoE route workspace of 16384 rows leaves the cache-friendly range) and peaks 5 GB higher.
 
-Scout receipt (server, one pair, warm prefill, FAST profile; ramp -> flat): 8192 rows 1277 -> 1123 ms, 32768 rows 4816 -> 4689 ms,
-43008 rows 6421 -> 6355 ms. The strict ABAB table and the byte comparison of the logit dumps follow in this section.
+Receipt (server, strict ABAB, fresh server per arm, two prefills per length and process: first = cold, last = warm;
+medians; ramp typed as `--blocks 1024,2048,4096,8192`, flat = the default):
+
+| rows | FAST ramp cold / warm | FAST flat cold / warm | flat tok/s (warm) | exact ramp -> flat (warm) |
+|---|---|---|---|---|
+| 8192 (3 pairs) | 1325 / 1289 ms | 1164 / 1130 ms | 7,250 | 1873 -> 1716 ms (1 pair) |
+| 32768 (3 pairs) | 4848 / 4886 ms | 4690 / 4731 ms | 6,927 | 7322 -> 7191 ms (1 pair) |
+| 43008 (3 pairs) | 6459 / 6532 ms | 6348 / 6412 ms | 6,707 | 9837 -> 9753 ms (1 pair) |
+
+Identity: `qwen_tf_logits` logit dumps (64 teacher-forced rows, 8K and 32K prompts, 63,569,920 bytes each) are
+byte-identical between the ramp and the flat schedule, in the exact profile and in the FAST profile, so the FAST gate
+receipt is unchanged. Kit: `scripts/bench/cuda/qwen_fast/prefill_abab.sh` with the two arms above.
 
 `--final-block-rows N` optionally reserves a specific tail size after that
 transformation, moving rows between existing blocks without adding blocks. Zero
