@@ -3493,7 +3493,7 @@ static int run_decode_entry(
     const char* pair_cut_env = std::getenv("STRIX_QWEN_PF_PIPE_CUT");
     const char* pair_cost_env = std::getenv("STRIX_QWEN_PF_PIPE_COSTS");
     // PR-3 stage emulation: the pair chunk (STRIX_QWEN_PF_PIPE_CHUNK) is the tile, as the pair route sets it.
-    if (!strix::qwen_pp::pipe_enabled() && std::getenv("STRIX_QWEN_PF_STAGE_EMULATE") && options.known_prefix_prefill_rows)
+    if (!strix::qwen_pp::pipe_enabled() && strix::envcfg::text("STRIX_QWEN_PF_STAGE_EMULATE") && options.known_prefix_prefill_rows)
         if (const char* emulate_chunk = std::getenv("STRIX_QWEN_PF_PIPE_CHUNK"); emulate_chunk && *emulate_chunk)
             options.known_prefix_prefill_rows = static_cast<std::uint32_t>(std::strtoul(emulate_chunk, nullptr, 10));
     if (strix::qwen_pp::pipe_enabled()) {
@@ -5848,13 +5848,13 @@ static int run_decode_entry(
         // order of 2v stages (v per rank) on ONE node: one cursor and one session, a frontier per stage swapped in
         // around each step, the step's layer range in qwen_pp::pipe_step, seams kept per (chunk, boundary). v = 0 runs
         // the same step loop without a split. Prints logits SHA-256, a state digest and the folded lineage.
-        if (const char* emulate_text = std::getenv("STRIX_QWEN_PF_STAGE_EMULATE");
+        if (const char* emulate_text = strix::envcfg::text("STRIX_QWEN_PF_STAGE_EMULATE");
             emulate_text && *emulate_text && !strix::qwen_pp::pipe_enabled()) {
             const auto emulate_v = static_cast<std::uint32_t>(std::strtoul(emulate_text, nullptr, 10));
             if (!known_prefill_plan || !known_prefix_owner || model.hidden_layers != 48 || options.tokens.empty())
                 throw std::invalid_argument("stage emulation requires the 48-layer tiled model and a prompt");
             strix::pair::StageMap emulate_map;
-            if (const char* map_text = std::getenv("STRIX_PAIR_STAGE_MAP"); map_text && *map_text && emulate_v)
+            if (const char* map_text = strix::envcfg::text("STRIX_PAIR_STAGE_MAP"); map_text && *map_text && emulate_v)
                 emulate_map = strix::pair::StageMap::parse(map_text, 48U);
             else if (emulate_v) emulate_map = strix::qwen_pp::even_map(emulate_v, 48U);
             else emulate_map.cuts = {strix::pair::StageCut(0U), strix::pair::StageCut(48U)};
