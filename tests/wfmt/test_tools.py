@@ -341,6 +341,29 @@ class ToolTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 isa.hip_resources(notes, data, ["kernel"])
 
+    def test_explicit_symbol_pairs_preserve_instructions_resources_and_coverage(self):
+        old_map, new_map = isa.symbol_maps([{"old": "kernel_old", "new": "kernel_new"}])
+        old = ["FUNCTION kernel_old", "v_fma_f32 v0, v1, v2, v0",
+               "s_branch 4 <kernel_old+0x10>", "FUNCTION unchanged", "s_endpgm"]
+        new = ["FUNCTION unchanged", "s_endpgm", "FUNCTION kernel_new",
+               "v_fma_f32 v0, v1, v2, v0", "s_branch 4 <kernel_new+0x10>"]
+        self.assertEqual(isa.mapped_stream(old, old_map), isa.mapped_stream(new, new_map))
+        self.assertNotEqual(isa.mapped_stream(old, old_map),
+                            isa.mapped_stream([line.replace("v_fma", "v_mul") for line in new], new_map))
+        self.assertNotEqual(isa.mapped_resources({"kernel_old": {"vgpr_count": 16}}, old_map),
+                            isa.mapped_resources({"kernel_new": {"vgpr_count": 17}}, new_map))
+        with self.assertRaisesRegex(ValueError, "missing"):
+            isa.mapped_stream(["FUNCTION other", "s_endpgm"], new_map)
+        with self.assertRaisesRegex(ValueError, "duplicate"):
+            isa.mapped_stream(old + old, old_map)
+        self.assertNotEqual(isa.mapped_stream(old, old_map),
+                            isa.mapped_stream(new + ["FUNCTION extra", "s_endpgm"], new_map))
+        for pairs in ([], [{"old": "a", "new": "b"}, {"old": "a", "new": "c"}],
+                      [{"old": "a", "new": "b"}, {"old": "c", "new": "b"}],
+                      [{"old": "a", "new": "b", "ignore": True}]):
+            with self.assertRaises(ValueError):
+                isa.symbol_maps(pairs)
+
     def test_isa_runner_rejects_resource_only_changes(self):
         old, new = self.path / "old.co", self.path / "new.co"
         old.write_bytes(device_object())

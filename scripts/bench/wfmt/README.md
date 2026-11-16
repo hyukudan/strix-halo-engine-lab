@@ -115,6 +115,14 @@ for review; byte equality alone cannot whitelist codegen changes. Review spills,
 registers, shared/LDS bytes and occupancy, and retain timing receipts plus a
 written explanation. No kernel is changed by P01.
 
+For a required source trait that changes mangled names, `--symbol-map PAIRS.json`
+accepts explicit `[{"old":"FULL_OLD_SYMBOL","new":"FULL_NEW_SYMBOL"}]` pairs.
+Both sides must be one-to-one and present in the selected functions. Only those
+names and function placement are normalised: instruction order within each
+function, every unmapped function, and every resource/descriptor value remain
+mandatory. The receipt retains the pairs; missing, duplicate or extra functions
+and changed instructions/resources cannot be excused by the map.
+
 Whole-model performance qualification supplies model/prompt paths externally:
 two prefills per process (first cold, last warm), ABAB at least three pairs,
 clocks, busy fraction, time, tokens and clocks/token alongside throughput. Such
