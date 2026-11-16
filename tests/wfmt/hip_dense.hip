@@ -136,6 +136,34 @@ template<unsigned R> void rows_case(unsigned k,unsigned n) {
         }
     }
 }
+template<unsigned R> void signed_case(unsigned k,unsigned n) {
+    using namespace strix::q8_rows;
+    auto w=weights(k,n);std::vector<float> x(R*k);
+    for(unsigned i=0;i<x.size();++i) x[i]=static_cast<float>(static_cast<int>(i%31U)-15)*0.03125F;
+    Buffer dw(w.size()),dx(x.size()*4U),dy(R*n*4U),codes(dense_a8_pitch<R>()*k),deltas(dense_a8_pitch<R>()*(k/32U)*4U);
+    dw.upload(w);dx.upload(x);
+    Site<R> site{};site.segments=segments({{dw.p,n}});site.width=k;site.outputs=n;site.output=dy.as<float>();
+    for(unsigned r=0;r<R;++r) site.input[r]=dx.as<float>()+r*k;
+    hipLaunchKernelGGL((dense_a8_quantize_kernel<Site<R>>),dim3((R*(k/8U)+255U)/256U),dim3(256),0,0,site,codes.as<std::int8_t>(),deltas.as<float>());check(hipGetLastError());
+    const auto ac=codes.read<std::int8_t>(R*k);const auto ad=deltas.read<float>(dense_a8_pitch<R>()*(k/32U));
+#ifdef STRIX_WFMT_CAPTURE
+    strix::weight::capture::emit("activation_codes",ac.data(),ac.size());
+    strix::weight::capture::emit("activation_scales",ad.data(),ad.size()*sizeof(float));
+#endif
+    if constexpr(R<=8U) {
+        hipLaunchKernelGGL((project_rows_dense_a8_kernel<Site<R>,1U,false,false>),dim3((n+7U)/8U),dim3(256),0,0,site,codes.as<std::int8_t>(),deltas.as<float>());check(hipGetLastError());const auto direct=dy.read<float>(R*n);
+        hipLaunchKernelGGL((project_rows_dense_a8_kernel<Site<R>,1U,true,false>),dim3((n+7U)/8U),dim3(256),dense_a8_stage_bytes<R>(k),0,site,codes.as<std::int8_t>(),deltas.as<float>());check(hipGetLastError());const auto staged=dy.read<float>(R*n);
+        if(direct!=staged) throw std::runtime_error("signed-A8 source staging differs");
+        std::vector<unsigned char> q6(n*(k/32U)*26U,0);
+        Buffer dq(q6.size());dq.upload(q6);site.segments=segments({{dq.p,n}});
+        hipLaunchKernelGGL((project_rows_dense_a8_kernel<Site<R>,1U,false,true>),dim3((n+7U)/8U),dim3(256),0,0,site,codes.as<std::int8_t>(),deltas.as<float>());check(hipGetLastError());dy.read<float>(R*n);
+    } else {
+        hipLaunchKernelGGL((project_rows_dense_a8_wmma_kernel<Site<R>,1U,1U>),dim3(((n+63U)/64U)*(R/16U)),dim3(128),0,0,site,codes.as<std::int8_t>(),deltas.as<float>());check(hipGetLastError());dy.read<float>(R*n);
+        if constexpr(R%64U==0U) {
+            hipLaunchKernelGGL((project_rows_dense_a8_wmma_lds2_kernel<Site<R>,4U,true>),dim3(((n+127U)/128U)*(R/64U)),dim3(128),0,0,site,codes.as<std::int8_t>(),deltas.as<float>());check(hipGetLastError());dy.read<float>(R*n);
+        }
+    }
+}
 void partial_case(bool q6) {
     using namespace strix::q8_rows;
     auto w=weights(256U,1U);
@@ -189,6 +217,8 @@ void dense_case(unsigned k,unsigned n,unsigned rows) {
 int main() try {
     Buffer op(4096U*3U*2U);hipLaunchKernelGGL(operands_kernel,dim3(16),dim3(256),0,0,op.as<std::uint16_t>());check(hipGetLastError());op.read<std::uint16_t>(4096U*3U);
     partial_case(false);partial_case(true);
+    signed_case<1>(256U,17U);signed_case<2>(256U,17U);signed_case<7>(256U,17U);signed_case<8>(256U,17U);
+    signed_case<16>(256U,17U);signed_case<32>(256U,17U);signed_case<64>(256U,17U);signed_case<128>(256U,17U);
     for(unsigned n:{1U,17U,65U}) {rows_case<1>(256U,n);rows_case<2>(512U,n);rows_case<7>(256U,n);rows_case<8>(512U,n);rows_case<16>(256U,n);rows_case<32>(512U,n);rows_case<64>(256U,n);}
     for(unsigned rows:{1U,2U,7U,8U,9U,31U,32U,33U,63U,64U,65U,127U,128U,129U}) dense_case(128U,17U,rows);
     std::cout<<"HIP dense source migration: operands/raw/Q8 scalar-packed/Q6/direct/staged/stepped/wide/coef/lane PASS\n";return 0;
