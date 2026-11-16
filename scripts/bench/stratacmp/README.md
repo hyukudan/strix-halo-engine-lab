@@ -69,6 +69,10 @@ The runner's timeout includes loading; size the selected case/window accordingly
 child process. It rejects a changed corpus hash or selected-ID/position file. The output `logits.bin` is
 directly comparable with CUDA export for that exact corpus case and positions file. `index.json` binds the
 actual effective args and request order. The runner does not create/replace R or certify a statistical pass.
+For a bounded device ticket, add `--selection-start N --selection-count K` to collect a contiguous slice
+of the unchanged frozen selections. The runner writes `selected.positions` for the CUDA exporter and
+records the original selection hash, interval, total count and explicit partial status in `index.json`.
+Use identical slices for every arm. A completed shard does not establish a completed case or quality gate.
 `quality.py strata-first --prefix PREFIX --ids CASE.ids --positions CASE.positions --out strata.bin` also
 converts previously collected `PREFIX.0`, `PREFIX.1`, ... rows when their external request-order record
 proves this same conditioning contract.

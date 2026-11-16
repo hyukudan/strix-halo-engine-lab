@@ -47,11 +47,23 @@ def engine_args(config, context):
     return result
 
 
+def selection_slice(positions, start=0, count=None):
+    count = len(positions) - start if count is None else count
+    if start < 0 or count <= 0 or start + count > len(positions):
+        raise ValueError("selection slice must be nonempty and inside frozen selections")
+    return positions[start:start+count], {
+        "start": start, "count": count, "total": len(positions),
+        "complete": start == 0 and count == len(positions),
+    }
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     for option in ("config", "manifest", "corpus", "case", "out"):
         p.add_argument("--" + option, required=True)
     p.add_argument("--timeout", type=float, default=120)
+    p.add_argument("--selection-start", type=int, default=0)
+    p.add_argument("--selection-count", type=int)
     a = p.parse_args()
     frozen = mf.load(a.manifest)
     corpus = Path(a.corpus)
@@ -66,7 +78,10 @@ def main():
     positions = [int(x) for x in (corpus / case["positions"]).read_text().split()]
     if not positions or positions != sorted(set(positions)) or positions[0] < 0 or positions[-1] >= len(ids)-1:
         raise ValueError("invalid labeled selections")
+    positions, scope = selection_slice(positions, a.selection_start, a.selection_count)
     out = Path(a.out).resolve(); out.mkdir(parents=True, exist_ok=False)
+    selected_path = out / "selected.positions"
+    selected_path.write_text("\n".join(map(str, positions)) + "\n")
     config = json.loads(Path(a.config).read_text(encoding="utf-8-sig"))
     argv = engine_args(config, len(ids) + 8)
     env = dict(os.environ, **config.get("env", {}))
@@ -95,7 +110,8 @@ def main():
                     raise RuntimeError("engine ended before request completion")
                 if not line.startswith("DONE") or "nonfinite" in line.lower():
                     raise RuntimeError("failed first-logit request")
-                records.append({"index": index, "position": position, "prompt_tokens": position+1,
+                records.append({"index": scope["start"] + index, "dump_index": index,
+                                "position": position, "prompt_tokens": position+1,
                                 "label": ids[position+1], "request_sha256": hashlib.sha256(request.encode()).hexdigest(),
                                 "reply": line.strip()})
             proc.stdin.write("QUIT\n"); proc.stdin.flush()
@@ -105,13 +121,16 @@ def main():
             timer.cancel()
             if proc.poll() is None:
                 proc.kill(); proc.wait()
-    result = quality.convert_first(out / "first", corpus / case["prompt_ids"], corpus / case["positions"], out / "logits.bin")
+    result = quality.convert_first(out / "first", corpus / case["prompt_ids"], selected_path, out / "logits.bin")
     result.update(case=case["case"], manifest_core_sha256=frozen["frozen"]["core_sha256"],
+                  selection_scope=scope, frozen_positions_sha256=case["positions_sha256"],
+                  selected_positions_sha256=sha256_file(selected_path),
                   binary_sha256=sha256_file(config["exe"]), args=argv, requests=records,
                   effective={"gpu": 0, "kv": "fp16", "prefix_cache": False, "drafting": False,
                              "context_capacity": len(ids)+8, "condition_every_prefix_token": True})
     (out / "index.json").write_text(json.dumps(result, indent=2) + "\n")
-    print(json.dumps({"case": case["case"], "rows": len(positions), "complete": True}))
+    print(json.dumps({"case": case["case"], "rows": len(positions),
+                      "shard_complete": True, "complete": scope["complete"], "selection_scope": scope}))
 
 
 if __name__ == "__main__":
