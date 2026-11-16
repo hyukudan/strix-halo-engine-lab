@@ -168,3 +168,10 @@ chooser, the `--rank/--peer/--transport` handling with the link setup, and the p
 `include/strix/pair/` (`pipe.hpp`, `balance.hpp`, `link.hpp`, `regime.hpp`) and `src/xport/hip_pipe_staging.hpp`.
 Qwen binds them with its seam-header validator; the Nemotron (gemma4) pair route (`STRIX_G4_PAIR=1`, see the model
 README) uses the same modules with its own seam layout.
+
+`regime.hpp` also carries the layout-aware pipeline rule: `interleaved_wall_ms` simulates C chunks x 2v
+virtual stages (stage s on rank s % 2, depth-first per rank, one FIFO link per direction) and equals the two-stage
+rule at v = 1; `choose_pipeline(..., virtual_stages, legal_v, LayoutDecl)` keeps a split-weight (tensor) pair on its
+resident route when the whole stage layers do not fit next to the decode layout, and otherwise pipelines only when
+it beats the alternative (tensor route or one node) by `min_gain` (3 %, run noise). `effective_line` prints
+`pair.pipeline mode=.. chunk=.. virtual=.. predicted_ms=.. alt_ms=.. reason=..`.
