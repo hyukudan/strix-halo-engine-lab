@@ -280,7 +280,7 @@ inline constexpr unsigned kPfMinKeys = 320;
 inline int flash_pf_mode() {  // -1 auto, 0 off, 1 on
     static strix::env_arms::Resolved<int> mode;
     return mode.get([] {
-        const char* p = std::getenv("STRIX_ATTN_FLASH_PF");
+        const char* p = strix::envcfg::text("STRIX_ATTN_FLASH_PF");
         if (p == nullptr || *p == '\0' || std::strcmp(p, "auto") == 0) return -1;
         return strix::envcfg::flag("STRIX_ATTN_FLASH_PF", true) ? 1 : 0;
     });
