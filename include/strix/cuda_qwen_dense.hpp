@@ -75,6 +75,9 @@ struct OnflyImage {
 void onfly_register(const void* q8_weight, const OnflyImage& image);
 void onfly_clear();
 std::size_t onfly_count();
+// Tuning / test hook of the NVFP4 launch shape (rows per warp 1|2|4|8, outputs per warp 1|2; 0 = measured table).
+// Shape changes parallelism only: every output is bitwise the same.
+void onfly_set_launch(std::uint32_t rows_per_warp, std::uint32_t outputs_per_warp);
 class OnflyScope {  // thread-local: the host thread that enqueues the decode window
 public:
     explicit OnflyScope(bool on);

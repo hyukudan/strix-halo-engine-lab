@@ -148,6 +148,18 @@ static int test_project(std::mt19937& rng) {
             }
         }
         CHECK(bad == 0, "rows %u: %zu outputs differ from the host oracle", rows, bad);
+        for (const std::uint32_t rw : {1U, 2U, 4U, 8U})   // launch shape = parallelism only: same bits
+            for (const std::uint32_t ow : {1U, 2U}) {
+                dn::onfly_set_launch(rw, ow);
+                {
+                    const dn::OnflyScope scope(true);
+                    CK(dn::project(nullptr, site, rows, codes, deltas, pitch));
+                }
+                std::vector<float> u(t.size());
+                CK(cudaMemcpy(u.data(), out, u.size() * 4, cudaMemcpyDeviceToHost));
+                CHECK(std::memcmp(u.data(), t.data(), u.size() * 4) == 0, "rows %u: launch shape %u/%u changes bits", rows, rw, ow);
+            }
+        dn::onfly_set_launch(0, 0);
         if (row1.empty()) row1.assign(t.begin(), t.begin() + (n0 + n1));
         CHECK(std::memcmp(row1.data(), t.data(), (n0 + n1) * 4) == 0, "rows %u: row 0 differs from rows = 1", rows);
         std::printf("rows %2u: nvfp4-a8 == host oracle (%u outputs), rows-invariant; |nvfp4 - q8| / |q8| = %.4f\n", rows,

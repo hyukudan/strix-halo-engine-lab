@@ -567,27 +567,42 @@ template <Store S> struct Nvfp4Policy {
         store_value<S>(s.k, row_base + r, n, y);
     }
 };
-template <Store S, std::uint32_t RMAX>
-cudaError_t launch_nvfp4_chunk(cudaStream_t stream, const Nvfp4Policy<S>& p, std::uint32_t rows, const std::int8_t* codes,
+// Launch shape (rows per warp chunk = blockIdx.y split, outputs per warp): parallelism only, the bits never change.
+std::uint32_t onfly_rw_hook = 0, onfly_out_hook = 0;   // test / tuning hooks (0 = the measured table below)
+template <Store S, std::uint32_t OUT, std::uint32_t RMAX>
+cudaError_t launch_nvfp4_shape(cudaStream_t stream, const Nvfp4Policy<S>& p, std::uint32_t rows, const std::int8_t* codes,
                                const float* deltas, std::uint32_t pitch) {
-    constexpr std::uint32_t kOut = 2, kWarps = 8;
-    const unsigned grid = (p.s.k.outputs + kOut * kWarps - 1U) / (kOut * kWarps);
-    a8::rows_gemv_kernel<Nvfp4Policy<S>, kOut, RMAX, kWarps>
+    constexpr std::uint32_t kWarps = 8;
+    const dim3 grid((p.s.k.outputs + OUT * kWarps - 1U) / (OUT * kWarps), (rows + RMAX - 1U) / RMAX);
+    a8::rows_gemv_kernel<Nvfp4Policy<S>, OUT, RMAX, kWarps>
         <<<grid, kWarps * 32U, 0, stream>>>(p, rows, p.s.k.width, codes, p.s.k.width, deltas, pitch);
     return cudaGetLastError();
 }
+template <Store S, std::uint32_t OUT>
+cudaError_t launch_nvfp4_rw(cudaStream_t stream, const Nvfp4Policy<S>& p, std::uint32_t rw, std::uint32_t rows,
+                            const std::int8_t* codes, const float* deltas, std::uint32_t pitch) {
+    switch (rw) {
+    case 1: return launch_nvfp4_shape<S, OUT, 1>(stream, p, rows, codes, deltas, pitch);
+    case 2: return launch_nvfp4_shape<S, OUT, 2>(stream, p, rows, codes, deltas, pitch);
+    case 4: return launch_nvfp4_shape<S, OUT, 4>(stream, p, rows, codes, deltas, pitch);
+    default: return launch_nvfp4_shape<S, OUT, 8>(stream, p, rows, codes, deltas, pitch);
+    }
+}
 template <Store S> cudaError_t launch_nvfp4(cudaStream_t stream, const K4Site& site, std::uint32_t rows,
                                             const std::int8_t* codes, const float* deltas, std::uint32_t pitch) {
-    for (std::uint32_t r0 = 0; r0 < rows; r0 += 32U) {   // rows of a chunk are independent: chunking keeps the bits
-        const std::uint32_t n = rows - r0 < 32U ? rows - r0 : 32U;
-        const Nvfp4Policy<S> p{site, r0};
-        const std::int8_t* c = codes + static_cast<std::uint64_t>(r0) * site.k.width;
-        const cudaError_t e = n <= 8U    ? launch_nvfp4_chunk<S, 8>(stream, p, n, c, deltas + r0, pitch)
-                              : n <= 16U ? launch_nvfp4_chunk<S, 16>(stream, p, n, c, deltas + r0, pitch)
-                                         : launch_nvfp4_chunk<S, 32>(stream, p, n, c, deltas + r0, pitch);
-        if (e != cudaSuccess) return e;
-    }
-    return cudaSuccess;
+    if (rows > 65535U * 8U) return cudaErrorInvalidValue;
+    std::uint32_t rw = onfly_rw_hook, out = onfly_out_hook;
+    // Measured table (nvfp4_a8_bench, PRO sm_120 2.8 GHz, Flash-Next shapes, best of rows-per-warp 1/2/4/8 x outputs 1/2):
+    // wide sites (>= 8192 outputs: GDN / QSA in) want min(pow2(rows), 8) rows per warp, one output per warp up to 2 rows;
+    // narrow sites (GDN / QSA out, shared expert) want half the rows per warp and one output per warp.
+    const bool wide = site.k.outputs >= 8192U;
+    std::uint32_t p2 = 1;
+    while (p2 < rows && p2 < 8U) p2 <<= 1U;
+    if (rw == 0) rw = wide ? p2 : (rows <= 2U ? 1U : (p2 / 2U < 8U ? p2 / 2U : 8U));
+    if (out == 0) out = wide && rows > 2U ? 2U : 1U;
+    const Nvfp4Policy<S> p{site, 0};
+    return out == 1U ? launch_nvfp4_rw<S, 1>(stream, p, rw, rows, codes, deltas, pitch)
+                     : launch_nvfp4_rw<S, 2>(stream, p, rw, rows, codes, deltas, pitch);
 }
 
 std::unordered_map<const void*, OnflyImage>& onfly_images() {
@@ -616,6 +631,10 @@ bool onfly_site(const Site& site, const KSite& k, K4Site& out) {
 void onfly_register(const void* q8_weight, const OnflyImage& image) { onfly_images()[q8_weight] = image; }
 void onfly_clear() { onfly_images().clear(); }
 std::size_t onfly_count() { return onfly_images().size(); }
+void onfly_set_launch(std::uint32_t rows_per_warp, std::uint32_t outputs_per_warp) {
+    onfly_rw_hook = rows_per_warp;
+    onfly_out_hook = outputs_per_warp;
+}
 OnflyScope::OnflyScope(bool on) : previous_(onfly_scope) { onfly_scope = on; }
 OnflyScope::~OnflyScope() { onfly_scope = previous_; }
 

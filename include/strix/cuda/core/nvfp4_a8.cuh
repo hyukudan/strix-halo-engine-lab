@@ -63,7 +63,7 @@ __device__ __forceinline__ void decode_group(uint2 c, std::uint32_t (&w)[4]) {
 }
 
 // Rows GEMV. Policy: outputs() -> N; operand(n) -> Row{codes, scales, half_ts}; store(row, n, float y).
-// One warp computes OUT consecutive outputs for rows [0, rows) (rows <= RMAX). Activation codes row r at
+// One warp computes OUT consecutive outputs for the RMAX-row chunk blockIdx.y of rows [0, rows). Activation codes row r at
 // a + r * a_stride (16-byte aligned, a_stride multiple of 16); deltas[b * pitch + r].
 struct Row {
     const std::uint8_t* codes;
@@ -74,6 +74,12 @@ template <class Policy, std::uint32_t OUT, std::uint32_t RMAX, std::uint32_t WAR
 __global__ __launch_bounds__(WARPS * 32) void rows_gemv_kernel(Policy p, std::uint32_t rows, std::uint32_t k,
                                                               const std::int8_t* a, std::uint32_t a_stride,
                                                               const float* deltas, std::uint32_t pitch) {
+    // blockIdx.y = row chunk of RMAX rows (same per-(n, r) chain: the split changes parallelism, never the bits).
+    const std::uint32_t r0 = blockIdx.y * RMAX;
+    if (r0 >= rows) return;
+    rows = rows - r0 < RMAX ? rows - r0 : RMAX;
+    a += static_cast<std::uint64_t>(r0) * a_stride;
+    deltas += r0;
     const std::uint32_t lane = threadIdx.x & 31U;
     const std::uint32_t n0 = (blockIdx.x * WARPS + (threadIdx.x >> 5)) * OUT;
     const std::uint32_t outputs = p.outputs();
@@ -124,7 +130,7 @@ __global__ __launch_bounds__(WARPS * 32) void rows_gemv_kernel(Policy p, std::ui
         if (r < rows && lane == r % 32U)
 #pragma unroll
             for (std::uint32_t o = 0; o < OUT; ++o)
-                if (n0 + o < outputs) p.store(r, n0 + o, __fmul_rn(acc[o][r], op[o].half_ts));
+                if (n0 + o < outputs) p.store(r0 + r, n0 + o, __fmul_rn(acc[o][r], op[o].half_ts));
 }
 
 }  // namespace strix::cuda::core::nvfp4_a8
