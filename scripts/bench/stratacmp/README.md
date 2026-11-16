@@ -2,6 +2,9 @@
 
 `run-fair.py` and `summarize.py` collect the paired timing matrix. All model, executable and output locations
 come from arguments. Keep one model family resident and use the device declaration/start gate.
+Use `--plan` to list the fixed ABAB order, then `--run-index N` to execute one entry per reserved
+FIFO window into the same output directory. Config and prompt hashes must remain identical;
+the completion marker is written only after every plan entry has a complete receipt.
 
 ## Teacher-forced quality
 

@@ -208,6 +208,7 @@ def main():
     p.add_argument("--max-context", type=int, default=45056)
     p.add_argument("--context-tolerance", type=float, default=0.05)
     p.add_argument("--plan", action="store_true")
+    p.add_argument("--run-index", type=int, help="run one fixed plan entry in a separately reserved FIFO window")
     args = p.parse_args()
     if args.pairs < 3:
         p.error("strict ABAB requires at least three pairs")
@@ -220,12 +221,22 @@ def main():
     if args.plan:
         print(json.dumps(dict(order=[f"{w}:{pair}:{a['name']}" for w, pair, a in plan], prompt_sha256=hashes), indent=1))
         return 0
-    args.out.mkdir(parents=True, exist_ok=False)
-    write(args.out / "config.json", config)
-    write(args.out / "prompt-sha256.json", hashes)
+    if args.run_index is not None and not 0 <= args.run_index < len(plan):
+        p.error("run-index is outside the fixed plan")
+    args.out.mkdir(parents=True, exist_ok=args.run_index is not None)
+    for name, expected in (("config.json", config), ("prompt-sha256.json", hashes)):
+        path = args.out / name
+        if path.exists() and json.loads(path.read_text(encoding="utf-8")) != expected:
+            p.error(f"existing {name} differs; use a fresh output directory")
+        write(path, expected)
     for index, (workload, pair, arm) in enumerate(plan):
+        if args.run_index is not None and index != args.run_index:
+            continue
         run_one(config, arm, workload, pair, args.out / f"{index:02}-{arm['name']}-{workload}", args)
-    (args.out / ".done").touch()
+    if all((args.out / f"{i:02}-{a['name']}-{w}" / "run.json").exists() and
+           json.loads((args.out / f"{i:02}-{a['name']}-{w}" / "run.json").read_text())["status"] == "complete"
+           for i, (w, _, a) in enumerate(plan)):
+        (args.out / ".done").touch()
     return 0
 
 
