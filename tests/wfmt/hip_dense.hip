@@ -44,6 +44,13 @@ struct Buffer {
 };
 __device__ float* partial_trace;
 __device__ unsigned* partial_count;
+inline constexpr unsigned kPartialSlots=4096U;
+__device__ void trace_value(float v) {
+    const unsigned t=((blockIdx.z*gridDim.y+blockIdx.y)*gridDim.x+blockIdx.x)*blockDim.x+threadIdx.x;
+    const unsigned i=partial_count[t]++;
+    if(i<kPartialSlots) partial_trace[t*kPartialSlots+i]=v;
+}
+
 template<unsigned R,bool Diagnostic=false> struct Site {
     using Input = float;
     static constexpr unsigned rows=R;
@@ -57,13 +64,10 @@ template<unsigned R,bool Diagnostic=false> struct Site {
         asm("v_fma_mix_f32 %0, %1, %2, neg(0) op_sel_hi:[1,0,0]" : "=v"(result) : "v"(scale), "v"(static_cast<float>(code)));
         return result;
     }
+    __device__ static void capture_partial(float value) requires Diagnostic { trace_value(value); }
     __device__ static void fma(float& acc,float c,float x) {
         acc=__builtin_fmaf(c,x,acc);
-        if constexpr(Diagnostic) {
-            const unsigned t=blockIdx.x*blockDim.x+threadIdx.x;
-            const unsigned i=partial_count[t]++;
-            if(i<256U) partial_trace[t*256U+i]=acc;
-        }
+        if constexpr(Diagnostic) capture_partial(acc);
     }
     __device__ static float add(float lower,float upper) {
         float result; asm("v_add_f32 %0, %1, %2" : "=v"(result) : "v"(lower), "v"(upper)); return result;
@@ -76,6 +80,16 @@ struct RawCols {
         return {weight+16U*i*in,out+16U*i,count,16U*i<count};
     }
 };
+template<unsigned Form> struct DiagnosticCols: strix::core::f16_dense_tall::q8a8::Cols<8U,Form> {
+    __device__ static void capture_partial(const strix::core::f16_dense_tall::Float8& value) {
+        for(unsigned i=0;i<8U;++i) trace_value(value[i]);
+    }
+};
+template<unsigned Form> __global__ void f16_partial_kernel(strix::core::f16_dense_tall::q8a8::View v) {
+    namespace d=strix::core::f16_dense_tall;
+    __shared__ d::Storage<1> lds;
+    d::core<1>(nullptr,v.in,v.rows,DiagnosticCols<Form>{{v}},lds,d::q8a8::Store{v.count,v.tile0,v.accumulate});
+}
 __global__ void raw_kernel(const float* x,unsigned k,unsigned rows,RawCols c) {
     __shared__ strix::core::f16_dense_tall::Storage<1> lds;
     strix::core::f16_dense_tall::core<1>(x,k,rows,c,lds,strix::core::f16_dense_tall::q8a8::Store{c.count,0U,0U},true);
@@ -192,7 +206,7 @@ void partial_case(bool q6) {
     auto w=weights(256U,1U);
     if(q6) w.assign(208U,0);
     std::vector<float> x(256U,0.125F);
-    Buffer dw(w.size()),dx(x.size()*4U),dy(4U),trace(256U*256U*4U),counts(256U*4U);
+    Buffer dw(w.size()),dx(x.size()*4U),dy(4U),trace(256U*kPartialSlots*4U),counts(256U*4U);
     dw.upload(w);dx.upload(x);
     auto* tp=trace.as<float>();auto* cp=counts.as<unsigned>();
     check(hipMemcpyToSymbol(HIP_SYMBOL(partial_trace),&tp,sizeof(tp)));
@@ -201,12 +215,98 @@ void partial_case(bool q6) {
     if(q6) hipLaunchKernelGGL((project_rows_kernel<Site<1U,true>,2U,false,true>),dim3(1),dim3(256),0,0,site);
     else hipLaunchKernelGGL((project_rows_kernel<Site<1U,true>,2U,false,false>),dim3(1),dim3(256),0,0,site);
     check(hipGetLastError());dy.read<float>(1);
-    auto values=trace.read<float>(256U*256U);
+    auto values=trace.read<float>(256U*kPartialSlots);
     auto used=counts.read<unsigned>(256U);
-    for(unsigned count:used) if(count>256U) throw std::runtime_error("diagnostic partial capacity");
+    for(unsigned count:used) if(count>kPartialSlots) throw std::runtime_error("diagnostic partial capacity");
 #ifdef STRIX_WFMT_CAPTURE
     strix::weight::capture::emit("partials",values.data(),values.size()*sizeof(float));
 #endif
+}
+template<unsigned R> void row_partials() {
+    using namespace strix::q8_rows;
+    context("hip.rows.partial.r"+std::to_string(R),"hip-q8-rows-fma-mix-fixture@1",{R,1U,256U},"gguf.q8_0@1");
+    auto w=weights(256U,1U);std::vector<float> x(R*256U,0.125F);
+    constexpr unsigned blocks=R>8U?R/4U:1U,threads=blocks*256U;
+    Buffer dw(w.size()),dx(x.size()*4U),dy(R*4U),trace(threads*kPartialSlots*4U),counts(threads*4U);
+    dw.upload(w);dx.upload(x);
+    auto* tp=trace.as<float>();auto* cp=counts.as<unsigned>();
+    check(hipMemcpyToSymbol(HIP_SYMBOL(partial_trace),&tp,sizeof(tp)));check(hipMemcpyToSymbol(HIP_SYMBOL(partial_count),&cp,sizeof(cp)));
+    Site<R,true> site{};site.segments=segments({{dw.p,1U}});site.width=256;site.outputs=1;site.output=dy.as<float>();
+    for(unsigned r=0;r<R;++r) site.input[r]=dx.as<float>()+r*256U;
+    const auto read=[&] {
+        check(hipGetLastError());dy.read<float>(R);auto values=trace.read<float>(threads*kPartialSlots);const auto used=counts.read<unsigned>(threads);
+        unsigned total=0;for(unsigned n:used) {if(n>kPartialSlots) throw std::runtime_error("row diagnostic partial capacity");total+=n;}
+        if(!total) throw std::runtime_error("missing row diagnostic partials");
+#ifdef STRIX_WFMT_CAPTURE
+        strix::weight::capture::emit("partials",values.data(),values.size()*sizeof(float));
+#endif
+        check(hipMemset(trace.p,0,threads*kPartialSlots*4U));check(hipMemset(counts.p,0,threads*4U));
+    };
+    if constexpr(R<=8U) {
+        hipLaunchKernelGGL((project_rows_kernel<Site<R,true>,2U,true,false>),dim3(1),dim3(256),R*256U*4U,0,site);read();
+        hipLaunchKernelGGL((project_rows_stepped_kernel<Site<R,true>,2U,1U>),dim3(1),dim3(256),2U*R*256U*4U,0,site);read();
+    } else {
+        hipLaunchKernelGGL((project_wide_rows_kernel<Site<R,true>,2U,4U>),dim3(blocks),dim3(256),0,0,site);read();
+        hipLaunchKernelGGL((project_wide_rows_staged_kernel<Site<R,true>,2U,4U>),dim3(blocks),dim3(256),0,0,site);read();
+        hipLaunchKernelGGL((project_wide_rows_coef_kernel<Site<R,true>,2U,4U,8U,false>),dim3(1),dim3(256),0,0,site);read();
+        Buffer codes(16U*1024U),scales(64U*16U),xs(R*256U*4U);
+        hipLaunchKernelGGL((lane_pack_weights_kernel<Site<R,true>>),dim3(4),dim3(256),0,0,site,codes.as<unsigned char>(),scales.as<std::uint16_t>(),1U);
+        codes.read<unsigned char>(16U*1024U);scales.read<std::uint16_t>(64U*8U);
+        hipLaunchKernelGGL((lane_pack_rows_kernel<Site<R,true>>),dim3(R),dim3(256),0,0,site,xs.as<float>());xs.read<float>(R*256U);
+        hipLaunchKernelGGL((project_wide_rows_lane_kernel<Site<R,true>,8U,8U,2U>),dim3(1),dim3(256),0,0,site,codes.as<unsigned char>(),scales.as<std::uint16_t>(),xs.as<float>());read();
+    }
+}
+template<unsigned R> void signed_partials() {
+    using namespace strix::q8_rows;
+    context("hip.signed-a8.partial.r"+std::to_string(R),"hip-signed-a8-block-chain@1",{R,1U,256U},"gguf.q8_0@1");
+    auto w=weights(256U,1U);std::vector<float> x(R*256U,0.125F);
+    Buffer dw(w.size()),dx(x.size()*4U),dy(R*4U),codes(dense_a8_pitch<R>()*256U),deltas(dense_a8_pitch<R>()*8U*4U),trace(256U*kPartialSlots*4U),counts(256U*4U);
+    dw.upload(w);dx.upload(x);auto* tp=trace.as<float>();auto* cp=counts.as<unsigned>();
+    check(hipMemcpyToSymbol(HIP_SYMBOL(partial_trace),&tp,sizeof(tp)));check(hipMemcpyToSymbol(HIP_SYMBOL(partial_count),&cp,sizeof(cp)));
+    Site<R,true> site{};site.segments=segments({{dw.p,1U}});site.width=256;site.outputs=1;site.output=dy.as<float>();
+    for(unsigned r=0;r<R;++r) site.input[r]=dx.as<float>()+r*256U;
+    hipLaunchKernelGGL((dense_a8_quantize_kernel<Site<R,true>>),dim3((R*32U+255U)/256U),dim3(256),0,0,site,codes.as<std::int8_t>(),deltas.as<float>());
+    codes.read<std::int8_t>(R*256U);deltas.read<float>(dense_a8_pitch<R>()*8U);
+    const auto read=[&] {
+        check(hipGetLastError());dy.read<float>(R);auto values=trace.read<float>(256U*kPartialSlots);const auto used=counts.read<unsigned>(256U);
+        unsigned total=0;for(unsigned n:used) {if(n>kPartialSlots) throw std::runtime_error("signed diagnostic partial capacity");total+=n;}
+#ifdef STRIX_WFMT_CAPTURE
+        if(!total) throw std::runtime_error("missing signed diagnostic partials");
+        strix::weight::capture::emit("partials",values.data(),values.size()*sizeof(float));
+#endif
+        check(hipMemset(trace.p,0,256U*kPartialSlots*4U));check(hipMemset(counts.p,0,256U*4U));
+    };
+    if constexpr(R<=8U) {
+        hipLaunchKernelGGL((project_rows_dense_a8_kernel<Site<R,true>,1U,false,false>),dim3(1),dim3(256),0,0,site,codes.as<std::int8_t>(),deltas.as<float>());read();
+        hipLaunchKernelGGL((project_rows_dense_a8_kernel<Site<R,true>,1U,true,false>),dim3(1),dim3(256),dense_a8_stage_bytes<R>(256U),0,site,codes.as<std::int8_t>(),deltas.as<float>());read();
+        std::vector<unsigned char> q6(208U,0);Buffer dq(q6.size());dq.upload(q6);site.segments=segments({{dq.p,1U}});
+        hipLaunchKernelGGL((project_rows_dense_a8_kernel<Site<R,true>,1U,false,true>),dim3(1),dim3(256),0,0,site,codes.as<std::int8_t>(),deltas.as<float>());read();
+    } else {
+        hipLaunchKernelGGL((project_rows_dense_a8_wmma_kernel<Site<R,true>,1U,1U>),dim3(R/16U),dim3(128),0,0,site,codes.as<std::int8_t>(),deltas.as<float>());read();
+        if constexpr(R%64U==0U) {
+            hipLaunchKernelGGL((project_rows_dense_a8_wmma_lds2_kernel<Site<R,true>,4U,true>),dim3(R/64U),dim3(128),0,0,site,codes.as<std::int8_t>(),deltas.as<float>());read();
+        }
+    }
+}
+void f16_partials() {
+    namespace d=strix::core::f16_dense_tall;
+    context("hip.dense-f16.partial","dense-q8a8-f16-v1@1",{1U,1U,128U},"gguf.q8_0@1");
+    auto w=weights(128U,1U);std::vector<std::int8_t> a(128U,7);std::vector<float> delta(4U,0.03125F);
+    Buffer dw(w.size()),da(a.size()),ds(16U),dy(4U),trace(256U*kPartialSlots*4U),counts(256U*4U);
+    dw.upload(w);da.upload(a);ds.upload(delta);
+    auto* tp=trace.as<float>();auto* cp=counts.as<unsigned>();
+    check(hipMemcpyToSymbol(HIP_SYMBOL(partial_trace),&tp,sizeof(tp)));check(hipMemcpyToSymbol(HIP_SYMBOL(partial_count),&cp,sizeof(cp)));
+    d::q8a8::View v{dw.as<std::uint8_t>(),da.as<std::int8_t>(),ds.as<float>(),dy.as<float>(),136U,0U,128U,1U,1U,128U,1U,0U,0U};
+    const auto read=[&] {
+        check(hipGetLastError());dy.read<float>(1U);auto values=trace.read<float>(256U*kPartialSlots);const auto used=counts.read<unsigned>(256U);
+        for(unsigned n:used) if(n>kPartialSlots) throw std::runtime_error("F16 diagnostic partial capacity");
+#ifdef STRIX_WFMT_CAPTURE
+        strix::weight::capture::emit("partials",values.data(),values.size()*sizeof(float));
+#endif
+        check(hipMemset(trace.p,0,256U*kPartialSlots*4U));check(hipMemset(counts.p,0,256U*4U));
+    };
+    hipLaunchKernelGGL((f16_partial_kernel<0U>),dim3(1),dim3(256),0,0,v);read();
+    hipLaunchKernelGGL((f16_partial_kernel<1U>),dim3(1),dim3(256),0,0,v);read();
 }
 void dense_case(unsigned k,unsigned n,unsigned rows) {
     namespace d=strix::core::f16_dense_tall;
@@ -262,7 +362,7 @@ int main() try {
 #endif
     context("hip.q8-f16-operands","dense-q8a8-f16-v1@1",{16U,256U},"gguf.q8_0@1");
     Buffer op(4096U*3U*2U);hipLaunchKernelGGL(operands_kernel,dim3(16),dim3(256),0,0,op.as<std::uint16_t>());check(hipGetLastError());op.read<std::uint16_t>(4096U*3U);
-    partial_case(false);partial_case(true);
+    partial_case(false);partial_case(true);row_partials<1>();row_partials<32>();signed_partials<1>();signed_partials<16>();signed_partials<64>();f16_partials();
     signed_case<1>(256U,17U);signed_case<2>(256U,17U);signed_case<7>(256U,17U);signed_case<8>(256U,17U);
     signed_case<16>(256U,17U);signed_case<32>(256U,17U);signed_case<64>(256U,17U);signed_case<128>(256U,17U);
     for(unsigned n:{1U,17U,65U}) {rows_case<1>(256U,n);rows_case<2>(512U,n);rows_case<7>(256U,n);rows_case<8>(512U,n);rows_case<16>(256U,n);rows_case<32>(512U,n);rows_case<64>(256U,n);}

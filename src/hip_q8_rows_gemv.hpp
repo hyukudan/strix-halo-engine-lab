@@ -1061,6 +1061,12 @@ __global__ __launch_bounds__(32U * W) void project_wide_rows_lane_kernel(Site si
         else if constexpr ((Exp & 8U) != 0U) lane_steps_noc(acc, xp, xn, lds);
         else if constexpr ((Exp & 2U) != 0U) { if (k == 0U) lane_steps_first_prefetch(acc, xp, xn, lds); else lane_steps_prefetch(acc, xp, xn, lds); }
         else if (k == 0U) lane_steps_first(acc, xp, xn, lds); else lane_steps(acc, xp, xn, lds);
+#if defined(STRIX_WFMT_CAPTURE) && STRIX_WFMT_CAPTURE
+        if constexpr (requires { site.capture_partial(acc[0]); }) {
+#pragma unroll
+            for (unsigned p = 0; p < 128U; ++p) site.capture_partial(acc[p]);
+        }
+#endif
         if (t0 + 2U == Stage) {
             if (s + 2U < steps && !(Exp & 48U))
 #pragma unroll
@@ -1423,7 +1429,11 @@ __global__ __launch_bounds__(kThreads) void project_rows_dense_a8_kernel(Site si
             const std::uint32_t count = min(ChainBlocks, blocks - 32U * s);
 #pragma unroll
             for (unsigned j = 0; j < ChainBlocks; ++j)
-                if (j < count) { const float2 c = chain[wave][lane][j]; acc = __builtin_fmaf(c.x, c.y, acc); }
+                if (j < count) { const float2 c = chain[wave][lane][j]; acc = __builtin_fmaf(c.x, c.y, acc);
+#if defined(STRIX_WFMT_CAPTURE) && STRIX_WFMT_CAPTURE
+                    if constexpr (requires { site.capture_partial(acc); }) site.capture_partial(acc);
+#endif
+                }
         }
         if (++s == supers) {
             if (lane < Pairs) {
@@ -1557,8 +1567,12 @@ __global__ __launch_bounds__(128) void project_rows_dense_a8_wmma_kernel(Site si
 #pragma unroll
                 for (unsigned u = 0; u < TN; ++u)
 #pragma unroll
-                    for (unsigned e = 0; e < 8U; ++e)
+                    for (unsigned e = 0; e < 8U; ++e) {
                         acc[t][u][e] = __builtin_fmaf(dw[s][u] * da[t][e], __int_as_float(c[t][u][e]) - kMagicF, acc[t][u][e]);
+#if defined(STRIX_WFMT_CAPTURE) && STRIX_WFMT_CAPTURE
+                        if constexpr (requires { site.capture_partial(acc[t][u][e]); }) site.capture_partial(acc[t][u][e]);
+#endif
+                    }
         }
     }
 #pragma unroll
@@ -1688,8 +1702,12 @@ __global__ __launch_bounds__(32U * Waves) void project_rows_dense_a8_wmma_lds2_k
 #pragma unroll
                     for (unsigned u = 0; u < TN; ++u)
 #pragma unroll
-                        for (unsigned e = 0; e < 8U; ++e)
+                        for (unsigned e = 0; e < 8U; ++e) {
                             acc[t][u][e] = __builtin_fmaf(dw[s][u] * da[e], __int_as_float(c[u][e]) - kMagicF, acc[t][u][e]);
+#if defined(STRIX_WFMT_CAPTURE) && STRIX_WFMT_CAPTURE
+                            if constexpr (requires { site.capture_partial(acc[t][u][e]); }) site.capture_partial(acc[t][u][e]);
+#endif
+                        }
                     __builtin_amdgcn_sched_barrier(0);
                 }
         }

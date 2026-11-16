@@ -193,8 +193,12 @@ __device__ __forceinline__ void core(const float* x, unsigned in, unsigned nr, C
                 const Half16 a = an;
                 if (kk + 1U < 4U || s == 0U || u0 + 4U < units) an = frag(u0 + kk + 1U);
 #pragma unroll
-                for (unsigned t = 0; t < TC; ++t)
+                for (unsigned t = 0; t < TC; ++t) {
                     acc[t] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a, detail::staged_fragment(&lds.w[16U * t + c][kk * 8U]), acc[t]);
+#if defined(STRIX_WFMT_CAPTURE) && STRIX_WFMT_CAPTURE
+                    if constexpr (requires { cols.capture_partial(acc[t]); }) cols.capture_partial(acc[t]);
+#endif
+                }
             }
         }
     }
