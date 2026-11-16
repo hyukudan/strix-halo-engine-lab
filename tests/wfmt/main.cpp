@@ -3,6 +3,8 @@
 #include <string_view>
 #include <exception>
 int wfmt_census_test();
+bool wfmt_readers_test();
+bool wfmt_admission_test();
 bool wfmt_contracts_test();
 bool wfmt_reference_test();
 bool wfmt_geometry_test();
@@ -20,6 +22,8 @@ int main(int argc, char** argv) {
     bool ok = false;
     if (name == "contracts") ok = wfmt_contracts_test();
     else if (name == "census") ok = wfmt_census_test() == 0;
+    else if (name == "readers") ok = wfmt_readers_test();
+    else if (name == "admission") ok = wfmt_admission_test();
     else if (name == "compare") ok = strix::weight::test::compare_case();
     else if (name == "reference") ok = wfmt_reference_test();
     else if (name == "geometry") ok = wfmt_geometry_test();

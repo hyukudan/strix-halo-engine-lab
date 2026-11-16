@@ -1,3 +1,4 @@
+#include "strix/weight/admission.hpp"
 // CUDA Qwen prefill driver (see include/strix/cuda_qwen_prefill.hpp): model upload, per-block step loop in the HIP
 // step order, node state export. The arithmetic lives in the family libraries (qwen_hc, qwen_dense, qwen_gdn, qwen_qsa,
 // qwen_moe, qwen_ple, qwen_mtp), each bit-identical to its HIP kernels; this file only wires buffers and order.
@@ -307,6 +308,8 @@ struct Prefill::Impl : BlockFields {
     std::function<void(std::uint32_t)> after_layer;        // called (host) after layer l's launches of a block
     am::Tables tables{};
     qsa::RopeTable* rope = nullptr;
+    weight::WeightMap source_weights;
+    std::vector<weight::LegacyConversion> source_conversions;
     gguf::FileInfo info;                       // tensors of every part, with the types as stored on the device
     std::string ple_part;                      // the part holding per_layer_token_embd
     bool native_experts = false;               // some layer's experts need the native MoE path
@@ -466,12 +469,23 @@ void Prefill::Impl::upload_model() {
     std::uint64_t scratch_bytes = 0;
     for (const auto& part : model_parts(cfg.model_gguf)) {
     const auto pinfo = gguf::read_file(part);
+    std::shared_ptr<const weight::Source> owner;
+    auto admission = weight::open_source(part,owner);
+    weight::TensorIndex indexed;
+    if (admission) admission = weight::index_gguf(pinfo,owner,indexed);
+    weight::WeightMap admitted;
+    if (admission) admission = weight::bind_qwen(indexed,admitted);
+    if (!admission) throw std::runtime_error("Qwen weight admission: " + admission.detail);
+    source_weights.insert(source_weights.end(),admitted.begin(),admitted.end());
     std::FILE* f = std::fopen(part.c_str(), "rb");
     if (!f) throw std::runtime_error("cannot open " + part);
     for (auto t : pinfo.tensors) {
         if (t.name.rfind("per_layer_token_embd", 0) == 0) { ple_part = part; info.tensors.push_back(t); continue; }  // PLE (host)
         if (t.name == "output.weight" && !cfg.decode) { info.tensors.push_back(t); continue; }                  // head (node)
         const Target target = transcode_target(t);
+        if (target != Target::native) source_conversions.push_back({weight::tensor_id(*owner,t.name),
+            target == Target::q8_0 ? weight::FormatId{"gguf.q8_0",1} : weight::FormatId{"plain.f32",1},
+            target == Target::q8_0 ? "legacy.qwen.cuda.amax127-f16-roundf@1" : "legacy.qwen.cuda.decode-f32@1"});
         if (target != Target::native && !transcode::supported(t.ggml_type))
             throw std::runtime_error("no decoder for " + t.name + " type " + std::to_string(t.ggml_type));
         void* raw = nullptr;
@@ -931,6 +945,8 @@ Prefill::Prefill(const Config& config) : impl_(std::make_unique<Impl>()) {
 }
 
 Prefill::~Prefill() = default;
+const weight::WeightMap& Prefill::weight_map() const noexcept { return impl_->source_weights; }
+const std::vector<weight::LegacyConversion>& Prefill::weight_conversions() const noexcept { return impl_->source_conversions; }
 
 std::string Prefill::describe() const {
     if (!impl_->cfg.diagnostic_bf16_mtp) return impl_->describe;
