@@ -93,7 +93,7 @@ for exe in "$bindir"/strix-*; do
         pass "$name usage (rc=$rc)"
     elif printf '%s' "$out" | grep -qiE "error while loading shared libraries|symbol lookup error"; then
         fail "$name --help: rc=$rc: $(printf '%s' "$out" | head -2 | tr '\n' ' ' | cut -c1-160)"
-    elif [ $rc -eq 1 ] && printf '%s' "$out" | grep -qiE "device gate: refusing to start: cannot enumerate"; then
+    elif { [ $rc -eq 1 ] || [ $rc -eq 2 ]; } && printf '%s' "$out" | grep -qiE "device gate: refusing to start: cannot enumerate"; then
         # Libraries resolved and the start gate ran; with no visible GPU nothing more can run (HIP mains bind first).
         nogpu=$((nogpu + 1))
         pass "$name loads (no visible GPU: the device gate refused before --help)"
