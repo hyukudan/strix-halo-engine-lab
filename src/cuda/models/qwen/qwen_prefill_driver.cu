@@ -24,6 +24,7 @@
 #include "strix/cuda/qwen_mtp_draft.hpp"
 #include "strix/cuda/qwen_plemtp.hpp"
 #include "strix/cuda/qwen_qsa.hpp"
+#include "strix/mtp_draft_split.hpp"
 #include "strix/cuda/qwen_transcode.hpp"
 #include "strix/gguf_reader.hpp"
 #include "strix/cuda/vram_guard.hpp"
@@ -395,6 +396,10 @@ struct Prefill::Impl : BlockFields {
     std::uint64_t* draft_pos = nullptr;         // device [8]
     std::uint64_t* draft_pos_pinned = nullptr;  // [8] + the pending token word after them
     std::uint64_t draft_captures = 0, draft_replays = 0;
+    // Draft chain in two graph segments [0, a) and [a, depth) (rtxmax3, shared chooser strix/mtp_draft_split.hpp): the second
+    // runs only when no draft of the first fell below min_p. STRIX_QRTX_DRAFT_SPLIT: unset/auto, 0 = one segment, N = fixed a.
+    strix::mtp::DraftSplit draft_split{strix::mtp::DraftSplit::mode_from_env("STRIX_QRTX_DRAFT_SPLIT")};
+    std::uint64_t draft_split_runs = 0, draft_second_runs = 0;
     // batched draft chains (draft_cohort): row j = the j-th chain by descending depth
     std::uint16_t* bd_wide = nullptr;          // [3][8][10240] attention / mlp / source wide rows
     std::uint16_t* bd_fused = nullptr;         // [8][10240] input-fusion rows
@@ -2375,8 +2380,15 @@ Draft Prefill::draft(SessionId session, std::uint32_t pending, std::uint32_t dep
     // from device memory (the eager chain runs once per key first; any position, pooled state or token replays it).
     qsa::MultiShape dshape{};
     const std::uint32_t one_row = 1;
+    const std::uint32_t first_segment = per_step_sync ? depth : m.draft_split.first_segment(depth);
+    if (first_segment < depth) ++m.draft_split_runs;
+    bool stopped = false;
+    for (std::uint32_t k0 = 0, k1 = first_segment; k0 < depth && !stopped; k0 = k1, k1 = depth) {
+    if (k0 > 0) ++m.draft_second_runs;
+    source = k0 ? wide_src : S.held;  // segment 2 continues from the chain's wide state and m.draft_token on the device
     const Impl::DraftKey dkey{reinterpret_cast<std::uintptr_t>(S.held), reinterpret_cast<std::uintptr_t>(S.mtp_kv),
-                              reinterpret_cast<std::uintptr_t>(S.mtp_index), reinterpret_cast<std::uintptr_t>(S.mtp_pooled), depth};
+                              reinterpret_cast<std::uintptr_t>(S.mtp_index), reinterpret_cast<std::uintptr_t>(S.mtp_pooled),
+                              depth | k0 << 8U | k1 << 16U};
     cudaGraphExec_t dexec = nullptr;
     bool capture = false;
     if (m.use_graphs && m.qsa_graph && m.draft_graph && !per_step_sync && S.mtp_pooled && cudaStreamQuery(m.stream) == cudaSuccess &&
@@ -2394,25 +2406,27 @@ Draft Prefill::draft(SessionId session, std::uint32_t pending, std::uint32_t dep
     }
     const std::uint32_t valid_before = S.mtp_pooled_valid;
     if (dexec || capture) {  // this chain's inputs (the stream is idle: no copy of an earlier replay is in flight)
-        for (std::uint32_t k = 0; k < depth; ++k) {
+        for (std::uint32_t k = k0; k < k1; ++k) {
             m.draft_pos_pinned[k] = S.length - 1 + k;
             const qsa::SegmentState st{1, S.length - 1 + k, qsa::LayerState{S.mtp_kv, S.mtp_index, S.mtp_pooled, &S.mtp_pooled_valid}};
             qsa::prepare_replay(&st, 1, m.qws, m.qsa_maps_pinned[12U + k]);
         }
         std::memcpy(m.draft_pos_pinned + kMaxStepRows, &pending, 4);
-    } else {
+    } else if (k0 == 0) {
         ck(cudaMemcpyAsync(m.draft_token, &pending, 4, cudaMemcpyHostToDevice, m.stream), "draft pending");
     }
     if (capture) {
         ck(cudaStreamBeginCapture(m.stream, cudaStreamCaptureModeRelaxed), "begin draft capture");
-        ck(cudaMemcpyAsync(m.draft_token, m.draft_pos_pinned + kMaxStepRows, 4, cudaMemcpyHostToDevice, m.stream), "draft pending");
+        if (k0 == 0)
+            ck(cudaMemcpyAsync(m.draft_token, m.draft_pos_pinned + kMaxStepRows, 4, cudaMemcpyHostToDevice, m.stream), "draft pending");
         ck(cudaMemcpyAsync(m.draft_pos, m.draft_pos_pinned, kMaxStepRows * sizeof(std::uint64_t), cudaMemcpyHostToDevice, m.stream),
            "draft positions");
-        ck(cudaMemcpyAsync(m.qsa_maps + 12, m.qsa_maps_pinned + 12, depth * sizeof(qsa::SegmentMap), cudaMemcpyHostToDevice, m.stream),
+        ck(cudaMemcpyAsync(m.qsa_maps + 12 + k0, m.qsa_maps_pinned + 12 + k0, (k1 - k0) * sizeof(qsa::SegmentMap), cudaMemcpyHostToDevice,
+                           m.stream),
            "draft qsa maps");
     }
     try {
-    for (std::uint32_t k = 0; k < (dexec ? 0U : depth); ++k) {
+    for (std::uint32_t k = k0; k < (dexec ? k0 : k1); ++k) {
         const std::uint64_t pos = S.length - 1 + k;
         // input fusion (enorm/hnorm/eh_proj) -> the MTP wide row; also stores a provisional cache row at pos
         pm::launch_mtp_cache_rows(mwts, pm::MtpRounding{}, source, m.draft_token, 1, pos, S.mtp_kv, S.mtp_index, m.mtp_ws,
@@ -2468,7 +2482,7 @@ Draft Prefill::draft(SessionId session, std::uint32_t pending, std::uint32_t dep
         std::memcpy(&probability, &sel[1], 4);
         out.tokens.push_back(sel[0]);
         out.probability.push_back(probability);
-        if (probability < min_probability) break;  // the node keeps the low draft and stops after it
+        if (probability < min_probability) { stopped = true; break; }  // the node keeps the low draft and stops after it
     }
     if (capture) {
         cudaGraph_t graph = nullptr;
@@ -2504,17 +2518,20 @@ Draft Prefill::draft(SessionId session, std::uint32_t pending, std::uint32_t dep
     }
     if (!per_step_sync) {
         // every step was launched back to back; one read, then the same stop rule (later steps are discarded)
+        // (one segment = the whole chain: the same stop rule; a stop in segment 1 skips segment 2, whose steps it discards)
         std::uint32_t all[2 * kMaxStepRows];
-        ck(cudaMemcpyAsync(all, m.draft_sel, std::uint64_t{depth} * 8, cudaMemcpyDeviceToHost, m.stream), "draft read");
+        ck(cudaMemcpyAsync(all, m.draft_sel + 2 * k0, std::uint64_t{k1 - k0} * 8, cudaMemcpyDeviceToHost, m.stream), "draft read");
         ck(cudaStreamSynchronize(m.stream), "draft chain");
-        for (std::uint32_t k = 0; k < depth; ++k) {
+        for (std::uint32_t k = k0; k < k1; ++k) {
             float probability;
-            std::memcpy(&probability, &all[2 * k + 1], 4);
-            out.tokens.push_back(all[2 * k]);
+            std::memcpy(&probability, &all[2 * (k - k0) + 1], 4);
+            out.tokens.push_back(all[2 * (k - k0)]);
             out.probability.push_back(probability);
-            if (probability < min_probability) break;
+            if (probability < min_probability) { stopped = true; break; }
         }
     }
+    }  // segments
+    if (!per_step_sync) m.draft_split.note(static_cast<std::uint32_t>(out.tokens.size()));
     return out;
 }
 

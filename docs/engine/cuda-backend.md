@@ -95,6 +95,11 @@ captured graph; each replay first copies the 12 maps from pinned memory. The MTP
 the same way (positions and the pending token from pinned memory, maps 12..18). Kernel bodies and their operation order
 are unchanged, so the logits are bit-identical. Switches: `STRIX_QRTX_QSA_GRAPH=0` (cut graphs, eager cores) and
 `STRIX_QRTX_DRAFT_GRAPH=0` (eager draft chain), both default on.
+The C1 draft chain runs as two graph segments [0, a) and [a, depth): the second only when no draft of the first fell
+below min_p (the verify would discard its steps). Kept drafts and verified tokens are unchanged; `a` comes from a
+histogram of kept drafts (shared chooser `include/strix/mtp_draft_split.hpp`, expected steps a + P(kept > a) (depth - a
++ 0.25)). `STRIX_QRTX_DRAFT_SPLIT=0` = one segment, `N` = fixed a. Measured (#680, 3 ABAB pairs): prose C1 +7.3 %, json
++1.9 %, edit +-0.2 %, window 16.1 -> 14.5 ms at 1.86 tokens/window.
 
 Served decode by prompt class: `scripts/bench/cuda/qwen_serve_classes.py` (prose / edit / json, C1 / C4 / C8, cold and
 warm passes, ids of every request) with `scripts/bench/cuda/qwen_classes_prompts.json`, and strict ABAB server arms with
