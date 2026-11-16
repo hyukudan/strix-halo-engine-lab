@@ -239,6 +239,9 @@ def main():
         return 0
     if args.run_index is not None and not 0 <= args.run_index < len(plan):
         p.error("run-index is outside the fixed plan")
+    if (args.resume or args.run_index is not None) and args.out.exists() and any(args.out.iterdir()):
+        if any(not (args.out / name).is_file() for name in ("config.json", "prompt-sha256.json")):
+            p.error("nonempty output is missing frozen metadata; use a fresh output directory")
     args.out.mkdir(parents=True, exist_ok=args.run_index is not None or args.resume)
     for name, expected in (("config.json", config), ("prompt-sha256.json", hashes)):
         path = args.out / name
