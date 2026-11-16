@@ -2,6 +2,7 @@
 #include "strix/weight/cache.hpp"
 #include "strix/weight/runtime.hpp"
 #include "strix/cuda/qwen_dense.hpp"
+#include "nvfp4_source.cuh"
 #include <span>
 #include <type_traits>
 
@@ -10,6 +11,8 @@ namespace strix::cuda::weight {
 inline constexpr ::strix::weight::KernelId dense_project_schema = 0x435701;
 inline constexpr ::strix::weight::KernelId transcode_q8_schema = 0x435702;
 inline constexpr ::strix::weight::KernelId transcode_f32_schema = 0x435703;
+inline constexpr ::strix::weight::KernelId nvfp4_schema = 0x435704;
+inline constexpr ::strix::weight::ImageId native_nvfp4_image{"cuda.nvfp4.native",1};
 struct DenseProjectArguments {
     qwen_dense::Site site;
     std::uint32_t rows;
@@ -39,6 +42,12 @@ inline ::strix::weight::KernelArguments transcode_arguments(const TranscodeArgum
     return {f32 ? transcode_f32_schema : transcode_q8_schema, 1, &a, sizeof(a)};
 }
 void transcode_arguments(TranscodeArguments&&, bool) = delete;
+
+inline ::strix::weight::KernelArguments arguments(const Nvfp4Arguments& a) {
+    return {nvfp4_schema,1,&a,sizeof(a)};
+}
+void arguments(Nvfp4Arguments&&) = delete;
+void arguments(const Nvfp4Arguments&&) = delete;
 void transcode_arguments(const TranscodeArguments&&, bool) = delete;
 
 using Launch = ::strix::weight::Status (*)(const ::strix::weight::Plan&, const ::strix::weight::WeightView&,

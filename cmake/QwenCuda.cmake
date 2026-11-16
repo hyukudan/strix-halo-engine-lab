@@ -10,12 +10,26 @@ if(MSVC)
         $<$<COMPILE_LANGUAGE:CXX>:/Zc:preprocessor>)
 endif()
 include(${CMAKE_CURRENT_LIST_DIR}/StrixCudaBackend.cmake)
+# The CUDA-only branch returns before src/cuda/core's standalone CMake. The
+# shared weight library already owns nvfp4_reference.cpp; compile the native
+# instruction implementation exactly once, without a second host reference.
+add_library(strix_nvfp4 STATIC src/cuda/core/nvfp4.cu)
+target_include_directories(strix_nvfp4 PUBLIC include)
+target_link_libraries(strix_nvfp4 PUBLIC strix-weight)
+set_target_properties(strix_nvfp4 PROPERTIES
+    CUDA_ARCHITECTURES 120a CUDA_STANDARD 20 CUDA_STANDARD_REQUIRED ON)
+target_compile_options(strix_nvfp4 PRIVATE
+    $<$<COMPILE_LANGUAGE:CUDA>:--fmad=false;--prec-div=true;--prec-sqrt=true;--ftz=false>)
+if(MSVC)
+    target_compile_options(strix_nvfp4 PRIVATE
+        $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/EHsc,/Zc:preprocessor,/utf-8>)
+endif()
 add_library(strix_qwen_cuda STATIC
     src/cuda/models/qwen/qwen_prefill_driver.cu src/cuda/models/qwen/qwen_hc.cu src/cuda/models/qwen/qwen_dense.cu
     src/cuda/models/qwen/qwen_gdn.cu src/cuda/models/qwen/qwen_qsa.cu src/cuda/models/qwen/qwen_moe.cu
     src/cuda/models/qwen/qwen_plemtp.cu src/cuda/models/qwen/qwen_mtp_draft.cu src/cuda/models/qwen/qwen_transcode.cu src/cuda/weight/registry.cu ${STRIX_CUDA_CORE_AMD_MATH_SOURCES} src/gguf_reader.cpp)
 target_include_directories(strix_qwen_cuda PUBLIC include src/cuda/models/qwen PRIVATE src)
-target_link_libraries(strix_qwen_cuda PUBLIC strix-weight)
+target_link_libraries(strix_qwen_cuda PUBLIC strix-weight strix_nvfp4)
 # Every Qwen CUDA binary resolves its device through the start gate (strix-devices-v1) before its first allocation.
 include(${CMAKE_CURRENT_LIST_DIR}/StrixDevice.cmake)
 target_link_libraries(strix_qwen_cuda PUBLIC strix_device strix_cuda_core)
@@ -151,8 +165,12 @@ if(STRIX_WFMT_CAPTURE)
 endif()
 # The CUDA-only branch declares the tuned library before binding these tests.
 if(STRIX_WFMT_TESTS)
+    # cuda_nvfp4_case uses the same runner and mandatory device gate as dense
+    # and GSQ cases; the native kernel above is specialised only for SM120.
     add_executable(strix-wfmt-cuda-tests tests/wfmt/cuda_main.cu tests/wfmt/cuda_dense.cu)
     target_include_directories(strix-wfmt-cuda-tests PRIVATE src)
+    target_sources(strix-wfmt-cuda-tests PRIVATE tests/wfmt/cuda_nvfp4.cu)
+    target_compile_definitions(strix-wfmt-cuda-tests PRIVATE STRIX_WFMT_NVFP4=1)
     target_link_libraries(strix-wfmt-cuda-tests PRIVATE strix_qwen_cuda strix-weight strix_device)
     target_compile_options(strix-wfmt-cuda-tests PRIVATE
         $<$<COMPILE_LANGUAGE:CUDA>:--fmad=false;--prec-div=true;--prec-sqrt=true;--ftz=false>)
@@ -161,5 +179,8 @@ if(STRIX_WFMT_TESTS)
     endif()
     add_test(NAME wfmt.cuda-dense COMMAND strix-wfmt-cuda-tests cuda-dense)
     add_test(NAME wfmt.cuda-abi COMMAND strix-wfmt-cuda-tests cuda-abi)
+    add_test(NAME wfmt.cuda-nvfp4 COMMAND strix-wfmt-cuda-tests cuda-nvfp4)
+    set_tests_properties(wfmt.cuda-nvfp4 PROPERTIES
+        TIMEOUT 110 ENVIRONMENT "CUDA_VISIBLE_DEVICES=0")
     set_tests_properties(wfmt.cuda-dense PROPERTIES TIMEOUT 110)
 endif()
