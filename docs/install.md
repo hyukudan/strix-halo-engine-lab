@@ -57,9 +57,9 @@ The HIP DMA-BUF export path needs HIP 7 or newer; older headers make that path r
 model and the host settings that help it are in [memory budget](operations/memory-budget.md); the packages never
 change kernel, GTT, IOMMU or boot settings.
 
-DEB dependencies come from `dpkg-shlibdeps` when the packages are built on a Debian/Ubuntu host (it names the
-package that provides `libamdhip64` there, from AMD's repository or the distribution); elsewhere `strix-hip`
-depends on `hip-runtime-amd` (override with `-DSTRIX_PACKAGE_DEB_HIP_DEPENDS=...`). RPM requirements come from
+DEB dependencies of `strix-core` and `strix-tools` come from `dpkg-shlibdeps`. `strix-hip` declares the tested
+ROCm range instead of the build host's ROCm packages: `libamdhip64-7 (>= 7.1.0) | hip-runtime-amd (>= 7.1.0)`
+(distribution or AMD repository; override with `-DSTRIX_PACKAGE_DEB_HIP_DEPENDS=...`). RPM requirements come from
 `rpmbuild`'s automatic library scan (`libamdhip64.so.N`), so they resolve on any RPM distribution that ships ROCm.
 
 ## Install on Linux
@@ -182,5 +182,5 @@ The lists live in `packaging/StrixPackaging.cmake`; the support matrix in `packa
 |---|---|---|
 | `strix-cuda-qwen-0.1.0-windows-x86_64.zip` (29 MB) | Windows 11, MSVC 14.44, CUDA 13.0, sm_120 | `--help` of both programs PASS; installed with a Qwen3.8-Flash-Next model and a declared RTX PRO 6000: weights 82.5 GB uploaded in 97 s, `GET /health` = 200; uninstall kept the configuration |
 | `strix-core`, `strix-tools` DEB (amd64), `strix-docs` DEB (all), tar.gz | Ubuntu 26.04, GCC, host tree | Depends from `dpkg-shlibdeps` (`libc6 (>= 2.43)`, `libstdc++6 (>= 14)`; tools add `python3`, `python3-numpy`); extracted tar.gz smoke: 13 PASS (5 programs have no `--help` yet: `strix-deepseek41-expert-server`, `strix-inspect-gguf`, `strix-memory-plan`, `strix-model-describe`, `strix-model-manifest`), `strix-skeleton-serve` `/health` = 200; `strix-package-support-tests` passed |
-| `strix-hip` DEB (amd64, 309 MB installed) + tar.gz, gfx1151 | Ubuntu 26.04, Ubuntu ROCm packages (HIP 7.16), 75 min cold build | Depends `libamdhip64-7 (>= 7.1.0)` + the ROCm runtime package, conffiles `/etc/strix/serve.toml` and `strix.env`, postinst / prerm / postrm, unit and sysusers entry; every program resolves `libamdhip64.so.7`; description and `build-hip.txt`: `gfx1151: qualified` |
+| `strix-hip` DEB (amd64, 309 MB installed) + tar.gz, gfx1151 | Ubuntu 26.04, Ubuntu ROCm packages (HIP 7.16), 75 min cold build | Depends (measured before the tested-range change) `libamdhip64-7 (>= 7.1.0)` + the build host ROCm runtime package, conffiles `/etc/strix/serve.toml` and `strix.env`, postinst / prerm / postrm, unit and sysusers entry; every program resolves `libamdhip64.so.7`; description and `build-hip.txt`: `gfx1151: qualified` |
 | RPM | not built on a node (no `rpmbuild` there) | built and listed (`rpm -qlp`) by the CI host job |

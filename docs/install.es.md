@@ -58,9 +58,10 @@ La ruta de exportación DMA-BUF de HIP necesita HIP 7 o posterior; con cabeceras
 soportado". La memoria por modelo y los ajustes del host que la ayudan están en
 [presupuesto de memoria](operations/memory-budget.md); los paquetes nunca cambian kernel, GTT, IOMMU ni arranque.
 
-Las dependencias DEB salen de `dpkg-shlibdeps` cuando los paquetes se construyen en Debian/Ubuntu (nombra el
-paquete que da `libamdhip64` en ese host, del repositorio de AMD o de la distribución); en otro host `strix-hip`
-depende de `hip-runtime-amd` (se cambia con `-DSTRIX_PACKAGE_DEB_HIP_DEPENDS=...`). Los requisitos RPM salen del
+Las dependencias DEB de `strix-core` y `strix-tools` salen de `dpkg-shlibdeps`. `strix-hip` declara el rango
+ROCm probado en lugar de los paquetes ROCm del host de compilación:
+`libamdhip64-7 (>= 7.1.0) | hip-runtime-amd (>= 7.1.0)` (distribución o repositorio de AMD; se cambia con
+`-DSTRIX_PACKAGE_DEB_HIP_DEPENDS=...`). Los requisitos RPM salen del
 análisis automático de bibliotecas de `rpmbuild` (`libamdhip64.so.N`) y se resuelven en cualquier distribución RPM
 con ROCm.
 

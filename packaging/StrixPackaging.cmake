@@ -98,7 +98,8 @@ else()
     set(_strix_pkg_notice_components core tools docs hip cuda)
 endif()
 foreach(_c IN LISTS _strix_pkg_notice_components)
-    install(FILES "${_strix_pkg_src}/LICENSE" DESTINATION "${CMAKE_INSTALL_DATADIR}/doc/strix-${_c}" COMPONENT ${_c})
+    install(FILES "${_strix_pkg_src}/LICENSE" "${_strix_pkg_dir}/THIRD-PARTY.md"
+        DESTINATION "${CMAKE_INSTALL_DATADIR}/doc/strix-${_c}" COMPONENT ${_c})
     install(DIRECTORY "${_strix_pkg_src}/LICENSES/" DESTINATION "${CMAKE_INSTALL_DATADIR}/doc/strix-${_c}/LICENSES"
         COMPONENT ${_c})
 endforeach()
@@ -297,23 +298,24 @@ else()
     set(CPACK_DEBIAN_PACKAGE_SECTION "science")
     set(CPACK_DEBIAN_PACKAGE_CONTROL_STRICT_PERMISSION TRUE)
     find_program(STRIX_DPKG_SHLIBDEPS dpkg-shlibdeps)
-    set(STRIX_PACKAGE_DEB_HIP_DEPENDS "" CACHE STRING
-        "Extra DEB Depends of strix-hip; empty: from dpkg-shlibdeps on a Debian host, else hip-runtime-amd")
+    # strix-hip declares the tested ROCm range instead of what dpkg-shlibdeps finds on the build host (that pins the
+    # host's ROCm generation package, e.g. amdrocm-runtime10.1): the distribution's libamdhip64-7 or AMD's
+    # hip-runtime-amd, HIP 7.1 or newer (the HIP 7 DMA-BUF path; tested with HIP 7.16).
+    set(STRIX_PACKAGE_DEB_HIP_DEPENDS "libamdhip64-7 (>= 7.1.0) | hip-runtime-amd (>= 7.1.0)" CACHE STRING
+        "DEB Depends of strix-hip on the ROCm runtime (tested range)")
+    set(_strix_deb_cxx_explicit "libc6, libstdc++6, libgcc-s1, ")
     if(STRIX_DPKG_SHLIBDEPS AND EXISTS "/etc/debian_version")
-        # The shlibs database names the package that provides libamdhip64 on this host (AMD repository or distro).
         set(CPACK_DEBIAN_PACKAGE_SHLIBDEPS ON)
         set(_strix_deb_cxx "")
     else()
-        # Not a Debian build host (no shlibs database): declare the C++ and ROCm runtimes explicitly.
-        set(_strix_deb_cxx "libc6, libstdc++6, libgcc-s1, ")
-        if(STRIX_PACKAGE_DEB_HIP_DEPENDS STREQUAL "")
-            set(STRIX_PACKAGE_DEB_HIP_DEPENDS "hip-runtime-amd")
-        endif()
+        # Not a Debian build host (no shlibs database): declare the C++ runtime explicitly.
+        set(_strix_deb_cxx "${_strix_deb_cxx_explicit}")
     endif()
     set(CPACK_DEBIAN_CORE_PACKAGE_DEPENDS "${_strix_deb_cxx}")
     string(REGEX REPLACE ", $" "" CPACK_DEBIAN_CORE_PACKAGE_DEPENDS "${CPACK_DEBIAN_CORE_PACKAGE_DEPENDS}")
     set(CPACK_DEBIAN_TOOLS_PACKAGE_DEPENDS "${_strix_deb_cxx}python3, python3-numpy")
-    set(CPACK_DEBIAN_HIP_PACKAGE_DEPENDS "${_strix_deb_cxx}${STRIX_PACKAGE_DEB_HIP_DEPENDS}")
+    set(CPACK_DEBIAN_HIP_PACKAGE_SHLIBDEPS OFF)
+    set(CPACK_DEBIAN_HIP_PACKAGE_DEPENDS "${_strix_deb_cxx_explicit}${STRIX_PACKAGE_DEB_HIP_DEPENDS}")
     set(CPACK_DEBIAN_CUDA_PACKAGE_DEPENDS "${CPACK_DEBIAN_CORE_PACKAGE_DEPENDS}")
     set(CPACK_DEBIAN_HIP_PACKAGE_SUGGESTS "strix-core, strix-tools, strix-docs")
     set(CPACK_DEBIAN_DOCS_PACKAGE_ARCHITECTURE all)
