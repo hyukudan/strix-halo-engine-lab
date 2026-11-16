@@ -25,9 +25,17 @@ __device__ __forceinline__ float block_sum128(float v, float* smem) {
 __global__ void __launch_bounds__(128) conv_pre_kernel(const float* __restrict__ w, const float* __restrict__ conv_state,
                                                        const float* __restrict__ raw, float* qc, std::uint32_t channels,
                                                        std::uint32_t rows, std::uint32_t q_blocks, std::uint32_t qk_blocks,
-                                                       float qscale) {
+                                                       float qscale, GdnSlotTable st) {
     __shared__ float red[4];
     pdl_trigger();
+    if (st.row0) {  // multi-session: this block's group (blockIdx.y)
+        pdl_wait();
+        const std::uint32_t g = blockIdx.y;
+        rows = st.nrows[g];
+        conv_state += static_cast<std::size_t>(st.state_slot[g]) * st.conv_stride;
+        raw += static_cast<std::size_t>(st.row0[g]) * channels;
+        qc += static_cast<std::size_t>(st.row0[g]) * channels;
+    }
     const std::uint32_t c = blockIdx.x * 128 + threadIdx.x;
     const float w0 = w[c * 4], w1 = w[c * 4 + 1], w2 = w[c * 4 + 2], w3 = w[c * 4 + 3];
     float s0 = conv_state[c * 3], s1 = conv_state[c * 3 + 1], s2 = conv_state[c * 3 + 2];  // committed state: written only outside the graph
@@ -131,9 +139,68 @@ __device__ __forceinline__ void delta_body(const DeltaArgs& a, const GdnDims& d,
     for (int k = 0; k < K; ++k) dp[static_cast<std::size_t>(k) * d.value_dim] = S[k];
 }
 
+// Multi-session adjustment of one group: offsets the row buffers and the state base, returns the group's rows and parity.
+__device__ __forceinline__ void slot_adjust(DeltaArgs& a, const GdnDims& d, const GdnSlotTable& st, std::uint32_t g,
+                                            std::uint32_t& rows, std::uint32_t& parity) {
+    const std::size_t r0 = st.row0[g];
+    const std::uint32_t ss = st.state_slot[g];
+    rows = st.nrows[g];
+    parity = st.parity[ss];
+    a.base += static_cast<std::size_t>(ss) * st.delta_stride;
+    a.qkvc += r0 * d.conv_channels();
+    a.a_raw += r0 * d.value_heads;
+    a.b_raw += r0 * d.value_heads;
+    if (a.z) a.z += r0 * d.v_width();
+    if (a.out) a.out += r0 * d.v_width();
+}
+
 __global__ void __launch_bounds__(128) delta_window_kernel(DeltaArgs a, GdnDims d, std::uint32_t rows,
-                                                           const std::uint32_t* parity, float eps) {
+                                                           const std::uint32_t* parity, float eps, GdnSlotTable st) {
+    if (st.row0) {
+        pdl_wait();
+        std::uint32_t par = 0;
+        slot_adjust(a, d, st, blockIdx.y, rows, par);
+        delta_body<true>(a, d, rows, par, blockIdx.x, eps);
+        return;
+    }
     delta_body<true>(a, d, rows, *parity, blockIdx.x, eps);
+}
+
+// Partial accept for multi-session: re-apply the first accept[g] rows (0 < accept < nrows) of group g for layer blockIdx.y.
+__global__ void __launch_bounds__(128) delta_apply_slots_kernel(CommitBatch b, GdnDims d, GdnSlotTable st, const std::uint32_t* accept) {
+    const std::uint32_t g = blockIdx.z;
+    const std::uint32_t k = accept[g];
+    if (k == 0 || k >= st.nrows[g]) return;
+    DeltaArgs a = b.a[blockIdx.y];
+    std::uint32_t rows = 0, par = 0;
+    slot_adjust(a, d, st, g, rows, par);
+    delta_body<false>(a, d, k, par, blockIdx.x, 0.0f);
+}
+
+__global__ void __launch_bounds__(128) conv_commit_slots_kernel(CommitBatch b, std::uint32_t channels, GdnSlotTable st,
+                                                                const std::uint32_t* accept) {
+    const std::uint32_t g = blockIdx.z;
+    const std::uint32_t k = accept ? accept[g] : st.nrows[g];
+    if (k == 0) return;
+    const DeltaArgs& a = b.a[blockIdx.y];
+    float* conv = a.conv + static_cast<std::size_t>(st.state_slot[g]) * st.conv_stride;
+    const float* raw = a.raw + static_cast<std::size_t>(st.row0[g]) * channels;
+    const std::uint32_t c = blockIdx.x * 128 + threadIdx.x;
+    const float s[3] = {conv[c * 3], conv[c * 3 + 1], conv[c * 3 + 2]};
+    float n[3];
+    for (int i = 0; i < 3; ++i) {
+        const int idx = static_cast<int>(k) - 3 + i;
+        n[i] = idx >= 0 ? raw[static_cast<std::size_t>(idx) * channels + c] : s[idx + 3];
+    }
+    conv[c * 3] = n[0];
+    conv[c * 3 + 1] = n[1];
+    conv[c * 3 + 2] = n[2];
+}
+
+__global__ void flip_slots_kernel(GdnSlotTable st, const std::uint32_t* accept) {
+    const std::uint32_t g = threadIdx.x;
+    const std::uint32_t k = accept ? accept[g] : st.nrows[g];
+    if (k > 0) st.parity[st.state_slot[g]] ^= 1u;
 }
 
 __global__ void __launch_bounds__(128) delta_apply_kernel(CommitBatch b, GdnDims d, std::uint32_t rows,
@@ -166,12 +233,46 @@ cudaError_t gdn_window(const GdnDims& d, const GdnLayer& layer, const GdnState& 
     const std::uint32_t C = d.conv_channels();
     const float qscale = static_cast<float>(1.0 / std::sqrt(static_cast<double>(d.key_dim)));
     if (auto e = launch_pdl(conv_pre_kernel, dim3(C / 128), dim3(128), stream, layer.conv_w, state.conv, win.raw, win.qkv_c, C, rows,
-                            d.key_heads, 2 * d.key_heads, qscale);
+                            d.key_heads, 2 * d.key_heads, qscale, GdnSlotTable{});
         e != cudaSuccess)
         return e;
     DeltaArgs a{state.delta_base, win.qkv_c, win.a_raw, win.b_raw, layer.ssm_a, layer.dt_bias, layer.norm_gain, z, out,
                 nullptr, nullptr};
-    return launch_pdl(delta_window_kernel, dim3(d.value_heads), dim3(128), stream, a, d, rows, parity_dev, eps);
+    return launch_pdl(delta_window_kernel, dim3(d.value_heads), dim3(128), stream, a, d, rows, parity_dev, eps, GdnSlotTable{});
+}
+
+cudaError_t gdn_window_slots(const GdnDims& d, const GdnLayer& layer, const GdnState& state, const GdnWindow& win, const float* z,
+                             float* out, std::uint32_t groups, const GdnSlotTable& t, float eps, cudaStream_t stream) {
+    if (d.key_dim != 128 || d.value_dim != 128 || d.conv_kernel != 4 || groups == 0 || groups > kMaxRows || !t.row0) return cudaErrorInvalidValue;
+    const std::uint32_t C = d.conv_channels();
+    const float qscale = static_cast<float>(1.0 / std::sqrt(static_cast<double>(d.key_dim)));
+    if (auto e = launch_pdl(conv_pre_kernel, dim3(C / 128, groups), dim3(128), stream, layer.conv_w, state.conv, win.raw, win.qkv_c, C,
+                            0u, d.key_heads, 2 * d.key_heads, qscale, t);
+        e != cudaSuccess)
+        return e;
+    DeltaArgs a{state.delta_base, win.qkv_c, win.a_raw, win.b_raw, layer.ssm_a, layer.dt_bias, layer.norm_gain, z, out,
+                nullptr, nullptr};
+    return launch_pdl(delta_window_kernel, dim3(d.value_heads, groups), dim3(128), stream, a, d, 0u, static_cast<const std::uint32_t*>(nullptr), eps, t);
+}
+
+cudaError_t gdn_commit_slots(const GdnDims& d, const GdnCommitLayer* layers, std::uint32_t n, std::uint32_t groups,
+                             const GdnSlotTable& t, const std::uint32_t* accept, bool partial, cudaStream_t stream) {
+    if (n == 0 || n > kMaxGdnLayers || groups == 0 || groups > kMaxRows || !t.row0 || (partial && !accept)) return cudaErrorInvalidValue;
+    CommitBatch b{};
+    for (std::uint32_t i = 0; i < n; ++i) {
+        const auto& L = layers[i];
+        b.a[i] = DeltaArgs{L.state.delta_base, L.win.qkv_c, L.win.a_raw, L.win.b_raw, L.layer.ssm_a, L.layer.dt_bias,
+                           nullptr, nullptr, nullptr, L.state.conv, L.win.raw};
+    }
+    const std::uint32_t C = d.conv_channels();
+    if (partial) {
+        delta_apply_slots_kernel<<<dim3(d.value_heads, n, groups), 128, 0, stream>>>(b, d, t, accept);
+        if (auto e = cudaGetLastError(); e != cudaSuccess) return e;
+    }
+    conv_commit_slots_kernel<<<dim3(C / 128, n, groups), 128, 0, stream>>>(b, C, t, accept);
+    if (auto e = cudaGetLastError(); e != cudaSuccess) return e;
+    flip_slots_kernel<<<1, groups, 0, stream>>>(t, accept);
+    return cudaGetLastError();
 }
 
 cudaError_t gdn_commit(const GdnDims& d, const GdnCommitLayer* layers, std::uint32_t n, std::uint32_t window_rows,

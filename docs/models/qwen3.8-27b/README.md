@@ -52,3 +52,14 @@ summed in ascending warp order. q8_0: int8 values are exact in bf16; each 32-blo
 - `--dense-arith fp32` keeps the CUDA-core FP32 kernels as the reference / off switch (documented order in dense.hpp).
 - FAST policies: `mma2` (hi + mid), `mma1` (hi only; max |dlogit| 8x larger, see RESULT). Not the default.
 - Shapes not covered (in % 32, out % 16, f32 weights) fall back to fp32 kernels.
+
+## Multi-session batched decode (CUDA, exact class, default path for slots)
+
+`CudaEngine::configure_slots(n)` gives n sessions (own KV, GDN/conv state, parity, length) that share the weights.
+`forward_slots(groups, tokens)` runs one dense pass per layer over the rows of all groups (a group = consecutive rows of one
+slot: 1 row = a decode lane, more = a verify/prefill window) with per-session attention and GDN: `cuda_core::RowMap`
+(per-row position + cache slot for `kv_store`/`rope_apply`/`attention_decode`) and `gdn_window_slots`/`gdn_commit_slots`
+(device slot tables, so one CUDA graph per (rows, groups) serves any set of sessions). Every row is bitwise equal to the
+session run alone (`qwen35_cuda_engine_test` section 4; `strix-cuda-qwen35-decode --slots N --slots-verify` on real packs).
+Windows commit with `commit_slots(accept[])` (partial accept supported). Bench: `--slots N --arms 8,4,1 --ab-pairs 3 --n-gen S
+--ctx-fill C` (strict ABAB, host-timed steps incl. token read-back, SM clock). `StepPlanner`/`plan_rows` lane rows map 1:1 to groups.

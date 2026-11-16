@@ -55,4 +55,23 @@ struct GdnCommitLayer {
 cudaError_t gdn_commit(const GdnDims& d, const GdnCommitLayer* layers, std::uint32_t n, std::uint32_t window_rows,
                        std::uint32_t k, std::uint32_t* parity_dev, cudaStream_t stream);
 
+// ---- Multi-session decode: several sessions (state slots) in one batch. A GROUP is a run of consecutive rows of ONE state slot
+// (a decode lane carries 1 row, a verify window several). Device tables [groups]: row0 (first row of the group in the batch buffers),
+// nrows, state_slot (index of the session state). parity is [state slots]. Per-layer state buffers hold [slot][...] blocks:
+// conv_stride floats per slot for conv ([channels][3]), delta_stride floats per slot for delta_base ([2][heads][128][128]).
+// Arithmetic per group is exactly gdn_window / gdn_commit on that slot's state (rows sequential inside the group).
+struct GdnSlotTable {
+    const std::uint32_t* row0 = nullptr;
+    const std::uint32_t* nrows = nullptr;
+    const std::uint32_t* state_slot = nullptr;
+    std::uint32_t* parity = nullptr;
+    std::size_t conv_stride = 0, delta_stride = 0;
+};
+cudaError_t gdn_window_slots(const GdnDims& d, const GdnLayer& layer, const GdnState& state, const GdnWindow& win, const float* z,
+                             float* out, std::uint32_t groups, const GdnSlotTable& t, float eps, cudaStream_t stream);
+// accept: device [groups] rows accepted per group (null = all rows of every group). partial: some group has 0 < accept < nrows
+// (re-applies the accepted rows to the committed side first). Flips the parity of groups with accept > 0.
+cudaError_t gdn_commit_slots(const GdnDims& d, const GdnCommitLayer* layers, std::uint32_t n, std::uint32_t groups,
+                             const GdnSlotTable& t, const std::uint32_t* accept, bool partial, cudaStream_t stream);
+
 }  // namespace strix::cuda_core
