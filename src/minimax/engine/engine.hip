@@ -1959,16 +1959,24 @@ struct Engine::Impl {
     }
     // Invariant prefill must cover every layer and every tail, even when the preferred dense routes are OFF.
     // With fixed S=1, workspace size is monotone in rows, so max_rows bounds every admitted chunk.
+    // A table default (pf_order) that cannot hold declines to adaptive with a printed reason, before receipts; an
+    // explicit STRIX_MMX_PF_ORDER=invariant keeps the hard error. Both ranks load the same config and weights, so the
+    // decision is the same on each rank (and the route receipt fingerprint checks it).
     void require_invariant_dense() const {
         if (!mmoe::prefill_order_invariant()) return;
-        if (!linears_loaded || !moe_opt)
-            throw std::invalid_argument("STRIX_MMX_PF_ORDER=invariant requires STRIX_MM_LINEARS!=off and STRIX_MM_MOE!=off");
+        const char* unmet = nullptr;
+        if (!linears_loaded || !moe_opt) unmet = "STRIX_MMX_PF_ORDER=invariant requires STRIX_MM_LINEARS!=off and STRIX_MM_MOE!=off";
         for (const auto& y : layers) {
+            if (unmet != nullptr) break;
             const mmoe::PrefillDenseJob qkv[3] = {{y.rq, q}, {y.rk, k}, {y.rv, v}};
             const mmoe::PrefillDenseJob o1[1] = {{y.ro, part}};
             if (!dense_available(opt.max_rows, qkv) || !dense_available(opt.max_rows, o1))
-                throw std::invalid_argument("STRIX_MMX_PF_ORDER=invariant requires supported resident q/k/v/o weights and sufficient prefill workspace");
+                unmet = "STRIX_MMX_PF_ORDER=invariant requires supported resident q/k/v/o weights and sufficient prefill workspace";
         }
+        if (unmet == nullptr) return;
+        if (!defaults::from_defaults("STRIX_MMX_PF_ORDER")) throw std::invalid_argument(unmet);
+        defaults::decline_default("STRIX_MMX_PF_ORDER", "adaptive", unmet);
+        mmoe::set_prefill_moe_order(0);
     }
     template <std::size_t N> bool dense_admit(std::size_t n, const mmoe::PrefillDenseJob (&jobs)[N], bool preferred) const {
         if (gemv) return false;  // decode and verification retain their existing GEMV arithmetic

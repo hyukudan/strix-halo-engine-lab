@@ -39,10 +39,12 @@ unsigned gemm_tile_rows(unsigned input, unsigned output, unsigned bits, unsigned
 unsigned gemm_splits(unsigned input, unsigned output, unsigned bits, unsigned rows) {
     return route::gemm_splits(input, output, bits, rows);
 }
-// MoE numeric order contract (STRIX_MMX_PF_ORDER): adaptive (default, today's identity: S from the expert's rows in the
-// chunk) or invariant (shared kGroupedSingleChainContract, S = 1 for gate, up and down: bits independent of chunking).
-// Test fixture only: change this between synchronized calls on one host thread;
-// never mutate it during engine execution or concurrent planning.
+// MoE numeric order contract (STRIX_MMX_PF_ORDER): invariant (default via the pf_order table item; shared
+// kGroupedSingleChainContract, S = 1 for gate, up and down: bits independent of chunking) or adaptive (off switch and
+// baseline; former identity: S from the expert's rows in the chunk).
+// The override is for test fixtures and for the engine's one load-time decline of a defaulted invariant order
+// (require_invariant_dense, on the loading thread before any execution or planning). Change it only between
+// synchronized calls on one host thread; never mutate it during engine execution or concurrent planning.
 namespace { int g_order_override = -1; }  // -1 = STRIX_MMX_PF_ORDER, 0 = adaptive, 1 = invariant
 void set_prefill_moe_order(int invariant) {
     if (invariant < -1 || invariant > 1) throw std::invalid_argument("set_prefill_moe_order: value must be -1, 0 or 1");

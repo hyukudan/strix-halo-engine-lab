@@ -134,6 +134,10 @@ constexpr Item kItems[] = {
      "Grouped all-member >=2048-row gate (configurable); TP2 4096+3844 IDs identical, -2.3/-2.5 % with late fence; full state/workload qualification pending"},
     {"pf_late_src_fence", "STRIX_MM_PF_LATE_SRC_FENCE", "1", "0",
      "Admitted grouped async source lifetime; TP2 IDs identical, combined -2.3/-2.5 %; full state/workload qualification pending"},
+    {"pf_order", "STRIX_MMX_PF_ORDER", "invariant", "adaptive",
+     "Chunk-invariant linear order mmx-pf-linear-s1-v1 (bits independent of chunking; cache identity prefill_order=): gate32 6 x 32K "
+     "units vs 3 L0 nulls each, pooled dNLL -0.053 CI95 [-0.148,+0.041] inside null spread, task 40/42 == 40/42; "
+     "a defaulted value falls back to adaptive when the invariant route is unmet"},
     // transport (host path, bits unchanged)
     {"dist_crc_parallel", "STRIX_DIST_CRC_PARALLEL", "1", "0", "Host transport measurement: ABA x3 TTFT 1K -12.8 %, decode -1 %, bits unchanged"},
     {"dist_host_crc_overlap", "STRIX_DIST_HOST_CRC_OVERLAP", "1", "0", "Host transport measurement: ABA x3 TTFT 1K -12.8 %, decode -1 %, bits unchanged"},
@@ -324,6 +328,13 @@ void apply() {
 bool from_defaults(const char* env) {
     std::lock_guard<std::mutex> g(g_mutex);
     return g_exported.count(env) != 0;
+}
+
+void decline_default(const char* env, const char* value, const std::string& reason) {
+    std::lock_guard<std::mutex> g(g_mutex);
+    if (g_exported.count(env) == 0) throw std::logic_error(std::string("decline_default: ") + env + " was not exported by the defaults");
+    (void)export_env(env, value, 1);
+    std::printf("minimax defaults: %s default declined -> %s (%s)\n", env, value, reason.c_str());
 }
 
 Cli parse_cli(const std::string& app, const std::vector<std::string>& args) {

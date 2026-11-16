@@ -117,7 +117,7 @@ const std::map<std::string, std::string> kFormer = {
     {"STRIX_MMX_PREFILL_TAIL_STREAM", "0"}, {"STRIX_MMX_PREFILL_PIPE_PAIR", "0"}, {"STRIX_MMX_PREFILL_PIPE_TAIL", "0"},
     {"STRIX_MM_PF_ROUTER_ROWS", "8"}, {"STRIX_MM_PF_MSA_SCRATCH_MB", "512"}, {"STRIX_MM_PF_DENSE_O", "0"},
     {"STRIX_MM_XB_WARM_O", "0"},           {"STRIX_MMX_MOE_TIGHT_GRID", "0"},
-    {"STRIX_MMX_MOE_PIPE", "0"},
+    {"STRIX_MMX_MOE_PIPE", "0"},           {"STRIX_MMX_PF_ORDER", "adaptive"},
 };
 
 void test_table() {
@@ -586,7 +586,13 @@ void test_fast_prefill_profile() {
         const auto p = md::prefill_policy(lookup(off));
         check(p.msa_flash == 0 && p.msa_flash_asked == "default" && p.policies.empty() && p.note.empty() && p.canonical.empty(),
               "fast profile: plain invocation runs nothing");
-        check(md::prefill_identity(lookup(off)).empty(), "fast profile: plain cache identity unchanged (no field)");
+        // The chunk-invariant linear order is the table default (pf_order): a plain invocation names it; the
+        // baseline switch and the explicit off form keep the legacy (empty) identity.
+        check(md::prefill_identity(lookup(off)) == "prefill_order=mmx-pf-linear-s1-v1" && md::linear_order(lookup(off)) == "invariant",
+              "fast profile: plain cache identity names the default invariant order");
+        const EnvMap base{{md::kBaselineEnv, "1"}};
+        check(md::prefill_identity(lookup(base)).empty() && md::linear_order(lookup(base)) == "adaptive",
+              "linear order: baseline restores the adaptive order and the legacy cache identity");
         EnvMap inv{{"STRIX_MMX_PF_ORDER", "invariant"}}, ada{{"STRIX_MMX_PF_ORDER", "adaptive"}};
         check(md::prefill_identity(lookup(inv)) == "prefill_order=mmx-pf-linear-s1-v1" && md::linear_order(lookup(inv)) == "invariant",
               "linear order: invariant names its cache identity");

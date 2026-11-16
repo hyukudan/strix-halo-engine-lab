@@ -3,7 +3,7 @@
 # SESSIONS = comma list of prompt names ($PROMPTS/<name>.u32), run in order in one process (first = cold).
 # Writes $KIT/run/RID on both nodes: q-* dumps, r0.log (r1.log on the peer), mon0/mon1 (busy, sclk, kfd evicted_ms),
 # mem.txt (MemAvailable), rc. Arms: reference = STRIX_MMX_PF_ORDER=adaptive, candidate = invariant, null = adaptive +
-# STRIX_MM_DIAG_ATTN_ULP=0:SEED (one-ulp null at layer 0). MAXROWS (env) = --max-rows (default 4096).
+# STRIX_MM_DIAG_ATTN_ULP=0:SEED (one-ulp null at layer 0). MAXROWS (env) = --max-rows (default 4096); STEPS (env) = greedy decode steps per session (default 1).
 set -u
 . "$(dirname "$0")/kit.env.sh"
 RID=$1 SECS=$2 CAP=$3 SESS=$4; shift 4; R=$KIT/run/$RID
@@ -19,7 +19,7 @@ for v in $(env | grep -oE "^STRIX_[A-Z0-9_]*" | grep -v EXPECT_TBS); do unset $v
 ENVS=(STRIX_SESSION_CACHE=0 STRIX_MM_STATE_FNV=1 STRIX_MM_QUALITY_OUT=$R/q STRIX_MM_QUALITY_ROWS=256 STRIX_MM_QUALITY_SELECT=${SEL:-1} "$@")
 printf '%s\n' "$@" > $R/arm-env
 A="--slots 1 --capacity $CAP --max-rows ${MAXROWS:-4096}"
-for s in ${SESS//,/ }; do [ -s $PROMPTS/$s.u32 ] || { echo "gate_run: no prompt $s"; exit 3; }; A="$A --session $s:$PROMPTS/$s.u32:1"; done
+for s in ${SESS//,/ }; do [ -s $PROMPTS/$s.u32 ] || { echo "gate_run: no prompt $s"; exit 3; }; A="$A --session $s:$PROMPTS/$s.u32:${STEPS:-1}"; done
 MON='d=/sys/class/drm/card1/device; [ -d $d ] || d=/sys/class/drm/card0/device; while :; do ev=0; for p in $(pgrep -u $(id -u) -f "[s]trix-minimax-rank"); do for f in /sys/class/kfd/kfd/proc/$p/stats_*/evicted_ms; do [ -r $f ] && ev=$((ev+$(cat $f))); done; done; echo "$(date +%s.%N) busy=$(cat $d/gpu_busy_percent) sclk=$(grep "\*" $d/pp_dpm_sclk | tr -d "\n") ev=$ev"; sleep 0.5; done'
 bash -c "$MON" > $R/mon0.txt 2>/dev/null & M0=$!
 $S2 "nohup bash -c '$MON' > $R/mon1.txt 2>/dev/null & echo \$!" > $R/m1.pid

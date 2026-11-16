@@ -611,10 +611,15 @@ breakdown, GPU clocks per token and a host-node link probe (RTT and useful throu
 
 ### MiniMax pair: chunk-invariant linear order
 
-`STRIX_MMX_PF_ORDER=invariant` binds the shared `moe_core::kGroupedSingleChainContract` (S = 1 for routed and shared
+`STRIX_MMX_PF_ORDER=invariant` is the default (table item `pf_order`; `adaptive` is the off switch and the
+`STRIX_MM_BASELINE=1` value; a defaulted value that cannot run on a load, e.g. `STRIX_MM_MOE=off`, declines to
+`adaptive` with a printed reason, an explicit `invariant` stays a hard error). Quality evidence: 6 x 32K units of
+different content against 3 one-ulp L0 nulls each (`scripts/bench/chunkinv/gate32b_chain.sh`, `gate32b_stats.py`):
+pooled signed dNLL -0.053, 95 % CI [-0.148, +0.041], inside the null spread [-0.263, +0.240]; KL q50/q90 above every
+null in 0 of 6 units; needle/two-hop/QA task 40/42 in both orders. It binds the shared `moe_core::kGroupedSingleChainContract` (S = 1 for routed and shared
 gate/up/down, MoE part `mmx-pf-moe-s1-v1`) and `core::fixed_linear_contract` for the dense q/k/v/o (S = 1; the v4 core
 runs every call whose `strix_gemm` split would differ): together the identity `mmx-pf-linear-s1-v1`, cache field
-`prefill_order=mmx-pf-linear-s1-v1`, receipt lever `minimax.linear_order`. `adaptive` keeps today's rows-dependent
+`prefill_order=mmx-pf-linear-s1-v1`, receipt lever `minimax.linear_order`. `adaptive` keeps the former rows-dependent
 splits. Invariant order applies only to prefill; decode and verification retain their existing routes, including
 `STRIX_MM_LINEARS=load`. Startup rejects `STRIX_MM_LINEARS=off`, `STRIX_MM_MOE=off`, unsupported or missing dense
 weights, and insufficient dense workspace. Mandatory dense dispatch fails explicitly instead of falling back.

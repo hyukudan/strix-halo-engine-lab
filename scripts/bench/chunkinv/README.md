@@ -30,3 +30,13 @@ gate_cmp.sh b b-e-a b-i-a b32k
 
 Use five nulls: with three, a candidate that matches the nulls fails a mean + 2 sd check about 11 % of the time.
 Run directories are never reused. A rerun after an engine failure gets a new RID.
+
+## Multi-unit long-context gate (gate32b)
+
+`mkunits.py` builds six independent 32K units (prose, docs, code, json, chat, mixed) from this repository with seven
+checkable answers each (five needles at 8-92 % depth, one two-hop pair, one question over the needles).
+`gate32b_chain.sh` runs per unit the reference, the candidate and NULLS one-ulp L0 nulls, one pair turn per arm, plus
+optional warm arms (a short warm-up session first; only the measured session is sealed), then `gate32b_stats.py`:
+per-unit and pooled signed dNLL with a t(5) 95 % CI and a hierarchical bootstrap, the null spread, KL q50/q90 against
+the nulls, paired task accuracy (cluster bootstrap + McNemar) and warm == cold bit checks. The decision rule is printed
+with the numbers. Hosts, model and binary come from the environment (KIT MODEL PROMPTS PEER BIN GATE TURN PY).

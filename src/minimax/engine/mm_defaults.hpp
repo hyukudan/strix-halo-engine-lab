@@ -88,6 +88,9 @@ void apply();
 // True when apply() exported `env` (the user did not set it): a default that cannot hold falls back with a notice
 // instead of failing.
 bool from_defaults(const char* env);
+// A defaulted item that cannot hold on this load: re-export `value` (normally the item's off form) so receipts and
+// cache identities name what runs, and print the reason. Throws if `env` was not exported by apply().
+void decline_default(const char* env, const char* value, const std::string& reason);
 
 // The USB4 transport names in session routes, whichever accepted spelling was requested
 // (strix::dist::negotiated_transport(requested, direct_live, kRouteHost, kRouteGpu)).
