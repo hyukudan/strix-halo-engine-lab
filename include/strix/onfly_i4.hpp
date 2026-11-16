@@ -6,7 +6,8 @@
 // The weight source itself (--turbo-weights native|onfly|converted, --turbo-weight-bits) is owned by
 // strix/turbo.hpp and resolved by strix::qwen::profile; this header adds only the Qwen tensor-group sub-switches:
 //   --turbo-onfly-groups LIST                STRIX_TURBO_ONFLY_GROUPS    gdn_in,gdn_out,qsa_io,shared_expert (default: all)
-//   --turbo-onfly-scale-rule legacy|full     STRIX_TURBO_ONFLY_SCALE     default full (core/iu4.hpp fast full range)
+//   --turbo-onfly-scale-rule legacy|full|mse STRIX_TURBO_ONFLY_SCALE    default full (core/iu4.hpp fast full range;
+//                                            mse = per-group clip search at load, same nibble grid and kernel)
 #include <cstdint>
 #include <functional>
 #include <stdexcept>
@@ -18,7 +19,8 @@ namespace strix::onfly_i4 {
 enum Group : unsigned { gdn_in = 1U, gdn_out = 2U, qsa_io = 4U, shared_expert = 8U, all_groups = 15U };
 inline constexpr std::string_view kIdentity = "qwen-turbo-plus-onfly-i4g64-v1";
 inline constexpr std::string_view kScopeNote = "decode dense projections (rows <= 8) i4g64; prefill (rows >= 16) q8_0";
-inline constexpr int kScaleLegacy = 0, kScaleFullRange = 2001;
+inline constexpr int kScaleLegacy = 0, kScaleFullRange = 2001, kScaleMse = 2002;
+inline std::string_view scale_rule_name(int rule) { return rule == kScaleLegacy ? "legacy" : rule == kScaleMse ? "mse" : "full"; }
 
 enum class Source : unsigned { native = 0, onfly = 1, converted = 2 };
 
@@ -33,7 +35,7 @@ struct Resolved {
     // Identity for cache keys / receipts; empty for native (byte-identical to the unmodified engine).
     [[nodiscard]] std::string identity() const {
         if (!active()) return {};
-        return std::string(kIdentity) + "-g" + std::to_string(groups) + (scale_rule == kScaleLegacy ? "-legacy" : "-full");
+        return std::string(kIdentity) + "-g" + std::to_string(groups) + "-" + std::string(scale_rule_name(scale_rule));
     }
 };
 
@@ -81,7 +83,8 @@ inline Resolved resolve(const Request& cli, const std::function<const char*(cons
     const auto rule = pick(cli.scale_rule, "STRIX_TURBO_ONFLY_SCALE");
     if (rule.empty() || rule == "full") r.scale_rule = kScaleFullRange;
     else if (rule == "legacy") r.scale_rule = kScaleLegacy;
-    else throw std::invalid_argument("--turbo-onfly-scale-rule: expected legacy or full");
+    else if (rule == "mse") r.scale_rule = kScaleMse;
+    else throw std::invalid_argument("--turbo-onfly-scale-rule: expected legacy, full or mse");
     return r;
 }
 

@@ -2348,7 +2348,7 @@ inline std::string effective_config_json(const EffectiveConfig& config) {
     out << ",\"turbo_weights\":{\"source\":\"" << (o.turbo.active() ? "onfly" : "native") << "\",\"bits\":" << o.turbo.bits
         << ",\"identity\":\"" << (o.turbo.active() ? o.turbo.identity() : std::string("native")) << "\",\"groups\":\""
         << (o.turbo.active() ? strix::onfly_i4::groups_text(o.turbo.groups) : std::string("none")) << "\",\"scale_rule\":\""
-        << (o.turbo.scale_rule == strix::onfly_i4::kScaleLegacy ? "legacy" : "full") << "\",\"scope\":\""
+        << strix::onfly_i4::scale_rule_name(o.turbo.scale_rule) << "\",\"scope\":\""
         << (o.turbo.active() ? std::string(strix::onfly_i4::kScopeNote) : std::string("native packs")) << "\"}";
     out << ",\"hc_lowband_policy\":" << (config.environment.contains("STRIX_QPF2K_HC_LOWBAND") ?
         std::strtoul(config.environment.at("STRIX_QPF2K_HC_LOWBAND").c_str(), nullptr, 0) : 0U);

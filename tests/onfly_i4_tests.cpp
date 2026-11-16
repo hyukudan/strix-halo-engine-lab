@@ -6,6 +6,7 @@
 
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <iostream>
 #include <string>
@@ -105,6 +106,49 @@ int main() {
         for (std::size_t c = N; c < padded; ++c)
             for (std::size_t g = 0; g < K / 64U; ++g) pad_zero = pad_zero && copy.scales[c * (K / 64U) + g] == 0;
         expect(pad_zero, "pad columns have scale 0");
+    }
+
+    // MSE clip search: equals an independent search over the same candidates and never has more squared error than the
+    // fast full range rule summed over every group (0.90 is one of the candidates).
+    {
+        const auto mse = core::onfly::convert_q8_0_host(q8.data(), N, K, core::iu4_scale_rule_mse);
+        const auto full = core::onfly::convert_q8_0_host(q8.data(), N, K, core::iu4_scale_rule_fast_full);
+        const std::size_t padded = core::onfly::padded_outputs(N);
+        double err_mse = 0, err_full = 0;
+        bool same = true;
+        for (std::size_t c = 0; c < N; ++c)
+            for (std::size_t g = 0; g < K / 64U; ++g) {
+                float w[64], pos = 0, neg = 0;
+                core::onfly::dequant_q8_group(q8.data() + c * core::onfly::q8_row_bytes(K), static_cast<unsigned>(g), w);
+                for (float x : w) { pos = std::fmax(pos, x); neg = std::fmax(neg, -x); }
+                const float base = std::fmax(pos / 7.0f, neg / 8.0f);
+                std::uint16_t want = oracle_f16(1.0f);
+                float best = -1.0f;
+                for (int i = 0; base != 0.0f && i < 21; ++i) {
+                    const std::uint16_t cb = oracle_f16(std::fmax((1.0f - 0.02f * static_cast<float>(i)) * base, 0x1p-24f));
+                    const float cs = core::onfly::f16_bits_to_f32(cb);
+                    float e = 0.0f;
+                    for (float x : w) { const float d = x - cs * static_cast<float>(clamp_rne(x * (1.0f / cs), -8)); e += d * d; }
+                    if (best < 0.0f || e < best) { best = e; want = cb; }
+                }
+                same = same && mse.scales[c * (K / 64U) + g] == want;
+                const auto group_err = [&](const core::onfly::HostCopy& cp) {
+                    const float s = core::onfly::f16_bits_to_f32(cp.scales[c * (K / 64U) + g]);
+                    double e = 0;
+                    for (int j = 0; j < 64; ++j) {
+                        const std::size_t k = g * 64U + static_cast<std::size_t>(j);
+                        const std::size_t byte = ((k / 16U * (padded / 16U) + c / 16U) * 16U + c % 16U) * 8U + (k % 16U) / 2U;
+                        const double d = w[j] - s * core::iu4_unpack(cp.packed[byte], static_cast<int>(k & 1U));
+                        e += d * d;
+                    }
+                    return e;
+                };
+                err_mse += group_err(mse);
+                err_full += group_err(full);
+            }
+        expect(same, "mse rule equals the independent clip search");
+        expect(err_mse <= err_full, "mse rule error <= fast full range error");
+        std::printf("onfly mse/full squared error ratio %.4f\n", err_full > 0 ? err_mse / err_full : 1.0);
     }
 
     // Sub-switch resolver: native default, onfly (decided by the profile weights) via CLI or environment gives the same value.

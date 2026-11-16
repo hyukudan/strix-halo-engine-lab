@@ -75,6 +75,27 @@ STRIX_ONFLY_HD inline std::uint16_t quantise_group(const float* w, int rule, int
         pos = w[j] > pos ? w[j] : pos;
         neg = -w[j] > neg ? -w[j] : neg;
     }
+    if (rule == iu4_scale_rule_mse) {
+        const float a = pos / 7.0f, b = neg / 8.0f, base = a > b ? a : b;
+        std::uint16_t best_bits = f32_to_f16_bits(1.0f);
+        if (base != 0.0f) {
+            float best = -1.0f;
+            for (int i = 0; i < iu4_mse_steps; ++i) {
+                const float raw = iu4_mse_clip(i) * base;
+                const std::uint16_t cb = f32_to_f16_bits(raw > 0x1p-24f ? raw : 0x1p-24f);
+                const float cs = f16_bits_to_f32(cb), inv = 1.0f / cs;
+                float err = 0.0f;
+                for (int j = 0; j < 64; ++j) {
+                    const float d = w[j] - cs * static_cast<float>(iu4_requant_full(w[j], inv));
+                    err += d * d;
+                }
+                if (best < 0.0f || err < best) { best = err; best_bits = cb; }
+            }
+        }
+        const float inv = 1.0f / f16_bits_to_f32(best_bits);
+        for (int j = 0; j < 64; ++j) q[j] = iu4_requant_full(w[j], inv);
+        return best_bits;
+    }
     float s;
     if (rule == iu4_scale_rule_fast_full) s = iu4_fast_full_scale(pos, neg);
     else { const float t = amax / 7.0f; s = amax == 0.0f ? 1.0f : (t > 0x1p-24f ? t : 0x1p-24f); }

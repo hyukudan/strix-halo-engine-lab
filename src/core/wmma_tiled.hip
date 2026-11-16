@@ -471,7 +471,7 @@ hipError_t convert_q8_0_iu4(const uint8_t* q8, int inputs, int outputs, uint8_t*
 hipError_t convert_exl3_iu4(const uint32_t* const* trellis, int bits, int experts, int inputs, int outputs,
     uint8_t* wq, _Float16* ws, size_t wq_expert, size_t ws_expert, hipStream_t stream, int scale_rule) {
     if (!trellis || bits < 2 || bits > 8 || experts <= 0 || inputs <= 0 || inputs % 64 || outputs <= 0 || outputs % 16 || !ws ||
-        !iu4_scale_rule_valid(scale_rule))
+        !iu4_scale_rule_valid(scale_rule) || scale_rule == iu4_scale_rule_mse)  // MSE search: Q8_0 onfly converter only
         return hipErrorInvalidValue;
     const size_t items = size_t(inputs / 64) * size_t(outputs / 16);
     const dim3 grid(unsigned((items + 7U) / 8U), unsigned(experts));
