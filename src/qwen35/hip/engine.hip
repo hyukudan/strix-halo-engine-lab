@@ -205,7 +205,8 @@ dl::View view(const Tensor& t) { return {t.data, t.inputs, t.outputs, t.row_byte
 
 template <unsigned Rows, wd::Format F, dl::Epilogue E>
 void launch_dense(const Tensor& w, const Tensor& up, const float* x, float* out, hipStream_t s) {
-    constexpr unsigned T = 2U;
+    constexpr unsigned T = Rows >= 16U ? 1U : 2U;  // T=2 at 16 rows spills (256 VGPR, 264-492 B scratch): one output per wave
+
     dl::kernel<Rows, T, F, E><<<(w.outputs + 4U * T - 1U) / (4U * T), 128, 0, s>>>(view(w), view(up), x, out);
 }
 // Rows are padded to the next of 1/2/4/8/16 over kMaxRows-sized scratch; every row is independent.
