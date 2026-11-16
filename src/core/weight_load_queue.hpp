@@ -13,6 +13,7 @@
 //
 // Host only (no GPU header): the HIP part is hip_weight_uploader.hpp, tests use a host uploader.
 #include "byte_budget.hpp"
+#include "strix/env_flags.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -143,7 +144,7 @@ struct WeightLoadOptions {
     bool hash = false;                                            // content hash per ticket (identity gates)
     // Budget full and no pooled buffer of the ticket's class: use an idle larger one instead of free + allocate.
     // STRIX_WEIGHT_STAGING_REUSE_LARGER=0 restores free + allocate (bitwise either way).
-    bool reuse_larger_staging = !(std::getenv("STRIX_WEIGHT_STAGING_REUSE_LARGER") && std::getenv("STRIX_WEIGHT_STAGING_REUSE_LARGER")[0] == '0');
+    bool reuse_larger_staging = strix::envcfg::flag("STRIX_WEIGHT_STAGING_REUSE_LARGER", true);
 };
 
 struct WeightLoadStats {

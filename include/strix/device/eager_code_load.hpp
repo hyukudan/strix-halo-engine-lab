@@ -23,6 +23,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include "strix/env_flags.hpp"
 #include <vector>
 
 #if defined(__unix__)
@@ -97,7 +98,7 @@ inline void eager_code_load_or_restart(char** argv, CodeLoad who = CodeLoad::sha
 // Receipt line of the resolved mode (the restarted image prints it): "code load: eager|deferred (<why>)".
 inline std::string code_load_receipt(CodeLoad who = CodeLoad::shared) {
     const char* hip = std::getenv("HIP_ENABLE_DEFERRED_LOADING");
-    const char* policy = std::getenv("STRIX_EAGER_CODE_LOAD");
+    const char* policy = strix::envcfg::text("STRIX_EAGER_CODE_LOAD");
     const bool eager = hip && std::string_view(hip) == "0";
     std::string why = policy && policy[0] == '0' ? "STRIX_EAGER_CODE_LOAD=0"
         : who == CodeLoad::engine ? "engine policy"
