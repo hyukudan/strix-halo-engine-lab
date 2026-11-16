@@ -196,7 +196,7 @@ inline bool draft_batch_default() {
 // Mean live per-position acceptance of the step's sessions (ContextDraft accept_s / accept_t); -1 when a session has no
 // context drafter or fewer than 4 trials of history, or when STRIX_QRTX_WIDE_ACCEPT fixes the model's value.
 template <class Streams> double live_accept(const Streams& streams) {
-    static const bool fixed = std::getenv("STRIX_QRTX_WIDE_ACCEPT") != nullptr;
+    static const bool fixed = strix::envcfg::text("STRIX_QRTX_WIDE_ACCEPT") != nullptr;
     if (fixed || streams.empty()) return -1.0;
     double sum = 0.0;
     for (const auto& st : streams) {

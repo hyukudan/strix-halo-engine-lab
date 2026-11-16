@@ -6,6 +6,8 @@
 // either the form already loops over 8-row pieces, or the call is split into <= 8-row pieces. Either way every
 // (row, output) chain is the one of the tiled form, so the bits do not change (rows never mix inside a chain).
 // STRIX_CUDA_DECODE_ROWS_MAX = 8 restores the old switch point; values are clamped to 8..16.
+#include "strix/env_flags.hpp"
+
 #include <cstdlib>
 
 namespace strix::cuda::core {
@@ -14,7 +16,7 @@ constexpr unsigned kDecodePieceRows = 8U;   // rows per decode-shaped piece (the
 
 inline unsigned decode_rows_max() {
     static const unsigned cap = [] {
-        const char* e = std::getenv("STRIX_CUDA_DECODE_ROWS_MAX");
+        const char* e = strix::envcfg::text("STRIX_CUDA_DECODE_ROWS_MAX");
         const unsigned long n = e && *e ? std::strtoul(e, nullptr, 10) : 16UL;
         return n < 8UL ? 8U : n > 16UL ? 16U : static_cast<unsigned>(n);
     }();
