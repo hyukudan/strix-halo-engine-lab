@@ -94,13 +94,15 @@ inline std::uint32_t window_of(std::uint32_t index, std::uint32_t sessions, std:
 struct WideModel {
     double a_ms = 10.5, b_ms = 2.81, wide_ms = 62.0, accept = 0.65, min_gain = 0.02;
 };
-// Cohort costs by the backend's decode row cap. Cap 16 (9..16-row decode pieces): the 16-row window costs the
-// 8-row cohort window (33 ms) x the measured single-session ratio T=16 / T=8 = 29.2 / 17.3 = 1.69 =
-// 55.7 ms, and a wider budget must win by 5 % (one forced pair, budget 16 vs 8: edit C4 +11 %, edit C8 +19 %,
-// json C8 +16 % (p ~0.9) taken; json C4 -6 %, prose C4 -50 %, prose C8 -5 % (p ~0.5) refused with the live p).
+// Cohort costs by the backend's decode row cap. Cap 16 (9..16-row decode forms, one-pass dense): a 16-row cohort
+// window costs 50 ms against the model's 33 ms 8-row window, fitted from in-process forced budget 16 vs 8 receipts
+// (2 ABAB pairs, ids equal, 90 % power cap): C8 edit +29.6 %, json +28.3 %, prose +3.4 / -0.1 % fit 46-48 ms; C4 edit
+// +23.8 %, json +3.4 / +6.5 %, prose -26 / -31 % fit 48-58 ms. A wider budget must win by 5 %: with the live p, edit and
+// json widen at C4 and C8, prose (p ~0.5) stays at 8; with no live p yet (the 0.65 prior) only C8 widens, which is
+// what lets its sessions verify drafts and learn their p (at budget 8, C8 sessions run one row and never verify).
 inline WideModel wide_measured(unsigned decode_rows_cap) {
     WideModel m;
-    if (decode_rows_cap >= 16U) { m.wide_ms = 55.7; m.min_gain = 0.05; }
+    if (decode_rows_cap >= 16U) { m.wide_ms = 50.0; m.min_gain = 0.05; }
     return m;
 }
 inline double expected_tokens(std::uint32_t rows, double p) {

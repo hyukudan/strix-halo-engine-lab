@@ -89,10 +89,11 @@ struct Stream {
 inline std::uint32_t window_rows_default() {
     static const std::uint32_t rows = [] {
         const char* v = std::getenv("STRIX_QRTX_WINDOW_ROWS");
-        // default 8. STRIX_QRTX_WINDOW_ROWS=16 (with the backend's 9..16-row decode pieces) lets the marginal rule widen on
-        // the live acceptance; not default yet: process-level C4/C8 arms were noisier than the effect
-        // (edit C1, budget-independent, moved 10 %), an in-process per-request budget A/B is the pending receipt
-        const long n = v ? std::strtol(v, nullptr, 10) : static_cast<long>(kWindowRows);
+        // default 16 with the backend's 9..16-row decode forms (core::decode_rows_max() 16), else 8: above 8 rows the
+        // marginal rule (wide_measured) widens on the live acceptance; STRIX_QRTX_WINDOW_ROWS=8 keeps 8-row windows
+        // (request field "window_rows" per request)
+        const long def = strix::cuda::core::decode_rows_max() >= 16U ? 16L : static_cast<long>(kWindowRows);
+        const long n = v ? std::strtol(v, nullptr, 10) : def;
         return static_cast<std::uint32_t>(std::clamp<long>(n, 1, static_cast<long>(kMaxWindowRows)));
     }();
     return rows;
