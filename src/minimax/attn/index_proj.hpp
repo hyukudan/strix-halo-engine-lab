@@ -52,16 +52,16 @@ void enqueue_index_proj_decode_lds(const IndexProjView& v, hipStream_t stream);
 void enqueue_index_proj_wmma(const IndexProjView& v, hipStream_t stream, unsigned tc = 4, bool rows_fast = false);
 // The same bits with x first rounded to FP16 into k-tile-major tiles (xt: rows x 6144 FP16, device; the CTAs then
 // read 16 KB contiguous per stage instead of 128 rows 24 KB apart). convert = false reuses xt as already written
-// (bench: the cost a producer that writes the tiles itself would leave).
+// for the same x and row count, ordered on stream (bench: the cost of consuming producer-written tiles).
 void enqueue_index_proj_wmma_x16(const IndexProjView& v, _Float16* xt, hipStream_t stream, bool convert = true);
 // The FAST entry (minimax-index-proj-wmma-v1, both forms the same bits): the x16 tiles form from kFastTilesRows rows,
-// the direct form below (strict ABAB x3, 60 layers' weights rotated, 11-15, gfxclk ~2.4 GHz, us per call:
-//   rows   exact slab   direct   x16 (convert + wmma)   x16 wmma alone
-//   1024        686        203        274                   151
-//   2048       1659        953        634                   307
-//   4096       2758       1716       1234                   529
-//   8192       5072       3058       2449                  1062
-// ; the 1024-row direct figure keeps x (25 MB) in the 32 MB MALL across the bench's calls). xt: rows x 6144 FP16 when
+// the direct form below (historical ABAB x3, fixed first 12/30 of 60 weight sets, 11-15, gfxclk ~2.4 GHz, us/call:
+//   rows   exact slab   direct   x16 (convert + wmma)   x16-only (withdrawn)
+//   1024        686        203        274                   withdrawn
+//   2048       1659        953        634                   withdrawn
+//   4096       2758       1716       1234                   withdrawn
+//   8192       5072       3058       2449                   withdrawn
+// ; x16-only at 1024/2048/4096 used a stale stride; all x16-only figures await a gated rerun. The 1024-row direct figure keeps x (25 MB) in the 32 MB MALL across the bench's calls). xt: rows x 6144 FP16 when
 // index_proj_fast_tiles(rows), else unused (may be null).
 inline constexpr unsigned kFastTilesRows = 2048;
 bool index_proj_fast_tiles(unsigned rows);
