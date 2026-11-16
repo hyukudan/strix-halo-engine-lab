@@ -2,6 +2,7 @@
 #include "strix/file_snapshot.hpp"
 #include "strix/hip_check.hpp"
 #include "strix/deepseek41_batch_forward.hpp"
+#include "strix/hip_logprob_partials.hpp"
 
 #include "strix/deepseek41_attention_host.hpp"
 #include "strix/deepseek41_plan.hpp"
@@ -368,6 +369,7 @@ std::uint64_t workspace_bytes_for(const TargetModel& model, const BatchForwardOp
     n += W * H + 2U * W * H / 32U * 4U;                                                    // FFN input A8
     n += W * K * I + 2U * W * K * I / 32U * 4U + W * I + 2U * W * I / 32U * 4U;            // expert activations A8
     n += (W * partial_blocks + 5U * W) * sizeof(ds41::ArgmaxCandidate);                     // argmax
+    n += 2U * W * sizeof(LogprobPartial);                                                 // score_own, score_other (also when scoring is off)
     n += 2U * (W * H + W * H / 2U) * 4U;                                                   // half sums (+ split shared down rows)
     n += 2U * (W * I / 2U + W * I / 64U * 4U);                                             // split shared activation halves
     n += 6U * (W * K + 1U) * 4U + 2U * std::max<std::uint64_t>(options.layers, 1U) * 4U;                                                // built routes
@@ -600,6 +602,9 @@ struct BatchForward::Impl {
     Dev<std::int32_t> sums, act_sums, sh_act_sums;
     Dev<ds41::ArgmaxCandidate> partial, cand0, cand1, best, cand_own, cand_other;
     Pinned<ds41::ArgmaxCandidate> best_pinned;
+    // logprob scoring (BatchForward::set_score_slots): [slice 0 rows | slice 1 rows] partials
+    Dev<LogprobPartial> score_own, score_other;
+    Pinned<LogprobPartial> score_pinned;
     struct BuiltRoutes {
         Dev<std::uint32_t> experts, begins, rows, slots, order, low_counts, counts;
     } built;
@@ -1184,6 +1189,9 @@ BatchForward::BatchForward(const std::filesystem::path& gguf, const BatchForward
     m.cand_own = m.track<ds41::ArgmaxCandidate>(W);
     m.cand_other = m.track<ds41::ArgmaxCandidate>(W);
     m.best_pinned = Pinned<ds41::ArgmaxCandidate>(W);
+    m.score_own = m.track<LogprobPartial>(W);
+    m.score_other = m.track<LogprobPartial>(W);
+    m.score_pinned = Pinned<LogprobPartial>(std::size_t{2} * W);
     m.half_own = m.track<float>(W * H + W * H / 2U);
     m.half_other = m.track<float>(W * H + W * H / 2U);
     m.shx_own = m.track<std::uint8_t>(W * I / 2U + W * I / 64U * 4U);
@@ -3195,6 +3203,16 @@ const std::vector<std::uint32_t>& BatchForward::run_step(std::span<const BatchRo
                 const auto* first = m.options.rank == 0U ? m.cand_own.p : m.cand_other.p;
                 const auto* second = m.options.rank == 0U ? m.cand_other.p : m.cand_own.p;
                 ds41::enqueue_combine_argmax(first, second, R, m.best.p, st);
+                if (score_slots_ != 0U) {  // this rank's slice partials, swapped with the peer's in one exchange
+                    enqueue_hip_logprob_partials({lp, R, sl.count, static_cast<std::uint32_t>(ls), sl.first, kLogprobPartialTop, nullptr,
+                                                  m.score_own.p}, st);
+                    wire.exchange(st, m.score_own.p, m.score_other.p, std::size_t{R} * sizeof(LogprobPartial),
+                                  dist::Tag{static_cast<std::uint32_t>(dist::TagKind::argmax), 1U, 0U});
+                    const auto* s0 = m.options.rank == 0U ? m.score_own.p : m.score_other.p;
+                    const auto* s1 = m.options.rank == 0U ? m.score_other.p : m.score_own.p;
+                    check(hipMemcpyAsync(m.score_pinned.p, s0, std::size_t{R} * sizeof(LogprobPartial), hipMemcpyDeviceToHost, st), "scores");
+                    check(hipMemcpyAsync(m.score_pinned.p + R, s1, std::size_t{R} * sizeof(LogprobPartial), hipMemcpyDeviceToHost, st), "scores");
+                }
             } else {
                 const auto r0 = ds41::vocab_slice(c.vocab_size, 2U, 0U), r1 = ds41::vocab_slice(c.vocab_size, 2U, 1U);
                 const auto [l0, s0] = m.logits_rows(r0.first, V);
@@ -3202,6 +3220,14 @@ const std::vector<std::uint32_t>& BatchForward::run_step(std::span<const BatchRo
                 ds41::enqueue_argmax(l0, R, r0.count, static_cast<std::uint32_t>(s0), r0.first, m.partial.p, m.cand0.p, st);
                 ds41::enqueue_argmax(l1, R, r1.count, static_cast<std::uint32_t>(s1), r1.first, m.partial.p, m.cand1.p, st);
                 ds41::enqueue_combine_argmax(m.cand0.p, m.cand1.p, R, m.best.p, st);
+                if (score_slots_ != 0U) {  // world 1: both slices here, the same two partials per row as a pair
+                    enqueue_hip_logprob_partials({l0, R, r0.count, static_cast<std::uint32_t>(s0), r0.first, kLogprobPartialTop, nullptr,
+                                                  m.score_own.p}, st);
+                    enqueue_hip_logprob_partials({l1, R, r1.count, static_cast<std::uint32_t>(s1), r1.first, kLogprobPartialTop, nullptr,
+                                                  m.score_other.p}, st);
+                    check(hipMemcpyAsync(m.score_pinned.p, m.score_own.p, std::size_t{R} * sizeof(LogprobPartial), hipMemcpyDeviceToHost, st), "scores");
+                    check(hipMemcpyAsync(m.score_pinned.p + R, m.score_other.p, std::size_t{R} * sizeof(LogprobPartial), hipMemcpyDeviceToHost, st), "scores");
+                }
             }
             check(hipMemcpyAsync(m.best_pinned.p, m.best.p, std::size_t{R} * sizeof(ds41::ArgmaxCandidate), hipMemcpyDeviceToHost, st), "tokens");
             break;
@@ -3305,6 +3331,22 @@ const std::vector<std::uint32_t>& BatchForward::run_step(std::span<const BatchRo
     for (std::uint32_t r = 0; r < R; ++r) {
         if (m.best_pinned.p[r].finite == 0U) throw std::runtime_error("deepseek41 batch forward: non-finite logits");
         tokens_[r] = m.best_pinned.p[r].index;
+    }
+    scored_.assign(score_slots_ != 0U ? R : 0U, 0U);
+    scores_.resize(scored_.size());
+    for (std::uint32_t r = 0; r < scored_.size(); ++r) {  // the scored slots' rows: FP64 merge of the two slices
+        if (rows[r].slot >= 64U || ((score_slots_ >> rows[r].slot) & 1U) == 0U) continue;
+        const LogprobPartial parts[2] = {m.score_pinned.p[r], m.score_pinned.p[R + r]};
+        auto& sc = scores_[r];
+        sc = combine_logprob_partials(parts, kLogprobPartialTop);
+        // the emitted token is the greedy one, i.e. the merged top 1 (value descending, lowest ID first): a difference
+        // is a scoring or a selection bug, never a token to emit
+        if (sc.top.empty() || sc.top.front().id != tokens_[r])
+            throw std::logic_error("deepseek41 batch forward: scored top differs from the greedy token");
+        sc.has_target = true;
+        sc.target_logprob = sc.top.front().logprob;
+        sc.target_rank = 1U;
+        scored_[r] = 1U;
     }
     m.last_segments.clear();
     for (const auto& g : segments) {

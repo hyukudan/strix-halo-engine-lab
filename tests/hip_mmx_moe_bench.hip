@@ -1663,6 +1663,80 @@ struct Bench {
             free_group(f);
         }
     }
+    // Chunk invariance (STRIX_MMX_PF_ORDER=invariant): the same rows through one device call per chunk of 256, 1024,
+    // 4096 and the whole call, plus 4096 + 1..17 row tails, are bitwise equal. Adaptive is the negative control.
+    void run_chunked(const Prefill& q, const opt::ExpertSlices* ex_d, unsigned T, unsigned seg, float* out) {
+        const std::size_t bytes = opt::prefill_moe_workspace_bound(std::min(seg, T));
+        void* ws = nullptr;
+        hip_ok(hipMalloc(&ws, bytes), "chunk ws");
+        for (unsigned c0 = 0; c0 < T; c0 += seg) {
+            const unsigned n = std::min(seg, T - c0);
+            std::vector<std::uint32_t> routes(std::size_t{n} * 8);
+            for (unsigned t = 0; t < n; ++t)
+                for (unsigned k = 0; k < 4; ++k) {
+                    const std::size_t g = std::size_t{c0} + t;
+                    routes[std::size_t{t} * 4 + k] = q.ids[g * 4 + k];
+                    std::memcpy(&routes[std::size_t{n} * 4 + std::size_t{t} * 4 + k], &q.w4[g * 4 + k], 4);
+                }
+            auto* routes_d = dalloc<std::uint32_t>(routes.size());
+            hip_ok(hipMemcpy(routes_d, routes.data(), routes.size() * 4, hipMemcpyHostToDevice), "routes");
+            opt::PrefillMoeDeviceView dv;
+            dv.rows = n;
+            dv.y = q.yy + std::size_t{c0} * H;
+            dv.routes = routes_d;
+            dv.experts = ex_d;
+            dv.shared = L.shared;
+            dv.out = out + std::size_t{c0} * H;
+            opt::enqueue_prefill_moe_device(dv, ws, bytes, nullptr);
+            hip_ok(hipDeviceSynchronize(), "chunked call");
+            opt::prefill_moe_device_check();
+            hip_ok(hipFree(routes_d), "free");
+        }
+        hip_ok(hipFree(ws), "free");
+    }
+    void test_prefill_chunk_invariance() {
+        struct Case { unsigned T; std::vector<unsigned> segs; };
+        std::vector<Case> cases = {{8192, {256, 1024, 4096}}};
+        for (unsigned t = 1; t <= 17; ++t) cases.push_back({4096 + t, {4096}});
+        for (unsigned t = 1; t <= 17; ++t) cases.push_back({t, {1}});
+        for (const Case& k : cases) {
+            Prefill q = make_prefill(k.T);
+            auto* ex_d = dalloc<opt::ExpertSlices>(opt::kExperts);
+            hip_ok(hipMemcpy(ex_d, q.ex.data(), opt::kExperts * sizeof(opt::ExpertSlices), hipMemcpyHostToDevice), "experts");
+            float* whole = dalloc<float>(std::size_t{k.T} * H);
+            float* part = dalloc<float>(std::size_t{k.T} * H);
+            bool control_differs = false;
+            for (int order : {1, 0}) {
+                opt::set_prefill_moe_order(order);
+                hip_ok(hipMemset(whole, 0xff, std::size_t{k.T} * H * 4), "poison");
+                run_chunked(q, ex_d, k.T, k.T, whole);
+                const auto ref = d2h(whole, std::size_t{k.T} * H);
+                for (unsigned seg : k.segs) {
+                    hip_ok(hipMemset(part, 0xff, std::size_t{k.T} * H * 4), "poison");
+                    run_chunked(q, ex_d, k.T, seg, part);
+                    std::size_t at = 0;
+                    const bool same = same_bits(ref, d2h(part, std::size_t{k.T} * H), &at);
+                    if (order == 1) {
+                        check(same, "chunk invariance T=" + std::to_string(k.T) + " seg=" + std::to_string(seg) +
+                                    " differs at " + std::to_string(at));
+                        std::printf("prefill chunk invariance T=%u seg=%u invariant: bitwise\n", k.T, seg);
+                    } else {
+                        control_differs |= !same;
+                    }
+                }
+            }
+            opt::set_prefill_moe_order(-1);
+            if (k.T == 8192) {
+                check(control_differs, "negative control: adaptive split should change bits with chunking");
+                std::printf("prefill chunk invariance T=8192 adaptive control: differs (expected)\n");
+            }
+            std::fflush(stdout);
+            hip_ok(hipFree(whole), "free");
+            hip_ok(hipFree(part), "free");
+            hip_ok(hipFree(ex_d), "free");
+            free_prefill(q);
+        }
+    }
     // Whole calls, interleaved: A = one device-planned call per chunk, B = the group-wide call (same bits).
     void bench_prefill_group() {
         for (unsigned S : {2U, 4U}) {
@@ -3385,6 +3459,7 @@ int main(int argc, char** argv) {
             if (!o.no_moe) test_section("test_prefill", [&] { b.test_prefill(); });
             if (!o.no_moe) test_section("test_prefill_device", [&] { b.test_prefill_device(); });
             if (!o.no_moe) test_section("test_prefill_group", [&] { b.test_prefill_group(); });
+            if (!o.no_moe) test_section("test_prefill_chunk_invariance", [&] { b.test_prefill_chunk_invariance(); });
             if (!o.no_moe) test_section("test_prefill_mtfit", [&] { b.test_prefill_mtfit(); });
             if (!o.no_moe) test_section("test_prefill_core8", [&] { b.test_prefill_core8(); });
             if (!o.no_moe && o.tests == "test_prefill_pipe") test_section("test_prefill_pipe", [&] { b.test_prefill_pipe(); });

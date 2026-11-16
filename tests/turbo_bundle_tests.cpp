@@ -82,15 +82,30 @@ void families() {
     generic(ds, p::Name::turbo, none, r);
     require(find(r, "attention_f16wmma") != nullptr && find(r, "attention_f16wmma")->value == "2", "ds41 turbo attention = bf16flash");
     require(find(r, "dense_f16") != nullptr && find(r, "dense_f16")->value == "1", "ds41 turbo dense f16");
-    require(find(r, "engram_wmma") != nullptr && find(r, "engram_wmma")->status == p::Status::pending, "ds41 engram pending");
+    require(profile_table.size() == 7, "ds41 keeps seven rows after replacing pending Engram");
+    std::size_t engram_rows = 0;
+    for (const auto& row : profile_table)
+        if (std::string_view(row.env) == "STRIX_DS41_FAST_ENGRAM") ++engram_rows;
+    require(engram_rows == 1 && find(r, "engram_wmma") == nullptr, "one real Engram row per env");
+    const auto* engram = find(r, "engram_f16wmma");
+    require(engram != nullptr && engram->status == p::Status::builtin && engram->value == "0" &&
+                std::string_view(engram->lever->value[3]).empty() && !engram->lever->runnable[3],
+            "ds41 real Engram stays explicit-only outside turbo");
     require(find(r, "decoder_replay") != nullptr && find(r, "decoder_replay")->status == p::Status::pending, "ds41 replay pending");
     generic(ds, p::Name::fast, none, r);
     require(find(r, "attention_f16wmma")->requested == "1", "ds41 fast unchanged (f16wmma)");
     generic(ds, p::Name::standard, none, r);
-    require(find(r, "engram_wmma") == nullptr || find(r, "engram_wmma")->status == p::Status::builtin, "ds41 default unchanged");
+    require(find(r, "engram_f16wmma") != nullptr && find(r, "engram_f16wmma")->status == p::Status::builtin, "ds41 default unchanged");
 
     const p::Engine mm{"minimax-pair", "", strix::minimax::defaults::profile_table, false, "minimax-turbo-v1"};
     generic(mm, p::Name::turbo, none, r);
+    require(strix::minimax::defaults::profile_table.size() == 6, "minimax retains two base index rows");
+    for (const char* lever : {"idx_wmma", "idx_wmma_layers"}) {
+        const auto* e = find(r, lever);
+        require(e != nullptr && e->status == p::Status::builtin && e->value == e->lever->builtin &&
+                    std::string_view(e->lever->value[3]).empty() && !e->lever->runnable[3],
+                "minimax index rows stay explicit-only outside turbo");
+    }
     require(find(r, "msa_flash")->status == p::Status::pending && find(r, "msa_flash_layers")->status == p::Status::pending,
             "minimax turbo flash waits for adapter admission/export");
     require(find(r, "moe_invariant")->status == p::Status::pending, "minimax moe invariant pending");

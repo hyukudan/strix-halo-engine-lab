@@ -27,6 +27,12 @@ struct MtpBatchPlanRule {bool pooled=false; bool calibrated=false; std::uint32_t
 // Most decoding requests the budget plans for (STRIX_SERVE_ROW_BUDGET_MAX_LANES, default 6, 0..8). Above it every
 // request gets the fixed table's two rows: measured, the budget wins at 2 to 6 requests and loses at 8.
 [[nodiscard]] std::uint32_t mtp_serve_row_budget_max_lanes() noexcept;
+// Most decoding requests one joint group (one target forward) takes above the lane bound, where every request has
+// the fixed two rows: STRIX_SERVE_JOINT_GROUP_LANES, 8..16 (16 = 32 rows, the widest shared step); default 8 = one
+// forward per eight requests, because a 9-lane single group stalled on the device (opt-in until fixed). "ab" alternates 8 and 16 by joint cycle (measurement).
+// Scheduling only: every row keeps its arithmetic in the 9..32-row wide steps.
+inline constexpr std::uint32_t kMtpJointGroupLanesMax=16U;
+[[nodiscard]] std::uint32_t mtp_serve_joint_group_lanes(std::uint64_t cycle=0) noexcept;
 // Joint scheduling only: all selections still come from each request's target.
 // A non-drafting request normally uses R2, commits one row and discards padding.
 class MtpBatchWindowController {
@@ -58,6 +64,11 @@ public:
     // The last plan(): its expected tokens and ms (target estimate + draft estimate), and whether it was a probe.
     struct PlanInfo {double expected=0.0, ms=0.0; bool probe=false;};
     [[nodiscard]] const PlanInfo& last_plan() const noexcept {return last_;}
+    // Requests per joint group for `count` live requests: above the budget rule's lane bound the plan is the fixed
+    // two rows per request (no search), so a group holds up to mtp_serve_joint_group_lanes(cycle); otherwise 8.
+    [[nodiscard]] std::size_t max_group_lanes(std::size_t count,std::uint64_t cycle=0) const noexcept {
+        return rule_.budget && count>mtp_serve_row_budget_max_lanes()?mtp_serve_joint_group_lanes(cycle):8U;
+    }
     // Budget rule cost model: a cycle costs fixed + row x physical rows + lane x lanes ms. Priors 28 + 6 x rows
     // + 6 x lanes (one lane: 34 + 6 x rows; STRIX_SERVE_ROW_COST=fixed,row,lane pins them); once the measured
     // topologies identify the three terms, their least-squares fit.

@@ -17,6 +17,7 @@
 #include <cuda_runtime.h>
 
 #include "qwen_amd_math.cuh"
+#include "strix/recurrent_state_type.hpp"
 
 namespace strix::cuda::qwen_gdn {
 
@@ -62,7 +63,15 @@ struct A8Out { std::int8_t* codes; float* deltas; };
 
 // Recurrence mapping: G lanes per state column (lane `sub` owns keys sub, sub+G, ...), blocks of 32 columns (32*G threads).
 // Any G in {2,4,8,16} gives the same bits (the HIP tree pairs keys i and i+d, d = 64..1); default 4 (fastest at T=8192).
-struct Tuning { std::uint32_t lanes = 4; };
+// state_type: stored element of the recurrent state buffers of the launch (f32 = incumbent; f16 / bf16 = FP32 arithmetic on a
+// 16-bit stored matrix, the state pointers then address 2-byte elements). round_each_row (16-bit only): decode / window /
+// commit-replay launches narrow+widen the state after every row, as if stored per token; prefill launches (false) keep FP32
+// inside the call and narrow once when the state is stored at the end. Same contract as the HIP kernels.
+struct Tuning {
+    std::uint32_t lanes = 4;
+    RecurrentStateType state_type = RecurrentStateType::f32;
+    bool round_each_row = false;
+};
 
 // Scratch: conv = the 3 BF16 rows before each 32-row chunk; decay = expf(gate) per (row, head); core = both (256-aligned).
 [[nodiscard]] std::size_t conv_scratch_bytes(std::uint32_t count);
