@@ -70,7 +70,7 @@ Status validate_special(const WeightView& view) {
    if(!scale || (scale->scalar!=Scalar::e4m3fn && scale->scalar!=Scalar::f32)) return {Error::malformed,"W4A8 group scale dtype"};
    status=required(view,"group_scales",scale->scalar,{{rows,width/group,0,0},2},part); if(!status) return status;
    if(part->scalar==Scalar::f32) status=scan(part->data,4,nonnegative_f32);
-   else status=scan(part->data,1,[](const Byte* p) { return std::to_integer<unsigned>(*p)<127; });
+   else status=scan(part->data,1,[](const Byte* p) { const auto code=std::to_integer<unsigned>(*p); return code<127 || code==128; });
    if(!status) return status;
    if(sidecar(view,"codebook")) {
     status=required(view,"codebook",Scalar::f32,{{16,0,0,0},1},part); if(!status) return status;

@@ -220,6 +220,12 @@ bool wfmt_reference_test() {
   if(!decode_reference(builtin_registry(),view,{0,old.size(),{},Scalar::f32},output) ||
      !std::equal(bytes.begin(),bytes.end(),std::as_bytes(std::span(old)).begin())) return false;
  }
+ const auto* w4=find_format(builtin_registry(),{"linear.w4a8-grouped",1}); if(!w4) return false;
+ auto signed_zero=fixture(*w4,0);
+ signed_zero.sidecars[1].data=memory(std::vector<Byte>(32,Byte{0x80}));
+ std::vector<Byte> zero_output(512*4); DecodeBuffer zero_buffer{zero_output,0};
+ if(!decode_reference(builtin_registry(),signed_zero,{0,512,{},Scalar::f32},zero_buffer) ||
+    std::any_of(zero_output.begin(),zero_output.end(),[](Byte byte) { return byte!=Byte{0}; })) return false;
  for(const auto& format:builtin_registry().formats) {
   if(!format.semantic_decode_supported) continue;
   auto view=fixture(format,1); view.payload.range.offset=UINT64_MAX;
