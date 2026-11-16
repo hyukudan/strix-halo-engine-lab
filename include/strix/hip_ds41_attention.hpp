@@ -128,6 +128,9 @@ struct AttentionView {
     // written by enqueue_attention_flash_mirror
     const std::uint16_t* ring16 = nullptr;
     const std::uint16_t* kv16 = nullptr;
+    // and, when non-null, the BF16 image of q after RoPE (R x heads x 512, from the q_b epilogue,
+    // enqueue_q_b_rope_image): the flash core reads it through query_op instead of q (same bits)
+    const std::uint16_t* q16 = nullptr;
 };
 inline constexpr unsigned kAttnGroupCount = 8;   // at most 8 head groups per row (8 heads per block)
 // variant 0: STRIX_DS41_BF16_ATTN_VARIANT (default 1, the first kernel); 2: QK split over the waves, 16-byte key stores

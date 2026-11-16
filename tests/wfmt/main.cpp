@@ -17,7 +17,13 @@ bool wfmt_resolve_test();
 bool wfmt_cache_test();
 bool wfmt_effective_config_test();
 bool wfmt_runtime_test();
+bool wfmt_cpu_test();
+bool wfmt_intel_test();
+bool wfmt_cpu_capture(std::string_view);
+bool wfmt_intel_capture(std::string_view);
 int main(int argc, char** argv) try {
+    if (argc == 3 && std::string_view(argv[1]) == "--wfmt-backend-capture")
+        return wfmt_cpu_capture(argv[2]) && wfmt_intel_capture(argv[2]) ? 0 : 1;
     if (argc == 3 && std::string_view(argv[1]) == "--wfmt-reference-capture")
         return wfmt_reference_capture(argv[2]) ? 0 : 1;
     if (argc == 5 && std::string_view(argv[1]) == "--wfmt-capture" &&
@@ -27,6 +33,8 @@ int main(int argc, char** argv) try {
     const std::string_view name(argv[1]);
     bool ok = false;
     if (name == "resolve") ok = wfmt_resolve_test();
+    else if (name == "cpu") ok = wfmt_cpu_test();
+    else if (name == "intel") ok = wfmt_intel_test();
     else if (name == "cache") ok = wfmt_cache_test();
     else if (name == "effective-config") ok = wfmt_effective_config_test();
     else if (name == "runtime") ok = wfmt_runtime_test();
