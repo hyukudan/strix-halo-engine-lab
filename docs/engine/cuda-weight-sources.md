@@ -1,9 +1,11 @@
 CUDA weight-format migration groundwork
 
-P10 is in progress. The shared CUDA source protocols and typed launch records are
-prepared alongside synthetic byte-capture fixtures. The existing tuned numerical
-bodies remain the execution baseline until the preceding executable and its ISA
-are frozen. Source migration and qualification must be completed together.
+P10 is in progress. Dense execution already calls shared CUDA core code through
+the source protocols and typed launch records. This change also introduces
+numerical forms and scheduling defaults; it is not solely pending extraction.
+Freezing the preceding executable and ISA, comparing them with the changed paths,
+and collecting complete-workload evidence remain qualification gates. Synthetic
+fixture inventories and host checks do not qualify these execution changes.
 
 The host descriptor/reference, admission, resolver and image-lifecycle contracts
 remain in the shared host layer. CUDA headers, resident views, instruction traits

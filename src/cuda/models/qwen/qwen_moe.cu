@@ -481,7 +481,7 @@ bool native_types(const Weights& w) {
     return !(a8_gate && a8_down);
 }
 
-void enqueue(const Rows& v, std::uint32_t rows, std::uint32_t clear_words, const Weights& w, const amdmath::Tables& tables,
+bool enqueue(const Rows& v, std::uint32_t rows, std::uint32_t clear_words, const Weights& w, const amdmath::Tables& tables,
              std::uint32_t* record, cudaStream_t s, bool moe_mma) {
     validate_expert_arithmetic(w,moe_mma);
     validate_route_storage(v, rows);
@@ -500,12 +500,13 @@ void enqueue(const Rows& v, std::uint32_t rows, std::uint32_t clear_words, const
         check(cudaGetLastError(), "MoE native down");
         enqueue_merge(v, rows, s);
         enqueue_commit(v, rows, record, s);
-        return;
+        return false;
     }
     enqueue_project(v, rows, w, tables, s, moe_mma);
     enqueue_down(v, rows, w, s, moe_mma);
     enqueue_merge(v, rows, s);
     enqueue_commit(v, rows, record, s);
+    return moe_mma;
 }
 
 }  // namespace strix::cuda::qwen_moe
