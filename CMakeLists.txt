@@ -5662,11 +5662,19 @@ if(STRIX_BACKEND_CPU)
     include("${CMAKE_CURRENT_LIST_DIR}/cmake/StrixBackendCpu.cmake")
 endif()
 
-# Host fixtures that include qwen_effective_config transitively consume the onfly core header.
-foreach(strix_qwen_fixture strix-rotary-descriptor-tests strix-serve-api-tests
-        strix-qwen-startup-policy-tests strix-qwen-router-bf16-tests strix-qwen-mtp-bundle-tests
-        strix-qwen-product-profile-tests strix-qwen-profile-resolution-tests)
-    if(TARGET ${strix_qwen_fixture})
-        target_include_directories(${strix_qwen_fixture} PRIVATE src)
-    endif()
-endforeach()
+# Host fixtures consuming the onfly census also need its source-local core header.
+set_property(SOURCE
+    tests/hip_http_batch_session_tests.cpp
+    tests/onfly_i4_tests.cpp
+    tests/ple_rolling_tests.cpp
+    tests/qwen_effective_config_tests.cpp
+    tests/qwen_mtp_bundle_tests.cpp
+    tests/qwen_product_profile_tests.cpp
+    tests/qwen_profile_resolution_tests.cpp
+    tests/qwen_router_bf16_tests.cpp
+    tests/qwen_startup_policy_tests.cpp
+    tests/qwen_yarn_host_compile_tests.cpp
+    tests/qwen_yarn_schedule_tests.cpp
+    tests/rotary_descriptor_tests.cpp
+    tests/serve_api_tests.cpp
+    APPEND PROPERTY INCLUDE_DIRECTORIES "${CMAKE_CURRENT_SOURCE_DIR}/src")
