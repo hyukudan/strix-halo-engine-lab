@@ -1601,9 +1601,10 @@ private:
             }
             receipt.set_rows(physical, useful);
             for (const auto& s : slots_) receipt.admitted += s->active ? 1U : 0U;
-            // Target forwards: one per lane alone plus one per shared window (cohort or group) of this cycle.
-            receipt.forwards = static_cast<std::uint32_t>(std::min<std::uint64_t>(stats_.cohort.cohort_windows - windows_before, UINT32_MAX));
-            for (const auto n : receipt.solo) receipt.forwards += n;
+            // Count shared execution once, plus every own window attempt and serial dispatch.
+            std::uint64_t forwards = stats_.cohort.cohort_windows - windows_before;
+            for (const auto& r : results) forwards += r.target_forwards;
+            receipt.forwards = static_cast<std::uint32_t>(std::min<std::uint64_t>(forwards, UINT32_MAX));
         };
         const auto receipt_done = [&] {
             if (!receipt_on) return;

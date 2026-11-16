@@ -553,6 +553,7 @@ HipMtpGreedyCycleResult HipMtpGreedyRuntime::finish_cycle(const HipMtpTargetHidd
     auto& i=*impl_;require(i.busy && !i.failed,"MTP greedy cycle finish requires a drafted cycle");
     auto is_eos=[&](std::uint32_t t){return std::find(eos.begin(),eos.end(),t)!=eos.end();};
     HipMtpGreedyCycleResult out;
+    out.target_forwards=verified.target_forwards;
     out.final_target=initial;
     out.proposed_candidates=static_cast<std::uint32_t>(i.candidates.size());
     try {
@@ -728,6 +729,7 @@ HipMtpGreedyCycleResult HipMtpGreedyRuntime::cycle(const HipMtpTargetHiddenTicke
         for(std::size_t index=0;;++index) {
             replay.push_back({out.final_target,pending});
             const auto drafts=i.target->token_sampler()?i.mtp->sampled_drafts():std::span<const TokenDraft>{};
+            ++out.target_forwards;
             auto completed=i.target->execute_serial(*i.session,i.resources,*i.dispatcher,pending,
                 index<drafts.size()?&drafts[index]:nullptr,
                 transaction?HipMtpHostRowSelector{[&](auto row){
