@@ -9,6 +9,8 @@
 #include <cstring>
 #include <iostream>
 #include <stdexcept>
+#include <string>
+#include <initializer_list>
 #include <vector>
 #if __has_include("../../src/hip/weight/registry.hpp")
 #include "../../src/hip/weight/registry.hpp"
@@ -22,6 +24,14 @@
 
 namespace {
 void check(hipError_t e) { if (e != hipSuccess) throw std::runtime_error(hipGetErrorString(e)); }
+void context(const std::string& name,const char* arithmetic,std::initializer_list<std::uint64_t> shape,const char* format) {
+#ifdef STRIX_WFMT_CAPTURE
+    strix::weight::capture::set_context(name.c_str(),arithmetic,shape,format);
+#else
+    (void)name;(void)arithmetic;(void)shape;(void)format;
+#endif
+}
+
 struct Buffer {
     void* p = nullptr;
     explicit Buffer(std::size_t n) { check(hipMalloc(&p,n)); check(hipMemset(p,0,n)); }
@@ -100,6 +110,8 @@ std::vector<unsigned char> weights(unsigned k,unsigned n) {
 }
 template<unsigned R> void rows_case(unsigned k,unsigned n) {
     using namespace strix::q8_rows;
+    const auto name="hip.rows.r"+std::to_string(R)+".k"+std::to_string(k)+".n"+std::to_string(n);
+    context(name,"hip-q8-rows-fma-mix-fixture@1",{R,n,k},"gguf.q8_0@1");
     auto w=weights(k,n); std::vector<float> x(R*k);
     for(unsigned i=0;i<x.size();++i) x[i]=static_cast<float>(static_cast<int>(i%127U)-63)*0.015625F;
     Buffer dw(w.size()), dx(x.size()*4U),dy(R*n*4U);dw.upload(w);dx.upload(x);
@@ -113,6 +125,7 @@ template<unsigned R> void rows_case(unsigned k,unsigned n) {
         hipLaunchKernelGGL((project_rows_stepped_kernel<Site<R>,2U,1U>),dim3((n+15U)/16U),dim3(256),2U*R*256U*4U,0,s);const auto c=read();
         if(a!=c) throw std::runtime_error("stepped rows differ");
         // Q6P32 all-zero codes with nonzero FP16 scales exercises the exact planar addressing.
+        context(name+".q6p32","hip-q8-rows-fma-mix-fixture@1",{R,n,k},"image.q6p32@1");
         std::vector<unsigned char> q6(n*(k/32U)*26U,0);
         for(unsigned o=0;o<n;++o) for(unsigned chunk=0;chunk<k/256U;++chunk) {
             auto off=strix::q6p::chunk_offsets(k,chunk);
@@ -144,6 +157,8 @@ template<unsigned R> void rows_case(unsigned k,unsigned n) {
 }
 template<unsigned R> void signed_case(unsigned k,unsigned n) {
     using namespace strix::q8_rows;
+    const auto name="hip.signed-a8.r"+std::to_string(R)+".k"+std::to_string(k)+".n"+std::to_string(n);
+    context(name,"hip-signed-a8-block-chain@1",{R,n,k},"gguf.q8_0@1");
     auto w=weights(k,n);std::vector<float> x(R*k);
     for(unsigned i=0;i<x.size();++i) x[i]=static_cast<float>(static_cast<int>(i%31U)-15)*0.03125F;
     Buffer dw(w.size()),dx(x.size()*4U),dy(R*n*4U),codes(dense_a8_pitch<R>()*k),deltas(dense_a8_pitch<R>()*(k/32U)*4U);
@@ -160,6 +175,7 @@ template<unsigned R> void signed_case(unsigned k,unsigned n) {
         hipLaunchKernelGGL((project_rows_dense_a8_kernel<Site<R>,1U,false,false>),dim3((n+7U)/8U),dim3(256),0,0,site,codes.as<std::int8_t>(),deltas.as<float>());check(hipGetLastError());const auto direct=dy.read<float>(R*n);
         hipLaunchKernelGGL((project_rows_dense_a8_kernel<Site<R>,1U,true,false>),dim3((n+7U)/8U),dim3(256),dense_a8_stage_bytes<R>(k),0,site,codes.as<std::int8_t>(),deltas.as<float>());check(hipGetLastError());const auto staged=dy.read<float>(R*n);
         if(direct!=staged) throw std::runtime_error("signed-A8 source staging differs");
+        context(name+".q6p32","hip-signed-a8-block-chain@1",{R,n,k},"image.q6p32@1");
         std::vector<unsigned char> q6(n*(k/32U)*26U,0);
         Buffer dq(q6.size());dq.upload(q6);site.segments=segments({{dq.p,n}});
         hipLaunchKernelGGL((project_rows_dense_a8_kernel<Site<R>,1U,false,true>),dim3((n+7U)/8U),dim3(256),0,0,site,codes.as<std::int8_t>(),deltas.as<float>());check(hipGetLastError());dy.read<float>(R*n);
@@ -172,6 +188,7 @@ template<unsigned R> void signed_case(unsigned k,unsigned n) {
 }
 void partial_case(bool q6) {
     using namespace strix::q8_rows;
+    context(q6?"hip.rows.partial.q6p32":"hip.rows.partial.q8","hip-q8-rows-fma-mix-fixture@1",{1U,1U,256U},q6?"image.q6p32@1":"gguf.q8_0@1");
     auto w=weights(256U,1U);
     if(q6) w.assign(208U,0);
     std::vector<float> x(256U,0.125F);
@@ -193,6 +210,8 @@ void partial_case(bool q6) {
 }
 void dense_case(unsigned k,unsigned n,unsigned rows) {
     namespace d=strix::core::f16_dense_tall;
+    const auto name="hip.dense-q8a8.r"+std::to_string(rows)+".k"+std::to_string(k)+".n"+std::to_string(n);
+    context(name,"dense-q8a8-f16-v1@1",{rows,n,k},"gguf.q8_0@1");
     auto w=weights(k,n);std::vector<std::int8_t> a(rows*k);std::vector<float> scales(rows*k/32U,0.03125F),x(rows*k);
     for(unsigned i=0;i<a.size();++i) {a[i]=static_cast<std::int8_t>(static_cast<int>(i%63U)-31);x[i]=static_cast<float>(a[i])*0.03125F;}
     Buffer dw(w.size()),da(a.size()),ds(scales.size()*4U),dx(x.size()*4U),dy(rows*n*4U);
@@ -215,6 +234,7 @@ void dense_case(unsigned k,unsigned n,unsigned rows) {
         const unsigned ro=std::min(o,n-1U);std::uint16_t scale;std::memcpy(&scale,w.data()+(ro*k/32U+j/32U)*34U,2U);
         f16[o*k+j]=static_cast<_Float16>(static_cast<float>(std::bit_cast<_Float16>(scale))*static_cast<float>(static_cast<std::int8_t>(w[(ro*k/32U+j/32U)*34U+2U+j%32U])));
     }
+    context(name+".raw-f16","hip-raw-f16-wmma@1",{rows,n,k},"plain.f16@1");
     Buffer df(f16.size()*2U);df.upload(f16);
     hipLaunchKernelGGL(raw_kernel,dim3((rows+127U)/128U,(n+15U)/16U),dim3(256),0,0,dx.as<float>(),k,rows,RawCols{df.as<_Float16>(),dy.as<float>(),k,n});check(hipGetLastError());const auto raw=dy.read<float>(rows*n);
     if(scalar!=raw) throw std::runtime_error("raw F16 source differs");
@@ -240,6 +260,7 @@ int main() try {
     if(!registered || registered->paired_k!=64U || registered->validate(view,shape)) throw std::runtime_error("HIP signed source admitted odd block pair");
     if(wh::find_source({"gguf.iq3_s",1},"f16-tile")) throw std::runtime_error("unregistered HIP source unexpectedly admitted");
 #endif
+    context("hip.q8-f16-operands","dense-q8a8-f16-v1@1",{16U,256U},"gguf.q8_0@1");
     Buffer op(4096U*3U*2U);hipLaunchKernelGGL(operands_kernel,dim3(16),dim3(256),0,0,op.as<std::uint16_t>());check(hipGetLastError());op.read<std::uint16_t>(4096U*3U);
     partial_case(false);partial_case(true);
     signed_case<1>(256U,17U);signed_case<2>(256U,17U);signed_case<7>(256U,17U);signed_case<8>(256U,17U);
