@@ -45,10 +45,12 @@ class Responses(unittest.TestCase):
                 self.assertEqual(client.response_error(result, 2) is None, valid)
 
     def test_cold_warm_and_concurrent_exit_status(self):
-        # Calls 0..19: cold C1/C4/C8; 20..33: warm C1/C4/C8.
+        # Each pass defaults to 8 C1 + 4 C4 + 8 C8 requests.
+        # Calls 0..19: cold C1/C4/C8; 20..39: warm C1/C4/C8.
+        request_count = 2 * (8 + 4 + 8)
         for bad_call, change in ((None, {}), (0, dict(ids=None)), (12, dict(ids=[7, 9])),
                                  (12, dict(ids=None)), (12, dict(error='SSE error')),
-                                 (20, dict(ids=[7, 9])), (26, dict(done=False))):
+                                 (20, dict(ids=[7, 9])), (32, dict(done=False))):
             with self.subTest(bad_call=bad_call, change=change), tempfile.TemporaryDirectory(dir=Path.cwd()) as tmp:
                 path = Path(tmp)
                 (path / 'prompts').write_text(json.dumps(dict(module='', edit=[], json=[])))
@@ -56,7 +58,7 @@ class Responses(unittest.TestCase):
                 args = ['classes', 'http://127.0.0.1', str(path / 'out'), '--prompts', str(path / 'prompts'),
                         '--tokenizer', 'unused', '--prose-ids', str(path / 'prose'), '--classes', 'prose',
                         '--prose-len', '1', '--max-tokens', '2']
-                counter = iter(range(34))
+                counter = iter(range(request_count))
 
                 def response(*_):
                     return good() | (change if next(counter) == bad_call else {})
@@ -74,7 +76,7 @@ class Responses(unittest.TestCase):
                         self.assertNotEqual(ex.exception.code, 0)
                 report = (path / 'out').read_text()
                 self.assertEqual('done failures 0' in report, bad_call is None)
-                self.assertEqual(len((path / 'out.ids').read_text().splitlines()), 34)
+                self.assertEqual(len((path / 'out.ids').read_text().splitlines()), request_count)
                 self.assertEqual(json.loads((path / 'out.server.json').read_text())['engine'], 'fixture')
 
     def test_occupied_endpoint(self):
