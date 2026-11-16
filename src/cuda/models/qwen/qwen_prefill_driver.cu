@@ -1214,12 +1214,7 @@ void Prefill::Impl::qsa_core(std::uint32_t l, const Segment& seg) {
     const std::uint64_t r = seg.offset;
     const qsa::RowBuffers rb{hidden + r * kHidden, q_gate + r * qsa::kQGateWidth, qk + r * qsa::kKvWidth, qv + r * qsa::kKvWidth,
                              index_q + r * qsa::kIndexQWidth, index_k + r * qsa::kIndexDim, attn_out + r * qsa::kAttnWidth};
-    const qsa::LayerWeights qw{static_cast<const std::uint16_t*>(lw[l].p[k_indexer_q_proj_weight]),
-                               static_cast<const std::uint16_t*>(lw[l].p[k_indexer_k_proj_weight]),
-                               static_cast<const float*>(lw[l].p[k_attn_q_norm_weight]),
-                               static_cast<const float*>(lw[l].p[k_attn_k_norm_weight]),
-                               static_cast<const float*>(lw[l].p[k_indexer_q_norm_weight]),
-                               static_cast<const float*>(lw[l].p[k_indexer_k_norm_weight])};
+    const auto qw = qsa_weights(l);
     const auto o = qsa_ordinal(l);
     SessionState& ss = *seg.s;
     const qsa::LayerState st{ss.kv[o], ss.raw_index[o], ss.pooled[o], &ss.pooled_valid[o]};
@@ -1232,12 +1227,7 @@ void Prefill::Impl::qsa_layer(std::uint32_t l, const Segment* seg, std::uint32_t
         return;
     }
     const qsa::RowBuffers rb{hidden, q_gate, qk, qv, index_q, index_k, attn_out};
-    const qsa::LayerWeights qw{static_cast<const std::uint16_t*>(lw[l].p[k_indexer_q_proj_weight]),
-                               static_cast<const std::uint16_t*>(lw[l].p[k_indexer_k_proj_weight]),
-                               static_cast<const float*>(lw[l].p[k_attn_q_norm_weight]),
-                               static_cast<const float*>(lw[l].p[k_attn_k_norm_weight]),
-                               static_cast<const float*>(lw[l].p[k_indexer_q_norm_weight]),
-                               static_cast<const float*>(lw[l].p[k_indexer_k_norm_weight])};
+    const auto qw = qsa_weights(l);
     const auto o = qsa_ordinal(l);
     qsa::SegmentState st[kMaxStepRows];
     for (std::uint32_t i = 0; i < count; ++i) {
@@ -2405,6 +2395,7 @@ Draft Prefill::draft(SessionId session, std::uint32_t pending, std::uint32_t dep
         }
     }
     const std::uint32_t valid_before = S.mtp_pooled_valid;
+    try {
     if (dexec || capture) {  // this chain's inputs (the stream is idle: no copy of an earlier replay is in flight)
         for (std::uint32_t k = k0; k < k1; ++k) {
             m.draft_pos_pinned[k] = S.length - 1 + k;
@@ -2425,7 +2416,6 @@ Draft Prefill::draft(SessionId session, std::uint32_t pending, std::uint32_t dep
                            m.stream),
            "draft qsa maps");
     }
-    try {
     for (std::uint32_t k = k0; k < (dexec ? k0 : k1); ++k) {
         const std::uint64_t pos = S.length - 1 + k;
         // input fusion (enorm/hnorm/eh_proj) -> the MTP wide row; also stores a provisional cache row at pos
