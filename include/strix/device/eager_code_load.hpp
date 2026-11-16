@@ -66,7 +66,12 @@ inline void restart_own_image(char** argv) {
     std::vector<char*> restart;
     for (const auto& argument : original) restart.push_back(const_cast<char*>(argument.c_str()));
     restart.push_back(nullptr);
-    ::execv("/proc/self/exe", original.empty() ? argv : restart.data());
+    // Exec the resolved binary path, not "/proc/self/exe": the kernel names the new image after the exec'd path, so the
+    // latter turns the process name (comm) into "exe" and name-based tools (pgrep, samplers, reapers) lose the engine.
+    char self[4096];
+    const auto n = ::readlink("/proc/self/exe", self, sizeof(self) - 1);
+    if (n > 0) self[n] = '\0';
+    ::execv(n > 0 ? self : "/proc/self/exe", original.empty() ? argv : restart.data());
     std::fprintf(stderr, "eager code loading: restart failed (%s); continuing with deferred loading\n", std::strerror(errno));
 #else
     (void)argv;
