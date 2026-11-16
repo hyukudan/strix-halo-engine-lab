@@ -84,8 +84,8 @@ int main() {
             }
             expect(std::all_of(seen.begin(), seen.end(), [](unsigned n) { return n == 1U; }), "round covers every live slot once");
         }
-        // Budget rule above the lane bound: fixed two rows per request, so one group (one target forward, one
-        // weight read) takes up to 16 requests = 32 rows; at or below the bound, and for searching rules, 8.
+        // Budget rule above the lane bound: fixed two rows per request, so one group (one logical target
+        // execution) takes up to 16 requests = 32 rows; at or below the bound, and for searching rules, 8.
         for (std::size_t round = 0; round < count + 2U; ++round) {
             strix::MtpBatchWindowController budget(count, strix::MtpBatchWindowController::parse_rule("budget"));
             strix::MtpBatchWindowController search(count);

@@ -353,13 +353,13 @@ std::vector<std::uint32_t> MtpBatchWindowController::budget_rows(std::span<const
     std::vector<serve::LaneDemand> lanes(q.size());
     for(std::size_t k=0;k<q.size();++k) {
         const auto& h=history_.at(q[k].slot);
-        std::uint32_t most=prior?std::min(q[k].limit,std::max(rule_.cap,2U)):q[k].limit;
+        const std::uint32_t row_limit=prior?std::min(q[k].limit,std::max(rule_.cap,2U)):q[k].limit;
         accept[k][0]=1.0F;
         for(std::size_t d=0;d<7U;++d) {
             const double p=prior?0.8:d<q[k].probabilities.size()?std::clamp(static_cast<double>(q[k].probabilities[d]),0.0,1.0):0.0;
             accept[k][d+1U]=static_cast<float>((h.hits[d]+4.0*p)/(h.seen[d]+4.0));
         }
-        lanes[k]={q[k].slot,most,2U,most,std::span<const float>(accept[k]),0.0};
+        lanes[k]={q[k].slot,row_limit,2U,row_limit,std::span<const float>(accept[k]),0.0};
     }
     const auto model=budget_cost();
     const double draft_ms=prior?(draft_.samples()?draft_.value():1.2):0.0;

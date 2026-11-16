@@ -25,8 +25,12 @@ def cycles(path):
                 continue
             kv = dict(PAIR.findall(line[at:]))
             try:
-                yield dict(lanes=int(kv["lanes"]), forwards=int(kv.get("forwards", "0")), emitted=int(kv["emitted"]),
-                           ms=float(kv["ms"]), prompt=kv.get("prompt") == "1", rows=int(kv["rows"]), pad=int(kv["pad"]),
+                # Missing execution evidence is unknown, never a measured zero/steady cycle.
+                forwards = int(kv["forwards"])
+                if kv["prompt"] not in ("0", "1") or forwards <= 0:
+                    continue
+                yield dict(lanes=int(kv["lanes"]), forwards=forwards, emitted=int(kv["emitted"]),
+                           ms=float(kv["ms"]), prompt=kv["prompt"] == "1", rows=int(kv["rows"]), pad=int(kv["pad"]),
                            solo=kv.get("solo", ""))
             except (KeyError, ValueError):
                 continue

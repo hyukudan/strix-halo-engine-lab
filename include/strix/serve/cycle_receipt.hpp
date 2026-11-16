@@ -54,8 +54,9 @@ struct CycleReceipt {
     // entry), so acceptance by depth comes out of the same receipt.
     std::array<std::uint32_t, kCycleDraftDepths> draft_rows_by_depth{};
     // admitted: requests holding a slot when the cycle ran (decoding or still reading their prompt), so
-    // admitted - lanes is the queue of prompts beside the decode. forwards: target forwards the cycle ran; each
-    // reads the shared weights once, so weight bytes = forwards x the model's bytes per forward (0 = not reported).
+    // admitted - lanes is the queue of prompts beside the decode. forwards: logical target executions
+    // (0 = not reported). This does not measure weight traffic:
+    // individual operations may use different dispatch and fusion routes.
     // solo[reason]: lanes that verified in a forward of their own, by CycleSoloReason.
     std::uint32_t admitted = 0, forwards = 0;
     std::array<std::uint32_t, kCycleSoloReasons> solo{};

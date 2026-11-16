@@ -19,7 +19,7 @@ Cycle receipts are read from the server log (--log, the bytes the burst appended
 
   serve cycle seq=.. lanes=.. rows=.. useful=.. pad=.. emitted=.. draft_rows=a/b/.. draft_ms=.. verify_ms=..
       host_ms=.. ms=.. prompt=0|1 begin_ns=.. end_ns=..        (strix/serve/cycle_receipt.hpp, STRIX_SERVE_RECEIPT=1)
-      [admitted=.. forwards=.. solo=single/no_rows/wide/padding/alone/no_owner]   (optional; forwards = weight reads)
+      [admitted=.. forwards=.. solo=single/no_rows/wide/padding/alone/no_owner]   (optional; forwards = logical target executions)
   batch cycle sessions=.. groups=.. rows=.. solo=.. emitted=.. ms=.. begin_ns=.. end_ns=..   (older cycle log)
 
 The older form has no prompt flag and no useful/padding split; the report says so instead of guessing.
