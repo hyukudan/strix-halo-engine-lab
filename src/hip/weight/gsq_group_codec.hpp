@@ -3,7 +3,6 @@
 // Device decode of one GSQ A8 group (see gsq_a8_groups.hpp): 8 words of 4 signed int8 weights in element order
 // and the group scale(s). Used by the GSQ IQ gate/up and down kernels (R1, windows, prefill).
 
-#include "source.hpp"
 #include "strix/gsq_a8_groups.hpp"
 #include "strix/hip_ggml_weight_formats.hpp"
 

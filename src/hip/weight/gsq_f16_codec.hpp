@@ -1,5 +1,4 @@
 #pragma once
-#include "source.hpp"
 #include "strix/gsq_a8_groups.hpp"
 #include "strix/hip_ggml_weight_formats.hpp"
 #include <hip/hip_fp16.h>
